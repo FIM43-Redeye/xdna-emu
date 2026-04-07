@@ -772,6 +772,249 @@ mod tests {
         }
     }
 
+    // -- truncate edge cases --
+
+    #[test]
+    fn truncate_64bit_passthrough() {
+        // bits >= 64: no masking, value passes through unchanged
+        assert_eq!(truncate(i64::MAX, true, 64), i64::MAX);
+        assert_eq!(truncate(i64::MIN, true, 64), i64::MIN);
+        assert_eq!(truncate(i64::MAX, false, 64), i64::MAX);
+    }
+
+    #[test]
+    fn truncate_unsigned_high_bits_stripped() {
+        // 0xFFFF_FFFF in unsigned 16-bit = 0xFFFF (65535)
+        assert_eq!(truncate(0xFFFF_FFFF, false, 16), 0xFFFF);
+        // Same value in signed 16-bit = -1
+        assert_eq!(truncate(0xFFFF_FFFF, true, 16), -1);
+    }
+
+    #[test]
+    fn truncate_4bit() {
+        // 4-bit unsigned: 0..15
+        assert_eq!(truncate(0xAB, false, 4), 0xB);
+        // 4-bit signed: -8..7
+        assert_eq!(truncate(0xF, true, 4), -1);
+        assert_eq!(truncate(0x8, true, 4), -8);
+        assert_eq!(truncate(0x7, true, 4), 7);
+    }
+
+    // -- pack_lane 4-bit --
+
+    #[test]
+    fn pack_lane_8_to_4_truncate() {
+        assert_eq!(pack_lane(0xAB, 8, 4, false, PackMode::Truncate), 0xB);
+    }
+
+    #[test]
+    fn pack_lane_8_to_4_signed_saturate() {
+        // Signed 4-bit range: [-8, 7]
+        assert_eq!(pack_lane(10, 8, 4, true, PackMode::Saturate), 7);
+        assert_eq!(pack_lane(-10, 8, 4, true, PackMode::Saturate), -8);
+        assert_eq!(pack_lane(5, 8, 4, true, PackMode::Saturate), 5);
+    }
+
+    #[test]
+    fn pack_lane_8_to_4_symmetric_saturate() {
+        // Symmetric signed 4-bit: [-7, 7] (not -8)
+        assert_eq!(pack_lane(-10, 8, 4, true, PackMode::SymmetricSaturate), -7);
+        assert_eq!(pack_lane(-8, 8, 4, true, PackMode::SymmetricSaturate), -7);
+        assert_eq!(pack_lane(-7, 8, 4, true, PackMode::SymmetricSaturate), -7);
+    }
+
+    #[test]
+    fn pack_lane_symmetric_unsigned_same_as_regular() {
+        // Unsigned symmetric saturate == regular saturate
+        assert_eq!(
+            pack_lane(300, 16, 8, false, PackMode::SymmetricSaturate),
+            pack_lane(300, 16, 8, false, PackMode::Saturate),
+        );
+        assert_eq!(
+            pack_lane(-1, 16, 8, false, PackMode::SymmetricSaturate),
+            pack_lane(-1, 16, 8, false, PackMode::Saturate),
+        );
+    }
+
+    // -- unpack_lane 4-bit --
+
+    #[test]
+    fn unpack_lane_4_to_8_signed() {
+        // -1 in 4-bit signed (0xF), widened to 8-bit = -1
+        assert_eq!(unpack_lane(0xF, 4, 8, true), -1);
+        // 7 in 4-bit signed, widened to 8-bit = 7
+        assert_eq!(unpack_lane(7, 4, 8, true), 7);
+        // -8 in 4-bit signed (0x8), widened to 8-bit = -8
+        assert_eq!(unpack_lane(0x8, 4, 8, true), -8);
+    }
+
+    #[test]
+    fn unpack_lane_4_to_8_unsigned() {
+        // 0xF in 4-bit unsigned, widened to 8-bit = 15
+        assert_eq!(unpack_lane(0xF, 4, 8, false), 15);
+    }
+
+    // -- extract_lane cross-boundary --
+
+    #[test]
+    fn extract_lane_crosses_u32_boundary() {
+        // 24-bit lanes: lane 1 starts at bit 24, crossing words 0 and 1.
+        // Needs 24 bits from bit 24: 8 from word 0, 16 from word 1.
+        let mut reg = [0u32; 8];
+        reg[0] = 0xAB_00_00_00; // bits [24..32) = 0xAB
+        reg[1] = 0x0000_CDEF;   // bits [32..48) = 0xCDEF -> combined [24..48) = 0xCDEFAB
+        let val = extract_lane(&reg, 1, 24, false);
+        // word 0 >> 24 = 0xAB, bits_from_first = 8
+        // word 1 << 8 = 0x00CDEF00, OR'd -> raw = 0x00CDEFAB
+        // mask = 0xFFFFFF -> 0xCDEFAB
+        assert_eq!(val, 0xCDEFAB);
+    }
+
+    #[test]
+    fn extract_lane_out_of_bounds_returns_zero() {
+        let reg = [0xFFFF_FFFFu32; 8];
+        // Lane 100 at 32-bit -> bit_offset = 3200, word_idx = 100, >= 8
+        assert_eq!(extract_lane(&reg, 100, 32, false), 0);
+    }
+
+    // -- insert_lanes cross-boundary --
+
+    #[test]
+    fn insert_lanes_crosses_u32_boundary() {
+        // Insert a 24-bit value at lane 1 (bit_offset=24), crossing words 0-1.
+        let mut reg = [0u32; 8];
+        let lanes = vec![0i64, 0xABCDEF]; // lane 0 = 0, lane 1 = 0xABCDEF
+        insert_lanes(&mut reg, &lanes, 24);
+
+        // Lane 1 at bit 24: low 8 bits in word 0 [24..32), high 16 bits in word 1 [0..16)
+        assert_eq!(reg[0] & 0xFF00_0000, 0xEF00_0000);
+        assert_eq!(reg[1] & 0x0000_FFFF, 0x0000_ABCD);
+    }
+
+    // -- is_type_token --
+
+    #[test]
+    fn is_type_token_valid() {
+        assert!(is_type_token("D4"));
+        assert!(is_type_token("D8"));
+        assert!(is_type_token("D16"));
+        assert!(is_type_token("D32"));
+        assert!(is_type_token("S8"));
+        assert!(is_type_token("S16"));
+        assert!(is_type_token("S32"));
+    }
+
+    #[test]
+    fn is_type_token_invalid() {
+        assert!(!is_type_token("D"));      // too short
+        assert!(!is_type_token("VPACK"));  // wrong prefix
+        assert!(!is_type_token("DX"));     // not a number
+        assert!(!is_type_token("8"));      // no prefix
+        assert!(!is_type_token(""));       // empty
+        assert!(!is_type_token("AG"));     // wrong prefix
+    }
+
+    // -- find_type_pair --
+
+    #[test]
+    fn find_type_pair_finds_consecutive() {
+        let parts = vec!["VPACK", "D8", "D16", "ag"];
+        assert_eq!(find_type_pair(&parts), Some((1, 2)));
+    }
+
+    #[test]
+    fn find_type_pair_none_when_no_consecutive() {
+        let parts = vec!["VPACK", "D8", "ag", "D16"];
+        assert_eq!(find_type_pair(&parts), None);
+    }
+
+    #[test]
+    fn find_type_pair_empty() {
+        let parts: Vec<&str> = vec![];
+        assert_eq!(find_type_pair(&parts), None);
+    }
+
+    #[test]
+    fn find_type_pair_single_element() {
+        let parts = vec!["D8"];
+        assert_eq!(find_type_pair(&parts), None);
+    }
+
+    // -- name parsing: dot-separated mnemonics --
+
+    #[test]
+    fn pack_widths_from_name_dot_separated() {
+        // Mnemonic format: vpack.d4.d8
+        assert_eq!(pack_widths_from_name("vpack.d4.d8"), (8, 4, false));
+        assert_eq!(pack_widths_from_name("vpack.s8.s16"), (16, 8, true));
+    }
+
+    #[test]
+    fn unpack_widths_from_name_dot_separated() {
+        assert_eq!(unpack_widths_from_name("vunpack.d16.d8"), (8, 16, false));
+        assert_eq!(unpack_widths_from_name("vunpack.s32.s16"), (16, 32, true));
+    }
+
+    // -- pack_half with saturation --
+
+    #[test]
+    fn pack_half_saturate_signed() {
+        // 8 lanes of 32-bit, pack to 16-bit with signed saturation.
+        // 256-bit / 32 = 8 input lanes.
+        let mut src = [0u32; 8];
+        let vals: Vec<i64> = vec![50000, -50000, 100, -100, 32767, -32768, 0, 1];
+        insert_lanes(&mut src, &vals, 32);
+
+        let result = pack_half(&src, 32, 16, true, PackMode::Saturate);
+
+        let expected: Vec<i64> = vals.iter().map(|&v| v.clamp(-32768, 32767)).collect();
+        for (i, &exp) in expected.iter().enumerate() {
+            let got = extract_lane(&result, i, 16, true);
+            assert_eq!(got, exp, "lane {} mismatch", i);
+        }
+    }
+
+    // -- unpack_half with signed negatives --
+
+    #[test]
+    fn unpack_half_signed_negative_extends() {
+        // 32 lanes of 8-bit signed, unpack lower 16 to 16-bit.
+        let mut src = [0u32; 8];
+        let mut vals = Vec::new();
+        for i in 0..32 {
+            vals.push(truncate(-(i as i64) - 1, true, 8)); // -1, -2, ..., -32
+        }
+        insert_lanes(&mut src, &vals, 8);
+
+        let result = unpack_half(&src, 0, 8, 16, true);
+
+        for i in 0..16 {
+            let got = extract_lane(&result, i, 16, true);
+            assert_eq!(got, vals[i], "lane {} mismatch: expected {}, got {}", i, vals[i], got);
+        }
+    }
+
+    // -- pack_vector 4-bit --
+
+    #[test]
+    fn pack_vector_8_to_4_truncate() {
+        // 512/8 = 64 lanes at 8-bit, but our 256-bit reg holds 32 lanes.
+        // pack_vector uses 512/bits_i lanes -> this is a 512-bit semantic.
+        // With [u32; 8] = 256 bits, 256/8 = 32 lanes. pack_vector divides
+        // 512/bits_i which for 8-bit = 64 lanes, exceeding the 8-word register.
+        // So pack_vector is for conceptual 512-bit. Let's use pack_half instead.
+        let mut src = [0u32; 8];
+        let vals: Vec<i64> = (0..32).map(|i| (i * 3 % 256) as i64).collect();
+        insert_lanes(&mut src, &vals, 8);
+
+        let result = pack_half(&src, 8, 4, false, PackMode::Truncate);
+
+        for (i, &v) in vals.iter().enumerate() {
+            let got = extract_lane(&result, i, 4, false);
+            assert_eq!(got, v & 0xF, "lane {} mismatch", i);
+        }
+    }
+
     // -- pack then unpack roundtrip --
 
     #[test]
