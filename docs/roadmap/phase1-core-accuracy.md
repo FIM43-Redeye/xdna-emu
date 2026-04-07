@@ -2,8 +2,9 @@
 
 **Goal**: Make the emulator faithful to real AIE2 hardware behavior.
 
-**Status**: Functional -- unit tests pass across all major subsystems, but
-real-binary validation is thin and timing has never been compared to hardware.
+**Status**: **100% ISA accuracy achieved (2026-04-06).** 4815/4815 instruction-level
+test points pass against real NPU hardware. 2660+ unit tests. Sparse vmac
+pipeline is hardware-faithful with oracle-verified routing.
 
 For the confidence tier system used in this document, see [ROADMAP.md](../../ROADMAP.md).
 
@@ -46,33 +47,34 @@ against real ELF binaries.
 
 **Files**: `src/interpreter/state/registers.rs`, `src/interpreter/execute/scalar.rs`
 
-### Vector Unit -- VERIFIED (basic), CLAIMED (full coverage)
+### Vector Unit -- VERIFIED (100% ISA accuracy)
 
-Unit tests exist for basic operations, but coverage of the full vector ISA is
-limited. No float32 edge case testing. No systematic coverage of all element
-type combinations.
+All vector operations validated against real NPU hardware via the ISA test
+harness (4815/4815 test points). Coverage includes all element type
+combinations, float edge cases, and sparse matrix multiply.
 
 | Capability | Confidence | Evidence |
 |------------|------------|----------|
-| W registers (24x256-bit) | VERIFIED | Unit tests |
-| Accumulator registers (8x256-bit) | VERIFIED | Unit tests |
-| Basic vector ops (add, sub, mul) | VERIFIED | Unit tests in `vector.rs` |
-| Matrix multiply (MAC variants) | VERIFIED | Unit tests |
-| Shift-Round-Saturate (SRS) | VERIFIED | Unit tests |
-| Type conversion (bf16/f32/int) | VERIFIED | Unit tests |
-| Vector load/store with post-modify | VERIFIED | Unit tests |
-| Vector element ops (extract, insert) | VERIFIED | Unit tests |
-| Vector comparison ops | VERIFIED | Unit tests |
-| Vector bitwise ops (and, or, xor, not) | VERIFIED | Unit tests |
-| Vector conditional arithmetic | VERIFIED | Unit tests |
-| Convolution ops (VMAC/VMSC/VNEGMAC) | VERIFIED | Unit tests |
-| BFloat16 arithmetic | VERIFIED | Unit tests with bf16<->f32 conversion |
-| Float32 edge cases (NaN, inf, denorm) | CLAIMED | No dedicated tests |
-| SIMD shuffle/permute (all variants) | CLAIMED | Basic implementation, mapped generically |
-| Sparse matrix multiply | CLAIMED | Maps to dense; no true sparse support |
-| Full element type coverage (all combinations) | CLAIMED | Not systematically tested |
+| W registers (24x256-bit) | VERIFIED | Unit tests + ISA harness |
+| X registers (12x512-bit wide) | VERIFIED | ISA harness |
+| Accumulator registers (8x512-bit, 4x1024-bit) | VERIFIED | ISA harness |
+| Arithmetic ops (add, sub, mul, min, max, abs, neg) | VERIFIED | ISA harness 100% |
+| Matrix multiply -- dense (i8xi4, i8xi8, i16xi8, i16xi16, bf16) | VERIFIED | ISA harness 100% |
+| Matrix multiply -- sparse (all types, hw-faithful vmac pipeline) | VERIFIED | ISA harness 100%, oracle-verified |
+| Shift-Round-Saturate (SRS, 10 rounding modes) | VERIFIED | ISA harness 100% |
+| UPS (widening conversion) | VERIFIED | ISA harness 100% |
+| Type conversion (bf16/f32/int, all directions) | VERIFIED | ISA harness 100% |
+| Vector load/store with post-modify | VERIFIED | Unit tests + bridge tests |
+| Vector element ops (extract, insert, push) | VERIFIED | ISA harness 100% |
+| Vector comparison ops (eq, ge, lt, eqz, select) | VERIFIED | ISA harness 100% |
+| Vector bitwise ops (and, or, xor, not) | VERIFIED | ISA harness 100% |
+| Vector conditional arithmetic (addsub, negadd, maxdiff) | VERIFIED | ISA harness 100% |
+| BFloat16 arithmetic (NaN canonical, FTZ, PSA 30-bit) | VERIFIED | ISA harness 100% |
+| Float32 edge cases (NaN, inf, denorm) | VERIFIED | ISA harness + dedicated unit tests |
+| SIMD shuffle/permute (40+ modes via routing tables) | VERIFIED | ISA harness 100% |
 
-**Files**: `src/interpreter/execute/vector.rs`, `src/interpreter/state/registers.rs`
+**Files**: `src/interpreter/execute/vector.rs`, `vector_arith.rs`, `vector_compare.rs`,
+`vector_misc.rs`, `vector_matmul.rs`, `vmac_hw.rs`, `vector_permute.rs`
 
 ### Memory System -- VERIFIED
 

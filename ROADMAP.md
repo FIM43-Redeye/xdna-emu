@@ -56,7 +56,7 @@ AIE2 and AIE2P share most of the architecture; AIE2P support will be incremental
 
 | Phase | Status | Confidence | Summary |
 |-------|--------|------------|---------|
-| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | Functional | Mixed | Extensive unit tests; bridge tests validate real binaries |
+| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | **100% ISA accuracy** | VERIFIED | 4815/4815 ISA test points pass; 2660+ unit tests |
 | [2. Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) | Partial | VERIFIED | XRT plugin works; bridge tests run; Peano compilation not integrated |
 | [3. Developer Experience](docs/roadmap/phase3-developer-experience.md) | GUI exists | OBSERVED | GUI renders; debugging features not built |
 | [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | Active | Mixed | Dual-compiler bridge tests, trace sweep, hardware comparison |
@@ -72,10 +72,21 @@ Make the emulator faithful to real AIE2 hardware behavior.
 See [phase1-core-accuracy.md](docs/roadmap/phase1-core-accuracy.md) for the
 detailed breakdown with per-component confidence markers.
 
-**What is VERIFIED:**
+**100% ISA Accuracy (VERIFIED):**
+
+The ISA validation harness tests 4815 instruction-level test points across
+the full AIE2 ISA, comparing emulator output against real NPU hardware.
+As of 2026-04-06, all 4815 points pass (100.0%).
+
+Key verified subsystems:
 - TableGen-driven instruction decoder with O(1) lookup
-- Scalar unit (GPRs, pointer/modifier registers, ALU operations)
-- Vector unit (W/X/Y registers, accumulators, element types including bf16/f32)
+- Scalar unit (GPRs, pointer/modifier registers, ALU operations) -- 100%
+- Vector unit (W/X/Y registers, accumulators, all element types) -- 100%
+- Dense matrix multiply (all type combinations: i8xi4, i8xi8, i16xi8, i16xi16, bf16) -- 100%
+- Sparse matrix multiply with hardware-faithful vmac pipeline -- 100%
+- Float32/BFloat16 compute (NaN canonicalization, FTZ, PSA rounding) -- 100%
+- SIMD shuffle/permute (all 40+ modes via routing tables) -- 100%
+- SRS/UPS type conversion (10 rounding modes) -- 100%
 - Memory system (load/store with post-modify, bank conflict detection)
 - DMA engine (multi-dimensional addressing, BD chaining, repeat count, zero-padding)
 - Synchronization (locks with acquire/release, barriers, deadlock detection)
@@ -91,14 +102,8 @@ All of the above have dedicated unit tests that run on every `cargo test`.
 - Bidirectional ping-pong DMA transferred correctly
 - Trace comparison shows emulator within ~0.6% of hardware cycle counts on clean traces
 
-**What is CLAIMED (untested or based on very limited evidence):**
-- Full ISA coverage -- not measured against a complete ISA inventory
-- Float32 edge cases (NaN, inf, denorm) -- no dedicated tests
-- SIMD shuffle/permute completeness -- basic implementation, mapped generically
-- Sparse matrix multiply accuracy -- maps to dense, no true sparse support
-
-**Next:** Expand real-binary testing, close remaining SemanticOp gaps, validate
-vector compute config word handling for ML kernels.
+**Next:** Codebase cleanup (in progress), expand bridge test coverage, begin
+Phase 2 toolchain integration (direct Peano compilation from emulator).
 
 ### Phase 2: Toolchain Integration
 

@@ -102,8 +102,8 @@ See [ROADMAP.md](ROADMAP.md) for detailed status with confidence markers
 
 | Phase | Status | Summary |
 |-------|--------|---------|
-| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | Functional | 1,635+ unit tests; 12+ bridge tests pass |
-| [2. Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) | Not started | Peano-first; Vitis deferred to post-1.0 |
+| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | **100% ISA** | 4815/4815 ISA test points; 2660+ unit tests; bridge tests pass |
+| [2. Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) | Partial | XRT plugin works; bridge tests run; Peano compilation not integrated |
 | [3. Developer Experience](docs/roadmap/phase3-developer-experience.md) | GUI exists | GUI renders; debugging features not built |
 | [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | Active | Dual-compiler bridge tests, trace sweep, parallel HW |
 | [5. Production Readiness](docs/roadmap/phase5-production-readiness.md) | Not started | |

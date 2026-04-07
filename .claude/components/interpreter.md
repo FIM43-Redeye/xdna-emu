@@ -52,10 +52,24 @@ Execution units implementing instruction semantics.
 |------|---------|
 | `mod.rs` | Module re-exports |
 | `scalar.rs` | `ScalarAlu` -- GPR operations, ALU, comparisons |
-| `vector.rs` | `VectorAlu` -- SIMD operations, element types, accumulators |
+| `vector.rs` | `VectorAlu` -- dispatch, helpers, SRS/UPS, accumulator ops, wide bridges |
+| `vector_arith.rs` | Arithmetic ops (add, sub, mul, min, max, shifts, negate, abs, floor) |
+| `vector_compare.rs` | Comparison ops (eq, ge, lt, eqz, select) |
+| `vector_misc.rs` | Misc ops (shuffle, broadcast, extract, insert, align, bitwise) |
+| `vector_matmul.rs` | Dense and sparse matrix multiply (config-driven, all type combos) |
+| `vector_matmul_sparse.rs` | Sparse matmul helpers |
+| `vmac_hw.rs` | Hardware-faithful sparse vmac pipeline (oracle-verified crossbar routing) |
+| `vector_permute.rs` | VSHUFFLE routing tables (40+ modes) |
+| `vector_srs.rs` | Shift-Round-Saturate (10 rounding modes) |
+| `vector_ups.rs` | UPS widening conversion |
+| `vector_pack.rs` | Pack/unpack operations |
+| `vector_float.rs` | Float32/BFloat16 compute helpers (NaN, FTZ, PSA) |
+| `vector_config.rs` | MAC configuration word parsing and geometry tables |
+| `vector_semantic.rs` | SemanticOp-based vector dispatch |
 | `memory.rs` | `MemoryUnit` -- load/store with post-modify addressing |
 | `control.rs` | `ControlUnit` -- branches, calls, loops, delay slots |
 | `stream.rs` | Stream put/get instruction execution |
+| `cascade.rs` | Cascade stream operations |
 | `semantic.rs` | `SemanticOp`-based execution dispatch |
 | `cycle_accurate.rs` | `CycleAccurateExecutor` -- full pipeline model with timing |
 
