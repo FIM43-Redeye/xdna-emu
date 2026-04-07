@@ -8,3 +8,9 @@
 pub use xdna_archspec::device_model;
 pub use xdna_archspec::regdb_extractor;
 pub use xdna_archspec::types;
+
+// Flatten the most-used types so consumers can write
+// `use crate::archspec::{TileKind, SubsystemKind}` directly.
+pub use xdna_archspec::types::{
+    ArchModel, ModuleKind, SubsystemKind, TileKind,
+};

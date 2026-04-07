@@ -37,7 +37,7 @@ use super::registers::TileAddress;
 use super::registers::{subsystem_from_offset, tile_kind_from_row};
 use super::tile::{Tile, TileType};
 use super::regdb;
-use crate::archspec::types::{SubsystemKind, TileKind};
+use crate::archspec::{SubsystemKind, TileKind};
 use crate::parser::cdo::{Cdo, CdoCommand};
 
 /// Sign-extend a lock value from a register u32 to i8.

@@ -17,7 +17,7 @@
 //! parser. All runtime consumers now use `arch_config.rs` (which uses archspec
 //! directly) or the compile-time `crate::arch::*` constants.
 
-use xdna_archspec::types::ArchModel;
+use crate::archspec::ArchModel;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -55,7 +55,7 @@ impl std::error::Error for DeviceModelError {}
 /// Mismatches are collected and returned together rather than panicking on
 /// the first one.
 pub fn validate_against_spec(model: &ArchModel) -> Result<(), DeviceModelError> {
-    use xdna_archspec::types::TileKind;
+    use crate::archspec::TileKind;
     let mut mismatches = Vec::new();
 
     // Compare as i64 to handle mixed integer widths from archspec types
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn npu1_tile_type_banks() {
-        use xdna_archspec::types::TileKind;
+        use crate::archspec::TileKind;
 
         let model = extract_device_model(&json_path(), "npu1").expect("parse failed");
 
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn npu1_tile_types() {
-        use xdna_archspec::types::TileKind;
+        use crate::archspec::TileKind;
 
         let model = extract_device_model(&json_path(), "npu1").expect("parse failed");
 
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn npu1_stream_switch_ports() {
-        use xdna_archspec::types::TileKind;
+        use crate::archspec::TileKind;
 
         let model = extract_device_model(&json_path(), "npu1").expect("parse failed");
 
@@ -371,7 +371,7 @@ mod tests {
             assert_eq!(topo.rows, 6, "{} rows", name);
 
             // All variants share the same local memory size.
-            use xdna_archspec::types::TileKind;
+            use crate::archspec::TileKind;
             let core = dev.tile_types.iter().find(|t| t.kind == TileKind::Compute).expect("no core");
             let mem_size = core.memory.as_ref().expect("no memory").size_bytes;
             assert_eq!(mem_size, 65536, "{} local memory", name);

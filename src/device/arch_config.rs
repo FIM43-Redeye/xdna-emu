@@ -195,7 +195,7 @@ pub struct ModelConfig {
 /// Uses the same `xdna_archspec::device_model` parser that build.rs uses for
 /// npu1 at compile time, so the JSON is only ever parsed by one code path.
 /// Keyed by device name (e.g. "npu2").
-pub(crate) static ARCHSPEC_MODELS: LazyLock<std::collections::HashMap<String, xdna_archspec::types::ArchModel>> =
+pub(crate) static ARCHSPEC_MODELS: LazyLock<std::collections::HashMap<String, crate::archspec::ArchModel>> =
     LazyLock::new(|| {
         let json_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tools/aie-device-models.json");
@@ -208,7 +208,7 @@ pub(crate) static ARCHSPEC_MODELS: LazyLock<std::collections::HashMap<String, xd
     });
 
 impl ModelConfig {
-    /// Create a ModelConfig from an `xdna_archspec::types::ArchModel`.
+    /// Create a ModelConfig from an `crate::archspec::ArchModel`.
     ///
     /// This is the single conversion path from the archspec JSON data (whether
     /// loaded at build time or runtime) into the emulator's `ArchConfig`.
@@ -217,8 +217,8 @@ impl ModelConfig {
     /// where column 0 is the leftmost shim column. mlir-aie counts only
     /// "compute columns" (e.g. 4 for NPU1), while the emulator uses 5
     /// (columns 0-4).
-    pub fn from_arch_model(model: &xdna_archspec::types::ArchModel, arch_name: &'static str) -> Self {
-        use xdna_archspec::types::TileKind;
+    pub fn from_arch_model(model: &crate::archspec::ArchModel, arch_name: &'static str) -> Self {
+        use crate::archspec::TileKind;
 
         // Helper: extract DMA slave/master counts from a tile's port list.
         // Shim tiles use shim_mux_ports; others use switchbox_ports.

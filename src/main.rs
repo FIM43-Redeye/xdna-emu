@@ -8,7 +8,7 @@ use xdna_emu::parser::xclbin::SectionKind;
 use xdna_emu::parser::cdo::{find_cdo_offset, CdoCommand};
 use xdna_emu::device::{TileAddress, RegisterInfo, DeviceState};
 use xdna_emu::device::registers::{subsystem_from_offset, tile_kind_from_row};
-use xdna_emu::archspec::types::SubsystemKind;
+use xdna_emu::archspec::SubsystemKind;
 use xdna_emu::testing::XclbinSuite;
 
 fn main() -> anyhow::Result<()> {

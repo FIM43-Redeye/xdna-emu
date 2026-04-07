@@ -18,7 +18,7 @@
 //! ```
 
 use std::fmt;
-use crate::archspec::types::SubsystemKind;
+use crate::archspec::{SubsystemKind, TileKind};
 
 /// Decoded tile address with column, row, and register offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +74,7 @@ pub struct RegisterInfo {
     /// Brief description
     pub description: &'static str,
     /// Which subsystem this belongs to
-    pub module: crate::archspec::types::SubsystemKind,
+    pub module: SubsystemKind,
 }
 
 impl RegisterInfo {
@@ -410,11 +410,11 @@ pub fn decode_register(addr: u32) -> (TileAddress, Option<RegisterInfo>) {
 /// that don't match any more specific subsystem.
 pub fn subsystem_from_offset(
     offset: u32,
-    tile_kind: crate::archspec::types::TileKind,
-) -> crate::archspec::types::SubsystemKind {
+    tile_kind: TileKind,
+) -> SubsystemKind {
     use crate::arch;
     use crate::arch::subsystem;
-    use crate::archspec::types::{SubsystemKind, TileKind};
+
 
     // Strategy: check most-specific (smallest) ranges first, then broader
     // encompassing ranges. Within overlapping clusters, the order is:
@@ -607,8 +607,8 @@ fn in_range(offset: u32, start: u32, end: u32) -> bool {
 /// - Row 0: ShimNoc
 /// - Rows 1..COMPUTE_ROW_START: Mem (memtile)
 /// - Rows >= COMPUTE_ROW_START: Compute
-pub fn tile_kind_from_row(row: u8) -> crate::archspec::types::TileKind {
-    use crate::archspec::types::TileKind;
+pub fn tile_kind_from_row(row: u8) -> TileKind {
+    use TileKind;
     if row == crate::arch::SHIM_ROW {
         TileKind::ShimNoc
     } else if row < crate::arch::COMPUTE_ROW_START {
@@ -669,7 +669,7 @@ mod tests {
 
     #[test]
     fn test_lookup_core_control() {
-        use crate::archspec::types::SubsystemKind;
+        use SubsystemKind;
         let info = RegisterInfo::lookup_aie2(0x32000).unwrap();
         assert_eq!(info.name, "CORE_CONTROL");
         assert_eq!(info.module, SubsystemKind::Processor);
@@ -733,7 +733,7 @@ mod tests {
 
     #[test]
     fn test_subsystem_from_offset_compute_primary() {
-        use crate::archspec::types::{SubsystemKind, TileKind};
+    
 
         // Data memory: full 64KB SRAM range
         assert_eq!(subsystem_from_offset(0x00000, TileKind::Compute), SubsystemKind::DataMemory);
@@ -769,7 +769,7 @@ mod tests {
 
     #[test]
     fn test_subsystem_from_offset_compute_secondary() {
-        use crate::archspec::types::{SubsystemKind, TileKind};
+    
 
         // Memory module performance counters
         assert_eq!(subsystem_from_offset(0x11000, TileKind::Compute), SubsystemKind::Performance);
@@ -793,7 +793,7 @@ mod tests {
 
     #[test]
     fn test_subsystem_from_offset_compute_unknown() {
-        use crate::archspec::types::{SubsystemKind, TileKind};
+    
 
         // Gap between data memory (0x10000) and performance (0x11000)
         assert_eq!(subsystem_from_offset(0x10800, TileKind::Compute), SubsystemKind::Unknown);
@@ -803,7 +803,7 @@ mod tests {
 
     #[test]
     fn test_subsystem_from_offset_memtile() {
-        use crate::archspec::types::{SubsystemKind, TileKind};
+    
 
         // Data memory: full 512KB SRAM range
         assert_eq!(subsystem_from_offset(0x00000, TileKind::Mem), SubsystemKind::DataMemory);
@@ -833,7 +833,7 @@ mod tests {
 
     #[test]
     fn test_subsystem_from_offset_shim() {
-        use crate::archspec::types::{SubsystemKind, TileKind};
+    
 
         // DMA
         assert_eq!(subsystem_from_offset(0x1D000, TileKind::ShimNoc), SubsystemKind::Dma);
@@ -863,7 +863,7 @@ mod tests {
 
     #[test]
     fn test_subsystem_from_offset_tile_sensitivity() {
-        use crate::archspec::types::{SubsystemKind, TileKind};
+    
 
         // Same offset (0x1D000) is DMA on both compute and shim
         assert_eq!(subsystem_from_offset(0x1D000, TileKind::Compute), SubsystemKind::Dma);
