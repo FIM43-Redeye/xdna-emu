@@ -49,6 +49,36 @@ impl VectorAlu {
         log::trace!("[VECTOR_ALU] Checking semantic={:?} element_type={:?} dest={:?}",
             semantic, op.element_type, op.dest);
 
+        // --- Extracted operations: dispatch directly, bypass half/wide routing ---
+        match semantic {
+            SemanticOp::Add => return Self::execute_add(op, ctx, et),
+            SemanticOp::Sub => return Self::execute_binary_elementwise(op, ctx, et, Self::vector_sub),
+            SemanticOp::Mul => return Self::execute_binary_elementwise(op, ctx, et, Self::vector_mul),
+            SemanticOp::Min => return Self::execute_binary_elementwise(op, ctx, et, Self::vector_min),
+            SemanticOp::Max => return Self::execute_binary_elementwise(op, ctx, et, Self::vector_max),
+            SemanticOp::Neg => return Self::execute_neg(op, ctx, et),
+            SemanticOp::Shl => return Self::execute_shl(op, ctx, et),
+            SemanticOp::Srl => return Self::execute_srl(op, ctx, et),
+            SemanticOp::Sra => return Self::execute_sra(op, ctx, et),
+            SemanticOp::AbsGtz => return Self::execute_abs_gtz(op, ctx, et),
+            SemanticOp::NegGtz => return Self::execute_neg_gtz(op, ctx, et),
+            SemanticOp::NegLtz => return Self::execute_neg_ltz(op, ctx, et),
+            SemanticOp::SubLt => return Self::execute_sub_lt(op, ctx, et),
+            SemanticOp::SubGe => return Self::execute_sub_ge(op, ctx, et),
+            SemanticOp::MaxDiffLt => return Self::execute_maxdiff_lt(op, ctx, et),
+            SemanticOp::Accumulate | SemanticOp::AccumSub
+            | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub
+            | SemanticOp::NegAdd => return Self::execute_accumulate(op, ctx, et, semantic),
+            SemanticOp::Cmp => return Self::execute_cmp(op, ctx, et),
+            SemanticOp::SetGe => return Self::execute_setge(op, ctx, et),
+            SemanticOp::SetLt => return Self::execute_setlt(op, ctx, et),
+            SemanticOp::SetEq => return Self::execute_seteq(op, ctx, et),
+            SemanticOp::MaxLt => return Self::execute_maxlt(op, ctx, et),
+            SemanticOp::MinGe => return Self::execute_minge(op, ctx, et),
+            SemanticOp::VectorSelect => return Self::execute_select(op, ctx, et),
+            _ => {}
+        }
+
         // Determine if this needs full-width (1024-bit) processing:
         // 1. is_wide_vector: instruction has Vector512 operands (x-registers)
         // 2. AccumReg-only ops (VADD, VSUB, VNEG) that use cm-class (Full)

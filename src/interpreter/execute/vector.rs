@@ -50,48 +50,7 @@ impl VectorAlu {
         match semantic {
             // ========== Arithmetic ==========
 
-            SemanticOp::Add => {
-                // Two variants:
-                // 1. VADD_elem: simple vector add (2 sources)
-                // 2. VADDSUB: conditional add/subtract (2 vector + 1 scalar source)
-                //    vaddsub.8 $d, $s1, $s2, $sel
-                //    d[i] = (sel[i] & 1) ? s1[i] - s2[i] : s1[i] + s2[i]
-                //    sel is a SCALAR register (bitmask), not a vector.
-                let has_scalar_sel = op.sources.iter()
-                    .any(|s| matches!(s, Operand::ScalarReg(_)))
-                    && op.sources.iter()
-                        .filter(|s| matches!(s, Operand::VectorReg(_)))
-                        .count() == 2;
-
-                if has_scalar_sel {
-                    let s1 = Self::get_vector_source(op, ctx, 0);
-                    let s2 = Self::get_vector_source(op, ctx, 1);
-                    // Read the scalar selector bitmask
-                    let sel_scalar = Self::get_nth_scalar_source(op, ctx, 0);
-                    let sel = Self::expand_select_mask(sel_scalar, et);
-                    let result = Self::vector_addsub(&s1, &s2, &sel, et);
-                    Self::write_vector_dest(op, ctx, result);
-                } else {
-                    let (a, b) = Self::get_two_vector_sources(op, ctx);
-                    let result = Self::vector_add(&a, &b, et);
-                    Self::write_vector_dest(op, ctx, result);
-                }
-                true
-            }
-
-            SemanticOp::Sub => {
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_sub(&a, &b, et);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
-
-            SemanticOp::Mul => {
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_mul(&a, &b, et);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
+            // Add, Sub, Mul, Min, Max: extracted to vector_dispatch.rs
 
             SemanticOp::Mac | SemanticOp::MatMul | SemanticOp::MatMulSub
             | SemanticOp::NegMul | SemanticOp::NegMatMul
@@ -99,29 +58,7 @@ impl VectorAlu {
                 return super::vector_matmul::execute_matmul(op, ctx);
             }
 
-            SemanticOp::Min => {
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_min(&a, &b, et);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
-
-            SemanticOp::Max => {
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_max(&a, &b, et);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
-
-            SemanticOp::Neg => {
-                // Vector negate: vneg $d, $s1 -- per-element negate.
-                // AccumReg-only Neg ops are routed to execute_wide which
-                // calls execute_acc_negate, so this arm only sees vector ops.
-                let src = Self::get_vector_source(op, ctx, 0);
-                let result = Self::vector_negate(&src, et);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
+            // Neg: extracted to vector_arith.rs
 
             // ========== Shuffle/Pack/Unpack ==========
 
@@ -148,62 +85,7 @@ impl VectorAlu {
                 true
             }
 
-            // ========== Comparison ==========
-
-            SemanticOp::Cmp => {
-                // Vector compare equal
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_cmp_eq(&a, &b, et);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
-
-            SemanticOp::SetGe => {
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_compare_ge(&a, &b, et);
-                Self::write_vector_dest(op, ctx, result);
-                // cmp = packed bitmask of the same comparison
-                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&result, et));
-                true
-            }
-
-            SemanticOp::SetLt => {
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_compare_lt(&a, &b, et);
-                Self::write_vector_dest(op, ctx, result);
-                // cmp = packed bitmask of the same comparison
-                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&result, et));
-                true
-            }
-
-            SemanticOp::SetEq => {
-                // Vector equal-to-zero (VEQZ): produces a comparison bitmask
-                // written to scalar cmp register(s), not a vector result.
-                let src = Self::get_vector_source(op, ctx, 0);
-                let result = Self::vector_compare_eqz(&src, et);
-                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&result, et));
-                true
-            }
-
-            SemanticOp::MaxLt => {
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_max(&a, &b, et);
-                Self::write_vector_dest(op, ctx, result);
-                // cmp = per-element (a < b)
-                let cmp = Self::vector_compare_lt(&a, &b, et);
-                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
-                true
-            }
-
-            SemanticOp::MinGe => {
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_min(&a, &b, et);
-                Self::write_vector_dest(op, ctx, result);
-                // cmp = per-element (a >= b)
-                let cmp = Self::vector_compare_ge(&a, &b, et);
-                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
-                true
-            }
+            // Comparison ops (Cmp, SetGe, SetLt, SetEq, MaxLt, MinGe): extracted to vector_compare.rs
 
             // ========== SRS/UPS/Convert ==========
 
@@ -295,37 +177,7 @@ impl VectorAlu {
                 true
             }
 
-            SemanticOp::VectorSelect => {
-                // VSEL.32 d, s1, s2, sel: per-lane conditional select.
-                // input_order is [s1, s2, sel] where sel is a scalar register
-                // whose bits control per-element selection.
-                //
-                // Hardware semantics (aietools aie_api select documentation):
-                //   d[i] = (sel >> i) & 1 == 0 ? s1[i] : s2[i]
-                //
-                // When sel bit is 0: take from s1 (first vector source).
-                // When sel bit is 1: take from s2 (second vector source).
-                let s1 = Self::get_vector_source(op, ctx, 0);
-                let s2 = Self::get_vector_source(op, ctx, 1);
-                // Read the scalar select mask from the last source operand
-                let sel_scalar = op.sources.get(2).map(|s| match s {
-                    Operand::ScalarReg(r) => ctx.scalar.read(*r),
-                    Operand::Immediate(v) => *v as u32,
-                    _ => Self::get_scalar_source(op, ctx),
-                }).unwrap_or(0);
-                // Expand scalar mask to per-lane vector mask.
-                let sel = Self::expand_select_mask(sel_scalar, et);
-                // vector_select does: mask != 0 ? arg1 : arg2
-                // Hardware wants: mask != 0 ? s2 : s1
-                // So pass s2 as arg1 and s1 as arg2.
-                let result = Self::vector_select(&sel, &s2, &s1, et);
-                log::debug!(
-                    "[VSEL] sel_scalar=0x{:X} sel={:?} s1={:?} s2={:?} -> {:?} (sources={:?}, dest={:?})",
-                    sel_scalar, sel, s1, s2, result, op.sources, op.dest
-                );
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
+            // VectorSelect: extracted to vector_compare.rs
 
             SemanticOp::VectorClear => {
                 Self::write_vector_dest(op, ctx, [0u32; 8]);
@@ -369,28 +221,7 @@ impl VectorAlu {
                 true
             }
 
-            // ========== Shift Operations ==========
-
-            SemanticOp::Shl => {
-                let (a, shift) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_shift_left(&a, &shift, et);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
-
-            SemanticOp::Srl => {
-                let (a, shift) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_shift_right_logical(&a, &shift, et);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
-
-            SemanticOp::Sra => {
-                let (a, shift) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_shift_right_arith(&a, &shift, et);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
+            // Shl, Srl, Sra: extracted to vector_arith.rs
 
             SemanticOp::Align => {
                 // Concatenate two vectors and shift
@@ -401,79 +232,8 @@ impl VectorAlu {
                 true
             }
 
-            // ========== Conditional Vector Operations ==========
-
-            SemanticOp::AbsGtz => {
-                let src = Self::get_vector_source(op, ctx, 0);
-                let result = Self::vector_abs_gtz(&src, et);
-                Self::write_vector_dest(op, ctx, result);
-                // cmp = per-element (s > 0)
-                let zero = [0u32; 8];
-                let cmp = Self::vector_compare_lt(&zero, &src, et); // 0 < s  =>  s > 0
-                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
-                true
-            }
-
-            SemanticOp::NegGtz => {
-                let vec_source_count = op.sources.iter()
-                    .filter(|s| matches!(s, Operand::VectorReg(_)))
-                    .count();
-
-                let src = if vec_source_count >= 2 {
-                    let cond = Self::get_vector_source(op, ctx, 0);
-                    let s1 = Self::get_vector_source(op, ctx, 1);
-                    let result = Self::vector_bneg_gtz(&cond, &s1, et);
-                    Self::write_vector_dest(op, ctx, result);
-                    s1
-                } else {
-                    let src = Self::get_vector_source(op, ctx, 0);
-                    let result = Self::vector_neg_gtz(&src, et);
-                    Self::write_vector_dest(op, ctx, result);
-                    src
-                };
-                // cmp = per-element (s > 0)
-                let zero = [0u32; 8];
-                let cmp = Self::vector_compare_lt(&zero, &src, et);
-                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
-                true
-            }
-
-            SemanticOp::NegLtz => {
-                let src = Self::get_vector_source(op, ctx, 0);
-                let result = Self::vector_neg_ltz(&src, et);
-                Self::write_vector_dest(op, ctx, result);
-                // cmp = per-element (s < 0)
-                let zero = [0u32; 8];
-                let cmp = Self::vector_compare_lt(&src, &zero, et);
-                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
-                true
-            }
-
-            SemanticOp::Accumulate | SemanticOp::AccumSub
-            | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub
-            | SemanticOp::NegAdd => {
-                // VADD/VSUB/VNEGADD/VNEGSUB: add/subtract two accumulator
-                // registers. Format: `vadd $dst, $acc1, $acc2, $config`.
-                //
-                // Check if sources contain AccumReg (acc-to-acc operation)
-                // or VectorReg (legacy vector accumulate / regular NegAdd).
-                let has_acc_source = op.sources.iter().any(|s| matches!(s, Operand::AccumReg(_)));
-
-                if has_acc_source {
-                    Self::execute_acc_add_sub(op, ctx);
-                } else if matches!(semantic, SemanticOp::NegAdd) {
-                    // Regular vector negate-add (no accumulator involvement).
-                    let (a, b) = Self::get_two_vector_sources(op, ctx);
-                    let result = Self::vector_neg_add(&a, &b, et);
-                    Self::write_vector_dest(op, ctx, result);
-                } else {
-                    // Legacy: accumulate a vector source into an accumulator.
-                    let src = Self::get_vector_source(op, ctx, 0);
-                    let acc_reg = Self::get_acc_dest(op);
-                    Self::vector_accumulate(ctx, acc_reg, &src, et);
-                }
-                true
-            }
+            // AbsGtz, NegGtz, NegLtz, Accumulate/AccumSub/AccumNegAdd/AccumNegSub/NegAdd:
+            // extracted to vector_arith.rs
 
             // ========== Bitwise Operations ==========
 
@@ -505,37 +265,7 @@ impl VectorAlu {
                 true
             }
 
-            // ========== Conditional Arithmetic ==========
-
-            SemanticOp::SubLt => {
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_sub_lt(&a, &b, et);
-                Self::write_vector_dest(op, ctx, result);
-                // cmp = per-element (a < b)
-                let cmp = Self::vector_compare_lt(&a, &b, et);
-                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
-                true
-            }
-
-            SemanticOp::SubGe => {
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_sub_ge(&a, &b, et);
-                Self::write_vector_dest(op, ctx, result);
-                // cmp = per-element (a >= b)
-                let cmp = Self::vector_compare_ge(&a, &b, et);
-                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
-                true
-            }
-
-            SemanticOp::MaxDiffLt => {
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_maxdiff_lt(&a, &b, et);
-                Self::write_vector_dest(op, ctx, result);
-                // cmp = per-element (a < b)
-                let cmp = Self::vector_compare_lt(&a, &b, et);
-                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
-                true
-            }
+            // SubLt, SubGe, MaxDiffLt: extracted to vector_arith.rs
 
             _ => false, // Not a vector operation handled here
         }
@@ -558,7 +288,7 @@ impl VectorAlu {
     /// - vsub:    dst = acc1 - acc2
     /// - vnegadd: dst = -acc1 + acc2
     /// - vnegsub: dst = -acc1 - acc2
-    fn execute_acc_add_sub(op: &SlotOp, ctx: &mut ExecutionContext) {
+    pub(super) fn execute_acc_add_sub(op: &SlotOp, ctx: &mut ExecutionContext) {
         // Collect the two AccumReg source indices.
         let mut acc_sources: Vec<u8> = Vec::new();
         for src in &op.sources {
@@ -731,7 +461,7 @@ impl VectorAlu {
     /// The config word controls zero_acc (zero the source before negation,
     /// producing 0). Float mode is detected from element_type (Float32/BFloat16):
     /// each u64 lane holds two fp32 values (bits [31:0] and bits [63:32]).
-    fn execute_acc_negate(op: &SlotOp, ctx: &mut ExecutionContext) {
+    pub(super) fn execute_acc_negate(op: &SlotOp, ctx: &mut ExecutionContext) {
         let acc_reg = op.sources.iter().find_map(|s| match s {
             Operand::AccumReg(r) => Some(*r),
             _ => None,
@@ -1092,128 +822,10 @@ impl VectorAlu {
         et: ElementType,
     ) -> bool {
         match semantic {
-            // ========== Element-wise arithmetic (bridge) ==========
-            SemanticOp::Add => {
-                // Check for VADDSUB: 2 vector sources + 1 scalar selector.
-                let has_scalar_sel = op.sources.iter()
-                    .any(|s| matches!(s, Operand::ScalarReg(_)))
-                    && op.sources.iter()
-                        .filter(|s| matches!(s, Operand::VectorReg(_)))
-                        .count() == 2;
-                if has_scalar_sel {
-                    // VADDSUB: read full 512-bit sources and scalar selector.
-                    let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                    let sel_scalar = Self::get_nth_scalar_source(op, ctx, 0);
-                    // Split wide vectors into lo/hi halves for per-half processing.
-                    let a_lo: [u32; 8] = a[..8].try_into().unwrap();
-                    let a_hi: [u32; 8] = a[8..].try_into().unwrap();
-                    let b_lo: [u32; 8] = b[..8].try_into().unwrap();
-                    let b_hi: [u32; 8] = b[8..].try_into().unwrap();
-                    // Expand selector bits: lo half uses lower bits, hi uses upper.
-                    // For 8-bit elements (32 per half), the selector is a 64-bit
-                    // register pair (eL class: l_n = {r(16+2n), r(16+2n+1)}).
-                    // LLVM decodes this as a single ScalarReg for the even register;
-                    // we read reg+1 for the upper 32 bits.
-                    let elems_per_half = 256 / et.bits() as u32;
-                    let sel_lo = Self::expand_select_mask(sel_scalar, et);
-                    let sel_hi_bits = if elems_per_half >= 32 {
-                        // 8-bit: 64-bit selector, upper 32 bits in the next register
-                        let sel_reg = op.sources.iter().find_map(|s| {
-                            if let Operand::ScalarReg(r) = s { Some(*r) } else { None }
-                        }).unwrap_or(0);
-                        ctx.scalar.read(sel_reg + 1)
-                    } else {
-                        sel_scalar >> elems_per_half
-                    };
-                    let sel_hi = Self::expand_select_mask(sel_hi_bits, et);
-                    let lo = Self::vector_addsub(&a_lo, &b_lo, &sel_lo, et);
-                    let hi = Self::vector_addsub(&a_hi, &b_hi, &sel_hi, et);
-                    let mut result = [0u32; 16];
-                    result[..8].copy_from_slice(&lo);
-                    result[8..].copy_from_slice(&hi);
-                    Self::write_wide_vec_dest(op, ctx, result);
-                    return true;
-                }
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_add);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-            SemanticOp::Sub => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_sub);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-            SemanticOp::Mul => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_mul);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-            SemanticOp::Min => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_min);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-            SemanticOp::Max => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_max);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-            SemanticOp::VectorSelect => {
-                // VSEL: 512-bit select with scalar bitmask.
-                // Must split the selector across lo/hi halves.
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let sel_scalar = op.sources.iter().find_map(|s| match s {
-                    Operand::ScalarReg(r) => Some(ctx.scalar.read(*r)),
-                    _ => None,
-                }).unwrap_or(0);
-                let a_lo: [u32; 8] = a[..8].try_into().unwrap();
-                let a_hi: [u32; 8] = a[8..].try_into().unwrap();
-                let b_lo: [u32; 8] = b[..8].try_into().unwrap();
-                let b_hi: [u32; 8] = b[8..].try_into().unwrap();
-                let elems_per_half = 256 / et.bits() as u32;
-                let sel_lo = Self::expand_select_mask(sel_scalar, et);
-                let sel_hi_bits = if elems_per_half >= 32 {
-                    // 8-bit elements: 64-bit mask from register pair.
-                    // The operand decodes as a single ScalarReg (low reg
-                    // of the pair). Read r+1 for the high 32 bits.
-                    op.sources.iter().find_map(|s| match s {
-                        Operand::ScalarReg(r) => Some(ctx.scalar.read(r + 1)),
-                        _ => None,
-                    }).unwrap_or(0)
-                } else {
-                    sel_scalar >> elems_per_half
-                };
-                let sel_hi = Self::expand_select_mask(sel_hi_bits, et);
-                // Hardware: bit=0 -> s1, bit=1 -> s2
-                let lo = Self::vector_select(&sel_lo, &b_lo, &a_lo, et);
-                let hi = Self::vector_select(&sel_hi, &b_hi, &a_hi, et);
-                let mut result = [0u32; 16];
-                result[..8].copy_from_slice(&lo);
-                result[8..].copy_from_slice(&hi);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
+            // Add, Sub, Mul, Min, Max: extracted to vector_dispatch.rs
+            // VectorSelect: extracted to vector_compare.rs
 
-            SemanticOp::Neg => {
-                // Two sub-cases:
-                // 1. AccumReg source: VNEG on cm-class accumulator (1024-bit)
-                // 2. VectorReg source: element-wise vector negate (512-bit)
-                let has_acc_source = op.sources.iter()
-                    .any(|s| matches!(s, Operand::AccumReg(_)));
-                if has_acc_source {
-                    Self::execute_acc_negate(op, ctx);
-                } else {
-                    let a = Self::get_wide_vec_source(op, ctx, 0);
-                    let result = Self::wide_element_wise_unary(&a, et, Self::vector_negate);
-                    Self::write_wide_vec_dest(op, ctx, result);
-                }
-                true
-            }
+            // Neg: extracted to vector_arith.rs
 
             // ========== Bitwise ops (no ElementType parameter) ==========
             SemanticOp::And => {
@@ -1263,84 +875,7 @@ impl VectorAlu {
                 true
             }
 
-            // ========== Comparison (bridge) ==========
-            SemanticOp::Cmp => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_cmp_eq);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-            SemanticOp::SetGe => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_ge);
-                if matches!(op.dest, Some(Operand::ScalarReg(_))) {
-                    // VGE: condense per-lane mask into scalar bitmask
-                    let lo: [u32; 8] = result[..8].try_into().unwrap();
-                    let hi: [u32; 8] = result[8..].try_into().unwrap();
-                    let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
-                    let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
-                    let lanes_per_half = 256 / et.bits() as u32;
-                    let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
-                    // For 8-bit elements, the mask needs 64 bits (register pair).
-                    if lanes_per_half >= 32 {
-                        // Write to primary dest (VGE/VLT: cmp is the main dest).
-                        Self::write_scalar_dest_wide(op, ctx, full_mask);
-                        // Also write to extra_dests (dual-result ops like VSUB_LT).
-                        Self::write_cmp_dest_wide(op, ctx, full_mask);
-                    } else {
-                        Self::write_scalar_dest(op, ctx, full_mask as u32);
-                        // Also write to extra_dests (cmp register) for 16/32-bit.
-                        Self::write_cmp_dest(op, ctx, full_mask as u32);
-                    }
-                } else {
-                    Self::write_wide_vec_dest(op, ctx, result);
-                    let lo: [u32; 8] = result[..8].try_into().unwrap();
-                    let hi: [u32; 8] = result[8..].try_into().unwrap();
-                    let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
-                    let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
-                    let lanes_per_half = 256 / et.bits() as u32;
-                    let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
-                    if lanes_per_half >= 32 {
-                        Self::write_cmp_dest_wide(op, ctx, full_mask);
-                    } else {
-                        Self::write_cmp_dest(op, ctx, full_mask as u32);
-                    }
-                }
-                true
-            }
-            SemanticOp::SetLt => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_lt);
-                if matches!(op.dest, Some(Operand::ScalarReg(_))) {
-                    let lo: [u32; 8] = result[..8].try_into().unwrap();
-                    let hi: [u32; 8] = result[8..].try_into().unwrap();
-                    let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
-                    let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
-                    let lanes_per_half = 256 / et.bits() as u32;
-                    let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
-                    if lanes_per_half >= 32 {
-                        Self::write_scalar_dest_wide(op, ctx, full_mask);
-                        Self::write_cmp_dest_wide(op, ctx, full_mask);
-                    } else {
-                        Self::write_scalar_dest(op, ctx, full_mask as u32);
-                        Self::write_cmp_dest(op, ctx, full_mask as u32);
-                    }
-                } else {
-                    Self::write_wide_vec_dest(op, ctx, result);
-                    let lo: [u32; 8] = result[..8].try_into().unwrap();
-                    let hi: [u32; 8] = result[8..].try_into().unwrap();
-                    let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
-                    let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
-                    let lanes_per_half = 256 / et.bits() as u32;
-                    let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
-                    if lanes_per_half >= 32 {
-                        Self::write_cmp_dest_wide(op, ctx, full_mask);
-                    } else {
-                        Self::write_cmp_dest(op, ctx, full_mask as u32);
-                    }
-                }
-                true
-            }
+            // Comparison ops (Cmp, SetGe, SetLt): extracted to vector_compare.rs
 
             // ========== Matrix Multiply (config-driven) ==========
             SemanticOp::Mac | SemanticOp::MatMul | SemanticOp::MatMulSub
@@ -1349,26 +884,7 @@ impl VectorAlu {
                 return super::vector_matmul::execute_matmul(op, ctx);
             }
 
-            // ========== Accumulator ops ==========
-            SemanticOp::Accumulate | SemanticOp::AccumSub
-            | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub
-            | SemanticOp::NegAdd => {
-                let has_acc_source = op.sources.iter()
-                    .any(|s| matches!(s, Operand::AccumReg(_)));
-                if has_acc_source {
-                    // VADD/VSUB/VNEGADD/VNEGSUB: accumulator-to-accumulator
-                    Self::execute_acc_add_sub(op, ctx);
-                } else if matches!(semantic, SemanticOp::NegAdd) {
-                    // Regular vector negate-add (no accumulator involvement).
-                    let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                    let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_neg_add);
-                    Self::write_wide_vec_dest(op, ctx, result);
-                } else {
-                    // Legacy: vector-into-accumulator, use fallback
-                    return Self::execute_wide_fallback(op, ctx, semantic, et);
-                }
-                true
-            }
+            // Accumulate/AccumSub/AccumNegAdd/AccumNegSub/NegAdd: extracted to vector_arith.rs
 
             // ========== SRS/UPS (element-wise, split into halves) ==========
 
@@ -1754,112 +1270,9 @@ impl VectorAlu {
                 true
             }
 
-            // ========== Shift operations (bridge) ==========
-            SemanticOp::Shl => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_shift_left);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-            SemanticOp::Srl => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_shift_right_logical);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-            SemanticOp::Sra => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_shift_right_arith);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-
-            // ========== Comparison variants (bridge) ==========
-            // MaxLt and MinGe are synonyms for Max/Min -- the conditional suffix
-            // describes the input ordering contract, not a distinct operation.
-            SemanticOp::MaxLt => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_max);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-            SemanticOp::MinGe => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_min);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-
-            // ========== Conditional arithmetic (bridge) ==========
-            SemanticOp::SubLt => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_sub_lt);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-            SemanticOp::SubGe => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_sub_ge);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-            SemanticOp::MaxDiffLt => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_maxdiff_lt);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-            // NegAdd and Sub are now handled in the accumulator dispatch above
-            // (with has_acc_source check to distinguish vector vs accumulator ops).
-
-            // ========== Conditional unary (bridge) ==========
-            SemanticOp::NegGtz => {
-                // Two-vector-source variant (VNEG_GTZ with select operand) uses fallback.
-                let vec_source_count = op.sources.iter()
-                    .filter(|s| matches!(s, Operand::VectorReg(_)))
-                    .count();
-                if vec_source_count >= 2 {
-                    return Self::execute_wide_fallback(op, ctx, semantic, et);
-                }
-                let a = Self::get_wide_vec_source(op, ctx, 0);
-                let result = Self::wide_element_wise_unary(&a, et, Self::vector_neg_gtz);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-            SemanticOp::NegLtz => {
-                let a = Self::get_wide_vec_source(op, ctx, 0);
-                let result = Self::wide_element_wise_unary(&a, et, Self::vector_neg_ltz);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-            SemanticOp::AbsGtz => {
-                let a = Self::get_wide_vec_source(op, ctx, 0);
-                let result = Self::wide_element_wise_unary(&a, et, Self::vector_abs_gtz);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
-            SemanticOp::SetEq => {
-                // VEQZ: compare each element to zero, produce scalar comparison bitmask.
-                // VEQZ has the cmp register as primary dest (not extra_dests), so
-                // write to dest via write_scalar_dest. Also write to extra_dests
-                // for dual-result ops that might share this path.
-                let a = Self::get_wide_vec_source(op, ctx, 0);
-                let result = Self::wide_element_wise_unary(&a, et, Self::vector_compare_eqz);
-                let lo: [u32; 8] = result[..8].try_into().unwrap();
-                let hi: [u32; 8] = result[8..].try_into().unwrap();
-                let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
-                let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
-                let lanes_per_half = 256 / et.bits() as u32;
-                let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
-                if lanes_per_half >= 32 {
-                    Self::write_scalar_dest_wide(op, ctx, full_mask);
-                    Self::write_cmp_dest_wide(op, ctx, full_mask);
-                } else {
-                    Self::write_scalar_dest(op, ctx, full_mask as u32);
-                    Self::write_cmp_dest(op, ctx, full_mask as u32);
-                }
-                true
-            }
+            // Shl, Srl, Sra, MaxLt, MinGe, SubLt, SubGe, MaxDiffLt,
+            // NegGtz, NegLtz, AbsGtz: extracted to vector_arith.rs
+            // SetEq: extracted to vector_compare.rs
 
             // ========== Convert (wide path) ==========
 
@@ -2122,101 +1535,7 @@ mod tests {
         ExecutionContext::new()
     }
 
-    #[test]
-    fn test_vector_add_i32() {
-        let mut ctx = make_ctx();
-        ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
-        ctx.vector.write(1, [10, 20, 30, 40, 50, 60, 70, 80]);
-
-        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add)
-            .as_vector(ElementType::Int32)
-            .with_dest(Operand::VectorReg(2))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(1));
-
-        assert!(VectorAlu::execute(&op, &mut ctx));
-        assert_eq!(ctx.vector.read(2), [11, 22, 33, 44, 55, 66, 77, 88]);
-    }
-
-    #[test]
-    fn test_vector_add_i16() {
-        let mut ctx = make_ctx();
-        // Pack 16-bit values: [1, 2] in lane 0, etc.
-        ctx.vector.write(0, [0x0002_0001, 0, 0, 0, 0, 0, 0, 0]);
-        ctx.vector.write(1, [0x0020_0010, 0, 0, 0, 0, 0, 0, 0]);
-
-        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add)
-            .as_vector(ElementType::Int16)
-            .with_dest(Operand::VectorReg(2))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(1));
-
-        VectorAlu::execute(&op, &mut ctx);
-        assert_eq!(ctx.vector.read(2)[0], 0x0022_0011);
-    }
-
-    #[test]
-    fn test_vector_sub() {
-        let mut ctx = make_ctx();
-        ctx.vector.write(0, [100, 200, 300, 400, 500, 600, 700, 800]);
-        ctx.vector.write(1, [10, 20, 30, 40, 50, 60, 70, 80]);
-
-        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Sub)
-            .as_vector(ElementType::Int32)
-            .with_dest(Operand::VectorReg(2))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(1));
-
-        VectorAlu::execute(&op, &mut ctx);
-        assert_eq!(ctx.vector.read(2), [90, 180, 270, 360, 450, 540, 630, 720]);
-    }
-
-    #[test]
-    fn test_vector_mul() {
-        let mut ctx = make_ctx();
-        ctx.vector.write(0, [2, 3, 4, 5, 6, 7, 8, 9]);
-        ctx.vector.write(1, [10, 10, 10, 10, 10, 10, 10, 10]);
-
-        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Mul)
-            .as_vector(ElementType::Int32)
-            .with_dest(Operand::VectorReg(2))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(1));
-
-        VectorAlu::execute(&op, &mut ctx);
-        assert_eq!(ctx.vector.read(2), [20, 30, 40, 50, 60, 70, 80, 90]);
-    }
-
-    // NOTE: test_vector_mac was removed -- it tested the old element-wise MAC
-    // path which has been replaced by config-driven matrix multiply dispatch
-    // (execute_matmul). MAC tests now belong in vector_matmul.rs.
-
-    #[test]
-    fn test_vector_min_max() {
-        let mut ctx = make_ctx();
-        ctx.vector.write(0, [5, 10, 15, 20, 25, 30, 35, 40]);
-        ctx.vector.write(1, [10, 5, 20, 15, 30, 25, 40, 35]);
-
-        // Min
-        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Min)
-            .as_vector(ElementType::UInt32)
-            .with_dest(Operand::VectorReg(2))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(1));
-
-        VectorAlu::execute(&op, &mut ctx);
-        assert_eq!(ctx.vector.read(2), [5, 5, 15, 15, 25, 25, 35, 35]);
-
-        // Max
-        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Max)
-            .as_vector(ElementType::UInt32)
-            .with_dest(Operand::VectorReg(2))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(1));
-
-        VectorAlu::execute(&op, &mut ctx);
-        assert_eq!(ctx.vector.read(2), [10, 10, 20, 20, 30, 30, 40, 40]);
-    }
+    // Arithmetic tests (add, sub, mul, min, max) moved to vector_arith.rs
 
     #[test]
     fn test_vector_shuffle_mode0() {
@@ -2275,202 +1594,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_vector_cmp() {
-        let mut ctx = make_ctx();
-        ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
-        ctx.vector.write(1, [1, 0, 3, 0, 5, 0, 7, 0]);
+    // test_vector_cmp: moved to vector_compare.rs
 
-        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Cmp)
-            .as_vector(ElementType::Int32)
-            .with_dest(Operand::VectorReg(2))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(1));
-
-        VectorAlu::execute(&op, &mut ctx);
-        let result = ctx.vector.read(2);
-        assert_eq!(result[0], 0xFFFF_FFFF); // 1 == 1
-        assert_eq!(result[1], 0); // 2 != 0
-        assert_eq!(result[2], 0xFFFF_FFFF); // 3 == 3
-        assert_eq!(result[3], 0); // 4 != 0
-    }
-
-    #[test]
-    fn test_vector_add_f32() {
-        let mut ctx = make_ctx();
-
-        // Create float vectors: [1.0, 2.0, 3.0, ...] and [0.5, 0.5, ...]
-        let a: [u32; 8] = [
-            1.0f32.to_bits(),
-            2.0f32.to_bits(),
-            3.0f32.to_bits(),
-            4.0f32.to_bits(),
-            5.0f32.to_bits(),
-            6.0f32.to_bits(),
-            7.0f32.to_bits(),
-            8.0f32.to_bits(),
-        ];
-        let b: [u32; 8] = [0.5f32.to_bits(); 8];
-
-        ctx.vector.write(0, a);
-        ctx.vector.write(1, b);
-
-        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add)
-            .as_vector(ElementType::Float32)
-            .with_dest(Operand::VectorReg(2))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(1));
-
-        VectorAlu::execute(&op, &mut ctx);
-        let result = ctx.vector.read(2);
-
-        // Check results: 1.5, 2.5, 3.5, ...
-        assert_eq!(f32::from_bits(result[0]), 1.5);
-        assert_eq!(f32::from_bits(result[1]), 2.5);
-        assert_eq!(f32::from_bits(result[2]), 3.5);
-        assert_eq!(f32::from_bits(result[7]), 8.5);
-    }
-
-    #[test]
-    fn test_vector_mul_f32() {
-        let mut ctx = make_ctx();
-
-        // [2.0, 3.0, 4.0, ...] * [0.5, 0.5, ...]
-        let a: [u32; 8] = [
-            2.0f32.to_bits(),
-            3.0f32.to_bits(),
-            4.0f32.to_bits(),
-            5.0f32.to_bits(),
-            6.0f32.to_bits(),
-            7.0f32.to_bits(),
-            8.0f32.to_bits(),
-            9.0f32.to_bits(),
-        ];
-        let b: [u32; 8] = [0.5f32.to_bits(); 8];
-
-        ctx.vector.write(0, a);
-        ctx.vector.write(1, b);
-
-        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Mul)
-            .as_vector(ElementType::Float32)
-            .with_dest(Operand::VectorReg(2))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(1));
-
-        VectorAlu::execute(&op, &mut ctx);
-        let result = ctx.vector.read(2);
-
-        // Check results: 1.0, 1.5, 2.0, ...
-        assert_eq!(f32::from_bits(result[0]), 1.0);
-        assert_eq!(f32::from_bits(result[1]), 1.5);
-        assert_eq!(f32::from_bits(result[2]), 2.0);
-    }
-
-    #[test]
-    fn test_vector_min_max_f32() {
-        let mut ctx = make_ctx();
-
-        // Test with positive and negative floats
-        let a: [u32; 8] = [
-            1.0f32.to_bits(),
-            (-2.0f32).to_bits(),
-            3.0f32.to_bits(),
-            (-4.0f32).to_bits(),
-            5.0f32.to_bits(),
-            6.0f32.to_bits(),
-            7.0f32.to_bits(),
-            8.0f32.to_bits(),
-        ];
-        let b: [u32; 8] = [
-            0.5f32.to_bits(),
-            (-1.0f32).to_bits(),
-            2.0f32.to_bits(),
-            (-5.0f32).to_bits(),
-            4.0f32.to_bits(),
-            7.0f32.to_bits(),
-            6.0f32.to_bits(),
-            9.0f32.to_bits(),
-        ];
-
-        ctx.vector.write(0, a);
-        ctx.vector.write(1, b);
-
-        // Min
-        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Min)
-            .as_vector(ElementType::Float32)
-            .with_dest(Operand::VectorReg(2))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(1));
-
-        VectorAlu::execute(&op, &mut ctx);
-        let result = ctx.vector.read(2);
-        assert_eq!(f32::from_bits(result[0]), 0.5);  // min(1.0, 0.5)
-        assert_eq!(f32::from_bits(result[1]), -2.0); // min(-2.0, -1.0)
-        assert_eq!(f32::from_bits(result[3]), -5.0); // min(-4.0, -5.0)
-
-        // Max
-        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Max)
-            .as_vector(ElementType::Float32)
-            .with_dest(Operand::VectorReg(2))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(1));
-
-        VectorAlu::execute(&op, &mut ctx);
-        let result = ctx.vector.read(2);
-        assert_eq!(f32::from_bits(result[0]), 1.0);  // max(1.0, 0.5)
-        assert_eq!(f32::from_bits(result[1]), -1.0); // max(-2.0, -1.0)
-        assert_eq!(f32::from_bits(result[3]), -4.0); // max(-4.0, -5.0)
-    }
-
-    #[test]
-    fn test_vector_add_bf16() {
-        let mut ctx = make_ctx();
-
-        // BFloat16 is upper 16 bits of f32
-        // Pack two bf16 values per u32: low half and high half
-        fn pack_bf16(lo: f32, hi: f32) -> u32 {
-            let lo_bits = (lo.to_bits() >> 16) as u16;
-            let hi_bits = (hi.to_bits() >> 16) as u16;
-            (lo_bits as u32) | ((hi_bits as u32) << 16)
-        }
-
-        // Create vectors with bf16 pairs
-        let a: [u32; 8] = [
-            pack_bf16(1.0, 2.0),
-            pack_bf16(3.0, 4.0),
-            0, 0, 0, 0, 0, 0,
-        ];
-        let b: [u32; 8] = [
-            pack_bf16(0.5, 0.5),
-            pack_bf16(0.5, 0.5),
-            0, 0, 0, 0, 0, 0,
-        ];
-
-        ctx.vector.write(0, a);
-        ctx.vector.write(1, b);
-
-        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add)
-            .as_vector(ElementType::BFloat16)
-            .with_dest(Operand::VectorReg(2))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(1));
-
-        VectorAlu::execute(&op, &mut ctx);
-        let result = ctx.vector.read(2);
-
-        // Extract and check bf16 values
-        let lo0 = VectorAlu::bf16_to_f32((result[0] & 0xFFFF) as u16);
-        let hi0 = VectorAlu::bf16_to_f32(((result[0] >> 16) & 0xFFFF) as u16);
-
-        // BFloat16 has limited precision, so check approximate equality
-        assert!((lo0 - 1.5).abs() < 0.1, "Expected ~1.5, got {}", lo0);
-        assert!((hi0 - 2.5).abs() < 0.1, "Expected ~2.5, got {}", hi0);
-    }
-
-    // NOTE: test_vector_matmul_dense_int32 was removed -- it tested the old
-    // element-wise matmul path which has been replaced by config-driven matrix
-    // multiply dispatch (execute_matmul). MatMul tests now belong in
-    // vector_matmul.rs.
+    // Float arithmetic tests (add_f32, mul_f32, min_max_f32, add_bf16) moved to vector_arith.rs
 
     #[test]
     fn test_vector_srs_int32() {
@@ -3110,67 +2236,7 @@ mod tests {
         assert_eq!(v5, [90, 100, 110, 120, 130, 140, 150, 160]);
     }
 
-    /// VGE with wide (x-register) sources and scalar dest produces a bitmask.
-    /// 16 lanes of i32 across two halves -> 16-bit scalar mask.
-    #[test]
-    fn test_wide_setge_scalar_dest_i32() {
-        let mut ctx = make_ctx();
-        // x0 = v0:v1 (lo:hi), x2 = v2:v3
-        // lo half (v0): [10, 5, 20, 3, 8, 8, 100, 0]
-        // hi half (v1): [1, 2, 3, 4, 5, 6, 7, 8]
-        ctx.vector.write(0, [10, 5, 20, 3, 8, 8, 100, 0]);
-        ctx.vector.write(1, [1, 2, 3, 4, 5, 6, 7, 8]);
-        // lo half (v2): [5, 10, 20, 4, 7, 8, 50, 1]
-        // hi half (v3): [1, 3, 2, 4, 6, 5, 7, 9]
-        ctx.vector.write(2, [5, 10, 20, 4, 7, 8, 50, 1]);
-        ctx.vector.write(3, [1, 3, 2, 4, 6, 5, 7, 9]);
-
-        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::SetGe)
-            .as_vector(ElementType::Int32)
-            .with_dest(Operand::ScalarReg(16))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(2));
-        op.is_wide_vector = true;
-
-        assert!(VectorAlu::execute(&op, &mut ctx));
-
-        // lo half comparison (a >= b):
-        //   10>=5=T, 5>=10=F, 20>=20=T, 3>=4=F, 8>=7=T, 8>=8=T, 100>=50=T, 0>=1=F
-        //   mask_lo = 0b_0111_0101 = 0x75
-        // hi half comparison:
-        //   1>=1=T, 2>=3=F, 3>=2=T, 4>=4=T, 5>=6=F, 6>=5=T, 7>=7=T, 8>=9=F
-        //   mask_hi = 0b_0110_1101 = 0x6D
-        // full_mask = mask_lo | (mask_hi << 8) = 0x6D75
-        let scalar_result = ctx.scalar.read(16);
-        assert_eq!(scalar_result, 0x6D75, "wide VGE scalar bitmask mismatch: got {:#06x}", scalar_result);
-    }
-
-    /// VLT with wide (x-register) sources and scalar dest produces a bitmask.
-    #[test]
-    fn test_wide_setlt_scalar_dest_i32() {
-        let mut ctx = make_ctx();
-        // Same data as above
-        ctx.vector.write(0, [10, 5, 20, 3, 8, 8, 100, 0]);
-        ctx.vector.write(1, [1, 2, 3, 4, 5, 6, 7, 8]);
-        ctx.vector.write(2, [5, 10, 20, 4, 7, 8, 50, 1]);
-        ctx.vector.write(3, [1, 3, 2, 4, 6, 5, 7, 9]);
-
-        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::SetLt)
-            .as_vector(ElementType::Int32)
-            .with_dest(Operand::ScalarReg(16))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(2));
-        op.is_wide_vector = true;
-
-        assert!(VectorAlu::execute(&op, &mut ctx));
-
-        // VLT is the complement of VGE (for signed integers, no NaN).
-        // lo: F,T,F,T,F,F,F,T -> 0b_1000_1010 = 0x8A
-        // hi: F,T,F,F,T,F,F,T -> 0b_1001_0010 = 0x92
-        // full_mask = 0x928A
-        let scalar_result = ctx.scalar.read(16);
-        assert_eq!(scalar_result, 0x928A, "wide VLT scalar bitmask mismatch: got {:#06x}", scalar_result);
-    }
+    // test_wide_setge_scalar_dest_i32, test_wide_setlt_scalar_dest_i32: moved to vector_compare.rs
 
     /// SRS from Acc32 (16 lanes packed 2 per u64) to 16-bit output.
     /// Verifies that vector_srs_from_acc correctly unpacks lo32/hi32 from
@@ -3240,83 +2306,5 @@ mod tests {
         }
     }
 
-    /// VADD_F: NaN + NaN should produce canonical NaN with mantissa = 1.
-    ///
-    /// Negative s16 values sign-extended to s32 produce f32 NaN bit patterns
-    /// (exponent = 0xFF, mantissa != 0).  The hardware canonical NaN is
-    /// 0x7F800001 (mantissa = 1, sign = 0).  Verified against real NPU1 HW.
-    #[test]
-    fn test_vadd_f_nan_canonical() {
-        use crate::tablegen::decoder_ffi::AccumWidth;
-        let mut ctx = make_ctx();
-
-        // Load NaN values: s16 = -1 -> s32 = 0xFFFFFFFF -> f32: NaN (exp=0xFF).
-        // Pack two NaN values per u64 accumulator lane.
-        let nan_s32 = 0xFFFFFFFFu32;
-        let nan_u64 = (nan_s32 as u64) | ((nan_s32 as u64) << 32);
-        let acc = [nan_u64; 8];
-        ctx.accumulator.write(0, acc);
-
-        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Accumulate)
-            .as_vector(ElementType::Float32)
-            .with_dest(Operand::AccumReg(0))
-            .with_source(Operand::AccumReg(0))
-            .with_source(Operand::AccumReg(0))
-            .with_source(Operand::ScalarReg(0));
-        op.accum_width = Some(AccumWidth::Half);
-        ctx.scalar.write(0, 0);
-
-        VectorAlu::execute(&op, &mut ctx);
-
-        let result = ctx.accumulator.read(0);
-        // Each u64 lane should hold two copies of canonical NaN = 0x7F800001.
-        let expected = 0x7F800001_7F800001u64;
-        for (i, &v) in result.iter().enumerate() {
-            assert_eq!(v, expected,
-                "acc lane {} should be canonical NaN pair, got {:#018x}", i, v);
-        }
-    }
-
-    /// VADD_F: float accumulator add should flush denormals to zero.
-    ///
-    /// The test harness loads s16 data via `vups.s32.s16` then runs
-    /// `vadd.f bml0, bml0, bml0, r0`.  Small positive s16 values
-    /// (1..127) sign-extend to s32 = denormalized f32 bit patterns.
-    /// FTZ should flush them to +0.0, so vadd.f(0, 0) = 0.
-    /// SRS should then produce zero.
-    #[test]
-    fn test_vadd_f_denormal_ftz() {
-        use crate::tablegen::decoder_ffi::AccumWidth;
-        let mut ctx = make_ctx();
-
-        // Simulate UPS: sign-extend 16 s16 values to s32, pack 2 per u64.
-        // Values 0..15: all small positive -> denormalized f32 patterns.
-        let src = [0x0002_0001u32, 0x0004_0003, 0x0006_0005, 0x0008_0007,
-                    0x000A_0009, 0x000C_000B, 0x000E_000D, 0x0010_000F];
-        let acc = super::vector_ups::ups_vector_to_acc(
-            &src, 0, ElementType::Int16, ElementType::Int32,
-        );
-        ctx.accumulator.write(0, acc);
-
-        // Build a vadd.f operation: bml0 = bml0 + bml0.
-        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Accumulate)
-            .as_vector(ElementType::Float32)
-            .with_dest(Operand::AccumReg(0))
-            .with_source(Operand::AccumReg(0))
-            .with_source(Operand::AccumReg(0))
-            .with_source(Operand::ScalarReg(0)); // config = 0
-        op.accum_width = Some(AccumWidth::Half);
-
-        // Config register r0 = 0.
-        ctx.scalar.write(0, 0);
-
-        VectorAlu::execute(&op, &mut ctx);
-
-        // Read back via SRS s16.s32 with shift=0.
-        let result_acc = ctx.accumulator.read(0);
-        // All values were denormalized f32 -> FTZ to 0 -> add(0,0) = 0.
-        for (i, &v) in result_acc.iter().enumerate() {
-            assert_eq!(v, 0, "acc lane {} should be 0 after FTZ, got {:#018x}", i, v);
-        }
-    }
+    // NaN and FTZ tests (vadd_f_nan_canonical, vadd_f_denormal_ftz) moved to vector_arith.rs
 }

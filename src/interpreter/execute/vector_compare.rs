@@ -1,9 +1,10 @@
 //! Comparison operations for the vector ALU.
 //!
-//! Extracted from vector.rs -- these are pure computational functions
-//! with no internal dependencies on dispatch or helper code.
+//! Contains both pure computational functions (vector_cmp_eq, vector_compare_ge,
+//! etc.) and dispatched execute_* entry points that handle narrow/wide routing.
 
-use crate::interpreter::bundle::ElementType;
+use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
+use crate::interpreter::state::ExecutionContext;
 
 use super::vector_dispatch::VectorAlu;
 
@@ -264,6 +265,302 @@ impl VectorAlu {
         result
     }
 
+    // ========== Dispatched entry points ==========
+
+    /// Vector compare equal (Cmp).
+    pub(super) fn execute_cmp(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
+        if op.is_wide_vector {
+            let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+            let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_cmp_eq);
+            Self::write_wide_vec_dest(op, ctx, result);
+            true
+        } else {
+            let (a, b) = Self::get_two_vector_sources(op, ctx);
+            let result = Self::vector_cmp_eq(&a, &b, et);
+            Self::write_vector_dest(op, ctx, result);
+            true
+        }
+    }
+
+    /// Set if greater-or-equal (SetGe).
+    pub(super) fn execute_setge(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
+        // Accumulator sources (Half or Full) need the wide path.
+        let has_wide_acc_source = matches!(op.accum_width,
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Full)
+            | Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+        if op.is_wide_vector || has_wide_acc_source {
+            let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+            let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_ge);
+            if matches!(op.dest, Some(Operand::ScalarReg(_))) {
+                // VGE: condense per-lane mask into scalar bitmask
+                let lo: [u32; 8] = result[..8].try_into().unwrap();
+                let hi: [u32; 8] = result[8..].try_into().unwrap();
+                let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
+                let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
+                let lanes_per_half = 256 / et.bits() as u32;
+                let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
+                // For 8-bit elements, the mask needs 64 bits (register pair).
+                if lanes_per_half >= 32 {
+                    // Write to primary dest (VGE/VLT: cmp is the main dest).
+                    Self::write_scalar_dest_wide(op, ctx, full_mask);
+                    // Also write to extra_dests (dual-result ops like VSUB_LT).
+                    Self::write_cmp_dest_wide(op, ctx, full_mask);
+                } else {
+                    Self::write_scalar_dest(op, ctx, full_mask as u32);
+                    // Also write to extra_dests (cmp register) for 16/32-bit.
+                    Self::write_cmp_dest(op, ctx, full_mask as u32);
+                }
+            } else {
+                Self::write_wide_vec_dest(op, ctx, result);
+                let lo: [u32; 8] = result[..8].try_into().unwrap();
+                let hi: [u32; 8] = result[8..].try_into().unwrap();
+                let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
+                let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
+                let lanes_per_half = 256 / et.bits() as u32;
+                let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
+                if lanes_per_half >= 32 {
+                    Self::write_cmp_dest_wide(op, ctx, full_mask);
+                } else {
+                    Self::write_cmp_dest(op, ctx, full_mask as u32);
+                }
+            }
+            true
+        } else {
+            let (a, b) = Self::get_two_vector_sources(op, ctx);
+            let result = Self::vector_compare_ge(&a, &b, et);
+            Self::write_vector_dest(op, ctx, result);
+            // cmp = packed bitmask of the same comparison
+            Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&result, et));
+            true
+        }
+    }
+
+    /// Set if less-than (SetLt).
+    pub(super) fn execute_setlt(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
+        // Accumulator sources (Half or Full) need the wide path.
+        let has_wide_acc_source = matches!(op.accum_width,
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Full)
+            | Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+        if op.is_wide_vector || has_wide_acc_source {
+            let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+            let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_lt);
+            if matches!(op.dest, Some(Operand::ScalarReg(_))) {
+                let lo: [u32; 8] = result[..8].try_into().unwrap();
+                let hi: [u32; 8] = result[8..].try_into().unwrap();
+                let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
+                let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
+                let lanes_per_half = 256 / et.bits() as u32;
+                let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
+                if lanes_per_half >= 32 {
+                    Self::write_scalar_dest_wide(op, ctx, full_mask);
+                    Self::write_cmp_dest_wide(op, ctx, full_mask);
+                } else {
+                    Self::write_scalar_dest(op, ctx, full_mask as u32);
+                    Self::write_cmp_dest(op, ctx, full_mask as u32);
+                }
+            } else {
+                Self::write_wide_vec_dest(op, ctx, result);
+                let lo: [u32; 8] = result[..8].try_into().unwrap();
+                let hi: [u32; 8] = result[8..].try_into().unwrap();
+                let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
+                let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
+                let lanes_per_half = 256 / et.bits() as u32;
+                let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
+                if lanes_per_half >= 32 {
+                    Self::write_cmp_dest_wide(op, ctx, full_mask);
+                } else {
+                    Self::write_cmp_dest(op, ctx, full_mask as u32);
+                }
+            }
+            true
+        } else {
+            let (a, b) = Self::get_two_vector_sources(op, ctx);
+            let result = Self::vector_compare_lt(&a, &b, et);
+            Self::write_vector_dest(op, ctx, result);
+            // cmp = packed bitmask of the same comparison
+            Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&result, et));
+            true
+        }
+    }
+
+    /// Set if equal to zero (SetEq / VEQZ).
+    pub(super) fn execute_seteq(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
+        if op.is_wide_vector {
+            // VEQZ: compare each element to zero, produce scalar comparison bitmask.
+            // VEQZ has the cmp register as primary dest (not extra_dests), so
+            // write to dest via write_scalar_dest. Also write to extra_dests
+            // for dual-result ops that might share this path.
+            let a = Self::get_wide_vec_source(op, ctx, 0);
+            let result = Self::wide_element_wise_unary(&a, et, Self::vector_compare_eqz);
+            let lo: [u32; 8] = result[..8].try_into().unwrap();
+            let hi: [u32; 8] = result[8..].try_into().unwrap();
+            let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
+            let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
+            let lanes_per_half = 256 / et.bits() as u32;
+            let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
+            if lanes_per_half >= 32 {
+                Self::write_scalar_dest_wide(op, ctx, full_mask);
+                Self::write_cmp_dest_wide(op, ctx, full_mask);
+            } else {
+                Self::write_scalar_dest(op, ctx, full_mask as u32);
+                Self::write_cmp_dest(op, ctx, full_mask as u32);
+            }
+            true
+        } else {
+            // Vector equal-to-zero (VEQZ): produces a comparison bitmask
+            // written to scalar cmp register(s), not a vector result.
+            let src = Self::get_vector_source(op, ctx, 0);
+            let result = Self::vector_compare_eqz(&src, et);
+            Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&result, et));
+            true
+        }
+    }
+
+    /// Vector max with LT comparison flag (MaxLt).
+    pub(super) fn execute_maxlt(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
+        if op.is_wide_vector {
+            let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+            let a_lo: [u32; 8] = a[..8].try_into().unwrap();
+            let a_hi: [u32; 8] = a[8..].try_into().unwrap();
+            let b_lo: [u32; 8] = b[..8].try_into().unwrap();
+            let b_hi: [u32; 8] = b[8..].try_into().unwrap();
+            let result_lo = Self::vector_max(&a_lo, &b_lo, et);
+            let result_hi = Self::vector_max(&a_hi, &b_hi, et);
+            let mut result = [0u32; 16];
+            result[..8].copy_from_slice(&result_lo);
+            result[8..].copy_from_slice(&result_hi);
+            Self::write_wide_vec_dest(op, ctx, result);
+            // cmp = per-element (a < b)
+            let cmp_lo = Self::vector_compare_lt(&a_lo, &b_lo, et);
+            let cmp_hi = Self::vector_compare_lt(&a_hi, &b_hi, et);
+            let mask_lo = Self::condense_comparison_mask(&cmp_lo, op.element_type);
+            let mask_hi = Self::condense_comparison_mask(&cmp_hi, op.element_type);
+            let lanes_per_half = 256 / et.bits() as u32;
+            let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
+            if lanes_per_half >= 32 {
+                Self::write_cmp_dest_wide(op, ctx, full_mask);
+            } else {
+                Self::write_cmp_dest(op, ctx, full_mask as u32);
+            }
+            true
+        } else {
+            let (a, b) = Self::get_two_vector_sources(op, ctx);
+            let result = Self::vector_max(&a, &b, et);
+            Self::write_vector_dest(op, ctx, result);
+            // cmp = per-element (a < b)
+            let cmp = Self::vector_compare_lt(&a, &b, et);
+            Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
+            true
+        }
+    }
+
+    /// Vector min with GE comparison flag (MinGe).
+    pub(super) fn execute_minge(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
+        if op.is_wide_vector {
+            let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+            let a_lo: [u32; 8] = a[..8].try_into().unwrap();
+            let a_hi: [u32; 8] = a[8..].try_into().unwrap();
+            let b_lo: [u32; 8] = b[..8].try_into().unwrap();
+            let b_hi: [u32; 8] = b[8..].try_into().unwrap();
+            let result_lo = Self::vector_min(&a_lo, &b_lo, et);
+            let result_hi = Self::vector_min(&a_hi, &b_hi, et);
+            let mut result = [0u32; 16];
+            result[..8].copy_from_slice(&result_lo);
+            result[8..].copy_from_slice(&result_hi);
+            Self::write_wide_vec_dest(op, ctx, result);
+            // cmp = per-element (a >= b)
+            let cmp_lo = Self::vector_compare_ge(&a_lo, &b_lo, et);
+            let cmp_hi = Self::vector_compare_ge(&a_hi, &b_hi, et);
+            let mask_lo = Self::condense_comparison_mask(&cmp_lo, op.element_type);
+            let mask_hi = Self::condense_comparison_mask(&cmp_hi, op.element_type);
+            let lanes_per_half = 256 / et.bits() as u32;
+            let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
+            if lanes_per_half >= 32 {
+                Self::write_cmp_dest_wide(op, ctx, full_mask);
+            } else {
+                Self::write_cmp_dest(op, ctx, full_mask as u32);
+            }
+            true
+        } else {
+            let (a, b) = Self::get_two_vector_sources(op, ctx);
+            let result = Self::vector_min(&a, &b, et);
+            Self::write_vector_dest(op, ctx, result);
+            // cmp = per-element (a >= b)
+            let cmp = Self::vector_compare_ge(&a, &b, et);
+            Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
+            true
+        }
+    }
+
+    /// Per-element vector select based on scalar bitmask (VectorSelect).
+    pub(super) fn execute_select(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
+        if op.is_wide_vector {
+            // VSEL: 512-bit select with scalar bitmask.
+            // Must split the selector across lo/hi halves.
+            let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+            let sel_scalar = op.sources.iter().find_map(|s| match s {
+                Operand::ScalarReg(r) => Some(ctx.scalar.read(*r)),
+                _ => None,
+            }).unwrap_or(0);
+            let a_lo: [u32; 8] = a[..8].try_into().unwrap();
+            let a_hi: [u32; 8] = a[8..].try_into().unwrap();
+            let b_lo: [u32; 8] = b[..8].try_into().unwrap();
+            let b_hi: [u32; 8] = b[8..].try_into().unwrap();
+            let elems_per_half = 256 / et.bits() as u32;
+            let sel_lo = Self::expand_select_mask(sel_scalar, et);
+            let sel_hi_bits = if elems_per_half >= 32 {
+                // 8-bit elements: 64-bit mask from register pair.
+                // The operand decodes as a single ScalarReg (low reg
+                // of the pair). Read r+1 for the high 32 bits.
+                op.sources.iter().find_map(|s| match s {
+                    Operand::ScalarReg(r) => Some(ctx.scalar.read(r + 1)),
+                    _ => None,
+                }).unwrap_or(0)
+            } else {
+                sel_scalar >> elems_per_half
+            };
+            let sel_hi = Self::expand_select_mask(sel_hi_bits, et);
+            // Hardware: bit=0 -> s1, bit=1 -> s2
+            let lo = Self::vector_select(&sel_lo, &b_lo, &a_lo, et);
+            let hi = Self::vector_select(&sel_hi, &b_hi, &a_hi, et);
+            let mut result = [0u32; 16];
+            result[..8].copy_from_slice(&lo);
+            result[8..].copy_from_slice(&hi);
+            Self::write_wide_vec_dest(op, ctx, result);
+            true
+        } else {
+            // VSEL.32 d, s1, s2, sel: per-lane conditional select.
+            // input_order is [s1, s2, sel] where sel is a scalar register
+            // whose bits control per-element selection.
+            //
+            // Hardware semantics (aietools aie_api select documentation):
+            //   d[i] = (sel >> i) & 1 == 0 ? s1[i] : s2[i]
+            //
+            // When sel bit is 0: take from s1 (first vector source).
+            // When sel bit is 1: take from s2 (second vector source).
+            let s1 = Self::get_vector_source(op, ctx, 0);
+            let s2 = Self::get_vector_source(op, ctx, 1);
+            // Read the scalar select mask from the last source operand
+            let sel_scalar = op.sources.get(2).map(|s| match s {
+                Operand::ScalarReg(r) => ctx.scalar.read(*r),
+                Operand::Immediate(v) => *v as u32,
+                _ => Self::get_scalar_source(op, ctx),
+            }).unwrap_or(0);
+            // Expand scalar mask to per-lane vector mask.
+            let sel = Self::expand_select_mask(sel_scalar, et);
+            // vector_select does: mask != 0 ? arg1 : arg2
+            // Hardware wants: mask != 0 ? s2 : s1
+            // So pass s2 as arg1 and s1 as arg2.
+            let result = Self::vector_select(&sel, &s2, &s1, et);
+            log::debug!(
+                "[VSEL] sel_scalar=0x{:X} sel={:?} s1={:?} s2={:?} -> {:?} (sources={:?}, dest={:?})",
+                sel_scalar, sel, s1, s2, result, op.sources, op.dest
+            );
+            Self::write_vector_dest(op, ctx, result);
+            true
+        }
+    }
+
     /// Per-element select: dst[i] = mask[i] != 0 ? src1[i] : src2[i]
     pub(super) fn vector_select(
         mask: &[u32; 8],
@@ -311,5 +608,97 @@ impl VectorAlu {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interpreter::bundle::{SlotIndex, Operand, ElementType};
+    use crate::tablegen::SemanticOp;
+
+    fn make_ctx() -> ExecutionContext {
+        ExecutionContext::new()
+    }
+
+    #[test]
+    fn test_vector_cmp() {
+        let mut ctx = make_ctx();
+        ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
+        ctx.vector.write(1, [1, 0, 3, 0, 5, 0, 7, 0]);
+
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Cmp)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
+
+        VectorAlu::execute(&op, &mut ctx);
+        let result = ctx.vector.read(2);
+        assert_eq!(result[0], 0xFFFF_FFFF); // 1 == 1
+        assert_eq!(result[1], 0); // 2 != 0
+        assert_eq!(result[2], 0xFFFF_FFFF); // 3 == 3
+        assert_eq!(result[3], 0); // 4 != 0
+    }
+
+    /// VGE with wide (x-register) sources and scalar dest produces a bitmask.
+    #[test]
+    fn test_wide_setge_scalar_dest_i32() {
+        let mut ctx = make_ctx();
+        // x0 = v0:v1 (lo:hi), x2 = v2:v3
+        // lo half (v0): [10, 5, 20, 3, 8, 8, 100, 0]
+        // hi half (v1): [1, 2, 3, 4, 5, 6, 7, 8]
+        ctx.vector.write(0, [10, 5, 20, 3, 8, 8, 100, 0]);
+        ctx.vector.write(1, [1, 2, 3, 4, 5, 6, 7, 8]);
+        // lo half (v2): [5, 10, 20, 4, 7, 8, 50, 1]
+        // hi half (v3): [1, 3, 2, 4, 6, 5, 7, 9]
+        ctx.vector.write(2, [5, 10, 20, 4, 7, 8, 50, 1]);
+        ctx.vector.write(3, [1, 3, 2, 4, 6, 5, 7, 9]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::SetGe)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::ScalarReg(16))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(2));
+        op.is_wide_vector = true;
+
+        assert!(VectorAlu::execute(&op, &mut ctx));
+
+        // lo half comparison (a >= b):
+        //   10>=5=T, 5>=10=F, 20>=20=T, 3>=4=F, 8>=7=T, 8>=8=T, 100>=50=T, 0>=1=F
+        //   mask_lo = 0b_0111_0101 = 0x75
+        // hi half comparison:
+        //   1>=1=T, 2>=3=F, 3>=2=T, 4>=4=T, 5>=6=F, 6>=5=T, 7>=7=T, 8>=9=F
+        //   mask_hi = 0b_0110_1101 = 0x6D
+        // full_mask = mask_lo | (mask_hi << 8) = 0x6D75
+        let scalar_result = ctx.scalar.read(16);
+        assert_eq!(scalar_result, 0x6D75, "wide VGE scalar bitmask mismatch: got {:#06x}", scalar_result);
+    }
+
+    /// VLT with wide (x-register) sources and scalar dest produces a bitmask.
+    #[test]
+    fn test_wide_setlt_scalar_dest_i32() {
+        let mut ctx = make_ctx();
+        // Same data as above
+        ctx.vector.write(0, [10, 5, 20, 3, 8, 8, 100, 0]);
+        ctx.vector.write(1, [1, 2, 3, 4, 5, 6, 7, 8]);
+        ctx.vector.write(2, [5, 10, 20, 4, 7, 8, 50, 1]);
+        ctx.vector.write(3, [1, 3, 2, 4, 6, 5, 7, 9]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::SetLt)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::ScalarReg(16))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(2));
+        op.is_wide_vector = true;
+
+        assert!(VectorAlu::execute(&op, &mut ctx));
+
+        // VLT is the complement of VGE (for signed integers, no NaN).
+        // lo: F,T,F,T,F,F,F,T -> 0b_1000_1010 = 0x8A
+        // hi: F,T,F,F,T,F,F,T -> 0b_1001_0010 = 0x92
+        // full_mask = 0x928A
+        let scalar_result = ctx.scalar.read(16);
+        assert_eq!(scalar_result, 0x928A, "wide VLT scalar bitmask mismatch: got {:#06x}", scalar_result);
     }
 }
