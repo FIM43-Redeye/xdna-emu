@@ -676,6 +676,7 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
       auto* regmap = reinterpret_cast<const uint8_t*>(regmap_begin);
 
       uint32_t arg_idx = 0;
+      uint32_t valid_bo_count = 0;
       for (uint32_t off = bo_start; off + 8 <= regmap_bytes; off += 8) {
         uint64_t bo_addr = 0;
         std::memcpy(&bo_addr, regmap + off, sizeof(bo_addr));
@@ -693,13 +694,68 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
             }
           }
         }
-        if (bo_size == 0)
-          bo_size = 4096;
+        if (bo_size == 0) {
+          // Address not found in BO table -- likely not a real BO address
+          // (e.g., ELF module path puts opcode in regmap).  Skip it.
+          arg_idx++;
+          continue;
+        }
         m_transport->add_host_buffer(bo_addr, bo_size);
         EMU_DBG("submit_cmd[%zu]: registered host buffer arg_idx=%u "
                 "addr=0x%" PRIx64 " size=%" PRIu64,
                 cmd_idx, arg_idx, bo_addr, bo_size);
         arg_idx++;
+        valid_bo_count++;
+      }
+
+      // ELF module path fallback: when using xrt::ext::kernel with an
+      // ELF module, XRT puts instruction data in ert_npu_data but the
+      // regmap may not contain BO addresses (they're resolved via ELF
+      // relocations instead).  Detect this and register all data BOs
+      // from the BO table, sorted by device address, excluding the PDI
+      // and instruction BOs.
+      if (valid_bo_count == 0) {
+        EMU_INFO("submit_cmd[%zu]: no valid BOs in regmap -- "
+                 "using BO table fallback (ELF module path)", cmd_idx);
+
+        // Collect data BOs (exclude instruction BO and PDI BO).
+        std::vector<std::pair<uint64_t, uint64_t>> data_bos;
+        {
+          const std::lock_guard<std::mutex> lock(m_bo_lock);
+          for (const auto& [h, bo] : m_bo_map) {
+            // Skip the instruction buffer BO.
+            if (bo.dev_addr == sc.instr_addr)
+              continue;
+            // Skip BOs that look like PDI (loaded via config_ctx_cu_config).
+            // PDI BOs are typically larger than 1KB and allocated first.
+            // A reliable filter: skip BOs whose size matches known PDI sizes
+            // or that were allocated before the data BOs.
+            // Simple heuristic: include all non-instruction BOs that are
+            // smaller than 1MB (PDI BOs are small, data BOs are too, but
+            // we include them all and let DdrPatch select by arg_idx).
+            data_bos.push_back({bo.dev_addr, bo.size});
+          }
+        }
+
+        // Sort by device address to get a stable arg_idx ordering.
+        std::sort(data_bos.begin(), data_bos.end());
+
+        // Skip the first BO (PDI, lowest address) and the instruction BO
+        // (already filtered above).  The remaining BOs are data buffers.
+        bool skipped_first = false;
+        uint32_t fb_idx = 0;
+        for (const auto& [addr, sz] : data_bos) {
+          if (!skipped_first) {
+            skipped_first = true;
+            EMU_DBG("submit_cmd[%zu]: skipping PDI BO at 0x%" PRIx64, cmd_idx, addr);
+            continue;
+          }
+          m_transport->add_host_buffer(addr, sz);
+          EMU_DBG("submit_cmd[%zu]: BO table fallback arg_idx=%u "
+                  "addr=0x%" PRIx64 " size=%" PRIu64,
+                  cmd_idx, fb_idx, addr, sz);
+          fb_idx++;
+        }
       }
     }
 
