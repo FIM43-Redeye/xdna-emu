@@ -95,6 +95,30 @@ impl VectorAlu {
     // wide_element_wise_unary, wide_element_wise_binary,
     // execute_wide_fallback, increment_vector_regs
 
+    // --- Generic operation dispatchers ---
+    // These eliminate per-op boilerplate for simple binary/unary ops.
+    //
+    // execute_binary_elementwise: handles the read-compute-write cycle
+    // for any binary op (add, sub, mul, min, max) at both widths.
+    //
+    //   fn execute_binary_elementwise(
+    //       op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType,
+    //       compute: fn(&[u32; 8], &[u32; 8], ElementType) -> [u32; 8],
+    //   ) -> bool
+    //
+    // Narrow: get_two_vector_sources -> compute -> write_vector_dest
+    // Wide:   get_two_wide_vec_sources -> wide_element_wise_binary(compute) -> write_wide_vec_dest
+    //
+    // execute_unary_elementwise: same pattern for unary ops (negate, not, abs).
+    //
+    //   fn execute_unary_elementwise(
+    //       op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType,
+    //       compute: fn(&[u32; 8], ElementType) -> [u32; 8],
+    //   ) -> bool
+    //
+    // Narrow: get_vector_source(0) -> compute -> write_vector_dest
+    // Wide:   get_wide_vec_source(0) -> wide_element_wise_unary(compute) -> write_wide_vec_dest
+
     // --- Wide element manipulation ---
     // wide_vector_push, extract_wide_element,
     // insert_wide_element, insert_wide_element_64,
@@ -275,46 +299,21 @@ Move the match arm logic for each arithmetic SemanticOp into `execute_<op>()` fu
 - Modify: `src/interpreter/execute/vector_dispatch.rs` (update match arms)
 - Modify: `src/interpreter/execute/vector.rs` (remove arms from execute_half/execute_wide)
 
-- [ ] **Step 1: Add execute_add to vector_arith.rs**
+- [ ] **Step 1: Wire up simple binary ops via execute_binary_elementwise**
 
-Read the Add arms from both `execute_half` (lines ~130-157) and `execute_wide` (lines ~1659-1703) in vector.rs. Combine them into a single function:
-
-```rust
-impl VectorAlu {
-    /// VADD / VADDSUB: element-wise vector addition.
-    ///
-    /// Two variants:
-    /// 1. VADD: simple vector add (2 sources)
-    /// 2. VADDSUB: conditional add/subtract (2 vector + 1 scalar selector)
-    pub(super) fn execute_add(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        et: ElementType,
-    ) -> bool {
-        // Copy the narrow arm logic AND the wide arm logic here,
-        // gated on op.is_wide_vector or the accum_width check.
-        // ...verbatim from execute_half::Add and execute_wide::Add...
-        true
-    }
-}
-```
-
-The function body combines both paths with an `if op.is_wide_vector { ... } else { ... }` guard. Copy the match arm bodies verbatim -- do NOT simplify.
-
-- [ ] **Step 2: Update dispatch to call execute_add**
-
-In vector_dispatch.rs, replace the temporary delegation for Add with a direct call. Since the scaffold still routes everything through execute_half/execute_wide, the simplest approach: remove the Add arms from execute_half and execute_wide in vector.rs, and add Add to a new match block in vector_dispatch.rs before the fallback:
+Sub, Mul, Min, Max all follow the exact same read-compute-write pattern with no special cases. Instead of writing 4 near-identical `execute_<op>` functions, dispatch calls the generic helper directly:
 
 ```rust
-// In vector_dispatch.rs execute(), add before the half/wide delegation:
-match semantic {
-    SemanticOp::Add => return Self::execute_add(op, ctx, et),
-    _ => {}
-}
-// ... existing half/wide fallback ...
+// In vector_dispatch.rs:
+SemanticOp::Sub => Self::execute_binary_elementwise(op, ctx, et, Self::vector_sub),
+SemanticOp::Mul => Self::execute_binary_elementwise(op, ctx, et, Self::vector_mul),
+SemanticOp::Min => Self::execute_binary_elementwise(op, ctx, et, Self::vector_min),
+SemanticOp::Max => Self::execute_binary_elementwise(op, ctx, et, Self::vector_max),
 ```
 
-- [ ] **Step 3: Test**
+Remove the Sub/Mul/Min/Max arms from both execute_half and execute_wide in vector.rs.
+
+- [ ] **Step 2: Test**
 
 ```bash
 TMPDIR=/tmp/claude-1000 cargo test --lib -- -q
@@ -322,29 +321,53 @@ TMPDIR=/tmp/claude-1000 cargo test --lib -- -q
 
 Expected: 2660+ passed, 0 failed.
 
-- [ ] **Step 4: Repeat for Sub, Mul, Min, Max, Neg**
+- [ ] **Step 3: Add execute_add to vector_arith.rs**
 
-These are the simple binary/unary arithmetic ops. Each follows the same pattern:
-- Read the narrow arm from execute_half
-- Read the wide arm from execute_wide
-- Combine into `execute_<op>(op, ctx, et) -> bool`
-- Add to the dispatch match
-- Remove the arms from execute_half/execute_wide
-- Run `cargo test --lib` after each
+Add has special-case VADDSUB detection (scalar selector bitmask), so it needs its own function. The wide VADDSUB path also splits the selector across lo/hi halves with 64-bit register pair handling for 8-bit elements.
 
-Note: `Neg` has a special case -- if the source is an AccumReg (accumulator-only negate), it calls `execute_acc_negate`. Read the arms carefully and preserve this branching.
+Read the Add arms from both `execute_half` (lines ~130-157) and `execute_wide` (lines ~1659-1703) in vector.rs. Combine into one function with an `if op.is_wide_vector { ... } else { ... }` guard. Copy verbatim -- do NOT simplify.
 
-- [ ] **Step 5: Extract NegAdd, shift ops (Shl, Srl, Sra)**
+```rust
+impl VectorAlu {
+    /// VADD / VADDSUB: element-wise vector addition.
+    pub(super) fn execute_add(
+        op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType,
+    ) -> bool {
+        // Detect VADDSUB: 2 vector sources + 1 scalar selector
+        let has_scalar_sel = ...;  // copy from existing arm
+        if op.is_wide_vector {
+            // wide path (copy from execute_wide::Add)
+        } else {
+            // narrow path (copy from execute_half::Add)
+        }
+        true
+    }
+}
+```
 
-Same pattern. Shift ops read a shift amount from operands.
+Update dispatch: `SemanticOp::Add => Self::execute_add(op, ctx, et),`
 
-- [ ] **Step 6: Extract conditional arithmetic (AbsGtz, NegGtz, NegLtz, SubLt, SubGe, MaxDiffLt)**
+Remove Add arms from execute_half and execute_wide. Test.
 
-Same pattern. These write to both a vector dest and a comparison dest.
+- [ ] **Step 4: Add execute_neg to vector_arith.rs**
 
-- [ ] **Step 7: Extract Accumulate**
+Neg has a special case: if the source is an AccumReg (accumulator-only negate), it calls `execute_acc_negate` instead of the element-wise path. The wide path also branches on this. Needs its own function.
 
-The Accumulate arm handles 4 SemanticOp variants (`Accumulate | AccumSub | AccumNegAdd | AccumNegSub`). It has a complex branch: if the op has an AccumReg source, it calls `execute_acc_add_sub`; otherwise it does legacy vector accumulation. Move `execute_acc_add_sub` and `execute_acc_negate` into vector_arith.rs as well.
+- [ ] **Step 5: Extract NegAdd**
+
+NegAdd has accumulator-only routing similar to Neg. Needs its own function.
+
+- [ ] **Step 6: Wire up shift ops (Shl, Srl, Sra)**
+
+Shifts read a shift amount from operands, so they can't use the generic binary helper. Each needs its own function but they share the same pattern: `get_vector_source(0)` + `get_shift_amount()` + compute + write. Consider a `execute_shift_op` helper if the pattern repeats cleanly; otherwise write three small functions.
+
+- [ ] **Step 7: Extract conditional arithmetic (AbsGtz, NegGtz, NegLtz, SubLt, SubGe, MaxDiffLt)**
+
+These write to both a vector dest and a comparison dest. Each needs its own function. The wide paths for some use the bridge pattern; others have dedicated implementations.
+
+- [ ] **Step 8: Extract Accumulate**
+
+The Accumulate arm handles 4 SemanticOp variants (`Accumulate | AccumSub | AccumNegAdd | AccumNegSub`). Complex branch: if the op has an AccumReg source, it calls `execute_acc_add_sub`; otherwise it does legacy vector accumulation. Move `execute_acc_add_sub` and `execute_acc_negate` into vector_arith.rs as well.
 
 - [ ] **Step 8: Move arithmetic tests**
 
@@ -436,7 +459,14 @@ Copy handles both vector and accumulator moves. Clear zeros a register.
 
 - [ ] **Step 5: Add execute_and, execute_or, execute_xor, execute_not**
 
-The wide path for bitwise ops manually splits halves (no bridge). Copy verbatim.
+Bitwise ops don't take ElementType (they operate on raw u32 words), so they can't use `execute_binary_elementwise` directly. Two options:
+
+(a) Add a second generic helper `execute_binary_typeless` with signature `fn(&[u32; 8], &[u32; 8]) -> [u32; 8]` that handles the narrow/wide split.
+(b) Write small per-op functions that read, compute, write.
+
+Option (a) is cleaner since all 3 binary bitwise ops (and, or, xor) and the unary not share the same read-compute-write pattern. The wide path is manually split in the current code but `wide_element_wise_binary` can't be used (wrong compute fn signature). A typeless variant avoids per-op boilerplate.
+
+Not (unary) needs its own `execute_unary_typeless` or a small wrapper.
 
 - [ ] **Step 6: Add execute_pack, execute_unpack to vector_pack.rs**
 

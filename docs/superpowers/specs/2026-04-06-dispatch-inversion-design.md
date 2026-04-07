@@ -95,12 +95,12 @@ impl VectorAlu {
         let et = op.element_type.unwrap_or(ElementType::Int32);
 
         match semantic {
-            // Arithmetic
+            // Arithmetic -- simple binary ops use generic dispatcher
             Add                         => Self::execute_add(op, ctx, et),
-            Sub                         => Self::execute_sub(op, ctx, et),
-            Mul                         => Self::execute_mul(op, ctx, et),
-            Min                         => Self::execute_min(op, ctx, et),
-            Max                         => Self::execute_max(op, ctx, et),
+            Sub                         => Self::execute_binary_elementwise(op, ctx, et, Self::vector_sub),
+            Mul                         => Self::execute_binary_elementwise(op, ctx, et, Self::vector_mul),
+            Min                         => Self::execute_binary_elementwise(op, ctx, et, Self::vector_min),
+            Max                         => Self::execute_binary_elementwise(op, ctx, et, Self::vector_max),
             Neg                         => Self::execute_neg(op, ctx, et),
             NegAdd                      => Self::execute_neg_add(op, ctx, et),
             Shl                         => Self::execute_shl(op, ctx, et),
@@ -133,10 +133,10 @@ impl VectorAlu {
             Align                       => Self::execute_align(op, ctx, et),
             Copy                        => Self::execute_copy(op, ctx, et),
             VectorClear                 => Self::execute_clear(op, ctx, et),
-            And                         => Self::execute_and(op, ctx, et),
-            Or                          => Self::execute_or(op, ctx, et),
-            Xor                         => Self::execute_xor(op, ctx, et),
-            Not                         => Self::execute_not(op, ctx, et),
+            And                         => Self::execute_binary_typeless(op, ctx, Self::vector_bitwise_and),
+            Or                          => Self::execute_binary_typeless(op, ctx, Self::vector_bitwise_or),
+            Xor                         => Self::execute_binary_typeless(op, ctx, Self::vector_bitwise_xor),
+            Not                         => Self::execute_unary_typeless(op, ctx, Self::vector_bitwise_not),
             Pack                        => Self::execute_pack(op, ctx, et),
             Unpack                      => Self::execute_unpack(op, ctx, et),
 
