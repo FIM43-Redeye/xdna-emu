@@ -1091,6 +1091,107 @@ mod tests {
         assert_eq!(srs_s32(half, 4, RoundingMode::ConvOdd), 17); // 17 is odd
     }
 
+    // -----------------------------------------------------------------------
+    // truncate_nonzero -- internal helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn truncate_nonzero_zero_bits() {
+        assert!(!truncate_nonzero(0xFF, 0));
+    }
+
+    #[test]
+    fn truncate_nonzero_all_zero() {
+        assert!(!truncate_nonzero(0x100, 8)); // only bit 8 set, checking low 8 bits
+    }
+
+    #[test]
+    fn truncate_nonzero_some_set() {
+        assert!(truncate_nonzero(0x101, 8)); // bit 0 set in low 8 bits
+    }
+
+    #[test]
+    fn truncate_nonzero_large_bits() {
+        // bits >= 128: returns value != 0
+        assert!(truncate_nonzero(1, 128));
+        assert!(!truncate_nonzero(0, 128));
+    }
+
+    // -----------------------------------------------------------------------
+    // truncate_to_width -- internal helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn truncate_to_width_zero_bits() {
+        assert_eq!(truncate_to_width(0xABCD, false, 0), 0);
+    }
+
+    #[test]
+    fn truncate_to_width_unsigned_8bit() {
+        assert_eq!(truncate_to_width(0xFF, false, 8), 0xFF);
+        assert_eq!(truncate_to_width(0x1FF, false, 8), 0xFF);
+    }
+
+    #[test]
+    fn truncate_to_width_signed_8bit() {
+        // 0x80 in signed 8-bit = -128
+        assert_eq!(truncate_to_width(0x80, true, 8), -128);
+        // 0x7F in signed 8-bit = 127
+        assert_eq!(truncate_to_width(0x7F, true, 8), 127);
+    }
+
+    #[test]
+    fn truncate_to_width_64bit() {
+        // bits >= 64: no masking
+        assert_eq!(truncate_to_width(i64::MAX as i128, true, 64), i64::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // srs_lane with saturation disabled
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn no_saturation_allows_overflow() {
+        // 32768 exceeds i16::MAX (32767). With shift=0, BIAS cancels out
+        // (value << BIAS >> BIAS = value), so result = 32768 truncated to
+        // 16-bit signed = -32768 (wraps). With saturation on, it would
+        // clamp to 32767.
+        let result = srs_lane(32768, 0, true, 16, false, false, RoundingMode::Floor);
+        assert_eq!(result, -32768);
+
+        // Compare: with saturation on, same value clamps.
+        let result_sat = srs_lane(32768, 0, true, 16, true, false, RoundingMode::Floor);
+        assert_eq!(result_sat, 32767);
+    }
+
+    // -----------------------------------------------------------------------
+    // ConvEven/ConvOdd with negative halfway values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conv_even_negative_half_to_even() {
+        // -280 >> 4 = -17.5, -18 is even -> -18
+        assert_eq!(srs_s32(-280, 4, RoundingMode::ConvEven), -18);
+    }
+
+    #[test]
+    fn conv_even_negative_half_already_even() {
+        // -264 >> 4 = -16.5, -16 is even -> -16
+        assert_eq!(srs_s32(-264, 4, RoundingMode::ConvEven), -16);
+    }
+
+    #[test]
+    fn conv_odd_negative_half_to_odd() {
+        // -264 >> 4 = -16.5, -16 is even -> -17 (odd)
+        assert_eq!(srs_s32(-264, 4, RoundingMode::ConvOdd), -17);
+    }
+
+    #[test]
+    fn conv_odd_negative_half_already_odd() {
+        // -280 >> 4 = -17.5, -17 is odd -> -17
+        assert_eq!(srs_s32(-280, 4, RoundingMode::ConvOdd), -17);
+    }
+
     #[test]
     fn negative_halfway_modes_diverge() {
         // At -16.5 (-264 >> 4), the modes diverge in the opposite direction.
@@ -1272,6 +1373,80 @@ mod integration_tests {
             let expected = (expected_lo as u32) | ((expected_hi as u32) << 16);
             assert_eq!(result[i], expected, "result[{}]: got {:#010x}, expected {:#010x}",
                 i, result[i], expected);
+        }
+    }
+
+    #[test]
+    fn test_srs_bf16_truncates_f32() {
+        // BFloat16 SRS: each u64 holds two f32, truncated to bf16.
+        // f32 1.0 = 0x3F800000 -> bf16 = 0x3F80
+        // f32 2.0 = 0x40000000 -> bf16 = 0x4000
+        let mut acc = [0u64; 8];
+        acc[0] = 0x3F80_0000u64 | (0x4000_0000u64 << 32); // lo=1.0, hi=2.0
+        acc[1] = 0x4040_0000u64 | (0x4080_0000u64 << 32); // lo=3.0, hi=4.0
+
+        let cfg = SrsConfig {
+            rounding_mode: 0,
+            saturation_mode: 0,
+            srs_sign: true,
+        };
+
+        let result = VectorAlu::vector_srs_from_acc(
+            &acc, 0, ElementType::Int32, ElementType::BFloat16, &cfg,
+        );
+
+        // result[0] = bf16(1.0) | bf16(2.0) << 16 = 0x3F80 | 0x4000_0000
+        assert_eq!(result[0] & 0xFFFF, 0x3F80); // bf16 for 1.0
+        assert_eq!(result[0] >> 16, 0x4000);     // bf16 for 2.0
+        assert_eq!(result[1] & 0xFFFF, 0x4040);  // bf16 for 3.0
+        assert_eq!(result[1] >> 16, 0x4080);      // bf16 for 4.0
+    }
+
+    #[test]
+    fn test_srs_float32_passthrough() {
+        // Float32 SRS: passes through the low 32 bits of each u64.
+        let mut acc = [0u64; 8];
+        acc[0] = 0xDEAD_BEEF_3F80_0000; // low 32 = 0x3F800000 (1.0f)
+        acc[1] = 0xCAFE_BABE_4000_0000; // low 32 = 0x40000000 (2.0f)
+
+        let cfg = SrsConfig {
+            rounding_mode: 0,
+            saturation_mode: 0,
+            srs_sign: true,
+        };
+
+        let result = VectorAlu::vector_srs_from_acc(
+            &acc, 0, ElementType::Int32, ElementType::Float32, &cfg,
+        );
+
+        assert_eq!(result[0], 0x3F80_0000); // 1.0f
+        assert_eq!(result[1], 0x4000_0000); // 2.0f
+    }
+
+    #[test]
+    fn test_srs_from_acc64_to_d16() {
+        // Acc64 -> 16-bit: 8 u64 lanes, SRS'd to 16-bit, packed 2 per u32.
+        let mut acc = [0u64; 8];
+        for i in 0..8usize {
+            acc[i] = (100 + i) as u64;
+        }
+
+        let cfg = SrsConfig {
+            rounding_mode: 0,
+            saturation_mode: 0,
+            srs_sign: true,
+        };
+
+        let result = VectorAlu::vector_srs_from_acc(
+            &acc, 0, ElementType::Int64, ElementType::Int16, &cfg,
+        );
+
+        // 8 lanes packed 2 per word = 4 words
+        for i in 0..4 {
+            let expected_lo = (100 + i * 2) as u16;
+            let expected_hi = (100 + i * 2 + 1) as u16;
+            let expected = (expected_lo as u32) | ((expected_hi as u32) << 16);
+            assert_eq!(result[i], expected, "result[{}]", i);
         }
     }
 
