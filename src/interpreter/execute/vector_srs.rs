@@ -328,6 +328,243 @@ fn truncate_to_width(value: i128, signed: bool, bits: u32) -> i64 {
     }
 }
 
+// --- VectorAlu dispatch and pipeline wrappers ---
+
+use crate::interpreter::bundle::{ElementType, SlotOp};
+use crate::interpreter::state::{ExecutionContext, SrsConfig};
+use super::vector_dispatch::VectorAlu;
+
+impl VectorAlu {
+    /// Dispatch entry point for SRS (Shift-Round-Saturate) operations.
+    ///
+    /// Handles both narrow (256-bit) and wide (512-bit / 1024-bit) paths,
+    /// including AccumWidth detection for Half vs Full accumulator sources.
+    pub(super) fn execute_srs(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
+        let has_wide_acc_source = matches!(op.accum_width,
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Full)
+            | Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+
+        if op.is_wide_vector || has_wide_acc_source {
+            Self::execute_srs_wide(op, ctx, et)
+        } else {
+            Self::execute_srs_narrow(op, ctx, et)
+        }
+    }
+
+    /// Narrow SRS path: read 512-bit accumulator, SRS to 256-bit vector.
+    fn execute_srs_narrow(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
+        let acc_reg = Self::get_acc_source(op);
+        let shift = Self::get_shift_amount(op, ctx);
+        let from = op.from_type.unwrap_or(ElementType::Int32);
+        let result = Self::vector_srs(ctx, acc_reg, shift, from, et);
+        Self::write_vector_dest(op, ctx, result);
+        true
+    }
+
+    /// Wide SRS path: read 1024-bit or 512-bit accumulator, SRS to 512-bit or 256-bit vector.
+    fn execute_srs_wide(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
+        let acc_reg = Self::get_acc_source(op);
+        let shift = Self::get_shift_amount(op, ctx);
+        let from = op.from_type.unwrap_or(ElementType::Int64);
+        // Half (bml/bmh) is 512-bit = single bm register, use narrow
+        // read. Full (cm) and None (legacy/wide default) use read_wide.
+        let is_half = matches!(op.accum_width,
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+
+        if !is_half {
+            // Wide SRS: read Acc1024 (cm-register), SRS each half,
+            // write Vec512.
+            let acc_wide = ctx.accumulator.read_wide(acc_reg);
+            let acc_lo: [u64; 8] = acc_wide[..8].try_into().unwrap();
+            let acc_hi: [u64; 8] = acc_wide[8..].try_into().unwrap();
+
+            let result_lo = Self::vector_srs_from_acc(&acc_lo, shift, from, et, &ctx.srs_config);
+            let result_hi = Self::vector_srs_from_acc(&acc_hi, shift, from, et, &ctx.srs_config);
+
+            // Pack the two halves contiguously. For reduction SRS
+            // (e.g., s8 from s32, s16 from s64), each half only fills
+            // a fraction of its 8-word output.
+            let from_bits = from.bits() as usize;
+            let lanes_per_half = if from_bits <= 32 { 16 } else { 8 };
+            let to_bits = et.bits() as usize;
+            let words_per_half = (lanes_per_half * to_bits + 31) / 32;
+
+            let mut result = [0u32; 16];
+            let n = words_per_half.min(8);
+            result[..n].copy_from_slice(&result_lo[..n]);
+            result[n..n + n].copy_from_slice(&result_hi[..n]);
+            Self::write_wide_vec_dest(op, ctx, result);
+        } else {
+            // Half SRS (bml/bmh): read single 512-bit accum register,
+            // SRS 8 lanes, write to 256-bit w-register.
+            let acc = ctx.accumulator.read(acc_reg);
+            let result = Self::vector_srs_from_acc(&acc, shift, from, et, &ctx.srs_config);
+            Self::write_vector_dest(op, ctx, result);
+        }
+        true
+    }
+
+    /// Shift-Round-Saturate: convert accumulator lanes to narrower vector output.
+    ///
+    /// Thin wrapper that reads the accumulator register and delegates to
+    /// `vector_srs_from_acc` for the actual conversion logic.
+    fn vector_srs(
+        ctx: &ExecutionContext,
+        acc_reg: u8,
+        shift: u32,
+        from_type: ElementType,
+        to_type: ElementType,
+    ) -> [u32; 8] {
+        let acc = ctx.accumulator.read(acc_reg);
+        Self::vector_srs_from_acc(&acc, shift, from_type, to_type, &ctx.srs_config)
+    }
+
+    /// Core SRS logic operating on accumulator data directly.
+    ///
+    /// The accumulator always has 8 lanes of 64-bit each (one value per u64).
+    /// SRS reads 8 accumulator values and converts them to narrower output,
+    /// packing multiple values per u32 word for 16-bit and 8-bit outputs.
+    ///
+    /// `from_type` controls how many bits of each u64 lane are meaningful:
+    /// in S32 mode only the low 32 bits matter (upper bits may be garbage),
+    /// in S64 mode the full 64 bits are used.
+    ///
+    /// Delegates to the `vector_srs` module which implements the full 10-mode
+    /// SRS pipeline (shift, round, saturate) per AIE2 hardware specification.
+    /// Float types (BFloat16, Float32) are handled inline since they bypass
+    /// the integer rounding pipeline.
+    ///
+    /// Used by the narrow `vector_srs`, wide SRS handler, and fused `vst.srs`.
+    pub(crate) fn vector_srs_from_acc(
+        acc: &[u64; 8],
+        shift: u32,
+        from_type: ElementType,
+        to_type: ElementType,
+        cfg: &SrsConfig,
+    ) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        // Read rounding and saturation from the SRS control register state.
+        let mode = RoundingMode::from_raw(cfg.rounding_mode)
+            .unwrap_or(RoundingMode::PosInf);
+        let saturate = cfg.saturate();
+        let sym_sat = cfg.symmetric_saturate();
+
+        let signed_output = to_type.is_signed();
+
+        // Mask accumulator values to from_type width.
+        // In S32 mode, only low 32 bits are meaningful.
+        // In S64 mode (or 64-bit types), use the full u64.
+        let from_bits = from_type.bits() as u32;
+        let mask_value = |raw: u64| -> i64 {
+            if from_bits >= 64 {
+                raw as i64
+            } else {
+                // Sign-extend from from_bits width.
+                let shift_amt = 64 - from_bits;
+                ((raw as i64) << shift_amt) >> shift_amt
+            }
+        };
+
+        // 8 accumulator lanes, each u64 holds one value.
+        match to_type {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
+                for i in 0..8 {
+                    let val = mask_value(acc[i]);
+                    let out = srs_lane(
+                        val, shift, signed_output, 32,
+                        saturate, sym_sat, mode,
+                    );
+                    result[i] = out as u32;
+                }
+            }
+            ElementType::Int16 | ElementType::UInt16 => {
+                if from_bits >= 64 {
+                    // Acc64 -> 16-bit (4:1 reduction): 8 u64 lanes, each
+                    // SRS'd from 64-bit to 16-bit. Pack 2 per u32 = 4 words.
+                    for i in 0..4 {
+                        let val0 = mask_value(acc[i * 2]);
+                        let val1 = mask_value(acc[i * 2 + 1]);
+                        let out0 = srs_lane(
+                            val0, shift, signed_output, 16,
+                            saturate, sym_sat, mode,
+                        );
+                        let out1 = srs_lane(
+                            val1, shift, signed_output, 16,
+                            saturate, sym_sat, mode,
+                        );
+                        result[i] = (out0 as u16 as u32) | ((out1 as u16 as u32) << 16);
+                    }
+                } else {
+                    // Acc32 -> 16-bit (2:1 reduction): 16 lanes packed 2 per u64.
+                    // Extract lo32 and hi32 from each u64 to get 16 acc32 lanes,
+                    // then SRS each to 16-bit and pack 2 per u32 result word.
+                    for i in 0..8 {
+                        let lo_val = mask_value(acc[i] & 0xFFFF_FFFF);
+                        let hi_val = mask_value(acc[i] >> 32);
+                        let out_lo = srs_lane(
+                            lo_val, shift, signed_output, 16,
+                            saturate, sym_sat, mode,
+                        );
+                        let out_hi = srs_lane(
+                            hi_val, shift, signed_output, 16,
+                            saturate, sym_sat, mode,
+                        );
+                        result[i] = (out_lo as u16 as u32) | ((out_hi as u16 as u32) << 16);
+                    }
+                }
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                // Acc32 mode: 16 lanes packed 2 per u64 -> 16 x 8-bit output.
+                // 16 bytes = 4 u32 result words.
+                for i in 0..4 {
+                    let mut word = 0u32;
+                    for j in 0..4 {
+                        let lane_idx = i * 4 + j;
+                        let u64_idx = lane_idx / 2;
+                        let is_hi = lane_idx % 2 == 1;
+                        let raw = if is_hi {
+                            acc[u64_idx] >> 32
+                        } else {
+                            acc[u64_idx] & 0xFFFF_FFFF
+                        };
+                        let val = mask_value(raw);
+                        let out = srs_lane(
+                            val, shift, signed_output, 8,
+                            saturate, sym_sat, mode,
+                        );
+                        word |= (out as u8 as u32) << (j * 8);
+                    }
+                    result[i] = word;
+                }
+            }
+            ElementType::BFloat16 => {
+                // Acc32 float mode: each u64 holds two f32 values.
+                // BFloat16 SRS: extract each f32 and truncate to bf16,
+                // packing two bf16 per u32 result word -> 16 bf16 lanes.
+                for i in 0..8 {
+                    let f_lo = f32::from_bits(acc[i] as u32);
+                    let f_hi = f32::from_bits((acc[i] >> 32) as u32);
+                    let bf_lo = Self::f32_to_bf16(f_lo);
+                    let bf_hi = Self::f32_to_bf16(f_hi);
+                    result[i] = (bf_lo as u32) | ((bf_hi as u32) << 16);
+                }
+            }
+            ElementType::Float32 => {
+                // Acc32 float mode: each u64 holds two f32 values
+                // (bits [31:0] = lo, bits [63:32] = hi).
+                // Float SRS is a pass-through: extract the low f32 per lane.
+                // 8 accumulator u64 words -> 8 f32 result words (low half).
+                for i in 0..8 {
+                    result[i] = acc[i] as u32;
+                }
+            }
+        }
+
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -358,6 +358,107 @@ pub fn ups_vector_to_acc_wide(
     result
 }
 
+// --- VectorAlu dispatch wrapper ---
+
+use crate::interpreter::bundle::{Operand, SlotOp};
+use crate::interpreter::state::ExecutionContext;
+use super::vector_dispatch::VectorAlu;
+
+impl VectorAlu {
+    /// Dispatch entry point for UPS (Upshift / type-widening) operations.
+    ///
+    /// Handles both narrow (256-bit) and wide (512-bit / 1024-bit) paths,
+    /// including AccumWidth detection for Half vs Full accumulator destinations.
+    pub(super) fn execute_ups(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
+        let has_wide_acc_source = matches!(op.accum_width,
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Full)
+            | Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+
+        if op.is_wide_vector || has_wide_acc_source {
+            Self::execute_ups_wide(op, ctx, et)
+        } else {
+            Self::execute_ups_narrow(op, ctx, et)
+        }
+    }
+
+    /// Narrow UPS path: widen narrow vector lanes into 512-bit accumulator.
+    fn execute_ups_narrow(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
+        let src = Self::get_vector_source(op, ctx, 0);
+        let shift = Self::get_shift_amount(op, ctx);
+        let from = op.from_type.unwrap_or(ElementType::Int16);
+        let acc_result = ups_vector_to_acc(&src, shift, from, et);
+        match &op.dest {
+            Some(Operand::AccumReg(r)) => {
+                ctx.accumulator.write(*r, acc_result);
+            }
+            other => {
+                panic!(
+                    "VUPS destination must be AccumReg, got {:?} (encoding={:?})",
+                    other, op.encoding_name,
+                );
+            }
+        }
+        true
+    }
+
+    /// Wide UPS path: widen to 1024-bit accumulator (w2c or x2c).
+    fn execute_ups_wide(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
+        let shift = Self::get_shift_amount(op, ctx);
+        let from = op.from_type.unwrap_or(ElementType::Int16);
+        let is_half = matches!(op.accum_width,
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+
+        if !is_half {
+            let acc_wide = if !op.is_wide_vector {
+                // w2c path: narrow source (256-bit wl) fills full
+                // 1024-bit cm register via 4:1 upshift.
+                let src = Self::get_vector_source(op, ctx, 0);
+                ups_vector_to_acc_wide(&src, shift, from, et)
+            } else {
+                // x2c path: wide source (512-bit x-reg), UPS each half.
+                let src = Self::get_wide_vec_source(op, ctx, 0);
+                let src_lo: [u32; 8] = src[..8].try_into().unwrap();
+                let src_hi: [u32; 8] = src[8..].try_into().unwrap();
+                let acc_lo = ups_vector_to_acc(&src_lo, shift, from, et);
+                let acc_hi = ups_vector_to_acc(&src_hi, shift, from, et);
+                let mut wide = [0u64; 16];
+                wide[..8].copy_from_slice(&acc_lo);
+                wide[8..].copy_from_slice(&acc_hi);
+                wide
+            };
+
+            match &op.dest {
+                Some(Operand::AccumReg(r)) => {
+                    ctx.accumulator.write_wide(*r, acc_wide);
+                }
+                other => {
+                    panic!(
+                        "Wide VUPS destination must be AccumReg, got {:?} (encoding={:?})",
+                        other, op.encoding_name,
+                    );
+                }
+            }
+        } else {
+            // Half UPS (bml/bmh): narrow source -> single 512-bit
+            // accum register.
+            let src = Self::get_vector_source(op, ctx, 0);
+            let acc_result = ups_vector_to_acc(&src, shift, from, et);
+            match &op.dest {
+                Some(Operand::AccumReg(r)) => {
+                    ctx.accumulator.write(*r, acc_result);
+                }
+                other => {
+                    panic!(
+                        "VUPS destination must be AccumReg, got {:?} (encoding={:?})",
+                        other, op.encoding_name,
+                    );
+                }
+            }
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

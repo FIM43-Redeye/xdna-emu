@@ -88,6 +88,7 @@ pub mod vector_srs;
 pub mod vector_ups;
 pub mod vector_config;
 pub mod vector_float;
+pub mod vector_convert;
 pub mod vector_matmul;
 pub mod vector_matmul_sparse;
 pub mod vmac_hw;

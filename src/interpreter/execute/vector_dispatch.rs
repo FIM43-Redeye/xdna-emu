@@ -97,6 +97,11 @@ impl VectorAlu {
             SemanticOp::Pack => return Self::execute_pack(op, ctx, et),
             SemanticOp::Unpack => return Self::execute_unpack(op, ctx, et),
 
+            // SRS/UPS/Convert
+            SemanticOp::Srs => return Self::execute_srs(op, ctx, et),
+            SemanticOp::Ups => return Self::execute_ups(op, ctx, et),
+            SemanticOp::Convert => return Self::execute_convert(op, ctx, et),
+
             _ => {}
         }
 
