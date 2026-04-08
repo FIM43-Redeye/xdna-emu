@@ -371,9 +371,29 @@ impl BufferDescriptor {
             lock_acq_value: sign_extend_7bit(lay.lock_acq_value.extract(w7) as u8),
             lock_acq_id: lay.lock_acq_id.extract(w7) as u8,
 
-            // Not used in Shim
+            // Shim BDs have no D2_Wrap register field. On real hardware,
+            // the D2 iteration count is implicit: the DMA transfers
+            // Buffer_Length words total, using D0 x D1 addressing per
+            // "page" and stepping by D2_Stepsize between pages. The D2
+            // wrap count is: buffer_length / (d0_size * d1_size).
+            // When D0 and D1 are both simple (wrap=0), D2 is unused.
             d3_stepsize: 0,
-            d2_wrap: 0,
+            d2_wrap: {
+                let d0_sz = lay.d0_wrap.extract(w3) as u32;
+                let d1_sz = lay.d1_wrap.extract(w4) as u32;
+                let buf_len = lay.buffer_length.extract(w0);
+                let d2_step = lay.d2_stepsize.extract(w5) + 1;
+                if d0_sz > 0 && d1_sz > 0 && d2_step > 0 {
+                    let page_size = d0_sz * d1_sz;
+                    if page_size > 0 && buf_len > page_size {
+                        (buf_len / page_size) as u16
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            },
             compression_enable: false,
             d0_zero_before: 0,
             d0_zero_after: 0,
@@ -933,6 +953,62 @@ mod tests {
         assert_eq!(cfg.length, 0x1000 * 4);
         assert_eq!(cfg.d0.size, 1);
         assert_eq!(cfg.d0.stride, 4 * 4);
+    }
+
+    /// Shim BD: D2 wrap is derived from buffer_length / (d0_size * d1_size)
+    /// since the shim BD register has no D2_Wrap field. This tests that a
+    /// 4D transfer [1,4,64,64] with strides [0,4096,64,1] produces the
+    /// correct d2_wrap=4 on a shim tile.
+    #[test]
+    fn test_shim_bd_implicit_d2_wrap() {
+        // Simulates the BD for: dma_memcpy_nd(%arg0[0,0,0,0][1,4,64,64][0,4096,64,1])
+        // In word units: D0=16 words (stride 1), D1=64 (stride 16), D2 stride=1024
+        // Buffer_Length = 16*64*4 = 4096 words = 16384 bytes
+        let words: [u32; 8] = [
+            4096,                  // BD_0: length=4096 words (16384 bytes)
+            0x0000_0400,           // BD_1: addr_low
+            0x0000_0000,           // BD_2: no packet
+            // BD_3: d0_wrap=16, d0_step stored=0 (actual=1)
+            (16 << 20) | 0,
+            // BD_4: d1_wrap=64, d1_step stored=15 (actual=16)
+            (64 << 20) | 15,
+            // BD_5: d2_step stored=1023 (actual=1024)
+            1023,
+            // BD_6: no iteration
+            0,
+            // BD_7: valid=1
+            1u32 << 25,
+        ];
+
+        let bd = BufferDescriptor::from_registers(&words, TileType::Shim);
+
+        // Verify D2 wrap was derived from buffer_length / (d0 * d1)
+        assert_eq!(bd.d2_wrap, 4, "d2_wrap should be 4096/(16*64)=4");
+        assert_eq!(bd.d0_wrap, 16);
+        assert_eq!(bd.d1_wrap, 64);
+        assert_eq!(bd.d2_stepsize, 1024);
+
+        let cfg = bd.to_bd_config();
+        assert_eq!(cfg.d2.size, 4);
+        assert_eq!(cfg.d2.stride, 1024 * 4); // 4096 bytes
+    }
+
+    /// Shim BD: simple 1D transfer should NOT produce a D2 wrap.
+    #[test]
+    fn test_shim_bd_simple_no_d2_wrap() {
+        let words: [u32; 8] = [
+            64,           // BD_0: length=64 words
+            0,            // BD_1
+            0,            // BD_2
+            0,            // BD_3: d0_wrap=0 (simple), d0_step=0
+            0,            // BD_4: d1_wrap=0, d1_step=0
+            0,            // BD_5: d2_step=0
+            0,            // BD_6
+            1u32 << 25,   // BD_7: valid=1
+        ];
+
+        let bd = BufferDescriptor::from_registers(&words, TileType::Shim);
+        assert_eq!(bd.d2_wrap, 0, "simple 1D should have d2_wrap=0");
     }
 
     #[test]
