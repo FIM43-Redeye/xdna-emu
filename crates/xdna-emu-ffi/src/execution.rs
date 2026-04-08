@@ -135,12 +135,11 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
             // immediately because no cores are enabled.  But the NPU
             // executor may still be issuing instructions that configure
             // and trigger DMA, or DMA channels may already be running.
-            // Keep running while any of: executor pending, DMA active,
-            // or sync conditions unsatisfied.
+            // Keep running while executor has pending work or syncs are
+            // unsatisfied.
             let executor_pending = !handle.npu_executor.is_done()
                 || !handle.npu_executor.syncs_satisfied(handle.engine.device());
-            let dma_active = handle.engine.device().array.any_dma_active();
-            if executor_pending || dma_active {
+            if executor_pending || handle.engine.device().array.any_dma_active() {
                 handle.engine.force_running();
             } else {
                 log::info!("Cores halted after {} cycles", cycles);
@@ -148,12 +147,13 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
             }
         }
 
-        // Check if DMA syncs are satisfied (execution complete).
-        // Only check after all NPU instructions have been processed
-        // and no DMA channels are still running.
+        // Check if all NPU sync conditions are satisfied.  On real
+        // hardware, firmware considers execution complete when the sync
+        // fires -- DMA channels may still be running (trace channels,
+        // BD chains with use_next_bd, etc.) but the host transfer is
+        // done.  Do NOT require all DMA to be idle here.
         if handle.npu_executor.is_done()
             && handle.npu_executor.syncs_satisfied(handle.engine.device())
-            && !handle.engine.device().array.any_dma_active()
         {
             log::info!("All DMA syncs satisfied after {} cycles", cycles);
             break;

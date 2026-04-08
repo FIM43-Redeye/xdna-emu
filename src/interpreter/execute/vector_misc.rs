@@ -578,41 +578,46 @@ impl VectorAlu {
 
     /// Copy: vector/accumulator move.
     ///
-    /// Handles VectorReg->VectorReg, AccumReg->AccumReg, and
-    /// AccumReg->VectorReg moves. Wide path also handles cm-register
-    /// (1024-bit) moves.
+    /// Handles all register-file move combinations:
+    /// - VectorReg -> VectorReg (narrow 256-bit and wide 512-bit)
+    /// - AccumReg -> AccumReg (bm 512-bit and cm 1024-bit)
+    /// - VectorReg -> AccumReg (e.g., vmov bmh0, x1)
+    /// - AccumReg -> VectorReg (e.g., vmov x0, bml0)
     pub(super) fn execute_copy(op: &SlotOp, ctx: &mut ExecutionContext, _et: ElementType) -> bool {
-        // cm-register moves (VMOV cm_dst, cm_src) don't set is_wide_vector
-        // but have AccumReg operands and need the wide path.
-        let has_acc = op.sources.iter().any(|s| matches!(s, Operand::AccumReg(_)))
-            || matches!(&op.dest, Some(Operand::AccumReg(_)));
-        if op.is_wide_vector || has_acc {
-            // Handle both vector-to-vector and accum-to-accum moves.
-            let has_acc_source = op.sources.iter()
-                .any(|s| matches!(s, Operand::AccumReg(_)));
-            if has_acc_source {
-                let src_reg = op.sources.iter().find_map(|s| match s {
-                    Operand::AccumReg(r) => Some(*r),
-                    _ => None,
-                }).unwrap_or(0);
-                let is_half = matches!(op.accum_width,
-                    Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
-                if !is_half {
-                    // Accumulator move: vmov cm_dst, cm_src
-                    let data = ctx.accumulator.read_wide(src_reg);
-                    Self::write_wide_acc_dest(op, ctx, data);
-                } else {
-                    // Half-accum move: vmov bm_dst, bm_src
-                    let data = ctx.accumulator.read(src_reg);
-                    let dst = Self::get_acc_dest(op);
-                    ctx.accumulator.write(dst, data);
-                }
+        let has_acc_source = op.sources.iter()
+            .any(|s| matches!(s, Operand::AccumReg(_)));
+        let has_acc_dest = matches!(&op.dest, Some(Operand::AccumReg(_)));
+
+        if has_acc_source && has_acc_dest {
+            // Accum -> Accum (bm or cm move).
+            let src_reg = op.sources.iter().find_map(|s| match s {
+                Operand::AccumReg(r) => Some(*r),
+                _ => None,
+            }).unwrap_or(0);
+            let is_half = matches!(op.accum_width,
+                Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+            if !is_half {
+                // Accumulator move: vmov cm_dst, cm_src
+                let data = ctx.accumulator.read_wide(src_reg);
+                Self::write_wide_acc_dest(op, ctx, data);
             } else {
-                // Vector move: vmov x_dst, x_src
-                let a = Self::get_wide_vec_source(op, ctx, 0);
-                Self::write_wide_vec_dest(op, ctx, a);
+                // Half-accum move: vmov bm_dst, bm_src
+                let data = ctx.accumulator.read(src_reg);
+                let dst = Self::get_acc_dest(op);
+                ctx.accumulator.write(dst, data);
             }
+        } else if has_acc_source || has_acc_dest {
+            // Cross-register-file move (vector <-> accumulator).
+            // get_vector_source handles AccumReg sources (truncates u64->u32).
+            // write_vector_dest handles AccumReg destinations (zero-extends u32->u64).
+            let src = Self::get_vector_source(op, ctx, 0);
+            Self::write_vector_dest(op, ctx, src);
+        } else if op.is_wide_vector {
+            // Wide vector move: vmov x_dst_wide, x_src_wide (512-bit)
+            let a = Self::get_wide_vec_source(op, ctx, 0);
+            Self::write_wide_vec_dest(op, ctx, a);
         } else {
+            // Narrow vector move: vmov x_dst, x_src (256-bit)
             let src = Self::get_vector_source(op, ctx, 0);
             Self::write_vector_dest(op, ctx, src);
         }

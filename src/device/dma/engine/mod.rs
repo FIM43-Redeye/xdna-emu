@@ -578,6 +578,15 @@ impl DmaEngine {
         self.channels[ch_idx].is_active()
     }
 
+    /// Get a human-readable description of a channel's FSM state.
+    pub fn channel_state_name(&self, channel: ChannelId) -> String {
+        let ch_idx = channel as usize;
+        if ch_idx >= self.num_channels() {
+            return "invalid".to_string();
+        }
+        self.channels[ch_idx].fsm_description()
+    }
+
     /// Check if a channel has pending work (active, waiting, or has queued work).
     pub fn channel_has_pending_work(&self, channel: ChannelId) -> bool {
         let ch_idx = channel as usize;
