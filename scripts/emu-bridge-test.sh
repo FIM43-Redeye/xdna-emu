@@ -88,7 +88,7 @@ RUN_EMU=true
 LIST_ONLY=false
 VERBOSE=false
 COMPILER_MODE="both"  # "both", "chess", "peano"
-NO_TRACE="${NO_TRACE:-false}"
+NO_TRACE="${NO_TRACE:-true}"
 SWEEP=false
 RUN_AIESIM=false
 
@@ -108,6 +108,7 @@ while [[ $# -gt 0 ]]; do
     --chess-only|--chess)  COMPILER_MODE="chess"; shift ;;
     --peano-only|--peano)  COMPILER_MODE="peano"; shift ;;
     --no-trace)            NO_TRACE=true; shift ;;
+    --trace)               NO_TRACE=false; shift ;;
     --sweep)               SWEEP=true; shift ;;
     --aiesim)              RUN_AIESIM=true; shift ;;
     --serial-hw)           NPU_HW_JOBS=1; shift ;;
@@ -120,7 +121,8 @@ Options:
   --compile       Force recompile all xclbins (default: use cached)
   --no-hw         Skip real hardware runs (default: hardware enabled)
   --no-emu        Skip emulator runs (default: emulator enabled)
-  --no-trace      Disable always-on trace preparation (default: traces enabled)
+  --trace         Enable trace injection and comparison (default: off)
+  --no-trace      Disable trace preparation (default; kept for back-compat)
   --sweep         Run full event sweep (trace-sweep.py) on passing tests after runs
   --aiesim        Run aiesimulator on Chess builds + VCD coverage audit
   --list          List available tests and exit
