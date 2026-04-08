@@ -708,54 +708,21 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
         valid_bo_count++;
       }
 
-      // ELF module path fallback: when using xrt::ext::kernel with an
-      // ELF module, XRT puts instruction data in ert_npu_data but the
-      // regmap may not contain BO addresses (they're resolved via ELF
-      // relocations instead).  Detect this and register all data BOs
-      // from the BO table, sorted by device address, excluding the PDI
-      // and instruction BOs.
+      // ELF module path: when using xrt::ext::kernel with an ELF
+      // module, XRT patches BO addresses directly into the control code
+      // buffers (block-write payloads in .ctrltext) via ELF relocations
+      // at the host, adding the DDR AIE address offset (0x80000000).
+      // The firmware does NOT receive a host buffer table -- it just
+      // executes the pre-patched instruction stream.
+      //
+      // We leave the host buffer table empty so the emulator's DdrPatch
+      // handler knows to derive correct addresses from the XRT-patched
+      // register values (subtracting the DDR offset) rather than looking
+      // up arg_idx in a (wrong) fallback table.
       if (valid_bo_count == 0) {
         EMU_INFO("submit_cmd[%zu]: no valid BOs in regmap -- "
-                 "using BO table fallback (ELF module path)", cmd_idx);
-
-        // Collect data BOs (exclude instruction BO and PDI BO).
-        std::vector<std::pair<uint64_t, uint64_t>> data_bos;
-        {
-          const std::lock_guard<std::mutex> lock(m_bo_lock);
-          for (const auto& [h, bo] : m_bo_map) {
-            // Skip the instruction buffer BO.
-            if (bo.dev_addr == sc.instr_addr)
-              continue;
-            // Skip BOs that look like PDI (loaded via config_ctx_cu_config).
-            // PDI BOs are typically larger than 1KB and allocated first.
-            // A reliable filter: skip BOs whose size matches known PDI sizes
-            // or that were allocated before the data BOs.
-            // Simple heuristic: include all non-instruction BOs that are
-            // smaller than 1MB (PDI BOs are small, data BOs are too, but
-            // we include them all and let DdrPatch select by arg_idx).
-            data_bos.push_back({bo.dev_addr, bo.size});
-          }
-        }
-
-        // Sort by device address to get a stable arg_idx ordering.
-        std::sort(data_bos.begin(), data_bos.end());
-
-        // Skip the first BO (PDI, lowest address) and the instruction BO
-        // (already filtered above).  The remaining BOs are data buffers.
-        bool skipped_first = false;
-        uint32_t fb_idx = 0;
-        for (const auto& [addr, sz] : data_bos) {
-          if (!skipped_first) {
-            skipped_first = true;
-            EMU_DBG("submit_cmd[%zu]: skipping PDI BO at 0x%" PRIx64, cmd_idx, addr);
-            continue;
-          }
-          m_transport->add_host_buffer(addr, sz);
-          EMU_DBG("submit_cmd[%zu]: BO table fallback arg_idx=%u "
-                  "addr=0x%" PRIx64 " size=%" PRIu64,
-                  cmd_idx, fb_idx, addr, sz);
-          fb_idx++;
-        }
+                 "ELF module path (addresses pre-patched by XRT)",
+                 cmd_idx);
       }
     }
 

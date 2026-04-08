@@ -757,19 +757,40 @@ impl NpuExecutor {
     }
 
     /// Execute a DDR patch instruction.
+    ///
+    /// Two modes of operation:
+    ///
+    /// 1. **Host buffer mode** (non-ELF path): host_buffers is populated by the
+    ///    plugin from the ERT regmap.  DdrPatch looks up `host_buffers[arg_idx]`
+    ///    and writes `buffer.address + arg_plus` to the BD register.
+    ///
+    /// 2. **Pre-patched mode** (ELF module path): host_buffers is empty.  XRT
+    ///    already patched the block-write payloads with correct BO addresses
+    ///    plus the DDR AIE address offset (0x80000000).  The preceding
+    ///    block-write has set the register to this pre-patched value.  We read
+    ///    the current register, subtract the DDR offset to translate from the
+    ///    AIE address space to our emulator address space, and write back.
+    ///    This models the hardware's DDR address translation.
     fn execute_ddr_patch(&mut self, reg_addr: u32, arg_idx: u8, arg_plus: u32, device: &mut DeviceState) -> Result<(), String> {
+        let (col, row, offset) = decode_npu_address(reg_addr);
+
+        if self.host_buffers.is_empty() {
+            // ELF module path: addresses are pre-patched by XRT with DDR
+            // offset.  Read the current register value (set by the preceding
+            // block-write), subtract the DDR AIE address offset, write back.
+            return self.execute_ddr_patch_prepatched(col, row, offset, reg_addr, arg_idx, arg_plus, device);
+        }
+
+        // Host buffer mode: look up the buffer address by arg_idx.
+        //
         // Extend host_buffers with trace-sized entries if the xclbin
         // references arg indices beyond what the test harness allocated.
         // This happens with trace-injected xclbins: trace injection adds an
-        // extra DDR buffer for HW packet trace collection. The emulator's
-        // trace units produce real binary trace packets that flow through
-        // the stream switch and shim DMA into this buffer, matching the
-        // format expected by mlir-aie's parse.py.
+        // extra DDR buffer for HW packet trace collection.
         while self.host_buffers.len() <= arg_idx as usize {
             let trace_addr = self.host_buffers.last()
                 .map(|b| b.address + b.size as u64)
                 .unwrap_or(0x10_0000);
-            // 1 MB trace buffer, matching the default trace_size
             let trace_size = 1_048_576;
             log::info!(
                 "DDR patch references arg_idx {} beyond {} known buffers -- \
@@ -787,7 +808,6 @@ impl NpuExecutor {
         }
 
         let buffer = &self.host_buffers[arg_idx as usize];
-
         let patched_addr = buffer.address + arg_plus as u64;
 
         log::debug!(
@@ -795,22 +815,65 @@ impl NpuExecutor {
             reg_addr, arg_idx, arg_plus, patched_addr
         );
 
-        // Write the patched address to the register
-        // For 64-bit addresses, we write the low 32 bits
-        let (col, row, offset) = decode_npu_address(reg_addr);
+        self.write_bd_address(col, row, offset, patched_addr, device);
+        Ok(())
+    }
 
-        // Write low 32 bits of the patched address through unified register bus.
-        device.write_tile_register(col, row, offset, patched_addr as u32);
+    /// DDR patch for the ELF module (pre-patched) path.
+    ///
+    /// XRT's ELF relocation processing patches block-write payloads with
+    /// `BO_addr + addend + DDR_AIE_ADDR_OFFSET` (where DDR_AIE_ADDR_OFFSET
+    /// = 0x80000000).  The preceding block-write wrote this value to the BD
+    /// register.  We read it, subtract the DDR offset to recover the
+    /// emulator-space address, and write back.
+    ///
+    /// This models the AIE's DDR address translation: the NPU sees DDR at a
+    /// 2 GB offset from the CPU's view.  On real hardware the memory
+    /// controller handles this; in the emulator we do it explicitly.
+    fn execute_ddr_patch_prepatched(
+        &self,
+        col: u8, row: u8, offset: u32,
+        reg_addr: u32, arg_idx: u8, arg_plus: u32,
+        device: &mut DeviceState,
+    ) -> Result<(), String> {
+        const DDR_AIE_ADDR_OFFSET: u64 = 0x8000_0000;
 
-        // Write high 32 bits of the patched address to the next word.
-        // For shim DMA BDs, the next word (word 2) shares its 32 bits between
-        // Base_Address_High[15:0] and other fields (Enable_Packet, Packet_ID,
-        // Packet_Type, OoO_BD_ID). A blind write would clobber those fields.
-        // Use read-modify-write to preserve the non-address bits.
-        let high_bits = (patched_addr >> 32) as u32;
+        // Read the current BD word pair (set by the preceding block-write).
+        let word_lo = device.tile_mut(col as usize, row as usize)
+            .map(|t| t.read_register(offset)).unwrap_or(0);
+        let word_hi = device.tile_mut(col as usize, row as usize)
+            .map(|t| t.read_register(offset + 4)).unwrap_or(0);
+
+        // Reconstruct the 48-bit address (shim BD format: low 32 in word 1,
+        // high 16 in word 2 bits[15:0]).
+        let xrt_addr = ((word_hi as u64 & 0xFFFF) << 32) | word_lo as u64;
+
+        // Subtract the DDR AIE address offset to get emulator-space address.
+        let emu_addr = xrt_addr.wrapping_sub(DDR_AIE_ADDR_OFFSET);
+
+        log::debug!(
+            "NPU DdrPatch (pre-patched): reg=0x{:08X} arg_idx={} arg_plus={} \
+             xrt_addr=0x{:012X} -> emu_addr=0x{:012X}",
+            reg_addr, arg_idx, arg_plus, xrt_addr, emu_addr
+        );
+
+        self.write_bd_address(col, row, offset, emu_addr, device);
+        Ok(())
+    }
+
+    /// Write a 48-bit address to a BD register pair, preserving non-address
+    /// bits in the high word for shim BDs (Enable_Packet, Packet_ID, etc.).
+    fn write_bd_address(&self, col: u8, row: u8, offset: u32, addr: u64, device: &mut DeviceState) {
+        // Write low 32 bits through the unified register bus.
+        device.write_tile_register(col, row, offset, addr as u32);
+
+        // Write high 16 bits to the next word.  For shim DMA BDs, the next
+        // word shares its 32 bits between Base_Address_High[15:0] and other
+        // fields (Enable_Packet, Packet_ID, Packet_Type, OoO_BD_ID).  Use
+        // read-modify-write to preserve the non-address bits.
+        let high_bits = (addr >> 32) as u32;
         let is_shim_bd = row == 0 && bd_index_for_blockwrite(row, offset).is_some();
         if is_shim_bd {
-            // Shim BD: Base_Address_High occupies bits 15:0 of word 2
             let current = device.tile_mut(col as usize, row as usize)
                 .map(|t| t.read_register(offset + 4)).unwrap_or(0);
             let merged = (current & 0xFFFF_0000) | (high_bits & 0x0000_FFFF);
@@ -822,8 +885,6 @@ impl NpuExecutor {
         // The register bus marks BD words dirty when written via
         // write_tile_register(). They will be reparsed at enqueue time
         // (reparse_dirty_bd is called from write_dma_channel).
-
-        Ok(())
     }
 
     /// Pre-flight check: would writing this value block on a full DMA task queue?
