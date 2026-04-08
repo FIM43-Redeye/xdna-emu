@@ -61,20 +61,48 @@ fi
 
 # Install the C++ plugin to XRT. The Rust .so stays in target/ and is
 # loaded by the plugin at runtime via dlopen (path resolved from XDNA_EMU).
-echo ">>> Installing C++ plugin to $XRT_PLUGIN ..."
-pkexec cp "$CPP_PLUGIN" "$XRT_PLUGIN"
+#
+# If $XRT_PLUGIN is a symlink pointing at our build output, no install
+# is needed -- XRT picks up the build output directly.
+if [[ -L "$XRT_PLUGIN" ]]; then
+  LINK_TARGET="$(readlink -f "$XRT_PLUGIN")"
+  PLUGIN_REAL="$(readlink -f "$CPP_PLUGIN")"
+  if [[ "$LINK_TARGET" == "$PLUGIN_REAL" ]]; then
+    echo ">>> C++ plugin symlinked to build output, no install needed."
+  else
+    echo ">>> Symlink exists but points elsewhere ($LINK_TARGET)."
+    echo ">>> Re-linking to $CPP_PLUGIN ..."
+    ln -sf "$CPP_PLUGIN" "$XRT_PLUGIN"
+  fi
+else
+  # Not a symlink -- check content and copy if needed.
+  HASH_SRC="$(md5sum "$CPP_PLUGIN" | cut -d' ' -f1)"
+  HASH_DST=""
+  if [[ -f "$XRT_PLUGIN" ]]; then
+    HASH_DST="$(md5sum "$XRT_PLUGIN" | cut -d' ' -f1)"
+  fi
 
-# Verify the copy actually took effect (pkexec can silently fail if
-# the user dismisses the auth dialog).
-HASH_SRC="$(md5sum "$CPP_PLUGIN" | cut -d' ' -f1)"
-HASH_DST="$(md5sum "$XRT_PLUGIN" | cut -d' ' -f1)"
-if [[ "$HASH_SRC" != "$HASH_DST" ]]; then
-  echo "FATAL: Plugin install failed -- hashes differ!" >&2
-  echo "  Built:     $HASH_SRC  $CPP_PLUGIN" >&2
-  echo "  Installed: $HASH_DST  $XRT_PLUGIN" >&2
-  exit 1
+  if [[ "$HASH_SRC" == "$HASH_DST" ]]; then
+    echo ">>> C++ plugin already up-to-date ($HASH_SRC), skipping install."
+  else
+    echo ">>> Installing C++ plugin to $XRT_PLUGIN ..."
+    # Try unprivileged copy first (works if dir is user-writable).
+    if cp "$CPP_PLUGIN" "$XRT_PLUGIN" 2>/dev/null; then
+      echo ">>> Installed (no elevation needed)."
+    else
+      pkexec cp "$CPP_PLUGIN" "$XRT_PLUGIN"
+    fi
+
+    # Verify the copy took effect.
+    HASH_DST="$(md5sum "$XRT_PLUGIN" | cut -d' ' -f1)"
+    if [[ "$HASH_SRC" != "$HASH_DST" ]]; then
+      echo "FATAL: Plugin install failed -- hashes differ!" >&2
+      echo "  Built:     $HASH_SRC  $CPP_PLUGIN" >&2
+      echo "  Installed: $HASH_DST  $XRT_PLUGIN" >&2
+      exit 1
+    fi
+    echo ">>> Done. C++ plugin installed and verified ($HASH_SRC)."
+  fi
 fi
-
-echo ">>> Done. C++ plugin installed and verified ($HASH_SRC)."
 echo ">>> Rust lib: $RUST_LIB"
 echo ">>> EMU test usage: XDNA_EMU=$PROFILE ./test.exe"
