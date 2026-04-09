@@ -232,12 +232,23 @@ fn main() {
 
         match result {
             Ok(output) if output.status.success() => {
-                // Install plugin .so to XRT lib directory
+                // Install plugin .so to XRT lib directory.
+                // If the destination is already a symlink to the source,
+                // skip the copy -- fs::copy follows symlinks and would
+                // truncate the source file to 0 bytes.
                 let src = plugin_build.join("libxrt_driver_emu.so.2.21.0");
                 let dst = xrt_lib.join("libxrt_driver_emu.so.2.21.0");
                 let link = xrt_lib.join("libxrt_driver_emu.so.2");
                 if src.exists() {
-                    if let Err(e) = fs::copy(&src, &dst) {
+                    let dst_resolves_to_src = dst.read_link()
+                        .ok()
+                        .and_then(|target| fs::canonicalize(xrt_lib.join(target)).ok())
+                        .map_or(false, |resolved| {
+                            fs::canonicalize(&src).map_or(false, |src_canon| resolved == src_canon)
+                        });
+                    if dst_resolves_to_src {
+                        // Already symlinked -- nothing to do.
+                    } else if let Err(e) = fs::copy(&src, &dst) {
                         println!("cargo:warning=Plugin install failed: {e}");
                     } else {
                         // Create/update symlink

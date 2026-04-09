@@ -125,11 +125,12 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
     // Initialize logging if not already done
     let _ = env_logger::try_init();
 
+    let config = xdna_emu::config::Config::get();
     let handle = Box::new(XdnaEmuHandle {
         engine: InterpreterEngine::new_npu1(),
         xclbin_path: None,
         npu_executor: NpuExecutor::new(),
-        max_cycles: 100000,
+        max_cycles: config.max_cycles(),
         // Start auto-allocation at 0x8000_0000_0000 to avoid conflicts
         // with user-specified host regions (typically < 0x1_0000_0000).
         next_alloc_addr: 0x8000_0000_0000,

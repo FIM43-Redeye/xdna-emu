@@ -38,8 +38,11 @@ if [[ ! -f "$BUILD_DIR/CMakeCache.txt" ]]; then
   ( cd "$BUILD_DIR" && cmake .. )
 fi
 
-echo ">>> Building (cargo build handles plugin automatically)..."
+echo ">>> Building Rust FFI lib..."
 nice -n 19 cargo build -p xdna-emu-ffi $CARGO_FLAGS
+
+echo ">>> Building C++ plugin..."
+( cd "$BUILD_DIR" && make -j$(nproc) )
 
 RUST_LIB="$EMU_DIR/target/$PROFILE/libxdna_emu.so"
 # The C++ plugin is the XRT driver shim that dlopen's the Rust lib.
@@ -52,9 +55,8 @@ if [[ ! -f "$RUST_LIB" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$CPP_PLUGIN" ]]; then
-  echo "FATAL: C++ plugin $CPP_PLUGIN not found!" >&2
-  echo "  The XRT driver plugin must be built separately (cmake in xrt-plugin/)." >&2
+if [[ ! -f "$CPP_PLUGIN" ]] || [[ ! -s "$CPP_PLUGIN" ]]; then
+  echo "FATAL: C++ plugin $CPP_PLUGIN not found or empty!" >&2
   echo "  Run: ./scripts/rebuild-plugin.sh --reconfigure" >&2
   exit 1
 fi

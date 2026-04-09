@@ -405,6 +405,10 @@ apply_lit_subs() {
   cmd="${cmd%"${cmd##*[![:space:]]}"}"
   if [[ "$cmd" == clang\ * ]]; then
     cmd="/usr/bin/clang++ ${cmd#clang }"
+  elif [[ "$cmd" == g++-[0-9]* ]]; then
+    # Normalize versioned g++ (e.g. g++-13) to system g++ to avoid ABI
+    # mismatches with XRT libs built by the system compiler.
+    cmd="/usr/bin/g++ ${cmd#g++-[0-9]* }"
   elif [[ "$cmd" == g++\ * ]]; then
     cmd="/usr/bin/g++ ${cmd#g++ }"
   fi

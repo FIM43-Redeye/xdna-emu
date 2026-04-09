@@ -45,6 +45,12 @@ pub struct Config {
     /// Enables elfanalyzer cross-validation, Chess compilation, and
     /// aiesimulator comparison when present. The emulator works without it.
     pub aietools_path: Option<String>,
+
+    /// Maximum emulation cycles before timeout.
+    /// Complex multi-tile designs (memtile routing, cascade) may need more
+    /// cycles than simple single-tile tests. Override via config file or
+    /// XDNA_EMU_MAX_CYCLES environment variable.
+    pub max_cycles: Option<u64>,
 }
 
 impl Config {
@@ -123,6 +129,15 @@ impl Config {
     /// Returns `None` if no path is configured or the path does not exist.
     pub fn aietools_path(&self) -> Option<PathBuf> {
         self.aietools_path.as_ref().map(PathBuf::from).filter(|p| p.exists())
+    }
+
+    /// Maximum emulation cycles before timeout. Default: 500,000.
+    ///
+    /// Simple tests complete in 2K-10K cycles. Complex multi-tile designs
+    /// with memtile routing and cascade connections need 100K-300K. The
+    /// default is generous to avoid false timeouts.
+    pub fn max_cycles(&self) -> u64 {
+        self.max_cycles.unwrap_or(500_000)
     }
 
     // -- Test fixture path helpers --
@@ -251,6 +266,9 @@ impl Config {
         if other.aietools_path.is_some() {
             self.aietools_path = other.aietools_path;
         }
+        if other.max_cycles.is_some() {
+            self.max_cycles = other.max_cycles;
+        }
     }
 
     /// Apply environment variable overrides.
@@ -275,6 +293,12 @@ impl Config {
         } else if let Ok(path) = std::env::var("XILINX_VITIS_AIETOOLS") {
             log::info!("Using XILINX_VITIS_AIETOOLS from environment: {}", path);
             self.aietools_path = Some(path);
+        }
+        if let Ok(val) = std::env::var("XDNA_EMU_MAX_CYCLES") {
+            if let Ok(cycles) = val.parse::<u64>() {
+                log::info!("Using XDNA_EMU_MAX_CYCLES from environment: {}", cycles);
+                self.max_cycles = Some(cycles);
+            }
         }
     }
 
@@ -376,6 +400,7 @@ mod tests {
             mlir_aie_path: None,
             xrt_path: Some("/base/xrt".to_string()),
             aietools_path: Some("/base/aietools".to_string()),
+            max_cycles: None,
         };
 
         let overlay = Config {
@@ -383,6 +408,7 @@ mod tests {
             mlir_aie_path: Some("/overlay/mlir-aie".to_string()),
             xrt_path: Some("/overlay/xrt".to_string()),
             aietools_path: None,
+            max_cycles: Some(200_000),
         };
 
         base.merge(overlay);
@@ -395,6 +421,8 @@ mod tests {
         assert_eq!(base.xrt_path, Some("/overlay/xrt".to_string()));
         // aietools_path unchanged (overlay was None)
         assert_eq!(base.aietools_path, Some("/base/aietools".to_string()));
+        // max_cycles set from overlay
+        assert_eq!(base.max_cycles, Some(200_000));
     }
 
     #[test]
