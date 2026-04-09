@@ -1321,7 +1321,24 @@ impl MemoryUnit {
     /// - 6: North neighbor   - 7: East = Local (AIE2)
     ///
     /// Offset within the target tile is `address & OFFSET_MASK`.
+    ///
+    /// When the processor bus is enabled (Core_Processor_Bus register),
+    /// addresses in the register space (0x10000-0x3FFFF, CardDir 1-3)
+    /// read tile configuration registers instead of data memory.
     fn read_memory(tile: &Tile, addr: u32, width: MemWidth, neighbors: Option<&NeighborMemory>) -> u64 {
+        // Processor bus: the core accesses tile configuration registers via
+        // a window at base 0x80000 in the core's address space. Register
+        // offset = (address - 0x80000). This maps to the tile's memory module,
+        // core module, etc. registers at their AM025 offsets.
+        const PROC_BUS_BASE: u32 = 0x80000;
+        const PROC_BUS_END: u32 = 0xC0000; // 256KB window
+        if tile.processor_bus_enabled && addr >= PROC_BUS_BASE && addr < PROC_BUS_END {
+            let reg_offset = addr - PROC_BUS_BASE;
+            let reg_val = tile.read_register_pure(reg_offset);
+            log::debug!("[PROC_BUS] read addr=0x{:X} reg=0x{:X} -> 0x{:08X}", addr, reg_offset, reg_val);
+            return reg_val as u64;
+        }
+
         let (quadrant, offset) = decode_data_address(addr);
 
         // Select memory source based on quadrant
@@ -1412,7 +1429,20 @@ impl MemoryUnit {
     ///
     /// Cross-tile writes (South/West/North/East) are buffered in the
     /// NeighborMemory for deferred application after the core step completes.
+    ///
+    /// When the processor bus is enabled, writes to the register space
+    /// (0x10000-0x3FFFF) target tile configuration registers.
     pub fn write_memory(tile: &mut Tile, addr: u32, value: u64, width: MemWidth, neighbors: Option<&mut NeighborMemory>) {
+        // Processor bus: write to tile config registers via 0x80000 window
+        const PROC_BUS_BASE: u32 = 0x80000;
+        const PROC_BUS_END: u32 = 0xC0000;
+        if tile.processor_bus_enabled && addr >= PROC_BUS_BASE && addr < PROC_BUS_END {
+            let reg_offset = addr - PROC_BUS_BASE;
+            log::debug!("[PROC_BUS] write addr=0x{:X} reg=0x{:X} value=0x{:X}", addr, reg_offset, value);
+            tile.registers.insert(reg_offset, value as u32);
+            return;
+        }
+
         let (quadrant, offset) = decode_data_address(addr);
 
         if quadrant != MemoryQuadrant::Local {

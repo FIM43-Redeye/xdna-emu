@@ -437,6 +437,9 @@ impl DeviceState {
             None => return,
         };
 
+        // Core_Processor_Bus register (AM025, offset 0x32038)
+        const CORE_PROCESSOR_BUS: u32 = 0x32038;
+
         match offset {
             cm::CORE_CONTROL => {
                 let was_enabled = tile.core.enabled;
@@ -460,6 +463,11 @@ impl DeviceState {
             cm::CORE_LR => {
                 tile.core.lr = value;
             }
+            CORE_PROCESSOR_BUS => {
+                tile.processor_bus_enabled = value & 1 != 0;
+                log::info!("Core ({},{}) processor bus {}",
+                    col, row, if tile.processor_bus_enabled { "ENABLED" } else { "DISABLED" });
+            }
             _ => {}
         }
     }
@@ -467,6 +475,7 @@ impl DeviceState {
     /// Masked write to a core register.
     pub(super) fn mask_write_core_register(&mut self, col: u8, row: u8, offset: u32, mask: u32, value: u32) {
         use crate::device::registers_spec::core_module as cm;
+        const CORE_PROCESSOR_BUS: u32 = 0x32038;
 
         let tile = match self.array.get_mut(col, row) {
             Some(t) => t,
@@ -486,6 +495,12 @@ impl DeviceState {
             }
             cm::CORE_STATUS => {
                 tile.core.status = (tile.core.status & !mask) | (value & mask);
+            }
+            CORE_PROCESSOR_BUS => {
+                let masked = (value & mask) | (if tile.processor_bus_enabled { 1 } else { 0 } & !mask);
+                tile.processor_bus_enabled = masked & 1 != 0;
+                log::info!("Core ({},{}) processor bus {}",
+                    col, row, if tile.processor_bus_enabled { "ENABLED" } else { "DISABLED" });
             }
             _ => {
                 // For other registers, do full write

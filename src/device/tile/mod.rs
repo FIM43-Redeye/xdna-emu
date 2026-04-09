@@ -53,6 +53,11 @@ pub struct Tile {
     /// Row index
     pub row: u8,
 
+    /// Processor bus enabled (Core_Processor_Bus register bit 0).
+    /// When set, core loads/stores from addresses >= 0x10000 access tile
+    /// configuration registers instead of neighbor data memory.
+    pub processor_bus_enabled: bool,
+
     // === Hot data (accessed every cycle) ===
 
     /// Core processor state (compute tiles only)
@@ -292,6 +297,7 @@ impl Tile {
             tile_type,
             col,
             row,
+            processor_bus_enabled: false,
             core: CoreState::default(),
             locks: vec![Lock::default(); params.num_locks],
             lock_arbiter: LockArbiter::new(
