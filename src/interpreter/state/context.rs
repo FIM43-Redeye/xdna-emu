@@ -716,8 +716,11 @@ impl ExecutionContext {
         for &idx in &ready_indices {
             ready_writes.push(self.pending_writes.swap_remove(idx));
         }
-        // Sort by ready_cycle ascending and apply
-        ready_writes.sort_by_key(|pw| pw.ready_cycle);
+        // Sort by (ready_cycle, issued_cycle) ascending and apply.
+        // When two writes have the same ready_cycle (e.g., a delayed
+        // delay-slot write and a branch-target write), the one issued
+        // later wins because it is applied last.
+        ready_writes.sort_by_key(|pw| (pw.ready_cycle, pw.issued_cycle));
         for pw in &ready_writes {
             self.apply_pending_write(pw);
         }
