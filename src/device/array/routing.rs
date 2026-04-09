@@ -960,9 +960,9 @@ impl TileArray {
                     let tlast = word.tlast;
                     self.tiles[dst_idx].stream_switch.slaves[dst_slave]
                         .push_with_tlast(data, tlast);
-                    self.inter_tile_pipeline.swap_remove(i);
+                    self.inter_tile_pipeline.remove(i);
                     delivered += 1;
-                    // Don't increment i -- swap_remove moved the last element here
+                    // Don't increment i -- remove shifted later elements down
                 } else {
                     // Destination can't accept -- word stays in pipeline (backpressure).
                     // It will be retried next cycle with cycles_remaining still at 0.

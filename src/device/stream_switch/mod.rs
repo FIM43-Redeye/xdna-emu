@@ -441,7 +441,7 @@ impl StreamSwitch {
                     let data = word.data;
                     let tlast = word.tlast;
                     self.masters[master_idx].push_with_tlast(data, tlast);
-                    self.switch_pipeline.swap_remove(i);
+                    self.switch_pipeline.remove(i);
                     delivered += 1;
                 } else {
                     // Master full -- backpressure, retry next cycle
