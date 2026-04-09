@@ -499,7 +499,7 @@ impl VectorAlu {
             // Must split the selector across lo/hi halves.
             let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
             let sel_scalar = op.sources.iter().find_map(|s| match s {
-                Operand::ScalarReg(r) => Some(ctx.scalar.read(*r)),
+                Operand::ScalarReg(r) => Some(ctx.scalar_read(*r)),
                 _ => None,
             }).unwrap_or(0);
             let a_lo: [u32; 8] = a[..8].try_into().unwrap();
@@ -513,7 +513,7 @@ impl VectorAlu {
                 // The operand decodes as a single ScalarReg (low reg
                 // of the pair). Read r+1 for the high 32 bits.
                 op.sources.iter().find_map(|s| match s {
-                    Operand::ScalarReg(r) => Some(ctx.scalar.read(r + 1)),
+                    Operand::ScalarReg(r) => Some(ctx.scalar_read(r + 1)),
                     _ => None,
                 }).unwrap_or(0)
             } else {
@@ -542,7 +542,7 @@ impl VectorAlu {
             let s2 = Self::get_vector_source(op, ctx, 1);
             // Read the scalar select mask from the last source operand
             let sel_scalar = op.sources.get(2).map(|s| match s {
-                Operand::ScalarReg(r) => ctx.scalar.read(*r),
+                Operand::ScalarReg(r) => ctx.scalar_read(*r),
                 Operand::Immediate(v) => *v as u32,
                 _ => Self::get_scalar_source(op, ctx),
             }).unwrap_or(0);

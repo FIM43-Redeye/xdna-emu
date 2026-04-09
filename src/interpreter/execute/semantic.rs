@@ -443,7 +443,18 @@ fn execute_mul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let a = read_source(op, ctx, 0);
     let b = read_source(op, ctx, 1);
     let result = a.wrapping_mul(b);
-    write_dest(op, ctx, result);
+    // AIE2 MUL has result latency 2 (II_MUL in AIE2Schedule.td).
+    // The result writes via the R_WX port at pipeline stage E1, which
+    // commits one cycle later than immediate (R_WA) writes.  Use a
+    // deferred write so that the next bundle still sees the pre-MUL
+    // value, matching hardware pipeline behavior.  This is critical
+    // when MUL and MOVA target the same register in the same bundle:
+    // MOVA (latency 1) is visible first, MUL (latency 2) overwrites later.
+    if let Some(Operand::ScalarReg(r)) = &op.dest {
+        ctx.queue_scalar_load(Operand::ScalarReg(*r), result, 2);
+    } else {
+        write_dest(op, ctx, result);
+    }
     // AIE2: MUL does NOT set any flags (no Defs=[srCarry] in TableGen)
     true
 }
@@ -510,7 +521,7 @@ fn execute_div_step(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     } else {
         (read_source(op, ctx, 0), read_source(op, ctx, 1))
     };
-    let pi = ctx.scalar.read(31); // r31: quotient accumulator (implicit)
+    let pi = ctx.scalar_read(31); // r31: quotient accumulator (implicit)
 
     // Shift both registers left.  The MSB of pi (r31) flows into the
     // LSB of ao -- this is the cross-register bit that connects the
@@ -1163,6 +1174,10 @@ mod tests {
         op.dest = Some(Operand::ScalarReg(3));
 
         assert!(execute_semantic(&op, &mut ctx));
+        // MUL uses deferred writes (latency 2). Advance the cycle counter
+        // past the ready point and commit pending writes.
+        ctx.record_instruction(2);
+        ctx.commit_pending_writes();
         assert_eq!(ctx.scalar_read(3), 42);
     }
 

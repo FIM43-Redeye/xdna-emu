@@ -376,7 +376,7 @@ impl VectorAlu {
                     // and the hardware produces mask = 0 (no routing bits set).
                     // With mask = 0, the crossbar passes byte 0 through and
                     // zeros the remaining 63 bytes.
-                    let r29 = ctx.scalar.read(29);
+                    let r29 = ctx.scalar_read(29);
                     let mode_idx = (r29 & 0x3F) as u8;
 
                     if let Some(mode) = super::vector_permute::ShuffleMode::from_mode(mode_idx) {
@@ -476,7 +476,7 @@ impl VectorAlu {
             //
             // Decoded sources: [s1 (VectorReg), idx (ScalarReg r29), s0 (ScalarReg)].
             let base = Self::get_wide_vec_source(op, ctx, 0);
-            let index = ctx.scalar.read(29);  // r29: implicit index register
+            let index = ctx.scalar_read(29);  // r29: implicit index register
             if matches!(et, ElementType::Int64 | ElementType::UInt64) {
                 // 64-bit: s0 is a register pair (rN+1:rN). Read both halves.
                 // get_nth_scalar_source returns the pair's base register value;
@@ -490,8 +490,8 @@ impl VectorAlu {
                     }
                 }
                 let reg = s0_reg.unwrap_or(0);
-                let lo = ctx.scalar.read(reg);
-                let hi = ctx.scalar.read(reg + 1);
+                let lo = ctx.scalar_read(reg);
+                let hi = ctx.scalar_read(reg + 1);
                 let result = Self::insert_wide_element_64(&base, index, lo, hi);
                 Self::write_wide_vec_dest(op, ctx, result);
             } else {
@@ -507,7 +507,7 @@ impl VectorAlu {
             // Decoded sources: [s1 (VectorReg), idx (ScalarReg r29), s0 (ScalarReg)].
             // Index is always r29 (implicit), value is the second scalar source.
             let mut base = Self::get_vector_source(op, ctx, 0);
-            let index = ctx.scalar.read(29);  // r29: implicit index register
+            let index = ctx.scalar_read(29);  // r29: implicit index register
             let value = Self::get_nth_scalar_source(op, ctx, 1);  // s0 (skip idx)
             Self::vector_insert(&mut base, value, index, et);
             Self::write_vector_dest(op, ctx, base);

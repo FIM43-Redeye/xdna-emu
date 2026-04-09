@@ -71,7 +71,7 @@ impl VectorAlu {
         // Extract shift from scalar source (VFLOOR only).
         let shift_val: Option<i32> = op.sources.iter().find_map(|s| {
             if let Operand::ScalarReg(r) = s {
-                Some(ctx.scalar.read(*r) as i32)
+                Some(ctx.scalar_read(*r) as i32)
             } else {
                 None
             }

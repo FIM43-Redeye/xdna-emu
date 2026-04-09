@@ -295,7 +295,7 @@ impl ControlUnit {
         // Last resort: scalar register (e.g., jr rX)
         for src in &op.sources {
             if let Operand::ScalarReg(r) = src {
-                return ctx.scalar.read(*r);
+                return ctx.scalar_read(*r);
             }
         }
         log::error!(

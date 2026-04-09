@@ -1232,7 +1232,7 @@ impl VectorAlu {
                     let sel_reg = op.sources.iter().find_map(|s| {
                         if let Operand::ScalarReg(r) = s { Some(*r) } else { None }
                     }).unwrap_or(0);
-                    ctx.scalar.read(sel_reg + 1)
+                    ctx.scalar_read(sel_reg + 1)
                 } else {
                     sel_scalar >> elems_per_half
                 };

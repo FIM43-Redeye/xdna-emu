@@ -209,7 +209,7 @@ impl VectorAlu {
         // Scan sources in reverse order -- the config register is typically last.
         for src in op.sources.iter().rev() {
             if let Operand::ScalarReg(r) = src {
-                return Some(ctx.scalar.read(*r));
+                return Some(ctx.scalar_read(*r));
             }
         }
         None
@@ -251,7 +251,7 @@ impl VectorAlu {
                 return *imm as u32;
             }
             if let Operand::ScalarReg(r) = src {
-                return ctx.scalar.read(*r);
+                return ctx.scalar_read(*r);
             }
         }
         0 // Default: no shift
@@ -306,7 +306,7 @@ impl VectorAlu {
                 return *imm as u32;
             }
             if let Operand::ScalarReg(r) = src {
-                return ctx.scalar.read(*r);
+                return ctx.scalar_read(*r);
             }
         }
         0 // Default: lane 0
@@ -316,7 +316,7 @@ impl VectorAlu {
     pub(super) fn get_scalar_source(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
         for src in &op.sources {
             match src {
-                Operand::ScalarReg(r) => return ctx.scalar.read(*r),
+                Operand::ScalarReg(r) => return ctx.scalar_read(*r),
                 Operand::Immediate(imm) => return *imm as u32,
                 _ => {}
             }
@@ -331,8 +331,8 @@ impl VectorAlu {
     pub(super) fn get_scalar_source_64(op: &SlotOp, ctx: &ExecutionContext) -> u64 {
         for src in &op.sources {
             if let Operand::ScalarReg(r) = src {
-                let lo = ctx.scalar.read(*r) as u64;
-                let hi = ctx.scalar.read(r + 1) as u64;
+                let lo = ctx.scalar_read(*r) as u64;
+                let hi = ctx.scalar_read(r + 1) as u64;
                 return lo | (hi << 32);
             }
         }
@@ -349,7 +349,7 @@ impl VectorAlu {
         for src in &op.sources {
             match src {
                 Operand::ScalarReg(r) => {
-                    if count == n { return ctx.scalar.read(*r); }
+                    if count == n { return ctx.scalar_read(*r); }
                     count += 1;
                 }
                 Operand::Immediate(imm) => {

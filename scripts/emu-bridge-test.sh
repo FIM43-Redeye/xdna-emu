@@ -396,7 +396,7 @@ apply_lit_subs() {
   cmd="${cmd//'%aietools'/$AIETOOLS_DIR}"
   cmd="${cmd//'%python '/}"
   cmd="${cmd//'%python'/python3}"
-  cmd="${cmd//'%xrt_flags'/-I$XRT_INCLUDE -L$XRT_LIB -luuid -lxrt_coreutil}"
+  cmd="${cmd//'%xrt_flags'/-I$src_dir -I$XRT_INCLUDE -L$XRT_LIB -luuid -lxrt_coreutil}"
   cmd="${cmd//'%test_utils_flags'/-I$TEST_UTILS_INCLUDE -L$TEST_UTILS_LIB -ltest_utils}"
   cmd="${cmd//'%test_lib_flags'/-I$TEST_UTILS_INCLUDE -L$TEST_UTILS_LIB -ltest_lib}"
   cmd="${cmd//'%run_on_npu1%'/}"
@@ -922,7 +922,7 @@ compile_one() {
   elif [[ -f "$build_dir/test.cpp" ]]; then
     if ! /usr/bin/clang++ "$build_dir/test.cpp" -o "$build_dir/test.exe" \
         -std=c++17 -Wall \
-        -I"$XRT_INCLUDE" -L"$XRT_LIB" \
+        -I"$src_dir" -I"$XRT_INCLUDE" -L"$XRT_LIB" \
         -I"$TEST_UTILS_INCLUDE" -L"$TEST_UTILS_LIB" \
         -luuid -lxrt_coreutil -ltest_utils -lrt -lstdc++ \
         >> "$log_file" 2>&1; then

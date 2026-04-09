@@ -319,6 +319,10 @@ impl CycleAccurateExecutor {
 
         // Execution order: LoadA/LoadB first, then Store, then compute slots.
         // Both load ports issue in the same cycle (they share a load unit).
+        //
+        // When two slots write the same scalar register in one bundle, the
+        // last writer (in this order) wins.  All reads use the pre-bundle
+        // snapshot, so execution order does not affect read values.
         let execution_order = [
             SlotIndex::LoadA,      // Primary load port (LDA)
             SlotIndex::LoadB,      // Secondary load port (LDB)
@@ -596,9 +600,13 @@ mod tests {
         ]);
 
         executor.execute(&bundle, &mut ctx, &mut tile);
-
-        assert_eq!(ctx.scalar.read(2), 30);
         assert_eq!(ctx.cycles, 1); // 1 cycle to issue (pipelined)
+
+        // MUL result has latency 2 -- not yet visible after 1 cycle.
+        // Advance one more cycle and commit to see the result.
+        ctx.record_instruction(1);
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.scalar.read(2), 30);
     }
 
     #[test]

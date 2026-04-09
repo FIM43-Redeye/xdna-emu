@@ -677,7 +677,7 @@ impl MemoryUnit {
         for src in &op.sources {
             match src {
                 Operand::Immediate(imm) => return *imm as u32,
-                Operand::ScalarReg(r) => return ctx.scalar.read(*r),
+                Operand::ScalarReg(r) => return ctx.scalar_read(*r),
                 _ => {}
             }
         }

@@ -335,7 +335,7 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 fn get_config_reg(op: &SlotOp, ctx: &ExecutionContext) -> Option<u32> {
     for src in op.sources.iter().rev() {
         if let Operand::ScalarReg(r) = src {
-            return Some(ctx.scalar.read(*r));
+            return Some(ctx.scalar_read(*r));
         }
     }
     None
