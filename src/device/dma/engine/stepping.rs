@@ -306,7 +306,16 @@ impl DmaEngine {
         // Emit DMA_FINISHED_BD
         self.trace_events.push((self.current_cycle, EventType::DmaFinishedBd { channel: ch_idx as u8 }));
 
-        // Check for BD chaining
+        // Check for BD chaining.
+        //
+        // Hardware follows next_bd unconditionally when Use_Next_BD is set
+        // (represented as next_bd = Some(n) in our model). The hardware does
+        // NOT detect chain cycles -- a BD chain that loops (BD0->BD1->BD0)
+        // runs indefinitely. This is correct for double-buffered DMA patterns.
+        //
+        // Chain termination only occurs when Use_Next_BD=0 (next_bd = None).
+        // The repeat_count then controls how many additional times the chain
+        // is re-executed from chain_start_bd.
         if let Some(next_bd) = completion.next_bd {
             log::debug!("DMA tile({},{}) ch{} chaining to BD {} (from BD {})",
                 self.col, self.row, ch_idx, next_bd, completion.bd_index);
@@ -316,7 +325,7 @@ impl DmaEngine {
             };
         }
 
-        // Check for repeat count
+        // Chain ended (Use_Next_BD=0). Check repeat_count for re-execution.
         if self.channels[ch_idx].repeat_count > 0 {
             self.channels[ch_idx].repeat_count -= 1;
             if let Some(start_bd) = self.channels[ch_idx].chain_start_bd {

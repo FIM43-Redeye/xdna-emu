@@ -523,6 +523,36 @@ fn test_bd_chain_with_repeat_restarts_from_start() {
         stats.bytes_transferred);
 }
 
+/// Self-chaining BD (next_bd == self) with Use_Next_BD=1 loops indefinitely
+/// on real hardware -- the silicon does NOT detect chain cycles. The chain
+/// terminates only when Use_Next_BD=0 (next_bd = None in our model).
+///
+/// This test verifies the hardware-correct behavior: a self-chaining BD
+/// runs continuously until the cycle limit.
+#[test]
+fn test_self_chaining_bd_loops_indefinitely() {
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+    let mut host_mem = make_host_memory();
+
+    // BD0 chains to itself (self-chain). Hardware follows next_bd blindly.
+    engine.configure_bd(0, BdConfig::simple_1d(0x100, 16).with_next(0)).unwrap();
+    engine.enqueue_task(2, 0, 0, false);
+
+    // Run for a fixed number of cycles -- channel should still be active.
+    for _ in 0..200 {
+        engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
+    }
+
+    assert!(engine.channel_has_pending_work(2),
+        "Self-chaining BD should still be running (hardware loops indefinitely)");
+
+    let stats = engine.channel_stats(2).unwrap();
+    assert!(stats.transfers_completed > 2,
+        "Expected multiple transfers from self-chaining loop, got {}",
+        stats.transfers_completed);
+}
+
 // === Stream Port Integration Tests ===
 
 #[test]
