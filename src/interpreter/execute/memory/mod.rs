@@ -1207,9 +1207,16 @@ impl MemoryUnit {
             }
         }
 
-        // Check if sources[0] is a pointer (test/legacy layout)
+        // Sources[0] is a pointer: either bare `[pN]` or indexed `[pN, djM]`.
+        // If sources[1] is a modifier register, include it as a byte offset.
         if let Some(Operand::PointerReg(r)) = op.sources.first() {
-            return ctx.pointer_read(*r);
+            let base_addr = ctx.pointer_read(*r);
+            let offset = op.sources.get(1).map_or(0u32, |src| match src {
+                Operand::ModifierReg(m) => ctx.modifier_read(*m),
+                Operand::Immediate(v) => *v as u32,
+                _ => 0,
+            });
+            return base_addr.wrapping_add(offset);
         }
 
         // Kernel layout: sources[0]=value, sources[1]=pointer, sources[2]=index
