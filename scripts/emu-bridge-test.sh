@@ -299,9 +299,9 @@ export -f npu_health_check
 # Helpers (shared with parallel jobs via export -f)
 # ---------------------------------------------------------------------------
 
-# Find the best .lit file in a test directory.
-# Prefers run.lit, falls back to the first *.lit file alphabetically.
-# Returns empty string if no .lit file found.
+# Find the best .lit/.py file with RUN lines in a test directory.
+# Prefers run.lit, then *.lit, then aie2.py (Python-generated tests).
+# Returns empty string if no suitable file found.
 find_lit_file() {
   local dir="$1"
   if [[ -f "$dir/run.lit" ]]; then
@@ -311,15 +311,27 @@ find_lit_file() {
   # Fall back to first *.lit file (alphabetically).
   local first
   first="$(find "$dir" -maxdepth 1 -name '*.lit' -print 2>/dev/null | sort | head -1)"
-  [[ -n "$first" ]] && echo "$first"
+  if [[ -n "$first" ]]; then
+    echo "$first"
+    return
+  fi
+  # Python-generated tests: aie2.py has RUN lines in comments.
+  if [[ -f "$dir/aie2.py" ]] && grep -q 'RUN:' "$dir/aie2.py" 2>/dev/null; then
+    echo "$dir/aie2.py"
+    return
+  fi
 }
 
-# Check if a test directory has a standard test.cpp + aie.mlir/run.lit.
+# Check if a test directory has a runnable test.
+#
+# Standard tests have: test.cpp + (aie.mlir or run.lit)
+# Python-generated tests have: test.cpp + aie2.py (generates aie2.mlir)
+# Nested tests: handled by subdirectory scan in discover_tests().
 is_standard_test() {
   local dir="$1"
   local lit
   lit="$(find_lit_file "$dir")"
-  [[ -f "$dir/test.cpp" ]] && [[ -f "$dir/aie.mlir" || -n "$lit" ]]
+  [[ -f "$dir/test.cpp" ]] && [[ -f "$dir/aie.mlir" || -n "$lit" || -f "$dir/aie2.py" ]]
 }
 
 # Check if a test requires npu2 (AIE2P -- skip for now).
@@ -394,7 +406,7 @@ apply_lit_subs() {
   cmd="${cmd#*RUN: }"
   cmd="${cmd//'%S'/$src_dir}"
   cmd="${cmd//'%aietools'/$AIETOOLS_DIR}"
-  cmd="${cmd//'%python '/}"
+  cmd="${cmd//'%python '/python3 }"
   cmd="${cmd//'%python'/python3}"
   cmd="${cmd//'%xrt_flags'/-I$src_dir -I$XRT_INCLUDE -L$XRT_LIB -luuid -lxrt_coreutil}"
   cmd="${cmd//'%test_utils_flags'/-I$TEST_UTILS_INCLUDE -L$TEST_UTILS_LIB -ltest_utils}"
@@ -434,38 +446,127 @@ extract_build_commands() {
   done < "$lit_file"
 }
 
-# Extract the test execution command from the test's .lit file.
-# When our trace injection is active (NO_TRACE != "true"), strips the legacy
-# --trace_sz and --trace_file flags so the test's built-in tracing is voided
-# and our separate bo_trace mechanism is used uniformly.
-get_run_cmd() {
+# Strip legacy trace flags from a run command.
+# Used when our trace injection is active (NO_TRACE != "true") so the test's
+# built-in tracing allocates nothing (trace_size defaults to 0).
+_strip_trace_flags() {
+  local cmd="$1"
+  if [[ "${NO_TRACE:-false}" != "true" ]]; then
+    cmd="$(echo "$cmd" | sed 's/--trace_sz[[:space:]]\+[0-9]\+//g')"
+    cmd="$(echo "$cmd" | sed 's/--trace_file[[:space:]]\+[^[:space:]]\+//g')"
+    cmd="$(echo "$cmd" | sed 's/[[:space:]]\+/ /g' | sed 's/[[:space:]]*$//')"
+  fi
+  echo "$cmd"
+}
+
+# Derive a variant name from a run command's xclbin filename.
+# e.g., "aie2_cascade.xclbin" -> "cascade", "aie.xclbin" -> ""
+# Returns empty string for the standard "aie.xclbin" case.
+_variant_from_cmd() {
+  local cmd="$1"
+  local xclbin
+  xclbin="$(echo "$cmd" | grep -oP '(?<=-x\s)\S+\.xclbin' || true)"
+  if [[ -z "$xclbin" ]]; then
+    # Try positional xclbin (e.g., "./test.exe aie.xclbin")
+    xclbin="$(echo "$cmd" | grep -oP '\S+\.xclbin' || true)"
+  fi
+  # Standard single-variant names -> empty variant
+  case "$xclbin" in
+    aie.xclbin|"") echo ""; return ;;
+  esac
+  # Strip directory prefix, .xclbin suffix, and common "aie2_" prefix.
+  local base="${xclbin##*/}"
+  base="${base%.xclbin}"
+  base="${base#aie2_}"
+  base="${base#aie_}"
+  echo "$base"
+}
+
+# List all run variants for a test.  Outputs one line per variant:
+#   <variant_name>
+# For single-variant tests (the common case), outputs a single empty line.
+# For multi-variant tests (e.g., matrix_multiplication_using_cascade), outputs
+# one line per variant (e.g., "plain", "buffer", "cascade").
+get_run_variants() {
   local src_dir="$1"
   local lit_file
   lit_file="$(find_lit_file "$src_dir")"
-  [[ -n "$lit_file" ]] || return 1
+  if [[ -z "$lit_file" ]]; then
+    echo ""
+    return
+  fi
 
+  local variants=()
   while IFS= read -r line; do
     [[ "$line" == *"RUN:"* ]] || continue
     if [[ "$line" == *"./test.exe"* ]] && [[ "$line" == *"npu1"* || "$line" != *"npu2"* ]]; then
       local cmd
       cmd="$(apply_lit_subs "$src_dir" "$line")"
       cmd="${cmd#"${cmd%%[![:space:]]*}"}"
-      # When our trace injection is active, strip legacy trace flags so the
-      # test's built-in tracing allocates nothing (trace_size defaults to 0).
-      if [[ "${NO_TRACE:-false}" != "true" ]]; then
-        # Strip --trace_sz <N> (flag + numeric argument)
-        cmd="$(echo "$cmd" | sed 's/--trace_sz[[:space:]]\+[0-9]\+//g')"
-        # Strip --trace_file <path> (flag + non-space argument)
-        cmd="$(echo "$cmd" | sed 's/--trace_file[[:space:]]\+[^[:space:]]\+//g')"
-        # Collapse any resulting double spaces
-        cmd="$(echo "$cmd" | sed 's/[[:space:]]\+/ /g' | sed 's/[[:space:]]*$//')"
-      fi
-      echo "$cmd"
-      return 0
+      local v
+      v="$(_variant_from_cmd "$cmd")"
+      variants+=("$v")
     fi
   done < "$lit_file"
 
-  echo "./test.exe -x aie.xclbin -k MLIR_AIE -i insts.bin"
+  if [[ ${#variants[@]} -le 1 ]]; then
+    # Zero or one run command: single-variant test (empty variant name).
+    echo ""
+    return
+  fi
+
+  # Multiple run commands: multi-variant test.  Output variant names.
+  printf '%s\n' "${variants[@]}"
+}
+
+# Extract the run command for a specific variant.
+# $1 = src_dir, $2 = variant name (empty string = first/only npu1 command)
+get_variant_run_cmd() {
+  local src_dir="$1"
+  local target_variant="${2:-}"
+  local lit_file
+  lit_file="$(find_lit_file "$src_dir")"
+  [[ -n "$lit_file" ]] || return 1
+
+  # Collect all npu1-matching run commands.
+  local cmds=()
+  while IFS= read -r line; do
+    [[ "$line" == *"RUN:"* ]] || continue
+    if [[ "$line" == *"./test.exe"* ]] && [[ "$line" == *"npu1"* || "$line" != *"npu2"* ]]; then
+      local cmd
+      cmd="$(apply_lit_subs "$src_dir" "$line")"
+      cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+      cmds+=("$cmd")
+    fi
+  done < "$lit_file"
+
+  # Empty variant with 0-1 commands: return the first (or fallback).
+  if [[ -z "$target_variant" ]]; then
+    if [[ ${#cmds[@]} -ge 1 ]]; then
+      echo "$(_strip_trace_flags "${cmds[0]}")"
+      return 0
+    fi
+    echo "./test.exe -x aie.xclbin -k MLIR_AIE -i insts.bin"
+    return 0
+  fi
+
+  # Non-empty variant: match by derived variant name.
+  for cmd in "${cmds[@]}"; do
+    local v
+    v="$(_variant_from_cmd "$cmd")"
+    if [[ "$v" == "$target_variant" ]]; then
+      echo "$(_strip_trace_flags "$cmd")"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+# Legacy wrapper: returns the first run command (backward compat for sweep etc.).
+get_run_cmd() {
+  local src_dir="$1"
+  get_variant_run_cmd "$src_dir" ""
 }
 
 # Sanitize test name for use as filename (replace / with _).
@@ -583,7 +684,9 @@ transform_for_peano() {
 # Export all helpers for xargs subshells.
 export -f find_lit_file is_standard_test requires_npu2 requires_only_compiler
 export -f get_npu_device apply_lit_subs
-export -f extract_build_commands get_run_cmd sanitize_name wait_npu_idle
+export -f extract_build_commands get_run_cmd get_run_variants get_variant_run_cmd
+export -f _strip_trace_flags _variant_from_cmd
+export -f sanitize_name wait_npu_idle
 export -f transform_for_chess transform_for_peano
 
 # ---------------------------------------------------------------------------
@@ -953,13 +1056,18 @@ run_one_hardware() {
   local name="$1"
   local bdf="$2"
   local compiler="$3"
+  local variant="${4:-}"   # Empty for single-variant tests.
   local safe
   safe="$(sanitize_name "$name")"
   local build_dir="$BUILD_BASE/$name/$compiler"
   local test_exe="$BUILD_BASE/$name/test.exe"
   local src_dir="$TEST_SRC/$name"
-  local log_file="$RESULTS_DIR/${safe}.${compiler}.hw.log"
-  local result_file="$RESULTS_DIR/${safe}.${compiler}.hw.result"
+
+  # Variant suffix for result/log filenames (empty for single-variant tests).
+  local vsuffix=""
+  [[ -n "$variant" ]] && vsuffix=".${variant}"
+  local log_file="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw.log"
+  local result_file="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw.result"
 
   # Symlink shared test.exe into per-compiler build dir
   if [[ -f "$test_exe" ]] && [[ ! -f "$build_dir/test.exe" ]]; then
@@ -977,9 +1085,9 @@ run_one_hardware() {
   fi
 
   local run_cmd
-  run_cmd="$(get_run_cmd "$src_dir")"
+  run_cmd="$(get_variant_run_cmd "$src_dir" "$variant")"
 
-  local trace_out_dir="$RESULTS_DIR/${safe}.${compiler}.hw"
+  local trace_out_dir="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw"
   mkdir -p "$trace_out_dir"
 
   # Snapshot TDR count and uptime for post-test attribution.
@@ -1031,6 +1139,7 @@ export -f run_one_hardware
 run_one_bridge() {
   local name="$1"
   local compiler="${2:-}"
+  local variant="${3:-}"   # Empty for single-variant tests.
   local safe
   safe="$(sanitize_name "$name")"
 
@@ -1039,7 +1148,7 @@ run_one_bridge() {
     local compilers
     read -ra compilers <<< "$COMPILERS_STR"
     for c in "${compilers[@]}"; do
-      run_one_bridge "$name" "$c"
+      run_one_bridge "$name" "$c" "$variant"
     done
     return
   fi
@@ -1047,8 +1156,16 @@ run_one_bridge() {
   local build_dir="$BUILD_BASE/$name/$compiler"
   local test_exe="$BUILD_BASE/$name/test.exe"
   local src_dir="$TEST_SRC/$name"
-  local log_file="$RESULTS_DIR/${safe}.${compiler}.bridge.log"
-  local result_file="$RESULTS_DIR/${safe}.${compiler}.bridge.result"
+
+  # Variant suffix for result/log filenames (empty for single-variant tests).
+  local vsuffix=""
+  [[ -n "$variant" ]] && vsuffix=".${variant}"
+  # Display name includes variant for multi-variant tests.
+  local display_name="$name"
+  [[ -n "$variant" ]] && display_name="${name}/${variant}"
+
+  local log_file="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.bridge.log"
+  local result_file="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.bridge.result"
 
   # Symlink shared test.exe into per-compiler build dir.
   if [[ -f "$test_exe" ]] && [[ ! -f "$build_dir/test.exe" ]]; then
@@ -1057,20 +1174,20 @@ run_one_bridge() {
 
   if [[ ! -f "$build_dir/test.exe" ]]; then
     echo "SKIP" > "$result_file"
-    echo "  BRIDGE $name ($compiler): SKIP (no test.exe)"
+    echo "  BRIDGE $display_name ($compiler): SKIP (no test.exe)"
     return
   fi
 
   if ! ls "$build_dir"/*.xclbin &>/dev/null; then
     echo "SKIP" > "$result_file"
-    echo "  BRIDGE $name ($compiler): SKIP (no xclbin)"
+    echo "  BRIDGE $display_name ($compiler): SKIP (no xclbin)"
     return
   fi
 
   local run_cmd
-  run_cmd="$(get_run_cmd "$src_dir")"
+  run_cmd="$(get_variant_run_cmd "$src_dir" "$variant")"
 
-  local trace_out_dir="$RESULTS_DIR/${safe}.${compiler}.emu"
+  local trace_out_dir="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.emu"
   mkdir -p "$trace_out_dir"
 
   local rc=0
@@ -1113,7 +1230,7 @@ run_one_bridge() {
     python3 "$EMU_ROOT/tools/trace-trim.py" "$trace_out_dir/trace_raw.bin" 2>/dev/null || true
   fi
 
-  echo "  BRIDGE $name ($compiler): $result"
+  echo "  BRIDGE $display_name ($compiler): $result"
 }
 export -f run_one_bridge
 
@@ -1155,7 +1272,7 @@ print_report() {
 
   # --- Header ---
   # Build dynamic header based on active compilers and modes.
-  local name_width=40
+  local name_width=50
   local col_width=10
 
   # Print header.
@@ -1221,15 +1338,30 @@ print_report() {
 
   local has_compile_fail=false
 
+  # Track which test names have already been counted for compile stats
+  # (compile is per-test, not per-variant).
+  declare -A _compile_counted  # "name:compiler" -> 1
+
   # --- Data rows ---
-  for name in "${test_list[@]}"; do
+  # Each entry in test_list is "name:variant" where variant may be empty.
+  for row in "${test_list[@]}"; do
+    local name="${row%%:*}"
+    local variant="${row#*:}"
     local safe
     safe="$(sanitize_name "$name")"
 
-    printf "%-${name_width}s" "$name"
+    # Variant suffix for result file lookups.
+    local vsuffix=""
+    [[ -n "$variant" ]] && vsuffix=".${variant}"
+
+    # Display name: "name/variant" for multi-variant, "name" for single.
+    local display_name="$name"
+    [[ -n "$variant" ]] && display_name="${name}/${variant}"
+
+    printf "%-${name_width}s" "$display_name"
 
     for compiler in "${compilers[@]}"; do
-      # Read compile result.
+      # Read compile result (compile is per-test, not per-variant).
       local cr="FAIL"
       [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] && \
         cr="$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")"
@@ -1247,7 +1379,12 @@ print_report() {
       fi
 
       if [[ "$cr" != "OK" ]]; then
-        compile_fail[$compiler]=$(( ${compile_fail[$compiler]} + 1 ))
+        # Only count compile failure once per test:compiler pair.
+        local ck="${name}:${compiler}"
+        if [[ -z "${_compile_counted[$ck]+x}" ]]; then
+          compile_fail[$compiler]=$(( ${compile_fail[$compiler]} + 1 ))
+          _compile_counted["$ck"]=1
+        fi
         has_compile_fail=true
         if [[ "$run_hw" == "true" ]]; then
           printf "  %-${col_width}s" "FAIL*"
@@ -1256,13 +1393,18 @@ print_report() {
         continue
       fi
 
-      compile_ok[$compiler]=$(( ${compile_ok[$compiler]} + 1 ))
+      # Only count compile success once per test:compiler pair.
+      local ck="${name}:${compiler}"
+      if [[ -z "${_compile_counted[$ck]+x}" ]]; then
+        compile_ok[$compiler]=$(( ${compile_ok[$compiler]} + 1 ))
+        _compile_counted["$ck"]=1
+      fi
 
-      # Read HW result.
+      # Read HW result (variant-aware).
       if [[ "$run_hw" == "true" ]]; then
         local hr="SKIP"
-        [[ -f "$RESULTS_DIR/${safe}.${compiler}.hw.result" ]] && \
-          hr="$(< "$RESULTS_DIR/${safe}.${compiler}.hw.result")"
+        [[ -f "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw.result" ]] && \
+          hr="$(< "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw.result")"
         printf "  %-${col_width}s" "$hr"
         case "$hr" in
           PASS)    hw_pass[$compiler]=$(( ${hw_pass[$compiler]} + 1 )) ;;
@@ -1275,10 +1417,10 @@ print_report() {
         esac
       fi
 
-      # Read bridge (EMU) result.
+      # Read bridge (EMU) result (variant-aware).
       local br="SKIP"
-      [[ -f "$RESULTS_DIR/${safe}.${compiler}.bridge.result" ]] && \
-        br="$(< "$RESULTS_DIR/${safe}.${compiler}.bridge.result")"
+      [[ -f "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.bridge.result" ]] && \
+        br="$(< "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.bridge.result")"
       printf "  %-${col_width}s" "$br"
       case "$br" in
         PASS)     bridge_pass[$compiler]=$(( ${bridge_pass[$compiler]} + 1 )) ;;
@@ -1291,12 +1433,12 @@ print_report() {
       esac
     done
 
-    # Trace columns (per-compiler).
+    # Trace columns (per-compiler, variant-aware).
     if $has_trace; then
       for compiler in "${compilers[@]}"; do
         local trace_summary="-"
-        if [[ -f "$RESULTS_DIR/${safe}.${compiler}.trace.summary" ]]; then
-          trace_summary="$(< "$RESULTS_DIR/${safe}.${compiler}.trace.summary")"
+        if [[ -f "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.trace.summary" ]]; then
+          trace_summary="$(< "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.trace.summary")"
           case "$trace_summary" in
             CLEAN*)   trace_clean[$compiler]=$(( ${trace_clean[$compiler]} + 1 )) ;;
             DIVERGE*) trace_diverge[$compiler]=$(( ${trace_diverge[$compiler]} + 1 )) ;;
@@ -1316,10 +1458,10 @@ print_report() {
     if [[ "$VERBOSE" == "true" ]]; then
       for compiler in "${compilers[@]}"; do
         local br="SKIP"
-        [[ -f "$RESULTS_DIR/${safe}.${compiler}.bridge.result" ]] && \
-          br="$(< "$RESULTS_DIR/${safe}.${compiler}.bridge.result")"
+        [[ -f "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.bridge.result" ]] && \
+          br="$(< "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.bridge.result")"
         if [[ "$br" != "PASS" ]] && [[ "$br" != "SKIP"* ]]; then
-          local logf="$RESULTS_DIR/${safe}.${compiler}.bridge.log"
+          local logf="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.bridge.log"
           if [[ -f "$logf" ]]; then
             echo "    --- $compiler bridge log tail ---"
             tail -5 "$logf" | sed 's/^/    /'
@@ -1327,10 +1469,10 @@ print_report() {
         fi
         if [[ "$run_hw" == "true" ]]; then
           local hr="SKIP"
-          [[ -f "$RESULTS_DIR/${safe}.${compiler}.hw.result" ]] && \
-            hr="$(< "$RESULTS_DIR/${safe}.${compiler}.hw.result")"
+          [[ -f "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw.result" ]] && \
+            hr="$(< "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw.result")"
           if [[ "$hr" != "PASS" ]] && [[ "$hr" != "SKIP"* ]]; then
-            local logf="$RESULTS_DIR/${safe}.${compiler}.hw.log"
+            local logf="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw.log"
             if [[ -f "$logf" ]]; then
               echo "    --- $compiler hw log tail ---"
               tail -5 "$logf" | sed 's/^/    /'
@@ -1512,7 +1654,8 @@ main() {
 
   # ---- Phase 3+4: Run HW+EMU concurrently --------------------------------
 
-  # Build job list: (name:compiler) pairs that compiled successfully.
+  # Build job list: (name:compiler:variant) tuples that compiled successfully.
+  # Variant is empty for single-variant tests, non-empty for multi-variant.
   # Split into parallel (safe) and quarantine (known TDR) pools.
   local all_jobs=()
   local hw_parallel_jobs=()
@@ -1523,14 +1666,30 @@ main() {
       safe="$(sanitize_name "$name")"
       [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] || continue
       [[ "$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")" == "OK" ]] || continue
-      all_jobs+=("$name:$compiler")
-      if is_quarantined "$name:$compiler"; then
-        hw_quarantine_jobs+=("$name:$compiler")
-      else
-        hw_parallel_jobs+=("$name:$compiler")
-      fi
+      # Expand into per-variant jobs.
+      local src_dir="$TEST_SRC/$name"
+      while IFS= read -r variant; do
+        local job_key="${name}:${compiler}:${variant}"
+        all_jobs+=("$job_key")
+        # Quarantine check uses name:compiler (variant-agnostic).
+        if is_quarantined "$name:$compiler"; then
+          hw_quarantine_jobs+=("$job_key")
+        else
+          hw_parallel_jobs+=("$job_key")
+        fi
+      done < <(get_run_variants "$src_dir")
     done
   done
+
+  # Helper to parse job tuples.  Format: "name:compiler:variant"
+  # Variant may be empty (single-variant test).
+  _job_name()     { echo "${1%%:*}"; }
+  _job_compiler() { local tmp="${1#*:}"; echo "${tmp%%:*}"; }
+  _job_variant()  { local tmp="${1#*:}"; echo "${tmp#*:}"; }
+  # Result file suffix: ".variant" for multi-variant, empty for single.
+  _job_vsuffix()  { local v; v="$(_job_variant "$1")"; [[ -n "$v" ]] && echo ".$v" || echo ""; }
+  # Display name: "name/variant" for multi-variant, "name" for single.
+  _job_display()  { local n; n="$(_job_name "$1")"; local v; v="$(_job_variant "$1")"; [[ -n "$v" ]] && echo "${n}/${v}" || echo "$n"; }
 
   # Detect NPU hardware for HW runs.
   local real_bdf=""
@@ -1550,12 +1709,19 @@ main() {
   info "Phase 3+4: Running ${#all_jobs[@]} job(s) (${hw_label:+$hw_label }${emu_label:+$emu_label}${q_label})"
 
   # Launch EMU for all jobs (parallel, no NPU constraint).
+  # Each job is passed as a single "name:compiler:variant" tuple to avoid
+  # xargs token-splitting issues with empty variants.
   local emu_pool_pid=""
   if $RUN_EMU; then
-    for entry in "${all_jobs[@]}"; do
-      local name="${entry%%:*}" compiler="${entry##*:}"
-      echo "$name $compiler"
-    done | xargs -P"$JOBS" -n2 bash -c 'run_one_bridge "$@"' _ &
+    printf '%s\n' "${all_jobs[@]}" \
+      | xargs -P"$JOBS" -I{} bash -c '
+          entry="$1"
+          j_name="${entry%%:*}"
+          tmp="${entry#*:}"
+          j_compiler="${tmp%%:*}"
+          j_variant="${tmp#*:}"
+          run_one_bridge "$j_name" "$j_compiler" "$j_variant"
+        ' _ {} &
     emu_pool_pid=$!
   fi
 
@@ -1568,19 +1734,21 @@ main() {
 
     # --- Parallel pool: safe tests at -j$NPU_HW_JOBS ---
     if [[ ${#hw_parallel_jobs[@]} -gt 0 ]]; then
-      declare -A hw_pids=()   # pid -> "name:compiler"
+      declare -A hw_pids=()   # pid -> "name:compiler:variant"
       local hw_idx=0
 
       while [[ $hw_idx -lt ${#hw_parallel_jobs[@]} ]] || [[ ${#hw_pids[@]} -gt 0 ]]; do
         # Launch jobs while slots available and queue not empty.
         while [[ ${#hw_pids[@]} -lt $NPU_HW_JOBS ]] && [[ $hw_idx -lt ${#hw_parallel_jobs[@]} ]]; do
           local entry="${hw_parallel_jobs[$hw_idx]}"
-          local hw_name="${entry%%:*}"
-          local hw_compiler="${entry##*:}"
+          local hw_name hw_compiler hw_variant
+          hw_name="$(_job_name "$entry")"
+          hw_compiler="$(_job_compiler "$entry")"
+          hw_variant="$(_job_variant "$entry")"
           ((hw_idx++)) || true
 
           (
-            run_one_hardware "$hw_name" "$real_bdf" "$hw_compiler"
+            run_one_hardware "$hw_name" "$real_bdf" "$hw_compiler" "$hw_variant"
           ) &
           hw_pids[$!]="$entry"
         done
@@ -1593,13 +1761,16 @@ main() {
           if [[ $done_pid -ne 0 ]] && [[ -n "${hw_pids[$done_pid]+x}" ]]; then
             local finished="${hw_pids[$done_pid]}"
             unset 'hw_pids[$done_pid]'
-            local fin_name="${finished%%:*}"
-            local fin_compiler="${finished##*:}"
+            local fin_name fin_compiler fin_vsuffix fin_display
+            fin_name="$(_job_name "$finished")"
+            fin_compiler="$(_job_compiler "$finished")"
+            fin_vsuffix="$(_job_vsuffix "$finished")"
+            fin_display="$(_job_display "$finished")"
             local fin_safe
             fin_safe="$(sanitize_name "$fin_name")"
             local hr="SKIP"
-            [[ -f "$RESULTS_DIR/${fin_safe}.${fin_compiler}.hw.result" ]] && \
-              hr="$(< "$RESULTS_DIR/${fin_safe}.${fin_compiler}.hw.result")"
+            [[ -f "$RESULTS_DIR/${fin_safe}${fin_vsuffix}.${fin_compiler}.hw.result" ]] && \
+              hr="$(< "$RESULTS_DIR/${fin_safe}${fin_vsuffix}.${fin_compiler}.hw.result")"
             ((hw_done++)) || true
             local tdr_tag=""
             if [[ "$hr" == "TDR" ]]; then
@@ -1610,7 +1781,7 @@ main() {
               done
               echo "TDR @$(uptime_sec)s -- concurrent: $suspects" >> "$tdr_suspect_file"
             fi
-            echo "  [${hw_done}/${hw_total}] HW $fin_name ($fin_compiler): $hr  @$(uptime_sec)s${tdr_tag}"
+            echo "  [${hw_done}/${hw_total}] HW $fin_display ($fin_compiler): $hr  @$(uptime_sec)s${tdr_tag}"
           fi
         fi
       done
@@ -1622,32 +1793,40 @@ main() {
     # real failures from contention artifacts.
     local retry_jobs=()
     for entry in "${hw_parallel_jobs[@]}"; do
-      local r_name="${entry%%:*}" r_compiler="${entry##*:}"
+      local r_name r_compiler r_vsuffix
+      r_name="$(_job_name "$entry")"
+      r_compiler="$(_job_compiler "$entry")"
+      r_vsuffix="$(_job_vsuffix "$entry")"
       local r_safe
       r_safe="$(sanitize_name "$r_name")"
       local r_result=""
-      [[ -f "$RESULTS_DIR/${r_safe}.${r_compiler}.hw.result" ]] && \
-        r_result="$(< "$RESULTS_DIR/${r_safe}.${r_compiler}.hw.result")"
+      [[ -f "$RESULTS_DIR/${r_safe}${r_vsuffix}.${r_compiler}.hw.result" ]] && \
+        r_result="$(< "$RESULTS_DIR/${r_safe}${r_vsuffix}.${r_compiler}.hw.result")"
       [[ "$r_result" == "TDR" ]] && retry_jobs+=("$entry")
     done
 
     if [[ ${#retry_jobs[@]} -gt 0 ]]; then
       info "HW retry: ${#retry_jobs[@]} TDR result(s) rerunning serially"
       for entry in "${retry_jobs[@]}"; do
-        local r_name="${entry%%:*}" r_compiler="${entry##*:}"
+        local r_name r_compiler r_variant r_vsuffix r_display
+        r_name="$(_job_name "$entry")"
+        r_compiler="$(_job_compiler "$entry")"
+        r_variant="$(_job_variant "$entry")"
+        r_vsuffix="$(_job_vsuffix "$entry")"
+        r_display="$(_job_display "$entry")"
         local r_safe
         r_safe="$(sanitize_name "$r_name")"
         # Save original log, then rerun.
-        local orig_log="$RESULTS_DIR/${r_safe}.${r_compiler}.hw.log"
+        local orig_log="$RESULTS_DIR/${r_safe}${r_vsuffix}.${r_compiler}.hw.log"
         [[ -f "$orig_log" ]] && cp "$orig_log" "${orig_log%.log}.tdr-orig.log"
-        run_one_hardware "$r_name" "$real_bdf" "$r_compiler"
+        run_one_hardware "$r_name" "$real_bdf" "$r_compiler" "$r_variant"
         local rr="SKIP"
-        [[ -f "$RESULTS_DIR/${r_safe}.${r_compiler}.hw.result" ]] && \
-          rr="$(< "$RESULTS_DIR/${r_safe}.${r_compiler}.hw.result")"
+        [[ -f "$RESULTS_DIR/${r_safe}${r_vsuffix}.${r_compiler}.hw.result" ]] && \
+          rr="$(< "$RESULTS_DIR/${r_safe}${r_vsuffix}.${r_compiler}.hw.result")"
         if [[ "$rr" == "PASS" ]]; then
-          echo "  RETRY $r_name ($r_compiler): PASS (was TDR collateral)"
+          echo "  RETRY $r_display ($r_compiler): PASS (was TDR collateral)"
         else
-          echo "  RETRY $r_name ($r_compiler): $rr (confirmed failure)"
+          echo "  RETRY $r_display ($r_compiler): $rr (confirmed failure)"
         fi
       done
     fi
@@ -1656,18 +1835,22 @@ main() {
     if [[ ${#hw_quarantine_jobs[@]} -gt 0 ]]; then
       info "HW quarantine: running ${#hw_quarantine_jobs[@]} isolated test(s)"
       for entry in "${hw_quarantine_jobs[@]}"; do
-        local q_name="${entry%%:*}"
-        local q_compiler="${entry##*:}"
-        run_one_hardware "$q_name" "$real_bdf" "$q_compiler"
+        local q_name q_compiler q_variant q_vsuffix q_display
+        q_name="$(_job_name "$entry")"
+        q_compiler="$(_job_compiler "$entry")"
+        q_variant="$(_job_variant "$entry")"
+        q_vsuffix="$(_job_vsuffix "$entry")"
+        q_display="$(_job_display "$entry")"
+        run_one_hardware "$q_name" "$real_bdf" "$q_compiler" "$q_variant"
         local q_safe
         q_safe="$(sanitize_name "$q_name")"
         local qr="SKIP"
-        [[ -f "$RESULTS_DIR/${q_safe}.${q_compiler}.hw.result" ]] && \
-          qr="$(< "$RESULTS_DIR/${q_safe}.${q_compiler}.hw.result")"
+        [[ -f "$RESULTS_DIR/${q_safe}${q_vsuffix}.${q_compiler}.hw.result" ]] && \
+          qr="$(< "$RESULTS_DIR/${q_safe}${q_vsuffix}.${q_compiler}.hw.result")"
         ((hw_done++)) || true
         local q_tag=""
         [[ "$qr" == "TDR" ]] && q_tag=" *** TDR ***"
-        echo "  [${hw_done}/${hw_total}] HW $q_name ($q_compiler): $qr  @$(uptime_sec)s [QUARANTINE]${q_tag}"
+        echo "  [${hw_done}/${hw_total}] HW $q_display ($q_compiler): $qr  @$(uptime_sec)s [QUARANTINE]${q_tag}"
       done
     fi
 
@@ -1685,57 +1868,70 @@ main() {
 
   if [[ "$NO_TRACE" != "true" ]]; then
     info "Phase 5: Comparing traces"
-    for name in "${compiled[@]}"; do
-      local safe
-      safe="$(sanitize_name "$name")"
-      for compiler in "${compilers[@]}"; do
-        local hw_trace="$RESULTS_DIR/${safe}.${compiler}.hw/trace_raw.bin"
-        local emu_trace="$RESULTS_DIR/${safe}.${compiler}.emu/trace_raw.bin"
-        local events_file="$RESULTS_DIR/${safe}.${compiler}.hw/events.json"
-        [[ ! -f "$events_file" ]] && events_file="$RESULTS_DIR/${safe}.${compiler}.emu/events.json"
-        local summary_file="$RESULTS_DIR/${safe}.${compiler}.trace.summary"
+    for entry in "${all_jobs[@]}"; do
+      local t5_name t5_compiler t5_vsuffix
+      t5_name="$(_job_name "$entry")"
+      t5_compiler="$(_job_compiler "$entry")"
+      t5_vsuffix="$(_job_vsuffix "$entry")"
+      local t5_safe
+      t5_safe="$(sanitize_name "$t5_name")"
 
-        if [[ -f "$hw_trace" ]] && [[ -f "$emu_trace" ]]; then
-          local cmp_log="$RESULTS_DIR/${safe}.${compiler}.trace.log"
-          local cmp_out
-          cmp_out="$(run_trace_compare --hw "$hw_trace" --emu "$emu_trace" 2>&1)" || true
-          echo "$cmp_out" > "$cmp_log"
+      local hw_trace="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.hw/trace_raw.bin"
+      local emu_trace="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.emu/trace_raw.bin"
+      local events_file="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.hw/events.json"
+      [[ ! -f "$events_file" ]] && events_file="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.emu/events.json"
+      local summary_file="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.trace.summary"
 
-          if echo "$cmp_out" | grep -q "CLEAN"; then
-            echo "CLEAN" > "$summary_file"
-          elif echo "$cmp_out" | grep -q "DIVERGE"; then
-            echo "DIVERGE" > "$summary_file"
-          else
-            echo "ERROR" > "$summary_file"
-          fi
-        elif [[ -f "$emu_trace" ]]; then
-          echo "EMU_ONLY" > "$summary_file"
-        elif [[ -f "$hw_trace" ]]; then
-          echo "HW_ONLY" > "$summary_file"
+      if [[ -f "$hw_trace" ]] && [[ -f "$emu_trace" ]]; then
+        local cmp_log="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.trace.log"
+        local cmp_out
+        cmp_out="$(run_trace_compare --hw "$hw_trace" --emu "$emu_trace" 2>&1)" || true
+        echo "$cmp_out" > "$cmp_log"
+
+        if echo "$cmp_out" | grep -q "CLEAN"; then
+          echo "CLEAN" > "$summary_file"
+        elif echo "$cmp_out" | grep -q "DIVERGE"; then
+          echo "DIVERGE" > "$summary_file"
         else
-          echo "NONE" > "$summary_file"
+          echo "ERROR" > "$summary_file"
         fi
-      done
+      elif [[ -f "$emu_trace" ]]; then
+        echo "EMU_ONLY" > "$summary_file"
+      elif [[ -f "$hw_trace" ]]; then
+        echo "HW_ONLY" > "$summary_file"
+      else
+        echo "NONE" > "$summary_file"
+      fi
     done
   fi
 
   # ---- Phase 5b: Event sweep (optional) -----------------------------------
 
   if [[ "$SWEEP" == "true" ]]; then
+    # Collect unique test names that have at least one passing variant.
     local sweep_targets=()
-    for name in "${compiled[@]}"; do
-      is_trace_quarantined "$name" && continue
-      local safe
-      safe="$(sanitize_name "$name")"
-      local any_pass=false
-      for compiler in "${compilers[@]}"; do
-        for suffix in hw bridge; do
-          local rf="$RESULTS_DIR/${safe}.${compiler}.${suffix}.result"
-          [[ -f "$rf" ]] && [[ "$(< "$rf")" == "PASS" ]] && any_pass=true
-        done
-        $any_pass && break
+    declare -A _sweep_seen=()
+    for entry in "${all_jobs[@]}"; do
+      local sw_name sw_compiler sw_vsuffix
+      sw_name="$(_job_name "$entry")"
+      sw_compiler="$(_job_compiler "$entry")"
+      sw_vsuffix="$(_job_vsuffix "$entry")"
+      [[ -n "${_sweep_seen[$sw_name]+x}" ]] && continue
+      is_trace_quarantined "$sw_name" && continue
+      local sw_safe
+      sw_safe="$(sanitize_name "$sw_name")"
+      local sw_found=false
+      for suffix in hw bridge; do
+        local rf="$RESULTS_DIR/${sw_safe}${sw_vsuffix}.${sw_compiler}.${suffix}.result"
+        if [[ -f "$rf" ]] && [[ "$(< "$rf")" == "PASS" ]]; then
+          sw_found=true
+          break
+        fi
       done
-      $any_pass && sweep_targets+=("$name")
+      if $sw_found; then
+        sweep_targets+=("$sw_name")
+        _sweep_seen["$sw_name"]=1
+      fi
     done
 
     if [[ ${#sweep_targets[@]} -gt 0 ]]; then
@@ -1896,8 +2092,33 @@ main() {
 
   # ---- Phase 6: Report ---------------------------------------------------
 
+  # Build variant-expanded report rows.  Each row is "name:variant" where
+  # variant is empty for single-variant tests.  Tests that were skipped
+  # (npu2-only, not compiled) still appear with an empty variant.
+  local report_rows=()
+  declare -A _reported_tests=()
+  # First, add all variant-expanded entries from the run phase.
+  for entry in "${all_jobs[@]}"; do
+    local rr_name rr_variant
+    rr_name="$(_job_name "$entry")"
+    rr_variant="$(_job_variant "$entry")"
+    local rr_key="${rr_name}:${rr_variant}"
+    if [[ -z "${_reported_tests[$rr_key]+x}" ]]; then
+      report_rows+=("$rr_key")
+      _reported_tests["$rr_key"]=1
+      _reported_tests["$rr_name"]=1  # Mark test name as seen.
+    fi
+  done
+  # Add tests that were skipped or failed compile (not in all_jobs).
+  for name in "${tests[@]}"; do
+    if [[ -z "${_reported_tests[$name]+x}" ]]; then
+      report_rows+=("${name}:")
+      _reported_tests["$name"]=1
+    fi
+  done
+
   info "Phase 6: Report"
-  print_report tests "$RUN_HW"
+  print_report report_rows "$RUN_HW"
 }
 
 main
