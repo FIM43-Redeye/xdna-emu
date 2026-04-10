@@ -554,16 +554,29 @@ impl InterpreterEngine {
                     continue;
                 }
 
-                // For compute tiles, we need memory module lock routing.
-                // Memory module locks (48-63) should access the MemTile (row 1) locks.
-                // Copy MemTile locks before stepping, then copy changes back after.
-                let mem_tile_row = 1; // MemTile is always row 1
-                let mut mem_tile_locks_copy: Option<Vec<crate::device::tile::Lock>> = None;
+                // AIE2 lock quadrant routing: copy neighbor locks before stepping,
+                // then write changes back after. Per mlir-aie getLockLocalBaseIndex:
+                //   South (IDs 0-15):  row-1 neighbor
+                //   West  (IDs 16-31): col-1 neighbor
+                //   North (IDs 32-47): row+1 neighbor
+                //   East  (IDs 48-63): own tile (handled internally)
+                let mut south_locks: Option<Vec<crate::device::tile::Lock>> = None;
+                let mut west_locks: Option<Vec<crate::device::tile::Lock>> = None;
+                let mut north_locks: Option<Vec<crate::device::tile::Lock>> = None;
 
-                // Copy memory tile locks if we're in a compute row
-                if row > mem_tile_row {
-                    if let Some(mem_tile) = self.device.tile(col, mem_tile_row) {
-                        mem_tile_locks_copy = Some(mem_tile.locks.clone());
+                if row > 0 {
+                    if let Some(south) = self.device.tile(col, row - 1) {
+                        south_locks = Some(south.locks.clone());
+                    }
+                }
+                if col > 0 {
+                    if let Some(west) = self.device.tile(col - 1, row) {
+                        west_locks = Some(west.locks.clone());
+                    }
+                }
+                if row + 1 < self.rows {
+                    if let Some(north) = self.device.tile(col, row + 1) {
+                        north_locks = Some(north.locks.clone());
                     }
                 }
 
@@ -581,20 +594,18 @@ impl InterpreterEngine {
 
                     let core = &mut self.cores[idx];
 
-                    // Step with memory tile locks and neighbor memory
-                    let result = if let Some(ref mut mem_locks) = mem_tile_locks_copy {
-                        core.interpreter.step_with_mem_locks(
-                            &mut core.context, tile,
-                            Some(mem_locks.as_mut_slice()),
-                            Some(&mut neighbors),
-                        )
-                    } else {
-                        core.interpreter.step_with_mem_locks(
-                            &mut core.context, tile,
-                            None,
-                            Some(&mut neighbors),
-                        )
+                    // Build neighbor locks struct
+                    let mut nlocks = crate::interpreter::execute::NeighborLocks {
+                        south: south_locks.as_mut().map(|v| v.as_mut_slice()),
+                        west: west_locks.as_mut().map(|v| v.as_mut_slice()),
+                        north: north_locks.as_mut().map(|v| v.as_mut_slice()),
                     };
+
+                    let result = core.interpreter.step_with_neighbor_locks(
+                        &mut core.context, tile,
+                        &mut nlocks,
+                        Some(&mut neighbors),
+                    );
 
                     // Update CoreDebugState with current PC and stall info.
                     // This mirrors the interpreter state into the register
@@ -657,21 +668,39 @@ impl InterpreterEngine {
                     neighbors.apply_writes(&mut self.device);
                 }
 
-                // Submit modified memory tile locks to the MemTile's arbiter.
+                // Submit modified neighbor locks back to neighbor tiles.
                 //
                 // Instead of writing back directly (which would make core lock
-                // releases visible to MemTile DMA in the same cycle), we compute
+                // releases visible to neighbor DMA in the same cycle), we compute
                 // the diff and submit it as a core release to the arbiter. The
                 // arbiter resolves in Phase 3, providing the 1-cycle delay.
-                if let Some(mem_locks) = mem_tile_locks_copy {
-                    if let Some(mem_tile) = self.device.tile_mut(col, mem_tile_row) {
-                        for i in 0..mem_locks.len().min(mem_tile.locks.len()) {
-                            let delta = (mem_locks[i].value as i16) - (mem_tile.locks[i].value as i16);
-                            if delta != 0 {
-                                mem_tile.defer_core_lock_release(i, delta as i8);
+                fn writeback_locks(
+                    device: &mut DeviceState,
+                    locks: Option<Vec<crate::device::tile::Lock>>,
+                    ncol: usize, nrow: usize,
+                ) {
+                    if let Some(modified) = locks {
+                        if let Some(neighbor) = device.tile_mut(ncol, nrow) {
+                            for i in 0..modified.len().min(neighbor.locks.len()) {
+                                let delta = (modified[i].value as i16) - (neighbor.locks[i].value as i16);
+                                if delta != 0 {
+                                    neighbor.defer_core_lock_release(i, delta as i8);
+                                }
                             }
                         }
                     }
+                }
+                // South
+                if row > 0 {
+                    writeback_locks(&mut self.device, south_locks, col, row - 1);
+                }
+                // West
+                if col > 0 {
+                    writeback_locks(&mut self.device, west_locks, col - 1, row);
+                }
+                // North
+                if row + 1 < self.rows {
+                    writeback_locks(&mut self.device, north_locks, col, row + 1);
                 }
             }
         }

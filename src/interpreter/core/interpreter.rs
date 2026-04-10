@@ -87,17 +87,40 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
         Self::new(InstructionDecoder::load_default(), CycleAccurateExecutor::new())
     }
 
-    /// Execute a single instruction cycle with memory tile lock routing
+    /// Execute a single instruction cycle with full neighbor lock routing
     /// and optional cross-tile memory access.
     ///
-    /// For compute tiles, pass the adjacent memory tile's locks to enable
-    /// proper routing of lock IDs 48-63 (memory module locks) to the MemTile.
-    /// Pass `neighbors` to enable cross-tile memory access (quadrants 1-3).
+    /// All four lock quadrants per AIE2 getLockLocalBaseIndex:
+    /// South (0-15), West (16-31), North (32-47), East/Internal (48-63).
+    pub fn step_with_neighbor_locks(
+        &mut self,
+        ctx: &mut ExecutionContext,
+        tile: &mut Tile,
+        neighbor_locks: &mut crate::interpreter::execute::NeighborLocks,
+        neighbors: Option<&mut crate::interpreter::execute::NeighborMemory>,
+    ) -> StepResult {
+        self.step_internal(ctx, tile, Some(neighbor_locks), neighbors)
+    }
+
+    /// Execute a single instruction cycle with South-only lock routing
+    /// and optional cross-tile memory access (backward-compatible).
     pub fn step_with_mem_locks(
         &mut self,
         ctx: &mut ExecutionContext,
         tile: &mut Tile,
         mem_tile_locks: Option<&mut [crate::device::tile::Lock]>,
+        neighbors: Option<&mut crate::interpreter::execute::NeighborMemory>,
+    ) -> StepResult {
+        let mut nlocks = crate::interpreter::execute::NeighborLocks::south_only(mem_tile_locks);
+        self.step_internal(ctx, tile, Some(&mut nlocks), neighbors)
+    }
+
+    /// Internal step implementation.
+    fn step_internal(
+        &mut self,
+        ctx: &mut ExecutionContext,
+        tile: &mut Tile,
+        neighbor_locks: Option<&mut crate::interpreter::execute::NeighborLocks>,
         neighbors: Option<&mut crate::interpreter::execute::NeighborMemory>,
     ) -> StepResult {
         // Check if halted
@@ -148,9 +171,13 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
 
         let bundle_size = bundle.size();
 
-        // Execute bundle with memory tile locks and neighbor memory for proper routing
+        // Execute bundle with neighbor locks and neighbor memory for proper routing
         self.status = CoreStatus::Running;
-        let result = self.executor.execute_with_mem_tile(&bundle, ctx, tile, mem_tile_locks, neighbors);
+        let result = if let Some(nlocks) = neighbor_locks {
+            self.executor.execute_with_neighbor_locks(&bundle, ctx, tile, nlocks, neighbors)
+        } else {
+            self.executor.execute_with_mem_tile(&bundle, ctx, tile, None, neighbors)
+        };
 
         // Save bundle for debugging
         self.last_bundle = Some(bundle);

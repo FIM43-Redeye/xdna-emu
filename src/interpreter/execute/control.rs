@@ -53,6 +53,33 @@ use crate::device::tile::{Lock, Tile, LockResult};
 use crate::interpreter::bundle::{BranchCondition, Operand, SlotOp};
 use crate::tablegen::SemanticOp;
 use crate::interpreter::state::ExecutionContext;
+
+/// Neighbor lock slices for cross-tile lock routing.
+///
+/// AIE2 compute tiles can access locks in all four cardinal neighbors:
+/// - South (IDs 0-15): row-1 neighbor (typically MemTile)
+/// - West  (IDs 16-31): col-1 neighbor
+/// - North (IDs 32-47): row+1 neighbor
+/// - East/Internal (IDs 48-63): own tile (handled separately)
+///
+/// Per mlir-aie AIETargetModel::getLockLocalBaseIndex().
+pub struct NeighborLocks<'a> {
+    pub south: Option<&'a mut [Lock]>,
+    pub west: Option<&'a mut [Lock]>,
+    pub north: Option<&'a mut [Lock]>,
+}
+
+impl<'a> NeighborLocks<'a> {
+    /// Create with no neighbors (all quadrants fall back to own tile).
+    pub fn none() -> Self {
+        Self { south: None, west: None, north: None }
+    }
+
+    /// Create from just a South neighbor (backward-compatible with old API).
+    pub fn south_only(locks: Option<&'a mut [Lock]>) -> Self {
+        Self { south: locks, west: None, north: None }
+    }
+}
 use crate::interpreter::traits::{ExecuteResult, Flags, StateAccess};
 
 /// Control unit for branches, calls, and synchronization.
@@ -65,19 +92,21 @@ impl ControlUnit {
         ctx: &mut ExecutionContext,
         tile: &mut Tile,
     ) -> Option<ExecuteResult> {
-        Self::execute_with_mem_locks(op, ctx, tile, None)
+        Self::execute_with_neighbor_locks(op, ctx, tile, &mut NeighborLocks::none())
     }
 
     /// Execute a control operation with optional cross-tile lock routing.
     ///
-    /// AIE2 lock quadrant mapping (per getLockLocalBaseIndex):
+    /// AIE2 lock quadrant mapping (per mlir-aie getLockLocalBaseIndex):
+    /// - IDs 0-15  (South): row-1 neighbor locks
+    /// - IDs 16-31 (West):  col-1 neighbor locks
+    /// - IDs 32-47 (North): row+1 neighbor locks
     /// - IDs 48-63 (East=Internal): own tile's memory module locks
-    /// - IDs 0-15  (South): `mem_tile_locks` if provided (row-1 neighbor)
-    pub fn execute_with_mem_locks(
+    pub fn execute_with_neighbor_locks(
         op: &SlotOp,
         ctx: &mut ExecutionContext,
         tile: &mut Tile,
-        mut mem_tile_locks: Option<&mut [Lock]>,
+        neighbor_locks: &mut NeighborLocks,
     ) -> Option<ExecuteResult> {
         match op.semantic {
             Some(SemanticOp::Br) | Some(SemanticOp::BrCond) => {
@@ -172,7 +201,7 @@ impl ControlUnit {
                 // The DMA BD lock field (4-bit) directly addresses tile-local
                 // locks 0-15, matching the East/Internal quadrant (IDs 48-63).
                 let (locks, lock_id, is_own_tile) = Self::route_lock(
-                    raw_lock_id, tile, &mut mem_tile_locks,
+                    raw_lock_id, tile, neighbor_locks,
                 );
 
                 let current_value = locks[lock_id as usize].value;
@@ -224,7 +253,7 @@ impl ControlUnit {
 
                 // Same quadrant routing as LockAcquire.
                 let (locks, lock_id, is_own_tile) = Self::route_lock(
-                    raw_lock_id, tile, &mut mem_tile_locks,
+                    raw_lock_id, tile, neighbor_locks,
                 );
 
                 if is_own_tile {
@@ -453,27 +482,42 @@ impl ControlUnit {
     fn route_lock<'a>(
         raw_lock_id: u8,
         tile: &'a mut Tile,
-        mem_tile_locks: &'a mut Option<&mut [Lock]>,
+        neighbor_locks: &'a mut NeighborLocks,
     ) -> (&'a mut [Lock], u8, bool) {
         if raw_lock_id >= 48 {
             // East = Internal = own tile's memory module locks.
             let id = (raw_lock_id - 48) % tile.locks.len() as u8;
             (&mut tile.locks, id, true)
         } else if raw_lock_id < 16 {
-            // South = row-1 neighbor (MemTile for compute tiles at row 2).
-            if let Some(ref mut mt_locks) = mem_tile_locks {
-                let id = raw_lock_id % mt_locks.len() as u8;
-                (&mut **mt_locks, id, false)
+            // South = row-1 neighbor.
+            if let Some(ref mut locks) = neighbor_locks.south {
+                let id = raw_lock_id % locks.len() as u8;
+                (&mut **locks, id, false)
             } else {
-                // No South neighbor locks provided; fall back to own tile.
+                log::warn!("Lock ID {} targets South neighbor but no South locks available", raw_lock_id);
                 let id = raw_lock_id % tile.locks.len() as u8;
                 (&mut tile.locks, id, true)
             }
+        } else if raw_lock_id < 32 {
+            // West = col-1 neighbor.
+            if let Some(ref mut locks) = neighbor_locks.west {
+                let id = (raw_lock_id - 16) % locks.len() as u8;
+                (&mut **locks, id, false)
+            } else {
+                log::warn!("Lock ID {} targets West neighbor but no West locks available", raw_lock_id);
+                let id = (raw_lock_id - 16) % tile.locks.len() as u8;
+                (&mut tile.locks, id, true)
+            }
         } else {
-            // West (16-31) or North (32-47): not yet supported.
-            // Fall back to own tile locks with modular mapping.
-            let id = (raw_lock_id % 16) % tile.locks.len() as u8;
-            (&mut tile.locks, id, true)
+            // North = row+1 neighbor (IDs 32-47).
+            if let Some(ref mut locks) = neighbor_locks.north {
+                let id = (raw_lock_id - 32) % locks.len() as u8;
+                (&mut **locks, id, false)
+            } else {
+                log::warn!("Lock ID {} targets North neighbor but no North locks available", raw_lock_id);
+                let id = (raw_lock_id - 32) % tile.locks.len() as u8;
+                (&mut tile.locks, id, true)
+            }
         }
     }
 

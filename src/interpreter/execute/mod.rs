@@ -99,7 +99,7 @@ mod semantic;
 
 pub use vector_dispatch::VectorAlu;
 pub use memory::{MemoryUnit, NeighborMemory};
-pub use control::ControlUnit;
+pub use control::{ControlUnit, NeighborLocks};
 pub use stream::{StreamOps, StreamResult};
 pub use cascade::{CascadeOps, CascadeResult};
 pub use cycle_accurate::{CycleAccurateExecutor, CycleAccurateStats};
