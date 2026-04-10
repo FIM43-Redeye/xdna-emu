@@ -379,8 +379,19 @@ impl StreamSwitch {
         // that circuit routes should not also consume from)
         words_forwarded += self.step_packet_routes();
 
-        // Phase 2: Accept new words from slaves into the pipeline
-        for route in &self.local_routes {
+        // Phase 2: Accept new words from slaves into the pipeline.
+        //
+        // Circuit-mode multicast: a single slave port can connect to multiple
+        // master ports (hardware duplicates the word in the switch fabric).
+        // We group routes by slave_idx so we pop once and push a pipeline
+        // entry for every destination master.
+        //
+        // Collect which slaves have been consumed this cycle to avoid
+        // double-popping when multiple routes share the same slave.
+        let mut slave_consumed: u64 = 0; // bitset, up to 64 slave ports
+
+        for i in 0..self.local_routes.len() {
+            let route = &self.local_routes[i];
             if !route.enabled {
                 continue;
             }
@@ -393,27 +404,51 @@ impl StreamSwitch {
                 continue;
             }
 
-            let slave_has_data = self.slaves[slave_idx].has_data();
-
-            // Debug: trace all routes for tiles with local routes
-            if slave_has_data || self.row >= 1 {
-                let fifo_len = self.slaves[slave_idx].fifo.len();
-                log::trace!("TileSwitch({},{}): route slave[{}]->master[{}] has_data={} fifo_len={}",
-                    self.col, self.row, slave_idx, master_idx, slave_has_data, fifo_len);
+            // Already consumed by a prior route in this cycle (multicast peer)
+            if slave_idx < 64 && (slave_consumed & (1u64 << slave_idx)) != 0 {
+                continue;
             }
 
+            let slave_has_data = self.slaves[slave_idx].has_data();
+
+            log::trace!("TileSwitch({},{}): route slave[{}]->master[{}] has_data={} fifo_len={}",
+                self.col, self.row, slave_idx, master_idx, slave_has_data,
+                self.slaves[slave_idx].fifo.len());
+
             if slave_has_data {
-                // Pop from slave and enter the switch pipeline with route-specific latency
+                // Pop once from slave
                 if let Some((data, tlast)) = self.slaves[slave_idx].pop_with_tlast() {
-                    self.switch_pipeline.push(InSwitchWord {
-                        master_idx: master_idx as u8,
-                        data,
-                        tlast,
-                        cycles_remaining: route.latency,
-                    });
-                    log::debug!("TileSwitch({},{}): slave[{}] -> pipeline({}) -> master[{}] data=0x{:08X}{}",
-                        self.col, self.row, slave_idx, route.latency, master_idx, data,
-                        if tlast { " TLAST" } else { "" });
+                    if slave_idx < 64 {
+                        slave_consumed |= 1u64 << slave_idx;
+                    }
+
+                    // Find ALL enabled routes from this slave (multicast fanout)
+                    // Find ALL enabled routes from this slave (multicast fanout).
+                    // Search the full route list -- routes for the same slave may
+                    // appear at any position.
+                    let mut dest_count: u32 = 0;
+                    for j in 0..self.local_routes.len() {
+                        let peer = &self.local_routes[j];
+                        if peer.slave_idx as usize != slave_idx || !peer.enabled {
+                            continue;
+                        }
+                        let peer_master = peer.master_idx as usize;
+                        if peer_master >= self.masters.len() {
+                            continue;
+                        }
+                        self.switch_pipeline.push(InSwitchWord {
+                            master_idx: peer.master_idx,
+                            data,
+                            tlast,
+                            cycles_remaining: peer.latency,
+                        });
+                        dest_count += 1;
+                        log::debug!("TileSwitch({},{}): slave[{}] -> pipeline({}) -> master[{}] data=0x{:08X}{}{}",
+                            self.col, self.row, slave_idx, peer.latency, peer_master, data,
+                            if tlast { " TLAST" } else { "" },
+                            if dest_count > 1 { " (multicast)" } else { "" });
+                    }
+                    let _ = dest_count; // used in log messages above
                 }
             }
         }

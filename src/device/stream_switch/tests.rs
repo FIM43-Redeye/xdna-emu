@@ -288,6 +288,94 @@ fn test_remove_local_route() {
 }
 
 // ========================================================================
+// Circuit-mode Multicast Tests
+// ========================================================================
+
+#[test]
+fn test_circuit_multicast_one_slave_two_masters() {
+    // One slave port routes to two master ports (multicast).
+    // Both masters should receive the same word.
+    let mut ss = StreamSwitch::new_compute_tile(0, 2);
+    ss.configure_local_route(0, 0); // slave 0 -> master 0
+    ss.configure_local_route(0, 1); // slave 0 -> master 1 (multicast)
+
+    // Push one word to the slave
+    ss.slaves[0].push_with_tlast(0xCAFEBABE, false);
+
+    // Determine pipeline latency (should be same for both routes)
+    let latency = ss.local_routes[0].latency;
+
+    // Step: should pop once, enter pipeline for both masters
+    ss.step();
+    assert!(!ss.slaves[0].has_data(), "Slave data should be consumed");
+    // Pipeline should have 2 entries (one per destination)
+    assert_eq!(ss.switch_pipeline.len(), 2, "Both multicast destinations should be in pipeline");
+
+    // Step through pipeline delivery
+    for _ in 0..latency {
+        ss.step();
+    }
+
+    // Both masters should have received the word
+    assert_eq!(ss.masters[0].pop(), Some(0xCAFEBABE), "Master 0 should get multicast data");
+    assert_eq!(ss.masters[1].pop(), Some(0xCAFEBABE), "Master 1 should get multicast data");
+}
+
+#[test]
+fn test_circuit_multicast_preserves_tlast() {
+    let mut ss = StreamSwitch::new_compute_tile(0, 2);
+    ss.configure_local_route(0, 0);
+    ss.configure_local_route(0, 1);
+
+    // Push word with TLAST
+    ss.slaves[0].push_with_tlast(0xDEAD0001, true);
+
+    let latency = ss.local_routes[0].latency;
+    for _ in 0..=latency {
+        ss.step();
+    }
+
+    // Both should get data with TLAST preserved
+    let (d0, t0) = ss.masters[0].pop_with_tlast().unwrap();
+    let (d1, t1) = ss.masters[1].pop_with_tlast().unwrap();
+    assert_eq!(d0, 0xDEAD0001);
+    assert_eq!(d1, 0xDEAD0001);
+    assert!(t0, "Master 0 should see TLAST");
+    assert!(t1, "Master 1 should see TLAST");
+}
+
+#[test]
+fn test_circuit_multicast_multiple_words() {
+    // Stream 4 words through a multicast route, verify all arrive at both destinations.
+    let mut ss = StreamSwitch::new_compute_tile(0, 2);
+    ss.configure_local_route(0, 0);
+    ss.configure_local_route(0, 1);
+
+    let words = [0x11111111u32, 0x22222222, 0x33333333, 0x44444444];
+    for &w in &words {
+        ss.slaves[0].push(w);
+    }
+
+    // Step and drain masters as words arrive. Master FIFO depth is only 2,
+    // so we must consume delivered words to make room for the next batch.
+    let mut received_0 = Vec::new();
+    let mut received_1 = Vec::new();
+    for _ in 0..40 {
+        ss.step();
+        while let Some(w) = ss.masters[0].pop() {
+            received_0.push(w);
+        }
+        while let Some(w) = ss.masters[1].pop() {
+            received_1.push(w);
+        }
+    }
+
+    // Verify all words arrived at both masters in order
+    assert_eq!(received_0, words.to_vec(), "Master 0 should get all multicast words in order");
+    assert_eq!(received_1, words.to_vec(), "Master 1 should get all multicast words in order");
+}
+
+// ========================================================================
 // Packet Header Tests
 // ========================================================================
 
