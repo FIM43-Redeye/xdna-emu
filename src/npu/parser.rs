@@ -414,15 +414,44 @@ impl NpuInstructionStream {
                     Ok(NpuInstruction::MaskPoll { reg_off: reg_off as u32, value, mask })
                 }
 
-                // ConfigShimDmaBd (5) and ConfigShimDmaDmaBufBd (6) are defined
-                // in aie-rt but never emitted by mlir-aie. Log if encountered.
+                // Opcodes that the emulator can safely skip.
+                // Noop: does nothing by definition.
+                // MaskPoll/MaskPollBusy: emulator writes are synchronous.
+                // Preempt: no preemption in emulator.
+                // LoadPdi/LoadPmStart/LoadPmEndInternal: firmware-level ops.
+                // CreateScratchpad/UpdateStateTable/UpdateReg/UpdateScratch: firmware state.
+                NpuOpcode::Noop => {
+                    log::debug!("NPU NOOP");
+                    // Consume the remaining 4 bytes of the standard 8-byte header
+                    let _zeros = cursor.read_u32::<LittleEndian>().ok();
+                    Ok(NpuInstruction::Unknown { opcode: opcode_byte, data: vec![] })
+                }
+
+                NpuOpcode::Preempt | NpuOpcode::MaskPollBusy |
+                NpuOpcode::LoadPdi | NpuOpcode::LoadPmStart |
+                NpuOpcode::CreateScratchpad | NpuOpcode::UpdateStateTable |
+                NpuOpcode::UpdateReg | NpuOpcode::UpdateScratch |
+                NpuOpcode::LoadPmEndInternal => {
+                    log::debug!("NPU opcode {:?} -- firmware-level, skipping", opcode);
+                    let _zeros = cursor.read_u32::<LittleEndian>().ok();
+                    // These may have payloads; skip 8 more bytes conservatively
+                    let mut buf = vec![0u8; 8];
+                    cursor.read_exact(&mut buf).ok();
+                    Ok(NpuInstruction::Unknown { opcode: opcode_byte, data: buf })
+                }
+
+                // ConfigShimDmaBd (14) and ConfigShimDmaDmaBufBd (15) configure
+                // shim DMA BDs as complete 8-word transactions. Not yet emitted
+                // by any test binary we've seen, but supported for completeness.
                 NpuOpcode::ConfigShimDmaBd | NpuOpcode::ConfigShimDmaDmaBufBd => {
                     log::warn!(
-                        "NPU opcode {:?} encountered but not implemented -- \
-                         mlir-aie does not emit this opcode; payload skipped",
+                        "NPU opcode {:?} encountered but execution not implemented -- \
+                         BD words will be skipped",
                         opcode
                     );
-                    let mut buf = vec![0u8; 8];
+                    let _zeros = cursor.read_u32::<LittleEndian>().ok();
+                    // Payload: 8 BD words (32 bytes) + location info
+                    let mut buf = vec![0u8; 36];
                     cursor.read_exact(&mut buf).ok();
                     Ok(NpuInstruction::Unknown {
                         opcode: opcode_byte,
@@ -625,11 +654,24 @@ mod tests {
 
     #[test]
     fn test_opcode_from_u8() {
+        // Standard ops (0-4)
         assert_eq!(NpuOpcode::from(0), NpuOpcode::Write32);
         assert_eq!(NpuOpcode::from(1), NpuOpcode::BlockWrite);
+        assert_eq!(NpuOpcode::from(2), NpuOpcode::BlockSet);
         assert_eq!(NpuOpcode::from(3), NpuOpcode::MaskWrite);
+        assert_eq!(NpuOpcode::from(4), NpuOpcode::MaskPoll);
+        // Extended ops (5-15) per xdna-driver numbering
+        assert_eq!(NpuOpcode::from(5), NpuOpcode::Noop);
+        assert_eq!(NpuOpcode::from(6), NpuOpcode::Preempt);
+        assert_eq!(NpuOpcode::from(14), NpuOpcode::ConfigShimDmaBd);
+        assert_eq!(NpuOpcode::from(15), NpuOpcode::ConfigShimDmaDmaBufBd);
+        // Custom ops (128+)
         assert_eq!(NpuOpcode::from(128), NpuOpcode::Tct);
         assert_eq!(NpuOpcode::from(129), NpuOpcode::DdrPatch);
-        assert_eq!(NpuOpcode::from(200), NpuOpcode::Unknown);
+        assert_eq!(NpuOpcode::from(130), NpuOpcode::ReadRegs);
+        assert_eq!(NpuOpcode::from(200), NpuOpcode::LoadPmEndInternal);
+        // Unknown
+        assert_eq!(NpuOpcode::from(99), NpuOpcode::Unknown);
+        assert_eq!(NpuOpcode::from(254), NpuOpcode::Unknown);
     }
 }

@@ -29,6 +29,14 @@ pub use parser::{NpuInstruction, NpuInstructionStream};
 pub use executor::{NpuExecutor, HostBuffer, AdvanceResult};
 
 /// NPU instruction opcodes.
+///
+/// Numbering follows the xdna-driver kernel module (ground truth) and
+/// mlir-aie AIETargetNPU.cpp. Note: the official aie-rt repo and aietools
+/// use an OLDER numbering where ConfigShimDmaBd=5, ConfigShimDmaDmaBufBd=6.
+/// That numbering is STALE -- the driver has added NOOP, PREEMPT, and other
+/// opcodes at positions 5-13, pushing ConfigShimDma to 14/15.
+///
+/// Source: xdna-driver/xrt/src/runtime_src/aie-rt/driver/src/common/xaie_txn.h
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum NpuOpcode {
@@ -42,15 +50,41 @@ pub enum NpuOpcode {
     MaskWrite = 3,
     /// Poll until (reg & mask) == value.
     MaskPoll = 4,
-    /// Configure shim DMA buffer descriptor.
-    ConfigShimDmaBd = 5,
-    /// Configure shim DMA with DMA buffer.
-    ConfigShimDmaDmaBufBd = 6,
+    /// No-operation.
+    Noop = 5,
+    /// Preemption control.
+    Preempt = 6,
+    /// Busy-wait poll until (reg & mask) == value.
+    MaskPollBusy = 7,
+    /// Load PDI (Programmable Device Image).
+    LoadPdi = 8,
+    /// Start loading program memory.
+    LoadPmStart = 9,
+    /// Create scratchpad memory region.
+    CreateScratchpad = 10,
+    /// Update firmware state table.
+    UpdateStateTable = 11,
+    /// Update register via firmware.
+    UpdateReg = 12,
+    /// Update scratchpad memory.
+    UpdateScratch = 13,
+    /// Configure shim DMA buffer descriptor (all 8 BD words at once).
+    ConfigShimDmaBd = 14,
+    /// Configure shim DMA buffer descriptor with DMA buffer handle.
+    ConfigShimDmaDmaBufBd = 15,
     /// Custom operation: Transaction Control Token (Sync/Wait).
     /// This is XAIE_IO_CUSTOM_OP_TCT = XAIE_IO_CUSTOM_OP_BEGIN = 128.
     Tct = 128,
     /// Custom operation: DDR address patch.
     DdrPatch = 129,
+    /// Custom operation: Read registers.
+    ReadRegs = 130,
+    /// Custom operation: Record timer value.
+    RecordTimer = 131,
+    /// Custom operation: Merge sync barrier.
+    MergeSync = 132,
+    /// Internal: end of program memory load.
+    LoadPmEndInternal = 200,
     /// Unknown opcode.
     Unknown = 255,
 }
@@ -63,10 +97,23 @@ impl From<u8> for NpuOpcode {
             2 => NpuOpcode::BlockSet,
             3 => NpuOpcode::MaskWrite,
             4 => NpuOpcode::MaskPoll,
-            5 => NpuOpcode::ConfigShimDmaBd,
-            6 => NpuOpcode::ConfigShimDmaDmaBufBd,
+            5 => NpuOpcode::Noop,
+            6 => NpuOpcode::Preempt,
+            7 => NpuOpcode::MaskPollBusy,
+            8 => NpuOpcode::LoadPdi,
+            9 => NpuOpcode::LoadPmStart,
+            10 => NpuOpcode::CreateScratchpad,
+            11 => NpuOpcode::UpdateStateTable,
+            12 => NpuOpcode::UpdateReg,
+            13 => NpuOpcode::UpdateScratch,
+            14 => NpuOpcode::ConfigShimDmaBd,
+            15 => NpuOpcode::ConfigShimDmaDmaBufBd,
             128 => NpuOpcode::Tct,
             129 => NpuOpcode::DdrPatch,
+            130 => NpuOpcode::ReadRegs,
+            131 => NpuOpcode::RecordTimer,
+            132 => NpuOpcode::MergeSync,
+            200 => NpuOpcode::LoadPmEndInternal,
             _ => NpuOpcode::Unknown,
         }
     }
