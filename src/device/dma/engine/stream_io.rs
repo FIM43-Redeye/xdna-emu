@@ -90,6 +90,11 @@ impl DmaEngine {
         self.stream_in.get(channel as usize).map_or(false, |q| !q.is_empty())
     }
 
+    /// Count available stream input words for a specific channel.
+    pub fn stream_in_count_for_channel(&self, channel: u8) -> usize {
+        self.stream_in.get(channel as usize).map_or(0, |q| q.len())
+    }
+
     /// Pop data from a specific channel's stream input buffer.
     ///
     /// Each channel has its own FIFO, so this is O(1) (front pop).

@@ -158,7 +158,10 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
         dma: DmaTiming {
             bd_setup_cycles: 4,
             channel_start_cycles: 2,
-            words_per_cycle: 1,
+            // AIE2 data memory bus is 128 bits = 16 bytes = 4 words per cycle.
+            // Source: xaiemlgbl_params.h DATAMEMORY_WIDTH = 128.
+            // (AIE2P is 256 bits = 8 words/cycle per xaie2psgbl_params.h.)
+            words_per_cycle: 4,
             memory_latency_cycles: 5,
             lock_acquire_cycles: 1,
             lock_release_cycles: 1,

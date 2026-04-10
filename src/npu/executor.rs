@@ -315,6 +315,26 @@ impl NpuExecutor {
 
     /// Load instructions directly (for testing or internal use).
     pub fn load_instructions(&mut self, instructions: Vec<NpuInstruction>) {
+        // Log instruction summary for debugging complex multi-tile flows
+        if instructions.len() > 10 {
+            let mut syncs = 0;
+            let mut enqueues = 0;
+            let mut writes = 0;
+            let mut patches = 0;
+            for instr in &instructions {
+                match instr {
+                    NpuInstruction::Sync { .. } => syncs += 1,
+                    NpuInstruction::BlockWrite { .. } => { enqueues += 1; writes += 1; },
+                    NpuInstruction::Write32 { .. } => writes += 1,
+                    NpuInstruction::DdrPatch { .. } => patches += 1,
+                    _ => {}
+                }
+            }
+            log::debug!(
+                "NPU instruction buffer: {} total ({} Write, {} BlockWrite, {} DdrPatch, {} Sync)",
+                instructions.len(), writes, enqueues, patches, syncs
+            );
+        }
         self.instructions = instructions;
         if self.instructions.is_empty() {
             self.state = ExecutorState::Done;

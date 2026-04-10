@@ -829,19 +829,25 @@ impl DmaEngine {
             return S2mmResult { success: false, stall: false, tlast_received: false, bytes_written: 0 };
         }
 
-        // Must have at least one word for this channel to transfer
-        // If no data is available, we stall (not an error - just waiting for producer)
-        if !self.has_stream_in_for_channel(channel) {
-            return S2mmResult { success: true, stall: true, tlast_received: false, bytes_written: 0 };
-        }
-
         // When decompression is enabled, consume compressed blocks from stream
-        // and write decompressed 32-byte blocks to memory.
+        // and write decompressed 32-byte blocks to memory. Decompression has
+        // its own word-by-word stall logic so skip the atomic beat check.
         if self.is_decompression_enabled(channel) {
+            if !self.has_stream_in_for_channel(channel) {
+                return S2mmResult { success: true, stall: true, tlast_received: false, bytes_written: 0 };
+            }
             return self.transfer_s2mm_decompressed(offset, bytes, channel, tile);
         }
 
-        // Uncompressed path: write data to tile memory in 32-bit words
+        // Uncompressed path: the DMA bus transfers atomically -- all words
+        // for this beat must be available in the stream before we proceed.
+        let words_needed = (bytes + 3) / 4;
+        let words_available = self.stream_in_count_for_channel(channel);
+        if words_available < words_needed {
+            return S2mmResult { success: true, stall: true, tlast_received: false, bytes_written: 0 };
+        }
+
+        // Write data to tile memory in 32-bit words
         let data = tile.data_memory_mut();
         let mut bytes_written = 0;
         let word_count = (bytes + 3) / 4;
@@ -1103,9 +1109,10 @@ impl DmaEngine {
         channel: u8,
         host_memory: &mut HostMemory,
     ) -> S2mmResult {
-        // Must have at least one word for this channel to transfer
-        // If no data is available, we stall (not an error - just waiting for producer)
-        if !self.has_stream_in_for_channel(channel) {
+        // Atomic beat: stall until stream has enough words for this transfer.
+        let words_needed = (bytes + 3) / 4;
+        let words_available = self.stream_in_count_for_channel(channel);
+        if words_available < words_needed {
             return S2mmResult { success: true, stall: true, tlast_received: false, bytes_written: 0 };
         }
 

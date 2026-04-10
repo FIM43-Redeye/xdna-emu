@@ -277,6 +277,8 @@ impl DeviceState {
         if is_start_queue {
             let bd_idx = lay.start_bd_id.extract(value) as u8;
             let repeat_count = lay.repeat_count.extract(value) as u8;
+            log::debug!("MemTile Start_Queue raw=0x{:08X} bd={} repeat={} (actual {}x) ch={}",
+                value, bd_idx, repeat_count, repeat_count as u32 + 1, ch_idx);
             // Re-parse ALL dirty BDs so chained BDs are also configured
             self.reparse_all_dirty_bds(col, row);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {

@@ -232,7 +232,8 @@ fn test_default_cycle_accurate_timing() {
     // Cycle-accurate timing is the default and only mode
     let engine = DmaEngine::new_compute_tile(1, 2);
     assert_eq!(engine.timing_config().bd_setup_cycles, 4);
-    assert_eq!(engine.timing_config().words_per_cycle, 1);
+    // AIE2: 128-bit bus = 4 words/cycle (xaiemlgbl_params.h DATAMEMORY_WIDTH=128)
+    assert_eq!(engine.timing_config().words_per_cycle, 4);
 }
 
 #[test]

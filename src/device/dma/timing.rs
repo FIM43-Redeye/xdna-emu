@@ -100,26 +100,27 @@ mod tests {
     fn test_timing_config_default() {
         let config = DmaTimingConfig::default();
         assert_eq!(config.bd_setup_cycles, 4);
-        assert_eq!(config.words_per_cycle, 1);
+        // AIE2: 128-bit bus = 4 words/cycle (xaiemlgbl_params.h DATAMEMORY_WIDTH=128)
+        assert_eq!(config.words_per_cycle, 4);
     }
 
     #[test]
     fn test_transfer_cycles_simple() {
         let config = DmaTimingConfig::default();
 
-        // 16 bytes = 4 words, no locks
+        // 16 bytes = 4 words at 4 words/cycle = 1 data cycle, no locks
         let cycles = config.transfer_cycles(16, false, false);
-        // BD setup (4) + channel start (2) + memory latency (5) + data (4) = 15
-        assert_eq!(cycles, 15);
+        // BD setup (4) + channel start (2) + memory latency (5) + data (1) = 12
+        assert_eq!(cycles, 12);
     }
 
     #[test]
     fn test_transfer_cycles_with_locks() {
         let config = DmaTimingConfig::default();
 
-        // 16 bytes = 4 words, with locks
+        // 16 bytes = 4 words at 4 words/cycle = 1 data cycle, with locks
         let cycles = config.transfer_cycles(16, true, true);
-        // BD setup (4) + channel start (2) + memory latency (5) + data (4) + acquire (1) + release (1) = 17
-        assert_eq!(cycles, 17);
+        // BD setup (4) + channel start (2) + memory latency (5) + data (1) + acquire (1) + release (1) = 14
+        assert_eq!(cycles, 14);
     }
 }
