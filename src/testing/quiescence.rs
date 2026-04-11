@@ -181,8 +181,8 @@ impl QuiescenceDetector {
                     let desc = match engine.core_status(col, row) {
                         Some(CoreStatus::Ready) => "Ready".to_string(),
                         Some(CoreStatus::Running) => "Running".to_string(),
-                        Some(CoreStatus::WaitingLock { lock_id }) => {
-                            format!("WaitingLock({})", lock_id)
+                        Some(CoreStatus::WaitingLock { raw_lock_id }) => {
+                            format!("WaitingLock({})", raw_lock_id)
                         }
                         Some(CoreStatus::WaitingDma { channel }) => {
                             format!("WaitingDma({})", channel)

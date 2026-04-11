@@ -107,8 +107,9 @@ pub enum ExecuteResult {
 
     /// Stall waiting on lock acquisition.
     WaitLock {
-        /// Lock ID being waited on.
-        lock_id: u8,
+        /// Raw lock ID (0-63) encoding quadrant + local index.
+        /// Quadrant: 0-15 South, 16-31 West, 32-47 North, 48-63 East/Internal.
+        raw_lock_id: u8,
     },
 
     /// Stall waiting on DMA completion.
@@ -379,7 +380,7 @@ mod tests {
         let r = ExecuteResult::Branch { target: 0x100 };
         assert!(matches!(r, ExecuteResult::Branch { target: 0x100 }));
 
-        let r = ExecuteResult::WaitLock { lock_id: 5 };
-        assert!(matches!(r, ExecuteResult::WaitLock { lock_id: 5 }));
+        let r = ExecuteResult::WaitLock { raw_lock_id: 5 };
+        assert!(matches!(r, ExecuteResult::WaitLock { raw_lock_id: 5 }));
     }
 }

@@ -237,7 +237,7 @@ impl ControlUnit {
                     LockResult::PreconditionNotMet => {
                         log::info!("LockAcquire raw={} mapped={} expected={} current={} -> WAIT (own_tile={})",
                             raw_lock_id, lock_id, expected, current_value, is_own_tile);
-                        Some(ExecuteResult::WaitLock { lock_id })
+                        Some(ExecuteResult::WaitLock { raw_lock_id })
                     }
                     LockResult::WouldOverflow => {
                         // This shouldn't happen for acquire, but handle it
@@ -667,7 +667,7 @@ mod tests {
             .with_source(Operand::Lock(5));
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
-        assert!(matches!(result, Some(ExecuteResult::WaitLock { lock_id: 5 })));
+        assert!(matches!(result, Some(ExecuteResult::WaitLock { raw_lock_id: 5 })));
     }
 
     #[test]
@@ -723,7 +723,7 @@ mod tests {
             .with_source(Operand::Immediate(-5)); // change_value
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
-        assert!(matches!(result, Some(ExecuteResult::WaitLock { lock_id: 7 })));
+        assert!(matches!(result, Some(ExecuteResult::WaitLock { raw_lock_id: 7 })));
         assert_eq!(tile.locks[7].value, 2); // Unchanged
     }
 

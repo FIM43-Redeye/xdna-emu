@@ -19,7 +19,8 @@ pub enum CoreStatus {
     /// Core is running.
     Running,
     /// Core is waiting on lock acquisition.
-    WaitingLock { lock_id: u8 },
+    /// Stores raw lock ID (0-63) preserving quadrant routing information.
+    WaitingLock { raw_lock_id: u8 },
     /// Core is waiting on DMA completion.
     WaitingDma { channel: u8 },
     /// Core is waiting on stream data (blocking read with empty buffer).
@@ -36,8 +37,8 @@ pub enum CoreStatus {
 pub enum StepResult {
     /// Continue executing next instruction.
     Continue,
-    /// Stalled waiting on lock.
-    WaitLock { lock_id: u8 },
+    /// Stalled waiting on lock. Stores raw lock ID (0-63) with quadrant.
+    WaitLock { raw_lock_id: u8 },
     /// Stalled waiting on DMA.
     WaitDma { channel: u8 },
     /// Stalled waiting on stream data.
@@ -128,8 +129,8 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
             return StepResult::Halt;
         }
 
-        // Try to resume from stall
-        if let Some(result) = self.try_resume_stall(ctx, tile) {
+        // Try to resume from stall (pass neighbor locks for cross-tile routing)
+        if let Some(result) = self.try_resume_stall(ctx, tile, neighbor_locks.as_ref().map(|nl| &**nl)) {
             return result;
         }
 
@@ -221,9 +222,9 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                 StepResult::Continue
             }
 
-            crate::interpreter::traits::ExecuteResult::WaitLock { lock_id } => {
-                self.status = CoreStatus::WaitingLock { lock_id };
-                StepResult::WaitLock { lock_id }
+            crate::interpreter::traits::ExecuteResult::WaitLock { raw_lock_id } => {
+                self.status = CoreStatus::WaitingLock { raw_lock_id };
+                StepResult::WaitLock { raw_lock_id }
             }
 
             crate::interpreter::traits::ExecuteResult::WaitDma { channel } => {
@@ -298,8 +299,8 @@ where
             return StepResult::Halt;
         }
 
-        // Try to resume from stall
-        if let Some(result) = self.try_resume_stall(ctx, tile) {
+        // Try to resume from stall (no neighbor locks in simple step path)
+        if let Some(result) = self.try_resume_stall(ctx, tile, None) {
             return result;
         }
 
@@ -389,12 +390,12 @@ where
                 StepResult::Continue
             }
 
-            ExecuteResult::WaitLock { lock_id } => {
-                log::info!("Core({},{}) stall: WaitingLock lock={} pc=0x{:X}",
-                    tile.col, tile.row, lock_id, ctx.pc());
-                self.status = CoreStatus::WaitingLock { lock_id };
+            ExecuteResult::WaitLock { raw_lock_id } => {
+                log::info!("Core({},{}) stall: WaitingLock raw_lock={} pc=0x{:X}",
+                    tile.col, tile.row, raw_lock_id, ctx.pc());
+                self.status = CoreStatus::WaitingLock { raw_lock_id };
                 ctx.record_stall(1);
-                StepResult::WaitLock { lock_id }
+                StepResult::WaitLock { raw_lock_id }
             }
 
             ExecuteResult::WaitDma { channel } => {
@@ -431,20 +432,53 @@ where
     /// Try to resume from a stall condition.
     ///
     /// Returns `Some(result)` if still stalled, `None` if resumed.
-    fn try_resume_stall(&mut self, ctx: &mut ExecutionContext, tile: &mut Tile) -> Option<StepResult> {
+    /// For cross-tile lock stalls, `neighbor_locks` provides access to the
+    /// correct neighbor tile's lock array via quadrant routing.
+    fn try_resume_stall(
+        &mut self,
+        ctx: &mut ExecutionContext,
+        tile: &mut Tile,
+        neighbor_locks: Option<&crate::interpreter::execute::NeighborLocks>,
+    ) -> Option<StepResult> {
         match self.status {
-            CoreStatus::WaitingLock { lock_id } => {
-                // Check if lock is now available (don't acquire yet - instruction will do that)
-                let lock_value = tile.locks[lock_id as usize].value;
-                log::trace!("try_resume_stall: lock {} value = {}", lock_id, lock_value);
+            CoreStatus::WaitingLock { raw_lock_id } => {
+                // Route the raw lock ID to the correct tile's lock array,
+                // matching the quadrant logic in ControlUnit::route_lock.
+                let lock_value = if raw_lock_id >= 48 {
+                    // East/Internal = own tile
+                    let id = (raw_lock_id - 48) as usize % tile.locks.len();
+                    tile.locks[id].value
+                } else if raw_lock_id < 16 {
+                    // South = row-1 neighbor
+                    neighbor_locks
+                        .and_then(|nl| nl.south.as_ref())
+                        .map(|locks| locks[raw_lock_id as usize % locks.len()].value)
+                        .unwrap_or(tile.locks[raw_lock_id as usize % tile.locks.len()].value)
+                } else if raw_lock_id < 32 {
+                    // West = col-1 neighbor
+                    let id = (raw_lock_id - 16) as usize;
+                    neighbor_locks
+                        .and_then(|nl| nl.west.as_ref())
+                        .map(|locks| locks[id % locks.len()].value)
+                        .unwrap_or(tile.locks[id % tile.locks.len()].value)
+                } else {
+                    // North = row+1 neighbor (IDs 32-47)
+                    let id = (raw_lock_id - 32) as usize;
+                    neighbor_locks
+                        .and_then(|nl| nl.north.as_ref())
+                        .map(|locks| locks[id % locks.len()].value)
+                        .unwrap_or(tile.locks[id % tile.locks.len()].value)
+                };
+
+                log::trace!("try_resume_stall: raw_lock {} value = {}", raw_lock_id, lock_value);
                 if lock_value > 0 {
-                    log::info!("Lock {} available (value={}), resuming execution", lock_id, lock_value);
+                    log::info!("Lock {} available (value={}), resuming execution", raw_lock_id, lock_value);
                     self.status = CoreStatus::Ready;
                     // Re-execute the instruction - it will acquire the lock
                     None
                 } else {
                     ctx.record_stall(1);
-                    Some(StepResult::WaitLock { lock_id })
+                    Some(StepResult::WaitLock { raw_lock_id })
                 }
             }
 
