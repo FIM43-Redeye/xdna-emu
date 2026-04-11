@@ -205,6 +205,14 @@ impl MemoryUnit {
         // Handle vector loads specially
         if width == MemWidth::Vector256 {
             let vec_data = Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n));
+            if crate::debug::watch::is_watched(addr as u64, 32) {
+                let dest_str = op.dest.as_ref()
+                    .map(|d| format!("{:?}", d))
+                    .unwrap_or_default();
+                crate::debug::watch::log_core_load(
+                    ctx.cycles, ctx.pc(), addr as u64, vec_data[0], &dest_str,
+                );
+            }
             if let Some(dest) = &op.dest {
                 ctx.queue_vector_load(dest.clone(), vec_data, latency);
             }
@@ -217,6 +225,14 @@ impl MemoryUnit {
             vec_data[2] = full_data[2];
             vec_data[3] = full_data[3];
             // words 4-7 stay zero
+            if crate::debug::watch::is_watched(addr as u64, 16) {
+                let dest_str = op.dest.as_ref()
+                    .map(|d| format!("{:?}", d))
+                    .unwrap_or_default();
+                crate::debug::watch::log_core_load(
+                    ctx.cycles, ctx.pc(), addr as u64, vec_data[0], &dest_str,
+                );
+            }
             if let Some(dest) = &op.dest {
                 ctx.queue_vector_load(dest.clone(), vec_data, latency);
             }
@@ -242,6 +258,14 @@ impl MemoryUnit {
                 raw_value  // no element type info, keep as-is
             };
 
+            if crate::debug::watch::is_watched(addr as u64, width.bytes() as usize) {
+                let dest_str = op.dest.as_ref()
+                    .map(|d| format!("{:?}", d))
+                    .unwrap_or_default();
+                crate::debug::watch::log_core_load(
+                    ctx.cycles, ctx.pc(), addr as u64, value as u32, &dest_str,
+                );
+            }
             Self::write_dest_with_latency(op, ctx, value, width, latency);
         }
 
@@ -272,13 +296,18 @@ impl MemoryUnit {
             // Read data from VectorReg, AccumReg, or ControlReg source.
             let vec_data = Self::read_store_data_wide(op, ctx);
 
-            if let Some(data) = vec_data {
+            if let Some(ref data) = vec_data {
+                if crate::debug::watch::is_watched(addr as u64, if width == MemWidth::QuadWord { 16 } else { 32 }) {
+                    crate::debug::watch::log_core_store(
+                        ctx.cycles, ctx.pc(), addr as u64, data[0],
+                    );
+                }
                 if width == MemWidth::QuadWord {
                     // 128-bit store: write only lower 4 words (16 bytes).
                     let half = [data[0], data[1], data[2], data[3], 0, 0, 0, 0];
                     Self::write_vector_to_memory(tile, addr, half, neighbors);
                 } else {
-                    Self::write_vector_to_memory(tile, addr, data, neighbors);
+                    Self::write_vector_to_memory(tile, addr, *data, neighbors);
                 }
             }
         } else {
@@ -294,6 +323,11 @@ impl MemoryUnit {
                 ctx.queue_pending_store(addr, source, width);
             } else {
                 let value = Self::get_store_value(op, ctx, width);
+                if crate::debug::watch::is_watched(addr as u64, width.bytes() as usize) {
+                    crate::debug::watch::log_core_store(
+                        ctx.cycles, ctx.pc(), addr as u64, value as u32,
+                    );
+                }
                 Self::write_memory(tile, addr, value, width, neighbors);
             }
         }
@@ -332,6 +366,15 @@ impl MemoryUnit {
         } else {
             Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n))
         };
+
+        if crate::debug::watch::is_watched(addr as u64, if op.mem_width == MemWidth::QuadWord { 16 } else { 32 }) {
+            let dest_str = op.dest.as_ref()
+                .map(|d| format!("{:?}", d))
+                .unwrap_or_default();
+            crate::debug::watch::log_core_load(
+                ctx.cycles, ctx.pc(), addr as u64, vec_data[0], &dest_str,
+            );
+        }
 
         // Queue deferred write to destination register.
         // AccumReg destinations (AM loads) need width metadata for quarter writes.
@@ -381,6 +424,15 @@ impl MemoryUnit {
         } else {
             Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n))
         };
+
+        if crate::debug::watch::is_watched(addr as u64, if op.mem_width == MemWidth::QuadWord { 16 } else { 32 }) {
+            let dest_str = op.dest.as_ref()
+                .map(|d| format!("{:?}", d))
+                .unwrap_or_default();
+            crate::debug::watch::log_core_load(
+                ctx.cycles, ctx.pc(), addr as u64, vec_data[0], &dest_str,
+            );
+        }
 
         // Queue deferred write to destination vector register
         if let Some(dest) = &op.dest {
@@ -1059,13 +1111,18 @@ impl MemoryUnit {
         // Get data from sources or dest. Check VectorReg, AccumReg, or ControlReg.
         let vec_data = Self::read_store_data_wide(op, ctx);
 
-        if let Some(data) = vec_data {
+        if let Some(ref data) = vec_data {
             log::trace!("[VST] writing to addr=0x{:X} mem_width={:?}", addr, op.mem_width);
+            if crate::debug::watch::is_watched(addr as u64, if op.mem_width == MemWidth::QuadWord { 16 } else { 32 }) {
+                crate::debug::watch::log_core_store(
+                    ctx.cycles, ctx.pc(), addr as u64, data[0],
+                );
+            }
             if op.mem_width == MemWidth::QuadWord {
                 let half = [data[0], data[1], data[2], data[3], 0, 0, 0, 0];
                 Self::write_vector_to_memory(tile, addr, half, neighbors);
             } else {
-                Self::write_vector_to_memory(tile, addr, data, neighbors);
+                Self::write_vector_to_memory(tile, addr, *data, neighbors);
             }
         } else {
             log::warn!("[VST] no data register found! sources={:?} dest={:?}", op.sources, op.dest);
