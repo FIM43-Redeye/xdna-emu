@@ -408,7 +408,18 @@ cargo flamegraph --release -- path/to/binary.xclbin
 
 # Trace comparison binary
 cargo build --release --bin trace-compare
+
+# Build FFI crate for bridge tests (debug .so loaded by XRT plugin)
+cargo build -p xdna-emu-ffi
+# Build + install plugin (release .so + C++ wrapper)
+./scripts/rebuild-plugin.sh
 ```
+
+**Building for bridge tests**: `cargo build` builds the main binary but NOT
+the FFI crate's cdylib `.so`. Bridge tests load `target/debug/libxdna_emu.so`
+(or release). After changing emulator code, run `cargo build -p xdna-emu-ffi`
+to update the `.so`, or use `./scripts/rebuild-plugin.sh` for the full
+release build + install cycle.
 
 **Note on doc tests**: Doc tests spawn separate processes that each load TableGen
 files from llvm-aie. The test script runs them with `nice -n 19` and limited
@@ -512,6 +523,26 @@ When investigating a failing test:
 2. Do not jump to hypotheses about unrelated subsystems (e.g., do not
    investigate stream routing if the data is wrong at source memory level).
 3. If unsure about hardware semantics, ask rather than guess.
+
+**Memory watch mechanism.** Set `XDNA_EMU_WATCH` to log every memory access
+to specified address ranges. Format: comma-separated `address:bytes` pairs
+(hex, 0x prefix optional, bytes defaults to 4). Requires `RUST_LOG=info`.
+
+```bash
+# Watch three addresses (40 bytes each) during a bridge test
+XDNA_EMU=debug XDNA_EMU_WATCH=0xC000:40,0x428:40,0x400:40 RUST_LOG=info \
+  ./test.exe 2>watch.log
+grep "\[WATCH\]" watch.log
+```
+
+Output shows cycle-correlated DMA and core memory operations:
+```
+[WATCH] cycle=200 DMA-WR   tile=(0,2) addr=0x0C000 value=0x00000001 ch=S2MM0
+[WATCH] cycle=249 DMA-RD   tile=(0,2) addr=0x00400 value=0x00000000 ch=MM2S2
+```
+
+Note: DMA watches use tile-local offsets. Core watches use the full 20-bit
+address space (e.g., 0x70400 for local memory at offset 0x400).
 
 **Correctness before performance.** Do not optimize (including multithreading)
 until emulator behavior is indistinguishable from real hardware. Making wrong
