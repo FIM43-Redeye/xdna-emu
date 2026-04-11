@@ -242,16 +242,6 @@ impl MemoryUnit {
                 raw_value  // no element type info, keep as-is
             };
 
-            if log::log_enabled!(log::Level::Trace) {
-                let masked = addr & 0xFFFF;
-                if masked >= 0x0400 && masked < 0x0420 {
-                    let elem = (masked - 0x0400) / 4;
-                    log::trace!(
-                        "[WATCH-LD] pc=0x{:03X} cycle={} elem={} addr=0x{:05X} value=0x{:08X} dest={:?}",
-                        ctx.pc(), ctx.cycles, elem, masked, value as u32, op.dest
-                    );
-                }
-            }
             Self::write_dest_with_latency(op, ctx, value, width, latency);
         }
 
