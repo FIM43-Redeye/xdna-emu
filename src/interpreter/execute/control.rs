@@ -138,9 +138,17 @@ impl ControlUnit {
                             _ => unreachable!(),
                         }
                     }
-                    // JNZD: test sources[0] (mRx0), decrement dest (mRx), branch to
-                    // sources[1] (mPm). Decrement always happens regardless of branch.
+                    // JNZD: test sources[0] (mRx0), write dest = mRx0 - 1,
+                    // branch to sources[1] (mPm) if mRx0 was nonzero.
+                    // Decrement always happens regardless of branch direction.
+                    //
                     // TableGen: (outs eR:$mRx), (ins eR:$mRx0, eP:$mPm)
+                    // Encoding: {mRx0, mRx, mPm, opcode} -- separate fields.
+                    //
+                    // When mRx == mRx0 (common case from Peano), this is a
+                    // simple decrement-in-place. When they differ (Chess
+                    // compiler uses this for stack-bridged loop counters),
+                    // dest gets source - 1 while source is unchanged.
                     BranchCondition::NotZeroDecrement => {
                         // Read the test register (sources[0] = mRx0)
                         let test_val = if let Some(Operand::ScalarReg(r)) = op.sources.first() {
@@ -156,13 +164,13 @@ impl ControlUnit {
                             log::debug!("JNZD: no test register found, defaulting to 0");
                             0
                         };
-                        // Decrement the destination register (dest = mRx), always.
-                        // Read dest separately since it may differ from the test source.
+                        // Write dest = test_val - 1 (the SOURCE value minus 1).
+                        // Critical: when dest != source, we must decrement the
+                        // source value, not re-read the dest register.
                         if let Some(Operand::ScalarReg(r)) = &op.dest {
-                            let cur = ctx.read_scalar(*r) as i32;
-                            let decremented = (cur - 1) as u32;
+                            let decremented = (test_val - 1) as u32;
                             ctx.write_scalar(*r, decremented);
-                            log::debug!("JNZD: r{} decremented {} -> {}", r, cur, decremented);
+                            log::debug!("JNZD: r{} = {} - 1 = {}", r, test_val, decremented);
                         }
                         test_val != 0
                     }
@@ -637,6 +645,91 @@ mod tests {
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Branch { target: 0x5000 })));
+    }
+
+    #[test]
+    fn test_jnzd_same_register_nonzero() {
+        // jnzd r5, r5, p0 -- common case (Peano compiler)
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        ctx.write_scalar(5, 3); // r5 = 3
+        ctx.pointer.write(0, 0x1b0); // p0 = branch target
+
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::BrCond)
+            .with_branch_condition(BranchCondition::NotZeroDecrement)
+            .with_dest(Operand::ScalarReg(5))          // mRx = r5
+            .with_source(Operand::ScalarReg(5))         // mRx0 = r5
+            .with_source(Operand::PointerReg(0));       // mPm = p0
+
+        let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
+        assert!(matches!(result, Some(ExecuteResult::Branch { target: 0x1b0 })));
+        assert_eq!(ctx.read_scalar(5), 2); // r5 = 3 - 1 = 2
+    }
+
+    #[test]
+    fn test_jnzd_same_register_zero() {
+        // jnzd r5, r5, p0 -- falls through when r5 = 0
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        ctx.write_scalar(5, 0); // r5 = 0
+        ctx.pointer.write(0, 0x1b0);
+
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::BrCond)
+            .with_branch_condition(BranchCondition::NotZeroDecrement)
+            .with_dest(Operand::ScalarReg(5))
+            .with_source(Operand::ScalarReg(5))
+            .with_source(Operand::PointerReg(0));
+
+        let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
+        assert!(matches!(result, Some(ExecuteResult::Continue)));
+        assert_eq!(ctx.read_scalar(5), 0xFFFFFFFF); // 0 - 1 wraps
+    }
+
+    #[test]
+    fn test_jnzd_split_register() {
+        // jnzd r20, r24, p1 -- Chess compiler pattern: different dest/source.
+        // dest gets source - 1; source is tested but NOT modified.
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        ctx.write_scalar(24, 3);     // r24 = 3 (source, tested)
+        ctx.write_scalar(20, 0x99);  // r20 = 0x99 (dest, gets r24 - 1)
+        ctx.pointer.write(1, 0x190); // p1 = branch target
+
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::BrCond)
+            .with_branch_condition(BranchCondition::NotZeroDecrement)
+            .with_dest(Operand::ScalarReg(20))           // mRx = r20
+            .with_source(Operand::ScalarReg(24))          // mRx0 = r24
+            .with_source(Operand::PointerReg(1));         // mPm = p1
+
+        let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
+        assert!(matches!(result, Some(ExecuteResult::Branch { target: 0x190 })));
+        assert_eq!(ctx.read_scalar(20), 2, "dest = source - 1 = 3 - 1 = 2");
+        assert_eq!(ctx.read_scalar(24), 3, "source unchanged");
+    }
+
+    #[test]
+    fn test_jnzd_split_register_zero() {
+        // jnzd r20, r24, p1 -- source = 0, falls through
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        ctx.write_scalar(24, 0);      // r24 = 0 (source)
+        ctx.write_scalar(20, 0x42);   // r20 = junk (dest)
+        ctx.pointer.write(1, 0x190);
+
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::BrCond)
+            .with_branch_condition(BranchCondition::NotZeroDecrement)
+            .with_dest(Operand::ScalarReg(20))
+            .with_source(Operand::ScalarReg(24))
+            .with_source(Operand::PointerReg(1));
+
+        let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
+        assert!(matches!(result, Some(ExecuteResult::Continue)));
+        assert_eq!(ctx.read_scalar(20), 0xFFFFFFFF, "dest = 0 - 1 wraps");
+        assert_eq!(ctx.read_scalar(24), 0, "source unchanged");
     }
 
     #[test]
