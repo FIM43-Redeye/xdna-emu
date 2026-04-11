@@ -847,6 +847,12 @@ impl DmaEngine {
             return S2mmResult { success: true, stall: true, tlast_received: false, bytes_written: 0 };
         }
 
+        // On real hardware, S2MM ignores TLAST unless Finish-on-TLAST (FoT)
+        // mode is enabled. Without FoT, the DMA continues accepting words
+        // until the BD's transfer length is satisfied, regardless of TLAST
+        // markers on the stream.
+        let fot_enabled = self.get_channel_fot_mode(channel) != 0;
+
         // Write data to tile memory in 32-bit words
         let data = tile.data_memory_mut();
         let mut bytes_written = 0;
@@ -875,7 +881,9 @@ impl DmaEngine {
                 // Track TLAST for FoT mode
                 if stream_data.tlast {
                     tlast_received = true;
-                    break; // Stop receiving after TLAST
+                    if fot_enabled {
+                        break; // FoT: stop receiving at TLAST boundary
+                    }
                 }
             } else {
                 // No more stream data for this channel - transfer partial, continue next step
@@ -1121,6 +1129,14 @@ impl DmaEngine {
             return self.transfer_stream_to_host_decompressed(addr, bytes, channel, host_memory);
         }
 
+        // On real hardware, S2MM ignores TLAST unless Finish-on-TLAST (FoT)
+        // mode is enabled. Without FoT, the DMA continues accepting words
+        // until the BD's transfer length is satisfied, regardless of TLAST
+        // markers on the stream. Breaking unconditionally on TLAST causes
+        // address pointer skips when TLAST falls mid-batch (e.g., 10-word
+        // source chunks vs 4-word DMA bus width).
+        let fot_enabled = self.get_channel_fot_mode(channel) != 0;
+
         // Uncompressed path: write data to host memory in 32-bit words
         let mut bytes_written = 0;
         let word_count = (bytes + 3) / 4;
@@ -1143,7 +1159,9 @@ impl DmaEngine {
             // Track TLAST for FoT mode
             if stream_data.tlast {
                 tlast_received = true;
-                break; // Stop receiving after TLAST
+                if fot_enabled {
+                    break; // FoT: stop receiving at TLAST boundary
+                }
             }
         }
 
