@@ -15,6 +15,7 @@ use xdna_emu::testing::XclbinSuite;
 fn main() -> anyhow::Result<()> {
     // Initialize logging
     env_logger::init();
+    xdna_emu::debug::watch::init();
 
     let args: Vec<String> = env::args().collect();
 

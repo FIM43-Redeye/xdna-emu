@@ -124,6 +124,7 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
 
     // Initialize logging if not already done
     let _ = env_logger::try_init();
+    xdna_emu::debug::watch::init();
 
     let config = xdna_emu::config::Config::get();
     let handle = Box::new(XdnaEmuHandle {
