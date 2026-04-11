@@ -27,6 +27,7 @@ pub mod npu;
 pub mod archspec;
 pub mod trace;
 pub mod aiesim;
+pub mod debug;
 
 // GUI (requires eframe/egui)
 #[cfg(feature = "gui")]
