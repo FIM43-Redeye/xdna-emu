@@ -716,6 +716,14 @@ impl DmaEngine {
                     self.col, self.row, channel, i, word_offset, word);
             }
 
+            if crate::debug::watch::is_watched(word_offset as u64, 4) {
+                crate::debug::watch::log_dma_read(
+                    self.current_cycle, self.col, self.row,
+                    word_offset as u64, word,
+                    &format!("MM2S{}", channel),
+                );
+            }
+
             // TLAST is asserted on last word unless suppressed
             // AM025: TLAST_Suppress (Word 5, bit 31) prevents TLAST assertion
             let is_last_word = is_last && (i == word_count - 1);
@@ -876,6 +884,15 @@ impl DmaEngine {
                         data[offset + bytes_written + j] = word_bytes[j];
                     }
                 }
+
+                if crate::debug::watch::is_watched((offset + bytes_written) as u64, 4) {
+                    crate::debug::watch::log_dma_write(
+                        self.current_cycle, self.col, self.row,
+                        (offset + bytes_written) as u64, word,
+                        &format!("S2MM{}", channel),
+                    );
+                }
+
                 bytes_written += 4;
 
                 // Track TLAST for FoT mode
@@ -1024,6 +1041,14 @@ impl DmaEngine {
             let word_addr = addr + (i * 4) as u64;
             let word = host_memory.read_u32(word_addr);
 
+            if crate::debug::watch::is_watched(word_addr, 4) {
+                crate::debug::watch::log_dma_read(
+                    self.current_cycle, self.col, self.row,
+                    word_addr, word,
+                    &format!("MM2S{}", channel),
+                );
+            }
+
             if i < 4 {
                 log::debug!("  MM2S word[{}]: addr=0x{:X} -> 0x{:08X}", i, word_addr, word);
             }
@@ -1152,8 +1177,17 @@ impl DmaEngine {
 
             let word = stream_data.data;
             let word_addr = addr + (i * 4) as u64;
-            log::info!("Shim S2MM write: addr=0x{:X} word=0x{:08X}", word_addr, word);
+            log::debug!("Shim S2MM write: addr=0x{:X} word=0x{:08X}", word_addr, word);
             host_memory.write_u32(word_addr, word);
+
+            if crate::debug::watch::is_watched(word_addr, 4) {
+                crate::debug::watch::log_dma_write(
+                    self.current_cycle, self.col, self.row,
+                    word_addr, word,
+                    &format!("S2MM{}", channel),
+                );
+            }
+
             bytes_written += 4;
 
             // Track TLAST for FoT mode
