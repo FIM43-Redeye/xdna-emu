@@ -71,7 +71,7 @@ impl CascadeOps {
         let data = match tile.pop_cascade_input() {
             Some(d) => d,
             None => {
-                log::debug!(
+                log::info!(
                     "[CASCADE] Read stall: SCD empty (tile {},{}, pc=0x{:X})",
                     tile.col, tile.row, ctx.pc()
                 );
@@ -85,7 +85,7 @@ impl CascadeOps {
                 Operand::VectorReg(r) => {
                     let words = cascade_to_vector(&data);
                     ctx.vector.write(*r, words);
-                    log::debug!(
+                    log::info!(
                         "[CASCADE] Read SCD -> v{} (tile {},{})",
                         r, tile.col, tile.row
                     );
@@ -93,10 +93,9 @@ impl CascadeOps {
                 Operand::AccumReg(r) => {
                     let lanes = cascade_to_accumulator(&data);
                     ctx.accumulator.write(*r, lanes);
-                    log::debug!(
-                        "[CASCADE] Read SCD -> acc{} (tile {},{}) data=[{:#X}, {:#X}, {:#X}, {:#X}, {:#X}, {:#X}]",
-                        r, tile.col, tile.row,
-                        data[0], data[1], data[2], data[3], data[4], data[5]
+                    log::info!(
+                        "[CASCADE] Read SCD -> acc{} (tile {},{}) data[0]={:#X}",
+                        r, tile.col, tile.row, data[0]
                     );
                 }
                 _ => {
@@ -122,7 +121,7 @@ impl CascadeOps {
         // VMOV MCD writes one 256-bit half-register, so 4 entries covers
         // two full accumulator transfers with room for pipeline slack.
         if tile.cascade_output.len() >= 4 {
-            log::debug!(
+            log::info!(
                 "[CASCADE] Write stall: MCD full (tile {},{}, pc=0x{:X})",
                 tile.col, tile.row, ctx.pc()
             );
@@ -135,7 +134,7 @@ impl CascadeOps {
                 Operand::VectorReg(r) => {
                     let words = ctx.vector.read(*r);
                     let d = vector_to_cascade(&words);
-                    log::debug!(
+                    log::info!(
                         "[CASCADE] Write v{} -> MCD (tile {},{})",
                         r, tile.col, tile.row
                     );
@@ -144,10 +143,9 @@ impl CascadeOps {
                 Operand::AccumReg(r) => {
                     let lanes = ctx.accumulator.read(*r);
                     let d = accumulator_to_cascade(&lanes);
-                    log::debug!(
-                        "[CASCADE] Write acc{} -> MCD (tile {},{}) data=[{:#X}, {:#X}, {:#X}, {:#X}, {:#X}, {:#X}]",
-                        r, tile.col, tile.row,
-                        d[0], d[1], d[2], d[3], d[4], d[5]
+                    log::info!(
+                        "[CASCADE] Write acc{} -> MCD (tile {},{}) data[0]={:#X}",
+                        r, tile.col, tile.row, d[0]
                     );
                     d
                 }

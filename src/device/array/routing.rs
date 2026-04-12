@@ -156,10 +156,10 @@ impl TileArray {
             let dst_idx = (dst_col as usize) * (rows as usize) + (dst_row as usize);
 
             if let Some(data) = self.tiles[src_idx].pop_cascade_output() {
-                log::debug!(
-                    "[CASCADE] Route ({},{}) -> ({},{})",
+                log::info!(
+                    "[CASCADE] Route ({},{}) -> ({},{}) data[0]={:#X}",
                     self.tiles[src_idx].col, self.tiles[src_idx].row,
-                    dst_col, dst_row
+                    dst_col, dst_row, data[0]
                 );
                 self.tiles[dst_idx].push_cascade_input(data);
             }
