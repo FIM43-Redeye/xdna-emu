@@ -366,6 +366,11 @@ pub struct XclbinSuite {
     collector: OpcodeCollector,
     /// Absolute cycle safety net. 0 means no limit (rely on TDR only).
     max_cycles: u64,
+    /// Stall detection threshold. 0 means disabled (rely on max_cycles only).
+    ///
+    /// Number of consecutive cycles with no lock-release progress while
+    /// pending syncs remain unsatisfied before declaring a stall.
+    stall_threshold: u64,
     /// Results from completed tests.
     results: Vec<(String, TestOutcome, Option<HardwareValidation>)>,
     /// Directory containing hardware reference outputs.
@@ -378,11 +383,16 @@ pub struct XclbinSuite {
 
 impl XclbinSuite {
     /// Create a new test suite.
+    ///
+    /// Reads `max_cycles` from [`super::DEFAULT_MAX_CYCLES`] and
+    /// `stall_threshold` from the global [`crate::config::Config`].
     pub fn new() -> Self {
+        let stall_threshold = crate::config::Config::get().stall_threshold();
         Self {
             tests: Vec::new(),
             collector: OpcodeCollector::new(),
             max_cycles: super::DEFAULT_MAX_CYCLES,
+            stall_threshold,
             results: Vec::new(),
             reference_dir: None,
             npu_output_dir: None,
@@ -407,6 +417,16 @@ impl XclbinSuite {
     /// Set to 0 to disable entirely (rely on TDR no-progress detection only).
     pub fn with_max_cycles(mut self, max: u64) -> Self {
         self.max_cycles = max;
+        self
+    }
+
+    /// Set the stall detection threshold in cycles.
+    ///
+    /// Number of consecutive cycles with no lock-release progress while
+    /// pending syncs remain unsatisfied before declaring a stall.
+    /// Set to 0 to disable stall detection.
+    pub fn with_stall_threshold(mut self, threshold: u64) -> Self {
+        self.stall_threshold = threshold;
         self
     }
 
@@ -698,6 +718,7 @@ impl XclbinSuite {
 
         // Create engine and apply CDO
         let mut engine = InterpreterEngine::new_npu1();
+        engine.set_stall_threshold(self.stall_threshold);
         if let Err(e) = engine.device_mut().apply_cdo(&cdo) {
             return (TestOutcome::LoadError {
                 message: format!("Failed to apply CDO: {}", e),
@@ -1127,13 +1148,10 @@ impl XclbinSuite {
         };
 
         const QUIESCENCE_CYCLES: u64 = 100;
-        /// No DMA byte progress for this many cycles with pending syncs = stall.
-        /// Longest passing test is ~20K cycles; 50K is generous.
-        const STALL_CYCLES: u64 = 50_000;
 
         let mut cycles = 0u64;
         let mut quiescence = QuiescenceDetector::new(QUIESCENCE_CYCLES);
-        let mut stall = StallDetector::new(STALL_CYCLES);
+        let mut stall = StallDetector::new(self.stall_threshold);
         // 0 means no hard limit -- rely on quiescence/stall detection only
         let cycle_limit = if self.max_cycles == 0 { u64::MAX } else { self.max_cycles };
 
