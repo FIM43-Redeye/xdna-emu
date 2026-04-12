@@ -51,6 +51,12 @@ pub struct Config {
     /// cycles than simple single-tile tests. Override via config file or
     /// XDNA_EMU_MAX_CYCLES environment variable.
     pub max_cycles: Option<u64>,
+
+    /// Stall detection threshold in cycles.
+    /// Number of consecutive cycles with no lock-release progress (while
+    /// pending syncs exist) before the emulator declares a stall and
+    /// terminates. Override via XDNA_EMU_STALL_THRESHOLD environment variable.
+    pub stall_threshold: Option<u64>,
 }
 
 impl Config {
@@ -131,13 +137,23 @@ impl Config {
         self.aietools_path.as_ref().map(PathBuf::from).filter(|p| p.exists())
     }
 
-    /// Maximum emulation cycles before timeout. Default: 500,000.
+    /// Maximum emulation cycles before timeout. Default: 10,000,000.
     ///
     /// Simple tests complete in 2K-10K cycles. Complex multi-tile designs
-    /// with memtile routing and cascade connections need 100K-300K. The
-    /// default is generous to avoid false timeouts.
+    /// with memtile routing and cascade connections need 100K-300K cycles.
+    /// The default is generous to avoid false timeouts; the stall detector
+    /// provides a faster adaptive cut-off for truly stuck workloads.
     pub fn max_cycles(&self) -> u64 {
-        self.max_cycles.unwrap_or(500_000)
+        self.max_cycles.unwrap_or(10_000_000)
+    }
+
+    /// Stall detection threshold in cycles. Default: 100,000.
+    ///
+    /// Number of consecutive cycles with no lock-release progress while
+    /// pending DMA syncs remain unsatisfied before declaring a stall.
+    /// Set to 0 to disable stall detection (rely on max_cycles only).
+    pub fn stall_threshold(&self) -> u64 {
+        self.stall_threshold.unwrap_or(100_000)
     }
 
     // -- Test fixture path helpers --
@@ -269,6 +285,9 @@ impl Config {
         if other.max_cycles.is_some() {
             self.max_cycles = other.max_cycles;
         }
+        if other.stall_threshold.is_some() {
+            self.stall_threshold = other.stall_threshold;
+        }
     }
 
     /// Apply environment variable overrides.
@@ -298,6 +317,12 @@ impl Config {
             if let Ok(cycles) = val.parse::<u64>() {
                 log::info!("Using XDNA_EMU_MAX_CYCLES from environment: {}", cycles);
                 self.max_cycles = Some(cycles);
+            }
+        }
+        if let Ok(val) = std::env::var("XDNA_EMU_STALL_THRESHOLD") {
+            if let Ok(threshold) = val.parse::<u64>() {
+                log::info!("Using XDNA_EMU_STALL_THRESHOLD from environment: {}", threshold);
+                self.stall_threshold = Some(threshold);
             }
         }
     }
@@ -401,6 +426,7 @@ mod tests {
             xrt_path: Some("/base/xrt".to_string()),
             aietools_path: Some("/base/aietools".to_string()),
             max_cycles: None,
+            stall_threshold: None,
         };
 
         let overlay = Config {
@@ -409,6 +435,7 @@ mod tests {
             xrt_path: Some("/overlay/xrt".to_string()),
             aietools_path: None,
             max_cycles: Some(200_000),
+            stall_threshold: Some(50_000),
         };
 
         base.merge(overlay);
@@ -423,6 +450,8 @@ mod tests {
         assert_eq!(base.aietools_path, Some("/base/aietools".to_string()));
         // max_cycles set from overlay
         assert_eq!(base.max_cycles, Some(200_000));
+        // stall_threshold set from overlay
+        assert_eq!(base.stall_threshold, Some(50_000));
     }
 
     #[test]
