@@ -62,6 +62,38 @@ impl CascadeOps {
         }
     }
 
+    /// Pre-check whether this op would stall, without any side effects.
+    ///
+    /// VLIW bundles execute multiple slots in parallel and must commit
+    /// atomically: either every slot completes or none does. If a cascade
+    /// op stalls mid-bundle, sibling slots that already executed would
+    /// double-commit when the bundle is retried next cycle. Callers must
+    /// pre-check every cascade slot and bail out before executing any
+    /// slot if one would block.
+    ///
+    /// Returns `Some(StallRead | StallWrite)` if the op would stall, or
+    /// `None` if the op is non-cascade or would proceed.
+    pub fn would_stall(op: &SlotOp, tile: &Tile) -> Option<CascadeResult> {
+        match op.semantic {
+            Some(SemanticOp::CascadeRead) => {
+                if tile.cascade_input.is_empty() {
+                    Some(CascadeResult::StallRead)
+                } else {
+                    None
+                }
+            }
+            Some(SemanticOp::CascadeWrite) => {
+                // Mirror the depth limit applied in execute_write.
+                if tile.cascade_output.len() >= 4 {
+                    Some(CascadeResult::StallWrite)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Execute cascade read: pop 384-bit data from SCD into destination register.
     fn execute_read(
         op: &SlotOp,

@@ -157,6 +157,44 @@ impl StreamOps {
         }
     }
 
+    /// Pre-check whether this op would stall, without any side effects.
+    ///
+    /// VLIW bundles execute multiple slots in parallel and must commit
+    /// atomically: either every slot completes or none does. If a stream
+    /// op stalls mid-bundle, sibling slots that already executed would
+    /// double-commit when the bundle is retried next cycle. Callers must
+    /// pre-check every stream slot and bail out before executing any
+    /// slot if one would block.
+    ///
+    /// Returns `Some(StreamResult::Stall)` if the op would stall, or
+    /// `None` if the op is non-stream / non-blocking / would proceed.
+    pub fn would_stall(op: &SlotOp, tile: &Tile) -> Option<StreamResult> {
+        // Non-blocking ops never stall.
+        if !op.blocking {
+            return None;
+        }
+        const STREAM_FIFO_DEPTH: usize = 4;
+        match op.semantic {
+            Some(SemanticOp::StreamWrite) | Some(SemanticOp::StreamWritePacketHeader) => {
+                let port = Self::get_port_from_operands(op);
+                if tile.stream_output_len(port) >= STREAM_FIFO_DEPTH {
+                    Some(StreamResult::Stall { port })
+                } else {
+                    None
+                }
+            }
+            Some(SemanticOp::StreamRead) => {
+                let port = Self::get_port_from_operands(op);
+                if tile.stream_input_len(port) == 0 {
+                    Some(StreamResult::Stall { port })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Get the source value for a stream write operation.
     ///
     /// Stream writes typically take a single source operand (scalar register).

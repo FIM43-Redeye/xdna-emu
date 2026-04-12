@@ -366,6 +366,64 @@ impl CycleAccurateExecutor {
             );
         }
 
+        // Pre-check stall conditions for cascade and stream slots.
+        //
+        // VLIW bundles must commit atomically: every slot completes in the
+        // same cycle or none does. If a cascade/stream slot stalls partway
+        // through the bundle and we keep executing sibling slots, those
+        // siblings commit side effects (register writes, post-increments,
+        // accumulating ALU ops) that then double-execute when the bundle is
+        // retried next cycle. That corrupts running sums and pointer math.
+        //
+        // Cascade reads occupy the LoadA slot (executes first), so even an
+        // unconditional `break` on stall would work for them. But cascade
+        // writes occupy the Vector slot (executes after Loads/Stores/Scalars),
+        // so by the time the stall is detected, sibling slots have already
+        // committed. The only correct fix is to look ahead: scan every
+        // active slot for a blocking condition before touching state.
+        //
+        // See cascade_matmul investigation 2026-04-12 for the failure that
+        // motivated this (matmul_using_cascade::cascade was producing wrong
+        // accumulator values whenever an `ADD r28, r14, r28` was bundled
+        // with a `VMOV bml, SCD` and the SCD ran empty).
+        for slot_idx in &execution_order {
+            if let Some(ref op) = bundle.slots()[*slot_idx as usize] {
+                if let Some(stall) = CascadeOps::would_stall(op, tile) {
+                    let port = match stall {
+                        CascadeResult::StallRead => 254,
+                        CascadeResult::StallWrite => 255,
+                        // would_stall only returns Stall* variants; other
+                        // variants are unreachable.
+                        _ => 254,
+                    };
+                    let stall_cycle = ctx.cycles;
+                    ctx.timing_context_mut().record_event(
+                        stall_cycle,
+                        EventType::StreamStall { cycles: 1 },
+                    );
+                    ctx.record_instruction(1);
+                    let timing = ctx.timing_context_mut();
+                    timing.hazard_stalls = self.total_hazard_stalls;
+                    timing.memory_stalls = self.total_memory_stalls;
+                    return ExecuteResult::WaitStream { port };
+                }
+                if let Some(super::stream::StreamResult::Stall { port }) =
+                    super::stream::StreamOps::would_stall(op, tile)
+                {
+                    let stall_cycle = ctx.cycles;
+                    ctx.timing_context_mut().record_event(
+                        stall_cycle,
+                        EventType::StreamStall { cycles: 1 },
+                    );
+                    ctx.record_instruction(1);
+                    let timing = ctx.timing_context_mut();
+                    timing.hazard_stalls = self.total_hazard_stalls;
+                    timing.memory_stalls = self.total_memory_stalls;
+                    return ExecuteResult::WaitStream { port };
+                }
+            }
+        }
+
         // AIE2 uses pure VLIW semantics: all reads within a bundle see the
         // pre-execution values. This is confirmed by the llvm-aie scheduling
         // model (AIE2Schedule.td) and hazard recognizer which handle data
