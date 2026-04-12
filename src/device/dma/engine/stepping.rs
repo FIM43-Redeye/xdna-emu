@@ -677,13 +677,20 @@ impl DmaEngine {
 
     /// Resolve an MM2S byte address to (target_tile, offset within it).
     ///
-    /// MemTile DMAs use the windowed (West/Own/East) address space per AM025;
-    /// each window is `mem_size` bytes wide. Compute/shim DMAs always target
-    /// the local tile and wrap the address at `mem_size` (legacy behaviour).
+    /// MemTile DMAs use the windowed (West/Own/East) address space per
+    /// `mlir-aie` (`getMemLocalBaseAddress`): West=`[0,mem_size)`,
+    /// Own=`[mem_size,2*mem_size)`, East=`[2*mem_size,3*mem_size)`.
     ///
-    /// On a missing neighbour or out-of-window address, logs an error,
-    /// records it in `fatal_errors`, and returns `None` so the caller can
-    /// fail the transfer.
+    /// **Missing-neighbour fallback:** mlir-aie's `dma_configure_task` path
+    /// emits *flat* addresses on AIE2 (no window offset added) -- a BD with
+    /// `addr=0x11000` on a column-0 MemTile is intended as Own[0x11000] even
+    /// though it lands in the West window. Real hardware silently aliases
+    /// the access to Own when the addressed neighbour does not exist (the
+    /// neighbour bus has no other endpoint), so we mirror that: West/East
+    /// targets with no neighbour fall back to Own at the same byte offset.
+    /// Out-of-window addresses (>= 3*mem_size) are still fatal.
+    ///
+    /// Compute/shim DMAs are unchanged: they wrap at `mem_size`.
     fn resolve_mm2s_target<'a>(
         &mut self,
         addr: u64,
@@ -696,30 +703,12 @@ impl DmaEngine {
         }
         match MemTileTarget::resolve(addr, mem_size) {
             Ok((MemTileTarget::Own, off)) => Some((own, off)),
-            Ok((MemTileTarget::West, off)) => match neighbors.west.as_deref() {
-                Some(t) => Some((t, off)),
-                None => {
-                    let msg = format!(
-                        "DMA MemTile({},{}) MM2S addr=0x{:X} -> West neighbour but no west tile (col=0?)",
-                        self.col, self.row, addr,
-                    );
-                    log::error!("{}", msg);
-                    self.fatal_errors.push(msg);
-                    None
-                }
-            },
-            Ok((MemTileTarget::East, off)) => match neighbors.east.as_deref() {
-                Some(t) => Some((t, off)),
-                None => {
-                    let msg = format!(
-                        "DMA MemTile({},{}) MM2S addr=0x{:X} -> East neighbour but no east tile (last column?)",
-                        self.col, self.row, addr,
-                    );
-                    log::error!("{}", msg);
-                    self.fatal_errors.push(msg);
-                    None
-                }
-            },
+            Ok((MemTileTarget::West, off)) => Some(
+                neighbors.west.as_deref().map(|t| (t, off)).unwrap_or((own, off)),
+            ),
+            Ok((MemTileTarget::East, off)) => Some(
+                neighbors.east.as_deref().map(|t| (t, off)).unwrap_or((own, off)),
+            ),
             Err(e) => {
                 let msg = format!(
                     "DMA MemTile({},{}) MM2S addr=0x{:X} outside three-window MemTile space (window_size=0x{:X})",
@@ -734,9 +723,10 @@ impl DmaEngine {
 
     /// Resolve an S2MM byte address to (target_tile, offset within it).
     ///
-    /// Mutable counterpart to `resolve_mm2s_target`. Same windowing semantics;
-    /// returns a `&mut Tile` borrowed from `own` or `neighbors` so the caller
-    /// can write data through the MemTile-to-MemTile shared-memory bus.
+    /// Mutable counterpart to `resolve_mm2s_target`; same windowing and
+    /// missing-neighbour fallback semantics. Returns a `&mut Tile` so the
+    /// caller can write through the MemTile-to-MemTile shared-memory bus
+    /// (or the local data memory if the West/East target is absent).
     fn resolve_s2mm_target<'a>(
         &mut self,
         addr: u64,
@@ -749,30 +739,18 @@ impl DmaEngine {
         }
         match MemTileTarget::resolve(addr, mem_size) {
             Ok((MemTileTarget::Own, off)) => Some((own, off)),
-            Ok((MemTileTarget::West, off)) => match neighbors.west.as_deref_mut() {
-                Some(t) => Some((t, off)),
-                None => {
-                    let msg = format!(
-                        "DMA MemTile({},{}) S2MM addr=0x{:X} -> West neighbour but no west tile (col=0?)",
-                        self.col, self.row, addr,
-                    );
-                    log::error!("{}", msg);
-                    self.fatal_errors.push(msg);
-                    None
-                }
-            },
-            Ok((MemTileTarget::East, off)) => match neighbors.east.as_deref_mut() {
-                Some(t) => Some((t, off)),
-                None => {
-                    let msg = format!(
-                        "DMA MemTile({},{}) S2MM addr=0x{:X} -> East neighbour but no east tile (last column?)",
-                        self.col, self.row, addr,
-                    );
-                    log::error!("{}", msg);
-                    self.fatal_errors.push(msg);
-                    None
-                }
-            },
+            Ok((MemTileTarget::West, off)) => Some(
+                match neighbors.west.as_deref_mut() {
+                    Some(t) => (t, off),
+                    None => (own, off),
+                },
+            ),
+            Ok((MemTileTarget::East, off)) => Some(
+                match neighbors.east.as_deref_mut() {
+                    Some(t) => (t, off),
+                    None => (own, off),
+                },
+            ),
             Err(e) => {
                 let msg = format!(
                     "DMA MemTile({},{}) S2MM addr=0x{:X} outside three-window MemTile space (window_size=0x{:X})",

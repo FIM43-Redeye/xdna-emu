@@ -1297,20 +1297,57 @@ fn test_memtile_s2mm_writes_to_east_neighbor() {
 }
 
 #[test]
-fn test_memtile_mm2s_missing_east_neighbour_records_fatal_error() {
-    // A BD that targets the East window when no east tile is wired up
-    // must record a fatal error rather than silently reading own/west data.
+fn test_memtile_mm2s_missing_neighbour_falls_back_to_own() {
+    // mlir-aie's `dma_configure_task` lowering on AIE2 emits *flat* MemTile
+    // addresses (no window offset added), so a BD with addr=0x100100 on a
+    // last-column MemTile that has no east tile is intended as Own[0x100]
+    // (the address falls in the "East" window only because the toolchain
+    // never adds the windowing offset for that path -- see
+    // mlir-aie's AIEDMATasksToNPU.cpp comment for AIE2 vs AIE2P).
+    //
+    // Real hardware silently aliases such accesses to Own when the
+    // addressed neighbour does not exist. We mirror that: no fatal error,
+    // and the read returns local data at the same byte offset.
     let mut engine = DmaEngine::new_mem_tile(3, 1);  // last col, no east
     let mut own_tile = Tile::mem_tile(3, 1);
     own_tile.data_memory_mut()[0x100..0x110].copy_from_slice(&[0x42; 16]);
 
-    let bd = BdConfig::simple_1d(0x100100, 16);  // East window
+    let bd = BdConfig::simple_1d(0x100100, 16);  // East-window addr, no east tile
+    engine.configure_bd(0, bd).unwrap();
+    engine.start_channel(6, 0).unwrap();
+
+    run_memtile_mm2s_to_completion(
+        &mut engine, 6, &mut own_tile,
+        None, None,
+        500,
+    );
+
+    assert!(engine.fatal_errors.is_empty(),
+        "missing East neighbour should fall back to Own, not fatal-error: {:?}",
+        engine.fatal_errors);
+    let expected_word = u32::from_le_bytes([0x42; 4]);
+    assert_eq!(engine.stream_out_len(), 4, "expected 4 stream words from own tile");
+    while let Some(w) = engine.stream_out.pop_front() {
+        assert_eq!(w.data, expected_word,
+            "stream word should fall back to own-tile data (0x42), got 0x{:08X}", w.data);
+    }
+}
+
+#[test]
+fn test_memtile_mm2s_out_of_window_addr_records_fatal_error() {
+    // Addresses beyond 3*mem_size have no defined window and remain a
+    // fatal error -- this guards against actual programming bugs (vs the
+    // benign "windowed addr without neighbour" case above).
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut own_tile = Tile::mem_tile(1, 1);
+
+    // 0x180000 = first byte beyond East window (3 * 0x80000).
+    let bd = BdConfig::simple_1d(0x180000, 16);
     engine.configure_bd(0, bd).unwrap();
     engine.start_channel(6, 0).unwrap();
 
     let mut neighbors = NeighborTiles::empty();
     let mut host_mem = make_host_memory();
-    // Step until channel reports Error or we exhaust attempts.
     for _ in 0..500 {
         engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
         if matches!(engine.channel_state(6), ChannelState::Error) {
@@ -1322,10 +1359,10 @@ fn test_memtile_mm2s_missing_east_neighbour_records_fatal_error() {
     }
 
     assert!(!engine.fatal_errors.is_empty(),
-        "expected fatal_errors to record missing-east-neighbour, got none");
+        "addr beyond 3*mem_size should fatal-error, got none");
     assert!(
-        engine.fatal_errors.iter().any(|e| e.contains("East neighbour")),
-        "fatal_errors should mention East neighbour, got: {:?}",
+        engine.fatal_errors.iter().any(|e| e.contains("outside three-window")),
+        "fatal_errors should mention out-of-window, got: {:?}",
         engine.fatal_errors,
     );
 }
