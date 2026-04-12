@@ -251,26 +251,26 @@ pub enum StallStatus {
     Stalled(QuiescenceDiagnosis),
 }
 
-/// Detects DMA stalls by monitoring byte transfer progress.
+/// Detects DMA stalls by monitoring lock-release progress.
 ///
 /// Complements [`QuiescenceDetector`] which catches true deadlocks (all
 /// subsystems terminal). This detector catches **livelocks** where cores
-/// are still running but DMA is not moving data, so the workload can
-/// never complete.
+/// are still running but neither DMA bytes are moving nor any lock is being
+/// released, so the workload can never complete.
 ///
-/// The stall counter resets whenever either DMA bytes or core instruction
-/// count changes. This prevents false positives from long-running kernel
-/// code (e.g. byte-by-byte memcpy) where DMA legitimately waits for
-/// lock releases that will come when the kernel finishes.
+/// The stall counter resets whenever either DMA bytes or lock release count
+/// changes. Lock releases are a robust forward-progress signal: any time a
+/// core releases a lock it is making productive progress toward completion,
+/// even if DMA bytes are not moving in that cycle.
 ///
 /// The counter only fires when there are unsatisfied pending syncs --
 /// otherwise the test may legitimately be doing pure computation.
 pub struct StallDetector {
     /// Last observed total DMA bytes transferred.
     last_dma_bytes: u64,
-    /// Last observed total core instructions executed.
-    last_instructions: u64,
-    /// Consecutive cycles with no progress (DMA or core).
+    /// Last observed total lock releases across all tiles.
+    last_lock_releases: u64,
+    /// Consecutive cycles with no progress (DMA or lock releases).
     cycles_since_progress: u64,
     /// Threshold before declaring a stall.
     threshold: u64,
@@ -281,7 +281,7 @@ impl StallDetector {
     pub fn new(threshold: u64) -> Self {
         Self {
             last_dma_bytes: 0,
-            last_instructions: 0,
+            last_lock_releases: 0,
             cycles_since_progress: 0,
             threshold,
         }
@@ -290,7 +290,7 @@ impl StallDetector {
     /// Check whether the system has stalled this cycle.
     ///
     /// Must be called once per cycle. Returns:
-    /// - `Progressing` if DMA bytes or core instructions are advancing
+    /// - `Progressing` if DMA bytes or lock releases are advancing
     /// - `Stalled(diagnosis)` if no progress for `threshold` cycles
     ///   with unsatisfied syncs
     pub fn check(
@@ -313,13 +313,13 @@ impl StallDetector {
         }
 
         let current_bytes = engine.device().array.total_dma_bytes_transferred();
-        let current_instructions = engine.total_instructions();
+        let current_lock_releases = engine.device().array.total_lock_releases();
 
         if current_bytes != self.last_dma_bytes
-            || current_instructions != self.last_instructions
+            || current_lock_releases != self.last_lock_releases
         {
             self.last_dma_bytes = current_bytes;
-            self.last_instructions = current_instructions;
+            self.last_lock_releases = current_lock_releases;
             self.cycles_since_progress = 0;
             StallStatus::Progressing
         } else {
