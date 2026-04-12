@@ -271,4 +271,12 @@ impl TileArray {
         }
         total
     }
+
+    /// Total lock releases granted across all tiles.
+    ///
+    /// Monotonically increasing counter used by stall detection.
+    /// Counts both core and DMA lock releases.
+    pub fn total_lock_releases(&self) -> u64 {
+        self.tiles.iter().map(|t| t.lock_release_count()).sum()
+    }
 }
