@@ -147,6 +147,11 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
             }
         }
 
+        if handle.engine.status() == EngineStatus::Stalled {
+            log::warn!("Stall detected after {} cycles: no monotonic progress", cycles);
+            break;
+        }
+
         // Check if all NPU sync conditions are satisfied.  On real
         // hardware, firmware considers execution complete when the sync
         // fires -- DMA channels may still be running (trace channels,

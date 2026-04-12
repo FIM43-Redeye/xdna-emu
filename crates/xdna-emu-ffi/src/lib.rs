@@ -127,8 +127,10 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
     xdna_emu::debug::watch::init();
 
     let config = xdna_emu::config::Config::get();
+    let mut engine = InterpreterEngine::new_npu1();
+    engine.set_stall_threshold(config.stall_threshold());
     let handle = Box::new(XdnaEmuHandle {
-        engine: InterpreterEngine::new_npu1(),
+        engine,
         xclbin_path: None,
         npu_executor: NpuExecutor::new(),
         max_cycles: config.max_cycles(),
