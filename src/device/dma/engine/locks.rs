@@ -21,7 +21,7 @@ impl DmaEngine {
     ///
     /// Called before arbiter resolution. After resolution, `step()` checks
     /// arbiter results to determine which operations succeeded.
-    pub fn submit_lock_requests(&self, tile: &mut Tile, neighbors: &mut NeighborLocks<'_>) {
+    pub fn submit_lock_requests(&self, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>) {
         for ch_idx in 0..self.channels.len() {
             match &self.channels[ch_idx].fsm {
                 ChannelFsm::AcquiringLock { lock_id, acquired: false, transfer, .. } => {
@@ -43,7 +43,7 @@ impl DmaEngine {
         lock_id: u8,
         transfer: &Transfer,
         tile: &mut Tile,
-        neighbors: &mut NeighborLocks<'_>,
+        neighbors: &mut NeighborTiles<'_>,
         ch_idx: u8,
     ) {
         use crate::device::tile::LockRequest;
@@ -90,7 +90,7 @@ impl DmaEngine {
         lock_id: u8,
         release_value: i8,
         tile: &mut Tile,
-        neighbors: &mut NeighborLocks<'_>,
+        neighbors: &mut NeighborTiles<'_>,
         ch_idx: u8,
     ) {
         use crate::device::tile::LockRequest;

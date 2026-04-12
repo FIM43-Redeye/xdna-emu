@@ -75,7 +75,7 @@ pub use addressing::{AddressGenerator, DimensionConfig, AddressIterator, Iterati
 pub use bd::{BufferDescriptor, bd_base_address, bd_register_count, BD_SPACING};
 pub use stream_io::StreamWord;
 pub use transfer::{Transfer, TransferDirection, TransferEndpoint, parse_source_tile_from_header};
-pub use engine::{DmaEngine, ChannelState, ChannelId, StreamData, ChannelTaskConfig, TaskQueueEntry, MAX_TASK_QUEUE_DEPTH, LockTarget, NeighborLocks};
+pub use engine::{DmaEngine, ChannelState, ChannelId, StreamData, ChannelTaskConfig, TaskQueueEntry, MAX_TASK_QUEUE_DEPTH, LockTarget, NeighborTiles};
 pub use token::{Token, TokenState, TaskQueue};
 pub use channel::{ChannelFsm, ChannelContext, CompletionInfo};
 pub use timing::DmaTimingConfig;

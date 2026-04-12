@@ -7,7 +7,7 @@ impl DmaEngine {
     ///
     /// This processes all active channels, moving data between memory and streams.
     /// Returns the overall result of the step.
-    pub fn step(&mut self, tile: &mut Tile, neighbors: &mut NeighborLocks<'_>, host_memory: &mut HostMemory) -> DmaResult {
+    pub fn step(&mut self, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>, host_memory: &mut HostMemory) -> DmaResult {
         let mut any_active = false;
         let mut any_waiting = false;
 
@@ -64,7 +64,7 @@ impl DmaEngine {
     /// Each match arm does ONE cycle of work and optionally transitions to
     /// a new state. This replaces the old step_channel() + step_channel_timed() +
     /// complete_transfer() + finish_complete_transfer() chain.
-    fn step_channel_fsm(&mut self, ch_idx: usize, tile: &mut Tile, neighbors: &mut NeighborLocks<'_>, host_memory: &mut HostMemory) {
+    fn step_channel_fsm(&mut self, ch_idx: usize, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>, host_memory: &mut HostMemory) {
         // Take the FSM out temporarily so we can match on it while
         // mutating self (for stream buffers, do_transfer, etc.)
         let fsm = std::mem::take(&mut self.channels[ch_idx].fsm);
@@ -179,7 +179,7 @@ impl DmaEngine {
 
             ChannelFsm::Transferring { mut transfer } => {
                 // Move one cycle of data
-                let result = self.do_transfer_cycle(ch_idx, &mut transfer, tile, host_memory);
+                let result = self.do_transfer_cycle(ch_idx, &mut transfer, tile, neighbors, host_memory);
 
                 match result {
                     TransferCycleResult::Continue => {
@@ -363,6 +363,7 @@ impl DmaEngine {
         ch_idx: usize,
         transfer: &mut Transfer,
         tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
         host_memory: &mut HostMemory,
     ) -> TransferCycleResult {
         let words_per_cycle = self.timing_config.words_per_cycle as usize;
@@ -396,7 +397,7 @@ impl DmaEngine {
                     let dest = transfer.dest;
                     let result = self.do_transfer(
                         source, dest, addr, 4, channel,
-                        is_last_word, tlast_suppress, tile, host_memory,
+                        is_last_word, tlast_suppress, tile, neighbors, host_memory,
                     );
 
                     if result.stall {
@@ -441,7 +442,7 @@ impl DmaEngine {
 
                 let result = self.do_transfer(
                     source, dest, addr, 4, channel,
-                    is_last, tlast_suppress, tile, host_memory,
+                    is_last, tlast_suppress, tile, neighbors, host_memory,
                 );
 
                 if result.stall {
@@ -483,7 +484,7 @@ impl DmaEngine {
         &mut self,
         lock_id: u8,
         tile: &Tile,
-        neighbors: &NeighborLocks<'_>,
+        neighbors: &NeighborTiles<'_>,
         ch_idx: usize,
     ) -> bool {
         let lock_target = match self.resolve_lock_id(lock_id) {
@@ -526,7 +527,7 @@ impl DmaEngine {
         lock_id: u8,
         release_value: i8,
         _tile: &mut Tile,
-        _neighbors: &mut NeighborLocks<'_>,
+        _neighbors: &mut NeighborTiles<'_>,
     ) {
         log::info!("DMA tile({},{}) lock release bd_lock={} delta={} (applied by arbiter)",
             self.col, self.row, lock_id, release_value);
@@ -582,12 +583,13 @@ impl DmaEngine {
         is_last: bool,
         tlast_suppress: bool,
         tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
         host_memory: &mut HostMemory,
     ) -> TransferResult {
         match (source, dest) {
             (TransferEndpoint::TileMemory { .. }, TransferEndpoint::Stream { .. }) => {
                 // MM2S: Read from tile memory, queue to stream output
-                if self.transfer_mm2s(addr, bytes, channel, is_last, tlast_suppress, tile) {
+                if self.transfer_mm2s(addr, bytes, channel, is_last, tlast_suppress, tile, neighbors) {
                     TransferResult::success()
                 } else {
                     TransferResult::failure()
@@ -595,7 +597,7 @@ impl DmaEngine {
             }
             (TransferEndpoint::Stream { .. }, TransferEndpoint::TileMemory { .. }) => {
                 // S2MM: Read from stream input, write to tile memory
-                let result = self.transfer_s2mm(addr, bytes, channel, tile);
+                let result = self.transfer_s2mm(addr, bytes, channel, tile, neighbors);
                 if result.stall {
                     // No stream data available - stall (not an error)
                     return TransferResult::stalled();
@@ -673,18 +675,145 @@ impl DmaEngine {
         }
     }
 
+    /// Resolve an MM2S byte address to (target_tile, offset within it).
+    ///
+    /// MemTile DMAs use the windowed (West/Own/East) address space per AM025;
+    /// each window is `mem_size` bytes wide. Compute/shim DMAs always target
+    /// the local tile and wrap the address at `mem_size` (legacy behaviour).
+    ///
+    /// On a missing neighbour or out-of-window address, logs an error,
+    /// records it in `fatal_errors`, and returns `None` so the caller can
+    /// fail the transfer.
+    fn resolve_mm2s_target<'a>(
+        &mut self,
+        addr: u64,
+        mem_size: usize,
+        own: &'a Tile,
+        neighbors: &'a NeighborTiles<'_>,
+    ) -> Option<(&'a Tile, usize)> {
+        if !self.tile_type.is_mem_tile() {
+            return Some((own, (addr as usize) % mem_size));
+        }
+        match MemTileTarget::resolve(addr, mem_size) {
+            Ok((MemTileTarget::Own, off)) => Some((own, off)),
+            Ok((MemTileTarget::West, off)) => match neighbors.west.as_deref() {
+                Some(t) => Some((t, off)),
+                None => {
+                    let msg = format!(
+                        "DMA MemTile({},{}) MM2S addr=0x{:X} -> West neighbour but no west tile (col=0?)",
+                        self.col, self.row, addr,
+                    );
+                    log::error!("{}", msg);
+                    self.fatal_errors.push(msg);
+                    None
+                }
+            },
+            Ok((MemTileTarget::East, off)) => match neighbors.east.as_deref() {
+                Some(t) => Some((t, off)),
+                None => {
+                    let msg = format!(
+                        "DMA MemTile({},{}) MM2S addr=0x{:X} -> East neighbour but no east tile (last column?)",
+                        self.col, self.row, addr,
+                    );
+                    log::error!("{}", msg);
+                    self.fatal_errors.push(msg);
+                    None
+                }
+            },
+            Err(e) => {
+                let msg = format!(
+                    "DMA MemTile({},{}) MM2S addr=0x{:X} outside three-window MemTile space (window_size=0x{:X})",
+                    self.col, self.row, e.byte_addr, e.mem_size,
+                );
+                log::error!("{}", msg);
+                self.fatal_errors.push(msg);
+                None
+            }
+        }
+    }
+
+    /// Resolve an S2MM byte address to (target_tile, offset within it).
+    ///
+    /// Mutable counterpart to `resolve_mm2s_target`. Same windowing semantics;
+    /// returns a `&mut Tile` borrowed from `own` or `neighbors` so the caller
+    /// can write data through the MemTile-to-MemTile shared-memory bus.
+    fn resolve_s2mm_target<'a>(
+        &mut self,
+        addr: u64,
+        mem_size: usize,
+        own: &'a mut Tile,
+        neighbors: &'a mut NeighborTiles<'_>,
+    ) -> Option<(&'a mut Tile, usize)> {
+        if !self.tile_type.is_mem_tile() {
+            return Some((own, (addr as usize) % mem_size));
+        }
+        match MemTileTarget::resolve(addr, mem_size) {
+            Ok((MemTileTarget::Own, off)) => Some((own, off)),
+            Ok((MemTileTarget::West, off)) => match neighbors.west.as_deref_mut() {
+                Some(t) => Some((t, off)),
+                None => {
+                    let msg = format!(
+                        "DMA MemTile({},{}) S2MM addr=0x{:X} -> West neighbour but no west tile (col=0?)",
+                        self.col, self.row, addr,
+                    );
+                    log::error!("{}", msg);
+                    self.fatal_errors.push(msg);
+                    None
+                }
+            },
+            Ok((MemTileTarget::East, off)) => match neighbors.east.as_deref_mut() {
+                Some(t) => Some((t, off)),
+                None => {
+                    let msg = format!(
+                        "DMA MemTile({},{}) S2MM addr=0x{:X} -> East neighbour but no east tile (last column?)",
+                        self.col, self.row, addr,
+                    );
+                    log::error!("{}", msg);
+                    self.fatal_errors.push(msg);
+                    None
+                }
+            },
+            Err(e) => {
+                let msg = format!(
+                    "DMA MemTile({},{}) S2MM addr=0x{:X} outside three-window MemTile space (window_size=0x{:X})",
+                    self.col, self.row, e.byte_addr, e.mem_size,
+                );
+                log::error!("{}", msg);
+                self.fatal_errors.push(msg);
+                None
+            }
+        }
+    }
+
     /// MM2S: Read from tile memory and queue to stream output.
+    ///
+    /// For MemTile DMAs, the byte address is decoded into a West/Own/East
+    /// window via `MemTileTarget::resolve()`. Compute/shim DMAs always read
+    /// from the local tile (legacy `addr % mem_size` wrap).
     ///
     /// # Arguments
     /// * `tlast_suppress` - If true, TLAST is not asserted even on the last word
-    pub(super) fn transfer_mm2s(&mut self, addr: u64, bytes: usize, channel: u8, is_last: bool, tlast_suppress: bool, tile: &Tile) -> bool {
+    pub(super) fn transfer_mm2s(
+        &mut self,
+        addr: u64,
+        bytes: usize,
+        channel: u8,
+        is_last: bool,
+        tlast_suppress: bool,
+        tile: &Tile,
+        neighbors: &NeighborTiles<'_>,
+    ) -> bool {
         let mem_size = tile.data_memory().len();
 
-        // MemTile DMA addresses may have a 0x80000 offset in the address space
-        // Wrap addresses to stay within memory bounds
-        let offset = (addr as usize) % mem_size;
+        // Resolve target tile and offset.
+        // MemTile uses the windowed (West/Own/East) address space; non-MemTile
+        // tiles wrap at mem_size.
+        let (target_tile, offset) = match self.resolve_mm2s_target(addr, mem_size, tile, neighbors) {
+            Some(r) => r,
+            None => return false,
+        };
 
-        // Record bank access for conflict detection
+        // Record bank access for conflict detection (offset is local to the target tile)
         self.cycle_dma_banks |= crate::device::banking::banks_for_access(
             offset as u32, bytes, self.num_banks,
         );
@@ -699,7 +828,7 @@ impl DmaEngine {
             return false;
         }
 
-        let data = tile.data_memory();
+        let data = target_tile.data_memory();
 
         // When compression is enabled, read 32-byte blocks and compress each one.
         // Compressed output (mask + packed non-zero bytes) is pushed as 32-bit stream words.
@@ -838,14 +967,25 @@ impl DmaEngine {
     ///
     /// Only transfers data that is available in stream_in for the specified channel.
     /// Returns S2mmResult indicating success, TLAST reception, and bytes written.
-    pub(super) fn transfer_s2mm(&mut self, addr: u64, bytes: usize, channel: u8, tile: &mut Tile) -> S2mmResult {
+    pub(super) fn transfer_s2mm(
+        &mut self,
+        addr: u64,
+        bytes: usize,
+        channel: u8,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) -> S2mmResult {
         let mem_size = tile.data_memory().len();
 
-        // MemTile DMA addresses may have a 0x80000 offset in the address space
-        // Wrap addresses to stay within memory bounds
-        let offset = (addr as usize) % mem_size;
+        // Resolve target tile and offset.
+        // MemTile uses the windowed (West/Own/East) address space; non-MemTile
+        // tiles wrap at mem_size.
+        let (target_tile, offset) = match self.resolve_s2mm_target(addr, mem_size, tile, neighbors) {
+            Some(r) => r,
+            None => return S2mmResult { success: false, stall: false, tlast_received: false, bytes_written: 0 },
+        };
 
-        // Record bank access for conflict detection
+        // Record bank access for conflict detection (offset is local to the target tile)
         self.cycle_dma_banks |= crate::device::banking::banks_for_access(
             offset as u32, bytes, self.num_banks,
         );
@@ -867,7 +1007,7 @@ impl DmaEngine {
             if !self.has_stream_in_for_channel(channel) {
                 return S2mmResult { success: true, stall: true, tlast_received: false, bytes_written: 0 };
             }
-            return self.transfer_s2mm_decompressed(offset, bytes, channel, tile);
+            return self.transfer_s2mm_decompressed(offset, bytes, channel, target_tile);
         }
 
         // Uncompressed path: the DMA bus transfers atomically -- all words
@@ -884,8 +1024,9 @@ impl DmaEngine {
         // markers on the stream.
         let fot_enabled = self.get_channel_fot_mode(channel) != 0;
 
-        // Write data to tile memory in 32-bit words
-        let data = tile.data_memory_mut();
+        // Write data to tile memory in 32-bit words.
+        // For MemTile DMAs this may be a neighbour's memory via the shared bus.
+        let data = target_tile.data_memory_mut();
         let mut bytes_written = 0;
         let word_count = (bytes + 3) / 4;
         let mut tlast_received = false;
@@ -940,12 +1081,15 @@ impl DmaEngine {
     /// Each block starts with a 32-bit mask word, followed by ceil(popcount(mask)/4)
     /// data words containing packed non-zero bytes. The decompressed 32-byte output
     /// is written to tile memory.
+    ///
+    /// `target_tile` is the resolved destination (own or neighbour MemTile);
+    /// `offset` is local to that tile's data memory.
     fn transfer_s2mm_decompressed(
         &mut self,
         offset: usize,
         bytes: usize,
         channel: u8,
-        tile: &mut Tile,
+        target_tile: &mut Tile,
     ) -> S2mmResult {
         const BLOCK_SIZE: usize = 32;
 
@@ -996,7 +1140,7 @@ impl DmaEngine {
             // Decompress (tolerates short input: missing bytes decompress as zero)
             match compression::decompress(&compressed_buf) {
                 Some(decompressed) => {
-                    let data = tile.data_memory_mut();
+                    let data = target_tile.data_memory_mut();
                     let write_len = BLOCK_SIZE.min(bytes - mem_bytes_written);
                     let dest_start = offset + mem_bytes_written;
                     let dest_end = (dest_start + write_len).min(data.len());

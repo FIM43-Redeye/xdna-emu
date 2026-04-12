@@ -102,10 +102,10 @@ impl TileArray {
             let (west_ref, own_ref, east_ref) = get_three_mut(
                 &mut self.tiles, idx, col as usize, rows, cols,
             );
-            let mut neighbors = dma::NeighborLocks { west: west_ref, east: east_ref };
+            let mut neighbors = dma::NeighborTiles { west: west_ref, east: east_ref };
             self.dma_engines[idx].step(own_ref, &mut neighbors, host_memory)
         } else {
-            self.dma_engines[idx].step(&mut self.tiles[idx], &mut dma::NeighborLocks::empty(), host_memory)
+            self.dma_engines[idx].step(&mut self.tiles[idx], &mut dma::NeighborTiles::empty(), host_memory)
         };
         Some(result)
     }
@@ -133,10 +133,10 @@ impl TileArray {
                 let (west_ref, own_ref, east_ref) = get_three_mut(
                     tiles, i, col, rows, cols,
                 );
-                let mut neighbors = dma::NeighborLocks { west: west_ref, east: east_ref };
+                let mut neighbors = dma::NeighborTiles { west: west_ref, east: east_ref };
                 engines[i].submit_lock_requests(own_ref, &mut neighbors);
             } else {
-                engines[i].submit_lock_requests(&mut tiles[i], &mut dma::NeighborLocks::empty());
+                engines[i].submit_lock_requests(&mut tiles[i], &mut dma::NeighborTiles::empty());
             }
         }
     }
@@ -162,10 +162,10 @@ impl TileArray {
                 let (west_ref, own_ref, east_ref) = get_three_mut(
                     tiles, i, col, rows, cols,
                 );
-                let mut neighbors = dma::NeighborLocks { west: west_ref, east: east_ref };
+                let mut neighbors = dma::NeighborTiles { west: west_ref, east: east_ref };
                 engines[i].step(own_ref, &mut neighbors, host_memory)
             } else {
-                engines[i].step(&mut tiles[i], &mut dma::NeighborLocks::empty(), host_memory)
+                engines[i].step(&mut tiles[i], &mut dma::NeighborTiles::empty(), host_memory)
             };
 
             if matches!(result, DmaResult::InProgress | DmaResult::WaitingForLock(_)) {

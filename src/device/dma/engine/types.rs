@@ -21,25 +21,88 @@ pub enum LockTarget {
     East(u8),
 }
 
-/// Provides mutable access to neighbor tiles for cross-tile lock operations.
+/// Identifies which MemTile's data memory a DMA byte address targets.
 ///
-/// Models the NPU interconnect that routes MemTile DMA lock accesses to
-/// neighbor columns. Constructed by the array level using disjoint borrows.
-/// Non-MemTile tiles pass `NeighborLocks::empty()`.
-pub struct NeighborLocks<'a> {
+/// MemTile DMA BDs encode a byte address into a windowed space that maps to
+/// the local MemTile and its two neighbours via the dedicated MemTile-to-
+/// MemTile shared-memory bus (NOT through the stream switch). With each
+/// window equal to one MemTile's data memory size (typically 0x80000 bytes
+/// = 512 KB), the convention per AM025 / mlir-aie is:
+///
+///   - `[0x00000, 0x80000)` -> West neighbor (col-1) data memory
+///   - `[0x80000, 0x100000)` -> Own data memory
+///   - `[0x100000, 0x180000)` -> East neighbor (col+1) data memory
+///
+/// Compute/shim DMAs do not use this windowing; their addresses always
+/// refer to local memory and are wrapped at `mem_size`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemTileTarget {
+    /// Access targets the local MemTile's data memory.
+    Own,
+    /// Access targets the west neighbor MemTile (col-1).
+    West,
+    /// Access targets the east neighbor MemTile (col+1).
+    East,
+}
+
+/// Address out of the legal three-window MemTile address space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemTileAddrOutOfRange {
+    /// Original byte address from the BD.
+    pub byte_addr: u64,
+    /// Window size that was used for decoding (= MemTile data memory bytes).
+    pub mem_size: usize,
+}
+
+impl MemTileTarget {
+    /// Resolve a MemTile DMA byte address into a target tile + offset.
+    ///
+    /// `mem_size` is the byte size of one MemTile's data memory; it sets the
+    /// window size. Returns the target window (West/Own/East) and the offset
+    /// within that window's memory.
+    ///
+    /// Returns `Err` if the address falls outside the three-window space.
+    /// On real hardware, such an address would cause a bus error; the caller
+    /// should treat it as a fatal kernel bug.
+    pub fn resolve(byte_addr: u64, mem_size: usize) -> Result<(Self, usize), MemTileAddrOutOfRange> {
+        debug_assert!(mem_size > 0, "mem_size must be > 0 for MemTile address decode");
+        let addr = byte_addr as usize;
+        let window = addr / mem_size;
+        let offset = addr % mem_size;
+        let target = match window {
+            0 => MemTileTarget::West,
+            1 => MemTileTarget::Own,
+            2 => MemTileTarget::East,
+            _ => return Err(MemTileAddrOutOfRange { byte_addr, mem_size }),
+        };
+        Ok((target, offset))
+    }
+}
+
+/// Provides mutable access to neighbor tiles for cross-tile DMA operations.
+///
+/// Models the MemTile-to-MemTile interconnect (shared-memory bus + lock
+/// routing) that lets a MemTile DMA reach its `+/-1` column neighbours
+/// without going through the stream switch. Constructed by the array level
+/// using disjoint borrows via `get_three_mut`.
+///
+/// Used for both lock arbitration (`LockTarget::{West,East}`) and data
+/// transfers (`MemTileTarget::{West,East}`). Non-MemTile tiles pass
+/// `NeighborTiles::empty()`.
+pub struct NeighborTiles<'a> {
     /// West neighbor MemTile (col-1), if it exists.
     pub west: Option<&'a mut Tile>,
     /// East neighbor MemTile (col+1), if it exists.
     pub east: Option<&'a mut Tile>,
 }
 
-impl NeighborLocks<'_> {
+impl NeighborTiles<'_> {
     /// Create an empty neighbor context (no cross-tile access).
     ///
-    /// Used for compute/shim tiles where cross-tile lock access
+    /// Used for compute/shim tiles where cross-tile MemTile access
     /// is not applicable.
-    pub fn empty() -> NeighborLocks<'static> {
-        NeighborLocks { west: None, east: None }
+    pub fn empty() -> NeighborTiles<'static> {
+        NeighborTiles { west: None, east: None }
     }
 }
 
@@ -158,4 +221,79 @@ pub(super) enum TransferCycleResult {
     FotFinish,
     /// Transfer error (bad address, etc.)
     Error,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MemTile data memory size used for the standard NPU1 layout (512 KB).
+    /// Matches `tile.data_memory().len()` for a real MemTile.
+    const MEMTILE_BYTES: usize = 0x80000;
+
+    #[test]
+    fn memtile_target_resolve_west_window_at_zero() {
+        // Window 0 = West neighbour
+        let (target, offset) = MemTileTarget::resolve(0, MEMTILE_BYTES).unwrap();
+        assert_eq!(target, MemTileTarget::West);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn memtile_target_resolve_west_window_offset() {
+        let (target, offset) = MemTileTarget::resolve(0x1234, MEMTILE_BYTES).unwrap();
+        assert_eq!(target, MemTileTarget::West);
+        assert_eq!(offset, 0x1234);
+    }
+
+    #[test]
+    fn memtile_target_resolve_own_window_at_boundary() {
+        // 0x80000 = exact start of Own window
+        let (target, offset) = MemTileTarget::resolve(0x80000, MEMTILE_BYTES).unwrap();
+        assert_eq!(target, MemTileTarget::Own);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn memtile_target_resolve_own_window_offset() {
+        let (target, offset) = MemTileTarget::resolve(0x80000 + 0xABC, MEMTILE_BYTES).unwrap();
+        assert_eq!(target, MemTileTarget::Own);
+        assert_eq!(offset, 0xABC);
+    }
+
+    #[test]
+    fn memtile_target_resolve_east_window_at_boundary() {
+        let (target, offset) = MemTileTarget::resolve(0x100000, MEMTILE_BYTES).unwrap();
+        assert_eq!(target, MemTileTarget::East);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn memtile_target_resolve_east_window_offset() {
+        let (target, offset) = MemTileTarget::resolve(0x100000 + 0x40, MEMTILE_BYTES).unwrap();
+        assert_eq!(target, MemTileTarget::East);
+        assert_eq!(offset, 0x40);
+    }
+
+    #[test]
+    fn memtile_target_resolve_top_of_east_window() {
+        // 0x17FFFC = last 4-byte word of East window
+        let (target, offset) = MemTileTarget::resolve(0x17FFFC, MEMTILE_BYTES).unwrap();
+        assert_eq!(target, MemTileTarget::East);
+        assert_eq!(offset, 0x7FFFC);
+    }
+
+    #[test]
+    fn memtile_target_resolve_out_of_range_returns_err() {
+        // 0x180000 = first byte beyond East window, no fourth window exists.
+        let err = MemTileTarget::resolve(0x180000, MEMTILE_BYTES).unwrap_err();
+        assert_eq!(err.byte_addr, 0x180000);
+        assert_eq!(err.mem_size, MEMTILE_BYTES);
+    }
+
+    #[test]
+    fn memtile_target_resolve_far_out_of_range_returns_err() {
+        let err = MemTileTarget::resolve(0xFFFF_FFFF, MEMTILE_BYTES).unwrap_err();
+        assert_eq!(err.byte_addr, 0xFFFF_FFFF);
+    }
 }

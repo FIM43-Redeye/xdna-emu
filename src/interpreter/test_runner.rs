@@ -1505,8 +1505,12 @@ mod tests {
         // - Channels 2-3: MM2S (memory to stream)
         let compute_s2mm_channel = 0u8;  // First S2MM channel on compute tile
 
-        // Configure MM2S BD on memtile: read from 0x1000, send to stream
-        let memtile_mm2s_bd = BdConfig::simple_1d(memtile_src_offset as u64, transfer_size);
+        // Configure MM2S BD on memtile: read from local offset 0x1000, send to stream.
+        // MemTile DMA addresses use a windowed space: West=[0,0x80000), Own=[0x80000,
+        // 0x100000), East=[0x100000,0x180000). For local-tile access the BD address
+        // must sit in the Own window. See MemTileTarget in dma::engine::types.
+        let memtile_mm2s_bd_addr = 0x80000u64 + memtile_src_offset as u64;
+        let memtile_mm2s_bd = BdConfig::simple_1d(memtile_mm2s_bd_addr, transfer_size);
         runner.configure_dma_bd(memtile_col, memtile_row, 0, memtile_mm2s_bd).unwrap();
         eprintln!("Configured memtile MM2S BD: addr=0x{:04X}, len={}", memtile_src_offset, transfer_size);
 

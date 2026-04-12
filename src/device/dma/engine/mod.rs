@@ -28,7 +28,7 @@
 //!
 //! // Step the engine each cycle
 //! while engine.any_channel_active() {
-//!     engine.step(&mut tile_memory, &mut NeighborLocks::empty(), &mut host_memory)?;
+//!     engine.step(&mut tile_memory, &mut NeighborTiles::empty(), &mut host_memory)?;
 //! }
 //! ```
 
@@ -640,7 +640,7 @@ impl DmaEngine {
         channel: ChannelId,
         bd_index: u8,
         tile: &mut Tile,
-        neighbors: &mut NeighborLocks<'_>,
+        neighbors: &mut NeighborTiles<'_>,
         host_memory: &mut HostMemory,
     ) -> Result<u64, DmaError> {
         self.start_channel(channel, bd_index)?;

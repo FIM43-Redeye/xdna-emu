@@ -110,7 +110,7 @@ fn test_simple_transfer() {
     // Step until complete
     let mut cycles = 0;
     while engine.channel_active(2) {
-        engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
         cycles += 1;
         if cycles > 100 {
             panic!("Transfer took too long");
@@ -175,9 +175,9 @@ fn test_transfer_with_lock() {
     // Arbiter-based lock arbitration: submit -> resolve -> step
     let mut cycles = 0;
     while engine.channel_active(2) {
-        engine.submit_lock_requests(&mut tile, &mut NeighborLocks::empty());
+        engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
         tile.resolve_lock_requests(0);
-        engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
         cycles += 1;
         if cycles > 500 {
             panic!("Transfer took too long: {} cycles", cycles);
@@ -202,7 +202,7 @@ fn test_execute_1d_transfer() {
     // Use MM2S channel (channel 2) for testing
     engine.configure_bd(0, BdConfig::simple_1d(0x100, 64)).unwrap();
 
-    let cycles = engine.execute_1d_transfer(2, 0, &mut tile, &mut NeighborLocks::empty(), &mut host_mem).unwrap();
+    let cycles = engine.execute_1d_transfer(2, 0, &mut tile, &mut NeighborTiles::empty(), &mut host_mem).unwrap();
     assert!(cycles > 0, "Transfer should take at least one cycle");
 
     let stats = engine.channel_stats(2).unwrap();
@@ -259,7 +259,7 @@ fn test_cycle_accurate_transfer() {
     // Step until complete
     let mut cycles = 0;
     while engine.channel_active(2) {
-        engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
         cycles += 1;
         if cycles > 100 {
             panic!("Transfer took too long");
@@ -300,7 +300,7 @@ fn test_lock_timing_integration() {
 
     // Step a few times - lock still not available
     for _ in 0..3 {
-        engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
     }
 
     // Verify waiting state
@@ -442,7 +442,7 @@ fn test_task_queue_multiple_tasks_complete() {
     // Run until all work is complete (including queued tasks)
     let mut cycles = 0;
     while engine.channel_has_pending_work(2) {
-        engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
         cycles += 1;
         if cycles > 100 {
             panic!("Tasks took too long");
@@ -474,7 +474,7 @@ fn test_task_queue_with_repeat() {
     // Run until all work is complete (including repeats)
     let mut cycles = 0;
     while engine.channel_has_pending_work(2) {
-        engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
         cycles += 1;
         if cycles > 200 {
             panic!("Repeated task took too long");
@@ -506,7 +506,7 @@ fn test_bd_chain_with_repeat_restarts_from_start() {
 
     let mut cycles = 0;
     while engine.channel_has_pending_work(2) {
-        engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
         cycles += 1;
         if cycles > 500 {
             panic!("BD chain with repeat took too long (>500 cycles)");
@@ -542,7 +542,7 @@ fn test_self_chaining_bd_loops_indefinitely() {
 
     // Run for a fixed number of cycles -- channel should still be active.
     for _ in 0..200 {
-        engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
     }
 
     assert!(engine.channel_has_pending_work(2),
@@ -666,7 +666,7 @@ fn test_mm2s_compression_sparse_data() {
     // Enable compression on MM2S channel 2
     engine.set_channel_compression_config(2, true, false, false);
 
-    let result = engine.transfer_mm2s(0, 32, 2, true, false, &tile);
+    let result = engine.transfer_mm2s(0, 32, 2, true, false, &tile, &NeighborTiles::empty());
     assert!(result);
 
     // mask + 1 data word (3 bytes + padding) = 2 stream words
@@ -688,7 +688,7 @@ fn test_mm2s_compression_all_zeros() {
 
     engine.set_channel_compression_config(2, true, false, false);
 
-    let result = engine.transfer_mm2s(0, 32, 2, true, false, &tile);
+    let result = engine.transfer_mm2s(0, 32, 2, true, false, &tile, &NeighborTiles::empty());
     assert!(result);
 
     // All zeros: just mask word, no data
@@ -709,7 +709,7 @@ fn test_s2mm_decompression_round_trip() {
 
     // MM2S compress from offset 0
     engine.set_channel_compression_config(2, true, false, false);
-    let result = engine.transfer_mm2s(0, 32, 2, true, false, &tile);
+    let result = engine.transfer_mm2s(0, 32, 2, true, false, &tile, &NeighborTiles::empty());
     assert!(result);
 
     // Route compressed data from stream_out to stream_in (channel 0)
@@ -723,7 +723,7 @@ fn test_s2mm_decompression_round_trip() {
 
     // S2MM decompress to offset 256
     engine.set_channel_compression_config(0, false, true, false);
-    let result = engine.transfer_s2mm(256, 32, 0, &mut tile);
+    let result = engine.transfer_s2mm(256, 32, 0, &mut tile, &mut NeighborTiles::empty());
     assert!(result.success);
     assert_eq!(result.bytes_written, 32);
 
@@ -750,7 +750,7 @@ fn test_mm2s_no_compression_when_disabled() {
 
     assert!(!engine.is_compression_enabled(2));
 
-    let result = engine.transfer_mm2s(0, 4, 2, true, false, &tile);
+    let result = engine.transfer_mm2s(0, 4, 2, true, false, &tile, &NeighborTiles::empty());
     assert!(result);
 
     assert_eq!(engine.stream_out_len(), 1);
@@ -772,7 +772,7 @@ fn test_s2mm_no_decompression_when_disabled() {
 
     assert!(!engine.is_decompression_enabled(0));
 
-    let result = engine.transfer_s2mm(0, 4, 0, &mut tile);
+    let result = engine.transfer_s2mm(0, 4, 0, &mut tile, &mut NeighborTiles::empty());
     assert!(result.success);
     assert_eq!(result.bytes_written, 4);
 
@@ -793,7 +793,7 @@ fn test_compression_multiple_blocks() {
 
     engine.set_channel_compression_config(2, true, false, false);
 
-    let result = engine.transfer_mm2s(0, 64, 2, true, false, &tile);
+    let result = engine.transfer_mm2s(0, 64, 2, true, false, &tile, &NeighborTiles::empty());
     assert!(result);
 
     // Block 0: mask + data = 2 words; Block 1: mask + data = 2 words
@@ -884,7 +884,8 @@ fn test_cross_tile_lock_acquire_west() {
 
     // Configure BD with acquire on west neighbor lock 5.
     // West locks are IDs 0-63, so lock_id=5 means west lock 5.
-    let bd = BdConfig::simple_1d(0x100, 32)
+    // Address 0x80100 = Own window (0x80000) + offset 0x100; see MemTileTarget.
+    let bd = BdConfig::simple_1d(0x80100, 32)
         .with_acquire(5, 1);  // acq_eq: wait for value == 1
     engine.configure_bd(0, bd).unwrap();
 
@@ -897,7 +898,7 @@ fn test_cross_tile_lock_acquire_west() {
 
     // Submit lock requests, resolve arbiters, then step
     {
-        let mut neighbors = NeighborLocks {
+        let mut neighbors = NeighborTiles {
             west: Some(&mut west_tile),
             east: None,
         };
@@ -906,7 +907,7 @@ fn test_cross_tile_lock_acquire_west() {
     own_tile.resolve_lock_requests(0);
     west_tile.resolve_lock_requests(0);
 
-    let mut neighbors = NeighborLocks {
+    let mut neighbors = NeighborTiles {
         west: Some(&mut west_tile),
         east: None,
     };
@@ -930,7 +931,8 @@ fn test_cross_tile_lock_acquire_east() {
     east_tile.locks[10].set(1);
 
     // East locks are IDs 128-191, so lock_id=138 means east lock 10.
-    let bd = BdConfig::simple_1d(0x100, 32)
+    // Address 0x80100 = Own window (0x80000) + offset 0x100; see MemTileTarget.
+    let bd = BdConfig::simple_1d(0x80100, 32)
         .with_acquire(138, 1);  // acq_eq on east lock 10
     engine.configure_bd(0, bd).unwrap();
     own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xBB; 32]);
@@ -939,7 +941,7 @@ fn test_cross_tile_lock_acquire_east() {
     assert!(matches!(engine.channel_state(6), ChannelState::WaitingForLock(138)));
 
     {
-        let mut neighbors = NeighborLocks {
+        let mut neighbors = NeighborTiles {
             west: None,
             east: Some(&mut east_tile),
         };
@@ -948,7 +950,7 @@ fn test_cross_tile_lock_acquire_east() {
     own_tile.resolve_lock_requests(0);
     east_tile.resolve_lock_requests(0);
 
-    let mut neighbors = NeighborLocks {
+    let mut neighbors = NeighborTiles {
         west: None,
         east: Some(&mut east_tile),
     };
@@ -964,14 +966,15 @@ fn test_cross_tile_lock_acquire_fails_without_neighbor() {
     // MemTile at col 0 has no west neighbor
     let mut engine = DmaEngine::new_mem_tile(0, 1);
     let mut own_tile = Tile::mem_tile(0, 1);
-    let bd = BdConfig::simple_1d(0x100, 32)
+    // Address 0x80100 = Own window (0x80000) + offset 0x100; see MemTileTarget.
+    let bd = BdConfig::simple_1d(0x80100, 32)
         .with_acquire(5, 1);  // West lock -- but no west neighbor at col 0
     engine.configure_bd(0, bd).unwrap();
     own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xCC; 32]);
 
     engine.start_channel(6, 0).unwrap();
 
-    let mut neighbors = NeighborLocks::empty();
+    let mut neighbors = NeighborTiles::empty();
     let mut host_mem = make_host_memory();
     engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
 
@@ -987,8 +990,9 @@ fn test_cross_tile_lock_release_west() {
     let mut own_tile = Tile::mem_tile(1, 1);
     let mut west_tile = Tile::mem_tile(0, 1);
 
-    // BD: acquire own lock 0 (ID 64), release west lock 3 (ID 3)
-    let bd = BdConfig::simple_1d(0x100, 32)
+    // BD: acquire own lock 0 (ID 64), release west lock 3 (ID 3).
+    // Address 0x80100 = Own window (0x80000) + offset 0x100; see MemTileTarget.
+    let bd = BdConfig::simple_1d(0x80100, 32)
         .with_acquire(64, 1)   // own lock 0, acq_eq value=1
         .with_release(3, 1);   // west lock 3, release delta +1
     engine.configure_bd(0, bd).unwrap();
@@ -1003,7 +1007,7 @@ fn test_cross_tile_lock_release_west() {
     let mut cycles = 0;
     while engine.channel_active(6) {
         {
-            let mut neighbors = NeighborLocks {
+            let mut neighbors = NeighborTiles {
                 west: Some(&mut west_tile),
                 east: None,
             };
@@ -1011,7 +1015,7 @@ fn test_cross_tile_lock_release_west() {
         }
         own_tile.resolve_lock_requests(0);
         west_tile.resolve_lock_requests(0);
-        let mut neighbors = NeighborLocks {
+        let mut neighbors = NeighborTiles {
             west: Some(&mut west_tile),
             east: None,
         };
@@ -1037,7 +1041,8 @@ fn test_cross_tile_lock_release_east() {
     let mut east_tile = Tile::mem_tile(2, 1);
 
     // BD: acquire own lock 0 (ID 64), release east lock 7 (ID 128+7=135)
-    let bd = BdConfig::simple_1d(0x100, 32)
+    // Address 0x80100 = Own window (0x80000) + offset 0x100; see MemTileTarget.
+    let bd = BdConfig::simple_1d(0x80100, 32)
         .with_acquire(64, 1)   // own lock 0, acq_eq value=1
         .with_release(135, 1); // east lock 7, release delta +1
     engine.configure_bd(0, bd).unwrap();
@@ -1052,7 +1057,7 @@ fn test_cross_tile_lock_release_east() {
     let mut cycles = 0;
     while engine.channel_active(6) {
         {
-            let mut neighbors = NeighborLocks {
+            let mut neighbors = NeighborTiles {
                 west: None,
                 east: Some(&mut east_tile),
             };
@@ -1060,7 +1065,7 @@ fn test_cross_tile_lock_release_east() {
         }
         own_tile.resolve_lock_requests(0);
         east_tile.resolve_lock_requests(0);
-        let mut neighbors = NeighborLocks {
+        let mut neighbors = NeighborTiles {
             west: None,
             east: Some(&mut east_tile),
         };
@@ -1087,7 +1092,8 @@ fn test_cross_tile_lock_own_acquire_memtile() {
     // Set own lock 10 to value 1 (lock_id = 64 + 10 = 74)
     own_tile.locks[10].set(1);
 
-    let bd = BdConfig::simple_1d(0x100, 32)
+    // Address 0x80100 = Own window (0x80000) + offset 0x100; see MemTileTarget.
+    let bd = BdConfig::simple_1d(0x80100, 32)
         .with_acquire(74, 1);  // own lock 10, acq_eq value=1
     engine.configure_bd(0, bd).unwrap();
     own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xCC; 32]);
@@ -1097,12 +1103,12 @@ fn test_cross_tile_lock_own_acquire_memtile() {
 
     // Submit and resolve -- no neighbors needed for own-tile lock
     {
-        let mut neighbors = NeighborLocks::empty();
+        let mut neighbors = NeighborTiles::empty();
         engine.submit_lock_requests(&mut own_tile, &mut neighbors);
     }
     own_tile.resolve_lock_requests(0);
 
-    let mut neighbors = NeighborLocks::empty();
+    let mut neighbors = NeighborTiles::empty();
     let mut host_mem = make_host_memory();
     engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
 
@@ -1117,21 +1123,211 @@ fn test_cross_tile_lock_acquire_no_east_neighbor() {
     let mut engine = DmaEngine::new_mem_tile(3, 1);
     let mut own_tile = Tile::mem_tile(3, 1);
 
-    // East lock 0 = lock_id 128
-    let bd = BdConfig::simple_1d(0x100, 32)
+    // East lock 0 = lock_id 128.
+    // Address 0x80100 = Own window (0x80000) + offset 0x100; see MemTileTarget.
+    let bd = BdConfig::simple_1d(0x80100, 32)
         .with_acquire(128, 1);
     engine.configure_bd(0, bd).unwrap();
     own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xDD; 32]);
 
     engine.start_channel(6, 0).unwrap();
 
-    let mut neighbors = NeighborLocks::empty();
+    let mut neighbors = NeighborTiles::empty();
     let mut host_mem = make_host_memory();
     engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
 
     // Should remain waiting -- no east neighbor to satisfy lock
     assert!(matches!(engine.channel_state(6), ChannelState::WaitingForLock(128)),
         "Should stay waiting when east neighbor tile is absent");
+}
+
+// === Cross-MemTile data access tests ===
+//
+// MemTile DMA BDs encode addresses in a windowed three-tile space:
+//   West=[0, 0x80000), Own=[0x80000, 0x100000), East=[0x100000, 0x180000).
+// These tests verify that data reads/writes are routed to the correct
+// neighbour tile via the MemTile-to-MemTile shared-memory bus, not the
+// stream switch. See `MemTileTarget` in `dma::engine::types`.
+
+/// Drive an MM2S MemTile DMA channel to completion in one helper, asserting
+/// it never goes to Error and never spins past `max_cycles`.
+fn run_memtile_mm2s_to_completion(
+    engine: &mut DmaEngine,
+    channel: u8,
+    own: &mut Tile,
+    neighbors_west: Option<&mut Tile>,
+    neighbors_east: Option<&mut Tile>,
+    max_cycles: usize,
+) {
+    use std::cell::RefCell;
+    // Stash neighbours in local RefCells so we can rebuild a NeighborTiles
+    // each iteration without violating disjoint-borrow rules.
+    let west_cell = neighbors_west.map(RefCell::new);
+    let east_cell = neighbors_east.map(RefCell::new);
+
+    let mut host_mem = make_host_memory();
+    for cycle in 0..max_cycles {
+        let mut west_borrow = west_cell.as_ref().map(|c| c.borrow_mut());
+        let mut east_borrow = east_cell.as_ref().map(|c| c.borrow_mut());
+        let mut neighbors = NeighborTiles {
+            west: west_borrow.as_deref_mut().map(|b| &mut **b),
+            east: east_borrow.as_deref_mut().map(|b| &mut **b),
+        };
+        engine.step(own, &mut neighbors, &mut host_mem);
+        drop(west_borrow);
+        drop(east_borrow);
+
+        if !engine.channel_active(channel) {
+            return;
+        }
+        if matches!(engine.channel_state(channel), ChannelState::Error) {
+            panic!("DMA channel {} entered Error state at cycle {}", channel, cycle);
+        }
+    }
+    panic!("DMA channel {} did not complete within {} cycles", channel, max_cycles);
+}
+
+#[test]
+fn test_memtile_mm2s_reads_from_east_neighbor() {
+    // Verify a MemTile MM2S BD with a base_addr in the East window reads
+    // from the neighbour tile's memory, not the local memory.
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut own_tile = Tile::mem_tile(1, 1);
+    let mut east_tile = Tile::mem_tile(2, 1);
+
+    // Seed both tiles distinctly so a wrong route would be obvious.
+    own_tile.data_memory_mut()[0x100..0x110].copy_from_slice(&[0xAA; 16]);
+    east_tile.data_memory_mut()[0x100..0x110].copy_from_slice(&[0xEE; 16]);
+
+    // BD reads from East window at offset 0x100, length 16 bytes (4 words).
+    // 0x100100 = East window (0x100000) + offset 0x100.
+    let bd = BdConfig::simple_1d(0x100100, 16);
+    engine.configure_bd(0, bd).unwrap();
+    engine.start_channel(6, 0).unwrap();
+
+    run_memtile_mm2s_to_completion(
+        &mut engine, 6, &mut own_tile,
+        None, Some(&mut east_tile),
+        500,
+    );
+
+    // The four stream words must contain east_tile's 0xEE pattern.
+    let expected_word = u32::from_le_bytes([0xEE; 4]);
+    assert_eq!(engine.stream_out_len(), 4, "expected 4 stream words from east tile");
+    while let Some(w) = engine.stream_out.pop_front() {
+        assert_eq!(w.data, expected_word,
+            "stream word should carry east-neighbour byte pattern (0xEE), got 0x{:08X}", w.data);
+    }
+}
+
+#[test]
+fn test_memtile_mm2s_reads_from_west_neighbor() {
+    // Symmetric to the East test: BD with base_addr in the West window
+    // should read from the west tile's memory.
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut own_tile = Tile::mem_tile(1, 1);
+    let mut west_tile = Tile::mem_tile(0, 1);
+
+    own_tile.data_memory_mut()[0x200..0x210].copy_from_slice(&[0x11; 16]);
+    west_tile.data_memory_mut()[0x200..0x210].copy_from_slice(&[0x77; 16]);
+
+    // BD reads from West window at offset 0x200, length 16 bytes.
+    // 0x000200 = West window (0x000000) + offset 0x200.
+    let bd = BdConfig::simple_1d(0x000200, 16);
+    engine.configure_bd(0, bd).unwrap();
+    engine.start_channel(6, 0).unwrap();
+
+    run_memtile_mm2s_to_completion(
+        &mut engine, 6, &mut own_tile,
+        Some(&mut west_tile), None,
+        500,
+    );
+
+    let expected_word = u32::from_le_bytes([0x77; 4]);
+    assert_eq!(engine.stream_out_len(), 4, "expected 4 stream words from west tile");
+    while let Some(w) = engine.stream_out.pop_front() {
+        assert_eq!(w.data, expected_word,
+            "stream word should carry west-neighbour byte pattern (0x77), got 0x{:08X}", w.data);
+    }
+}
+
+#[test]
+fn test_memtile_s2mm_writes_to_east_neighbor() {
+    // S2MM with a BD in the East window should land bytes in the east
+    // neighbour's data memory, leaving the local tile untouched.
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut own_tile = Tile::mem_tile(1, 1);
+    let mut east_tile = Tile::mem_tile(2, 1);
+
+    // Pre-fill both tiles with sentinels so a wrong write target is obvious.
+    own_tile.data_memory_mut()[0x300..0x310].copy_from_slice(&[0x55; 16]);
+    east_tile.data_memory_mut()[0x300..0x310].copy_from_slice(&[0x00; 16]);
+
+    // Push 4 stream words for a 16-byte S2MM transfer on channel 0.
+    let payload_word = u32::from_le_bytes([0xC3; 4]);
+    for i in 0..4 {
+        engine.push_stream_in(StreamData {
+            data: payload_word,
+            tlast: i == 3,
+            channel: 0,
+        });
+    }
+
+    // BD writes into the East window at offset 0x300, length 16.
+    // 0x100300 = East window (0x100000) + offset 0x300.
+    let bd = BdConfig::simple_1d(0x100300, 16);
+    engine.configure_bd(0, bd).unwrap();
+    engine.start_channel(0, 0).unwrap();
+
+    run_memtile_mm2s_to_completion(
+        &mut engine, 0, &mut own_tile,
+        None, Some(&mut east_tile),
+        500,
+    );
+
+    // East tile should now hold the payload at offset 0x300.
+    let east_data = &east_tile.data_memory()[0x300..0x310];
+    assert!(east_data.iter().all(|&b| b == 0xC3),
+        "east neighbour memory should hold S2MM payload (0xC3), got {:?}", east_data);
+
+    // Own tile must remain untouched at the same offset.
+    let own_data = &own_tile.data_memory()[0x300..0x310];
+    assert!(own_data.iter().all(|&b| b == 0x55),
+        "own tile memory should be unchanged (0x55), got {:?}", own_data);
+}
+
+#[test]
+fn test_memtile_mm2s_missing_east_neighbour_records_fatal_error() {
+    // A BD that targets the East window when no east tile is wired up
+    // must record a fatal error rather than silently reading own/west data.
+    let mut engine = DmaEngine::new_mem_tile(3, 1);  // last col, no east
+    let mut own_tile = Tile::mem_tile(3, 1);
+    own_tile.data_memory_mut()[0x100..0x110].copy_from_slice(&[0x42; 16]);
+
+    let bd = BdConfig::simple_1d(0x100100, 16);  // East window
+    engine.configure_bd(0, bd).unwrap();
+    engine.start_channel(6, 0).unwrap();
+
+    let mut neighbors = NeighborTiles::empty();
+    let mut host_mem = make_host_memory();
+    // Step until channel reports Error or we exhaust attempts.
+    for _ in 0..500 {
+        engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
+        if matches!(engine.channel_state(6), ChannelState::Error) {
+            break;
+        }
+        if !engine.channel_active(6) {
+            break;
+        }
+    }
+
+    assert!(!engine.fatal_errors.is_empty(),
+        "expected fatal_errors to record missing-east-neighbour, got none");
+    assert!(
+        engine.fatal_errors.iter().any(|e| e.contains("East neighbour")),
+        "fatal_errors should mention East neighbour, got: {:?}",
+        engine.fatal_errors,
+    );
 }
 
 #[test]
