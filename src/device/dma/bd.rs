@@ -205,9 +205,26 @@ impl BufferDescriptor {
             lock_acq_value: sign_extend_7bit(lay.lock_acq_value.extract(w5) as u8),
             lock_acq_id: lay.lock_acq_id.extract(w5) as u8,
 
-            // Not used in compute tile
+            // Compute tile BDs have D2_Stepsize but no D2_Wrap register
+            // field. Like shim tiles, the D2 iteration count is implicit:
+            // d2_wrap = buffer_length / (d0_size * d1_size).
             d3_stepsize: 0,
-            d2_wrap: 0,
+            d2_wrap: {
+                let d0_sz = lay.d0_wrap.extract(w3) as u32;
+                let d1_sz = lay.d1_wrap.extract(w3) as u32;
+                let buf_len = lay.buffer_length.extract(w0);
+                let d2_step = lay.d2_stepsize.extract(w3) + 1;
+                if d0_sz > 0 && d1_sz > 0 && d2_step > 0 {
+                    let page_size = d0_sz * d1_sz;
+                    if page_size > 0 && buf_len > page_size {
+                        (buf_len / page_size) as u16
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            },
             d0_zero_before: 0,
             d0_zero_after: 0,
             d1_zero_before: 0,
@@ -481,6 +498,37 @@ impl BufferDescriptor {
 
         let d3_stride = (self.d3_stepsize as i32) * 4;
 
+        // MemTile BDs support 4 explicit dimensions per aie-rt
+        // `AieMlMemTileMultiDimProp`: D0/D1/D2 have (wrap, stepsize)
+        // register fields, but D3 has only a stepsize -- its size is
+        // implicit from buffer_length / (d0_size * d1_size * d2_size).
+        // This mirrors the derivation we already do for d2_wrap on
+        // compute/shim BDs (which lack a d2_wrap register). Without
+        // this, a BD configured with 4D addressing underruns: the
+        // address generator finishes after d0*d1*d2 words and
+        // `current()` returns the stuck-at-last address for every
+        // subsequent word (observed as repeated `0x27` in
+        // dma_complex_dims).
+        //
+        // For simple transfers where length == d0*d1*d2, d3 stays 0
+        // (effective 1) so the dim product is unchanged. Guarded by
+        // d3_stepsize > 0 to restrict this to MemTile BDs: compute and
+        // shim parsers explicitly set d3_stepsize = 0 since those tile
+        // types have no D3 register field.
+        let d3_size = if self.d3_stepsize > 0 {
+            let d0_eff = if d0_size == 0 { 1 } else { d0_size };
+            let d1_eff = if d1_size == 0 { 1 } else { d1_size };
+            let d2_eff = if d2_size == 0 { 1 } else { d2_size };
+            let product = d0_eff * d1_eff * d2_eff;
+            if product > 0 && self.length_words > product {
+                self.length_words / product
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
         // IterationConfig uses stored-1 convention: wrap=0 means 1 iteration,
         // stepsize is also stored-1. BufferDescriptor already has actual values
         // (e.g., iteration_wrap=3 means 3 iterations). Convert back.
@@ -503,7 +551,7 @@ impl BufferDescriptor {
             d0: DimensionConfig { size: d0_size, stride: d0_stride },
             d1: DimensionConfig { size: d1_size, stride: d1_stride },
             d2: DimensionConfig { size: d2_size, stride: d2_stride },
-            d3: DimensionConfig { size: 0, stride: d3_stride },
+            d3: DimensionConfig { size: d3_size, stride: d3_stride },
             iteration,
             compression_enable: self.compression_enable,
             zero_padding: {
@@ -862,6 +910,8 @@ mod tests {
         assert_eq!(cfg.d1.stride, 8 * 4);
         assert_eq!(cfg.d2.size, 2);
         assert_eq!(cfg.d2.stride, 16 * 4);
+        // D3 size is implicit: length_words / (d0 * d1 * d2) = 256 / 128 = 2.
+        assert_eq!(cfg.d3.size, 2);
         assert_eq!(cfg.d3.stride, 32 * 4);
 
         // Iteration: actual values -> stored-1 convention
@@ -1009,6 +1059,110 @@ mod tests {
 
         let bd = BufferDescriptor::from_registers(&words, TileType::Shim);
         assert_eq!(bd.d2_wrap, 0, "simple 1D should have d2_wrap=0");
+    }
+
+    /// MemTile BD: D3 size is implicit, derived from
+    /// buffer_length / (d0_size * d1_size * d2_size).
+    ///
+    /// Per aie-rt `AieMlMemTileMultiDimProp`, MemTile BDs support 4
+    /// explicit dimensions, but D3 has only a StepSize register --
+    /// its size is implicit. This mirrors the derivation used by
+    /// compute/shim BDs for d2_wrap (which also lack a register
+    /// field for their outermost dim size).
+    ///
+    /// Reproduces the dma_complex_dims failure mode: a 4D objectfifo
+    /// [<size=4,stride=40>, <size=1,stride=5>, <size=8,stride=5>,
+    /// <size=5,stride=1>] must fully tile 160 i32 words with no
+    /// underrun.
+    #[test]
+    fn test_memtile_bd_implicit_d3_size() {
+        // Simulates mem_to_comp producer BD for dma_complex_dims:
+        //   MLIR dims (outermost->innermost): 4/40, 1/5, 8/5, 5/1
+        //   Hardware mapping:
+        //     D0: wrap=5, step stored=0 (actual=1 word = 4 bytes)
+        //     D1: wrap=8, step stored=4 (actual=5 words = 20 bytes)
+        //     D2: wrap=1, step stored=4 (actual=5 words = 20 bytes)
+        //     D3: step stored=39 (actual=40 words = 160 bytes), size implicit
+        //     length=160 words, addr=0xA0000/4=0x28000
+        //
+        // AM025 MemTile BD bit positions:
+        //   BD_0: Buffer_Length[16:0]
+        //   BD_1: Base_Address[18:0]
+        //   BD_2: D0_Stepsize[16:0], D0_Wrap[26:17]
+        //   BD_3: D1_Stepsize[16:0], D1_Wrap[26:17]
+        //   BD_4: D2_Stepsize[16:0], D2_Wrap[26:17]
+        //   BD_5: D3_Stepsize[16:0]     (no D3_Wrap -- size is implicit)
+        //   BD_7: Valid_BD[31]
+        let words: [u32; 8] = [
+            160,                              // BD_0: buffer_length = 160 words
+            0x2_8000,                         // BD_1: base_address = 0x28000
+            (5u32 << 17) | 0,                 // BD_2: d0_wrap=5, d0_step stored=0
+            (8u32 << 17) | 4,                 // BD_3: d1_wrap=8, d1_step stored=4
+            (1u32 << 17) | 4,                 // BD_4: d2_wrap=1, d2_step stored=4
+            39,                               // BD_5: d3_step stored=39 (actual=40)
+            0,                                // BD_6: no iteration
+            1u32 << 31,                       // BD_7: valid=1
+        ];
+
+        let bd = BufferDescriptor::from_registers(&words, TileType::MemTile);
+        assert_eq!(bd.d0_wrap, 5);
+        assert_eq!(bd.d1_wrap, 8);
+        assert_eq!(bd.d2_wrap, 1);
+        assert_eq!(bd.d0_stepsize, 1);
+        assert_eq!(bd.d1_stepsize, 5);
+        assert_eq!(bd.d2_stepsize, 5);
+        assert_eq!(bd.d3_stepsize, 40);
+        assert_eq!(bd.length_words, 160);
+
+        let cfg = bd.to_bd_config();
+        // D3 size must be derived: 160 / (5 * 8 * 1) = 4.
+        assert_eq!(cfg.d3.size, 4, "d3 size should be 160/(5*8*1)=4");
+        assert_eq!(cfg.d3.stride, 40 * 4, "d3 stride in bytes");
+
+        // Total elements across all 4 dims must match length_words so the
+        // address generator produces all 160 addresses, not 40.
+        let total: u32 = cfg.d0.effective_size()
+            * cfg.d1.effective_size()
+            * cfg.d2.effective_size()
+            * cfg.d3.effective_size();
+        assert_eq!(total, cfg.length / 4, "dim product must match length/4");
+    }
+
+    /// MemTile BD: for simple 1D transfers where length_words equals
+    /// d0*d1*d2, d3.size stays 0 (effective 1) so the dim product
+    /// matches length exactly without spurious d3 iterations.
+    #[test]
+    fn test_memtile_bd_simple_1d_no_d3() {
+        // 1D contiguous BD: d0_wrap=64, others unused.
+        // D0_Wrap field at [26:17] per AM025.
+        let words: [u32; 8] = [
+            64,                               // length=64 words
+            0,                                // addr=0
+            (64u32 << 17) | 0,                // d0_wrap=64, d0_step stored=0
+            0,
+            0,
+            0,                                // d3_step stored=0 (actual=1 after +1)
+            0,
+            1u32 << 31,                       // valid
+        ];
+
+        // Note: parse_memtile stores d3_stepsize = extract + 1. With
+        // stored=0, actual d3_stepsize=1, which is still > 0. This
+        // matches the reset value; we want to verify that the
+        // derivation doesn't inflate d3 spuriously for simple
+        // transfers.
+        let bd = BufferDescriptor::from_registers(&words, TileType::MemTile);
+        assert_eq!(bd.d3_stepsize, 1, "d3_stepsize reset value after +1");
+
+        let cfg = bd.to_bd_config();
+        // d0=64, d1=0 (eff 1), d2=0 (eff 1). product=64. length_words=64.
+        // length_words > product is FALSE (equal), so d3_size stays 0.
+        assert_eq!(cfg.d3.size, 0, "no d3 for simple 1D transfer");
+        let total: u32 = cfg.d0.effective_size()
+            * cfg.d1.effective_size()
+            * cfg.d2.effective_size()
+            * cfg.d3.effective_size();
+        assert_eq!(total, cfg.length / 4);
     }
 
     #[test]

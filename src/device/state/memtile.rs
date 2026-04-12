@@ -229,9 +229,11 @@ impl DeviceState {
                         bd_idx, col, row, e,
                     ));
                 } else if config.valid {
-                    log::info!("CDO configured MemTile BD {} on tile ({},{}) addr=0x{:X} len={} d0=[{},{}] d1=[{},{}] acq={:?} rel={:?} next={:?} pkt={}(id={},type={})",
+                    log::info!("CDO configured MemTile BD {} on tile ({},{}) addr=0x{:X} len={} d0=[{},{}] d1=[{},{}] d2=[{},{}] d3_stride={} iter=[wrap={},step={}] acq={:?} rel={:?} next={:?} pkt={}(id={},type={})",
                         bd_idx, col, row, config.base_addr, config.length,
                         config.d0.size, config.d0.stride, config.d1.size, config.d1.stride,
+                        config.d2.size, config.d2.stride, config.d3.stride,
+                        config.iteration.wrap, config.iteration.stepsize,
                         config.acquire_lock.map(|id| (id, config.acquire_value)),
                         config.release_lock.map(|id| (id, config.release_value)),
                         config.next_bd,
