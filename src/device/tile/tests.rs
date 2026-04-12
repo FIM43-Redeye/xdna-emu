@@ -860,3 +860,25 @@ fn test_perf_counter_write_out_of_range() {
     counters.write_event_value(3, 0xFFFF);
     assert_eq!(counters.read_event_value(3), 0);
 }
+
+#[test]
+fn test_lock_release_counter() {
+    let mut tile = Tile::compute(0, 2);
+    assert_eq!(tile.lock_release_count(), 0);
+
+    // Set lock 0 to value 1 so a release (decrement) can succeed.
+    tile.locks[0].value = 1;
+
+    // Submit a release request and resolve.
+    tile.defer_core_lock_release(0, 1);
+    tile.resolve_lock_requests(0);
+
+    assert_eq!(tile.lock_release_count(), 1);
+
+    // Second release: set lock back to 1 and release again.
+    tile.locks[0].value = 1;
+    tile.defer_core_lock_release(0, 1);
+    tile.resolve_lock_requests(0);
+
+    assert_eq!(tile.lock_release_count(), 2);
+}

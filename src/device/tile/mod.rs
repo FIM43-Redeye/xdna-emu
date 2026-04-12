@@ -276,6 +276,14 @@ pub struct Tile {
     /// Each entry is (word, tlast). The header is first, followed by data
     /// words, with TLAST on the final data word.
     pub pending_ctrl_response: std::collections::VecDeque<(u32, bool)>,
+
+    /// Cumulative count of granted lock releases (core + DMA).
+    ///
+    /// Monotonically increasing. Incremented inside `resolve_lock_requests()`
+    /// whenever a release operation is granted by the lock arbiter.
+    /// Used by stall detection to distinguish 'slow but working' from
+    /// 'stuck in an infinite loop'.
+    lock_release_count: u64,
 }
 
 // Performance counter types are now in src/device/perf_counters/mod.rs.
@@ -365,6 +373,7 @@ impl Tile {
             mem_edge_detectors: [EdgeDetector::default(); 2],
             pending_broadcasts: Vec::new(),
             pending_ctrl_response: std::collections::VecDeque::new(),
+            lock_release_count: 0,
         }
     }
 
@@ -698,9 +707,12 @@ impl Tile {
     /// all lock state changes regardless of source.
     pub fn resolve_lock_requests(&mut self, cycle: u64) -> Vec<(LockRequestor, usize, bool, bool)> {
         let results = self.lock_arbiter.resolve(&mut self.locks);
-        // Emit trace events for granted lock operations.
+        // Emit trace events for granted lock operations and track releases.
         for &(_, lock_id, granted, is_acquire) in results {
             if granted {
+                if !is_acquire {
+                    self.lock_release_count += 1;
+                }
                 let event = if is_acquire {
                     EventType::LockAcquire { lock_id: lock_id as u8 }
                 } else {
@@ -738,6 +750,15 @@ impl Tile {
     #[inline]
     pub fn lock_snapshot_value(&self, lock_id: usize) -> i8 {
         self.effective_lock_value(lock_id)
+    }
+
+    /// Cumulative count of granted lock releases on this tile.
+    ///
+    /// Monotonically increasing -- incremented each time `resolve_lock_requests()`
+    /// grants a release operation. Used by stall detection.
+    #[inline]
+    pub fn lock_release_count(&self) -> u64 {
+        self.lock_release_count
     }
 
     // === Control Packet Handling ===
