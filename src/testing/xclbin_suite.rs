@@ -1180,6 +1180,18 @@ impl XclbinSuite {
                         cycles,
                     };
                 }
+                EngineStatus::Stalled => {
+                    // Stall detection fired (adaptive timeout). Treat as a
+                    // timeout -- the test suite will report failure with the
+                    // cycle count so the caller can diagnose.
+                    return TestOutcome::Fail {
+                        message: format!(
+                            "Stall detected: no progress for threshold cycles (cycle {})",
+                            cycles
+                        ),
+                        cycles,
+                    };
+                }
                 EngineStatus::Running | EngineStatus::Ready | EngineStatus::Paused => {
                     // Continue running
                 }

@@ -35,6 +35,8 @@ pub enum EngineStatus {
     Paused,
     /// All cores have halted.
     Halted,
+    /// No monotonic progress for stall_threshold cycles.
+    Stalled,
     /// Engine encountered an error.
     Error,
 }
@@ -103,14 +105,14 @@ pub struct InterpreterEngine {
     total_instructions: u64,
     /// Auto-run mode.
     auto_run: bool,
-    /// Counter for cycles with no progress while all cores halted.
-    /// Used to detect deadlock where DMAs are stalled waiting for resources.
-    no_progress_cycles: u32,
-    /// Last cycle's words routed (to detect progress).
-    last_words_routed: usize,
-    /// Last cycle's total DMA bytes transferred (to detect DMA-level progress
-    /// even when no stream words are routed -- e.g., during lock operations).
+    /// Stall detection: last observed total DMA bytes transferred.
     last_dma_bytes: u64,
+    /// Stall detection: last observed total lock releases.
+    last_lock_releases: u64,
+    /// Consecutive cycles with no monotonic progress.
+    stall_cycles: u64,
+    /// Cycles of no progress before declaring stall. 0 = disabled.
+    stall_threshold: u64,
 }
 
 impl InterpreterEngine {
@@ -148,9 +150,10 @@ impl InterpreterEngine {
             total_cycles: 0,
             total_instructions: 0,
             auto_run: false,
-            no_progress_cycles: 0,
-            last_words_routed: 0,
             last_dma_bytes: 0,
+            last_lock_releases: 0,
+            stall_cycles: 0,
+            stall_threshold: 0,
         }
     }
 
@@ -173,6 +176,11 @@ impl InterpreterEngine {
     /// Get the engine status.
     pub fn status(&self) -> EngineStatus {
         self.status
+    }
+
+    /// Set the stall detection threshold. 0 disables stall detection.
+    pub fn set_stall_threshold(&mut self, threshold: u64) {
+        self.stall_threshold = threshold;
     }
 
     /// Reset status from Halted to Running.
@@ -716,7 +724,7 @@ impl InterpreterEngine {
         // events get the correct cycle number.
         self.device.array.set_dma_cycle(self.total_cycles);
 
-        let (dma_active, streams_moved, words_routed) =
+        let (dma_active, streams_moved, _words_routed) =
             self.device.array.step_data_movement(&mut self.host_memory);
 
         // Check for fatal errors from data movement (impossible-on-hardware
@@ -977,55 +985,51 @@ impl InterpreterEngine {
         // All compute work is done when cores have halted (or none exist).
         let cores_done = if any_cores_enabled { all_halted } else { !any_running };
 
-        if cores_done {
-            // No DMA activity at all -- clean halt.
-            if !dma_active {
-                self.status = EngineStatus::Halted;
-                return;
-            }
+        if cores_done && !dma_active {
+            self.status = EngineStatus::Halted;
+            return;
+        }
 
-            // DMA still active -- check for progress or deadlock.
-            let dma_waiting = self.device.array.any_dma_waiting_for_lock();
-
-            // Progress means EITHER stream words were routed OR DMA transferred
-            // more bytes. During pipeline drainage after core completion, DMA may
-            // spend several cycles on lock acquire/release without routing stream
-            // words -- but bytes_transferred will still increase when data moves.
+        // -- Monotonic progress detection --
+        if self.stall_threshold > 0 {
             let dma_bytes = self.device.array.total_dma_bytes_transferred();
-            let making_progress = words_routed > 0
-                || dma_bytes > self.last_dma_bytes;
-            self.last_words_routed = words_routed;
-            self.last_dma_bytes = dma_bytes;
+            let lock_releases = self.device.array.total_lock_releases();
 
-            if !making_progress {
-                // DMA active but no progress this cycle
-                self.no_progress_cycles += 1;
-
-                // After 50 cycles of no progress with all work halted, give up.
-                // Lock acquire/release cycles and multi-hop stream routing can
-                // cause gaps of 10-20 cycles with no visible byte progress, so
-                // we need a generous threshold to avoid false positives.
-                if self.no_progress_cycles >= 50 {
-                    if dma_waiting {
-                        log::info!(
-                            "Engine halting after {} cycles: all cores done, DMAs stalled on unreleased locks",
-                            self.no_progress_cycles
-                        );
-                    } else {
-                        log::info!(
-                            "Engine halting after {} cycles: all cores done, DMA deadlock detected",
-                            self.no_progress_cycles
-                        );
-                    }
+            if dma_bytes > self.last_dma_bytes || lock_releases > self.last_lock_releases {
+                self.stall_cycles = 0;
+                self.last_dma_bytes = dma_bytes;
+                self.last_lock_releases = lock_releases;
+            } else {
+                self.stall_cycles += 1;
+                if self.stall_cycles >= self.stall_threshold {
+                    log::warn!(
+                        "Stall detected: no progress for {} cycles (dma_bytes={}, lock_releases={})",
+                        self.stall_cycles, dma_bytes, lock_releases,
+                    );
+                    self.status = EngineStatus::Stalled;
+                }
+            }
+        } else if cores_done && dma_active {
+            // Stall detection disabled -- fall back to simple deadlock check.
+            // Only runs while cores are done but DMA is still active.
+            let dma_bytes = self.device.array.total_dma_bytes_transferred();
+            if dma_bytes > self.last_dma_bytes {
+                self.stall_cycles = 0;
+                self.last_dma_bytes = dma_bytes;
+            } else {
+                self.stall_cycles += 1;
+                if self.stall_cycles >= 50 {
+                    log::info!(
+                        "Engine halting: all cores done, DMA stalled for {} cycles",
+                        self.stall_cycles,
+                    );
                     self.status = EngineStatus::Halted;
                 }
-            } else {
-                // Making progress - reset counter
-                self.no_progress_cycles = 0;
             }
         } else {
-            // Cores still running - reset counter
-            self.no_progress_cycles = 0;
+            // Cores still running, stall detection disabled -- reset counter
+            // so it doesn't carry over stale counts into the post-halt check.
+            self.stall_cycles = 0;
         }
     }
 
@@ -1094,7 +1098,7 @@ impl InterpreterEngine {
         for _ in 0..max_cycles {
             self.step();
 
-            if matches!(self.status, EngineStatus::Halted | EngineStatus::Error) {
+            if matches!(self.status, EngineStatus::Halted | EngineStatus::Stalled | EngineStatus::Error) {
                 break;
             }
         }
@@ -1201,6 +1205,7 @@ impl InterpreterEngine {
             EngineStatus::Running => "Running",
             EngineStatus::Paused => "Paused",
             EngineStatus::Halted => "Halted",
+            EngineStatus::Stalled => "Stalled",
             EngineStatus::Error => "Error",
         }
     }
