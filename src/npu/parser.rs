@@ -441,35 +441,31 @@ impl NpuInstructionStream {
                 }
 
                 // ConfigShimDmaBd (14) and ConfigShimDmaDmaBufBd (15) configure
-                // shim DMA BDs as complete 8-word transactions. Not yet emitted
-                // by any test binary we've seen, but supported for completeness.
+                // shim DMA BDs as complete 8-word transactions. Not yet
+                // implemented -- panic loudly so we never silently skip a BD
+                // configuration that would change DMA behavior.
                 NpuOpcode::ConfigShimDmaBd | NpuOpcode::ConfigShimDmaDmaBufBd => {
-                    log::warn!(
-                        "NPU opcode {:?} encountered but execution not implemented -- \
-                         BD words will be skipped",
-                        opcode
+                    panic!(
+                        "NPU opcode {:?} ({:#04x}) is not implemented. \
+                         This instruction configures a shim DMA BD with \
+                         multi-dimensional addressing parameters; silently \
+                         skipping it would corrupt DMA transfers. Implement \
+                         in src/npu/parser.rs and src/npu/executor.rs before \
+                         running tests that emit it.",
+                        opcode, opcode_byte
                     );
-                    let _zeros = cursor.read_u32::<LittleEndian>().ok();
-                    // Payload: 8 BD words (32 bytes) + location info
-                    let mut buf = vec![0u8; 36];
-                    cursor.read_exact(&mut buf).ok();
-                    Ok(NpuInstruction::Unknown {
-                        opcode: opcode_byte,
-                        data: buf,
-                    })
                 }
 
                 _ => {
-                    log::warn!(
-                        "NPU unknown standard opcode {} ({:#04x}), skipping",
-                        opcode_byte, opcode_byte
+                    panic!(
+                        "NPU unknown opcode {} ({:#04x}) at offset {:#X}. \
+                         Silently skipping unknown opcodes is unsafe -- they \
+                         may carry payload bytes whose absence corrupts \
+                         downstream parsing, or they may configure hardware \
+                         state that affects test results. Add a handler in \
+                         src/npu/parser.rs.",
+                        opcode_byte, opcode_byte, cursor.position().saturating_sub(4)
                     );
-                    let mut buf = vec![0u8; 8];
-                    cursor.read_exact(&mut buf).ok();
-                    Ok(NpuInstruction::Unknown {
-                        opcode: opcode_byte,
-                        data: buf,
-                    })
                 }
             }
         }
