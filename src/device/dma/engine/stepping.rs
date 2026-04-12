@@ -366,7 +366,6 @@ impl DmaEngine {
         host_memory: &mut HostMemory,
     ) -> TransferCycleResult {
         let words_per_cycle = self.timing_config.words_per_cycle as usize;
-        let bytes_per_cycle = words_per_cycle * 4;
 
         if transfer.has_zero_padding() {
             // Padding-aware path: one word at a time
@@ -417,38 +416,61 @@ impl DmaEngine {
                 }
             }
         } else {
-            // Standard path: transfer bytes_per_cycle at once
-            let bytes_to_transfer = bytes_per_cycle.min(transfer.remaining_bytes() as usize);
-            if bytes_to_transfer == 0 {
+            // Standard path: transfer up to words_per_cycle words this cycle.
+            //
+            // Each word's address comes from the BD's address generator so
+            // multi-dimensional stride/wrap configuration (matrix transpose,
+            // nd_memcpy_transforms, etc.) is honored. Reading the chunk
+            // linearly from a single base address would produce wrong data
+            // for any non-contiguous BD.
+            let bytes_remaining = transfer.remaining_bytes() as usize;
+            if bytes_remaining == 0 {
                 return TransferCycleResult::Continue;
             }
+            let words_this_cycle = words_per_cycle.min((bytes_remaining + 3) / 4);
 
-            let remaining_after = transfer.remaining_bytes().saturating_sub(bytes_to_transfer as u64);
-            let addr = transfer.current_address();
             let source = transfer.source;
             let dest = transfer.dest;
             let channel = transfer.channel;
-            let is_last = remaining_after == 0;
             let tlast_suppress = transfer.effective_tlast_suppress();
+            let mut fot_finished = false;
 
-            let result = self.do_transfer(
-                source, dest, addr, bytes_to_transfer, channel,
-                is_last, tlast_suppress, tile, host_memory,
-            );
+            for w in 0..words_this_cycle {
+                let addr = transfer.current_address();
+                let is_last = transfer.remaining_bytes() <= 4;
 
-            if result.stall {
-                return TransferCycleResult::Stalled;
-            }
-            if result.success {
-                transfer.advance(bytes_to_transfer as u64);
-                self.channels[ch_idx].stats.bytes_transferred += bytes_to_transfer as u64;
-                if result.fot_finish {
-                    TransferCycleResult::FotFinish
-                } else {
-                    TransferCycleResult::Continue
+                let result = self.do_transfer(
+                    source, dest, addr, 4, channel,
+                    is_last, tlast_suppress, tile, host_memory,
+                );
+
+                if result.stall {
+                    // Mid-chunk stall: if any word made it through this
+                    // cycle, report Continue so progress is visible; if
+                    // we stalled on the very first word, report Stalled.
+                    return if w == 0 {
+                        TransferCycleResult::Stalled
+                    } else {
+                        TransferCycleResult::Continue
+                    };
                 }
+                if !result.success {
+                    return TransferCycleResult::Error;
+                }
+
+                transfer.advance(4);
+                self.channels[ch_idx].stats.bytes_transferred += 4;
+
+                if result.fot_finish {
+                    fot_finished = true;
+                    break;
+                }
+            }
+
+            if fot_finished {
+                TransferCycleResult::FotFinish
             } else {
-                TransferCycleResult::Error
+                TransferCycleResult::Continue
             }
         }
     }
@@ -690,6 +712,7 @@ impl DmaEngine {
 
         log::debug!("DMA({},{}) MM2S ch{}: addr=0x{:X} offset=0x{:X} bytes={} words={}",
             self.col, self.row, channel, addr, offset, bytes, word_count);
+
 
         for i in 0..word_count {
             let word_offset = offset + i * 4;
