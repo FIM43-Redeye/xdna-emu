@@ -35,7 +35,7 @@ pub use neighbor::NeighborMemory;
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{ElementType, MemWidth, Operand, PostModify, SlotIndex, SlotOp};
 use crate::interpreter::state::ExecutionContext;
-use crate::interpreter::timing::{LATENCY_MEMORY, CROSS_TILE_LATENCY, MemoryQuadrant};
+use crate::interpreter::timing::{LATENCY_MEMORY, MemoryQuadrant};
 use crate::tablegen::SemanticOp;
 
 /// Offset mask for extracting the local address within a tile's memory.
@@ -60,20 +60,19 @@ fn decode_data_address(addr: u32) -> (MemoryQuadrant, usize) {
     (MemoryQuadrant::from_address(addr), offset)
 }
 
-/// Compute the total load latency for a data memory address.
+/// Compute the load latency for a core data memory access.
 ///
-/// Local memory uses the base LATENCY_MEMORY (7 cycles).
-/// Cross-tile accesses add CROSS_TILE_LATENCY (4 cycles) per hop
-/// to model the routing delay through the stream switch.
+/// On AIE2, all data memory accesses (local and cross-tile neighbor) have the
+/// same pipeline depth (7 cycles). The core accesses neighbor memory modules
+/// through direct ports, NOT through the stream switch. Cross-tile routing
+/// latency applies only to DMA transfers, not core load/store operations.
+///
+/// The Chess compiler schedules load-use distances based on this uniform
+/// latency; adding extra cycles for cross-tile accesses causes pipeline
+/// hazards where stores read stale register values.
 #[inline]
-fn load_latency_for_address(addr: u32) -> u64 {
-    let (quadrant, _) = decode_data_address(addr);
-    let base = LATENCY_MEMORY as u64;
-    if quadrant == MemoryQuadrant::Local {
-        base
-    } else {
-        base + CROSS_TILE_LATENCY as u64
-    }
+fn load_latency_for_address(_addr: u32) -> u64 {
+    LATENCY_MEMORY as u64
 }
 
 // NeighborMemory is in neighbor.rs
@@ -210,7 +209,7 @@ impl MemoryUnit {
                     .map(|d| format!("{:?}", d))
                     .unwrap_or_default();
                 crate::debug::watch::log_core_load(
-                    ctx.cycles, ctx.pc(), addr as u64, vec_data[0], &dest_str,
+                    ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, vec_data[0], &dest_str,
                 );
             }
             if let Some(dest) = &op.dest {
@@ -230,7 +229,7 @@ impl MemoryUnit {
                     .map(|d| format!("{:?}", d))
                     .unwrap_or_default();
                 crate::debug::watch::log_core_load(
-                    ctx.cycles, ctx.pc(), addr as u64, vec_data[0], &dest_str,
+                    ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, vec_data[0], &dest_str,
                 );
             }
             if let Some(dest) = &op.dest {
@@ -263,7 +262,7 @@ impl MemoryUnit {
                     .map(|d| format!("{:?}", d))
                     .unwrap_or_default();
                 crate::debug::watch::log_core_load(
-                    ctx.cycles, ctx.pc(), addr as u64, value as u32, &dest_str,
+                    ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, value as u32, &dest_str,
                 );
             }
             Self::write_dest_with_latency(op, ctx, value, width, latency);
@@ -299,7 +298,7 @@ impl MemoryUnit {
             if let Some(ref data) = vec_data {
                 if crate::debug::watch::is_watched(addr as u64, if width == MemWidth::QuadWord { 16 } else { 32 }) {
                     crate::debug::watch::log_core_store(
-                        ctx.cycles, ctx.pc(), addr as u64, data[0],
+                        ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, data[0],
                     );
                 }
                 if width == MemWidth::QuadWord {
@@ -325,7 +324,7 @@ impl MemoryUnit {
                 let value = Self::get_store_value(op, ctx, width);
                 if crate::debug::watch::is_watched(addr as u64, width.bytes() as usize) {
                     crate::debug::watch::log_core_store(
-                        ctx.cycles, ctx.pc(), addr as u64, value as u32,
+                        ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, value as u32,
                     );
                 }
                 Self::write_memory(tile, addr, value, width, neighbors);
@@ -372,7 +371,7 @@ impl MemoryUnit {
                 .map(|d| format!("{:?}", d))
                 .unwrap_or_default();
             crate::debug::watch::log_core_load(
-                ctx.cycles, ctx.pc(), addr as u64, vec_data[0], &dest_str,
+                ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, vec_data[0], &dest_str,
             );
         }
 
@@ -430,7 +429,7 @@ impl MemoryUnit {
                 .map(|d| format!("{:?}", d))
                 .unwrap_or_default();
             crate::debug::watch::log_core_load(
-                ctx.cycles, ctx.pc(), addr as u64, vec_data[0], &dest_str,
+                ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, vec_data[0], &dest_str,
             );
         }
 
@@ -1115,7 +1114,7 @@ impl MemoryUnit {
             log::trace!("[VST] writing to addr=0x{:X} mem_width={:?}", addr, op.mem_width);
             if crate::debug::watch::is_watched(addr as u64, if op.mem_width == MemWidth::QuadWord { 16 } else { 32 }) {
                 crate::debug::watch::log_core_store(
-                    ctx.cycles, ctx.pc(), addr as u64, data[0],
+                    ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, data[0],
                 );
             }
             if op.mem_width == MemWidth::QuadWord {
@@ -1407,6 +1406,7 @@ impl MemoryUnit {
             return 0;
         };
 
+
         Self::read_from_slice(mem, offset, width)
     }
 
@@ -1508,6 +1508,7 @@ impl MemoryUnit {
             }
             // No neighbor context -- fall through to local write (legacy behavior)
         }
+
 
         // Local tile write (Local direction or no neighbor context)
         let mem = tile.data_memory_mut();
@@ -2440,23 +2441,25 @@ mod tests {
     }
 
     #[test]
-    fn test_load_latency_local_vs_cross_tile() {
-        use crate::interpreter::timing::CROSS_TILE_LATENCY;
+    fn test_load_latency_uniform_for_all_quadrants() {
+        // On AIE2, core loads have the same pipeline latency for ALL data
+        // memory quadrants. The core accesses neighbor memory through direct
+        // ports, not the stream switch, so there is no cross-tile routing
+        // penalty for core load/store operations.
 
-        // Local memory (CardDir 7 = East = local): base latency only
+        // Local memory (CardDir 7 = East = local)
         assert_eq!(load_latency_for_address(0x70000), LATENCY_MEMORY as u64);
         assert_eq!(load_latency_for_address(0x7FFFF), LATENCY_MEMORY as u64);
 
-        // West neighbor (CardDir 5): base + cross-tile
-        let expected_cross = LATENCY_MEMORY as u64 + CROSS_TILE_LATENCY as u64;
-        assert_eq!(load_latency_for_address(0x50000), expected_cross);
-        assert_eq!(load_latency_for_address(0x5FFFF), expected_cross);
+        // West neighbor (CardDir 5): same latency as local
+        assert_eq!(load_latency_for_address(0x50000), LATENCY_MEMORY as u64);
+        assert_eq!(load_latency_for_address(0x5FFFF), LATENCY_MEMORY as u64);
 
-        // North neighbor (CardDir 6): base + cross-tile
-        assert_eq!(load_latency_for_address(0x60000), expected_cross);
+        // North neighbor (CardDir 6): same latency as local
+        assert_eq!(load_latency_for_address(0x60000), LATENCY_MEMORY as u64);
 
-        // South neighbor (CardDir 4): base + cross-tile
-        assert_eq!(load_latency_for_address(0x40000), expected_cross);
+        // South neighbor (CardDir 4): same latency as local
+        assert_eq!(load_latency_for_address(0x40000), LATENCY_MEMORY as u64);
 
         // CardDir 7 at different offset: still local
         assert_eq!(load_latency_for_address(0x70440), LATENCY_MEMORY as u64);
@@ -2980,5 +2983,67 @@ mod tests {
             .collect();
         assert_eq!(&output[..], &input_data[..],
             "UPS->SRS with s0=0 (hw init) should round-trip correctly");
+    }
+
+    // --- Cross-tile load pipeline hazard regression test ---
+
+    #[test]
+    fn test_cross_tile_load_completes_at_same_latency_as_local() {
+        // Regression test for cross-tile load latency bug.
+        //
+        // On AIE2, core loads from neighbor memory have the SAME pipeline
+        // latency as local loads (7 cycles). The Chess compiler schedules
+        // load-use distances accordingly. If the emulator adds extra latency
+        // for cross-tile loads, stores scheduled at cycle+7 read stale
+        // register values (the load hasn't written back yet).
+        //
+        // This test verifies: a cross-tile load into r0, committed after
+        // exactly LATENCY_MEMORY cycles, produces the correct value.
+        let mut device = crate::device::DeviceState::new_npu1();
+
+        // Write a known value to the west neighbor's memory (tile 0,3)
+        let test_value: u32 = 0xDEAD_BEEF;
+        if let Some(west) = device.tile_mut(0, 3) {
+            west.write_data_u32(0xA00, test_value);
+        }
+
+        // Set up execution context for tile (1,3)
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(1, 3);
+
+        // Pre-load r0 with a stale value (this is what the bug exposed:
+        // the store would read this stale value instead of the loaded one)
+        ctx.scalar.write(0, 0x00000003);
+
+        // Point p0 at the west neighbor address: 0x50A00 (CardDir 5, offset 0xA00)
+        ctx.pointer.write(0, 0x50A00);
+
+        // Build neighbor snapshot
+        let mut nbr = NeighborMemory::new(1, 3);
+        nbr.ensure_snapshot(MemoryQuadrant::West, &device);
+
+        // Execute: r0 = [p0] (load from west neighbor)
+        let load_op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0));
+
+        let issue_cycle = ctx.cycles;
+        MemoryUnit::execute(&load_op, &mut ctx, &mut tile, Some(&mut nbr));
+
+        // The load should NOT be visible yet (it's queued in the pipeline)
+        assert_eq!(ctx.scalar.read(0), 0x00000003,
+            "Load should not be committed immediately (pipeline latency)");
+
+        // Advance to exactly LATENCY_MEMORY cycles after issue and commit.
+        // This is the cycle where hardware makes the value available and
+        // where the compiler schedules dependent instructions.
+        ctx.cycles = issue_cycle + LATENCY_MEMORY as u64;
+        ctx.commit_pending_writes();
+
+        // The loaded value must be visible now -- at the SAME latency as
+        // a local load. If cross-tile loads had extra latency, this would
+        // still show the stale value (0x00000003).
+        assert_eq!(ctx.scalar.read(0), test_value,
+            "Cross-tile load must complete at LATENCY_MEMORY cycles, same as local");
     }
 }

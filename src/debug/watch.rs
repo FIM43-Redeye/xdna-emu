@@ -151,12 +151,14 @@ pub fn is_watched(addr: u64, len: usize) -> bool {
 /// Log a core load that hit a watch range.
 ///
 /// ```text
-/// [WATCH] cycle=283 CORE-LD  pc=0x1A0 addr=0x0C000 value=0x00000001 -> ScalarReg(24)
+/// [WATCH] cycle=283 tile=(0,2) CORE-LD  pc=0x1A0 addr=0x0C000 value=0x00000001 -> ScalarReg(24)
 /// ```
-pub fn log_core_load(cycle: u64, pc: u32, addr: u64, value: u32, dest: &str) {
+pub fn log_core_load(cycle: u64, col: u8, row: u8, pc: u32, addr: u64, value: u32, dest: &str) {
     log::info!(
-        "[WATCH] cycle={} CORE-LD  pc=0x{:X} addr=0x{:05X} value=0x{:08X} -> {}",
+        "[WATCH] cycle={} tile=({},{}) CORE-LD  pc=0x{:X} addr=0x{:05X} value=0x{:08X} -> {}",
         cycle,
+        col,
+        row,
         pc,
         addr,
         value,
@@ -167,12 +169,14 @@ pub fn log_core_load(cycle: u64, pc: u32, addr: u64, value: u32, dest: &str) {
 /// Log a core store that hit a watch range.
 ///
 /// ```text
-/// [WATCH] cycle=283 CORE-ST  pc=0x1B4 addr=0x00400 value=0x00000005
+/// [WATCH] cycle=283 tile=(0,2) CORE-ST  pc=0x1B4 addr=0x00400 value=0x00000005
 /// ```
-pub fn log_core_store(cycle: u64, pc: u32, addr: u64, value: u32) {
+pub fn log_core_store(cycle: u64, col: u8, row: u8, pc: u32, addr: u64, value: u32) {
     log::info!(
-        "[WATCH] cycle={} CORE-ST  pc=0x{:X} addr=0x{:05X} value=0x{:08X}",
+        "[WATCH] cycle={} tile=({},{}) CORE-ST  pc=0x{:X} addr=0x{:05X} value=0x{:08X}",
         cycle,
+        col,
+        row,
         pc,
         addr,
         value
