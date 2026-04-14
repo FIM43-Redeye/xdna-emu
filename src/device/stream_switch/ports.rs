@@ -140,16 +140,19 @@ impl StreamPort {
     }
 
     /// Check if FIFO has data.
+    #[inline]
     pub fn has_data(&self) -> bool {
         !self.fifo.is_empty()
     }
 
     /// Check if FIFO can accept more data.
+    #[inline]
     pub fn can_accept(&self) -> bool {
         self.fifo.len() < self.fifo_capacity
     }
 
     /// Check if FIFO is full (backpressure).
+    #[inline]
     pub fn is_full(&self) -> bool {
         self.fifo.len() >= self.fifo_capacity
     }
@@ -205,16 +208,19 @@ impl StreamPort {
     }
 
     /// Peek at front of FIFO without removing.
+    #[inline]
     pub fn peek(&self) -> Option<u32> {
         self.fifo.front().copied()
     }
 
     /// Peek at front TLAST flag without removing.
+    #[inline]
     pub fn peek_tlast(&self) -> Option<bool> {
         self.tlast_flags.front().copied()
     }
 
     /// Get number of items in FIFO.
+    #[inline]
     pub fn fifo_level(&self) -> usize {
         self.fifo.len()
     }
