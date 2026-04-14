@@ -1,6 +1,7 @@
 //! Port types and stream port implementation.
 
 use crate::arch::timing as arch_timing;
+use std::collections::VecDeque;
 
 /// Stream port direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,11 +80,12 @@ pub struct StreamPort {
     pub direction: PortDirection,
     /// Port type
     pub port_type: PortType,
-    /// FIFO buffer (data waiting to be sent/received)
-    pub fifo: Vec<u32>,
+    /// FIFO buffer (data waiting to be sent/received).
+    /// `VecDeque` because FIFO pop is the hot path and `Vec::remove(0)` is O(n).
+    pub fifo: VecDeque<u32>,
     /// TLAST flags parallel to `fifo` -- true if word at same index has TLAST set.
-    /// Kept in lock-step: push/pop/clear update both vectors together.
-    tlast_flags: Vec<bool>,
+    /// Kept in lock-step: push/pop/clear update both deques together.
+    tlast_flags: VecDeque<bool>,
     /// FIFO capacity
     pub fifo_capacity: usize,
     /// Raw configuration register value (from CDO)
@@ -124,8 +126,8 @@ impl StreamPort {
             index,
             direction,
             port_type,
-            fifo: Vec::with_capacity(fifo_capacity),
-            tlast_flags: Vec::with_capacity(fifo_capacity),
+            fifo: VecDeque::with_capacity(fifo_capacity),
+            tlast_flags: VecDeque::with_capacity(fifo_capacity),
             fifo_capacity,
             config: 0,
             route_to: None,
@@ -155,8 +157,8 @@ impl StreamPort {
     /// Push data into FIFO (returns false if full). TLAST defaults to false.
     pub fn push(&mut self, data: u32) -> bool {
         if self.can_accept() {
-            self.fifo.push(data);
-            self.tlast_flags.push(false);
+            self.fifo.push_back(data);
+            self.tlast_flags.push_back(false);
             self.cycle_active = true;
             true
         } else {
@@ -167,8 +169,8 @@ impl StreamPort {
     /// Push data with explicit TLAST flag (returns false if full).
     pub fn push_with_tlast(&mut self, data: u32, tlast: bool) -> bool {
         if self.can_accept() {
-            self.fifo.push(data);
-            self.tlast_flags.push(tlast);
+            self.fifo.push_back(data);
+            self.tlast_flags.push_back(tlast);
             self.cycle_active = true;
             if tlast {
                 self.cycle_tlast = true;
@@ -184,8 +186,8 @@ impl StreamPort {
         if self.fifo.is_empty() {
             None
         } else {
-            self.tlast_flags.remove(0);
-            Some(self.fifo.remove(0))
+            self.tlast_flags.pop_front();
+            self.fifo.pop_front()
         }
     }
 
@@ -194,22 +196,22 @@ impl StreamPort {
         if self.fifo.is_empty() {
             None
         } else {
-            let tlast = self.tlast_flags.remove(0);
+            let tlast = self.tlast_flags.pop_front().unwrap_or(false);
             if tlast {
                 self.cycle_tlast = true;
             }
-            Some((self.fifo.remove(0), tlast))
+            self.fifo.pop_front().map(|d| (d, tlast))
         }
     }
 
     /// Peek at front of FIFO without removing.
     pub fn peek(&self) -> Option<u32> {
-        self.fifo.first().copied()
+        self.fifo.front().copied()
     }
 
     /// Peek at front TLAST flag without removing.
     pub fn peek_tlast(&self) -> Option<bool> {
-        self.tlast_flags.first().copied()
+        self.tlast_flags.front().copied()
     }
 
     /// Get number of items in FIFO.

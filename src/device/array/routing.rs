@@ -2,6 +2,31 @@
 
 use super::*;
 use crate::arch::stream_switch::{compute, mem_tile, shim};
+use crate::device::stream_switch::PortType;
+use std::fmt;
+
+/// Lazily-formatted description of a DMA MM2S -> stream switch slave route.
+///
+/// The description is only used in a `log::info!` call, which short-circuits
+/// when the log level is disabled. Using an enum with a `Display` impl avoids
+/// allocating a formatted `String` on every routed word when logging is off.
+enum Mm2sRouteDesc {
+    ShimMux { channel: u8 },
+    ShimFallbackSouthNorth,
+    DmaPort { channel: u8, port_type: PortType },
+}
+
+impl fmt::Display for Mm2sRouteDesc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShimMux { channel } => write!(f, "Shim Mux MM2S ch{}", channel),
+            Self::ShimFallbackSouthNorth => f.write_str("fallback South->North"),
+            Self::DmaPort { channel, port_type } => {
+                write!(f, "ch {}, type={:?}", channel, port_type)
+            }
+        }
+    }
+}
 
 impl TileArray {
     /// Step all per-tile stream switches.
@@ -521,7 +546,7 @@ impl TileArray {
                         .flatten();
 
                     if let Some(slave_idx) = from_mux {
-                        Some((slave_idx, format!("Shim Mux MM2S ch{}", mm2s_ch)))
+                        Some((slave_idx, Mm2sRouteDesc::ShimMux { channel: mm2s_ch as u8 }))
                     } else {
                         // Fallback: find South slave with circuit route to North
                         let mut fallback_slave = None;
@@ -537,7 +562,7 @@ impl TileArray {
                             }
                         }
                         if let Some(slave_idx) = fallback_slave {
-                            Some((slave_idx, "fallback South->North".to_string()))
+                            Some((slave_idx, Mm2sRouteDesc::ShimFallbackSouthNorth))
                         } else {
                             let msg = format!(
                                 "DMA_MM2S->TileSwitch: Shim ({},{}) no route for MM2S ch{} -- \
@@ -566,7 +591,7 @@ impl TileArray {
                     if slave_port < self.tiles[i].stream_switch.slaves.len() {
                         let port_type = self.tiles[i].stream_switch.slaves[slave_port].port_type;
                         if matches!(port_type, PortType::Dma(_)) {
-                            Some((slave_port, format!("ch {}, type={:?}", data.channel, port_type)))
+                            Some((slave_port, Mm2sRouteDesc::DmaPort { channel: data.channel, port_type }))
                         } else {
                             log::debug!("DMA_MM2S->TileSwitch: tile ({},{}) slave[{}] rejected - wrong type {:?}",
                                 col, row, slave_port, port_type);
@@ -764,7 +789,7 @@ impl TileArray {
 
                         if master_idx < self.tiles[idx].stream_switch.masters.len() {
                             let port = &self.tiles[idx].stream_switch.masters[master_idx];
-                            if let (Some(&data), Some(tlast)) = (port.fifo.first(), port.peek_tlast()) {
+                            if let (Some(&data), Some(tlast)) = (port.fifo.front(), port.peek_tlast()) {
                                 // Check if destination slave can accept
                                 if slave_idx < self.tiles[above_idx].stream_switch.slaves.len()
                                     && self.tiles[above_idx].stream_switch.slaves[slave_idx].can_accept()
@@ -808,7 +833,7 @@ impl TileArray {
 
                         if master_idx < self.tiles[idx].stream_switch.masters.len() {
                             let port = &self.tiles[idx].stream_switch.masters[master_idx];
-                            if let (Some(&data), Some(tlast)) = (port.fifo.first(), port.peek_tlast()) {
+                            if let (Some(&data), Some(tlast)) = (port.fifo.front(), port.peek_tlast()) {
                                 // Check if destination slave can accept
                                 if slave_idx < self.tiles[below_idx].stream_switch.slaves.len()
                                     && self.tiles[below_idx].stream_switch.slaves[slave_idx].can_accept()
@@ -853,7 +878,7 @@ impl TileArray {
 
                         if master_idx < self.tiles[idx].stream_switch.masters.len() {
                             let port = &self.tiles[idx].stream_switch.masters[master_idx];
-                            if let (Some(&data), Some(tlast)) = (port.fifo.first(), port.peek_tlast()) {
+                            if let (Some(&data), Some(tlast)) = (port.fifo.front(), port.peek_tlast()) {
                                 if slave_idx < self.tiles[right_idx].stream_switch.slaves.len()
                                     && self.tiles[right_idx].stream_switch.slaves[slave_idx].can_accept()
                                 {
@@ -890,7 +915,7 @@ impl TileArray {
 
                         if master_idx < self.tiles[idx].stream_switch.masters.len() {
                             let port = &self.tiles[idx].stream_switch.masters[master_idx];
-                            if let (Some(&data), Some(tlast)) = (port.fifo.first(), port.peek_tlast()) {
+                            if let (Some(&data), Some(tlast)) = (port.fifo.front(), port.peek_tlast()) {
                                 if slave_idx < self.tiles[left_idx].stream_switch.slaves.len()
                                     && self.tiles[left_idx].stream_switch.slaves[slave_idx].can_accept()
                                 {
