@@ -439,7 +439,16 @@ impl VectorAlu {
     /// VectorExtract: extract element from vector to scalar.
     ///
     /// Wide path operates on full 512-bit source.
+    ///
+    /// Writeback to scalar GPR is deferred by 2 cycles. The vec2scl functional
+    /// unit ends at pipeline stage E2 in the chess scheduler model
+    /// (`fu_vec2scl_E2` / `l_wm_copy0_v2s_scl_o_E2` in aie_ml/lib/isg/me_iss.isb),
+    /// matching II_VEXTRACT def-latency=2 in AIE2Schedule.td. Without the
+    /// deferral, kernels that overwrite a register holding a recent LDA value
+    /// (e.g., cascade matmul get-only) see the new VEXTRACT value too early
+    /// and break the consumer that was scheduled to read the LDA value first.
     pub(super) fn execute_vector_extract(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
+        const VEXTRACT_TO_GPR_LATENCY: u64 = 2;
         if op.is_wide_vector {
             // VEXTRACT operates on a full 512-bit source.
             // Cannot use fallback (execute_half twice) because the second
@@ -449,18 +458,26 @@ impl VectorAlu {
             let value = Self::extract_wide_element(&src, index, et);
             if et.bits() >= 64 {
                 // 64-bit extract: write register pair (rN, rN+1)
-                Self::write_scalar_dest(op, ctx, value as u32);
-                if let Some(Operand::ScalarReg(r)) = &op.dest {
-                    ctx.scalar.write(r + 1, (value >> 32) as u32);
+                if let Some(dest) = op.dest.clone() {
+                    ctx.queue_scalar_load(dest, value as u32, VEXTRACT_TO_GPR_LATENCY);
+                    if let Some(Operand::ScalarReg(r)) = &op.dest {
+                        ctx.queue_scalar_load(
+                            Operand::ScalarReg(r + 1),
+                            (value >> 32) as u32,
+                            VEXTRACT_TO_GPR_LATENCY,
+                        );
+                    }
                 }
-            } else {
-                Self::write_scalar_dest(op, ctx, value as u32);
+            } else if let Some(dest) = op.dest.clone() {
+                ctx.queue_scalar_load(dest, value as u32, VEXTRACT_TO_GPR_LATENCY);
             }
         } else {
             let src = Self::get_vector_source(op, ctx, 0);
             let index = Self::get_lane_index(op, ctx);
             let result = Self::vector_extract(&src, index, et);
-            Self::write_scalar_dest(op, ctx, result);
+            if let Some(dest) = op.dest.clone() {
+                ctx.queue_scalar_load(dest, result, VEXTRACT_TO_GPR_LATENCY);
+            }
         }
         true
     }
