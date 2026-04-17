@@ -86,6 +86,11 @@ fn main() {
 
     // Generate per-tile-type subsystem address ranges.
     gen_subsystems(&arch_model, &out_dir);
+
+    // Generate core module register offsets and lock-request bit constants.
+    gen_core_module(&regdb, &out_dir);
+    gen_lock_request(&regdb, &out_dir, "memory", "gen_memory_lock.rs");
+    gen_lock_request(&regdb, &out_dir, "memory_tile", "gen_memtile_lock.rs");
 }
 
 // ============================================================================
@@ -821,5 +826,225 @@ fn get_field(fields: &HashMap<String, String>, name: &str, struct_name: &str) ->
         .unwrap_or_else(|| panic!("Field '{}' not found in {}", name, struct_name));
     parse_numeric_value(val_str)
         .unwrap_or_else(|| panic!("Cannot parse '{}' = '{}' in {}", name, val_str, struct_name))
+}
+
+// ============================================================================
+// Step 1: Core module register offsets
+// ============================================================================
+
+fn gen_core_module(regdb: &regdb::RegisterDb, out_dir: &Path) {
+    let core = regdb
+        .module("core")
+        .expect("AM025 JSON missing 'core' module");
+
+    // Map of JSON register name -> Rust constant name
+    let register_map: &[(&str, &str)] = &[
+        ("Core_Control", "CORE_CONTROL"),
+        ("Core_Status", "CORE_STATUS"),
+        ("Enable_Events", "CORE_ENABLE_EVENTS"),
+        ("Reset_Event", "CORE_RESET_EVENT"),
+        ("Debug_Control0", "CORE_DEBUG_CONTROL0"),
+        ("Core_PC", "CORE_PC"),
+        ("Core_SP", "CORE_SP"),
+        ("Core_LR", "CORE_LR"),
+        ("Tile_Control", "TILE_CONTROL"),
+        ("Memory_Control", "MEMORY_CONTROL"),
+    ];
+
+    let mut out = gen_header("AM025 core module registers");
+
+    for &(json_name, const_name) in register_map {
+        let reg = core
+            .register(json_name)
+            .unwrap_or_else(|| {
+                panic!("Core register '{}' not found in AM025 JSON", json_name)
+            });
+        writeln!(out, "/// {} (AM025: {})", const_name, json_name).unwrap();
+        writeln!(out, "pub const {}: u32 = {:#07X};", const_name, reg.offset).unwrap();
+        writeln!(out).unwrap();
+    }
+
+    // Compute OFFSET_START / OFFSET_END from all non-stream-switch core registers.
+    // The core module address space runs from the lowest core register offset
+    // to just below the stream switch region (which starts at 0x3F000).
+    let core_proper_offsets: Vec<u32> = core
+        .registers
+        .iter()
+        .filter(|r| !r.name.starts_with("Stream_Switch"))
+        .map(|r| r.offset)
+        .filter(|&o| (0x30000..0x3F000).contains(&o))
+        .collect();
+
+    assert!(
+        !core_proper_offsets.is_empty(),
+        "No core-module registers found in 0x30000..0x3F000"
+    );
+
+    let min_offset = *core_proper_offsets.iter().min().unwrap();
+    // Round start down to 4K page boundary for clean dispatch
+    let offset_start = min_offset & !0xFFF;
+    // End just before stream switch region (0x3F000)
+    let offset_end = 0x3EFFF_u32;
+
+    writeln!(out, "/// Core module offset range start (derived from AM025)").unwrap();
+    writeln!(out, "pub const OFFSET_START: u32 = {:#07X};", offset_start).unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "/// Core module offset range end (before stream switch at 0x3F000)"
+    )
+    .unwrap();
+    writeln!(out, "pub const OFFSET_END: u32 = {:#07X};", offset_end).unwrap();
+
+    fs::write(out_dir.join("gen_core_module.rs"), out).unwrap();
+}
+
+// ============================================================================
+// Step 2: Lock_Request constants
+// ============================================================================
+
+fn gen_lock_request(
+    regdb: &regdb::RegisterDb,
+    out_dir: &Path,
+    module_name: &str,
+    output_file: &str,
+) {
+    let module = regdb
+        .module(module_name)
+        .unwrap_or_else(|| panic!("AM025 JSON missing '{}' module", module_name));
+
+    let lock_req = module
+        .register("Lock_Request")
+        .unwrap_or_else(|| {
+            panic!(
+                "Lock_Request register not found in '{}' module",
+                module_name
+            )
+        });
+
+    let base_offset = lock_req.offset;
+    let desc = lock_req.description.as_deref().unwrap_or("");
+
+    // Parse end address from description: "... address space: 0xBASE - 0xLAST, ..."
+    // End (exclusive) = LAST + 4 (since registers are 4-byte aligned)
+    let end_offset = parse_lock_end_address(desc, module_name);
+
+    // Parse Lock_Id bit range: "Lock_Id [high:low]"
+    let (id_high, id_low) = parse_desc_range(desc, "Lock_Id", module_name);
+    let id_shift = id_low;
+    let id_bits = id_high - id_low + 1;
+    let id_mask = (1u32 << id_bits) - 1;
+
+    // Parse Acq_Rel bit: "Acq_Rel (N)"
+    let acq_rel_bit = parse_desc_single_bit(desc, "Acq_Rel", module_name);
+
+    // Parse Change_Value range: "Change_Value [high:low]"
+    let (cv_high, cv_low) = parse_desc_range(desc, "Change_Value", module_name);
+    let cv_shift = cv_low;
+    let cv_bits = cv_high - cv_low + 1;
+    let cv_mask = (1u32 << cv_bits) - 1;
+
+    let mut out = gen_header(&format!("AM025 {}/Lock_Request", module_name));
+
+    writeln!(out, "/// Lock_Request base address").unwrap();
+    writeln!(out, "pub const LOCK_REQUEST_BASE: u32 = {:#07X};", base_offset).unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "/// Lock_Request end address (exclusive)").unwrap();
+    writeln!(out, "pub const LOCK_REQUEST_END: u32 = {:#07X};", end_offset).unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "/// Lock_Request address field: Lock_Id [{high}:{low}] ({bits} bits)",
+        high = id_high,
+        low = id_low,
+        bits = id_bits
+    )
+    .unwrap();
+    writeln!(out, "pub const LOCK_REQUEST_ID_SHIFT: u32 = {};", id_shift).unwrap();
+    writeln!(out, "pub const LOCK_REQUEST_ID_MASK: u32 = {:#X};", id_mask).unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "/// Lock_Request address field: Acq_Rel ({}) (1=acquire, 0=release)",
+        acq_rel_bit
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "pub const LOCK_REQUEST_ACQ_REL_BIT: u32 = {};",
+        acq_rel_bit
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "/// Lock_Request address field: Change_Value [{high}:{low}] ({bits} bits)",
+        high = cv_high,
+        low = cv_low,
+        bits = cv_bits
+    )
+    .unwrap();
+    writeln!(out, "pub const LOCK_REQUEST_VALUE_SHIFT: u32 = {};", cv_shift).unwrap();
+    writeln!(out, "pub const LOCK_REQUEST_VALUE_MASK: u32 = {:#X};", cv_mask).unwrap();
+
+    fs::write(out_dir.join(output_file), out).unwrap();
+}
+
+/// Parse "... 0xBASE - 0xLAST, ..." from Lock_Request description.
+/// Returns exclusive end (LAST + 4).
+fn parse_lock_end_address(desc: &str, module_name: &str) -> u32 {
+    // Pattern: "0xBASE - 0xLAST"
+    let dash_idx = desc.find(" - 0x").unwrap_or_else(|| {
+        panic!(
+            "Lock_Request in '{}' has no ' - 0x' in description: {}",
+            module_name, desc
+        )
+    });
+    let after_dash = &desc[dash_idx + 3..]; // skip " - "
+    let hex_str: String = after_dash
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit() || *c == 'x' || *c == 'X')
+        .collect();
+    let hex_str = hex_str.trim_start_matches("0x").trim_start_matches("0X");
+    let last_addr = u32::from_str_radix(hex_str, 16).unwrap_or_else(|e| {
+        panic!(
+            "Bad end address in Lock_Request description for '{}': {}",
+            module_name, e
+        )
+    });
+    last_addr + 4 // exclusive end
+}
+
+/// Parse "Name [high:low]" from description text.
+fn parse_desc_range(desc: &str, field_name: &str, module_name: &str) -> (u32, u32) {
+    let pattern = format!("{} [", field_name);
+    let start = desc.find(&pattern).unwrap_or_else(|| {
+        panic!(
+            "Field '{}' not found in Lock_Request description for '{}': {}",
+            field_name, module_name, desc
+        )
+    });
+    let after = &desc[start + pattern.len()..];
+    let bracket_end = after.find(']').unwrap();
+    let range_str = &after[..bracket_end];
+    let parts: Vec<&str> = range_str.split(':').collect();
+    assert_eq!(parts.len(), 2, "Expected high:low in '{}'", range_str);
+    let high: u32 = parts[0].parse().unwrap();
+    let low: u32 = parts[1].parse().unwrap();
+    (high, low)
+}
+
+/// Parse "Name (bit)" from description text.
+fn parse_desc_single_bit(desc: &str, field_name: &str, module_name: &str) -> u32 {
+    let pattern = format!("{} (", field_name);
+    let start = desc.find(&pattern).unwrap_or_else(|| {
+        panic!(
+            "Field '{}' not found in Lock_Request description for '{}': {}",
+            field_name, module_name, desc
+        )
+    });
+    let after = &desc[start + pattern.len()..];
+    let paren_end = after.find(')').unwrap();
+    after[..paren_end].parse().unwrap()
 }
 

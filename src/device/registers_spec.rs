@@ -55,7 +55,7 @@ pub mod memory_module {
 
     // Lock_Request register (AM025 memory_module/lock/misc.txt)
     // 16KB address space where address encodes lock operation parameters
-    include!(concat!(env!("OUT_DIR"), "/gen_memory_lock.rs"));
+    pub use xdna_archspec::aie2::registers::memory::*;
 
     // Lock overflow/underflow status register offsets are now data-driven
     // via `regdb::device_reg_layout().memory_locks_overflow` etc.
@@ -76,8 +76,8 @@ pub mod memory_module {
 
 pub mod core_module {
     //! Core module register addresses.
-    //! Generated from AM025 JSON at build time. See build.rs.
-    include!(concat!(env!("OUT_DIR"), "/gen_core_module.rs"));
+    //! Generated from AM025 JSON at build time; forwarded from xdna_archspec.
+    pub use xdna_archspec::aie2::registers::*;
 }
 
 // ============================================================================
@@ -96,7 +96,7 @@ pub mod mem_tile_module {
 
     // Lock_Request register (AM025 memory_tile_module/lock/misc.txt)
     // 64KB address space where address encodes lock operation parameters
-    include!(concat!(env!("OUT_DIR"), "/gen_memtile_lock.rs"));
+    pub use xdna_archspec::aie2::registers::mem_tile::*;
 
     // Lock overflow/underflow status register offsets are now data-driven
     // via `regdb::device_reg_layout().memtile_locks_overflow_0` etc.

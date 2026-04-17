@@ -29,6 +29,13 @@ include!(concat!(env!("OUT_DIR"), "/gen_arch.rs"));
 /// with `OFFSET_START` and `OFFSET_END` consts.
 pub mod subsystems;
 
+/// Core-module register offsets and lock-request bitfield constants.
+///
+/// Top level: core module offsets (CORE_CONTROL, CORE_STATUS, etc.) and
+/// OFFSET_START / OFFSET_END. Submodules `memory` and `mem_tile` contain
+/// Lock_Request address-encoding constants for each module type.
+pub mod registers;
+
 /// Stream switch port type identifier (xdna-emu convention, not hardware).
 ///
 /// Each port index in the port arrays maps to one of these types. This
