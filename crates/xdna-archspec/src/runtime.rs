@@ -218,7 +218,7 @@ pub struct ModelConfig {
     /// Number of memory tile rows, used to classify row numbers into tile types.
     /// Row 0 is always shim; rows 1..=num_mem_tile_rows are mem tiles;
     /// rows above are compute tiles.
-    num_mem_tile_rows: u32,
+    num_mem_tile_rows: u8,
     /// Maximum lock counter value (63 for AIE2, from device_constants).
     max_lock_value: u32,
     /// Per-tile-type parameter caches (indexed by tile kind).
@@ -341,7 +341,7 @@ impl ModelConfig {
             // column-0 convention used in CDO addressing.
             columns: topo.columns + 1,
             rows: topo.rows,
-            num_mem_tile_rows: topo.num_mem_tile_rows as u32,
+            num_mem_tile_rows: topo.num_mem_tile_rows,
             max_lock_value,
             core_params,
             mem_tile_params,
@@ -407,7 +407,7 @@ impl ArchConfig for ModelConfig {
         // Row 0 is always shim (NoC-connected on NPU; ShimPl is not modelled).
         match row {
             0 => TileKind::ShimNoc,
-            r if r <= self.num_mem_tile_rows as u8 => TileKind::Mem,
+            r if r <= self.num_mem_tile_rows => TileKind::Mem,
             _ => TileKind::Compute,
         }
     }

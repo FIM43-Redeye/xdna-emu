@@ -132,7 +132,6 @@ impl PortLayout for ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::PortLayout as _;
 
     fn npu1_config() -> ModelConfig {
         // Extract the inner ModelConfig for PortLayout impl access.
