@@ -347,3 +347,44 @@ Deep rename (`TileType::MemTile` -> `Mem`, etc.) is deferred to the Tile
 Topology subsystem pass (Subsystem 2). `ArchConfig` will take/return `TileKind`
 at its interface after Task 3 moves the trait into the crate; runtime callers
 using `TileType` convert via `.into()` at the boundary.
+
+---
+
+## Completion
+
+Phase 1a landed 2026-04-16.  Tag: `phase1a-consolidate`.
+
+### Commits
+
+| Task | Commits | Subject |
+|------|---------|---------|
+| 1 (audit) | `7231620`, `cb243a3`, `1128d1d` | docs: audit archspec consolidation surface (+ 2 corrections) |
+| 2 (type bridge) | `43fc807`, `3d0d635` | refactor: add From conversions between TileType and TileKind (+ resolution section) |
+| 3 (move trait) | `cd47426`, `aff2596` | refactor: move ArchConfig trait into xdna_archspec::runtime (+ nit fixes) |
+| 4 (migrate consumers) | `6792275`, `20d2ad1`, `05de707`, `f882c6e` | refactor: migrate device::{model,registers,state,array} to xdna_archspec |
+| 5 (delete shims) | `ff7ff8b`, `5676ef0` | refactor: delete parallel arch shims (+ stale-reference cleanup) |
+
+### Verification
+
+- `cargo test --lib`: 2798 passed, 0 failed, 5 ignored (baseline preserved)
+- `cargo build --release`: clean (pre-existing C++ FFI warnings only)
+- `cargo test -p xdna-archspec --lib`: 138 passed, 1 pre-existing `test_full_parse_all_devices` failure (device count 13 vs 12, unrelated to Phase 1a)
+- Bridge test `--no-hw` smoke (add_one, all variants): Chess 10/10 PASS, Peano 9/9 PASS
+- Full HW bridge run: deferred (30-min run; user will schedule)
+
+### Surprises and deviations
+
+- Task 1: plan's `rg` pattern missed `super::arch_config` imports; audit was updated with both greps.
+- Task 2: TileType/TileKind not structurally identical (expected a simple alias); used bidirectional `From` bridge instead.  Deep rename deferred to Tile Topology subsystem pass.
+- Task 3: `npu1()` constructor unified with npu2/xcve2802 via JSON at runtime (previously used build.rs constants). Port-layout methods stayed runtime-side as the `PortLayout` extension trait because their data comes from `crate::arch::*` (build.rs-generated, not accessible to the workspace crate).  `program_memory_size` correctness issue found in audit was fixed during the move (added `program_memory_size` field to `TileTypeParams`).
+- Task 3: renamed the trait method `tile_type()` → `tile_kind()` to match return type.
+- Task 4: `state/mod.rs` needed two imports migrated (`crate::archspec` AND `super::arch_config`), not just one.
+- Task 5: `main.rs` had a `xdna_emu::archspec::SubsystemKind` import Task 4's sweep missed; caught and fixed during deletion pass.  `arch_config.rs` was renamed to `port_layout.rs` (more accurate name).
+
+### Follow-ups flagged for Phase 1b+
+
+- Deep rename `TileType::MemTile` → `TileKind::Mem` across runtime code: deferred to Tile Topology subsystem (Subsystem 2).
+- DMA fallback `(2, 2)` in `from_arch_model()` is silent -- consider replacing with `.expect()` or `log::warn!()`.
+- `TileTypeParams` shim DMA coverage, NPU2 tile param coverage, column overflow guard -- Phase 2 hygiene.
+- Inner-scope `TileKind` imports in `model.rs` tests: consolidate in Phase 2 hygiene.
+- Import ordering in `device/array/mod.rs`: Phase 2 hygiene.
