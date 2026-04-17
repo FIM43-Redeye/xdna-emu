@@ -10,8 +10,8 @@ of the repository on 2026-04-16.
 
 Source file: `src/device/arch_config.rs`
 
-The `ArchConfig` trait is declared at line 39 and has **20 methods**: 14
-required (abstract) and 6 provided (default implementations built from the
+The `ArchConfig` trait is declared at line 39 and has **22 methods**: 17
+required (abstract) and 5 provided (default implementations built from the
 required methods).
 
 ### Required Methods
