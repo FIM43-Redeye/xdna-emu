@@ -52,7 +52,6 @@ pub mod port_layout;
 pub mod model;
 pub mod regdb;
 pub mod registers;
-pub mod registers_spec;
 pub mod tile;
 pub mod array;
 pub mod state;

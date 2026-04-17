@@ -336,8 +336,8 @@ fn validate_shim_mux_layout() {
 // ====================================================================
 // Spot-check: verify JSON field layouts match AM025 expected values.
 // These tests use inline expected values (from AM025) rather than
-// references to registers_spec.rs, since the JSON is now the single
-// authoritative source for bit field definitions.
+// hardcoded references, since the JSON is now the single authoritative
+// source for bit field definitions.
 // ====================================================================
 
 #[test]
@@ -593,7 +593,7 @@ fn validate_shim_bd_fields() {
 
 #[test]
 fn validate_core_module_registers() {
-    use crate::device::registers_spec::core_module as cm;
+    use xdna_archspec::aie2::registers as cm;
 
     let Some(db) = load_test_db() else {
         eprintln!("Skipping: register database JSON not found");

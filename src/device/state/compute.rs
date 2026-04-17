@@ -431,7 +431,7 @@ impl DeviceState {
 
     /// Write to a core register.
     pub(super) fn write_core_register(&mut self, col: u8, row: u8, offset: u32, value: u32) {
-        use crate::device::registers_spec::core_module as cm;
+        use xdna_archspec::aie2::registers as cm;
 
         let tile = match self.array.get_mut(col, row) {
             Some(t) => t,
@@ -475,7 +475,7 @@ impl DeviceState {
 
     /// Masked write to a core register.
     pub(super) fn mask_write_core_register(&mut self, col: u8, row: u8, offset: u32, mask: u32, value: u32) {
-        use crate::device::registers_spec::core_module as cm;
+        use xdna_archspec::aie2::registers as cm;
         const CORE_PROCESSOR_BUS: u32 = 0x32038;
 
         let tile = match self.array.get_mut(col, row) {

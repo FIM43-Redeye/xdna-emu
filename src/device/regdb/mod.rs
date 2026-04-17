@@ -61,8 +61,7 @@ pub fn load_for_device(device: &str) -> Result<RegisterDb, String> {
 /// resolved once at startup.
 ///
 /// Structural constants (base addresses, strides) are derived from register
-/// offsets in the JSON database, eliminating the need for hand-coded constants
-/// in `registers_spec.rs`.
+/// offsets in the JSON database, eliminating the need for hand-coded constants.
 #[derive(Debug, Clone)]
 pub struct DeviceRegLayout {
     /// Full register database (for ad-hoc lookups)
