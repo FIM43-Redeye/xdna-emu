@@ -3,35 +3,56 @@
 Recovery document for picking up this refactor in a future session. Read
 this first, then dive into the authoritative artifacts below.
 
-**Last updated:** 2026-04-17 (after Phase 1a landed)
+**Last updated:** 2026-04-17 (after Phase 1b Subsystem 1 landed, reduced scope)
 **Current branch:** `dev` (no master merges until the refactor is done)
-**Latest tag:** `phase1a-consolidate` at `6534e28`
+**Latest tag:** `phase1-subsys-regs-mem` at `8c0f217`
 
 ---
 
 ## Where We Are
 
-Phase 1a of the device-family refactor is complete. The three parallel
-arch abstractions (`xdna-archspec` crate + `src/archspec/mod.rs` +
-`src/device/arch_config.rs`) have collapsed into one: the `xdna-archspec`
-workspace crate is the single source-of-truth, and every consumer in
-`src/` imports directly from `xdna_archspec::types` or
-`xdna_archspec::runtime`. The only runtime-side remnant is
-`src/device/port_layout.rs` -- a narrow `PortLayout` extension trait for
-the six stream-switch methods whose data comes from build.rs-generated
-`crate::arch::*` and can't live in the workspace crate yet.
+Phase 1a landed at `phase1a-consolidate` (`6534e28`). Phase 1b Subsystem 1
+(Registers & Memory Map) landed at `phase1-subsys-regs-mem` (`8c0f217`)
+**with reduced scope**: Tasks 9 (gen_tablegen + build_helpers) and Task 10
+(decoder_ffi) were deferred to Subsystem 6 (ISA Decode) because both are
+coupled to xdna-emu's interpreter types (`Operand`, `MappedOperand`,
+`RegisterMap`, the tablegen `types.rs` / `resolver/` modules). Moving the
+ISA infrastructure into archspec without untangling those types would
+leave dangling cross-crate boundaries that the type system cannot enforce.
+See `docs/arch/subsys1-audit.md` (`## Task 9 Deferral`, `## Task 10 Deferral`,
+`## Task 11 Reduced Scope`) for the full reasoning.
 
-**Verification that held:**
-- `cargo test --lib`: 2798 passed, 0 failed, 5 ignored.
+**Consequence:** the original Phase 1b/1c order no longer makes sense.
+Subsystem 6 (ISA Decode) is now the immediate next step -- it has to
+complete before Subsystems 2-5 / 7-8 proceed cleanly, because a lot of the
+pending cleanup for Subsystem 1 (the 36 remaining `crate::arch::*`
+consumers, the `mod arch` forwarder in `src/lib.rs`, the `extract_aiert`
+duplication in xdna-emu/build.rs) all unblock when Subsystem 6 lands.
+
+Phase 1a (from the earlier pass): the three parallel arch abstractions
+(`xdna-archspec` crate + `src/archspec/mod.rs` + `src/device/arch_config.rs`)
+collapsed into one -- the `xdna-archspec` workspace crate is the single
+source-of-truth, and every consumer in `src/` imports directly from
+`xdna_archspec::types` or `xdna_archspec::runtime`. The port-layout
+methods in `src/device/port_layout.rs` that were once a runtime-side
+remnant have since been consolidated through the Subsystem 1 work into
+`xdna_archspec::aie2::{port_type, stream_switch}`.
+
+**Verification that held (at `phase1-subsys-regs-mem`):**
+- `cargo test --lib`: 2797 passed, 0 failed, 5 ignored. (Was 2798 before
+  Task 15; the `sign_extend_7bit` unit test living inside the deleted
+  `registers_spec.rs` correctly dissolved with the file. That function had
+  zero external consumers.)
 - `cargo build --release`: clean.
-- `cargo test -p xdna-archspec --lib`: 14 `runtime::tests` pass; 1
-  pre-existing `test_full_parse_all_devices` failure unrelated to the
-  refactor.
-- Bridge test `--no-hw` smoke (add_one): Chess 10/10 PASS, Peano 9/9 PASS.
-- Bridge test full (HW + EMU, dual-compiler, 119 tests): Chess 64/64
-  PASS, Peano 55/55 compiled with 2 pre-existing Peano-EMU timeouts
-  (`dma_task_large_linear`, `objectfifo_repeat/init_values_repeat`) and
-  1 XFAIL. **No regressions from Phase 1a.**
+- `cargo test -p xdna-archspec --lib`: 138 pass / 1 pre-existing failure
+  (`test_full_parse_all_devices`, device-count mismatch unrelated to the
+  refactor).
+- Bridge `--no-hw -v add_one`: Chess 10/10 PASS, Peano 9/9 PASS.
+- Full HW bridge + ISA suite passed at the Part A tag with baseline
+  regressions only (`bd_chain_repeat_on_memtile` fails on real NPU too, so
+  it's not an emulator regression; Peano EMU timeouts stable against
+  baseline). Part B was doc + file-dissolution only, no semantic change,
+  so the 40-minute HW run was not re-executed at the Part B tag.
 
 ---
 
@@ -128,15 +149,15 @@ when we start it -- don't try to pre-write all 8 subsystem plans.
 
 **Per-subsystem tag at end:** `phase1-subsys-<name>`.
 
-| # | Subsystem | Tag | Description |
-|---|-----------|-----|-------------|
-| 1 | Registers & Memory Map | `phase1-subsys-regs-mem` | Plumb hardcoded register offsets, memory sizes, per-tile-type counts through `ArchModel`. Mostly data; likely no new trait. |
-| 2 | Tile Topology | `phase1-subsys-tile-topo` | Replace `row == 0` / `row >= N` checks with `ArchModel`-backed classification. **Includes the deferred `TileType` -> `TileKind` deep rename**: merge `Shim`/`ShimNoc`, rename `MemTile` -> `Mem`. |
-| 3 | DMA Engine & BD Format | `phase1-subsys-dma` | First behavioral seam. Audit AIE2 vs AIE1 BD layout via aie-rt source. Lift BD parse/encode + channel stepping behind `DmaModel` trait. |
-| 4 | Locks | `phase1-subsys-locks` | Small seam exercise. `LockModel` trait if acquire/release/value semantics genuinely differ (likely around lock value width). |
-| 5 | Stream Switch | `phase1-subsys-stream-switch` | Topology (data, already via archspec) + routing legality (behavior, trait: `StreamSwitchModel`). Possibly the right moment to move `crate::arch::*` port generation into the archspec crate if AIE2P forces it. |
-| 6 | ISA Decode | `phase1-subsys-isa-decode` | Bundle/slot layout, decoder tables. 3-slot (AIE1) vs 6-slot (AIE2) is the biggest arch cliff. `IsaDecoder` trait. |
-| 7 | ISA Execute | `phase1-subsys-isa-execute` | Semantic ops, intrinsic handlers. Biggest; largest files live here (`vmac_routing.rs` 239KB, `memory/mod.rs` 124KB). `IsaExecutor` trait. |
+| # | Subsystem | Tag | Status | Description |
+|---|-----------|-----|--------|-------------|
+| 1 | Registers & Memory Map | `phase1-subsys-regs-mem` | **Done (reduced scope)** | Plumb hardcoded register offsets, memory sizes, per-tile-type counts through `ArchModel`. Mostly data; no new trait. Tasks 9+10 deferred to Subsystem 6; see audit. |
+| 6 | ISA Decode | `phase1-subsys-isa-decode` | **Up next** | Bundle/slot layout, decoder tables, decoder FFI, and the tablegen types + resolver migration that unblocks Subsystem 1's deferred Tasks 9 and 10. 3-slot (AIE1) vs 6-slot (AIE2) is the biggest arch cliff. `IsaDecoder` trait. |
+| 2 | Tile Topology | `phase1-subsys-tile-topo` | Pending | Replace `row == 0` / `row >= N` checks with `ArchModel`-backed classification. **Includes the deferred `TileType` -> `TileKind` deep rename**: merge `Shim`/`ShimNoc`, rename `MemTile` -> `Mem`. |
+| 3 | DMA Engine & BD Format | `phase1-subsys-dma` | Pending | First behavioral seam. Audit AIE2 vs AIE1 BD layout via aie-rt source. Lift BD parse/encode + channel stepping behind `DmaModel` trait. |
+| 4 | Locks | `phase1-subsys-locks` | Pending | Small seam exercise. `LockModel` trait if acquire/release/value semantics genuinely differ (likely around lock value width). |
+| 5 | Stream Switch | `phase1-subsys-stream-switch` | Pending | Topology (data, already via archspec) + routing legality (behavior, trait: `StreamSwitchModel`). |
+| 7 | ISA Execute | `phase1-subsys-isa-execute` | Pending | Semantic ops, intrinsic handlers. Biggest; largest files live here (`vmac_routing.rs` 239KB, `memory/mod.rs` 124KB). `IsaExecutor` trait. |
 | 8 | Parser (XCLBIN / PDI / ELF) | `phase1-subsys-parser` | Container format variance. `BinaryLoader` trait. |
 
 **End state after Phase 1:** adding AIE2P is "implement the traits for a
@@ -145,53 +166,74 @@ platform differences." Neither requires re-plumbing.
 
 ---
 
-## How to Pick Up Subsystem 1 (Registers & Memory Map)
+## How to Pick Up Subsystem 6 (ISA Decode)
 
 This is the concrete next action. Start here in a fresh session.
 
-1. **Read the key artifacts** (spec, plan, audit -- links above).
+1. **Read the key artifacts:**
+   - `docs/superpowers/specs/2026-04-16-device-family-refactor-design.md` (parent)
+   - `docs/superpowers/plans/2026-04-16-device-family-refactor-plan.md` (parent plan)
+   - `docs/arch/subsys1-audit.md` (includes `## Task 9 Deferral`, `## Task 10 Deferral`, and the `## Follow-ups flagged for Subsystem 6` list at the bottom)
+   - `docs/arch/registers-memory-map.md` (the Subsystem 1 design note)
+   - `docs/superpowers/plans/2026-04-17-subsys1-regs-mem.md` (Subsystem 1's plan, including its blocked Tasks 9 and 10 for reference)
 
 2. **Verify the current state hasn't drifted:**
    ```bash
-   git log --oneline phase1a-consolidate..HEAD
+   git log --oneline phase1-subsys-regs-mem..HEAD
    ```
    If nothing has landed since the tag, you're picking up exactly where
-   Phase 1a left off.
+   Subsystem 1 left off.
 
    ```bash
    cargo test --lib 2>&1 | tail -5
    ```
-   Expect: `2798 passed; 0 failed; 5 ignored`. If different, investigate
+   Expect: `2797 passed; 0 failed; 5 ignored`. If different, investigate
    before proceeding.
 
-3. **Invoke brainstorming** to shape Subsystem 1's spec:
+3. **Invoke brainstorming** to shape Subsystem 6's spec:
    ```
    /brainstorming
    ```
-   Topic: "Phase 1b Subsystem 1: Registers & Memory Map." The
-   brainstorming should produce a spec at
-   `docs/superpowers/specs/YYYY-MM-DD-subsys1-regs-mem-design.md`.
+   Topic: "Phase 1b Subsystem 6: ISA Decode, plus Subsystem 1 leftovers."
+   The brainstorming should produce a spec at
+   `docs/superpowers/specs/YYYY-MM-DD-subsys6-isa-decode-design.md`.
 
-   **Shape the spec around these questions:**
-   - Where are register offsets currently hardcoded in `src/device/`?
-   - Where are per-tile-type memory sizes hardcoded (not already through
-     `ArchConfig::data_memory_size` / `program_memory_size`)?
-   - Does anything bypass `ArchModel` and read from `crate::arch::*`
-     directly outside `port_layout.rs`?
-   - Are there any register-offset constants in
-     `src/interpreter/` that should move to `xdna-archspec`?
+   **Shape the spec around these questions (the Subsystem 1 follow-up
+   list in `docs/arch/subsys1-audit.md` enumerates them):**
+   - Can `src/tablegen/types.rs` and `src/tablegen/resolver/` move wholesale
+     to `xdna_archspec::aie2::isa::`, or do they need to decompose into
+     arch-agnostic types (archspec) and xdna-emu-specific wrappers?
+   - Where does `interpreter::bundle::slot::Operand` actually belong? If it
+     describes a slot-typed operand abstractly, archspec. If it's the
+     emulator's interpretation of an operand during execution, xdna-emu.
+   - Does the `RegisterMap` / `MappedOperand` / `classify_reg_name` layer
+     want a `RegisterMapper` trait in archspec or a direct move of
+     `Operand` + constants (the cleaner but bigger move)?
+   - After the types migrate, can `build_helpers/` move + `gen_tablegen`
+     expose as `xdna_archspec::aie2::isa::decoder_tables::*`?
+   - After the types migrate, can the `extern "C"` block move + FFI Rust
+     shim expose as `xdna_archspec::aie2::decoder_ffi::*`? The
+     register-name mapping layer might stay in xdna-emu if it's
+     fundamentally an emulator concern.
+   - Is 3-slot (AIE1) vs 6-slot (AIE2) the right place to introduce an
+     `IsaDecoder` trait, or is the VLIW bundle structure itself still data
+     (archspec) with only the decoding behavior (bundle disassembly)
+     behind a trait?
 
-4. **Invoke writing-plans** next to produce a bite-sized plan at
-   `docs/superpowers/plans/YYYY-MM-DD-subsys1-regs-mem.md`.
+4. **Invoke writing-plans** next to produce a plan at
+   `docs/superpowers/plans/YYYY-MM-DD-subsys6-isa-decode.md`. Mention
+   explicitly that this plan consumes the deferred Subsystem 1 Tasks 9
+   and 10, plus the `mod arch` forwarder dissolution and the 36 remaining
+   `crate::arch::*` consumer rewrites.
 
 5. **Invoke subagent-driven-development** to execute:
    ```
    /subagent-driven-development
    ```
-   Same skill flow as Phase 1a: implementer subagent per task, two-stage
+   Same flow as prior subsystems: implementer subagent per task, two-stage
    review (spec compliance then code quality), same-session orchestration.
 
-6. **At end of Subsystem 1:** tag `phase1-subsys-regs-mem`, append a
+6. **At end of Subsystem 6:** tag `phase1-subsys-isa-decode`, append a
    completion section to the subsystem's audit, update this
    `NEXT-STEPS.md` to move Subsystem 2 to "up next."
 
