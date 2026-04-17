@@ -1,16 +1,18 @@
-// Shared element type inference logic.
+// Shared element type inference logic -- runtime copy.
 //
-// This file is the SINGLE SOURCE OF TRUTH for instruction name -> element type
-// mapping. It is textually included by both:
-//   - build_helpers/semantics.rs  (build-time codegen, String output)
-//   - src/tablegen/resolver.rs    (runtime decoder, ElementType output)
+// This file has two authoritative copies that MUST stay in sync:
+//   - crates/xdna-archspec/build_helpers/element_type_logic.rs  (build-time)
+//   - src/tablegen/element_type_logic.rs                        (this file, runtime)
+//
+// The build-time copy lives in archspec's build_helpers alongside the
+// TableGen extraction code. The runtime copy (this file) is a regular module
+// of the xdna-emu tablegen subsystem.
 //
 // It uses a self-contained TypeTag enum with no external dependencies so it
 // compiles in both contexts. Each consumer provides a thin conversion layer
 // from TypeTag to its own output type.
 //
-// IMPORTANT: when adding patterns here, both build-time and runtime consumers
-// automatically pick them up. No more dual maintenance.
+// IMPORTANT: when updating patterns, update BOTH copies identically.
 
 /// Lightweight type discriminant shared between build-time and runtime.
 ///
