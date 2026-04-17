@@ -48,7 +48,7 @@
 //! ```
 
 pub mod banking;
-pub mod arch_config;
+pub mod port_layout;
 pub mod model;
 pub mod regdb;
 pub mod registers;
@@ -68,7 +68,7 @@ pub mod interrupts;
 pub mod perf_counters;
 pub mod timer;
 
-pub use arch_config::{ArchConfig, ModelConfig, default_arch};
+pub use xdna_archspec::runtime::{ArchConfig, ModelConfig, default_arch};
 pub use registers::{RegisterInfo, TileAddress};
 pub use tile::{Tile, TileType, Lock, LockResult, DmaBufferDescriptor, DmaChannel, CoreState};
 pub use array::TileArray;

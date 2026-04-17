@@ -1,25 +1,18 @@
-//! Runtime-side architecture configuration shim and port-layout extension.
+//! Runtime-side stream-switch port-layout extension trait for `ModelConfig`.
 //!
-//! The core `ArchConfig` trait, `ModelConfig` implementation, `default_arch`,
-//! and `ARCHSPEC_MODELS` now live in `xdna_archspec::runtime`. This module:
+//! Defines the `PortLayout` extension trait and its implementation for
+//! `ModelConfig`. These methods must remain runtime-side because their data
+//! comes from `crate::arch` (a build.rs-generated module containing AM025 port
+//! arrays that is not accessible from the archspec workspace crate).
 //!
-//! 1. Re-exports them so all existing consumers continue to compile unchanged.
-//! 2. Defines the `PortLayout` extension trait for stream-switch port-layout
-//!    queries, which must remain runtime-side because their data comes from
-//!    `crate::arch` (a build.rs-generated module containing AM025 port arrays
-//!    that is not accessible from the archspec workspace crate).
+//! When AIE2P diverges in port layout, add AIE2P-specific arrays and select
+//! based on `ModelConfig::name()` or an architecture field. That addition
+//! stays runtime-side until port generation is moved into the archspec crate.
 //!
 //! See `docs/arch/phase1a-audit.md` (Port Data Dependency section) for the
 //! full rationale.
-//!
-//! # Migration status
-//!
-//! - Task 3 (this file): re-export + PortLayout.
-//! - Task 4: migrate consumers from `crate::device::arch_config::*` to
-//!   `xdna_archspec::runtime::*` directly.
-//! - Task 5: delete this shim once all consumers are migrated.
 
-pub use xdna_archspec::runtime::{ArchConfig, ModelConfig, default_arch, ARCHSPEC_MODELS};
+use xdna_archspec::runtime::ModelConfig;
 use xdna_archspec::types::TileKind;
 
 /// Stream-switch port-layout extension trait.
