@@ -109,6 +109,8 @@ pub struct InterpreterEngine {
     last_dma_bytes: u64,
     /// Stall detection: last observed total lock releases.
     last_lock_releases: u64,
+    /// Stall detection: last observed total instructions executed.
+    last_instructions: u64,
     /// Consecutive cycles with no monotonic progress.
     stall_cycles: u64,
     /// Cycles of no progress before declaring stall. 0 = disabled.
@@ -152,6 +154,7 @@ impl InterpreterEngine {
             auto_run: false,
             last_dma_bytes: 0,
             last_lock_releases: 0,
+            last_instructions: 0,
             stall_cycles: 0,
             stall_threshold: 0,
         }
@@ -991,20 +994,39 @@ impl InterpreterEngine {
         }
 
         // -- Monotonic progress detection --
+        //
+        // Three signals count as forward progress, any one of which resets
+        // the stall counter:
+        //
+        // 1. DMA bytes transferred: a DMA channel moved data.
+        // 2. Lock releases: an arbiter released a lock to a waiter.
+        // 3. Core instructions executed: a core advanced its PC at least
+        //    once outside of WaitLock/WaitDma/WaitStream.
+        //
+        // The third signal exists to avoid false stalls during heavy scalar
+        // computation (e.g. byte-by-byte memcpy in compute kernels) that can
+        // run for tens of thousands of cycles between any DMA or lock event.
+        // True deadlocks are still caught: a deadlocked core is in WaitLock
+        // (etc.) and does not advance total_instructions.
         if self.stall_threshold > 0 {
             let dma_bytes = self.device.array.total_dma_bytes_transferred();
             let lock_releases = self.device.array.total_lock_releases();
+            let instructions = self.total_instructions;
 
-            if dma_bytes > self.last_dma_bytes || lock_releases > self.last_lock_releases {
+            if dma_bytes > self.last_dma_bytes
+                || lock_releases > self.last_lock_releases
+                || instructions > self.last_instructions
+            {
                 self.stall_cycles = 0;
                 self.last_dma_bytes = dma_bytes;
                 self.last_lock_releases = lock_releases;
+                self.last_instructions = instructions;
             } else {
                 self.stall_cycles += 1;
                 if self.stall_cycles >= self.stall_threshold {
                     log::warn!(
-                        "Stall detected: no progress for {} cycles (dma_bytes={}, lock_releases={})",
-                        self.stall_cycles, dma_bytes, lock_releases,
+                        "Stall detected: no progress for {} cycles (dma_bytes={}, lock_releases={}, instructions={})",
+                        self.stall_cycles, dma_bytes, lock_releases, instructions,
                     );
                     self.status = EngineStatus::Stalled;
                 }
@@ -1131,6 +1153,10 @@ impl InterpreterEngine {
         self.status = EngineStatus::Ready;
         self.total_cycles = 0;
         self.total_instructions = 0;
+        self.last_dma_bytes = 0;
+        self.last_lock_releases = 0;
+        self.last_instructions = 0;
+        self.stall_cycles = 0;
     }
 
     /// Sync core enabled state and PC from device tiles.
