@@ -62,12 +62,19 @@ required methods).
 
 ## Consumers and Imports
 
-Command used:
+Commands used:
 ```
 rg -l 'use (crate::archspec|crate::device::arch_config|xdna_archspec)' src/
+rg -l 'super::arch_config' src/
 ```
 
-Output: 8 files.  Verbatim `use` lines extracted from each:
+**Note:** The plan's original `rg` pattern only matches absolute paths
+(`crate::...` and `xdna_archspec::...`), so imports that use relative `super::`
+paths are missed.  Implementers MUST run the second grep as a complement.
+Together they find all 9 consumer files; running only the first misses
+`src/device/array/mod.rs` (which imports via `use super::arch_config::{...}`).
+
+Output: 9 files.  Verbatim `use` lines extracted from each:
 
 ### `src/archspec/mod.rs`
 ```rust
@@ -124,18 +131,26 @@ pub use xdna_archspec::regdb::*;
 use crate::archspec::{SubsystemKind, TileKind};
 ```
 
+### `src/device/array/mod.rs`
+```rust
+use super::arch_config::{ArchConfig, ModelConfig};
+```
+Uses a `super::` path (not caught by the plan's primary `rg` pattern; see
+note at the top of this section).
+
 ### Summary Table
 
-| File | Symbols imported |
-|------|-----------------|
-| `src/archspec/mod.rs` | `device_model`, `regdb_extractor`, `types`, `ArchModel`, `ModuleKind`, `SubsystemKind`, `TileKind` |
-| `src/device/arch_config.rs` | `TileKind`, `ArchModel` (qualified path) |
-| `src/device/model.rs` | `ArchModel`, `TileKind`, `extract_device_model`, `extract_device_models` |
-| `src/device/registers.rs` | `SubsystemKind`, `TileKind` |
-| `src/device/regdb/field_layouts.rs` | `BitField`, `RegisterDb` |
-| `src/device/regdb/tests.rs` | `AccessMode`, `BitField` |
-| `src/device/regdb/mod.rs` | `xdna_archspec::regdb::*` (glob re-export) |
-| `src/device/state/mod.rs` | `SubsystemKind`, `TileKind` |
+| File | Symbols imported | Role |
+|------|-----------------|------|
+| `src/archspec/mod.rs` | `device_model`, `regdb_extractor`, `types`, `ArchModel`, `ModuleKind`, `SubsystemKind`, `TileKind` | **Shim -- to be deleted, not migrated** |
+| `src/device/arch_config.rs` | `TileKind`, `ArchModel` (qualified path) | **Shim -- to be deleted, not migrated** (contents moved into `xdna_archspec`) |
+| `src/device/model.rs` | `ArchModel`, `TileKind`, `extract_device_model`, `extract_device_models` | Migration target |
+| `src/device/registers.rs` | `SubsystemKind`, `TileKind` | Migration target |
+| `src/device/regdb/field_layouts.rs` | `BitField`, `RegisterDb` | Migration target |
+| `src/device/regdb/tests.rs` | `AccessMode`, `BitField` | Migration target |
+| `src/device/regdb/mod.rs` | `xdna_archspec::regdb::*` (glob re-export) | Migration target |
+| `src/device/state/mod.rs` | `SubsystemKind`, `TileKind` | Migration target |
+| `src/device/array/mod.rs` | `ArchConfig`, `ModelConfig` (from `super::arch_config`) | Migration target |
 
 ---
 
@@ -303,8 +318,12 @@ the generation is worth moving.
 One additional complication: `program_memory_size()` for the `Compute` variant
 also directly references `crate::arch::compute::PROGRAM_MEMORY_SIZE` (line
 392).  However, this value is also present in `ArchModel` via
-`TileTypeModel::memory::program_memory_bytes`, so the runtime-side
-implementation can use `self.core_params.data_memory_size` or a dedicated
-`program_memory_size` field in `TileTypeParams` instead of the generated
-constant.  This would remove the only non-port dependency on `crate::arch`
-from the trait implementation, making Option A fully viable.
+`TileTypeModel::memory::program_memory_bytes` (defined in
+`crates/xdna-archspec/src/types.rs`), so the runtime-side implementation
+should add a dedicated `program_memory_size` field to `TileTypeParams`,
+populated from `memory.program_memory_bytes`, and use that field instead of
+the generated constant.  Note: do NOT reuse `data_memory_size` for program
+memory -- they are different values (64KB data vs 16KB program on AIE2
+compute tiles).  With this field added, the only non-port dependency on
+`crate::arch` is removed from the trait implementation, making Option A
+fully viable.
