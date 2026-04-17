@@ -29,7 +29,7 @@ mod routing;
 #[cfg(test)]
 mod tests;
 
-use super::arch_config::{ArchConfig, ModelConfig};
+use xdna_archspec::runtime::{ArchConfig, ModelConfig};
 use super::dma::{self, DmaEngine, DmaResult};
 use super::host_memory::HostMemory;
 use super::tile::{Tile, TileParams, TileType};
