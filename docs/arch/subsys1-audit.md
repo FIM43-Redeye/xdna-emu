@@ -115,6 +115,16 @@ Codegen functions (`^fn gen_`):
 | 1971 | `gen_aiert_locks(modules: &[LockModData], out_dir: &Path)` |
 | 1993 | `gen_aiert_ports(port_maps: &[PortMapData], out_dir: &Path)` |
 
+**Call-site to output-file mapping** (relevant for tracing `include!()` back to a generator):
+`gen_lock_request` is parameterized and called twice; there is no `fn gen_memory_lock` or
+`fn gen_memtile_lock` to search for.
+
+| build.rs line | Call | Output file |
+|---------------|------|-------------|
+| 146 | `gen_core_module(&regdb, &out_dir)` | `gen_core_module.rs` |
+| 147 | `gen_lock_request(&regdb, &out_dir, "memory", "gen_memory_lock.rs")` | `gen_memory_lock.rs` |
+| 148 | `gen_lock_request(&regdb, &out_dir, "memory_tile", "gen_memtile_lock.rs")` | `gen_memtile_lock.rs` |
+
 aie-rt extraction function:
 
 | Line | Function |
