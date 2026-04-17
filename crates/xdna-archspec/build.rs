@@ -111,6 +111,11 @@ fn main() {
     // Generate stream switch port type arrays and per-tile-type port ranges.
     let port_data = gen_stream_ports(&regdb, &out_dir);
     gen_stream_ranges(&regdb, &port_data, &out_dir);
+
+    // Generate trace event code tables from the mlir-aie Python bridge.
+    let bridge_path = workspace_root.join("tools/mlir-aie-bridge.py");
+    println!("cargo:rerun-if-changed={}", bridge_path.display());
+    gen_trace_events(&bridge_path, &out_dir);
 }
 
 // ============================================================================
@@ -1518,4 +1523,178 @@ fn find_master_enable_bit(regdb: &regdb::RegisterDb) -> u32 {
         }
     }
     panic!("Master_Enable bit field not found in any Stream_Switch_Master_Config register");
+}
+
+// ============================================================================
+// gen_trace_events: mlir-aie trace event code tables
+// ============================================================================
+
+/// Generate trace event code constants from the mlir-aie Python bridge.
+///
+/// Invokes `tools/mlir-aie-bridge.py trace-events`, parses the JSON output,
+/// and emits `trace_event_codes.rs` into $OUT_DIR. Falls back to
+/// `write_trace_event_stub` if the bridge is unavailable or fails.
+///
+/// The workspace_root-relative bridge path is correct: the archspec crate
+/// lives at `crates/xdna-archspec`, so workspace_root == xdna-emu root,
+/// which is where `tools/` lives.
+fn gen_trace_events(bridge_path: &Path, out_dir: &Path) {
+    use std::process::Command;
+
+    if !bridge_path.exists() {
+        write_trace_event_stub(out_dir);
+        return;
+    }
+
+    // Find Python interpreter: prefer mlir-aie ironenv, fall back to system python3.
+    // workspace_root.parent() == npu-work (same as manifest_dir.parent() in xdna-emu).
+    let workspace_root = bridge_path.parent().and_then(|p| p.parent()).unwrap_or(Path::new("."));
+    let ironenv_python = workspace_root
+        .parent()
+        .unwrap_or(workspace_root)
+        .join("mlir-aie/ironenv/bin/python3");
+    let python = if ironenv_python.exists() {
+        ironenv_python
+    } else {
+        PathBuf::from("python3")
+    };
+
+    let output = Command::new(&python)
+        .arg(bridge_path)
+        .arg("trace-events")
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            eprintln!(
+                "cargo:warning=mlir-aie bridge trace-events failed ({}), using stub: {}",
+                o.status, stderr
+            );
+            write_trace_event_stub(out_dir);
+            return;
+        }
+        Err(e) => {
+            eprintln!(
+                "cargo:warning=Could not run mlir-aie bridge ({}), using stub",
+                e
+            );
+            write_trace_event_stub(out_dir);
+            return;
+        }
+    };
+
+    let json: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "cargo:warning=mlir-aie bridge returned invalid JSON ({}), using stub",
+                e
+            );
+            write_trace_event_stub(out_dir);
+            return;
+        }
+    };
+
+    let enums = match json["enums"].as_object() {
+        Some(e) => e,
+        None => {
+            eprintln!("cargo:warning=mlir-aie bridge JSON missing 'enums', using stub");
+            write_trace_event_stub(out_dir);
+            return;
+        }
+    };
+
+    let mut out = gen_header("mlir-aie trace event enums (via mlir-aie-bridge.py)");
+    writeln!(out, "// Source: mlir-aie Python API (aie.utils.trace_events)").unwrap();
+    writeln!(out).unwrap();
+
+    // Generate modules for each event enum.
+    let enum_order = ["CoreEvent", "MemEvent", "MemTileEvent", "ShimTileEvent"];
+    let mod_names = ["core_events", "mem_events", "memtile_events", "shim_events"];
+    let fn_names = [
+        "core_event_name",
+        "mem_event_name",
+        "memtile_event_name",
+        "shim_event_name",
+    ];
+
+    for (i, enum_name) in enum_order.iter().enumerate() {
+        let mod_name = mod_names[i];
+        let fn_name = fn_names[i];
+
+        if let Some(events) = enums.get(*enum_name).and_then(|v| v.as_object()) {
+            // Collect and sort by value for deterministic output.
+            let mut entries: Vec<(String, u64)> = events
+                .iter()
+                .filter_map(|(name, val)| val.as_u64().map(|v| (name.clone(), v)))
+                .collect();
+            entries.sort_by_key(|(_, v)| *v);
+
+            // Module with const definitions.
+            writeln!(out, "/// {} event codes from mlir-aie.", enum_name).unwrap();
+            writeln!(out, "#[allow(dead_code)]").unwrap();
+            writeln!(out, "pub mod {} {{", mod_name).unwrap();
+            for (name, value) in &entries {
+                // Sanitize names: replace leading digits, etc.
+                let const_name = sanitize_const_name(name).to_ascii_uppercase();
+                writeln!(out, "    pub const {}: u8 = {};", const_name, value).unwrap();
+            }
+            writeln!(out, "}}\n").unwrap();
+
+            // Name lookup function.
+            writeln!(
+                out,
+                "/// Look up {} event name by hardware code.",
+                enum_name
+            )
+            .unwrap();
+            writeln!(out, "pub fn {}(code: u8) -> &'static str {{", fn_name).unwrap();
+            writeln!(out, "    match code {{").unwrap();
+            for (name, value) in &entries {
+                writeln!(out, "        {} => \"{}\",", value, name).unwrap();
+            }
+            writeln!(out, "        _ => \"UNKNOWN\",").unwrap();
+            writeln!(out, "    }}").unwrap();
+            writeln!(out, "}}\n").unwrap();
+        }
+    }
+
+    fs::write(out_dir.join("trace_event_codes.rs"), out).unwrap();
+}
+
+/// Write a stub `trace_event_codes.rs` when the bridge is not available.
+fn write_trace_event_stub(out_dir: &Path) {
+    let stub = "\
+// Trace event codes not generated (mlir-aie bridge not available).
+// Rebuild with mlir-aie installed for full event code tables.
+
+pub fn core_event_name(_code: u8) -> &'static str { \"UNKNOWN\" }
+pub fn mem_event_name(_code: u8) -> &'static str { \"UNKNOWN\" }
+pub fn memtile_event_name(_code: u8) -> &'static str { \"UNKNOWN\" }
+pub fn shim_event_name(_code: u8) -> &'static str { \"UNKNOWN\" }
+";
+    fs::write(out_dir.join("trace_event_codes.rs"), stub).unwrap();
+}
+
+/// Sanitize a Python enum name for use as a Rust const identifier.
+///
+/// Replaces non-alphanumeric/underscore characters with `_`, and
+/// prepends `_` if the name starts with a digit (Rust idents cannot start
+/// with a digit).
+fn sanitize_const_name(name: &str) -> String {
+    let mut result = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            result.push(ch);
+        } else {
+            result.push('_');
+        }
+    }
+    // Rust consts can't start with a digit.
+    if result.starts_with(|c: char| c.is_ascii_digit()) {
+        result.insert(0, '_');
+    }
+    result
 }

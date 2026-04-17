@@ -3,8 +3,8 @@
 //! Every `pub const` that reflects AIE2 hardware data -- register
 //! offsets, memory sizes, per-tile-type resource counts, stream switch
 //! port layouts, timing constants, FoT values, and packet formats --
-//! lives under this module. Additional slices (trace event IDs, ISA
-//! encodings, decoder FFI) land here in Tasks 8-10.
+//! lives under this module. Additional slices (ISA encodings, decoder FFI)
+//! land here in Tasks 9-10.
 //! Multi-arch support is planned as sibling modules (e.g.,
 //! `xdna_archspec::aie1`, `xdna_archspec::aie2p`) that would mirror
 //! this namespace with different values.
@@ -47,6 +47,14 @@ pub mod registers;
 /// `NORTH_MASTER_START/END`, `SOUTH_MASTER_START/END`, etc.
 /// `ENABLE_BIT` and `SLAVE_SELECT_MASK` live at the module root.
 pub mod stream_switch;
+
+/// Trace event codes from the mlir-aie Python bridge.
+///
+/// Per-tile-module const tables (`core_events`, `mem_events`, `memtile_events`,
+/// `shim_events`) and name-lookup functions (`core_event_name`, etc.).
+/// Generated at build time by `build.rs` from `tools/mlir-aie-bridge.py trace-events`.
+/// Falls back to stub functions returning "UNKNOWN" when mlir-aie is absent.
+pub mod trace_events;
 
 /// Stream switch port type identifier (xdna-emu convention, not hardware).
 ///

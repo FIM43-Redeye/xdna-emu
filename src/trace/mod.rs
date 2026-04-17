@@ -11,13 +11,14 @@ pub mod compare;
 pub mod store;
 pub mod vcd;
 
-/// Generated trace event codes from mlir-aie's canonical enums.
+/// Trace event codes from mlir-aie's canonical enums.
 ///
 /// Provides per-tile-type event code constants and name lookup functions.
-/// Generated at build time by `build.rs` from `tools/mlir-aie-bridge.py trace-events`.
-/// Falls back to stubs if mlir-aie is not available.
+/// Generated at build time by `xdna-archspec/build.rs` from
+/// `tools/mlir-aie-bridge.py trace-events`. Falls back to stubs if
+/// mlir-aie is not available.
 pub mod event_codes {
-    include!(concat!(env!("OUT_DIR"), "/trace_event_codes.rs"));
+    pub use xdna_archspec::aie2::trace_events::*;
 }
 
 use crate::interpreter::state::EventType;
