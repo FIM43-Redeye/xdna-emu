@@ -13,6 +13,7 @@
 pub mod device_model;
 pub mod regdb;
 pub mod regdb_extractor;
+pub mod runtime;
 pub mod tablegen;
 pub mod types;
 

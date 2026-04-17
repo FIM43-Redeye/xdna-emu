@@ -104,7 +104,8 @@ impl DeviceState {
             return;
         }
 
-        let tile_type = self.array.arch().tile_type(col, row);
+        // tile_kind() returns TileKind (archspec); convert to TileType for match arms below.
+        let tile_type: super::super::tile::TileType = self.array.arch().tile_kind(col, row).into();
         let reg_layout = regdb::device_reg_layout();
 
         let bd_config = self.array.get(col, row).map(|tile| {

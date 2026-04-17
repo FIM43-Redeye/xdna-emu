@@ -78,7 +78,8 @@ impl DeviceState {
     /// Both share the same BD base address (0x1D000) and stride (0x20),
     /// so we determine tile type from the row to select the correct parser.
     pub(super) fn write_dma_bd(&mut self, col: u8, row: u8, offset: u32, value: u32) {
-        let tile_type = self.array.arch().tile_type(col, row);
+        // tile_kind() returns TileKind (archspec); convert to TileType for match arms below.
+        let tile_type: super::super::tile::TileType = self.array.arch().tile_kind(col, row).into();
         let reg_layout = regdb::device_reg_layout();
 
         // Select base/stride/max words based on tile type.

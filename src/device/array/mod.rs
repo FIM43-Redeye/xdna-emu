@@ -186,14 +186,18 @@ impl TileArray {
         // Per-tile-type params come from ArchConfig (data-driven from mlir-aie).
         for col in 0..cols {
             for row in 0..rows {
-                let tile_type = arch.tile_type(col, row);
+                // tile_kind() returns TileKind (archspec); convert to TileType
+                // (runtime) for Tile and DmaEngine constructors.  The From impls
+                // were established in Task 2 (commit 43fc807).
+                let tile_kind = arch.tile_kind(col, row);
+                let tile_type: TileType = tile_kind.into();
                 let params = TileParams {
-                    data_memory_size: arch.data_memory_size(tile_type),
-                    num_locks: arch.lock_count(tile_type),
-                    num_bds: arch.dma_bd_count(tile_type),
-                    num_channels: arch.dma_total_channels(tile_type),
-                    dma_s2mm_channels: arch.dma_s2mm_channels(tile_type),
-                    dma_mm2s_channels: arch.dma_mm2s_channels(tile_type),
+                    data_memory_size: arch.data_memory_size(tile_kind),
+                    num_locks: arch.lock_count(tile_kind),
+                    num_bds: arch.dma_bd_count(tile_kind),
+                    num_channels: arch.dma_total_channels(tile_kind),
+                    dma_s2mm_channels: arch.dma_s2mm_channels(tile_kind),
+                    dma_mm2s_channels: arch.dma_mm2s_channels(tile_kind),
                 };
                 tiles.push(Tile::new(tile_type, col, row, &params));
 
