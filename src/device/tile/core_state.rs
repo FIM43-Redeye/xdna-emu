@@ -1,5 +1,7 @@
 //! Core processor state, legacy stream port, tile type, and control packet action.
 
+use xdna_archspec::types::TileKind;
+
 /// Core processor state.
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
@@ -75,6 +77,34 @@ impl TileType {
     }
 }
 
+impl From<TileKind> for TileType {
+    /// Convert an archspec `TileKind` to the runtime `TileType`.
+    ///
+    /// `ShimPl` is lossy: the emulator only models NoC-connected shims, so
+    /// both `ShimNoc` and `ShimPl` collapse to `TileType::Shim`.
+    fn from(kind: TileKind) -> Self {
+        match kind {
+            TileKind::Compute => TileType::Compute,
+            TileKind::Mem => TileType::MemTile,
+            TileKind::ShimNoc | TileKind::ShimPl => TileType::Shim,
+        }
+    }
+}
+
+impl From<TileType> for TileKind {
+    /// Convert the runtime `TileType` to an archspec `TileKind`.
+    ///
+    /// `TileType::Shim` maps to `TileKind::ShimNoc` because the emulator
+    /// never produces `ShimPl` tiles -- NoC is the only shim variant modelled.
+    fn from(tt: TileType) -> Self {
+        match tt {
+            TileType::Compute => TileKind::Compute,
+            TileType::MemTile => TileKind::Mem,
+            TileType::Shim => TileKind::ShimNoc,
+        }
+    }
+}
+
 // Control packet state machine (ControlPacketState) has been moved to
 // control_packets::StreamReassembler in array.rs.
 
@@ -92,4 +122,44 @@ pub enum CtrlPacketAction {
     ReadRegisters { col: u8, row: u8, offset: u32, count: u8, response_id: u8 },
     /// An error occurred during control packet processing.
     Error(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tile_type_round_trip_compute() {
+        let tt = TileType::Compute;
+        let kind: TileKind = tt.into();
+        let tt2: TileType = kind.into();
+        assert_eq!(tt, tt2);
+    }
+
+    #[test]
+    fn tile_type_round_trip_mem_tile() {
+        let tt = TileType::MemTile;
+        let kind: TileKind = tt.into();
+        assert_eq!(kind, TileKind::Mem);
+        let tt2: TileType = kind.into();
+        assert_eq!(tt, tt2);
+    }
+
+    #[test]
+    fn tile_type_round_trip_shim() {
+        let tt = TileType::Shim;
+        let kind: TileKind = tt.into();
+        assert_eq!(kind, TileKind::ShimNoc);
+        let tt2: TileType = kind.into();
+        assert_eq!(tt, tt2);
+    }
+
+    #[test]
+    fn tile_kind_shim_pl_maps_to_shim() {
+        // ShimPl is lossy: the emulator collapses it to Shim since it only
+        // models NoC-connected shims.
+        let kind = TileKind::ShimPl;
+        let tt: TileType = kind.into();
+        assert_eq!(tt, TileType::Shim);
+    }
 }
