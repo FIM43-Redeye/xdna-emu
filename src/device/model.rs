@@ -14,8 +14,8 @@
 //!
 //! Historically this module contained serde `#[derive(Deserialize)]` structs
 //! for the same JSON. Those were removed because they duplicated the archspec
-//! parser. All runtime consumers now use `arch_config.rs` (which uses archspec
-//! directly) or the compile-time `crate::arch::*` constants.
+//! parser. All runtime consumers now use `xdna_archspec::runtime` directly or
+//! the compile-time `crate::arch::*` constants.
 
 use xdna_archspec::types::ArchModel;
 

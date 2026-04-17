@@ -68,7 +68,6 @@ pub mod interrupts;
 pub mod perf_counters;
 pub mod timer;
 
-pub use xdna_archspec::runtime::{ArchConfig, ModelConfig, default_arch};
 pub use registers::{RegisterInfo, TileAddress};
 pub use tile::{Tile, TileType, Lock, LockResult, DmaBufferDescriptor, DmaChannel, CoreState};
 pub use array::TileArray;

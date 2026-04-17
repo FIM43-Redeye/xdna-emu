@@ -286,7 +286,7 @@ Lock stride:    0x10 (16 bytes)
 
 ### What This Replaces
 
-- `src/device/arch_config.rs` -- all tile classification and resource queries
+- `xdna_archspec::runtime` (`ArchConfig` trait, `ModelConfig`) -- all tile classification and resource queries; `src/device/port_layout.rs` hosts the runtime-side `PortLayout` extension trait
 - `src/device/aie2_spec.rs` -- memory sizes, lock counts, BD counts, port layouts
 
 ### How to Consume
@@ -637,7 +637,7 @@ JSON register database. Validate device model constants against AIETargetModel.
 - `src/device/registers_spec.rs` (validate or replace)
 - `src/device/dma/bd.rs` (generate field extraction from JSON)
 - `src/device/aie2_spec.rs` (validate or replace)
-- `src/device/arch_config.rs` (validate against AIETargetModel)
+- `xdna_archspec::runtime` (`ArchConfig`/`ModelConfig` -- validate against AIETargetModel; port-layout extension in `src/device/port_layout.rs`)
 
 **Estimated scope**: ~400 lines new code, ~600 lines replaced/validated
 

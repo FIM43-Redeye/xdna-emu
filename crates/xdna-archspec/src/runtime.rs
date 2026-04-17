@@ -10,7 +10,7 @@
 //!   sizes, lock counts, and DMA configuration. Stream-switch port-layout
 //!   methods are **not** part of this trait -- they depend on `crate::arch`
 //!   (build.rs-generated, main crate only) and live in a runtime-side extension
-//!   trait `PortLayout` in `src/device/arch_config.rs`. See the phase 1a audit
+//!   trait `PortLayout` in `src/device/port_layout.rs`. See the phase 1a audit
 //!   at `docs/arch/phase1a-audit.md` for the rationale.
 //!
 //! - `ModelConfig`: `ArchConfig` implementation backed by `ArchModel`. All
