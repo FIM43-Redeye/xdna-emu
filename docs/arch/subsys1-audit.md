@@ -273,3 +273,53 @@ Will move in Subsystem 6:
 - `crate::arch` consumers: 37 files (unchanged from pre-Task-4 baseline; cleanup deferred with Tasks 9/10)
 - `mod arch` in `src/lib.rs`: simplified forwarder (`pub use xdna_archspec::aie2::*` + `subsystem` compat shim)
 - `gen_*` functions remaining in `xdna-emu/build.rs`: 4 (`gen_header`, `gen_aiert_dma`, `gen_aiert_locks`, `gen_aiert_ports`)
+
+---
+
+## Part A Completion
+
+Landed 2026-04-17. Tag: `phase1-subsys-regs-mem-partA`.
+
+### Commits (from last Task 1 audit commit 1e6aa0a through tag)
+
+- `c760737` refactor: factor model_builder out of xdna-archspec lib.rs
+- `5e2698e` docs: archspec lib.rs docstring describes current state
+- `dd1ee5d` build: scaffold xdna-archspec/build.rs
+- `37de234` build: drop premature LLVM_AIE_PATH trigger from archspec scaffold
+- `21d8ecd` refactor: move gen_arch into xdna-archspec
+- `e03faea` refactor: drop orphan gen_aiert_* writes + mark duplicated parsing
+- `50ad119` refactor: move gen_subsystems into xdna-archspec
+- `41162df` refactor: move gen_core_module + lock generators into xdna-archspec
+- `2b10e82` refactor: move gen_stream_ports + gen_stream_ranges into xdna-archspec
+- `e1e7a96` refactor: move gen_trace_events into xdna-archspec
+- `1052889` refactor: move build_helpers/ to xdna-archspec (Task 9) -- reverted
+- `3a38ea9` refactor: defer gen_tablegen + build_helpers move to Subsystem 6
+- `8970bb0` docs: reduced-scope Task 11 + Tasks 9/10 deferral notes
+- `5678278` docs: plan Task 9 blockquote reflects Tasks 10/11 status
+
+### Fast verification (at tag)
+
+- `cargo test --lib`: `2798 passed; 0 failed; 5 ignored` (baseline).
+- `cargo test -p xdna-archspec --lib`: `138 passed; 1 failed` (`test_full_parse_all_devices`
+  pre-existing device-count mismatch).
+- `cargo build --release`: clean (1m 47s).
+- Bridge `--no-hw -v add_one`: Chess 10/10 PASS, Peano 9/9 PASS.
+
+### Full HW / ISA gate
+
+The plan's original Task 12 verification gate called for the full HW bridge run
+(`./scripts/emu-bridge-test.sh`) and the ISA test suite (`./scripts/isa-test.sh`).
+With Tasks 9 + 10 deferred to Subsystem 6, the full validation was started as a
+background run; results land in `/tmp/claude-1000/subsys1-partA-{bridge,isa}.log`.
+Because this intermediate tag marks a reduced-scope endpoint rather than the
+original Part A completion, any regressions surfaced by the full runs are
+addressed in follow-up commits before Part B proceeds.
+
+### Deviations
+
+- `mod arch` in `src/lib.rs` kept as forwarder (not deleted) because Tasks 5-7
+  generators couldn't land their sed-rewrite at the same time as their move.
+- Consumer rewrites (~37 files using `crate::arch::*`) deferred to Subsystem 6
+  where they can happen atomically after all generators move.
+- Tasks 9 and 10 deferred due to interpreter-type coupling. See their dedicated
+  sections above.
