@@ -30,6 +30,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 // ============================================================================
+// Port type constants -- mirrors aie2::port_type for codegen output
+// ============================================================================
+// These are our encoding convention, not hardware-defined. The generated code
+// references `port_type::*` which is defined in the same module scope.
+
+const PT_CORE: u8 = 0;
+const PT_FIFO: u8 = 1;
+const PT_TRACE: u8 = 2;
+const PT_CTRL: u8 = 3;
+const PT_NORTH_BASE: u8 = 10;
+const PT_SOUTH_BASE: u8 = 20;
+const PT_EAST_BASE: u8 = 30;
+const PT_WEST_BASE: u8 = 40;
+const PT_DMA_BASE: u8 = 50;
+
+// ============================================================================
 // Entry point
 // ============================================================================
 
@@ -91,6 +107,10 @@ fn main() {
     gen_core_module(&regdb, &out_dir);
     gen_lock_request(&regdb, &out_dir, "memory", "gen_memory_lock.rs");
     gen_lock_request(&regdb, &out_dir, "memory_tile", "gen_memtile_lock.rs");
+
+    // Generate stream switch port type arrays and per-tile-type port ranges.
+    let port_data = gen_stream_ports(&regdb, &out_dir);
+    gen_stream_ranges(&regdb, &port_data, &out_dir);
 }
 
 // ============================================================================
@@ -1048,3 +1068,454 @@ fn parse_desc_single_bit(desc: &str, field_name: &str, module_name: &str) -> u32
     after[..paren_end].parse().unwrap()
 }
 
+// ============================================================================
+// gen_stream_ports: Stream switch port type arrays
+// ============================================================================
+
+/// Collected port arrays for deriving ranges in gen_stream_ranges.
+struct PortArrayData {
+    compute_master: Vec<PortEntry>,
+    compute_slave: Vec<PortEntry>,
+    memtile_master: Vec<PortEntry>,
+    memtile_slave: Vec<PortEntry>,
+    shim_master: Vec<PortEntry>,
+    shim_slave: Vec<PortEntry>,
+}
+
+struct PortEntry {
+    port_type_value: u8,
+    port_type_expr: String,
+    suffix: String,
+}
+
+fn gen_stream_ports(regdb: &regdb::RegisterDb, out_dir: &Path) -> PortArrayData {
+    let mut out = gen_header("AM025 Stream_Switch_*_Config registers");
+    // Note: the generated code references `port_type::*` which is defined
+    // in the `aie2` module (aie2/mod.rs), before the include!() point.
+
+    let compute_master =
+        collect_port_array(regdb, "core", "Stream_Switch_Master_Config_");
+    let compute_slave =
+        collect_port_array(regdb, "core", "Stream_Switch_Slave_Config_");
+    let memtile_master =
+        collect_port_array(regdb, "memory_tile", "Stream_Switch_Master_Config_");
+    let memtile_slave =
+        collect_port_array(regdb, "memory_tile", "Stream_Switch_Slave_Config_");
+    let shim_master =
+        collect_port_array(regdb, "shim", "Stream_Switch_Master_Config_");
+    let shim_slave =
+        collect_port_array(regdb, "shim", "Stream_Switch_Slave_Config_");
+
+    write_port_array(
+        &mut out,
+        "COMPUTE_MASTER_PORTS",
+        "Compute tile stream switch master",
+        "CORE_MODULE",
+        &compute_master,
+    );
+    write_port_array(
+        &mut out,
+        "COMPUTE_SLAVE_PORTS",
+        "Compute tile stream switch slave",
+        "CORE_MODULE",
+        &compute_slave,
+    );
+    write_port_array(
+        &mut out,
+        "MEMTILE_MASTER_PORTS",
+        "MemTile stream switch master",
+        "MEMORY_TILE_MODULE",
+        &memtile_master,
+    );
+    write_port_array(
+        &mut out,
+        "MEMTILE_SLAVE_PORTS",
+        "MemTile stream switch slave",
+        "MEMORY_TILE_MODULE",
+        &memtile_slave,
+    );
+    write_port_array(
+        &mut out,
+        "SHIM_MASTER_PORTS",
+        "Shim tile stream switch master",
+        "PL_MODULE",
+        &shim_master,
+    );
+    write_port_array(
+        &mut out,
+        "SHIM_SLAVE_PORTS",
+        "Shim tile stream switch slave",
+        "PL_MODULE",
+        &shim_slave,
+    );
+
+    fs::write(out_dir.join("gen_stream_ports.rs"), out).unwrap();
+
+    PortArrayData {
+        compute_master,
+        compute_slave,
+        memtile_master,
+        memtile_slave,
+        shim_master,
+        shim_slave,
+    }
+}
+
+/// Collect and sort port entries for a given module and register prefix.
+fn collect_port_array(
+    regdb: &regdb::RegisterDb,
+    module_name: &str,
+    prefix: &str,
+) -> Vec<PortEntry> {
+    let module = regdb
+        .module(module_name)
+        .unwrap_or_else(|| panic!("AM025 JSON missing '{}' module", module_name));
+
+    let mut entries: Vec<(u32, PortEntry)> = module
+        .registers
+        .iter()
+        .filter(|r| r.name.starts_with(prefix))
+        .map(|r| {
+            let suffix = r.name[prefix.len()..].to_string();
+            let (port_type_value, port_type_expr) = suffix_to_port_type(&suffix);
+            (
+                r.offset,
+                PortEntry {
+                    port_type_value,
+                    port_type_expr,
+                    suffix,
+                },
+            )
+        })
+        .collect();
+
+    // Sort by offset to get the canonical hardware port ordering
+    entries.sort_by_key(|(offset, _)| *offset);
+    entries.into_iter().map(|(_, entry)| entry).collect()
+}
+
+/// Map a register name suffix to a port type value and Rust expression.
+fn suffix_to_port_type(suffix: &str) -> (u8, String) {
+    // Special names first
+    if suffix == "AIE_Core0" {
+        return (PT_CORE, "port_type::CORE".to_string());
+    }
+    if suffix == "Tile_Ctrl" {
+        return (PT_CTRL, "port_type::CTRL".to_string());
+    }
+    if suffix.starts_with("FIFO") {
+        return (PT_FIFO, "port_type::FIFO".to_string());
+    }
+    if suffix == "AIE_Trace" || suffix == "Mem_Trace" || suffix == "Trace" {
+        return (PT_TRACE, "port_type::TRACE".to_string());
+    }
+
+    // Directional ports: "North0" or "North_0" formats
+    let directions: &[(&str, u8, &str)] = &[
+        ("North", PT_NORTH_BASE, "north"),
+        ("South", PT_SOUTH_BASE, "south"),
+        ("East", PT_EAST_BASE, "east"),
+        ("West", PT_WEST_BASE, "west"),
+        ("DMA", PT_DMA_BASE, "dma"),
+    ];
+
+    for &(dir_prefix, base, fn_name) in directions {
+        if let Some(rest) = suffix.strip_prefix(dir_prefix) {
+            // Handle both "North0" and "North_0" formats
+            let num_str = rest.strip_prefix('_').unwrap_or(rest);
+            let n: u8 = num_str.parse().unwrap_or_else(|e| {
+                panic!("Cannot parse port index from suffix '{}': {}", suffix, e)
+            });
+            return (base + n, format!("port_type::{}({})", fn_name, n));
+        }
+    }
+
+    panic!(
+        "Unknown stream switch config suffix: '{}'. \
+         Expected AIE_Core0, Tile_Ctrl, FIFO*, *Trace, or Direction[_]N.",
+        suffix
+    );
+}
+
+/// Write a single port type array constant.
+fn write_port_array(
+    out: &mut String,
+    const_name: &str,
+    doc_prefix: &str,
+    am025_section: &str,
+    entries: &[PortEntry],
+) {
+    writeln!(
+        out,
+        "/// {} port layout (AM025 {}).",
+        doc_prefix, am025_section
+    )
+    .unwrap();
+    writeln!(out, "pub const {}: &[u8] = &[", const_name).unwrap();
+    for (i, entry) in entries.iter().enumerate() {
+        writeln!(
+            out,
+            "    {:<26} // {}: {}",
+            format!("{},", entry.port_type_expr),
+            i,
+            entry.suffix
+        )
+        .unwrap();
+    }
+    writeln!(out, "];\n").unwrap();
+}
+
+// ============================================================================
+// gen_stream_ranges: Stream switch port ranges and config bits
+// ============================================================================
+
+fn gen_stream_ranges(
+    regdb: &regdb::RegisterDb,
+    port_data: &PortArrayData,
+    out_dir: &Path,
+) {
+    let mut out = gen_header("AM025 stream switch port ranges");
+
+    // Extract ENABLE_BIT from any Master_Config register's Master_Enable field
+    let enable_bit = find_master_enable_bit(regdb);
+    writeln!(
+        out,
+        "/// Stream switch master enable bit position (AM025: Master_Enable)"
+    )
+    .unwrap();
+    writeln!(out, "pub const ENABLE_BIT: u32 = {};", enable_bit).unwrap();
+    writeln!(out).unwrap();
+    // SLAVE_SELECT_MASK stays hardcoded -- it's a sub-field within the
+    // Configuration field that the JSON doesn't break out separately.
+    writeln!(
+        out,
+        "/// Slave select mask (5-bit sub-field, not individually specified in AM025)"
+    )
+    .unwrap();
+    writeln!(out, "pub const SLAVE_SELECT_MASK: u32 = 0x1F;").unwrap();
+    writeln!(out).unwrap();
+
+    // Shim port ranges
+    writeln!(out, "/// Shim tile port ranges").unwrap();
+    writeln!(out, "pub mod shim {{").unwrap();
+    write_direction_ranges(&mut out, "NORTH", &port_data.shim_master, &port_data.shim_slave);
+    write_direction_ranges(&mut out, "SOUTH", &port_data.shim_master, &port_data.shim_slave);
+    write_direction_ranges(&mut out, "EAST", &port_data.shim_master, &port_data.shim_slave);
+    write_direction_ranges(&mut out, "WEST", &port_data.shim_master, &port_data.shim_slave);
+    write_bundle_ranges(&mut out, "TRACE", PT_TRACE, &port_data.shim_master, &port_data.shim_slave);
+    writeln!(out, "}}\n").unwrap();
+
+    // MemTile port ranges
+    writeln!(out, "/// MemTile port ranges").unwrap();
+    writeln!(out, "pub mod mem_tile {{").unwrap();
+    write_direction_ranges(
+        &mut out,
+        "SOUTH",
+        &port_data.memtile_master,
+        &port_data.memtile_slave,
+    );
+    write_direction_ranges(
+        &mut out,
+        "NORTH",
+        &port_data.memtile_master,
+        &port_data.memtile_slave,
+    );
+    write_bundle_ranges(&mut out, "DMA", PT_DMA_BASE, &port_data.memtile_master, &port_data.memtile_slave);
+    write_bundle_ranges(&mut out, "TRACE", PT_TRACE, &port_data.memtile_master, &port_data.memtile_slave);
+    writeln!(out, "}}\n").unwrap();
+
+    // Compute tile port ranges
+    writeln!(out, "/// Compute tile port ranges").unwrap();
+    writeln!(out, "pub mod compute {{").unwrap();
+    write_direction_ranges(
+        &mut out,
+        "SOUTH",
+        &port_data.compute_master,
+        &port_data.compute_slave,
+    );
+    write_direction_ranges(
+        &mut out,
+        "NORTH",
+        &port_data.compute_master,
+        &port_data.compute_slave,
+    );
+    write_direction_ranges(&mut out, "EAST", &port_data.compute_master, &port_data.compute_slave);
+    write_direction_ranges(&mut out, "WEST", &port_data.compute_master, &port_data.compute_slave);
+    write_bundle_ranges(&mut out, "DMA", PT_DMA_BASE, &port_data.compute_master, &port_data.compute_slave);
+    write_bundle_ranges(&mut out, "TRACE", PT_TRACE, &port_data.compute_master, &port_data.compute_slave);
+    writeln!(out, "}}").unwrap();
+
+    fs::write(out_dir.join("gen_stream_ranges.rs"), out).unwrap();
+}
+
+/// Find the first and last port indices for a given direction in the arrays,
+/// and write MASTER_START/END and SLAVE_START/END constants.
+fn write_direction_ranges(
+    out: &mut String,
+    direction: &str,
+    master_ports: &[PortEntry],
+    slave_ports: &[PortEntry],
+) {
+    let dir_base = match direction {
+        "NORTH" => PT_NORTH_BASE,
+        "SOUTH" => PT_SOUTH_BASE,
+        "EAST" => PT_EAST_BASE,
+        "WEST" => PT_WEST_BASE,
+        _ => panic!("Unknown direction: {}", direction),
+    };
+
+    // Find index range for this direction in master ports
+    if let Some((start, end)) = find_port_range(master_ports, dir_base) {
+        writeln!(
+            out,
+            "    /// {}-facing master ports: {}-{} ({} ports)",
+            direction.to_lowercase(),
+            start,
+            end,
+            end - start + 1
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const {}_MASTER_START: u8 = {};",
+            direction, start
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const {}_MASTER_END: u8 = {};",
+            direction, end
+        )
+        .unwrap();
+    }
+
+    // Find index range for this direction in slave ports
+    if let Some((start, end)) = find_port_range(slave_ports, dir_base) {
+        writeln!(
+            out,
+            "    /// {}-facing slave ports: {}-{} ({} ports)",
+            direction.to_lowercase(),
+            start,
+            end,
+            end - start + 1
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const {}_SLAVE_START: u8 = {};",
+            direction, start
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const {}_SLAVE_END: u8 = {};",
+            direction, end
+        )
+        .unwrap();
+    }
+}
+
+/// Find port index range for a bundle type and write START/END constants.
+///
+/// For ranged types (DMA, directional), matches `base <= value < base + 10`.
+/// For single-value types (TRACE, CORE, FIFO), matches `value == base` exactly.
+fn write_bundle_ranges(
+    out: &mut String,
+    bundle: &str,
+    base: u8,
+    master_ports: &[PortEntry],
+    slave_ports: &[PortEntry],
+) {
+    // TRACE/CORE/FIFO are single-value types; directional and DMA are ranged
+    let is_ranged = base >= 10;
+
+    if let Some((start, end)) = find_port_range_flex(master_ports, base, is_ranged) {
+        writeln!(
+            out,
+            "    /// {} master ports: {}-{} ({} ports)",
+            bundle.to_lowercase(),
+            start,
+            end,
+            end - start + 1
+        )
+        .unwrap();
+        writeln!(out, "    pub const {}_MASTER_START: u8 = {};", bundle, start).unwrap();
+        writeln!(out, "    pub const {}_MASTER_END: u8 = {};", bundle, end).unwrap();
+    }
+
+    if let Some((start, end)) = find_port_range_flex(slave_ports, base, is_ranged) {
+        writeln!(
+            out,
+            "    /// {} slave ports: {}-{} ({} ports)",
+            bundle.to_lowercase(),
+            start,
+            end,
+            end - start + 1
+        )
+        .unwrap();
+        writeln!(out, "    pub const {}_SLAVE_START: u8 = {};", bundle, start).unwrap();
+        writeln!(out, "    pub const {}_SLAVE_END: u8 = {};", bundle, end).unwrap();
+    }
+}
+
+/// Find the first and last indices matching a port type.
+///
+/// When `ranged` is true, matches `base <= value < base + 10` (for directional/DMA).
+/// When `ranged` is false, matches `value == base` exactly (for TRACE/CORE/FIFO).
+fn find_port_range_flex(ports: &[PortEntry], base: u8, ranged: bool) -> Option<(u8, u8)> {
+    let mut first = None;
+    let mut last = None;
+
+    for (i, entry) in ports.iter().enumerate() {
+        let matches = if ranged {
+            entry.port_type_value >= base && entry.port_type_value < base + 10
+        } else {
+            entry.port_type_value == base
+        };
+        if matches {
+            if first.is_none() {
+                first = Some(i as u8);
+            }
+            last = Some(i as u8);
+        }
+    }
+
+    first.map(|f| (f, last.unwrap()))
+}
+
+/// Find the first and last indices where port_type_value has the given base
+/// (e.g., PT_NORTH_BASE for any north(N) port).
+fn find_port_range(ports: &[PortEntry], base: u8) -> Option<(u8, u8)> {
+    let mut first = None;
+    let mut last = None;
+
+    for (i, entry) in ports.iter().enumerate() {
+        if entry.port_type_value >= base && entry.port_type_value < base + 10 {
+            if first.is_none() {
+                first = Some(i as u8);
+            }
+            last = Some(i as u8);
+        }
+    }
+
+    first.map(|f| (f, last.unwrap()))
+}
+
+/// Find the Master_Enable bit position from any Stream_Switch_Master_Config register.
+fn find_master_enable_bit(regdb: &regdb::RegisterDb) -> u32 {
+    for module in regdb.modules.values() {
+        for reg in &module.registers {
+            if reg.name.starts_with("Stream_Switch_Master_Config_") {
+                if let Some(field) = reg.field("Master_Enable") {
+                    // Graph crate's BitField has lsb/msb already parsed.
+                    assert_eq!(
+                        field.lsb, field.msb,
+                        "Master_Enable should be a single bit"
+                    );
+                    return field.lsb as u32;
+                }
+            }
+        }
+    }
+    panic!("Master_Enable bit field not found in any Stream_Switch_Master_Config register");
+}

@@ -3,8 +3,8 @@
 //! Every `pub const` that reflects AIE2 hardware data -- register
 //! offsets, memory sizes, per-tile-type resource counts, stream switch
 //! port layouts, timing constants, FoT values, and packet formats --
-//! lives under this module. Additional slices (ISA encodings, trace
-//! event IDs, register/memory-map helpers) land here in Tasks 6-9.
+//! lives under this module. Additional slices (trace event IDs, ISA
+//! encodings, decoder FFI) land here in Tasks 8-10.
 //! Multi-arch support is planned as sibling modules (e.g.,
 //! `xdna_archspec::aie1`, `xdna_archspec::aie2p`) that would mirror
 //! this namespace with different values.
@@ -23,6 +23,11 @@
 //   - pub mod timing, packet, ctrl_packet, fot, processor.
 include!(concat!(env!("OUT_DIR"), "/gen_arch.rs"));
 
+// Port type arrays generated from AM025 Stream_Switch_*_Config registers.
+// Defines COMPUTE_MASTER_PORTS, COMPUTE_SLAVE_PORTS, MEMTILE_MASTER_PORTS,
+// MEMTILE_SLAVE_PORTS, SHIM_MASTER_PORTS, SHIM_SLAVE_PORTS.
+include!(concat!(env!("OUT_DIR"), "/gen_stream_ports.rs"));
+
 /// Per-tile-type subsystem address ranges (generated from ArchModel).
 ///
 /// Submodules: compute, memtile, shim. Each contains `pub mod <subsystem>`
@@ -35,6 +40,13 @@ pub mod subsystems;
 /// OFFSET_START / OFFSET_END. Submodules `memory` and `mem_tile` contain
 /// Lock_Request address-encoding constants for each module type.
 pub mod registers;
+
+/// Stream switch port ranges and configuration bits (from AM025).
+///
+/// Submodules `compute`, `mem_tile`, `shim` each contain
+/// `NORTH_MASTER_START/END`, `SOUTH_MASTER_START/END`, etc.
+/// `ENABLE_BIT` and `SLAVE_SELECT_MASK` live at the module root.
+pub mod stream_switch;
 
 /// Stream switch port type identifier (xdna-emu convention, not hardware).
 ///
