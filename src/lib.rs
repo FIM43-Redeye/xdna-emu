@@ -53,7 +53,7 @@ pub mod fuzzer;
 /// It replaces scattered hardcoded constants with spec-derived values.
 ///
 /// Gen_arch content + port_type now live in xdna_archspec::aie2 and are
-/// re-exported here. Other generators move in Tasks 5-8.
+/// re-exported here. Other generators move in Tasks 5-10.
 pub mod arch {
     pub use xdna_archspec::aie2::*;
 

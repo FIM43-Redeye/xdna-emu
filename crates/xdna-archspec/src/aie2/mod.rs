@@ -2,10 +2,12 @@
 //!
 //! Every `pub const` that reflects AIE2 hardware data -- register
 //! offsets, memory sizes, per-tile-type resource counts, stream switch
-//! port layouts, ISA encodings, timing constants, FoT values, event
-//! IDs -- lives under this module. Multi-arch support is planned as
-//! sibling modules (e.g., `xdna_archspec::aie1`, `xdna_archspec::aie2p`)
-//! that would mirror this namespace with different values.
+//! port layouts, timing constants, FoT values, and packet formats --
+//! lives under this module. Additional slices (ISA encodings, trace
+//! event IDs, register/memory-map helpers) land here in Tasks 6-9.
+//! Multi-arch support is planned as sibling modules (e.g.,
+//! `xdna_archspec::aie1`, `xdna_archspec::aie2p`) that would mirror
+//! this namespace with different values.
 //!
 //! This module's submodules are either `include!()` of
 //! build.rs-generated files in $OUT_DIR or hand-written constants that

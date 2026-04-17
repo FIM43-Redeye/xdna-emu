@@ -1382,6 +1382,13 @@ fn run_aiert_preprocessor(aiert_dir: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+// ---- aie-rt preprocessor parsing (duplicated with xdna-archspec/build.rs) ----
+//
+// The archspec copy uses this logic to cross-validate ArchModel fields.
+// This copy produces gen_aiert_dma/locks/ports.rs via gen_aiert_*(),
+// which aiert_validation.rs includes. Both copies must stay in sync;
+// delete this copy when gen_aiert_* consumers migrate.
+
 // -- Data structures for parsed aie-rt structs --
 
 struct DmaModData {
