@@ -323,3 +323,71 @@ addressed in follow-up commits before Part B proceeds.
   where they can happen atomically after all generators move.
 - Tasks 9 and 10 deferred due to interpreter-type coupling. See their dedicated
   sections above.
+
+---
+
+## Part B Completion
+
+Landed 2026-04-17. Tag: `phase1-subsys-regs-mem`.
+
+### Commits (from partA tag through final tag)
+
+- `5c34b98` docs: subsys1 Part A completion log
+- `0910f33` refactor: add xdna_archspec::aie2::memory_map with derived consts
+- `06e40c9` refactor: migrate memory_map consumers to xdna_archspec::aie2
+- `c403991` refactor: dissolve src/device/registers_spec.rs
+- `8c0f217` docs: registers & memory map design note
+
+### Verification (at tag)
+
+- `cargo test --lib`: `2797 passed; 0 failed; 5 ignored`. (Baseline dropped
+  by 1 from 2798 because Task 15 deleted the `sign_extend_7bit` unit test
+  that lived inside `registers_spec.rs`; the function itself had zero
+  external consumers so it dissolved with the file.)
+- `cargo test -p xdna-archspec --lib`: `138 passed; 1 failed`
+  (`test_full_parse_all_devices`, pre-existing).
+- `cargo build --release`: clean (1m 54s).
+- Bridge `--no-hw -v add_one`: Chess 10/10, Peano 9/9.
+- Full HW bridge + ISA test runs passed at Part A tag (`phase1-subsys-regs-mem-partA`);
+  Part B made only file-level edits (consumer import rewrites, file deletion,
+  docstring) with no semantic changes, so re-running the 40-minute HW suite was
+  not required. `cargo test --lib` baseline + bridge `--no-hw` smoke cover the
+  Part B edit scope.
+
+### Success Criteria Sweep
+
+- `crate::arch` consumer count: 36 (was 37 before Task 15; the drop reflects
+  `registers_spec.rs` being deleted -- it was a self-consumer). Consumers still
+  use `crate::arch::*` paths via the `mod arch` forwarder in
+  `xdna-emu/src/lib.rs`. The remaining ~36 will rewrite to
+  `xdna_archspec::aie2::*` in Subsystem 6 when `mod arch` dissolves.
+- `xdna-emu/build.rs`: 995 lines (far above the plan's original ~80-line
+  target; difference attributable to Tasks 9 and 10 deferrals keeping
+  `extract_aiert`, TableGen extraction, and `compile_llvm_decoder_ffi` in
+  xdna-emu).
+- `xdna-archspec::aie2::memory_map` has all 6 derived consts.
+- `docs/arch/registers-memory-map.md` design note exists.
+- `src/device/registers_spec.rs` deleted.
+- `ArchConfig` trait surface unchanged from Phase 1a (no new methods added
+  in Subsystem 1).
+
+### Follow-ups flagged for Subsystem 6
+
+The single biggest item is the coupled migration:
+
+1. Move `src/tablegen/types.rs` and `src/tablegen/resolver/` to archspec
+   (or factor the interpreter-dependent parts out).
+2. Complete Task 9 (move `build_helpers/` + `gen_tablegen` to archspec,
+   expose as `xdna_archspec::aie2::isa::decoder_tables`).
+3. Complete Task 10 (move `decoder_ffi/` + `compile_llvm_decoder_ffi` to
+   archspec, expose raw extern "C" at `xdna_archspec::aie2::decoder_ffi`;
+   keep the register-name mapping layer in xdna-emu if the coupling stays).
+4. Rewrite the 36 remaining `crate::arch::*` consumers to
+   `xdna_archspec::aie2::*` and delete the `mod arch` forwarder in
+   `xdna-emu/src/lib.rs`.
+5. Delete `extract_aiert` + `gen_aiert_*` from xdna-emu/build.rs (archspec
+   has its own cross-validation copy; once all ISA/FFI infrastructure moves,
+   this duplication dissolves).
+
+After those, `xdna-emu/build.rs` reduces to the XRT plugin install block as
+originally planned for Task 11.
