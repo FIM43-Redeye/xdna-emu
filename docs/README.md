@@ -2,54 +2,52 @@
 
 Technical reference documentation for the xdna-emu project.
 
+## Reference Documents
+
+Living technical reference material:
+
+- [aiesimulator.md](aiesimulator.md) -- AMD aiesimulator integration and usage
+- [dma-reference.md](dma-reference.md) -- DMA engine reference (BD fields,
+  sequences, polling semantics)
+- [driver-diagnostics.md](driver-diagnostics.md) -- XDNA driver debugfs and
+  IOCTL telemetry
+- [programmatic-sources.md](programmatic-sources.md) -- Survey of
+  programmatically-extractable sources of hardware truth
+
 ## Format Specifications
 
-- [XCLBIN Format](formats/xclbin.md) - Container format for NPU binaries
-- [AIE Partition Format](formats/aie_partition.md) - AIE partition section structure
-- [CDO Format](formats/cdo.md) - Configuration Data Objects (tile setup commands)
-- [ELF Format](formats/elf.md) - AIE core ELF executables
+- [XCLBIN Format](formats/xclbin.md) -- Container format for NPU binaries
+- [AIE Partition Format](formats/aie_partition.md) -- AIE partition section
+- [CDO Format](formats/cdo.md) -- Configuration Data Objects
+- [ELF Format](formats/elf.md) -- AIE core ELF executables
 
-## Architecture References
+## Subdirectories
 
-The following documentation will be added as the emulator develops:
+- [`roadmap/`](roadmap/) -- Phase-by-phase project roadmap with status
+  markers (VERIFIED / OBSERVED / CLAIMED)
+- [`investigations/`](investigations/) -- Debugging writeups for notable
+  bugs and hardware behaviors (errata, silicon quirks)
+- [`xdna/`](xdna/) -- AMD AM020/AM025 hardware reference manual extracts
+- [`patches/`](patches/) -- Local patches against upstream projects
+- [`plans/`](plans/) -- Active implementation plans (when present)
+- [`superpowers/specs/`](superpowers/specs/) -- Active design specs from
+  brainstorming sessions
+- [`archive/`](archive/) -- Historical content (completed plans, dated
+  audits, superseded investigations). Not actively maintained; preserved
+  for reference when the git log isn't enough.
 
-- **AIE2 Tile Architecture** - Core, memory, DMA, stream switch per tile
-- **Register Definitions** - Memory-mapped register layout (see NEXT-STEPS.md)
-- **DMA Descriptor Format** - Buffer descriptor structures
-- **Stream Switch Configuration** - Routing and packet switching
-- **Lock/Synchronization** - 64 locks per tile, acquire/release semantics
+## External References
 
-See AMD documentation (AM020, AM025) for authoritative hardware references.
-
-## External Documentation
-
-### AMD Official Docs
-- [AM020 - AIE-ML Architecture Manual](https://docs.amd.com/) - Core architecture
-- [AM025 - AIE-ML Register Reference](https://docs.amd.com/) - Register definitions
-- [UG1304 - Versal ACAP System Software](https://docs.amd.com/r/en-US/ug1304-versal-acap-ssdg) - CDO/PDI formats
+### AMD Official Documentation
+- [AM020 -- AIE-ML Architecture Manual](https://docs.amd.com/)
+- [AM025 -- AIE-ML Register Reference](https://docs.amd.com/)
+- [UG1304 -- Versal ACAP System Software](https://docs.amd.com/r/en-US/ug1304-versal-acap-ssdg)
 
 ### Source Code References
-- **XRT**: `/opt/xilinx/xrt/` - Runtime headers, xclbin definitions
-- **mlir-aie**: `/home/triple/npu-work/mlir-aie/` - Compiler, device models, bootgen
-- **llvm-aie (Peano)**: https://github.com/Xilinx/llvm-aie - ISA definitions
+- **XRT**: `/opt/xilinx/xrt/` -- Runtime headers, xclbin definitions
+- **mlir-aie**: `../mlir-aie/` -- Compiler, device models, bootgen
+- **llvm-aie (Peano)**: https://github.com/Xilinx/llvm-aie -- ISA definitions
+- **aie-rt**: `../aie-rt/` -- Official Xilinx hardware abstraction layer
 
-### Key Files in mlir-aie
-```
-include/aie/Dialect/AIE/IR/AIETargetModel.h  - Device parameters (memory sizes, locks, etc.)
-third_party/bootgen/cdo-*.{h,c}              - CDO format implementation
-lib/Targets/AIETargetCDODirect.cpp           - CDO generation from MLIR
-```
-
-### Key Files in XRT
-```
-include/xrt/detail/xclbin.h    - XCLBIN format definition
-include/aiebu/aiebu_assembler.h - AIE binary utilities
-```
-
-## Test Data
-
-Real xclbin files for testing are available in mlir-aie:
-```
-/home/triple/npu-work/mlir-aie/build/test/npu-xrt/*/aie.xclbin
-/home/triple/npu-work/mlir-aie/programming_examples/*/build/*.xclbin
-```
+See [`../CLAUDE.md`](../CLAUDE.md) for the authoritative source hierarchy
+and how to derive from the toolchain.

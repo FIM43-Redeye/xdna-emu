@@ -559,3 +559,114 @@ now failing, that is a regression to fix before moving on.
 logic fuzzer that generates valid kernels, runs them on both the emulator and
 real NPU hardware, and compares results. This is future work -- do not start
 building it until hand-written test coverage confirms baseline correctness.
+
+## Operational Notes
+
+Durable rules and operational procedures that didn't fit cleanly elsewhere.
+These were previously scattered across Claude memory files; consolidating
+them here keeps the project self-documenting.
+
+### Build discipline
+
+**Rebuild before testing.** The XRT plugin loads `libxdna_emu.so` at
+runtime. `cargo test --lib` does NOT trigger a plugin rebuild, and
+ISA/bridge tests load whatever `.so` is on disk. After any Rust source
+change, run `cargo build` (and `cargo build --release` if release is
+being exercised). Stale `.so`s have produced phantom bugs, including a
+memorable "concurrency bug" that was really just a stale debug lib.
+
+**Profile clarification.** The rule "one build at a time" means one
+invocation of a given target, not one build overall. `cargo build` and
+`cargo build --release` can run concurrently -- cargo handles the
+locking between them. Don't run the same command twice concurrently.
+
+**Stale cargo warnings.** If `cargo build` prints
+`Plugin install failed: Read-only file system (os error 30)` but the
+filesystem is writable, it's a cached warning from a prior
+sandbox-blocked build. `cargo clean -p xdna-emu` (with the matching
+profile) flushes it.
+
+### Test suite costs
+
+- `./scripts/isa-test.sh`: ~5-10 minutes (release build + 123 HW batches)
+- `./scripts/emu-bridge-test.sh`: ~15-30 minutes (dual-compiler, HW + EMU)
+
+These are expensive; don't re-run them just to "check progress." Run
+once after a batch of fixes and examine results. For targeted re-runs,
+use filter arguments or single-test invocations.
+
+**Use tee for long runs.** When backgrounding a test, pipe through tee
+so output is both live-monitorable and logged:
+
+```bash
+./scripts/isa-test.sh 2>&1 | tee /tmp/claude-1000/isa-test.log
+```
+
+A bare redirect hides progress from both sides. (`/tmp` is fine here --
+the log is ephemeral.)
+
+### Hardware testing
+
+**Never run two hardware test suites concurrently.** Bridge tests and
+ISA tests both target the NPU device; running them in parallel causes
+them to fight for the device and both must be killed. Run hardware
+suites sequentially. Pure `cargo test --lib` unit tests are safe to run
+alongside since they don't touch hardware.
+
+### NPU recovery
+
+When the NPU wedges, recovery escalates through:
+
+1. **Driver reload** -- handles most TDR recoveries:
+   ```bash
+   pkexec modprobe -r amdxdna && pkexec modprobe amdxdna
+   ```
+
+2. **Secondary Bus Reset (SBR)** -- remove driver FIRST, then reset the
+   upstream bridge:
+   ```bash
+   pkexec modprobe -r amdxdna
+   pkexec sh -c 'echo 1 > /sys/bus/pci/devices/0000:00:08.2/reset'
+   sleep 5
+   pkexec modprobe amdxdna
+   ```
+
+3. **Suspend/resume** -- `systemctl suspend` power-cycles the
+   SoC-integrated NPU.
+
+4. **Reboot** -- last resort.
+
+FLR (Function Level Reset) on the NPU function is broken; SBR on the
+upstream bridge is the working path. Always remove `amdxdna` before any
+PCIe reset -- the driver holds state that corrupts the device on
+hot-reset. PCIe BDFs shift when hardware changes (e.g., GPU swaps
+renumber the bus); `lspci | grep "IPU Device"` finds the current BDF.
+
+### Working-directory conventions
+
+**Never put tools, scripts, or persistent work products in `/tmp`.**
+This PC cannot suspend and reboots often, which wipes `/tmp`. Tools
+live under `xdna-emu/tools/` or `xdna-emu/scripts/`. Experiment results
+go under `xdna-emu/build/experiments/` or `~/npu-work/experiments/`.
+Only truly ephemeral data (sandbox temp dirs for `cargo test`, log
+tees for a specific run) should use `/tmp/claude-1000/`.
+
+### Developer environment state
+
+These describe the current machine's setup. Other contributors will
+substitute their own values.
+
+- **Kernel**: custom `7.0.0-rc5`. Out-of-tree `amdxdna` loaded via
+  `pkexec insmod path/to/amdxdna.ko` after driver removal.
+- **Chess license**: `HOSTID=f4289d05121f` (bound to current Wi-Fi
+  card; 2 of 3 vendor-permitted swaps remaining).
+- **DNS**: UConn DNS is broken. Fix per-session:
+  `resolvectl dns wlp5s0 8.8.8.8 8.8.4.4` (does not persist across
+  reboot).
+- **mlir-aie venv**: `/home/triple/npu-work/mlir-aie/ironenv/`
+- **PYTHONPATH**: `/home/triple/npu-work/mlir-aie/install/python`
+- **XRT plugin**: `./scripts/rebuild-plugin.sh` builds and installs the
+  debug `.so` by default (`--release` for release). `XDNA_EMU=debug`
+  or `release` selects the lib profile via `XDNA_EMU_DIR` at runtime.
+- **Trace column offset**: emulator col=0 vs HW col=start_col (cosmetic;
+  trace tools should normalize).
