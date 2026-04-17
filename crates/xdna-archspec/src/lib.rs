@@ -13,6 +13,7 @@
 //! The `model_builder` module is factored out so a future `build.rs`
 //! can `#[path]`-include it without pulling in `runtime`'s `Arc`/`LazyLock`.
 
+pub mod aie2;
 pub mod device_model;
 pub mod model_builder;
 pub mod regdb;

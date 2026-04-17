@@ -52,37 +52,10 @@ pub mod fuzzer;
 /// (device model + register database, cross-validated via Confirmed<T>).
 /// It replaces scattered hardcoded constants with spec-derived values.
 ///
-/// Includes:
-/// - Array topology and per-tile-type resource counts (gen_arch.rs)
-/// - Per-tile-type subsystem address ranges (gen_subsystems.rs)
-/// - Stream switch port type arrays (gen_stream_ports.rs)
-/// - Stream switch port ranges and config bits (gen_stream_ranges.rs)
+/// Gen_arch content + port_type now live in xdna_archspec::aie2 and are
+/// re-exported here. Other generators move in Tasks 5-8.
 pub mod arch {
-    include!(concat!(env!("OUT_DIR"), "/gen_arch.rs"));
-
-    /// Stream switch port type identifier.
-    ///
-    /// These are our encoding convention (not hardware register values).
-    /// Each port index in the port arrays maps to one of these types.
-    pub mod port_type {
-        pub const CORE: u8 = 0;
-        pub const FIFO: u8 = 1;
-        pub const TRACE: u8 = 2;
-        /// Tile control port (configuration/debug).
-        /// Per AM025: compute=port 3, memtile=port 6, shim=port 0.
-        pub const CTRL: u8 = 3;
-        pub const NORTH_BASE: u8 = 10;
-        pub const SOUTH_BASE: u8 = 20;
-        pub const EAST_BASE: u8 = 30;
-        pub const WEST_BASE: u8 = 40;
-        pub const DMA_BASE: u8 = 50;
-
-        pub const fn north(n: u8) -> u8 { NORTH_BASE + n }
-        pub const fn south(n: u8) -> u8 { SOUTH_BASE + n }
-        pub const fn east(n: u8) -> u8 { EAST_BASE + n }
-        pub const fn west(n: u8) -> u8 { WEST_BASE + n }
-        pub const fn dma(n: u8) -> u8 { DMA_BASE + n }
-    }
+    pub use xdna_archspec::aie2::*;
 
     /// Subsystem address ranges per tile type (generated from ArchModel).
     pub mod subsystem {
