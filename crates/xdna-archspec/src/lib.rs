@@ -6,11 +6,12 @@
 //! (AIE, AIE2, AIE2P) with all its tile types, registers, and
 //! relationships.
 //!
-//! This crate is a workspace member of xdna-emu. Its own `build.rs`
-//! performs all AIE2 code generation (under `src/aie2/`) and LLVM
-//! MCDisassembler FFI compilation. Runtime users import from `runtime`
-//! for `ArchConfig`/`ModelConfig` or from `aie2` for generated
-//! const data.
+//! This crate is a workspace member of xdna-emu, usable as both a
+//! library dependency (for runtime queries) and a build dependency
+//! (for compile-time code generation from the validated spec).
+//! Runtime users import from `runtime` for `ArchConfig`/`ModelConfig`.
+//! The `model_builder` module is factored out so a future `build.rs`
+//! can `#[path]`-include it without pulling in `runtime`'s `Arc`/`LazyLock`.
 
 pub mod device_model;
 pub mod model_builder;
