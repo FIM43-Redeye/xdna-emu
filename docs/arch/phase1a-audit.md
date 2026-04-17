@@ -327,3 +327,23 @@ memory -- they are different values (64KB data vs 16KB program on AIE2
 compute tiles).  With this field added, the only non-port dependency on
 `crate::arch` is removed from the trait implementation, making Option A
 fully viable.
+
+---
+
+## TileType vs TileKind Resolution
+
+Task 2 outcome.
+
+The two enums are structurally incompatible (3 vs 4 variants; name mismatch
+`MemTile`/`Mem`; extra `ShimPl` that has no runtime equivalent), so a plain
+type-alias cannot be used.
+
+**Resolution:** `From<TileKind> for TileType` and `From<TileType> for TileKind`
+added in `src/device/tile/core_state.rs` (commit `43fc807`). `ShimPl` collapses
+to `Shim` (lossy, documented, and tested). `TileType::Shim` promotes to
+`TileKind::ShimNoc` (emulator invariant: no `ShimPl` tiles exist in the array).
+
+Deep rename (`TileType::MemTile` -> `Mem`, etc.) is deferred to the Tile
+Topology subsystem pass (Subsystem 2). `ArchConfig` will take/return `TileKind`
+at its interface after Task 3 moves the trait into the crate; runtime callers
+using `TileType` convert via `.into()` at the boundary.
