@@ -210,4 +210,66 @@ revert commit:
 - The `cargo:rerun-if-changed=<bridge_path>` print is hoisted to the rebuild-trigger
   block near the top of `main()`, not left inline before the `gen_trace_events` call.
 
-Tasks 10 and 11 proceed normally in Subsystem 1.
+Tasks 10 and 11 are also deferred; see sections below.
+
+---
+
+## Task 10 Deferral
+
+Task 10 of the Subsystem 1 plan intended to move the `decoder_ffi/` directory
+(C++ source for the LLVM disassembler bridge) and its associated `cc` build-dep
+into `xdna-archspec`.
+
+The move cannot complete cleanly without also relocating the Rust-side FFI
+consumers. The `extern "C"` declarations and their wrappers live in
+`src/tablegen/decoder_ffi.rs` (1,185 lines) and are enmeshed with
+`interpreter::bundle::slot::Operand` via `MappedOperand`, `RegisterMap`, and
+`classify_reg_name`. Moving the C++ side without those Rust types would leave
+dangling cross-crate FFI boundaries that the type system cannot enforce.
+
+Moving those interpreter types to archspec is a larger restructuring that belongs
+to Subsystem 6 (ISA Decode) per the parent refactor design. Task 10 is deferred
+there.
+
+As a result:
+- `decoder_ffi/` remains at `xdna-emu/decoder_ffi/` (not moved).
+- `xdna-emu/Cargo.toml` retains `cc = "1"` in `[build-dependencies]`.
+- `xdna-emu/build.rs` retains `compile_llvm_decoder_ffi` and `run_llvm_config`.
+
+---
+
+## Task 11 Reduced Scope
+
+Task 11's original goal was to reduce `xdna-emu/build.rs` to the XRT plugin
+install block, removing all codegen and FFI compile once Tasks 9 and 10 had
+relocated their respective pieces. Since both Tasks 9 and 10 are deferred to
+Subsystem 6, the full build.rs shrinkage is also deferred.
+
+**What Task 11 actually did (reduced scope):**
+
+1. Updated the `xdna-emu/build.rs` header doc to accurately describe the hybrid
+   state: what still lives there, why, and that Subsystem 6 is the cleanup trigger.
+2. Added per-line comments to `xdna-emu/Cargo.toml`'s `[build-dependencies]`
+   block, explaining why each dep is still needed and which subsystem removes it.
+3. Updated the plan (`docs/superpowers/plans/2026-04-17-subsys1-regs-mem.md`)
+   with a Task 10 deferral note and replaced Task 11's step list with a
+   reduced-scope note.
+4. Updated this audit with Task 10 Deferral and Task 11 Reduced Scope sections.
+
+**Current build.rs state (pending Subsystem 6):**
+
+Still present:
+- `extract_aiert` + ~10 parsing helpers + `gen_aiert_dma` / `gen_aiert_locks` / `gen_aiert_ports` (feeds `src/device/aiert_validation.rs`)
+- `#[path = "build_helpers/mod.rs"] mod build_helpers` + `extract_all` / `generate_tablegen_file` (feeds `src/tablegen/` via `gen_tablegen.rs`)
+- `compile_llvm_decoder_ffi` + `run_llvm_config` + `llvm_aie_path` resolution
+- XRT plugin install logic
+
+Will move in Subsystem 6:
+- The entire `extract_aiert` + `gen_aiert_*` block (with `build_arch_model` call)
+- The entire TableGen extraction block + `build_helpers/` directory
+- The entire `decoder_ffi/` compile + FFI Rust consumers
+
+**Verification numbers (as of this commit):**
+- `crate::arch` consumers: 37 files (unchanged from pre-Task-4 baseline; cleanup deferred with Tasks 9/10)
+- `mod arch` in `src/lib.rs`: simplified forwarder (`pub use xdna_archspec::aie2::*` + `subsystem` compat shim)
+- `gen_*` functions remaining in `xdna-emu/build.rs`: 4 (`gen_header`, `gen_aiert_dma`, `gen_aiert_locks`, `gen_aiert_ports`)

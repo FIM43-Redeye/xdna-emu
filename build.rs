@@ -1,18 +1,34 @@
-//! Build-time code generation for xdna-emu.
+//! Build script for xdna-emu.
 //!
-//! Architecture data generation (ArchModel, AM025 registers, stream switch
-//! port arrays/ranges, subsystem ranges, core/lock registers, trace event codes)
-//! has moved to `crates/xdna-archspec/build.rs`. This script handles the
-//! remaining xdna-emu-specific outputs.
+//! After Phase 1b Subsystem 1 (registers & memory map), most arch-data
+//! code generation has moved to `crates/xdna-archspec/build.rs`. What remains
+//! here pending Subsystem 6 (ISA Decode):
+//!
+//! - `extract_aiert` + helpers + `gen_aiert_dma` / `gen_aiert_locks` / `gen_aiert_ports`
+//!   (outputs consumed by `src/device/aiert_validation.rs`).
+//!   These duplicate their archspec counterparts; the cross-validation
+//!   side-effect on ArchModel is unique to archspec's copy.
+//!
+//! - TableGen extraction block via `#[path = "build_helpers/mod.rs"]`
+//!   (produces `gen_tablegen.rs` for `src/tablegen/`). Deferred to
+//!   Subsystem 6 because `gen_tablegen`'s output references interpreter
+//!   types that must move together.
+//!
+//! - `compile_llvm_decoder_ffi` + LLVM link (compiles
+//!   `decoder_ffi/aie2_decoder.cpp`). Deferred to Subsystem 6 because
+//!   the Rust-side FFI consumers live inside `src/tablegen/` and are
+//!   coupled to `interpreter::bundle::slot::Operand`.
+//!
+//! - XRT plugin install logic (always belongs in xdna-emu).
+//!
+//! When Subsystem 6 runs, `extract_aiert` + `gen_aiert_*` + the TableGen block
+//! + the FFI compile all move, leaving only plugin install here.
 //!
 //! Generated files (written to `$OUT_DIR/`):
 //! - `gen_aiert_dma.rs`     -- aie-rt DMA module data (included by `aiert_validation`)
 //! - `gen_aiert_locks.rs`   -- aie-rt lock module data (included by `aiert_validation`)
 //! - `gen_aiert_ports.rs`   -- aie-rt port module data (included by `aiert_validation`)
 //! - `gen_tablegen.rs`      -- complete instruction decoder tables (included by `tablegen` module)
-//!
-//! In addition, this script compiles the LLVM decoder FFI (`decoder_ffi/`)
-//! and rebuilds+installs the XRT plugin (`xrt-plugin/`).
 
 #[path = "build_helpers/mod.rs"]
 mod build_helpers;

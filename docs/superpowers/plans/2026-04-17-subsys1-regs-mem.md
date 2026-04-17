@@ -1184,6 +1184,13 @@ EOF
 
 ### Task 10: Move `decoder_ffi/` (aie2_decoder.cpp + LLVM link) into `xdna-archspec`
 
+> **Deferred.** The decoder_ffi `extern "C"` block lives in
+> `src/tablegen/decoder_ffi.rs` (1,185 lines), enmeshed with
+> `interpreter::bundle::slot::Operand` via `MappedOperand` /
+> `RegisterMap` / `classify_reg_name`. A clean move requires
+> moving or abstracting those interpreter types, which belongs to
+> Subsystem 6 (ISA Decode). Deferred there.
+
 **Files:**
 - Move: `decoder_ffi/` directory
 - Modify: `crates/xdna-archspec/Cargo.toml` (add `cc` build-dep)
@@ -1334,117 +1341,80 @@ EOF
 
 ---
 
-### Task 11: Final cleanup -- shrink `xdna-emu/build.rs` to plugin-install only
+### Task 11: Document hybrid build.rs state (reduced scope)
 
-**Files:**
-- Modify: `build.rs` (xdna-emu)
-- Modify: `xdna-emu/Cargo.toml` (remove `xdna-archspec` build-dep)
+> **Reduced scope.** Tasks 9 and 10 were deferred to Subsystem 6 (see their
+> deferral notes above). Their deferral blocks the original goal of reducing
+> `xdna-emu/build.rs` to plugin-install only. Instead, Task 11 updates
+> documentation to accurately reflect the hybrid state: what remains in
+> `xdna-emu/build.rs`, why each piece is still there, and that Subsystem 6
+> is the trigger for the remaining cleanup.
+>
+> The full build.rs shrinkage (Steps 1-2 of the original plan) will execute
+> as the last step of Subsystem 6, once `extract_aiert` + `gen_aiert_*`,
+> the TableGen block, and the FFI compile have all moved together with their
+> coupled interpreter types.
+>
+> The verification steps below still apply -- with adjusted expected values
+> (non-zero `crate::arch` consumers, non-empty `build.rs`, `build_helpers/`
+> and `decoder_ffi/` still present at their original paths).
 
-- [ ] **Step 1: Reduce `xdna-emu/build.rs` to the XRT plugin install block**
+**Files modified in reduced scope:**
+- `build.rs` (xdna-emu) -- header doc updated to describe hybrid state
+- `xdna-emu/Cargo.toml` -- `[build-dependencies]` has per-line comments explaining why each dep is still needed
+- `docs/superpowers/plans/2026-04-17-subsys1-regs-mem.md` -- Task 10 deferral note + this reduced-scope note
+- `docs/arch/subsys1-audit.md` -- Task 10 Deferral + Task 11 Reduced Scope sections
 
-The file should consist of: the doc comment, the imports (`std::env`, `std::fs`, `std::path::{Path, PathBuf}`, `std::process::Command`), and the plugin-install `main()` body (which was at the end of the original, starting around line 211). Delete everything else.
+- [x] **Step 1: Update `xdna-emu/build.rs` header doc**
 
-Final structure:
+Replace the existing header doc with text that names what still lives
+in `xdna-emu/build.rs` and why each item awaits Subsystem 6.
 
-```rust
-//! Build script for xdna-emu.
-//!
-//! All arch-data codegen and the LLVM decoder FFI compile have moved
-//! to xdna-archspec (Phase 1b Subsystem 1). This script now only
-//! handles XRT plugin installation to /opt/xilinx/xrt/lib/.
+- [x] **Step 2: Update `xdna-emu/Cargo.toml` build-deps**
 
-use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
+Add per-line comments to each build-dep entry explaining why it is still
+pulled in and which subsystem removes it.
 
-fn main() {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-
-    // Rebuild triggers for plugin C++ sources.
-    let plugin_src = manifest_dir.join("xrt-plugin/src");
-    if plugin_src.exists() {
-        for entry in fs::read_dir(&plugin_src).unwrap() {
-            let entry = entry.unwrap();
-            println!("cargo:rerun-if-changed={}", entry.path().display());
-        }
-        println!("cargo:rerun-if-changed=xrt-plugin/CMakeLists.txt");
-    }
-
-    // Only build the plugin if the cmake build directory exists.
-    // First-time setup still requires:
-    //   mkdir -p xrt-plugin/build && cd xrt-plugin/build && cmake ..
-    let plugin_build = manifest_dir.join("xrt-plugin/build");
-    let xrt_lib = Path::new("/opt/xilinx/xrt/lib");
-    if plugin_build.join("CMakeCache.txt").exists() && xrt_lib.exists() {
-        // <paste the plugin-install block from the old build.rs here verbatim>
-    }
-}
-```
-
-Paste the plugin-install `if` body from the original build.rs (the block starting `let result = std::process::Command::new("cmake")` through the end of the outer `if`).
-
-- [ ] **Step 2: Remove the `xdna-archspec` build-dep from xdna-emu/Cargo.toml**
-
-The build.rs no longer uses `xdna-archspec` (it was used for the `build_arch_model` call). Top-level `Cargo.toml`'s `[build-dependencies]`:
-
-```toml
-[build-dependencies]
-serde_json = "1"
-```
-
-(Or even empty if serde_json is also unused -- verify with a quick `cargo build` after.)
-
-- [ ] **Step 3: Verify zero `crate::arch` references remain in source**
+- [x] **Step 3: Verify `mod arch` is the simplified forwarder**
 
 ```bash
-rg 'crate::arch\b' src/ examples/ tests/ xrt-plugin/ 2>&1
+rg -A 10 'pub mod arch' src/lib.rs
 ```
 
-Expected: no matches. If any remain, rewrite them to `xdna_archspec::aie2::...` and rebuild.
+Expected: `pub use xdna_archspec::aie2::*;` + `pub mod subsystem { pub use xdna_archspec::aie2::subsystems::*; }`. If more complex, flag as a regression.
 
-- [ ] **Step 4: Verify zero codegen include sites remain in xdna-emu source**
+- [x] **Step 4: Count `crate::arch` consumers**
 
 ```bash
-rg 'include!\(concat!\(env!\("OUT_DIR"\)' src/ build.rs
+rg -l 'crate::arch\b' src/ examples/ tests/ xrt-plugin/ | wc -l
 ```
 
-Expected: no matches outside of registers_spec.rs's forwarders, which were removed in Task 6 Step 4.
+Expected: ~37 (pre-Task-4 baseline; cleanup is deferred alongside Tasks 9/10).
 
-- [ ] **Step 5: Verify the original build_helpers/ and decoder_ffi/ directories are gone**
+- [x] **Step 5: Verify `build_helpers/` and `decoder_ffi/` still present**
 
 ```bash
-ls build_helpers decoder_ffi 2>&1
+ls build_helpers decoder_ffi
 ```
 
-Expected: both say "No such file or directory" (the git mv in Tasks 9 and 10 relocated them under `crates/xdna-archspec/`).
+Expected: both exist (deferred Tasks 9 and 10 did not move them).
 
-- [ ] **Step 6: Build + test + bridge smoke**
+- [x] **Step 6: Build + test + bridge smoke**
 
 ```bash
 cargo build
-cargo test --lib
+TMPDIR=/tmp/claude-1000 cargo test --lib
 cargo test -p xdna-archspec --lib
 ./scripts/emu-bridge-test.sh --no-hw -v add_one
 ```
 
-- [ ] **Step 7: Commit**
+Expected: baseline unchanged -- only doc comments and Cargo.toml comments modified.
 
-```bash
-git add -A
-git commit -m "$(cat <<'EOF'
-refactor: shrink xdna-emu/build.rs to plugin install only
+- [x] **Step 7: Commit**
 
-All arch-data codegen and the LLVM decoder FFI now live in
-xdna-archspec (Tasks 4-10). xdna-emu/build.rs is reduced to the XRT
-plugin install logic and xdna-archspec is removed from its
-build-deps.
-
-No references to crate::arch remain under xdna-emu/src.
-
-Generated using Claude Code.
-EOF
-)"
-```
+Commit with message describing: Tasks 9+10 deferral rationale, Task 11
+reduced scope, what was updated (build.rs header, Cargo.toml comments,
+plan and audit docs).
 
 ---
 
