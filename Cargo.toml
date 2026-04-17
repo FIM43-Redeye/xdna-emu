@@ -66,10 +66,8 @@ vcd-recording = ["dep:vcd"]
 [build-dependencies]
 serde_json = "1"                              # Used by extract_aiert for JSON Value parsing
 xdna-archspec = { path = "crates/xdna-archspec" }
-# tblgen is used by build_helpers (now at crates/xdna-archspec/build_helpers/) which
-# xdna-emu/build.rs includes via #[path]. Full migration to archspec awaits type refactor.
 tblgen = { git = "https://github.com/FIM43-Redeye/tblgen-rs.git", branch = "feat/varbit-init", default-features = false, features = ["llvm21-0"] }
-cc = "1"                                      # C++ compilation for LLVM decoder FFI (Task 10)
+cc = "1"                                      # C++ compilation for LLVM decoder FFI
 
 [dev-dependencies]
 hex = "0.4"                                             # Hex dump utilities for debugging

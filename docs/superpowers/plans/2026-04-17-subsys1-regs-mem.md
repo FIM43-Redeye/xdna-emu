@@ -1044,6 +1044,14 @@ EOF
 
 ### Task 9: Move `build_helpers/` into `xdna-archspec`
 
+> **Deferred.** This task is not executed in Subsystem 1. The generated
+> `gen_tablegen.rs` references `super::super::types::*` and
+> `super::super::resolver::*` which resolve to xdna-emu's
+> `src/tablegen/{types.rs, resolver/}`. Moving `gen_tablegen` to archspec
+> requires moving those types + resolver too -- a restructuring that
+> belongs to Subsystem 6 (ISA Decode). Task 9 is deferred there. Tasks 10
+> and 11 proceed normally.
+
 **Files:**
 - Move: `build_helpers/` directory
 - Modify: `crates/xdna-archspec/Cargo.toml` (add `tblgen` build-dep)

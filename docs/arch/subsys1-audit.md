@@ -184,3 +184,30 @@ Definition and tests in `src/device/registers_spec.rs` (takes `u32`, public):
 | `src/device/regdb/tests.rs` | 596 | `core_module as cm` |
 | `src/device/state/compute.rs` | 434 | `core_module as cm` |
 | `src/device/state/compute.rs` | 478 | `core_module as cm` |
+
+---
+
+## Task 9 Deferral
+
+Task 9 of the Subsystem 1 plan attempted to move `build_helpers/` and `gen_tablegen`
+into `xdna-archspec`. The move cannot complete cleanly without also moving
+`xdna-emu`'s `src/tablegen/types.rs` and `resolver/` -- the generated
+`gen_tablegen.rs` uses `super::super::types::*` and `super::super::resolver::*`
+paths that only resolve when the code lives inside xdna-emu's module tree.
+
+Moving those types + resolver to archspec is a larger restructuring that belongs
+to Subsystem 6 (ISA Decode) per the parent refactor design. Task 9 is deferred
+there.
+
+The implementation attempt (commit 1052889) was reverted in the follow-up commit.
+`build_helpers/` remains at `xdna-emu/build_helpers/` and `xdna-emu/build.rs`
+continues to reference it via `#[path = "build_helpers/mod.rs"]` as before Task 9.
+
+The two Task 8 review nits that were bundled into 1052889 were preserved in the
+revert commit:
+- `gen_trace_events` in `crates/xdna-archspec/build.rs` takes `workspace_root`
+  as an explicit parameter (instead of re-deriving via `bridge_path.parent().parent()`).
+- The `cargo:rerun-if-changed=<bridge_path>` print is hoisted to the rebuild-trigger
+  block near the top of `main()`, not left inline before the `gen_trace_events` call.
+
+Tasks 10 and 11 proceed normally in Subsystem 1.

@@ -9,18 +9,12 @@
 //! - `gen_aiert_dma.rs`     -- aie-rt DMA module data (included by `aiert_validation`)
 //! - `gen_aiert_locks.rs`   -- aie-rt lock module data (included by `aiert_validation`)
 //! - `gen_aiert_ports.rs`   -- aie-rt port module data (included by `aiert_validation`)
-//! - `gen_tablegen.rs`      -- complete ISA decoder tables (included by `src/tablegen/`)
+//! - `gen_tablegen.rs`      -- complete instruction decoder tables (included by `tablegen` module)
 //!
 //! In addition, this script compiles the LLVM decoder FFI (`decoder_ffi/`)
 //! and rebuilds+installs the XRT plugin (`xrt-plugin/`).
-//!
-//! Note: `build_helpers/` has moved to `crates/xdna-archspec/build_helpers/` as
-//! its canonical home. This build.rs references it from that location. The
-//! `tblgen` build-dep is still required here because xdna-emu generates
-//! `gen_tablegen.rs` into its own OUT_DIR for `src/tablegen/`. Full migration
-//! to archspec awaits type migration in a future task.
 
-#[path = "crates/xdna-archspec/build_helpers/mod.rs"]
+#[path = "build_helpers/mod.rs"]
 mod build_helpers;
 
 use std::collections::HashMap;
@@ -134,12 +128,10 @@ fn main() {
     // Full TableGen extraction for decoder tables (build-time)
     // ========================================================================
 
-    // Rebuild triggers for build_helpers source files.
-    // build_helpers/ lives at crates/xdna-archspec/build_helpers/ (moved in Task 9).
+    // Rebuild triggers for build_helpers source files
     for helper in &["mod.rs", "extract.rs", "records.rs", "semantics.rs",
-                     "cpp_switch.rs", "bytecode.rs", "codegen.rs",
-                     "element_type_logic.rs"] {
-        println!("cargo:rerun-if-changed=crates/xdna-archspec/build_helpers/{}", helper);
+                     "cpp_switch.rs", "bytecode.rs", "codegen.rs"] {
+        println!("cargo:rerun-if-changed=build_helpers/{}", helper);
     }
 
     let aie2_td = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2.td");
