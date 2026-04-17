@@ -1050,7 +1050,7 @@ EOF
 > `src/tablegen/{types.rs, resolver/}`. Moving `gen_tablegen` to archspec
 > requires moving those types + resolver too -- a restructuring that
 > belongs to Subsystem 6 (ISA Decode). Task 9 is deferred there. Tasks 10
-> and 11 proceed normally.
+> and 11 were also affected -- see their deferral / reduced-scope notes below.
 
 **Files:**
 - Move: `build_helpers/` directory
