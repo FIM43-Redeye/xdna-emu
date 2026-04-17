@@ -56,6 +56,12 @@ pub mod stream_switch;
 /// Falls back to stub functions returning "UNKNOWN" when mlir-aie is absent.
 pub mod trace_events;
 
+/// Derived memory-map constants (AIE_DATA_MEMORY_BASE, PROGRAM_MEMORY_BASE, etc.).
+///
+/// All values are computed from other `aie2` submodule constants so that
+/// memory-map arithmetic has a single home inside `xdna-archspec`.
+pub mod memory_map;
+
 /// Stream switch port type identifier (xdna-emu convention, not hardware).
 ///
 /// Each port index in the port arrays maps to one of these types. This
