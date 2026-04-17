@@ -23,6 +23,12 @@
 //   - pub mod timing, packet, ctrl_packet, fot, processor.
 include!(concat!(env!("OUT_DIR"), "/gen_arch.rs"));
 
+/// Per-tile-type subsystem address ranges (generated from ArchModel).
+///
+/// Submodules: compute, memtile, shim. Each contains `pub mod <subsystem>`
+/// with `OFFSET_START` and `OFFSET_END` consts.
+pub mod subsystems;
+
 /// Stream switch port type identifier (xdna-emu convention, not hardware).
 ///
 /// Each port index in the port arrays maps to one of these types. This

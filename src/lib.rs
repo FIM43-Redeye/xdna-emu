@@ -58,8 +58,11 @@ pub mod arch {
     pub use xdna_archspec::aie2::*;
 
     /// Subsystem address ranges per tile type (generated from ArchModel).
+    /// Forwards to xdna_archspec::aie2::subsystems; consumers still use
+    /// `crate::arch::subsystem::*` under the singular name until Task 11
+    /// renames them.
     pub mod subsystem {
-        include!(concat!(env!("OUT_DIR"), "/gen_subsystems.rs"));
+        pub use xdna_archspec::aie2::subsystems::*;
     }
 
     // Port type arrays generated from AM025 Stream_Switch_*_Config registers.
