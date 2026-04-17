@@ -274,7 +274,7 @@ impl DeviceState {
             }
 
             SubsystemKind::ProgramMemory => {
-                use crate::device::registers_spec::PROGRAM_MEMORY_BASE;
+                use xdna_archspec::aie2::memory_map::PROGRAM_MEMORY_BASE;
                 // Write to program memory
                 let tile = self.array.get_mut(tile_addr.col, tile_addr.row).unwrap();
                 let pm_offset = offset - PROGRAM_MEMORY_BASE as usize;
@@ -299,7 +299,7 @@ impl DeviceState {
             }
 
             _ => {
-                use crate::device::registers_spec::MEM_TILE_DATA_MEMORY_END;
+                use xdna_archspec::aie2::memory_map::MEM_TILE_DATA_MEMORY_END;
                 // Could be register array writes - handle as data
                 let tile = self.array.get_mut(tile_addr.col, tile_addr.row).unwrap();
                 if offset <= MEM_TILE_DATA_MEMORY_END as usize

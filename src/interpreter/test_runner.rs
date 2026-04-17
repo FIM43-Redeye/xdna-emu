@@ -169,7 +169,7 @@ impl TestRunner {
                     tile.write_program(vaddr, data);
                 }
                 crate::parser::MemoryRegion::Data => {
-                    use crate::device::registers_spec::AIE_DATA_MEMORY_BASE;
+                    use xdna_archspec::aie2::memory_map::AIE_DATA_MEMORY_BASE;
                     // Load into data memory (offset from data memory base)
                     let dm_offset = vaddr.saturating_sub(AIE_DATA_MEMORY_BASE as usize);
                     let dm = tile.data_memory_mut();
@@ -2175,7 +2175,7 @@ mod tests {
                                 data.len(), vaddr);
                         }
                         MemoryRegion::Data => {
-                            use crate::device::registers_spec::AIE_DATA_MEMORY_BASE;
+                            use xdna_archspec::aie2::memory_map::AIE_DATA_MEMORY_BASE;
                             let dm_offset = vaddr.saturating_sub(AIE_DATA_MEMORY_BASE as usize);
                             let dm = tile.data_memory_mut();
                             if dm_offset + data.len() <= dm.len() {
