@@ -40,7 +40,7 @@ fn main() {
     let mlir_aie = env::var("MLIR_AIE_PATH").unwrap_or_else(|_| {
         workspace_root
             .parent()
-            .expect("workspace root has no parent")
+            .expect("workspace root has no parent -- set MLIR_AIE_PATH to override")
             .join("mlir-aie")
             .to_string_lossy()
             .to_string()
@@ -54,7 +54,6 @@ fn main() {
     println!("cargo:rerun-if-changed={}", am025_path.display());
     println!("cargo:rerun-if-changed={}", device_model_path.display());
     println!("cargo:rerun-if-env-changed=MLIR_AIE_PATH");
-    println!("cargo:rerun-if-env-changed=LLVM_AIE_PATH");
     println!("cargo:rerun-if-changed=build.rs");
 
     // Tasks 4-11 add actual codegen calls here.
