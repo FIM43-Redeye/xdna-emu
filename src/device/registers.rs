@@ -18,7 +18,7 @@
 //! ```
 
 use std::fmt;
-use crate::archspec::{SubsystemKind, TileKind};
+use xdna_archspec::types::{SubsystemKind, TileKind};
 
 /// Decoded tile address with column, row, and register offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
