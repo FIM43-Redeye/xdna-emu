@@ -278,3 +278,49 @@ Future hygiene: have archspec's build.rs set `LLVM_SYS_210_PREFIX` explicitly so
 - Plan's Tasks 3, 4, 5 (move types, resolver, decoder_bytecode independently) merged into a single mega-move because circular `super::` references between them required simultaneous relocation. Part of Task 6 (element_type_logic runtime copy) and part of Task 10 (decoder_ffi split at line 346) were absorbed into the same commit (`11f1275`) for the same reason.
 - Plan's Task 10 reduced scope: the split already happened in the mega-move. Final register_map relocation to `interpreter::decode` is Task 13, in Part B.
 - Plan's Task 7 Step 3a (codegen string path rewrite `super::super::` -> `super::`) skipped because both module trees have a `mod generated { include!() }` wrapper that preserves the two-level depth. Paths left unchanged.
+
+---
+
+## Part B Completion Log (2026-04-18)
+
+Part B closed out at `phase1-subsys-isa-decode`. Seven tasks landed on top of Part A:
+
+| Task | Subject | Commit |
+|------|---------|--------|
+| 13 | Move `src/tablegen/register_map.rs` -> `src/interpreter/decode/register_map.rs`; rewrite 10 `AccumWidth` consumers | `bb99951` |
+| 14 | Atomic sed rewrite of 29 `crate::tablegen::*` consumers to `xdna_archspec::aie2::isa::*` (+ 1 doc-comment) | `0e6982b` |
+| 15 | Atomic sed rewrite of 36 `crate::arch::*` consumers to `xdna_archspec::aie2::*`; `use crate::arch;` -> alias; `subsystem` -> `subsystems as subsystem` alias | `f07ecfb` |
+| 16 | Delete `src/tablegen/`; remove `mod arch { ... }` / `mod tablegen` from `src/lib.rs`; fix `src/bin/export_isa.rs` import; rescue 21 tests to archspec + register_map | `454a608` |
+| 17 | Shrink `build.rs` 201 -> 97 lines (plugin install only); empty xdna-emu `[build-dependencies]` | `9aafa8c` |
+| 18 | `docs/arch/isa-decode.md` design note | `d3338a6` |
+| 19 | Full HW bridge + ISA gate; tag `phase1-subsys-isa-decode`; this log; NEXT-STEPS update | (this commit) |
+
+### Part B Deliverables
+
+- [x] `MappedOperand` / `RegisterMap` / `classify_reg_name` / `AccumWidth` live at their interpreter-side canonical path.
+- [x] Zero `crate::tablegen::*` or `crate::arch::*` references remain outside `src/lib.rs` (which no longer has them).
+- [x] `src/tablegen/` directory deleted.
+- [x] `pub mod arch { ... }` and `pub mod tablegen` forwarder blocks removed from `src/lib.rs`.
+- [x] `xdna-emu/build.rs` reduced to XRT plugin install only; no `[build-dependencies]`.
+- [x] Test counts: xdna-emu `2712 passed`, archspec `220 passed` (the 1 failure is the pre-existing `device_model::test_full_parse_all_devices`). Live-test parity preserved with pre-delete count.
+- [x] Full HW bridge + ISA gate: see `/tmp/claude-1000/subsys6-partB-{bridge,isa}.log`.
+
+### Deviations in Part B
+
+- **Task 14 missed `AccumWidth` fixup in the plan's sed script.** `AccumWidth` is emulator-side (not archspec), so the generic `crate::tablegen::*` -> `xdna_archspec::aie2::isa::*` rewrite would have produced a bad path. Task 13 pre-rewrote all 10 `AccumWidth` consumers to `crate::interpreter::decode::register_map::AccumWidth` so Task 14 didn't need to know.
+- **Task 14 caught one unplanned consumer:** `src/interpreter/decode/operand_extraction.rs` combined `operand_from_reg_name` (interpreter-side) with the other decoder_ffi imports in a single `use` block. Split the import: archspec for `decoder_ffi::{self, DecodedOperand, DecodeResult}`, register_map for `{AccumWidth, operand_from_reg_name}`.
+- **Task 15 needed additional fixups beyond the plan's sed.** Six files used bare `use crate::arch;` (module-as-name), rewritten to `use xdna_archspec::aie2 as arch;`. Two files used `use crate::arch::subsystem;` (singular compat shim), rewritten to `use xdna_archspec::aie2::subsystems as subsystem;` to preserve the local short name.
+- **Task 16 deleted 21 tests.** The tests were rescued to their rightful homes (archspec for `load_from_generated` / decoder-FFI tests, `interpreter::decode::register_map` for cross-coverage tests that depend on `reg_map_coverage`). Net live-test count preserved.
+- **Task 17 discovered `build.rs` was still running dead code.** The pre-Part-B build.rs called `build_arch_model` and `confirm_processor_slots` but the returned `arch_model` went unused -- those calls were only emitting `cargo:warning` lines for cross-validation side effects. Removing them dropped the `xdna-archspec` build-dependency entirely; the archspec build.rs owns that validation now.
+
+### Incidental harness fixes (not on the plan)
+
+During Task 12 + 19 verification, the shell bridge harness
+(`scripts/emu-bridge-test.sh`) surfaced two long-standing bugs, both
+fixed in commit `ba86b37`:
+1. `apply_lit_subs` never substituted lit's `%s` macro. Only one test in the tree (`bd_chain_repeat_on_memtile`) uses `FileCheck %s`, but any new test relying on it would have errored out at the harness level.
+2. `XFAIL:` parsing was missing entirely from the shell bridge. The Rust-native `src/testing/` harness had it since March (`b139c29`); the XRT bridge harness did not. Added `is_xfail()` honoring `XFAIL: *` and comma-separated feature lists (`chess`, `peano`); result writers rewrite `FAIL`/`TIMEOUT` -> `XFAIL` and `PASS` -> `XPASS`; summary counters surface both.
+
+### Pre-existing EMU regression flagged during gate
+
+`bd_chain_repeat_on_memtile` EMU side hangs in a DMA `check_acquire_granted granted=false` polling loop and never emits `PASS!`. Bridge result is `FAIL` (not `XFAIL` -- the test has no XFAIL annotation). Traced backward via the bridge-test-results history: passed on 20260414 (pre-Phase-1a), failing by 20260416. Introduced somewhere in Subsystem 1 or earlier Phase-1a work, not in Subsystem 6. Flagged as an independent investigation item; unrelated to this subsystem's deliverables.
