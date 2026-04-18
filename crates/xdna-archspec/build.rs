@@ -19,7 +19,11 @@
 //! - `gen_memtile_lock.rs`    -- mem tile Lock_Request bit constants
 //! - `gen_stream_ranges.rs`   -- stream switch port index ranges
 //! - `trace_event_codes.rs`   -- trace event code tables
+//! - `gen_tablegen.rs`        -- complete instruction decoder tables
 //!
+#[path = "build_helpers/mod.rs"]
+mod build_helpers;
+
 #[path = "src/types.rs"]
 mod types;
 #[path = "src/regdb.rs"]
@@ -128,6 +132,50 @@ fn main() {
 
     // Generate trace event code tables from the mlir-aie Python bridge.
     gen_trace_events(workspace_root, &bridge_path, &out_dir);
+
+    // ========================================================================
+    // TableGen extraction -> gen_tablegen.rs (and per-slot gen_tblgen_slot_*.rs)
+    // LLVM_AIE_PATH env var or sibling llvm-aie directory.
+    // ========================================================================
+
+    let llvm_aie_path = std::path::PathBuf::from(env::var("LLVM_AIE_PATH").unwrap_or_else(|_| {
+        workspace_root
+            .parent()
+            .expect("workspace root has no parent -- set LLVM_AIE_PATH to override")
+            .join("llvm-aie")
+            .to_string_lossy()
+            .to_string()
+    }));
+
+    // Rebuild triggers for build_helpers source files
+    for helper in &["mod.rs", "extract.rs", "records.rs", "semantics.rs",
+                     "cpp_switch.rs", "bytecode.rs", "codegen.rs"] {
+        println!("cargo:rerun-if-changed=build_helpers/{}", helper);
+    }
+
+    let aie2_td = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2.td");
+    if aie2_td.exists() {
+        println!("cargo:rerun-if-changed={}", aie2_td.display());
+        for td in &["AIE2InstrFormats.td", "AIE2InstrInfo.td", "AIE2InstrPatterns.td",
+                     "AIE2Slots.td", "AIE2Schedule.td", "AIE2RegisterInfo.td"] {
+            let p = llvm_aie_path.join(format!("llvm/lib/Target/AIE/{}", td));
+            if p.exists() { println!("cargo:rerun-if-changed={}", p.display()); }
+        }
+        let cpp = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2InstrInfo.cpp");
+        if cpp.exists() { println!("cargo:rerun-if-changed={}", cpp.display()); }
+
+        let extracted = build_helpers::extract::extract_all(&llvm_aie_path)
+            .unwrap_or_else(|e| panic!("TableGen extraction failed: {}", e));
+        println!("cargo:warning=TableGen: extracted {} instructions across {} slots",
+            extracted.total_instructions(), extracted.slot_count());
+        build_helpers::codegen::generate_tablegen_file(&extracted, &out_dir);
+    } else {
+        panic!("llvm-aie not found at {} -- required for build-time TableGen extraction.\n\
+                Set LLVM_AIE_PATH to override.", llvm_aie_path.display());
+    }
+
+    println!("cargo:rerun-if-changed={}", llvm_aie_path.display());
+    println!("cargo:rerun-if-env-changed=LLVM_AIE_PATH");
 }
 
 // ============================================================================

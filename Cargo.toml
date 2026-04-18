@@ -70,9 +70,6 @@ serde_json = "1"
 # Needed for build_arch_model (feeds extract_aiert -> gen_aiert_*) and for
 # RegisterDb used in the aie-rt parsing helpers. Removed in Subsystem 6.
 xdna-archspec = { path = "crates/xdna-archspec" }
-# Used by build_helpers/ (TableGen extraction block -> gen_tablegen.rs).
-# Moves to xdna-archspec in Subsystem 6 alongside the tablegen types.
-tblgen = { git = "https://github.com/FIM43-Redeye/tblgen-rs.git", branch = "feat/varbit-init", default-features = false, features = ["llvm21-0"] }
 # Used by compile_llvm_decoder_ffi (compiles decoder_ffi/aie2_decoder.cpp).
 # Moves to xdna-archspec in Subsystem 6 alongside the FFI consumers in src/tablegen/.
 cc = "1"

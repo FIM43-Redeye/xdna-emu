@@ -4734,6 +4734,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "tblgen",
  "tempfile",
 ]
 
@@ -4760,7 +4761,6 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
- "tblgen",
  "tempfile",
  "thiserror 2.0.17",
  "toml",

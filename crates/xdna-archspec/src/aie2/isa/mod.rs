@@ -15,6 +15,19 @@ pub mod decoder_bytecode;
 pub mod decoder_ffi;
 pub mod element_type_logic;
 
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/gen_tablegen.rs"));
+}
+
+/// Load the complete TableGen model from build-time generated constants.
+///
+/// This is the sole entry point for instruction decoder data. All 600+
+/// instruction encodings, decoder bytecode, scheduling model, register
+/// definitions, and composite format layouts are compiled in.
+pub fn load_from_generated() -> types::TblgenOutput {
+    generated::load_from_generated()
+}
+
 // Re-exports matching xdna-emu's src/tablegen/mod.rs surface so consumers
 // can `use xdna_archspec::aie2::isa::*;` to get the full tablegen API.
 pub use types::*;

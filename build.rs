@@ -1,37 +1,25 @@
 //! Build script for xdna-emu.
 //!
-//! After Phase 1b Subsystem 1 (registers & memory map), most arch-data
-//! code generation has moved to `crates/xdna-archspec/build.rs`. What remains
-//! here pending Subsystem 6 (ISA Decode):
+//! Most arch-data code generation has moved to `crates/xdna-archspec/build.rs`.
+//! What remains here pending later Subsystem 6 tasks:
 //!
 //! - `extract_aiert` + helpers + `gen_aiert_dma` / `gen_aiert_locks` / `gen_aiert_ports`
 //!   (outputs consumed by `src/device/aiert_validation.rs`).
 //!   These duplicate their archspec counterparts; the cross-validation
 //!   side-effect on ArchModel is unique to archspec's copy.
 //!
-//! - TableGen extraction block via `#[path = "build_helpers/mod.rs"]`
-//!   (produces `gen_tablegen.rs` for `src/tablegen/`). Deferred to
-//!   Subsystem 6 because `gen_tablegen`'s output references interpreter
-//!   types that must move together.
-//!
 //! - `compile_llvm_decoder_ffi` + LLVM link (compiles
-//!   `decoder_ffi/aie2_decoder.cpp`). Deferred to Subsystem 6 because
-//!   the Rust-side FFI consumers live inside `src/tablegen/` and are
-//!   coupled to `interpreter::bundle::slot::Operand`.
+//!   `decoder_ffi/aie2_decoder.cpp`). Moves to archspec in Task 9.
 //!
 //! - XRT plugin install logic (always belongs in xdna-emu).
 //!
-//! When Subsystem 6 runs, `extract_aiert` + `gen_aiert_*` + the TableGen block
-//! + the FFI compile all move, leaving only plugin install here.
+//! gen_tablegen.rs moved to xdna-archspec/build.rs in Task 7; consumed via
+//! `xdna_archspec::aie2::isa::load_from_generated()`.
 //!
 //! Generated files (written to `$OUT_DIR/`):
 //! - `gen_aiert_dma.rs`     -- aie-rt DMA module data (included by `aiert_validation`)
 //! - `gen_aiert_locks.rs`   -- aie-rt lock module data (included by `aiert_validation`)
 //! - `gen_aiert_ports.rs`   -- aie-rt port module data (included by `aiert_validation`)
-//! - `gen_tablegen.rs`      -- complete instruction decoder tables (included by `tablegen` module)
-
-#[path = "crates/xdna-archspec/build_helpers/mod.rs"]
-mod build_helpers;
 
 use std::collections::HashMap;
 use std::env;
@@ -139,43 +127,9 @@ fn main() {
     // gen_arch(), gen_subsystems(), gen_core_module(), gen_lock_request(),
     // gen_stream_ports(), gen_stream_ranges(), and gen_trace_events() have all
     // moved to xdna-archspec/build.rs (Tasks 4-8).
-
-    // ========================================================================
-    // Full TableGen extraction for decoder tables (build-time)
-    // ========================================================================
-
-    // Rebuild triggers for build_helpers source files
-    for helper in &["mod.rs", "extract.rs", "records.rs", "semantics.rs",
-                     "cpp_switch.rs", "bytecode.rs", "codegen.rs"] {
-        println!("cargo:rerun-if-changed=crates/xdna-archspec/build_helpers/{}", helper);
-    }
-
-    let aie2_td = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2.td");
-    if aie2_td.exists() {
-        println!("cargo:rerun-if-changed={}", aie2_td.display());
-        for td in &["AIE2InstrFormats.td", "AIE2InstrInfo.td", "AIE2InstrPatterns.td",
-                     "AIE2Slots.td", "AIE2Schedule.td", "AIE2RegisterInfo.td"] {
-            let p = llvm_aie_path.join(format!("llvm/lib/Target/AIE/{}", td));
-            if p.exists() { println!("cargo:rerun-if-changed={}", p.display()); }
-        }
-        let cpp = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2InstrInfo.cpp");
-        if cpp.exists() { println!("cargo:rerun-if-changed={}", cpp.display()); }
-
-        match build_helpers::extract::extract_all(llvm_aie_path) {
-            Ok(output) => {
-                println!("cargo:warning=TableGen: extracted {} instructions across {} slots",
-                    output.total_instructions(), output.slot_count());
-                build_helpers::codegen::generate_tablegen_file(&output, &out_dir);
-            }
-            Err(e) => {
-                panic!("TableGen extraction failed:\n  {}\n\
-                        Set LLVM_AIE_PATH to override.", e);
-            }
-        }
-    } else {
-        panic!("llvm-aie not found at {} -- required for build-time TableGen extraction.\n\
-                Set LLVM_AIE_PATH to override.", llvm_aie_path.display());
-    }
+    //
+    // gen_tablegen.rs now emits from xdna-archspec/build.rs (Task 7).
+    // load_from_generated() is forwarded via pub use in src/tablegen/mod.rs.
 
     // ========================================================================
     // LLVM decoder FFI -- compile aie2_decoder.cpp and link LLVM libraries

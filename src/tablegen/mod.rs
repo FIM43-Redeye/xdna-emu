@@ -29,19 +29,10 @@ pub mod register_map;
 mod resolver;
 mod types;
 
-// Build-time generated instruction tables (per-slot files for parallel compilation)
-mod generated {
-    include!(concat!(env!("OUT_DIR"), "/gen_tablegen.rs"));
-}
-
-/// Load the complete TableGen model from build-time generated constants.
-///
-/// This is the sole entry point for instruction decoder data. All 600+
-/// instruction encodings, decoder bytecode, scheduling model, register
-/// definitions, and composite format layouts are compiled in.
-pub fn load_from_generated() -> types::TblgenOutput {
-    generated::load_from_generated()
-}
+// gen_tablegen.rs now emits from xdna-archspec's build.rs and is included
+// in xdna_archspec::aie2::isa. Forward load_from_generated here so all
+// existing call sites remain unchanged.
+pub use xdna_archspec::aie2::isa::load_from_generated;
 
 pub use resolver::{
     build_decoder_tables, AddressingMode, CompositeEncoder, DecoderIndex, InstrEncoding,
