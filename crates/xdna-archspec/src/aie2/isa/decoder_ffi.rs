@@ -7,7 +7,10 @@
 //! - Output operand classification from MCInstrDesc::NumDefs
 //!
 //! The C side (`decoder_ffi/aie2_decoder.cpp`) is compiled and linked by
-//! build.rs using the `cc` crate and `llvm-config --libs aie`.
+//! **xdna-emu's** build.rs (not this crate's build.rs). The FFI symbols
+//! are resolved at link time when xdna-archspec is linked into xdna-emu.
+//! Subsystem 6 Tasks 8 and 9 will move the C++ compilation into this
+//! crate's build.rs, making archspec self-contained.
 //!
 //! The interpreter-aware half (MappedOperand, RegisterMap, classify_reg_name)
 //! lives in xdna-emu's `tablegen::register_map` (relocates to
