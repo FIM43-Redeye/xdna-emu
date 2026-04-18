@@ -154,24 +154,35 @@ pub trait TileTopology: Send + Sync {
   at array boundaries. `South` returns `None` when `row == SHIM_ROW`; this
   is what `coordinator.rs:578, 705` and `neighbor.rs:80, 135` want.
 
-**New: `TileKind` helper free functions** in archspec (next to the enum
-definition):
+**New: `TileKind` inherent predicate methods** in archspec:
 
 ```rust
-pub fn is_shim(kind: TileKind) -> bool { matches!(kind, TileKind::ShimNoc | TileKind::ShimPl) }
-pub fn is_mem(kind: TileKind) -> bool { matches!(kind, TileKind::Mem) }
-pub fn is_compute(kind: TileKind) -> bool { matches!(kind, TileKind::Compute) }
+impl TileKind {
+    pub const fn is_shim(self) -> bool {
+        matches!(self, TileKind::ShimNoc | TileKind::ShimPl)
+    }
+    pub const fn is_mem(self) -> bool {
+        matches!(self, TileKind::Mem)
+    }
+    pub const fn is_compute(self) -> bool {
+        matches!(self, TileKind::Compute)
+    }
+}
 ```
 
-Or equivalently as inherent methods on `TileKind` -- implementation choice
-left to the plan. Signature intent: predicate collapse of the
-`ShimNoc | ShimPl` pair without forcing every caller to re-write the match.
+Inherent methods (not free functions) because `kind.is_shim()` reads as
+a hardware truth about the discriminant, not an emulator-side convention
+-- it matches how every other discriminant-predicate method in the
+codebase is shaped. `const fn` lets the predicates participate in
+`const`-evaluated contexts if they come up.
 
-**New: `ArchModel::topology(&self) -> &dyn TileTopology`** (or concrete
-`&Aie2Topology` if the plan keeps the whole thing monomorphic in Phase 1;
-either works for Subsystem 2 as long as the trait exists for AIE1 to hook
-later). The concrete object lives inside `ArchModel` (built during
-`load_from_json`) or is a static associated constant -- plan's call.
+**New: `ArchModel::topology(&self) -> &dyn TileTopology`.** Trait-object
+return is the committed shape -- it keeps consumer code non-generic and
+gives AIE1's eventual `Aie1Topology` impl a drop-in hook without
+re-plumbing the accessor. The concrete object lives inside `ArchModel`
+(built during `load_from_json`, stored as a `Box<dyn TileTopology>`
+field) or as a `&'static` reference to a zero-sized impl -- that storage
+choice is a plan-level detail that does not escape archspec's internals.
 
 **Dissolved: `src/device/tile/core_state.rs::TileType`.** The enum
 definition, its three predicate methods (`is_shim`, `is_mem_tile`,
