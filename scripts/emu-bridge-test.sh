@@ -380,6 +380,42 @@ requires_only_compiler() {
   return 0
 }
 
+# Check whether a test is expected to fail.
+#
+# Parses the `XFAIL:` directive in the lit file's header.  Accepted forms:
+#   XFAIL: *              -- expected to fail unconditionally
+#   XFAIL: <feature,...>  -- expected to fail when any listed feature matches
+#
+# We treat the compiler name (chess/peano) as a feature.  Only the first ~40
+# lines are scanned (lit itself only honors directives near the top).
+#
+# Returns 0 if the test is expected to fail for this compiler, 1 otherwise.
+is_xfail() {
+  local src_dir="$1"
+  local compiler="$2"
+  local lit
+  lit="$(find_lit_file "$src_dir")"
+  [[ -n "$lit" ]] || return 1
+  local xfail_line
+  xfail_line="$(head -n 40 "$lit" | grep -oE 'XFAIL:[[:space:]]*[^[:space:]].*' | head -1)" || return 1
+  [[ -n "$xfail_line" ]] || return 1
+  # Strip "XFAIL:" prefix and surrounding whitespace.
+  local spec="${xfail_line#XFAIL:}"
+  spec="${spec#"${spec%%[![:space:]]*}"}"
+  spec="${spec%"${spec##*[![:space:]]}"}"
+  # Strip trailing comment closers (e.g., from C-style `// XFAIL: *`).
+  spec="${spec%%[[:space:]]//*}"
+  # Unconditional XFAIL.
+  [[ "$spec" == "*" ]] && return 0
+  # Feature list -- match on compiler name.
+  local IFS=', '
+  local feat
+  for feat in $spec; do
+    [[ "$feat" == "$compiler" ]] && return 0
+  done
+  return 1
+}
+
 # Extract NPUDEVICE substitution from the test's .lit file.
 get_npu_device() {
   local lit
@@ -403,8 +439,13 @@ get_npu_device() {
 apply_lit_subs() {
   local src_dir="$1"
   local cmd="$2"
+  # %s is lit's "current test file" macro.  Compute it from src_dir so
+  # `FileCheck %s` picks up CHECK: directives in the lit source itself.
+  local lit_file
+  lit_file="$(find_lit_file "$src_dir")"
   cmd="${cmd#*RUN: }"
   cmd="${cmd//'%S'/$src_dir}"
+  [[ -n "$lit_file" ]] && cmd="${cmd//'%s'/$lit_file}"
   cmd="${cmd//'%aietools'/$AIETOOLS_DIR}"
   cmd="${cmd//'%python '/python3 }"
   cmd="${cmd//'%python'/python3}"
@@ -682,7 +723,7 @@ transform_for_peano() {
 }
 
 # Export all helpers for xargs subshells.
-export -f find_lit_file is_standard_test requires_npu2 requires_only_compiler
+export -f find_lit_file is_standard_test requires_npu2 requires_only_compiler is_xfail
 export -f get_npu_device apply_lit_subs
 export -f extract_build_commands get_run_cmd get_run_variants get_variant_run_cmd
 export -f _strip_trace_flags _variant_from_cmd
@@ -1108,16 +1149,27 @@ run_one_hardware() {
   tdr_after="$(tdr_count)"
   local tdr_new=$(( tdr_after - tdr_before ))
 
+  local result
   if [[ $tdr_new -gt 0 ]]; then
-    echo "TDR" > "$result_file"
+    result="TDR"
     echo "TDR detected: $tdr_new new aie2_tdr_work events (uptime ${t_start}s)" >> "$log_file"
   elif [[ $rc -eq 0 ]] && grep -q "PASS" "$log_file"; then
-    echo "PASS" > "$result_file"
+    result="PASS"
   elif [[ $rc -eq 124 ]]; then
-    echo "TIMEOUT" > "$result_file"
+    result="TIMEOUT"
   else
-    echo "FAIL" > "$result_file"
+    result="FAIL"
   fi
+
+  # Honor XFAIL annotations: a failing xfail is XFAIL, a passing xfail is XPASS.
+  if is_xfail "$src_dir" "$compiler"; then
+    case "$result" in
+      PASS)          result="XPASS" ;;
+      FAIL|TIMEOUT)  result="XFAIL" ;;
+    esac
+  fi
+
+  echo "$result" > "$result_file"
 
   # Copy events.json for trace decoding.
   local build_traced="$BUILD_BASE/$name/traced"
@@ -1217,6 +1269,15 @@ run_one_bridge() {
     fi
   fi
 
+  # Honor XFAIL annotations: a failing xfail is XFAIL, a passing xfail is XPASS.
+  # EMU_MISS is an infrastructure bug -- never mask it with XFAIL.
+  if [[ "$result" != "EMU_MISS" ]] && is_xfail "$src_dir" "$compiler"; then
+    case "$result" in
+      PASS)          result="XPASS" ;;
+      FAIL|TIMEOUT)  result="XFAIL" ;;
+    esac
+  fi
+
   echo "$result" > "$result_file"
 
   # Copy events.json for trace decoding.
@@ -1313,7 +1374,8 @@ print_report() {
   # Use associative arrays keyed by compiler.
   declare -A compile_ok compile_fail
   declare -A bridge_pass bridge_fail bridge_skip bridge_timeout bridge_emumiss
-  declare -A hw_pass hw_fail hw_skip hw_timeout hw_tdr
+  declare -A bridge_xfail bridge_xpass
+  declare -A hw_pass hw_fail hw_skip hw_timeout hw_tdr hw_xfail hw_xpass
   for compiler in "${compilers[@]}"; do
     compile_ok[$compiler]=0
     compile_fail[$compiler]=0
@@ -1322,11 +1384,15 @@ print_report() {
     bridge_skip[$compiler]=0
     bridge_timeout[$compiler]=0
     bridge_emumiss[$compiler]=0
+    bridge_xfail[$compiler]=0
+    bridge_xpass[$compiler]=0
     hw_pass[$compiler]=0
     hw_fail[$compiler]=0
     hw_skip[$compiler]=0
     hw_timeout[$compiler]=0
     hw_tdr[$compiler]=0
+    hw_xfail[$compiler]=0
+    hw_xpass[$compiler]=0
   done
   declare -A trace_clean trace_diverge trace_error trace_skip
   for compiler in "${compilers[@]}"; do
@@ -1412,6 +1478,9 @@ print_report() {
                    hw_fail[$compiler]=$(( ${hw_fail[$compiler]} + 1 )) ;;
           TIMEOUT) hw_timeout[$compiler]=$(( ${hw_timeout[$compiler]} + 1 ))
                    hw_fail[$compiler]=$(( ${hw_fail[$compiler]} + 1 )) ;;
+          XFAIL)   hw_xfail[$compiler]=$(( ${hw_xfail[$compiler]} + 1 )) ;;
+          XPASS)   hw_xpass[$compiler]=$(( ${hw_xpass[$compiler]} + 1 ))
+                   hw_fail[$compiler]=$(( ${hw_fail[$compiler]} + 1 )) ;;
           SKIP*)   hw_skip[$compiler]=$(( ${hw_skip[$compiler]} + 1 )) ;;
           *)       hw_fail[$compiler]=$(( ${hw_fail[$compiler]} + 1 )) ;;
         esac
@@ -1427,6 +1496,9 @@ print_report() {
         TIMEOUT)  bridge_timeout[$compiler]=$(( ${bridge_timeout[$compiler]} + 1 ))
                   bridge_fail[$compiler]=$(( ${bridge_fail[$compiler]} + 1 )) ;;
         EMU_MISS) bridge_emumiss[$compiler]=$(( ${bridge_emumiss[$compiler]} + 1 ))
+                  bridge_fail[$compiler]=$(( ${bridge_fail[$compiler]} + 1 )) ;;
+        XFAIL)    bridge_xfail[$compiler]=$(( ${bridge_xfail[$compiler]} + 1 )) ;;
+        XPASS)    bridge_xpass[$compiler]=$(( ${bridge_xpass[$compiler]} + 1 ))
                   bridge_fail[$compiler]=$(( ${bridge_fail[$compiler]} + 1 )) ;;
         SKIP*)    bridge_skip[$compiler]=$(( ${bridge_skip[$compiler]} + 1 )) ;;
         *)        bridge_fail[$compiler]=$(( ${bridge_fail[$compiler]} + 1 )) ;;
@@ -1460,7 +1532,7 @@ print_report() {
         local br="SKIP"
         [[ -f "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.bridge.result" ]] && \
           br="$(< "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.bridge.result")"
-        if [[ "$br" != "PASS" ]] && [[ "$br" != "SKIP"* ]]; then
+        if [[ "$br" != "PASS" ]] && [[ "$br" != "SKIP"* ]] && [[ "$br" != "XFAIL" ]]; then
           local logf="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.bridge.log"
           if [[ -f "$logf" ]]; then
             echo "    --- $compiler bridge log tail ---"
@@ -1471,7 +1543,7 @@ print_report() {
           local hr="SKIP"
           [[ -f "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw.result" ]] && \
             hr="$(< "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw.result")"
-          if [[ "$hr" != "PASS" ]] && [[ "$hr" != "SKIP"* ]]; then
+          if [[ "$hr" != "PASS" ]] && [[ "$hr" != "SKIP"* ]] && [[ "$hr" != "XFAIL" ]]; then
             local logf="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw.log"
             if [[ -f "$logf" ]]; then
               echo "    --- $compiler hw log tail ---"
@@ -1518,10 +1590,18 @@ print_report() {
     if [[ ${bridge_emumiss[$compiler]} -gt 0 ]]; then
       echo "  (${bridge_emumiss[$compiler]} EMU_MISS)"
     fi
+    if [[ ${bridge_xfail[$compiler]} -gt 0 ]]; then
+      echo "  (${bridge_xfail[$compiler]} XFAIL)"
+    fi
+    if [[ ${bridge_xpass[$compiler]} -gt 0 ]]; then
+      echo "  (${bridge_xpass[$compiler]} XPASS -- unexpected pass)"
+    fi
     if [[ "$run_hw" == "true" ]]; then
       local hw_extra=""
       [[ ${hw_tdr[$compiler]} -gt 0 ]] && hw_extra+=" (${hw_tdr[$compiler]} TDR)"
       [[ ${hw_timeout[$compiler]} -gt 0 ]] && hw_extra+=" (${hw_timeout[$compiler]} timeout)"
+      [[ ${hw_xfail[$compiler]} -gt 0 ]] && hw_extra+=" (${hw_xfail[$compiler]} XFAIL)"
+      [[ ${hw_xpass[$compiler]} -gt 0 ]] && hw_extra+=" (${hw_xpass[$compiler]} XPASS)"
       echo "  HW: ${hw_pass[$compiler]} pass, ${hw_fail[$compiler]} fail, ${hw_skip[$compiler]} skip${hw_extra}"
     fi
   done
