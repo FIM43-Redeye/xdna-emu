@@ -321,16 +321,68 @@ ls src/interpreter/decode/               # register_map.rs lives here
 
 ---
 
-## Pre-existing Issues (Not Refactor Regressions; Don't Panic)
+## Open Regression: EMU Throughput Dropped ~2x Since `phase1-subsys-regs-mem` Started
 
-- **`bd_chain_repeat_on_memtile` EMU hangs in a DMA
-  `check_acquire_granted granted=false` polling loop** and never emits
-  `PASS!` in either Chess or Peano. On the real NPU it also fails.
-  Bisect against `build/bridge-test-results/` directories shows it was
-  passing on 20260414 and broken by 20260416; introduced somewhere in
-  Phase 1a or early Subsystem 1, pre-dates Subsystem 6. Independent
-  investigation item -- run it as a dedicated workstream between
-  subsystems, don't try to fix it mid-refactor (blurs bisect).
+**Not specific to bd_chain.** Six bridge tests that passed on 20260416
+now time out at the 120s cap or hang outright:
+
+| Test | Compiler | 20260416 | Now | Symptom |
+|------|----------|---------|-----|---------|
+| `bd_chain_repeat_on_memtile` | chess | PASS | FAIL | stuck in DMA acquire poll, no `PASS!` emitted |
+| `bd_chain_repeat_on_memtile` | peano | PASS | FAIL | same |
+| `ctrl_packet_reconfig_1x4_cores` | chess | PASS (~94s) | TIMEOUT | same DMA acquire poll, ran 345k log lines in 120s vs 584k in 94s on baseline |
+| `ctrl_packet_reconfig_1x4_cores` | peano | PASS | TIMEOUT | same |
+| `ctrl_packet_reconfig_4x1_cores` | chess | PASS | TIMEOUT | same |
+| `ctrl_packet_reconfig_4x1_cores` | peano | PASS | TIMEOUT | same |
+| `matrix_multiplication_using_cascade/buffer` | chess | PASS | TIMEOUT | same |
+| `objectfifo_repeat/compute_repeat` | peano | PASS | TIMEOUT | same |
+
+Old Peano timeouts that ALSO existed on 20260416 and are unrelated:
+`dma_task_large_linear`, `objectfifo_repeat/init_values_repeat`.
+
+**Bisect window:** 20260416 20:14 (last known 69/69 Chess pass at EMU
+level) through today's `phase1-subsys-isa-decode` tag. All commits
+in that range are on `dev`; `git log --oneline 8c0f217^..HEAD` in
+chronological order.  Subsys-1 Part B (`0910f33`, `06e40c9`, `c403991`,
+`8c0f217`) and Subsystem 6 (A + B) all live in this window.
+
+**Memory_map refactor (0910f33/06e40c9/c403991) is probably innocent:**
+values are identical, just a namespace move (`crate::device::registers_spec`
+-> `xdna_archspec::aie2::memory_map`), verified by comparing the
+`AIE_DATA_MEMORY_BASE` / `PROGRAM_MEMORY_BASE` / etc. definitions.
+
+**Most suspicious:** something in the `#[cfg(info)]` log-volume /
+dispatch path. The symptom (same polling loop, but completes fewer
+iterations in the same wall-clock) smells like per-cycle overhead
+crept into the interpreter dispatch.  Candidates:
+
+1. `11f1275` (tablegen mega-move) -- nominally pure relocation but
+   touches `#[path]` module includes and `mod generated { include!() }`
+   wrappers; worth checking if the generated `TblgenOutput` takes a
+   different path through `load_from_generated()` now.
+2. `bb99951` (register_map -> interpreter::decode) -- a new-ish module
+   boundary, could have an inlining change.
+3. Subsystem 1 Part A commits before 20260416 (e.g. the ArchModel
+   runtime lookup consolidation) -- the 20260416 run was pre-Subsys1-
+   Part-B but post-Subsys1-Part-A, so those aren't in the bisect
+   window.  **But re-check**: 20260414 was also "PASS" for bd_chain
+   etc.; if 20260414 and 20260416 are both clean, Part A is innocent
+   too.
+
+**Investigation strategy (for a dedicated session):**
+1. `git checkout phase1-subsys-regs-mem` and rerun the bridge against
+   `bd_chain_repeat_on_memtile --no-hw` -- if it passes there, the
+   regression is in Subsystem 6 (mega-move or register_map move).  If
+   it fails, the regression is in Subsystem 1 Part B.
+2. If narrowed to Subsystem 6, bisect 4 commits: `11f1275`, `bb99951`,
+   `0e6982b`, `f07ecfb`.
+3. If narrowed to Subsystem 1 Part B, bisect 3 commits: `0910f33`,
+   `06e40c9`, `c403991`.
+
+**Don't fix mid-subsystem.** This is its own investigation workstream
+between subsystems -- keeping the bisect cleanly on `dev` (no
+interleaved fixes) is more valuable than shaving time off a Subsystem-2
+timeline.
 - `cargo test -p xdna-archspec --lib`: `test_full_parse_all_devices`
   fails with device count 13 vs expected 12. Unrelated to this refactor;
   present before Phase 1a started.
