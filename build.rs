@@ -9,7 +9,7 @@
 //!   side-effect on ArchModel is unique to archspec's copy.
 //!
 //! - `compile_llvm_decoder_ffi` + LLVM link (compiles
-//!   `decoder_ffi/aie2_decoder.cpp`). Moves to archspec in Task 9.
+//!   `crates/xdna-archspec/decoder_ffi/aie2_decoder.cpp`). Moves to archspec in Task 9.
 //!
 //! - XRT plugin install logic (always belongs in xdna-emu).
 //!
@@ -869,7 +869,7 @@ pub const MEMTILE_SLAVE_PORTS: &[(AieRtPortType, u8)] = &[];
     fs::write(out_dir.join("gen_aiert_ports.rs"), ports_stub).unwrap();
 }
 
-/// Compile `decoder_ffi/aie2_decoder.cpp` and link the LLVM AIE libraries.
+/// Compile `crates/xdna-archspec/decoder_ffi/aie2_decoder.cpp` and link the LLVM AIE libraries.
 ///
 /// This gives the emulator access to LLVM's MCDisassembler for perfect
 /// instruction decoding, including TRY_DECODE register class validation
@@ -887,9 +887,9 @@ fn compile_llvm_decoder_ffi(llvm_aie_path: &Path) {
         return;
     }
 
-    let decoder_cpp = "decoder_ffi/aie2_decoder.cpp";
+    let decoder_cpp = "crates/xdna-archspec/decoder_ffi/aie2_decoder.cpp";
     println!("cargo:rerun-if-changed={}", decoder_cpp);
-    println!("cargo:rerun-if-changed=decoder_ffi/aie2_decoder.h");
+    println!("cargo:rerun-if-changed=crates/xdna-archspec/decoder_ffi/aie2_decoder.h");
 
     // Compile aie2_decoder.cpp with the cc crate.
     cc::Build::new()
