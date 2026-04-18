@@ -21,6 +21,7 @@ use crate::interpreter::decode::InstructionDecoder;
 use crate::interpreter::execute::{CycleAccurateExecutor, NeighborMemory};
 use crate::interpreter::state::{EventType, ExecutionContext};
 use crate::interpreter::timing::MemoryQuadrant;
+use xdna_archspec::aie2::SHIM_ROW;
 
 /// Engine execution status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -575,7 +576,7 @@ impl InterpreterEngine {
                 let mut west_locks: Option<Vec<crate::device::tile::Lock>> = None;
                 let mut north_locks: Option<Vec<crate::device::tile::Lock>> = None;
 
-                if row > 0 {
+                if row > SHIM_ROW as usize {
                     if let Some(south) = self.device.tile(col, row - 1) {
                         south_locks = Some(south.locks.clone());
                     }
@@ -702,7 +703,7 @@ impl InterpreterEngine {
                     }
                 }
                 // South
-                if row > 0 {
+                if row > SHIM_ROW as usize {
                     writeback_locks(&mut self.device, south_locks, col, row - 1);
                 }
                 // West

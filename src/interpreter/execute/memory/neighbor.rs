@@ -5,6 +5,7 @@
 //! after the core step completes, matching hardware behavior.
 
 use crate::interpreter::timing::MemoryQuadrant;
+use xdna_archspec::aie2::SHIM_ROW;
 
 /// Read-only snapshots of neighbor tile data memory for cross-tile access.
 ///
@@ -77,7 +78,12 @@ impl NeighborMemory {
     fn neighbor_coords(&self, dir: MemoryQuadrant) -> Option<(usize, usize)> {
         match dir {
             MemoryQuadrant::South => {
-                if self.row > 0 { Some((self.col, self.row - 1)) } else { None }
+                // Shim row (row == SHIM_ROW) has no south neighbor.
+                if self.row > SHIM_ROW as usize {
+                    Some((self.col, self.row - 1))
+                } else {
+                    None
+                }
             }
             MemoryQuadrant::West => {
                 if self.col > 0 { Some((self.col - 1, self.row)) } else { None }
@@ -132,7 +138,11 @@ impl NeighborMemory {
         let row = self.row;
         for (dir, offset, data) in self.pending_writes {
             let coords = match dir {
-                MemoryQuadrant::South => if row > 0 { Some((col, row - 1)) } else { None },
+                MemoryQuadrant::South => if row > SHIM_ROW as usize {
+                    Some((col, row - 1))
+                } else {
+                    None
+                },
                 MemoryQuadrant::West => if col > 0 { Some((col - 1, row)) } else { None },
                 MemoryQuadrant::North => Some((col, row + 1)),
                 MemoryQuadrant::East => Some((col + 1, row)),
