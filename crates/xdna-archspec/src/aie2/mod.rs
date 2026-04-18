@@ -86,3 +86,7 @@ pub mod port_type {
     pub const fn west(n: u8) -> u8 { WEST_BASE + n }
     pub const fn dma(n: u8) -> u8 { DMA_BASE + n }
 }
+
+/// Instruction set architecture: decoder tables, runtime model, and
+/// LLVM MCDisassembler FFI. Populated during Subsystem 6 Part A.
+pub mod isa;
