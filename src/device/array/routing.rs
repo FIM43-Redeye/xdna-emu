@@ -457,10 +457,10 @@ impl TileArray {
         let mut words_routed = 0;
 
         for i in 0..self.tiles.len() {
-            let tile_type = self.tiles[i].tile_type;
+            let tile_kind = self.tiles[i].tile_kind;
 
-            match tile_type {
-                TileType::Compute => {
+            match tile_kind {
+                TileKind::Compute => {
                     let aie_trace = compute::TRACE_SLAVE_START as usize;
                     let mem_trace = compute::TRACE_SLAVE_END as usize;
 
@@ -481,7 +481,7 @@ impl TileArray {
                         words_routed += 1;
                     }
                 }
-                TileType::MemTile => {
+                TileKind::Mem => {
                     let trace_port = mem_tile::TRACE_SLAVE_START as usize;
 
                     while self.tiles[i].mem_trace.has_pending_words()
@@ -492,7 +492,7 @@ impl TileArray {
                         words_routed += 1;
                     }
                 }
-                TileType::Shim => {
+                TileKind::ShimNoc | TileKind::ShimPl => {
                     let trace_port = shim::TRACE_SLAVE_START as usize;
 
                     while self.tiles[i].mem_trace.has_pending_words()
@@ -538,7 +538,7 @@ impl TileArray {
             // target slave has space, retaining blocked words for next cycle.
             let tile = &mut tiles[i];
             let dma = &mut dma_engines[i];
-            let tile_type = tile.tile_type;
+            let tile_kind = tile.tile_kind;
             let col = tile.col;
             let row = tile.row;
             let s2mm_count = dma.s2mm_channel_count() as u8;
@@ -548,7 +548,7 @@ impl TileArray {
 
             while let Some(data) = dma.pop_stream_out() {
                 // Determine the target slave port for this DMA MM2S word.
-                let target_slave = if tile_type == TileType::Shim {
+                let target_slave = if tile_kind.is_shim() {
                     let mm2s_ch = data.channel.saturating_sub(s2mm_count) as usize;
                     let from_mux = tile.shim_mux_mm2s_slaves
                         .get(mm2s_ch)
@@ -589,16 +589,16 @@ impl TileArray {
                         }
                     }
                 } else {
-                    let slave_port = match tile_type {
-                        TileType::MemTile => {
+                    let slave_port = match tile_kind {
+                        TileKind::Mem => {
                             let ch_offset = data.channel.saturating_sub(s2mm_count);
                             (mem_tile::DMA_SLAVE_START + ch_offset) as usize
                         }
-                        TileType::Compute => {
+                        TileKind::Compute => {
                             let ch_offset = data.channel.saturating_sub(s2mm_count);
                             (compute::DMA_SLAVE_START + ch_offset) as usize
                         }
-                        TileType::Shim => unreachable!(),
+                        TileKind::ShimNoc | TileKind::ShimPl => unreachable!(),
                     };
 
                     let slaves = tile.stream_switch.slaves.as_slice();
@@ -625,7 +625,7 @@ impl TileArray {
                         slave.push_with_tlast(data.data, data.tlast);
                         words_routed += 1;
 
-                        let prefix = if tile_type == TileType::Shim { "Shim" } else { "tile" };
+                        let prefix = if tile_kind.is_shim() { "Shim" } else { "tile" };
                         log::info!("DMA_MM2S->TileSwitch: {} ({},{}) slave[{}] <- 0x{:08X}{} ({})",
                             prefix, col, row, slave_idx, data.data,
                             if data.tlast { " TLAST" } else { "" }, desc);
@@ -778,26 +778,26 @@ impl TileArray {
         for col in 0..self.cols {
             for row in 0..self.rows {
                 let idx = self.tile_index(col, row);
-                let tile_type = self.tiles[idx].tile_type;
+                let tile_kind = self.tiles[idx].tile_kind;
 
                 // Check North masters - data flows to tile above (row + 1)
                 if row + 1 < self.rows {
                     let above_idx = self.tile_index(col, row + 1);
-                    let above_type = self.tiles[above_idx].tile_type;
+                    let above_type = self.tiles[above_idx].tile_kind;
 
                     // Determine port mappings based on tile types (AM025-derived constants)
-                    let (north_master_start, north_master_count, south_slave_start) = match (tile_type, above_type) {
-                        (TileType::Shim, TileType::MemTile) => (
+                    let (north_master_start, north_master_count, south_slave_start) = match (tile_kind, above_type) {
+                        (TileKind::ShimNoc | TileKind::ShimPl, TileKind::Mem) => (
                             shim::NORTH_MASTER_START as usize,
                             (shim::NORTH_MASTER_END - shim::NORTH_MASTER_START + 1) as usize,
                             mem_tile::SOUTH_SLAVE_START as usize,
                         ),
-                        (TileType::MemTile, TileType::Compute) => (
+                        (TileKind::Mem, TileKind::Compute) => (
                             mem_tile::NORTH_MASTER_START as usize,
                             (mem_tile::NORTH_MASTER_END - mem_tile::NORTH_MASTER_START + 1) as usize,
                             compute::SOUTH_SLAVE_START as usize,
                         ),
-                        (TileType::Compute, TileType::Compute) => (
+                        (TileKind::Compute, TileKind::Compute) => (
                             compute::NORTH_MASTER_START as usize,
                             (compute::NORTH_MASTER_END - compute::NORTH_MASTER_START + 1) as usize,
                             compute::SOUTH_SLAVE_START as usize,
@@ -827,21 +827,21 @@ impl TileArray {
                 // Check South masters - data flows to tile below (row - 1)
                 if row > 0 {
                     let below_idx = self.tile_index(col, row - 1);
-                    let below_type = self.tiles[below_idx].tile_type;
+                    let below_type = self.tiles[below_idx].tile_kind;
 
                     // Determine port mappings based on tile types (AM025-derived constants)
-                    let (south_master_start, south_master_count, north_slave_start) = match (tile_type, below_type) {
-                        (TileType::MemTile, TileType::Shim) => (
+                    let (south_master_start, south_master_count, north_slave_start) = match (tile_kind, below_type) {
+                        (TileKind::Mem, TileKind::ShimNoc | TileKind::ShimPl) => (
                             mem_tile::SOUTH_MASTER_START as usize,
                             (mem_tile::SOUTH_MASTER_END - mem_tile::SOUTH_MASTER_START + 1) as usize,
                             shim::NORTH_SLAVE_START as usize,
                         ),
-                        (TileType::Compute, TileType::MemTile) => (
+                        (TileKind::Compute, TileKind::Mem) => (
                             compute::SOUTH_MASTER_START as usize,
                             (compute::SOUTH_MASTER_END - compute::SOUTH_MASTER_START + 1) as usize,
                             mem_tile::NORTH_SLAVE_START as usize,
                         ),
-                        (TileType::Compute, TileType::Compute) => (
+                        (TileKind::Compute, TileKind::Compute) => (
                             compute::SOUTH_MASTER_START as usize,
                             (compute::SOUTH_MASTER_END - compute::SOUTH_MASTER_START + 1) as usize,
                             compute::NORTH_SLAVE_START as usize,
@@ -874,20 +874,20 @@ impl TileArray {
         for col in 0..self.cols {
             for row in 0..self.rows {
                 let idx = self.tile_index(col, row);
-                let tile_type = self.tiles[idx].tile_type;
+                let tile_kind = self.tiles[idx].tile_kind;
 
                 if col + 1 < self.cols {
                     let right_idx = self.tile_index(col + 1, row);
-                    let right_type = self.tiles[right_idx].tile_type;
+                    let right_type = self.tiles[right_idx].tile_kind;
 
                     // East masters on source -> West slaves on destination (AM025-derived)
-                    let (east_master_start, east_count, west_slave_start) = match (tile_type, right_type) {
-                        (TileType::Compute, TileType::Compute) => (
+                    let (east_master_start, east_count, west_slave_start) = match (tile_kind, right_type) {
+                        (TileKind::Compute, TileKind::Compute) => (
                             compute::EAST_MASTER_START as usize,
                             (compute::EAST_MASTER_END - compute::EAST_MASTER_START + 1) as usize,
                             compute::WEST_SLAVE_START as usize,
                         ),
-                        (TileType::Shim, TileType::Shim) => (
+                        (TileKind::ShimNoc | TileKind::ShimPl, TileKind::ShimNoc | TileKind::ShimPl) => (
                             shim::EAST_MASTER_START as usize,
                             (shim::EAST_MASTER_END - shim::EAST_MASTER_START + 1) as usize,
                             shim::WEST_SLAVE_START as usize,
@@ -915,16 +915,16 @@ impl TileArray {
                 // West masters on source -> East slaves on destination (col - 1)
                 if col > 0 {
                     let left_idx = self.tile_index(col - 1, row);
-                    let left_type = self.tiles[left_idx].tile_type;
+                    let left_type = self.tiles[left_idx].tile_kind;
 
                     // West masters on source -> East slaves on destination (AM025-derived)
-                    let (west_master_start, west_count, east_slave_start) = match (tile_type, left_type) {
-                        (TileType::Compute, TileType::Compute) => (
+                    let (west_master_start, west_count, east_slave_start) = match (tile_kind, left_type) {
+                        (TileKind::Compute, TileKind::Compute) => (
                             compute::WEST_MASTER_START as usize,
                             (compute::WEST_MASTER_END - compute::WEST_MASTER_START + 1) as usize,
                             compute::EAST_SLAVE_START as usize,
                         ),
-                        (TileType::Shim, TileType::Shim) => (
+                        (TileKind::ShimNoc | TileKind::ShimPl, TileKind::ShimNoc | TileKind::ShimPl) => (
                             shim::WEST_MASTER_START as usize,
                             (shim::WEST_MASTER_END - shim::WEST_MASTER_START + 1) as usize,
                             shim::EAST_SLAVE_START as usize,

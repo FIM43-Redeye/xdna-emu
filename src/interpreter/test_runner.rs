@@ -1441,7 +1441,7 @@ mod tests {
         // Verify memtile is correctly identified
         // Use array.tile() which returns &Tile directly (bounds are known valid)
         let memtile = runner.engine.device().array.tile(memtile_col, memtile_row);
-        assert!(memtile.is_mem_tile(), "Tile at ({},{}) should be a memory tile", memtile_col, memtile_row);
+        assert!(memtile.is_mem(), "Tile at ({},{}) should be a memory tile", memtile_col, memtile_row);
         eprintln!("Memory tile ({},{}) confirmed: 512KB memory, 64 locks, 12 DMA channels",
             memtile_col, memtile_row);
 

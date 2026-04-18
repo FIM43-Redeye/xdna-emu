@@ -9,7 +9,7 @@
 use super::{NpuInstruction, NpuInstructionStream};
 use crate::device::DeviceState;
 use crate::device::host_memory::HostMemory;
-use crate::device::tile::TileType;
+use xdna_archspec::types::TileKind;
 use xdna_archspec::aie2::SHIM_ROW;
 
 /// Result of a single `try_advance()` step.
@@ -230,7 +230,7 @@ impl NpuExecutor {
         if let Some(dma) = device.array.dma_engine(sync.column, sync.row) {
             let reg_layout = crate::device::regdb::device_reg_layout();
             let status = dma.get_channel_status(abs_channel);
-            let status_layout = if dma.tile_type.is_mem_tile() {
+            let status_layout = if dma.tile_kind.is_mem() {
                 &reg_layout.memtile_status
             } else {
                 &reg_layout.memory_status
@@ -923,8 +923,8 @@ impl NpuExecutor {
     ) -> bool {
         use crate::device::dma::MAX_TASK_QUEUE_DEPTH;
 
-        let tile_type = match device.tile(col as usize, row as usize)
-            .map(|t| t.tile_type) {
+        let tile_kind = match device.tile(col as usize, row as usize)
+            .map(|t| t.tile_kind) {
             Some(tt) => tt,
             None => return false,
         };
@@ -939,8 +939,8 @@ impl NpuExecutor {
         let reg_layout = crate::device::regdb::device_reg_layout();
 
         // Identify if this offset is a start queue write
-        let (abs_channel, _is_mm2s) = match tile_type {
-            TileType::Compute => {
+        let (abs_channel, _is_mm2s) = match tile_kind {
+            TileKind::Compute => {
                 let base = reg_layout.memory_channel_base;
                 let stride = reg_layout.memory_channel_stride;
                 match Self::channel_from_queue_write(offset, base, stride, s2mm_channels, s2mm_channels + mm2s_channels) {
@@ -948,7 +948,7 @@ impl NpuExecutor {
                     None => return false,
                 }
             }
-            TileType::MemTile => {
+            TileKind::Mem => {
                 let stride = reg_layout.memtile_channel_stride;
                 let s2mm_base = reg_layout.memtile_channel_s2mm_base;
                 let mm2s_base = reg_layout.memtile_channel_mm2s_base;
@@ -960,7 +960,7 @@ impl NpuExecutor {
                     return false;
                 }
             }
-            TileType::Shim => {
+            TileKind::ShimNoc | TileKind::ShimPl => {
                 let base = reg_layout.shim_channel_base;
                 let stride = reg_layout.shim_channel_stride;
                 match Self::channel_from_queue_write(offset, base, stride, s2mm_channels, s2mm_channels + mm2s_channels) {
@@ -975,8 +975,8 @@ impl NpuExecutor {
             .map_or(false, |dma| dma.task_queue_size(abs_channel) >= MAX_TASK_QUEUE_DEPTH);
 
         if queue_full {
-            let bd_mask = match tile_type {
-                TileType::MemTile => 0x3F,
+            let bd_mask = match tile_kind {
+                TileKind::Mem => 0x3F,
                 _ => 0xF,
             };
             let bd_id = (value & bd_mask) as u8;
@@ -1055,9 +1055,9 @@ fn is_data_memory_offset(tile: &crate::device::tile::Tile, offset: u32) -> bool 
 /// BD region bounds are derived from the AM025 register database.
 /// Check if a BlockWrite targets a DMA BD region in any tile type.
 ///
-/// Returns `(bd_index, tile_type)` if the offset falls within a BD register
+/// Returns `(bd_index, tile_kind)` if the offset falls within a BD register
 /// range. Row determines tile type: 0=shim, 1=memtile, >=2=compute.
-fn bd_index_for_blockwrite(row: u8, offset: u32) -> Option<(u8, TileType)> {
+fn bd_index_for_blockwrite(row: u8, offset: u32) -> Option<(u8, TileKind)> {
     let layout = crate::device::regdb::device_reg_layout();
 
     match row {
@@ -1065,7 +1065,7 @@ fn bd_index_for_blockwrite(row: u8, offset: u32) -> Option<(u8, TileType)> {
             // Shim BD region
             if offset >= layout.shim_bd_base && offset < layout.shim_channel_base {
                 let idx = (offset - layout.shim_bd_base) / layout.shim_bd_stride;
-                Some((idx as u8, TileType::Shim))
+                Some((idx as u8, TileKind::ShimNoc))
             } else {
                 None
             }
@@ -1076,7 +1076,7 @@ fn bd_index_for_blockwrite(row: u8, offset: u32) -> Option<(u8, TileType)> {
                 let rel = offset - layout.memtile_bd_base;
                 if rel < layout.memtile_bd_stride * 48 {
                     let idx = rel / layout.memtile_bd_stride;
-                    Some((idx as u8, TileType::MemTile))
+                    Some((idx as u8, TileKind::Mem))
                 } else {
                     None
                 }
@@ -1090,7 +1090,7 @@ fn bd_index_for_blockwrite(row: u8, offset: u32) -> Option<(u8, TileType)> {
                 let rel = offset - layout.memory_bd_base;
                 if rel < layout.memory_bd_stride * 16 {
                     let idx = rel / layout.memory_bd_stride;
-                    Some((idx as u8, TileType::Compute))
+                    Some((idx as u8, TileKind::Compute))
                 } else {
                     None
                 }

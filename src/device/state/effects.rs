@@ -49,7 +49,7 @@ impl DeviceState {
 
         // 3. Lock overflow/underflow status registers (write-to-clear).
         // Writing 1 to a bit clears that lock's overflow/underflow status.
-        if tile.is_mem_tile() {
+        if tile.is_mem() {
             if offset == reg_layout.memtile_locks_overflow_0 {
                 tile.clear_lock_overflow_bits(0, 32, value);
             } else if offset == reg_layout.memtile_locks_overflow_1 {
@@ -93,7 +93,7 @@ impl DeviceState {
                 if offset >= base && offset < end {
                     tile.write_mem_perf_register(offset - base, value);
                 }
-            } else if tile.is_mem_tile() {
+            } else if tile.is_mem() {
                 // MemTile perf counters: 0x91000-0x9108C
                 let base = subsystem::memtile::performance::OFFSET_START;
                 let end = subsystem::memtile::performance::OFFSET_END;
@@ -121,7 +121,7 @@ impl DeviceState {
             if offset >= me.trace_control_base && offset <= me.trace_control_end {
                 tile.mem_trace.write_register(offset - me.trace_control_base, value);
             }
-        } else if tile.is_mem_tile() {
+        } else if tile.is_mem() {
             if offset >= mte.trace_control_base && offset <= mte.trace_control_end {
                 tile.mem_trace.write_register(offset - mte.trace_control_base, value);
             }
@@ -139,7 +139,7 @@ impl DeviceState {
             if offset == me.edge_detection {
                 Tile::configure_edge_detectors(&mut tile.mem_edge_detectors, value, false);
             }
-        } else if tile.is_mem_tile() {
+        } else if tile.is_mem() {
             if offset == mte.edge_detection {
                 Tile::configure_edge_detectors(&mut tile.mem_edge_detectors, value, true);
             }
@@ -154,11 +154,11 @@ impl DeviceState {
         // ports 0-7 for PORT_RUNNING/IDLE/STALLED trace events.
         // These registers live in the stream switch address space (0x3FF00),
         // not the event subsystem, so they can't go through EventModule.
-        let port_sel_base = match tile.tile_type {
-            TileType::Compute | TileType::Shim => {
+        let port_sel_base = match tile.tile_kind {
+            TileKind::Compute | TileKind::ShimNoc | TileKind::ShimPl => {
                 ce.event_port_select.map(|[r0, r1]| (r0, r1))
             }
-            TileType::MemTile => {
+            TileKind::Mem => {
                 mte.event_port_select.map(|[r0, r1]| (r0, r1))
             }
         };
@@ -197,7 +197,7 @@ impl DeviceState {
                 if offset >= base && offset < end {
                     tile.mem_timer.write_register(offset - base, value);
                 }
-            } else if tile.is_mem_tile() {
+            } else if tile.is_mem() {
                 let base = subsystem::memtile::timer::OFFSET_START;
                 let end = subsystem::memtile::timer::OFFSET_END;
                 if offset >= base && offset < end {
@@ -251,7 +251,7 @@ impl DeviceState {
                         em.write_register(offset, value);
                     }
                 }
-            } else if tile.is_mem_tile() {
+            } else if tile.is_mem() {
                 let base = subsystem::memtile::event::OFFSET_START;
                 let end = subsystem::memtile::event::OFFSET_END;
                 if offset >= base && offset < end {
@@ -288,10 +288,10 @@ impl DeviceState {
         // The EventModule above handles the event register write, but the
         // trace units and broadcast propagation also need to be notified.
         // Event_Generate offset is the first register in the event block.
-        let is_event_generate = match tile.tile_type {
-            TileType::Compute => offset == ce.event_generate || offset == me.event_generate,
-            TileType::MemTile => offset == mte.event_generate,
-            TileType::Shim => offset == ce.event_generate,
+        let is_event_generate = match tile.tile_kind {
+            TileKind::Compute => offset == ce.event_generate || offset == me.event_generate,
+            TileKind::Mem => offset == mte.event_generate,
+            TileKind::ShimNoc | TileKind::ShimPl => offset == ce.event_generate,
         };
         if is_event_generate {
             let event_id = (value & 0x7F) as u8;
@@ -307,13 +307,13 @@ impl DeviceState {
             // Check broadcast channel mapping in the EventModule: if the
             // generated event matches any broadcast channel's configured
             // event, queue the BROADCAST_N event for column propagation.
-            let broadcast_base = match tile.tile_type {
-                TileType::Compute | TileType::Shim => 107u8, // Core/PL module
-                TileType::MemTile => 142u8,
+            let broadcast_base = match tile.tile_kind {
+                TileKind::Compute | TileKind::ShimNoc | TileKind::ShimPl => 107u8, // Core/PL module
+                TileKind::Mem => 142u8,
             };
-            let events_ref = match tile.tile_type {
-                TileType::Compute | TileType::Shim => tile.core_events.as_ref(),
-                TileType::MemTile => tile.mem_events.as_ref(),
+            let events_ref = match tile.tile_kind {
+                TileKind::Compute | TileKind::ShimNoc | TileKind::ShimPl => tile.core_events.as_ref(),
+                TileKind::Mem => tile.mem_events.as_ref(),
             };
             if let Some(em) = events_ref {
                 for ch in 0..16u8 {

@@ -129,10 +129,10 @@ impl DmaEngine {
     /// For memtiles: ch0-5 -> slave ports 0-5
     /// For shim tiles: ch0 -> slave port 2, ch1 -> slave port 3 (South ports)
     pub fn mm2s_slave_port(&self, ch: u8) -> u8 {
-        match self.tile_type {
-            TileType::Compute => super::super::stream_io::compute::mm2s_slave_port(ch),
-            TileType::MemTile => super::super::stream_io::memtile::mm2s_slave_port(ch),
-            TileType::Shim => super::super::stream_io::shim::mm2s_slave_port(ch),
+        match self.tile_kind {
+            TileKind::Compute => super::super::stream_io::compute::mm2s_slave_port(ch),
+            TileKind::Mem => super::super::stream_io::memtile::mm2s_slave_port(ch),
+            TileKind::ShimNoc | TileKind::ShimPl => super::super::stream_io::shim::mm2s_slave_port(ch),
         }
     }
 
@@ -142,10 +142,10 @@ impl DmaEngine {
     /// For memtiles: ch0-5 <- master ports 0-5
     /// For shim tiles: ch0 <- master port 2, ch1 <- master port 3 (South ports)
     pub fn s2mm_master_port(&self, ch: u8) -> u8 {
-        match self.tile_type {
-            TileType::Compute => super::super::stream_io::compute::s2mm_master_port(ch),
-            TileType::MemTile => super::super::stream_io::memtile::s2mm_master_port(ch),
-            TileType::Shim => super::super::stream_io::shim::s2mm_master_port(ch),
+        match self.tile_kind {
+            TileKind::Compute => super::super::stream_io::compute::s2mm_master_port(ch),
+            TileKind::Mem => super::super::stream_io::memtile::s2mm_master_port(ch),
+            TileKind::ShimNoc | TileKind::ShimPl => super::super::stream_io::shim::s2mm_master_port(ch),
         }
     }
 

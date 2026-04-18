@@ -75,9 +75,9 @@ impl DeviceState {
     /// at runtime -- do NOT mask here.
     pub(super) fn parse_memtile_bd_from_words(&self, words: &[u32]) -> crate::device::dma::BdConfig {
         use crate::device::dma::bd::BufferDescriptor;
-        use crate::device::tile::TileType;
+        use xdna_archspec::types::TileKind;
 
-        let parsed = BufferDescriptor::from_registers(words, TileType::MemTile);
+        let parsed = BufferDescriptor::from_registers(words, TileKind::Mem);
         let mut config = parsed.to_bd_config();
 
         // For backwards compatibility, mark as valid if any data is present
@@ -104,8 +104,7 @@ impl DeviceState {
             return;
         }
 
-        // tile_kind() returns TileKind (archspec); convert to TileType for match arms below.
-        let tile_type: super::super::tile::TileType = self.array.arch().tile_kind(col, row).into();
+        let tile_kind = self.array.arch().tile_kind(col, row);
         let reg_layout = regdb::device_reg_layout();
 
         let bd_config = self.array.get(col, row).map(|tile| {
@@ -114,8 +113,8 @@ impl DeviceState {
             }
             let bd = &tile.dma_bds[bd_idx];
 
-            match tile_type {
-                TileType::MemTile => {
+            match tile_kind {
+                TileKind::Mem => {
                     let w6_off = reg_layout.memtile_bd_base
                         + (bd_idx as u32) * reg_layout.memtile_bd_stride + 24;
                     let w7_off = reg_layout.memtile_bd_base
@@ -126,7 +125,7 @@ impl DeviceState {
                                  bd.control, bd.d0, bd.d1, w6, w7];
                     Some(self.parse_memtile_bd_from_words(&words))
                 }
-                TileType::Shim => {
+                TileKind::ShimNoc | TileKind::ShimPl => {
                     let w6_off = reg_layout.shim_bd_base
                         + (bd_idx as u32) * reg_layout.shim_bd_stride + 24;
                     let w7_off = reg_layout.shim_bd_base
@@ -135,7 +134,7 @@ impl DeviceState {
                     let w7 = *tile.registers_ref().get(&w7_off).unwrap_or(&0);
                     let words = [bd.addr_low, bd.addr_high, bd.length,
                                  bd.control, bd.d0, bd.d1, w6, w7];
-                    let parsed = BufferDescriptor::from_registers(&words, TileType::Shim);
+                    let parsed = BufferDescriptor::from_registers(&words, TileKind::ShimNoc);
                     let mut config = parsed.to_bd_config();
                     if !config.valid && words.iter().any(|&w| w != 0) {
                         config.valid = true;
@@ -146,7 +145,7 @@ impl DeviceState {
                     // Compute tile: 6 words
                     let words = [bd.addr_low, bd.addr_high, bd.length,
                                  bd.control, bd.d0, bd.d1];
-                    let parsed = BufferDescriptor::from_registers(&words, TileType::Compute);
+                    let parsed = BufferDescriptor::from_registers(&words, TileKind::Compute);
                     let mut config = parsed.to_bd_config();
                     if !config.valid && words.iter().any(|&w| w != 0) {
                         config.valid = true;

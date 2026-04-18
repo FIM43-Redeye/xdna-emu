@@ -18,7 +18,7 @@ impl DeviceState {
         base: u32,
         stride: u32,
         value: u32,
-        tile_type: &str,
+        tile_kind: &str,
     ) {
         let lock_idx = ((tile_addr.offset - base) / stride) as usize;
         if lock_idx < tile.locks.len() {
@@ -26,7 +26,7 @@ impl DeviceState {
             tile.locks[lock_idx].set(signed);
             if value != 0 {
                 log::info!("CDO init {} lock {} on tile ({},{}) = {}",
-                    tile_type, lock_idx, tile_addr.col, tile_addr.row, signed);
+                    tile_kind, lock_idx, tile_addr.col, tile_addr.row, signed);
             }
         }
     }
@@ -78,15 +78,14 @@ impl DeviceState {
     /// Both share the same BD base address (0x1D000) and stride (0x20),
     /// so we determine tile type from the row to select the correct parser.
     pub(super) fn write_dma_bd(&mut self, col: u8, row: u8, offset: u32, value: u32) {
-        // tile_kind() returns TileKind (archspec); convert to TileType for match arms below.
-        let tile_type: super::super::tile::TileType = self.array.arch().tile_kind(col, row).into();
+        let tile_kind = self.array.arch().tile_kind(col, row);
         let reg_layout = regdb::device_reg_layout();
 
         // Select base/stride/max words based on tile type.
         // Shim and compute share the same BD base and stride, but shim uses
         // 8 words per BD while compute uses 6.
-        let (bd_base, bd_stride, max_words) = match tile_type {
-            TileType::Shim => (reg_layout.shim_bd_base, reg_layout.shim_bd_stride, reg_layout.shim_bd_words),
+        let (bd_base, bd_stride, max_words) = match tile_kind {
+            TileKind::ShimNoc | TileKind::ShimPl => (reg_layout.shim_bd_base, reg_layout.shim_bd_stride, reg_layout.shim_bd_words),
             _ => (reg_layout.memory_bd_base, reg_layout.memory_bd_stride, reg_layout.memory_bd_words),
         };
 

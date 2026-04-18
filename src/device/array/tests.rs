@@ -47,8 +47,8 @@ fn test_tile_types() {
     assert!(array.tile(4, 0).is_shim());
 
     // Mem tiles at row 1
-    assert!(array.tile(0, 1).is_mem_tile());
-    assert!(array.tile(4, 1).is_mem_tile());
+    assert!(array.tile(0, 1).is_mem());
+    assert!(array.tile(4, 1).is_mem());
 
     // Compute tiles at rows 2-5
     assert!(array.tile(0, 2).is_compute());

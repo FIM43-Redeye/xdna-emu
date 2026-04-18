@@ -18,7 +18,7 @@ fn test_tile_creation() {
 #[test]
 fn test_mem_tile_creation() {
     let tile = Tile::mem_tile(0, 1);
-    assert!(tile.is_mem_tile());
+    assert!(tile.is_mem());
     assert!(tile.program_memory().is_none());
     assert_eq!(tile.data_memory().len(), 512 * 1024);
     assert_eq!(tile.locks.len(), 64);
@@ -545,7 +545,7 @@ fn test_write_tile_register_updates_memtile_bd() {
 
     // Verify BD starts zeroed on the MemTile (col=1, row=1)
     let tile = device.array.get(1, 1).expect("tile(1,1) should exist");
-    assert!(tile.is_mem_tile(), "tile(1,1) should be a MemTile");
+    assert!(tile.is_mem(), "tile(1,1) should be a MemTile");
     assert_eq!(tile.dma_bds[0].length, 0, "BD0 length should start at 0");
 
     // Write via write_tile_register -- the unified register bus

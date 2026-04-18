@@ -23,7 +23,7 @@
 use super::super::addressing::AddressGenerator;
 use super::super::{BdConfig, DmaError};
 use super::padding::{PadAction, ZeroPadState};
-use crate::device::tile::TileType;
+use xdna_archspec::types::TileKind;
 
 /// Lock acquisition mode for DMA transfers.
 ///
@@ -202,7 +202,7 @@ impl Transfer {
         direction: TransferDirection,
         tile_col: u8,
         tile_row: u8,
-        tile_type: TileType,
+        tile_kind: TileKind,
     ) -> Result<Self, DmaError> {
         if !bd_config.valid {
             return Err(DmaError::BdNotValid(bd_index));
@@ -231,7 +231,7 @@ impl Transfer {
         let pad = &bd_config.zero_padding;
         let zero_pad_state = if pad.is_enabled()
             && direction == TransferDirection::MM2S
-            && tile_type == TileType::MemTile
+            && tile_kind == TileKind::Mem
         {
             Some(ZeroPadState::new(
                 *pad,
@@ -250,7 +250,7 @@ impl Transfer {
         let total_bytes = data_bytes;
 
         // Determine endpoints based on direction and tile type
-        let is_shim = tile_type == TileType::Shim;
+        let is_shim = tile_kind.is_shim();
 
         let (source, dest) = match (direction, is_shim) {
             (TransferDirection::S2MM, true) => (

@@ -68,7 +68,7 @@ pub mod perf_counters;
 pub mod timer;
 
 pub use registers::{RegisterInfo, TileAddress};
-pub use tile::{Tile, TileType, Lock, LockResult, DmaBufferDescriptor, DmaChannel, CoreState};
+pub use tile::{Tile, TileKind, Lock, LockResult, DmaBufferDescriptor, DmaChannel, CoreState};
 pub use array::TileArray;
 pub use state::{DeviceState, CdoStats};
 pub use host_memory::{HostMemory, HostMemoryError, MemoryRegion, DataDirection};

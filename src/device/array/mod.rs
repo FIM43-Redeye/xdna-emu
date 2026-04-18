@@ -32,7 +32,7 @@ mod tests;
 use xdna_archspec::runtime::{ArchConfig, ModelConfig};
 use super::dma::{self, DmaEngine, DmaResult};
 use super::host_memory::HostMemory;
-use super::tile::{Tile, TileParams, TileType};
+use super::tile::{Tile, TileParams, TileKind};
 use crate::interpreter::state::EventType;
 use std::sync::Arc;
 
@@ -60,13 +60,13 @@ pub(super) fn get_three_mut(
     let west_idx = if col > 0 {
         let idx = own_idx - rows;
         // Only provide neighbor if it's also a MemTile
-        if tiles[idx].is_mem_tile() { Some(idx) } else { None }
+        if tiles[idx].is_mem() { Some(idx) } else { None }
     } else {
         None
     };
     let east_idx = if col + 1 < cols {
         let idx = own_idx + rows;
-        if tiles[idx].is_mem_tile() { Some(idx) } else { None }
+        if tiles[idx].is_mem() { Some(idx) } else { None }
     } else {
         None
     };
@@ -186,11 +186,7 @@ impl TileArray {
         // Per-tile-type params come from ArchConfig (data-driven from mlir-aie).
         for col in 0..cols {
             for row in 0..rows {
-                // tile_kind() returns TileKind (archspec); convert to TileType
-                // (runtime) for Tile and DmaEngine constructors.  The From impls
-                // were established in Task 2 (commit 43fc807).
                 let tile_kind = arch.tile_kind(col, row);
-                let tile_type: TileType = tile_kind.into();
                 let params = TileParams {
                     data_memory_size: arch.data_memory_size(tile_kind),
                     num_locks: arch.lock_count(tile_kind),
@@ -199,11 +195,11 @@ impl TileArray {
                     dma_s2mm_channels: arch.dma_s2mm_channels(tile_kind),
                     dma_mm2s_channels: arch.dma_mm2s_channels(tile_kind),
                 };
-                tiles.push(Tile::new(tile_type, col, row, &params));
+                tiles.push(Tile::new(tile_kind, col, row, &params));
 
                 // Create DMA engine with ArchConfig-derived channel/BD/lock counts
                 dma_engines.push(DmaEngine::new(
-                    col, row, tile_type,
+                    col, row, tile_kind,
                     params.dma_s2mm_channels, params.dma_mm2s_channels,
                     params.num_bds, params.num_locks as u8,
                 ));
@@ -349,7 +345,7 @@ impl TileArray {
 
     /// Get all memory tiles.
     pub fn mem_tiles(&self) -> impl Iterator<Item = &Tile> {
-        self.tiles.iter().filter(|t| t.is_mem_tile())
+        self.tiles.iter().filter(|t| t.is_mem())
     }
 
     /// Count tiles by type.
@@ -358,10 +354,10 @@ impl TileArray {
         let mut mem = 0;
         let mut compute = 0;
         for tile in &self.tiles {
-            match tile.tile_type {
-                TileType::Shim => shim += 1,
-                TileType::MemTile => mem += 1,
-                TileType::Compute => compute += 1,
+            match tile.tile_kind {
+                TileKind::ShimNoc | TileKind::ShimPl => shim += 1,
+                TileKind::Mem => mem += 1,
+                TileKind::Compute => compute += 1,
             }
         }
         (shim, mem, compute)
@@ -381,10 +377,10 @@ impl TileArray {
                 *ch = Default::default();
             }
             // Recreate stream switch based on tile type (they have different port configurations)
-            tile.stream_switch = match tile.tile_type {
-                TileType::Shim => crate::device::stream_switch::StreamSwitch::new_shim_tile(tile.col),
-                TileType::MemTile => crate::device::stream_switch::StreamSwitch::new_mem_tile(tile.col, tile.row),
-                TileType::Compute => crate::device::stream_switch::StreamSwitch::new_compute_tile(tile.col, tile.row),
+            tile.stream_switch = match tile.tile_kind {
+                TileKind::ShimNoc | TileKind::ShimPl => crate::device::stream_switch::StreamSwitch::new_shim_tile(tile.col),
+                TileKind::Mem => crate::device::stream_switch::StreamSwitch::new_mem_tile(tile.col, tile.row),
+                TileKind::Compute => crate::device::stream_switch::StreamSwitch::new_compute_tile(tile.col, tile.row),
             };
             // Note: We don't zero memory here for performance
             // Call zero_memory() explicitly if needed

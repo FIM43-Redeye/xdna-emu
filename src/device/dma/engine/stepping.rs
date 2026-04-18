@@ -268,7 +268,7 @@ impl DmaEngine {
             ChannelType::S2MM => TransferDirection::S2MM,
             ChannelType::MM2S => TransferDirection::MM2S,
         };
-        Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_type)
+        Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_kind)
     }
 
     /// Begin the completion sequence after data movement is done.
@@ -698,7 +698,7 @@ impl DmaEngine {
         own: &'a Tile,
         neighbors: &'a NeighborTiles<'_>,
     ) -> Option<(&'a Tile, usize)> {
-        if !self.tile_type.is_mem_tile() {
+        if !self.tile_kind.is_mem() {
             return Some((own, (addr as usize) % mem_size));
         }
         match MemTileTarget::resolve(addr, mem_size) {
@@ -734,7 +734,7 @@ impl DmaEngine {
         own: &'a mut Tile,
         neighbors: &'a mut NeighborTiles<'_>,
     ) -> Option<(&'a mut Tile, usize)> {
-        if !self.tile_type.is_mem_tile() {
+        if !self.tile_kind.is_mem() {
             return Some((own, (addr as usize) % mem_size));
         }
         match MemTileTarget::resolve(addr, mem_size) {

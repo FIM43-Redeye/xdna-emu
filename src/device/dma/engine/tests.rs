@@ -22,7 +22,7 @@ fn test_engine_creation() {
 fn test_mem_tile_engine() {
     let engine = DmaEngine::new_mem_tile(0, 1);
     assert_eq!(engine.num_channels(), 12);
-    assert!(engine.tile_type.is_mem_tile());
+    assert!(engine.tile_kind.is_mem());
 }
 
 #[test]
@@ -819,42 +819,42 @@ fn test_compression_multiple_blocks() {
 #[test]
 fn test_resolve_lock_id_memtile() {
     // MemTile: 64 locks, 192-entry address space
-    let tile_type = TileType::MemTile;
+    let tile_kind = TileKind::Mem;
     let num_locks = 64;
 
     // West neighbor: IDs 0-63
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 1, 1, num_locks, 0),
+        DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 0),
         Some(LockTarget::West(0))
     );
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 1, 1, num_locks, 63),
+        DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 63),
         Some(LockTarget::West(63))
     );
 
     // Own tile: IDs 64-127
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 1, 1, num_locks, 64),
+        DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 64),
         Some(LockTarget::Own(0))
     );
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 1, 1, num_locks, 127),
+        DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 127),
         Some(LockTarget::Own(63))
     );
 
     // East neighbor: IDs 128-191
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 1, 1, num_locks, 128),
+        DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 128),
         Some(LockTarget::East(0))
     );
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 1, 1, num_locks, 191),
+        DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 191),
         Some(LockTarget::East(63))
     );
 
     // Out of range
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 1, 1, num_locks, 192),
+        DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 192),
         None
     );
 }
@@ -862,10 +862,10 @@ fn test_resolve_lock_id_memtile() {
 #[test]
 fn test_resolve_lock_id_compute() {
     // Compute tiles: 4-bit field, always Own
-    let tile_type = TileType::Compute;
+    let tile_kind = TileKind::Compute;
     let num_locks = 16;
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 1, 2, num_locks, 5),
+        DmaEngine::resolve_lock_id_static(tile_kind, 1, 2, num_locks, 5),
         Some(LockTarget::Own(5))
     );
 }
@@ -1370,69 +1370,69 @@ fn test_memtile_mm2s_out_of_window_addr_records_fatal_error() {
 #[test]
 fn test_resolve_lock_id_memtile_boundary_values() {
     // Exhaustive boundary test for all three regions of the 192-entry space.
-    let tile_type = TileType::MemTile;
+    let tile_kind = TileKind::Mem;
     let num_locks: u8 = 64;
 
     // Region boundaries: 0, 63, 64, 127, 128, 191, 192
     // West region: [0, 64)
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 0),
+        DmaEngine::resolve_lock_id_static(tile_kind, 2, 1, num_locks, 0),
         Some(LockTarget::West(0)),
         "lock_id=0 -> West(0)"
     );
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 32),
+        DmaEngine::resolve_lock_id_static(tile_kind, 2, 1, num_locks, 32),
         Some(LockTarget::West(32)),
         "lock_id=32 -> West(32) (mid-range)"
     );
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 63),
+        DmaEngine::resolve_lock_id_static(tile_kind, 2, 1, num_locks, 63),
         Some(LockTarget::West(63)),
         "lock_id=63 -> West(63) (last in West region)"
     );
 
     // Own region: [64, 128)
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 64),
+        DmaEngine::resolve_lock_id_static(tile_kind, 2, 1, num_locks, 64),
         Some(LockTarget::Own(0)),
         "lock_id=64 -> Own(0) (first in Own region)"
     );
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 96),
+        DmaEngine::resolve_lock_id_static(tile_kind, 2, 1, num_locks, 96),
         Some(LockTarget::Own(32)),
         "lock_id=96 -> Own(32) (mid-range)"
     );
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 127),
+        DmaEngine::resolve_lock_id_static(tile_kind, 2, 1, num_locks, 127),
         Some(LockTarget::Own(63)),
         "lock_id=127 -> Own(63) (last in Own region)"
     );
 
     // East region: [128, 192)
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 128),
+        DmaEngine::resolve_lock_id_static(tile_kind, 2, 1, num_locks, 128),
         Some(LockTarget::East(0)),
         "lock_id=128 -> East(0) (first in East region)"
     );
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 160),
+        DmaEngine::resolve_lock_id_static(tile_kind, 2, 1, num_locks, 160),
         Some(LockTarget::East(32)),
         "lock_id=160 -> East(32) (mid-range)"
     );
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 191),
+        DmaEngine::resolve_lock_id_static(tile_kind, 2, 1, num_locks, 191),
         Some(LockTarget::East(63)),
         "lock_id=191 -> East(63) (last in East region)"
     );
 
     // Out of range
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 192),
+        DmaEngine::resolve_lock_id_static(tile_kind, 2, 1, num_locks, 192),
         None,
         "lock_id=192 -> None (out of range)"
     );
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 255),
+        DmaEngine::resolve_lock_id_static(tile_kind, 2, 1, num_locks, 255),
         None,
         "lock_id=255 -> None (out of range, max u8)"
     );
@@ -1441,14 +1441,14 @@ fn test_resolve_lock_id_memtile_boundary_values() {
 #[test]
 fn test_resolve_lock_id_shim_passthrough() {
     // Shim tiles use a small lock ID field, always maps to Own.
-    let tile_type = TileType::Shim;
+    let tile_kind = TileKind::ShimNoc;
     let num_locks = 16;
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 0, 0, num_locks, 0),
+        DmaEngine::resolve_lock_id_static(tile_kind, 0, 0, num_locks, 0),
         Some(LockTarget::Own(0))
     );
     assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_type, 0, 0, num_locks, 15),
+        DmaEngine::resolve_lock_id_static(tile_kind, 0, 0, num_locks, 15),
         Some(LockTarget::Own(15))
     );
 }
@@ -1493,7 +1493,7 @@ fn test_memtile_mm2s_packet_header_insertion() {
     // This verifies the data path from BD config to Transfer to packet
     // header, which is the path that the packet_flow test depends on.
     use crate::device::dma::transfer::{Transfer, TransferDirection};
-    use crate::device::TileType;
+    use xdna_archspec::types::TileKind;
 
     let mut bd = BdConfig::default();
     bd.valid = true;
@@ -1507,7 +1507,7 @@ fn test_memtile_mm2s_packet_header_insertion() {
 
     // Create a Transfer from this BD (as MemTile MM2S)
     let transfer = Transfer::new(
-        &bd, 1, 6, TransferDirection::MM2S, 0, 1, TileType::MemTile
+        &bd, 1, 6, TransferDirection::MM2S, 0, 1, TileKind::Mem
     ).expect("should create transfer");
 
     // The transfer must carry the packet config from the BD

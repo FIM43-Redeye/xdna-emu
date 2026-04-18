@@ -36,6 +36,7 @@ pub use params::{PROGRAM_MEMORY_SIZE, TileParams};
 pub use locks::{LockResult, LockRequestor, LockRequest, LockArbiterStats, LockArbiter, Lock};
 pub use dma_legacy::{DmaBufferDescriptor, DmaChannel};
 pub use core_state::{CoreState, LegacyStreamPort, TileType, CtrlPacketAction};
+pub use xdna_archspec::types::TileKind;
 pub use edge::EdgeDetector;
 
 use super::stream_switch::StreamSwitch as FunctionalStreamSwitch;
@@ -45,7 +46,7 @@ use crate::interpreter::state::EventType;
 #[derive(Debug)]
 pub struct Tile {
     /// Tile type
-    pub tile_type: TileType,
+    pub tile_kind: TileKind,
 
     /// Column index
     pub col: u8,
@@ -295,14 +296,14 @@ impl Tile {
     /// Production code should use the `ArchConfig`-derived params (via
     /// `TileArray::new()`). Test code can use `Tile::compute()` etc. for
     /// convenience with NPU1/AIE2 defaults.
-    pub fn new(tile_type: TileType, col: u8, row: u8, params: &TileParams) -> Self {
-        let program_memory = match tile_type {
-            TileType::Compute => Some(Box::new([0u8; PROGRAM_MEMORY_SIZE])),
+    pub fn new(tile_kind: TileKind, col: u8, row: u8, params: &TileParams) -> Self {
+        let program_memory = match tile_kind {
+            TileKind::Compute => Some(Box::new([0u8; PROGRAM_MEMORY_SIZE])),
             _ => None,
         };
 
         Self {
-            tile_type,
+            tile_kind,
             col,
             row,
             processor_bus_enabled: false,
@@ -317,10 +318,10 @@ impl Tile {
             dma_channels: vec![DmaChannel::default(); params.num_channels],
             stream_input: Default::default(),
             stream_output: Default::default(),
-            stream_switch: match tile_type {
-                TileType::Shim => FunctionalStreamSwitch::new_shim_tile(col),
-                TileType::MemTile => FunctionalStreamSwitch::new_mem_tile(col, row),
-                TileType::Compute => FunctionalStreamSwitch::new_compute_tile(col, row),
+            stream_switch: match tile_kind {
+                TileKind::ShimNoc | TileKind::ShimPl => FunctionalStreamSwitch::new_shim_tile(col),
+                TileKind::Mem => FunctionalStreamSwitch::new_mem_tile(col, row),
+                TileKind::Compute => FunctionalStreamSwitch::new_compute_tile(col, row),
             },
             data_memory: vec![0u8; params.data_memory_size].into_boxed_slice(),
             program_memory,
@@ -335,35 +336,35 @@ impl Tile {
             mem_trace: TraceUnit::new(col, row),
             mem_trace_pending: Vec::new(),
             event_port_selection: [None; 8],
-            core_perf_counters: match tile_type {
-                TileType::Compute => super::perf_counters::PerfCounterBank::new(4),
-                TileType::Shim => super::perf_counters::PerfCounterBank::new(2),
-                TileType::MemTile => super::perf_counters::PerfCounterBank::new(0),
+            core_perf_counters: match tile_kind {
+                TileKind::Compute => super::perf_counters::PerfCounterBank::new(4),
+                TileKind::ShimNoc | TileKind::ShimPl => super::perf_counters::PerfCounterBank::new(2),
+                TileKind::Mem => super::perf_counters::PerfCounterBank::new(0),
             },
-            mem_perf_counters: match tile_type {
-                TileType::Compute => super::perf_counters::PerfCounterBank::new(2),
-                TileType::MemTile => super::perf_counters::PerfCounterBank::new(4),
-                TileType::Shim => super::perf_counters::PerfCounterBank::new(0),
+            mem_perf_counters: match tile_kind {
+                TileKind::Compute => super::perf_counters::PerfCounterBank::new(2),
+                TileKind::Mem => super::perf_counters::PerfCounterBank::new(4),
+                TileKind::ShimNoc | TileKind::ShimPl => super::perf_counters::PerfCounterBank::new(0),
             },
             core_timer: super::timer::TileTimer::new(),
             mem_timer: super::timer::TileTimer::new(),
             core_debug: super::core_debug::CoreDebugState::new(),
-            core_events: match tile_type {
-                TileType::Compute => Some(super::events::EventModule::new(super::events::EventModuleType::Core)),
-                TileType::Shim => Some(super::events::EventModule::new(super::events::EventModuleType::Pl)),
-                TileType::MemTile => None, // MemTile has no core module
+            core_events: match tile_kind {
+                TileKind::Compute => Some(super::events::EventModule::new(super::events::EventModuleType::Core)),
+                TileKind::ShimNoc | TileKind::ShimPl => Some(super::events::EventModule::new(super::events::EventModuleType::Pl)),
+                TileKind::Mem => None, // MemTile has no core module
             },
-            mem_events: match tile_type {
-                TileType::Compute => Some(super::events::EventModule::new(super::events::EventModuleType::Memory)),
-                TileType::MemTile => Some(super::events::EventModule::new(super::events::EventModuleType::MemTile)),
-                TileType::Shim => None, // Shim has no memory module
+            mem_events: match tile_kind {
+                TileKind::Compute => Some(super::events::EventModule::new(super::events::EventModuleType::Memory)),
+                TileKind::Mem => Some(super::events::EventModule::new(super::events::EventModuleType::MemTile)),
+                TileKind::ShimNoc | TileKind::ShimPl => None, // Shim has no memory module
             },
-            l1_irq: if tile_type == TileType::Shim {
+            l1_irq: if tile_kind.is_shim() {
                 Some(super::interrupts::L1InterruptController::new())
             } else {
                 None
             },
-            l2_irq: if tile_type == TileType::Shim {
+            l2_irq: if tile_kind.is_shim() {
                 Some(super::interrupts::L2InterruptController::new())
             } else {
                 None
@@ -383,19 +384,19 @@ impl Tile {
     /// `Tile::new()` with ArchConfig-derived params.
     #[inline]
     pub fn compute(col: u8, row: u8) -> Self {
-        Self::new(TileType::Compute, col, row, &TileParams::compute())
+        Self::new(TileKind::Compute, col, row, &TileParams::compute())
     }
 
     /// Create a memory tile with NPU1/AIE2 default parameters.
     #[inline]
     pub fn mem_tile(col: u8, row: u8) -> Self {
-        Self::new(TileType::MemTile, col, row, &TileParams::mem_tile())
+        Self::new(TileKind::Mem, col, row, &TileParams::mem_tile())
     }
 
     /// Create a shim tile with NPU1/AIE2 default parameters.
     #[inline]
     pub fn shim(col: u8, row: u8) -> Self {
-        Self::new(TileType::Shim, col, row, &TileParams::shim())
+        Self::new(TileKind::ShimNoc, col, row, &TileParams::shim())
     }
 
     /// Get data memory slice.
@@ -476,28 +477,28 @@ impl Tile {
     /// Check if this is a compute tile.
     #[inline]
     pub fn is_compute(&self) -> bool {
-        self.tile_type == TileType::Compute
+        self.tile_kind == TileKind::Compute
     }
 
     /// Check if this is a memory tile.
     #[inline]
-    pub fn is_mem_tile(&self) -> bool {
-        self.tile_type == TileType::MemTile
+    pub fn is_mem(&self) -> bool {
+        self.tile_kind.is_mem()
     }
 
     /// Check if this is a shim tile.
     #[inline]
     pub fn is_shim(&self) -> bool {
-        self.tile_type == TileType::Shim
+        self.tile_kind.is_shim()
     }
 
     /// DMA BD base address and stride for this tile type (from register database).
     #[inline]
     fn bd_layout(&self, rl: &super::regdb::DeviceRegLayout) -> (u32, u32) {
-        match self.tile_type {
-            TileType::MemTile => (rl.memtile_bd_base, rl.memtile_bd_stride),
-            TileType::Shim => (rl.shim_bd_base, rl.shim_bd_stride),
-            TileType::Compute => (rl.memory_bd_base, rl.memory_bd_stride),
+        match self.tile_kind {
+            TileKind::Mem => (rl.memtile_bd_base, rl.memtile_bd_stride),
+            TileKind::ShimNoc | TileKind::ShimPl => (rl.shim_bd_base, rl.shim_bd_stride),
+            TileKind::Compute => (rl.memory_bd_base, rl.memory_bd_stride),
         }
     }
 
@@ -507,10 +508,10 @@ impl Tile {
     /// contiguous with the same stride).
     #[inline]
     fn channel_layout(&self, rl: &super::regdb::DeviceRegLayout) -> (u32, u32) {
-        match self.tile_type {
-            TileType::MemTile => (rl.memtile_channel_s2mm_base, rl.memtile_channel_stride),
-            TileType::Shim => (rl.shim_channel_base, rl.shim_channel_stride),
-            TileType::Compute => (rl.memory_channel_base, rl.memory_channel_stride),
+        match self.tile_kind {
+            TileKind::Mem => (rl.memtile_channel_s2mm_base, rl.memtile_channel_stride),
+            TileKind::ShimNoc | TileKind::ShimPl => (rl.shim_channel_base, rl.shim_channel_stride),
+            TileKind::Compute => (rl.memory_channel_base, rl.memory_channel_stride),
         }
     }
 
@@ -528,10 +529,10 @@ impl Tile {
 
     /// Number of physical memory banks for this tile type (for conflict detection).
     pub fn num_banks(&self) -> usize {
-        match self.tile_type {
-            TileType::Compute => xdna_archspec::aie2::compute::PHYSICAL_BANKS as usize,
-            TileType::MemTile => xdna_archspec::aie2::memtile::PHYSICAL_BANKS as usize,
-            TileType::Shim => 0,
+        match self.tile_kind {
+            TileKind::Compute => xdna_archspec::aie2::compute::PHYSICAL_BANKS as usize,
+            TileKind::Mem => xdna_archspec::aie2::memtile::PHYSICAL_BANKS as usize,
+            TileKind::ShimNoc | TileKind::ShimPl => 0,
         }
     }
 
@@ -608,7 +609,7 @@ impl Tile {
             let fire = (det.trigger_rising && det.curr_active && !det.prev_active)
                 || (det.trigger_falling && !det.curr_active && det.prev_active);
             if fire {
-                let hw_id = if self.is_mem_tile() {
+                let hw_id = if self.is_mem() {
                     crate::trace::memtile_edge_detection_event_hw_id(i as u8)
                 } else {
                     crate::trace::mem_edge_detection_event_hw_id(i as u8)

@@ -96,7 +96,7 @@ impl DmaEngine {
         use crate::device::tile::LockRequest;
 
         let lock_target = match Self::resolve_lock_id_static(
-            self.tile_type, self.col, self.row, self.num_locks, lock_id,
+            self.tile_kind, self.col, self.row, self.num_locks, lock_id,
         ) {
             Some(target) => target,
             None => return,
@@ -129,7 +129,7 @@ impl DmaEngine {
     /// For MemTile, maps the 8-bit cross-tile lock address space to local
     /// lock indices. For compute/shim, passes through directly.
     pub(super) fn resolve_lock_id(&self, lock_id: u8) -> Option<LockTarget> {
-        Self::resolve_lock_id_static(self.tile_type, self.col, self.row, self.num_locks, lock_id)
+        Self::resolve_lock_id_static(self.tile_kind, self.col, self.row, self.num_locks, lock_id)
     }
 
     /// Static version of resolve_lock_id for use when &self is partially borrowed.
@@ -141,8 +141,8 @@ impl DmaEngine {
     ///   - IDs 2*num_locks .. 3*num_locks-1: East neighbor (col+1) locks
     ///
     /// Compute/shim: 4-bit field, always Own tile.
-    pub fn resolve_lock_id_static(tile_type: TileType, col: u8, row: u8, num_locks: u8, lock_id: u8) -> Option<LockTarget> {
-        if !tile_type.is_mem_tile() {
+    pub fn resolve_lock_id_static(tile_kind: TileKind, col: u8, row: u8, num_locks: u8, lock_id: u8) -> Option<LockTarget> {
+        if !tile_kind.is_mem() {
             // Compute/shim: 4-bit field, always local
             return Some(LockTarget::Own(lock_id));
         }

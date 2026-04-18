@@ -12,7 +12,7 @@
 
 use crate::device::dma::ChannelState;
 use crate::device::host_memory::HostMemory;
-use crate::device::tile::TileType;
+use xdna_archspec::types::TileKind;
 use crate::device::DeviceState;
 use crate::parser::{AieElf, MemoryRegion};
 use crate::interpreter::bundle::VliwBundle;
@@ -600,7 +600,7 @@ impl InterpreterEngine {
 
                 // Get tile for this core
                 if let Some(tile) = self.device.tile_mut(col, row) {
-                    if tile.tile_type != TileType::Compute {
+                    if tile.tile_kind != TileKind::Compute {
                         continue;
                     }
 
@@ -775,7 +775,7 @@ impl InterpreterEngine {
                     if let Some(id) = crate::trace::shim_event_to_hw_id(&event) {
                         tile.notify_core_trace_event(id, cycle);
                     }
-                } else if tile.is_mem_tile() {
+                } else if tile.is_mem() {
                     if let Some(id) = crate::trace::memtile_event_to_hw_id(&event) {
                         tile.notify_mem_trace_event(id, cycle);
                     }
@@ -802,13 +802,13 @@ impl InterpreterEngine {
             let cycle = self.total_cycles;
             // Collect (tile_idx, hw_event_id, event_type, trace_target) tuples.
             // trace_target: which trace unit to notify (core_trace vs mem_trace).
-            let mut port_events: Vec<(usize, u8, EventType, TileType)> = Vec::new();
+            let mut port_events: Vec<(usize, u8, EventType, TileKind)> = Vec::new();
             for idx in 0..self.device.array.tiles.len() {
                 let tile = &self.device.array.tiles[idx];
                 if !tile.core_trace.is_configured() && !tile.mem_trace.is_configured() {
                     continue;
                 }
-                let tt = tile.tile_type;
+                let tt = tile.tile_kind;
 
                 for event_port in 0..8u8 {
                     if let Some((port_idx, is_master)) = tile.event_port_selection[event_port as usize] {
@@ -822,16 +822,16 @@ impl InterpreterEngine {
                         // PORT_RUNNING or PORT_IDLE (mutually exclusive)
                         let (hw_id, evt) = if port.cycle_active {
                             let hw_id = match tt {
-                                TileType::Compute => crate::trace::core_port_running_hw_id(event_port),
-                                TileType::MemTile => crate::trace::memtile_port_running_hw_id(event_port),
-                                TileType::Shim => crate::trace::shim_port_running_hw_id(event_port),
+                                TileKind::Compute => crate::trace::core_port_running_hw_id(event_port),
+                                TileKind::Mem => crate::trace::memtile_port_running_hw_id(event_port),
+                                TileKind::ShimNoc | TileKind::ShimPl => crate::trace::shim_port_running_hw_id(event_port),
                             };
                             (hw_id, EventType::PortRunning { port: event_port })
                         } else {
                             let hw_id = match tt {
-                                TileType::Compute => crate::trace::core_port_idle_hw_id(event_port),
-                                TileType::MemTile => crate::trace::memtile_port_idle_hw_id(event_port),
-                                TileType::Shim => crate::trace::shim_port_idle_hw_id(event_port),
+                                TileKind::Compute => crate::trace::core_port_idle_hw_id(event_port),
+                                TileKind::Mem => crate::trace::memtile_port_idle_hw_id(event_port),
+                                TileKind::ShimNoc | TileKind::ShimPl => crate::trace::shim_port_idle_hw_id(event_port),
                             };
                             (hw_id, EventType::PortIdle { port: event_port })
                         };
@@ -839,18 +839,18 @@ impl InterpreterEngine {
 
                         if port.cycle_stalled {
                             let hw_id = match tt {
-                                TileType::Compute => crate::trace::core_port_stalled_hw_id(event_port),
-                                TileType::MemTile => crate::trace::memtile_port_stalled_hw_id(event_port),
-                                TileType::Shim => crate::trace::shim_port_stalled_hw_id(event_port),
+                                TileKind::Compute => crate::trace::core_port_stalled_hw_id(event_port),
+                                TileKind::Mem => crate::trace::memtile_port_stalled_hw_id(event_port),
+                                TileKind::ShimNoc | TileKind::ShimPl => crate::trace::shim_port_stalled_hw_id(event_port),
                             };
                             port_events.push((idx, hw_id, EventType::PortStalled { port: event_port }, tt));
                         }
 
                         if port.cycle_tlast {
                             let hw_id = match tt {
-                                TileType::Compute => crate::trace::core_port_tlast_hw_id(event_port),
-                                TileType::MemTile => crate::trace::memtile_port_tlast_hw_id(event_port),
-                                TileType::Shim => crate::trace::shim_port_tlast_hw_id(event_port),
+                                TileKind::Compute => crate::trace::core_port_tlast_hw_id(event_port),
+                                TileKind::Mem => crate::trace::memtile_port_tlast_hw_id(event_port),
+                                TileKind::ShimNoc | TileKind::ShimPl => crate::trace::shim_port_tlast_hw_id(event_port),
                             };
                             port_events.push((idx, hw_id, EventType::PortTlast { port: event_port }, tt));
                         }
@@ -862,7 +862,7 @@ impl InterpreterEngine {
                 // Compute tiles: core_trace (CoreEvent namespace)
                 // Shim tiles: core_trace (PL module, single trace unit)
                 // MemTiles: mem_trace (MemTileEvent namespace)
-                if tt == TileType::MemTile {
+                if tt == TileKind::Mem {
                     tile.notify_mem_trace_event(hw_id, cycle);
                 } else {
                     tile.notify_core_trace_event(hw_id, cycle);
@@ -908,7 +908,7 @@ impl InterpreterEngine {
             }
             for (tile_idx, bank) in bank_events {
                 let tile = &mut self.device.array.tiles[tile_idx];
-                let hw_id = if tile.is_mem_tile() {
+                let hw_id = if tile.is_mem() {
                     crate::trace::memtile_conflict_dm_bank_hw_id(bank)
                 } else {
                     crate::trace::mem_conflict_dm_bank_hw_id(bank)
@@ -1171,7 +1171,7 @@ impl InterpreterEngine {
         for col in 0..self.cols {
             for row in self.compute_row_start..self.rows {
                 if let Some(tile) = self.device.array.get(col as u8, row as u8) {
-                    if tile.tile_type == TileType::Compute {
+                    if tile.tile_kind == TileKind::Compute {
                         let idx = col * self.rows + row;
                         if let Some(core) = self.cores.get_mut(idx) {
                             // Sync enabled state from tile

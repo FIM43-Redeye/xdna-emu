@@ -10,7 +10,7 @@
 //!
 //! Reference: AMD AM020/AM025 and docs/dma-reference.md
 
-use crate::device::tile::TileType;
+use xdna_archspec::types::TileKind;
 
 /// BD spacing: 32 bytes (0x20) between BDs for all tile types.
 /// Consistent across compute, memtile, and shim; also derivable from regdb.
@@ -142,11 +142,11 @@ impl BufferDescriptor {
     ///
     /// # Panics
     /// Panics if `words` slice is too short for the tile type.
-    pub fn from_registers(words: &[u32], tile_type: TileType) -> Self {
-        match tile_type {
-            TileType::Compute => Self::parse_compute(words),
-            TileType::MemTile => Self::parse_memtile(words),
-            TileType::Shim => Self::parse_shim(words),
+    pub fn from_registers(words: &[u32], tile_kind: TileKind) -> Self {
+        match tile_kind {
+            TileKind::Compute => Self::parse_compute(words),
+            TileKind::Mem => Self::parse_memtile(words),
+            TileKind::ShimNoc | TileKind::ShimPl => Self::parse_shim(words),
         }
     }
 
@@ -156,7 +156,7 @@ impl BufferDescriptor {
     /// All bit positions come from `BdFieldLayout::from_regdb()` rather than
     /// hardcoded shift/mask constants. This matches the pattern used by `parse_shim()`.
     fn parse_compute(words: &[u32]) -> Self {
-        let expected = bd_register_count(TileType::Compute);
+        let expected = bd_register_count(TileKind::Compute);
         assert!(words.len() >= expected, "Compute BD needs {} registers", expected);
 
         let lay = &crate::device::regdb::device_reg_layout().memory_bd;
@@ -245,7 +245,7 @@ impl BufferDescriptor {
     /// module). All bit positions come from `MemTileBdFieldLayout::from_regdb()`
     /// rather than hardcoded shift/mask constants.
     fn parse_memtile(words: &[u32]) -> Self {
-        let expected = bd_register_count(TileType::MemTile);
+        let expected = bd_register_count(TileKind::Mem);
         assert!(words.len() >= expected, "MemTile BD needs {} registers", expected);
 
         let lay = &crate::device::regdb::device_reg_layout().memtile_bd;
@@ -324,7 +324,7 @@ impl BufferDescriptor {
     /// address (split across two registers), and AXI parameters (burst length,
     /// SMID, AxCache, AxQoS).
     fn parse_shim(words: &[u32]) -> Self {
-        let expected = bd_register_count(TileType::Shim);
+        let expected = bd_register_count(TileKind::ShimNoc);
         assert!(words.len() >= expected, "Shim BD needs {} registers", expected);
 
         let lay = &crate::device::regdb::device_reg_layout().shim_bd;
@@ -427,10 +427,10 @@ impl BufferDescriptor {
     /// * `memory` - Tile memory slice
     /// * `bd_id` - BD slot index
     /// * `tile_type` - Type of tile
-    pub fn from_memory(memory: &[u8], bd_id: u8, tile_type: TileType) -> Self {
-        let base = bd_base_address(tile_type);
+    pub fn from_memory(memory: &[u8], bd_id: u8, tile_kind: TileKind) -> Self {
+        let base = bd_base_address(tile_kind);
         let offset = (base + bd_id as u64 * BD_SPACING) as usize;
-        let reg_count = bd_register_count(tile_type);
+        let reg_count = bd_register_count(tile_kind);
 
         // Read register words from memory
         let mut words = Vec::with_capacity(reg_count);
@@ -449,7 +449,7 @@ impl BufferDescriptor {
             }
         }
 
-        Self::from_registers(&words, tile_type)
+        Self::from_registers(&words, tile_kind)
     }
 
     /// Convert byte address to word address
@@ -586,12 +586,12 @@ impl BufferDescriptor {
 }
 
 /// Get BD base address for a tile type (from register database).
-pub fn bd_base_address(tile_type: TileType) -> u64 {
+pub fn bd_base_address(tile_kind: TileKind) -> u64 {
     let lay = crate::device::regdb::device_reg_layout();
-    match tile_type {
-        TileType::Compute => lay.memory_bd_base as u64,
-        TileType::MemTile => lay.memtile_bd_base as u64,
-        TileType::Shim => lay.shim_bd_base as u64,
+    match tile_kind {
+        TileKind::Compute => lay.memory_bd_base as u64,
+        TileKind::Mem => lay.memtile_bd_base as u64,
+        TileKind::ShimNoc | TileKind::ShimPl => lay.shim_bd_base as u64,
     }
 }
 
@@ -599,12 +599,12 @@ pub fn bd_base_address(tile_type: TileType) -> u64 {
 ///
 /// Counts DMA_BD0_N registers in the register database for each module type.
 /// The regdb computes this at init time and stores in DeviceRegLayout.
-pub fn bd_register_count(tile_type: TileType) -> usize {
+pub fn bd_register_count(tile_kind: TileKind) -> usize {
     let lay = crate::device::regdb::device_reg_layout();
-    match tile_type {
-        TileType::Compute => lay.memory_bd_words,
-        TileType::MemTile => lay.memtile_bd_words,
-        TileType::Shim => lay.shim_bd_words,
+    match tile_kind {
+        TileKind::Compute => lay.memory_bd_words,
+        TileKind::Mem => lay.memtile_bd_words,
+        TileKind::ShimNoc | TileKind::ShimPl => lay.shim_bd_words,
     }
 }
 
@@ -643,7 +643,7 @@ mod tests {
             0x0200_0000,  // BD_5: valid=1
         ];
 
-        let bd = BufferDescriptor::from_registers(&words, TileType::Compute);
+        let bd = BufferDescriptor::from_registers(&words, TileKind::Compute);
 
         assert!(bd.valid);
         assert_eq!(bd.base_addr_words, 0x10);
@@ -672,7 +672,7 @@ mod tests {
             0x8000_0000,  // BD_7: valid=1
         ];
 
-        let bd = BufferDescriptor::from_registers(&words, TileType::MemTile);
+        let bd = BufferDescriptor::from_registers(&words, TileKind::Mem);
 
         assert!(bd.valid);
         assert!(bd.enable_packet);
@@ -697,7 +697,7 @@ mod tests {
             0x0200_0000,  // BD_7: valid=1
         ];
 
-        let bd = BufferDescriptor::from_registers(&words, TileType::Shim);
+        let bd = BufferDescriptor::from_registers(&words, TileKind::ShimNoc);
 
         assert!(bd.valid);
         assert_eq!(bd.length_words, 0x1000);
@@ -736,7 +736,7 @@ mod tests {
             | (3 << 18) | (2 << 13) | (1 << 12) | (1 << 5) | 7;
 
         let words = [w0, w1, w2, w3, w4, w5];
-        let bd = BufferDescriptor::from_registers(&words, TileType::Compute);
+        let bd = BufferDescriptor::from_registers(&words, TileKind::Compute);
 
         // Word 0
         assert_eq!(bd.base_addr_words, 0x1AB, "base_addr_words");
@@ -810,7 +810,7 @@ mod tests {
         let w7: u32 = (1u32 << 31) | (3 << 24) | (0x42 << 16) | (1 << 15) | (2 << 8) | 0x37;
 
         let words = [w0, w1, w2, w3, w4, w5, w6, w7];
-        let bd = BufferDescriptor::from_registers(&words, TileType::MemTile);
+        let bd = BufferDescriptor::from_registers(&words, TileKind::Mem);
 
         // Word 0
         assert!(bd.enable_packet, "enable_packet");
@@ -995,7 +995,7 @@ mod tests {
             0x0200_0000,  // BD_7: valid=1
         ];
 
-        let bd = BufferDescriptor::from_registers(&words, TileType::Shim);
+        let bd = BufferDescriptor::from_registers(&words, TileKind::ShimNoc);
         let cfg = bd.to_bd_config();
 
         assert!(cfg.valid);
@@ -1030,7 +1030,7 @@ mod tests {
             1u32 << 25,
         ];
 
-        let bd = BufferDescriptor::from_registers(&words, TileType::Shim);
+        let bd = BufferDescriptor::from_registers(&words, TileKind::ShimNoc);
 
         // Verify D2 wrap was derived from buffer_length / (d0 * d1)
         assert_eq!(bd.d2_wrap, 4, "d2_wrap should be 4096/(16*64)=4");
@@ -1057,7 +1057,7 @@ mod tests {
             1u32 << 25,   // BD_7: valid=1
         ];
 
-        let bd = BufferDescriptor::from_registers(&words, TileType::Shim);
+        let bd = BufferDescriptor::from_registers(&words, TileKind::ShimNoc);
         assert_eq!(bd.d2_wrap, 0, "simple 1D should have d2_wrap=0");
     }
 
@@ -1104,7 +1104,7 @@ mod tests {
             1u32 << 31,                       // BD_7: valid=1
         ];
 
-        let bd = BufferDescriptor::from_registers(&words, TileType::MemTile);
+        let bd = BufferDescriptor::from_registers(&words, TileKind::Mem);
         assert_eq!(bd.d0_wrap, 5);
         assert_eq!(bd.d1_wrap, 8);
         assert_eq!(bd.d2_wrap, 1);
@@ -1151,7 +1151,7 @@ mod tests {
         // matches the reset value; we want to verify that the
         // derivation doesn't inflate d3 spuriously for simple
         // transfers.
-        let bd = BufferDescriptor::from_registers(&words, TileType::MemTile);
+        let bd = BufferDescriptor::from_registers(&words, TileKind::Mem);
         assert_eq!(bd.d3_stepsize, 1, "d3_stepsize reset value after +1");
 
         let cfg = bd.to_bd_config();

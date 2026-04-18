@@ -52,7 +52,7 @@ use super::transfer::{Transfer, TransferDirection, TransferEndpoint, PadAction};
 use super::channel::{ChannelFsm, ChannelContext, CompletionInfo};
 use super::timing::DmaTimingConfig;
 use crate::device::host_memory::HostMemory;
-use crate::device::tile::{Tile, TileType};
+use crate::device::tile::{Tile, TileKind};
 use crate::interpreter::state::EventType;
 use crate::interpreter::timing::sync::LockTimingState;
 
@@ -66,7 +66,7 @@ pub struct DmaEngine {
     pub row: u8,
 
     /// Tile type (affects channel count, BD count, and transfer endpoints)
-    pub tile_type: TileType,
+    pub tile_kind: TileKind,
 
     /// Buffer descriptor configurations
     pub(super) bd_configs: Vec<BdConfig>,
@@ -144,10 +144,10 @@ impl DmaEngine {
     /// `num_channels` and `num_bds` come from the architecture configuration
     /// (ArchConfig) rather than compile-time constants. The caller is
     /// responsible for providing the correct values for the tile type.
-    pub fn new(col: u8, row: u8, tile_type: TileType, s2mm_channels: usize, mm2s_channels: usize, num_bds: usize, num_locks: u8) -> Self {
+    pub fn new(col: u8, row: u8, tile_kind: TileKind, s2mm_channels: usize, mm2s_channels: usize, num_bds: usize, num_locks: u8) -> Self {
         let num_channels = s2mm_channels + mm2s_channels;
-        log::debug!("DmaEngine::new col={} row={} tile_type={:?} num_channels={} (s2mm={}, mm2s={}) num_bds={} num_locks={}",
-            col, row, tile_type, num_channels, s2mm_channels, mm2s_channels, num_bds, num_locks);
+        log::debug!("DmaEngine::new col={} row={} tile_kind={:?} num_channels={} (s2mm={}, mm2s={}) num_bds={} num_locks={}",
+            col, row, tile_kind, num_channels, s2mm_channels, mm2s_channels, num_bds, num_locks);
 
         let channels = (0..num_channels)
             .map(|i| ChannelContext::new(i as u8))
@@ -156,7 +156,7 @@ impl DmaEngine {
         Self {
             col,
             row,
-            tile_type,
+            tile_kind,
             bd_configs: vec![BdConfig::default(); num_bds],
             bd_dirty: vec![false; num_bds],
             channels,
@@ -170,10 +170,10 @@ impl DmaEngine {
             s2mm_count: s2mm_channels,
             mm2s_count: mm2s_channels,
             num_locks,
-            num_banks: match tile_type {
-                TileType::Compute => xdna_archspec::aie2::compute::PHYSICAL_BANKS as usize,
-                TileType::MemTile => xdna_archspec::aie2::memtile::PHYSICAL_BANKS as usize,
-                TileType::Shim => 0,
+            num_banks: match tile_kind {
+                TileKind::Compute => xdna_archspec::aie2::compute::PHYSICAL_BANKS as usize,
+                TileKind::Mem => xdna_archspec::aie2::memtile::PHYSICAL_BANKS as usize,
+                TileKind::ShimNoc | TileKind::ShimPl => 0,
             },
             cycle_dma_banks: 0,
             fatal_errors: Vec::new(),
@@ -186,19 +186,19 @@ impl DmaEngine {
     /// ArchConfig-derived values (see `DeviceArray::new()`).
     #[cfg(test)]
     pub fn new_compute_tile(col: u8, row: u8) -> Self {
-        Self::new(col, row, TileType::Compute, 2, 2, 16, 16)
+        Self::new(col, row, TileKind::Compute, 2, 2, 16, 16)
     }
 
     /// Create a memory tile DMA engine with AIE2 defaults (6+6 channels, 48 BDs).
     #[cfg(test)]
     pub fn new_mem_tile(col: u8, row: u8) -> Self {
-        Self::new(col, row, TileType::MemTile, 6, 6, 48, 64)
+        Self::new(col, row, TileKind::Mem, 6, 6, 48, 64)
     }
 
     /// Create a shim tile DMA engine with AIE2 defaults (2+2 channels, 16 BDs).
     #[cfg(test)]
     pub fn new_shim_tile(col: u8, row: u8) -> Self {
-        Self::new(col, row, TileType::Shim, 2, 2, 16, 0)
+        Self::new(col, row, TileKind::ShimNoc, 2, 2, 16, 0)
     }
 
     /// Configure custom timing parameters.
@@ -270,7 +270,7 @@ impl DmaEngine {
     /// field width: 4 bits for compute (16 BDs), 6 bits for memtile (48 BDs).
     pub(super) fn status_layout(&self) -> &'static crate::device::regdb::StatusFieldLayout {
         let layout = crate::device::regdb::device_reg_layout();
-        if self.tile_type.is_mem_tile() {
+        if self.tile_kind.is_mem() {
             &layout.memtile_status
         } else {
             &layout.memory_status
@@ -310,7 +310,7 @@ impl DmaEngine {
     /// Returns true if the combination is valid (or the tile is not a MemTile).
     /// Returns false for invalid MemTile BD-channel combinations.
     pub(super) fn check_memtile_bd_channel_validity(&self, bd_index: u8, channel: ChannelId) -> bool {
-        if !self.tile_type.is_mem_tile() {
+        if !self.tile_kind.is_mem() {
             return true;
         }
 
@@ -432,7 +432,7 @@ impl DmaEngine {
         };
 
         // Create transfer
-        let transfer = Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_type)?;
+        let transfer = Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_kind)?;
 
         log::info!("DMA tile({},{}) ch{} BD{} start: total_bytes={} base_addr=0x{:X} next_bd={:?} acq_lock={:?}(val={}) rel_lock={:?}(val={}) pkt={}(id={}) dir={:?}",
             self.col, self.row, channel, bd_index,

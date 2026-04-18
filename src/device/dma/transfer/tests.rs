@@ -3,7 +3,7 @@
 use super::*;
 use crate::device::dma::addressing::{AddressGenerator, ZeroPadConfig};
 use crate::device::dma::{BdConfig, DmaError};
-use crate::device::tile::TileType;
+use xdna_archspec::types::TileKind;
 
 
 fn simple_bd() -> BdConfig {
@@ -18,7 +18,7 @@ fn simple_bd() -> BdConfig {
 #[test]
 fn test_transfer_creation() {
     let bd = simple_bd();
-    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
 
     assert_eq!(transfer.bd_index, 0);
     assert_eq!(transfer.channel, 0);
@@ -31,7 +31,7 @@ fn test_transfer_invalid_bd() {
     let mut bd = simple_bd();
     bd.valid = false;
 
-    let result = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute);
+    let result = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute);
     assert!(matches!(result, Err(DmaError::BdNotValid(0))));
 }
 
@@ -41,7 +41,7 @@ fn test_transfer_with_acquire_lock() {
     bd.acquire_lock = Some(5);
     bd.acquire_value = 1;
 
-    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
     assert_eq!(transfer.acquire_lock, Some(5));
     assert_eq!(transfer.acquire_value, 1);
     assert_eq!(transfer.acquire_mode(), Some(LockAcquireMode::Equal(1)));
@@ -53,7 +53,7 @@ fn test_transfer_advance_to_completion() {
     bd.acquire_lock = Some(5);
     bd.release_lock = Some(5);
 
-    let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+    let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
 
     // Lock config is stored on the transfer
     assert_eq!(transfer.acquire_lock, Some(5));
@@ -68,7 +68,7 @@ fn test_transfer_advance_to_completion() {
 #[test]
 fn test_transfer_progress() {
     let bd = simple_bd();
-    let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+    let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
 
     assert_eq!(transfer.progress(), 0.0);
 
@@ -82,7 +82,7 @@ fn test_transfer_progress() {
 #[test]
 fn test_transfer_remaining() {
     let bd = simple_bd();
-    let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+    let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
 
     assert_eq!(transfer.remaining_bytes(), 256);
 
@@ -93,7 +93,7 @@ fn test_transfer_remaining() {
 #[test]
 fn test_transfer_direction_s2mm() {
     let bd = simple_bd();
-    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::S2MM, 1, 2, TileType::Compute).unwrap();
+    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::S2MM, 1, 2, TileKind::Compute).unwrap();
 
     assert!(matches!(transfer.source, TransferEndpoint::Stream { .. }));
     assert!(matches!(transfer.dest, TransferEndpoint::TileMemory { .. }));
@@ -102,7 +102,7 @@ fn test_transfer_direction_s2mm() {
 #[test]
 fn test_transfer_direction_mm2s() {
     let bd = simple_bd();
-    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
 
     assert!(matches!(transfer.source, TransferEndpoint::TileMemory { .. }));
     assert!(matches!(transfer.dest, TransferEndpoint::Stream { .. }));
@@ -129,7 +129,7 @@ fn test_tile_to_host_transfer() {
 #[test]
 fn test_transfer_error() {
     let bd = simple_bd();
-    let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+    let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
 
     transfer.set_error(DmaError::AddressOutOfBounds { address: 0xFFFF, limit: 0x1000 });
 
@@ -140,7 +140,7 @@ fn test_transfer_error() {
 #[test]
 fn test_next_bd_chaining() {
     let bd = BdConfig::simple_1d(0x1000, 256).with_next(3);
-    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
 
     assert_eq!(transfer.next_bd, Some(3));
 }
@@ -148,7 +148,7 @@ fn test_next_bd_chaining() {
 #[test]
 fn test_packet_header_disabled_by_default() {
     let bd = simple_bd();
-    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
 
     assert!(!transfer.enable_packet);
     assert!(!transfer.needs_packet_header());
@@ -163,7 +163,7 @@ fn test_packet_header_generation() {
     bd.packet_type = 0x3;    // 3-bit value (Trace)
 
     // Create transfer at tile (3, 5)
-    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 3, 5, TileType::Compute).unwrap();
+    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 3, 5, TileKind::Compute).unwrap();
 
     assert!(transfer.needs_packet_header());
 
@@ -212,7 +212,7 @@ fn test_packet_header_sent_tracking() {
     bd.enable_packet = true;
     bd.packet_id = 0x10;
 
-    let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+    let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
 
     // Initially needs header
     assert!(transfer.needs_packet_header());
@@ -254,21 +254,21 @@ fn test_lock_acquire_mode_conversion() {
 fn test_transfer_acquire_mode() {
     // Transfer without lock
     let bd = simple_bd();
-    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
     assert!(transfer.acquire_mode().is_none());
 
     // Transfer with lock in Equal mode
     let mut bd_locked = simple_bd();
     bd_locked.acquire_lock = Some(5);
     bd_locked.acquire_value = 1;
-    let transfer_locked = Transfer::new(&bd_locked, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+    let transfer_locked = Transfer::new(&bd_locked, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
     assert_eq!(transfer_locked.acquire_mode(), Some(LockAcquireMode::Equal(1)));
 
     // Transfer with lock in GE mode
     let mut bd_ge = simple_bd();
     bd_ge.acquire_lock = Some(5);
     bd_ge.acquire_value = -2;
-    let transfer_ge = Transfer::new(&bd_ge, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+    let transfer_ge = Transfer::new(&bd_ge, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
     assert_eq!(transfer_ge.acquire_mode(), Some(LockAcquireMode::GreaterEqual(2)));
 }
 
@@ -479,21 +479,21 @@ fn test_transfer_with_padding_total_bytes() {
 
     // MemTile MM2S: padding active, total_bytes = Buffer_Length
     let transfer = Transfer::new(
-        &bd, 0, 0, TransferDirection::MM2S, 1, 1, TileType::MemTile,
+        &bd, 0, 0, TransferDirection::MM2S, 1, 1, TileKind::Mem,
     ).unwrap();
     assert_eq!(transfer.total_bytes, 56);
     assert!(transfer.has_zero_padding());
 
     // Same BD on compute tile -- no padding applied (compute doesn't pad)
     let transfer_compute = Transfer::new(
-        &bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute,
+        &bd, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute,
     ).unwrap();
     assert_eq!(transfer_compute.total_bytes, 56);
     assert!(!transfer_compute.has_zero_padding());
 
     // MemTile S2MM -- no padding (S2MM ignores padding config)
     let transfer_s2mm = Transfer::new(
-        &bd, 0, 0, TransferDirection::S2MM, 1, 1, TileType::MemTile,
+        &bd, 0, 0, TransferDirection::S2MM, 1, 1, TileKind::Mem,
     ).unwrap();
     assert!(!transfer_s2mm.has_zero_padding());
 }
@@ -562,7 +562,7 @@ fn test_transfer_padding_no_double_count() {
     };
 
     let transfer = Transfer::new(
-        &bd, 0, 0, TransferDirection::MM2S, 1, 1, TileType::MemTile,
+        &bd, 0, 0, TransferDirection::MM2S, 1, 1, TileKind::Mem,
     ).unwrap();
 
     // total_bytes must equal Buffer_Length (64), not Buffer_Length + pad (76)

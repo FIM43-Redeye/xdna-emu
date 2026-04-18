@@ -21,7 +21,7 @@ impl Tile {
 
         // Lock_Request register - address encodes operation parameters
         // Reading performs the lock operation and returns result
-        if self.is_mem_tile() {
+        if self.is_mem() {
             if (mt::LOCK_REQUEST_BASE..mt::LOCK_REQUEST_END).contains(&offset) {
                 return self.handle_lock_request(offset, true);
             }
@@ -141,12 +141,12 @@ impl Tile {
         }
 
         // Lock value registers (read-only, no acquire side effect)
-        let lock_base = if self.is_mem_tile() {
+        let lock_base = if self.is_mem() {
             reg_layout.memtile_lock_base
         } else {
             reg_layout.memory_lock_base
         };
-        let lock_stride = if self.is_mem_tile() {
+        let lock_stride = if self.is_mem() {
             reg_layout.memtile_lock_stride
         } else {
             reg_layout.memory_lock_stride
@@ -195,7 +195,7 @@ impl Tile {
     /// Delegates to the PerfCounterBank's register interface.
     pub fn write_mem_perf_register(&mut self, offset_in_block: u32, value: u32) {
         // MemTile uses 8-bit event fields; compute memory module uses 7-bit
-        let event_width = if self.is_mem_tile() { 8 } else { 7 };
+        let event_width = if self.is_mem() { 8 } else { 7 };
         self.mem_perf_counters.write_register(offset_in_block, value, event_width);
     }
 
