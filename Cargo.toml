@@ -64,11 +64,9 @@ tooling = ["dep:crossterm"]
 vcd-recording = ["dep:vcd"]
 
 [build-dependencies]
-# Used by extract_aiert for JSON Value parsing (feeds gen_aiert_dma/locks/ports).
-# Removed when Subsystem 6 completes and extract_aiert moves to xdna-archspec.
-serde_json = "1"
-# Needed for build_arch_model (feeds extract_aiert -> gen_aiert_*) and for
-# RegisterDb used in the aie-rt parsing helpers. Removed in Subsystem 6.
+# Needed for build_arch_model (processor-slot cross-validation via
+# confirm_processor_slots) and for RegisterDb. extract_aiert + gen_aiert_*
+# moved to xdna-archspec's build.rs in Subsystem 6 Task 11.
 xdna-archspec = { path = "crates/xdna-archspec" }
 
 [dev-dependencies]

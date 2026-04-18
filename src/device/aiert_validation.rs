@@ -6,7 +6,9 @@
 
 #[cfg(test)]
 mod aiert_dma {
-    include!(concat!(env!("OUT_DIR"), "/gen_aiert_dma.rs"));
+    // Re-export all DMA submodules from archspec so test code uses the same
+    // names (compute_dma::BD_BASE, memtile_dma::BD_BASE, etc.) as before.
+    pub use xdna_archspec::aie2::aiert::dma::*;
 
     #[test]
     fn memtile_dma_bd_base_matches_regdb() {
@@ -92,7 +94,9 @@ mod aiert_dma {
 
 #[cfg(test)]
 mod aiert_locks {
-    include!(concat!(env!("OUT_DIR"), "/gen_aiert_locks.rs"));
+    // Re-export all lock submodules from archspec so test code uses the same
+    // names (compute_locks::SET_VAL_BASE, etc.) as before.
+    pub use xdna_archspec::aie2::aiert::locks::*;
 
     #[test]
     fn compute_lock_set_val_base_matches_regdb() {
@@ -148,7 +152,9 @@ mod aiert_locks {
 
 #[cfg(test)]
 mod aiert_ports {
-    include!(concat!(env!("OUT_DIR"), "/gen_aiert_ports.rs"));
+    // Re-export all port constants and the AieRtPortType enum from archspec
+    // so test code uses the same names as before.
+    pub use xdna_archspec::aie2::aiert::ports::*;
 
     #[test]
     fn compute_master_port_count() {

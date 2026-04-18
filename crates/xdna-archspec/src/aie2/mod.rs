@@ -87,6 +87,11 @@ pub mod port_type {
     pub const fn dma(n: u8) -> u8 { DMA_BASE + n }
 }
 
+/// aie-rt cross-validation data. Each submodule wraps a
+/// build-time-generated file extracted from aie-rt headers via the C
+/// preprocessor. Submodules: `dma`, `locks`, `ports`.
+pub mod aiert;
+
 /// Instruction set architecture: decoder tables, runtime model, and
 /// LLVM MCDisassembler FFI. Populated during Subsystem 6 Part A.
 pub mod isa;

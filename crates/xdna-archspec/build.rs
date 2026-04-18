@@ -110,10 +110,11 @@ fn main() {
         crate::model_builder::build_arch_model(&device_model_path, &regdb, "npu1")
             .unwrap_or_else(|e| panic!("Failed to build ArchModel: {}", e));
 
-    // Cross-validate subsystem ranges via aie-rt.
-    // Must run before gen_arch so the model's Confirmed<T> sources reflect
-    // both AM025 and aie-rt when code is generated.
-    extract_aiert(workspace_root, &mut arch_model);
+    // Cross-validate subsystem ranges via aie-rt, and emit gen_aiert_*.rs
+    // files consumed by xdna_archspec::aie2::aiert::* (and from there by
+    // xdna-emu's aiert_validation.rs). Must run before gen_arch so the
+    // model's Confirmed<T> sources reflect both AM025 and aie-rt.
+    extract_aiert(workspace_root, &out_dir, &mut arch_model);
 
     // Generate architecture constants from the validated model.
     gen_arch(&arch_model, &out_dir);
@@ -617,15 +618,15 @@ fn gen_subsystems(model: &crate::types::ArchModel, out_dir: &Path) {
 // extract_aiert: aie-rt header extraction (DMA, Lock, Stream Switch)
 // ============================================================================
 
-/// Cross-validate subsystem address ranges in the ArchModel against aie-rt.
+/// Cross-validate subsystem address ranges in the ArchModel against aie-rt,
+/// and emit gen_aiert_{dma,locks,ports}.rs into `out_dir`.
 ///
-/// This copy of extract_aiert is for cross-validation only: it mutates
-/// `arch_model` via confirm_subsystem_ranges. File emission
-/// (gen_aiert_dma/locks/ports.rs) lives in xdna-emu/build.rs's copy,
-/// where aiert_validation.rs consumes the output. Don't re-add the
-/// gen_aiert_* calls here unless those consumers move to archspec.
+/// The generated files are consumed by `xdna_archspec::aie2::aiert::*`,
+/// which xdna-emu's `aiert_validation.rs` imports instead of including
+/// from its own OUT_DIR.
 fn extract_aiert(
     workspace_root: &Path,
+    out_dir: &Path,
     arch_model: &mut crate::types::ArchModel,
 ) {
     use crate::types::{
@@ -651,14 +652,16 @@ fn extract_aiert(
     let preprocessed = match run_aiert_preprocessor(&aiert_dir) {
         Some(text) => text,
         None => {
-            // aie-rt unavailable: skip cross-validation. The ArchModel
-            // retains its AM025-only Confirmed<T> values; no files to write.
+            // aie-rt unavailable: skip cross-validation and emit stub files
+            // so that xdna_archspec::aie2::aiert::* compiles regardless.
+            write_aiert_stubs(out_dir);
             return;
         }
     };
 
     let dma_modules = parse_dma_modules(&preprocessed);
     let lock_modules = parse_lock_modules(&preprocessed);
+    let port_maps = parse_port_maps(&preprocessed);
 
     // Cross-validate subsystem offset_start values against aie-rt.
     // DMA BaseAddr is the BD base offset, matching the DMA subsystem's
@@ -706,6 +709,11 @@ fn extract_aiert(
     }
 
     crate::model_builder::confirm_subsystem_ranges(arch_model, &confirmations);
+
+    // Emit generated files for xdna_archspec::aie2::aiert::* submodules.
+    gen_aiert_dma(&dma_modules, out_dir);
+    gen_aiert_locks(&lock_modules, out_dir);
+    gen_aiert_ports(&port_maps, out_dir);
 }
 
 /// Run gcc -E on xaiemlgbl_reginit.c with all aie-rt include paths.
@@ -763,12 +771,11 @@ fn run_aiert_preprocessor(aiert_dir: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-// ---- aie-rt preprocessor parsing (duplicated with xdna-emu/build.rs) ----
+// ---- aie-rt preprocessor parsing ----
 //
-// The xdna-emu copy produces gen_aiert_dma/locks/ports.rs for
-// aiert_validation.rs; this copy mutates ArchModel for cross-validation
-// only. Keep the two in sync until aiert_validation.rs migrates, at
-// which point delete the xdna-emu copy.
+// Used by extract_aiert for both cross-validation (mutates ArchModel) and
+// file emission (gen_aiert_dma/locks/ports.rs consumed by aiert_validation.rs
+// in xdna-emu via xdna_archspec::aie2::aiert::*).
 
 // -- Data structures for parsed aie-rt structs --
 
@@ -780,6 +787,11 @@ struct DmaModData {
 struct LockModData {
     name: String,
     fields: HashMap<String, String>,
+}
+
+struct PortMapData {
+    name: String,
+    entries: Vec<(String, u8)>, // (PortType name, PortNum)
 }
 
 /// Parse all XAie_DmaMod struct initializers from preprocessed text.
@@ -796,6 +808,71 @@ fn parse_lock_modules(text: &str) -> Vec<LockModData> {
         .into_iter()
         .map(|(name, fields)| LockModData { name, fields })
         .collect()
+}
+
+/// Parse all XAie_StrmSwPortMap array initializers from preprocessed text.
+fn parse_port_maps(text: &str) -> Vec<PortMapData> {
+    let mut results = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i].trim();
+        // Look for: static const XAie_StrmSwPortMap <name>[] =
+        if line.contains("XAie_StrmSwPortMap") && line.contains("[]") {
+            let name = extract_identifier(line, "XAie_StrmSwPortMap");
+            if let Some(name) = name {
+                let mut entries = Vec::new();
+                let mut depth = 0;
+                let mut current_port_type: Option<String> = None;
+                let mut current_port_num: Option<u8> = None;
+
+                // Advance to opening brace
+                while i < lines.len() && !lines[i].contains('{') {
+                    i += 1;
+                }
+                if i < lines.len() {
+                    depth = 1;
+                    i += 1;
+                }
+
+                while i < lines.len() && depth > 0 {
+                    let l = lines[i].trim();
+                    for ch in l.chars() {
+                        match ch {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 1 {
+                                    // End of one entry
+                                    if let (Some(pt), Some(pn)) =
+                                        (current_port_type.take(), current_port_num.take())
+                                    {
+                                        entries.push((pt, pn));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if let Some(val) = extract_field_value(l, "PortType") {
+                        current_port_type = Some(val);
+                    }
+                    if let Some(val) = extract_field_value(l, "PortNum") {
+                        current_port_num = parse_numeric_value(&val).map(|v| v as u8);
+                    }
+
+                    i += 1;
+                }
+
+                results.push(PortMapData { name, entries });
+            }
+        }
+        i += 1;
+    }
+
+    results
 }
 
 /// Generic parser for C struct initializers of a given type name.
@@ -920,6 +997,261 @@ fn get_field(fields: &HashMap<String, String>, name: &str, struct_name: &str) ->
         .unwrap_or_else(|| panic!("Field '{}' not found in {}", name, struct_name));
     parse_numeric_value(val_str)
         .unwrap_or_else(|| panic!("Cannot parse '{}' = '{}' in {}", name, val_str, struct_name))
+}
+
+/// Extract a field value from a line like ".FieldName = value,"
+fn extract_field_value(line: &str, field: &str) -> Option<String> {
+    let pattern = format!(".{} =", field);
+    if let Some(idx) = line.find(&pattern) {
+        let after = line[idx + pattern.len()..].trim();
+        let value: String = after
+            .chars()
+            .take_while(|c| *c != ',' && *c != '}')
+            .collect();
+        Some(value.trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Map an aie-rt DMA struct instance name to a Rust module name.
+fn dma_mod_name(name: &str) -> &str {
+    if name.contains("MemTile") {
+        "memtile_dma"
+    } else if name.contains("Shim") {
+        "shim_dma"
+    } else {
+        "compute_dma"
+    }
+}
+
+/// Map an aie-rt Lock struct instance name to a Rust module name.
+fn lock_mod_name(name: &str) -> &str {
+    if name.contains("MemTile") {
+        "memtile_locks"
+    } else if name.contains("Shim") {
+        "shim_locks"
+    } else {
+        "compute_locks"
+    }
+}
+
+/// Map an aie-rt port map array name to a Rust constant name.
+fn port_map_rust_name(name: &str) -> &str {
+    if name.contains("MemTile") && name.contains("Master") {
+        "MEMTILE_MASTER_PORTS"
+    } else if name.contains("MemTile") && name.contains("Slave") {
+        "MEMTILE_SLAVE_PORTS"
+    } else if name.contains("Shim") && name.contains("Master") {
+        "SHIM_MASTER_PORTS"
+    } else if name.contains("Shim") && name.contains("Slave") {
+        "SHIM_SLAVE_PORTS"
+    } else if name.contains("Master") {
+        "COMPUTE_MASTER_PORTS"
+    } else {
+        "COMPUTE_SLAVE_PORTS"
+    }
+}
+
+// -- Code generation functions for aie-rt extracted data --
+
+fn gen_aiert_dma(modules: &[DmaModData], out_dir: &Path) {
+    let mut out = gen_header("aie-rt xaiemlgbl_reginit.c DMA modules");
+
+    for m in modules {
+        let mod_name = dma_mod_name(&m.name);
+        writeln!(out, "/// DMA constants from aie-rt {} ({})", m.name, mod_name).unwrap();
+        writeln!(out, "pub mod {} {{", mod_name).unwrap();
+        writeln!(out, "    pub const BD_BASE: u32 = {:#010X};", get_field(&m.fields, "BaseAddr", &m.name)).unwrap();
+        writeln!(out, "    pub const BD_STRIDE: u32 = {:#06X};", get_field(&m.fields, "IdxOffset", &m.name)).unwrap();
+        writeln!(out, "    pub const NUM_BDS: usize = {};", get_field(&m.fields, "NumBds", &m.name)).unwrap();
+        writeln!(out, "    pub const NUM_LOCKS: usize = {};", get_field(&m.fields, "NumLocks", &m.name)).unwrap();
+        writeln!(out, "    pub const START_QUEUE_BASE: u32 = {:#010X};", get_field(&m.fields, "StartQueueBase", &m.name)).unwrap();
+        writeln!(out, "    pub const CH_CTRL_BASE: u32 = {:#010X};", get_field(&m.fields, "ChCtrlBase", &m.name)).unwrap();
+        writeln!(out, "    pub const NUM_CHANNELS: usize = {};", get_field(&m.fields, "NumChannels", &m.name)).unwrap();
+        writeln!(out, "    pub const CH_STRIDE: u32 = {:#06X};", get_field(&m.fields, "ChIdxOffset", &m.name)).unwrap();
+        writeln!(out, "    pub const CH_STATUS_BASE: u32 = {:#010X};", get_field(&m.fields, "ChStatusBase", &m.name)).unwrap();
+        writeln!(out, "    pub const CH_STATUS_STRIDE: u32 = {:#06X};", get_field(&m.fields, "ChStatusOffset", &m.name)).unwrap();
+        writeln!(out, "    pub const NUM_ADDR_DIM: usize = {};", get_field(&m.fields, "NumAddrDim", &m.name)).unwrap();
+        writeln!(out, "}}\n").unwrap();
+    }
+
+    fs::write(out_dir.join("gen_aiert_dma.rs"), out).unwrap();
+}
+
+fn gen_aiert_locks(modules: &[LockModData], out_dir: &Path) {
+    let mut out = gen_header("aie-rt xaiemlgbl_reginit.c Lock modules");
+
+    for m in modules {
+        let mod_name = lock_mod_name(&m.name);
+        writeln!(out, "/// Lock constants from aie-rt {} ({})", m.name, mod_name).unwrap();
+        writeln!(out, "pub mod {} {{", mod_name).unwrap();
+        writeln!(out, "    pub const BASE: u32 = {:#010X};", get_field(&m.fields, "BaseAddr", &m.name)).unwrap();
+        writeln!(out, "    pub const NUM_LOCKS: usize = {};", get_field(&m.fields, "NumLocks", &m.name)).unwrap();
+        writeln!(out, "    pub const LOCK_ID_STRIDE: u32 = {:#06X};", get_field(&m.fields, "LockIdOff", &m.name)).unwrap();
+        writeln!(out, "    pub const REL_ACQ_OFFSET: u32 = {:#06X};", get_field(&m.fields, "RelAcqOff", &m.name)).unwrap();
+        writeln!(out, "    pub const LOCK_VAL_OFFSET: u32 = {:#06X};", get_field(&m.fields, "LockValOff", &m.name)).unwrap();
+        writeln!(out, "    pub const VAL_UPPER_BOUND: i32 = {};", get_field(&m.fields, "LockValUpperBound", &m.name) as i32).unwrap();
+        writeln!(out, "    pub const VAL_LOWER_BOUND: i32 = {};", get_field(&m.fields, "LockValLowerBound", &m.name) as i32).unwrap();
+        writeln!(out, "    pub const SET_VAL_BASE: u32 = {:#010X};", get_field(&m.fields, "LockSetValBase", &m.name)).unwrap();
+        writeln!(out, "    pub const SET_VAL_STRIDE: u32 = {:#06X};", get_field(&m.fields, "LockSetValOff", &m.name)).unwrap();
+        writeln!(out, "}}\n").unwrap();
+    }
+
+    fs::write(out_dir.join("gen_aiert_locks.rs"), out).unwrap();
+}
+
+fn gen_aiert_ports(port_maps: &[PortMapData], out_dir: &Path) {
+    let mut out = gen_header("aie-rt xaiemlgbl_reginit.c stream switch port maps");
+
+    // Port type enum
+    writeln!(out, "/// Port type enum matching aie-rt XAie_StrmSwPortType.").unwrap();
+    writeln!(out, "#[derive(Debug, Clone, Copy, PartialEq, Eq)]").unwrap();
+    writeln!(out, "#[repr(u8)]").unwrap();
+    writeln!(out, "pub enum AieRtPortType {{").unwrap();
+    writeln!(out, "    Core = 0, Dma = 1, Ctrl = 2, Fifo = 3,").unwrap();
+    writeln!(out, "    South = 4, West = 5, North = 6, East = 7, Trace = 8,").unwrap();
+    writeln!(out, "}}\n").unwrap();
+
+    for pm in port_maps {
+        let const_name = port_map_rust_name(&pm.name);
+        writeln!(out, "/// {} (from aie-rt {})", const_name, pm.name).unwrap();
+        writeln!(
+            out,
+            "pub const {}: &[(AieRtPortType, u8)] = &[",
+            const_name
+        )
+        .unwrap();
+
+        for (i, (port_type, port_num)) in pm.entries.iter().enumerate() {
+            let rust_variant = match port_type.as_str() {
+                "CORE" => "Core",
+                "DMA" => "Dma",
+                "CTRL" => "Ctrl",
+                "FIFO" => "Fifo",
+                "SOUTH" => "South",
+                "WEST" => "West",
+                "NORTH" => "North",
+                "EAST" => "East",
+                "TRACE" => "Trace",
+                other => panic!("Unknown port type '{}' in {}", other, pm.name),
+            };
+            writeln!(
+                out,
+                "    (AieRtPortType::{}, {}), // {}",
+                rust_variant, port_num, i
+            )
+            .unwrap();
+        }
+
+        writeln!(out, "];\n").unwrap();
+    }
+
+    fs::write(out_dir.join("gen_aiert_ports.rs"), out).unwrap();
+}
+
+/// Write stub files when aie-rt is not available.
+fn write_aiert_stubs(out_dir: &Path) {
+    let dma_stub = "\
+// aie-rt not available -- stub file.
+pub mod memtile_dma {
+    pub const BD_BASE: u32 = 0x000A0000;
+    pub const BD_STRIDE: u32 = 0x0020;
+    pub const NUM_BDS: usize = 48;
+    pub const NUM_LOCKS: usize = 192;
+    pub const START_QUEUE_BASE: u32 = 0x000A0604;
+    pub const CH_CTRL_BASE: u32 = 0x000A0600;
+    pub const NUM_CHANNELS: usize = 6;
+    pub const CH_STRIDE: u32 = 0x0008;
+    pub const CH_STATUS_BASE: u32 = 0x000A0660;
+    pub const CH_STATUS_STRIDE: u32 = 0x0020;
+    pub const NUM_ADDR_DIM: usize = 4;
+}
+pub mod compute_dma {
+    pub const BD_BASE: u32 = 0x0001D000;
+    pub const BD_STRIDE: u32 = 0x0020;
+    pub const NUM_BDS: usize = 16;
+    pub const NUM_LOCKS: usize = 16;
+    pub const START_QUEUE_BASE: u32 = 0x0001DE04;
+    pub const CH_CTRL_BASE: u32 = 0x0001DE00;
+    pub const NUM_CHANNELS: usize = 2;
+    pub const CH_STRIDE: u32 = 0x0008;
+    pub const CH_STATUS_BASE: u32 = 0x0001DF00;
+    pub const CH_STATUS_STRIDE: u32 = 0x0010;
+    pub const NUM_ADDR_DIM: usize = 3;
+}
+pub mod shim_dma {
+    pub const BD_BASE: u32 = 0x0001D000;
+    pub const BD_STRIDE: u32 = 0x0020;
+    pub const NUM_BDS: usize = 16;
+    pub const NUM_LOCKS: usize = 16;
+    pub const START_QUEUE_BASE: u32 = 0x0001D204;
+    pub const CH_CTRL_BASE: u32 = 0x0001D200;
+    pub const NUM_CHANNELS: usize = 2;
+    pub const CH_STRIDE: u32 = 0x0008;
+    pub const CH_STATUS_BASE: u32 = 0x0001D220;
+    pub const CH_STATUS_STRIDE: u32 = 0x0008;
+    pub const NUM_ADDR_DIM: usize = 3;
+}
+";
+
+    let locks_stub = "\
+// aie-rt not available -- stub file.
+pub mod compute_locks {
+    pub const BASE: u32 = 0x00040000;
+    pub const NUM_LOCKS: usize = 16;
+    pub const LOCK_ID_STRIDE: u32 = 0x0400;
+    pub const REL_ACQ_OFFSET: u32 = 0x0200;
+    pub const LOCK_VAL_OFFSET: u32 = 0x0004;
+    pub const VAL_UPPER_BOUND: i32 = 63;
+    pub const VAL_LOWER_BOUND: i32 = -64;
+    pub const SET_VAL_BASE: u32 = 0x0001F000;
+    pub const SET_VAL_STRIDE: u32 = 0x0010;
+}
+pub mod shim_locks {
+    pub const BASE: u32 = 0x00040000;
+    pub const NUM_LOCKS: usize = 16;
+    pub const LOCK_ID_STRIDE: u32 = 0x0400;
+    pub const REL_ACQ_OFFSET: u32 = 0x0200;
+    pub const LOCK_VAL_OFFSET: u32 = 0x0004;
+    pub const VAL_UPPER_BOUND: i32 = 63;
+    pub const VAL_LOWER_BOUND: i32 = -64;
+    pub const SET_VAL_BASE: u32 = 0x00014000;
+    pub const SET_VAL_STRIDE: u32 = 0x0010;
+}
+pub mod memtile_locks {
+    pub const BASE: u32 = 0x000D0000;
+    pub const NUM_LOCKS: usize = 64;
+    pub const LOCK_ID_STRIDE: u32 = 0x0400;
+    pub const REL_ACQ_OFFSET: u32 = 0x0200;
+    pub const LOCK_VAL_OFFSET: u32 = 0x0004;
+    pub const VAL_UPPER_BOUND: i32 = 63;
+    pub const VAL_LOWER_BOUND: i32 = -64;
+    pub const SET_VAL_BASE: u32 = 0x000C0000;
+    pub const SET_VAL_STRIDE: u32 = 0x0010;
+}
+";
+
+    let ports_stub = "\
+// aie-rt not available -- stub file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AieRtPortType {
+    Core = 0, Dma = 1, Ctrl = 2, Fifo = 3,
+    South = 4, West = 5, North = 6, East = 7, Trace = 8,
+}
+
+pub const COMPUTE_MASTER_PORTS: &[(AieRtPortType, u8)] = &[];
+pub const COMPUTE_SLAVE_PORTS: &[(AieRtPortType, u8)] = &[];
+pub const SHIM_MASTER_PORTS: &[(AieRtPortType, u8)] = &[];
+pub const SHIM_SLAVE_PORTS: &[(AieRtPortType, u8)] = &[];
+pub const MEMTILE_MASTER_PORTS: &[(AieRtPortType, u8)] = &[];
+pub const MEMTILE_SLAVE_PORTS: &[(AieRtPortType, u8)] = &[];
+";
+
+    fs::write(out_dir.join("gen_aiert_dma.rs"), dma_stub).unwrap();
+    fs::write(out_dir.join("gen_aiert_locks.rs"), locks_stub).unwrap();
+    fs::write(out_dir.join("gen_aiert_ports.rs"), ports_stub).unwrap();
 }
 
 // ============================================================================
