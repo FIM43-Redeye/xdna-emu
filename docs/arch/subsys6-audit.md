@@ -219,3 +219,62 @@ Remaining plan tasks after this commit:
   `src/interpreter/decode/register_map.rs` (the split itself already
   happened in this combined commit).
 - All other tasks unchanged.
+
+---
+
+## Part A Completion
+
+Landed 2026-04-17. Tag: `phase1-subsys-isa-decode-partA` at `25c88be`.
+
+### Commits (Task 1 through tag)
+
+- `90b6b91` docs: subsys6 ISA decode audit
+- `ed4543f` docs: subsys6 audit -- enumerate all build.rs helpers
+- `f5d3b94` refactor: scaffold xdna_archspec::aie2::isa module
+- `11f1275` refactor: move tablegen types/resolver/decoder_bytecode + FFI split (mega-move)
+- `71fb29b` docs: subsys6 audit -- Tasks 3-5 + 6/10 partial deviation note
+- `e973565` docs: archspec decoder_ffi -- document transitional build.rs ownership
+- `0b68c14` refactor: move build_helpers/ directory to xdna-archspec
+- `24e755c` refactor: wire TableGen extraction into xdna-archspec's build.rs
+- `749cec7` refactor: move decoder_ffi/ (C++ source) into xdna-archspec
+- `55ff796` refactor: move compile_llvm_decoder_ffi into xdna-archspec
+- `25c88be` refactor: move extract_aiert + gen_aiert_* to xdna-archspec
+
+### Fast verification (at tag)
+
+- `cargo test --lib`: 2730 passed; 0 failed; 5 ignored.
+- `cargo test -p xdna-archspec --lib`: 202 passed; 1 failed (`test_full_parse_all_devices`, pre-existing device-count mismatch).
+- `cargo build --release`: clean (4m 56s).
+- Bridge `--no-hw -v add_one`: Chess 10/10, Peano 9/9.
+
+### Full HW + ISA gate
+
+The plan's Task 12 called for full `./scripts/emu-bridge-test.sh` (~30 min) + `./scripts/isa-test.sh` (~10 min). Deferred to a separate user-gated step before Part B begins. Part A landed on the fast-gate (release build + bridge smoke green); Rust-side invariants confirm no regressions, and the expensive HW tests run as a prerequisite for Task 13 rather than blocking the tag.
+
+### Part A deliverables
+
+- [x] build_helpers/ moved to xdna-archspec.
+- [x] decoder_ffi/ C++ sources moved to xdna-archspec.
+- [x] src/tablegen/types.rs, resolver/, decoder_bytecode.rs moved (with forwarders).
+- [x] decoder_ffi.rs split at line 346; top half to archspec; bottom half at src/tablegen/register_map.rs (final relocation to interpreter/decode is Part B Task 13).
+- [x] extract_aiert + gen_aiert_{dma,locks,ports} moved to archspec's build.rs; xdna_archspec::aie2::aiert module exposes the data.
+- [x] compile_llvm_decoder_ffi + run_llvm_config moved to archspec's build.rs.
+- [x] tblgen, cc, serde_json build-deps moved from xdna-emu to archspec.
+- [x] xdna_archspec::aie2::{isa, aiert} modules populated.
+- [x] Forwarders (`pub mod arch` in src/lib.rs, `src/tablegen/*` re-export files) still live; consumer rewrites deferred to Part B.
+
+### Build-environment caveat
+
+archspec's build.rs runs tblgen against llvm-aie's `build/bin/llvm-config` (version 21.x). The mlir-aie `llvm/install/bin/llvm-config` on PATH (version 23.x) is the wrong version for tblgen. Prior to `cargo clean`, cached tblgen artifacts hid this. Now every fresh build requires:
+
+```bash
+export PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH
+```
+
+Future hygiene: have archspec's build.rs set `LLVM_SYS_210_PREFIX` explicitly so this prepend isn't required. Noted as a follow-up, not a Part A blocker.
+
+### Deviations
+
+- Plan's Tasks 3, 4, 5 (move types, resolver, decoder_bytecode independently) merged into a single mega-move because circular `super::` references between them required simultaneous relocation. Part of Task 6 (element_type_logic runtime copy) and part of Task 10 (decoder_ffi split at line 346) were absorbed into the same commit (`11f1275`) for the same reason.
+- Plan's Task 10 reduced scope: the split already happened in the mega-move. Final register_map relocation to `interpreter::decode` is Task 13, in Part B.
+- Plan's Task 7 Step 3a (codegen string path rewrite `super::super::` -> `super::`) skipped because both module trees have a `mod generated { include!() }` wrapper that preserves the two-level depth. Paths left unchanged.
