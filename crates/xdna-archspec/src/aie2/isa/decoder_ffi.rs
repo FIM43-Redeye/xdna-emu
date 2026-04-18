@@ -363,3 +363,161 @@ pub fn query_all_instr_info() -> Vec<InstrInfo> {
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decoder_init() {
+        assert!(init(), "LLVM decoder should initialize successfully");
+    }
+
+    #[test]
+    fn test_opcode_name_lookup() {
+        assert!(init());
+        let _ = opcode_name(0);
+        assert!(opcode_name(999999).is_none());
+    }
+
+    #[test]
+    fn test_mv_slot_decode_with_operands() {
+        let result = decode_slot(Slot::Mv, 0x00713c);
+        assert!(result.is_some(), "MV bits 0x00713c should decode");
+        let decoded = result.unwrap();
+        assert!(
+            decoded.name.contains("MOV") || decoded.name.contains("mov"),
+            "Expected MOV, got '{}'",
+            decoded.name,
+        );
+        assert!(!decoded.operands.is_empty(), "Should have operands");
+        for op in &decoded.operands {
+            if let DecodedOperand::Reg { name, .. } = op {
+                assert!(!name.starts_with('?'), "Reg name should be resolved: {}", name);
+            }
+        }
+    }
+
+    #[test]
+    fn test_vpush_hi_32_disambiguation() {
+        let r4_bits: u64 = 0x02903D;
+        let decoded = decode_slot(Slot::Mv, r4_bits)
+            .expect("r4 bits should decode");
+        assert_eq!(decoded.name, "VPUSH_HI_32");
+    }
+
+    #[test]
+    fn test_num_defs_for_vadd() {
+        let result = decode_slot(Slot::Vec, 0x000001);
+        if let Some(decoded) = result {
+            let _ = decoded.num_defs;
+            let _ = decoded.defs();
+            let _ = decoded.uses();
+        }
+    }
+
+    #[test]
+    fn test_register_names_populated() {
+        let decoded = decode_slot(Slot::Mv, 0x028C3D).expect("should decode");
+        assert_eq!(decoded.name, "VPUSH_HI_32");
+        let reg_names: Vec<&str> = decoded.operands.iter().filter_map(|op| {
+            if let DecodedOperand::Reg { name, .. } = op { Some(name.as_str()) } else { None }
+        }).collect();
+        assert!(!reg_names.is_empty(), "Should have register operands");
+    }
+
+    #[test]
+    fn test_vadd_f_decodes_correctly() {
+        let decoded = decode_slot(Slot::Vec, 0x2).expect("VADD_F should decode");
+        assert_eq!(decoded.name, "VADD_F", "LLVM should identify as VADD_F");
+        assert_eq!(decoded.num_defs, 1, "one output (destination accum)");
+        for op in &decoded.operands {
+            if let DecodedOperand::Reg { name, .. } = op {
+                assert!(
+                    name.starts_with("bm") || name.starts_with("r"),
+                    "VADD_F operand should be accum or scalar, got {}",
+                    name,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_vmac_f_untied_acc_operands() {
+        let vec_bits: u64 = 0x0040001;
+        let decoded = decode_slot(Slot::Vec, vec_bits)
+            .expect("VMAC_F with untied acc should decode");
+        assert!(decoded.name.starts_with("VMAC_F"),
+            "Expected VMAC_F, got {}", decoded.name);
+        assert_eq!(decoded.num_defs, 1, "one output def");
+        let reg_names: Vec<&str> = decoded.operands.iter().filter_map(|op| {
+            if let DecodedOperand::Reg { name, .. } = op {
+                Some(name.as_str())
+            } else {
+                None
+            }
+        }).collect();
+        assert!(reg_names.len() >= 2, "Need at least dst + acc1 registers");
+        assert_eq!(reg_names[0], "bml0", "dst should be bml0");
+        assert_eq!(reg_names[1], "bml2", "acc1 should be bml2");
+    }
+
+    // -----------------------------------------------------------------------
+    // Instruction metadata (InstrInfo) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_query_all_instr_info_returns_data() {
+        let infos = query_all_instr_info();
+        assert!(infos.len() > 600, "Should have 600+ opcodes, got {}", infos.len());
+        let with_latency = infos.iter().filter(|i| i.latency.is_some()).count();
+        assert!(with_latency > 100,
+            "Should have 100+ opcodes with latency, got {}", with_latency);
+        let with_sched = infos.iter().filter(|i| i.sched_class > 0).count();
+        assert!(with_sched > 100,
+            "Should have 100+ opcodes with sched class, got {}", with_sched);
+    }
+
+    #[test]
+    fn test_instr_info_flags_populated() {
+        let infos = query_all_instr_info();
+        let loads = infos.iter().filter(|i| i.is_load()).count();
+        let stores = infos.iter().filter(|i| i.is_store()).count();
+        let branches = infos.iter().filter(|i| i.is_branch()).count();
+        assert!(loads > 50, "Should have 50+ load instructions, got {}", loads);
+        assert!(stores > 50, "Should have 50+ store instructions, got {}", stores);
+        assert!(branches > 5, "Should have 5+ branch instructions, got {}", branches);
+    }
+
+    #[test]
+    fn test_instr_info_latency_cross_check() {
+        // Cross-validate LLVM itinerary latencies against AM020 constants.
+        let infos = query_all_instr_info();
+        let mut found_load = false;
+        let mut found_store = false;
+        let mut found_vmac = false;
+        for (opcode, info) in infos.iter().enumerate() {
+            if let Some(latency) = info.latency {
+                let name = match opcode_name(opcode as u32) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if info.is_load() && name.starts_with("LDA_") && !found_load {
+                    assert_eq!(latency, 7, "{} latency should be 7 (load)", name);
+                    found_load = true;
+                }
+                if info.is_store() && name.starts_with("ST_") && !found_store {
+                    assert_eq!(latency, 1, "{} latency should be 1 (store)", name);
+                    found_store = true;
+                }
+                if name.starts_with("VMAC_vmac_") && !found_vmac {
+                    assert_eq!(latency, 5, "{} latency should be 5 (VMAC)", name);
+                    found_vmac = true;
+                }
+            }
+        }
+        assert!(found_load, "Should have found a load instruction with latency");
+        assert!(found_store, "Should have found a store instruction with latency");
+        assert!(found_vmac, "Should have found a VMAC instruction with latency");
+    }
+}

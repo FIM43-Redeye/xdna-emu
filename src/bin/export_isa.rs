@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json;
 
-use xdna_emu::tablegen::{
-    self, InstrEncoding, OperandType, RegisterKind,
+use xdna_archspec::aie2::isa::{
+    self as tablegen, InstrEncoding, OperandType, RegisterKind,
 };
 
 // ---------------------------------------------------------------------------

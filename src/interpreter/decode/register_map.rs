@@ -531,4 +531,102 @@ mod tests {
         assert!(operand_from_reg_name("").is_none());
         assert!(operand_from_reg_name("tile_cntr").is_none());
     }
+
+    /// No unmapped register ever appears as an explicit operand in any
+    /// decoded instruction across all slots.  If this fails, LLVM is
+    /// emitting an operand with a register name we don't handle -- a real
+    /// gap to fix, not a test bug.
+    #[test]
+    fn test_unmapped_regs_never_appear_as_explicit_operands() {
+        use xdna_archspec::aie2::isa::decoder_ffi::{DecodedOperand, Slot, decode_slot};
+        let (_, unmapped) = reg_map_coverage();
+        let unmapped_set: std::collections::HashSet<&str> =
+            unmapped.iter().map(|s| s.as_str()).collect();
+
+        let slots = [
+            (Slot::Alu, 20u64),
+            (Slot::Lda, 21),
+            (Slot::Ldb, 16),
+            (Slot::Mv,  22),
+            (Slot::St,  21),
+            (Slot::Vec, 26),
+        ];
+
+        let mut hits: Vec<String> = Vec::new();
+        for (slot, width) in &slots {
+            for probe in 0..512u64 {
+                let bits = probe << (width / 2);
+                if let Some(decoded) = decode_slot(*slot, bits) {
+                    for op in &decoded.operands {
+                        if let DecodedOperand::Reg { name, .. } = op {
+                            if unmapped_set.contains(name.as_str())
+                                && !hits.iter().any(|h| h.starts_with(name.as_str()))
+                            {
+                                hits.push(format!(
+                                    "{} in {} (slot {:?} bits 0x{:X})",
+                                    name, decoded.name, slot, bits
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !hits.is_empty() {
+            eprintln!("Unmapped registers appearing as explicit operands ({}):", hits.len());
+            for h in &hits {
+                eprintln!("  {}", h);
+            }
+            panic!(
+                "{} unmapped register(s) appear as explicit operands -- need mapping",
+                hits.len()
+            );
+        }
+    }
+
+    /// Every register operand returned by the LLVM decoder must resolve
+    /// through operand_from_reg_name (i.e., no silent drops).
+    #[test]
+    fn test_llvm_decode_operands_map_correctly() {
+        use xdna_archspec::aie2::isa::decoder_ffi::{DecodedOperand, Slot, decode_slot};
+        let decoded = decode_slot(Slot::Mv, 0x028C3D)
+            .expect("VPUSH_HI_32 should decode");
+        assert_eq!(decoded.name, "VPUSH_HI_32");
+
+        let mut mapped = 0;
+        for op in &decoded.operands {
+            if let DecodedOperand::Reg { name, .. } = op {
+                let result = operand_from_reg_name(name);
+                assert!(
+                    result.is_some(),
+                    "LLVM register '{}' should map to an Operand",
+                    name,
+                );
+                mapped += 1;
+            }
+        }
+        assert!(mapped > 0, "Should have mapped at least one register operand");
+    }
+
+    /// Informational probe of vec-slot decoded operands: warns on unmapped
+    /// registers rather than failing (surfaces gaps without blocking).
+    #[test]
+    fn test_vec_decode_operands_map_correctly() {
+        use xdna_archspec::aie2::isa::decoder_ffi::{DecodedOperand, Slot, decode_slot};
+        for bits in [0x000001u64, 0x100001, 0x200001] {
+            if let Some(decoded) = decode_slot(Slot::Vec, bits) {
+                for op in &decoded.operands {
+                    if let DecodedOperand::Reg { name, .. } = op {
+                        if operand_from_reg_name(name).is_none() {
+                            eprintln!(
+                                "WARNING: unmapped register '{}' in {} (Vec 0x{:06X})",
+                                name, decoded.name, bits
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
