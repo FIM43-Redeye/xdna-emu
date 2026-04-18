@@ -1,11 +1,9 @@
-//! Compatibility forwarder. The pure-FFI half now lives in
-//! `xdna_archspec::aie2::isa::decoder_ffi`. The MappedOperand /
-//! RegisterMap / classify_reg_name half lives in
-//! `crate::tablegen::register_map` (relocates to
-//! `crate::interpreter::decode::register_map` in Part B).
+//! Compatibility forwarder. The pure-FFI half lives in
+//! `xdna_archspec::aie2::isa::decoder_ffi`. The MappedOperand / RegisterMap /
+//! classify_reg_name half lives in `crate::interpreter::decode::register_map`.
 
 pub use xdna_archspec::aie2::isa::decoder_ffi::*;
-pub use super::register_map::*;
+pub use crate::interpreter::decode::register_map::*;
 
 #[cfg(test)]
 mod tests {

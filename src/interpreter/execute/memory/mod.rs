@@ -381,7 +381,7 @@ impl MemoryUnit {
             match dest {
                 Operand::AccumReg(_) => {
                     let width = op.accum_width.unwrap_or(
-                        crate::tablegen::decoder_ffi::AccumWidth::Half,
+                        crate::interpreter::decode::register_map::AccumWidth::Half,
                     );
                     ctx.queue_accum_load(dest.clone(), vec_data, width, latency);
                 }
@@ -776,7 +776,7 @@ impl MemoryUnit {
         // Half (bml/bmh) -> 512-bit single register.
         // Full/None (cm) -> 1024-bit wide pair via w2c upshift.
         let is_half = matches!(op.accum_width,
-            Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+            Some(crate::interpreter::decode::register_map::AccumWidth::Half));
 
         match &op.dest {
             Some(Operand::AccumReg(r)) => {
@@ -878,7 +878,7 @@ impl MemoryUnit {
         // Half (bml/bmh) -> 512-bit single register, narrow SRS.
         // Full/None (cm) -> 1024-bit wide pair, SRS each half and pack.
         let is_half = matches!(op.accum_width,
-            Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+            Some(crate::interpreter::decode::register_map::AccumWidth::Half));
 
         let addr = Self::get_store_address(op, ctx);
 
@@ -1134,7 +1134,7 @@ impl MemoryUnit {
     /// Read 256-bit store data from the first VectorReg, AccumReg, or ControlReg
     /// found in the op's sources or dest. Returns [u32; 8] or None.
     fn read_store_data_wide(op: &SlotOp, ctx: &ExecutionContext) -> Option<[u32; 8]> {
-        use crate::tablegen::decoder_ffi::AccumWidth;
+        use crate::interpreter::decode::register_map::AccumWidth;
 
         for operand in op.sources.iter().chain(op.dest.iter()) {
             match operand {
@@ -2861,7 +2861,7 @@ mod tests {
     /// conversion test: vlda.ups.s32.s8 cm0, s0, [p0] -> vst.srs.s8.s32 cm0, s0, [p1].
     #[test]
     fn test_fused_ups_srs_s8_s32_wide_roundtrip() {
-        use crate::tablegen::decoder_ffi::AccumWidth;
+        use crate::interpreter::decode::register_map::AccumWidth;
 
         let mut ctx = make_ctx();
         let mut tile = make_tile();
@@ -2930,7 +2930,7 @@ mod tests {
     /// compilers may read s0 before writing it.
     #[test]
     fn test_fused_ups_srs_s0_zero_init() {
-        use crate::tablegen::decoder_ffi::AccumWidth;
+        use crate::interpreter::decode::register_map::AccumWidth;
 
         let mut ctx = make_ctx();
         let mut tile = make_tile();

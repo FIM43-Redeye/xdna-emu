@@ -19,13 +19,11 @@
 //! Modules below are forwarders that preserve all existing import paths.
 //!
 //! The interpreter-coupled half of the old `decoder_ffi.rs` (MappedOperand,
-//! RegisterMap, classify_reg_name, operand_from_reg_name) lives in
-//! `crate::tablegen::register_map` pending relocation to
-//! `crate::interpreter::decode::register_map` in Part B.
+//! RegisterMap, classify_reg_name, operand_from_reg_name) now lives at
+//! `crate::interpreter::decode::register_map`.
 
 pub mod decoder_bytecode;
 pub mod decoder_ffi;
-pub mod register_map;
 mod resolver;
 mod types;
 

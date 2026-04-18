@@ -286,8 +286,8 @@ impl VectorAlu {
     pub(super) fn execute_setge(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         // Accumulator sources (Half or Full) need the wide path.
         let has_wide_acc_source = matches!(op.accum_width,
-            Some(crate::tablegen::decoder_ffi::AccumWidth::Full)
-            | Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+            Some(crate::interpreter::decode::register_map::AccumWidth::Full)
+            | Some(crate::interpreter::decode::register_map::AccumWidth::Half));
         if op.is_wide_vector || has_wide_acc_source {
             let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
             let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_ge);
@@ -339,8 +339,8 @@ impl VectorAlu {
     pub(super) fn execute_setlt(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         // Accumulator sources (Half or Full) need the wide path.
         let has_wide_acc_source = matches!(op.accum_width,
-            Some(crate::tablegen::decoder_ffi::AccumWidth::Full)
-            | Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+            Some(crate::interpreter::decode::register_map::AccumWidth::Full)
+            | Some(crate::interpreter::decode::register_map::AccumWidth::Half));
         if op.is_wide_vector || has_wide_acc_source {
             let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
             let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_lt);

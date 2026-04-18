@@ -50,7 +50,7 @@ pub struct PendingWrite {
     pub vec_value: Option<[u32; 8]>,
     /// Accumulator access width for AccumReg destinations.
     /// Determines which lanes to write (quarter/half/full).
-    pub accum_width: Option<crate::tablegen::decoder_ffi::AccumWidth>,
+    pub accum_width: Option<crate::interpreter::decode::register_map::AccumWidth>,
     /// Cycle at which this write becomes visible.
     pub ready_cycle: u64,
     /// Cycle at which this write was issued (for forwarding discrimination).
@@ -588,7 +588,7 @@ impl ExecutionContext {
         &mut self,
         dest: Operand,
         value: [u32; 8],
-        width: crate::tablegen::decoder_ffi::AccumWidth,
+        width: crate::interpreter::decode::register_map::AccumWidth,
         latency: u64,
     ) {
         self.pending_writes.push(PendingWrite {
@@ -783,9 +783,9 @@ impl ExecutionContext {
         &mut self,
         reg: u8,
         vec: &[u32; 8],
-        width: Option<crate::tablegen::decoder_ffi::AccumWidth>,
+        width: Option<crate::interpreter::decode::register_map::AccumWidth>,
     ) {
-        use crate::tablegen::decoder_ffi::AccumWidth;
+        use crate::interpreter::decode::register_map::AccumWidth;
 
         // Convert [u32; 8] (256 bits) to [u64; 4] by pairing adjacent words.
         let to_u64_lanes = |v: &[u32; 8]| -> [u64; 4] {

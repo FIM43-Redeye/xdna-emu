@@ -371,8 +371,8 @@ impl VectorAlu {
     /// including AccumWidth detection for Half vs Full accumulator destinations.
     pub(super) fn execute_ups(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         let has_wide_acc_source = matches!(op.accum_width,
-            Some(crate::tablegen::decoder_ffi::AccumWidth::Full)
-            | Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+            Some(crate::interpreter::decode::register_map::AccumWidth::Full)
+            | Some(crate::interpreter::decode::register_map::AccumWidth::Half));
 
         if op.is_wide_vector || has_wide_acc_source {
             Self::execute_ups_wide(op, ctx, et)
@@ -406,7 +406,7 @@ impl VectorAlu {
         let shift = Self::get_shift_amount(op, ctx);
         let from = op.from_type.unwrap_or(ElementType::Int16);
         let is_half = matches!(op.accum_width,
-            Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+            Some(crate::interpreter::decode::register_map::AccumWidth::Half));
 
         if !is_half {
             let acc_wide = if !op.is_wide_vector {

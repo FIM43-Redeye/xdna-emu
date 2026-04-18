@@ -1,9 +1,9 @@
 //! LLVM register name -> emulator Operand mapping.
 //!
 //! Adapter layer between the FFI in `xdna_archspec::aie2::isa::decoder_ffi`
-//! and the interpreter's `Operand` enum. Bottom half of the old
-//! `decoder_ffi.rs`; relocates to `crate::interpreter::decode::register_map`
-//! in Subsystem 6 Part B.
+//! and the interpreter's `Operand` enum. This is interpreter execution-model
+//! code (it references the emulator's `Operand` enum and register-file
+//! indices), so it lives here rather than in the arch-data crate.
 
 use xdna_archspec::aie2::isa::decoder_ffi::*;
 

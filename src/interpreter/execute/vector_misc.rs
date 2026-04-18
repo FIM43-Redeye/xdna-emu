@@ -612,7 +612,7 @@ impl VectorAlu {
                 _ => None,
             }).unwrap_or(0);
             let is_half = matches!(op.accum_width,
-                Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+                Some(crate::interpreter::decode::register_map::AccumWidth::Half));
             if !is_half {
                 // Accumulator move: vmov cm_dst, cm_src
                 let data = ctx.accumulator.read_wide(src_reg);
@@ -652,7 +652,7 @@ impl VectorAlu {
             let has_acc_dest = matches!(&op.dest, Some(Operand::AccumReg(_)));
             if has_acc_dest {
                 let is_half = matches!(op.accum_width,
-                    Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+                    Some(crate::interpreter::decode::register_map::AccumWidth::Half));
                 if !is_half {
                     Self::write_wide_acc_dest(op, ctx, [0u64; 16]);
                 } else {

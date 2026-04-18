@@ -17,11 +17,11 @@ impl VectorAlu {
     /// with AccumWidth detection (Quarter/Half/Full).
     pub(super) fn execute_convert(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         let has_wide_acc_source = matches!(op.accum_width,
-            Some(crate::tablegen::decoder_ffi::AccumWidth::Full)
-            | Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+            Some(crate::interpreter::decode::register_map::AccumWidth::Full)
+            | Some(crate::interpreter::decode::register_map::AccumWidth::Half));
         let is_quarter_acc = matches!(op.accum_width,
-            Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterLow)
-            | Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterHigh));
+            Some(crate::interpreter::decode::register_map::AccumWidth::QuarterLow)
+            | Some(crate::interpreter::decode::register_map::AccumWidth::QuarterHigh));
 
         if op.is_wide_vector || has_wide_acc_source || is_quarter_acc {
             Self::execute_convert_wide(op, ctx, et)
@@ -95,21 +95,21 @@ impl VectorAlu {
             // VFLOOR reads a quarter as 16 packed BF16 values, not as lane values.
             let acc_reg = Self::get_acc_source(op);
             let is_quarter = matches!(op.accum_width,
-                Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterLow) |
-                Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterHigh));
+                Some(crate::interpreter::decode::register_map::AccumWidth::QuarterLow) |
+                Some(crate::interpreter::decode::register_map::AccumWidth::QuarterHigh));
             // Only Full (cm-class) is truly wide (1024-bit, 16 lanes).
             // Half (bml/bmh) is 512-bit = 8 lanes. When accum_width is
             // None, default to half -- the even-register heuristic was
             // wrong because bml registers ARE even-numbered.
             let is_wide = matches!(op.accum_width,
-                Some(crate::tablegen::decoder_ffi::AccumWidth::Full));
+                Some(crate::interpreter::decode::register_map::AccumWidth::Full));
 
             let (src_lo, src_hi) = if is_quarter {
                 // Quarter-accumulator: 256 bits = 4 u64 lanes.
                 // Repack as 8 u32 words (raw byte reinterpretation).
                 let acc = ctx.accumulator.read(acc_reg);
                 let lane_start = match op.accum_width {
-                    Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterHigh) => 4,
+                    Some(crate::interpreter::decode::register_map::AccumWidth::QuarterHigh) => 4,
                     _ => 0,
                 };
                 let mut words = [0u32; 8];
@@ -342,7 +342,7 @@ mod tests {
     use crate::interpreter::execute::vector_dispatch::VectorAlu;
     use crate::interpreter::state::ExecutionContext;
     use crate::tablegen::SemanticOp;
-    use crate::tablegen::decoder_ffi::AccumWidth;
+    use crate::interpreter::decode::register_map::AccumWidth;
 
     fn make_ctx() -> ExecutionContext {
         ExecutionContext::new()

@@ -341,8 +341,8 @@ impl VectorAlu {
     /// including AccumWidth detection for Half vs Full accumulator sources.
     pub(super) fn execute_srs(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         let has_wide_acc_source = matches!(op.accum_width,
-            Some(crate::tablegen::decoder_ffi::AccumWidth::Full)
-            | Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+            Some(crate::interpreter::decode::register_map::AccumWidth::Full)
+            | Some(crate::interpreter::decode::register_map::AccumWidth::Half));
 
         if op.is_wide_vector || has_wide_acc_source {
             Self::execute_srs_wide(op, ctx, et)
@@ -369,7 +369,7 @@ impl VectorAlu {
         // Half (bml/bmh) is 512-bit = single bm register, use narrow
         // read. Full (cm) and None (legacy/wide default) use read_wide.
         let is_half = matches!(op.accum_width,
-            Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+            Some(crate::interpreter::decode::register_map::AccumWidth::Half));
 
         if !is_half {
             // Wide SRS: read Acc1024 (cm-register), SRS each half,

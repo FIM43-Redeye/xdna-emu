@@ -42,6 +42,7 @@ mod operand_extraction;
 mod slot_builder;
 pub(crate) mod composite;
 pub mod crossref;
+pub mod register_map;
 
 pub use decoder::{DecodedInstr, InstructionDecoder};
 

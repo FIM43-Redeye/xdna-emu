@@ -1588,10 +1588,10 @@ impl VectorAlu {
         // Fallback: cm registers always use even base indices, so odd index implies bm.
         let dst_reg = Self::get_acc_dest(op);
         let is_wide = match op.accum_width {
-            Some(crate::tablegen::decoder_ffi::AccumWidth::Full) => true,
-            Some(crate::tablegen::decoder_ffi::AccumWidth::Half)
-            | Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterLow)
-            | Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterHigh) => false,
+            Some(crate::interpreter::decode::register_map::AccumWidth::Full) => true,
+            Some(crate::interpreter::decode::register_map::AccumWidth::Half)
+            | Some(crate::interpreter::decode::register_map::AccumWidth::QuarterLow)
+            | Some(crate::interpreter::decode::register_map::AccumWidth::QuarterHigh) => false,
             None => {
                 // Legacy fallback: if any index is odd, it must be a bm half.
                 let any_odd = acc_sources.iter().any(|r| r % 2 != 0) || dst_reg % 2 != 0;
@@ -1712,10 +1712,10 @@ impl VectorAlu {
         // Wide (cm) vs narrow (bm) -- same detection as execute_acc_add_sub.
         // Use AccumWidth metadata from decoder when available (structural signal).
         let is_wide = match op.accum_width {
-            Some(crate::tablegen::decoder_ffi::AccumWidth::Full) => true,
-            Some(crate::tablegen::decoder_ffi::AccumWidth::Half)
-            | Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterLow)
-            | Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterHigh) => false,
+            Some(crate::interpreter::decode::register_map::AccumWidth::Full) => true,
+            Some(crate::interpreter::decode::register_map::AccumWidth::Half)
+            | Some(crate::interpreter::decode::register_map::AccumWidth::QuarterLow)
+            | Some(crate::interpreter::decode::register_map::AccumWidth::QuarterHigh) => false,
             None => {
                 let any_odd = acc_reg % 2 != 0 || dst_reg % 2 != 0;
                 !any_odd
@@ -2393,7 +2393,7 @@ mod tests {
     /// 0x7F800001 (mantissa = 1, sign = 0).  Verified against real NPU1 HW.
     #[test]
     fn test_vadd_f_nan_canonical() {
-        use crate::tablegen::decoder_ffi::AccumWidth;
+        use crate::interpreter::decode::register_map::AccumWidth;
         let mut ctx = make_ctx();
 
         // Load NaN values: s16 = -1 -> s32 = 0xFFFFFFFF -> f32: NaN (exp=0xFF).
@@ -2432,7 +2432,7 @@ mod tests {
     /// SRS should then produce zero.
     #[test]
     fn test_vadd_f_denormal_ftz() {
-        use crate::tablegen::decoder_ffi::AccumWidth;
+        use crate::interpreter::decode::register_map::AccumWidth;
         let mut ctx = make_ctx();
 
         // Simulate UPS: sign-extend 16 s16 values to s32, pack 2 per u64.

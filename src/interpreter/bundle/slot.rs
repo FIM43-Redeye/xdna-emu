@@ -303,7 +303,7 @@ pub struct SlotOp {
     /// AccumReg operand (dest or source). Used by execute_acc_add_sub to
     /// choose between 512-bit (bml/bmh) and 1024-bit (cm) read/write paths
     /// instead of the unreliable parity heuristic.
-    pub accum_width: Option<crate::tablegen::decoder_ffi::AccumWidth>,
+    pub accum_width: Option<crate::interpreter::decode::register_map::AccumWidth>,
 }
 
 // Core methods on SlotOp.
