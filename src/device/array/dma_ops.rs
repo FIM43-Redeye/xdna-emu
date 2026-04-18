@@ -94,9 +94,9 @@ impl TileArray {
             return None;
         }
         let idx = self.tile_index(col, row);
-        let is_mem_tile = self.tiles[idx].is_mem();
+        let is_mem = self.tiles[idx].is_mem();
 
-        let result = if is_mem_tile {
+        let result = if is_mem {
             let rows = self.rows as usize;
             let cols = self.cols as usize;
             let (west_ref, own_ref, east_ref) = get_three_mut(
@@ -127,8 +127,8 @@ impl TileArray {
         let engines = &self.dma_engines;
 
         for i in 0..tiles.len() {
-            let is_mem_tile = engines[i].tile_kind.is_mem();
-            if is_mem_tile {
+            let is_mem = engines[i].tile_kind.is_mem();
+            if is_mem {
                 let col = i / rows;
                 let (west_ref, own_ref, east_ref) = get_three_mut(
                     tiles, i, col, rows, cols,
@@ -155,9 +155,9 @@ impl TileArray {
             tiles[i].reset_bank_tracking();
             engines[i].cycle_dma_banks = 0;
 
-            let is_mem_tile = engines[i].tile_kind.is_mem();
+            let is_mem = engines[i].tile_kind.is_mem();
 
-            let result = if is_mem_tile {
+            let result = if is_mem {
                 let col = i / rows;
                 let (west_ref, own_ref, east_ref) = get_three_mut(
                     tiles, i, col, rows, cols,

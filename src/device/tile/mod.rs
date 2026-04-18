@@ -477,7 +477,7 @@ impl Tile {
     /// Check if this is a compute tile.
     #[inline]
     pub fn is_compute(&self) -> bool {
-        self.tile_kind == TileKind::Compute
+        self.tile_kind.is_compute()
     }
 
     /// Check if this is a memory tile.

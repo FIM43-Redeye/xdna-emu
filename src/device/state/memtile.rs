@@ -75,7 +75,6 @@ impl DeviceState {
     /// at runtime -- do NOT mask here.
     pub(super) fn parse_memtile_bd_from_words(&self, words: &[u32]) -> crate::device::dma::BdConfig {
         use crate::device::dma::bd::BufferDescriptor;
-        use xdna_archspec::types::TileKind;
 
         let parsed = BufferDescriptor::from_registers(words, TileKind::Mem);
         let mut config = parsed.to_bd_config();

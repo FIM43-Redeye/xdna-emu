@@ -600,7 +600,7 @@ impl InterpreterEngine {
 
                 // Get tile for this core
                 if let Some(tile) = self.device.tile_mut(col, row) {
-                    if tile.tile_kind != TileKind::Compute {
+                    if !tile.is_compute() {
                         continue;
                     }
 
@@ -862,7 +862,7 @@ impl InterpreterEngine {
                 // Compute tiles: core_trace (CoreEvent namespace)
                 // Shim tiles: core_trace (PL module, single trace unit)
                 // MemTiles: mem_trace (MemTileEvent namespace)
-                if tt == TileKind::Mem {
+                if tt.is_mem() {
                     tile.notify_mem_trace_event(hw_id, cycle);
                 } else {
                     tile.notify_core_trace_event(hw_id, cycle);
@@ -1171,7 +1171,7 @@ impl InterpreterEngine {
         for col in 0..self.cols {
             for row in self.compute_row_start..self.rows {
                 if let Some(tile) = self.device.array.get(col as u8, row as u8) {
-                    if tile.tile_kind == TileKind::Compute {
+                    if tile.is_compute() {
                         let idx = col * self.rows + row;
                         if let Some(core) = self.cores.get_mut(idx) {
                             // Sync enabled state from tile
