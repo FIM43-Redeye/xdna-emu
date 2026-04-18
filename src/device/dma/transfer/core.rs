@@ -231,7 +231,7 @@ impl Transfer {
         let pad = &bd_config.zero_padding;
         let zero_pad_state = if pad.is_enabled()
             && direction == TransferDirection::MM2S
-            && tile_kind == TileKind::Mem
+            && tile_kind.is_mem()
         {
             Some(ZeroPadState::new(
                 *pad,

@@ -64,8 +64,11 @@ impl ArchModel {
             }
             Architecture::Aie => {
                 unimplemented!(
-                    "AIE1 topology impl not populated until AIE1 support lands \
-                     (tracked as post-Subsystem-2 follow-on work)."
+                    "AIE1 topology impl not populated until AIE1 support lands. \
+                     See docs/arch/tile-topology.md (`## What would AIE1 look \
+                     like?`) for the sketch of the planned `Aie1Topology` impl. \
+                     Tag `phase1-subsys-tile-topo` introduced the trait seam; \
+                     AIE1 population is post-Phase-1 follow-on work."
                 )
             }
         }
