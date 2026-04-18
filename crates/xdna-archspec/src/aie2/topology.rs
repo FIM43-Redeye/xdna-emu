@@ -84,6 +84,43 @@ impl TileTopology for Aie2Topology {
 mod tests {
     use super::*;
 
+    // -------------------------------------------------------------------------
+    // Integration test: ArchModel::topology() dispatch path
+    // -------------------------------------------------------------------------
+
+    /// Exercises `ArchModel::topology()` and `Aie2Topology::from_model()` end-
+    /// to-end. The 11 direct-construction tests above never call these paths.
+    #[test]
+    fn archmodel_topology_dispatches_to_aie2() {
+        use crate::types::{ArchModel, Architecture, ArrayTopology, Source, SourceAttribution};
+
+        let mut model = ArchModel::new(Architecture::Aie2);
+        model.array_topology = Some(ArrayTopology {
+            columns: 5,
+            rows: 6,
+            num_mem_tile_rows: 1,
+            column_shift: 0,
+            row_shift: 0,
+            tile_map: Vec::new(),
+            source: SourceAttribution {
+                origin: Source::DeviceModel,
+                file: "test".to_string(),
+                detail: "integration test fixture".to_string(),
+            },
+        });
+
+        let topo = model.topology();
+
+        // Row classification via the trait-object dispatch path.
+        assert_eq!(topo.classify(0, 0), TileKind::ShimNoc);
+        assert_eq!(topo.classify(0, 1), TileKind::Mem);
+        assert_eq!(topo.classify(0, 2), TileKind::Compute);
+
+        // Neighbor queries to confirm from_model() plumbed extents correctly.
+        assert_eq!(topo.neighbor(0, 0, Direction::South), None);
+        assert_eq!(topo.neighbor(2, 2, Direction::South), Some((2, 1)));
+    }
+
     /// Canonical NPU1 (Phoenix) topology: 5 columns x 6 rows, 1 memtile row.
     fn npu1() -> Aie2Topology {
         Aie2Topology { columns: 5, rows: 6, num_mem_tile_rows: 1 }

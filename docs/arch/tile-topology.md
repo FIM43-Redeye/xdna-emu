@@ -22,7 +22,7 @@ All entries below are in `xdna-archspec` as of the
 | `TileKind` enum (4 variants + `is_shim` / `is_mem` / `is_compute` const-fn predicates) | `xdna_archspec::types` | aie-rt XAIE_TILE_TYPE constants |
 | `TileTopology` trait + `Direction` enum | `xdna_archspec::topology` | Emulator design |
 | `Aie2Topology` concrete impl | `xdna_archspec::aie2::topology` | Built from `ArchModel` extents + `SHIM_ROW` / `COMPUTE_ROW_START` constants |
-| `ArchModel::topology()` accessor | `xdna_archspec::types` (ArchModel impl block) | Dispatches on `ArchModel::architecture` |
+| `ArchModel::topology()` accessor | `xdna_archspec::topology` (additional `impl ArchModel` block -- `types.rs` is `#[path]`-included by build.rs, which prevents cross-module imports from within it) | Dispatches on `ArchModel::arch` |
 
 No runtime-side `TileType` enum remains; consumers import `TileKind`
 directly from archspec.
