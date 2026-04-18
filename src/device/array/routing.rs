@@ -2,6 +2,7 @@
 
 use super::*;
 use xdna_archspec::aie2::stream_switch::{compute, mem_tile, shim};
+use xdna_archspec::aie2::SHIM_ROW;
 use crate::device::stream_switch::PortType;
 use std::fmt;
 
@@ -141,7 +142,8 @@ impl TileArray {
                 let (dst_col, dst_row) = match tile.cascade_output_dir {
                     0 => {
                         // South: (col, row - 1)
-                        if row == 0 { continue; }
+                        // Shim row has no south neighbor.
+                        if row == SHIM_ROW { continue; }
                         (col, row - 1)
                     }
                     1 => {

@@ -10,6 +10,7 @@ use super::{NpuInstruction, NpuInstructionStream};
 use crate::device::DeviceState;
 use crate::device::host_memory::HostMemory;
 use crate::device::tile::TileType;
+use xdna_archspec::aie2::SHIM_ROW;
 
 /// Result of a single `try_advance()` step.
 ///
@@ -892,7 +893,7 @@ impl NpuExecutor {
         // fields (Enable_Packet, Packet_ID, Packet_Type, OoO_BD_ID).  Use
         // read-modify-write to preserve the non-address bits.
         let high_bits = (addr >> 32) as u32;
-        let is_shim_bd = row == 0 && bd_index_for_blockwrite(row, offset).is_some();
+        let is_shim_bd = row == SHIM_ROW && bd_index_for_blockwrite(row, offset).is_some();
         if is_shim_bd {
             let current = device.tile_mut(col as usize, row as usize)
                 .map(|t| t.read_register(offset + 4)).unwrap_or(0);
