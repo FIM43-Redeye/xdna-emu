@@ -49,6 +49,11 @@ use std::io::{BufRead, Write};
 
 use regex::Regex;
 
+/// VCD-trace-local tile-type enum. NOT the archspec `TileKind` -- this
+/// is a private enum used exclusively for VCD signal-name dispatch in
+/// trace output. Do not expose it publicly or import `TileKind` in
+/// parallel without considering which one the call site wants.
+///
 /// Tile type classification derived from VCD signal hierarchy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TileType {

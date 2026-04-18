@@ -35,7 +35,7 @@ mod tests;
 pub use params::{PROGRAM_MEMORY_SIZE, TileParams};
 pub use locks::{LockResult, LockRequestor, LockRequest, LockArbiterStats, LockArbiter, Lock};
 pub use dma_legacy::{DmaBufferDescriptor, DmaChannel};
-pub use core_state::{CoreState, LegacyStreamPort, TileType, CtrlPacketAction};
+pub use core_state::{CoreState, LegacyStreamPort, CtrlPacketAction};
 pub use xdna_archspec::types::TileKind;
 pub use edge::EdgeDetector;
 
