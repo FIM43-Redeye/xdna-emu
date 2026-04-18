@@ -132,11 +132,11 @@ subsequent subsystem passes inherit.
   `north_master_range`, `south_master_range`, `north_slave_range`,
   `south_slave_range`) live on the runtime-side `PortLayout` extension
   trait in `src/device/port_layout.rs`, not on `ArchConfig` in the
-  crate. Their data comes from `crate::arch::*` (build.rs-generated from
-  AM025 JSON); moving that generation into the workspace crate is a
-  bigger build-system change, deferred. When Subsystem 5 (Stream Switch)
-  runs, revisit this: if AIE2P diverges on port layout, it may be the
-  right moment to move port-data generation into the crate.
+  crate. Their data source is now `xdna_archspec::aie2::{port_type,
+  stream_switch}` (moved from `crate::arch::*` during Subsystem 1/6),
+  so the only runtime-side remnant is the extension trait itself. When
+  Subsystem 5 (Stream Switch) runs, revisit: if AIE2P diverges on port
+  layout, moving `PortLayout` behind a trait may be justified.
 - **`npu1()` loads from the archspec JSON at runtime.** Before Phase 1a,
   `npu1()` used build.rs-generated constants and `npu2()`/`xcve2802()`
   loaded from JSON. Phase 1a unified all three through JSON, eliminating
@@ -205,8 +205,12 @@ This is the concrete next action. Start here in a fresh session.
      merge, both of which belong in Subsystem 2.
    - `docs/arch/subsys1-audit.md` -- any tile-topology hardcodes that
      Subsystem 1 left behind.
-   - `docs/arch/isa-decode.md` -- the Subsystem 6 seam design note
-     (for the const-first pattern template).
+   - `docs/arch/subsys6-audit.md` -- Part A + Part B completion logs;
+     useful as a template for how a subsystem's audit should be
+     structured and for how sed-driven consumer rewrites were handled.
+   - `docs/arch/isa-decode.md` -- Subsystem 6's mandatory per-seam
+     design note; use it as the template for Subsystem 2's note
+     (`docs/arch/tile-topology.md`).
 
 2. **Verify the current state hasn't drifted:**
    ```bash
@@ -260,26 +264,37 @@ This is the concrete next action. Start here in a fresh session.
 ## Useful Commands
 
 ```bash
-# See Phase 1a commits
-git log --oneline 67ec2c5..phase1a-consolidate
+# EVERY cargo build/test needs this PATH prepend (tblgen needs
+# llvm-config 21.x, not mlir-aie's 23.x).  Hygiene fix deferred:
+# archspec's build.rs should set LLVM_SYS_210_PREFIX explicitly.
+export PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH
+
+# Commit history at the current refactor frontier
+git log --oneline phase1-subsys-isa-decode..HEAD
+git log --oneline phase1-subsys-regs-mem..phase1-subsys-isa-decode
 
 # Run library tests (Global Invariant; green at every commit)
-cargo test --lib
-
-# Run the archspec crate tests
-cargo test -p xdna-archspec --lib
+cargo test --lib                         # expect 2712 pass at the tag
+cargo test -p xdna-archspec --lib        # expect 220 pass + 1 known fail
 
 # Fast bridge smoke (catches 90% of regressions, ~30s)
-./scripts/emu-bridge-test.sh --no-hw -v add_one
+./scripts/emu-bridge-test.sh --no-hw -v add_one_cpp_aiecc
 
-# Full bridge run (15-30 min; requires NPU to be idle)
-./scripts/emu-bridge-test.sh 2>&1 | tee /tmp/claude-1000/bridge-phase1-subsys<N>.log
+# Full bridge run (~30 min) + ISA (~10 min), sequential
+./scripts/emu-bridge-test.sh 2>&1 | tee /tmp/claude-1000/bridge-subsys<N>.log
+./scripts/isa-test.sh         2>&1 | tee /tmp/claude-1000/isa-subsys<N>.log
+
+# FFI cdylib rebuild (needed after Rust changes for bridge to pick
+# them up -- `cargo build` alone does NOT update libxdna_emu.so)
+cargo build -p xdna-emu-ffi
 
 # What's currently in xdna-archspec
 ls crates/xdna-archspec/src/
+ls crates/xdna-archspec/src/aie2/
 
-# What's currently in src/device (after Phase 1a)
-ls src/device/
+# What's currently in src/ (after Subsystem 6)
+ls src/                                  # no src/tablegen/ anymore
+ls src/interpreter/decode/               # register_map.rs lives here
 ```
 
 ---
@@ -306,16 +321,24 @@ ls src/device/
 
 ---
 
-## Pre-existing Issues (Not Phase-1a Regressions; Don't Panic)
+## Pre-existing Issues (Not Refactor Regressions; Don't Panic)
 
+- **`bd_chain_repeat_on_memtile` EMU hangs in a DMA
+  `check_acquire_granted granted=false` polling loop** and never emits
+  `PASS!` in either Chess or Peano. On the real NPU it also fails.
+  Bisect against `build/bridge-test-results/` directories shows it was
+  passing on 20260414 and broken by 20260416; introduced somewhere in
+  Phase 1a or early Subsystem 1, pre-dates Subsystem 6. Independent
+  investigation item -- run it as a dedicated workstream between
+  subsystems, don't try to fix it mid-refactor (blurs bisect).
 - `cargo test -p xdna-archspec --lib`: `test_full_parse_all_devices`
   fails with device count 13 vs expected 12. Unrelated to this refactor;
   present before Phase 1a started.
-- Peano bridge EMU timeouts on `dma_task_large_linear` and
-  `objectfifo_repeat/init_values_repeat`. Present in yesterday's
-  pre-Phase-1a run; not caused by this refactor.
-- `examples/run_add_test.rs` has a stale API compile error. Unrelated to
-  this refactor; pre-existing.
+- Peano bridge EMU timeouts on `dma_task_large_linear`,
+  `objectfifo_repeat/{compute_repeat,init_values_repeat}`,
+  `ctrl_packet_reconfig_{1x4,4x1}_cores`, and
+  `matrix_multiplication_using_cascade/buffer`. Present before Phase 1a;
+  stable count across subsystem tags.
 - Generated file warnings (unused constants in `gen_aiert_*.rs`).
   Pre-existing.
 
