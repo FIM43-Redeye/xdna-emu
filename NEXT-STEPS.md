@@ -54,8 +54,14 @@ remnant have since been consolidated through the Subsystem 1 work into
   lines; xdna-emu has no build-dependencies anymore (all codegen in
   `crates/xdna-archspec/build.rs`).
 - Bridge `--no-hw -v add_one_cpp_aiecc`: Chess + Peano PASS.
-- Full HW bridge + ISA suite gate at the tag: see
-  `/tmp/claude-1000/subsys6-partB-{bridge,isa}.log`.
+- Bridge `--no-hw` spot-check at HEAD with a fresh
+  `cargo build -p xdna-emu-ffi` (2026-04-18): every targeted EMU
+  test passes except the pre-existing `bd_chain_repeat_on_memtile`
+  deadlock documented below.  (An older `subsys6-partB-bridge.log`
+  exists but is unreliable -- it was captured with a stale `.so`
+  and reports five phantom EMU timeouts that do not reproduce once
+  the FFI is rebuilt.  Always rebuild the FFI immediately before
+  capturing a gate log; see "Useful Commands".)
 
 **Build-environment caveat (carried from Part A, still applies):** every
 fresh `cargo build` needs
@@ -73,13 +79,20 @@ explicitly.
   didn't). `XFAIL: *` and `XFAIL: peano|chess` feature lists now
   produce `XFAIL` / `XPASS` results instead of `FAIL`.
 
-**Pre-existing EMU regression flagged during Subsystem 6 gate (not our
-fault):**
-- `bd_chain_repeat_on_memtile` EMU side gets stuck in a DMA
+**Known pre-existing failure (independent of Phase 1 -- do not block
+on it):**
+- `bd_chain_repeat_on_memtile` EMU side spins in a DMA
   `check_acquire_granted granted=false` polling loop and never emits
-  `PASS!`. Traced to Subsystem 1 (or earlier); passed on 20260414,
-  failed by 20260416 at `phase1-subsys-regs-mem`. Independent
-  workstream; open as an investigation after Subsystem 2 lands.
+  `PASS!` on either Chess or Peano.  Verified to reproduce at
+  `53e9337` and `0af8548` (both 2026-04-16, pre-refactor).  The
+  20260416 bridge result files show PASS for this test, but the
+  94k-line bridge log clearly shows the same deadlock in its tail --
+  the "PASS" was a harness anomaly from the pre-`ba86b37` script not
+  substituting lit's `%s` macro, which made `FileCheck %s` error in a
+  way the bridge script misread as pass.  `ba86b37` (substitute `%s`
+  and honor `XFAIL:`) correctly surfaces this long-latent deadlock.
+  Independent workstream; investigate after the Phase 1 refactor
+  if worthwhile, not during.
 
 ---
 
@@ -285,7 +298,14 @@ cargo test -p xdna-archspec --lib        # expect 220 pass + 1 known fail
 ./scripts/isa-test.sh         2>&1 | tee /tmp/claude-1000/isa-subsys<N>.log
 
 # FFI cdylib rebuild (needed after Rust changes for bridge to pick
-# them up -- `cargo build` alone does NOT update libxdna_emu.so)
+# them up -- `cargo build` alone does NOT update libxdna_emu.so).
+# ALWAYS rebuild the FFI immediately before running the bridge
+# gate at a subsystem tag.  A stale .so left over from a prior
+# refactor has produced at least one phantom multi-test "regression"
+# narrative (retracted 2026-04-18) -- rebuild first, draw
+# conclusions second.  If the .so timestamp in target/debug looks
+# older than the latest source commit, `cargo clean -p xdna-emu-ffi`
+# before the rebuild.
 cargo build -p xdna-emu-ffi
 
 # What's currently in xdna-archspec
@@ -321,94 +341,21 @@ ls src/interpreter/decode/               # register_map.rs lives here
 
 ---
 
-## Open Regression: EMU Correctness Regression in DMA Lock Release (masked as bridge timeouts)
+## Known Pre-Existing Failures
 
-**Initially misdiagnosed as a throughput drop.** Closer look at the
-logs shows both runs produce the same ~94k log lines spanning the same
-~16 seconds of emulator INFO timestamps, with the same 13 BD-start
-events. The 20260416 run emitted `PASS!` (from test.exe's stderr) at
-line 8; the 20260417 run emits neither `PASS!` nor `FAIL`. test.exe is
-waiting on the plugin forever because the emulator never releases a
-lock that the DMA is polling for -- `check_acquire_granted ...
-granted=false` spins indefinitely. The 120s bridge timeout kills
-test.exe before it prints a verdict.
+These predate Phase 1 and are orthogonal to the refactor -- do not
+block on them, do not investigate them mid-subsystem:
 
-**This is a state-machine bug, not slowness.** Some event that used
-to release a lock (probably another DMA completing, or a control-
-sequence step) no longer fires, so the producer/consumer chain
-deadlocks.  Seven bridge tests that passed on 20260416 now exhibit
-this symptom:
-
-| Test | Compiler | 20260416 | Now | Symptom |
-|------|----------|---------|-----|---------|
-| `bd_chain_repeat_on_memtile` | chess | PASS | FAIL | stuck in DMA acquire poll, no `PASS!` emitted |
-| `bd_chain_repeat_on_memtile` | peano | PASS | FAIL | same |
-| `ctrl_packet_reconfig_1x4_cores` | chess | PASS | TIMEOUT | same DMA acquire deadlock |
-| `ctrl_packet_reconfig_1x4_cores` | peano | PASS | TIMEOUT | same |
-| `ctrl_packet_reconfig_4x1_cores` | chess | PASS | TIMEOUT | same |
-| `ctrl_packet_reconfig_4x1_cores` | peano | PASS | TIMEOUT | same |
-| `matrix_multiplication_using_cascade/buffer` | chess | PASS | TIMEOUT | same |
-| `objectfifo_repeat/compute_repeat` | peano | PASS | TIMEOUT | same |
-
-Note: the `check_acquire_granted granted=false` line appears at the
-tail of *all* these logs -- the polling loop is the symptom, and all
-tests that hit this symptom share the same underlying deadlock.
-
-Old Peano timeouts that ALSO existed on 20260416 and are unrelated:
-`dma_task_large_linear`, `objectfifo_repeat/init_values_repeat`.
-
-**Bisect window:** 20260416 20:14 (last known 69/69 Chess pass at EMU
-level) through today's `phase1-subsys-isa-decode` tag. All commits
-in that range are on `dev`; `git log --oneline 8c0f217^..HEAD` in
-chronological order.  Subsys-1 Part B (`0910f33`, `06e40c9`, `c403991`,
-`8c0f217`) and Subsystem 6 (A + B) all live in this window.
-
-**Memory_map refactor (0910f33/06e40c9/c403991) is probably innocent:**
-values are identical, just a namespace move (`crate::device::registers_spec`
--> `xdna_archspec::aie2::memory_map`), verified by comparing the
-`AIE_DATA_MEMORY_BASE` / `PROGRAM_MEMORY_BASE` / etc. definitions.
-
-**Most suspicious:** something in the DMA stepping / lock bookkeeping
-path that runs on completion of each DMA. The symptom is a deadlock,
-not slowness -- an event that used to release a lock (probably
-consumer-lock release after a shim-DMA or memtile-DMA completes) no
-longer fires. Candidates:
-
-1. `11f1275` (tablegen mega-move) -- nominally pure relocation but
-   touches `#[path]` module includes and `mod generated { include!() }`
-   wrappers; worth checking if the generated `TblgenOutput` takes a
-   different path through `load_from_generated()` now.
-2. `bb99951` (register_map -> interpreter::decode) -- a new-ish module
-   boundary, could have an inlining change.
-3. Subsystem 1 Part A commits before 20260416 (e.g. the ArchModel
-   runtime lookup consolidation) -- the 20260416 run was pre-Subsys1-
-   Part-B but post-Subsys1-Part-A, so those aren't in the bisect
-   window.  **But re-check**: 20260414 was also "PASS" for bd_chain
-   etc.; if 20260414 and 20260416 are both clean, Part A is innocent
-   too.
-
-**Investigation strategy (for a dedicated session):**
-1. `git checkout phase1-subsys-regs-mem` and rerun the bridge against
-   `bd_chain_repeat_on_memtile --no-hw` -- if it passes there, the
-   regression is in Subsystem 6 (mega-move or register_map move).  If
-   it fails, the regression is in Subsystem 1 Part B.
-2. If narrowed to Subsystem 6, bisect 4 commits: `11f1275`, `bb99951`,
-   `0e6982b`, `f07ecfb`.
-3. If narrowed to Subsystem 1 Part B, bisect 3 commits: `0910f33`,
-   `06e40c9`, `c403991`.
-
-**Don't fix mid-subsystem.** This is its own investigation workstream
-between subsystems -- keeping the bisect cleanly on `dev` (no
-interleaved fixes) is more valuable than shaving time off a Subsystem-2
-timeline.
+- `bd_chain_repeat_on_memtile` bridge EMU (Chess and Peano): the
+  latent DMA deadlock documented in "Where We Are" above.  Verified
+  pre-refactor.  An earlier iteration of this document posted a
+  multi-test deadlock narrative based on the stale
+  `subsys6-partB-bridge.log`; that narrative was wrong (the other
+  tests pass once the FFI is rebuilt cleanly) and has been retracted.
 - `cargo test -p xdna-archspec --lib`: `test_full_parse_all_devices`
-  fails with device count 13 vs expected 12. Unrelated to this refactor;
-  present before Phase 1a started.
-- Peano bridge EMU timeouts on `dma_task_large_linear`,
-  `objectfifo_repeat/{compute_repeat,init_values_repeat}`,
-  `ctrl_packet_reconfig_{1x4,4x1}_cores`, and
-  `matrix_multiplication_using_cascade/buffer`. Present before Phase 1a;
-  stable count across subsystem tags.
+  fails with device count 13 vs expected 12.  Pre-dates Phase 1a.
+- Peano bridge EMU timeouts on `dma_task_large_linear` and
+  `objectfifo_repeat/init_values_repeat`.  Also pre-existing.
 - Generated file warnings (unused constants in `gen_aiert_*.rs`).
   Pre-existing.
 
