@@ -321,21 +321,38 @@ ls src/interpreter/decode/               # register_map.rs lives here
 
 ---
 
-## Open Regression: EMU Throughput Dropped ~2x Since `phase1-subsys-regs-mem` Started
+## Open Regression: EMU Correctness Regression in DMA Lock Release (masked as bridge timeouts)
 
-**Not specific to bd_chain.** Six bridge tests that passed on 20260416
-now time out at the 120s cap or hang outright:
+**Initially misdiagnosed as a throughput drop.** Closer look at the
+logs shows both runs produce the same ~94k log lines spanning the same
+~16 seconds of emulator INFO timestamps, with the same 13 BD-start
+events. The 20260416 run emitted `PASS!` (from test.exe's stderr) at
+line 8; the 20260417 run emits neither `PASS!` nor `FAIL`. test.exe is
+waiting on the plugin forever because the emulator never releases a
+lock that the DMA is polling for -- `check_acquire_granted ...
+granted=false` spins indefinitely. The 120s bridge timeout kills
+test.exe before it prints a verdict.
+
+**This is a state-machine bug, not slowness.** Some event that used
+to release a lock (probably another DMA completing, or a control-
+sequence step) no longer fires, so the producer/consumer chain
+deadlocks.  Seven bridge tests that passed on 20260416 now exhibit
+this symptom:
 
 | Test | Compiler | 20260416 | Now | Symptom |
 |------|----------|---------|-----|---------|
 | `bd_chain_repeat_on_memtile` | chess | PASS | FAIL | stuck in DMA acquire poll, no `PASS!` emitted |
 | `bd_chain_repeat_on_memtile` | peano | PASS | FAIL | same |
-| `ctrl_packet_reconfig_1x4_cores` | chess | PASS (~94s) | TIMEOUT | same DMA acquire poll, ran 345k log lines in 120s vs 584k in 94s on baseline |
+| `ctrl_packet_reconfig_1x4_cores` | chess | PASS | TIMEOUT | same DMA acquire deadlock |
 | `ctrl_packet_reconfig_1x4_cores` | peano | PASS | TIMEOUT | same |
 | `ctrl_packet_reconfig_4x1_cores` | chess | PASS | TIMEOUT | same |
 | `ctrl_packet_reconfig_4x1_cores` | peano | PASS | TIMEOUT | same |
 | `matrix_multiplication_using_cascade/buffer` | chess | PASS | TIMEOUT | same |
 | `objectfifo_repeat/compute_repeat` | peano | PASS | TIMEOUT | same |
+
+Note: the `check_acquire_granted granted=false` line appears at the
+tail of *all* these logs -- the polling loop is the symptom, and all
+tests that hit this symptom share the same underlying deadlock.
 
 Old Peano timeouts that ALSO existed on 20260416 and are unrelated:
 `dma_task_large_linear`, `objectfifo_repeat/init_values_repeat`.
@@ -351,10 +368,11 @@ values are identical, just a namespace move (`crate::device::registers_spec`
 -> `xdna_archspec::aie2::memory_map`), verified by comparing the
 `AIE_DATA_MEMORY_BASE` / `PROGRAM_MEMORY_BASE` / etc. definitions.
 
-**Most suspicious:** something in the `#[cfg(info)]` log-volume /
-dispatch path. The symptom (same polling loop, but completes fewer
-iterations in the same wall-clock) smells like per-cycle overhead
-crept into the interpreter dispatch.  Candidates:
+**Most suspicious:** something in the DMA stepping / lock bookkeeping
+path that runs on completion of each DMA. The symptom is a deadlock,
+not slowness -- an event that used to release a lock (probably
+consumer-lock release after a shim-DMA or memtile-DMA completes) no
+longer fires. Candidates:
 
 1. `11f1275` (tablegen mega-move) -- nominally pure relocation but
    touches `#[path]` module includes and `mod generated { include!() }`
