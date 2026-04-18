@@ -122,28 +122,42 @@ Plan expected ~25-38 files; 27 is within range.
 
 ## xdna-emu/build.rs Surface
 
-**995 lines** total.
+**995 lines** total. **22 top-level `fn` definitions** (from `rg -n '^fn ' build.rs`).
 
-Functions matching `^fn (gen_|extract_|compile_|run_)`:
+A previous revision of this table used the regex `^fn (gen_|extract_|compile_|run_)`
+and silently captured only 10 of the 22 functions. The table below enumerates all
+22. The 11 helper functions in the `parse_*` / name-mapping group are part of the
+same `extract_aiert` + aie-rt parsing block and migrate with Task 11.
 
-| Line | Function |
-|------|----------|
-| 275 | `gen_header(source_desc: &str) -> String` |
-| 289 | `extract_aiert(...)` |
-| 380 | `run_aiert_preprocessor(aiert_dir: &Path) -> Option<String>` |
-| 599 | `extract_identifier(line: &str, type_name: &str) -> Option<String>` |
-| 643 | `extract_field_value(line: &str, field: &str) -> Option<String>` |
-| 718 | `gen_aiert_dma(modules: &[DmaModData], out_dir: &Path)` |
-| 742 | `gen_aiert_locks(modules: &[LockModData], out_dir: &Path)` |
-| 764 | `gen_aiert_ports(port_maps: &[PortMapData], out_dir: &Path)` |
-| 923 | `compile_llvm_decoder_ffi(llvm_aie_path: &Path)` |
-| 982 | `run_llvm_config(llvm_config: &Path, args: &[&str]) -> String` |
+| Line | Function | Block | Migrates |
+|------|----------|-------|----------|
+| 52 | `main()` | Orchestration | stays in `xdna-emu/build.rs` |
+| 275 | `gen_header(source_desc: &str) -> String` | Shared utility | Task 7 (or shared) |
+| 289 | `extract_aiert(...)` | aie-rt extraction (top-level) | Task 11 |
+| 380 | `run_aiert_preprocessor(aiert_dir: &Path) -> Option<String>` | aie-rt extraction | Task 11 |
+| 459 | `parse_dma_modules(text: &str) -> Vec<DmaModData>` | aie-rt parsing | Task 11 |
+| 467 | `parse_lock_modules(text: &str) -> Vec<LockModData>` | aie-rt parsing | Task 11 |
+| 475 | `parse_port_maps(text: &str) -> Vec<PortMapData>` | aie-rt parsing | Task 11 |
+| 542 | `parse_struct_initializers(text, type_name)` | aie-rt parsing | Task 11 |
+| 599 | `extract_identifier(line: &str, type_name: &str) -> Option<String>` | aie-rt parsing | Task 11 |
+| 614 | `parse_field_assignment(line: &str) -> Option<(String, String)>` | aie-rt parsing | Task 11 |
+| 643 | `extract_field_value(line: &str, field: &str) -> Option<String>` | aie-rt parsing | Task 11 |
+| 658 | `parse_numeric_value(s: &str) -> Option<u32>` | aie-rt parsing | Task 11 |
+| 671 | `get_field(fields, name, struct_name) -> u32` | aie-rt parsing | Task 11 |
+| 680 | `dma_mod_name(name: &str) -> &str` | aie-rt name mapping | Task 11 |
+| 690 | `lock_mod_name(name: &str) -> &str` | aie-rt name mapping | Task 11 |
+| 700 | `port_map_rust_name(name: &str) -> &str` | aie-rt name mapping | Task 11 |
+| 718 | `gen_aiert_dma(modules: &[DmaModData], out_dir: &Path)` | aie-rt codegen | Task 11 |
+| 742 | `gen_aiert_locks(modules: &[LockModData], out_dir: &Path)` | aie-rt codegen | Task 11 |
+| 764 | `gen_aiert_ports(port_maps: &[PortMapData], out_dir: &Path)` | aie-rt codegen | Task 11 |
+| 814 | `write_aiert_stubs(out_dir: &Path)` | aie-rt fallback stubs | Task 11 |
+| 923 | `compile_llvm_decoder_ffi(llvm_aie_path: &Path)` | TableGen / FFI | Task 9 |
+| 982 | `run_llvm_config(llvm_config: &Path, args: &[&str]) -> String` | TableGen / FFI | Task 9 |
 
-Functions slated for migration to `xdna-archspec/build.rs` in Tasks 7, 9, 11:
-- `compile_llvm_decoder_ffi` (Task 9)
-- `extract_aiert`, `run_aiert_preprocessor`, `extract_identifier`,
-  `extract_field_value`, `gen_aiert_dma`, `gen_aiert_locks`,
-  `gen_aiert_ports` (Task 11)
+**Migration summary by task:**
+- **Task 7** (gen_arch relocation): `gen_header` may move here or become shared; `main` orchestration updated.
+- **Task 9** (TableGen/FFI): `compile_llvm_decoder_ffi`, `run_llvm_config`.
+- **Task 11** (aie-rt extraction): all 18 remaining functions in the aie-rt parsing, codegen, and fallback-stub block (lines 289-820).
 
 ---
 
