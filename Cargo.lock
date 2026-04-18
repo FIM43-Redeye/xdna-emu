@@ -4731,6 +4731,7 @@ dependencies = [
 name = "xdna-archspec"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "log",
  "serde",
  "serde_json",
@@ -4744,7 +4745,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "byteorder",
- "cc",
  "crossterm",
  "dirs",
  "eframe",

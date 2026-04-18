@@ -8,8 +8,7 @@
 //!   These duplicate their archspec counterparts; the cross-validation
 //!   side-effect on ArchModel is unique to archspec's copy.
 //!
-//! - `compile_llvm_decoder_ffi` + LLVM link (compiles
-//!   `crates/xdna-archspec/decoder_ffi/aie2_decoder.cpp`). Moves to archspec in Task 9.
+//! - `compile_llvm_decoder_ffi` + LLVM link moved to archspec/build.rs in Task 9.
 //!
 //! - XRT plugin install logic (always belongs in xdna-emu).
 //!
@@ -130,15 +129,6 @@ fn main() {
     //
     // gen_tablegen.rs now emits from xdna-archspec/build.rs (Task 7).
     // load_from_generated() is forwarded via pub use in src/tablegen/mod.rs.
-
-    // ========================================================================
-    // LLVM decoder FFI -- compile aie2_decoder.cpp and link LLVM libraries
-    // ========================================================================
-    //
-    // Links LLVM's AIE2 MCDisassembler into the emulator so we get perfect
-    // TRY_DECODE disambiguation (register class validation) without having
-    // to reimplement LLVM's per-instruction decoder functions.
-    compile_llvm_decoder_ffi(llvm_aie_path);
 
     // ========================================================================
     // Post-codegen: rebuild and install XRT plugin
@@ -869,81 +859,3 @@ pub const MEMTILE_SLAVE_PORTS: &[(AieRtPortType, u8)] = &[];
     fs::write(out_dir.join("gen_aiert_ports.rs"), ports_stub).unwrap();
 }
 
-/// Compile `crates/xdna-archspec/decoder_ffi/aie2_decoder.cpp` and link the LLVM AIE libraries.
-///
-/// This gives the emulator access to LLVM's MCDisassembler for perfect
-/// instruction decoding, including TRY_DECODE register class validation
-/// that our bytecode interpreter cannot replicate.
-fn compile_llvm_decoder_ffi(llvm_aie_path: &Path) {
-    let llvm_build = llvm_aie_path.join("build");
-    let llvm_src = llvm_aie_path.join("llvm");
-    let llvm_config = llvm_build.join("bin/llvm-config");
-
-    if !llvm_config.exists() {
-        println!(
-            "cargo:warning=LLVM decoder FFI: llvm-config not found at {} -- skipping",
-            llvm_config.display()
-        );
-        return;
-    }
-
-    let decoder_cpp = "crates/xdna-archspec/decoder_ffi/aie2_decoder.cpp";
-    println!("cargo:rerun-if-changed={}", decoder_cpp);
-    println!("cargo:rerun-if-changed=crates/xdna-archspec/decoder_ffi/aie2_decoder.h");
-
-    // Compile aie2_decoder.cpp with the cc crate.
-    cc::Build::new()
-        .cpp(true)
-        .std("c++17")
-        .opt_level(2)
-        .file(decoder_cpp)
-        .include(llvm_build.join("include"))
-        .include(llvm_src.join("include"))
-        .include(llvm_build.join("lib/Target/AIE"))
-        .include(llvm_src.join("lib/Target/AIE"))
-        .define("__STDC_LIMIT_MACROS", None)
-        .define("__STDC_CONSTANT_MACROS", None)
-        .define("_GNU_SOURCE", None)
-        .flag("-fno-exceptions")
-        .flag("-funwind-tables")
-        .compile("aie2_decoder");
-
-    // Link LLVM libraries. Use llvm-config to get the authoritative list.
-    let llvm_libdir = run_llvm_config(&llvm_config, &["--libdir"]);
-    println!("cargo:rustc-link-search=native={}", llvm_libdir.trim());
-
-    // Parse --libs aie output: "-lLLVMAIEDisassembler -lLLVMMCDisassembler ..."
-    let libs_output = run_llvm_config(&llvm_config, &["--libs", "aie"]);
-    for token in libs_output.split_whitespace() {
-        if let Some(lib) = token.strip_prefix("-l") {
-            println!("cargo:rustc-link-lib=static={}", lib);
-        }
-    }
-
-    // System libraries (dynamic): "-lrt -ldl -lm -lz -lzstd -lxml2"
-    let syslibs_output = run_llvm_config(&llvm_config, &["--system-libs"]);
-    for token in syslibs_output.split_whitespace() {
-        if let Some(lib) = token.strip_prefix("-l") {
-            println!("cargo:rustc-link-lib=dylib={}", lib);
-        }
-    }
-
-    // C++ standard library
-    println!("cargo:rustc-link-lib=dylib=stdc++");
-}
-
-/// Run llvm-config with the given arguments and return stdout as a String.
-fn run_llvm_config(llvm_config: &Path, args: &[&str]) -> String {
-    let output = std::process::Command::new(llvm_config)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("Failed to run llvm-config: {}", e));
-    if !output.status.success() {
-        panic!(
-            "llvm-config {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    String::from_utf8(output.stdout).unwrap()
-}

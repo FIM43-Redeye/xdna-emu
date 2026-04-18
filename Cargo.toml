@@ -70,9 +70,6 @@ serde_json = "1"
 # Needed for build_arch_model (feeds extract_aiert -> gen_aiert_*) and for
 # RegisterDb used in the aie-rt parsing helpers. Removed in Subsystem 6.
 xdna-archspec = { path = "crates/xdna-archspec" }
-# Used by compile_llvm_decoder_ffi (compiles decoder_ffi/aie2_decoder.cpp).
-# Moves to xdna-archspec in Subsystem 6 alongside the FFI consumers in src/tablegen/.
-cc = "1"
 
 [dev-dependencies]
 hex = "0.4"                                             # Hex dump utilities for debugging
