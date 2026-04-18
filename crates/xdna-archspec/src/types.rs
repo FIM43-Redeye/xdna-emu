@@ -77,6 +77,69 @@ impl fmt::Display for TileKind {
     }
 }
 
+impl TileKind {
+    /// Is this a shim tile (either `ShimNoc` or `ShimPl`)?
+    ///
+    /// Both shim variants share the same conceptual "shim tile" role in
+    /// the emulator's code paths. AIE2 only ever produces `ShimNoc`;
+    /// AIE1 produces both, but code that cares about per-column mux
+    /// distinction should match on the variant directly rather than
+    /// calling this helper.
+    #[inline]
+    pub const fn is_shim(self) -> bool {
+        matches!(self, TileKind::ShimNoc | TileKind::ShimPl)
+    }
+
+    /// Is this a memory tile?
+    #[inline]
+    pub const fn is_mem(self) -> bool {
+        matches!(self, TileKind::Mem)
+    }
+
+    /// Is this a compute tile?
+    #[inline]
+    pub const fn is_compute(self) -> bool {
+        matches!(self, TileKind::Compute)
+    }
+}
+
+#[cfg(test)]
+mod tile_kind_predicate_tests {
+    use super::TileKind;
+
+    #[test]
+    fn is_shim_covers_both_variants() {
+        assert!(TileKind::ShimNoc.is_shim());
+        assert!(TileKind::ShimPl.is_shim());
+        assert!(!TileKind::Mem.is_shim());
+        assert!(!TileKind::Compute.is_shim());
+    }
+
+    #[test]
+    fn is_mem_only_mem() {
+        assert!(TileKind::Mem.is_mem());
+        assert!(!TileKind::Compute.is_mem());
+        assert!(!TileKind::ShimNoc.is_mem());
+        assert!(!TileKind::ShimPl.is_mem());
+    }
+
+    #[test]
+    fn is_compute_only_compute() {
+        assert!(TileKind::Compute.is_compute());
+        assert!(!TileKind::Mem.is_compute());
+        assert!(!TileKind::ShimNoc.is_compute());
+        assert!(!TileKind::ShimPl.is_compute());
+    }
+
+    #[test]
+    fn predicates_are_const_fn() {
+        // Verify const-fn status: these can be evaluated at compile time.
+        const _SHIM: bool = TileKind::ShimNoc.is_shim();
+        const _MEM: bool = TileKind::Mem.is_mem();
+        const _COMPUTE: bool = TileKind::Compute.is_compute();
+    }
+}
+
 // ============================================================================
 // Source attribution
 // ============================================================================
