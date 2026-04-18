@@ -3,9 +3,50 @@
 Recovery document for picking up this refactor in a future session. Read
 this first, then dive into the authoritative artifacts below.
 
-**Last updated:** 2026-04-17 (after Phase 1b Subsystem 1 landed, reduced scope)
+**Last updated:** 2026-04-17 (Phase 1b Subsystem 6 Part A landed; Part B pending)
 **Current branch:** `dev` (no master merges until the refactor is done)
-**Latest tag:** `phase1-subsys-regs-mem` at `8c0f217`
+**Latest tag:** `phase1-subsys-isa-decode-partA` at `71050cb`
+
+---
+
+## Session Checkpoint (2026-04-17, mid-Subsystem-6)
+
+**State at this checkpoint:**
+- Subsystem 6 Part A landed at `phase1-subsys-isa-decode-partA` (`71050cb`).
+- 11 commits cover the relocation: mega-move (`11f1275`) + build_helpers
+  directory (`0b68c14`) + TableGen wiring (`24e755c`) + decoder_ffi C++
+  (`749cec7`) + compile_llvm_decoder_ffi (`55ff796`) + extract_aiert /
+  gen_aiert_* (`25c88be`) + supporting docs. Audit log at
+  `docs/arch/subsys6-audit.md` details all deviations.
+- Rust-side invariants green: release build clean, 2730 xdna-emu lib
+  tests pass, 202/1 archspec lib tests (1 pre-existing fail), bridge
+  `--no-hw -v add_one` green.
+- **Full HW bridge + ISA suite running in background at time of
+  checkpoint.** Bridge log at `/tmp/claude-1000/subsys6-partA-bridge.log`
+  followed by ISA at `/tmp/claude-1000/subsys6-partA-isa.log`. Sequential
+  (never parallel -- both target the NPU). Expect ~30 min bridge +
+  ~10 min ISA.
+- **Build-environment caveat:** every fresh `cargo build` now requires
+  `export PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH` so
+  tblgen's build-script finds llvm-config 21.x (not mlir-aie's 23.x).
+  Prior cached artifacts hid this. Hygiene fix: archspec's build.rs
+  should set `LLVM_SYS_210_PREFIX` explicitly. Flagged, not done.
+
+**What remains in Subsystem 6 (Part B, 7 tasks):**
+- Task 13: move `src/tablegen/register_map.rs` -> `src/interpreter/decode/register_map.rs`.
+- Task 14: atomic rewrite of ~27 `crate::tablegen::*` consumers.
+- Task 15: atomic rewrite of 36 `crate::arch::*` consumers.
+- Task 16: delete `src/tablegen/` directory; delete `pub mod arch` + `pub mod tablegen` forwarder blocks in `src/lib.rs`.
+- Task 17: shrink `xdna-emu/build.rs` to ~80 lines (plugin install only); empty `[build-dependencies]`.
+- Task 18: write `docs/arch/isa-decode.md` design note.
+- Task 19: full HW + ISA gate; tag `phase1-subsys-isa-decode`; update this NEXT-STEPS.md.
+
+**To resume:**
+1. Check HW bridge + ISA logs at `/tmp/claude-1000/subsys6-partA-{bridge,isa}.log` -- confirm no new regressions vs the `phase1-subsys-regs-mem` baseline.
+2. Re-open the plan at `docs/superpowers/plans/2026-04-17-subsys6-isa-decode.md` starting at Task 13.
+3. Invoke `superpowers:subagent-driven-development` to continue execution.
+
+---
 
 ---
 
