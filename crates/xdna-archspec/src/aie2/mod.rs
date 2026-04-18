@@ -92,6 +92,9 @@ pub mod port_type {
 /// preprocessor. Submodules: `dma`, `locks`, `ports`.
 pub mod aiert;
 
+/// AIE2-family tile topology impl (`Aie2Topology`). Subsystem 2 seam.
+pub mod topology;
+
 /// Instruction set architecture: decoder tables, runtime model, and
 /// LLVM MCDisassembler FFI. Populated during Subsystem 6 Part A.
 pub mod isa;

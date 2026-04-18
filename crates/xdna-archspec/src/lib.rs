@@ -20,6 +20,7 @@ pub mod regdb;
 pub mod regdb_extractor;
 pub mod runtime;
 pub mod tablegen;
+pub mod topology;
 pub mod types;
 
 pub use model_builder::{build_arch_model, confirm_subsystem_ranges};
