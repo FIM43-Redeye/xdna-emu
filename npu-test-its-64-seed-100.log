@@ -1,0 +1,72 @@
+Fuzzing 64 iterations, base seed 100
+  peano: /home/triple/npu-work/llvm-aie/install/bin/clang
+  aiecc: /home/triple/npu-work/mlir-aie/install/bin/aiecc.py
+  template: /home/triple/npu-work/xdna-emu/tools/fuzz_template.py
+Generated 64 kernels, compiling with 16 threads...
+Compile: 64 ok, 0 error (10.9s, 16 threads)
+[1/64] seed 100 MISMATCH: element [2]: emulator=0, npu=2 (256 total elements)
+[2/64] seed 101 MISMATCH: element [0]: emulator=0, npu=110 (32 total elements)
+[3/64] seed 102 MISMATCH: element [0]: emulator=0, npu=63 (128 total elements)
+[4/64] seed 103 MATCH
+[5/64] seed 104 MISMATCH: element [0]: emulator=0, npu=-6 (256 total elements)
+[6/64] seed 105 MATCH
+[7/64] seed 106 MATCH
+[8/64] seed 107 MISMATCH: element [0]: emulator=0, npu=-35 (16 total elements)
+[9/64] seed 108 MISMATCH: element [0]: emulator=0, npu=1 (64 total elements)
+[10/64] seed 109 MISMATCH: element [1]: emulator=0, npu=1 (256 total elements)
+[11/64] seed 110 MISMATCH: element [2]: emulator=0, npu=2 (32 total elements)
+[12/64] seed 111 MATCH
+[13/64] seed 112 MISMATCH: element [0]: emulator=0, npu=1 (64 total elements)
+[14/64] seed 113 MATCH
+[15/64] seed 114 MISMATCH: element [0]: emulator=0, npu=47 (32 total elements)
+[16/64] seed 115 MISMATCH: element [1]: emulator=0, npu=-30 (256 total elements)
+[17/64] seed 116 MATCH
+[18/64] seed 117 MISMATCH: element [0]: emulator=0, npu=1 (128 total elements)
+[19/64] seed 118 MISMATCH: element [0]: emulator=0, npu=79 (256 total elements)
+[20/64] seed 119 MATCH
+[21/64] seed 120 MISMATCH: element [1]: emulator=0, npu=2 (16 total elements)
+[22/64] seed 121 MISMATCH: element [0]: emulator=0, npu=-126 (128 total elements)
+[23/64] seed 122 MISMATCH: element [0]: emulator=0, npu=1 (256 total elements)
+[24/64] seed 123 MISMATCH: element [0]: emulator=0, npu=-54 (64 total elements)
+[25/64] seed 124 MISMATCH: element [1]: emulator=0, npu=1 (128 total elements)
+[26/64] seed 125 MISMATCH: element [1]: emulator=0, npu=1 (32 total elements)
+[27/64] seed 126 MISMATCH: element [0]: emulator=0, npu=-47 (64 total elements)
+[28/64] seed 127 MISMATCH: element [0]: emulator=0, npu=-21 (16 total elements)
+[29/64] seed 128 MISMATCH: element [1]: emulator=0, npu=4 (32 total elements)
+[30/64] seed 129 MATCH
+[31/64] seed 130 MISMATCH: element [0]: emulator=0, npu=-348 (16 total elements)
+[32/64] seed 131 MISMATCH: element [0]: emulator=0, npu=113 (128 total elements)
+[33/64] seed 132 MISMATCH: element [0]: emulator=0, npu=73 (16 total elements)
+[34/64] seed 133 MISMATCH: element [1]: emulator=0, npu=1 (128 total elements)
+[35/64] seed 134 MISMATCH: element [0]: emulator=0, npu=117 (256 total elements)
+[36/64] seed 135 MATCH
+[37/64] seed 136 MISMATCH: element [1]: emulator=0, npu=2 (64 total elements)
+[38/64] seed 137 MISMATCH: element [0]: emulator=0, npu=1 (16 total elements)
+[39/64] seed 138 MATCH
+[40/64] seed 139 MISMATCH: element [0]: emulator=0, npu=1 (256 total elements)
+[41/64] seed 140 MISMATCH: element [1]: emulator=0, npu=2 (32 total elements)
+[42/64] seed 141 MATCH
+[43/64] seed 142 MISMATCH: element [2]: emulator=0, npu=2 (16 total elements)
+[44/64] seed 143 MISMATCH: element [0]: emulator=0, npu=-119 (128 total elements)
+[45/64] seed 144 MATCH
+[46/64] seed 145 MISMATCH: element [0]: emulator=0, npu=1 (16 total elements)
+[47/64] seed 146 MISMATCH: element [0]: emulator=0, npu=-12 (64 total elements)
+[48/64] seed 147 MISMATCH: element [0]: emulator=0, npu=21 (256 total elements)
+[49/64] seed 148 MISMATCH: element [0]: emulator=0, npu=-103 (64 total elements)
+[50/64] seed 149 MISMATCH: element [0]: emulator=0, npu=1 (256 total elements)
+[51/64] seed 150 MISMATCH: element [1]: emulator=0, npu=1 (32 total elements)
+[52/64] seed 151 MISMATCH: element [0]: emulator=0, npu=8 (128 total elements)
+[53/64] seed 152 MATCH
+[54/64] seed 153 MISMATCH: element [1]: emulator=0, npu=1 (32 total elements)
+[55/64] seed 154 MISMATCH: element [1]: emulator=0, npu=1 (128 total elements)
+[56/64] seed 155 MISMATCH: element [0]: emulator=0, npu=1 (16 total elements)
+[57/64] seed 156 MISMATCH: element [0]: emulator=0, npu=77 (128 total elements)
+[58/64] seed 157 MATCH
+[59/64] seed 158 MATCH
+[60/64] seed 159 MISMATCH: element [0]: emulator=0, npu=-89 (256 total elements)
+[61/64] seed 160 MISMATCH: element [0]: emulator=0, npu=-1 (128 total elements)
+[62/64] seed 161 MISMATCH: element [0]: emulator=0, npu=-32 (32 total elements)
+[63/64] seed 162 MISMATCH: element [0]: emulator=0, npu=-2944 (256 total elements)
+[64/64] seed 163 MISMATCH: element [0]: emulator=0, npu=7 (64 total elements)
+Execute: 15 pass, 49 fail, 0 error (126.9s)
+Fuzz complete: 15 pass, 49 fail, 0 error

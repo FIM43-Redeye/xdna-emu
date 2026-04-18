@@ -1,0 +1,24 @@
+{
+  "rust": {
+    "command": "rust-analyzer",
+    "args": [],
+    "extensionToLanguage": {
+      ".rs": "rust"
+    },
+    "startupTimeout": 120000,
+    "initializationOptions": {
+      "check": {
+        "command": "check",
+        "workspace": true
+      },
+      "cargo": {
+        "buildScripts": {
+          "enable": true
+        }
+      },
+      "diagnostics": {
+        "disabled": ["unlinked-file"]
+      }
+    }
+  }
+}

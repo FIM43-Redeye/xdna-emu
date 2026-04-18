@@ -1,0 +1,475 @@
+warning: unused variable: `host_memory`
+   --> src/npu/executor.rs:679:106
+    |
+679 |     fn check_dma_trigger(&mut self, col: u8, row: u8, offset: u32, value: u32, device: &mut DeviceState, host_memory: &mut HostMemory) {
+    |                                                                                                          ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_host_memory`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `instr_index` is never read
+  --> src/npu/executor.rs:47:9
+   |
+45 |     BlockedOnQueue {
+   |     -------------- field in this variant
+46 |         /// Index of the instruction that triggered the block (for logging).
+47 |         instr_index: usize,
+   |         ^^^^^^^^^^^
+   |
+   = note: `ExecutorState` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `state` is never used
+   --> src/npu/executor.rs:137:19
+    |
+118 | impl NpuExecutor {
+    | ---------------- method in this implementation
+...
+137 |     pub(crate) fn state(&self) -> &ExecutorState {
+    |                   ^^^^^
+
+warning: `xdna-emu` (lib) generated 3 warnings (run `cargo fix --lib -p xdna-emu` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 0.14s
+     Running `target/release/npu-test --suite=all --compiler=all --runtime=hw --rebuild -v`
+platform: npu1 (AIE2) -- features: ryzen_ai, ryzen_ai_npu1, peano, chess, valid_xchess_license, aiesimulator, xrt_python_bindings
+aietools: aietools at /home/triple/npu-work/aietools (elfanalyzer, xchesscc, aiesimulator, hwanalyze)
+build env: python=/home/triple/npu-work/mlir-aie/ironenv/bin/python3, aiecc=aiecc.py, peano=/home/triple/npu-work/llvm-aie/install, aietools at /home/triple/npu-work/aietools, test_lib
+hw: NPU available (native test.exe + npu-runner fallback)
+Discovering tests from source tree...
+pre-flight: 7 tests will be skipped
+  4 -- Requires NPU2
+  1 -- Multi-kernel sequential: parser support pending
+  1 -- Multi-kernel runlist: parser support pending
+  1 -- Multi-kernel transaction: parser support pending
+Found 72 tests in source tree
+
+=== BUILD PHASE ===
+Mode: --rebuild (forcing all rebuilds)
+65 tests (102 builds: 65 primary, 37 comparison), 7 skipped (skip-reason: 7, no chess: 0, no steps: 0)
+Building 102 tasks with 16 threads...
+[ 1/102] add_314_using_dma_op                     Peano built (0.9s)
+[ 2/102] add_21_i8_using_dma_op_with_padding      Peano built (0.9s)
+[ 3/102] add_blockwrite                           Peano built (1.0s)
+[ 4/102] add_378_i32_using_dma_op_with_padding    Peano built (1.1s)
+[ 5/102] add_12_i8_using_2d_dma_op_with_padding   Peano built (1.3s)
+[ 6/102] add_one_objFifo                          Peano built (0.9s)
+[ 7/102] add_one_objFifo_elf                      Peano built (0.9s)
+[ 8/102] add_maskwrite                            Peano built (2.3s)
+[ 9/102] add_one_using_dma                        Peano built (1.0s)
+[10/102] add_one_ctrl_packet                      Peano built (4.6s)
+[11/102] add_one_ctrl_packet_4_cores              Peano built (12.5s)
+[12/102] add_one_ctrl_packet_col_overlay          Peano built (12.7s)
+[13/102] add_21_i8_using_dma_op_with_padding      Chess built (40.4s)
+[14/102] adjacent_memtile_allocation/onelargefifo Chess built (37.8s)
+[15/102] add_one_objFifo_elf                      Chess built (41.0s)
+[16/102] add_maskwrite                            Chess built (43.3s)
+[17/102] core_dmas/dma_configure_task_lock        Peano built (1.2s)
+[18/102] adjacent_memtile_allocation/onelargefifo Chess built (41.3s)
+[19/102] core_dmas/dma_configure_task_token       Peano built (1.0s)
+[20/102] add_378_i32_using_dma_op_with_padding    Chess built (45.2s)
+[21/102] add_12_i8_using_2d_dma_op_with_padding   Chess built (45.5s)
+[22/102] add_one_objFifo                          Chess built (44.6s)
+[23/102] add_314_using_dma_op                     Chess built (46.3s)
+[24/102] add_one_using_dma                        Chess built (44.1s)
+[25/102] add_one_ctrl_packet                      Chess built (47.1s)
+[26/102] add_blockwrite                           Chess built (47.1s)
+[27/102] ctrl_packet_reconfig                     Peano built (2.9s)
+[28/102] ctrl_packet_reconfig_1x4_cores           Peano built (4.2s)
+[29/102] ctrl_packet_reconfig_elf                 Peano built (2.8s)
+[30/102] ctrl_packet_reconfig_4x1_cores           Peano built (4.9s)
+[31/102] dma_complex_dims                         Peano built (2.5s)
+[32/102] adjacent_memtile_allocation/twofifo_one_ Chess built (41.2s)
+[33/102] dma_task_large_linear                    Peano built (2.7s)
+[34/102] add_one_ctrl_packet_4_cores              Chess built (54.8s)
+[35/102] add_one_ctrl_packet_col_overlay          Chess built (54.2s)
+[36/102] dmabd_task_queue                         Peano built (1.4s)
+[37/102] column_specific                          Chess built (32.0s)
+[38/102] core_dmas/dma_configure_task_lock        Chess built (32.6s)
+[39/102] core_dmas/dma_configure_task_token       Chess built (31.6s)
+[40/102] device_width                             Chess built (30.8s)
+[41/102] dma_task_large_linear                    Chess built (35.5s)
+[42/102] dma_complex_dims                         Chess built (38.1s)
+[43/102] dmabd_task_queue                         Chess built (37.1s)
+[44/102] memtile_dmas/dma_configure_task_lock     Peano built (1.0s)
+[45/102] bd_chain_repeat_on_memtile               Chess built (86.7s)
+[46/102] memtile_dmas/dma_configure_task_token    Peano built (0.8s)
+[47/102] ctrl_packet_reconfig                     Chess built (68.2s)
+[48/102] ctrl_packet_reconfig_elf                 Chess built (66.8s)
+[49/102] ctrl_packet_reconfig_4x1_cores           Chess built (69.9s)
+[50/102] ctrl_packet_reconfig_1x4_cores           Chess built (71.3s)
+[51/102] memtile_dmas/blockwrite_using_locks      Chess built (32.3s)
+[52/102] memtile_dmas/dma_configure_task_lock     Chess built (31.2s)
+[53/102] objectfifo_repeat/compute_repeat         Peano built (1.7s)
+[54/102] memtile_dmas/dma_configure_task_token    Chess built (32.1s)
+[55/102] objectfifo_repeat/distribute_repeat      Peano built (1.8s)
+[56/102] dynamic_object_fifo/reduction            Chess built (80.3s)
+[57/102] dynamic_object_fifo/ping_pong            Chess built (80.5s)
+[58/102] dynamic_object_fifo/nested_loops         Chess built (82.4s)
+[59/102] objectfifo_repeat/init_values_repeat     Peano built (2.0s)
+[60/102] objectfifo_repeat/simple_repeat          Peano built (1.7s)
+[61/102] packet_flow                              Peano built (1.8s)
+[62/102] memtile_dmas/writebd                     Chess built (31.9s)
+[63/102] memtile_dmas/writebd_tokens              Chess built (31.5s)
+[64/102] packet_flow_fanin                        Peano built (2.0s)
+[65/102] packet_flow_fanout                       Peano built (1.8s)
+[66/102] nd_memcpy_linear_repeat                  Chess built (39.2s)
+[67/102] dynamic_object_fifo/sliding_window_condi Chess built (80.5s)
+[68/102] dynamic_object_fifo/sliding_window       Chess built (82.1s)
+[69/102] static_L1_init                           Peano built (1.4s)
+[70/102] dynamic_object_fifo/two_core_sliding_win Chess built (82.3s)
+[71/102] neighbor_tile_memory_access              Chess built (38.7s)
+[72/102] sync_task_complete_token                 Peano built (2.3s)
+[73/102] sync_task_complete_token_bd_chaining     Peano built (2.0s)
+[74/102] objectfifo_repeat/compute_repeat         Chess built (37.1s)
+[75/102] matrix_transpose                         Chess built (79.1s)
+[76/102] objectfifo_repeat/simple_repeat          Chess built (31.3s)
+[77/102] objectfifo_repeat/init_values_repeat     Chess built (37.6s)
+[78/102] packet_flow                              Chess built (33.8s)
+[79/102] objectfifo_repeat/distribute_repeat      Chess built (43.2s)
+[80/102] packet_flow_fanin                        Chess built (34.7s)
+[81/102] vec_vec_add_memtile_init                 Peano built (1.5s)
+[82/102] packet_flow_fanout                       Chess built (35.5s)
+[83/102] vec_vec_add_objfifo_init                 Peano built (1.5s)
+[84/102] tile_dmas/blockwrite_using_locks         Chess built (29.4s)
+[85/102] tile_dmas/writebd                        Chess built (28.9s)
+[86/102] vec_vec_add_tile_init                    Peano built (1.2s)
+[87/102] sync_task_complete_token                 Chess built (35.8s)
+[88/102] static_L1_init                           Chess built (38.1s)
+[89/102] nd_memcpy_transforms                     Chess built (77.8s)
+[90/102] tile_dmas/writebd_tokens                 Chess built (28.5s)
+[91/102] sync_task_complete_token_bd_chaining     Chess built (35.7s)
+[92/102] cascade_flows                            Chess built (158.8s)
+[93/102] vec_mul_event_trace                      Peano FAILED (33.8s): Peano build step 2/2 failed (exit 1):
+         log: build/logs/vec_mul_event_trace-peano.log
+[94/102] vec_vec_add_memtile_init                 Chess built (30.2s)
+[95/102] vec_vec_add_objfifo_init                 Chess built (27.4s)
+[96/102] vec_vec_add_tile_init                    Chess built (25.9s)
+[97/102] runtime_cumsum                           Chess built (63.6s)
+[98/102] tile_mapped_read                         Chess built (56.6s)
+[99/102] vec_mul_event_trace                      Chess built (51.9s)
+[100/102] two_col                                  Chess built (57.8s)
+[101/102] vector_scalar_using_dma                  Chess built (44.6s)
+[102/102] matrix_multiplication_using_cascade      Chess built (166.1s)
+
+Builds: 101/102 succeeded (36 Peano, 65 Chess) (245.0s)
+
+Native test.exe: 66 compiled, 0 failed
+
+Building 62 programming examples...
+
+=== BUILD PHASE ===
+Mode: --rebuild (forcing all rebuilds)
+43 tests (86 builds: 43 primary, 43 comparison), 19 skipped (skip-reason: 19, no chess: 0, no steps: 0)
+Building 86 tasks with 16 threads...
+[ 1/86] examples/basic/matrix_multiplication/mat Chess FAILED (0.1s): make: *** No rule to make target '../makefile-common'.  Stop.
+         log: build/logs/examples-basic-matrix_multiplication-matrix_vector-chess.log
+[ 2/86] examples/basic/dma_transpose_packet      Peano built (0.1s)
+[ 3/86] examples/basic/dma_transpose             Peano built (0.1s)
+[ 4/86] examples/basic/matrix_scalar_add         Chess built (0.1s)
+[ 5/86] examples/basic/dma_transpose_packet      Chess built (0.1s)
+[ 6/86] examples/basic/matrix_scalar_add         Peano built (0.1s)
+[ 7/86] examples/basic/dma_transpose             Chess built (0.1s)
+[ 8/86] examples/basic/passthrough_dmas          Peano built (0.1s)
+[ 9/86] examples/basic/passthrough_dmas          Chess built (0.1s)
+[10/86] examples/basic/passthrough_kernel        Peano built (0.1s)
+[11/86] examples/basic/passthrough_kernel        Chess built (0.1s)
+[12/86] examples/basic/passthrough_pykernel      Peano built (0.1s)
+[13/86] examples/basic/passthrough_pykernel      Chess built (0.1s)
+[14/86] examples/basic/memcpy                    Peano built (1.8s)
+[15/86] examples/basic/passthrough_dmas_plio     Peano FAILED (2.2s): Peano example build completed but no xclbin found in ../mlir-aie/programming_examples/basic/passthrough_dmas_plio/build
+         log: build/logs/examples-basic-passthrough_dmas_plio-peano.log
+[16/86] examples/basic/passthrough_dmas_plio     Chess FAILED (2.4s): Chess example build completed but no xclbin found in /home/triple/npu-work/xdna-emu/build/chess_examples/examples/basic/passthrough_dmas_plio/build
+         log: build/logs/examples-basic-passthrough_dmas_plio-chess.log
+[2026-02-28T06:23:56Z WARN  xdna_emu::integration::chess_build] Peano example build exited with 2 but xclbin was produced
+[17/86] examples/basic/packet_switch             Peano built (8.1s)
+[18/86] examples/basic/tiling_exploration/per_ti Peano built (0.1s)
+[2026-02-28T06:23:56Z WARN  xdna_emu::integration::chess_build] Chess example build exited with 2 but xclbin was produced
+[19/86] examples/basic/packet_switch             Chess built (8.2s)
+[20/86] examples/basic/tiling_exploration/per_ti Chess built (0.1s)
+[21/86] examples/basic/tiling_exploration/tile_g Peano built (0.1s)
+[2026-02-28T06:23:56Z WARN  xdna_emu::integration::chess_build] Peano example build exited with 2 but xclbin was produced
+[22/86] examples/basic/row_wise_bias_add         Peano built (8.0s)
+[23/86] examples/basic/tiling_exploration/tile_g Chess built (0.1s)
+[24/86] examples/basic/vector_reduce_add         Peano built (0.1s)
+[25/86] examples/basic/vector_reduce_add         Chess built (0.1s)
+[26/86] examples/basic/vector_reduce_max/multi_c Peano built (0.1s)
+[27/86] examples/basic/vector_reduce_max/multi_c Chess built (0.1s)
+[28/86] examples/basic/vector_reduce_max/single_ Peano built (0.1s)
+[29/86] examples/basic/vector_reduce_max/single_ Chess built (0.1s)
+[30/86] examples/basic/vector_reduce_max/single_ Peano built (0.1s)
+[31/86] examples/basic/vector_reduce_max/single_ Chess built (0.1s)
+[32/86] examples/basic/vector_reduce_min         Peano built (0.1s)
+[33/86] examples/basic/vector_reduce_min         Chess built (0.1s)
+[34/86] examples/basic/vector_scalar_add         Peano built (0.1s)
+[35/86] examples/basic/vector_scalar_add         Chess built (0.1s)
+[36/86] examples/basic/vector_scalar_add_runlist Peano built (0.1s)
+[37/86] examples/basic/vector_scalar_add_runlist Chess built (0.1s)
+[38/86] examples/basic/vector_scalar_mul         Peano built (0.1s)
+[39/86] examples/basic/vector_scalar_mul         Chess built (0.1s)
+[40/86] examples/basic/vector_vector_add_BDs_ini Peano built (0.1s)
+[41/86] examples/basic/vector_vector_add_BDs_ini Chess built (0.1s)
+[42/86] examples/basic/vector_vector_modulo      Peano built (0.1s)
+[43/86] examples/basic/vector_vector_modulo      Chess built (0.1s)
+[44/86] examples/basic/vector_vector_mul         Chess built (0.1s)
+[45/86] examples/basic/vector_vector_mul         Peano built (0.1s)
+[2026-02-28T06:23:57Z WARN  xdna_emu::integration::chess_build] Chess example build exited with 2 but xclbin was produced
+[46/86] examples/basic/row_wise_bias_add         Chess built (7.8s)
+[47/86] examples/ml/block_datatypes/bfp_conversi Chess FAILED (0.9s): Python: FileNotFoundError: [Errno 2] No such file or directory: '/home/triple/npu-work/a
+         log: build/logs/examples-ml-block_datatypes-bfp_conversion-chess.log
+[48/86] examples/ml/bottleneck                   Peano built (0.1s)
+[49/86] examples/ml/bottleneck                   Chess built (0.1s)
+[50/86] examples/ml/block_datatypes/vector_passt Peano FAILED (1.0s): error: /home/triple/npu-work/mlir-aie/programming_examples/ml/block_datatypes/ve
+         log: build/logs/examples-ml-block_datatypes-vector_passthrough-peano.log
+[51/86] examples/ml/block_datatypes/bfp_conversi Peano FAILED (1.1s): error: /home/triple/npu-work/mlir-aie/programming_examples/ml/block_datatypes/bf
+         log: build/logs/examples-ml-block_datatypes-bfp_conversion-peano.log
+[52/86] examples/ml/conv2d_fused_relu            Peano built (0.1s)
+[53/86] examples/ml/conv2d_fused_relu            Chess built (0.1s)
+[54/86] examples/ml/eltwise_add                  Peano built (0.1s)
+[55/86] examples/ml/eltwise_add                  Chess built (0.1s)
+[56/86] examples/ml/eltwise_mul                  Peano built (0.1s)
+[57/86] examples/ml/eltwise_mul                  Chess built (0.1s)
+[58/86] examples/ml/magika                       Peano FAILED (0.1s): Peano example build completed but no xclbin found in ../mlir-aie/programming_examples/ml/magika/build
+         log: build/logs/examples-ml-magika-peano.log
+[59/86] examples/ml/magika                       Chess built (0.1s)
+[60/86] examples/ml/resnet/layers_conv2_x        Peano built (0.1s)
+[61/86] examples/ml/resnet/layers_conv2_x        Chess built (0.1s)
+[62/86] examples/ml/scale_shift                  Peano built (0.1s)
+[63/86] examples/ml/block_datatypes/vector_passt Chess FAILED (0.9s): Python: FileNotFoundError: [Errno 2] No such file or directory: '/home/triple/npu-work/a
+         log: build/logs/examples-ml-block_datatypes-vector_passthrough-chess.log
+[64/86] examples/ml/scale_shift                  Chess built (0.1s)
+[65/86] examples/vision/color_detect             Peano built (0.1s)
+[66/86] examples/vision/color_threshold          Peano built (0.1s)
+[2026-02-28T06:23:59Z WARN  xdna_emu::integration::chess_build] Chess example build exited with 2 but xclbin was produced
+[67/86] examples/basic/combined_transpose        Chess built (11.4s)
+[68/86] examples/vision/edge_detect              Peano built (0.1s)
+[2026-02-28T06:23:59Z WARN  xdna_emu::integration::chess_build] Peano example build exited with 2 but xclbin was produced
+[69/86] examples/basic/combined_transpose        Peano built (11.8s)
+[70/86] examples/vision/vision_passthrough       Peano built (0.1s)
+[71/86] examples/ml/relu                         Peano built (2.2s)
+[2026-02-28T06:24:01Z WARN  xdna_emu::integration::chess_build] Peano example build exited with 2 but xclbin was produced
+[72/86] examples/basic/shuffle_transpose         Peano built (11.3s)
+[2026-02-28T06:24:02Z WARN  xdna_emu::integration::chess_build] Chess example build exited with 2 but xclbin was produced
+[73/86] examples/basic/shuffle_transpose         Chess built (11.2s)
+[2026-02-28T06:24:04Z WARN  xdna_emu::integration::chess_build] Chess example build exited with 2 but xclbin was produced
+[74/86] examples/basic/matrix_multiplication/cas Chess built (16.6s)
+[2026-02-28T06:24:04Z WARN  xdna_emu::integration::chess_build] Peano example build exited with 2 but xclbin was produced
+[75/86] examples/basic/matrix_multiplication/sin Peano built (16.8s)
+[2026-02-28T06:24:05Z WARN  xdna_emu::integration::chess_build] Peano example build exited with 2 but xclbin was produced
+[76/86] examples/basic/matrix_multiplication/mat Peano built (17.1s)
+[2026-02-28T06:24:05Z WARN  xdna_emu::integration::chess_build] Chess example build exited with 2 but xclbin was produced
+[77/86] examples/basic/matrix_multiplication/sin Chess built (17.4s)
+[2026-02-28T06:24:05Z WARN  xdna_emu::integration::chess_build] Peano example build exited with 2 but xclbin was produced
+[78/86] examples/basic/matrix_multiplication/cas Peano built (17.5s)
+[2026-02-28T06:24:05Z WARN  xdna_emu::integration::chess_build] Chess example build exited with 2 but xclbin was produced
+[79/86] examples/basic/matrix_multiplication/who Chess built (17.6s)
+[2026-02-28T06:24:05Z WARN  xdna_emu::integration::chess_build] Peano example build exited with 2 but xclbin was produced
+[80/86] examples/basic/matrix_multiplication/who Peano built (17.6s)
+[81/86] examples/basic/memcpy                    Chess built (23.6s)
+[82/86] examples/vision/vision_passthrough       Chess FAILED (19.7s): make: *** [Makefile:51: build/final_1920.xclbin] Error 255
+         log: build/logs/examples-vision-vision_passthrough-chess.log
+[83/86] examples/vision/color_threshold          Chess FAILED (22.6s): make: *** [Makefile:51: build/final_1920.xclbin] Error 255
+         log: build/logs/examples-vision-color_threshold-chess.log
+[84/86] examples/ml/relu                         Chess built (25.0s)
+[85/86] examples/vision/color_detect             Chess FAILED (26.7s): make: *** [Makefile:58: build/final_1920.xclbin] Error 255
+         log: build/logs/examples-vision-color_detect-chess.log
+[86/86] examples/vision/edge_detect              Chess FAILED (29.9s): make: *** [Makefile:60: build/final_1920.xclbin] Error 255
+         log: build/logs/examples-vision-edge_detect-chess.log
+
+Builds: 74/86 succeeded (39 Peano, 35 Chess) (41.3s)
+
+  examples test.exe: 32 compiled, 0 failed
+40 programming examples built
+8 pre-built examples added as fallback
+114 tests ready to run
+
+=== HARDWARE-ONLY MODE ===
+
+[ 1/114] add_12_i8_using_2d_dma_op_with_padd chess: PASS (4096/4096)   (0.3s)  peano: PASS (4096/4096)   (0.2s)
+[ 2/114] add_21_i8_using_dma_op_with_padding chess: PASS (64/64)       (0.2s)  peano: PASS (64/64)       (0.2s)
+[ 3/114] add_314_using_dma_op                chess: PASS (64/64)       (0.2s)  peano: PASS (64/64)       (0.2s)
+[ 4/114] add_378_i32_using_dma_op_with_paddi chess: PASS (64/64)       (0.1s)  peano: PASS (64/64)       (0.2s)
+[ 5/114] add_blockwrite                      chess: PASS (64/64)       (0.2s)  peano: PASS (64/64)       (0.2s)
+[ 6/114] add_maskwrite                       chess: PASS (8/8)         (0.1s) [UNEXPECTED PASS]  peano: PASS (8/8)         (0.1s) [UNEXPECTED PASS]
+[ 7/114] add_one_ctrl_packet                 chess: PASS (16/16)       (0.1s) [UNEXPECTED PASS]  peano: FAIL (6/16)        (0.1s) [XFAIL]
+[ 8/114] add_one_ctrl_packet_4_cores         chess: PASS (32/32)       (0.2s) [UNEXPECTED PASS]  peano: FAIL (12/32)       (0.2s) [XFAIL]
+[ 9/114] add_one_ctrl_packet_col_overlay     chess: PASS (32/32)       (0.2s) [UNEXPECTED PASS]  peano: FAIL (12/32)       (0.2s) [XFAIL]
+[10/114] add_one_objFifo                     chess: PASS (64/64)       (0.2s)  peano: PASS (64/64)       (0.2s)
+[11/114] add_one_objFifo_elf                 chess: PASS (64/64)       (0.2s)  peano: PASS (64/64)       (0.2s)
+[12/114] add_one_using_dma                   chess: PASS (64/64)       (0.2s)  peano: PASS (64/64)       (0.2s)
+[13/114] adjacent_memtile_allocation/onelarg chess: PASS (8/8)         (0.2s)
+[14/114] adjacent_memtile_allocation/onelarg chess: PASS (8/8)         (0.2s)
+[15/114] adjacent_memtile_allocation/twofifo chess: PASS (64000/64000) (0.2s)
+[16/114] bd_chain_repeat_on_memtile          chess: PASS               (0.2s)
+[17/114] cascade_flows                       chess: PASS (64/64)       (0.2s)
+[18/114] column_specific                     chess: PASS               (0.2s)
+[19/114] core_dmas/dma_configure_task_lock   chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[20/114] core_dmas/dma_configure_task_token  chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[21/114] ctrl_packet_reconfig                
+[22/114] ctrl_packet_reconfig_1x4_cores      
+[23/114] ctrl_packet_reconfig_4x1_cores      
+[24/114] ctrl_packet_reconfig_elf            
+[25/114] device_width                        chess: PASS               (0.1s)
+  (test 26 error, device recovered via TDR -- continuing)
+  (test 26 error, device recovered via TDR -- continuing)
+[26/114] dma_complex_dims                    chess: SIGNAL (SIGABRT)   (1.1s) [XFAIL]  peano: SIGNAL (SIGABRT)   (1.1s) [XFAIL]
+[27/114] dma_task_large_linear               chess: PASS               (0.3s) [UNEXPECTED PASS]  peano: PASS               (0.1s) [UNEXPECTED PASS]
+[28/114] dmabd_task_queue                    chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[29/114] dynamic_object_fifo/nested_loops    chess: PASS               (0.1s)
+[30/114] dynamic_object_fifo/ping_pong       chess: PASS               (0.2s)
+[31/114] dynamic_object_fifo/reduction       chess: PASS               (0.1s)
+[32/114] dynamic_object_fifo/sliding_window  chess: PASS               (0.2s)
+[33/114] dynamic_object_fifo/sliding_window_ chess: PASS               (0.2s)
+[34/114] dynamic_object_fifo/two_core_slidin chess: PASS               (0.2s)
+[35/114] matrix_multiplication_using_cascade chess: PASS               (0.2s)
+[36/114] matrix_multiplication_using_cascade chess: PASS               (0.2s)
+[37/114] matrix_multiplication_using_cascade chess: PASS               (0.2s)
+[38/114] matrix_transpose                    chess: PASS               (0.2s)
+[39/114] memtile_dmas/blockwrite_using_locks chess: PASS               (0.2s)
+[40/114] memtile_dmas/dma_configure_task_loc chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[41/114] memtile_dmas/dma_configure_task_tok chess: PASS               (0.2s)  peano: PASS               (0.1s)
+[42/114] memtile_dmas/writebd                chess: PASS               (0.2s)
+[43/114] memtile_dmas/writebd_tokens         chess: PASS               (0.2s)
+[44/114] nd_memcpy_linear_repeat             chess: PASS               (0.2s)
+[45/114] nd_memcpy_transforms                chess: PASS               (0.2s)
+[46/114] neighbor_tile_memory_access         chess: PASS (1024/1024)   (0.2s) [UNEXPECTED PASS]
+[47/114] objectfifo_repeat/compute_repeat    chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[48/114] objectfifo_repeat/distribute_repeat chess: FAIL (0/28654)     (0.2s) [XFAIL]  peano: FAIL (0/28654)     (0.2s) [XFAIL]
+[49/114] objectfifo_repeat/init_values_repea chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[50/114] objectfifo_repeat/simple_repeat     chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[51/114] packet_flow                         chess: PASS (4096/4096)   (0.2s)  peano: PASS (4096/4096)   (0.2s)
+[52/114] packet_flow_fanin                   chess: PASS (8192/8192)   (0.1s)  peano: PASS (8192/8192)   (0.2s)
+[53/114] packet_flow_fanout                  chess: PASS (8192/8192)   (0.2s)  peano: PASS (8192/8192)   (0.2s)
+[54/114] runtime_cumsum                      chess: PASS               (0.2s)
+[55/114] static_L1_init                      chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[56/114] sync_task_complete_token            chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[57/114] sync_task_complete_token_bd_chainin chess: PASS               (0.2s)  peano: PASS               (0.1s)
+[58/114] tile_dmas/blockwrite_using_locks    chess: PASS               (0.2s)
+[59/114] tile_dmas/writebd                   chess: PASS               (0.2s)
+[60/114] tile_dmas/writebd_tokens            chess: PASS               (0.2s)
+[61/114] tile_mapped_read                    chess: PASS (64/64)       (0.2s)
+[62/114] two_col                             chess: PASS (8192/8192)   (0.2s)
+[63/114] vec_vec_add_memtile_init            chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[64/114] vec_vec_add_objfifo_init            chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[65/114] vec_vec_add_tile_init               chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[66/114] vector_scalar_using_dma             chess: PASS (4096/4096)   (0.2s)
+  (test 67 error, device recovered via TDR -- continuing)
+  (test 67 error, device recovered via TDR -- continuing)
+[67/114] examples/basic/combined_transpose   chess: SIGNAL (SIGSEGV)   (1.3s)  peano: SIGNAL (SIGSEGV)   (1.4s)
+  (test 68 error, device recovered via TDR -- continuing)
+  (test 68 error, device recovered via TDR -- continuing)
+[68/114] examples/basic/dma_transpose        chess: ERROR (unknown error) (0.3s)  peano: ERROR (unknown error) (0.3s)
+  (test 69 error, device recovered via TDR -- continuing)
+  (test 69 error, device recovered via TDR -- continuing)
+[69/114] examples/basic/dma_transpose_packet chess: ERROR (unknown error) (0.2s)  peano: ERROR (unknown error) (0.3s)
+[70/114] examples/basic/matrix_multiplicatio chess: FAIL (0/1)         (1.8s)  peano: FAIL (0/1)         (1.7s)
+[71/114] examples/basic/matrix_multiplicatio peano: FAIL (0/1)         (1.0s)
+[72/114] examples/basic/matrix_multiplicatio chess: FAIL (0/1)         (1.6s)  peano: FAIL (0/1)         (1.6s)
+[73/114] examples/basic/matrix_multiplicatio chess: FAIL (0/1)         (1.6s)  peano: FAIL (0/1)         (1.7s)
+[74/114] examples/basic/matrix_scalar_add    chess: PASS               (0.2s)  peano: PASS               (0.2s)
+  (test 75 error, device recovered via TDR -- continuing)
+  (test 75 error, device recovered via TDR -- continuing)
+[75/114] examples/basic/memcpy               chess: ERROR (unknown error) (0.1s)  peano: SIGNAL (SIGSEGV)   (1.3s)
+  (test 76 error, device recovered via TDR -- continuing)
+[76/114] examples/basic/packet_switch/add    peano: SIGNAL (SIGABRT)   (1.1s)
+  (test 77 error, device recovered via TDR -- continuing)
+[77/114] examples/basic/packet_switch/mult   peano: SIGNAL (SIGABRT)   (1.1s)
+[78/114] examples/basic/passthrough_dmas     chess: PASS               (0.3s)  peano: PASS               (0.2s)
+[79/114] examples/basic/passthrough_kernel   chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[80/114] examples/basic/passthrough_pykernel chess: PASS               (0.1s)  peano: PASS               (0.2s)
+  (test 81 error, device recovered via TDR -- continuing)
+  (test 81 error, device recovered via TDR -- continuing)
+[81/114] examples/basic/row_wise_bias_add    chess: SIGNAL (SIGABRT)   (1.1s)  peano: SIGNAL (SIGABRT)   (1.1s)
+  (test 82 error, device recovered via TDR -- continuing)
+  (test 82 error, device recovered via TDR -- continuing)
+[82/114] examples/basic/shuffle_transpose    chess: ERROR (unknown error) (0.3s)  peano: ERROR (unknown error) (0.3s)
+[83/114] examples/basic/tiling_exploration/per_tile    SKIP (no buffer spec or test.exe)
+[84/114] examples/basic/tiling_exploration/tile_group  SKIP (no buffer spec or test.exe)
+[85/114] examples/basic/vector_reduce_add    chess: PASS               (0.3s)  peano: PASS               (0.2s)
+[86/114] examples/basic/vector_reduce_max/multi_column SKIP (no buffer spec or test.exe)
+[87/114] examples/basic/vector_reduce_max/single_colum SKIP (no buffer spec or test.exe)
+[88/114] examples/basic/vector_reduce_max/single_core_ SKIP (no buffer spec or test.exe)
+[89/114] examples/basic/vector_reduce_min    chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[90/114] examples/basic/vector_scalar_add    chess: PASS (1024/1024)   (0.2s)  peano: PASS (1024/1024)   (0.1s)
+  (test 91 error, device recovered via TDR -- continuing)
+  (test 91 error, device recovered via TDR -- continuing)
+[91/114] examples/basic/vector_scalar_add_ru chess: SIGNAL (SIGABRT)   (1.2s)  peano: SIGNAL (SIGABRT)   (1.3s)
+[92/114] examples/basic/vector_scalar_mul    chess: PASS               (0.3s)  peano: PASS               (0.2s)
+[93/114] examples/basic/vector_vector_add_BD chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[94/114] examples/basic/vector_vector_modulo chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[95/114] examples/basic/vector_vector_mul    chess: PASS               (0.2s)  peano: PASS               (0.1s)
+[96/114] examples/ml/bottleneck                        SKIP (no buffer spec or test.exe)
+[97/114] examples/ml/conv2d_fused_relu                 SKIP (no buffer spec or test.exe)
+[98/114] examples/ml/eltwise_add             chess: PASS               (0.2s)  peano: PASS               (0.2s)
+[99/114] examples/ml/eltwise_mul             chess: PASS               (0.2s)  peano: PASS               (0.2s)
+  (test 100 error, device recovered via TDR -- continuing)
+  (test 100 error, device recovered via TDR -- continuing)
+[100/114] examples/ml/relu                    chess: ERROR (unknown error) (0.2s)  peano: ERROR (unknown error) (0.3s)
+[101/114] examples/ml/resnet/layers_conv2_x             SKIP (no buffer spec or test.exe)
+[102/114] examples/ml/scale_shift             chess: PASS               (0.3s)  peano: PASS               (0.2s)
+  (test 103 error, device recovered via TDR -- continuing)
+[103/114] examples/vision/color_detect        peano: SIGNAL (SIG?)      (0.5s)
+  (test 104 error, device recovered via TDR -- continuing)
+[104/114] examples/vision/color_threshold     peano: SIGNAL (SIGSEGV)   (1.4s)
+  (test 105 error, device recovered via TDR -- continuing)
+[105/114] examples/vision/edge_detect         peano: SIGNAL (SIG?)      (0.4s)
+[106/114] examples/vision/vision_passthrough  peano: PASS               (0.4s)
+  (test 107 error, device recovered via TDR -- continuing)
+[107/114] examples/basic/chaining_channels    peano: ERROR (npu-runner failed (exit code Some(1)): Opening device 0...)
+[108/114] examples/basic/vector_exp           peano: PASS (64/64)       (0.3s)
+[109/114] examples/ml/conv2d                            SKIP (no buffer spec or test.exe)
+[110/114] examples/ml/gelu                    peano: DONE (no validation) (0.2s)
+[111/114] examples/ml/rope                              SKIP (no buffer spec or test.exe)
+[112/114] examples/ml/silu                    peano: DONE (no validation) (0.2s)
+[113/114] examples/ml/softmax                 peano: DONE (no validation) (0.2s)
+[114/114] examples/ml/swiglu                  peano: DONE (no validation) (0.2s)
+
+============================================================
+=== UNIT TESTS (chess_compiler_tests_aie2) ===
+
+Found 10 unit tests
+
+--- Unit Test Build Phase (10 tests) ---
+[ 1/10] 01_precompiled_core_function                            cached (0.0s)
+[ 2/10] 02_precompiled_kernel                                   cached (0.0s)
+[ 3/10] 03_cascade_core_functions                               cached (0.0s)
+[ 4/10] 03_simple                                               cached (0.0s)
+[ 5/10] 04_shared_memory                                        SKIP (XFAIL in both aie.mlir and aie_row.mlir)
+[ 6/10] 04_shim_dma_kernel                                      SKIP (FIXME: this hangs)
+[ 7/10] 05_shim_dma_core_function                               SKIP (FIXME: this hangs in simulation)
+[ 8/10] 07_shim_dma_core_function_with_loop                     SKIP (XFAIL)
+[ 9/10] 08_tile_locks                                           cached (0.0s)
+[10/10] 09_memtile_locks                                        cached (0.0s)
+Unit test builds: 6/6 succeeded (0.0s)
+
+--- Unit Test Simulation Phase (6 tests) ---
+[ 1/6] 01_precompiled_core_function...                                                            [ 1/6] 01_precompiled_core_function                            PASS (25.1s)
+[ 2/6] 02_precompiled_kernel...                                                            [ 2/6] 02_precompiled_kernel                                   PASS (25.0s)
+[ 3/6] 03_cascade_core_functions...                                                            [ 3/6] 03_cascade_core_functions                               PASS (25.2s)
+[ 4/6] 03_simple...                                                            [ 4/6] 03_simple                                               PASS (25.1s)
+[ 5/6] 08_tile_locks...                                                            [ 5/6] 08_tile_locks                                           PASS (25.1s)
+[ 6/6] 09_memtile_locks...                                                            [ 6/6] 09_memtile_locks                                        PASS (44.8s)
+                                                            
+============================================================
+=== HARDWARE-ONLY SUMMARY ===
+Total:            114
+Skipped:          10 (no buffer spec or insts.bin)
+
+=== LIVE HARDWARE EXECUTION ===
+Peano HW:         43/70 pass, 7 fail, 15 error  (5 expected fail)  (2 unexpected pass)
+Chess HW:         74/87 pass, 2 fail, 9 error  (2 expected fail)  (6 unexpected pass)
+
+=== DIFFERENTIAL (Peano vs Chess on HW) ===
+Compared:         57
+Both pass:        41
+Chess only:       3 (Peano bug?)
+Both fail:        13 (test issue?) (2 XFAIL)
+
+=== UNIT TESTS ===
+Discovered:       10
+Skipped:          4
+Built:            6
+Build Failed:     0
+Simulated:        6
+Sim Pass:         6
+Sim Fail:         0
+Sim Error:        0
+Results written to build/results.json

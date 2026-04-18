@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "aietools": {
+      "command": "python3",
+      "args": ["tools/aietools-mcp-server.py"],
+      "env": {
+        "AIETOOLS_DIR": "/home/triple/npu-work/aietools",
+        "XILINXD_LICENSE_FILE": "/home/triple/.Xilinx/Xilinx.lic"
+      }
+    }
+  }
+}

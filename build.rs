@@ -30,7 +30,7 @@
 //! - `gen_aiert_ports.rs`   -- aie-rt port module data (included by `aiert_validation`)
 //! - `gen_tablegen.rs`      -- complete instruction decoder tables (included by `tablegen` module)
 
-#[path = "build_helpers/mod.rs"]
+#[path = "crates/xdna-archspec/build_helpers/mod.rs"]
 mod build_helpers;
 
 use std::collections::HashMap;
@@ -147,7 +147,7 @@ fn main() {
     // Rebuild triggers for build_helpers source files
     for helper in &["mod.rs", "extract.rs", "records.rs", "semantics.rs",
                      "cpp_switch.rs", "bytecode.rs", "codegen.rs"] {
-        println!("cargo:rerun-if-changed=build_helpers/{}", helper);
+        println!("cargo:rerun-if-changed=crates/xdna-archspec/build_helpers/{}", helper);
     }
 
     let aie2_td = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2.td");
