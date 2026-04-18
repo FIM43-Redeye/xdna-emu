@@ -25,7 +25,7 @@
 //! conflict on the store port.
 
 use crate::interpreter::bundle::{SlotIndex, SlotOp, VliwBundle};
-use crate::tablegen::SemanticOp;
+use xdna_archspec::aie2::isa::SemanticOp;
 
 /// Execution resources that can cause structural hazards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -211,7 +211,7 @@ pub fn bundle_structural_penalty(bundle: &VliwBundle) -> u8 {
 mod tests {
     use super::*;
     use crate::interpreter::bundle::PostModify;
-    use crate::tablegen::SemanticOp;
+    use xdna_archspec::aie2::isa::SemanticOp;
 
     #[test]
     fn test_no_conflict_independent_slots() {

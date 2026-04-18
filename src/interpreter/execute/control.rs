@@ -51,7 +51,7 @@
 
 use crate::device::tile::{Lock, Tile, LockResult};
 use crate::interpreter::bundle::{BranchCondition, Operand, SlotOp};
-use crate::tablegen::SemanticOp;
+use xdna_archspec::aie2::isa::SemanticOp;
 use crate::interpreter::state::ExecutionContext;
 
 /// Neighbor lock slices for cross-tile lock routing.
@@ -569,7 +569,7 @@ impl ControlUnit {
 mod tests {
     use super::*;
     use crate::interpreter::bundle::SlotIndex;
-    use crate::tablegen::SemanticOp;
+    use xdna_archspec::aie2::isa::SemanticOp;
 
     fn make_ctx() -> ExecutionContext {
         ExecutionContext::new()

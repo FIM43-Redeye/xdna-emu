@@ -26,7 +26,7 @@
 //! Because our register file stores 8 x u32 words, the caller is responsible
 //! for writing the result to the appropriate accumulator register(s).
 
-use crate::tablegen::ElementType;
+use xdna_archspec::aie2::isa::ElementType;
 
 /// UPS scale modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -826,7 +826,7 @@ mod integration_tests {
     use crate::interpreter::execute::vector_ups::ups_vector_to_acc;
     use crate::interpreter::execute::vector_ups::ups_vector_to_acc_wide;
     use crate::interpreter::state::{ExecutionContext, SrsConfig};
-    use crate::tablegen::SemanticOp;
+    use xdna_archspec::aie2::isa::SemanticOp;
 
     fn make_ctx() -> ExecutionContext {
         ExecutionContext::new()

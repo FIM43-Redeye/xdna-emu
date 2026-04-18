@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use crate::tablegen::{DecoderIndex, InstrEncoding, decoder_bytecode, decoder_ffi};
+use xdna_archspec::aie2::isa::{DecoderIndex, InstrEncoding, decoder_bytecode, decoder_ffi};
 
 use super::decoder::InstructionDecoder;
 
@@ -56,7 +56,7 @@ impl InstructionDecoder {
     /// All instruction encodings, decoder bytecode, and metadata were extracted
     /// from llvm-aie at compile time. No filesystem access required at runtime.
     fn load_from_generated() -> Self {
-        let output = crate::tablegen::load_from_generated();
+        let output = xdna_archspec::aie2::isa::load_from_generated();
 
         // Build data-driven format table from composite format Inst fields
         let format_table = if output.composite_formats.iter().any(|f| !f.slot_maps.is_empty()) {

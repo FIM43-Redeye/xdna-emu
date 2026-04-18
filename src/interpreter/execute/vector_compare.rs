@@ -615,7 +615,7 @@ impl VectorAlu {
 mod tests {
     use super::*;
     use crate::interpreter::bundle::{SlotIndex, Operand, ElementType};
-    use crate::tablegen::SemanticOp;
+    use xdna_archspec::aie2::isa::SemanticOp;
 
     fn make_ctx() -> ExecutionContext {
         ExecutionContext::new()

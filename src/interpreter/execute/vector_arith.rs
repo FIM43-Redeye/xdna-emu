@@ -5,7 +5,7 @@
 
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::state::ExecutionContext;
-use crate::tablegen::SemanticOp;
+use xdna_archspec::aie2::isa::SemanticOp;
 
 use super::vector_dispatch::VectorAlu;
 
@@ -1477,14 +1477,14 @@ impl VectorAlu {
         op: &SlotOp,
         ctx: &mut ExecutionContext,
         et: ElementType,
-        semantic: crate::tablegen::SemanticOp,
+        semantic: xdna_archspec::aie2::isa::SemanticOp,
     ) -> bool {
         let has_acc_source = op.sources.iter().any(|s| matches!(s, Operand::AccumReg(_)));
 
         if has_acc_source {
             // VADD/VSUB/VNEGADD/VNEGSUB: accumulator-to-accumulator
             Self::execute_acc_add_sub(op, ctx);
-        } else if matches!(semantic, crate::tablegen::SemanticOp::NegAdd) {
+        } else if matches!(semantic, xdna_archspec::aie2::isa::SemanticOp::NegAdd) {
             // Regular vector negate-add (no accumulator involvement).
             if op.is_wide_vector {
                 let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
@@ -1785,7 +1785,7 @@ mod tests {
     use super::*;
     use crate::interpreter::bundle::{ElementType, Operand, SlotIndex, SlotOp};
     use crate::interpreter::state::ExecutionContext;
-    use crate::tablegen::SemanticOp;
+    use xdna_archspec::aie2::isa::SemanticOp;
 
     fn make_ctx() -> ExecutionContext {
         ExecutionContext::new()

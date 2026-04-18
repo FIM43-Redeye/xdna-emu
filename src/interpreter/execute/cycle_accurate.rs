@@ -27,7 +27,7 @@
 
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{Operand, SlotOp, VliwBundle};
-use crate::tablegen::SemanticOp;
+use xdna_archspec::aie2::isa::SemanticOp;
 use crate::interpreter::state::{EventType, ExecutionContext};
 use crate::interpreter::timing::{
     HazardDetector, HazardStats, LatencyTable, MemoryAccess, MemoryModel,
@@ -601,7 +601,7 @@ pub struct CycleAccurateStats {
 mod tests {
     use super::*;
     use crate::interpreter::bundle::{MemWidth, Operand, SlotIndex};
-    use crate::tablegen::SemanticOp;
+    use xdna_archspec::aie2::isa::SemanticOp;
 
     fn make_bundle(ops: Vec<SlotOp>) -> VliwBundle {
         let mut bundle = VliwBundle::empty();

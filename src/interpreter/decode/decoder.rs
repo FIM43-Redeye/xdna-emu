@@ -26,7 +26,7 @@ use crate::interpreter::bundle::{
     extract_slots,
 };
 use crate::interpreter::traits::{DecodeError, Decoder};
-use crate::tablegen::{
+use xdna_archspec::aie2::isa::{
     DecoderIndex, InstrEncoding, SemanticOp,
     decoder_ffi,
 };
@@ -497,7 +497,7 @@ impl Decoder for InstructionDecoder {
 mod tests {
     use super::*;
     use crate::interpreter::bundle::ElementType;
-    use crate::tablegen::OperandField;
+    use xdna_archspec::aie2::isa::OperandField;
     use std::path::Path;
 
     #[test]
@@ -964,7 +964,7 @@ mod tests {
     /// instructions in the same slots.
     #[test]
     fn test_vector_load_channel_by_slot() {
-        use crate::tablegen::{AddressingMode, InstrMemWidth};
+        use xdna_archspec::aie2::isa::{AddressingMode, InstrMemWidth};
         let decoder = InstructionDecoder::new();
 
         // Helper to build a minimal Load encoding for the given slot+is_vector
@@ -1043,7 +1043,7 @@ mod tests {
     /// the is_ptr_arithmetic field (not mnemonic checking).
     #[test]
     fn test_padd_dest_is_pointer() {
-        use crate::tablegen::{AddressingMode, InstrMemWidth, OperandType, RegisterKind};
+        use xdna_archspec::aie2::isa::{AddressingMode, InstrMemWidth, OperandType, RegisterKind};
 
         let decoder = InstructionDecoder::new();
 
@@ -1181,7 +1181,7 @@ mod tests {
 
     /// Helper: create a minimal vector encoding with the given mnemonic.
     fn make_vec_encoding(mnemonic: &str) -> InstrEncoding {
-        use crate::tablegen::{AddressingMode, InstrMemWidth};
+        use xdna_archspec::aie2::isa::{AddressingMode, InstrMemWidth};
         InstrEncoding {
             name: mnemonic.to_uppercase().replace('.', "_"),
             mnemonic: mnemonic.to_string(),
@@ -1200,7 +1200,7 @@ mod tests {
             addressing_mode: AddressingMode::Unknown,
             mem_width: InstrMemWidth::Word,
             has_complete_decoder: true,
-            element_type: crate::tablegen::infer_element_type(mnemonic),
+            element_type: xdna_archspec::aie2::isa::infer_element_type(mnemonic),
             from_type: None,
             branch_condition: None,
             is_vector: true,
@@ -1422,7 +1422,7 @@ mod tests {
     #[test]
     fn test_ffi_vs_legacy_operand_crosscheck() {
         use crate::interpreter::bundle::SlotType;
-        use crate::tablegen::AddressingMode;
+        use xdna_archspec::aie2::isa::AddressingMode;
 
         // Find ELF files from fuzz dir (recursive) or ISA test harness.
         let mut elf_paths = Vec::new();
@@ -1623,7 +1623,7 @@ mod tests {
     #[ignore]
     fn test_llvm_postmodify_operand_layout() {
         use crate::interpreter::bundle::SlotType;
-        use crate::tablegen::AddressingMode;
+        use xdna_archspec::aie2::isa::AddressingMode;
 
         // Find post-modify load instructions in ELF files.
         let mut elf_paths = Vec::new();
@@ -1698,8 +1698,8 @@ mod tests {
 
                         let key = format!("{} nd={} ops={:?}", enc_name, raw.num_defs,
                             raw.operands.iter().map(|o| match o {
-                                crate::tablegen::decoder_ffi::DecodedOperand::Reg { name, .. } => format!("Reg({})", name),
-                                crate::tablegen::decoder_ffi::DecodedOperand::Imm(v) => format!("Imm({})", v),
+                                xdna_archspec::aie2::isa::decoder_ffi::DecodedOperand::Reg { name, .. } => format!("Reg({})", name),
+                                xdna_archspec::aie2::isa::decoder_ffi::DecodedOperand::Imm(v) => format!("Imm({})", v),
                             }).collect::<Vec<_>>()
                         );
                         if seen.insert(key.clone()) {
@@ -1958,8 +1958,8 @@ mod tests {
 
         // Also check ST slot FFI decode directly
         let st_bits: u64 = 0x000001;
-        let ffi_result = crate::tablegen::decoder_ffi::decode_slot(
-            crate::tablegen::decoder_ffi::Slot::St, st_bits);
+        let ffi_result = xdna_archspec::aie2::isa::decoder_ffi::decode_slot(
+            xdna_archspec::aie2::isa::decoder_ffi::Slot::St, st_bits);
         if let Some(result) = &ffi_result {
             eprintln!("ST FFI: name={} num_defs={} operands={:?}",
                 result.name, result.num_defs, result.operands);
@@ -1995,8 +1995,8 @@ mod tests {
 
         // Also try direct FFI decode
         let st_bits: u64 = 0x000007;
-        let ffi_result = crate::tablegen::decoder_ffi::decode_slot(
-            crate::tablegen::decoder_ffi::Slot::St, st_bits);
+        let ffi_result = xdna_archspec::aie2::isa::decoder_ffi::decode_slot(
+            xdna_archspec::aie2::isa::decoder_ffi::Slot::St, st_bits);
         if let Some(result) = &ffi_result {
             eprintln!("ST FFI: name={} num_defs={} operands={:?}",
                 result.name, result.num_defs, result.operands);
@@ -2025,11 +2025,11 @@ mod tests {
                 || enc.mnemonic == "movx" || enc.mnemonic == "movxm")
             && !enc.is_vector
         {
-            Some(crate::tablegen::SemanticOp::Copy)
+            Some(xdna_archspec::aie2::isa::SemanticOp::Copy)
         } else {
             enc.semantic
         };
-        assert_eq!(effective_semantic, Some(crate::tablegen::SemanticOp::Copy),
+        assert_eq!(effective_semantic, Some(xdna_archspec::aie2::isa::SemanticOp::Copy),
             "MOVX_mvx_scl should get Copy semantic from mnemonic fallback");
     }
 }

@@ -32,7 +32,7 @@ use helpers::*;
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::execute::vector_config::{AccWidth, MatMulConfig};
 use crate::interpreter::state::{ExecutionContext, Vec512, Acc1024};
-use crate::tablegen::SemanticOp;
+use xdna_archspec::aie2::isa::SemanticOp;
 
 // ---------------------------------------------------------------------------
 // Entry point: execute_matmul

@@ -17,7 +17,7 @@ use super::vector_srs::{self, RoundingMode};
 use super::vector_ups;
 use super::VectorAlu;
 use crate::interpreter::bundle::{ElementType, Operand, SlotIndex, SlotOp};
-use crate::tablegen::SemanticOp;
+use xdna_archspec::aie2::isa::SemanticOp;
 use crate::interpreter::state::ExecutionContext;
 
 // ---------------------------------------------------------------------------

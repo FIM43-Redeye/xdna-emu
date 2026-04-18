@@ -5,5 +5,5 @@
 //! decoding is handled by `decoder.rs` using the encoder formulas from
 //! `AIE2MCCodeEmitterRegOperandDef.h` in llvm-aie.
 //!
-//! The `CompositeEncoder` enum lives in `crate::tablegen` and is imported
-//! directly by the decoder.
+//! The `CompositeEncoder` enum lives in `xdna_archspec::aie2::isa` and is
+//! imported directly by the decoder.

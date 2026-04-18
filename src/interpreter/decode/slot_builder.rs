@@ -4,7 +4,7 @@
 //! element type, memory width, implicit registers, etc.).
 
 use crate::interpreter::bundle::{MemWidth, Operand, PostModify, SlotIndex, SlotOp};
-use crate::tablegen::{
+use xdna_archspec::aie2::isa::{
     CompositeEncoder, InstrMemWidth, OperandType, RegisterKind, SemanticOp,
 };
 

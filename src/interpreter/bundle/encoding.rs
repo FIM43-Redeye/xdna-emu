@@ -279,7 +279,7 @@ pub fn is_nop_encoding(word: u32) -> bool {
 /// # Panics
 ///
 /// Panics if a parsed format size doesn't correspond to any known BundleFormat.
-pub fn validate_bundle_formats(formats: &[crate::tablegen::CompositeFormatDef]) {
+pub fn validate_bundle_formats(formats: &[xdna_archspec::aie2::isa::CompositeFormatDef]) {
     // Collect all parsed format sizes
     let known_sizes: &[u8] = &[2, 4, 6, 8, 10, 12, 14, 16];
 
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_validate_bundle_formats_with_live_data() {
-        let output = crate::tablegen::load_from_generated();
+        let output = xdna_archspec::aie2::isa::load_from_generated();
 
         // Should not panic
         validate_bundle_formats(&output.composite_formats);

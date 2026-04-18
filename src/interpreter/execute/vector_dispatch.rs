@@ -5,7 +5,7 @@
 
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::state::ExecutionContext;
-use crate::tablegen::SemanticOp;
+use xdna_archspec::aie2::isa::SemanticOp;
 
 /// Vector ALU execution unit.
 pub struct VectorAlu;

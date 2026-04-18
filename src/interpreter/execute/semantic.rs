@@ -62,7 +62,7 @@
 use crate::interpreter::bundle::{Operand, SlotIndex, SlotOp, SelectVariant};
 use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::traits::Flags;
-use crate::tablegen::SemanticOp;
+use xdna_archspec::aie2::isa::SemanticOp;
 
 /// Execute a SlotOp using its SemanticOp if available.
 ///
@@ -909,7 +909,7 @@ mod tests {
     use super::*;
     use crate::interpreter::bundle::SlotIndex;
     use crate::interpreter::bundle::SelectVariant;
-    use crate::tablegen::ImplicitReg;
+    use xdna_archspec::aie2::isa::ImplicitReg;
     use smallvec::smallvec;
 
     fn make_test_context() -> ExecutionContext {

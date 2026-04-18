@@ -1211,7 +1211,7 @@ mod integration_tests {
     use crate::interpreter::bundle::{ElementType, Operand, SlotIndex, SlotOp};
     use crate::interpreter::execute::vector_dispatch::VectorAlu;
     use crate::interpreter::state::{ExecutionContext, SrsConfig};
-    use crate::tablegen::SemanticOp;
+    use xdna_archspec::aie2::isa::SemanticOp;
 
     fn make_ctx() -> ExecutionContext {
         ExecutionContext::new()

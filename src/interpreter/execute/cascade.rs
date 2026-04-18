@@ -24,7 +24,7 @@
 
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{Operand, SlotOp};
-use crate::tablegen::SemanticOp;
+use xdna_archspec::aie2::isa::SemanticOp;
 use crate::interpreter::state::ExecutionContext;
 
 /// Cascade operations execution unit.
@@ -243,7 +243,7 @@ fn cascade_to_accumulator(data: &[u64; 6]) -> [u64; 8] {
 mod tests {
     use super::*;
     use crate::interpreter::bundle::SlotIndex;
-    use crate::tablegen::SemanticOp;
+    use xdna_archspec::aie2::isa::SemanticOp;
 
     fn make_ctx() -> ExecutionContext {
         ExecutionContext::new()

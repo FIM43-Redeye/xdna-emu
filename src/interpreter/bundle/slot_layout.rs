@@ -118,7 +118,7 @@ impl FormatTable {
     ///
     /// Only formats that have Inst-derived bit-level layout (non-zero fixed_mask
     /// or non-empty slot_maps) are included.
-    pub fn build(formats: &[crate::tablegen::CompositeFormatDef]) -> Self {
+    pub fn build(formats: &[xdna_archspec::aie2::isa::CompositeFormatDef]) -> Self {
         let mut groups: [Vec<FormatEntry>; 8] = Default::default();
 
         for fmt in formats {
@@ -1572,7 +1572,7 @@ mod tests {
 
     /// Build a FormatTable from the build-time generated tblgen output.
     fn try_build_format_table() -> Option<FormatTable> {
-        let output = crate::tablegen::load_from_generated();
+        let output = xdna_archspec::aie2::isa::load_from_generated();
         Some(FormatTable::build(&output.composite_formats))
     }
 
@@ -1635,7 +1635,7 @@ mod tests {
 
     #[test]
     fn test_format_table_roundtrip_all_formats() {
-        let output = crate::tablegen::load_from_generated();
+        let output = xdna_archspec::aie2::isa::load_from_generated();
         let table = FormatTable::build(&output.composite_formats);
 
         // For each composite format, construct a synthetic bundle with known

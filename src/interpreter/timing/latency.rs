@@ -15,8 +15,8 @@
 //! | Vector MAC | 4+ cycles | Multiply-accumulate |
 
 use crate::interpreter::bundle::SlotOp;
-use crate::tablegen::SemanticOp;
-use crate::tablegen::decoder_ffi;
+use xdna_archspec::aie2::isa::SemanticOp;
+use xdna_archspec::aie2::isa::decoder_ffi;
 
 /// Timing information for a single operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,7 +360,7 @@ impl LatencyTable {
     /// Asserts that our hardcoded constants match the values extracted from
     /// `AIE2Schedule.td`. This catches any drift between the emulator and
     /// the compiler's scheduling model.
-    pub fn validated_aie2(model: &crate::tablegen::ProcessorModel) -> Self {
+    pub fn validated_aie2(model: &xdna_archspec::aie2::isa::ProcessorModel) -> Self {
         // ProcessorModel.LoadLatency (5) is the memory pipeline depth.
         // LATENCY_MEMORY (7) is the full instruction result latency including
         // 2 extra writeback stages visible in AIE2Schedule.td itineraries.
@@ -586,7 +586,7 @@ mod tests {
 
     #[test]
     fn test_validated_aie2_matches_processor_model() {
-        use crate::tablegen::ProcessorModel;
+        use xdna_archspec::aie2::isa::ProcessorModel;
 
         let model = ProcessorModel {
             load_latency: 5,
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "LATENCY_MEMORY should be")]
     fn test_validated_aie2_catches_load_latency_drift() {
-        use crate::tablegen::ProcessorModel;
+        use xdna_archspec::aie2::isa::ProcessorModel;
 
         let model = ProcessorModel {
             load_latency: 9, // Wrong! AIE2 is 5 (9 + 2 = 11 != 7)
@@ -635,7 +635,7 @@ mod tests {
     ///   branch cost, which is a different concept.
     #[test]
     fn test_latency_cross_validation_against_itineraries() {
-        let tblgen = crate::tablegen::load_from_generated();
+        let tblgen = xdna_archspec::aie2::isa::load_from_generated();
 
         let mut checked = 0u32;
         let mut mismatches = Vec::new();
@@ -694,7 +694,7 @@ mod tests {
     /// the SemanticOp fallback.
     #[test]
     fn test_llvm_opcode_latency_path() {
-        use crate::tablegen::decoder_ffi;
+        use xdna_archspec::aie2::isa::decoder_ffi;
 
         let table = LatencyTable::aie2();
         let infos = decoder_ffi::query_all_instr_info();

@@ -8,7 +8,7 @@
 
 use crate::interpreter::bundle::{ElementType, Operand, ShufflePattern, SlotOp};
 use crate::interpreter::state::ExecutionContext;
-use crate::tablegen::SemanticOp;
+use xdna_archspec::aie2::isa::SemanticOp;
 
 use super::vector_dispatch::VectorAlu;
 

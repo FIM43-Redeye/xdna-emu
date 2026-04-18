@@ -9,12 +9,13 @@ use crate::interpreter::bundle::{Operand, PostModify};
 use crate::interpreter::state::SP_PTR_INDEX;
 #[cfg(test)]
 use crate::interpreter::state::{MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M};
-use crate::tablegen::{
+use xdna_archspec::aie2::isa::{
     AddressingMode, InstrEncoding,
-    decoder_ffi::{self, DecodedOperand, DecodeResult, operand_from_reg_name},
+    decoder_ffi::{self, DecodedOperand, DecodeResult},
 };
+use crate::interpreter::decode::register_map::{AccumWidth, operand_from_reg_name};
 #[cfg(test)]
-use crate::tablegen::{CompositeEncoder, OperandType, RegisterKind};
+use xdna_archspec::aie2::isa::{CompositeEncoder, OperandType, RegisterKind};
 
 use super::decoder::{DecodedInstr, InstructionDecoder, can_be_dest};
 
@@ -81,7 +82,7 @@ impl InstructionDecoder {
         bits: u64,
         slot_type: crate::interpreter::bundle::SlotType,
     ) -> Option<(DecodedInstr, Option<Operand>, Vec<Operand>, Option<PostModify>, Option<u32>, Vec<Operand>,
-                  Option<decoder_ffi::AccumWidth>)> {
+                  Option<AccumWidth>)> {
         let ffi_slot = Self::slot_type_to_ffi(slot_type)?;
         let ffi_result = decoder_ffi::decode_slot(ffi_slot, bits)?;
 
@@ -129,7 +130,7 @@ impl InstructionDecoder {
         ffi_result: &DecodeResult,
         encoding: &InstrEncoding,
     ) -> (Option<Operand>, Vec<Operand>, Option<PostModify>, Vec<Operand>,
-          Option<decoder_ffi::AccumWidth>) {
+          Option<AccumWidth>) {
         let num_defs = ffi_result.num_defs as usize;
 
         // Map all LLVM operands to our Operand type.
@@ -143,7 +144,7 @@ impl InstructionDecoder {
         // Also capture the first AccumWidth seen from register class metadata
         // (e.g., bml -> Half, cm -> Full). This flows to SlotOp.accum_width
         // for use in accumulator execution paths.
-        let mut first_accum_width: Option<decoder_ffi::AccumWidth> = None;
+        let mut first_accum_width: Option<AccumWidth> = None;
         let mapped: Vec<Option<Operand>> = ffi_result.operands.iter().map(|op| {
             match op {
                 DecodedOperand::Reg { name, .. } => {
@@ -569,7 +570,7 @@ impl InstructionDecoder {
     #[cfg(test)]
     fn decode_ag_field(
         &self,
-        field: &crate::tablegen::OperandField,
+        field: &xdna_archspec::aie2::isa::OperandField,
         value: u64,
         decoded: &DecodedInstr,
         direct_dest: &mut Option<Operand>,

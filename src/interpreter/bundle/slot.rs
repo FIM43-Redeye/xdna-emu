@@ -18,12 +18,12 @@
 use smallvec::SmallVec;
 
 // TableGen-derived semantic information and shared types
-use crate::tablegen::{ImplicitReg, SemanticOp};
+use xdna_archspec::aie2::isa::{ImplicitReg, SemanticOp};
 
 // Re-export types defined in tablegen::types so existing code using
 // crate::interpreter::bundle::{ElementType, BranchCondition, SelectVariant}
 // continues to compile without changes.
-pub use crate::tablegen::{BranchCondition, ElementType, SelectVariant};
+pub use xdna_archspec::aie2::isa::{BranchCondition, ElementType, SelectVariant};
 
 /// Slot index within a VLIW bundle.
 ///
@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_slot_op_builder() {
-        use crate::tablegen::SemanticOp;
+        use xdna_archspec::aie2::isa::SemanticOp;
 
         let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
             .with_dest(Operand::ScalarReg(0))

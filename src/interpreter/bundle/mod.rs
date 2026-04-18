@@ -292,7 +292,7 @@ fn disassemble_op(slot_op: &SlotOp) -> String {
 /// This is the fallback path for SlotOps constructed in tests without
 /// an encoding_name. Real decoded instructions always have encoding_name.
 fn disassemble_from_semantic(slot_op: &SlotOp) -> String {
-    use crate::tablegen::SemanticOp;
+    use xdna_archspec::aie2::isa::SemanticOp;
 
     let Some(semantic) = slot_op.semantic else {
         return "unknown".to_string();
@@ -555,7 +555,7 @@ fn condition_suffix(c: BranchCondition) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tablegen::SemanticOp;
+    use xdna_archspec::aie2::isa::SemanticOp;
 
     #[test]
     fn test_empty_bundle() {

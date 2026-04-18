@@ -794,7 +794,7 @@ impl fmt::Debug for MaskRegisterFile {
 ///
 /// Panics with a descriptive message if any register class size doesn't match
 /// the emulator's expectations.
-pub fn validate_register_model(model: &crate::tablegen::RegisterModel) {
+pub fn validate_register_model(model: &xdna_archspec::aie2::isa::RegisterModel) {
     // Scalar GPR class "eR" should have exactly NUM_SCALAR_GPRS members
     if let Some(er) = model.classes.get("eR") {
         assert_eq!(
@@ -1122,7 +1122,7 @@ mod tests {
 
     #[test]
     fn test_validate_register_model_with_live_data() {
-        let output = crate::tablegen::load_from_generated();
+        let output = xdna_archspec::aie2::isa::load_from_generated();
 
         // Should not panic
         validate_register_model(&output.register_model);

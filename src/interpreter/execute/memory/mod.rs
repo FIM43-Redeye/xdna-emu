@@ -36,7 +36,7 @@ use crate::device::tile::Tile;
 use crate::interpreter::bundle::{ElementType, MemWidth, Operand, PostModify, SlotIndex, SlotOp};
 use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::timing::{LATENCY_MEMORY, MemoryQuadrant};
-use crate::tablegen::SemanticOp;
+use xdna_archspec::aie2::isa::SemanticOp;
 
 /// Offset mask for extracting the local address within a tile's memory.
 /// `address & OFFSET_MASK` gives the byte offset within the target tile.
@@ -1728,7 +1728,7 @@ mod tests {
     use super::*;
     use crate::interpreter::bundle::{ElementType, SlotIndex};
     use crate::interpreter::state::SP_PTR_INDEX;
-    use crate::tablegen::SemanticOp;
+    use xdna_archspec::aie2::isa::SemanticOp;
 
     fn make_ctx() -> ExecutionContext {
         ExecutionContext::new()

@@ -341,7 +341,7 @@ mod tests {
     use crate::interpreter::bundle::{ElementType, Operand, SlotIndex, SlotOp};
     use crate::interpreter::execute::vector_dispatch::VectorAlu;
     use crate::interpreter::state::ExecutionContext;
-    use crate::tablegen::SemanticOp;
+    use xdna_archspec::aie2::isa::SemanticOp;
     use crate::interpreter::decode::register_map::AccumWidth;
 
     fn make_ctx() -> ExecutionContext {

@@ -115,7 +115,7 @@ mod tests {
     use crate::interpreter::state::ExecutionContext;
     use crate::interpreter::traits::Executor;
     use crate::interpreter::bundle::{VliwBundle, SlotOp, SlotIndex, Operand};
-    use crate::tablegen::SemanticOp;
+    use xdna_archspec::aie2::isa::SemanticOp;
 
     fn make_bundle_with_op(op: SlotOp) -> VliwBundle {
         let mut bundle = VliwBundle::empty();
