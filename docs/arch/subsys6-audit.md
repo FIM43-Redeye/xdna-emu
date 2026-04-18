@@ -177,3 +177,45 @@ Task 10 splits the file here: everything above line 346 moves to
 `src/interpreter/decode/`.
 
 Matches plan expectation exactly (line 346).
+
+---
+
+## Plan Deviations
+
+### Tasks 3-5 + parts of 6 and 10 combined into one commit
+
+Discovered during Task 3 execution that Tasks 3, 4, 5 couldn't move
+independently because:
+- `types.rs::TblgenOutput` uses `super::resolver::InstrEncoding` and
+  `super::decoder_bytecode::DecoderTable`
+- `resolver/mod.rs` imports from `super::types`
+- `resolver/mod.rs::SlotIndex::decode()` calls
+  `super::decoder_ffi::slot_from_name` / `decode_slot_name`
+- `resolver/semantic_inference.rs` calls
+  `super::super::element_type_logic::*`
+
+The atomic unit is five pieces, not three: types, resolver,
+decoder_bytecode, element_type_logic (runtime copy), and the pure-FFI
+top half of decoder_ffi.rs. All moved together in commit 11f1275.
+
+Additional deviations from the original plan:
+
+- `log = "0.4"` added to archspec's Cargo.toml (required by
+  `resolver/mod.rs` production code using `log::trace!()`).
+- `get_num_regs()` and `get_reg_name()` public wrapper functions added to
+  archspec's `decoder_ffi.rs` so `register_map.rs` (in xdna-emu) can call
+  them without accessing private `extern "C"` symbols.
+- xdna-emu test count after mega-move: 2730 (plan expected 2797). Delta of
+  -67 is correct -- those tests relocated into archspec.
+- Archspec test count after mega-move: 202 (plan expected 138). Delta of
+  +64 is the relocated test modules, with 2 tests newly marked `#[ignore]`
+  (decoder_bytecode integration tests that require `load_from_generated`,
+  wired in Task 7).
+
+Remaining plan tasks after this commit:
+- Task 6 still moves `build_helpers/` directory (the build-time copy
+  of element_type_logic.rs stays there pending that).
+- Task 10 reduces to relocating `src/tablegen/register_map.rs` ->
+  `src/interpreter/decode/register_map.rs` (the split itself already
+  happened in this combined commit).
+- All other tasks unchanged.
