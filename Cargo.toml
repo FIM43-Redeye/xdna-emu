@@ -64,10 +64,9 @@ tooling = ["dep:crossterm"]
 vcd-recording = ["dep:vcd"]
 
 [build-dependencies]
-# Needed for build_arch_model (processor-slot cross-validation via
-# confirm_processor_slots) and for RegisterDb. extract_aiert + gen_aiert_*
-# moved to xdna-archspec's build.rs in Subsystem 6 Task 11.
-xdna-archspec = { path = "crates/xdna-archspec" }
+# xdna-emu's build.rs only installs the XRT plugin now.  All arch-data
+# codegen and the LLVM MCDisassembler FFI compile live in
+# crates/xdna-archspec/build.rs.
 
 [dev-dependencies]
 hex = "0.4"                                             # Hex dump utilities for debugging
