@@ -11,17 +11,23 @@
 //! The `resolver` module still provides the runtime types (`InstrEncoding`,
 //! `OperandField`, etc.) and the `decoder_bytecode` module provides the
 //! bytecode interpreter. Both are consumed by the instruction decoder.
+//!
+//! ## Subsystem 6 Part A layout
+//!
+//! Arch-agnostic types and logic now live in
+//! `xdna_archspec::aie2::isa::{types,resolver,decoder_bytecode,decoder_ffi,element_type_logic}`.
+//! Modules below are forwarders that preserve all existing import paths.
+//!
+//! The interpreter-coupled half of the old `decoder_ffi.rs` (MappedOperand,
+//! RegisterMap, classify_reg_name, operand_from_reg_name) lives in
+//! `crate::tablegen::register_map` pending relocation to
+//! `crate::interpreter::decode::register_map` in Part B.
 
 pub mod decoder_bytecode;
 pub mod decoder_ffi;
+pub mod register_map;
 mod resolver;
 mod types;
-
-// Shared element type inference logic (canonical source: build_helpers/).
-// Included here so the runtime resolver can delegate to the same logic
-// that the build-time codegen uses. See build_helpers/element_type_logic.rs.
-#[path = "../../build_helpers/element_type_logic.rs"]
-mod element_type_logic;
 
 // Build-time generated instruction tables (per-slot files for parallel compilation)
 mod generated {

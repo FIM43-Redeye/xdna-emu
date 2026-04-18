@@ -1,12 +1,12 @@
-// Shared element type inference logic -- build-time copy.
+// Shared element type inference logic -- runtime copy (archspec isa/).
 //
 // This file has two authoritative copies that MUST stay in sync:
-//   - build_helpers/element_type_logic.rs                              (this file, build-time)
-//   - crates/xdna-archspec/src/aie2/isa/element_type_logic.rs         (runtime, Subsystem 6 Task 3+)
+//   - build_helpers/element_type_logic.rs                              (build-time, xdna-emu)
+//   - crates/xdna-archspec/src/aie2/isa/element_type_logic.rs         (this file, runtime)
 //
-// The build-time copy lives here alongside the TableGen extraction code
-// (used during xdna-emu's build.rs codegen phase). The runtime copy lives
-// in archspec's isa/ module and is used by the runtime resolver.
+// The runtime copy lives here in archspec's isa/ module, consumed by
+// the runtime resolver (resolver/semantic_inference.rs). The build-time
+// copy stays in build_helpers/ for xdna-emu's codegen phase.
 //
 // Task 6 will consolidate these; until then they are separate files that
 // must be kept in sync.
