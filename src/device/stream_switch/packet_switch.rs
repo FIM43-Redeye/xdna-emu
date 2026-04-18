@@ -1,7 +1,7 @@
 //! Packet switching logic: slot configuration, arbiter-based routing, and
 //! the standalone PacketSwitch state machine.
 
-use crate::arch::timing as arch_timing;
+use xdna_archspec::aie2::timing as arch_timing;
 use super::packet_types::{PacketHeader, PacketRoute};
 
 // ============================================================================

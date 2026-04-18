@@ -79,7 +79,7 @@ impl DeviceState {
         // counter block starts at a base address; we compute the in-block
         // offset and delegate to the Tile method that parses the fields.
         {
-            use crate::arch::subsystem;
+            use xdna_archspec::aie2::subsystems as subsystem;
             if tile.is_compute() {
                 // Core module perf counters: 0x31500-0x3158C
                 let base = subsystem::compute::core_performance::OFFSET_START;
@@ -185,7 +185,7 @@ impl DeviceState {
         // Compute tiles have core_timer + mem_timer; memtile has mem_timer;
         // shim has core_timer (PL module timer).
         {
-            use crate::arch::subsystem;
+            use xdna_archspec::aie2::subsystems as subsystem;
             if tile.is_compute() {
                 let base = subsystem::compute::core_timer::OFFSET_START;
                 let end = subsystem::compute::core_timer::OFFSET_END;
@@ -235,7 +235,7 @@ impl DeviceState {
         //   MemTile:      0x94008-0x94524 (module prefix 0x90000)
         //   Shim (PL):    0x34008-0x34518 (module prefix 0x30000)
         {
-            use crate::arch::subsystem;
+            use xdna_archspec::aie2::subsystems as subsystem;
             if tile.is_compute() {
                 let base = subsystem::compute::core_event::OFFSET_START;
                 let end = subsystem::compute::core_event::OFFSET_END;

@@ -369,7 +369,7 @@ mod tests {
     // Helper: build a control packet header word.
     // length_field is the raw 2-bit value (beats = length_field + 1).
     fn build_test_header(address: u32, length_field: u32, operation: u32, response_id: u32) -> u32 {
-        use crate::arch::ctrl_packet::*;
+        use xdna_archspec::aie2::ctrl_packet::*;
         (address & ADDRESS_MASK)
             | ((length_field & LENGTH_MASK) << LENGTH_SHIFT)
             | ((operation & OPERATION_MASK) << OPERATION_SHIFT)

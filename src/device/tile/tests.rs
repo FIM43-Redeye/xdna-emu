@@ -570,7 +570,7 @@ fn test_write_tile_register_updates_memtile_bd() {
 /// offset, count (beats+1), and response_id from the header.
 #[test]
 fn test_ctrl_packet_op_read_via_reassembler() {
-    use crate::arch::ctrl_packet::*;
+    use xdna_archspec::aie2::ctrl_packet::*;
     use super::super::control_packets::{StreamReassembler, ReassembleResult, CtrlOpCode};
 
     let mut reassembler = StreamReassembler::new(2, 3);

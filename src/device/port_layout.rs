@@ -2,7 +2,7 @@
 //!
 //! Defines the `PortLayout` extension trait and its implementation for
 //! `ModelConfig`. These methods must remain runtime-side because their data
-//! comes from `crate::arch` (a build.rs-generated module containing AM025 port
+//! comes from `xdna_archspec::aie2` (a build.rs-generated module containing AM025 port
 //! arrays that is not accessible from the archspec workspace crate).
 //!
 //! When AIE2P diverges in port layout, add AIE2P-specific arrays and select
@@ -21,7 +21,7 @@ use xdna_archspec::types::TileKind;
 /// the main crate's `build.rs` from AM025 register names (via
 /// `gen_stream_ports()` and `gen_stream_ranges()`).  The archspec workspace
 /// crate does not run the main crate's build.rs, so it cannot access
-/// `crate::arch::*`.
+/// `xdna_archspec::aie2::*`.
 ///
 /// When AIE2P diverges in port layout, add AIE2P-specific arrays and select
 /// based on `ModelConfig::name()` or an architecture field.  That addition
@@ -61,22 +61,22 @@ pub trait PortLayout {
 impl PortLayout for ModelConfig {
     fn master_ports(&self, tile: TileKind) -> &'static [u8] {
         match tile {
-            TileKind::ShimNoc | TileKind::ShimPl => crate::arch::SHIM_MASTER_PORTS,
-            TileKind::Mem => crate::arch::MEMTILE_MASTER_PORTS,
-            TileKind::Compute => crate::arch::COMPUTE_MASTER_PORTS,
+            TileKind::ShimNoc | TileKind::ShimPl => xdna_archspec::aie2::SHIM_MASTER_PORTS,
+            TileKind::Mem => xdna_archspec::aie2::MEMTILE_MASTER_PORTS,
+            TileKind::Compute => xdna_archspec::aie2::COMPUTE_MASTER_PORTS,
         }
     }
 
     fn slave_ports(&self, tile: TileKind) -> &'static [u8] {
         match tile {
-            TileKind::ShimNoc | TileKind::ShimPl => crate::arch::SHIM_SLAVE_PORTS,
-            TileKind::Mem => crate::arch::MEMTILE_SLAVE_PORTS,
-            TileKind::Compute => crate::arch::COMPUTE_SLAVE_PORTS,
+            TileKind::ShimNoc | TileKind::ShimPl => xdna_archspec::aie2::SHIM_SLAVE_PORTS,
+            TileKind::Mem => xdna_archspec::aie2::MEMTILE_SLAVE_PORTS,
+            TileKind::Compute => xdna_archspec::aie2::COMPUTE_SLAVE_PORTS,
         }
     }
 
     fn north_master_range(&self, tile: TileKind) -> (u8, u8) {
-        use crate::arch::stream_switch::*;
+        use xdna_archspec::aie2::stream_switch::*;
         match tile {
             TileKind::ShimNoc | TileKind::ShimPl => (shim::NORTH_MASTER_START, shim::NORTH_MASTER_END),
             TileKind::Mem => (mem_tile::NORTH_MASTER_START, mem_tile::NORTH_MASTER_END),
@@ -85,7 +85,7 @@ impl PortLayout for ModelConfig {
     }
 
     fn south_master_range(&self, tile: TileKind) -> (u8, u8) {
-        use crate::arch::stream_switch::*;
+        use xdna_archspec::aie2::stream_switch::*;
         match tile {
             // Shim tiles have no south-facing masters (south is the external interface).
             TileKind::ShimNoc | TileKind::ShimPl => (0, 0),
@@ -95,7 +95,7 @@ impl PortLayout for ModelConfig {
     }
 
     fn north_slave_range(&self, tile: TileKind) -> (u8, u8) {
-        use crate::arch::stream_switch::*;
+        use xdna_archspec::aie2::stream_switch::*;
         match tile {
             TileKind::ShimNoc | TileKind::ShimPl => (shim::NORTH_SLAVE_START, shim::NORTH_SLAVE_END),
             TileKind::Mem => (mem_tile::NORTH_SLAVE_START, mem_tile::NORTH_SLAVE_END),
@@ -104,7 +104,7 @@ impl PortLayout for ModelConfig {
     }
 
     fn south_slave_range(&self, tile: TileKind) -> (u8, u8) {
-        use crate::arch::stream_switch::*;
+        use xdna_archspec::aie2::stream_switch::*;
         match tile {
             // Shim tiles have no south-facing slaves.
             TileKind::ShimNoc | TileKind::ShimPl => (0, 0),
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_npu1_port_ranges() {
-        use crate::arch::stream_switch::{compute, mem_tile, shim};
+        use xdna_archspec::aie2::stream_switch::{compute, mem_tile, shim};
 
         let cfg = npu1_config();
 

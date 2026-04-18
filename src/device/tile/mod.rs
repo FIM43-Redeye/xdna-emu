@@ -11,7 +11,7 @@
 //! # Architecture Constants
 //!
 //! All constants are derived from AMD AM020 (AIE-ML Architecture Manual).
-//! See `crate::arch` module for the authoritative constants.
+//! See `xdna_archspec::aie2` module for the authoritative constants.
 //!
 //! # Performance
 //!
@@ -529,8 +529,8 @@ impl Tile {
     /// Number of physical memory banks for this tile type (for conflict detection).
     pub fn num_banks(&self) -> usize {
         match self.tile_type {
-            TileType::Compute => crate::arch::compute::PHYSICAL_BANKS as usize,
-            TileType::MemTile => crate::arch::memtile::PHYSICAL_BANKS as usize,
+            TileType::Compute => xdna_archspec::aie2::compute::PHYSICAL_BANKS as usize,
+            TileType::MemTile => xdna_archspec::aie2::memtile::PHYSICAL_BANKS as usize,
             TileType::Shim => 0,
         }
     }

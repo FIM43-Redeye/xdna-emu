@@ -54,7 +54,7 @@ impl Default for SyncTimingConfig {
 impl SyncTimingConfig {
     /// Create configuration from architecture timing constants.
     pub fn from_arch() -> Self {
-        use crate::arch::timing;
+        use xdna_archspec::aie2::timing;
         Self {
             acquire_latency: timing::LOCK_ACQUIRE_LATENCY,
             release_latency: timing::LOCK_RELEASE_LATENCY,

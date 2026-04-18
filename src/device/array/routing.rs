@@ -1,7 +1,7 @@
 //! Stream switch routing, cascade routing, and inter-tile data movement.
 
 use super::*;
-use crate::arch::stream_switch::{compute, mem_tile, shim};
+use xdna_archspec::aie2::stream_switch::{compute, mem_tile, shim};
 use crate::device::stream_switch::PortType;
 use std::fmt;
 
@@ -669,7 +669,7 @@ impl TileArray {
             let dma = &mut dma_engines[i];
             let col = tile.col;
             let row = tile.row;
-            let is_shim = row == crate::arch::SHIM_ROW;
+            let is_shim = row == xdna_archspec::aie2::SHIM_ROW;
 
             // Check DMA master ports for outgoing data
             let num_masters = tile.stream_switch.masters.len();
@@ -951,7 +951,7 @@ impl TileArray {
 
         // Pop words from source masters into the inter-tile pipeline.
         // Words will be delivered after ROUTE_LATENCY_PER_HOP cycles.
-        use crate::arch::timing::ROUTE_PER_HOP as ROUTE_LATENCY_PER_HOP;
+        use xdna_archspec::aie2::timing::ROUTE_PER_HOP as ROUTE_LATENCY_PER_HOP;
 
         for (src_col, src_row, src_master, dst_col, dst_row, dst_slave, _data, _tlast) in transfers {
             let src_idx = self.tile_index(src_col, src_row);

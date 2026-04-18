@@ -1,7 +1,7 @@
 //! AIE2 Memory Banking Utilities
 //!
 //! Interleaved banking functions for memory conflict detection.
-//! Bank counts and sizes are in `crate::arch` (generated from ArchModel).
+//! Bank counts and sizes are in `xdna_archspec::aie2` (generated from ArchModel).
 //!
 //! AIE2 uses 128-bit (16-byte) interleaved banking: consecutive 16-byte
 //! lines map to different physical banks, enabling parallel access from
@@ -65,22 +65,22 @@ mod tests {
 
     #[test]
     fn test_compute_banking_constants() {
-        assert_eq!(crate::arch::compute::PHYSICAL_BANKS, 8);
-        assert_eq!(crate::arch::compute::PHYSICAL_BANK_SIZE, 8 * 1024);
+        assert_eq!(xdna_archspec::aie2::compute::PHYSICAL_BANKS, 8);
+        assert_eq!(xdna_archspec::aie2::compute::PHYSICAL_BANK_SIZE, 8 * 1024);
         // Bank width: 128 bits per aie-rt XAIEMLGBL_MEMORY_MODULE_DATAMEMORY_WIDTH.
-        assert_eq!(crate::arch::compute::PHYSICAL_BANK_WIDTH_BITS, 128);
+        assert_eq!(xdna_archspec::aie2::compute::PHYSICAL_BANK_WIDTH_BITS, 128);
     }
 
     #[test]
     fn test_memtile_banking_constants() {
-        assert_eq!(crate::arch::memtile::PHYSICAL_BANKS, 16);
-        assert_eq!(crate::arch::memtile::PHYSICAL_BANK_SIZE, 32 * 1024);
+        assert_eq!(xdna_archspec::aie2::memtile::PHYSICAL_BANKS, 16);
+        assert_eq!(xdna_archspec::aie2::memtile::PHYSICAL_BANK_SIZE, 32 * 1024);
         assert_eq!(
-            crate::arch::memtile::PHYSICAL_BANKS as u64 * crate::arch::memtile::PHYSICAL_BANK_SIZE,
+            xdna_archspec::aie2::memtile::PHYSICAL_BANKS as u64 * xdna_archspec::aie2::memtile::PHYSICAL_BANK_SIZE,
             512 * 1024
         );
         // Bank width: 128 bits per aie-rt XAIEMLGBL_MEM_TILE_MODULE_DATAMEMORY_WIDTH.
-        assert_eq!(crate::arch::memtile::PHYSICAL_BANK_WIDTH_BITS, 128);
+        assert_eq!(xdna_archspec::aie2::memtile::PHYSICAL_BANK_WIDTH_BITS, 128);
     }
 
     #[test]

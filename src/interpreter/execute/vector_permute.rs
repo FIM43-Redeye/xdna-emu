@@ -57,10 +57,10 @@
 //! inner, channel) coordinates.
 
 /// Number of bytes in a vector register (from archspec processor model).
-const VEC_BYTES: usize = crate::arch::processor::VECTOR_REGISTER_BYTES;
+const VEC_BYTES: usize = xdna_archspec::aie2::processor::VECTOR_REGISTER_BYTES;
 
 /// Number of bytes in a vector pair (shuffle unit input, from archspec).
-const PAIR_BYTES: usize = crate::arch::processor::VECTOR_PAIR_BYTES;
+const PAIR_BYTES: usize = xdna_archspec::aie2::processor::VECTOR_PAIR_BYTES;
 
 // ============================================================================
 // Shuffle modes (from me_enums.h)

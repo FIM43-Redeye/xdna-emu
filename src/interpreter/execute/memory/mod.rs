@@ -40,7 +40,7 @@ use xdna_archspec::aie2::isa::SemanticOp;
 
 /// Offset mask for extracting the local address within a tile's memory.
 /// `address & OFFSET_MASK` gives the byte offset within the target tile.
-const OFFSET_MASK: u32 = crate::arch::compute::MEMORY_SIZE as u32 - 1;
+const OFFSET_MASK: u32 = xdna_archspec::aie2::compute::MEMORY_SIZE as u32 - 1;
 
 /// Decode a data memory address into its cardinal direction and local offset.
 ///

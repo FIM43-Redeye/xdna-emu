@@ -53,7 +53,7 @@ impl Default for DmaTimingConfig {
 impl DmaTimingConfig {
     /// Create timing config from architecture constants.
     pub fn from_arch() -> Self {
-        use crate::arch::timing;
+        use xdna_archspec::aie2::timing;
         Self {
             bd_setup_cycles: timing::DMA_BD_SETUP_CYCLES,
             channel_start_cycles: timing::DMA_CHANNEL_START_CYCLES,

@@ -258,7 +258,7 @@ impl DeviceState {
         // Determine channel index and whether this is a start queue write
         let (ch_idx, is_start_queue) = self.decode_memtile_channel_offset(offset);
 
-        if ch_idx >= crate::arch::memtile::NUM_DMA_CHANNELS as usize * 2 {
+        if ch_idx >= xdna_archspec::aie2::memtile::NUM_DMA_CHANNELS as usize * 2 {
             return;
         }
 
@@ -291,7 +291,7 @@ impl DeviceState {
                         col, row, ch_idx, bd_idx,
                     );
                 } else {
-                    let mt_s2mm = crate::arch::memtile::NUM_DMA_CHANNELS as usize;
+                    let mt_s2mm = xdna_archspec::aie2::memtile::NUM_DMA_CHANNELS as usize;
                     let dir = if ch_idx < mt_s2mm { "S2MM" } else { "MM2S" };
                     let local_ch = if ch_idx < mt_s2mm { ch_idx } else { ch_idx - mt_s2mm };
                     log::info!("CDO enqueued MemTile DMA {} ch {} BD {} repeat={} on tile ({},{})",
@@ -307,7 +307,7 @@ impl DeviceState {
         let lay = &reg_layout.memtile_channel;
         let (ch_idx, is_start_queue) = self.decode_memtile_channel_offset(offset);
 
-        if ch_idx >= crate::arch::memtile::NUM_DMA_CHANNELS as usize * 2 {
+        if ch_idx >= xdna_archspec::aie2::memtile::NUM_DMA_CHANNELS as usize * 2 {
             return;
         }
 
@@ -342,7 +342,7 @@ impl DeviceState {
                         col, row, ch_idx, bd_idx,
                     );
                 } else {
-                    let mt_s2mm = crate::arch::memtile::NUM_DMA_CHANNELS as usize;
+                    let mt_s2mm = xdna_archspec::aie2::memtile::NUM_DMA_CHANNELS as usize;
                     let dir = if ch_idx < mt_s2mm { "S2MM" } else { "MM2S" };
                     let local_ch = if ch_idx < mt_s2mm { ch_idx } else { ch_idx - mt_s2mm };
                     log::info!("CDO enqueued MemTile DMA {} ch {} BD {} repeat={} on tile ({},{})",
@@ -383,7 +383,7 @@ impl DeviceState {
     /// Master config format: bit 31 = enable, bits 4:0 = slave select
     /// Slave config format: bit 31 = enable
     pub(super) fn write_memtile_stream_switch(&mut self, col: u8, row: u8, offset: u32, value: u32) {
-        use crate::arch::stream_switch::{ENABLE_BIT, SLAVE_SELECT_MASK};
+        use xdna_archspec::aie2::stream_switch::{ENABLE_BIT, SLAVE_SELECT_MASK};
         let ss = &regdb::device_reg_layout().memtile_stream_switch;
 
         // MemTile master ports: base + (port * 4), slave ports: base + (port * 4)

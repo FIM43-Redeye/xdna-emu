@@ -131,23 +131,23 @@ impl PacketHeader {
         let mut word: u32 = 0;
 
         // Stream ID: bits 4-0
-        word |= (self.stream_id as u32) & crate::arch::packet::STREAM_ID_MASK;
+        word |= (self.stream_id as u32) & xdna_archspec::aie2::packet::STREAM_ID_MASK;
 
         // Packet Type: bits 14-12
-        word |= ((self.packet_type as u32) & crate::arch::packet::TYPE_MASK)
-            << crate::arch::packet::TYPE_SHIFT as usize;
+        word |= ((self.packet_type as u32) & xdna_archspec::aie2::packet::TYPE_MASK)
+            << xdna_archspec::aie2::packet::TYPE_SHIFT as usize;
 
         // Source Row: bits 20-16
-        word |= ((self.src_row as u32) & crate::arch::packet::SRC_ROW_MASK)
-            << crate::arch::packet::SRC_ROW_SHIFT as usize;
+        word |= ((self.src_row as u32) & xdna_archspec::aie2::packet::SRC_ROW_MASK)
+            << xdna_archspec::aie2::packet::SRC_ROW_SHIFT as usize;
 
         // Source Column: bits 27-21
-        word |= ((self.src_col as u32) & crate::arch::packet::SRC_COL_MASK)
-            << crate::arch::packet::SRC_COL_SHIFT as usize;
+        word |= ((self.src_col as u32) & xdna_archspec::aie2::packet::SRC_COL_MASK)
+            << xdna_archspec::aie2::packet::SRC_COL_SHIFT as usize;
 
         // Calculate odd parity over bits 30-0
         let parity = (word.count_ones() & 1) ^ 1; // Odd parity
-        word |= parity << crate::arch::packet::PARITY_SHIFT as usize;
+        word |= parity << xdna_archspec::aie2::packet::PARITY_SHIFT as usize;
 
         word
     }
@@ -157,17 +157,17 @@ impl PacketHeader {
     /// Returns (header, parity_ok) tuple.
     pub fn decode(word: u32) -> (Self, bool) {
         // Extract fields
-        let stream_id = (word & crate::arch::packet::STREAM_ID_MASK) as u8;
+        let stream_id = (word & xdna_archspec::aie2::packet::STREAM_ID_MASK) as u8;
 
         let packet_type = PacketType::from_u8(
-            ((word >> crate::arch::packet::TYPE_SHIFT as usize) & crate::arch::packet::TYPE_MASK) as u8,
+            ((word >> xdna_archspec::aie2::packet::TYPE_SHIFT as usize) & xdna_archspec::aie2::packet::TYPE_MASK) as u8,
         );
 
         let src_row =
-            ((word >> crate::arch::packet::SRC_ROW_SHIFT as usize) & crate::arch::packet::SRC_ROW_MASK) as u8;
+            ((word >> xdna_archspec::aie2::packet::SRC_ROW_SHIFT as usize) & xdna_archspec::aie2::packet::SRC_ROW_MASK) as u8;
 
         let src_col =
-            ((word >> crate::arch::packet::SRC_COL_SHIFT as usize) & crate::arch::packet::SRC_COL_MASK) as u8;
+            ((word >> xdna_archspec::aie2::packet::SRC_COL_SHIFT as usize) & xdna_archspec::aie2::packet::SRC_COL_MASK) as u8;
 
         // Check parity (odd parity means total 1-bits should be odd)
         let parity_ok = word.count_ones() & 1 == 1;

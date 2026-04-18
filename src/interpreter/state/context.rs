@@ -90,7 +90,7 @@ pub struct PendingStore {
 /// - add_21_i8: add.nc at store+5 → result at store+6 → read at store+6 ✓
 /// - add_12_i8: add.nc at store+6 → result at store+7 → read at store+6
 ///   reads the OLD r0 from the previous iteration (add.nc hasn't written yet) ✓
-const PARTIAL_WORD_STORE_DATA_LATENCY: u64 = crate::arch::processor::PARTIAL_STORE_DATA_LATENCY as u64;
+const PARTIAL_WORD_STORE_DATA_LATENCY: u64 = xdna_archspec::aie2::processor::PARTIAL_STORE_DATA_LATENCY as u64;
 
 /// Complete execution context for an AIE2 core.
 ///

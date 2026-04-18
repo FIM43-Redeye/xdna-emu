@@ -29,7 +29,7 @@
 /// The accumulator value is effectively left-shifted by BIAS bits before
 /// the user-specified shift is applied. This means the total right-shift
 /// is `user_shift + BIAS`.
-const BIAS: u32 = crate::arch::processor::SRS_SHIFT_BIAS as u32;
+const BIAS: u32 = xdna_archspec::aie2::processor::SRS_SHIFT_BIAS as u32;
 
 /// Hardware rounding modes for the SRS instruction.
 ///

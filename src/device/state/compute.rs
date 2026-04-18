@@ -142,7 +142,7 @@ impl DeviceState {
         let rel = offset - reg_layout.memory_channel_base;
         let ch_idx = (rel / reg_layout.memory_channel_stride) as usize;
         let is_start_queue = (rel % reg_layout.memory_channel_stride) >= 4;
-        let is_s2mm = ch_idx < crate::arch::compute::NUM_DMA_CHANNELS as usize;
+        let is_s2mm = ch_idx < xdna_archspec::aie2::compute::NUM_DMA_CHANNELS as usize;
 
         let num_channels = self.array.get(col, row).map_or(0, |t| t.dma_channels.len());
         if ch_idx >= num_channels {
@@ -305,7 +305,7 @@ impl DeviceState {
         let rel = offset - reg_layout.shim_channel_base;
         let ch_idx = (rel / reg_layout.shim_channel_stride) as usize;
         let is_start_queue = (rel % reg_layout.shim_channel_stride) >= 4;
-        let is_s2mm = ch_idx < crate::arch::shim::NUM_DMA_CHANNELS as usize;
+        let is_s2mm = ch_idx < xdna_archspec::aie2::shim::NUM_DMA_CHANNELS as usize;
 
         let num_channels = self.array.get(col, row).map_or(0, |t| t.dma_channels.len());
         if ch_idx >= num_channels {
@@ -515,7 +515,7 @@ impl DeviceState {
     /// Master config format: bit 31 = enable, bits 4:0 = slave select
     /// Slave config format: bit 31 = enable
     pub(super) fn write_stream_switch(&mut self, col: u8, row: u8, offset: u32, value: u32) {
-        use crate::arch::stream_switch::{ENABLE_BIT, SLAVE_SELECT_MASK};
+        use xdna_archspec::aie2::stream_switch::{ENABLE_BIT, SLAVE_SELECT_MASK};
         let ss = &regdb::device_reg_layout().memory_stream_switch;
 
         // Master ports: base + (port * 4), Slave ports: base + (port * 4)

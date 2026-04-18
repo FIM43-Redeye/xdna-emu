@@ -1,6 +1,6 @@
 //! Port types and stream port implementation.
 
-use crate::arch::timing as arch_timing;
+use xdna_archspec::aie2::timing as arch_timing;
 use std::collections::VecDeque;
 
 /// Stream port direction.
@@ -50,7 +50,7 @@ impl PortType {
     /// - 40+n: West(n)
     /// - 50+n: DMA(n)
     pub fn from_spec(encoded: u8) -> Self {
-        use crate::arch::port_type;
+        use xdna_archspec::aie2::port_type;
         match encoded {
             port_type::CORE => PortType::Core,
             port_type::FIFO => PortType::Fifo,

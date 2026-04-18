@@ -83,7 +83,7 @@ impl MemoryRegion {
     /// Uses architecture constants from xdna-archspec (DATA_MEM_ADDR,
     /// MEMORY_SIZE) so boundaries adapt automatically for AIE2P.
     pub fn from_address(addr: u32) -> Self {
-        use crate::arch::compute::{DATA_MEM_ADDR, MEMORY_SIZE};
+        use xdna_archspec::aie2::compute::{DATA_MEM_ADDR, MEMORY_SIZE};
         // Data memory: 4 quadrants (S/W/N/E) starting at DATA_MEM_ADDR.
         const DATA_START: u32 = DATA_MEM_ADDR;
         const DATA_END: u32 = DATA_MEM_ADDR + 4 * MEMORY_SIZE as u32 - 1;

@@ -24,8 +24,8 @@
 //! ```
 
 use anyhow::{anyhow, Result};
-use crate::arch;
-use crate::arch::stream_switch as ss;
+use xdna_archspec::aie2 as arch;
+use xdna_archspec::aie2::stream_switch as ss;
 use crate::device::dma::BdConfig;
 use crate::interpreter::engine::{InterpreterEngine, EngineStatus};
 use crate::parser::AieElf;

@@ -40,7 +40,7 @@
 //! - Unaligned access is undefined behavior (may fault or produce wrong results)
 
 /// Number of physical memory banks per compute tile (for conflict detection).
-pub const NUM_BANKS: usize = crate::arch::compute::PHYSICAL_BANKS as usize;
+pub const NUM_BANKS: usize = xdna_archspec::aie2::compute::PHYSICAL_BANKS as usize;
 
 // ============================================================================
 // Cross-Tile Memory Access Latency (AM020 Ch4)
@@ -65,11 +65,11 @@ pub const NUM_BANKS: usize = crate::arch::compute::PHYSICAL_BANKS as usize;
 //
 
 /// Size of each memory quadrant (64KB = compute tile data memory).
-pub const QUADRANT_SIZE: u32 = crate::arch::compute::MEMORY_SIZE as u32;
+pub const QUADRANT_SIZE: u32 = xdna_archspec::aie2::compute::MEMORY_SIZE as u32;
 
 /// Latency for accessing neighbor tile memory (1 hop).
 /// Per AM020 Ch2: local-to-external routing is 4 cycles.
-pub const CROSS_TILE_LATENCY: u8 = crate::arch::timing::ROUTE_LOCAL_TO_EXTERNAL;
+pub const CROSS_TILE_LATENCY: u8 = xdna_archspec::aie2::timing::ROUTE_LOCAL_TO_EXTERNAL;
 
 /// Memory quadrant (which tile's memory is being accessed).
 ///
@@ -120,7 +120,7 @@ impl MemoryQuadrant {
     /// Source: aie-rt `_XAie_GetTargetTileLoc()` (xaie_elfloader.c:124-183)
     #[inline]
     pub fn from_address(address: u32) -> Self {
-        use crate::arch;
+        use xdna_archspec::aie2 as arch;
         let card_dir = (address / arch::compute::MEMORY_SIZE as u32) as u8;
         match card_dir {
             d if d == arch::cardinal::SOUTH => Self::South,
@@ -170,13 +170,13 @@ impl MemoryQuadrant {
 }
 
 /// Size of each bank in bytes.
-pub const BANK_SIZE: usize = crate::arch::compute::PHYSICAL_BANK_SIZE as usize;
+pub const BANK_SIZE: usize = xdna_archspec::aie2::compute::PHYSICAL_BANK_SIZE as usize;
 
 /// Bank width in bytes (derived from ArchModel physical bank_width_bits).
-pub const BANK_WIDTH_BYTES: usize = crate::arch::compute::PHYSICAL_BANK_WIDTH_BITS as usize / 8;
+pub const BANK_WIDTH_BYTES: usize = xdna_archspec::aie2::compute::PHYSICAL_BANK_WIDTH_BITS as usize / 8;
 
 /// Base memory access latency (cycles).
-pub const BASE_LATENCY: u8 = crate::arch::timing::DATA_MEMORY_LATENCY;
+pub const BASE_LATENCY: u8 = xdna_archspec::aie2::timing::DATA_MEMORY_LATENCY;
 
 /// Additional stall cycles on bank conflict.
 pub const CONFLICT_PENALTY: u8 = 1;
@@ -575,7 +575,7 @@ mod tests {
         assert_eq!(BANK_WIDTH_BYTES, 16);
         assert_eq!(
             BANK_WIDTH_BYTES,
-            crate::arch::compute::PHYSICAL_BANK_WIDTH_BITS as usize / 8,
+            xdna_archspec::aie2::compute::PHYSICAL_BANK_WIDTH_BITS as usize / 8,
         );
     }
 

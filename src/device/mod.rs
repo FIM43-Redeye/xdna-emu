@@ -80,5 +80,5 @@ pub use dma::{
 };
 pub use stream_switch::{StreamSwitch, StreamPort, StreamPacket, PortDirection, PortType};
 
-// Architecture variant enum removed -- use ArchConfig trait or crate::arch::*
+// Architecture variant enum removed -- use ArchConfig trait or xdna_archspec::aie2::*
 // constants for architecture-specific values.

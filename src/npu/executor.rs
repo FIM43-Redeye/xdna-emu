@@ -1120,7 +1120,7 @@ fn decode_npu_address(addr: u32) -> (u8, u8, u32) {
     // This is for column 0, row 0
 
     // Tile address encoding: col|row|offset (AM020 Ch2, derived from ArchModel).
-    use crate::arch::{TILE_COL_SHIFT, TILE_ROW_SHIFT, TILE_OFFSET_MASK};
+    use xdna_archspec::aie2::{TILE_COL_SHIFT, TILE_ROW_SHIFT, TILE_OFFSET_MASK};
     let col = ((addr >> TILE_COL_SHIFT) & 0x7F) as u8;
     let row = ((addr >> TILE_ROW_SHIFT) & 0x1F) as u8;
     let offset = addr & TILE_OFFSET_MASK;

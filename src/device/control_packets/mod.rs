@@ -19,7 +19,7 @@
 //! # Operations
 //!
 //! The 2-bit operation field encodes four opcodes (derived from
-//! `crate::arch::ctrl_packet`):
+//! `xdna_archspec::aie2::ctrl_packet`):
 //!
 //! | Value | Operation    | Description                                    |
 //! |-------|-------------|------------------------------------------------|
@@ -48,7 +48,7 @@
 //!
 //! # Deriving from the Toolchain
 //!
-//! All header field positions are read from `crate::arch::ctrl_packet::*`
+//! All header field positions are read from `xdna_archspec::aie2::ctrl_packet::*`
 //! (generated from xdna-archspec, which derives from AM020/AM025). Operation
 //! codes match `OP_WRITE`, `OP_READ`, `OP_WRITE_INCR`, `OP_BLOCK_WRITE` from
 //! the same source. MaskWrite semantics (`(old & ~mask) | value`) match the

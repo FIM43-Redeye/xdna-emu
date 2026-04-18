@@ -24,13 +24,13 @@
 use super::BundleFormat;
 
 /// Slot widths in bits (from archspec processor model, sourced from AIE2Slots.td).
-pub const LDA_WIDTH: u8 = crate::arch::processor::LDA_WIDTH;
-pub const LDB_WIDTH: u8 = crate::arch::processor::LDB_WIDTH;
-pub const ALU_WIDTH: u8 = crate::arch::processor::ALU_WIDTH;
-pub const MV_WIDTH: u8 = crate::arch::processor::MV_WIDTH;
-pub const ST_WIDTH: u8 = crate::arch::processor::ST_WIDTH;
-pub const VEC_WIDTH: u8 = crate::arch::processor::VEC_WIDTH;
-pub const LNG_WIDTH: u8 = crate::arch::processor::LNG_WIDTH;
+pub const LDA_WIDTH: u8 = xdna_archspec::aie2::processor::LDA_WIDTH;
+pub const LDB_WIDTH: u8 = xdna_archspec::aie2::processor::LDB_WIDTH;
+pub const ALU_WIDTH: u8 = xdna_archspec::aie2::processor::ALU_WIDTH;
+pub const MV_WIDTH: u8 = xdna_archspec::aie2::processor::MV_WIDTH;
+pub const ST_WIDTH: u8 = xdna_archspec::aie2::processor::ST_WIDTH;
+pub const VEC_WIDTH: u8 = xdna_archspec::aie2::processor::VEC_WIDTH;
+pub const LNG_WIDTH: u8 = xdna_archspec::aie2::processor::LNG_WIDTH;
 
 /// Which slot type was detected in a bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

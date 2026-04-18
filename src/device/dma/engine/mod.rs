@@ -171,8 +171,8 @@ impl DmaEngine {
             mm2s_count: mm2s_channels,
             num_locks,
             num_banks: match tile_type {
-                TileType::Compute => crate::arch::compute::PHYSICAL_BANKS as usize,
-                TileType::MemTile => crate::arch::memtile::PHYSICAL_BANKS as usize,
+                TileType::Compute => xdna_archspec::aie2::compute::PHYSICAL_BANKS as usize,
+                TileType::MemTile => xdna_archspec::aie2::memtile::PHYSICAL_BANKS as usize,
                 TileType::Shim => 0,
             },
             cycle_dma_banks: 0,

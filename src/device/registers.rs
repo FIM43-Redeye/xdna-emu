@@ -41,7 +41,7 @@ impl TileAddress {
     /// [19:0]  = offset
     /// ```
     pub fn decode(addr: u32) -> Self {
-        use crate::arch::{TILE_COL_SHIFT, TILE_ROW_SHIFT, TILE_OFFSET_MASK};
+        use xdna_archspec::aie2::{TILE_COL_SHIFT, TILE_ROW_SHIFT, TILE_OFFSET_MASK};
         Self {
             col: ((addr >> TILE_COL_SHIFT) & 0x1F) as u8,
             row: ((addr >> TILE_ROW_SHIFT) & 0x1F) as u8,
@@ -51,7 +51,7 @@ impl TileAddress {
 
     /// Encode tile coordinates and offset into a 32-bit address.
     pub fn encode(col: u8, row: u8, offset: u32) -> u32 {
-        use crate::arch::{TILE_COL_SHIFT, TILE_ROW_SHIFT, TILE_OFFSET_MASK};
+        use xdna_archspec::aie2::{TILE_COL_SHIFT, TILE_ROW_SHIFT, TILE_OFFSET_MASK};
         ((col as u32) << TILE_COL_SHIFT) | ((row as u32) << TILE_ROW_SHIFT) | (offset & TILE_OFFSET_MASK)
     }
 
@@ -126,7 +126,7 @@ impl fmt::Display for RegisterInfo {
 /// BD base/stride/words derived from register database (AM025).
 fn lookup_dma_bd(offset: u32) -> Option<RegisterInfo> {
     let lay = super::regdb::device_reg_layout();
-    let bd_end = lay.memory_bd_base + crate::arch::compute::NUM_BDS as u32 * lay.memory_bd_stride;
+    let bd_end = lay.memory_bd_base + xdna_archspec::aie2::compute::NUM_BDS as u32 * lay.memory_bd_stride;
 
     if !(lay.memory_bd_base..bd_end).contains(&offset) {
         return None;
@@ -163,7 +163,7 @@ fn lookup_dma_bd(offset: u32) -> Option<RegisterInfo> {
 /// Lock base/stride derived from register database (AM025).
 fn lookup_lock(offset: u32) -> Option<RegisterInfo> {
     let lay = super::regdb::device_reg_layout();
-    let lock_end = lay.memory_lock_base + crate::arch::compute::NUM_LOCKS as u32 * lay.memory_lock_stride;
+    let lock_end = lay.memory_lock_base + xdna_archspec::aie2::compute::NUM_LOCKS as u32 * lay.memory_lock_stride;
 
     if !(lay.memory_lock_base..lock_end).contains(&offset) {
         return None;
@@ -394,7 +394,7 @@ pub fn decode_register(addr: u32) -> (TileAddress, Option<RegisterInfo>) {
 /// The generated subsystem constants for DataMemory cover only the AM025
 /// register group (a few bytes). Actual data memory is the full SRAM:
 /// 64KB for compute tiles, 512KB for memtiles. This function uses the
-/// architecture memory sizes from `crate::arch` for data memory routing.
+/// architecture memory sizes from `xdna_archspec::aie2` for data memory routing.
 ///
 /// # Overlap handling
 ///
@@ -412,8 +412,8 @@ pub fn subsystem_from_offset(
     offset: u32,
     tile_kind: TileKind,
 ) -> SubsystemKind {
-    use crate::arch;
-    use crate::arch::subsystem;
+    use xdna_archspec::aie2 as arch;
+    use xdna_archspec::aie2::subsystems as subsystem;
 
 
     // Strategy: check most-specific (smallest) ranges first, then broader
@@ -609,9 +609,9 @@ fn in_range(offset: u32, start: u32, end: u32) -> bool {
 /// - Rows >= COMPUTE_ROW_START: Compute
 pub fn tile_kind_from_row(row: u8) -> TileKind {
     use TileKind;
-    if row == crate::arch::SHIM_ROW {
+    if row == xdna_archspec::aie2::SHIM_ROW {
         TileKind::ShimNoc
-    } else if row < crate::arch::COMPUTE_ROW_START {
+    } else if row < xdna_archspec::aie2::COMPUTE_ROW_START {
         TileKind::Mem
     } else {
         TileKind::Compute
@@ -887,7 +887,7 @@ mod tests {
     fn gen_subsystems_accessible() {
         // Verify the generated subsystem module compiles and has expected constants.
         // Values come from AM025 register ranges, cross-validated with aie-rt.
-        use crate::arch::subsystem;
+        use xdna_archspec::aie2::subsystems as subsystem;
 
         // Compute tile: DMA at 0x1D000, Lock at 0x1F000
         assert_eq!(subsystem::compute::dma::OFFSET_START, 0x1D000);

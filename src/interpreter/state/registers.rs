@@ -88,7 +88,7 @@ pub const NUM_VECTOR_REGS: usize = 32;
 pub const NUM_ACCUMULATOR_REGS: usize = 18;
 
 /// Mask for pointer/modifier values (tile-local address width, from archspec).
-const PTR_MASK: u32 = crate::arch::TILE_OFFSET_MASK;
+const PTR_MASK: u32 = xdna_archspec::aie2::TILE_OFFSET_MASK;
 
 /// Scalar register file including special-purpose registers.
 ///

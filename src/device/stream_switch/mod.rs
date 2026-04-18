@@ -52,7 +52,7 @@ pub use packet_switch::*;
 #[cfg(test)]
 mod tests;
 
-use crate::arch::timing as arch_timing;
+use xdna_archspec::aie2::timing as arch_timing;
 
 /// Stream switch for a single tile.
 #[derive(Debug, Clone)]
@@ -129,8 +129,8 @@ impl StreamSwitch {
     /// Port layout is defined in arch::{COMPUTE_MASTER_PORTS, COMPUTE_SLAVE_PORTS}.
     /// Tile_Ctrl port type is data-driven from AM025 register database.
     pub fn new_compute_tile(col: u8, row: u8) -> Self {
-        let masters = Self::build_ports_from_spec(crate::arch::COMPUTE_MASTER_PORTS, PortDirection::Master);
-        let slaves = Self::build_ports_from_spec(crate::arch::COMPUTE_SLAVE_PORTS, PortDirection::Slave);
+        let masters = Self::build_ports_from_spec(xdna_archspec::aie2::COMPUTE_MASTER_PORTS, PortDirection::Master);
+        let slaves = Self::build_ports_from_spec(xdna_archspec::aie2::COMPUTE_SLAVE_PORTS, PortDirection::Slave);
 
         let num_slaves = slaves.len();
         let num_masters = masters.len();
@@ -161,8 +161,8 @@ impl StreamSwitch {
     /// 4 South masters but 6 South slaves. This matches MemTile's role as
     /// a buffer between Shim (which has 6 North outputs) and Compute tiles.
     pub fn new_mem_tile(col: u8, row: u8) -> Self {
-        let masters = Self::build_ports_from_spec(crate::arch::MEMTILE_MASTER_PORTS, PortDirection::Master);
-        let slaves = Self::build_ports_from_spec(crate::arch::MEMTILE_SLAVE_PORTS, PortDirection::Slave);
+        let masters = Self::build_ports_from_spec(xdna_archspec::aie2::MEMTILE_MASTER_PORTS, PortDirection::Master);
+        let slaves = Self::build_ports_from_spec(xdna_archspec::aie2::MEMTILE_SLAVE_PORTS, PortDirection::Slave);
 
         let num_slaves = slaves.len();
         let num_masters = masters.len();
@@ -191,8 +191,8 @@ impl StreamSwitch {
     ///
     /// The 6 North masters (12-17) connect 1:1 to MemTile South slaves (7-12).
     pub fn new_shim_tile(col: u8) -> Self {
-        let masters = Self::build_ports_from_spec(crate::arch::SHIM_MASTER_PORTS, PortDirection::Master);
-        let slaves = Self::build_ports_from_spec(crate::arch::SHIM_SLAVE_PORTS, PortDirection::Slave);
+        let masters = Self::build_ports_from_spec(xdna_archspec::aie2::SHIM_MASTER_PORTS, PortDirection::Master);
+        let slaves = Self::build_ports_from_spec(xdna_archspec::aie2::SHIM_SLAVE_PORTS, PortDirection::Slave);
 
         let num_slaves = slaves.len();
         let num_masters = masters.len();

@@ -1,7 +1,7 @@
 //! Control packet header parsing.
 //!
 //! Parses the 32-bit control packet header into structured fields using
-//! bit positions from `crate::arch::ctrl_packet::*` (generated from
+//! bit positions from `xdna_archspec::aie2::ctrl_packet::*` (generated from
 //! xdna-archspec, derived from AM020/AM025).
 //!
 //! # Header Layout (AM020 Table 3)
@@ -19,7 +19,7 @@ use std::fmt;
 /// Control packet operation codes.
 ///
 /// These map directly to the 2-bit operation field in the control packet
-/// header. Values are derived from `crate::arch::ctrl_packet::OP_*` constants
+/// header. Values are derived from `xdna_archspec::aie2::ctrl_packet::OP_*` constants
 /// (generated from xdna-archspec).
 ///
 /// Note: There is no MaskWrite opcode in control packets. MaskWrite is a
@@ -135,13 +135,13 @@ pub struct HeaderFields {
 
 /// Parse control packet header fields from a raw 32-bit word.
 ///
-/// Uses `crate::arch::ctrl_packet::*` constants for all bit positions,
+/// Uses `xdna_archspec::aie2::ctrl_packet::*` constants for all bit positions,
 /// ensuring derivation from the toolchain rather than hardcoded values.
 ///
 /// Returns `Err` only if the operation field is invalid (impossible with
 /// a 2-bit field, but handled defensively).
 pub fn parse_header(header: u32) -> Result<HeaderFields, ParseError> {
-    use crate::arch::ctrl_packet::*;
+    use xdna_archspec::aie2::ctrl_packet::*;
 
     let address = header & ADDRESS_MASK;
     let beats = ((header >> LENGTH_SHIFT) & LENGTH_MASK) as u8 + 1;
@@ -171,7 +171,7 @@ pub fn build_header(
     opcode: CtrlOpCode,
     response_id: u8,
 ) -> u32 {
-    use crate::arch::ctrl_packet::*;
+    use xdna_archspec::aie2::ctrl_packet::*;
 
     let length_val = beats.saturating_sub(1) as u32;
 
@@ -324,7 +324,7 @@ mod tests {
 
     // Helper to build a header word from raw field values.
     fn make_header(address: u32, length_raw: u8, operation: u8, response_id: u8) -> u32 {
-        use crate::arch::ctrl_packet::*;
+        use xdna_archspec::aie2::ctrl_packet::*;
         (address & ADDRESS_MASK)
             | ((length_raw as u32 & LENGTH_MASK) << LENGTH_SHIFT)
             | ((operation as u32 & OPERATION_MASK) << OPERATION_SHIFT)
@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn opcode_repr_matches_arch_constants() {
-        use crate::arch::ctrl_packet::*;
+        use xdna_archspec::aie2::ctrl_packet::*;
         assert_eq!(CtrlOpCode::Write as u8, OP_WRITE);
         assert_eq!(CtrlOpCode::Read as u8, OP_READ);
         assert_eq!(CtrlOpCode::WriteIncr as u8, OP_WRITE_INCR);

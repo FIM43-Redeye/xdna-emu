@@ -571,7 +571,7 @@ impl Transfer {
 ///
 /// Returns (col, row) extracted from header bits 27:21 and 20:16.
 pub fn parse_source_tile_from_header(header: u32) -> (u8, u8) {
-    use crate::arch::packet;
+    use xdna_archspec::aie2::packet;
     let col = ((header >> packet::SRC_COL_SHIFT) & packet::SRC_COL_MASK) as u8;
     let row = ((header >> packet::SRC_ROW_SHIFT) & packet::SRC_ROW_MASK) as u8;
     (col, row)
@@ -581,7 +581,7 @@ pub fn parse_source_tile_from_header(header: u32) -> (u8, u8) {
 ///
 /// Returns the 3-bit packet type from bits 14:12.
 pub fn parse_packet_type_from_header(header: u32) -> u8 {
-    use crate::arch::packet;
+    use xdna_archspec::aie2::packet;
     ((header >> packet::TYPE_SHIFT) & packet::TYPE_MASK) as u8
 }
 
@@ -589,6 +589,6 @@ pub fn parse_packet_type_from_header(header: u32) -> u8 {
 ///
 /// Returns the 5-bit stream ID from bits 4:0.
 pub fn parse_stream_id_from_header(header: u32) -> u8 {
-    use crate::arch::packet;
+    use xdna_archspec::aie2::packet;
     (header & packet::STREAM_ID_MASK) as u8
 }

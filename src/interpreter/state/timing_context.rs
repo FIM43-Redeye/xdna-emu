@@ -131,7 +131,7 @@ pub struct PendingBranch {
 }
 
 /// Branch delay slot count (pipeline depth, from archspec processor model).
-const BRANCH_DELAY_SLOTS: u8 = crate::arch::processor::BRANCH_DELAY_SLOTS;
+const BRANCH_DELAY_SLOTS: u8 = xdna_archspec::aie2::processor::BRANCH_DELAY_SLOTS;
 
 /// Initial counter value: BRANCH_DELAY_SLOTS + 1 because tick() is called on
 /// the branch cycle itself (before the first delay-slot instruction executes).

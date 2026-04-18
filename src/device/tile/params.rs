@@ -1,7 +1,7 @@
 //! Constants and construction parameters for AIE tiles.
 
 /// Size of program memory (16 KB = 1024 x 128-bit instructions).
-pub const PROGRAM_MEMORY_SIZE: usize = crate::arch::compute::PROGRAM_MEMORY_SIZE as usize;
+pub const PROGRAM_MEMORY_SIZE: usize = xdna_archspec::aie2::compute::PROGRAM_MEMORY_SIZE as usize;
 
 /// Parameters for constructing a Tile with correct per-tile-type sizing.
 ///
@@ -27,7 +27,7 @@ pub struct TileParams {
 impl TileParams {
     /// NPU1/AIE2 compute tile params, from compile-time arch constants.
     pub fn compute() -> Self {
-        use crate::arch;
+        use xdna_archspec::aie2 as arch;
         let ch = arch::compute::NUM_DMA_CHANNELS as usize;
         Self {
             data_memory_size: arch::compute::MEMORY_SIZE as usize,
@@ -41,7 +41,7 @@ impl TileParams {
 
     /// NPU1/AIE2 memory tile params, from compile-time arch constants.
     pub fn mem_tile() -> Self {
-        use crate::arch;
+        use xdna_archspec::aie2 as arch;
         let ch = arch::memtile::NUM_DMA_CHANNELS as usize;
         Self {
             data_memory_size: arch::memtile::MEMORY_SIZE as usize,
@@ -55,7 +55,7 @@ impl TileParams {
 
     /// NPU1/AIE2 shim tile params, from compile-time arch constants.
     pub fn shim() -> Self {
-        use crate::arch;
+        use xdna_archspec::aie2 as arch;
         let ch = arch::shim::NUM_DMA_CHANNELS as usize;
         Self {
             data_memory_size: 0,
