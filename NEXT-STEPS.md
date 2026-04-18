@@ -3,9 +3,9 @@
 Recovery document for picking up this refactor in a future session. Read
 this first, then dive into the authoritative artifacts below.
 
-**Last updated:** 2026-04-18 (Phase 1b Subsystem 6 landed; Subsystem 2 up next)
+**Last updated:** 2026-04-18 (Phase 1b Subsystem 2 landed; Subsystem 3 up next)
 **Current branch:** `dev` (no master merges until the refactor is done)
-**Latest tag:** `phase1-subsys-isa-decode` (Part B commits land on top of `phase1-subsys-isa-decode-partA`)
+**Latest tag:** `phase1-subsys-tile-topo` (Subsystem 2 completion)
 
 ---
 
@@ -193,8 +193,8 @@ when we start it -- don't try to pre-write all 8 subsystem plans.
 |---|-----------|-----|--------|-------------|
 | 1 | Registers & Memory Map | `phase1-subsys-regs-mem` | **Done (reduced scope)** | Plumb hardcoded register offsets, memory sizes, per-tile-type counts through `ArchModel`. Mostly data; no new trait. Tasks 9+10 deferred to Subsystem 6; see audit. |
 | 6 | ISA Decode | `phase1-subsys-isa-decode` | **Done** | Decoder tables, bytecode walker, MCDisassembler FFI and the resolver/types modules moved to `xdna_archspec::aie2::isa`; `MappedOperand` / `RegisterMap` / `AccumWidth` (interpreter-coupled) moved to `xdna_emu::interpreter::decode::register_map`. Subsystem 1's deferred Tasks 9/10 absorbed. No trait seam -- see `docs/arch/isa-decode.md`. |
-| 2 | Tile Topology | `phase1-subsys-tile-topo` | **Up next** | Replace `row == 0` / `row >= N` checks with `ArchModel`-backed classification. **Includes the deferred `TileType` -> `TileKind` deep rename**: merge `Shim`/`ShimNoc`, rename `MemTile` -> `Mem`. |
-| 3 | DMA Engine & BD Format | `phase1-subsys-dma` | Pending | First behavioral seam. Audit AIE2 vs AIE1 BD layout via aie-rt source. Lift BD parse/encode + channel stepping behind `DmaModel` trait. |
+| 2 | Tile Topology | `phase1-subsys-tile-topo` | **Done** | Trait seam (TileTopology) + AIE2 impl. TileType->TileKind deep rename. 2 bare row==0 hardcodes + 4 row>0 neighbor guards routed through archspec constants. See docs/arch/tile-topology.md. |
+| 3 | DMA Engine & BD Format | `phase1-subsys-dma` | **Up next** | First behavioral seam. Audit AIE2 vs AIE1 BD layout via aie-rt source. Lift BD parse/encode + channel stepping behind `DmaModel` trait. |
 | 4 | Locks | `phase1-subsys-locks` | Pending | Small seam exercise. `LockModel` trait if acquire/release/value semantics genuinely differ (likely around lock value width). |
 | 5 | Stream Switch | `phase1-subsys-stream-switch` | Pending | Topology (data, already via archspec) + routing legality (behavior, trait: `StreamSwitchModel`). |
 | 7 | ISA Execute | `phase1-subsys-isa-execute` | Pending | Semantic ops, intrinsic handlers. Biggest; largest files live here (`vmac_routing.rs` 239KB, `memory/mod.rs` 124KB). `IsaExecutor` trait. |
@@ -206,71 +206,63 @@ platform differences." Neither requires re-plumbing.
 
 ---
 
-## How to Pick Up Subsystem 2 (Tile Topology)
+## How to Pick Up Subsystem 3 (DMA Engine & BD Format)
 
 This is the concrete next action. Start here in a fresh session.
 
 1. **Read the key artifacts:**
    - `docs/superpowers/specs/2026-04-16-device-family-refactor-design.md` (parent)
    - `docs/superpowers/plans/2026-04-16-device-family-refactor-plan.md` (parent plan)
-   - `docs/arch/phase1a-audit.md` -- `## Follow-ups flagged` lists the
-     deferred `TileType` -> `TileKind` rename and the `Shim`/`ShimNoc`
-     merge, both of which belong in Subsystem 2.
-   - `docs/arch/subsys1-audit.md` -- any tile-topology hardcodes that
-     Subsystem 1 left behind.
+   - `docs/arch/phase1a-audit.md` -- the DMA-channel fallback `(2, 2)` noted
+     under "Follow-ups flagged" is Subsystem 3 scope.
+   - `docs/arch/subsys2-audit.md` -- Subsystem 2 completion; gives the
+     current tile-topology trait surface that Subsystem 3 consumes.
+   - `docs/arch/tile-topology.md` -- the per-seam design note template
+     Subsystem 3 should mimic for `docs/arch/dma-model.md`.
    - `docs/arch/subsys6-audit.md` -- Part A + Part B completion logs;
-     useful as a template for how a subsystem's audit should be
-     structured and for how sed-driven consumer rewrites were handled.
-   - `docs/arch/isa-decode.md` -- Subsystem 6's mandatory per-seam
-     design note; use it as the template for Subsystem 2's note
-     (`docs/arch/tile-topology.md`).
+     still the best template for how an audit is structured.
 
 2. **Verify the current state hasn't drifted:**
    ```bash
-   git log --oneline phase1-subsys-isa-decode..HEAD
+   git log --oneline phase1-subsys-tile-topo..HEAD
    ```
    If nothing has landed since the tag, you're picking up exactly where
-   Subsystem 6 left off.
+   Subsystem 2 left off.
 
    ```bash
    PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
    PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec --lib 2>&1 | tail -3
    ```
-   Expect xdna-emu `2712 passed; 0 failed; 5 ignored` and archspec
-   `220 passed; 1 failed; 2 ignored` (the one failure is the
-   pre-existing `device_model::test_full_parse_all_devices`).
+   Expect xdna-emu `2708 passed; 0 failed; 5 ignored` and archspec
+   `236 passed; 1 failed; 2 ignored` (pre-existing
+   `test_full_parse_all_devices`).
 
-3. **Invoke brainstorming** to shape Subsystem 2's spec:
+3. **Invoke brainstorming** to shape Subsystem 3's spec:
    ```
    /brainstorming
    ```
-   Topic: "Phase 1b Subsystem 2: Tile Topology, including the deferred
-   `TileType` -> `TileKind` deep rename."
+   Topic: "Phase 1b Subsystem 3: DMA Engine & BD Format."
 
    **Shape the spec around these questions:**
-   - Which tile-classification predicates in `src/device/` and
-     `src/interpreter/` are still doing `row == 0` or `row >= N`
-     instead of asking `ArchModel`?
-   - Does `TileKind` in archspec need new variants for AIE1 / AIE2P
-     cases we don't currently distinguish, or is the `Shim/ShimNoc/Mem/
-     Compute` set already sufficient?
-   - Is the `From<TileType>` / `Into<TileKind>` bridge at
-     `src/device/tile/core_state.rs` ready to dissolve, or does the
-     runtime path still need the `TileType` alias?
-   - Is there a behavioral seam here (different row-indexing per arch
-     family, different shim-mux placement) that wants a `TileTopology`
-     trait, or is this pure plumbing?
+   - Does AIE2 vs AIE1 BD layout diverge at the field level, or only at
+     the per-tile-type level that archspec already parameterizes via
+     aiert modules?
+   - Which channel-stepping behaviors are actually per-arch vs. just
+     per-tile-type?
+   - What does the "what would AIE1 look like?" answer for DMA look
+     like, and does it justify a trait seam for BD parsing alone, for
+     channel stepping alone, or both?
+   - Is the silent channel-fallback `(2, 2)` from Phase 1a scope here,
+     or Phase 2 hygiene?
 
 4. **Invoke writing-plans** to produce a plan at
-   `docs/superpowers/plans/YYYY-MM-DD-subsys2-tile-topology.md`.
+   `docs/superpowers/plans/YYYY-MM-DD-subsys3-dma.md`.
 
-5. **Invoke subagent-driven-development** to execute.  Template:
-   implementer subagent per task; spec-compliance + code-quality review
-   gates; same-session orchestration.
+5. **Invoke subagent-driven-development** to execute.
 
-6. **At end of Subsystem 2:** tag `phase1-subsys-tile-topo`, append a
+6. **At end of Subsystem 3:** tag `phase1-subsys-dma`, append a
    completion section to its audit, update this `NEXT-STEPS.md` to
-   move Subsystem 3 (DMA Engine) to "up next."
+   move Subsystem 4 (Locks) to "up next."
 
 ---
 
@@ -283,12 +275,12 @@ This is the concrete next action. Start here in a fresh session.
 export PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH
 
 # Commit history at the current refactor frontier
-git log --oneline phase1-subsys-isa-decode..HEAD
-git log --oneline phase1-subsys-regs-mem..phase1-subsys-isa-decode
+git log --oneline phase1-subsys-tile-topo..HEAD
+git log --oneline phase1-subsys-isa-decode..phase1-subsys-tile-topo
 
 # Run library tests (Global Invariant; green at every commit)
-cargo test --lib                         # expect 2712 pass at the tag
-cargo test -p xdna-archspec --lib        # expect 220 pass + 1 known fail
+cargo test --lib                         # expect 2708 pass at the tag
+cargo test -p xdna-archspec --lib        # expect 236 pass + 1 known fail
 
 # Fast bridge smoke (catches 90% of regressions, ~30s)
 ./scripts/emu-bridge-test.sh --no-hw -v add_one_cpp_aiecc

@@ -135,7 +135,15 @@ Neither adds for AIE2 today.
 
 ---
 
-## Completion
+## Completion (2026-04-18)
 
-*(To be filled in by Task 8 with final LOC counts, test deltas, and
-the specific commit shas.)*
+Landed at `phase1-subsys-tile-topo`. Net effect:
+
+- `xdna_archspec::topology::{TileTopology, Direction}` trait + enum live at the crate root.
+- `xdna_archspec::aie2::topology::Aie2Topology` concrete impl for AIE2-family devices (NPU1/NPU4/NPU5/NPU6).
+- `xdna_archspec::types::ArchModel::topology()` accessor dispatches on `Architecture` (actual impl block lives in `topology.rs` due to a `#[path]`-include constraint in `build.rs`).
+- `xdna_archspec::types::TileKind` gains `const fn` inherent predicates `is_shim` / `is_mem` / `is_compute`.
+- `xdna-emu`'s `TileType` enum + `From` bridge deleted; all consumers migrate to `TileKind`.
+- Two bare `row == 0` tile-classification hardcodes and four memory-neighbor `row > 0` guards now route through archspec's `SHIM_ROW` constant (the trait exists; full-dispatch migration for those call paths is natural Subsystem 7 work).
+
+Verification: `cargo test --lib` = 2708, archspec = 236, full bridge = phase1-subsys-isa-decode baseline (no new regressions), ISA = 0 fail out of 4815.
