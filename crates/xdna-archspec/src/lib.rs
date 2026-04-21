@@ -16,6 +16,7 @@
 pub mod aie2;
 pub mod device_model;
 pub mod dma;
+pub mod locks;
 pub mod model_builder;
 pub mod regdb;
 pub mod regdb_extractor;

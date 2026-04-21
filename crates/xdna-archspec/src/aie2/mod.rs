@@ -98,6 +98,9 @@ pub mod topology;
 /// AIE2-family DMA model (`Aie2DmaModel` + `AIE2_DMA_MODEL` static). Subsystem 3 seam.
 pub mod dma;
 
+/// AIE2-family lock model (`Aie2LockModel` + `AIE2_LOCK_MODEL` static). Subsystem 4 seam.
+pub mod locks;
+
 /// Instruction set architecture: decoder tables, runtime model, and
 /// LLVM MCDisassembler FFI. Populated during Subsystem 6 Part A.
 pub mod isa;
