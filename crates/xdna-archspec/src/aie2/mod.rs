@@ -101,6 +101,10 @@ pub mod dma;
 /// AIE2-family lock model (`Aie2LockModel` + `AIE2_LOCK_MODEL` static). Subsystem 4 seam.
 pub mod locks;
 
+/// AIE2-family stream switch model (`Aie2StreamSwitchModel` +
+/// `AIE2_STREAM_SWITCH_MODEL` static). Subsystem 5 seam.
+pub mod stream_switch_model;
+
 /// Instruction set architecture: decoder tables, runtime model, and
 /// LLVM MCDisassembler FFI. Populated during Subsystem 6 Part A.
 pub mod isa;
