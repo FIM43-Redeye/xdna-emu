@@ -65,10 +65,13 @@ to archspec.
   decisions before and after. The test suite catches any drift.
 - **No second-arch implementation during the refactor.** Phase 1
   ground rule.
-- **No `AieRtPortType` API change.** The carrier preserves the enum
-  type (`&'static [(AieRtPortType, u8)]`) across the seam; `PortLayout`'s
-  `&'static [u8]` return type is a narrower convenience that goes away
-  with the extension trait.
+- **No port-array element-type change.** The carrier preserves the
+  existing `&'static [u8]` array type (port-type ordinals encoded via
+  `xdna_archspec::aie2::port_type::{CORE, FIFO, CTRL, north(n), south(n),
+  east(n), west(n), dma(n)}` const fns in the generated
+  `gen_stream_ports.rs`). Promoting to a richer enum (e.g.,
+  `&'static [(AieRtPortType, u8)]`) is a separate future concern, not
+  a stream-switch seam concern.
 
 ---
 
@@ -285,8 +288,8 @@ Not on the trait:
 ```rust
 #[derive(Debug, Clone, Copy)]
 pub struct TileStreamPorts {
-    pub master_ports: &'static [(AieRtPortType, u8)],
-    pub slave_ports: &'static [(AieRtPortType, u8)],
+    pub master_ports: &'static [u8],   // port-type ordinals per xdna_archspec::aie2::port_type
+    pub slave_ports:  &'static [u8],
     pub north_master: (u8, u8),    // (start, end) inclusive
     pub south_master: (u8, u8),    // (0, 0) sentinel if N/A (shim)
     pub north_slave:  (u8, u8),
