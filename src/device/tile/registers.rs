@@ -155,7 +155,7 @@ impl Tile {
         if (lock_base..lock_end).contains(&offset) {
             let lock_id = ((offset - lock_base) / lock_stride) as usize;
             if lock_id < self.locks.len() {
-                return self.locks[lock_id].value as u32 & reg_layout.lock_value_mask;
+                return self.locks[lock_id].value as u32 & crate::device::arch_handle::lock_value_layout().mask;
             }
         }
 

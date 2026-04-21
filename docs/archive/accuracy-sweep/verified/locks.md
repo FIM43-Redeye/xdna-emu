@@ -88,7 +88,7 @@ field for reading/writing the current lock value:
 - LSB = 0
 
 This is a different interface from the Lock_Request register. The emulator's
-`sign_extend_lock_value()` correctly handles this 6-bit field, deriving the
+`LockValueLayout::sign_extend()` (on the archspec-side AIE2_LOCK_VALUE_LAYOUT) correctly handles this 6-bit field, deriving the
 width and mask from the AM025 register database at startup.
 
 ### Value Range (MATCH)

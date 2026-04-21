@@ -47,6 +47,7 @@
 //! assert_eq!(addr.row, 2);
 //! ```
 
+pub mod arch_handle;
 pub mod banking;
 pub mod port_layout;
 pub mod model;

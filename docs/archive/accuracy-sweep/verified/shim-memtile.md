@@ -168,7 +168,7 @@ distinguished from compute lock base (0x1F000). MemTile lock count = 64
 ### 13. Sign Extension for Lock Values
 
 `sign_extend_7bit()` correctly extends 7-bit lock values to i8.
-`sign_extend_lock_value()` derives field width from regdb (6 bits for AIE2).
+`LockValueLayout::sign_extend()` operates on the archspec-side AIE2_LOCK_VALUE_LAYOUT (width=6 / mask=0x3F for AIE2).
 
 ### 14. BD-to-BdConfig Conversion
 

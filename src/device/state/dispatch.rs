@@ -48,15 +48,15 @@ impl DeviceState {
                 if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
                     match tile_kind {
                         TileKind::Mem => {
-                            Self::write_lock_value(reg_layout, tile, tile_addr,
+                            Self::write_lock_value(tile, tile_addr,
                                 reg_layout.memtile_lock_base, reg_layout.memtile_lock_stride, value, "MemTile");
                         }
                         TileKind::Compute => {
-                            Self::write_lock_value(reg_layout, tile, tile_addr,
+                            Self::write_lock_value(tile, tile_addr,
                                 reg_layout.memory_lock_base, reg_layout.memory_lock_stride, value, "Compute");
                         }
                         TileKind::ShimNoc | TileKind::ShimPl => {
-                            Self::write_lock_value(reg_layout, tile, tile_addr,
+                            Self::write_lock_value(tile, tile_addr,
                                 reg_layout.shim_lock_base, reg_layout.shim_lock_stride, value, "Shim");
                         }
                     }
@@ -171,15 +171,15 @@ impl DeviceState {
                 SubsystemKind::Lock => {
                     match tile_kind {
                         TileKind::Mem => {
-                            Self::mask_write_lock_value(reg_layout, tile, tile_addr.offset,
+                            Self::mask_write_lock_value(tile, tile_addr.offset,
                                 reg_layout.memtile_lock_base, reg_layout.memtile_lock_stride, mask, value);
                         }
                         TileKind::Compute => {
-                            Self::mask_write_lock_value(reg_layout, tile, tile_addr.offset,
+                            Self::mask_write_lock_value(tile, tile_addr.offset,
                                 reg_layout.memory_lock_base, reg_layout.memory_lock_stride, mask, value);
                         }
                         TileKind::ShimNoc | TileKind::ShimPl => {
-                            Self::mask_write_lock_value(reg_layout, tile, tile_addr.offset,
+                            Self::mask_write_lock_value(tile, tile_addr.offset,
                                 reg_layout.shim_lock_base, reg_layout.shim_lock_stride, mask, value);
                         }
                     }

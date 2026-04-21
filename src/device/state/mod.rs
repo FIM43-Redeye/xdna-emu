@@ -40,14 +40,6 @@ use super::regdb;
 use xdna_archspec::types::{SubsystemKind, TileKind};
 use crate::parser::cdo::{Cdo, CdoCommand};
 
-/// Sign-extend a lock value from a register u32 to i8.
-///
-/// Delegates to DeviceRegLayout::sign_extend_lock_value() which derives the
-/// field width from the AM025 register database (6 bits for AIE2).
-fn sign_extend_lock_value(reg_layout: &regdb::DeviceRegLayout, raw: u32) -> i8 {
-    reg_layout.sign_extend_lock_value(raw)
-}
-
 /// Statistics about CDO application.
 #[derive(Debug, Default)]
 pub struct CdoStats {

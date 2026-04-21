@@ -10,9 +10,8 @@ impl DeviceState {
     /// Write a lock value (direct write, no mask).
     ///
     /// Lock registers are 16 bytes (LOCK_STRIDE) apart per AM025.
-    /// Lock_Value field width is derived from the register database.
+    /// Lock_Value field width is derived from the archspec LockValueLayout.
     pub(super) fn write_lock_value(
-        reg_layout: &regdb::DeviceRegLayout,
         tile: &mut Tile,
         tile_addr: TileAddress,
         base: u32,
@@ -22,7 +21,7 @@ impl DeviceState {
     ) {
         let lock_idx = ((tile_addr.offset - base) / stride) as usize;
         if lock_idx < tile.locks.len() {
-            let signed = sign_extend_lock_value(reg_layout, value);
+            let signed = crate::device::arch_handle::lock_value_layout().sign_extend(value);
             tile.locks[lock_idx].set(signed);
             if value != 0 {
                 log::info!("CDO init {} lock {} on tile ({},{}) = {}",
@@ -33,7 +32,6 @@ impl DeviceState {
 
     /// Masked write to a lock value.
     pub(super) fn mask_write_lock_value(
-        reg_layout: &regdb::DeviceRegLayout,
         tile: &mut Tile,
         offset: u32,
         base: u32,
@@ -43,10 +41,12 @@ impl DeviceState {
     ) {
         let lock_idx = ((offset - base) / stride) as usize;
         if lock_idx < tile.locks.len() {
-            // Read current value in unsigned representation for mask ops
-            let current_raw = (tile.locks[lock_idx].value as u8 & reg_layout.lock_value_mask as u8) as u32;
+            // Read current value in unsigned representation for mask ops.
+            // Mask is derived from the archspec LockValueLayout (6-bit field for AIE2).
+            let layout = crate::device::arch_handle::lock_value_layout();
+            let current_raw = (tile.locks[lock_idx].value as u8 & layout.mask as u8) as u32;
             let new_raw = (current_raw & !mask) | (value & mask);
-            let signed = sign_extend_lock_value(reg_layout, new_raw);
+            let signed = layout.sign_extend(new_raw);
             tile.locks[lock_idx].set(signed);
         }
     }
