@@ -95,6 +95,9 @@ pub mod aiert;
 /// AIE2-family tile topology impl (`Aie2Topology`). Subsystem 2 seam.
 pub mod topology;
 
+/// AIE2-family DMA model (`Aie2DmaModel` + `AIE2_DMA_MODEL` static). Subsystem 3 seam.
+pub mod dma;
+
 /// Instruction set architecture: decoder tables, runtime model, and
 /// LLVM MCDisassembler FFI. Populated during Subsystem 6 Part A.
 pub mod isa;
