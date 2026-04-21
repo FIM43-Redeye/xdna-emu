@@ -342,8 +342,10 @@ impl DmaEngine {
         self.trace(EventType::DmaFinishedTask { channel: ch_idx as u8 });
         self.maybe_emit_task_token(ch_idx);
 
-        // Check for more tasks in the queue
-        if !self.channels[ch_idx].task_queue.is_empty() {
+        // Check for more tasks in the queue (AIE2+ only).
+        if self.dma_model.supports_task_queue()
+            && !self.channels[ch_idx].task_queue.is_empty()
+        {
             log::debug!("DMA tile({},{}) ch{} task complete, {} tasks remaining in queue",
                 self.col, self.row, ch_idx, self.channels[ch_idx].task_queue.len());
             self.start_next_queued_task(ch_idx as u8);

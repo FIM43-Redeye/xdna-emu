@@ -16,6 +16,17 @@ impl DmaEngine {
         repeat_count: u8,
         enable_token_issue: bool,
     ) -> bool {
+        if !self.dma_model.supports_task_queue() {
+            // AIE1 has no task queue; this call silently fails.  In
+            // production, AIE1 code paths never reach here (higher
+            // layers check the flag), but guard defensively.
+            log::trace!(
+                "DMA tile({},{}) ch{} enqueue_task ignored: arch has no task queue",
+                self.col, self.row, channel
+            );
+            return false;
+        }
+
         let ch_idx = channel as usize;
         if ch_idx >= self.channels.len() {
             return false;
@@ -94,6 +105,9 @@ impl DmaEngine {
 
     /// Get the current task queue size for a channel.
     pub fn task_queue_size(&self, channel: u8) -> usize {
+        if !self.dma_model.supports_task_queue() {
+            return 0;
+        }
         self.channels
             .get(channel as usize)
             .map(|ch| ch.task_queue.len())
@@ -102,6 +116,9 @@ impl DmaEngine {
 
     /// Check if the task queue overflow flag is set for a channel.
     pub fn task_queue_overflow(&self, channel: u8) -> bool {
+        if !self.dma_model.supports_task_queue() {
+            return false;
+        }
         self.channels
             .get(channel as usize)
             .map(|ch| ch.task_queue.has_overflow())
@@ -110,6 +127,9 @@ impl DmaEngine {
 
     /// Clear the task queue overflow flag (write-to-clear per AM025).
     pub fn clear_task_queue_overflow(&mut self, channel: u8) {
+        if !self.dma_model.supports_task_queue() {
+            return;
+        }
         if let Some(ch) = self.channels.get_mut(channel as usize) {
             ch.task_queue.clear_overflow();
         }

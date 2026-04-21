@@ -29,13 +29,15 @@ impl DmaEngine {
             status = layout.cur_bd.insert(status, bd_idx as u32);
         }
 
-        // Task_Queue_Size
-        let queue_size = ch.task_queue.len() as u32;
-        status = layout.task_queue_size.insert(status, queue_size);
+        // Task_Queue_Size + Task_Queue_Overflow (AIE2+ only; AIE1
+        // status register has StartQSize/Stalled instead).
+        if self.dma_model.supports_task_queue() {
+            let queue_size = ch.task_queue.len() as u32;
+            status = layout.task_queue_size.insert(status, queue_size);
 
-        // Task_Queue_Overflow
-        if ch.task_queue.has_overflow() {
-            status = layout.task_queue_overflow.set_bit(status);
+            if ch.task_queue.has_overflow() {
+                status = layout.task_queue_overflow.set_bit(status);
+            }
         }
 
         // Error_BD_Unavailable
@@ -103,6 +105,9 @@ impl DmaEngine {
 
     /// Get whether out-of-order mode is enabled for a channel (S2MM).
     pub fn is_out_of_order_enabled(&self, channel: u8) -> bool {
+        if !self.dma_model.supports_ooo_mode() {
+            return false;
+        }
         self.channels
             .get(channel as usize)
             .map(|ch| ch.task_config.out_of_order_enable)
@@ -140,14 +145,26 @@ impl DmaEngine {
         decompression_enable: bool,
         out_of_order_enable: bool,
     ) {
+        // On archs without compression (AIE1), silently drop the
+        // compression bits -- setting them would be a no-op during
+        // the transfer path since supports_compression() gates the
+        // compression callers in stepping.rs.
+        let effective_compress = compression_enable && self.dma_model.supports_compression();
+        let effective_decompress = decompression_enable && self.dma_model.supports_compression();
+        // Same for OOO.
+        let effective_ooo = out_of_order_enable && self.dma_model.supports_ooo_mode();
+
         if let Some(ch) = self.channels.get_mut(ch_idx as usize) {
-            ch.task_config.compression_enable = compression_enable;
-            ch.task_config.decompression_enable = decompression_enable;
-            ch.task_config.out_of_order_enable = out_of_order_enable;
+            ch.task_config.compression_enable = effective_compress;
+            ch.task_config.decompression_enable = effective_decompress;
+            ch.task_config.out_of_order_enable = effective_ooo;
 
             log::trace!(
-                "DMA tile({},{}) ch{} set compression config: compress={} decompress={} ooo={}",
-                self.col, self.row, ch_idx, compression_enable, decompression_enable, out_of_order_enable
+                "DMA tile({},{}) ch{} set compression config: compress={} decompress={} ooo={} \
+                 (requested compress={} decompress={} ooo={})",
+                self.col, self.row, ch_idx,
+                effective_compress, effective_decompress, effective_ooo,
+                compression_enable, decompression_enable, out_of_order_enable,
             );
         }
     }
