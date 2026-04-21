@@ -1,3 +1,12 @@
+//! DMA model trait and pre-resolved register layouts for NPU DMA engines.
+//!
+//! `field_layouts` contains BD/channel/status field structs (migrated from
+//! xdna-emu Subsystem 3). `layouts` contains `DeviceRegLayout`, the top-level
+//! aggregator that resolves all field layouts for one device architecture.
+//! `mod` (this file) contains the `DmaModel` trait for per-arch behavior.
+//!
+//! Original module doc:
+//!
 //! DMA model trait: feature flags and timing carrier for per-arch DMA
 //! behavior.
 //!
@@ -16,6 +25,20 @@
 //! FSM dispatch stays tile-type-dispatched in xdna-emu; trait calls happen
 //! at DmaEngine construction and at the ~5 call-site boundaries where AIE2
 //! features are disabled for other archs.
+
+pub mod field_layouts;
+pub mod layouts;
+#[cfg(test)]
+mod layouts_tests;
+
+pub use field_layouts::{
+    BdFieldLayout, ChannelFieldLayout, StatusFieldLayout,
+    MemTileBdFieldLayout, ShimBdFieldLayout,
+    ShimMuxField, ShimMuxLayout,
+    StreamSwitchLayout, ModuleEventLayout,
+};
+
+pub use layouts::DeviceRegLayout;
 
 use crate::types::TileKind;
 

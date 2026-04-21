@@ -5,7 +5,7 @@
 //! emulation. This avoids repeated hash map lookups on every BD parse or
 //! channel control access.
 
-use xdna_archspec::regdb::{BitField, RegisterDb};
+use crate::regdb::{BitField, RegisterDb};
 
 // ============================================================================
 // Compute tile BD layout (6 words)
