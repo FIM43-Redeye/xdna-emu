@@ -3,9 +3,9 @@
 Recovery document for picking up this refactor in a future session. Read
 this first, then dive into the authoritative artifacts below.
 
-**Last updated:** 2026-04-21 (Phase 1b Subsystem 3 landed; Subsystem 4 up next)
+**Last updated:** 2026-04-21 (Phase 1b Subsystem 4 landed; Subsystem 5 up next)
 **Current branch:** `dev` (no master merges until the refactor is done)
-**Latest tag:** `phase1-subsys-dma` (Subsystem 3 completion)
+**Latest tag:** `phase1-subsys-locks` (Subsystem 4 completion)
 
 ---
 
@@ -195,8 +195,8 @@ when we start it -- don't try to pre-write all 8 subsystem plans.
 | 6 | ISA Decode | `phase1-subsys-isa-decode` | **Done** | Decoder tables, bytecode walker, MCDisassembler FFI and the resolver/types modules moved to `xdna_archspec::aie2::isa`; `MappedOperand` / `RegisterMap` / `AccumWidth` (interpreter-coupled) moved to `xdna_emu::interpreter::decode::register_map`. Subsystem 1's deferred Tasks 9/10 absorbed. No trait seam -- see `docs/arch/isa-decode.md`. |
 | 2 | Tile Topology | `phase1-subsys-tile-topo` | **Done** | Trait seam (TileTopology) + AIE2 impl. TileType->TileKind deep rename. 2 bare row==0 hardcodes + 4 row>0 neighbor guards routed through archspec constants. See docs/arch/tile-topology.md. |
 | 3 | DMA Engine & BD Format | `phase1-subsys-dma` | **Done** | First behavioral seam. `DmaModel` trait (9 methods: 7 feature flags + `max_tensor_dims` + `timing_config`) + `Aie2DmaModel` impl. `DeviceRegLayout` family migrated to archspec; xdna-emu `Deref` wrapper retains lock-value-width fields pending Subsystem 4. 5 AIE2-only call sites gated on `supports_*()` feature flags. `(2,2)` silent fallback fixed. 7 hygiene items. Bonus: `test_full_parse_all_devices` archspec failure fixed, giving a clean baseline. See `docs/arch/dma-model.md`. |
-| 4 | Locks | `phase1-subsys-locks` | **Up next** | Small seam exercise. `LockModel` trait if acquire/release/value semantics genuinely differ (likely around lock value width). Inherits Subsystem 3's pinned `sign_extend_lock_value` + `lock_value_*` fields on xdna-emu's `DeviceRegLayout` wrapper — migrate those to `LockModel` as part of this work; the wrapper likely collapses entirely after. |
-| 5 | Stream Switch | `phase1-subsys-stream-switch` | Pending | Topology (data, already via archspec) + routing legality (behavior, trait: `StreamSwitchModel`). |
+| 4 | Locks | `phase1-subsys-locks` | **Done** | Small seam: 3-method LockModel trait (supports_acquire_eq, supports_dynamic_value_ops, value_layout) + LockValueLayout carrier + Aie2LockModel. Migrated `sign_extend_lock_value` + lock_value_* fields from xdna-emu's DeviceRegLayout wrapper to archspec; wrapper collapsed. See docs/arch/lock-model.md. |
+| 5 | Stream Switch | `phase1-subsys-stream-switch` | **Up next** | Topology (data, already via archspec) + routing legality (behavior). Likely `StreamSwitchModel` trait. Packet ID support (AIE2) vs circuit-only (AIE1) is a candidate feature flag. |
 | 7 | ISA Execute | `phase1-subsys-isa-execute` | Pending | Semantic ops, intrinsic handlers. Biggest; largest files live here (`vmac_routing.rs` 239KB, `memory/mod.rs` 124KB). `IsaExecutor` trait. |
 | 8 | Parser (XCLBIN / PDI / ELF) | `phase1-subsys-parser` | Container format variance. `BinaryLoader` trait. |
 
@@ -206,73 +206,81 @@ platform differences." Neither requires re-plumbing.
 
 ---
 
-## How to Pick Up Subsystem 4 (Locks)
+## How to Pick Up Subsystem 5 (Stream Switch)
 
 This is the concrete next action. Start here in a fresh session.
 
 1. **Read the key artifacts:**
    - `docs/superpowers/specs/2026-04-16-device-family-refactor-design.md` (parent)
    - `docs/superpowers/plans/2026-04-16-device-family-refactor-plan.md` (parent plan)
-   - `docs/arch/subsys3-audit.md` -- Subsystem 3 completion; specifically
-     notes that `sign_extend_lock_value` + the `lock_value_width` /
-     `lock_value_mask` / `lock_value_sign_bit` fields stayed in
-     xdna-emu's `src/device/regdb/mod.rs` wrapper pending Subsystem 4.
-   - `docs/arch/dma-model.md` -- the per-seam design note template
-     Subsystem 4 should mimic for `docs/arch/lock-model.md`.
-   - `docs/arch/tile-topology.md` -- alternate template if the lock
-     seam ends up closer in shape to Subsystem 2 than 3.
+   - `docs/arch/subsys4-audit.md` -- Subsystem 4 completion; notes that
+     `DeviceRegLayout` wrapper fully collapsed and lock-value fields
+     migrated to `xdna_archspec::locks::LockModel`. No loose ends remain
+     from Subsystems 3-4.
+   - `docs/arch/dma-model.md` -- the behavioral seam template to mimic
+     for `docs/arch/stream-switch-model.md` (if a trait is warranted).
+   - `src/device/array/stream_switch.rs` and `src/device/port_layout.rs`
+     -- the current xdna-emu stream switch state; identify what is
+     hardcoded vs data-driven.
+   - `crates/xdna-archspec/src/aie2/stream_switch.rs` and
+     `crates/xdna-archspec/src/aie2/port_type.rs` -- archspec's current
+     port/bundle topology data (already partially migrated in Subsystem 1).
 
 2. **Verify the current state hasn't drifted:**
    ```bash
-   git log --oneline phase1-subsys-dma..HEAD
+   git log --oneline phase1-subsys-locks..HEAD
    ```
    If nothing has landed since the tag, you're picking up exactly where
-   Subsystem 3 left off.
+   Subsystem 4 left off.
 
    ```bash
    PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
    PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec --lib 2>&1 | tail -3
    ```
    Expect xdna-emu `2687 passed; 0 failed; 5 ignored` and archspec
-   `273 passed; 0 failed; 2 ignored` (clean baseline -- the pre-existing
-   `test_full_parse_all_devices` failure was fixed in Subsystem 3's
-   Task 8).
+   `282 passed; 0 failed; 2 ignored`.
 
-3. **Invoke brainstorming** to shape Subsystem 4's spec:
+3. **Invoke brainstorming** to shape Subsystem 5's spec:
    ```
    /brainstorming
    ```
-   Topic: "Phase 1b Subsystem 4: Locks."
+   Topic: "Phase 1b Subsystem 5: Stream Switch."
 
    **Shape the spec around these questions:**
-   - Lock value width: AIE1 and AIE2 both appear to use 6-bit signed
-     per the current `lock_value_width = 6` derivation in
-     `src/device/regdb/mod.rs`. Verify against AM020 + AM025. If they
-     really are the same width, what does actually diverge in lock
-     behavior?
-   - Lock acquire-with-value semantics: acq-GE (greater-or-equal),
-     acq-EQ (exact-match), atomic acquire-release. Any per-arch
-     difference?
-   - Does `LockModel` want to absorb `DmaModel::supports_independent_lock_ids`
-     from Subsystem 3 (AIE1 requires `Acq.LockId == Rel.LockId`), or
-     does that stay DMA-side as a BD-apply-time check?
-   - `sign_extend_lock_value` migration: does it move to `LockModel`
-     entirely, or does the method stay xdna-emu-side while the field
-     metadata moves to archspec? Design-note this decision before
-     touching code.
-   - After the migration, does xdna-emu's `DeviceRegLayout` wrapper
-     collapse entirely (become a simple `pub use xdna_archspec::dma::
-     DeviceRegLayout;` re-export), or does it retain any other
-     Subsystem-3-era fields that Subsystem 4 missed?
+   - **Topology vs routing legality split:** the archspec JSON already
+     provides port counts per bundle (master/slave counts for each
+     port type). Is that sufficient, or do we need a `StreamSwitchModel`
+     trait for behavioral legality checks (e.g., which source can route
+     to which destination)?
+   - **Packet-ID support:** AIE2 supports both circuit-switched (always)
+     and packet-switched (stream ID in the packet header) routing.
+     AIE1's packet routing differs. Is `supports_packet_routing` a
+     feature flag worth exposing on the trait now, or defer to AIE1
+     landing?
+   - **Port-layout methods:** `src/device/port_layout.rs` exposes six
+     methods (`master_ports`, `slave_ports`, `north_master_range`,
+     `south_master_range`, `north_slave_range`, `south_slave_range`)
+     that are AIE2-specific in their data but currently live as an
+     extension trait runtime-side. Does `StreamSwitchModel` absorb
+     these, or do they stay as a data-only archspec query function?
+   - **Shim mux vs switchbox distinction:** shim tiles have a mux layer
+     (DMA channels, NoC ports) that compute tiles don't. How does the
+     trait surface this? Is it per-tile-kind dispatch, or a separate
+     `ShimMuxModel` sub-trait?
+   - **What would AIE1 look like?** AIE1's stream switch is architecturally
+     similar (circuit routing, port bundles) but has no packet-ID
+     support. The "coarse first" rule says: if AIE1's impl would be a
+     simple `false` flag and the same port-count data, the trait is
+     right-shaped.
 
 4. **Invoke writing-plans** to produce a plan at
-   `docs/superpowers/plans/YYYY-MM-DD-subsys4-locks.md`.
+   `docs/superpowers/plans/YYYY-MM-DD-subsys5-stream-switch.md`.
 
 5. **Invoke subagent-driven-development** to execute.
 
-6. **At end of Subsystem 4:** tag `phase1-subsys-locks`, append a
-   completion section to its audit, update this `NEXT-STEPS.md` to
-   move Subsystem 5 (Stream Switch) to "up next."
+6. **At end of Subsystem 5:** tag `phase1-subsys-stream-switch`, append
+   a completion section to its audit, update this `NEXT-STEPS.md` to
+   move Subsystem 7 (ISA Execute) to "up next."
 
 ---
 
@@ -285,12 +293,12 @@ This is the concrete next action. Start here in a fresh session.
 export PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH
 
 # Commit history at the current refactor frontier
-git log --oneline phase1-subsys-tile-topo..HEAD
-git log --oneline phase1-subsys-isa-decode..phase1-subsys-tile-topo
+git log --oneline phase1-subsys-locks..HEAD
+git log --oneline phase1-subsys-dma..phase1-subsys-locks
 
 # Run library tests (Global Invariant; green at every commit)
-cargo test --lib                         # expect 2708 pass at the tag
-cargo test -p xdna-archspec --lib        # expect 236 pass + 1 known fail
+cargo test --lib                         # expect 2687 pass at the tag
+cargo test -p xdna-archspec --lib        # expect 282 pass
 
 # Fast bridge smoke (catches 90% of regressions, ~30s)
 ./scripts/emu-bridge-test.sh --no-hw -v add_one_cpp_aiecc

@@ -139,7 +139,45 @@ on `DmaModel` when Subsystem 3 added it.
 
 ---
 
-## Completion
+## Completion (2026-04-21)
 
-*(To be filled in by Task 7 with final LOC counts, test deltas, and
-specific commit shas.)*
+Landed at `phase1-subsys-locks`. Net effect:
+
+- `xdna_archspec::locks::LockModel` trait (3 methods:
+  `supports_acquire_eq`, `supports_dynamic_value_ops`, `value_layout`)
+  + `LockValueLayout` carrier struct (width, mask, sign_bit, min, max)
+  with `sign_extend(raw: u32) -> i8` method live at the crate root.
+- `xdna_archspec::aie2::locks::Aie2LockModel` concrete impl +
+  `AIE2_LOCK_MODEL` static + `AIE2_LOCK_VALUE_LAYOUT` static for
+  AIE2-family devices (NPU1/NPU4/NPU5/NPU6).
+- `xdna_archspec::runtime::ArchConfig::lock_model()` accessor
+  returns `&'static dyn LockModel`, dispatching on
+  `ModelConfig::architecture` exactly like `dma_model()`.
+- xdna-emu's `DeviceRegLayout` wrapper struct (the Subsystem 3
+  holdover) fully collapsed: the three lock fields, `sign_extend_lock_value`
+  method, `Deref` impl, and `from_regdb` / `load_for_device`
+  method-form constructors all deleted. `src/device/regdb/mod.rs`
+  shrunk from ~138 LOC to ~60 LOC (re-exports + OnceLock accessor +
+  config-aware loader function).
+- Six xdna-emu call sites (`tile/registers.rs:158`,
+  `state/compute.rs` write_lock_value + mask_write_lock_value,
+  and the deleted `state/mod.rs` wrapper fn) migrate to
+  `arch_handle::lock_value_layout()` + `layout.sign_extend()` /
+  `layout.mask`.
+- New `src/device/arch_handle.rs` module provides a process-global
+  cache of `&'static LockValueLayout`, seeded from `default_arch().lock_model()`
+  on first access. Bridge pattern until GUI runtime arch-switch
+  lands.
+- Drift-detection test in `src/device/tile/locks.rs` asserts
+  `Lock::MIN_VALUE` / `MAX_VALUE` match
+  `AIE2_LOCK_VALUE_LAYOUT.min` / `.max`.
+- Regdb drift-detection test in `xdna_archspec::aie2::locks`
+  asserts the static constants agree with the
+  `memory.Lock0_value.Lock_value` field in the regdb JSON.
+
+Verification: `cargo test --lib` = 2687 passed / 0 failed / 5 ignored;
+archspec = 282 passed / 0 failed / 2 ignored; full HW bridge matches
+phase1-subsys-dma character (Chess HW 63 pass / 1 fail, Peano HW 53
+pass / 1 fail / 1 XFAIL -- the single HW fail on each compiler is the
+pre-existing `bd_chain_repeat_on_memtile` EMU deadlock); ISA test
+suite 4815/4815 PASS (100.0%).

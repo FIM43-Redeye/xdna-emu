@@ -57,4 +57,59 @@ Non-divergences (for the record):
 
 ## Completion
 
-*(To be filled in by Task 7.)*
+Landed 2026-04-21. Tag: `phase1-subsys-locks`.
+
+### Commits (Task 1 through tag)
+
+```
+8fcdaf5 test: lock bounds drift-detection against archspec LockValueLayout
+fbf9347 refactor: collapse xdna-emu DeviceRegLayout wrapper
+e044a34 refactor: migrate lock-value-mask / sign_extend call sites to LockModel
+b246803 feat(archspec): ArchConfig::lock_model() accessor
+7b7d1dd feat(archspec): LockModel trait + LockValueLayout carrier + Aie2LockModel
+ce50758 docs: Subsystem 4 audit + lock-model design note scaffolds
+7595baf docs: Subsystem 4 (Locks) implementation plan
+8166ae0 docs: Subsystem 4 (Locks) design spec
+```
+
+### Verification (at tag)
+
+- `cargo test --lib`: 2687 passed; 0 failed; 5 ignored.
+- `cargo test -p xdna-archspec --lib`: 282 passed; 0 failed; 2 ignored.
+- `cargo build --release`: clean.
+- FFI cdylib rebuild (`cargo build -p xdna-emu-ffi`): clean.
+- Bridge `--no-hw -v add_one_cpp_aiecc`: Chess and Peano PASS.
+- Full HW bridge: Chess 62/62 compiled, HW 63 pass / 1 fail; Peano 55/55 compiled, HW 53 pass / 1 fail / 1 XFAIL. Matches phase1-subsys-dma character -- the single HW failure on each compiler is the pre-existing `bd_chain_repeat_on_memtile` EMU deadlock documented in NEXT-STEPS.md. Bridge-side timeouts (11 Chess, 13 Peano) are the pre-existing EMU latency issue, not regressions.
+- ISA test suite: 4815/4815 PASS (100.0%); FAIL: 0.
+
+### Success criteria sweep
+
+- `LockModel` trait in `xdna_archspec::locks` (3 methods): populated.
+- `LockValueLayout` data carrier + `sign_extend()` method: populated.
+- `Aie2LockModel` concrete impl + `AIE2_LOCK_MODEL` + `AIE2_LOCK_VALUE_LAYOUT` statics: populated.
+- `ArchConfig::lock_model()` accessor: populated.
+- xdna-emu wrapper `DeviceRegLayout` struct: **collapsed** (Deref, lock fields, sign_extend_lock_value, from_regdb / load_for_device methods all deleted).
+- 6 xdna-emu call sites migrated through `arch_handle::lock_value_layout()`: done.
+- `sign_extend_lock_value` wrapper fn in `state/mod.rs`: deleted.
+- `Lock::MIN_VALUE` / `MAX_VALUE` drift-detection test against archspec: added.
+- `docs/arch/lock-model.md` design note: written.
+
+### Net code delta
+
+- New in archspec: ~180 LOC (LockModel trait + LockValueLayout + Aie2LockModel + tests + drift test).
+- Deleted in xdna-emu: ~80 LOC (wrapper struct, sign_extend method, Deref, sign_extend_lock_value wrapper fn, migrated tests).
+- Modified in xdna-emu: 6 call sites rewrites (~20 LOC touched), new `arch_handle` module (~30 LOC).
+- Net workspace LOC change: +~150 LOC (mostly new trait + tests).
+
+### Follow-ups flagged
+
+Follow-ups that fit naturally in later work, NOT blocking:
+
+- **AIE1 plug-in:** `Aie1LockModel` fills in when AIE1 support starts. At that point, `Lock::MIN_VALUE` / `MAX_VALUE` specialize per-arch (either via a type parameter on `Lock` or via separate `Aie1Lock` / `Aie2Lock` structs). The drift-detection test added here moves along.
+- **Generic-type-parameter monomorphization:** post-seam-pass optimization direction (per the spec's "Future direction"). Hot types that today reach `&'static dyn LockModel` / `&'static dyn DmaModel` switch to `<L: LockModel>` / `<D: DmaModel>`.
+- **`arch_handle` module generalization:** currently exposes only `lock_value_layout()`. If Subsystem 5 (Stream Switch) or later needs a similar process-global handle, extend `arch_handle` rather than multiplying modules.
+- **Phase 2 hygiene carried through from Task 2/4 code-review minor flags:**
+  - `OnceLock<&'static LockValueLayout>` double-indirection in `src/device/arch_handle.rs` could be simplified to `OnceLock<LockValueLayout>` (since LockValueLayout is Copy) to store by value.
+  - `src/device/tile/registers.rs:158` uses the full `crate::device::arch_handle::lock_value_layout()` path; a module-level `use` import would be more idiomatic.
+  - Pre-existing dead-code warnings in `crates/xdna-archspec/src/{regdb_extractor,tablegen,types,regdb}.rs` plus stale imports/errors in `tests/arch_constants.rs`, `examples/run_add_test.rs`, `examples/bdd_validate.rs`, `decoder.rs:1425` (Subsystem 6 rot; not Subsystem 4's scope).
+- **Subsystem 5 (Stream Switch):** see NEXT-STEPS pickup guide.
