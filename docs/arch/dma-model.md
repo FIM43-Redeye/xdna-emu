@@ -149,7 +149,46 @@ when it lands -- AIE2's FSM match never sees it because
 
 ---
 
-## Completion
+## Completion (2026-04-21)
 
-*(To be filled in by Task 8 with final LOC counts, test deltas, and
-specific commit shas.)*
+Landed at `phase1-subsys-dma`. Net effect:
+
+- `xdna_archspec::dma::DmaModel` trait (9 methods: 7 feature flags +
+  `max_tensor_dims` + `timing_config`) + `DmaTimingConfig` struct live
+  at the crate root.
+- `xdna_archspec::aie2::dma::Aie2DmaModel` concrete impl +
+  `AIE2_DMA_MODEL` static singleton for AIE2-family devices
+  (NPU1/NPU4/NPU5/NPU6).
+- `xdna_archspec::runtime::ArchConfig::dma_model()` accessor returns
+  `&'static dyn DmaModel`, dispatching on `ModelConfig::architecture`
+  (added to the trait rather than a standalone `ArchModel` method
+  because production call sites hold `Arc<dyn ArchConfig>`).
+- `xdna_archspec::dma::DeviceRegLayout` + `BdFieldLayout` family
+  migrated from xdna-emu (with xdna-emu retaining a thin `Deref`
+  wrapper that adds the lock-value-width fields pending Subsystem 4).
+- `DmaEngine::new()` at `engine/mod.rs:147` threads `&'static dyn
+  DmaModel`; production construction routes through
+  `arch.dma_model()` at `src/device/array/mod.rs:205`.
+- Five AIE2-only call sites (task-queue enqueue + size/overflow/clear
+  accessors, task-queue pop on task complete, task-queue status bits,
+  OOO status, compression config setter) gate on `self.dma_model
+  .supports_X()`. AIE1's eventual `Aie1DmaModel` returning `false`
+  makes those paths inert without touching FSM or status code.
+- `(2, 2)` silent DMA-channel fallback in archspec's `runtime.rs`
+  replaced with `.expect()` (verified unreachable for supported
+  devices).
+- Seven hygiene items applied in files we were already editing
+  (compression warn messages, named pad constants, AM025 citations,
+  rewritten MAX_TASK_QUEUE_DEPTH comment, named STREAM_BUFFER_
+  CAPACITY_WORDS, MemTile BD-channel hard error + new covering test,
+  plus two doc-comment fold-ins from Task 3/5 code reviews).
+- Bonus: the pre-existing `test_full_parse_all_devices` archspec
+  failure (carried since Phase 1a, expected 12 devices vs 13 in the
+  JSON) was fixed as Task 8 scope creep, giving the tag a clean
+  archspec baseline for the first time since the refactor began.
+
+Verification: `cargo test --lib` = 2687 / 0 / 5; archspec = 273 / 0 / 2
+(first clean baseline!); release build clean; full HW bridge matches
+Subsystem 2 baseline exactly (Chess 63 pass / 1 pre-existing fail,
+Peano 51 pass / 3 pre-existing fail, HW 63+53 pass); ISA test suite
+4815/4815 PASS (100.0%).
