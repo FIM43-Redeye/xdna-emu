@@ -202,6 +202,7 @@ impl TileArray {
                     col, row, tile_kind,
                     params.dma_s2mm_channels, params.dma_mm2s_channels,
                     params.num_bds, params.num_locks as u8,
+                    arch.dma_model(),
                 ));
             }
         }

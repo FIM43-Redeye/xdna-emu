@@ -82,6 +82,12 @@ pub struct DmaEngine {
     /// Timing configuration (controls cycle-accuracy vs fast mode)
     pub(super) timing_config: DmaTimingConfig,
 
+    /// DMA feature-flag + timing model (cold path; consulted at the ~5
+    /// arch-divergent call sites in this module).  AIE2 engines receive
+    /// `&AIE2_DMA_MODEL`; `ArchModel::dma_model()` dispatches on the
+    /// `Architecture`.
+    pub(super) dma_model: &'static dyn xdna_archspec::dma::DmaModel,
+
     /// Stream output buffer (MM2S channels produce data here).
     /// Data is read from tile memory and queued for the stream router.
     pub(super) stream_out: VecDeque<StreamData>,
@@ -144,7 +150,16 @@ impl DmaEngine {
     /// `num_channels` and `num_bds` come from the architecture configuration
     /// (ArchConfig) rather than compile-time constants. The caller is
     /// responsible for providing the correct values for the tile type.
-    pub fn new(col: u8, row: u8, tile_kind: TileKind, s2mm_channels: usize, mm2s_channels: usize, num_bds: usize, num_locks: u8) -> Self {
+    pub fn new(
+        col: u8,
+        row: u8,
+        tile_kind: TileKind,
+        s2mm_channels: usize,
+        mm2s_channels: usize,
+        num_bds: usize,
+        num_locks: u8,
+        dma_model: &'static dyn xdna_archspec::dma::DmaModel,
+    ) -> Self {
         let num_channels = s2mm_channels + mm2s_channels;
         log::debug!("DmaEngine::new col={} row={} tile_kind={:?} num_channels={} (s2mm={}, mm2s={}) num_bds={} num_locks={}",
             col, row, tile_kind, num_channels, s2mm_channels, mm2s_channels, num_bds, num_locks);
@@ -160,7 +175,8 @@ impl DmaEngine {
             bd_configs: vec![BdConfig::default(); num_bds],
             bd_dirty: vec![false; num_bds],
             channels,
-            timing_config: DmaTimingConfig::from_arch(),
+            timing_config: DmaTimingConfig::from_model(dma_model),
+            dma_model,
             stream_out: VecDeque::with_capacity(16),
             stream_in: (0..s2mm_channels).map(|_| VecDeque::with_capacity(16)).collect(),
             task_tokens: TokenState::new(),
@@ -186,19 +202,28 @@ impl DmaEngine {
     /// ArchConfig-derived values (see `DeviceArray::new()`).
     #[cfg(test)]
     pub fn new_compute_tile(col: u8, row: u8) -> Self {
-        Self::new(col, row, TileKind::Compute, 2, 2, 16, 16)
+        Self::new(
+            col, row, TileKind::Compute, 2, 2, 16, 16,
+            &xdna_archspec::aie2::dma::AIE2_DMA_MODEL,
+        )
     }
 
     /// Create a memory tile DMA engine with AIE2 defaults (6+6 channels, 48 BDs).
     #[cfg(test)]
     pub fn new_mem_tile(col: u8, row: u8) -> Self {
-        Self::new(col, row, TileKind::Mem, 6, 6, 48, 64)
+        Self::new(
+            col, row, TileKind::Mem, 6, 6, 48, 64,
+            &xdna_archspec::aie2::dma::AIE2_DMA_MODEL,
+        )
     }
 
     /// Create a shim tile DMA engine with AIE2 defaults (2+2 channels, 16 BDs).
     #[cfg(test)]
     pub fn new_shim_tile(col: u8, row: u8) -> Self {
-        Self::new(col, row, TileKind::ShimNoc, 2, 2, 16, 0)
+        Self::new(
+            col, row, TileKind::ShimNoc, 2, 2, 16, 0,
+            &xdna_archspec::aie2::dma::AIE2_DMA_MODEL,
+        )
     }
 
     /// Configure custom timing parameters.

@@ -80,7 +80,7 @@ pub struct DmaTimingConfig {
 /// Per-arch DMA behavior, consulted at DmaEngine construction and at the
 /// handful of call-site boundaries where AIE2 features are disabled for
 /// other architectures.
-pub trait DmaModel: Send + Sync {
+pub trait DmaModel: Send + Sync + std::fmt::Debug {
     /// Per-channel 8-deep task queue. AIE2+: true. AIE1: false.
     ///
     /// Evidence: `xaie_dma_aieml.c:1257-1279` defines

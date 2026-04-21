@@ -46,24 +46,41 @@ pub struct DmaTimingConfig {
 
 impl Default for DmaTimingConfig {
     fn default() -> Self {
-        Self::from_arch()
+        // Default to AIE2 for test convenience.  Production callers
+        // should use from_model() with the arch-appropriate model.
+        Self::from_model(&xdna_archspec::aie2::dma::AIE2_DMA_MODEL)
     }
 }
 
 impl DmaTimingConfig {
-    /// Create timing config from architecture constants.
-    pub fn from_arch() -> Self {
-        use xdna_archspec::aie2::timing;
+    /// Create timing config from a DmaModel's per-arch constants.
+    ///
+    /// The constants come from the arch impl (AIE2: reads from
+    /// `xdna_archspec::aie2::timing::DMA_*`).  This is a cold path --
+    /// called once per DmaEngine construction.
+    pub fn from_model(model: &'static dyn xdna_archspec::dma::DmaModel) -> Self {
+        let m = model.timing_config();
         Self {
-            bd_setup_cycles: timing::DMA_BD_SETUP_CYCLES,
-            channel_start_cycles: timing::DMA_CHANNEL_START_CYCLES,
-            words_per_cycle: timing::DMA_WORDS_PER_CYCLE,
-            memory_latency_cycles: timing::DMA_MEMORY_LATENCY_CYCLES,
-            lock_acquire_cycles: timing::DMA_LOCK_ACQUIRE_CYCLES,
-            lock_release_cycles: timing::DMA_LOCK_RELEASE_CYCLES,
-            bd_chain_cycles: timing::DMA_BD_CHAIN_CYCLES,
-            host_memory_latency_cycles: timing::DMA_HOST_MEMORY_LATENCY_CYCLES,
+            bd_setup_cycles: m.bd_setup_cycles,
+            channel_start_cycles: m.channel_start_cycles,
+            words_per_cycle: m.words_per_cycle,
+            memory_latency_cycles: m.memory_latency_cycles,
+            lock_acquire_cycles: m.lock_acquire_cycles,
+            lock_release_cycles: m.lock_release_cycles,
+            bd_chain_cycles: m.bd_chain_cycles,
+            host_memory_latency_cycles: m.host_memory_latency_cycles,
         }
+    }
+
+    /// Create timing config from AIE2 architecture constants.
+    ///
+    /// Kept for backwards compatibility with the few remaining callers
+    /// that don't have a `DmaModel` in scope (primarily tests).
+    /// Deprecated in favor of `from_model`; remove once all callers
+    /// have `dma_model` in hand.
+    #[deprecated(note = "use from_model(&AIE2_DMA_MODEL) instead")]
+    pub fn from_arch() -> Self {
+        Self::from_model(&xdna_archspec::aie2::dma::AIE2_DMA_MODEL)
     }
 
     /// Calculate total cycles for a transfer of given size.

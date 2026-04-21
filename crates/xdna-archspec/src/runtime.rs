@@ -46,7 +46,7 @@
 //! assert_eq!(arch.program_memory_size(TileKind::Compute), 16 * 1024);
 //! ```
 
-use crate::types::{ArchModel, TileKind};
+use crate::types::{ArchModel, Architecture, TileKind};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
@@ -157,6 +157,18 @@ pub trait ArchConfig: Send + Sync + std::fmt::Debug {
 
     /// Get a human-readable architecture name for display purposes.
     fn name(&self) -> &'static str;
+
+    // ========================================================================
+    // DMA Model
+    // ========================================================================
+
+    /// Return the DMA feature-flag + timing model for this architecture.
+    ///
+    /// The returned reference is `'static` because every concrete `DmaModel`
+    /// impl is a zero-sized, stateless singleton (e.g. `AIE2_DMA_MODEL`).
+    /// Production callers pass this into `DmaEngine::new()`; test helpers
+    /// can use `&xdna_archspec::aie2::dma::AIE2_DMA_MODEL` directly.
+    fn dma_model(&self) -> &'static dyn crate::dma::DmaModel;
 }
 
 // ============================================================================
@@ -227,6 +239,9 @@ pub struct ModelConfig {
     shim_params: TileTypeParams,
     /// Human-readable architecture name (leaked &'static str for trait compat).
     arch_name: &'static str,
+    /// Architecture family (AIE, AIE2, AIE2P) -- stored for `dma_model()`
+    /// dispatch and any future per-arch branching in `ArchConfig` impls.
+    architecture: Architecture,
 }
 
 /// Pre-loaded device models from the archspec JSON, parsed once at first use.
@@ -348,6 +363,7 @@ impl ModelConfig {
             mem_tile_params,
             shim_params,
             arch_name,
+            architecture: model.arch,
         }
     }
 
@@ -447,6 +463,20 @@ impl ArchConfig for ModelConfig {
 
     fn name(&self) -> &'static str {
         self.arch_name
+    }
+
+    fn dma_model(&self) -> &'static dyn crate::dma::DmaModel {
+        match self.architecture {
+            Architecture::Aie2 | Architecture::Aie2p => {
+                &crate::aie2::dma::AIE2_DMA_MODEL
+            }
+            Architecture::Aie => {
+                unimplemented!(
+                    "AIE1 DmaModel not populated until AIE1 support lands \
+                     (see docs/arch/dma-model.md for planned Aie1DmaModel)"
+                )
+            }
+        }
     }
 }
 
