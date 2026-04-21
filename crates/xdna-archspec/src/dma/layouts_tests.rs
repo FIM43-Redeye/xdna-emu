@@ -1,8 +1,8 @@
 //! Tests for DeviceRegLayout, BdFieldLayout, and related field layouts.
 //!
 //! Migrated from xdna-emu's `src/device/regdb/tests.rs` in Subsystem 3.
-//! Tests that exercise lock-value-width fields or `sign_extend_lock_value`
-//! remained in xdna-emu (they depend on the xdna-emu wrapper).
+//! Tests for lock-value-width fields and `sign_extend_lock_value` migrated
+//! to archspec's `locks` module as part of Subsystem 4.
 
 #[cfg(test)]
 mod tests {
@@ -191,8 +191,8 @@ mod tests {
         let layout = DeviceRegLayout::from_regdb(db)
             .expect("Failed to build DeviceRegLayout");
 
-        // Verify lock layout (AM025) -- structural offsets, not lock-value field widths
-        // (lock_value_width / mask / sign_bit stay in xdna-emu until Subsystem 4)
+        // Verify lock layout (AM025) -- structural offsets only; lock-value field
+        // widths (lock_value_width / mask / sign_bit) live in archspec's LockModel.
         assert_eq!(layout.memory_lock_base, 0x1F000);
         assert_eq!(layout.memory_lock_stride, 0x10);
         assert_eq!(layout.memtile_lock_base, 0xC0000);

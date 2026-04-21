@@ -6,10 +6,9 @@
 //! cache (`OnceLock`) and config-system wiring (`load_for_device()`).
 //!
 //! Lock-value-width fields (`lock_value_mask` / `lock_value_sign_bit`)
-//! and `sign_extend_lock_value` deliberately stayed in xdna-emu for
-//! Subsystem 3 and migrate to `LockModel` as part of Subsystem 4; this
-//! avoids a half-migrated lock-width concept straddling the crate
-//! boundary during the refactor.
+//! and `sign_extend_lock_value` migrated to `LockModel` (archspec) as
+//! part of Subsystem 4. The xdna-emu wrapper struct that hosted them
+//! was deleted in the same subsystem.
 
 use crate::dma::field_layouts::{
     BdFieldLayout, ChannelFieldLayout, StatusFieldLayout,
