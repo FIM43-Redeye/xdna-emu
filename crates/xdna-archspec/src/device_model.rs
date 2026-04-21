@@ -661,17 +661,21 @@ mod tests {
             .join("../../tools/aie-device-models.json")
     }
 
-    // Test 1: Full parse -- all 12 devices parse without error.
+    // Test 1: Full parse -- all 13 devices parse without error.
+    //
+    // 12 NPU variants (npu1 + 3 col-count sub-variants, npu2 + 7
+    // col-count sub-variants) + 1 Versal AIE1 device (xcve2802).
     #[test]
     fn test_full_parse_all_devices() {
         let models = extract_device_models(&json_path()).expect("parse failed");
-        assert_eq!(models.len(), 12, "expected 12 devices, got {}", models.len());
+        assert_eq!(models.len(), 13, "expected 13 devices, got {}", models.len());
 
         // Verify all expected device names are present.
         let expected = [
             "npu1", "npu1_1col", "npu1_2col", "npu1_3col",
             "npu2", "npu2_1col", "npu2_2col", "npu2_3col",
             "npu2_4col", "npu2_5col", "npu2_6col", "npu2_7col",
+            "xcve2802",
         ];
         for name in &expected {
             assert!(models.contains_key(*name), "missing device: {}", name);
