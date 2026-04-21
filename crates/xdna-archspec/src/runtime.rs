@@ -169,6 +169,19 @@ pub trait ArchConfig: Send + Sync + std::fmt::Debug {
     /// Production callers pass this into `DmaEngine::new()`; test helpers
     /// can use `&xdna_archspec::aie2::dma::AIE2_DMA_MODEL` directly.
     fn dma_model(&self) -> &'static dyn crate::dma::DmaModel;
+
+    // ========================================================================
+    // Lock Model (Subsystem 4)
+    // ========================================================================
+
+    /// Return the lock feature-flag + value-layout model for this architecture.
+    ///
+    /// The returned reference is `'static` because every concrete `LockModel`
+    /// impl is a zero-sized, stateless singleton (e.g. `AIE2_LOCK_MODEL`).
+    /// Cold-path callers read the returned `value_layout()` when they need
+    /// the mask / sign-extend formula; hot-path callers (none today)
+    /// should cache `&'static LockValueLayout` at construction.
+    fn lock_model(&self) -> &'static dyn crate::locks::LockModel;
 }
 
 // ============================================================================
@@ -474,6 +487,20 @@ impl ArchConfig for ModelConfig {
                 unimplemented!(
                     "AIE1 DmaModel not populated until AIE1 support lands \
                      (see docs/arch/dma-model.md for planned Aie1DmaModel)"
+                )
+            }
+        }
+    }
+
+    fn lock_model(&self) -> &'static dyn crate::locks::LockModel {
+        match self.architecture {
+            Architecture::Aie2 | Architecture::Aie2p => {
+                &crate::aie2::locks::AIE2_LOCK_MODEL
+            }
+            Architecture::Aie => {
+                unimplemented!(
+                    "AIE1 LockModel not populated until AIE1 support lands \
+                     (see docs/arch/lock-model.md for planned Aie1LockModel)"
                 )
             }
         }
