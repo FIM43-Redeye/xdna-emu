@@ -182,6 +182,21 @@ pub trait ArchConfig: Send + Sync + std::fmt::Debug {
     /// the mask / sign-extend formula; hot-path callers (none today)
     /// should cache `&'static LockValueLayout` at construction.
     fn lock_model(&self) -> &'static dyn crate::locks::LockModel;
+
+    // ========================================================================
+    // Stream Switch Model (Subsystem 5)
+    // ========================================================================
+
+    /// Returns the stream-switch model for this architecture.
+    ///
+    /// The returned reference is `&'static` so consumers may cache
+    /// it for the lifetime of the process without concern about
+    /// dangling pointers. All AIE2-family devices share a single
+    /// `AIE2_STREAM_SWITCH_MODEL` singleton.
+    ///
+    /// Calls on `Architecture::Aie` (AIE1 / Versal) panic via
+    /// `unimplemented!()` until an AIE1 model is populated.
+    fn stream_switch_model(&self) -> &'static dyn crate::stream_switch::StreamSwitchModel;
 }
 
 // ============================================================================
@@ -505,6 +520,18 @@ impl ArchConfig for ModelConfig {
             }
         }
     }
+
+    fn stream_switch_model(&self) -> &'static dyn crate::stream_switch::StreamSwitchModel {
+        match self.architecture {
+            Architecture::Aie2 | Architecture::Aie2p => {
+                &crate::aie2::stream_switch_model::AIE2_STREAM_SWITCH_MODEL
+            }
+            Architecture::Aie => unimplemented!(
+                "AIE1 StreamSwitchModel not populated; add \
+                 xdna_archspec::aie1::stream_switch_model::AIE1_STREAM_SWITCH_MODEL"
+            ),
+        }
+    }
 }
 
 // ============================================================================
@@ -698,5 +725,20 @@ mod tests {
     fn test_max_lock_value() {
         let arch = npu1_arch();
         assert_eq!(arch.max_lock_value(), 63); // AIE2: 6-bit unsigned
+    }
+
+    #[test]
+    fn stream_switch_model_dispatches_to_aie2_for_aie2_family() {
+        use crate::stream_switch::StreamSwitchModel;
+        for name in &["npu1", "npu2", "npu4", "npu5", "npu6"] {
+            if let Some(model) = ARCHSPEC_MODELS.get(*name) {
+                let cfg = ModelConfig::from_arch_model(model, name);
+                assert!(
+                    cfg.stream_switch_model().supports_deterministic_merge(),
+                    "{}: AIE2-family must report supports_deterministic_merge = true",
+                    name
+                );
+            }
+        }
     }
 }
