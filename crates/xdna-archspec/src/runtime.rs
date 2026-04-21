@@ -272,10 +272,11 @@ impl ModelConfig {
                 TileKind::ShimNoc | TileKind::ShimPl => &tile.shim_mux_ports,
                 _ => &tile.switchbox_ports,
             };
-            ports.iter()
+            let dma = ports.iter()
                 .find(|p| p.bundle == "DMA")
-                .map(|p| (p.slaves as usize, p.masters as usize))
-                .unwrap_or((2, 2)) // conservative fallback if DMA bundle not found
+                .expect("DMA bundle missing from tile type; \
+                         regenerate device model with tools/aie-device-dump.py");
+            (dma.slaves as usize, dma.masters as usize)
         };
 
         let compute = model.tile_types.iter().find(|t| t.kind == TileKind::Compute)
