@@ -86,10 +86,12 @@ equations.
 
 Four Explore-agent audits ran against the 12,121-LOC DMA module tree
 plus the two aie-rt reference implementations (`xaie_dma_aie.c`, 1095
-LOC for AIE1; `xaie_dma_aieml.c`, 1526 LOC for AIE2/AIEML). Full
-reports live in the subsystem-3 audit doc
-(`docs/arch/subsys3-audit.md`, written as part of this subsystem).
-Synthesized findings:
+LOC for AIE1; `xaie_dma_aieml.c`, 1526 LOC for AIE2/AIEML). The
+subsystem-3 audit doc (`docs/arch/subsys3-audit.md`) is scaffolded in
+Task 1 of the implementation plan and completed (with results,
+migration totals, and surprises-encountered) in Task 8 at the tag;
+it does not exist yet. Synthesized findings from the four agent
+reports:
 
 **Arch-divergent behaviors (need trait dispatch):**
 
@@ -139,10 +141,10 @@ Synthesized findings:
 | `DeviceRegLayout` struct (`src/device/regdb/mod.rs:54-...`) | Move to archspec |
 | `BdFieldLayout`, `MemTileBdFieldLayout`, `ShimBdFieldLayout` (`src/device/regdb/field_layouts.rs`) | Move to archspec |
 | `ChannelFieldLayout`, `StatusFieldLayout`, `StreamSwitchLayout`, `ShimMuxLayout`, `ModuleEventLayout` | Move to archspec |
-| `DeviceRegLayout::from_regdb()` builders | Move to archspec |
-| `sign_extend_lock_value` helper | Move to archspec (pure math, called from `src/device/state/mod.rs`) |
-| `OnceLock<DeviceRegLayout>` + `device_reg_layout()` accessor | **Stay in xdna-emu** (OnceLock singleton + config-loading wrapper is emulator-side) |
-| `load_for_device()` function | **Stay in xdna-emu** (uses `crate::config::Config::get()` for JSON path resolution) |
+| `DeviceRegLayout::from_regdb()` constructor | Move to archspec |
+| `OnceLock<DeviceRegLayout>` + `device_reg_layout()` accessor | **Stay in xdna-emu** (OnceLock singleton is the emulator-side runtime cache) |
+| `DeviceRegLayout::load_for_device()` loader (the one that uses `crate::config::Config::get()` for JSON path resolution) | **Stay in xdna-emu** (config-system coupling) |
+| `sign_extend_lock_value` helper (reads `lock_value_mask` + `lock_value_sign_bit` fields on `DeviceRegLayout`) | **Stay in xdna-emu** for Subsystem 3; the method and its backing fields migrate together into Subsystem 4's `LockModel` (see Subsystem 4 forward pointer below). Moving only the helper now would leave a lock-width concept half-migrated across archspec and xdna-emu. |
 | `BufferDescriptor` struct + `parse_compute / parse_memtile / parse_shim` | **Stay in xdna-emu** (emulator-internal parsing that reads the archspec-owned layouts) |
 
 **Hygiene items in files we will already be editing** (deodorize as
@@ -227,12 +229,17 @@ in `src/device/dma/bd.rs`, `src/device/dma/engine/mod.rs`, and
 `src/device/state/*` change one import line each; the aggregation
 logic itself moves unchanged.
 
-`DmaEngine::new_*` constructors gain a `&dyn DmaModel` parameter (or
-accept an `ArchModel` and route through it; plan-level choice).
-`DmaTimingConfig::from_arch()` becomes
-`DmaTimingConfig::from_model(&dyn DmaModel)`, reading the timing
-values through the trait instead of the hardcoded
-`xdna_archspec::aie2::timing::*` path.
+The **production** `DmaEngine::new()` constructor
+(`src/device/dma/engine/mod.rs:147`) gains a `&'static dyn DmaModel`
+parameter; its single production caller in `DeviceArray::new()`
+(`src/device/array/mod.rs:201`) threads it from `ArchModel::dma_model()`.
+`DmaTimingConfig::from_arch()` at `engine/mod.rs:163` becomes
+`DmaTimingConfig::from_model(&dyn DmaModel)`, reading the timing values
+through the trait instead of the hardcoded
+`xdna_archspec::aie2::timing::*` path. The three `#[cfg(test)]` helpers
+(`new_compute_tile`, `new_mem_tile`, `new_shim_tile` at lines 188, 194,
+200) update their bodies to construct a static `AIE2_DMA_MODEL` reference
+and pass it through to `new()` -- test-code-only change.
 
 The ~5 arch-divergent call sites gate on `model.supports_X()`:
 
@@ -352,7 +359,14 @@ sibling file). Public symbols: `DeviceRegLayout`, `BdFieldLayout`,
 `MemTileBdFieldLayout`, `ShimBdFieldLayout`, `ChannelFieldLayout`,
 `StatusFieldLayout`, `StreamSwitchLayout`, `ShimMuxLayout`,
 `ModuleEventLayout`, `DeviceRegLayout::from_regdb()`,
-`DeviceRegLayout::sign_extend_lock_value()`. No API shape change.
+plus the aggregation logic itself. Not moved: `sign_extend_lock_value`
+method and its backing `lock_value_mask` / `lock_value_sign_bit` fields
+-- these describe the lock-value format, which is Subsystem 4's seam.
+Keeping the method in xdna-emu (as a method on the locally-aliased
+`DeviceRegLayout` re-export) for Subsystem 3 avoids a half-migrated
+lock-width concept straddling the crate boundary. Subsystem 4 migrates
+the method and its backing fields together as part of the `LockModel`
+work. No API shape change for other migrating symbols.
 
 **Retained: xdna-emu wrapper.** `src/device/regdb/mod.rs` shrinks to
 the `OnceLock`, `load_for_device()`, and `device_reg_layout()`
@@ -367,12 +381,20 @@ location likely mirrors `topology.rs`'s location (an `impl ArchModel`
 block in `dma/mod.rs` because `types.rs` is `#[path]`-included by
 `build.rs`).
 
-**Modified: `DmaEngine` construction.** `new_compute_tile`,
-`new_mem_tile`, `new_shim_tile`, `new_shim_tile_with_locks` gain a
-`dma_model: &dyn DmaModel` parameter. The engine stores an `Arc<dyn
-DmaModel>` or equivalent for subsequent feature-flag checks during
-stepping. Plan picks storage shape; the trait is `Send + Sync` so
-both `Arc` and `&'static` work.
+**Modified: `DmaEngine` construction.** The production constructor
+`DmaEngine::new(col, row, tile_kind, s2mm_channels, mm2s_channels,
+num_bds, num_locks)` at `engine/mod.rs:147` gains a
+`dma_model: &'static dyn DmaModel` parameter. The engine stores the
+reference for subsequent feature-flag checks during stepping. The
+`&'static` shape is the recommended default: `Aie2DmaModel` is a
+zero-sized struct, and `ArchModel::dma_model()` can return a reference
+to a `static AIE2_DMA_MODEL: Aie2DmaModel = Aie2DmaModel;` singleton.
+This avoids `Arc` overhead and a lifetime parameter on `DmaEngine`.
+The single production caller at `src/device/array/mod.rs:201` threads
+the model through from `ArchModel::dma_model()`. The three
+`#[cfg(test)]` helpers (`new_compute_tile`, `new_mem_tile`,
+`new_shim_tile` at `engine/mod.rs:188, 194, 200`) call the static
+`AIE2_DMA_MODEL` directly.
 
 **Modified: `DmaTimingConfig`.** Gains `from_model(&dyn DmaModel)`
 constructor; `from_arch()` either becomes a thin alias or deletes.
@@ -406,8 +428,9 @@ let dma_channels = |tile: &crate::types::TileTypeModel| -> (usize, usize) {
 3. `DeviceRegLayout` loads from the archspec-side `from_regdb()`
    builder into the xdna-emu OnceLock (first call to
    `device_reg_layout()`).
-4. `DmaEngine::new_*` constructors take the `DmaModel` reference;
-   store it plus existing per-tile params.
+4. `DeviceArray::new()` threads `ArchModel::dma_model()` into each
+   per-tile `DmaEngine::new()` call at `src/device/array/mod.rs:201`;
+   the engine stores the reference alongside existing per-tile params.
 5. `DmaTimingConfig::from_model()` reads the eight cycle constants
    through the trait.
 
@@ -533,9 +556,16 @@ if the migration proves sprawlier than the audit estimates:
 The split decision is data-driven: if the migration exceeds ~20
 commits or touches ~40+ files, split; otherwise land as one part.
 Subsystem 2 landed in 12 commits touching ~23 files with ~200 LOC new
-and ~200 deleted; Subsystem 3 is estimated larger in LOC (more moved,
+and ~200 deleted. Subsystem 3 is estimated larger in LOC (more moved,
 less deleted -- the archspec migration is ~450 LOC of relocation
-alone) but similar in file-count.
+alone) and likely larger in file-count too: the regdb migration alone
+touches `regdb/mod.rs`, `regdb/field_layouts.rs`, `regdb/tests.rs`,
+plus consumer imports in `src/device/dma/bd.rs`,
+`src/device/dma/engine/mod.rs`, and `src/device/state/{compute,memtile,
+dispatch,effects,mod}.rs` -- ~10 files just for the data migration,
+before the trait plumbing and hygiene passes. Plan Part A against that
+estimate; if realized file count exceeds ~30 or commit count exceeds
+~15, split.
 
 **Task sequence (the plan will flesh these out):**
 
@@ -549,8 +579,13 @@ alone) but similar in file-count.
    `device_reg_layout()` accessor. Update all consumer imports.
 4. Fix the `(2, 2)` silent fallback in `runtime.rs:278` with
    `.expect()`. Verify AIE2 still loads (it does).
-5. Thread `&dyn DmaModel` through `DmaEngine::new_*` constructors
-   and store it. `DmaTimingConfig::from_model()`.
+5. Thread `&'static dyn DmaModel` through the production
+   `DmaEngine::new()` constructor (`engine/mod.rs:147`) and its single
+   caller at `src/device/array/mod.rs:201`; store it on the engine.
+   Introduce `DmaTimingConfig::from_model()` at `engine/mod.rs:163`.
+   Update the three `#[cfg(test)]` helpers (`new_compute_tile`,
+   `new_mem_tile`, `new_shim_tile`) to call through with a static
+   `AIE2_DMA_MODEL` singleton -- test-code-only change.
 6. Gate the ~5 feature-dispatch call sites
    (`task_queue_ops.rs`, `stepping.rs:343-351`, `status.rs:33-37`,
    `status.rs:104-109`, `compression.rs` entry).
@@ -640,8 +675,14 @@ entry into. AIE2's FSM never sees those variants.
 
 - **Subsystem 4 (Locks).** Lock value width (AIE1: 6-bit signed;
   AIE2+: 7-bit signed) and the `LockModel` trait live there.
-  `DmaModel::supports_independent_lock_ids()` stays here because it
-  is a DMA-side BD-apply check, not a lock-subsystem concern.
+  `DmaModel::supports_independent_lock_ids()` stays in Subsystem 3
+  because it is a DMA-side BD-apply check, not a lock-subsystem
+  concern. The `sign_extend_lock_value()` helper and its backing
+  `lock_value_mask` / `lock_value_sign_bit` fields (currently on
+  `DeviceRegLayout`) explicitly stay in xdna-emu for Subsystem 3 and
+  migrate to `LockModel` as part of Subsystem 4 -- this avoids a
+  half-migrated lock-width concept straddling the crate boundary
+  during the refactor.
 - **Subsystem 5 (Stream Switch).** If routing legality checks need
   arch-specific DMA-port awareness beyond what the existing
   `TileTopology::classify(col, 0)` returns, revisit whether
@@ -673,7 +714,11 @@ entry into. AIE2's FSM never sees those variants.
 - [ ] `DeviceRegLayout` family migrated from `src/device/regdb/`
       into archspec; xdna-emu-side wrapper (OnceLock +
       `load_for_device()` + `device_reg_layout()`) retained.
-- [ ] `DmaEngine::new_*` constructors accept `&dyn DmaModel`.
+- [ ] Production `DmaEngine::new()` (`engine/mod.rs:147`) accepts
+      `&'static dyn DmaModel`; threaded through from
+      `DeviceArray::new()` at `src/device/array/mod.rs:201`. Test-only
+      helpers (`new_compute_tile`, `new_mem_tile`, `new_shim_tile`)
+      updated to use a static `AIE2_DMA_MODEL` singleton.
 - [ ] `DmaTimingConfig::from_model()` reading from the trait.
 - [ ] ~5 feature-gated call sites converted to `model.supports_X()`:
       `task_queue_ops.rs`, `stepping.rs:343-351`, `status.rs:33-37`,
