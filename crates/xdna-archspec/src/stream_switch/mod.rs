@@ -220,6 +220,25 @@ mod tests {
         assert_eq!(shim::SOUTH_MASTER_START, 2);
         assert_eq!(shim::SOUTH_MASTER_END, 7);
 
+        // Slave-side E/W/SOUTH constants (migrated from original test)
+        assert_eq!(compute::EAST_SLAVE_START, 19);
+        assert_eq!(compute::EAST_SLAVE_END, 22);
+        assert_eq!(compute::WEST_SLAVE_START, 11);
+        assert_eq!(compute::WEST_SLAVE_END, 14);
+        assert_eq!(shim::EAST_SLAVE_START, 18);
+        assert_eq!(shim::EAST_SLAVE_END, 21);
+        assert_eq!(shim::WEST_SLAVE_START, 10);
+        assert_eq!(shim::WEST_SLAVE_END, 13);
+        assert_eq!(shim::SOUTH_SLAVE_START, 2);
+        assert_eq!(shim::SOUTH_SLAVE_END, 9);
+
+        // Arithmetic count checks (restated from original test)
+        assert_eq!(compute::EAST_MASTER_END - compute::EAST_MASTER_START + 1, 4);
+        assert_eq!(compute::WEST_MASTER_END - compute::WEST_MASTER_START + 1, 4);
+        assert_eq!(shim::EAST_MASTER_END - shim::EAST_MASTER_START + 1, 4);
+        assert_eq!(shim::WEST_MASTER_END - shim::WEST_MASTER_START + 1, 4);
+        assert_eq!(shim::SOUTH_MASTER_END - shim::SOUTH_MASTER_START + 1, 6);
+
         // MemTile has no E/W ports (structural check: the symbols must
         // still exist on compute/shim but not mem_tile).
         assert_eq!(mem_tile::SOUTH_MASTER_START, 7);

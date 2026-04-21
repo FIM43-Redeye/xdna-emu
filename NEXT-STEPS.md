@@ -37,9 +37,12 @@ Phase 1a (from the earlier pass): the three parallel arch abstractions
 collapsed into one -- the `xdna-archspec` workspace crate is the single
 source-of-truth, and every consumer in `src/` imports directly from
 `xdna_archspec::types` or `xdna_archspec::runtime`. The port-layout
-methods in `src/device/port_layout.rs` that were once a runtime-side
-remnant have since been consolidated through the Subsystem 1 work into
-`xdna_archspec::aie2::{port_type, stream_switch}`.
+methods that were once a runtime-side remnant in
+`src/device/port_layout.rs` have since been consolidated through the
+Subsystem 1 work into `xdna_archspec::aie2::{port_type, stream_switch}`;
+the `PortLayout` extension trait itself was deleted in Subsystem 5,
+and the data is now reached via `arch_handle::stream_switch_topology()`
+/ `xdna_archspec::stream_switch::StreamSwitchTopology`.
 
 **Verification that held (at `phase1-subsys-isa-decode`):**
 - `cargo test --lib`: 2712 passed, 0 failed, 5 ignored. Down from 2730
@@ -143,13 +146,15 @@ subsequent subsystem passes inherit.
 - **Port-layout methods stay runtime-side.** The six stream-switch
   port-layout methods (`master_ports`, `slave_ports`,
   `north_master_range`, `south_master_range`, `north_slave_range`,
-  `south_slave_range`) live on the runtime-side `PortLayout` extension
-  trait in `src/device/port_layout.rs`, not on `ArchConfig` in the
-  crate. Their data source is now `xdna_archspec::aie2::{port_type,
-  stream_switch}` (moved from `crate::arch::*` during Subsystem 1/6),
-  so the only runtime-side remnant is the extension trait itself. When
-  Subsystem 5 (Stream Switch) runs, revisit: if AIE2P diverges on port
-  layout, moving `PortLayout` behind a trait may be justified.
+  `south_slave_range`) lived on the runtime-side `PortLayout` extension
+  trait in `src/device/port_layout.rs` (deleted in Subsystem 5), not on
+  `ArchConfig` in the crate. Their data source is now
+  `xdna_archspec::aie2::{port_type, stream_switch}` (moved from
+  `crate::arch::*` during Subsystem 1/6), and the aggregate is reached
+  via `xdna_archspec::stream_switch::StreamSwitchTopology` +
+  `ArchConfig::stream_switch_model().topology()`. When AIE2P diverges
+  on port layout, add an AIE2P `StreamSwitchModel` impl alongside
+  `Aie2StreamSwitchModel`.
 - **`npu1()` loads from the archspec JSON at runtime.** Before Phase 1a,
   `npu1()` used build.rs-generated constants and `npu2()`/`xcve2802()`
   loaded from JSON. Phase 1a unified all three through JSON, eliminating
@@ -219,9 +224,12 @@ This is the concrete next action. Start here in a fresh session.
      from Subsystems 3-4.
    - `docs/arch/dma-model.md` -- the behavioral seam template to mimic
      for `docs/arch/stream-switch-model.md` (if a trait is warranted).
-   - `src/device/array/stream_switch.rs` and `src/device/port_layout.rs`
-     -- the current xdna-emu stream switch state; identify what is
-     hardcoded vs data-driven.
+   - `src/device/array/stream_switch.rs` -- the current xdna-emu
+     stream switch state; identify what is hardcoded vs data-driven.
+     (Note: `src/device/port_layout.rs` was deleted in Subsystem 5;
+     its data is now reached via
+     `xdna_archspec::stream_switch::StreamSwitchTopology` /
+     `arch_handle::stream_switch_topology()`.)
    - `crates/xdna-archspec/src/aie2/stream_switch.rs` and
      `crates/xdna-archspec/src/aie2/port_type.rs` -- archspec's current
      port/bundle topology data (already partially migrated in Subsystem 1).
@@ -257,12 +265,15 @@ This is the concrete next action. Start here in a fresh session.
      AIE1's packet routing differs. Is `supports_packet_routing` a
      feature flag worth exposing on the trait now, or defer to AIE1
      landing?
-   - **Port-layout methods:** `src/device/port_layout.rs` exposes six
+   - **Port-layout methods:** `src/device/port_layout.rs` exposed six
      methods (`master_ports`, `slave_ports`, `north_master_range`,
      `south_master_range`, `north_slave_range`, `south_slave_range`)
-     that are AIE2-specific in their data but currently live as an
-     extension trait runtime-side. Does `StreamSwitchModel` absorb
-     these, or do they stay as a data-only archspec query function?
+     as a runtime-side extension trait. Subsystem 5 resolved this by
+     absorbing the data into `StreamSwitchTopology` (carrier, reached
+     via `StreamSwitchModel::topology()`) and deleting the extension
+     trait. The open question now is whether E/W slave ranges -- which
+     exist as build.rs constants but are not yet carrier fields --
+     should also move onto the carrier.
    - **Shim mux vs switchbox distinction:** shim tiles have a mux layer
      (DMA channels, NoC ports) that compute tiles don't. How does the
      trait surface this? Is it per-tile-kind dispatch, or a separate

@@ -12,7 +12,6 @@ Read this file when working on anything in `src/device/`.
 |------|---------|
 | `mod.rs` | Module root, re-exports, `AieArch` enum (Aie2/Aie2P) |
 | `aie2_spec.rs` | Architecture constants derived from AM020 (register offsets, memory sizes, tile geometry) |
-| `port_layout.rs` | `PortLayout` extension trait for `ModelConfig` -- stream-switch port-layout queries (data sourced from `crate::arch::*`, build.rs-generated). The core `ArchConfig` trait and `ModelConfig` live in `xdna_archspec::runtime`. |
 | `registers.rs` | `RegisterInfo`, `RegisterModule`, `TileAddress` -- CDO address decoding |
 | `registers_spec.rs` | Register specification constants (offsets, field masks) |
 | `tile.rs` | `Tile` state: memory, locks, DMA BDs, core state, stream switch |
