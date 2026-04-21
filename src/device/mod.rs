@@ -49,7 +49,6 @@
 
 pub mod arch_handle;
 pub mod banking;
-pub mod port_layout;
 pub mod model;
 pub mod regdb;
 pub mod registers;

@@ -7,11 +7,11 @@
 //! # What lives here
 //!
 //! - `ArchConfig`: core trait covering dimensions, tile classification, memory
-//!   sizes, lock counts, and DMA configuration. Stream-switch port-layout
-//!   methods are **not** part of this trait -- they depend on `crate::arch`
-//!   (build.rs-generated, main crate only) and live in a runtime-side extension
-//!   trait `PortLayout` in `src/device/port_layout.rs`. See the phase 1a audit
-//!   at `docs/arch/phase1a-audit.md` for the rationale.
+//!   sizes, lock counts, DMA configuration, and the per-arch model accessors
+//!   (`dma_model()`, `lock_model()`, `stream_switch_model()`). Stream-switch
+//!   port-layout data is reachable via `stream_switch_model().topology()`;
+//!   see `crate::stream_switch::StreamSwitchTopology` for the carrier and
+//!   `crate::aie2::stream_switch_model` for the AIE2 concrete impl.
 //!
 //! - `ModelConfig`: `ArchConfig` implementation backed by `ArchModel`. All
 //!   device parameters come from the parsed device model; no build.rs constants
@@ -58,10 +58,12 @@ use std::sync::{Arc, LazyLock};
 /// - Memory sizes per tile type
 /// - DMA configuration (channels, buffer descriptors)
 ///
-/// Stream-switch port-layout methods (`master_ports`, `slave_ports`, range
-/// accessors) are NOT part of this trait. They are defined in the runtime-side
-/// `PortLayout` extension trait because their data comes from build.rs-generated
-/// arrays (`crate::arch::*`) that are not accessible from this crate.
+/// Behavioral seams (DMA, locks, stream switch) are reached via the
+/// `dma_model()`, `lock_model()`, and `stream_switch_model()` accessors.
+/// Stream-switch port-layout data is exposed through
+/// `stream_switch_model().topology()`, which returns a
+/// `&'static StreamSwitchTopology` aggregating the build.rs-generated
+/// port arrays and range constants into a per-tile-kind carrier.
 ///
 /// All tile-type parameters use `TileKind` (this crate's native enum). Runtime
 /// callers using `TileType` convert via `.into()` at the call site.
@@ -231,9 +233,12 @@ struct TileTypeParams {
 /// Architecture configuration backed by mlir-aie's `DeviceModel`.
 ///
 /// All device-configuration values (dimensions, memory sizes, lock/BD counts,
-/// DMA channels) come from the parsed ArchModel. Stream switch port layouts and
-/// ranges (AM025 register-level data) come from `crate::arch` in the main crate
-/// and are exposed via the runtime-side `PortLayout` extension trait.
+/// DMA channels) come from the parsed ArchModel. Stream-switch port layouts
+/// and ranges (AM025 register-level data) come from build.rs-generated
+/// modules in `crate::aie2::{COMPUTE,MEMTILE,SHIM}_{MASTER,SLAVE}_PORTS` and
+/// `crate::aie2::stream_switch::{compute,mem_tile,shim}`; they are aggregated
+/// into `AIE2_STREAM_SWITCH_TOPOLOGY` and exposed via
+/// `ArchConfig::stream_switch_model().topology()`.
 ///
 /// # Constructors
 ///
@@ -729,7 +734,6 @@ mod tests {
 
     #[test]
     fn stream_switch_model_dispatches_to_aie2_for_aie2_family() {
-        use crate::stream_switch::StreamSwitchModel;
         for name in &["npu1", "npu2", "npu4", "npu5", "npu6"] {
             if let Some(model) = ARCHSPEC_MODELS.get(*name) {
                 let cfg = ModelConfig::from_arch_model(model, name);

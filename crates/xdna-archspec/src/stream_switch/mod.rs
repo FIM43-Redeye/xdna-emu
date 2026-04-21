@@ -160,4 +160,80 @@ mod tests {
         assert_eq!(noc.south_master, (0, 0));
         assert_eq!(noc.south_slave, (0, 0));
     }
+
+    // === Migrated from src/device/port_layout.rs ===
+    //
+    // These tests originally asserted properties of the runtime-side
+    // PortLayout extension trait. With PortLayout deleted and its data
+    // source (the archspec-generated port arrays) reachable via
+    // AIE2_STREAM_SWITCH_TOPOLOGY, the assertions are restated against
+    // the carrier.
+
+    #[test]
+    fn test_npu1_port_layouts_migrated() {
+        use crate::aie2::stream_switch_model::AIE2_STREAM_SWITCH_TOPOLOGY;
+
+        // Verify port counts match AM025 spec (restated from the original
+        // `test_npu1_port_layouts` in src/device/port_layout.rs).
+        assert_eq!(AIE2_STREAM_SWITCH_TOPOLOGY.shim.master_ports.len(), 22);
+        assert_eq!(AIE2_STREAM_SWITCH_TOPOLOGY.shim.slave_ports.len(), 23);
+
+        assert_eq!(AIE2_STREAM_SWITCH_TOPOLOGY.memtile.master_ports.len(), 17);
+        assert_eq!(AIE2_STREAM_SWITCH_TOPOLOGY.memtile.slave_ports.len(), 18);
+
+        assert_eq!(AIE2_STREAM_SWITCH_TOPOLOGY.compute.master_ports.len(), 23);
+        assert_eq!(AIE2_STREAM_SWITCH_TOPOLOGY.compute.slave_ports.len(), 25);
+    }
+
+    #[test]
+    fn test_npu1_port_ranges_migrated() {
+        use crate::aie2::stream_switch::{compute, mem_tile, shim};
+        use crate::aie2::stream_switch_model::AIE2_STREAM_SWITCH_TOPOLOGY;
+
+        // Shim north masters: 12-17 (6 ports)
+        assert_eq!(AIE2_STREAM_SWITCH_TOPOLOGY.shim.north_master, (12, 17));
+        let (start, end) = AIE2_STREAM_SWITCH_TOPOLOGY.shim.north_master;
+        assert_eq!(end - start + 1, 6);
+
+        // MemTile south masters: 7-10 (4 ports)
+        assert_eq!(AIE2_STREAM_SWITCH_TOPOLOGY.memtile.south_master, (7, 10));
+
+        // MemTile north masters: 11-16 (6 ports)
+        assert_eq!(AIE2_STREAM_SWITCH_TOPOLOGY.memtile.north_master, (11, 16));
+
+        // Shim has no intra-array south (sentinel).
+        assert_eq!(AIE2_STREAM_SWITCH_TOPOLOGY.shim.south_master, (0, 0));
+        assert_eq!(AIE2_STREAM_SWITCH_TOPOLOGY.shim.south_slave, (0, 0));
+
+        // E/W generated constants (not in carrier fields today, but the
+        // drift-detection test above locks them. These direct-access
+        // assertions are preserved here because they were in the
+        // original test.)
+        assert_eq!(compute::EAST_MASTER_START, 19);
+        assert_eq!(compute::EAST_MASTER_END, 22);
+        assert_eq!(compute::WEST_MASTER_START, 9);
+        assert_eq!(compute::WEST_MASTER_END, 12);
+        assert_eq!(shim::EAST_MASTER_START, 18);
+        assert_eq!(shim::EAST_MASTER_END, 21);
+        assert_eq!(shim::WEST_MASTER_START, 8);
+        assert_eq!(shim::WEST_MASTER_END, 11);
+        assert_eq!(shim::SOUTH_MASTER_START, 2);
+        assert_eq!(shim::SOUTH_MASTER_END, 7);
+
+        // MemTile has no E/W ports (structural check: the symbols must
+        // still exist on compute/shim but not mem_tile).
+        assert_eq!(mem_tile::SOUTH_MASTER_START, 7);
+        assert_eq!(mem_tile::NORTH_MASTER_START, 11);
+    }
+
+    #[test]
+    fn test_shim_pl_same_as_shim_noc_migrated() {
+        use crate::aie2::stream_switch_model::AIE2_STREAM_SWITCH_TOPOLOGY;
+
+        let noc = AIE2_STREAM_SWITCH_TOPOLOGY.for_tile(TileKind::ShimNoc);
+        let pl = AIE2_STREAM_SWITCH_TOPOLOGY.for_tile(TileKind::ShimPl);
+        assert_eq!(noc.master_ports, pl.master_ports);
+        assert_eq!(noc.slave_ports, pl.slave_ports);
+        assert_eq!(noc.north_master, pl.north_master);
+    }
 }
