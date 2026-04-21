@@ -92,11 +92,16 @@ pub const START_BD_ID_WIDTH_MEMTILE: u32 = 6;
 
 /// Maximum task queue depth per channel.
 ///
-/// Per AM025, the Task_Queue_Size status field is 3 bits [22:20],
-/// meaning values 0-7 are representable. The queue is 8 entries deep,
-/// and aie-rt polls the MSB (bit 22) to detect "queue not full"
-/// (see `_XAieMl_DmaWaitForBdTaskQueue` which polls for bit 22 == 0,
-/// meaning queue size < 4... but the full depth is 8).
+/// Per AM025 the hardware FIFO is 8 entries deep.  The
+/// `Task_Queue_Size` status field is 3 bits wide, reporting values
+/// 0-7; bit 7 (MSB) is implicit in "queue full".  aie-rt's
+/// `_XAieMl_DmaWaitForBdTaskQueue` polls the field's MSB (bit 22 of
+/// the status word = bit 2 of the 3-bit Task_Queue_Size) to detect
+/// "queue at least half-full" (size >= 4) as a backpressure
+/// signal -- it does not indicate queue saturation.
+///
+/// AIE2+ only: AIE1 has no task queue mechanism.  Consult
+/// `DmaModel::supports_task_queue()` before using.
 pub const MAX_TASK_QUEUE_DEPTH: usize = 8;
 
 /// Maximum repeat count (8-bit field encodes actual-1, so max actual is 256).

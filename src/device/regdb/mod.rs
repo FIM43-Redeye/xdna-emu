@@ -35,6 +35,10 @@ pub use xdna_archspec::dma::DeviceRegLayout as ArchDeviceRegLayout;
 #[derive(Debug, Clone)]
 pub struct DeviceRegLayout {
     /// The archspec-side layout data (BD layouts, channel bases, etc.).
+    ///
+    /// Exposed publicly because Subsystem 4's `LockModel` migration will
+    /// need to reach into this field when moving the lock-value-width
+    /// metadata out of the xdna-emu wrapper.
     pub arch: ArchDeviceRegLayout,
     /// Width of the Lock_value field in bits (6 for AIE2).
     ///

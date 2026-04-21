@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Maximum number of words buffered per stream input FIFO.
+///
+/// Each S2MM channel has its own FIFO. Value determined empirically
+/// from bridge-test traces; not an AM025 register (the hardware FIFO
+/// is much smaller, but the emulator buffers more to absorb
+/// scheduler jitter without blocking). If this proves too shallow
+/// or too deep in practice, tune here in one place.
+pub(super) const STREAM_BUFFER_CAPACITY_WORDS: usize = 256;
+
 impl DmaEngine {
     /// Pop a word from the stream output buffer (MM2S produced data).
     ///
@@ -41,14 +50,14 @@ impl DmaEngine {
             self.fatal_errors.push(msg);
             return false;
         }
-        if self.stream_in[ch].len() < 256 {
+        if self.stream_in[ch].len() < STREAM_BUFFER_CAPACITY_WORDS {
             self.stream_in[ch].push_back(data);
             true
         } else {
             let msg = format!(
-                "DMA({},{}) stream_in buffer full (256), dropping ch{} data: 0x{:08X} -- \
+                "DMA({},{}) stream_in buffer full ({}), dropping ch{} data: 0x{:08X} -- \
                  backpressure violation",
-                self.col, self.row, data.channel, data.data,
+                self.col, self.row, STREAM_BUFFER_CAPACITY_WORDS, data.channel, data.data,
             );
             log::error!("{}", msg);
             self.fatal_errors.push(msg);
@@ -67,12 +76,12 @@ impl DmaEngine {
     /// know the target channel should use `can_accept_stream_in_for_channel`
     /// for precise per-channel backpressure.
     pub fn can_accept_stream_in(&self) -> bool {
-        self.stream_in.iter().any(|q| q.len() < 256)
+        self.stream_in.iter().any(|q| q.len() < STREAM_BUFFER_CAPACITY_WORDS)
     }
 
     /// Check if a specific S2MM channel's stream input buffer has space.
     pub fn can_accept_stream_in_for_channel(&self, channel: u8) -> bool {
-        self.stream_in.get(channel as usize).map_or(false, |q| q.len() < 256)
+        self.stream_in.get(channel as usize).map_or(false, |q| q.len() < STREAM_BUFFER_CAPACITY_WORDS)
     }
 
     /// Get the number of words in stream output buffer.
@@ -109,7 +118,7 @@ impl DmaEngine {
         for ch_idx in 0..self.channels.len() {
             if self.channel_type(ch_idx as u8) == ChannelType::S2MM {
                 let is_pending = self.channels[ch_idx].is_active();
-                if is_pending && self.stream_in.len() < 256 {
+                if is_pending && self.stream_in.len() < 256 { // TODO(phase2): This compares channel count to 256 -- likely a latent bug; see subsys3 audit
                     return Some(ch_idx as u8);
                 }
             }

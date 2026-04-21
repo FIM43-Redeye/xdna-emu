@@ -1673,3 +1673,19 @@ fn test_per_direction_channel() {
     assert_eq!(engine.per_direction_channel(7), 1);
     assert_eq!(engine.per_direction_channel(11), 5);
 }
+
+#[test]
+fn memtile_invalid_bd_channel_combination_returns_error() {
+    // BD 24 is the first "odd channel" BD; per-direction channel 0 (S2MM ch 0)
+    // is even, so BD 24 + ch 0 should be rejected.
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    // Configure BD 24 to something valid otherwise.
+    let bd = BdConfig::simple_1d(0x1000, 16);
+    engine.configure_bd(24, bd).unwrap();
+
+    let result = engine.start_channel_with_repeat(0, 24, 0);
+    assert!(
+        matches!(result, Err(DmaError::InvalidBd(24))),
+        "expected InvalidBd(24), got {:?}", result
+    );
+}

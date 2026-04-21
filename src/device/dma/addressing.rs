@@ -212,13 +212,20 @@ impl ZeroPadConfig {
 
         let mut valid = true;
 
-        // Per-dimension max values: 0x3F >> dim_index
-        // D0: 6 bits (63), D1: 5 bits (31), D2: 4 bits (15)
-        const PAD_MAX_BASE: u8 = 0x3F;
+        // Per-dimension max zero-padding values from AM025's MemTile BD
+        // D{0,1,2}_Zero_{Before,After} field widths:
+        //   D0: 6-bit field (max 63 words before / after).
+        //   D1: 5-bit field (max 31 iteration counts).
+        //   D2: 4-bit field (max 15 iteration counts).
+        // Each dimension has one fewer bit than the previous; the
+        // hardware packs these into a single BD word.
+        const PAD_MAX_D0_WORDS: u8 = 63;
+        const PAD_MAX_D1_ITERS: u8 = 31;
+        const PAD_MAX_D2_ITERS: u8 = 15;
         let dim_maxes: [u8; 3] = [
-            PAD_MAX_BASE,       // D0: 63
-            PAD_MAX_BASE >> 1,  // D1: 31
-            PAD_MAX_BASE >> 2,  // D2: 15
+            PAD_MAX_D0_WORDS,
+            PAD_MAX_D1_ITERS,
+            PAD_MAX_D2_ITERS,
         ];
 
         let befores = [self.d0_before, self.d1_before, self.d2_before];

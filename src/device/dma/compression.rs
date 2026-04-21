@@ -38,6 +38,10 @@
 /// Returns None if input is not exactly 32 bytes.
 pub fn compress(input: &[u8]) -> Option<Vec<u8>> {
     if input.len() != 32 {
+        log::warn!(
+            "DMA compression: expected 32-byte input (256-bit word), got {} bytes; returning None",
+            input.len()
+        );
         return None;
     }
 
@@ -77,6 +81,10 @@ pub fn compress(input: &[u8]) -> Option<Vec<u8>> {
 /// Returns the decompressed 32-byte word, or None if input is invalid.
 pub fn decompress(input: &[u8]) -> Option<[u8; 32]> {
     if input.len() < 4 {
+        log::warn!(
+            "DMA decompression: input too short for 4-byte mask header (got {}); returning None",
+            input.len()
+        );
         return None;
     }
 
@@ -112,6 +120,10 @@ pub fn decompress(input: &[u8]) -> Option<[u8; 32]> {
 /// 4 (mask) + non_zero_count + padding_to_4_byte_boundary
 pub fn compressed_size(input: &[u8]) -> usize {
     if input.len() != 32 {
+        log::warn!(
+            "DMA compressed_size: expected 32-byte input, got {}; returning 0",
+            input.len()
+        );
         return 0;
     }
 
@@ -127,6 +139,10 @@ pub fn compressed_size(input: &[u8]) -> usize {
 /// Returns true if the compressed size would be smaller than uncompressed.
 pub fn is_compressible(input: &[u8]) -> bool {
     if input.len() != 32 {
+        log::warn!(
+            "DMA is_compressible: expected 32-byte input, got {}; returning false",
+            input.len()
+        );
         return false;
     }
 

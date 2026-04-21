@@ -228,7 +228,7 @@ impl DmaEngine {
 
     /// Configure custom timing parameters.
     ///
-    /// The default is already cycle-accurate (`DmaTimingConfig::from_arch()`).
+    /// The default is already cycle-accurate (`DmaTimingConfig::from_model()`).
     /// This method allows tuning specific timing values if needed.
     pub fn with_timing(mut self, config: DmaTimingConfig) -> Self {
         self.timing_config = config;
@@ -430,17 +430,21 @@ impl DmaEngine {
         // MemTile BD-channel validity check (per aie-rt
         // _XAieMl_MemTileDmaCheckBdChValidity): BDs 0-23 are valid only
         // for even per-direction channels (0, 2, 4) and BDs 24-47 are
-        // valid only for odd per-direction channels (1, 3, 5).
+        // valid only for odd per-direction channels (1, 3, 5).  AM025
+        // treats this as a hard invariant -- real hardware rejects the
+        // combination at BD apply time.
         if !self.check_memtile_bd_channel_validity(bd_index, channel) {
             let dir_ch = self.per_direction_channel(channel);
-            log::warn!(
+            log::error!(
                 "DMA tile({},{}) invalid MemTile BD-channel combination: \
-                 BD {} is only valid for {} channels, but per-direction channel {} is {}",
+                 BD {} is only valid for {} channels, but per-direction channel {} is {} \
+                 -- rejecting per AM025 invariant",
                 self.col, self.row, bd_index,
                 if bd_index < 24 { "even" } else { "odd" },
                 dir_ch,
                 if dir_ch % 2 == 0 { "even" } else { "odd" },
             );
+            return Err(DmaError::InvalidBd(bd_index));
         }
 
         // Check if channel is already busy
