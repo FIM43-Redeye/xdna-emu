@@ -1282,7 +1282,10 @@ run_one_bridge() {
   fi
 
   # Verify emulator actually ran (catch silent fallthrough to real NPU).
-  if [[ "$result" == "PASS" ]]; then
+  # Runs on PASS or BUDGET -- both imply sym_run_ was called; if the plugin
+  # still didn't load, the EMU markers will be missing and this flips to
+  # EMU_MISS (infrastructure failure takes precedence over budget signal).
+  if [[ "$result" == "PASS" || "$result" == "BUDGET" ]]; then
     if ! grep -qE '(Loaded PDI|xdna_emu|XDNA emulator)' "$log_file"; then
       result="EMU_MISS"
     fi
@@ -1292,8 +1295,8 @@ run_one_bridge() {
   # EMU_MISS is an infrastructure bug -- never mask it with XFAIL.
   if [[ "$result" != "EMU_MISS" ]] && is_xfail "$src_dir" "$compiler"; then
     case "$result" in
-      PASS)          result="XPASS" ;;
-      FAIL|TIMEOUT)  result="XFAIL" ;;
+      PASS)                 result="XPASS" ;;
+      FAIL|TIMEOUT|BUDGET)  result="XFAIL" ;;
     esac
   fi
 
