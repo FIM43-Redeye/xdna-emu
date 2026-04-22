@@ -1139,6 +1139,10 @@ run_one_hardware() {
   t_start="$(uptime_sec)"
 
   local cycles_file="$build_dir/${safe}${vsuffix}.hw.cycles.txt"
+  # Clear any stale cycles file from a prior run where the helper wasn't
+  # invoked (e.g., XRT patch not installed, trace-path compile). Phase C
+  # then treats "no file" as unbounded instead of reading stale numbers.
+  rm -f "$cycles_file"
   local rc=0
   (
     cd "$build_dir"
