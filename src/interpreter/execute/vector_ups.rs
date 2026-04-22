@@ -27,47 +27,7 @@
 //! for writing the result to the appropriate accumulator register(s).
 
 use xdna_archspec::aie2::isa::ElementType;
-
-/// UPS scale modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpsScale {
-    /// Half-scale: narrower input type (8->32 or 16->64).
-    Half,
-    /// Full-scale: wider input type (16->32 or 32->64).
-    Full,
-}
-
-/// UPS accumulator modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpsAccMode {
-    /// 32-bit accumulator output.
-    Acc32,
-    /// 64-bit accumulator output.
-    Acc64,
-}
-
-/// Parameters for a single UPS mode, derived from the mode table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UpsMode {
-    /// Number of SIMD lanes.
-    pub lanes: u32,
-    /// Input element width in bits.
-    pub bits_in: u32,
-    /// Output element width in bits.
-    pub bits_out: u32,
-}
-
-/// Look up the UPS mode parameters from scale and accumulator settings.
-///
-/// Returns `(lanes, bits_in, bits_out)` matching the hardware mode table.
-pub fn ups_mode(scale: UpsScale, acc: UpsAccMode) -> UpsMode {
-    match (scale, acc) {
-        (UpsScale::Half, UpsAccMode::Acc32) => UpsMode { lanes: 32, bits_in: 8, bits_out: 32 },
-        (UpsScale::Full, UpsAccMode::Acc32) => UpsMode { lanes: 32, bits_in: 16, bits_out: 32 },
-        (UpsScale::Half, UpsAccMode::Acc64) => UpsMode { lanes: 16, bits_in: 16, bits_out: 64 },
-        (UpsScale::Full, UpsAccMode::Acc64) => UpsMode { lanes: 16, bits_in: 32, bits_out: 64 },
-    }
-}
+pub use xdna_archspec::aie2::ups::{UpsScale, UpsAccMode, UpsMode, ups_mode};
 
 /// Infer the UPS mode from source and destination element types.
 ///

@@ -180,6 +180,12 @@ pub mod rounding;
 /// for each element type pair. Authoritative source for `vector_config.rs`.
 pub mod matmul;
 
+/// UPS (Upshift / type-widening) mode table for the AIE2 vector unit.
+///
+/// The four valid UPS modes: `UpsScale` x `UpsAccMode` -> `UpsMode`
+/// (lanes, bits_in, bits_out). Authoritative source for `vector_ups.rs`.
+pub mod ups;
+
 /// Instruction set architecture: decoder tables, runtime model, and
 /// LLVM MCDisassembler FFI. Populated during Subsystem 6 Part A.
 pub mod isa;
