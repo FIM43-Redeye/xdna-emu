@@ -166,6 +166,13 @@ pub mod stream_switch_model;
 /// `AIE2_ISA_EXECUTOR` static). Subsystem 7 seam.
 pub mod isa_execute_model;
 
+/// Hardware rounding modes for the SRS instruction and bf16 conversion.
+///
+/// Defines the 10-variant `RoundingMode` enum shared between the integer
+/// SRS pipeline (`vector_srs.rs`) and the bf16 conversion path
+/// (`vector_float.rs`). Both files previously carried identical local copies.
+pub mod rounding;
+
 /// Instruction set architecture: decoder tables, runtime model, and
 /// LLVM MCDisassembler FFI. Populated during Subsystem 6 Part A.
 pub mod isa;

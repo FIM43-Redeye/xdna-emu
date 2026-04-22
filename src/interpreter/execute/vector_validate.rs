@@ -13,7 +13,8 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use super::vector_srs::{self, RoundingMode};
+use super::vector_srs;
+use xdna_archspec::aie2::rounding::RoundingMode;
 use super::vector_ups;
 use super::VectorAlu;
 use crate::interpreter::bundle::{ElementType, Operand, SlotIndex, SlotOp};

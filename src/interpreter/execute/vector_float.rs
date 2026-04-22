@@ -21,74 +21,7 @@
 //! All behavioral facts are derived from the AIE2 hardware model in the
 //! open-source toolchain and observed NPU hardware behavior.
 
-// ---------------------------------------------------------------------------
-// AIE2 SRS rounding modes
-//
-// The 10 hardware rounding modes used by the SRS instruction and the bf16
-// conversion path. Mode indices match the hardware encoding in the config
-// word. Valid indices are 0-3 and 8-13 (4-7 are reserved/unused).
-//
-// Rounding mode definitions per AIE2 hardware specification.
-// ---------------------------------------------------------------------------
-
-/// Hardware rounding modes for the SRS instruction and bf16 conversion.
-///
-/// The mode index values match the hardware encoding in the configuration word.
-/// Valid indices are 0-3 and 8-13 (indices 4-7 are reserved/unused).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum RoundingMode {
-    /// Mode 0: Floor -- truncate toward negative infinity.
-    Floor = 0,
-
-    /// Mode 1: Ceiling -- round toward positive infinity.
-    Ceil = 1,
-
-    /// Mode 2: Symmetric floor -- round toward zero (positive) or away (negative).
-    SymFloor = 2,
-
-    /// Mode 3: Symmetric ceiling -- round away from zero (positive) or toward (negative).
-    SymCeil = 3,
-
-    /// Mode 8: Round half toward negative infinity.
-    NegInf = 8,
-
-    /// Mode 9: Round half toward positive infinity.
-    PosInf = 9,
-
-    /// Mode 10: Round half toward zero (symmetric).
-    SymZero = 10,
-
-    /// Mode 11: Round half away from zero (symmetric).
-    SymInf = 11,
-
-    /// Mode 12: Convergent rounding to even (IEEE 754 banker's rounding).
-    ConvEven = 12,
-
-    /// Mode 13: Convergent rounding to odd.
-    ConvOdd = 13,
-}
-
-impl RoundingMode {
-    /// Convert a raw hardware mode index to a RoundingMode.
-    ///
-    /// Returns `None` for reserved indices (4-7, 14-15, etc.).
-    pub fn from_raw(index: u8) -> Option<Self> {
-        match index {
-            0 => Some(Self::Floor),
-            1 => Some(Self::Ceil),
-            2 => Some(Self::SymFloor),
-            3 => Some(Self::SymCeil),
-            8 => Some(Self::NegInf),
-            9 => Some(Self::PosInf),
-            10 => Some(Self::SymZero),
-            11 => Some(Self::SymInf),
-            12 => Some(Self::ConvEven),
-            13 => Some(Self::ConvOdd),
-            _ => None,
-        }
-    }
-}
+use xdna_archspec::aie2::rounding::RoundingMode;
 
 // ---------------------------------------------------------------------------
 // BF16 bit layout constants
