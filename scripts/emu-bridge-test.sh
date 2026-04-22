@@ -1043,7 +1043,6 @@ compile_one() {
       sed \
         -e 's/unsigned int device_index = 0;/const char* _bdf = std::getenv("XRT_DEVICE_BDF");/' \
         -e 's/auto device = xrt::device(device_index);/auto device = _bdf ? xrt::device(std::string(_bdf)) : xrt::device(0);/' \
-        -e '/xrt::hw_context context(device, xclbin.get_uuid());/a\  test_utils::CycleCounterHelper _xdna_cyc(context); _xdna_cyc.start();' \
         "$src_dir/test.cpp" > "$build_dir/test.cpp"
     fi
   fi
@@ -1138,17 +1137,11 @@ run_one_hardware() {
   local t_start
   t_start="$(uptime_sec)"
 
-  local cycles_file="$build_dir/${safe}${vsuffix}.hw.cycles.txt"
-  # Clear any stale cycles file from a prior run where the helper wasn't
-  # invoked (e.g., XRT patch not installed, trace-path compile). Phase C
-  # then treats "no file" as unbounded instead of reading stale numbers.
-  rm -f "$cycles_file"
   local rc=0
   (
     cd "$build_dir"
     export XRT_DEVICE_BDF="$bdf"
     export XDNA_TRACE_DIR="$trace_out_dir"
-    export XDNA_CYCLES_OUT="$cycles_file"
     timeout 30 bash -c "$run_cmd"
   ) > "$log_file" 2>&1 || rc=$?
 
