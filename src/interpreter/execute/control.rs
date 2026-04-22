@@ -52,6 +52,7 @@
 use crate::device::tile::{Lock, Tile, LockResult};
 use crate::interpreter::bundle::{BranchCondition, Operand, SlotOp};
 use xdna_archspec::aie2::isa::SemanticOp;
+use xdna_archspec::aie2::locks::quadrants;
 use crate::interpreter::state::ExecutionContext;
 
 /// Neighbor lock slices for cross-tile lock routing.
@@ -492,11 +493,11 @@ impl ControlUnit {
         tile: &'a mut Tile,
         neighbor_locks: &'a mut NeighborLocks,
     ) -> (&'a mut [Lock], u8, bool) {
-        if raw_lock_id >= 48 {
+        if raw_lock_id >= quadrants::EAST_START {
             // East = Internal = own tile's memory module locks.
-            let id = (raw_lock_id - 48) % tile.locks.len() as u8;
+            let id = (raw_lock_id - quadrants::EAST_START) % tile.locks.len() as u8;
             (&mut tile.locks, id, true)
-        } else if raw_lock_id < 16 {
+        } else if raw_lock_id < quadrants::SOUTH_END {
             // South = row-1 neighbor.
             if let Some(ref mut locks) = neighbor_locks.south {
                 let id = raw_lock_id % locks.len() as u8;
@@ -506,24 +507,24 @@ impl ControlUnit {
                 let id = raw_lock_id % tile.locks.len() as u8;
                 (&mut tile.locks, id, true)
             }
-        } else if raw_lock_id < 32 {
+        } else if raw_lock_id < quadrants::WEST_END {
             // West = col-1 neighbor.
             if let Some(ref mut locks) = neighbor_locks.west {
-                let id = (raw_lock_id - 16) % locks.len() as u8;
+                let id = (raw_lock_id - quadrants::WEST_START) % locks.len() as u8;
                 (&mut **locks, id, false)
             } else {
                 log::warn!("Lock ID {} targets West neighbor but no West locks available", raw_lock_id);
-                let id = (raw_lock_id - 16) % tile.locks.len() as u8;
+                let id = (raw_lock_id - quadrants::WEST_START) % tile.locks.len() as u8;
                 (&mut tile.locks, id, true)
             }
         } else {
             // North = row+1 neighbor (IDs 32-47).
             if let Some(ref mut locks) = neighbor_locks.north {
-                let id = (raw_lock_id - 32) % locks.len() as u8;
+                let id = (raw_lock_id - quadrants::NORTH_START) % locks.len() as u8;
                 (&mut **locks, id, false)
             } else {
                 log::warn!("Lock ID {} targets North neighbor but no North locks available", raw_lock_id);
-                let id = (raw_lock_id - 32) % tile.locks.len() as u8;
+                let id = (raw_lock_id - quadrants::NORTH_START) % tile.locks.len() as u8;
                 (&mut tile.locks, id, true)
             }
         }

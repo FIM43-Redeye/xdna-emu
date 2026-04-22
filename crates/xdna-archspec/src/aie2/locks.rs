@@ -15,8 +15,85 @@
 //! `xaiemlgbl_reginit.c:2452-2453` (LockValUpperBound=63,
 //! LockValLowerBound=-64). A regdb drift-detection test in this
 //! module asserts the JSON still agrees with these static constants.
+//!
+//! ## Lock ID Quadrant Mapping
+//!
+//! AIE2 cores address 64 locks via a 6-bit ID field. The field is
+//! divided into four 16-lock quadrants that each map to a neighboring
+//! tile's memory-module lock bank:
+//!
+//! | ID range | Direction | Neighbor |
+//! |----------|-----------|----------|
+//! | 0–15     | South     | row − 1  |
+//! | 16–31    | West      | col − 1  |
+//! | 32–47    | North     | row + 1  |
+//! | 48–63    | East/Internal | own tile |
+//!
+//! Source: AM025 §"Lock Instruction Encoding" and aie-rt
+//! `xaie_locks_aieml.h` `XAieMl_LockSetValue()` which uses the
+//! same 4-quadrant split to select the target tile.
 
 use crate::locks::{LockModel, LockValueLayout};
+
+/// Lock ID quadrant boundaries for AIE2.
+///
+/// The 6-bit lock ID field in AIE2 core instructions (range 0–63) is
+/// partitioned into four 16-lock quadrants. These constants delimit
+/// each quadrant so that call sites can route lock operations to the
+/// correct neighbor tile without embedding bare literals.
+///
+/// Source: AM025 §"Lock Instruction Encoding"; cross-confirmed by
+/// aie-rt `xaie_locks_aieml.h` `XAieMl_LockSetValue()`.
+pub mod quadrants {
+    /// South quadrant: lock IDs 0–15 address the row-1 neighbor.
+    pub const SOUTH_START: u8 = 0;
+    /// Exclusive end of the South quadrant (first West ID).
+    pub const SOUTH_END: u8 = 16;
+
+    /// West quadrant: lock IDs 16–31 address the col-1 neighbor.
+    pub const WEST_START: u8 = SOUTH_END;
+    /// Exclusive end of the West quadrant (first North ID).
+    pub const WEST_END: u8 = 32;
+
+    /// North quadrant: lock IDs 32–47 address the row+1 neighbor.
+    pub const NORTH_START: u8 = WEST_END;
+    /// Exclusive end of the North quadrant (first East/Internal ID).
+    pub const NORTH_END: u8 = 48;
+
+    /// East/Internal quadrant: lock IDs 48–63 address the own tile.
+    ///
+    /// "East" in AIE2 non-checkerboard layout means the local tile.
+    pub const EAST_START: u8 = NORTH_END;
+    /// Exclusive end of the East/Internal quadrant (lock-ID ceiling).
+    pub const EAST_END: u8 = 64;
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Drift-detection: quadrant boundaries must partition 0–63 into
+        /// four contiguous 16-element ranges. If the hardware encoding
+        /// changes (e.g., AIE2P uses a different partitioning), this
+        /// test fires and forces a manual review.
+        #[test]
+        fn quadrant_boundaries_partition_lock_id_space() {
+            // Each quadrant covers exactly 16 IDs.
+            assert_eq!(SOUTH_END - SOUTH_START, 16, "South quadrant must have 16 IDs");
+            assert_eq!(WEST_END - WEST_START,   16, "West quadrant must have 16 IDs");
+            assert_eq!(NORTH_END - NORTH_START, 16, "North quadrant must have 16 IDs");
+            assert_eq!(EAST_END  - EAST_START,  16, "East quadrant must have 16 IDs");
+
+            // Quadrants must be contiguous and start at 0.
+            assert_eq!(SOUTH_START, 0, "South quadrant must start at 0");
+            assert_eq!(WEST_START,  SOUTH_END, "West must start where South ends");
+            assert_eq!(NORTH_START, WEST_END,  "North must start where West ends");
+            assert_eq!(EAST_START,  NORTH_END, "East must start where North ends");
+
+            // Total coverage = 64 IDs (full 6-bit field).
+            assert_eq!(EAST_END, 64, "East quadrant must end at 64");
+        }
+    }
+}
 
 /// The AIE2 Lock_value field layout.
 ///
