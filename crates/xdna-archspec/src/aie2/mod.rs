@@ -62,6 +62,63 @@ pub mod trace_events;
 /// memory-map arithmetic has a single home inside `xdna-archspec`.
 pub mod memory_map;
 
+/// Instruction result-latency constants for the AIE2 core pipeline.
+///
+/// These latencies are the cycles from instruction issue to when the result
+/// is visible to a subsequent instruction (i.e., forwarding/bypass delays
+/// included). Values are derived from `AIE2Schedule.td` itinerary data
+/// via the `II_*` classes and are cross-validated in xdna-emu's
+/// `test_latency_cross_validation_against_itineraries` test.
+///
+/// The `timing` module (generated) holds device-level timing parameters
+/// (DMA, stream-switch, lock, memory pipeline depth). This module holds
+/// instruction-pipeline result latencies that come from the compiler's
+/// scheduling model rather than the device architecture JSON.
+pub mod instruction_latency {
+    /// Scalar multiply (32×32) result latency: 2 cycles.
+    ///
+    /// Source: `AIE2Schedule.td` `II_MUL` itinerary, `operand_cycles[0] = 2`.
+    pub const SCALAR_MUL: u8 = 2;
+
+    /// Scalar division result latency: 6 cycles.
+    ///
+    /// AIE2 uses an iterative division algorithm. The 6-cycle value
+    /// represents the throughput cost (hardware stalls for 6 cycles
+    /// before the next instruction can issue). Source: AM020 Ch4 +
+    /// hardware observation.
+    pub const SCALAR_DIV: u8 = 6;
+
+    /// Vector simple operation result latency (add, sub, compare): 2 cycles.
+    ///
+    /// Source: `AIE2Schedule.td` `II_VADD`, `II_VSUB` itineraries,
+    /// `operand_cycles[0] = 2`.
+    pub const VECTOR_SIMPLE: u8 = 2;
+
+    /// Vector multiply result latency: 5 cycles.
+    ///
+    /// Source: `AIE2Schedule.td` `II_VMUL`, `II_VNEGMUL` itineraries,
+    /// `operand_cycles[0] = 5`.
+    pub const VECTOR_MUL: u8 = 5;
+
+    /// Vector MAC (multiply-accumulate) result latency: 5 cycles.
+    ///
+    /// Source: `AIE2Schedule.td` `II_VMAC`, `II_VMSC`, `II_VNEGMAC`,
+    /// `II_VACC` itineraries, `operand_cycles[0] = 5`.
+    pub const VECTOR_MAC: u8 = 5;
+
+    /// Vector shuffle/permute result latency: 2 cycles.
+    ///
+    /// Source: `AIE2Schedule.td` `II_VSHUFFLE` itinerary,
+    /// `operand_cycles[0] = 2`.
+    pub const VECTOR_SHUFFLE: u8 = 2;
+
+    /// Vector pack/unpack result latency: 2 cycles.
+    ///
+    /// Source: `AIE2Schedule.td` `II_VPACK` itinerary,
+    /// `operand_cycles[0] = 2`.
+    pub const VECTOR_PACK: u8 = 2;
+}
+
 /// Stream switch port type identifier (xdna-emu convention, not hardware).
 ///
 /// Each port index in the port arrays maps to one of these types. This

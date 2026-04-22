@@ -17,6 +17,7 @@
 use crate::interpreter::bundle::SlotOp;
 use xdna_archspec::aie2::isa::SemanticOp;
 use xdna_archspec::aie2::isa::decoder_ffi;
+use xdna_archspec::aie2::{instruction_latency, timing};
 
 /// Timing information for a single operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,12 +76,17 @@ pub const LATENCY_SCALAR_SHIFT: u8 = 1;
 /// Scalar compare: 1 cycle
 pub const LATENCY_SCALAR_CMP: u8 = 1;
 
-/// Scalar multiply (32x32): 2 cycles (AM020 Ch4)
-pub const LATENCY_SCALAR_MUL: u8 = 2;
+/// Scalar multiply (32x32): 2 cycles.
+///
+/// Sourced from `xdna_archspec::aie2::instruction_latency::SCALAR_MUL`
+/// (AIE2Schedule.td `II_MUL` itinerary, `operand_cycles[0] = 2`).
+pub const LATENCY_SCALAR_MUL: u8 = instruction_latency::SCALAR_MUL;
 
-/// Scalar division: 6 cycles (iterative algorithm estimate)
+/// Scalar division: 6 cycles (iterative algorithm).
+///
 /// AIE2 uses iterative division, not a hardware divider.
-pub const LATENCY_SCALAR_DIV: u8 = 6;
+/// Sourced from `xdna_archspec::aie2::instruction_latency::SCALAR_DIV`.
+pub const LATENCY_SCALAR_DIV: u8 = instruction_latency::SCALAR_DIV;
 
 /// Scalar select: 1 cycle (conditional move)
 pub const LATENCY_SCALAR_SEL: u8 = 1;
@@ -88,7 +94,7 @@ pub const LATENCY_SCALAR_SEL: u8 = 1;
 /// Scalar move: 1 cycle
 pub const LATENCY_SCALAR_MOV: u8 = 1;
 
-/// Data memory load result latency: 7 cycles (AIE2Schedule.td)
+/// Data memory load result latency: `DATA_MEMORY_LATENCY + 2` cycles.
 ///
 /// This is the full pipeline from issue to register availability:
 ///   Cycle 0: Address validation (AvoidPartWordStore stage)
@@ -96,11 +102,10 @@ pub const LATENCY_SCALAR_MOV: u8 = 1;
 ///   Cycle 5: Memory access completes (MemoryCycles<[5]>)
 ///   Cycle 7: Writeback to register file (P_WM/R_WA ports)
 ///
-/// Every load itinerary in AIE2Schedule.td confirms operandcycles[0] = 7.
-/// ProcessorModel.LoadLatency = 5 is a DEFAULT fallback for instructions
-/// without itinerary data; the compiler's scheduler uses the itinerary-
-/// specific 7-cycle value.
-pub const LATENCY_MEMORY: u8 = 7;
+/// `DATA_MEMORY_LATENCY` (= 5) is the memory pipeline depth from archspec.
+/// The +2 accounts for the two writeback stages visible in AIE2Schedule.td.
+/// Every load itinerary confirms operandcycles[0] = 7.
+pub const LATENCY_MEMORY: u8 = timing::DATA_MEMORY_LATENCY + 2;
 
 /// Data memory store: 1 cycle (fire-and-forget from the core).
 /// Stores push data into a write buffer and the core continues immediately.
@@ -116,40 +121,55 @@ pub const LATENCY_NOP: u8 = 0;
 /// Branch (not taken): 1 cycle
 pub const LATENCY_BRANCH_NOT_TAKEN: u8 = 1;
 
-/// Branch (taken): 3 cycles (pipeline flush estimate)
-/// AM020 doesn't specify exact penalty; this is an estimate.
-pub const LATENCY_BRANCH_TAKEN: u8 = 3;
+/// Branch (taken): pipeline flush penalty in cycles.
+///
+/// Sourced from `xdna_archspec::aie2::timing::BRANCH_PENALTY`.
+pub const LATENCY_BRANCH_TAKEN: u8 = timing::BRANCH_PENALTY;
 
 /// Call: same as branch taken
-pub const LATENCY_CALL: u8 = 3;
+pub const LATENCY_CALL: u8 = timing::BRANCH_PENALTY;
 
 /// Return: same as branch taken
-pub const LATENCY_RETURN: u8 = 3;
+pub const LATENCY_RETURN: u8 = timing::BRANCH_PENALTY;
 
-/// Lock acquire (uncontested): 1 cycle
-pub const LATENCY_LOCK_ACQUIRE: u8 = 1;
+/// Lock acquire (uncontested): 1 cycle.
+///
+/// Sourced from `xdna_archspec::aie2::timing::LOCK_ACQUIRE_LATENCY`.
+pub const LATENCY_LOCK_ACQUIRE: u8 = timing::LOCK_ACQUIRE_LATENCY;
 
-/// Lock release: 1 cycle
-pub const LATENCY_LOCK_RELEASE: u8 = 1;
+/// Lock release: 1 cycle.
+///
+/// Sourced from `xdna_archspec::aie2::timing::LOCK_RELEASE_LATENCY`.
+pub const LATENCY_LOCK_RELEASE: u8 = timing::LOCK_RELEASE_LATENCY;
 
 // Vector operation latencies (estimates based on pipeline depth)
 // AM020 mentions "eight stages maximum" for the pipeline.
 
-/// Vector simple ops (add, sub, compare): 2 cycles
-pub const LATENCY_VECTOR_SIMPLE: u8 = 2;
+/// Vector simple ops (add, sub, compare): 2 cycles.
+///
+/// Sourced from `xdna_archspec::aie2::instruction_latency::VECTOR_SIMPLE`.
+pub const LATENCY_VECTOR_SIMPLE: u8 = instruction_latency::VECTOR_SIMPLE;
 
-/// Vector multiply: 5 cycles (TableGen II_VMUL operand_cycles[0] = 5)
-pub const LATENCY_VECTOR_MUL: u8 = 5;
+/// Vector multiply: 5 cycles (TableGen II_VMUL operand_cycles[0] = 5).
+///
+/// Sourced from `xdna_archspec::aie2::instruction_latency::VECTOR_MUL`.
+pub const LATENCY_VECTOR_MUL: u8 = instruction_latency::VECTOR_MUL;
 
-/// Vector MAC (multiply-accumulate): 5 cycles
-/// (TableGen II_VMAC operand_cycles[0] = 5; accumulator input at cycle 3)
-pub const LATENCY_VECTOR_MAC: u8 = 5;
+/// Vector MAC (multiply-accumulate): 5 cycles.
+/// (TableGen II_VMAC operand_cycles[0] = 5; accumulator input at cycle 3).
+///
+/// Sourced from `xdna_archspec::aie2::instruction_latency::VECTOR_MAC`.
+pub const LATENCY_VECTOR_MAC: u8 = instruction_latency::VECTOR_MAC;
 
-/// Vector shuffle/permute: 2 cycles
-pub const LATENCY_VECTOR_SHUFFLE: u8 = 2;
+/// Vector shuffle/permute: 2 cycles.
+///
+/// Sourced from `xdna_archspec::aie2::instruction_latency::VECTOR_SHUFFLE`.
+pub const LATENCY_VECTOR_SHUFFLE: u8 = instruction_latency::VECTOR_SHUFFLE;
 
-/// Vector pack/unpack: 2 cycles
-pub const LATENCY_VECTOR_PACK: u8 = 2;
+/// Vector pack/unpack: 2 cycles.
+///
+/// Sourced from `xdna_archspec::aie2::instruction_latency::VECTOR_PACK`.
+pub const LATENCY_VECTOR_PACK: u8 = instruction_latency::VECTOR_PACK;
 
 // ============================================================================
 // Timing Constants (pre-computed from the latency constants above)
