@@ -203,6 +203,15 @@ pub mod matmul;
 /// (lanes, bits_in, bits_out). Authoritative source for `vector_ups.rs`.
 pub mod ups;
 
+/// VMAC crossbar routing data (PRMX + PRMY tables) for the AIE2
+/// multiply-accumulate pipeline.
+///
+/// Pure hardware-probed data (789 active m-bits, 15808 route entries)
+/// with two `pub fn` entry points, `eval_prmx` and `eval_prmy`, that
+/// operate on the tables. Consumed by `src/interpreter/execute/vmac_hw.rs`
+/// via `use xdna_archspec::aie2::vmac::{eval_prmx, eval_prmy};`.
+pub mod vmac;
+
 /// Instruction set architecture: decoder tables, runtime model, and
 /// LLVM MCDisassembler FFI. Populated during Subsystem 6 Part A.
 pub mod isa;

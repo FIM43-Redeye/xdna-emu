@@ -10,13 +10,10 @@
 //!
 //! Reference: aietools me_inline_primitives.h, lines 4961-14892.
 
-#[allow(unused, unused_parens)]
-mod routing {
-    include!("vmac_routing.rs");
-}
-
-// Re-export routing evaluation functions.
-pub use routing::{eval_prmx, eval_prmy};
+// Routing data + evaluation functions live in archspec:
+// `xdna_archspec::aie2::vmac::{eval_prmx, eval_prmy}`. Re-export here so
+// the rest of the vmac_hw pipeline can use unqualified names.
+pub use xdna_archspec::aie2::vmac::{eval_prmx, eval_prmy};
 
 // ---------------------------------------------------------------------------
 // decode_mask: 4-bit mask nibble -> two 3-bit selection indices
