@@ -555,7 +555,8 @@ impl ArchConfig for ModelConfig {
                 &crate::aie2::isa_execute_model::AIE2_ISA_EXECUTOR
             }
             Architecture::Aie => unimplemented!(
-                "AIE1 IsaExecutor not populated; Phase 1 refactor ships AIE2 seam only"
+                "AIE1 IsaExecutor not populated; add \
+                 xdna_archspec::aie1::isa_execute_model::Aie1IsaExecutor"
             ),
         }
     }
@@ -770,8 +771,7 @@ mod tests {
 
     #[test]
     fn isa_executor_dispatches_to_aie2_for_aie2_family() {
-        // Test with loaded NPU1 (AIE2) and NPU2 (AIE2P) models
-        for name in &["npu1", "npu2"] {
+        for name in &["npu1", "npu2", "npu4", "npu5", "npu6"] {
             if let Some(model) = ARCHSPEC_MODELS.get(*name) {
                 let cfg = ModelConfig::from_arch_model(model, name);
                 let executor = cfg.isa_executor();

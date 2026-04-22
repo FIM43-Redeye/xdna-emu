@@ -1,7 +1,8 @@
-//! Process-global cache of the architecture's lock model and stream-switch topology.
+//! Process-global cache of architecture-level seams: lock value layout,
+//! stream-switch topology, and ISA execute model.
 //!
-//! Exposes the lock value layout and stream-switch topology as fast accessors
-//! without forcing every caller to hold a `&dyn ArchConfig` or a `Tile`.
+//! Exposes each as a fast accessor without forcing every caller to hold a
+//! `&dyn ArchConfig` or a `Tile`.
 //! Lazy-initialized at first call; the resolved `&'static` references stay cached
 //! for the process lifetime.
 //!
