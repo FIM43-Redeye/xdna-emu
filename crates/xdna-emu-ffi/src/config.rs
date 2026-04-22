@@ -5,9 +5,9 @@
 use std::ffi::{CStr, c_char};
 use std::slice;
 
-use xdna_emu::parser::{Xclbin, AiePartition, Cdo};
-use xdna_emu::parser::xclbin::SectionKind;
-use xdna_emu::parser::cdo::find_cdo_offset;
+use xdna_emu_core::parser::{Xclbin, AiePartition, Cdo};
+use xdna_emu_core::parser::xclbin::SectionKind;
+use xdna_emu_core::parser::cdo::find_cdo_offset;
 
 use super::{XdnaEmuHandle, XdnaEmuResult, set_last_error};
 

@@ -8,10 +8,14 @@ license = "MIT"
 [lib]
 # Keep the .so name stable: libxdna_emu.so
 # The XRT plugin dlopen's this by name via XDNA_EMU_DIR.
+# rlib is added alongside cdylib so integration tests (tests/*) can link
+# against this crate's Rust API. The dependency on the main `xdna-emu`
+# crate is renamed to `xdna_emu_core` here to avoid the name collision
+# (both crates otherwise resolve to the lib name `xdna_emu`).
 name = "xdna_emu"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-xdna-emu = { path = "../..", default-features = false }
+xdna_emu_core = { package = "xdna-emu", path = "../..", default-features = false }
 log = "0.4"
 env_logger = "0.11"

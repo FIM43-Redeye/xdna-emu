@@ -50,8 +50,8 @@ use std::cell::RefCell;
 use std::ffi::c_char;
 use std::sync::Mutex;
 
-use xdna_emu::interpreter::engine::InterpreterEngine;
-use xdna_emu::npu::NpuExecutor;
+use xdna_emu_core::interpreter::engine::InterpreterEngine;
+use xdna_emu_core::npu::NpuExecutor;
 
 // Thread-local error storage for xdna_emu_get_error().
 thread_local! {
@@ -89,13 +89,29 @@ pub enum XdnaEmuResult {
     NullPointer = 6,
 }
 
+/// Why the emulator stopped running.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XdnaEmuHaltReason {
+    /// Kernel ran to natural completion (cores halted, syncs satisfied).
+    Completed = 0,
+    /// Cycle budget (`max_cycles`) reached before natural completion.
+    Budget = 1,
+    /// Error during execution (FFI fault, executor error).
+    Error = 2,
+}
+
 /// Execution status returned by run functions.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct XdnaEmuExecStatus {
     pub result: XdnaEmuResult,
     pub cycles_executed: u64,
+    /// True when cores have halted or all DMA syncs are satisfied.
+    /// Kept for back-compat; `halt_reason` carries richer information.
     pub halted: bool,
+    /// Structured reason for the halt.
+    pub halt_reason: XdnaEmuHaltReason,
 }
 
 // Global lock for thread safety during initialization
@@ -124,9 +140,9 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
 
     // Initialize logging if not already done
     let _ = env_logger::try_init();
-    xdna_emu::debug::watch::init();
+    xdna_emu_core::debug::watch::init();
 
-    let config = xdna_emu::config::Config::get();
+    let config = xdna_emu_core::config::Config::get();
     let mut engine = InterpreterEngine::new_npu1();
     engine.set_stall_threshold(config.stall_threshold());
     let handle = Box::new(XdnaEmuHandle {

@@ -4,9 +4,9 @@
 
 use std::slice;
 
-use xdna_emu::npu::NpuInstructionStream;
+use xdna_emu_core::npu::NpuInstructionStream;
 
-use super::{XdnaEmuHandle, XdnaEmuResult, XdnaEmuExecStatus};
+use super::{XdnaEmuHandle, XdnaEmuResult, XdnaEmuExecStatus, XdnaEmuHaltReason};
 
 /// Execute NPU instructions.
 ///
@@ -67,7 +67,12 @@ pub unsafe extern "C" fn xdna_emu_set_max_cycles(
 
 /// Run the emulator until completion or max cycles.
 ///
-/// Returns execution status including whether the cores halted.
+/// Returns execution status including halt reason and cycle count.
+///
+/// When `max_cycles` is 0 (set via `xdna_emu_set_max_cycles`), execution is
+/// unbounded — the emulator runs until cores halt naturally or syncs are
+/// satisfied. A non-zero `max_cycles` caps execution; if the budget is
+/// exhausted before natural completion, `halt_reason` is `Budget`.
 #[no_mangle]
 pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExecStatus {
     if handle.is_null() {
@@ -75,17 +80,23 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
             result: XdnaEmuResult::InvalidHandle,
             cycles_executed: 0,
             halted: false,
+            halt_reason: XdnaEmuHaltReason::Error,
         };
     }
 
     let handle = &mut *handle;
 
-    use xdna_emu::interpreter::engine::EngineStatus;
+    use xdna_emu_core::interpreter::engine::EngineStatus;
 
     let mut cycles = 0u64;
     let max = handle.max_cycles;
+    // max == 0 means unbounded: the loop runs until a natural exit point.
+    let unbounded = max == 0;
 
-    log::info!("Running emulator (max {} cycles)", max);
+    log::info!(
+        "Running emulator (max {})",
+        if unbounded { "unbounded".to_string() } else { format!("{} cycles", max) }
+    );
 
     // Warm-up: let cores run to their first blocking point before
     // processing NPU instructions.  On real hardware, the core has been
@@ -105,17 +116,28 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         log::info!("Core warm-up: {} cycles (all cores at first blocking point)", cycles);
     }
 
-    while cycles < max {
-        // Advance NPU instruction execution (interleaved with engine step)
+    // Track whether we exited via a natural halt (Completed) or fell through
+    // to budget exhaustion.
+    let mut natural_halt = false;
+
+    'run: while unbounded || cycles < max {
+        // Advance NPU instruction execution (interleaved with engine step).
         let npu_progressed;
         {
             let (device, host_mem) = handle.engine.device_and_host_memory();
             let result = handle.npu_executor.try_advance(device, host_mem);
-            if let xdna_emu::npu::AdvanceResult::Error(msg) = result {
+            if let xdna_emu_core::npu::AdvanceResult::Error(msg) = result {
                 log::error!("NPU executor fatal: {}", msg);
-                break;
+                // Flush trace before returning so partial data reaches DDR.
+                handle.engine.flush_trace_to_host();
+                return XdnaEmuExecStatus {
+                    result: XdnaEmuResult::ExecutionError,
+                    cycles_executed: cycles,
+                    halted: false,
+                    halt_reason: XdnaEmuHaltReason::Error,
+                };
             }
-            npu_progressed = matches!(result, xdna_emu::npu::AdvanceResult::Progressed);
+            npu_progressed = matches!(result, xdna_emu_core::npu::AdvanceResult::Progressed);
         }
 
         // When the NPU executor progressed (executed an instruction that may
@@ -143,13 +165,17 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
                 handle.engine.force_running();
             } else {
                 log::info!("Cores halted after {} cycles", cycles);
-                break;
+                natural_halt = true;
+                break 'run;
             }
         }
 
         if handle.engine.status() == EngineStatus::Stalled {
             log::warn!("Stall detected after {} cycles: no monotonic progress", cycles);
-            break;
+            // A stall is treated as a natural (if unhappy) halt — the run
+            // completed as far as the emulator can tell, not a budget cut.
+            natural_halt = true;
+            break 'run;
         }
 
         // Check if all NPU sync conditions are satisfied.  On real
@@ -161,7 +187,8 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
             && handle.npu_executor.syncs_satisfied(handle.engine.device())
         {
             log::info!("All DMA syncs satisfied after {} cycles", cycles);
-            break;
+            natural_halt = true;
+            break 'run;
         }
     }
 
@@ -174,9 +201,18 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         || (handle.npu_executor.is_done()
             && handle.npu_executor.syncs_satisfied(handle.engine.device()));
 
+    // If we didn't exit naturally (halted/stalled/syncs), the while-loop
+    // condition `cycles >= max` ended the run — budget was exhausted.
+    let halt_reason = if natural_halt || halted {
+        XdnaEmuHaltReason::Completed
+    } else {
+        XdnaEmuHaltReason::Budget
+    };
+
     XdnaEmuExecStatus {
         result: XdnaEmuResult::Success,
         cycles_executed: cycles,
         halted,
+        halt_reason,
     }
 }
