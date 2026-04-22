@@ -181,6 +181,15 @@ pub mod isa_execute_model;
 /// (`vector_float.rs`). Both files previously carried identical local copies.
 pub mod rounding;
 
+/// Permute and shuffle data for the AIE2 vector unit.
+///
+/// `ShuffleMode` (48 hardware shuffle modes) + `SHUFFLE_ROUTING` (hardware-probed
+/// byte-routing table, 48 x 64 bytes) drive the `vshuffle` instruction.
+/// `MacPermuteMode` (26 modes) + `MacPermuteConfig` + `mac_permute_config()`
+/// drive MAC permutation routing. All pure data; execution algorithms
+/// (`shuffle_vectors`, `rc2i`) stay in xdna-emu.
+pub mod permute;
+
 /// Matrix multiply geometry tables for the AIE2 vector multiply array.
 ///
 /// `DENSE_GEOMETRY_TABLE`, `SPARSE_GEOMETRY_TABLE`, and `CONFIG_GEOMETRY_TABLE`

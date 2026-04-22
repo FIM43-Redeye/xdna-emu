@@ -277,7 +277,7 @@ impl VectorAlu {
             hi_bytes[i * 4..i * 4 + 4].copy_from_slice(&s2[i].to_le_bytes());
         }
 
-        let out_bytes = if let Some(mode) = super::vector_permute::ShuffleMode::from_mode(mode_idx) {
+        let out_bytes = if let Some(mode) = xdna_archspec::aie2::permute::ShuffleMode::from_mode(mode_idx) {
             super::vector_permute::shuffle_vectors(&lo_bytes, &hi_bytes, mode)
         } else {
             // mode >= 48: mask overflows to 0, crossbar passes
@@ -379,7 +379,7 @@ impl VectorAlu {
                     let r29 = ctx.scalar_read(29);
                     let mode_idx = (r29 & 0x3F) as u8;
 
-                    if let Some(mode) = super::vector_permute::ShuffleMode::from_mode(mode_idx) {
+                    if let Some(mode) = xdna_archspec::aie2::permute::ShuffleMode::from_mode(mode_idx) {
                         let mut lo_bytes = [0u8; 64];
                         let hi_bytes = [0u8; 64];
                         for i in 0..16 {
