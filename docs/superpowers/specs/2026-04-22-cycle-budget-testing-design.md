@@ -4,9 +4,12 @@
 **Status:** Design approved, ready for implementation plan
 **Context:** Subsystem 7 (ISA Execute) landed and produced a bridge-test
 regression: 10 Chess + 10 Peano tests went PASS → TIMEOUT at the wall-clock
-`timeout 120` boundary. Log-volume evidence (72MB → 35MB) suggests the
-slowdown is host-side (wall-clock), not cycle-modeled (EMU_cycles > HW_cycles).
-Today's bridge harness can't tell these apart — both surface as a timeout.
+`timeout 120` boundary. The cause could be host-side slowdown (EMU taking
+longer wall-clock time to emulate the same kernel) or cycle-modeled slowdown
+(EMU spending more emulated cycles to complete the same kernel work) — and
+log-volume alone can't distinguish them (both produce smaller logs for
+different reasons). Today's bridge harness can't tell these apart; both
+surface as a timeout.
 
 ## Goal
 
@@ -39,19 +42,34 @@ Order rationale: B measures HW before we know what EMU "should" do. A makes
 EMU's cycle budget observable without gating on anything yet. D tightens EMU's
 counter so the comparison in C reflects reality. C ties it all together.
 
-## Framing: EMU cycles should be ≤ HW cycles
+## Framing: what `ACTIVE_CORE` actually measures
 
-EMU's DMA is near-instantaneous today; NoC latency is not modeled; stream
-switch crossings are free. Result: for the same kernel, EMU runs fewer
-cycles than HW (it skips stalls HW actually incurs).
+`XAIE_EVENT_ACTIVE_CORE` ticks only during cycles the core is in Execute
+state. It does *not* tick during DMA stalls, lock waits, cascade stalls, or
+idle. On HW and (after Phase D) on EMU alike.
 
-This matters for tolerance interpretation. A 3× upper bound is a **runaway
-cap**, not a slack allowance. The expected steady state is `EMU_cycles ≤
-HW_cycles`. If EMU_cycles >> HW_cycles, that's a cycle-modeling regression
-in EMU — a real signal worth investigating.
+So the comparison in Phase C isn't "wall-clock work" — it's
+"instruction-executing cycles for this kernel." For identical instruction
+streams (we run the same `.xclbin` on both), the expected relationship is
+**`EMU_cycles ≈ HW_cycles`**.
 
-As EMU's cycle modeling tightens, tolerance tightens too. Today's 3× is
-deliberately loose because we know EMU underestimates.
+Directional caveats:
+- `EMU_cycles < HW_cycles` — EMU's pipeline/hazard/scheduling model is
+  *simpler* than HW's silicon behavior. EMU might compress instructions
+  into fewer cycles if it misses a hazard HW enforces.
+- `EMU_cycles > HW_cycles` — EMU over-counting execute cycles. Either a
+  regression in EMU's cycle model, or Phase D didn't eliminate all
+  level-event drift (stall cycles still being counted as execute cycles).
+
+The 3× tolerance in Phase C is a **runaway cap**, not a slack allowance.
+It catches pathological regressions (EMU taking many multiples of HW
+cycles). As EMU's modeling tightens, tolerance tightens. The drift
+helper (`show-cycle-drift.sh`) exposes bi-directional drift for
+investigation regardless of gating.
+
+This framing is distinct from wall-clock: EMU spending more *host* time
+per emulated cycle is a Phase A / bridge concern (host-side perf), not
+reflected in `ACTIVE_CORE` at all.
 
 ---
 
@@ -70,8 +88,13 @@ void xdna_cycle_counter_readout(const std::string& out_path);
 ```
 
 `setup` iterates every compute tile in the active partition and configures
-perf counter 0 on each core with `XAIE_EVENT_ACTIVE_CORE` as both start and
-reset event (free-running).
+perf counter 0 on each core: start_event = `XAIE_EVENT_ACTIVE_CORE`,
+stop_event = none, reset_event = none, threshold = 0 (no auto-reset, no
+auto-stop). Counter runs free from first core-active cycle through readout.
+
+(Counter index 0 is a convention. If upstreamed, other users may want to
+use counter 0 for their own purposes; we'd need to coordinate. For our
+own tests today there's no collision.)
 
 `readout` iterates the same tiles, reads each counter, and writes a
 plain-text file:
@@ -159,17 +182,30 @@ Wherever the plugin receives `XdnaEmuExecStatus` from `xdna_emu_run()`, emit
 a line to stderr before returning:
 
 ```
-XDNA_EMU_STATUS: halted=<bool> cycles=<u64> budget_exceeded=<bool>
+XDNA_EMU_STATUS: halt_reason=<completed|budget|error> cycles=<u64> max_cycles=<u64>
 ```
 
-- `budget_exceeded = halted && max_cycles_was_set && cycles_executed >= max_cycles`.
+- `halt_reason` distinguishes *why* the emulator stopped. `completed` = core
+  hit a HALT instruction (kernel done). `budget` = cycle budget reached.
+  `error` = crash / FFI fault.
+- `max_cycles=0` when unset / unbounded.
 - Keyed prefix so bridge can grep cleanly.
+
+This requires the FFI's `XdnaEmuExecStatus` to surface `halt_reason`
+explicitly. If it doesn't today, add it — the `halted` boolean alone is
+ambiguous (can't distinguish "kernel finished right at budget" from
+"budget fired exactly when kernel would have completed"). Checking the
+FFI struct's current shape is a plan-phase concrete task.
 
 **3. Bridge script parses status.**
 
 In `scripts/emu-bridge-test.sh`, after each EMU run, grep the captured log
-for `XDNA_EMU_STATUS:`. If `budget_exceeded=true`, mark the test `BUDGET`
-— a distinct result from `TIMEOUT` (wall-clock) and `FAIL` (functional).
+for `XDNA_EMU_STATUS:`. If `halt_reason=budget`, mark the test `BUDGET` — a
+distinct result from `TIMEOUT` (wall-clock) and `FAIL` (functional).
+
+Precondition to verify in plan phase: the bridge's current capture
+redirection must include stderr. If today's script only captures stdout,
+the plan adds the `2>&1` merge before this parse step.
 
 **4. Wall-clock safety net relaxed.**
 
@@ -192,10 +228,14 @@ but when the tests are known-long, you need it.
 
 - `set_max_cycles(0)` → unbounded (no cap).
 - When cap is reached, emulator voluntarily halts **at bundle boundary**
-  (not mid-bundle); `run()` returns with `halted=true`, `cycles_executed
-  == max_cycles` (modulo partial bundle completion).
+  (not mid-bundle); `run()` returns with `halt_reason=budget`,
+  `cycles_executed == max_cycles` (modulo partial bundle completion).
+- When kernel hits HALT instruction before cap, `run()` returns with
+  `halt_reason=completed`, `cycles_executed <= max_cycles`.
 - Emulator state stays consistent on halt — bundle either completes or
   doesn't start.
+- Plan-phase task: confirm current FFI struct shape and add `halt_reason`
+  if absent.
 
 ### Result classification changes
 
@@ -273,8 +313,16 @@ into the core's execute path: tick once per successfully-executed
 instruction. Narrower surface; doesn't change `tick()`'s contract for
 pulse-event counters.
 
-Plan task will pick based on minimum diff + clearest invariant. Both
-achieve the same behavior for the workload at hand.
+**Option 3 — Event-emission-per-cycle.**
+Emit `ACTIVE_CORE` as an event every cycle the core executes, and have
+`handle_event()` itself increment the counter on matching fires. Most
+faithful to aie-rt's documented event-driven model (counters tick on
+event occurrence, not on a separate per-cycle callback). Largest
+surface — changes the counter increment path globally.
+
+Plan task picks based on minimum diff + clearest invariant. All three
+achieve the same observable behavior; Option 2 probably has the
+smallest diff.
 
 ### Audit scope
 
@@ -414,20 +462,23 @@ Directly useful for the perf hunt that follows this workstream.
 | # | Phase | Step | Commit |
 |---|-------|------|--------|
 | 1 | B.1 | Helper C++ source + CMake glue in mlir-aie | `[mlir-aie] test: add xdna_cycle_counter helper for HW cycle capture` |
-| 2 | B.2 | Rebuild test.exe binaries, verify artifacts | `chore: rebuild bridge test.exe binaries with cycle helper` |
-| 3 | A.1 | Plugin env-var reader + XDNA_EMU_STATUS line + bridge parser | `feat(plugin,bridge): wire XDNA_EMU_MAX_CYCLES; emit status line` |
-| 4 | A.2 | Wall-clock timeout relaxed to 600s + `--no-timeout` flag | `feat(bridge): relax wall-clock timeout; add --no-timeout` |
-| 5 | D.1 | Audit: confirm HW ACTIVE_CORE semantics + level-event list | `docs: cycle-budget D.1 audit of level-valued perf events` |
-| 6 | D.2 | Refactor PerfCounterBank for level-event semantics + unit tests | `fix(perf_counters): ACTIVE_CORE ticks only during core execute` |
-| 7 | D.3 | Integration spot-check vs Phase B HW references | (no commit unless fix needed) |
-| 8 | C.1 | `*.hw.cycles.txt` parser | `feat(bridge): parse hw cycles artifacts for budget` |
-| 9 | C.2 | Override file loader | `feat(bridge): cycle-budget override file loader` |
-| 10 | C.3 | Budget calculation + env var export | `feat(bridge): apply per-test XDNA_EMU_MAX_CYCLES budget` |
-| 11 | C.4 | Status → BUDGET result classification | (rolled into earlier commit if trivial) |
-| 12 | C.5 | Results column merge + `show-cycle-drift.sh` | `feat(bridge): merge cycle counts into results; add drift helper` |
+| 2 | A.1 | Plugin env-var reader + XDNA_EMU_STATUS line + bridge parser | `feat(plugin,bridge): wire XDNA_EMU_MAX_CYCLES; emit status line` |
+| 3 | A.2 | Wall-clock timeout relaxed to 600s + `--no-timeout` flag | `feat(bridge): relax wall-clock timeout; add --no-timeout` |
+| 4 | D.1 | Audit: confirm HW ACTIVE_CORE semantics + level-event list | `docs: cycle-budget D.1 audit of level-valued perf events` |
+| 5 | D.2 | Refactor PerfCounterBank for level-event semantics + unit tests | `fix(perf_counters): ACTIVE_CORE ticks only during core execute` |
+| 6 | D.3 | Integration spot-check vs Phase B HW references | (no commit unless fix needed) |
+| 7 | C.1 | `*.hw.cycles.txt` parser | `feat(bridge): parse hw cycles artifacts for budget` |
+| 8 | C.2 | Override file loader | `feat(bridge): cycle-budget override file loader` |
+| 9 | C.3 | Budget calculation + env var export | `feat(bridge): apply per-test XDNA_EMU_MAX_CYCLES budget` |
+| 10 | C.4 | Status → BUDGET result classification | (rolled into earlier commit if trivial) |
+| 11 | C.5 | Results column merge + `show-cycle-drift.sh` | `feat(bridge): merge cycle counts into results; add drift helper` |
 
 Each commit independently runnable. Rollback at any step is a straight
 revert.
+
+Note: rebuilding bridge test.exe binaries after B.1 is a procedural step
+(part of running `scripts/emu-bridge-test.sh --compile`), not a separate
+git commit.
 
 ## Risks and Mitigations
 
@@ -439,7 +490,7 @@ revert.
 | Shell-script complexity | Factor budget logic into one function (~30 lines). If it grows, move to a small Python helper |
 | `XDNA_EMU_STATUS:` parser fragility (stderr buffering, TTY quirks, output interleaving) | Distinctive prefix; anchored grep; test against real bridge logs before gating on it |
 | Counter width overflow (32-bit) | Bridge tests stay well under 4G cycles per core; not a practical concern for this workload |
-| `EMU_cycles << HW_cycles` always true → comparison meaningless | Tolerance is upper-bound only; the point is catching regressions, not gating on ratio parity. As EMU modeling tightens, tolerance tightens |
+| Bridge gate fires only on `EMU > HW` drift; under-drift invisible | `show-cycle-drift.sh` surfaces drift in either direction for investigation. Gate is upper-bound only (catching regressions); drift helper catches under-counting that would indicate incomplete modeling |
 
 ## Success Criteria
 
@@ -448,19 +499,44 @@ After all four phases land:
 - Every HW-path bridge test produces a `{t}.hw.cycles.txt` with sensible numbers.
 - Every EMU-path run produces an `XDNA_EMU_STATUS:` line.
 - Bridge results show cycle counts merged into status columns.
-- Today's 20 regressions produce `BUDGET` results (cycle-modeled slowdown),
-  not `TIMEOUT` (wall-clock) — confirming the slowdown is in cycle count,
-  not just host-side overhead. Or vice versa — whichever it actually is.
-  Either way, we've separated the signals.
+- Today's 20 regressions produce either `BUDGET` (cycle-modeled slowdown)
+  or `TIMEOUT` (host-side wall-clock slowdown). Whichever class it is, we
+  know, and the perf-hunt workstream that follows attacks the right target.
 - `scripts/show-cycle-drift.sh` gives an at-a-glance ranked drift view,
   ready for the perf-hunt workstream to follow.
 
 ## Open Questions (Deferred to Plan Phase)
 
-- Exact location of the `setup` / `readout` call sites in mlir-aie's test
+**Load-bearing — block planning until answered:**
+
+- **How does the Phase B helper access an `XAie_DevInst*`?** The
+  `XAie_PerfCounter*` APIs require an aie-rt device handle, not an XRT
+  `hw_context`. Bridge test.exe binaries talk to XRT, not aie-rt directly.
+  Possible paths: (a) a private XRT API that exposes the underlying
+  `XAie_DevInst`, (b) a separate aie-rt `XAie_CfgInitialize` from inside
+  test.exe against the same partition, (c) wrap perf counter reads in an
+  XRT-level API that already exists but we haven't found. First plan-phase
+  task is proving this is reachable; if not, the Phase B mechanism shifts.
+- **mlir-aie patch deployment.** Our `../mlir-aie/` is a local checkout.
+  Options: commit patch directly in that tree (and track a fork branch),
+  ship a `.patch` file applied by `scripts/` at bridge-setup time, or land
+  upstream immediately and sync. Affects how reviewers reproduce the work.
+- **Bridge stderr capture.** Phase A's `XDNA_EMU_STATUS:` line goes to
+  stderr. Verify today's bridge capture includes stderr; if not, add `2>&1`
+  merge in the EMU invocation line.
+- **FFI `halt_reason` field.** Does `XdnaEmuExecStatus` already carry a
+  reason field, or only the `halted` bool? If only bool, add the enum field
+  in Phase A.
+
+**Non-blocking — choose during planning:**
+
+- **Exact location of `setup` / `readout` call sites** in mlir-aie's test
   main template (requires reading the current template).
-- Option 1 vs Option 2 for the D.2 refactor (level-predicate on tick vs
-  move tick site). Pick based on diff size after reading the current tick
-  call sites.
-- Whether override multiplier should be an integer or a float. Lean integer
-  for simplicity unless a real test needs fractional.
+- **Concrete source for partition tile layout.** The helper needs the list
+  of `(col, row)` compute tile pairs in the active partition. Sources to
+  investigate: xclbin metadata, test-harness-provided config, MLIR-generated
+  constants.
+- **Option 1 / 2 / 3 for the D.2 refactor.** Pick based on diff size after
+  reading current tick call sites. Option 2 is the default presumption.
+- **Override multiplier — integer or float.** Lean integer for simplicity
+  unless a real test needs fractional.
