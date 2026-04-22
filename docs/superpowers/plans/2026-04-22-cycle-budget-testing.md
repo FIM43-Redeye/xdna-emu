@@ -436,8 +436,10 @@ Header-only RAII helper that programs AIE2 perf counter 0 with
 start_event = ACTIVE_CORE on every compute tile. Destructor writes
 tile,row,cycles lines to the path named by \$XDNA_CYCLES_OUT.
 
-Uses XRT's read_aie_reg / write_aie_reg public API (xrt_aie.h),
-so no aie-rt linkage is required in test.exe.
+Uses the patched xrt::hw_context::{read,write}_aie_reg API
+(xrt_hw_context.h), so no aie-rt linkage is required in test.exe.
+The patch lives in xdna-driver/xrt/ on a parallel
+xdna-emu-cycle-budget branch; upstream eventually.
 
 Register offsets and event ID derived from aie-rt xaiemlgbl_params.h
 and xaiemlgbl_reginit.c."
