@@ -63,9 +63,11 @@ def parse_args():
     p.add_argument("--input", required=True, help="path to input .mlir")
     p.add_argument("--out", required=True, help="path to write traced .mlir")
     p.add_argument("--buffer-size", type=int, default=8192,
-                   help="trace buffer size in bytes (default: 8192)")
+                   help="trace buffer size in bytes (default: 8192); "
+                        "consumed by the host_config emission in Task 5")
     p.add_argument("--no-op", action="store_true",
-                   help="parse and reserialize without injecting (for testing)")
+                   help="parse and reserialize without injecting "
+                        "(testing only -- skips injection)")
     return p.parse_args()
 
 
