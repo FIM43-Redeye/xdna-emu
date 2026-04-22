@@ -80,7 +80,31 @@ Files: `execute/mod.rs`, `semantic.rs`, `cycle_accurate.rs`,
 
 Files: `control.rs`, `stream.rs`, `cascade.rs`.
 
-(Filled in by Task 1 Step 4.)
+### `control.rs`
+
+- **Size + responsibility.** 1088 lines; the `ControlUnit` struct handling branches (conditional/unconditional, five branch-condition variants), calls/returns, lock acquire/release, DMA start/wait, halt, and the `NeighborLocks` routing table for cross-tile lock access via the quadrant mapping.
+- **AIE2 hardcode count.** 14 matches. Load-bearing instances: (1) lock ID quadrant boundaries 0-15 (South), 16-31 (West), 32-47 (North), 48-63 (East=Internal) embedded as literal integers in `route_lock()` (lines 490-530); (2) `// AIE2 lock quadrant mapping (per mlir-aie getLockLocalBaseIndex)` (lines 100-104, 201-204, 478-484); (3) `// AIE2 uses semaphore locks with 6-bit unsigned values (0-63)` (line 39); (4) `// AIE2 has two ACQ instruction variants` (line 382). The quadrant ID boundaries (0/16/32/48) are the primary hardcode; the 6-bit lock value range (0-63, which equals the per-tile 16 lock slots x 4 quadrants) is a structural fact.
+- **Divergence risks vs AIE1/AIE2P.** Lock quadrant mapping (IDs 0-15 = South, etc.) is AIE2-specific, derived from `mlir-aie AIETargetModel::getLockLocalBaseIndex()`. AIE1 uses a different lock topology (no South neighbor locks for compute tiles; different quadrant boundaries). The quadrant offsets (16, 32, 48) are AIE2-specific constants that are NOT yet in archspec. The 6-bit lock value range is also AIE2-specific. Branch delay-slot handling delegates to `ExecutionContext::tick_delay_slots` (not in this file). Lock acquire/release semantics (delta-based semaphore: ACQ waits until value >= expected then subtracts delta, REL adds delta) appear structurally identical between AIE1 and AIE2 per aie-rt `xaie_locks_aieml.h` vs `xaie_locks_aie.h`.
+- **Prescribed migration verb.** `read-archspec-via-accessor`. The quadrant ID boundaries (0, 16, 32, 48) and lock count (64 total) should move to archspec (extend `xdna_archspec::aie2::locks` or add a `lock_quadrant_offsets()` accessor). The lock acquire/release algorithms stay in xdna-emu.
+- **Estimated LOC impact.** ~20 lines changing in xdna-emu (replace 4 magic boundaries); ~20 lines added to archspec (quadrant layout constants or existing locks module extension).
+
+### `stream.rs`
+
+- **Size + responsibility.** 459 lines; `StreamOps` handling stream read/write operations (`StreamReadScalar`, `StreamWriteScalar`, `StreamWritePacketHeader`) by routing through the `Tile`'s stream buffers, with blocking-read stall detection.
+- **AIE2 hardcode count.** 5 matches, all in comments/docs: `// AIE2 uses streams for tile-to-tile communication` (line 4); `// Each AIE2 tile has stream switch ports` (line 21); `// AIE2 stream ops typically encode the port as an immediate operand` (line 83); one import of `xdna_archspec::aie2::isa::SemanticOp`. No load-bearing arch-specific constants in the implementation.
+- **Divergence risks vs AIE1/AIE2P.** Stream port enumeration (which port index maps to which bundle type) is already archspec-resident via the stream-switch model from Subsystem 5. The stream read/write algorithm (push to FIFO, stall if empty on read) is arch-generic. AIE2P is expected to be identical at the instruction level. AIE1 has streams but the port numbering differs -- this is already handled by the stream-switch model's port-type assignments, not by this file.
+- **Prescribed migration verb.** `leave-alone`.
+- **Estimated LOC impact.** 0 xdna-emu changes; 0 archspec additions.
+
+### `cascade.rs`
+
+- **Size + responsibility.** 379 lines; `CascadeOps` implementing the 384-bit point-to-point cascade link -- reads from SCD (input FIFO), writes to MCD (output FIFO), with VLIW-safe pre-flight stall detection (`would_stall()`), and data-packing functions for vector (256-bit → 384-bit) and accumulator (512-bit → 384-bit) types.
+- **AIE2 hardcode count.** 9 matches. All are structural: `// 384-bit data width = 6 x u64 = 48 bytes` (line 9); `// Depth-1 FIFO` (line 10); cascade direction register at `0x36060` (line 11); accumulator pack functions that explicitly use `[u64; 6]` (384 bits) and `[u64; 8]` (512 bits) layouts (lines 225-245). The 384-bit width is the canonical cascade width for AIE2.
+- **Divergence risks vs AIE1/AIE2P.** AIE1 does **not** have a cascade link -- this subsystem would be entirely absent for AIE1. AIE2P is expected to retain a cascade link of the same width (no evidence of change in aie-rt or llvm-aie, but not verified). The 384-bit width (6 x u64) is intrinsic to how data is packed/unpacked; an AIE2P with a different cascade width would need different pack/unpack functions. This is the clearest example in this area of a genuinely arch-specific shape: cascade exists only on AIE2 (and presumably AIE2P), not on AIE1.
+- **Prescribed migration verb.** `wrap-in-trait`. The cascade width (384 bits) and the FIFO depth are archspec data. However, the existence vs. non-existence of the cascade link is a shape difference, not a values difference. For Subsystem 7's purposes: the cascade data (width, register address) should move to archspec; for AIE1 support, a trait method returning `Option<&'static dyn CascadeModel>` would be cleanest, but this may be overkill if AIE1 is never targeted. **Pre-audit assessment was correct that cascade is arch-specific; the question is whether the shape-vs-values test warrants a trait method.** Given AIE1 simply has no cascade (not a different cascade), the simpler approach is an archspec feature flag (`has_cascade_link: bool`) readable via `arch_handle::processor_model()`, and the execute path gates on it. This avoids a trait method.
+- **Estimated LOC impact.** ~15 lines changing in xdna-emu (guard cascade dispatch on `arch_handle::processor_model().has_cascade_link`); ~10 lines added to archspec (extend `processor` module with `has_cascade_link: bool`).
+
+**Area summary.** No `IsaExecutor` trait methods warranted for this area. The control-register mappings in `control.rs` (lock quadrant IDs 0/16/32/48) are the primary data-migration target; they should extend the existing locks module in archspec. The 384-bit cascade width and register address in `cascade.rs` should migrate to archspec processor data, gated by a `has_cascade_link` feature flag -- not a trait method. `stream.rs` is clean (`leave-alone`). `control.rs` is `read-archspec-via-accessor`. `cascade.rs` is `move-to-archspec` for the constants.
 
 ## 3. Memory
 
