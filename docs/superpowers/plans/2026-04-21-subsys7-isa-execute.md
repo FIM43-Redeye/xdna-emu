@@ -1191,65 +1191,810 @@ Part B.
 
 ---
 
-## Part B -- Authored After Task 1 Audit Lands
+## Part B -- Authored 2026-04-21 After Audit Landed
 
-Part B tasks are authored as a plan amendment once Task 1 (the audit)
-commits. The amendment adds concrete tasks starting at `### Task 3:`
-and ending with a final gate + tag task.
+The Subsystem 7 audit (committed through `63fca4a`) concluded
+**Approach A: zero `IsaExecutor` trait methods warranted.** Every
+candidate divergence reduces to data-expressible differences. Part B
+is therefore data-migration-only: ~6,300 LOC moving from xdna-emu
+into `xdna_archspec::aie2::*` submodules plus ~90 scattered accessor
+migrations, followed by the completion + tag task.
 
-**Expected Part B task shape** (not commitments; the audit drives the
-exact list):
+**Pre-verified findings driving Part B** (see audit closing summary):
 
-- **Tasks 3-5: Data migrations.** One task per data-migration
-  destination from the audit's closing summary. Expected to include:
-  - Wholesale move of `src/interpreter/execute/vmac_routing.rs` into
-    `xdna_archspec::aie2::vmac::routing` with consumer update in
-    `vmac_hw.rs`. Drift-detection test.
-  - AIE2 latency values from `timing/latency.rs` -> archspec
-    (extending `ProcessorModel` or new `aie2::timing` module).
-  - Memory-hierarchy constants from `memory/mod.rs` if the audit
-    surfaces any outside archspec.
-  - Any other data-migration rows the audit surfaces.
+- `RoundingMode` enum duplication in `vector_srs.rs` (lines 34-87) and
+  `vector_float.rs` (lines 34-70) is **structurally identical**. Only
+  cosmetic doc-comment differences: `vector_float.rs` has the more
+  accurate enum-level doc ("Hardware rounding modes for the SRS
+  instruction and bf16 conversion"); `vector_srs.rs` has fuller
+  per-variant docs. Merge: keep `vector_float.rs`'s enum-level doc +
+  `vector_srs.rs`'s per-variant docs. Verified read-only 2026-04-21.
+- `vmac_routing.rs` is `include!`'d from `vmac_hw.rs` line 15 with
+  only two consumers (`eval_prmx`/`eval_prmy` called at lines 1053,
+  1062 of `vmac_hw.rs`). Move is mechanical.
+- `has_cascade_link: bool` is a genuinely new archspec addition, not a
+  simple move. Plumbing: add field to `ProcessorModel`, wire through
+  `from_arch_model` (with default `true` for AIE2 arches), add
+  accessor, gate `cascade.rs` call sites. Estimated LOC is closer to
+  20-30 than the +2 the audit table suggested.
 
-- **Tasks 6-(N-1): Trait-method additions + call-site migrations.**
-  One task per trait method added to `IsaExecutor`, each task:
-  (a) adds the method signature to `isa_execute/mod.rs`;
-  (b) adds the `Aie2IsaExecutor` impl in `aie2/isa_execute_model.rs`;
-  (c) migrates the call sites in `src/interpreter/execute/*.rs` to
-      use `arch_handle::isa_executor().<method>(...)`;
-  (d) adds before-after equivalence tests where the call site did
-      not already have coverage.
+**Task order is safest-first** (reversed from the audit's
+size-ordering): accessor bundles warm up the pattern, medium
+consolidations follow, big wholesale moves land last when the
+pattern is proven. This preserves green tests at every commit.
 
-  If the audit's closing summary concludes **no trait methods**, this
-  block is empty and Part B consists only of data migrations + the
-  final gate task.
+---
 
-- **Task N: Completion + gate + tag.** Fills in
-  `docs/arch/isa-execute-model.md` (expanding the audit's trait
-  rationale into ~300 words + AIE1 projection), fills in the audit's
-  `## Completion` section with commit list and verification results,
-  updates `NEXT-STEPS.md` (move Subsystem 8 to "up next"), runs the
-  full-tree gate:
-  - `cargo test --lib`
-  - `cargo test -p xdna-archspec --lib`
-  - `cargo build --release`
-  - `cargo build -p xdna-emu-ffi`
-  - `./scripts/emu-bridge-test.sh` (full, ~30 min, tee to
-    `/tmp/claude-1000/bridge-subsys7.log`)
-  - `./scripts/isa-test.sh` (~10 min, tee to
-    `/tmp/claude-1000/isa-subsys7.log`)
-  - sequential, never concurrent (per CLAUDE.md rule)
+### Task 3: Accessor migrations (5 bundles)
 
-  Finally, tags `phase1-subsys-isa-execute`.
+**Files:**
+- Modify: `src/interpreter/execute/semantic.rs` (control register IDs)
+- Modify: `src/interpreter/execute/control.rs` (lock quadrant boundaries)
+- Modify: `src/interpreter/timing/latency.rs` (latency constants)
+- Modify: `src/interpreter/execute/memory/mod.rs` (PROC_BUS_*)
+- Modify: `src/interpreter/execute/cycle_accurate.rs` (LatencyTable::aie2 + delay slot)
+- Possibly modify: `crates/xdna-archspec/src/aie2/` (extend existing modules if any constant isn't already archspec-resident)
 
-**Amendment protocol (repeated for clarity):**
+**Goal:** Replace hardcoded AIE2 literals in five distinct execute-layer call-site bundles with archspec accessor calls. Each bundle gets its own commit. The sub-migrations are independent; they may be reordered if one is blocked, but all five must land in this task.
 
-1. After Task 2 commits, read `docs/arch/subsys7-audit.md` in full,
-   especially the closing summary.
-2. Edit this file, replacing this "Part B -- Authored After..."
-   section with concrete `### Task 3: ...`, `### Task 4: ...`, etc.
-3. Commit as `docs(plan): Subsys 7 Part B tasks from audit findings`.
-4. Resume execution from Task 3.
+For each sub-bundle below, the pattern is: (1) verify the constant's archspec destination exists; if not, add it to archspec with a test; (2) find all call sites in the target xdna-emu file via grep; (3) replace each literal with the accessor call; (4) `cargo test --lib` (expect unchanged count); (5) commit.
+
+- [ ] **Step 1: Bundle 3a -- Control register IDs in `semantic.rs`**
+
+Audit reference: `semantic.rs` uses lock-quadrant-style IDs `crSat`, `crRnd`, `crSRSSign` and q-regs (~30 sites). Find them with:
+
+```bash
+cd /home/triple/npu-work/xdna-emu
+grep -nE "crSat|crRnd|crSRSSign|crSat0|crUPSSign" src/interpreter/execute/semantic.rs
+```
+
+For each match, verify the constant exists in archspec (likely in `crates/xdna-archspec/src/aie2/aiert/` or `aie2::processor`). If the constant is NOT already in archspec, add it to the appropriate archspec module (with a drift-detection test asserting it matches the aie-rt header value). Then update the `semantic.rs` site to read via the accessor, e.g.:
+
+```rust
+// Before
+const CR_SAT: u32 = 0x1D0;  // or a literal usage
+// After
+use xdna_archspec::aie2::<path>::CR_SAT;
+```
+
+(Or via `arch_handle::processor_model().ctrl_regs().sat()` if the archspec shape prefers a method.)
+
+Commit:
+```bash
+cd /home/triple/npu-work/xdna-emu
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
+# Expected: 2684 passed (unchanged) OR +N if drift tests added.
+git add src/interpreter/execute/semantic.rs crates/xdna-archspec/src/aie2/  # paths as modified
+git commit -m "refactor: control register IDs read from archspec in semantic.rs
+
+Migrates the ~30 hardcoded control-register-ID sites in semantic.rs
+to read via archspec accessors. Part of Subsystem 7 Part B accessor
+migrations (audit item 7).
+
+Generated using Claude Code."
+```
+
+- [ ] **Step 2: Bundle 3b -- Lock quadrant boundaries in `control.rs`**
+
+Audit reference: the quadrant boundaries are 0-15 (South), 16-31 (West), 32-47 (North), 48-63 (East/Internal). Find them:
+
+```bash
+grep -nE "\b(16|32|48)\b.*lock|lock.*(16|32|48)" src/interpreter/execute/control.rs
+```
+
+(Adjust grep if literal hits are noisy.) Verify the archspec `aie2::locks` module has these quadrant boundaries. If not, add them. Update the `control.rs` sites to read via accessor.
+
+Commit (same style as 3a):
+```bash
+git commit -m "refactor: lock quadrant boundaries read from archspec in control.rs
+
+Migrates the ~20 lock-quadrant literal sites (0-15/16-31/32-47/48-63)
+in control.rs to read via archspec's aie2::locks accessor. Part of
+Subsystem 7 Part B accessor migrations (audit item 8).
+
+Generated using Claude Code."
+```
+
+- [ ] **Step 3: Bundle 3c -- Latency constants in `timing/latency.rs`**
+
+Audit reference: 8 raw numeric literals duplicating archspec values (`LATENCY_MEMORY`, `LATENCY_SCALAR_MUL`, etc.). Find them:
+
+```bash
+grep -nE "^\s*const LATENCY_|pub const LATENCY_" src/interpreter/timing/latency.rs
+```
+
+For each, check if `ProcessorModel` (or another archspec module) already has the value. If yes, replace the xdna-emu const with an accessor usage. If no, add it to archspec first. Update any call sites that referenced the removed consts.
+
+Commit: `refactor: latency constants read from archspec in timing/latency.rs`
+
+- [ ] **Step 4: Bundle 3d -- PROC_BUS_* in `memory/mod.rs`**
+
+Audit reference: `PROC_BUS_BASE`, `PROC_BUS_END` literals. Find them:
+
+```bash
+grep -nE "PROC_BUS_BASE|PROC_BUS_END" src/interpreter/execute/memory/mod.rs
+```
+
+Verify the constants exist in archspec `aie2::compute` (or equivalent). If not, add them (with drift test). Update the ~10 call sites in `memory/mod.rs`.
+
+Commit: `refactor: PROC_BUS_* literals read from archspec in memory/mod.rs`
+
+- [ ] **Step 5: Bundle 3e -- LatencyTable::aie2() + delay-slot in `cycle_accurate.rs`**
+
+Audit reference: `LatencyTable::aie2()` constructor call + delay-slot constant. Find them:
+
+```bash
+grep -nE "LatencyTable::aie2|DELAY_SLOT" src/interpreter/execute/cycle_accurate.rs
+```
+
+The `LatencyTable::aie2()` call at line ~87 should route through `default_arch()` or `arch_handle::processor_model()`; the delay-slot constant should come from archspec. Verify archspec has these or extend it.
+
+Commit: `refactor: cycle_accurate reads LatencyTable + delay slot from archspec`
+
+- [ ] **Step 6: Verify Task 3 close**
+
+```bash
+cd /home/triple/npu-work/xdna-emu
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
+# Expected: 2684 passed (or +N from any drift tests added to archspec).
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec --lib 2>&1 | tail -3
+# Expected: 300 passed or +N from any drift tests added.
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build -p xdna-emu-ffi 2>&1 | tail -3
+./scripts/emu-bridge-test.sh --no-hw -v add_one_cpp_aiecc 2>&1 | tail -20
+# Expected: PASS on both Chess and Peano.
+```
+
+Five commits for Task 3 if all sub-bundles land cleanly. If any sub-bundle surfaces unexpected archspec plumbing (e.g., a constant is deeply embedded and reaching it via accessor requires more structural work), commit what's done and BLOCK-escalate the rest for plan revision.
+
+---
+
+### Task 4: Medium data-moves (4 migrations)
+
+**Files:**
+- Create: `crates/xdna-archspec/src/aie2/rounding.rs` (or extend existing module -- verify at Step 1)
+- Create: `crates/xdna-archspec/src/aie2/matmul.rs` (or extend if exists)
+- Create: `crates/xdna-archspec/src/aie2/ups.rs` (or extend if exists)
+- Modify: `crates/xdna-archspec/src/aie2/processor.rs` (or equivalent; add `has_cascade_link` + `CASCADE_WORDS`)
+- Modify: `crates/xdna-archspec/src/aie2/mod.rs` (wire any new modules)
+- Modify: `src/interpreter/execute/vector_srs.rs` (RoundingMode dedup)
+- Modify: `src/interpreter/execute/vector_float.rs` (RoundingMode dedup)
+- Modify: `src/interpreter/execute/vector_config.rs` (matmul geometry tables)
+- Modify: `src/interpreter/execute/vector_ups.rs` (UPS mode table)
+- Modify: `src/interpreter/execute/cascade.rs` (gate on `has_cascade_link`)
+- Modify: `src/device/arch_handle.rs` (new accessor(s) if needed for `has_cascade_link` gating pattern)
+
+**Goal:** Move four bounded data artifacts from execute/ to archspec, each with a drift-detection test and its own commit.
+
+- [ ] **Step 1: `RoundingMode` dedup (pre-verified safe)**
+
+`vector_srs.rs:34-87` and `vector_float.rs:34-70` define the same 10-variant enum plus an identical `from_raw()` method. Verified identical 2026-04-21 apart from cosmetic doc-comment variation. Merge:
+
+1. Create `crates/xdna-archspec/src/aie2/rounding.rs` (or extend an existing SRS-adjacent module if one exists -- check `ls crates/xdna-archspec/src/aie2/` first):
+
+```rust
+//! Hardware rounding modes for the SRS instruction and bf16 conversion.
+//!
+//! The mode index values match the AIE2 hardware encoding in the
+//! configuration word. Valid indices are 0-3 and 8-13 (indices 4-7
+//! are reserved).
+
+/// Hardware rounding modes for the SRS instruction and bf16 conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RoundingMode {
+    /// Mode 0: Floor -- truncate toward negative infinity.
+    /// Discards all fractional bits. Equivalent to arithmetic right shift.
+    Floor = 0,
+    /// Mode 1: Ceiling -- round toward positive infinity.
+    /// Adds 1 if any discarded bits are nonzero and value is not already exact.
+    Ceil = 1,
+    /// Mode 2: Symmetric floor -- round toward zero (positive) or away (negative).
+    /// Sign-dependent: positive values truncate, negative values round away from zero.
+    SymFloor = 2,
+    /// Mode 3: Symmetric ceiling -- round away from zero (positive) or toward (negative).
+    /// Opposite of SymFloor.
+    SymCeil = 3,
+    /// Mode 8: Round half toward negative infinity.
+    /// At the exact halfway point, rounds toward -inf; otherwise rounds to nearest.
+    NegInf = 8,
+    /// Mode 9: Round half toward positive infinity.
+    /// At the exact halfway point, rounds toward +inf; otherwise rounds to nearest.
+    PosInf = 9,
+    /// Mode 10: Round half toward zero (symmetric).
+    /// At the exact halfway point, rounds toward zero; otherwise rounds to nearest.
+    SymZero = 10,
+    /// Mode 11: Round half away from zero (symmetric).
+    /// At the exact halfway point, rounds away from zero; otherwise rounds to nearest.
+    SymInf = 11,
+    /// Mode 12: Convergent rounding to even (IEEE 754 banker's rounding).
+    /// At the exact halfway point, rounds to the nearest even value.
+    ConvEven = 12,
+    /// Mode 13: Convergent rounding to odd.
+    /// At the exact halfway point, rounds to the nearest odd value.
+    ConvOdd = 13,
+}
+
+impl RoundingMode {
+    /// Convert a raw hardware mode index to a `RoundingMode`.
+    /// Returns `None` for reserved indices (4-7, 14-15).
+    pub fn from_raw(index: u8) -> Option<Self> {
+        match index {
+            0 => Some(Self::Floor),
+            1 => Some(Self::Ceil),
+            2 => Some(Self::SymFloor),
+            3 => Some(Self::SymCeil),
+            8 => Some(Self::NegInf),
+            9 => Some(Self::PosInf),
+            10 => Some(Self::SymZero),
+            11 => Some(Self::SymInf),
+            12 => Some(Self::ConvEven),
+            13 => Some(Self::ConvOdd),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rounding_mode_from_raw_valid_indices() {
+        for (raw, expected) in [
+            (0, RoundingMode::Floor),
+            (1, RoundingMode::Ceil),
+            (2, RoundingMode::SymFloor),
+            (3, RoundingMode::SymCeil),
+            (8, RoundingMode::NegInf),
+            (9, RoundingMode::PosInf),
+            (10, RoundingMode::SymZero),
+            (11, RoundingMode::SymInf),
+            (12, RoundingMode::ConvEven),
+            (13, RoundingMode::ConvOdd),
+        ] {
+            assert_eq!(RoundingMode::from_raw(raw), Some(expected));
+        }
+    }
+
+    #[test]
+    fn rounding_mode_from_raw_reserved_indices_return_none() {
+        for raw in [4, 5, 6, 7, 14, 15, 200, 255] {
+            assert_eq!(RoundingMode::from_raw(raw), None);
+        }
+    }
+}
+```
+
+2. Wire the module: add `pub mod rounding;` to `crates/xdna-archspec/src/aie2/mod.rs`.
+
+3. Remove the two local definitions from `vector_srs.rs` (lines 34-108 -- enum + impl) and `vector_float.rs` (lines 34-91). Replace each with `use xdna_archspec::aie2::rounding::RoundingMode;`.
+
+4. `cargo test -p xdna-archspec --lib`: expect 302 passed (+2 from new tests). `cargo test --lib`: expect 2684 unchanged.
+
+Commit:
+```bash
+git add crates/xdna-archspec/src/aie2/rounding.rs \
+        crates/xdna-archspec/src/aie2/mod.rs \
+        src/interpreter/execute/vector_srs.rs \
+        src/interpreter/execute/vector_float.rs
+git commit -m "refactor: consolidate RoundingMode to archspec::aie2::rounding
+
+Deduplicates the identical 10-variant RoundingMode enum + from_raw()
+impl from vector_srs.rs and vector_float.rs into a single definition
+under xdna_archspec::aie2::rounding. Verified structurally identical
+pre-dedup (only cosmetic doc-comment variation). Both source files
+now use the shared archspec definition.
+
+Part of Subsystem 7 Part B (audit item 3).
+
+Generated using Claude Code."
+```
+
+- [ ] **Step 2: Matmul geometry tables**
+
+`vector_config.rs` has `DENSE_GEOMETRY_TABLE` and `SPARSE_GEOMETRY_TABLE`. Find them:
+
+```bash
+grep -nE "DENSE_GEOMETRY_TABLE|SPARSE_GEOMETRY_TABLE" src/interpreter/execute/vector_config.rs
+```
+
+Move the table constants to `crates/xdna-archspec/src/aie2/matmul.rs` (new module). Wire `pub mod matmul;` in `aie2/mod.rs`. Update `vector_config.rs` to `use xdna_archspec::aie2::matmul::{DENSE_GEOMETRY_TABLE, SPARSE_GEOMETRY_TABLE};`. Add a drift-detection test in the new archspec module locking the table to the exact byte values before/after the move.
+
+Commit: `refactor: matmul geometry tables moved to archspec::aie2::matmul`
+
+- [ ] **Step 3: UPS mode table**
+
+`vector_ups.rs::ups_mode()` contains a 4-entry valid type-pair table. Find it:
+
+```bash
+grep -nB2 -A15 "fn ups_mode" src/interpreter/execute/vector_ups.rs
+```
+
+Move the table to `crates/xdna-archspec/src/aie2/ups.rs` (new module). Update `vector_ups.rs` to read the table via the archspec module. Drift test.
+
+Commit: `refactor: UPS mode table moved to archspec::aie2::ups`
+
+- [ ] **Step 4: Cascade data + `has_cascade_link` feature flag**
+
+This is the one migration with real plumbing work. Three sub-parts, all in one commit:
+
+a. **Add the flag to archspec's ProcessorModel** (or wherever processor-level metadata lives). Grep:
+
+```bash
+grep -rn "pub struct ProcessorModel\|pub struct ArchProcessorMetadata" crates/xdna-archspec/src/
+```
+
+Add a `pub has_cascade_link: bool` field to the struct. Add `pub const CASCADE_WORDS: usize = 6;` alongside (or as a method). Default it to `true` for AIE2/AIE2P constructors.
+
+b. **Wire `has_cascade_link` through `from_arch_model`** or whatever constructor path ModelConfig uses. AIE2 arches get `true`. AIE1 gets `false` (though we never construct AIE1 here today, set the default correctly for when we do).
+
+c. **Add an accessor** if the existing processor-model accessor path doesn't already cover it. Probably `arch_handle::processor_model().has_cascade_link` works directly if an accessor already exists; otherwise extend.
+
+d. **Gate `cascade.rs` call sites** on `has_cascade_link`. Find them:
+
+```bash
+grep -nE "cascade|Cascade" src/interpreter/execute/cascade.rs | head -20
+```
+
+At each cascade operation entry point, early-return (no-op) when the flag is false. The concrete cascade operations stay unchanged for AIE2 (flag is true).
+
+e. **Remove the `CASCADE_WORDS = 6` literal from `cascade.rs`**; read via archspec instead.
+
+Add a test in archspec: `has_cascade_link_true_for_aie2_family`.
+
+Expected test-count change: archspec +1-3 (drift tests + feature-flag test), xdna-emu unchanged.
+
+Commit:
+```bash
+git commit -m "refactor(archspec): cascade data + has_cascade_link feature flag
+
+Moves CASCADE_WORDS=6 from cascade.rs to archspec and adds a new
+has_cascade_link: bool flag to ProcessorModel. Wires the flag through
+from_arch_model (AIE2/AIE2P default true; AIE1 default false). Gates
+cascade dispatch in src/interpreter/execute/cascade.rs on the flag,
+so a future AIE1 port gets no-op cascade handlers without touching
+execute-layer code.
+
+Part of Subsystem 7 Part B (audit item 6).
+
+Generated using Claude Code."
+```
+
+- [ ] **Step 5: Verify Task 4 close**
+
+```bash
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec --lib 2>&1 | tail -3
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build -p xdna-emu-ffi 2>&1 | tail -3
+./scripts/emu-bridge-test.sh --no-hw -v add_one_cpp_aiecc 2>&1 | tail -20
+```
+
+Expected: all tests green, bridge smoke PASS. Four commits for Task 4.
+
+---
+
+### Task 5: `vector_permute.rs` tables wholesale move
+
+**Files:**
+- Create: `crates/xdna-archspec/src/aie2/permute.rs` (~3200 LOC, static data + enum)
+- Modify: `crates/xdna-archspec/src/aie2/mod.rs` (add `pub mod permute;`)
+- Modify: `src/interpreter/execute/vector_permute.rs` (remove local tables + enum; add imports)
+
+**Goal:** Move `SHUFFLE_ROUTING: [[u8; 64]; 48]` (3072 bytes of hardware-probed routing data) and the 26-variant `MacPermuteMode` enum from `vector_permute.rs` into `xdna_archspec::aie2::permute`. This is the second-largest data migration after `vmac_routing.rs`.
+
+- [ ] **Step 1: Locate the tables + enum in `vector_permute.rs`**
+
+```bash
+grep -nE "SHUFFLE_ROUTING|pub enum MacPermuteMode|^pub enum MacPermuteMode" src/interpreter/execute/vector_permute.rs
+```
+
+Note the line ranges for:
+- The `SHUFFLE_ROUTING: [[u8; 64]; 48]` static
+- The `MacPermuteMode` enum (all 26 variants)
+- Any associated `impl` blocks (e.g., `MacPermuteMode::from_raw`, `as_u8`, etc.)
+
+- [ ] **Step 2: Create `crates/xdna-archspec/src/aie2/permute.rs`**
+
+Open a new file and transplant the `SHUFFLE_ROUTING` static + `MacPermuteMode` enum + attached impl blocks verbatim. Preserve existing doc comments. Add a module header:
+
+```rust
+//! AIE2 permute/shuffle data: SHUFFLE_ROUTING lookup table and
+//! MacPermuteMode enum.
+//!
+//! Moved from src/interpreter/execute/vector_permute.rs as part of
+//! Subsystem 7 Part B (audit item 2). Pure data -- no algorithmic
+//! content. The shuffle routing table is hardware-probed; the
+//! MacPermuteMode enum mirrors the 26 valid hardware permute modes.
+
+// ... (transplanted content)
+```
+
+Add drift-detection tests at the end of the new module:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shuffle_routing_table_size() {
+        assert_eq!(SHUFFLE_ROUTING.len(), 48);
+        assert_eq!(SHUFFLE_ROUTING[0].len(), 64);
+    }
+
+    #[test]
+    fn mac_permute_mode_variant_count() {
+        // Locks at 26 variants; if this changes, audit the migration.
+        // Count MacPermuteMode enumerations the compiler knows about.
+        // This test is a placeholder until a better variant-count check
+        // is available via #[derive(EnumCount)] or similar.
+        // Substitute with actual variant enumeration if the enum derives
+        // strum::EnumCount.
+        let _smoke: MacPermuteMode = MacPermuteMode::from_raw(0).unwrap();
+    }
+}
+```
+
+(Adjust tests to match how the codebase actually locks table invariants elsewhere -- see `aie2_topology_matches_generated_constants` in Subsystem 5 for the pattern. If the variant enum doesn't derive `EnumCount`, do a manual assertion listing all expected variants.)
+
+- [ ] **Step 3: Wire the module in `aie2/mod.rs`**
+
+Add `pub mod permute;` after the other model-ish modules in `aie2/mod.rs`.
+
+- [ ] **Step 4: Remove local definitions from `vector_permute.rs`**
+
+Delete the `SHUFFLE_ROUTING` static, the `MacPermuteMode` enum, and all attached `impl` blocks. Add at the top of `vector_permute.rs`:
+
+```rust
+use xdna_archspec::aie2::permute::{SHUFFLE_ROUTING, MacPermuteMode};
+```
+
+- [ ] **Step 5: Build + test**
+
+```bash
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build 2>&1 | tail -10
+# Expected: clean build.
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
+# Expected: 2684 passed (unchanged; pure move).
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec --lib 2>&1 | tail -3
+# Expected: +2 from drift tests.
+```
+
+If the build fails with "unresolved import" errors, trace each back -- it's likely a transplanted impl that referenced a private type in vector_permute.rs. Either make the referenced type `pub` (if it's appropriate for archspec) or split: leave the offending impl in vector_permute.rs and reach back through archspec for the data parts.
+
+- [ ] **Step 6: Bridge smoke + commit**
+
+```bash
+cargo build -p xdna-emu-ffi 2>&1 | tail -3
+./scripts/emu-bridge-test.sh --no-hw -v add_one_cpp_aiecc 2>&1 | tail -20
+```
+Expected: PASS on both Chess and Peano.
+
+Commit:
+```bash
+git add crates/xdna-archspec/src/aie2/permute.rs \
+        crates/xdna-archspec/src/aie2/mod.rs \
+        src/interpreter/execute/vector_permute.rs
+git commit -m "refactor: move SHUFFLE_ROUTING + MacPermuteMode to archspec::aie2::permute
+
+Wholesale transplant of ~3200 LOC of hardware-probed permute data
+from src/interpreter/execute/vector_permute.rs to
+xdna_archspec::aie2::permute. Pure data move -- no algorithmic
+changes. Includes SHUFFLE_ROUTING lookup table (48 x 64 bytes) and
+the 26-variant MacPermuteMode enum.
+
+Part of Subsystem 7 Part B (audit item 2).
+
+Generated using Claude Code."
+```
+
+One commit for Task 5.
+
+---
+
+### Task 6: `vmac_routing.rs` wholesale move
+
+**Files:**
+- Create: `crates/xdna-archspec/src/aie2/vmac/` (directory)
+- Create: `crates/xdna-archspec/src/aie2/vmac/mod.rs` (or `routing.rs`) with the transplanted content
+- Modify: `crates/xdna-archspec/src/aie2/mod.rs` (add `pub mod vmac;`)
+- Delete: `src/interpreter/execute/vmac_routing.rs` (2862 LOC)
+- Modify: `src/interpreter/execute/vmac_hw.rs` (update `include!` or switch to `use`)
+- Modify: `src/interpreter/execute/mod.rs` if it declares `mod vmac_routing;` there
+
+**Goal:** Move the entire 234 KB static crossbar routing data file wholesale from execute/ to archspec. Consumers (`vmac_hw.rs` line 15 `include!` + uses of `eval_prmx`/`eval_prmy`) update to read through archspec module path.
+
+- [ ] **Step 1: Inspect the current consumer pattern**
+
+```bash
+head -30 /home/triple/npu-work/xdna-emu/src/interpreter/execute/vmac_hw.rs
+grep -nE "vmac_routing|eval_prmx|eval_prmy" src/interpreter/execute/vmac_hw.rs
+```
+
+Identify exactly how `vmac_hw.rs` pulls in `vmac_routing.rs`: is it `include!("vmac_routing.rs")`, or `mod vmac_routing;` in `execute/mod.rs` + `use`, or something else? The audit reported it's `include!`'d from line 15 of `vmac_hw.rs`; verify.
+
+- [ ] **Step 2: Create the archspec destination**
+
+Create `crates/xdna-archspec/src/aie2/vmac/mod.rs`:
+
+```rust
+//! AIE2 VMAC crossbar routing.
+//!
+//! Moved from src/interpreter/execute/vmac_routing.rs as part of
+//! Subsystem 7 Part B (audit item 1). Pure static data probed from
+//! the AMD C++ ISS: 789 active m-bits, 15808 route entries (PRMX
+//! tables), 26 x 512 = 13312 Y-route entries (PRMY tables).
+//!
+//! The two consumer functions `eval_prmx` and `eval_prmy` are
+//! re-exported here for direct use from `vmac_hw.rs`.
+
+pub mod routing;
+
+pub use routing::{eval_prmx, eval_prmy};
+```
+
+Create `crates/xdna-archspec/src/aie2/vmac/routing.rs` and COPY the contents of `src/interpreter/execute/vmac_routing.rs` into it verbatim (including the auto-generated-file comment banner at the top). Any `pub fn eval_prmx`, `pub fn eval_prmy` (or whatever the exported symbols are) should remain `pub`.
+
+- [ ] **Step 3: Wire the vmac module in `aie2/mod.rs`**
+
+Add `pub mod vmac;` to `crates/xdna-archspec/src/aie2/mod.rs` in the appropriate alphabetical position.
+
+- [ ] **Step 4: Update `vmac_hw.rs` consumer**
+
+Replace the `include!` (or `mod vmac_routing; use vmac_routing::*;`) with an import from archspec:
+
+```rust
+// Replace line 15's `include!("vmac_routing.rs");` or equivalent with:
+use xdna_archspec::aie2::vmac::{eval_prmx, eval_prmy};
+```
+
+(Or whatever symbol set the file actually exports. Verify first.)
+
+- [ ] **Step 5: Delete `src/interpreter/execute/vmac_routing.rs`**
+
+```bash
+git rm src/interpreter/execute/vmac_routing.rs
+```
+
+If `execute/mod.rs` declared `mod vmac_routing;`, remove that line.
+
+- [ ] **Step 6: Build + test**
+
+```bash
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build 2>&1 | tail -10
+# Expected: clean build.
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
+# Expected: 2684 passed (unchanged; pure move).
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec --lib 2>&1 | tail -3
+# Expected: +1 from drift-detection smoke test.
+```
+
+Add a drift-detection smoke test in `crates/xdna-archspec/src/aie2/vmac/mod.rs` (or a sibling tests file):
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eval_prmx_callable() {
+        // Smoke test: call eval_prmx with a known input. This locks
+        // the symbol's existence + calling convention across the
+        // wholesale move; content-level drift is caught by the
+        // existing tests in vmac_hw.rs that exercise the full pipeline.
+        let input = [0u8; 16];
+        let _output = eval_prmx(&input, 0);
+        // No assertion on value; the test exercises the code path.
+    }
+}
+```
+
+(Adjust to match the actual signatures of `eval_prmx`/`eval_prmy`.)
+
+- [ ] **Step 7: Bridge smoke + commit**
+
+```bash
+cargo build -p xdna-emu-ffi 2>&1 | tail -3
+./scripts/emu-bridge-test.sh --no-hw -v add_one_cpp_aiecc 2>&1 | tail -20
+```
+Expected: PASS.
+
+Commit:
+```bash
+git add crates/xdna-archspec/src/aie2/vmac/ \
+        crates/xdna-archspec/src/aie2/mod.rs \
+        src/interpreter/execute/vmac_hw.rs \
+        src/interpreter/execute/
+# The removal of vmac_routing.rs is already staged via `git rm`.
+git commit -m "refactor: move vmac_routing.rs wholesale to archspec::aie2::vmac
+
+Transplants 2862 lines of hardware-probed AIE2 VMAC crossbar routing
+data from src/interpreter/execute/vmac_routing.rs (234K pure data,
+zero algorithm) into xdna_archspec::aie2::vmac::routing with
+eval_prmx + eval_prmy re-exported from aie2::vmac. vmac_hw.rs
+switches from include! to use xdna_archspec::aie2::vmac::*.
+
+Part of Subsystem 7 Part B (audit item 1). Largest single migration
+of the subsystem.
+
+Generated using Claude Code."
+```
+
+One commit for Task 6.
+
+---
+
+### Task 7: Completion + gate + tag
+
+**Files:**
+- Modify: `docs/arch/subsys7-audit.md` (fill `## Completion` section)
+- Modify: `docs/arch/isa-execute-model.md` (expand all placeholders with content)
+- Modify: `NEXT-STEPS.md` (move Subsystem 8 to "up next")
+
+**Goal:** Close Part B and land the subsystem tag. This task has no source-code changes -- it documents the state, runs the full gate, and tags.
+
+- [ ] **Step 1: Fill in `docs/arch/isa-execute-model.md`**
+
+Replace each `(Filled in at Part B close.)` placeholder with content. The design-note template is structured as:
+
+- **What lives where.** Summarize the archspec landing: `xdna_archspec::aie2::rounding` (RoundingMode), `aie2::permute` (SHUFFLE_ROUTING + MacPermuteMode), `aie2::vmac` (crossbar data + eval_prmx/eval_prmy), `aie2::matmul` (geometry tables), `aie2::ups` (UPS mode table), extended `ProcessorModel` (has_cascade_link, CASCADE_WORDS, control register IDs, latency values, PROC_BUS_*), and unchanged: `crate::isa_execute` (empty IsaExecutor trait anchor).
+
+- **Trait surface.** Explain the empty trait: its purpose is as an anchor for future seams, not as a current dispatch point. Reference the audit's Approach A conclusion.
+
+- **The shape-vs-values rule, applied to ISA execute.** ~2-3 paragraphs explaining why execute landed at values + feature flags rather than shapes. Cite `has_cascade_link` as the prototypical feature flag and `RoundingMode::from_raw` as the prototypical data-table consolidation.
+
+- **What would AIE1 look like?** Expand the audit's ~100-word projection into ~300 words. Per the audit: narrower vectors/accumulators (parameterized by `VEC_BYTES`), checkerboard memory (already reads `IS_CHECKERBOARD`), no cascade (`has_cascade_link: false`), different VMAC pipeline (separate AIE1 matmul module, AIE2 untouched), different rounding-mode set (new AIE1 variants in the archspec enum or separate enum + feature-gated handlers).
+
+- **Alternatives rejected.** Four entries matching the spec's alternatives section: Approach A-as-different-landing, Approach C (full trait), pre-audit commitment, sub-subsystem decomposition.
+
+No commit yet (combine with Step 2 below).
+
+- [ ] **Step 2: Fill in `## Completion` section of `docs/arch/subsys7-audit.md`**
+
+Replace `(Filled in at the end of Subsystem 7, in the Part B final task.)` with a completion section structured like Subsystem 5's audit completion:
+
+```markdown
+## Completion
+
+**Subsystem 7 closed at:** <tag phase1-subsys-isa-execute, commit SHA>
+**Date:** <fill in>
+
+### Commits landed (since phase1-subsys-stream-switch)
+
+<output of `git log --oneline phase1-subsys-stream-switch..HEAD`>
+
+### Test counts
+
+- `cargo test --lib`: <N passed; 0 failed; 5 ignored>
+- `cargo test -p xdna-archspec --lib`: <M passed; 0 failed; 2 ignored>
+- `cargo build --release`: clean
+- Bridge full run: <Chess / Peano summary, tee log path>
+- ISA test: <result, tee log path>
+
+### Success criteria check
+
+- [x] Approach A landed (zero IsaExecutor trait methods).
+- [x] 12 audit-list data migrations landed (list with commit refs).
+- [x] Execute algorithms untouched for AIE2; arch-specific data lives in archspec.
+- [x] AIE1 / AIE2P port is now "populate archspec data" -- no execute/*.rs edits.
+- [x] Tests green at every commit. Bridge smoke green at every task close.
+
+### Net delta
+
+- xdna-emu LOC: <delta>
+- archspec LOC: <delta>
+- Total: ~<delta> LOC moved, 0 LOC rewritten.
+
+### Follow-ups flagged for AIE1-landing pass (not in Subsystem 7 scope)
+
+- (list anything surfaced during migration that's a genuinely-separate workstream)
+```
+
+- [ ] **Step 3: Update `NEXT-STEPS.md`**
+
+Follow the pattern from Subsystem 5's update:
+- Update "Last updated" to today's date.
+- Update "Latest tag" to `phase1-subsys-isa-execute`.
+- In the Phase 1b pass-order table, mark Subsystem 7 **Done** with one-line summary. Mark Subsystem 8 (Parser) **Up next**.
+- Rewrite the "How to Pick Up Subsystem 7 (ISA Execute)" section as "How to Pick Up Subsystem 8 (Parser)" with the shaping questions the spec will need.
+- Update the test-count expectations in the Useful Commands section.
+
+Commit:
+```bash
+git add docs/arch/subsys7-audit.md docs/arch/isa-execute-model.md NEXT-STEPS.md
+git commit -m "docs: Subsystem 7 completion + NEXT-STEPS update
+
+Subsystem 7 (ISA Execute) complete. Approach A landed: empty
+IsaExecutor trait anchor + 12 data migrations to archspec,
+no trait methods, execute algorithms untouched for AIE2. AIE1
+and AIE2P ports now require only archspec additions.
+
+Generated using Claude Code."
+```
+
+- [ ] **Step 4: Run the full-tree gate (sequential)**
+
+Per CLAUDE.md: never run two hardware test suites concurrently. Run bridge first, then ISA.
+
+```bash
+cd /home/triple/npu-work/xdna-emu
+export PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH
+
+# Rebuild FFI (critical -- bridge reads the .so, and stale ones
+# produce phantom regressions)
+cargo clean -p xdna-emu-ffi
+cargo build -p xdna-emu-ffi
+
+# Unit + archspec
+cargo test --lib 2>&1 | tail -3
+cargo test -p xdna-archspec --lib 2>&1 | tail -3
+
+# Release build
+cargo build --release 2>&1 | tail -5
+
+# Full bridge (sequential)
+./scripts/emu-bridge-test.sh 2>&1 | tee /tmp/claude-1000/bridge-subsys7.log
+# Wait for complete; capture Chess + Peano summaries + any failures.
+
+# ISA (after bridge completes)
+./scripts/isa-test.sh 2>&1 | tee /tmp/claude-1000/isa-subsys7.log
+# Expected: 4815/4815.
+```
+
+Expected outcomes:
+- `cargo test --lib`: 2684 + any drift tests added during Part B (should be small; mostly archspec-side). Zero failures.
+- `cargo test -p xdna-archspec --lib`: 300 + significant growth (drift tests for each new archspec data module + the has_cascade_link test + RoundingMode tests). Zero failures.
+- `cargo build --release`: clean.
+- Bridge: same pass/fail profile as `phase1-subsys-stream-switch` (Chess PASS on 62+, Peano PASS on 53+, known pre-existing deadlocks still pre-existing).
+- ISA: 4815/4815.
+
+If any of these fail unexpectedly, do NOT tag. Diagnose and fix before tagging.
+
+- [ ] **Step 5: Tag `phase1-subsys-isa-execute`**
+
+```bash
+git tag phase1-subsys-isa-execute
+git log --oneline phase1-subsys-stream-switch..phase1-subsys-isa-execute | head -30
+```
+
+Report the tag SHA.
+
+- [ ] **Step 6: Amend the Completion section with final numbers**
+
+Re-open `docs/arch/subsys7-audit.md` and fill in the actual SHA, date, commit count, test counts, bridge/ISA results into the Completion section's placeholders from Step 2. Commit with:
+
+```bash
+git commit --amend --no-edit
+```
+
+(Amending is acceptable here ONLY because the completion-doc commit just landed; the subsystem tag has NOT been pushed yet. If any ambiguity, just make a new commit.)
+
+Alternatively, make a new commit:
+
+```bash
+git add docs/arch/subsys7-audit.md
+git commit -m "docs: fill Subsystem 7 Completion section with final numbers"
+```
+
+Tag does not need to be re-issued if the tag was placed on the earlier commit -- the Completion-fill commit sits at HEAD after the tag; the tag still points at the working state.
+
+Preferred: make Step 5 tag AFTER Step 6 completes, so the tag points at the final completion-fill commit.
+
+---
+
+## Part B Completion
+
+After Task 7 Step 5 (or Step 6 followed by Step 5, per the preferred ordering note), Subsystem 7 is closed. State:
+
+- Tag `phase1-subsys-isa-execute` placed.
+- `cargo test --lib` ≈ 2684 + drift tests; archspec ≈ 300 + significant drift tests.
+- Bridge full run captured at `/tmp/claude-1000/bridge-subsys7.log`; ISA at `/tmp/claude-1000/isa-subsys7.log`.
+- Audit and design-note docs fully populated.
+- `NEXT-STEPS.md` points at Subsystem 8 (Parser) as the next work item.
+
+Expected total commit count across Part A + Part B: ~25-30.
+
+**Ready to pause / hand off / proceed to Subsystem 8.**
 
 ---
 
