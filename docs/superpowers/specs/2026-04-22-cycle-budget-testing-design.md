@@ -1,7 +1,7 @@
 # Cycle-Budget Testing — Design Spec
 
 **Date:** 2026-04-22
-**Status:** Design approved, ready for implementation plan
+**Status:** Design approved + load-bearing open questions resolved, ready for implementation plan
 **Context:** Subsystem 7 (ISA Execute) landed and produced a bridge-test
 regression: 10 Chess + 10 Peano tests went PASS → TIMEOUT at the wall-clock
 `timeout 120` boundary. The cause could be host-side slowdown (EMU taking
@@ -75,28 +75,86 @@ reflected in `ACTIVE_CORE` at all.
 
 ## Phase B — HW Cycle Capture
 
+### Mechanism: XRT register API (not aie-rt)
+
+Bridge test.exe binaries talk to XRT via `xrt::hw_context`, not aie-rt
+directly. XRT exposes tile register access through `xrt::device` via
+`xrt_aie.h`:
+
+```cpp
+uint32_t device.read_aie_reg(col, row, offset);
+void     device.write_aie_reg(col, row, offset, value);
+```
+
+`xrt::device` is reachable from `hw_context.get_device()`. Backed by DRM
+ioctls `DRM_AMDXDNA_READ_AIE_REG` / `DRM_AMDXDNA_WRITE_AIE_REG` in the
+xdna kernel driver, coexists cleanly with the shim's own `XAie_DevInst`.
+This lets us program perf counters without linking aie-rt or standing up
+a second `XAie_DevInst`.
+
+Register offsets and bit layouts come from the AM025 database that
+`regdb.rs` already loads:
+
+- Perf counter 0 control register (start-event field, stop-event, reset).
+- Perf counter 0 value register (32-bit counter readout).
+
+`XAIE_EVENT_ACTIVE_CORE` event ID also lives in the register DB /
+aie-rt's event enumeration; helper encodes the event ID constant
+directly (constant is stable across the AIE2 lifetime).
+
 ### What we build
 
 A small C++ helper linked into every mlir-aie bridge test.exe:
 
 ```cpp
-// Called after XRT context / AIE partition is live, before kernel launch.
-void xdna_cycle_counter_setup(xrt::hw_context& ctx, const PartitionLayout& layout);
+class CycleCounterHelper {
+public:
+  // Constructed once after hw_context is live.
+  CycleCounterHelper(xrt::hw_context& ctx,
+                     const std::vector<std::pair<uint16_t, uint16_t>>& compute_tiles);
 
-// Called after kernel completion, before context teardown.
-void xdna_cycle_counter_readout(const std::string& out_path);
+  // Write control reg + zero the counter on each tile.
+  void start();
+
+  // Read each counter, write `{col row cycles}` lines to out_path.
+  void readout(const std::string& out_path);
+
+private:
+  xrt::device device_;
+  std::vector<std::pair<uint16_t, uint16_t>> tiles_;
+};
 ```
 
-`setup` iterates every compute tile in the active partition and configures
-perf counter 0 on each core: start_event = `XAIE_EVENT_ACTIVE_CORE`,
-stop_event = none, reset_event = none, threshold = 0 (no auto-reset, no
-auto-stop). Counter runs free from first core-active cycle through readout.
+(Class vs free-function shape is a plan-phase decision; what matters
+here is that both operations need `xrt::device` and the tile list, so
+a helper object is the natural shape.)
+
+`start` iterates every compute tile and, via `device.write_aie_reg`,
+performs two register accesses per tile:
+
+1. **Masked write to the control register** at
+   `PerfCtrlBaseAddr + (counter/2) * PerfCtrlOffsetAdd`, setting the
+   Start event field to `ACTIVE_CORE` and the Stop event field to 0
+   (no auto-stop). (Since `read_aie_reg` + `write_aie_reg` don't have
+   a native masked-write, the helper reads the current value,
+   clears the Start/Stop fields, and writes back OR'd with the
+   new values.)
+2. **Plain write of 0 to the counter value register** at
+   `PerfCounterBaseAddr + counter * PerfCounterOffsetAdd`, zeroing the
+   count.
+
+This matches aie-rt's
+`XAie_PerfCounterControlSet` + `XAie_PerfCounterReset` sequence
+(`aie-rt/driver/src/perfcnt/xaie_perfcnt.c:206,550`): the control
+register write is a masked write that preserves other bits, and the
+counter value register is a separate plain write. Counter runs free
+from first core-active cycle through readout.
 
 (Counter index 0 is a convention. If upstreamed, other users may want to
 use counter 0 for their own purposes; we'd need to coordinate. For our
 own tests today there's no collision.)
 
-`readout` iterates the same tiles, reads each counter, and writes a
+`readout` iterates the same tiles via `device.read_aie_reg`, and writes a
 plain-text file:
 
 ```
@@ -121,7 +179,10 @@ Under mlir-aie's `test/npu-xrt/` scaffolding:
   creation, readout before exit.
 
 Start with a local patch; upstream to mlir-aie once stable. Design does not
-depend on which path we take.
+depend on which path we take. `../mlir-aie/` is a git checkout, so the
+practical approach is to commit on a local branch (e.g. `xdna-emu-cycle-budget`)
+and track via the script's existing mlir-aie path assumptions. Upstream once
+the helper stabilizes.
 
 ### Why `XAIE_EVENT_ACTIVE_CORE`
 
@@ -203,9 +264,9 @@ In `scripts/emu-bridge-test.sh`, after each EMU run, grep the captured log
 for `XDNA_EMU_STATUS:`. If `halt_reason=budget`, mark the test `BUDGET` — a
 distinct result from `TIMEOUT` (wall-clock) and `FAIL` (functional).
 
-Precondition to verify in plan phase: the bridge's current capture
-redirection must include stderr. If today's script only captures stdout,
-the plan adds the `2>&1` merge before this parse step.
+Bridge script already captures stderr (`emu-bridge-test.sh:1255` uses
+`> "$log_file" 2>&1`), so the parser can grep the log directly — no
+capture-redirection change needed.
 
 **4. Wall-clock safety net relaxed.**
 
@@ -234,8 +295,24 @@ but when the tests are known-long, you need it.
   `halt_reason=completed`, `cycles_executed <= max_cycles`.
 - Emulator state stays consistent on halt — bundle either completes or
   doesn't start.
-- Plan-phase task: confirm current FFI struct shape and add `halt_reason`
-  if absent.
+
+### FFI changes required in Phase A
+
+Verified against `crates/xdna-emu-ffi/src/lib.rs:95-99` and
+`crates/xdna-emu-ffi/src/execution.rs:70-182`:
+
+- `XdnaEmuExecStatus` has `{ result, cycles_executed, halted }` today;
+  **add** a `halt_reason` field (C-ABI enum: `Completed | Budget | Error`).
+  The existing `halted: bool` is ambiguous and stays collapsed behind the
+  new enum (or gets removed; plan decides).
+- `execution.rs:108` uses `while cycles < max` — with `max = 0` the loop
+  doesn't run at all. Change to `while max == 0 || cycles < max` so the
+  "0 = unbounded" semantic holds at the run loop, not just in the
+  plugin wrapper.
+- Populate `halt_reason` at the three exit points in `xdna_emu_run`:
+  natural halt (EngineStatus::Halted + syncs done) → `Completed`; loop
+  condition falling out with `cycles >= max` and no halt → `Budget`;
+  any error branch → `Error`.
 
 ### Result classification changes
 
@@ -507,26 +584,21 @@ After all four phases land:
 
 ## Open Questions (Deferred to Plan Phase)
 
-**Load-bearing — block planning until answered:**
+**Resolved during spec review** (see sections above for how each is now
+handled):
 
-- **How does the Phase B helper access an `XAie_DevInst*`?** The
-  `XAie_PerfCounter*` APIs require an aie-rt device handle, not an XRT
-  `hw_context`. Bridge test.exe binaries talk to XRT, not aie-rt directly.
-  Possible paths: (a) a private XRT API that exposes the underlying
-  `XAie_DevInst`, (b) a separate aie-rt `XAie_CfgInitialize` from inside
-  test.exe against the same partition, (c) wrap perf counter reads in an
-  XRT-level API that already exists but we haven't found. First plan-phase
-  task is proving this is reachable; if not, the Phase B mechanism shifts.
-- **mlir-aie patch deployment.** Our `../mlir-aie/` is a local checkout.
-  Options: commit patch directly in that tree (and track a fork branch),
-  ship a `.patch` file applied by `scripts/` at bridge-setup time, or land
-  upstream immediately and sync. Affects how reviewers reproduce the work.
-- **Bridge stderr capture.** Phase A's `XDNA_EMU_STATUS:` line goes to
-  stderr. Verify today's bridge capture includes stderr; if not, add `2>&1`
-  merge in the EMU invocation line.
-- **FFI `halt_reason` field.** Does `XdnaEmuExecStatus` already carry a
-  reason field, or only the `halted` bool? If only bool, add the enum field
-  in Phase A.
+- **Phase B tile-register access path.** Resolved: use
+  `xrt::device::read_aie_reg` / `write_aie_reg` from `xrt_aie.h` against
+  AM025 register offsets. No aie-rt linkage needed in test.exe.
+- **Bridge stderr capture.** Resolved: `emu-bridge-test.sh:1255` already
+  uses `> "$log_file" 2>&1`. Parser reads the existing log.
+- **FFI `halt_reason` field.** Resolved: struct currently has only
+  `halted: bool` (`crates/xdna-emu-ffi/src/lib.rs:95-99`); Phase A adds
+  a C-ABI enum `halt_reason` field. Loop condition at
+  `execution.rs:108` also changes so `max_cycles=0` reads as unbounded.
+- **mlir-aie patch deployment.** Resolved to a practical default: commit
+  on a local branch in the existing `../mlir-aie/` checkout. Upstream
+  when the helper stabilizes.
 
 **Non-blocking — choose during planning:**
 
@@ -540,3 +612,6 @@ After all four phases land:
   reading current tick call sites. Option 2 is the default presumption.
 - **Override multiplier — integer or float.** Lean integer for simplicity
   unless a real test needs fractional.
+- **Helper shape: class vs two free functions.** Class is cleaner for
+  shared state (device, tile list). Either works; plan picks whichever
+  is smaller diff.
