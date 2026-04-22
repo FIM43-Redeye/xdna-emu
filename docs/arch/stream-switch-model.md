@@ -13,7 +13,15 @@ will look like.
 
 ## What lives where
 
-(Filled in after Task 2 lands.)
+All entries below reflect state as of the `phase1-subsys-stream-switch` tag.
+
+| Data/code | Module | Source |
+|---|---|---|
+| `StreamSwitchModel` trait (2 methods) + `StreamSwitchTopology` + `TileStreamPorts` carrier | `xdna_archspec::stream_switch` | Emulator design |
+| `Aie2StreamSwitchModel` concrete impl + `AIE2_STREAM_SWITCH_MODEL` + `AIE2_STREAM_SWITCH_TOPOLOGY` statics | `xdna_archspec::aie2::stream_switch_model` | aie-rt xaiemlgbl_reginit.c + AM025 register DB JSON |
+| `ArchConfig::stream_switch_model()` accessor | `xdna_archspec::runtime` | Dispatches on `Architecture` |
+| `arch_handle::stream_switch_topology()` | `xdna_emu::device::arch_handle` | Process-global `OnceLock` cache |
+| `StreamSwitch` struct + routing state | `xdna_emu::device::stream_switch` | Unchanged (traits describe, don't hold state) |
 
 ---
 
@@ -41,7 +49,33 @@ Concretely:
 
 ## The trait surface
 
-(Filled in after Task 2 lands.)
+```rust
+pub trait StreamSwitchModel: Send + Sync + core::fmt::Debug {
+    fn supports_deterministic_merge(&self) -> bool;
+    fn topology(&self) -> &'static StreamSwitchTopology;
+}
+```
+
+Two methods, "coarse first":
+
+- One feature flag covers the one genuine behavioral divergence
+  surfaced by the aie-rt audit (AIE1 lacks deterministic merge; AIE2
+  has it on all tile types).
+- `topology` returns a carrier struct with three `TileStreamPorts`
+  sub-structs (one per tile kind) and a `for_tile(TileKind)`
+  accessor. Carrier is `Copy` and `Debug`, trivially composable
+  across arch boundaries.
+
+Not on the trait:
+
+- `supports_packet_routing`: invariant `true` across AIE1/AIE2
+  per aie-rt shared `xaie_ss.c`. Ceremony.
+- Port-validity check (`validate_route`): programming-time concern
+  in aie-rt, not emulated today.
+- Packet slot count / arbiter count: invariant (4 / 8 across arches).
+- `StreamSwitch` runtime state (slots, arbiter locks, priority
+  pointers): holds state, not a trait concern (traits describe,
+  don't hold state).
 
 ---
 
@@ -96,6 +130,44 @@ runtime arch-dispatch). Including a flag whose only valid value is
 
 ---
 
-## Completion
+## Completion (2026-04-22)
 
-(Filled in at end of Subsystem 5.)
+Landed at `phase1-subsys-stream-switch`. Net effect:
+
+- `xdna_archspec::stream_switch::StreamSwitchModel` trait (2 methods:
+  `supports_deterministic_merge`, `topology`) + `StreamSwitchTopology`
+  carrier + `TileStreamPorts` + `for_tile(TileKind)` accessor live at
+  the crate root.
+- `xdna_archspec::aie2::stream_switch_model::Aie2StreamSwitchModel`
+  concrete impl + `AIE2_STREAM_SWITCH_MODEL` + `AIE2_STREAM_SWITCH_TOPOLOGY`
+  statics for AIE2-family devices (NPU1/NPU4/NPU5/NPU6).
+- `xdna_archspec::runtime::ArchConfig::stream_switch_model()` accessor
+  returns `&'static dyn StreamSwitchModel`, dispatching on
+  `ModelConfig::architecture` exactly like `dma_model()` and
+  `lock_model()`.
+- xdna-emu's `src/device/port_layout.rs` (231 LOC, dead-code extension
+  trait with 3 tests) fully deleted; tests migrated to
+  `xdna_archspec::stream_switch` with assertions restated against
+  `AIE2_STREAM_SWITCH_TOPOLOGY`.
+- Six tile-construction call sites (`StreamSwitch::new_compute_tile` /
+  `new_mem_tile` / `new_shim_tile`, each x masters + slaves) migrate
+  to `arch_handle::stream_switch_topology().for_tile(kind).master_ports`
+  (and `slave_ports`).
+- New `src/device/arch_handle.rs` accessor `stream_switch_topology()`
+  provides a process-global `OnceLock` cache of
+  `&'static StreamSwitchTopology`, seeded from
+  `default_arch().stream_switch_model().topology()`. Mirrors the
+  Subsystem 4 `lock_value_layout()` bridge pattern until GUI runtime
+  arch-switch lands.
+- Drift-detection test in `crates/xdna-archspec/src/aie2/stream_switch_model.rs`
+  asserts `AIE2_STREAM_SWITCH_TOPOLOGY` agrees with all six
+  `*_MASTER_PORTS` / `*_SLAVE_PORTS` arrays and all four
+  N/S range constants per tile kind. A follow-up fix-up commit
+  (`6dab467`) restored 10 slave-side E/W/SOUTH range assertions and
+  5 arithmetic count checks that the initial test migration dropped;
+  coverage for those generated constants now lives in
+  `test_npu1_port_ranges_migrated`.
+
+Verification: `cargo test --lib` = 2684 passed / 0 failed / 5 ignored;
+archspec = 297 passed / 0 failed / 2 ignored; full HW bridge matches
+phase1-subsys-locks character (Task 7); ISA 4815/4815 PASS (Task 7).

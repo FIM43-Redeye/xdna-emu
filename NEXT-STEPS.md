@@ -3,9 +3,9 @@
 Recovery document for picking up this refactor in a future session. Read
 this first, then dive into the authoritative artifacts below.
 
-**Last updated:** 2026-04-21 (Phase 1b Subsystem 4 landed; Subsystem 5 up next)
+**Last updated:** 2026-04-22 (Phase 1b Subsystem 5 landed; Subsystem 7 up next)
 **Current branch:** `dev` (no master merges until the refactor is done)
-**Latest tag:** `phase1-subsys-locks` (Subsystem 4 completion)
+**Latest tag:** `phase1-subsys-stream-switch` (Subsystem 5 completion)
 
 ---
 
@@ -201,8 +201,8 @@ when we start it -- don't try to pre-write all 8 subsystem plans.
 | 2 | Tile Topology | `phase1-subsys-tile-topo` | **Done** | Trait seam (TileTopology) + AIE2 impl. TileType->TileKind deep rename. 2 bare row==0 hardcodes + 4 row>0 neighbor guards routed through archspec constants. See docs/arch/tile-topology.md. |
 | 3 | DMA Engine & BD Format | `phase1-subsys-dma` | **Done** | First behavioral seam. `DmaModel` trait (9 methods: 7 feature flags + `max_tensor_dims` + `timing_config`) + `Aie2DmaModel` impl. `DeviceRegLayout` family migrated to archspec; xdna-emu `Deref` wrapper retains lock-value-width fields pending Subsystem 4. 5 AIE2-only call sites gated on `supports_*()` feature flags. `(2,2)` silent fallback fixed. 7 hygiene items. Bonus: `test_full_parse_all_devices` archspec failure fixed, giving a clean baseline. See `docs/arch/dma-model.md`. |
 | 4 | Locks | `phase1-subsys-locks` | **Done** | Small seam: 3-method LockModel trait (supports_acquire_eq, supports_dynamic_value_ops, value_layout) + LockValueLayout carrier + Aie2LockModel. Migrated `sign_extend_lock_value` + lock_value_* fields from xdna-emu's DeviceRegLayout wrapper to archspec; wrapper collapsed. See docs/arch/lock-model.md. |
-| 5 | Stream Switch | `phase1-subsys-stream-switch` | **Up next** | Topology (data, already via archspec) + routing legality (behavior). Likely `StreamSwitchModel` trait. Packet ID support (AIE2) vs circuit-only (AIE1) is a candidate feature flag. |
-| 7 | ISA Execute | `phase1-subsys-isa-execute` | Pending | Semantic ops, intrinsic handlers. Biggest; largest files live here (`vmac_routing.rs` 239KB, `memory/mod.rs` 124KB). `IsaExecutor` trait. |
+| 5 | Stream Switch | `phase1-subsys-stream-switch` | **Done** | Two-method `StreamSwitchModel` trait (`supports_deterministic_merge` + `topology`) + `StreamSwitchTopology` carrier (3 `TileStreamPorts` sub-structs with `for_tile(TileKind)` accessor) + `Aie2StreamSwitchModel`. Dead-code `PortLayout` extension trait (231 LOC) deleted; 3 tests migrated to archspec. 6 tile-construction sites in `stream_switch/mod.rs` migrated through `arch_handle::stream_switch_topology()`. Direct archspec-constant consumers (`routing.rs`, `stream_io.rs`, `state/`) stay on direct access as AIE1-landing follow-ups. See `docs/arch/stream-switch-model.md`. |
+| 7 | ISA Execute | `phase1-subsys-isa-execute` | **Up next** | Semantic ops, intrinsic handlers. Biggest; largest files live here (`vmac_routing.rs` 239KB, `memory/mod.rs` 124KB). `IsaExecutor` trait. |
 | 8 | Parser (XCLBIN / PDI / ELF) | `phase1-subsys-parser` | Container format variance. `BinaryLoader` trait. |
 
 **End state after Phase 1:** adding AIE2P is "implement the traits for a
@@ -211,87 +211,89 @@ platform differences." Neither requires re-plumbing.
 
 ---
 
-## How to Pick Up Subsystem 5 (Stream Switch)
+## How to Pick Up Subsystem 7 (ISA Execute)
 
 This is the concrete next action. Start here in a fresh session.
 
 1. **Read the key artifacts:**
    - `docs/superpowers/specs/2026-04-16-device-family-refactor-design.md` (parent)
    - `docs/superpowers/plans/2026-04-16-device-family-refactor-plan.md` (parent plan)
-   - `docs/arch/subsys4-audit.md` -- Subsystem 4 completion; notes that
-     `DeviceRegLayout` wrapper fully collapsed and lock-value fields
-     migrated to `xdna_archspec::locks::LockModel`. No loose ends remain
-     from Subsystems 3-4.
-   - `docs/arch/dma-model.md` -- the behavioral seam template to mimic
-     for `docs/arch/stream-switch-model.md` (if a trait is warranted).
-   - `src/device/array/stream_switch.rs` -- the current xdna-emu
-     stream switch state; identify what is hardcoded vs data-driven.
-     (Note: `src/device/port_layout.rs` was deleted in Subsystem 5;
-     its data is now reached via
-     `xdna_archspec::stream_switch::StreamSwitchTopology` /
-     `arch_handle::stream_switch_topology()`.)
-   - `crates/xdna-archspec/src/aie2/stream_switch.rs` and
-     `crates/xdna-archspec/src/aie2/port_type.rs` -- archspec's current
-     port/bundle topology data (already partially migrated in Subsystem 1).
+   - `docs/arch/subsys5-audit.md` -- Subsystem 5 completion; confirms
+     `StreamSwitchModel` trait + `StreamSwitchTopology` carrier landed
+     in archspec, `PortLayout` extension trait deleted. No loose ends
+     from Subsystems 3-5.
+   - `docs/arch/stream-switch-model.md` -- most recent behavioral-seam
+     design note; alongside `dma-model.md` and `lock-model.md`,
+     provides three worked examples of the "coarse first" trait shape
+     for a future ISA Execute seam to mimic.
+   - `docs/arch/isa-decode.md` -- Subsystem 6 (ISA Decode) design
+     note. Decode shipped with **no trait seam** -- the argument is
+     there, worth revisiting if ISA Execute's variance turns out
+     thinner than expected.
+   - `src/interpreter/` -- the current xdna-emu execution path. Start
+     with `src/interpreter/execute/mod.rs` (if that's still the entry
+     point) and the two large files flagged below.
 
 2. **Verify the current state hasn't drifted:**
    ```bash
-   git log --oneline phase1-subsys-locks..HEAD
+   git log --oneline phase1-subsys-stream-switch..HEAD
    ```
    If nothing has landed since the tag, you're picking up exactly where
-   Subsystem 4 left off.
+   Subsystem 5 left off.
 
    ```bash
    PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
    PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec --lib 2>&1 | tail -3
    ```
-   Expect xdna-emu `2687 passed; 0 failed; 5 ignored` and archspec
-   `282 passed; 0 failed; 2 ignored`.
+   Expect xdna-emu `2684 passed; 0 failed; 5 ignored` and archspec
+   `297 passed; 0 failed; 2 ignored`.
 
-3. **Invoke brainstorming** to shape Subsystem 5's spec:
+3. **Invoke brainstorming** to shape Subsystem 7's spec:
    ```
    /brainstorming
    ```
-   Topic: "Phase 1b Subsystem 5: Stream Switch."
+   Topic: "Phase 1b Subsystem 7: ISA Execute."
 
    **Shape the spec around these questions:**
-   - **Topology vs routing legality split:** the archspec JSON already
-     provides port counts per bundle (master/slave counts for each
-     port type). Is that sufficient, or do we need a `StreamSwitchModel`
-     trait for behavioral legality checks (e.g., which source can route
-     to which destination)?
-   - **Packet-ID support:** AIE2 supports both circuit-switched (always)
-     and packet-switched (stream ID in the packet header) routing.
-     AIE1's packet routing differs. Is `supports_packet_routing` a
-     feature flag worth exposing on the trait now, or defer to AIE1
-     landing?
-   - **Port-layout methods:** `src/device/port_layout.rs` exposed six
-     methods (`master_ports`, `slave_ports`, `north_master_range`,
-     `south_master_range`, `north_slave_range`, `south_slave_range`)
-     as a runtime-side extension trait. Subsystem 5 resolved this by
-     absorbing the data into `StreamSwitchTopology` (carrier, reached
-     via `StreamSwitchModel::topology()`) and deleting the extension
-     trait. The open question now is whether E/W slave ranges -- which
-     exist as build.rs constants but are not yet carrier fields --
-     should also move onto the carrier.
-   - **Shim mux vs switchbox distinction:** shim tiles have a mux layer
-     (DMA channels, NoC ports) that compute tiles don't. How does the
-     trait surface this? Is it per-tile-kind dispatch, or a separate
-     `ShimMuxModel` sub-trait?
-   - **What would AIE1 look like?** AIE1's stream switch is architecturally
-     similar (circuit routing, port bundles) but has no packet-ID
-     support. The "coarse first" rule says: if AIE1's impl would be a
-     simple `false` flag and the same port-count data, the trait is
-     right-shaped.
+   - **Semantic-op divergence between AIE1 and AIE2:** does any
+     semantic op (vector / scalar / accumulator math, control flow)
+     behave differently at the bit level across arches? If the answer
+     is "almost none" then an `IsaExecutor` trait is ceremony and
+     ISA Execute should follow ISA Decode's no-trait pattern.
+     Conversely, any non-trivial divergence (rounding modes,
+     saturation, accumulator widths) gates the trait surface.
+   - **Intrinsic-handler seam:** AIE2 has 317 arch-specific
+     intrinsics; AIE1's intrinsic set is disjoint (different
+     instructions entirely, not renamed). How should intrinsic
+     dispatch be structured so adding AIE1 is "implement a separate
+     table" rather than "edit an existing table"? Candidate: per-arch
+     `IntrinsicHandler` maps in archspec, with a thin
+     `IsaExecutor::handle_intrinsic` trait method that looks one up.
+   - **The large-file split:** `vmac_routing.rs` (239KB) and
+     `memory/mod.rs` (124KB) are the biggest runtime files. Are they
+     inherently large, or are they doing multiple responsibilities
+     that could split? Subsystem 7 is the right moment to propose a
+     split if one is warranted -- but only if the variance-analysis
+     motivates it.
+   - **What lives in archspec vs what stays in xdna-emu:** ISA Decode
+     moved `MappedOperand`, `RegisterMap`, `AccumWidth` to xdna-emu's
+     interpreter and kept the disassembler bits in archspec. Execute
+     will hit similar questions -- which semantic-op implementations
+     are arch-generic vs arch-specific, and how does the runtime
+     execution loop reach them.
+   - **What would AIE1 look like?** Same question as the other seams.
+     If `Aie1IsaExecutor` is easy to describe in ~100 words, the
+     trait is right-shaped. If it's 800 words and still unclear, the
+     shape is wrong.
 
 4. **Invoke writing-plans** to produce a plan at
-   `docs/superpowers/plans/YYYY-MM-DD-subsys5-stream-switch.md`.
+   `docs/superpowers/plans/YYYY-MM-DD-subsys7-isa-execute.md`.
 
 5. **Invoke subagent-driven-development** to execute.
 
-6. **At end of Subsystem 5:** tag `phase1-subsys-stream-switch`, append
+6. **At end of Subsystem 7:** tag `phase1-subsys-isa-execute`, append
    a completion section to its audit, update this `NEXT-STEPS.md` to
-   move Subsystem 7 (ISA Execute) to "up next."
+   move Subsystem 8 (Parser) to "up next."
 
 ---
 
@@ -304,12 +306,12 @@ This is the concrete next action. Start here in a fresh session.
 export PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH
 
 # Commit history at the current refactor frontier
-git log --oneline phase1-subsys-locks..HEAD
-git log --oneline phase1-subsys-dma..phase1-subsys-locks
+git log --oneline phase1-subsys-stream-switch..HEAD
+git log --oneline phase1-subsys-locks..phase1-subsys-stream-switch
 
 # Run library tests (Global Invariant; green at every commit)
-cargo test --lib                         # expect 2687 pass at the tag
-cargo test -p xdna-archspec --lib        # expect 282 pass
+cargo test --lib                         # expect 2684 pass at the tag
+cargo test -p xdna-archspec --lib        # expect 297 pass
 
 # Fast bridge smoke (catches 90% of regressions, ~30s)
 ./scripts/emu-bridge-test.sh --no-hw -v add_one_cpp_aiecc
