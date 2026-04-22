@@ -103,11 +103,11 @@ private:
         HALT_ERROR     = 2,
     };
     struct ExecStatus {
-        Result     result;
-        uint64_t   cycles;
-        int        halted;       // bool in Rust, int here -- same 4-byte slot on x86_64
-        HaltReason halt_reason;  // Added alongside FFI halt_reason field.
-    };
+        Result     result;          // 4 bytes, offset 0
+        uint64_t   cycles_executed; // 8 bytes, offset 8 (with 4-byte alignment padding at 4)
+        uint8_t    halted;          // 1 byte, offset 16 -- matches Rust `bool` layout exactly
+        HaltReason halt_reason;     // 4 bytes, offset 20 (compiler adds 3 bytes of pad at 17-19)
+    };                              // total: 24 bytes
 
     // -- Existing FFI -------------------------------------------------------
     using fn_create             = XdnaEmuHandle* (*)();

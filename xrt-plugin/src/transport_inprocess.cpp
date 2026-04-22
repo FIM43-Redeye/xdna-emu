@@ -133,13 +133,21 @@ emu_transport_inprocess::emu_transport_inprocess(const std::string& lib_path)
     // Apply cycle budget from XDNA_EMU_MAX_CYCLES (0 or unset = unbounded).
     if (const char* env = std::getenv("XDNA_EMU_MAX_CYCLES")) {
         char* end = nullptr;
-        uint64_t val = std::strtoull(env, &end, 10);
-        if (end == env || *end != '\0') {
+        // Reject negative values (strtoull silently wraps them to UINT64_MAX,
+        // which would be interpreted as a "huge but finite" budget rather than
+        // the likely-intended "unlimited").
+        if (env[0] == '-') {
             std::cerr << "[xdna-emu] XDNA_EMU_MAX_CYCLES='" << env
-                      << "' unparseable; ignoring\n";
+                      << "' is negative; ignoring (use 0 for unbounded)\n";
         } else {
-            max_cycles_budget_ = val;
-            sym_set_max_cycles_(emu_, val);
+            uint64_t val = std::strtoull(env, &end, 10);
+            if (end == env || *end != '\0') {
+                std::cerr << "[xdna-emu] XDNA_EMU_MAX_CYCLES='" << env
+                          << "' unparseable; ignoring\n";
+            } else {
+                max_cycles_budget_ = val;
+                sym_set_max_cycles_(emu_, val);
+            }
         }
     }
 }
@@ -260,10 +268,11 @@ void emu_transport_inprocess::execute(const void* instructions, size_t size)
 
     // Run the emulator to completion.
     ExecStatus status = sym_run_(emu_);
-    check(status.result, "execute (run)");
     last_run_complete_ = (status.halted != 0);
 
     // Emit a structured status line so the bridge script can classify results.
+    // Emit BEFORE the check(result) throw so bridges still see halt_reason on
+    // error paths -- otherwise an ExecutionError loses all cycle/reason info.
     const char* reason_str = "error";
     switch (status.halt_reason) {
         case HALT_COMPLETED: reason_str = "completed"; break;
@@ -271,8 +280,10 @@ void emu_transport_inprocess::execute(const void* instructions, size_t size)
         case HALT_ERROR:     reason_str = "error";     break;
     }
     std::cerr << "XDNA_EMU_STATUS: halt_reason=" << reason_str
-              << " cycles=" << status.cycles
+              << " cycles=" << status.cycles_executed
               << " max_cycles=" << max_cycles_budget_ << "\n";
+
+    check(status.result, "execute (run)");
 }
 
 void emu_transport_inprocess::execute_from_device(uint64_t dev_addr,

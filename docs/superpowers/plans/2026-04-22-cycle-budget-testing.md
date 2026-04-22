@@ -1696,7 +1696,7 @@ For the EMU column, similarly extract cycles from the status line:
       local emu_status_line
       emu_status_line="$(grep 'XDNA_EMU_STATUS:' "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.bridge.log" 2>/dev/null | tail -1)"
       local emu_cycles=""
-      [[ -n "$emu_status_line" ]] && emu_cycles="$(echo "$emu_status_line" | grep -oP 'cycles=\K\d+')"
+      [[ -n "$emu_status_line" ]] && emu_cycles="$(echo "$emu_status_line" | grep -oP '\bcycles=\K\d+')"
       local emu_cell="$br"
       if [[ -n "$emu_cycles" ]] && [[ -n "$hw_max" ]] && [[ "$hw_max" -gt 0 ]]; then
         emu_cell="$br $emu_cycles/$hw_max"
@@ -1748,7 +1748,7 @@ for log in "$RESULTS_DIR"/*.bridge.log; do
   safe="${base%.*}"
   compiler="${base##*.}"
 
-  emu_cycles="$(grep 'XDNA_EMU_STATUS:' "$log" | tail -1 | grep -oP 'cycles=\K\d+' || true)"
+  emu_cycles="$(grep 'XDNA_EMU_STATUS:' "$log" | tail -1 | grep -oP '\bcycles=\K\d+' || true)"
   [[ -z "$emu_cycles" ]] && continue
 
   # Find matching HW cycles file by walking the build dir.
