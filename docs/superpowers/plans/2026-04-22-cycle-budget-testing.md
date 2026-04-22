@@ -4,6 +4,26 @@
 
 **Goal:** Instrument bridge tests so that cycle-count regressions (EMU spending more emulated cycles than HW) can be classified separately from wall-clock slowdowns (EMU's host process running slow), turning today's opaque TIMEOUT results into actionable `BUDGET` vs `TIMEOUT` signals.
 
+## Phase B Pivot Note (2026-04-22, mid-execution)
+
+The original Phase B built a `CycleCounterHelper` that called a patched `xrt::hw_context::read_aie_reg`. The XRT patch (Task 1) is correct and committed, but during Task 4 verification on real HW we discovered the underlying ioctl is gated by `MSG_OP_AIE_RW_ACCESS` — a firmware capability that Phoenix firmware 1.5.5.391 does not advertise. The kernel driver returns `-EOPNOTSUPP` from `aie2_rw_aie_reg` at `aie2_message.c:1774`.
+
+No software-only workaround: `DRM_AMDXDNA_READ_AIE_REG` is `#ifdef AMDXDNA_AIE2_PRIV` (dev-build only, and still firmware-gated). Strix/NPU2/NPU4 and Versal likely ship with the capability, but there's no known firmware update path for our Phoenix hardware.
+
+**Revised Phase B approach:** use mlir-aie's declarative trace infrastructure (`aie.utils.trace.configure_trace()`, `start_trace()`, `parse_trace()` plus the `aie-opt --aie-insert-trace-flows` / `--aie-inline-trace-config` passes — declarative trace IRON API landed via PR #2988). Capture `CoreEvent.ACTIVE` (= 28 = 0x1C) with timestamps via the HW's per-tile timer; trace unit writes packets to a DMA buffer; post-run `parse_trace()` yields cycle counts. No firmware RPC needed — trace config is set at compile time.
+
+**Bonus:** this retires our atrophied in-tree trace tools (`tools/trace-inject.py`, `trace-sweep.py`, `trace-trim.py`, `trace-merge.py`, `trace-prepare.py`, and `src/bin/trace_compare.rs`) and delegates to mlir-aie's single source of truth. (Trace *comparison* may need a small replacement later — deferred.)
+
+**Status of the old Phase B:**
+- **Task 1 (XRT patch)**: remains committed on `xdna-driver` branch `xdna-emu-cycle-budget` as future-firmware-ready code. Dormant.
+- **Task 2 (CycleCounterHelper)**: remains committed on `mlir-aie` branch `xdna-emu-cycle-budget` as dormant companion code. Not currently used.
+- **Task 3 (bridge sed injection)**: reverted from xdna-emu `dev` in commit `4b13a9b`.
+- **Task 4 (HW verification)**: superseded; will be re-done against the trace-based Phase B.
+
+**Execution reorder:** Phase A (FFI + plugin) and Phase D (PerfCounterBank level-event fix) are independent of Phase B and proceed now. Phase B gets a separate brainstorm once Phase A + D land, then Phase C follows Phase B.
+
+---
+
 **Architecture:** Four phases land in order (B prerequisite: XRT patch) → B → A → D → C.
 **XRT patch prerequisite** — stock `xrt::aie::device::read_aie_reg` takes `(pid, context_id, col, row, addr)` and opens its own AIE context on construction, conflicting with `xrt::hw_context`. We add a small additive method `xrt::hw_context::read_aie_reg(col, row, addr)` that reuses the context's own slot_idx + core_device, applies partition-relative-to-absolute col translation, and issues the shim's existing 3-arg register read. Patch lives in our local `xdna-driver/xrt/` build; upstream eventually.
 **B** adds HW perf counter capture in mlir-aie test.exe binaries using the patched API.
