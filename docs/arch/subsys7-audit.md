@@ -343,7 +343,68 @@ Files: `interpreter/timing/{arbitration, barrier, deadlock, hazards,
 latency, memory, mod, slots, sync}.rs`, plus `execute/cycle_accurate.rs`
 latency tables.
 
-(Filled in by Task 1 Step 8.)
+### `timing/latency.rs`
+
+- **Size + responsibility.** 753 lines; instruction latency constants (scalar, vector, memory, branch, lock), the `LatencyTable` struct (two-tier: LLVM itinerary primary + `SemanticOp` fallback), `validated_aie2()` cross-validation against `ProcessorModel`, and the `itinerary_to_timing()` name→timing mapper.
+- **AIE2 hardcode count.** 30 matches. Key load-bearing instances:
+  - `LATENCY_MEMORY: u8 = 7` (line 103) -- raw literal not yet reading from `timing::DATA_MEMORY_LATENCY` (which does exist in archspec at `xdna_archspec::aie2::timing::DATA_MEMORY_LATENCY`).
+  - `LATENCY_SCALAR_MUL: u8 = 2` (line 79), `LATENCY_SCALAR_DIV: u8 = 6` (line 83), `LATENCY_VECTOR_MUL: u8 = 5` (line 142), `LATENCY_VECTOR_MAC: u8 = 5` (line 146), `LATENCY_VECTOR_SIMPLE: u8 = 2` (line 139), `LATENCY_BRANCH_TAKEN: u8 = 3` (line 121) -- all raw literals.
+  - The `validated_aie2()` function at line 363-388 already validates `LATENCY_MEMORY` against `ProcessorModel.load_latency + 2` and `LATENCY_BRANCH_TAKEN` against `ProcessorModel.mispredict_penalty - 1`. This validation infrastructure exists but the primary source of truth is still the raw literal, not the archspec constant.
+  - `LatencyTable::aie2()` (line 196) explicitly names the architecture in the constructor -- the seam for future `LatencyTable::for_arch(arch)`.
+- **What's already in archspec.** `xdna_archspec::aie2::timing` contains: `DATA_MEMORY_LATENCY`, `LOCK_ACQUIRE_LATENCY`, `LOCK_RELEASE_LATENCY`, `BRANCH_PENALTY`, `ROUTE_LOCAL_TO_EXTERNAL`, and more. The `timing/memory.rs` file already reads `DATA_MEMORY_LATENCY` from archspec (line 179 of `memory.rs`). The duplication is in `latency.rs` itself, which re-declares `LATENCY_MEMORY = 7` independently.
+- **Divergence risks vs AIE1/AIE2P.** Every latency value in this file is AIE2-specific. AIE1 has different pipeline depths and different memory latency (per AM020 for AIE1). The `SemanticOp`-based fallback table is arch-agnostic in structure but arch-specific in values. The `validated_aie2()` function creates a one-way dependency on `ProcessorModel` format; AIE1 would need `validated_aie1()` with different target values.
+- **Prescribed migration verb.** `read-archspec-via-accessor`. The raw literals (`LATENCY_MEMORY=7`, `LATENCY_SCALAR_MUL=2`, etc.) should be replaced with reads from `xdna_archspec::aie2::timing::*` or `xdna_archspec::aie2::processor::*`. `LATENCY_MEMORY` duplicates `xdna_archspec::aie2::timing::DATA_MEMORY_LATENCY` exactly.
+- **Estimated LOC impact.** ~20 lines changing in xdna-emu (replace literals with archspec references); 0 additions to archspec (all target constants already exist).
+
+### `timing/memory.rs`
+
+- **Size + responsibility.** 921 lines; memory bank conflict detection, `MemoryQuadrant` routing enum, cross-tile latency, bank size constants, alignment checking.
+- **AIE2 hardcode count.** 20. Key instances: all primary constants are already archspec-sourced:
+  - `NUM_BANKS = xdna_archspec::aie2::compute::PHYSICAL_BANKS` (line 43).
+  - `QUADRANT_SIZE = xdna_archspec::aie2::compute::MEMORY_SIZE` (line 68).
+  - `CROSS_TILE_LATENCY = xdna_archspec::aie2::timing::ROUTE_LOCAL_TO_EXTERNAL` (line 72).
+  - `BASE_LATENCY = xdna_archspec::aie2::timing::DATA_MEMORY_LATENCY` (line 179).
+  - `BANK_SIZE = xdna_archspec::aie2::compute::PHYSICAL_BANK_SIZE` (line 173).
+  - `BANK_WIDTH_BYTES = xdna_archspec::aie2::compute::PHYSICAL_BANK_WIDTH_BITS / 8` (line 176).
+  - `compute::IS_CHECKERBOARD` read for checkerboard-aware routing (line 133).
+  The AIE2 references in this file are all documentation (`// AIE2 (IsCheckerBoard=0)`) or already-archspec references.
+- **Prescribed migration verb.** `leave-alone`. This file is exemplary -- it is the model for how the rest of the timing area should be migrated.
+- **Estimated LOC impact.** 0.
+
+### `timing/hazards.rs`
+
+- **Size + responsibility.** 724 lines; register hazard detection (RAW, WAW), `HazardDetector` struct, per-register `ready_cycle` tracking, `HazardStats`.
+- **AIE2 hardcode count.** 2 (doc comment `// AIE2 has an 8-stage maximum pipeline` and import of `xdna_archspec::aie2::isa::SemanticOp`). No load-bearing arch-specific constants -- the hazard detection algorithm (advance cycle, check ready_cycle, insert stall) is arch-generic; the latencies feeding it come from `LatencyTable`.
+- **Prescribed migration verb.** `leave-alone`.
+- **Estimated LOC impact.** 0.
+
+### `timing/slots.rs`
+
+- **Size + responsibility.** 298 lines; VLIW structural hazard detection (`check_bundle_conflicts`), `ExecutionResource` enum mapping slot types to functional units.
+- **AIE2 hardcode count.** 3. Key: `// AIE2 VLIW bundles can contain up to 7 slots that execute in parallel` (line 7). The `ExecutionResource` variants (LoadUnit, StoreUnit, VectorUnit, etc.) mirror the AIE2 VLIW slot structure. These are architectural constants that would differ for AIE1 (fewer slots, different structural hazard rules).
+- **Divergence risks.** The structural hazard rules (`// two loads and one store can run in parallel`) are AIE2-specific. AIE1 has fewer slots and different conflict rules. However, these rules are encoded in a match expression driven by `SemanticOp`, not by hardcoded slot counts -- so they are flexible in the sense that removing a SemanticOp case would disable the conflicting unit. For Subsystem 7, this is `leave-alone`.
+- **Prescribed migration verb.** `leave-alone`.
+- **Estimated LOC impact.** 0.
+
+### `timing/arbitration.rs`, `barrier.rs`, `deadlock.rs`, `sync.rs`
+
+- **Sizes + responsibilities.** Arbitration (356 lines): memory-tile round-robin contention model (scaffolded, not wired). Barrier (778 lines): multi-core barrier timing (scaffolded, not wired). Deadlock (621 lines): lock circular-wait detection with depth limit. Sync (361 lines): lock timing state tracking.
+- **AIE2 hardcode counts.** Arbitration: 1 doc reference. Barrier: 2 doc references. Deadlock: 4, including `max_cycle_length: 16` (line 393, a heuristic for AIE2 arrays). Sync: 3 (imports + doc).
+- **Divergence risks.** All are arch-generic algorithms consuming arch-specific inputs. The deadlock cycle-length heuristic (16) is an operational parameter, not a hardware constant. None of these files have load-bearing AIE2 constants in the algorithm paths.
+- **Prescribed migration verb.** `leave-alone` for all four.
+- **Estimated LOC impact.** 0 for all four.
+
+### `timing/mod.rs`
+
+- **Size + responsibility.** 52 lines; re-exports only.
+- **AIE2 hardcode count.** 2 (doc comment + `LatencyTable::aie2()` usage note). No constants.
+- **Prescribed migration verb.** `leave-alone`.
+
+### `execute/cycle_accurate.rs` latency tables
+
+Already audited in Section 1. The only timing-relevant finding is `LatencyTable::aie2()` at construction (line 87), which should become `LatencyTable::for_arch(arch_handle::processor_model())`. Currently this is a naming issue rather than a behavioral divergence since `aie2()` calls the archspec LLVM FFI internally. The `BRANCH_DELAY_SLOTS = 5` in archspec (`processor::BRANCH_DELAY_SLOTS`) is not yet consumed in `cycle_accurate.rs` -- the 5-slot behavior is implicit in `ExecutionContext::tick_delay_slots`.
+
+**Timing area summary.** The spec's "data migration only, no trait seam" stance is confirmed. `timing/memory.rs` is the exemplary file -- already fully archspec-driven. `timing/latency.rs` is the primary migration target: its 8 raw literal constants (`LATENCY_MEMORY`, `LATENCY_SCALAR_MUL`, etc.) duplicate values already in `xdna_archspec::aie2::timing`. `validated_aie2()` already validates the relationship; the next step is to replace the literals with the archspec reads, making the validation unnecessary. `hazards.rs`, `slots.rs`, `arbitration.rs`, `barrier.rs`, `deadlock.rs`, `sync.rs`, and `mod.rs` are all `leave-alone`.
 
 ---
 
