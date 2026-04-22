@@ -173,6 +173,13 @@ pub mod isa_execute_model;
 /// (`vector_float.rs`). Both files previously carried identical local copies.
 pub mod rounding;
 
+/// Matrix multiply geometry tables for the AIE2 vector multiply array.
+///
+/// `DENSE_GEOMETRY_TABLE`, `SPARSE_GEOMETRY_TABLE`, and `CONFIG_GEOMETRY_TABLE`
+/// encode the valid tile dimensions (rows, inner, cols) and accumulator modes
+/// for each element type pair. Authoritative source for `vector_config.rs`.
+pub mod matmul;
+
 /// Instruction set architecture: decoder tables, runtime model, and
 /// LLVM MCDisassembler FFI. Populated during Subsystem 6 Part A.
 pub mod isa;
