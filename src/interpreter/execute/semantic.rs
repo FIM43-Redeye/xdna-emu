@@ -63,6 +63,7 @@ use crate::interpreter::bundle::{Operand, SlotIndex, SlotOp, SelectVariant};
 use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::traits::Flags;
 use xdna_archspec::aie2::isa::SemanticOp;
+use xdna_archspec::aie2::registers::ctrl_regs;
 
 /// Execute a SlotOp using its SemanticOp if available.
 ///
@@ -235,11 +236,14 @@ pub(super) fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
             ctx.accumulator.read(*r)[0] as u32
         }
         Operand::ControlReg(id) => {
-            match id {
-                6 => ctx.srs_config.rounding_mode as u32,   // crRnd
-                8 => ctx.srs_config.srs_sign as u32,        // crSRSSign
-                9 => ctx.srs_config.saturation_mode as u32, // crSat
-                _ => 0,
+            if *id == ctrl_regs::CR_RND {
+                ctx.srs_config.rounding_mode as u32
+            } else if *id == ctrl_regs::CR_SRS_SIGN {
+                ctx.srs_config.srs_sign as u32
+            } else if *id == ctrl_regs::CR_SAT {
+                ctx.srs_config.saturation_mode as u32
+            } else {
+                0
             }
         }
         _ => 0,
@@ -276,31 +280,31 @@ pub(super) fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value
         Operand::ModifierReg(r) => ctx.modifier.write(*r, value),
         Operand::ControlReg(id) => {
             // Control register write: update SRS/UPS config.
-            // Hardware register IDs from AIE2GenRegisterInfo.td.
-            match id {
-                9 => { // crSat
+            // Hardware register IDs from AIE2GenRegisterInfo.td via archspec.
+            match *id {
+                ctrl_regs::CR_SAT => {
                     ctx.srs_config.saturation_mode = (value & 0x3) as u8;
                     log::trace!("crSat = {} (raw 0x{:X})", value & 0x3, value);
                 }
-                6 => { // crRnd
+                ctrl_regs::CR_RND => {
                     ctx.srs_config.rounding_mode = (value & 0xF) as u8;
                     log::trace!("crRnd = {} (raw 0x{:X})", value & 0xF, value);
                 }
-                8 => { // crSRSSign
+                ctrl_regs::CR_SRS_SIGN => {
                     ctx.srs_config.srs_sign = (value & 1) != 0;
                     log::trace!("crSRSSign = {} (raw 0x{:X})", value & 1, value);
                 }
                 // Mask registers q0-q3: ControlReg(16..19).
                 // Scalar write sets the low 32 bits (clears upper bits).
                 16..=19 => {
-                    let q_idx = (id - 16) as u8;
+                    let q_idx = (*id - 16) as u8;
                     ctx.mask.write_u32_low(q_idx, value);
                     log::trace!("q{} = 0x{:08X} (scalar write)", q_idx, value);
                 }
                 // ql0-ql3: ControlReg(28..31). Scalar write to low word
                 // of low 64-bit half (preserves rest).
                 28..=31 => {
-                    let q_idx = (id - 28) as u8;
+                    let q_idx = (*id - 28) as u8;
                     let mut cur = ctx.mask.read(q_idx);
                     cur[0] = value;
                     ctx.mask.write(q_idx, cur);
@@ -309,7 +313,7 @@ pub(super) fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value
                 // qh0-qh3: ControlReg(32..35). Scalar write to low word
                 // of high 64-bit half (preserves rest).
                 32..=35 => {
-                    let q_idx = (id - 32) as u8;
+                    let q_idx = (*id - 32) as u8;
                     let mut cur = ctx.mask.read(q_idx);
                     cur[2] = value;
                     ctx.mask.write(q_idx, cur);
@@ -1072,7 +1076,7 @@ mod tests {
 
         let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy);
         op.sources = smallvec![Operand::ScalarReg(5)];
-        op.dest = Some(Operand::ControlReg(6)); // crRnd
+        op.dest = Some(Operand::ControlReg(ctrl_regs::CR_RND));
 
         assert!(execute_semantic(&op, &mut ctx));
         assert_eq!(ctx.srs_config.rounding_mode, 9);
@@ -1084,7 +1088,7 @@ mod tests {
 
         let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy);
         op.sources = smallvec![Operand::Immediate(3)];
-        op.dest = Some(Operand::ControlReg(9)); // crSat
+        op.dest = Some(Operand::ControlReg(ctrl_regs::CR_SAT));
 
         assert!(execute_semantic(&op, &mut ctx));
         assert_eq!(ctx.srs_config.saturation_mode, 3);
@@ -1096,7 +1100,7 @@ mod tests {
 
         let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy);
         op.sources = smallvec![Operand::Immediate(1)];
-        op.dest = Some(Operand::ControlReg(8)); // crSRSSign
+        op.dest = Some(Operand::ControlReg(ctrl_regs::CR_SRS_SIGN));
 
         assert!(execute_semantic(&op, &mut ctx));
         assert!(ctx.srs_config.srs_sign);
@@ -1109,14 +1113,14 @@ mod tests {
         // crSat only uses lower 2 bits
         let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy);
         op.sources = smallvec![Operand::Immediate(0xFF)];
-        op.dest = Some(Operand::ControlReg(9)); // crSat
+        op.dest = Some(Operand::ControlReg(ctrl_regs::CR_SAT));
         assert!(execute_semantic(&op, &mut ctx));
         assert_eq!(ctx.srs_config.saturation_mode, 3); // 0xFF & 0x3
 
         // crRnd only uses lower 4 bits
         let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy);
         op.sources = smallvec![Operand::Immediate(0xFF)];
-        op.dest = Some(Operand::ControlReg(6)); // crRnd
+        op.dest = Some(Operand::ControlReg(ctrl_regs::CR_RND));
         assert!(execute_semantic(&op, &mut ctx));
         assert_eq!(ctx.srs_config.rounding_mode, 15); // 0xFF & 0xF
     }
@@ -1130,12 +1134,12 @@ mod tests {
         // movx crSat, r0
         let mut write_op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy);
         write_op.sources = smallvec![Operand::ScalarReg(0)];
-        write_op.dest = Some(Operand::ControlReg(9)); // crSat
+        write_op.dest = Some(Operand::ControlReg(ctrl_regs::CR_SAT));
         assert!(execute_semantic(&write_op, &mut ctx));
 
         // mov r14, crSat
         let mut read_op = SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::Copy);
-        read_op.sources = smallvec![Operand::ControlReg(9)];
+        read_op.sources = smallvec![Operand::ControlReg(ctrl_regs::CR_SAT)];
         read_op.dest = Some(Operand::ScalarReg(14));
         assert!(execute_semantic(&read_op, &mut ctx));
 
@@ -1151,12 +1155,12 @@ mod tests {
         // movx crRnd, r0
         let mut write_op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy);
         write_op.sources = smallvec![Operand::ScalarReg(0)];
-        write_op.dest = Some(Operand::ControlReg(6)); // crRnd
+        write_op.dest = Some(Operand::ControlReg(ctrl_regs::CR_RND));
         assert!(execute_semantic(&write_op, &mut ctx));
 
         // mov r14, crRnd
         let mut read_op = SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::Copy);
-        read_op.sources = smallvec![Operand::ControlReg(6)];
+        read_op.sources = smallvec![Operand::ControlReg(ctrl_regs::CR_RND)];
         read_op.dest = Some(Operand::ScalarReg(14));
         assert!(execute_semantic(&read_op, &mut ctx));
 
