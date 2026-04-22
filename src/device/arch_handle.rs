@@ -12,6 +12,7 @@
 //! reached through one indirection.
 
 use std::sync::OnceLock;
+use xdna_archspec::isa_execute::IsaExecutor;
 use xdna_archspec::locks::LockValueLayout;
 use xdna_archspec::stream_switch::StreamSwitchTopology;
 
@@ -36,5 +37,18 @@ static STREAM_SWITCH_TOPOLOGY: OnceLock<&'static StreamSwitchTopology> = OnceLoc
 pub fn stream_switch_topology() -> &'static StreamSwitchTopology {
     STREAM_SWITCH_TOPOLOGY.get_or_init(|| {
         xdna_archspec::runtime::default_arch().stream_switch_model().topology()
+    })
+}
+
+static ISA_EXECUTOR: OnceLock<&'static dyn IsaExecutor> = OnceLock::new();
+
+/// Per-arch ISA execute seam for operation-level behavioral divergence.
+///
+/// Returns the `&'static dyn IsaExecutor` for the runtime's default
+/// arch. Ships empty per Subsystem 7's Approach A audit; anchored
+/// for future seams.
+pub fn isa_executor() -> &'static dyn IsaExecutor {
+    *ISA_EXECUTOR.get_or_init(|| {
+        xdna_archspec::runtime::default_arch().isa_executor()
     })
 }
