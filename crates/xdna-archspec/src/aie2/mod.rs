@@ -197,3 +197,39 @@ pub mod ups;
 /// Instruction set architecture: decoder tables, runtime model, and
 /// LLVM MCDisassembler FFI. Populated during Subsystem 6 Part A.
 pub mod isa;
+
+#[cfg(test)]
+mod tests {
+    use super::instruction_latency;
+
+    /// Drift-detection test for the instruction_latency pipeline constants.
+    ///
+    /// These constants come from `AIE2Schedule.td` itinerary data and are
+    /// cross-validated against xdna-emu's `test_latency_cross_validation_against_itineraries`
+    /// test in `src/interpreter/timing/latency.rs`. This standalone archspec test
+    /// catches drift without requiring the full emulator crate to compile.
+    ///
+    /// If any of these values change, verify the new value against
+    /// `AIE2Schedule.td` `operand_cycles[0]` for the corresponding itinerary
+    /// class before updating.
+    #[test]
+    fn instruction_latency_constants_match_aie2schedule_td() {
+        // Scalar pipeline latencies
+        assert_eq!(instruction_latency::SCALAR_MUL, 2,
+            "II_MUL operand_cycles[0] = 2 per AIE2Schedule.td");
+        assert_eq!(instruction_latency::SCALAR_DIV, 6,
+            "6-cycle iterative division per AM020 Ch4 + hardware observation");
+
+        // Vector pipeline latencies
+        assert_eq!(instruction_latency::VECTOR_SIMPLE, 2,
+            "II_VADD/II_VSUB operand_cycles[0] = 2 per AIE2Schedule.td");
+        assert_eq!(instruction_latency::VECTOR_MUL, 5,
+            "II_VMUL operand_cycles[0] = 5 per AIE2Schedule.td");
+        assert_eq!(instruction_latency::VECTOR_MAC, 5,
+            "II_VMAC operand_cycles[0] = 5 per AIE2Schedule.td");
+        assert_eq!(instruction_latency::VECTOR_SHUFFLE, 2,
+            "II_VSHUFFLE operand_cycles[0] = 2 per AIE2Schedule.td");
+        assert_eq!(instruction_latency::VECTOR_PACK, 2,
+            "II_VPACK operand_cycles[0] = 2 per AIE2Schedule.td");
+    }
+}
