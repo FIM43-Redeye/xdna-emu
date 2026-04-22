@@ -55,6 +55,21 @@ pub fn isa_executor() -> &'static dyn IsaExecutor {
     })
 }
 
+static HAS_CASCADE_LINK: OnceLock<bool> = OnceLock::new();
+
+/// Whether the default architecture has a cascade link between adjacent compute tiles.
+///
+/// AIE2 and AIE2P return `true`; AIE1 returns `false`. Lazily resolved from
+/// `default_arch().has_cascade_link()` on first call.
+///
+/// `cascade.rs` gates all cascade operations on this flag, so a future
+/// AIE1 path gets no-op cascade handlers without touching execute-layer logic.
+pub fn has_cascade_link() -> bool {
+    *HAS_CASCADE_LINK.get_or_init(|| {
+        xdna_archspec::runtime::default_arch().has_cascade_link()
+    })
+}
+
 static LATENCY_TABLE: OnceLock<LatencyTable> = OnceLock::new();
 
 /// Process-wide instruction latency table for the default architecture.

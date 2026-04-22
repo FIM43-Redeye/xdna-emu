@@ -1224,6 +1224,13 @@ pub struct ProcessorModel {
     /// before the user-specified shift is applied.
     /// Source: AM020 / aietools vector model.
     pub srs_shift_bias: u8,
+    /// Whether this architecture has a cascade link between adjacent compute tiles.
+    ///
+    /// AIE2 and AIE2P compute tiles have a dedicated 384-bit point-to-point
+    /// cascade link (6 x u64). AIE1 does not have this link. Set `true` for
+    /// AIE2/AIE2P; `false` for AIE1 (when AIE1 support is added).
+    /// Source: aie-rt xaie_core.c:993-1046; AM020 cascade stream description.
+    pub has_cascade_link: bool,
     pub source: SourceAttribution,
 }
 

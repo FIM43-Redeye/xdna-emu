@@ -455,6 +455,8 @@ def lda_slot : InstSlot<"Lda", 21> {
                 branch_delay_slots: 5,
                 partial_store_data_latency: 6,
                 srs_shift_bias: 4,
+                // This test model is AIE2; cascade link present.
+                has_cascade_link: true,
                 source: src,
             }),
         };

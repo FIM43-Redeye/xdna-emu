@@ -210,6 +210,19 @@ pub trait ArchConfig: Send + Sync + std::fmt::Debug {
     /// audit's Approach A conclusion (zero trait methods
     /// warranted); attached for future seams.
     fn isa_executor(&self) -> &'static dyn crate::isa_execute::IsaExecutor;
+
+    // ========================================================================
+    // Cascade Link (Subsystem 7)
+    // ========================================================================
+
+    /// Whether this architecture has a cascade link between adjacent compute tiles.
+    ///
+    /// AIE2 and AIE2P compute tiles have a dedicated 384-bit point-to-point
+    /// cascade link (`aie2::CASCADE_WORDS` u64 words per transfer). AIE1 does
+    /// not have this link and cascade operations should be no-ops on AIE1.
+    ///
+    /// Reads from `ProcessorModel::has_cascade_link` when available.
+    fn has_cascade_link(&self) -> bool;
 }
 
 // ============================================================================
@@ -560,6 +573,16 @@ impl ArchConfig for ModelConfig {
             ),
         }
     }
+
+    fn has_cascade_link(&self) -> bool {
+        // AIE2 and AIE2P compute tiles have a dedicated 384-bit cascade link.
+        // AIE1 does not. Drive from the architecture field so a future AIE1
+        // ModelConfig automatically returns false without touching execute code.
+        match self.architecture {
+            Architecture::Aie2 | Architecture::Aie2p => true,
+            Architecture::Aie => false,
+        }
+    }
 }
 
 // ============================================================================
@@ -782,6 +805,25 @@ mod tests {
                     executor as *const _ as *const (),
                     expected as *const _ as *const ()
                 ), "{}: isa_executor must dispatch to AIE2_ISA_EXECUTOR", name);
+            }
+        }
+    }
+
+    /// Drift test: has_cascade_link must be true for AIE2-family (NPU1 and NPU2+).
+    ///
+    /// The cascade link is a 384-bit point-to-point connection between adjacent
+    /// AIE2/AIE2P compute tiles. Any regression (e.g., accidentally setting
+    /// has_cascade_link=false for AIE2) would silently disable all cascade ops.
+    #[test]
+    fn has_cascade_link_true_for_aie2_family() {
+        for name in &["npu1", "npu2", "npu4", "npu5", "npu6"] {
+            if let Some(model) = ARCHSPEC_MODELS.get(*name) {
+                let cfg = ModelConfig::from_arch_model(model, name);
+                assert!(
+                    cfg.has_cascade_link(),
+                    "{}: AIE2-family must have has_cascade_link=true",
+                    name
+                );
             }
         }
     }

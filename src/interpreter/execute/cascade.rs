@@ -6,10 +6,11 @@
 //!
 //! # Hardware Facts (aie-rt xaie_core.c:993-1046)
 //!
-//! - 384-bit data width = 6 x u64 = 48 bytes
+//! - 384-bit data width = `CASCADE_WORDS` x u64 = 48 bytes
 //! - Depth-1 FIFO per direction (input SCD, output MCD)
 //! - Direction configured via accumulator control register at 0x36060
 //! - Core stalls on empty SCD read or full MCD write
+//! - Only present on architectures where `has_cascade_link` is true (AIE2, AIE2P).
 //!
 //! # Instructions
 //!
@@ -18,13 +19,14 @@
 //!
 //! # Data Packing
 //!
-//! The cascade link is 384 bits wide. Register types are narrower or wider:
-//! - Vector register (256 bits = 8 x u32): packed into low 4 of [u64; 6]
-//! - Accumulator register (512 bits = 8 x u64): low 6 of 8 lanes used
+//! The cascade link is 384 bits wide (`CASCADE_WORDS` u64 words). Register types:
+//! - Vector register (256 bits = 8 x u32): packed into low 4 of `[u64; CASCADE_WORDS]`
+//! - Accumulator register (512 bits = 8 x u64): low `CASCADE_WORDS` of 8 lanes used
 
+use crate::device::arch_handle;
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{Operand, SlotOp};
-use xdna_archspec::aie2::isa::SemanticOp;
+use xdna_archspec::aie2::{CASCADE_WORDS, isa::SemanticOp};
 use crate::interpreter::state::ExecutionContext;
 
 /// Cascade operations execution unit.
@@ -49,12 +51,16 @@ impl CascadeOps {
     /// Execute a cascade operation.
     ///
     /// Returns `Completed` if handled, `Stall` if blocking, or
-    /// `NotCascadeOp` if the operation isn't a cascade instruction.
+    /// `NotCascadeOp` if the operation isn't a cascade instruction (or if
+    /// the architecture has no cascade link -- always the case for AIE1).
     pub fn execute(
         op: &SlotOp,
         ctx: &mut ExecutionContext,
         tile: &mut Tile,
     ) -> CascadeResult {
+        if !arch_handle::has_cascade_link() {
+            return CascadeResult::NotCascadeOp;
+        }
         match op.semantic {
             Some(SemanticOp::CascadeRead) => Self::execute_read(op, ctx, tile),
             Some(SemanticOp::CascadeWrite) => Self::execute_write(op, ctx, tile),
@@ -72,8 +78,12 @@ impl CascadeOps {
     /// slot if one would block.
     ///
     /// Returns `Some(StallRead | StallWrite)` if the op would stall, or
-    /// `None` if the op is non-cascade or would proceed.
+    /// `None` if the op is non-cascade, would proceed, or if the
+    /// architecture has no cascade link.
     pub fn would_stall(op: &SlotOp, tile: &Tile) -> Option<CascadeResult> {
+        if !arch_handle::has_cascade_link() {
+            return None;
+        }
         match op.semantic {
             Some(SemanticOp::CascadeRead) => {
                 if tile.cascade_input.is_empty() {
@@ -223,19 +233,19 @@ fn cascade_to_vector(data: &[u64; 6]) -> [u32; 8] {
 }
 
 /// Pack a 512-bit accumulator register (8 x u64) into 384-bit cascade data (6 x u64).
-/// Takes the low 6 of 8 lanes (384 of 512 bits).
+/// Takes the low `CASCADE_WORDS` of 8 lanes (384 of 512 bits).
 fn accumulator_to_cascade(lanes: &[u64; 8]) -> [u64; 6] {
     let mut data = [0u64; 6];
-    data.copy_from_slice(&lanes[..6]);
+    data.copy_from_slice(&lanes[..CASCADE_WORDS]);
     data
 }
 
 /// Unpack 384-bit cascade data (6 x u64) into a 512-bit accumulator register (8 x u64).
-/// Low 6 lanes from cascade data, high 2 lanes zero-padded.
+/// Low `CASCADE_WORDS` lanes from cascade data, remaining lanes zero-padded.
 fn cascade_to_accumulator(data: &[u64; 6]) -> [u64; 8] {
     let mut lanes = [0u64; 8];
-    lanes[..6].copy_from_slice(data);
-    // lanes[6] and lanes[7] remain zero
+    lanes[..CASCADE_WORDS].copy_from_slice(data);
+    // lanes[CASCADE_WORDS..] remain zero
     lanes
 }
 

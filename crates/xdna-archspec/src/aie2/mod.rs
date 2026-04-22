@@ -28,6 +28,14 @@ include!(concat!(env!("OUT_DIR"), "/gen_arch.rs"));
 // MEMTILE_SLAVE_PORTS, SHIM_MASTER_PORTS, SHIM_SLAVE_PORTS.
 include!(concat!(env!("OUT_DIR"), "/gen_stream_ports.rs"));
 
+/// Number of u64 words in the AIE2 cascade link data payload.
+///
+/// The cascade link is 384 bits wide = 6 x u64. This is the physical
+/// link width connecting adjacent compute tiles (SCD input, MCD output).
+/// Source: aie-rt xaie_core.c:993-1046; AM020 cascade stream description.
+/// Only valid when `ProcessorModel::has_cascade_link` is true.
+pub const CASCADE_WORDS: usize = 6;
+
 /// Per-tile-type subsystem address ranges (generated from ArchModel).
 ///
 /// Submodules: compute, memtile, shim. Each contains `pub mod <subsystem>`
