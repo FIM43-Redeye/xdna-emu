@@ -37,6 +37,7 @@ use crate::interpreter::bundle::{ElementType, MemWidth, Operand, PostModify, Slo
 use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::timing::{LATENCY_MEMORY, MemoryQuadrant};
 use xdna_archspec::aie2::isa::SemanticOp;
+use xdna_archspec::aie2::memory_map;
 
 /// Offset mask for extracting the local address within a tile's memory.
 /// `address & OFFSET_MASK` gives the byte offset within the target tile.
@@ -1381,12 +1382,11 @@ impl MemoryUnit {
     fn read_memory(tile: &Tile, addr: u32, width: MemWidth, neighbors: Option<&NeighborMemory>) -> u64 {
         // Processor bus: the core accesses tile configuration registers via
         // a window at base 0x80000 in the core's address space. Register
-        // offset = (address - 0x80000). This maps to the tile's memory module,
-        // core module, etc. registers at their AM025 offsets.
-        const PROC_BUS_BASE: u32 = 0x80000;
-        const PROC_BUS_END: u32 = 0xC0000; // 256KB window
-        if tile.processor_bus_enabled && addr >= PROC_BUS_BASE && addr < PROC_BUS_END {
-            let reg_offset = addr - PROC_BUS_BASE;
+        // offset = (address - PROC_BUS_BASE). This maps to the tile's memory
+        // module, core module, etc. registers at their AM025 offsets.
+        // Window constants from xdna_archspec::aie2::memory_map.
+        if tile.processor_bus_enabled && addr >= memory_map::PROC_BUS_BASE && addr < memory_map::PROC_BUS_END {
+            let reg_offset = addr - memory_map::PROC_BUS_BASE;
             let reg_val = tile.read_register_pure(reg_offset);
             log::debug!("[PROC_BUS] read addr=0x{:X} reg=0x{:X} -> 0x{:08X}", addr, reg_offset, reg_val);
             return reg_val as u64;
@@ -1487,11 +1487,10 @@ impl MemoryUnit {
     /// When the processor bus is enabled, writes to the register space
     /// (0x10000-0x3FFFF) target tile configuration registers.
     pub fn write_memory(tile: &mut Tile, addr: u32, value: u64, width: MemWidth, neighbors: Option<&mut NeighborMemory>) {
-        // Processor bus: write to tile config registers via 0x80000 window
-        const PROC_BUS_BASE: u32 = 0x80000;
-        const PROC_BUS_END: u32 = 0xC0000;
-        if tile.processor_bus_enabled && addr >= PROC_BUS_BASE && addr < PROC_BUS_END {
-            let reg_offset = addr - PROC_BUS_BASE;
+        // Processor bus: write to tile config registers via the 0x80000 window.
+        // Window constants from xdna_archspec::aie2::memory_map.
+        if tile.processor_bus_enabled && addr >= memory_map::PROC_BUS_BASE && addr < memory_map::PROC_BUS_END {
+            let reg_offset = addr - memory_map::PROC_BUS_BASE;
             log::debug!("[PROC_BUS] write addr=0x{:X} reg=0x{:X} value=0x{:X}", addr, reg_offset, value);
             tile.registers.insert(reg_offset, value as u32);
             return;

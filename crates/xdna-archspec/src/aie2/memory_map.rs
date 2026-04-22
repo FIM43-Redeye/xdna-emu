@@ -8,6 +8,35 @@
 
 use super::{cardinal, compute, memtile, DATA_MEM_HOST_OFFSET};
 
+// ============================================================================
+// Processor Bus window
+// ============================================================================
+//
+// When a core enables its Processor Bus (Core_Processor_Bus register), a
+// 256KB window at byte addresses 0x80000–0xBFFFF in the core's data
+// address space is redirected to the tile's configuration registers
+// instead of data memory.
+//
+// The base address is (EAST + 1) * MEMORY_SIZE = 8 * 64KB = 0x80000.
+// The window spans 4 * MEMORY_SIZE = 4 * 64KB = 256KB.
+//
+// Source: AM025 §"Core Processor Bus" + emulator behavioral observation.
+// aie-rt `xaiemlgbl_reginit.c` `AieMlCoreProcBusCtrlReg` registers the
+// enable bit; the address window itself is defined in AM025 Table 3-n.
+
+/// Base address of the processor bus window in the core's data address space.
+///
+/// The core accesses tile configuration registers through this window when
+/// `tile.processor_bus_enabled` is true. Derived as `(cardinal::EAST + 1)
+/// * compute::MEMORY_SIZE`.
+pub const PROC_BUS_BASE: u32 =
+    (cardinal::EAST as u32 + 1) * compute::MEMORY_SIZE as u32;
+
+/// Exclusive end address of the processor bus window (base + 256KB).
+///
+/// The window spans 4 × `compute::MEMORY_SIZE` (= 4 × 64KB = 256KB).
+pub const PROC_BUS_END: u32 = PROC_BUS_BASE + 4 * compute::MEMORY_SIZE as u32;
+
 /// AIE data memory base in the core's data address space.
 ///
 /// This is the East cardinal direction (local memory for AIE2) base
