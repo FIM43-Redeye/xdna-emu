@@ -110,7 +110,60 @@ Files: `control.rs`, `stream.rs`, `cascade.rs`.
 
 Files: `memory/mod.rs`, `memory/neighbor.rs`. (Deep dive for `mod.rs`.)
 
-(Filled in by Task 1 Step 5.)
+### `memory/mod.rs` (deep dive)
+
+- **Size + responsibility.** 3049 lines; the `MemoryUnit` struct handling the full load/store surface: scalar loads/stores, vector load-A/load-B/4x-gather, fused load+compute (vlda.ups, vlda.conv), fused compute+store (vst.srs, vst.pack, vst.conv), vector store, partial-word stores (deferred RMW model for st.s8/st.u8/st.s16/st.u16), bank-conflict recording, and the processor-bus window (read/write to tile config registers via 0x80000). The file also contains `read_memory()` / `write_memory()` as arch-generic primitives.
+
+- **AIE2 hardcode count.** ~40 matches. Key load-bearing instances:
+  - `const OFFSET_MASK: u32 = xdna_archspec::aie2::compute::MEMORY_SIZE as u32 - 1` (line 43) -- already archspec-sourced.
+  - `// AIE2 cores use a 20-bit data address space... CardDir 7=East(local on AIE2)` (lines 47-51).
+  - `// On AIE2 (IsCheckerBoard=0), East is always the local tile's own memory` (line 20-22) -- architectural statement about the checkerboard flag; the flag itself is already in archspec as `compute::IS_CHECKERBOARD`.
+  - `// AIE2 partial-word stores... II_STHB operand latency = 7 in AIE2Schedule.td` (line 314-316).
+  - `// On AIE2, all data memory accesses... have the same pipeline depth (7 cycles)` (line 65).
+  - `// On AIE2, core loads have the same pipeline latency for ALL data...` (line 2445).
+  - `// On AIE2, core loads from neighbor memory have the SAME pipeline` (line 2994).
+  - `const PROC_BUS_BASE: u32 = 0x80000` (line 1386, 1491) -- the processor bus base address for accessing tile config registers; not yet in archspec.
+  - `const PROC_BUS_END: u32 = 0xC0000` (line 1387) -- processor bus window size (256KB); not yet in archspec.
+
+- **Structural breakdown.** The 3049 lines decompose into recognizable subsystems:
+  - **Entry point / dispatch** (lines 83-181): `MemoryUnit::execute()` dispatches on `op.semantic` × `op.is_vector` × `op.slot` to one of ~13 handler functions.
+  - **Scalar load/store** (lines 183-291): `execute_load()` / `execute_store()` -- bank conflict tracking, address decode, deferred write for partial-width stores.
+  - **Vector loads** (lines 343-573): `execute_vector_load_a()`, `execute_vector_load_b()`, `execute_vector_load_4x()`, `execute_vector_load_unpack()` -- each reads 256-bit aligned blocks from memory, with element-width-driven decode.
+  - **Fused load+compute** (lines 765-865): `execute_fused_load_ups()`, `execute_fused_load_convert()` -- load from memory, then apply SRS/UPS pipeline in-register.
+  - **Fused compute+store** (lines 866-1090): `execute_fused_store_srs()`, `execute_fused_store_pack()`, `execute_fused_store_convert()` -- apply pipeline operation, then store.
+  - **Vector store** (lines 1092-1348): `execute_vector_store()` with deferred partial-word mechanics.
+  - **Memory primitives** (lines 1370-1700): `read_memory()`, `write_memory()`, `read_vector_from_memory()`, `write_vector_to_memory()` -- the arch-generic read/write core using `MemoryQuadrant` routing, which is already archspec-driven.
+  - **Test suite** (lines 1731+): 1300+ lines of unit tests covering scalar/vector loads and stores across all cardinal directions.
+
+- **Arch-generic vs arch-specific split.** The vast majority of the code is arch-generic in algorithm:
+  - The element-width dispatch tables (8-bit, 16-bit, 32-bit loads) are data-driven by `ElementType` and `MemWidth`, not by AIE2-specific enumerations.
+  - The CardDir routing (`decode_data_address`, `MemoryQuadrant`) already reads from archspec constants (`compute::MEMORY_SIZE`, `cardinal::EAST`, `compute::IS_CHECKERBOARD`).
+  - The bank-conflict tracking delegates to `tile.num_banks()` which reads from the tile's archspec-derived configuration.
+  - The deferred load latency (`LATENCY_MEMORY = 7`) is the primary remaining hardcode; it lives in `timing/latency.rs` (not here) but is consumed via `load_latency_for_address()` (line 74-76), which currently always returns 7.
+  - **Arch-specific fragments:** The processor bus addresses (`PROC_BUS_BASE = 0x80000`, `PROC_BUS_END = 0xC0000`) are hardcoded raw constants not yet in archspec. These are addresses into the tile's configuration register space and differ from the data memory address space.
+
+- **Key question: does this justify a `memory_load`/`memory_store` trait method?** No. The memory dispatch algorithm (element-type dispatch, CardDir routing, bank conflict tracking) is uniform across AIE1/AIE2/AIE2P. The only divergence is:
+  1. Which CardDir maps to local (East=local on AIE2, alternates on AIE1/checkerboard) -- already handled via `compute::IS_CHECKERBOARD` in archspec.
+  2. The processor bus base address -- a constant, not an algorithm.
+  3. Load latency -- a constant consumed from `timing/latency.rs`.
+  All are *values*, not *shapes*. Memory load/store stays as arch-generic code reading archspec constants via `arch_handle::*` accessors.
+
+- **Data migration candidates.** 
+  - `PROC_BUS_BASE = 0x80000` and `PROC_BUS_END = 0xC0000`: move to archspec as `compute::PROC_BUS_BASE` and `compute::PROC_BUS_WINDOW_SIZE` (or derive from existing memory map constants). ~2 constants.
+  - `load_latency_for_address()` (line 74-76): currently returns `LATENCY_MEMORY` regardless of address. Should consume `xdna_archspec::aie2::timing::DATA_MEMORY_LATENCY` directly (already exists in archspec). The indirection via `timing/latency.rs::LATENCY_MEMORY` is the only remaining duplication.
+
+- **Prescribed migration verb.** `read-archspec-via-accessor` (for the 2 processor bus constants and the latency indirection).
+- **Estimated LOC impact.** ~10 lines changing in xdna-emu; ~10 lines added to archspec (processor bus constants extension).
+
+### `memory/neighbor.rs`
+
+- **Size + responsibility.** 166 lines; `NeighborMemory` struct providing lazy copy-on-access snapshots of adjacent tiles' data memory (indexed by `MemoryQuadrant`), with a write-buffer for deferred cross-tile stores applied after the core step.
+- **AIE2 hardcode count.** 1: `use xdna_archspec::aie2::SHIM_ROW` (line 8) -- already archspec-sourced.
+- **Divergence risks vs AIE1/AIE2P.** The AIE1 checkerboard topology (East is a real neighbor on some rows, local on others) is explicitly noted in comments (line 29-32); the code already handles this correctly because `MemoryQuadrant::from_address()` maps CardDir to the appropriate quadrant based on `IS_CHECKERBOARD`. No algorithmic changes are needed for AIE1. AIE2P is expected to be identical.
+- **Prescribed migration verb.** `leave-alone`.
+- **Estimated LOC impact.** 0.
+
+**Deep-dive summary.** `memory/mod.rs` is predominantly arch-generic. The address routing is already data-driven from archspec constants (`MEMORY_SIZE`, `IS_CHECKERBOARD`, `cardinal::*`). The two remaining hardcodes are the processor bus base address (0x80000/0xC0000, ~2 constants to migrate) and the load latency indirection (which already exists in archspec as `timing::DATA_MEMORY_LATENCY`, just not yet consumed directly). No `IsaExecutor` trait method is warranted for the memory subsystem: all divergence is reducible to data constants. `neighbor.rs` is clean. The AIE1 checkerboard-local ambiguity is already handled architecturally.
 
 ## 4. Vector ALU
 
