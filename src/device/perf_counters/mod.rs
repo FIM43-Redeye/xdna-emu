@@ -110,14 +110,17 @@ impl Default for CounterState {
 /// Performance counters are event-driven. Call `handle_event()` whenever
 /// a hardware event fires in the owning module. If the event matches a
 /// counter's start, stop, or reset event, the counter transitions state.
-/// Call `tick()` once per cycle to increment all active counters.
+/// Call `tick_active_cycles()` or `tick_idle_cycles()` once per cycle to
+/// increment active counters. ACTIVE_CORE-configured counters (event 0x1C)
+/// are level-gated: they tick only during cycles when the core is in
+/// Execute state.
 ///
 /// # Threshold Events
 ///
 /// When a counter value reaches its configured `event_value`, the counter
 /// generates a `PERF_CNT_N` event. The caller is responsible for routing
-/// this event back into the tile's event system. `tick()` returns a list
-/// of counter indices that fired threshold events this cycle.
+/// this event back into the tile's event system. The per-cycle tick methods
+/// return a list of counter indices that fired threshold events this cycle.
 #[derive(Debug, Clone)]
 pub struct PerfCounterBank {
     /// Number of valid counters in this module (2 or 4).

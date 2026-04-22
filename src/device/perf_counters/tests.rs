@@ -1,3 +1,9 @@
+// Legacy `tick()` call sites predate the active/idle split (Task 9, Phase D.2).
+// They behave identically to `tick_active_cycles()` via the deprecated shim;
+// migration is incremental. Allow the warnings here so the module build stays
+// clean until the legacy call sites are rewritten.
+#![allow(deprecated)]
+
 use super::*;
 
 // -- Construction and defaults --
@@ -666,10 +672,10 @@ fn active_core_ticks_only_while_core_active() {
 
 #[test]
 fn pulse_event_counter_ticks_in_both_states() {
-    // A counter started by a non-ACTIVE_CORE event (e.g., LOCK_ACQUIRE = 0x2E per
-    // aie-rt xaie_events_aieml.h) should behave as before: tick whenever Active,
-    // regardless of core state.
-    const EVENT_LOCK_ACQUIRE: u8 = 0x2E;
+    // A counter started by a non-ACTIVE_CORE event (e.g.,
+    // INSTR_LOCK_ACQUIRE_REQ = 0x2C per aie-rt xaie_events_aieml.h) should
+    // behave as before: tick whenever Active, regardless of core state.
+    const EVENT_LOCK_ACQUIRE: u8 = 0x2C;
     let mut bank = PerfCounterBank::new(4);
     bank.write_control_start_stop(EVENT_LOCK_ACQUIRE as u32, 0, 1, 7);
     bank.handle_event(EVENT_LOCK_ACQUIRE);
