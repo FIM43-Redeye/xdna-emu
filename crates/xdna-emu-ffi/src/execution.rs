@@ -104,6 +104,15 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
     // NPU instructions arrive through firmware + NoC).  Without this,
     // maskwrite/blockwrite instructions modify tile memory before the
     // core's init loop has written its initial values.
+    //
+    // NOTE: warm-up cycles count against `max_cycles`. For small budgets
+    // (e.g. `max_cycles=1` for smoke tests), the warm-up alone can exhaust
+    // the budget and the run loop below won't execute a single cycle of
+    // real work -- you'll see `halt_reason=Budget` with `cycles == warm-up
+    // count`. This is acceptable for the cycle-budget use case (any real
+    // test needs a budget much larger than 100k), but documented here so
+    // a smoke-test-sized budget isn't mistaken for a "kernel did nothing"
+    // signal.
     if handle.engine.enabled_cores() > 0 && !handle.npu_executor.is_done() {
         const MAX_WARMUP: u64 = 100_000;
         while cycles < MAX_WARMUP {

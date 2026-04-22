@@ -90,8 +90,23 @@ private:
 
     // -- Result / status types (mirrored from xdna_emu.h) -------------------
     // We only need these as typedefs for the function pointers.
+    //
+    // LAYOUT MUST MATCH `XdnaEmuExecStatus` in
+    // crates/xdna-emu-ffi/src/lib.rs. Field order and sizes here are
+    // load-bearing: the Rust cdylib returns this struct by value via
+    // the C ABI. Appending new fields is safe; reordering is not.
     using Result = int;          // XdnaEmuResult enum (0 = success)
-    struct ExecStatus { Result result; uint64_t cycles; int halted; };
+    enum HaltReason : int {      // Mirrors Rust `XdnaEmuHaltReason`.
+        HALT_COMPLETED = 0,
+        HALT_BUDGET    = 1,
+        HALT_ERROR     = 2,
+    };
+    struct ExecStatus {
+        Result     result;
+        uint64_t   cycles;
+        int        halted;       // bool in Rust, int here -- same 4-byte slot on x86_64
+        HaltReason halt_reason;  // Added alongside FFI halt_reason field.
+    };
 
     // -- Existing FFI -------------------------------------------------------
     using fn_create             = XdnaEmuHandle* (*)();

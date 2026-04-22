@@ -2,9 +2,10 @@
 //
 // Integration tests for xdna_emu_set_max_cycles + halt_reason.
 //
-// Uses the FFI crate's rlib (lib name `xdna_emu`) directly via the
-// `xdna_emu_ffi` alias to avoid confusion with the upstream `xdna-emu`
-// crate (which was renamed to `xdna_emu_core` in the FFI crate's deps).
+// Uses the FFI crate's rlib (lib name `xdna_emu`). The FFI crate imports
+// the core xdna-emu crate as `xdna_emu_core` to avoid a lib-name
+// collision; the FFI crate's own lib name is still `xdna_emu`, so this
+// test imports from `xdna_emu::` directly.
 
 use xdna_emu::{
     xdna_emu_create, xdna_emu_destroy, xdna_emu_run, xdna_emu_set_max_cycles,
