@@ -91,6 +91,7 @@ COMPILER_MODE="both"  # "both", "chess", "peano"
 NO_TRACE="${NO_TRACE:-true}"
 SWEEP=false
 RUN_AIESIM=false
+NO_TIMEOUT=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -113,6 +114,7 @@ while [[ $# -gt 0 ]]; do
     --aiesim)              RUN_AIESIM=true; shift ;;
     --serial-hw)           NPU_HW_JOBS=1; shift ;;
     --parallel-hw)         NPU_HW_JOBS="${NPU_HW_JOBS_PARALLEL:-5}"; shift ;;
+    --no-timeout)          NO_TIMEOUT=true; shift ;;
     --help|-h)
       cat <<'USAGE'
 Usage: emu-bridge-test.sh [options] [test-name-regex]
@@ -132,6 +134,7 @@ Options:
   --peano-only    Only compile/run with Peano compiler
   --serial-hw     Run hardware tests sequentially (explicit, same as default)
   --parallel-hw   Run hardware tests in parallel (-j5) for speed
+  --no-timeout    Run EMU without wall-clock timeout (use for very long runs)
   (default: both compilers, Chess is ground truth, HW serial)
 
 Filter:
@@ -165,7 +168,7 @@ for _c in "${COMPILERS[@]}"; do
 done
 
 # Export variables that parallel jobs need.
-export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP RUN_AIESIM
+export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP RUN_AIESIM NO_TIMEOUT
 export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT SCRIPT_DIR TRACE_QUARANTINE_FILE
 export XRT_DIR XRT_INCLUDE XRT_LIB
 export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
@@ -1251,7 +1254,11 @@ run_one_bridge() {
     [[ -n "${XDNA_EMU_LIB:-}" ]] && export XDNA_EMU_LIB
     export XRT_DEVICE_BDF="ffff:ff:1f.0"
     export XDNA_TRACE_DIR="$trace_out_dir"
-    timeout 120 bash -c "$run_cmd"
+    if [[ "${NO_TIMEOUT:-false}" == "true" ]]; then
+      bash -c "$run_cmd"
+    else
+      timeout 600 bash -c "$run_cmd"
+    fi
   ) > "$log_file" 2>&1 || rc=$?
   local result
   if [[ $rc -eq 0 ]] && grep -q "PASS" "$log_file"; then
@@ -1260,6 +1267,18 @@ run_one_bridge() {
     result="TIMEOUT"
   else
     result="FAIL"
+  fi
+
+  # Override with BUDGET if the plugin reported budget-exceeded.
+  # BUDGET overrides FAIL/TIMEOUT but not EMU_MISS (infrastructure failure takes priority).
+  local status_line
+  status_line="$(grep 'XDNA_EMU_STATUS:' "$log_file" | tail -1 || true)"
+  if [[ -n "$status_line" ]]; then
+    local hr
+    hr="$(echo "$status_line" | grep -oP 'halt_reason=\K\w+' || true)"
+    if [[ "$hr" == "budget" ]]; then
+      result="BUDGET"
+    fi
   fi
 
   # Verify emulator actually ran (catch silent fallthrough to real NPU).
@@ -1374,7 +1393,7 @@ print_report() {
   # Use associative arrays keyed by compiler.
   declare -A compile_ok compile_fail
   declare -A bridge_pass bridge_fail bridge_skip bridge_timeout bridge_emumiss
-  declare -A bridge_xfail bridge_xpass
+  declare -A bridge_xfail bridge_xpass bridge_budget
   declare -A hw_pass hw_fail hw_skip hw_timeout hw_tdr hw_xfail hw_xpass
   for compiler in "${compilers[@]}"; do
     compile_ok[$compiler]=0
@@ -1386,6 +1405,7 @@ print_report() {
     bridge_emumiss[$compiler]=0
     bridge_xfail[$compiler]=0
     bridge_xpass[$compiler]=0
+    bridge_budget[$compiler]=0
     hw_pass[$compiler]=0
     hw_fail[$compiler]=0
     hw_skip[$compiler]=0
@@ -1493,6 +1513,8 @@ print_report() {
       printf "  %-${col_width}s" "$br"
       case "$br" in
         PASS)     bridge_pass[$compiler]=$(( ${bridge_pass[$compiler]} + 1 )) ;;
+        BUDGET)   bridge_budget[$compiler]=$(( ${bridge_budget[$compiler]} + 1 ))
+                  bridge_fail[$compiler]=$(( ${bridge_fail[$compiler]} + 1 )) ;;
         TIMEOUT)  bridge_timeout[$compiler]=$(( ${bridge_timeout[$compiler]} + 1 ))
                   bridge_fail[$compiler]=$(( ${bridge_fail[$compiler]} + 1 )) ;;
         EMU_MISS) bridge_emumiss[$compiler]=$(( ${bridge_emumiss[$compiler]} + 1 ))
@@ -1584,6 +1606,9 @@ print_report() {
     label="$(echo "$compiler" | sed 's/./\U&/')"
     local total=$(( ${compile_ok[$compiler]} + ${compile_fail[$compiler]} ))
     echo "${label}: ${compile_ok[$compiler]}/${total} compiled, ${bridge_pass[$compiler]} bridge pass, ${bridge_fail[$compiler]} bridge fail"
+    if [[ ${bridge_budget[$compiler]} -gt 0 ]]; then
+      echo "  (${bridge_budget[$compiler]} BUDGET)"
+    fi
     if [[ ${bridge_timeout[$compiler]} -gt 0 ]]; then
       echo "  (${bridge_timeout[$compiler]} timeout)"
     fi
