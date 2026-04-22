@@ -12,6 +12,7 @@
 #include "transport.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 
 // Forward-declare the opaque handle so we don't pull in xdna_emu.h here.
@@ -169,6 +170,9 @@ private:
 
     // Counter for generating unique buffer addresses in fallback mode.
     uint64_t        next_alloc_addr_ = 0x100000000ULL;
+
+    // Cycle budget set from XDNA_EMU_MAX_CYCLES (0 = unbounded).
+    uint64_t        max_cycles_budget_ = 0;
 
     // -- Resolved function pointers (existing) ------------------------------
     fn_create             sym_create_             = nullptr;
