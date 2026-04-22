@@ -42,7 +42,39 @@ Two files get ~2 pages each: `vmac_routing.rs` and `memory/mod.rs`.
 Files: `execute/mod.rs`, `semantic.rs`, `cycle_accurate.rs`,
 `vector_dispatch.rs`.
 
-(Filled in by Task 1 Step 3.)
+### `mod.rs`
+
+- **Size + responsibility.** 160 lines; declares all execute submodules and re-exports the six top-level units (`CycleAccurateExecutor`, `VectorAlu`, `MemoryUnit`, `ControlUnit`, `StreamOps`, `CascadeOps`), plus the module-level dispatch-chain diagram in its doc comment.
+- **AIE2 hardcode count.** 0 direct AIE2 identifiers; the doc comment describes the 384-bit cascade link and the dispatch chain, but contains no arch-branded constants. All references to hardware specifics are in prose comments only.
+- **Divergence risks vs AIE1/AIE2P.** The dispatch chain order (`semantic -> VectorAlu -> MemoryUnit -> CascadeOps -> StreamOps -> ControlUnit`) is architectural: AIE1 has no cascade link, so `CascadeOps` would be a no-op. AIE2P is a superset and the order is expected to be identical. Risk is low -- the module is pure plumbing.
+- **Prescribed migration verb.** `leave-alone`. The dispatch chain is arch-generic; nothing here is a hardcoded value.
+- **Estimated LOC impact.** 0 xdna-emu changes; 0 archspec additions.
+
+### `semantic.rs`
+
+- **Size + responsibility.** 1678 lines; TableGen-driven scalar dispatch for ~40 `SemanticOp` variants covering arithmetic, bitwise, shift, comparison, pointer ops, sign/zero extension, control register writes (crSat, crRnd, crSRSSign, mask registers), and the cycle counter read.
+- **AIE2 hardcode count.** 27 matches. Key instances: (1) `// The counter is 32-bit on AIE2 (wraps at 2^32)` (line 154); (2) control register IDs `9` (crSat), `6` (crRnd), `8` (crSRSSign), `16-19` (q0-q3), `28-31` (ql0-ql3), `32-35` (qh0-qh3) embedded as magic integers in the `write_dest` match arm (lines 280-318); (3) `// AIE2 has a unique flag architecture` in the module doc (line 30); (4) per-op comments like `// AIE2: ADD sets the Carry flag` citing TableGen Defs (lines 390, 400, 446, etc.); (5) `/// Per AIE2InstrPatterns.td section 4.1.11` (lines 607, 624). The carry flag comments and TableGen cross-references are documentation only; the control-register IDs at lines 280-318 are load-bearing hardcodes.
+- **Divergence risks vs AIE1/AIE2P.** The control-register ID assignments (crSat=9, crRnd=6, crSRSSign=8, q0-q3=16-19, ql0-ql3=28-31, qh0-qh3=32-35) are derived from `AIE2GenRegisterInfo.td`. AIE1 has a different special-register layout (different IDs, no qh/ql split). The `SemanticOp::ReadCycleCounter` handler wraps the counter at 32 bits (line 154), which matches AIE2; AIE1 documentation does not specify a different width but should be verified. The carry flag semantics (ADD/SUB set carry, MUL/AND/OR do not) appear identical between AIE1 and AIE2 based on llvm-aie `AIEBaseInstrInfo.td`. Scalar arithmetic algorithms are arch-generic.
+- **Prescribed migration verb.** `read-archspec-via-accessor`. The control-register IDs should move to archspec (extend `xdna_archspec::aie2::registers` or a new `aie2::ctrl_regs` submodule). The scalar algorithms and flag semantics stay in xdna-emu; they read arch-specific IDs via accessor at runtime.
+- **Estimated LOC impact.** ~30 lines changing in xdna-emu (replace 7 literal match arms with archspec constants); ~40 lines added to archspec (new `ctrl_register_ids` module or extension of `registers`).
+
+### `cycle_accurate.rs`
+
+- **Size + responsibility.** 958 lines; the `CycleAccurateExecutor` struct and its `execute_internal` implementation covering: VLIW bundle dispatch (slots executed in `LoadA -> LoadB -> Store -> Scalar0 -> Scalar1 -> Vector -> Accumulator -> Control` order), pre-flight stall detection for cascade and stream ops, VLIW snapshot semantics, deferred load/store commit, hazard recording, branch delay slot bookkeeping, and timing-context event emission.
+- **AIE2 hardcode count.** 9 matches. Key instances: `LatencyTable::aie2()` (line 87, constructs from LLVM FFI); `// AIE2 uses a write-back pipeline WITHOUT a hardware scoreboard` (line 302); `// AIE2 uses pure VLIW semantics` (line 427); `// AIE2 uses pure VLIW semantics... AIE2Schedule.td` (line 429); `// AIE2 has 5 delay slots` (line 536); `// per AIE2 quadrant mapping` (line 256). The most load-bearing is `LatencyTable::aie2()` at line 87 -- this is an explicit arch-dispatch call.
+- **Divergence risks vs AIE1/AIE2P.** The 5-delay-slot rule is AIE2-specific (per `AIE2Schedule.td`; AIE1 has 6 delay slots per `AIE1InstrInfo.td`). The no-scoreboard write-back pipeline rule is AIE2-specific (AIE1 uses a scoreboard per `aie-rt` scheduling docs). The VLIW slot order is tied to the 8-slot AIE2 VLIW format; AIE1 has fewer slots. These are all _shape_ divergences. However, no timing values are hardcoded in this file -- they all delegate to `LatencyTable` and `HazardDetector`. The delay-slot count (5) is the clearest AIE2-specific constant in the execute path (line 536 comment references hardware but the 5-count is implicit in `tick_delay_slots`).
+- **Prescribed migration verb.** `read-archspec-via-accessor`. The file delegates timing to `LatencyTable` (already archspec-driven) and hazard detection to the timing submodule. The 5-delay-slot behavior and scoreboard-vs-no-scoreboard rules are behavioral differences that would eventually need a trait method or config accessor if AIE1 is added. For Subsystem 7, no change is needed -- this file is already mostly arch-generic. The `LatencyTable::aie2()` call is the seam; it should eventually become `LatencyTable::for_arch(arch_handle::processor_model())`, but that is a naming refactor, not a behavioral migration.
+- **Estimated LOC impact.** 0-5 xdna-emu changes (if delay-slot count is moved to archspec); 0 archspec additions (delay slots already in `processor::BRANCH_DELAY_SLOTS`).
+
+### `vector_dispatch.rs`
+
+- **Size + responsibility.** 111 lines; single `VectorAlu::execute()` entry point that pattern-matches on `SemanticOp` variants and dispatches to the individual `vector_*.rs` implementations.
+- **AIE2 hardcode count.** 0 direct arch-branded constants. Imports `xdna_archspec::aie2::isa::SemanticOp` (explicit arch crate, but this is the same pattern as all other execute files -- they all target AIE2).
+- **Divergence risks vs AIE1/AIE2P.** The dispatch table itself is `SemanticOp`-driven and arch-generic. However, two arms warrant note: (1) the SRS/UPS/Pack/Unpack/Convert fused-memory guard (lines 31-37) checks `op.slot.is_memory()` to avoid double-handling -- this is AIE2 slot semantics; (2) the MAC dispatch arm (lines 102-108) routes to `execute_matmul`, which is currently AIE2-only. If AIE1 MAC semantics differ, this arm would need a trait-method dispatch. For now, `leave-alone`.
+- **Prescribed migration verb.** `leave-alone`.
+- **Estimated LOC impact.** 0 xdna-emu changes; 0 archspec additions.
+
+**Area summary.** The dispatcher/orchestration area is almost entirely arch-generic. The only genuine arch-specific content is the control-register IDs hardcoded in `semantic.rs` (8 magic integers mapping to crSat, crRnd, crSRSSign, and the q-register banks) and the implicit 5-delay-slot assumption in `cycle_accurate.rs` (where `processor::BRANCH_DELAY_SLOTS` is already in archspec but not yet consumed). Neither finding warrants an `IsaExecutor` trait method: both are *values* (register IDs, slot counts) not *shapes* (different algorithms). Migration verbs: `semantic.rs` → `read-archspec-via-accessor` for control register IDs; `cycle_accurate.rs` → wiring `LatencyTable` to processor model already in archspec (no new archspec additions needed). The remaining two files are `leave-alone`.
 
 ## 2. Scalar / control / stream / cascade
 
