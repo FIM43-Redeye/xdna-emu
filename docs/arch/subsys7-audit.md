@@ -410,13 +410,105 @@ Already audited in Section 1. The only timing-relevant finding is `LatencyTable:
 
 ## Closing summary
 
-(Filled in by Task 1 Step 9.)
+The audit covered all 20 files in `src/interpreter/execute/` plus 9 files in
+`src/interpreter/timing/` (29 files, ~23,000 lines). The central question from
+the spec -- whether `IsaExecutor` will have 0, 2-3, or 5+ methods -- is now
+answered:
+
+**Zero trait methods are warranted.** Every candidate divergence point (SRS
+rounding mode set, VMAC crossbar routing, accumulator widths, shuffle routing
+table, cascade presence) reduces to a data difference addressable by archspec
+constants or tables, not an algorithmic difference requiring per-arch code
+paths. This is Approach A from the spec.
+
+The two files closest to requiring a trait method were `cascade.rs` (AIE1 has
+no cascade link at all) and `vmac_routing.rs` (the routing tables are
+AIE2-specific). Both resolved as data/feature-flag rather than shape: cascade
+absence is captured by `has_cascade_link: bool` in archspec processor data,
+and VMAC routing is a pure table-lookup algorithm that works identically for
+any arch's tables.
+
+The timing subsystem is already 80% archspec-driven; `timing/memory.rs` is the
+exemplary file with every constant already sourced from `xdna_archspec`.
+`timing/latency.rs` is the largest gap, carrying 8 raw numeric literals that
+duplicate archspec values.
+
+The execute subsystem has two large data blobs that need to move:
+`vmac_routing.rs` (2862 lines of crossbar tables -- already `include!`'d,
+making the move mechanical) and `vector_permute.rs`'s `SHUFFLE_ROUTING` table
+(3072 bytes, hardware-probed). Both are pure data with zero algorithm.
+
+RoundingMode duplication (same 10-variant enum defined twice, in `vector_srs.rs`
+and `vector_float.rs`) is the only consolidation target across execute files;
+moving it to archspec resolves both duplication and arch-specificity in one
+step.
+
+The ISA execute subsystem has no algorithmic shape divergence between AIE2 and
+AIE1. The executor stays as a single concrete type. `IsaExecutor` is not needed
+as a trait; if one is added later for extensibility it will have zero required
+methods (all default implementations).
 
 ### Tentative trait method list
 
+None. The audit found zero methods warranted. `IsaExecutor` (if added at all)
+is a marker trait with only default implementations.
+
+Candidates examined and rejected:
+
+| Candidate | Why rejected |
+|-----------|-------------|
+| `fn vmac_route(mbit, pmode)` | Pure table-index arithmetic; same algorithm any arch; only tables differ |
+| `fn srs_round(mode, val)` | Rounding algorithms (sgn/lsb/grd/stk signals) are arch-generic standard logic; only mode-index set differs |
+| `fn cascade_width()` | Presence/absence is a feature flag, not a shape difference |
+| `fn memory_quadrant(addr)` | Address decoding is identical; only `MEMORY_SIZE` constant differs (already in archspec) |
+
 ### Data migration list
 
+Items are ordered by size of change (largest first). All verbs reference the
+archspec migration taxonomy defined in the spec.
+
+| Item | Source file | Verb | archspec module | Est. LOC change |
+|------|------------|------|-----------------|-----------------|
+| VMAC crossbar tables (`PRMX_*`, `PRMY_*`) | `vmac_routing.rs` (2862 lines) | move-to-archspec | `aie2::vmac` | −2862 in execute, +2862 in archspec |
+| `SHUFFLE_ROUTING: [[u8;64];48]` + `MacPermuteMode` enum | `vector_permute.rs` | move-to-archspec | `aie2::permute` | −~3200 in execute, +~3200 in archspec |
+| `RoundingMode` enum (10 modes, deduplicate) | `vector_srs.rs` + `vector_float.rs` | move-to-archspec | `aie2::srs` | −~100 (two copies) in execute, +~60 in archspec |
+| `DENSE_GEOMETRY_TABLE` + `SPARSE_GEOMETRY_TABLE` | `vector_config.rs` | move-to-archspec | `aie2::matmul` | −~30 in execute, +~30 in archspec |
+| UPS mode table in `ups_mode()` | `vector_ups.rs` | move-to-archspec | `aie2::ups` | −~10 in execute, +~15 in archspec |
+| `has_cascade_link: bool` flag | (new addition) | move-to-archspec | `aie2::processor` | +1 in archspec |
+| Cascade width constant `CASCADE_WORDS = 6` | `cascade.rs` | move-to-archspec | `aie2::processor` | −1 in execute, +1 in archspec |
+| Control register IDs (`crSat`, `crRnd`, `crSRSSign`, q-regs) | `semantic.rs` | read-archspec-via-accessor | `aie2::processor` | ~30 changing in execute |
+| Lock quadrant boundaries (0-15, 16-31, 32-47, 48-63) | `control.rs` | read-archspec-via-accessor | `aie2::locks` | ~20 changing in execute |
+| Latency constants (`LATENCY_MEMORY`, `LATENCY_SCALAR_MUL`, etc.) | `timing/latency.rs` | read-archspec-via-accessor | `aie2::timing` | ~20 changing, 0 added to archspec |
+| `PROC_BUS_BASE`, `PROC_BUS_END` literals | `memory/mod.rs` | read-archspec-via-accessor | `aie2::compute` | ~10 changing |
+| `LatencyTable::aie2()` constructor, delay-slot constant | `cycle_accurate.rs` | read-archspec-via-accessor | `aie2::processor` | ~10 changing |
+
 ### AIE1 projection
+
+An AIE1 port of the execute subsystem would require only archspec additions,
+not algorithm changes. The execute files would not need modification.
+
+Specifically: AIE1 uses 128-bit vectors (vs AIE2's 256-bit), 512-bit
+accumulators (vs AIE2's 1024-bit), and a checkerboard memory addressing
+pattern (East neighbor is cross-tile on some rows, local on others). It has no
+cascade link and no VMAC crossbar (different SIMD pipeline). Its rounding mode
+set differs from AIE2's 10-mode set.
+
+None of these differences require different execute algorithms:
+- Narrower vector/accumulator widths: the execute code already reads `VEC_BYTES`
+  from archspec; AIE1's value just differs.
+- Checkerboard: `memory/neighbor.rs` already reads `IS_CHECKERBOARD` and branches
+  correctly; AIE1 sets this true.
+- No cascade link: `cascade.rs` would guard all operations on `has_cascade_link`;
+  AIE1 sets this false and the cascade handlers become no-ops.
+- No VMAC crossbar: AIE1 uses a different multiply pipeline; the `vmac_hw.rs`
+  functions would not be called for AIE1 `VMAC` instructions. A separate
+  AIE1-specific matmul module would be added if AIE1 is ever targeted; the
+  AIE2 module is unaffected.
+- Different rounding modes: `RoundingMode` enum in archspec would have an AIE1
+  variant; the rounding algorithm (sgn/lsb/grd/stk signals) is the same.
+
+The execute subsystem is safe to extend to AIE1 purely through archspec data
+additions. This validates the "no trait, data migration only" conclusion.
 
 ---
 
