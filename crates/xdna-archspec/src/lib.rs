@@ -16,6 +16,7 @@
 pub mod aie2;
 pub mod device_model;
 pub mod dma;
+pub mod isa_execute;
 pub mod locks;
 pub mod stream_switch;
 pub mod model_builder;

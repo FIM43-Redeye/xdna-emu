@@ -199,6 +199,17 @@ pub trait ArchConfig: Send + Sync + std::fmt::Debug {
     /// Calls on `Architecture::Aie` (AIE1 / Versal) panic via
     /// `unimplemented!()` until an AIE1 model is populated.
     fn stream_switch_model(&self) -> &'static dyn crate::stream_switch::StreamSwitchModel;
+
+    // ========================================================================
+    // ISA Execute Model (Subsystem 7)
+    // ========================================================================
+
+    /// Per-arch ISA execute model (Subsystem 7 behavioral seam).
+    ///
+    /// Returns `&'static dyn IsaExecutor`. Ships empty per the
+    /// audit's Approach A conclusion (zero trait methods
+    /// warranted); attached for future seams.
+    fn isa_executor(&self) -> &'static dyn crate::isa_execute::IsaExecutor;
 }
 
 // ============================================================================
@@ -537,6 +548,17 @@ impl ArchConfig for ModelConfig {
             ),
         }
     }
+
+    fn isa_executor(&self) -> &'static dyn crate::isa_execute::IsaExecutor {
+        match self.architecture {
+            Architecture::Aie2 | Architecture::Aie2p => {
+                &crate::aie2::isa_execute_model::AIE2_ISA_EXECUTOR
+            }
+            Architecture::Aie => unimplemented!(
+                "AIE1 IsaExecutor not populated; Phase 1 refactor ships AIE2 seam only"
+            ),
+        }
+    }
 }
 
 // ============================================================================
@@ -742,6 +764,24 @@ mod tests {
                     "{}: AIE2-family must report supports_deterministic_merge = true",
                     name
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn isa_executor_dispatches_to_aie2_for_aie2_family() {
+        // Test with loaded NPU1 (AIE2) and NPU2 (AIE2P) models
+        for name in &["npu1", "npu2"] {
+            if let Some(model) = ARCHSPEC_MODELS.get(*name) {
+                let cfg = ModelConfig::from_arch_model(model, name);
+                let executor = cfg.isa_executor();
+                let expected: &dyn crate::isa_execute::IsaExecutor =
+                    &crate::aie2::isa_execute_model::AIE2_ISA_EXECUTOR;
+                // Both AIE2 and AIE2P should dispatch to the same singleton
+                assert!(core::ptr::eq(
+                    executor as *const _ as *const (),
+                    expected as *const _ as *const ()
+                ), "{}: isa_executor must dispatch to AIE2_ISA_EXECUTOR", name);
             }
         }
     }
