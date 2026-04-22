@@ -128,11 +128,26 @@ Key flags: `--chess-only`, `--peano-only`, `--no-hw`, `--compile`,
 
 ## Trace Pipeline
 
-Binary trace comparison between emulator and real NPU hardware:
-- `tools/trace-inject.py` -- inject trace routing into MLIR
-- `tools/trace-sweep.py` -- multi-batch sweep across event types
+Binary trace comparison between emulator and real NPU hardware. The legacy
+Python tools have been superseded by mlir-aie's declarative trace IRON API
+(Phase B of cycle-budget testing). Legacy tools remain in `tools/deprecated/`
+for reference.
+
+**Active pipeline:**
+- `tools/mlir-trace-inject.py` -- inject trace routing into MLIR (uses mlir-aie API)
+- `bridge-runner/bridge-trace-runner` -- multi-batch sweep orchestrator
+- `tools/trace-to-cycles.py` -- parse trace buffers and compute cycles
 - `src/bin/trace_compare.rs` -- Rust binary comparison (replaced Python OOM)
 - `src/trace/compare.rs` -- core comparison logic
 - `src/trace/vcd.rs` -- aiesimulator VCD parser
 
 Build: `cargo build --release --bin trace-compare`
+
+**Deprecated tools** (do not add new callers):
+- `tools/deprecated/trace-inject.py` -- legacy MLIR trace injection
+- `tools/deprecated/trace-sweep.py` -- legacy multi-batch orchestrator
+- `tools/deprecated/trace-trim.py` -- buffer trimming
+- `tools/deprecated/trace-merge.py` -- Perfetto JSON merge
+- `tools/deprecated/trace-patch-events.py` -- in-place event patching
+
+See `tools/deprecated/README.md`.

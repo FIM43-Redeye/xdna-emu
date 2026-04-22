@@ -472,16 +472,26 @@ Flags: `--chess-only`, `--peano-only`, `--no-hw`, `--compile`,
 Binary trace comparison between emulator and real NPU hardware. All traces
 converge to Perfetto JSON (viewable at ui.perfetto.dev).
 
+**Active pipeline:**
 | Tool | Purpose |
 |------|---------|
-| `tools/trace-inject.py` | Inject trace routing into MLIR (capacity planner, collision-aware IDs) |
-| `tools/trace-sweep.py` | Multi-batch event sweep orchestrator (pre-compiled artifacts, HW serial + EMU parallel) |
-| `tools/trace-trim.py` | Strip sentinel padding from raw trace buffers |
-| `tools/trace-merge.py` | Merge per-batch Perfetto JSON with TRUE anchor alignment |
-| `tools/trace-patch-events.py` | Patch event slots in compiled insts.bin without recompilation |
+| `tools/mlir-trace-inject.py` | Inject trace routing into MLIR (uses mlir-aie declarative API) |
+| `bridge-runner/bridge-trace-runner` | Multi-batch event sweep orchestrator |
+| `tools/trace-to-cycles.py` | Parse trace buffers and compute cycle budgets |
 | `src/bin/trace_compare.rs` | **Rust** binary trace comparison (replaced Python -- 65GB OOM -> 11MB) |
 
 Build: `cargo build --release --bin trace-compare`
+
+**Deprecated tools** (archive at `tools/deprecated/` for reference):
+| Tool | Original purpose |
+|------|------------------|
+| `tools/deprecated/trace-inject.py` | Inject trace routing into MLIR (capacity planner, collision-aware IDs) |
+| `tools/deprecated/trace-sweep.py` | Multi-batch event sweep orchestrator (pre-compiled artifacts, HW serial + EMU parallel) |
+| `tools/deprecated/trace-trim.py` | Strip sentinel padding from raw trace buffers |
+| `tools/deprecated/trace-merge.py` | Merge per-batch Perfetto JSON with TRUE anchor alignment |
+| `tools/deprecated/trace-patch-events.py` | Patch event slots in compiled insts.bin without recompilation |
+
+See `tools/deprecated/README.md` for rationale.
 
 ## XRT Plugin (`xrt-plugin/`)
 
