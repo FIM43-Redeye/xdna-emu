@@ -318,7 +318,7 @@ Create `/home/triple/npu-work/mlir-aie/runtime_lib/test_lib/include/cycle_counte
 // for cols outside the actual partition.
 //
 // Register offsets: Core module perf counter 0 control = 0x31500,
-// value = 0x31520. ACTIVE_CORE event ID on AIE2 = 0x24 (36 decimal), per
+// value = 0x31520. ACTIVE_CORE event ID on AIE2 = 0x1C (28 decimal), per
 // AM025 event enumeration and aie-rt xaiemlgbl_reginit.c.
 //
 // Failures on individual tiles (tile not in partition, XRT ioctl error)
@@ -343,7 +343,7 @@ class CycleCounterHelper {
 public:
     static constexpr uint32_t PERF_CTRL0_OFFSET     = 0x00031500;
     static constexpr uint32_t PERF_COUNTER0_OFFSET  = 0x00031520;
-    static constexpr uint8_t  EVENT_ACTIVE_CORE     = 0x24;
+    static constexpr uint8_t  EVENT_ACTIVE_CORE     = 0x1C;
 
     // NPU1 partition-relative cols: any context has start_col relative to
     // its own partition, so we probe cols 0..7 (covers the max partition
@@ -1228,7 +1228,7 @@ Add to `/home/triple/npu-work/xdna-emu/src/device/perf_counters/tests.rs` (near 
 
 ```rust
 /// ACTIVE_CORE event ID on AIE2 (per aie-rt xaiemlgbl_reginit.c).
-const EVENT_ACTIVE_CORE: u8 = 0x24;
+const EVENT_ACTIVE_CORE: u8 = 0x1C;
 
 #[test]
 fn active_core_ticks_only_while_core_active() {
@@ -1294,7 +1294,7 @@ In `/home/triple/npu-work/xdna-emu/src/device/perf_counters/mod.rs`, replace the
     /// ACTIVE_CORE event ID on AIE2 (per aie-rt xaiemlgbl_reginit.c).
     /// A counter whose start_event is this value is level-gated on the core
     /// Execute state.
-    const EVENT_ACTIVE_CORE: u8 = 0x24;
+    const EVENT_ACTIVE_CORE: u8 = 0x1C;
 
     /// Advance counters for a cycle during which the core is in Execute state.
     ///
@@ -1413,7 +1413,7 @@ git add src/device/perf_counters/mod.rs \
 git commit -m "perf_counters: gate ACTIVE_CORE ticks on core Execute state (Phase D.2)
 
 Splits tick() into tick_active_cycles() and tick_idle_cycles().
-Counters started by ACTIVE_CORE (event 0x24) only advance during
+Counters started by ACTIVE_CORE (event 0x1C) only advance during
 cycles when the core is running an instruction; pulse-started
 counters tick in both. Coordinator picks the variant per tile per
 cycle based on core state. Old tick() kept as a deprecated shim."
