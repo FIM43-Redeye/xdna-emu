@@ -1,5 +1,5 @@
 //! Process-global cache of architecture-level seams: lock value layout,
-//! stream-switch topology, and ISA execute model.
+//! stream-switch topology, ISA execute model, and instruction latency table.
 //!
 //! Exposes each as a fast accessor without forcing every caller to hold a
 //! `&dyn ArchConfig` or a `Tile`.
@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 use xdna_archspec::isa_execute::IsaExecutor;
 use xdna_archspec::locks::LockValueLayout;
 use xdna_archspec::stream_switch::StreamSwitchTopology;
+use crate::interpreter::timing::LatencyTable;
 
 static LOCK_VALUE_LAYOUT: OnceLock<&'static LockValueLayout> = OnceLock::new();
 
@@ -52,4 +53,20 @@ pub fn isa_executor() -> &'static dyn IsaExecutor {
     *ISA_EXECUTOR.get_or_init(|| {
         xdna_archspec::runtime::default_arch().isa_executor()
     })
+}
+
+static LATENCY_TABLE: OnceLock<LatencyTable> = OnceLock::new();
+
+/// Process-wide instruction latency table for the default architecture.
+///
+/// Lazily populated on first call by querying the LLVM MCDisassembler FFI
+/// for all instruction itinerary latencies. Subsequent calls return the
+/// cached reference with zero FFI overhead.
+///
+/// This seam replaces direct `LatencyTable::aie2()` calls at construction
+/// sites so that the table is built once and shared across all executors.
+/// When multi-arch support lands, this accessor will select the table based
+/// on the runtime arch rather than the hardcoded AIE2 constructor.
+pub fn latency_table() -> &'static LatencyTable {
+    LATENCY_TABLE.get_or_init(LatencyTable::aie2)
 }

@@ -25,12 +25,13 @@
 //! The AIE2 has 8 memory banks. Accessing the same bank from multiple ports
 //! in the same cycle causes a stall.
 
+use crate::device::arch_handle;
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{Operand, SlotOp, VliwBundle};
 use xdna_archspec::aie2::isa::SemanticOp;
 use crate::interpreter::state::{EventType, ExecutionContext};
 use crate::interpreter::timing::{
-    HazardDetector, HazardStats, LatencyTable, MemoryAccess, MemoryModel,
+    HazardDetector, HazardStats, MemoryAccess, MemoryModel,
 };
 use crate::interpreter::traits::{ExecuteResult, Executor};
 
@@ -57,8 +58,8 @@ pub struct CycleAccurateExecutor {
     /// Track call return address.
     pending_call_return_addr: Option<u32>,
 
-    /// Latency lookup table.
-    latencies: LatencyTable,
+    /// Latency lookup table (process-global, from arch_handle).
+    latencies: &'static crate::interpreter::timing::LatencyTable,
 
     /// Register hazard detector.
     hazards: HazardDetector,
@@ -81,10 +82,14 @@ pub struct CycleAccurateExecutor {
 
 impl CycleAccurateExecutor {
     /// Create a new cycle-accurate executor.
+    ///
+    /// The latency table is sourced from the process-global
+    /// `arch_handle::latency_table()` cache, which is populated once from
+    /// the LLVM FFI and reused across all executor instances.
     pub fn new() -> Self {
         Self {
             pending_call_return_addr: None,
-            latencies: LatencyTable::aie2(),
+            latencies: arch_handle::latency_table(),
             hazards: HazardDetector::new(),
             memory: MemoryModel::new(),
             total_hazard_stalls: 0,
@@ -533,11 +538,12 @@ impl CycleAccurateExecutor {
 
         // Emit branch event (no explicit penalty -- delay slots handle it).
         //
-        // AIE2 has 5 delay slots after every taken branch. The compiler
-        // fills them with useful work (or NOPs if it can't). Each delay
-        // slot instruction costs 1 cycle via record_instruction(1) like
-        // any other bundle. This naturally produces the correct branch
-        // cost: filled slots = 0 extra cycles, unfilled = 1 per NOP.
+        // AIE2 has `processor::BRANCH_DELAY_SLOTS` (= 5) delay slots after
+        // every taken branch. The compiler fills them with useful work (or
+        // NOPs if it can't). Each delay-slot instruction costs 1 cycle via
+        // record_instruction(1) like any other bundle. This naturally produces
+        // the correct branch cost: filled slots = 0 extra cycles, unfilled =
+        // 1 per NOP.
         //
         // Adding BRANCH_PENALTY_CYCLES on top of delay slots would
         // double-count: the pipeline flush IS the delay slots.
