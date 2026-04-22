@@ -172,7 +172,104 @@ Files: `vector_arith.rs`, `vector_compare.rs`, `vector_misc.rs`,
 `vector_semantic.rs`, `vector_permute.rs`, `vector_float.rs`,
 `vector_config.rs`, `vector_convert.rs`, `vector_validate.rs`.
 
-(Filled in by Task 1 Step 6.)
+### `vector_arith.rs`
+
+- **Size + responsibility.** 2468 lines; arithmetic, accumulate, and accumulator operations for the vector ALU -- `vector_addsub`, `execute_add`, `execute_binary_elementwise`, `execute_accumulate`, `execute_accum_wide` (for 512-bit bm and 1024-bit cm accumulator paths), and `execute_neg` on accumulators.
+- **AIE2 hardcode count.** 14. Key instances: `// AIE2 NaN semantics: when either operand is NaN, always return s1` (lines 254, 358); `aie2_acc_fp32_add` calls for bf16 accumulator add (lines 1613, 1626, 1627, 1658, 1668, 1669); `// Wide (cm, 1024-bit) vs narrow (bm, 512-bit) accumulator` (line 1586). The NaN semantics and fp32 accumulator paths are AIE2-specific behavior derived from hardware observation. The 512/1024-bit register widths are expressed via `VECTOR_REGISTER_BITS` from archspec (indirectly), but the hard branches on width in `execute_accum_wide` use literal `256/et.bits()` (line 1228).
+- **Divergence risks vs AIE1/AIE2P.** AIE2 NaN behavior (always produce AIE2 canonical NaN regardless of input sign) is hardware-specific and differs from IEEE 754. AIE1 may have different NaN canonicalization (not verified; `vector_float.rs` comment at line 308 notes the real hardware differs from the aietools Python model). Accumulator width (512/1024 bit) is AIE2-specific; AIE1 uses narrower accumulators.
+- **Prescribed migration verb.** `leave-alone` for the arithmetic algorithms; the `aie2_acc_fp32_add` function in `vector_float.rs` encapsulates AIE2-specific float behavior and is already factored out. The NaN behavior is AIE2 hardware ground truth; no constant to migrate.
+- **Estimated LOC impact.** 0.
+
+### `vector_compare.rs`
+
+- **Size + responsibility.** 920 lines; vector comparisons: `SetGe`, `SetLt`, `SetEq`, `MaxLt`, `MinGe`, `Cmp`, `VectorSelect`.
+- **AIE2 hardcode count.** 1 import of `xdna_archspec::aie2::isa::SemanticOp`; no load-bearing arch-specific constants in compare logic.
+- **Prescribed migration verb.** `leave-alone`.
+- **Estimated LOC impact.** 0.
+
+### `vector_misc.rs`
+
+- **Size + responsibility.** 931 lines; miscellaneous vector ops: absolute value variants (`AbsGtz`, `NegGtz`, `NegLtz`), conditional sub (`SubLt`, `SubGe`), and `MaxDiffLt`.
+- **AIE2 hardcode count.** 2 (import + one comment). No load-bearing arch constants.
+- **Prescribed migration verb.** `leave-alone`.
+- **Estimated LOC impact.** 0.
+
+### `vector_pack.rs`
+
+- **Size + responsibility.** 1035 lines; pack/unpack operations (`Pack`, `Unpack`) -- narrowing wide elements into packed byte lanes and widening.
+- **AIE2 hardcode count.** 1 (import). No load-bearing arch constants; the element-width dispatch is `ElementType`-driven.
+- **Prescribed migration verb.** `leave-alone`.
+- **Estimated LOC impact.** 0.
+
+### `vector_ups.rs`
+
+- **Size + responsibility.** 942 lines; UPS (upshift / type-widening) operations -- promotes narrow integer lanes to wider accumulator lanes with optional left shift.
+- **AIE2 hardcode count.** 4 (3 imports + `// Hardware behavior (derived from AIE2 architecture)` in doc). The UPS mode table (`ups_mode()` function at lines 63-70) is a 4-entry table encoding the valid lane/width combinations (8→32, 16→32, 16→64, 32→64). This table is logically archspec material; it describes what type-promotion paths the AIE2 multiply array supports.
+- **Divergence risks vs AIE1/AIE2P.** AIE1's narrower 128-bit vector unit would support fewer UPS modes (e.g., no 32-lane paths since that requires a 256-bit register). The mode table would change. This is a values-migration candidate.
+- **Prescribed migration verb.** `move-to-archspec`. The `ups_mode()` table (4 entries) should move to `xdna_archspec::aie2::isa` or processor module; the algorithm (sign extension + shift + mask) stays in xdna-emu.
+- **Estimated LOC impact.** ~10 lines changing in xdna-emu; ~15 lines added to archspec (UPS mode table with accessor).
+
+### `vector_srs.rs`
+
+- **Size + responsibility.** 1483 lines; SRS (Shift-Round-Saturate) rounding mode definitions (`RoundingMode` enum with 10 modes), BIAS constant (`SRS_SHIFT_BIAS` from archspec at line 32), rounding decision logic (`srs_round()`), saturation logic (`srs_saturate()`), and the `execute_srs` / `execute_srs_narrow` / `execute_srs_wide` dispatch.
+- **AIE2 hardcode count.** 7 (mostly doc references; `const BIAS: u32 = xdna_archspec::aie2::processor::SRS_SHIFT_BIAS as u32` at line 32 is already archspec-sourced).
+- **Divergence risks vs AIE1/AIE2P.** The 10-mode rounding set (Floor, Ceil, SymFloor, SymCeil, NegInf, PosInf, SymZero, SymInf, ConvEven, ConvOdd -- modes 0-3 and 8-13) is AIE2-specific. The rounding algorithms (based on `sgn`, `lsb`, `grd`, `stk` bits) are the same rounding-mode algorithms that IEEE 754 defines; only the index encoding and the set of supported modes differ per arch. AIE1's SRS supports a smaller set of rounding modes (not all 10; exact subset unknown without deeper AIE1 research). **This is the primary candidate for an `IsaExecutor` trait method** (`apply_srs`) -- but the pre-audit hypothesis needs refining. The rounding *algorithms* are arch-generic (the sgn/lsb/grd/stk computation is standard); only the valid *mode indices* differ. This means the divergence is in the `RoundingMode` enumeration and mode table, not in the algorithm itself. A simpler resolution: the rounding-mode enum (10 modes, with gaps at 4-7 and 14-15) is AIE2-specific data that could move to archspec, while the algorithm that executes a given `RoundingMode` stays in xdna-emu. An AIE1 port would populate a smaller rounding-mode table in archspec; the algorithm in xdna-emu would receive whichever mode archspec reports as valid and execute it. **This resolves the SRS question without a trait method.**
+- **Prescribed migration verb.** `move-to-archspec` for the `RoundingMode` enum and valid-index table; `leave-alone` for the rounding and saturation algorithms.
+- **Estimated LOC impact.** ~50 lines changing in xdna-emu (move `RoundingMode` enum to archspec, update imports); ~60 lines added to archspec.
+
+### `vector_helpers.rs`
+
+- **Size + responsibility.** 1383 lines; shared vector utilities consumed by `vector_*.rs` implementations -- accumulator read/write adapters (`get_acc_source`, `write_acc_dest`), vector register read/write helpers (`read_vector_source`, `write_vector_dest`), wide (512-bit/1024-bit) helpers, `get_shift_amount`, `execute_binary_typeless`, etc.
+- **AIE2 hardcode count.** 0. All width constants (256 bits, 512 bits) are derived from `VECTOR_REGISTER_BITS`/`VECTOR_PAIR_BITS` from archspec (lines 406-450 area).
+- **Prescribed migration verb.** `leave-alone`.
+- **Estimated LOC impact.** 0.
+
+### `vector_semantic.rs`
+
+- **Size + responsibility.** 1421 lines; `execute_shuffle`, `execute_vector_broadcast`, `execute_vector_extract`, `execute_vector_insert`, `execute_vector_push`, `execute_align`, `execute_copy`, `execute_vector_clear` -- vector data-movement operations.
+- **AIE2 hardcode count.** 2 (imports). No load-bearing arch constants.
+- **Prescribed migration verb.** `leave-alone`.
+- **Estimated LOC impact.** 0.
+
+### `vector_permute.rs`
+
+- **Size + responsibility.** 1786 lines; shuffle unit (48 modes via `SHUFFLE_ROUTING` byte-level table at line 1545) and MAC permutation engine (26 modes via `MacPermuteMode` enum). The `SHUFFLE_ROUTING` table (48 × 64 bytes) is hardware-probed from real AIE2 silicon (comment at line 1542-1544). The `VEC_BYTES` and `PAIR_BYTES` constants are already archspec-sourced (lines 60-63).
+- **AIE2 hardcode count.** 7. Key: `SHUFFLE_ROUTING` table (probed from AIE2 silicon, 3072 bytes); `MacPermuteMode` enum (26 variants, AIE2-specific); `// Hardware constraint: the AIE2 has acc_num accumulators (32 for...` (line 1036); `// The AIE2 has 512 multipliers feeding acc_num accumulators` (line 1170).
+- **Divergence risks vs AIE1/AIE2P.** Both the shuffle routing table and the MAC permutation modes are entirely AIE2-specific. AIE1 has a different shuffle unit with different mode numbers and different byte routing. AIE2P may share the same tables or have extensions. These are the largest data-migration candidates in the vector ALU area: both the `SHUFFLE_ROUTING` table and the `MacPermuteMode` enum are pure archspec material.
+- **Prescribed migration verb.** `move-to-archspec`. The `SHUFFLE_ROUTING` table (3072 bytes of hardware-probed data) and the `MacPermuteMode` enum (26 variants with their `rc2i` geometry) should move to `xdna_archspec::aie2::vmac` or a new `aie2::permute` module. The algorithm that applies the table (byte-level transpose logic) stays in xdna-emu.
+- **Estimated LOC impact.** ~3200 lines moving from xdna-emu to archspec; the execute code in xdna-emu shrinks to ~300 lines of algorithm plus archspec references.
+
+### `vector_float.rs`
+
+- **Size + responsibility.** 1325 lines; all AIE2-specific BF16 and FP32 semantics: flush-to-zero (FTZ) for denormals, canonical NaN bit pattern (mantissa=1, positive, regardless of input; hardware-verified against NPU1 at line 308), bf16/fp32 conversion with rounding, the duplicate `RoundingMode` enum for float conversions, `aie2_fp32_add`/`aie2_acc_fp32_add` with FTZ and NaN propagation.
+- **AIE2 hardcode count.** 50 (the highest of any vector file). This file is almost entirely AIE2-specific behavior. Key hardcodes: canonical NaN pattern `0x01` mantissa (line 316); FTZ rule; the 10-mode `RoundingMode` enum (duplication with `vector_srs.rs`!); `sgn_mag=True` convention for bf16 conversion rounding.
+- **Divergence risks vs AIE1/AIE2P.** The canonical NaN pattern (mantissa=1, always positive) is hardware-verified AIE2 behavior that differs from IEEE 754 and from the aietools Python model (which uses mantissa=0x7F). AIE1's float handling is different (narrower pipeline, different NaN conventions). This file is entirely AIE2-specific floating-point microarchitecture. **Notable:** `vector_float.rs` defines `RoundingMode` independently from `vector_srs.rs`'s `RoundingMode` -- the two enums are identical. This duplication should be resolved by a single `RoundingMode` in archspec.
+- **Prescribed migration verb.** `move-to-archspec` for the `RoundingMode` enum (consolidating the duplicate); `leave-alone` for the FTZ/NaN algorithms (they are AIE2 behavioral facts, but they belong in xdna-emu as execute-side implementations, not data). The canonical NaN constant (`0x01` mantissa, positive sign) could become an archspec constant in `aie2::processor`.
+- **Estimated LOC impact.** ~15 lines migrated (RoundingMode enum consolidation + canonical NaN constant); 0 for the algorithms.
+
+### `vector_config.rs`
+
+- **Size + responsibility.** 1067 lines; matrix multiply configuration word parser -- `MatMulConfig` struct, `AccWidth` enum, `DENSE_GEOMETRY_TABLE` (8 entries) and `SPARSE_GEOMETRY_TABLE` (5 entries) encoding the valid (bits_x, bits_y, rows, inner, cols, acc_cmb, bfloat, sparse) tuples for AIE2's multiply array.
+- **AIE2 hardcode count.** 4 (doc comments). Key: `DENSE_GEOMETRY_TABLE` and `SPARSE_GEOMETRY_TABLE` (13 entries total) are pure AIE2 archspec data -- they encode what matrix geometries the hardware multiplier array supports.
+- **Divergence risks vs AIE1/AIE2P.** The geometry tables are entirely AIE2-specific. AIE1 supports a smaller set of matrix geometries (narrower multiplier array). These tables are the clearest data-migration target in the vector-ALU area.
+- **Prescribed migration verb.** `move-to-archspec`. Both geometry tables should move to `xdna_archspec::aie2::vmac` (same module as the VMAC routing tables). The `MatMulConfig` struct and its parsing logic stay in xdna-emu.
+- **Estimated LOC impact.** ~30 lines moving to archspec; ~15 lines changing in xdna-emu (update imports and accessor calls).
+
+### `vector_convert.rs`
+
+- **Size + responsibility.** 507 lines; type conversions between vector element types -- FP32↔BF16, INT↔FLOAT, with AIE2 FTZ applied.
+- **AIE2 hardcode count.** 4 (doc references to `AIE2 FTZ` at lines 251, 259, 318). All are behavioral facts implemented via `vector_float.rs` helpers; no raw constants.
+- **Prescribed migration verb.** `leave-alone`.
+- **Estimated LOC impact.** 0.
+
+### `vector_validate.rs`
+
+- **Size + responsibility.** 284 lines; test module only (gated by `#[cfg(test)]`), exercising vector ALU operations.
+- **AIE2 hardcode count.** 1 (import). No production constants.
+- **Prescribed migration verb.** `leave-alone`.
+- **Estimated LOC impact.** 0.
+
+**Vector ALU area summary.** No `IsaExecutor` trait methods warranted. The pre-audit hypothesis that SRS rounding would require a trait method is resolved: the rounding *algorithms* (sgn/lsb/grd/stk logic) are arch-generic; only the rounding-mode enum (10 modes with specific gaps) and the UPS mode table (4 valid type-pair entries) are arch-specific data. Both move to archspec without trait methods. The largest single migration in this area is `vector_permute.rs`'s `SHUFFLE_ROUTING` table (~3072 bytes of hardware-probed data + the `MacPermuteMode` 26-variant enum) and `vector_config.rs`'s geometry tables. Notable finding: `RoundingMode` is duplicated between `vector_srs.rs` and `vector_float.rs`; consolidation into a single archspec definition is the right fix. `vector_float.rs` (50 AIE2 references) is the most AIE2-entangled file in this area but its entanglement is behavioral facts, not data constants -- it stays in xdna-emu. Files that are `leave-alone`: `vector_arith`, `vector_compare`, `vector_misc`, `vector_pack`, `vector_helpers`, `vector_semantic`, `vector_convert`, `vector_validate`.
 
 ## 5. VMAC / matmul
 
