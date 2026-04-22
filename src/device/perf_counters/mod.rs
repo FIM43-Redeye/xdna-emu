@@ -355,31 +355,78 @@ impl PerfCounterBank {
         }
     }
 
-    /// Advance all active counters by one cycle.
+    /// ACTIVE_CORE event ID on AIE2.
     ///
+    /// Per `aie-rt/driver/src/events/xaie_events_aieml.h:63`,
+    /// `XAIE_EVENT_ACTIVE_CORE_CORE = 28 = 0x1C`. A counter configured
+    /// with this start event is level-gated on the core Execute state: it
+    /// should tick only while the core is actually executing an instruction,
+    /// not while stalled on a lock, DMA, cascade, or disabled.
+    const EVENT_ACTIVE_CORE: u8 = 0x1C;
+
+    /// Advance counters for a cycle during which the core is in Execute state.
+    ///
+    /// All active counters increment, regardless of their start event.
     /// Returns a vector of counter indices that reached their event value
-    /// threshold this cycle. The caller should generate the corresponding
-    /// `PERF_CNT_N` events.
+    /// threshold this cycle. Counter values wrap at u32::MAX (matching
+    /// 32-bit hardware counters).
+    pub fn tick_active_cycles(&mut self) -> Vec<usize> {
+        self.tick_internal(true)
+    }
+
+    /// Advance counters for a cycle during which the core is NOT in Execute
+    /// state (stalled on lock/DMA/cascade, halted, or disabled).
     ///
-    /// Counter values wrap at u32::MAX (matching 32-bit hardware counters).
-    pub fn tick(&mut self) -> Vec<usize> {
+    /// Counters whose `start_event` is `EVENT_ACTIVE_CORE` (0x1C) do not
+    /// tick — they are level-gated on core Execute state. All other active
+    /// counters (pulse-started) still tick.
+    ///
+    /// Returns a vector of counter indices that reached their threshold
+    /// this cycle.
+    pub fn tick_idle_cycles(&mut self) -> Vec<usize> {
+        self.tick_internal(false)
+    }
+
+    fn tick_internal(&mut self, core_active: bool) -> Vec<usize> {
         let mut threshold_events = Vec::new();
 
         for i in 0..self.num_counters {
-            if self.state[i] == CounterState::Active {
-                self.counter_value[i] = self.counter_value[i].wrapping_add(1);
+            if self.state[i] != CounterState::Active {
+                continue;
+            }
 
-                // Check threshold: fire event when counter reaches event_value.
-                // event_value of 0 means no threshold configured.
-                if self.event_value[i] != 0
-                    && self.counter_value[i] == self.event_value[i]
-                {
-                    threshold_events.push(i);
-                }
+            // Level-gated counters: skip when core is not in Execute state.
+            if self.start_event[i] == Self::EVENT_ACTIVE_CORE && !core_active {
+                continue;
+            }
+
+            self.counter_value[i] = self.counter_value[i].wrapping_add(1);
+
+            // Check threshold: fire event when counter reaches event_value.
+            // event_value of 0 means no threshold configured.
+            if self.event_value[i] != 0
+                && self.counter_value[i] == self.event_value[i]
+            {
+                threshold_events.push(i);
             }
         }
 
         threshold_events
+    }
+
+    /// Advance all active counters by one cycle.
+    ///
+    /// # Deprecated
+    ///
+    /// Prefer [`tick_active_cycles`] or [`tick_idle_cycles`] at call sites
+    /// where core state is known. This shim forwards to `tick_active_cycles`
+    /// to preserve backward compatibility for unmigrated callers.
+    ///
+    /// [`tick_active_cycles`]: PerfCounterBank::tick_active_cycles
+    /// [`tick_idle_cycles`]: PerfCounterBank::tick_idle_cycles
+    #[deprecated(note = "use tick_active_cycles() or tick_idle_cycles()")]
+    pub fn tick(&mut self) -> Vec<usize> {
+        self.tick_active_cycles()
     }
 
     // -- Register Interface --

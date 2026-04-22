@@ -627,3 +627,80 @@ fn same_event_for_multiple_counters() {
     assert_eq!(bank.read_counter(0), 1);
     assert_eq!(bank.read_counter(1), 1);
 }
+
+// -- Level-event semantics: tick_active_cycles / tick_idle_cycles --
+
+/// ACTIVE_CORE event ID on AIE2 (per aie-rt xaiemlgbl_reginit.c / xaie_events_aieml.h).
+const EVENT_ACTIVE_CORE: u8 = 0x1C;
+
+#[test]
+fn active_core_ticks_only_while_core_active() {
+    let mut bank = PerfCounterBank::new(4);
+    // Configure counter 0: start=ACTIVE_CORE, stop=0 (none), counter_hi=1, event_width=7
+    bank.write_control_start_stop(
+        EVENT_ACTIVE_CORE as u32, // start0=0x1C, stop0=0, start1=0, stop1=0
+        0, 1, 7,
+    );
+    // Fire start event -> counter 0 becomes Active.
+    bank.handle_event(EVENT_ACTIVE_CORE);
+    assert!(bank.is_active(0));
+
+    // 10 active cycles.
+    for _ in 0..10 {
+        bank.tick_active_cycles();
+    }
+    assert_eq!(bank.read_counter(0), 10);
+
+    // 5 idle cycles (core stalled / blocked / disabled).
+    for _ in 0..5 {
+        bank.tick_idle_cycles();
+    }
+    assert_eq!(bank.read_counter(0), 10, "counter must not tick while core is idle");
+
+    // 10 more active cycles.
+    for _ in 0..10 {
+        bank.tick_active_cycles();
+    }
+    assert_eq!(bank.read_counter(0), 20);
+}
+
+#[test]
+fn pulse_event_counter_ticks_in_both_states() {
+    // A counter started by a non-ACTIVE_CORE event (e.g., LOCK_ACQUIRE = 0x2E per
+    // aie-rt xaie_events_aieml.h) should behave as before: tick whenever Active,
+    // regardless of core state.
+    const EVENT_LOCK_ACQUIRE: u8 = 0x2E;
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(EVENT_LOCK_ACQUIRE as u32, 0, 1, 7);
+    bank.handle_event(EVENT_LOCK_ACQUIRE);
+    assert!(bank.is_active(0));
+
+    // tick_idle_cycles should still increment pulse-started counters.
+    for _ in 0..10 {
+        bank.tick_idle_cycles();
+    }
+    assert_eq!(bank.read_counter(0), 10);
+
+    // tick_active_cycles also increments pulse-started counters.
+    for _ in 0..5 {
+        bank.tick_active_cycles();
+    }
+    assert_eq!(bank.read_counter(0), 15);
+}
+
+#[test]
+fn deprecated_tick_shim_behaves_as_active_cycles() {
+    // The deprecated tick() shim must forward to tick_active_cycles(),
+    // so ACTIVE_CORE-started counters still tick when called.
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(EVENT_ACTIVE_CORE as u32, 0, 1, 7);
+    bank.handle_event(EVENT_ACTIVE_CORE);
+
+    #[allow(deprecated)]
+    {
+        for _ in 0..5 {
+            bank.tick();
+        }
+    }
+    assert_eq!(bank.read_counter(0), 5);
+}

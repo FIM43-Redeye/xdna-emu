@@ -57,6 +57,11 @@ struct CoreState {
     /// Used to incrementally drain new events each cycle for the
     /// hardware trace unit without needing a drain() method.
     trace_events_consumed: usize,
+    /// True if this core executed an instruction (StepResult::Continue)
+    /// during the current cycle's execute phase. Used by the tick phase to
+    /// route ACTIVE_CORE-configured perf counters to tick_active_cycles vs
+    /// tick_idle_cycles. Reset to false at the start of each cycle.
+    active_this_cycle: bool,
 }
 
 impl CoreState {
@@ -73,6 +78,7 @@ impl CoreState {
             context: ExecutionContext::new_for_tile(col, row),
             enabled: false,
             trace_events_consumed: 0,
+            active_this_cycle: false,
         }
     }
 }
@@ -534,6 +540,13 @@ impl InterpreterEngine {
         let mut any_running = false;
         let mut all_halted = true;
 
+        // Reset per-core active flag. Set to true only for StepResult::Continue
+        // in Phase 2; the perf counter tick in Phase 3e reads it to pick
+        // tick_active_cycles vs tick_idle_cycles for ACTIVE_CORE-gated counters.
+        for core in &mut self.cores {
+            core.active_this_cycle = false;
+        }
+
         // Phase 1: Sync DMA start requests from tiles to DMA engines
         self.sync_dma_start_requests();
 
@@ -630,6 +643,7 @@ impl InterpreterEngine {
                             all_halted = false;
                             any_running = true;
                             self.total_instructions += 1;
+                            core.active_this_cycle = true;
                         }
                         StepResult::WaitLock { .. } => {
                             tile.core_debug.update_stalls(false, true, false, false);
@@ -955,14 +969,28 @@ impl InterpreterEngine {
         // that increment every cycle. The timer can generate a trigger
         // event when it reaches a programmed threshold.
         //
-        // Performance counters also tick each cycle. Active counters
-        // increment and check against their configured event_value
-        // threshold, generating PERF_CNT_N events when reached.
-        for tile in &mut self.device.array.tiles {
+        // Core module perf counters are dispatched to tick_active_cycles or
+        // tick_idle_cycles based on whether the core executed an instruction
+        // (StepResult::Continue) this cycle. Counters configured with
+        // ACTIVE_CORE (0x1C) as start_event are level-gated: they tick only
+        // when the core is in Execute state, matching hardware behavior.
+        //
+        // Memory module perf counters are not gated on core Execute state;
+        // they always use tick_active_cycles (existing semantics preserved).
+        //
+        // Tiles are indexed identically to self.cores (col * rows + row), so
+        // cores[i] is the CoreState for tiles[i].
+        for (i, tile) in self.device.array.tiles.iter_mut().enumerate() {
             tile.core_timer.tick();
             tile.mem_timer.tick();
-            tile.core_perf_counters.tick();
-            tile.mem_perf_counters.tick();
+            let core_active = self.cores.get(i).map_or(false, |c| c.active_this_cycle);
+            if core_active {
+                tile.core_perf_counters.tick_active_cycles();
+            } else {
+                tile.core_perf_counters.tick_idle_cycles();
+            }
+            // Memory module perf counters tick unconditionally.
+            tile.mem_perf_counters.tick_active_cycles();
         }
 
         // Phase 4: Update tile DMA channel state from engine state
