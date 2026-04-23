@@ -50,6 +50,14 @@ RUST_LIB="$EMU_DIR/target/$PROFILE/libxdna_emu.so"
 CPP_PLUGIN="$BUILD_DIR/libxrt_driver_emu.so.2.21.0"
 XRT_PLUGIN="/opt/xilinx/xrt/lib/libxrt_driver_emu.so.2.21.0"
 
+# Profile-named symlinks installed in /opt/xilinx/xrt/lib/:
+#   libxdna_emu_debug.so   -> target/debug/libxdna_emu.so
+#   libxdna_emu_release.so -> target/release/libxdna_emu.so
+# The plugin dlopens libxdna_emu_<profile>.so first (from pdev_emu.cpp) so
+# debug/release selection works via XDNA_EMU env var without XDNA_EMU_DIR.
+XRT_LIB_DIR="/opt/xilinx/xrt/lib"
+PROFILE_LINK="$XRT_LIB_DIR/libxdna_emu_${PROFILE}.so"
+
 if [[ ! -f "$RUST_LIB" ]]; then
   echo "FATAL: Rust lib $RUST_LIB not found after build!" >&2
   exit 1
@@ -106,5 +114,60 @@ else
     echo ">>> Done. C++ plugin installed and verified ($HASH_SRC)."
   fi
 fi
+# Ensure the profile-suffixed symlink in /opt/xilinx/xrt/lib/ points at the
+# Rust .so we just built.  The C++ plugin (pdev_emu.cpp) dlopens
+# libxdna_emu_<profile>.so by name; this is what makes that resolution work.
+install_profile_symlink() {
+  local target_profile="$1"
+  local target_lib="$EMU_DIR/target/$target_profile/libxdna_emu.so"
+  local link="$XRT_LIB_DIR/libxdna_emu_${target_profile}.so"
+
+  # If the Rust lib for the OTHER profile doesn't exist yet, skip silently
+  # (we only install the one we built).
+  if [[ "$target_profile" != "$PROFILE" && ! -f "$target_lib" ]]; then
+    return
+  fi
+  if [[ ! -f "$target_lib" ]]; then
+    return
+  fi
+
+  # Desired: symlink pointing at the built Rust .so.
+  local want="$target_lib"
+  if [[ -L "$link" ]]; then
+    local have="$(readlink "$link")"
+    if [[ "$have" == "$want" ]]; then
+      return
+    fi
+  fi
+
+  echo ">>> Linking $link -> $want"
+  if ln -sfn "$want" "$link" 2>/dev/null; then
+    :
+  else
+    pkexec ln -sfn "$want" "$link"
+  fi
+  NEEDS_LDCONFIG=1
+}
+NEEDS_LDCONFIG=0
+
+install_profile_symlink "$PROFILE"
+# Also refresh the OTHER profile's symlink if its build exists, so toggling
+# XDNA_EMU between debug/release just works without re-running this script.
+OTHER_PROFILE="debug"
+[[ "$PROFILE" == "debug" ]] && OTHER_PROFILE="release"
+install_profile_symlink "$OTHER_PROFILE"
+
+# Refresh ldconfig if we created or updated any symlinks, so the newly
+# installed names are visible to dlopen via the standard search path.
+if [[ "$NEEDS_LDCONFIG" == "1" ]]; then
+  echo ">>> Refreshing ldconfig..."
+  if ldconfig 2>/dev/null; then
+    :
+  else
+    pkexec ldconfig
+  fi
+fi
+
 echo ">>> Rust lib: $RUST_LIB"
+echo ">>> Profile symlink: $PROFILE_LINK -> $RUST_LIB"
 echo ">>> EMU test usage: XDNA_EMU=$PROFILE ./test.exe"

@@ -20,10 +20,13 @@ on_first_open() const
   //
   // Resolution order:
   //   1. XDNA_EMU_DIR + XDNA_EMU profile -- e.g. $XDNA_EMU_DIR/target/debug/libxdna_emu.so
+  //      (explicit path override; honored as-is, no further fallbacks).
   //      XDNA_EMU="debug" or "release" selects the Cargo profile.
   //      XDNA_EMU="1" (or any other truthy value) defaults to "debug".
-  //   2. Plain dlopen fallback -- "libxdna_emu.so" via ldconfig/LD_LIBRARY_PATH
-  std::string lib_path;
+  //   2. Profile-named lib in the standard search path --
+  //      libxdna_emu_debug.so or libxdna_emu_release.so (installed as symlinks
+  //      in /opt/xilinx/xrt/lib/ by rebuild-plugin.sh).
+  //   3. Plain libxdna_emu.so via ldconfig/LD_LIBRARY_PATH (legacy fallback).
   const char* dir_env = std::getenv("XDNA_EMU_DIR");
   const char* emu_env = std::getenv("XDNA_EMU");
   std::string profile = "debug";  // default
@@ -33,14 +36,28 @@ on_first_open() const
       profile = "release";
     // "debug", "1", or any other truthy value -> debug
   }
-  if (dir_env && dir_env[0] != '\0') {
-    lib_path = std::string(dir_env) + "/target/" + profile + "/libxdna_emu.so";
-  } else {
-    lib_path = "libxdna_emu.so";
-  }
-  EMU_INFO("Loading emulator library: %s (profile=%s)", lib_path.c_str(), profile.c_str());
 
-  m_transport = emu_transport::create_inprocess(lib_path);
+  if (dir_env && dir_env[0] != '\0') {
+    // Explicit override: use it verbatim, no fallbacks.
+    std::string lib_path = std::string(dir_env) + "/target/" + profile +
+                           "/libxdna_emu.so";
+    EMU_INFO("Loading emulator library: %s (profile=%s, XDNA_EMU_DIR override)",
+             lib_path.c_str(), profile.c_str());
+    m_transport = emu_transport::create_inprocess(lib_path);
+  } else {
+    // No override: try profile-suffixed name first, then plain name.
+    std::string profiled = "libxdna_emu_" + profile + ".so";
+    std::string plain    = "libxdna_emu.so";
+    EMU_INFO("Loading emulator library: %s (profile=%s)",
+             profiled.c_str(), profile.c_str());
+    try {
+      m_transport = emu_transport::create_inprocess(profiled);
+    } catch (const std::runtime_error& e) {
+      EMU_WARN("Profile-named lib %s not found (%s); falling back to %s",
+               profiled.c_str(), e.what(), plain.c_str());
+      m_transport = emu_transport::create_inprocess(plain);
+    }
+  }
 
   // Pass XDNA_EMU_LOG_LEVEL through to the Rust emulator so that both
   // the C++ plugin and Rust emulator use the same verbosity setting.
