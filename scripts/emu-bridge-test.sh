@@ -96,9 +96,13 @@ WITH_HW_CYCLES=${WITH_HW_CYCLES:-false}
 WITH_CYCLE_DIFF=${WITH_CYCLE_DIFF:-false}
 
 # Phase E dual-bound EMU timing constants.
-# EMU_SECONDS_PER_CYCLE is a conservative starting value (~1000 sim-cycles/sec);
-# to be calibrated empirically post-Task 14.
-EMU_SECONDS_PER_CYCLE=${EMU_SECONDS_PER_CYCLE:-0.001}
+# EMU_SECONDS_PER_CYCLE: wall-clock seconds per simulated cycle. Emulator's
+# reported simulation rate is ~800 MHz (pessimistic) to ~1 GHz; 2e-9 s/cycle
+# = 500 M sim-cycles/sec is a conservative starting value that gives headroom
+# on both figures. In practice the 600 s wall-clock floor (below) dominates
+# for any test under ~300 G cycles, so this mostly matters as a sanity cap
+# for pathologically long runs.
+EMU_SECONDS_PER_CYCLE=${EMU_SECONDS_PER_CYCLE:-2e-9}
 EMU_CYCLE_BUDGET_MULTIPLIER=${EMU_CYCLE_BUDGET_MULTIPLIER:-2.0}
 export EMU_SECONDS_PER_CYCLE EMU_CYCLE_BUDGET_MULTIPLIER
 
