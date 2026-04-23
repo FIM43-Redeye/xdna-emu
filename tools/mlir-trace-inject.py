@@ -76,9 +76,28 @@ _TRACE_PACKET_ID_START = 1          # AIEInsertTraceFlows reassigns during lower
 _TRACE_BROADCAST_START = 15         # hardware broadcast channel that starts trace
 _TRACE_BROADCAST_STOP = 14          # hardware broadcast channel that stops trace
 _TRACE_DEFAULT_CORE_EVENTS = (
-    "INSTR_VECTOR",      # vector-instruction issue
-    "INSTR_EVENT_0",     # software event pin 0 (kernel boundary marker, if used)
-    "INSTR_EVENT_1",     # software event pin 1 (kernel boundary marker, if used)
+    # Matches mlir-aie's own core-tile defaults in
+    # python/utils/trace/setup.py::_get_default_events_for_tile, minus
+    # the two port events (PORT_RUNNING_0/1) which require additional
+    # PortEvent config plumbing we don't currently emit through the
+    # declarative ops.
+    #
+    # The three INSTR_* events are software pins / vector markers; they
+    # fire on vector paths but are silent on pure scalar kernels
+    # (Phase B Limitation 1). The three stall events and the two lock
+    # request events fire whenever the core waits on memory, a stream,
+    # or a lock, which covers virtually every scalar kernel that uses
+    # DMA + locks. The set is chosen to produce usable trace signals
+    # on both vector and scalar workloads within the 8-event trace-unit
+    # limit.
+    "INSTR_EVENT_0",         # software event pin 0 (kernel boundary marker)
+    "INSTR_EVENT_1",         # software event pin 1 (kernel boundary marker)
+    "INSTR_VECTOR",          # vector-instruction issue
+    "MEMORY_STALL",          # core stalled waiting on local memory
+    "STREAM_STALL",          # core stalled waiting on a stream
+    "LOCK_STALL",            # core stalled waiting on a lock
+    "INSTR_LOCK_ACQUIRE_REQ",# lock acquire requested
+    "INSTR_LOCK_RELEASE_REQ",# lock release requested
 )
 
 
