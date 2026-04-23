@@ -5,7 +5,7 @@ AIE MLIR design.
 
 Uses mlir-aie's Python bindings to parse an existing .mlir, walk its
 aie.device body, insert aie.trace declarations for each compute tile, and
-insert aie.trace_host_config + aie.trace_start_config ops at the top of
+insert aie.trace.host_config + aie.trace.start_config ops at the top of
 the aie.runtime_sequence body.
 
 Rationale: mlir-aie's declarative trace IRON API (aie.utils.trace) is
@@ -80,6 +80,17 @@ _TRACE_DEFAULT_CORE_EVENTS = (
     "INSTR_EVENT_0",     # software event pin 0 (kernel boundary marker, if used)
     "INSTR_EVENT_1",     # software event pin 1 (kernel boundary marker, if used)
 )
+
+
+def _trace_sym(col: int, row: int) -> str:
+    """Symbol name for the aie.trace op attached to tile (col, row).
+
+    Single source of truth so a future rename only touches one place.
+    Task 4 constructs the TraceOp with this name; Task 5's
+    trace_start_config must reference the same name -- drift between the
+    two sites would silently produce an unreachable trace config.
+    """
+    return f"trace_t{col}_{row}"
 
 
 def parse_args():
@@ -206,7 +217,7 @@ def _inject_trace_ops(module, input_path: str, aied, buffer_size: int) -> int:
             # This exactly mirrors how mlir-aie's configure_trace() works.
             # The decorator invokes _trace_body synchronously before the next
             # loop iteration reassigns the name, so redefinition is safe.
-            @aied.trace(tile_val, f"trace_t{col}_{row}")
+            @aied.trace(tile_val, _trace_sym(col, row))
             def _trace_body():  # noqa: F811 -- redefinition is intentional (one per tile)
                 aied.trace_mode(aied.TraceMode.EventTime)
                 # packet id is the conventional starting id; AIEInsertTraceFlows
@@ -247,7 +258,7 @@ def _inject_trace_ops(module, input_path: str, aied, buffer_size: int) -> int:
         # One per compute tile, matching the trace decl symbols inserted above.
         # Mirror of mlir-aie python/utils/trace/setup.py line 542.
         for col, row, _ in compute_tiles:
-            aied.trace_start_config(f"trace_t{col}_{row}")
+            aied.trace_start_config(_trace_sym(col, row))
 
     return 0
 
