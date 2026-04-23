@@ -71,6 +71,24 @@ def parse_args():
     return p.parse_args()
 
 
+def _has_trace_ops(operation) -> bool:
+    """Return True if any op in the subtree has name 'aie.trace'.
+
+    The MLIR Python bindings expose operation.walk() but its callback
+    signature expects a C++ WalkCallback type that is not easily wrapped from
+    Python (calling it raises std::bad_cast).  Manual traversal through
+    operation.regions is reliable and fast enough for design-scale MLIR.
+    """
+    if operation.name == "aie.trace":
+        return True
+    for region in operation.regions:
+        for block in region:
+            for child_op in block:
+                if _has_trace_ops(child_op):
+                    return True
+    return False
+
+
 def main():
     args = parse_args()
     text = Path(args.input).read_text()
@@ -83,7 +101,16 @@ def main():
     with Context(), Location.unknown():
         module = Module.parse(text)
         if not args.no_op:
-            # Injection logic lands in Tasks 3-5.
+            # Idempotency guard: refuse to inject if trace ops already exist.
+            # --no-op is an identity round-trip and is always safe to re-run.
+            if _has_trace_ops(module.operation):
+                print(
+                    f"error: {args.input} already contains aie.trace ops; "
+                    "refusing to double-inject (exit 2)",
+                    file=sys.stderr,
+                )
+                return 2
+            # TODO(Task 4-5): real injection logic
             raise NotImplementedError("injection not yet implemented")
         Path(args.out).write_text(str(module))
 

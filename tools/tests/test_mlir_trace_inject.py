@@ -39,3 +39,31 @@ def test_injector_no_op_mode_round_trips(tmp_path):
     # not raw text. At minimum, tile count and op kinds should match.
     assert result.count("aie.tile") == original.count("aie.tile")
     assert result.count("aie.device") == original.count("aie.device")
+
+
+ALREADY_TRACED = FIXTURES / "sample_already_traced.mlir"
+
+
+def test_injector_bails_on_already_traced(tmp_path):
+    """If input already has aie.trace ops, injector should refuse (exit 2)."""
+    out = tmp_path / "out.mlir"
+    r = _run(
+        ["--input", str(ALREADY_TRACED), "--out", str(out)],
+        check=False,
+    )
+    assert r.returncode == 2, f"expected exit 2, got {r.returncode}; stderr={r.stderr}"
+    assert "already" in r.stderr.lower() or "trace" in r.stderr.lower()
+    assert not out.exists(), "output file should not be written when injector refuses"
+
+
+def test_no_op_round_trips_already_traced(tmp_path):
+    """--no-op must not trigger the idempotency check (identity pass is always safe)."""
+    out = tmp_path / "out.mlir"
+    r = _run(
+        ["--no-op", "--input", str(ALREADY_TRACED), "--out", str(out)],
+        check=False,
+    )
+    assert r.returncode == 0, f"--no-op on already-traced input failed: stderr={r.stderr}"
+    assert out.exists(), "output file should be written in --no-op mode"
+    result = out.read_text()
+    assert result.count("aie.trace") >= 1, "aie.trace op should survive round-trip"
