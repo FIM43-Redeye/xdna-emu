@@ -8,6 +8,23 @@ resulting report surfaced three things worth pinning down before Task 7
 (classification) and before anyone else touches `trace-compare`. This note
 captures them.
 
+> **UPDATE (2026-04-23, later same day):** Finding #3's "254 115-cycle HW
+> startup anomaly" turned out to be a bug in our **own** Rust trace decoder,
+> not a real HW behavior. Our `decode_per_tile` decoded each 32-byte packet
+> as if its timer started at 0 (unless a Start token reset it), which
+> manufactured a phantom gap whenever a second packet continued the timer
+> stream without a Start token. mlir-aie's `parse_trace` handles packet
+> continuity correctly. We've since migrated the whole pipeline onto
+> mlir-aie's decoder via `tools/parse-trace.py`; `trace-compare` now reads
+> the events JSON that script emits rather than re-decoding binaries in
+> Rust. The real drift on `vector_scalar_using_dma` is **+2 cycles per
+> iteration, Stable, 0 diverged, 0 count mismatch** — essentially perfect.
+> The rest of the findings below are preserved as-written for history;
+> treat the "big startup anomaly" narrative as a debugging artifact.
+> Relevant commits: migration from in-Rust decoder to events-JSON
+> ingestion, new `tools/parse-trace.py`, deletion of `trace-to-cycles.py`
+> in favor of a single-pass decoder.
+
 ## Commits landed in this session (for cold re-entry)
 
 ```
@@ -270,7 +287,8 @@ update when we revisit:
 
 1. `cat docs/superpowers/plans/2026-04-23-phase-e-trace-diff-cycle-budget.md`
    for the plan.
-2. `git log --oneline -15` — commits listed at the top of this note.
+2. `git log --oneline -20` — includes the decoder-migration commits added
+   later on 2026-04-23 (parse-trace.py + trace-compare events-JSON swap).
 3. Run the smoke test to see the current state of the pipeline:
    ```bash
    source /home/triple/npu-work/toolchain-build/activate-npu-env.sh
@@ -279,7 +297,47 @@ update when we revisit:
    LATEST=$(ls -dt build/bridge-test-results/2026*/ | head -1)
    cat $LATEST/vector_scalar_using_dma.chess.cycles.compare.txt
    ```
-   Expected: 75-line report with a single `Tile (0,2)` entry, per-iteration
-   breakdown showing HW=10310 / EMU=10308, step-change anomaly on iter 1.
-4. Task 7 is up next.  Decide A / B / C per the "Implications for Task 7"
-   section above before writing code.
+   Expected post-migration: single `Tile (0,2)` entry, 2 edge event types
+   (INSTR_EVENT_0 / INSTR_EVENT_1), 4 iterations each, **Stable** drift
+   classification, constant `+2` cycles/iter EMU-fast-of-HW. No count
+   mismatch, no divergence. This is the clean baseline for Task 7.
+4. Task 7 is up next. See "Post-decoder-fix rethinking Task 7" below.
+
+---
+
+## Post-decoder-fix rethinking Task 7
+
+With the decoder migration, the landscape changed materially:
+
+- The previously-scary "254k anomaly" vanished — it was a decoder artifact.
+- `vector_scalar_using_dma` shows **0 diverged, 0 count mismatch, Stable
+  iteration drift of +2 cycles/iter**. Cycles-total ratio EMU/HW = 0.9999.
+- Per-iteration output is structured (`IterationResult.drift_classification
+  ∈ {Stable, StepChange, Accumulating, Irregular}`) and already
+  categorizes anomaly shape for us.
+
+This makes the classification problem much simpler than I thought in the
+A/B/C discussion above. What we actually need from Task 7:
+
+1. **MATCH** — diverged=0, count mismatch=0, ratio in threshold. The
+   common case now.
+2. **DRIFT** — anything with diverged>0, or ratio outside threshold, or
+   iteration classification ∈ {StepChange, Accumulating, Irregular}.
+3. **EMPTY** — no events on one side (trace didn't capture).
+4. **COMPILE-FAIL(traced)** — already handled by existing plumbing.
+
+Prefer a thin classifier that reads *both* the scalar cycles.txt files
+**and** greps the compare report summary lines ("Edge event types: N
+clean, M diverged, K count mismatch"). We don't need per-iteration
+parsing; the Rust side already summarized it.
+
+Overrides (Task 11) stay cheap: per-test "accept up to this drift in
+cycles per iter", matching the thin classifier. Override file is only
+needed for tests where legit emulator simplifications produce known
+larger drift.
+
+Summary for whoever picks up Task 7: the plan as written largely works
+now. The "strict classifier gives DRIFT everywhere" concern that
+motivated options A/B/C was false; it was built on bad decoder output.
+Implement the strict classifier (option A in the original framing); it
+will produce useful signal on real data.

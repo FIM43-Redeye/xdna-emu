@@ -477,8 +477,8 @@ converge to Perfetto JSON (viewable at ui.perfetto.dev).
 |------|---------|
 | `tools/mlir-trace-inject.py` | Inject trace routing into MLIR (uses mlir-aie declarative API) |
 | `bridge-runner/bridge-trace-runner` | Multi-batch event sweep orchestrator |
-| `tools/trace-to-cycles.py` | Parse trace buffers and compute cycle budgets |
-| `src/bin/trace_compare.rs` | **Rust** binary trace comparison (replaced Python -- 65GB OOM -> 11MB) |
+| `tools/parse-trace.py` | Single-source decoder: wraps mlir-aie's `parse_trace` and emits any combination of flat events JSON, cycles scalar, raw Perfetto, and raw command stream |
+| `src/bin/trace_compare.rs` | **Rust** HW/EMU comparison (consumes events JSON from parse-trace.py) |
 
 Build: `cargo build --release --bin trace-compare`
 
