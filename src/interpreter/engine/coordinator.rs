@@ -547,6 +547,12 @@ impl InterpreterEngine {
             core.active_this_cycle = false;
         }
 
+        // Publish the current simulation cycle to the tile array so that
+        // register-write side effects (trace unit start/stop, broadcast
+        // propagation) can time-stamp events with the right cycle. Also
+        // propagates to DMA engines for DMA-side trace events.
+        self.device.array.set_dma_cycle(self.total_cycles);
+
         // Phase 1: Sync DMA start requests from tiles to DMA engines
         self.sync_dma_start_requests();
 
@@ -677,12 +683,20 @@ impl InterpreterEngine {
                     }
 
                     // Notify core trace unit with any new events since last cycle.
+                    //
+                    // Use the coordinator's global cycle (self.total_cycles) rather
+                    // than the per-core `evt.cycle`. The event log stores the
+                    // core-local retire counter (ctx.cycles), which freezes during
+                    // stalls and thus does not reflect the tile clock that real HW
+                    // trace units observe. Events drained here happened in the
+                    // current simulation step, so total_cycles is the right stamp.
                     let events = core.context.timing_context().events.events();
                     let new_start = core.trace_events_consumed;
                     if new_start < events.len() {
+                        let cycle = self.total_cycles;
                         for evt in &events[new_start..] {
                             if let Some(hw_id) = crate::trace::core_event_to_hw_id(&evt.event) {
-                                tile.notify_core_trace_event(hw_id, evt.cycle);
+                                tile.notify_core_trace_event(hw_id, cycle);
                             }
                         }
                         core.trace_events_consumed = events.len();

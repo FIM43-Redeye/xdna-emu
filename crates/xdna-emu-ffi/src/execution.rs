@@ -130,6 +130,12 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
     let mut natural_halt = false;
 
     'run: while unbounded || cycles < max {
+        // Publish the current simulation cycle to the tile array before the
+        // NPU executor runs. Register-write side effects (trace unit
+        // start/stop, broadcast propagation) driven by NPU instructions
+        // read array.current_cycle to time-stamp events.
+        handle.engine.device_mut().array.set_dma_cycle(cycles);
+
         // Advance NPU instruction execution (interleaved with engine step).
         let npu_progressed;
         {

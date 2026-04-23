@@ -15,6 +15,9 @@ impl DeviceState {
     /// structured module dispatch has run.
     pub(super) fn apply_tile_local_effects(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         let reg_layout = regdb::device_reg_layout();
+        // Snapshot the simulation cycle up front so we can pass it to trace
+        // units without needing a second borrow of self.array below.
+        let current_cycle = self.array.current_cycle;
 
         let tile = match self.array.get_mut(col, row) {
             Some(t) => t,
@@ -296,13 +299,16 @@ impl DeviceState {
         if is_event_generate {
             let event_id = (value & 0x7F) as u8;
             log::info!(
-                "Tile({},{}) Event_Generate: event_id={} (offset=0x{:X})",
-                col, row, event_id, offset
+                "Tile({},{}) Event_Generate: event_id={} (offset=0x{:X}) cycle={}",
+                col, row, event_id, offset, current_cycle
             );
 
-            // Fire the event directly on local trace units.
-            tile.core_trace.notify_event(event_id, 0);
-            tile.mem_trace.notify_event(event_id, 0);
+            // Fire the event directly on local trace units. Use the array's
+            // current_cycle so trace unit deltas reflect real simulation time;
+            // passing a hardcoded 0 here causes every generated event to look
+            // like it fired at cycle 0.
+            tile.core_trace.notify_event(event_id, current_cycle);
+            tile.mem_trace.notify_event(event_id, current_cycle);
 
             // Check broadcast channel mapping in the EventModule: if the
             // generated event matches any broadcast channel's configured
@@ -342,6 +348,10 @@ impl DeviceState {
     /// Event_Generate on the shim tile, which generates BROADCAST_15 (start) or
     /// BROADCAST_14 (stop), and all tiles' trace units see their start/stop event.
     pub(crate) fn propagate_broadcasts(&mut self, col: u8, source_row: u8) {
+        // Snapshot the simulation cycle so the trace unit start/stop events
+        // are time-stamped with the current cycle rather than 0.
+        let current_cycle = self.array.current_cycle;
+
         // Drain pending broadcasts from the source tile.
         let broadcasts = if let Some(tile) = self.array.get_mut(col, source_row) {
             tile.drain_pending_broadcasts()
@@ -357,15 +367,15 @@ impl DeviceState {
         let rows = self.array.rows();
         for hw_id in &broadcasts {
             log::info!(
-                "Propagating BROADCAST_{} (hw_id={}) from tile ({},{}) to column {}",
-                hw_id - 107, hw_id, col, source_row, col
+                "Propagating BROADCAST_{} (hw_id={}) from tile ({},{}) to column {} at cycle {}",
+                hw_id - 107, hw_id, col, source_row, col, current_cycle
             );
             for row in 0..rows {
                 if let Some(tile) = self.array.get_mut(col as u8, row as u8) {
                     // Notify both trace units -- the trace unit checks if the
                     // event matches its configured start/stop event.
-                    tile.notify_core_trace_event(*hw_id, 0);
-                    tile.notify_mem_trace_event(*hw_id, 0);
+                    tile.notify_core_trace_event(*hw_id, current_cycle);
+                    tile.notify_mem_trace_event(*hw_id, current_cycle);
                 }
             }
         }
