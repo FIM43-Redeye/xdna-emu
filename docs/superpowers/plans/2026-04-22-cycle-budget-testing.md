@@ -22,6 +22,8 @@ No software-only workaround: `DRM_AMDXDNA_READ_AIE_REG` is `#ifdef AMDXDNA_AIE2_
 
 **Execution reorder:** Phase A (FFI + plugin) and Phase D (PerfCounterBank level-event fix) are independent of Phase B and proceed now. Phase B gets a separate brainstorm once Phase A + D land, then Phase C follows Phase B.
 
+**Phase B status (2026-04-22 update):** **Done.** Phase B was re-planned and executed as a standalone document at [`2026-04-22-phase-b-trace-cycle-capture.md`](2026-04-22-phase-b-trace-cycle-capture.md). All 15 tasks landed. Validation results across 7 representative bridge tests are recorded at [`2026-04-22-phase-b-trace-cycle-capture-validation.md`](2026-04-22-phase-b-trace-cycle-capture-validation.md): pipeline produces valid `cycles.HW.<test>.<compiler>.txt` files for vector-bearing tests (`vector_scalar_using_dma` = 41181 cycles as the reference success case). Four limitations documented (scalar-kernel empty traces, single-event-per-tile degenerate deltas, `.py`-only MLIR sources, ctrlpkt-flow incompatibility) — none block Phase C. Phase C tasks below can now consume the cycles files this pipeline produces.
+
 ---
 
 **Architecture:** Four phases land in order (B prerequisite: XRT patch) → B → A → D → C.
