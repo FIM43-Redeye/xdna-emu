@@ -254,6 +254,19 @@ is_trace_quarantined() {
 export -f is_trace_quarantined
 
 # ---------------------------------------------------------------------------
+# Drift-override lookup (Phase E Task 7 stub; Task 11 replaces with real load)
+# ---------------------------------------------------------------------------
+# Sets two caller-named variables to the accepted EMU/HW ratio bounds.
+# Usage:  _lookup_drift_bounds <test_name> _out_lower_var _out_upper_var
+_lookup_drift_bounds() {
+  local _out_l="$2"
+  local _out_u="$3"
+  printf -v "$_out_l" '%s' "0.5"
+  printf -v "$_out_u" '%s' "2.0"
+}
+export -f _lookup_drift_bounds
+
+# ---------------------------------------------------------------------------
 # Test quarantine (fundamentally broken tests -- skip entirely)
 # ---------------------------------------------------------------------------
 
@@ -665,6 +678,108 @@ _run_trace_compare() {
     return 0
 }
 
+# _classify_cycle_diff <test_name> <variant>
+# Reads the HW/EMU cycles files and the compare report, writes one of
+# MATCH(<ratio>) / DRIFT(ratio=<r>,diverge=<n>) / EMPTY / NO_DATA /
+# EMU_TRACE_BUG / HW_TRACE_BUG / COMPARE-ERR to
+# RESULTS_DIR/<safe>.<variant>.cycle.result. Always returns 0 unless
+# called with bad args; the classification itself is advisory.
+_classify_cycle_diff() {
+    local test_name="$1"
+    local variant="$2"
+
+    local safe
+    safe="$(sanitize_name "$test_name")"
+    local work_dir="$RESULTS_DIR/${safe}.hw-cycles"
+    local hw_bin="$work_dir/trace_hw.${variant}.bin"
+    local emu_bin="$work_dir/trace_emu.${variant}.bin"
+    local hw_cycles_txt="$RESULTS_DIR/${safe}.${variant}.cycles.HW.txt"
+    local emu_cycles_txt="$RESULTS_DIR/${safe}.${variant}.cycles.EMU.txt"
+    local report="$RESULTS_DIR/${safe}.${variant}.cycles.compare.txt"
+    local out_file="$RESULTS_DIR/${safe}.${variant}.cycle.result"
+
+    local hw_have_bin=false; [[ -f "$hw_bin"  ]] && hw_have_bin=true
+    local emu_have_bin=false; [[ -f "$emu_bin" ]] && emu_have_bin=true
+
+    if ! $hw_have_bin && ! $emu_have_bin; then
+        echo "NO_DATA" > "$out_file"
+        return 0
+    fi
+
+    local hw_cycles=0 emu_cycles=0
+    [[ -f "$hw_cycles_txt"  ]] && hw_cycles="$(tr -d '[:space:]' < "$hw_cycles_txt")"
+    [[ -f "$emu_cycles_txt" ]] && emu_cycles="$(tr -d '[:space:]' < "$emu_cycles_txt")"
+    [[ -z "$hw_cycles"  ]] && hw_cycles=0
+    [[ -z "$emu_cycles" ]] && emu_cycles=0
+
+    # Asymmetry cases: one side traced, the other didn't.
+    if $hw_have_bin && ! $emu_have_bin; then
+        echo "EMU_TRACE_BUG" > "$out_file"
+        return 0
+    fi
+    if $emu_have_bin && ! $hw_have_bin; then
+        echo "HW_TRACE_BUG" > "$out_file"
+        return 0
+    fi
+    if [[ "$hw_cycles" -gt 0 && "$emu_cycles" -eq 0 ]]; then
+        echo "EMU_TRACE_BUG" > "$out_file"
+        return 0
+    fi
+    if [[ "$emu_cycles" -gt 0 && "$hw_cycles" -eq 0 ]]; then
+        echo "HW_TRACE_BUG" > "$out_file"
+        return 0
+    fi
+
+    # Both sides captured zero events: legitimate for scalar-only kernels.
+    if [[ "$hw_cycles" -eq 0 && "$emu_cycles" -eq 0 ]]; then
+        echo "EMPTY" > "$out_file"
+        return 0
+    fi
+
+    # Both non-zero: parse the compare report for divergence counts.
+    if [[ ! -f "$report" ]]; then
+        echo "COMPARE-ERR" > "$out_file"
+        return 0
+    fi
+
+    local edge_line level_line
+    edge_line="$(grep -E '^Edge event types:'  "$report" || true)"
+    level_line="$(grep -E '^Level event types:' "$report" || true)"
+    if [[ -z "$edge_line" || -z "$level_line" ]]; then
+        echo "COMPARE-ERR" > "$out_file"
+        return 0
+    fi
+
+    # Summary line format: "Edge event types:    N clean, M diverged, K count mismatch"
+    local e_div e_cmm l_div l_cmm
+    e_div="$(echo "$edge_line"  | grep -oE '[0-9]+ diverged'       | awk '{print $1}')"
+    e_cmm="$(echo "$edge_line"  | grep -oE '[0-9]+ count mismatch' | awk '{print $1}')"
+    l_div="$(echo "$level_line" | grep -oE '[0-9]+ diverged'       | awk '{print $1}')"
+    l_cmm="$(echo "$level_line" | grep -oE '[0-9]+ count mismatch' | awk '{print $1}')"
+    [[ -z "$e_div" ]] && e_div=0
+    [[ -z "$e_cmm" ]] && e_cmm=0
+    [[ -z "$l_div" ]] && l_div=0
+    [[ -z "$l_cmm" ]] && l_cmm=0
+    local total_diverge=$(( e_div + e_cmm + l_div + l_cmm ))
+
+    local lower upper
+    _lookup_drift_bounds "$test_name" lower upper
+
+    local ratio
+    ratio="$(awk -v e="$emu_cycles" -v h="$hw_cycles" \
+        'BEGIN{ if(h==0){print "0.00"} else{printf "%.2f", e/h} }')"
+    local in_bounds
+    in_bounds="$(awk -v r="$ratio" -v l="$lower" -v u="$upper" \
+        'BEGIN{ if(r>=l && r<=u) print 1; else print 0 }')"
+
+    if [[ "$total_diverge" -eq 0 && "$in_bounds" == "1" ]]; then
+        echo "MATCH($ratio)" > "$out_file"
+    else
+        echo "DRIFT(ratio=$ratio,diverge=$total_diverge)" > "$out_file"
+    fi
+    return 0
+}
+
 # Derive a variant name from a run command's xclbin filename.
 # e.g., "aie2_cascade.xclbin" -> "cascade", "aie.xclbin" -> ""
 # Returns empty string for the standard "aie.xclbin" case.
@@ -891,7 +1006,7 @@ transform_for_peano() {
 export -f find_lit_file is_standard_test requires_npu2 requires_only_compiler is_xfail
 export -f get_npu_device apply_lit_subs
 export -f extract_build_commands get_run_cmd get_run_variants get_variant_run_cmd
-export -f _strip_trace_flags _variant_from_cmd _run_trace_cycles_pipeline _run_trace_compare
+export -f _strip_trace_flags _variant_from_cmd _run_trace_cycles_pipeline _run_trace_compare _classify_cycle_diff
 export -f sanitize_name wait_npu_idle
 export -f transform_for_chess transform_for_peano
 
@@ -1530,10 +1645,12 @@ run_one_bridge() {
       fi
   fi
 
-  # Phase E: compare HW vs EMU traces when both bins exist.
-  # Classification comes in Task 7; this just produces the raw report.
+  # Phase E: compare HW vs EMU traces when both bins exist, then classify
+  # the result into a persistent .cycle.result (MATCH / DRIFT / EMPTY /
+  # *_TRACE_BUG / COMPARE-ERR / NO_DATA).
   if [[ "$WITH_CYCLE_DIFF" == "true" && "$result" == "PASS" ]]; then
       _run_trace_compare "$name" "${compiler}${vsuffix}" || true
+      _classify_cycle_diff "$name" "${compiler}${vsuffix}" || true
   fi
 
   # Copy events.json for trace decoding.
