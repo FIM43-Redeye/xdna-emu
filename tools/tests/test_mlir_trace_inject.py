@@ -68,3 +68,20 @@ def test_no_op_round_trips_already_traced(tmp_path):
     assert out.exists(), "output file should be written in --no-op mode"
     result = out.read_text()
     assert result.count("aie.trace") >= 1, "aie.trace op should survive round-trip"
+
+
+def test_injector_adds_trace_decl_per_compute_tile(tmp_path):
+    """Each non-shim tile in the input should get one aie.trace decl."""
+    out = tmp_path / "out.mlir"
+    r = _run(["--input", str(UNTRACED), "--out", str(out)])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    result = out.read_text()
+    # Fixture has one compute tile (0, 2). Shim tile (0, 0) is not compute.
+    # Count aie.trace at the op-start level (not aie.trace.event/etc. sub-ops).
+    # A reliable way: look for the decl form "aie.trace @" which is uniquely the
+    # outer TraceOp (its body has aie.trace.event but those are indented/nested).
+    trace_count = result.count("aie.trace @")
+    # We expect exactly 1 trace decl (for tile 0,2).
+    assert trace_count == 1, f"expected 1 aie.trace decl, got {trace_count}\n---\n{result}"
+    # Confirm the tile it attaches to appears in the output (various spellings ok):
+    assert "tile" in result.lower()

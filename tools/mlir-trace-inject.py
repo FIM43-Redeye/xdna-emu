@@ -60,6 +60,7 @@ Exit codes:
        (output file is NOT written on exit 2)
 """
 import argparse
+import io
 import sys
 from pathlib import Path
 
@@ -99,6 +100,97 @@ def _has_trace_ops(operation) -> bool:
     return False
 
 
+def _inject_trace_ops(module, input_path: str, aied) -> int:
+    """Walk module, find compute tiles (row >= 2), and inject one aie.trace per tile.
+
+    Compute tile classification for npu1 / npu1_1col:
+      row 0  -- shim tile (NoC interface)
+      row 1  -- memory tile (shared SRAM, no core)
+      row >= 2 -- compute tile (VLIW core + vector unit)
+
+    Construction uses the decorator-form lowercase builder aied.trace(tile, sym),
+    which matches how mlir-aie's own configure_trace() (python/utils/trace/setup.py)
+    constructs these ops.  The decorator creates the TraceOp with a proper region
+    block, sets up the InsertionPoint for the body, calls the decorated function,
+    and returns the completed op -- identical to how aied.core() and aied.device()
+    work.  This is Path A (direct Python binding constructors).
+
+    Output note: the caller must use module.operation.print(print_generic_op_form=False)
+    rather than str(module) because the aie.trace region body lacks an explicit
+    block terminator in MLIR generic form, which breaks Module.parse() on reload.
+    The custom text-form printer handles this implicitly via aie.trace.stop.
+
+    Returns 0 on success, non-zero on error.
+    """
+    from aie.ir import InsertionPoint, IntegerAttr
+
+    # Locate the single aie.device op at the top level.
+    device_op = None
+    for op in module.body.operations:
+        if op.operation.name == "aie.device":
+            device_op = op
+            break
+    if device_op is None:
+        print(
+            f"error: no aie.device op found in {input_path}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Collect compute tile SSA values from the device body.
+    # Keep them in declaration order so injected traces appear deterministically.
+    device_body = device_op.operation.regions[0].blocks[0]
+    compute_tiles = []  # list of (col: int, row: int, tile_ssa_value)
+    aie_end_op = None
+    for inner in device_body.operations:
+        if inner.operation.name == "aie.tile":
+            col = int(IntegerAttr(inner.operation.attributes["col"]).value)
+            row = int(IntegerAttr(inner.operation.attributes["row"]).value)
+            if row >= 2:
+                compute_tiles.append((col, row, inner.operation.result))
+        if inner.operation.name == "aie.end":
+            aie_end_op = inner
+
+    if not compute_tiles:
+        print(
+            f"warning: no compute tiles (row >= 2) found in {input_path}; "
+            "writing unchanged",
+            file=sys.stderr,
+        )
+        return 0
+
+    # aie.end is the sentinel terminator of the device body. Insert the trace
+    # ops immediately before it so they appear after tile declarations but are
+    # still within the device body.  InsertionPoint(op) means "insert before op".
+    with InsertionPoint(aie_end_op.operation):
+        for col, row, tile_val in compute_tiles:
+            # The @aied.trace(tile, sym) decorator-form builder:
+            #   1. Constructs TraceOp(tile=tile_val, sym_name=sym_name)
+            #   2. Appends a block to the op's single region
+            #   3. Sets the InsertionPoint to at_block_begin of that block
+            #   4. Calls the decorated function (populates the body)
+            #   5. Restores the previous InsertionPoint
+            # This exactly mirrors how mlir-aie's configure_trace() works.
+            @aied.trace(tile_val, f"trace_t{col}_{row}")
+            def _trace_body():  # noqa: F811 -- redefinition is intentional (one per tile)
+                aied.trace_mode(aied.TraceMode.EventTime)
+                # packet id=1 is the conventional starting id; AIEInsertTraceFlows
+                # will reassign ids when it lowers the declarative ops to hardware
+                # configuration sequences.
+                aied.trace_packet(1, aied.TracePacketType.Core)
+                # Default event set: instruction vector, software event pins 0 and 1.
+                # These match mlir-aie's _get_default_events_for_tile() for core tiles.
+                aied.trace_event("INSTR_VECTOR")
+                aied.trace_event("INSTR_EVENT_0")
+                aied.trace_event("INSTR_EVENT_1")
+                # Broadcast channels 15 (start) and 14 (stop) are the mlir-aie
+                # defaults from configure_trace() (python/utils/trace/setup.py).
+                aied.trace_start(broadcast=15)
+                aied.trace_stop(broadcast=14)
+
+    return 0
+
+
 def main():
     args = parse_args()
     text = Path(args.input).read_text()
@@ -120,9 +212,17 @@ def main():
                     file=sys.stderr,
                 )
                 return 2
-            # TODO(Task 4-5): real injection logic
-            raise NotImplementedError("injection not yet implemented")
-        Path(args.out).write_text(str(module))
+            rc = _inject_trace_ops(module, args.input, aied)
+            if rc != 0:
+                return rc
+        buf = io.StringIO()
+        # Use print_generic_op_form=False so the aie dialect's custom printers
+        # emit text-form syntax (e.g. "aie.trace @sym(tile) { ... }") rather
+        # than generic form ("aie.trace"(%0) <{sym_name = ...}> ({...})).
+        # The generic form lacks explicit block terminators for aie.trace
+        # regions and cannot be round-tripped through Module.parse().
+        module.operation.print(print_generic_op_form=False, file=buf)
+        Path(args.out).write_text(buf.getvalue())
 
 
 if __name__ == "__main__":
