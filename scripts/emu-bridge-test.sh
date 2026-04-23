@@ -516,45 +516,49 @@ _strip_trace_flags() {
   echo "$cmd"
 }
 
-# _run_hw_cycles_pipeline <build_dir> <xclbin> <kernel> <instr> <variant>
-# Runs bridge-trace-runner against a real HW xclbin, then trace-to-cycles
-# on the resulting trace bytes. Writes cycles.HW.<variant>.txt to RESULTS_DIR
-# beside the standard *.hw.result file. Best-effort: any failure logs and
-# returns non-zero, but the caller treats this as informational (|| true).
-_run_hw_cycles_pipeline() {
-    local build_dir="$1"
-    local xclbin="$2"
-    local kernel="$3"      # currently unused; runner auto-detects single kernel
-    local instr="$4"
-    local variant="$5"     # already includes compiler + any variant suffix
+# _run_trace_cycles_pipeline <side> <build_dir> <xclbin> <kernel> <instr> <variant>
+#   side ∈ {HW, EMU}.
+# Runs bridge-trace-runner against a traced xclbin on the requested side,
+# then runs trace-to-cycles on the output. Writes:
+#   RESULTS_DIR/<safe>.hw-cycles/trace_{hw,emu}.<variant>.bin
+#   RESULTS_DIR/<safe>.<variant>.cycles.{HW,EMU}.txt
+# Best-effort: any failure logs and returns non-zero, but callers pass || true
+# so the core bridge/hw verdicts are never gated on the cycle-capture side.
+_run_trace_cycles_pipeline() {
+    local side="$1"
+    local build_dir="$2"
+    local xclbin="$3"
+    local kernel="$4"      # currently unused; runner auto-detects single kernel
+    local instr="$5"
+    local variant="$6"     # already includes compiler + any variant suffix
 
     local test_name
     test_name="$(basename "$(dirname "$build_dir")")"
 
     local runner="$EMU_ROOT/bridge-runner/build/bridge-trace-runner"
     if [[ ! -x "$runner" ]]; then
-        echo "[hw-cycles] $test_name ($variant): runner not built at $runner; skipping" >&2
+        echo "[trace-cycles:$side] $test_name ($variant): runner not built at $runner; skipping" >&2
         return 0
     fi
 
     # parse_trace needs the POST-LOWERING MLIR (input_with_addresses.mlir)
     # produced by aiecc.py inside its .prj scratch dir. The source aie_arch.mlir
     # has high-level aie.trace ops but lacks the npu.write32 ops that
-    # parse_mlir_trace_events scans for to identify trace tiles. Fall back to
-    # the source MLIR for the trace-presence check; skip extraction if the
+    # parse_mlir_trace_events scans for to identify trace tiles. Use the
+    # source MLIR for the trace-presence check; skip extraction if the
     # lowered MLIR is missing.
     local src_mlir="$build_dir/aie_arch.mlir"
     if [[ ! -f "$src_mlir" ]]; then
-        echo "[hw-cycles] $test_name ($variant): no MLIR at $src_mlir; cannot extract cycles" >&2
+        echo "[trace-cycles:$side] $test_name ($variant): no MLIR at $src_mlir; cannot extract cycles" >&2
         return 0
     fi
     if ! grep -q "aie.trace " "$src_mlir" 2>/dev/null; then
-        echo "[hw-cycles] $test_name ($variant): MLIR has no trace ops; skipping" >&2
+        echo "[trace-cycles:$side] $test_name ($variant): MLIR has no trace ops; skipping" >&2
         return 0
     fi
     local mlir_path="$build_dir/aie_arch.mlir.prj/input_with_addresses.mlir"
     if [[ ! -f "$mlir_path" ]]; then
-        echo "[hw-cycles] $test_name ($variant): no lowered MLIR at $mlir_path; cannot extract cycles" >&2
+        echo "[trace-cycles:$side] $test_name ($variant): no lowered MLIR at $mlir_path; cannot extract cycles" >&2
         return 0
     fi
 
@@ -562,18 +566,36 @@ _run_hw_cycles_pipeline() {
     safe="$(sanitize_name "$test_name")"
     local work_dir="$RESULTS_DIR/${safe}.hw-cycles"
     mkdir -p "$work_dir"
-    local trace_bin="$work_dir/trace_hw.$variant.bin"
-    local cycles_txt="$RESULTS_DIR/${safe}.${variant}.cycles.HW.txt"
-    local runner_log="$work_dir/runner.$variant.log"
-    local extract_log="$work_dir/extract.$variant.log"
 
-    if ! "$runner" \
+    local bin_label cycles_label
+    case "$side" in
+        HW)  bin_label="trace_hw";  cycles_label="HW" ;;
+        EMU) bin_label="trace_emu"; cycles_label="EMU" ;;
+        *)   echo "[trace-cycles] unknown side: $side" >&2; return 1 ;;
+    esac
+
+    local trace_bin="$work_dir/${bin_label}.${variant}.bin"
+    local cycles_txt="$RESULTS_DIR/${safe}.${variant}.cycles.${cycles_label}.txt"
+    local runner_log="$work_dir/runner.${bin_label}.${variant}.log"
+    local extract_log="$work_dir/extract.${bin_label}.${variant}.log"
+
+    # Side-specific env: EMU routes through the XRT plugin + xdna-emu. HW runs
+    # on real silicon, so nothing extra is needed.
+    local -a env_prefix=()
+    if [[ "$side" == "EMU" ]]; then
+        env_prefix+=("XDNA_EMU=${XDNA_EMU:-debug}")
+        env_prefix+=("XDNA_EMU_LOG_LEVEL=${XDNA_EMU_LOG_LEVEL:-info}")
+        env_prefix+=("XRT_DEVICE_BDF=ffff:ff:1f.0")
+        [[ -n "${XDNA_EMU_DIR:-}" ]] && env_prefix+=("XDNA_EMU_DIR=$XDNA_EMU_DIR")
+    fi
+
+    if ! env "${env_prefix[@]}" "$runner" \
         --xclbin "$xclbin" \
         --instr "$instr" \
         --trace-out "$trace_bin" \
         --trace-size 8192 \
         2>"$runner_log"; then
-        echo "[hw-cycles] $test_name ($variant): runner failed; see $runner_log" >&2
+        echo "[trace-cycles:$side] $test_name ($variant): runner failed; see $runner_log" >&2
         return 1
     fi
 
@@ -583,11 +605,11 @@ _run_hw_cycles_pipeline() {
         --xclbin-mlir "$mlir_path" \
         --out "$cycles_txt" \
         2>"$extract_log"; then
-        echo "[hw-cycles] $test_name ($variant): extractor failed; see $extract_log" >&2
+        echo "[trace-cycles:$side] $test_name ($variant): extractor failed; see $extract_log" >&2
         return 1
     fi
 
-    echo "[hw-cycles] $test_name ($variant): cycles=$(cat "$cycles_txt")" >&2
+    echo "[trace-cycles:$side] $test_name ($variant): cycles=$(cat "$cycles_txt")" >&2
     return 0
 }
 
@@ -817,7 +839,7 @@ transform_for_peano() {
 export -f find_lit_file is_standard_test requires_npu2 requires_only_compiler is_xfail
 export -f get_npu_device apply_lit_subs
 export -f extract_build_commands get_run_cmd get_run_variants get_variant_run_cmd
-export -f _strip_trace_flags _variant_from_cmd _run_hw_cycles_pipeline
+export -f _strip_trace_flags _variant_from_cmd _run_trace_cycles_pipeline
 export -f sanitize_name wait_npu_idle
 export -f transform_for_chess transform_for_peano
 
@@ -1306,9 +1328,9 @@ run_one_hardware() {
       local _hw_instr="$build_dir/insts.bin"
       [[ -f "$_hw_instr" ]] || _hw_instr=""
       if [[ -n "$_hw_xclbin" && -n "$_hw_instr" ]]; then
-          _run_hw_cycles_pipeline "$build_dir" "$_hw_xclbin" "" "$_hw_instr" "${compiler}${vsuffix}" || true
+          _run_trace_cycles_pipeline HW "$build_dir" "$_hw_xclbin" "" "$_hw_instr" "${compiler}${vsuffix}" || true
       else
-          echo "[hw-cycles] $name (${compiler}${vsuffix}): missing xclbin or insts.bin in $build_dir; skipping" >&2
+          echo "[trace-cycles:HW] $name (${compiler}${vsuffix}): missing xclbin or insts.bin in $build_dir; skipping" >&2
       fi
   fi
 
