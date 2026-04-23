@@ -1370,6 +1370,17 @@ compile_one_compiler() {
     [[ "$cmd" == *clang*test.cpp* ]] && continue
     [[ "$cmd" == *g++*test.cpp* ]] && continue
 
+    # When HW_CYCLES is active and this RUN line is the .py MLIR generator
+    # (column_specific-style tests: `python3 .../aie*.py > ./foo.mlir`),
+    # substitute `cp <traced_mlir> ./foo.mlir` so the traced MLIR our
+    # injector produced ends up where aiecc expects it. Without this swap
+    # the .py would regenerate the MLIR clean, clobbering our injection.
+    if [[ -n "$HW_CYCLES_TRACED_MLIR" ]] \
+       && [[ "$cmd" =~ ^python3[[:space:]]+[^[:space:]]+/aie[^[:space:]]*\.py[[:space:]]+\>[[:space:]]+([^[:space:]]+\.mlir)$ ]]; then
+      local _py_out="${BASH_REMATCH[1]}"
+      cmd="cp $HW_CYCLES_TRACED_MLIR $_py_out"
+    fi
+
     # Fix MLIR path references for aiecc commands.
     if [[ "$cmd" == *aiecc.py* ]]; then
       cmd="${cmd//$src_dir\/aie.mlir/./aie_arch.mlir}"
@@ -1483,27 +1494,58 @@ compile_one() {
   if [[ "$WITH_HW_CYCLES" == "true" ]] && is_trace_incompat "$name"; then
       echo "  HW-CYCLES INJECT $name: SKIP (in trace-incompat-tests.txt)"
   fi
-  if [[ "$WITH_HW_CYCLES" == "true" ]] && [[ -f "$src_dir/aie.mlir" ]] \
-      && ! is_trace_incompat "$name"; then
+  if [[ "$WITH_HW_CYCLES" == "true" ]] && ! is_trace_incompat "$name"; then
       local hw_cycles_inject_log="$RESULTS_DIR/${safe}.hw-cycles-inject.log"
       local hw_cycles_target="$build_dir/aie-hw-cycles-traced.mlir"
       local hw_cycles_src="$build_dir/aie-hw-cycles-src.mlir"
-      local hw_cycles_dev
-      hw_cycles_dev="$(get_npu_device "$src_dir")"
       mkdir -p "$build_dir"
-      sed "s/NPUDEVICE/${hw_cycles_dev}/g" "$src_dir/aie.mlir" > "$hw_cycles_src"
-      PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python \
-          python3 "$EMU_ROOT/tools/mlir-trace-inject.py" \
-          --input "$hw_cycles_src" \
-          --out "$hw_cycles_target" \
-          --buffer-size 8192 \
-          > "$hw_cycles_inject_log" 2>&1
-      case $? in
-          0) hw_cycles_traced_mlir="$hw_cycles_target"
-             echo "  HW-CYCLES INJECT $name: OK" ;;
-          2) echo "  HW-CYCLES INJECT $name: SKIP (already traced)" ;;
-          *) echo "  HW-CYCLES INJECT $name: FAIL (see $hw_cycles_inject_log)" ;;
-      esac
+      : > "$hw_cycles_inject_log"
+      # Resolve the source MLIR. Two cases:
+      #   - Static:  $src_dir/aie.mlir exists verbatim. Apply the test's
+      #              NPUDEVICE sed substitution, write to hw_cycles_src.
+      #   - Python:  No aie.mlir, but an aie*.py generator lives in the
+      #              source dir (column_specific-style tests). Run it
+      #              with PYTHONPATH to materialize the MLIR, then
+      #              inject on that. The .py is expected to emit a
+      #              complete device-bound MLIR -- no NPUDEVICE sub
+      #              needed.
+      local have_src=false
+      if [[ -f "$src_dir/aie.mlir" ]]; then
+          local hw_cycles_dev
+          hw_cycles_dev="$(get_npu_device "$src_dir")"
+          sed "s/NPUDEVICE/${hw_cycles_dev}/g" "$src_dir/aie.mlir" > "$hw_cycles_src"
+          have_src=true
+      else
+          local py_gen=""
+          for _cand in "$src_dir"/aie*.py; do
+              [[ -f "$_cand" ]] || continue
+              grep -q 'RUN:' "$_cand" 2>/dev/null || continue
+              py_gen="$_cand"; break
+          done
+          if [[ -n "$py_gen" ]]; then
+              echo "  HW-CYCLES INJECT $name: generating MLIR from $(basename "$py_gen")" >> "$hw_cycles_inject_log"
+              if PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python \
+                  python3 "$py_gen" > "$hw_cycles_src" 2>> "$hw_cycles_inject_log"; then
+                  have_src=true
+              else
+                  echo "  HW-CYCLES INJECT $name: FAIL (running $(basename "$py_gen") -- see $hw_cycles_inject_log)"
+              fi
+          fi
+      fi
+      if $have_src; then
+          PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python \
+              python3 "$EMU_ROOT/tools/mlir-trace-inject.py" \
+              --input "$hw_cycles_src" \
+              --out "$hw_cycles_target" \
+              --buffer-size 8192 \
+              >> "$hw_cycles_inject_log" 2>&1
+          case $? in
+              0) hw_cycles_traced_mlir="$hw_cycles_target"
+                 echo "  HW-CYCLES INJECT $name: OK" ;;
+              2) echo "  HW-CYCLES INJECT $name: SKIP (already traced)" ;;
+              *) echo "  HW-CYCLES INJECT $name: FAIL (see $hw_cycles_inject_log)" ;;
+          esac
+      fi
   fi
   export HW_CYCLES_TRACED_MLIR="$hw_cycles_traced_mlir"
 
