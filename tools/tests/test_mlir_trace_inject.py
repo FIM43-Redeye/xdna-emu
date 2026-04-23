@@ -1,7 +1,10 @@
 """Tests for tools/mlir-trace-inject.py."""
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 INJECTOR = REPO / "tools" / "mlir-trace-inject.py"
@@ -128,9 +131,6 @@ def test_injector_default_buffer_size_used_when_not_specified(tmp_path):
 # Integration tests: injected MLIR survives a real aiecc.py compile
 # ---------------------------------------------------------------------------
 
-import os
-import shutil
-
 # Small, known-good aiecc test fixture with an inline core and no link_with
 # deps.  Uses npu1_1col — one of the device names accepted by the installed
 # mlir-aie Python bindings (unlike the newer "NPUDEVICE" alias used by some
@@ -143,8 +143,6 @@ BRIDGE_TEST_MLIR = Path(
 
 def test_injector_output_compiles_with_aiecc(tmp_path):
     """Traced MLIR should compile cleanly via aiecc.py."""
-    import pytest
-
     if not BRIDGE_TEST_MLIR.exists():
         pytest.skip(f"bridge test MLIR not found: {BRIDGE_TEST_MLIR}")
     if shutil.which("aiecc.py") is None:
@@ -203,9 +201,14 @@ def test_compiled_traced_xclbin_has_trace_buffer_slot(tmp_path):
 
     When the toolchain is updated to a version that names the slot "trace",
     replace the XML arg-count assertion with 'assert "trace" in metadata_xml'.
-    """
-    import pytest
 
+    Baseline note: the untraced `cpp_npu_and_xclbin.mlir` produces a kernel
+    with args at id=0..6 (opcode, instr, ninstr, plus the test's 4 buffers).
+    The id="7" slot only exists after AIEInsertTraceFlows appends the trace
+    buffer.  If this test ever starts passing on untraced MLIR (the baseline
+    grows to >= 8 args for unrelated reasons), swap in an explicit
+    untraced-vs-traced arg-count comparison.
+    """
     if not BRIDGE_TEST_MLIR.exists():
         pytest.skip(f"bridge test MLIR not found: {BRIDGE_TEST_MLIR}")
     if shutil.which("aiecc.py") is None:
@@ -233,7 +236,9 @@ def test_compiled_traced_xclbin_has_trace_buffer_slot(tmp_path):
         text=True,
         cwd=str(build_dir),
     )
-    assert r2.returncode == 0, f"aiecc failed:\n{r2.stderr}"
+    assert r2.returncode == 0, (
+        f"aiecc failed:\nSTDOUT:\n{r2.stdout}\nSTDERR:\n{r2.stderr}"
+    )
     xclbin = build_dir / "aie-traced.xclbin"
     assert xclbin.exists(), "xclbin was not produced"
 
