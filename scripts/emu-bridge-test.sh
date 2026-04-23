@@ -92,6 +92,7 @@ NO_TRACE="${NO_TRACE:-true}"
 SWEEP=false
 RUN_AIESIM=false
 NO_TIMEOUT=false
+WITH_HW_CYCLES=${WITH_HW_CYCLES:-false}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -115,6 +116,7 @@ while [[ $# -gt 0 ]]; do
     --serial-hw)           NPU_HW_JOBS=1; shift ;;
     --parallel-hw)         NPU_HW_JOBS="${NPU_HW_JOBS_PARALLEL:-5}"; shift ;;
     --no-timeout)          NO_TIMEOUT=true; shift ;;
+    --with-hw-cycles)      WITH_HW_CYCLES=true; shift ;;
     --help|-h)
       cat <<'USAGE'
 Usage: emu-bridge-test.sh [options] [test-name-regex]
@@ -135,6 +137,8 @@ Options:
   --serial-hw     Run hardware tests sequentially (explicit, same as default)
   --parallel-hw   Run hardware tests in parallel (-j5) for speed
   --no-timeout    Run EMU without wall-clock timeout (use for very long runs)
+  --with-hw-cycles  Run trace-based HW cycle capture pipeline per HW test;
+                    emits cycles.HW.<variant>.txt beside each result.
   (default: both compilers, Chess is ground truth, HW serial)
 
 Filter:
@@ -168,7 +172,7 @@ for _c in "${COMPILERS[@]}"; do
 done
 
 # Export variables that parallel jobs need.
-export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP RUN_AIESIM NO_TIMEOUT
+export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP RUN_AIESIM NO_TIMEOUT WITH_HW_CYCLES
 export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT SCRIPT_DIR TRACE_QUARANTINE_FILE
 export XRT_DIR XRT_INCLUDE XRT_LIB
 export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
@@ -501,6 +505,20 @@ _strip_trace_flags() {
     cmd="$(echo "$cmd" | sed 's/[[:space:]]\+/ /g' | sed 's/[[:space:]]*$//')"
   fi
   echo "$cmd"
+}
+
+# _run_hw_cycles_pipeline <test_dir> <xclbin> <kernel> <instr> <variant>
+# Runs trace inject -> aiecc (already done upstream) -> bridge-trace-runner ->
+# trace-to-cycles. Output file: $test_dir/cycles.HW.<variant>.txt
+# Stub for Task 12; full implementation lands in Task 13.
+_run_hw_cycles_pipeline() {
+    local test_dir="$1"
+    local xclbin="$2"
+    local kernel="$3"
+    local instr="$4"
+    local variant="$5"
+    echo "_run_hw_cycles_pipeline: stub (test_dir=$test_dir variant=$variant)" >&2
+    return 0
 }
 
 # Derive a variant name from a run command's xclbin filename.
