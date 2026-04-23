@@ -1462,6 +1462,22 @@ run_one_bridge() {
 
   echo "$result" > "$result_file"
 
+  # Phase E: capture EMU cycle count via trace pipeline (best-effort).
+  # Mirrors run_one_hardware's WITH_HW_CYCLES hook; only fires under the
+  # cycle-diff superset flag, and only for tests that passed (a FAILed
+  # bridge run's cycle count is meaningless for drift comparison).
+  if [[ "$WITH_CYCLE_DIFF" == "true" && "$result" == "PASS" ]]; then
+      local _emu_xclbin
+      _emu_xclbin="$(find "$build_dir" -maxdepth 1 -name '*.xclbin' -print -quit 2>/dev/null || true)"
+      local _emu_instr="$build_dir/insts.bin"
+      [[ -f "$_emu_instr" ]] || _emu_instr=""
+      if [[ -n "$_emu_xclbin" && -n "$_emu_instr" ]]; then
+          _run_trace_cycles_pipeline EMU "$build_dir" "$_emu_xclbin" "" "$_emu_instr" "${compiler}${vsuffix}" || true
+      else
+          echo "[trace-cycles:EMU] $name (${compiler}${vsuffix}): missing xclbin or insts.bin in $build_dir; skipping" >&2
+      fi
+  fi
+
   # Copy events.json for trace decoding.
   local build_traced="$BUILD_BASE/$name/traced"
   if [[ -f "$build_traced/events.json" ]]; then
