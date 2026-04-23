@@ -507,17 +507,72 @@ _strip_trace_flags() {
   echo "$cmd"
 }
 
-# _run_hw_cycles_pipeline <test_dir> <xclbin> <kernel> <instr> <variant>
-# Runs trace inject -> aiecc (already done upstream) -> bridge-trace-runner ->
-# trace-to-cycles. Output file: $test_dir/cycles.HW.<variant>.txt
-# Stub for Task 12; full implementation lands in Task 13.
+# _run_hw_cycles_pipeline <build_dir> <xclbin> <kernel> <instr> <variant>
+# Runs bridge-trace-runner against a real HW xclbin, then trace-to-cycles
+# on the resulting trace bytes. Writes cycles.HW.<variant>.txt to RESULTS_DIR
+# beside the standard *.hw.result file. Best-effort: any failure logs and
+# returns non-zero, but the caller treats this as informational (|| true).
 _run_hw_cycles_pipeline() {
-    local test_dir="$1"
+    local build_dir="$1"
     local xclbin="$2"
-    local kernel="$3"
+    local kernel="$3"      # currently unused; runner auto-detects single kernel
     local instr="$4"
-    local variant="$5"
-    echo "_run_hw_cycles_pipeline: stub (test_dir=$test_dir variant=$variant)" >&2
+    local variant="$5"     # already includes compiler + any variant suffix
+
+    local test_name
+    test_name="$(basename "$(dirname "$build_dir")")"
+
+    local runner="$EMU_ROOT/bridge-runner/build/bridge-trace-runner"
+    if [[ ! -x "$runner" ]]; then
+        echo "[hw-cycles] $test_name ($variant): runner not built at $runner; skipping" >&2
+        return 0
+    fi
+
+    # The injected MLIR sits at $build_dir/aie_arch.mlir (compile_one_compiler
+    # writes it there during MLIR prep). trace-to-cycles needs it to call
+    # parse_trace().
+    local mlir_path="$build_dir/aie_arch.mlir"
+    if [[ ! -f "$mlir_path" ]]; then
+        echo "[hw-cycles] $test_name ($variant): no MLIR at $mlir_path; cannot extract cycles" >&2
+        return 0
+    fi
+
+    # Skip if xclbin has no trace kernarg (injection was a no-op or skipped).
+    if ! xclbinutil --info --input "$xclbin" 2>/dev/null | grep -qi "trace"; then
+        echo "[hw-cycles] $test_name ($variant): xclbin has no trace kernarg; skipping" >&2
+        return 0
+    fi
+
+    local safe
+    safe="$(sanitize_name "$test_name")"
+    local work_dir="$RESULTS_DIR/${safe}.hw-cycles"
+    mkdir -p "$work_dir"
+    local trace_bin="$work_dir/trace.$variant.bin"
+    local cycles_txt="$RESULTS_DIR/${safe}.${variant}.cycles.HW.txt"
+    local runner_log="$work_dir/runner.$variant.log"
+    local extract_log="$work_dir/extract.$variant.log"
+
+    if ! "$runner" \
+        --xclbin "$xclbin" \
+        --instr "$instr" \
+        --trace-out "$trace_bin" \
+        --trace-size 8192 \
+        2>"$runner_log"; then
+        echo "[hw-cycles] $test_name ($variant): runner failed; see $runner_log" >&2
+        return 1
+    fi
+
+    if ! PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python \
+        python3 "$EMU_ROOT/tools/trace-to-cycles.py" \
+        --trace-bin "$trace_bin" \
+        --xclbin-mlir "$mlir_path" \
+        --out "$cycles_txt" \
+        2>"$extract_log"; then
+        echo "[hw-cycles] $test_name ($variant): extractor failed; see $extract_log" >&2
+        return 1
+    fi
+
+    echo "[hw-cycles] $test_name ($variant): cycles=$(cat "$cycles_txt")" >&2
     return 0
 }
 
@@ -747,7 +802,7 @@ transform_for_peano() {
 export -f find_lit_file is_standard_test requires_npu2 requires_only_compiler is_xfail
 export -f get_npu_device apply_lit_subs
 export -f extract_build_commands get_run_cmd get_run_variants get_variant_run_cmd
-export -f _strip_trace_flags _variant_from_cmd
+export -f _strip_trace_flags _variant_from_cmd _run_hw_cycles_pipeline
 export -f sanitize_name wait_npu_idle
 export -f transform_for_chess transform_for_peano
 
@@ -843,7 +898,9 @@ compile_one_compiler() {
 
   # Determine which source MLIR to use.
   local src_mlir=""
-  if [[ "$TRACE_OK" == "true" ]] && [[ -f "$TRACED_DIR/aie_traced.mlir" ]]; then
+  if [[ -n "$HW_CYCLES_TRACED_MLIR" ]] && [[ -f "$HW_CYCLES_TRACED_MLIR" ]]; then
+    src_mlir="$HW_CYCLES_TRACED_MLIR"
+  elif [[ "$TRACE_OK" == "true" ]] && [[ -f "$TRACED_DIR/aie_traced.mlir" ]]; then
     src_mlir="$TRACED_DIR/aie_traced.mlir"
   elif [[ -f "$src_dir/aie.mlir" ]]; then
     src_mlir="$src_dir/aie.mlir"
@@ -1036,6 +1093,41 @@ compile_one() {
   export TRACE_OK="$trace_ok"
   export TRACED_DIR="$traced_dir"
 
+  # ---- Phase B: HW cycle capture trace injection (separate from --trace) ----
+  # When WITH_HW_CYCLES=true, inject declarative aie.trace ops into the
+  # source MLIR via mlir-trace-inject.py. The injected output gets fed to
+  # aiecc.py in compile_one_compiler via HW_CYCLES_TRACED_MLIR. Independent
+  # of NO_TRACE / trace-prepare.py -- the two paths produce different artifacts
+  # and target different downstream consumers.
+  #
+  # The injector requires a valid device keyword (npu1, npu1_1col, etc.);
+  # mlir-aie test sources use the literal "NPUDEVICE" placeholder which the
+  # test's lit file normally resolves via sed. We do the substitution into a
+  # temporary pre-substituted MLIR before handing it to the injector.
+  local hw_cycles_traced_mlir=""
+  if [[ "$WITH_HW_CYCLES" == "true" ]] && [[ -f "$src_dir/aie.mlir" ]]; then
+      local hw_cycles_inject_log="$RESULTS_DIR/${safe}.hw-cycles-inject.log"
+      local hw_cycles_target="$build_dir/aie-hw-cycles-traced.mlir"
+      local hw_cycles_src="$build_dir/aie-hw-cycles-src.mlir"
+      local hw_cycles_dev
+      hw_cycles_dev="$(get_npu_device "$src_dir")"
+      mkdir -p "$build_dir"
+      sed "s/NPUDEVICE/${hw_cycles_dev}/g" "$src_dir/aie.mlir" > "$hw_cycles_src"
+      PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python \
+          python3 "$EMU_ROOT/tools/mlir-trace-inject.py" \
+          --input "$hw_cycles_src" \
+          --out "$hw_cycles_target" \
+          --buffer-size 8192 \
+          > "$hw_cycles_inject_log" 2>&1
+      case $? in
+          0) hw_cycles_traced_mlir="$hw_cycles_target"
+             echo "  HW-CYCLES INJECT $name: OK" ;;
+          2) echo "  HW-CYCLES INJECT $name: SKIP (already traced)" ;;
+          *) echo "  HW-CYCLES INJECT $name: FAIL (see $hw_cycles_inject_log)" ;;
+      esac
+  fi
+  export HW_CYCLES_TRACED_MLIR="$hw_cycles_traced_mlir"
+
   # Reconstruct COMPILERS array from serialized string
   local compilers
   read -ra compilers <<< "$COMPILERS_STR"
@@ -1191,6 +1283,19 @@ run_one_hardware() {
   fi
 
   echo "$result" > "$result_file"
+
+  # Phase B: capture HW cycle count via trace pipeline (best-effort).
+  if [[ "$WITH_HW_CYCLES" == "true" && "$result" == "PASS" ]]; then
+      local _hw_xclbin
+      _hw_xclbin="$(find "$build_dir" -maxdepth 1 -name '*.xclbin' -print -quit 2>/dev/null || true)"
+      local _hw_instr="$build_dir/insts.bin"
+      [[ -f "$_hw_instr" ]] || _hw_instr=""
+      if [[ -n "$_hw_xclbin" && -n "$_hw_instr" ]]; then
+          _run_hw_cycles_pipeline "$build_dir" "$_hw_xclbin" "" "$_hw_instr" "${compiler}${vsuffix}" || true
+      else
+          echo "[hw-cycles] $name (${compiler}${vsuffix}): missing xclbin or insts.bin in $build_dir; skipping" >&2
+      fi
+  fi
 
   # Copy events.json for trace decoding.
   local build_traced="$BUILD_BASE/$name/traced"
