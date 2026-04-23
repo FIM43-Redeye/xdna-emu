@@ -52,10 +52,20 @@ provided aiex was imported before entering the context.
 Usage:
   mlir-trace-inject.py --input design.mlir --out design-traced.mlir
   mlir-trace-inject.py --no-op --input design.mlir --out copy.mlir
+
+Exit codes:
+  0 -- success (output written)
+  1 -- unexpected error (e.g. parse failure, argparse rejection)
+  2 -- input already contains aie.trace ops; refusing to double-inject
+       (output file is NOT written on exit 2)
 """
 import argparse
 import sys
 from pathlib import Path
+
+# MLIR op name used by mlir-aie for the declarative trace op. If the
+# aie dialect is ever renamed upstream, only this constant needs updating.
+TRACE_OP_NAME = "aie.trace"
 
 
 def parse_args():
@@ -72,14 +82,14 @@ def parse_args():
 
 
 def _has_trace_ops(operation) -> bool:
-    """Return True if any op in the subtree has name 'aie.trace'.
+    """Return True if any op in the subtree has name TRACE_OP_NAME.
 
     The MLIR Python bindings expose operation.walk() but its callback
     signature expects a C++ WalkCallback type that is not easily wrapped from
     Python (calling it raises std::bad_cast).  Manual traversal through
     operation.regions is reliable and fast enough for design-scale MLIR.
     """
-    if operation.name == "aie.trace":
+    if operation.name == TRACE_OP_NAME:
         return True
     for region in operation.regions:
         for block in region:

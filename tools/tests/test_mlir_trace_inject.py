@@ -52,7 +52,8 @@ def test_injector_bails_on_already_traced(tmp_path):
         check=False,
     )
     assert r.returncode == 2, f"expected exit 2, got {r.returncode}; stderr={r.stderr}"
-    assert "already" in r.stderr.lower() or "trace" in r.stderr.lower()
+    assert "already contains" in r.stderr.lower(), \
+        f"stderr should cite 'already contains'; got: {r.stderr}"
     assert not out.exists(), "output file should not be written when injector refuses"
 
 
