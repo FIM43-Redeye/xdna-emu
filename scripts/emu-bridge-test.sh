@@ -610,6 +610,57 @@ extract_build_commands() {
   done < "$lit_file"
 }
 
+# ---------------------------------------------------------------------------
+# Test-artifact name discovery (Phase E post-validation)
+# ---------------------------------------------------------------------------
+# aiecc.py emits NPU instruction + control-packet binaries whose filenames
+# are specified by the test's run.lit via `--npu-insts-name=` and
+# `--ctrlpkt-name=` flags. Historically we hardcoded "insts.bin"; that
+# breaks for control-packet tests (aie_run_seq.bin) and any future test
+# that picks its own name. Parse the lit authoritatively instead.
+#
+# Each helper echoes the discovered filename (no path) and defaults to the
+# aiecc.py default when the flag isn't present. Both are pure text
+# operations, safe to call from subshells via export -f below.
+
+# _discover_aiecc_name <src_dir> <flag_suffix> <default>
+# Extracts --<flag_suffix>=<value> from the test's run.lit and echoes the value.
+# Echoes <default> if no matching flag is found or the lit is missing.
+_discover_aiecc_name() {
+  local src_dir="$1"
+  local flag="$2"
+  local fallback="$3"
+  local lit
+  lit="$(find_lit_file "$src_dir")"
+  if [[ -z "$lit" || ! -f "$lit" ]]; then
+    echo "$fallback"
+    return
+  fi
+  local val
+  val="$(grep -oE -- "--${flag}=[^[:space:]]+" "$lit" | tail -1 | sed "s/^--${flag}=//")"
+  if [[ -z "$val" ]]; then
+    echo "$fallback"
+  else
+    echo "$val"
+  fi
+}
+
+# _discover_instr_binary <src_dir>
+# Primary NPU instruction binary (aiecc --npu-insts-name). Default: insts.bin.
+_discover_instr_binary() {
+  _discover_aiecc_name "$1" "npu-insts-name" "insts.bin"
+}
+
+# _discover_ctrlpkt_binary <src_dir>
+# Optional control-packet blob (aiecc --ctrlpkt-name). Default: "" (not used).
+# Callers should test the returned path for existence; the default is empty
+# so builds without ctrlpkt generation produce no phantom --input path.
+_discover_ctrlpkt_binary() {
+  _discover_aiecc_name "$1" "ctrlpkt-name" ""
+}
+
+export -f _discover_aiecc_name _discover_instr_binary _discover_ctrlpkt_binary
+
 # Strip legacy trace flags from a run command.
 # Used when our trace injection is active (NO_TRACE != "true") so the test's
 # built-in tracing allocates nothing (trace_size defaults to 0).
@@ -652,23 +703,31 @@ _run_trace_cycles_pipeline() {
     fi
 
     # parse_trace needs the POST-LOWERING MLIR (input_with_addresses.mlir)
-    # produced by aiecc.py inside its .prj scratch dir. The source aie_arch.mlir
-    # has high-level aie.trace ops but lacks the npu.write32 ops that
-    # parse_mlir_trace_events scans for to identify trace tiles. Use the
-    # source MLIR for the trace-presence check; skip extraction if the
-    # lowered MLIR is missing.
-    local src_mlir="$build_dir/aie_arch.mlir"
-    if [[ ! -f "$src_mlir" ]]; then
-        echo "[trace-cycles:$side] $test_name ($variant): no MLIR at $src_mlir; cannot extract cycles" >&2
+    # produced by aiecc.py inside its .prj scratch dir. The .prj dir is
+    # named after whatever MLIR aiecc was invoked on -- aie_arch.mlir.prj
+    # for most tests, aie_overlay.mlir.prj for control-packet tests, etc.
+    # Discover it by searching for the unique input_with_addresses.mlir
+    # rather than hardcoding the source-filename assumption.
+    #
+    # The trace-presence check uses a source MLIR with high-level aie.trace
+    # ops. We pick any MLIR in build_dir with aie.trace (typically
+    # aie_arch.mlir, written by our injector); if none, no tracing happened.
+    local src_mlir=""
+    for _cand in "$build_dir"/*.mlir; do
+        [[ -f "$_cand" ]] || continue
+        if grep -q "aie.trace " "$_cand" 2>/dev/null; then
+            src_mlir="$_cand"
+            break
+        fi
+    done
+    if [[ -z "$src_mlir" ]]; then
+        echo "[trace-cycles:$side] $test_name ($variant): no MLIR with aie.trace ops in $build_dir; skipping" >&2
         return 0
     fi
-    if ! grep -q "aie.trace " "$src_mlir" 2>/dev/null; then
-        echo "[trace-cycles:$side] $test_name ($variant): MLIR has no trace ops; skipping" >&2
-        return 0
-    fi
-    local mlir_path="$build_dir/aie_arch.mlir.prj/input_with_addresses.mlir"
-    if [[ ! -f "$mlir_path" ]]; then
-        echo "[trace-cycles:$side] $test_name ($variant): no lowered MLIR at $mlir_path; cannot extract cycles" >&2
+    local mlir_path
+    mlir_path="$(find "$build_dir" -mindepth 2 -maxdepth 2 -name 'input_with_addresses.mlir' -print -quit 2>/dev/null || true)"
+    if [[ -z "$mlir_path" || ! -f "$mlir_path" ]]; then
+        echo "[trace-cycles:$side] $test_name ($variant): no aiecc-lowered MLIR (input_with_addresses.mlir) under $build_dir/*.prj/; cannot extract cycles" >&2
         return 0
     fi
 
@@ -700,11 +759,23 @@ _run_trace_cycles_pipeline() {
         [[ -n "${XDNA_EMU_DIR:-}" ]] && env_prefix+=("XDNA_EMU_DIR=$XDNA_EMU_DIR")
     fi
 
+    # Optional control-packet blob gets fed as --input when the test's lit
+    # specifies --ctrlpkt-name. Runs through the same run.lit discovery as
+    # the --instr file so any future aiecc-emitted artifact can be added
+    # with a one-line _discover_*_binary helper above.
+    local -a extra_args=()
+    local _ctrlpkt_name
+    _ctrlpkt_name="$(_discover_ctrlpkt_binary "$TEST_SRC/$test_name")"
+    if [[ -n "$_ctrlpkt_name" ]] && [[ -f "$build_dir/$_ctrlpkt_name" ]]; then
+        extra_args+=(--input "$build_dir/$_ctrlpkt_name")
+    fi
+
     if ! env "${env_prefix[@]}" "$runner" \
         --xclbin "$xclbin" \
         --instr "$instr" \
         --trace-out "$trace_bin" \
         --trace-size 8192 \
+        "${extra_args[@]}" \
         2>"$runner_log"; then
         echo "[trace-cycles:$side] $test_name ($variant): runner failed; see $runner_log" >&2
         return 1
@@ -1596,12 +1667,19 @@ run_one_hardware() {
   if [[ "$WITH_HW_CYCLES" == "true" && "$result" == "PASS" ]]; then
       local _hw_xclbin
       _hw_xclbin="$(find "$build_dir" -maxdepth 1 -name '*.xclbin' -print -quit 2>/dev/null || true)"
-      local _hw_instr="$build_dir/insts.bin"
-      [[ -f "$_hw_instr" ]] || _hw_instr=""
+      # Discover the test's instruction binary name from its run.lit file
+      # (--npu-insts-name=<foo>). Falls back to the aiecc default insts.bin
+      # when the test relies on the default. This avoids hardcoding the
+      # set of known filenames.
+      local _src_dir="$TEST_SRC/$name"
+      local _hw_instr_name
+      _hw_instr_name="$(_discover_instr_binary "$_src_dir")"
+      local _hw_instr=""
+      [[ -f "$build_dir/$_hw_instr_name" ]] && _hw_instr="$build_dir/$_hw_instr_name"
       if [[ -n "$_hw_xclbin" && -n "$_hw_instr" ]]; then
           _run_trace_cycles_pipeline HW "$build_dir" "$_hw_xclbin" "" "$_hw_instr" "${compiler}${vsuffix}" || true
       else
-          echo "[trace-cycles:HW] $name (${compiler}${vsuffix}): missing xclbin or insts.bin in $build_dir; skipping" >&2
+          echo "[trace-cycles:HW] $name (${compiler}${vsuffix}): missing xclbin or instruction binary ($_hw_instr_name) in $build_dir; skipping" >&2
       fi
   fi
 
@@ -1763,12 +1841,16 @@ run_one_bridge() {
   if [[ "$WITH_CYCLE_DIFF" == "true" && "$result" == "PASS" ]]; then
       local _emu_xclbin
       _emu_xclbin="$(find "$build_dir" -maxdepth 1 -name '*.xclbin' -print -quit 2>/dev/null || true)"
-      local _emu_instr="$build_dir/insts.bin"
-      [[ -f "$_emu_instr" ]] || _emu_instr=""
+      # Discover the test's instruction binary name from run.lit (see HW path).
+      local _src_dir="$TEST_SRC/$name"
+      local _emu_instr_name
+      _emu_instr_name="$(_discover_instr_binary "$_src_dir")"
+      local _emu_instr=""
+      [[ -f "$build_dir/$_emu_instr_name" ]] && _emu_instr="$build_dir/$_emu_instr_name"
       if [[ -n "$_emu_xclbin" && -n "$_emu_instr" ]]; then
           _run_trace_cycles_pipeline EMU "$build_dir" "$_emu_xclbin" "" "$_emu_instr" "${compiler}${vsuffix}" || true
       else
-          echo "[trace-cycles:EMU] $name (${compiler}${vsuffix}): missing xclbin or insts.bin in $build_dir; skipping" >&2
+          echo "[trace-cycles:EMU] $name (${compiler}${vsuffix}): missing xclbin or instruction binary ($_emu_instr_name) in $build_dir; skipping" >&2
       fi
   fi
 
