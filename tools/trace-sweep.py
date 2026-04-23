@@ -135,6 +135,106 @@ def batch_events(events: List[EventDef], slots: int = 8) -> List[List[EventDef]]
     return [events[i:i + slots] for i in range(0, len(events), slots)]
 
 
+def _build_batches(
+    events: List[EventDef],
+    slots: int = 8,
+    ground_event: Optional[EventDef] = None,
+) -> List[List[EventDef]]:
+    """Group sweep events into 8-slot batches.
+
+    Without grounding: straightforward slice into fixed-size batches.
+
+    With grounding: slot 0 of every batch is reserved for the grounding
+    event, so each batch carries at most (slots-1) swept events. The
+    grounding event is filtered out of the sweep list if the caller
+    included it, so it never double-counts in the matrix.
+
+    An empty sweep list + non-None ground_event still produces one batch
+    carrying just the grounding event -- useful for tile/event discovery
+    without a full sweep.
+    """
+    if ground_event is None:
+        return [events[i:i + slots] for i in range(0, len(events), slots)]
+    sweep = [e for e in events if e.id != ground_event.id]
+    per_batch = slots - 1
+    batches: List[List[EventDef]] = []
+    for i in range(0, len(sweep), per_batch):
+        batches.append([ground_event] + sweep[i:i + per_batch])
+    if not batches:
+        batches.append([ground_event])
+    return batches
+
+
+# ---------------------------------------------------------------------------
+# Anchor / merge
+# ---------------------------------------------------------------------------
+
+def _anchor_events(
+    events: List[Dict], ground_slot: int = 0,
+) -> Tuple[Optional[int], List[Dict]]:
+    """Subtract the grounding event's timestamp from every other event's
+    timestamp in a batch.
+
+    Returns (anchor_ts, anchored_events):
+    - anchor_ts is the `ts` of the *first* event recorded on ground_slot,
+      or None if nothing fired there (grounding failure -- caller should
+      flag and not trust anchored_ts values).
+    - anchored_events excludes the grounding event itself (it's
+      instrumentation, not swept data) and every remaining event carries a
+      new `ts_anchored` field. If anchor_ts is None, ts_anchored is also
+      None on every event.
+
+    All events on the grounding slot are dropped from the output, not
+    just the first -- the grounding slot is pure instrumentation, and if
+    the event fires twice in a batch that's a diagnostic to surface via
+    the anchor (the anchor is always the *first* firing), not something
+    to pollute the swept-event timeline with.
+    """
+    anchor: Optional[int] = None
+    for ev in events:
+        if ev.get("slot") == ground_slot:
+            anchor = ev.get("ts")
+            break
+    out: List[Dict] = []
+    for ev in events:
+        if ev.get("slot") == ground_slot:
+            continue
+        ts = ev.get("ts")
+        copy = dict(ev)
+        if anchor is not None and ts is not None:
+            copy["ts_anchored"] = ts - anchor
+        else:
+            copy["ts_anchored"] = None
+        out.append(copy)
+    return anchor, out
+
+
+def _merge_anchored(
+    per_batch: List[Tuple[int, List[Dict]]],
+) -> List[Dict]:
+    """Flatten per-batch anchored event lists into one sorted timeline.
+
+    Sort key: (is_unanchored, ts_anchored). Unanchored events (batches
+    where the grounding event never fired) sink to the end so the
+    deterministic prefix reads cleanly. Each event gets a `source_batch`
+    tag so post-hoc attribution stays possible.
+
+    Stable within the same ts_anchored value so tied events preserve
+    batch order.
+    """
+    items: List[Dict] = []
+    for batch_idx, events in per_batch:
+        for ev in events:
+            c = dict(ev)
+            c["source_batch"] = batch_idx
+            items.append(c)
+    items.sort(key=lambda e: (
+        e.get("ts_anchored") is None,
+        e.get("ts_anchored") if e.get("ts_anchored") is not None else 0,
+    ))
+    return items
+
+
 # ---------------------------------------------------------------------------
 # Runner wrappers
 # ---------------------------------------------------------------------------
@@ -174,22 +274,26 @@ def _relabel_events(
     col: int, row: int,
     tile_type: str,
     batch: List["EventDef"],
-) -> Dict[str, int]:
+) -> Tuple[Dict[str, int], List[Dict]]:
     """Rewrite slot_names and per-event `name` fields in an events.json so
-    they reflect what the patched insts.bin actually programmed, then
-    return a per-slot fire count.
+    they reflect what the patched insts.bin actually programmed, and
+    return (per-event fire counts, filtered event list for this tile).
 
     parse-trace.py reads slot names from the original (pre-patch) MLIR --
     the trace unit itself only records slot indices, so the raw data is
     already correct. This function fixes only the labelling layer so
     downstream consumers see the right event names.
+
+    The returned filtered list is the subset of events whose (row,
+    pkt_type) match this tile, with the `name` field overwritten to the
+    current batch's label. It's ready to feed into _anchor_events.
     """
     if not events_json.exists():
-        return {}
+        return {}, []
     try:
         doc = json.loads(events_json.read_text())
     except Exception:
-        return {}
+        return {}, []
     # tile_type -> key in slot_names dict. parse-trace uses "mem" for
     # memmod; everything else matches our naming.
     slot_key = "mem" if tile_type == "memmod" else tile_type
@@ -208,6 +312,7 @@ def _relabel_events(
     # wouldn't, because adjacent tiles aren't routed into this trace BO.
     pkt_for_tile = 1 if tile_type == "memmod" else 0
     per_slot: Dict[int, int] = {}
+    filtered: List[Dict] = []
     for ev in doc.get("events", []):
         if ev.get("row") != row:
             continue
@@ -218,10 +323,12 @@ def _relabel_events(
             continue
         ev["name"] = names[slot]
         per_slot[slot] = per_slot.get(slot, 0) + 1
+        filtered.append(ev)
 
     events_json.write_text(json.dumps(doc, indent=2) + "\n")
     # Map slot -> event name
-    return {names[s]: n for s, n in per_slot.items() if names[s]}
+    counts = {names[s]: n for s, n in per_slot.items() if names[s]}
+    return counts, filtered
 
 
 def _run_one_side(
@@ -318,6 +425,27 @@ def _find_post_lowering_mlir(build_dir: Path) -> Optional[Path]:
     return None
 
 
+def _resolve_ground_event(
+    tile_type: str, name: Optional[str],
+) -> Optional[EventDef]:
+    """Resolve a grounding event name against the tile's event table.
+
+    Returns None if the caller passed no grounding event. Raises
+    ValueError if the name is unknown for this tile type -- better to
+    surface the typo early than to have every batch silently run without
+    anchoring.
+    """
+    if not name:
+        return None
+    for ev in load_events(tile_type):
+        if ev.name == name:
+            return ev
+    raise ValueError(
+        f"grounding event {name!r} not defined for tile_type {tile_type!r}; "
+        f"check mlir-aie/build/include/.../xaie_events_aieml.h"
+    )
+
+
 def sweep(
     test_name: str,
     compiler: str,
@@ -330,6 +458,7 @@ def sweep(
     run_hw: bool = True,
     run_emu: bool = True,
     ctrlpkt: Optional[Path] = None,
+    ground_event_name: Optional[str] = None,
 ) -> dict:
     xclbin = build_dir / "aie.xclbin"
     insts = build_dir / "insts.bin"
@@ -349,7 +478,13 @@ def sweep(
     if events_filter:
         wanted = set(events_filter)
         all_events = [e for e in all_events if e.name in wanted]
-    batches = batch_events(all_events)
+    ground_event = _resolve_ground_event(tile_type, ground_event_name)
+    batches = _build_batches(all_events, slots=8, ground_event=ground_event)
+    # When grounding is active, slot 0 of every batch carries the
+    # grounding event; the per-event matrix reports only sweep events
+    # (slot >= 1). This keeps the matrix clean -- the grounding event is
+    # instrumentation, not data.
+    first_sweep_slot = 1 if ground_event is not None else 0
 
     # Per-sweep work directory. Keep batch artifacts around for post-hoc
     # inspection; they compose with parse-trace's own JSON/cycles outputs.
@@ -358,6 +493,10 @@ def sweep(
     patched = work_dir / "insts.patched.bin"
 
     results: List[dict] = []
+    hw_anchored_batches: List[Tuple[int, List[Dict]]] = []
+    emu_anchored_batches: List[Tuple[int, List[Dict]]] = []
+    hw_batch_anchors: List[Dict] = []
+    emu_batch_anchors: List[Dict] = []
     t_start = time.time()
     for b_idx, batch in enumerate(batches):
         event_ids = [e.id for e in batch]
@@ -380,8 +519,9 @@ def sweep(
             parse_log=work_dir / f"b{b_idx}.hw.parse.log",
             ctrlpkt=ctrlpkt,
         )
+        hw_tile_events: List[Dict] = []
         if hw_res.ok:
-            hw_res.per_event_count = _relabel_events(
+            hw_res.per_event_count, hw_tile_events = _relabel_events(
                 hw_events_out, col, row, tile_type, batch)
 
         emu_res = RunResult(ok=False, cycles=None, events_count=None,
@@ -402,15 +542,34 @@ def sweep(
             parse_log=work_dir / f"b{b_idx}.emu.parse.log",
             ctrlpkt=ctrlpkt,
         )
+        emu_tile_events: List[Dict] = []
         if emu_res.ok:
-            emu_res.per_event_count = _relabel_events(
+            emu_res.per_event_count, emu_tile_events = _relabel_events(
                 emu_events_out, col, row, tile_type, batch)
+
+        # Anchor this batch's events on the grounding event (slot 0). When
+        # grounding is disabled we still feed the list through
+        # _anchor_events with a nonsense ground_slot so the merged
+        # timeline still gets built -- just without anchoring, ts_anchored
+        # stays None.
+        if ground_event is not None:
+            hw_anchor, hw_anchored = _anchor_events(hw_tile_events, ground_slot=0)
+            emu_anchor, emu_anchored = _anchor_events(emu_tile_events, ground_slot=0)
+        else:
+            hw_anchor, hw_anchored = None, [dict(e, ts_anchored=None) for e in hw_tile_events]
+            emu_anchor, emu_anchored = None, [dict(e, ts_anchored=None) for e in emu_tile_events]
+        hw_anchored_batches.append((b_idx, hw_anchored))
+        emu_anchored_batches.append((b_idx, emu_anchored))
+        hw_batch_anchors.append({"batch": b_idx, "anchor_ts": hw_anchor})
+        emu_batch_anchors.append({"batch": b_idx, "anchor_ts": emu_anchor})
 
         # Per-slot attribution: events_count is the batch-wide total
         # (kept for sanity checks); per_event_count breaks it out by
         # slot so each event has its own fire count.  Cycles is the
         # last-event timestamp, still batch-level.
         for slot, ev in enumerate(batch):
+            if slot < first_sweep_slot:
+                continue  # grounding event -- not a swept data row
             results.append({
                 "id": ev.id,
                 "name": ev.name,
@@ -429,19 +588,46 @@ def sweep(
                     "error": emu_res.error,
                 },
             })
+        ground_note = (
+            f" hw_anchor={hw_anchor} emu_anchor={emu_anchor}"
+            if ground_event is not None else ""
+        )
         print(f"[sweep] batch {b_idx + 1}/{len(batches)}: "
               f"events {[e.name for e in batch]} "
-              f"hw_cyc={hw_res.cycles} emu_cyc={emu_res.cycles}",
+              f"hw_cyc={hw_res.cycles} emu_cyc={emu_res.cycles}{ground_note}",
               flush=True)
 
     summary = {
         "test": test_name,
         "compiler": compiler,
         "tile": {"col": col, "row": row, "type": tile_type},
+        "grounding_event": ground_event.name if ground_event else None,
         "events": results,
         "elapsed_sec": round(time.time() - t_start, 2),
     }
     out_json.write_text(json.dumps(summary, indent=2) + "\n")
+
+    # Merged timeline output. Emitted whenever we have per-batch events
+    # regardless of grounding -- without grounding, ts_anchored is None
+    # on every row and the merged view is just a concatenation, which is
+    # still useful for diffing "did the same events fire" across runs.
+    merged_path = out_json.with_suffix(".merged.json")
+    merged = {
+        "test": test_name,
+        "compiler": compiler,
+        "tile": {"col": col, "row": row, "type": tile_type},
+        "grounding_event": ground_event.name if ground_event else None,
+        "batches_merged": len(batches),
+        "hw": {
+            "anchors": hw_batch_anchors,
+            "events": _merge_anchored(hw_anchored_batches),
+        },
+        "emu": {
+            "anchors": emu_batch_anchors,
+            "events": _merge_anchored(emu_anchored_batches),
+        },
+    }
+    merged_path.write_text(json.dumps(merged, indent=2) + "\n")
     return summary
 
 
@@ -470,6 +656,11 @@ def main() -> int:
     ap.add_argument("--ctrlpkt", type=Path, help="optional control-packet blob to pass as --input")
     ap.add_argument("--no-hw", action="store_true", help="skip HW runs")
     ap.add_argument("--no-emu", action="store_true", help="skip EMU runs")
+    ap.add_argument("--ground-event",
+                    help="event name to reserve in slot 0 of every batch; "
+                         "its timestamp anchors other events in a merged "
+                         "timeline (e.g. USER_EVENT_1). Max sweep events per "
+                         "batch drops from 8 to 7 when set.")
     args = ap.parse_args()
 
     build_dir = args.build_dir or (
@@ -489,6 +680,7 @@ def main() -> int:
         run_hw=not args.no_hw,
         run_emu=not args.no_emu,
         ctrlpkt=args.ctrlpkt,
+        ground_event_name=args.ground_event,
     )
     print(f"[sweep] wrote {args.out} ({len(summary['events'])} events, "
           f"{summary['elapsed_sec']}s)")
