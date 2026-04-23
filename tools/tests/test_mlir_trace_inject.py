@@ -10,6 +10,7 @@ REPO = Path(__file__).resolve().parents[2]
 INJECTOR = REPO / "tools" / "mlir-trace-inject.py"
 FIXTURES = REPO / "tools" / "tests" / "fixtures"
 UNTRACED = FIXTURES / "sample_untraced.mlir"
+MULTI_DEVICE = FIXTURES / "sample_multi_device.mlir"
 
 
 def _run(args, check=True):
@@ -125,6 +126,73 @@ def test_injector_default_buffer_size_used_when_not_specified(tmp_path):
     result = out.read_text()
     assert "aie.trace.host_config" in result
     assert "8192" in result, f"default buffer size missing:\n{result}"
+
+
+def test_injector_targets_device_with_runtime_sequence(tmp_path):
+    """Regression: when a module has multiple aie.device ops (e.g.
+    ctrl_packet_reconfig with @base + @main), trace-inject must land the
+    aie.trace decls in the device that contains the aie.runtime_sequence,
+    not the first device it encounters. Otherwise orphan trace decls end up
+    in the overlay device and downstream aiecc --device-name=<overlay>
+    compile fails with "aie.trace ops found but no runtime_sequence
+    defined"."""
+    out = tmp_path / "out.mlir"
+    r = _run(["--input", str(MULTI_DEVICE), "--out", str(out)])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    result = out.read_text()
+
+    # Trace decl + runtime_sequence config must land in the same device
+    # body. Split the output into per-device chunks and check which chunk
+    # owns each op.
+    lines = result.splitlines()
+    device_boundaries = [
+        i for i, line in enumerate(lines) if "aie.device(" in line
+    ]
+    assert len(device_boundaries) == 2, (
+        f"expected 2 aie.device ops in output, got "
+        f"{len(device_boundaries)}:\n{result}"
+    )
+    base_chunk = "\n".join(lines[device_boundaries[0]:device_boundaries[1]])
+    main_chunk = "\n".join(lines[device_boundaries[1]:])
+
+    # @base should be clean: tiles only, no trace decls or config.
+    assert "aie.trace @" not in base_chunk, (
+        f"trace decls leaked into @base (the overlay device):\n{base_chunk}"
+    )
+    assert "aie.trace.host_config" not in base_chunk
+    assert "aie.trace.start_config" not in base_chunk
+
+    # @main must carry the trace decls and runtime_sequence host/start config.
+    assert "aie.trace @trace_t0_2" in main_chunk, (
+        f"trace decl missing from @main:\n{main_chunk}"
+    )
+    assert "aie.trace.host_config" in main_chunk
+    assert "aie.trace.start_config" in main_chunk
+
+
+def test_injector_no_devices_have_runtime_sequence_is_clean_noop(tmp_path):
+    """If NO device in the module has an aie.runtime_sequence, trace-inject
+    should not leave orphan trace decls anywhere (they would break downstream
+    aiecc). It can warn and exit 0 without injecting, which is a cleaner
+    signal than a partially-injected output."""
+    # Build a fixture on the fly: a single @overlay device with tiles only.
+    fixture = tmp_path / "no_rs.mlir"
+    fixture.write_text(
+        "module {\n"
+        "  aie.device(npu1_1col) @overlay {\n"
+        "    %tile_0_0 = aie.tile(0, 0)\n"
+        "    %tile_0_2 = aie.tile(0, 2)\n"
+        "  }\n"
+        "}\n"
+    )
+    out = tmp_path / "out.mlir"
+    r = _run(["--input", str(fixture), "--out", str(out)])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    result = out.read_text()
+    assert "aie.trace @" not in result, (
+        "trace decls should not be injected when no device has a "
+        f"runtime_sequence; output:\n{result}"
+    )
 
 
 # ---------------------------------------------------------------------------

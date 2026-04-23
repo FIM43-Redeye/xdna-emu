@@ -160,105 +160,114 @@ def _inject_trace_ops(module, input_path: str, aied, buffer_size: int) -> int:
     """
     from aie.ir import InsertionPoint, IntegerAttr
 
-    # Locate the single aie.device op at the top level.
-    device_op = None
-    for op in module.body.operations:
-        if op.operation.name == "aie.device":
-            device_op = op
-            break
-    if device_op is None:
+    # Collect every aie.device op at the top level. Modules like
+    # ctrl_packet_reconfig have more than one -- e.g. an @base overlay
+    # containing only tiles plus an @main carrying the kernel and runtime
+    # sequence -- and trace injection must land in the device that owns the
+    # runtime sequence, not whatever device comes first in source order.
+    device_ops = [
+        op for op in module.body.operations
+        if op.operation.name == "aie.device"
+    ]
+    if not device_ops:
         print(
             f"error: no aie.device op found in {input_path}",
             file=sys.stderr,
         )
         return 1
 
-    # Collect compute tile SSA values from the device body.
-    # Keep them in declaration order so injected traces appear deterministically.
-    device_body = device_op.operation.regions[0].blocks[0]
-    compute_tiles = []  # list of (col: int, row: int, tile_ssa_value)
-    for inner in device_body.operations:
-        if inner.operation.name == "aie.tile":
-            col = int(IntegerAttr(inner.operation.attributes["col"]).value)
-            row = int(IntegerAttr(inner.operation.attributes["row"]).value)
-            if row >= 2:
-                compute_tiles.append((col, row, inner.operation.result))
+    # A target device = an aie.device whose body contains an
+    # aie.runtime_sequence. Injecting trace decls into a device without a
+    # runtime_sequence produces orphan ops that break aiecc's trace-lowering
+    # pass ("aie.trace ops found but no runtime_sequence defined").
+    targets = []  # list of (device_op, device_body, runtime_sequence_op)
+    for device_op in device_ops:
+        device_body = device_op.operation.regions[0].blocks[0]
+        rs_op = next(
+            (op for op in device_body.operations
+             if op.operation.name == "aie.runtime_sequence"),
+            None,
+        )
+        if rs_op is not None:
+            targets.append((device_op, device_body, rs_op))
 
-    if not compute_tiles:
+    if not targets:
         print(
-            f"warning: no compute tiles (row >= 2) found in {input_path}; "
-            "writing unchanged",
+            f"warning: no aie.device with an aie.runtime_sequence found in "
+            f"{input_path}; trace decls not injected (would be orphans)",
             file=sys.stderr,
         )
         return 0
 
-    # Insert trace ops before the device body's terminator.  The aie.device
-    # block's last op is always its terminator (aie.end for well-formed input,
-    # but using "last op" rather than matching name == 'aie.end' is resilient
-    # to upstream renames and to blocks where the terminator differs).  If the
-    # block is somehow empty, we bail rather than risk writing malformed MLIR.
-    ops_list = list(device_body.operations)
-    if not ops_list:
-        print(
-            f"error: aie.device body is empty in {input_path}; cannot inject",
-            file=sys.stderr,
-        )
-        return 1
-    terminator = ops_list[-1]
+    # Inject into every device that has a runtime_sequence. Each device gets
+    # its own set of trace decls for its own compute tiles, and its own
+    # runtime-sequence prologue (host_config + one start_config per tile).
+    for device_op, device_body, rs_op in targets:
+        # Collect compute tile SSA values from this device body.
+        # Keep them in declaration order so injected traces appear deterministically.
+        compute_tiles = []  # list of (col: int, row: int, tile_ssa_value)
+        for inner in device_body.operations:
+            if inner.operation.name == "aie.tile":
+                col = int(IntegerAttr(inner.operation.attributes["col"]).value)
+                row = int(IntegerAttr(inner.operation.attributes["row"]).value)
+                if row >= 2:
+                    compute_tiles.append((col, row, inner.operation.result))
 
-    with InsertionPoint(terminator.operation):
-        for col, row, tile_val in compute_tiles:
-            # The @aied.trace(tile, sym) decorator-form builder:
-            #   1. Constructs TraceOp(tile=tile_val, sym_name=sym_name)
-            #   2. Appends a block to the op's single region
-            #   3. Sets the InsertionPoint to at_block_begin of that block
-            #   4. Calls the decorated function synchronously (populates body)
-            #   5. Restores the previous InsertionPoint
-            # This exactly mirrors how mlir-aie's configure_trace() works.
-            # The decorator invokes _trace_body synchronously before the next
-            # loop iteration reassigns the name, so redefinition is safe.
-            @aied.trace(tile_val, _trace_sym(col, row))
-            def _trace_body():  # noqa: F811 -- redefinition is intentional (one per tile)
-                aied.trace_mode(aied.TraceMode.EventTime)
-                # packet id is the conventional starting id; AIEInsertTraceFlows
-                # reassigns ids when it lowers the declarative ops.
-                aied.trace_packet(_TRACE_PACKET_ID_START, aied.TracePacketType.Core)
-                for event_name in _TRACE_DEFAULT_CORE_EVENTS:
-                    aied.trace_event(event_name)
-                aied.trace_start(broadcast=_TRACE_BROADCAST_START)
-                aied.trace_stop(broadcast=_TRACE_BROADCAST_STOP)
+        if not compute_tiles:
+            # No kernels live on this device -- skip silently. A device with
+            # a runtime_sequence but no compute tiles is unusual but not an
+            # error (e.g. a placeholder device).
+            continue
 
-    # Task 5: find aie.runtime_sequence and prepend host_config + start_config.
-    # We must locate the op AFTER the per-tile traces are inserted (above), because
-    # the device body is walked fresh here -- the earlier InsertionPoint context has
-    # already closed, so the device body iterator reflects the completed state.
-    rs_op = None
-    for inner in device_body.operations:
-        if inner.operation.name == "aie.runtime_sequence":
-            rs_op = inner
-            break
-    if rs_op is None:
-        print(
-            f"warning: no aie.runtime_sequence in {input_path}; "
-            "trace host config not emitted (trace decls still present)",
-            file=sys.stderr,
-        )
-        return 0
+        # Insert trace ops before the device body's terminator.  The aie.device
+        # block's last op is always its terminator (aie.end for well-formed input,
+        # but using "last op" rather than matching name == 'aie.end' is resilient
+        # to upstream renames and to blocks where the terminator differs).
+        ops_list = list(device_body.operations)
+        if not ops_list:
+            print(
+                f"error: aie.device body is empty in {input_path}; cannot inject",
+                file=sys.stderr,
+            )
+            return 1
+        terminator = ops_list[-1]
 
-    rs_block = rs_op.operation.regions[0].blocks[0]
-    with InsertionPoint.at_block_begin(rs_block):
-        # trace_host_config(buffer_size=N) emits:
-        #   aie.trace.host_config buffer_size = N
-        # Signature: trace_host_config(buffer_size, *, arg_idx=4,
-        #                              routing=TraceShimRouting.Single, ...)
-        # Mirror of mlir-aie python/utils/trace/setup.py line 534.
-        aied.trace_host_config(buffer_size=buffer_size)
-        # trace_start_config(name) emits:
-        #   aie.trace.start_config @<name>
-        # One per compute tile, matching the trace decl symbols inserted above.
-        # Mirror of mlir-aie python/utils/trace/setup.py line 542.
-        for col, row, _ in compute_tiles:
-            aied.trace_start_config(_trace_sym(col, row))
+        with InsertionPoint(terminator.operation):
+            for col, row, tile_val in compute_tiles:
+                # The @aied.trace(tile, sym) decorator-form builder:
+                #   1. Constructs TraceOp(tile=tile_val, sym_name=sym_name)
+                #   2. Appends a block to the op's single region
+                #   3. Sets the InsertionPoint to at_block_begin of that block
+                #   4. Calls the decorated function synchronously (populates body)
+                #   5. Restores the previous InsertionPoint
+                # This exactly mirrors how mlir-aie's configure_trace() works.
+                # The decorator invokes _trace_body synchronously before the next
+                # loop iteration reassigns the name, so redefinition is safe.
+                @aied.trace(tile_val, _trace_sym(col, row))
+                def _trace_body():  # noqa: F811 -- redefinition is intentional (one per tile)
+                    aied.trace_mode(aied.TraceMode.EventTime)
+                    # packet id is the conventional starting id; AIEInsertTraceFlows
+                    # reassigns ids when it lowers the declarative ops.
+                    aied.trace_packet(_TRACE_PACKET_ID_START, aied.TracePacketType.Core)
+                    for event_name in _TRACE_DEFAULT_CORE_EVENTS:
+                        aied.trace_event(event_name)
+                    aied.trace_start(broadcast=_TRACE_BROADCAST_START)
+                    aied.trace_stop(broadcast=_TRACE_BROADCAST_STOP)
+
+        rs_block = rs_op.operation.regions[0].blocks[0]
+        with InsertionPoint.at_block_begin(rs_block):
+            # trace_host_config(buffer_size=N) emits:
+            #   aie.trace.host_config buffer_size = N
+            # Signature: trace_host_config(buffer_size, *, arg_idx=4,
+            #                              routing=TraceShimRouting.Single, ...)
+            # Mirror of mlir-aie python/utils/trace/setup.py line 534.
+            aied.trace_host_config(buffer_size=buffer_size)
+            # trace_start_config(name) emits:
+            #   aie.trace.start_config @<name>
+            # One per compute tile, matching the trace decl symbols inserted above.
+            # Mirror of mlir-aie python/utils/trace/setup.py line 542.
+            for col, row, _ in compute_tiles:
+                aied.trace_start_config(_trace_sym(col, row))
 
     return 0
 
