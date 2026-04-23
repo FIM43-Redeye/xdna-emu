@@ -61,7 +61,12 @@ fn main() {
                 output_path = Some(args.get(i).unwrap_or_else(|| usage()).clone());
             }
             "--extended" => {
-                opts = AnalysisOptions::extended();
+                // OR-in the extended analyses rather than replacing the whole
+                // struct, so flags like --remap-columns parsed earlier on the
+                // same command line aren't silently clobbered.
+                opts.iterations = true;
+                opts.stalls = true;
+                opts.cross_tile = true;
             }
             "--iterations" => {
                 opts.iterations = true;
