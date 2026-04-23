@@ -1,8 +1,16 @@
 # Phase E Task 1 Validation — Handoff (2026-04-23)
 
-Status at end of session: **Task 1 FAILED**, discovered a deeper emulator bug
-than the plan anticipated. Picking this up later. WIP fixes are in the working
-tree, uncommitted.
+> **Status update (same day, later session):** Task 1 now **PASSES**. Both Bug 1
+> (cycle threading) and Bug 2 (slot-NOP over-emission) are fixed in the working
+> tree. EMU trace matches HW on `vector_scalar_using_dma`: 15 events
+> (8 × INSTR_EVENT_0, 7 × INSTR_EVENT_1) identical to HW, span 41,176 vs HW
+> 41,181 cycles (0.01 % drift — the kind of delta Phase E was built to
+> measure). `cargo test --lib`: 2692 pass, 5 new tests added.  See "Resolution"
+> section at bottom.
+
+Status at end of **first** session: **Task 1 FAILED**, discovered a deeper
+emulator bug than the plan anticipated. Picking this up later. WIP fixes are
+in the working tree, uncommitted.
 
 ## tl;dr
 
@@ -218,6 +226,64 @@ User hadn't decided between these when we stopped. They went to sleep.
    Phase B 7-test batch, not just `vector_scalar_using_dma`.
 5. Either way, do **NOT** pretend Task 1 passed. It didn't. The plan's
    decision gate is explicit about this.
+
+## Resolution (later on 2026-04-23)
+
+Picked path A, systematic-debugging discipline. The per-slot classifier in
+`src/interpreter/execute/cycle_accurate.rs:442-477` was emitting
+`InstrLoad` / `InstrStore` / `InstrVector` for **every** occupied slot,
+regardless of whether that slot held a real op or a NOP. On real AIE2 silicon
+those events fire on functional-unit activity, not on structural slot
+presence; NOPA / NOPB / NOPS / NOPV don't dispatch to any unit.
+
+Evidence that fingered the bug (runtime probe of one kernel run):
+- 28 689 `InstrVector` events emitted, every single one with
+  `op_nop=true semantic=Some(Nop)` — i.e. all NOPV.
+- 8 `SemanticOp::Event` fires (4 kernel invocations × event0 + event1),
+  exactly matching the kernel source. Bug-2 hypothesis ("EVENT handler never
+  fires") from the first session was wrong; the handler works, it was just
+  being drowned by the slot classifier in the trace output.
+
+Fix: add `if op.is_nop() { None } else { ... }` guard to the per-slot event
+classifier. See `cycle_accurate.rs` diff on `dev`.
+
+Tests added in the same file (all pass):
+- `test_nopv_does_not_emit_instr_vector`
+- `test_nopa_does_not_emit_instr_load`
+- `test_nops_does_not_emit_instr_store`
+- `test_real_load_does_emit_instr_load`
+- `test_full_nop_bundle_emits_nothing`
+
+End-to-end validation (chess, `vector_scalar_using_dma`):
+
+| Metric            | HW                              | EMU (fixed)                     |
+|-------------------|---------------------------------|---------------------------------|
+| Total events      | 15                              | 15                              |
+| `INSTR_EVENT_0`   | 8                               | 8                               |
+| `INSTR_EVENT_1`   | 7                               | 7                               |
+| `INSTR_VECTOR`    | 0 (scalar kernel)               | 0                               |
+| Timestamp span    | 3885 → 45066 (Δ=41181)          | 1183 → 42359 (Δ=41176)          |
+
+Cycle-span drift is 5 cycles (0.012 %) — well inside the ±50 % budget Phase E
+will use. Task 1's validation gate is satisfied.
+
+Separate observation: `cascade_flows` EMU trace is empty
+(`halt_reason=completed cycles=2253`, no packets emitted). This is a
+**pre-existing** cascade-flow / multi-tile trace-unit bug, unchanged by
+either fix — the symptom was the same before Bug 1 was touched, and nothing
+in the fixes could produce it. Track separately; not a regression, not
+blocking Phase E.
+
+Plugin cleanup also landed alongside the fixes: `/opt/xilinx/xrt/lib/` now
+carries `libxdna_emu_debug.so` and `libxdna_emu_release.so` as symlinks to
+the corresponding `target/<profile>/libxdna_emu.so`. The C++ plugin
+(`xrt-plugin/src/pdev_emu.cpp`) tries the profile-suffixed name first before
+the plain `libxdna_emu.so` fallback, so `XDNA_EMU=debug` or `=release` now
+routes correctly even without `XDNA_EMU_DIR`. The "stale .so" foot-gun from
+the first session is gone.
+
+Next step: resume Phase E Task 2.  No extra cycle-drift override entries
+needed for vector_scalar_using_dma based on this measurement.
 
 ## Raw repro commands (preserve context for later)
 

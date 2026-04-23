@@ -463,12 +463,25 @@ impl CycleAccurateExecutor {
                 // Emit per-slot instruction class event matching hardware trace codes.
                 // Each active slot generates its own event, just like hardware where
                 // different event types fire for each functional unit.
-                let event = match slot_idx {
-                    SlotIndex::LoadA | SlotIndex::LoadB => Some(EventType::InstrLoad { pc }),
-                    SlotIndex::Store => Some(EventType::InstrStore { pc }),
-                    SlotIndex::Vector | SlotIndex::Accumulator =>
-                        Some(EventType::InstrVector { pc }),
-                    _ => None, // Scalar/Control events classified below
+                //
+                // NOPs occupy the slot structurally but don't activate the
+                // functional unit on real hardware -- NOPA/NOPB don't dispatch
+                // to the load units, NOPS doesn't write memory, NOPV doesn't
+                // touch the vector pipeline. So they must NOT emit INSTR_LOAD
+                // / INSTR_STORE / INSTR_VECTOR.  Skipping NOPs here matches
+                // the AIE2 events module behaviour described in
+                // `xaie_events_aieml.h`, where these events count unit
+                // activity, not slot presence.
+                let event = if op.is_nop() {
+                    None
+                } else {
+                    match slot_idx {
+                        SlotIndex::LoadA | SlotIndex::LoadB => Some(EventType::InstrLoad { pc }),
+                        SlotIndex::Store => Some(EventType::InstrStore { pc }),
+                        SlotIndex::Vector | SlotIndex::Accumulator =>
+                            Some(EventType::InstrVector { pc }),
+                        _ => None, // Scalar/Control events classified below
+                    }
                 };
                 if let Some(evt) = event {
                     ctx.timing_context_mut().record_event(start_cycle, evt);
@@ -960,5 +973,150 @@ mod tests {
         ctx.cycles = 11;
         ctx.commit_pending_writes();
         assert_eq!(ctx.pointer.read(1), 0x1234);
+    }
+
+    // --- NOP / slot-based event classification tests ---
+    //
+    // AIE2 hardware fires INSTR_LOAD / INSTR_STORE / INSTR_VECTOR only when
+    // the corresponding functional unit does work.  NOPA / NOPB / NOPS / NOPV
+    // occupy their slot in the encoding but don't activate the unit, so no
+    // event is emitted on real silicon.  The emulator must match this.
+
+    #[test]
+    fn test_nopv_does_not_emit_instr_vector() {
+        use crate::interpreter::state::EventType;
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+
+        // NOPV occupies the Vector slot structurally but does no work.
+        let bundle = make_bundle(vec![SlotOp::nop(SlotIndex::Vector)]);
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        let events = ctx.timing_context().events.events();
+        let has_instr_vector = events
+            .iter()
+            .any(|e| matches!(e.event, EventType::InstrVector { .. }));
+        assert!(
+            !has_instr_vector,
+            "NOPV must not emit INSTR_VECTOR; events: {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn test_nopa_does_not_emit_instr_load() {
+        use crate::interpreter::state::EventType;
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+
+        // NOPA in the LoadA slot: no load port activity.
+        let bundle = make_bundle(vec![SlotOp::nop(SlotIndex::LoadA)]);
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        let events = ctx.timing_context().events.events();
+        let has_instr_load = events
+            .iter()
+            .any(|e| matches!(e.event, EventType::InstrLoad { .. }));
+        assert!(
+            !has_instr_load,
+            "NOPA must not emit INSTR_LOAD; events: {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn test_nops_does_not_emit_instr_store() {
+        use crate::interpreter::state::EventType;
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+
+        // NOPS in the Store slot: no memory write.
+        let bundle = make_bundle(vec![SlotOp::nop(SlotIndex::Store)]);
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        let events = ctx.timing_context().events.events();
+        let has_instr_store = events
+            .iter()
+            .any(|e| matches!(e.event, EventType::InstrStore { .. }));
+        assert!(
+            !has_instr_store,
+            "NOPS must not emit INSTR_STORE; events: {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn test_real_load_does_emit_instr_load() {
+        use crate::interpreter::state::EventType;
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+
+        tile.write_data_u32(0x100, 42);
+        ctx.pointer.write(0, 0x100);
+
+        let bundle = make_bundle(vec![
+            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+                .with_mem_width(MemWidth::Word)
+                .with_dest(Operand::ScalarReg(0))
+                .with_source(Operand::PointerReg(0)),
+        ]);
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        let events = ctx.timing_context().events.events();
+        let instr_loads: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.event, EventType::InstrLoad { .. }))
+            .collect();
+        assert_eq!(
+            instr_loads.len(), 1,
+            "Real load should emit exactly one INSTR_LOAD; events: {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn test_full_nop_bundle_emits_nothing() {
+        use crate::interpreter::state::EventType;
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+
+        // A bundle of all NOPs across every functional-unit slot.  This is
+        // what padding rows in scalar-kernel disassembly look like
+        // (`NOPA; NOPB; NOPS; NOPX; NOPM; NOPV`).
+        let bundle = make_bundle(vec![
+            SlotOp::nop(SlotIndex::LoadA),
+            SlotOp::nop(SlotIndex::LoadB),
+            SlotOp::nop(SlotIndex::Store),
+            SlotOp::nop(SlotIndex::Scalar0),
+            SlotOp::nop(SlotIndex::Scalar1),
+            SlotOp::nop(SlotIndex::Vector),
+        ]);
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        let events = ctx.timing_context().events.events();
+        let unit_activity: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(
+                e.event,
+                EventType::InstrLoad { .. }
+                    | EventType::InstrStore { .. }
+                    | EventType::InstrVector { .. }
+            ))
+            .collect();
+        assert!(
+            unit_activity.is_empty(),
+            "Full-NOP bundle must not emit any unit-activity events; got: {:?}",
+            unit_activity
+        );
     }
 }
