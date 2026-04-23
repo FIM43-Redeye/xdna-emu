@@ -2855,6 +2855,30 @@ main() {
     fi
   done
 
+  # Re-classify cycle diffs from final on-disk state. The in-Phase-3+4
+  # call inside run_one_bridge runs on EMU's timeline; HW's parallel job
+  # may not have written cycles.HW.txt yet, so an early classification
+  # can read an EMU_TRACE_BUG / HW_TRACE_BUG asymmetry that resolves
+  # once both sides finish. Re-running here with the complete state
+  # produces stable classifications.
+  if [[ "$WITH_CYCLE_DIFF" == "true" ]]; then
+    local _reclass_compilers
+    read -ra _reclass_compilers <<< "$COMPILERS_STR"
+    for _row in "${report_rows[@]}"; do
+      local _rn="${_row%%:*}"
+      local _rv="${_row#*:}"
+      local _rsuffix=""
+      [[ -n "$_rv" ]] && _rsuffix=".${_rv}"
+      for _rc in "${_reclass_compilers[@]}"; do
+        local _br="SKIP"
+        [[ -f "$RESULTS_DIR/$(sanitize_name "$_rn")${_rsuffix}.${_rc}.bridge.result" ]] && \
+          _br="$(< "$RESULTS_DIR/$(sanitize_name "$_rn")${_rsuffix}.${_rc}.bridge.result")"
+        [[ "$_br" == "PASS" ]] || continue
+        _classify_cycle_diff "$_rn" "${_rc}${_rsuffix}" || true
+      done
+    done
+  fi
+
   info "Phase 6: Report"
   print_report report_rows "$RUN_HW"
 }
