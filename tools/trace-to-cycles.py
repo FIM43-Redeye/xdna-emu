@@ -47,6 +47,13 @@ def cycles_from_events(events):
     kernel emits explicit INSTR_EVENT_0/1 boundary markers: whichever events
     the core actually fires (INSTR_VECTOR, INSTR_EVENT_*, port events, etc.)
     will bracket the interval between kernel start and end.
+
+    Only Perfetto durative/instant phases are counted: B (begin), E (end),
+    X (complete), i (instant).  Metadata events (M), counter events (C),
+    object events (O/N/D), and flow events (s/t/f) are intentionally skipped
+    -- they either carry no cycle-relevant timing or aren't emitted by
+    mlir-aie's trace output.  If a future mlir-aie version adds a phase we
+    care about, extend this filter.
     """
     ts_values = [
         e["ts"] for e in events
