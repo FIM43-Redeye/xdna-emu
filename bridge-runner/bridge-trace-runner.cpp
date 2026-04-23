@@ -175,10 +175,21 @@ std::vector<uint32_t> load_instr_binary(const std::string& path) {
 
 /// Read the contents of a file into a BO's host-mapped memory, up to the BO's
 /// size.  If the file is shorter than expected_size, the tail is left as
-/// whatever the caller initialized the BO with (typically zero).
+/// whatever the caller initialized the BO with (typically zero).  If the file
+/// is LARGER than expected_size, the excess is silently discarded -- warn on
+/// stderr so size-mismatched inputs (e.g. f64 data passed to an f32 kernarg)
+/// surface as an obvious diagnostic rather than a silent half-load.
 void load_bo_from_file(xrt::bo& bo, const std::string& path, size_t expected_size) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("cannot open input file: " + path);
+    std::streamsize file_size = f.tellg();
+    if (file_size < 0) throw std::runtime_error("cannot stat input file: " + path);
+    if (static_cast<size_t>(file_size) > expected_size) {
+        std::fprintf(stderr,
+            "warning: %s is %lld bytes but kernarg expects %zu; discarding excess\n",
+            path.c_str(), static_cast<long long>(file_size), expected_size);
+    }
+    f.seekg(0);
     f.read(static_cast<char*>(bo.map<void*>()), static_cast<std::streamsize>(expected_size));
 }
 
@@ -208,12 +219,16 @@ KernArgPlan classify_kernargs(const std::vector<KernArgInfo>& kargs) {
         else buffer_indices.push_back(k.index);
     }
     // Expected layout (mlir-aie bridge-test convention):
-    //   scalars: opcode (u64), ninstr (u32)
-    //   buffers: instr, [bo0..boK-1], trace
-    if (scalar_indices.size() < 2) {
+    //   scalars: opcode (u64), ninstr (u32) -- exactly 2
+    //   buffers: instr, [bo0..boK-1], trace -- at least 2
+    // Tightening scalar_indices to exactly 2: if a future test adds a third
+    // scalar (tuning param, tile id, etc.), the runner needs to grow a new
+    // positional slot for it rather than silently leave it unbound.
+    if (scalar_indices.size() != 2) {
         throw std::runtime_error(
-            "expected at least 2 scalar kernargs (opcode, ninstr); got " +
-            std::to_string(scalar_indices.size()));
+            "expected exactly 2 scalar kernargs (opcode, ninstr); got " +
+            std::to_string(scalar_indices.size()) +
+            " (runner needs updating to handle additional scalars)");
     }
     if (buffer_indices.size() < 2) {
         throw std::runtime_error(
@@ -323,6 +338,9 @@ int main(int argc, char** argv) {
             size_t karg_idx = plan.middle_buf_indices[mb_i];
             size_t sz = static_cast<size_t>(kargs[karg_idx].size);
             auto& bo = make_buffer(karg_idx, sz, xrt::bo::flags::host_only);
+            // Zero-fill first so a short-read from load_bo_from_file leaves
+            // a zeroed tail rather than uninitialized bytes.  The single sync
+            // after the file load is all that needs to reach the device.
             std::memset(bo.map<void*>(), 0, sz);
             load_bo_from_file(bo, in_path, sz);
             bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
