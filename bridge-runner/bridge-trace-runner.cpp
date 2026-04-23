@@ -341,7 +341,21 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("internal: input index out of middle-buffer range");
             }
             size_t karg_idx = plan.middle_buf_indices[mb_i];
-            size_t sz = static_cast<size_t>(kargs[karg_idx].size);
+            size_t karg_declared_sz = static_cast<size_t>(kargs[karg_idx].size);
+            // Stat the input file -- for pointer kernargs (e.g. ctrlpkt)
+            // kargs[].size is the 8-byte pointer width, not the data size.
+            // Size the BO from the larger of {declared kernarg size, file
+            // size} so pointer kernargs get the full data, and under-sized
+            // files still get a BO big enough for the kernel's expectation.
+            size_t file_sz = 0;
+            {
+                std::ifstream fs(in_path, std::ios::binary | std::ios::ate);
+                if (!fs) throw std::runtime_error("cannot open input file: " + in_path);
+                std::streamsize p = fs.tellg();
+                if (p < 0) throw std::runtime_error("cannot stat input file: " + in_path);
+                file_sz = static_cast<size_t>(p);
+            }
+            size_t sz = std::max(karg_declared_sz, file_sz);
             auto& bo = make_buffer(karg_idx, sz, xrt::bo::flags::host_only);
             // Zero-fill first so a short-read from load_bo_from_file leaves
             // a zeroed tail rather than uninitialized bytes.  The single sync
