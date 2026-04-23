@@ -261,6 +261,47 @@ is_trace_quarantined() {
 export -f is_trace_quarantined
 
 # ---------------------------------------------------------------------------
+# Trace-injection incompatibility list (Phase E Task 10)
+# ---------------------------------------------------------------------------
+# Tests whose MLIR fails to compile after Phase B trace injection. Known
+# trace-incompat tests still have a useful HW-only signal; skipping injection
+# up-front saves a noisy compile failure every --with-hw-cycles run.
+
+TRACE_INCOMPAT_FILE="${SCRIPT_DIR}/trace-incompat-tests.txt"
+declare -A TRACE_INCOMPAT=()
+if [[ -f "$TRACE_INCOMPAT_FILE" ]]; then
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="${line// /}"
+    [[ -z "$line" ]] && continue
+    TRACE_INCOMPAT["$line"]=1
+  done < "$TRACE_INCOMPAT_FILE"
+  if [[ ${#TRACE_INCOMPAT[@]} -gt 0 ]]; then
+    echo ">>> Trace-injection incompat: ${#TRACE_INCOMPAT[@]} test(s) will have injection skipped"
+  fi
+fi
+export TRACE_INCOMPAT_FILE
+
+is_trace_incompat() {
+  # Fast path: associative array (main process only -- not exported).
+  if [[ ${#TRACE_INCOMPAT[@]} -gt 0 ]] 2>/dev/null; then
+    [[ -n "${TRACE_INCOMPAT[${1}]+x}" ]]
+    return
+  fi
+  # Slow path: file read (subshells via xargs).
+  local name="$1"
+  [[ -f "$TRACE_INCOMPAT_FILE" ]] || return 1
+  while IFS= read -r line; do
+    local entry="${line%%#*}"
+    entry="${entry// /}"
+    [[ -z "$entry" ]] && continue
+    [[ "$entry" == "$name" ]] && return 0
+  done < "$TRACE_INCOMPAT_FILE"
+  return 1
+}
+export -f is_trace_incompat
+
+# ---------------------------------------------------------------------------
 # Drift-override lookup (Phase E Task 7 stub; Task 11 replaces with real load)
 # ---------------------------------------------------------------------------
 # Sets two caller-named variables to the accepted EMU/HW ratio bounds.
@@ -1322,7 +1363,11 @@ compile_one() {
   # test's lit file normally resolves via sed. We do the substitution into a
   # temporary pre-substituted MLIR before handing it to the injector.
   local hw_cycles_traced_mlir=""
-  if [[ "$WITH_HW_CYCLES" == "true" ]] && [[ -f "$src_dir/aie.mlir" ]]; then
+  if [[ "$WITH_HW_CYCLES" == "true" ]] && is_trace_incompat "$name"; then
+      echo "  HW-CYCLES INJECT $name: SKIP (in trace-incompat-tests.txt)"
+  fi
+  if [[ "$WITH_HW_CYCLES" == "true" ]] && [[ -f "$src_dir/aie.mlir" ]] \
+      && ! is_trace_incompat "$name"; then
       local hw_cycles_inject_log="$RESULTS_DIR/${safe}.hw-cycles-inject.log"
       local hw_cycles_target="$build_dir/aie-hw-cycles-traced.mlir"
       local hw_cycles_src="$build_dir/aie-hw-cycles-src.mlir"
