@@ -13,6 +13,9 @@ mock_xrt/build/
 # NPU runner build artifacts
 tools/npu-runner/build/
 
+# bridge-trace-runner build artifacts
+bridge-runner/build/
+
 # Captured NPU hardware outputs (machine-specific, regenerate with capture_npu_outputs)
 tests/npu-outputs/
 
