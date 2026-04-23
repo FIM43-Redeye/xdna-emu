@@ -302,15 +302,57 @@ is_trace_incompat() {
 export -f is_trace_incompat
 
 # ---------------------------------------------------------------------------
-# Drift-override lookup (Phase E Task 7 stub; Task 11 replaces with real load)
+# Cycle-drift overrides (Phase E Task 11)
 # ---------------------------------------------------------------------------
+# Per-test EMU/HW ratio bounds for MATCH/DRIFT classification. Defaults to
+# [0.5, 2.0]; overridden per-test via scripts/cycle-drift-overrides.txt.
+
+DRIFT_OVERRIDES_FILE="${SCRIPT_DIR}/cycle-drift-overrides.txt"
+declare -A DRIFT_LOWER=() DRIFT_UPPER=()
+if [[ -f "$DRIFT_OVERRIDES_FILE" ]]; then
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="$(echo "$line" | awk '{$1=$1; print}')"  # trim
+    [[ -z "$line" ]] && continue
+    read -r _t _l _u <<< "$line"
+    [[ -z "$_t" || -z "$_l" || -z "$_u" ]] && continue
+    DRIFT_LOWER["$_t"]="$_l"
+    DRIFT_UPPER["$_t"]="$_u"
+  done < "$DRIFT_OVERRIDES_FILE"
+  if [[ ${#DRIFT_LOWER[@]} -gt 0 ]]; then
+    echo ">>> Cycle-drift overrides: ${#DRIFT_LOWER[@]} test(s) with custom bounds"
+  fi
+fi
+export DRIFT_OVERRIDES_FILE
+
+# _lookup_drift_bounds <test_name> _out_lower_var _out_upper_var
 # Sets two caller-named variables to the accepted EMU/HW ratio bounds.
-# Usage:  _lookup_drift_bounds <test_name> _out_lower_var _out_upper_var
+# Returns per-test overrides if listed in DRIFT_OVERRIDES_FILE, else [0.5, 2.0].
 _lookup_drift_bounds() {
-  local _out_l="$2"
-  local _out_u="$3"
-  printf -v "$_out_l" '%s' "0.5"
-  printf -v "$_out_u" '%s' "2.0"
+    local t="$1"
+    local _out_l="$2"
+    local _out_u="$3"
+    local l="0.5" u="2.0"
+    # Fast path: in-memory array (main process).
+    if [[ ${#DRIFT_LOWER[@]} -gt 0 ]] 2>/dev/null; then
+        if [[ -n "${DRIFT_LOWER[$t]+x}" ]]; then
+            l="${DRIFT_LOWER[$t]}"
+            u="${DRIFT_UPPER[$t]}"
+        fi
+    elif [[ -f "$DRIFT_OVERRIDES_FILE" ]]; then
+        # Subshell path: file read.
+        while IFS= read -r line; do
+            line="${line%%#*}"
+            line="$(echo "$line" | awk '{$1=$1; print}')"
+            [[ -z "$line" ]] && continue
+            read -r _t _l _u <<< "$line"
+            if [[ "$_t" == "$t" ]]; then
+                l="$_l"; u="$_u"; break
+            fi
+        done < "$DRIFT_OVERRIDES_FILE"
+    fi
+    printf -v "$_out_l" '%s' "$l"
+    printf -v "$_out_u" '%s' "$u"
 }
 export -f _lookup_drift_bounds
 
