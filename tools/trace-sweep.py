@@ -198,13 +198,21 @@ def _relabel_events(
         doc["slot_names"].setdefault(slot_key, [""] * 8)
         doc["slot_names"][slot_key] = names
 
+    # Column-axis caveat: HW trace records absolute columns (the runtime
+    # allocator picks a start_col at launch), while EMU uses relative
+    # columns starting at 0. Filtering strictly by col would drop every HW
+    # event when start_col != 0. Since the sweep only enables one tile at
+    # a time, we filter by (row, expected packet type) and let the slot
+    # index carry identity. This works as long as stray events from
+    # adjacent tiles don't share the same (row, slot) -- which they
+    # wouldn't, because adjacent tiles aren't routed into this trace BO.
+    pkt_for_tile = 1 if tile_type == "memmod" else 0
     per_slot: Dict[int, int] = {}
     for ev in doc.get("events", []):
-        if ev.get("col") != col or ev.get("row") != row:
+        if ev.get("row") != row:
             continue
-        # Filter by packet type: core events have pkt_type=0; mem events
-        # have pkt_type=1.  Keep both when tile_type=="memmod" OR "core"
-        # since a traced compute tile can carry both packet streams.
+        if ev.get("pkt_type") != pkt_for_tile:
+            continue
         slot = ev.get("slot")
         if slot is None or slot >= len(names) or not names[slot]:
             continue
@@ -262,14 +270,16 @@ def _run_one_side(
     with parse_log.open("w") as lf:
         rc = subprocess.run(parse_cmd, env=parse_env, stdout=lf, stderr=subprocess.STDOUT).returncode
     if rc != 0:
-        # "trace has no timestamped events" means the kernel ran but the
-        # selected event set never fired -- not a failure, just empty
+        # Multiple parse-trace error shapes all mean "kernel ran but the
+        # selected event set never fired" -- not a failure, just empty
         # data. Record it as ok with zero events so the sweep correctly
         # attributes "0 fires" to every event in the batch.
+        #   "no timestamped events"            -- trace had bytes but no
+        #                                         event records
+        #   "empty or all zeros" (from mlir-aie) -- trace BO entirely zero
         log_text = parse_log.read_text(errors="replace") if parse_log.exists() else ""
-        if "no timestamped events" in log_text:
-            # Write empty JSON so downstream relabeling has something to
-            # open; zero-cycle marker so we can still compose the result.
+        empty_markers = ("no timestamped events", "empty or all zeros")
+        if any(m in log_text for m in empty_markers):
             events_out.write_text('{"schema_version":1,"events":[],"slot_names":{}}\n')
             cycles_out.write_text("0\n")
             return RunResult(ok=True, cycles=0, events_count=0)
