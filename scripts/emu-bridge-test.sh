@@ -638,9 +638,15 @@ _run_trace_compare() {
         return 2
     fi
 
+    # --remap-columns normalizes each side's physical column numbers to
+    # 0-indexed logical columns before pairing. HW schedulers pick
+    # start_col=1 (or similar) whereas the emulator always places kernels
+    # at col=0; without remapping, identical events on row=2 appear on
+    # tile (1,2) in HW vs (0,2) in EMU and fall out as count mismatches.
     if ! "$rust_bin" \
         --hw "$hw_bin" \
         --emu "$emu_bin" \
+        --remap-columns \
         --stalls \
         --extended \
         -o "$report" 2>/dev/null; then
