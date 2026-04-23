@@ -1895,3 +1895,14 @@ Plan complete and saved to `docs/superpowers/plans/2026-04-22-cycle-budget-testi
 **2. Inline Execution** — Execute tasks in this session using executing-plans, batch execution with checkpoints.
 
 **Which approach?**
+
+---
+
+## Post-Phase B status update (2026-04-23)
+
+Phase C ("cycle budget enforcement") and Phase D.3 ("HW integration
+spot-check") are superseded by Phase E -- see
+[`2026-04-23-phase-e-trace-diff-cycle-budget.md`](2026-04-23-phase-e-trace-diff-cycle-budget.md)
+for the replacement design and
+[`2026-04-23-phase-e-validation.md`](2026-04-23-phase-e-validation.md)
+for empirical results.
