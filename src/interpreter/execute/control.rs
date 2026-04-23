@@ -241,6 +241,17 @@ impl ControlUnit {
                         );
                         log::info!("LockAcquire raw={} mapped={} expected={} delta={} current={} -> {} SUCCESS (own_tile={})",
                             raw_lock_id, lock_id, expected, delta, current_value, lock.value, is_own_tile);
+                        // Trace event: INSTR_LOCK_ACQUIRE_REQ (hw_id 44). HW fires
+                        // this once per acquire instruction issued. We record only
+                        // on Success so retries during WaitLock stalls don't inflate
+                        // the count -- for tests that complete, every acquire
+                        // eventually succeeds exactly once, matching HW 1:1.
+                        let pc = ctx.pc();
+                        let cycle = ctx.cycles;
+                        ctx.timing_context_mut().record_event(
+                            cycle,
+                            crate::interpreter::state::EventType::InstrLockAcquireReq { pc },
+                        );
                         Some(ExecuteResult::Continue)
                     }
                     LockResult::PreconditionNotMet => {
@@ -282,6 +293,15 @@ impl ControlUnit {
                     log::info!("LockRelease tile({},{}) raw={} mapped={} delta={} {} -> {} (cross_tile)",
                         tile_col, tile_row, raw_lock_id, lock_id, delta, old_value, lock.value);
                 }
+                // Trace event: INSTR_LOCK_RELEASE_REQ (hw_id 45). HW fires this
+                // once per release instruction issued; releases always complete
+                // in the same cycle, so a single record matches HW 1:1.
+                let pc = ctx.pc();
+                let cycle = ctx.cycles;
+                ctx.timing_context_mut().record_event(
+                    cycle,
+                    crate::interpreter::state::EventType::InstrLockReleaseReq { pc },
+                );
                 Some(ExecuteResult::Continue)
             }
 
