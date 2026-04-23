@@ -67,7 +67,21 @@ int parse_cli(int argc, char** argv, CliArgs& out) {
         else if (a == "--trace-out")    out.trace_out = need_val("--trace-out");
         else if (a == "--input")        out.inputs.push_back(need_val("--input"));
         else if (a == "--output")       out.outputs.push_back(need_val("--output"));
-        else if (a == "--trace-size")   out.trace_size_bytes = std::strtoull(need_val("--trace-size"), nullptr, 0);
+        else if (a == "--trace-size") {
+            // strtoull silently wraps negatives to UINT64_MAX and accepts any
+            // leading garbage -- validate explicitly so "-1" or "foo" fail loud.
+            const char* val = need_val("--trace-size");
+            if (val[0] == '-' || val[0] == '\0') {
+                std::fprintf(stderr, "error: --trace-size must be a non-negative integer, got '%s'\n", val);
+                return 1;
+            }
+            char* end = nullptr;
+            out.trace_size_bytes = std::strtoull(val, &end, 0);
+            if (end == val || *end != '\0') {
+                std::fprintf(stderr, "error: --trace-size must be a non-negative integer, got '%s'\n", val);
+                return 1;
+            }
+        }
         else if (a == "-v" || a == "--verbose") out.verbose = true;
         else if (a == "-h" || a == "--help") { print_usage(argv[0]); std::exit(0); }
         else {
