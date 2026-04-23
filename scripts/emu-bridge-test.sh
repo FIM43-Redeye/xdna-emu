@@ -895,9 +895,20 @@ _classify_cycle_diff() {
         return 0
     fi
 
-    # Both sides captured zero events: legitimate for scalar-only kernels.
+    # Both sides captured zero events. Two legitimate shapes:
+    #   NO_CORE  -- traced MLIR has no aie.core (DMA-only passthrough like
+    #               column_specific). Core-side trace events cannot fire
+    #               without a core, so HW and EMU both produce zeros.
+    #   EMPTY    -- has core, but default event set did not fire (Phase B
+    #               Limitation 1 -- scalar kernels). Broadening the event
+    #               set would turn these into usable data points.
     if [[ "$hw_cycles" -eq 0 && "$emu_cycles" -eq 0 ]]; then
-        echo "EMPTY" > "$out_file"
+        local traced_mlir="$BUILD_BASE/$test_name/aie-hw-cycles-traced.mlir"
+        if [[ -f "$traced_mlir" ]] && ! grep -q 'aie\.core' "$traced_mlir"; then
+            echo "NO_CORE" > "$out_file"
+        else
+            echo "EMPTY" > "$out_file"
+        fi
         return 0
     fi
 
@@ -2087,11 +2098,12 @@ print_report() {
   done
 
   # Cycle-drift counters (Phase E Task 12).
-  declare -A cycle_match cycle_drift cycle_empty cycle_emu_bug cycle_hw_bug cycle_compare_err cycle_no_data
+  declare -A cycle_match cycle_drift cycle_empty cycle_no_core cycle_emu_bug cycle_hw_bug cycle_compare_err cycle_no_data
   for compiler in "${compilers[@]}"; do
     cycle_match[$compiler]=0
     cycle_drift[$compiler]=0
     cycle_empty[$compiler]=0
+    cycle_no_core[$compiler]=0
     cycle_emu_bug[$compiler]=0
     cycle_hw_bug[$compiler]=0
     cycle_compare_err[$compiler]=0
@@ -2099,6 +2111,7 @@ print_report() {
   done
   declare -a cycle_offenders=()   # lines for the summary block
   declare -a cycle_empty_list=()
+  declare -a cycle_no_core_list=()
 
   local has_compile_fail=false
 
@@ -2237,6 +2250,7 @@ print_report() {
             MATCH*)          tag="match";         cycle_match[$compiler]=$(( ${cycle_match[$compiler]} + 1 )) ;;
             DRIFT*)          tag="drift";         cycle_drift[$compiler]=$(( ${cycle_drift[$compiler]} + 1 )) ;;
             EMPTY)           tag="empty";         cycle_empty[$compiler]=$(( ${cycle_empty[$compiler]} + 1 )) ;;
+            NO_CORE)         tag="no-core";       cycle_no_core[$compiler]=$(( ${cycle_no_core[$compiler]} + 1 )) ;;
             EMU_TRACE_BUG)   tag="emu-trace-bug"; cycle_emu_bug[$compiler]=$(( ${cycle_emu_bug[$compiler]} + 1 )) ;;
             HW_TRACE_BUG)    tag="hw-trace-bug";  cycle_hw_bug[$compiler]=$(( ${cycle_hw_bug[$compiler]} + 1 )) ;;
             COMPARE-ERR)     tag="compare-err";   cycle_compare_err[$compiler]=$(( ${cycle_compare_err[$compiler]} + 1 )) ;;
@@ -2246,6 +2260,8 @@ print_report() {
             cycle_offenders+=("  $display_name ($compiler): $cyc")
           elif [[ "$tag" == "empty" ]]; then
             cycle_empty_list+=("  $display_name ($compiler)")
+          elif [[ "$tag" == "no-core" ]]; then
+            cycle_no_core_list+=("  $display_name ($compiler)")
           fi
         else
           cyc="-"
@@ -2368,11 +2384,12 @@ print_report() {
     echo "  CYCLE DRIFT (Phase E)"
     echo "==========================================================================="
     for compiler in "${compilers[@]}"; do
-      printf "  %-8s  %d MATCH  %d DRIFT  %d EMPTY  %d EMU_TRACE_BUG  %d HW_TRACE_BUG  %d COMPARE-ERR  %d skipped\n" \
+      printf "  %-8s  %d MATCH  %d DRIFT  %d EMPTY  %d NO_CORE  %d EMU_TRACE_BUG  %d HW_TRACE_BUG  %d COMPARE-ERR  %d skipped\n" \
         "$compiler" \
         "${cycle_match[$compiler]}" \
         "${cycle_drift[$compiler]}" \
         "${cycle_empty[$compiler]}" \
+        "${cycle_no_core[$compiler]}" \
         "${cycle_emu_bug[$compiler]}" \
         "${cycle_hw_bug[$compiler]}" \
         "${cycle_compare_err[$compiler]}" \
@@ -2391,6 +2408,14 @@ print_report() {
       echo ""
       echo "  Empty-trace tests (default event set insufficient -- see Phase B Limitation 1):"
       for line in "${cycle_empty_list[@]}"; do
+        echo "$line"
+      done
+    fi
+
+    if [[ ${#cycle_no_core_list[@]} -gt 0 ]]; then
+      echo ""
+      echo "  No-core tests (DMA-only / passthrough; core trace events cannot fire by design):"
+      for line in "${cycle_no_core_list[@]}"; do
         echo "$line"
       done
     fi

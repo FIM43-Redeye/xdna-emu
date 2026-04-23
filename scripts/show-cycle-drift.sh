@@ -53,8 +53,11 @@ BEGIN { }
   sev=abs(logr(ratio))
   # Bugs / compare errors float to the top.
   if (tag ~ /TRACE_BUG|COMPARE-ERR/) sev=10
-  # EMPTY / NO_DATA: expected artifacts, not bugs. Below any real drift
-  # (max |log10(ratio)| in [0.5, 2.0] bounds is ~0.6), above MATCH baseline.
+  # EMPTY / NO_DATA / NO_CORE: expected artifacts, not bugs. Below any real
+  # drift (max |log10(ratio)| in [0.5, 2.0] bounds is ~0.6), above MATCH
+  # baseline. NO_CORE (DMA-only passthrough, no core events possible) is
+  # pushed slightly below EMPTY so it sinks to the very bottom.
+  else if (tag ~ /NO_CORE/) sev=0.5
   else if (tag ~ /EMPTY|NO_DATA/) sev=1
   printf("%.4f  %-48s  %s\n", sev, name, tag)
 }
