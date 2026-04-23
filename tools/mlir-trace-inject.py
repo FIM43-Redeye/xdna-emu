@@ -113,20 +113,32 @@ def _has_trace_ops(operation) -> bool:
     return False
 
 
-def _inject_trace_ops(module, input_path: str, aied) -> int:
-    """Walk module, find compute tiles (row >= 2), and inject one aie.trace per tile.
+def _inject_trace_ops(module, input_path: str, aied, buffer_size: int) -> int:
+    """Walk module, find compute tiles (row >= 2), inject one aie.trace per tile,
+    and prepend aie.trace.host_config + aie.trace.start_config ops to the
+    aie.runtime_sequence body.
 
     Compute tile classification for npu1 / npu1_1col:
       row 0  -- shim tile (NoC interface)
       row 1  -- memory tile (shared SRAM, no core)
       row >= 2 -- compute tile (VLIW core + vector unit)
 
+    Per-tile trace injection (Task 4):
     Construction uses the decorator-form lowercase builder aied.trace(tile, sym),
     which matches how mlir-aie's own configure_trace() (python/utils/trace/setup.py)
     constructs these ops.  The decorator creates the TraceOp with a proper region
     block, sets up the InsertionPoint for the body, calls the decorated function,
     and returns the completed op -- identical to how aied.core() and aied.device()
     work.  This is Path A (direct Python binding constructors).
+
+    Runtime sequence injection (Task 5):
+    After the per-tile traces are inserted, we find aie.runtime_sequence and
+    prepend two classes of ops at block-begin (before any existing runtime ops):
+      aie.trace.host_config buffer_size = <N>
+      aie.trace.start_config @trace_t{col}_{row}   (one per compute tile)
+    This mirrors mlir-aie's own configure_trace() in python/utils/trace/setup.py
+    (lines 534-542).  mlir-aie's AIEInsertTraceFlows pass then lowers these
+    declarative ops to register-write sequences during aiecc.py compilation.
 
     Output note: the caller must use module.operation.print(print_generic_op_form=False)
     rather than str(module) because the aie.trace region body lacks an explicit
@@ -205,6 +217,38 @@ def _inject_trace_ops(module, input_path: str, aied) -> int:
                 aied.trace_start(broadcast=_TRACE_BROADCAST_START)
                 aied.trace_stop(broadcast=_TRACE_BROADCAST_STOP)
 
+    # Task 5: find aie.runtime_sequence and prepend host_config + start_config.
+    # We must locate the op AFTER the per-tile traces are inserted (above), because
+    # the device body is walked fresh here -- the earlier InsertionPoint context has
+    # already closed, so the device body iterator reflects the completed state.
+    rs_op = None
+    for inner in device_body.operations:
+        if inner.operation.name == "aie.runtime_sequence":
+            rs_op = inner
+            break
+    if rs_op is None:
+        print(
+            f"warning: no aie.runtime_sequence in {input_path}; "
+            "trace host config not emitted (trace decls still present)",
+            file=sys.stderr,
+        )
+        return 0
+
+    rs_block = rs_op.operation.regions[0].blocks[0]
+    with InsertionPoint.at_block_begin(rs_block):
+        # trace_host_config(buffer_size=N) emits:
+        #   aie.trace.host_config buffer_size = N
+        # Signature: trace_host_config(buffer_size, *, arg_idx=4,
+        #                              routing=TraceShimRouting.Single, ...)
+        # Mirror of mlir-aie python/utils/trace/setup.py line 534.
+        aied.trace_host_config(buffer_size=buffer_size)
+        # trace_start_config(name) emits:
+        #   aie.trace.start_config @<name>
+        # One per compute tile, matching the trace decl symbols inserted above.
+        # Mirror of mlir-aie python/utils/trace/setup.py line 542.
+        for col, row, _ in compute_tiles:
+            aied.trace_start_config(f"trace_t{col}_{row}")
+
     return 0
 
 
@@ -229,7 +273,7 @@ def main():
                     file=sys.stderr,
                 )
                 return 2
-            rc = _inject_trace_ops(module, args.input, aied)
+            rc = _inject_trace_ops(module, args.input, aied, args.buffer_size)
             if rc != 0:
                 return rc
         buf = io.StringIO()

@@ -93,3 +93,32 @@ def test_injector_adds_trace_decl_per_compute_tile(tmp_path):
     assert "INSTR_EVENT_1" in result, "INSTR_EVENT_1 event missing"
     # start broadcast=15, stop broadcast=14 (mlir-aie defaults).
     assert "15" in result and "14" in result, "broadcast channels 15/14 missing"
+
+
+def test_injector_adds_runtime_sequence_trace_config(tmp_path):
+    """The aie.runtime_sequence body should start with trace.host_config +
+    one trace.start_config per trace decl, before existing runtime ops."""
+    out = tmp_path / "out.mlir"
+    r = _run([
+        "--input", str(UNTRACED),
+        "--out", str(out),
+        "--buffer-size", "16384",
+    ])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    result = out.read_text()
+    assert "aie.trace.host_config" in result, f"host_config missing in output:\n{result}"
+    assert "aie.trace.start_config" in result, f"start_config missing in output:\n{result}"
+    # Start_config should reference the trace symbol by name.
+    assert "@trace_t0_2" in result, "start_config should reference @trace_t0_2"
+    # Custom buffer size should flow through.
+    assert "16384" in result, "custom --buffer-size did not reach the output"
+
+
+def test_injector_default_buffer_size_used_when_not_specified(tmp_path):
+    """If --buffer-size is omitted, the default (8192) should appear."""
+    out = tmp_path / "out.mlir"
+    r = _run(["--input", str(UNTRACED), "--out", str(out)])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    result = out.read_text()
+    assert "aie.trace.host_config" in result
+    assert "8192" in result, f"default buffer size missing:\n{result}"
