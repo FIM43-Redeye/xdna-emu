@@ -37,6 +37,10 @@
 
 namespace {
 
+// AIE kernel opcode used by mlir-aie's launch convention (see bridge test
+// examples at mlir-aie/test/npu-xrt/*/test.cpp).
+constexpr uint64_t AIE_KERNEL_OPCODE = 3;
+
 struct CliArgs {
     std::string xclbin;
     std::string kernel_name;       // empty = auto-detect single kernel
@@ -387,8 +391,7 @@ int main(int argc, char** argv) {
         xrt::run run(kernel);
         for (size_t i = 0; i < kargs.size(); ++i) {
             if (i == plan.opcode_idx) {
-                // Opcode 3 is the AIE kernel opcode used by mlir-aie.
-                run.set_arg(static_cast<int>(i), static_cast<uint64_t>(3));
+                run.set_arg(static_cast<int>(i), AIE_KERNEL_OPCODE);
             } else if (i == plan.instr_size_idx) {
                 run.set_arg(static_cast<int>(i),
                             static_cast<uint32_t>(instr_words.size()));
@@ -435,6 +438,15 @@ int main(int argc, char** argv) {
                 size_t mb_slot = args.inputs.size() + o;
                 if (mb_slot >= plan.middle_buf_indices.size()) break;
                 size_t karg_idx = plan.middle_buf_indices[mb_slot];
+                // Defensive: middle buffers are always allocated in Task 9's
+                // make_buffer(), so arg_to_bo_idx[karg_idx] should never be
+                // SIZE_MAX here.  Guard anyway so a future refactor that
+                // skips allocation fails loudly instead of indexing bos[~0].
+                if (arg_to_bo_idx[karg_idx] == SIZE_MAX) {
+                    throw std::runtime_error(
+                        "output kernarg " + std::to_string(karg_idx) +
+                        " has no BO (classification skipped allocation?)");
+                }
                 xrt::bo& bo = bos[arg_to_bo_idx[karg_idx]];
                 bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                 std::ofstream out(args.outputs[o], std::ios::binary);
