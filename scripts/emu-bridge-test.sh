@@ -532,18 +532,24 @@ _run_hw_cycles_pipeline() {
         return 0
     fi
 
-    # The injected MLIR sits at $build_dir/aie_arch.mlir (compile_one_compiler
-    # writes it there during MLIR prep). trace-to-cycles needs it to call
-    # parse_trace().
-    local mlir_path="$build_dir/aie_arch.mlir"
-    if [[ ! -f "$mlir_path" ]]; then
-        echo "[hw-cycles] $test_name ($variant): no MLIR at $mlir_path; cannot extract cycles" >&2
+    # parse_trace needs the POST-LOWERING MLIR (input_with_addresses.mlir)
+    # produced by aiecc.py inside its .prj scratch dir. The source aie_arch.mlir
+    # has high-level aie.trace ops but lacks the npu.write32 ops that
+    # parse_mlir_trace_events scans for to identify trace tiles. Fall back to
+    # the source MLIR for the trace-presence check; skip extraction if the
+    # lowered MLIR is missing.
+    local src_mlir="$build_dir/aie_arch.mlir"
+    if [[ ! -f "$src_mlir" ]]; then
+        echo "[hw-cycles] $test_name ($variant): no MLIR at $src_mlir; cannot extract cycles" >&2
         return 0
     fi
-
-    # Skip if xclbin has no trace kernarg (injection was a no-op or skipped).
-    if ! xclbinutil --info --input "$xclbin" 2>/dev/null | grep -qi "trace"; then
-        echo "[hw-cycles] $test_name ($variant): xclbin has no trace kernarg; skipping" >&2
+    if ! grep -q "aie.trace " "$src_mlir" 2>/dev/null; then
+        echo "[hw-cycles] $test_name ($variant): MLIR has no trace ops; skipping" >&2
+        return 0
+    fi
+    local mlir_path="$build_dir/aie_arch.mlir.prj/input_with_addresses.mlir"
+    if [[ ! -f "$mlir_path" ]]; then
+        echo "[hw-cycles] $test_name ($variant): no lowered MLIR at $mlir_path; cannot extract cycles" >&2
         return 0
     fi
 
