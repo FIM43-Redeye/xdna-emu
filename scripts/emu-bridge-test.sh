@@ -557,7 +557,7 @@ _run_hw_cycles_pipeline() {
     safe="$(sanitize_name "$test_name")"
     local work_dir="$RESULTS_DIR/${safe}.hw-cycles"
     mkdir -p "$work_dir"
-    local trace_bin="$work_dir/trace.$variant.bin"
+    local trace_bin="$work_dir/trace_hw.$variant.bin"
     local cycles_txt="$RESULTS_DIR/${safe}.${variant}.cycles.HW.txt"
     local runner_log="$work_dir/runner.$variant.log"
     local extract_log="$work_dir/extract.$variant.log"
