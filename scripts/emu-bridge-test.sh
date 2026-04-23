@@ -613,6 +613,42 @@ _run_trace_cycles_pipeline() {
     return 0
 }
 
+# _run_trace_compare <test_name> <variant>
+# Runs trace-compare on the HW and EMU trace bins produced earlier; writes
+# the report to RESULTS_DIR/<safe>.<variant>.cycles.compare.txt.
+# Returns 0 on success, 1 if either bin is missing, 2 if trace-compare errored.
+_run_trace_compare() {
+    local test_name="$1"
+    local variant="$2"
+
+    local safe
+    safe="$(sanitize_name "$test_name")"
+    local work_dir="$RESULTS_DIR/${safe}.hw-cycles"
+    local hw_bin="$work_dir/trace_hw.${variant}.bin"
+    local emu_bin="$work_dir/trace_emu.${variant}.bin"
+    local report="$RESULTS_DIR/${safe}.${variant}.cycles.compare.txt"
+
+    if [[ ! -f "$hw_bin" || ! -f "$emu_bin" ]]; then
+        return 1
+    fi
+
+    local rust_bin="$EMU_ROOT/target/release/trace-compare"
+    if [[ ! -x "$rust_bin" ]]; then
+        echo "[trace-compare] trace-compare binary not built at $rust_bin" >&2
+        return 2
+    fi
+
+    if ! "$rust_bin" \
+        --hw "$hw_bin" \
+        --emu "$emu_bin" \
+        --stalls \
+        --extended \
+        -o "$report" 2>/dev/null; then
+        return 2
+    fi
+    return 0
+}
+
 # Derive a variant name from a run command's xclbin filename.
 # e.g., "aie2_cascade.xclbin" -> "cascade", "aie.xclbin" -> ""
 # Returns empty string for the standard "aie.xclbin" case.
@@ -839,7 +875,7 @@ transform_for_peano() {
 export -f find_lit_file is_standard_test requires_npu2 requires_only_compiler is_xfail
 export -f get_npu_device apply_lit_subs
 export -f extract_build_commands get_run_cmd get_run_variants get_variant_run_cmd
-export -f _strip_trace_flags _variant_from_cmd _run_trace_cycles_pipeline
+export -f _strip_trace_flags _variant_from_cmd _run_trace_cycles_pipeline _run_trace_compare
 export -f sanitize_name wait_npu_idle
 export -f transform_for_chess transform_for_peano
 
@@ -1476,6 +1512,12 @@ run_one_bridge() {
       else
           echo "[trace-cycles:EMU] $name (${compiler}${vsuffix}): missing xclbin or insts.bin in $build_dir; skipping" >&2
       fi
+  fi
+
+  # Phase E: compare HW vs EMU traces when both bins exist.
+  # Classification comes in Task 7; this just produces the raw report.
+  if [[ "$WITH_CYCLE_DIFF" == "true" && "$result" == "PASS" ]]; then
+      _run_trace_compare "$name" "${compiler}${vsuffix}" || true
   fi
 
   # Copy events.json for trace decoding.
