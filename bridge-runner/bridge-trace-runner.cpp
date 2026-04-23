@@ -22,8 +22,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "xrt/xrt_device.h"
+#include "xrt/xrt_kernel.h"
+#include "xrt/experimental/xrt_xclbin.h"
 
 namespace {
 
@@ -98,6 +103,57 @@ int parse_cli(int argc, char** argv, CliArgs& out) {
     return 0;
 }
 
+struct KernArgInfo {
+    std::string name;
+    std::string host_type;   // e.g., "uint32_t*", "uint32_t", "uint64_t*"
+    size_t index = 0;
+    uint64_t size = 0;       // in bytes; for pointers, the buffer size
+    uint64_t offset = 0;
+    bool is_scalar() const { return host_type.find('*') == std::string::npos; }
+};
+
+std::vector<KernArgInfo> read_kernel_args(
+    const xrt::xclbin& xclbin,
+    const std::string& kernel_name_hint,
+    std::string& chosen_kernel_name,
+    bool verbose)
+{
+    auto kernels = xclbin.get_kernels();
+    if (kernels.empty()) {
+        throw std::runtime_error("xclbin has no kernels");
+    }
+    const xrt::xclbin::kernel* picked = nullptr;
+    for (const auto& k : kernels) {
+        if (kernel_name_hint.empty() ||
+            k.get_name().find(kernel_name_hint) != std::string::npos) {
+            picked = &k;
+            break;
+        }
+    }
+    if (!picked) {
+        throw std::runtime_error("no kernel matches --kernel hint: " + kernel_name_hint);
+    }
+    chosen_kernel_name = picked->get_name();
+    std::vector<KernArgInfo> out;
+    for (const auto& a : picked->get_args()) {
+        KernArgInfo k;
+        k.name = a.get_name();
+        k.host_type = a.get_host_type();
+        k.index = a.get_index();
+        k.size = a.get_size();
+        k.offset = a.get_offset();
+        out.push_back(k);
+        if (verbose) {
+            std::fprintf(stderr,
+                "  arg[%zu] name=%-12s host_type=%-16s size=%lu offset=%lu %s\n",
+                k.index, k.name.c_str(), k.host_type.c_str(),
+                (unsigned long)k.size, (unsigned long)k.offset,
+                k.is_scalar() ? "(scalar)" : "(buffer)");
+        }
+    }
+    return out;
+}
+
 } // anonymous namespace
 
 int main(int argc, char** argv) {
@@ -111,6 +167,21 @@ int main(int argc, char** argv) {
                      (unsigned long)args.trace_size_bytes,
                      args.inputs.size(), args.outputs.size());
     }
-    // XRT logic lands in Tasks 8-10.
+    // Load the xclbin and discover its kernel-arg layout.
+    try {
+        xrt::device device(0);
+        xrt::xclbin xclbin(args.xclbin);
+        std::string kernel_name;
+        auto kargs = read_kernel_args(xclbin, args.kernel_name, kernel_name, args.verbose);
+        std::fprintf(stderr, "bridge-trace-runner: kernel=%s, %zu args\n",
+                     kernel_name.c_str(), kargs.size());
+        // device is kept alive here to verify XRT device opening works end-to-end.
+        // Task 9 will use it for BO allocation.
+        (void)device;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
+    // Allocation + execution land in Tasks 9-10.
     return 0;
 }

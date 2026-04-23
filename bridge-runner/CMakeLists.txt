@@ -4,6 +4,10 @@ project(bridge-trace-runner CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Emit compile_commands.json so clangd/other IDE tooling can resolve XRT
+# includes without hand-maintained .clangd configuration.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # XRT comes from /opt/xilinx/xrt by default.
 set(XRT_ROOT "/opt/xilinx/xrt" CACHE PATH "XRT install root")
 include_directories(SYSTEM "${XRT_ROOT}/include")
