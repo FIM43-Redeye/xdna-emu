@@ -454,6 +454,10 @@ apply_lit_subs() {
   cmd="${cmd//'%S'/$src_dir}"
   [[ -n "$lit_file" ]] && cmd="${cmd//'%s'/$lit_file}"
   cmd="${cmd//'%aietools'/$AIETOOLS_DIR}"
+  # %python aiecc.py: aiecc.py has a python3 shebang and lives on PATH after
+  # env activation, but `python3 aiecc.py` makes python3 search CWD only and
+  # fails. Strip the python3 prefix and let the shebang handle it.
+  cmd="${cmd//'%python aiecc.py'/aiecc.py}"
   cmd="${cmd//'%python '/python3 }"
   cmd="${cmd//'%python'/python3}"
   cmd="${cmd//'%xrt_flags'/-I$src_dir -I$XRT_INCLUDE -L$XRT_LIB -luuid -lxrt_coreutil}"
