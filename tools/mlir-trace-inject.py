@@ -68,6 +68,19 @@ from pathlib import Path
 # aie dialect is ever renamed upstream, only this constant needs updating.
 TRACE_OP_NAME = "aie.trace"
 
+# Default trace configuration constants.  These mirror mlir-aie's own
+# defaults in python/utils/trace/setup.py (configure_trace + _get_default_events_for_tile).
+# Keeping them as named constants documents the derivation and makes upstream
+# drift easy to track.
+_TRACE_PACKET_ID_START = 1          # AIEInsertTraceFlows reassigns during lowering
+_TRACE_BROADCAST_START = 15         # hardware broadcast channel that starts trace
+_TRACE_BROADCAST_STOP = 14          # hardware broadcast channel that stops trace
+_TRACE_DEFAULT_CORE_EVENTS = (
+    "INSTR_VECTOR",      # vector-instruction issue
+    "INSTR_EVENT_0",     # software event pin 0 (kernel boundary marker, if used)
+    "INSTR_EVENT_1",     # software event pin 1 (kernel boundary marker, if used)
+)
+
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
@@ -141,15 +154,12 @@ def _inject_trace_ops(module, input_path: str, aied) -> int:
     # Keep them in declaration order so injected traces appear deterministically.
     device_body = device_op.operation.regions[0].blocks[0]
     compute_tiles = []  # list of (col: int, row: int, tile_ssa_value)
-    aie_end_op = None
     for inner in device_body.operations:
         if inner.operation.name == "aie.tile":
             col = int(IntegerAttr(inner.operation.attributes["col"]).value)
             row = int(IntegerAttr(inner.operation.attributes["row"]).value)
             if row >= 2:
                 compute_tiles.append((col, row, inner.operation.result))
-        if inner.operation.name == "aie.end":
-            aie_end_op = inner
 
     if not compute_tiles:
         print(
@@ -159,34 +169,41 @@ def _inject_trace_ops(module, input_path: str, aied) -> int:
         )
         return 0
 
-    # aie.end is the sentinel terminator of the device body. Insert the trace
-    # ops immediately before it so they appear after tile declarations but are
-    # still within the device body.  InsertionPoint(op) means "insert before op".
-    with InsertionPoint(aie_end_op.operation):
+    # Insert trace ops before the device body's terminator.  The aie.device
+    # block's last op is always its terminator (aie.end for well-formed input,
+    # but using "last op" rather than matching name == 'aie.end' is resilient
+    # to upstream renames and to blocks where the terminator differs).  If the
+    # block is somehow empty, we bail rather than risk writing malformed MLIR.
+    ops_list = list(device_body.operations)
+    if not ops_list:
+        print(
+            f"error: aie.device body is empty in {input_path}; cannot inject",
+            file=sys.stderr,
+        )
+        return 1
+    terminator = ops_list[-1]
+
+    with InsertionPoint(terminator.operation):
         for col, row, tile_val in compute_tiles:
             # The @aied.trace(tile, sym) decorator-form builder:
             #   1. Constructs TraceOp(tile=tile_val, sym_name=sym_name)
             #   2. Appends a block to the op's single region
             #   3. Sets the InsertionPoint to at_block_begin of that block
-            #   4. Calls the decorated function (populates the body)
+            #   4. Calls the decorated function synchronously (populates body)
             #   5. Restores the previous InsertionPoint
             # This exactly mirrors how mlir-aie's configure_trace() works.
+            # The decorator invokes _trace_body synchronously before the next
+            # loop iteration reassigns the name, so redefinition is safe.
             @aied.trace(tile_val, f"trace_t{col}_{row}")
             def _trace_body():  # noqa: F811 -- redefinition is intentional (one per tile)
                 aied.trace_mode(aied.TraceMode.EventTime)
-                # packet id=1 is the conventional starting id; AIEInsertTraceFlows
-                # will reassign ids when it lowers the declarative ops to hardware
-                # configuration sequences.
-                aied.trace_packet(1, aied.TracePacketType.Core)
-                # Default event set: instruction vector, software event pins 0 and 1.
-                # These match mlir-aie's _get_default_events_for_tile() for core tiles.
-                aied.trace_event("INSTR_VECTOR")
-                aied.trace_event("INSTR_EVENT_0")
-                aied.trace_event("INSTR_EVENT_1")
-                # Broadcast channels 15 (start) and 14 (stop) are the mlir-aie
-                # defaults from configure_trace() (python/utils/trace/setup.py).
-                aied.trace_start(broadcast=15)
-                aied.trace_stop(broadcast=14)
+                # packet id is the conventional starting id; AIEInsertTraceFlows
+                # reassigns ids when it lowers the declarative ops.
+                aied.trace_packet(_TRACE_PACKET_ID_START, aied.TracePacketType.Core)
+                for event_name in _TRACE_DEFAULT_CORE_EVENTS:
+                    aied.trace_event(event_name)
+                aied.trace_start(broadcast=_TRACE_BROADCAST_START)
+                aied.trace_stop(broadcast=_TRACE_BROADCAST_STOP)
 
     return 0
 

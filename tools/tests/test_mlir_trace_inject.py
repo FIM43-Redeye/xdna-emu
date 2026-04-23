@@ -71,17 +71,25 @@ def test_no_op_round_trips_already_traced(tmp_path):
 
 
 def test_injector_adds_trace_decl_per_compute_tile(tmp_path):
-    """Each non-shim tile in the input should get one aie.trace decl."""
+    """Each non-shim tile in the input should get one aie.trace decl with
+    the mandatory body (mode, packet, events, start/stop broadcasts)."""
     out = tmp_path / "out.mlir"
     r = _run(["--input", str(UNTRACED), "--out", str(out)])
     assert r.returncode == 0, f"stderr={r.stderr}"
     result = out.read_text()
     # Fixture has one compute tile (0, 2). Shim tile (0, 0) is not compute.
-    # Count aie.trace at the op-start level (not aie.trace.event/etc. sub-ops).
-    # A reliable way: look for the decl form "aie.trace @" which is uniquely the
-    # outer TraceOp (its body has aie.trace.event but those are indented/nested).
+    # Count aie.trace at the op-start level (not aie.trace.event/etc. sub-ops):
+    # the decl form "aie.trace @" is uniquely the outer TraceOp (its body has
+    # aie.trace.event but those are indented/nested).
     trace_count = result.count("aie.trace @")
-    # We expect exactly 1 trace decl (for tile 0,2).
     assert trace_count == 1, f"expected 1 aie.trace decl, got {trace_count}\n---\n{result}"
-    # Confirm the tile it attaches to appears in the output (various spellings ok):
-    assert "tile" in result.lower()
+    # Symbol name should follow trace_t{col}_{row} convention.
+    assert "@trace_t0_2" in result, f"sym_name missing; got:\n{result}"
+    # Body must contain all the spec-mandated fields. Regressions that drop
+    # the mode op, event list, or broadcast channels should fail this test.
+    assert "Event-Time" in result, "aie.trace.mode 'Event-Time' missing"
+    assert "INSTR_VECTOR" in result, "INSTR_VECTOR event missing"
+    assert "INSTR_EVENT_0" in result, "INSTR_EVENT_0 event missing"
+    assert "INSTR_EVENT_1" in result, "INSTR_EVENT_1 event missing"
+    # start broadcast=15, stop broadcast=14 (mlir-aie defaults).
+    assert "15" in result and "14" in result, "broadcast channels 15/14 missing"
