@@ -1861,6 +1861,8 @@ print_report() {
   local run_hw=$2
   local has_trace=false
   [[ "$NO_TRACE" != "true" ]] && has_trace=true
+  local has_cycle=false
+  [[ "$WITH_CYCLE_DIFF" == "true" ]] && has_cycle=true
 
   local compilers
   read -ra compilers <<< "$COMPILERS_STR"
@@ -1894,6 +1896,13 @@ print_report() {
       printf "  %-20s" "${label}/TRACE"
     done
   fi
+  if $has_cycle; then
+    for compiler in "${compilers[@]}"; do
+      local label
+      label="$(echo "$compiler" | sed 's/./\U&/')"
+      printf "  %-24s" "${label}/CYCLES"
+    done
+  fi
   echo ""
 
   # Print separator.
@@ -1907,6 +1916,11 @@ print_report() {
   if $has_trace; then
     for _ in "${compilers[@]}"; do
       printf "  %-20s" "$(printf '%0.s-' $(seq 1 20))"
+    done
+  fi
+  if $has_cycle; then
+    for _ in "${compilers[@]}"; do
+      printf "  %-24s" "$(printf '%0.s-' $(seq 1 24))"
     done
   fi
   echo ""
@@ -1943,6 +1957,20 @@ print_report() {
     trace_error[$compiler]=0
     trace_skip[$compiler]=0
   done
+
+  # Cycle-drift counters (Phase E Task 12).
+  declare -A cycle_match cycle_drift cycle_empty cycle_emu_bug cycle_hw_bug cycle_compare_err cycle_no_data
+  for compiler in "${compilers[@]}"; do
+    cycle_match[$compiler]=0
+    cycle_drift[$compiler]=0
+    cycle_empty[$compiler]=0
+    cycle_emu_bug[$compiler]=0
+    cycle_hw_bug[$compiler]=0
+    cycle_compare_err[$compiler]=0
+    cycle_no_data[$compiler]=0
+  done
+  declare -a cycle_offenders=()   # lines for the summary block
+  declare -a cycle_empty_list=()
 
   local has_compile_fail=false
 
@@ -2070,6 +2098,35 @@ print_report() {
       done
     fi
 
+    # Cycle-drift column (Phase E Task 12).
+    if $has_cycle; then
+      for compiler in "${compilers[@]}"; do
+        local cyc="-"
+        local tag=""
+        if [[ -f "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.cycle.result" ]]; then
+          cyc="$(< "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.cycle.result")"
+          case "$cyc" in
+            MATCH*)          tag="match";         cycle_match[$compiler]=$(( ${cycle_match[$compiler]} + 1 )) ;;
+            DRIFT*)          tag="drift";         cycle_drift[$compiler]=$(( ${cycle_drift[$compiler]} + 1 )) ;;
+            EMPTY)           tag="empty";         cycle_empty[$compiler]=$(( ${cycle_empty[$compiler]} + 1 )) ;;
+            EMU_TRACE_BUG)   tag="emu-trace-bug"; cycle_emu_bug[$compiler]=$(( ${cycle_emu_bug[$compiler]} + 1 )) ;;
+            HW_TRACE_BUG)    tag="hw-trace-bug";  cycle_hw_bug[$compiler]=$(( ${cycle_hw_bug[$compiler]} + 1 )) ;;
+            COMPARE-ERR)     tag="compare-err";   cycle_compare_err[$compiler]=$(( ${cycle_compare_err[$compiler]} + 1 )) ;;
+            NO_DATA|-)       tag="no-data";       cycle_no_data[$compiler]=$(( ${cycle_no_data[$compiler]} + 1 )) ;;
+          esac
+          if [[ "$tag" == "drift" || "$tag" == "emu-trace-bug" || "$tag" == "hw-trace-bug" || "$tag" == "compare-err" ]]; then
+            cycle_offenders+=("  $display_name ($compiler): $cyc")
+          elif [[ "$tag" == "empty" ]]; then
+            cycle_empty_list+=("  $display_name ($compiler)")
+          fi
+        else
+          cyc="-"
+          cycle_no_data[$compiler]=$(( ${cycle_no_data[$compiler]} + 1 ))
+        fi
+        printf "  %-24s" "$cyc"
+      done
+    fi
+
     echo ""
 
     # Verbose: show log tail on failure.
@@ -2176,6 +2233,41 @@ print_report() {
       echo "${label} trace: ${trace_clean[$compiler]} clean, ${trace_diverge[$compiler]} diverge, ${trace_error[$compiler]} error, ${trace_skip[$compiler]} skip"
     done
   fi
+
+  if $has_cycle; then
+    echo ""
+    echo "==========================================================================="
+    echo "  CYCLE DRIFT (Phase E)"
+    echo "==========================================================================="
+    for compiler in "${compilers[@]}"; do
+      printf "  %-8s  %d MATCH  %d DRIFT  %d EMPTY  %d EMU_TRACE_BUG  %d HW_TRACE_BUG  %d COMPARE-ERR  %d skipped\n" \
+        "$compiler" \
+        "${cycle_match[$compiler]}" \
+        "${cycle_drift[$compiler]}" \
+        "${cycle_empty[$compiler]}" \
+        "${cycle_emu_bug[$compiler]}" \
+        "${cycle_hw_bug[$compiler]}" \
+        "${cycle_compare_err[$compiler]}" \
+        "${cycle_no_data[$compiler]}"
+    done
+
+    if [[ ${#cycle_offenders[@]} -gt 0 ]]; then
+      echo ""
+      echo "  Offenders (DRIFT / *_TRACE_BUG / COMPARE-ERR):"
+      for line in "${cycle_offenders[@]}"; do
+        echo "$line"
+      done
+    fi
+
+    if [[ ${#cycle_empty_list[@]} -gt 0 ]]; then
+      echo ""
+      echo "  Empty-trace tests (default event set insufficient -- see Phase B Limitation 1):"
+      for line in "${cycle_empty_list[@]}"; do
+        echo "$line"
+      done
+    fi
+  fi
+
   echo "Logs: $RESULTS_DIR/"
 }
 
