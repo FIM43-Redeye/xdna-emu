@@ -1240,8 +1240,14 @@ compile_one_compiler() {
   done < <(extract_build_commands "$lit_file" "$src_dir")
 
   if $failed; then
-    echo "FAIL" > "$result_file"
-    echo "  COMPILE $name ($compiler): FAIL"
+    local fail_tag="FAIL"
+    local label="FAIL"
+    if [[ -n "$HW_CYCLES_TRACED_MLIR" ]] && [[ "$src_mlir" == "$HW_CYCLES_TRACED_MLIR" ]]; then
+      fail_tag="FAIL_TRACED"
+      label="FAIL(traced)"
+    fi
+    echo "$fail_tag" > "$result_file"
+    echo "  COMPILE $name ($compiler): $label"
     return 0
   fi
 
@@ -1901,10 +1907,12 @@ print_report() {
           _compile_counted["$ck"]=1
         fi
         has_compile_fail=true
+        local _fail_label="FAIL*"
+        [[ "$cr" == "FAIL_TRACED" ]] && _fail_label="FAILt*"
         if [[ "$run_hw" == "true" ]]; then
-          printf "  %-${col_width}s" "FAIL*"
+          printf "  %-${col_width}s" "$_fail_label"
         fi
-        printf "  %-${col_width}s" "FAIL*"
+        printf "  %-${col_width}s" "$_fail_label"
         continue
       fi
 
@@ -2011,10 +2019,25 @@ print_report() {
   for compiler in "${compilers[@]}"; do
     [[ ${hw_tdr[$compiler]} -gt 0 ]] && has_tdr=true
   done
+  # Detect whether any FAIL_TRACED exists to tailor the footnote.
+  local has_traced_fail=false
+  for row in "${test_list[@]}"; do
+    local _n="${row%%:*}"
+    local _safe
+    _safe="$(sanitize_name "$_n")"
+    for compiler in "${compilers[@]}"; do
+      if [[ -f "$RESULTS_DIR/${_safe}.${compiler}.compile.result" ]]; then
+        local _cr
+        _cr="$(< "$RESULTS_DIR/${_safe}.${compiler}.compile.result")"
+        [[ "$_cr" == "FAIL_TRACED" ]] && has_traced_fail=true
+      fi
+    done
+  done
   if $has_compile_fail || $has_tdr; then
     echo ""
-    $has_compile_fail && echo "* = compile failed"
-    $has_tdr && echo "TDR = hardware timeout detection and recovery (NPU hung)"
+    $has_compile_fail && echo "*  = compile failed"
+    $has_traced_fail  && echo "t* = compile failed on trace-injected MLIR (retry without --with-hw-cycles)"
+    $has_tdr          && echo "TDR = hardware timeout detection and recovery (NPU hung)"
   fi
 
   # Show TDR suspect groups (from parallel runs).
