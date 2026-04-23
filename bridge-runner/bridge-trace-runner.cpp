@@ -22,11 +22,15 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
+#include "xrt/xrt_hw_context.h"
 #include "xrt/xrt_kernel.h"
 #include "xrt/experimental/xrt_xclbin.h"
 
@@ -154,6 +158,80 @@ std::vector<KernArgInfo> read_kernel_args(
     return out;
 }
 
+/// Load an instruction binary as a vector of uint32_t words.
+std::vector<uint32_t> load_instr_binary(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error("cannot open instr file: " + path);
+    std::streamsize bytes = f.tellg();
+    if (bytes < 0) throw std::runtime_error("cannot stat instr file: " + path);
+    if (bytes % 4 != 0) {
+        throw std::runtime_error("instr file size not a multiple of 4 bytes: " + path);
+    }
+    f.seekg(0);
+    std::vector<uint32_t> words(static_cast<size_t>(bytes) / 4);
+    f.read(reinterpret_cast<char*>(words.data()), bytes);
+    return words;
+}
+
+/// Read the contents of a file into a BO's host-mapped memory, up to the BO's
+/// size.  If the file is shorter than expected_size, the tail is left as
+/// whatever the caller initialized the BO with (typically zero).
+void load_bo_from_file(xrt::bo& bo, const std::string& path, size_t expected_size) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open input file: " + path);
+    f.read(static_cast<char*>(bo.map<void*>()), static_cast<std::streamsize>(expected_size));
+}
+
+/// Positional classification of kernargs into their semantic roles.
+/// The installed mlir-aie toolchain uses generic names (bo0, bo1, ...) rather
+/// than a distinguished "trace" name, so we dispatch by position:
+///
+///   scalars[0]  = opcode     (arg 0)
+///   buffers[0]  = instr      (arg 1, first buffer)
+///   scalars[1]  = ninstr     (arg 2)
+///   buffers[1..N-2] = middle data buffers (inputs then outputs)
+///   buffers[N-1] = trace     (last buffer)
+struct KernArgPlan {
+    size_t opcode_idx      = SIZE_MAX;  // first scalar
+    size_t instr_idx       = SIZE_MAX;  // first buffer
+    size_t instr_size_idx  = SIZE_MAX;  // second scalar
+    std::vector<size_t> middle_buf_indices;  // buffers between instr and trace
+    size_t trace_idx       = SIZE_MAX;  // last buffer
+};
+
+KernArgPlan classify_kernargs(const std::vector<KernArgInfo>& kargs) {
+    KernArgPlan plan;
+    std::vector<size_t> scalar_indices;
+    std::vector<size_t> buffer_indices;
+    for (const auto& k : kargs) {
+        if (k.is_scalar()) scalar_indices.push_back(k.index);
+        else buffer_indices.push_back(k.index);
+    }
+    // Expected layout (mlir-aie bridge-test convention):
+    //   scalars: opcode (u64), ninstr (u32)
+    //   buffers: instr, [bo0..boK-1], trace
+    if (scalar_indices.size() < 2) {
+        throw std::runtime_error(
+            "expected at least 2 scalar kernargs (opcode, ninstr); got " +
+            std::to_string(scalar_indices.size()));
+    }
+    if (buffer_indices.size() < 2) {
+        throw std::runtime_error(
+            "expected at least 2 buffer kernargs (instr + trace); got " +
+            std::to_string(buffer_indices.size()));
+    }
+    plan.opcode_idx     = scalar_indices[0];
+    plan.instr_size_idx = scalar_indices[1];
+    plan.instr_idx      = buffer_indices[0];
+    plan.trace_idx      = buffer_indices.back();
+    // Middle buffers: everything between the first buffer (instr) and the
+    // last buffer (trace).
+    for (size_t i = 1; i + 1 < buffer_indices.size(); ++i) {
+        plan.middle_buf_indices.push_back(buffer_indices[i]);
+    }
+    return plan;
+}
+
 } // anonymous namespace
 
 int main(int argc, char** argv) {
@@ -175,13 +253,114 @@ int main(int argc, char** argv) {
         auto kargs = read_kernel_args(xclbin, args.kernel_name, kernel_name, args.verbose);
         std::fprintf(stderr, "bridge-trace-runner: kernel=%s, %zu args\n",
                      kernel_name.c_str(), kargs.size());
-        // device is kept alive here to verify XRT device opening works end-to-end.
-        // Task 9 will use it for BO allocation.
-        (void)device;
+
+        // Classify kernargs into positional roles.
+        auto plan = classify_kernargs(kargs);
+        if (args.verbose) {
+            std::fprintf(stderr,
+                "  plan: opcode=%zu instr=%zu ninstr=%zu middle=%zu trace=%zu\n",
+                plan.opcode_idx, plan.instr_idx, plan.instr_size_idx,
+                plan.middle_buf_indices.size(), plan.trace_idx);
+        }
+        // Sanity-check --input/--output count against available middle buffers.
+        size_t expected_middle = args.inputs.size() + args.outputs.size();
+        if (expected_middle > plan.middle_buf_indices.size()) {
+            throw std::runtime_error(
+                "too many --input/--output args: got " +
+                std::to_string(expected_middle) + ", xclbin has " +
+                std::to_string(plan.middle_buf_indices.size()) + " middle buffers");
+        }
+
+        // Register xclbin with device and open a hardware context.
+        device.register_xclbin(xclbin);
+        xrt::hw_context context(device, xclbin.get_uuid());
+        xrt::kernel kernel(context, kernel_name);
+
+        // Load the instruction binary.
+        auto instr_words = load_instr_binary(args.instr_bin);
+        if (args.verbose) {
+            std::fprintf(stderr, "  loaded %zu instruction words from %s\n",
+                         instr_words.size(), args.instr_bin.c_str());
+        }
+
+        // Per-arg BO storage indexed by kernarg index.  Reserve upfront so that
+        // push_back never reallocates while we hold interior references.
+        std::vector<xrt::bo> bos;
+        bos.reserve(kargs.size());
+        xrt::bo* trace_bo_ptr = nullptr;
+
+        // Helper: allocate a BO for a given kernarg index and track it.
+        auto make_buffer = [&](size_t karg_idx, size_t sz,
+                               xrt::bo::flags flags) -> xrt::bo& {
+            bos.emplace_back(device, sz, flags,
+                             kernel.group_id(static_cast<int>(karg_idx)));
+            return bos.back();
+        };
+
+        // Instr BO: cacheable (kernel reads only, no host-after-run access).
+        {
+            auto& bo = make_buffer(plan.instr_idx,
+                                   instr_words.size() * sizeof(uint32_t),
+                                   xrt::bo::flags::cacheable);
+            std::memcpy(bo.map<void*>(),
+                        instr_words.data(),
+                        instr_words.size() * sizeof(uint32_t));
+            bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+
+        // Middle buffers: first args.inputs.size() loaded from --input files;
+        // remaining output slots and any unbound extras are zero-filled.
+        size_t mb_i = 0;
+        for (const std::string& in_path : args.inputs) {
+            if (mb_i >= plan.middle_buf_indices.size()) {
+                throw std::runtime_error("internal: input index out of middle-buffer range");
+            }
+            size_t karg_idx = plan.middle_buf_indices[mb_i];
+            size_t sz = static_cast<size_t>(kargs[karg_idx].size);
+            auto& bo = make_buffer(karg_idx, sz, xrt::bo::flags::host_only);
+            std::memset(bo.map<void*>(), 0, sz);
+            load_bo_from_file(bo, in_path, sz);
+            bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            mb_i++;
+        }
+        for (size_t o = 0; o < args.outputs.size(); ++o) {
+            if (mb_i >= plan.middle_buf_indices.size()) break;
+            size_t karg_idx = plan.middle_buf_indices[mb_i];
+            size_t sz = static_cast<size_t>(kargs[karg_idx].size);
+            auto& bo = make_buffer(karg_idx, sz, xrt::bo::flags::host_only);
+            std::memset(bo.map<void*>(), 0, sz);
+            bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            mb_i++;
+        }
+        // Any remaining middle buffers not covered by --input/--output get
+        // zero-filled BOs at their kernarg-declared size so the kernel can
+        // launch without a shape mismatch.
+        while (mb_i < plan.middle_buf_indices.size()) {
+            size_t karg_idx = plan.middle_buf_indices[mb_i];
+            size_t sz = static_cast<size_t>(kargs[karg_idx].size);
+            auto& bo = make_buffer(karg_idx, sz, xrt::bo::flags::host_only);
+            std::memset(bo.map<void*>(), 0, sz);
+            bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            mb_i++;
+        }
+
+        // Trace BO: zero-filled, sized to --trace-size.
+        {
+            auto& bo = make_buffer(plan.trace_idx, args.trace_size_bytes,
+                                   xrt::bo::flags::host_only);
+            std::memset(bo.map<void*>(), 0, args.trace_size_bytes);
+            bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            trace_bo_ptr = &bo;
+        }
+        (void)trace_bo_ptr;  // Task 10 will sync back + write --trace-out
+
+        std::fprintf(stderr, "bridge-trace-runner: allocated %zu BOs "
+                             "(instr + %zu middle + trace)\n",
+                     bos.size(), plan.middle_buf_indices.size());
+        // Kernel launch + trace sync-back + dump land in Task 10.
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;
     }
-    // Allocation + execution land in Tasks 9-10.
     return 0;
 }
