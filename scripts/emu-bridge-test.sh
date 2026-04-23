@@ -95,6 +95,13 @@ NO_TIMEOUT=false
 WITH_HW_CYCLES=${WITH_HW_CYCLES:-false}
 WITH_CYCLE_DIFF=${WITH_CYCLE_DIFF:-false}
 
+# Phase E dual-bound EMU timing constants.
+# EMU_SECONDS_PER_CYCLE is a conservative starting value (~1000 sim-cycles/sec);
+# to be calibrated empirically post-Task 14.
+EMU_SECONDS_PER_CYCLE=${EMU_SECONDS_PER_CYCLE:-0.001}
+EMU_CYCLE_BUDGET_MULTIPLIER=${EMU_CYCLE_BUDGET_MULTIPLIER:-2.0}
+export EMU_SECONDS_PER_CYCLE EMU_CYCLE_BUDGET_MULTIPLIER
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --compile)     FORCE_COMPILE=true; shift ;;
@@ -1572,6 +1579,26 @@ run_one_bridge() {
   local trace_out_dir="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.emu"
   mkdir -p "$trace_out_dir"
 
+  # Phase E dual-bound timing: if a HW cycles file exists for this
+  # test+compiler+variant, derive a tighter cycle budget and a scaled
+  # wall-clock timeout. Otherwise fall back to today's 600 s.
+  # File naming matches _run_trace_cycles_pipeline (variant = compiler+vsuffix).
+  local _hw_cycles_file="$RESULTS_DIR/${safe}.${compiler}${vsuffix}.cycles.HW.txt"
+  local _hw_cycles=0
+  if [[ -f "$_hw_cycles_file" ]]; then
+      _hw_cycles="$(tr -d '[:space:]' < "$_hw_cycles_file")"
+      [[ -z "$_hw_cycles" ]] && _hw_cycles=0
+  fi
+
+  local _cycle_budget=""
+  local _timeout_s=600
+  if [[ "$_hw_cycles" -gt 0 ]]; then
+      _cycle_budget="$(awk -v c="$_hw_cycles" -v m="$EMU_CYCLE_BUDGET_MULTIPLIER" \
+          'BEGIN{ printf "%d", c*m + 0.5 }')"
+      _timeout_s="$(awk -v c="$_hw_cycles" -v m="$EMU_CYCLE_BUDGET_MULTIPLIER" -v s="$EMU_SECONDS_PER_CYCLE" \
+          'BEGIN{ t=c*m*s; if (t<600) t=600; printf "%d", t + 0.5 }')"
+  fi
+
   local rc=0
   (
     cd "$build_dir"
@@ -1581,10 +1608,13 @@ run_one_bridge() {
     [[ -n "${XDNA_EMU_LIB:-}" ]] && export XDNA_EMU_LIB
     export XRT_DEVICE_BDF="ffff:ff:1f.0"
     export XDNA_TRACE_DIR="$trace_out_dir"
+    if [[ -n "$_cycle_budget" ]]; then
+      export XDNA_EMU_MAX_CYCLES="$_cycle_budget"
+    fi
     if [[ "${NO_TIMEOUT:-false}" == "true" ]]; then
       bash -c "$run_cmd"
     else
-      timeout 600 bash -c "$run_cmd"
+      timeout "${_timeout_s}" bash -c "$run_cmd"
     fi
   ) > "$log_file" 2>&1 || rc=$?
   local result
