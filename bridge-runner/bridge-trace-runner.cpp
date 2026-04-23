@@ -19,6 +19,7 @@
 // Output: raw trace buffer contents written to --trace-out, ready to be
 // parsed by tools/trace-to-cycles.py.
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -375,13 +376,75 @@ int main(int argc, char** argv) {
             bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
             trace_bo_ptr = &bo;
         }
-        (void)trace_bo_ptr;    // Task 10 will sync back + write --trace-out
-        (void)arg_to_bo_idx;   // Task 10 will use this to bind run args
-
         std::fprintf(stderr, "bridge-trace-runner: allocated %zu BOs "
                              "(instr + %zu middle + trace)\n",
                      bos.size(), plan.middle_buf_indices.size());
-        // Kernel launch + trace sync-back + dump land in Task 10.
+
+        // Build the positional arg vector.  For each kernarg, either pass the
+        // scalar value we know by role (opcode = 3 as the AIE kernel opcode,
+        // ninstr = instr_words.size()) or reference the BO we allocated above
+        // via arg_to_bo_idx.
+        xrt::run run(kernel);
+        for (size_t i = 0; i < kargs.size(); ++i) {
+            if (i == plan.opcode_idx) {
+                // Opcode 3 is the AIE kernel opcode used by mlir-aie.
+                run.set_arg(static_cast<int>(i), static_cast<uint64_t>(3));
+            } else if (i == plan.instr_size_idx) {
+                run.set_arg(static_cast<int>(i),
+                            static_cast<uint32_t>(instr_words.size()));
+            } else if (arg_to_bo_idx[i] != SIZE_MAX) {
+                run.set_arg(static_cast<int>(i), bos[arg_to_bo_idx[i]]);
+            } else {
+                throw std::runtime_error(
+                    "kernarg " + std::to_string(i) +
+                    " was not classified (no scalar role and no BO bound)");
+            }
+        }
+
+        if (args.verbose) {
+            std::fprintf(stderr, "  launching kernel (timeout 30s)\n");
+        }
+        run.start();
+        auto state = run.wait(std::chrono::seconds(30));
+        if (state != ERT_CMD_STATE_COMPLETED) {
+            std::fprintf(stderr, "error: kernel did not complete (state=%d)\n",
+                         static_cast<int>(state));
+            return 1;
+        }
+
+        // Trace buffer: sync from device then write raw bytes to --trace-out.
+        trace_bo_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        {
+            std::ofstream out(args.trace_out, std::ios::binary);
+            if (!out) {
+                throw std::runtime_error("cannot open trace-out: " + args.trace_out);
+            }
+            out.write(static_cast<const char*>(trace_bo_ptr->map<const void*>()),
+                      static_cast<std::streamsize>(args.trace_size_bytes));
+        }
+        if (args.verbose) {
+            std::fprintf(stderr, "  wrote %lu bytes of trace to %s\n",
+                         (unsigned long)args.trace_size_bytes, args.trace_out.c_str());
+        }
+
+        // Optional: write middle-buffer outputs back to --output paths, in
+        // order.  We skipped the first args.inputs.size() middle slots (those
+        // are inputs).  The outputs map to the next args.outputs.size() slots.
+        if (!args.outputs.empty()) {
+            for (size_t o = 0; o < args.outputs.size(); ++o) {
+                size_t mb_slot = args.inputs.size() + o;
+                if (mb_slot >= plan.middle_buf_indices.size()) break;
+                size_t karg_idx = plan.middle_buf_indices[mb_slot];
+                xrt::bo& bo = bos[arg_to_bo_idx[karg_idx]];
+                bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                std::ofstream out(args.outputs[o], std::ios::binary);
+                if (!out) {
+                    throw std::runtime_error("cannot open output file: " + args.outputs[o]);
+                }
+                out.write(static_cast<const char*>(bo.map<const void*>()),
+                          static_cast<std::streamsize>(kargs[karg_idx].size));
+            }
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;
