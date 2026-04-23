@@ -1,11 +1,11 @@
-//! Efficient trace comparison: Rust replacement for trace-compare.py.
+//! Efficient trace comparison: HW vs EMU.
 //!
-//! Compares HW vs EMU binary trace buffers with O(n) time and bounded
-//! memory. Output format matches the Python version so the bridge script
-//! can parse it unchanged.
+//! Consumes per-side events JSON produced by tools/parse-trace.py (which
+//! delegates binary decoding to mlir-aie's parser). All binary-level work
+//! happens upstream; this tool only does the structural comparison.
 //!
 //! Usage:
-//!   trace-compare --hw trace_raw.bin --emu trace_raw.bin [--events-json events.json] [-o report.txt]
+//!   trace-compare --hw hw.events.json --emu emu.events.json [--events-json slot-names.json] [-o report.txt]
 //!   trace-compare --sweep /path/to/sweep-dir [-o report.txt]
 //!   trace-compare --sweep /path/to/sweep-dir --extended [-o report.txt]
 
@@ -16,14 +16,20 @@ use xdna_emu::trace::compare::{self, AnalysisOptions, EventsConfig};
 
 fn usage() -> ! {
     eprintln!("Usage:");
-    eprintln!("  trace-compare --hw <file> --emu <file> [--events-json <file>] [-o <file>]");
+    eprintln!("  trace-compare --hw <events.json> --emu <events.json> \\");
+    eprintln!("                [--events-json <slot-names.json>] [-o <file>]");
     eprintln!("  trace-compare --sweep <dir> [-o <file>]");
+    eprintln!();
+    eprintln!("  The --hw/--emu inputs are events JSON produced by");
+    eprintln!("  tools/parse-trace.py; the optional --events-json is a legacy");
+    eprintln!("  aiecc slot-name override (mlir-aie events.json format).");
     eprintln!();
     eprintln!("Extended analysis (appended after standard report):");
     eprintln!("  --extended       Enable all extended analyses");
     eprintln!("  --iterations     Per-iteration period breakdown for recurring events");
     eprintln!("  --stalls         Stall attribution (level stalls -> resolving events)");
     eprintln!("  --cross-tile     Cross-tile event correlation (edge-to-edge pairing)");
+    eprintln!("  --remap-columns  Normalize physical cols to logical 0-indexed");
     process::exit(1);
 }
 

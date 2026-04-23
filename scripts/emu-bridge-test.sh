@@ -519,8 +519,11 @@ _strip_trace_flags() {
 # _run_trace_cycles_pipeline <side> <build_dir> <xclbin> <kernel> <instr> <variant>
 #   side ∈ {HW, EMU}.
 # Runs bridge-trace-runner against a traced xclbin on the requested side,
-# then runs trace-to-cycles on the output. Writes:
+# then runs parse-trace.py (mlir-aie-backed decoder) to emit both the flat
+# events JSON (for trace-compare) and the cycles scalar (for the CYCLES
+# column) in a single pass. Writes:
 #   RESULTS_DIR/<safe>.hw-cycles/trace_{hw,emu}.<variant>.bin
+#   RESULTS_DIR/<safe>.hw-cycles/trace_{hw,emu}.<variant>.events.json
 #   RESULTS_DIR/<safe>.<variant>.cycles.{HW,EMU}.txt
 # Best-effort: any failure logs and returns non-zero, but callers pass || true
 # so the core bridge/hw verdicts are never gated on the cycle-capture side.
@@ -575,6 +578,7 @@ _run_trace_cycles_pipeline() {
     esac
 
     local trace_bin="$work_dir/${bin_label}.${variant}.bin"
+    local events_json="$work_dir/${bin_label}.${variant}.events.json"
     local cycles_txt="$RESULTS_DIR/${safe}.${variant}.cycles.${cycles_label}.txt"
     local runner_log="$work_dir/runner.${bin_label}.${variant}.log"
     local extract_log="$work_dir/extract.${bin_label}.${variant}.log"
@@ -599,13 +603,18 @@ _run_trace_cycles_pipeline() {
         return 1
     fi
 
+    # Single-pass decode: parse-trace.py wraps mlir-aie's parser and emits
+    # both the flat events JSON (for trace-compare) and the cycles scalar
+    # (for the CYCLES column). One invocation, derived from shared state,
+    # guarantees the two outputs never disagree.
     if ! PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python \
-        python3 "$EMU_ROOT/tools/trace-to-cycles.py" \
+        python3 "$EMU_ROOT/tools/parse-trace.py" \
         --trace-bin "$trace_bin" \
         --xclbin-mlir "$mlir_path" \
-        --out "$cycles_txt" \
+        --out-events "$events_json" \
+        --out-cycles "$cycles_txt" \
         2>"$extract_log"; then
-        echo "[trace-cycles:$side] $test_name ($variant): extractor failed; see $extract_log" >&2
+        echo "[trace-cycles:$side] $test_name ($variant): parse-trace failed; see $extract_log" >&2
         return 1
     fi
 
@@ -614,9 +623,10 @@ _run_trace_cycles_pipeline() {
 }
 
 # _run_trace_compare <test_name> <variant>
-# Runs trace-compare on the HW and EMU trace bins produced earlier; writes
-# the report to RESULTS_DIR/<safe>.<variant>.cycles.compare.txt.
-# Returns 0 on success, 1 if either bin is missing, 2 if trace-compare errored.
+# Runs trace-compare on the HW and EMU events JSONs produced by
+# _run_trace_cycles_pipeline (via parse-trace.py). Writes the report to
+# RESULTS_DIR/<safe>.<variant>.cycles.compare.txt.
+# Returns 0 on success, 1 if either events JSON is missing, 2 on compare error.
 _run_trace_compare() {
     local test_name="$1"
     local variant="$2"
@@ -624,11 +634,11 @@ _run_trace_compare() {
     local safe
     safe="$(sanitize_name "$test_name")"
     local work_dir="$RESULTS_DIR/${safe}.hw-cycles"
-    local hw_bin="$work_dir/trace_hw.${variant}.bin"
-    local emu_bin="$work_dir/trace_emu.${variant}.bin"
+    local hw_events="$work_dir/trace_hw.${variant}.events.json"
+    local emu_events="$work_dir/trace_emu.${variant}.events.json"
     local report="$RESULTS_DIR/${safe}.${variant}.cycles.compare.txt"
 
-    if [[ ! -f "$hw_bin" || ! -f "$emu_bin" ]]; then
+    if [[ ! -f "$hw_events" || ! -f "$emu_events" ]]; then
         return 1
     fi
 
@@ -644,8 +654,8 @@ _run_trace_compare() {
     # at col=0; without remapping, identical events on row=2 appear on
     # tile (1,2) in HW vs (0,2) in EMU and fall out as count mismatches.
     if ! "$rust_bin" \
-        --hw "$hw_bin" \
-        --emu "$emu_bin" \
+        --hw "$hw_events" \
+        --emu "$emu_events" \
         --remap-columns \
         --stalls \
         --extended \
@@ -1542,18 +1552,63 @@ run_one_bridge() {
 export -f run_one_bridge
 
 # ---------------------------------------------------------------------------
-# Trace comparison helper
+# Trace comparison helpers (Phase 5: run_one_bridge trace_raw.bin flow)
 # ---------------------------------------------------------------------------
 
-# Run trace-compare: prefer Rust binary, fall back to Python.
-# Uses the same CLI interface for both.
+# Decode a raw trace bin to our events-JSON format via mlir-aie's parser.
+# Usage: _bin_to_events_json <trace.bin> <xclbin-mlir> <out.events.json>
+# Returns 0 on success, non-zero if mlir-aie parsing fails (unwritten output).
+_bin_to_events_json() {
+  local bin="$1" mlir="$2" out="$3"
+  PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python \
+    python3 "$EMU_ROOT/tools/parse-trace.py" \
+      --trace-bin "$bin" \
+      --xclbin-mlir "$mlir" \
+      --out-events "$out" 2>/dev/null
+}
+export -f _bin_to_events_json
+
+# Run trace-compare on a bin pair. Requires the Rust binary and a matching
+# xclbin-mlir (for parse-trace.py). Caller supplies --hw <bin> --emu <bin>
+# --xclbin-mlir <mlir> [extra trace-compare args]; we convert to events
+# JSONs in a temp dir, then invoke the Rust tool.
 run_trace_compare() {
   local rust_bin="$EMU_ROOT/target/release/trace-compare"
-  if [[ -x "$rust_bin" ]]; then
-    "$rust_bin" "$@"
-  else
-    python3 "$EMU_ROOT/tools/trace-compare.py" "$@"
+  if [[ ! -x "$rust_bin" ]]; then
+    echo "error: trace-compare not built at $rust_bin" >&2
+    return 127
   fi
+
+  local hw_bin="" emu_bin="" mlir="" passthrough=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --hw) hw_bin="$2"; shift 2 ;;
+      --emu) emu_bin="$2"; shift 2 ;;
+      --xclbin-mlir) mlir="$2"; shift 2 ;;
+      *) passthrough+=("$1"); shift ;;
+    esac
+  done
+
+  if [[ -z "$hw_bin" || -z "$emu_bin" || -z "$mlir" ]]; then
+    echo "run_trace_compare: --hw, --emu, --xclbin-mlir required" >&2
+    return 2
+  fi
+
+  local tmp
+  tmp="$(mktemp -d "${TMPDIR:-/tmp/claude-1000}/trace-compare.XXXXXX")"
+  local hw_events="$tmp/hw.events.json"
+  local emu_events="$tmp/emu.events.json"
+
+  if ! _bin_to_events_json "$hw_bin" "$mlir" "$hw_events" \
+       || ! _bin_to_events_json "$emu_bin" "$mlir" "$emu_events"; then
+    rm -rf "$tmp"
+    return 3
+  fi
+
+  local rc=0
+  "$rust_bin" --hw "$hw_events" --emu "$emu_events" "${passthrough[@]}" || rc=$?
+  rm -rf "$tmp"
+  return $rc
 }
 export -f run_trace_compare
 
@@ -2213,11 +2268,13 @@ main() {
       local events_file="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.hw/events.json"
       [[ ! -f "$events_file" ]] && events_file="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.emu/events.json"
       local summary_file="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.trace.summary"
+      # parse-trace.py needs the post-lowering MLIR to resolve event slots.
+      local t5_mlir="$BUILD_BASE/$t5_name/${t5_compiler}/aie_arch.mlir.prj/input_with_addresses.mlir"
 
-      if [[ -f "$hw_trace" ]] && [[ -f "$emu_trace" ]]; then
+      if [[ -f "$hw_trace" ]] && [[ -f "$emu_trace" ]] && [[ -f "$t5_mlir" ]]; then
         local cmp_log="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.trace.log"
         local cmp_out
-        cmp_out="$(run_trace_compare --hw "$hw_trace" --emu "$emu_trace" 2>&1)" || true
+        cmp_out="$(run_trace_compare --hw "$hw_trace" --emu "$emu_trace" --xclbin-mlir "$t5_mlir" 2>&1)" || true
         echo "$cmp_out" > "$cmp_log"
 
         if echo "$cmp_out" | grep -q "CLEAN"; then

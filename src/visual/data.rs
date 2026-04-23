@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::trace::compare::{
     AnalysisOptions, BatchResult, EventsConfig, TileEvent, TileKey,
-    compare_batch_with_opts, decode_per_tile,
+    compare_batch_with_opts, load_events_json,
 };
 
 use super::alignment::AlignmentMap;
@@ -75,40 +75,55 @@ pub struct LoadedComparison {
 impl LoadedComparison {
     /// Load and compare traces from HW and EMU directories.
     ///
-    /// Each directory should contain a `trace_raw.bin` file. The events
-    /// configuration is loaded from `events.json` in the HW directory
-    /// (falling back to the parent directory, then to defaults).
+    /// Each directory must contain a `trace.events.json` file produced by
+    /// `tools/parse-trace.py` (which invokes mlir-aie's decoder). The
+    /// slot-name configuration is read from `events.json` in the HW dir if
+    /// present (legacy aiecc format), otherwise recovered from the events
+    /// JSON's own `slot_names` field.
     pub fn from_trace_dirs(hw_dir: &Path, emu_dir: &Path) -> Result<Self, String> {
-        let hw_raw = hw_dir.join("trace_raw.bin");
-        let emu_raw = emu_dir.join("trace_raw.bin");
+        let hw_events_path = hw_dir.join("trace.events.json");
+        let emu_events_path = emu_dir.join("trace.events.json");
 
-        if !hw_raw.exists() {
-            return Err(format!("HW trace not found: {}", hw_raw.display()));
+        if !hw_events_path.exists() {
+            return Err(format!(
+                "HW trace events not found: {}\n\
+                 (run tools/parse-trace.py --out-events on the HW bin first)",
+                hw_events_path.display(),
+            ));
         }
-        if !emu_raw.exists() {
-            return Err(format!("EMU trace not found: {}", emu_raw.display()));
+        if !emu_events_path.exists() {
+            return Err(format!(
+                "EMU trace events not found: {}\n\
+                 (run tools/parse-trace.py --out-events on the EMU bin first)",
+                emu_events_path.display(),
+            ));
         }
 
-        // Load events configuration.
-        let config = load_events_config(hw_dir)?;
+        // Legacy slot-name override (aiecc events.json) if present; otherwise
+        // slot_names from the HW events JSON wins (see compare_batch_with_opts).
+        let config_override = load_events_config(hw_dir)?;
 
         // Run comparison.
         let batch = compare_batch_with_opts(
-            &hw_raw,
-            &emu_raw,
-            &config,
+            &hw_events_path,
+            &emu_events_path,
+            &config_override,
             0, // batch index
             &AnalysisOptions::default(),
         )?;
 
-        // Decode raw traces into per-tile events for rendering.
-        let hw_data = std::fs::read(&hw_raw)
-            .map_err(|e| format!("read {}: {}", hw_raw.display(), e))?;
-        let emu_data = std::fs::read(&emu_raw)
-            .map_err(|e| format!("read {}: {}", emu_raw.display(), e))?;
-
-        let hw_events = decode_per_tile(&hw_data);
-        let emu_events = decode_per_tile(&emu_data);
+        // Re-load events for rendering (comparison consumed them but didn't
+        // return the tile maps; fine for now since traces are small).
+        let (hw_events, hw_config) = load_events_json(&hw_events_path)?;
+        let (emu_events, _) = load_events_json(&emu_events_path)?;
+        let config = if !config_override.core_events.is_empty()
+            || !config_override.mem_events.is_empty()
+            || !config_override.memtile_events.is_empty()
+        {
+            config_override
+        } else {
+            hw_config
+        };
 
         // Sort tile keys by divergence count (most divergent first).
         let mut sorted_keys: Vec<TileKey> = batch

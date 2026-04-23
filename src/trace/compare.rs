@@ -361,295 +361,92 @@ fn slot_name(slot: u8, names: &[String]) -> String {
 }
 
 // ============================================================================
-// Binary trace decoding (per-tile grouping)
+// Events-JSON ingestion (produced by tools/parse-trace.py)
 // ============================================================================
+//
+// Binary packet decoding lives in mlir-aie's aie.utils.trace module; we call
+// it via parse-trace.py and consume the resulting JSON. Keeping the decoder
+// single-sourced means HW-format evolution lands once, upstream, rather than
+// drifting between two parallel decoders.
 
-/// Trim a raw trace buffer to the end of real data.
-///
-/// Finds the first 0xFEFEFEFE word followed by two 0x00000000 words.
-/// Returns the byte length of the valid data prefix (always multiple of 4).
-fn trim_trace_buffer(data: &[u8]) -> usize {
-    let word_count = data.len() / 4;
-    for i in 0..word_count {
-        let off = i * 4;
-        let word =
-            u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-        if word == 0xFEFEFEFE && i + 2 < word_count {
-            let w1 = u32::from_le_bytes([
-                data[off + 4],
-                data[off + 5],
-                data[off + 6],
-                data[off + 7],
-            ]);
-            let w2 = u32::from_le_bytes([
-                data[off + 8],
-                data[off + 9],
-                data[off + 10],
-                data[off + 11],
-            ]);
-            if w1 == 0 && w2 == 0 {
-                return (i + 1) * 4;
-            }
-        }
-    }
-    data.len()
+#[derive(Deserialize)]
+struct EventRecord {
+    col: u8,
+    row: u8,
+    pkt_type: u8,
+    slot: u8,
+    #[allow(dead_code)] // retained for debugging / future per-event name plumbing
+    name: String,
+    ts: u64,
 }
 
-/// Validate a 32-bit word as a trace packet header.
-///
-/// Per mlir-aie `parse_pkt_hdr_in_stream`: odd parity, bits [11:5]=0,
-/// bit 19=0, bits [30:28]=0.
-fn is_valid_trace_header(word: u32) -> bool {
-    if word.count_ones() % 2 == 0 {
-        return false;
-    }
-    if ((word >> 5) & 0x7F) != 0 {
-        return false;
-    }
-    if ((word >> 19) & 0x1) != 0 {
-        return false;
-    }
-    if ((word >> 28) & 0x7) != 0 {
-        return false;
-    }
-    true
+#[derive(Deserialize)]
+struct SlotNamesRecord {
+    #[serde(default)]
+    core: Vec<String>,
+    #[serde(default)]
+    mem: Vec<String>,
+    #[serde(default)]
+    memtile: Vec<String>,
+    // "shim" field exists in the JSON but we don't currently consume it;
+    // shim-tile slot naming would go through mem_events today.
 }
 
-/// Decode one packet's 28-byte payload into trace events.
-///
-/// Event byte encoding matches mlir-aie `parse.py` and AM025 spec.
-/// State (abs_cycle, last_slots) is per-packet, matching the Python decoder.
-fn decode_packet_payload(payload: &[u8; 28]) -> Vec<TileEvent> {
-    let mut events = Vec::new();
-    let mut abs_cycle: u64 = 0;
-    let mut last_slots: Vec<u8> = Vec::new();
-    let mut i = 0;
-
-    while i < 28 {
-        let b = payload[i];
-
-        // Padding (0xFE)
-        if b == 0xFE {
-            i += 1;
-            continue;
-        }
-        // Sync / end marker (0xFF)
-        if b == 0xFF {
-            i += 1;
-            continue;
-        }
-        // Start: (byte & 0xFB) == 0xF0, 8 bytes total (56-bit timer)
-        if (b & 0xFB) == 0xF0 {
-            if i + 8 > 28 {
-                break;
-            }
-            let mut timer: u64 = 0;
-            for j in 1..8 {
-                timer = (timer << 8) | (payload[i + j] as u64);
-            }
-            abs_cycle = timer;
-            i += 8;
-            continue;
-        }
-        // Repeat0: bits[7:4] = 1110 (delta=1 per repeat, per mlir-aie)
-        if b & 0xF0 == 0xE0 {
-            let repeats = (b & 0x0F) as u64;
-            for _ in 0..repeats {
-                abs_cycle += 1;
-                for &s in &last_slots {
-                    events.push(TileEvent {
-                        slot: s,
-                        abs_cycle,
-                    });
-                }
-            }
-            i += 1;
-            continue;
-        }
-        // Skip/Filler: bits[7:2] = 110111
-        if b & 0xFC == 0xDC {
-            i += 4;
-            continue;
-        }
-        // Repeat1: bits[7:2] = 110110 (delta=1 per repeat)
-        if b & 0xFC == 0xD8 {
-            if i + 2 > 28 {
-                break;
-            }
-            let repeats = (((b & 0x03) as u64) << 8) | (payload[i + 1] as u64);
-            for _ in 0..repeats {
-                abs_cycle += 1;
-                for &s in &last_slots {
-                    events.push(TileEvent {
-                        slot: s,
-                        abs_cycle,
-                    });
-                }
-            }
-            i += 2;
-            continue;
-        }
-        // Multiple2: bits[7:2] = 110101
-        if b & 0xFC == 0xD4 {
-            if i + 4 > 28 {
-                break;
-            }
-            let mask = ((b as u16 & 0x03) << 6) | ((payload[i + 1] as u16) >> 2);
-            let delta = (((payload[i + 1] & 0x03) as u64) << 16)
-                | ((payload[i + 2] as u64) << 8)
-                | (payload[i + 3] as u64);
-            abs_cycle += delta;
-            last_slots.clear();
-            for slot in 0..8u8 {
-                if mask & (1 << slot) != 0 {
-                    last_slots.push(slot);
-                    events.push(TileEvent { slot, abs_cycle });
-                }
-            }
-            i += 4;
-            continue;
-        }
-        // Multiple1: bits[7:2] = 110100
-        if b & 0xFC == 0xD0 {
-            if i + 3 > 28 {
-                break;
-            }
-            let mask = ((b as u16 & 0x03) << 6) | ((payload[i + 1] as u16) >> 2);
-            let delta =
-                (((payload[i + 1] & 0x03) as u64) << 8) | (payload[i + 2] as u64);
-            abs_cycle += delta;
-            last_slots.clear();
-            for slot in 0..8u8 {
-                if mask & (1 << slot) != 0 {
-                    last_slots.push(slot);
-                    events.push(TileEvent { slot, abs_cycle });
-                }
-            }
-            i += 3;
-            continue;
-        }
-        // Multiple0: bits[7:4] = 1100
-        if b & 0xF0 == 0xC0 {
-            if i + 2 > 28 {
-                break;
-            }
-            let mask = ((b as u16 & 0x0F) << 4) | ((payload[i + 1] as u16) >> 4);
-            let delta = (payload[i + 1] & 0x0F) as u64;
-            abs_cycle += delta;
-            last_slots.clear();
-            for slot in 0..8u8 {
-                if mask & (1 << slot) != 0 {
-                    last_slots.push(slot);
-                    events.push(TileEvent { slot, abs_cycle });
-                }
-            }
-            i += 2;
-            continue;
-        }
-        // Single2: bits[7:5] = 101
-        if b & 0xE0 == 0xA0 {
-            if i + 3 > 28 {
-                break;
-            }
-            let slot = (b >> 2) & 0x07;
-            let delta = (((b & 0x03) as u64) << 16)
-                | ((payload[i + 1] as u64) << 8)
-                | (payload[i + 2] as u64);
-            abs_cycle += delta;
-            last_slots = vec![slot];
-            events.push(TileEvent { slot, abs_cycle });
-            i += 3;
-            continue;
-        }
-        // Single1: bits[7:5] = 100
-        if b & 0xE0 == 0x80 {
-            if i + 2 > 28 {
-                break;
-            }
-            let slot = (b >> 2) & 0x07;
-            let delta = (((b & 0x03) as u64) << 8) | (payload[i + 1] as u64);
-            abs_cycle += delta;
-            last_slots = vec![slot];
-            events.push(TileEvent { slot, abs_cycle });
-            i += 2;
-            continue;
-        }
-        // Single0: bit7 = 0
-        if b & 0x80 == 0 {
-            let slot = (b >> 4) & 0x07;
-            let delta = (b & 0x0F) as u64;
-            abs_cycle += delta;
-            last_slots = vec![slot];
-            events.push(TileEvent { slot, abs_cycle });
-            i += 1;
-            continue;
-        }
-
-        // Unknown byte -- skip.
-        i += 1;
-    }
-
-    events
+#[derive(Deserialize)]
+struct EventsFile {
+    #[serde(default)]
+    schema_version: u32,
+    events: Vec<EventRecord>,
+    #[serde(default)]
+    slot_names: Option<SlotNamesRecord>,
 }
 
-/// Decode a raw binary trace into per-tile event lists.
+/// Load a per-side events JSON produced by tools/parse-trace.py.
 ///
-/// Parses the trace buffer packet by packet, extracting tile identifiers
-/// from packet headers (col, row, pkt_type) and grouping decoded events.
-pub fn decode_per_tile(data: &[u8]) -> TileEvents {
-    let trimmed_len = trim_trace_buffer(data);
-    let data = &data[..trimmed_len];
+/// Returns (per-tile events, slot-name config). The config is populated from
+/// the JSON's slot_names field when present; callers that want to override
+/// names (legacy aiecc events.json) can substitute their own config.
+pub fn load_events_json(path: &Path) -> Result<(TileEvents, EventsConfig), String> {
+    let text =
+        fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let file: EventsFile = serde_json::from_str(&text)
+        .map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    if file.schema_version != 0 && file.schema_version != 1 {
+        return Err(format!(
+            "{}: unsupported schema_version {}",
+            path.display(),
+            file.schema_version
+        ));
+    }
+
     let mut tiles: TileEvents = HashMap::new();
-
-    let mut offset = 0;
-    while offset + 32 <= data.len() {
-        let header = u32::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]);
-
-        // Skip empty or invalid packets.
-        if header == 0 || !is_valid_trace_header(header) {
-            offset += 32;
-            continue;
-        }
-
-        let col = ((header >> 21) & 0x7F) as u8;
-        let row = ((header >> 16) & 0x1F) as u8;
-        let pkt_type = ((header >> 12) & 0x3) as u8;
-
-        // Extract 28-byte payload (big-endian from LE words).
-        let mut payload = [0u8; 28];
-        for word_idx in 0..7 {
-            let word_off = offset + (word_idx + 1) * 4;
-            let word = u32::from_le_bytes([
-                data[word_off],
-                data[word_off + 1],
-                data[word_off + 2],
-                data[word_off + 3],
-            ]);
-            payload[word_idx * 4] = (word >> 24) as u8;
-            payload[word_idx * 4 + 1] = (word >> 16) as u8;
-            payload[word_idx * 4 + 2] = (word >> 8) as u8;
-            payload[word_idx * 4 + 3] = word as u8;
-        }
-
-        let events = decode_packet_payload(&payload);
-        let key = TileKey { col, row, pkt_type };
-        tiles.entry(key).or_default().extend(events);
-
-        offset += 32;
+    for rec in file.events {
+        let key = TileKey {
+            col: rec.col,
+            row: rec.row,
+            pkt_type: rec.pkt_type,
+        };
+        tiles.entry(key).or_default().push(TileEvent {
+            slot: rec.slot,
+            abs_cycle: rec.ts,
+        });
     }
-
-    // Sort each tile's events by cycle.
     for events in tiles.values_mut() {
         events.sort_by_key(|e| e.abs_cycle);
     }
 
-    tiles
+    let config = match file.slot_names {
+        Some(sn) => EventsConfig {
+            core_events: sn.core,
+            mem_events: sn.mem,
+            memtile_events: sn.memtile,
+        },
+        None => EventsConfig::default(),
+    };
+
+    Ok((tiles, config))
 }
+
 
 /// Remap physical columns to 0-indexed logical columns.
 ///
@@ -1703,21 +1500,37 @@ pub fn compare_batch(
     compare_batch_with_opts(hw_path, emu_path, config, batch_idx, &AnalysisOptions::default())
 }
 
-/// Compare one HW/EMU trace file pair with extended analysis options.
+/// Compare one HW/EMU trace pair with extended analysis options.
+///
+/// Inputs are events-JSON paths produced by tools/parse-trace.py. If `config`
+/// has any non-empty event list, it overrides the slot_names embedded in the
+/// events JSON; otherwise the JSON's slot_names wins (HW-side takes priority
+/// over EMU-side for name conflicts).
 pub fn compare_batch_with_opts(
-    hw_path: &Path,
-    emu_path: &Path,
+    hw_events_path: &Path,
+    emu_events_path: &Path,
     config: &EventsConfig,
     batch_idx: usize,
     opts: &AnalysisOptions,
 ) -> Result<BatchResult, String> {
-    let hw_data =
-        fs::read(hw_path).map_err(|e| format!("read {}: {}", hw_path.display(), e))?;
-    let emu_data =
-        fs::read(emu_path).map_err(|e| format!("read {}: {}", emu_path.display(), e))?;
+    let (hw_tiles, hw_config) = load_events_json(hw_events_path)?;
+    let (emu_tiles, emu_config) = load_events_json(emu_events_path)?;
 
-    let hw_tiles = decode_per_tile(&hw_data);
-    let emu_tiles = decode_per_tile(&emu_data);
+    // Resolve slot-name config: caller override > HW-side JSON > EMU-side JSON.
+    let effective_config = if !config.core_events.is_empty()
+        || !config.mem_events.is_empty()
+        || !config.memtile_events.is_empty()
+    {
+        config.clone()
+    } else if !hw_config.core_events.is_empty()
+        || !hw_config.mem_events.is_empty()
+        || !hw_config.memtile_events.is_empty()
+    {
+        hw_config
+    } else {
+        emu_config
+    };
+    let config = &effective_config;
 
     // When remap_columns is enabled, normalize physical columns to logical
     // 0-indexed so traces from different NPU column assignments can be compared.
@@ -2387,13 +2200,19 @@ pub fn compare_sweep_dir_with_opts(
         }
 
         let batch_dir = sweep_dir.join(format!("batch_{:02}", info.batch));
-        let hw_raw = batch_dir.join("hw").join("trace_raw.bin");
-        let emu_raw = batch_dir.join("emu").join("trace_raw.bin");
+        // Sweep mode expects per-batch events JSONs produced upstream
+        // (tools/parse-trace.py). The legacy layout put raw .bin files here;
+        // the sweep orchestrator now writes .events.json alongside.
+        let hw_events = batch_dir.join("hw").join("trace.events.json");
+        let emu_events = batch_dir.join("emu").join("trace.events.json");
 
-        if !hw_raw.exists() || !emu_raw.exists() {
+        if !hw_events.exists() || !emu_events.exists() {
             continue;
         }
 
+        // Legacy aiecc events.json (slot_names override) may still exist per
+        // batch; prefer it over the slot_names embedded in the events JSON
+        // when present, since it matches what aiecc itself emitted.
         let events_json = batch_dir.join("events.json");
         let config = if events_json.exists() {
             let text = fs::read_to_string(&events_json)
@@ -2404,7 +2223,7 @@ pub fn compare_sweep_dir_with_opts(
             EventsConfig::default()
         };
 
-        match compare_batch_with_opts(&hw_raw, &emu_raw, &config, info.batch, opts) {
+        match compare_batch_with_opts(&hw_events, &emu_events, &config, info.batch, opts) {
             Ok(result) => batch_results.push(result),
             Err(e) => {
                 eprintln!("Warning: batch {} failed: {}", info.batch, e);
@@ -2422,80 +2241,6 @@ pub fn compare_sweep_dir_with_opts(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_trim_trace_buffer_finds_sentinel() {
-        let mut data = vec![0u8; 64];
-        // Put some non-zero data at the start.
-        data[0] = 0x42;
-        // Sentinel at word 4 (byte 16).
-        data[16..20].copy_from_slice(&0xFEFEFEFEu32.to_le_bytes());
-        data[20..24].copy_from_slice(&0u32.to_le_bytes());
-        data[24..28].copy_from_slice(&0u32.to_le_bytes());
-        assert_eq!(trim_trace_buffer(&data), 20); // (4+1)*4 = 20
-    }
-
-    #[test]
-    fn test_trim_trace_buffer_no_sentinel() {
-        let data = vec![0x42u8; 64];
-        assert_eq!(trim_trace_buffer(&data), 64);
-    }
-
-    #[test]
-    fn test_is_valid_trace_header() {
-        // All-zero: even parity → invalid.
-        assert!(!is_valid_trace_header(0));
-        // Known valid header from real trace: col=0, row=2, pkt_type=0, pkt_id=1
-        // = (0 << 21) | (2 << 16) | (0 << 11) | 1 = 0x00020001
-        // popcount = 2 (even) → invalid. Need odd parity.
-        assert!(!is_valid_trace_header(0x00020001));
-        // Add a bit to make parity odd: 0x00020003, popcount=3 (odd).
-        // Reserved check: bits[11:5]=0? 0x003 >> 5 = 0, OK.
-        // Bit 19? 0x00020003 >> 19 = 0, OK. Bits[30:28]? 0, OK.
-        assert!(is_valid_trace_header(0x00020003));
-    }
-
-    #[test]
-    fn test_decode_packet_payload_single0() {
-        // Single0: 0b0EEETTTT = slot 1, delta 3 = 0b0_001_0011 = 0x13
-        let mut payload = [0xFEu8; 28];
-        payload[0] = 0x13;
-        let events = decode_packet_payload(&payload);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].slot, 1);
-        assert_eq!(events[0].abs_cycle, 3);
-    }
-
-    #[test]
-    fn test_decode_packet_payload_start_then_single() {
-        let mut payload = [0xFEu8; 28];
-        // Start marker: 0xF0 + 7 bytes of timer value = 100 (0x64).
-        payload[0] = 0xF0;
-        payload[1..8].copy_from_slice(&[0, 0, 0, 0, 0, 0, 100]);
-        // Single0: slot 2, delta 5 = 0b0_010_0101 = 0x25
-        payload[8] = 0x25;
-        let events = decode_packet_payload(&payload);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].slot, 2);
-        assert_eq!(events[0].abs_cycle, 105);
-    }
-
-    #[test]
-    fn test_decode_packet_payload_repeat() {
-        let mut payload = [0xFEu8; 28];
-        // Single0: slot 3, delta 1 = 0b0_011_0001 = 0x31
-        payload[0] = 0x31;
-        // Repeat0: 3 repeats = 0b1110_0011 = 0xE3
-        payload[1] = 0xE3;
-        let events = decode_packet_payload(&payload);
-        // 1 original + 3 repeats = 4 events.
-        assert_eq!(events.len(), 4);
-        assert_eq!(events[0].abs_cycle, 1); // delta=1
-        assert_eq!(events[1].abs_cycle, 2); // repeat delta=1
-        assert_eq!(events[2].abs_cycle, 3);
-        assert_eq!(events[3].abs_cycle, 4);
-        assert!(events.iter().all(|e| e.slot == 3));
-    }
 
     #[test]
     fn test_events_to_intervals() {
