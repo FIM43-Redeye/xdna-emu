@@ -16,6 +16,12 @@ tools/npu-runner/build/
 # bridge-trace-runner build artifacts
 bridge-runner/build/
 
+# clangd index cache
+bridge-runner/.cache/
+
+# aiecc.py per-MLIR project directory (created next to traced .mlir output)
+aie_traced.mlir.prj/
+
 # Captured NPU hardware outputs (machine-specific, regenerate with capture_npu_outputs)
 tests/npu-outputs/
 
