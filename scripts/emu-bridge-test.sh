@@ -93,6 +93,7 @@ SWEEP=false
 RUN_AIESIM=false
 NO_TIMEOUT=false
 WITH_HW_CYCLES=${WITH_HW_CYCLES:-false}
+WITH_CYCLE_DIFF=${WITH_CYCLE_DIFF:-false}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -117,6 +118,7 @@ while [[ $# -gt 0 ]]; do
     --parallel-hw)         NPU_HW_JOBS="${NPU_HW_JOBS_PARALLEL:-5}"; shift ;;
     --no-timeout)          NO_TIMEOUT=true; shift ;;
     --with-hw-cycles)      WITH_HW_CYCLES=true; shift ;;
+    --with-cycle-diff)     WITH_CYCLE_DIFF=true; WITH_HW_CYCLES=true; shift ;;
     --help|-h)
       cat <<'USAGE'
 Usage: emu-bridge-test.sh [options] [test-name-regex]
@@ -139,6 +141,9 @@ Options:
   --no-timeout    Run EMU without wall-clock timeout (use for very long runs)
   --with-hw-cycles  Run trace-based HW cycle capture pipeline per HW test;
                     emits cycles.HW.<variant>.txt beside each result.
+  --with-cycle-diff Additionally run EMU through the trace pipeline and
+                    compare against HW via trace-compare. Implies
+                    --with-hw-cycles.
   (default: both compilers, Chess is ground truth, HW serial)
 
 Filter:
@@ -172,7 +177,7 @@ for _c in "${COMPILERS[@]}"; do
 done
 
 # Export variables that parallel jobs need.
-export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP RUN_AIESIM NO_TIMEOUT WITH_HW_CYCLES
+export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP RUN_AIESIM NO_TIMEOUT WITH_HW_CYCLES WITH_CYCLE_DIFF
 export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT SCRIPT_DIR TRACE_QUARANTINE_FILE
 export XRT_DIR XRT_INCLUDE XRT_LIB
 export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
