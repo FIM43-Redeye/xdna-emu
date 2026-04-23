@@ -283,17 +283,22 @@ int main(int argc, char** argv) {
                          instr_words.size(), args.instr_bin.c_str());
         }
 
-        // Per-arg BO storage indexed by kernarg index.  Reserve upfront so that
-        // push_back never reallocates while we hold interior references.
+        // Per-arg BO storage.  Reserve upfront so push_back never reallocates
+        // while we hold interior references.  `arg_to_bo_idx[k]` gives the index
+        // in `bos` for kernarg k, or SIZE_MAX if k is a scalar -- Task 10 uses
+        // this to call run.set_arg(k, bos[arg_to_bo_idx[k]]) without having to
+        // re-derive the kernarg->BO mapping from the plan.
         std::vector<xrt::bo> bos;
         bos.reserve(kargs.size());
+        std::vector<size_t> arg_to_bo_idx(kargs.size(), SIZE_MAX);
         xrt::bo* trace_bo_ptr = nullptr;
 
-        // Helper: allocate a BO for a given kernarg index and track it.
+        // Helper: allocate a BO for a given kernarg index and record it.
         auto make_buffer = [&](size_t karg_idx, size_t sz,
                                xrt::bo::flags flags) -> xrt::bo& {
             bos.emplace_back(device, sz, flags,
                              kernel.group_id(static_cast<int>(karg_idx)));
+            arg_to_bo_idx[karg_idx] = bos.size() - 1;
             return bos.back();
         };
 
@@ -352,7 +357,8 @@ int main(int argc, char** argv) {
             bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
             trace_bo_ptr = &bo;
         }
-        (void)trace_bo_ptr;  // Task 10 will sync back + write --trace-out
+        (void)trace_bo_ptr;    // Task 10 will sync back + write --trace-out
+        (void)arg_to_bo_idx;   // Task 10 will use this to bind run args
 
         std::fprintf(stderr, "bridge-trace-runner: allocated %zu BOs "
                              "(instr + %zu middle + trace)\n",
