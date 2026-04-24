@@ -269,6 +269,36 @@ def _run_patch(
     subprocess.run(cmd, check=True, capture_output=True)
 
 
+def _run_patch_multi(
+    original_insts: Path,
+    patched_insts: Path,
+    patches: List[Tuple[int, int, str, List[int]]],
+) -> None:
+    """Apply multiple tile patches to one insts.bin in sequence.
+
+    Each entry is (col, row, tile_type, event_ids). The patches are
+    independent (they target disjoint Trace_Event registers because the
+    NPU address encoding includes (col, row)), so chaining them -- read
+    original, patch tile A, patch tile B over the intermediate, write
+    final -- produces the same bytes as a single atomic multi-tile
+    patch would.
+    """
+    if not patches:
+        # Copy through unchanged -- downstream runner still needs the file.
+        patched_insts.write_bytes(original_insts.read_bytes())
+        return
+    # Start from the original; chain patches through a scratch file so we
+    # can invoke the existing single-tile patcher subprocess unchanged.
+    scratch = patched_insts.parent / f"{patched_insts.name}.scratch"
+    src = original_insts
+    for i, (col, row, tile_type, event_ids) in enumerate(patches):
+        dst = patched_insts if i == len(patches) - 1 else scratch
+        _run_patch(src, dst, col, row, tile_type, event_ids)
+        src = dst
+    if scratch.exists():
+        scratch.unlink()
+
+
 def _relabel_events(
     events_json: Path,
     col: int, row: int,
@@ -515,25 +545,73 @@ def _resolve_ground_event(
     )
 
 
-def sweep(
+@dataclass(frozen=True)
+class TileSpec:
+    """A tile to include in a multi-tile sweep.
+
+    tile_type must be one of the four keys in trace-patch-events.py's
+    _TRACE_EVENT_REGS. For multi-tile sweeps we currently require every
+    TileSpec to share the same tile_type (different types have disjoint
+    event lists, so a single sweep can't meaningfully cover both in the
+    same batches).
+    """
+    col: int
+    row: int
+    tile_type: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.tile_type}_c{self.col}r{self.row}"
+
+
+def _tile_output_path(
+    out_dir: Path, test_name: str, compiler: str, tile: TileSpec,
+) -> Path:
+    return out_dir / f"{test_name}.{compiler}.{tile.label}.json"
+
+
+def sweep_multi(
     test_name: str,
     compiler: str,
-    col: int,
-    row: int,
-    tile_type: str,
+    tiles: List[TileSpec],
     build_dir: Path,
-    out_json: Path,
+    out_dir: Path,
     events_filter: Optional[List[str]] = None,
     run_hw: bool = True,
     run_emu: bool = True,
     ctrlpkt: Optional[Path] = None,
     ground_event_name: Optional[str] = None,
-) -> dict:
-    # Resolve which runtime-sequence file this test actually produces.
-    # Most tests emit insts.bin; control-packet tests emit aie_run_seq.bin
-    # (plus an optional ctrlpkt.bin that gets passed as --input). The
-    # caller's explicit --ctrlpkt takes precedence over discovered config
-    # so debugging overrides still work.
+) -> List[dict]:
+    """Sweep every trace event across a set of tiles in one kernel run.
+
+    The xclbin's trace routing is already set up at compile time for
+    every tile in the traced MLIR; all tiles' trace packets converge to
+    the same shim DMA output. So a single kernel invocation with every
+    tile's Trace_Event registers programmed captures all of them
+    simultaneously, and we split the resulting packet stream per-tile by
+    (row, pkt_type) during relabelling.
+
+    Returns one summary dict per tile (same schema as the old single-tile
+    sweep). Each summary is also written to out_dir as
+    `<test>.<compiler>.<tile.label>.json`.
+
+    Batch size is min(slot_capacity) across the tiles -- if one tile has
+    4 slots (Trace_Event0-only compile) and another has 8, we batch at
+    4 so every tile has valid data in every batch. Lockstep batching
+    across tiles keeps the per-tile result set aligned with the batch
+    index for free.
+    """
+    if not tiles:
+        raise ValueError("sweep_multi requires at least one tile")
+    tile_types = {t.tile_type for t in tiles}
+    if len(tile_types) > 1:
+        raise ValueError(
+            f"sweep_multi requires all tiles to share tile_type; got {tile_types}. "
+            f"Different tile types have disjoint event ID spaces, so a shared "
+            f"sweep can't cover both -- invoke once per tile_type."
+        )
+    tile_type = tiles[0].tile_type
+
     cfg = discover_test_config(test_name)
     xclbin = build_dir / "aie.xclbin"
     insts = build_dir / cfg.insts_name
@@ -564,52 +642,59 @@ def sweep(
         all_events = [e for e in all_events if e.name in wanted]
     ground_event = _resolve_ground_event(tile_type, ground_event_name)
 
-    # Detect how many trace-event slots the compiled xclbin actually
-    # exposes for this tile. Some tests come with 3-event trace blocks
-    # baked into their source MLIR and compile to a single Trace_Event0
-    # write (4 slots); asking the patcher for 8 events there is a
-    # contract violation that used to manifest as a fail-fast
-    # subprocess.CalledProcessError with 16/18 combos dead on arrival.
-    # Probing lets us halve the batch size transparently instead.
     import importlib.util as _imputil
     _pspec = _imputil.spec_from_file_location(
         "trace_patch_events", REPO_ROOT / "tools" / "trace-patch-events.py",
     )
     _pmod = _imputil.module_from_spec(_pspec)
+    sys.modules["trace_patch_events"] = _pmod
     _pspec.loader.exec_module(_pmod)
-    slot_capacity = _pmod.probe_slot_capacity(
-        insts.read_bytes(), col, row, tile_type,
-    )
-    if slot_capacity == 0:
-        raise FileNotFoundError(
-            f"xclbin at {build_dir} has no Trace_Event writes for tile "
-            f"({col},{row}) type={tile_type}; this test isn't trace-routed "
-            f"to that tile. Re-compile with trace injection enabled."
+    insts_bytes = insts.read_bytes()
+    per_tile_capacity: Dict[TileSpec, int] = {}
+    for tile in tiles:
+        cap = _pmod.probe_slot_capacity(
+            insts_bytes, tile.col, tile.row, tile.tile_type,
         )
+        if cap == 0:
+            raise FileNotFoundError(
+                f"xclbin at {build_dir} has no Trace_Event writes for tile "
+                f"{tile.label}; re-compile with trace injection enabled "
+                f"or drop this tile from the sweep."
+            )
+        per_tile_capacity[tile] = cap
+    min_cap = min(per_tile_capacity.values())
+
     batches = _build_batches(
-        all_events, slots=slot_capacity, ground_event=ground_event,
+        all_events, slots=min_cap, ground_event=ground_event,
     )
-    # When grounding is active, slot 0 of every batch carries the
-    # grounding event; the per-event matrix reports only sweep events
-    # (slot >= 1). This keeps the matrix clean -- the grounding event is
-    # instrumentation, not data.
     first_sweep_slot = 1 if ground_event is not None else 0
 
-    # Per-sweep work directory. Keep batch artifacts around for post-hoc
-    # inspection; they compose with parse-trace's own JSON/cycles outputs.
-    work_dir = out_json.parent / f"{out_json.stem}.work"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Per-tile accumulators. Each tile carries its own result list + anchors.
+    per_tile_results: Dict[TileSpec, List[dict]] = {t: [] for t in tiles}
+    per_tile_hw_anchored: Dict[TileSpec, List[Tuple[int, List[Dict]]]] = {t: [] for t in tiles}
+    per_tile_emu_anchored: Dict[TileSpec, List[Tuple[int, List[Dict]]]] = {t: [] for t in tiles}
+    per_tile_hw_anchors: Dict[TileSpec, List[Dict]] = {t: [] for t in tiles}
+    per_tile_emu_anchors: Dict[TileSpec, List[Dict]] = {t: [] for t in tiles}
+
+    # Single work-dir shared across all tiles of this invocation. The
+    # per-batch trace artifacts are one run -- splitting per-tile is a
+    # post-processing filter, not a separate invocation.
+    work_dir = out_dir / f"{test_name}.{compiler}.multitile.work"
     work_dir.mkdir(parents=True, exist_ok=True)
     patched = work_dir / "insts.patched.bin"
 
-    results: List[dict] = []
-    hw_anchored_batches: List[Tuple[int, List[Dict]]] = []
-    emu_anchored_batches: List[Tuple[int, List[Dict]]] = []
-    hw_batch_anchors: List[Dict] = []
-    emu_batch_anchors: List[Dict] = []
     t_start = time.time()
     for b_idx, batch in enumerate(batches):
         event_ids = [e.id for e in batch]
-        _run_patch(insts, patched, col, row, tile_type, event_ids)
+        # Program the same event set on every tile in lockstep. Different
+        # tile types would need different event IDs, but we enforced
+        # same-tile-type above; same type => same IDs work across tiles.
+        patches = [
+            (t.col, t.row, t.tile_type, event_ids) for t in tiles
+        ]
+        _run_patch_multi(insts, patched, patches)
 
         hw_events_out = work_dir / f"b{b_idx}.hw.events.json"
         emu_events_out = work_dir / f"b{b_idx}.emu.events.json"
@@ -628,10 +713,6 @@ def sweep(
             parse_log=work_dir / f"b{b_idx}.hw.parse.log",
             ctrlpkt=ctrlpkt,
         )
-        hw_tile_events: List[Dict] = []
-        if hw_res.ok:
-            hw_res.per_event_count, hw_tile_events = _relabel_events(
-                hw_events_out, col, row, tile_type, batch)
 
         emu_res = RunResult(ok=False, cycles=None, events_count=None,
                             error="emu skipped") if not run_emu else _run_one_side(
@@ -651,93 +732,146 @@ def sweep(
             parse_log=work_dir / f"b{b_idx}.emu.parse.log",
             ctrlpkt=ctrlpkt,
         )
-        emu_tile_events: List[Dict] = []
-        if emu_res.ok:
-            emu_res.per_event_count, emu_tile_events = _relabel_events(
-                emu_events_out, col, row, tile_type, batch)
 
-        # Anchor this batch's events on the grounding event (slot 0). When
-        # grounding is disabled we still feed the list through
-        # _anchor_events with a nonsense ground_slot so the merged
-        # timeline still gets built -- just without anchoring, ts_anchored
-        # stays None.
-        if ground_event is not None:
-            hw_anchor, hw_anchored = _anchor_events(hw_tile_events, ground_slot=0)
-            emu_anchor, emu_anchored = _anchor_events(emu_tile_events, ground_slot=0)
-        else:
-            hw_anchor, hw_anchored = None, [dict(e, ts_anchored=None) for e in hw_tile_events]
-            emu_anchor, emu_anchored = None, [dict(e, ts_anchored=None) for e in emu_tile_events]
-        hw_anchored_batches.append((b_idx, hw_anchored))
-        emu_anchored_batches.append((b_idx, emu_anchored))
-        hw_batch_anchors.append({"batch": b_idx, "anchor_ts": hw_anchor})
-        emu_batch_anchors.append({"batch": b_idx, "anchor_ts": emu_anchor})
+        # Split the one parsed events.json per-tile, relabel each tile's
+        # filtered subset with this batch's event names. _relabel_events
+        # is idempotent across tiles because its filter key (row,
+        # pkt_type) is different for each tile, so rewriting the names
+        # field on the subset it claims doesn't corrupt other tiles'
+        # rows.
+        for tile in tiles:
+            hw_tile_events: List[Dict] = []
+            emu_tile_events: List[Dict] = []
+            hw_per_event: Dict[str, int] = {}
+            emu_per_event: Dict[str, int] = {}
+            if hw_res.ok:
+                hw_per_event, hw_tile_events = _relabel_events(
+                    hw_events_out, tile.col, tile.row, tile.tile_type, batch)
+            if emu_res.ok:
+                emu_per_event, emu_tile_events = _relabel_events(
+                    emu_events_out, tile.col, tile.row, tile.tile_type, batch)
 
-        # Per-slot attribution: events_count is the batch-wide total
-        # (kept for sanity checks); per_event_count breaks it out by
-        # slot so each event has its own fire count.  Cycles is the
-        # last-event timestamp, still batch-level.
-        for slot, ev in enumerate(batch):
-            if slot < first_sweep_slot:
-                continue  # grounding event -- not a swept data row
-            results.append({
-                "id": ev.id,
-                "name": ev.name,
-                "slot": slot,
-                "batch": b_idx,
-                "hw": {
-                    "cycles": hw_res.cycles,
-                    "events_total": hw_res.events_count,
-                    "fired": hw_res.per_event_count.get(ev.name, 0) if hw_res.ok else None,
-                    "error": hw_res.error,
-                },
-                "emu": {
-                    "cycles": emu_res.cycles,
-                    "events_total": emu_res.events_count,
-                    "fired": emu_res.per_event_count.get(ev.name, 0) if emu_res.ok else None,
-                    "error": emu_res.error,
-                },
-            })
-        ground_note = (
-            f" hw_anchor={hw_anchor} emu_anchor={emu_anchor}"
-            if ground_event is not None else ""
-        )
-        print(f"[sweep] batch {b_idx + 1}/{len(batches)}: "
-              f"events {[e.name for e in batch]} "
-              f"hw_cyc={hw_res.cycles} emu_cyc={emu_res.cycles}{ground_note}",
+            if ground_event is not None:
+                hw_anchor, hw_anchored = _anchor_events(hw_tile_events, ground_slot=0)
+                emu_anchor, emu_anchored = _anchor_events(emu_tile_events, ground_slot=0)
+            else:
+                hw_anchor, hw_anchored = None, [dict(e, ts_anchored=None) for e in hw_tile_events]
+                emu_anchor, emu_anchored = None, [dict(e, ts_anchored=None) for e in emu_tile_events]
+            per_tile_hw_anchored[tile].append((b_idx, hw_anchored))
+            per_tile_emu_anchored[tile].append((b_idx, emu_anchored))
+            per_tile_hw_anchors[tile].append({"batch": b_idx, "anchor_ts": hw_anchor})
+            per_tile_emu_anchors[tile].append({"batch": b_idx, "anchor_ts": emu_anchor})
+
+            for slot, ev in enumerate(batch):
+                if slot < first_sweep_slot:
+                    continue
+                per_tile_results[tile].append({
+                    "id": ev.id,
+                    "name": ev.name,
+                    "slot": slot,
+                    "batch": b_idx,
+                    "hw": {
+                        "cycles": hw_res.cycles,
+                        "events_total": hw_res.events_count,
+                        "fired": hw_per_event.get(ev.name, 0) if hw_res.ok else None,
+                        "error": hw_res.error,
+                    },
+                    "emu": {
+                        "cycles": emu_res.cycles,
+                        "events_total": emu_res.events_count,
+                        "fired": emu_per_event.get(ev.name, 0) if emu_res.ok else None,
+                        "error": emu_res.error,
+                    },
+                })
+        print(f"[sweep-multi] batch {b_idx + 1}/{len(batches)} on "
+              f"{len(tiles)} tile(s): events "
+              f"{[e.name for e in batch]} "
+              f"hw_cyc={hw_res.cycles} emu_cyc={emu_res.cycles}",
               flush=True)
 
-    summary = {
-        "test": test_name,
-        "compiler": compiler,
-        "tile": {"col": col, "row": row, "type": tile_type},
-        "grounding_event": ground_event.name if ground_event else None,
-        "events": results,
-        "elapsed_sec": round(time.time() - t_start, 2),
-    }
-    out_json.write_text(json.dumps(summary, indent=2) + "\n")
+    summaries: List[dict] = []
+    elapsed = round(time.time() - t_start, 2)
+    for tile in tiles:
+        out_json = _tile_output_path(out_dir, test_name, compiler, tile)
+        summary = {
+            "test": test_name,
+            "compiler": compiler,
+            "tile": {"col": tile.col, "row": tile.row, "type": tile.tile_type},
+            "grounding_event": ground_event.name if ground_event else None,
+            "events": per_tile_results[tile],
+            "elapsed_sec": elapsed,
+        }
+        out_json.write_text(json.dumps(summary, indent=2) + "\n")
+        merged_path = out_json.with_suffix(".merged.json")
+        merged = {
+            "test": test_name,
+            "compiler": compiler,
+            "tile": {"col": tile.col, "row": tile.row, "type": tile.tile_type},
+            "grounding_event": ground_event.name if ground_event else None,
+            "batches_merged": len(batches),
+            "hw": {
+                "anchors": per_tile_hw_anchors[tile],
+                "events": _merge_anchored(per_tile_hw_anchored[tile]),
+            },
+            "emu": {
+                "anchors": per_tile_emu_anchors[tile],
+                "events": _merge_anchored(per_tile_emu_anchored[tile]),
+            },
+        }
+        merged_path.write_text(json.dumps(merged, indent=2) + "\n")
+        summaries.append(summary)
+    return summaries
 
-    # Merged timeline output. Emitted whenever we have per-batch events
-    # regardless of grounding -- without grounding, ts_anchored is None
-    # on every row and the merged view is just a concatenation, which is
-    # still useful for diffing "did the same events fire" across runs.
-    merged_path = out_json.with_suffix(".merged.json")
-    merged = {
-        "test": test_name,
-        "compiler": compiler,
-        "tile": {"col": col, "row": row, "type": tile_type},
-        "grounding_event": ground_event.name if ground_event else None,
-        "batches_merged": len(batches),
-        "hw": {
-            "anchors": hw_batch_anchors,
-            "events": _merge_anchored(hw_anchored_batches),
-        },
-        "emu": {
-            "anchors": emu_batch_anchors,
-            "events": _merge_anchored(emu_anchored_batches),
-        },
-    }
-    merged_path.write_text(json.dumps(merged, indent=2) + "\n")
-    return summary
+
+def sweep(
+    test_name: str,
+    compiler: str,
+    col: int,
+    row: int,
+    tile_type: str,
+    build_dir: Path,
+    out_json: Path,
+    events_filter: Optional[List[str]] = None,
+    run_hw: bool = True,
+    run_emu: bool = True,
+    ctrlpkt: Optional[Path] = None,
+    ground_event_name: Optional[str] = None,
+) -> dict:
+    """Backward-compatible single-tile entry point.
+
+    Delegates to sweep_multi with a single TileSpec. Output is written to
+    the caller-specified out_json (not to out_dir/<label>.json) so
+    existing callers keep working unchanged.
+    """
+    tile = TileSpec(col=col, row=row, tile_type=tile_type)
+    summaries = sweep_multi(
+        test_name=test_name,
+        compiler=compiler,
+        tiles=[tile],
+        build_dir=build_dir,
+        out_dir=out_json.parent,
+        events_filter=events_filter,
+        run_hw=run_hw,
+        run_emu=run_emu,
+        ctrlpkt=ctrlpkt,
+        ground_event_name=ground_event_name,
+    )
+    # sweep_multi wrote to out_dir/<test>.<compiler>.<tile.label>.json.
+    # Rename onto the caller's requested path if they differ, and also
+    # move the sibling .merged.json.
+    canonical = _tile_output_path(out_json.parent, test_name, compiler, tile)
+    if canonical != out_json and canonical.exists():
+        if out_json.exists():
+            out_json.unlink()
+        canonical.rename(out_json)
+        canonical_merged = canonical.with_suffix(".merged.json")
+        if canonical_merged.exists():
+            target_merged = out_json.with_suffix(".merged.json")
+            if target_merged.exists():
+                target_merged.unlink()
+            canonical_merged.rename(target_merged)
+    return summaries[0]
+
 
 
 # ---------------------------------------------------------------------------
@@ -751,14 +885,24 @@ def main() -> int:
     )
     ap.add_argument("--test", required=True, help="test name (matches npu-xrt dir)")
     ap.add_argument("--compiler", default="chess", choices=["chess", "peano"])
-    ap.add_argument("--col", type=int, required=True)
-    ap.add_argument("--row", type=int, required=True)
-    ap.add_argument("--tile-type", required=True,
+    # Two mutually-exclusive invocation modes:
+    #   single-tile: --col/--row/--tile-type/--out FILE  (legacy)
+    #   multi-tile:  --tiles "c:r:t,..." --out-dir DIR   (preferred)
+    ap.add_argument("--col", type=int)
+    ap.add_argument("--row", type=int)
+    ap.add_argument("--tile-type",
                     choices=["core", "memmod", "memtile", "shim"])
+    ap.add_argument("--out", type=Path,
+                    help="single-tile output JSON (single-tile mode only)")
+    ap.add_argument("--tiles",
+                    help="multi-tile spec: comma list of col:row:type, all "
+                         "same tile_type (e.g. 0:3:core,1:3:core,1:2:core). "
+                         "Writes one JSON per tile into --out-dir.")
+    ap.add_argument("--out-dir", type=Path,
+                    help="multi-tile output directory (multi-tile mode only)")
     ap.add_argument("--build-dir", type=Path,
                     help="override build directory "
                          "(default: <mlir-aie>/build/test/npu-xrt/<test>/<compiler>)")
-    ap.add_argument("--out", type=Path, required=True, help="output JSON path")
     ap.add_argument("--events",
                     help="comma-separated event name whitelist "
                          "(default: every event in the tile type)")
@@ -777,6 +921,40 @@ def main() -> int:
     )
     events_filter = [s.strip() for s in args.events.split(",")] if args.events else None
 
+    if args.tiles:
+        if not args.out_dir:
+            ap.error("--tiles requires --out-dir")
+        tiles: List[TileSpec] = []
+        for spec in args.tiles.split(","):
+            parts = spec.strip().split(":")
+            if len(parts) != 3:
+                ap.error(f"bad --tiles entry {spec!r}; want col:row:tile_type")
+            try:
+                tiles.append(TileSpec(
+                    col=int(parts[0]), row=int(parts[1]),
+                    tile_type=parts[2],
+                ))
+            except ValueError as e:
+                ap.error(f"bad --tiles entry {spec!r}: {e}")
+        summaries = sweep_multi(
+            test_name=args.test, compiler=args.compiler,
+            tiles=tiles, build_dir=build_dir, out_dir=args.out_dir,
+            events_filter=events_filter,
+            run_hw=not args.no_hw, run_emu=not args.no_emu,
+            ctrlpkt=args.ctrlpkt,
+            ground_event_name=args.ground_event,
+        )
+        for s in summaries:
+            tile = s["tile"]
+            print(f"[sweep-multi] wrote {args.out_dir}/"
+                  f"{args.test}.{args.compiler}.{tile['type']}_c{tile['col']}r{tile['row']}.json "
+                  f"({len(s['events'])} events, {s['elapsed_sec']}s)")
+        return 0
+
+    # Legacy single-tile path
+    if args.col is None or args.row is None or args.tile_type is None or args.out is None:
+        ap.error("single-tile mode requires --col, --row, --tile-type, --out "
+                 "(or use --tiles/--out-dir)")
     summary = sweep(
         test_name=args.test,
         compiler=args.compiler,

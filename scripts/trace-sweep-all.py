@@ -219,28 +219,29 @@ def allocate_results_dir(label: Optional[str]) -> Path:
 def run_sweep(
     test: str,
     compiler: str,
-    tile: TracedTile,
-    out_json: Path,
+    tiles: List[TracedTile],
+    out_dir: Path,
     ground_event: Optional[str],
     no_hw: bool,
     no_emu: bool,
     events: Optional[str],
     timeout_sec: Optional[float],
 ) -> dict:
-    """Call tools/trace-sweep.py as a subprocess and return a status dict.
+    """Call tools/trace-sweep.py in multi-tile mode for one (test, compiler)
+    with its full tile list. One kernel invocation covers every tile; the
+    per-tile output JSONs land in out_dir.
 
     Keeps the subprocess boundary so a trace-sweep crash on one combo
     doesn't take down the whole harness run.  timeout_sec bounds wall time
-    per combo so a wedged EMU can't hold up the whole sweep.
+    so a wedged EMU can't hold up the whole sweep.
     """
+    tiles_arg = ",".join(f"{t.col}:{t.row}:{t.tile_type}" for t in tiles)
     cmd = [
         sys.executable, str(TRACE_SWEEP),
         "--test", test,
         "--compiler", compiler,
-        "--col", str(tile.col),
-        "--row", str(tile.row),
-        "--tile-type", tile.tile_type,
-        "--out", str(out_json),
+        "--tiles", tiles_arg,
+        "--out-dir", str(out_dir),
     ]
     if ground_event:
         cmd += ["--ground-event", ground_event]
@@ -251,7 +252,7 @@ def run_sweep(
     if events:
         cmd += ["--events", events]
 
-    log_path = out_json.with_suffix(".log")
+    log_path = out_dir / f"{test}.{compiler}.log"
     t0 = time.time()
     rc: int
     timed_out = False
@@ -267,11 +268,20 @@ def run_sweep(
             rc = 124  # timeout convention (GNU `timeout` uses 124)
             timed_out = True
     dt = round(time.time() - t0, 1)
+    # Count which per-tile outputs actually landed. Each tile should
+    # produce <test>.<compiler>.<tile.label>.json; missing outputs mean
+    # the sweep crashed before that tile was written.
+    produced = []
+    missing = []
+    for tile in tiles:
+        p = out_dir / f"{test}.{compiler}.{tile.label}.json"
+        (produced if p.is_file() else missing).append(tile.label)
     return {
         "test": test,
         "compiler": compiler,
-        "tile": {"col": tile.col, "row": tile.row, "type": tile.tile_type},
-        "out": out_json.name if out_json.exists() else None,
+        "tiles": [{"col": t.col, "row": t.row, "type": t.tile_type} for t in tiles],
+        "outputs_produced": produced,
+        "outputs_missing": missing,
         "log": log_path.name,
         "rc": rc,
         "timed_out": timed_out,
@@ -385,13 +395,18 @@ def main() -> int:
                       f"likely lives in ctrlpkt.bin -- patching those is "
                       f"not yet implemented)", file=sys.stderr)
                 continue
-            for tile in schedulable_tiles:
-                combos.append((test, comp, tile))
+            # Multi-tile grouping: one combo per (test, comp) carrying
+            # the full list of schedulable tiles. trace-sweep.py's
+            # multi-tile mode runs the kernel once and splits the trace
+            # per-tile on the way out, so we don't waste kernel runs.
+            combos.append((test, comp, schedulable_tiles))
 
-    print(f"[sweep-all] {len(combos)} combos over "
+    print(f"[sweep-all] {len(combos)} combo(s) "
+          f"({sum(len(c[2]) for c in combos)} tiles) over "
           f"{len(tests)} tests / {len(compilers)} compiler(s)")
-    for test, comp, tile in combos:
-        print(f"  {test:40s} {comp:6s} {tile.label}")
+    for test, comp, tiles in combos:
+        tile_labels = ",".join(t.label for t in tiles)
+        print(f"  {test:40s} {comp:6s} {tile_labels}")
     if args.dry_run:
         return 0
 
@@ -399,10 +414,9 @@ def main() -> int:
     print(f"[sweep-all] writing to {out_dir}")
 
     def _submit(combo):
-        test, comp, tile = combo
-        out_json = out_dir / f"{test}.{comp}.{tile.label}.json"
+        test, comp, tiles = combo
         return run_sweep(
-            test=test, compiler=comp, tile=tile, out_json=out_json,
+            test=test, compiler=comp, tiles=tiles, out_dir=out_dir,
             ground_event=ground, no_hw=args.no_hw, no_emu=args.no_emu,
             events=args.events, timeout_sec=args.timeout,
         )
@@ -411,8 +425,9 @@ def main() -> int:
     t_total = time.time()
     if args.jobs == 1:
         for i, combo in enumerate(combos, 1):
-            test, comp, tile = combo
-            print(f"[sweep-all] ({i}/{len(combos)}) {test} {comp} {tile.label}",
+            test, comp, tiles = combo
+            tile_labels = ",".join(t.label for t in tiles)
+            print(f"[sweep-all] ({i}/{len(combos)}) {test} {comp} [{tile_labels}]",
                   flush=True)
             status = _submit(combo)
             if status["rc"] != 0:
@@ -424,8 +439,8 @@ def main() -> int:
         # above). Each worker spawns its own trace-sweep.py subprocess
         # which runs its own emulator inside bridge-trace-runner, so the
         # fan-out is filesystem-isolated. Shared state: the results dir,
-        # but every combo writes to a unique filename.
-        print(f"[sweep-all] running {len(combos)} combos with {args.jobs} "
+        # but every combo writes per-tile to unique filenames.
+        print(f"[sweep-all] running {len(combos)} combo(s) with {args.jobs} "
               f"parallel workers (EMU only)", flush=True)
         with ThreadPoolExecutor(max_workers=args.jobs) as pool:
             futures = {pool.submit(_submit, c): c for c in combos}
@@ -436,15 +451,56 @@ def main() -> int:
                 statuses.append(status)
                 test = status["test"]
                 comp = status["compiler"]
-                tile_lbl = f"{status['tile']['type']}_c{status['tile']['col']}r{status['tile']['row']}"
+                tile_labels = ",".join(
+                    f"{t['type']}_c{t['col']}r{t['row']}" for t in status["tiles"]
+                )
                 if status["rc"] == 0:
                     print(f"[sweep-all] ({done}/{len(combos)}) OK {test} {comp} "
-                          f"{tile_lbl} ({status['elapsed_sec']}s)", flush=True)
+                          f"[{tile_labels}] ({status['elapsed_sec']}s)", flush=True)
                 else:
                     tag = "TIMEOUT" if status.get("timed_out") else f"rc={status['rc']}"
                     print(f"[sweep-all] ({done}/{len(combos)}) !! {tag} "
-                          f"{test} {comp} {tile_lbl}, see {status['log']}",
+                          f"{test} {comp} [{tile_labels}], see {status['log']}",
                           file=sys.stderr, flush=True)
+
+    # Post-hoc data-quality pass. trace-sweep.py exits 0 even when every
+    # batch errored (errors go into the per-event JSON so one bad batch
+    # can't kill a sweep), so rc=0 doesn't mean the combo produced usable
+    # data. Re-read each produced per-tile JSON and count HW/EMU errors.
+    # Each combo now covers multiple tiles, so aggregate per-tile rows.
+    want_hw = not args.no_hw
+    want_emu = not args.no_emu
+    for status in statuses:
+        total_rows = hw_errors = emu_errors = 0
+        per_tile_health = []
+        for tile in status["tiles"]:
+            label = f"{tile['type']}_c{tile['col']}r{tile['row']}"
+            out_path = out_dir / f"{status['test']}.{status['compiler']}.{label}.json"
+            tile_rows = tile_hw_err = tile_emu_err = 0
+            if out_path.is_file():
+                try:
+                    d = json.loads(out_path.read_text())
+                    for row in d.get("events", []):
+                        tile_rows += 1
+                        if want_hw and row.get("hw", {}).get("error"):
+                            tile_hw_err += 1
+                        if want_emu and row.get("emu", {}).get("error"):
+                            tile_emu_err += 1
+                except Exception:
+                    pass
+            total_rows += tile_rows
+            hw_errors += tile_hw_err
+            emu_errors += tile_emu_err
+            per_tile_health.append({
+                "tile": label,
+                "rows": tile_rows,
+                "hw_errors": tile_hw_err,
+                "emu_errors": tile_emu_err,
+            })
+        status["rows_total"] = total_rows
+        status["rows_hw_error"] = hw_errors
+        status["rows_emu_error"] = emu_errors
+        status["per_tile_health"] = per_tile_health
 
     summary = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -455,10 +511,39 @@ def main() -> int:
         "combos": statuses,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    ok = sum(1 for s in statuses if s["rc"] == 0)
-    print(f"[sweep-all] done: {ok}/{len(statuses)} ok, "
+
+    orchestrator_ok = sum(1 for s in statuses if s["rc"] == 0)
+    # A combo is "clean" iff every event row on every requested side
+    # has data. Partial / all-bad combos are surfaced separately so the
+    # user sees "orchestrator said OK but HW errored on every batch"
+    # rather than the hidden success-by-exit-code reading.
+    def _clean(s):
+        if s["rc"] != 0:
+            return False
+        if s.get("rows_total", 0) == 0:
+            return False
+        if want_hw and s.get("rows_hw_error", 0) > 0:
+            return False
+        if want_emu and s.get("rows_emu_error", 0) > 0:
+            return False
+        return True
+    clean = sum(1 for s in statuses if _clean(s))
+    partial = [s for s in statuses if s["rc"] == 0 and not _clean(s)]
+    print(f"[sweep-all] done: {clean}/{len(statuses)} combos with clean data "
+          f"({orchestrator_ok}/{len(statuses)} orchestrator rc=0), "
           f"total {summary['total_elapsed_sec']}s")
-    return 0 if ok == len(statuses) else 2
+    for s in partial:
+        tile_labels = ",".join(
+            f"{t['type']}_c{t['col']}r{t['row']}" for t in s["tiles"]
+        )
+        bits = []
+        if want_hw and s.get("rows_hw_error", 0):
+            bits.append(f"HW errors on {s['rows_hw_error']}/{s['rows_total']} rows")
+        if want_emu and s.get("rows_emu_error", 0):
+            bits.append(f"EMU errors on {s['rows_emu_error']}/{s['rows_total']} rows")
+        print(f"  partial: {s['test']} [{tile_labels}]: {'; '.join(bits)}",
+              file=sys.stderr)
+    return 0 if clean == len(statuses) else 2
 
 
 if __name__ == "__main__":
