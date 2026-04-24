@@ -14,8 +14,10 @@
 //!         └── cdo_groups[] array
 //! ```
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use zerocopy::{FromBytes, Immutable, KnownLayout};
+
+use super::error::ParseError;
 
 /// Array offset reference (size + offset from section start)
 #[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable)]
@@ -114,16 +116,23 @@ pub struct AiePartition<'a> {
 impl<'a> AiePartition<'a> {
     /// Parse an AIE Partition section from raw bytes
     pub fn parse(data: &'a [u8]) -> Result<Self> {
-        if data.len() < std::mem::size_of::<RawAiePartition>() {
-            bail!(
-                "AIE Partition too small: {} bytes (need {})",
-                data.len(),
-                std::mem::size_of::<RawAiePartition>()
-            );
+        let expected = std::mem::size_of::<RawAiePartition>();
+        if data.len() < expected {
+            return Err(ParseError::Truncated {
+                offset: 0,
+                expected_bytes: expected - data.len(),
+                available: data.len(),
+                context: "AIE Partition header",
+            }
+            .into());
         }
 
         let (header, _) = RawAiePartition::read_from_prefix(data)
-            .map_err(|e| anyhow!("Failed to parse AIE partition header: {:?}", e))?;
+            .map_err(|e| ParseError::External {
+                offset: 0,
+                context: "AIE Partition header",
+                message: format!("{:?}", e),
+            })?;
 
         Ok(Self { data, header })
     }
