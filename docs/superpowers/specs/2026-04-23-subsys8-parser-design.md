@@ -260,22 +260,90 @@ The make-it-pleasant pass. Four sub-deliverables, each independent
 
 ### Shape
 
-```rust
-// src/device/ops.rs -- new module
-pub enum DeviceOp {
-    // Register-level writes (most common CDO outcome)
-    RegWrite  { tile: TileAddr, offset: u32, value: u32 },
-    RegMask   { tile: TileAddr, offset: u32, mask: u32, value: u32 },
-    RegBurst  { tile: TileAddr, offset: u32, words: SmallVec<[u32; 8]> },
+The refined proposal below replaces the starting hypothesis (see Subsystem 8 audit §Closing Summary for the reasoning). User-gated: Stage 8b Half 2 does not start until this enum is confirmed.
 
-    // Structured writes (what archspec already names)
+```rust
+// src/device/ops.rs -- new module (Stage 8b Half 2)
+//
+// DeviceOp: arch-generic, device-facing operation vocabulary.
+// Produced by cdo::semantics::lower(); consumed by device::state::apply().
+//
+// Design rules (from spec §"`DeviceOp` vocabulary"):
+// 1. Device-facing, not CDO-facing (two CDO opcodes can produce the same op).
+// 2. Arch-generic (TileAddr, BdFields, StreamRouteSpec via archspec).
+// 3. Mixed granularity (RegWrite is the escape hatch).
+// 4. Value-typed (Copy where possible; SmallVec for burst data only).
+// 5. Audit-refined variant list (this block supersedes the starting hypothesis).
+
+use xdna_archspec::types::TileAddr;
+use xdna_archspec::aie2::dma::BdFields;
+use xdna_archspec::aie2::stream_switch::StreamRouteSpec;
+use xdna_archspec::aie2::dma::{DmaChannelId, DmaDir};
+use smallvec::SmallVec;
+
+#[derive(Debug, Clone)]
+pub enum DeviceOp {
+    // --- Register-level writes (dominant CDO outcomes, ~75% of commands) ---
+
+    /// Single 32-bit register write.
+    /// Produced by: CdoRaw::Write, CdoRaw::Write64 (after 64->32 truncation).
+    RegWrite { tile: TileAddr, offset: u32, value: u32 },
+
+    /// Masked register write: *reg = (*reg & !mask) | (value & mask).
+    /// Produced by: CdoRaw::MaskWrite, CdoRaw::MaskWrite64.
+    RegMask { tile: TileAddr, offset: u32, mask: u32, value: u32 },
+
+    /// Bulk write: consecutive words starting at offset.
+    /// Produced by: CdoRaw::DmaWrite (program/data memory loads).
+    /// Uses SmallVec to avoid heap allocation for small payloads (<= 8 words).
+    RegBurst { tile: TileAddr, offset: u32, words: SmallVec<[u32; 8]> },
+
+    // --- Structured writes (archspec already names these) ---
+
+    /// Configure a DMA Buffer Descriptor.
+    /// Produced by: CdoRaw::Write to DMA BD register range (semantics::lower
+    /// recognizes the offset range and calls arch.dma_model().parse_bd_words()).
     BdConfigure { tile: TileAddr, bd_id: u8, fields: BdFields },
-    LockInit    { tile: TileAddr, lock_id: u8, value: i32 },
+
+    /// Initialize a lock to a specific value.
+    /// Produced by: CdoRaw::Write to lock register range.
+    LockInit { tile: TileAddr, lock_id: u8, value: i32 },
+
+    /// Configure a stream switch connection.
+    /// Produced by: CdoRaw::Write to stream switch register range.
     StreamRoute { tile: TileAddr, route: StreamRouteSpec },
 
-    // Coarse control
-    CoreEnable  { tile: TileAddr, enabled: bool },
-    DmaStart    { tile: TileAddr, channel: DmaChannelId, dir: DmaDir },
+    // --- Coarse control ---
+
+    /// Enable or disable a compute core.
+    /// Produced by: CdoRaw::Write or CdoRaw::MaskWrite to Core_Control register.
+    CoreEnable { tile: TileAddr, enabled: bool },
+
+    /// Start a DMA channel.
+    /// Produced by: CdoRaw::Write to DMA channel start register.
+    DmaStart { tile: TileAddr, channel: DmaChannelId, dir: DmaDir },
+
+    // --- Synchronization / timing (audit-discovered; not in starting hypothesis) ---
+
+    /// Poll a register until (value & mask) == expected.
+    /// On real hardware: blocks until the condition is met (DMA completion, etc.).
+    /// In the emulator: currently a logged no-op (writes are synchronous).
+    /// Retaining as a variant preserves the information for future cycle-accurate work.
+    /// Produced by: CdoRaw::MaskPoll, CdoRaw::MaskPoll64.
+    /// Copy-able: all fields are primitive.
+    MaskPoll { tile: TileAddr, offset: u32, mask: u32, expected: u32 },
+
+    /// Timing delay for N cycles.
+    /// On real hardware: inserts a wait. In the emulator: no-op.
+    /// Produced by: CdoRaw::Delay.
+    /// Copy-able.
+    Delay { cycles: u32 },
+
+    /// Debug sequence marker (value is an opaque tag).
+    /// Always a no-op in device-state; useful for trace and test tooling.
+    /// Produced by: CdoRaw::Marker.
+    /// Copy-able.
+    Marker { value: u32 },
 }
 ```
 
