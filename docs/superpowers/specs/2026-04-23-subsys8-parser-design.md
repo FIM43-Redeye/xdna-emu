@@ -270,9 +270,14 @@ The refined proposal below replaces the starting hypothesis (see Subsystem 8 aud
 //
 // Design rules (see below the enum):
 
-use xdna_archspec::types::TileAddr;
-use xdna_archspec::aie2::dma::{DmaChannelId, DmaDir};
+use xdna_archspec::types::{TileAddr, DmaDirection};
 use smallvec::SmallVec;
+
+// Notes on type sourcing (post-amendment, Option B):
+//   - TileAddr is introduced fresh in archspec::types as part of Task 10.
+//   - DmaDirection already exists in archspec::types (S2mm/Mm2s).
+//   - DMA channel is u8 (matches existing device/state surface; a
+//     newtype would be premature until something demands it).
 
 #[derive(Debug, Clone)]
 pub enum DeviceOp {
@@ -318,7 +323,7 @@ pub enum DeviceOp {
 
     /// Start a DMA channel.
     /// Produced by: CdoRaw::Write to DMA channel control register.
-    DmaStart { tile: TileAddr, channel: DmaChannelId, dir: DmaDir },
+    DmaStart { tile: TileAddr, channel: u8, dir: DmaDirection },
 
     // --- Synchronization / timing (no-op in emulator today) ---
 
