@@ -59,6 +59,48 @@ TRACE_SWEEP = REPO_ROOT / "tools" / "trace-sweep.py"
 RESULTS_BASE = REPO_ROOT / "build" / "trace-sweep-results"
 
 
+# Reuse trace-sweep.py's discover_test_config helper so the two tools
+# always agree on "what file does this test produce." Importing a module
+# whose filename contains a hyphen requires the importlib dance -- and
+# dataclass() needs the module registered in sys.modules *before*
+# exec_module runs, or its __module__ lookup breaks.
+_TRACE_SWEEP_MOD = None
+
+
+def _load_trace_sweep_module():
+    global _TRACE_SWEEP_MOD
+    if _TRACE_SWEEP_MOD is not None:
+        return _TRACE_SWEEP_MOD
+    import importlib.util as _iu
+    spec = _iu.spec_from_file_location("trace_sweep", TRACE_SWEEP)
+    mod = _iu.module_from_spec(spec)
+    sys.modules["trace_sweep"] = mod
+    spec.loader.exec_module(mod)
+    _TRACE_SWEEP_MOD = mod
+    return mod
+
+
+def _test_config(test_name: str):
+    return _load_trace_sweep_module().discover_test_config(test_name)
+
+
+_TRACE_PATCH_MOD = None
+
+
+def _load_trace_patch_module():
+    global _TRACE_PATCH_MOD
+    if _TRACE_PATCH_MOD is not None:
+        return _TRACE_PATCH_MOD
+    import importlib.util as _iu
+    path = REPO_ROOT / "tools" / "trace-patch-events.py"
+    spec = _iu.spec_from_file_location("trace_patch_events", path)
+    mod = _iu.module_from_spec(spec)
+    sys.modules["trace_patch_events"] = mod
+    spec.loader.exec_module(mod)
+    _TRACE_PATCH_MOD = mod
+    return mod
+
+
 # ---------------------------------------------------------------------------
 # Tile discovery
 # ---------------------------------------------------------------------------
@@ -306,6 +348,12 @@ def main() -> int:
             print(f"[skip] {test}: no traced tiles in {traced}",
                   file=sys.stderr)
             continue
+        # Ask trace-sweep.py what this test actually produces. That way
+        # control-packet tests (which use aie_run_seq.bin, not insts.bin)
+        # come in too -- the sweep can patch any runtime-sequence file the
+        # test emits, as long as the compiled xclbin has trace routing on
+        # the target tile.
+        cfg = _test_config(test)
         for comp in compilers:
             comp_dir = BUILD_BASE / test / comp
             if not (comp_dir / "aie.xclbin").is_file():
@@ -313,17 +361,31 @@ def main() -> int:
                       f"emu-bridge-test.sh --with-hw-cycles --{comp}-only "
                       f"-v {test}", file=sys.stderr)
                 continue
-            # Control-packet tests (e.g. ctrl_packet_reconfig_elf) bundle
-            # the runtime sequence as main_seq.bin / main_ctrlpkt.bin
-            # instead of insts.bin, which trace-sweep.py can't patch.
-            # Surface that clearly instead of churning through 16 batches
-            # only to FileNotFoundError.
-            if not (comp_dir / "insts.bin").is_file():
-                print(f"[skip] {test}/{comp}: no insts.bin (uses a "
-                      f"non-insts runtime sequence; patch-based sweep "
-                      f"doesn't apply)", file=sys.stderr)
+            insts_path = comp_dir / cfg.insts_name
+            if not insts_path.is_file():
+                print(f"[skip] {test}/{comp}: runtime-sequence file "
+                      f"{cfg.insts_name!r} missing from build dir "
+                      f"(discovered from {test}/run.lit)", file=sys.stderr)
                 continue
-            for tile in tiles:
+            # Patch-based sweep needs Trace_Event writes in the runtime
+            # sequence. Some tests (e.g. ctrl_packet_reconfig_1x4_cores)
+            # program the trace config via control-packet DMA writes that
+            # live in ctrlpkt.bin, not via Write32 ops in the runtime
+            # sequence. Probe here so the first batch doesn't have to
+            # discover that combo-by-combo.
+            tp = _load_trace_patch_module()
+            data = insts_path.read_bytes()
+            schedulable_tiles = [
+                tile for tile in tiles
+                if tp.probe_slot_capacity(data, tile.col, tile.row, tile.tile_type) > 0
+            ]
+            if not schedulable_tiles:
+                print(f"[skip] {test}/{comp}: no Trace_Event writes in "
+                      f"{cfg.insts_name} for any traced tile (trace config "
+                      f"likely lives in ctrlpkt.bin -- patching those is "
+                      f"not yet implemented)", file=sys.stderr)
+                continue
+            for tile in schedulable_tiles:
                 combos.append((test, comp, tile))
 
     print(f"[sweep-all] {len(combos)} combos over "

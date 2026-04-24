@@ -352,7 +352,10 @@ def _run_one_side(
         "--xclbin", str(xclbin),
         "--instr", str(instr),
         "--trace-out", str(trace_bin),
-        "--trace-size", "8192",
+        # 1 MiB trace BO. The 8 KiB default silently truncated lock-heavy
+        # kernels halfway through, making EMU undercount events that fired
+        # fine but didn't fit. See trace-sweep-v2 validation notes / #138.
+        "--trace-size", "1048576",
     ]
     if ctrlpkt and ctrlpkt.is_file():
         cmd += ["--input", str(ctrlpkt)]
@@ -425,6 +428,72 @@ def _find_post_lowering_mlir(build_dir: Path) -> Optional[Path]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Test-config discovery
+# ---------------------------------------------------------------------------
+#
+# Tests produce different runtime-sequence filenames depending on what
+# their run.lit tells aiecc.py to emit. Examples:
+#
+#   default test               -> insts.bin
+#   ctrl_packet_reconfig       -> aie_run_seq.bin + ctrlpkt.bin (as --input)
+#   ctrl_packet_reconfig_elf   -> same, plus a pre-built aie.elf
+#
+# Hardcoding "insts.bin" made the sweep silently skip entire families of
+# tests. Parsing run.lit authoritatively fixes that: we read the exact
+# --npu-insts-name / --ctrlpkt-name flags the test compiles with and use
+# those. Mirrors scripts/emu-bridge-test.sh's _discover_aiecc_name helpers
+# (kept in shell because bridge-test.sh is shell; kept here in Python to
+# avoid inter-process calls for every sweep combo).
+
+_AIECC_FLAG_RE = re.compile(r"--(npu-insts-name|ctrlpkt-name)=(\S+)")
+
+
+@dataclass(frozen=True)
+class TestConfig:
+    """What a test actually produces and needs at runtime."""
+    insts_name: str                 # filename in build_dir (patch target)
+    ctrlpkt_name: Optional[str]     # None if test doesn't generate one
+
+
+def _find_run_lit(test_src: Path) -> Optional[Path]:
+    """Locate run.lit for a test. Most tests name it exactly; a handful
+    use variant names like test.lit."""
+    for name in ("run.lit", "test.lit"):
+        cand = test_src / name
+        if cand.is_file():
+            return cand
+    return None
+
+
+def discover_test_config(test_name: str) -> TestConfig:
+    """Parse a test's run.lit to learn which runtime-sequence file aiecc
+    was told to emit.
+
+    Lookup precedence:
+      1. The last occurrence of --npu-insts-name=X wins (run.lit can
+         mention it multiple times for different build variants).
+      2. Fall back to 'insts.bin' when the flag is absent.
+      3. --ctrlpkt-name=Y sets ctrlpkt_name; absence leaves it None.
+
+    Does not check whether the files exist in the build tree -- that's
+    the sweep driver's job. This function only surfaces the *names* from
+    the source-of-truth run.lit.
+    """
+    test_src = MLIR_AIE_ROOT / "test" / "npu-xrt" / test_name
+    lit = _find_run_lit(test_src)
+    insts_name = "insts.bin"
+    ctrlpkt_name: Optional[str] = None
+    if lit is not None:
+        for m in _AIECC_FLAG_RE.finditer(lit.read_text()):
+            flag, value = m.group(1), m.group(2)
+            if flag == "npu-insts-name":
+                insts_name = value
+            elif flag == "ctrlpkt-name":
+                ctrlpkt_name = value
+    return TestConfig(insts_name=insts_name, ctrlpkt_name=ctrlpkt_name)
+
+
 def _resolve_ground_event(
     tile_type: str, name: Optional[str],
 ) -> Optional[EventDef]:
@@ -460,13 +529,28 @@ def sweep(
     ctrlpkt: Optional[Path] = None,
     ground_event_name: Optional[str] = None,
 ) -> dict:
+    # Resolve which runtime-sequence file this test actually produces.
+    # Most tests emit insts.bin; control-packet tests emit aie_run_seq.bin
+    # (plus an optional ctrlpkt.bin that gets passed as --input). The
+    # caller's explicit --ctrlpkt takes precedence over discovered config
+    # so debugging overrides still work.
+    cfg = discover_test_config(test_name)
     xclbin = build_dir / "aie.xclbin"
-    insts = build_dir / "insts.bin"
-    if not xclbin.exists() or not insts.exists():
+    insts = build_dir / cfg.insts_name
+    if not xclbin.exists():
         raise FileNotFoundError(
-            f"xclbin or insts.bin missing in {build_dir}; compile with "
+            f"xclbin missing in {build_dir}; compile with "
             f"--with-hw-cycles first so trace routing is present"
         )
+    if not insts.exists():
+        raise FileNotFoundError(
+            f"runtime-sequence file {cfg.insts_name!r} missing in "
+            f"{build_dir} (discovered from {test_name}/run.lit)"
+        )
+    if ctrlpkt is None and cfg.ctrlpkt_name:
+        cand = build_dir / cfg.ctrlpkt_name
+        if cand.is_file():
+            ctrlpkt = cand
     mlir = _find_post_lowering_mlir(build_dir)
     if mlir is None:
         raise FileNotFoundError(

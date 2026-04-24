@@ -48,7 +48,14 @@ struct CliArgs {
     std::string trace_out;         // where to dump raw trace bytes
     std::vector<std::string> inputs;   // paths to input buffer binaries
     std::vector<std::string> outputs;  // paths where outputs get written
-    uint64_t trace_size_bytes = 8192;
+    // Default 1 MiB. Large enough that event-heavy workloads (lock-
+    // intensive kernels, full-event sweeps) don't silently truncate
+    // mid-trace. The trace unit has no backpressure -- once the BO
+    // fills, further events are dropped on the floor and the comparison
+    // gets attributed to "emulator didn't emit the event" when the real
+    // cause was "buffer ran out." 1 MiB still fits comfortably in host
+    // memory and NPU BO allocation limits.
+    uint64_t trace_size_bytes = 1u << 20;
     bool verbose = false;
 };
 

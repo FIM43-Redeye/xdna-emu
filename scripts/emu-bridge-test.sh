@@ -774,7 +774,7 @@ _run_trace_cycles_pipeline() {
         --xclbin "$xclbin" \
         --instr "$instr" \
         --trace-out "$trace_bin" \
-        --trace-size 8192 \
+        --trace-size 1048576 \
         "${extra_args[@]}" \
         2>"$runner_log"; then
         echo "[trace-cycles:$side] $test_name ($variant): runner failed; see $runner_log" >&2
