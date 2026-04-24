@@ -62,6 +62,21 @@ pub mod dma {
     /// 0, Start_Queue at offset 4.
     pub const CHANNEL_STRIDE: u32 = 0x08;
 
+    /// Offset within a channel slot from Ctrl to Start_Queue.
+    /// Real hardware triggers a DMA transfer by pushing a BD ID to
+    /// Start_Queue; Ctrl is channel-level configuration only. Parser
+    /// promotion to `DeviceOp::DmaStart` targets Start_Queue writes.
+    pub const START_QUEUE_OFFSET_IN_SLOT: u32 = 0x04;
+
+    /// S2MM channel 0 Start_Queue. AM025 offset 0x1DE04.
+    pub const COMPUTE_DMA_S2MM_0_START_QUEUE: u32 = 0x1DE04;
+    /// S2MM channel 1 Start_Queue. AM025 offset 0x1DE0C.
+    pub const COMPUTE_DMA_S2MM_1_START_QUEUE: u32 = 0x1DE0C;
+    /// MM2S channel 0 Start_Queue. AM025 offset 0x1DE14.
+    pub const COMPUTE_DMA_MM2S_0_START_QUEUE: u32 = 0x1DE14;
+    /// MM2S channel 1 Start_Queue. AM025 offset 0x1DE1C.
+    pub const COMPUTE_DMA_MM2S_1_START_QUEUE: u32 = 0x1DE1C;
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -90,6 +105,26 @@ pub mod dma {
             assert_eq!(
                 COMPUTE_DMA_MM2S_0_CTRL - COMPUTE_DMA_S2MM_1_CTRL,
                 CHANNEL_STRIDE,
+            );
+        }
+
+        /// Drift-detection: asserts Start_Queue offsets match Ctrl + 4.
+        /// Source: `mlir-aie/lib/Dialect/AIE/Util/aie_registers_aie2.json`
+        /// (DMA_S2MM_0_Start_Queue at 0x1DE04, etc).
+        #[test]
+        fn compute_dma_start_queue_offsets_match_am025() {
+            assert_eq!(COMPUTE_DMA_S2MM_0_START_QUEUE, 0x1DE04);
+            assert_eq!(COMPUTE_DMA_S2MM_1_START_QUEUE, 0x1DE0C);
+            assert_eq!(COMPUTE_DMA_MM2S_0_START_QUEUE, 0x1DE14);
+            assert_eq!(COMPUTE_DMA_MM2S_1_START_QUEUE, 0x1DE1C);
+            // Each Start_Queue is 4 bytes past its Ctrl.
+            assert_eq!(
+                COMPUTE_DMA_S2MM_0_START_QUEUE - COMPUTE_DMA_S2MM_0_CTRL,
+                START_QUEUE_OFFSET_IN_SLOT,
+            );
+            assert_eq!(
+                COMPUTE_DMA_MM2S_1_START_QUEUE - COMPUTE_DMA_MM2S_1_CTRL,
+                START_QUEUE_OFFSET_IN_SLOT,
             );
         }
     }

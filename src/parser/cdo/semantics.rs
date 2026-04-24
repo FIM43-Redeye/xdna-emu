@@ -12,10 +12,12 @@
 //!
 //!   - A write to `CORE_CONTROL` on a compute tile becomes
 //!     `CoreEnable` (direction carried by bit 0 of the value).
-//!   - A write to a compute-tile DMA channel control register with the
-//!     enable bit set becomes `DmaStart { channel, dir }`. A write with
-//!     enable=0 falls through to `RegWrite` because it is configuring
-//!     or resetting the channel, not starting it.
+//!   - A write to a compute-tile DMA channel **Start_Queue** register
+//!     becomes `DmaStart { channel, dir }`. Writes to the channel
+//!     **Ctrl** register (Start_Queue - 4) are configuration only and
+//!     pass through as `RegWrite` -- real hardware treats them the
+//!     same way: Ctrl holds channel-level state, Start_Queue is the
+//!     trigger that pushes a BD ID and enqueues the transfer.
 //!
 //! Both promotions are gated to compute tiles (row >= 2 on AIE2); shim
 //! (row 0) and memtile (row 1) writes to the same offsets fall through
@@ -36,8 +38,8 @@
 use smallvec::SmallVec;
 
 use xdna_archspec::aie2::registers::dma::{
-    COMPUTE_DMA_MM2S_0_CTRL, COMPUTE_DMA_MM2S_1_CTRL, COMPUTE_DMA_S2MM_0_CTRL,
-    COMPUTE_DMA_S2MM_1_CTRL,
+    COMPUTE_DMA_MM2S_0_START_QUEUE, COMPUTE_DMA_MM2S_1_START_QUEUE,
+    COMPUTE_DMA_S2MM_0_START_QUEUE, COMPUTE_DMA_S2MM_1_START_QUEUE,
 };
 use xdna_archspec::aie2::registers::CORE_CONTROL;
 use xdna_archspec::aie2::{TILE_COL_SHIFT, TILE_OFFSET_MASK, TILE_ROW_SHIFT};
@@ -73,15 +75,17 @@ fn is_compute_row(row: u8) -> bool {
     row >= 2
 }
 
-/// Match a compute-tile DMA channel control offset and return
-/// `(channel, direction)` if it names one.
+/// Match a compute-tile DMA channel Start_Queue offset and return
+/// `(channel, direction)` if it names one. A write to Start_Queue is
+/// the hardware trigger for a DMA transfer; Ctrl writes (Start_Queue
+/// - 4) are configuration and pass through as `RegWrite`.
 #[inline]
-fn match_compute_dma_ctrl(offset: u32) -> Option<(u8, DmaDirection)> {
+fn match_compute_dma_start_queue(offset: u32) -> Option<(u8, DmaDirection)> {
     match offset {
-        o if o == COMPUTE_DMA_S2MM_0_CTRL => Some((0, DmaDirection::S2mm)),
-        o if o == COMPUTE_DMA_S2MM_1_CTRL => Some((1, DmaDirection::S2mm)),
-        o if o == COMPUTE_DMA_MM2S_0_CTRL => Some((0, DmaDirection::Mm2s)),
-        o if o == COMPUTE_DMA_MM2S_1_CTRL => Some((1, DmaDirection::Mm2s)),
+        o if o == COMPUTE_DMA_S2MM_0_START_QUEUE => Some((0, DmaDirection::S2mm)),
+        o if o == COMPUTE_DMA_S2MM_1_START_QUEUE => Some((1, DmaDirection::S2mm)),
+        o if o == COMPUTE_DMA_MM2S_0_START_QUEUE => Some((0, DmaDirection::Mm2s)),
+        o if o == COMPUTE_DMA_MM2S_1_START_QUEUE => Some((1, DmaDirection::Mm2s)),
         _ => None,
     }
 }
@@ -171,14 +175,14 @@ fn lower_write(address: u32, value: u32) -> DeviceOp {
         };
     }
 
-    // DMA channel start on a compute tile. Only promote when the enable
-    // bit is set -- a write with enable=0 is configuring or resetting
-    // the channel, not starting it, and should pass through as RegWrite.
+    // DMA channel start on a compute tile: any write to a Start_Queue
+    // register pushes a BD ID and starts a transfer. Ctrl writes are
+    // channel-level config and are NOT promoted here -- they pass
+    // through as RegWrite exactly like a write to any other config
+    // register.
     if is_compute_row(tile.row) {
-        if let Some((channel, dir)) = match_compute_dma_ctrl(offset) {
-            if (value & 1) != 0 {
-                return DeviceOp::DmaStart { tile, channel, dir };
-            }
+        if let Some((channel, dir)) = match_compute_dma_start_queue(offset) {
+            return DeviceOp::DmaStart { tile, channel, dir };
         }
     }
 
@@ -239,6 +243,11 @@ fn bytes_to_words_le(data: &[u8]) -> SmallVec<[u32; 64]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The Ctrl consts aren't used by the production code (promotion
+    // matches Start_Queue instead), but tests reference them to verify
+    // Ctrl writes fall through to RegWrite.
+    use xdna_archspec::aie2::registers::dma::COMPUTE_DMA_S2MM_0_CTRL;
 
     /// Build an AIE2 host-view address for a tile-local offset.
     fn aie_addr(col: u8, row: u8, offset: u32) -> u32 {
@@ -563,14 +572,20 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // DmaStart promotion (DMA Ctrl offsets on compute tile with bit 0=1)
+    // DmaStart promotion (DMA Start_Queue offsets on a compute tile).
+    //
+    // Start_Queue is the trigger register that pushes a BD ID and
+    // enqueues a DMA transfer. The paired Ctrl register (Start_Queue
+    // - 4) is channel configuration only and must pass through as
+    // RegWrite. This mirrors real hardware's separation of channel
+    // state (Ctrl) from transfer trigger (Start_Queue).
     // ------------------------------------------------------------------
 
     #[test]
-    fn dma_s2mm_0_ctrl_enable_on_compute_lowers_to_dma_start() {
+    fn dma_s2mm_0_start_queue_on_compute_lowers_to_dma_start() {
         let (col, row) = compute_tile_addr();
-        let addr = aie_addr(col, row, COMPUTE_DMA_S2MM_0_CTRL);
-        let ops = lower(&CdoRaw::Write { address: addr, value: 0x1 });
+        let addr = aie_addr(col, row, COMPUTE_DMA_S2MM_0_START_QUEUE);
+        let ops = lower(&CdoRaw::Write { address: addr, value: 0x7 }); // BD ID 7
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             DeviceOp::DmaStart { tile, channel, dir } => {
@@ -583,10 +598,10 @@ mod tests {
     }
 
     #[test]
-    fn dma_s2mm_1_ctrl_enable_on_compute_lowers_to_dma_start() {
+    fn dma_s2mm_1_start_queue_on_compute_lowers_to_dma_start() {
         let (col, row) = compute_tile_addr();
-        let addr = aie_addr(col, row, COMPUTE_DMA_S2MM_1_CTRL);
-        let ops = lower(&CdoRaw::Write { address: addr, value: 0x1 });
+        let addr = aie_addr(col, row, COMPUTE_DMA_S2MM_1_START_QUEUE);
+        let ops = lower(&CdoRaw::Write { address: addr, value: 0x3 });
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             DeviceOp::DmaStart { channel, dir, .. } => {
@@ -598,9 +613,9 @@ mod tests {
     }
 
     #[test]
-    fn dma_mm2s_0_ctrl_enable_on_compute_lowers_to_dma_start() {
+    fn dma_mm2s_0_start_queue_on_compute_lowers_to_dma_start() {
         let (col, row) = compute_tile_addr();
-        let addr = aie_addr(col, row, COMPUTE_DMA_MM2S_0_CTRL);
+        let addr = aie_addr(col, row, COMPUTE_DMA_MM2S_0_START_QUEUE);
         let ops = lower(&CdoRaw::Write { address: addr, value: 0x1 });
         assert_eq!(ops.len(), 1);
         match &ops[0] {
@@ -613,10 +628,10 @@ mod tests {
     }
 
     #[test]
-    fn dma_mm2s_1_ctrl_enable_on_compute_lowers_to_dma_start() {
+    fn dma_mm2s_1_start_queue_on_compute_lowers_to_dma_start() {
         let (col, row) = compute_tile_addr();
-        let addr = aie_addr(col, row, COMPUTE_DMA_MM2S_1_CTRL);
-        let ops = lower(&CdoRaw::Write { address: addr, value: 0x1 });
+        let addr = aie_addr(col, row, COMPUTE_DMA_MM2S_1_START_QUEUE);
+        let ops = lower(&CdoRaw::Write { address: addr, value: 0x5 });
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             DeviceOp::DmaStart { channel, dir, .. } => {
@@ -628,44 +643,45 @@ mod tests {
     }
 
     #[test]
-    fn dma_ctrl_write_without_enable_bit_stays_regwrite() {
-        // A Ctrl write with bit 0 = 0 is configuration or reset, not a
-        // start. Must fall through to RegWrite even on a compute tile.
+    fn dma_ctrl_write_on_compute_stays_regwrite() {
+        // Ctrl (Start_Queue - 4) is configuration only; writing it
+        // never starts a transfer. Must pass through as RegWrite even
+        // with bit 0 set (channel-armed configuration, not a trigger).
         let (col, row) = compute_tile_addr();
         let addr = aie_addr(col, row, COMPUTE_DMA_S2MM_0_CTRL);
-        let ops = lower(&CdoRaw::Write { address: addr, value: 0x10 }); // bit 4 set, bit 0 clear
+        let ops = lower(&CdoRaw::Write { address: addr, value: 0x1 });
         assert_eq!(ops.len(), 1);
         assert!(
             matches!(ops[0], DeviceOp::RegWrite { .. }),
-            "DMA Ctrl write with enable=0 must stay RegWrite, got {:?}",
+            "DMA Ctrl write must stay RegWrite regardless of value, got {:?}",
             ops[0]
         );
     }
 
     #[test]
-    fn dma_ctrl_write_on_shim_tile_is_regwrite_not_dma_start() {
+    fn dma_start_queue_write_on_shim_tile_is_regwrite_not_dma_start() {
         // Shim has DMA channels too but at a different base address
-        // (0x1D200). A write at offset 0x1DE00 on a shim tile is a
-        // different register entirely (or out-of-range); it must not
-        // promote to DmaStart.
-        let addr = aie_addr(0, 0, COMPUTE_DMA_S2MM_0_CTRL);
+        // (0x1D200 Ctrl / 0x1D204 Start_Queue). A write at compute's
+        // Start_Queue offset on a shim tile is either a different
+        // register or out-of-range; it must not promote.
+        let addr = aie_addr(0, 0, COMPUTE_DMA_S2MM_0_START_QUEUE);
         let ops = lower(&CdoRaw::Write { address: addr, value: 0x1 });
         assert_eq!(ops.len(), 1);
         assert!(
             matches!(ops[0], DeviceOp::RegWrite { .. }),
-            "shim write at compute-DMA offset must stay RegWrite, got {:?}",
+            "shim write at compute Start_Queue offset must stay RegWrite, got {:?}",
             ops[0]
         );
     }
 
     #[test]
-    fn dma_ctrl_write_on_memtile_is_regwrite_not_dma_start() {
-        let addr = aie_addr(0, 1, COMPUTE_DMA_S2MM_0_CTRL);
+    fn dma_start_queue_write_on_memtile_is_regwrite_not_dma_start() {
+        let addr = aie_addr(0, 1, COMPUTE_DMA_S2MM_0_START_QUEUE);
         let ops = lower(&CdoRaw::Write { address: addr, value: 0x1 });
         assert_eq!(ops.len(), 1);
         assert!(
             matches!(ops[0], DeviceOp::RegWrite { .. }),
-            "memtile write at compute-DMA offset must stay RegWrite, got {:?}",
+            "memtile write at compute Start_Queue offset must stay RegWrite, got {:?}",
             ops[0]
         );
     }
