@@ -30,35 +30,7 @@
 use anyhow::{anyhow, bail, Result};
 use goblin::elf::{Elf, program_header::PT_LOAD};
 use std::path::Path;
-
-/// AIE machine type in ELF header (e_machine field)
-/// See: llvm-aie llvm/include/llvm/BinaryFormat/ELF.h
-pub const EM_AIE: u16 = 264; // 0x108
-
-/// AIE architecture flags (e_flags field)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum AieArchitecture {
-    /// AIE1 - Original AI Engine (Versal)
-    Aie1 = 0x01,
-    /// AIE2 - AI Engine ML (Phoenix/HawkPoint NPU)
-    Aie2 = 0x02,
-    /// AIE2P - AI Engine ML+ (Strix/Krackan NPU)
-    Aie2P = 0x03,
-    /// Unknown architecture
-    Unknown = 0x00,
-}
-
-impl From<u32> for AieArchitecture {
-    fn from(flags: u32) -> Self {
-        match flags & 0x0F {
-            0x01 => AieArchitecture::Aie1,
-            0x02 => AieArchitecture::Aie2,
-            0x03 => AieArchitecture::Aie2P,
-            _ => AieArchitecture::Unknown,
-        }
-    }
-}
+use xdna_archspec::elf::{EM_AIE, AieArchitecture};
 
 /// Memory region type for AIE address interpretation.
 ///
@@ -458,21 +430,6 @@ mod tests {
         ]);
 
         elf
-    }
-
-    #[test]
-    fn test_em_aie_constant() {
-        assert_eq!(EM_AIE, 264);
-        assert_eq!(EM_AIE, 0x108);
-    }
-
-    #[test]
-    fn test_aie_architecture_from_flags() {
-        assert_eq!(AieArchitecture::from(0x01), AieArchitecture::Aie1);
-        assert_eq!(AieArchitecture::from(0x02), AieArchitecture::Aie2);
-        assert_eq!(AieArchitecture::from(0x03), AieArchitecture::Aie2P);
-        assert_eq!(AieArchitecture::from(0x00), AieArchitecture::Unknown);
-        assert_eq!(AieArchitecture::from(0x12), AieArchitecture::Aie2); // Mask test
     }
 
     #[test]
