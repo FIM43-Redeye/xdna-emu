@@ -317,7 +317,7 @@ impl XclbinTest {
     /// Parses the CDO and looks for DMA_WRITE commands to program memory
     /// (offset 0x20000). Returns the count of unique tiles with embedded code.
     pub fn count_embedded_cores(&self) -> usize {
-        use crate::parser::cdo::CdoCommand;
+        use crate::parser::cdo::CdoRaw;
         use crate::device::TileAddress;
         use std::collections::HashSet;
 
@@ -342,7 +342,7 @@ impl XclbinTest {
             if let Some(cdo_offset) = find_cdo_offset(pdi.pdi_image) {
                 if let Ok(cdo) = Cdo::parse(&pdi.pdi_image[cdo_offset..]) {
                     for cmd in cdo.commands() {
-                        if let CdoCommand::DmaWrite { address, data } = &cmd {
+                        if let CdoRaw::DmaWrite { address, data } = &cmd {
                             let tile = TileAddress::decode(*address);
                             // ProgMem starts at offset 0x20000 for compute tiles
                             if tile.offset >= 0x20000 && tile.offset < 0x40000 && !data.is_empty() {

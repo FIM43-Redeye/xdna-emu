@@ -28,13 +28,13 @@ impl DeviceState {
     }
 
     /// Apply a single CDO command.
-    fn apply_command(&mut self, cmd: &CdoCommand) -> Result<()> {
+    fn apply_command(&mut self, cmd: &CdoRaw) -> Result<()> {
         match cmd {
-            CdoCommand::Nop { .. } => {
+            CdoRaw::Nop { .. } => {
                 self.stats.nops += 1;
             }
 
-            CdoCommand::Write { address, value } => {
+            CdoRaw::Write { address, value } => {
                 self.stats.writes += 1;
                 let tile_addr = TileAddress::decode(*address);
                 log::trace!("CDO Write: addr=0x{:08X} -> tile({},{}) offset=0x{:05X} value=0x{:08X}",
@@ -42,7 +42,7 @@ impl DeviceState {
                 self.write_register(*address, *value)?;
             }
 
-            CdoCommand::MaskWrite { address, mask, value } => {
+            CdoRaw::MaskWrite { address, mask, value } => {
                 self.stats.mask_writes += 1;
                 let tile_addr = TileAddress::decode(*address);
                 log::trace!("CDO MaskWrite: addr=0x{:08X} -> tile({},{}) offset=0x{:05X} mask=0x{:08X} value=0x{:08X}",
@@ -52,7 +52,7 @@ impl DeviceState {
 
             // Write64/MaskWrite64 use 64-bit addresses but AIE tiles are 32-bit addressed.
             // The high 32 bits are always 0 for AIE, so we use the low 32 bits.
-            CdoCommand::Write64 { address, value } => {
+            CdoRaw::Write64 { address, value } => {
                 self.stats.writes += 1;
                 let addr32 = *address as u32;
                 let tile_addr = TileAddress::decode(addr32);
@@ -61,7 +61,7 @@ impl DeviceState {
                 self.write_register(addr32, *value)?;
             }
 
-            CdoCommand::MaskWrite64 { address, mask, value } => {
+            CdoRaw::MaskWrite64 { address, mask, value } => {
                 self.stats.mask_writes += 1;
                 let addr32 = *address as u32;
                 let tile_addr = TileAddress::decode(addr32);
@@ -70,7 +70,7 @@ impl DeviceState {
                 self.mask_write_register(addr32, *mask, *value)?;
             }
 
-            CdoCommand::DmaWrite { address, data } => {
+            CdoRaw::DmaWrite { address, data } => {
                 self.stats.dma_writes += 1;
                 let tile_addr = TileAddress::decode(*address);
                 let subsystem = subsystem_from_offset(tile_addr.offset, tile_kind_from_row(tile_addr.row));
@@ -82,21 +82,21 @@ impl DeviceState {
             // Synchronization/timing commands - no-ops in emulation.
             // MaskPoll waits for a register to match a value on real hardware;
             // in the emulator, configuration writes take effect immediately.
-            CdoCommand::MaskPoll { .. } | CdoCommand::MaskPoll64 { .. } => {
+            CdoRaw::MaskPoll { .. } | CdoRaw::MaskPoll64 { .. } => {
                 log::trace!("CDO MaskPoll: skipped (emulator writes are synchronous)");
             }
 
             // Delay inserts a wait on real hardware; no-op in emulation.
-            CdoCommand::Delay { .. } => {
+            CdoRaw::Delay { .. } => {
                 log::trace!("CDO Delay: skipped (emulator has no real-time clock)");
             }
 
             // Structural markers - no functional effect.
-            CdoCommand::EndMark | CdoCommand::Marker { .. } => {
+            CdoRaw::EndMark | CdoRaw::Marker { .. } => {
                 log::trace!("CDO marker/end: skipped");
             }
 
-            CdoCommand::Unknown { opcode, payload } => {
+            CdoRaw::Unknown { opcode, payload } => {
                 self.stats.unknown += 1;
                 anyhow::bail!(
                     "CDO opcode {:#06x} not implemented ({} payload words) -- unknown hardware config",

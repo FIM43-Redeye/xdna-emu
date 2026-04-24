@@ -216,7 +216,7 @@ impl From<u16> for CdoOpcode {
 
 /// Decoded CDO command with payload
 #[derive(Debug, Clone)]
-pub enum CdoCommand {
+pub enum CdoRaw {
     /// Write value to 32-bit address
     Write { address: u32, value: u32 },
 
@@ -254,7 +254,7 @@ pub enum CdoCommand {
     Unknown { opcode: u16, payload: Vec<u32> },
 }
 
-impl CdoCommand {
+impl CdoRaw {
     /// Returns the target address for address-based commands
     pub fn address(&self) -> Option<u64> {
         match self {
@@ -369,18 +369,18 @@ impl<'a> Cdo<'a> {
         let mut counts = std::collections::HashMap::new();
         for cmd in self.commands() {
             let name = match &cmd {
-                CdoCommand::Write { .. } => "WRITE",
-                CdoCommand::MaskWrite { .. } => "MASK_WRITE",
-                CdoCommand::Write64 { .. } => "WRITE64",
-                CdoCommand::MaskWrite64 { .. } => "MASK_WRITE64",
-                CdoCommand::DmaWrite { .. } => "DMA_WRITE",
-                CdoCommand::MaskPoll { .. } => "MASK_POLL",
-                CdoCommand::MaskPoll64 { .. } => "MASK_POLL64",
-                CdoCommand::Delay { .. } => "DELAY",
-                CdoCommand::Nop { .. } => "NOP",
-                CdoCommand::EndMark => "END_MARK",
-                CdoCommand::Marker { .. } => "MARKER",
-                CdoCommand::Unknown { opcode, .. } => {
+                CdoRaw::Write { .. } => "WRITE",
+                CdoRaw::MaskWrite { .. } => "MASK_WRITE",
+                CdoRaw::Write64 { .. } => "WRITE64",
+                CdoRaw::MaskWrite64 { .. } => "MASK_WRITE64",
+                CdoRaw::DmaWrite { .. } => "DMA_WRITE",
+                CdoRaw::MaskPoll { .. } => "MASK_POLL",
+                CdoRaw::MaskPoll64 { .. } => "MASK_POLL64",
+                CdoRaw::Delay { .. } => "DELAY",
+                CdoRaw::Nop { .. } => "NOP",
+                CdoRaw::EndMark => "END_MARK",
+                CdoRaw::Marker { .. } => "MARKER",
+                CdoRaw::Unknown { opcode, .. } => {
                     let key = format!("UNKNOWN(0x{:03X})", opcode);
                     *counts.entry(key).or_insert(0) += 1;
                     continue;
@@ -416,7 +416,7 @@ pub struct CdoCommandIterator<'a> {
 }
 
 impl<'a> Iterator for CdoCommandIterator<'a> {
-    type Item = CdoCommand;
+    type Item = CdoRaw;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.offset + 4 > self.data.len() {
@@ -441,7 +441,7 @@ impl<'a> Iterator for CdoCommandIterator<'a> {
         let payload_len = if inline_len == 0xFF {
             if self.offset + 4 > self.data.len() {
                 self.offset = self.data.len();
-                return Some(CdoCommand::Unknown {
+                return Some(CdoRaw::Unknown {
                     opcode: (cmd_word & 0xFFFF) as u16,
                     payload: Vec::new(),
                 });
@@ -463,7 +463,7 @@ impl<'a> Iterator for CdoCommandIterator<'a> {
         if self.offset + payload_bytes > self.data.len() {
             // Truncated command - return what we can
             self.offset = self.data.len();
-            return Some(CdoCommand::Unknown {
+            return Some(CdoRaw::Unknown {
                 opcode: (cmd_word & 0xFFFF) as u16,
                 payload: Vec::new(),
             });
@@ -485,25 +485,25 @@ impl<'a> Iterator for CdoCommandIterator<'a> {
 
         // Decode command
         let cmd = match opcode {
-            CdoOpcode::EndMark => CdoCommand::EndMark,
+            CdoOpcode::EndMark => CdoRaw::EndMark,
 
-            CdoOpcode::Write if payload_len >= 2 => CdoCommand::Write {
+            CdoOpcode::Write if payload_len >= 2 => CdoRaw::Write {
                 address: payload[0],
                 value: payload[1],
             },
 
-            CdoOpcode::MaskWrite if payload_len >= 3 => CdoCommand::MaskWrite {
+            CdoOpcode::MaskWrite if payload_len >= 3 => CdoRaw::MaskWrite {
                 address: payload[0],
                 mask: payload[1],
                 value: payload[2],
             },
 
-            CdoOpcode::Write64 if payload_len >= 3 => CdoCommand::Write64 {
+            CdoOpcode::Write64 if payload_len >= 3 => CdoRaw::Write64 {
                 address: ((payload[0] as u64) << 32) | (payload[1] as u64),
                 value: payload[2],
             },
 
-            CdoOpcode::MaskWrite64 if payload_len >= 4 => CdoCommand::MaskWrite64 {
+            CdoOpcode::MaskWrite64 if payload_len >= 4 => CdoRaw::MaskWrite64 {
                 address: ((payload[0] as u64) << 32) | (payload[1] as u64),
                 mask: payload[2],
                 value: payload[3],
@@ -533,30 +533,30 @@ impl<'a> Iterator for CdoCommandIterator<'a> {
                     .iter()
                     .flat_map(|w| w.to_le_bytes())
                     .collect();
-                CdoCommand::DmaWrite { address, data }
+                CdoRaw::DmaWrite { address, data }
             }
 
-            CdoOpcode::MaskPoll if payload_len >= 3 => CdoCommand::MaskPoll {
+            CdoOpcode::MaskPoll if payload_len >= 3 => CdoRaw::MaskPoll {
                 address: payload[0],
                 mask: payload[1],
                 expected: payload[2],
             },
 
-            CdoOpcode::MaskPoll64 if payload_len >= 4 => CdoCommand::MaskPoll64 {
+            CdoOpcode::MaskPoll64 if payload_len >= 4 => CdoRaw::MaskPoll64 {
                 address: ((payload[0] as u64) << 32) | (payload[1] as u64),
                 mask: payload[2],
                 expected: payload[3],
             },
 
-            CdoOpcode::Delay if payload_len >= 1 => CdoCommand::Delay { cycles: payload[0] },
+            CdoOpcode::Delay if payload_len >= 1 => CdoRaw::Delay { cycles: payload[0] },
 
-            CdoOpcode::Nop => CdoCommand::Nop {
+            CdoOpcode::Nop => CdoRaw::Nop {
                 words: payload_len as u16,
             },
 
-            CdoOpcode::Marker if payload_len >= 1 => CdoCommand::Marker { value: payload[0] },
+            CdoOpcode::Marker if payload_len >= 1 => CdoRaw::Marker { value: payload[0] },
 
-            _ => CdoCommand::Unknown {
+            _ => CdoRaw::Unknown {
                 opcode: (cmd_word & 0xFFFF) as u16,
                 payload,
             },
@@ -644,7 +644,7 @@ mod tests {
         assert_eq!(commands.len(), 1);
 
         match &commands[0] {
-            CdoCommand::Write { address, value } => {
+            CdoRaw::Write { address, value } => {
                 assert_eq!(*address, 0x0020_0000);
                 assert_eq!(*value, 0xDEADBEEF);
             }
@@ -656,7 +656,7 @@ mod tests {
     fn test_aie_address_decode() {
         // Address for tile (1, 2) with offset 0x1234
         let addr: u32 = (1 << 25) | (2 << 20) | 0x1234;
-        let cmd = CdoCommand::Write {
+        let cmd = CdoRaw::Write {
             address: addr,
             value: 0,
         };
@@ -730,7 +730,7 @@ mod tests {
         assert_eq!(commands.len(), 2);
 
         match &commands[0] {
-            CdoCommand::DmaWrite { address, data } => {
+            CdoRaw::DmaWrite { address, data } => {
                 assert_eq!(*address, 0x0022_0000);
                 assert_eq!(data.len(), 8);
                 assert_eq!(data[0..4], [0xEF, 0xBE, 0xAD, 0xDE]); // little-endian
@@ -788,7 +788,7 @@ mod tests {
         assert_eq!(commands.len(), 1);
 
         match &commands[0] {
-            CdoCommand::DmaWrite { address, data } => {
+            CdoRaw::DmaWrite { address, data } => {
                 assert_eq!(*address, 0x0022_0000);
                 // 258 data words * 4 bytes = 1032 bytes
                 assert_eq!(data.len(), 258 * 4);
@@ -828,8 +828,8 @@ mod tests {
         let commands: Vec<_> = cdo.commands().collect();
         assert_eq!(commands.len(), 3);
 
-        assert!(matches!(commands[0], CdoCommand::Nop { words: 0 }));
-        assert!(matches!(commands[1], CdoCommand::Write { address: 0x1234, value: 0x5678 }));
-        assert!(matches!(commands[2], CdoCommand::EndMark));
+        assert!(matches!(commands[0], CdoRaw::Nop { words: 0 }));
+        assert!(matches!(commands[1], CdoRaw::Write { address: 0x1234, value: 0x5678 }));
+        assert!(matches!(commands[2], CdoRaw::EndMark));
     }
 }

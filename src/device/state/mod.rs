@@ -38,7 +38,7 @@ use super::registers::{subsystem_from_offset, tile_kind_from_row};
 use super::tile::Tile;
 use super::regdb;
 use xdna_archspec::types::{SubsystemKind, TileKind};
-use crate::parser::cdo::{Cdo, CdoCommand};
+use crate::parser::cdo::{Cdo, CdoRaw};
 
 /// Statistics about CDO application.
 #[derive(Debug, Default)]

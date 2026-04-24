@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use xdna_emu::parser::{Xclbin, AiePartition, Cdo, AieElf};
 use xdna_emu::parser::xclbin::SectionKind;
-use xdna_emu::parser::cdo::{find_cdo_offset, CdoCommand};
+use xdna_emu::parser::cdo::{find_cdo_offset, CdoRaw};
 use xdna_emu::device::{TileAddress, RegisterInfo, DeviceState};
 use xdna_emu::device::registers::{subsystem_from_offset, tile_kind_from_row};
 use xdna_archspec::types::SubsystemKind;
@@ -176,7 +176,7 @@ fn main() -> anyhow::Result<()> {
                                     println!();
                                     println!("DMA_WRITE commands:");
                                     for (j, cmd) in cdo.commands().enumerate() {
-                                        if let CdoCommand::DmaWrite { address, data } = &cmd {
+                                        if let CdoRaw::DmaWrite { address, data } = &cmd {
                                             let addr = TileAddress::decode(*address);
                                             let subsystem = subsystem_from_offset(addr.offset, tile_kind_from_row(addr.row));
                                             println!("  [{:2}] tile({},{}) offset=0x{:05X} {} {} bytes",
@@ -282,7 +282,7 @@ fn print_register_analysis(cdo: &Cdo) {
 }
 
 /// Print a single CDO command with register decode
-fn print_command(idx: usize, cmd: &CdoCommand) {
+fn print_command(idx: usize, cmd: &CdoRaw) {
     if let Some((col, row, offset)) = cmd.decode_aie_address() {
         let tile = TileAddress { col, row, offset };
         let reg_info = RegisterInfo::lookup_aie2(offset);
@@ -298,15 +298,15 @@ fn print_command(idx: usize, cmd: &CdoCommand) {
 
         // Format based on command type
         match cmd {
-            CdoCommand::Write { value, .. } => {
+            CdoRaw::Write { value, .. } => {
                 println!("  [{:2}] WRITE     tile({},{}) {} = 0x{:08X}",
                     idx, col, row, reg_name, value);
             }
-            CdoCommand::MaskWrite { mask, value, .. } => {
+            CdoRaw::MaskWrite { mask, value, .. } => {
                 println!("  [{:2}] MASKWRITE tile({},{}) {} mask=0x{:X} val=0x{:X}",
                     idx, col, row, reg_name, mask, value);
             }
-            CdoCommand::DmaWrite { data, .. } => {
+            CdoRaw::DmaWrite { data, .. } => {
                 println!("  [{:2}] DMAWRITE  tile({},{}) {} {} bytes",
                     idx, col, row, reg_name, data.len());
             }
@@ -317,7 +317,7 @@ fn print_command(idx: usize, cmd: &CdoCommand) {
     } else {
         // Non-addressed commands (NOP, etc.)
         match cmd {
-            CdoCommand::Nop { words } => {
+            CdoRaw::Nop { words } => {
                 if *words > 0 {
                     println!("  [{:2}] NOP ({} words)", idx, words);
                 } else {
