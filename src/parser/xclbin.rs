@@ -15,9 +15,11 @@
 //! ```
 
 use std::path::Path;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result};
 use memmap2::Mmap;
 use zerocopy::{FromBytes, Immutable, KnownLayout};
+
+use super::error::ParseError;
 
 /// Magic bytes for XCLBIN format: "xclbin2\0"
 pub const XCLBIN_MAGIC: [u8; 8] = *b"xclbin2\0";
@@ -209,29 +211,47 @@ impl Xclbin {
         // Need at least magic + signature_length + reserved + keyblock + unique_id + header
         const MIN_SIZE: usize = 8 + 4 + 28 + 256 + 8 + 152;
         if data_len < MIN_SIZE {
-            bail!("File too small: {} bytes (minimum {})", data_len, MIN_SIZE);
+            return Err(ParseError::Truncated {
+                offset: 0,
+                expected_bytes: MIN_SIZE - data_len,
+                available: data_len,
+                context: "XCLBIN header",
+            }
+            .into());
         }
 
         let data_slice = &mmap[..];
 
         // Validate magic
         if data_slice[0..8] != XCLBIN_MAGIC {
-            bail!(
-                "Invalid magic: expected {:?}, got {:?}",
-                XCLBIN_MAGIC,
-                &data_slice[0..8]
-            );
+            return Err(ParseError::BadMagic {
+                offset: 0,
+                expected: format!("{:?}", XCLBIN_MAGIC),
+                got: format!("{:?}", &data_slice[0..8]),
+                hex_context: ParseError::hex_window(data_slice, 0, 16),
+            }
+            .into());
         }
 
         // Parse header (starts at offset 0x130 = 304)
         const HEADER_OFFSET: usize = 0x130;
         let (header, _) = RawHeader::read_from_prefix(&data_slice[HEADER_OFFSET..])
-            .map_err(|e| anyhow!("Failed to parse header: {:?}", e))?;
+            .map_err(|e| ParseError::External {
+                offset: HEADER_OFFSET,
+                context: "XCLBIN header",
+                message: format!("{:?}", e),
+            })?;
 
         // Validate section count
         let num_sections = header.num_sections as usize;
         if num_sections > 0x10000 {
-            bail!("Invalid section count: {}", num_sections);
+            return Err(ParseError::InvalidValue {
+                offset: HEADER_OFFSET,
+                field: "section count",
+                value: num_sections as u64,
+                reason: "exceeds sanity limit of 0x10000",
+            }
+            .into());
         }
 
         // Parse section headers (start at offset 0x1C8 = 456)
@@ -241,11 +261,21 @@ impl Xclbin {
         for i in 0..num_sections {
             let offset = SECTIONS_OFFSET + i * 40;
             if offset + 40 > data_len {
-                bail!("Section header {} extends past end of file", i);
+                return Err(ParseError::Truncated {
+                    offset,
+                    expected_bytes: (offset + 40) - data_len,
+                    available: data_len.saturating_sub(offset),
+                    context: "XCLBIN section header",
+                }
+                .into());
             }
 
             let (section, _) = RawSectionHeader::read_from_prefix(&data_slice[offset..])
-                .map_err(|e| anyhow!("Failed to parse section header {}: {:?}", i, e))?;
+                .map_err(|e| ParseError::External {
+                    offset,
+                    context: "XCLBIN section header",
+                    message: format!("{:?}", e),
+                })?;
 
             section_headers.push(section);
         }
