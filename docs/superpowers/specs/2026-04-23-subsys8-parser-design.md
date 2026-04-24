@@ -268,81 +268,75 @@ The refined proposal below replaces the starting hypothesis (see Subsystem 8 aud
 // DeviceOp: arch-generic, device-facing operation vocabulary.
 // Produced by cdo::semantics::lower(); consumed by device::state::apply().
 //
-// Design rules (from spec §"`DeviceOp` vocabulary"):
-// 1. Device-facing, not CDO-facing (two CDO opcodes can produce the same op).
-// 2. Arch-generic (TileAddr, BdFields, StreamRouteSpec via archspec).
-// 3. Mixed granularity (RegWrite is the escape hatch).
-// 4. Value-typed (Copy where possible; SmallVec for burst data only).
-// 5. Audit-refined variant list (this block supersedes the starting hypothesis).
+// Design rules (see below the enum):
 
 use xdna_archspec::types::TileAddr;
-use xdna_archspec::aie2::dma::BdFields;
-use xdna_archspec::aie2::stream_switch::StreamRouteSpec;
 use xdna_archspec::aie2::dma::{DmaChannelId, DmaDir};
 use smallvec::SmallVec;
 
 #[derive(Debug, Clone)]
 pub enum DeviceOp {
-    // --- Register-level writes (dominant CDO outcomes, ~75% of commands) ---
+    // --- Register-level writes (escape hatch; ~75% of CDO commands) ---
 
     /// Single 32-bit register write.
-    /// Produced by: CdoRaw::Write, CdoRaw::Write64 (after 64->32 truncation).
+    /// Produced by: CdoRaw::Write.
     RegWrite { tile: TileAddr, offset: u32, value: u32 },
 
+    /// 64-bit register-pair write (atomic low/high halves preserved).
+    /// Produced by: CdoRaw::Write64. Distinct variant (rather than
+    /// truncating to u32) because CDO Write64 writes register pairs
+    /// atomically; collapsing to RegWrite would silently drop the
+    /// high half.
+    RegWrite64 { tile: TileAddr, offset: u32, value: u64 },
+
     /// Masked register write: *reg = (*reg & !mask) | (value & mask).
-    /// Produced by: CdoRaw::MaskWrite, CdoRaw::MaskWrite64.
+    /// Produced by: CdoRaw::MaskWrite.
     RegMask { tile: TileAddr, offset: u32, mask: u32, value: u32 },
 
+    /// 64-bit masked register-pair write.
+    /// Produced by: CdoRaw::MaskWrite64. Same preservation reasoning
+    /// as RegWrite64.
+    RegMask64 { tile: TileAddr, offset: u32, mask: u64, value: u64 },
+
     /// Bulk write: consecutive words starting at offset.
-    /// Produced by: CdoRaw::DmaWrite (program/data memory loads).
-    /// Uses SmallVec to avoid heap allocation for small payloads (<= 8 words).
-    RegBurst { tile: TileAddr, offset: u32, words: SmallVec<[u32; 8]> },
+    /// Produced by: CdoRaw::DmaWrite (program/data memory loads, BD
+    /// configuration sequences, stream-switch config sequences, lock
+    /// init sequences, etc.). Inline SmallVec capacity 64 = 256 bytes;
+    /// sized generously to cover typical NPU burst patterns without
+    /// heap allocation. Spills to heap for larger bursts.
+    RegBurst { tile: TileAddr, offset: u32, words: SmallVec<[u32; 64]> },
 
-    // --- Structured writes (archspec already names these) ---
-
-    /// Configure a DMA Buffer Descriptor.
-    /// Produced by: CdoRaw::Write to DMA BD register range (semantics::lower
-    /// recognizes the offset range and calls arch.dma_model().parse_bd_words()).
-    BdConfigure { tile: TileAddr, bd_id: u8, fields: BdFields },
-
-    /// Initialize a lock to a specific value.
-    /// Produced by: CdoRaw::Write to lock register range.
-    LockInit { tile: TileAddr, lock_id: u8, value: i32 },
-
-    /// Configure a stream switch connection.
-    /// Produced by: CdoRaw::Write to stream switch register range.
-    StreamRoute { tile: TileAddr, route: StreamRouteSpec },
-
-    // --- Coarse control ---
+    // --- Coarse control (local single-register promotions) ---
+    //
+    // Both variants below are "local promotions": a single CdoRaw::Write
+    // to a well-known offset is promoted directly to a structured op
+    // without needing sequence-recognition state.
 
     /// Enable or disable a compute core.
     /// Produced by: CdoRaw::Write or CdoRaw::MaskWrite to Core_Control register.
     CoreEnable { tile: TileAddr, enabled: bool },
 
     /// Start a DMA channel.
-    /// Produced by: CdoRaw::Write to DMA channel start register.
+    /// Produced by: CdoRaw::Write to DMA channel control register.
     DmaStart { tile: TileAddr, channel: DmaChannelId, dir: DmaDir },
 
-    // --- Synchronization / timing (audit-discovered; not in starting hypothesis) ---
+    // --- Synchronization / timing (no-op in emulator today) ---
 
     /// Poll a register until (value & mask) == expected.
-    /// On real hardware: blocks until the condition is met (DMA completion, etc.).
+    /// On real hardware: blocks until the condition is met (DMA completion etc).
     /// In the emulator: currently a logged no-op (writes are synchronous).
-    /// Retaining as a variant preserves the information for future cycle-accurate work.
+    /// Retained to preserve information for future cycle-accurate work.
     /// Produced by: CdoRaw::MaskPoll, CdoRaw::MaskPoll64.
-    /// Copy-able: all fields are primitive.
     MaskPoll { tile: TileAddr, offset: u32, mask: u32, expected: u32 },
 
     /// Timing delay for N cycles.
     /// On real hardware: inserts a wait. In the emulator: no-op.
     /// Produced by: CdoRaw::Delay.
-    /// Copy-able.
     Delay { cycles: u32 },
 
     /// Debug sequence marker (value is an opaque tag).
     /// Always a no-op in device-state; useful for trace and test tooling.
     /// Produced by: CdoRaw::Marker.
-    /// Copy-able.
     Marker { value: u32 },
 }
 ```
@@ -352,25 +346,32 @@ pub enum DeviceOp {
 1. **Device-facing, not CDO-facing.** Two CDO variants that produce
    the same device effect lower to the same `DeviceOp`. The vocabulary
    describes what happens, not how it was encoded.
-2. **Arch-generic.** `TileAddr`, `BdFields`, `StreamRouteSpec`
-   resolve through archspec. New variants appear only if the device
-   does something new, not because the CDO encoded it differently.
-3. **Mixed granularity, intentionally.** `RegWrite` is the escape
-   hatch for CDO commands whose semantics we don't want to promote
-   to a structured op. Structured variants exist where archspec
-   already knows the semantics. This avoids a "can't represent the
-   thing that came in" scenario.
-4. **Value-typed.** `RegWrite` / `RegMask` / `CoreEnable` / etc. are
-   `Copy`. `RegBurst` uses `SmallVec<[u32; 8]>` -- inline up to 8
-   words (fits the common case), spills to heap beyond. No `Arc`,
-   `Rc`, or `Box` in the vocabulary.
-5. **Audit refines the variant list.** The list above is the
-   starting hypothesis. 8a's CDO-semantics audit counts which
-   `CdoRaw` variants appear in the XCLBINs on disk, groups them by
-   device effect, and proposes the concrete `DeviceOp` enum. If the
-   audit finds 95% of CDO commands are plain writes with a handful
-   of structured outliers, the enum stays thin. If the audit finds
-   a zoo, the enum grows.
+2. **Arch-generic.** `TileAddr` resolves through archspec. New variants
+   appear only if the device does something new, not because the CDO
+   encoded it differently.
+3. **Escape hatch + local-promotion only.** `RegWrite`/`RegWrite64`/
+   `RegMask`/`RegMask64`/`RegBurst` are the escape hatch that absorbs
+   every raw-write command. Structured variants (`CoreEnable`,
+   `DmaStart`) exist ONLY where the promotion is a local decision (one
+   CdoRaw::Write to a recognized offset -> structured op, no state
+   needed). **We deliberately do not promote sequence-assembled
+   structures (BDs, locks, stream routes) at parse time.** Hardware
+   programs those through sequences of register writes and reassembles
+   them on a trigger-register write; the emulator's `device/state`
+   layer does the same reassembly. Keeping the hardware pattern in the
+   apply layer rather than in the parser keeps `semantics::lower`
+   stateless and matches silicon behavior.
+4. **Value-typed.** `RegWrite` / `RegWrite64` / `RegMask` / `RegMask64` /
+   `CoreEnable` / `DmaStart` / `MaskPoll` / `Delay` / `Marker` are all
+   individually `Copy`-able. `RegBurst` uses `SmallVec<[u32; 64]>`
+   for inline storage. The enum as a whole is `Clone` (not `Copy`)
+   because of `RegBurst`; `apply` takes `&DeviceOp` so this is fine.
+   No `Arc`, `Rc`, or `Box` in the vocabulary.
+5. **No state-in-lower.** `cdo::semantics::lower` is a stateless
+   per-command function. It does not buffer writes, does not read
+   device state, and does not track in-progress reassembly. This
+   preserves testability (pure `CdoRaw` -> `Vec<DeviceOp>` mapping)
+   and matches hardware's write-then-trigger-reassemble pattern.
 
 ### Lowering function
 
@@ -380,14 +381,22 @@ pub fn lower(raw: &CdoRaw, arch: &ArchHandle)
     -> SmallVec<[DeviceOp; 4]>
 {
     match raw {
-        CdoRaw::Write32 { addr, value } => {
+        CdoRaw::Write { addr, value } => {
             let (tile, offset) = arch.memory_map().decode_global(*addr);
+            // Optional local promotion: if `offset` is Core_Control or a
+            // DMA channel start, emit CoreEnable / DmaStart instead of
+            // RegWrite. Falls through to RegWrite otherwise.
             smallvec![DeviceOp::RegWrite { tile, offset, value: *value }]
         }
-        CdoRaw::DmaBdConfig { tile, bd_id, words } => {
-            let fields = arch.dma_model().parse_bd_words(words);
-            smallvec![DeviceOp::BdConfigure {
-                tile: *tile, bd_id: *bd_id, fields
+        CdoRaw::Write64 { addr, value } => {
+            let (tile, offset) = arch.memory_map().decode_global(*addr);
+            smallvec![DeviceOp::RegWrite64 { tile, offset, value: *value }]
+        }
+        CdoRaw::DmaWrite { addr, data } => {
+            let (tile, offset) = arch.memory_map().decode_global(*addr);
+            smallvec![DeviceOp::RegBurst {
+                tile, offset,
+                words: data.iter().copied().collect(),
             }]
         }
         // ... remaining variants
@@ -397,8 +406,7 @@ pub fn lower(raw: &CdoRaw, arch: &ArchHandle)
 
 Plain free function, not a trait method. Inline-friendly. All arch
 dispatch happens through the existing archspec accessors
-(`memory_map`, `dma_model`, etc.); `lower` adds no new arch-dispatch
-surface.
+(`memory_map`); `lower` adds no new arch-dispatch surface.
 
 ## End-to-end data flow
 

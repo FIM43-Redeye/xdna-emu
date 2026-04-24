@@ -539,10 +539,25 @@ archspec output is the small `xdna_archspec::elf` module containing `EM_AIE` and
 
 ### Refined `DeviceOp` enum proposal
 
-The spec's starting hypothesis had 8 variants. The audit adds 3 (MaskPoll, Delay, Marker)
-and collapses 2 (Write64/MaskWrite64 fold into RegWrite/RegMask). Nop and EndMark are
-discarded (produce no `DeviceOp`). Net result: **9 variants** (starting hypothesis was 8;
-net +1 from audit-discovered real-XCLBIN variants).
+**User gate confirmed 2026-04-24.** Three decisions from the user review reshape the
+audit's initial proposal into the final 10-variant enum below:
+
+1. **Add `RegWrite64` + `RegMask64`** (splitting the Write64/MaskWrite64 absorption). CDO
+   Write64 writes register pairs atomically; truncating to u32 would silently drop the high
+   half. Distinct variants preserve information.
+2. **Drop `BdConfigure` / `LockInit` / `StreamRoute`.** Parse-time promotion of these would
+   require `semantics::lower` to gain state or read access to device state, neither of
+   which fit the "stateless per-command lowering" principle. Real hardware programs BDs /
+   locks / stream switches through sequences of register writes and reassembles them on a
+   trigger-register write; the emulator's `device/state` layer does the same reassembly.
+   Keeping the hardware pattern in the apply layer is cleaner and matches silicon.
+3. **Bump `RegBurst` inline capacity 8 -> 64.** User framing: "as large as the NPU would
+   conceivably ever need it to be; memory is cheap." Covers typical NPU burst patterns
+   without heap allocation; spills to heap for outliers.
+
+Starting hypothesis had 8 variants. Audit added 3 (MaskPoll, Delay, Marker). User gate
+added 2 (RegWrite64, RegMask64) and dropped 3 (BdConfigure, LockInit, StreamRoute). Final
+result: **10 variants**.
 
 ```rust
 // src/device/ops.rs -- new module (Stage 8b Half 2)
@@ -550,108 +565,99 @@ net +1 from audit-discovered real-XCLBIN variants).
 // DeviceOp: arch-generic, device-facing operation vocabulary.
 // Produced by cdo::semantics::lower(); consumed by device::state::apply().
 //
-// Design rules (from spec §"`DeviceOp` vocabulary"):
-// 1. Device-facing, not CDO-facing (two CDO opcodes can produce the same op).
-// 2. Arch-generic (TileAddr, BdFields, StreamRouteSpec via archspec).
-// 3. Mixed granularity (RegWrite is the escape hatch).
-// 4. Value-typed (Copy where possible; SmallVec for burst data only).
-// 5. Audit-refined variant list (this block supersedes the starting hypothesis).
+// Design rules (see spec §"`DeviceOp` vocabulary" > §"Design rules").
 
 use xdna_archspec::types::TileAddr;
-use xdna_archspec::aie2::dma::BdFields;
-use xdna_archspec::aie2::stream_switch::StreamRouteSpec;
 use xdna_archspec::aie2::dma::{DmaChannelId, DmaDir};
 use smallvec::SmallVec;
 
 #[derive(Debug, Clone)]
 pub enum DeviceOp {
-    // --- Register-level writes (dominant CDO outcomes, ~75% of commands) ---
+    // --- Register-level writes (escape hatch; ~75% of CDO commands) ---
 
     /// Single 32-bit register write.
-    /// Produced by: CdoRaw::Write, CdoRaw::Write64 (after 64->32 truncation).
+    /// Produced by: CdoRaw::Write.
     RegWrite { tile: TileAddr, offset: u32, value: u32 },
 
+    /// 64-bit register-pair write (atomic low/high halves preserved).
+    /// Produced by: CdoRaw::Write64. Distinct variant (rather than
+    /// truncating to u32) because CDO Write64 writes register pairs
+    /// atomically; collapsing to RegWrite would silently drop the
+    /// high half.
+    RegWrite64 { tile: TileAddr, offset: u32, value: u64 },
+
     /// Masked register write: *reg = (*reg & !mask) | (value & mask).
-    /// Produced by: CdoRaw::MaskWrite, CdoRaw::MaskWrite64.
+    /// Produced by: CdoRaw::MaskWrite.
     RegMask { tile: TileAddr, offset: u32, mask: u32, value: u32 },
 
+    /// 64-bit masked register-pair write.
+    /// Produced by: CdoRaw::MaskWrite64. Same preservation reasoning
+    /// as RegWrite64.
+    RegMask64 { tile: TileAddr, offset: u32, mask: u64, value: u64 },
+
     /// Bulk write: consecutive words starting at offset.
-    /// Produced by: CdoRaw::DmaWrite (program/data memory loads).
-    /// Uses SmallVec to avoid heap allocation for small payloads (<= 8 words).
-    RegBurst { tile: TileAddr, offset: u32, words: SmallVec<[u32; 8]> },
+    /// Produced by: CdoRaw::DmaWrite (program/data memory loads, BD
+    /// configuration sequences, stream-switch config sequences, lock
+    /// init sequences, etc.). Inline SmallVec capacity 64 = 256 bytes;
+    /// sized generously to cover typical NPU burst patterns without
+    /// heap allocation. Spills to heap for larger bursts.
+    RegBurst { tile: TileAddr, offset: u32, words: SmallVec<[u32; 64]> },
 
-    // --- Structured writes (archspec already names these) ---
-
-    /// Configure a DMA Buffer Descriptor.
-    /// Produced by: CdoRaw::Write to DMA BD register range (semantics::lower
-    /// recognizes the offset range and calls arch.dma_model().parse_bd_words()).
-    BdConfigure { tile: TileAddr, bd_id: u8, fields: BdFields },
-
-    /// Initialize a lock to a specific value.
-    /// Produced by: CdoRaw::Write to lock register range.
-    LockInit { tile: TileAddr, lock_id: u8, value: i32 },
-
-    /// Configure a stream switch connection.
-    /// Produced by: CdoRaw::Write to stream switch register range.
-    StreamRoute { tile: TileAddr, route: StreamRouteSpec },
-
-    // --- Coarse control ---
+    // --- Coarse control (local single-register promotions) ---
 
     /// Enable or disable a compute core.
     /// Produced by: CdoRaw::Write or CdoRaw::MaskWrite to Core_Control register.
     CoreEnable { tile: TileAddr, enabled: bool },
 
     /// Start a DMA channel.
-    /// Produced by: CdoRaw::Write to DMA channel start register.
+    /// Produced by: CdoRaw::Write to DMA channel control register.
     DmaStart { tile: TileAddr, channel: DmaChannelId, dir: DmaDir },
 
-    // --- Synchronization / timing (audit-discovered; not in starting hypothesis) ---
+    // --- Synchronization / timing (no-op in emulator today) ---
 
     /// Poll a register until (value & mask) == expected.
-    /// On real hardware: blocks until the condition is met (DMA completion, etc.).
+    /// On real hardware: blocks until the condition is met (DMA completion etc).
     /// In the emulator: currently a logged no-op (writes are synchronous).
-    /// Retaining as a variant preserves the information for future cycle-accurate work.
+    /// Retained to preserve information for future cycle-accurate work.
     /// Produced by: CdoRaw::MaskPoll, CdoRaw::MaskPoll64.
-    /// Copy-able: all fields are primitive.
     MaskPoll { tile: TileAddr, offset: u32, mask: u32, expected: u32 },
 
     /// Timing delay for N cycles.
     /// On real hardware: inserts a wait. In the emulator: no-op.
     /// Produced by: CdoRaw::Delay.
-    /// Copy-able.
     Delay { cycles: u32 },
 
     /// Debug sequence marker (value is an opaque tag).
     /// Always a no-op in device-state; useful for trace and test tooling.
     /// Produced by: CdoRaw::Marker.
-    /// Copy-able.
     Marker { value: u32 },
 }
 ```
 
-**Variant justification vs. fold-into-catch-all:**
+**Variant justification:**
 
-- `MaskPoll`: standalone because it has distinct semantics (conditional wait) and distinct
-  payload shape (mask + expected) that don't fit `RegWrite`. The emulator currently ignores
-  it, but retaining it costs one Copy-capable enum variant and preserves the option for
-  cycle-accurate DMA ordering. Justified.
-- `Delay`: standalone for the same reason -- timing-only, architecturally meaningful,
-  trivially cheap as a Copy variant. The alternative (fold into a catch-all `Nop`) would
-  lose the cycle-count information. Justified.
-- `Marker`: standalone because it is a common CDO primitive used by AMD tooling to annotate
-  configuration sequence boundaries. Trace tooling may want to observe it. One Copy variant
-  with a single `u32` field. Justified.
-- `Nop`/`EndMark`: **not in the refined enum.** These produce no `DeviceOp`; `semantics::lower`
-  drops them (returns an empty iterator for EndMark; increments stats but emits nothing for
-  Nop). This is cleaner than a `Nop` DeviceOp that `apply` must match and discard.
-- `BdConfigure`/`LockInit`/`StreamRoute`/`CoreEnable`/`DmaStart`: **retained from starting
-  hypothesis.** These require archspec-assisted interpretation of the target register offset
-  (semantics::lower recognizes the offset range and promotes a plain RegWrite into one of
-  these structured ops). The audit confirms they appear in real XCLBINs.
-
-**THIS IS THE USER-GATED DELIVERABLE.** Stage 8b Half 2 does not start until the user
-reviews this enum and confirms. If the user wants to reshape any variant (e.g., collapse
-`BdConfigure` back into `RegBurst` to defer BD field parsing), that is the time to say so.
+- `RegWrite64` / `RegMask64`: standalone to preserve the 64-bit payload. Truncation was
+  unsafe; apply-side can choose to truncate-with-warning when a 32-bit register is
+  targeted, keeping the decision explicit rather than silent at parse time.
+- `RegBurst` with capacity 64: user-specified inline size for "as large as the NPU would
+  conceivably ever need." Enum instance size ~272 bytes; `apply` takes `&DeviceOp`, so
+  the size only matters at creation, which is stream-processed.
+- `CoreEnable` / `DmaStart`: retained as local single-register promotions. Both are
+  single writes to well-known offsets; promotion is stateless and zero-cost. Unlike the
+  dropped `BdConfigure` / `LockInit` / `StreamRoute`, these don't require sequence
+  recognition.
+- `MaskPoll`, `Delay`, `Marker`: standalone -- each has a distinct shape (MaskPoll has
+  mask + expected; Delay has a cycle count; Marker has an opaque tag). All Copy, all
+  cheap, all preserve information for future work.
+- `Nop` / `EndMark`: not in the refined enum. `semantics::lower` drops them (empty
+  iterator for EndMark; no output for Nop). Cleaner than a no-op DeviceOp variant that
+  apply must match and discard.
+- `BdConfigure` / `LockInit` / `StreamRoute`: **dropped per user gate.** Hardware programs
+  these through sequences of register writes and reassembles on the trigger-register
+  write. The emulator's `device/state` layer does the same reassembly via its existing
+  register-write dispatch. Parse-time promotion would require either state in `lower` or
+  read-access to device state, both of which violate the stateless-lowering principle.
+  Keeping the hardware pattern in apply is the correct architectural choice.
 
 ### AIE1 projection (one paragraph)
 
