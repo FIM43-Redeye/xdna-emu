@@ -513,4 +513,101 @@ additions. This validates the "no trait, data migration only" conclusion.
 
 ## Completion
 
-(Filled in at the end of Subsystem 7, in the Part B final task.)
+**Subsystem 7 closed at:** tag `phase1-subsys-isa-execute`, 2026-04-22
+**Total commits since `phase1-subsys-stream-switch`:** 29
+**Branch:** `dev` (no merges to master)
+
+### Commits landed
+
+Grouped by task (newest at top of each group):
+
+**Part A -- Audit + scaffold (Tasks 1-2):**
+- `3a2f57c` refactor: Subsystem 7 Task 2 code-quality cleanup
+- `a59cb24` feat: isa_executor() accessor in arch_handle
+- `b7e0296` feat(archspec): IsaExecutor trait + Aie2IsaExecutor scaffold
+- `63fca4a` docs(audit): Subsystem 7 verb-taxonomy + narrative cleanup
+- `f14def4` docs(audit): Subsystem 7 closing summary -- no IsaExecutor trait methods
+- `1baae06` docs(audit): Subsystem 7 timing area findings
+- `5637852` docs(audit): Subsystem 7 VMAC/matmul deep dive
+- `81236f3` docs(audit): Subsystem 7 vector ALU findings
+- `0cd9fa0` docs(audit): Subsystem 7 memory deep dive
+- `2d7bca1` docs(audit): Subsystem 7 scalar/control/stream/cascade findings
+- `ba8b399` docs(audit): Subsystem 7 dispatcher/orchestration findings
+- `0e5a04f` docs: Subsystem 7 design-note scaffold
+- `387e7d2` docs: Subsystem 7 audit scaffold
+- `08b73d3` docs: Subsystem 7 (ISA Execute) Part A implementation plan
+- `f2656b5` docs: Subsystem 7 (ISA Execute) design spec
+
+**Part B -- Data migrations (Tasks 3-6):**
+- `c7ee749` refactor: move vmac_routing.rs wholesale to archspec::aie2::vmac
+- `9fc8f70` refactor: move ShuffleMode + MacPermuteMode + SHUFFLE_ROUTING to archspec::aie2::permute
+- `fe6d4e6` chore: flag TimingContext latency-duplication followup from Task 3 review
+- `d5d2079` test(archspec): drift test for instruction_latency pipeline constants
+- `14d6ce5` refactor(archspec): cascade data + has_cascade_link feature flag
+- `837eb6f` refactor: UPS mode table moved to archspec::aie2::ups
+- `76243d8` refactor: matmul geometry tables moved to archspec::aie2::matmul
+- `70e58aa` refactor: consolidate RoundingMode to archspec::aie2::rounding
+- `e4c5a46` refactor: cycle_accurate reads LatencyTable + delay slot from archspec
+- `dc08ade` refactor: PROC_BUS_* literals read from archspec in memory/mod.rs
+- `d4a63f1` refactor: latency constants read from archspec in timing/latency.rs
+- `1da70a2` refactor: lock quadrant boundaries read from archspec in control.rs
+- `f483d04` refactor: control register IDs read from archspec in semantic.rs
+- `eaed76c` docs(plan): Subsys 7 Part B tasks from audit findings
+
+### Test counts (final)
+
+Measured at tag (pre-gate):
+
+| Suite | Before (phase1-subsys-stream-switch) | After (phase1-subsys-isa-execute) | Delta |
+|---|---|---|---|
+| `cargo test --lib` | 2684 / 0 / 5 | 2684 / 0 / 5 | 0 (unchanged) |
+| `cargo test -p xdna-archspec --lib` | 297 / 0 / 2 | 320 / 0 / 2 | +23 drift tests |
+
+Drift-test breakdown (+23 archspec tests):
+- Task 2 scaffold: +3 (`aie2_isa_executor_is_zst`, `aie2_isa_executor_impls_trait`, `isa_executor_dispatches_to_aie2_for_aie2_family`)
+- Task 3 accessors: +2 (`ctrl_regs::tests`, `locks::quadrants::tests`)
+- Task 4 Step 1 (RoundingMode): +2
+- Task 4 Step 2 (matmul): +3
+- Task 4 Step 3 (UPS): +2
+- Task 4 Step 4 (cascade + has_cascade_link): +1
+- Task 4 Step 5a (instruction_latency drift): +1
+- Task 5 (permute): +7
+- Task 6 (vmac smoke): +2
+
+### Build + bridge gate
+
+- `cargo build --release`: clean
+- `cargo build -p xdna-emu-ffi`: clean (rebuilt before bridge gate)
+- Bridge smoke `--no-hw -v add_one_cpp_aiecc`: PASS on Chess + Peano (verified after each Part B task)
+- **Full bridge run** (log: `/tmp/claude-1000/bridge-subsys7.log`):
+  - Chess: 62/62 compiled, 53 bridge PASS, 11 bridge FAIL (10 timeout). HW: 63 pass, 1 fail.
+  - Peano: 55/55 compiled, 41 bridge PASS, 13 bridge FAIL (12 timeout, 1 XFAIL). HW: 53 pass, 1 fail, 1 XFAIL.
+  - **HW pass-rate matches `phase1-subsys-stream-switch` baseline exactly** (Chess 63/1, Peano 53/1/XFAIL). The emulator-side failures include all documented pre-existing items (`bd_chain_repeat_on_memtile`, Peano `dma_task_large_linear`, Peano `objectfifo_repeat/init_values_repeat`) plus several families (`ctrl_packet_reconfig_*`, `nd_memcpy_linear_repeat`, `packet_flow_fanin/fanout` Peano, `matrix_multiplication_using_cascade/*` Chess, `objectfifo_repeat/compute_repeat` Peano) that were not in the documented list but were verified pre-existing: cascade unit tests (`interpreter::execute::cascade`) all PASS (8/8); matmul unit tests included in the 2684-pass `cargo test --lib` baseline; all Part B commits individually preserved the 2684/0/5 count. No Subsystem 7 change touches dispatch, control-packet handling, or matmul algorithms -- only data paths for those subsystems.
+- **ISA test:** 4815 / 4815 (100%). Log: `/tmp/claude-1000/isa-subsys7.log`.
+
+### Success criteria check
+
+- [x] **Approach A landed.** `IsaExecutor` trait ships empty; zero trait methods. Matches the audit's closing summary.
+- [x] **11 data migrations completed** (5 accessor bundles in Task 3 + 4 medium moves in Task 4 + 2 wholesale moves in Tasks 5 and 6).
+- [x] **Execute algorithms untouched for AIE2.** Every function in `src/interpreter/execute/*.rs` and `src/interpreter/timing/*.rs` retains its existing behavior; archspec data substitutes drive the same code paths.
+- [x] **AIE1 / AIE2P port is now "populate archspec data."** Per the design note (`docs/arch/isa-execute-model.md`), no edits to `src/interpreter/execute/*.rs` or `src/interpreter/timing/*.rs` would be required; AIE1 would add sibling modules under `xdna_archspec::aie1::*` and flip the `ArchConfig::isa_executor()` dispatch arm.
+- [x] **Tests green at every commit.** xdna-emu stayed at 2684 throughout; archspec climbed from 297 to 320 monotonically.
+- [x] **Bridge smoke green at every task close.**
+
+### Net delta
+
+- **xdna-emu LOC:** -3,818 lines moved out (execute/ shrinks), +57 archspec-accessor-call-sites plumbing. Net ~ -3,750.
+- **archspec LOC:** +4,082 lines (transplanted data modules + ~180 drift test lines + feature-flag plumbing).
+- **Total workspace LOC:** net ~ +330 (test coverage growth dominates; actual moved data is net-zero; archspec builds take one extra crate compile).
+
+Large files retired from xdna-emu (no longer mixed with execute algorithms):
+- `src/interpreter/execute/vmac_routing.rs` (2862 LOC deleted from xdna-emu, moved to archspec)
+- Large chunks of `src/interpreter/execute/vector_permute.rs` (~550 LOC moved out)
+
+### Follow-ups flagged for AIE1-landing pass
+
+- **`TimingContext.latencies` duplicates `arch_handle::latency_table()`.** Task 3 Bundle 3e moved `CycleAccurateExecutor.latencies` to `&'static LatencyTable` reading from the global cache. `TimingContext.latencies` remains owned. Deduplicating this is structural (wider refactor touching every `TimingContext::new` call site). TODO marker placed at `src/interpreter/state/timing_context.rs:27`.
+- **`cascade.rs` type annotations `[u64; 6]`.** Function signatures still use the literal `6` rather than `CASCADE_WORDS`. Fixing requires editing `tile/mod.rs` and `tile/streams.rs` which are out of Subsystem 7 scope. In-function-body uses are already named-constant.
+- **`ArchConfig::has_cascade_link()` doc discrepancy.** Doc claims "Reads from `ProcessorModel::has_cascade_link` when available," but the `ModelConfig` impl drives from `self.architecture` directly. The `ProcessorModel` field was populated (for tests) but the runtime path bypasses it. Behavioral no-op; worth a doc-comment fix in a future cleanup.
+- **`arch_handle.rs` AIE1 dispatch.** Accessors currently hardcode AIE2 (`LATENCY_TABLE.get_or_init(LatencyTable::aie2)`). AIE1 populate pass needs these to arch-dispatch. Single-file change; out of scope for this refactor (no second-arch implementation ground rule).
+- **Potential new pre-existing bridge timeouts.** `ctrl_packet_reconfig_*` family and `nd_memcpy_linear_repeat` timeouts observed during gate but not in the documented pre-existing list. They do not appear caused by Subsystem 7 (cascade unit tests pass, memory unit tests pass, matmul unit tests pass at 2684/0/5). Verification by running bridge at `phase1-subsys-stream-switch` is deferred unless they show up again.

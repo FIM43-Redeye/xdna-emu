@@ -3,9 +3,9 @@
 Recovery document for picking up this refactor in a future session. Read
 this first, then dive into the authoritative artifacts below.
 
-**Last updated:** 2026-04-22 (Phase 1b Subsystem 5 landed; Subsystem 7 up next)
+**Last updated:** 2026-04-22 (Phase 1b Subsystem 7 landed; Subsystem 8 up next)
 **Current branch:** `dev` (no master merges until the refactor is done)
-**Latest tag:** `phase1-subsys-stream-switch` (Subsystem 5 completion)
+**Latest tag:** `phase1-subsys-isa-execute` (Subsystem 7 completion)
 
 ---
 
@@ -202,8 +202,8 @@ when we start it -- don't try to pre-write all 8 subsystem plans.
 | 3 | DMA Engine & BD Format | `phase1-subsys-dma` | **Done** | First behavioral seam. `DmaModel` trait (9 methods: 7 feature flags + `max_tensor_dims` + `timing_config`) + `Aie2DmaModel` impl. `DeviceRegLayout` family migrated to archspec; xdna-emu `Deref` wrapper retains lock-value-width fields pending Subsystem 4. 5 AIE2-only call sites gated on `supports_*()` feature flags. `(2,2)` silent fallback fixed. 7 hygiene items. Bonus: `test_full_parse_all_devices` archspec failure fixed, giving a clean baseline. See `docs/arch/dma-model.md`. |
 | 4 | Locks | `phase1-subsys-locks` | **Done** | Small seam: 3-method LockModel trait (supports_acquire_eq, supports_dynamic_value_ops, value_layout) + LockValueLayout carrier + Aie2LockModel. Migrated `sign_extend_lock_value` + lock_value_* fields from xdna-emu's DeviceRegLayout wrapper to archspec; wrapper collapsed. See docs/arch/lock-model.md. |
 | 5 | Stream Switch | `phase1-subsys-stream-switch` | **Done** | Two-method `StreamSwitchModel` trait (`supports_deterministic_merge` + `topology`) + `StreamSwitchTopology` carrier (3 `TileStreamPorts` sub-structs with `for_tile(TileKind)` accessor) + `Aie2StreamSwitchModel`. Dead-code `PortLayout` extension trait (231 LOC) deleted; 3 tests migrated to archspec. 6 tile-construction sites in `stream_switch/mod.rs` migrated through `arch_handle::stream_switch_topology()`. Direct archspec-constant consumers (`routing.rs`, `stream_io.rs`, `state/`) stay on direct access as AIE1-landing follow-ups. See `docs/arch/stream-switch-model.md`. |
-| 7 | ISA Execute | `phase1-subsys-isa-execute` | **Up next** | Semantic ops, intrinsic handlers. Biggest; largest files live here (`vmac_routing.rs` 239KB, `memory/mod.rs` 124KB). `IsaExecutor` trait. |
-| 8 | Parser (XCLBIN / PDI / ELF) | `phase1-subsys-parser` | Container format variance. `BinaryLoader` trait. |
+| 7 | ISA Execute | `phase1-subsys-isa-execute` | **Done** | Audit concluded Approach A (zero trait methods warranted): all divergence is data-expressible. `IsaExecutor` trait ships empty as a stable anchor. 11 data migrations landed across 5 tasks -- `vmac_routing.rs` (234K) + `vector_permute.rs` tables + `RoundingMode` dedup + matmul/UPS/cascade data + 5 accessor bundles. `has_cascade_link: bool` feature flag added to `ProcessorModel`. AIE1/AIE2P ports now "populate archspec; no execute/ edits." See `docs/arch/isa-execute-model.md` + `docs/arch/subsys7-audit.md`. |
+| 8 | Parser (XCLBIN / PDI / ELF) | `phase1-subsys-parser` | **Up next** | Container format variance. `BinaryLoader` trait. |
 
 **End state after Phase 1:** adding AIE2P is "implement the traits for a
 second arch"; adding AIE1/Versal is "implement the traits + extend for
@@ -211,89 +211,78 @@ platform differences." Neither requires re-plumbing.
 
 ---
 
-## How to Pick Up Subsystem 7 (ISA Execute)
+## How to Pick Up Subsystem 8 (Parser)
 
 This is the concrete next action. Start here in a fresh session.
 
 1. **Read the key artifacts:**
    - `docs/superpowers/specs/2026-04-16-device-family-refactor-design.md` (parent)
    - `docs/superpowers/plans/2026-04-16-device-family-refactor-plan.md` (parent plan)
-   - `docs/arch/subsys5-audit.md` -- Subsystem 5 completion; confirms
-     `StreamSwitchModel` trait + `StreamSwitchTopology` carrier landed
-     in archspec, `PortLayout` extension trait deleted. No loose ends
-     from Subsystems 3-5.
-   - `docs/arch/stream-switch-model.md` -- most recent behavioral-seam
-     design note; alongside `dma-model.md` and `lock-model.md`,
-     provides three worked examples of the "coarse first" trait shape
-     for a future ISA Execute seam to mimic.
-   - `docs/arch/isa-decode.md` -- Subsystem 6 (ISA Decode) design
-     note. Decode shipped with **no trait seam** -- the argument is
-     there, worth revisiting if ISA Execute's variance turns out
-     thinner than expected.
-   - `src/interpreter/` -- the current xdna-emu execution path. Start
-     with `src/interpreter/execute/mod.rs` (if that's still the entry
-     point) and the two large files flagged below.
+   - `docs/arch/subsys7-audit.md` -- Subsystem 7 completion; confirms
+     `IsaExecutor` ships as an empty trait anchor, all divergence
+     migrated as data to `xdna_archspec::aie2::{rounding, permute,
+     vmac, matmul, ups, instruction_latency}` + `ProcessorModel`
+     extensions. No loose ends.
+   - `docs/arch/isa-execute-model.md` -- design note showing the
+     "data in archspec, algorithms in xdna-emu" split and the reasons
+     each candidate trait method was rejected.
+   - `docs/arch/isa-decode.md` -- Subsystem 6 (ISA Decode) design note;
+     precedent for landing without a trait seam.
+   - `src/parser/` -- the current xdna-emu parser path. XCLBIN / PDI /
+     ELF container handling. Also check `src/parser/cdo/` for CDO
+     config parsing.
 
 2. **Verify the current state hasn't drifted:**
    ```bash
-   git log --oneline phase1-subsys-stream-switch..HEAD
+   git log --oneline phase1-subsys-isa-execute..HEAD
    ```
    If nothing has landed since the tag, you're picking up exactly where
-   Subsystem 5 left off.
+   Subsystem 7 left off.
 
    ```bash
    PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
    PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec --lib 2>&1 | tail -3
    ```
    Expect xdna-emu `2684 passed; 0 failed; 5 ignored` and archspec
-   `297 passed; 0 failed; 2 ignored`.
+   `320 passed; 0 failed; 2 ignored`.
 
-3. **Invoke brainstorming** to shape Subsystem 7's spec:
+3. **Invoke brainstorming** to shape Subsystem 8's spec:
    ```
    /brainstorming
    ```
-   Topic: "Phase 1b Subsystem 7: ISA Execute."
+   Topic: "Phase 1b Subsystem 8: Parser (XCLBIN / PDI / ELF)."
 
    **Shape the spec around these questions:**
-   - **Semantic-op divergence between AIE1 and AIE2:** does any
-     semantic op (vector / scalar / accumulator math, control flow)
-     behave differently at the bit level across arches? If the answer
-     is "almost none" then an `IsaExecutor` trait is ceremony and
-     ISA Execute should follow ISA Decode's no-trait pattern.
-     Conversely, any non-trivial divergence (rounding modes,
-     saturation, accumulator widths) gates the trait surface.
-   - **Intrinsic-handler seam:** AIE2 has 317 arch-specific
-     intrinsics; AIE1's intrinsic set is disjoint (different
-     instructions entirely, not renamed). How should intrinsic
-     dispatch be structured so adding AIE1 is "implement a separate
-     table" rather than "edit an existing table"? Candidate: per-arch
-     `IntrinsicHandler` maps in archspec, with a thin
-     `IsaExecutor::handle_intrinsic` trait method that looks one up.
-   - **The large-file split:** `vmac_routing.rs` (239KB) and
-     `memory/mod.rs` (124KB) are the biggest runtime files. Are they
-     inherently large, or are they doing multiple responsibilities
-     that could split? Subsystem 7 is the right moment to propose a
-     split if one is warranted -- but only if the variance-analysis
-     motivates it.
-   - **What lives in archspec vs what stays in xdna-emu:** ISA Decode
-     moved `MappedOperand`, `RegisterMap`, `AccumWidth` to xdna-emu's
-     interpreter and kept the disassembler bits in archspec. Execute
-     will hit similar questions -- which semantic-op implementations
-     are arch-generic vs arch-specific, and how does the runtime
-     execution loop reach them.
-   - **What would AIE1 look like?** Same question as the other seams.
-     If `Aie1IsaExecutor` is easy to describe in ~100 words, the
-     trait is right-shaped. If it's 800 words and still unclear, the
-     shape is wrong.
+   - **Container format variance.** Do XCLBIN, PDI, and ELF formats
+     themselves differ across AIE1/AIE2/AIE2P, or just the content
+     they carry? XCLBIN is a Xilinx-wide container; the AIE-specific
+     sections inside are what varies. The parser should distinguish
+     "I can read the container" (arch-generic) from "I can interpret
+     this AIE section" (arch-specific).
+   - **The `BinaryLoader` trait question.** Mirrors the `IsaExecutor`
+     question from Subsystem 7: does container parsing have
+     algorithmic *shape* divergence between arches, or just *values*?
+     Spec's prior is a trait with 2-4 methods around section dispatch;
+     audit may disprove.
+   - **CDO interpretation scope.** The CDO section inside XCLBIN
+     carries DMA configurations, routing, lock setup -- all of which
+     are arch-specific data that Subsystems 3-5 already migrated to
+     archspec. The CDO parser should read those configs through the
+     existing archspec data without arch-dispatch.
+   - **AIE1/Versal breadth.** Versal FPGAs (out-of-scope today) pair
+     AIE1 with PL fabric; their container layouts differ from XDNA's
+     XCLBIN. Does the parser abstraction need to accommodate this,
+     or is "Versal is out of scope" a fine excuse to skip?
 
 4. **Invoke writing-plans** to produce a plan at
-   `docs/superpowers/plans/YYYY-MM-DD-subsys7-isa-execute.md`.
+   `docs/superpowers/plans/YYYY-MM-DD-subsys8-parser.md`.
 
 5. **Invoke subagent-driven-development** to execute.
 
-6. **At end of Subsystem 7:** tag `phase1-subsys-isa-execute`, append
-   a completion section to its audit, update this `NEXT-STEPS.md` to
-   move Subsystem 8 (Parser) to "up next."
+6. **At end of Subsystem 8:** tag `phase1-subsys-parser`, append a
+   completion section to its audit, update this `NEXT-STEPS.md` to
+   mark Phase 1b complete (all eight subsystems done) and transition
+   to Phase 2 hygiene or a milestone tag (`phase1-complete`).
 
 ---
 
@@ -306,12 +295,12 @@ This is the concrete next action. Start here in a fresh session.
 export PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH
 
 # Commit history at the current refactor frontier
-git log --oneline phase1-subsys-stream-switch..HEAD
-git log --oneline phase1-subsys-locks..phase1-subsys-stream-switch
+git log --oneline phase1-subsys-isa-execute..HEAD
+git log --oneline phase1-subsys-stream-switch..phase1-subsys-isa-execute
 
 # Run library tests (Global Invariant; green at every commit)
 cargo test --lib                         # expect 2684 pass at the tag
-cargo test -p xdna-archspec --lib        # expect 297 pass
+cargo test -p xdna-archspec --lib        # expect 320 pass
 
 # Fast bridge smoke (catches 90% of regressions, ~30s)
 ./scripts/emu-bridge-test.sh --no-hw -v add_one_cpp_aiecc
@@ -381,6 +370,42 @@ block on them, do not investigate them mid-subsystem:
   `objectfifo_repeat/init_values_repeat`.  Also pre-existing.
 - Generated file warnings (unused constants in `gen_aiert_*.rs`).
   Pre-existing.
+
+---
+
+## Deferred Workstreams (named, not yet scheduled)
+
+### Cycle-budget bridge test timeouts (replace wall-clock)
+
+**The issue.** `scripts/emu-bridge-test.sh` and the underlying
+test-runner harness currently decide "this test timed out" based on
+wall-clock seconds. That's fragile: any concurrent heavy CPU load
+(ROCm compile, other `cargo build --release`, anything that spikes
+the host) slows the emulator's per-cycle wall-time and makes tests
+hit the wall-clock timeout even though they're making correct
+progress. Surfaced during the Subsystem 7 gate: a concurrent ROCm
+build made 20 Chess/Peano bridge tests flip PASS -> TIMEOUT, all
+reproducible as environment contention rather than code regressions.
+
+**The fix.** Replace wall-clock with cycle budget. The emulator
+already tracks per-tile cycle counts; propagate a "max cycles" knob
+through the FFI (env var or new FFI entry point), and have the
+bridge harness declare timeout based on `emu_cycle_count > N` rather
+than `elapsed_seconds > M`. Tests that genuinely deadlock (infinite
+loop) still terminate; tests that are just slow under contention
+still pass.
+
+**Work scope.** ~half-day. Touches:
+- `scripts/emu-bridge-test.sh` (timeout decision)
+- `src/ffi/` (new max-cycles knob)
+- Emulator main loop (check-and-abort on cycle threshold)
+- Possibly test helpers in `mlir-aie/test/npu-xrt/` (if any tests
+  assume wall-clock behavior rather than simulated-time semantics)
+
+**When.** Its own brainstorm -> plan -> implementation cycle. Could
+land as Phase 2 hygiene, or as a standalone piece of work after
+Subsystem 8 (Parser). Not a Subsystem 7 concern despite being
+surfaced by its gate.
 
 ---
 
