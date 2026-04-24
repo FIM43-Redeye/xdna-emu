@@ -13,6 +13,17 @@
 //! [21:20] Length      (2-bit, value+1 = number of data beats)
 //! [19:0]  Address     (20-bit tile-local register offset)
 //! ```
+//!
+//! # Relationship to `src/parser/*`
+//!
+//! Structurally distinct from `src/parser/*` (the XCLBIN / CDO / ELF
+//! static-configuration parsers): control packets carry NPU runtime
+//! commands as a 32-bit header + data beats, whereas CDO carries a
+//! 20-byte container header + variable-length typed command stream,
+//! and XCLBIN is a Xilinx axlf container. No framing primitives
+//! overlap. Subsystem 8 audit §7 (`docs/arch/subsys8-audit.md`)
+//! evaluated shared-module extraction and found zero overlap -- the
+//! two parsers stay separate by design.
 
 use std::fmt;
 
