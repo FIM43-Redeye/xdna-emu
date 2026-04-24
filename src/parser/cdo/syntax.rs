@@ -11,10 +11,11 @@
 //! for legacy callers; Stage 8b Half 2 will relocate this kind of
 //! arch-aware decoding into the semantics layer behind `ArchHandle`.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use zerocopy::FromBytes;
 
 use super::framing::{CdoVersion, RawCdoHeader, CDO_HEADER_SIZE, CDO_MAGIC_CDO, CDO_MAGIC_XLNX};
+use crate::parser::error::ParseError;
 
 /// CDO command opcodes (CDOv2)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,24 +202,31 @@ impl<'a> Cdo<'a> {
     /// Parse a CDO from raw bytes
     pub fn parse(data: &'a [u8]) -> Result<Self> {
         if data.len() < CDO_HEADER_SIZE {
-            bail!(
-                "CDO too small: {} bytes (minimum {})",
-                data.len(),
-                CDO_HEADER_SIZE
-            );
+            return Err(ParseError::Truncated {
+                offset: 0,
+                expected_bytes: CDO_HEADER_SIZE - data.len(),
+                available: data.len(),
+                context: "CDO header",
+            }
+            .into());
         }
 
         let (header, _) = RawCdoHeader::read_from_prefix(data)
-            .map_err(|e| anyhow!("Failed to parse CDO header: {:?}", e))?;
+            .map_err(|e| ParseError::External {
+                offset: 0,
+                context: "CDO header",
+                message: format!("{:?}", e),
+            })?;
 
         // Validate magic
         if header.ident_word != CDO_MAGIC_CDO && header.ident_word != CDO_MAGIC_XLNX {
-            bail!(
-                "Invalid CDO magic: 0x{:08X} (expected 0x{:08X} or 0x{:08X})",
-                header.ident_word,
-                CDO_MAGIC_CDO,
-                CDO_MAGIC_XLNX
-            );
+            return Err(ParseError::BadMagic {
+                offset: 0,
+                expected: format!("0x{:08X} or 0x{:08X}", CDO_MAGIC_CDO, CDO_MAGIC_XLNX),
+                got: format!("0x{:08X}", header.ident_word),
+                hex_context: ParseError::hex_window(data, 0, 16),
+            }
+            .into());
         }
 
         // Validate checksum
