@@ -13,6 +13,9 @@ pub mod aie_partition;
 pub mod cdo;
 pub mod elf;
 
+#[cfg(test)]
+pub mod testing;
+
 pub use error::ParseError;
 pub use xclbin::Xclbin;
 pub use aie_partition::AiePartition;
