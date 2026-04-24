@@ -59,12 +59,25 @@ pub enum DeviceOp {
     /// Enable or disable a compute core.
     /// Produced by: `CdoRaw::Write` or `CdoRaw::MaskWrite` targeting
     /// the Core_Control register.
-    CoreEnable { tile: TileAddr, enabled: bool },
+    ///
+    /// `enabled` is the decoded enable state (bit 0 of the final value);
+    /// `value` is the raw 32-bit register value (or, for MaskWrite, the
+    /// mask-blended value) that state stores into `tile.core.control`
+    /// for readback-correctness. Carrying the raw word keeps the typed
+    /// op self-describing so `device::state` never has to re-derive it.
+    CoreEnable { tile: TileAddr, enabled: bool, value: u32 },
 
     /// Start a DMA channel.
-    /// Produced by: `CdoRaw::Write` targeting a DMA channel control
+    /// Produced by: `CdoRaw::Write` targeting a DMA channel Start_Queue
     /// register.
-    DmaStart { tile: TileAddr, channel: u8, dir: DmaDirection },
+    ///
+    /// `bd_id` is the full 32-bit value written to Start_Queue; it
+    /// carries the starting BD index (via `start_bd_id` field) plus
+    /// repeat count, token-issue enable, and other channel-start
+    /// parameters that `device::state` decodes before enqueueing the
+    /// task. Passing the raw value avoids splitting field extraction
+    /// between the parser and state.
+    DmaStart { tile: TileAddr, channel: u8, dir: DmaDirection, bd_id: u32 },
 
     // --- Synchronization / timing ---
 
@@ -149,18 +162,34 @@ mod tests {
 
     #[test]
     fn core_enable_variant() {
-        let on = DeviceOp::CoreEnable { tile: t(0, 2), enabled: true };
-        let off = DeviceOp::CoreEnable { tile: t(0, 2), enabled: false };
-        assert!(matches!(on, DeviceOp::CoreEnable { enabled: true, .. }));
-        assert!(matches!(off, DeviceOp::CoreEnable { enabled: false, .. }));
+        let on = DeviceOp::CoreEnable { tile: t(0, 2), enabled: true, value: 0x1 };
+        let off = DeviceOp::CoreEnable { tile: t(0, 2), enabled: false, value: 0x0 };
+        assert!(matches!(on, DeviceOp::CoreEnable { enabled: true, value: 0x1, .. }));
+        assert!(matches!(off, DeviceOp::CoreEnable { enabled: false, value: 0x0, .. }));
     }
 
     #[test]
     fn dma_start_both_directions() {
-        let s2mm = DeviceOp::DmaStart { tile: t(0, 0), channel: 0, dir: DmaDirection::S2mm };
-        let mm2s = DeviceOp::DmaStart { tile: t(0, 0), channel: 1, dir: DmaDirection::Mm2s };
-        assert!(matches!(s2mm, DeviceOp::DmaStart { dir: DmaDirection::S2mm, channel: 0, .. }));
-        assert!(matches!(mm2s, DeviceOp::DmaStart { dir: DmaDirection::Mm2s, channel: 1, .. }));
+        let s2mm = DeviceOp::DmaStart {
+            tile: t(0, 0),
+            channel: 0,
+            dir: DmaDirection::S2mm,
+            bd_id: 0x7,
+        };
+        let mm2s = DeviceOp::DmaStart {
+            tile: t(0, 0),
+            channel: 1,
+            dir: DmaDirection::Mm2s,
+            bd_id: 0x3,
+        };
+        assert!(matches!(
+            s2mm,
+            DeviceOp::DmaStart { dir: DmaDirection::S2mm, channel: 0, bd_id: 0x7, .. }
+        ));
+        assert!(matches!(
+            mm2s,
+            DeviceOp::DmaStart { dir: DmaDirection::Mm2s, channel: 1, bd_id: 0x3, .. }
+        ));
     }
 
     #[test]

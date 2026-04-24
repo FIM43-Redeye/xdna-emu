@@ -167,11 +167,14 @@ pub fn lower(raw: &CdoRaw) -> SmallVec<[DeviceOp; 4]> {
 fn lower_write(address: u32, value: u32) -> DeviceOp {
     let (tile, offset) = decode_aie2_address(address);
 
-    // Core enable/disable on a compute tile.
+    // Core enable/disable on a compute tile. The raw `value` rides along
+    // so `device::state` can store it verbatim into `tile.core.control`
+    // for readback (hardware stores the full 32-bit word, not just bit 0).
     if offset == CORE_CONTROL && is_compute_row(tile.row) {
         return DeviceOp::CoreEnable {
             tile,
             enabled: (value & 1) != 0,
+            value,
         };
     }
 
@@ -180,9 +183,13 @@ fn lower_write(address: u32, value: u32) -> DeviceOp {
     // channel-level config and are NOT promoted here -- they pass
     // through as RegWrite exactly like a write to any other config
     // register.
+    //
+    // The raw `value` is carried as `bd_id`: `device::state` extracts
+    // start_bd_id / repeat_count / enable_token_issue from it the same
+    // way `write_dma_channel`'s Start_Queue branch did pre-refactor.
     if is_compute_row(tile.row) {
         if let Some((channel, dir)) = match_compute_dma_start_queue(offset) {
-            return DeviceOp::DmaStart { tile, channel, dir };
+            return DeviceOp::DmaStart { tile, channel, dir, bd_id: value };
         }
     }
 
@@ -203,9 +210,16 @@ fn lower_mask_write(address: u32, mask: u32, value: u32) -> DeviceOp {
     let (tile, offset) = decode_aie2_address(address);
 
     if offset == CORE_CONTROL && is_compute_row(tile.row) && (mask & 1) != 0 {
+        // Raw `value` is forwarded as-is, matching what the pre-refactor
+        // `mask_write_core_register` CORE_CONTROL branch saw. `device::
+        // state` applies the full mask-blend (read current, replace
+        // masked bits) when it handles the CoreEnable op; the typed op
+        // only needs enough to reconstruct that effect, so the raw
+        // incoming word + enabled flag is sufficient.
         return DeviceOp::CoreEnable {
             tile,
             enabled: (value & 1) != 0,
+            value,
         };
     }
 
@@ -483,9 +497,10 @@ mod tests {
         let ops = lower(&CdoRaw::Write { address: addr, value: 0x1 });
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            DeviceOp::CoreEnable { tile, enabled } => {
+            DeviceOp::CoreEnable { tile, enabled, value } => {
                 assert_eq!(*tile, TileAddr::new(col, row));
                 assert!(*enabled, "bit 0 set -> enabled=true");
+                assert_eq!(*value, 0x1, "raw value must be carried for readback");
             }
             _ => panic!("expected CoreEnable, got {:?}", ops[0]),
         }
@@ -499,8 +514,9 @@ mod tests {
         let ops = lower(&CdoRaw::Write { address: addr, value: 0x2 });
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            DeviceOp::CoreEnable { enabled, .. } => {
+            DeviceOp::CoreEnable { enabled, value, .. } => {
                 assert!(!*enabled, "bit 0 clear -> enabled=false");
+                assert_eq!(*value, 0x2, "raw value preserved even when disabling");
             }
             _ => panic!("expected CoreEnable, got {:?}", ops[0]),
         }
@@ -545,9 +561,12 @@ mod tests {
         });
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            DeviceOp::CoreEnable { tile, enabled } => {
+            DeviceOp::CoreEnable { tile, enabled, value } => {
                 assert_eq!(*tile, TileAddr::new(col, row));
                 assert!(*enabled);
+                // MaskWrite forwards the raw value; device::state does
+                // the mask-blend when it applies the op.
+                assert_eq!(*value, 0x1);
             }
             _ => panic!("expected CoreEnable, got {:?}", ops[0]),
         }
@@ -588,10 +607,11 @@ mod tests {
         let ops = lower(&CdoRaw::Write { address: addr, value: 0x7 }); // BD ID 7
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            DeviceOp::DmaStart { tile, channel, dir } => {
+            DeviceOp::DmaStart { tile, channel, dir, bd_id } => {
                 assert_eq!(*tile, TileAddr::new(col, row));
                 assert_eq!(*channel, 0);
                 assert_eq!(*dir, DmaDirection::S2mm);
+                assert_eq!(*bd_id, 0x7, "raw Start_Queue value must be preserved");
             }
             _ => panic!("expected DmaStart(S2mm, 0), got {:?}", ops[0]),
         }
@@ -604,9 +624,10 @@ mod tests {
         let ops = lower(&CdoRaw::Write { address: addr, value: 0x3 });
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            DeviceOp::DmaStart { channel, dir, .. } => {
+            DeviceOp::DmaStart { channel, dir, bd_id, .. } => {
                 assert_eq!(*channel, 1);
                 assert_eq!(*dir, DmaDirection::S2mm);
+                assert_eq!(*bd_id, 0x3);
             }
             _ => panic!("expected DmaStart(S2mm, 1), got {:?}", ops[0]),
         }
@@ -619,9 +640,10 @@ mod tests {
         let ops = lower(&CdoRaw::Write { address: addr, value: 0x1 });
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            DeviceOp::DmaStart { channel, dir, .. } => {
+            DeviceOp::DmaStart { channel, dir, bd_id, .. } => {
                 assert_eq!(*channel, 0);
                 assert_eq!(*dir, DmaDirection::Mm2s);
+                assert_eq!(*bd_id, 0x1);
             }
             _ => panic!("expected DmaStart(Mm2s, 0), got {:?}", ops[0]),
         }
@@ -634,9 +656,10 @@ mod tests {
         let ops = lower(&CdoRaw::Write { address: addr, value: 0x5 });
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            DeviceOp::DmaStart { channel, dir, .. } => {
+            DeviceOp::DmaStart { channel, dir, bd_id, .. } => {
                 assert_eq!(*channel, 1);
                 assert_eq!(*dir, DmaDirection::Mm2s);
+                assert_eq!(*bd_id, 0x5);
             }
             _ => panic!("expected DmaStart(Mm2s, 1), got {:?}", ops[0]),
         }

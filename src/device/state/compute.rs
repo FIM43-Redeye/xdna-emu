@@ -130,7 +130,15 @@ impl DeviceState {
             bd_idx, word, value, col, row);
     }
 
-    /// Write to a DMA channel register.
+    /// Write to a compute-tile DMA channel register.
+    ///
+    /// Handles both Ctrl and Start_Queue writes. The CDO path now
+    /// promotes Start_Queue writes to `DeviceOp::DmaStart` and applies
+    /// them via `start_compute_dma_channel` from `apply_device_op`; the
+    /// Start_Queue branch below remains live for non-CDO paths (NPU
+    /// instructions via `write_tile_register`, control packets, FFI)
+    /// that still feed raw register writes through this function. See
+    /// the commit message on Stage 8b Half 2 for the rationale.
     pub(super) fn write_dma_channel(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         let reg_layout = regdb::device_reg_layout();
         let lay = &reg_layout.memory_channel;
@@ -202,7 +210,8 @@ impl DeviceState {
             }
         }
 
-        // Start the DmaEngine channel when START_QUEUE is written
+        // Start the DmaEngine channel when START_QUEUE is written (non-CDO
+        // paths; CDO goes through DeviceOp::DmaStart).
         if is_start_queue {
             let bd_idx = lay.start_bd_id.extract(value) as u8;
             let repeat_count = lay.repeat_count.extract(value) as u8;
@@ -243,7 +252,121 @@ impl DeviceState {
         }
     }
 
-    /// Masked write to a DMA channel register.
+    /// Apply a `DeviceOp::DmaStart` to a compute tile.
+    ///
+    /// Replicates the Start_Queue-write side effect that `write_dma_channel`
+    /// used to perform inline:
+    ///   - store the raw Start_Queue value, decoded starting BD, and
+    ///     enable_token_issue flag into the tile's channel state;
+    ///   - re-parse any dirty BDs so chained BDs are configured;
+    ///   - set the DmaEngine's per-task config (token issue, controller_id,
+    ///     fot_mode) and enqueue the transfer.
+    ///
+    /// `channel` is 0 or 1 within the direction; `dir` selects S2MM vs
+    /// MM2S. Internally these map to ch_idx 0..3 matching the register
+    /// layout (S2MM_0, S2MM_1, MM2S_0, MM2S_1).
+    pub(super) fn start_compute_dma_channel(
+        &mut self,
+        col: u8,
+        row: u8,
+        channel: u8,
+        dir: xdna_archspec::types::DmaDirection,
+        bd_id: u32,
+    ) {
+        use xdna_archspec::types::DmaDirection;
+
+        let reg_layout = regdb::device_reg_layout();
+        let lay = &reg_layout.memory_channel;
+
+        let num_s2mm = xdna_archspec::aie2::compute::NUM_DMA_CHANNELS as usize;
+        let ch_idx = match dir {
+            DmaDirection::S2mm => channel as usize,
+            DmaDirection::Mm2s => num_s2mm + channel as usize,
+        };
+
+        let num_channels = self.array.get(col, row).map_or(0, |t| t.dma_channels.len());
+        if ch_idx >= num_channels {
+            return;
+        }
+
+        let enable_token_issue = lay.enable_token_issue.extract_bool(bd_id);
+        let bd_idx = lay.start_bd_id.extract(bd_id) as u8;
+        let repeat_count = lay.repeat_count.extract(bd_id) as u8;
+
+        // Record the raw Start_Queue state on the tile (same writes the
+        // pre-refactor Start_Queue branch did).
+        if let Some(tile) = self.array.get_mut(col, row) {
+            let dma_ch = &mut tile.dma_channels[ch_idx];
+            dma_ch.start_queue = bd_id;
+            dma_ch.current_bd = bd_idx;
+            dma_ch.enable_token_issue = enable_token_issue;
+        }
+
+        // Read back the controller_id and fot_mode captured by the prior
+        // Ctrl write, so the enqueued task config matches what hardware
+        // would see.
+        let (controller_id, fot_mode) = self.array.get(col, row)
+            .map(|t| {
+                let dma_ch = &t.dma_channels[ch_idx];
+                (dma_ch.controller_id, dma_ch.fot_mode)
+            })
+            .unwrap_or((0, 0));
+
+        // Re-parse ALL dirty BDs so chained BDs are also configured.
+        self.reparse_all_dirty_bds(col, row);
+
+        if let Some(dma) = self.array.dma_engine_mut(col, row) {
+            dma.set_channel_task_config(ch_idx as u8, enable_token_issue, controller_id, fot_mode);
+
+            // Enqueue to the channel's task queue (hardware has 8-deep queue).
+            // Unlike start_channel_with_repeat(), this never rejects a busy
+            // channel -- it queues the task for execution when the current
+            // transfer finishes.
+            if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, enable_token_issue) {
+                log::warn!(
+                    "DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
+                    col, row, ch_idx, bd_idx,
+                );
+            } else if enable_token_issue {
+                log::debug!("CDO enqueued DMA channel {} BD {} repeat={} token_issue=true controller_id={} on tile ({},{})",
+                    ch_idx, bd_idx, repeat_count, controller_id, col, row);
+            } else {
+                log::info!("CDO enqueued DMA channel {} BD {} repeat={} on tile ({},{})",
+                    ch_idx, bd_idx, repeat_count, col, row);
+            }
+        }
+    }
+
+    /// Apply a `DeviceOp::CoreEnable` to a compute tile.
+    ///
+    /// Replicates the CORE_CONTROL write side-effect that
+    /// `write_core_register` used to perform inline: store the raw value
+    /// into `tile.core.control`, update `tile.core.enabled`, and push
+    /// a pending core-enable event so the coordinator can sync the
+    /// interpreter's core state.
+    pub(super) fn apply_core_enable(&mut self, col: u8, row: u8, enabled: bool, value: u32) {
+        let tile = match self.array.get_mut(col, row) {
+            Some(t) => t,
+            None => return,
+        };
+
+        let was_enabled = tile.core.enabled;
+        tile.core.control = value;
+        tile.core.enabled = enabled;
+        if tile.core.enabled != was_enabled {
+            log::info!("Core ({},{}) {}", col, row,
+                if tile.core.enabled { "ENABLED" } else { "DISABLED" });
+            self.pending_core_enables.push((col, row, tile.core.enabled));
+        }
+    }
+
+    /// Masked write to a compute-tile DMA channel register.
+    ///
+    /// MaskWrite to Start_Queue is not promoted to `DeviceOp::DmaStart`
+    /// (promotion gates on Write, not MaskWrite), and non-CDO paths
+    /// (NPU instructions, control packets, FFI) also reach this
+    /// function directly. The legacy Start_Queue branch below remains
+    /// live for both cases.
     pub(super) fn mask_write_dma_channel(&mut self, col: u8, row: u8, offset: u32, mask: u32, value: u32) {
         let reg_layout = regdb::device_reg_layout();
         let lay = &reg_layout.memory_channel;
@@ -273,6 +396,11 @@ impl DeviceState {
 
         // Enqueue to the DMA channel's task queue when START_QUEUE is written.
         // Field positions derived from AM025 via ChannelFieldLayout.
+        //
+        // Note: MaskWrite to Start_Queue is not promoted to DmaStart
+        // (promotion is gated to Write, not MaskWrite). If a MaskWrite
+        // path ever reaches here, we fall back to the legacy inline
+        // enqueue so that observed behavior stays identical.
         if let Some(queue_val) = new_start_queue {
             let bd_idx = lay.start_bd_id.extract(queue_val) as u8;
             let repeat_count = lay.repeat_count.extract(queue_val) as u8;
@@ -429,6 +557,13 @@ impl DeviceState {
     }
 
     /// Write to a core register.
+    ///
+    /// The CORE_CONTROL branch is also exercised by non-CDO paths
+    /// (NPU instructions, control packets, FFI via
+    /// `write_tile_register`); the CDO path now promotes
+    /// CORE_CONTROL writes to `DeviceOp::CoreEnable` and handles them
+    /// via `apply_core_enable`. The branch below stays live for the
+    /// non-CDO callers.
     pub(super) fn write_core_register(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         use xdna_archspec::aie2::registers as cm;
 
