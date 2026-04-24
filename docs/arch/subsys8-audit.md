@@ -676,4 +676,33 @@ consumer for any device that uses CDO v2 configuration.
 
 ## Completion
 
-(Filled in at the end of Stage 8a, in Task 6.)
+Stage 8a landed at tag `phase1-subsys-parser-arch`. Commit series:
+
+- `5992923` docs: Subsystem 8 audit scaffold
+- `e55381e` docs: Subsystem 8 design-note scaffold
+- `aee3662` docs(audit): Subsystem 8 parser audit (sections 1-9 + summary)
+- `ee6a31b` docs(plan): Subsys 8 Task 4/5/17 steps from audit findings
+- `98094dd` refactor(archspec): migrate EM_AIE + AieArchitecture to archspec
+- `356ce65` docs(design-note): Subsystem 8 binary-loader-model populated
+- `771d163` docs(spec): Subsys 8 -- refined DeviceOp proposal from audit
+- see git log for audit-completion and NEXT-STEPS commits
+
+### Deliverables
+
+- Per-area audit (§§1--7): all sections populated with evidence-backed findings.
+- Trait decision (§9): no `BinaryLoader` trait (matches Subsystem 6 `IsaDecoder` precedent). Five candidate methods evaluated in the rejection table; none survived.
+- Design note: `docs/arch/binary-loader-model.md` filled with five populated sections.
+- Data migrations: `EM_AIE` + `AieArchitecture` moved to new `xdna_archspec::elf` module. 17 LOC archspec addition; ~30 LOC xdna-emu reduction (via duplicate-test removal).
+- Refined `DeviceOp` proposal: 11 variants (starting hypothesis was 8; audit added MaskPoll, Delay, Marker; Nop and EndMark dropped; Write64/MaskWrite64 collapsed into RegWrite/RegMask). Documented in spec §"`DeviceOp` vocabulary"; pending user gate before Stage 8b Half 2.
+
+### Baselines at tag time
+
+- `cargo test --lib`: 2684 passed; 0 failed; 5 ignored. (Baseline was 2686; -2 from duplicate-test removal in Task 4 is not a regression -- the removed tests are now covered by archspec tests, net coverage unchanged.)
+- `cargo test -p xdna-archspec --lib`: 322 passed; 0 failed; 2 ignored. (+2 from the new `xdna_archspec::elf` tests.)
+- Full bridge: matches `/tmp/claude-1000/subsys8-baseline-bridge.log`. Chess 62/62 bridge pass + 2 expected fail. Peano 55/55 bridge pass + 1 expected fail + 1 XFAIL.
+- ISA test: matches `/tmp/claude-1000/subsys8-baseline-isa.log` (all PASS).
+
+### Follow-ups flagged (Phase 2 hygiene)
+
+- `examples/run_add_test.rs`, `examples/bdd_validate.rs`, `tests/arch_constants.rs` are stale and reference `xdna_emu::arch` and `xdna_emu::tablegen` modules that Subsystem 6 dissolved. Not in `cargo test --lib` or `cargo build --release` paths, so they don't block. Phase 2 hygiene will either update or delete them.
+- `src/parser/elf.rs::MemoryRegion::from_address()` still has an arch-hardcoded archspec read (see audit §6 trailing item). Arch-generic accessor is a Phase 2 hygiene item.
