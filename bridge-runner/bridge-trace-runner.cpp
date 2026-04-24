@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -41,6 +42,22 @@ namespace {
 // examples at mlir-aie/test/npu-xrt/*/test.cpp).
 constexpr uint64_t AIE_KERNEL_OPCODE = 3;
 
+// Classifier FFI struct (must match Rust XdnaEmuKernargRole).
+struct ClassifierRole {
+    uint8_t arg_idx;
+    uint8_t role;
+    uint8_t _pad[2];
+    uint32_t bd_reg_addr;
+};
+constexpr uint8_t ROLE_DATA_MM2S = 0;
+constexpr uint8_t ROLE_DATA_S2MM = 1;
+constexpr uint8_t ROLE_CTRLPKT   = 2;
+// ROLE_UNKNOWN = 255 is defined in the Rust FFI but we don't branch on it
+// explicitly on the C++ side -- any non-Ctrlpkt role is treated as data.
+
+using classify_fn_t = int64_t (*)(const void*, uint64_t, const void*, uint64_t,
+                                  ClassifierRole*, uint64_t);
+
 struct CliArgs {
     std::string xclbin;
     std::string kernel_name;       // empty = auto-detect single kernel
@@ -48,6 +65,7 @@ struct CliArgs {
     std::string trace_out;         // where to dump raw trace bytes
     std::vector<std::string> inputs;   // paths to input buffer binaries
     std::vector<std::string> outputs;  // paths where outputs get written
+    std::vector<std::string> ctrlpkts; // paths to ctrlpkt blobs
     // Default 1 MiB. Large enough that event-heavy workloads (lock-
     // intensive kernels, full-event sweeps) don't silently truncate
     // mid-trace. The trace unit has no backpressure -- once the BO
@@ -88,6 +106,7 @@ int parse_cli(int argc, char** argv, CliArgs& out) {
         else if (a == "--trace-out")    out.trace_out = need_val("--trace-out");
         else if (a == "--input")        out.inputs.push_back(need_val("--input"));
         else if (a == "--output")       out.outputs.push_back(need_val("--output"));
+        else if (a == "--ctrlpkt")      out.ctrlpkts.push_back(need_val("--ctrlpkt"));
         else if (a == "--trace-size") {
             // strtoull silently wraps negatives to UINT64_MAX and accepts any
             // leading garbage -- validate explicitly so "-1" or "foo" fail loud.
@@ -259,6 +278,64 @@ KernArgPlan classify_kernargs(const std::vector<KernArgInfo>& kargs) {
     return plan;
 }
 
+/// Try to load libxdna_emu.so and resolve xdna_emu_classify_kernargs.
+/// Returns nullptr if the library is absent or the symbol is missing;
+/// callers then fall back to positional binding.
+classify_fn_t try_load_classifier(bool verbose) {
+    auto try_path = [&](const std::string& path) -> classify_fn_t {
+        void* h = dlopen(path.c_str(), RTLD_LAZY);
+        if (!h) return nullptr;
+        auto fn = reinterpret_cast<classify_fn_t>(dlsym(h, "xdna_emu_classify_kernargs"));
+        if (verbose && fn) std::fprintf(stderr, "  classifier loaded from %s\n", path.c_str());
+        return fn;
+    };
+    if (const char* dir = std::getenv("XDNA_EMU_DIR"); dir && *dir) {
+        if (auto fn = try_path(std::string(dir) + "/libxdna_emu.so")) return fn;
+    }
+    return try_path("libxdna_emu.so");
+}
+
+/// Classify kernarg roles via the Rust FFI. Returns empty on failure.
+std::vector<ClassifierRole> classify_kernargs_via_ffi(
+    classify_fn_t fn,
+    const std::string& xclbin_path,
+    const std::vector<uint32_t>& instr_words,
+    bool verbose)
+{
+    if (!fn) return {};
+    std::ifstream xf(xclbin_path, std::ios::binary | std::ios::ate);
+    if (!xf) return {};
+    std::streamsize xsz = xf.tellg();
+    if (xsz <= 0) return {};
+    xf.seekg(0);
+    std::vector<uint8_t> xbytes(static_cast<size_t>(xsz));
+    xf.read(reinterpret_cast<char*>(xbytes.data()), xsz);
+
+    const uint8_t* ibytes = reinterpret_cast<const uint8_t*>(instr_words.data());
+    uint64_t isz = instr_words.size() * sizeof(uint32_t);
+
+    int64_t count = fn(xbytes.data(), xbytes.size(), ibytes, isz, nullptr, 0);
+    if (count < 0) {
+        if (verbose) std::fprintf(stderr, "  classifier returned error %ld\n", (long)count);
+        return {};
+    }
+    std::vector<ClassifierRole> out(static_cast<size_t>(count));
+    int64_t filled = fn(xbytes.data(), xbytes.size(), ibytes, isz,
+                        out.data(), out.size());
+    if (filled < 0) return {};
+    out.resize(static_cast<size_t>(filled));
+    return out;
+}
+
+const char* role_name(uint8_t role) {
+    switch (role) {
+        case ROLE_DATA_MM2S: return "data_mm2s";
+        case ROLE_DATA_S2MM: return "data_s2mm";
+        case ROLE_CTRLPKT:   return "ctrlpkt";
+        default:             return "unknown";
+    }
+}
+
 } // anonymous namespace
 
 int main(int argc, char** argv) {
@@ -310,6 +387,78 @@ int main(int argc, char** argv) {
                          instr_words.size(), args.instr_bin.c_str());
         }
 
+        // Best-effort kernarg-role classification via libxdna_emu.so.
+        // When the classifier is available and --ctrlpkt paths are supplied,
+        // we bind each ctrlpkt path to the classifier-identified Ctrlpkt
+        // data-arg (ascending arg_idx order). --input/--output flows
+        // positionally through the remaining middle buffers exactly as
+        // before, skipping any slot reserved for a ctrlpkt. Without the
+        // classifier, --ctrlpkt falls back to being equivalent to --input
+        // appended to the front of the input list, preserving legacy
+        // positional behavior.
+        static classify_fn_t g_classify = try_load_classifier(args.verbose);
+        auto roles = classify_kernargs_via_ffi(
+            g_classify, args.xclbin, instr_words, args.verbose);
+        std::vector<size_t> ctrlpkt_data_args;
+        for (const auto& r : roles) {
+            if (r.role == ROLE_CTRLPKT) {
+                ctrlpkt_data_args.push_back(static_cast<size_t>(r.arg_idx));
+            }
+        }
+        std::sort(ctrlpkt_data_args.begin(), ctrlpkt_data_args.end());
+        if (args.verbose && !roles.empty()) {
+            std::fprintf(stderr, "  classifier roles:");
+            for (const auto& r : roles) {
+                std::fprintf(stderr, " arg%u=%s", r.arg_idx, role_name(r.role));
+            }
+            std::fprintf(stderr, "\n");
+        }
+        // If no classifier, treat --ctrlpkt as positional --input.
+        if (g_classify == nullptr || roles.empty()) {
+            if (!args.ctrlpkts.empty() && args.verbose) {
+                std::fprintf(stderr,
+                    "  classifier unavailable; --ctrlpkt falls back to --input\n");
+            }
+            args.inputs.insert(args.inputs.begin(),
+                               args.ctrlpkts.begin(), args.ctrlpkts.end());
+            args.ctrlpkts.clear();
+        } else if (args.ctrlpkts.size() > ctrlpkt_data_args.size()) {
+            throw std::runtime_error(
+                "more --ctrlpkt paths (" + std::to_string(args.ctrlpkts.size()) +
+                ") than classifier-identified ctrlpkt args (" +
+                std::to_string(ctrlpkt_data_args.size()) + ")");
+        }
+
+        // Build a data-arg -> binding-source map:
+        //   ctrlpkt path (if reserved for this slot), otherwise --input file
+        //   in positional order skipping reserved slots, otherwise --output,
+        //   otherwise zero-fill.
+        enum class Bind { Zero, InputFile, OutputSlot, CtrlpktFile };
+        struct BindInfo { Bind kind; std::string path; };
+        std::vector<BindInfo> data_arg_binding(plan.middle_buf_indices.size(),
+                                               BindInfo{Bind::Zero, {}});
+        std::vector<bool> reserved(plan.middle_buf_indices.size(), false);
+        for (size_t i = 0; i < args.ctrlpkts.size(); ++i) {
+            size_t slot = ctrlpkt_data_args[i];
+            if (slot >= data_arg_binding.size()) {
+                throw std::runtime_error(
+                    "classifier reports ctrlpkt at arg_idx " +
+                    std::to_string(slot) + " but only " +
+                    std::to_string(data_arg_binding.size()) + " middle buffers exist");
+            }
+            data_arg_binding[slot] = {Bind::CtrlpktFile, args.ctrlpkts[i]};
+            reserved[slot] = true;
+        }
+        size_t input_i = 0, output_i = 0;
+        for (size_t slot = 0; slot < data_arg_binding.size(); ++slot) {
+            if (reserved[slot]) continue;
+            if (input_i < args.inputs.size()) {
+                data_arg_binding[slot] = {Bind::InputFile, args.inputs[input_i++]};
+            } else if (output_i < args.outputs.size()) {
+                data_arg_binding[slot] = {Bind::OutputSlot, args.outputs[output_i++]};
+            }
+        }
+
         // Per-arg BO storage.  Reserve upfront so push_back never reallocates
         // while we hold interior references.  `arg_to_bo_idx[k]` gives the index
         // in `bos` for kernarg k, or SIZE_MAX if k is a scalar -- Task 10 uses
@@ -340,57 +489,30 @@ int main(int argc, char** argv) {
             bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         }
 
-        // Middle buffers: first args.inputs.size() loaded from --input files;
-        // remaining output slots and any unbound extras are zero-filled.
-        size_t mb_i = 0;
-        for (const std::string& in_path : args.inputs) {
-            if (mb_i >= plan.middle_buf_indices.size()) {
-                throw std::runtime_error("internal: input index out of middle-buffer range");
-            }
-            size_t karg_idx = plan.middle_buf_indices[mb_i];
+        // Middle buffers: driven by the data_arg_binding table built above.
+        // Each slot is either bound to a file (ctrlpkt or --input), reserved
+        // for an --output, or zero-filled.
+        for (size_t slot = 0; slot < plan.middle_buf_indices.size(); ++slot) {
+            size_t karg_idx = plan.middle_buf_indices[slot];
             size_t karg_declared_sz = static_cast<size_t>(kargs[karg_idx].size);
-            // Stat the input file -- for pointer kernargs (e.g. ctrlpkt)
-            // kargs[].size is the 8-byte pointer width, not the data size.
-            // Size the BO from the larger of {declared kernarg size, file
-            // size} so pointer kernargs get the full data, and under-sized
-            // files still get a BO big enough for the kernel's expectation.
-            size_t file_sz = 0;
-            {
-                std::ifstream fs(in_path, std::ios::binary | std::ios::ate);
-                if (!fs) throw std::runtime_error("cannot open input file: " + in_path);
+            const auto& bind = data_arg_binding[slot];
+            size_t sz = karg_declared_sz;
+            if (bind.kind == Bind::InputFile || bind.kind == Bind::CtrlpktFile) {
+                // For pointer kernargs (void*) the declared size is 8 bytes
+                // regardless of payload; size the BO from the file's actual
+                // bytes so the whole blob reaches the device.
+                std::ifstream fs(bind.path, std::ios::binary | std::ios::ate);
+                if (!fs) throw std::runtime_error("cannot open input file: " + bind.path);
                 std::streamsize p = fs.tellg();
-                if (p < 0) throw std::runtime_error("cannot stat input file: " + in_path);
-                file_sz = static_cast<size_t>(p);
+                if (p < 0) throw std::runtime_error("cannot stat input file: " + bind.path);
+                sz = std::max(karg_declared_sz, static_cast<size_t>(p));
             }
-            size_t sz = std::max(karg_declared_sz, file_sz);
-            auto& bo = make_buffer(karg_idx, sz, xrt::bo::flags::host_only);
-            // Zero-fill first so a short-read from load_bo_from_file leaves
-            // a zeroed tail rather than uninitialized bytes.  The single sync
-            // after the file load is all that needs to reach the device.
-            std::memset(bo.map<void*>(), 0, sz);
-            load_bo_from_file(bo, in_path, sz);
-            bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            mb_i++;
-        }
-        for (size_t o = 0; o < args.outputs.size(); ++o) {
-            if (mb_i >= plan.middle_buf_indices.size()) break;
-            size_t karg_idx = plan.middle_buf_indices[mb_i];
-            size_t sz = static_cast<size_t>(kargs[karg_idx].size);
             auto& bo = make_buffer(karg_idx, sz, xrt::bo::flags::host_only);
             std::memset(bo.map<void*>(), 0, sz);
+            if (bind.kind == Bind::InputFile || bind.kind == Bind::CtrlpktFile) {
+                load_bo_from_file(bo, bind.path, sz);
+            }
             bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            mb_i++;
-        }
-        // Any remaining middle buffers not covered by --input/--output get
-        // zero-filled BOs at their kernarg-declared size so the kernel can
-        // launch without a shape mismatch.
-        while (mb_i < plan.middle_buf_indices.size()) {
-            size_t karg_idx = plan.middle_buf_indices[mb_i];
-            size_t sz = static_cast<size_t>(kargs[karg_idx].size);
-            auto& bo = make_buffer(karg_idx, sz, xrt::bo::flags::host_only);
-            std::memset(bo.map<void*>(), 0, sz);
-            bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            mb_i++;
         }
 
         // Trace BO: zero-filled, sized to --trace-size.

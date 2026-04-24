@@ -36,11 +36,13 @@
 //!   are borrowed from thread-local or handle state; they are invalidated
 //!   by the next FFI call on the same thread or by destroying the handle.
 
+mod classify;
 mod config;
 mod execution;
 mod memory;
 mod query;
 
+pub use classify::*;
 pub use config::*;
 pub use execution::*;
 pub use memory::*;

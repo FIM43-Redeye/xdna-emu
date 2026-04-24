@@ -759,15 +759,16 @@ _run_trace_cycles_pipeline() {
         [[ -n "${XDNA_EMU_DIR:-}" ]] && env_prefix+=("XDNA_EMU_DIR=$XDNA_EMU_DIR")
     fi
 
-    # Optional control-packet blob gets fed as --input when the test's lit
-    # specifies --ctrlpkt-name. Runs through the same run.lit discovery as
-    # the --instr file so any future aiecc-emitted artifact can be added
-    # with a one-line _discover_*_binary helper above.
+    # Optional control-packet blob gets fed as --ctrlpkt when the test's
+    # lit specifies --ctrlpkt-name. The runner uses libxdna_emu.so's
+    # kernarg classifier to identify the Ctrlpkt-role arg_idx and bind
+    # the blob there; if the classifier is unavailable the flag falls
+    # back to --input semantics (legacy positional).
     local -a extra_args=()
     local _ctrlpkt_name
     _ctrlpkt_name="$(_discover_ctrlpkt_binary "$TEST_SRC/$test_name")"
     if [[ -n "$_ctrlpkt_name" ]] && [[ -f "$build_dir/$_ctrlpkt_name" ]]; then
-        extra_args+=(--input "$build_dir/$_ctrlpkt_name")
+        extra_args+=(--ctrlpkt "$build_dir/$_ctrlpkt_name")
     fi
 
     if ! env "${env_prefix[@]}" "$runner" \

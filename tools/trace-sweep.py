@@ -388,7 +388,10 @@ def _run_one_side(
         "--trace-size", "1048576",
     ]
     if ctrlpkt and ctrlpkt.is_file():
-        cmd += ["--input", str(ctrlpkt)]
+        # --ctrlpkt binds to the classifier-identified ctrlpkt slot via
+        # libxdna_emu.so; falls back to positional --input if the lib
+        # isn't available at runtime.
+        cmd += ["--ctrlpkt", str(ctrlpkt)]
 
     env = os.environ.copy()
     env.update(runner_env)
