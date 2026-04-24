@@ -213,6 +213,38 @@ impl<'a> AieElf<'a> {
             })
     }
 
+    /// Load all PT_LOAD segments into the given compute tile's memories.
+    ///
+    /// Program-region segments land in program memory at their virtual
+    /// offset; data-region segments land in data memory at
+    /// `vaddr - AIE_DATA_MEMORY_BASE`. Symbol-region segments are
+    /// metadata and do not write memory. Out-of-bounds writes are
+    /// silently dropped (matching the pre-refactor callers' behavior).
+    ///
+    /// Canonicalises the ELF-to-tile loading that previously lived in
+    /// `interpreter::test_runner` (twice) and
+    /// `interpreter::engine::coordinator`.
+    pub fn load_into(&self, tile: &mut crate::device::tile::Tile) {
+        use xdna_archspec::aie2::memory_map::AIE_DATA_MEMORY_BASE;
+
+        for seg in self.load_segments() {
+            let vaddr = seg.vaddr as usize;
+            match seg.region {
+                MemoryRegion::Program => {
+                    tile.write_program(vaddr, seg.data);
+                }
+                MemoryRegion::Data => {
+                    let dm_offset = vaddr.saturating_sub(AIE_DATA_MEMORY_BASE as usize);
+                    let dm = tile.data_memory_mut();
+                    if dm_offset + seg.data.len() <= dm.len() {
+                        dm[dm_offset..dm_offset + seg.data.len()].copy_from_slice(seg.data);
+                    }
+                }
+                MemoryRegion::Stack | MemoryRegion::Unknown => {}
+            }
+        }
+    }
+
     /// Get the .text section (program code)
     pub fn text_section(&self) -> Option<&'a [u8]> {
         self.elf.section_headers.iter()

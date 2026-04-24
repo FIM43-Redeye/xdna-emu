@@ -14,7 +14,7 @@ use crate::device::dma::ChannelState;
 use crate::device::host_memory::HostMemory;
 use xdna_archspec::types::TileKind;
 use crate::device::DeviceState;
-use crate::parser::{AieElf, MemoryRegion};
+use crate::parser::AieElf;
 use crate::interpreter::bundle::VliwBundle;
 use crate::interpreter::core::{CoreInterpreter, CoreStatus, StepResult};
 use crate::interpreter::decode::InstructionDecoder;
@@ -492,25 +492,7 @@ impl InterpreterEngine {
         {
             let tile = self.device.tile_mut(col, row)
                 .ok_or_else(|| format!("Invalid tile coordinates ({}, {})", col, row))?;
-
-            for seg in elf.load_segments() {
-                let vaddr = seg.vaddr as usize;
-
-                match seg.region {
-                    MemoryRegion::Program => {
-                        tile.write_program(vaddr, seg.data);
-                    }
-                    MemoryRegion::Data => {
-                        // Data memory starts at 0x00070000 in AIE address space
-                        let dm_offset = vaddr.saturating_sub(0x00070000);
-                        let dm = tile.data_memory_mut();
-                        if dm_offset + seg.data.len() <= dm.len() {
-                            dm[dm_offset..dm_offset + seg.data.len()].copy_from_slice(seg.data);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            elf.load_into(tile);
         }
 
         // Set entry point and enable core

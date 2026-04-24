@@ -158,28 +158,7 @@ impl TestRunner {
         let tile = self.engine.device_mut().tile_mut(col as usize, row as usize)
             .ok_or_else(|| anyhow!("Invalid tile coordinates ({}, {})", col, row))?;
 
-        // Load segments
-        for seg in elf.load_segments() {
-            let vaddr = seg.vaddr as usize;
-            let data = seg.data;
-
-            match seg.region {
-                crate::parser::MemoryRegion::Program => {
-                    // Load into program memory
-                    tile.write_program(vaddr, data);
-                }
-                crate::parser::MemoryRegion::Data => {
-                    use xdna_archspec::aie2::memory_map::AIE_DATA_MEMORY_BASE;
-                    // Load into data memory (offset from data memory base)
-                    let dm_offset = vaddr.saturating_sub(AIE_DATA_MEMORY_BASE as usize);
-                    let dm = tile.data_memory_mut();
-                    if dm_offset + data.len() <= dm.len() {
-                        dm[dm_offset..dm_offset + data.len()].copy_from_slice(data);
-                    }
-                }
-                _ => {}
-            }
-        }
+        elf.load_into(tile);
 
         // Set entry point and enable
         self.engine.set_core_pc(col as usize, row as usize, elf.entry_point());
@@ -2163,30 +2142,23 @@ mod tests {
                     }
                 };
 
-                // Load segments
+                // Announce what's about to load (observability for the
+                // debug runner), then let the canonical loader copy bytes.
                 for seg in elf.load_segments() {
                     let vaddr = seg.vaddr as usize;
-                    let data = seg.data;
-
                     match seg.region {
-                        MemoryRegion::Program => {
-                            tile.write_program(vaddr, data);
-                            eprintln!("    Loaded {} bytes to program memory @ 0x{:x}",
-                                data.len(), vaddr);
-                        }
-                        MemoryRegion::Data => {
-                            use xdna_archspec::aie2::memory_map::AIE_DATA_MEMORY_BASE;
-                            let dm_offset = vaddr.saturating_sub(AIE_DATA_MEMORY_BASE as usize);
-                            let dm = tile.data_memory_mut();
-                            if dm_offset + data.len() <= dm.len() {
-                                dm[dm_offset..dm_offset + data.len()].copy_from_slice(data);
-                                eprintln!("    Loaded {} bytes to data memory @ 0x{:x}",
-                                    data.len(), dm_offset);
-                            }
-                        }
+                        MemoryRegion::Program => eprintln!(
+                            "    Loading {} bytes to program memory @ 0x{:x}",
+                            seg.data.len(), vaddr
+                        ),
+                        MemoryRegion::Data => eprintln!(
+                            "    Loading {} bytes to data memory @ vaddr 0x{:x}",
+                            seg.data.len(), vaddr
+                        ),
                         _ => {}
                     }
                 }
+                elf.load_into(tile);
 
                 // Set entry point and enable core
                 engine.set_core_pc(col as usize, row as usize, elf.entry_point());
