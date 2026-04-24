@@ -649,7 +649,8 @@ fn test_lock_event_reaches_trace_unit() {
     let hw_id = crate::trace::mem_event_to_hw_id(event);
     assert_eq!(hw_id, Some(45), "LOCK_SEL0_ACQ_GE should be event ID 45");
 
-    // Notify the trace unit and flush to check capture
+    // Notify the trace unit and flush to check capture.
+    // Flush drains any pending per-cycle mask before padding the final packet.
     tile.mem_trace.notify_event(45, 100);
     tile.mem_trace.flush();
     assert!(

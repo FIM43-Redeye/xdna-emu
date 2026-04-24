@@ -959,6 +959,23 @@ impl InterpreterEngine {
             }
         }
 
+        // Phase 3f: Commit per-cycle trace frames.
+        //
+        // Per AM020 event-time mode, a trace unit creates at most one frame
+        // per cycle. `notify_event` accumulates slot activity into a bitmask;
+        // committing here emits one Single/Multiple frame for this cycle.
+        // Without this step the mask only commits lazily on the next cycle's
+        // event, which can leave the last cycle's frame uncommitted past the
+        // simulation's natural end and inflate routing pressure for the
+        // uncommitted bytes when they eventually land at flush time.
+        {
+            let cycle = self.total_cycles;
+            for tile in &mut self.device.array.tiles {
+                tile.core_trace.commit_cycle(cycle);
+                tile.mem_trace.commit_cycle(cycle);
+            }
+        }
+
         // Phase 3e: Tick tile timers and performance counters.
         //
         // Each tile has two 64-bit timers (core module and memory module)

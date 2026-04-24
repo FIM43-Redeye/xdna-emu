@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// Notify a single event and immediately commit the frame for its cycle.
+///
+/// Matches the coordinator's per-cycle commit pass so tests exercising the
+/// Single0/1/2 encoding paths see byte-buffer growth right after the call
+/// without needing to chain an extra notify on a later cycle.
+fn notify_commit(tu: &mut TraceUnit, hw_id: u8, cycle: u64) {
+    tu.notify_event(hw_id, cycle);
+    tu.commit_cycle(cycle);
+}
+
 #[test]
 fn test_trace_unit_default_unconfigured() {
     let tu = TraceUnit::new(0, 2);
@@ -62,9 +72,9 @@ fn test_start_stop_state_machine() {
     tu.notify_event(28, 0);
     assert_eq!(tu.state, TraceState::Running);
 
-    // Matched event is encoded while running
+    // Matched event is encoded while running (per-cycle commit)
     let before = tu.byte_buffer.len();
-    tu.notify_event(37, 100);
+    notify_commit(&mut tu, 37, 100);
     assert!(tu.byte_buffer.len() > before);
 
     // Stop event transitions to Stopped
@@ -87,7 +97,7 @@ fn test_single0_encoding() {
     let start_len = tu.byte_buffer.len(); // Start marker = 8 bytes
 
     // Event with delta=5 (fits in Single0: 4-bit delta)
-    tu.notify_event(37, 5);
+    notify_commit(&mut tu, 37, 5);
     assert_eq!(tu.byte_buffer.len(), start_len + 1); // Single0 = 1 byte
 
     // Verify encoding: slot=0, delta=5 -> 0b00000101 = 0x05
@@ -104,7 +114,7 @@ fn test_single1_encoding() {
     let start_len = tu.byte_buffer.len();
 
     // Event with delta=500 (fits in Single1: 10-bit delta)
-    tu.notify_event(37, 500);
+    notify_commit(&mut tu, 37, 500);
     assert_eq!(tu.byte_buffer.len(), start_len + 2); // Single1 = 2 bytes
 
     // Verify encoding: slot=0, delta=500
@@ -127,7 +137,7 @@ fn test_single1_encoding_nonzero_slot() {
     // Slot 1, delta=500: format 0b100EEETT
     // byte0 = 0x80 | (1 << 2) | (500 >> 8 = 1) = 0x80 | 0x04 | 0x01 = 0x85
     // byte1 = 500 & 0xFF = 0xF4
-    tu.notify_event(38, 500);
+    notify_commit(&mut tu, 38, 500);
     assert_eq!(tu.byte_buffer[start_len], 0x85);
     assert_eq!(tu.byte_buffer[start_len + 1], 0xF4);
 
@@ -144,7 +154,7 @@ fn test_single2_encoding() {
     let start_len = tu.byte_buffer.len();
 
     // Event with delta=100000 (fits in Single2: 18-bit delta)
-    tu.notify_event(37, 100000);
+    notify_commit(&mut tu, 37, 100000);
     assert_eq!(tu.byte_buffer.len(), start_len + 3); // Single2 = 3 bytes
 
     // Verify encoding: slot=0, delta=100000 = 0x186A0
@@ -171,7 +181,7 @@ fn test_single2_encoding_nonzero_slot() {
     // Format: 0b101EEETT TTTTTTTT TTTTTTTT
     // byte0 = 0xA0 | (3 << 2) | (0x186A0 >> 16 = 1) = 0xA0 | 0x0C | 0x01 = 0xAD
     // byte1 = 0x86, byte2 = 0xA0
-    tu.notify_event(40, 100000);
+    notify_commit(&mut tu, 40, 100000);
     assert_eq!(tu.byte_buffer[start_len], 0xAD);
     assert_eq!(tu.byte_buffer[start_len + 1], 0x86);
     assert_eq!(tu.byte_buffer[start_len + 2], 0xA0);
@@ -194,10 +204,11 @@ fn test_packet_formation() {
     // Start tracing (emits 8-byte Start marker)
     tu.notify_event(28, 0);
 
-    // Generate enough Single0 events to fill 28 bytes
-    // Start marker is 8 bytes, so we need 20 more Single0 events (1 byte each)
+    // Generate enough Single0 events to fill 28 bytes. Each event fires on
+    // its own cycle and the per-cycle commit encodes it as 1 byte.
+    // Start marker is 8 bytes, so we need 20 more Single0 events.
     for i in 1..=20 {
-        tu.notify_event(37, i as u64); // delta=1 each time
+        notify_commit(&mut tu, 37, i as u64); // delta=1 each time
     }
 
     // Should have exactly one packet now (28 bytes consumed)
@@ -227,8 +238,8 @@ fn test_flush_pads_partial_packet() {
 
     // Start tracing and emit a few events
     tu.notify_event(28, 0);
-    tu.notify_event(37, 5);
-    tu.notify_event(37, 10);
+    notify_commit(&mut tu, 37, 5);
+    notify_commit(&mut tu, 37, 10);
 
     // Not enough for a full packet yet
     assert!(!tu.has_pending_packets());
@@ -266,7 +277,7 @@ fn test_unmatched_event_ignored() {
     let len_after_start = tu.byte_buffer.len();
 
     // Event 99 is not in any slot -- should be ignored
-    tu.notify_event(99, 50);
+    notify_commit(&mut tu, 99, 50);
     assert_eq!(tu.byte_buffer.len(), len_after_start);
 }
 
@@ -299,9 +310,9 @@ fn test_packet_header_parity() {
     tu.write_register(0x10, 37);
 
     tu.notify_event(28, 0);
-    // Generate 20 events to fill a packet
+    // Generate 20 events (each on its own cycle) to fill a packet
     for i in 1..=20 {
-        tu.notify_event(37, i as u64);
+        notify_commit(&mut tu, 37, i as u64);
     }
 
     let packet = tu.pop_packet().unwrap();
@@ -322,19 +333,19 @@ fn test_slot_index_in_encoding() {
     let start_len = tu.byte_buffer.len();
 
     // Slot 0, delta=1: 0b00000001 = 0x01
-    tu.notify_event(37, 1);
+    notify_commit(&mut tu, 37, 1);
     assert_eq!(tu.byte_buffer[start_len], 0x01);
 
     // Slot 1, delta=1: 0b00010001 = 0x11
-    tu.notify_event(38, 2);
+    notify_commit(&mut tu, 38, 2);
     assert_eq!(tu.byte_buffer[start_len + 1], 0x11);
 
     // Slot 2, delta=1: 0b00100001 = 0x21
-    tu.notify_event(39, 3);
+    notify_commit(&mut tu, 39, 3);
     assert_eq!(tu.byte_buffer[start_len + 2], 0x21);
 
     // Slot 3, delta=1: 0b00110001 = 0x31
-    tu.notify_event(40, 4);
+    notify_commit(&mut tu, 40, 4);
     assert_eq!(tu.byte_buffer[start_len + 3], 0x31);
 }
 
@@ -396,7 +407,7 @@ fn test_roundtrip_all_slots_all_formats() {
             let start_len = tu.byte_buffer.len(); // 8 bytes start marker
 
             let event_id = 37 + slot;
-            tu.notify_event(event_id, d); // delta = d (from start cycle 0)
+            notify_commit(&mut tu, event_id, d); // delta = d (from start cycle 0)
             let base = start_len;
             assert!(
                 tu.byte_buffer.len() >= base + expected_size,
@@ -501,7 +512,7 @@ fn test_packet_header_matches_mlir_aie_decoder() {
 
         tu.notify_event(28, 0);
         for i in 1..=20 {
-            tu.notify_event(37, i as u64);
+            notify_commit(&mut tu, 37, i as u64);
         }
 
         let packet = tu.pop_packet().unwrap();
@@ -519,4 +530,236 @@ fn test_packet_header_matches_mlir_aie_decoder() {
         assert_eq!(dec_type, pkt_type as u32, "pkt_type mismatch for pkt_type={}", pkt_type);
         assert_eq!(dec_id, pkt_id as u32, "pkt_id mismatch for pkt_type={}", pkt_type);
     }
+}
+
+// ===== Per-cycle coalescing / Multiple encoding (#138 regression tests) =====
+
+/// Two simultaneous events in the same cycle must coalesce into one
+/// Multiple0 frame (2 bytes), not two Single0 frames (1 byte each). The
+/// slot bits should appear in the mask portion and the cycle delta should
+/// appear once in the delta portion. This matches AM020 event-time mode
+/// and mlir-aie's `convert_to_commands` decoder for Multiple0.
+#[test]
+fn test_multiple0_two_slots_same_cycle() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    // slot 0 = 37, slot 3 = 40
+    tu.write_register(0x10, 37 | (40 << 24));
+
+    tu.notify_event(28, 0);
+    let start_len = tu.byte_buffer.len();
+
+    // Two events fire on cycle 5 (delta=5 from last emitted frame at 0).
+    tu.notify_event(37, 5);
+    tu.notify_event(40, 5);
+    tu.commit_cycle(5);
+
+    // Multiple0 = 2 bytes. Expected mask = 0b00001001 (slots 0 and 3).
+    assert_eq!(tu.byte_buffer.len(), start_len + 2,
+        "popcount=2 events should coalesce into Multiple0 (2 bytes)");
+
+    // byte0 bits [7:4] = 0b1100, bits [3:0] = mask[7:4] = 0b0000
+    // byte1 bits [7:4] = mask[3:0] = 0b1001, bits [3:0] = delta = 5
+    assert_eq!(tu.byte_buffer[start_len], 0xC0);
+    assert_eq!(tu.byte_buffer[start_len + 1], (0b1001 << 4) | 5);
+}
+
+/// Three simultaneous events with delta too large for Multiple0 must use
+/// Multiple1 (3 bytes, 10-bit delta).
+#[test]
+fn test_multiple1_three_slots_delta_500() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37 | (38 << 8) | (40 << 24)); // slots 0,1,3
+
+    tu.notify_event(28, 0);
+    let start_len = tu.byte_buffer.len();
+
+    tu.notify_event(37, 500);
+    tu.notify_event(38, 500);
+    tu.notify_event(40, 500);
+    tu.commit_cycle(500);
+
+    // Multiple1 = 3 bytes, mask=0b00001011, delta=500=0x1F4
+    assert_eq!(tu.byte_buffer.len(), start_len + 3);
+    let mask: u8 = 0b0000_1011;
+    let delta: u16 = 500;
+    // byte0 = 0b110100EE where E is mask[7:6]
+    assert_eq!(tu.byte_buffer[start_len], 0xD0 | (mask >> 6));
+    // byte1 = mask[5:0] in [7:2], delta[9:8] in [1:0]
+    assert_eq!(
+        tu.byte_buffer[start_len + 1],
+        ((mask & 0x3F) << 2) | ((delta >> 8) as u8 & 0x03)
+    );
+    assert_eq!(tu.byte_buffer[start_len + 2], (delta & 0xFF) as u8);
+}
+
+/// All 8 slots firing in the same cycle with a large delta must use
+/// Multiple2 (4 bytes, 18-bit delta). Regression test for #138: without
+/// per-cycle coalescing this would emit 8 Single-format frames inflating
+/// the byte stream by ~4x and overloading routing.
+#[test]
+fn test_multiple2_all_slots_delta_100000() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    // Fill all 8 slots with distinct event IDs.
+    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (40 << 24));
+    tu.write_register(0x14, 41 | (42 << 8) | (43 << 16) | (44 << 24));
+
+    tu.notify_event(28, 0);
+    let start_len = tu.byte_buffer.len();
+
+    for id in 37..=44 {
+        tu.notify_event(id, 100000);
+    }
+    tu.commit_cycle(100000);
+
+    // Multiple2 = 4 bytes, mask=0xFF, delta=100000=0x186A0 (18 bits)
+    assert_eq!(tu.byte_buffer.len(), start_len + 4);
+    let mask: u8 = 0xFF;
+    let delta: u32 = 100000;
+    assert_eq!(tu.byte_buffer[start_len], 0xD4 | (mask >> 6));
+    assert_eq!(
+        tu.byte_buffer[start_len + 1],
+        ((mask & 0x3F) << 2) | ((delta >> 16) as u8 & 0x03)
+    );
+    assert_eq!(tu.byte_buffer[start_len + 2], ((delta >> 8) & 0xFF) as u8);
+    assert_eq!(tu.byte_buffer[start_len + 3], (delta & 0xFF) as u8);
+}
+
+/// Mask decodes correctly via mlir-aie's `convert_to_commands` discriminator
+/// logic for each Multiple format. This is an end-to-end round-trip check
+/// that guarantees downstream tooling will read the bitmask exactly right.
+#[test]
+fn test_multiple_roundtrip_matches_mlir_aie() {
+    fn decode_multiple(buf: &[u8]) -> (u8, u64, usize) {
+        let b0 = buf[0];
+        if (b0 & 0xF0) == 0xC0 {
+            // Multiple0
+            let cycles = (buf[1] & 0x0F) as u64;
+            let mask = ((b0 & 0x0F) << 4) | (buf[1] >> 4);
+            (mask, cycles, 2)
+        } else if (b0 & 0xFC) == 0xD0 {
+            // Multiple1
+            let mask = ((b0 & 0x03) << 6) | (buf[1] >> 2);
+            let cycles = (((buf[1] & 0x03) as u64) << 8) | buf[2] as u64;
+            (mask, cycles, 3)
+        } else if (b0 & 0xFC) == 0xD4 {
+            // Multiple2
+            let mask = ((b0 & 0x03) << 6) | (buf[1] >> 2);
+            let cycles = (((buf[1] & 0x03) as u64) << 16)
+                | ((buf[2] as u64) << 8)
+                | buf[3] as u64;
+            (mask, cycles, 4)
+        } else {
+            panic!("not a Multiple byte: 0x{:02X}", b0);
+        }
+    }
+
+    let cases: &[(u8, u64, usize)] = &[
+        (0b0000_0011, 0, 2),        // Multiple0, delta=0
+        (0b1100_0011, 15, 2),       // Multiple0, max delta
+        (0b0101_0101, 16, 3),       // Multiple1 threshold
+        (0b1111_1111, 1023, 3),     // Multiple1 max
+        (0b1111_0000, 1024, 4),     // Multiple2 threshold
+        (0b1100_0011, 262143, 4),   // Multiple2 max
+    ];
+
+    for &(mask, delta, expected_size) in cases {
+        let mut tu = TraceUnit::new(0, 2);
+        tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+        tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (40 << 24));
+        tu.write_register(0x14, 41 | (42 << 8) | (43 << 16) | (44 << 24));
+
+        tu.notify_event(28, 0);
+        let base = tu.byte_buffer.len();
+
+        for i in 0u8..8 {
+            if mask & (1 << i) != 0 {
+                tu.notify_event(37 + i, delta);
+            }
+        }
+        tu.commit_cycle(delta);
+
+        assert_eq!(
+            tu.byte_buffer.len(),
+            base + expected_size,
+            "mask=0b{:08b} delta={}: encoded size",
+            mask, delta
+        );
+        let (dec_mask, dec_delta, consumed) = decode_multiple(&tu.byte_buffer[base..]);
+        assert_eq!(dec_mask, mask, "mask roundtrip for 0b{:08b} delta={}", mask, delta);
+        assert_eq!(dec_delta, delta, "delta roundtrip for 0b{:08b} delta={}", mask, delta);
+        assert_eq!(consumed, expected_size, "size roundtrip for 0b{:08b} delta={}", mask, delta);
+    }
+}
+
+/// Events that arrive for different cycles must each get their own frame.
+/// Lazy commit on cycle change: notifying a new cycle while a prior cycle
+/// has pending slots flushes the prior frame first.
+#[test]
+fn test_lazy_commit_on_cycle_change() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37 | (38 << 8)); // slot 0 = 37, slot 1 = 38
+
+    tu.notify_event(28, 0);
+    let start_len = tu.byte_buffer.len();
+
+    // Cycle 5: slot 0 fires. No commit yet.
+    tu.notify_event(37, 5);
+    assert_eq!(tu.byte_buffer.len(), start_len);
+    assert_eq!(tu.pending_slot_mask, 0b0000_0001);
+
+    // Cycle 10: slot 1 fires. Previous cycle's frame commits first.
+    tu.notify_event(38, 10);
+    // Single0 for slot 0 delta=5 = 0x05 (1 byte committed)
+    assert_eq!(tu.byte_buffer.len(), start_len + 1);
+    assert_eq!(tu.byte_buffer[start_len], 0x05);
+    assert_eq!(tu.pending_slot_mask, 0b0000_0010);
+
+    // commit_cycle(10) flushes the cycle-10 frame.
+    tu.commit_cycle(10);
+    // Single0 for slot 1 delta=5 = 0b00010101 = 0x15
+    assert_eq!(tu.byte_buffer.len(), start_len + 2);
+    assert_eq!(tu.byte_buffer[start_len + 1], 0x15);
+}
+
+/// With 8 slots firing every cycle for many cycles, the byte rate must stay
+/// bounded (at most 4 bytes/cycle for Multiple2 worst case) instead of
+/// scaling linearly with event count (which would be 8 Single0s/cycle = 8
+/// bytes/cycle). This is the core property that fixes #138's packet pile-up.
+#[test]
+fn test_per_cycle_coalesce_bounds_byte_rate() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (40 << 24));
+    tu.write_register(0x14, 41 | (42 << 8) | (43 << 16) | (44 << 24));
+
+    tu.notify_event(28, 0);
+    let start_len = tu.byte_buffer.len();
+
+    const CYCLES: u64 = 100;
+    for cycle in 1..=CYCLES {
+        for id in 37..=44 {
+            tu.notify_event(id, cycle);
+        }
+        tu.commit_cycle(cycle);
+    }
+
+    let bytes_emitted = tu.byte_buffer.len() + tu.pending_words.len() * 4 - start_len;
+    // Worst-case with delta=1: each cycle emits one Multiple0 = 2 bytes.
+    // Upper bound: CYCLES * 2 (plus some rounding from packetization).
+    // Legacy Single0-per-event encoding would emit CYCLES * 8 = 800 bytes;
+    // Multiple-coalesced encoding emits CYCLES * 2 = 200 bytes.
+    assert!(
+        bytes_emitted as u64 <= CYCLES * 3,
+        "8 slots over {} cycles should coalesce to <= {} bytes, got {}",
+        CYCLES, CYCLES * 3, bytes_emitted
+    );
+    assert!(
+        bytes_emitted as u64 >= CYCLES * 2,
+        "expected at least {} bytes for {} cycles of Multiple0, got {}",
+        CYCLES * 2, CYCLES, bytes_emitted
+    );
 }

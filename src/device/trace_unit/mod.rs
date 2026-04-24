@@ -16,15 +16,33 @@
 //!
 //! # Byte Encoding (from mlir-aie utils/trace/utils.py)
 //!
-//! Events are compressed into variable-length byte sequences:
+//! Events are compressed into variable-length byte sequences. Per AM020
+//! event-time mode tracks up to eight events "on a per-cycle basis" and
+//! creates ONE frame per cycle to record the state of the tracked events;
+//! when multiple slots fire in the same cycle they share one Multiple frame.
 //!
-//! | Type    | Pattern                          | Content                         |
-//! |---------|----------------------------------|---------------------------------|
-//! | Single0 | `0b0EEETTTT`                     | event(3), delta(4): 0-15 cycles |
-//! | Single1 | `0b100EEETT TTTTTTTT`            | event(3), delta(10): 0-1023     |
-//! | Single2 | `0b101EEETT TTTTTTTT TTTTTTTT`   | event(3), delta(18): 0-262143   |
-//! | Start   | `0b11110000 + 7 bytes timer`     | 56-bit timer sync               |
-//! | Pad     | `0xFE`                           | Fills remainder of packet       |
+//! | Type      | Pattern                                     | Content                                        |
+//! |-----------|---------------------------------------------|------------------------------------------------|
+//! | Single0   | `0b0EEETTTT`                                | slot(3), delta(4): 0-15 cycles                 |
+//! | Single1   | `0b100EEETT TTTTTTTT`                       | slot(3), delta(10): 0-1023                     |
+//! | Single2   | `0b101EEETT TTTTTTTT TTTTTTTT`              | slot(3), delta(18): 0-262143                   |
+//! | Multiple0 | `0b1100EEEE EEEETTTT`                       | mask(8), delta(4)                              |
+//! | Multiple1 | `0b110100EE EEEEEETT TTTTTTTT`              | mask(8), delta(10)                             |
+//! | Multiple2 | `0b110101EE EEEEEETT TTTTTTTT TTTTTTTT`     | mask(8), delta(18)                             |
+//! | Start     | `0b11110000 + 7 bytes timer`                | 56-bit timer sync                              |
+//! | Pad       | `0xFE`                                      | Fills remainder of packet                      |
+//!
+//! Discriminators and field placements match mlir-aie's
+//! `python/utils/trace/utils.py::convert_to_commands` decoder.
+//!
+//! # Per-cycle coalescing
+//!
+//! `notify_event` accumulates fired slots for the current cycle into a
+//! bitmask without emitting bytes. Emission happens in `commit_cycle()`
+//! (called per cycle by the coordinator) or lazily when a new cycle's
+//! event arrives. This matches the HW invariant of "at most one frame per
+//! cycle" and avoids the inflation that led to trace undercount when many
+//! slots were active (issue #138).
 //!
 //! # Packet Format
 //!
@@ -109,8 +127,15 @@ pub struct TraceUnit {
     pub(super) state: TraceState,
     /// Cycle counter (starts when tracing begins).
     timer: u64,
-    /// Cycle of the last encoded event (for delta computation).
+    /// Cycle of the last *emitted* frame (for delta computation). Updated
+    /// when `commit_cycle()` flushes the pending slot mask.
     last_event_cycle: u64,
+    /// Cycle that `pending_slot_mask` is being accumulated for. All slot
+    /// bits set before this cycle advances are coalesced into one frame.
+    pending_cycle: u64,
+    /// Bitmask of slots whose events have fired during `pending_cycle`.
+    /// Flushed by `commit_cycle()` or lazily on next-cycle event arrival.
+    pub(super) pending_slot_mask: u8,
     /// Accumulated encoded bytes waiting to be packed into packets.
     pub(super) byte_buffer: Vec<u8>,
     /// Individual words ready for emission to the stream switch.
@@ -144,6 +169,8 @@ impl TraceUnit {
             state: TraceState::Idle,
             timer: 0,
             last_event_cycle: 0,
+            pending_cycle: 0,
+            pending_slot_mask: 0,
             byte_buffer: Vec::with_capacity(64),
             pending_words: VecDeque::new(),
             col,
@@ -275,11 +302,21 @@ impl TraceUnit {
 
     /// Notify the trace unit of a hardware event at the given cycle.
     ///
-    /// If the event matches a configured slot, it is encoded and buffered.
+    /// If the event matches a configured slot, its bit is set in the
+    /// pending cycle mask but not encoded immediately. Bytes are emitted
+    /// at cycle boundaries by `commit_cycle()` (or lazily when a new cycle
+    /// arrives), which matches HW's "one frame per cycle" behavior.
+    ///
     /// Start/stop events control the tracing state machine.
     pub fn notify_event(&mut self, hw_event_id: u8, cycle: u64) {
         if !self.configured {
             return;
+        }
+
+        // If we have a pending cycle frame and the event is for a newer
+        // cycle, commit the old frame before accumulating into the new one.
+        if cycle != self.pending_cycle && self.pending_slot_mask != 0 {
+            self.commit_pending_frame();
         }
 
         // Check for start/stop events
@@ -287,6 +324,8 @@ impl TraceUnit {
             self.state = TraceState::Running;
             self.timer = cycle;
             self.last_event_cycle = cycle;
+            self.pending_cycle = cycle;
+            self.pending_slot_mask = 0;
             // Emit a Start marker with the current timer value
             self.encode_start(cycle);
             log::debug!(
@@ -318,13 +357,28 @@ impl TraceUnit {
             None => return, // Event not in any slot
         };
 
-        // Encode the event with cycle delta
-        let delta = cycle.saturating_sub(self.last_event_cycle);
-        self.last_event_cycle = cycle;
-        self.encode_single(slot, delta);
+        // Accumulate into the pending-cycle mask.
+        self.pending_cycle = cycle;
+        self.pending_slot_mask |= 1 << slot;
+    }
 
-        // Check if we have enough bytes for a complete packet
-        self.try_emit_packet();
+    /// Commit any accumulated slot activity for cycles <= `cycle`.
+    ///
+    /// Called by the coordinator at the end of every cycle in which one or
+    /// more trace events may have fired. Writes exactly one frame (Single
+    /// or Multiple encoding) to the byte buffer for each cycle that had
+    /// any pending events, matching the HW "one frame per cycle" rule.
+    pub fn commit_cycle(&mut self, cycle: u64) {
+        if self.state != TraceState::Running {
+            return;
+        }
+        if self.pending_slot_mask == 0 {
+            return;
+        }
+        if self.pending_cycle > cycle {
+            return;
+        }
+        self.commit_pending_frame();
     }
 
     /// Advance the timer. Called each cycle to keep the internal clock in sync.
@@ -375,7 +429,14 @@ impl TraceUnit {
     }
 
     /// Flush any remaining bytes as a padded final packet.
+    ///
+    /// Commits any pending same-cycle accumulation first so its frame lands
+    /// in the byte buffer before padding is applied.
     pub fn flush(&mut self) {
+        if self.pending_slot_mask != 0 {
+            self.commit_pending_frame();
+        }
+
         if self.byte_buffer.is_empty() {
             return;
         }
@@ -394,6 +455,33 @@ impl TraceUnit {
     }
 
     // -- Internal encoding methods --
+
+    /// Commit the pending slot mask for `pending_cycle` as one HW-accurate
+    /// trace frame. The encoding is chosen from the mask's popcount:
+    ///
+    /// - popcount == 1: Single0/1/2 (1/2/3 bytes)
+    /// - popcount >= 2: Multiple0/1/2 (2/3/4 bytes)
+    ///
+    /// This matches AM020 event-time mode, which creates at most one frame
+    /// per cycle and groups simultaneous slot activity with the Multiple
+    /// encodings documented in mlir-aie's parse.py.
+    fn commit_pending_frame(&mut self) {
+        let mask = self.pending_slot_mask;
+        if mask == 0 {
+            return;
+        }
+        let delta = self.pending_cycle.saturating_sub(self.last_event_cycle);
+        self.last_event_cycle = self.pending_cycle;
+        self.pending_slot_mask = 0;
+
+        if mask.count_ones() == 1 {
+            let slot = mask.trailing_zeros() as u8;
+            self.encode_single(slot, delta);
+        } else {
+            self.encode_multiple(mask, delta);
+        }
+        self.try_emit_packet();
+    }
 
     /// Encode a single event with a cycle delta.
     ///
@@ -436,6 +524,62 @@ impl TraceUnit {
             self.byte_buffer.push(byte0);
             self.byte_buffer.push(byte1);
             self.byte_buffer.push(byte2);
+        }
+    }
+
+    /// Encode multiple simultaneous events as one Multiple0/1/2 frame.
+    ///
+    /// Bit layouts match mlir-aie's `convert_to_commands` decoder:
+    ///
+    /// Multiple0: `0b1100EEEE EEEETTTT` (2 bytes)
+    ///   - byte0 bits [7:4] = 0b1100 (discriminator)
+    ///   - byte0 bits [3:0] = mask[7:4] (high nibble of slot bitmask)
+    ///   - byte1 bits [7:4] = mask[3:0] (low nibble of slot bitmask)
+    ///   - byte1 bits [3:0] = delta (4 bits, 0-15)
+    ///
+    /// Multiple1: `0b110100EE EEEEEETT TTTTTTTT` (3 bytes)
+    ///   - byte0 bits [7:2] = 0b110100 (discriminator)
+    ///   - byte0 bits [1:0] = mask[7:6]
+    ///   - byte1 bits [7:2] = mask[5:0]
+    ///   - byte1 bits [1:0] = delta[9:8]
+    ///   - byte2        = delta[7:0] (total 10 bits, 0-1023)
+    ///
+    /// Multiple2: `0b110101EE EEEEEETT TTTTTTTT TTTTTTTT` (4 bytes)
+    ///   - byte0 bits [7:2] = 0b110101 (discriminator)
+    ///   - byte0 bits [1:0] = mask[7:6]
+    ///   - byte1 bits [7:2] = mask[5:0]
+    ///   - byte1 bits [1:0] = delta[17:16]
+    ///   - byte2        = delta[15:8]
+    ///   - byte3        = delta[7:0] (total 18 bits, 0-262143)
+    fn encode_multiple(&mut self, mask: u8, delta: u64) {
+        debug_assert!(mask.count_ones() >= 2);
+
+        if delta <= 15 {
+            // Multiple0 (2 bytes)
+            let byte0 = 0xC0 | (mask >> 4);
+            let byte1 = ((mask & 0x0F) << 4) | (delta as u8 & 0x0F);
+            self.byte_buffer.push(byte0);
+            self.byte_buffer.push(byte1);
+        } else if delta <= 1023 {
+            // Multiple1 (3 bytes)
+            let d = delta as u16;
+            let byte0 = 0xD0 | (mask >> 6);
+            let byte1 = ((mask & 0x3F) << 2) | ((d >> 8) as u8 & 0x03);
+            let byte2 = (d & 0xFF) as u8;
+            self.byte_buffer.push(byte0);
+            self.byte_buffer.push(byte1);
+            self.byte_buffer.push(byte2);
+        } else {
+            // Multiple2 (4 bytes), clamp delta to 18 bits
+            let d = delta.min(0x3FFFF) as u32;
+            let byte0 = 0xD4 | (mask >> 6);
+            let byte1 = ((mask & 0x3F) << 2) | ((d >> 16) as u8 & 0x03);
+            let byte2 = ((d >> 8) & 0xFF) as u8;
+            let byte3 = (d & 0xFF) as u8;
+            self.byte_buffer.push(byte0);
+            self.byte_buffer.push(byte1);
+            self.byte_buffer.push(byte2);
+            self.byte_buffer.push(byte3);
         }
     }
 
