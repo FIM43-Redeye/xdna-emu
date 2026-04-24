@@ -69,7 +69,11 @@ def load_dir(d: Path) -> List[ComboMatrix]:
     """
     combos: List[ComboMatrix] = []
     for p in sorted(d.glob("*.json")):
-        if p.name.endswith(".merged.json") or p.name == "summary.json":
+        # Skip our own non-combo outputs: merged timelines from
+        # trace-sweep.py and any summary.*.json (harness writes
+        # summary.json, merge-sweep-results.py writes summary.hw.json
+        # and summary.emu.json).
+        if p.name.endswith(".merged.json") or p.name.startswith("summary"):
             continue
         try:
             combos.append(load_combo(p))
