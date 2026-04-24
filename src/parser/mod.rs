@@ -7,11 +7,13 @@
 //! - [`cdo`] - Configuration Data Objects (tile setup commands)
 //! - [`elf`] - AIE core ELF executables
 
+pub mod error;
 pub mod xclbin;
 pub mod aie_partition;
 pub mod cdo;
 pub mod elf;
 
+pub use error::ParseError;
 pub use xclbin::Xclbin;
 pub use aie_partition::AiePartition;
 pub use cdo::Cdo;
