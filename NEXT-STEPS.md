@@ -3,9 +3,34 @@
 Recovery document for picking up this refactor in a future session. Read
 this first, then dive into the authoritative artifacts below.
 
-**Last updated:** 2026-04-24 (Phase 1b Subsystem 8 Stage 8b landed; Stage 8c up next -- diagnostics, fixtures, ELF dedup, control-packet alignment)
-**Current branch:** `dev` (no master merges until the refactor is done)
-**Latest tag:** `phase1-subsys-parser-coupling` (Subsystem 8 Stage 8b completion)
+**Last updated:** 2026-04-24 (Phase 1 COMPLETE -- all 8 subsystems landed)
+**Current branch:** `dev` (no master merges until Phase 2 hygiene is scoped)
+**Latest tag:** `phase1-subsys-parser-ergonomics` (Subsystem 8 Stage 8c completion; Phase 1 done)
+
+---
+
+## Phase 1 Complete
+
+All eight Phase 1b subsystems have landed with per-seam design notes, arch data migrated to `xdna-archspec`, and stage-close tags applied. Subsystem 8 completed today across three stages:
+
+- `phase1-subsys-parser-arch` (Stage 8a -- audit + data migrations + BinaryLoader no-trait decision)
+- `phase1-subsys-parser-coupling` (Stage 8b -- CDO layer split + 8-variant DeviceOp vocabulary + device/state migration)
+- `phase1-subsys-parser-ergonomics` (Stage 8c -- ParseError diagnostics + test-fixture builders + ELF load canonicalisation + control-packet non-overlap doc)
+
+**All eight subsystem tags:**
+
+- `phase1-subsys-regs-mem` (1: Registers & Memory Map)
+- `phase1-subsys-tile-topo` (2: Tile Topology)
+- `phase1-subsys-dma` (3: DMA Engine & BD Format)
+- `phase1-subsys-locks` (4: Locks)
+- `phase1-subsys-stream-switch` (5: Stream Switch)
+- `phase1-subsys-isa-decode` (6: ISA Decode)
+- `phase1-subsys-isa-execute` (7: ISA Execute)
+- `phase1-subsys-parser-{arch,coupling,ergonomics}` (8: Parser)
+
+**What comes next.** Phase 2 hygiene: dead-code cleanup (archspec's `types.rs`, `regdb.rs`, `tablegen.rs` have unused methods / fields from earlier subsystems' migrations), stale examples (`run_add_test.rs`, `bdd_validate.rs`, `arch_constants.rs` reference dissolved `xdna_emu::arch` / `xdna_emu::tablegen` modules), and follow-ups surfaced during the refactor (extending DeviceOp to cover non-CDO write paths like NPU instructions and control packets; memtile/shim DMA promotion; arch-generic `MemoryRegion::from_address`). Each deserves its own brainstorm + plan cycle.
+
+**Master merge.** Dev is currently 13+ commits ahead of master. Merging is at user discretion; suggested milestone is to tag `phase1-complete` on dev first, then decide whether to squash-merge or fast-forward-merge to master.
 
 ---
 
@@ -99,34 +124,37 @@ on it):**
 
 ---
 
-## Stage 8b Closed -- What Landed
+## Subsystem 8 -- What Landed
 
-**`phase1-subsys-parser-coupling` tags the close of Stage 8b.** The DeviceOp
-vocabulary is live, the CDO module is split along framing / syntax / semantics
-lines, and `device::state::apply_cdo` now consumes typed `DeviceOp`s produced
-by `semantics::lower` instead of matching on `CdoRaw` directly.
+**Stage 8a** (`phase1-subsys-parser-arch`): audit + data migrations (`EM_AIE` /
+`AieArchitecture` → archspec) + BinaryLoader no-trait decision (see
+`docs/arch/binary-loader-model.md`).
+
+**Stage 8b** (`phase1-subsys-parser-coupling`): CDO module split along framing
+/ syntax / semantics lines + 8-variant `DeviceOp` vocabulary + `device::state`
+consumes `DeviceOp` via `semantics::lower`.
 
 **Final DeviceOp shape (8 variants):** `RegWrite`, `RegMask`, `RegBurst`,
-`CoreEnable`, `DmaStart`, `MaskPoll`, `Delay`, `Marker`.
+`CoreEnable`, `DmaStart`, `MaskPoll`, `Delay`, `Marker`. Two post-gate
+revisions reshaped the enum during implementation:
 
-Two post-gate revisions reshaped the enum during implementation:
+1. **Dropped `RegWrite64` / `RegMask64`** (commit `48be765`). Explore audit of
+   AM025 + aie-rt found zero 64-bit MMIO registers; CDO `Write64` means 64-bit
+   *address*, not value. Variants come back with real producers if a future
+   arch needs them.
 
-1. **Dropped `RegWrite64` / `RegMask64`** (commit `48be765`). Gate concern was
-   "Write64 truncation = silent data loss." Explore audit of the AM025 register
-   database (1,806 registers, zero 64-bit MMIO entries) and aie-rt headers (no
-   `XAie_Write64` API) showed CDO `Write64` means 64-bit *address*, not
-   64-bit value. The existing `device/state` already truncated to u32 with
-   no information loss. If a future arch adds genuine 64-bit MMIO, the variants
-   come back with real producers behind them.
+2. **`DmaStart` promotes Start_Queue writes, not Ctrl writes** (commit
+   `38c7cfa`). Start_Queue is the hardware transfer trigger; Ctrl is channel
+   config. Archspec `dma` submodule gained `COMPUTE_DMA_*_START_QUEUE`
+   consts.
 
-2. **`DmaStart` promotes Start_Queue writes, not Ctrl writes** (commit `38c7cfa`).
-   First-pass Task 11 matched DMA Ctrl; hardware actually triggers transfers on
-   `Start_Queue` (Ctrl + 4). Ctrl is channel-level configuration. The archspec
-   `dma` submodule gained `COMPUTE_DMA_*_START_QUEUE` consts (AM025 offsets
-   0x1DE04/0x1DE0C/0x1DE14/0x1DE1C) with drift-detection tests.
-
-Both promotions carry raw register data so `device/state` can store it for
-readback: `CoreEnable { enabled, value }`, `DmaStart { channel, dir, bd_id }`.
+**Stage 8c** (`phase1-subsys-parser-ergonomics`): `ParseError` enum for
+structured diagnostics (replaces 15 `anyhow!`/`bail!` sites across 4 parser
+files), test-fixture builders (`XclbinBuilder`, `CdoBuilder`, `ElfBuilder`
+with 10 round-trip tests through the real parsers), `AieElf::load_into`
+canonical ELF-to-tile loader (consolidating 3 duplicated sites in
+test_runner + coordinator), and a non-overlap doc comment in
+`control_packets/parser.rs` per audit §7.
 
 ### Known follow-up: non-CDO write paths still bypass DeviceOp
 
@@ -141,9 +169,8 @@ functions are also reached from:
 Removing the branches would silently drop the enable/start side effects for
 those paths. The CDO path is fully typed and branches-through-DeviceOp;
 non-CDO paths remain offset-dispatched. Extending DeviceOp to be the
-universal device-write boundary (not just the CDO-parser boundary) is its
-own refactor scope -- future audit-first subsystem work, not a Stage 8b
-extension. See `docs/arch/subsys8-audit.md` epilogue.
+universal device-write boundary (not just the CDO-parser boundary) is Phase 2
+scope. See `docs/arch/subsys8-audit.md` epilogue.
 
 ---
 
@@ -251,7 +278,7 @@ when we start it -- don't try to pre-write all 8 subsystem plans.
 | 4 | Locks | `phase1-subsys-locks` | **Done** | Small seam: 3-method LockModel trait (supports_acquire_eq, supports_dynamic_value_ops, value_layout) + LockValueLayout carrier + Aie2LockModel. Migrated `sign_extend_lock_value` + lock_value_* fields from xdna-emu's DeviceRegLayout wrapper to archspec; wrapper collapsed. See docs/arch/lock-model.md. |
 | 5 | Stream Switch | `phase1-subsys-stream-switch` | **Done** | Two-method `StreamSwitchModel` trait (`supports_deterministic_merge` + `topology`) + `StreamSwitchTopology` carrier (3 `TileStreamPorts` sub-structs with `for_tile(TileKind)` accessor) + `Aie2StreamSwitchModel`. Dead-code `PortLayout` extension trait (231 LOC) deleted; 3 tests migrated to archspec. 6 tile-construction sites in `stream_switch/mod.rs` migrated through `arch_handle::stream_switch_topology()`. Direct archspec-constant consumers (`routing.rs`, `stream_io.rs`, `state/`) stay on direct access as AIE1-landing follow-ups. See `docs/arch/stream-switch-model.md`. |
 | 7 | ISA Execute | `phase1-subsys-isa-execute` | **Done** | Audit concluded Approach A (zero trait methods warranted): all divergence is data-expressible. `IsaExecutor` trait ships empty as a stable anchor. 11 data migrations landed across 5 tasks -- `vmac_routing.rs` (234K) + `vector_permute.rs` tables + `RoundingMode` dedup + matmul/UPS/cascade data + 5 accessor bundles. `has_cascade_link: bool` feature flag added to `ProcessorModel`. AIE1/AIE2P ports now "populate archspec; no execute/ edits." See `docs/arch/isa-execute-model.md` + `docs/arch/subsys7-audit.md`. |
-| 8 | Parser (XCLBIN / PDI / ELF) | `phase1-subsys-parser` | **Stages 8a + 8b done (`phase1-subsys-parser-arch`, `phase1-subsys-parser-coupling`); Stage 8c (ergonomics) up next** | Container format variance. `BinaryLoader` trait (decided: no trait; see `docs/arch/binary-loader-model.md`). CDO three-layer split + 8-variant DeviceOp vocab + device/state DeviceOp boundary (8b done). ELF dedup + diagnostics + fixtures + control-packet alignment (8c). |
+| 8 | Parser (XCLBIN / PDI / ELF) | `phase1-subsys-parser-{arch,coupling,ergonomics}` | **Done** | Container format variance. `BinaryLoader` trait (decided: no trait; see `docs/arch/binary-loader-model.md`). CDO three-layer split + 8-variant DeviceOp vocab + device/state DeviceOp boundary (8b). ParseError diagnostics + test-fixture builders + `AieElf::load_into` canonical loader + control-packet non-overlap doc (8c). See `docs/arch/subsys8-audit.md`. |
 
 **End state after Phase 1:** adding AIE2P is "implement the traits for a
 second arch"; adding AIE1/Versal is "implement the traits + extend for
