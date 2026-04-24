@@ -16,9 +16,25 @@
 // trace buffer as the LAST buffer kernarg after inputs/outputs are
 // accounted for. This is position-robust across toolchain versions.
 //
+// Two invocation modes:
+//
+//   Single-shot (legacy):
+//     bridge-trace-runner --xclbin A.xclbin --instr insts.bin \
+//                         --trace-out trace.bin [--input ...] [...]
+//
+//   Batch (session):
+//     bridge-trace-runner --batch-stdin [--xclbin A.xclbin] [--kernel NAME]
+//     # Each line on stdin is a set of per-run args in the same CLI syntax
+//     # (minus --xclbin/--kernel which are inherited from the outer CLI).
+//     # Per line, the runner emits one JSON status object on stdout.
+//     # When --xclbin varies across lines, the runner caches prepared-kernel
+//     # state per xclbin so device/xclbin/hw_context/kernel are each built
+//     # exactly once per unique xclbin across the session.
+//
 // Output: raw trace buffer contents written to --trace-out, ready to be
-// parsed by tools/trace-to-cycles.py.
+// parsed by tools/parse-trace.py.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -26,8 +42,12 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <fstream>
+#include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 #include "xrt/xrt_bo.h"
@@ -58,14 +78,27 @@ constexpr uint8_t ROLE_CTRLPKT   = 2;
 using classify_fn_t = int64_t (*)(const void*, uint64_t, const void*, uint64_t,
                                   ClassifierRole*, uint64_t);
 
-struct CliArgs {
-    std::string xclbin;
+// CLI args split into two scopes:
+//   OuterArgs: set once per process. In single-shot mode these fully describe
+//              the one run; in batch mode they supply session-level defaults
+//              (xclbin, kernel, verbose) that each batch line can override.
+//   RunArgs:   per-run parameters. Built from the outer CLI in single-shot
+//              mode, or rebuilt per stdin line in batch mode.
+struct OuterArgs {
+    std::string xclbin;            // default xclbin when --batch-stdin lines omit one
     std::string kernel_name;       // empty = auto-detect single kernel
-    std::string instr_bin;         // path to insts.bin
-    std::string trace_out;         // where to dump raw trace bytes
-    std::vector<std::string> inputs;   // paths to input buffer binaries
-    std::vector<std::string> outputs;  // paths where outputs get written
-    std::vector<std::string> ctrlpkts; // paths to ctrlpkt blobs
+    bool batch_stdin = false;
+    bool verbose = false;
+};
+
+struct RunArgs {
+    std::string xclbin;            // may override outer default in batch mode
+    std::string kernel_name;       // may override outer default in batch mode
+    std::string instr_bin;
+    std::string trace_out;
+    std::vector<std::string> inputs;
+    std::vector<std::string> outputs;
+    std::vector<std::string> ctrlpkts;
     // Default 1 MiB. Large enough that event-heavy workloads (lock-
     // intensive kernels, full-event sweeps) don't silently truncate
     // mid-trace. The trace unit has no backpressure -- once the BO
@@ -74,68 +107,145 @@ struct CliArgs {
     // cause was "buffer ran out." 1 MiB still fits comfortably in host
     // memory and NPU BO allocation limits.
     uint64_t trace_size_bytes = 1u << 20;
-    bool verbose = false;
 };
 
 void print_usage(const char* argv0) {
     std::fprintf(stderr,
-        "usage: %s --xclbin <path> --instr <insts.bin> "
-        "--trace-out <path> [--kernel <name>] [--input <bin>]... "
-        "[--output <path>]... [--trace-size N] [-v]\n"
+        "usage:\n"
+        "  %s --xclbin <path> --instr <insts.bin> --trace-out <path> \\\n"
+        "     [--kernel <name>] [--input <bin>]... [--output <path>]... \\\n"
+        "     [--ctrlpkt <bin>]... [--trace-size N] [-v]\n"
+        "\n"
+        "  %s --batch-stdin [--xclbin <path>] [--kernel <name>] [-v]\n"
+        "     # read one command line per stdin line in the same syntax\n"
+        "     # as above (minus --xclbin/--kernel unless overriding); emits\n"
+        "     # a single-line JSON status per run on stdout.\n"
         "\n"
         "Generic XRT runner for trace-instrumented AIE xclbins.\n"
         "Kernel args are discovered from xclbin metadata -- no hardcoded\n"
         "group_id mapping. The trace buffer is identified as the last\n"
         "buffer kernarg after inputs/outputs.\n",
-        argv0);
+        argv0, argv0);
 }
 
-int parse_cli(int argc, char** argv, CliArgs& out) {
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto need_val = [&](const char* flag) -> const char* {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr, "error: %s needs a value\n", flag);
-                std::exit(1);
+// Tokenise a stdin command line into argv-style tokens. Supports simple
+// whitespace splitting plus "double-quoted" substrings so paths with
+// spaces pass through intact. No escape handling -- callers just avoid
+// embedded quotes in paths, which the trace sweep never produces.
+std::vector<std::string> tokenize_line(const std::string& line) {
+    std::vector<std::string> out;
+    std::string cur;
+    bool in_quote = false;
+    for (char c : line) {
+        if (c == '"') {
+            in_quote = !in_quote;
+            continue;
+        }
+        if (!in_quote && (c == ' ' || c == '\t')) {
+            if (!cur.empty()) { out.push_back(cur); cur.clear(); }
+            continue;
+        }
+        cur.push_back(c);
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+// Parse a token list into {outer, run}. In batch-stdin mode the caller
+// passes tokens from one stdin line and sets is_batch_line=true, which
+// skips the single-shot required-args check and allows omitted
+// --xclbin/--kernel (they inherit from outer). Returns 0 on success.
+int parse_tokens(const std::vector<std::string>& tokens,
+                 OuterArgs& outer, RunArgs& run,
+                 bool is_batch_line, const char* argv0) {
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const std::string& a = tokens[i];
+        auto need_val = [&](const char* flag) -> std::string {
+            if (i + 1 >= tokens.size()) {
+                throw std::runtime_error(std::string("error: ") + flag + " needs a value");
             }
-            return argv[++i];
+            return tokens[++i];
         };
-        if (a == "--xclbin")            out.xclbin = need_val("--xclbin");
-        else if (a == "--kernel")       out.kernel_name = need_val("--kernel");
-        else if (a == "--instr")        out.instr_bin = need_val("--instr");
-        else if (a == "--trace-out")    out.trace_out = need_val("--trace-out");
-        else if (a == "--input")        out.inputs.push_back(need_val("--input"));
-        else if (a == "--output")       out.outputs.push_back(need_val("--output"));
-        else if (a == "--ctrlpkt")      out.ctrlpkts.push_back(need_val("--ctrlpkt"));
+        if (a == "--xclbin")            run.xclbin = need_val("--xclbin");
+        else if (a == "--kernel")       run.kernel_name = need_val("--kernel");
+        else if (a == "--instr")        run.instr_bin = need_val("--instr");
+        else if (a == "--trace-out")    run.trace_out = need_val("--trace-out");
+        else if (a == "--input")        run.inputs.push_back(need_val("--input"));
+        else if (a == "--output")       run.outputs.push_back(need_val("--output"));
+        else if (a == "--ctrlpkt")      run.ctrlpkts.push_back(need_val("--ctrlpkt"));
+        else if (a == "--batch-stdin") {
+            if (is_batch_line) {
+                throw std::runtime_error("error: --batch-stdin is not allowed on a batch input line");
+            }
+            outer.batch_stdin = true;
+        }
         else if (a == "--trace-size") {
             // strtoull silently wraps negatives to UINT64_MAX and accepts any
             // leading garbage -- validate explicitly so "-1" or "foo" fail loud.
-            const char* val = need_val("--trace-size");
-            if (val[0] == '-' || val[0] == '\0') {
-                std::fprintf(stderr, "error: --trace-size must be a non-negative integer, got '%s'\n", val);
-                return 1;
+            std::string val = need_val("--trace-size");
+            if (val.empty() || val[0] == '-') {
+                throw std::runtime_error(
+                    "error: --trace-size must be a non-negative integer, got '" + val + "'");
             }
             char* end = nullptr;
-            out.trace_size_bytes = std::strtoull(val, &end, 0);
-            if (end == val || *end != '\0') {
-                std::fprintf(stderr, "error: --trace-size must be a non-negative integer, got '%s'\n", val);
+            run.trace_size_bytes = std::strtoull(val.c_str(), &end, 0);
+            if (end == val.c_str() || *end != '\0') {
+                throw std::runtime_error(
+                    "error: --trace-size must be a non-negative integer, got '" + val + "'");
+            }
+        }
+        else if (a == "-v" || a == "--verbose") outer.verbose = true;
+        else if (a == "-h" || a == "--help") { print_usage(argv0); std::exit(0); }
+        else {
+            throw std::runtime_error(std::string("error: unknown arg: ") + a);
+        }
+    }
+    if (!is_batch_line) {
+        // Single-shot: all three paths required. In batch mode the outer
+        // CLI may carry only --xclbin/--kernel/--verbose/--batch-stdin.
+        if (outer.batch_stdin) {
+            // Batch: instr/trace-out come on stdin, not the outer CLI.
+            if (!run.instr_bin.empty() || !run.trace_out.empty()) {
+                std::fprintf(stderr, "warning: --instr/--trace-out on outer CLI are ignored in --batch-stdin mode\n");
+                run.instr_bin.clear();
+                run.trace_out.clear();
+            }
+        } else {
+            if (run.xclbin.empty() || run.instr_bin.empty() || run.trace_out.empty()) {
+                std::fprintf(stderr, "error: --xclbin, --instr, and --trace-out are required\n");
+                print_usage(argv0);
                 return 1;
             }
         }
-        else if (a == "-v" || a == "--verbose") out.verbose = true;
-        else if (a == "-h" || a == "--help") { print_usage(argv[0]); std::exit(0); }
-        else {
-            std::fprintf(stderr, "error: unknown arg: %s\n", a.c_str());
-            print_usage(argv[0]);
-            return 1;
+        // Promote run-level xclbin/kernel to outer defaults so the batch loop
+        // (if any) inherits them. Single-shot doesn't care which it reads from.
+        if (!run.xclbin.empty() && outer.xclbin.empty()) outer.xclbin = run.xclbin;
+        if (!run.kernel_name.empty() && outer.kernel_name.empty())
+            outer.kernel_name = run.kernel_name;
+    } else {
+        // Batch line: inherit xclbin/kernel if not specified on this line.
+        if (run.xclbin.empty()) run.xclbin = outer.xclbin;
+        if (run.kernel_name.empty()) run.kernel_name = outer.kernel_name;
+        if (run.xclbin.empty() || run.instr_bin.empty() || run.trace_out.empty()) {
+            throw std::runtime_error(
+                "error: batch line needs --instr, --trace-out "
+                "(and --xclbin if not inherited from outer CLI)");
         }
     }
-    if (out.xclbin.empty() || out.instr_bin.empty() || out.trace_out.empty()) {
-        std::fprintf(stderr, "error: --xclbin, --instr, and --trace-out are required\n");
+    return 0;
+}
+
+int parse_cli(int argc, char** argv, OuterArgs& outer, RunArgs& run) {
+    std::vector<std::string> tokens;
+    tokens.reserve(static_cast<size_t>(argc - 1));
+    for (int i = 1; i < argc; ++i) tokens.emplace_back(argv[i]);
+    try {
+        return parse_tokens(tokens, outer, run, /*is_batch_line=*/false, argv[0]);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s\n", e.what());
         print_usage(argv[0]);
         return 1;
     }
-    return 0;
 }
 
 struct KernArgInfo {
@@ -296,6 +406,8 @@ classify_fn_t try_load_classifier(bool verbose) {
 }
 
 /// Classify kernarg roles via the Rust FFI. Returns empty on failure.
+/// Re-reads the xclbin bytes on each call -- cheap (~ms for a ~1 MB file)
+/// and keeps the per-run classification independent of any outer caching.
 std::vector<ClassifierRole> classify_kernargs_via_ffi(
     classify_fn_t fn,
     const std::string& xclbin_path,
@@ -336,37 +448,216 @@ const char* role_name(uint8_t role) {
     }
 }
 
-} // anonymous namespace
+// --------------------------------------------------------------------------
+// Per-xclbin state held across runs in batch mode.
+// --------------------------------------------------------------------------
 
-int main(int argc, char** argv) {
-    CliArgs args;
-    if (int rc = parse_cli(argc, argv, args); rc != 0) return rc;
-    std::fprintf(stderr, "bridge-trace-runner: xclbin=%s instr=%s trace_out=%s\n",
-                 args.xclbin.c_str(), args.instr_bin.c_str(), args.trace_out.c_str());
-    if (args.verbose) {
-        std::fprintf(stderr, "  kernel=%s trace_size=%lu inputs=%zu outputs=%zu\n",
-                     args.kernel_name.empty() ? "<auto>" : args.kernel_name.c_str(),
-                     (unsigned long)args.trace_size_bytes,
-                     args.inputs.size(), args.outputs.size());
+// Reusing a single xrt::hw_context across repeated kernel launches in
+// the same process produces an *alternating* TIMEOUT pattern: run 0
+// succeeds, run 1 times out (state=8), run 2 succeeds, run 3 aborts
+// (state=6), etc. This reproduces across tests (add_one_objFifo,
+// add_one_using_dma), with BO pooling, with per-run BO alloc, and with
+// inter-run sleeps -- the only thing that eliminates it is recreating
+// the hw_context before each launch. Reference tests that loop over
+// kernel invocations within a single hw_context (matrix_multiplication)
+// sync inputs only once and re-launch; they don't exercise the
+// re-sync + re-launch pattern that our trace sweep needs.
+//
+// Until the underlying XRT/driver behavior is understood we build a
+// fresh hw_context + kernel on each call. This still skips the far
+// more expensive per-process startup (device open, xclbin parse,
+// classifier dlopen) and measures ~90ms/run on Phoenix vs ~228ms for
+// a fresh process per run -- a 2.5x speedup. Set
+// BRIDGE_RUNNER_REUSE_CONTEXT=1 to experiment with the unsafe-but-
+// faster reuse path (not recommended; will hit the timeout pattern).
+bool reuse_context_across_runs() {
+    if (const char* v = std::getenv("BRIDGE_RUNNER_REUSE_CONTEXT")) {
+        return std::atoi(v) != 0;
     }
-    // Load the xclbin and discover its kernel-arg layout.
-    try {
-        xrt::device device(0);
-        xrt::xclbin xclbin(args.xclbin);
-        std::string kernel_name;
-        auto kargs = read_kernel_args(xclbin, args.kernel_name, kernel_name, args.verbose);
-        std::fprintf(stderr, "bridge-trace-runner: kernel=%s, %zu args\n",
-                     kernel_name.c_str(), kargs.size());
+    return false;
+}
 
-        // Classify kernargs into positional roles.
-        auto plan = classify_kernargs(kargs);
-        if (args.verbose) {
-            std::fprintf(stderr,
-                "  plan: opcode=%zu instr=%zu ninstr=%zu middle=%zu trace=%zu\n",
-                plan.opcode_idx, plan.instr_idx, plan.instr_size_idx,
-                plan.middle_buf_indices.size(), plan.trace_idx);
+struct PreparedKernel {
+    std::string xclbin_path;
+    std::string kernel_hint;   // empty means "any"
+    xrt::xclbin xclbin;
+    std::string kernel_name;
+    xrt::hw_context context;
+    xrt::kernel kernel;
+    std::vector<KernArgInfo> kargs;
+    KernArgPlan plan;
+
+    // BO pool held across runs. Reallocating BOs between rapid-fire
+    // runs against the same hw_context causes the scheduler to
+    // intermittently time out (observed: every other run fails with
+    // state=8 TIMEOUT on add_one_using_dma / add_one_objFifo). Pooling
+    // BOs so the kernel sees a stable set of backing buffers -- and
+    // only rewriting their *contents* between runs -- matches how the
+    // reference test.cpp uses XRT (one alloc + many kernel invocations)
+    // and eliminates the failures.
+    //
+    // The pool is lazily initialized on the first execute_run call.
+    // Subsequent calls verify sizes still match; a size mismatch
+    // triggers a full pool rebuild for that slot (rare in practice --
+    // trace sweeps keep BO sizes constant).
+    bool pool_ready = false;
+    std::vector<xrt::bo> pool_bos;                 // index-parallel to pool_arg_to_bo
+    std::vector<size_t> pool_arg_to_bo_idx;        // kargs.size(); SIZE_MAX for scalars
+    std::vector<size_t> pool_bo_sizes;             // parallel to pool_bos
+    size_t pool_trace_bo_idx = SIZE_MAX;
+    // Last-run binding snapshot so we can detect when the --input/
+    // --ctrlpkt mapping changes and need to reseed contents.
+    std::vector<std::string> pool_middle_binding_tags;
+    std::vector<std::string> pool_middle_binding_paths;
+    uint64_t pool_trace_size = 0;
+    // xrt::run is NOT pooled across calls -- reusing it breaks after a
+    // timeout and is not the XRT-documented pattern. Each execute_run
+    // creates a fresh run, sets args, starts, waits. The BOs it
+    // references come from this pool so no BO churn happens per run.
+};
+
+std::unique_ptr<PreparedKernel> prepare_kernel(
+    xrt::device& device,
+    const std::string& xclbin_path,
+    const std::string& kernel_hint,
+    bool verbose)
+{
+    auto p = std::make_unique<PreparedKernel>();
+    p->xclbin_path = xclbin_path;
+    p->kernel_hint = kernel_hint;
+    p->xclbin = xrt::xclbin(xclbin_path);
+    p->kargs = read_kernel_args(p->xclbin, kernel_hint, p->kernel_name, verbose);
+    std::fprintf(stderr, "bridge-trace-runner: kernel=%s, %zu args\n",
+                 p->kernel_name.c_str(), p->kargs.size());
+    p->plan = classify_kernargs(p->kargs);
+    if (verbose) {
+        std::fprintf(stderr,
+            "  plan: opcode=%zu instr=%zu ninstr=%zu middle=%zu trace=%zu\n",
+            p->plan.opcode_idx, p->plan.instr_idx, p->plan.instr_size_idx,
+            p->plan.middle_buf_indices.size(), p->plan.trace_idx);
+    }
+    device.register_xclbin(p->xclbin);
+    p->context = xrt::hw_context(device, p->xclbin.get_uuid());
+    p->kernel = xrt::kernel(p->context, p->kernel_name);
+    return p;
+}
+
+// --------------------------------------------------------------------------
+// Per-run execution.
+// --------------------------------------------------------------------------
+
+struct RunOutcome {
+    bool ok = false;
+    std::string error;
+    uint64_t elapsed_ms = 0;
+};
+
+// Escape a string for single-line JSON. Handles the minimum set of chars
+// that could appear in a stderr error message; we never embed arbitrary
+// JSON-hostile data in these strings.
+std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c & 0xff);
+                    out += buf;
+                } else {
+                    out.push_back(c);
+                }
         }
-        // Sanity-check --input/--output count against available middle buffers.
+    }
+    return out;
+}
+
+// Helper: resolve the binding for each middle-buffer slot given the
+// per-run ctrlpkt/input/output lists and the classifier output. Returns
+// a parallel vector with one entry per middle slot.
+enum class Bind { Zero, InputFile, OutputSlot, CtrlpktFile };
+struct BindInfo { Bind kind; std::string path; size_t output_slot_index = 0; };
+
+std::vector<BindInfo> resolve_bindings(
+    const KernArgPlan& plan,
+    const std::vector<size_t>& ctrlpkt_data_args,
+    const std::vector<std::string>& inputs,
+    const std::vector<std::string>& outputs,
+    const std::vector<std::string>& ctrlpkts)
+{
+    std::vector<BindInfo> data_arg_binding(plan.middle_buf_indices.size(),
+                                           BindInfo{Bind::Zero, {}, 0});
+    std::vector<bool> reserved(plan.middle_buf_indices.size(), false);
+    for (size_t i = 0; i < ctrlpkts.size(); ++i) {
+        size_t slot = ctrlpkt_data_args[i];
+        if (slot >= data_arg_binding.size()) {
+            throw std::runtime_error(
+                "classifier reports ctrlpkt at arg_idx " +
+                std::to_string(slot) + " but only " +
+                std::to_string(data_arg_binding.size()) + " middle buffers exist");
+        }
+        data_arg_binding[slot] = {Bind::CtrlpktFile, ctrlpkts[i], 0};
+        reserved[slot] = true;
+    }
+    size_t input_i = 0, output_i = 0;
+    for (size_t slot = 0; slot < data_arg_binding.size(); ++slot) {
+        if (reserved[slot]) continue;
+        if (input_i < inputs.size()) {
+            data_arg_binding[slot] = {Bind::InputFile, inputs[input_i++], 0};
+        } else if (output_i < outputs.size()) {
+            data_arg_binding[slot] = {Bind::OutputSlot, outputs[output_i], output_i};
+            ++output_i;
+        }
+    }
+    return data_arg_binding;
+}
+
+// Stable string tag for a binding, used to detect when the per-slot
+// role changed between runs (invalidates pooled BO content).
+std::string binding_tag(const BindInfo& b) {
+    switch (b.kind) {
+        case Bind::Zero:        return "zero";
+        case Bind::InputFile:   return "input:" + b.path;
+        case Bind::OutputSlot:  return "output";
+        case Bind::CtrlpktFile: return "ctrlpkt:" + b.path;
+    }
+    return "?";
+}
+
+// Determine the required BO size for a middle slot. File-backed slots
+// must be sized >= their file (pointer kernargs declare size=8 for the
+// pointer itself, so we take the file size when it's larger).
+size_t middle_slot_size(const KernArgInfo& karg, const BindInfo& bind) {
+    size_t declared = static_cast<size_t>(karg.size);
+    if (bind.kind == Bind::InputFile || bind.kind == Bind::CtrlpktFile) {
+        std::ifstream fs(bind.path, std::ios::binary | std::ios::ate);
+        if (!fs) throw std::runtime_error("cannot open input file: " + bind.path);
+        std::streamsize p = fs.tellg();
+        if (p < 0) throw std::runtime_error("cannot stat input file: " + bind.path);
+        return std::max(declared, static_cast<size_t>(p));
+    }
+    return declared;
+}
+
+RunOutcome execute_run(
+    xrt::device& device,
+    PreparedKernel& prep,
+    classify_fn_t classify_fn,
+    const RunArgs& args,
+    bool verbose)
+{
+    RunOutcome result;
+    auto t0 = std::chrono::steady_clock::now();
+    try {
+        const auto& kargs = prep.kargs;
+        const auto& plan = prep.plan;
+
         size_t expected_middle = args.inputs.size() + args.outputs.size();
         if (expected_middle > plan.middle_buf_indices.size()) {
             throw std::runtime_error(
@@ -375,30 +666,14 @@ int main(int argc, char** argv) {
                 std::to_string(plan.middle_buf_indices.size()) + " middle buffers");
         }
 
-        // Register xclbin with device and open a hardware context.
-        device.register_xclbin(xclbin);
-        xrt::hw_context context(device, xclbin.get_uuid());
-        xrt::kernel kernel(context, kernel_name);
-
-        // Load the instruction binary.
+        // Load instr + classify kernargs to identify ctrlpkt slots.
         auto instr_words = load_instr_binary(args.instr_bin);
-        if (args.verbose) {
+        if (verbose) {
             std::fprintf(stderr, "  loaded %zu instruction words from %s\n",
                          instr_words.size(), args.instr_bin.c_str());
         }
-
-        // Best-effort kernarg-role classification via libxdna_emu.so.
-        // When the classifier is available and --ctrlpkt paths are supplied,
-        // we bind each ctrlpkt path to the classifier-identified Ctrlpkt
-        // data-arg (ascending arg_idx order). --input/--output flows
-        // positionally through the remaining middle buffers exactly as
-        // before, skipping any slot reserved for a ctrlpkt. Without the
-        // classifier, --ctrlpkt falls back to being equivalent to --input
-        // appended to the front of the input list, preserving legacy
-        // positional behavior.
-        static classify_fn_t g_classify = try_load_classifier(args.verbose);
         auto roles = classify_kernargs_via_ffi(
-            g_classify, args.xclbin, instr_words, args.verbose);
+            classify_fn, args.xclbin, instr_words, verbose);
         std::vector<size_t> ctrlpkt_data_args;
         for (const auto& r : roles) {
             if (r.role == ROLE_CTRLPKT) {
@@ -406,203 +681,372 @@ int main(int argc, char** argv) {
             }
         }
         std::sort(ctrlpkt_data_args.begin(), ctrlpkt_data_args.end());
-        if (args.verbose && !roles.empty()) {
+        if (verbose && !roles.empty()) {
             std::fprintf(stderr, "  classifier roles:");
             for (const auto& r : roles) {
                 std::fprintf(stderr, " arg%u=%s", r.arg_idx, role_name(r.role));
             }
             std::fprintf(stderr, "\n");
         }
-        // If no classifier, treat --ctrlpkt as positional --input.
-        if (g_classify == nullptr || roles.empty()) {
-            if (!args.ctrlpkts.empty() && args.verbose) {
+
+        std::vector<std::string> inputs = args.inputs;
+        std::vector<std::string> ctrlpkts = args.ctrlpkts;
+        if (classify_fn == nullptr || roles.empty()) {
+            if (!ctrlpkts.empty() && verbose) {
                 std::fprintf(stderr,
                     "  classifier unavailable; --ctrlpkt falls back to --input\n");
             }
-            args.inputs.insert(args.inputs.begin(),
-                               args.ctrlpkts.begin(), args.ctrlpkts.end());
-            args.ctrlpkts.clear();
-        } else if (args.ctrlpkts.size() > ctrlpkt_data_args.size()) {
+            inputs.insert(inputs.begin(), ctrlpkts.begin(), ctrlpkts.end());
+            ctrlpkts.clear();
+        } else if (ctrlpkts.size() > ctrlpkt_data_args.size()) {
             throw std::runtime_error(
-                "more --ctrlpkt paths (" + std::to_string(args.ctrlpkts.size()) +
+                "more --ctrlpkt paths (" + std::to_string(ctrlpkts.size()) +
                 ") than classifier-identified ctrlpkt args (" +
                 std::to_string(ctrlpkt_data_args.size()) + ")");
         }
 
-        // Build a data-arg -> binding-source map:
-        //   ctrlpkt path (if reserved for this slot), otherwise --input file
-        //   in positional order skipping reserved slots, otherwise --output,
-        //   otherwise zero-fill.
-        enum class Bind { Zero, InputFile, OutputSlot, CtrlpktFile };
-        struct BindInfo { Bind kind; std::string path; };
-        std::vector<BindInfo> data_arg_binding(plan.middle_buf_indices.size(),
-                                               BindInfo{Bind::Zero, {}});
-        std::vector<bool> reserved(plan.middle_buf_indices.size(), false);
-        for (size_t i = 0; i < args.ctrlpkts.size(); ++i) {
-            size_t slot = ctrlpkt_data_args[i];
-            if (slot >= data_arg_binding.size()) {
-                throw std::runtime_error(
-                    "classifier reports ctrlpkt at arg_idx " +
-                    std::to_string(slot) + " but only " +
-                    std::to_string(data_arg_binding.size()) + " middle buffers exist");
-            }
-            data_arg_binding[slot] = {Bind::CtrlpktFile, args.ctrlpkts[i]};
-            reserved[slot] = true;
-        }
-        size_t input_i = 0, output_i = 0;
-        for (size_t slot = 0; slot < data_arg_binding.size(); ++slot) {
-            if (reserved[slot]) continue;
-            if (input_i < args.inputs.size()) {
-                data_arg_binding[slot] = {Bind::InputFile, args.inputs[input_i++]};
-            } else if (output_i < args.outputs.size()) {
-                data_arg_binding[slot] = {Bind::OutputSlot, args.outputs[output_i++]};
-            }
+        auto data_arg_binding = resolve_bindings(
+            plan, ctrlpkt_data_args, inputs, args.outputs, ctrlpkts);
+
+        // Rebuild hw_context + kernel per run to sidestep the
+        // alternating-TIMEOUT pattern that hits on hw_context reuse
+        // (see reuse_context_across_runs() docstring). Drops the BO
+        // pool too since group_id is tied to the recreated kernel.
+        if (!reuse_context_across_runs()) {
+            prep.kernel = xrt::kernel{};
+            prep.context = xrt::hw_context{};
+            prep.context = xrt::hw_context(device, prep.xclbin.get_uuid());
+            prep.kernel = xrt::kernel(prep.context, prep.kernel_name);
+            prep.pool_ready = false;
         }
 
-        // Per-arg BO storage.  Reserve upfront so push_back never reallocates
-        // while we hold interior references.  `arg_to_bo_idx[k]` gives the index
-        // in `bos` for kernarg k, or SIZE_MAX if k is a scalar -- Task 10 uses
-        // this to call run.set_arg(k, bos[arg_to_bo_idx[k]]) without having to
-        // re-derive the kernarg->BO mapping from the plan.
-        std::vector<xrt::bo> bos;
-        bos.reserve(kargs.size());
-        std::vector<size_t> arg_to_bo_idx(kargs.size(), SIZE_MAX);
-        xrt::bo* trace_bo_ptr = nullptr;
-
-        // Helper: allocate a BO for a given kernarg index and record it.
-        auto make_buffer = [&](size_t karg_idx, size_t sz,
-                               xrt::bo::flags flags) -> xrt::bo& {
-            bos.emplace_back(device, sz, flags,
-                             kernel.group_id(static_cast<int>(karg_idx)));
-            arg_to_bo_idx[karg_idx] = bos.size() - 1;
-            return bos.back();
-        };
-
-        // Instr BO: cacheable (kernel reads only, no host-after-run access).
-        {
-            auto& bo = make_buffer(plan.instr_idx,
-                                   instr_words.size() * sizeof(uint32_t),
-                                   xrt::bo::flags::cacheable);
-            std::memcpy(bo.map<void*>(),
-                        instr_words.data(),
-                        instr_words.size() * sizeof(uint32_t));
-            bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        }
-
-        // Middle buffers: driven by the data_arg_binding table built above.
-        // Each slot is either bound to a file (ctrlpkt or --input), reserved
-        // for an --output, or zero-filled.
+        // --- Pooled BO allocation ---
+        //
+        // First call or a BO-size mismatch triggers a fresh pool. When
+        // the pool already matches current requirements, we reuse the
+        // BOs directly -- only their *contents* are rewritten per run.
+        // This matches the reference test.cpp's "one alloc, many runs"
+        // pattern and avoids the alternating-run failures seen when
+        // BOs were reallocated between launches in the same hw_context.
+        size_t instr_bytes = instr_words.size() * sizeof(uint32_t);
+        bool need_full_rebuild = !prep.pool_ready;
+        std::vector<size_t> middle_sizes(plan.middle_buf_indices.size());
         for (size_t slot = 0; slot < plan.middle_buf_indices.size(); ++slot) {
             size_t karg_idx = plan.middle_buf_indices[slot];
-            size_t karg_declared_sz = static_cast<size_t>(kargs[karg_idx].size);
-            const auto& bind = data_arg_binding[slot];
-            size_t sz = karg_declared_sz;
-            if (bind.kind == Bind::InputFile || bind.kind == Bind::CtrlpktFile) {
-                // For pointer kernargs (void*) the declared size is 8 bytes
-                // regardless of payload; size the BO from the file's actual
-                // bytes so the whole blob reaches the device.
-                std::ifstream fs(bind.path, std::ios::binary | std::ios::ate);
-                if (!fs) throw std::runtime_error("cannot open input file: " + bind.path);
-                std::streamsize p = fs.tellg();
-                if (p < 0) throw std::runtime_error("cannot stat input file: " + bind.path);
-                sz = std::max(karg_declared_sz, static_cast<size_t>(p));
+            middle_sizes[slot] = middle_slot_size(kargs[karg_idx],
+                                                  data_arg_binding[slot]);
+        }
+
+        // Size-mismatch check. We rebuild the whole pool rather than
+        // per-slot reallocation so the xrt::run re-setarg is a clean
+        // single pass.
+        if (!need_full_rebuild) {
+            if (prep.pool_trace_size != args.trace_size_bytes) need_full_rebuild = true;
+        }
+        if (!need_full_rebuild) {
+            // Check each BO's current size matches what we'd want now.
+            // instr BO:
+            size_t instr_bo_idx = prep.pool_arg_to_bo_idx[plan.instr_idx];
+            if (prep.pool_bo_sizes[instr_bo_idx] != instr_bytes) need_full_rebuild = true;
+            // middle BOs:
+            for (size_t slot = 0; !need_full_rebuild && slot < plan.middle_buf_indices.size(); ++slot) {
+                size_t karg_idx = plan.middle_buf_indices[slot];
+                size_t idx = prep.pool_arg_to_bo_idx[karg_idx];
+                if (prep.pool_bo_sizes[idx] != middle_sizes[slot]) need_full_rebuild = true;
             }
-            auto& bo = make_buffer(karg_idx, sz, xrt::bo::flags::host_only);
-            std::memset(bo.map<void*>(), 0, sz);
-            if (bind.kind == Bind::InputFile || bind.kind == Bind::CtrlpktFile) {
-                load_bo_from_file(bo, bind.path, sz);
+        }
+
+        if (need_full_rebuild) {
+            if (verbose) {
+                std::fprintf(stderr,
+                    "bridge-trace-runner: %s BO pool\n",
+                    prep.pool_ready ? "rebuilding" : "allocating");
             }
+            prep.pool_bos.clear();
+            prep.pool_bo_sizes.clear();
+            prep.pool_arg_to_bo_idx.assign(kargs.size(), SIZE_MAX);
+            prep.pool_bos.reserve(plan.middle_buf_indices.size() + 2);
+            prep.pool_bo_sizes.reserve(plan.middle_buf_indices.size() + 2);
+
+            auto make_buffer = [&](size_t karg_idx, size_t sz,
+                                   xrt::bo::flags flags) -> xrt::bo& {
+                prep.pool_bos.emplace_back(device, sz, flags,
+                                           prep.kernel.group_id(static_cast<int>(karg_idx)));
+                prep.pool_bo_sizes.push_back(sz);
+                prep.pool_arg_to_bo_idx[karg_idx] = prep.pool_bos.size() - 1;
+                return prep.pool_bos.back();
+            };
+
+            make_buffer(plan.instr_idx, instr_bytes, xrt::bo::flags::cacheable);
+            for (size_t slot = 0; slot < plan.middle_buf_indices.size(); ++slot) {
+                size_t karg_idx = plan.middle_buf_indices[slot];
+                make_buffer(karg_idx, middle_sizes[slot], xrt::bo::flags::host_only);
+            }
+            make_buffer(plan.trace_idx, args.trace_size_bytes, xrt::bo::flags::host_only);
+            prep.pool_trace_bo_idx = prep.pool_arg_to_bo_idx[plan.trace_idx];
+            prep.pool_trace_size = args.trace_size_bytes;
+
+            prep.pool_middle_binding_tags.assign(plan.middle_buf_indices.size(), {});
+            prep.pool_middle_binding_paths.assign(plan.middle_buf_indices.size(), {});
+            prep.pool_ready = true;
+        } else if (verbose) {
+            std::fprintf(stderr, "bridge-trace-runner: reusing pooled BOs\n");
+        }
+
+        // Fill instr BO with current instr contents.
+        {
+            xrt::bo& bo = prep.pool_bos[prep.pool_arg_to_bo_idx[plan.instr_idx]];
+            std::memcpy(bo.map<void*>(), instr_words.data(), instr_bytes);
             bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         }
 
-        // Trace BO: zero-filled, sized to --trace-size.
+        // Fill middle BOs per-binding. Re-seed content every run (we
+        // can't tell without reading the file whether the prior run
+        // left stale bytes in a slot we'll now treat differently, and
+        // zero + optional file-load is cheap for the sizes we deal in).
+        for (size_t slot = 0; slot < plan.middle_buf_indices.size(); ++slot) {
+            size_t karg_idx = plan.middle_buf_indices[slot];
+            xrt::bo& bo = prep.pool_bos[prep.pool_arg_to_bo_idx[karg_idx]];
+            const auto& bind = data_arg_binding[slot];
+            std::memset(bo.map<void*>(), 0, middle_sizes[slot]);
+            if (bind.kind == Bind::InputFile || bind.kind == Bind::CtrlpktFile) {
+                load_bo_from_file(bo, bind.path, middle_sizes[slot]);
+            }
+            bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            prep.pool_middle_binding_tags[slot] = binding_tag(bind);
+            prep.pool_middle_binding_paths[slot] = bind.path;
+        }
+
+        // Trace BO: zero every launch (the trace unit writes a prefix;
+        // stale bytes beyond the prefix would corrupt later parses).
         {
-            auto& bo = make_buffer(plan.trace_idx, args.trace_size_bytes,
-                                   xrt::bo::flags::host_only);
+            xrt::bo& bo = prep.pool_bos[prep.pool_trace_bo_idx];
             std::memset(bo.map<void*>(), 0, args.trace_size_bytes);
             bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            trace_bo_ptr = &bo;
         }
-        std::fprintf(stderr, "bridge-trace-runner: allocated %zu BOs "
-                             "(instr + %zu middle + trace)\n",
-                     bos.size(), plan.middle_buf_indices.size());
 
-        // Build the positional arg vector.  For each kernarg, either pass the
-        // scalar value we know by role (opcode = 3 as the AIE kernel opcode,
-        // ninstr = instr_words.size()) or reference the BO we allocated above
-        // via arg_to_bo_idx.
-        xrt::run run(kernel);
+        // Fresh xrt::run per call; reusing one across starts is not the
+        // documented pattern and a single timeout poisons the run object
+        // for all future launches. Args come from the pooled BOs, so
+        // construction is still cheap (no BO alloc). We use the
+        // kernel() functor (matches the reference test.cpp pattern) --
+        // it calls set_arg+start atomically and is what the programming
+        // examples use in multi-iteration loops.
+        xrt::run run(prep.kernel);
         for (size_t i = 0; i < kargs.size(); ++i) {
             if (i == plan.opcode_idx) {
                 run.set_arg(static_cast<int>(i), AIE_KERNEL_OPCODE);
             } else if (i == plan.instr_size_idx) {
                 run.set_arg(static_cast<int>(i),
                             static_cast<uint32_t>(instr_words.size()));
-            } else if (arg_to_bo_idx[i] != SIZE_MAX) {
-                run.set_arg(static_cast<int>(i), bos[arg_to_bo_idx[i]]);
+            } else if (prep.pool_arg_to_bo_idx[i] != SIZE_MAX) {
+                run.set_arg(static_cast<int>(i),
+                            prep.pool_bos[prep.pool_arg_to_bo_idx[i]]);
             } else {
                 throw std::runtime_error(
                     "kernarg " + std::to_string(i) +
                     " was not classified (no scalar role and no BO bound)");
             }
         }
-
-        if (args.verbose) {
+        if (verbose) {
             std::fprintf(stderr, "  launching kernel (timeout 30s)\n");
         }
         run.start();
         auto state = run.wait(std::chrono::seconds(30));
+        if (verbose) {
+            std::fprintf(stderr, "  run state after wait: %d\n", (int)state);
+        }
         if (state != ERT_CMD_STATE_COMPLETED) {
-            std::fprintf(stderr, "error: kernel did not complete (state=%d)\n",
-                         static_cast<int>(state));
-            return 1;
+            throw std::runtime_error(
+                "kernel did not complete (state=" +
+                std::to_string(static_cast<int>(state)) + ")");
         }
 
-        // Trace buffer: sync from device then write raw bytes to --trace-out.
-        trace_bo_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        // Trace buffer: sync from device then write raw bytes.
+        xrt::bo& trace_bo = prep.pool_bos[prep.pool_trace_bo_idx];
+        trace_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         {
             std::ofstream out(args.trace_out, std::ios::binary);
             if (!out) {
                 throw std::runtime_error("cannot open trace-out: " + args.trace_out);
             }
-            out.write(static_cast<const char*>(trace_bo_ptr->map<const void*>()),
+            out.write(static_cast<const char*>(trace_bo.map<const void*>()),
                       static_cast<std::streamsize>(args.trace_size_bytes));
         }
-        if (args.verbose) {
+        if (verbose) {
             std::fprintf(stderr, "  wrote %lu bytes of trace to %s\n",
                          (unsigned long)args.trace_size_bytes, args.trace_out.c_str());
         }
 
-        // Optional: write middle-buffer outputs back to --output paths, in
-        // order.  We skipped the first args.inputs.size() middle slots (those
-        // are inputs).  The outputs map to the next args.outputs.size() slots.
+        // Write any --output sinks back to their host paths.
         if (!args.outputs.empty()) {
-            for (size_t o = 0; o < args.outputs.size(); ++o) {
-                size_t mb_slot = args.inputs.size() + o;
-                if (mb_slot >= plan.middle_buf_indices.size()) break;
-                size_t karg_idx = plan.middle_buf_indices[mb_slot];
-                // Defensive: middle buffers are always allocated in Task 9's
-                // make_buffer(), so arg_to_bo_idx[karg_idx] should never be
-                // SIZE_MAX here.  Guard anyway so a future refactor that
-                // skips allocation fails loudly instead of indexing bos[~0].
-                if (arg_to_bo_idx[karg_idx] == SIZE_MAX) {
-                    throw std::runtime_error(
-                        "output kernarg " + std::to_string(karg_idx) +
-                        " has no BO (classification skipped allocation?)");
-                }
-                xrt::bo& bo = bos[arg_to_bo_idx[karg_idx]];
+            for (size_t slot = 0; slot < plan.middle_buf_indices.size(); ++slot) {
+                if (data_arg_binding[slot].kind != Bind::OutputSlot) continue;
+                size_t karg_idx = plan.middle_buf_indices[slot];
+                xrt::bo& bo = prep.pool_bos[prep.pool_arg_to_bo_idx[karg_idx]];
                 bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                std::ofstream out(args.outputs[o], std::ios::binary);
+                const auto& out_path = data_arg_binding[slot].path;
+                std::ofstream out(out_path, std::ios::binary);
                 if (!out) {
-                    throw std::runtime_error("cannot open output file: " + args.outputs[o]);
+                    throw std::runtime_error("cannot open output file: " + out_path);
                 }
                 out.write(static_cast<const char*>(bo.map<const void*>()),
                           static_cast<std::streamsize>(kargs[karg_idx].size));
             }
         }
+        result.ok = true;
+    } catch (const std::exception& e) {
+        result.ok = false;
+        result.error = e.what();
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    result.elapsed_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+    return result;
+}
+
+// --------------------------------------------------------------------------
+// Session: manages a cache of PreparedKernel keyed by xclbin path. New
+// xclbins trigger prepare_kernel; reused xclbins reuse the cached entry.
+// --------------------------------------------------------------------------
+
+struct Session {
+    xrt::device device;
+    classify_fn_t classify_fn = nullptr;
+    bool verbose = false;
+    // Cache key is (xclbin_path, kernel_hint). Different kernel hints
+    // against the same xclbin select different kernels, so they need
+    // separate PreparedKernel entries.
+    std::unordered_map<std::string, std::unique_ptr<PreparedKernel>> cache;
+
+    PreparedKernel& get_or_prepare(const std::string& xclbin_path,
+                                   const std::string& kernel_hint) {
+        std::string key = xclbin_path + "::" + kernel_hint;
+        auto it = cache.find(key);
+        if (it != cache.end()) return *it->second;
+        auto prep = prepare_kernel(device, xclbin_path, kernel_hint, verbose);
+        auto& ref = *prep;
+        cache.emplace(std::move(key), std::move(prep));
+        return ref;
+    }
+};
+
+int run_single_shot(Session& session, const RunArgs& args) {
+    std::fprintf(stderr, "bridge-trace-runner: xclbin=%s instr=%s trace_out=%s\n",
+                 args.xclbin.c_str(), args.instr_bin.c_str(), args.trace_out.c_str());
+    if (session.verbose) {
+        std::fprintf(stderr, "  kernel=%s trace_size=%lu inputs=%zu outputs=%zu\n",
+                     args.kernel_name.empty() ? "<auto>" : args.kernel_name.c_str(),
+                     (unsigned long)args.trace_size_bytes,
+                     args.inputs.size(), args.outputs.size());
+    }
+    try {
+        auto& prep = session.get_or_prepare(args.xclbin, args.kernel_name);
+        auto out = execute_run(session.device, prep, session.classify_fn,
+                               args, session.verbose);
+        if (!out.ok) {
+            std::fprintf(stderr, "error: %s\n", out.error.c_str());
+            return 1;
+        }
+        return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;
     }
+}
+
+int run_batch_stdin(Session& session, const OuterArgs& outer, const char* argv0) {
+    // Emit a "ready" marker on stdout so the parent can synchronise before
+    // sending the first command. This also doubles as a liveness check
+    // (parent sees ready = session is up and classifier resolved).
+    std::printf("{\"event\":\"ready\",\"pid\":%ld}\n", (long)getpid());
+    std::fflush(stdout);
+
+    std::string line;
+    uint64_t run_idx = 0;
+    while (std::getline(std::cin, line)) {
+        // Trim trailing CR (Windows line endings) so the last token parses
+        // cleanly on mixed-platform pipes.
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        // Ignore blank lines and # comments so the parent can interleave
+        // human-readable markers without breaking the protocol.
+        if (line.empty() || line[0] == '#') continue;
+
+        RunArgs args;
+        // Inherit outer xclbin/kernel defaults.
+        OuterArgs outer_copy = outer;
+        try {
+            auto tokens = tokenize_line(line);
+            parse_tokens(tokens, outer_copy, args, /*is_batch_line=*/true, argv0);
+        } catch (const std::exception& e) {
+            std::printf(
+                "{\"run_idx\":%llu,\"ok\":false,\"error\":\"parse: %s\"}\n",
+                (unsigned long long)run_idx,
+                json_escape(e.what()).c_str());
+            std::fflush(stdout);
+            ++run_idx;
+            continue;
+        }
+
+        // Prep or reuse for this xclbin.
+        PreparedKernel* prep = nullptr;
+        try {
+            prep = &session.get_or_prepare(args.xclbin, args.kernel_name);
+        } catch (const std::exception& e) {
+            std::printf(
+                "{\"run_idx\":%llu,\"ok\":false,\"error\":\"prepare: %s\"}\n",
+                (unsigned long long)run_idx,
+                json_escape(e.what()).c_str());
+            std::fflush(stdout);
+            ++run_idx;
+            continue;
+        }
+
+        if (session.verbose) {
+            std::fprintf(stderr,
+                "bridge-trace-runner[batch]: run %llu xclbin=%s instr=%s trace_out=%s\n",
+                (unsigned long long)run_idx,
+                args.xclbin.c_str(), args.instr_bin.c_str(), args.trace_out.c_str());
+        }
+
+        auto out = execute_run(session.device, *prep, session.classify_fn,
+                               args, session.verbose);
+        if (out.ok) {
+            std::printf(
+                "{\"run_idx\":%llu,\"ok\":true,\"trace_out\":\"%s\",\"elapsed_ms\":%llu}\n",
+                (unsigned long long)run_idx,
+                json_escape(args.trace_out).c_str(),
+                (unsigned long long)out.elapsed_ms);
+        } else {
+            std::printf(
+                "{\"run_idx\":%llu,\"ok\":false,\"trace_out\":\"%s\",\"error\":\"%s\",\"elapsed_ms\":%llu}\n",
+                (unsigned long long)run_idx,
+                json_escape(args.trace_out).c_str(),
+                json_escape(out.error).c_str(),
+                (unsigned long long)out.elapsed_ms);
+        }
+        std::fflush(stdout);
+        ++run_idx;
+    }
     return 0;
+}
+
+} // anonymous namespace
+
+int main(int argc, char** argv) {
+    OuterArgs outer;
+    RunArgs run;
+    if (int rc = parse_cli(argc, argv, outer, run); rc != 0) return rc;
+
+    try {
+        Session session{xrt::device(0), try_load_classifier(outer.verbose),
+                        outer.verbose, {}};
+        if (outer.batch_stdin) {
+            return run_batch_stdin(session, outer, argv[0]);
+        }
+        return run_single_shot(session, run);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
 }

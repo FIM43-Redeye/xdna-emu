@@ -361,46 +361,139 @@ def _relabel_events(
     return counts, filtered
 
 
-def _run_one_side(
-    side: str,                   # "HW" or "EMU"
-    runner_env: Dict[str, str],
-    xclbin: Path,
-    instr: Path,
+class RunnerSession:
+    """Long-lived bridge-trace-runner process in --batch-stdin mode.
+
+    Holds a single XRT device + xclbin across many patched-instr runs
+    so per-launch overhead drops from ~228 ms (fresh process) to
+    ~90 ms (shared device, fresh hw_context per run). The hw_context
+    is rebuilt per launch inside the runner -- see the runner's
+    ``reuse_context_across_runs`` docstring for the reason the outer
+    process can't safely hold a single hw_context across runs yet.
+
+    Use as a context manager or call close() explicitly. If the
+    subprocess dies or blocks, run_one() raises RuntimeError so the
+    caller can restart the session rather than silently hang.
+    """
+
+    def __init__(self, xclbin: Path, runner_env: Dict[str, str],
+                 side: str, stderr_log: Path, verbose: bool = False):
+        self.side = side
+        self.stderr_log = stderr_log
+        self._stderr_fh = stderr_log.open("w")
+        cmd = [str(RUNNER), "--batch-stdin", "--xclbin", str(xclbin)]
+        if verbose:
+            cmd.append("-v")
+        env = os.environ.copy()
+        env.update(runner_env)
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._stderr_fh,
+            env=env,
+            text=True,
+            bufsize=1,
+        )
+        ready_line = self.proc.stdout.readline().strip()
+        if not ready_line:
+            self.close()
+            raise RuntimeError(f"{side} runner died before ready")
+        try:
+            ready = json.loads(ready_line)
+        except json.JSONDecodeError as e:
+            self.close()
+            raise RuntimeError(
+                f"{side} runner first line not JSON: {ready_line!r}") from e
+        if ready.get("event") != "ready":
+            self.close()
+            raise RuntimeError(
+                f"{side} runner first line not 'ready': {ready_line!r}")
+
+    def run_one(
+        self,
+        instr: Path,
+        trace_out: Path,
+        inputs: Optional[List[Path]] = None,
+        outputs: Optional[List[Path]] = None,
+        ctrlpkts: Optional[List[Path]] = None,
+        trace_size: int = 1 << 20,
+    ) -> dict:
+        """Dispatch one run. Returns the parsed JSON status dict.
+
+        The status dict has keys {"ok", "trace_out", "elapsed_ms"} on
+        success and an additional "error" string on failure; parse
+        errors (invalid CLI line) surface as ok=false with a "parse:"
+        error prefix.
+        """
+        if self.proc is None or self.proc.poll() is not None:
+            raise RuntimeError(f"{self.side} runner has exited")
+        parts = [
+            "--instr", str(instr),
+            "--trace-out", str(trace_out),
+            "--trace-size", str(trace_size),
+        ]
+        for p in (inputs or []):
+            parts += ["--input", str(p)]
+        for p in (outputs or []):
+            parts += ["--output", str(p)]
+        for p in (ctrlpkts or []):
+            parts += ["--ctrlpkt", str(p)]
+        # Our argument values never contain spaces in this codebase,
+        # but quote paths defensively so a future path with spaces
+        # doesn't silently corrupt tokenisation on the C++ side.
+        def quote(s: str) -> str:
+            return f'"{s}"' if (" " in s or "\t" in s) else s
+        line = " ".join(quote(p) for p in parts)
+        try:
+            self.proc.stdin.write(line + "\n")
+            self.proc.stdin.flush()
+        except BrokenPipeError as e:
+            raise RuntimeError(f"{self.side} runner stdin closed") from e
+        resp = self.proc.stdout.readline()
+        if not resp:
+            raise RuntimeError(f"{self.side} runner produced no response")
+        try:
+            return json.loads(resp)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"{self.side} runner non-JSON response: {resp!r}") from e
+
+    def close(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+        self.proc = None
+        if self._stderr_fh is not None and not self._stderr_fh.closed:
+            self._stderr_fh.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+
+def _parse_trace_bin(
     trace_bin: Path,
     mlir: Path,
     events_out: Path,
     cycles_out: Path,
-    runner_log: Path,
     parse_log: Path,
-    ctrlpkt: Optional[Path],
-) -> RunResult:
-    """One (patch → run → parse) cycle. Returns a RunResult; failures are
-    recorded, not raised -- a single-event failure must not kill the sweep.
+    env_for_parse: Dict[str, str],
+) -> Tuple[bool, Optional[str], Optional[int], Optional[int]]:
+    """Run parse-trace.py on a trace binary. Returns (ok, error,
+    cycles, events_count). ok=True with cycles=0/events_count=0 means
+    the trace parsed as empty (kernel ran, no events fired); that's
+    not a sweep failure.
     """
-    cmd = [
-        str(RUNNER),
-        "--xclbin", str(xclbin),
-        "--instr", str(instr),
-        "--trace-out", str(trace_bin),
-        # 1 MiB trace BO. The 8 KiB default silently truncated lock-heavy
-        # kernels halfway through, making EMU undercount events that fired
-        # fine but didn't fit. See trace-sweep-v2 validation notes / #138.
-        "--trace-size", "1048576",
-    ]
-    if ctrlpkt and ctrlpkt.is_file():
-        # --ctrlpkt binds to the classifier-identified ctrlpkt slot via
-        # libxdna_emu.so; falls back to positional --input if the lib
-        # isn't available at runtime.
-        cmd += ["--ctrlpkt", str(ctrlpkt)]
-
-    env = os.environ.copy()
-    env.update(runner_env)
-    with runner_log.open("w") as lf:
-        rc = subprocess.run(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT).returncode
-    if rc != 0:
-        return RunResult(ok=False, cycles=None, events_count=None,
-                         error=f"{side} runner exit {rc}")
-
     parse_cmd = [
         sys.executable, str(PARSE_TOOL),
         "--trace-bin", str(trace_bin),
@@ -408,26 +501,19 @@ def _run_one_side(
         "--out-events", str(events_out),
         "--out-cycles", str(cycles_out),
     ]
-    parse_env = env.copy()
+    parse_env = env_for_parse.copy()
     parse_env["PYTHONPATH"] = str(MLIR_AIE_ROOT / "install" / "python")
     with parse_log.open("w") as lf:
-        rc = subprocess.run(parse_cmd, env=parse_env, stdout=lf, stderr=subprocess.STDOUT).returncode
+        rc = subprocess.run(parse_cmd, env=parse_env,
+                            stdout=lf, stderr=subprocess.STDOUT).returncode
     if rc != 0:
-        # Multiple parse-trace error shapes all mean "kernel ran but the
-        # selected event set never fired" -- not a failure, just empty
-        # data. Record it as ok with zero events so the sweep correctly
-        # attributes "0 fires" to every event in the batch.
-        #   "no timestamped events"            -- trace had bytes but no
-        #                                         event records
-        #   "empty or all zeros" (from mlir-aie) -- trace BO entirely zero
         log_text = parse_log.read_text(errors="replace") if parse_log.exists() else ""
         empty_markers = ("no timestamped events", "empty or all zeros")
         if any(m in log_text for m in empty_markers):
             events_out.write_text('{"schema_version":1,"events":[],"slot_names":{}}\n')
             cycles_out.write_text("0\n")
-            return RunResult(ok=True, cycles=0, events_count=0)
-        return RunResult(ok=False, cycles=None, events_count=None,
-                         error=f"{side} parse-trace exit {rc}")
+            return True, None, 0, 0
+        return False, f"parse-trace exit {rc}", None, None
 
     try:
         cycles = int(cycles_out.read_text().strip() or "0")
@@ -439,6 +525,55 @@ def _run_one_side(
             events_count = len(json.loads(events_out.read_text()))
         except Exception:
             events_count = 0
+    return True, None, cycles, events_count
+
+
+def _run_one_side(
+    side: str,                   # "HW" or "EMU"
+    session: Optional["RunnerSession"],
+    runner_env: Dict[str, str],  # used to build parse_env (not for the runner)
+    instr: Path,
+    trace_bin: Path,
+    mlir: Path,
+    events_out: Path,
+    cycles_out: Path,
+    parse_log: Path,
+    ctrlpkt: Optional[Path],
+) -> RunResult:
+    """One (run → parse) cycle.
+
+    The runner session is shared across all batches of a sweep; this
+    function just dispatches a single run_one() and then parses. The
+    trace_bin is written by the runner and read back by parse-trace.
+
+    Failures are recorded in the RunResult, not raised -- a single
+    batch failure must not kill the sweep.
+    """
+    if session is None:
+        return RunResult(ok=False, cycles=None, events_count=None,
+                         error=f"{side} session is not open")
+    try:
+        status = session.run_one(
+            instr=instr,
+            trace_out=trace_bin,
+            ctrlpkts=[ctrlpkt] if (ctrlpkt and ctrlpkt.is_file()) else None,
+            trace_size=1 << 20,
+        )
+    except RuntimeError as e:
+        return RunResult(ok=False, cycles=None, events_count=None,
+                         error=f"{side} runner session: {e}")
+    if not status.get("ok", False):
+        return RunResult(ok=False, cycles=None, events_count=None,
+                         error=f"{side} runner: {status.get('error', 'unknown')}")
+
+    env_for_parse = os.environ.copy()
+    env_for_parse.update(runner_env)
+    ok, err, cycles, events_count = _parse_trace_bin(
+        trace_bin, mlir, events_out, cycles_out, parse_log, env_for_parse,
+    )
+    if not ok:
+        return RunResult(ok=False, cycles=None, events_count=None,
+                         error=f"{side} {err}")
     return RunResult(ok=True, cycles=cycles, events_count=events_count)
 
 
@@ -688,6 +823,29 @@ def sweep_multi(
     work_dir.mkdir(parents=True, exist_ok=True)
     patched = work_dir / "insts.patched.bin"
 
+    # Open long-lived runner sessions for HW and EMU up front. Each
+    # session holds a single xrt::device + xclbin across every batch,
+    # so the ~228 ms per-process startup cost is paid once per sweep
+    # instead of once per batch.
+    hw_runner_env: Dict[str, str] = {}
+    emu_runner_env: Dict[str, str] = {
+        "XDNA_EMU": os.environ.get("XDNA_EMU", "debug"),
+        "XDNA_EMU_LOG_LEVEL": os.environ.get("XDNA_EMU_LOG_LEVEL", "info"),
+        "XRT_DEVICE_BDF": "ffff:ff:1f.0",
+    }
+    hw_session: Optional[RunnerSession] = None
+    emu_session: Optional[RunnerSession] = None
+    if run_hw:
+        hw_session = RunnerSession(
+            xclbin=xclbin, runner_env=hw_runner_env, side="HW",
+            stderr_log=work_dir / "hw.runner.log",
+        )
+    if run_emu:
+        emu_session = RunnerSession(
+            xclbin=xclbin, runner_env=emu_runner_env, side="EMU",
+            stderr_log=work_dir / "emu.runner.log",
+        )
+
     t_start = time.time()
     for b_idx, batch in enumerate(batches):
         event_ids = [e.id for e in batch]
@@ -705,14 +863,13 @@ def sweep_multi(
         hw_res = RunResult(ok=False, cycles=None, events_count=None,
                            error="hw skipped") if not run_hw else _run_one_side(
             side="HW",
-            runner_env={},
-            xclbin=xclbin,
+            session=hw_session,
+            runner_env=hw_runner_env,
             instr=patched,
             trace_bin=work_dir / f"b{b_idx}.trace_hw.bin",
             mlir=mlir,
             events_out=hw_events_out,
             cycles_out=work_dir / f"b{b_idx}.hw.cycles.txt",
-            runner_log=work_dir / f"b{b_idx}.hw.runner.log",
             parse_log=work_dir / f"b{b_idx}.hw.parse.log",
             ctrlpkt=ctrlpkt,
         )
@@ -720,18 +877,13 @@ def sweep_multi(
         emu_res = RunResult(ok=False, cycles=None, events_count=None,
                             error="emu skipped") if not run_emu else _run_one_side(
             side="EMU",
-            runner_env={
-                "XDNA_EMU": os.environ.get("XDNA_EMU", "debug"),
-                "XDNA_EMU_LOG_LEVEL": os.environ.get("XDNA_EMU_LOG_LEVEL", "info"),
-                "XRT_DEVICE_BDF": "ffff:ff:1f.0",
-            },
-            xclbin=xclbin,
+            session=emu_session,
+            runner_env=emu_runner_env,
             instr=patched,
             trace_bin=work_dir / f"b{b_idx}.trace_emu.bin",
             mlir=mlir,
             events_out=emu_events_out,
             cycles_out=work_dir / f"b{b_idx}.emu.cycles.txt",
-            runner_log=work_dir / f"b{b_idx}.emu.runner.log",
             parse_log=work_dir / f"b{b_idx}.emu.parse.log",
             ctrlpkt=ctrlpkt,
         )
@@ -791,6 +943,16 @@ def sweep_multi(
               f"{[e.name for e in batch]} "
               f"hw_cyc={hw_res.cycles} emu_cyc={emu_res.cycles}",
               flush=True)
+
+    # Close sessions here rather than via try/finally so the cleanup
+    # cost stays measurable (visible in elapsed_sec) without altering
+    # the sweep result shape. On interrupt the parent process exit
+    # takes the children with it; no state is lost that wouldn't
+    # already be lost by interrupt.
+    if hw_session is not None:
+        hw_session.close()
+    if emu_session is not None:
+        emu_session.close()
 
     summaries: List[dict] = []
     elapsed = round(time.time() - t_start, 2)
