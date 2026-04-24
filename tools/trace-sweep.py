@@ -479,7 +479,32 @@ def sweep(
         wanted = set(events_filter)
         all_events = [e for e in all_events if e.name in wanted]
     ground_event = _resolve_ground_event(tile_type, ground_event_name)
-    batches = _build_batches(all_events, slots=8, ground_event=ground_event)
+
+    # Detect how many trace-event slots the compiled xclbin actually
+    # exposes for this tile. Some tests come with 3-event trace blocks
+    # baked into their source MLIR and compile to a single Trace_Event0
+    # write (4 slots); asking the patcher for 8 events there is a
+    # contract violation that used to manifest as a fail-fast
+    # subprocess.CalledProcessError with 16/18 combos dead on arrival.
+    # Probing lets us halve the batch size transparently instead.
+    import importlib.util as _imputil
+    _pspec = _imputil.spec_from_file_location(
+        "trace_patch_events", REPO_ROOT / "tools" / "trace-patch-events.py",
+    )
+    _pmod = _imputil.module_from_spec(_pspec)
+    _pspec.loader.exec_module(_pmod)
+    slot_capacity = _pmod.probe_slot_capacity(
+        insts.read_bytes(), col, row, tile_type,
+    )
+    if slot_capacity == 0:
+        raise FileNotFoundError(
+            f"xclbin at {build_dir} has no Trace_Event writes for tile "
+            f"({col},{row}) type={tile_type}; this test isn't trace-routed "
+            f"to that tile. Re-compile with trace injection enabled."
+        )
+    batches = _build_batches(
+        all_events, slots=slot_capacity, ground_event=ground_event,
+    )
     # When grounding is active, slot 0 of every batch carries the
     # grounding event; the per-event matrix reports only sweep events
     # (slot >= 1). This keeps the matrix clean -- the grounding event is

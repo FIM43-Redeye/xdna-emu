@@ -164,6 +164,37 @@ def _pack_event_slots(events: List[int]) -> Tuple[int, int]:
     return event0 & 0xFFFFFFFF, event1 & 0xFFFFFFFF
 
 
+def probe_slot_capacity(
+    data: bytes, col: int, row: int, tile_type: str,
+) -> int:
+    """Return the number of event slots this xclbin actually exposes for
+    the target tile: 8 if both Trace_Event0 and Trace_Event1 writes are
+    present in insts.bin, 4 if only Trace_Event0, 0 if neither.
+
+    Used by the sweep orchestrator to pick a batch size that matches the
+    compiled trace config -- some tests come with 3-event trace blocks
+    baked into their source MLIR, which compile to a single Trace_Event0
+    write and no Trace_Event1; asking the patcher for 8 events there
+    would be a lie.
+    """
+    if tile_type not in _TRACE_EVENT_REGS:
+        raise ValueError(f"unknown tile_type {tile_type!r}")
+    off_e0, off_e1 = _TRACE_EVENT_REGS[tile_type]
+    target_e0 = _npu_address(col, row, off_e0)
+    target_e1 = _npu_address(col, row, off_e1)
+    has_e0 = has_e1 = False
+    for _rec_off, reg_off, _value in _walk_write32(data):
+        if reg_off == target_e0:
+            has_e0 = True
+        elif reg_off == target_e1:
+            has_e1 = True
+    if has_e0 and has_e1:
+        return 8
+    if has_e0:
+        return 4
+    return 0
+
+
 def patch_events(
     data: bytes,
     col: int,
@@ -171,22 +202,40 @@ def patch_events(
     tile_type: str,
     events: List[int],
 ) -> Tuple[bytes, int]:
-    """Patch the two Trace_Event registers for (col, row, tile_type) to the
-    packed event IDs. Returns (patched_bytes, num_writes_patched).
+    """Patch the Trace_Event register(s) for (col, row, tile_type).
+    Returns (patched_bytes, num_writes_patched).
 
-    Raises ValueError if the target writes aren't found -- the xclbin was
-    either compiled without trace on that tile, or with a different tile
-    type.  Either way, patching silently would be a bug: the sweep would
-    run with stale events and we'd attribute the result to the wrong
-    config.
+    Works whether the xclbin has both Trace_Event0 and Trace_Event1 (full
+    8 slots) or just Trace_Event0 (4 slots); if only Trace_Event0 exists
+    the caller must have passed <=4 events -- more than that is a bug in
+    the caller, not something to silently truncate, because the extra
+    events would simply never fire and we'd misattribute "0 fires" to
+    them.
+
+    Raises ValueError if neither Trace_Event register is present (xclbin
+    compiled without trace on this tile, or for a different tile type)
+    or if the caller's event count exceeds the xclbin's slot capacity.
     """
     if tile_type not in _TRACE_EVENT_REGS:
         raise ValueError(f"unknown tile_type {tile_type!r}; want one of "
                          f"{sorted(_TRACE_EVENT_REGS)}")
+    capacity = probe_slot_capacity(data, col, row, tile_type)
+    if capacity == 0:
+        raise ValueError(
+            f"no Trace_Event writes found for tile ({col},{row}) "
+            f"type={tile_type}. xclbin was compiled without trace on "
+            f"this tile or for a different tile type."
+        )
+    if len(events) > capacity:
+        raise ValueError(
+            f"xclbin exposes {capacity} trace slots for tile ({col},{row}) "
+            f"type={tile_type} but caller supplied {len(events)} events. "
+            f"Reduce the batch size (compiled MLIR only wrote "
+            f"{'Trace_Event0' if capacity == 4 else 'both Trace_Event regs'})."
+        )
     off_e0, off_e1 = _TRACE_EVENT_REGS[tile_type]
     target_e0 = _npu_address(col, row, off_e0)
     target_e1 = _npu_address(col, row, off_e1)
-
     packed_e0, packed_e1 = _pack_event_slots(events)
 
     writes = _walk_write32(data)
@@ -199,11 +248,11 @@ def patch_events(
         elif reg_off == target_e1:
             struct.pack_into("<I", buf, rec_off + 16, packed_e1)
             patched += 1
-    if patched != 2:
+    if patched not in (1, 2):
         raise ValueError(
-            f"expected 2 Trace_Event writes for tile ({col},{row}) "
-            f"type={tile_type}; found {patched}. xclbin may have been "
-            f"compiled without trace on this tile or for a different type."
+            f"expected 1 or 2 Trace_Event writes for tile ({col},{row}) "
+            f"type={tile_type}; found {patched}. Internal inconsistency "
+            f"with probe_slot_capacity."
         )
     return bytes(buf), patched
 

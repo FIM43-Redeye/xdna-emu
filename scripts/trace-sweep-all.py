@@ -313,6 +313,16 @@ def main() -> int:
                       f"emu-bridge-test.sh --with-hw-cycles --{comp}-only "
                       f"-v {test}", file=sys.stderr)
                 continue
+            # Control-packet tests (e.g. ctrl_packet_reconfig_elf) bundle
+            # the runtime sequence as main_seq.bin / main_ctrlpkt.bin
+            # instead of insts.bin, which trace-sweep.py can't patch.
+            # Surface that clearly instead of churning through 16 batches
+            # only to FileNotFoundError.
+            if not (comp_dir / "insts.bin").is_file():
+                print(f"[skip] {test}/{comp}: no insts.bin (uses a "
+                      f"non-insts runtime sequence; patch-based sweep "
+                      f"doesn't apply)", file=sys.stderr)
+                continue
             for tile in tiles:
                 combos.append((test, comp, tile))
 
