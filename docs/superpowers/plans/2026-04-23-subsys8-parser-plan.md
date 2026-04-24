@@ -898,34 +898,345 @@ Expected: clean commit.
 
 ## Task 4: Data migrations (audit-driven)
 
-**Goal:** Execute each migration surfaced by audit closing summary. Each is its own commit.
+**Goal:** Migrate the 2 items surfaced by audit §Closing Summary "Data migration list":
+1. `EM_AIE: u16 = 264` (ELF machine type literal)
+2. `AieArchitecture` enum (Aie1=0x01, Aie2=0x02, Aie2P=0x03)
 
-**Detailed steps:** Authored by Task 3 Step 2. Until Task 3 commits, this section is intentionally a placeholder referring to the audit's data-migration list. Expected shape per migration:
+Both move from `src/parser/elf.rs` to a new `xdna_archspec::elf` module. One commit for
+both migrations (they're tightly coupled; ~17 LOC total archspec addition).
 
-- [ ] **Step N (per migration):** Create archspec destination, move content, wire accessor, write drift test, remove or forward-ref original, commit.
+**Files:**
+- Create: `crates/xdna-archspec/src/elf.rs`
+- Modify: `crates/xdna-archspec/src/lib.rs` (add `pub mod elf;`)
+- Modify: `src/parser/elf.rs`
 
-Verification per migration:
-- `cargo test --lib` green.
-- `cargo test -p xdna-archspec --lib` green.
-- The drift test for the migrated item passes.
+- [ ] **Step 1: Create `crates/xdna-archspec/src/elf.rs`**
 
-Expected migration count: 2--5 items (audit dependent). Mirrors Subsystem 7 Part B Task 3 (5 accessor migrations) and Task 4 (4 medium data-moves) scale.
+Content:
+
+```rust
+//! ELF format constants shared across AIE architectures.
+//!
+//! These are toolchain-derived identifiers (from llvm-aie backends):
+//! - `EM_AIE` is the ELF machine type number LLVM emits for AIE ELFs.
+//! - `AieArchitecture` is the per-arch flag value carried in the ELF
+//!   header's `e_flags` field.
+//!
+//! Kept in archspec (not xdna-emu's parser) so that a future AIE1
+//! implementation populates its arch constants in the same place as
+//! memory-map, DMA model, and ISA data.
+
+/// ELF machine type for AIE cores. LLVM's AIE backend emits this value
+/// in `Elf::e_machine`. Source: llvm-aie/llvm/include/llvm/BinaryFormat/ELF.h.
+pub const EM_AIE: u16 = 264;
+
+/// AIE architecture variant encoded in ELF `e_flags`.
+///
+/// Source: llvm-aie AIEELFObjectWriter + aie-rt's ELF loader expects
+/// this enum's values in the low byte of `e_flags`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AieArchitecture {
+    Aie1 = 0x01,
+    Aie2 = 0x02,
+    Aie2P = 0x03,
+}
+
+impl AieArchitecture {
+    /// Decode from the low byte of ELF `e_flags`. Returns `None` for
+    /// unrecognized values rather than defaulting, so callers can
+    /// decide how to handle unknown arches.
+    pub fn from_e_flags(flags: u32) -> Option<Self> {
+        match (flags & 0xFF) as u8 {
+            0x01 => Some(Self::Aie1),
+            0x02 => Some(Self::Aie2),
+            0x03 => Some(Self::Aie2P),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn em_aie_matches_llvm_aie_value() {
+        assert_eq!(EM_AIE, 264);
+    }
+
+    #[test]
+    fn aie_architecture_roundtrips_through_e_flags() {
+        for (flag, expected) in [
+            (0x01u32, AieArchitecture::Aie1),
+            (0x02u32, AieArchitecture::Aie2),
+            (0x03u32, AieArchitecture::Aie2P),
+        ] {
+            assert_eq!(AieArchitecture::from_e_flags(flag), Some(expected));
+        }
+    }
+
+    #[test]
+    fn aie_architecture_rejects_unknown_flags() {
+        assert_eq!(AieArchitecture::from_e_flags(0x00), None);
+        assert_eq!(AieArchitecture::from_e_flags(0xFF), None);
+    }
+}
+```
+
+- [ ] **Step 2: Add `pub mod elf;`** to `crates/xdna-archspec/src/lib.rs` at the
+  appropriate alphabetical spot (after existing `pub mod` declarations).
+
+- [ ] **Step 3: Update `src/parser/elf.rs`** to import from archspec rather than
+  declaring locally.
+
+  - At top: `use xdna_archspec::elf::{EM_AIE, AieArchitecture};`
+  - Remove the local `const EM_AIE: u16 = 264;` definition.
+  - Remove the local `pub enum AieArchitecture { ... }` definition.
+  - Update all call sites (in the same file) that referenced local `AieArchitecture`
+    or `EM_AIE`; they now reach the archspec versions through the `use` statement.
+  - If any consumer outside `src/parser/elf.rs` imports these (grep to check),
+    update their imports too.
+
+- [ ] **Step 4: Verify**
+
+```bash
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec --lib 2>&1 | tail -3
+# Expect: 320 + 3 new tests = 323 passed, 0 failed.
+
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
+# Expect: 2686 passed (xdna-emu tests unchanged; elf.rs only re-imports).
+
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build --release 2>&1 | tail -3
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/xdna-archspec/src/elf.rs crates/xdna-archspec/src/lib.rs src/parser/elf.rs
+# plus any other files Step 3 touched
+git commit -m "$(cat <<'EOF'
+refactor(archspec): migrate EM_AIE + AieArchitecture to archspec
+
+Moves the two toolchain-derived ELF identifiers from the xdna-emu
+parser into a new xdna_archspec::elf module:
+- EM_AIE (ELF machine type number, LLVM-defined).
+- AieArchitecture enum (per-arch flag value in ELF e_flags).
+
+Both audit §Closing Summary data-migration-list items landed.
+xdna_archspec now owns all toolchain-derived ELF constants; a future
+AIE1 implementation adds arch-specific flag handling in the same
+place as its memory map / DMA model / ISA data.
+
+Generated using Claude Code.
+EOF
+)"
+```
+
+Verification:
+- `cargo test --lib` green (2686 passed, unchanged).
+- `cargo test -p xdna-archspec --lib` green (323 passed -- up 3 from the new tests).
+- Archspec `AieArchitecture::from_e_flags` drift tests pass.
 
 ---
 
-## Task 5: BinaryLoader trait decision + implementation
+## Task 5: BinaryLoader trait decision + design note
 
-**Goal:** Land whatever `BinaryLoader` shape the audit §9 chose -- populated trait / empty anchor / no trait. Fill in `docs/arch/binary-loader-model.md`.
+**Goal:** Audit §9 concluded **no trait** (mirrors Subsystem 6 `IsaDecoder` precedent,
+not Subsystem 7's empty anchor). No `crates/xdna-archspec/binary_loader/` module is
+created; no dispatch test is added. The only Task 5 deliverable is filling in
+`docs/arch/binary-loader-model.md` with the audit's reasoning and AIE1 projection.
 
-**Detailed steps:** Authored by Task 3 Step 3. One of three shapes per audit §9.
+**Files:**
+- Modify: `docs/arch/binary-loader-model.md`
 
-- [ ] **Step N (shape-dependent):** Per Task 3 Step 3 amendment.
+- [ ] **Step 1: Fill in `## What lives where` section**
+
+Replace `(Filled in at Task 5. Expected table: ...)` with a concrete table reflecting
+the post-migration state:
+
+```markdown
+| Data / code | Module | Notes |
+|-------------|--------|-------|
+| `EM_AIE` (ELF machine type = 264) | `xdna_archspec::elf` | Moved from `src/parser/elf.rs` in Task 4. |
+| `AieArchitecture` enum + `from_e_flags` | `xdna_archspec::elf` | Moved from `src/parser/elf.rs` in Task 4. |
+| XCLBIN container parsing (`Xclbin`, `SectionKind`) | `src/parser/xclbin.rs` | Arch-agnostic; stays in xdna-emu. |
+| AIE Partition wrapper (`AiePartition`) | `src/parser/aie_partition.rs` | Arch-agnostic framing; stays in xdna-emu. |
+| CDO framing (`CdoVersion`, `RawCdoHeader`, `find_cdo_offset`) | `src/parser/cdo/framing.rs` | Arch-uniform byte-level framing. Created in Stage 8b Half 1. |
+| CDO syntax (`CdoOpcode`, `CdoRaw`, `Cdo`) | `src/parser/cdo/syntax.rs` | Typed commands; arch-uniform byte format. Created in Stage 8b Half 1. |
+| CDO semantics (`lower`) + arch-handle-consuming lowering | `src/parser/cdo/semantics.rs` | Reads archspec (memory map, DMA model, etc.) through existing accessors. No new arch dispatch. Created in Stage 8b Half 2. |
+| ELF parsing (`AieElf`, `MemoryRegion`, `load_into`) | `src/parser/elf.rs` | Arch-agnostic ELF reader; uses `xdna_archspec::elf` constants. Consolidated in Stage 8c. |
+| `DeviceOp` enum (arch-generic device ops) | `src/device/ops.rs` | New vocabulary between parser and device-state. Created in Stage 8b Half 2. |
+```
+
+- [ ] **Step 2: Fill in `## Trait surface` section**
+
+Replace `(Filled in at Task 5. One of: populated ... / empty anchor ... / "no trait" ...)` with:
+
+```markdown
+**No trait.** The parser layer does not define a `BinaryLoader` trait in
+`xdna-archspec`. This matches the Subsystem 6 `IsaDecoder` precedent and
+reflects three findings from the audit:
+
+1. **XCLBIN / AIE Partition / CDO framing is arch-uniform.** Every AIE2 NPU
+   (and every AIE1 Versal design that the audit checked) uses the same XCLBIN
+   magic, the same AIE Partition struct, and the same CDO v2 byte-level format.
+   There is no variance to dispatch on at the container-parsing layer.
+
+2. **CDO semantics variance is data-expressible.** The `semantics::lower`
+   function consults `ArchHandle` accessors (memory map, DMA model, lock layout,
+   stream switch topology) for address decoding and BD field parsing. All four
+   of those accessors are already arch-aware through their respective model
+   traits (Subsystems 1, 3, 4, 5). `lower` adds no new arch-dispatch surface;
+   it's a plain free function that parameterises through pre-existing accessors.
+
+3. **Parsing is not on a hot path.** Unlike ISA execute (where the interpreter
+   inner loop might benefit from a trait anchor to monomorphise later), the
+   parser runs once at XCLBIN load. There is no dispatch-pathway-reservation
+   argument that would motivate the empty-anchor pattern Subsystem 7 used.
+
+The single small archspec deliverable is `xdna_archspec::elf` (Task 4), which is
+a data module (two constants + one enum), not a trait.
+```
+
+- [ ] **Step 3: Fill in `## The shape-vs-values rule, applied to parser` section**
+
+Replace the placeholder with:
+
+```markdown
+Subsystem 6 established the rule:
+
+> A type belongs in archspec iff it is derivable from the toolchain without
+> reference to emulator execution state.
+
+Subsystem 7 sharpened it:
+
+> Among arch-specific content, *data* (tables, enums, constants, feature flags)
+> lives in archspec while *algorithms* stay in xdna-emu.
+
+Applied to the parser:
+
+- **Data** that the toolchain (llvm-aie + aie-rt) defines -- `EM_AIE`,
+  `AieArchitecture`, CDO opcode identity -- lives in archspec. The Task 4
+  migration moves `EM_AIE` and `AieArchitecture` specifically; `CdoOpcode` stays
+  in xdna-emu because its byte-level opcode values are not defined by the
+  toolchain (they're defined by AMD's CDO specification, which is arch-uniform
+  and doesn't warrant the migration overhead for one enum).
+- **Algorithms** -- XCLBIN section iteration, AIE Partition extraction, CDO
+  command decoding, ELF section-to-memory copying -- stay in xdna-emu. These
+  read archspec data where needed (Task 4 adds one such read site in
+  `parser::elf`) but are themselves pure functions of bytes-in, typed-out.
+- **The one interesting layering departure** is `cdo::semantics::lower`, which
+  reads archspec freely (memory map, DMA model, etc.) during the byte-to-op
+  translation. This is deliberate -- the spec's design philosophy §"Elegant
+  over pristine purity" explicitly allows the parser to be arch-aware in the
+  semantics sublayer. The syntax and framing sublayers stay arch-blind for
+  testability; the semantics sublayer is arch-aware because the lowering task
+  demands it.
+```
+
+- [ ] **Step 4: Fill in `## What would AIE1 look like?` section**
+
+Copy the AIE1 projection from `docs/arch/subsys8-audit.md` §Closing Summary (the
+one-paragraph version), then expand with the specific archspec additions AIE1 would
+need:
+
+```markdown
+An AIE1 port of the parser layer would require no algorithm changes and one
+small archspec addition.
+
+**Archspec additions:**
+- `xdna_archspec::aie1::elf` -- if AIE1's ELF flag values ever diverge from
+  AIE2's (e.g., AIE1 uses `e_flags = 0x01`). Today this is handled by the
+  existing `AieArchitecture::Aie1 = 0x01` variant, so the module may not even
+  need to be created.
+- AIE1-specific `CdoOpcode` variants -- if AIE1 Versal designs include PM-domain
+  or NPI commands not present in today's enum. These would be additions to
+  `CdoOpcode`'s `Unknown(u16)` catch-all, which is in xdna-emu not archspec; the
+  catch-all already handles unknown opcodes gracefully, so they don't need to
+  be named unless the parser needs to interpret them.
+
+**Parser-side changes:** **none.** `xclbin::parse`, `aie_partition::parse`,
+`cdo::framing::parse_header`, `cdo::syntax::decode`, `elf::AieElf::parse`, and
+`elf::AieElf::load_into` are all byte-level parsers that work against
+arch-uniform formats. `cdo::semantics::lower` dispatches through `ArchHandle`
+accessors already -- when `ArchConfig::Aie` is populated with AIE1 values, the
+accessors return AIE1 data and the lowering works unchanged.
+
+**Device-state side changes:** none specific to the parser -- `device::state::apply`
+consumes `DeviceOp`, which is already arch-generic.
+
+The smoothness of this projection is precisely why the audit concluded "no trait":
+there is no variance at the parsing layer that a trait would dispatch on.
+```
+
+- [ ] **Step 5: Fill in `## Alternatives rejected` section**
+
+```markdown
+### Populated `BinaryLoader` trait (1--3 methods)
+
+Rejected. §9's rejection table evaluated five candidate methods
+(`parse_container_sections`, `extract_partition_payload`,
+`decode_cdo_command`, `lower_cdo`, `load_elf`). None survived -- every
+candidate either has zero algorithmic variance (container framing is
+arch-uniform) or is data-expressible through existing archspec accessors
+(CDO semantics). A populated trait would be ceremony.
+
+### Empty anchor trait (mirroring `IsaExecutor`)
+
+Rejected. Subsystem 7 justified the `IsaExecutor` empty anchor on two
+grounds: (a) preserving a dispatch pathway for future seams without
+cross-subsystem plumbing, and (b) hot-path dispatch might eventually
+benefit from monomorphisation. Neither applies to the parser:
+
+- Future parser seams would most likely be new archspec data (new
+  opcodes, new ELF flags), not new dispatch. An anchor doesn't help
+  data migrations.
+- Parsing is a one-shot cold path. There is no hot-path motivation.
+
+The cost of an empty anchor (one module, one ZST, one singleton, one
+dispatch test, one accessor) was deemed not worth paying for a pathway
+we don't expect to populate.
+
+### Pre-audit commitment
+
+Rejected by spec. The parent device-family refactor explicitly requires
+audit-first design. Subsystem 5's `PortLayout` extension trait (231 LOC
+of dead code deleted after the fact) is the cautionary precedent.
+```
+
+- [ ] **Step 6: Verify no placeholders remain**
+
+```bash
+grep -n "Filled in at Task\|TODO\|TBD" docs/arch/binary-loader-model.md
+# Expect: no output (all placeholders filled).
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add docs/arch/binary-loader-model.md
+git commit -m "$(cat <<'EOF'
+docs(design-note): Subsystem 8 binary-loader-model populated
+
+Fills the design note body with the "no trait" landing per audit §9.
+Five sections now populated: data placement table, trait-surface
+reasoning, shape-vs-values rule applied, AIE1 projection,
+alternatives rejected (populated trait, empty anchor, pre-audit
+commitment).
+
+The audit's rejection-table logic lives in subsys8-audit.md §9;
+this doc is the durable design-note companion per the parent
+refactor's "what would AIE1 look like?" requirement.
+
+Generated using Claude Code.
+EOF
+)"
+```
 
 Verification:
-- `cargo test --lib` green.
-- `cargo test -p xdna-archspec --lib` green.
-- Dispatch test (if trait or anchor) passes.
-- `docs/arch/binary-loader-model.md` has no unfilled placeholders.
+- `cargo test --lib` green (unchanged by doc-only commit).
+- `grep "Filled in at Task" docs/arch/binary-loader-model.md` returns nothing.
 
 ---
 
@@ -1861,13 +2172,58 @@ Estimated commits for Task 16: 1 canonical + 5-8 per-consumer migrations = 6-9 c
 
 ## Task 17: Stage 8c -- control-packet parser alignment
 
-**Goal:** Apply the decision from audit §7 (Task 3 amendment).
+**Goal:** Audit §7 concluded "coincidental only" -- `src/device/control_packets/parser.rs`
+shares 0 framing primitives with `src/parser/*`. They are structurally different parsers
+(control-packets are NPU runtime command dispatch; src/parser/* is XCLBIN/CDO/ELF static
+configuration). No shared module. Task 17 is a one-line documentation commit:
 
-**Detailed steps:** Authored via Task 3 Step 4 amendment per the three outcomes (extract / leave / merge).
+**Files:**
+- Modify: `src/device/control_packets/parser.rs`
 
-Expected shape:
-- [ ] **Step N (outcome-dependent):** Per Task 3 Step 4.
-- Commit per outcome.
+- [ ] **Step 1: Add explanatory module-level comment**
+
+At the top of `src/device/control_packets/parser.rs` (above existing imports), add:
+
+```rust
+//! Control packet parser (runtime command dispatch).
+//!
+//! Structurally distinct from `src/parser/*` (the XCLBIN/CDO/ELF static
+//! configuration parsers): control packets carry NPU runtime commands
+//! wrapped in a 1-word header + payload, whereas CDO carries a 20-byte
+//! header + variable-length command stream, and XCLBIN is a Xilinx
+//! container. No framing primitives overlap. Subsystem 8 audit §7
+//! (docs/arch/subsys8-audit.md) evaluated shared-module extraction
+//! and found zero overlap -- the two parsers stay separate by design.
+```
+
+Preserve any existing module-level doc comment by appending to it rather than replacing.
+
+- [ ] **Step 2: Verify build + tests**
+
+```bash
+PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
+```
+
+Expected: 2686 passed (unchanged by doc-only edit).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add src/device/control_packets/parser.rs
+git commit -m "$(cat <<'EOF'
+docs(control_packets): document non-overlap with src/parser
+
+Subsystem 8 audit §7 evaluated shared-module extraction between the
+control-packet parser and the src/parser/* static-configuration
+parsers and found zero framing-primitive overlap. The two parsers
+remain separate by design. Module-level comment added to
+src/device/control_packets/parser.rs pointing at the audit for
+future readers.
+
+Generated using Claude Code.
+EOF
+)"
+```
 
 ---
 
