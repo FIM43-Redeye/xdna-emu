@@ -886,12 +886,21 @@ impl InterpreterEngine {
 
         // Phase 4: Detect memory bank conflicts (core vs DMA).
         //
-        // CONFLICT_DM_BANK events fire when the core and DMA access the same
-        // memory bank in the same cycle. The hardware resolves conflicts by
-        // stalling one agent; we detect them for trace event generation.
+        // When the core and DMA access the same memory bank in the same
+        // cycle, HW fires two classes of trace event:
+        //   * CONFLICT_DM_BANK_N on the memory module trace unit (per-bank,
+        //     mem event IDs 77-84 for compute tiles / 112-119 for memtiles).
+        //   * MEMORY_STALL on the core module trace unit (core event 23),
+        //     since the core's load/store bundle is the agent that stalls.
+        //
+        // Both events target the same cycle, so we emit them together and
+        // bump the core's `memory_stalls` cycle-stat counter. This mirrors
+        // how `LOCK_STALL` is emitted on the core side for lock conflicts.
         {
             let cycle = self.total_cycles;
             let mut bank_events: Vec<(usize, u8)> = Vec::new();
+            // Cores whose bundle stalled this cycle due to a DMA-bank conflict.
+            let mut stalled_cores: Vec<usize> = Vec::new();
             for col in 0..self.cols {
                 for row in self.compute_row_start..self.rows {
                     let idx = col * self.rows + row;
@@ -910,6 +919,7 @@ impl InterpreterEngine {
                                 bank_events.push((tile_idx, bank));
                             }
                         }
+                        stalled_cores.push(idx);
                     }
 
                     // Reset core bank tracking for next cycle
@@ -924,6 +934,27 @@ impl InterpreterEngine {
                     crate::trace::mem_conflict_dm_bank_hw_id(bank)
                 };
                 tile.notify_mem_trace_event(hw_id, cycle);
+            }
+            // Emit MEMORY_STALL (core event 23) for each core that lost a
+            // bank to the DMA this cycle. Bump the core's stall counter too.
+            for core_idx in stalled_cores {
+                // Map core index -> tile coordinates for the trace unit.
+                let col = core_idx / self.rows;
+                let row = core_idx % self.rows;
+                if let Some(tile) = self.device.array.get_mut(col as u8, row as u8) {
+                    let hw_id = crate::trace::core_event_to_hw_id(
+                        &crate::interpreter::state::EventType::MemoryStall { cycles: 1 },
+                    );
+                    if let Some(id) = hw_id {
+                        tile.notify_core_trace_event(id, cycle);
+                    }
+                }
+                let ctx = &mut self.cores[core_idx].context;
+                ctx.timing_context_mut().memory_stalls += 1;
+                ctx.timing_context_mut().record_event(
+                    cycle,
+                    crate::interpreter::state::EventType::MemoryStall { cycles: 1 },
+                );
             }
         }
 

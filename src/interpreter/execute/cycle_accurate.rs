@@ -190,7 +190,13 @@ impl CycleAccurateExecutor {
     }
 
     /// Record memory access for bank conflict tracking.
-    fn record_memory_access(&mut self, op: &SlotOp, ctx: &ExecutionContext) {
+    ///
+    /// When two in-cycle accesses land on the same bank, the HW stalls the
+    /// bundle for one cycle and fires MEMORY_STALL on the core trace unit
+    /// (AM020 event-time mode, core module event 23). We emit the event
+    /// into the timing context so `core_event_to_hw_id` can route it to
+    /// the trace unit, and bump `total_memory_stalls` for cycle accounting.
+    fn record_memory_access(&mut self, op: &SlotOp, ctx: &mut ExecutionContext) {
         match op.semantic {
             Some(SemanticOp::Load) | Some(SemanticOp::Store) if !op.is_vector => {
                 // Resolve address from the first pointer register in operands.
@@ -210,7 +216,16 @@ impl CycleAccurateExecutor {
                     is_write: is_store,
                     port: if is_store { 2 } else { 0 },
                 };
-                self.memory.record_access(&access);
+                let conflict = self.memory.record_access(&access);
+                if conflict.has_conflict() {
+                    let cycle = ctx.cycles;
+                    let stall = conflict.stall_cycles;
+                    self.total_memory_stalls += stall as u64;
+                    ctx.timing_context_mut().record_event(
+                        cycle,
+                        EventType::MemoryStall { cycles: stall },
+                    );
+                }
             }
             _ => {}
         }
@@ -722,6 +737,53 @@ mod tests {
         ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 42);
         assert_eq!(ctx.cycles, 1); // 1 cycle to issue (pipelined); result deferred by latency
+    }
+
+    /// Two scalar loads in the same bundle aimed at the same bank must be
+    /// detected as a conflict, bump `total_memory_stalls`, and emit a
+    /// `MemoryStall` event in the timing context. The event is what the
+    /// coordinator later routes to the core trace unit as MEMORY_STALL
+    /// (core event 23) -- previously no code path generated this event.
+    #[test]
+    fn test_memory_bank_conflict_emits_memory_stall() {
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.timing_context_mut().enable_tracing();
+        let mut tile = Tile::compute(0, 2);
+
+        // Two addresses that both land on bank 0 (see banking::BANK_ROW_BYTES).
+        // 0x00 and 0x80 are 128 bytes apart which, with 8-way interleave,
+        // both map to bank 0. This mirrors the existing timing/memory.rs
+        // test_bank_conflict fixture.
+        ctx.pointer.write(0, 0x00);
+        ctx.pointer.write(1, 0x80);
+
+        let bundle = make_bundle(vec![
+            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+                .with_mem_width(MemWidth::Word)
+                .with_dest(Operand::ScalarReg(0))
+                .with_source(Operand::PointerReg(0)),
+            SlotOp::from_semantic(SlotIndex::LoadB, SemanticOp::Load)
+                .with_mem_width(MemWidth::Word)
+                .with_dest(Operand::ScalarReg(1))
+                .with_source(Operand::PointerReg(1)),
+        ]);
+
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        assert!(
+            executor.total_memory_stalls > 0,
+            "two loads to bank 0 should bump total_memory_stalls"
+        );
+        let timing = ctx.timing_context();
+        let memory_stall_events: Vec<_> = timing.events.events().iter()
+            .filter(|e| matches!(e.event, EventType::MemoryStall { .. }))
+            .collect();
+        assert!(
+            !memory_stall_events.is_empty(),
+            "expected a MemoryStall event to be recorded; got {:?}",
+            timing.events.events()
+        );
     }
 
     #[test]
