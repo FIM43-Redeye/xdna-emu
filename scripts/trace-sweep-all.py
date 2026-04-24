@@ -45,6 +45,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -182,11 +183,13 @@ def run_sweep(
     no_hw: bool,
     no_emu: bool,
     events: Optional[str],
+    timeout_sec: Optional[float],
 ) -> dict:
     """Call tools/trace-sweep.py as a subprocess and return a status dict.
 
     Keeps the subprocess boundary so a trace-sweep crash on one combo
-    doesn't take down the whole harness run.
+    doesn't take down the whole harness run.  timeout_sec bounds wall time
+    per combo so a wedged EMU can't hold up the whole sweep.
     """
     cmd = [
         sys.executable, str(TRACE_SWEEP),
@@ -208,8 +211,19 @@ def run_sweep(
 
     log_path = out_json.with_suffix(".log")
     t0 = time.time()
+    rc: int
+    timed_out = False
     with log_path.open("w") as lf:
-        rc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT).returncode
+        try:
+            rc = subprocess.run(
+                cmd, stdout=lf, stderr=subprocess.STDOUT,
+                timeout=timeout_sec,
+            ).returncode
+        except subprocess.TimeoutExpired:
+            # subprocess.run already killed the child when timeout fires.
+            # Tag the combo as timed-out so the summary surfaces it.
+            rc = 124  # timeout convention (GNU `timeout` uses 124)
+            timed_out = True
     dt = round(time.time() - t0, 1)
     return {
         "test": test,
@@ -218,6 +232,7 @@ def run_sweep(
         "out": out_json.name if out_json.exists() else None,
         "log": log_path.name,
         "rc": rc,
+        "timed_out": timed_out,
         "elapsed_sec": dt,
     }
 
@@ -245,9 +260,27 @@ def main() -> int:
                          "(forwarded to trace-sweep.py)")
     ap.add_argument("--no-hw", action="store_true")
     ap.add_argument("--no-emu", action="store_true")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="parallel combos (EMU-only). --jobs >1 requires "
+                         "--no-hw because HW contention serialises through "
+                         "the NPU. Default: 1.")
+    ap.add_argument("--timeout", type=float, default=1800.0,
+                    help="per-combo wall-time limit in seconds; a timed-out "
+                         "combo is killed and recorded rc=124 in summary.json "
+                         "so the harness stays responsive when one EMU wedges "
+                         "(default: 1800 = 30 min)")
     ap.add_argument("--dry-run", action="store_true",
                     help="list combos without running")
     args = ap.parse_args()
+
+    if args.jobs < 1:
+        print("--jobs must be >=1", file=sys.stderr)
+        return 2
+    if args.jobs > 1 and not args.no_hw:
+        print("--jobs >1 requires --no-hw (NPU access is serial). Either "
+              "run HW serially first with --no-emu, then EMU in parallel "
+              "with --no-hw --jobs N.", file=sys.stderr)
+        return 2
 
     tests = discover_tests(args.test)
     if not tests:
@@ -293,21 +326,53 @@ def main() -> int:
     out_dir = allocate_results_dir(args.label)
     print(f"[sweep-all] writing to {out_dir}")
 
-    statuses = []
-    t_total = time.time()
-    for i, (test, comp, tile) in enumerate(combos, 1):
+    def _submit(combo):
+        test, comp, tile = combo
         out_json = out_dir / f"{test}.{comp}.{tile.label}.json"
-        print(f"[sweep-all] ({i}/{len(combos)}) {test} {comp} {tile.label}",
-              flush=True)
-        status = run_sweep(
+        return run_sweep(
             test=test, compiler=comp, tile=tile, out_json=out_json,
             ground_event=ground, no_hw=args.no_hw, no_emu=args.no_emu,
-            events=args.events,
+            events=args.events, timeout_sec=args.timeout,
         )
-        if status["rc"] != 0:
-            print(f"  !! rc={status['rc']}, see {status['log']}",
-                  file=sys.stderr)
-        statuses.append(status)
+
+    statuses = []
+    t_total = time.time()
+    if args.jobs == 1:
+        for i, combo in enumerate(combos, 1):
+            test, comp, tile = combo
+            print(f"[sweep-all] ({i}/{len(combos)}) {test} {comp} {tile.label}",
+                  flush=True)
+            status = _submit(combo)
+            if status["rc"] != 0:
+                tag = "TIMEOUT" if status.get("timed_out") else f"rc={status['rc']}"
+                print(f"  !! {tag}, see {status['log']}", file=sys.stderr)
+            statuses.append(status)
+    else:
+        # Parallel EMU: we only hit here when --no-hw is set (enforced
+        # above). Each worker spawns its own trace-sweep.py subprocess
+        # which runs its own emulator inside bridge-trace-runner, so the
+        # fan-out is filesystem-isolated. Shared state: the results dir,
+        # but every combo writes to a unique filename.
+        print(f"[sweep-all] running {len(combos)} combos with {args.jobs} "
+              f"parallel workers (EMU only)", flush=True)
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futures = {pool.submit(_submit, c): c for c in combos}
+            done = 0
+            for fut in as_completed(futures):
+                done += 1
+                status = fut.result()
+                statuses.append(status)
+                test = status["test"]
+                comp = status["compiler"]
+                tile_lbl = f"{status['tile']['type']}_c{status['tile']['col']}r{status['tile']['row']}"
+                if status["rc"] == 0:
+                    print(f"[sweep-all] ({done}/{len(combos)}) OK {test} {comp} "
+                          f"{tile_lbl} ({status['elapsed_sec']}s)", flush=True)
+                else:
+                    tag = "TIMEOUT" if status.get("timed_out") else f"rc={status['rc']}"
+                    print(f"[sweep-all] ({done}/{len(combos)}) !! {tag} "
+                          f"{test} {comp} {tile_lbl}, see {status['log']}",
+                          file=sys.stderr, flush=True)
 
     summary = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
