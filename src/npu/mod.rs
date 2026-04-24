@@ -22,9 +22,13 @@
 //! - `CONFIG_SHIMDMA_DMABUF_BD` (6): Configure shim DMA with DMA buffer
 //! - `DDR_PATCH` (129): Patch address with host buffer address
 
+mod classify;
 mod parser;
 mod executor;
 
+pub use classify::{
+    classify_bytes, classify_kernargs, classify_with_topology, KernargClassification, KernargRole,
+};
 pub use parser::{NpuInstruction, NpuInstructionStream};
 pub use executor::{NpuExecutor, HostBuffer, AdvanceResult};
 

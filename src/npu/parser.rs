@@ -485,6 +485,14 @@ impl NpuInstructionStream {
     pub fn is_empty(&self) -> bool {
         self.instructions.is_empty()
     }
+
+    /// Build a stream directly from a list of instructions. Intended for
+    /// tests and for classifiers that synthesise streams without a
+    /// binary round-trip.
+    #[doc(hidden)]
+    pub fn from_instructions(instructions: Vec<NpuInstruction>) -> Self {
+        Self { instructions }
+    }
 }
 
 #[cfg(test)]

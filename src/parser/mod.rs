@@ -12,6 +12,7 @@ pub mod xclbin;
 pub mod aie_partition;
 pub mod cdo;
 pub mod elf;
+pub mod stream_switch_topology;
 
 #[cfg(test)]
 pub mod testing;
