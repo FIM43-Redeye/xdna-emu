@@ -27,10 +27,12 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use goblin::elf::{Elf, program_header::PT_LOAD};
 use std::path::Path;
 use xdna_archspec::elf::{EM_AIE, AieArchitecture};
+
+use super::error::ParseError;
 
 /// Memory region type for AIE address interpretation.
 ///
@@ -127,21 +129,32 @@ impl<'a> std::fmt::Debug for AieElf<'a> {
 impl<'a> AieElf<'a> {
     /// Parse an AIE ELF from raw bytes
     pub fn parse(data: &'a [u8]) -> Result<Self> {
-        let elf = Elf::parse(data)
-            .map_err(|e| anyhow!("Failed to parse ELF: {}", e))?;
+        let elf = Elf::parse(data).map_err(|e| ParseError::Structural {
+            offset: 0,
+            context: "ELF",
+            source: Box::new(e),
+        })?;
 
-        // Validate it's an AIE ELF
+        // Validate it's an AIE ELF. e_machine is at offset 0x12 in the ELF header.
         if elf.header.e_machine != EM_AIE {
-            bail!(
-                "Not an AIE ELF: machine type 0x{:X}, expected 0x{:X} (EM_AIE)",
-                elf.header.e_machine,
-                EM_AIE
-            );
+            return Err(ParseError::InvalidValue {
+                offset: 0x12,
+                field: "e_machine",
+                value: elf.header.e_machine as u64,
+                reason: "expected EM_AIE (0x108); not an AIE ELF",
+            }
+            .into());
         }
 
-        // Must be 32-bit
+        // Must be 32-bit. EI_CLASS is at offset 0x04 in the ELF header.
         if elf.is_64 {
-            bail!("AIE ELF must be 32-bit, got 64-bit");
+            return Err(ParseError::InvalidValue {
+                offset: 0x04,
+                field: "EI_CLASS",
+                value: 2, // ELFCLASS64
+                reason: "AIE ELF must be 32-bit (ELFCLASS32)",
+            }
+            .into());
         }
 
         Ok(Self { data, elf })
@@ -149,8 +162,11 @@ impl<'a> AieElf<'a> {
 
     /// Parse an AIE ELF from a file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<(Vec<u8>, Self)> {
-        let data = std::fs::read(path.as_ref())
-            .map_err(|e| anyhow!("Failed to read ELF file: {}", e))?;
+        let data = std::fs::read(path.as_ref()).map_err(|e| ParseError::Structural {
+            offset: 0,
+            context: "ELF file read",
+            source: Box::new(e),
+        })?;
 
         // We need to return ownership of data along with the parsed ELF
         // This is a bit awkward but necessary for lifetime management
@@ -471,7 +487,11 @@ mod tests {
 
         let result = AieElf::parse(&data);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Not an AIE ELF"));
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("e_machine") && msg.contains("not an AIE ELF"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]
