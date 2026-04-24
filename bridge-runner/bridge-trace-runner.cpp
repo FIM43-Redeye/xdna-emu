@@ -44,8 +44,12 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
@@ -477,6 +481,211 @@ bool reuse_context_across_runs() {
     return false;
 }
 
+// Async context pipeline: pre-builds the next hw_context + kernel in a
+// background thread and async-destroys used ones in a second thread, so
+// the main thread doesn't pay the ~40 ms build + ~45 ms destroy cost
+// inline. The runner becomes bottlenecked on combined builder-plus-
+// destroyer throughput instead of their sum.
+//
+// Measured speedups are smaller than the math suggests, because the
+// driver's aie2_lock mutex (grabbed by both aie2_hwctx_start and
+// aie2_hwctx_stop in xdna-driver) serializes builder and destroyer:
+// they can't actually run in parallel inside the kernel driver. What
+// we do get is the main thread's kernel submission (which uses a
+// per-context mailbox and doesn't grab aie2_lock) overlapping with
+// whichever of build/destroy is running.
+//
+// On Phoenix + trace-sweep, this measures ~8% sweep wall-clock
+// improvement (33.5 s -> 30.9 s averaged over 3 runs on
+// add_one_objFifo/chess). Runner-level per-iter drops from ~125 ms
+// sync to ~85 ms async, but parse-trace.py dominates at ~900 ms/batch
+// so most of the runner savings are hidden in the total.
+//
+// Disable with BRIDGE_RUNNER_ASYNC_CTX=0 to fall back to the
+// synchronous teardown path (useful for debugging or isolating
+// regressions).
+bool async_ctx_enabled() {
+    if (const char* v = std::getenv("BRIDGE_RUNNER_ASYNC_CTX")) {
+        return std::atoi(v) != 0;
+    }
+    return true;
+}
+
+// How many ready hw_contexts to keep pre-built. Default 1 is enough for
+// the typical sweep where builder throughput (~40 ms/ctx) dominates
+// main-thread consumption (~2 ms kernel + BO alloc). Higher values help
+// if the main thread briefly runs faster than builder steady-state.
+// Capped at 4 so we never approach the Phoenix per-process hw_context
+// limit (empirically ~6) even with a destroyer queue also in flight.
+size_t async_ctx_depth() {
+    if (const char* v = std::getenv("BRIDGE_RUNNER_ASYNC_DEPTH")) {
+        int n = std::atoi(v);
+        if (n < 1) n = 1;
+        if (n > 4) n = 4;
+        return static_cast<size_t>(n);
+    }
+    return 1;
+}
+
+struct CtxBundle {
+    xrt::hw_context ctx;
+    xrt::kernel kernel;
+};
+
+// Per-(xclbin,kernel) pipeline. Owns a builder thread that produces
+// ready CtxBundles and a destroyer thread that consumes retired ones.
+// Thread-safe for a single consumer (the main thread) -- take_ready()
+// and retire() are the only main-thread entry points.
+class CtxPipeline {
+public:
+    CtxPipeline(xrt::device& device, xrt::xclbin xclbin,
+                std::string kernel_name, bool verbose)
+        : device_(device), xclbin_(std::move(xclbin)),
+          kernel_name_(std::move(kernel_name)), verbose_(verbose),
+          want_depth_(async_ctx_depth())
+    {
+        builder_ = std::thread([this]{ builder_loop(); });
+        destroyer_ = std::thread([this]{ destroyer_loop(); });
+    }
+
+    ~CtxPipeline() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            shutdown_ = true;
+        }
+        cv_need_build_.notify_all();
+        cv_need_destroy_.notify_all();
+        cv_ready_.notify_all();
+        if (builder_.joinable()) builder_.join();
+        if (destroyer_.joinable()) destroyer_.join();
+    }
+
+    // Blocks until a ready bundle is available. Returns nullptr only on
+    // shutdown. A builder may occasionally fail (network hiccup, NPU
+    // transient), in which case it retries; take_ready() just waits.
+    std::unique_ptr<CtxBundle> take_ready() {
+        auto t0 = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_ready_.wait(lk, [this]{ return !ready_.empty() || shutdown_; });
+        if (ready_.empty()) return nullptr;
+        auto b = std::move(ready_.front());
+        ready_.pop_front();
+        size_t gv = graveyard_.size();
+        size_t rd = ready_.size();
+        // Wake the builder to restock the queue. We notify under the
+        // lock so the builder sees the updated ready_.size() when it
+        // rechecks its predicate.
+        cv_need_build_.notify_one();
+        auto t1 = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        if (verbose_) {
+            std::fprintf(stderr,
+                "[pipeline] take_ready wait=%lldms (ready=%zu, graveyard=%zu)\n",
+                (long long)ms, rd, gv);
+        }
+        return b;
+    }
+
+    // Hand a used bundle to the destroyer. Main thread returns without
+    // waiting; the destroyer thread will tear it down in the
+    // background.
+    void retire(std::unique_ptr<CtxBundle> bundle) {
+        if (!bundle) return;
+        size_t gv;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            graveyard_.push_back(std::move(bundle));
+            gv = graveyard_.size();
+        }
+        cv_need_destroy_.notify_one();
+        if (verbose_) {
+            std::fprintf(stderr,
+                "[pipeline] retired (graveyard now %zu)\n", gv);
+        }
+    }
+
+private:
+    void builder_loop() {
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_need_build_.wait(lk, [this]{
+                    return shutdown_ || ready_.size() < want_depth_;
+                });
+                if (shutdown_) return;
+            }
+            // Build outside the lock -- hw_context construction can
+            // take ~40 ms, we don't want to hold mu_ that long.
+            std::unique_ptr<CtxBundle> b;
+            try {
+                b = std::make_unique<CtxBundle>();
+                b->ctx = xrt::hw_context(device_, xclbin_.get_uuid());
+                b->kernel = xrt::kernel(b->ctx, kernel_name_);
+            } catch (const std::exception& e) {
+                if (verbose_) {
+                    std::fprintf(stderr,
+                        "[ctx-builder] build failed: %s (retry)\n", e.what());
+                }
+                // Back off briefly and retry on the next loop iteration.
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (shutdown_) return;
+                ready_.push_back(std::move(b));
+            }
+            cv_ready_.notify_one();
+        }
+    }
+
+    void destroyer_loop() {
+        while (true) {
+            std::unique_ptr<CtxBundle> b;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_need_destroy_.wait(lk, [this]{
+                    return shutdown_ || !graveyard_.empty();
+                });
+                if (shutdown_ && graveyard_.empty()) return;
+                if (graveyard_.empty()) continue;
+                b = std::move(graveyard_.front());
+                graveyard_.pop_front();
+            }
+            // Explicit reset outside the lock -- kernel first (holds a
+            // reference to ctx), then ctx.
+            try {
+                b->kernel = xrt::kernel{};
+                b->ctx = xrt::hw_context{};
+            } catch (const std::exception& e) {
+                if (verbose_) {
+                    std::fprintf(stderr,
+                        "[ctx-destroyer] destroy threw: %s (continuing)\n",
+                        e.what());
+                }
+            }
+            // b goes out of scope here.
+        }
+    }
+
+    xrt::device& device_;
+    xrt::xclbin xclbin_;
+    std::string kernel_name_;
+    bool verbose_;
+    size_t want_depth_;
+
+    std::mutex mu_;
+    std::condition_variable cv_ready_;
+    std::condition_variable cv_need_build_;
+    std::condition_variable cv_need_destroy_;
+    std::deque<std::unique_ptr<CtxBundle>> ready_;
+    std::deque<std::unique_ptr<CtxBundle>> graveyard_;
+    bool shutdown_ = false;
+
+    std::thread builder_;
+    std::thread destroyer_;
+};
+
 struct PreparedKernel {
     std::string xclbin_path;
     std::string kernel_hint;   // empty means "any"
@@ -514,6 +723,14 @@ struct PreparedKernel {
     // timeout and is not the XRT-documented pattern. Each execute_run
     // creates a fresh run, sets args, starts, waits. The BOs it
     // references come from this pool so no BO churn happens per run.
+
+    // Async pipeline: when enabled, each run takes a fresh
+    // hw_context+kernel from the builder thread and retires the used
+    // one to the destroyer thread. When this pipeline is active,
+    // pool_ready is always false -- the BO pool is invalidated every
+    // run because BOs are bound to the retiring kernel's group_ids.
+    // Constructed lazily on the first async run.
+    std::unique_ptr<CtxPipeline> pipeline;
 };
 
 std::unique_ptr<PreparedKernel> prepare_kernel(
@@ -654,6 +871,9 @@ RunOutcome execute_run(
 {
     RunOutcome result;
     auto t0 = std::chrono::steady_clock::now();
+    // Hoisted above the try so the retirement block at the end can see
+    // it regardless of where an exception was thrown.
+    std::unique_ptr<CtxBundle> active_bundle;
     try {
         const auto& kargs = prep.kargs;
         const auto& plan = prep.plan;
@@ -709,14 +929,32 @@ RunOutcome execute_run(
             plan, ctrlpkt_data_args, inputs, args.outputs, ctrlpkts);
 
         // Rebuild hw_context + kernel per run to sidestep the
-        // alternating-TIMEOUT pattern that hits on hw_context reuse
-        // (see reuse_context_across_runs() docstring). Drops the BO
-        // pool too since group_id is tied to the recreated kernel.
+        // alternating-TIMEOUT pattern that hits on hw_context reuse.
+        // Two paths: async pipeline (default) hands us a pre-built
+        // bundle and retires the used one to a destroyer thread so
+        // both costs overlap kernel execution; synchronous teardown
+        // (legacy, for comparison) does it all inline.
         if (!reuse_context_across_runs()) {
-            prep.kernel = xrt::kernel{};
-            prep.context = xrt::hw_context{};
-            prep.context = xrt::hw_context(device, prep.xclbin.get_uuid());
-            prep.kernel = xrt::kernel(prep.context, prep.kernel_name);
+            if (async_ctx_enabled()) {
+                if (!prep.pipeline) {
+                    prep.pipeline = std::make_unique<CtxPipeline>(
+                        device, prep.xclbin, prep.kernel_name, verbose);
+                }
+                active_bundle = prep.pipeline->take_ready();
+                if (!active_bundle) {
+                    throw std::runtime_error(
+                        "ctx pipeline shut down before producing a bundle");
+                }
+                // Swap the pre-built ctx+kernel into prep so the rest
+                // of execute_run operates on a fresh, valid pair.
+                prep.context = active_bundle->ctx;
+                prep.kernel = active_bundle->kernel;
+            } else {
+                prep.kernel = xrt::kernel{};
+                prep.context = xrt::hw_context{};
+                prep.context = xrt::hw_context(device, prep.xclbin.get_uuid());
+                prep.kernel = xrt::kernel(prep.context, prep.kernel_name);
+            }
             prep.pool_ready = false;
         }
 
@@ -898,6 +1136,19 @@ RunOutcome execute_run(
     } catch (const std::exception& e) {
         result.ok = false;
         result.error = e.what();
+    }
+    // Retire the async-acquired bundle regardless of success/failure.
+    // Clear prep's copies first so the destroyer thread holds the last
+    // reference and can tear down off the main thread's critical path.
+    // BO pool is bound to this kernel's group_ids, so it has to go too.
+    if (active_bundle) {
+        prep.pool_bos.clear();
+        prep.pool_bo_sizes.clear();
+        prep.pool_arg_to_bo_idx.clear();
+        prep.pool_ready = false;
+        prep.kernel = xrt::kernel{};
+        prep.context = xrt::hw_context{};
+        prep.pipeline->retire(std::move(active_bundle));
     }
     auto t1 = std::chrono::steady_clock::now();
     result.elapsed_ms = static_cast<uint64_t>(
