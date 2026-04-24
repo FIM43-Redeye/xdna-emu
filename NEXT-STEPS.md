@@ -3,9 +3,9 @@
 Recovery document for picking up this refactor in a future session. Read
 this first, then dive into the authoritative artifacts below.
 
-**Last updated:** 2026-04-22 (Phase 1b Subsystem 7 landed; Subsystem 8 up next)
+**Last updated:** 2026-04-24 (Phase 1b Subsystem 8 Stage 8a landed; Stage 8b Half 1 up next, Stage 8b Half 2 gated on user review)
 **Current branch:** `dev` (no master merges until the refactor is done)
-**Latest tag:** `phase1-subsys-isa-execute` (Subsystem 7 completion)
+**Latest tag:** `phase1-subsys-parser-arch` (Subsystem 8 Stage 8a completion)
 
 ---
 
@@ -96,6 +96,52 @@ on it):**
   and honor `XFAIL:`) correctly surfaces this long-latent deadlock.
   Independent workstream; investigate after the Phase 1 refactor
   if worthwhile, not during.
+
+---
+
+## Gate between Stage 8a and 8b (Half 2)
+
+**The refined `DeviceOp` proposal is ready for user review** before Stage 8b Half 2 begins.
+The proposal lives at:
+
+> `docs/superpowers/specs/2026-04-23-subsys8-parser-design.md`
+> §"`DeviceOp` vocabulary" > §Shape
+
+The 11-variant enum there (see audit closing summary at `docs/arch/subsys8-audit.md`
+§"Refined `DeviceOp` enum proposal") supersedes the 8-variant starting hypothesis.
+Changes from the hypothesis: added `MaskPoll`, `Delay`, `Marker`; collapsed
+`Write64`/`MaskWrite64` into `RegWrite`/`RegMask`; dropped `Nop`/`EndMark` (produce no op).
+
+### What can proceed immediately (Stage 8b Half 1)
+
+**Stage 8b Half 1 is fully specifiable and can start without the user gate.** It is a
+type-rename + file-split with no `DeviceOp` involvement:
+
+1. **Rename `CdoCommand` → `CdoRaw`** throughout the tree. Mechanical; no behavior change.
+2. **Split `src/parser/cdo.rs` (835 LOC) into three submodules:**
+   - `src/parser/cdo/framing.rs` -- header parse, length framing, byte-level.
+   - `src/parser/cdo/syntax.rs` -- emit `CdoRaw` variants.
+   - `src/parser/cdo/semantics.rs` -- stub pass-through (accepts `CdoRaw`, returns `CdoRaw`). No `DeviceOp` yet.
+
+At the close of Half 1 there is a bisect-safe checkpoint: the tree compiles, all tests
+pass, and the internal CDO structure is in place. `device/state` still consumes `CdoRaw`
+directly via the pass-through `semantics`. This checkpoint is the rollback anchor for
+Half 2.
+
+### What is gated (Stage 8b Half 2)
+
+**Stage 8b Half 2 does not start until the user confirms the `DeviceOp` proposal.** Half 2:
+
+1. Introduces `src/device/ops.rs` with the `DeviceOp` enum.
+2. Rewrites `semantics::lower` to emit `DeviceOp` (instead of pass-through).
+3. Migrates `device/state` to consume `DeviceOp` (instead of `CdoRaw`).
+
+This is the step where the vocabulary locks in -- reshaping a variant costs a cascade
+edit through `semantics::lower`, `device::state::apply`, and downstream tests. The gate
+exists to catch that before implementation, not after.
+
+**To unblock Half 2:** review `docs/superpowers/specs/2026-04-23-subsys8-parser-design.md`
+§Shape, confirm the 11-variant enum (or request changes), and let the next session know.
 
 ---
 
@@ -203,7 +249,7 @@ when we start it -- don't try to pre-write all 8 subsystem plans.
 | 4 | Locks | `phase1-subsys-locks` | **Done** | Small seam: 3-method LockModel trait (supports_acquire_eq, supports_dynamic_value_ops, value_layout) + LockValueLayout carrier + Aie2LockModel. Migrated `sign_extend_lock_value` + lock_value_* fields from xdna-emu's DeviceRegLayout wrapper to archspec; wrapper collapsed. See docs/arch/lock-model.md. |
 | 5 | Stream Switch | `phase1-subsys-stream-switch` | **Done** | Two-method `StreamSwitchModel` trait (`supports_deterministic_merge` + `topology`) + `StreamSwitchTopology` carrier (3 `TileStreamPorts` sub-structs with `for_tile(TileKind)` accessor) + `Aie2StreamSwitchModel`. Dead-code `PortLayout` extension trait (231 LOC) deleted; 3 tests migrated to archspec. 6 tile-construction sites in `stream_switch/mod.rs` migrated through `arch_handle::stream_switch_topology()`. Direct archspec-constant consumers (`routing.rs`, `stream_io.rs`, `state/`) stay on direct access as AIE1-landing follow-ups. See `docs/arch/stream-switch-model.md`. |
 | 7 | ISA Execute | `phase1-subsys-isa-execute` | **Done** | Audit concluded Approach A (zero trait methods warranted): all divergence is data-expressible. `IsaExecutor` trait ships empty as a stable anchor. 11 data migrations landed across 5 tasks -- `vmac_routing.rs` (234K) + `vector_permute.rs` tables + `RoundingMode` dedup + matmul/UPS/cascade data + 5 accessor bundles. `has_cascade_link: bool` feature flag added to `ProcessorModel`. AIE1/AIE2P ports now "populate archspec; no execute/ edits." See `docs/arch/isa-execute-model.md` + `docs/arch/subsys7-audit.md`. |
-| 8 | Parser (XCLBIN / PDI / ELF) | `phase1-subsys-parser` | **Up next** | Container format variance. `BinaryLoader` trait. |
+| 8 | Parser (XCLBIN / PDI / ELF) | `phase1-subsys-parser` | **Stage 8a done (`phase1-subsys-parser-arch`); Stage 8b Half 1 up next; Stage 8b Half 2 gated on user review of refined DeviceOp proposal** | Container format variance. `BinaryLoader` trait (decided: no trait). CDO three-layer split + DeviceOp vocab (8b). ELF dedup + diagnostics + fixtures (8c). |
 
 **End state after Phase 1:** adding AIE2P is "implement the traits for a
 second arch"; adding AIE1/Versal is "implement the traits + extend for
