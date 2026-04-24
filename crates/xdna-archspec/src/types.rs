@@ -140,6 +140,58 @@ mod tile_kind_predicate_tests {
     }
 }
 
+/// Tile coordinate pair (column, row).
+///
+/// Rows are numbered from bottom (shim row = 0). Columns are 0-indexed
+/// from the left of the array. Both fields fit in u8 across all AIE2
+/// and AIE2P parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TileAddr {
+    pub col: u8,
+    pub row: u8,
+}
+
+impl TileAddr {
+    pub const fn new(col: u8, row: u8) -> Self {
+        Self { col, row }
+    }
+}
+
+impl fmt::Display for TileAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({},{})", self.col, self.row)
+    }
+}
+
+#[cfg(test)]
+mod tile_addr_tests {
+    use super::TileAddr;
+
+    #[test]
+    fn tile_addr_new_sets_fields() {
+        let a = TileAddr::new(3, 4);
+        assert_eq!(a.col, 3);
+        assert_eq!(a.row, 4);
+    }
+
+    #[test]
+    fn tile_addr_display_matches_tuple_form() {
+        assert_eq!(TileAddr::new(0, 2).to_string(), "(0,2)");
+        assert_eq!(TileAddr::new(5, 0).to_string(), "(5,0)");
+    }
+
+    #[test]
+    fn tile_addr_is_copy_and_hash() {
+        use std::collections::HashSet;
+        let a = TileAddr::new(1, 1);
+        let b = a; // Copy
+        let mut set = HashSet::new();
+        set.insert(a);
+        set.insert(b);
+        assert_eq!(set.len(), 1);
+    }
+}
+
 // ============================================================================
 // Source attribution
 // ============================================================================

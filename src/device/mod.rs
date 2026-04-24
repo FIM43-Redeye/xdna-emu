@@ -55,6 +55,7 @@ pub mod registers;
 pub mod tile;
 pub mod array;
 pub mod state;
+pub mod ops;
 pub mod host_memory;
 pub mod dma;
 pub mod stream_switch;
