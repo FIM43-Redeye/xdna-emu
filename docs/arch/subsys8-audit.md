@@ -732,3 +732,99 @@ Stage 8a landed at tag `phase1-subsys-parser-arch`. Commit series:
 
 - `examples/run_add_test.rs`, `examples/bdd_validate.rs`, `tests/arch_constants.rs` are stale and reference `xdna_emu::arch` and `xdna_emu::tablegen` modules that Subsystem 6 dissolved. Not in `cargo test --lib` or `cargo build --release` paths, so they don't block. Phase 2 hygiene will either update or delete them.
 - `src/parser/elf.rs::MemoryRegion::from_address()` still has an arch-hardcoded archspec read (see audit §6 trailing item). Arch-generic accessor is a Phase 2 hygiene item.
+
+---
+
+## Epilogue: Stage 8b closure (tag `phase1-subsys-parser-coupling`)
+
+**What landed:** the CDO module split along framing / syntax / semantics lines
+(Task 8 bisect anchor at `1feb66a`), the 8-variant `DeviceOp` module in
+`src/device/ops.rs` (Task 10 at `a28b14f`, revised at `48be765`),
+`semantics::lower` rewritten to emit `DeviceOp` with promotion for
+CORE_CONTROL → `CoreEnable` and compute-tile DMA Start_Queue → `DmaStart`
+(Task 11 at `0402eca`, DmaStart target corrected at `38c7cfa`), and
+`device::state::apply_cdo` migrated to iterate `DeviceOp` through
+`apply_device_op` (Task 12 at `0fa794c`).
+
+### Post-gate revisions to DeviceOp
+
+The user-gate-confirmed 10-variant enum became 8 variants after two
+evidence-driven corrections during implementation:
+
+1. **RegWrite64 / RegMask64 dropped.** Explore-agent audit of the AM025
+   register JSON (1,806 memory-mapped registers, zero with width=64) and
+   the aie-rt headers (no `XAie_Write64` API; DMA BD address halves are
+   two independent 32-bit register writes) established that CDO opcode
+   0x108 (`Write64`) means 64-bit *address*, not 64-bit value. The
+   existing `device/state` already truncated to u32 without data loss.
+   Preserving the gate's concern ("put them back if 64-bit registers
+   appear") is satisfied by re-adding the variants then with real
+   producers behind them.
+
+2. **DmaStart promotion retargeted to Start_Queue.** Initial Task 11
+   matched the DMA Ctrl register with an enable-bit check; the agent
+   flagged during self-review that real hardware triggers transfers by
+   pushing a BD ID to `Start_Queue` (Ctrl + 4), not by setting enable
+   in Ctrl. The fix swapped the promotion target and added the four
+   `COMPUTE_DMA_{S2MM,MM2S}_{0,1}_START_QUEUE` consts to
+   `xdna_archspec::aie2::registers::dma` with drift-detection tests.
+   Ctrl writes now pass through as `RegWrite` (they're channel
+   configuration, not transfer triggers).
+
+Both corrections strengthened the "typed ops match what silicon does"
+principle the user named at the gate.
+
+### Load-bearing finding: non-CDO write paths still bypass DeviceOp
+
+`device::state::write_core_register` / `mask_write_core_register` /
+`write_dma_channel` / `mask_write_dma_channel` retain their
+`CORE_CONTROL` and `Start_Queue` offset-dispatch branches. These
+functions are also entry points for non-CDO register writes:
+
+- `src/interpreter/engine/coordinator.rs` (3 call sites) -- NPU
+  instruction register writes
+- `src/npu/executor.rs` (6 call sites) -- `Write32`, `BlockWrite`,
+  `MaskWrite`, `DdrPatch` NPU instructions
+- Control-packet dispatch, which routes through `write_tile_register`
+
+Removing those branches would silently drop the CORE_CONTROL
+enable/disable side effect and the Start_Queue task-enqueue effect for
+those paths. The CDO path now bypasses the branches entirely
+(via `apply_device_op` → `apply_core_enable` / `start_compute_dma_channel`),
+so the branches serve only the non-CDO paths today. The CDO path is
+fully typed; non-CDO paths remain offset-dispatched.
+
+This is a real architectural boundary surfaced by the refactor, not a
+Subsystem 8 bug. Making `DeviceOp` the *universal* device-write
+boundary (covering NPU instructions and control packets in addition to
+CDOs) is a separate audit-first refactor scope -- likely a future
+subsystem if its value outweighs its cost. For now, the finding is
+archived here and noted in `NEXT-STEPS.md` under "Known follow-up:
+non-CDO write paths still bypass DeviceOp."
+
+Similarly, memtile and shim DMA channel promotions are deliberately
+deferred: `archspec::aie2::registers::dma` exposes only compute-tile
+Ctrl/Start_Queue offsets, and `lower()` only promotes for
+`row >= 2`. When memtile/shim DMA promotions land, they extend the
+archspec submodule with their own base addresses and the `lower()`
+match expands accordingly.
+
+### Baselines at Stage 8b tag time
+
+- `cargo test --lib`: 2720 passed; 0 failed; 5 ignored. (Baseline at
+  Stage 8a was 2684; +36 from new DeviceOp and `semantics::lower` tests.)
+- `cargo test -p xdna-archspec --lib`: 327 passed; 0 failed; 2 ignored.
+  (Baseline at Stage 8a was 322; +5 from TileAddr tests and the
+  `dma` submodule drift-detection tests.)
+- Release build clean. FFI crate build clean.
+- Full bridge test: matches pre-refactor behavior (see
+  `/tmp/claude-1000/subsys8-8b-bridge.log`).
+- ISA test: matches pre-refactor behavior (see
+  `/tmp/claude-1000/subsys8-8b-isa.log`).
+
+### What remains for Subsystem 8
+
+Stage 8c (ergonomics): `ParseError` enum (diagnostics), test fixtures
+(`XclbinBuilder` / `CdoBuilder` / `ElfBuilder`), ELF loading
+deduplication across 8 consumer sites, control-packet alignment note.
+See plan Tasks 14-18.
