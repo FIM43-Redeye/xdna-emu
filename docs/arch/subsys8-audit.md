@@ -559,6 +559,26 @@ Starting hypothesis had 8 variants. Audit added 3 (MaskPoll, Delay, Marker). Use
 added 2 (RegWrite64, RegMask64) and dropped 3 (BdConfigure, LockInit, StreamRoute). Final
 result: **10 variants**.
 
+**Post-gate revision 2026-04-24 (Task 10 follow-up): 8 variants, not 10.**
+During Task 11 prep, checking the actual producer/consumer of CDO Write64 revealed that
+"Write64" is an address-width opcode, not a value-width opcode -- CDO opcode 0x108 writes
+a 32-bit value to a 64-bit address, and `device/state/cdo.rs:53-61` already truncates the
+high 32 address bits (always zero for AIE) and writes the 32-bit value. An Explore audit
+of the aie-rt headers and the AM025 register JSON (1,806 registers, zero 64-bit entries;
+aie-rt has no `XAie_Write64` API; DMA BD address halves are two independent 32-bit writes)
+confirmed there is no AIE architecture, current or on the roadmap, in which a 64-bit
+MMIO write is meaningful. Decision 1 above was based on a misreading of the CDO format.
+
+`RegWrite64` and `RegMask64` are dropped from DeviceOp. `CdoRaw::Write64` lowers to
+`DeviceOp::RegWrite` (after address truncation); `CdoRaw::MaskWrite64` lowers to
+`DeviceOp::RegMask`. This matches existing hardware-equivalent behavior. If a future AIE
+part introduces genuine 64-bit MMIO, the variants can be reintroduced with real producers
+behind them.
+
+The enum snippet below retains the as-of-gate shape for historical accuracy; the current
+source of truth for DeviceOp is `src/device/ops.rs`. See spec §"Write64 is an
+address-width opcode" for the full rationale.
+
 ```rust
 // src/device/ops.rs -- new module (Stage 8b Half 2)
 //

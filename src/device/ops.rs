@@ -32,26 +32,17 @@ pub enum DeviceOp {
     // --- Register-level writes (escape hatch; ~75% of CDO commands) ---
 
     /// Single 32-bit register write.
-    /// Produced by: `CdoRaw::Write`.
+    /// Produced by: `CdoRaw::Write`, and by `CdoRaw::Write64` after
+    /// address truncation (see `RegMask` doc for the CDO-Write64
+    /// width-naming note).
     RegWrite { tile: TileAddr, offset: u32, value: u32 },
 
-    /// 64-bit register-pair write.
-    ///
-    /// Distinct variant (rather than truncating to `u32`) because CDO
-    /// Write64 writes register pairs atomically; collapsing to
-    /// `RegWrite` would silently drop the high half.
-    /// Produced by: `CdoRaw::Write64`.
-    RegWrite64 { tile: TileAddr, offset: u32, value: u64 },
-
     /// Masked register write: `*reg = (*reg & !mask) | (value & mask)`.
-    /// Produced by: `CdoRaw::MaskWrite`.
+    /// Produced by: `CdoRaw::MaskWrite`, and by `CdoRaw::MaskWrite64`
+    /// after address truncation (Write64/MaskWrite64 in CDO mean
+    /// 64-bit *address*, not 64-bit value -- the high 32 bits of the
+    /// address are always zero for AIE and the written value is u32).
     RegMask { tile: TileAddr, offset: u32, mask: u32, value: u32 },
-
-    /// 64-bit masked register-pair write.
-    ///
-    /// Same preservation reasoning as `RegWrite64`.
-    /// Produced by: `CdoRaw::MaskWrite64`.
-    RegMask64 { tile: TileAddr, offset: u32, mask: u64, value: u64 },
 
     /// Bulk write: `words.len()` consecutive 32-bit words starting at
     /// `offset`.
@@ -120,38 +111,11 @@ mod tests {
     }
 
     #[test]
-    fn reg_write64_preserves_high_half() {
-        let op = DeviceOp::RegWrite64 { tile: t(1, 3), offset: 0x2000, value: 0xCAFEBABE_DEADBEEF };
-        if let DeviceOp::RegWrite64 { value, .. } = op {
-            assert_eq!(value, 0xCAFEBABE_DEADBEEF);
-            assert_eq!((value >> 32) as u32, 0xCAFEBABE);
-        } else {
-            panic!("wrong variant");
-        }
-    }
-
-    #[test]
     fn reg_mask_applies_shape() {
         let op = DeviceOp::RegMask { tile: t(2, 1), offset: 0x100, mask: 0xFF00, value: 0x5500 };
         if let DeviceOp::RegMask { mask, value, .. } = op {
             assert_eq!(mask, 0xFF00);
             assert_eq!(value, 0x5500);
-        } else {
-            panic!("wrong variant");
-        }
-    }
-
-    #[test]
-    fn reg_mask64_preserves_high_half() {
-        let op = DeviceOp::RegMask64 {
-            tile: t(0, 0),
-            offset: 0x400,
-            mask: 0xFFFFFFFF_00000000,
-            value: 0xAAAAAAAA_00000000,
-        };
-        if let DeviceOp::RegMask64 { mask, value, .. } = op {
-            assert_eq!(mask, 0xFFFFFFFF_00000000);
-            assert_eq!(value, 0xAAAAAAAA_00000000);
         } else {
             panic!("wrong variant");
         }

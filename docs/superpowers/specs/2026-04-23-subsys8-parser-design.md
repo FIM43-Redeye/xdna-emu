@@ -284,24 +284,16 @@ pub enum DeviceOp {
     // --- Register-level writes (escape hatch; ~75% of CDO commands) ---
 
     /// Single 32-bit register write.
-    /// Produced by: CdoRaw::Write.
+    /// Produced by: CdoRaw::Write, and by CdoRaw::Write64 after address
+    /// truncation. (CDO's "Write64" opcode means 64-bit *address* not
+    /// 64-bit value -- see the §"Write64 is an address-width opcode"
+    /// note below for the evidence that settled this.)
     RegWrite { tile: TileAddr, offset: u32, value: u32 },
 
-    /// 64-bit register-pair write (atomic low/high halves preserved).
-    /// Produced by: CdoRaw::Write64. Distinct variant (rather than
-    /// truncating to u32) because CDO Write64 writes register pairs
-    /// atomically; collapsing to RegWrite would silently drop the
-    /// high half.
-    RegWrite64 { tile: TileAddr, offset: u32, value: u64 },
-
     /// Masked register write: *reg = (*reg & !mask) | (value & mask).
-    /// Produced by: CdoRaw::MaskWrite.
+    /// Produced by: CdoRaw::MaskWrite, and by CdoRaw::MaskWrite64
+    /// after address truncation (same naming-width note as RegWrite).
     RegMask { tile: TileAddr, offset: u32, mask: u32, value: u32 },
-
-    /// 64-bit masked register-pair write.
-    /// Produced by: CdoRaw::MaskWrite64. Same preservation reasoning
-    /// as RegWrite64.
-    RegMask64 { tile: TileAddr, offset: u32, mask: u64, value: u64 },
 
     /// Bulk write: consecutive words starting at offset.
     /// Produced by: CdoRaw::DmaWrite (program/data memory loads, BD
@@ -346,6 +338,35 @@ pub enum DeviceOp {
 }
 ```
 
+### Write64 is an address-width opcode (post-gate revision)
+
+The user gate originally confirmed a 10-variant DeviceOp including
+`RegWrite64 { value: u64 }` and `RegMask64 { mask: u64, value: u64 }`,
+with the stated concern that collapsing them into `RegWrite` / `RegMask`
+would silently truncate 64-bit register-pair writes. A post-gate audit
+(Explore agent, 2026-04-24) established that this concern was based on a
+misreading of the CDO opcode:
+
+- CDO `Write64` (opcode 0x108) and `MaskWrite64` (0x107) mean write to a
+  64-bit address with a 32-bit value, not write a 64-bit value. The
+  `64` is the address width.
+- AIE tiles are 32-bit-addressed; the high 32 address bits are always 0.
+  Existing `device/state/cdo.rs:53-61` already truncates to the low 32
+  and writes the 32-bit value unchanged.
+- aie-rt has no `XAie_Write64` API. All register I/O is 32-bit.
+- mlir-aie's AM025 register database (1,806 registers) has zero entries
+  with width=64 for memory-mapped registers. The 127 width=128 entries
+  are vector accumulators and memory arrays, not MMIO.
+- DMA BD address low/high are two separate 32-bit registers written in
+  sequence (aie-rt patterns), not an atomic 64-bit pair.
+
+Conclusion: RegWrite64 / RegMask64 had no producer in the parser and no
+consumer in device/state. They are dropped. DeviceOp is 8 variants.
+If a future architecture introduces genuinely 64-bit-wide MMIO
+registers, the variants can be reintroduced then with real data behind
+them -- this is a framework-extension point re-opened by evidence, not
+a speculative reservation.
+
 ### Design rules
 
 1. **Device-facing, not CDO-facing.** Two CDO variants that produce
@@ -354,9 +375,9 @@ pub enum DeviceOp {
 2. **Arch-generic.** `TileAddr` resolves through archspec. New variants
    appear only if the device does something new, not because the CDO
    encoded it differently.
-3. **Escape hatch + local-promotion only.** `RegWrite`/`RegWrite64`/
-   `RegMask`/`RegMask64`/`RegBurst` are the escape hatch that absorbs
-   every raw-write command. Structured variants (`CoreEnable`,
+3. **Escape hatch + local-promotion only.** `RegWrite` / `RegMask` /
+   `RegBurst` are the escape hatch that absorbs every raw-write command.
+   Structured variants (`CoreEnable`,
    `DmaStart`) exist ONLY where the promotion is a local decision (one
    CdoRaw::Write to a recognized offset -> structured op, no state
    needed). **We deliberately do not promote sequence-assembled
@@ -366,12 +387,12 @@ pub enum DeviceOp {
    layer does the same reassembly. Keeping the hardware pattern in the
    apply layer rather than in the parser keeps `semantics::lower`
    stateless and matches silicon behavior.
-4. **Value-typed.** `RegWrite` / `RegWrite64` / `RegMask` / `RegMask64` /
-   `CoreEnable` / `DmaStart` / `MaskPoll` / `Delay` / `Marker` are all
-   individually `Copy`-able. `RegBurst` uses `SmallVec<[u32; 64]>`
-   for inline storage. The enum as a whole is `Clone` (not `Copy`)
-   because of `RegBurst`; `apply` takes `&DeviceOp` so this is fine.
-   No `Arc`, `Rc`, or `Box` in the vocabulary.
+4. **Value-typed.** `RegWrite` / `RegMask` / `CoreEnable` / `DmaStart` /
+   `MaskPoll` / `Delay` / `Marker` are all individually `Copy`-able.
+   `RegBurst` uses `SmallVec<[u32; 64]>` for inline storage. The enum
+   as a whole is `Clone` (not `Copy`) because of `RegBurst`; `apply`
+   takes `&DeviceOp` so this is fine. No `Arc`, `Rc`, or `Box` in the
+   vocabulary.
 5. **No state-in-lower.** `cdo::semantics::lower` is a stateless
    per-command function. It does not buffer writes, does not read
    device state, and does not track in-progress reassembly. This
