@@ -377,15 +377,32 @@ class RunnerSession:
     """
 
     def __init__(self, xclbin: Path, runner_env: Dict[str, str],
-                 side: str, stderr_log: Path, verbose: bool = False):
+                 side: str, stderr_log: Path, verbose: bool = False,
+                 cdo_preambles: Optional[List[Path]] = None,
+                 trace_buf_idx: Optional[int] = None,
+                 reuse_ctx: bool = False):
         self.side = side
         self.stderr_log = stderr_log
         self._stderr_fh = stderr_log.open("w")
+        # Per-call CLI fragments common to every run on this session.
+        # Folded into run_one() rather than the outer cmd because the
+        # runner's batch-stdin protocol re-parses every line through the
+        # same parser, so they must live on the per-line side.
+        self._cdo_preambles = list(cdo_preambles or [])
+        self._trace_buf_idx = trace_buf_idx
         cmd = [str(RUNNER), "--batch-stdin", "--xclbin", str(xclbin)]
         if verbose:
             cmd.append("-v")
         env = os.environ.copy()
         env.update(runner_env)
+        # Reuse-ctx mode enables BRIDGE_RUNNER_REUSE_CONTEXT in the
+        # subprocess. Combined with --cdo-preamble that re-applies the
+        # init/enable CDOs each launch, this lets the runner skip
+        # hw_context teardown between runs (saving ~90 ms per launch on
+        # Phoenix). Without the preamble, this mode hits the alternating
+        # state=8/state=6 timeout pattern.
+        if reuse_ctx:
+            env["BRIDGE_RUNNER_REUSE_CONTEXT"] = "1"
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -439,6 +456,10 @@ class RunnerSession:
             parts += ["--output", str(p)]
         for p in (ctrlpkts or []):
             parts += ["--ctrlpkt", str(p)]
+        for p in self._cdo_preambles:
+            parts += ["--cdo-preamble", str(p)]
+        if self._trace_buf_idx is not None:
+            parts += ["--trace-buf-idx", str(self._trace_buf_idx)]
         # Our argument values never contain spaces in this codebase,
         # but quote paths defensively so a future path with spaces
         # doesn't silently corrupt tokenisation on the C++ side.
@@ -581,6 +602,84 @@ def _run_one_side(
 # Top-level sweep
 # ---------------------------------------------------------------------------
 
+_INSTS_HEADER_BYTES = 16
+_INSTS_OPCODE_WRITE32   = 0x00
+_INSTS_OPCODE_BLOCKWRITE = 0x01
+_INSTS_OPCODE_MASKWRITE = 0x03
+_INSTS_OPCODE_DDR_PATCH = 0x81
+
+
+def _discover_trace_buf_idx(insts: Path) -> Optional[int]:
+    """Compute the trace BO's 0-indexed position among data buffers.
+
+    Method: walk insts.bin's DdrPatch ops and take the max ``arg_idx``.
+    DdrPatch ops fill in BO addresses for shim-DMA BDs at runtime, with
+    one patch per data buffer the kernel uses. Trace is added last by
+    every build flow we support (mlir-aie's --with-hw-cycles puts it at
+    arg_idx=N+1 where N is the user-buffer count; the trace-inject flow
+    in xdna-emu's traced-tests adds it as the next runtime_sequence
+    arg). In both cases the trace BO ends up with the highest arg_idx
+    among DdrPatch targets, so taking the max is robust.
+
+    Returns None if the file isn't a recognisable insts.bin or has no
+    DdrPatch ops -- in that case the caller falls back to the runner's
+    legacy "last buffer kernarg = trace" heuristic.
+
+    DdrPatch layout (from src/npu/parser.rs lines 313-358):
+      48-byte instruction; payload offsets 16/24/32 hold reg_addr,
+      arg_idx (one byte at offset 24), and arg_plus respectively.
+    """
+    try:
+        data = insts.read_bytes()
+    except OSError:
+        return None
+    if len(data) < _INSTS_HEADER_BYTES:
+        return None
+    magic = int.from_bytes(data[0:4], "little")
+    if magic != 0x06030100:
+        return None
+    total_size = int.from_bytes(data[12:16], "little")
+    end = min(len(data), total_size)
+    off = _INSTS_HEADER_BYTES
+    max_arg_idx: Optional[int] = None
+    while off + 4 <= end:
+        opcode = data[off] & 0xFF
+        if opcode == _INSTS_OPCODE_WRITE32:
+            size = 24
+        elif opcode == _INSTS_OPCODE_BLOCKWRITE:
+            if off + 16 > end:
+                break
+            size = int.from_bytes(data[off + 12:off + 16], "little")
+        elif opcode == _INSTS_OPCODE_MASKWRITE:
+            size = 28
+        elif opcode == _INSTS_OPCODE_DDR_PATCH:
+            size = 48
+            if off + 36 <= end:
+                arg_idx = data[off + 8 + 24]   # payload[24] inside the op
+                if max_arg_idx is None or arg_idx > max_arg_idx:
+                    max_arg_idx = arg_idx
+        else:
+            # Unknown opcode -- stop walking; any answer we'd derive
+            # past this point is unreliable.
+            break
+        off += size
+    return max_arg_idx
+
+
+def _find_cdo_preambles(mlir: Path) -> List[Path]:
+    """Locate main_aie_cdo_init.bin + main_aie_cdo_enable.bin alongside
+    the lowered MLIR. They live in the same .mlir.prj/ directory the
+    aiecc.py compile produced. Returns [] if either is missing -- the
+    caller treats that as "no preamble injection available."
+    """
+    prj = mlir.parent
+    init = prj / "main_aie_cdo_init.bin"
+    enable = prj / "main_aie_cdo_enable.bin"
+    if init.is_file() and enable.is_file():
+        return [init, enable]
+    return []
+
+
 def _find_post_lowering_mlir(build_dir: Path) -> Optional[Path]:
     """Locate the aiecc-lowered MLIR (input_with_addresses.mlir) inside
     build_dir/*.prj/. Same discovery shape as emu-bridge-test.sh so parse
@@ -719,6 +818,7 @@ def sweep_multi(
     run_emu: bool = True,
     ctrlpkt: Optional[Path] = None,
     ground_event_name: Optional[str] = None,
+    reuse_ctx: bool = False,
 ) -> List[dict]:
     """Sweep every trace event across a set of tiles in one kernel run.
 
@@ -833,17 +933,47 @@ def sweep_multi(
         "XDNA_EMU_LOG_LEVEL": os.environ.get("XDNA_EMU_LOG_LEVEL", "info"),
         "XRT_DEVICE_BDF": "ffff:ff:1f.0",
     }
+    # Trace-BO discovery and CDO preamble paths are only used in the
+    # --reuse-ctx flow. Baseline trace-sweep keeps the runner's legacy
+    # behavior untouched (last-buffer-kernarg = trace, no preamble
+    # injection), so opting *out* of --reuse-ctx is risk-free.
+    trace_buf_idx: Optional[int] = None
+    cdo_preambles: List[Path] = []
+    if reuse_ctx:
+        trace_buf_idx = _discover_trace_buf_idx(insts)
+        if trace_buf_idx is None:
+            raise FileNotFoundError(
+                f"--reuse-ctx requested but trace_buf_idx could not be "
+                f"discovered from {insts}; the runner's legacy "
+                f"last-buffer heuristic isn't safe under hwctx reuse "
+                f"because the wrong BO would be re-bound on every run"
+            )
+        cdo_preambles = _find_cdo_preambles(mlir)
+        if not cdo_preambles:
+            raise FileNotFoundError(
+                f"--reuse-ctx requested but main_aie_cdo_init.bin / "
+                f"main_aie_cdo_enable.bin are missing under {mlir.parent}"
+            )
+
     hw_session: Optional[RunnerSession] = None
     emu_session: Optional[RunnerSession] = None
     if run_hw:
         hw_session = RunnerSession(
             xclbin=xclbin, runner_env=hw_runner_env, side="HW",
             stderr_log=work_dir / "hw.runner.log",
+            cdo_preambles=cdo_preambles, trace_buf_idx=trace_buf_idx,
+            reuse_ctx=reuse_ctx,
         )
     if run_emu:
+        # The emulator side is already deterministic and doesn't have
+        # the hwctx-reuse limitation, but we still pass the same args
+        # so HW/EMU stay symmetric -- both sides get the same insts.bin
+        # preamble and identify the trace BO the same way.
         emu_session = RunnerSession(
             xclbin=xclbin, runner_env=emu_runner_env, side="EMU",
             stderr_log=work_dir / "emu.runner.log",
+            cdo_preambles=cdo_preambles, trace_buf_idx=trace_buf_idx,
+            reuse_ctx=reuse_ctx,
         )
 
     t_start = time.time()
@@ -1001,6 +1131,7 @@ def sweep(
     run_emu: bool = True,
     ctrlpkt: Optional[Path] = None,
     ground_event_name: Optional[str] = None,
+    reuse_ctx: bool = False,
 ) -> dict:
     """Backward-compatible single-tile entry point.
 
@@ -1020,6 +1151,7 @@ def sweep(
         run_emu=run_emu,
         ctrlpkt=ctrlpkt,
         ground_event_name=ground_event_name,
+        reuse_ctx=reuse_ctx,
     )
     # sweep_multi wrote to out_dir/<test>.<compiler>.<tile.label>.json.
     # Rename onto the caller's requested path if they differ, and also
@@ -1079,6 +1211,13 @@ def main() -> int:
                          "its timestamp anchors other events in a merged "
                          "timeline (e.g. USER_EVENT_1). Max sweep events per "
                          "batch drops from 8 to 7 when set.")
+    ap.add_argument("--reuse-ctx", action="store_true",
+                    help="have the runner reuse a single hw_context across "
+                         "all batches by injecting the test's init+enable "
+                         "CDO blobs as an in-band preamble. Cuts per-batch "
+                         "latency from ~90ms to ~10ms on Phoenix; requires "
+                         "main_aie_cdo_init.bin and main_aie_cdo_enable.bin "
+                         "alongside the lowered MLIR.")
     args = ap.parse_args()
 
     build_dir = args.build_dir or (
@@ -1108,6 +1247,7 @@ def main() -> int:
             run_hw=not args.no_hw, run_emu=not args.no_emu,
             ctrlpkt=args.ctrlpkt,
             ground_event_name=args.ground_event,
+            reuse_ctx=args.reuse_ctx,
         )
         for s in summaries:
             tile = s["tile"]
@@ -1133,6 +1273,7 @@ def main() -> int:
         run_emu=not args.no_emu,
         ctrlpkt=args.ctrlpkt,
         ground_event_name=args.ground_event,
+        reuse_ctx=args.reuse_ctx,
     )
     print(f"[sweep] wrote {args.out} ({len(summary['events'])} events, "
           f"{summary['elapsed_sec']}s)")
