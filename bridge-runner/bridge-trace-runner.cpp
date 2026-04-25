@@ -103,6 +103,38 @@ struct RunArgs {
     std::vector<std::string> inputs;
     std::vector<std::string> outputs;
     std::vector<std::string> ctrlpkts;
+    // Tiles to core-reset before each kernel launch. Format: "col:row".
+    // When BRIDGE_RUNNER_REUSE_CONTEXT=1, the runner prepends a
+    // disable/reset/enable sequence to every insts.bin so kernel state
+    // doesn't bleed across runs. When the context is rebuilt per-run
+    // anyway (default), the preamble is a no-op (bytes are still
+    // injected but harmless).
+    std::vector<std::pair<uint8_t, uint8_t>> reset_tiles;
+
+    // Per-lock init values to write before the core is re-enabled.
+    // Format: col:row:lock_id:value. Mirrors what the CDO's init
+    // sequence does at hw_context creation: zero all locks, then
+    // overwrite the ones with non-zero MLIR-declared init values.
+    // Without these, a core-only reset starts the kernel from
+    // (locks=0) which deadlocks any kernel whose first core-side
+    // action is acquiring a prod lock (the prod=2 init lets the core
+    // claim two output buffers up front; with prod=0 there's nothing
+    // to acquire and no producer to release it).
+    struct LockInit { uint8_t col; uint8_t row; uint8_t lock_id; int8_t value; };
+    std::vector<LockInit> lock_inits;
+
+    // CDO blobs (mlir-aie's main_aie_cdo_*.bin) to replay as a
+    // userspace preamble before each kernel launch. Transcoded to
+    // insts.bin opcodes (Write32/MaskWrite/BlockWrite) and spliced
+    // ahead of the original instruction stream. Multiple flags allowed,
+    // applied in order -- typical usage is two paths: the init blob
+    // (zero locks, set lock init values, configure DMA BDs and stream
+    // switch routing, holds core in reset) followed by the enable blob
+    // (single MaskWrite to clear the reset bit and start the core).
+    // This is the userspace-only equivalent of re-running aie2_hwctx_start
+    // and lets us reuse a single hw_context across many launches without
+    // trace state drifting between runs.
+    std::vector<std::string> cdo_preambles;
     // Default 1 MiB. Large enough that event-heavy workloads (lock-
     // intensive kernels, full-event sweeps) don't silently truncate
     // mid-trace. The trace unit has no backpressure -- once the BO
@@ -111,6 +143,18 @@ struct RunArgs {
     // cause was "buffer ran out." 1 MiB still fits comfortably in host
     // memory and NPU BO allocation limits.
     uint64_t trace_size_bytes = 1u << 20;
+
+    // Override for the runner's "last buffer kernarg = trace BO"
+    // heuristic. Set to the 0-indexed position of the trace BO among
+    // the data buffer kernargs (bo0..boN-1, NOT counting the instr
+    // buffer). Matches manifest.json's trace_ddr_id field.
+    //
+    // Why this exists: mlir-aie's IRON trace injection allocates an
+    // extra buffer slot in the kernel signature for trace, but it
+    // doesn't always end up at the last position -- some tests have
+    // trailing unused/ctrlpkt slots after it. The "last BO" heuristic
+    // saves a zero buffer in those cases. -1 = use heuristic.
+    int trace_buf_idx = -1;
 };
 
 void print_usage(const char* argv0) {
@@ -118,7 +162,9 @@ void print_usage(const char* argv0) {
         "usage:\n"
         "  %s --xclbin <path> --instr <insts.bin> --trace-out <path> \\\n"
         "     [--kernel <name>] [--input <bin>]... [--output <path>]... \\\n"
-        "     [--ctrlpkt <bin>]... [--trace-size N] [-v]\n"
+        "     [--ctrlpkt <bin>]... [--cdo-preamble <cdo.bin>]... \\\n"
+        "     [--reset-tile col:row]... [--reset-lock col:row:lock:val]... \\\n"
+        "     [--trace-buf-idx N] [--trace-size N] [-v]\n"
         "\n"
         "  %s --batch-stdin [--xclbin <path>] [--kernel <name>] [-v]\n"
         "     # read one command line per stdin line in the same syntax\n"
@@ -177,6 +223,80 @@ int parse_tokens(const std::vector<std::string>& tokens,
         else if (a == "--input")        run.inputs.push_back(need_val("--input"));
         else if (a == "--output")       run.outputs.push_back(need_val("--output"));
         else if (a == "--ctrlpkt")      run.ctrlpkts.push_back(need_val("--ctrlpkt"));
+        else if (a == "--reset-tile") {
+            // Format: "col:row". Multiple --reset-tile flags allowed,
+            // one per active core tile in the kernel.
+            std::string spec = need_val("--reset-tile");
+            auto colon = spec.find(':');
+            if (colon == std::string::npos) {
+                throw std::runtime_error(
+                    "error: --reset-tile expects col:row, got '" + spec + "'");
+            }
+            int col = std::atoi(spec.substr(0, colon).c_str());
+            int row = std::atoi(spec.substr(colon + 1).c_str());
+            if (col < 0 || col > 0x7F || row < 0 || row > 0x1F) {
+                throw std::runtime_error(
+                    "error: --reset-tile col/row out of range: " + spec);
+            }
+            run.reset_tiles.emplace_back(static_cast<uint8_t>(col),
+                                         static_cast<uint8_t>(row));
+        }
+        else if (a == "--cdo-preamble") {
+            // Path to a CDO blob (mlir-aie main_aie_cdo_*.bin) to
+            // transcode into the insts.bin preamble. Repeatable;
+            // applied in order. Typical: --cdo-preamble init.bin
+            // --cdo-preamble enable.bin.
+            run.cdo_preambles.push_back(need_val("--cdo-preamble"));
+        }
+        else if (a == "--trace-buf-idx") {
+            // 0-indexed position of the trace BO among data buffer
+            // kernargs (bo0..boN-1). Matches manifest.json's
+            // trace_ddr_id. -1 (default) keeps the legacy "last buffer
+            // = trace" heuristic.
+            std::string v = need_val("--trace-buf-idx");
+            if (v.empty() || (v[0] == '-' && v.size() == 1)) {
+                throw std::runtime_error(
+                    "error: --trace-buf-idx must be an integer, got '" + v + "'");
+            }
+            char* end = nullptr;
+            long val = std::strtol(v.c_str(), &end, 0);
+            if (end == v.c_str() || *end != '\0' || val < -1 || val > 31) {
+                throw std::runtime_error(
+                    "error: --trace-buf-idx out of range [-1,31]: " + v);
+            }
+            run.trace_buf_idx = static_cast<int>(val);
+        }
+        else if (a == "--reset-lock") {
+            // Format: col:row:lock_id:value. Value is signed 6-bit
+            // (-64..63), per the AIE2 lock value field width. Multiple
+            // --reset-lock flags allowed.
+            std::string spec = need_val("--reset-lock");
+            auto parts = std::vector<std::string>{};
+            std::string cur;
+            for (char c : spec) {
+                if (c == ':') { parts.push_back(cur); cur.clear(); }
+                else cur.push_back(c);
+            }
+            if (!cur.empty()) parts.push_back(cur);
+            if (parts.size() != 4) {
+                throw std::runtime_error(
+                    "error: --reset-lock expects col:row:lock_id:value, got '"
+                    + spec + "'");
+            }
+            int col = std::atoi(parts[0].c_str());
+            int row = std::atoi(parts[1].c_str());
+            int lid = std::atoi(parts[2].c_str());
+            int val = std::atoi(parts[3].c_str());
+            if (col < 0 || col > 0x7F || row < 0 || row > 0x1F
+                || lid < 0 || lid >= 16 || val < -64 || val > 63) {
+                throw std::runtime_error(
+                    "error: --reset-lock fields out of range: " + spec);
+            }
+            run.lock_inits.push_back({static_cast<uint8_t>(col),
+                                      static_cast<uint8_t>(row),
+                                      static_cast<uint8_t>(lid),
+                                      static_cast<int8_t>(val)});
+        }
         else if (a == "--batch-stdin") {
             if (is_batch_line) {
                 throw std::runtime_error("error: --batch-stdin is not allowed on a batch input line");
@@ -303,6 +423,377 @@ std::vector<KernArgInfo> read_kernel_args(
     return out;
 }
 
+// AIE2 NPU register addressing: addr = (col << 25) | (row << 20) | offset.
+// Constants confirmed via xdna-archspec/aie-device-models.json column_shift
+// and row_shift fields, and against the NPU instruction parser at
+// src/npu/executor.rs decode_addr_to_tile_relative().
+constexpr uint32_t AIE2_COL_SHIFT = 25;
+constexpr uint32_t AIE2_ROW_SHIFT = 20;
+constexpr uint32_t AIE2_CORE_CTRL_OFFSET = 0x00032000;
+constexpr uint32_t AIE2_LOCK_VALUE_BASE = 0x0001F000;
+constexpr uint32_t AIE2_LOCK_STRIDE = 0x10;
+constexpr uint32_t AIE2_LOCKS_PER_TILE = 16;
+
+inline uint32_t tile_addr(uint8_t col, uint8_t row, uint32_t offset) {
+    return (static_cast<uint32_t>(col) << AIE2_COL_SHIFT)
+         | (static_cast<uint32_t>(row) << AIE2_ROW_SHIFT)
+         | offset;
+}
+
+// Append a MaskWrite (opcode 0x03) op to the instruction word vector.
+// Layout (28 bytes = 7 u32s):
+//   [0] hdr   = 0x00000003 (opcode in low byte, rest padding)
+//   [1] pad   = 0
+//   [2,3] reg_addr (u64 LE; high word zero for 32-bit NPU addrs)
+//   [4] value
+//   [5] mask
+//   [6] size  = 28
+// Authority: src/npu/parser.rs (decoder) and mlir-aie's
+// AIETargetNPU.cpp::appendMaskWrite32() (encoder).
+inline void emit_maskwrite(std::vector<uint32_t>& out,
+                           uint32_t reg_addr, uint32_t value, uint32_t mask) {
+    out.push_back(0x00000003);
+    out.push_back(0);
+    out.push_back(reg_addr);
+    out.push_back(0);
+    out.push_back(value);
+    out.push_back(mask);
+    out.push_back(28);
+}
+
+// Append a Write32 (opcode 0x00) op. Layout (24 bytes = 6 u32s):
+//   [0] hdr   = 0x00000000
+//   [1] pad   = 0
+//   [2,3] reg_addr (u64 LE)
+//   [4] value
+//   [5] size  = 24
+inline void emit_write32(std::vector<uint32_t>& out,
+                         uint32_t reg_addr, uint32_t value) {
+    out.push_back(0x00000000);
+    out.push_back(0);
+    out.push_back(reg_addr);
+    out.push_back(0);
+    out.push_back(value);
+    out.push_back(24);
+}
+
+// Append a BlockWrite (opcode 0x01) op. Layout (16 + N*4 bytes):
+//   [0] hdr     = 0x00000001
+//   [1] pad     = 0
+//   [2] reg_off (u32 -- BlockWrite uses a 32-bit offset, unlike
+//                Write32/MaskWrite which use a u64-aligned reg_addr)
+//   [3] size    = 16 + payload_bytes (the full instruction size)
+//   [4..]       N data words written to consecutive 4-byte addresses.
+// Authority: src/npu/parser.rs decode of NpuOpcode::BlockWrite (header
+// is 8 bytes opcode+pad, then u32 reg_off, then u32 size, then payload).
+inline void emit_blockwrite(std::vector<uint32_t>& out,
+                            uint32_t reg_off,
+                            const uint32_t* data, size_t n) {
+    out.push_back(0x00000001);
+    out.push_back(0);
+    out.push_back(reg_off);
+    out.push_back(static_cast<uint32_t>(16 + n * 4));
+    out.insert(out.end(), data, data + n);
+}
+
+// Op size (in u32 words) for each emitter, used to count num_ops_extra.
+constexpr uint32_t MASKWRITE_WORDS = 7;
+constexpr uint32_t WRITE32_WORDS = 6;
+// BlockWrite is variable-length; only the fixed-header word count is constant.
+constexpr uint32_t BLOCKWRITE_HEADER_WORDS = 4;
+
+// Build the reset preamble for a set of active core tiles. For each
+// tile the sequence is the four mask-writes that aie-rt's CoreReset
+// API performs against the Core Control register at offset 0x32000:
+//   1. disable core (bit 0 = 0)
+//   2. assert reset (bit 1 = 1)
+//   3. deassert reset (bit 1 = 0)
+//   4. re-enable core (bit 0 = 1)
+// This eliminates the alternating-TIMEOUT pattern when reusing a
+// single hw_context across kernel launches, EXCEPT for kernels that
+// use cascade flows -- there's no user-space register to drain the
+// cascade-FIFO state, so cascade kernels still need hw_context
+// teardown. Detection of that case lives in the caller (typically
+// trace-sweep.py builds the reset-tile list from MLIR analysis and
+// omits it for cascade kernels).
+//
+// The returned words are appended to the existing instruction stream;
+// the runner increments num_ops and total_size in the header before
+// submission.
+std::vector<uint32_t> build_reset_preamble(
+    const std::vector<std::pair<uint8_t, uint8_t>>& tiles,
+    const std::vector<RunArgs::LockInit>& lock_inits)
+{
+    std::vector<uint32_t> out;
+    out.reserve(tiles.size() * (3 * MASKWRITE_WORDS
+                                + AIE2_LOCKS_PER_TILE * WRITE32_WORDS)
+                + lock_inits.size() * WRITE32_WORDS);
+    // Mirror the CDO init sequence exactly (extracted from
+    // main_aie_cdo_init.bin for add_one_objFifo and confirmed against
+    // aie-rt's reginit table in xaiemlgbl_reginit.c:2454):
+    //
+    //   1. Assert core reset (and KEEP it asserted -- the CDO holds the
+    //      core in reset throughout the entire init phase). The CDO
+    //      doesn't even bother clearing the enable bit explicitly
+    //      because the reset bit dominates.
+    //   2. While core is in reset, write 0 to all 16 lock value
+    //      registers in each tile's memory module.
+    //   3. Apply per-lock non-zero init values from MLIR (typically
+    //      prod-lock init=2 for objFifo double-buffer kernels).
+    //   4. Deassert reset and re-enable the core.
+    //
+    // Earlier attempts that toggled reset on/off around lock writes,
+    // or skipped lock writes entirely, either hung the kernel or
+    // produced trace variance across runs. This sequence matches
+    // exactly what hw_context creation does, so traces should be
+    // bit-identical to a fresh-context baseline.
+    for (auto [col, row] : tiles) {
+        uint32_t ctrl = tile_addr(col, row, AIE2_CORE_CTRL_OFFSET);
+        emit_maskwrite(out, ctrl, /*val=*/2, /*mask=*/2);   // assert reset
+        for (uint32_t n = 0; n < AIE2_LOCKS_PER_TILE; ++n) {
+            uint32_t reg = tile_addr(col, row,
+                AIE2_LOCK_VALUE_BASE + n * AIE2_LOCK_STRIDE);
+            emit_write32(out, reg, /*value=*/0);
+        }
+    }
+    // Per-lock non-zero init values come AFTER the zero-pass, also
+    // while core is held in reset. The 6-bit signed value is written
+    // into the low 6 bits of the lock value register; we mask to that
+    // width and reinterpret as unsigned for the wire-level write.
+    for (const auto& li : lock_inits) {
+        uint32_t reg = tile_addr(li.col, li.row,
+            AIE2_LOCK_VALUE_BASE + li.lock_id * AIE2_LOCK_STRIDE);
+        uint32_t v = static_cast<uint32_t>(li.value) & 0x3F;
+        emit_write32(out, reg, v);
+    }
+    // Finally release reset and re-enable the core. We use mask=3 with
+    // value=1 (enable=1, reset=0) in a single mask-write, which
+    // matches what enable.bin does (one MaskWrite to switch both bits
+    // simultaneously is safer than two separate writes).
+    for (auto [col, row] : tiles) {
+        uint32_t ctrl = tile_addr(col, row, AIE2_CORE_CTRL_OFFSET);
+        emit_maskwrite(out, ctrl, /*val=*/1, /*mask=*/3);   // enable=1, reset=0
+    }
+    return out;
+}
+
+// Splice a freshly built reset preamble into a runtime-sequence
+// (insts.bin) word stream loaded from disk. The original header
+// reports num_ops and total_size_bytes; we update both.
+//
+// Header layout (16 bytes = 4 u32s):
+//   [0] magic         = 0x06030100
+//   [1] flags         (preserved)
+//   [2] num_ops
+//   [3] total_size_bytes
+void splice_reset_preamble(std::vector<uint32_t>& instr_words,
+                           const std::vector<uint32_t>& preamble_words)
+{
+    if (instr_words.size() < 4) return;     // bad input -- caller will error elsewhere
+    if (preamble_words.empty()) return;
+    constexpr size_t HEADER_WORDS = 4;
+    constexpr uint32_t MAGIC = 0x06030100;
+    if (instr_words[0] != MAGIC) return;    // not our format -- leave alone
+    // Walk the preamble word-stream to count actual ops, since op size
+    // varies (write32 = 6 words, maskwrite = 7 words). Each op's size
+    // in BYTES is in its size field, which is at a different word
+    // index per opcode -- but its position is always the *last* word
+    // of that op (parser.rs:371-406 confirms). Easier and more robust:
+    // walk by reading each op's size field at an opcode-dependent
+    // position.
+    uint32_t num_ops_extra = 0;
+    size_t i = 0;
+    while (i < preamble_words.size()) {
+        uint32_t opcode = preamble_words[i] & 0xFF;
+        size_t op_words;
+        switch (opcode) {
+            case 0x00: op_words = WRITE32_WORDS; break;
+            case 0x03: op_words = MASKWRITE_WORDS; break;
+            case 0x01: {
+                // BlockWrite: size in bytes lives in the 4th word
+                // (header, pad, reg_off, size_bytes, ...payload).
+                if (i + BLOCKWRITE_HEADER_WORDS > preamble_words.size()) return;
+                uint32_t size_bytes = preamble_words[i + 3];
+                if (size_bytes < 16 || size_bytes % 4 != 0) return;
+                op_words = size_bytes / 4;
+                break;
+            }
+            default:
+                // Unknown opcode -- bail on counting; let the FW
+                // complain about the malformed stream rather than
+                // silently miscounting.
+                return;
+        }
+        ++num_ops_extra;
+        i += op_words;
+    }
+    uint32_t bytes_extra = static_cast<uint32_t>(preamble_words.size() * 4);
+    instr_words[2] += num_ops_extra;
+    instr_words[3] += bytes_extra;
+    // Insert preamble after the 4-word header, before the original ops.
+    instr_words.insert(instr_words.begin() + HEADER_WORDS,
+                       preamble_words.begin(), preamble_words.end());
+}
+
+// CDO opcodes used by mlir-aie's main_aie_cdo_*.bin blobs. Authority:
+// xdna-emu/src/parser/cdo/syntax.rs CdoOpcode enum.
+constexpr uint16_t CDO_OP_END_MARK    = 0x100;
+constexpr uint16_t CDO_OP_MASK_WRITE  = 0x102;
+constexpr uint16_t CDO_OP_WRITE       = 0x103;
+constexpr uint16_t CDO_OP_DMA_WRITE   = 0x105;
+constexpr uint16_t CDO_OP_MASK_WRITE64 = 0x107;
+constexpr uint16_t CDO_OP_WRITE64     = 0x108;
+constexpr uint16_t CDO_OP_NOP         = 0x111;
+constexpr uint16_t CDO_OP_MARKER      = 0x119;
+
+constexpr uint32_t CDO_HEADER_BYTES   = 20;
+constexpr uint32_t CDO_MAGIC_CDO      = 0x004f4443; // "CDO\0"
+constexpr uint32_t CDO_MAGIC_XLNX     = 0x584c4e58; // "XLNX"
+
+// Transcode a CDO blob (the kind mlir-aie emits as main_aie_cdo_*.bin)
+// into an insts.bin word stream. The point: the init CDO contains all
+// the state setup that hw_context creation normally applies via the
+// firmware mailbox -- core reset, lock zeroing + init values, DMA BD
+// programming, stream-switch routing, and trace unit setup. By
+// replaying it as user-space insts.bin ops we re-establish that state
+// per kernel launch, which is the only way to hold trace output stable
+// when reusing a single hw_context across many launches.
+//
+// Mapping:
+//   CDO Write64  (0x108)   -> insts.bin Write32   (0x00)
+//   CDO Write    (0x103)   -> insts.bin Write32   (0x00)
+//   CDO MaskWrite64 (0x107) -> insts.bin MaskWrite (0x03)
+//   CDO MaskWrite  (0x102)  -> insts.bin MaskWrite (0x03)
+//   CDO DmaWrite (0x105)   -> insts.bin BlockWrite (0x01)
+//   CDO Nop / EndMark / Marker -> skipped
+//
+// Unsupported CDO ops (MaskPoll, Delay) throw -- these don't appear in
+// the static config CDOs we replay, and silently dropping them would
+// produce a subtly-broken preamble.
+//
+// 64-bit CDO addresses with a non-zero high word are rejected: AIE NPU
+// register space is 32 bits; a non-zero hi means the blob targets DDR
+// above 4 GiB, which the AIE controller can't reach via insts.bin
+// register writes anyway.
+std::vector<uint32_t> transcode_cdo_to_insts(const std::vector<uint8_t>& cdo,
+                                             const std::string& path_for_msg)
+{
+    if (cdo.size() < CDO_HEADER_BYTES) {
+        throw std::runtime_error(path_for_msg + ": CDO blob too small ("
+                                 + std::to_string(cdo.size()) + " bytes)");
+    }
+    uint32_t ident, cdo_length_words;
+    std::memcpy(&ident, cdo.data() + 4, 4);
+    std::memcpy(&cdo_length_words, cdo.data() + 12, 4);
+    if (ident != CDO_MAGIC_CDO && ident != CDO_MAGIC_XLNX) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "0x%08x", ident);
+        throw std::runtime_error(path_for_msg + ": bad CDO magic " + buf);
+    }
+    size_t end = std::min<size_t>(cdo.size(),
+        static_cast<size_t>(CDO_HEADER_BYTES) + cdo_length_words * 4);
+
+    std::vector<uint32_t> out;
+    size_t off = CDO_HEADER_BYTES;
+    while (off + 4 <= end) {
+        uint32_t cmd_word;
+        std::memcpy(&cmd_word, cdo.data() + off, 4);
+        off += 4;
+        uint16_t opcode = static_cast<uint16_t>(cmd_word & 0xFFFF);
+        uint8_t inline_len = static_cast<uint8_t>((cmd_word >> 16) & 0xFF);
+        uint32_t payload_len;
+        if (inline_len == 0xFF) {
+            // CDO v2 extended length: payload size lives in the next word.
+            if (off + 4 > end) break;
+            std::memcpy(&payload_len, cdo.data() + off, 4);
+            off += 4;
+        } else {
+            payload_len = inline_len;
+        }
+        if (off + static_cast<size_t>(payload_len) * 4 > end) break;
+        const uint32_t* payload =
+            reinterpret_cast<const uint32_t*>(cdo.data() + off);
+        off += static_cast<size_t>(payload_len) * 4;
+
+        auto require = [&](uint32_t need, const char* op_name) {
+            if (payload_len < need) {
+                throw std::runtime_error(path_for_msg + ": CDO " + op_name
+                    + " has payload_len=" + std::to_string(payload_len)
+                    + ", expected >=" + std::to_string(need));
+            }
+        };
+        auto check_addr_hi = [&](uint32_t addr_hi, const char* op_name) {
+            if (addr_hi != 0) {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "0x%08x", addr_hi);
+                throw std::runtime_error(path_for_msg + ": CDO " + op_name
+                    + " addr_hi=" + buf + " (>4GiB) not supported");
+            }
+        };
+
+        switch (opcode) {
+        case CDO_OP_END_MARK:
+        case CDO_OP_NOP:
+        case CDO_OP_MARKER:
+            break;
+
+        case CDO_OP_WRITE:
+            require(2, "Write");
+            emit_write32(out, payload[0], payload[1]);
+            break;
+
+        case CDO_OP_WRITE64:
+            require(3, "Write64");
+            check_addr_hi(payload[0], "Write64");
+            emit_write32(out, payload[1], payload[2]);
+            break;
+
+        case CDO_OP_MASK_WRITE:
+            require(3, "MaskWrite");
+            // CDO order is [addr, mask, value]; insts.bin emit order is
+            // (addr, value, mask) per emit_maskwrite signature.
+            emit_maskwrite(out, payload[0], payload[2], payload[1]);
+            break;
+
+        case CDO_OP_MASK_WRITE64:
+            require(4, "MaskWrite64");
+            check_addr_hi(payload[0], "MaskWrite64");
+            // [addr_hi, addr_lo, mask, value]
+            emit_maskwrite(out, payload[1], payload[3], payload[2]);
+            break;
+
+        case CDO_OP_DMA_WRITE:
+            require(2, "DmaWrite");
+            check_addr_hi(payload[0], "DmaWrite");
+            // payload = [addr_hi, addr_lo, data...]
+            emit_blockwrite(out, payload[1],
+                            payload + 2,
+                            static_cast<size_t>(payload_len) - 2);
+            break;
+
+        default: {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "0x%03x", opcode);
+            throw std::runtime_error(path_for_msg + ": CDO opcode " + buf
+                + " not supported in preamble replay");
+        }
+        }
+    }
+    return out;
+}
+
+// Slurp a CDO file from disk.
+std::vector<uint8_t> load_cdo_blob(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error("cannot open CDO file: " + path);
+    std::streamsize bytes = f.tellg();
+    if (bytes < 0) throw std::runtime_error("cannot stat CDO file: " + path);
+    f.seekg(0);
+    std::vector<uint8_t> data(static_cast<size_t>(bytes));
+    f.read(reinterpret_cast<char*>(data.data()), bytes);
+    return data;
+}
+
 /// Load an instruction binary as a vector of uint32_t words.
 std::vector<uint32_t> load_instr_binary(const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -355,7 +846,8 @@ struct KernArgPlan {
     size_t trace_idx       = SIZE_MAX;  // last buffer
 };
 
-KernArgPlan classify_kernargs(const std::vector<KernArgInfo>& kargs) {
+KernArgPlan classify_kernargs(const std::vector<KernArgInfo>& kargs,
+                              int trace_buf_idx_override = -1) {
     KernArgPlan plan;
     std::vector<size_t> scalar_indices;
     std::vector<size_t> buffer_indices;
@@ -365,7 +857,7 @@ KernArgPlan classify_kernargs(const std::vector<KernArgInfo>& kargs) {
     }
     // Expected layout (mlir-aie bridge-test convention):
     //   scalars: opcode (u64), ninstr (u32) -- exactly 2
-    //   buffers: instr, [bo0..boK-1], trace -- at least 2
+    //   buffers: instr, [bo0..boK-1] (at least one of which is trace) -- >=2
     // Tightening scalar_indices to exactly 2: if a future test adds a third
     // scalar (tuning param, tile id, etc.), the runner needs to grow a new
     // positional slot for it rather than silently leave it unbound.
@@ -383,10 +875,29 @@ KernArgPlan classify_kernargs(const std::vector<KernArgInfo>& kargs) {
     plan.opcode_idx     = scalar_indices[0];
     plan.instr_size_idx = scalar_indices[1];
     plan.instr_idx      = buffer_indices[0];
-    plan.trace_idx      = buffer_indices.back();
-    // Middle buffers: everything between the first buffer (instr) and the
-    // last buffer (trace).
-    for (size_t i = 1; i + 1 < buffer_indices.size(); ++i) {
+
+    // Trace BO selection. Data buffers are buffer_indices[1..N-1] (i.e.,
+    // excluding instr at [0]), so a 0-indexed data-buffer override of N
+    // selects buffer_indices[N+1].
+    size_t trace_buf_arr_pos;  // index into buffer_indices[]
+    if (trace_buf_idx_override >= 0) {
+        size_t want = static_cast<size_t>(trace_buf_idx_override) + 1;
+        if (want >= buffer_indices.size()) {
+            throw std::runtime_error(
+                "--trace-buf-idx " + std::to_string(trace_buf_idx_override)
+                + " out of range; kernel has " +
+                std::to_string(buffer_indices.size() - 1) + " data buffers");
+        }
+        trace_buf_arr_pos = want;
+    } else {
+        trace_buf_arr_pos = buffer_indices.size() - 1;  // legacy: last
+    }
+    plan.trace_idx = buffer_indices[trace_buf_arr_pos];
+
+    // Middle buffers: every data buffer that isn't instr (idx 0) and
+    // isn't trace.
+    for (size_t i = 1; i < buffer_indices.size(); ++i) {
+        if (i == trace_buf_arr_pos) continue;
         plan.middle_buf_indices.push_back(buffer_indices[i]);
     }
     return plan;
@@ -695,6 +1206,10 @@ struct PreparedKernel {
     xrt::kernel kernel;
     std::vector<KernArgInfo> kargs;
     KernArgPlan plan;
+    // Cached trace buffer override applied at prepare time (-1 = none).
+    // Used by get_or_prepare to detect callers passing inconsistent
+    // overrides for the same xclbin.
+    int trace_buf_idx = -1;
 
     // BO pool held across runs. Reallocating BOs between rapid-fire
     // runs against the same hw_context causes the scheduler to
@@ -737,6 +1252,7 @@ std::unique_ptr<PreparedKernel> prepare_kernel(
     xrt::device& device,
     const std::string& xclbin_path,
     const std::string& kernel_hint,
+    int trace_buf_idx,
     bool verbose)
 {
     auto p = std::make_unique<PreparedKernel>();
@@ -746,12 +1262,15 @@ std::unique_ptr<PreparedKernel> prepare_kernel(
     p->kargs = read_kernel_args(p->xclbin, kernel_hint, p->kernel_name, verbose);
     std::fprintf(stderr, "bridge-trace-runner: kernel=%s, %zu args\n",
                  p->kernel_name.c_str(), p->kargs.size());
-    p->plan = classify_kernargs(p->kargs);
+    p->plan = classify_kernargs(p->kargs, trace_buf_idx);
+    p->trace_buf_idx = trace_buf_idx;
     if (verbose) {
         std::fprintf(stderr,
-            "  plan: opcode=%zu instr=%zu ninstr=%zu middle=%zu trace=%zu\n",
+            "  plan: opcode=%zu instr=%zu ninstr=%zu middle=%zu trace=%zu"
+            " (trace_buf_idx=%d)\n",
             p->plan.opcode_idx, p->plan.instr_idx, p->plan.instr_size_idx,
-            p->plan.middle_buf_indices.size(), p->plan.trace_idx);
+            p->plan.middle_buf_indices.size(), p->plan.trace_idx,
+            trace_buf_idx);
     }
     device.register_xclbin(p->xclbin);
     p->context = xrt::hw_context(device, p->xclbin.get_uuid());
@@ -891,6 +1410,56 @@ RunOutcome execute_run(
         if (verbose) {
             std::fprintf(stderr, "  loaded %zu instruction words from %s\n",
                          instr_words.size(), args.instr_bin.c_str());
+        }
+        // Inject the userspace preamble that re-establishes hw_context
+        // setup state before the kernel runs. Two sources, additive:
+        //
+        //   --cdo-preamble <path>  : transcode a full CDO blob into
+        //     insts.bin ops. This is the comprehensive path (replays
+        //     core reset, lock zero+init, DMA BDs, stream-switch
+        //     routing, trace setup) and is what we rely on for
+        //     hwctx-reuse trace stability.
+        //
+        //   --reset-tile / --reset-lock : the older minimal path that
+        //     only resets core+locks. Kept for the cases where a CDO
+        //     blob isn't available or we want a hand-tuned preamble.
+        //
+        // Harmless (just extra register writes) when reuse_context is
+        // off, but necessary when on -- without it, every-other-launch
+        // hangs on drifted lock state and the trace unit state drifts
+        // between launches.
+        std::vector<uint32_t> combined_preamble;
+        for (const auto& p : args.cdo_preambles) {
+            auto blob = load_cdo_blob(p);
+            auto words = transcode_cdo_to_insts(blob, p);
+            if (verbose) {
+                std::fprintf(stderr,
+                    "  cdo preamble %s: %zu bytes -> %zu insts.bin words\n",
+                    p.c_str(), blob.size(), words.size());
+            }
+            combined_preamble.insert(combined_preamble.end(),
+                                     words.begin(), words.end());
+        }
+        if (!args.reset_tiles.empty() || !args.lock_inits.empty()) {
+            auto words = build_reset_preamble(args.reset_tiles,
+                                              args.lock_inits);
+            if (verbose) {
+                std::fprintf(stderr,
+                    "  manual reset preamble: %zu tile(s), %zu lock-init(s)"
+                    " -> %zu words\n",
+                    args.reset_tiles.size(), args.lock_inits.size(),
+                    words.size());
+            }
+            combined_preamble.insert(combined_preamble.end(),
+                                     words.begin(), words.end());
+        }
+        if (!combined_preamble.empty()) {
+            splice_reset_preamble(instr_words, combined_preamble);
+            if (verbose) {
+                std::fprintf(stderr,
+                    "  preamble total: +%zu words spliced\n",
+                    combined_preamble.size());
+            }
         }
         auto roles = classify_kernargs_via_ffi(
             classify_fn, args.xclbin, instr_words, verbose);
@@ -1171,11 +1740,26 @@ struct Session {
     std::unordered_map<std::string, std::unique_ptr<PreparedKernel>> cache;
 
     PreparedKernel& get_or_prepare(const std::string& xclbin_path,
-                                   const std::string& kernel_hint) {
+                                   const std::string& kernel_hint,
+                                   int trace_buf_idx = -1) {
         std::string key = xclbin_path + "::" + kernel_hint;
         auto it = cache.find(key);
-        if (it != cache.end()) return *it->second;
-        auto prep = prepare_kernel(device, xclbin_path, kernel_hint, verbose);
+        if (it != cache.end()) {
+            // Surface inconsistent --trace-buf-idx across runs against
+            // the same xclbin -- the cached plan's trace selection
+            // would be wrong for the new value, so refuse rather than
+            // silently using stale routing.
+            if (it->second->trace_buf_idx != trace_buf_idx) {
+                throw std::runtime_error(
+                    "trace_buf_idx mismatch on cached xclbin "
+                    + xclbin_path + ": cached=" +
+                    std::to_string(it->second->trace_buf_idx) +
+                    ", new=" + std::to_string(trace_buf_idx));
+            }
+            return *it->second;
+        }
+        auto prep = prepare_kernel(device, xclbin_path, kernel_hint,
+                                   trace_buf_idx, verbose);
         auto& ref = *prep;
         cache.emplace(std::move(key), std::move(prep));
         return ref;
@@ -1192,7 +1776,8 @@ int run_single_shot(Session& session, const RunArgs& args) {
                      args.inputs.size(), args.outputs.size());
     }
     try {
-        auto& prep = session.get_or_prepare(args.xclbin, args.kernel_name);
+        auto& prep = session.get_or_prepare(args.xclbin, args.kernel_name,
+                                            args.trace_buf_idx);
         auto out = execute_run(session.device, prep, session.classify_fn,
                                args, session.verbose);
         if (!out.ok) {
@@ -1242,7 +1827,8 @@ int run_batch_stdin(Session& session, const OuterArgs& outer, const char* argv0)
         // Prep or reuse for this xclbin.
         PreparedKernel* prep = nullptr;
         try {
-            prep = &session.get_or_prepare(args.xclbin, args.kernel_name);
+            prep = &session.get_or_prepare(args.xclbin, args.kernel_name,
+                                           args.trace_buf_idx);
         } catch (const std::exception& e) {
             std::printf(
                 "{\"run_idx\":%llu,\"ok\":false,\"error\":\"prepare: %s\"}\n",
