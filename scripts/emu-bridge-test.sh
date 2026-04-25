@@ -677,7 +677,8 @@ _strip_trace_flags() {
 # _run_trace_cycles_pipeline <side> <build_dir> <xclbin> <kernel> <instr> <variant>
 #   side ∈ {HW, EMU}.
 # Runs bridge-trace-runner against a traced xclbin on the requested side,
-# then runs parse-trace.py (mlir-aie-backed decoder) to emit both the flat
+# then runs parse-trace.py (in-tree tools/trace_decoder backend by default;
+# mlir-aie still used for slot-name lookup from MLIR) to emit both the flat
 # events JSON (for trace-compare) and the cycles scalar (for the CYCLES
 # column) in a single pass. Writes:
 #   RESULTS_DIR/<safe>.hw-cycles/trace_{hw,emu}.<variant>.bin

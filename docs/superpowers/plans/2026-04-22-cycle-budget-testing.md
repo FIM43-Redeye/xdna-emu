@@ -14,6 +14,8 @@ No software-only workaround: `DRM_AMDXDNA_READ_AIE_REG` is `#ifdef AMDXDNA_AIE2_
 
 **Bonus:** this retires our atrophied in-tree trace tools (`tools/trace-inject.py`, `trace-sweep.py`, `trace-trim.py`, `trace-merge.py`, `trace-prepare.py`, and `src/bin/trace_compare.rs`) and delegates to mlir-aie's single source of truth. (Trace *comparison* may need a small replacement later — deferred.)
 
+> **Update (2026-04-25):** the deferred replacement landed.  `tools/trace_decoder/` is an in-tree, MIT-licensed byte-stream decoder covering modes 0/1/2 (mlir-aie's `parse_trace` covers mode 0 only, and we declined to upstream new modes as an external contributor).  `tools/parse-trace.py --decoder=ours` is now the default and authoritative for the cycle-diff pipeline; `--decoder=mlir-aie` remains the cross-validation oracle for mode 0.  Not a permanent fork — when mlir-aie's `parse_trace` covers all three modes upstream, we swap back.  Trace decoding is post-mortem so the swap-back has no hot-path cost.
+
 **Status of the old Phase B:**
 - **Task 1 (XRT patch)**: remains committed on `xdna-driver` branch `xdna-emu-cycle-budget` as future-firmware-ready code. Dormant.
 - **Task 2 (CycleCounterHelper)**: remains committed on `mlir-aie` branch `xdna-emu-cycle-budget` as dormant companion code. Not currently used.

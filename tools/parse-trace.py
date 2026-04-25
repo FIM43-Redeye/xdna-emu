@@ -6,8 +6,15 @@ Exposes every decoder layer the xdna-emu pipeline cares about so downstream
 tools never disagree about what the trace says.  Two decoder backends are
 selectable via --decoder:
 
-  --decoder mlir-aie   (default) routes through aie.utils.trace.parse_trace
-  --decoder ours       routes through tools/trace_decoder/ (in-tree, MIT)
+  --decoder ours       (default) routes through tools/trace_decoder/, the
+                       in-tree MIT-licensed decoder.  Authoritative for the
+                       xdna-emu validation pipeline today because mlir-aie's
+                       parse_trace covers only mode 0 (EVENT_TIME); modes 1
+                       (EVENT_PC) and 2 (INST_EXEC) are decode-only here.
+  --decoder mlir-aie   routes through aie.utils.trace.parse_trace.  Useful
+                       for cross-validation (we maintain bit-perfect mode-0
+                       parity with this oracle) and as the swap-back path
+                       once mlir-aie covers all three modes upstream.
 
 Output formats:
 
@@ -19,9 +26,10 @@ Output formats:
                          Kernel-duration proxy; drop-in for the old
                          trace-to-cycles.py output.
 
-  --out-perfetto <path>  Raw Perfetto JSON from aie.utils.trace.parse_trace
-                         (begin/end/metadata events).  For debugging and
-                         ui.perfetto.dev viewing.
+  --out-perfetto <path>  Perfetto JSON timeline (begin/end/metadata events)
+                         viewable at ui.perfetto.dev.  Both decoders emit
+                         B/E pairs for mode 0; the in-tree decoder rejects
+                         modes 1/2 here pending a B/E convention for those.
 
   --out-commands <path>  Decoded command stream per (trace_type, row, col),
                          with Start tokens preserved.  For debugging decoder
@@ -33,7 +41,7 @@ derived from shared intermediate state.
 
 Exit codes:
   0 -- success
-  1 -- bad input, parse failure, or mlir-aie not importable
+  1 -- bad input, parse failure, or selected decoder not importable
 """
 import argparse
 import json
@@ -53,14 +61,16 @@ def parse_args():
     p.add_argument("--out-cycles")
     p.add_argument("--out-perfetto")
     p.add_argument("--out-commands")
-    p.add_argument("--decoder", choices=("mlir-aie", "ours"), default="mlir-aie",
-                   help="byte-stream decoder backend. 'mlir-aie' (default) uses "
-                        "aie.utils.trace.parse_trace; 'ours' uses the in-tree "
-                        "tools/trace_decoder package. The 'ours' path supports "
-                        "--out-commands / --out-events / --out-cycles for "
-                        "EVENT_TIME (mode 0) and EVENT_PC (mode 1) traces; "
-                        "--out-perfetto remains mlir-aie-only until our "
-                        "timeline emits B/E pairs.")
+    p.add_argument("--decoder", choices=("mlir-aie", "ours"), default="ours",
+                   help="byte-stream decoder backend. 'ours' (default) uses "
+                        "the in-tree tools/trace_decoder package, which "
+                        "covers EVENT_TIME (mode 0), EVENT_PC (mode 1), and "
+                        "INST_EXEC (mode 2). 'mlir-aie' routes through "
+                        "aie.utils.trace.parse_trace (mode 0 only); use it "
+                        "for cross-validation against the upstream oracle. "
+                        "--out-perfetto is supported on both backends for "
+                        "mode 0; 'ours' rejects --out-perfetto for modes "
+                        "1/2 pending a B/E convention.")
     p.add_argument("--trace-mode", choices=("event_time", "event_pc", "inst_exec"),
                    default="event_time",
                    help="trace mode selector for --decoder=ours. 'event_time' "
@@ -237,14 +247,20 @@ def commands_per_tile(trace_buffer, mlir_text):
     return {"trace_types": commands}
 
 
-def _import_decoder():
-    """Import the heavy mlir-aie trace decoder. Returns (numpy, parse_trace)
-    or raises ImportError with a hint if the env isn't set up. Pulled out
-    so server mode can amortize the cost across many requests.
-    """
+def _import_numpy():
+    """Import numpy. Both decoder backends need it (raw trace words are
+    loaded via ``np.fromfile``)."""
     import numpy as np
+    return np
+
+
+def _import_mlir_aie_parse_trace():
+    """Import the heavy mlir-aie trace decoder.  Returns ``parse_trace`` or
+    raises ImportError with a hint if the env isn't set up.  Lazy because
+    --decoder=ours (the default) doesn't need it; pulling it in
+    unconditionally would force the ironenv Python on every caller."""
     from aie.utils.trace.parse import parse_trace
-    return np, parse_trace
+    return parse_trace
 
 
 def _import_ours():
@@ -540,7 +556,7 @@ def decode_one(np_mod, parse_trace_fn,
 
 
 def server_loop(np_mod, parse_trace_fn, td_mod=None,
-                default_decoder="mlir-aie") -> int:
+                default_decoder="ours") -> int:
     """Long-lived decode loop. One JSON request per stdin line; one JSON
     response per stdout line. Stdin EOF exits cleanly.
 
@@ -553,6 +569,11 @@ def server_loop(np_mod, parse_trace_fn, td_mod=None,
     ``"decoder": "mlir-aie"`` in the JSON request to override the
     server's default backend on a per-call basis (defaults to whatever
     was passed to ``--decoder`` at server startup).
+
+    Both backends are lazy-loaded: pass ``parse_trace_fn=None`` and/or
+    ``td_mod=None`` and the loop will import on first use.  Lets a
+    --decoder=ours server avoid the mlir-aie import entirely when no
+    request needs it.
     """
     import time as _t
     print(json.dumps({"event": "ready"}), flush=True)
@@ -576,6 +597,15 @@ def server_loop(np_mod, parse_trace_fn, td_mod=None,
             except ImportError as e:
                 print(json.dumps({"ok": False,
                                   "error": f"trace_decoder import failed: {e}"}),
+                      flush=True)
+                continue
+        if decoder == "mlir-aie" and parse_trace_fn is None:
+            try:
+                parse_trace_fn = _import_mlir_aie_parse_trace()
+            except ImportError as e:
+                print(json.dumps({"ok": False,
+                                  "error": f"mlir-aie parse_trace import "
+                                           f"failed: {e}"}),
                       flush=True)
                 continue
         try:
@@ -616,23 +646,33 @@ def server_loop(np_mod, parse_trace_fn, td_mod=None,
 def main():
     args = parse_args()
     try:
-        np_mod, parse_trace_fn = _import_decoder()
+        np_mod = _import_numpy()
     except ImportError as e:
-        print(
-            f"error: mlir-aie trace module not importable: {e}\n"
-            "  ensure PYTHONPATH includes mlir-aie/install/python and the "
-            "ironenv Python is active",
-            file=sys.stderr,
-        )
+        print(f"error: numpy not importable: {e}", file=sys.stderr)
         return 1
 
+    # Both decoder imports are lazy: only pull in what the selected backend
+    # actually needs.  --decoder=ours (the default) skips mlir-aie entirely
+    # so callers don't need ironenv on PATH for in-tree decoding.
     td_mod = None
-    if args.decoder == "ours":
+    parse_trace_fn = None
+    if args.decoder == "ours" or args.server:
         try:
             td_mod = _import_ours()
         except ImportError as e:
             print(f"error: in-tree trace_decoder not importable: {e}",
                   file=sys.stderr)
+            return 1
+    if args.decoder == "mlir-aie":
+        try:
+            parse_trace_fn = _import_mlir_aie_parse_trace()
+        except ImportError as e:
+            print(
+                f"error: mlir-aie trace module not importable: {e}\n"
+                "  ensure PYTHONPATH includes mlir-aie/install/python and the "
+                "ironenv Python is active",
+                file=sys.stderr,
+            )
             return 1
 
     if args.server:

@@ -84,14 +84,25 @@ than mode 0. Mode 3 has the same discriminator byte as mode 2's
 secondary packet, suggesting it's a related variant rather than truly
 unimplemented.
 
-**Authoritative decoder situation.** mlir-aie's `parse_trace`
-(`mlir-aie/python/utils/trace/parse.py`) decodes mode 0 only -- no
-mention of `atom`, `INST_EXEC`, or PC mode anywhere in mlir-aie's
-trace utilities. aie-rt configures the trace mode register but ships
-no host decoder for any mode (the trace data lives off-chip in the
-trace buffer; aie-rt's job ends at the register write). AM020 §2
-documents mode 2 as emitting "conditional and unconditional direct
-branches, all indirect branches, and ZOL LC" -- a branch-trace
+**Authoritative decoder situation (2026-04-25 update).** We now ship an
+in-tree decoder at `tools/trace_decoder/` (MIT) covering modes 0
+(EVENT_TIME), 1 (EVENT_PC), and 2 (INST_EXEC).  `parse-trace.py
+--decoder=ours` is the default and authoritative for the xdna-emu
+cycle-diff pipeline; mlir-aie's `parse_trace` (mode 0 only) remains
+selectable via `--decoder=mlir-aie` for cross-validation.  Not a
+permanent fork: if/when mlir-aie's `parse_trace` covers all three
+modes upstream, we swap back -- trace decoding is post-mortem so the
+swap-back is a one-line default change with no hot-path cost.
+
+**Historical context** (the situation that drove us to write our own):
+mlir-aie's `parse_trace` (`mlir-aie/python/utils/trace/parse.py`)
+decodes mode 0 only -- no mention of `atom`, `INST_EXEC`, or PC mode
+anywhere in mlir-aie's trace utilities. aie-rt configures the trace
+mode register but ships no host decoder for any mode (the trace data
+lives off-chip in the trace buffer; aie-rt's job ends at the register
+write). AM020 §2 documents mode 2 as emitting "conditional and
+unconditional direct branches, all indirect branches, and ZOL LC"
+-- a branch-trace
 record format -- but does not specify byte layout.
 
 We have an experimental decoder at

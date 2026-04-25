@@ -1,8 +1,10 @@
 //! Efficient trace comparison: HW vs EMU.
 //!
-//! Consumes per-side events JSON produced by tools/parse-trace.py (which
-//! delegates binary decoding to mlir-aie's parser). All binary-level work
-//! happens upstream; this tool only does the structural comparison.
+//! Consumes per-side events JSON produced by tools/parse-trace.py.  The
+//! decoder backend that produced those JSONs is opaque to this tool --
+//! the in-tree tools/trace_decoder package and mlir-aie's parse_trace
+//! emit the same record shape.  All binary-level work happens upstream;
+//! this tool only does the structural comparison.
 //!
 //! Usage:
 //!   trace-compare --hw hw.events.json --emu emu.events.json [--events-json slot-names.json] [-o report.txt]
