@@ -67,36 +67,65 @@ is the right default and shift focus to calibrating the residual.
 
 PC-trace mode (`XAIE_TRACE_EVENT_PC`, mode=1) remains unexplored.
 
-**Mode 2 (XAIE_TRACE_INST_EXEC) finding (2026-04-24).** Patched
-add_one_objFifo to `--mode 2` and ran 5 same-batch iterations under
-hwctx reuse. The mode-2 trace decodes via
-`tools/trace-mode-tests/decode_trace_experiment.py` into:
+**Trace mode survey (2026-04-24).** Patched add_one_objFifo to each
+mode value (0..3) via the patcher and captured under bridge-runner.
+Per-run trimmed-trace sizes from fresh hwctx (no reuse, so the trace
+buffer is clean each run):
 
-- a 16-bit `sync_pc` (PC at trace start)
-- an "atom string" of E/N characters (one per instruction-slot cycle:
-  `E` = instruction executed, `N` = no-execute / stall)
-- an embedded events list (slot_idx, atom_position) pairs
+| mode | name | bytes | discriminator at off 7 |
+|------|------|-------|------------------------|
+| 0 | EVENT_TIME | 320 | `f0` |
+| 1 | EVENT_PC | 896 | `f1` |
+| 2 | INST_EXEC | 192 | `f0` (1st pkt), `f2` (2nd pkt) |
+| 3 | reserved (per AM020) | 896 | `f2` |
 
-**Result: atom strings are bit-identical across all 5 iterations**
-(SHA-256 prefix `b831a004`, 128 atoms), even though mode-0 traces of
-the same kernel show ~7% cycle-span variance in their timestamps. The
-*execution flow* is fully deterministic; the variance lives entirely
-in the trace's timestamp-encoding layer, not in what the core does.
+Modes 1 and 3 are NOT empty -- both produce 896-byte payloads, larger
+than mode 0. Mode 3 has the same discriminator byte as mode 2's
+secondary packet, suggesting it's a related variant rather than truly
+unimplemented.
 
-Anomaly worth noting: `sync_pc` alternates between 0x0330 and 0x00CC
-across iterations (even iters: 0x0330, odd: 0x00CC), and event counts
-alternate 16/21. The atoms don't change. Hypothesis: hwctx-reuse
-preserves some state bit that flips per run, shifting where the trace
-state machine syncs but not the underlying execution. Worth a deeper
-look but not blocking.
+**Authoritative decoder situation.** mlir-aie's `parse_trace`
+(`mlir-aie/python/utils/trace/parse.py`) decodes mode 0 only -- no
+mention of `atom`, `INST_EXEC`, or PC mode anywhere in mlir-aie's
+trace utilities. aie-rt configures the trace mode register but ships
+no host decoder for any mode (the trace data lives off-chip in the
+trace buffer; aie-rt's job ends at the register write). AM020 §2
+documents mode 2 as emitting "conditional and unconditional direct
+branches, all indirect branches, and ZOL LC" -- a branch-trace
+record format -- but does not specify byte layout.
 
-**This makes mode 2 the right baseline for the sequence-skeleton
-extractor.** The atom string IS the skeleton; the embedded events are
-the wobblers. No timestamp arithmetic needed.
+We have an experimental decoder at
+`tools/trace-mode-tests/decode_trace_experiment.py` that interprets
+mode-2 bytes as `E`/`N` atoms (instruction-slot execute bits). **This
+interpretation is unverified** -- AM020's "branches and ZOL LC"
+description is incompatible with per-instruction-slot atom bits, so
+the decoder is probably wrong about the semantics even if its byte
+walk happens to be self-consistent.
 
-**Status:** patcher landed; mode 0 stable for event counts, mode 2
-fully deterministic for execution flow. Sequence-skeleton tooling
-should build on mode 2.
+**Stability under fresh hwctx (n=3 per mode):** all modes produce
+constant-size traces but their byte content differs run-to-run --
+SHA-256s of trimmed bytes are unique each run. So *some* of the per-
+run variance is timestamp/delta-encoded into the bytes. No mode
+gives us bit-identical traces of the same kernel.
+
+**Earlier "atom-identical across 5 iterations" claim (RETRACTED):**
+that result came from runs under hwctx-reuse where the trace buffer
+**accumulates across iterations** -- bridge-trace-runner does not zero
+the trace BO between batches. Iter 0's data starts at offset 0; each
+subsequent iter appends. The decoder always read offset 0 and got
+iter 0's bytes back every time. data_end grew 192 -> 448 -> 640 -> 896
+-> 1088 across the 5 runs. This is also a runner bug worth fixing
+(or at least documenting): for reuse-mode batches, the runner should
+either zero the trace BO or report a per-batch "new data starts at
+offset N."
+
+PC-trace mode (1) and reserved mode (3) remain unexamined beyond
+"yes, they produce data."
+
+**Status:** patcher works for any mode value; modes 1, 2, 3 produce
+captures but we have no trustworthy decoder for them. Reverse-
+engineering needed (or finding a decoder buried in aietools); until
+then mode 0 is the only mode whose contents we can interpret.
 
 ### 2. Performance counters with start/stop/reset events
 
