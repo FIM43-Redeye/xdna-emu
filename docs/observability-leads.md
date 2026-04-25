@@ -191,6 +191,69 @@ branch outcomes, cycle markers, and memory accesses* -- not E/N
 atoms. A diff between mode-0 and mode-1 bytes for the same kernel
 should reveal where PC values are inserted.
 
+#### Aietools follow-up (2026-04-24): full decoder library found
+
+Earlier search missed the binaries because `find` without `-L` does
+not follow the `aietools/` symlink. Re-searching with `-L` (or via
+the canonical path `amd-unified-software/aietools/`) reveals the
+real install includes a complete trace-decoder shared library
+(read-only reference -- do not copy):
+
+`aietools/lib/lnx64.o/libxv_trace_decoder_opt.so`
+
+Symbol-table inspection (read-only knowledge of hardware behavior)
+exposes the full frame taxonomy in `cardano::Trace`:
+
+| Class | What it represents |
+|-------|--------------------|
+| `Execution_Start` | trace start marker |
+| `Execution_Stop` | trace stop marker |
+| `Execution_Sync` | sync / resync (carries the sync_pc anchor) |
+| `Execution_E_atom` | one cycle in which an instruction executed |
+| `Execution_N_atom` | one cycle in which the core did not execute (stall) |
+| `Execution_New_PC` | taken-branch destination PC |
+| `Execution_New_PC_AIE4` | New_PC variant for AIE4 |
+| `Execution_LC` | zero-overhead-loop loop counter snapshot |
+| `Execution_Filler0/1` | padding frames |
+| `Execution_Repeat0/1` | run-length compression frames |
+
+So our experimental decoder's "EEENN..." atom string interpretation
+was right in spirit -- the frames really are per-cycle execute /
+no-execute markers, not slot-bit packing. Each atom = one cycle.
+The `Execution_New_PC` frames interleaved with atoms give us the
+actual taken-branch destinations. Combined: a fully reconstructible
+cycle-by-cycle execution path through the kernel ELF.
+
+For Event-PC mode (1), diagnostic strings reveal the parallel set:
+`Event PC frame`, `Event PC Sync frame`, `Event PC Filler frame`,
+`Event PC Start frame Timer value:`, `Event PC Repeat 0/1`. So
+mode 1 is structured similarly to mode 0 but with PC values
+attached to event records instead of (or alongside) timer deltas.
+
+Other library symbols hint at the decode internals:
+- `TraceDecoder::decode_packet(uint*, ..., name, offset)` -- main
+  byte-stream decoder
+- `TraceDecoder::decodeExecutionTrace(...)` -- mode 2 entry point
+- `TraceDecoder::record_single_event`, `record_multiple_events`,
+  `record_event_repeat` -- mode 0 event-record handlers
+- `EVENT_TIME_FRAME_TYPE` enum (mode 0 frame discriminator)
+- All frame `decode()` methods take `(uint, uint, int, bitset<32>&,
+  ofstream&)` -- the `bitset<32>` strongly implies 32-bit-word-
+  aligned frame headers
+
+**Path forward:** the library is dynamically loadable. We can
+either (a) link our parser to it via dlopen + the public C++ API,
+treating it as the authoritative oracle without copying anything,
+or (b) write our own decoder informed by the frame taxonomy and
+test it against the oracle's output as a fixture. Option (a) gets
+us correct decoding immediately; option (b) gives us a portable
+decoder we can ship in xdna-emu without an aietools dependency.
+
+**Quick win available:** even without parsing every frame type, we
+can bucket-count frame headers in a captured trace to verify our
+experimental decoder is roughly hitting the right structural
+classes, and probe modes 1/3 byte content with the same approach.
+
 ### 2. Performance counters with start/stop/reset events
 
 `aie-rt/driver/src/perfcnt/xaie_perfcnt.h`
