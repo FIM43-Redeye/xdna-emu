@@ -58,8 +58,15 @@ def parse_args():
                         "aie.utils.trace.parse_trace; 'ours' uses the in-tree "
                         "tools/trace_decoder package. The 'ours' path supports "
                         "--out-commands / --out-events / --out-cycles for "
-                        "EVENT_TIME (mode 0) traces; --out-perfetto remains "
-                        "mlir-aie-only until our timeline emits B/E pairs.")
+                        "EVENT_TIME (mode 0) and EVENT_PC (mode 1) traces; "
+                        "--out-perfetto remains mlir-aie-only until our "
+                        "timeline emits B/E pairs.")
+    p.add_argument("--trace-mode", choices=("event_time", "event_pc"),
+                   default="event_time",
+                   help="trace mode selector for --decoder=ours. 'event_time' "
+                        "(default) decodes mode-0 traces with cycle-delta "
+                        "events. 'event_pc' decodes mode-1 traces where the "
+                        "encoded quantity is the PC at each event fire.")
     p.add_argument("--server", action="store_true",
                    help="run as a long-lived decode server. Reads one JSON "
                         "request per stdin line {trace_bin, xclbin_mlir, "
@@ -287,7 +294,8 @@ def _slot_names_from_mlir(mlir_text):
 def decode_one_ours(np_mod, td_mod,
                     trace_bin: str, xclbin_mlir: str,
                     out_events: str = None, out_cycles: str = None,
-                    out_perfetto: str = None, out_commands: str = None) -> dict:
+                    out_perfetto: str = None, out_commands: str = None,
+                    trace_mode: str = "event_time") -> dict:
     """Decode a single trace using the in-tree decoder backend.
 
     Mirrors the public surface of ``decode_one`` but routes through
@@ -298,7 +306,12 @@ def decode_one_ours(np_mod, td_mod,
                        mlir-aie path.
       --out-events     flat event list ({col, row, pkt_type, slot, name,
                        ts}), bit-equivalent to the mlir-aie path on mode 0.
+                       In mode 1 (EVENT_PC) the ``ts`` field carries the
+                       PC instead of a cycle count.
       --out-cycles     scalar max(ts) - min(ts) over emitted events.
+
+    ``trace_mode`` selects the per-tile decoder; supported values are
+    ``"event_time"`` (mode 0, default) and ``"event_pc"`` (mode 1).
 
     --out-perfetto is rejected: producing Perfetto B/E pairs requires
     the active-event tracking we have not ported yet.  Use the
@@ -310,11 +323,22 @@ def decode_one_ours(np_mod, td_mod,
             "use --decoder=mlir-aie for Perfetto output"
         )
 
+    mode_lookup = {
+        "event_time": td_mod.TraceMode.EVENT_TIME,
+        "event_pc": td_mod.TraceMode.EVENT_PC,
+    }
+    if trace_mode not in mode_lookup:
+        raise ValueError(
+            f"--decoder=ours: unsupported trace_mode {trace_mode!r}; "
+            f"expected one of {sorted(mode_lookup)}"
+        )
+    mode_enum = mode_lookup[trace_mode]
+
     raw = np_mod.fromfile(trace_bin, dtype=np_mod.uint32)
     words = raw.tolist()
 
     if out_commands:
-        commands_per_tile = td_mod.decode_words(words, mode=td_mod.TraceMode.EVENT_TIME)
+        commands_per_tile = td_mod.decode_words(words, mode=mode_enum)
         # Reshape into the mlir-aie-compatible output: trace_types[pkt_type][f"{row},{col}"] = [...]
         max_pt = max((pt for (pt, _, _) in commands_per_tile), default=-1)
         trace_types = [dict() for _ in range(max(4, max_pt + 1))]
@@ -330,7 +354,7 @@ def decode_one_ours(np_mod, td_mod,
             mlir_text = Path(xclbin_mlir).read_text()
             slot_names = _slot_names_from_mlir(mlir_text)
         events = td_mod.parse_trace(words, slot_names=slot_names,
-                                    mode=td_mod.TraceMode.EVENT_TIME)
+                                    mode=mode_enum)
         flat = [
             {
                 "col": e.col,
@@ -550,6 +574,7 @@ def server_loop(np_mod, parse_trace_fn, td_mod=None,
                     out_cycles=req.get("out_cycles"),
                     out_perfetto=req.get("out_perfetto"),
                     out_commands=req.get("out_commands"),
+                    trace_mode=req.get("trace_mode", "event_time"),
                 )
             else:
                 result = decode_one(
@@ -610,6 +635,7 @@ def main():
                 out_cycles=args.out_cycles,
                 out_perfetto=args.out_perfetto,
                 out_commands=args.out_commands,
+                trace_mode=args.trace_mode,
             )
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)

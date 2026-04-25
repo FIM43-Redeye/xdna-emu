@@ -28,8 +28,11 @@ data copied):
 * AM020 architecture reference -- mode descriptions for INST_EXEC
   ("branches and ZOL LC").
 
-Modes 1 (EVENT_PC), 2 (INST_EXEC), and 3 (reserved) are work-in-progress;
-mode 0 is the bit-equivalence target for the first iteration.
+Modes 0 (EVENT_TIME) and 1 (EVENT_PC) are implemented; mode 2 (INST_EXEC)
+and 3 (reserved) are work-in-progress.  Mode-1 wire format was reverse-
+engineered from captured traces and confirmed against the per-word
+dispatch in ``adf::Trace::TraceDecoder::decodePacket`` (read-only objdump
+inspection); the implementation here is original.
 """
 
 from .frame import (

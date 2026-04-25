@@ -13,17 +13,35 @@ person doesn't have to chase the same thread.
 
 ```
 amd-unified-software/
+  bin/vitis-server                        # AMD wrapper: sets JAVA_HOME,
+                                          # PYTHONHOME, RDI_DATADIR (via
+                                          # rdiArgs.sh), LD_LIBRARY_PATH (via
+                                          # ldlibpath.sh), IDE_SKIP_SERVER_LICENSE,
+                                          # then execs the Gradle launcher.
   ide/
     electron-app/lnx64/vitis-ide          # Theia/Electron binary
     browser-app/lnx64/                    # Same Theia frontend, Node-served
   vitis-server/
     bin/vitis-server                      # Gradle-generated Java launcher
+                                          # (no env setup, just runs java)
     lib/*.jar                             # Java + gRPC + Netty + custom Xilinx jars
     scripts/                              # Tcl helpers, cmake toolchains, AIE templates
+  data/vitis/                             # Where RDI_DATADIR points
+  tps/lnx64/                              # Bundled JRE 21, Python 3.13, cmake, git
   lib/lnx64.o/
     libxv_common.so                       # JNI native libs the server loads
     libLLVM-9*.so, libboost_*.so.1.72.0   # OLD versions that shadow modern ones
 ```
+
+There are **two** `bin/vitis-server` files in the install -- this matters.
+The one at `amd-unified-software/bin/vitis-server` is the AMD wrapper that
+performs all the JVM env setup; the one at
+`amd-unified-software/vitis-server/bin/vitis-server` is the bare Gradle
+launcher.  The IDE backend resolves `$XILINX_VITIS/bin/vitis-server`, so
+`XILINX_VITIS` controls which of the two it spawns.  We always want the
+wrapper -- if the JVM is launched directly without it, the server binds
+its gRPC port, fails its license / data-dir lookup, and exits seconds
+later, leaving the IDE backend with `ECONNREFUSED` on every call.
 
 * The Electron app's main process is in
   `ide/electron-app/lnx64/resources/app/scripts/rigel-electron-main.js`.
@@ -59,24 +77,32 @@ Verbose log to watch:
 
 ## What you need to set
 
-Two pieces -- both missing from a stock launch:
+Just one variable, scoped to the IDE subprocess:
 
-| Env var          | Value                                                      | Why                                                 |
-|------------------|------------------------------------------------------------|-----------------------------------------------------|
-| `XILINX_VITIS`   | `<NPU_WORK_DIR>/amd-unified-software/vitis-server`         | IDE backend resolves `$XILINX_VITIS/bin/vitis-server` |
-| `LD_LIBRARY_PATH`| prepend `<NPU_WORK_DIR>/amd-unified-software/lib/lnx64.o`  | JVM `loadLibrary("xv_common")` and friends          |
+| Env var        | Value                                          | Why                                                       |
+|----------------|------------------------------------------------|-----------------------------------------------------------|
+| `XILINX_VITIS` | `<NPU_WORK_DIR>/amd-unified-software`          | IDE backend resolves `$XILINX_VITIS/bin/vitis-server`, which must land on the AMD wrapper -- the wrapper then sets `JAVA_HOME`, `PYTHONHOME`, `RDI_DATADIR`, `LD_LIBRARY_PATH`, `IDE_SKIP_SERVER_LICENSE`, etc. on its way to the JVM. |
 
-### Env-var conflict with aietools
+The wrapper builds `LD_LIBRARY_PATH` itself (via `bin/ldlibpath.sh`) to
+include `lib/lnx64.o/`, so we don't need to prepend it externally; the
+JNI `loadLibrary("xv_common")` resolves through the wrapper's path.
 
-`activate-npu-env.sh` already sets `XILINX_VITIS=$AIETOOLS_DIR` because
-**aietools' Python loader uses that path to find its bundled
-`tps/lnx64/python-3.13.0/`**.  The two pointings are incompatible --
-aietools needs `XILINX_VITIS=...amd-unified-software/aietools`, the IDE
-needs `XILINX_VITIS=...amd-unified-software/vitis-server`.
+### One `XILINX_VITIS` for both aietools and the IDE
 
-We resolve this with a wrapper: `toolchain-build/launch-vitis-ide.sh`
-overrides both env vars **only for the IDE subprocess**, leaving the
-parent shell's aietools-friendly env intact.
+`activate-npu-env.sh` sets `XILINX_VITIS=$UNIFIED` (the installer root)
+once and that value satisfies both consumers:
+
+* The IDE backend resolves `$XILINX_VITIS/bin/vitis-server` and lands on
+  the AMD wrapper.
+* aietools' `loader` script reads `$XILINX_VITIS/tps/lnx64/python-3.13.0/`
+  to find its Python.  That path is mirrored at the unified root with
+  identical site-packages to `aietools/tps/lnx64/python-3.13.0/`, so the
+  loader gets an interchangeable Python.
+
+The launcher wrapper at `toolchain-build/launch-vitis-ide.sh` still
+exists for invocations from a shell that hasn't sourced the activator
+(and to gate startup behind sanity checks); a sourced shell can exec
+the IDE binary directly.
 
 ### Why we don't add the native lib dir to global `LD_LIBRARY_PATH`
 
@@ -90,8 +116,8 @@ parent shell's aietools-friendly env intact.
 * `libJudy.so.1` -- collides with the Ubuntu package's library.
 
 Putting this directory on a user's global `LD_LIBRARY_PATH` would break
-the rest of the toolchain.  The wrapper adds it only inside the IDE
-process tree, where the JVM consumes it on the way in.
+the rest of the toolchain.  Scoping the IDE behind a wrapper means this
+dir only ends up in the JVM process tree, via the wrapper's own setup.
 
 ## How to launch
 
@@ -123,11 +149,9 @@ IDE from working:
   debug session starts.
 * `Invalid ESW Repo Directory path 'null'` -- embedded software
   examples repo isn't configured (uncommon on a workstation install).
-* `Reading early access data from ...vitis-server/vitis-server/scripts/early-access/...`
-  -- the path has `vitis-server` doubled because the Feature Registry
-  appends `vitis-server/` to `$XILINX_VITIS` (which already points at
-  `vitis-server/`).  Cosmetic; the file is still found via the doubled
-  segment because it doesn't exist there, and the loader falls back.
+* `Reading early access data from ...vitis-server/scripts/early-access/...`
+  -- the Feature Registry appends `vitis-server/` to `$XILINX_VITIS`
+  (which now points at the unified root) to find scripts.  Cosmetic.
 
 ## Why this matters
 
@@ -140,9 +164,10 @@ can talk to the same gRPC backend if we want our own UI surface.
 
 ## Quick troubleshooting
 
-| Symptom                                                            | Likely cause                          |
-|--------------------------------------------------------------------|---------------------------------------|
-| IDE opens but `Could not initialize contribution` re XILINX_VITIS  | Forgot to use the wrapper / activate  |
-| `UnsatisfiedLinkError: no xv_common in java.library.path`          | `LD_LIBRARY_PATH` missing native libs |
-| `Invalid workspace`                                                | Pass an existing dir to `-w`          |
-| IDE hangs at `Initializing the frontend client`                    | Server died -- check verbose log      |
+| Symptom                                                            | Likely cause                                                                                               |
+|--------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------|
+| IDE opens but `Could not initialize contribution` re XILINX_VITIS  | Forgot to use the wrapper / activate                                                                       |
+| Backend gets `ECONNREFUSED` on every gRPC call                     | `XILINX_VITIS` points at the `vitis-server/` subdir, so the IDE bypasses the AMD wrapper -- point it at the unified root. |
+| `UnsatisfiedLinkError: no xv_common in java.library.path`          | Wrapper bypassed (so its `LD_LIBRARY_PATH` setup didn't run) or `lib/lnx64.o/` is missing from the install |
+| `Invalid workspace`                                                | Pass an existing dir to `-w`                                                                               |
+| IDE hangs at `Initializing the frontend client`                    | Server died -- check verbose log                                                                           |

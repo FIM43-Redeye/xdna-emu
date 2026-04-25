@@ -1,0 +1,840 @@
+[
+  {
+    "type": "Start",
+    "timer_value": 321015
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 816
+  },
+  {
+    "type": "Repeat",
+    "count": 1023
+  },
+  {
+    "type": "Repeat",
+    "count": 1023
+  },
+  {
+    "type": "Repeat",
+    "count": 720
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 136,
+    "pc": 816
+  },
+  {
+    "type": "Repeat",
+    "count": 7
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 136,
+    "pc": 816
+  },
+  {
+    "type": "Repeat",
+    "count": 6
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 336
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 350
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 352
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 354
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 356
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 800
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 804
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 808
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 810
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 32,
+    "pc": 812
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 814
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 136,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 368
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 374
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 378
+  },
+  {
+    "type": "Start",
+    "timer_value": 2825
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 498
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 500
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 832
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 836
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 840
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 842
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 72,
+    "pc": 844
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 846
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 810
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 48,
+    "pc": 812
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 814
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 144,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 544
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 550
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 558
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 32,
+    "pc": 812
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 64,
+    "pc": 844
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 712
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 832
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 836
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 840
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 842
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 72,
+    "pc": 844
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 846
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 314
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 316
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 318
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 320
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 322
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 800
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 804
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 808
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 32,
+    "pc": 812
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 32,
+    "pc": 812
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 64,
+    "pc": 844
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 498
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 500
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 832
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 836
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 840
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 842
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 72,
+    "pc": 844
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 846
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 810
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 48,
+    "pc": 812
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 814
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 144,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 544
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 550
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 558
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 32,
+    "pc": 812
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 64,
+    "pc": 844
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 712
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 832
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 836
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 840
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 842
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 72,
+    "pc": 844
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 846
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 8,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 314
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 316
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 318
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 320
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 322
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 800
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 804
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 808
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 32,
+    "pc": 812
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 32,
+    "pc": 812
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 64,
+    "pc": 844
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 64,
+    "pc": 844
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 810
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 48,
+    "pc": 812
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 814
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 144,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 544
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 550
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 558
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 32,
+    "pc": 812
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 64,
+    "pc": 844
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 64,
+    "pc": 844
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 314
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 316
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 318
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 320
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 322
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 800
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 804
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 808
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 32,
+    "pc": 812
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 32,
+    "pc": 812
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 64,
+    "pc": 844
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 64,
+    "pc": 844
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 808
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 810
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 48,
+    "pc": 812
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 814
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 144,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 544
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 550
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 32,
+    "pc": 812
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 816
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 64,
+    "pc": 844
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 64,
+    "pc": 844
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 128,
+    "pc": 848
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 746
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 750
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 754
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 758
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 762
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 766
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 770
+  },
+  {
+    "type": "EventPC",
+    "event_bits": 16,
+    "pc": 774
+  }
+]

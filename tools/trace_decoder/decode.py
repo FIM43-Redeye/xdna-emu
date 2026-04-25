@@ -40,7 +40,7 @@ from .frame import (
     TraceCommand,
     TraceMode,
 )
-from .modes import mode0
+from .modes import mode0, mode1
 from .packet import deinterleave_packets, trim_trailing_padding, words_to_bytes
 
 
@@ -56,14 +56,19 @@ def decode_words(words: Iterable[int], mode: TraceMode = TraceMode.EVENT_TIME):
 
     Returns a dict ``{(pkt_type, row, col): [TraceCommand, ...]}``.
 
-    Modes 1 and 2 are not yet implemented; passing them raises
-    NotImplementedError so callers fail fast rather than silently
-    decoding with the wrong opcode table.
+    Modes 0 (EVENT_TIME) and 1 (EVENT_PC) are supported.  Mode 2
+    (INST_EXEC) is not yet implemented and raises NotImplementedError so
+    callers fail fast rather than silently decoding with the wrong
+    opcode table.
     """
-    if mode != TraceMode.EVENT_TIME:
+    if mode == TraceMode.EVENT_TIME:
+        per_mode_decode = mode0.decode
+    elif mode == TraceMode.EVENT_PC:
+        per_mode_decode = mode1.decode
+    else:
         raise NotImplementedError(
             f"trace_decoder: mode {mode!r} not yet implemented "
-            "(only EVENT_TIME / mode 0 is supported in this iteration)"
+            "(EVENT_TIME and EVENT_PC supported in this iteration)"
         )
 
     word_list = list(words)
@@ -75,7 +80,7 @@ def decode_words(words: Iterable[int], mode: TraceMode = TraceMode.EVENT_TIME):
     commands: dict[tuple[int, int, int], list[TraceCommand]] = {}
     for key, payload_words in by_tile_words.items():
         bytes_ = words_to_bytes(payload_words)
-        commands[key] = list(mode0.decode(bytes_))
+        commands[key] = list(per_mode_decode(bytes_))
     return commands
 
 
@@ -181,6 +186,57 @@ def rebuild_timeline_mode0(
     return events
 
 
+def rebuild_timeline_mode1(
+    commands_per_tile: dict[tuple[int, int, int], list[TraceCommand]],
+    slot_names: dict[int, dict[str, list[str]]],
+) -> list[Event]:
+    """Walk per-tile mode-1 command lists and emit ``Event`` records.
+
+    EventCmd's ``cycles`` field carries the program counter rather than
+    a cycle delta; we surface it as the Event's ``ts`` so existing
+    consumers can still sort/group on a single scalar.  Sync and Start
+    have no PC contribution and are skipped.  Repeat expands the most
+    recent fire ``count`` times at the same PC -- in mode-1 traces this
+    corresponds to the same event firing for N cycles in a tight loop
+    that doesn't change the PC.
+    """
+    events: list[Event] = []
+    for (pkt_type, row, col), cmds in commands_per_tile.items():
+        prev_event: EventCmd | None = None
+        names_for_pt = slot_names.get(pkt_type, {})
+        slot_table = names_for_pt.get(f"{row},{col}", [""] * 8)
+
+        def _emit(ev: EventCmd) -> None:
+            for slot in range(8):
+                if ev.event_bits & (1 << slot):
+                    name = slot_table[slot] if slot < len(slot_table) else ""
+                    _emit_event(
+                        events,
+                        col=col,
+                        row=row,
+                        pkt_type=pkt_type,
+                        slot=slot,
+                        name=name,
+                        ts=ev.cycles,  # mode 1: ts carries PC
+                    )
+
+        for cmd in cmds:
+            if isinstance(cmd, EventCmd):
+                _emit(cmd)
+                prev_event = cmd
+                continue
+            if isinstance(cmd, RepeatCmd):
+                if prev_event is None:
+                    continue
+                for _ in range(cmd.count):
+                    _emit(prev_event)
+                continue
+            # Start, Sync, Stop carry no PC contribution in mode 1.
+
+    events.sort(key=lambda e: (e.col, e.row, e.pkt_type, e.ts, e.slot))
+    return events
+
+
 def parse_trace(
     trace_buffer,
     slot_names: dict[int, dict[str, list[str]]] | None = None,
@@ -205,6 +261,8 @@ def parse_trace(
         words = list(trace_buffer)
 
     commands = decode_words(words, mode=mode)
+    if mode == TraceMode.EVENT_PC:
+        return rebuild_timeline_mode1(commands, slot_names or {})
     return rebuild_timeline_mode0(commands, slot_names or {})
 
 
