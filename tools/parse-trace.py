@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-parse-trace.py -- Unified wrapper around mlir-aie's trace decoder.
+parse-trace.py -- Unified wrapper around the AIE trace decoders.
 
-Exposes every decoder layer the xdna-emu pipeline cares about, all fed by the
-same mlir-aie parse, so downstream tools never disagree about what the trace
-says:
+Exposes every decoder layer the xdna-emu pipeline cares about so downstream
+tools never disagree about what the trace says.  Two decoder backends are
+selectable via --decoder:
+
+  --decoder mlir-aie   (default) routes through aie.utils.trace.parse_trace
+  --decoder ours       routes through tools/trace_decoder/ (in-tree, MIT)
+
+Output formats:
 
   --out-events <path>    Flat per-tile event list (primary format).  Each
                          record: {col, row, pkt_type, slot, name, ts}.
@@ -48,6 +53,13 @@ def parse_args():
     p.add_argument("--out-cycles")
     p.add_argument("--out-perfetto")
     p.add_argument("--out-commands")
+    p.add_argument("--decoder", choices=("mlir-aie", "ours"), default="mlir-aie",
+                   help="byte-stream decoder backend. 'mlir-aie' (default) uses "
+                        "aie.utils.trace.parse_trace; 'ours' uses the in-tree "
+                        "tools/trace_decoder package. The 'ours' path supports "
+                        "--out-commands / --out-events / --out-cycles for "
+                        "EVENT_TIME (mode 0) traces; --out-perfetto remains "
+                        "mlir-aie-only until our timeline emits B/E pairs.")
     p.add_argument("--server", action="store_true",
                    help="run as a long-lived decode server. Reads one JSON "
                         "request per stdin line {trace_bin, xclbin_mlir, "
@@ -225,6 +237,199 @@ def _import_decoder():
     return np, parse_trace
 
 
+def _import_ours():
+    """Import the in-tree trace_decoder package.
+
+    Lives next to this script (tools/trace_decoder/), so we add the
+    parent directory to sys.path on first call.  Returns the package
+    module so callers can use trace_decoder.decode_words /
+    trace_decoder.parse_trace directly.
+    """
+    import importlib
+    import os
+    import sys as _sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in _sys.path:
+        _sys.path.insert(0, here)
+    return importlib.import_module("trace_decoder")
+
+
+def _slot_names_from_mlir(mlir_text):
+    """Extract per-tile slot-name tables by delegating to mlir-aie.
+
+    Returns a dict ``{pkt_type_int: {"row,col": [name0..name7]}}`` that
+    matches the shape ``trace_decoder.parse_trace`` expects.
+
+    We use mlir-aie's ``parse_mlir_trace_events`` because MLIR parsing
+    is squarely in the mlir-aie toolchain's domain (and mlir-aie is
+    open source, so this is not the dependency we are trying to avoid
+    -- aietools is).  Slot codes are translated to event names via
+    ``lookup_event_name_by_type`` for the same reason.
+    """
+    from aie.utils.trace.parse import (
+        parse_mlir_trace_events,
+        lookup_event_name_by_type,
+    )
+    pid_events, events_module = parse_mlir_trace_events(mlir_text, None)
+    slot_names = {}
+    for pkt_type, by_loc in enumerate(pid_events):
+        if not by_loc:
+            continue
+        slot_names[pkt_type] = {}
+        for loc, codes in by_loc.items():
+            slot_names[pkt_type][loc] = [
+                lookup_event_name_by_type(pkt_type, code, events_module)
+                for code in codes[:8]
+            ]
+    return slot_names
+
+
+def decode_one_ours(np_mod, td_mod,
+                    trace_bin: str, xclbin_mlir: str,
+                    out_events: str = None, out_cycles: str = None,
+                    out_perfetto: str = None, out_commands: str = None) -> dict:
+    """Decode a single trace using the in-tree decoder backend.
+
+    Mirrors the public surface of ``decode_one`` but routes through
+    ``trace_decoder``.  Output formats supported:
+
+      --out-commands   per-tile typed-command JSON (Start/Single/Multiple/
+                       Repeat/Event_Sync), shape-compatible with the
+                       mlir-aie path.
+      --out-events     flat event list ({col, row, pkt_type, slot, name,
+                       ts}), bit-equivalent to the mlir-aie path on mode 0.
+      --out-cycles     scalar max(ts) - min(ts) over emitted events.
+
+    --out-perfetto is rejected: producing Perfetto B/E pairs requires
+    the active-event tracking we have not ported yet.  Use the
+    'mlir-aie' decoder for Perfetto output until that lands.
+    """
+    if out_perfetto:
+        raise ValueError(
+            "--decoder=ours does not yet support --out-perfetto; "
+            "use --decoder=mlir-aie for Perfetto output"
+        )
+
+    raw = np_mod.fromfile(trace_bin, dtype=np_mod.uint32)
+    words = raw.tolist()
+
+    if out_commands:
+        commands_per_tile = td_mod.decode_words(words, mode=td_mod.TraceMode.EVENT_TIME)
+        # Reshape into the mlir-aie-compatible output: trace_types[pkt_type][f"{row},{col}"] = [...]
+        max_pt = max((pt for (pt, _, _) in commands_per_tile), default=-1)
+        trace_types = [dict() for _ in range(max(4, max_pt + 1))]
+        for (pt, r, c), cmds in commands_per_tile.items():
+            trace_types[pt][f"{r},{c}"] = [_cmd_to_oracle_dict(cmd) for cmd in cmds]
+        Path(out_commands).write_text(json.dumps({"trace_types": trace_types}, indent=2))
+
+    flat = []
+    cycles = None
+    if out_events or out_cycles:
+        slot_names = {}
+        if xclbin_mlir:
+            mlir_text = Path(xclbin_mlir).read_text()
+            slot_names = _slot_names_from_mlir(mlir_text)
+        events = td_mod.parse_trace(words, slot_names=slot_names,
+                                    mode=td_mod.TraceMode.EVENT_TIME)
+        flat = [
+            {
+                "col": e.col,
+                "row": e.row,
+                "pkt_type": e.pkt_type,
+                "slot": e.slot,
+                "name": e.name,
+                "ts": e.ts,
+            }
+            for e in events
+        ]
+        flat.sort(key=lambda r: (r["col"], r["row"], r["pkt_type"], r["ts"]))
+        if flat:
+            cycles = max(e["ts"] for e in flat) - min(e["ts"] for e in flat)
+
+    if out_events:
+        # The mlir-aie path emits a slot_names structure here too; we
+        # reuse the same one we used internally so downstream consumers
+        # can render slot indices to names without re-reading the MLIR.
+        slot_names_named = _slot_names_for_output(slot_names if (out_events and xclbin_mlir) else {})
+        Path(out_events).write_text(
+            json.dumps({
+                "schema_version": 1,
+                "events": flat,
+                "slot_names": slot_names_named,
+            }, indent=2)
+        )
+    if out_cycles:
+        Path(out_cycles).write_text(f"{cycles or 0}\n")
+
+    return {
+        "ok": True,
+        "events_count": len(flat),
+        "cycles": cycles,
+        "empty": (out_events or out_cycles) and not flat,
+    }
+
+
+def _cmd_to_oracle_dict(cmd) -> dict:
+    """Convert a typed TraceCommand to the mlir-aie convert_to_commands
+    output shape, so --decoder=ours --out-commands stays drop-in.
+
+    The size-variant distinction (Single0 vs Single1 vs Single2, etc.)
+    is encoder-side and not preserved by our schema; we use the variant
+    suffix that minimally encodes the cycles field, matching what
+    mlir-aie's encoder would have chosen for the same byte stream.
+    """
+    type_name = type(cmd).__name__
+    if type_name == "StartCmd":
+        return {"type": "Start", "timer_value": cmd.timer_value}
+    if type_name == "SyncCmd":
+        return {"type": "Event_Sync"}
+    if type_name == "RepeatCmd":
+        suffix = "0" if cmd.count < 16 else "1"
+        return {"type": f"Repeat{suffix}", "repeats": cmd.count}
+    if type_name == "EventCmd":
+        bits_set = bin(cmd.event_bits).count("1")
+        if bits_set == 1:
+            slot = (cmd.event_bits & -cmd.event_bits).bit_length() - 1
+            if cmd.cycles < 16:
+                suffix = "0"
+            elif cmd.cycles < 1024:
+                suffix = "1"
+            else:
+                suffix = "2"
+            return {"type": f"Single{suffix}", "event": slot, "cycles": cmd.cycles}
+        if cmd.cycles < 16:
+            suffix = "0"
+        elif cmd.cycles < 1024:
+            suffix = "1"
+        else:
+            suffix = "2"
+        out = {"type": f"Multiple{suffix}", "cycles": cmd.cycles}
+        for i in range(8):
+            if cmd.event_bits & (1 << i):
+                out[f"event{i}"] = i
+        return out
+    raise AssertionError(f"unknown command type: {type_name}")
+
+
+def _slot_names_for_output(slot_names_internal):
+    """Reshape internal slot_names ({pkt_type: {loc: [names]}}) into the
+    output shape mlir-aie's parse-trace.py emits ({"core"/"mem"/"shim"/
+    "memtile": [name0..name7]}), aggregating across tiles of the same
+    type.  First non-empty wins per slot.
+    """
+    pt_code_to_key = {0: "core", 1: "mem", 2: "shim", 3: "memtile"}
+    result = {k: [""] * 8 for k in pt_code_to_key.values()}
+    for pkt_type, by_loc in slot_names_internal.items():
+        key = pt_code_to_key.get(pkt_type)
+        if key is None:
+            continue
+        for _loc, names in by_loc.items():
+            for slot, name in enumerate(names[:8]):
+                if name and not result[key][slot]:
+                    result[key][slot] = name
+    return result
+
+
 def decode_one(np_mod, parse_trace_fn,
                trace_bin: str, xclbin_mlir: str,
                out_events: str = None, out_cycles: str = None,
@@ -296,7 +501,8 @@ def decode_one(np_mod, parse_trace_fn,
     }
 
 
-def server_loop(np_mod, parse_trace_fn) -> int:
+def server_loop(np_mod, parse_trace_fn, td_mod=None,
+                default_decoder="mlir-aie") -> int:
     """Long-lived decode loop. One JSON request per stdin line; one JSON
     response per stdout line. Stdin EOF exits cleanly.
 
@@ -304,6 +510,11 @@ def server_loop(np_mod, parse_trace_fn) -> int:
     initialization) dominates a per-batch sweep; running 32 batches as
     32 fresh interpreters wastes ~20 s on imports alone. With the server
     mode, the sweep spawns one decoder process and reuses it.
+
+    Per-request override: include ``"decoder": "ours"`` or
+    ``"decoder": "mlir-aie"`` in the JSON request to override the
+    server's default backend on a per-call basis (defaults to whatever
+    was passed to ``--decoder`` at server startup).
     """
     import time as _t
     print(json.dumps({"event": "ready"}), flush=True)
@@ -320,16 +531,36 @@ def server_loop(np_mod, parse_trace_fn) -> int:
                   flush=True)
             continue
         t0 = _t.monotonic()
+        decoder = req.get("decoder", default_decoder)
+        if decoder == "ours" and td_mod is None:
+            try:
+                td_mod = _import_ours()
+            except ImportError as e:
+                print(json.dumps({"ok": False,
+                                  "error": f"trace_decoder import failed: {e}"}),
+                      flush=True)
+                continue
         try:
-            result = decode_one(
-                np_mod, parse_trace_fn,
-                trace_bin=req["trace_bin"],
-                xclbin_mlir=req["xclbin_mlir"],
-                out_events=req.get("out_events"),
-                out_cycles=req.get("out_cycles"),
-                out_perfetto=req.get("out_perfetto"),
-                out_commands=req.get("out_commands"),
-            )
+            if decoder == "ours":
+                result = decode_one_ours(
+                    np_mod, td_mod,
+                    trace_bin=req["trace_bin"],
+                    xclbin_mlir=req["xclbin_mlir"],
+                    out_events=req.get("out_events"),
+                    out_cycles=req.get("out_cycles"),
+                    out_perfetto=req.get("out_perfetto"),
+                    out_commands=req.get("out_commands"),
+                )
+            else:
+                result = decode_one(
+                    np_mod, parse_trace_fn,
+                    trace_bin=req["trace_bin"],
+                    xclbin_mlir=req["xclbin_mlir"],
+                    out_events=req.get("out_events"),
+                    out_cycles=req.get("out_cycles"),
+                    out_perfetto=req.get("out_perfetto"),
+                    out_commands=req.get("out_commands"),
+                )
         except KeyError as e:
             print(json.dumps({"ok": False,
                               "error": f"missing request key: {e}"}),
@@ -356,18 +587,43 @@ def main():
         )
         return 1
 
-    if args.server:
-        return server_loop(np_mod, parse_trace_fn)
+    td_mod = None
+    if args.decoder == "ours":
+        try:
+            td_mod = _import_ours()
+        except ImportError as e:
+            print(f"error: in-tree trace_decoder not importable: {e}",
+                  file=sys.stderr)
+            return 1
 
-    result = decode_one(
-        np_mod, parse_trace_fn,
-        trace_bin=args.trace_bin,
-        xclbin_mlir=args.xclbin_mlir,
-        out_events=args.out_events,
-        out_cycles=args.out_cycles,
-        out_perfetto=args.out_perfetto,
-        out_commands=args.out_commands,
-    )
+    if args.server:
+        return server_loop(np_mod, parse_trace_fn, td_mod=td_mod,
+                           default_decoder=args.decoder)
+
+    if args.decoder == "ours":
+        try:
+            result = decode_one_ours(
+                np_mod, td_mod,
+                trace_bin=args.trace_bin,
+                xclbin_mlir=args.xclbin_mlir,
+                out_events=args.out_events,
+                out_cycles=args.out_cycles,
+                out_perfetto=args.out_perfetto,
+                out_commands=args.out_commands,
+            )
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+    else:
+        result = decode_one(
+            np_mod, parse_trace_fn,
+            trace_bin=args.trace_bin,
+            xclbin_mlir=args.xclbin_mlir,
+            out_events=args.out_events,
+            out_cycles=args.out_cycles,
+            out_perfetto=args.out_perfetto,
+            out_commands=args.out_commands,
+        )
     if result.get("empty") and args.out_cycles:
         # CLI mode preserves the old hard-failure behavior on empty
         # trace + --out-cycles; tools rely on the exit code today.

@@ -241,13 +241,53 @@ Other library symbols hint at the decode internals:
   ofstream&)` -- the `bitset<32>` strongly implies 32-bit-word-
   aligned frame headers
 
-**Path forward:** the library is dynamically loadable. We can
-either (a) link our parser to it via dlopen + the public C++ API,
-treating it as the authoritative oracle without copying anything,
-or (b) write our own decoder informed by the frame taxonomy and
-test it against the oracle's output as a fixture. Option (a) gets
-us correct decoding immediately; option (b) gives us a portable
-decoder we can ship in xdna-emu without an aietools dependency.
+**Path forward:** write our own decoder informed by the frame
+taxonomy and the adf::Trace API contract (below) and validate
+against the open-source mode-0 oracle (mlir-aie's parse_trace).
+We will *not* link aietools at runtime -- aietools' licensing
+posture is too ambiguous for a runtime dependency. Read for
+understanding, ship original code.
+
+#### adf::Trace::TraceDecoder API contract (read-only reference)
+
+A second decoder library `lib/lnx64.o/libevent_trace_decoder.so`
+(distinct from the Synopsys cardano `libxv_trace_decoder_opt.so`,
+this one is in the AMD `adf::Trace::` namespace) directly maps the
+mode-0/mode-1 surface we care about. Symbol-table inspection only;
+no code or strings copied:
+
+| Method (signature, demangled)                                                | What it tells us |
+|------------------------------------------------------------------------------|------------------|
+| `TraceDecoder::decodePacket(uint8_t (&buf)[8], uint pkt_index)`              | The byte-stream reader works on 8-byte windows -- consistent with mode-0 frame opcodes that range 1..8 bytes (Single*, Multiple*, Start, Repeat*) |
+| `TraceDecoder::processStart(col, row, module_type, Module*, bool, trace_mode, uint64 ts)` | Start frame carries a 64-bit timer value AND the trace_mode -- so the same frame layout serves all modes; the mode dictates which event-handlers fire after |
+| `TraceDecoder::processStop(..., uint ts)`                                    | Stop is timestamped |
+| `TraceDecoder::processSync(...)`                                             | Sync resyncs the decoder; carries no payload (inferred from no extra arg) |
+| `TraceDecoder::processRepeat(..., uint count)`                               | Run-length compression frame |
+| `TraceDecoder::processAssertedEvents(..., bitset<8>, uint cycles_or_ts)`     | **Mode 0 (EVENT_TIME)**: 8-bit event mask + cycle delta |
+| `TraceDecoder::processEventPC(..., bitset<8>, uint pc)`                      | **Mode 1 (EVENT_PC)**: same 8-bit event mask but with PC value instead of cycles |
+| `TraceDecoder::processEventPCStop(...)`                                      | Mode-1 specific stop variant -- mode-1 has its own end-of-trace marker |
+| `FileOutputTraceDecoder::streamOutDecodedTimeEvent(col, row, mod_type, ?, ?, event_status, uint64)` | Mode-0 emit: 7 fields incl. event_status |
+| `FileOutputTraceDecoder::streamOutDecodedPCEvent(col, row, mod_type, ?, ?, uint)` | Mode-1 emit: 6 fields, no event_status, but a uint PC field |
+
+**Key inference**: modes 0 and 1 share the same encoder framework
+(Start, Stop, Sync, Repeat all common; bitset<8> event-mask format
+common). The single difference is the secondary value attached to
+each event-firing record: cycles in mode 0, PC in mode 1. Mode 1's
+own stop marker (`processEventPCStop`) suggests the per-mode header
+discriminator (`f0`/`f1`) tells the decoder which terminal opcode
+to expect.
+
+**For implementation purposes**: build mode-0 fully (validated
+against mlir-aie's parse_trace), then mode-1 reuses Start/Stop/
+Sync/Repeat verbatim and replaces the cycle-encoded Single*/Multiple*
+opcodes with PC-encoded variants. Empirical bytes diff (mode-0 vs
+mode-1 of the same kernel) will localise the new opcodes.
+
+**Mode 2 (INST_EXEC)** is a separate beast handled by
+`libxv_trace_decoder_opt.so` (cardano::Trace, Synopsys-copyrighted)
+-- the Execution_E_atom / Execution_New_PC frame taxonomy described
+above. Cardano is the reference for mode 2 only; libevent doesn't
+cover it.
 
 **Quick win available:** even without parsing every frame type, we
 can bucket-count frame headers in a captured trace to verify our
