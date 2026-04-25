@@ -47,9 +47,9 @@ End-to-end validation of the trace-diff-based cycle budget pipeline
 | `add_one_using_dma` | peano | 0 | 0 | — | EMPTY | Same. |
 | `cascade_flows` | chess | 9 | 0 | — | **EMU_TRACE_BUG** | HW captures 9-cycle span (degenerate per Phase B Limitation 2: only 2 timestamped events total, across 2 tiles); EMU captures *nothing*. EMU-side trace-unit behavior on cascade configurations is a real gap. |
 | `cascade_flows` | peano | — | — | — | (SKIP compiler) | Chess-only test. |
-| `column_specific` | chess | — | — | — | NO_DATA | No `aie.mlir` (uses `aie2.py` generator); trace inject silently skipped. Phase B Limitation 3. |
+| `column_specific` | chess | — | — | — | NO_DATA | No `aie.mlir` (uses `aie2.py` generator); trace inject silently skipped. Phase B Limitation 3. **Update 2026-04-25:** classifier now reports `NO_CORE` correctly -- traced MLIR is generated, but the test is DMA-only (no `aie.core`), so trace events cannot fire by design. Not a bug; just expected silence. |
 | `column_specific` | peano | — | — | — | NO_DATA | Same. |
-| `ctrl_packet_reconfig` | chess | — | — | — | NO_DATA | `insts.bin` not present (test uses `aie_run_seq.bin` + `ctrlpkt.bin` convention); cycle pipeline needs a code-path for this. |
+| `ctrl_packet_reconfig` | chess | — | — | — | NO_DATA | `insts.bin` not present (test uses `aie_run_seq.bin` + `ctrlpkt.bin` convention); cycle pipeline needs a code-path for this. **Update 2026-04-25:** discovery is now correct (`_discover_instr_binary` returns `aie_run_seq.bin`, `_discover_ctrlpkt_binary` returns `ctrlpkt.bin`), but `bridge-trace-runner` doesn't apply the ctrlpkt before submitting the run sequence. test.exe directly under EMU completes in 46828 cycles; bridge-runner fails on both sides. Tracked as a runner bug -- see `docs/superpowers/findings/2026-04-25-ctrl-packet-reconfig-bridge-runner.md`. |
 | `ctrl_packet_reconfig` | peano | — | — | — | NO_DATA | Same. |
 
 ## Aggregate
@@ -130,12 +130,14 @@ if control-packet tests become interesting cycle targets.
 
 ## Tuning opportunities surfaced
 
-- **`EMU_SECONDS_PER_CYCLE = 1e-3` is still un-calibrated.** Real
-  wall-clock numbers from this batch were not collected (tests
-  dominated by compile + HW reset overhead, not EMU sim time). A
-  calibration pass using `vector_scalar_using_dma` alone (`time` +
-  `XDNA_EMU_STATUS` cycles) would give the first empirical value.
-  Defer.
+- **`EMU_SECONDS_PER_CYCLE` calibration: closed (2026-04-25).** The
+  Phase E doc was looking at the stale `1e-3` value; the current value
+  in `scripts/emu-bridge-test.sh` is `2e-9` (500 MHz sim rate), which
+  is reasonable. Per A.5 findings
+  (`docs/superpowers/findings/2026-04-25-cycle-accumulator-status.md`),
+  this constant is a wallclock-timeout parameter, not a cycle-diff
+  parameter, and the 600s floor dominates for any test under ~300 G
+  cycles, so further calibration is not warranted.
 - **Default ratio bounds `[0.5, 2.0]` are not exercised by this batch.**
   The only matched test gave ratio 1.00 (EMU=41176, HW=41181 — 0.012%
   drift). We have no data on how tight these bounds should be for other
