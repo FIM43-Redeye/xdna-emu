@@ -65,12 +65,38 @@ on-tile events. Future direction: try anchoring on PERF_CNT events
 precise on-tile bound, or use this as evidence that the broadcast bound
 is the right default and shift focus to calibrating the residual.
 
-PC-trace mode (`XAIE_TRACE_EVENT_PC`) and instruction-execution mode
-(`XAIE_TRACE_INST_EXEC`) remain unexplored. Available via the same
-`--mode` flag on the patcher.
+PC-trace mode (`XAIE_TRACE_EVENT_PC`, mode=1) remains unexplored.
 
-**Status:** patcher landed; default behavior validated as a strong
-baseline. Iterate from here.
+**Mode 2 (XAIE_TRACE_INST_EXEC) finding (2026-04-24).** Patched
+add_one_objFifo to `--mode 2` and ran 5 same-batch iterations under
+hwctx reuse. The mode-2 trace decodes via
+`tools/trace-mode-tests/decode_trace_experiment.py` into:
+
+- a 16-bit `sync_pc` (PC at trace start)
+- an "atom string" of E/N characters (one per instruction-slot cycle:
+  `E` = instruction executed, `N` = no-execute / stall)
+- an embedded events list (slot_idx, atom_position) pairs
+
+**Result: atom strings are bit-identical across all 5 iterations**
+(SHA-256 prefix `b831a004`, 128 atoms), even though mode-0 traces of
+the same kernel show ~7% cycle-span variance in their timestamps. The
+*execution flow* is fully deterministic; the variance lives entirely
+in the trace's timestamp-encoding layer, not in what the core does.
+
+Anomaly worth noting: `sync_pc` alternates between 0x0330 and 0x00CC
+across iterations (even iters: 0x0330, odd: 0x00CC), and event counts
+alternate 16/21. The atoms don't change. Hypothesis: hwctx-reuse
+preserves some state bit that flips per run, shifting where the trace
+state machine syncs but not the underlying execution. Worth a deeper
+look but not blocking.
+
+**This makes mode 2 the right baseline for the sequence-skeleton
+extractor.** The atom string IS the skeleton; the embedded events are
+the wobblers. No timestamp arithmetic needed.
+
+**Status:** patcher landed; mode 0 stable for event counts, mode 2
+fully deterministic for execution flow. Sequence-skeleton tooling
+should build on mode 2.
 
 ### 2. Performance counters with start/stop/reset events
 
@@ -81,24 +107,51 @@ XAie_PerfCounterControlSet(DevInst, Loc, Module, Counter,
                            StartEvent, StopEvent)
 XAie_PerfCounterResetControlSet(DevInst, Loc, Module, Counter, ResetEvent)
 XAie_PerfCounterEventValueSet(...)   // threshold trigger
-XAie_PerfCounterGet(...)
+XAie_PerfCounterGet(...)             // host-side register read
 ```
 
-Four 32-bit counters per tile, each with independent start, stop, and reset
-events. A counter started on EVENT_A and stopped on EVENT_B gives a
-cycle-exact span across runs -- no timestamp arithmetic, no drift
-accumulation.
+Four 32-bit counters per tile (core: 0x31500 control block, 0x31520 value,
+0x31580 threshold). Each counts cycles while in the "armed" state
+(armed by start_event, disarmed by stop_event). When the count hits the
+threshold, fires `PERF_CNT_N` event.
 
-**This is the cleanest mechanism for "cycles between two marker events."**
-It would directly answer "is the wobble in the prelude, the body, or the
-postlude?" by partitioning the run into perfcnt-bounded segments.
+**Hard constraint discovered (2026-04-24):** the NPU instruction set
+exposed by XRT (`Write32`, `MaskWrite`, `MaskPoll`) has no `Read32` op,
+so we cannot read counter values back to host through the runtime
+sequence. The only way to surface a perfcnt measurement in our XRT
+path is via the `PERF_CNT_N` event into the trace.
 
-There is also a separate **MDM (Microcode DMA) performance counter** API
-(`XAie_MdmPerfCounterStart/Stop/Sample/Get`) that exposes DMA latency
-distribution. Worth exploring once we want to attribute drift specifically
-to DMA timing.
+Trace timestamps and perfcnt both run off the same 64-bit free-running
+timer, so perfcnt-via-trace is **not** an independent cycle source --
+it gives us the same timestamps the trace already captures.
 
-**Status:** doable today. Would pair naturally with lead #1.
+What perfcnt-via-trace *can* still buy us:
+
+1. **Deterministic trace stop**: route `PERF_CNT_0` to Trace_Control0's
+   stop_event slot, with perfcnt configured to fire at threshold N
+   cycles after BROADCAST_15. This replaces the host-fired BROADCAST_14
+   (variable latency) with a tile-internal "exactly N cycles after
+   start" stop. Useful for fixed-window captures.
+2. **Periodic timing markers**: small threshold (e.g., 100), with
+   counter not auto-resetting -- fires `PERF_CNT_0` every 100 cycles,
+   gives us cycle-stride markers in the trace.
+3. **Threshold-as-bound check**: set threshold to expected cycle count;
+   trace shows PERF_CNT firing iff actual count met threshold. Useful
+   for asserting "the body took ≥N cycles."
+
+**Implementation hurdle:** existing insts.bin doesn't write to perfcnt
+registers, and CDO preamble doesn't either (verified by scanning init
+and enable blobs). To enable perfcnt we'd need to *insert* new Write32
+ops into insts.bin (header has `num_ops` and `total_size` fields that
+must be updated), or compile perfcnt config into the source MLIR.
+
+**MDM (Microcode DMA) performance counters** are a separate set
+(`XAie_MdmPerfCounterStart/Stop/Sample/Get`) that may be readable
+differently -- not yet investigated.
+
+**Status:** scoped down. Worth implementing the insert-ops capability
+in the patcher when we need a fixed-window trace, but no longer the
+"independent ground truth" the lead originally promised.
 
 ### 3. Event broadcast + directional blocking
 
