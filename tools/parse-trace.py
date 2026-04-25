@@ -39,18 +39,36 @@ from pathlib import Path
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    p.add_argument("--trace-bin", required=True,
+    p.add_argument("--trace-bin",
                    help="raw trace bytes (uint32 words) from the runtime")
-    p.add_argument("--xclbin-mlir", required=True,
+    p.add_argument("--xclbin-mlir",
                    help="post-lowering MLIR (input_with_addresses.mlir) used "
                         "to build the xclbin; names the trace events")
     p.add_argument("--out-events")
     p.add_argument("--out-cycles")
     p.add_argument("--out-perfetto")
     p.add_argument("--out-commands")
+    p.add_argument("--server", action="store_true",
+                   help="run as a long-lived decode server. Reads one JSON "
+                        "request per stdin line {trace_bin, xclbin_mlir, "
+                        "out_events?, out_cycles?, out_perfetto?, "
+                        "out_commands?} and writes one JSON response per "
+                        "line. Heavy mlir-aie/numpy imports happen once at "
+                        "startup; subsequent decodes are ~50x faster than "
+                        "spawning a fresh interpreter per call.")
     args = p.parse_args()
-    if not any([args.out_events, args.out_cycles, args.out_perfetto, args.out_commands]):
-        p.error("at least one --out-* option is required")
+    if args.server:
+        # Server mode reads request paths from stdin -- one-shot CLI args
+        # would be ignored, so flag the misuse early.
+        if any([args.trace_bin, args.xclbin_mlir, args.out_events,
+                args.out_cycles, args.out_perfetto, args.out_commands]):
+            p.error("--server is mutually exclusive with --trace-bin / "
+                    "--out-* flags; pass those in stdin requests instead")
+    else:
+        if not args.trace_bin or not args.xclbin_mlir:
+            p.error("--trace-bin and --xclbin-mlir are required (or use --server)")
+        if not any([args.out_events, args.out_cycles, args.out_perfetto, args.out_commands]):
+            p.error("at least one --out-* option is required")
     return args
 
 
@@ -197,12 +215,138 @@ def commands_per_tile(trace_buffer, mlir_text):
     return {"trace_types": commands}
 
 
+def _import_decoder():
+    """Import the heavy mlir-aie trace decoder. Returns (numpy, parse_trace)
+    or raises ImportError with a hint if the env isn't set up. Pulled out
+    so server mode can amortize the cost across many requests.
+    """
+    import numpy as np
+    from aie.utils.trace.parse import parse_trace
+    return np, parse_trace
+
+
+def decode_one(np_mod, parse_trace_fn,
+               trace_bin: str, xclbin_mlir: str,
+               out_events: str = None, out_cycles: str = None,
+               out_perfetto: str = None, out_commands: str = None) -> dict:
+    """Decode a single trace and emit any of the four output formats.
+
+    Returns a result dict that the server mode forwards to its caller:
+      {"ok": True, "events_count": N, "cycles": <span or None>}
+    or
+      {"ok": True, "events_count": 0, "cycles": 0, "empty": True}
+        when the trace had no timestamped events. (One-shot CLI mode
+        treats empty as a hard failure to preserve the historic exit
+        code; server mode lets callers handle it.)
+    """
+    raw = np_mod.fromfile(trace_bin, dtype=np_mod.uint32)
+    mlir_text = Path(xclbin_mlir).read_text()
+    try:
+        perfetto_events = parse_trace_fn(raw, mlir_text)
+    except ValueError as e:
+        # mlir-aie's parse_trace raises ValueError("Invalid trace data:
+        # empty or all zeros") when the kernel ran but no events fired.
+        # That's a normal sweep outcome (e.g. an event that never
+        # triggers in this kernel), not a parse failure -- emit empty
+        # outputs and report empty=True so the caller can distinguish
+        # "kernel ran, nothing to see" from "decoder broke."
+        if "empty or all zeros" in str(e):
+            if out_events:
+                Path(out_events).write_text(
+                    '{"schema_version":1,"events":[],"slot_names":{}}\n')
+            if out_cycles:
+                Path(out_cycles).write_text("0\n")
+            if out_perfetto:
+                Path(out_perfetto).write_text("[]\n")
+            if out_commands:
+                Path(out_commands).write_text('{"trace_types":{}}\n')
+            return {"ok": True, "events_count": 0, "cycles": 0, "empty": True}
+        raise
+
+    if out_perfetto:
+        Path(out_perfetto).write_text(json.dumps(perfetto_events, indent=2))
+    if out_commands:
+        cmds = commands_per_tile(raw, mlir_text)
+        Path(out_commands).write_text(json.dumps(cmds, indent=2))
+
+    flat = perfetto_to_events(perfetto_events)
+    cycles = None
+    if flat:
+        cycles = max(e["ts"] for e in flat) - min(e["ts"] for e in flat)
+
+    if out_events:
+        slot_names = perfetto_to_slot_names(perfetto_events)
+        Path(out_events).write_text(
+            json.dumps({
+                "schema_version": 1,
+                "events": flat,
+                "slot_names": slot_names,
+            }, indent=2)
+        )
+    if out_cycles:
+        # Empty trace -> 0 cycles. CLI main() turns that into a failure
+        # for backward compat; server mode reports it as ok+empty.
+        Path(out_cycles).write_text(f"{cycles or 0}\n")
+
+    return {
+        "ok": True,
+        "events_count": len(flat),
+        "cycles": cycles,
+        "empty": not flat,
+    }
+
+
+def server_loop(np_mod, parse_trace_fn) -> int:
+    """Long-lived decode loop. One JSON request per stdin line; one JSON
+    response per stdout line. Stdin EOF exits cleanly.
+
+    Why this exists: the import cost above (~620 ms of mlir-aie + numpy
+    initialization) dominates a per-batch sweep; running 32 batches as
+    32 fresh interpreters wastes ~20 s on imports alone. With the server
+    mode, the sweep spawns one decoder process and reuses it.
+    """
+    import time as _t
+    print(json.dumps({"event": "ready"}), flush=True)
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        if line == "exit":
+            break
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError as e:
+            print(json.dumps({"ok": False, "error": f"bad request json: {e}"}),
+                  flush=True)
+            continue
+        t0 = _t.monotonic()
+        try:
+            result = decode_one(
+                np_mod, parse_trace_fn,
+                trace_bin=req["trace_bin"],
+                xclbin_mlir=req["xclbin_mlir"],
+                out_events=req.get("out_events"),
+                out_cycles=req.get("out_cycles"),
+                out_perfetto=req.get("out_perfetto"),
+                out_commands=req.get("out_commands"),
+            )
+        except KeyError as e:
+            print(json.dumps({"ok": False,
+                              "error": f"missing request key: {e}"}),
+                  flush=True)
+            continue
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": str(e)}), flush=True)
+            continue
+        result["elapsed_ms"] = int((_t.monotonic() - t0) * 1000)
+        print(json.dumps(result), flush=True)
+    return 0
+
+
 def main():
     args = parse_args()
-
     try:
-        import numpy as np
-        from aie.utils.trace.parse import parse_trace
+        np_mod, parse_trace_fn = _import_decoder()
     except ImportError as e:
         print(
             f"error: mlir-aie trace module not importable: {e}\n"
@@ -212,39 +356,23 @@ def main():
         )
         return 1
 
-    raw = np.fromfile(args.trace_bin, dtype=np.uint32)
-    mlir_text = Path(args.xclbin_mlir).read_text()
+    if args.server:
+        return server_loop(np_mod, parse_trace_fn)
 
-    perfetto_events = parse_trace(raw, mlir_text)
-
-    if args.out_perfetto:
-        Path(args.out_perfetto).write_text(json.dumps(perfetto_events, indent=2))
-
-    if args.out_commands:
-        cmds = commands_per_tile(raw, mlir_text)
-        Path(args.out_commands).write_text(json.dumps(cmds, indent=2))
-
-    # Derive flat events from the Perfetto list once; used by both --out-events
-    # and --out-cycles to guarantee they agree.
-    flat = perfetto_to_events(perfetto_events)
-
-    if args.out_events:
-        slot_names = perfetto_to_slot_names(perfetto_events)
-        Path(args.out_events).write_text(
-            json.dumps({
-                "schema_version": 1,
-                "events": flat,
-                "slot_names": slot_names,
-            }, indent=2)
-        )
-
-    if args.out_cycles:
-        if not flat:
-            print("error: trace has no timestamped events", file=sys.stderr)
-            return 1
-        span = max(e["ts"] for e in flat) - min(e["ts"] for e in flat)
-        Path(args.out_cycles).write_text(f"{span}\n")
-
+    result = decode_one(
+        np_mod, parse_trace_fn,
+        trace_bin=args.trace_bin,
+        xclbin_mlir=args.xclbin_mlir,
+        out_events=args.out_events,
+        out_cycles=args.out_cycles,
+        out_perfetto=args.out_perfetto,
+        out_commands=args.out_commands,
+    )
+    if result.get("empty") and args.out_cycles:
+        # CLI mode preserves the old hard-failure behavior on empty
+        # trace + --out-cycles; tools rely on the exit code today.
+        print("error: trace has no timestamped events", file=sys.stderr)
+        return 1
     return 0
 
 

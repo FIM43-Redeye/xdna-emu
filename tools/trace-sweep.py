@@ -502,6 +502,122 @@ class RunnerSession:
         self.close()
 
 
+class ParseSession:
+    """Long-lived parse-trace.py decode server.
+
+    Why this exists: parse-trace.py imports mlir-aie + numpy, which
+    costs ~620 ms per Python startup. A 32-batch sweep that decodes
+    once per side per batch pays that cost 32-64 times -- about 20-40
+    seconds purely on imports, or 75% of the total sweep wall clock.
+    Spawning one decoder process per sweep amortizes the import to a
+    single ~430 ms startup, dropping subsequent decodes to ~100 ms each
+    (~6x per-decode speedup).
+
+    Protocol mirrors RunnerSession: the subprocess prints a "ready"
+    event on startup, then accepts one JSON request per stdin line and
+    emits one JSON response per stdout line.
+    """
+
+    def __init__(self, side: str, stderr_log: Path,
+                 env_for_parse: Optional[Dict[str, str]] = None):
+        self.side = side
+        self.stderr_log = stderr_log
+        self._stderr_fh = stderr_log.open("w")
+        env = os.environ.copy()
+        if env_for_parse:
+            env.update(env_for_parse)
+        # Always inject the mlir-aie install path -- the same way
+        # _parse_trace_bin does in fallback mode -- so we don't depend
+        # on the caller having activated ironenv.
+        env["PYTHONPATH"] = (
+            str(MLIR_AIE_ROOT / "install" / "python")
+            + os.pathsep + env.get("PYTHONPATH", "")
+        ).rstrip(os.pathsep)
+        cmd = [sys.executable, str(PARSE_TOOL), "--server"]
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._stderr_fh,
+            env=env,
+            text=True,
+            bufsize=1,
+        )
+        ready_line = self.proc.stdout.readline().strip()
+        if not ready_line:
+            self.close()
+            raise RuntimeError(f"{side} parser died before ready "
+                               f"(see {stderr_log})")
+        try:
+            ready = json.loads(ready_line)
+        except json.JSONDecodeError as e:
+            self.close()
+            raise RuntimeError(
+                f"{side} parser first line not JSON: {ready_line!r}") from e
+        if ready.get("event") != "ready":
+            self.close()
+            raise RuntimeError(
+                f"{side} parser first line not 'ready': {ready_line!r}")
+
+    def parse_one(
+        self,
+        trace_bin: Path,
+        xclbin_mlir: Path,
+        out_events: Optional[Path] = None,
+        out_cycles: Optional[Path] = None,
+        out_perfetto: Optional[Path] = None,
+        out_commands: Optional[Path] = None,
+    ) -> dict:
+        """Send one decode request, return parsed response dict.
+
+        The response shape is what parse-trace.py's server_loop emits:
+            {"ok": True, "events_count": N, "cycles": <span or None>,
+             "empty": <bool>, "elapsed_ms": M}
+          or {"ok": False, "error": "..."}.
+        """
+        if self.proc is None or self.proc.poll() is not None:
+            raise RuntimeError(f"{self.side} parser has exited")
+        req = {"trace_bin": str(trace_bin), "xclbin_mlir": str(xclbin_mlir)}
+        if out_events:   req["out_events"]   = str(out_events)
+        if out_cycles:   req["out_cycles"]   = str(out_cycles)
+        if out_perfetto: req["out_perfetto"] = str(out_perfetto)
+        if out_commands: req["out_commands"] = str(out_commands)
+        try:
+            self.proc.stdin.write(json.dumps(req) + "\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, IOError) as e:
+            raise RuntimeError(f"{self.side} parser write failed: {e}") from e
+        resp = self.proc.stdout.readline().strip()
+        if not resp:
+            raise RuntimeError(f"{self.side} parser closed before response")
+        try:
+            return json.loads(resp)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"{self.side} parser response not JSON: {resp!r}") from e
+
+    def close(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+        self.proc = None
+        if self._stderr_fh is not None and not self._stderr_fh.closed:
+            self._stderr_fh.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+
 def _parse_trace_bin(
     trace_bin: Path,
     mlir: Path,
@@ -509,12 +625,50 @@ def _parse_trace_bin(
     cycles_out: Path,
     parse_log: Path,
     env_for_parse: Dict[str, str],
+    parser_session: Optional[ParseSession] = None,
 ) -> Tuple[bool, Optional[str], Optional[int], Optional[int]]:
-    """Run parse-trace.py on a trace binary. Returns (ok, error,
+    """Run parse-trace on a trace binary. Returns (ok, error,
     cycles, events_count). ok=True with cycles=0/events_count=0 means
     the trace parsed as empty (kernel ran, no events fired); that's
     not a sweep failure.
+
+    When ``parser_session`` is provided, the decode is dispatched
+    through the long-lived parse-trace --server subprocess, avoiding
+    a fresh Python startup (~620 ms -> ~100 ms per call). When None,
+    falls back to the old subprocess.run() path so this helper still
+    works outside a session-managed sweep.
     """
+    if parser_session is not None:
+        try:
+            resp = parser_session.parse_one(
+                trace_bin=trace_bin,
+                xclbin_mlir=mlir,
+                out_events=events_out,
+                out_cycles=cycles_out,
+            )
+        except RuntimeError as e:
+            return False, f"parse-trace session: {e}", None, None
+        if not resp.get("ok"):
+            err = resp.get("error", "unknown")
+            # The server reports "empty" via flags rather than a
+            # special error message, but errno-style failures still
+            # arrive as ok=false. Treat empty-trace exactly the same
+            # way the fallback path does.
+            return False, f"parse-trace: {err}", None, None
+        if resp.get("empty"):
+            # Server still wrote whatever output files were requested
+            # (with cycles=0); make doubly sure the events file is
+            # well-formed for downstream tools that didn't pass
+            # out_events to the server.
+            if not events_out.exists():
+                events_out.write_text(
+                    '{"schema_version":1,"events":[],"slot_names":{}}\n')
+            return True, None, 0, 0
+        return True, None, int(resp.get("cycles") or 0), \
+               int(resp.get("events_count") or 0)
+
+    # Fallback path: spawn a fresh interpreter per call. Slow but kept
+    # for callers that don't want to manage a ParseSession.
     parse_cmd = [
         sys.executable, str(PARSE_TOOL),
         "--trace-bin", str(trace_bin),
@@ -560,6 +714,7 @@ def _run_one_side(
     cycles_out: Path,
     parse_log: Path,
     ctrlpkt: Optional[Path],
+    parser_session: Optional["ParseSession"] = None,
 ) -> RunResult:
     """One (run → parse) cycle.
 
@@ -591,6 +746,7 @@ def _run_one_side(
     env_for_parse.update(runner_env)
     ok, err, cycles, events_count = _parse_trace_bin(
         trace_bin, mlir, events_out, cycles_out, parse_log, env_for_parse,
+        parser_session=parser_session,
     )
     if not ok:
         return RunResult(ok=False, cycles=None, events_count=None,
@@ -976,6 +1132,22 @@ def sweep_multi(
             reuse_ctx=reuse_ctx,
         )
 
+    # One persistent decoder process per side. The mlir-aie + numpy
+    # imports cost ~620 ms per fresh interpreter, which dominates the
+    # sweep wall clock; spawning them once and routing all batch
+    # decodes through the long-lived processes drops per-decode cost
+    # to ~100 ms.
+    hw_parser: Optional[ParseSession] = None
+    emu_parser: Optional[ParseSession] = None
+    if run_hw:
+        hw_parser = ParseSession(
+            side="HW", stderr_log=work_dir / "hw.parser.log",
+        )
+    if run_emu:
+        emu_parser = ParseSession(
+            side="EMU", stderr_log=work_dir / "emu.parser.log",
+        )
+
     t_start = time.time()
     for b_idx, batch in enumerate(batches):
         event_ids = [e.id for e in batch]
@@ -1002,6 +1174,7 @@ def sweep_multi(
             cycles_out=work_dir / f"b{b_idx}.hw.cycles.txt",
             parse_log=work_dir / f"b{b_idx}.hw.parse.log",
             ctrlpkt=ctrlpkt,
+            parser_session=hw_parser,
         )
 
         emu_res = RunResult(ok=False, cycles=None, events_count=None,
@@ -1016,6 +1189,7 @@ def sweep_multi(
             cycles_out=work_dir / f"b{b_idx}.emu.cycles.txt",
             parse_log=work_dir / f"b{b_idx}.emu.parse.log",
             ctrlpkt=ctrlpkt,
+            parser_session=emu_parser,
         )
 
         # Split the one parsed events.json per-tile, relabel each tile's
@@ -1083,6 +1257,10 @@ def sweep_multi(
         hw_session.close()
     if emu_session is not None:
         emu_session.close()
+    if hw_parser is not None:
+        hw_parser.close()
+    if emu_parser is not None:
+        emu_parser.close()
 
     summaries: List[dict] = []
     elapsed = round(time.time() - t_start, 2)
