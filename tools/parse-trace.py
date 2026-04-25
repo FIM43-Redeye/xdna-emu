@@ -316,14 +316,17 @@ def decode_one_ours(np_mod, td_mod,
     ``trace_mode`` selects the per-tile decoder; supported values are
     ``"event_time"`` (mode 0, default) and ``"event_pc"`` (mode 1).
 
-    --out-perfetto is rejected: producing Perfetto B/E pairs requires
-    the active-event tracking we have not ported yet.  Use the
-    'mlir-aie' decoder for Perfetto output until that lands.
+    --out-perfetto is supported for ``trace_mode='event_time'`` (mode 0)
+    only -- modes 1 (PC anchors instead of cycle anchors) and 2 (per-
+    cycle E_atom/N_atom records) don't have an established B/E pair
+    convention yet, so we reject them rather than emit a malformed
+    timeline.
     """
-    if out_perfetto:
+    if out_perfetto and trace_mode != "event_time":
         raise ValueError(
-            "--decoder=ours does not yet support --out-perfetto; "
-            "use --decoder=mlir-aie for Perfetto output"
+            f"--decoder=ours --out-perfetto: trace_mode={trace_mode!r} "
+            "not supported; only event_time (mode 0) emits Perfetto B/E "
+            "pairs in this iteration"
         )
 
     mode_lookup = {
@@ -341,6 +344,12 @@ def decode_one_ours(np_mod, td_mod,
     raw = np_mod.fromfile(trace_bin, dtype=np_mod.uint32)
     words = raw.tolist()
 
+    # Compute slot_names once if anything downstream needs them.
+    slot_names = {}
+    if (out_events or out_cycles or out_perfetto) and xclbin_mlir:
+        mlir_text = Path(xclbin_mlir).read_text()
+        slot_names = _slot_names_from_mlir(mlir_text)
+
     if out_commands:
         commands_per_tile = td_mod.decode_words(words, mode=mode_enum)
         # Reshape into the mlir-aie-compatible output: trace_types[pkt_type][f"{row},{col}"] = [...]
@@ -350,13 +359,14 @@ def decode_one_ours(np_mod, td_mod,
             trace_types[pt][f"{r},{c}"] = [_cmd_to_oracle_dict(cmd) for cmd in cmds]
         Path(out_commands).write_text(json.dumps({"trace_types": trace_types}, indent=2))
 
+    if out_perfetto:
+        commands_per_tile = td_mod.decode_words(words, mode=mode_enum)
+        perfetto_events = td_mod.rebuild_perfetto_mode0(commands_per_tile, slot_names)
+        Path(out_perfetto).write_text(json.dumps(perfetto_events, indent=2))
+
     flat = []
     cycles = None
     if out_events or out_cycles:
-        slot_names = {}
-        if xclbin_mlir:
-            mlir_text = Path(xclbin_mlir).read_text()
-            slot_names = _slot_names_from_mlir(mlir_text)
         events = td_mod.parse_trace(words, slot_names=slot_names,
                                     mode=mode_enum)
         flat = [

@@ -345,6 +345,69 @@ def test_mode2_core_tile_decode_matches_freeze(
     )
 
 
+# ---------------------------------------------------------------------------
+# Per-tile auto-detect: real captures mix tile modes (CORE in mode 1/2,
+# MEMTILE in mode 0).  decode_words(mode=None) must dispatch per tile
+# based on each Start opcode's low-2-bit discriminator.
+# ---------------------------------------------------------------------------
+
+
+def test_detect_per_tile_modes_mixed_capture():
+    """The mode-1 fixture has CORE in EVENT_PC and MEMTILE in EVENT_TIME."""
+    from trace_decoder import detect_per_tile_modes
+
+    raw = np.fromfile(FIXTURE_DIR / "mode1_mixed_r0.bin", dtype=np.uint32)
+    modes = detect_per_tile_modes(raw.tolist())
+    assert modes[(PacketType.CORE, 2, 1)] == TraceMode.EVENT_PC
+    assert modes[(PacketType.MEMTILE, 1, 1)] == TraceMode.EVENT_TIME
+
+
+def test_decode_words_auto_picks_per_tile_mode():
+    """decode_words(mode=None) must decode each tile with its own mode.
+
+    The CORE tile's first command should be a StartCmd whose timer
+    matches the mode-1 fixture's known anchor (0x4e5f7), AND the
+    MEMTILE tile (mode 0) must produce an EventCmd-shaped command
+    sequence (rather than nonsense).
+    """
+    from trace_decoder.modes.mode2 import CycleCmd  # noqa: F401 (sentinel)
+
+    raw = np.fromfile(FIXTURE_DIR / "mode1_mixed_r0.bin", dtype=np.uint32)
+    by_tile = decode_words(raw.tolist(), mode=None)
+
+    core_cmds = by_tile[(PacketType.CORE, 2, 1)]
+    assert isinstance(core_cmds[0], StartCmd)
+    assert core_cmds[0].timer_value == 0x4E5F7
+
+    memtile_cmds = by_tile[(PacketType.MEMTILE, 1, 1)]
+    assert isinstance(memtile_cmds[0], StartCmd)
+    # Mode-0 timer is the 56-bit anchor read off the F0 prefix.
+    assert memtile_cmds[0].timer_value > 0
+    # Mode-0 has cycle-delta EventCmds; mode-1 EventCmds reuse the
+    # cycles slot for PCs (max 0x3FFF = 16383).  A non-trivial mode-0
+    # timer will exceed 16383, so this gives us a coarse "decoded as
+    # mode 0, not mode 1" sanity check.
+    assert memtile_cmds[0].timer_value > 16383
+
+
+def test_decode_words_auto_skips_no_start():
+    """Tiles with no recognisable Start opcode auto-detect to skip
+    rather than crash the whole decode."""
+    # Construct a fake one-tile word stream with no Start byte:
+    # pkt header at word[0], all-FE filler in words[1..7].
+    # Header: pkt_type=CORE, col=1, row=2 -- valid parity.  We borrow
+    # the value from the mode-0 fixture so we don't recompute parity.
+    raw = np.fromfile(FIXTURE_DIR / "mode0_add_one_objfifo_r0.bin", dtype=np.uint32)
+    header = int(raw[0])  # known-good CORE header
+    bogus = [header] + [0xFEFEFEFE] * 7
+    by_tile = decode_words(bogus, mode=None)
+    # Either the tile silently empties out (no Start, skip) or the
+    # decoder finds no tile at all -- both are acceptable; the key
+    # assertion is that no exception bubbled up.
+    for cmds in by_tile.values():
+        assert cmds == []
+
+
 def test_mode2_frame_tree_synthetic():
     """Hand-built words exercise each frame's bit pattern.
 
@@ -414,10 +477,12 @@ def test_parse_trace_cli_out_commands_matches_oracle(tmp_path):
     assert out.read_text() == expected.read_text()
 
 
-def test_parse_trace_cli_out_perfetto_rejects_ours(tmp_path):
-    """--decoder=ours --out-perfetto must fail loudly until we port
-    the B/E pair generation, so callers don't silently get a missing
-    output file."""
+def test_parse_trace_cli_out_perfetto_mode0_emits_be_pairs(tmp_path):
+    """--decoder=ours --out-perfetto on a mode-0 capture must emit the
+    Chrome-trace JSON shape mlir-aie's path produces: M/process_name +
+    M/thread_name metadata, then B/E pairs whose timestamps lie in a
+    sane range and whose pids match the metadata.
+    """
     import os
     import subprocess
 
@@ -426,7 +491,7 @@ def test_parse_trace_cli_out_perfetto_rejects_ours(tmp_path):
         pytest.skip("ironenv python not available")
     script = Path(__file__).parent / "parse-trace.py"
     fixture = FIXTURE_DIR / "mode0_add_one_objfifo_r0.bin"
-    out = tmp_path / "should_not_exist.json"
+    out = tmp_path / "ours_perfetto.json"
 
     env = os.environ.copy()
     env["PYTHONPATH"] = (
@@ -449,6 +514,62 @@ def test_parse_trace_cli_out_perfetto_rejects_ours(tmp_path):
         text=True,
         env=env,
     )
+    assert proc.returncode == 0, proc.stderr
+    events = json.loads(out.read_text())
+    assert isinstance(events, list) and len(events) > 0
+    # Must contain at least one process_name M event and one B-phase event.
+    has_proc = any(e.get("ph") == "M" and e.get("name") == "process_name" for e in events)
+    has_b = any(e.get("ph") == "B" for e in events)
+    has_e = any(e.get("ph") == "E" for e in events)
+    assert has_proc and has_b and has_e, [e.get("ph") for e in events[:5]]
+    # B/E pairs should balance per (pid, tid).
+    from collections import Counter
+    open_count = Counter()
+    for e in events:
+        if e.get("ph") == "B":
+            open_count[(e["pid"], e["tid"])] += 1
+        elif e.get("ph") == "E":
+            open_count[(e["pid"], e["tid"])] -= 1
+    assert all(v == 0 for v in open_count.values()), open_count
+
+
+def test_parse_trace_cli_out_perfetto_rejects_non_mode0(tmp_path):
+    """--decoder=ours --out-perfetto for mode 1 or 2 must fail loudly
+    until those timeline rebuilds land, so callers don't silently get a
+    malformed timeline."""
+    import os
+    import subprocess
+
+    iron_py = "/home/triple/npu-work/mlir-aie/ironenv/bin/python3"
+    if not os.path.isfile(iron_py):
+        pytest.skip("ironenv python not available")
+    script = Path(__file__).parent / "parse-trace.py"
+    fixture = FIXTURE_DIR / "mode1_mixed_r0.bin"
+    out = tmp_path / "should_not_exist.json"
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = (
+        "/home/triple/npu-work/mlir-aie/install/python:" + env.get("PYTHONPATH", "")
+    )
+    proc = subprocess.run(
+        [
+            iron_py,
+            str(script),
+            "--trace-bin",
+            str(fixture),
+            "--xclbin-mlir",
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/peano/aie_arch.mlir.prj/input_with_addresses.mlir",
+            "--decoder",
+            "ours",
+            "--trace-mode",
+            "event_pc",
+            "--out-perfetto",
+            str(out),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
     assert proc.returncode != 0
-    assert "perfetto" in proc.stderr.lower()
+    assert "event_pc" in proc.stderr.lower() or "perfetto" in proc.stderr.lower()
     assert not out.exists()

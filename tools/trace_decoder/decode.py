@@ -51,23 +51,71 @@ from .packet import deinterleave_packets, trim_trailing_padding, words_to_bytes
 _SYNC_CYCLE_ADVANCE = 0x3FFFF
 
 
-def decode_words(words: Iterable[int], mode: TraceMode = TraceMode.EVENT_TIME):
+_MODE_DECODER = {
+    TraceMode.EVENT_TIME: mode0.decode,
+    TraceMode.EVENT_PC: mode1.decode,
+    TraceMode.INST_EXEC: mode2.decode,
+}
+
+
+def detect_per_tile_modes(
+    words: Iterable[int],
+) -> dict[tuple[int, int, int], TraceMode | None]:
+    """Return ``{(pkt_type, row, col): TraceMode}`` from the Start opcode
+    of each per-tile payload.
+
+    A value of ``None`` means the tile has no recognisable Start opcode
+    or uses the reserved mode 3 -- both treated as "skip" by
+    ``decode_words(mode=None)``.  Useful when downstream code needs to
+    know *which* mode each tile was configured for (e.g. to pick a
+    timeline-rebuild strategy per tile).
+    """
+    word_list = trim_trailing_padding(list(words))
+    by_tile_words = deinterleave_packets(word_list)
+    return {
+        key: _detect_tile_mode(words_to_bytes(payload))
+        for key, payload in by_tile_words.items()
+    }
+
+
+def _detect_tile_mode(byte_stream: list[int]) -> TraceMode | None:
+    """Read the trace-mode discriminator from the first Start opcode.
+
+    Every per-tile payload begins with a Start opcode in one of the
+    forms ``1111 0XXM`` where ``M`` (low 2 bits) encodes the trace
+    mode (0=EVENT_TIME, 1=EVENT_PC, 2=INST_EXEC, 3=reserved) and bit 2
+    is the segment-start vs re-anchor flag.  Skip-filler bytes
+    (``0xFE``) may precede the Start opcode and are tolerated.
+    Returns ``None`` if no Start is found in the stream -- the caller
+    should then fall back to a default or raise.
+    """
+    for b in byte_stream:
+        if b == 0xFE:
+            continue
+        if (b & 0xF8) == 0xF0:
+            try:
+                return TraceMode(b & 0x3)
+            except ValueError:
+                return None
+        return None
+    return None
+
+
+def decode_words(
+    words: Iterable[int],
+    mode: TraceMode | None = TraceMode.EVENT_TIME,
+):
     """De-interleave a raw word stream and decode per-tile command lists.
 
     Returns a dict ``{(pkt_type, row, col): [TraceCommand, ...]}``.
 
-    Modes 0 (EVENT_TIME) and 1 (EVENT_PC) are supported.  Mode 2
-    (INST_EXEC) is not yet implemented and raises NotImplementedError so
-    callers fail fast rather than silently decoding with the wrong
-    opcode table.
+    All three implemented modes (EVENT_TIME, EVENT_PC, INST_EXEC) are
+    supported; passing ``mode=None`` enables per-tile auto-detection
+    via the Start opcode's low-2-bit discriminator (the encoder always
+    starts each tile's stream with that opcode).  Mode 3 is reserved
+    and raises ``NotImplementedError`` if encountered.
     """
-    if mode == TraceMode.EVENT_TIME:
-        per_mode_decode = mode0.decode
-    elif mode == TraceMode.EVENT_PC:
-        per_mode_decode = mode1.decode
-    elif mode == TraceMode.INST_EXEC:
-        per_mode_decode = mode2.decode
-    else:
+    if mode is not None and mode not in _MODE_DECODER:
         raise NotImplementedError(
             f"trace_decoder: mode {mode!r} not yet implemented "
             "(EVENT_TIME, EVENT_PC, INST_EXEC supported in this iteration)"
@@ -82,6 +130,16 @@ def decode_words(words: Iterable[int], mode: TraceMode = TraceMode.EVENT_TIME):
     commands: dict[tuple[int, int, int], list[TraceCommand]] = {}
     for key, payload_words in by_tile_words.items():
         bytes_ = words_to_bytes(payload_words)
+        if mode is None:
+            tile_mode = _detect_tile_mode(bytes_)
+            if tile_mode is None or tile_mode not in _MODE_DECODER:
+                # Tile has no recognisable Start (or mode 3): skip
+                # rather than poison downstream consumers.
+                commands[key] = []
+                continue
+            per_mode_decode = _MODE_DECODER[tile_mode]
+        else:
+            per_mode_decode = _MODE_DECODER[mode]
         commands[key] = list(per_mode_decode(bytes_))
     return commands
 
@@ -186,6 +244,140 @@ def rebuild_timeline_mode0(
 
     events.sort(key=lambda e: (e.col, e.row, e.pkt_type, e.ts))
     return events
+
+
+_PT_CODE_TO_NAME = {0: "core", 1: "mem", 2: "shim", 3: "memtile"}
+
+
+def rebuild_perfetto_mode0(
+    commands_per_tile: dict[tuple[int, int, int], list[TraceCommand]],
+    slot_names: dict[int, dict[str, list[str]]],
+) -> list[dict]:
+    """Walk per-tile mode-0 commands and emit Chrome-trace B/E pairs.
+
+    Output shape matches mlir-aie's ``parse_trace`` Perfetto output so
+    ``--decoder=ours --out-perfetto`` is a drop-in replacement:
+
+      * one ``M`` ``process_name`` event per tile, ``pid`` opaque,
+        ``args.name = "<pkt_type_name>(row,col)"``;
+      * one ``M`` ``thread_name`` event per (tile, slot), ``tid =
+        slot``, ``args.name`` = the slot's event name (or "");
+      * a ``B``/``E`` pair per event activation: ``B`` at the cycle the
+        event becomes active, ``E`` at the cycle it deactivates (or end
+        of trace if it's still asserted at the segment end).
+
+    Mode-0 semantics: each EventCmd is a snapshot of the *currently
+    asserted* slot mask after a cycle delta, so we diff against the
+    previous mask to find activations / deactivations.  Repeat extends
+    the most-recent transition pattern by ``count``; a zero-cycle prior
+    just lengthens the timer linearly without changing the mask, while
+    a non-zero prior replays the pattern N times.  Sync nudges the
+    timer by the documented spec-typo constant; Start anchors it.
+    """
+    out: list[dict] = []
+    pid_counter = 0
+    for (pkt_type, row, col), cmds in commands_per_tile.items():
+        pid = pid_counter
+        pid_counter += 1
+        pt_name = _PT_CODE_TO_NAME.get(pkt_type, f"pt{pkt_type}")
+        out.append(
+            {
+                "ph": "M",
+                "name": "process_name",
+                "pid": pid,
+                "args": {"name": f"{pt_name}({row},{col})"},
+            }
+        )
+        slot_table = slot_names.get(pkt_type, {}).get(f"{row},{col}", [""] * 8)
+        for slot in range(8):
+            name = slot_table[slot] if slot < len(slot_table) else ""
+            out.append(
+                {
+                    "ph": "M",
+                    "name": "thread_name",
+                    "pid": pid,
+                    "tid": slot,
+                    "args": {"name": name},
+                }
+            )
+
+        timer = 0
+        active: dict[int, int] = {}  # slot -> activation_ts
+        prev_mask = 0
+        prev_event: EventCmd | None = None
+
+        def _emit_be(new_mask: int, ts: int) -> None:
+            nonlocal active
+            for slot in range(8):
+                bit = 1 << slot
+                was_on = bool(prev_mask & bit)
+                now_on = bool(new_mask & bit)
+                if now_on and not was_on:
+                    out.append(
+                        {
+                            "ph": "B",
+                            "name": slot_table[slot] if slot < len(slot_table) else "",
+                            "pid": pid,
+                            "tid": slot,
+                            "ts": ts,
+                        }
+                    )
+                    active[slot] = ts
+                elif was_on and not now_on:
+                    out.append(
+                        {
+                            "ph": "E",
+                            "name": slot_table[slot] if slot < len(slot_table) else "",
+                            "pid": pid,
+                            "tid": slot,
+                            "ts": ts,
+                        }
+                    )
+                    active.pop(slot, None)
+
+        for cmd in cmds:
+            if isinstance(cmd, StartCmd):
+                # Close out any still-active events at the previous
+                # timer, then anchor.
+                _emit_be(0, timer)
+                prev_mask = 0
+                timer = cmd.timer_value
+                prev_event = None
+                continue
+            if isinstance(cmd, SyncCmd):
+                timer += _SYNC_CYCLE_ADVANCE
+                continue
+            if isinstance(cmd, StopCmd):
+                continue
+            if isinstance(cmd, EventCmd):
+                timer += 1 + cmd.cycles
+                _emit_be(cmd.event_bits, timer)
+                prev_mask = cmd.event_bits
+                prev_event = cmd
+                continue
+            if isinstance(cmd, RepeatCmd):
+                if prev_event is None:
+                    continue
+                if prev_event.cycles == 0:
+                    # Linear timer extension; mask is unchanged across
+                    # the repeat, so no transitions to emit.
+                    timer += cmd.count
+                else:
+                    for _ in range(cmd.count):
+                        timer += 1 + prev_event.cycles
+                        # The pattern that gets repeated is the
+                        # previous transition (mask stays constant
+                        # across replays in the mlir-aie algorithm),
+                        # so no B/E during the body -- only the timer
+                        # advances.  Active events get their dur
+                        # extended naturally by the next transition's
+                        # E timestamp.
+                continue
+
+        # Close out any events still asserted at end-of-segment.
+        _emit_be(0, timer)
+
+    return out
 
 
 def rebuild_timeline_mode1(

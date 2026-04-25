@@ -28,11 +28,14 @@ data copied):
 * AM020 architecture reference -- mode descriptions for INST_EXEC
   ("branches and ZOL LC").
 
-Modes 0 (EVENT_TIME) and 1 (EVENT_PC) are implemented; mode 2 (INST_EXEC)
-and 3 (reserved) are work-in-progress.  Mode-1 wire format was reverse-
-engineered from captured traces and confirmed against the per-word
-dispatch in ``adf::Trace::TraceDecoder::decodePacket`` (read-only objdump
-inspection); the implementation here is original.
+Modes 0 (EVENT_TIME), 1 (EVENT_PC), and 2 (INST_EXEC) are implemented;
+mode 3 is reserved and not documented in any source we have access to.
+The mode-1 byte format and mode-2 frame tree were reverse-engineered
+from captured traces and confirmed against the dispatch in
+``adf::Trace::TraceDecoder::decodePacket`` (mode 1) and
+``cardano::Trace::TraceDecoder::initializeExecutionTraceFrameTree``
+(mode 2) -- read-only objdump inspection only; the implementations
+here are original.
 """
 
 from .frame import (
@@ -46,7 +49,14 @@ from .frame import (
     PacketType,
 )
 from .packet import StreamPacketHeader, parse_packet_header, deinterleave_packets
-from .decode import decode_words, parse_trace
+from .decode import (
+    decode_words,
+    detect_per_tile_modes,
+    parse_trace,
+    rebuild_timeline_mode0,
+    rebuild_timeline_mode1,
+    rebuild_perfetto_mode0,
+)
 
 __all__ = [
     "StartCmd",
@@ -61,5 +71,9 @@ __all__ = [
     "parse_packet_header",
     "deinterleave_packets",
     "decode_words",
+    "detect_per_tile_modes",
     "parse_trace",
+    "rebuild_timeline_mode0",
+    "rebuild_timeline_mode1",
+    "rebuild_perfetto_mode0",
 ]
