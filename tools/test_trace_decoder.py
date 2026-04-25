@@ -287,9 +287,80 @@ def test_mode1_start_opcode_distinguishes_from_mode0():
     assert cmds[0].timer_value == 42
 
 
-def test_mode2_raises_not_implemented(fixture_words):
-    with pytest.raises(NotImplementedError):
-        decode_words(fixture_words, mode=TraceMode.INST_EXEC)
+# ---------------------------------------------------------------------------
+# Mode 2 (INST_EXEC) decode -- frozen-fixture regression
+# ---------------------------------------------------------------------------
+#
+# Mode 2 has no public oracle either; the freeze captures the current
+# decoder output of a real on-tile capture.  CORE tile sanity anchors:
+#   - StartCmd anchor_pc = 0x330 (= 816, matches Start word's low-14
+#     bits in the capture).
+#   - Two repeating sequences of New_PC at 0x150, 0x170, 0x1E0, 0x200,
+#     0x220, 0x240, 0x2B0, 0x2D0 -- a tight loop body with 7-8 taken
+#     branches.
+#   - A few E_atom (executed) and N_atom (stalled) cycles trailing.
+
+
+@pytest.fixture(scope="module")
+def mode2_fixture_words():
+    raw = np.fromfile(FIXTURE_DIR / "mode2_mixed_r0.bin", dtype=np.uint32)
+    return raw.tolist()
+
+
+@pytest.fixture(scope="module")
+def mode2_core_expected():
+    path = FIXTURE_DIR / "mode2_mixed_r0_core_expected.json"
+    return json.loads(path.read_text())
+
+
+def _mode2_cmd_to_dict(cmd) -> dict:
+    from trace_decoder.modes.mode2 import CycleCmd, LoopCountCmd
+
+    if isinstance(cmd, StartCmd):
+        return {"type": "Start", "anchor_pc": cmd.timer_value}
+    if isinstance(cmd, CycleCmd):
+        return {"type": "N_atom" if cmd.stalled else "E_atom"}
+    if isinstance(cmd, EventCmd):
+        return {"type": "New_PC", "pc": cmd.cycles}
+    if isinstance(cmd, RepeatCmd):
+        return {"type": "Repeat", "count": cmd.count}
+    if isinstance(cmd, LoopCountCmd):
+        return {"type": "LC", "flag": cmd.flag, "count": cmd.count}
+    if isinstance(cmd, SyncCmd):
+        return {"type": "Sync"}
+    raise AssertionError(f"unhandled mode2 cmd: {cmd!r}")
+
+
+def test_mode2_core_tile_decode_matches_freeze(
+    mode2_fixture_words, mode2_core_expected
+):
+    """Mode-2 CORE tile decode must agree with the frozen JSON fixture."""
+    by_tile = decode_words(mode2_fixture_words, mode=TraceMode.INST_EXEC)
+    core_key = (PacketType.CORE, 2, 1)
+    assert core_key in by_tile, by_tile.keys()
+    ours = [_mode2_cmd_to_dict(c) for c in by_tile[core_key]]
+    assert ours == mode2_core_expected, (
+        f"len ours={len(ours)} expected={len(mode2_core_expected)}\n"
+        f"first 5 ours={ours[:5]}\nfirst 5 expected={mode2_core_expected[:5]}"
+    )
+
+
+def test_mode2_frame_tree_synthetic():
+    """Hand-built words exercise each frame's bit pattern.
+
+    Word 0xF2003030: Start prefix 11110 + bit26 flag (0) + ...
+                     anchor PC = low 14 bits = 0x0330 = 816.
+    Word 0x81708160: New_PC at 0x0170 (368), then New_PC at 0x0160 (352).
+    """
+    from trace_decoder.modes.mode2 import CycleCmd
+    from trace_decoder.modes.mode2 import decode
+
+    # 0xF2003030 0x81708160 packed MSB-first.
+    bytes_ = [0xF2, 0x00, 0x03, 0x30, 0x81, 0x70, 0x81, 0x60]
+    cmds = list(decode(bytes_))
+    assert isinstance(cmds[0], StartCmd) and cmds[0].timer_value == 0x330
+    assert isinstance(cmds[1], EventCmd) and cmds[1].cycles == 0x170
+    assert isinstance(cmds[2], EventCmd) and cmds[2].cycles == 0x160
 
 
 # ---------------------------------------------------------------------------

@@ -40,7 +40,7 @@ from .frame import (
     TraceCommand,
     TraceMode,
 )
-from .modes import mode0, mode1
+from .modes import mode0, mode1, mode2
 from .packet import deinterleave_packets, trim_trailing_padding, words_to_bytes
 
 
@@ -65,10 +65,12 @@ def decode_words(words: Iterable[int], mode: TraceMode = TraceMode.EVENT_TIME):
         per_mode_decode = mode0.decode
     elif mode == TraceMode.EVENT_PC:
         per_mode_decode = mode1.decode
+    elif mode == TraceMode.INST_EXEC:
+        per_mode_decode = mode2.decode
     else:
         raise NotImplementedError(
             f"trace_decoder: mode {mode!r} not yet implemented "
-            "(EVENT_TIME and EVENT_PC supported in this iteration)"
+            "(EVENT_TIME, EVENT_PC, INST_EXEC supported in this iteration)"
         )
 
     word_list = list(words)

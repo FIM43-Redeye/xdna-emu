@@ -61,12 +61,15 @@ def parse_args():
                         "EVENT_TIME (mode 0) and EVENT_PC (mode 1) traces; "
                         "--out-perfetto remains mlir-aie-only until our "
                         "timeline emits B/E pairs.")
-    p.add_argument("--trace-mode", choices=("event_time", "event_pc"),
+    p.add_argument("--trace-mode", choices=("event_time", "event_pc", "inst_exec"),
                    default="event_time",
                    help="trace mode selector for --decoder=ours. 'event_time' "
                         "(default) decodes mode-0 traces with cycle-delta "
                         "events. 'event_pc' decodes mode-1 traces where the "
-                        "encoded quantity is the PC at each event fire.")
+                        "encoded quantity is the PC at each event fire. "
+                        "'inst_exec' decodes mode-2 instruction-execution "
+                        "traces (E/N_atom cycle records, New_PC branches, "
+                        "LC loop counts).")
     p.add_argument("--server", action="store_true",
                    help="run as a long-lived decode server. Reads one JSON "
                         "request per stdin line {trace_bin, xclbin_mlir, "
@@ -326,6 +329,7 @@ def decode_one_ours(np_mod, td_mod,
     mode_lookup = {
         "event_time": td_mod.TraceMode.EVENT_TIME,
         "event_pc": td_mod.TraceMode.EVENT_PC,
+        "inst_exec": td_mod.TraceMode.INST_EXEC,
     }
     if trace_mode not in mode_lookup:
         raise ValueError(
