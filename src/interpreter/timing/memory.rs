@@ -120,22 +120,40 @@ impl MemoryQuadrant {
     /// Source: aie-rt `_XAie_GetTargetTileLoc()` (xaie_elfloader.c:124-183)
     #[inline]
     pub fn from_address(address: u32) -> Self {
-        use xdna_archspec::aie2 as arch;
-        let card_dir = (address / arch::compute::MEMORY_SIZE as u32) as u8;
+        // Cardinal direction values (4=South, 5=West, 6=North, 7=East) are
+        // hardware constants shared across AIE/AIE2/AIE2P, so they stay as
+        // local consts; the bank size (used for the `address / size` bucket)
+        // and the checkerboard flag are arch-dependent and route through
+        // arch_handle so AIE1/AIE2P inherit the right values from their
+        // device models without touching this function.
+        const SOUTH: u8 = 4;
+        const WEST: u8 = 5;
+        const NORTH: u8 = 6;
+        const EAST: u8 = 7;
+
+        let map = match crate::device::arch_handle::core_address_map() {
+            Some(m) => m,
+            // No CoreAddressMap means the device model didn't carry one
+            // (synthetic test models). Fall back to "everything local"
+            // -- timing tests using such models won't exercise cross-tile.
+            None => return Self::Local,
+        };
+        let bank_size = 1u32 << map.data_mem_shift;
+        let card_dir = (address / bank_size) as u8;
         match card_dir {
-            d if d == arch::cardinal::SOUTH => Self::South,
-            d if d == arch::cardinal::WEST => Self::West,
-            d if d == arch::cardinal::NORTH => Self::North,
-            d if d == arch::cardinal::EAST => {
-                // AIE2: East is always local (IsCheckerBoard=false).
-                // Checkerboard architectures would check row parity here.
-                if arch::compute::IS_CHECKERBOARD {
-                    Self::East // Cross-tile access to eastern neighbor
-                } else {
-                    Self::Local
-                }
-            }
-            // Below DATA_MEM_ADDR or invalid CardDir -- treat as local
+            SOUTH => Self::South,
+            WEST  => Self::West,
+            NORTH => Self::North,
+            EAST  => if map.is_checkerboard {
+                // AIE1: East is the eastern neighbor (cross-tile access).
+                // A row-parity check would refine the West/East mapping;
+                // we don't have an AIE1 path today, so treat both halves
+                // as cross-tile until that arch lands.
+                Self::East
+            } else {
+                // AIE2/AIE2P: East is always local.
+                Self::Local
+            },
             _ => Self::Local,
         }
     }

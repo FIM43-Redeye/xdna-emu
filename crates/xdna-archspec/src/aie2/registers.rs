@@ -42,11 +42,14 @@ pub mod mem_tile {
 /// "memory" (compute-tile memory module). Drift-detection tests assert
 /// these constants against the AM025 JSON at runtime via the regdb crate.
 ///
-/// Memtile DMA control offsets (0xA0600 base) and shim DMA control
-/// offsets (0x1D200 base) are intentionally not exposed here yet; the
-/// parser-to-DeviceOp promotion for DMA currently applies only to
-/// compute tiles (row >= 2 on AIE2). Follow-up work will extend this
-/// module when memtile/shim promotions are added.
+/// Memtile (module "memory_tile", base 0xA0600, 6 channels per direction)
+/// and shim (module "shim", base 0x1D200, 2 channels per direction) DMA
+/// control offsets are also exposed below so the CDO lower path can
+/// promote DmaStart on every tile kind, not just compute. Hardware
+/// names the trigger register `Start_Queue` on compute/memtile and
+/// `Task_Queue` on shim; both live at Ctrl + 4 within their channel
+/// slot, and both behave the same way -- a write triggers a DMA
+/// transfer using the BD ID in the value.
 pub mod dma {
     /// S2MM channel 0 control. AM025 offset 0x1DE00.
     pub const COMPUTE_DMA_S2MM_0_CTRL: u32 = 0x1DE00;
@@ -76,6 +79,28 @@ pub mod dma {
     pub const COMPUTE_DMA_MM2S_0_START_QUEUE: u32 = 0x1DE14;
     /// MM2S channel 1 Start_Queue. AM025 offset 0x1DE1C.
     pub const COMPUTE_DMA_MM2S_1_START_QUEUE: u32 = 0x1DE1C;
+
+    /// Number of S2MM (and MM2S) channels on memtiles -- 6 per direction.
+    pub const MEMTILE_CHANNELS_PER_DIR: u8 = 6;
+    /// Memtile DMA channel slot stride (Ctrl + Start_Queue = 8 bytes).
+    pub const MEMTILE_CHANNEL_STRIDE: u32 = 0x08;
+    /// Memtile S2MM channel 0 Start_Queue. AM025 offset 0xA0604.
+    /// Subsequent S2MM channels are at +0x08 each (S2MM_1 = 0xA060C, ..., S2MM_5 = 0xA062C).
+    pub const MEMTILE_DMA_S2MM_0_START_QUEUE: u32 = 0xA0604;
+    /// Memtile MM2S channel 0 Start_Queue. AM025 offset 0xA0634.
+    /// Subsequent MM2S channels are at +0x08 each (MM2S_1 = 0xA063C, ..., MM2S_5 = 0xA065C).
+    pub const MEMTILE_DMA_MM2S_0_START_QUEUE: u32 = 0xA0634;
+
+    /// Number of S2MM (and MM2S) channels on shim -- 2 per direction.
+    pub const SHIM_CHANNELS_PER_DIR: u8 = 2;
+    /// Shim DMA channel slot stride (Ctrl + Task_Queue = 8 bytes).
+    pub const SHIM_CHANNEL_STRIDE: u32 = 0x08;
+    /// Shim S2MM channel 0 Task_Queue. AM025 offset 0x1D204.
+    /// (Hardware names this `Task_Queue` on shim; semantically equivalent
+    /// to memtile/compute `Start_Queue`.) S2MM_1 follows at 0x1D20C.
+    pub const SHIM_DMA_S2MM_0_TASK_QUEUE: u32 = 0x1D204;
+    /// Shim MM2S channel 0 Task_Queue. AM025 offset 0x1D214. MM2S_1 at 0x1D21C.
+    pub const SHIM_DMA_MM2S_0_TASK_QUEUE: u32 = 0x1D214;
 
     #[cfg(test)]
     mod tests {
@@ -125,6 +150,41 @@ pub mod dma {
             assert_eq!(
                 COMPUTE_DMA_MM2S_1_START_QUEUE - COMPUTE_DMA_MM2S_1_CTRL,
                 START_QUEUE_OFFSET_IN_SLOT,
+            );
+        }
+
+        /// Drift-detection: memtile S2MM/MM2S Start_Queue base offsets,
+        /// stride, and channel-count agree with AM025.
+        /// Source: `aie_registers_aie2.json` module "memory_tile":
+        /// DMA_S2MM_0_Start_Queue at 0xA0604, MM2S_0_Start_Queue at 0xA0634.
+        #[test]
+        fn memtile_dma_start_queue_offsets_match_am025() {
+            assert_eq!(MEMTILE_DMA_S2MM_0_START_QUEUE, 0xA0604);
+            assert_eq!(MEMTILE_DMA_MM2S_0_START_QUEUE, 0xA0634);
+            // 6 channels each direction, 8 bytes apart.
+            assert_eq!(MEMTILE_CHANNELS_PER_DIR, 6);
+            assert_eq!(MEMTILE_CHANNEL_STRIDE, 0x08);
+            // MM2S follows S2MM after 6 channels at stride 8 + 0 gap.
+            assert_eq!(
+                MEMTILE_DMA_MM2S_0_START_QUEUE - MEMTILE_DMA_S2MM_0_START_QUEUE,
+                MEMTILE_CHANNELS_PER_DIR as u32 * MEMTILE_CHANNEL_STRIDE,
+            );
+        }
+
+        /// Drift-detection: shim S2MM/MM2S Task_Queue base offsets,
+        /// stride, and channel-count agree with AM025.
+        /// Source: `aie_registers_aie2.json` module "shim":
+        /// DMA_S2MM_0_Task_Queue at 0x1D204, MM2S_0_Task_Queue at 0x1D214.
+        #[test]
+        fn shim_dma_task_queue_offsets_match_am025() {
+            assert_eq!(SHIM_DMA_S2MM_0_TASK_QUEUE, 0x1D204);
+            assert_eq!(SHIM_DMA_MM2S_0_TASK_QUEUE, 0x1D214);
+            assert_eq!(SHIM_CHANNELS_PER_DIR, 2);
+            assert_eq!(SHIM_CHANNEL_STRIDE, 0x08);
+            // MM2S follows S2MM after 2 channels at stride 8.
+            assert_eq!(
+                SHIM_DMA_MM2S_0_TASK_QUEUE - SHIM_DMA_S2MM_0_TASK_QUEUE,
+                SHIM_CHANNELS_PER_DIR as u32 * SHIM_CHANNEL_STRIDE,
             );
         }
     }

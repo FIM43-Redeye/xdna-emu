@@ -91,7 +91,12 @@ pub fn extract_device_models(path: &Path) -> Result<HashMap<String, ArchModel>, 
     let file_str = path.display().to_string();
     let mut result = HashMap::new();
     for (name, value) in devices_obj {
-        let model = extract_device(name, value, &file_str)?;
+        let mut model = extract_device(name, value, &file_str)?;
+        // Apply per-arch manual constants (CoreAddressMap, TimingModel,
+        // etc.) that the device-model JSON doesn't carry.  This mirrors
+        // what `build_arch_model` does at build time so that runtime
+        // consumers see the same fully-populated `ArchModel` shape.
+        crate::model_builder::populate_manual_constants(&mut model);
         result.insert(name.clone(), model);
     }
     Ok(result)

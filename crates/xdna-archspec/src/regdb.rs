@@ -4,6 +4,13 @@
 //! JSON file with 1,806 registers and 6,412 bit fields parsed from AMD's
 //! AM025 (AIE-ML Register Reference) documentation.
 //!
+//! Data-model file: bitfield helpers (`extract`, `insert`, `set_bit`) and
+//! query helpers (`non_zero_reset_values`, `registers_with_access`) are
+//! intentional API for whichever consumer reaches for them next.
+//! `dead_code` tolerated here -- delete explicitly if a method is
+//! genuinely retired.
+#![allow(dead_code)]
+//!
 //! This module provides the base parsing types used by both the architecture
 //! graph (for extraction and cross-validation) and the emulator (for runtime
 //! register access). The emulator extends these types with pre-resolved

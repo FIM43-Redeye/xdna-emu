@@ -19,12 +19,13 @@
 //!     same way: Ctrl holds channel-level state, Start_Queue is the
 //!     trigger that pushes a BD ID and enqueues the transfer.
 //!
-//! Both promotions are gated to compute tiles (row >= 2 on AIE2); shim
-//! (row 0) and memtile (row 1) writes to the same offsets fall through
-//! to the register-level op. The offset tables for memtile and shim DMA
-//! live at different base addresses and are intentionally not promoted
-//! here yet -- follow-up work will extend the archspec `dma` submodule
-//! when those paths grow typed promotions.
+//! `CoreEnable` is gated to compute tiles (row >= 2 on AIE2) since shim
+//! and memtile have no core. `DmaStart` promotion applies to all three
+//! tile kinds: compute uses `Start_Queue` (base 0x1DE00, 2 channels per
+//! direction), memtile uses `Start_Queue` (base 0xA0600, 6 channels per
+//! direction), shim uses `Task_Queue` (base 0x1D200, 2 channels per
+//! direction). All are at Ctrl + 4 within their respective channel
+//! slots.
 //!
 //! Address decoding is inlined rather than routed through an
 //! `ArchHandle`: AIE2 and AIE2P share the same 5-bit column / 5-bit row
@@ -40,6 +41,10 @@ use smallvec::SmallVec;
 use xdna_archspec::aie2::registers::dma::{
     COMPUTE_DMA_MM2S_0_START_QUEUE, COMPUTE_DMA_MM2S_1_START_QUEUE,
     COMPUTE_DMA_S2MM_0_START_QUEUE, COMPUTE_DMA_S2MM_1_START_QUEUE,
+    MEMTILE_CHANNELS_PER_DIR, MEMTILE_CHANNEL_STRIDE,
+    MEMTILE_DMA_MM2S_0_START_QUEUE, MEMTILE_DMA_S2MM_0_START_QUEUE,
+    SHIM_CHANNELS_PER_DIR, SHIM_CHANNEL_STRIDE,
+    SHIM_DMA_MM2S_0_TASK_QUEUE, SHIM_DMA_S2MM_0_TASK_QUEUE,
 };
 use xdna_archspec::aie2::registers::CORE_CONTROL;
 use xdna_archspec::aie2::{TILE_COL_SHIFT, TILE_OFFSET_MASK, TILE_ROW_SHIFT};
@@ -67,27 +72,94 @@ fn decode_aie2_address(addr: u32) -> (TileAddr, u32) {
 ///
 /// Row 0 is shim, row 1 is memtile, rows >= 2 are compute. This is the
 /// layout for all current AIE2 parts (NPU1/Phoenix). AIE2P keeps the
-/// same convention. Used to gate `CoreEnable` / `DmaStart` promotions
-/// so writes to the same offsets on shim/memtile fall through to the
-/// register-level op.
+/// same convention. Used to gate `CoreEnable` (shim and memtile have
+/// no core).
 #[inline]
 fn is_compute_row(row: u8) -> bool {
     row >= 2
 }
 
-/// Match a compute-tile DMA channel Start_Queue offset and return
-/// `(channel, direction)` if it names one. A write to Start_Queue is
-/// the hardware trigger for a DMA transfer; Ctrl writes (Start_Queue
-/// - 4) are configuration and pass through as `RegWrite`.
+/// Is this tile a memtile on AIE2 (row 1)?
 #[inline]
-fn match_compute_dma_start_queue(offset: u32) -> Option<(u8, DmaDirection)> {
-    match offset {
-        o if o == COMPUTE_DMA_S2MM_0_START_QUEUE => Some((0, DmaDirection::S2mm)),
-        o if o == COMPUTE_DMA_S2MM_1_START_QUEUE => Some((1, DmaDirection::S2mm)),
-        o if o == COMPUTE_DMA_MM2S_0_START_QUEUE => Some((0, DmaDirection::Mm2s)),
-        o if o == COMPUTE_DMA_MM2S_1_START_QUEUE => Some((1, DmaDirection::Mm2s)),
-        _ => None,
+fn is_mem_row(row: u8) -> bool {
+    row == 1
+}
+
+/// Is this tile the shim row on AIE2 (row 0)?
+#[inline]
+fn is_shim_row(row: u8) -> bool {
+    row == 0
+}
+
+/// Match a tile-local DMA Start_Queue (or shim Task_Queue) offset for the
+/// given tile row, returning `(channel, direction)` if it names one. A
+/// write to that register is the hardware trigger for a DMA transfer;
+/// Ctrl writes (offset - 4) are configuration and pass through as
+/// `RegWrite`.
+///
+/// Compute tiles have 2 channels per direction (offsets 0x1DE04 / 0x1DE0C
+/// for S2MM_0/1, 0x1DE14 / 0x1DE1C for MM2S_0/1). Memtiles have 6
+/// channels per direction starting at 0xA0604 (S2MM) and 0xA0634 (MM2S),
+/// stride 8. Shim has 2 channels per direction starting at 0x1D204
+/// (S2MM) and 0x1D214 (MM2S), stride 8 (the register is named
+/// `Task_Queue` on shim but is the same trigger semantically).
+#[inline]
+fn match_dma_start_queue(row: u8, offset: u32) -> Option<(u8, DmaDirection)> {
+    if is_compute_row(row) {
+        return match offset {
+            o if o == COMPUTE_DMA_S2MM_0_START_QUEUE => Some((0, DmaDirection::S2mm)),
+            o if o == COMPUTE_DMA_S2MM_1_START_QUEUE => Some((1, DmaDirection::S2mm)),
+            o if o == COMPUTE_DMA_MM2S_0_START_QUEUE => Some((0, DmaDirection::Mm2s)),
+            o if o == COMPUTE_DMA_MM2S_1_START_QUEUE => Some((1, DmaDirection::Mm2s)),
+            _ => None,
+        };
     }
+    if is_mem_row(row) {
+        return match_strided_start_queue(
+            offset,
+            MEMTILE_DMA_S2MM_0_START_QUEUE,
+            MEMTILE_DMA_MM2S_0_START_QUEUE,
+            MEMTILE_CHANNELS_PER_DIR,
+            MEMTILE_CHANNEL_STRIDE,
+        );
+    }
+    if is_shim_row(row) {
+        return match_strided_start_queue(
+            offset,
+            SHIM_DMA_S2MM_0_TASK_QUEUE,
+            SHIM_DMA_MM2S_0_TASK_QUEUE,
+            SHIM_CHANNELS_PER_DIR,
+            SHIM_CHANNEL_STRIDE,
+        );
+    }
+    None
+}
+
+/// Helper: match `offset` against a contiguous `[base, base + n*stride)`
+/// channel-trigger range for one direction. Falls through to the next
+/// direction when the first doesn't match.
+#[inline]
+fn match_strided_start_queue(
+    offset: u32,
+    s2mm_base: u32,
+    mm2s_base: u32,
+    channels_per_dir: u8,
+    stride: u32,
+) -> Option<(u8, DmaDirection)> {
+    let n = channels_per_dir as u32;
+    if offset >= s2mm_base && offset < s2mm_base + n * stride {
+        let delta = offset - s2mm_base;
+        if delta % stride == 0 {
+            return Some(((delta / stride) as u8, DmaDirection::S2mm));
+        }
+    }
+    if offset >= mm2s_base && offset < mm2s_base + n * stride {
+        let delta = offset - mm2s_base;
+        if delta % stride == 0 {
+            return Some(((delta / stride) as u8, DmaDirection::Mm2s));
+        }
+    }
+    None
 }
 
 /// Lower a `CdoRaw` command into zero or more `DeviceOp`s.
@@ -178,19 +250,17 @@ fn lower_write(address: u32, value: u32) -> DeviceOp {
         };
     }
 
-    // DMA channel start on a compute tile: any write to a Start_Queue
-    // register pushes a BD ID and starts a transfer. Ctrl writes are
-    // channel-level config and are NOT promoted here -- they pass
-    // through as RegWrite exactly like a write to any other config
-    // register.
+    // DMA channel start on any tile (compute, memtile, or shim): any
+    // write to the channel's Start_Queue / Task_Queue register pushes a
+    // BD ID and starts a transfer. Ctrl writes are channel-level config
+    // and are NOT promoted here -- they pass through as RegWrite exactly
+    // like a write to any other config register.
     //
     // The raw `value` is carried as `bd_id`: `device::state` extracts
     // start_bd_id / repeat_count / enable_token_issue from it the same
     // way `write_dma_channel`'s Start_Queue branch did pre-refactor.
-    if is_compute_row(tile.row) {
-        if let Some((channel, dir)) = match_compute_dma_start_queue(offset) {
-            return DeviceOp::DmaStart { tile, channel, dir, bd_id: value };
-        }
+    if let Some((channel, dir)) = match_dma_start_queue(tile.row, offset) {
+        return DeviceOp::DmaStart { tile, channel, dir, bd_id: value };
     }
 
     DeviceOp::RegWrite { tile, offset, value }

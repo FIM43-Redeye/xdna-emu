@@ -134,7 +134,7 @@ impl DeviceState {
     ///
     /// Handles both Ctrl and Start_Queue writes. The CDO path now
     /// promotes Start_Queue writes to `DeviceOp::DmaStart` and applies
-    /// them via `start_compute_dma_channel` from `apply_device_op`; the
+    /// them via `start_dma_channel` from `apply_device_op`; the
     /// Start_Queue branch below remains live for non-CDO paths (NPU
     /// instructions via `write_tile_register`, control packets, FFI)
     /// that still feed raw register writes through this function. See
@@ -252,7 +252,7 @@ impl DeviceState {
         }
     }
 
-    /// Apply a `DeviceOp::DmaStart` to a compute tile.
+    /// Apply a `DeviceOp::DmaStart` to a tile (compute, memtile, or shim).
     ///
     /// Replicates the Start_Queue-write side effect that `write_dma_channel`
     /// used to perform inline:
@@ -262,10 +262,11 @@ impl DeviceState {
     ///   - set the DmaEngine's per-task config (token issue, controller_id,
     ///     fot_mode) and enqueue the transfer.
     ///
-    /// `channel` is 0 or 1 within the direction; `dir` selects S2MM vs
-    /// MM2S. Internally these map to ch_idx 0..3 matching the register
-    /// layout (S2MM_0, S2MM_1, MM2S_0, MM2S_1).
-    pub(super) fn start_compute_dma_channel(
+    /// `channel` is 0..N within the direction (compute: 0..2, memtile:
+    /// 0..6, shim: 0..2); `dir` selects S2MM vs MM2S. Internally these
+    /// map into the tile's flat `dma_channels` vector with S2MMs first
+    /// (layout enforced by `DmaEngine::new`).
+    pub(super) fn start_dma_channel(
         &mut self,
         col: u8,
         row: u8,
@@ -278,7 +279,12 @@ impl DeviceState {
         let reg_layout = regdb::device_reg_layout();
         let lay = &reg_layout.memory_channel;
 
-        let num_s2mm = xdna_archspec::aie2::compute::NUM_DMA_CHANNELS as usize;
+        // Per-tile S2MM count -- the boundary between S2MM and MM2S in
+        // the tile's flat dma_channels vector.  Compute=2, memtile=6,
+        // shim=2 per AIE2 archspec; routing through ArchConfig keeps
+        // AIE2P/AIE1 ports correct without code changes.
+        let tile_kind = self.array.arch().tile_kind(col, row);
+        let num_s2mm = self.array.arch().dma_s2mm_channels(tile_kind);
         let ch_idx = match dir {
             DmaDirection::S2mm => channel as usize,
             DmaDirection::Mm2s => num_s2mm + channel as usize,

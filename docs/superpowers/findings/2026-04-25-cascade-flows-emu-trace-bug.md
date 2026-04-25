@@ -37,20 +37,31 @@ Cycles: HW span 6368, EMU span 61. EMU total emulator cycles `= 2256`
 ### Finding 1: trace window is host-driven and fragile under EMU timing
 
 Trace start/stop are broadcast events 15/14, fired by host control
-packets. On HW, the host fires START → kernel runs ~6368 cycles → host
-fires STOP. On EMU, the emulator outpaces wallclock, so the host fires
-START and STOP nearly back-to-back. Result: the trace captures only the
-small slice of EMU execution that overlaps the host's broadcast-fire
-window.
+packets, embedded in the runtime instruction stream (insts.bin /
+aie_run_seq.bin). Both HW and EMU see the same logical bracket
+points -- the window boundaries don't shift under EMU timing.
 
-This is *not* an EMU bug. It's a real consequence of the host-driven
-trace window applied to a fast emulator. The fix surface is the
-perfctr-based trace window (observability lead #2): use a tile-internal
-PERF_CNT_0 fired N cycles after START to drive STOP, replacing the
-host-fired BROADCAST_14.
+**Correction (2026-04-25 follow-up).** An earlier draft of this
+finding claimed the EMU window was shorter because the emulator
+outpaces wallclock and host-fired broadcasts arrived back-to-back.
+That was wrong: the broadcasts aren't host-wallclock-fired, they're
+embedded in the device instruction stream.
 
-Tracked under thread C.1 (event-bounded trace prototype) and A.2 (the
-sweep + PC-anchored joining lets us cope with shorter windows).
+What actually differs is **what fires inside that window**. EMU
+captures 5 events on t03 (lock + stall events); HW captures 5
+different events on t03 (vector + lock-stall) plus 4 events on t12.
+With disjoint event sets, `max(ts) - min(ts)` measures different
+things on the two sides -- the cycle ratio 0.01 reflects that
+disagreement on event-firing, not that EMU "finished the kernel in
+1% of HW's cycles." A.5's determinism check confirmed EMU runs
+cycles=2256 total, deterministically.
+
+The implication: cycle-span scalar is an unreliable kernel-duration
+proxy whenever the two sides disagree on which events fire. PC-
+anchored joining (A.2) is the right fix because it joins on
+(event, PC) identity instead of cycle-span -- a comparison that
+remains meaningful even when one side fires INSTR_VECTOR×2 and the
+other doesn't.
 
 ### Finding 2: EMU and HW report disjoint events on the same tile
 

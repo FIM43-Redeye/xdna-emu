@@ -79,7 +79,12 @@ pub fn confirm_subsystem_ranges(
 /// When a data-driven extractor is added for any of these values, it
 /// should call `Confirmed::confirm()` to cross-validate against the
 /// hand-written baseline.
-fn populate_manual_constants(model: &mut types::ArchModel) {
+///
+/// Public so the runtime path (`device_model::extract_device_models`)
+/// can apply the same constants the build-time `build_arch_model` does
+/// -- consumers like `ArchConfig::core_address_map()` need the data
+/// regardless of which entry point produced the model.
+pub fn populate_manual_constants(model: &mut types::ArchModel) {
     match model.arch {
         types::Architecture::Aie2 => populate_aie2_manual_constants(model),
         // Other architectures: add population functions as needed.

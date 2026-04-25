@@ -4,6 +4,10 @@
 //! and lifts register definitions into graph-level types with pattern
 //! recognition and behavioral classification.
 //!
+//! Data-model file: query helpers like `total_count` are intentional API
+//! surface for downstream consumers; `dead_code` tolerated.
+#![allow(dead_code)]
+//!
 //! The four scheduling-relevant register categories:
 //! - **State**: Readable resource state (Lock{N}_value, DMA_BD{N}_{M})
 //! - **Operations**: Interfaces that trigger actions (Lock_Request)

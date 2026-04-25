@@ -1,4 +1,13 @@
 //! Core type definitions for the NPU architecture graph.
+//!
+//! Data-model file: many small constructors, predicates, and finder
+//! methods exist as intentional API surface even when there are no
+//! consumers yet (different parts of the graph are pulled by different
+//! subsystems).  We tolerate `dead_code` here so the warnings don't
+//! drown real signal -- if a method is genuinely unused after a
+//! subsystem boundary settles, delete it explicitly rather than relying
+//! on the lint.
+#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

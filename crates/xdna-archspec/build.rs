@@ -32,8 +32,6 @@ mod regdb;
 mod device_model;
 #[path = "src/regdb_extractor.rs"]
 mod regdb_extractor;
-#[path = "src/tablegen.rs"]
-mod tablegen;
 #[path = "src/model_builder.rs"]
 mod model_builder;
 

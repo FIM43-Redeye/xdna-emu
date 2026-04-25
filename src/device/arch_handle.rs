@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 use xdna_archspec::isa_execute::IsaExecutor;
 use xdna_archspec::locks::LockValueLayout;
 use xdna_archspec::stream_switch::StreamSwitchTopology;
+use xdna_archspec::types::CoreAddressMap;
 use crate::interpreter::timing::LatencyTable;
 
 static LOCK_VALUE_LAYOUT: OnceLock<&'static LockValueLayout> = OnceLock::new();
@@ -52,6 +53,30 @@ static ISA_EXECUTOR: OnceLock<&'static dyn IsaExecutor> = OnceLock::new();
 pub fn isa_executor() -> &'static dyn IsaExecutor {
     *ISA_EXECUTOR.get_or_init(|| {
         xdna_archspec::runtime::default_arch().isa_executor()
+    })
+}
+
+static CORE_ADDRESS_MAP: OnceLock<Option<&'static CoreAddressMap>> = OnceLock::new();
+
+/// Compute tile's core-side address map for the default architecture.
+///
+/// Carries the cardinal-direction (CardDir) constants used when the
+/// core resolves a memory address into a {Local, South, West, North,
+/// East} quadrant: `data_mem_addr`, `data_mem_shift` (so a bank size
+/// is `1 << data_mem_shift`), and `is_checkerboard`.  Routing through
+/// here lets `MemoryQuadrant::from_address` cope with any AIE arch the
+/// runtime selects without arch-hardcoded constants in the call site.
+///
+/// Returns `None` if the underlying device model didn't ship a
+/// `CoreAddressMap` (early/synthetic test models); current AIE2/AIE2P
+/// builds always populate it.
+pub fn core_address_map() -> Option<&'static CoreAddressMap> {
+    *CORE_ADDRESS_MAP.get_or_init(|| {
+        // Leak the clone to a static reference so the OnceLock can hold a
+        // 'static borrow.  One allocation per process; same lifetime
+        // shape as lock_value_layout() / stream_switch_topology() above.
+        xdna_archspec::runtime::default_arch().core_address_map()
+            .map(|m| Box::leak(Box::new(m.clone())) as &'static _)
     })
 }
 

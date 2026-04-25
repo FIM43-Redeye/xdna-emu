@@ -125,7 +125,7 @@ impl DeviceState {
     /// writes and avoids duplicating tile-local effect logic.
     ///
     /// Structured ops (`CoreEnable`, `DmaStart`) call dedicated helpers
-    /// (`apply_core_enable`, `start_compute_dma_channel`) that
+    /// (`apply_core_enable`, `start_dma_channel`) that
     /// replicate the CDO-specific side effects that used to live
     /// inline in `write_core_register`'s CORE_CONTROL branch and
     /// `write_dma_channel`'s Start_Queue branch.
@@ -154,7 +154,7 @@ impl DeviceState {
                 self.apply_core_enable(tile.col, tile.row, *enabled, *value);
             }
             DeviceOp::DmaStart { tile, channel, dir, bd_id } => {
-                self.start_compute_dma_channel(tile.col, tile.row, *channel, *dir, *bd_id);
+                self.start_dma_channel(tile.col, tile.row, *channel, *dir, *bd_id);
             }
             DeviceOp::MaskPoll { .. } => {
                 // On real hardware MaskPoll blocks until the condition is

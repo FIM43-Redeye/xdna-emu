@@ -223,6 +223,18 @@ pub trait ArchConfig: Send + Sync + std::fmt::Debug {
     ///
     /// Reads from `ProcessorModel::has_cascade_link` when available.
     fn has_cascade_link(&self) -> bool;
+
+    /// Compute tile's core-side address map.
+    ///
+    /// Carries `data_mem_addr` / `data_mem_shift` / `is_checkerboard` --
+    /// the shape of the cardinal-direction (CardDir) addressing the core
+    /// uses to reach its own memory and its neighbours' memories.
+    /// Consumers route through this instead of arch-hardcoded constants
+    /// so AIE2P/AIE1 ports only need to populate the model.
+    ///
+    /// Returns `None` if the device model didn't carry one (early-day
+    /// constructors); current AIE2 builds always populate it.
+    fn core_address_map(&self) -> Option<&crate::types::CoreAddressMap>;
 }
 
 // ============================================================================
@@ -294,6 +306,11 @@ pub struct ModelConfig {
     core_params: TileTypeParams,
     mem_tile_params: TileTypeParams,
     shim_params: TileTypeParams,
+    /// Compute tile's core-side address map (data_mem_addr, data_mem_shift,
+    /// is_checkerboard).  Cached on construction so `core_address_map()`
+    /// is a single deref away.  `None` only if the device model lacks
+    /// the field -- current AIE2/AIE2P builds always populate it.
+    core_address_map: Option<crate::types::CoreAddressMap>,
     /// Human-readable architecture name (leaked &'static str for trait compat).
     arch_name: &'static str,
     /// Architecture family (AIE, AIE2, AIE2P) -- stored for `dma_model()`
@@ -425,6 +442,7 @@ impl ModelConfig {
             core_params,
             mem_tile_params,
             shim_params,
+            core_address_map: compute.core_address_map.clone(),
             arch_name,
             architecture: model.arch,
         }
@@ -588,6 +606,10 @@ impl ArchConfig for ModelConfig {
             Architecture::Aie2 | Architecture::Aie2p => true,
             Architecture::Aie => false,
         }
+    }
+
+    fn core_address_map(&self) -> Option<&crate::types::CoreAddressMap> {
+        self.core_address_map.as_ref()
     }
 }
 
