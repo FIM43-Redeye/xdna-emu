@@ -20,7 +20,7 @@ import json
 import sys
 from collections import defaultdict
 
-SOURCE_FILE = "/home/triple/npu-work/aietools/data/aie_ml/lib/isg/me_inline_primitives.h"
+SOURCE_FILE = "/home/triple/npu-work/amd-unified-software/aietools/data/aie_ml/lib/isg/me_inline_primitives.h"
 FUNC_START = 5189
 FUNC_END = 9047
 

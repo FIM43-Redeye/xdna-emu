@@ -248,7 +248,7 @@ documentation. Read to understand the hardware, then write original code.
   signatures (argument/return types, configuration word) but not what the
   operation computes. How does VMAC's configuration word affect rounding,
   saturation, and accumulator behavior? The aietools Python models at
-  `aietools/data/aie_ml/lib/python_model/model/` describe these semantics
+  `amd-unified-software/aietools/data/aie_ml/lib/python_model/model/` describe these semantics
   (mulmac.py, srs_ups.py, permute.py, constants.py). Read them to understand
   the hardware behavior, then implement independently.
 - **Stream switch per-port type assignments**: mlir-aie gives port counts per
@@ -260,11 +260,15 @@ documentation. Read to understand the hardware, then write original code.
 
 **Documentation path**: `xdna-emu/docs/xdna/` (extracted text files, not PDFs)
 
-**aietools reference paths** (read-only, never copy):
-- Vector semantics: `aietools/data/aie_ml/lib/python_model/model/`
-- Register IDs: `aietools/data/aie_ml/lib/isg/me_regid.txt` (Synopsys copyright)
-- AIE API headers: `aietools/include/aie_api/` (MIT licensed)
-- Event types: `aietools/data/eventanalyze/event_type_table.txt`
+**aietools reference paths** (read-only, never copy). aietools lives at
+`amd-unified-software/aietools/` (the canonical install path; an earlier
+`aietools/` symlink was removed for clarity, so always use the full path):
+
+- Vector semantics: `amd-unified-software/aietools/data/aie_ml/lib/python_model/model/`
+- Register IDs: `amd-unified-software/aietools/data/aie_ml/lib/isg/me_regid.txt` (Synopsys copyright)
+- AIE API headers: `amd-unified-software/aietools/include/aie_api/` (MIT licensed)
+- Event types: `amd-unified-software/aietools/data/eventanalyze/event_type_table.txt`
+- Trace decoder library: `amd-unified-software/aietools/lib/lnx64.o/libxv_trace_decoder_opt.so` (Synopsys-copyrighted; readable for symbols, never linked or copied)
 
 ### Research Guidance
 
@@ -343,7 +347,7 @@ Top-level source files not covered by component docs:
 - **aie-rt**: `../aie-rt/driver/src/` - Official Xilinx hardware abstraction layer (branch `xlnx_rel_v2025.2`). The reference implementation for DMA, locks, and stream switch programming. Includes unit tests, examples, FAL, and AIE2P definitions. (mlir-aie vendors a patched fork at `third_party/aie-rt/` for its build -- that is NOT the emulator's reference.)
 - **mlir-aie**: `../mlir-aie` - MLIR-based AIE compiler, test binaries, device models, AM025 register database JSON
 - **llvm-aie**: `../llvm-aie` (local clone) - Peano compiler, ISA definitions via TableGen
-- **aietools**: `../aietools` - AMD proprietary tools (Chess compiler, aiesimulator, analysis tools). Read-only reference for hardware semantics not covered by open-source toolchain. See Licensing section.
+- **aietools**: `../amd-unified-software/aietools` - AMD proprietary tools (Chess compiler, aiesimulator, analysis tools). Read-only reference for hardware semantics not covered by open-source toolchain. See Licensing section.
 - **xdna-driver**: `/home/triple/npu-work/xdna-driver` - Linux kernel driver, device definitions
 - **XRT**: https://github.com/Xilinx/XRT - runtime (installed at /opt/xilinx/xrt)
 

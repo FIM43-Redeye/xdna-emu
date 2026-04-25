@@ -55,7 +55,7 @@ TEST_UTILS_INCLUDE="${TEST_LIB_DIR}/include"
 TEST_UTILS_LIB="${TEST_LIB_DIR}/lib"
 
 # aietools
-AIETOOLS_DIR="${AIETOOLS_DIR:-/home/triple/npu-work/aietools}"
+AIETOOLS_DIR="${AIETOOLS_DIR:-/home/triple/npu-work/amd-unified-software/aietools}"
 
 # Compiler paths (auto-detect from environment)
 PEANO_CLANG="${PEANO_INSTALL_DIR:-${MLIR_AIE}/../llvm-aie/install}/bin/clang++"

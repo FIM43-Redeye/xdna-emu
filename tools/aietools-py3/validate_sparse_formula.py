@@ -15,7 +15,7 @@ import os
 
 # Add aietools model path
 model_path = os.path.join(os.path.dirname(__file__),
-    '../../aietools/data/aie_ml/lib/python_model/model')
+    '../../../amd-unified-software/aietools/data/aie_ml/lib/python_model/model')
 sys.path.insert(0, model_path)
 
 import numpy as np

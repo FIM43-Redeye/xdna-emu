@@ -547,12 +547,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--opns-header",
-        default="../aietools/data/aie_ml/lib/isg/me_chess_opns.h",
+        default="../amd-unified-software/aietools/data/aie_ml/lib/isg/me_chess_opns.h",
         help="Path to me_chess_opns.h (default: %(default)s)",
     )
     parser.add_argument(
         "--types-header",
-        default="../aietools/data/aie_ml/lib/isg/me_chess_types.h",
+        default="../amd-unified-software/aietools/data/aie_ml/lib/isg/me_chess_types.h",
         help="Path to me_chess_types.h (default: %(default)s)",
     )
     parser.add_argument(

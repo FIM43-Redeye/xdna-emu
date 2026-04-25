@@ -20,7 +20,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 BDD_ENUM="$PROJECT_DIR/tools/bdd_enum/build/bdd_enum"
 VALIDATOR="$PROJECT_DIR/target/release/examples/bdd_validate"
-ISG_DIR="${ISG_DIR:-/home/triple/npu-work/aietools/data/aie_ml/lib/isg}"
+ISG_DIR="${ISG_DIR:-/home/triple/npu-work/amd-unified-software/aietools/data/aie_ml/lib/isg}"
 
 # Which ENA file to use
 ENA_NAME="${1:-me_das.ena}"

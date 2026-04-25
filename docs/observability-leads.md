@@ -193,13 +193,13 @@ should reveal where PC values are inserted.
 
 #### Aietools follow-up (2026-04-24): full decoder library found
 
-Earlier search missed the binaries because `find` without `-L` does
-not follow the `aietools/` symlink. Re-searching with `-L` (or via
-the canonical path `amd-unified-software/aietools/`) reveals the
-real install includes a complete trace-decoder shared library
-(read-only reference -- do not copy):
+Earlier search missed the binaries because `find` without `-L` did
+not follow the `aietools/` symlink (since removed). Searching the
+canonical path `amd-unified-software/aietools/` reveals the real
+install includes a complete trace-decoder shared library (read-only
+reference -- do not copy):
 
-`aietools/lib/lnx64.o/libxv_trace_decoder_opt.so`
+`amd-unified-software/aietools/lib/lnx64.o/libxv_trace_decoder_opt.so`
 
 Symbol-table inspection (read-only knowledge of hardware behavior)
 exposes the full frame taxonomy in `cardano::Trace`:
