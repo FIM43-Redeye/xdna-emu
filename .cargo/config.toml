@@ -1,2 +1,14 @@
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# Point the tblgen crate at our local llvm-aie build (it expects
+# `<prefix>/bin/llvm-config` to be the LLVM 21.x install we use, not
+# whatever older llvm-config happens to be in PATH). Resolved relative
+# to this config file (xdna-emu/.cargo/config.toml -> ../llvm-aie/build).
+# Override per-shell with TABLEGEN_210_PREFIX=/path/to/llvm-build if needed.
+#
+# (NEXT-STEPS.md previously called this LLVM_SYS_*_PREFIX -- that's the
+# llvm-sys crate's convention; the tblgen-rs fork we use reads
+# TABLEGEN_<MAJOR>0_PREFIX instead.)
+[env]
+TABLEGEN_210_PREFIX = { value = "../llvm-aie/build", relative = true, force = false }

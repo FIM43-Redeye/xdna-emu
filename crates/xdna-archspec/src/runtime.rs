@@ -411,8 +411,14 @@ impl ModelConfig {
 
         Self {
             // The emulator adds 1 column to the model's count for the
-            // column-0 convention used in CDO addressing.
-            columns: topo.columns + 1,
+            // column-0 convention used in CDO addressing.  Real device
+            // model values are at most a couple dozen columns, so the
+            // checked_add is purely a defensive guard against a
+            // catastrophic regenerated model -- we'd rather panic loudly
+            // than silently wrap to 0.
+            columns: topo.columns.checked_add(1)
+                .expect("array_topology.columns + 1 overflowed usize; \
+                         device model JSON is corrupt"),
             rows: topo.rows,
             num_mem_tile_rows: topo.num_mem_tile_rows,
             max_lock_value,
