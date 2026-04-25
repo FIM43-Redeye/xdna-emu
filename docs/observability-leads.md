@@ -127,6 +127,70 @@ captures but we have no trustworthy decoder for them. Reverse-
 engineering needed (or finding a decoder buried in aietools); until
 then mode 0 is the only mode whose contents we can interpret.
 
+#### Aietools hunt result (2026-04-24)
+
+Searched the local aietools install for an authoritative on-tile
+trace decoder. Found a partial trail; the `.cpp` implementation is
+**not shipped** in this install, but a Synopsys-copyrighted header
+discloses the **semantic** structure of the trace stream
+(read-only reference per project policy; do not copy):
+
+`tps/lnx64/target_aie_ml/chessdir/checkersdir/include/checkers_trace_decoder.h`
+
+The header defines a decoder-callback API whose virtual methods
+enumerate exactly what the on-tile trace stream encodes:
+
+- cycle markers
+- instruction-address (PC) values at indirect/taken branches
+- conditional-branch outcomes (taken / not-taken bits)
+- memory request and response (address + value)
+- function-call actions (jsr, rts, entry, ji/rti, tailcall, delay-slot)
+- hardware stalls
+- IO/stream changes
+- trace control (start/stop) and overflow markers
+- trace-stage transitions
+
+This **matches AM020 §2's "branches and ZOL LC" description** and
+proves our experimental decoder's per-instruction-slot E/N atom
+interpretation is wrong. The stream is event-driven (records
+deltas on branches and accesses) not slot-driven (no E/N bit per
+issue slot).
+
+**For Event-PC mode (mode 1)**: the stream is essentially mode 0's
+event firings interleaved with `process_instruction_address(pc)`
+records -- each event captured along with the PC at which it fired,
+giving us PC-anchored events instead of cycle-anchored.
+
+**For INST_EXEC mode (mode 2)**: pure execution-flow trace --
+sequence of `process_cjump(taken)` and `process_instruction_address(pc)`
+calls reconstructible into a branch-by-branch path through the ELF.
+
+**Byte format remains opaque** -- the header shows the API surface,
+not the wire format. Other aietools artefacts checked and dismissed:
+
+- `data/DynamicEventTraceSchema.json`, `EventTraceConfigSchema.json`:
+  configuration-side schemas, not decode formats
+- `bin/x86sim_decode_event_trace.py`: x86sim's internal event log,
+  not on-tile trace
+- `data/eventanalyze/event_type_table.txt`: high-level analyzer event
+  types (CORE_WAIT, PC_CHANGE, etc.), not byte format
+- `bin/eventanalyze`, `bin/hwanalyze`: bash wrappers for missing
+  loader binaries; the actual analyzers aren't in this install
+- `data/pl_fileio/libpl_trace_decoder.so`: programmable-logic trace
+  (FPGA fabric), not AIE
+- `tps/lnx64/target_aie_ml/chessdir/ychessdir/iss_hw_tracing.tcl`:
+  ISS-debugger UI plugin; references load_trace but the actual
+  binary plumbing isn't here either
+
+**Where to go:** either try a fuller aietools install (the AMD
+unified installer ships more components -- the `.cpp` decoder may
+be in a sibling package), or reverse-engineer the byte format using
+the semantic structure above as a guide. The latter is now far more
+tractable: we know we're looking for a stream that contains *PCs,
+branch outcomes, cycle markers, and memory accesses* -- not E/N
+atoms. A diff between mode-0 and mode-1 bytes for the same kernel
+should reveal where PC values are inserted.
+
 ### 2. Performance counters with start/stop/reset events
 
 `aie-rt/driver/src/perfcnt/xaie_perfcnt.h`
