@@ -1,0 +1,346 @@
+# Observability Leads -- Untapped Capabilities in aie-rt and xdna-driver
+
+Survey notes from a 2026-04-24 sweep of `../aie-rt/` and `../xdna-driver/`.
+Captures debug, trace, and observability infrastructure we are not yet using
+in xdna-emu's trace pipeline. Preserved here so the leads survive across
+sessions and so the next round of sequence-skeleton / drift-correction work
+can pick them up without re-doing the survey.
+
+The driving question was: what would let us anchor the trace window to
+deterministic events, partition the variance budget, or get an independent
+ground truth for "the kernel body took N cycles"?
+
+Sorted by relevance to the trace-sweep / sequence-skeleton work.
+
+---
+
+## Drift correction & sequence-skeleton
+
+### 1. Event-bounded trace windows
+
+`aie-rt/driver/src/trace/xaie_trace.h`
+
+```c
+XAie_TraceStartEvent(DevInst, Loc, Module, Event)
+XAie_TraceStopEvent(DevInst, Loc, Module, Event)
+XAie_TraceControlConfig(DevInst, Loc, Module, StartEvent, StopEvent, Mode)
+XAie_TraceModeConfig(DevInst, Loc, Module, Mode)
+  // modes: XAIE_TRACE_EVENT_TIME, XAIE_TRACE_EVENT_PC, XAIE_TRACE_INST_EXEC
+```
+
+The trace window is bounded by start/stop events. Trace_Control0
+register (offset 0x340D0 on core, 0x140D0 on memmod, 0x340D0 on shim,
+0x940D0 on memtile) carries the start_event (bits [16:22], 7 bits on
+core/mem/shim, 8 bits on memtile) and stop_event (bits [24:30/31]).
+
+**Discovery (2026-04-24):** mlir-aie's compiled output is *not*
+free-running -- it sets `start_event=BROADCAST_15` (122 on core) and
+`stop_event=BROADCAST_14` (121). The host fires those broadcasts via
+shim control packets to bracket the kernel run.
+
+`tools/trace-patch-events.py` (extended in this session) supports
+`--start-event` / `--stop-event` / `--mode` flags to override these
+fields in an existing insts.bin. No mlir-aie patch needed.
+
+**Empirical comparison** (`build/experiments/cdo-preamble-test/test_event_bounded.py`,
+add_one_objFifo, N=20 same-batch iters under hwctx reuse + CDO preamble):
+
+| Mode | start | stop | mean cycles | sd | range | n_events sd |
+|------|-------|------|-------------|----|----|------|
+| broadcast (default) | 122 | 121 | 3160 | **221** | 1049 | **0.0** |
+| call-return | INSTR_CALL=35 | INSTR_RETURN=36 | 3109 | **199** | 772 | 1.2 |
+| call-disabled | INSTR_CALL=35 | CORE_DISABLED=29 | 9911 | 2664 | 8944 | 1.6 |
+
+Broadcast is essentially as stable as call-return on span (220 vs 200
+cycles sd) but gives **perfect event-count stability** (sd=0.0,
+exactly 146 events every iteration). Call-disabled is broken under
+hwctx-reuse: CORE_DISABLED doesn't fire predictably so the trace runs
+3x longer and varies 12x more.
+
+**Take-away:** mlir-aie's broadcast configuration is near-optimal for
+this workload. The remaining ~7% span jitter is residual broadcast
+latency variance, not something we can reduce by re-anchoring on
+on-tile events. Future direction: try anchoring on PERF_CNT events
+(perfcnt threshold reached -> fire one-shot event) to get a more
+precise on-tile bound, or use this as evidence that the broadcast bound
+is the right default and shift focus to calibrating the residual.
+
+PC-trace mode (`XAIE_TRACE_EVENT_PC`) and instruction-execution mode
+(`XAIE_TRACE_INST_EXEC`) remain unexplored. Available via the same
+`--mode` flag on the patcher.
+
+**Status:** patcher landed; default behavior validated as a strong
+baseline. Iterate from here.
+
+### 2. Performance counters with start/stop/reset events
+
+`aie-rt/driver/src/perfcnt/xaie_perfcnt.h`
+
+```c
+XAie_PerfCounterControlSet(DevInst, Loc, Module, Counter,
+                           StartEvent, StopEvent)
+XAie_PerfCounterResetControlSet(DevInst, Loc, Module, Counter, ResetEvent)
+XAie_PerfCounterEventValueSet(...)   // threshold trigger
+XAie_PerfCounterGet(...)
+```
+
+Four 32-bit counters per tile, each with independent start, stop, and reset
+events. A counter started on EVENT_A and stopped on EVENT_B gives a
+cycle-exact span across runs -- no timestamp arithmetic, no drift
+accumulation.
+
+**This is the cleanest mechanism for "cycles between two marker events."**
+It would directly answer "is the wobble in the prelude, the body, or the
+postlude?" by partitioning the run into perfcnt-bounded segments.
+
+There is also a separate **MDM (Microcode DMA) performance counter** API
+(`XAie_MdmPerfCounterStart/Stop/Sample/Get`) that exposes DMA latency
+distribution. Worth exploring once we want to attribute drift specifically
+to DMA timing.
+
+**Status:** doable today. Would pair naturally with lead #1.
+
+### 3. Event broadcast + directional blocking
+
+`aie-rt/driver/src/events/xaie_events.h`
+
+```c
+XAie_EventBroadcast(DevInst, Loc, Module, BroadcastId, Event)
+XAie_EventBroadcastBlockDir(DevInst, Loc, Module, ..., Dir)
+  // Dir: North/South/East/West
+XAie_EventComboConfig(...)            // AND/OR/AND_NOT, up to 8 events
+XAie_EventGroupControl(...)           // group events bitmap
+```
+
+Cross-tile anchor capability we don't use today. If sequence-skeleton
+extends to multi-tile, broadcasting a single "go" event into multiple
+trace control registers gives synchronous start across the array.
+Directional blocking lets us shape the broadcast region (e.g., one column
+only).
+
+Combo events let one trace slot fire on (A AND B) or (A OR B), which could
+reduce the number of slots needed for compound conditions.
+
+**Edge detection** events (rising/falling edges of monitored signals) are
+new in AIE2P -- not available on Phoenix/NPU1.
+
+**Status:** useful when we go multi-tile. Not blocking current work.
+
+---
+
+## Orthogonal observability
+
+### 4. Kernel ftrace tracepoints
+
+`xdna-driver/src/driver/amdxdna/amdxdna_trace.h`
+
+```
+xdna_job             (sched_job, name, string, seq, op)
+mbox_set_tail        (channel_id, opcode, msg_id)
+mbox_set_head        (channel_id, opcode, msg_id)
+mbox_irq_handle      (irq, msix_index)
+uc_irq_handle        (irq, msix_index)
+mbox_rx_worker       (...)
+mbox_poll_handle     (...)
+amdxdna_debug_point  (name, number, string)
+```
+
+Enable via `/sys/kernel/debug/tracing/events/amdxdna_trace/`. Captures the
+host-device handshake at the kernel level: job submit, mailbox push/pull,
+IRQ arrival, worker wake-up.
+
+Lets us partition variance across the stack: "did this 50us jitter come
+from kernel scheduling, mailbox latency, or on-tile execution?" Free to
+enable -- no instrumentation in our code.
+
+**Status:** add to runner once user's debugfs is back. Cheap and additive.
+
+### 5. `QUERY_HW_CONTEXTS` ioctl
+
+`xdna-driver/include/uapi/drm/amdxdna_accel.h`
+
+`DRM_IOCTL_AMDXDNA_GET_INFO` with type `QUERY_HW_CONTEXTS` returns an array
+of `amdxdna_drm_hwctx_entry`:
+
+```c
+struct amdxdna_drm_hwctx_entry {
+  u64 context_id;
+  struct { start_col, num_col } partition;
+  u32 pid;
+  u64 command_submissions;
+  u64 command_completions;
+  u64 migrations;
+  u64 preemptions;
+  u64 errors;
+};
+```
+
+Per-batch sanity check independent of the trace buffer. Useful for
+distinguishing "trace was empty because nothing ran" from "trace was empty
+because event config was wrong." Also surfaces preemption/migration events
+that would otherwise be invisible in the trace.
+
+Other useful `GET_INFO` queries:
+- `QUERY_RESOURCE_INFO` -- npu_clk_max, npu_tops_curr, npu_task_curr
+- `QUERY_CLOCK_METADATA` -- mp_npu_clock and h_clock with current freq_mhz
+- `QUERY_SENSORS` -- power (mW), column utilization
+- `QUERY_AIE_STATUS` -- per-column live bitmap
+- `GET_POWER_MODE` -- DEFAULT / LOW / MEDIUM / HIGH / TURBO
+
+**Status:** doable today via XRT shim or raw ioctl.
+
+### 6. Firmware log/trace ring buffers
+
+`xdna-driver/src/driver/amdxdna/aie2_dpt.c`
+
+Two 8KB ring buffers maintained by firmware (PMC):
+
+| Buffer | Debugfs entry | Contents |
+|--------|---------------|----------|
+| FW log   | `dump_fw_log_buffer`   | Errors, warnings, info, debug |
+| FW trace | `dump_fw_trace_buffer` | Detailed firmware execution events |
+
+Frame format (both buffers):
+
+```
+header: magic 0xCA, data_word_len, seq_num, reserved
+data:   timestamp (u64), format_flag, level, app_id, argc, line, module
+footer: reserved, seq_num, data_word_len, magic 0xBA
+```
+
+Sequence numbers detect wraparound. Levels: ERR / WRN / INF / DBG.
+
+Probably contains the kernel-FW handshake timing we currently can't see.
+Could correlate firmware ops with our on-tile trace events.
+
+**Status:** read on demand via debugfs once user's debugfs is back.
+
+---
+
+## Auxiliary capabilities (lower priority but preserve)
+
+### Debug halt / interrupt backtracking
+
+`aie-rt/driver/src/core/xaie_core.h` and
+`aie-rt/driver/src/interrupt/xaie_interrupt_backtrack.c`:
+
+```c
+XAie_CoreDebugHalt / XAie_CoreDebugUnhalt
+XAie_CoreGetDebugHaltStatus
+XAie_CoreConfigDebugControl1        // event-triggered halt
+XAie_CoreConfigureErrorHaltEvent
+XAie_BacktrackErrorInterrupts       // walks error log, finds source tile
+```
+
+Synchronization primitive (freeze cores on error) plus a post-mortem
+backtracking API. Useful if we ever need to pause emulation on a
+trace-detected anomaly.
+
+### Power / clock / DPM
+
+xdna-driver:
+- Debugfs `dpm_level` -- read and write DPM level (frequency pair
+  `[npuclk, hclk]` MHz). NPU1 has a discrete table.
+- `aie2_smu.c` exposes `AIE_SMU_SET_HARD_DPMLEVEL` and `SOFT_DPMLEVEL`
+- `QUERY_CLOCK_METADATA` ioctl reads current frequencies
+
+aie-rt:
+- `XAie_PmSetColumnClk` -- column-wide clock gate. Could "pause" a batch
+  for inspection at power level.
+
+Relevant to the future "6 MHz downclock so DMA delay becomes irrelevant"
+direction. The DPM table is discrete, so we're constrained to the levels
+firmware exposes -- not arbitrary frequencies. Worth checking what the
+lowest level actually is.
+
+### TDR (Timeout Detection & Recovery)
+
+`xdna-driver/src/driver/amdxdna/aie2_tdr.c`
+
+Periodic watchdog (default 2s, module param `timeout_in_sec`). Detects
+stuck contexts via submission/completion counter stagnation, then either
+dumps state (`tdr_dump_ctx=true`) or resets the context.
+
+`docs/driver-diagnostics.md` covers the existing `aie2_diag` debugfs
+surface (diag_stats, diag_tdr_history, diag_cert_state) -- this is the
+userspace view of TDR events.
+
+### FAL (Full Abstraction Layer)
+
+`aie-rt/fal/src/`
+
+C++ resource manager + profiling helpers. Pre-built widgets:
+
+- `XAieActiveCycles` (counter on ACTIVE vs DISABLED)
+- `XAieStallCycles` (counter on GROUP_CORE_STALL vs GROUP_CORE_PROGRAM_FLOW)
+- `XAieStallOccurrences` (event count, not duration)
+- Trace-resource class with slot reservation, cross-module event support
+
+Reference for managing shared resources (events, counters, broadcast
+channels, trace slots) when we have many concurrent measurements. Not
+needed for current single-trace setup.
+
+### Telemetry types (firmware-side aggregates)
+
+`xdna-driver/src/driver/amdxdna/aie2_msg_priv.h`
+
+5 telemetry buffer types, queryable via debugfs `telemetry_*` files or
+`QUERY_TELEMETRY` ioctl:
+
+- DISABLED, HEALTH, ERROR_INFO, **PROFILING**, DEBUG
+
+Each is an 8KB DMA buffer fetched from FW on read. PROFILING is the
+interesting one for fidelity validation -- per-tile / aggregate
+performance metrics that we could compare against emulated values.
+
+NPU4 collapses this to a single PERF_COUNTER type with different layout.
+
+---
+
+## Action priority for trace-sweep work
+
+When sequence-skeleton tooling resumes, in this order:
+
+1. **Event-bounded trace prototype (lead #1).** Patch insts.bin to set
+   start/stop events on the trace control register. Run a 20-iter
+   same-batch test and check whether entry/exit jitter collapses. Single
+   biggest potential win, testable without mlir-aie changes.
+
+2. **Perfcnt-span sidecar (lead #2).** One perf counter started on first
+   INSTR_CALL, stopped on last INSTR_RETURN, read out post-batch.
+   Independent ground truth for "did the kernel body take a constant
+   number of cycles?"
+
+3. **Ftrace capture in the runner (lead #4).** Once debugfs is back,
+   subscribe to `xdna_job` and `mbox_*` tracepoints during a sweep.
+   Partitions kernel-side variance from on-tile variance.
+
+4. **`QUERY_HW_CONTEXTS` per-batch sample (lead #5).** Cheap meta-anchor
+   for batch validity. Append to runner JSON status output.
+
+Leads 3 and 6 are useful adjuncts but not in the critical path.
+
+---
+
+## Source paths cheat sheet
+
+```
+aie-rt/driver/src/trace/xaie_trace.h         -- trace API
+aie-rt/driver/src/perfcnt/xaie_perfcnt.h     -- perfcnt API
+aie-rt/driver/src/events/xaie_events.h       -- event broadcast / combo / group
+aie-rt/driver/src/core/xaie_core.h           -- debug halt
+aie-rt/driver/src/interrupt/                 -- L1/L2, backtracking
+aie-rt/driver/src/pm/xaie_clock.h            -- column clock gating
+aie-rt/fal/src/rsc/xaiefal-trace.hpp         -- FAL trace resource
+aie-rt/fal/src/rsc/xaiefal-perf.hpp          -- FAL perfcnt resource
+aie-rt/fal/src/profile/xaiefal-profile.hpp   -- pre-built profilers
+
+xdna-driver/include/uapi/drm/amdxdna_accel.h            -- ioctl + query types
+xdna-driver/src/driver/amdxdna/amdxdna_trace.h          -- ftrace tracepoints
+xdna-driver/src/driver/amdxdna/aie2_debugfs.c           -- NPU1 debugfs surface
+xdna-driver/src/driver/amdxdna/aie2_dpt.c               -- FW log/trace parsing
+xdna-driver/src/driver/amdxdna/aie2_tdr.c               -- TDR watchdog
+xdna-driver/src/driver/amdxdna/aie2_msg_priv.h          -- telemetry types
+xdna-driver/src/driver/amdxdna/aie2_smu.c               -- DPM commands
+xdna-driver/src/driver/amdxdna/amdxdna_error.h          -- error codes
+```

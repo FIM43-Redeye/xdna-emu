@@ -75,6 +75,29 @@ _TRACE_EVENT_REGS = {
     "shim":    (0x340E0, 0x340E4),
 }
 
+# Trace_Control0 register offsets per tile-type. Layout (from
+# xaiemlgbl_params.h):
+#   bits [0:1]   MODE          0=event-time, 1=event-PC, 2=instr-exec
+#   bits [16:22] TRACE_START   7-bit event id (8-bit on memtile)
+#   bits [24:30] TRACE_STOP    7-bit event id (8-bit on memtile)
+# mlir-aie's compiled output sets these to BROADCAST_15 / BROADCAST_14
+# (122 / 121 on core), gated by host-issued shim control packets. We
+# patch them to events that fire from inside the kernel itself, which
+# eliminates the broadcast-latency component of entry/exit jitter.
+_TRACE_CONTROL0_REGS = {
+    "core":    0x340D0,
+    "memmod":  0x140D0,
+    "memtile": 0x940D0,
+    "shim":    0x340D0,
+}
+# Event field width: memtile has 8-bit slots, others 7-bit.
+_EVENT_FIELD_WIDTHS = {
+    "core":    7,
+    "memmod":  7,
+    "memtile": 8,
+    "shim":    7,
+}
+
 # Fixed-size standard-op byte lengths. Entries not here are either
 # variable-length (resolved from an embedded size field) or custom
 # (opcode >= 128; size at offset +4). Numbers derived from the cursor-read
@@ -257,6 +280,64 @@ def patch_events(
     return bytes(buf), patched
 
 
+def patch_trace_control(
+    data: bytes,
+    col: int,
+    row: int,
+    tile_type: str,
+    start_event: int | None = None,
+    stop_event: int | None = None,
+    mode: int | None = None,
+) -> Tuple[bytes, int]:
+    """Patch the Trace_Control0 register's start_event, stop_event, and/or
+    mode fields. Any field set to None is left as the existing value
+    (read from the existing Write32 in insts.bin).
+
+    Returns (patched_bytes, n_writes_patched). Raises ValueError if no
+    Trace_Control0 write is found for the target tile.
+    """
+    if tile_type not in _TRACE_CONTROL0_REGS:
+        raise ValueError(f"unknown tile_type {tile_type!r}; want one of "
+                         f"{sorted(_TRACE_CONTROL0_REGS)}")
+    width = _EVENT_FIELD_WIDTHS[tile_type]
+    max_event = (1 << width) - 1
+    for name, val in [("start_event", start_event), ("stop_event", stop_event)]:
+        if val is not None and not (0 <= val <= max_event):
+            raise ValueError(f"{name}={val} exceeds {width}-bit field "
+                             f"(max {max_event}) for tile_type={tile_type}")
+    if mode is not None and not (0 <= mode <= 3):
+        raise ValueError(f"mode={mode} exceeds 2-bit field")
+
+    target = _npu_address(col, row, _TRACE_CONTROL0_REGS[tile_type])
+    buf = bytearray(data)
+    patched = 0
+    for rec_off, reg_off, old_value in _walk_write32(data):
+        if reg_off != target:
+            continue
+        new = old_value
+        if start_event is not None:
+            mask = ((1 << width) - 1) << 16
+            new = (new & ~mask) | ((start_event & ((1 << width) - 1)) << 16)
+        if stop_event is not None:
+            mask = ((1 << width) - 1) << 24
+            new = (new & ~mask) | ((stop_event & ((1 << width) - 1)) << 24)
+        if mode is not None:
+            new = (new & ~0x3) | (mode & 0x3)
+        struct.pack_into("<I", buf, rec_off + 16, new & 0xFFFFFFFF)
+        patched += 1
+    if patched == 0:
+        raise ValueError(
+            f"no Trace_Control0 write found for tile ({col},{row}) "
+            f"type={tile_type}. xclbin compiled without trace on this tile?"
+        )
+    if patched != 1:
+        raise ValueError(
+            f"expected exactly 1 Trace_Control0 write for tile ({col},{row}) "
+            f"type={tile_type}; found {patched}. insts.bin layout unexpected."
+        )
+    return bytes(buf), patched
+
+
 def _parse_events_arg(spec: str) -> List[int]:
     """Parse a comma-separated event list. Each entry is decimal or 0xHEX.
     Trailing empty entries are ignored so callers can write '-events=33,,'
@@ -289,25 +370,65 @@ def main() -> int:
     ap.add_argument("--tile-type", required=True,
                     choices=sorted(_TRACE_EVENT_REGS),
                     help="tile-type event-register set to patch")
-    ap.add_argument("--events", required=True,
+    ap.add_argument("--events", default=None,
                     help="comma-separated event IDs (decimal or 0xHEX), "
-                         "up to 8; missing trailing slots default to 0")
+                         "up to 8; missing trailing slots default to 0. "
+                         "Omit to leave Trace_Event0/1 untouched (use with "
+                         "--start-event/--stop-event for control-only patching)")
+    ap.add_argument("--start-event", type=lambda s: int(s, 0), default=None,
+                    help="override Trace_Control0 TRACE_START event id "
+                         "(default: leave existing value untouched). mlir-aie "
+                         "compiles to BROADCAST_15 (122 on core); replacing "
+                         "with a kernel-internal event eliminates broadcast "
+                         "latency from entry/exit jitter")
+    ap.add_argument("--stop-event", type=lambda s: int(s, 0), default=None,
+                    help="override Trace_Control0 TRACE_STOP event id "
+                         "(default: leave existing value untouched). mlir-aie "
+                         "compiles to BROADCAST_14 (121 on core)")
+    ap.add_argument("--mode", type=lambda s: int(s, 0), default=None,
+                    help="override Trace_Control0 MODE field "
+                         "(0=event-time, 1=event-PC, 2=instr-exec)")
     ap.add_argument("--output", required=True, help="path to write patched insts.bin")
     args = ap.parse_args()
 
+    if (args.events is None and args.start_event is None
+            and args.stop_event is None and args.mode is None):
+        ap.error("nothing to patch: pass --events and/or "
+                 "--start-event/--stop-event/--mode")
+
     data = Path(args.input).read_bytes()
+    summary_parts: list[str] = []
     try:
-        events = _parse_events_arg(args.events)
-        patched_bytes, n = patch_events(
-            data, args.col, args.row, args.tile_type, events,
-        )
+        if args.events is not None:
+            events = _parse_events_arg(args.events)
+            data, n = patch_events(
+                data, args.col, args.row, args.tile_type, events,
+            )
+            summary_parts.append(f"events={events} ({n} write32 patched)")
+        if (args.start_event is not None or args.stop_event is not None
+                or args.mode is not None):
+            data, n = patch_trace_control(
+                data, args.col, args.row, args.tile_type,
+                start_event=args.start_event,
+                stop_event=args.stop_event,
+                mode=args.mode,
+            )
+            ctl_bits = []
+            if args.start_event is not None:
+                ctl_bits.append(f"start={args.start_event}")
+            if args.stop_event is not None:
+                ctl_bits.append(f"stop={args.stop_event}")
+            if args.mode is not None:
+                ctl_bits.append(f"mode={args.mode}")
+            summary_parts.append(f"control[{','.join(ctl_bits)}] ({n} patched)")
     except ValueError as e:
         print(f"trace-patch-events: {e}", file=sys.stderr)
         return 2
 
-    Path(args.output).write_bytes(patched_bytes)
-    print(f"trace-patch-events: patched {n} Write32 ops in {args.output} "
-          f"(tile ({args.col},{args.row}) type={args.tile_type} events={events})")
+    Path(args.output).write_bytes(data)
+    print(f"trace-patch-events: tile ({args.col},{args.row}) "
+          f"type={args.tile_type} -> {args.output} :: "
+          + "; ".join(summary_parts))
     return 0
 
 

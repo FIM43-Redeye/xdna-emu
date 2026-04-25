@@ -11,6 +11,9 @@ Living technical reference material:
   sequences, polling semantics)
 - [driver-diagnostics.md](driver-diagnostics.md) -- XDNA driver debugfs and
   IOCTL telemetry
+- [observability-leads.md](observability-leads.md) -- Untapped debug/trace
+  capabilities in aie-rt and xdna-driver, with action priorities for
+  trace-sweep / sequence-skeleton work
 - [programmatic-sources.md](programmatic-sources.md) -- Survey of
   programmatically-extractable sources of hardware truth
 
