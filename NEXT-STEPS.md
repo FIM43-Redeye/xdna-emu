@@ -3,9 +3,11 @@
 Recovery document for picking up this refactor in a future session. Read
 this first, then dive into the authoritative artifacts below.
 
-**Last updated:** 2026-04-24 (Phase 1 COMPLETE -- all 8 subsystems landed)
-**Current branch:** `dev` (no master merges until Phase 2 hygiene is scoped)
+**Last updated:** 2026-04-25 (Phase 2 hygiene partial -- D.1/D.2/D.4/D.5/D.6/D.7 landed; D.3 design doc, implementation deferred to its own brainstorm)
+**Current branch:** `dev` (no master merges until D.3 lands or `phase1-complete` is tagged)
 **Latest tag:** `phase1-subsys-parser-ergonomics` (Subsystem 8 Stage 8c completion; Phase 1 done)
+
+**Session-resume entry point**: read `docs/superpowers/findings/2026-04-25-session-summary.md` first. It maps the 6 commits from 2026-04-25, the 6 findings docs from threads A and C, and what's still open (A.2 sweep + PC-anchored joining; D.3 universal-DeviceOp refactor; C.3/#6 debugfs-blocked; D.8 master merge milestone).
 
 ---
 
