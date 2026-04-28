@@ -428,6 +428,16 @@ impl TraceUnit {
         self.configured
     }
 
+    /// Return the number of encoded bytes currently buffered.
+    ///
+    /// Bytes accumulate as events are committed and are consumed when packed
+    /// into 8-word packets. A non-zero value means at least one trace frame
+    /// has been encoded since the last flush. Useful for integration tests
+    /// that verify event routing without inspecting packet content.
+    pub fn encoded_bytes_len(&self) -> usize {
+        self.byte_buffer.len()
+    }
+
     /// Flush any remaining bytes as a padded final packet.
     ///
     /// Commits any pending same-cycle accumulation first so its frame lands

@@ -694,6 +694,48 @@ fn pulse_event_counter_ticks_in_both_states() {
     assert_eq!(bank.read_counter(0), 15);
 }
 
+// -- Wiring-level test: threshold firing via tick_active_cycles --
+
+/// Verifies that a counter configured with start_event=TRUE(1) and
+/// event_value=10 fires exactly once at cycle 10, then stops.
+///
+/// This is the load-bearing behavior wired into coordinator.rs in Task 1:
+/// tick_active_cycles() returns a Vec of counter indices that crossed
+/// threshold this cycle.
+#[test]
+fn threshold_fires_once_at_event_value() {
+    let mut bank = PerfCounterBank::new(4);
+    // Configure cnt0: start=1 (TRUE), stop=0 (none), threshold=10.
+    // write_control_start_stop(value, counter_lo, counter_hi, event_width)
+    // bits [6:0] = start0, bits [14:8] = stop0
+    let ctrl0 = (1u32) | (0u32 << 8); // start=TRUE(1), stop=NONE(0)
+    bank.write_control_start_stop(ctrl0, 0, 1, 7);
+    bank.write_event_value(0, 10);
+    bank.handle_event(1); // TRUE event fires -> counter 0 starts
+
+    // Cycles 1-9: counter ticks but threshold not yet reached.
+    for cycle in 1..10 {
+        let fired = bank.tick_active_cycles();
+        assert!(
+            fired.is_empty(),
+            "cycle {} fired prematurely: {:?}",
+            cycle,
+            fired
+        );
+    }
+
+    // Cycle 10: counter hits threshold, should report counter index 0.
+    let fired = bank.tick_active_cycles();
+    assert_eq!(fired, vec![0], "cycle 10 should fire counter 0");
+
+    // Cycle 11+: no re-fire without a reset event.
+    let fired = bank.tick_active_cycles();
+    assert!(
+        fired.is_empty(),
+        "cycle 11 should not re-fire (no reset configured)"
+    );
+}
+
 #[test]
 fn deprecated_tick_shim_behaves_as_active_cycles() {
     // The deprecated tick() shim must forward to tick_active_cycles(),

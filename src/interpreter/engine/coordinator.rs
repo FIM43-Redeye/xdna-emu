@@ -1007,11 +1007,10 @@ impl InterpreterEngine {
             }
         }
 
-        // Phase 3e: Tick tile timers and performance counters.
+        // Phase 3e: Tick tile timers and performance counters; route firings.
         //
         // Each tile has two 64-bit timers (core module and memory module)
-        // that increment every cycle. The timer can generate a trigger
-        // event when it reaches a programmed threshold.
+        // that increment every cycle.
         //
         // Core module perf counters are dispatched to tick_active_cycles or
         // tick_idle_cycles based on whether the core executed an instruction
@@ -1024,17 +1023,38 @@ impl InterpreterEngine {
         //
         // Tiles are indexed identically to self.cores (col * rows + row), so
         // cores[i] is the CoreState for tiles[i].
+        //
+        // Per aie-rt xaie_events_aieml.h, PERF_CNT_N hw event id is 5+N in
+        // every module type (core 5..8, memmod 5..6, memtile 5..8, shim/PL
+        // 5..6). Each counter that crossed its threshold this cycle is fed
+        // back through handle_event (so self-resetting configs can recycle)
+        // and forwarded to the owning module's trace unit.
+        const PERF_CNT_BASE: u8 = 5;
+        let cycle = self.total_cycles;
         for (i, tile) in self.device.array.tiles.iter_mut().enumerate() {
             tile.core_timer.tick();
             tile.mem_timer.tick();
+
             let core_active = self.cores.get(i).map_or(false, |c| c.active_this_cycle);
-            if core_active {
-                tile.core_perf_counters.tick_active_cycles();
+            let core_fired = if core_active {
+                tile.core_perf_counters.tick_active_cycles()
             } else {
-                tile.core_perf_counters.tick_idle_cycles();
+                tile.core_perf_counters.tick_idle_cycles()
+            };
+            for cnt_idx in core_fired {
+                let hw_id = PERF_CNT_BASE + cnt_idx as u8;
+                // Feed back so self-reset configs work, then trace-notify.
+                tile.core_perf_counters.handle_event(hw_id);
+                tile.notify_core_trace_event(hw_id, cycle);
             }
+
             // Memory module perf counters tick unconditionally.
-            tile.mem_perf_counters.tick_active_cycles();
+            let mem_fired = tile.mem_perf_counters.tick_active_cycles();
+            for cnt_idx in mem_fired {
+                let hw_id = PERF_CNT_BASE + cnt_idx as u8;
+                tile.mem_perf_counters.handle_event(hw_id);
+                tile.notify_mem_trace_event(hw_id, cycle);
+            }
         }
 
         // Phase 4: Update tile DMA channel state from engine state
@@ -1627,5 +1647,79 @@ mod tests {
     fn test_npu2_is_cycle_accurate() {
         let engine = InterpreterEngine::new_npu2();
         assert!(engine.is_cycle_accurate());
+    }
+
+    // --- Perf counter → trace unit wiring test (Task 1, A.2) ---
+
+    /// Verifies that threshold firings from PerfCounterBank are routed to the
+    /// tile's trace unit.
+    ///
+    /// Before Task 1, the coordinator discards the Vec<usize> returned by
+    /// tick_*_cycles(). This test catches that gap: it configures a perf
+    /// counter to fire at threshold=5, maps PERF_CNT_0 (hw_id=5) to trace
+    /// slot 0, and asserts the trace unit has recorded data after running.
+    ///
+    /// The test should FAIL before the wiring is in place (Step 1.3).
+    #[test]
+    fn test_perfcnt_threshold_routes_to_trace_unit() {
+        let mut engine = InterpreterEngine::new_npu1();
+
+        // Enable core (0,2) with enough NOPs to run 20+ cycles without halting.
+        // NOPs advance PC by 4 bytes; 512 bytes -> 128 cycles of runtime.
+        engine.enable_core(0, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+            tile.write_program(0, &[0x00u8; 512]);
+        }
+
+        // Configure perf counter 0 on tile (0,2) core module:
+        //   start_event = TRUE (id=1), stop_event = NONE (id=0), threshold = 5.
+        // write_control_start_stop(value, counter_lo, counter_hi, event_width)
+        // bits [6:0]=start0, [14:8]=stop0
+        {
+            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let ctrl0 = 1u32 | (0u32 << 8); // start=TRUE(1), stop=NONE(0)
+            tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
+            tile.core_perf_counters.write_event_value(0, 5);
+            // Manually arm: TRUE event is always-asserted, so call handle_event(1)
+            // once to transition counter 0 into Active state.
+            tile.core_perf_counters.handle_event(1);
+        }
+
+        // Configure trace unit on tile (0,2) core module:
+        //   mode = EventTime (0), start_event = TRUE (1), stop_event = NONE (0)
+        //   slot 0 = PERF_CNT_0 (hw_id = 5)
+        {
+            let tile = engine.device_mut().array.tile_mut(0, 2);
+            // Trace_Control0: [31:24]=stop=0, [23:16]=start=1, [1:0]=mode=0
+            let ctrl0 = (0u32 << 24) | (1u32 << 16) | 0u32;
+            tile.core_trace.write_register(0x00, ctrl0);
+            // Trace_Event0: slot0 = PERF_CNT_0 = 5
+            tile.core_trace.write_register(0x10, 5u32);
+        }
+
+        // The coordinator fires TRUE(1) on the trace unit in Phase 3c, which
+        // will transition it from Idle to Running on the first step.
+
+        // Run 20 cycles: threshold=5 fires at cycle 5 (counter started at 0),
+        // and the wiring should route PERF_CNT_0(5) into the trace unit.
+        let _cycles = engine.run(20);
+
+        // After Task 1, the trace unit byte_buffer must be non-empty: at least
+        // one frame was encoded for the cycle-5 threshold event.
+        // After Task 1 wiring, the trace must hold MORE than just the 8-byte
+        // start marker (0xF0 + 7 timer bytes that encode_start() pushes).
+        // A threshold event at cycle 5 adds a Single0 frame (1 byte), so
+        // wired correctly the byte count will be > 8.
+        //
+        // Without the wiring (coordinator discards Vec return), only the
+        // start marker is in the buffer: exactly 8 bytes, never a slot frame.
+        let tile = engine.device().array.tile(0, 2);
+        let encoded = tile.core_trace.encoded_bytes_len();
+        assert!(
+            encoded > 8,
+            "trace has only {} encoded bytes (just the start marker): \
+             perfcnt threshold was not routed to trace unit",
+            encoded
+        );
     }
 }
