@@ -121,11 +121,7 @@ pub fn init() {
         let ranges = parse_watch_env(&value);
         if !ranges.is_empty() {
             for r in &ranges {
-                log::info!(
-                    "[WATCH] watching {:?} bytes starting at 0x{:X}",
-                    r.len,
-                    r.start
-                );
+                log::info!("[WATCH] watching {:?} bytes starting at 0x{:X}", r.len, r.start);
             }
         }
         ranges
@@ -277,10 +273,7 @@ mod tests {
     #[test]
     fn test_parse_multiple() {
         let ranges = parse_watch_env("0xC000:40,0x400:4,0x1000:16");
-        assert_eq!(
-            ranges,
-            vec![range(0xC000, 40), range(0x400, 4), range(0x1000, 16)]
-        );
+        assert_eq!(ranges, vec![range(0xC000, 40), range(0x400, 4), range(0x1000, 16)]);
     }
 
     #[test]
