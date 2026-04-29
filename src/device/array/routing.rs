@@ -105,11 +105,9 @@ impl TileArray {
         // Entirely separate from the stream switch fabric.
         self.route_cascade();
 
-        let switch_pipelines_active = self.tiles.iter()
-            .any(|t| t.stream_switch.has_pipeline_data());
-        let streams_active = words_routed > 0
-            || !self.inter_tile_pipeline.is_empty()
-            || switch_pipelines_active;
+        let switch_pipelines_active = self.tiles.iter().any(|t| t.stream_switch.has_pipeline_data());
+        let streams_active =
+            words_routed > 0 || !self.inter_tile_pipeline.is_empty() || switch_pipelines_active;
         (dma_active, streams_active, words_routed)
     }
 
@@ -143,12 +141,16 @@ impl TileArray {
                     0 => {
                         // South: (col, row - 1)
                         // Shim row has no south neighbor.
-                        if row == SHIM_ROW { continue; }
+                        if row == SHIM_ROW {
+                            continue;
+                        }
                         (col, row - 1)
                     }
                     1 => {
                         // East: (col + 1, row)
-                        if col + 1 >= cols { continue; }
+                        if col + 1 >= cols {
+                            continue;
+                        }
                         (col + 1, row)
                     }
                     _ => continue,
@@ -185,8 +187,11 @@ impl TileArray {
             if let Some(data) = self.tiles[src_idx].pop_cascade_output() {
                 log::info!(
                     "[CASCADE] Route ({},{}) -> ({},{}) data[0]={:#X}",
-                    self.tiles[src_idx].col, self.tiles[src_idx].row,
-                    dst_col, dst_row, data[0]
+                    self.tiles[src_idx].col,
+                    self.tiles[src_idx].row,
+                    dst_col,
+                    dst_row,
+                    data[0]
                 );
                 self.tiles[dst_idx].push_cascade_input(data);
             }
@@ -287,7 +292,9 @@ impl TileArray {
                 words_routed += 1;
                 log::debug!(
                     "TileSwitch->Core: tile ({},{}) master[0] -> stream_input = 0x{:08X}",
-                    self.tiles[i].col, self.tiles[i].row, data
+                    self.tiles[i].col,
+                    self.tiles[i].row,
+                    data
                 );
             }
         }
@@ -308,7 +315,10 @@ impl TileArray {
 
         for i in 0..self.tiles.len() {
             // Find TileCtrl master port index
-            let ctrl_master = self.tiles[i].stream_switch.masters.iter()
+            let ctrl_master = self.tiles[i]
+                .stream_switch
+                .masters
+                .iter()
                 .position(|p| matches!(p.port_type, PortType::TileCtrl));
 
             let master_idx = match ctrl_master {
@@ -329,7 +339,8 @@ impl TileArray {
 
             // Drain all pending words from the TileCtrl master port
             while self.tiles[i].stream_switch.masters[master_idx].has_data() {
-                if let Some((data, tlast)) = self.tiles[i].stream_switch.masters[master_idx].pop_with_tlast() {
+                if let Some((data, tlast)) = self.tiles[i].stream_switch.masters[master_idx].pop_with_tlast()
+                {
                     let col = self.tiles[i].col;
                     let row = self.tiles[i].row;
 
@@ -352,7 +363,10 @@ impl TileArray {
                     words_routed += 1;
                     log::debug!(
                         "TileSwitch->Ctrl: tile ({},{}) master[{}] -> ctrl_pkt = 0x{:08X}{}",
-                        col, row, master_idx, data,
+                        col,
+                        row,
+                        master_idx,
+                        data,
                         if tlast { " TLAST" } else { "" }
                     );
                 }
@@ -367,7 +381,11 @@ impl TileArray {
     /// This bridges the new control_packets module with the existing coordinator
     /// dispatch path. Once the coordinator is updated to consume ControlPackets
     /// directly, this adapter can be removed.
-    fn packet_to_actions(col: u8, row: u8, packet: &crate::device::control_packets::ControlPacket) -> Vec<crate::device::tile::CtrlPacketAction> {
+    fn packet_to_actions(
+        col: u8,
+        row: u8,
+        packet: &crate::device::control_packets::ControlPacket,
+    ) -> Vec<crate::device::tile::CtrlPacketAction> {
         use crate::device::control_packets::CtrlOpCode;
         use crate::device::tile::CtrlPacketAction;
 
@@ -376,18 +394,29 @@ impl TileArray {
             CtrlOpCode::Write | CtrlOpCode::BlockWrite | CtrlOpCode::WriteIncr => {
                 for (i, &value) in packet.data.iter().enumerate() {
                     let addr = packet.address + (i as u32) * 4;
-                    log::info!("Tile ({},{}) ctrl_pkt {:?}: [0x{:05X}] = 0x{:08X}",
-                        col, row, packet.opcode, addr, value);
-                    actions.push(CtrlPacketAction::WriteRegister {
-                        col, row, offset: addr, value,
-                    });
+                    log::info!(
+                        "Tile ({},{}) ctrl_pkt {:?}: [0x{:05X}] = 0x{:08X}",
+                        col,
+                        row,
+                        packet.opcode,
+                        addr,
+                        value
+                    );
+                    actions.push(CtrlPacketAction::WriteRegister { col, row, offset: addr, value });
                 }
             }
             CtrlOpCode::Read => {
-                log::info!("Tile ({},{}) ctrl_pkt READ: addr=0x{:05X} beats={} resp_id={}",
-                    col, row, packet.address, packet.beats, packet.response_id);
+                log::info!(
+                    "Tile ({},{}) ctrl_pkt READ: addr=0x{:05X} beats={} resp_id={}",
+                    col,
+                    row,
+                    packet.address,
+                    packet.beats,
+                    packet.response_id
+                );
                 actions.push(CtrlPacketAction::ReadRegisters {
-                    col, row,
+                    col,
+                    row,
                     offset: packet.address,
                     count: packet.beats,
                     response_id: packet.response_id,
@@ -418,7 +447,9 @@ impl TileArray {
                             words_routed += 1;
                             log::debug!(
                                 "Core->TileSwitch: tile({},{}) slave[0] <- 0x{:08X}",
-                                self.tiles[i].col, self.tiles[i].row, data
+                                self.tiles[i].col,
+                                self.tiles[i].row,
+                                data
                             );
                         }
                     } else {
@@ -430,7 +461,10 @@ impl TileArray {
                                 words_routed += 1;
                                 log::debug!(
                                     "Core->TileSwitch: tile({},{}) slave[{}] <- 0x{:08X}",
-                                    self.tiles[i].col, self.tiles[i].row, slave_port, data
+                                    self.tiles[i].col,
+                                    self.tiles[i].row,
+                                    slave_port,
+                                    data
                                 );
                             }
                         }
@@ -550,10 +584,7 @@ impl TileArray {
                 // Determine the target slave port for this DMA MM2S word.
                 let target_slave = if tile_kind.is_shim() {
                     let mm2s_ch = data.channel.saturating_sub(s2mm_count) as usize;
-                    let from_mux = tile.shim_mux_mm2s_slaves
-                        .get(mm2s_ch)
-                        .copied()
-                        .flatten();
+                    let from_mux = tile.shim_mux_mm2s_slaves.get(mm2s_ch).copied().flatten();
 
                     if let Some(slave_idx) = from_mux {
                         Some((slave_idx, Mm2sRouteDesc::ShimMux { channel: mm2s_ch as u8 }))
@@ -566,7 +597,8 @@ impl TileArray {
                         for route in &ss.local_routes {
                             let s = route.slave_idx as usize;
                             let m = route.master_idx as usize;
-                            if s < slaves.len() && m < masters.len()
+                            if s < slaves.len()
+                                && m < masters.len()
                                 && matches!(slaves[s].port_type, PortType::South)
                                 && matches!(masters[m].port_type, PortType::North)
                             {
@@ -607,8 +639,13 @@ impl TileArray {
                         if matches!(port_type, PortType::Dma(_)) {
                             Some((slave_port, Mm2sRouteDesc::DmaPort { channel: data.channel, port_type }))
                         } else {
-                            log::debug!("DMA_MM2S->TileSwitch: tile ({},{}) slave[{}] rejected - wrong type {:?}",
-                                col, row, slave_port, port_type);
+                            log::debug!(
+                                "DMA_MM2S->TileSwitch: tile ({},{}) slave[{}] rejected - wrong type {:?}",
+                                col,
+                                row,
+                                slave_port,
+                                port_type
+                            );
                             // Drop misconfigured data
                             continue;
                         }
@@ -626,9 +663,16 @@ impl TileArray {
                         words_routed += 1;
 
                         let prefix = if tile_kind.is_shim() { "Shim" } else { "tile" };
-                        log::info!("DMA_MM2S->TileSwitch: {} ({},{}) slave[{}] <- 0x{:08X}{} ({})",
-                            prefix, col, row, slave_idx, data.data,
-                            if data.tlast { " TLAST" } else { "" }, desc);
+                        log::info!(
+                            "DMA_MM2S->TileSwitch: {} ({},{}) slave[{}] <- 0x{:08X}{} ({})",
+                            prefix,
+                            col,
+                            row,
+                            slave_idx,
+                            data.data,
+                            if data.tlast { " TLAST" } else { "" },
+                            desc
+                        );
                     } else {
                         // Target FIFO full -- retain for next cycle.
                         // Per-channel independence: other channels' words
@@ -704,8 +748,15 @@ impl TileArray {
                     let fifo_len = master.fifo.len();
                     if fifo_len > 0 {
                         let can_accept = dma.can_accept_stream_in_for_channel(ch);
-                        log::debug!("TileSwitch->DMA check: tile ({},{}) master[{}] ch {} fifo_len={} can_accept={}",
-                            col, row, master_port, ch, fifo_len, can_accept);
+                        log::debug!(
+                            "TileSwitch->DMA check: tile ({},{}) master[{}] ch {} fifo_len={} can_accept={}",
+                            col,
+                            row,
+                            master_port,
+                            ch,
+                            fifo_len,
+                            can_accept
+                        );
                     }
 
                     // Per-channel backpressure: only pop from master if the
@@ -717,11 +768,7 @@ impl TileArray {
 
                     if let Some((data, tlast)) = master.pop_with_tlast() {
                         // Push to DMA S2MM stream_in
-                        let stream_data = StreamData {
-                            data,
-                            tlast,
-                            channel: ch,
-                        };
+                        let stream_data = StreamData { data, tlast, channel: ch };
                         let push_result = dma.push_stream_in(stream_data);
                         let new_len = dma.stream_in_len();
                         if push_result {
@@ -786,24 +833,25 @@ impl TileArray {
                     let above_type = self.tiles[above_idx].tile_kind;
 
                     // Determine port mappings based on tile types (AM025-derived constants)
-                    let (north_master_start, north_master_count, south_slave_start) = match (tile_kind, above_type) {
-                        (TileKind::ShimNoc | TileKind::ShimPl, TileKind::Mem) => (
-                            shim::NORTH_MASTER_START as usize,
-                            (shim::NORTH_MASTER_END - shim::NORTH_MASTER_START + 1) as usize,
-                            mem_tile::SOUTH_SLAVE_START as usize,
-                        ),
-                        (TileKind::Mem, TileKind::Compute) => (
-                            mem_tile::NORTH_MASTER_START as usize,
-                            (mem_tile::NORTH_MASTER_END - mem_tile::NORTH_MASTER_START + 1) as usize,
-                            compute::SOUTH_SLAVE_START as usize,
-                        ),
-                        (TileKind::Compute, TileKind::Compute) => (
-                            compute::NORTH_MASTER_START as usize,
-                            (compute::NORTH_MASTER_END - compute::NORTH_MASTER_START + 1) as usize,
-                            compute::SOUTH_SLAVE_START as usize,
-                        ),
-                        _ => continue,
-                    };
+                    let (north_master_start, north_master_count, south_slave_start) =
+                        match (tile_kind, above_type) {
+                            (TileKind::ShimNoc | TileKind::ShimPl, TileKind::Mem) => (
+                                shim::NORTH_MASTER_START as usize,
+                                (shim::NORTH_MASTER_END - shim::NORTH_MASTER_START + 1) as usize,
+                                mem_tile::SOUTH_SLAVE_START as usize,
+                            ),
+                            (TileKind::Mem, TileKind::Compute) => (
+                                mem_tile::NORTH_MASTER_START as usize,
+                                (mem_tile::NORTH_MASTER_END - mem_tile::NORTH_MASTER_START + 1) as usize,
+                                compute::SOUTH_SLAVE_START as usize,
+                            ),
+                            (TileKind::Compute, TileKind::Compute) => (
+                                compute::NORTH_MASTER_START as usize,
+                                (compute::NORTH_MASTER_END - compute::NORTH_MASTER_START + 1) as usize,
+                                compute::SOUTH_SLAVE_START as usize,
+                            ),
+                            _ => continue,
+                        };
 
                     // Transfer from each North master to corresponding South slave
                     for i in 0..north_master_count {
@@ -817,7 +865,16 @@ impl TileArray {
                                 if slave_idx < self.tiles[above_idx].stream_switch.slaves.len()
                                     && self.tiles[above_idx].stream_switch.slaves[slave_idx].can_accept()
                                 {
-                                    transfers.push((col, row, master_idx, col, row + 1, slave_idx, data, tlast));
+                                    transfers.push((
+                                        col,
+                                        row,
+                                        master_idx,
+                                        col,
+                                        row + 1,
+                                        slave_idx,
+                                        data,
+                                        tlast,
+                                    ));
                                 }
                             }
                         }
@@ -830,24 +887,25 @@ impl TileArray {
                     let below_type = self.tiles[below_idx].tile_kind;
 
                     // Determine port mappings based on tile types (AM025-derived constants)
-                    let (south_master_start, south_master_count, north_slave_start) = match (tile_kind, below_type) {
-                        (TileKind::Mem, TileKind::ShimNoc | TileKind::ShimPl) => (
-                            mem_tile::SOUTH_MASTER_START as usize,
-                            (mem_tile::SOUTH_MASTER_END - mem_tile::SOUTH_MASTER_START + 1) as usize,
-                            shim::NORTH_SLAVE_START as usize,
-                        ),
-                        (TileKind::Compute, TileKind::Mem) => (
-                            compute::SOUTH_MASTER_START as usize,
-                            (compute::SOUTH_MASTER_END - compute::SOUTH_MASTER_START + 1) as usize,
-                            mem_tile::NORTH_SLAVE_START as usize,
-                        ),
-                        (TileKind::Compute, TileKind::Compute) => (
-                            compute::SOUTH_MASTER_START as usize,
-                            (compute::SOUTH_MASTER_END - compute::SOUTH_MASTER_START + 1) as usize,
-                            compute::NORTH_SLAVE_START as usize,
-                        ),
-                        _ => continue,
-                    };
+                    let (south_master_start, south_master_count, north_slave_start) =
+                        match (tile_kind, below_type) {
+                            (TileKind::Mem, TileKind::ShimNoc | TileKind::ShimPl) => (
+                                mem_tile::SOUTH_MASTER_START as usize,
+                                (mem_tile::SOUTH_MASTER_END - mem_tile::SOUTH_MASTER_START + 1) as usize,
+                                shim::NORTH_SLAVE_START as usize,
+                            ),
+                            (TileKind::Compute, TileKind::Mem) => (
+                                compute::SOUTH_MASTER_START as usize,
+                                (compute::SOUTH_MASTER_END - compute::SOUTH_MASTER_START + 1) as usize,
+                                mem_tile::NORTH_SLAVE_START as usize,
+                            ),
+                            (TileKind::Compute, TileKind::Compute) => (
+                                compute::SOUTH_MASTER_START as usize,
+                                (compute::SOUTH_MASTER_END - compute::SOUTH_MASTER_START + 1) as usize,
+                                compute::NORTH_SLAVE_START as usize,
+                            ),
+                            _ => continue,
+                        };
 
                     // Transfer from each South master to corresponding North slave
                     for i in 0..south_master_count {
@@ -861,7 +919,16 @@ impl TileArray {
                                 if slave_idx < self.tiles[below_idx].stream_switch.slaves.len()
                                     && self.tiles[below_idx].stream_switch.slaves[slave_idx].can_accept()
                                 {
-                                    transfers.push((col, row, master_idx, col, row - 1, slave_idx, data, tlast));
+                                    transfers.push((
+                                        col,
+                                        row,
+                                        master_idx,
+                                        col,
+                                        row - 1,
+                                        slave_idx,
+                                        data,
+                                        tlast,
+                                    ));
                                 }
                             }
                         }
@@ -905,7 +972,16 @@ impl TileArray {
                                 if slave_idx < self.tiles[right_idx].stream_switch.slaves.len()
                                     && self.tiles[right_idx].stream_switch.slaves[slave_idx].can_accept()
                                 {
-                                    transfers.push((col, row, master_idx, col + 1, row, slave_idx, data, tlast));
+                                    transfers.push((
+                                        col,
+                                        row,
+                                        master_idx,
+                                        col + 1,
+                                        row,
+                                        slave_idx,
+                                        data,
+                                        tlast,
+                                    ));
                                 }
                             }
                         }
@@ -942,7 +1018,16 @@ impl TileArray {
                                 if slave_idx < self.tiles[left_idx].stream_switch.slaves.len()
                                     && self.tiles[left_idx].stream_switch.slaves[slave_idx].can_accept()
                                 {
-                                    transfers.push((col, row, master_idx, col - 1, row, slave_idx, data, tlast));
+                                    transfers.push((
+                                        col,
+                                        row,
+                                        master_idx,
+                                        col - 1,
+                                        row,
+                                        slave_idx,
+                                        data,
+                                        tlast,
+                                    ));
                                 }
                             }
                         }
@@ -960,7 +1045,9 @@ impl TileArray {
             let dst_idx = self.tile_index(dst_col, dst_row);
 
             // Pop from source master (with TLAST)
-            if let Some((data, tlast)) = self.tiles[src_idx].stream_switch.masters[src_master].pop_with_tlast() {
+            if let Some((data, tlast)) =
+                self.tiles[src_idx].stream_switch.masters[src_master].pop_with_tlast()
+            {
                 self.inter_tile_pipeline.push(InFlightWord {
                     dst_tile_idx: dst_idx,
                     dst_slave_idx: dst_slave,
@@ -1006,8 +1093,7 @@ impl TileArray {
                 {
                     let data = word.data;
                     let tlast = word.tlast;
-                    self.tiles[dst_idx].stream_switch.slaves[dst_slave]
-                        .push_with_tlast(data, tlast);
+                    self.tiles[dst_idx].stream_switch.slaves[dst_slave].push_with_tlast(data, tlast);
                     self.inter_tile_pipeline.remove(i);
                     delivered += 1;
                     // Don't increment i -- remove shifted later elements down

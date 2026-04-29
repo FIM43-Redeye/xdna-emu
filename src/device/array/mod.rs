@@ -60,21 +60,27 @@ pub(super) fn get_three_mut(
     let west_idx = if col > 0 {
         let idx = own_idx - rows;
         // Only provide neighbor if it's also a MemTile
-        if tiles[idx].is_mem() { Some(idx) } else { None }
+        if tiles[idx].is_mem() {
+            Some(idx)
+        } else {
+            None
+        }
     } else {
         None
     };
     let east_idx = if col + 1 < cols {
         let idx = own_idx + rows;
-        if tiles[idx].is_mem() { Some(idx) } else { None }
+        if tiles[idx].is_mem() {
+            Some(idx)
+        } else {
+            None
+        }
     } else {
         None
     };
 
     match (west_idx, east_idx) {
-        (None, None) => {
-            (None, &mut tiles[own_idx], None)
-        }
+        (None, None) => (None, &mut tiles[own_idx], None),
         (Some(w), None) => {
             // w < own_idx guaranteed (west is lower column)
             let (left, right) = tiles.split_at_mut(own_idx);
@@ -199,9 +205,13 @@ impl TileArray {
 
                 // Create DMA engine with ArchConfig-derived channel/BD/lock counts
                 dma_engines.push(DmaEngine::new(
-                    col, row, tile_kind,
-                    params.dma_s2mm_channels, params.dma_mm2s_channels,
-                    params.num_bds, params.num_locks as u8,
+                    col,
+                    row,
+                    tile_kind,
+                    params.dma_s2mm_channels,
+                    params.dma_mm2s_channels,
+                    params.num_bds,
+                    params.num_locks as u8,
                     arch.dma_model(),
                 ));
             }
@@ -217,7 +227,11 @@ impl TileArray {
             .collect();
 
         Self {
-            arch, cols, rows, tiles, dma_engines,
+            arch,
+            cols,
+            rows,
+            tiles,
+            dma_engines,
             fatal_errors: Vec::new(),
             pending_ctrl_actions: Vec::new(),
             current_cycle: 0,
@@ -379,9 +393,13 @@ impl TileArray {
             }
             // Recreate stream switch based on tile type (they have different port configurations)
             tile.stream_switch = match tile.tile_kind {
-                TileKind::ShimNoc | TileKind::ShimPl => crate::device::stream_switch::StreamSwitch::new_shim_tile(tile.col),
+                TileKind::ShimNoc | TileKind::ShimPl => {
+                    crate::device::stream_switch::StreamSwitch::new_shim_tile(tile.col)
+                }
                 TileKind::Mem => crate::device::stream_switch::StreamSwitch::new_mem_tile(tile.col, tile.row),
-                TileKind::Compute => crate::device::stream_switch::StreamSwitch::new_compute_tile(tile.col, tile.row),
+                TileKind::Compute => {
+                    crate::device::stream_switch::StreamSwitch::new_compute_tile(tile.col, tile.row)
+                }
             };
             // Note: We don't zero memory here for performance
             // Call zero_memory() explicitly if needed

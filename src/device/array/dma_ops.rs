@@ -99,9 +99,7 @@ impl TileArray {
         let result = if is_mem {
             let rows = self.rows as usize;
             let cols = self.cols as usize;
-            let (west_ref, own_ref, east_ref) = get_three_mut(
-                &mut self.tiles, idx, col as usize, rows, cols,
-            );
+            let (west_ref, own_ref, east_ref) = get_three_mut(&mut self.tiles, idx, col as usize, rows, cols);
             let mut neighbors = dma::NeighborTiles { west: west_ref, east: east_ref };
             self.dma_engines[idx].step(own_ref, &mut neighbors, host_memory)
         } else {
@@ -130,9 +128,7 @@ impl TileArray {
             let is_mem = engines[i].tile_kind.is_mem();
             if is_mem {
                 let col = i / rows;
-                let (west_ref, own_ref, east_ref) = get_three_mut(
-                    tiles, i, col, rows, cols,
-                );
+                let (west_ref, own_ref, east_ref) = get_three_mut(tiles, i, col, rows, cols);
                 let mut neighbors = dma::NeighborTiles { west: west_ref, east: east_ref };
                 engines[i].submit_lock_requests(own_ref, &mut neighbors);
             } else {
@@ -159,9 +155,7 @@ impl TileArray {
 
             let result = if is_mem {
                 let col = i / rows;
-                let (west_ref, own_ref, east_ref) = get_three_mut(
-                    tiles, i, col, rows, cols,
-                );
+                let (west_ref, own_ref, east_ref) = get_three_mut(tiles, i, col, rows, cols);
                 let mut neighbors = dma::NeighborTiles { west: west_ref, east: east_ref };
                 engines[i].step(own_ref, &mut neighbors, host_memory)
             } else {

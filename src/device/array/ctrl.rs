@@ -38,19 +38,14 @@ impl TileArray {
         let tile = match self.get_mut(col, row) {
             Some(t) => t,
             None => {
-                log::error!(
-                    "handle_read_registers: tile({},{}) not found", col, row
-                );
+                log::error!("handle_read_registers: tile({},{}) not found", col, row);
                 return false;
             }
         };
 
         // Verify the TileCtrl slave port exists.
         if tile.stream_switch.tile_ctrl_slave_port().is_none() {
-            log::error!(
-                "handle_read_registers: tile({},{}) has no TileCtrl slave port",
-                col, row,
-            );
+            log::error!("handle_read_registers: tile({},{}) has no TileCtrl slave port", col, row,);
             return false;
         }
 
@@ -62,8 +57,7 @@ impl TileArray {
 
         // Build stream packet header: pkt_id = response_id, type = Data,
         // source = this tile's (col, row).
-        let header = PacketHeader::new(response_id & 0x1F, col, row)
-            .with_type(PacketType::Data);
+        let header = PacketHeader::new(response_id & 0x1F, col, row).with_type(PacketType::Data);
         let header_word = header.encode();
 
         // Queue header + data words into pending buffer.
@@ -77,7 +71,12 @@ impl TileArray {
         log::info!(
             "handle_read_registers: tile({},{}) read {} regs from 0x{:05X}, \
              {} response words queued (resp_id={})",
-            col, row, count, offset, count as usize + 1, response_id,
+            col,
+            row,
+            count,
+            offset,
+            count as usize + 1,
+            response_id,
         );
 
         true

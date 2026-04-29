@@ -10,8 +10,8 @@ fn test_array_creation_npu1() {
     assert_eq!(array.tiles.len(), 30);
 
     let (shim, mem, compute) = array.count_by_type();
-    assert_eq!(shim, 5);  // Row 0, all columns
-    assert_eq!(mem, 5);   // Row 1, all columns
+    assert_eq!(shim, 5); // Row 0, all columns
+    assert_eq!(mem, 5); // Row 1, all columns
     assert_eq!(compute, 20); // Rows 2-5, all columns
 }
 
@@ -153,10 +153,10 @@ fn test_cascade_route_south() {
     // Configure tile (1,2): input direction = North (0)
     // cascade_input_dir: bit 0 (0=North, 1=West)
     // cascade_output_dir: bit 1 (0=South, 1=East)
-    array.tile_mut(1, 3).cascade_input_dir = 0;  // North
-    array.tile_mut(1, 3).cascade_output_dir = 0;  // South
-    array.tile_mut(1, 2).cascade_input_dir = 0;  // North
-    array.tile_mut(1, 2).cascade_output_dir = 0;  // South
+    array.tile_mut(1, 3).cascade_input_dir = 0; // North
+    array.tile_mut(1, 3).cascade_output_dir = 0; // South
+    array.tile_mut(1, 2).cascade_input_dir = 0; // North
+    array.tile_mut(1, 2).cascade_output_dir = 0; // South
 
     // Push cascade data to tile (1,3) output
     let data: [u64; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
@@ -178,11 +178,11 @@ fn test_cascade_route_east() {
     let mut array = TileArray::npu1();
 
     // Configure tile (1,3): output direction = East (1)
-    array.tile_mut(1, 3).cascade_input_dir = 0;  // North
-    array.tile_mut(1, 3).cascade_output_dir = 1;  // East
-    // Configure tile (2,3): input direction = West (1)
-    array.tile_mut(2, 3).cascade_input_dir = 1;  // West
-    array.tile_mut(2, 3).cascade_output_dir = 0;  // South
+    array.tile_mut(1, 3).cascade_input_dir = 0; // North
+    array.tile_mut(1, 3).cascade_output_dir = 1; // East
+                                                 // Configure tile (2,3): input direction = West (1)
+    array.tile_mut(2, 3).cascade_input_dir = 1; // West
+    array.tile_mut(2, 3).cascade_output_dir = 0; // South
 
     let data: [u64; 6] = [1, 2, 3, 4, 5, 6];
     array.tile_mut(1, 3).push_cascade_output(data);
@@ -229,8 +229,8 @@ fn test_cascade_direction_mismatch_no_route() {
 
     // Source outputs South, but destination expects West (mismatch)
     array.tile_mut(1, 3).cascade_input_dir = 0;
-    array.tile_mut(1, 3).cascade_output_dir = 0;  // South
-    array.tile_mut(1, 2).cascade_input_dir = 1;  // West (wrong!)
+    array.tile_mut(1, 3).cascade_output_dir = 0; // South
+    array.tile_mut(1, 2).cascade_input_dir = 1; // West (wrong!)
     array.tile_mut(1, 2).cascade_output_dir = 0;
 
     let data: [u64; 6] = [99; 6];
@@ -261,13 +261,15 @@ fn test_handle_read_registers_injects_response() {
     let base_offset: u32 = 0x440;
     let values = [0xAAAA_0001u32, 0xBBBB_0002, 0xCCCC_0003, 0xDDDD_0004];
     for (i, &val) in values.iter().enumerate() {
-        array.tile_mut(col, row).write_data_u32(
-            (base_offset + (i as u32) * 4) as usize, val,
-        );
+        array
+            .tile_mut(col, row)
+            .write_data_u32((base_offset + (i as u32) * 4) as usize, val);
     }
 
     // Verify the TileCtrl slave port exists (port 3 on compute tiles)
-    let ctrl_slave_idx = array.tile(col, row).stream_switch
+    let ctrl_slave_idx = array
+        .tile(col, row)
+        .stream_switch
         .tile_ctrl_slave_port()
         .expect("compute tile should have TileCtrl slave port");
     assert!(
@@ -286,17 +288,15 @@ fn test_handle_read_registers_injects_response() {
 
     // Response words are queued, not yet in the FIFO
     assert_eq!(
-        array.tile(col, row).pending_ctrl_response.len(), 5,
+        array.tile(col, row).pending_ctrl_response.len(),
+        5,
         "pending buffer should have header + 4 data words"
     );
 
     // Drain cycle 1: fills slave FIFO up to capacity (4 words)
     let injected1 = array.drain_ctrl_responses();
     assert_eq!(injected1, 4, "first drain should inject 4 words (FIFO capacity)");
-    assert_eq!(
-        array.tile(col, row).pending_ctrl_response.len(), 1,
-        "1 word should remain in pending buffer"
-    );
+    assert_eq!(array.tile(col, row).pending_ctrl_response.len(), 1, "1 word should remain in pending buffer");
 
     // Pop and verify the stream header
     let slave = array.tile_mut(col, row).stream_switch.slave_mut(ctrl_slave_idx).unwrap();
