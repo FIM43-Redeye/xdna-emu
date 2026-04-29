@@ -15,7 +15,6 @@
 pub enum EventType {
     // -- Instruction events (Core module trace) --
     // Per-class events matching hardware CoreEvent codes from AIE2Schedule.td.
-
     /// Vector instruction executed (VMAC, VADD, VCMP, etc.).
     /// Maps to hardware INSTR_VECTOR.
     InstrVector { pc: u32 },
@@ -48,7 +47,6 @@ pub enum EventType {
     InstrEvent { pc: u32, id: u8 },
 
     // -- Stall events (Core module trace) --
-
     /// Memory access stall.
     /// Maps to hardware MEMORY_STALL.
     MemoryStall { cycles: u8 },
@@ -62,7 +60,6 @@ pub enum EventType {
     // -- DMA events (Memory module trace) --
     // Channel encodes direction: 0-1 = S2MM (input), 2-3 = MM2S (output)
     // for compute tiles. Shim/memtile may have more channels.
-
     /// DMA channel started a task.
     /// Maps to hardware DMA_x_START_TASK.
     DmaStartTask { channel: u8 },
@@ -80,7 +77,6 @@ pub enum EventType {
     DmaStreamStarvation { channel: u8 },
 
     // -- Lock events (Memory module trace) --
-
     /// Lock acquired.
     /// Maps to hardware LOCK_n_ACQ.
     LockAcquire { lock_id: u8 },
@@ -89,7 +85,6 @@ pub enum EventType {
     LockRelease { lock_id: u8 },
 
     // -- Core state events --
-
     /// Core is actively executing.
     /// Maps to hardware ACTIVE_CORE.
     CoreActive,
@@ -99,7 +94,6 @@ pub enum EventType {
 
     // -- Stream port events (Core/MemTile/Shim module trace) --
     // Level events sampled every cycle per monitored port.
-
     /// Port had no data this cycle.
     /// Maps to hardware PORT_IDLE_0 through PORT_IDLE_7.
     PortIdle { port: u8 },
@@ -114,7 +108,6 @@ pub enum EventType {
     PortTlast { port: u8 },
 
     // -- Branch events (emulator-internal, no direct HW trace event) --
-
     /// Branch taken with source and target PCs.
     BranchTaken { from_pc: u32, to_pc: u32 },
 }
@@ -147,11 +140,7 @@ impl EventLog {
 
     /// Create a new event log with specified capacity.
     pub fn with_capacity(max_events: usize) -> Self {
-        Self {
-            events: Vec::with_capacity(max_events.min(1000)),
-            max_events,
-            enabled: false,
-        }
+        Self { events: Vec::with_capacity(max_events.min(1000)), max_events, enabled: false }
     }
 
     /// Enable event recording.

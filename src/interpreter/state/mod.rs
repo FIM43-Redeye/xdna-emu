@@ -39,21 +39,29 @@ pub use registers::{
     MaskRegisterFile,
     ModifierRegisterFile,
     // Wide register type aliases.
-    Vec512, Acc1024,
+    Vec512,
+    Acc1024,
     // Register file dimensions and special register indices.
-    NUM_SCALAR_REGS, NUM_SCALAR_GPRS,
-    LR_REG_INDEX, LS_REG_INDEX, LE_REG_INDEX, LC_REG_INDEX,
-    DP_REG_INDEX, CORE_ID_REG_INDEX, SP_PTR_INDEX,
+    NUM_SCALAR_REGS,
+    NUM_SCALAR_GPRS,
+    LR_REG_INDEX,
+    LS_REG_INDEX,
+    LE_REG_INDEX,
+    LC_REG_INDEX,
+    DP_REG_INDEX,
+    CORE_ID_REG_INDEX,
+    SP_PTR_INDEX,
     // Modifier register sub-class base indices.
-    MOD_BASE_M, MOD_BASE_DN, MOD_BASE_DJ, MOD_BASE_DC,
+    MOD_BASE_M,
+    MOD_BASE_DN,
+    MOD_BASE_DJ,
+    MOD_BASE_DC,
     // TableGen validation.
     validate_register_model,
 };
 pub use context::{
-    ExecutionContext, SpRegister, TimingContext,
-    EventLog, EventType, TimestampedEvent,
-    PendingBranch, PendingWrite,
-    SrsConfig,
+    ExecutionContext, SpRegister, TimingContext, EventLog, EventType, TimestampedEvent, PendingBranch,
+    PendingWrite, SrsConfig,
 };
 
 #[cfg(test)]

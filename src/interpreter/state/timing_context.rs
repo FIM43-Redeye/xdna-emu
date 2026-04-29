@@ -145,22 +145,14 @@ impl PendingBranch {
     /// Uses initial count of BRANCH_DELAY_INITIAL because tick() is called
     /// on the branch cycle.
     pub fn new(target: u32) -> Self {
-        Self {
-            target,
-            delay_slots: BRANCH_DELAY_INITIAL,
-            is_call: false,
-        }
+        Self { target, delay_slots: BRANCH_DELAY_INITIAL, is_call: false }
     }
 
     /// Create a new pending call (jl) with BRANCH_DELAY_SLOTS delay slots.
     ///
     /// When delay slots are exhausted, the caller should set LR = current PC.
     pub fn new_call(target: u32) -> Self {
-        Self {
-            target,
-            delay_slots: BRANCH_DELAY_INITIAL,
-            is_call: true,
-        }
+        Self { target, delay_slots: BRANCH_DELAY_INITIAL, is_call: true }
     }
 
     /// Decrement delay slot counter. Returns true if branch should now be taken.

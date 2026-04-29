@@ -112,9 +112,7 @@ impl Default for ScalarRegisterFile {
 impl ScalarRegisterFile {
     /// Create a new zeroed register file.
     pub const fn new() -> Self {
-        Self {
-            regs: [0; NUM_SCALAR_REGS],
-        }
+        Self { regs: [0; NUM_SCALAR_REGS] }
     }
 
     /// Initialize the read-only CORE_ID register.
@@ -162,12 +160,7 @@ impl ScalarRegisterFile {
 impl fmt::Debug for ScalarRegisterFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Only show non-zero registers
-        let non_zero: Vec<_> = self
-            .regs
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| **v != 0)
-            .collect();
+        let non_zero: Vec<_> = self.regs.iter().enumerate().filter(|(_, v)| **v != 0).collect();
 
         if non_zero.is_empty() {
             write!(f, "ScalarRegisterFile {{ all zero }}")
@@ -202,9 +195,7 @@ impl Default for PointerRegisterFile {
 impl PointerRegisterFile {
     /// Create a new zeroed register file.
     pub const fn new() -> Self {
-        Self {
-            regs: [0; NUM_POINTER_REGS],
-        }
+        Self { regs: [0; NUM_POINTER_REGS] }
     }
 
     /// Read a pointer register (0-7).
@@ -236,12 +227,7 @@ impl PointerRegisterFile {
 
 impl fmt::Debug for PointerRegisterFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let non_zero: Vec<_> = self
-            .regs
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| **v != 0)
-            .collect();
+        let non_zero: Vec<_> = self.regs.iter().enumerate().filter(|(_, v)| **v != 0).collect();
 
         if non_zero.is_empty() {
             write!(f, "PointerRegisterFile {{ all zero }}")
@@ -280,9 +266,7 @@ impl Default for ModifierRegisterFile {
 impl ModifierRegisterFile {
     /// Create a new zeroed register file.
     pub const fn new() -> Self {
-        Self {
-            regs: [0; NUM_MODIFIER_REGS],
-        }
+        Self { regs: [0; NUM_MODIFIER_REGS] }
     }
 
     /// Read a modifier register (0-31).
@@ -324,12 +308,7 @@ impl ModifierRegisterFile {
 
 impl fmt::Debug for ModifierRegisterFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let non_zero: Vec<_> = self
-            .regs
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| **v != 0)
-            .collect();
+        let non_zero: Vec<_> = self.regs.iter().enumerate().filter(|(_, v)| **v != 0).collect();
 
         if non_zero.is_empty() {
             write!(f, "ModifierRegisterFile {{ all zero }}")
@@ -372,9 +351,7 @@ impl Default for VectorRegisterFile {
 impl VectorRegisterFile {
     /// Create a new zeroed register file.
     pub const fn new() -> Self {
-        Self {
-            regs: [[0; 8]; NUM_VECTOR_REGS],
-        }
+        Self { regs: [[0; 8]; NUM_VECTOR_REGS] }
     }
 
     /// Read a vector register as 8 × u32.
@@ -415,12 +392,7 @@ impl VectorRegisterFile {
     pub fn write_bytes(&mut self, reg: u8, bytes: &[u8; 32]) {
         let mut words = [0u32; 8];
         for (i, word) in words.iter_mut().enumerate() {
-            *word = u32::from_le_bytes([
-                bytes[i * 4],
-                bytes[i * 4 + 1],
-                bytes[i * 4 + 2],
-                bytes[i * 4 + 3],
-            ]);
+            *word = u32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]);
         }
         self.write(reg, words);
     }
@@ -431,11 +403,7 @@ impl VectorRegisterFile {
     /// `base_reg` is already the decoded index (0, 2, 4, ...) -- the caller
     /// is responsible for the x -> w mapping before calling here.
     pub fn read_wide(&self, base_reg: u8) -> Vec512 {
-        debug_assert!(
-            base_reg % 2 == 0,
-            "wide vector read from odd base register {}",
-            base_reg
-        );
+        debug_assert!(base_reg % 2 == 0, "wide vector read from odd base register {}", base_reg);
         let lo = self.read(base_reg);
         let hi = self.read(base_reg + 1);
         let mut result = [0u32; 16];
@@ -446,11 +414,7 @@ impl VectorRegisterFile {
 
     /// Write a 512-bit x-register (split across two consecutive w-registers).
     pub fn write_wide(&mut self, base_reg: u8, data: Vec512) {
-        debug_assert!(
-            base_reg % 2 == 0,
-            "wide vector write to odd base register {}",
-            base_reg
-        );
+        debug_assert!(base_reg % 2 == 0, "wide vector write to odd base register {}", base_reg);
         let mut lo = [0u32; 8];
         let mut hi = [0u32; 8];
         lo.copy_from_slice(&data[..8]);
@@ -464,11 +428,7 @@ impl VectorRegisterFile {
     /// The decoder maps y0 -> vreg 0, y1 -> vreg 4, etc. (reg * 4).
     /// `base_reg` is already the decoded index (0, 4, 8, ...).
     pub fn read_quad(&self, base_reg: u8) -> [u32; 32] {
-        debug_assert!(
-            base_reg % 4 == 0,
-            "quad vector read from non-aligned base register {}",
-            base_reg
-        );
+        debug_assert!(base_reg % 4 == 0, "quad vector read from non-aligned base register {}", base_reg);
         let mut result = [0u32; 32];
         result[..8].copy_from_slice(&self.read(base_reg));
         result[8..16].copy_from_slice(&self.read(base_reg + 1));
@@ -479,11 +439,7 @@ impl VectorRegisterFile {
 
     /// Write a 1024-bit y-register (split across four consecutive w-registers).
     pub fn write_quad(&mut self, base_reg: u8, data: &[u32; 32]) {
-        debug_assert!(
-            base_reg % 4 == 0,
-            "quad vector write to non-aligned base register {}",
-            base_reg
-        );
+        debug_assert!(base_reg % 4 == 0, "quad vector write to non-aligned base register {}", base_reg);
         let mut w = [0u32; 8];
         for i in 0..4 {
             w.copy_from_slice(&data[i * 8..(i + 1) * 8]);
@@ -547,9 +503,7 @@ impl Default for AccumulatorRegisterFile {
 impl AccumulatorRegisterFile {
     /// Create a new zeroed register file.
     pub const fn new() -> Self {
-        Self {
-            regs: [[0; 8]; NUM_ACCUMULATOR_REGS],
-        }
+        Self { regs: [[0; 8]; NUM_ACCUMULATOR_REGS] }
     }
 
     /// Read an accumulator register as 8 × u64.
@@ -595,11 +549,7 @@ impl AccumulatorRegisterFile {
     /// cm0 = (acc0, acc1), cm2 = (acc2, acc3), etc.
     /// `base_reg` must be even (hardware enforces pair alignment).
     pub fn read_wide(&self, base_reg: u8) -> Acc1024 {
-        debug_assert!(
-            base_reg % 2 == 0,
-            "wide accum read from odd base register {}",
-            base_reg
-        );
+        debug_assert!(base_reg % 2 == 0, "wide accum read from odd base register {}", base_reg);
         let lo = self.read(base_reg);
         let hi = self.read(base_reg + 1);
         let mut result = [0u64; 16];
@@ -610,11 +560,7 @@ impl AccumulatorRegisterFile {
 
     /// Write a 1024-bit cm-register (split across two consecutive bm-registers).
     pub fn write_wide(&mut self, base_reg: u8, data: Acc1024) {
-        debug_assert!(
-            base_reg % 2 == 0,
-            "wide accum write to odd base register {}",
-            base_reg
-        );
+        debug_assert!(base_reg % 2 == 0, "wide accum write to odd base register {}", base_reg);
         let mut lo = [0u64; 8];
         let mut hi = [0u64; 8];
         lo.copy_from_slice(&data[..8]);
@@ -689,9 +635,7 @@ pub struct MaskRegisterFile {
 impl MaskRegisterFile {
     /// Create a new mask register file with all registers zeroed.
     pub fn new() -> Self {
-        Self {
-            regs: [[0u32; 4]; NUM_MASK_REGS],
-        }
+        Self { regs: [[0u32; 4]; NUM_MASK_REGS] }
     }
 
     /// Read the low 64 bits of a mask register (used by sparse matmul).
@@ -766,11 +710,7 @@ impl fmt::Debug for MaskRegisterFile {
         } else {
             writeln!(f, "MaskRegisterFile {{")?;
             for (reg, val) in non_zero {
-                writeln!(
-                    f,
-                    "  q{}: 0x{:08X}_{:08X}_{:08X}_{:08X}",
-                    reg, val[3], val[2], val[1], val[0]
-                )?;
+                writeln!(f, "  q{}: 0x{:08X}_{:08X}_{:08X}_{:08X}", reg, val[3], val[2], val[1], val[0])?;
             }
             write!(f, "}}")
         }
@@ -798,18 +738,22 @@ pub fn validate_register_model(model: &xdna_archspec::aie2::isa::RegisterModel) 
     // Scalar GPR class "eR" should have exactly NUM_SCALAR_GPRS members
     if let Some(er) = model.classes.get("eR") {
         assert_eq!(
-            er.members.len(), NUM_SCALAR_GPRS,
+            er.members.len(),
+            NUM_SCALAR_GPRS,
             "eR class has {} members, expected NUM_SCALAR_GPRS={}",
-            er.members.len(), NUM_SCALAR_GPRS
+            er.members.len(),
+            NUM_SCALAR_GPRS
         );
     }
 
     // Pointer class "eP" should have exactly NUM_POINTER_REGS members
     if let Some(ep) = model.classes.get("eP") {
         assert_eq!(
-            ep.members.len(), NUM_POINTER_REGS,
+            ep.members.len(),
+            NUM_POINTER_REGS,
             "eP class has {} members, expected NUM_POINTER_REGS={}",
-            ep.members.len(), NUM_POINTER_REGS
+            ep.members.len(),
+            NUM_POINTER_REGS
         );
     }
 
@@ -823,9 +767,12 @@ pub fn validate_register_model(model: &xdna_archspec::aie2::isa::RegisterModel) 
     for (class_name, desc) in &modifier_classes {
         if let Some(cls) = model.classes.get(*class_name) {
             assert_eq!(
-                cls.members.len(), 8,
+                cls.members.len(),
+                8,
                 "{} ({}) class has {} members, expected 8",
-                class_name, desc, cls.members.len()
+                class_name,
+                desc,
+                cls.members.len()
             );
         }
     }
@@ -853,11 +800,11 @@ pub fn validate_register_model(model: &xdna_archspec::aie2::isa::RegisterModel) 
     // These are the most critical -- a mismatch means LR, LC, etc. are
     // decoded to the wrong register slot.
     let special_checks: &[(&str, u16)] = &[
-        ("lr", 39),    // (4 << 3) | 0b111
-        ("LS", 7),     // (0 << 3) | 0b111
-        ("LE", 71),    // (8 << 3) | 0b111
-        ("LC", 87),    // (10 << 3) | 0b111
-        ("DP", 23),    // (2 << 3) | 0b111
+        ("lr", 39),      // (4 << 3) | 0b111
+        ("LS", 7),       // (0 << 3) | 0b111
+        ("LE", 71),      // (8 << 3) | 0b111
+        ("LC", 87),      // (10 << 3) | 0b111
+        ("DP", 23),      // (2 << 3) | 0b111
         ("CORE_ID", 55), // (6 << 3) | 0b111
     ];
     for (name, expected_hw) in special_checks {
@@ -978,15 +925,15 @@ mod tests {
 
         // m0, dn0, dj0, dc0 are all sub-registers of d0 but at different
         // bit positions. They should be independent in our flat model.
-        regs.write(MOD_BASE_M + 0, 0x111);       // m0
-        regs.write(MOD_BASE_DN + 0, 0x222);      // dn0
-        regs.write(MOD_BASE_DJ + 0, 0x333);      // dj0
-        regs.write(MOD_BASE_DC + 0, 0x444);      // dc0
+        regs.write(MOD_BASE_M + 0, 0x111); // m0
+        regs.write(MOD_BASE_DN + 0, 0x222); // dn0
+        regs.write(MOD_BASE_DJ + 0, 0x333); // dj0
+        regs.write(MOD_BASE_DC + 0, 0x444); // dc0
 
-        assert_eq!(regs.read(MOD_BASE_M + 0), 0x111);   // m0 unchanged
-        assert_eq!(regs.read(MOD_BASE_DN + 0), 0x222);   // dn0 unchanged
-        assert_eq!(regs.read(MOD_BASE_DJ + 0), 0x333);   // dj0 unchanged
-        assert_eq!(regs.read(MOD_BASE_DC + 0), 0x444);   // dc0 unchanged
+        assert_eq!(regs.read(MOD_BASE_M + 0), 0x111); // m0 unchanged
+        assert_eq!(regs.read(MOD_BASE_DN + 0), 0x222); // dn0 unchanged
+        assert_eq!(regs.read(MOD_BASE_DJ + 0), 0x333); // dj0 unchanged
+        assert_eq!(regs.read(MOD_BASE_DC + 0), 0x444); // dc0 unchanged
     }
 
     // ========== Vector Register Tests ==========
@@ -1087,15 +1034,19 @@ mod tests {
         arf.write(0, [100, 200, 300, 400, 500, 600, 700, 800]);
         arf.write(1, [900, 1000, 1100, 1200, 1300, 1400, 1500, 1600]);
         let wide = arf.read_wide(0);
-        assert_eq!(wide, [100, 200, 300, 400, 500, 600, 700, 800,
-                           900, 1000, 1100, 1200, 1300, 1400, 1500, 1600]);
+        assert_eq!(
+            wide,
+            [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500, 1600]
+        );
     }
 
     #[test]
     fn test_accum_write_wide() {
         let mut arf = AccumulatorRegisterFile::new();
         let mut data = [0u64; 16];
-        for i in 0..16 { data[i] = (i as u64 + 1) * 10; }
+        for i in 0..16 {
+            data[i] = (i as u64 + 1) * 10;
+        }
         arf.write_wide(0, data);
         assert_eq!(arf.read(0), [10, 20, 30, 40, 50, 60, 70, 80]);
         assert_eq!(arf.read(1), [90, 100, 110, 120, 130, 140, 150, 160]);

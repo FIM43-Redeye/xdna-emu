@@ -18,8 +18,8 @@
 //! ```
 
 use super::registers::{
-    AccumulatorRegisterFile, MaskRegisterFile, ModifierRegisterFile, PointerRegisterFile,
-    ScalarRegisterFile, VectorRegisterFile,
+    AccumulatorRegisterFile, MaskRegisterFile, ModifierRegisterFile, PointerRegisterFile, ScalarRegisterFile,
+    VectorRegisterFile,
 };
 use crate::interpreter::bundle::Operand;
 use crate::interpreter::traits::{Flags, StateAccess};
@@ -90,7 +90,8 @@ pub struct PendingStore {
 /// - add_21_i8: add.nc at store+5 → result at store+6 → read at store+6 ✓
 /// - add_12_i8: add.nc at store+6 → result at store+7 → read at store+6
 ///   reads the OLD r0 from the previous iteration (add.nc hasn't written yet) ✓
-const PARTIAL_WORD_STORE_DATA_LATENCY: u64 = xdna_archspec::aie2::processor::PARTIAL_STORE_DATA_LATENCY as u64;
+const PARTIAL_WORD_STORE_DATA_LATENCY: u64 =
+    xdna_archspec::aie2::processor::PARTIAL_STORE_DATA_LATENCY as u64;
 
 /// Complete execution context for an AIE2 core.
 ///
@@ -433,12 +434,16 @@ impl ExecutionContext {
                     self.pc = ls;
                     log::debug!(
                         "ZLS loop: executed instr at LE=0x{:X}, LC {} -> {}, jumping to LS=0x{:X}",
-                        le, lc, new_lc, ls
+                        le,
+                        lc,
+                        new_lc,
+                        ls
                     );
                 } else {
                     log::debug!(
                         "ZLS loop: final iteration at LE=0x{:X}, LC {} -> 0, falling through",
-                        le, lc
+                        le,
+                        lc
                     );
                 }
             }
@@ -470,8 +475,6 @@ impl ExecutionContext {
     /// Set the stack pointer value.
     #[inline]
     pub fn set_sp(&mut self, value: u32) {
-
-
         match self.sp_reg {
             SpRegister::Pointer(r) => self.pointer.write(r, value),
             SpRegister::Scalar(r) => self.scalar.write(r, value),
@@ -672,8 +675,7 @@ impl ExecutionContext {
     #[inline]
     pub fn record_core_bank_access(&mut self, addr: u32, bytes: usize, num_banks: usize) {
         if num_banks > 0 {
-            self.cycle_core_banks |=
-                crate::device::banking::banks_for_access(addr, bytes, num_banks);
+            self.cycle_core_banks |= crate::device::banking::banks_for_access(addr, bytes, num_banks);
         }
     }
 
@@ -967,7 +969,9 @@ impl ExecutionContext {
         self.pending_writes.iter().rev().find_map(|pw| {
             if pw.issued_cycle < self.cycles && pw.ready_cycle <= self.cycles {
                 if let Operand::ScalarReg(r) = &pw.dest {
-                    if *r == reg { return Some(pw.scalar_value); }
+                    if *r == reg {
+                        return Some(pw.scalar_value);
+                    }
                 }
             }
             None
@@ -979,7 +983,9 @@ impl ExecutionContext {
         self.pending_writes.iter().rev().find_map(|pw| {
             if pw.issued_cycle < self.cycles && pw.ready_cycle <= self.cycles {
                 if let Operand::PointerReg(r) = &pw.dest {
-                    if *r == reg { return Some(pw.scalar_value); }
+                    if *r == reg {
+                        return Some(pw.scalar_value);
+                    }
                 }
             }
             None
@@ -991,7 +997,9 @@ impl ExecutionContext {
         self.pending_writes.iter().rev().find_map(|pw| {
             if pw.issued_cycle < self.cycles && pw.ready_cycle <= self.cycles {
                 if let Operand::ModifierReg(r) = &pw.dest {
-                    if *r == reg { return Some(pw.scalar_value); }
+                    if *r == reg {
+                        return Some(pw.scalar_value);
+                    }
                 }
             }
             None
@@ -1060,7 +1068,8 @@ impl ExecutionContext {
                     self.set_lr(return_addr);
                     log::debug!(
                         "Call delay slots exhausted, LR=0x{:X}, branching to 0x{:X}",
-                        return_addr, target
+                        return_addr,
+                        target
                     );
                 } else {
                     log::debug!("Delay slots exhausted, branching to 0x{:X}", target);
@@ -1107,8 +1116,7 @@ impl ExecutionContext {
     ///
     /// Accepts indices 0-47 (including special register slots 32-47).
     pub fn set_lr_register(&mut self, reg: u8) {
-        assert!((reg as usize) < super::registers::NUM_SCALAR_REGS,
-                "lr register index {} out of range", reg);
+        assert!((reg as usize) < super::registers::NUM_SCALAR_REGS, "lr register index {} out of range", reg);
         self.lr_reg = reg;
     }
 }
@@ -1198,12 +1206,7 @@ mod tests {
     fn test_flags_operations() {
         let mut ctx = ExecutionContext::new();
 
-        let flags = Flags {
-            z: true,
-            n: false,
-            c: true,
-            v: false,
-        };
+        let flags = Flags { z: true, n: false, c: true, v: false };
         ctx.set_flags(flags);
 
         let read = ctx.flags();
@@ -1267,10 +1270,7 @@ mod tests {
 
         let vec_data = [1, 2, 3, 4, 5, 6, 7, 8];
         <ExecutionContext as StateAccess>::write_vector(&mut ctx, 5, vec_data);
-        assert_eq!(
-            <ExecutionContext as StateAccess>::read_vector(&ctx, 5),
-            vec_data
-        );
+        assert_eq!(<ExecutionContext as StateAccess>::read_vector(&ctx, 5), vec_data);
     }
 
     #[test]
@@ -1307,8 +1307,7 @@ mod tests {
         assert_eq!(ctx.pc(), 0);
         // After reset, r5 should NOT retain the pre-reset value (42).
         // It will have the register init pattern (tripwire), not zero.
-        assert_ne!(ctx.scalar.read(5), 42,
-            "r5 should not retain pre-reset value");
+        assert_ne!(ctx.scalar.read(5), 42, "r5 should not retain pre-reset value");
         assert_eq!(ctx.cycles, 0);
         assert!(!ctx.halted);
     }
@@ -1416,23 +1415,18 @@ mod tests {
 
         // At cycle 11: load not ready -- read old value
         ctx.cycles = 11;
-        assert_eq!(ctx.scalar_read(5), 111,
-            "Before ready_cycle, should return old register value");
-        assert_eq!(ctx.scalar.read(5), 111,
-            "Live register should still have old value");
+        assert_eq!(ctx.scalar_read(5), 111, "Before ready_cycle, should return old register value");
+        assert_eq!(ctx.scalar.read(5), 111, "Live register should still have old value");
 
         // At cycle 16: still pending, still not ready
         ctx.cycles = 16;
-        assert_eq!(ctx.scalar_read(5), 111,
-            "Still before ready_cycle, should return old value");
+        assert_eq!(ctx.scalar_read(5), 111, "Still before ready_cycle, should return old value");
 
         // At cycle 17: ready -- forward then commit
         ctx.cycles = 17;
-        assert_eq!(ctx.scalar_read(5), 222,
-            "At ready_cycle, forwarding should return load value");
+        assert_eq!(ctx.scalar_read(5), 222, "At ready_cycle, forwarding should return load value");
         ctx.commit_pending_writes();
-        assert_eq!(ctx.scalar.read(5), 222,
-            "After commit, live register should have new value");
+        assert_eq!(ctx.scalar.read(5), 222, "After commit, live register should have new value");
         // No more pending writes, read should return live value
         assert_eq!(ctx.scalar_read(5), 222);
     }
@@ -1451,15 +1445,16 @@ mod tests {
 
         // Before ready_cycle: forwarding should NOT return the value
         ctx.cycles = 12;
-        assert_eq!(ctx.pointer_read(7), 0xDEAD,
-            "Before ready_cycle, pointer_read should return old value");
-        assert_eq!(ctx.pointer.read(7), 0xDEAD,
-            "Live pointer register should still have old value");
+        assert_eq!(ctx.pointer_read(7), 0xDEAD, "Before ready_cycle, pointer_read should return old value");
+        assert_eq!(ctx.pointer.read(7), 0xDEAD, "Live pointer register should still have old value");
 
         // At ready_cycle: forwarding should work
         ctx.cycles = 17;
-        assert_eq!(ctx.pointer_read(7), 0x78000,
-            "At ready_cycle, pointer forwarding should return pending load value");
+        assert_eq!(
+            ctx.pointer_read(7),
+            0x78000,
+            "At ready_cycle, pointer forwarding should return pending load value"
+        );
 
         // After ready: commit should apply
         ctx.cycles = 17;
@@ -1478,15 +1473,16 @@ mod tests {
 
         // Before ready_cycle: should read old value
         ctx.cycles = 6;
-        assert_eq!(ctx.modifier_read(3), 0x10,
-            "Before ready_cycle, modifier_read should return old value");
-        assert_eq!(ctx.modifier.read(3), 0x10,
-            "Live modifier should still have old value");
+        assert_eq!(ctx.modifier_read(3), 0x10, "Before ready_cycle, modifier_read should return old value");
+        assert_eq!(ctx.modifier.read(3), 0x10, "Live modifier should still have old value");
 
         // At ready_cycle (5 + 7 = 12): forwarding should work
         ctx.cycles = 12;
-        assert_eq!(ctx.modifier_read(3), 0x20,
-            "At ready_cycle, modifier forwarding should return pending value");
+        assert_eq!(
+            ctx.modifier_read(3),
+            0x20,
+            "At ready_cycle, modifier forwarding should return pending value"
+        );
     }
 
     #[test]
@@ -1500,8 +1496,7 @@ mod tests {
         ctx.queue_scalar_load(Operand::ScalarReg(5), 222, 7);
 
         // Same cycle: forward_scalar should return None
-        assert_eq!(ctx.forward_scalar(5), None,
-            "Same-cycle pending write must not be forwarded");
+        assert_eq!(ctx.forward_scalar(5), None, "Same-cycle pending write must not be forwarded");
         // scalar_read falls through to live value
         assert_eq!(ctx.scalar_read(5), 111);
     }
@@ -1519,15 +1514,16 @@ mod tests {
         // Before ready_cycle: forward should NOT return the value
         // (load latency hasn't elapsed yet)
         ctx.cycles = 12;
-        assert_eq!(ctx.forward_scalar(5), None,
-            "Before ready_cycle, forward should not return pending value");
-        assert_eq!(ctx.scalar_read(5), 0,
-            "Before ready_cycle, scalar_read should return old value");
+        assert_eq!(
+            ctx.forward_scalar(5),
+            None,
+            "Before ready_cycle, forward should not return pending value"
+        );
+        assert_eq!(ctx.scalar_read(5), 0, "Before ready_cycle, scalar_read should return old value");
 
         // At ready_cycle: forward should work
         ctx.cycles = 13;
-        assert_eq!(ctx.forward_scalar(5), Some(42),
-            "At ready_cycle, forward should return pending value");
+        assert_eq!(ctx.forward_scalar(5), Some(42), "At ready_cycle, forward should return pending value");
 
         // Commit drains it
         ctx.commit_pending_writes();
@@ -1551,30 +1547,28 @@ mod tests {
 
         // At cycle 13: neither load is ready yet -- read old value
         ctx.cycles = 13;
-        assert_eq!(ctx.scalar_read(5), 0,
-            "Neither load ready yet, should read old register value");
+        assert_eq!(ctx.scalar_read(5), 0, "Neither load ready yet, should read old register value");
 
         // At cycle 17: first load is ready, second is not -- forward first
         ctx.cycles = 17;
-        assert_eq!(ctx.forward_scalar(5), Some(1001),
-            "First load ready, second not yet -- should forward first");
+        assert_eq!(
+            ctx.forward_scalar(5),
+            Some(1001),
+            "First load ready, second not yet -- should forward first"
+        );
 
         // Commit at 17 drains first load
         ctx.commit_pending_writes();
-        assert_eq!(ctx.scalar.read(5), 1001,
-            "First load should have committed to live register");
+        assert_eq!(ctx.scalar.read(5), 1001, "First load should have committed to live register");
         // Second still pending but not ready -- read committed value
-        assert_eq!(ctx.scalar_read(5), 1001,
-            "Second load not ready yet, should read committed first");
+        assert_eq!(ctx.scalar_read(5), 1001, "Second load not ready yet, should read committed first");
 
         // At cycle 19: second load ready -- forward it
         ctx.cycles = 19;
-        assert_eq!(ctx.forward_scalar(5), Some(1002),
-            "Second load now ready, should be forwarded");
+        assert_eq!(ctx.forward_scalar(5), Some(1002), "Second load now ready, should be forwarded");
 
         ctx.commit_pending_writes();
-        assert_eq!(ctx.scalar.read(5), 1002,
-            "Second load should overwrite first in live register");
+        assert_eq!(ctx.scalar.read(5), 1002, "Second load should overwrite first in live register");
     }
 
     #[test]
@@ -1598,14 +1592,12 @@ mod tests {
         // NOT 5 (the pending load value)
         for c in 101..=106 {
             ctx.cycles = c;
-            assert_eq!(ctx.scalar_read(24), 42,
-                "At cycle {c}, load not ready, must read old value 42");
+            assert_eq!(ctx.scalar_read(24), 42, "At cycle {c}, load not ready, must read old value 42");
         }
 
         // Cycle 107: load completes, r24 becomes 5
         ctx.cycles = 107;
-        assert_eq!(ctx.scalar_read(24), 5,
-            "At ready_cycle 107, should forward new value 5");
+        assert_eq!(ctx.scalar_read(24), 5, "At ready_cycle 107, should forward new value 5");
     }
 
     #[test]
@@ -1617,10 +1609,8 @@ mod tests {
         ctx.queue_scalar_load(Operand::ScalarReg(5), 42, 7);
 
         ctx.cycles = 11;
-        assert_eq!(ctx.forward_scalar(6), None,
-            "Forward should not match different register");
-        assert_eq!(ctx.forward_pointer(5), None,
-            "Forward should not match different register class");
+        assert_eq!(ctx.forward_scalar(6), None, "Forward should not match different register");
+        assert_eq!(ctx.forward_pointer(5), None, "Forward should not match different register class");
     }
 
     // =====================================================================
@@ -1647,8 +1637,7 @@ mod tests {
 
         // All pointer regs should be unaffected
         for i in 0..8u8 {
-            assert_eq!(ctx.pointer.read(i), 0x1000 + i as u32,
-                "p{} should be unaffected by SP write", i);
+            assert_eq!(ctx.pointer.read(i), 0x1000 + i as u32, "p{} should be unaffected by SP write", i);
         }
     }
 
@@ -1662,8 +1651,7 @@ mod tests {
             ctx.pointer.write(i, 0xBEEF);
         }
 
-        assert_eq!(ctx.sp(), 0x70000,
-            "SP should be unaffected by pointer register writes");
+        assert_eq!(ctx.sp(), 0x70000, "SP should be unaffected by pointer register writes");
     }
 
     #[test]
@@ -1689,8 +1677,7 @@ mod tests {
         assert_eq!(ctx.sp(), 0x70080);
 
         // No pending write should have been created
-        assert!(ctx.pending_writes.is_empty(),
-            "SP write should not create a pending write");
+        assert!(ctx.pending_writes.is_empty(), "SP write should not create a pending write");
     }
 
     #[test]
@@ -1730,15 +1717,13 @@ mod tests {
         // Load not ready yet -- snapshot value should be returned
         ctx.cycles = 11;
         ctx.begin_bundle();
-        assert_eq!(ctx.scalar_read(5), 333,
-            "Before ready_cycle, snapshot value should be returned");
+        assert_eq!(ctx.scalar_read(5), 333, "Before ready_cycle, snapshot value should be returned");
         ctx.end_bundle();
 
         // At cycle 17: load is ready -- forwarding overrides snapshot
         ctx.cycles = 17;
         ctx.begin_bundle();
-        assert_eq!(ctx.scalar_read(5), 444,
-            "At ready_cycle, forwarding must override snapshot");
+        assert_eq!(ctx.scalar_read(5), 444, "At ready_cycle, forwarding must override snapshot");
         ctx.end_bundle();
     }
 
@@ -1756,8 +1741,7 @@ mod tests {
         ctx.queue_scalar_load(Operand::ScalarReg(5), 222, 7);
 
         // Read in same bundle: should get snapshot value, not the pending load
-        assert_eq!(ctx.scalar_read(5), 333,
-            "Same-bundle load must not be forwarded");
+        assert_eq!(ctx.scalar_read(5), 333, "Same-bundle load must not be forwarded");
 
         ctx.end_bundle();
     }
@@ -1782,8 +1766,7 @@ mod tests {
         ctx.commit_pending_writes();
 
         // Later ready_cycle writes second, overwriting the earlier one
-        assert_eq!(ctx.scalar.read(5), 2002,
-            "Later-ready write should overwrite earlier-ready write");
+        assert_eq!(ctx.scalar.read(5), 2002, "Later-ready write should overwrite earlier-ready write");
     }
 
     #[test]
@@ -1848,12 +1831,10 @@ mod tests {
         ctx.commit_pending_writes();
 
         for i in 0..3u8 {
-            assert_eq!(ctx.scalar.read(i), (i as u32 + 1) * 100,
-                "r{} should be committed", i);
+            assert_eq!(ctx.scalar.read(i), (i as u32 + 1) * 100, "r{} should be committed", i);
         }
         for i in 3..6u8 {
-            assert_eq!(ctx.scalar.read(i), 0,
-                "r{} should NOT be committed yet", i);
+            assert_eq!(ctx.scalar.read(i), 0, "r{} should NOT be committed yet", i);
         }
         assert_eq!(ctx.pending_writes.len(), 3);
 
@@ -1861,8 +1842,7 @@ mod tests {
         ctx.cycles = 22;
         ctx.commit_pending_writes();
         for i in 3..6u8 {
-            assert_eq!(ctx.scalar.read(i), (i as u32 + 1) * 100,
-                "r{} should now be committed", i);
+            assert_eq!(ctx.scalar.read(i), (i as u32 + 1) * 100, "r{} should now be committed", i);
         }
         assert!(ctx.pending_writes.is_empty());
     }
@@ -1884,16 +1864,13 @@ mod tests {
         // At cycle 17: should NOT be committed yet (was delayed to 18)
         ctx.cycles = 17;
         ctx.commit_pending_writes();
-        assert_eq!(ctx.pointer.read(7), 0,
-            "Delayed write should not commit at original ready_cycle");
+        assert_eq!(ctx.pointer.read(7), 0, "Delayed write should not commit at original ready_cycle");
         // Forward also should not work (ready_cycle is 18)
-        assert_eq!(ctx.pointer_read(7), 0,
-            "Before delayed ready_cycle, forward should return old value");
+        assert_eq!(ctx.pointer_read(7), 0, "Before delayed ready_cycle, forward should return old value");
 
         // At cycle 18: ready -- forward and commit
         ctx.cycles = 18;
-        assert_eq!(ctx.pointer_read(7), 0x78000,
-            "At delayed ready_cycle, forward should return value");
+        assert_eq!(ctx.pointer_read(7), 0x78000, "At delayed ready_cycle, forward should return value");
         ctx.commit_pending_writes();
         assert_eq!(ctx.pointer.read(7), 0x78000);
     }
@@ -1938,16 +1915,13 @@ mod tests {
 
         // Step 5: Before ready_cycle, read returns the clobbered value
         ctx.cycles = 101;
-        assert_eq!(ctx.pointer_read(7), 0x70080,
-            "Before ready_cycle, should read clobbered sp value");
+        assert_eq!(ctx.pointer_read(7), 0x70080, "Before ready_cycle, should read clobbered sp value");
 
         // At ready_cycle (107), forward works and commit applies
         ctx.cycles = 107;
-        assert_eq!(ctx.pointer_read(7), 0x78000,
-            "At ready_cycle, forward should return restored value");
+        assert_eq!(ctx.pointer_read(7), 0x78000, "At ready_cycle, forward should return restored value");
         ctx.commit_pending_writes();
-        assert_eq!(ctx.pointer.read(7), 0x78000,
-            "p7 should be restored to original value");
+        assert_eq!(ctx.pointer.read(7), 0x78000, "p7 should be restored to original value");
     }
 
     #[test]
@@ -1971,13 +1945,11 @@ mod tests {
 
         // Step 4: At cycle 55 (before ready_cycle 58), reads old clobbered value
         ctx.cycles = 55;
-        assert_eq!(ctx.pointer_read(7), 0,
-            "Before ready_cycle, p7 should return old (clobbered) value");
+        assert_eq!(ctx.pointer_read(7), 0, "Before ready_cycle, p7 should return old (clobbered) value");
 
         // At ready_cycle 58: forwarding works
         ctx.cycles = 58;
-        assert_eq!(ctx.pointer_read(7), 0x78000,
-            "At ready_cycle, p7 should be forwarded from pending load");
+        assert_eq!(ctx.pointer_read(7), 0x78000, "At ready_cycle, p7 should be forwarded from pending load");
     }
 
     #[test]
@@ -1997,18 +1969,15 @@ mod tests {
 
         // At cycle 13: load not ready yet -- read the MOV value
         ctx.cycles = 13;
-        assert_eq!(ctx.scalar_read(5), 3001,
-            "Before ready_cycle, MOV value should be visible");
+        assert_eq!(ctx.scalar_read(5), 3001, "Before ready_cycle, MOV value should be visible");
 
         // At cycle 17: load ready -- forward overrides MOV
         ctx.cycles = 17;
-        assert_eq!(ctx.scalar_read(5), 3002,
-            "At ready_cycle, pending load should override MOV value");
+        assert_eq!(ctx.scalar_read(5), 3002, "At ready_cycle, pending load should override MOV value");
 
         // Commit applies the load to the register file
         ctx.commit_pending_writes();
-        assert_eq!(ctx.scalar.read(5), 3002,
-            "Load should overwrite the MOV value when committed");
+        assert_eq!(ctx.scalar.read(5), 3002, "Load should overwrite the MOV value when committed");
     }
 
     // =====================================================================
@@ -2104,20 +2073,24 @@ mod tests {
         // === Phase 6: Back at caller (return point) ===
         ctx.cycles = 107;
         ctx.commit_pending_writes(); // p7 ready=108 > 107, NOT committed
-        // Before ready_cycle: reads old clobbered value
-        assert_eq!(ctx.pointer_read(7), 0x70040,
-            "Before ready_cycle, p7 should read clobbered value (from padda)");
+                                     // Before ready_cycle: reads old clobbered value
+        assert_eq!(
+            ctx.pointer_read(7),
+            0x70040,
+            "Before ready_cycle, p7 should read clobbered value (from padda)"
+        );
 
         // At ready_cycle 108: forward works and commit applies
         ctx.cycles = 108;
-        assert_eq!(ctx.pointer_read(7), 0x78000,
-            "At ready_cycle, p7 should be forwarded");
+        assert_eq!(ctx.pointer_read(7), 0x78000, "At ready_cycle, p7 should be forwarded");
         ctx.commit_pending_writes(); // p7 ready=108 <= 108, COMMITTED!
-        assert_eq!(ctx.pointer.read(7), 0x78000,
-            "p7 committed in register file after return");
-        assert!(ctx.pending_writes.iter().all(|pw| {
-            !matches!(&pw.dest, Operand::PointerReg(7))
-        }), "p7 pending write drained from queue");
+        assert_eq!(ctx.pointer.read(7), 0x78000, "p7 committed in register file after return");
+        assert!(
+            ctx.pending_writes
+                .iter()
+                .all(|pw| { !matches!(&pw.dest, Operand::PointerReg(7)) }),
+            "p7 pending write drained from queue"
+        );
 
         // === Phase 7: Several instructions in caller (no p7 writes) ===
         // rel, add, ltu, add, xor, xor, or at cycles 107-114
@@ -2128,7 +2101,7 @@ mod tests {
 
         // === Phase 8: jnz loop back (second branch) ===
         ctx.cycles = 116; // jnz
-        // 5 delay slots at 117-121
+                          // 5 delay slots at 117-121
         ctx.cycles = 121;
         // Branch takes effect - delay_pending_writes(1) on empty queue
         ctx.delay_pending_writes(1); // no-op (p7 already committed)
@@ -2136,8 +2109,7 @@ mod tests {
         // === Phase 9: Back at loop start ===
         ctx.cycles = 122;
         ctx.commit_pending_writes(); // nothing pending
-        assert_eq!(ctx.pointer.read(7), 0x78000,
-            "p7 intact after jnz loop back");
+        assert_eq!(ctx.pointer.read(7), 0x78000, "p7 intact after jnz loop back");
 
         // === Phase 10: acq (stalls, cycles advance) ===
         for c in 123..=130 {
@@ -2148,8 +2120,7 @@ mod tests {
         // === Phase 11: Second jl call - delay slot reads p7 ===
         ctx.cycles = 135;
         let p7_second_call = ctx.pointer_read(7);
-        assert_eq!(p7_second_call, 0x78000,
-            "CRITICAL: p7 must be 0x78000 at second memcpy call");
+        assert_eq!(p7_second_call, 0x78000, "CRITICAL: p7 must be 0x78000 at second memcpy call");
     }
 
     #[test]
