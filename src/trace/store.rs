@@ -68,11 +68,7 @@ pub struct LoadedTrace {
 impl LoadedTrace {
     /// Build a LoadedTrace from unsorted events.
     /// Sorts events and computes cycle_range and active_tiles.
-    pub fn from_events(
-        label: String,
-        source: TraceSource,
-        mut events: Vec<TraceEvent>,
-    ) -> Self {
+    pub fn from_events(label: String, source: TraceSource, mut events: Vec<TraceEvent>) -> Self {
         events.sort_by(|a, b| {
             a.cycle
                 .cmp(&b.cycle)
@@ -87,16 +83,9 @@ impl LoadedTrace {
             (events.first().unwrap().cycle, events.last().unwrap().cycle)
         };
 
-        let active_tiles: HashSet<(u8, u8)> =
-            events.iter().map(|e| (e.col, e.row)).collect();
+        let active_tiles: HashSet<(u8, u8)> = events.iter().map(|e| (e.col, e.row)).collect();
 
-        Self {
-            label,
-            source,
-            events,
-            cycle_range,
-            active_tiles,
-        }
+        Self { label, source, events, cycle_range, active_tiles }
     }
 
     /// Binary search for the contiguous slice of events at a given cycle.
@@ -108,11 +97,7 @@ impl LoadedTrace {
     }
 
     /// Slice of events in [start_cycle, end_cycle] inclusive.
-    pub fn events_in_range(
-        &self,
-        start_cycle: u64,
-        end_cycle: u64,
-    ) -> &[TraceEvent] {
+    pub fn events_in_range(&self, start_cycle: u64, end_cycle: u64) -> &[TraceEvent] {
         let start = self.events.partition_point(|e| e.cycle < start_cycle);
         let end = self.events.partition_point(|e| e.cycle <= end_cycle);
         &self.events[start..end]
@@ -122,17 +107,11 @@ impl LoadedTrace {
     ///
     /// Extracts PID-to-tile mapping from process_name metadata, then
     /// converts B/E events into TraceEvents with tile coordinates.
-    pub fn from_perfetto_json(
-        reader: impl Read,
-        label: String,
-        source: TraceSource,
-    ) -> Result<Self, String> {
-        let raw: serde_json::Value = serde_json::from_reader(reader)
-            .map_err(|e| format!("JSON parse error: {}", e))?;
+    pub fn from_perfetto_json(reader: impl Read, label: String, source: TraceSource) -> Result<Self, String> {
+        let raw: serde_json::Value =
+            serde_json::from_reader(reader).map_err(|e| format!("JSON parse error: {}", e))?;
 
-        let array = raw
-            .as_array()
-            .ok_or_else(|| "Expected JSON array".to_string())?;
+        let array = raw.as_array().ok_or_else(|| "Expected JSON array".to_string())?;
 
         // Phase 1: Build PID -> (col, row, trace_type) map from metadata.
         let mut pid_map: HashMap<u64, (u8, u8, TraceType)> = HashMap::new();
@@ -140,13 +119,10 @@ impl LoadedTrace {
             if entry.get("ph").and_then(|v| v.as_str()) != Some("M") {
                 continue;
             }
-            if entry.get("name").and_then(|v| v.as_str())
-                != Some("process_name")
-            {
+            if entry.get("name").and_then(|v| v.as_str()) != Some("process_name") {
                 continue;
             }
-            let pid =
-                entry.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+            let pid = entry.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
             let pname = entry
                 .get("args")
                 .and_then(|a| a.get("name"))
@@ -166,38 +142,19 @@ impl LoadedTrace {
                 _ => continue, // skip metadata and other phases
             };
 
-            let pid =
-                entry.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+            let pid = entry.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
             let (col, row, trace_type) = match pid_map.get(&pid) {
                 Some(v) => *v,
                 None => continue, // skip events with unknown PID
             };
 
-            let name = entry
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("UNKNOWN")
-                .to_string();
+            let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("UNKNOWN").to_string();
 
-            let cycle =
-                entry.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
-            let tid = entry.get("tid").and_then(|v| v.as_u64()).unwrap_or(0)
-                as u32;
-            let args = entry
-                .get("args")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
+            let cycle = entry.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
+            let tid = entry.get("tid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let args = entry.get("args").cloned().unwrap_or(serde_json::Value::Null);
 
-            events.push(TraceEvent {
-                cycle,
-                col,
-                row,
-                name,
-                phase: ph,
-                tid,
-                trace_type,
-                args,
-            });
+            events.push(TraceEvent { cycle, col, row, name, phase: ph, tid, trace_type, args });
         }
 
         Ok(Self::from_events(label, source, events))
@@ -224,10 +181,7 @@ fn parse_process_name(name: &str) -> Option<(u8, u8, TraceType)> {
     // Try "tileROW,COL" format first (our format and hw traces).
     if let Some(pos) = name.find("tile") {
         let rest = &name[pos + 4..];
-        let coords: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == ',')
-            .collect();
+        let coords: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == ',').collect();
         let parts: Vec<&str> = coords.split(',').collect();
         if parts.len() == 2 {
             let row: u8 = parts[0].parse().ok()?;
@@ -239,16 +193,10 @@ fn parse_process_name(name: &str) -> Option<(u8, u8, TraceType)> {
     // Try "column COL, row ROW" format (mlir-aie).
     if let Some(col_pos) = name.find("column ") {
         let after_col = &name[col_pos + 7..];
-        let col_str: String = after_col
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
+        let col_str: String = after_col.chars().take_while(|c| c.is_ascii_digit()).collect();
         if let Some(row_pos) = name.find("row ") {
             let after_row = &name[row_pos + 4..];
-            let row_str: String = after_row
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
+            let row_str: String = after_row.chars().take_while(|c| c.is_ascii_digit()).collect();
             let col: u8 = col_str.parse().ok()?;
             let row: u8 = row_str.parse().ok()?;
             return Some((col, row, trace_type));
@@ -270,11 +218,7 @@ pub struct TraceStore {
 
 impl Default for TraceStore {
     fn default() -> Self {
-        Self {
-            traces: Vec::new(),
-            cursor: 0,
-            cycle_range: (0, 0),
-        }
+        Self { traces: Vec::new(), cursor: 0, cycle_range: (0, 0) }
     }
 }
 
@@ -293,14 +237,8 @@ impl TraceStore {
             if trace.events.is_empty() {
                 continue;
             }
-            min_cycle =
-                Some(min_cycle.map_or(trace.cycle_range.0, |m: u64| {
-                    m.min(trace.cycle_range.0)
-                }));
-            max_cycle =
-                Some(max_cycle.map_or(trace.cycle_range.1, |m: u64| {
-                    m.max(trace.cycle_range.1)
-                }));
+            min_cycle = Some(min_cycle.map_or(trace.cycle_range.0, |m: u64| m.min(trace.cycle_range.0)));
+            max_cycle = Some(max_cycle.map_or(trace.cycle_range.1, |m: u64| m.max(trace.cycle_range.1)));
         }
         self.cycle_range = match (min_cycle, max_cycle) {
             (Some(lo), Some(hi)) => (lo, hi),
@@ -357,18 +295,11 @@ impl TraceStore {
     /// Returns (trace_ref, event_slice) pairs. Slice may be empty for
     /// traces with no events at this cycle.
     pub fn events_at_cursor(&self) -> Vec<(&LoadedTrace, &[TraceEvent])> {
-        self.traces
-            .iter()
-            .map(|t| (t, t.events_at_cycle(self.cursor)))
-            .collect()
+        self.traces.iter().map(|t| (t, t.events_at_cycle(self.cursor))).collect()
     }
 
     /// Events at the cursor for a specific tile, per loaded trace.
-    pub fn tile_events_at_cursor(
-        &self,
-        col: u8,
-        row: u8,
-    ) -> Vec<(&LoadedTrace, Vec<&TraceEvent>)> {
+    pub fn tile_events_at_cursor(&self, col: u8, row: u8) -> Vec<(&LoadedTrace, Vec<&TraceEvent>)> {
         self.traces
             .iter()
             .map(|t| {
@@ -383,29 +314,15 @@ impl TraceStore {
     }
 
     /// Events in a cycle range [start, end] inclusive, per loaded trace.
-    pub fn events_in_range(
-        &self,
-        start: u64,
-        end: u64,
-    ) -> Vec<(&LoadedTrace, &[TraceEvent])> {
-        self.traces
-            .iter()
-            .map(|t| (t, t.events_in_range(start, end)))
-            .collect()
+    pub fn events_in_range(&self, start: u64, end: u64) -> Vec<(&LoadedTrace, &[TraceEvent])> {
+        self.traces.iter().map(|t| (t, t.events_in_range(start, end))).collect()
     }
 
     /// Load a Perfetto JSON trace file into the store.
-    pub fn load(
-        &mut self,
-        path: &Path,
-        label: String,
-        source: TraceSource,
-    ) -> Result<(), String> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("Cannot open {}: {}", path.display(), e))?;
+    pub fn load(&mut self, path: &Path, label: String, source: TraceSource) -> Result<(), String> {
+        let file = std::fs::File::open(path).map_err(|e| format!("Cannot open {}: {}", path.display(), e))?;
         let reader = std::io::BufReader::new(file);
-        let trace =
-            LoadedTrace::from_perfetto_json(reader, label, source)?;
+        let trace = LoadedTrace::from_perfetto_json(reader, label, source)?;
         self.add_trace(trace);
         Ok(())
     }
@@ -471,11 +388,7 @@ mod tests {
                 args: serde_json::Value::Null,
             },
         ];
-        let trace = LoadedTrace::from_events(
-            "test".to_string(),
-            TraceSource::Emulator,
-            events,
-        );
+        let trace = LoadedTrace::from_events("test".to_string(), TraceSource::Emulator, events);
         // Should be sorted by cycle
         assert_eq!(trace.events[0].cycle, 5);
         assert_eq!(trace.events[1].cycle, 10);
@@ -488,16 +401,8 @@ mod tests {
     #[test]
     fn test_seek_clamps_to_range() {
         let mut store = TraceStore::new();
-        let events = vec![
-            make_event(10, 0, 2, "A"),
-            make_event(20, 0, 2, "B"),
-            make_event(30, 0, 2, "C"),
-        ];
-        store.add_trace(LoadedTrace::from_events(
-            "t1".into(),
-            TraceSource::Emulator,
-            events,
-        ));
+        let events = vec![make_event(10, 0, 2, "A"), make_event(20, 0, 2, "B"), make_event(30, 0, 2, "C")];
+        store.add_trace(LoadedTrace::from_events("t1".into(), TraceSource::Emulator, events));
 
         store.seek(15);
         assert_eq!(store.cursor, 15);
@@ -512,16 +417,8 @@ mod tests {
     #[test]
     fn test_next_event_cycle() {
         let mut store = TraceStore::new();
-        let events = vec![
-            make_event(10, 0, 2, "A"),
-            make_event(20, 0, 2, "B"),
-            make_event(30, 0, 2, "C"),
-        ];
-        store.add_trace(LoadedTrace::from_events(
-            "t1".into(),
-            TraceSource::Emulator,
-            events,
-        ));
+        let events = vec![make_event(10, 0, 2, "A"), make_event(20, 0, 2, "B"), make_event(30, 0, 2, "C")];
+        store.add_trace(LoadedTrace::from_events("t1".into(), TraceSource::Emulator, events));
 
         store.seek(10);
         assert_eq!(store.next_event_cycle(), Some(20));
@@ -536,16 +433,8 @@ mod tests {
     #[test]
     fn test_prev_event_cycle() {
         let mut store = TraceStore::new();
-        let events = vec![
-            make_event(10, 0, 2, "A"),
-            make_event(20, 0, 2, "B"),
-            make_event(30, 0, 2, "C"),
-        ];
-        store.add_trace(LoadedTrace::from_events(
-            "t1".into(),
-            TraceSource::Emulator,
-            events,
-        ));
+        let events = vec![make_event(10, 0, 2, "A"), make_event(20, 0, 2, "B"), make_event(30, 0, 2, "C")];
+        store.add_trace(LoadedTrace::from_events("t1".into(), TraceSource::Emulator, events));
 
         store.seek(30);
         assert_eq!(store.prev_event_cycle(), Some(20));
@@ -585,11 +474,7 @@ mod tests {
         store.add_trace(LoadedTrace::from_events(
             "t1".into(),
             TraceSource::Emulator,
-            vec![
-                make_event(10, 0, 2, "A"),
-                make_event(10, 1, 2, "B"),
-                make_event(20, 0, 2, "C"),
-            ],
+            vec![make_event(10, 0, 2, "A"), make_event(10, 1, 2, "B"), make_event(20, 0, 2, "C")],
         ));
 
         store.seek(10);
@@ -625,11 +510,7 @@ mod tests {
         store.add_trace(LoadedTrace::from_events(
             "t1".into(),
             TraceSource::Emulator,
-            vec![
-                make_event(10, 0, 2, "A"),
-                make_event(10, 1, 2, "B"),
-                make_event(10, 0, 2, "C"),
-            ],
+            vec![make_event(10, 0, 2, "A"), make_event(10, 1, 2, "B"), make_event(10, 0, 2, "C")],
         ));
 
         store.seek(10);
@@ -687,12 +568,9 @@ mod tests {
 {"name":"INSTR_VECTOR","ph":"E","pid":0,"tid":0,"ts":11,"args":{}}
 ]"#;
 
-        let trace = LoadedTrace::from_perfetto_json(
-            json.as_bytes(),
-            "test".to_string(),
-            TraceSource::Emulator,
-        )
-        .unwrap();
+        let trace =
+            LoadedTrace::from_perfetto_json(json.as_bytes(), "test".to_string(), TraceSource::Emulator)
+                .unwrap();
 
         assert_eq!(trace.events.len(), 2);
         assert_eq!(trace.events[0].cycle, 10);
@@ -716,12 +594,9 @@ mod tests {
 {"name":"INSTR_LOAD","ph":"B","pid":2,"tid":1,"ts":10,"args":{}}
 ]"#;
 
-        let trace = LoadedTrace::from_perfetto_json(
-            json.as_bytes(),
-            "test".to_string(),
-            TraceSource::Hardware,
-        )
-        .unwrap();
+        let trace =
+            LoadedTrace::from_perfetto_json(json.as_bytes(), "test".to_string(), TraceSource::Hardware)
+                .unwrap();
 
         assert_eq!(trace.events.len(), 3);
         // Sorted by cycle, then col
@@ -730,11 +605,7 @@ mod tests {
         assert!(trace.active_tiles.contains(&(0, 2)));
         assert!(trace.active_tiles.contains(&(1, 2)));
         // Check trace types resolved from PID metadata
-        let mem_event = trace
-            .events
-            .iter()
-            .find(|e| e.name == "DMA_START_TASK")
-            .unwrap();
+        let mem_event = trace.events.iter().find(|e| e.name == "DMA_START_TASK").unwrap();
         assert_eq!(mem_event.trace_type, TraceType::Mem);
     }
 
@@ -746,12 +617,8 @@ mod tests {
 {"name":"INSTR_VECTOR","ph":"B","pid":0,"tid":0,"ts":5,"args":{}}
 ]"#;
 
-        let trace = LoadedTrace::from_perfetto_json(
-            json.as_bytes(),
-            "test".into(),
-            TraceSource::Emulator,
-        )
-        .unwrap();
+        let trace =
+            LoadedTrace::from_perfetto_json(json.as_bytes(), "test".into(), TraceSource::Emulator).unwrap();
 
         // Only the B event, not the M metadata events
         assert_eq!(trace.events.len(), 1);
@@ -760,16 +627,13 @@ mod tests {
     #[test]
     fn test_load_from_file() {
         // Use a real trace file from the build directory if available.
-        let path =
-            std::path::Path::new("build/traces/add_one_using_dma/emu-trace.json");
+        let path = std::path::Path::new("build/traces/add_one_using_dma/emu-trace.json");
         if !path.exists() {
             // Skip test if no trace files built.
             return;
         }
         let mut store = TraceStore::new();
-        store
-            .load(path, "emu".into(), TraceSource::Emulator)
-            .unwrap();
+        store.load(path, "emu".into(), TraceSource::Emulator).unwrap();
         assert_eq!(store.traces.len(), 1);
         assert!(!store.traces[0].events.is_empty());
         assert!(store.cycle_range.1 > 0);
@@ -786,8 +650,7 @@ mod tests {
 
     #[test]
     fn test_parse_process_name_column_row_format() {
-        let result =
-            parse_process_name("core_trace for column 0, row 2");
+        let result = parse_process_name("core_trace for column 0, row 2");
         assert_eq!(result, Some((0, 2, TraceType::Core)));
     }
 
@@ -808,11 +671,7 @@ mod tests {
         assert_eq!(store.cycle_range, (100, 200));
 
         // Add an empty trace -- should NOT drag min to 0.
-        store.add_trace(LoadedTrace::from_events(
-            "empty".into(),
-            TraceSource::Hardware,
-            vec![],
-        ));
+        store.add_trace(LoadedTrace::from_events("empty".into(), TraceSource::Hardware, vec![]));
         assert_eq!(store.cycle_range, (100, 200));
     }
 

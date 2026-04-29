@@ -147,10 +147,7 @@ pub enum IterationDriftType {
     /// Cumulative drift is monotonically increasing/decreasing.
     Accumulating,
     /// A sudden jump at one iteration.
-    StepChange {
-        at_iteration: usize,
-        magnitude: i64,
-    },
+    StepChange { at_iteration: usize, magnitude: i64 },
     /// No clear pattern.
     Irregular,
 }
@@ -160,10 +157,9 @@ impl std::fmt::Display for IterationDriftType {
         match self {
             Self::Stable => write!(f, "Stable"),
             Self::Accumulating => write!(f, "Accumulating"),
-            Self::StepChange {
-                at_iteration,
-                magnitude,
-            } => write!(f, "StepChange at #{} (magnitude {})", at_iteration, magnitude),
+            Self::StepChange { at_iteration, magnitude } => {
+                write!(f, "StepChange at #{} (magnitude {})", at_iteration, magnitude)
+            }
             Self::Irregular => write!(f, "Irregular"),
         }
     }
@@ -469,46 +465,32 @@ struct EventsFile {
 /// the JSON's slot_names field when present; callers that want to override
 /// names (legacy aiecc events.json) can substitute their own config.
 pub fn load_events_json(path: &Path) -> Result<(TileEvents, EventsConfig), String> {
-    let text =
-        fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-    let file: EventsFile = serde_json::from_str(&text)
-        .map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    let text = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let file: EventsFile =
+        serde_json::from_str(&text).map_err(|e| format!("parse {}: {}", path.display(), e))?;
     if file.schema_version != 0 && file.schema_version != 1 {
-        return Err(format!(
-            "{}: unsupported schema_version {}",
-            path.display(),
-            file.schema_version
-        ));
+        return Err(format!("{}: unsupported schema_version {}", path.display(), file.schema_version));
     }
 
     let mut tiles: TileEvents = HashMap::new();
     for rec in file.events {
-        let key = TileKey {
-            col: rec.col,
-            row: rec.row,
-            pkt_type: rec.pkt_type,
-        };
-        tiles.entry(key).or_default().push(TileEvent {
-            slot: rec.slot,
-            abs_cycle: rec.ts,
-        });
+        let key = TileKey { col: rec.col, row: rec.row, pkt_type: rec.pkt_type };
+        tiles
+            .entry(key)
+            .or_default()
+            .push(TileEvent { slot: rec.slot, abs_cycle: rec.ts });
     }
     for events in tiles.values_mut() {
         events.sort_by_key(|e| e.abs_cycle);
     }
 
     let config = match file.slot_names {
-        Some(sn) => EventsConfig {
-            core_events: sn.core,
-            mem_events: sn.mem,
-            memtile_events: sn.memtile,
-        },
+        Some(sn) => EventsConfig { core_events: sn.core, mem_events: sn.mem, memtile_events: sn.memtile },
         None => EventsConfig::default(),
     };
 
     Ok((tiles, config))
 }
-
 
 /// Remap physical columns to 0-indexed logical columns.
 ///
@@ -524,11 +506,7 @@ fn remap_tile_columns(tiles: &TileEvents) -> TileEvents {
     tiles
         .iter()
         .map(|(key, events)| {
-            let new_key = TileKey {
-                col: col_map[&key.col],
-                row: key.row,
-                pkt_type: key.pkt_type,
-            };
+            let new_key = TileKey { col: col_map[&key.col], row: key.row, pkt_type: key.pkt_type };
             (new_key, events.to_vec())
         })
         .collect()
@@ -542,11 +520,7 @@ fn remap_tile_columns(tiles: &TileEvents) -> TileEvents {
 ///
 /// Returns (hw_t0, emu_t0) -- the absolute cycle of the first shared edge
 /// event in each trace. Subtracting these aligns the timelines.
-fn find_edge_anchor(
-    hw_events: &[TileEvent],
-    emu_events: &[TileEvent],
-    slot_names: &[String],
-) -> (u64, u64) {
+fn find_edge_anchor(hw_events: &[TileEvent], emu_events: &[TileEvent], slot_names: &[String]) -> (u64, u64) {
     // First occurrence per slot.
     let mut hw_first: HashMap<u8, u64> = HashMap::new();
     for ev in hw_events {
@@ -558,11 +532,7 @@ fn find_edge_anchor(
     }
 
     // Find first shared slot that is an edge event (not level, not TRUE).
-    let shared: BTreeSet<u8> = hw_first
-        .keys()
-        .copied()
-        .filter(|s| emu_first.contains_key(s))
-        .collect();
+    let shared: BTreeSet<u8> = hw_first.keys().copied().filter(|s| emu_first.contains_key(s)).collect();
 
     for slot in shared {
         let name = slot_name(slot, slot_names);
@@ -608,15 +578,9 @@ fn events_to_intervals(cycles: &[i64]) -> Vec<(i64, i64)> {
 }
 
 /// Analyze one edge event type: pair by occurrence index, compute deltas.
-fn analyze_edge_event(
-    name: String,
-    hw_cycles: &[i64],
-    emu_cycles: &[i64],
-) -> EdgeResult {
+fn analyze_edge_event(name: String, hw_cycles: &[i64], emu_cycles: &[i64]) -> EdgeResult {
     let paired = hw_cycles.len().min(emu_cycles.len());
-    let deltas: Vec<i64> = (0..paired)
-        .map(|i| hw_cycles[i] - emu_cycles[i])
-        .collect();
+    let deltas: Vec<i64> = (0..paired).map(|i| hw_cycles[i] - emu_cycles[i]).collect();
 
     // Find divergence point.
     let diverge_idx = deltas.iter().position(|d| d.abs() > DIVERGE_THRESHOLD);
@@ -625,10 +589,7 @@ fn analyze_edge_event(
     let drift_type = if let Some(div) = diverge_idx {
         if div < deltas.len() - 1 {
             let tail = &deltas[div..];
-            let diffs: Vec<i64> = tail
-                .windows(2)
-                .map(|w| w[1].abs() - w[0].abs())
-                .collect();
+            let diffs: Vec<i64> = tail.windows(2).map(|w| w[1].abs() - w[0].abs()).collect();
             let growing = diffs.iter().filter(|&&d| d > 0).count();
             if growing > diffs.len() * 6 / 10 {
                 "accumulating"
@@ -667,11 +628,7 @@ fn analyze_edge_event(
 }
 
 /// Analyze one level event type by interval structure.
-fn analyze_level_event(
-    name: String,
-    hw_ivs: &[(i64, i64)],
-    emu_ivs: &[(i64, i64)],
-) -> LevelResult {
+fn analyze_level_event(name: String, hw_ivs: &[(i64, i64)], emu_ivs: &[(i64, i64)]) -> LevelResult {
     let paired = hw_ivs.len().min(emu_ivs.len());
 
     let mut dur_deltas = Vec::with_capacity(paired);
@@ -694,15 +651,7 @@ fn analyze_level_event(
         (0, paired.min(4))
     };
     let samples: Vec<(usize, i64, i64, i64, i64)> = (ctx_start..ctx_end)
-        .map(|i| {
-            (
-                i,
-                hw_ivs[i].0,
-                hw_ivs[i].1,
-                emu_ivs[i].0,
-                emu_ivs[i].1,
-            )
-        })
+        .map(|i| (i, hw_ivs[i].0, hw_ivs[i].1, emu_ivs[i].0, emu_ivs[i].1))
         .collect();
 
     LevelResult {
@@ -733,9 +682,7 @@ fn classify_iteration_drift(timings: &[IterationTiming]) -> IterationDriftType {
     }
 
     // Check if all period deltas are within threshold -> Stable.
-    let all_stable = timings
-        .iter()
-        .all(|t| t.period_delta.abs() <= PERIOD_DELTA_THRESHOLD);
+    let all_stable = timings.iter().all(|t| t.period_delta.abs() <= PERIOD_DELTA_THRESHOLD);
     if all_stable {
         return IterationDriftType::Stable;
     }
@@ -748,10 +695,7 @@ fn classify_iteration_drift(timings: &[IterationTiming]) -> IterationDriftType {
     let step_threshold = (median.max(1)) * 10;
     for t in timings {
         if t.period_delta.abs() > step_threshold && t.period_delta.abs() > PERIOD_DELTA_THRESHOLD {
-            return IterationDriftType::StepChange {
-                at_iteration: t.iteration,
-                magnitude: t.period_delta,
-            };
+            return IterationDriftType::StepChange { at_iteration: t.iteration, magnitude: t.period_delta };
         }
     }
 
@@ -795,13 +739,7 @@ fn analyze_iterations_edge(
         let emu_period = emu_cycles[i] - emu_cycles[i - 1];
         let period_delta = hw_period - emu_period;
         cumulative_drift += period_delta;
-        timings.push(IterationTiming {
-            iteration: i,
-            hw_period,
-            emu_period,
-            period_delta,
-            cumulative_drift,
-        });
+        timings.push(IterationTiming { iteration: i, hw_period, emu_period, period_delta, cumulative_drift });
     }
 
     let drift_classification = classify_iteration_drift(&timings);
@@ -840,13 +778,7 @@ fn analyze_iterations_level(
         let emu_period = emu_ivs[i].0 - emu_ivs[i - 1].0;
         let period_delta = hw_period - emu_period;
         cumulative_drift += period_delta;
-        timings.push(IterationTiming {
-            iteration: i,
-            hw_period,
-            emu_period,
-            period_delta,
-            cumulative_drift,
-        });
+        timings.push(IterationTiming { iteration: i, hw_period, emu_period, period_delta, cumulative_drift });
     }
 
     let drift_classification = classify_iteration_drift(&timings);
@@ -1014,8 +946,7 @@ fn tiles_match(stall: &TileKey, candidate: &TileKey, rel: TileRelationship) -> b
     match rel {
         TileRelationship::SameTile => stall.col == candidate.col && stall.row == candidate.row,
         TileRelationship::SameColAdjacentRow => {
-            stall.col == candidate.col
-                && ((stall.row as i16 - candidate.row as i16).abs() == 1)
+            stall.col == candidate.col && ((stall.row as i16 - candidate.row as i16).abs() == 1)
         }
     }
 }
@@ -1023,11 +954,7 @@ fn tiles_match(stall: &TileKey, candidate: &TileKey, rel: TileRelationship) -> b
 /// Find the nearest resolving event at or after `after_abs` within margin.
 ///
 /// `candidate_cycles_abs` must be sorted. Uses binary search.
-fn find_resolution_event(
-    after_abs: u64,
-    candidate_cycles_abs: &[u64],
-    margin: i64,
-) -> Option<u64> {
+fn find_resolution_event(after_abs: u64, candidate_cycles_abs: &[u64], margin: i64) -> Option<u64> {
     let idx = candidate_cycles_abs.partition_point(|&c| c < after_abs);
     if idx < candidate_cycles_abs.len() {
         let gap = candidate_cycles_abs[idx] as i64 - after_abs as i64;
@@ -1055,16 +982,10 @@ fn build_absolute_event_map(
     let mut map: HashMap<(TileKey, String), Vec<u64>> = HashMap::new();
     for (&key, events) in tiles {
         // Find the slot names for this tile.
-        let names = configs
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, n)| *n)
-            .unwrap_or(&[]);
+        let names = configs.iter().find(|(k, _)| *k == key).map(|(_, n)| *n).unwrap_or(&[]);
         for ev in events {
             let name = slot_name(ev.slot, names);
-            map.entry((key, name))
-                .or_default()
-                .push(ev.abs_cycle);
+            map.entry((key, name)).or_default().push(ev.abs_cycle);
         }
     }
     // Sort all lists.
@@ -1099,32 +1020,20 @@ fn analyze_stall_attribution(
     let hw_abs = build_absolute_event_map(hw_tiles, &tile_configs);
     let emu_abs = build_absolute_event_map(emu_tiles, &tile_configs);
 
-    let all_keys: BTreeSet<TileKey> = hw_tiles
-        .keys()
-        .chain(emu_tiles.keys())
-        .copied()
-        .collect();
+    let all_keys: BTreeSet<TileKey> = hw_tiles.keys().chain(emu_tiles.keys()).copied().collect();
 
     let mut attributions = Vec::new();
 
     for rule in STALL_RULES {
         // Find stall tiles matching the rule's pkt_type.
-        let stall_tiles: Vec<TileKey> = all_keys
-            .iter()
-            .filter(|k| k.pkt_type == rule.stall_pkt)
-            .copied()
-            .collect();
+        let stall_tiles: Vec<TileKey> =
+            all_keys.iter().filter(|k| k.pkt_type == rule.stall_pkt).copied().collect();
 
         for &stall_key in &stall_tiles {
             // Check if this tile has stall intervals (via level results).
-            let tile_result = tile_results
-                .iter()
-                .find(|(k, _)| *k == stall_key);
-            let stall_intervals = tile_result.and_then(|(_, tr)| {
-                tr.level_results
-                    .iter()
-                    .find(|lr| lr.name == rule.stall)
-            });
+            let tile_result = tile_results.iter().find(|(k, _)| *k == stall_key);
+            let stall_intervals =
+                tile_result.and_then(|(_, tr)| tr.level_results.iter().find(|lr| lr.name == rule.stall));
             if stall_intervals.is_none() {
                 continue;
             }
@@ -1132,10 +1041,7 @@ fn analyze_stall_attribution(
             // Find candidate resolution tiles.
             let resolve_tiles: Vec<TileKey> = all_keys
                 .iter()
-                .filter(|k| {
-                    k.pkt_type == rule.resolve_pkt
-                        && tiles_match(&stall_key, k, rule.rel)
-                })
+                .filter(|k| k.pkt_type == rule.resolve_pkt && tiles_match(&stall_key, k, rule.rel))
                 .copied()
                 .collect();
 
@@ -1144,12 +1050,20 @@ fn analyze_stall_attribution(
                 let hw_stall_ivs = get_level_intervals_abs(
                     hw_tiles.get(&stall_key).map(|v| v.as_slice()).unwrap_or(&[]),
                     rule.stall,
-                    tile_configs.iter().find(|(k, _)| *k == stall_key).map(|(_, n)| *n).unwrap_or(&[]),
+                    tile_configs
+                        .iter()
+                        .find(|(k, _)| *k == stall_key)
+                        .map(|(_, n)| *n)
+                        .unwrap_or(&[]),
                 );
                 let emu_stall_ivs = get_level_intervals_abs(
                     emu_tiles.get(&stall_key).map(|v| v.as_slice()).unwrap_or(&[]),
                     rule.stall,
-                    tile_configs.iter().find(|(k, _)| *k == stall_key).map(|(_, n)| *n).unwrap_or(&[]),
+                    tile_configs
+                        .iter()
+                        .find(|(k, _)| *k == stall_key)
+                        .map(|(_, n)| *n)
+                        .unwrap_or(&[]),
                 );
 
                 // Get resolution event cycles (absolute).
@@ -1175,9 +1089,8 @@ fn analyze_stall_attribution(
                 let emu_resolutions = resolve_stalls(&emu_stall_ivs, &emu_resolve_cycles, rule.resolve);
 
                 let paired = hw_resolutions.len().min(emu_resolutions.len());
-                let gap_deltas: Vec<i64> = (0..paired)
-                    .map(|i| hw_resolutions[i].gap - emu_resolutions[i].gap)
-                    .collect();
+                let gap_deltas: Vec<i64> =
+                    (0..paired).map(|i| hw_resolutions[i].gap - emu_resolutions[i].gap).collect();
 
                 if !hw_resolutions.is_empty() || !emu_resolutions.is_empty() {
                     attributions.push(StallAttribution {
@@ -1197,11 +1110,7 @@ fn analyze_stall_attribution(
 }
 
 /// Get absolute-cycle intervals for a named level event on a tile.
-fn get_level_intervals_abs(
-    events: &[TileEvent],
-    event_name: &str,
-    slot_names: &[String],
-) -> Vec<(u64, u64)> {
+fn get_level_intervals_abs(events: &[TileEvent], event_name: &str, slot_names: &[String]) -> Vec<(u64, u64)> {
     // Find which slot(s) correspond to this event name.
     let target_slots: Vec<u8> = slot_names
         .iter()
@@ -1373,27 +1282,18 @@ fn analyze_cross_tile(
     let hw_abs = build_absolute_event_map(hw_tiles, &tile_configs);
     let emu_abs = build_absolute_event_map(emu_tiles, &tile_configs);
 
-    let all_keys: BTreeSet<TileKey> = hw_tiles
-        .keys()
-        .chain(emu_tiles.keys())
-        .copied()
-        .collect();
+    let all_keys: BTreeSet<TileKey> = hw_tiles.keys().chain(emu_tiles.keys()).copied().collect();
 
     let mut correlations = Vec::new();
 
     for rule in CORRELATION_RULES {
-        let src_tiles: Vec<TileKey> = all_keys
-            .iter()
-            .filter(|k| k.pkt_type == rule.src_pkt)
-            .copied()
-            .collect();
+        let src_tiles: Vec<TileKey> =
+            all_keys.iter().filter(|k| k.pkt_type == rule.src_pkt).copied().collect();
 
         for &src_key in &src_tiles {
             let dst_tiles: Vec<TileKey> = all_keys
                 .iter()
-                .filter(|k| {
-                    k.pkt_type == rule.dst_pkt && tiles_match(&src_key, k, rule.rel)
-                })
+                .filter(|k| k.pkt_type == rule.dst_pkt && tiles_match(&src_key, k, rule.rel))
                 .copied()
                 .collect();
 
@@ -1423,9 +1323,7 @@ fn analyze_cross_tile(
                 }
 
                 let paired = hw_pairs.len().min(emu_pairs.len());
-                let gap_deltas: Vec<i64> = (0..paired)
-                    .map(|i| hw_pairs[i].gap - emu_pairs[i].gap)
-                    .collect();
+                let gap_deltas: Vec<i64> = (0..paired).map(|i| hw_pairs[i].gap - emu_pairs[i].gap).collect();
 
                 correlations.push(CorrelationResult {
                     rule_name: rule.name.to_string(),
@@ -1570,10 +1468,7 @@ pub fn compare_pc_anchored_for_tile(
     emu_events: &[TileEvent],
     slot_names: &[String],
 ) -> PCAnchoredReport {
-    let mut report = PCAnchoredReport {
-        pkt_type: key.pkt_type as u32,
-        ..Default::default()
-    };
+    let mut report = PCAnchoredReport { pkt_type: key.pkt_type as u32, ..Default::default() };
 
     // Partition anchored (abs_cycle > 0) vs unanchored (abs_cycle == 0).
     let mut hw_anchored: Vec<&TileEvent> = Vec::new();
@@ -1614,18 +1509,11 @@ pub fn compare_pc_anchored_for_tile(
     }
 
     // Collect all event names seen in either side.
-    let all_names: BTreeSet<String> = hw_by_name
-        .keys()
-        .chain(emu_by_name.keys())
-        .cloned()
-        .collect();
+    let all_names: BTreeSet<String> = hw_by_name.keys().chain(emu_by_name.keys()).cloned().collect();
 
     // Locate perfcnt overflow PCs from HW side (HW is ground truth).
     // We use the first slot name that matches a known perfcnt spelling.
-    let perfcnt_name: Option<String> = all_names
-        .iter()
-        .find(|n| is_perfcnt_event(n.as_str()))
-        .cloned();
+    let perfcnt_name: Option<String> = all_names.iter().find(|n| is_perfcnt_event(n.as_str())).cloned();
 
     let hw_perfcnt_pcs: Vec<u64> = perfcnt_name
         .as_ref()
@@ -1669,9 +1557,7 @@ pub fn compare_pc_anchored_for_tile(
 
         let hw_only: HashSet<u64> = hw_set.difference(&emu_set).copied().collect();
         let emu_only: HashSet<u64> = emu_set.difference(&hw_set).copied().collect();
-        report
-            .set_diff
-            .insert(name.clone(), (hw_only, emu_only));
+        report.set_diff.insert(name.clone(), (hw_only, emu_only));
 
         // Per-PC multiset diff: count occurrences on each side.
         // hw_pcs and emu_pcs are sorted (above), so partition_point gives
@@ -1740,10 +1626,7 @@ fn estimate_perfcnt_period(perfcnt_pcs: &[u64]) -> Option<u64> {
     if perfcnt_pcs.len() < 2 {
         return None;
     }
-    let mut gaps: Vec<u64> = perfcnt_pcs
-        .windows(2)
-        .map(|w| w[1].saturating_sub(w[0]))
-        .collect();
+    let mut gaps: Vec<u64> = perfcnt_pcs.windows(2).map(|w| w[1].saturating_sub(w[0])).collect();
     gaps.sort();
     Some(gaps[gaps.len() / 2])
 }
@@ -1766,10 +1649,7 @@ fn compare_tile_events(
     let mut hw_by_slot: HashMap<u8, Vec<i64>> = HashMap::new();
     let mut emu_by_slot: HashMap<u8, Vec<i64>> = HashMap::new();
     for ev in hw_events {
-        hw_by_slot
-            .entry(ev.slot)
-            .or_default()
-            .push(ev.abs_cycle as i64 - hw_t0 as i64);
+        hw_by_slot.entry(ev.slot).or_default().push(ev.abs_cycle as i64 - hw_t0 as i64);
     }
     for ev in emu_events {
         emu_by_slot
@@ -1778,11 +1658,7 @@ fn compare_tile_events(
             .push(ev.abs_cycle as i64 - emu_t0 as i64);
     }
 
-    let all_slots: BTreeSet<u8> = hw_by_slot
-        .keys()
-        .chain(emu_by_slot.keys())
-        .copied()
-        .collect();
+    let all_slots: BTreeSet<u8> = hw_by_slot.keys().chain(emu_by_slot.keys()).copied().collect();
 
     let mut edge_results = Vec::new();
     let mut level_results = Vec::new();
@@ -1803,18 +1679,14 @@ fn compare_tile_events(
             let hw_ivs = events_to_intervals(&hw_sorted);
             let emu_ivs = events_to_intervals(&emu_sorted);
             if opts.iterations {
-                if let Some(ir) =
-                    analyze_iterations_level(&name, tile_key, &hw_ivs, &emu_ivs)
-                {
+                if let Some(ir) = analyze_iterations_level(&name, tile_key, &hw_ivs, &emu_ivs) {
                     iteration_results.push(ir);
                 }
             }
             level_results.push(analyze_level_event(name, &hw_ivs, &emu_ivs));
         } else {
             if opts.iterations {
-                if let Some(ir) =
-                    analyze_iterations_edge(&name, tile_key, &hw_sorted, &emu_sorted)
-                {
+                if let Some(ir) = analyze_iterations_edge(&name, tile_key, &hw_sorted, &emu_sorted) {
                     iteration_results.push(ir);
                 }
             }
@@ -1822,13 +1694,7 @@ fn compare_tile_events(
         }
     }
 
-    TileResult {
-        hw_t0,
-        emu_t0,
-        edge_results,
-        level_results,
-        iteration_results,
-    }
+    TileResult { hw_t0, emu_t0, edge_results, level_results, iteration_results }
 }
 
 /// Compare one HW/EMU trace file pair.
@@ -1881,8 +1747,7 @@ pub fn compare_batch_with_opts(
         (hw_tiles, emu_tiles)
     };
 
-    let all_keys: BTreeSet<TileKey> =
-        hw_tiles.keys().chain(emu_tiles.keys()).copied().collect();
+    let all_keys: BTreeSet<TileKey> = hw_tiles.keys().chain(emu_tiles.keys()).copied().collect();
 
     let mut tiles = Vec::new();
     for key in all_keys {
@@ -1963,11 +1828,8 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
     let _ = writeln!(out, "{}", "=".repeat(76));
     let _ = writeln!(out, "Raw Binary Trace Comparison");
     let _ = writeln!(out, "  Alignment:  first shared edge event per tile");
-    let _ = writeln!(
-        out,
-        "  Edge:       paired by occurrence index, divergence at |dt|>{}",
-        DIVERGE_THRESHOLD
-    );
+    let _ =
+        writeln!(out, "  Edge:       paired by occurrence index, divergence at |dt|>{}", DIVERGE_THRESHOLD);
     let _ = writeln!(out, "  Level:      compared by interval structure");
     let _ = writeln!(out, "{}", "=".repeat(76));
     let _ = writeln!(out);
@@ -2060,11 +1922,7 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
                 } else {
                     "OK".to_string()
                 };
-                let _ = writeln!(
-                    out,
-                    "    [edge] {:<32} {:<20} {}",
-                    er.name, count_str, status,
-                );
+                let _ = writeln!(out, "    [edge] {:<32} {:<20} {}", er.name, count_str, status,);
 
                 // Clean timing stats.
                 if !clean.is_empty() {
@@ -2097,11 +1955,7 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
 
                 // Divergence annotation.
                 if er.diverge_idx.is_some() {
-                    let _ = writeln!(
-                        out,
-                        "           Drift pattern: {}",
-                        er.drift_type
-                    );
+                    let _ = writeln!(out, "           Drift pattern: {}", er.drift_type);
                     divergence_details.push((
                         batch.batch_idx,
                         format!("({},{}) {}", key.col, key.row, module),
@@ -2138,11 +1992,7 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
                 } else {
                     "OK".to_string()
                 };
-                let _ = writeln!(
-                    out,
-                    "    [level] {:<31} {:<20} {}",
-                    lr.name, count_str, status,
-                );
+                let _ = writeln!(out, "    [level] {:<31} {:<20} {}", lr.name, count_str, status,);
 
                 // Clean duration stats.
                 if !lr.dur_deltas.is_empty() {
@@ -2151,8 +2001,7 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
                     if !clean_dur.is_empty() {
                         let min_d = clean_dur.iter().copied().min().unwrap();
                         let max_d = clean_dur.iter().copied().max().unwrap();
-                        let mean_d =
-                            clean_dur.iter().sum::<i64>() as f64 / clean_dur.len() as f64;
+                        let mean_d = clean_dur.iter().sum::<i64>() as f64 / clean_dur.len() as f64;
                         let _ = writeln!(
                             out,
                             "            Clean durations ({}): min={:+} max={:+} mean={:+.1}",
@@ -2199,17 +2048,10 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
     // ---- Divergence summary ----
     if !divergence_details.is_empty() {
         let _ = writeln!(out, "{}", "=".repeat(76));
-        let _ = writeln!(
-            out,
-            "Divergence Points (where HW and EMU first disagree)"
-        );
+        let _ = writeln!(out, "Divergence Points (where HW and EMU first disagree)");
         let _ = writeln!(out, "{}", "=".repeat(76));
         for (batch, tile, name, idx, drift) in &divergence_details {
-            let _ = writeln!(
-                out,
-                "  Batch {}  {:<16} {:<34} #{:<5} ({})",
-                batch, tile, name, idx, drift,
-            );
+            let _ = writeln!(out, "  Batch {}  {:<16} {:<34} #{:<5} ({})", batch, tile, name, idx, drift,);
         }
         let _ = writeln!(out);
     }
@@ -2241,22 +2083,14 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
         let _ = writeln!(out, "  Pairs:           {}", n);
         let _ = writeln!(out, "  Min:             {:+}", sorted_c[0]);
         let _ = writeln!(out, "  Max:             {:+}", sorted_c[n - 1]);
-        let _ = writeln!(
-            out,
-            "  Mean:            {:+.1}",
-            sorted_c.iter().sum::<i64>() as f64 / n as f64
-        );
+        let _ = writeln!(out, "  Mean:            {:+.1}", sorted_c.iter().sum::<i64>() as f64 / n as f64);
         let _ = writeln!(out, "  Median:          {:+}", sorted_c[n / 2]);
         let _ = writeln!(out, "  Spread:          {}", sorted_c[n - 1] - sorted_c[0]);
         let _ = writeln!(out);
         for &threshold in &[0i64, 1, 2, 5, 10] {
             let within = count_within(&sorted_c, threshold);
             let pct = within as f64 / n as f64 * 100.0;
-            let _ = writeln!(
-                out,
-                "  Within +/-{:>3}:    {:>4}/{} ({:.1}%)",
-                threshold, within, n, pct,
-            );
+            let _ = writeln!(out, "  Within +/-{:>3}:    {:>4}/{} ({:.1}%)", threshold, within, n, pct,);
         }
 
         // Total stats (including post-divergence) if different from clean.
@@ -2265,24 +2099,13 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
             let sorted_t = &all_edge_deltas_total;
             let nt = sorted_t.len();
             let _ = writeln!(out);
-            let _ = writeln!(
-                out,
-                "Edge timing (ALL pairs including post-divergence):"
-            );
+            let _ = writeln!(out, "Edge timing (ALL pairs including post-divergence):");
             let _ = writeln!(out, "  Pairs:           {}", nt);
-            let _ = writeln!(
-                out,
-                "  Spread:          {}",
-                sorted_t[nt - 1] - sorted_t[0]
-            );
+            let _ = writeln!(out, "  Spread:          {}", sorted_t[nt - 1] - sorted_t[0]);
             for &threshold in &[0i64, 1, 2, 5, 10, 50] {
                 let within = count_within(sorted_t, threshold);
                 let pct = within as f64 / nt as f64 * 100.0;
-                let _ = writeln!(
-                    out,
-                    "  Within +/-{:>3}:    {:>4}/{} ({:.1}%)",
-                    threshold, within, nt, pct,
-                );
+                let _ = writeln!(out, "  Within +/-{:>3}:    {:>4}/{} ({:.1}%)", threshold, within, nt, pct,);
             }
         }
     }
@@ -2309,8 +2132,7 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
                     let _ = writeln!(
                         out,
                         "Tile ({},{}) {} -- {} ({} iterations, {})",
-                        key.col, key.row, module, ir.name, ir.iteration_count,
-                        ir.drift_classification,
+                        key.col, key.row, module, ir.name, ir.iteration_count, ir.drift_classification,
                     );
                     let _ = writeln!(
                         out,
@@ -2348,9 +2170,7 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
     }
 
     // Stall Attribution
-    let has_stalls = batch_results
-        .iter()
-        .any(|b| !b.stall_attributions.is_empty());
+    let has_stalls = batch_results.iter().any(|b| !b.stall_attributions.is_empty());
     if has_stalls {
         let _ = writeln!(out, "{}", "=".repeat(76));
         let _ = writeln!(out, "Stall Attribution");
@@ -2368,9 +2188,13 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
                     out,
                     "{} on ({},{}) {} -> {} on ({},{}) {}",
                     sa.stall_name,
-                    sa.stall_tile.col, sa.stall_tile.row, stall_mod,
+                    sa.stall_tile.col,
+                    sa.stall_tile.row,
+                    stall_mod,
                     sa.hw_resolutions.first().map(|r| r.resolve_name.as_str()).unwrap_or("?"),
-                    sa.resolve_tile.col, sa.resolve_tile.row, resolve_mod,
+                    sa.resolve_tile.col,
+                    sa.resolve_tile.row,
+                    resolve_mod,
                 );
                 let _ = writeln!(
                     out,
@@ -2399,8 +2223,7 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
                     );
                 }
                 if !sa.gap_deltas.is_empty() {
-                    let mean_delta =
-                        sa.gap_deltas.iter().sum::<i64>() as f64 / sa.gap_deltas.len() as f64;
+                    let mean_delta = sa.gap_deltas.iter().sum::<i64>() as f64 / sa.gap_deltas.len() as f64;
                     let direction = if mean_delta > 0.5 {
                         "EMU faster"
                     } else if mean_delta < -0.5 {
@@ -2408,11 +2231,7 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
                     } else {
                         "matched"
                     };
-                    let _ = writeln!(
-                        out,
-                        "  Delta:   mean={:+.1}cy ({})",
-                        mean_delta, direction,
-                    );
+                    let _ = writeln!(out, "  Delta:   mean={:+.1}cy ({})", mean_delta, direction,);
                 }
                 let _ = writeln!(out);
             }
@@ -2438,17 +2257,17 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
                         out,
                         "{}  (Tile ({},{}) {} -> Tile ({},{}) {})",
                         cr.rule_name,
-                        cr.src_tile.col, cr.src_tile.row, src_mod,
-                        cr.dst_tile.col, cr.dst_tile.row, dst_mod,
+                        cr.src_tile.col,
+                        cr.src_tile.row,
+                        src_mod,
+                        cr.dst_tile.col,
+                        cr.dst_tile.row,
+                        dst_mod,
                     );
 
                     let hw_count = cr.hw_pairs.len();
                     let emu_count = cr.emu_pairs.len();
-                    let _ = writeln!(
-                        out,
-                        "  Pairs: HW={}, EMU={}",
-                        hw_count, emu_count,
-                    );
+                    let _ = writeln!(out, "  Pairs: HW={}, EMU={}", hw_count, emu_count,);
 
                     if !cr.hw_pairs.is_empty() {
                         let hw_gaps: Vec<i64> = cr.hw_pairs.iter().map(|p| p.gap).collect();
@@ -2485,7 +2304,9 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
                         let _ = writeln!(
                             out,
                             "  Delta:   mean={:+.1}cy ({}, {} pairs compared)",
-                            mean_delta, direction, cr.gap_deltas.len(),
+                            mean_delta,
+                            direction,
+                            cr.gap_deltas.len(),
                         );
                     }
                     let _ = writeln!(out);
@@ -2555,9 +2376,7 @@ struct SweepBatchInfo {
 /// hw_events_path, emu_events_path) tuples for every batch that has both HW
 /// and EMU events JSON files.  Used when the manifest does not carry a
 /// `batches[]` list (lockstep / mode-1 manifests omit it).
-fn discover_batches_from_fs(
-    sweep_dir: &Path,
-) -> Vec<(usize, std::path::PathBuf, std::path::PathBuf)> {
+fn discover_batches_from_fs(sweep_dir: &Path) -> Vec<(usize, std::path::PathBuf, std::path::PathBuf)> {
     let mut results = Vec::new();
     // Pattern: sweep_dir/batch_NN/  where NN is zero-padded decimal.
     let rd = match fs::read_dir(sweep_dir) {
@@ -2600,15 +2419,12 @@ pub fn compare_sweep_dir(sweep_dir: &Path) -> Result<String, String> {
 ///   - Legacy (sweep_multi): `batches: [{batch, status, hw_status, emu_status}, ...]`
 ///   - Lockstep (sweep_lockstep / mode-1): no `batches[]` field; batches are
 ///     discovered from `batch_NN/` subdirectories.
-pub fn compare_sweep_dir_with_opts(
-    sweep_dir: &Path,
-    opts: &AnalysisOptions,
-) -> Result<String, String> {
+pub fn compare_sweep_dir_with_opts(sweep_dir: &Path, opts: &AnalysisOptions) -> Result<String, String> {
     let manifest_path = sweep_dir.join("sweep-manifest.json");
-    let manifest_text = fs::read_to_string(&manifest_path)
-        .map_err(|e| format!("read {}: {}", manifest_path.display(), e))?;
-    let manifest: SweepManifest = serde_json::from_str(&manifest_text)
-        .map_err(|e| format!("parse manifest: {}", e))?;
+    let manifest_text =
+        fs::read_to_string(&manifest_path).map_err(|e| format!("read {}: {}", manifest_path.display(), e))?;
+    let manifest: SweepManifest =
+        serde_json::from_str(&manifest_text).map_err(|e| format!("parse manifest: {}", e))?;
 
     // Build the batch list.  See `SweepManifest` doc for format policy:
     //   - `batches: None`     -> lockstep manifest, scan batch_NN/ on disk.
@@ -2662,8 +2478,7 @@ pub fn compare_sweep_dir_with_opts(
         let config = if events_json.exists() {
             let text = fs::read_to_string(&events_json)
                 .map_err(|e| format!("read {}: {}", events_json.display(), e))?;
-            serde_json::from_str(&text)
-                .map_err(|e| format!("parse {}: {}", events_json.display(), e))?
+            serde_json::from_str(&text).map_err(|e| format!("parse {}: {}", events_json.display(), e))?
         } else {
             EventsConfig::default()
         };
@@ -2695,15 +2510,8 @@ pub fn compare_sweep_dir_with_opts(
             if manifest.unsafe_for_pc_join {
                 let mut warning = String::new();
                 let _ = writeln!(warning, "{}", "=".repeat(76));
-                let _ = writeln!(
-                    warning,
-                    "WARNING: sweep-manifest flagged unsafe_for_pc_join=true"
-                );
-                let _ = writeln!(
-                    warning,
-                    "  reason: {}",
-                    manifest.reason.as_deref().unwrap_or("?")
-                );
+                let _ = writeln!(warning, "WARNING: sweep-manifest flagged unsafe_for_pc_join=true");
+                let _ = writeln!(warning, "  reason: {}", manifest.reason.as_deref().unwrap_or("?"));
                 let _ = writeln!(
                     warning,
                     "  PC-anchored cross-batch joining was skipped; results are per-batch only."
@@ -2720,10 +2528,7 @@ pub fn compare_sweep_dir_with_opts(
         // not silently suppress real baseline files.
         let baselines = list_mode2_baselines(sweep_dir);
         if !baselines.is_empty() {
-            let _ = writeln!(
-                pc_suffix,
-                "Mode-2 baselines captured (deferred to A.2b for comparison):"
-            );
+            let _ = writeln!(pc_suffix, "Mode-2 baselines captured (deferred to A.2b for comparison):");
             for path in &baselines {
                 let _ = writeln!(pc_suffix, "  {}", path.display());
             }
@@ -2793,10 +2598,7 @@ fn read_pc1_manifest(sweep_dir: &Path) -> Option<Pc1SweepManifest> {
         Ok(text) => match serde_json::from_str(&text) {
             Ok(m) => Some(m),
             Err(e) => {
-                eprintln!(
-                    "Warning: sweep-manifest.json parse failed (Pc1 schema): {}",
-                    e
-                );
+                eprintln!("Warning: sweep-manifest.json parse failed (Pc1 schema): {}", e);
                 None
             }
         },
@@ -2860,10 +2662,7 @@ pub fn list_mode2_baselines(sweep_dir: &Path) -> Vec<std::path::PathBuf> {
 /// When empty, all events are classified as "swept".
 ///
 /// This function is `pub` so unit tests can call it directly without a sweep dir.
-pub fn format_report_pc_anchored(
-    batch_results: &[BatchResult],
-    grounding: &BTreeSet<String>,
-) -> String {
+pub fn format_report_pc_anchored(batch_results: &[BatchResult], grounding: &BTreeSet<String>) -> String {
     // --- Aggregate across batches ---
 
     // event_name -> batch_idx -> "swept" | "absent" | "grounding"
@@ -2882,19 +2681,13 @@ pub fn format_report_pc_anchored(
                 } else {
                     "swept"
                 };
-                event_per_batch
-                    .entry(name.clone())
-                    .or_default()
-                    .insert(batch.batch_idx, status);
+                event_per_batch.entry(name.clone()).or_default().insert(batch.batch_idx, status);
 
                 let entry = event_total_diff.entry(name.clone()).or_default();
                 entry.0 += hw_only.len() + emu_only.len();
 
                 if let Some(ms) = report.multiset_diff.get(name) {
-                    let mag: usize = ms
-                        .values()
-                        .map(|(_, _, d)| d.unsigned_abs() as usize)
-                        .sum();
+                    let mag: usize = ms.values().map(|(_, _, d)| d.unsigned_abs() as usize).sum();
                     entry.1 += mag;
                 }
             }
@@ -2946,40 +2739,23 @@ pub fn format_report_pc_anchored(
     // Sort descending by combined magnitude, with alphabetical tie-break.
     // The explicit secondary key keeps output deterministic across BTreeMap
     // iteration changes and Rust's sort stability guarantees.
-    sorted_div.sort_by(|(na, (sa, ma)), (nb, (sb, mb))| {
-        (sb + mb).cmp(&(sa + ma)).then_with(|| na.cmp(nb))
-    });
+    sorted_div.sort_by(|(na, (sa, ma)), (nb, (sb, mb))| (sb + mb).cmp(&(sa + ma)).then_with(|| na.cmp(nb)));
     for (name, (set_size, multiset_mag)) in &sorted_div {
-        let _ = writeln!(
-            out,
-            "  {:24}: set_diff={} multiset_mag={}",
-            name, set_size, multiset_mag
-        );
+        let _ = writeln!(out, "  {:24}: set_diff={} multiset_mag={}", name, set_size, multiset_mag);
     }
     let _ = writeln!(out);
 
     // ---- Section 3: Cycle delta summary ----
     let _ = writeln!(out, "{}", "=".repeat(76));
-    let _ = writeln!(
-        out,
-        "Perfcnt-anchored cycle deltas (avg |delta_cycles| per event)"
-    );
+    let _ = writeln!(out, "Perfcnt-anchored cycle deltas (avg |delta_cycles| per event)");
     let _ = writeln!(out, "{}", "=".repeat(76));
     for (name, deltas) in &event_cycle_deltas {
         if deltas.is_empty() {
             continue;
         }
-        let avg_abs =
-            deltas.iter().map(|d| d.unsigned_abs() as f64).sum::<f64>() / deltas.len() as f64;
+        let avg_abs = deltas.iter().map(|d| d.unsigned_abs() as f64).sum::<f64>() / deltas.len() as f64;
         let max_abs = deltas.iter().map(|d| d.unsigned_abs()).max().unwrap_or(0);
-        let _ = writeln!(
-            out,
-            "  {:24}: avg={:.1} max={} n={}",
-            name,
-            avg_abs,
-            max_abs,
-            deltas.len()
-        );
+        let _ = writeln!(out, "  {:24}: avg={:.1} max={} n={}", name, avg_abs, max_abs, deltas.len());
     }
     let _ = writeln!(out);
 
@@ -3065,9 +2841,27 @@ mod tests {
     #[test]
     fn test_classify_iteration_drift_stable() {
         let timings = vec![
-            IterationTiming { iteration: 1, hw_period: 25, emu_period: 25, period_delta: 0, cumulative_drift: 0 },
-            IterationTiming { iteration: 2, hw_period: 25, emu_period: 26, period_delta: -1, cumulative_drift: -1 },
-            IterationTiming { iteration: 3, hw_period: 25, emu_period: 24, period_delta: 1, cumulative_drift: 0 },
+            IterationTiming {
+                iteration: 1,
+                hw_period: 25,
+                emu_period: 25,
+                period_delta: 0,
+                cumulative_drift: 0,
+            },
+            IterationTiming {
+                iteration: 2,
+                hw_period: 25,
+                emu_period: 26,
+                period_delta: -1,
+                cumulative_drift: -1,
+            },
+            IterationTiming {
+                iteration: 3,
+                hw_period: 25,
+                emu_period: 24,
+                period_delta: 1,
+                cumulative_drift: 0,
+            },
         ];
         assert!(matches!(classify_iteration_drift(&timings), IterationDriftType::Stable));
     }
@@ -3075,10 +2869,34 @@ mod tests {
     #[test]
     fn test_classify_iteration_drift_step_change() {
         let timings = vec![
-            IterationTiming { iteration: 1, hw_period: 25, emu_period: 25, period_delta: 0, cumulative_drift: 0 },
-            IterationTiming { iteration: 2, hw_period: 25, emu_period: 25, period_delta: 0, cumulative_drift: 0 },
-            IterationTiming { iteration: 3, hw_period: 25, emu_period: 75, period_delta: -50, cumulative_drift: -50 },
-            IterationTiming { iteration: 4, hw_period: 25, emu_period: 25, period_delta: 0, cumulative_drift: -50 },
+            IterationTiming {
+                iteration: 1,
+                hw_period: 25,
+                emu_period: 25,
+                period_delta: 0,
+                cumulative_drift: 0,
+            },
+            IterationTiming {
+                iteration: 2,
+                hw_period: 25,
+                emu_period: 25,
+                period_delta: 0,
+                cumulative_drift: 0,
+            },
+            IterationTiming {
+                iteration: 3,
+                hw_period: 25,
+                emu_period: 75,
+                period_delta: -50,
+                cumulative_drift: -50,
+            },
+            IterationTiming {
+                iteration: 4,
+                hw_period: 25,
+                emu_period: 25,
+                period_delta: 0,
+                cumulative_drift: -50,
+            },
         ];
         match classify_iteration_drift(&timings) {
             IterationDriftType::StepChange { at_iteration, magnitude } => {
@@ -3224,10 +3042,7 @@ mod tests {
 
     #[test]
     fn test_analysis_options_pc_anchored_any_enabled() {
-        let opts = AnalysisOptions {
-            pc_anchored: true,
-            ..Default::default()
-        };
+        let opts = AnalysisOptions { pc_anchored: true, ..Default::default() };
         assert!(opts.any_enabled());
     }
 
@@ -3282,10 +3097,7 @@ mod tests {
             TileEvent { slot: 0, abs_cycle: 100 },
             TileEvent { slot: 0, abs_cycle: 200 },
         ];
-        let emu_events = vec![
-            TileEvent { slot: 0, abs_cycle: 100 },
-            TileEvent { slot: 0, abs_cycle: 200 },
-        ];
+        let emu_events = vec![TileEvent { slot: 0, abs_cycle: 100 }, TileEvent { slot: 0, abs_cycle: 200 }];
         let names = vec!["INSTR_VECTOR".to_string()];
         let key = TileKey { col: 0, row: 2, pkt_type: 0 };
         let report = compare_pc_anchored_for_tile(key, &hw_events, &emu_events, &names);
@@ -3305,12 +3117,12 @@ mod tests {
         // Events with abs_cycle == 0 are the "no-PC" sentinel: they should
         // accumulate into unanchored_count_* and NOT appear in set_diff.
         let hw_events = vec![
-            TileEvent { slot: 0, abs_cycle: 0 },   // unanchored
+            TileEvent { slot: 0, abs_cycle: 0 }, // unanchored
             TileEvent { slot: 0, abs_cycle: 100 },
         ];
         let emu_events = vec![
-            TileEvent { slot: 0, abs_cycle: 0 },   // unanchored
-            TileEvent { slot: 0, abs_cycle: 0 },   // unanchored
+            TileEvent { slot: 0, abs_cycle: 0 }, // unanchored
+            TileEvent { slot: 0, abs_cycle: 0 }, // unanchored
             TileEvent { slot: 0, abs_cycle: 100 },
         ];
         let names = vec!["INSTR_VECTOR".to_string()];
@@ -3481,10 +3293,7 @@ mod tests {
         ];
         let key = TileKey { col: 0, row: 2, pkt_type: 0 };
         let report = compare_pc_anchored_for_tile(key, &hw_events, &emu_events, &names);
-        assert!(
-            report.cycle_bands.is_empty(),
-            "asymmetric perfcnt should suppress cycle band generation"
-        );
+        assert!(report.cycle_bands.is_empty(), "asymmetric perfcnt should suppress cycle band generation");
         assert_eq!(report.hw_perfcnt_tick_count, 2);
         assert_eq!(report.emu_perfcnt_tick_count, 0);
         // Set/multiset diff still works regardless of perfcnt presence.
@@ -3500,20 +3309,14 @@ mod tests {
         let mut report = PCAnchoredReport::default();
         report.pkt_type = 0;
         for name in events_present {
-            report
-                .set_diff
-                .insert(name.to_string(), (HashSet::new(), HashSet::new()));
+            report.set_diff.insert(name.to_string(), (HashSet::new(), HashSet::new()));
             report.multiset_diff.insert(name.to_string(), HashMap::new());
         }
         report
     }
 
     /// Build a BatchResult with only pc_anchored data (no tile timing data).
-    fn make_batch_pc_only(
-        batch_idx: usize,
-        key: TileKey,
-        report: PCAnchoredReport,
-    ) -> BatchResult {
+    fn make_batch_pc_only(batch_idx: usize, key: TileKey, report: PCAnchoredReport) -> BatchResult {
         let mut pc_anchored = HashMap::new();
         pc_anchored.insert(key, report);
         BatchResult {
@@ -3533,21 +3336,9 @@ mod tests {
         // PERF_CNT_0 is in the grounding set.
         // Expected: INSTR_VECTOR shows swept/absent; MEMORY_STALL shows absent/swept;
         //           PERF_CNT_0 shows grounding in both batches.
-        let key = TileKey {
-            col: 0,
-            row: 2,
-            pkt_type: 0,
-        };
-        let batch0 = make_batch_pc_only(
-            0,
-            key,
-            make_pc_report_for_events(&["PERF_CNT_0", "INSTR_VECTOR"]),
-        );
-        let batch1 = make_batch_pc_only(
-            1,
-            key,
-            make_pc_report_for_events(&["PERF_CNT_0", "MEMORY_STALL"]),
-        );
+        let key = TileKey { col: 0, row: 2, pkt_type: 0 };
+        let batch0 = make_batch_pc_only(0, key, make_pc_report_for_events(&["PERF_CNT_0", "INSTR_VECTOR"]));
+        let batch1 = make_batch_pc_only(1, key, make_pc_report_for_events(&["PERF_CNT_0", "MEMORY_STALL"]));
 
         let grounding: BTreeSet<String> = ["PERF_CNT_0".to_string()].iter().cloned().collect();
         let report = format_report_pc_anchored(&[batch0, batch1], &grounding);
@@ -3567,31 +3358,19 @@ mod tests {
         // Event A: set_diff = 5 PCs hw-only, 0 emu-only -> total set = 5.
         // Event B: set_diff = 1 PC hw-only, 0 emu-only -> total set = 1.
         // Expected: A appears before B in the divergence section.
-        let key = TileKey {
-            col: 0,
-            row: 2,
-            pkt_type: 0,
-        };
+        let key = TileKey { col: 0, row: 2, pkt_type: 0 };
 
         // Build report for event A with 5 hw-only PCs.
         let mut report_a = PCAnchoredReport::default();
         let hw_only_a: HashSet<u64> = [100, 200, 300, 400, 500].iter().cloned().collect();
-        report_a
-            .set_diff
-            .insert("EVENT_A".to_string(), (hw_only_a, HashSet::new()));
-        report_a
-            .multiset_diff
-            .insert("EVENT_A".to_string(), HashMap::new());
+        report_a.set_diff.insert("EVENT_A".to_string(), (hw_only_a, HashSet::new()));
+        report_a.multiset_diff.insert("EVENT_A".to_string(), HashMap::new());
 
         // Build report for event B with 1 hw-only PC.
         let mut report_b = PCAnchoredReport::default();
         let hw_only_b: HashSet<u64> = [100].iter().cloned().collect();
-        report_b
-            .set_diff
-            .insert("EVENT_B".to_string(), (hw_only_b, HashSet::new()));
-        report_b
-            .multiset_diff
-            .insert("EVENT_B".to_string(), HashMap::new());
+        report_b.set_diff.insert("EVENT_B".to_string(), (hw_only_b, HashSet::new()));
+        report_b.multiset_diff.insert("EVENT_B".to_string(), HashMap::new());
 
         let mut pc_anchored = HashMap::new();
         // Put both events in the same tile report by merging.
@@ -3602,12 +3381,8 @@ mod tests {
         combined
             .set_diff
             .insert("EVENT_B".to_string(), report_b.set_diff["EVENT_B"].clone());
-        combined
-            .multiset_diff
-            .insert("EVENT_A".to_string(), HashMap::new());
-        combined
-            .multiset_diff
-            .insert("EVENT_B".to_string(), HashMap::new());
+        combined.multiset_diff.insert("EVENT_A".to_string(), HashMap::new());
+        combined.multiset_diff.insert("EVENT_B".to_string(), HashMap::new());
         pc_anchored.insert(key, combined);
 
         let batch = BatchResult {
@@ -3628,10 +3403,7 @@ mod tests {
         let pos_b = report.find("EVENT_B").expect("EVENT_B not found");
         // EVENT_A has higher divergence -> should appear first in sorted output.
         // We look for them specifically in the divergence section.
-        let div_section = report
-            .split("PC-anchored divergences")
-            .nth(1)
-            .unwrap_or("");
+        let div_section = report.split("PC-anchored divergences").nth(1).unwrap_or("");
         let div_pos_a = div_section.find("EVENT_A").unwrap_or(usize::MAX);
         let div_pos_b = div_section.find("EVENT_B").unwrap_or(usize::MAX);
         assert!(
@@ -3652,11 +3424,7 @@ mod tests {
         //   PC 200: delta = -20
         //   PC 300: delta = 0
         // avg |delta| = (10 + 20 + 0) / 3 = 10.0; max |delta| = 20.
-        let key = TileKey {
-            col: 0,
-            row: 2,
-            pkt_type: 0,
-        };
+        let key = TileKey { col: 0, row: 2, pkt_type: 0 };
         let mut report = PCAnchoredReport::default();
         // set_diff must have the key so the event appears.
         report
@@ -3684,12 +3452,7 @@ mod tests {
         );
         bands.insert(
             300u64,
-            CycleBand {
-                hw_cycle_est: 300,
-                emu_cycle_est: 300,
-                delta_cycles: 0,
-                exceeds_tolerance: false,
-            },
+            CycleBand { hw_cycle_est: 300, emu_cycle_est: 300, delta_cycles: 0, exceeds_tolerance: false },
         );
         report.cycle_bands.insert("INSTR_VECTOR".to_string(), bands);
 
@@ -3708,14 +3471,8 @@ mod tests {
         let grounding = BTreeSet::new();
         let report_str = format_report_pc_anchored(&[batch], &grounding);
 
-        assert!(
-            report_str.contains("Perfcnt-anchored cycle deltas"),
-            "cycle delta section missing"
-        );
-        assert!(
-            report_str.contains("INSTR_VECTOR"),
-            "event name missing in cycle delta section"
-        );
+        assert!(report_str.contains("Perfcnt-anchored cycle deltas"), "cycle delta section missing");
+        assert!(report_str.contains("INSTR_VECTOR"), "event name missing in cycle delta section");
         // avg=10.0, max=20, n=3.
         assert!(report_str.contains("avg=10.0"), "avg mismatch: {}", report_str);
         assert!(report_str.contains("max=20"), "max mismatch: {}", report_str);
@@ -3744,9 +3501,7 @@ mod tests {
     fn pc_anchored_unsafe_for_pc_join_manifest_test() {
         // Build a synthetic sweep dir in TMPDIR with a manifest that has
         // unsafe_for_pc_join=true. Verify read_pc1_manifest parses it.
-        let tmpdir = std::path::PathBuf::from(
-            std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()),
-        );
+        let tmpdir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
         let sweep_dir = tmpdir.join("task8_test_manifest");
         std::fs::create_dir_all(&sweep_dir).expect("create sweep dir");
 
@@ -3765,15 +3520,11 @@ mod tests {
             "reason": "grounding event PERF_CNT_0 PC drifted",
             "sweep_error": null
         }"#;
-        std::fs::write(sweep_dir.join("sweep-manifest.json"), manifest_json)
-            .expect("write manifest");
+        std::fs::write(sweep_dir.join("sweep-manifest.json"), manifest_json).expect("write manifest");
 
         let manifest = read_pc1_manifest(&sweep_dir).expect("manifest should parse");
         assert!(manifest.unsafe_for_pc_join);
-        assert_eq!(
-            manifest.reason.as_deref(),
-            Some("grounding event PERF_CNT_0 PC drifted")
-        );
+        assert_eq!(manifest.reason.as_deref(), Some("grounding event PERF_CNT_0 PC drifted"));
 
         // Grounding extraction includes core events.
         let grounding = read_grounding_from_pc1_manifest(&sweep_dir);
@@ -3788,26 +3539,16 @@ mod tests {
         // Two events with identical set+multiset magnitude: the secondary
         // alphabetical key must produce stable, deterministic ordering
         // (EVENT_AAA before EVENT_ZZZ regardless of HashMap iteration order).
-        let key = TileKey {
-            col: 0,
-            row: 2,
-            pkt_type: 0,
-        };
+        let key = TileKey { col: 0, row: 2, pkt_type: 0 };
         let mut combined = PCAnchoredReport::default();
         // Both events have a single hw-only PC -> set_diff total = 1 each.
         let single_pc: HashSet<u64> = [42].iter().cloned().collect();
         combined
             .set_diff
             .insert("EVENT_ZZZ".to_string(), (single_pc.clone(), HashSet::new()));
-        combined
-            .set_diff
-            .insert("EVENT_AAA".to_string(), (single_pc, HashSet::new()));
-        combined
-            .multiset_diff
-            .insert("EVENT_AAA".to_string(), HashMap::new());
-        combined
-            .multiset_diff
-            .insert("EVENT_ZZZ".to_string(), HashMap::new());
+        combined.set_diff.insert("EVENT_AAA".to_string(), (single_pc, HashSet::new()));
+        combined.multiset_diff.insert("EVENT_AAA".to_string(), HashMap::new());
+        combined.multiset_diff.insert("EVENT_ZZZ".to_string(), HashMap::new());
 
         let mut pc_anchored = HashMap::new();
         pc_anchored.insert(key, combined);
@@ -3825,16 +3566,9 @@ mod tests {
         let report = format_report_pc_anchored(&[batch], &grounding);
 
         // Find positions in the divergence section only.
-        let div_section = report
-            .split("PC-anchored divergences")
-            .nth(1)
-            .expect("divergence section");
-        let pos_aaa = div_section
-            .find("EVENT_AAA")
-            .expect("EVENT_AAA in divergence section");
-        let pos_zzz = div_section
-            .find("EVENT_ZZZ")
-            .expect("EVENT_ZZZ in divergence section");
+        let div_section = report.split("PC-anchored divergences").nth(1).expect("divergence section");
+        let pos_aaa = div_section.find("EVENT_AAA").expect("EVENT_AAA in divergence section");
+        let pos_zzz = div_section.find("EVENT_ZZZ").expect("EVENT_ZZZ in divergence section");
         assert!(
             pos_aaa < pos_zzz,
             "Equal-magnitude events should sort alphabetically: \
@@ -3850,9 +3584,7 @@ mod tests {
         // NO sweep-manifest.json. compare_sweep_dir_with_opts must list the
         // baseline files anyway -- a missing/corrupted manifest must not
         // silently suppress real on-disk artifacts.
-        let tmpdir = std::path::PathBuf::from(
-            std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()),
-        );
+        let tmpdir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
         let sweep_dir = tmpdir.join("task8_test_baseline_no_manifest");
         let _ = std::fs::remove_dir_all(&sweep_dir);
         std::fs::create_dir_all(&sweep_dir).expect("create sweep dir");
@@ -3935,10 +3667,7 @@ mod tests {
             }
         }"#;
         let m: SweepManifest = serde_json::from_str(json).expect("lockstep parse");
-        assert!(
-            m.batches.is_none(),
-            "lockstep manifest must round-trip as None, not Some([])"
-        );
+        assert!(m.batches.is_none(), "lockstep manifest must round-trip as None, not Some([])");
     }
 
     /// Empty `batches: []` is the "legacy run with zero passing batches"
@@ -3957,9 +3686,7 @@ mod tests {
     /// `compare_sweep_dir_with_opts` should discover the batches via fs.
     #[test]
     fn compare_sweep_dir_lockstep_uses_fs_discovery() {
-        let tmpdir = std::path::PathBuf::from(
-            std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()),
-        );
+        let tmpdir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
         let sweep_dir = tmpdir.join("compare_lockstep_fs_discovery_fixture");
         let _ = std::fs::remove_dir_all(&sweep_dir);
         std::fs::create_dir_all(&sweep_dir).expect("create sweep dir");
@@ -3980,8 +3707,7 @@ mod tests {
                 "shim": []
             }
         }"#;
-        std::fs::write(sweep_dir.join("sweep-manifest.json"), manifest)
-            .expect("write manifest");
+        std::fs::write(sweep_dir.join("sweep-manifest.json"), manifest).expect("write manifest");
 
         // Two batch_NN dirs on disk; compare_sweep_dir_with_opts should
         // discover both via fs since manifest.batches is None.
@@ -4014,9 +3740,7 @@ mod tests {
     /// fall back to fs discovery -- even if batch_NN/ dirs exist.
     #[test]
     fn compare_sweep_dir_legacy_empty_batches_does_not_fall_back_to_fs() {
-        let tmpdir = std::path::PathBuf::from(
-            std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()),
-        );
+        let tmpdir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
         let sweep_dir = tmpdir.join("compare_legacy_empty_no_fs_fallback_fixture");
         let _ = std::fs::remove_dir_all(&sweep_dir);
         std::fs::create_dir_all(&sweep_dir).expect("create sweep dir");

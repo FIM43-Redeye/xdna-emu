@@ -32,9 +32,7 @@ use crate::interpreter::state::EventType;
 ///
 /// Requires the `tooling` feature (needs the integration::bridge module).
 #[cfg(feature = "tooling")]
-pub fn validate_trace_events(
-    bridge: &crate::integration::bridge::BridgePath,
-) -> Result<Vec<String>, String> {
+pub fn validate_trace_events(bridge: &crate::integration::bridge::BridgePath) -> Result<Vec<String>, String> {
     let json = crate::integration::bridge::invoke_bridge(bridge, "trace-events", &[])?;
 
     let mut warnings = Vec::new();
@@ -53,10 +51,7 @@ pub fn validate_trace_events(
     for (name, expected) in core_checks {
         if let Some(actual) = core[*name].as_u64() {
             if actual as u8 != *expected {
-                warnings.push(format!(
-                    "CoreEvent::{} compiled={} mlir-aie={}",
-                    name, expected, actual,
-                ));
+                warnings.push(format!("CoreEvent::{} compiled={} mlir-aie={}", name, expected, actual,));
             }
         }
     }
@@ -71,10 +66,7 @@ pub fn validate_trace_events(
     for (name, expected) in mem_checks {
         if let Some(actual) = mem[*name].as_u64() {
             if actual as u8 != *expected {
-                warnings.push(format!(
-                    "MemEvent::{} compiled={} mlir-aie={}",
-                    name, expected, actual,
-                ));
+                warnings.push(format!("MemEvent::{} compiled={} mlir-aie={}", name, expected, actual,));
             }
         }
     }
@@ -99,28 +91,28 @@ pub fn validate_trace_events(
 pub fn core_event_to_hw_id(event: &EventType) -> Option<u8> {
     match event {
         // User-defined events (Core module)
-        EventType::InstrEvent { id: 0, .. }    => Some(33),
-        EventType::InstrEvent { id: 1, .. }    => Some(34),
-        EventType::InstrEvent { .. }           => None, // id 2/3 are AIE2P only
+        EventType::InstrEvent { id: 0, .. } => Some(33),
+        EventType::InstrEvent { id: 1, .. } => Some(34),
+        EventType::InstrEvent { .. } => None, // id 2/3 are AIE2P only
         // Stall events (Core module)
-        EventType::MemoryStall { .. }          => Some(23),
-        EventType::StreamStall { .. }          => Some(24),
-        EventType::LockStall { .. }            => Some(26),
+        EventType::MemoryStall { .. } => Some(23),
+        EventType::StreamStall { .. } => Some(24),
+        EventType::LockStall { .. } => Some(26),
         // Core status
-        EventType::CoreActive                  => Some(28),
-        EventType::CoreDisabled                => Some(29),
+        EventType::CoreActive => Some(28),
+        EventType::CoreDisabled => Some(29),
         // Program flow events
-        EventType::InstrCall { .. }            => Some(35),
-        EventType::InstrReturn { .. }          => Some(36),
-        EventType::InstrVector { .. }          => Some(37),
-        EventType::InstrLoad { .. }            => Some(38),
-        EventType::InstrStore { .. }           => Some(39),
-        EventType::InstrStreamGet { .. }       => Some(40),
-        EventType::InstrStreamPut { .. }       => Some(41),
-        EventType::InstrLockAcquireReq { .. }  => Some(44),
-        EventType::InstrLockReleaseReq { .. }  => Some(45),
+        EventType::InstrCall { .. } => Some(35),
+        EventType::InstrReturn { .. } => Some(36),
+        EventType::InstrVector { .. } => Some(37),
+        EventType::InstrLoad { .. } => Some(38),
+        EventType::InstrStore { .. } => Some(39),
+        EventType::InstrStreamGet { .. } => Some(40),
+        EventType::InstrStreamPut { .. } => Some(41),
+        EventType::InstrLockAcquireReq { .. } => Some(44),
+        EventType::InstrLockReleaseReq { .. } => Some(45),
         // Branch is an emulator-internal event, no hardware equivalent
-        EventType::BranchTaken { .. }          => None,
+        EventType::BranchTaken { .. } => None,
         // Memory module events don't have core event IDs
         _ => None,
     }
@@ -139,16 +131,16 @@ pub fn core_event_to_hw_id(event: &EventType) -> Option<u8> {
 /// directly available at notify time.
 pub(crate) fn event_pc(event: &EventType) -> Option<u32> {
     match event {
-        EventType::InstrVector { pc }           |
-        EventType::InstrLoad { pc }             |
-        EventType::InstrStore { pc }            |
-        EventType::InstrCall { pc }             |
-        EventType::InstrReturn { pc }           |
-        EventType::InstrLockAcquireReq { pc }   |
-        EventType::InstrLockReleaseReq { pc }   |
-        EventType::InstrStreamGet { pc }        |
-        EventType::InstrStreamPut { pc }        => Some(*pc),
-        EventType::InstrEvent { pc, .. }        => Some(*pc),
+        EventType::InstrVector { pc }
+        | EventType::InstrLoad { pc }
+        | EventType::InstrStore { pc }
+        | EventType::InstrCall { pc }
+        | EventType::InstrReturn { pc }
+        | EventType::InstrLockAcquireReq { pc }
+        | EventType::InstrLockReleaseReq { pc }
+        | EventType::InstrStreamGet { pc }
+        | EventType::InstrStreamPut { pc } => Some(*pc),
+        EventType::InstrEvent { pc, .. } => Some(*pc),
         // If you add a new InstrXxx variant carrying `pc: u32`, add a matching
         // arm above and extend `event_pc_extracts_from_instruction_variants` --
         // otherwise the new variant will silently fall through to None and
@@ -215,7 +207,7 @@ pub fn mem_event_to_hw_id(event: &EventType) -> Option<u8> {
             } else {
                 None
             }
-        },
+        }
         // Lock release: LOCK_0_REL=46, stride 4 per lock
         // Lock 0 rel=46, Lock 1 rel=50, ..., Lock 7 rel=74
         EventType::LockRelease { lock_id } => {
@@ -224,7 +216,7 @@ pub fn mem_event_to_hw_id(event: &EventType) -> Option<u8> {
             } else {
                 None
             }
-        },
+        }
         // Core events don't have memory module IDs
         _ => None,
     }
@@ -286,7 +278,7 @@ pub fn memtile_event_to_hw_id(event: &EventType) -> Option<u8> {
             } else {
                 None
             }
-        },
+        }
         // Lock release: LOCK_SEL0_REL=48, stride 4 per lock
         EventType::LockRelease { lock_id } => {
             if *lock_id <= 7 {
@@ -294,7 +286,7 @@ pub fn memtile_event_to_hw_id(event: &EventType) -> Option<u8> {
             } else {
                 None
             }
-        },
+        }
         _ => None,
     }
 }
@@ -355,7 +347,7 @@ pub fn shim_event_to_hw_id(event: &EventType) -> Option<u8> {
             } else {
                 None
             }
-        },
+        }
         // Lock release: LOCK_0_REL=41, stride 4 per lock
         EventType::LockRelease { lock_id } => {
             if *lock_id <= 5 {
@@ -363,7 +355,7 @@ pub fn shim_event_to_hw_id(event: &EventType) -> Option<u8> {
             } else {
                 None
             }
-        },
+        }
         _ => None,
     }
 }
@@ -714,15 +706,13 @@ mod tests {
     fn test_validate_trace_events_passes() {
         // Validate compiled-in tables against live mlir-aie (if available).
         let bridge = crate::integration::bridge::BridgePath::discover();
-        if bridge.is_none() { return; }
+        if bridge.is_none() {
+            return;
+        }
         let warnings = validate_trace_events(&bridge.unwrap());
         assert!(warnings.is_ok(), "validation failed: {:?}", warnings.err());
         let warnings = warnings.unwrap();
-        assert!(
-            warnings.is_empty(),
-            "trace event mismatches: {:?}",
-            warnings,
-        );
+        assert!(warnings.is_empty(), "trace event mismatches: {:?}", warnings,);
     }
 
     #[test]

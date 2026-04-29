@@ -126,8 +126,9 @@ pub fn parse_vcd_header(reader: &mut impl BufRead) -> std::io::Result<VcdHeader>
     //   memtile: ...math_engine.mem_row.tile_X_Y.event_trace.eventN_name
     //   compute: ...math_engine.array.tile_X_Y.cm.event_trace.eventN_name
     let signal_re = Regex::new(
-        r"math_engine\.(shim|mem_row|array)\.tile_(\d+)_(\d+)(?:\.cm)?\.event_trace\.event(\d+)_(.+)"
-    ).expect("valid regex");
+        r"math_engine\.(shim|mem_row|array)\.tile_(\d+)_(\d+)(?:\.cm)?\.event_trace\.event(\d+)_(.+)",
+    )
+    .expect("valid regex");
 
     let mut timescale_ps: u64 = 1;
     let mut signal_map: BTreeMap<u32, usize> = BTreeMap::new();
@@ -193,13 +194,7 @@ pub fn parse_vcd_header(reader: &mut impl BufRead) -> std::io::Result<VcdHeader>
                         }
 
                         let idx = signals.len();
-                        signals.push(EventSignal {
-                            tile_type,
-                            col,
-                            row,
-                            event_code,
-                            event_name,
-                        });
+                        signals.push(EventSignal { tile_type, col, row, event_code, event_name });
                         signal_map.insert(id, idx);
                     }
                 }
@@ -208,11 +203,7 @@ pub fn parse_vcd_header(reader: &mut impl BufRead) -> std::io::Result<VcdHeader>
         }
     }
 
-    Ok(VcdHeader {
-        timescale_ps,
-        signal_map,
-        signals,
-    })
+    Ok(VcdHeader { timescale_ps, signal_map, signals })
 }
 
 /// Parse a timescale string like "1 ps", "1ps", or "$timescale 1 ps $end".
@@ -282,37 +273,65 @@ fn event_tid(signal: &EventSignal) -> u32 {
 
     if signal.tile_type == TileType::Compute {
         // Core tile: spread instruction events across tids 0-7
-        if name == "INSTR_VECTOR" { return 0; }
-        if name == "INSTR_LOAD" { return 1; }
-        if name == "INSTR_STORE" { return 2; }
-        if name == "INSTR_CALL" || name == "INSTR_RETURN" { return 3; }
-        if name.starts_with("INSTR_LOCK_") { return 4; }
-        if name.starts_with("INSTR_STREAM_") { return 5; }
-        if name.ends_with("_STALL") || name.starts_with("MEMORY_STALL")
-            || name.starts_with("LOCK_STALL") || name.starts_with("STREAM_STALL")
+        if name == "INSTR_VECTOR" {
+            return 0;
+        }
+        if name == "INSTR_LOAD" {
+            return 1;
+        }
+        if name == "INSTR_STORE" {
+            return 2;
+        }
+        if name == "INSTR_CALL" || name == "INSTR_RETURN" {
+            return 3;
+        }
+        if name.starts_with("INSTR_LOCK_") {
+            return 4;
+        }
+        if name.starts_with("INSTR_STREAM_") {
+            return 5;
+        }
+        if name.ends_with("_STALL")
+            || name.starts_with("MEMORY_STALL")
+            || name.starts_with("LOCK_STALL")
+            || name.starts_with("STREAM_STALL")
         {
             return 6;
         }
-        if name == "ACTIVE" || name == "DISABLED" { return 7; }
+        if name == "ACTIVE" || name == "DISABLED" {
+            return 7;
+        }
     }
 
     // DMA events
     if name.starts_with("DMA_") {
-        if name.contains("START_TASK") { return 0; }
-        if name.contains("FINISHED") { return 1; }
-        if name.contains("STALLED") || name.contains("STARVATION") { return 2; }
+        if name.contains("START_TASK") {
+            return 0;
+        }
+        if name.contains("FINISHED") {
+            return 1;
+        }
+        if name.contains("STALLED") || name.contains("STARVATION") {
+            return 2;
+        }
         return 3;
     }
 
     // Lock events
     if name.starts_with("LOCK_") {
-        if name.contains("ACQ") { return 3; }
-        if name.contains("REL") { return 4; }
+        if name.contains("ACQ") {
+            return 3;
+        }
+        if name.contains("REL") {
+            return 4;
+        }
         return 5;
     }
 
     // Group and other events: use high tid to avoid cluttering main lanes
-    if name.starts_with("GROUP_") { return 8; }
+    if name.starts_with("GROUP_") {
+        return 8;
+    }
 
     // Catch-all
     9
@@ -349,11 +368,7 @@ pub fn vcd_to_perfetto(
     if header.signals.is_empty() {
         // No event_trace signals found -- write empty trace
         output.write_all(b"[\n]\n")?;
-        return Ok(VcdConvertResult {
-            signal_count: 0,
-            transition_count: 0,
-            tile_count: 0,
-        });
+        return Ok(VcdConvertResult { signal_count: 0, transition_count: 0, tile_count: 0 });
     }
 
     // Phase 2: Scan body for transitions on tracked signals
@@ -428,16 +443,12 @@ fn parse_vcd_body(
                 if let Ok(id) = id_str.trim().parse::<u32>() {
                     if let Some(&sig_idx) = header.signal_map.get(&id) {
                         let phase = match value_str {
-                            "1" => "B",  // Signal went high -> Begin
-                            "0" => "E",  // Signal went low -> End
+                            "1" => "B",    // Signal went high -> Begin
+                            "0" => "E",    // Signal went low -> End
                             _ => continue, // Multi-bit value, skip
                         };
                         let cycle = current_time_ps / clock_period_ps;
-                        transitions.push(Transition {
-                            cycle,
-                            phase,
-                            signal_idx: sig_idx,
-                        });
+                        transitions.push(Transition { cycle, phase, signal_idx: sig_idx });
                     }
                 }
             }
@@ -462,11 +473,7 @@ fn emit_perfetto(
     let mut pid_map: BTreeMap<TileTraceKey, u32> = BTreeMap::new();
     for &sig_idx in &active_signals {
         let signal = &header.signals[sig_idx];
-        let key = TileTraceKey {
-            trace_type: event_trace_type(signal),
-            col: signal.col,
-            row: signal.row,
-        };
+        let key = TileTraceKey { trace_type: event_trace_type(signal), col: signal.col, row: signal.row };
         let next_pid = pid_map.len() as u32;
         pid_map.entry(key).or_insert(next_pid);
     }
@@ -475,11 +482,7 @@ fn emit_perfetto(
     let mut tid_names: BTreeMap<(u32, u32), &str> = BTreeMap::new();
     for &sig_idx in &active_signals {
         let signal = &header.signals[sig_idx];
-        let key = TileTraceKey {
-            trace_type: event_trace_type(signal),
-            col: signal.col,
-            row: signal.row,
-        };
+        let key = TileTraceKey { trace_type: event_trace_type(signal), col: signal.col, row: signal.row };
         let pid = pid_map[&key];
         let tid = event_tid(signal);
         tid_names.entry((pid, tid)).or_insert(&signal.event_name);
@@ -494,7 +497,9 @@ fn emit_perfetto(
             TraceType::Core => "core",
             TraceType::Mem => "mem",
         };
-        if !first { output.write_all(b",\n")?; }
+        if !first {
+            output.write_all(b",\n")?;
+        }
         first = false;
         write!(
             output,
@@ -505,7 +510,9 @@ fn emit_perfetto(
 
     // Write thread_name metadata for each tid
     for (&(pid, tid), &name) in &tid_names {
-        if !first { output.write_all(b",\n")?; }
+        if !first {
+            output.write_all(b",\n")?;
+        }
         first = false;
         write!(
             output,
@@ -518,15 +525,13 @@ fn emit_perfetto(
     let mut transition_count = 0;
     for t in transitions {
         let signal = &header.signals[t.signal_idx];
-        let key = TileTraceKey {
-            trace_type: event_trace_type(signal),
-            col: signal.col,
-            row: signal.row,
-        };
+        let key = TileTraceKey { trace_type: event_trace_type(signal), col: signal.col, row: signal.row };
         let pid = pid_map[&key];
         let tid = event_tid(signal);
 
-        if !first { output.write_all(b",\n")?; }
+        if !first {
+            output.write_all(b",\n")?;
+        }
         first = false;
         write!(
             output,
@@ -538,11 +543,7 @@ fn emit_perfetto(
 
     output.write_all(b"\n]\n")?;
 
-    Ok(VcdConvertResult {
-        signal_count: header.signals.len(),
-        transition_count,
-        tile_count: pid_map.len(),
-    })
+    Ok(VcdConvertResult { signal_count: header.signals.len(), transition_count, tile_count: pid_map.len() })
 }
 
 #[cfg(test)]
@@ -719,7 +720,8 @@ b0 50
         // Core events
         let core_signal = EventSignal {
             tile_type: TileType::Compute,
-            col: 0, row: 3,
+            col: 0,
+            row: 3,
             event_code: 37,
             event_name: "INSTR_VECTOR".to_string(),
         };
@@ -727,7 +729,8 @@ b0 50
 
         let active_signal = EventSignal {
             tile_type: TileType::Compute,
-            col: 0, row: 3,
+            col: 0,
+            row: 3,
             event_code: 28,
             event_name: "ACTIVE".to_string(),
         };
@@ -736,7 +739,8 @@ b0 50
         // Memory events
         let dma_signal = EventSignal {
             tile_type: TileType::Shim,
-            col: 0, row: 0,
+            col: 0,
+            row: 0,
             event_code: 14,
             event_name: "DMA_S2MM_0_START_TASK".to_string(),
         };
@@ -744,7 +748,8 @@ b0 50
 
         let lock_signal = EventSignal {
             tile_type: TileType::Compute,
-            col: 0, row: 3,
+            col: 0,
+            row: 3,
             event_code: 44,
             event_name: "LOCK_SEL0_ACQ_EQ".to_string(),
         };
@@ -780,7 +785,11 @@ b0 50
 
         // The 08_tile_locks test should have many event_trace signals
         // (sentinel events TRUE/NONE are filtered, leaving ~17K useful signals)
-        assert!(result.signal_count > 1000, "Expected 1000+ event_trace signals, got {}", result.signal_count);
+        assert!(
+            result.signal_count > 1000,
+            "Expected 1000+ event_trace signals, got {}",
+            result.signal_count
+        );
         assert!(result.transition_count > 0, "Expected transitions");
         assert!(result.tile_count > 0, "Expected at least one tile");
 
@@ -797,8 +806,7 @@ b0 50
         assert!(json.contains("tile3,7"), "Expected tile3,7 (row 3, col 7)");
 
         // Should contain core events
-        assert!(json.contains("ACTIVE") || json.contains("DISABLED"),
-            "Expected core state events");
+        assert!(json.contains("ACTIVE") || json.contains("DISABLED"), "Expected core state events");
 
         // Write output for manual inspection
         let out_path = "build/unit_tests/08_tile_locks/trace_from_vcd.json";
@@ -811,7 +819,8 @@ b0 50
     fn test_tid_assignment() {
         let make_signal = |name: &str| EventSignal {
             tile_type: TileType::Compute,
-            col: 0, row: 3,
+            col: 0,
+            row: 3,
             event_code: 0,
             event_name: name.to_string(),
         };
