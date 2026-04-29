@@ -1,0 +1,35 @@
+edition = "2021"
+
+# Line width: project writes to ~100-110 chars comfortably.
+# Setting 110 eliminates most wrapping drift without sacrificing readability.
+max_width = 110
+
+# Keep import and module ordering under project control.
+# The codebase groups imports semantically (std / external / crate / sub-crate)
+# with blank-line separators; rustfmt's default alphabetization would collapse
+# those groups and lose the intent.
+reorder_imports = false
+reorder_modules = false
+
+# Allow compact struct literals -- the default of 18 is far too aggressive
+# and forces every `Struct { a: 1, b: 2 }` literal onto multiple lines.
+struct_lit_width = 80
+
+# Allow method chains to stay compact up to 80 chars before breaking.
+# Default of 60 breaks chains that are perfectly readable on one line.
+chain_width = 80
+
+# Allow function calls with many arguments to stay on one line up to 100 chars.
+# Default of 60 is too aggressive for this codebase.
+fn_call_width = 100
+
+# Allow array literals to stay on one line up to 100 chars before expanding
+# to one element per line. The default of 60 reformats things like
+# `&["AIE2InstrFormats.td", "AIE2InstrInfo.td", ...]` into vertical lists.
+array_width = 100
+
+# Allow single-line attribute-like attributes (similar threshold to fn_call_width).
+attr_fn_like_width = 100
+
+# Keep derives merged. Project already writes merged derives consistently.
+merge_derives = true

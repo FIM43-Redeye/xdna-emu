@@ -1,0 +1,16 @@
+# Commits listed here are skipped by `git blame`, conventionally bulk
+# formatting / rename commits whose churn would otherwise mask the
+# original content author.
+#
+# Local setup (one-time per checkout):
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub honors this file automatically -- no setup needed there.
+#
+# Per-commit format: one full SHA per line, optionally followed by a
+# `# comment` describing the commit. Blank lines and `#` comments are
+# ignored.
+#
+# This project is in the middle of a Path B rustfmt convergence; entries
+# below are the chunked `cargo fmt` commits. See CLAUDE.md "Code
+# formatting" for the broader plan.

@@ -600,6 +600,34 @@ filesystem is writable, it's a cached warning from a prior
 sandbox-blocked build. `cargo clean -p xdna-emu` (with the matching
 profile) flushes it.
 
+### Code formatting
+
+The repo has a tuned `rustfmt.toml` at the root. Stable rustfmt only;
+non-default settings preserve the project's semantic conventions
+(import groups, compact struct literals, ~110-char lines, in-line method
+chains). The codebase is **not yet fully fmt'd**; convergence is in
+progress (see "Path B" below).
+
+**Path B → E → pre-commit hook.** The plan:
+
+1. **Path B (current):** Run `cargo fmt` on subtrees one at a time,
+   each in its own commit. Add each commit's SHA to
+   `.git-blame-ignore-revs` so `git blame` skips the formatting commit
+   and attributes lines to the original content author. Run locally
+   once: `git config blame.ignoreRevsFile .git-blame-ignore-revs`.
+   GitHub honors the file automatically; no per-user setup there.
+2. **Path E (after convergence):** Stay clean during edits. The
+   project ships a `PostToolUse` hook in `.claude/settings.json` that
+   auto-runs `cargo fmt` on any `.rs` file Claude edits. Editor
+   format-on-save handles the same role for human edits.
+3. **Pre-commit hook (after convergence):** Once everything checks
+   clean, enable `cargo fmt --check` as a local pre-commit hook + a
+   CI step. Both block on drift. This is the final guard.
+
+**Don't run `cargo fmt` repo-wide in one commit.** It'd be 3500+
+drift blocks of mostly mechanical change in one ungrokkable diff;
+chunked Path B commits stay reviewable.
+
 ### Test suite costs
 
 - `./scripts/isa-test.sh`: ~5-10 minutes (release build + 123 HW batches)
