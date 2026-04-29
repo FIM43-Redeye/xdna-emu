@@ -40,11 +40,17 @@ fn shift_round_rne(man: i64, lo_pos: i32, prec: i32, norm_round_overflow: bool) 
         return (0, false);
     }
 
-    let rmask: i64 = if sh_dn > 0 && sh_dn < 63 { (1i64 << sh_dn) - 1 } else { 0 };
+    let rmask: i64 = if sh_dn > 0 && sh_dn < 63 {
+        (1i64 << sh_dn) - 1
+    } else {
+        0
+    };
 
     let r: i64 = if sh_dn < 0 {
         let lsh = (-sh_dn) as u32;
-        if lsh >= 63 { return (0, false); } // Would overflow
+        if lsh >= 63 {
+            return (0, false);
+        } // Would overflow
         man.wrapping_shl(lsh)
     } else {
         man >> sh_dn
@@ -60,7 +66,11 @@ fn shift_round_rne(man: i64, lo_pos: i32, prec: i32, norm_round_overflow: bool) 
 
     let mut expincr = false;
 
-    let overflow_threshold = if (prec + 2) < 63 { 1i64 << (prec + 2) } else { i64::MAX };
+    let overflow_threshold = if (prec + 2) < 63 {
+        1i64 << (prec + 2)
+    } else {
+        i64::MAX
+    };
     if norm_round_overflow && rup && (q >= overflow_threshold) {
         let val = q >> 2;
         expincr = true;
@@ -74,10 +84,11 @@ fn shift_round_rne(man: i64, lo_pos: i32, prec: i32, norm_round_overflow: bool) 
 /// Find the position of the leading one bit (0-indexed from LSB).
 /// Returns -1 for input 0.
 fn flo(man: i64) -> i32 {
-    if man <= 0 { return -1; }
+    if man <= 0 {
+        return -1;
+    }
     63 - man.leading_zeros() as i32
 }
-
 
 /// Hardware-accurate bf16 MAC for one output lane (vmac pipeline).
 ///
@@ -146,9 +157,7 @@ pub(crate) fn bf16_mac_hw_lane(
         // Inf * zero = NaN (hardware behavior).
         let cex0 = (aexp == 0 && aman == 0) || (bexp == 0 && bman == 0);
 
-        nan_flag = nan_flag || cnan
-            || (inf_flag && cinf && csgn != inf_sgn)
-            || (cinf && cex0);
+        nan_flag = nan_flag || cnan || (inf_flag && cinf && csgn != inf_sgn) || (cinf && cex0);
         inf_flag = (inf_flag || cinf) && !nan_flag;
         if cinf && inf_sgn == false && !nan_flag {
             inf_sgn = csgn;
@@ -161,8 +170,12 @@ pub(crate) fn bf16_mac_hw_lane(
 
         // Denorm handling: bump exponent so product exponent math works,
         // but mantissa does NOT get implicit 1 (tracked via aex0/bex0).
-        if aexp == 0 && aman != 0 { aexp = 1; }
-        if bexp == 0 && bman != 0 { bexp = 1; }
+        if aexp == 0 && aman != 0 {
+            aexp = 1;
+        }
+        if bexp == 0 && bman != 0 {
+            bexp = 1;
+        }
 
         // Biased product exponent: hardware adds +1.
         let cexp: i32 = if aexp == 0 || bexp == 0 {
@@ -178,11 +191,11 @@ pub(crate) fn bf16_mac_hw_lane(
         // array always computes products; bfnorm applies NaN/Inf flags at
         // the output.  (See bfshiftcompute_lane oaccman = concat(!exp0, man).)
         let a_man: i64 = if !aex0 {
-            0x80 | aman as i64  // Normal, Inf, or NaN: add implicit 1
+            0x80 | aman as i64 // Normal, Inf, or NaN: add implicit 1
         } else if aman != 0 {
-            aman as i64  // Denorm: raw mantissa, no implicit 1
+            aman as i64 // Denorm: raw mantissa, no implicit 1
         } else {
-            0  // Zero
+            0 // Zero
         };
         let b_man: i64 = if !bex0 {
             0x80 | bman as i64
@@ -214,7 +227,9 @@ pub(crate) fn bf16_mac_hw_lane(
 
     // Denorm handling for accumulator (same pattern as products).
     let mut qexp = qexp_raw;
-    if qexp == 0 && qman_raw != 0 { qexp = 1; }
+    if qexp == 0 && qman_raw != 0 {
+        qexp = 1;
+    }
 
     let qexp_biased: i32 = if !qzero { (qexp as i32) + 128 } else { 0 };
 
@@ -223,17 +238,19 @@ pub(crate) fn bf16_mac_hw_lane(
     // non-zero exponents (including NaN/Inf at exp=255), raw mantissa
     // without implicit 1 for denorms, zero for true zeros.
     let qman_unsigned: i64 = if qexp_raw > 0 {
-        (1i64 << 23) | (qman_raw as i64)  // Normal, NaN, or Inf
+        (1i64 << 23) | (qman_raw as i64) // Normal, NaN, or Inf
     } else if qman_raw != 0 {
-        qman_raw as i64  // Denorm (no implicit 1)
+        qman_raw as i64 // Denorm (no implicit 1)
     } else {
-        0  // True zero
+        0 // True zero
     };
 
     // NaN/Inf from acc1.
     nan_flag = nan_flag || qnan || (inf_flag && qinf && qsgn != inf_sgn);
     inf_flag = (inf_flag || qinf) && !nan_flag;
-    if qinf && !nan_flag { inf_sgn = inf_sgn || qsgn; }
+    if qinf && !nan_flag {
+        inf_sgn = inf_sgn || qsgn;
+    }
 
     // Phase 2b: Second accumulator (acc2) for AddMac/SubMac.
     //
@@ -248,14 +265,16 @@ pub(crate) fn bf16_mac_hw_lane(
         let dnan = dexp_raw == 255 && dman_raw != 0;
 
         let mut dexp = dexp_raw;
-        if dexp == 0 && dman_raw != 0 { dexp = 1; }
+        if dexp == 0 && dman_raw != 0 {
+            dexp = 1;
+        }
 
         let dexp_biased: i32 = if !dzero { (dexp as i32) + 128 } else { 0 };
         // Same mantissa logic as acc1: include for NaN/Inf/denorm.
         let dman: i64 = if dexp_raw > 0 {
             (1i64 << 23) | (dman_raw as i64)
         } else if dman_raw != 0 {
-            dman_raw as i64  // Denorm
+            dman_raw as i64 // Denorm
         } else {
             0
         };
@@ -263,7 +282,9 @@ pub(crate) fn bf16_mac_hw_lane(
         // NaN/Inf from acc2.
         nan_flag = nan_flag || dnan || (inf_flag && dinf && (dsgn != sub_acc2) != inf_sgn);
         inf_flag = (inf_flag || dinf) && !nan_flag;
-        if dinf && !nan_flag { inf_sgn = inf_sgn || (dsgn != sub_acc2); }
+        if dinf && !nan_flag {
+            inf_sgn = inf_sgn || (dsgn != sub_acc2);
+        }
 
         // Effective sign: XOR with sub_acc2 for SubMac.
         let effective_sgn = dsgn != sub_acc2;
@@ -345,7 +366,11 @@ pub(crate) fn bf16_mac_hw_lane(
         let vk_acc = qman_unsigned; // << 0 (float_width - 23 = 0)
         let (aligned, _) = shift_round_rne(vk_acc, 23 + s_acc, FLOAT_WIDTH, false);
         // Apply accumulator sign (hardware cry_hw + cpr_hw 2's complement).
-        if qsgn { -aligned } else { aligned }
+        if qsgn {
+            -aligned
+        } else {
+            aligned
+        }
     } else {
         0
     };
@@ -358,7 +383,11 @@ pub(crate) fn bf16_mac_hw_lane(
         let s_d = cexpmax - d_exp_biased;
         let vk_d = d_man_unsigned;
         let (aligned, _) = shift_round_rne(vk_d, 23 + s_d, FLOAT_WIDTH, false);
-        if d_sgn { -aligned } else { aligned }
+        if d_sgn {
+            -aligned
+        } else {
+            aligned
+        }
     } else {
         0
     };
@@ -441,7 +470,6 @@ pub(crate) fn bf16_mac_hw_lane(
 
     fp32_make(sgn, exps as u8, mans as u32 & 0x7F_FFFF)
 }
-
 
 #[cfg(test)]
 mod tests {

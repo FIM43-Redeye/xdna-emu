@@ -54,7 +54,9 @@ pub(super) fn extract_element_bytes(src: &[u8; 128], byte_idx: usize, bits: u32,
         4 => {
             let byte_pos = byte_idx / 2;
             let nibble = byte_idx % 2;
-            if byte_pos >= 128 { return 0; }
+            if byte_pos >= 128 {
+                return 0;
+            }
             let raw = src[byte_pos];
             let val = if nibble == 0 { raw & 0xF } else { (raw >> 4) & 0xF };
             if signed && (val & 0x8) != 0 {
@@ -64,22 +66,38 @@ pub(super) fn extract_element_bytes(src: &[u8; 128], byte_idx: usize, bits: u32,
             }
         }
         8 => {
-            if byte_idx >= 128 { return 0; }
+            if byte_idx >= 128 {
+                return 0;
+            }
             let val = src[byte_idx];
-            if signed { val as i8 as i64 } else { val as i64 }
+            if signed {
+                val as i8 as i64
+            } else {
+                val as i64
+            }
         }
         16 => {
-            if byte_idx + 1 >= 128 { return 0; }
+            if byte_idx + 1 >= 128 {
+                return 0;
+            }
             let val = u16::from_le_bytes([src[byte_idx], src[byte_idx + 1]]);
-            if signed { val as i16 as i64 } else { val as i64 }
+            if signed {
+                val as i16 as i64
+            } else {
+                val as i64
+            }
         }
         32 => {
-            if byte_idx + 3 >= 128 { return 0; }
-            let val = u32::from_le_bytes([
-                src[byte_idx], src[byte_idx + 1],
-                src[byte_idx + 2], src[byte_idx + 3],
-            ]);
-            if signed { val as i32 as i64 } else { val as i64 }
+            if byte_idx + 3 >= 128 {
+                return 0;
+            }
+            let val =
+                u32::from_le_bytes([src[byte_idx], src[byte_idx + 1], src[byte_idx + 2], src[byte_idx + 3]]);
+            if signed {
+                val as i32 as i64
+            } else {
+                val as i64
+            }
         }
         _ => 0,
     }
@@ -200,9 +218,15 @@ pub(super) fn extract_element_512(src: &Vec512, byte_idx: usize, bits: u32, sign
             let nibble = byte_idx % 2;
             let word = byte_pos / 4;
             let byte_in_word = byte_pos % 4;
-            if word >= src.len() { return 0; }
+            if word >= src.len() {
+                return 0;
+            }
             let raw_byte = ((src[word] >> (byte_in_word * 8)) & 0xFF) as u8;
-            let val = if nibble == 0 { raw_byte & 0xF } else { (raw_byte >> 4) & 0xF };
+            let val = if nibble == 0 {
+                raw_byte & 0xF
+            } else {
+                (raw_byte >> 4) & 0xF
+            };
             if signed && (val & 0x8) != 0 {
                 // Sign-extend from 4 bits
                 (val as i8 | !0xFu8 as i8) as i64
@@ -213,23 +237,41 @@ pub(super) fn extract_element_512(src: &Vec512, byte_idx: usize, bits: u32, sign
         8 => {
             let word = byte_idx / 4;
             let byte_in_word = byte_idx % 4;
-            if word >= src.len() { return 0; }
+            if word >= src.len() {
+                return 0;
+            }
             let val = ((src[word] >> (byte_in_word * 8)) & 0xFF) as u8;
-            if signed { val as i8 as i64 } else { val as i64 }
+            if signed {
+                val as i8 as i64
+            } else {
+                val as i64
+            }
         }
         16 => {
             let elem_idx = byte_idx / 2;
             let word = elem_idx / 2;
             let half_in_word = elem_idx % 2;
-            if word >= src.len() { return 0; }
+            if word >= src.len() {
+                return 0;
+            }
             let val = ((src[word] >> (half_in_word * 16)) & 0xFFFF) as u16;
-            if signed { val as i16 as i64 } else { val as i64 }
+            if signed {
+                val as i16 as i64
+            } else {
+                val as i64
+            }
         }
         32 => {
             let word = byte_idx / 4;
-            if word >= src.len() { return 0; }
+            if word >= src.len() {
+                return 0;
+            }
             let val = src[word];
-            if signed { val as i32 as i64 } else { val as i64 }
+            if signed {
+                val as i32 as i64
+            } else {
+                val as i64
+            }
         }
         _ => 0,
     }
@@ -307,7 +349,9 @@ pub fn matmul_dense(
         ElementType::BFloat16 => super::matmul_bf16xbf16(acc, a, b, false),
         ElementType::Int32 => super::matmul_i32xi16(acc, a, b, true, true, false),
         ElementType::UInt32 => super::matmul_i32xi16(acc, a, b, false, false, false),
-        ElementType::Int64 | ElementType::UInt64 => super::matmul_i32xi16(acc, a, b, signed_a, signed_b, false),
+        ElementType::Int64 | ElementType::UInt64 => {
+            super::matmul_i32xi16(acc, a, b, signed_a, signed_b, false)
+        }
         ElementType::Float32 => super::matmul_bf16xbf16(acc, a, b, false),
     }
 }
@@ -329,11 +373,12 @@ pub fn matmul_sub(
         ElementType::BFloat16 => super::matmul_bf16xbf16(acc, a, b, true),
         ElementType::Int32 => super::matmul_i32xi16(acc, a, b, true, true, true),
         ElementType::UInt32 => super::matmul_i32xi16(acc, a, b, false, false, true),
-        ElementType::Int64 | ElementType::UInt64 => super::matmul_i32xi16(acc, a, b, signed_a, signed_b, true),
+        ElementType::Int64 | ElementType::UInt64 => {
+            super::matmul_i32xi16(acc, a, b, signed_a, signed_b, true)
+        }
         ElementType::Float32 => super::matmul_bf16xbf16(acc, a, b, true),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -341,10 +386,10 @@ mod tests {
 
     #[test]
     fn test_extract_i8() {
-        let packed = pack_i8(&[1, -2, 3, -4, 5, -6, 7, -8,
-                               0, 0, 0, 0, 0, 0, 0, 0,
-                               0, 0, 0, 0, 0, 0, 0, 0,
-                               0, 0, 0, 0, 0, 0, 0, 0]);
+        let packed = pack_i8(&[
+            1, -2, 3, -4, 5, -6, 7, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0,
+        ]);
         assert_eq!(extract_i8(&packed, 0), 1);
         assert_eq!(extract_i8(&packed, 1), -2);
         assert_eq!(extract_i8(&packed, 2), 3);
@@ -355,8 +400,7 @@ mod tests {
 
     #[test]
     fn test_extract_i16() {
-        let packed = pack_i16(&[100, -200, 300, -400, 0, 0, 0, 0,
-                                0, 0, 0, 0, 0, 0, 0, 0]);
+        let packed = pack_i16(&[100, -200, 300, -400, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(extract_i16(&packed, 0), 100);
         assert_eq!(extract_i16(&packed, 1), -200);
         assert_eq!(extract_i16(&packed, 2), 300);

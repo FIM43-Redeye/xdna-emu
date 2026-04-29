@@ -356,7 +356,11 @@ fn fp32_bits_to_f64_raw(bits: u32) -> f64 {
     };
 
     let value = frac * (2.0f64).powi(e);
-    if sign != 0 { -value } else { value }
+    if sign != 0 {
+        -value
+    } else {
+        value
+    }
 }
 
 /// Convert an f64 value back to fp32 bit pattern, allowing the full exponent
@@ -365,7 +369,11 @@ fn fp32_bits_to_f64_raw(bits: u32) -> f64 {
 #[inline]
 fn f64_to_fp32_bits_raw(value: f64) -> u32 {
     if value == 0.0 {
-        return if value.is_sign_negative() { 0x80000000 } else { 0x00000000 };
+        return if value.is_sign_negative() {
+            0x80000000
+        } else {
+            0x00000000
+        };
     }
 
     let sign = value < 0.0;
@@ -488,13 +496,7 @@ pub fn aie2_acc_fp32_add(a_bits: u32, b_bits: u32) -> u32 {
 /// the sign-based tiebreaker is flipped.
 ///
 /// Rounding behavior per AIE2 hardware model (`srs_round` with `sgn_mag=True`).
-fn srs_round_bf16(
-    mode: RoundingMode,
-    sign: bool,
-    lsb: bool,
-    guard: bool,
-    sticky: bool,
-) -> bool {
+fn srs_round_bf16(mode: RoundingMode, sign: bool, lsb: bool, guard: bool, sticky: bool) -> bool {
     // Classify the rounding mode.
     let is_halfway = matches!(
         mode,
@@ -508,10 +510,7 @@ fn srs_round_bf16(
 
     let mut symmetric = matches!(
         mode,
-        RoundingMode::SymFloor
-            | RoundingMode::SymCeil
-            | RoundingMode::SymInf
-            | RoundingMode::SymZero
+        RoundingMode::SymFloor | RoundingMode::SymCeil | RoundingMode::SymInf | RoundingMode::SymZero
     );
 
     let otherdir = matches!(
@@ -807,9 +806,9 @@ mod tests {
         assert!(!fp32_is_denorm(0x8000_0000)); // -0
         assert!(!fp32_is_denorm(0x3F80_0000)); // 1.0
         assert!(!fp32_is_denorm(0x0080_0000)); // smallest normal
-        assert!(fp32_is_denorm(0x0000_0001));  // smallest denorm
-        assert!(fp32_is_denorm(0x007F_FFFF));  // largest denorm
-        assert!(fp32_is_denorm(0x8000_0001));  // negative denorm
+        assert!(fp32_is_denorm(0x0000_0001)); // smallest denorm
+        assert!(fp32_is_denorm(0x007F_FFFF)); // largest denorm
+        assert!(fp32_is_denorm(0x8000_0001)); // negative denorm
     }
 
     #[test]
@@ -861,24 +860,24 @@ mod tests {
         assert!(!bf16_is_nan(0x3F80)); // 1.0
         assert!(!bf16_is_nan(0x7F80)); // +inf
         assert!(!bf16_is_nan(0xFF80)); // -inf
-        assert!(bf16_is_nan(0x7F81));  // NaN
-        assert!(bf16_is_nan(0x7FFF));  // NaN
-        assert!(bf16_is_nan(0xFFFF));  // -NaN
+        assert!(bf16_is_nan(0x7F81)); // NaN
+        assert!(bf16_is_nan(0x7FFF)); // NaN
+        assert!(bf16_is_nan(0xFFFF)); // -NaN
     }
 
     #[test]
     fn test_fp32_is_nan() {
         assert!(!fp32_is_nan(0x0000_0000));
         assert!(!fp32_is_nan(0x7F80_0000)); // +inf
-        assert!(fp32_is_nan(0x7F80_0001));  // NaN
-        assert!(fp32_is_nan(0x7FC0_0000));  // qNaN
-        assert!(fp32_is_nan(0xFFC0_0000));  // -qNaN
+        assert!(fp32_is_nan(0x7F80_0001)); // NaN
+        assert!(fp32_is_nan(0x7FC0_0000)); // qNaN
+        assert!(fp32_is_nan(0xFFC0_0000)); // -qNaN
     }
 
     #[test]
     fn test_fp32_is_inf() {
-        assert!(fp32_is_inf(0x7F80_0000));  // +inf
-        assert!(fp32_is_inf(0xFF80_0000));  // -inf
+        assert!(fp32_is_inf(0x7F80_0000)); // +inf
+        assert!(fp32_is_inf(0xFF80_0000)); // -inf
         assert!(!fp32_is_inf(0x7F80_0001)); // NaN
         assert!(!fp32_is_inf(0x0000_0000)); // zero
     }
@@ -1108,22 +1107,29 @@ mod tests {
 
         // Write values to all 16 lanes and read back.
         let values = [
-            1.0f32, -1.0, 0.0, 2.5, -3.14, 100.0, f32::INFINITY, f32::NEG_INFINITY,
-            0.5, -0.5, 1e10, -1e10, 1e-10, -1e-10, f32::MIN_POSITIVE, -0.0,
+            1.0f32,
+            -1.0,
+            0.0,
+            2.5,
+            -3.14,
+            100.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.5,
+            -0.5,
+            1e10,
+            -1e10,
+            1e-10,
+            -1e-10,
+            f32::MIN_POSITIVE,
+            -0.0,
         ];
         for (i, &v) in values.iter().enumerate() {
             write_acc_f32(&mut acc, i, v);
         }
         for (i, &v) in values.iter().enumerate() {
             let read = read_acc_f32(&acc, i);
-            assert_eq!(
-                read.to_bits(),
-                v.to_bits(),
-                "lane {} mismatch: expected {:?} got {:?}",
-                i,
-                v,
-                read
-            );
+            assert_eq!(read.to_bits(), v.to_bits(), "lane {} mismatch: expected {:?} got {:?}", i, v, read);
         }
     }
 

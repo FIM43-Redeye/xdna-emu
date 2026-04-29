@@ -139,7 +139,6 @@ impl MemoryUnit {
             }
 
             // ========== Fused load+compute operations ==========
-
             Some(SemanticOp::Ups) if Self::has_memory_operand(op) => {
                 // vlda.ups: load from memory, upshift to accumulator
                 Self::execute_fused_load_ups(op, ctx, tile, pm);
@@ -158,7 +157,6 @@ impl MemoryUnit {
             // Standalone SRS/Pack/Convert (e.g., VSRS in the ST slot) have no
             // memory operand -- they write to a register, not memory. VectorAlu
             // handles those.
-
             Some(SemanticOp::Srs) if Self::has_memory_operand(op) => {
                 // vst.srs: shift-round-saturate accumulator, store to memory
                 Self::execute_fused_store_srs(op, ctx, tile, pm, neighbors);
@@ -200,17 +198,27 @@ impl MemoryUnit {
             ctx.record_core_bank_access(local_offset as u32, width.bytes() as usize, tile.num_banks());
         }
 
-        log::trace!("[LOAD] addr=0x{:X} width={:?} dest={:?} srcs={:?} latency={}",
-            addr, width, op.dest, op.sources, latency);
+        log::trace!(
+            "[LOAD] addr=0x{:X} width={:?} dest={:?} srcs={:?} latency={}",
+            addr,
+            width,
+            op.dest,
+            op.sources,
+            latency
+        );
         // Handle vector loads specially
         if width == MemWidth::Vector256 {
             let vec_data = Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n));
             if crate::debug::watch::is_watched(addr as u64, 32) {
-                let dest_str = op.dest.as_ref()
-                    .map(|d| format!("{:?}", d))
-                    .unwrap_or_default();
+                let dest_str = op.dest.as_ref().map(|d| format!("{:?}", d)).unwrap_or_default();
                 crate::debug::watch::log_core_load(
-                    ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, vec_data[0], &dest_str,
+                    ctx.cycles,
+                    tile.col,
+                    tile.row,
+                    ctx.pc(),
+                    addr as u64,
+                    vec_data[0],
+                    &dest_str,
                 );
             }
             if let Some(dest) = &op.dest {
@@ -226,11 +234,15 @@ impl MemoryUnit {
             vec_data[3] = full_data[3];
             // words 4-7 stay zero
             if crate::debug::watch::is_watched(addr as u64, 16) {
-                let dest_str = op.dest.as_ref()
-                    .map(|d| format!("{:?}", d))
-                    .unwrap_or_default();
+                let dest_str = op.dest.as_ref().map(|d| format!("{:?}", d)).unwrap_or_default();
                 crate::debug::watch::log_core_load(
-                    ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, vec_data[0], &dest_str,
+                    ctx.cycles,
+                    tile.col,
+                    tile.row,
+                    ctx.pc(),
+                    addr as u64,
+                    vec_data[0],
+                    &dest_str,
                 );
             }
             if let Some(dest) = &op.dest {
@@ -252,18 +264,22 @@ impl MemoryUnit {
                         _ => raw_value,
                     }
                 } else {
-                    raw_value  // already zero-extended
+                    raw_value // already zero-extended
                 }
             } else {
-                raw_value  // no element type info, keep as-is
+                raw_value // no element type info, keep as-is
             };
 
             if crate::debug::watch::is_watched(addr as u64, width.bytes() as usize) {
-                let dest_str = op.dest.as_ref()
-                    .map(|d| format!("{:?}", d))
-                    .unwrap_or_default();
+                let dest_str = op.dest.as_ref().map(|d| format!("{:?}", d)).unwrap_or_default();
                 crate::debug::watch::log_core_load(
-                    ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, value as u32, &dest_str,
+                    ctx.cycles,
+                    tile.col,
+                    tile.row,
+                    ctx.pc(),
+                    addr as u64,
+                    value as u32,
+                    &dest_str,
                 );
             }
             Self::write_dest_with_latency(op, ctx, value, width, latency);
@@ -297,9 +313,17 @@ impl MemoryUnit {
             let vec_data = Self::read_store_data_wide(op, ctx);
 
             if let Some(ref data) = vec_data {
-                if crate::debug::watch::is_watched(addr as u64, if width == MemWidth::QuadWord { 16 } else { 32 }) {
+                if crate::debug::watch::is_watched(
+                    addr as u64,
+                    if width == MemWidth::QuadWord { 16 } else { 32 },
+                ) {
                     crate::debug::watch::log_core_store(
-                        ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, data[0],
+                        ctx.cycles,
+                        tile.col,
+                        tile.row,
+                        ctx.pc(),
+                        addr as u64,
+                        data[0],
                     );
                 }
                 if width == MemWidth::QuadWord {
@@ -325,7 +349,12 @@ impl MemoryUnit {
                 let value = Self::get_store_value(op, ctx, width);
                 if crate::debug::watch::is_watched(addr as u64, width.bytes() as usize) {
                     crate::debug::watch::log_core_store(
-                        ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, value as u32,
+                        ctx.cycles,
+                        tile.col,
+                        tile.row,
+                        ctx.pc(),
+                        addr as u64,
+                        value as u32,
                     );
                 }
                 Self::write_memory(tile, addr, value, width, neighbors);
@@ -367,12 +396,23 @@ impl MemoryUnit {
             Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n))
         };
 
-        if crate::debug::watch::is_watched(addr as u64, if op.mem_width == MemWidth::QuadWord { 16 } else { 32 }) {
-            let dest_str = op.dest.as_ref()
-                .map(|d| format!("{:?}", d))
-                .unwrap_or_default();
+        if crate::debug::watch::is_watched(
+            addr as u64,
+            if op.mem_width == MemWidth::QuadWord {
+                16
+            } else {
+                32
+            },
+        ) {
+            let dest_str = op.dest.as_ref().map(|d| format!("{:?}", d)).unwrap_or_default();
             crate::debug::watch::log_core_load(
-                ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, vec_data[0], &dest_str,
+                ctx.cycles,
+                tile.col,
+                tile.row,
+                ctx.pc(),
+                addr as u64,
+                vec_data[0],
+                &dest_str,
             );
         }
 
@@ -381,9 +421,9 @@ impl MemoryUnit {
         if let Some(dest) = &op.dest {
             match dest {
                 Operand::AccumReg(_) => {
-                    let width = op.accum_width.unwrap_or(
-                        crate::interpreter::decode::register_map::AccumWidth::Half,
-                    );
+                    let width = op
+                        .accum_width
+                        .unwrap_or(crate::interpreter::decode::register_map::AccumWidth::Half);
                     ctx.queue_accum_load(dest.clone(), vec_data, width, latency);
                 }
                 _ => {
@@ -425,12 +465,23 @@ impl MemoryUnit {
             Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n))
         };
 
-        if crate::debug::watch::is_watched(addr as u64, if op.mem_width == MemWidth::QuadWord { 16 } else { 32 }) {
-            let dest_str = op.dest.as_ref()
-                .map(|d| format!("{:?}", d))
-                .unwrap_or_default();
+        if crate::debug::watch::is_watched(
+            addr as u64,
+            if op.mem_width == MemWidth::QuadWord {
+                16
+            } else {
+                32
+            },
+        ) {
+            let dest_str = op.dest.as_ref().map(|d| format!("{:?}", d)).unwrap_or_default();
             crate::debug::watch::log_core_load(
-                ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, vec_data[0], &dest_str,
+                ctx.cycles,
+                tile.col,
+                tile.row,
+                ctx.pc(),
+                addr as u64,
+                vec_data[0],
+                &dest_str,
             );
         }
 
@@ -451,8 +502,7 @@ impl MemoryUnit {
         } else {
             // Structural fallback: VLDB_4x has no pointer operand.
             // Regular VLDB has a PointerReg source; VLDB_4x has only VectorReg.
-            op.sources.iter().all(|s| matches!(s, Operand::VectorReg(_)))
-                && !op.sources.is_empty()
+            op.sources.iter().all(|s| matches!(s, Operand::VectorReg(_))) && !op.sources.is_empty()
         }
     }
 
@@ -534,31 +584,30 @@ impl MemoryUnit {
             let (quadrant, offset) = decode_data_address(addr);
             let mem: &[u8] = if quadrant == MemoryQuadrant::Local || neighbors.is_none() {
                 tile.data_memory()
-            } else if let Some(nbr_mem) = neighbors.as_ref()
-                .and_then(|n| n.get_memory(quadrant))
-            {
+            } else if let Some(nbr_mem) = neighbors.as_ref().and_then(|n| n.get_memory(quadrant)) {
                 nbr_mem
             } else {
                 continue; // non-existent neighbor -> zeros
             };
 
             if offset + 7 < mem.len() {
-                result[i * 2] = u32::from_le_bytes([
-                    mem[offset], mem[offset + 1],
-                    mem[offset + 2], mem[offset + 3],
-                ]);
-                result[i * 2 + 1] = u32::from_le_bytes([
-                    mem[offset + 4], mem[offset + 5],
-                    mem[offset + 6], mem[offset + 7],
-                ]);
+                result[i * 2] =
+                    u32::from_le_bytes([mem[offset], mem[offset + 1], mem[offset + 2], mem[offset + 3]]);
+                result[i * 2 + 1] =
+                    u32::from_le_bytes([mem[offset + 4], mem[offset + 5], mem[offset + 6], mem[offset + 7]]);
             }
         }
 
         log::trace!(
             "[VLDB_4x] {} src=v{} addrs=[{:#x},{:#x},{:#x},{:#x}] -> [{:08x},{:08x},...]",
-            name, src_reg,
-            eff_addrs[0], eff_addrs[1], eff_addrs[2], eff_addrs[3],
-            result[0], result[1],
+            name,
+            src_reg,
+            eff_addrs[0],
+            eff_addrs[1],
+            eff_addrs[2],
+            eff_addrs[3],
+            result[0],
+            result[1],
         );
 
         if let Some(dest) = &op.dest {
@@ -701,11 +750,7 @@ impl MemoryUnit {
     }
 
     /// Load 256 bits from memory at the op's address. Shared by fused load handlers.
-    fn fused_load_vector(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        tile: &Tile,
-    ) -> [u32; 8] {
+    fn fused_load_vector(op: &SlotOp, ctx: &mut ExecutionContext, tile: &Tile) -> [u32; 8] {
         let addr = Self::get_address(op, ctx);
         let (quadrant, local_offset) = decode_data_address(addr);
         if quadrant == MemoryQuadrant::Local {
@@ -776,27 +821,24 @@ impl MemoryUnit {
 
         // Half (bml/bmh) -> 512-bit single register.
         // Full/None (cm) -> 1024-bit wide pair via w2c upshift.
-        let is_half = matches!(op.accum_width,
-            Some(crate::interpreter::decode::register_map::AccumWidth::Half));
+        let is_half =
+            matches!(op.accum_width, Some(crate::interpreter::decode::register_map::AccumWidth::Half));
 
         match &op.dest {
             Some(Operand::AccumReg(r)) => {
                 if is_half {
-                    let acc = super::vector_ups::ups_vector_to_acc(
-                        &vec_data, shift, from, to,
-                    );
+                    let acc = super::vector_ups::ups_vector_to_acc(&vec_data, shift, from, to);
                     ctx.accumulator.write(*r, acc);
                 } else {
-                    let acc_wide = super::vector_ups::ups_vector_to_acc_wide(
-                        &vec_data, shift, from, to,
-                    );
+                    let acc_wide = super::vector_ups::ups_vector_to_acc_wide(&vec_data, shift, from, to);
                     ctx.accumulator.write_wide(*r, acc_wide);
                 }
             }
             other => {
                 log::warn!(
                     "[FUSED] vlda.ups: expected AccumReg dest, got {:?} (encoding={:?})",
-                    other, op.encoding_name,
+                    other,
+                    op.encoding_name,
                 );
             }
         }
@@ -840,8 +882,7 @@ impl MemoryUnit {
                     // Pack into accumulator as raw u64 words
                     let mut acc = [0u64; 8];
                     for i in 0..4 {
-                        acc[i] = result[i * 2] as u64
-                            | ((result[i * 2 + 1] as u64) << 32);
+                        acc[i] = result[i * 2] as u64 | ((result[i * 2 + 1] as u64) << 32);
                     }
                     ctx.accumulator.write(*r, acc);
                 }
@@ -878,16 +919,14 @@ impl MemoryUnit {
 
         // Half (bml/bmh) -> 512-bit single register, narrow SRS.
         // Full/None (cm) -> 1024-bit wide pair, SRS each half and pack.
-        let is_half = matches!(op.accum_width,
-            Some(crate::interpreter::decode::register_map::AccumWidth::Half));
+        let is_half =
+            matches!(op.accum_width, Some(crate::interpreter::decode::register_map::AccumWidth::Half));
 
         let addr = Self::get_store_address(op, ctx);
 
         if is_half {
             let acc = ctx.accumulator.read(acc_reg);
-            let narrowed = super::VectorAlu::vector_srs_from_acc(
-                &acc, shift, from, to, &ctx.srs_config,
-            );
+            let narrowed = super::VectorAlu::vector_srs_from_acc(&acc, shift, from, to, &ctx.srs_config);
 
             let to_bits = to.bits() as usize;
             let from_bits = from.bits() as usize;
@@ -896,7 +935,11 @@ impl MemoryUnit {
 
             log::debug!(
                 "[FUSED] vst.srs: acc{} -> addr=0x{:X} ({} bytes, {:?}->{:?}, half)",
-                acc_reg, addr, store_bytes, from, to,
+                acc_reg,
+                addr,
+                store_bytes,
+                from,
+                to,
             );
 
             let (quadrant, local_offset) = decode_data_address(addr);
@@ -911,12 +954,8 @@ impl MemoryUnit {
             let acc_lo: [u64; 8] = acc_wide[..8].try_into().unwrap();
             let acc_hi: [u64; 8] = acc_wide[8..].try_into().unwrap();
 
-            let result_lo = super::VectorAlu::vector_srs_from_acc(
-                &acc_lo, shift, from, to, &ctx.srs_config,
-            );
-            let result_hi = super::VectorAlu::vector_srs_from_acc(
-                &acc_hi, shift, from, to, &ctx.srs_config,
-            );
+            let result_lo = super::VectorAlu::vector_srs_from_acc(&acc_lo, shift, from, to, &ctx.srs_config);
+            let result_hi = super::VectorAlu::vector_srs_from_acc(&acc_hi, shift, from, to, &ctx.srs_config);
 
             // Pack the two halves. For reduction SRS (e.g., Acc32->i8),
             // each half only fills a fraction of its 8-word result.
@@ -936,7 +975,11 @@ impl MemoryUnit {
 
             log::debug!(
                 "[FUSED] vst.srs: acc{} -> addr=0x{:X} ({} bytes, {:?}->{:?}, wide)",
-                acc_reg, addr, store_bytes, from, to,
+                acc_reg,
+                addr,
+                store_bytes,
+                from,
+                to,
             );
 
             let (quadrant, local_offset) = decode_data_address(addr);
@@ -980,11 +1023,17 @@ impl MemoryUnit {
         };
 
         let packed_lo = super::vector_pack::pack_half(
-            &src_lo, bits_i, bits_o, signed,
+            &src_lo,
+            bits_i,
+            bits_o,
+            signed,
             super::vector_pack::PackMode::Truncate,
         );
         let packed_hi = super::vector_pack::pack_half(
-            &src_hi, bits_i, bits_o, signed,
+            &src_hi,
+            bits_i,
+            bits_o,
+            signed,
             super::vector_pack::PackMode::Truncate,
         );
 
@@ -996,10 +1045,7 @@ impl MemoryUnit {
         result[n..n + n].copy_from_slice(&packed_hi[..n]);
 
         let addr = Self::get_store_address(op, ctx);
-        log::debug!(
-            "[FUSED] vst.pack: addr=0x{:X} ({}-bit -> {}-bit)",
-            addr, bits_i, bits_o,
-        );
+        log::debug!("[FUSED] vst.pack: addr=0x{:X} ({}-bit -> {}-bit)", addr, bits_i, bits_o,);
 
         let (quadrant, local_offset) = decode_data_address(addr);
         if quadrant == MemoryQuadrant::Local {
@@ -1048,10 +1094,7 @@ impl MemoryUnit {
                     result[i] = (bf_lo as u32) | ((bf_hi as u32) << 16);
                 }
                 let addr = Self::get_store_address(op, ctx);
-                log::debug!(
-                    "[FUSED] vst.conv: addr=0x{:X} ({:?} -> {:?}, from accum)",
-                    addr, from, to,
-                );
+                log::debug!("[FUSED] vst.conv: addr=0x{:X} ({:?} -> {:?}, from accum)", addr, from, to,);
                 let (quadrant, local_offset) = decode_data_address(addr);
                 if quadrant == MemoryQuadrant::Local {
                     ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
@@ -1073,10 +1116,7 @@ impl MemoryUnit {
         let converted = super::VectorAlu::vector_convert(&src, from, to);
 
         let addr = Self::get_store_address(op, ctx);
-        log::debug!(
-            "[FUSED] vst.conv: addr=0x{:X} ({:?} -> {:?})",
-            addr, from, to,
-        );
+        log::debug!("[FUSED] vst.conv: addr=0x{:X} ({:?} -> {:?})", addr, from, to,);
 
         let (quadrant, local_offset) = decode_data_address(addr);
         if quadrant == MemoryQuadrant::Local {
@@ -1113,9 +1153,21 @@ impl MemoryUnit {
 
         if let Some(ref data) = vec_data {
             log::trace!("[VST] writing to addr=0x{:X} mem_width={:?}", addr, op.mem_width);
-            if crate::debug::watch::is_watched(addr as u64, if op.mem_width == MemWidth::QuadWord { 16 } else { 32 }) {
+            if crate::debug::watch::is_watched(
+                addr as u64,
+                if op.mem_width == MemWidth::QuadWord {
+                    16
+                } else {
+                    32
+                },
+            ) {
                 crate::debug::watch::log_core_store(
-                    ctx.cycles, tile.col, tile.row, ctx.pc(), addr as u64, data[0],
+                    ctx.cycles,
+                    tile.col,
+                    tile.row,
+                    ctx.pc(),
+                    addr as u64,
+                    data[0],
                 );
             }
             if op.mem_width == MemWidth::QuadWord {
@@ -1272,7 +1324,10 @@ impl MemoryUnit {
             Operand::ScalarReg(r) => ctx.scalar_read(*r),
             Operand::Immediate(v) => *v as u32,
             other => {
-                log::warn!("[MEMORY] get_store_address: unexpected base operand {:?}, defaulting to 0", other);
+                log::warn!(
+                    "[MEMORY] get_store_address: unexpected base operand {:?}, defaulting to 0",
+                    other
+                );
                 0
             }
         });
@@ -1284,7 +1339,10 @@ impl MemoryUnit {
             Operand::Immediate(v) => (*v as i32 * 4) as u32,
             Operand::ScalarReg(r) => ctx.scalar_read(*r).wrapping_mul(4),
             other => {
-                log::warn!("[MEMORY] get_store_address: unexpected offset operand {:?}, defaulting to 0", other);
+                log::warn!(
+                    "[MEMORY] get_store_address: unexpected offset operand {:?}, defaulting to 0",
+                    other
+                );
                 0
             }
         });
@@ -1309,12 +1367,13 @@ impl MemoryUnit {
         } else {
             // Hand-constructed SlotOp (tests): use legacy layout detection.
             // If sources[0] is an address, value is in dest.
-            op.sources.first().and_then(|first| {
-                match first {
+            op.sources
+                .first()
+                .and_then(|first| match first {
                     Operand::PointerReg(_) | Operand::Memory { .. } => op.dest.as_ref(),
                     _ => Some(first),
-                }
-            }).or(op.dest.as_ref())
+                })
+                .or(op.dest.as_ref())
         };
 
         Self::read_store_operand(operand, ctx, width)
@@ -1330,14 +1389,14 @@ impl MemoryUnit {
         // operand. The LLVM FFI decoder puts the data register in op.dest when
         // it appears first in the MCInst defs, so fall back to dest when the
         // sources contain only address operands (PointerReg, Memory, ModifierReg).
-        let operand = op.sources.first().and_then(|first| {
-            match first {
-                Operand::PointerReg(_) | Operand::Memory { .. } | Operand::ModifierReg(_) => {
-                    op.dest.clone()
-                }
+        let operand = op
+            .sources
+            .first()
+            .and_then(|first| match first {
+                Operand::PointerReg(_) | Operand::Memory { .. } | Operand::ModifierReg(_) => op.dest.clone(),
                 _ => Some(first.clone()),
-            }
-        }).or_else(|| op.dest.clone());
+            })
+            .or_else(|| op.dest.clone());
         operand.unwrap_or(Operand::ScalarReg(0))
     }
 
@@ -1385,7 +1444,8 @@ impl MemoryUnit {
         // offset = (address - PROC_BUS_BASE). This maps to the tile's memory
         // module, core module, etc. registers at their AM025 offsets.
         // Window constants from xdna_archspec::aie2::memory_map.
-        if tile.processor_bus_enabled && addr >= memory_map::PROC_BUS_BASE && addr < memory_map::PROC_BUS_END {
+        if tile.processor_bus_enabled && addr >= memory_map::PROC_BUS_BASE && addr < memory_map::PROC_BUS_END
+        {
             let reg_offset = addr - memory_map::PROC_BUS_BASE;
             let reg_val = tile.read_register_pure(reg_offset);
             log::debug!("[PROC_BUS] read addr=0x{:X} reg=0x{:X} -> 0x{:08X}", addr, reg_offset, reg_val);
@@ -1406,17 +1466,13 @@ impl MemoryUnit {
             return 0;
         };
 
-
         Self::read_from_slice(mem, offset, width)
     }
 
     /// Read a value from a memory slice at the given offset.
     fn read_from_slice(mem: &[u8], addr: usize, width: MemWidth) -> u64 {
         if addr >= mem.len() {
-            log::warn!(
-                "[MEMORY] OOB read: addr=0x{:X} width={:?} mem_size=0x{:X}",
-                addr, width, mem.len()
-            );
+            log::warn!("[MEMORY] OOB read: addr=0x{:X} width={:?} mem_size=0x{:X}", addr, width, mem.len());
             return 0;
         }
 
@@ -1437,8 +1493,7 @@ impl MemoryUnit {
             }
             MemWidth::Word => {
                 if addr + 3 < mem.len() {
-                    u32::from_le_bytes([mem[addr], mem[addr + 1], mem[addr + 2], mem[addr + 3]])
-                        as u64
+                    u32::from_le_bytes([mem[addr], mem[addr + 1], mem[addr + 2], mem[addr + 3]]) as u64
                 } else {
                     0
                 }
@@ -1486,10 +1541,17 @@ impl MemoryUnit {
     ///
     /// When the processor bus is enabled, writes to the register space
     /// (0x10000-0x3FFFF) target tile configuration registers.
-    pub fn write_memory(tile: &mut Tile, addr: u32, value: u64, width: MemWidth, neighbors: Option<&mut NeighborMemory>) {
+    pub fn write_memory(
+        tile: &mut Tile,
+        addr: u32,
+        value: u64,
+        width: MemWidth,
+        neighbors: Option<&mut NeighborMemory>,
+    ) {
         // Processor bus: write to tile config registers via the 0x80000 window.
         // Window constants from xdna_archspec::aie2::memory_map.
-        if tile.processor_bus_enabled && addr >= memory_map::PROC_BUS_BASE && addr < memory_map::PROC_BUS_END {
+        if tile.processor_bus_enabled && addr >= memory_map::PROC_BUS_BASE && addr < memory_map::PROC_BUS_END
+        {
             let reg_offset = addr - memory_map::PROC_BUS_BASE;
             log::debug!("[PROC_BUS] write addr=0x{:X} reg=0x{:X} value=0x{:X}", addr, reg_offset, value);
             tile.registers.insert(reg_offset, value as u32);
@@ -1507,7 +1569,6 @@ impl MemoryUnit {
             }
             // No neighbor context -- fall through to local write (legacy behavior)
         }
-
 
         // Local tile write (Local direction or no neighbor context)
         let mem = tile.data_memory_mut();
@@ -1590,12 +1651,16 @@ impl MemoryUnit {
     /// memory pipeline. Cross-tile accesses (South/West/North) incur additional
     /// routing latency on top of the base LATENCY_MEMORY. The compiler relies
     /// on this latency to pipeline multiple loads to the same register.
-    fn write_dest_with_latency(op: &SlotOp, ctx: &mut ExecutionContext, value: u64, width: MemWidth, latency: u64) {
+    fn write_dest_with_latency(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        value: u64,
+        width: MemWidth,
+        latency: u64,
+    ) {
         if let Some(dest) = &op.dest {
             match dest {
-                Operand::ScalarReg(_)
-                | Operand::PointerReg(_)
-                | Operand::ModifierReg(_) => {
+                Operand::ScalarReg(_) | Operand::PointerReg(_) | Operand::ModifierReg(_) => {
                     ctx.queue_scalar_load(dest.clone(), value as u32, latency);
                 }
                 Operand::VectorReg(_) => {
@@ -1677,12 +1742,8 @@ impl MemoryUnit {
         if addr + 31 < mem.len() {
             for i in 0..8 {
                 let offset = addr + i * 4;
-                result[i] = u32::from_le_bytes([
-                    mem[offset],
-                    mem[offset + 1],
-                    mem[offset + 2],
-                    mem[offset + 3],
-                ]);
+                result[i] =
+                    u32::from_le_bytes([mem[offset], mem[offset + 1], mem[offset + 2], mem[offset + 3]]);
             }
         }
 
@@ -1690,7 +1751,12 @@ impl MemoryUnit {
     }
 
     /// Write a vector to memory (256 bits = 32 bytes) with cross-tile routing.
-    pub fn write_vector_to_memory(tile: &mut Tile, addr: u32, value: [u32; 8], neighbors: Option<&mut NeighborMemory>) {
+    pub fn write_vector_to_memory(
+        tile: &mut Tile,
+        addr: u32,
+        value: [u32; 8],
+        neighbors: Option<&mut NeighborMemory>,
+    ) {
         let (quadrant, offset) = decode_data_address(addr);
 
         if quadrant != MemoryQuadrant::Local {
@@ -1980,8 +2046,8 @@ mod tests {
         let mut tile = make_tile();
 
         // Write test vector data
-        let test_data = [0xAABBCCDD, 0x11223344, 0x55667788, 0x99AABBCC,
-                         0xDDEEFF00, 0x12345678, 0x9ABCDEF0, 0xFEDCBA98];
+        let test_data =
+            [0xAABBCCDD, 0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00, 0x12345678, 0x9ABCDEF0, 0xFEDCBA98];
         MemoryUnit::write_vector_to_memory(&mut tile, 0x700, test_data, None);
         ctx.pointer.write(0, 0x700);
 
@@ -2026,8 +2092,8 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        let test_data = [0xDEADBEEF, 0xCAFEBABE, 0x12345678, 0x9ABCDEF0,
-                         0x0F0F0F0F, 0xF0F0F0F0, 0xAAAA5555, 0x5555AAAA];
+        let test_data =
+            [0xDEADBEEF, 0xCAFEBABE, 0x12345678, 0x9ABCDEF0, 0x0F0F0F0F, 0xF0F0F0F0, 0xAAAA5555, 0x5555AAAA];
         MemoryUnit::write_vector_to_memory(&mut tile, 0x900, test_data, None);
         ctx.pointer.write(4, 0x900); // B-channel typically uses p4-p7
 
@@ -2058,8 +2124,8 @@ mod tests {
             .as_vector(ElementType::Int32)
             .with_mem_width(MemWidth::Vector256)
             .with_post_modify(PostModify::Register(2))
-        .with_dest(Operand::VectorReg(1))
-        .with_source(Operand::PointerReg(5));
+            .with_dest(Operand::VectorReg(1))
+            .with_source(Operand::PointerReg(5));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
@@ -2072,8 +2138,8 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        let test_data = [0x11111111, 0x22222222, 0x33333333, 0x44444444,
-                         0x55555555, 0x66666666, 0x77777777, 0x88888888];
+        let test_data =
+            [0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x66666666, 0x77777777, 0x88888888];
         ctx.vector.write(4, test_data);
         ctx.pointer.write(2, 0xB00);
 
@@ -2397,7 +2463,7 @@ mod tests {
         let mem = west.data_memory();
         for (i, &expected) in test_data.iter().enumerate() {
             let offset = 0x800 + i * 4;
-            let actual = u32::from_le_bytes([mem[offset], mem[offset+1], mem[offset+2], mem[offset+3]]);
+            let actual = u32::from_le_bytes([mem[offset], mem[offset + 1], mem[offset + 2], mem[offset + 3]]);
             assert_eq!(actual, expected, "Vector word {} mismatch", i);
         }
     }
@@ -2561,8 +2627,11 @@ mod tests {
         MemoryUnit::execute(&load_op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
 
-        assert_eq!(ctx.pointer.read(7), 0x78000,
-            "p7 should be restored to original value after load from [sp, #-32]");
+        assert_eq!(
+            ctx.pointer.read(7),
+            0x78000,
+            "p7 should be restored to original value after load from [sp, #-32]"
+        );
     }
 
     #[test]
@@ -2593,21 +2662,17 @@ mod tests {
         MemoryUnit::execute(&load_op, &mut ctx, &mut tile, None);
 
         // Should NOT be committed yet (load latency = 7)
-        assert_eq!(ctx.pointer.read(7), 0,
-            "Load should not be committed immediately (latency pending)");
+        assert_eq!(ctx.pointer.read(7), 0, "Load should not be committed immediately (latency pending)");
 
         // Before ready_cycle: read returns old value
         ctx.cycles = 101;
-        assert_eq!(ctx.pointer_read(7), 0,
-            "Before ready_cycle, should return old register value");
+        assert_eq!(ctx.pointer_read(7), 0, "Before ready_cycle, should return old register value");
 
         // At ready_cycle: forward works, then commit
         ctx.cycles = 100 + LATENCY_MEMORY as u64;
-        assert_eq!(ctx.pointer_read(7), 0x78000,
-            "At ready_cycle, forward should return pending load value");
+        assert_eq!(ctx.pointer_read(7), 0x78000, "At ready_cycle, forward should return pending load value");
         ctx.commit_pending_writes();
-        assert_eq!(ctx.pointer.read(7), 0x78000,
-            "After commit, p7 should have restored value");
+        assert_eq!(ctx.pointer.read(7), 0x78000, "After commit, p7 should have restored value");
     }
 
     #[test]
@@ -2632,8 +2697,11 @@ mod tests {
         MemoryUnit::execute(&store_op, &mut ctx, &mut tile, None);
 
         // Verify: [sp - 8] = 0x70040 - 8 = 0x70038 -> local 0x0038
-        assert_eq!(tile.read_data_u32(0x38), Some(0xDEAD_BEEF),
-            "Store via SP-relative addressing should write to correct local offset");
+        assert_eq!(
+            tile.read_data_u32(0x38),
+            Some(0xDEAD_BEEF),
+            "Store via SP-relative addressing should write to correct local offset"
+        );
     }
 
     #[test]
@@ -2664,12 +2732,10 @@ mod tests {
         ctx.queue_pointer_write(7, ctx.sp(), 1); // ready=12
 
         // Verify p7 is still old (deferred by 1)
-        assert_eq!(ctx.pointer.read(7), 0x78000,
-            "p7 live should still be old value (write deferred)");
+        assert_eq!(ctx.pointer.read(7), 0x78000, "p7 live should still be old value (write deferred)");
         // But forward returns new value
         ctx.cycles = 12;
-        assert_eq!(ctx.pointer_read(7), 0x70060,
-            "p7 forward should return sp value after clobber");
+        assert_eq!(ctx.pointer_read(7), 0x70060, "p7 forward should return sp value after clobber");
 
         // Commit the clobber
         ctx.commit_pending_writes();
@@ -2686,21 +2752,21 @@ mod tests {
 
         // Cycle 51: load not ready -- read returns clobbered sp value
         ctx.cycles = 51;
-        assert_eq!(ctx.pointer_read(7), 0x70060,
-            "Before ready_cycle, should read clobbered sp value");
+        assert_eq!(ctx.pointer_read(7), 0x70060, "Before ready_cycle, should read clobbered sp value");
 
         // Cycle 55: still not ready
         ctx.cycles = 55;
-        assert_eq!(ctx.pointer_read(7), 0x70060,
-            "Still before ready_cycle, should read clobbered sp value");
+        assert_eq!(ctx.pointer_read(7), 0x70060, "Still before ready_cycle, should read clobbered sp value");
 
         // Cycle 57: load ready -- forward returns restored value, then commit
         ctx.cycles = 57;
-        assert_eq!(ctx.pointer_read(7), 0x78000,
-            "At ready_cycle, forwarding should return restored p7 value");
+        assert_eq!(
+            ctx.pointer_read(7),
+            0x78000,
+            "At ready_cycle, forwarding should return restored p7 value"
+        );
         ctx.commit_pending_writes();
-        assert_eq!(ctx.pointer.read(7), 0x78000,
-            "p7 should be committed to restored value");
+        assert_eq!(ctx.pointer.read(7), 0x78000, "p7 should be committed to restored value");
     }
 
     #[test]
@@ -2726,12 +2792,10 @@ mod tests {
         MemoryUnit::execute(&load_op, &mut ctx, &mut tile, None);
 
         // SP should be post-modified: 0x70100 + 4 = 0x70104
-        assert_eq!(ctx.sp(), 0x70104,
-            "SP should be post-modified by +4");
+        assert_eq!(ctx.sp(), 0x70104, "SP should be post-modified by +4");
 
         // p7 should be UNAFFECTED
-        assert_eq!(ctx.pointer.read(7), 0xBEEF,
-            "p7 must not be affected by SP post-modify");
+        assert_eq!(ctx.pointer.read(7), 0xBEEF, "p7 must not be affected by SP post-modify");
 
         ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 0x42);
@@ -2773,8 +2837,7 @@ mod tests {
 
         // Memory at sp-32 = 0x100-0x20 = 0xE0 should contain 0x78000
         let stored = tile.read_data_u32(0xE0);
-        assert_eq!(stored, Some(0x78000),
-            "st p7 must store p7's VALUE (0x78000), not 0");
+        assert_eq!(stored, Some(0x78000), "st p7 must store p7's VALUE (0x78000), not 0");
     }
 
     #[test]
@@ -2808,8 +2871,11 @@ mod tests {
         MemoryUnit::execute(&load_op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
 
-        assert_eq!(ctx.pointer.read(7), 0x78000,
-            "p7 must be restored to original value after store/load roundtrip");
+        assert_eq!(
+            ctx.pointer.read(7),
+            0x78000,
+            "p7 must be restored to original value after store/load roundtrip"
+        );
     }
 
     #[test]
@@ -2830,8 +2896,7 @@ mod tests {
 
         // sp-36 = 0x200-0x24 = 0x1DC
         let stored = tile.read_data_u32(0x1DC);
-        assert_eq!(stored, Some(0x74000),
-            "st p6 must store p6's value correctly");
+        assert_eq!(stored, Some(0x74000), "st p6 must store p6's value correctly");
     }
 
     #[test]
@@ -2850,8 +2915,7 @@ mod tests {
         MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
 
         let stored = tile.read_data_u32(0xFC); // 0x100 - 4
-        assert_eq!(stored, Some(0x42),
-            "st dj0 must store modifier register value");
+        assert_eq!(stored, Some(0x42), "st dj0 must store modifier register value");
     }
 
     /// Test the fused vlda.ups + vst.srs round-trip for s8.s32 wide (cm register).
@@ -2867,8 +2931,8 @@ mod tests {
 
         // Write 32 bytes of i8 test data to input address (0x100)
         let input_data: [u8; 32] = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-            17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+            27, 28, 29, 30, 31, 32,
         ];
         for (i, &byte) in input_data.iter().enumerate() {
             tile.data_memory_mut()[0x100 + i] = byte;
@@ -2888,11 +2952,11 @@ mod tests {
         // Step 1: vlda.ups.s32.s8 cm0, s0, [p0, #0]
         let mut ups_op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Ups)
             .with_dest(Operand::AccumReg(0))
-            .with_source(Operand::ScalarReg(0))    // shift register
+            .with_source(Operand::ScalarReg(0)) // shift register
             .with_source(Operand::Memory { base: 0, offset: 0 });
         ups_op.from_type = Some(ElementType::Int8);
         ups_op.element_type = Some(ElementType::Int32);
-        ups_op.accum_width = Some(AccumWidth::Full);  // cm register
+        ups_op.accum_width = Some(AccumWidth::Full); // cm register
         ups_op.mem_width = MemWidth::Vector256;
         ups_op.is_vector = true;
 
@@ -2900,28 +2964,28 @@ mod tests {
 
         // Verify accumulator has non-zero data
         let acc = ctx.accumulator.read_wide(0);
-        assert!(acc.iter().any(|&v| v != 0),
-            "UPS should produce non-zero accumulator data");
+        assert!(acc.iter().any(|&v| v != 0), "UPS should produce non-zero accumulator data");
 
         // Step 2: vst.srs.s8.s32 cm0, s0, [p1, #0]
         let mut srs_op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Srs)
-            .with_source(Operand::AccumReg(0))     // accumulator source
-            .with_source(Operand::ScalarReg(0))    // shift register
+            .with_source(Operand::AccumReg(0)) // accumulator source
+            .with_source(Operand::ScalarReg(0)) // shift register
             .with_source(Operand::Memory { base: 1, offset: 0 });
         srs_op.from_type = Some(ElementType::Int32);
         srs_op.element_type = Some(ElementType::Int8);
-        srs_op.accum_width = Some(AccumWidth::Full);  // cm register
+        srs_op.accum_width = Some(AccumWidth::Full); // cm register
         srs_op.mem_width = MemWidth::Vector256;
         srs_op.is_vector = true;
 
         MemoryUnit::execute(&srs_op, &mut ctx, &mut tile, None);
 
         // Read output and compare with input (should be identity for shift=0)
-        let output: Vec<u8> = (0..32)
-            .map(|i| tile.data_memory()[0x200 + i])
-            .collect();
-        assert_eq!(&output[..], &input_data[..],
-            "fused vlda.ups + vst.srs s8.s32 round-trip should be identity");
+        let output: Vec<u8> = (0..32).map(|i| tile.data_memory()[0x200 + i]).collect();
+        assert_eq!(
+            &output[..],
+            &input_data[..],
+            "fused vlda.ups + vst.srs s8.s32 round-trip should be identity"
+        );
     }
 
     /// Verify that s0 (SRS shift register) starts at zero, matching hardware
@@ -2936,8 +3000,8 @@ mod tests {
 
         // Write test data to input
         let input_data: [u8; 32] = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-            17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+            27, 28, 29, 30, 31, 32,
         ];
         for (i, &byte) in input_data.iter().enumerate() {
             tile.data_memory_mut()[0x100 + i] = byte;
@@ -2953,7 +3017,7 @@ mod tests {
         // UPS with s0 = 0 (from init, like hardware)
         let mut ups_op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Ups)
             .with_dest(Operand::AccumReg(0))
-            .with_source(Operand::ScalarReg(40))  // s0 = ScalarReg(40)
+            .with_source(Operand::ScalarReg(40)) // s0 = ScalarReg(40)
             .with_source(Operand::Memory { base: 0, offset: 0 });
         ups_op.from_type = Some(ElementType::Int8);
         ups_op.element_type = Some(ElementType::Int32);
@@ -2966,7 +3030,7 @@ mod tests {
         // SRS with s0 = 0 (unchanged)
         let mut srs_op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Srs)
             .with_source(Operand::AccumReg(0))
-            .with_source(Operand::ScalarReg(40))  // s0 = ScalarReg(40)
+            .with_source(Operand::ScalarReg(40)) // s0 = ScalarReg(40)
             .with_source(Operand::Memory { base: 1, offset: 0 });
         srs_op.from_type = Some(ElementType::Int32);
         srs_op.element_type = Some(ElementType::Int8);
@@ -2977,11 +3041,8 @@ mod tests {
         MemoryUnit::execute(&srs_op, &mut ctx, &mut tile, None);
 
         // s0=0 round-trip should produce identity
-        let output: Vec<u8> = (0..32)
-            .map(|i| tile.data_memory()[0x200 + i])
-            .collect();
-        assert_eq!(&output[..], &input_data[..],
-            "UPS->SRS with s0=0 (hw init) should round-trip correctly");
+        let output: Vec<u8> = (0..32).map(|i| tile.data_memory()[0x200 + i]).collect();
+        assert_eq!(&output[..], &input_data[..], "UPS->SRS with s0=0 (hw init) should round-trip correctly");
     }
 
     // --- Cross-tile load pipeline hazard regression test ---
@@ -3030,8 +3091,11 @@ mod tests {
         MemoryUnit::execute(&load_op, &mut ctx, &mut tile, Some(&mut nbr));
 
         // The load should NOT be visible yet (it's queued in the pipeline)
-        assert_eq!(ctx.scalar.read(0), 0x00000003,
-            "Load should not be committed immediately (pipeline latency)");
+        assert_eq!(
+            ctx.scalar.read(0),
+            0x00000003,
+            "Load should not be committed immediately (pipeline latency)"
+        );
 
         // Advance to exactly LATENCY_MEMORY cycles after issue and commit.
         // This is the cycle where hardware makes the value available and
@@ -3042,7 +3106,10 @@ mod tests {
         // The loaded value must be visible now -- at the SAME latency as
         // a local load. If cross-tile loads had extra latency, this would
         // still show the stale value (0x00000003).
-        assert_eq!(ctx.scalar.read(0), test_value,
-            "Cross-tile load must complete at LATENCY_MEMORY cycles, same as local");
+        assert_eq!(
+            ctx.scalar.read(0),
+            test_value,
+            "Cross-tile load must complete at LATENCY_MEMORY cycles, same as local"
+        );
     }
 }

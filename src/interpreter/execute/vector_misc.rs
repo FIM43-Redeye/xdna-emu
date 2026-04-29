@@ -68,7 +68,11 @@ impl VectorAlu {
     /// Broadcast a scalar value to all vector lanes.
     pub(super) fn vector_broadcast(value: u32, elem_type: ElementType) -> [u32; 8] {
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
+            ElementType::Int32
+            | ElementType::UInt32
+            | ElementType::Int64
+            | ElementType::UInt64
+            | ElementType::Float32 => {
                 // Broadcast 32-bit value to all 8 lanes
                 [value; 8]
             }
@@ -92,7 +96,11 @@ impl VectorAlu {
     /// Returns the element at the given lane index, converted to a u32.
     pub(super) fn vector_extract(src: &[u32; 8], index: u32, elem_type: ElementType) -> u32 {
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
+            ElementType::Int32
+            | ElementType::UInt32
+            | ElementType::Int64
+            | ElementType::UInt64
+            | ElementType::Float32 => {
                 // 8 lanes of 32-bit elements
                 let lane = (index as usize) & 0x7;
                 src[lane]
@@ -129,7 +137,11 @@ impl VectorAlu {
     /// Returns the element value (zero-extended to u32).
     pub(super) fn extract_element_by_index(src: &[u32; 8], index: u32, et: ElementType) -> u32 {
         match et {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
+            ElementType::Int32
+            | ElementType::UInt32
+            | ElementType::Int64
+            | ElementType::UInt64
+            | ElementType::Float32 => {
                 let idx = (index as usize) & 7;
                 src[idx]
             }
@@ -152,7 +164,11 @@ impl VectorAlu {
 
     pub(super) fn vector_insert(dst: &mut [u32; 8], value: u32, index: u32, elem_type: ElementType) {
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
+            ElementType::Int32
+            | ElementType::UInt32
+            | ElementType::Int64
+            | ElementType::UInt64
+            | ElementType::Float32 => {
                 // 8 lanes of 32-bit elements
                 let lane = (index as usize) & 0x7;
                 dst[lane] = value;
@@ -290,8 +306,10 @@ impl VectorAlu {
         let mut result = [0u32; 16];
         for i in 0..16 {
             result[i] = u32::from_le_bytes([
-                out_bytes[i * 4], out_bytes[i * 4 + 1],
-                out_bytes[i * 4 + 2], out_bytes[i * 4 + 3],
+                out_bytes[i * 4],
+                out_bytes[i * 4 + 1],
+                out_bytes[i * 4 + 2],
+                out_bytes[i * 4 + 3],
             ]);
         }
         Self::write_wide_vec_dest(op, ctx, result);
@@ -363,7 +381,9 @@ impl VectorAlu {
                 //   .16: identity (1 component, no rearrangement)
                 //   .32: 128-bit blocks (4 copies x 2 components)
                 //   .64: 256-bit blocks (4 copies x 4 components)
-                let is_shfl = op.encoding_name.as_deref()
+                let is_shfl = op
+                    .encoding_name
+                    .as_deref()
                     .map_or(false, |n| n.contains("SHFL") || n.contains("shfl"));
 
                 if is_shfl {
@@ -388,8 +408,10 @@ impl VectorAlu {
                         let shuffled = super::vector_permute::shuffle_vectors(&lo_bytes, &hi_bytes, mode);
                         for i in 0..16 {
                             result[i] = u32::from_le_bytes([
-                                shuffled[i * 4], shuffled[i * 4 + 1],
-                                shuffled[i * 4 + 2], shuffled[i * 4 + 3],
+                                shuffled[i * 4],
+                                shuffled[i * 4 + 1],
+                                shuffled[i * 4 + 2],
+                                shuffled[i * 4 + 3],
                             ]);
                         }
                     } else {
@@ -493,7 +515,7 @@ impl VectorAlu {
             //
             // Decoded sources: [s1 (VectorReg), idx (ScalarReg r29), s0 (ScalarReg)].
             let base = Self::get_wide_vec_source(op, ctx, 0);
-            let index = ctx.scalar_read(29);  // r29: implicit index register
+            let index = ctx.scalar_read(29); // r29: implicit index register
             if matches!(et, ElementType::Int64 | ElementType::UInt64) {
                 // 64-bit: s0 is a register pair (rN+1:rN). Read both halves.
                 // get_nth_scalar_source returns the pair's base register value;
@@ -502,7 +524,10 @@ impl VectorAlu {
                 let mut scalar_count = 0;
                 for src in &op.sources {
                     if let Operand::ScalarReg(r) = src {
-                        if scalar_count == 1 { s0_reg = Some(*r); break; }
+                        if scalar_count == 1 {
+                            s0_reg = Some(*r);
+                            break;
+                        }
                         scalar_count += 1;
                     }
                 }
@@ -512,7 +537,7 @@ impl VectorAlu {
                 let result = Self::insert_wide_element_64(&base, index, lo, hi);
                 Self::write_wide_vec_dest(op, ctx, result);
             } else {
-                let value = Self::get_nth_scalar_source(op, ctx, 1);  // s0 (skip idx)
+                let value = Self::get_nth_scalar_source(op, ctx, 1); // s0 (skip idx)
                 let result = Self::insert_wide_element(&base, index, value, et);
                 Self::write_wide_vec_dest(op, ctx, result);
             }
@@ -524,8 +549,8 @@ impl VectorAlu {
             // Decoded sources: [s1 (VectorReg), idx (ScalarReg r29), s0 (ScalarReg)].
             // Index is always r29 (implicit), value is the second scalar source.
             let mut base = Self::get_vector_source(op, ctx, 0);
-            let index = ctx.scalar_read(29);  // r29: implicit index register
-            let value = Self::get_nth_scalar_source(op, ctx, 1);  // s0 (skip idx)
+            let index = ctx.scalar_read(29); // r29: implicit index register
+            let value = Self::get_nth_scalar_source(op, ctx, 1); // s0 (skip idx)
             Self::vector_insert(&mut base, value, index, et);
             Self::write_vector_dest(op, ctx, base);
         }
@@ -567,9 +592,11 @@ impl VectorAlu {
             // optional pre-shift merge. See wide_vector_shift() docs.
             let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
 
-            let n_scalars = op.sources.iter().filter(|s| {
-                matches!(s, Operand::ScalarReg(_) | Operand::Immediate(_))
-            }).count();
+            let n_scalars = op
+                .sources
+                .iter()
+                .filter(|s| matches!(s, Operand::ScalarReg(_) | Operand::Immediate(_)))
+                .count();
 
             let (step, shift) = if n_scalars >= 2 {
                 // VSHIFT_ALIGN: first scalar = step, second = shift
@@ -601,18 +628,21 @@ impl VectorAlu {
     /// - VectorReg -> AccumReg (e.g., vmov bmh0, x1)
     /// - AccumReg -> VectorReg (e.g., vmov x0, bml0)
     pub(super) fn execute_copy(op: &SlotOp, ctx: &mut ExecutionContext, _et: ElementType) -> bool {
-        let has_acc_source = op.sources.iter()
-            .any(|s| matches!(s, Operand::AccumReg(_)));
+        let has_acc_source = op.sources.iter().any(|s| matches!(s, Operand::AccumReg(_)));
         let has_acc_dest = matches!(&op.dest, Some(Operand::AccumReg(_)));
 
         if has_acc_source && has_acc_dest {
             // Accum -> Accum (bm or cm move).
-            let src_reg = op.sources.iter().find_map(|s| match s {
-                Operand::AccumReg(r) => Some(*r),
-                _ => None,
-            }).unwrap_or(0);
-            let is_half = matches!(op.accum_width,
-                Some(crate::interpreter::decode::register_map::AccumWidth::Half));
+            let src_reg = op
+                .sources
+                .iter()
+                .find_map(|s| match s {
+                    Operand::AccumReg(r) => Some(*r),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let is_half =
+                matches!(op.accum_width, Some(crate::interpreter::decode::register_map::AccumWidth::Half));
             if !is_half {
                 // Accumulator move: vmov cm_dst, cm_src
                 let data = ctx.accumulator.read_wide(src_reg);
@@ -651,8 +681,10 @@ impl VectorAlu {
             // Handle both vector and accumulator clears.
             let has_acc_dest = matches!(&op.dest, Some(Operand::AccumReg(_)));
             if has_acc_dest {
-                let is_half = matches!(op.accum_width,
-                    Some(crate::interpreter::decode::register_map::AccumWidth::Half));
+                let is_half = matches!(
+                    op.accum_width,
+                    Some(crate::interpreter::decode::register_map::AccumWidth::Half)
+                );
                 if !is_half {
                     Self::write_wide_acc_dest(op, ctx, [0u64; 16]);
                 } else {
@@ -677,7 +709,11 @@ impl VectorAlu {
     pub(super) fn expand_select_mask(sel: u32, elem_type: ElementType) -> [u32; 8] {
         let mut mask = [0u32; 8];
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
+            ElementType::Int32
+            | ElementType::UInt32
+            | ElementType::Int64
+            | ElementType::UInt64
+            | ElementType::Float32 => {
                 // 8 elements, 1 bit each
                 for i in 0..8 {
                     mask[i] = if (sel >> i) & 1 != 0 { 1 } else { 0 };
@@ -753,7 +789,8 @@ mod tests {
     fn test_vector_shuffle_overflow_mode() {
         // mode >= 48: mask overflows, only byte 0 of lo passes through
         let mut ctx = make_ctx();
-        ctx.vector.write_wide(0, [0xDEADBEEF, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        ctx.vector
+            .write_wide(0, [0xDEADBEEF, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
         ctx.vector.write_wide(2, [0xFF; 16]);
         ctx.scalar.write(3, 50); // mode 50 >= 48
 
@@ -779,12 +816,14 @@ mod tests {
     #[test]
     fn test_wide_vector_push_lo_32() {
         let mut src = [0u32; 16];
-        for i in 0..16 { src[i] = (i as u32 + 1) * 100; }
+        for i in 0..16 {
+            src[i] = (i as u32 + 1) * 100;
+        }
         let result = VectorAlu::wide_vector_push(&src, 0xDEAD_BEEF_u64, false, ElementType::Int32);
-        assert_eq!(result[0],  0xDEAD_BEEF, "inserted value at lo end");
-        assert_eq!(result[1],  100,         "former element 0 shifted to 1");
-        assert_eq!(result[8],  800,         "former element 7 crossed 256-bit boundary");
-        assert_eq!(result[15], 1500,        "former element 14 at high end");
+        assert_eq!(result[0], 0xDEAD_BEEF, "inserted value at lo end");
+        assert_eq!(result[1], 100, "former element 0 shifted to 1");
+        assert_eq!(result[8], 800, "former element 7 crossed 256-bit boundary");
+        assert_eq!(result[15], 1500, "former element 14 at high end");
     }
 
     /// vpush.hi: scalar inserted at the highest position, existing elements
@@ -792,11 +831,13 @@ mod tests {
     #[test]
     fn test_wide_vector_push_hi_32() {
         let mut src = [0u32; 16];
-        for i in 0..16 { src[i] = (i as u32 + 1) * 100; }
+        for i in 0..16 {
+            src[i] = (i as u32 + 1) * 100;
+        }
         let result = VectorAlu::wide_vector_push(&src, 0xCAFE_BABE_u64, true, ElementType::Int32);
-        assert_eq!(result[0],  200,         "former element 1 shifted to 0");
-        assert_eq!(result[7],  900,         "former element 8 crossed boundary to 7");
-        assert_eq!(result[14], 1600,        "former element 15 at second-to-last");
+        assert_eq!(result[0], 200, "former element 1 shifted to 0");
+        assert_eq!(result[7], 900, "former element 8 crossed boundary to 7");
+        assert_eq!(result[14], 1600, "former element 15 at second-to-last");
         assert_eq!(result[15], 0xCAFE_BABE, "inserted value at hi end");
     }
 
@@ -804,7 +845,9 @@ mod tests {
     #[test]
     fn test_wide_vector_push_lo_64() {
         let mut src = [0u32; 16];
-        for i in 0..16 { src[i] = (i as u32 + 1) * 100; }
+        for i in 0..16 {
+            src[i] = (i as u32 + 1) * 100;
+        }
         let result = VectorAlu::wide_vector_push(&src, 0x1234_5678_ABCD_EF00_u64, false, ElementType::Int64);
         // Low 32 bits at word 0, high 32 bits at word 1.
         assert_eq!(result[0], 0xABCD_EF00, "64-bit value low word");
@@ -818,7 +861,9 @@ mod tests {
     #[test]
     fn test_wide_vector_push_hi_64() {
         let mut src = [0u32; 16];
-        for i in 0..16 { src[i] = (i as u32 + 1) * 100; }
+        for i in 0..16 {
+            src[i] = (i as u32 + 1) * 100;
+        }
         let result = VectorAlu::wide_vector_push(&src, 0xDEAD_BEEF_CAFE_0000_u64, true, ElementType::Int64);
         // High 8 bytes = inserted value.
         assert_eq!(result[14], 0xCAFE_0000, "64-bit value low word at hi end");
@@ -843,7 +888,7 @@ mod tests {
     fn test_extract_wide_element_16bit() {
         let mut src = [0u32; 16];
         src[8] = 0xBEEF_DEAD; // lo16 = 0xDEAD, hi16 = 0xBEEF
-        // UInt16: no sign extension, raw 16-bit value
+                              // UInt16: no sign extension, raw 16-bit value
         let val = VectorAlu::extract_wide_element(&src, 17, ElementType::UInt16);
         assert_eq!(val, 0xBEEF);
         // Int16: sign-extended (0xBEEF is negative as i16)
@@ -909,7 +954,7 @@ mod tests {
         let mut src1 = [0u32; 16];
         let mut src2 = [0u32; 16];
         src1[15] = 0xAAAA_AAAA; // last word of src1
-        src2[0]  = 0xBBBB_BBBB; // first word of src2
+        src2[0] = 0xBBBB_BBBB; // first word of src2
         let result = VectorAlu::wide_vector_shift(&src1, &src2, 0, 60);
         assert_eq!(result[0], 0xAAAA_AAAA, "last word of src1 at result[0]");
         assert_eq!(result[1], 0xBBBB_BBBB, "first word of src2 at result[1]");

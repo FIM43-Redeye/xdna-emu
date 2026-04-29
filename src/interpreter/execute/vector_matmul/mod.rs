@@ -66,10 +66,7 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let conf_val = match get_config_reg(op, ctx) {
         Some(v) => v,
         None => {
-            log::error!(
-                "[MATMUL] no config register found in sources for {:?}",
-                op.encoding_name
-            );
+            log::error!("[MATMUL] no config register found in sources for {:?}", op.encoding_name);
             return true; // Handled (as error), don't fall through.
         }
     };
@@ -126,9 +123,12 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // VADDMSC/VSUBMSC (AddMac/SubMac + MSC): the subtract flag wasn't
     // flipped above (AddMac/SubMac not in the match), but MSC needs it.
     if let Some(ref name) = op.encoding_name {
-        if name.contains("msc") && matches!(semantic,
-            SemanticOp::NegMul | SemanticOp::NegMatMul
-            | SemanticOp::AddMac | SemanticOp::SubMac) {
+        if name.contains("msc")
+            && matches!(
+                semantic,
+                SemanticOp::NegMul | SemanticOp::NegMatMul | SemanticOp::AddMac | SemanticOp::SubMac
+            )
+        {
             config.subtract = !config.subtract;
         }
     }
@@ -161,9 +161,17 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // separate $dst and $acc1 fields -- when they differ, the hardware reads
     // from acc1 and writes to dst.  For tied instructions (dst == acc1), the
     // first AccumReg source IS the same register as dest.
-    let acc_src = op.sources.iter().find_map(|s| {
-        if let Operand::AccumReg(r) = s { Some(*r) } else { None }
-    }).unwrap_or(acc_dest);
+    let acc_src = op
+        .sources
+        .iter()
+        .find_map(|s| {
+            if let Operand::AccumReg(r) = s {
+                Some(*r)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(acc_dest);
 
     let mut acc = if is_half {
         // bm (512-bit): read single register, pad to 1024-bit working buffer.
@@ -227,9 +235,7 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         // is_msc XOR is_neg gives the correct mdm bit for all variants.
         // VNEGMSC gets MatMulSub (not NegMul) because HW testing shows
         // it produces acc - products (same sign as VMSC).
-        let is_msc = op.encoding_name.as_ref()
-            .map(|n| n.contains("msc"))
-            .unwrap_or(false);
+        let is_msc = op.encoding_name.as_ref().map(|n| n.contains("msc")).unwrap_or(false);
         let is_neg = matches!(semantic, SemanticOp::NegMul | SemanticOp::NegMatMul);
         let sub0 = is_msc ^ is_neg;
         let sub1 = is_neg;
@@ -253,17 +259,11 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         };
 
         // Use the hardware-faithful vmac pipeline.
-        acc = super::vmac_hw::sparse_vmac(
-            &a_bytes, &b_register, mask,
-            &acc, &scd, conf_val, sub0, sub1, sub2,
-        );
+        acc =
+            super::vmac_hw::sparse_vmac(&a_bytes, &b_register, mask, &acc, &scd, conf_val, sub0, sub1, sub2);
     } else {
         let (a, b) = get_two_vec512(op, ctx);
-        matmul_config_driven(
-            &mut acc, &a, &b, &config,
-            acc2_for_bfloat.as_ref(),
-            is_sub_acc2,
-        );
+        matmul_config_driven(&mut acc, &a, &b, &config, acc2_for_bfloat.as_ref(), is_sub_acc2);
     }
 
     // For integer AddMac/SubMac: merge acc2 AFTER the multiply.
@@ -347,16 +347,13 @@ fn get_config_reg(op: &SlotOp, ctx: &ExecutionContext) -> Option<u32> {
 /// (already decoded as even indices: x0->0, x2->2, etc.). We read the full
 /// 512-bit value via `read_wide`.
 fn get_two_vec512(op: &SlotOp, ctx: &ExecutionContext) -> (Vec512, Vec512) {
-    let mut vregs = op
-        .sources
-        .iter()
-        .filter_map(|s| {
-            if let Operand::VectorReg(r) = s {
-                Some(*r)
-            } else {
-                None
-            }
-        });
+    let mut vregs = op.sources.iter().filter_map(|s| {
+        if let Operand::VectorReg(r) = s {
+            Some(*r)
+        } else {
+            None
+        }
+    });
 
     let a_reg = vregs.next().unwrap_or_else(|| {
         log::error!("[MATMUL] missing first VectorReg source");
@@ -411,10 +408,7 @@ fn get_acc_dest(op: &SlotOp) -> (u8, bool) {
             }
         }
         other => {
-            log::error!(
-                "[MATMUL] expected AccumReg dest, got {:?} -- defaulting to cm0",
-                other
-            );
+            log::error!("[MATMUL] expected AccumReg dest, got {:?} -- defaulting to cm0", other);
             (0, false)
         }
     }
@@ -442,9 +436,7 @@ fn get_acc_source(op: &SlotOp) -> u8 {
             return *r;
         }
     }
-    log::error!(
-        "[MATMUL] no AccumReg found in sources -- defaulting to cm0"
-    );
+    log::error!("[MATMUL] no AccumReg found in sources -- defaulting to cm0");
     0
 }
 
@@ -560,7 +552,9 @@ pub fn matmul_sparse_config_driven(
         let mut count = 0;
         for b in 0..4u8 {
             if (nibble >> b) & 1 != 0 {
-                if count == n { return Some(b as usize); }
+                if count == n {
+                    return Some(b as usize);
+                }
                 count += 1;
             }
         }
@@ -572,7 +566,9 @@ pub fn matmul_sparse_config_driven(
         // (2 bf16 elements). The inner_k derivation is the same as integer.
         for g in 0..num_groups {
             let mask4 = ((mask >> (4 * g)) & 0xF) as u8;
-            if mask4.count_ones() > 2 { continue; }
+            if mask4.count_ones() > 2 {
+                continue;
+            }
 
             let block = g / 4;
             let ig = block / 2;
@@ -588,7 +584,9 @@ pub fn matmul_sparse_config_driven(
             for comp_idx in 0..2usize {
                 let b_elem = g * 2 + comp_idx;
                 let b_off = b_elem * 2;
-                if b_off + 1 >= 64 { continue; }
+                if b_off + 1 >= 64 {
+                    continue;
+                }
                 let col = b_elem % cols;
 
                 let b_bits = u16::from_le_bytes([b[b_off], b[b_off + 1]]);
@@ -596,7 +594,9 @@ pub fn matmul_sparse_config_driven(
 
                 for r in 0..rows {
                     let a_off = (r * inner + inner_k) * 2;
-                    if a_off + 1 >= 128 { continue; }
+                    if a_off + 1 >= 128 {
+                        continue;
+                    }
                     let a_bits = u16::from_le_bytes([a[a_off], a[a_off + 1]]);
                     let a_val = f32::from_bits((a_bits as u32) << 16);
 
@@ -622,7 +622,9 @@ pub fn matmul_sparse_config_driven(
     for g in 0..num_groups {
         let mask4 = ((mask >> (4 * g)) & 0xF) as u8;
         // Hardware decode_mask: >2 set bits maps to no-route.
-        if mask4.count_ones() > 2 { continue; }
+        if mask4.count_ones() > 2 {
+            continue;
+        }
 
         // Block-based inner_k derivation (cleanroom, 2026-04-02).
         let block = g / 4;
@@ -717,19 +719,11 @@ pub fn matmul_config_driven(
                 let mut b_elems = Vec::with_capacity(inner);
 
                 for k in 0..inner {
-                    let elem_idx = if is_elemwise {
-                        r + k * 16
-                    } else {
-                        r * inner + k
-                    };
+                    let elem_idx = if is_elemwise { r + k * 16 } else { r * inner + k };
                     let a_word = elem_idx / 2;
                     let a_half = elem_idx % 2;
 
-                    let b_elem_idx = if is_elemwise {
-                        r + k * 16
-                    } else {
-                        k * cols + c
-                    };
+                    let b_elem_idx = if is_elemwise { r + k * 16 } else { k * cols + c };
                     let b_word = b_elem_idx / 2;
                     let b_half = b_elem_idx % 2;
 
@@ -738,17 +732,9 @@ pub fn matmul_config_driven(
                 }
 
                 let prev_bits = read_acc_wide_f32(acc, out_idx).to_bits();
-                let lane_acc2 = acc2_data.map(|a2| {
-                    read_acc_wide_f32(a2, out_idx).to_bits()
-                });
-                let result = bf16_mac_hw_lane(
-                    prev_bits,
-                    &a_elems,
-                    &b_elems,
-                    config.subtract,
-                    lane_acc2,
-                    sub_acc2,
-                );
+                let lane_acc2 = acc2_data.map(|a2| read_acc_wide_f32(a2, out_idx).to_bits());
+                let result =
+                    bf16_mac_hw_lane(prev_bits, &a_elems, &b_elems, config.subtract, lane_acc2, sub_acc2);
                 write_acc_wide_f32(acc, out_idx, f32::from_bits(result));
             }
         }
@@ -897,12 +883,7 @@ fn matmul_i16xi16_32(
 /// bf16 x bf16 matrix multiply with fp32 accumulator.
 ///
 /// Geometry: A[4][4] * B[4][4] = C[4][4], 16 output fp32 values.
-fn matmul_bf16xbf16(
-    acc: &mut [u64; 8],
-    a: &[u32; 8],
-    b: &[u32; 8],
-    subtract: bool,
-) {
+fn matmul_bf16xbf16(acc: &mut [u64; 8], a: &[u32; 8], b: &[u32; 8], subtract: bool) {
     let geom = TileGeometry { rows: 4, inner: 4, cols: 4 };
 
     for r in 0..geom.rows {
@@ -976,7 +957,6 @@ fn matmul_i32xi16(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1048,11 +1028,7 @@ mod tests {
                 let out_idx = r * 4 + c;
                 let expected = (r * 4 + c + 1) as i64;
                 let actual = read_acc32(&acc, out_idx);
-                assert_eq!(
-                    actual, expected,
-                    "C[{}][{}]: expected {}, got {}",
-                    r, c, expected, actual
-                );
+                assert_eq!(actual, expected, "C[{}][{}]: expected {}, got {}", r, c, expected, actual);
             }
         }
     }
@@ -1070,12 +1046,7 @@ mod tests {
         for r in 0..4 {
             for c in 0..4 {
                 let out_idx = r * 4 + c;
-                assert_eq!(
-                    read_acc32(&acc, out_idx),
-                    8,
-                    "C[{}][{}] should be 8",
-                    r, c
-                );
+                assert_eq!(read_acc32(&acc, out_idx), 8, "C[{}][{}] should be 8", r, c);
             }
         }
     }
@@ -1098,7 +1069,8 @@ mod tests {
                     read_acc32(&acc, out_idx),
                     16,
                     "C[{}][{}] should be 16 after two accumulations",
-                    r, c
+                    r,
+                    c
                 );
             }
         }
@@ -1266,7 +1238,10 @@ mod tests {
                 assert!(
                     (actual - expected).abs() < 0.01,
                     "C[{}][{}]: expected {}, got {}",
-                    r, c, expected, actual
+                    r,
+                    c,
+                    expected,
+                    actual
                 );
             }
         }
@@ -1286,11 +1261,7 @@ mod tests {
 
         for idx in 0..16 {
             let actual = read_acc_f32(&acc, idx);
-            assert!(
-                (actual - 4.0).abs() < 0.01,
-                "Output[{}]: expected 4.0, got {}",
-                idx, actual
-            );
+            assert!((actual - 4.0).abs() < 0.01, "Output[{}]: expected 4.0, got {}", idx, actual);
         }
     }
 
@@ -1309,11 +1280,7 @@ mod tests {
 
         for idx in 0..16 {
             let actual = read_acc_f32(&acc, idx);
-            assert!(
-                (actual - 8.0).abs() < 0.01,
-                "Output[{}]: expected 8.0, got {}",
-                idx, actual
-            );
+            assert!((actual - 8.0).abs() < 0.01, "Output[{}]: expected 8.0, got {}", idx, actual);
         }
     }
 
@@ -1333,11 +1300,7 @@ mod tests {
 
         for idx in 0..16 {
             let actual = read_acc_f32(&acc, idx);
-            assert!(
-                actual.abs() < 0.01,
-                "Output[{}]: expected 0.0, got {}",
-                idx, actual
-            );
+            assert!(actual.abs() < 0.01, "Output[{}]: expected 0.0, got {}", idx, actual);
         }
     }
 
@@ -1412,11 +1375,7 @@ mod tests {
 
         for idx in 0..16 {
             let actual = read_acc_f32(&acc, idx);
-            assert!(
-                (actual - 24.0).abs() < 0.1,
-                "Output[{}]: expected 24.0, got {}",
-                idx, actual
-            );
+            assert!((actual - 24.0).abs() < 0.1, "Output[{}]: expected 24.0, got {}", idx, actual);
         }
     }
 
@@ -1485,11 +1444,7 @@ mod tests {
 
         ctx.scalar.write(5, config_i8xi8_accumulate());
 
-        let op = make_mac_op(
-            SemanticOp::Mac,
-            0, 2, 5, 0,
-            None,
-        );
+        let op = make_mac_op(SemanticOp::Mac, 0, 2, 5, 0, None);
 
         let handled = execute_matmul(&op, &mut ctx);
         assert!(handled, "execute_matmul should handle Mac semantic");
@@ -1500,11 +1455,7 @@ mod tests {
             let lane = i / 2;
             let half = i % 2;
             let val = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as i32;
-            assert_eq!(
-                val, 8,
-                "output[{}]: expected 8, got {}",
-                i, val
-            );
+            assert_eq!(val, 8, "output[{}]: expected 8, got {}", i, val);
         }
     }
 
@@ -1519,11 +1470,7 @@ mod tests {
         ctx.vector.write_wide(2, ones);
         ctx.scalar.write(5, config_bf16_accumulate());
 
-        let mut op = make_mac_op(
-            SemanticOp::Mac,
-            0, 2, 5, 0,
-            Some("VMAC_F_vmac_bm_core_dense"),
-        );
+        let mut op = make_mac_op(SemanticOp::Mac, 0, 2, 5, 0, Some("VMAC_F_vmac_bm_core_dense"));
         op.element_type = Some(ElementType::BFloat16);
 
         let handled = execute_matmul(&op, &mut ctx);
@@ -1535,11 +1482,7 @@ mod tests {
             let half = i % 2;
             let bits = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as u32;
             let val = f32::from_bits(bits);
-            assert!(
-                (val - 8.0).abs() < 0.01,
-                "output[{}]: expected 8.0, got {}",
-                i, val
-            );
+            assert!((val - 8.0).abs() < 0.01, "output[{}]: expected 8.0, got {}", i, val);
         }
     }
 
@@ -1554,11 +1497,7 @@ mod tests {
         ctx.vector.write_wide(2, ones);
         ctx.scalar.write(5, config_i8xi8_accumulate());
 
-        let op = make_mac_op(
-            SemanticOp::NegMul,
-            0, 2, 5, 0,
-            None,
-        );
+        let op = make_mac_op(SemanticOp::NegMul, 0, 2, 5, 0, None);
 
         let handled = execute_matmul(&op, &mut ctx);
         assert!(handled);
@@ -1568,11 +1507,7 @@ mod tests {
             let lane = i / 2;
             let half = i % 2;
             let val = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as u32 as i32;
-            assert_eq!(
-                val, -8,
-                "output[{}]: expected -8, got {}",
-                i, val
-            );
+            assert_eq!(val, -8, "output[{}]: expected -8, got {}", i, val);
         }
     }
 
@@ -1591,11 +1526,7 @@ mod tests {
         ctx.vector.write_wide(2, ones);
         ctx.scalar.write(5, config_i8xi8_zero_acc());
 
-        let op = make_mac_op(
-            SemanticOp::Mac,
-            0, 2, 5, 0,
-            None,
-        );
+        let op = make_mac_op(SemanticOp::Mac, 0, 2, 5, 0, None);
 
         let handled = execute_matmul(&op, &mut ctx);
         assert!(handled);
@@ -1605,11 +1536,7 @@ mod tests {
             let lane = i / 2;
             let half = i % 2;
             let val = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as i32;
-            assert_eq!(
-                val, 8,
-                "output[{}]: expected 8 (zero_acc should clear), got {}",
-                i, val
-            );
+            assert_eq!(val, 8, "output[{}]: expected 8 (zero_acc should clear), got {}", i, val);
         }
     }
 
@@ -1627,15 +1554,15 @@ mod tests {
     #[test]
     fn test_sparse_config_driven_all_zero_b_produces_zero() {
         let mut a = [0u8; 128];
-        for b in a.iter_mut() { *b = 1; }
+        for b in a.iter_mut() {
+            *b = 1;
+        }
         let b = [0u8; 64];
         let mask: u128 = 0x33333333_33333333_33333333_33333333;
         let mut acc = [0u64; 16];
 
-        let config = MatMulConfig::from_config_word(
-            (1 << 3) | (5 << 5) | (1 << 8) | (1 << 9) | 1,
-            false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_config_word((1 << 3) | (5 << 5) | (1 << 8) | (1 << 9) | 1, false).unwrap();
         assert!(config.sparse, "variant=5 should give sparse geometry");
         assert_eq!(config.inner, 16, "sparse i8xi8 inner should be 16");
 
@@ -1656,10 +1583,8 @@ mod tests {
         let mask: u128 = 0x33333333_33333333_33333333_33333333;
         let mut acc = [0u64; 16];
 
-        let config = MatMulConfig::from_config_word(
-            (1 << 3) | (5 << 5) | (1 << 8) | (1 << 9) | 1,
-            false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_config_word((1 << 3) | (5 << 5) | (1 << 8) | (1 << 9) | 1, false).unwrap();
 
         matmul_sparse_config_driven(&mut acc, &a, &b, mask, &config);
 
@@ -1702,11 +1627,7 @@ mod tests {
             let lane = i / 2;
             let half = i % 2;
             let val = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as i32;
-            assert_eq!(
-                val, 0,
-                "sparse output[{}] with zero mask should be 0, got {}",
-                i, val
-            );
+            assert_eq!(val, 0, "sparse output[{}] with zero mask should be 0, got {}", i, val);
         }
     }
 
@@ -1769,7 +1690,8 @@ mod sparse_matmul_tests {
         let config = MatMulConfig::from_config_word(
             (1 << 0) | (0 << 1) | (1 << 3) | (5 << 5) | (1 << 8) | (1 << 9),
             false,
-        ).expect("valid sparse i8xi8 config");
+        )
+        .expect("valid sparse i8xi8 config");
         let mut acc = [0u64; 16];
         matmul_sparse_config_driven(&mut acc, &a, &b, mask, &config);
         for c in 0..8 {
@@ -1783,15 +1705,16 @@ mod sparse_matmul_tests {
     #[test]
     fn test_sparse_bf16_basic() {
         let mut a = [0u8; 128];
-        a[0] = 0x80; a[1] = 0x3F;
-        a[2] = 0x80; a[3] = 0x3F;
+        a[0] = 0x80;
+        a[1] = 0x3F;
+        a[2] = 0x80;
+        a[3] = 0x3F;
         let mut b = [0u8; 64];
-        b[0] = 0x00; b[1] = 0x40;
+        b[0] = 0x00;
+        b[1] = 0x40;
         let mask: u128 = 0x3;
-        let config = MatMulConfig::from_config_word(
-            (1 << 0) | (2 << 5),
-            true,
-        ).expect("valid sparse bf16 config");
+        let config =
+            MatMulConfig::from_config_word((1 << 0) | (2 << 5), true).expect("valid sparse bf16 config");
         let mut acc = [0u64; 16];
         matmul_sparse_config_driven(&mut acc, &a, &b, mask, &config);
         let result_bits = (acc[0] & 0xFFFF_FFFF) as u32;

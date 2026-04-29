@@ -26,9 +26,7 @@ impl VectorAlu {
 
     /// Get a single vector source operand.
     pub(super) fn get_vector_source(op: &SlotOp, ctx: &ExecutionContext, idx: usize) -> [u32; 8] {
-        op.sources
-            .get(idx)
-            .map_or([0; 8], |src| Self::read_vector_operand(src, ctx))
+        op.sources.get(idx).map_or([0; 8], |src| Self::read_vector_operand(src, ctx))
     }
 
     /// Read a vector operand value.
@@ -113,8 +111,7 @@ impl VectorAlu {
     /// - 8-bit elements: 32 lanes -> 32-bit mask (bits [31:0])
     pub(super) fn condense_comparison_mask(value: &[u32; 8], elem_type: Option<ElementType>) -> u32 {
         match elem_type {
-            Some(ElementType::Int32) | Some(ElementType::UInt32)
-            | Some(ElementType::Float32) | None => {
+            Some(ElementType::Int32) | Some(ElementType::UInt32) | Some(ElementType::Float32) | None => {
                 // 8 x 32-bit lanes: one bit per u32 word
                 let mut mask = 0u32;
                 for i in 0..8 {
@@ -124,8 +121,7 @@ impl VectorAlu {
                 }
                 mask
             }
-            Some(ElementType::Int16) | Some(ElementType::UInt16)
-            | Some(ElementType::BFloat16) => {
+            Some(ElementType::Int16) | Some(ElementType::UInt16) | Some(ElementType::BFloat16) => {
                 // 16 x 16-bit lanes: two lanes packed per u32 word
                 let mut mask = 0u32;
                 for i in 0..8 {
@@ -151,10 +147,7 @@ impl VectorAlu {
                 mask
             }
             other => {
-                panic!(
-                    "condense_comparison_mask: unhandled element type {:?}",
-                    other,
-                );
+                panic!("condense_comparison_mask: unhandled element type {:?}", other,);
             }
         }
     }
@@ -166,12 +159,16 @@ impl VectorAlu {
     pub(super) fn pack_comparison_flags(mask: &[u32; 8], elem_type: ElementType) -> u32 {
         let mut flags: u32 = 0;
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32
-            | ElementType::Int64 | ElementType::UInt64
+            ElementType::Int32
+            | ElementType::UInt32
+            | ElementType::Int64
+            | ElementType::UInt64
             | ElementType::Float32 => {
                 // 8 elements of 32-bit
                 for i in 0..8 {
-                    if mask[i] != 0 { flags |= 1 << i; }
+                    if mask[i] != 0 {
+                        flags |= 1 << i;
+                    }
                 }
             }
             ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => {
@@ -180,8 +177,12 @@ impl VectorAlu {
                     let lo = mask[i] & 0xFFFF;
                     let hi = (mask[i] >> 16) & 0xFFFF;
                     let bit = i * 2;
-                    if lo != 0 { flags |= 1 << bit; }
-                    if hi != 0 { flags |= 1 << (bit + 1); }
+                    if lo != 0 {
+                        flags |= 1 << bit;
+                    }
+                    if hi != 0 {
+                        flags |= 1 << (bit + 1);
+                    }
                 }
             }
             ElementType::Int8 | ElementType::UInt8 => {
@@ -190,7 +191,9 @@ impl VectorAlu {
                     for j in 0..4 {
                         let byte = (mask[i] >> (j * 8)) & 0xFF;
                         let bit = i * 4 + j;
-                        if byte != 0 { flags |= 1 << bit; }
+                        if byte != 0 {
+                            flags |= 1 << bit;
+                        }
                     }
                 }
             }
@@ -349,11 +352,15 @@ impl VectorAlu {
         for src in &op.sources {
             match src {
                 Operand::ScalarReg(r) => {
-                    if count == n { return ctx.scalar_read(*r); }
+                    if count == n {
+                        return ctx.scalar_read(*r);
+                    }
                     count += 1;
                 }
                 Operand::Immediate(imm) => {
-                    if count == n { return *imm as u32; }
+                    if count == n {
+                        return *imm as u32;
+                    }
                     count += 1;
                 }
                 _ => {}
@@ -423,10 +430,7 @@ impl VectorAlu {
     }
 
     /// Read two wide vector sources.
-    pub(super) fn get_two_wide_vec_sources(
-        op: &SlotOp,
-        ctx: &ExecutionContext,
-    ) -> (Vec512, Vec512) {
+    pub(super) fn get_two_wide_vec_sources(op: &SlotOp, ctx: &ExecutionContext) -> (Vec512, Vec512) {
         let a = Self::get_wide_vec_source(op, ctx, 0);
         let b = Self::get_wide_vec_source(op, ctx, 1);
         (a, b)
@@ -437,10 +441,7 @@ impl VectorAlu {
         if let Some(Operand::VectorReg(r)) = &op.dest {
             ctx.vector.write_wide(*r, value);
         } else {
-            log::error!(
-                "[VECTOR_WIDE] write_wide_vec_dest: expected VectorReg dest, got {:?}",
-                op.dest
-            );
+            log::error!("[VECTOR_WIDE] write_wide_vec_dest: expected VectorReg dest, got {:?}", op.dest);
         }
     }
 
@@ -606,7 +607,8 @@ impl VectorAlu {
             let overflow_mask = (1u64 << overflow_bits) - 1;
             let hi_val = result[word_idx + 1] as u64;
             let hi_cleared = hi_val & !overflow_mask;
-            let hi_inserted = hi_cleared | (((value as u64) >> (et.bits() as u32 - overflow_bits)) & overflow_mask);
+            let hi_inserted =
+                hi_cleared | (((value as u64) >> (et.bits() as u32 - overflow_bits)) & overflow_mask);
             result[word_idx + 1] = hi_inserted as u32;
         }
         result
@@ -636,8 +638,8 @@ impl VectorAlu {
         for i in 0..16 {
             let aw = a_orig[i].to_le_bytes();
             let bw = b[i].to_le_bytes();
-            a_bytes[i*4..i*4+4].copy_from_slice(&aw);
-            b_bytes[i*4..i*4+4].copy_from_slice(&bw);
+            a_bytes[i * 4..i * 4 + 4].copy_from_slice(&aw);
+            b_bytes[i * 4..i * 4 + 4].copy_from_slice(&bw);
         }
 
         // Step 1: vshift_mask -- decompose shift register value.
@@ -657,10 +659,10 @@ impl VectorAlu {
         if step_val >= 1 && step_val <= 4 {
             // Pre-shift a right by 2^(step+1) bytes = {4, 8, 16, 32} bytes.
             let pre_shift_bits = match step_val {
-                1 => 32,   // 4 bytes
-                2 => 64,   // 8 bytes
-                3 => 128,  // 16 bytes
-                4 => 256,  // 32 bytes
+                1 => 32,  // 4 bytes
+                2 => 64,  // 8 bytes
+                3 => 128, // 16 bytes
+                4 => 256, // 32 bytes
                 _ => 0,
             };
             // Right-shift a_orig by pre_shift_bits as a 512-bit value.
@@ -685,9 +687,13 @@ impl VectorAlu {
         for i in 0..64 {
             let a_sel = (maska_64 >> i) & 1;
             let b_sel = (maskb_64 >> i) & 1;
-            c_bytes[i] = if a_sel != 0 { a_active[i] }
-                         else if b_sel != 0 { b_bytes[i] }
-                         else { 0 };
+            c_bytes[i] = if a_sel != 0 {
+                a_active[i]
+            } else if b_sel != 0 {
+                b_bytes[i]
+            } else {
+                0
+            };
         }
 
         // Step 4: Progressive barrel shift using shift[5:0] bit by bit.
@@ -728,7 +734,10 @@ impl VectorAlu {
         let mut result = [0u32; 16];
         for i in 0..16 {
             result[i] = u32::from_le_bytes([
-                c_bytes[i*4], c_bytes[i*4+1], c_bytes[i*4+2], c_bytes[i*4+3]
+                c_bytes[i * 4],
+                c_bytes[i * 4 + 1],
+                c_bytes[i * 4 + 2],
+                c_bytes[i * 4 + 3],
             ]);
         }
         result
@@ -891,10 +900,7 @@ mod tests {
     #[test]
     fn test_condense_mask_32bit_none_set() {
         let value = [0u32; 8];
-        assert_eq!(
-            VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int32)),
-            0x00,
-        );
+        assert_eq!(VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int32)), 0x00,);
     }
 
     #[test]
@@ -904,10 +910,7 @@ mod tests {
         for i in (0..8).step_by(2) {
             value[i] = 0xFFFF_FFFF;
         }
-        assert_eq!(
-            VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int32)),
-            0b0101_0101,
-        );
+        assert_eq!(VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int32)), 0b0101_0101,);
     }
 
     #[test]
@@ -924,10 +927,7 @@ mod tests {
     fn test_condense_mask_32bit_none_element_type() {
         // None element type should behave like 32-bit
         let value = [0xFFFF_FFFF; 8];
-        assert_eq!(
-            VectorAlu::condense_comparison_mask(&value, None),
-            0xFF,
-        );
+        assert_eq!(VectorAlu::condense_comparison_mask(&value, None), 0xFF,);
     }
 
     // ========== Comparison Masks (16-bit elements) ==========
@@ -935,10 +935,7 @@ mod tests {
     #[test]
     fn test_condense_mask_16bit_all_set() {
         let value = [0xFFFF_FFFF; 8]; // all 16 lanes set
-        assert_eq!(
-            VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int16)),
-            0xFFFF,
-        );
+        assert_eq!(VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int16)), 0xFFFF,);
     }
 
     #[test]
@@ -968,10 +965,7 @@ mod tests {
     #[test]
     fn test_condense_mask_8bit_all_set() {
         let value = [0xFFFF_FFFF; 8]; // all 32 lanes set
-        assert_eq!(
-            VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int8)),
-            0xFFFF_FFFF,
-        );
+        assert_eq!(VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int8)), 0xFFFF_FFFF,);
     }
 
     #[test]
@@ -979,10 +973,7 @@ mod tests {
         // Only byte 0 in each word is set
         let value = [0x0000_00FF; 8];
         // Lanes 0, 4, 8, 12, 16, 20, 24, 28
-        assert_eq!(
-            VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int8)),
-            0x1111_1111,
-        );
+        assert_eq!(VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int8)), 0x1111_1111,);
     }
 
     // ========== pack_comparison_flags ==========
@@ -1012,14 +1003,8 @@ mod tests {
         let mut src = [0u32; 16];
         src[0] = 0xDEAD_BEEF;
         src[5] = 0xCAFE_BABE;
-        assert_eq!(
-            VectorAlu::extract_wide_element(&src, 0, ElementType::Int32),
-            0xDEAD_BEEF,
-        );
-        assert_eq!(
-            VectorAlu::extract_wide_element(&src, 5, ElementType::Int32),
-            0xCAFE_BABE,
-        );
+        assert_eq!(VectorAlu::extract_wide_element(&src, 0, ElementType::Int32), 0xDEAD_BEEF,);
+        assert_eq!(VectorAlu::extract_wide_element(&src, 5, ElementType::Int32), 0xCAFE_BABE,);
     }
 
     #[test]
@@ -1027,14 +1012,8 @@ mod tests {
         let mut src = [0u32; 16];
         // Word 0 = 0x0002_0001 -> element 0 = 0x0001, element 1 = 0x0002
         src[0] = 0x0002_0001;
-        assert_eq!(
-            VectorAlu::extract_wide_element(&src, 0, ElementType::UInt16),
-            0x0001,
-        );
-        assert_eq!(
-            VectorAlu::extract_wide_element(&src, 1, ElementType::UInt16),
-            0x0002,
-        );
+        assert_eq!(VectorAlu::extract_wide_element(&src, 0, ElementType::UInt16), 0x0001,);
+        assert_eq!(VectorAlu::extract_wide_element(&src, 1, ElementType::UInt16), 0x0002,);
     }
 
     #[test]
@@ -1043,10 +1022,7 @@ mod tests {
         // Word 0: bytes [0x01, 0xFF, 0x7F, 0x80]
         src[0] = 0x807F_FF01;
         // Element 0 = 0x01 (signed: 1)
-        assert_eq!(
-            VectorAlu::extract_wide_element(&src, 0, ElementType::Int8),
-            1,
-        );
+        assert_eq!(VectorAlu::extract_wide_element(&src, 0, ElementType::Int8), 1,);
         // Element 1 = 0xFF (signed: -1, sign-extended to u64)
         assert_eq!(
             VectorAlu::extract_wide_element(&src, 1, ElementType::Int8) as u32,
@@ -1060,10 +1036,7 @@ mod tests {
         // Element 0 at words [0, 1]: lo=0xAAAA, hi=0xBBBB
         src[0] = 0xAAAA_AAAA;
         src[1] = 0xBBBB_BBBB;
-        assert_eq!(
-            VectorAlu::extract_wide_element(&src, 0, ElementType::Int64),
-            0xBBBB_BBBB_AAAA_AAAA,
-        );
+        assert_eq!(VectorAlu::extract_wide_element(&src, 0, ElementType::Int64), 0xBBBB_BBBB_AAAA_AAAA,);
     }
 
     #[test]
@@ -1110,7 +1083,7 @@ mod tests {
     fn test_insert_wide_element_64bit() {
         let src = [0u32; 16];
         let result = VectorAlu::insert_wide_element_64(&src, 2, 0xAAAA_1111, 0xBBBB_2222);
-        assert_eq!(result[4], 0xAAAA_1111);   // element 2 -> words [4, 5]
+        assert_eq!(result[4], 0xAAAA_1111); // element 2 -> words [4, 5]
         assert_eq!(result[5], 0xBBBB_2222);
     }
 
@@ -1156,7 +1129,9 @@ mod tests {
         // Simple identity function applied to both halves
         fn negate(v: &[u32; 8], _et: ElementType) -> [u32; 8] {
             let mut r = [0u32; 8];
-            for i in 0..8 { r[i] = !v[i]; }
+            for i in 0..8 {
+                r[i] = !v[i];
+            }
             r
         }
 
@@ -1173,7 +1148,9 @@ mod tests {
     fn test_wide_element_wise_binary() {
         fn add_32(a: &[u32; 8], b: &[u32; 8], _et: ElementType) -> [u32; 8] {
             let mut r = [0u32; 8];
-            for i in 0..8 { r[i] = a[i].wrapping_add(b[i]); }
+            for i in 0..8 {
+                r[i] = a[i].wrapping_add(b[i]);
+            }
             r
         }
 
@@ -1205,7 +1182,9 @@ mod tests {
     fn test_wide_shift_by_4_bytes() {
         // Shift by 4 bytes = rotate c by 4 bytes (1 word)
         let mut a = [0u32; 16];
-        for i in 0..16 { a[i] = i as u32; }
+        for i in 0..16 {
+            a[i] = i as u32;
+        }
         let b = [0u32; 16];
         let result = VectorAlu::wide_vector_shift(&a, &b, 0, 4);
         // After shifting a by 4 bytes: word[0] should contain what was word[1]
@@ -1238,19 +1217,13 @@ mod tests {
 
     #[test]
     fn test_read_vector_operand_immediate_broadcast() {
-        let result = VectorAlu::read_vector_operand(
-            &Operand::Immediate(42),
-            &ExecutionContext::new(),
-        );
+        let result = VectorAlu::read_vector_operand(&Operand::Immediate(42), &ExecutionContext::new());
         assert_eq!(result, [42u32; 8]);
     }
 
     #[test]
     fn test_read_vector_operand_unexpected_returns_zeros() {
-        let result = VectorAlu::read_vector_operand(
-            &Operand::PointerReg(0),
-            &ExecutionContext::new(),
-        );
+        let result = VectorAlu::read_vector_operand(&Operand::PointerReg(0), &ExecutionContext::new());
         assert_eq!(result, [0u32; 8]);
     }
 
@@ -1297,11 +1270,7 @@ mod tests {
         let mut ctx = ExecutionContext::new();
         ctx.scalar.write(5, 0xCC00_FF19);
         let mut op = SlotOp::nop(SlotIndex::Vector);
-        op.sources = smallvec![
-            Operand::VectorReg(0),
-            Operand::VectorReg(1),
-            Operand::ScalarReg(5),
-        ];
+        op.sources = smallvec![Operand::VectorReg(0), Operand::VectorReg(1), Operand::ScalarReg(5),];
         assert_eq!(VectorAlu::get_config_register(&op, &ctx), Some(0xCC00_FF19));
     }
 
@@ -1360,11 +1329,7 @@ mod tests {
         ctx.scalar.write(2, 100);
         ctx.scalar.write(4, 200);
         let mut op = SlotOp::nop(SlotIndex::Vector);
-        op.sources = smallvec![
-            Operand::VectorReg(0),
-            Operand::ScalarReg(2),
-            Operand::ScalarReg(4),
-        ];
+        op.sources = smallvec![Operand::VectorReg(0), Operand::ScalarReg(2), Operand::ScalarReg(4),];
         assert_eq!(VectorAlu::get_nth_scalar_source(&op, &ctx, 0), 100);
         assert_eq!(VectorAlu::get_nth_scalar_source(&op, &ctx, 1), 200);
     }

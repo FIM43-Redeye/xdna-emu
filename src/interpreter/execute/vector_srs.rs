@@ -61,10 +61,7 @@ fn srs_round(mode: RoundingMode, sgn: bool, lsb: bool, grd: bool, stk: bool) -> 
     // "symmetric" modes use sign to decide direction.
     let symmetric = matches!(
         mode,
-        RoundingMode::SymFloor
-            | RoundingMode::SymCeil
-            | RoundingMode::SymInf
-            | RoundingMode::SymZero
+        RoundingMode::SymFloor | RoundingMode::SymCeil | RoundingMode::SymInf | RoundingMode::SymZero
     );
 
     // "otherdir" modes round in the opposite direction from the default.
@@ -234,11 +231,7 @@ fn truncate_to_width(value: i128, signed: bool, bits: u32) -> i64 {
     if bits == 0 {
         return 0;
     }
-    let mask = if bits >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << bits) - 1
-    };
+    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
     let truncated = (value as u64) & mask;
 
     if signed && bits < 64 {
@@ -266,9 +259,11 @@ impl VectorAlu {
     /// Handles both narrow (256-bit) and wide (512-bit / 1024-bit) paths,
     /// including AccumWidth detection for Half vs Full accumulator sources.
     pub(super) fn execute_srs(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
-        let has_wide_acc_source = matches!(op.accum_width,
+        let has_wide_acc_source = matches!(
+            op.accum_width,
             Some(crate::interpreter::decode::register_map::AccumWidth::Full)
-            | Some(crate::interpreter::decode::register_map::AccumWidth::Half));
+                | Some(crate::interpreter::decode::register_map::AccumWidth::Half)
+        );
 
         if op.is_wide_vector || has_wide_acc_source {
             Self::execute_srs_wide(op, ctx, et)
@@ -294,8 +289,8 @@ impl VectorAlu {
         let from = op.from_type.unwrap_or(ElementType::Int64);
         // Half (bml/bmh) is 512-bit = single bm register, use narrow
         // read. Full (cm) and None (legacy/wide default) use read_wide.
-        let is_half = matches!(op.accum_width,
-            Some(crate::interpreter::decode::register_map::AccumWidth::Half));
+        let is_half =
+            matches!(op.accum_width, Some(crate::interpreter::decode::register_map::AccumWidth::Half));
 
         if !is_half {
             // Wide SRS: read Acc1024 (cm-register), SRS each half,
@@ -371,8 +366,7 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         // Read rounding and saturation from the SRS control register state.
-        let mode = RoundingMode::from_raw(cfg.rounding_mode)
-            .unwrap_or(RoundingMode::PosInf);
+        let mode = RoundingMode::from_raw(cfg.rounding_mode).unwrap_or(RoundingMode::PosInf);
         let saturate = cfg.saturate();
         let sym_sat = cfg.symmetric_saturate();
 
@@ -397,10 +391,7 @@ impl VectorAlu {
             ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
                 for i in 0..8 {
                     let val = mask_value(acc[i]);
-                    let out = srs_lane(
-                        val, shift, signed_output, 32,
-                        saturate, sym_sat, mode,
-                    );
+                    let out = srs_lane(val, shift, signed_output, 32, saturate, sym_sat, mode);
                     result[i] = out as u32;
                 }
             }
@@ -411,14 +402,8 @@ impl VectorAlu {
                     for i in 0..4 {
                         let val0 = mask_value(acc[i * 2]);
                         let val1 = mask_value(acc[i * 2 + 1]);
-                        let out0 = srs_lane(
-                            val0, shift, signed_output, 16,
-                            saturate, sym_sat, mode,
-                        );
-                        let out1 = srs_lane(
-                            val1, shift, signed_output, 16,
-                            saturate, sym_sat, mode,
-                        );
+                        let out0 = srs_lane(val0, shift, signed_output, 16, saturate, sym_sat, mode);
+                        let out1 = srs_lane(val1, shift, signed_output, 16, saturate, sym_sat, mode);
                         result[i] = (out0 as u16 as u32) | ((out1 as u16 as u32) << 16);
                     }
                 } else {
@@ -428,14 +413,8 @@ impl VectorAlu {
                     for i in 0..8 {
                         let lo_val = mask_value(acc[i] & 0xFFFF_FFFF);
                         let hi_val = mask_value(acc[i] >> 32);
-                        let out_lo = srs_lane(
-                            lo_val, shift, signed_output, 16,
-                            saturate, sym_sat, mode,
-                        );
-                        let out_hi = srs_lane(
-                            hi_val, shift, signed_output, 16,
-                            saturate, sym_sat, mode,
-                        );
+                        let out_lo = srs_lane(lo_val, shift, signed_output, 16, saturate, sym_sat, mode);
+                        let out_hi = srs_lane(hi_val, shift, signed_output, 16, saturate, sym_sat, mode);
                         result[i] = (out_lo as u16 as u32) | ((out_hi as u16 as u32) << 16);
                     }
                 }
@@ -455,10 +434,7 @@ impl VectorAlu {
                             acc[u64_idx] & 0xFFFF_FFFF
                         };
                         let val = mask_value(raw);
-                        let out = srs_lane(
-                            val, shift, signed_output, 8,
-                            saturate, sym_sat, mode,
-                        );
+                        let out = srs_lane(val, shift, signed_output, 8, saturate, sym_sat, mode);
                         word |= (out as u8 as u32) << (j * 8);
                     }
                     result[i] = word;
@@ -945,12 +921,7 @@ mod tests {
     #[test]
     fn from_raw_reserved_modes() {
         for i in [4, 5, 6, 7, 14, 15, 16, 255] {
-            assert_eq!(
-                RoundingMode::from_raw(i),
-                None,
-                "index {} should be None",
-                i
-            );
+            assert_eq!(RoundingMode::from_raw(i), None, "index {} should be None", i);
         }
     }
 
@@ -996,12 +967,7 @@ mod tests {
             RoundingMode::ConvEven,
             RoundingMode::ConvOdd,
         ] {
-            assert_eq!(
-                srs_s32(exact, 4, mode),
-                16,
-                "mode {:?} should give 16 for exact value",
-                mode
-            );
+            assert_eq!(srs_s32(exact, 4, mode), 16, "mode {:?} should give 16 for exact value", mode);
         }
     }
 
@@ -1224,9 +1190,7 @@ mod integration_tests {
     #[test]
     fn test_vector_srs_from_type_masks_accumulator() {
         let mut ctx = make_ctx();
-        ctx.accumulator.write(0, [
-            0xDEAD_BEEF_0000_0064, 0, 0, 0, 0, 0, 0, 0,
-        ]);
+        ctx.accumulator.write(0, [0xDEAD_BEEF_0000_0064, 0, 0, 0, 0, 0, 0, 0]);
 
         let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
             .as_vector(ElementType::Int16)
@@ -1283,22 +1247,19 @@ mod integration_tests {
             acc[i] = lo | (hi << 32);
         }
 
-        let cfg = SrsConfig {
-            rounding_mode: 0,
-            saturation_mode: 0,
-            srs_sign: true,
-        };
+        let cfg = SrsConfig { rounding_mode: 0, saturation_mode: 0, srs_sign: true };
 
-        let result = VectorAlu::vector_srs_from_acc(
-            &acc, 0, ElementType::Int32, ElementType::Int16, &cfg,
-        );
+        let result = VectorAlu::vector_srs_from_acc(&acc, 0, ElementType::Int32, ElementType::Int16, &cfg);
 
         for i in 0..8 {
             let expected_lo = (100 + i * 2) as u16;
             let expected_hi = (100 + i * 2 + 1) as u16;
             let expected = (expected_lo as u32) | ((expected_hi as u32) << 16);
-            assert_eq!(result[i], expected, "result[{}]: got {:#010x}, expected {:#010x}",
-                i, result[i], expected);
+            assert_eq!(
+                result[i], expected,
+                "result[{}]: got {:#010x}, expected {:#010x}",
+                i, result[i], expected
+            );
         }
     }
 
@@ -1311,21 +1272,15 @@ mod integration_tests {
         acc[0] = 0x3F80_0000u64 | (0x4000_0000u64 << 32); // lo=1.0, hi=2.0
         acc[1] = 0x4040_0000u64 | (0x4080_0000u64 << 32); // lo=3.0, hi=4.0
 
-        let cfg = SrsConfig {
-            rounding_mode: 0,
-            saturation_mode: 0,
-            srs_sign: true,
-        };
+        let cfg = SrsConfig { rounding_mode: 0, saturation_mode: 0, srs_sign: true };
 
-        let result = VectorAlu::vector_srs_from_acc(
-            &acc, 0, ElementType::Int32, ElementType::BFloat16, &cfg,
-        );
+        let result = VectorAlu::vector_srs_from_acc(&acc, 0, ElementType::Int32, ElementType::BFloat16, &cfg);
 
         // result[0] = bf16(1.0) | bf16(2.0) << 16 = 0x3F80 | 0x4000_0000
         assert_eq!(result[0] & 0xFFFF, 0x3F80); // bf16 for 1.0
-        assert_eq!(result[0] >> 16, 0x4000);     // bf16 for 2.0
-        assert_eq!(result[1] & 0xFFFF, 0x4040);  // bf16 for 3.0
-        assert_eq!(result[1] >> 16, 0x4080);      // bf16 for 4.0
+        assert_eq!(result[0] >> 16, 0x4000); // bf16 for 2.0
+        assert_eq!(result[1] & 0xFFFF, 0x4040); // bf16 for 3.0
+        assert_eq!(result[1] >> 16, 0x4080); // bf16 for 4.0
     }
 
     #[test]
@@ -1335,15 +1290,9 @@ mod integration_tests {
         acc[0] = 0xDEAD_BEEF_3F80_0000; // low 32 = 0x3F800000 (1.0f)
         acc[1] = 0xCAFE_BABE_4000_0000; // low 32 = 0x40000000 (2.0f)
 
-        let cfg = SrsConfig {
-            rounding_mode: 0,
-            saturation_mode: 0,
-            srs_sign: true,
-        };
+        let cfg = SrsConfig { rounding_mode: 0, saturation_mode: 0, srs_sign: true };
 
-        let result = VectorAlu::vector_srs_from_acc(
-            &acc, 0, ElementType::Int32, ElementType::Float32, &cfg,
-        );
+        let result = VectorAlu::vector_srs_from_acc(&acc, 0, ElementType::Int32, ElementType::Float32, &cfg);
 
         assert_eq!(result[0], 0x3F80_0000); // 1.0f
         assert_eq!(result[1], 0x4000_0000); // 2.0f
@@ -1357,15 +1306,9 @@ mod integration_tests {
             acc[i] = (100 + i) as u64;
         }
 
-        let cfg = SrsConfig {
-            rounding_mode: 0,
-            saturation_mode: 0,
-            srs_sign: true,
-        };
+        let cfg = SrsConfig { rounding_mode: 0, saturation_mode: 0, srs_sign: true };
 
-        let result = VectorAlu::vector_srs_from_acc(
-            &acc, 0, ElementType::Int64, ElementType::Int16, &cfg,
-        );
+        let result = VectorAlu::vector_srs_from_acc(&acc, 0, ElementType::Int64, ElementType::Int16, &cfg);
 
         // 8 lanes packed 2 per word = 4 words
         for i in 0..4 {
@@ -1385,15 +1328,9 @@ mod integration_tests {
             acc[i] = lo | (hi << 32);
         }
 
-        let cfg = SrsConfig {
-            rounding_mode: 0,
-            saturation_mode: 0,
-            srs_sign: true,
-        };
+        let cfg = SrsConfig { rounding_mode: 0, saturation_mode: 0, srs_sign: true };
 
-        let result = VectorAlu::vector_srs_from_acc(
-            &acc, 0, ElementType::Int32, ElementType::Int8, &cfg,
-        );
+        let result = VectorAlu::vector_srs_from_acc(&acc, 0, ElementType::Int32, ElementType::Int8, &cfg);
 
         for i in 0..4 {
             let mut expected = 0u32;
@@ -1402,8 +1339,11 @@ mod integration_tests {
                 let val = (10 + lane_idx) as u8;
                 expected |= (val as u32) << (j * 8);
             }
-            assert_eq!(result[i], expected, "result[{}]: got {:#010x}, expected {:#010x}",
-                i, result[i], expected);
+            assert_eq!(
+                result[i], expected,
+                "result[{}]: got {:#010x}, expected {:#010x}",
+                i, result[i], expected
+            );
         }
     }
 }

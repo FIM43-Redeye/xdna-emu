@@ -53,11 +53,7 @@ impl CascadeOps {
     /// Returns `Completed` if handled, `Stall` if blocking, or
     /// `NotCascadeOp` if the operation isn't a cascade instruction (or if
     /// the architecture has no cascade link -- always the case for AIE1).
-    pub fn execute(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        tile: &mut Tile,
-    ) -> CascadeResult {
+    pub fn execute(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> CascadeResult {
         if !arch_handle::has_cascade_link() {
             return CascadeResult::NotCascadeOp;
         }
@@ -105,17 +101,15 @@ impl CascadeOps {
     }
 
     /// Execute cascade read: pop 384-bit data from SCD into destination register.
-    fn execute_read(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        tile: &mut Tile,
-    ) -> CascadeResult {
+    fn execute_read(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> CascadeResult {
         let data = match tile.pop_cascade_input() {
             Some(d) => d,
             None => {
                 log::info!(
                     "[CASCADE] Read stall: SCD empty (tile {},{}, pc=0x{:X})",
-                    tile.col, tile.row, ctx.pc()
+                    tile.col,
+                    tile.row,
+                    ctx.pc()
                 );
                 return CascadeResult::StallRead;
             }
@@ -127,17 +121,17 @@ impl CascadeOps {
                 Operand::VectorReg(r) => {
                     let words = cascade_to_vector(&data);
                     ctx.vector.write(*r, words);
-                    log::info!(
-                        "[CASCADE] Read SCD -> v{} (tile {},{})",
-                        r, tile.col, tile.row
-                    );
+                    log::info!("[CASCADE] Read SCD -> v{} (tile {},{})", r, tile.col, tile.row);
                 }
                 Operand::AccumReg(r) => {
                     let lanes = cascade_to_accumulator(&data);
                     ctx.accumulator.write(*r, lanes);
                     log::info!(
                         "[CASCADE] Read SCD -> acc{} (tile {},{}) data[0]={:#X}",
-                        r, tile.col, tile.row, data[0]
+                        r,
+                        tile.col,
+                        tile.row,
+                        data[0]
                     );
                 }
                 _ => {
@@ -153,11 +147,7 @@ impl CascadeOps {
     }
 
     /// Execute cascade write: push source register data to MCD.
-    fn execute_write(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        tile: &mut Tile,
-    ) -> CascadeResult {
+    fn execute_write(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> CascadeResult {
         // Backpressure: if MCD FIFO is full, stall.
         // Depth 4: hardware has a 2-deep 512-bit FIFO (AM020), and each
         // VMOV MCD writes one 256-bit half-register, so 4 entries covers
@@ -165,7 +155,9 @@ impl CascadeOps {
         if tile.cascade_output.len() >= 4 {
             log::info!(
                 "[CASCADE] Write stall: MCD full (tile {},{}, pc=0x{:X})",
-                tile.col, tile.row, ctx.pc()
+                tile.col,
+                tile.row,
+                ctx.pc()
             );
             return CascadeResult::StallWrite;
         }
@@ -176,10 +168,7 @@ impl CascadeOps {
                 Operand::VectorReg(r) => {
                     let words = ctx.vector.read(*r);
                     let d = vector_to_cascade(&words);
-                    log::info!(
-                        "[CASCADE] Write v{} -> MCD (tile {},{})",
-                        r, tile.col, tile.row
-                    );
+                    log::info!("[CASCADE] Write v{} -> MCD (tile {},{})", r, tile.col, tile.row);
                     d
                 }
                 Operand::AccumReg(r) => {
@@ -187,7 +176,10 @@ impl CascadeOps {
                     let d = accumulator_to_cascade(&lanes);
                     log::info!(
                         "[CASCADE] Write acc{} -> MCD (tile {},{}) data[0]={:#X}",
-                        r, tile.col, tile.row, d[0]
+                        r,
+                        tile.col,
+                        tile.row,
+                        d[0]
                     );
                     d
                 }
@@ -268,8 +260,8 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead)
-            .with_dest(Operand::VectorReg(0));
+        let op =
+            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead).with_dest(Operand::VectorReg(0));
 
         assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::StallRead);
     }
@@ -279,13 +271,18 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        let test_data: [u64; 6] = [0x0000_0002_0000_0001, 0x0000_0004_0000_0003,
-                                    0x0000_0006_0000_0005, 0x0000_0008_0000_0007,
-                                    0xDEAD, 0xBEEF];
+        let test_data: [u64; 6] = [
+            0x0000_0002_0000_0001,
+            0x0000_0004_0000_0003,
+            0x0000_0006_0000_0005,
+            0x0000_0008_0000_0007,
+            0xDEAD,
+            0xBEEF,
+        ];
         tile.push_cascade_input(test_data);
 
-        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead)
-            .with_dest(Operand::VectorReg(5));
+        let op =
+            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead).with_dest(Operand::VectorReg(5));
 
         assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::Completed);
 
@@ -308,8 +305,8 @@ mod tests {
         let test_data: [u64; 6] = [10, 20, 30, 40, 50, 60];
         tile.push_cascade_input(test_data);
 
-        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead)
-            .with_dest(Operand::AccumReg(3));
+        let op =
+            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead).with_dest(Operand::AccumReg(3));
 
         assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::Completed);
 

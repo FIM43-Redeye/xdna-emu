@@ -27,7 +27,9 @@
 //! layout for sign/accumulate derived from instruction encoding.
 
 use crate::interpreter::bundle::ElementType;
-use xdna_archspec::aie2::matmul::{GeometryEntry, DENSE_GEOMETRY_TABLE, SPARSE_GEOMETRY_TABLE, CONFIG_GEOMETRY_TABLE};
+use xdna_archspec::aie2::matmul::{
+    GeometryEntry, DENSE_GEOMETRY_TABLE, SPARSE_GEOMETRY_TABLE, CONFIG_GEOMETRY_TABLE,
+};
 
 /// Accumulator width mode, determined by `acc_cmb` in the mult mode.
 ///
@@ -91,7 +93,6 @@ pub struct MatMulConfig {
     pub bits_y: u32,
 }
 
-
 impl MatMulConfig {
     /// Parse a matmul configuration from element types and mode flags.
     ///
@@ -126,9 +127,9 @@ impl MatMulConfig {
         let bfloat = matches!(a_type, ElementType::BFloat16) && matches!(b_type, ElementType::BFloat16);
 
         // Find the first matching geometry entry.
-        let entry = DENSE_GEOMETRY_TABLE.iter().find(|e| {
-            e.bits_x == bits_x && e.bits_y == bits_y && e.bfloat == bfloat
-        })?;
+        let entry = DENSE_GEOMETRY_TABLE
+            .iter()
+            .find(|e| e.bits_x == bits_x && e.bits_y == bits_y && e.bfloat == bfloat)?;
 
         Some(Self {
             rows: entry.rows,
@@ -139,7 +140,11 @@ impl MatMulConfig {
             y_signed,
             a_type,
             b_type,
-            acc_width: if entry.acc_cmb == 2 { AccWidth::Acc64 } else { AccWidth::Acc32 },
+            acc_width: if entry.acc_cmb == 2 {
+                AccWidth::Acc64
+            } else {
+                AccWidth::Acc32
+            },
             bfloat: entry.bfloat,
             subtract,
             sparse: false,
@@ -188,7 +193,11 @@ impl MatMulConfig {
             y_signed,
             a_type,
             b_type,
-            acc_width: if entry.acc_cmb == 2 { AccWidth::Acc64 } else { AccWidth::Acc32 },
+            acc_width: if entry.acc_cmb == 2 {
+                AccWidth::Acc64
+            } else {
+                AccWidth::Acc32
+            },
             bfloat: entry.bfloat,
             subtract,
             sparse: false,
@@ -237,7 +246,11 @@ impl MatMulConfig {
             y_signed,
             a_type,
             b_type,
-            acc_width: if entry.acc_cmb == 2 { AccWidth::Acc64 } else { AccWidth::Acc32 },
+            acc_width: if entry.acc_cmb == 2 {
+                AccWidth::Acc64
+            } else {
+                AccWidth::Acc32
+            },
             bfloat: entry.bfloat,
             subtract,
             sparse: false,
@@ -344,7 +357,11 @@ impl MatMulConfig {
             y_signed: sgn_y,
             a_type,
             b_type,
-            acc_width: if entry.acc_cmb == 2 { AccWidth::Acc64 } else { AccWidth::Acc32 },
+            acc_width: if entry.acc_cmb == 2 {
+                AccWidth::Acc64
+            } else {
+                AccWidth::Acc32
+            },
             bfloat: entry.bfloat,
             bits_x: entry.bits_x,
             bits_y: entry.bits_y,
@@ -353,7 +370,6 @@ impl MatMulConfig {
         })
     }
 }
-
 
 /// Look up geometry for integer MAC from config word fields.
 fn lookup_integer_geometry(amode: u32, bmode: u32, variant: u32) -> Option<&'static GeometryEntry> {
@@ -371,21 +387,39 @@ fn lookup_bf16_geometry(variant: u32) -> Option<&'static GeometryEntry> {
     match variant {
         // Dense 4x8x4: 16 outputs in 32-bit accumulator lanes
         0 => Some(&GeometryEntry {
-            bits_x: 16, bits_y: 16, rows: 4, inner: 8, cols: 4,
-            acc_cmb: 1, bfloat: true, sparse: false,
+            bits_x: 16,
+            bits_y: 16,
+            rows: 4,
+            inner: 8,
+            cols: 4,
+            acc_cmb: 1,
+            bfloat: true,
+            sparse: false,
         }),
         // Element-wise: 16 channels, each a 1x2 dot product.
         // Lane L computes A[L]*B[L] + A[L+16]*B[L+16] -- stride-16
         // symmetric mapping for both A and B sides. Handled in
         // matmul_config_driven's is_elemwise path.
         1 => Some(&GeometryEntry {
-            bits_x: 16, bits_y: 16, rows: 16, inner: 2, cols: 1,
-            acc_cmb: 1, bfloat: true, sparse: false,
+            bits_x: 16,
+            bits_y: 16,
+            rows: 16,
+            inner: 2,
+            cols: 1,
+            acc_cmb: 1,
+            bfloat: true,
+            sparse: false,
         }),
         // Sparse: doubled inner dimension (4x16x4)
         2 => Some(&GeometryEntry {
-            bits_x: 16, bits_y: 16, rows: 4, inner: 16, cols: 4,
-            acc_cmb: 1, bfloat: true, sparse: true,
+            bits_x: 16,
+            bits_y: 16,
+            rows: 4,
+            inner: 16,
+            cols: 4,
+            acc_cmb: 1,
+            bfloat: true,
+            sparse: true,
         }),
         _ => None,
     }
@@ -405,10 +439,7 @@ fn element_types_from_entry(entry: &GeometryEntry) -> (ElementType, ElementType)
             8 => ElementType::Int8,
             16 => ElementType::Int16,
             32 => ElementType::Int32,
-            other => panic!(
-                "element_types_from_entry: unexpected bits_x={} in geometry {:?}",
-                other, entry,
-            ),
+            other => panic!("element_types_from_entry: unexpected bits_x={} in geometry {:?}", other, entry,),
         }
     };
 
@@ -419,10 +450,7 @@ fn element_types_from_entry(entry: &GeometryEntry) -> (ElementType, ElementType)
             4 => ElementType::Int8, // int4 represented as Int8 (no Int4 variant)
             8 => ElementType::Int8,
             16 => ElementType::Int16,
-            other => panic!(
-                "element_types_from_entry: unexpected bits_y={} in geometry {:?}",
-                other, entry,
-            )
+            other => panic!("element_types_from_entry: unexpected bits_y={} in geometry {:?}", other, entry,),
         }
     };
 
@@ -439,10 +467,8 @@ mod tests {
 
     #[test]
     fn test_i8xi8_geometry() {
-        let config = MatMulConfig::from_types(
-            ElementType::Int8, ElementType::Int8,
-            true, true, true, false,
-        ).expect("i8xi8 should have a valid geometry");
+        let config = MatMulConfig::from_types(ElementType::Int8, ElementType::Int8, true, true, true, false)
+            .expect("i8xi8 should have a valid geometry");
 
         // Hardware: mmode 1 (8x8 acc_cmb=1), rows=4, inner=8, cols=8
         assert_eq!(config.rows, 4);
@@ -455,10 +481,9 @@ mod tests {
 
     #[test]
     fn test_i8xi8_sign_and_accumulate() {
-        let config = MatMulConfig::from_types(
-            ElementType::Int8, ElementType::Int8,
-            false, false, true, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::Int8, ElementType::Int8, false, false, true, false)
+                .unwrap();
 
         assert!(!config.accumulate);
         assert!(!config.x_signed);
@@ -469,10 +494,9 @@ mod tests {
     #[test]
     fn test_u8xu8_same_geometry_as_i8xi8() {
         // Unsigned int8 uses the same geometry; sign is a separate concern.
-        let config = MatMulConfig::from_types(
-            ElementType::UInt8, ElementType::UInt8,
-            true, false, false, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::UInt8, ElementType::UInt8, true, false, false, false)
+                .unwrap();
 
         assert_eq!(config.rows, 4);
         assert_eq!(config.inner, 8);
@@ -486,10 +510,9 @@ mod tests {
 
     #[test]
     fn test_i16xi16_geometry_acc32() {
-        let config = MatMulConfig::from_types(
-            ElementType::Int16, ElementType::Int16,
-            true, true, true, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::Int16, ElementType::Int16, true, true, true, false)
+                .unwrap();
 
         // Hardware: mmode 3 (16x16 acc_cmb=1), rows=4, inner=2, cols=8
         assert_eq!(config.rows, 4);
@@ -506,10 +529,8 @@ mod tests {
 
     #[test]
     fn test_i16xi8_geometry_acc32() {
-        let config = MatMulConfig::from_types(
-            ElementType::Int16, ElementType::Int8,
-            true, true, true, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::Int16, ElementType::Int8, true, true, true, false).unwrap();
 
         // Hardware: mmode 2 (16x8 acc_cmb=1), rows=4, inner=4, cols=8
         assert_eq!(config.rows, 4);
@@ -524,10 +545,9 @@ mod tests {
 
     #[test]
     fn test_bf16xbf16_geometry() {
-        let config = MatMulConfig::from_types(
-            ElementType::BFloat16, ElementType::BFloat16,
-            true, true, true, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::BFloat16, ElementType::BFloat16, true, true, true, false)
+                .unwrap();
 
         // Hardware: mmode 6 (16x16 bfloat acc_cmb=1 acc_num=16),
         // rows=4, inner=8, cols=4
@@ -545,10 +565,9 @@ mod tests {
 
     #[test]
     fn test_i32xi16_geometry() {
-        let config = MatMulConfig::from_types(
-            ElementType::Int32, ElementType::Int16,
-            true, true, true, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::Int32, ElementType::Int16, true, true, true, false)
+                .unwrap();
 
         // Hardware: mmode 7 (32x16 acc_cmb=2), rows=4, inner=2, cols=4
         assert_eq!(config.rows, 4);
@@ -565,10 +584,17 @@ mod tests {
     #[test]
     fn test_i16xi8_acc64_variant_2x8x8() {
         let config = MatMulConfig::from_geometry(
-            ElementType::Int16, ElementType::Int8,
-            2, 8, 8,
-            true, true, true, false,
-        ).unwrap();
+            ElementType::Int16,
+            ElementType::Int8,
+            2,
+            8,
+            8,
+            true,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(config.rows, 2);
         assert_eq!(config.inner, 8);
@@ -579,10 +605,17 @@ mod tests {
     #[test]
     fn test_i16xi8_acc64_variant_4x8x4() {
         let config = MatMulConfig::from_geometry(
-            ElementType::Int16, ElementType::Int8,
-            4, 8, 4,
-            true, true, true, false,
-        ).unwrap();
+            ElementType::Int16,
+            ElementType::Int8,
+            4,
+            8,
+            4,
+            true,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(config.rows, 4);
         assert_eq!(config.inner, 8);
@@ -593,10 +626,17 @@ mod tests {
     #[test]
     fn test_i16xi16_acc64_variant_2x4x8() {
         let config = MatMulConfig::from_geometry(
-            ElementType::Int16, ElementType::Int16,
-            2, 4, 8,
-            true, true, true, false,
-        ).unwrap();
+            ElementType::Int16,
+            ElementType::Int16,
+            2,
+            4,
+            8,
+            true,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(config.rows, 2);
         assert_eq!(config.inner, 4);
@@ -607,10 +647,17 @@ mod tests {
     #[test]
     fn test_i16xi16_acc64_variant_4x4x4() {
         let config = MatMulConfig::from_geometry(
-            ElementType::Int16, ElementType::Int16,
-            4, 4, 4,
-            true, true, true, false,
-        ).unwrap();
+            ElementType::Int16,
+            ElementType::Int16,
+            4,
+            4,
+            4,
+            true,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(config.rows, 4);
         assert_eq!(config.inner, 4);
@@ -626,9 +673,15 @@ mod tests {
     fn test_invalid_geometry_rejected() {
         // 4x4x4 is not a valid geometry for int8 x int8.
         let config = MatMulConfig::from_geometry(
-            ElementType::Int8, ElementType::Int8,
-            4, 4, 4,
-            true, true, true, false,
+            ElementType::Int8,
+            ElementType::Int8,
+            4,
+            4,
+            4,
+            true,
+            true,
+            true,
+            false,
         );
         assert!(config.is_none());
     }
@@ -638,10 +691,8 @@ mod tests {
         // Float32 is not a valid direct matmul input type (bf16 is).
         // Float32 as a_type has bits=32, which matches int32 geometry when
         // paired with int16, but Float32 x Float32 has no entry.
-        let config = MatMulConfig::from_types(
-            ElementType::Float32, ElementType::Float32,
-            true, true, true, false,
-        );
+        let config =
+            MatMulConfig::from_types(ElementType::Float32, ElementType::Float32, true, true, true, false);
         assert!(config.is_none());
     }
 
@@ -714,19 +765,15 @@ mod tests {
 
     #[test]
     fn test_accumulate_true() {
-        let config = MatMulConfig::from_types(
-            ElementType::Int8, ElementType::Int8,
-            true, true, true, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::Int8, ElementType::Int8, true, true, true, false).unwrap();
         assert!(config.accumulate);
     }
 
     #[test]
     fn test_accumulate_false() {
-        let config = MatMulConfig::from_types(
-            ElementType::Int8, ElementType::Int8,
-            false, true, true, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::Int8, ElementType::Int8, false, true, true, false).unwrap();
         assert!(!config.accumulate);
     }
 
@@ -736,30 +783,26 @@ mod tests {
 
     #[test]
     fn test_signed_signed() {
-        let config = MatMulConfig::from_types(
-            ElementType::Int8, ElementType::Int8,
-            true, true, true, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::Int8, ElementType::Int8, true, true, true, false).unwrap();
         assert!(config.x_signed);
         assert!(config.y_signed);
     }
 
     #[test]
     fn test_unsigned_unsigned() {
-        let config = MatMulConfig::from_types(
-            ElementType::UInt8, ElementType::UInt8,
-            true, false, false, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::UInt8, ElementType::UInt8, true, false, false, false)
+                .unwrap();
         assert!(!config.x_signed);
         assert!(!config.y_signed);
     }
 
     #[test]
     fn test_signed_unsigned() {
-        let config = MatMulConfig::from_types(
-            ElementType::Int8, ElementType::UInt8,
-            true, true, false, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::Int8, ElementType::UInt8, true, true, false, false)
+                .unwrap();
         assert!(config.x_signed);
         assert!(!config.y_signed);
     }
@@ -770,19 +813,16 @@ mod tests {
 
     #[test]
     fn test_subtract_true() {
-        let config = MatMulConfig::from_types(
-            ElementType::Int16, ElementType::Int16,
-            true, true, true, true,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::Int16, ElementType::Int16, true, true, true, true).unwrap();
         assert!(config.subtract);
     }
 
     #[test]
     fn test_subtract_false() {
-        let config = MatMulConfig::from_types(
-            ElementType::Int16, ElementType::Int16,
-            true, true, true, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::Int16, ElementType::Int16, true, true, true, false)
+                .unwrap();
         assert!(!config.subtract);
     }
 
@@ -803,18 +843,18 @@ mod tests {
         // acc_cmb=2 (2x8x8, 4x8x4).
         let geoms = MatMulConfig::valid_geometries(ElementType::Int16, ElementType::Int8);
         assert_eq!(geoms.len(), 3);
-        assert!(geoms.contains(&(4, 4, 8)));  // acc_cmb=1
-        assert!(geoms.contains(&(2, 8, 8)));  // acc_cmb=2 variant 1
-        assert!(geoms.contains(&(4, 8, 4)));  // acc_cmb=2 variant 2
+        assert!(geoms.contains(&(4, 4, 8))); // acc_cmb=1
+        assert!(geoms.contains(&(2, 8, 8))); // acc_cmb=2 variant 1
+        assert!(geoms.contains(&(4, 8, 4))); // acc_cmb=2 variant 2
     }
 
     #[test]
     fn test_valid_geometries_i16xi16_has_three() {
         let geoms = MatMulConfig::valid_geometries(ElementType::Int16, ElementType::Int16);
         assert_eq!(geoms.len(), 3);
-        assert!(geoms.contains(&(4, 2, 8)));  // acc_cmb=1
-        assert!(geoms.contains(&(2, 4, 8)));  // acc_cmb=2 variant 1
-        assert!(geoms.contains(&(4, 4, 4)));  // acc_cmb=2 variant 2
+        assert!(geoms.contains(&(4, 2, 8))); // acc_cmb=1
+        assert!(geoms.contains(&(2, 4, 8))); // acc_cmb=2 variant 1
+        assert!(geoms.contains(&(4, 4, 4))); // acc_cmb=2 variant 2
     }
 
     #[test]
@@ -855,38 +895,33 @@ mod tests {
 
     #[test]
     fn test_macs_per_output_i8xi8() {
-        let config = MatMulConfig::from_types(
-            ElementType::Int8, ElementType::Int8,
-            true, true, true, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::Int8, ElementType::Int8, true, true, true, false).unwrap();
         assert_eq!(config.macs_per_output(), 8);
     }
 
     #[test]
     fn test_macs_per_output_bf16() {
-        let config = MatMulConfig::from_types(
-            ElementType::BFloat16, ElementType::BFloat16,
-            true, true, true, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::BFloat16, ElementType::BFloat16, true, true, true, false)
+                .unwrap();
         assert_eq!(config.macs_per_output(), 8);
     }
 
     #[test]
     fn test_output_count_i16xi16_acc32() {
-        let config = MatMulConfig::from_types(
-            ElementType::Int16, ElementType::Int16,
-            true, true, true, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::Int16, ElementType::Int16, true, true, true, false)
+                .unwrap();
         // 4 rows x 8 cols = 32
         assert_eq!(config.output_count(), 32);
     }
 
     #[test]
     fn test_output_count_bf16() {
-        let config = MatMulConfig::from_types(
-            ElementType::BFloat16, ElementType::BFloat16,
-            true, true, true, false,
-        ).unwrap();
+        let config =
+            MatMulConfig::from_types(ElementType::BFloat16, ElementType::BFloat16, true, true, true, false)
+                .unwrap();
         // 4 rows x 4 cols = 16
         assert_eq!(config.output_count(), 16);
     }
@@ -899,21 +934,17 @@ mod tests {
     fn test_all_type_combinations_have_geometry() {
         // These are all the valid A x B type pairs that the hardware supports.
         let valid_pairs: &[(ElementType, ElementType)] = &[
-            (ElementType::Int8, ElementType::Int8),      // 8x8 dense
-            (ElementType::UInt8, ElementType::UInt8),     // same hw, unsigned
-            (ElementType::Int16, ElementType::Int8),      // 16x8
-            (ElementType::Int16, ElementType::Int16),     // 16x16
+            (ElementType::Int8, ElementType::Int8),         // 8x8 dense
+            (ElementType::UInt8, ElementType::UInt8),       // same hw, unsigned
+            (ElementType::Int16, ElementType::Int8),        // 16x8
+            (ElementType::Int16, ElementType::Int16),       // 16x16
             (ElementType::BFloat16, ElementType::BFloat16), // bf16
-            (ElementType::Int32, ElementType::Int16),     // 32x16
+            (ElementType::Int32, ElementType::Int16),       // 32x16
         ];
 
         for (a, b) in valid_pairs {
             let config = MatMulConfig::from_types(*a, *b, true, true, true, false);
-            assert!(
-                config.is_some(),
-                "Expected valid geometry for {:?} x {:?}",
-                a, b
-            );
+            assert!(config.is_some(), "Expected valid geometry for {:?} x {:?}", a, b);
             let c = config.unwrap();
             // Sanity: output count must be positive and fit the acc register.
             assert!(c.output_count() > 0);
@@ -927,32 +958,43 @@ mod tests {
 
     #[test]
     fn test_from_types_matches_from_geometry_i8xi8() {
-        let by_type = MatMulConfig::from_types(
-            ElementType::Int8, ElementType::Int8,
-            true, true, true, false,
-        ).unwrap();
+        let by_type =
+            MatMulConfig::from_types(ElementType::Int8, ElementType::Int8, true, true, true, false).unwrap();
 
         let by_geom = MatMulConfig::from_geometry(
-            ElementType::Int8, ElementType::Int8,
-            by_type.rows, by_type.inner, by_type.cols,
-            true, true, true, false,
-        ).unwrap();
+            ElementType::Int8,
+            ElementType::Int8,
+            by_type.rows,
+            by_type.inner,
+            by_type.cols,
+            true,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(by_type, by_geom);
     }
 
     #[test]
     fn test_from_types_matches_from_geometry_bf16() {
-        let by_type = MatMulConfig::from_types(
-            ElementType::BFloat16, ElementType::BFloat16,
-            false, true, true, true,
-        ).unwrap();
+        let by_type =
+            MatMulConfig::from_types(ElementType::BFloat16, ElementType::BFloat16, false, true, true, true)
+                .unwrap();
 
         let by_geom = MatMulConfig::from_geometry(
-            ElementType::BFloat16, ElementType::BFloat16,
-            by_type.rows, by_type.inner, by_type.cols,
-            false, true, true, true,
-        ).unwrap();
+            ElementType::BFloat16,
+            ElementType::BFloat16,
+            by_type.rows,
+            by_type.inner,
+            by_type.cols,
+            false,
+            true,
+            true,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(by_type, by_geom);
     }

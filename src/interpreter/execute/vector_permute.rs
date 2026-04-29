@@ -93,7 +93,6 @@ pub fn shuffle_vectors(lo: &[u8; VEC_BYTES], hi: &[u8; VEC_BYTES], mode: Shuffle
     out
 }
 
-
 // ============================================================================
 // Multi-dimensional index computation (rc2i)
 // ============================================================================
@@ -275,7 +274,9 @@ mod tests {
                 result[i],
                 input[i * 2],
                 "mismatch at byte {i}: expected input[{}]={}, got {}",
-                i * 2, input[i * 2], result[i]
+                i * 2,
+                input[i * 2],
+                result[i]
             );
         }
     }
@@ -295,8 +296,7 @@ mod tests {
                 let dst_byte = c * 2 + r;
                 let src_byte = r * 64 + c;
                 assert_eq!(
-                    result[dst_byte],
-                    input[src_byte],
+                    result[dst_byte], input[src_byte],
                     "mismatch at byte {dst_byte}: expected input[{src_byte}]"
                 );
             }
@@ -333,11 +333,7 @@ mod tests {
             for c in 0..4 {
                 let src_off = (r * 4 + c) * 4;
                 let dst_off = (c * 4 + r) * 4;
-                assert_eq!(
-                    &result[dst_off..dst_off + 4],
-                    &lo[src_off..src_off + 4],
-                    "mismatch at ({r},{c})"
-                );
+                assert_eq!(&result[dst_off..dst_off + 4], &lo[src_off..src_off + 4], "mismatch at ({r},{c})");
             }
         }
     }
@@ -371,11 +367,7 @@ mod tests {
             for c in 0..4 {
                 let src_off = (r * 4 + c) * 2;
                 let dst_off = (c * 4 + r) * 2;
-                assert_eq!(
-                    &result[dst_off..dst_off + 2],
-                    &lo[src_off..src_off + 2],
-                    "mismatch at ({r},{c})"
-                );
+                assert_eq!(&result[dst_off..dst_off + 2], &lo[src_off..src_off + 2], "mismatch at ({r},{c})");
             }
         }
     }
@@ -409,19 +401,13 @@ mod tests {
             if !cfg.convolve_x && !cfg.sparse {
                 // X buffer size = bits_x * channels * rows * inner bits
                 let x_bits = cfg.bits_x * cfg.channels * cfg.rows * cfg.inner;
-                assert!(
-                    x_bits <= 512,
-                    "mode {i}: X buffer too large: {x_bits} bits"
-                );
+                assert!(x_bits <= 512, "mode {i}: X buffer too large: {x_bits} bits");
             }
 
             if !cfg.sparse {
                 // Y buffer size = bits_y * channels * inner * cols bits
                 let y_bits = cfg.bits_y * cfg.channels * cfg.inner * cfg.cols;
-                assert!(
-                    y_bits <= 512,
-                    "mode {i}: Y buffer too large: {y_bits} bits"
-                );
+                assert!(y_bits <= 512, "mode {i}: Y buffer too large: {y_bits} bits");
             }
         }
     }
@@ -472,12 +458,8 @@ mod tests {
         let result = shuffle_vectors(&lo, &hi, ShuffleMode::T32_16x2Lo);
 
         for i in 0..16 {
-            let val = u32::from_le_bytes([
-                result[i * 4],
-                result[i * 4 + 1],
-                result[i * 4 + 2],
-                result[i * 4 + 3],
-            ]);
+            let val =
+                u32::from_le_bytes([result[i * 4], result[i * 4 + 1], result[i * 4 + 2], result[i * 4 + 3]]);
             let expected = (i * 2) as u32;
             assert_eq!(val, expected, "element {i}: expected {expected}, got {val}");
         }
@@ -527,34 +509,22 @@ mod tests {
         expected_convolve_x: bool,
         expected_sparse: bool,
     ) {
-        let mode = MacPermuteMode::from_mode(mode_idx)
-            .unwrap_or_else(|| panic!("mode {mode_idx} should be valid"));
+        let mode =
+            MacPermuteMode::from_mode(mode_idx).unwrap_or_else(|| panic!("mode {mode_idx} should be valid"));
         let cfg = mac_permute_config(mode);
 
-        assert_eq!(cfg.bits_x, expected_bits_x,
-            "mode {mode_idx}: bits_x mismatch");
-        assert_eq!(cfg.bits_y, expected_bits_y,
-            "mode {mode_idx}: bits_y mismatch");
-        assert_eq!(cfg.acc_combine, expected_acc_combine,
-            "mode {mode_idx}: acc_combine mismatch");
-        assert_eq!(cfg.bfloat, expected_bfloat,
-            "mode {mode_idx}: bfloat mismatch");
-        assert_eq!(cfg.rows, expected_rows,
-            "mode {mode_idx}: rows mismatch");
-        assert_eq!(cfg.inner, expected_inner,
-            "mode {mode_idx}: inner mismatch");
-        assert_eq!(cfg.cols, expected_cols,
-            "mode {mode_idx}: cols mismatch");
-        assert_eq!(cfg.channels, expected_channels,
-            "mode {mode_idx}: channels mismatch");
-        assert_eq!(cfg.complex_x, expected_complex_x,
-            "mode {mode_idx}: complex_x mismatch");
-        assert_eq!(cfg.complex_y, expected_complex_y,
-            "mode {mode_idx}: complex_y mismatch");
-        assert_eq!(cfg.convolve_x, expected_convolve_x,
-            "mode {mode_idx}: convolve_x mismatch");
-        assert_eq!(cfg.sparse, expected_sparse,
-            "mode {mode_idx}: sparse mismatch");
+        assert_eq!(cfg.bits_x, expected_bits_x, "mode {mode_idx}: bits_x mismatch");
+        assert_eq!(cfg.bits_y, expected_bits_y, "mode {mode_idx}: bits_y mismatch");
+        assert_eq!(cfg.acc_combine, expected_acc_combine, "mode {mode_idx}: acc_combine mismatch");
+        assert_eq!(cfg.bfloat, expected_bfloat, "mode {mode_idx}: bfloat mismatch");
+        assert_eq!(cfg.rows, expected_rows, "mode {mode_idx}: rows mismatch");
+        assert_eq!(cfg.inner, expected_inner, "mode {mode_idx}: inner mismatch");
+        assert_eq!(cfg.cols, expected_cols, "mode {mode_idx}: cols mismatch");
+        assert_eq!(cfg.channels, expected_channels, "mode {mode_idx}: channels mismatch");
+        assert_eq!(cfg.complex_x, expected_complex_x, "mode {mode_idx}: complex_x mismatch");
+        assert_eq!(cfg.complex_y, expected_complex_y, "mode {mode_idx}: complex_y mismatch");
+        assert_eq!(cfg.convolve_x, expected_convolve_x, "mode {mode_idx}: convolve_x mismatch");
+        assert_eq!(cfg.sparse, expected_sparse, "mode {mode_idx}: sparse mismatch");
     }
 
     // --- Matrix multiply modes (modes 0-8) ---
@@ -737,8 +707,7 @@ mod tests {
         while MacPermuteMode::from_mode(count).is_some() {
             count += 1;
         }
-        assert_eq!(count, 26,
-            "Expected exactly 26 MAC permute modes (aietools constants.py generates 26)");
+        assert_eq!(count, 26, "Expected exactly 26 MAC permute modes (aietools constants.py generates 26)");
     }
 
     /// Verify that all modes produce the expected number of output lanes.
@@ -766,9 +735,12 @@ mod tests {
             let acc_num: u32 = if cfg.bfloat { 16 } else { 32 };
             let expected_lanes = acc_num / cfg.acc_combine;
 
-            assert_eq!(output_elements, expected_lanes,
+            assert_eq!(
+                output_elements, expected_lanes,
                 "mode {i}: output elements ({output_elements}) != expected lanes ({expected_lanes}) \
-                 [acc_num={acc_num}, acc_combine={}]", cfg.acc_combine);
+                 [acc_num={acc_num}, acc_combine={}]",
+                cfg.acc_combine
+            );
         }
     }
 
@@ -782,10 +754,8 @@ mod tests {
             let cfg = mac_permute_config(mode);
 
             if cfg.bfloat {
-                assert_eq!(cfg.bits_x, 16,
-                    "mode {i}: bfloat mode should have bits_x=16");
-                assert_eq!(cfg.bits_y, 16,
-                    "mode {i}: bfloat mode should have bits_y=16");
+                assert_eq!(cfg.bits_x, 16, "mode {i}: bfloat mode should have bits_x=16");
+                assert_eq!(cfg.bits_y, 16, "mode {i}: bfloat mode should have bits_y=16");
             }
         }
     }
@@ -800,34 +770,29 @@ mod tests {
         // Sparse mode 21 (8x4) vs mode 0 (8x4): inner 32 vs 16
         let dense = mac_permute_config(MacPermuteMode::Mode_8x4_4x16_16x8);
         let sparse = mac_permute_config(MacPermuteMode::Mode_8x4_Sparse);
-        assert_eq!(sparse.inner, dense.inner * 2,
-            "sparse 8x4: inner should be 2x dense");
+        assert_eq!(sparse.inner, dense.inner * 2, "sparse 8x4: inner should be 2x dense");
         assert_eq!(sparse.rows, dense.rows);
         assert_eq!(sparse.cols, dense.cols);
 
         // Sparse mode 22 (8x8) vs mode 1 (8x8): inner 16 vs 8
         let dense = mac_permute_config(MacPermuteMode::Mode_8x8_4x8_8x8);
         let sparse = mac_permute_config(MacPermuteMode::Mode_8x8_Sparse);
-        assert_eq!(sparse.inner, dense.inner * 2,
-            "sparse 8x8: inner should be 2x dense");
+        assert_eq!(sparse.inner, dense.inner * 2, "sparse 8x8: inner should be 2x dense");
 
         // Sparse mode 23 (16x8) vs mode 4 (16x8): inner 16 vs 8
         let dense = mac_permute_config(MacPermuteMode::Mode_16x8_2x8_8x8);
         let sparse = mac_permute_config(MacPermuteMode::Mode_16x8_Sparse);
-        assert_eq!(sparse.inner, dense.inner * 2,
-            "sparse 16x8: inner should be 2x dense");
+        assert_eq!(sparse.inner, dense.inner * 2, "sparse 16x8: inner should be 2x dense");
 
         // Sparse mode 24 (16x16) vs mode 6 (16x16): inner 8 vs 4
         let dense = mac_permute_config(MacPermuteMode::Mode_16x16_2x4_4x8);
         let sparse = mac_permute_config(MacPermuteMode::Mode_16x16_Sparse);
-        assert_eq!(sparse.inner, dense.inner * 2,
-            "sparse 16x16: inner should be 2x dense");
+        assert_eq!(sparse.inner, dense.inner * 2, "sparse 16x16: inner should be 2x dense");
 
         // Sparse mode 25 (bf16) vs mode 8 (bf16): inner 16 vs 8
         let dense = mac_permute_config(MacPermuteMode::Mode_BF16_4x8_8x4);
         let sparse = mac_permute_config(MacPermuteMode::Mode_BF16_Sparse);
-        assert_eq!(sparse.inner, dense.inner * 2,
-            "sparse bf16: inner should be 2x dense");
+        assert_eq!(sparse.inner, dense.inner * 2, "sparse bf16: inner should be 2x dense");
     }
 
     /// Verify that all sparse modes have channels=1 (no multi-channel
@@ -839,8 +804,7 @@ mod tests {
             let cfg = mac_permute_config(mode);
 
             if cfg.sparse {
-                assert_eq!(cfg.channels, 1,
-                    "mode {i}: sparse modes must have channels=1");
+                assert_eq!(cfg.channels, 1, "mode {i}: sparse modes must have channels=1");
             }
         }
     }
@@ -854,8 +818,7 @@ mod tests {
             let cfg = mac_permute_config(mode);
 
             if cfg.convolve_x {
-                assert_eq!(cfg.cols, 1,
-                    "mode {i}: convolution modes must have cols=1");
+                assert_eq!(cfg.cols, 1, "mode {i}: convolution modes must have cols=1");
             }
         }
     }
@@ -869,8 +832,10 @@ mod tests {
             let cfg = mac_permute_config(mode);
 
             if cfg.complex_x || cfg.complex_y {
-                assert!(cfg.complex_x && cfg.complex_y,
-                    "mode {i}: complex modes must have both complex_x and complex_y");
+                assert!(
+                    cfg.complex_x && cfg.complex_y,
+                    "mode {i}: complex modes must have both complex_x and complex_y"
+                );
             }
         }
     }
@@ -909,34 +874,39 @@ mod tests {
             let mult_per_lane = (MULT_NUM / acc_num) * cfg.acc_combine;
 
             // Verify the fundamental identity
-            assert_eq!(output_lanes * mult_per_lane, MULT_NUM,
-                "mode {i}: output_lanes * mult_per_lane != 512");
+            assert_eq!(
+                output_lanes * mult_per_lane,
+                MULT_NUM,
+                "mode {i}: output_lanes * mult_per_lane != 512"
+            );
 
             // Verify output_lanes matches mode dimensions
             let complex_factor = if cfg.complex_x || cfg.complex_y { 2 } else { 1 };
             let computed_lanes = cfg.rows * cfg.cols * cfg.channels;
             // Complex modes produce complex outputs (real+imag per lane)
             if complex_factor == 1 {
-                assert_eq!(computed_lanes, output_lanes,
-                    "mode {i}: dimension product doesn't match output_lanes");
+                assert_eq!(
+                    computed_lanes, output_lanes,
+                    "mode {i}: dimension product doesn't match output_lanes"
+                );
             }
 
             // Verify mul_per_op makes sense
             let bx = cfg.bits_x;
             let by = cfg.bits_y;
             let mul_per_op = (bx / MULT_GRAN_X) * (by / MULT_GRAN_Y);
-            assert!(mul_per_op > 0,
-                "mode {i}: mul_per_op should be > 0");
+            assert!(mul_per_op > 0, "mode {i}: mul_per_op should be > 0");
 
             // Verify dup (post-addition depth) is a whole number
             let inner_muls = cfg.inner * mul_per_op * complex_factor;
-            assert!(mult_per_lane % inner_muls == 0,
+            assert!(
+                mult_per_lane % inner_muls == 0,
                 "mode {i}: mult_per_lane ({mult_per_lane}) not divisible by \
-                 inner_muls ({inner_muls})");
+                 inner_muls ({inner_muls})"
+            );
 
             let dup = mult_per_lane / inner_muls;
-            assert!(dup >= 1,
-                "mode {i}: dup={dup} should be >= 1");
+            assert!(dup >= 1, "mode {i}: dup={dup} should be >= 1");
         }
     }
 
@@ -957,17 +927,14 @@ mod tests {
                 // With all strides = 1: rows + inner - 1
                 let x_elements = cfg.rows + cfg.inner - 1;
                 let x_bits = cfg.bits_x * cfg.channels * x_elements;
-                assert!(x_bits <= 512,
-                    "mode {i} (conv): X buffer {x_bits} bits exceeds 512");
+                assert!(x_bits <= 512, "mode {i} (conv): X buffer {x_bits} bits exceeds 512");
             } else if cfg.sparse {
                 // Sparse modes: X permutation width doubles to 1024
                 let x_bits = cfg.bits_x * cfg.channels * cfg.rows * cfg.inner;
-                assert!(x_bits <= 1024,
-                    "mode {i} (sparse): X buffer {x_bits} bits exceeds 1024");
+                assert!(x_bits <= 1024, "mode {i} (sparse): X buffer {x_bits} bits exceeds 1024");
             } else {
                 let x_bits = cfg.bits_x * cfg.channels * cfg.rows * cfg.inner;
-                assert!(x_bits <= 512,
-                    "mode {i}: X buffer {x_bits} bits exceeds 512");
+                assert!(x_bits <= 512, "mode {i}: X buffer {x_bits} bits exceeds 512");
             }
         }
     }
@@ -984,11 +951,9 @@ mod tests {
 
             let y_bits = cfg.bits_y * cfg.channels * cfg.inner * cfg.cols;
             if cfg.sparse {
-                assert!(y_bits / 2 <= 512,
-                    "mode {i} (sparse): Y buffer {y_bits}/2 bits exceeds 512");
+                assert!(y_bits / 2 <= 512, "mode {i} (sparse): Y buffer {y_bits}/2 bits exceeds 512");
             } else {
-                assert!(y_bits <= 512,
-                    "mode {i}: Y buffer {y_bits} bits exceeds 512");
+                assert!(y_bits <= 512, "mode {i}: Y buffer {y_bits} bits exceeds 512");
             }
         }
     }
@@ -1011,9 +976,12 @@ mod tests {
                 "mode {i}: bits_y={} not in {{4, 8, 16}}",
                 cfg.bits_y
             );
-            assert!(cfg.bits_x >= cfg.bits_y,
+            assert!(
+                cfg.bits_x >= cfg.bits_y,
                 "mode {i}: bits_x={} < bits_y={} violates hardware constraint",
-                cfg.bits_x, cfg.bits_y);
+                cfg.bits_x,
+                cfg.bits_y
+            );
         }
     }
 
@@ -1036,35 +1004,35 @@ mod tests {
 
         let expected_mmodes: [(u32, u32, u32, bool); 26] = [
             // mode 0-8: matrix multiply
-            ( 8,  4, 1, false), // mmode 0
-            ( 8,  8, 1, false), // mmode 1
-            (16,  8, 1, false), // mmode 2
+            (8, 4, 1, false),   // mmode 0
+            (8, 8, 1, false),   // mmode 1
+            (16, 8, 1, false),  // mmode 2
             (16, 16, 1, false), // mmode 3
-            (16,  8, 2, false), // mmode 4
-            (16,  8, 2, false), // mmode 4
+            (16, 8, 2, false),  // mmode 4
+            (16, 8, 2, false),  // mmode 4
             (16, 16, 2, false), // mmode 5
             (16, 16, 2, false), // mmode 5
             (16, 16, 1, true),  // mmode 6
             // mode 9-12: element-wise
-            (16,  8, 1, false), // mmode 2
-            ( 8,  8, 1, false), // mmode 1
+            (16, 8, 1, false),  // mmode 2
+            (8, 8, 1, false),   // mmode 1
             (16, 16, 1, false), // mmode 3
             (16, 16, 2, false), // mmode 5
             // mode 13-16: convolution
-            ( 8,  8, 1, false), // mmode 1
-            ( 8,  8, 1, false), // mmode 1
-            ( 8,  8, 1, false), // mmode 1
+            (8, 8, 1, false),   // mmode 1
+            (8, 8, 1, false),   // mmode 1
+            (8, 8, 1, false),   // mmode 1
             (16, 16, 2, false), // mmode 5
             // mode 17: bf16 element-wise
-            (16, 16, 1, true),  // mmode 6
+            (16, 16, 1, true), // mmode 6
             // mode 18-20: FFT
             (32, 16, 2, false), // mmode 7
             (32, 16, 2, false), // mmode 7
             (16, 16, 2, false), // mmode 5
             // mode 21-25: sparse
-            ( 8,  4, 1, false), // mmode 0
-            ( 8,  8, 1, false), // mmode 1
-            (16,  8, 2, false), // mmode 4
+            (8, 4, 1, false),   // mmode 0
+            (8, 8, 1, false),   // mmode 1
+            (16, 8, 2, false),  // mmode 4
             (16, 16, 2, false), // mmode 5
             (16, 16, 1, true),  // mmode 6
         ];
@@ -1073,14 +1041,10 @@ mod tests {
             let mode = MacPermuteMode::from_mode(i as u8).unwrap();
             let cfg = mac_permute_config(mode);
 
-            assert_eq!(cfg.bits_x, bx,
-                "mode {i}: bits_x mismatch for mult_mode lookup");
-            assert_eq!(cfg.bits_y, by,
-                "mode {i}: bits_y mismatch for mult_mode lookup");
-            assert_eq!(cfg.acc_combine, ac,
-                "mode {i}: acc_combine mismatch for mult_mode lookup");
-            assert_eq!(cfg.bfloat, bf,
-                "mode {i}: bfloat mismatch for mult_mode lookup");
+            assert_eq!(cfg.bits_x, bx, "mode {i}: bits_x mismatch for mult_mode lookup");
+            assert_eq!(cfg.bits_y, by, "mode {i}: bits_y mismatch for mult_mode lookup");
+            assert_eq!(cfg.acc_combine, ac, "mode {i}: acc_combine mismatch for mult_mode lookup");
+            assert_eq!(cfg.bfloat, bf, "mode {i}: bfloat mismatch for mult_mode lookup");
         }
     }
 
@@ -1092,8 +1056,7 @@ mod tests {
         for r in 0..4 {
             for c in 0..4 {
                 let idx = rc2i(r, c, 0, 4, 4, 1, 1, 1, 1, Ordering::RowMajor);
-                assert_eq!(idx, r * 4 + c,
-                    "rc2i row-major ({r},{c}): expected {}, got {idx}", r * 4 + c);
+                assert_eq!(idx, r * 4 + c, "rc2i row-major ({r},{c}): expected {}, got {idx}", r * 4 + c);
             }
         }
 
@@ -1101,8 +1064,7 @@ mod tests {
         for r in 0..4 {
             for c in 0..4 {
                 let idx = rc2i(r, c, 0, 4, 4, 1, 1, 1, 1, Ordering::ColMajor);
-                assert_eq!(idx, c * 4 + r,
-                    "rc2i col-major ({r},{c}): expected {}, got {idx}", c * 4 + r);
+                assert_eq!(idx, c * 4 + r, "rc2i col-major ({r},{c}): expected {}, got {idx}", c * 4 + r);
             }
         }
     }
@@ -1134,8 +1096,7 @@ mod tests {
             let mode = ShuffleMode::from_mode(i).unwrap();
             let result = shuffle_vectors(&lo, &hi, mode);
             // Just verify it produces 64 bytes without panicking
-            assert_eq!(result.len(), VEC_BYTES,
-                "mode {i}: result length mismatch");
+            assert_eq!(result.len(), VEC_BYTES, "mode {i}: result length mismatch");
         }
     }
 
@@ -1196,8 +1157,7 @@ mod tests {
         for i in 0..=47u8 {
             let mode = ShuffleMode::from_mode(i).unwrap();
             let result = shuffle_vectors(&zero, &zero, mode);
-            assert_eq!(result, zero,
-                "mode {i}: zero input should produce zero output");
+            assert_eq!(result, zero, "mode {i}: zero input should produce zero output");
         }
     }
 
@@ -1221,7 +1181,9 @@ mod tests {
         // Broadcast u16 components: a1d6, ea99, c25a, 45ba
         let comp: [u8; 8] = [0xd6, 0xa1, 0x99, 0xea, 0x5a, 0xc2, 0xba, 0x45];
         let mut bcast = [0u8; VEC_BYTES];
-        for i in 0..8 { bcast[i*8..i*8+8].copy_from_slice(&comp); }
+        for i in 0..8 {
+            bcast[i * 8..i * 8 + 8].copy_from_slice(&comp);
+        }
 
         // HW output: [A A 0 0 B B 0 0 C C 0 0 D D 0 0] * 2
         let mut hw = [0u8; VEC_BYTES];
@@ -1229,14 +1191,17 @@ mod tests {
         for half in 0..2 {
             let base = half * 32;
             for (c, comp) in comps.iter().enumerate() {
-                hw[base + c*8] = comp[0]; hw[base + c*8+1] = comp[1];
-                hw[base + c*8+2] = comp[0]; hw[base + c*8+3] = comp[1];
+                hw[base + c * 8] = comp[0];
+                hw[base + c * 8 + 1] = comp[1];
+                hw[base + c * 8 + 2] = comp[0];
+                hw[base + c * 8 + 3] = comp[1];
             }
         }
 
         let result = shuffle_vectors(&bcast, &zero, ShuffleMode::T16_4x16Lo);
-        assert_eq!(result, hw,
-            "shuffle(broadcast.64, zeros, T16_4x16Lo) must match NPU1 VBCSTSHFL_64 output");
+        assert_eq!(
+            result, hw,
+            "shuffle(broadcast.64, zeros, T16_4x16Lo) must match NPU1 VBCSTSHFL_64 output"
+        );
     }
 }
-

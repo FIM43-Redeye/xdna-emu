@@ -19,7 +19,11 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
+            ElementType::Int32
+            | ElementType::UInt32
+            | ElementType::Int64
+            | ElementType::UInt64
+            | ElementType::Float32 => {
                 for i in 0..8 {
                     if sel[i] & 1 != 0 {
                         result[i] = s1[i].wrapping_sub(s2[i]);
@@ -36,8 +40,16 @@ impl VectorAlu {
                     let b_hi = ((s2[i] >> 16) & 0xFFFF) as u16;
                     let sel_lo = sel[i] & 1;
                     let sel_hi = (sel[i] >> 16) & 1;
-                    let r_lo = if sel_lo != 0 { a_lo.wrapping_sub(b_lo) } else { a_lo.wrapping_add(b_lo) };
-                    let r_hi = if sel_hi != 0 { a_hi.wrapping_sub(b_hi) } else { a_hi.wrapping_add(b_hi) };
+                    let r_lo = if sel_lo != 0 {
+                        a_lo.wrapping_sub(b_lo)
+                    } else {
+                        a_lo.wrapping_add(b_lo)
+                    };
+                    let r_hi = if sel_hi != 0 {
+                        a_hi.wrapping_sub(b_hi)
+                    } else {
+                        a_hi.wrapping_add(b_hi)
+                    };
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -447,7 +459,11 @@ impl VectorAlu {
     pub(super) fn vector_shift_left(src: &[u32; 8], shift: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
+            ElementType::Int32
+            | ElementType::UInt32
+            | ElementType::Int64
+            | ElementType::UInt64
+            | ElementType::Float32 => {
                 for i in 0..8 {
                     let sh = shift[i] & 0x1F;
                     result[i] = src[i].wrapping_shl(sh);
@@ -481,10 +497,18 @@ impl VectorAlu {
     }
 
     /// Vector logical right shift: unsigned shift right.
-    pub(super) fn vector_shift_right_logical(src: &[u32; 8], shift: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+    pub(super) fn vector_shift_right_logical(
+        src: &[u32; 8],
+        shift: &[u32; 8],
+        elem_type: ElementType,
+    ) -> [u32; 8] {
         let mut result = [0u32; 8];
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
+            ElementType::Int32
+            | ElementType::UInt32
+            | ElementType::Int64
+            | ElementType::UInt64
+            | ElementType::Float32 => {
                 for i in 0..8 {
                     let sh = shift[i] & 0x1F;
                     result[i] = src[i].wrapping_shr(sh);
@@ -518,10 +542,18 @@ impl VectorAlu {
     }
 
     /// Vector arithmetic right shift: signed shift right (preserves sign bit).
-    pub(super) fn vector_shift_right_arith(src: &[u32; 8], shift: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+    pub(super) fn vector_shift_right_arith(
+        src: &[u32; 8],
+        shift: &[u32; 8],
+        elem_type: ElementType,
+    ) -> [u32; 8] {
         let mut result = [0u32; 8];
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
+            ElementType::Int32
+            | ElementType::UInt32
+            | ElementType::Int64
+            | ElementType::UInt64
+            | ElementType::Float32 => {
                 for i in 0..8 {
                     let sh = (shift[i] & 0x1F) as u32;
                     result[i] = ((src[i] as i32).wrapping_shr(sh)) as u32;
@@ -709,7 +741,11 @@ impl VectorAlu {
             ElementType::UInt32 | ElementType::UInt64 => {
                 for i in 0..8 {
                     let c = cmp[i];
-                    result[i] = if c > 0 { (s1[i] as i32).wrapping_neg() as u32 } else { s1[i] };
+                    result[i] = if c > 0 {
+                        (s1[i] as i32).wrapping_neg() as u32
+                    } else {
+                        s1[i]
+                    };
                 }
             }
             ElementType::Float32 => {
@@ -1013,8 +1049,7 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32
-            | ElementType::Int64 | ElementType::UInt64 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
                 for i in 0..8 {
                     result[i] = a[i].wrapping_sub(b[i]);
                 }
@@ -1193,22 +1228,15 @@ impl VectorAlu {
     // operation, gated by op.is_wide_vector internally.
 
     /// Execute vector Add (includes VADDSUB detection).
-    pub(super) fn execute_add(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        et: ElementType,
-    ) -> bool {
+    pub(super) fn execute_add(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         // Two variants:
         // 1. VADD_elem: simple vector add (2 sources)
         // 2. VADDSUB: conditional add/subtract (2 vector + 1 scalar source)
         //    vaddsub.8 $d, $s1, $s2, $sel
         //    d[i] = (sel[i] & 1) ? s1[i] - s2[i] : s1[i] + s2[i]
         //    sel is a SCALAR register (bitmask), not a vector.
-        let has_scalar_sel = op.sources.iter()
-            .any(|s| matches!(s, Operand::ScalarReg(_)))
-            && op.sources.iter()
-                .filter(|s| matches!(s, Operand::VectorReg(_)))
-                .count() == 2;
+        let has_scalar_sel = op.sources.iter().any(|s| matches!(s, Operand::ScalarReg(_)))
+            && op.sources.iter().filter(|s| matches!(s, Operand::VectorReg(_))).count() == 2;
 
         if op.is_wide_vector {
             if has_scalar_sel {
@@ -1229,9 +1257,17 @@ impl VectorAlu {
                 let sel_lo = Self::expand_select_mask(sel_scalar, et);
                 let sel_hi_bits = if elems_per_half >= 32 {
                     // 8-bit: 64-bit selector, upper 32 bits in the next register
-                    let sel_reg = op.sources.iter().find_map(|s| {
-                        if let Operand::ScalarReg(r) = s { Some(*r) } else { None }
-                    }).unwrap_or(0);
+                    let sel_reg = op
+                        .sources
+                        .iter()
+                        .find_map(|s| {
+                            if let Operand::ScalarReg(r) = s {
+                                Some(*r)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
                     ctx.scalar_read(sel_reg + 1)
                 } else {
                     sel_scalar >> elems_per_half
@@ -1268,11 +1304,7 @@ impl VectorAlu {
     }
 
     /// Execute vector Neg (includes accumulator-only routing).
-    pub(super) fn execute_neg(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        et: ElementType,
-    ) -> bool {
+    pub(super) fn execute_neg(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         // Detect accumulator-only: AccumReg source with no VectorReg source.
         let is_accum_only = op.sources.iter().any(|s| matches!(s, Operand::AccumReg(_)))
             && !op.sources.iter().any(|s| matches!(s, Operand::VectorReg(_)));
@@ -1293,38 +1325,22 @@ impl VectorAlu {
     }
 
     /// Execute vector shift left.
-    pub(super) fn execute_shl(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        et: ElementType,
-    ) -> bool {
+    pub(super) fn execute_shl(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         Self::execute_binary_elementwise(op, ctx, et, Self::vector_shift_left)
     }
 
     /// Execute vector logical shift right.
-    pub(super) fn execute_srl(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        et: ElementType,
-    ) -> bool {
+    pub(super) fn execute_srl(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         Self::execute_binary_elementwise(op, ctx, et, Self::vector_shift_right_logical)
     }
 
     /// Execute vector arithmetic shift right.
-    pub(super) fn execute_sra(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        et: ElementType,
-    ) -> bool {
+    pub(super) fn execute_sra(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         Self::execute_binary_elementwise(op, ctx, et, Self::vector_shift_right_arith)
     }
 
     /// Execute AbsGtz: absolute value + comparison flags (s > 0).
-    pub(super) fn execute_abs_gtz(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        et: ElementType,
-    ) -> bool {
+    pub(super) fn execute_abs_gtz(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         if op.is_wide_vector {
             let a = Self::get_wide_vec_source(op, ctx, 0);
             let result = Self::wide_element_wise_unary(&a, et, Self::vector_abs_gtz);
@@ -1342,16 +1358,10 @@ impl VectorAlu {
     }
 
     /// Execute NegGtz: negate + comparison flags (s > 0).
-    pub(super) fn execute_neg_gtz(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        et: ElementType,
-    ) -> bool {
+    pub(super) fn execute_neg_gtz(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         if op.is_wide_vector {
             // Two-vector-source variant (VNEG_GTZ with select operand) uses fallback.
-            let vec_source_count = op.sources.iter()
-                .filter(|s| matches!(s, Operand::VectorReg(_)))
-                .count();
+            let vec_source_count = op.sources.iter().filter(|s| matches!(s, Operand::VectorReg(_))).count();
             if vec_source_count >= 2 {
                 // Two-source wide VNEG_GTZ: not yet implemented.
                 return false;
@@ -1360,9 +1370,7 @@ impl VectorAlu {
             let result = Self::wide_element_wise_unary(&a, et, Self::vector_neg_gtz);
             Self::write_wide_vec_dest(op, ctx, result);
         } else {
-            let vec_source_count = op.sources.iter()
-                .filter(|s| matches!(s, Operand::VectorReg(_)))
-                .count();
+            let vec_source_count = op.sources.iter().filter(|s| matches!(s, Operand::VectorReg(_))).count();
 
             let src = if vec_source_count >= 2 {
                 let cond = Self::get_vector_source(op, ctx, 0);
@@ -1385,11 +1393,7 @@ impl VectorAlu {
     }
 
     /// Execute NegLtz: bitwise NOT + comparison flags (s < 0).
-    pub(super) fn execute_neg_ltz(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        et: ElementType,
-    ) -> bool {
+    pub(super) fn execute_neg_ltz(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         if op.is_wide_vector {
             let a = Self::get_wide_vec_source(op, ctx, 0);
             let result = Self::wide_element_wise_unary(&a, et, Self::vector_neg_ltz);
@@ -1407,11 +1411,7 @@ impl VectorAlu {
     }
 
     /// Execute SubLt: subtraction + comparison flags (a < b).
-    pub(super) fn execute_sub_lt(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        et: ElementType,
-    ) -> bool {
+    pub(super) fn execute_sub_lt(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         if op.is_wide_vector {
             let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
             let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_sub_lt);
@@ -1428,11 +1428,7 @@ impl VectorAlu {
     }
 
     /// Execute SubGe: subtraction + comparison flags (a >= b).
-    pub(super) fn execute_sub_ge(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        et: ElementType,
-    ) -> bool {
+    pub(super) fn execute_sub_ge(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         if op.is_wide_vector {
             let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
             let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_sub_ge);
@@ -1449,11 +1445,7 @@ impl VectorAlu {
     }
 
     /// Execute MaxDiffLt: max(a-b, 0) + comparison flags (a < b).
-    pub(super) fn execute_maxdiff_lt(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        et: ElementType,
-    ) -> bool {
+    pub(super) fn execute_maxdiff_lt(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         if op.is_wide_vector {
             let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
             let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_maxdiff_lt);
@@ -1533,8 +1525,16 @@ impl VectorAlu {
             }
         }
 
-        let acc1_reg = if !acc_sources.is_empty() { acc_sources[0] } else { 0 };
-        let acc2_reg = if acc_sources.len() >= 2 { acc_sources[1] } else { acc1_reg };
+        let acc1_reg = if !acc_sources.is_empty() {
+            acc_sources[0]
+        } else {
+            0
+        };
+        let acc2_reg = if acc_sources.len() >= 2 {
+            acc_sources[1]
+        } else {
+            acc1_reg
+        };
 
         // Read config register.
         let conf = Self::get_config_register(op, ctx).unwrap_or(0);
@@ -1565,17 +1565,17 @@ impl VectorAlu {
         // Map semantic -> (md1, md2).  Accept both AccumXxx (build-time) and
         // generic NegAdd (runtime mnemonic dispatch, no NegSub variant exists).
         let (md1, md2) = match semantic {
-            SemanticOp::Accumulate => (false, false),                    // VADD
-            SemanticOp::AccumSub => (false, true),                       // VSUB
-            SemanticOp::AccumNegAdd => (true, true),                     // VNEGADD
-            SemanticOp::AccumNegSub => (true, false),                    // VNEGSUB
+            SemanticOp::Accumulate => (false, false), // VADD
+            SemanticOp::AccumSub => (false, true),    // VSUB
+            SemanticOp::AccumNegAdd => (true, true),  // VNEGADD
+            SemanticOp::AccumNegSub => (true, false), // VNEGSUB
             SemanticOp::NegAdd => {
                 // Runtime mnemonic dispatch -- both vnegadd and vnegsub map to
                 // NegAdd.  Distinguish via encoding name.
                 if enc_lower.contains("negsub") {
-                    (true, false)                                        // VNEGSUB
+                    (true, false) // VNEGSUB
                 } else {
-                    (true, true)                                         // VNEGADD
+                    (true, true) // VNEGADD
                 }
             }
             _ => (false, false),
@@ -1612,14 +1612,28 @@ impl VectorAlu {
             if is_float {
                 use super::vector_float::{fp32_flush_to_zero, aie2_acc_fp32_add};
                 for i in 0..16 {
-                    let mut a1_lo = if zero_acc1 { 0u32 } else { fp32_flush_to_zero(a1[i] as u32) };
-                    let mut a1_hi = if zero_acc1 { 0u32 } else { fp32_flush_to_zero((a1[i] >> 32) as u32) };
+                    let mut a1_lo = if zero_acc1 {
+                        0u32
+                    } else {
+                        fp32_flush_to_zero(a1[i] as u32)
+                    };
+                    let mut a1_hi = if zero_acc1 {
+                        0u32
+                    } else {
+                        fp32_flush_to_zero((a1[i] >> 32) as u32)
+                    };
                     let mut a2_lo = fp32_flush_to_zero(a2[i] as u32);
                     let mut a2_hi = fp32_flush_to_zero((a2[i] >> 32) as u32);
 
                     // Negate by flipping sign bit (works for zero, normal, inf, NaN).
-                    if negate_acc1 { a1_lo ^= 0x8000_0000; a1_hi ^= 0x8000_0000; }
-                    if negate_acc2 { a2_lo ^= 0x8000_0000; a2_hi ^= 0x8000_0000; }
+                    if negate_acc1 {
+                        a1_lo ^= 0x8000_0000;
+                        a1_hi ^= 0x8000_0000;
+                    }
+                    if negate_acc2 {
+                        a2_lo ^= 0x8000_0000;
+                        a2_hi ^= 0x8000_0000;
+                    }
 
                     // Use acc ALU add (no output FTZ): the accumulator
                     // register file preserves denormalized fp32 values.
@@ -1642,7 +1656,10 @@ impl VectorAlu {
                     let v2_hi = if negate_acc2 { v2_hi.wrapping_neg() } else { v2_hi };
                     let mut r_lo = v1_lo.wrapping_add(v2_lo);
                     let mut r_hi = v1_hi.wrapping_add(v2_hi);
-                    if shift16 { r_lo >>= 16; r_hi >>= 16; }
+                    if shift16 {
+                        r_lo >>= 16;
+                        r_hi >>= 16;
+                    }
                     result[i] = (r_lo as u32 as u64) | ((r_hi as u32 as u64) << 32);
                 }
             }
@@ -1657,13 +1674,27 @@ impl VectorAlu {
             if is_float {
                 use super::vector_float::{fp32_flush_to_zero, aie2_acc_fp32_add};
                 for i in 0..8 {
-                    let mut a1_lo = if zero_acc1 { 0u32 } else { fp32_flush_to_zero(a1[i] as u32) };
-                    let mut a1_hi = if zero_acc1 { 0u32 } else { fp32_flush_to_zero((a1[i] >> 32) as u32) };
+                    let mut a1_lo = if zero_acc1 {
+                        0u32
+                    } else {
+                        fp32_flush_to_zero(a1[i] as u32)
+                    };
+                    let mut a1_hi = if zero_acc1 {
+                        0u32
+                    } else {
+                        fp32_flush_to_zero((a1[i] >> 32) as u32)
+                    };
                     let mut a2_lo = fp32_flush_to_zero(a2[i] as u32);
                     let mut a2_hi = fp32_flush_to_zero((a2[i] >> 32) as u32);
 
-                    if negate_acc1 { a1_lo ^= 0x8000_0000; a1_hi ^= 0x8000_0000; }
-                    if negate_acc2 { a2_lo ^= 0x8000_0000; a2_hi ^= 0x8000_0000; }
+                    if negate_acc1 {
+                        a1_lo ^= 0x8000_0000;
+                        a1_hi ^= 0x8000_0000;
+                    }
+                    if negate_acc2 {
+                        a2_lo ^= 0x8000_0000;
+                        a2_hi ^= 0x8000_0000;
+                    }
 
                     let r_lo = aie2_acc_fp32_add(a1_lo, a2_lo);
                     let r_hi = aie2_acc_fp32_add(a1_hi, a2_hi);
@@ -1682,7 +1713,10 @@ impl VectorAlu {
                     let v2_hi = if negate_acc2 { v2_hi.wrapping_neg() } else { v2_hi };
                     let mut r_lo = v1_lo.wrapping_add(v2_lo);
                     let mut r_hi = v1_hi.wrapping_add(v2_hi);
-                    if shift16 { r_lo >>= 16; r_hi >>= 16; }
+                    if shift16 {
+                        r_lo >>= 16;
+                        r_hi >>= 16;
+                    }
                     result[i] = (r_lo as u32 as u64) | ((r_hi as u32 as u64) << 32);
                 }
             }
@@ -1698,10 +1732,14 @@ impl VectorAlu {
     /// producing 0). Float mode is detected from element_type (Float32/BFloat16):
     /// each u64 lane holds two fp32 values (bits [31:0] and bits [63:32]).
     pub(super) fn execute_acc_negate(op: &SlotOp, ctx: &mut ExecutionContext) {
-        let acc_reg = op.sources.iter().find_map(|s| match s {
-            Operand::AccumReg(r) => Some(*r),
-            _ => None,
-        }).unwrap_or(0);
+        let acc_reg = op
+            .sources
+            .iter()
+            .find_map(|s| match s {
+                Operand::AccumReg(r) => Some(*r),
+                _ => None,
+            })
+            .unwrap_or(0);
         let dst_reg = Self::get_acc_dest(op);
 
         let conf = Self::get_config_register(op, ctx).unwrap_or(0);
@@ -1730,12 +1768,20 @@ impl VectorAlu {
                 for i in 0..16 {
                     let lo = fp32_flush_to_zero(src[i] as u32);
                     let hi = fp32_flush_to_zero((src[i] >> 32) as u32);
-                    let r_lo = if zero_acc { 0u32 }
-                        else if fp32_is_nan(lo) { fp32_make_nan(false) }
-                        else { lo ^ 0x8000_0000 };
-                    let r_hi = if zero_acc { 0u32 }
-                        else if fp32_is_nan(hi) { fp32_make_nan(false) }
-                        else { hi ^ 0x8000_0000 };
+                    let r_lo = if zero_acc {
+                        0u32
+                    } else if fp32_is_nan(lo) {
+                        fp32_make_nan(false)
+                    } else {
+                        lo ^ 0x8000_0000
+                    };
+                    let r_hi = if zero_acc {
+                        0u32
+                    } else if fp32_is_nan(hi) {
+                        fp32_make_nan(false)
+                    } else {
+                        hi ^ 0x8000_0000
+                    };
                     result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
             } else {
@@ -1757,12 +1803,20 @@ impl VectorAlu {
                 for i in 0..8 {
                     let lo = fp32_flush_to_zero(src[i] as u32);
                     let hi = fp32_flush_to_zero((src[i] >> 32) as u32);
-                    let r_lo = if zero_acc { 0u32 }
-                        else if fp32_is_nan(lo) { fp32_make_nan(false) }
-                        else { lo ^ 0x8000_0000 };
-                    let r_hi = if zero_acc { 0u32 }
-                        else if fp32_is_nan(hi) { fp32_make_nan(false) }
-                        else { hi ^ 0x8000_0000 };
+                    let r_lo = if zero_acc {
+                        0u32
+                    } else if fp32_is_nan(lo) {
+                        fp32_make_nan(false)
+                    } else {
+                        lo ^ 0x8000_0000
+                    };
+                    let r_hi = if zero_acc {
+                        0u32
+                    } else if fp32_is_nan(hi) {
+                        fp32_make_nan(false)
+                    } else {
+                        hi ^ 0x8000_0000
+                    };
                     result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
             } else {
@@ -1992,7 +2046,7 @@ mod tests {
 
         VectorAlu::execute(&op, &mut ctx);
         let result = ctx.vector.read(2);
-        assert_eq!(f32::from_bits(result[0]), 0.5);  // min(1.0, 0.5)
+        assert_eq!(f32::from_bits(result[0]), 0.5); // min(1.0, 0.5)
         assert_eq!(f32::from_bits(result[1]), -2.0); // min(-2.0, -1.0)
         assert_eq!(f32::from_bits(result[3]), -5.0); // min(-4.0, -5.0)
 
@@ -2005,7 +2059,7 @@ mod tests {
 
         VectorAlu::execute(&op, &mut ctx);
         let result = ctx.vector.read(2);
-        assert_eq!(f32::from_bits(result[0]), 1.0);  // max(1.0, 0.5)
+        assert_eq!(f32::from_bits(result[0]), 1.0); // max(1.0, 0.5)
         assert_eq!(f32::from_bits(result[1]), -1.0); // max(-2.0, -1.0)
         assert_eq!(f32::from_bits(result[3]), -4.0); // max(-4.0, -5.0)
     }
@@ -2023,16 +2077,8 @@ mod tests {
         }
 
         // Create vectors with bf16 pairs
-        let a: [u32; 8] = [
-            pack_bf16(1.0, 2.0),
-            pack_bf16(3.0, 4.0),
-            0, 0, 0, 0, 0, 0,
-        ];
-        let b: [u32; 8] = [
-            pack_bf16(0.5, 0.5),
-            pack_bf16(0.5, 0.5),
-            0, 0, 0, 0, 0, 0,
-        ];
+        let a: [u32; 8] = [pack_bf16(1.0, 2.0), pack_bf16(3.0, 4.0), 0, 0, 0, 0, 0, 0];
+        let b: [u32; 8] = [pack_bf16(0.5, 0.5), pack_bf16(0.5, 0.5), 0, 0, 0, 0, 0, 0];
 
         ctx.vector.write(0, a);
         ctx.vector.write(1, b);
@@ -2273,11 +2319,11 @@ mod tests {
     #[test]
     fn addsub_i32_mixed() {
         let s1 = [10, 20, 0, 0, 0, 0, 0, 0];
-        let s2 = [3,  5, 0, 0, 0, 0, 0, 0];
+        let s2 = [3, 5, 0, 0, 0, 0, 0, 0];
         // sel bit 0: lane 0 subtracts, lane 1 adds
         let sel = [1, 0, 0, 0, 0, 0, 0, 0];
         let r = VectorAlu::vector_addsub(&s1, &s2, &sel, ElementType::Int32);
-        assert_eq!(r[0], 7);  // 10 - 3
+        assert_eq!(r[0], 7); // 10 - 3
         assert_eq!(r[1], 25); // 20 + 5
     }
 
@@ -2289,8 +2335,8 @@ mod tests {
         let val = [10, 20, 30, 0, 0, 0, 0, 0];
         let r = VectorAlu::vector_bneg_gtz(&cmp, &val, ElementType::Int32);
         assert_eq!(r[0] as i32, -10); // cmp > 0 -> negate
-        assert_eq!(r[1], 20);         // cmp == 0 -> no change
-        assert_eq!(r[2], 30);         // cmp < 0 -> no change
+        assert_eq!(r[1], 20); // cmp == 0 -> no change
+        assert_eq!(r[2], 30); // cmp < 0 -> no change
     }
 
     // -- vector_maxdiff_lt --
@@ -2300,9 +2346,9 @@ mod tests {
         let a = [5, 3, 10, 0, 0, 0, 0, 0];
         let b = [3, 5, 10, 0, 0, 0, 0, 0];
         let r = VectorAlu::vector_maxdiff_lt(&a, &b, ElementType::UInt32);
-        assert_eq!(r[0], 2);  // 5 - 3
-        assert_eq!(r[1], 0);  // 3 - 5 saturates to 0
-        assert_eq!(r[2], 0);  // 10 - 10
+        assert_eq!(r[0], 2); // 5 - 3
+        assert_eq!(r[1], 0); // 3 - 5 saturates to 0
+        assert_eq!(r[2], 0); // 10 - 10
     }
 
     #[test]
@@ -2310,7 +2356,7 @@ mod tests {
         let a = [(-10i32) as u32, 10, 0, 0, 0, 0, 0, 0];
         let b = [5, (-5i32) as u32, 0, 0, 0, 0, 0, 0];
         let r = VectorAlu::vector_maxdiff_lt(&a, &b, ElementType::Int32);
-        assert_eq!(r[0], 0);  // -10 - 5 < 0 -> clamp to 0
+        assert_eq!(r[0], 0); // -10 - 5 < 0 -> clamp to 0
         assert_eq!(r[1], 15); // 10 - (-5) = 15
     }
 
@@ -2322,7 +2368,7 @@ mod tests {
         let b = [3, 3, 0, 0, 0, 0, 0, 0];
         let r = VectorAlu::vector_neg_add(&a, &b, ElementType::Int32);
         assert_eq!(r[0] as i32, -7); // -10 + 3
-        assert_eq!(r[1] as i32, 8);  // 5 + 3
+        assert_eq!(r[1] as i32, 8); // 5 + 3
     }
 
     #[test]
@@ -2418,8 +2464,7 @@ mod tests {
         // Each u64 lane should hold two copies of canonical NaN = 0x7F800001.
         let expected = 0x7F800001_7F800001u64;
         for (i, &v) in result.iter().enumerate() {
-            assert_eq!(v, expected,
-                "acc lane {} should be canonical NaN pair, got {:#018x}", i, v);
+            assert_eq!(v, expected, "acc lane {} should be canonical NaN pair, got {:#018x}", i, v);
         }
     }
 
@@ -2437,11 +2482,18 @@ mod tests {
 
         // Simulate UPS: sign-extend 16 s16 values to s32, pack 2 per u64.
         // Values 0..15: all small positive -> denormalized f32 patterns.
-        let src = [0x0002_0001u32, 0x0004_0003, 0x0006_0005, 0x0008_0007,
-                    0x000A_0009, 0x000C_000B, 0x000E_000D, 0x0010_000F];
-        let acc = super::super::vector_ups::ups_vector_to_acc(
-            &src, 0, ElementType::Int16, ElementType::Int32,
-        );
+        let src = [
+            0x0002_0001u32,
+            0x0004_0003,
+            0x0006_0005,
+            0x0008_0007,
+            0x000A_0009,
+            0x000C_000B,
+            0x000E_000D,
+            0x0010_000F,
+        ];
+        let acc =
+            super::super::vector_ups::ups_vector_to_acc(&src, 0, ElementType::Int16, ElementType::Int32);
         ctx.accumulator.write(0, acc);
 
         // Build a vadd.f operation: bml0 = bml0 + bml0.

@@ -16,12 +16,16 @@ impl VectorAlu {
     /// Handles both narrow and wide paths, including accumulator sources
     /// with AccumWidth detection (Quarter/Half/Full).
     pub(super) fn execute_convert(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
-        let has_wide_acc_source = matches!(op.accum_width,
+        let has_wide_acc_source = matches!(
+            op.accum_width,
             Some(crate::interpreter::decode::register_map::AccumWidth::Full)
-            | Some(crate::interpreter::decode::register_map::AccumWidth::Half));
-        let is_quarter_acc = matches!(op.accum_width,
+                | Some(crate::interpreter::decode::register_map::AccumWidth::Half)
+        );
+        let is_quarter_acc = matches!(
+            op.accum_width,
             Some(crate::interpreter::decode::register_map::AccumWidth::QuarterLow)
-            | Some(crate::interpreter::decode::register_map::AccumWidth::QuarterHigh));
+                | Some(crate::interpreter::decode::register_map::AccumWidth::QuarterHigh)
+        );
 
         if op.is_wide_vector || has_wide_acc_source || is_quarter_acc {
             Self::execute_convert_wide(op, ctx, et)
@@ -76,11 +80,8 @@ impl VectorAlu {
                 None
             }
         });
-        let is_vfloor = from == ElementType::BFloat16
-            && et == ElementType::Int32
-            && shift_val.is_some();
-        let has_acc_source = op.sources.iter()
-            .any(|s| matches!(s, Operand::AccumReg(_)));
+        let is_vfloor = from == ElementType::BFloat16 && et == ElementType::Int32 && shift_val.is_some();
+        let has_acc_source = op.sources.iter().any(|s| matches!(s, Operand::AccumReg(_)));
 
         if has_acc_source {
             // Accumulator source: read acc data as raw bits, then convert.
@@ -94,15 +95,17 @@ impl VectorAlu {
             // The raw bits are reinterpreted according to `from` type -- e.g.,
             // VFLOOR reads a quarter as 16 packed BF16 values, not as lane values.
             let acc_reg = Self::get_acc_source(op);
-            let is_quarter = matches!(op.accum_width,
-                Some(crate::interpreter::decode::register_map::AccumWidth::QuarterLow) |
-                Some(crate::interpreter::decode::register_map::AccumWidth::QuarterHigh));
+            let is_quarter = matches!(
+                op.accum_width,
+                Some(crate::interpreter::decode::register_map::AccumWidth::QuarterLow)
+                    | Some(crate::interpreter::decode::register_map::AccumWidth::QuarterHigh)
+            );
             // Only Full (cm-class) is truly wide (1024-bit, 16 lanes).
             // Half (bml/bmh) is 512-bit = 8 lanes. When accum_width is
             // None, default to half -- the even-register heuristic was
             // wrong because bml registers ARE even-numbered.
-            let is_wide = matches!(op.accum_width,
-                Some(crate::interpreter::decode::register_map::AccumWidth::Full));
+            let is_wide =
+                matches!(op.accum_width, Some(crate::interpreter::decode::register_map::AccumWidth::Full));
 
             let (src_lo, src_hi) = if is_quarter {
                 // Quarter-accumulator: 256 bits = 4 u64 lanes.
@@ -141,7 +144,7 @@ impl VectorAlu {
                 let acc = ctx.accumulator.read(acc_reg);
                 let mut all = [0u32; 16];
                 for i in 0..8 {
-                    all[i * 2] = acc[i] as u32;         // val[2i]
+                    all[i * 2] = acc[i] as u32; // val[2i]
                     all[i * 2 + 1] = (acc[i] >> 32) as u32; // val[2i+1]
                 }
                 let mut lo = [0u32; 8];
@@ -152,11 +155,9 @@ impl VectorAlu {
             };
             let (res_lo, res_hi) = if is_vfloor {
                 let s = shift_val.unwrap();
-                (Self::vector_floor_bf16_to_s32(&src_lo, s),
-                 Self::vector_floor_bf16_to_s32(&src_hi, s))
+                (Self::vector_floor_bf16_to_s32(&src_lo, s), Self::vector_floor_bf16_to_s32(&src_hi, s))
             } else {
-                (Self::vector_convert(&src_lo, from, et),
-                 Self::vector_convert(&src_hi, from, et))
+                (Self::vector_convert(&src_lo, from, et), Self::vector_convert(&src_hi, from, et))
             };
             // VCONV may produce narrow output (e.g., f32->bf16 packs 8 f32
             // into 4 words of bf16). Write to the appropriate dest width.
@@ -173,8 +174,7 @@ impl VectorAlu {
                 let words_per_half = (8 * et.bits() as usize) / (from.bits() as usize);
                 let mut result = [0u32; 8];
                 result[..words_per_half].copy_from_slice(&res_lo[..words_per_half]);
-                result[words_per_half..words_per_half * 2]
-                    .copy_from_slice(&res_hi[..words_per_half]);
+                result[words_per_half..words_per_half * 2].copy_from_slice(&res_hi[..words_per_half]);
                 Self::write_vector_dest(op, ctx, result);
             } else {
                 // Same-width or expansion from half/full acc.
@@ -194,11 +194,9 @@ impl VectorAlu {
                 hi_in[..4].copy_from_slice(&src[4..]);
                 let (res_lo, res_hi) = if is_vfloor {
                     let s = shift_val.unwrap();
-                    (Self::vector_floor_bf16_to_s32(&lo_in, s),
-                     Self::vector_floor_bf16_to_s32(&hi_in, s))
+                    (Self::vector_floor_bf16_to_s32(&lo_in, s), Self::vector_floor_bf16_to_s32(&hi_in, s))
                 } else {
-                    (Self::vector_convert(&lo_in, from, et),
-                     Self::vector_convert(&hi_in, from, et))
+                    (Self::vector_convert(&lo_in, from, et), Self::vector_convert(&hi_in, from, et))
                 };
                 if matches!(op.dest, Some(Operand::AccumReg(_))) {
                     // Accumulator dest: pack 16 x u32 into 8 x u64.
@@ -360,7 +358,12 @@ mod tests {
             [
                 (bf16_1 as u32) | ((bf16_2 as u32) << 16),
                 (bf16_3 as u32) | ((bf16_4 as u32) << 16),
-                0, 0, 0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
             ],
         );
 
@@ -389,7 +392,12 @@ mod tests {
             &[
                 ((VectorAlu::f32_to_bf16(1.5) as u32) | ((VectorAlu::f32_to_bf16(-2.5) as u32) << 16)),
                 ((VectorAlu::f32_to_bf16(0.0) as u32) | ((VectorAlu::f32_to_bf16(100.0) as u32) << 16)),
-                0, 0, 0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
             ],
             0,
         );
@@ -443,9 +451,15 @@ mod tests {
         for i in 0..8 {
             let lo_bf16 = (result[i / 2] >> ((i % 2) * 16)) as u16;
             let expected = VectorAlu::f32_to_bf16((i + 1) as f32);
-            assert_eq!(lo_bf16, expected,
+            assert_eq!(
+                lo_bf16,
+                expected,
                 "element {}: expected bf16({}.0)=0x{:04X}, got 0x{:04X}",
-                i, i + 1, expected, lo_bf16);
+                i,
+                i + 1,
+                expected,
+                lo_bf16
+            );
         }
     }
 
@@ -478,10 +492,20 @@ mod tests {
             let f_hi = f32::from_bits(hi);
             let expected_lo = (i * 2 + 1) as f32;
             let expected_hi = (i * 2 + 2) as f32;
-            assert!((f_lo - expected_lo).abs() < 0.1,
-                "lane {} lo: expected {}, got {}", i, expected_lo, f_lo);
-            assert!((f_hi - expected_hi).abs() < 0.1,
-                "lane {} hi: expected {}, got {}", i, expected_hi, f_hi);
+            assert!(
+                (f_lo - expected_lo).abs() < 0.1,
+                "lane {} lo: expected {}, got {}",
+                i,
+                expected_lo,
+                f_lo
+            );
+            assert!(
+                (f_hi - expected_hi).abs() < 0.1,
+                "lane {} hi: expected {}, got {}",
+                i,
+                expected_hi,
+                f_hi
+            );
         }
     }
 

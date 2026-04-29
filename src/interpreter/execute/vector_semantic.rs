@@ -151,9 +151,7 @@ pub(crate) fn get_two_vector_sources(op: &SlotOp, ctx: &ExecutionContext) -> ([u
 
 /// Read a single vector source operand by index.
 pub(crate) fn get_vector_source(op: &SlotOp, ctx: &ExecutionContext, idx: usize) -> [u32; 8] {
-    op.sources
-        .get(idx)
-        .map_or([0; 8], |src| read_vector_operand(src, ctx))
+    op.sources.get(idx).map_or([0; 8], |src| read_vector_operand(src, ctx))
 }
 
 /// Interpret an operand as a vector register read.
@@ -416,7 +414,11 @@ pub(crate) fn vector_cmp_eq(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) 
     let mut result = [0u32; 8];
 
     match elem_type {
-        ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
+        ElementType::Int32
+        | ElementType::UInt32
+        | ElementType::Int64
+        | ElementType::UInt64
+        | ElementType::Float32 => {
             for i in 0..8 {
                 result[i] = if a[i] == b[i] { 0xFFFF_FFFF } else { 0 };
             }
@@ -822,7 +824,6 @@ pub(crate) fn vector_sra(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
     result
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -838,13 +839,7 @@ mod tests {
     }
 
     // -- Helper to build a vector binop --
-    fn make_binop(
-        semantic: SemanticOp,
-        et: ElementType,
-        src0: u8,
-        src1: u8,
-        dst: u8,
-    ) -> SlotOp {
+    fn make_binop(semantic: SemanticOp, et: ElementType, src0: u8, src1: u8, dst: u8) -> SlotOp {
         SlotOp::from_semantic(SlotIndex::Vector, semantic)
             .as_vector(et)
             .with_dest(Operand::VectorReg(dst))
@@ -862,10 +857,7 @@ mod tests {
         ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
         ctx.vector.write(1, [10, 20, 30, 40, 50, 60, 70, 80]);
 
-        let op = make_binop(
-            SemanticOp::Add, ElementType::Int32,
-            0, 1, 2,
-        );
+        let op = make_binop(SemanticOp::Add, ElementType::Int32, 0, 1, 2);
         assert!(execute_vector_semantic(&op, &mut ctx));
         assert_eq!(ctx.vector.read(2), [11, 22, 33, 44, 55, 66, 77, 88]);
     }
@@ -884,10 +876,7 @@ mod tests {
         ctx.vector.write(0, [0x0002_0001, 0, 0, 0, 0, 0, 0, 0]);
         ctx.vector.write(1, [0x0020_0010, 0, 0, 0, 0, 0, 0, 0]);
 
-        let op = make_binop(
-            SemanticOp::Add, ElementType::Int16,
-            0, 1, 2,
-        );
+        let op = make_binop(SemanticOp::Add, ElementType::Int16, 0, 1, 2);
         execute_vector_semantic(&op, &mut ctx);
         assert_eq!(ctx.vector.read(2)[0], 0x0022_0011);
     }
@@ -904,17 +893,20 @@ mod tests {
     fn test_vector_add_f32() {
         let mut ctx = make_ctx();
         let a: [u32; 8] = [
-            1.0f32.to_bits(), 2.0f32.to_bits(), 3.0f32.to_bits(), 4.0f32.to_bits(),
-            5.0f32.to_bits(), 6.0f32.to_bits(), 7.0f32.to_bits(), 8.0f32.to_bits(),
+            1.0f32.to_bits(),
+            2.0f32.to_bits(),
+            3.0f32.to_bits(),
+            4.0f32.to_bits(),
+            5.0f32.to_bits(),
+            6.0f32.to_bits(),
+            7.0f32.to_bits(),
+            8.0f32.to_bits(),
         ];
         let b: [u32; 8] = [0.5f32.to_bits(); 8];
         ctx.vector.write(0, a);
         ctx.vector.write(1, b);
 
-        let op = make_binop(
-            SemanticOp::Add, ElementType::Float32,
-            0, 1, 2,
-        );
+        let op = make_binop(SemanticOp::Add, ElementType::Float32, 0, 1, 2);
         execute_vector_semantic(&op, &mut ctx);
         let result = ctx.vector.read(2);
         assert_eq!(f32::from_bits(result[0]), 1.5);
@@ -1298,10 +1290,7 @@ mod tests {
         ctx.vector.write(0, [1; 8]);
         ctx.vector.write(1, [2; 8]);
 
-        let op = make_binop(
-            SemanticOp::Add, ElementType::UInt32,
-            0, 1, 2,
-        );
+        let op = make_binop(SemanticOp::Add, ElementType::UInt32, 0, 1, 2);
         assert!(execute_vector_semantic(&op, &mut ctx));
         assert_eq!(ctx.vector.read(2), [3; 8]);
     }
@@ -1312,10 +1301,7 @@ mod tests {
         ctx.vector.write(0, [10; 8]);
         ctx.vector.write(1, [3; 8]);
 
-        let op = make_binop(
-            SemanticOp::Sub, ElementType::UInt32,
-            0, 1, 2,
-        );
+        let op = make_binop(SemanticOp::Sub, ElementType::UInt32, 0, 1, 2);
         assert!(execute_vector_semantic(&op, &mut ctx));
         assert_eq!(ctx.vector.read(2), [7; 8]);
     }
@@ -1326,10 +1312,7 @@ mod tests {
         ctx.vector.write(0, [5; 8]);
         ctx.vector.write(1, [3; 8]);
 
-        let op = make_binop(
-            SemanticOp::Mul, ElementType::UInt32,
-            0, 1, 2,
-        );
+        let op = make_binop(SemanticOp::Mul, ElementType::UInt32, 0, 1, 2);
         assert!(execute_vector_semantic(&op, &mut ctx));
         assert_eq!(ctx.vector.read(2), [15; 8]);
     }
@@ -1340,10 +1323,7 @@ mod tests {
         ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
         ctx.vector.write(1, [1, 0, 3, 0, 5, 0, 7, 0]);
 
-        let op = make_binop(
-            SemanticOp::Cmp, ElementType::Int32,
-            0, 1, 2,
-        );
+        let op = make_binop(SemanticOp::Cmp, ElementType::Int32, 0, 1, 2);
         assert!(execute_vector_semantic(&op, &mut ctx));
         let result = ctx.vector.read(2);
         assert_eq!(result[0], 0xFFFF_FFFF);
@@ -1358,10 +1338,7 @@ mod tests {
         ctx.vector.write(0, [5, 10, 15, 20, 25, 30, 35, 40]);
         ctx.vector.write(1, [10, 5, 20, 15, 30, 25, 40, 35]);
 
-        let op = make_binop(
-            SemanticOp::Min, ElementType::UInt32,
-            0, 1, 2,
-        );
+        let op = make_binop(SemanticOp::Min, ElementType::UInt32, 0, 1, 2);
         assert!(execute_vector_semantic(&op, &mut ctx));
         assert_eq!(ctx.vector.read(2), [5, 5, 15, 15, 25, 25, 35, 35]);
     }
@@ -1372,10 +1349,7 @@ mod tests {
         ctx.vector.write(0, [5, 10, 15, 20, 25, 30, 35, 40]);
         ctx.vector.write(1, [10, 5, 20, 15, 30, 25, 40, 35]);
 
-        let op = make_binop(
-            SemanticOp::Max, ElementType::UInt32,
-            0, 1, 2,
-        );
+        let op = make_binop(SemanticOp::Max, ElementType::UInt32, 0, 1, 2);
         assert!(execute_vector_semantic(&op, &mut ctx));
         assert_eq!(ctx.vector.read(2), [10, 10, 20, 20, 30, 30, 40, 40]);
     }

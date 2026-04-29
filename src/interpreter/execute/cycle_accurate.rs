@@ -30,9 +30,7 @@ use crate::device::tile::Tile;
 use crate::interpreter::bundle::{Operand, SlotOp, VliwBundle};
 use xdna_archspec::aie2::isa::SemanticOp;
 use crate::interpreter::state::{EventType, ExecutionContext};
-use crate::interpreter::timing::{
-    HazardDetector, HazardStats, MemoryAccess, MemoryModel,
-};
+use crate::interpreter::timing::{HazardDetector, HazardStats, MemoryAccess, MemoryModel};
 use crate::interpreter::traits::{ExecuteResult, Executor};
 
 use super::cascade::{CascadeOps, CascadeResult};
@@ -202,13 +200,17 @@ impl CycleAccurateExecutor {
                 // Resolve address from the first pointer register in operands.
                 // This is approximate (doesn't account for modifiers/offsets)
                 // but sufficient for bank conflict detection.
-                let addr = op.sources.iter().find_map(|src| match src {
-                    Operand::Memory { base, offset } => {
-                        Some(ctx.pointer.read(*base).wrapping_add(*offset as i32 as u32))
-                    }
-                    Operand::PointerReg(r) => Some(ctx.pointer.read(*r)),
-                    _ => None,
-                }).unwrap_or(0);
+                let addr = op
+                    .sources
+                    .iter()
+                    .find_map(|src| match src {
+                        Operand::Memory { base, offset } => {
+                            Some(ctx.pointer.read(*base).wrapping_add(*offset as i32 as u32))
+                        }
+                        Operand::PointerReg(r) => Some(ctx.pointer.read(*r)),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
                 let is_store = matches!(op.semantic, Some(SemanticOp::Store));
                 let access = MemoryAccess {
                     address: addr,
@@ -221,10 +223,8 @@ impl CycleAccurateExecutor {
                     let cycle = ctx.cycles;
                     let stall = conflict.stall_cycles;
                     self.total_memory_stalls += stall as u64;
-                    ctx.timing_context_mut().record_event(
-                        cycle,
-                        EventType::MemoryStall { cycles: stall },
-                    );
+                    ctx.timing_context_mut()
+                        .record_event(cycle, EventType::MemoryStall { cycles: stall });
                 }
             }
             _ => {}
@@ -357,10 +357,10 @@ impl CycleAccurateExecutor {
         // last writer (in this order) wins.  All reads use the pre-bundle
         // snapshot, so execution order does not affect read values.
         let execution_order = [
-            SlotIndex::LoadA,      // Primary load port (LDA)
-            SlotIndex::LoadB,      // Secondary load port (LDB)
-            SlotIndex::Store,      // Register reads for stores (before scalar writes!)
-            SlotIndex::Scalar0,    // Scalar operations
+            SlotIndex::LoadA,   // Primary load port (LDA)
+            SlotIndex::LoadB,   // Secondary load port (LDB)
+            SlotIndex::Store,   // Register reads for stores (before scalar writes!)
+            SlotIndex::Scalar0, // Scalar operations
             SlotIndex::Scalar1,
             SlotIndex::Vector,
             SlotIndex::Accumulator,
@@ -377,13 +377,9 @@ impl CycleAccurateExecutor {
         // This models the II_STHB RMW pipeline (operand latency 7).
         let ready_stores = ctx.drain_ready_stores();
         for ps in &ready_stores {
-            let value = super::memory::MemoryUnit::read_store_register(
-                &ps.source, ctx, ps.width,
-            );
+            let value = super::memory::MemoryUnit::read_store_register(&ps.source, ctx, ps.width);
             let neighbor_ref = neighbors.as_mut().map(|n| &mut **n);
-            super::memory::MemoryUnit::write_memory(
-                tile, ps.address, value, ps.width, neighbor_ref,
-            );
+            super::memory::MemoryUnit::write_memory(tile, ps.address, value, ps.width, neighbor_ref);
         }
 
         // Pre-check stall conditions for cascade and stream slots.
@@ -417,10 +413,8 @@ impl CycleAccurateExecutor {
                         _ => 254,
                     };
                     let stall_cycle = ctx.cycles;
-                    ctx.timing_context_mut().record_event(
-                        stall_cycle,
-                        EventType::StreamStall { cycles: 1 },
-                    );
+                    ctx.timing_context_mut()
+                        .record_event(stall_cycle, EventType::StreamStall { cycles: 1 });
                     ctx.record_instruction(1);
                     let timing = ctx.timing_context_mut();
                     timing.hazard_stalls = self.total_hazard_stalls;
@@ -431,10 +425,8 @@ impl CycleAccurateExecutor {
                     super::stream::StreamOps::would_stall(op, tile)
                 {
                     let stall_cycle = ctx.cycles;
-                    ctx.timing_context_mut().record_event(
-                        stall_cycle,
-                        EventType::StreamStall { cycles: 1 },
-                    );
+                    ctx.timing_context_mut()
+                        .record_event(stall_cycle, EventType::StreamStall { cycles: 1 });
                     ctx.record_instruction(1);
                     let timing = ctx.timing_context_mut();
                     timing.hazard_stalls = self.total_hazard_stalls;
@@ -458,7 +450,9 @@ impl CycleAccurateExecutor {
             if let Some(ref op) = bundle.slots()[*slot_idx as usize] {
                 // Reborrow neighbors for each slot operation
                 let slot_neighbors = neighbors.as_mut().map(|n| &mut **n);
-                if let Some(result) = self.execute_slot_with_neighbor_locks(op, ctx, tile, neighbor_locks, slot_neighbors) {
+                if let Some(result) =
+                    self.execute_slot_with_neighbor_locks(op, ctx, tile, neighbor_locks, slot_neighbors)
+                {
                     match &result {
                         ExecuteResult::Branch { .. }
                         | ExecuteResult::Call { .. }
@@ -493,8 +487,7 @@ impl CycleAccurateExecutor {
                     match slot_idx {
                         SlotIndex::LoadA | SlotIndex::LoadB => Some(EventType::InstrLoad { pc }),
                         SlotIndex::Store => Some(EventType::InstrStore { pc }),
-                        SlotIndex::Vector | SlotIndex::Accumulator =>
-                            Some(EventType::InstrVector { pc }),
+                        SlotIndex::Vector | SlotIndex::Accumulator => Some(EventType::InstrVector { pc }),
                         _ => None, // Scalar/Control events classified below
                     }
                 };
@@ -531,7 +524,8 @@ impl CycleAccurateExecutor {
             // Return is detected by the control unit returning a Branch to LR.
             // We check if the branch target matches the link register value.
             ExecuteResult::Branch { target } if *target == ctx.lr() => {
-                ctx.timing_context_mut().record_event(start_cycle, EventType::InstrReturn { pc });
+                ctx.timing_context_mut()
+                    .record_event(start_cycle, EventType::InstrReturn { pc });
             }
             ExecuteResult::Halt => {
                 ctx.timing_context_mut().record_event(start_cycle, EventType::CoreDisabled);
@@ -540,26 +534,32 @@ impl CycleAccurateExecutor {
                 // haven't committed yet. The hardware pipeline drains them before
                 // the core truly stops.
                 for _ in 0..10 {
-                    if ctx.pending_stores_empty() { break; }
+                    if ctx.pending_stores_empty() {
+                        break;
+                    }
                     ctx.cycles += 1;
                     ctx.commit_pending_writes();
                     let stores = ctx.drain_ready_stores();
                     for ps in &stores {
-                        let value = super::memory::MemoryUnit::read_store_register(
-                            &ps.source, ctx, ps.width,
-                        );
+                        let value = super::memory::MemoryUnit::read_store_register(&ps.source, ctx, ps.width);
                         let neighbor_ref = neighbors.as_mut().map(|n| &mut **n);
                         super::memory::MemoryUnit::write_memory(
-                            tile, ps.address, value, ps.width, neighbor_ref,
+                            tile,
+                            ps.address,
+                            value,
+                            ps.width,
+                            neighbor_ref,
                         );
                     }
                 }
             }
             ExecuteResult::WaitLock { .. } => {
-                ctx.timing_context_mut().record_event(start_cycle, EventType::LockStall { cycles: 1 });
+                ctx.timing_context_mut()
+                    .record_event(start_cycle, EventType::LockStall { cycles: 1 });
             }
             ExecuteResult::WaitStream { .. } => {
-                ctx.timing_context_mut().record_event(start_cycle, EventType::StreamStall { cycles: 1 });
+                ctx.timing_context_mut()
+                    .record_event(start_cycle, EventType::StreamStall { cycles: 1 });
             }
             _ => {}
         }
@@ -581,10 +581,8 @@ impl CycleAccurateExecutor {
         };
         if let Some(target) = branch_target {
             let branch_cycle = ctx.cycles;
-            ctx.timing_context_mut().record_event(
-                branch_cycle,
-                EventType::BranchTaken { from_pc: pc, to_pc: target },
-            );
+            ctx.timing_context_mut()
+                .record_event(branch_cycle, EventType::BranchTaken { from_pc: pc, to_pc: target });
         }
 
         // Advance cycle counter by 1 (pipelined issue rate).
@@ -601,12 +599,7 @@ impl CycleAccurateExecutor {
 }
 
 impl Executor for CycleAccurateExecutor {
-    fn execute(
-        &mut self,
-        bundle: &VliwBundle,
-        ctx: &mut ExecutionContext,
-        tile: &mut Tile,
-    ) -> ExecuteResult {
+    fn execute(&mut self, bundle: &VliwBundle, ctx: &mut ExecutionContext, tile: &mut Tile) -> ExecuteResult {
         // Delegate to internal implementation with no neighbor locks or memory
         self.execute_internal(bundle, ctx, tile, &mut super::control::NeighborLocks::none(), None)
     }
@@ -673,12 +666,10 @@ mod tests {
         ctx.scalar.write(1, 20);
 
         // Scalar add has 1 cycle latency
-        let bundle = make_bundle(vec![
-            SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
-                .with_dest(Operand::ScalarReg(2))
-                .with_source(Operand::ScalarReg(0))
-                .with_source(Operand::ScalarReg(1)),
-        ]);
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
+            .with_dest(Operand::ScalarReg(2))
+            .with_source(Operand::ScalarReg(0))
+            .with_source(Operand::ScalarReg(1))]);
 
         executor.execute(&bundle, &mut ctx, &mut tile);
 
@@ -696,12 +687,10 @@ mod tests {
         ctx.scalar.write(1, 6);
 
         // Scalar mul has 2 cycle latency
-        let bundle = make_bundle(vec![
-            SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::Mul)
-                .with_dest(Operand::ScalarReg(2))
-                .with_source(Operand::ScalarReg(0))
-                .with_source(Operand::ScalarReg(1)),
-        ]);
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::Mul)
+            .with_dest(Operand::ScalarReg(2))
+            .with_source(Operand::ScalarReg(0))
+            .with_source(Operand::ScalarReg(1))]);
 
         executor.execute(&bundle, &mut ctx, &mut tile);
         assert_eq!(ctx.cycles, 1); // 1 cycle to issue (pipelined)
@@ -723,12 +712,10 @@ mod tests {
         ctx.pointer.write(0, 0x100);
 
         // Memory load has 5 cycle latency
-        let bundle = make_bundle(vec![
-            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
-                .with_mem_width(MemWidth::Word)
-                .with_dest(Operand::ScalarReg(0))
-                .with_source(Operand::PointerReg(0)),
-        ]);
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Word)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0))]);
 
         executor.execute(&bundle, &mut ctx, &mut tile);
 
@@ -771,12 +758,12 @@ mod tests {
 
         executor.execute(&bundle, &mut ctx, &mut tile);
 
-        assert!(
-            executor.total_memory_stalls > 0,
-            "two loads to bank 0 should bump total_memory_stalls"
-        );
+        assert!(executor.total_memory_stalls > 0, "two loads to bank 0 should bump total_memory_stalls");
         let timing = ctx.timing_context();
-        let memory_stall_events: Vec<_> = timing.events.events().iter()
+        let memory_stall_events: Vec<_> = timing
+            .events
+            .events()
+            .iter()
             .filter(|e| matches!(e.event, EventType::MemoryStall { .. }))
             .collect();
         assert!(
@@ -818,11 +805,9 @@ mod tests {
         let mut ctx = ExecutionContext::new();
         let mut tile = Tile::compute(0, 2);
 
-        let bundle = make_bundle(vec![
-            SlotOp::from_semantic(SlotIndex::Control, SemanticOp::Br)
-                .with_branch_condition(BranchCondition::Always)
-                .with_source(Operand::Immediate(0x100)),
-        ]);
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Control, SemanticOp::Br)
+            .with_branch_condition(BranchCondition::Always)
+            .with_source(Operand::Immediate(0x100))]);
 
         let result = executor.execute(&bundle, &mut ctx, &mut tile);
 
@@ -844,11 +829,9 @@ mod tests {
         let mut ctx = ExecutionContext::new();
         let mut tile = Tile::compute(0, 2);
 
-        let bundle = make_bundle(vec![
-            SlotOp::from_semantic(SlotIndex::Control, SemanticOp::Br)
-                .with_branch_condition(BranchCondition::Always)
-                .with_source(Operand::Immediate(0x200)),
-        ]);
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Control, SemanticOp::Br)
+            .with_branch_condition(BranchCondition::Always)
+            .with_source(Operand::Immediate(0x200))]);
 
         executor.execute(&bundle, &mut ctx, &mut tile);
 
@@ -874,12 +857,10 @@ mod tests {
         ctx.scalar.write(0, 10);
         ctx.scalar.write(1, 20);
 
-        let bundle = make_bundle(vec![
-            SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
-                .with_dest(Operand::ScalarReg(2))
-                .with_source(Operand::ScalarReg(0))
-                .with_source(Operand::ScalarReg(1)),
-        ]);
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
+            .with_dest(Operand::ScalarReg(2))
+            .with_source(Operand::ScalarReg(0))
+            .with_source(Operand::ScalarReg(1))]);
 
         executor.execute(&bundle, &mut ctx, &mut tile);
 
@@ -908,11 +889,9 @@ mod tests {
         let mut tile = Tile::compute(0, 2);
 
         // Execute a branch instruction
-        let bundle = make_bundle(vec![
-            SlotOp::from_semantic(SlotIndex::Control, SemanticOp::Br)
-                .with_branch_condition(BranchCondition::Always)
-                .with_source(Operand::Immediate(0x200)),
-        ]);
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Control, SemanticOp::Br)
+            .with_branch_condition(BranchCondition::Always)
+            .with_source(Operand::Immediate(0x200))]);
 
         executor.execute(&bundle, &mut ctx, &mut tile);
 
@@ -921,9 +900,9 @@ mod tests {
         let events = timing.events.events();
 
         // Should have BranchTaken event (hardware-aligned)
-        let has_branch_taken = events.iter().any(|e| {
-            matches!(e.event, EventType::BranchTaken { from_pc: 0, to_pc: 0x200 })
-        });
+        let has_branch_taken = events
+            .iter()
+            .any(|e| matches!(e.event, EventType::BranchTaken { from_pc: 0, to_pc: 0x200 }));
 
         assert!(has_branch_taken, "Should have BranchTaken event");
     }
@@ -935,12 +914,10 @@ mod tests {
         let mut ctx = ExecutionContext::new();
         let mut tile = Tile::compute(0, 2);
 
-        let bundle = make_bundle(vec![
-            SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
-                .with_dest(Operand::ScalarReg(2))
-                .with_source(Operand::ScalarReg(0))
-                .with_source(Operand::ScalarReg(1)),
-        ]);
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
+            .with_dest(Operand::ScalarReg(2))
+            .with_source(Operand::ScalarReg(0))
+            .with_source(Operand::ScalarReg(1))]);
 
         executor.execute(&bundle, &mut ctx, &mut tile);
 
@@ -964,29 +941,21 @@ mod tests {
         ctx.pointer.write(1, 0xDEAD); // Old p1 value
 
         // movxm p1, #0x70400
-        let bundle = make_bundle(vec![
-            SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::Copy)
-                .with_dest(Operand::PointerReg(1))
-                .with_source(Operand::Immediate(0x70400)),
-        ]);
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::Copy)
+            .with_dest(Operand::PointerReg(1))
+            .with_source(Operand::Immediate(0x70400))]);
 
         executor.execute(&bundle, &mut ctx, &mut tile);
 
         // After execution, p1 should still be the OLD value (write is deferred).
-        assert_eq!(
-            ctx.pointer.read(1), 0xDEAD,
-            "Pointer write should be deferred, not visible immediately"
-        );
+        assert_eq!(ctx.pointer.read(1), 0xDEAD, "Pointer write should be deferred, not visible immediately");
 
         // Execute another bundle (any NOP will do). This calls commit_pending_writes.
         let nop = make_bundle(vec![]);
         executor.execute(&nop, &mut ctx, &mut tile);
 
         // Now p1 should have the new value (committed at start of cycle 2).
-        assert_eq!(
-            ctx.pointer.read(1), 0x70400,
-            "Pointer write should be committed after one cycle"
-        );
+        assert_eq!(ctx.pointer.read(1), 0x70400, "Pointer write should be committed after one cycle");
     }
 
     #[test]
@@ -1008,7 +977,8 @@ mod tests {
         ctx.cycles = 6;
         ctx.commit_pending_writes();
         assert_eq!(
-            ctx.pointer.read(1), 0xDEAD,
+            ctx.pointer.read(1),
+            0xDEAD,
             "Pointer write should NOT be visible at branch target (cycle 6)"
         );
 
@@ -1016,7 +986,8 @@ mod tests {
         ctx.cycles = 7;
         ctx.commit_pending_writes();
         assert_eq!(
-            ctx.pointer.read(1), 0x70400,
+            ctx.pointer.read(1),
+            0x70400,
             "Pointer write should be visible one cycle after branch target"
         );
     }
@@ -1057,14 +1028,8 @@ mod tests {
         executor.execute(&bundle, &mut ctx, &mut tile);
 
         let events = ctx.timing_context().events.events();
-        let has_instr_vector = events
-            .iter()
-            .any(|e| matches!(e.event, EventType::InstrVector { .. }));
-        assert!(
-            !has_instr_vector,
-            "NOPV must not emit INSTR_VECTOR; events: {:?}",
-            events
-        );
+        let has_instr_vector = events.iter().any(|e| matches!(e.event, EventType::InstrVector { .. }));
+        assert!(!has_instr_vector, "NOPV must not emit INSTR_VECTOR; events: {:?}", events);
     }
 
     #[test]
@@ -1080,14 +1045,8 @@ mod tests {
         executor.execute(&bundle, &mut ctx, &mut tile);
 
         let events = ctx.timing_context().events.events();
-        let has_instr_load = events
-            .iter()
-            .any(|e| matches!(e.event, EventType::InstrLoad { .. }));
-        assert!(
-            !has_instr_load,
-            "NOPA must not emit INSTR_LOAD; events: {:?}",
-            events
-        );
+        let has_instr_load = events.iter().any(|e| matches!(e.event, EventType::InstrLoad { .. }));
+        assert!(!has_instr_load, "NOPA must not emit INSTR_LOAD; events: {:?}", events);
     }
 
     #[test]
@@ -1103,14 +1062,8 @@ mod tests {
         executor.execute(&bundle, &mut ctx, &mut tile);
 
         let events = ctx.timing_context().events.events();
-        let has_instr_store = events
-            .iter()
-            .any(|e| matches!(e.event, EventType::InstrStore { .. }));
-        assert!(
-            !has_instr_store,
-            "NOPS must not emit INSTR_STORE; events: {:?}",
-            events
-        );
+        let has_instr_store = events.iter().any(|e| matches!(e.event, EventType::InstrStore { .. }));
+        assert!(!has_instr_store, "NOPS must not emit INSTR_STORE; events: {:?}", events);
     }
 
     #[test]
@@ -1124,12 +1077,10 @@ mod tests {
         tile.write_data_u32(0x100, 42);
         ctx.pointer.write(0, 0x100);
 
-        let bundle = make_bundle(vec![
-            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
-                .with_mem_width(MemWidth::Word)
-                .with_dest(Operand::ScalarReg(0))
-                .with_source(Operand::PointerReg(0)),
-        ]);
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Word)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0))]);
         executor.execute(&bundle, &mut ctx, &mut tile);
 
         let events = ctx.timing_context().events.events();
@@ -1138,7 +1089,8 @@ mod tests {
             .filter(|e| matches!(e.event, EventType::InstrLoad { .. }))
             .collect();
         assert_eq!(
-            instr_loads.len(), 1,
+            instr_loads.len(),
+            1,
             "Real load should emit exactly one INSTR_LOAD; events: {:?}",
             events
         );
@@ -1168,12 +1120,14 @@ mod tests {
         let events = ctx.timing_context().events.events();
         let unit_activity: Vec<_> = events
             .iter()
-            .filter(|e| matches!(
-                e.event,
-                EventType::InstrLoad { .. }
-                    | EventType::InstrStore { .. }
-                    | EventType::InstrVector { .. }
-            ))
+            .filter(|e| {
+                matches!(
+                    e.event,
+                    EventType::InstrLoad { .. }
+                        | EventType::InstrStore { .. }
+                        | EventType::InstrVector { .. }
+                )
+            })
             .collect();
         assert!(
             unit_activity.is_empty(),

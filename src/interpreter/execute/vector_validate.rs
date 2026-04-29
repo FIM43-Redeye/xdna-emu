@@ -82,8 +82,7 @@ fn load_golden() -> GoldenData {
     let path = golden_path();
     let data = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("Failed to read golden data at {}: {}", path.display(), e));
-    serde_json::from_str(&data)
-        .unwrap_or_else(|e| panic!("Failed to parse golden data: {}", e))
+    serde_json::from_str(&data).unwrap_or_else(|e| panic!("Failed to parse golden data: {}", e))
 }
 
 /// Run a binary vector operation through VectorAlu::execute.
@@ -165,8 +164,15 @@ fn validate_srs_golden() {
                 first_failures.push(format!(
                     "SRS MISMATCH: value={}, shift={}, signed={}, bits_o={}, \
                      sat={}, sym_sat={}, rnd={}: expected={}, actual={}",
-                    case.value, case.shift, case.signed, case.bits_o,
-                    case.sat, case.sym_sat, case.rnd, case.expected, actual,
+                    case.value,
+                    case.shift,
+                    case.signed,
+                    case.bits_o,
+                    case.sat,
+                    case.sym_sat,
+                    case.rnd,
+                    case.expected,
+                    actual,
                 ));
             }
         }
@@ -211,8 +217,7 @@ fn validate_ups_golden() {
                 first_failures.push(format!(
                     "UPS MISMATCH: value={}, shift={}, bits_in={}, bits_out={}, \
                      sat={}: expected={}, actual={}",
-                    case.value, case.shift, case.bits_in, case.bits_out,
-                    case.sat, case.expected, actual,
+                    case.value, case.shift, case.bits_in, case.bits_out, case.sat, case.expected, actual,
                 ));
             }
         }

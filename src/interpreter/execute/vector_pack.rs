@@ -41,11 +41,7 @@ fn truncate(value: i64, signed: bool, bits: u32) -> i64 {
     if bits == 0 {
         return 0;
     }
-    let mask = if bits >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << bits) - 1
-    };
+    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
     let masked = (value as u64) & mask;
 
     if signed && bits < 64 {
@@ -115,13 +111,7 @@ pub fn unpack_lane(value: i64, bits_i: u32, bits_o: u32, signed: bool) -> i64 {
 /// The input is treated as 512/bits_i lanes of `bits_i`-bit values packed
 /// into the 256-bit (8 x u32) register representation. The output contains
 /// 512/bits_i lanes of `bits_o`-bit values, repacked into 8 x u32.
-pub fn pack_vector(
-    src: &[u32; 8],
-    bits_i: u32,
-    bits_o: u32,
-    signed: bool,
-    mode: PackMode,
-) -> [u32; 8] {
+pub fn pack_vector(src: &[u32; 8], bits_i: u32, bits_o: u32, signed: bool, mode: PackMode) -> [u32; 8] {
     let lanes = (512 / bits_i) as usize;
     let mut narrowed = vec![0i64; lanes];
 
@@ -141,12 +131,7 @@ pub fn pack_vector(
 ///
 /// The input is treated as 512/bits_o lanes of `bits_i`-bit values. Each
 /// lane is widened to `bits_o` bits. The result contains 512/bits_o lanes.
-pub fn unpack_vector(
-    src: &[u32; 8],
-    bits_i: u32,
-    bits_o: u32,
-    signed: bool,
-) -> [u32; 8] {
+pub fn unpack_vector(src: &[u32; 8], bits_i: u32, bits_o: u32, signed: bool) -> [u32; 8] {
     // Number of output lanes that fit in a 512-bit register
     let lanes = (512 / bits_o) as usize;
     let mut widened = vec![0i64; lanes];
@@ -224,13 +209,7 @@ pub fn unpack_widths_from_name(name: &str) -> (u32, u32, bool) {
 ///
 /// Processes one 256-bit register, treating it as 256/bits_i lanes of
 /// bits_i-width values, and packs each down to bits_o width.
-pub fn pack_half(
-    src: &[u32; 8],
-    bits_i: u32,
-    bits_o: u32,
-    signed: bool,
-    mode: PackMode,
-) -> [u32; 8] {
+pub fn pack_half(src: &[u32; 8], bits_i: u32, bits_o: u32, signed: bool, mode: PackMode) -> [u32; 8] {
     let lanes = (256 / bits_i) as usize;
     let mut narrowed = vec![0i64; lanes];
     for i in 0..lanes {
@@ -247,13 +226,7 @@ pub fn pack_half(
 /// Extracts lanes at bits_i width starting from lane_start, widens each to
 /// bits_o, and packs the results into a 256-bit output register. The number
 /// of output lanes is 256/bits_o.
-pub fn unpack_half(
-    src: &[u32; 8],
-    lane_start: usize,
-    bits_i: u32,
-    bits_o: u32,
-    signed: bool,
-) -> [u32; 8] {
+pub fn unpack_half(src: &[u32; 8], lane_start: usize, bits_i: u32, bits_o: u32, signed: bool) -> [u32; 8] {
     let out_lanes = (256 / bits_o) as usize;
     let mut widened = vec![0i64; out_lanes];
     for i in 0..out_lanes {
@@ -346,20 +319,15 @@ impl VectorAlu {
             let src_lo: [u32; 8] = src[..8].try_into().unwrap();
             let src_hi: [u32; 8] = src[8..].try_into().unwrap();
 
-            let packed_lo = pack_half(
-                &src_lo, bits_i, bits_o, signed, PackMode::Truncate,
-            );
-            let packed_hi = pack_half(
-                &src_hi, bits_i, bits_o, signed, PackMode::Truncate,
-            );
+            let packed_lo = pack_half(&src_lo, bits_i, bits_o, signed, PackMode::Truncate);
+            let packed_hi = pack_half(&src_hi, bits_i, bits_o, signed, PackMode::Truncate);
 
             // Each half produces (256/bits_i * bits_o) bits of packed data.
             // Concatenate the two halves into a single 256-bit w-register.
             let words_per_half = ((256 / bits_i) * bits_o / 32) as usize;
             let mut result = [0u32; 8];
             result[..words_per_half].copy_from_slice(&packed_lo[..words_per_half]);
-            result[words_per_half..words_per_half * 2]
-                .copy_from_slice(&packed_hi[..words_per_half]);
+            result[words_per_half..words_per_half * 2].copy_from_slice(&packed_hi[..words_per_half]);
 
             // Write to 256-bit w-register dest (NOT write_wide_vec_dest).
             Self::write_vector_dest(op, ctx, result);
@@ -397,9 +365,7 @@ impl VectorAlu {
             // reads from lane_start = 256/bits_o in the source.
             let lanes_per_half = (256 / bits_o) as usize;
             let result_lo = unpack_half(&src, 0, bits_i, bits_o, signed);
-            let result_hi = unpack_half(
-                &src, lanes_per_half, bits_i, bits_o, signed,
-            );
+            let result_hi = unpack_half(&src, lanes_per_half, bits_i, bits_o, signed);
 
             let mut result = [0u32; 16];
             result[..8].copy_from_slice(&result_lo);
@@ -558,8 +524,7 @@ mod tests {
     #[test]
     fn extract_insert_roundtrip_16bit() {
         // 16 lanes of 16-bit values in 256 bits (8 x u32)
-        let values: Vec<i64> = vec![1, -2, 3, -4, 5, -6, 7, -8,
-                                     9, -10, 11, -12, 13, -14, 15, -16];
+        let values: Vec<i64> = vec![1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16];
         let mut reg = [0u32; 8];
         insert_lanes(&mut reg, &values, 16);
 
@@ -603,8 +568,7 @@ mod tests {
         // 8 lanes of 32-bit -> 8 lanes of 16-bit (lower half of result).
         // Input: [0x10001, 0x20002, 0x30003, 0x40004, 0x50005, 0x60006, 0x70007, 0x80008]
         let mut src = [0u32; 8];
-        let vals: Vec<i64> = vec![0x10001, 0x20002, 0x30003, 0x40004,
-                                   0x50005, 0x60006, 0x70007, 0x80008];
+        let vals: Vec<i64> = vec![0x10001, 0x20002, 0x30003, 0x40004, 0x50005, 0x60006, 0x70007, 0x80008];
         insert_lanes(&mut src, &vals, 32);
 
         let result = pack_vector(&src, 32, 16, false, PackMode::Truncate);
@@ -622,10 +586,9 @@ mod tests {
         // 256-bit register holds 16 lanes at 16-bit.
         let mut src = [0u32; 8];
         let vals: Vec<i64> = vec![
-            50, -50, 127, -128,     // in range for s8
-            200, -200, 0, 1,        // overflow positive and negative
-            -1, 100, -100, 64,
-            -64, 32, -32, 16,
+            50, -50, 127, -128, // in range for s8
+            200, -200, 0, 1, // overflow positive and negative
+            -1, 100, -100, 64, -64, 32, -32, 16,
         ];
         insert_lanes(&mut src, &vals, 16);
 
@@ -862,7 +825,7 @@ mod tests {
         // Needs 24 bits from bit 24: 8 from word 0, 16 from word 1.
         let mut reg = [0u32; 8];
         reg[0] = 0xAB_00_00_00; // bits [24..32) = 0xAB
-        reg[1] = 0x0000_CDEF;   // bits [32..48) = 0xCDEF -> combined [24..48) = 0xCDEFAB
+        reg[1] = 0x0000_CDEF; // bits [32..48) = 0xCDEF -> combined [24..48) = 0xCDEFAB
         let val = extract_lane(&reg, 1, 24, false);
         // word 0 >> 24 = 0xAB, bits_from_first = 8
         // word 1 << 8 = 0x00CDEF00, OR'd -> raw = 0x00CDEFAB
@@ -906,12 +869,12 @@ mod tests {
 
     #[test]
     fn is_type_token_invalid() {
-        assert!(!is_type_token("D"));      // too short
-        assert!(!is_type_token("VPACK"));  // wrong prefix
-        assert!(!is_type_token("DX"));     // not a number
-        assert!(!is_type_token("8"));      // no prefix
-        assert!(!is_type_token(""));       // empty
-        assert!(!is_type_token("AG"));     // wrong prefix
+        assert!(!is_type_token("D")); // too short
+        assert!(!is_type_token("VPACK")); // wrong prefix
+        assert!(!is_type_token("DX")); // not a number
+        assert!(!is_type_token("8")); // no prefix
+        assert!(!is_type_token("")); // empty
+        assert!(!is_type_token("AG")); // wrong prefix
     }
 
     // -- find_type_pair --

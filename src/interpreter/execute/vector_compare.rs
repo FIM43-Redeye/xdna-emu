@@ -14,7 +14,11 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
+            ElementType::Int32
+            | ElementType::UInt32
+            | ElementType::Int64
+            | ElementType::UInt64
+            | ElementType::Float32 => {
                 for i in 0..8 {
                     result[i] = if a[i] == b[i] { 0xFFFF_FFFF } else { 0 };
                 }
@@ -285,9 +289,11 @@ impl VectorAlu {
     /// Set if greater-or-equal (SetGe).
     pub(super) fn execute_setge(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         // Accumulator sources (Half or Full) need the wide path.
-        let has_wide_acc_source = matches!(op.accum_width,
+        let has_wide_acc_source = matches!(
+            op.accum_width,
             Some(crate::interpreter::decode::register_map::AccumWidth::Full)
-            | Some(crate::interpreter::decode::register_map::AccumWidth::Half));
+                | Some(crate::interpreter::decode::register_map::AccumWidth::Half)
+        );
         if op.is_wide_vector || has_wide_acc_source {
             let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
             let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_ge);
@@ -338,9 +344,11 @@ impl VectorAlu {
     /// Set if less-than (SetLt).
     pub(super) fn execute_setlt(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         // Accumulator sources (Half or Full) need the wide path.
-        let has_wide_acc_source = matches!(op.accum_width,
+        let has_wide_acc_source = matches!(
+            op.accum_width,
             Some(crate::interpreter::decode::register_map::AccumWidth::Full)
-            | Some(crate::interpreter::decode::register_map::AccumWidth::Half));
+                | Some(crate::interpreter::decode::register_map::AccumWidth::Half)
+        );
         if op.is_wide_vector || has_wide_acc_source {
             let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
             let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_lt);
@@ -498,10 +506,14 @@ impl VectorAlu {
             // VSEL: 512-bit select with scalar bitmask.
             // Must split the selector across lo/hi halves.
             let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-            let sel_scalar = op.sources.iter().find_map(|s| match s {
-                Operand::ScalarReg(r) => Some(ctx.scalar_read(*r)),
-                _ => None,
-            }).unwrap_or(0);
+            let sel_scalar = op
+                .sources
+                .iter()
+                .find_map(|s| match s {
+                    Operand::ScalarReg(r) => Some(ctx.scalar_read(*r)),
+                    _ => None,
+                })
+                .unwrap_or(0);
             let a_lo: [u32; 8] = a[..8].try_into().unwrap();
             let a_hi: [u32; 8] = a[8..].try_into().unwrap();
             let b_lo: [u32; 8] = b[..8].try_into().unwrap();
@@ -512,10 +524,13 @@ impl VectorAlu {
                 // 8-bit elements: 64-bit mask from register pair.
                 // The operand decodes as a single ScalarReg (low reg
                 // of the pair). Read r+1 for the high 32 bits.
-                op.sources.iter().find_map(|s| match s {
-                    Operand::ScalarReg(r) => Some(ctx.scalar_read(r + 1)),
-                    _ => None,
-                }).unwrap_or(0)
+                op.sources
+                    .iter()
+                    .find_map(|s| match s {
+                        Operand::ScalarReg(r) => Some(ctx.scalar_read(r + 1)),
+                        _ => None,
+                    })
+                    .unwrap_or(0)
             } else {
                 sel_scalar >> elems_per_half
             };
@@ -541,11 +556,15 @@ impl VectorAlu {
             let s1 = Self::get_vector_source(op, ctx, 0);
             let s2 = Self::get_vector_source(op, ctx, 1);
             // Read the scalar select mask from the last source operand
-            let sel_scalar = op.sources.get(2).map(|s| match s {
-                Operand::ScalarReg(r) => ctx.scalar_read(*r),
-                Operand::Immediate(v) => *v as u32,
-                _ => Self::get_scalar_source(op, ctx),
-            }).unwrap_or(0);
+            let sel_scalar = op
+                .sources
+                .get(2)
+                .map(|s| match s {
+                    Operand::ScalarReg(r) => ctx.scalar_read(*r),
+                    Operand::Immediate(v) => *v as u32,
+                    _ => Self::get_scalar_source(op, ctx),
+                })
+                .unwrap_or(0);
             // Expand scalar mask to per-lane vector mask.
             let sel = Self::expand_select_mask(sel_scalar, et);
             // vector_select does: mask != 0 ? arg1 : arg2
@@ -554,7 +573,13 @@ impl VectorAlu {
             let result = Self::vector_select(&sel, &s2, &s1, et);
             log::debug!(
                 "[VSEL] sel_scalar=0x{:X} sel={:?} s1={:?} s2={:?} -> {:?} (sources={:?}, dest={:?})",
-                sel_scalar, sel, s1, s2, result, op.sources, op.dest
+                sel_scalar,
+                sel,
+                s1,
+                s2,
+                result,
+                op.sources,
+                op.dest
             );
             Self::write_vector_dest(op, ctx, result);
             true
@@ -571,7 +596,11 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
+            ElementType::Int32
+            | ElementType::UInt32
+            | ElementType::Int64
+            | ElementType::UInt64
+            | ElementType::Float32 => {
                 // 8 lanes of 32-bit elements
                 for i in 0..8 {
                     result[i] = if mask[i] != 0 { src1[i] } else { src2[i] };
@@ -645,9 +674,9 @@ mod tests {
         let b = [1, 0, 3, 0, 5, 0, 7, 0];
         let r = VectorAlu::vector_cmp_eq(&a, &b, ElementType::Int32);
         assert_eq!(r[0], !0); // 1 == 1
-        assert_eq!(r[1], 0);  // 2 != 0
+        assert_eq!(r[1], 0); // 2 != 0
         assert_eq!(r[2], !0); // 3 == 3
-        assert_eq!(r[3], 0);  // 4 != 0
+        assert_eq!(r[3], 0); // 4 != 0
     }
 
     #[test]
@@ -677,12 +706,12 @@ mod tests {
     #[test]
     fn test_ge_i32_signed() {
         let a = [5, 0xFFFF_FFFF, 10, 0, 0, 0, 0, 0]; // [5, -1, 10, 0, ...]
-        let b = [3, 0, 10, 1, 0, 0, 0, 0];              // [3,  0, 10, 1, ...]
+        let b = [3, 0, 10, 1, 0, 0, 0, 0]; // [3,  0, 10, 1, ...]
         let r = VectorAlu::vector_compare_ge(&a, &b, ElementType::Int32);
         assert_eq!(r[0], !0); // 5 >= 3
-        assert_eq!(r[1], 0);  // -1 >= 0 is false
+        assert_eq!(r[1], 0); // -1 >= 0 is false
         assert_eq!(r[2], !0); // 10 >= 10
-        assert_eq!(r[3], 0);  // 0 >= 1 is false
+        assert_eq!(r[3], 0); // 0 >= 1 is false
     }
 
     #[test]
@@ -699,7 +728,7 @@ mod tests {
         let b = [f32::to_bits(1.0), f32::to_bits(0.0), 0, 0, 0, 0, 0, 0];
         let r = VectorAlu::vector_compare_ge(&a, &b, ElementType::Float32);
         assert_eq!(r[0], !0); // 1.5 >= 1.0
-        assert_eq!(r[1], 0);  // -1.0 >= 0.0 is false
+        assert_eq!(r[1], 0); // -1.0 >= 0.0 is false
     }
 
     #[test]
@@ -758,11 +787,11 @@ mod tests {
         let a = [0, 1, 0, 0xFFFF_FFFF, 0, 42, 0, 0];
         let r = VectorAlu::vector_compare_eqz(&a, ElementType::Int32);
         assert_eq!(r[0], !0); // 0 == 0
-        assert_eq!(r[1], 0);  // 1 != 0
+        assert_eq!(r[1], 0); // 1 != 0
         assert_eq!(r[2], !0); // 0 == 0
-        assert_eq!(r[3], 0);  // -1 != 0
+        assert_eq!(r[3], 0); // -1 != 0
         assert_eq!(r[4], !0); // 0 == 0
-        assert_eq!(r[5], 0);  // 42 != 0
+        assert_eq!(r[5], 0); // 42 != 0
     }
 
     #[test]

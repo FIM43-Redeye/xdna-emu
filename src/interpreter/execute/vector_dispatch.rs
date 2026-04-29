@@ -28,9 +28,15 @@ impl VectorAlu {
         // Skip fused ops that have memory operands -- MemoryUnit handles these.
         // Standalone SRS/Pack/UPS on memory slots with NO memory operand are
         // register-only and must be handled here.
-        if op.slot.is_memory() && matches!(semantic,
-            SemanticOp::Ups | SemanticOp::Srs | SemanticOp::Pack
-            | SemanticOp::Unpack | SemanticOp::Convert)
+        if op.slot.is_memory()
+            && matches!(
+                semantic,
+                SemanticOp::Ups
+                    | SemanticOp::Srs
+                    | SemanticOp::Pack
+                    | SemanticOp::Unpack
+                    | SemanticOp::Convert
+            )
             && op.sources.iter().any(|s| matches!(s, Operand::Memory { .. }))
         {
             return false;
@@ -38,8 +44,12 @@ impl VectorAlu {
 
         let et = op.element_type.unwrap_or(ElementType::Int32);
 
-        log::trace!("[VECTOR_ALU] Checking semantic={:?} element_type={:?} dest={:?}",
-            semantic, op.element_type, op.dest);
+        log::trace!(
+            "[VECTOR_ALU] Checking semantic={:?} element_type={:?} dest={:?}",
+            semantic,
+            op.element_type,
+            op.dest
+        );
 
         match semantic {
             // ========== Arithmetic ==========
@@ -59,10 +69,10 @@ impl VectorAlu {
             SemanticOp::SubLt => Self::execute_sub_lt(op, ctx, et),
             SemanticOp::SubGe => Self::execute_sub_ge(op, ctx, et),
             SemanticOp::MaxDiffLt => Self::execute_maxdiff_lt(op, ctx, et),
-            SemanticOp::Accumulate | SemanticOp::AccumSub
-            | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub => {
-                Self::execute_accumulate(op, ctx, et, semantic)
-            }
+            SemanticOp::Accumulate
+            | SemanticOp::AccumSub
+            | SemanticOp::AccumNegAdd
+            | SemanticOp::AccumNegSub => Self::execute_accumulate(op, ctx, et, semantic),
 
             // ========== Comparison ==========
             SemanticOp::Cmp => Self::execute_cmp(op, ctx, et),
@@ -99,11 +109,13 @@ impl VectorAlu {
             SemanticOp::Convert => Self::execute_convert(op, ctx, et),
 
             // ========== Matrix engine ==========
-            SemanticOp::Mac | SemanticOp::MatMul | SemanticOp::MatMulSub
-            | SemanticOp::NegMul | SemanticOp::NegMatMul
-            | SemanticOp::AddMac | SemanticOp::SubMac => {
-                super::vector_matmul::execute_matmul(op, ctx)
-            }
+            SemanticOp::Mac
+            | SemanticOp::MatMul
+            | SemanticOp::MatMulSub
+            | SemanticOp::NegMul
+            | SemanticOp::NegMatMul
+            | SemanticOp::AddMac
+            | SemanticOp::SubMac => super::vector_matmul::execute_matmul(op, ctx),
 
             _ => false,
         }

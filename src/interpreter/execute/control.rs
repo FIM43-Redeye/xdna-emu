@@ -88,11 +88,7 @@ pub struct ControlUnit;
 
 impl ControlUnit {
     /// Execute a control operation (without cross-tile lock routing).
-    pub fn execute(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        tile: &mut Tile,
-    ) -> Option<ExecuteResult> {
+    pub fn execute(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> Option<ExecuteResult> {
         Self::execute_with_neighbor_locks(op, ctx, tile, &mut NeighborLocks::none())
     }
 
@@ -129,7 +125,8 @@ impl ControlUnit {
                             log::error!(
                                 "JNZ/JZ: no register operand found, defaulting to 0 -- \
                                  likely a decoder bug (dest={:?}, sources={:?})",
-                                op.dest, op.sources
+                                op.dest,
+                                op.sources
                             );
                             0
                         };
@@ -209,9 +206,7 @@ impl ControlUnit {
                 //
                 // The DMA BD lock field (4-bit) directly addresses tile-local
                 // locks 0-15, matching the East/Internal quadrant (IDs 48-63).
-                let (locks, lock_id, is_own_tile) = Self::route_lock(
-                    raw_lock_id, tile, neighbor_locks,
-                );
+                let (locks, lock_id, is_own_tile) = Self::route_lock(raw_lock_id, tile, neighbor_locks);
 
                 let current_value = locks[lock_id as usize].value;
                 let lock = &mut locks[lock_id as usize];
@@ -237,7 +232,11 @@ impl ControlUnit {
                     LockResult::Success => {
                         log::trace!(
                             "[WATCH-ACQ] pc=0x{:03X} cycle={} lock={} value={}->{} SUCCESS",
-                            ctx.pc(), ctx.cycles, raw_lock_id, current_value, lock.value
+                            ctx.pc(),
+                            ctx.cycles,
+                            raw_lock_id,
+                            current_value,
+                            lock.value
                         );
                         log::info!("LockAcquire raw={} mapped={} expected={} delta={} current={} -> {} SUCCESS (own_tile={})",
                             raw_lock_id, lock_id, expected, delta, current_value, lock.value, is_own_tile);
@@ -255,8 +254,14 @@ impl ControlUnit {
                         Some(ExecuteResult::Continue)
                     }
                     LockResult::PreconditionNotMet => {
-                        log::info!("LockAcquire raw={} mapped={} expected={} current={} -> WAIT (own_tile={})",
-                            raw_lock_id, lock_id, expected, current_value, is_own_tile);
+                        log::info!(
+                            "LockAcquire raw={} mapped={} expected={} current={} -> WAIT (own_tile={})",
+                            raw_lock_id,
+                            lock_id,
+                            expected,
+                            current_value,
+                            is_own_tile
+                        );
                         Some(ExecuteResult::WaitLock { raw_lock_id })
                     }
                     LockResult::WouldOverflow => {
@@ -272,9 +277,7 @@ impl ControlUnit {
                 let tile_row = tile.row;
 
                 // Same quadrant routing as LockAcquire.
-                let (locks, lock_id, is_own_tile) = Self::route_lock(
-                    raw_lock_id, tile, neighbor_locks,
-                );
+                let (locks, lock_id, is_own_tile) = Self::route_lock(raw_lock_id, tile, neighbor_locks);
 
                 if is_own_tile {
                     // Own-tile release: defer by 1 cycle to model hardware lock
@@ -282,26 +285,39 @@ impl ControlUnit {
                     // and resolved in Phase 3, making it visible to DMA next cycle.
                     let old_value = locks[lock_id as usize].value;
                     tile.defer_core_lock_release(lock_id as usize, delta);
-                    log::info!("LockRelease tile({},{}) raw={} mapped={} delta={} value={} DEFERRED (own_tile)",
-                        tile_col, tile_row, raw_lock_id, lock_id, delta, old_value);
+                    log::info!(
+                        "LockRelease tile({},{}) raw={} mapped={} delta={} value={} DEFERRED (own_tile)",
+                        tile_col,
+                        tile_row,
+                        raw_lock_id,
+                        lock_id,
+                        delta,
+                        old_value
+                    );
                 } else {
                     // Cross-tile release (memtile path): the clone-modify-writeback
                     // mechanism in the coordinator handles deferral separately.
                     let old_value = locks[lock_id as usize].value;
                     let lock = &mut locks[lock_id as usize];
                     lock.release_with_value(delta);
-                    log::info!("LockRelease tile({},{}) raw={} mapped={} delta={} {} -> {} (cross_tile)",
-                        tile_col, tile_row, raw_lock_id, lock_id, delta, old_value, lock.value);
+                    log::info!(
+                        "LockRelease tile({},{}) raw={} mapped={} delta={} {} -> {} (cross_tile)",
+                        tile_col,
+                        tile_row,
+                        raw_lock_id,
+                        lock_id,
+                        delta,
+                        old_value,
+                        lock.value
+                    );
                 }
                 // Trace event: INSTR_LOCK_RELEASE_REQ (hw_id 45). HW fires this
                 // once per release instruction issued; releases always complete
                 // in the same cycle, so a single record matches HW 1:1.
                 let pc = ctx.pc();
                 let cycle = ctx.cycles;
-                ctx.timing_context_mut().record_event(
-                    cycle,
-                    crate::interpreter::state::EventType::InstrLockReleaseReq { pc },
-                );
+                ctx.timing_context_mut()
+                    .record_event(cycle, crate::interpreter::state::EventType::InstrLockReleaseReq { pc });
                 Some(ExecuteResult::Continue)
             }
 
@@ -384,9 +400,7 @@ impl ControlUnit {
             BranchCondition::OverflowSet => flags.v,
             BranchCondition::OverflowClear => !flags.v,
             // These are handled directly in execute() using register values
-            BranchCondition::Zero
-            | BranchCondition::NotZero
-            | BranchCondition::NotZeroDecrement => {
+            BranchCondition::Zero | BranchCondition::NotZero | BranchCondition::NotZeroDecrement => {
                 panic!(
                     "Zero/NotZero/NotZeroDecrement condition reached evaluate_condition() -- \
                      must be handled in execute() using register values"
@@ -619,12 +633,7 @@ mod tests {
         let mut tile = make_tile();
 
         // Set zero flag
-        ctx.set_flags(Flags {
-            z: true,
-            n: false,
-            c: false,
-            v: false,
-        });
+        ctx.set_flags(Flags { z: true, n: false, c: false, v: false });
 
         let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::BrCond)
             .with_branch_condition(BranchCondition::Equal)
@@ -640,12 +649,7 @@ mod tests {
         let mut tile = make_tile();
 
         // Zero flag not set
-        ctx.set_flags(Flags {
-            z: false,
-            n: false,
-            c: false,
-            v: false,
-        });
+        ctx.set_flags(Flags { z: false, n: false, c: false, v: false });
 
         let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::BrCond)
             .with_branch_condition(BranchCondition::Equal)
@@ -679,9 +683,9 @@ mod tests {
 
         let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::BrCond)
             .with_branch_condition(BranchCondition::NotZeroDecrement)
-            .with_dest(Operand::ScalarReg(5))          // mRx = r5
-            .with_source(Operand::ScalarReg(5))         // mRx0 = r5
-            .with_source(Operand::PointerReg(0));       // mPm = p0
+            .with_dest(Operand::ScalarReg(5)) // mRx = r5
+            .with_source(Operand::ScalarReg(5)) // mRx0 = r5
+            .with_source(Operand::PointerReg(0)); // mPm = p0
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Branch { target: 0x1b0 })));
@@ -715,15 +719,15 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        ctx.write_scalar(24, 3);     // r24 = 3 (source, tested)
-        ctx.write_scalar(20, 0x99);  // r20 = 0x99 (dest, gets r24 - 1)
+        ctx.write_scalar(24, 3); // r24 = 3 (source, tested)
+        ctx.write_scalar(20, 0x99); // r20 = 0x99 (dest, gets r24 - 1)
         ctx.pointer.write(1, 0x190); // p1 = branch target
 
         let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::BrCond)
             .with_branch_condition(BranchCondition::NotZeroDecrement)
-            .with_dest(Operand::ScalarReg(20))           // mRx = r20
-            .with_source(Operand::ScalarReg(24))          // mRx0 = r24
-            .with_source(Operand::PointerReg(1));         // mPm = p1
+            .with_dest(Operand::ScalarReg(20)) // mRx = r20
+            .with_source(Operand::ScalarReg(24)) // mRx0 = r24
+            .with_source(Operand::PointerReg(1)); // mPm = p1
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Branch { target: 0x190 })));
@@ -737,8 +741,8 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        ctx.write_scalar(24, 0);      // r24 = 0 (source)
-        ctx.write_scalar(20, 0x42);   // r20 = junk (dest)
+        ctx.write_scalar(24, 0); // r24 = 0 (source)
+        ctx.write_scalar(20, 0x42); // r20 = junk (dest)
         ctx.pointer.write(1, 0x190);
 
         let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::BrCond)
@@ -761,8 +765,8 @@ mod tests {
         // Initialize lock with value 1 (available)
         tile.locks[5].value = 1;
 
-        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockAcquire)
-            .with_source(Operand::Lock(5));
+        let op =
+            SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockAcquire).with_source(Operand::Lock(5));
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
@@ -777,8 +781,8 @@ mod tests {
         // Lock value 0 (unavailable)
         tile.locks[5].value = 0;
 
-        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockAcquire)
-            .with_source(Operand::Lock(5));
+        let op =
+            SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockAcquire).with_source(Operand::Lock(5));
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::WaitLock { raw_lock_id: 5 })));
@@ -791,8 +795,8 @@ mod tests {
 
         tile.locks[3].value = 0;
 
-        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockRelease)
-            .with_source(Operand::Lock(3));
+        let op =
+            SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockRelease).with_source(Operand::Lock(3));
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
@@ -976,8 +980,8 @@ mod tests {
         tile.locks[5].value = 0;
 
         // Phase 2: Core releases lock 5 (submits to arbiter, not yet applied)
-        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockRelease)
-            .with_source(Operand::Lock(5));
+        let op =
+            SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockRelease).with_source(Operand::Lock(5));
         ControlUnit::execute(&op, &mut ctx, &mut tile);
 
         // Lock value is still 0 (release pending in arbiter)

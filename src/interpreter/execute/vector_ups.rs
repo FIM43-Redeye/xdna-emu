@@ -89,8 +89,12 @@ pub fn ups_lane(value: i64, shift: u32, bits_in: u32, bits_out: u32, saturate: b
 /// When `signed_input` is false, the input value is zero-extended (masked)
 /// instead of sign-extended, matching hardware behavior for unsigned UPS.
 pub fn ups_lane_signed(
-    value: i64, shift: u32, bits_in: u32, bits_out: u32,
-    saturate: bool, signed_input: bool,
+    value: i64,
+    shift: u32,
+    bits_in: u32,
+    bits_out: u32,
+    saturate: bool,
+    signed_input: bool,
 ) -> i64 {
     // Extend input to its declared width.
     let extended = if signed_input {
@@ -158,7 +162,11 @@ fn pack_lane(dst: &mut [u32; 8], index: u32, lane_bits: u32, value: i64) {
     let bit_offset = index * lane_bits;
     let word_idx = (bit_offset / 32) as usize;
     let bit_within_word = bit_offset % 32;
-    let mask = if lane_bits >= 64 { u64::MAX } else { (1u64 << lane_bits) - 1 };
+    let mask = if lane_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << lane_bits) - 1
+    };
     let raw = (value as u64) & mask;
 
     if lane_bits <= 32 - bit_within_word {
@@ -169,11 +177,15 @@ fn pack_lane(dst: &mut [u32; 8], index: u32, lane_bits: u32, value: i64) {
         // Spans two words.
         let lo_bits = 32 - bit_within_word;
         let lo_mask = ((1u64 << lo_bits) - 1) as u32;
-        dst[word_idx] = (dst[word_idx] & !(lo_mask << bit_within_word))
-            | ((raw as u32 & lo_mask) << bit_within_word);
+        dst[word_idx] =
+            (dst[word_idx] & !(lo_mask << bit_within_word)) | ((raw as u32 & lo_mask) << bit_within_word);
         if word_idx + 1 < 8 {
             let hi_bits = lane_bits - lo_bits;
-            let hi_mask = if hi_bits >= 32 { u32::MAX } else { (1u32 << hi_bits) - 1 };
+            let hi_mask = if hi_bits >= 32 {
+                u32::MAX
+            } else {
+                (1u32 << hi_bits) - 1
+            };
             let hi_val = (raw >> lo_bits) as u32 & hi_mask;
             dst[word_idx + 1] = (dst[word_idx + 1] & !hi_mask) | hi_val;
         }
@@ -194,19 +206,18 @@ fn pack_lane(dst: &mut [u32; 8], index: u32, lane_bits: u32, value: i64) {
 ///
 /// For the common 32-bit accumulator modes (8->32 and 16->32), the full
 /// result fits in 256 bits (8 x u32).
-pub fn ups_vector(
-    src: &[u32; 8],
-    shift: u32,
-    from_type: ElementType,
-    to_type: ElementType,
-) -> [u32; 8] {
+pub fn ups_vector(src: &[u32; 8], shift: u32, from_type: ElementType, to_type: ElementType) -> [u32; 8] {
     let bits_in = from_type.bits() as u32;
     let bits_out = to_type.bits() as u32;
     let lanes = 256 / bits_in;
 
     // For output wider than 32 bits per lane, we can only fit
     // 256 / bits_out lanes in the result. Cap accordingly.
-    let out_lanes = if bits_out > 0 { (256 / bits_out).min(lanes) } else { 0 };
+    let out_lanes = if bits_out > 0 {
+        (256 / bits_out).min(lanes)
+    } else {
+        0
+    };
 
     let mut result = [0u32; 8];
 
@@ -330,9 +341,11 @@ impl VectorAlu {
     /// Handles both narrow (256-bit) and wide (512-bit / 1024-bit) paths,
     /// including AccumWidth detection for Half vs Full accumulator destinations.
     pub(super) fn execute_ups(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
-        let has_wide_acc_source = matches!(op.accum_width,
+        let has_wide_acc_source = matches!(
+            op.accum_width,
             Some(crate::interpreter::decode::register_map::AccumWidth::Full)
-            | Some(crate::interpreter::decode::register_map::AccumWidth::Half));
+                | Some(crate::interpreter::decode::register_map::AccumWidth::Half)
+        );
 
         if op.is_wide_vector || has_wide_acc_source {
             Self::execute_ups_wide(op, ctx, et)
@@ -365,8 +378,8 @@ impl VectorAlu {
     fn execute_ups_wide(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         let shift = Self::get_shift_amount(op, ctx);
         let from = op.from_type.unwrap_or(ElementType::Int16);
-        let is_half = matches!(op.accum_width,
-            Some(crate::interpreter::decode::register_map::AccumWidth::Half));
+        let is_half =
+            matches!(op.accum_width, Some(crate::interpreter::decode::register_map::AccumWidth::Half));
 
         if !is_half {
             let acc_wide = if !op.is_wide_vector {
@@ -682,8 +695,16 @@ mod tests {
     fn test_ups_acc32_packing_two_per_u64() {
         // vups.s32.s16 with shift=0: 16 input lanes of 16-bit -> 16 acc32 values,
         // packed 2 per u64.  u64[i] = lane[2*i] | (lane[2*i+1] << 32).
-        let src = [0x0002_0001u32, 0x0004_0003, 0x0006_0005, 0x0008_0007,
-                    0x000A_0009, 0x000C_000B, 0x000E_000D, 0x0010_000F];
+        let src = [
+            0x0002_0001u32,
+            0x0004_0003,
+            0x0006_0005,
+            0x0008_0007,
+            0x000A_0009,
+            0x000C_000B,
+            0x000E_000D,
+            0x0010_000F,
+        ];
         let acc = ups_vector_to_acc(&src, 0, ElementType::Int16, ElementType::Int32);
         // Lane 0=1, lane 1=2 -> acc[0] = 1 | (2<<32)
         assert_eq!(acc[0], 1 | (2u64 << 32), "acc[0]");
@@ -795,11 +816,17 @@ mod integration_tests {
     #[test]
     fn test_vector_ups_srs_roundtrip() {
         let mut ctx = make_ctx();
-        let src = [0x0002_0001u32, 0x0004_0003, 0x0006_0005, 0x0008_0007,
-                    0x000A_0009, 0x000C_000B, 0x000E_000D, 0x0010_000F];
-        let acc = ups_vector_to_acc(
-            &src, 0, ElementType::Int16, ElementType::Int32,
-        );
+        let src = [
+            0x0002_0001u32,
+            0x0004_0003,
+            0x0006_0005,
+            0x0008_0007,
+            0x000A_0009,
+            0x000C_000B,
+            0x000E_000D,
+            0x0010_000F,
+        ];
+        let acc = ups_vector_to_acc(&src, 0, ElementType::Int16, ElementType::Int32);
         ctx.accumulator.write(0, acc);
 
         let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
@@ -824,25 +851,27 @@ mod integration_tests {
     #[test]
     fn test_wide_ups_srs_s8_s32_roundtrip() {
         let src = [
-            0x04030201u32, 0x08070605, 0x0C0B0A09, 0x100F0E0D,
-            0x14131211, 0x18171615, 0x1C1B1A19, 0x201F1E1D,
+            0x04030201u32,
+            0x08070605,
+            0x0C0B0A09,
+            0x100F0E0D,
+            0x14131211,
+            0x18171615,
+            0x1C1B1A19,
+            0x201F1E1D,
         ];
 
-        let acc_wide = ups_vector_to_acc_wide(
-            &src, 0, ElementType::Int8, ElementType::Int32,
-        );
+        let acc_wide = ups_vector_to_acc_wide(&src, 0, ElementType::Int8, ElementType::Int32);
         assert!(acc_wide.iter().any(|&v| v != 0), "UPS produced all zeros");
 
         let acc_lo: [u64; 8] = acc_wide[..8].try_into().unwrap();
         let acc_hi: [u64; 8] = acc_wide[8..].try_into().unwrap();
 
         let cfg = SrsConfig::default();
-        let result_lo = VectorAlu::vector_srs_from_acc(
-            &acc_lo, 0, ElementType::Int32, ElementType::Int8, &cfg,
-        );
-        let result_hi = VectorAlu::vector_srs_from_acc(
-            &acc_hi, 0, ElementType::Int32, ElementType::Int8, &cfg,
-        );
+        let result_lo =
+            VectorAlu::vector_srs_from_acc(&acc_lo, 0, ElementType::Int32, ElementType::Int8, &cfg);
+        let result_hi =
+            VectorAlu::vector_srs_from_acc(&acc_hi, 0, ElementType::Int32, ElementType::Int8, &cfg);
 
         let lanes_per_half = 16usize;
         let to_bits = 8usize;
@@ -856,17 +885,13 @@ mod integration_tests {
         assert_eq!(packed, src, "wide s8.s32 UPS->SRS round-trip failed");
 
         // Also test with non-zero shift
-        let acc_shifted = ups_vector_to_acc_wide(
-            &src, 4, ElementType::Int8, ElementType::Int32,
-        );
+        let acc_shifted = ups_vector_to_acc_wide(&src, 4, ElementType::Int8, ElementType::Int32);
         let acc_s_lo: [u64; 8] = acc_shifted[..8].try_into().unwrap();
         let acc_s_hi: [u64; 8] = acc_shifted[8..].try_into().unwrap();
-        let res_s_lo = VectorAlu::vector_srs_from_acc(
-            &acc_s_lo, 4, ElementType::Int32, ElementType::Int8, &cfg,
-        );
-        let res_s_hi = VectorAlu::vector_srs_from_acc(
-            &acc_s_hi, 4, ElementType::Int32, ElementType::Int8, &cfg,
-        );
+        let res_s_lo =
+            VectorAlu::vector_srs_from_acc(&acc_s_lo, 4, ElementType::Int32, ElementType::Int8, &cfg);
+        let res_s_hi =
+            VectorAlu::vector_srs_from_acc(&acc_s_hi, 4, ElementType::Int32, ElementType::Int8, &cfg);
         let mut packed_s = [0u32; 8];
         packed_s[..4].copy_from_slice(&res_s_lo[..4]);
         packed_s[4..8].copy_from_slice(&res_s_hi[..4]);

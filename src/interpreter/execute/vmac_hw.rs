@@ -28,17 +28,17 @@ pub use xdna_archspec::aie2::vmac::{eval_prmx, eval_prmy};
 /// Returns (sel0, sel1).
 pub(crate) fn decode_mask(mask4: u8) -> (u8, u8) {
     match mask4 & 0xF {
-        1  => (1, 0),
-        2  => (2, 0),
-        3  => (1, 1),
-        4  => (0, 2),
-        5  => (1, 2),
-        6  => (2, 2),
-        8  => (0, 4),
-        9  => (1, 4),
+        1 => (1, 0),
+        2 => (2, 0),
+        3 => (1, 1),
+        4 => (0, 2),
+        5 => (1, 2),
+        6 => (2, 2),
+        8 => (0, 4),
+        9 => (1, 4),
         10 => (2, 4),
         12 => (4, 4),
-        _  => (0, 0), // >2 bits set or zero
+        _ => (0, 0), // >2 bits set or zero
     }
 }
 
@@ -250,7 +250,9 @@ fn build_prmx_control(smode: &[u64; 12], pmode: u32) -> [u64; 13] {
 /// Each bit controls whether the corresponding 8-bit multiply input gets
 /// sign-extended (bit 7 replicated to bit 8).
 fn sgex_mask(mmode: u8, sgn_x: bool) -> u32 {
-    if !sgn_x { return 0; }
+    if !sgn_x {
+        return 0;
+    }
     let mut s = 0u32;
     // Groups of 4 bits, each controlled by different mmode bit combinations
     let patterns: [(u8, u32); 8] = [
@@ -273,7 +275,9 @@ fn sgex_mask(mmode: u8, sgn_x: bool) -> u32 {
 
 /// Compute the 32-bit sign extension mask for Y path.
 fn sgey_mask(mmode: u8, sgn_y: bool) -> u32 {
-    if !sgn_y { return 0; }
+    if !sgn_y {
+        return 0;
+    }
     let mut s = 0u32;
     let patterns: [(u8, u32); 8] = [
         (0x01, 0x0000_0003), // bits 0-1:   mmode & 0x01
@@ -368,11 +372,7 @@ fn mpyl_hw_lane(
         let r1 = (x1 as i32) * (ny1 as i32) + q1; // 15-bit
 
         // BFloat shift: left-shift r1 by 4 bits
-        let r1s = if bfloat {
-            (r1 << 4) as i32
-        } else {
-            r1
-        };
+        let r1s = if bfloat { (r1 << 4) as i32 } else { r1 };
 
         // Truncate to 17 bits (sign-extended)
         let r = r0 + r1s + (q0 as i32);
@@ -382,14 +382,7 @@ fn mpyl_hw_lane(
 }
 
 /// High-path multiplier: 16 pairs of (8-bit x 4-bit) -> 16 x 14-bit products.
-fn mpyh_hw_lane(
-    px: &[u8; 32],
-    py: &[u8; 32],
-    sgn_x: bool,
-    sgn_y: bool,
-    negate: u32,
-    mmode: u8,
-) -> [i32; 16] {
+fn mpyh_hw_lane(px: &[u8; 32], py: &[u8; 32], sgn_x: bool, sgn_y: bool, negate: u32, mmode: u8) -> [i32; 16] {
     let maskx = sgex_mask(mmode, sgn_x);
     let masky = sgey_mask(mmode, sgn_y);
     let mut result = [0i32; 16];
@@ -446,22 +439,27 @@ fn mpyh_hw_lane(
 ///   bit 0 = shift 0, bit 1 = shift 4, bit 2 = shift 8,
 ///   bit 3 = shift 12, bit 4 = shift 16, bit 5 = shift 20
 fn psa_create_shmode(mmode: u8) -> [u8; 8] {
-    const SHIFTS: [u32; 8] = [
-        0x41041, 0x42082, 0x41104, 0x42208,
-        0x41044, 0x42088, 0x41110, 0x42220,
-    ];
+    const SHIFTS: [u32; 8] = [0x41041, 0x42082, 0x41104, 0x42208, 0x41044, 0x42088, 0x41110, 0x42220];
     let mut result = [0u8; 8];
     for i in 0..8 {
         let s = SHIFTS[i];
         let mut m = 0u8;
         // bits 23:18 selected by mmode bit 0 or 6
-        if mmode & 0x41 != 0 { m |= ((s >> 18) & 0x3F) as u8; }
+        if mmode & 0x41 != 0 {
+            m |= ((s >> 18) & 0x3F) as u8;
+        }
         // bits 17:12 selected by mmode bit 1
-        if mmode & 0x02 != 0 { m |= ((s >> 12) & 0x3F) as u8; }
+        if mmode & 0x02 != 0 {
+            m |= ((s >> 12) & 0x3F) as u8;
+        }
         // bits 11:6 selected by mmode bit 2 or 4
-        if mmode & 0x14 != 0 { m |= ((s >> 6) & 0x3F) as u8; }
+        if mmode & 0x14 != 0 {
+            m |= ((s >> 6) & 0x3F) as u8;
+        }
         // bits 5:0 selected by mmode bit 3 or 5 or 7
-        if mmode & 0xA8 != 0 { m |= (s & 0x3F) as u8; }
+        if mmode & 0xA8 != 0 {
+            m |= (s & 0x3F) as u8;
+        }
         result[i] = m;
     }
     result
@@ -479,13 +477,21 @@ fn psa_shift1(products: &[i64; 16], shmode: &[u8; 8]) -> [i64; 16] {
         let m = shmode[i & 7]; // lower 3 bits of index select shmode
         let a = products[i];
         // m is one-hot: select shift amount
-        let shifted = if m & 1 != 0 { a }
-            else if m & 2 != 0 { a << 4 }
-            else if m & 4 != 0 { a << 8 }
-            else if m & 8 != 0 { a << 12 }
-            else if m & 16 != 0 { a << 16 }
-            else if m & 32 != 0 { a << 20 }
-            else { 0 };
+        let shifted = if m & 1 != 0 {
+            a
+        } else if m & 2 != 0 {
+            a << 4
+        } else if m & 4 != 0 {
+            a << 8
+        } else if m & 8 != 0 {
+            a << 12
+        } else if m & 16 != 0 {
+            a << 16
+        } else if m & 32 != 0 {
+            a << 20
+        } else {
+            0
+        };
         // Truncate to 35 bits (sign-extended)
         result[i] = (shifted << 29) >> 29;
     }
@@ -510,7 +516,7 @@ fn multi_adder8(shifted: &[i64; 16]) -> (i64, i64) {
 /// Returns (r0, r1, r2) as (36-bit, 36-bit, 32-bit).
 fn psa_shift2(lo: i64, hi: i64, mmode: u8) -> (i64, i64, i32) {
     let m32 = mmode & 0x4F != 0; // bits 0,1,2,3,6
-    let m0 = mmode & 0x30 != 0;  // bits 4,5
+    let m0 = mmode & 0x30 != 0; // bits 4,5
     let m16 = mmode & 0x80 != 0; // bit 7
 
     let r0 = lo;
@@ -544,13 +550,7 @@ fn psa_shift2(lo: i64, hi: i64, mmode: u8) -> (i64, i64, i32) {
 /// mmode: multiplier mode
 ///
 /// Returns 68-bit result as (lo36, hi32).
-fn psal_lane(
-    products: &[i32; 16],
-    subtract: u8,
-    acc: u64,
-    scd: u64,
-    mmode: u8,
-) -> (i64, i32) {
+fn psal_lane(products: &[i32; 16], subtract: u8, acc: u64, scd: u64, mmode: u8) -> (i64, i32) {
     let shmode = psa_create_shmode(mmode);
 
     // Extend products to i64 (26-bit in hardware, via bfshift_bypass)
@@ -587,13 +587,15 @@ fn psal_lane(
     // Compute offset (one's complement correction)
     let split = mmode & 0x4F != 0;
     let o0 = (neg_acc0 as u32) + (neg_scd0 as u32);
-    let o1 = if split { (neg_acc1 as u32) + (neg_scd1 as u32) } else { 0 };
+    let o1 = if split {
+        (neg_acc1 as u32) + (neg_scd1 as u32)
+    } else {
+        0
+    };
 
     // Split adder5: combine products + acc + scd + offset
-    let k0 = (m0 as i128) + (m1 as i128)
-        + (ai_lo as i128) + (di_lo as i128) + (o0 as i128);
-    let k1 = (m2 as i128)
-        + (ai_hi as i128) + (di_hi as i128) + (o1 as i128);
+    let k0 = (m0 as i128) + (m1 as i128) + (ai_lo as i128) + (di_lo as i128) + (o0 as i128);
+    let k1 = (m2 as i128) + (ai_hi as i128) + (di_hi as i128) + (o1 as i128);
 
     // Truncate k0 to 36 bits, k1 to 32 bits
     let k0_36 = (k0 & 0xF_FFFF_FFFF) as i64;
@@ -603,13 +605,7 @@ fn psal_lane(
 }
 
 /// Full PSA high pipeline for one lane.
-fn psah_lane(
-    products: &[i32; 16],
-    subtract: u8,
-    acc: u64,
-    scd: u64,
-    mmode: u8,
-) -> (i64, i32) {
+fn psah_lane(products: &[i32; 16], subtract: u8, acc: u64, scd: u64, mmode: u8) -> (i64, i32) {
     let shmode = psa_create_shmode(mmode);
 
     let mut extended = [0i64; 16];
@@ -639,12 +635,14 @@ fn psah_lane(
 
     let split = mmode & 0x4F != 0;
     let o0 = (neg0 as u32) + (neg_scd0 as u32);
-    let o1 = if split { (neg1 as u32) + (neg_scd1 as u32) } else { 0 };
+    let o1 = if split {
+        (neg1 as u32) + (neg_scd1 as u32)
+    } else {
+        0
+    };
 
-    let k0 = (m0 as i128) + (m1 as i128)
-        + (ai_lo as i128) + (di_lo as i128) + (o0 as i128);
-    let k1 = (m2 as i128)
-        + (ai_hi as i128) + (di_hi as i128) + (o1 as i128);
+    let k0 = (m0 as i128) + (m1 as i128) + (ai_lo as i128) + (di_lo as i128) + (o0 as i128);
+    let k1 = (m2 as i128) + (ai_hi as i128) + (di_hi as i128) + (o1 as i128);
 
     let k0_36 = (k0 & 0xF_FFFF_FFFF) as i64;
     let k1_32 = (k1 & 0xFFFF_FFFF) as i32;
@@ -714,39 +712,39 @@ pub fn vec_control(
     // Bits 0-20 are dense modes, bits 21-25 are sparse modes.
     let pmode_bit = match (mmode, variant) {
         // mmode bit 0 (0x01 = i8xi4)
-        (0x01, 0) => 0,   // dense
-        (0x01, 1) => 21,  // sparse
+        (0x01, 0) => 0,  // dense
+        (0x01, 1) => 21, // sparse
         // mmode bit 1 (0x02 = i8xi8)
-        (0x02, 0) => 1,   // dense
-        (0x02, 1) => 10,  // 0xA
-        (0x02, 2) => 13,  // 0xD
-        (0x02, 3) => 14,  // 0xE
-        (0x02, 4) => 15,  // 0xF
-        (0x02, 5) => 22,  // 0x16 = sparse
+        (0x02, 0) => 1,  // dense
+        (0x02, 1) => 10, // 0xA
+        (0x02, 2) => 13, // 0xD
+        (0x02, 3) => 14, // 0xE
+        (0x02, 4) => 15, // 0xF
+        (0x02, 5) => 22, // 0x16 = sparse
         // mmode bit 2 (0x04 = i16xi8)
-        (0x04, 0) => 2,   // dense
-        (0x04, 1) => 9,   // 0x9
+        (0x04, 0) => 2, // dense
+        (0x04, 1) => 9, // 0x9
         // mmode bit 3 (0x08 = i16xi16)
-        (0x08, 0) => 3,   // dense
-        (0x08, 1) => 11,  // 0xB
+        (0x08, 0) => 3,  // dense
+        (0x08, 1) => 11, // 0xB
         // mmode bit 4 (0x10)
-        (0x10, 0) => 4,   // 0x4
-        (0x10, 1) => 5,   // 0x5
-        (0x10, 2) => 23,  // 0x17 = sparse (i16xi8 sparse)
+        (0x10, 0) => 4,  // 0x4
+        (0x10, 1) => 5,  // 0x5
+        (0x10, 2) => 23, // 0x17 = sparse (i16xi8 sparse)
         // mmode bit 5 (0x20)
-        (0x20, 0) => 6,   // 0x6
-        (0x20, 1) => 7,   // 0x7
-        (0x20, 2) => 12,  // 0xC
-        (0x20, 3) => 16,  // 0x10
-        (0x20, 4) => 20,  // 0x14
-        (0x20, 5) => 24,  // 0x18 = sparse (i16xi16 sparse)
+        (0x20, 0) => 6,  // 0x6
+        (0x20, 1) => 7,  // 0x7
+        (0x20, 2) => 12, // 0xC
+        (0x20, 3) => 16, // 0x10
+        (0x20, 4) => 20, // 0x14
+        (0x20, 5) => 24, // 0x18 = sparse (i16xi16 sparse)
         // mmode bit 6 (0x40 = bf16)
-        (0x40, 0) => 8,   // 0x8
-        (0x40, 1) => 17,  // 0x11
-        (0x40, 2) => 25,  // 0x19 = sparse (bf16 sparse)
+        (0x40, 0) => 8,  // 0x8
+        (0x40, 1) => 17, // 0x11
+        (0x40, 2) => 25, // 0x19 = sparse (bf16 sparse)
         // mmode bit 7 (0x80)
-        (0x80, 0) => 18,  // 0x12
-        (0x80, 1) => 19,  // 0x13
+        (0x80, 0) => 18, // 0x12
+        (0x80, 1) => 19, // 0x13
         _ => 0,
     };
     let pmode = 1u32 << pmode_bit;
@@ -790,7 +788,7 @@ fn vec_control_negate(mmode: u8, sub: u8) -> [u32; 8] {
         for b in 0..64u32 {
             let group = b / 8;
             let in_group = (b % 8) as u8;
-            let half = in_group / 4;       // 0 for first 4 bits, 1 for next 4
+            let half = in_group / 4; // 0 for first 4 bits, 1 for next 4
             let pair_bit = in_group % 2;
             let base: u8 = if group % 4 < 2 { 0 } else { 4 };
             let sub_idx = base + half * 2 + pair_bit;
@@ -871,12 +869,9 @@ fn sparse_vmac_bf16(
     use super::vector_matmul::bf16_mac_hw_lane;
 
     // Extract bf16 elements from A (64 elements) and B (32 elements)
-    let a_bf16: [u16; 64] = std::array::from_fn(|i| {
-        u16::from_le_bytes([a_dense[2 * i], a_dense[2 * i + 1]])
-    });
-    let b_bf16: [u16; 32] = std::array::from_fn(|i| {
-        u16::from_le_bytes([b_sparse[2 * i], b_sparse[2 * i + 1]])
-    });
+    let a_bf16: [u16; 64] = std::array::from_fn(|i| u16::from_le_bytes([a_dense[2 * i], a_dense[2 * i + 1]]));
+    let b_bf16: [u16; 32] =
+        std::array::from_fn(|i| u16::from_le_bytes([b_sparse[2 * i], b_sparse[2 * i + 1]]));
 
     // Compute bfsmode from mask (same computation as mask2sel for pmode_bit=25).
     // bfsmode[i] = rbfxbf[i], a 3-bit routing selector per B position.
@@ -921,7 +916,9 @@ fn sparse_vmac_bf16(
             for inner in 0..8u32 {
                 let bidx = (inner * 4 + col) as usize;
                 let mode = bfsmode[bidx];
-                if mode == 0 { continue; }
+                if mode == 0 {
+                    continue;
+                }
 
                 // A element index depends on bfsmode value (one-hot):
                 //   The base is row*16 + (inner>>1)*4
@@ -932,9 +929,27 @@ fn sparse_vmac_bf16(
                 let base = (row * 16 + (inner >> 1) * 4) as usize;
                 let odd = (inner & 1) != 0;
                 let t = match mode {
-                    1 => if odd { 1 } else { 0 },
-                    2 => if odd { 2 } else { 1 },
-                    4 => if odd { 3 } else { 2 },
+                    1 => {
+                        if odd {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    2 => {
+                        if odd {
+                            2
+                        } else {
+                            1
+                        }
+                    }
+                    4 => {
+                        if odd {
+                            3
+                        } else {
+                            2
+                        }
+                    }
                     _ => continue, // unknown mode, skip
                 };
                 let aidx = base + t;
@@ -971,10 +986,8 @@ fn sparse_vmac_bf16(
             if a_elems.is_empty() && prev_bits == 0 && scd_bits.is_none() {
                 fp32_results[out_idx] = 0;
             } else {
-                fp32_results[out_idx] = bf16_mac_hw_lane(
-                    prev_bits, &a_elems, &b_elems, subtract,
-                    scd_bits, negate_scd,
-                );
+                fp32_results[out_idx] =
+                    bf16_mac_hw_lane(prev_bits, &a_elems, &b_elems, subtract, scd_bits, negate_scd);
             }
         }
     }
@@ -984,8 +997,7 @@ fn sparse_vmac_bf16(
     // Remaining result[8..16] are zero (unused for bm accumulators).
     let mut result = [0u64; 16];
     for i in 0..8 {
-        result[i] = (fp32_results[2 * i] as u64)
-            | ((fp32_results[2 * i + 1] as u64) << 32);
+        result[i] = (fp32_results[2 * i] as u64) | ((fp32_results[2 * i + 1] as u64) << 32);
     }
     result
 }
@@ -1036,8 +1048,17 @@ pub fn sparse_vmac(
     // which already implements the full bfloat pipeline.
     if mmode & 0x40 != 0 {
         return sparse_vmac_bf16(
-            a_dense, b_sparse, mask, acc, scd, config,
-            sub0, sub1, sub2, subtract_acc, subtract_mul,
+            a_dense,
+            b_sparse,
+            mask,
+            acc,
+            scd,
+            config,
+            sub0,
+            sub1,
+            sub2,
+            subtract_acc,
+            subtract_mul,
         );
     }
 
@@ -1074,9 +1095,7 @@ pub fn sparse_vmac(
         let px: [u8; 32] = std::array::from_fn(|i| bx[base + i]);
         let py: [u8; 32] = std::array::from_fn(|i| by[base + i]);
 
-        let products = mpyl_hw_lane(
-            &px, &py, sgn_x, sgn_y, negate_lanes[lane], 0xFFFF, 0xFFFF, mmode,
-        );
+        let products = mpyl_hw_lane(&px, &py, sgn_x, sgn_y, negate_lanes[lane], 0xFFFF, 0xFFFF, mmode);
 
         let (k0, k1) = psal_lane(&products, subtract_acc, acc[lane], scd[lane], mmode);
         result[lane] = acc_overlap(k0, k1, mmode);
@@ -1088,9 +1107,7 @@ pub fn sparse_vmac(
         let px: [u8; 32] = std::array::from_fn(|i| bx[base + i]);
         let py: [u8; 32] = std::array::from_fn(|i| by[base + i]);
 
-        let products = mpyh_hw_lane(
-            &px, &py, sgn_x, sgn_y, negate_lanes[lane], mmode,
-        );
+        let products = mpyh_hw_lane(&px, &py, sgn_x, sgn_y, negate_lanes[lane], mmode);
 
         let (k0, k1) = psah_lane(&products, subtract_acc, acc[8 + lane], scd[8 + lane], mmode);
         result[8 + lane] = acc_overlap(k0, k1, mmode);
@@ -1141,7 +1158,7 @@ mod tests {
         // bits 0,2,4,...14 = 1 (sub[0]), others 0
         let expected_lo = 0x5555u32; // bits 0-15: alternating 1,0
         assert_eq!(r[0], expected_lo); // even lanes
-        assert_eq!(r[1], 0);          // odd lanes (high 32 bits, sub[4..7]=0)
+        assert_eq!(r[1], 0); // odd lanes (high 32 bits, sub[4..7]=0)
     }
 
     #[test]
@@ -1181,9 +1198,12 @@ mod tests {
         ];
         for (nibble, &exp) in expected.iter().enumerate() {
             assert_eq!(
-                decode_mask(nibble as u8), exp,
+                decode_mask(nibble as u8),
+                exp,
                 "decode_mask({:#06b}) = {:?}, expected {:?}",
-                nibble, decode_mask(nibble as u8), exp
+                nibble,
+                decode_mask(nibble as u8),
+                exp
             );
         }
     }
@@ -1298,9 +1318,9 @@ mod tests {
         // mmode & 0x4F != 0 -> split mode (no carry cascade)
         // lo=0x1234_5678, hi=0xABCD_EF01
         let k0 = 0x1_2345_6789i64; // 36-bit (low 32 = 0x2345_6789, carry nibble = 0x1)
-        let k1 = 0x7BCD_EF01i32;   // 32-bit
+        let k1 = 0x7BCD_EF01i32; // 32-bit
         let result = acc_overlap(k0, k1, 0x01); // mmode=0x01 is in 0x4F -> split
-        // split: no carry cascade, just concatenate lo32 and hi32
+                                                // split: no carry cascade, just concatenate lo32 and hi32
         let lo32 = (k0 as u64) & 0xFFFF_FFFF;
         let hi32 = (k1 as u64) & 0xFFFF_FFFF;
         assert_eq!(result, lo32 | (hi32 << 32));
@@ -1377,10 +1397,14 @@ mod tests {
     #[test]
     fn multi_adder8_simple() {
         let mut shifted = [0i64; 16];
-        for i in 0..8 { shifted[i] = 1; }
-        for i in 8..16 { shifted[i] = 2; }
+        for i in 0..8 {
+            shifted[i] = 1;
+        }
+        for i in 8..16 {
+            shifted[i] = 2;
+        }
         let (lo, hi) = multi_adder8(&shifted);
-        assert_eq!(lo, 8);  // 8 * 1
+        assert_eq!(lo, 8); // 8 * 1
         assert_eq!(hi, 16); // 8 * 2
     }
 
@@ -1403,7 +1427,7 @@ mod tests {
         // mmode & 0x4F != 0 -> m32=true, m0=false, m16=false
         let (r0, r1, r2) = psa_shift2(100, 200, 0x01);
         assert_eq!(r0, 100); // r0 = lo always
-        assert_eq!(r1, 0);   // m0=false, m16=false -> 0
+        assert_eq!(r1, 0); // m0=false, m16=false -> 0
         assert_eq!(r2, 200); // m32=true -> hi as i32
     }
 
@@ -1414,7 +1438,7 @@ mod tests {
         let (r0, r1, r2) = psa_shift2(100, 200, 0x30);
         assert_eq!(r0, 100);
         assert_eq!(r1, 200); // m0=true -> hi
-        assert_eq!(r2, 0);   // m32=false, m16=false -> 0
+        assert_eq!(r2, 0); // m32=false, m16=false -> 0
     }
 
     // -----------------------------------------------------------------------
@@ -1440,7 +1464,7 @@ mod tests {
         let shmode = psa_create_shmode(0x02);
         // SHIFTS[0] = 0x41041: bits [17:12] = (0x41041 >> 12) & 0x3F = 0x41 & 0x3F = 0x01
         assert_eq!(shmode[0], 1); // shift 0
-        // SHIFTS[1] = 0x42082: bits [17:12] = (0x42082 >> 12) & 0x3F = 0x42 & 0x3F = 0x02
+                                  // SHIFTS[1] = 0x42082: bits [17:12] = (0x42082 >> 12) & 0x3F = 0x42 & 0x3F = 0x02
         assert_eq!(shmode[1], 2); // shift 4
     }
 
@@ -1517,11 +1541,15 @@ mod tests {
     fn test_sparse_vmac_uniform_vs_oracle() {
         use std::process::Command;
         let oracle_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tools/vmac-oracle/vmac_oracle");
-        if !std::path::Path::new(oracle_path).exists() { return; }
+        if !std::path::Path::new(oracle_path).exists() {
+            return;
+        }
 
         // Uniform: all A = 0x01, all B = 0x01
         let mut a_dense = [0u8; 128];
-        for i in 0..64 { a_dense[i] = 1; }
+        for i in 0..64 {
+            a_dense[i] = 1;
+        }
         let b_sparse = [1u8; 64];
         // Uniform mask: 2 bits set per nibble
         let mask: u128 = 0x33333333_33333333_33333333_33333333;
@@ -1537,9 +1565,11 @@ mod tests {
         let mask_hex: String = mask_bytes_le.iter().map(|b| format!("{:02x}", b)).collect();
         let output = Command::new(oracle_path)
             .args([&a_hex, &b_hex, &mask_hex, "353"])
-            .output().unwrap();
+            .output()
+            .unwrap();
         let oracle_stdout = String::from_utf8_lossy(&output.stdout);
-        let oracle_lanes: Vec<u64> = oracle_stdout.lines()
+        let oracle_lanes: Vec<u64> = oracle_stdout
+            .lines()
             .filter(|l| !l.is_empty())
             .map(|l| u64::from_str_radix(l.trim(), 16).unwrap())
             .collect();
@@ -1557,10 +1587,14 @@ mod tests {
     fn test_sparse_vmac_i16xi16_uniform_vs_oracle() {
         use std::process::Command;
         let oracle_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tools/vmac-oracle/vmac_oracle");
-        if !std::path::Path::new(oracle_path).exists() { return; }
+        if !std::path::Path::new(oracle_path).exists() {
+            return;
+        }
 
         let mut a_dense = [0u8; 128];
-        for i in 0..64 { a_dense[i] = 1; }
+        for i in 0..64 {
+            a_dense[i] = 1;
+        }
         let b_sparse = [1u8; 64];
         let mask: u128 = 0x33333333_33333333_33333333_33333333;
         let config: u32 = 0x3bb; // i16xi16 sparse, signed, zero_acc
@@ -1575,9 +1609,11 @@ mod tests {
         let mask_hex: String = mask_bytes_le.iter().map(|b| format!("{:02x}", b)).collect();
         let output = Command::new(oracle_path)
             .args([&a_hex, &b_hex, &mask_hex, "3bb"])
-            .output().unwrap();
+            .output()
+            .unwrap();
         let oracle_stdout = String::from_utf8_lossy(&output.stdout);
-        let oracle_lanes: Vec<u64> = oracle_stdout.lines()
+        let oracle_lanes: Vec<u64> = oracle_stdout
+            .lines()
             .filter(|l| !l.is_empty())
             .map(|l| u64::from_str_radix(l.trim(), 16).unwrap())
             .collect();
@@ -1608,7 +1644,9 @@ mod tests {
         // Test vectors: sequential data for reproducibility.
         // A: 128 bytes (64 used, rest zero-padded)
         let mut a_dense = [0u8; 128];
-        for i in 0..64 { a_dense[i] = (i as u8).wrapping_mul(7).wrapping_add(3); }
+        for i in 0..64 {
+            a_dense[i] = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
         // B: 64 bytes compressed sparse data
         let b_sparse: [u8; 64] = std::array::from_fn(|i| (i as u8).wrapping_mul(13).wrapping_add(5));
         // Mask: each nibble has at most 2 bits set (valid sparse mask)
@@ -1657,10 +1695,7 @@ mod tests {
         let mut mismatches = 0;
         for i in 0..16 {
             if result[i] != oracle_lanes[i] {
-                eprintln!(
-                    "Lane {}: rust=0x{:016x} oracle=0x{:016x}",
-                    i, result[i], oracle_lanes[i]
-                );
+                eprintln!("Lane {}: rust=0x{:016x} oracle=0x{:016x}", i, result[i], oracle_lanes[i]);
                 mismatches += 1;
             }
         }
@@ -1690,7 +1725,9 @@ mod tests {
         let configs: [u32; 2] = [0x3bb, 0x0bb]; // signed, unsigned
 
         let mut a_dense = [0u8; 128];
-        for i in 0..64 { a_dense[i] = (i as u8).wrapping_mul(7).wrapping_add(3); }
+        for i in 0..64 {
+            a_dense[i] = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
         let b_sparse: [u8; 64] = std::array::from_fn(|i| (i as u8).wrapping_mul(13).wrapping_add(5));
         let acc = [0u64; 16];
         let scd = [0u64; 16];
@@ -1711,9 +1748,11 @@ mod tests {
                 let mask_hex: String = mask_bytes_le.iter().map(|b| format!("{:02x}", b)).collect();
                 let output = Command::new(oracle_path)
                     .args([&a_hex, &b_hex, &mask_hex, &format!("{:x}", config)])
-                    .output().unwrap();
+                    .output()
+                    .unwrap();
                 let oracle_stdout = String::from_utf8_lossy(&output.stdout);
-                let oracle_lanes: Vec<u64> = oracle_stdout.lines()
+                let oracle_lanes: Vec<u64> = oracle_stdout
+                    .lines()
                     .filter(|l| !l.is_empty())
                     .map(|l| u64::from_str_radix(l.trim(), 16).unwrap())
                     .collect();
@@ -1721,11 +1760,16 @@ mod tests {
                 let mismatches = (0..16).filter(|&i| result[i] != oracle_lanes[i]).count();
                 if mismatches > 0 {
                     total_fail += 1;
-                    eprintln!("FAIL config=0x{:03x} mask=0x{:032x}: {}/16 lanes differ",
-                        config, mask, mismatches);
+                    eprintln!(
+                        "FAIL config=0x{:03x} mask=0x{:032x}: {}/16 lanes differ",
+                        config, mask, mismatches
+                    );
                     for i in 0..16 {
                         if result[i] != oracle_lanes[i] {
-                            eprintln!("  L{}: rust=0x{:016x} oracle=0x{:016x}", i, result[i], oracle_lanes[i]);
+                            eprintln!(
+                                "  L{}: rust=0x{:016x} oracle=0x{:016x}",
+                                i, result[i], oracle_lanes[i]
+                            );
                         }
                     }
                 }
@@ -1741,25 +1785,23 @@ mod tests {
         use std::process::Command;
 
         let oracle_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tools/vmac-oracle/vmac_oracle");
-        if !std::path::Path::new(oracle_path).exists() { return; }
+        if !std::path::Path::new(oracle_path).exists() {
+            return;
+        }
 
         // bf16 sparse config: amode=2, bmode=0, variant=2, zero_acc=1
         let config: u32 = 0x45;
 
         // Random-ish bf16 data for thorough testing
-        let a_dense: [u8; 128] = std::array::from_fn(|i| {
-            (i as u8).wrapping_mul(47).wrapping_add(91)
-        });
-        let b_sparse: [u8; 64] = std::array::from_fn(|i| {
-            (i as u8).wrapping_mul(31).wrapping_add(17)
-        });
+        let a_dense: [u8; 128] = std::array::from_fn(|i| (i as u8).wrapping_mul(47).wrapping_add(91));
+        let b_sparse: [u8; 64] = std::array::from_fn(|i| (i as u8).wrapping_mul(31).wrapping_add(17));
 
         let masks: [u128; 5] = [
-            u128::from_le_bytes([0x33; 16]),         // 2 active per output
-            u128::from_le_bytes([0x03; 16]),         // 1 active per output
-            u128::from_le_bytes([0xCC; 16]),         // 2 active (bits 2,3)
-            u128::from_le_bytes([0x55; 16]),         // 2 active (bits 0,2)
-            0x01020408_10204080_01020408_10204080,   // asymmetric
+            u128::from_le_bytes([0x33; 16]),       // 2 active per output
+            u128::from_le_bytes([0x03; 16]),       // 1 active per output
+            u128::from_le_bytes([0xCC; 16]),       // 2 active (bits 2,3)
+            u128::from_le_bytes([0x55; 16]),       // 2 active (bits 0,2)
+            0x01020408_10204080_01020408_10204080, // asymmetric
         ];
 
         let acc = [0u64; 16];
@@ -1780,16 +1822,21 @@ mod tests {
 
             let output = Command::new(oracle_path)
                 .args([&a_hex, &b_hex, &mask_hex, &format!("{:x}", config)])
-                .output().unwrap();
+                .output()
+                .unwrap();
             let oracle_stdout = String::from_utf8_lossy(&output.stdout);
-            let oracle_lanes: Vec<u64> = oracle_stdout.lines()
+            let oracle_lanes: Vec<u64> = oracle_stdout
+                .lines()
                 .filter(|l| !l.is_empty())
                 .map(|l| u64::from_str_radix(l.trim(), 16).unwrap())
                 .collect();
 
             if oracle_lanes.len() != 16 {
-                eprintln!("SKIP mask=0x{:032x}: oracle returned {} lanes (expected 16)",
-                    mask, oracle_lanes.len());
+                eprintln!(
+                    "SKIP mask=0x{:032x}: oracle returned {} lanes (expected 16)",
+                    mask,
+                    oracle_lanes.len()
+                );
                 continue;
             }
 
@@ -1797,15 +1844,17 @@ mod tests {
             // Pack into 8 u64 for comparison with our packed result.
             let mut oracle_packed = [0u64; 8];
             for i in 0..8 {
-                oracle_packed[i] = (oracle_lanes[2 * i] & 0xFFFF_FFFF)
-                    | ((oracle_lanes[2 * i + 1] & 0xFFFF_FFFF) << 32);
+                oracle_packed[i] =
+                    (oracle_lanes[2 * i] & 0xFFFF_FFFF) | ((oracle_lanes[2 * i + 1] & 0xFFFF_FFFF) << 32);
             }
 
             let mismatches = (0..8).filter(|&i| result[i] != oracle_packed[i]).count();
             if mismatches > 0 {
                 total_fail += 1;
-                eprintln!("FAIL config=0x{:03x} mask=0x{:032x}: {}/8 accumulators differ",
-                    config, mask, mismatches);
+                eprintln!(
+                    "FAIL config=0x{:03x} mask=0x{:032x}: {}/8 accumulators differ",
+                    config, mask, mismatches
+                );
                 for i in 0..8 {
                     if result[i] != oracle_packed[i] {
                         eprintln!("  acc{}: rust=0x{:016x} oracle=0x{:016x}", i, result[i], oracle_packed[i]);

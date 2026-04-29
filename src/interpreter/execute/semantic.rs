@@ -89,10 +89,10 @@ pub fn execute_semantic(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         SemanticOp::Adc => execute_adc(op, ctx),
         SemanticOp::Sbc => execute_sbc(op, ctx),
         SemanticOp::Mul => execute_mul(op, ctx),
-        SemanticOp::SDiv => execute_div(op, ctx, true),  // signed
+        SemanticOp::SDiv => execute_div(op, ctx, true), // signed
         SemanticOp::UDiv => execute_div(op, ctx, false), // unsigned
         SemanticOp::DivStep => execute_div_step(op, ctx),
-        SemanticOp::SRem => execute_rem(op, ctx, true),  // signed
+        SemanticOp::SRem => execute_rem(op, ctx, true), // signed
         SemanticOp::URem => execute_rem(op, ctx, false), // unsigned
         SemanticOp::Abs => execute_abs(op, ctx),
         SemanticOp::Neg => execute_neg(op, ctx),
@@ -175,10 +175,8 @@ pub fn execute_semantic(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
             };
             let pc = ctx.pc();
             let cycle = ctx.cycles;
-            ctx.timing_context_mut().record_event(
-                cycle,
-                crate::interpreter::state::EventType::InstrEvent { pc, id: event_id },
-            );
+            ctx.timing_context_mut()
+                .record_event(cycle, crate::interpreter::state::EventType::InstrEvent { pc, id: event_id });
             true
         }
 
@@ -330,7 +328,8 @@ pub(super) fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value
             log::warn!(
                 "[SEMANTIC] Scalar write to VectorReg({}): value=0x{:X} -- \
                  if this fires frequently, check decoder classification",
-                r, value
+                r,
+                value
             );
             let mut lanes = [0u32; 8];
             lanes[0] = value;
@@ -341,18 +340,15 @@ pub(super) fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value
             log::warn!(
                 "[SEMANTIC] Scalar write to AccumReg({}): value=0x{:X} -- \
                  if this fires frequently, check decoder classification",
-                r, value
+                r,
+                value
             );
             let mut lanes = [0u64; 8];
             lanes[0] = value as u64;
             ctx.accumulator.write(*r, lanes);
         }
         _ => {
-            debug_assert!(
-                false,
-                "write_operand called with non-writable operand: {:?}",
-                operand,
-            );
+            debug_assert!(false, "write_operand called with non-writable operand: {:?}", operand,);
         }
     }
 }
@@ -383,7 +379,11 @@ fn execute_add(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         log::warn!(
             "[BUG] Pointer arithmetic reached execute_add instead of execute_pointer_add: \
              pc=0x{:03X} slot={:?} dest={:?} srcs={:?} name={:?}",
-            ctx.pc(), op.slot, op.dest, op.sources, op.encoding_name
+            ctx.pc(),
+            op.slot,
+            op.dest,
+            op.sources,
+            op.encoding_name
         );
     }
 
@@ -468,7 +468,11 @@ fn execute_div(op: &SlotOp, ctx: &mut ExecutionContext, signed: bool) -> bool {
     let b = read_source(op, ctx, 1);
     let result = if b == 0 {
         // Division by zero: return saturated value
-        if signed { i32::MIN as u32 } else { u32::MAX }
+        if signed {
+            i32::MIN as u32
+        } else {
+            u32::MAX
+        }
     } else if signed {
         ((a as i32).wrapping_div(b as i32)) as u32
     } else {
@@ -518,9 +522,7 @@ fn execute_rem(op: &SlotOp, ctx: &mut ExecutionContext, signed: bool) -> bool {
 fn execute_div_step(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // LLVM FFI decoder puts the tied r31 as sources[0] (from sd_in), so s0
     // and s1 are at indices 1 and 2 when r31 is present in the source list.
-    let (ai, b) = if op.sources.len() >= 3
-        && matches!(op.sources.first(), Some(Operand::ScalarReg(31)))
-    {
+    let (ai, b) = if op.sources.len() >= 3 && matches!(op.sources.first(), Some(Operand::ScalarReg(31))) {
         (read_source(op, ctx, 1), read_source(op, ctx, 2))
     } else {
         (read_source(op, ctx, 0), read_source(op, ctx, 1))
@@ -704,7 +706,11 @@ fn execute_select(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 
     log::trace!(
         "[SEMANTIC SELECT] variant={:?} test={} src_true={} cond={} result={}",
-        op.select_variant, test, src_true, condition, result
+        op.select_variant,
+        test,
+        src_true,
+        condition,
+        result
     );
 
     write_dest(op, ctx, result);
@@ -719,10 +725,7 @@ fn execute_select(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 
 fn execute_mov(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let value = read_source(op, ctx, 0);
-    log::debug!(
-        "[SEMANTIC MOV] dest={:?} src={:?} value={}",
-        op.dest, op.sources.get(0), value
-    );
+    log::debug!("[SEMANTIC MOV] dest={:?} src={:?} value={}", op.dest, op.sources.get(0), value);
     write_dest(op, ctx, value);
     true
 }
@@ -903,7 +906,6 @@ fn execute_truncate(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     true
 }
 
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -953,17 +955,14 @@ mod tests {
         let mut ctx = make_test_context();
         ctx.scalar.write(1, 100); // true value
         ctx.scalar.write(2, 200); // false value
-        ctx.scalar.write(27, 0);  // test value (r27) = 0, so select true
+        ctx.scalar.write(27, 0); // test value (r27) = 0, so select true
 
         let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Select)
             .with_select_variant(SelectVariant::EqualZero);
         op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
         op.dest = Some(Operand::ScalarReg(3));
-        op.implicit_regs = smallvec![ImplicitReg {
-            reg_class: "eR27".to_string(),
-            reg_num: 27,
-            is_use: true,
-        }];
+        op.implicit_regs =
+            smallvec![ImplicitReg { reg_class: "eR27".to_string(), reg_num: 27, is_use: true }];
 
         assert!(execute_semantic(&op, &mut ctx));
         assert_eq!(ctx.scalar_read(3), 100); // r27==0, so true value selected
@@ -974,17 +973,14 @@ mod tests {
         let mut ctx = make_test_context();
         ctx.scalar.write(1, 100); // true value
         ctx.scalar.write(2, 200); // false value
-        ctx.scalar.write(27, 1);  // test value (r27) != 0, so select false
+        ctx.scalar.write(27, 1); // test value (r27) != 0, so select false
 
         let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Select)
             .with_select_variant(SelectVariant::EqualZero);
         op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
         op.dest = Some(Operand::ScalarReg(3));
-        op.implicit_regs = smallvec![ImplicitReg {
-            reg_class: "eR27".to_string(),
-            reg_num: 27,
-            is_use: true,
-        }];
+        op.implicit_regs =
+            smallvec![ImplicitReg { reg_class: "eR27".to_string(), reg_num: 27, is_use: true }];
 
         assert!(execute_semantic(&op, &mut ctx));
         assert_eq!(ctx.scalar_read(3), 200); // r27!=0, eqz condition false -> false value
@@ -995,17 +991,14 @@ mod tests {
         let mut ctx = make_test_context();
         ctx.scalar.write(1, 100); // true value
         ctx.scalar.write(2, 200); // false value
-        ctx.scalar.write(27, 0);  // test value (r27) = 0, so sel.nez selects false
+        ctx.scalar.write(27, 0); // test value (r27) = 0, so sel.nez selects false
 
         let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Select)
             .with_select_variant(SelectVariant::NotEqualZero);
         op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
         op.dest = Some(Operand::ScalarReg(3));
-        op.implicit_regs = smallvec![ImplicitReg {
-            reg_class: "eR27".to_string(),
-            reg_num: 27,
-            is_use: true,
-        }];
+        op.implicit_regs =
+            smallvec![ImplicitReg { reg_class: "eR27".to_string(), reg_num: 27, is_use: true }];
 
         assert!(execute_semantic(&op, &mut ctx));
         assert_eq!(ctx.scalar_read(3), 200); // r27==0, nez condition false -> false value
@@ -1022,11 +1015,8 @@ mod tests {
             .with_select_variant(SelectVariant::NotEqualZero);
         op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
         op.dest = Some(Operand::ScalarReg(3));
-        op.implicit_regs = smallvec![ImplicitReg {
-            reg_class: "eR27".to_string(),
-            reg_num: 27,
-            is_use: true,
-        }];
+        op.implicit_regs =
+            smallvec![ImplicitReg { reg_class: "eR27".to_string(), reg_num: 27, is_use: true }];
 
         assert!(execute_semantic(&op, &mut ctx));
         assert_eq!(ctx.scalar_read(3), 100); // r27!=0, nez condition true -> true value
@@ -1036,7 +1026,7 @@ mod tests {
     fn test_execute_setcc_lt_signed() {
         let mut ctx = make_test_context();
         ctx.scalar.write(1, (-5i32) as u32); // -5
-        ctx.scalar.write(2, 3);               // 3
+        ctx.scalar.write(2, 3); // 3
 
         let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::SetLt);
         op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
@@ -1415,8 +1405,8 @@ mod tests {
         // ao = 8 << 1 = 16. 16 >= 3: ao = 16 - 3 = 13, po = 0 << 1 | 1 = 1.
         let mut ctx = make_test_context();
         ctx.scalar.write(1, 0x00000008); // ai = s0
-        ctx.scalar.write(2, 3);          // b  = s1
-        ctx.scalar.write(31, 0);         // pi = r31
+        ctx.scalar.write(2, 3); // b  = s1
+        ctx.scalar.write(31, 0); // pi = r31
 
         let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::DivStep);
         op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
@@ -1433,9 +1423,9 @@ mod tests {
         // One dstep: pi=0, ai=1, b=3.
         // ao = 1 << 1 = 2. 2 < 3: no subtract, no quotient bit.
         let mut ctx = make_test_context();
-        ctx.scalar.write(1, 1);           // ai
-        ctx.scalar.write(2, 3);           // b
-        ctx.scalar.write(31, 0);          // pi
+        ctx.scalar.write(1, 1); // ai
+        ctx.scalar.write(2, 3); // b
+        ctx.scalar.write(31, 0); // pi
 
         let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::DivStep);
         op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
@@ -1453,8 +1443,8 @@ mod tests {
         // Verified against NPU hardware step-capture.
         let mut ctx = make_test_context();
         ctx.scalar.write(1, 100); // dividend (ai, also d0)
-        ctx.scalar.write(2, 7);   // divisor (b)
-        ctx.scalar.write(31, 0);  // quotient accumulator starts at 0
+        ctx.scalar.write(2, 7); // divisor (b)
+        ctx.scalar.write(31, 0); // quotient accumulator starts at 0
 
         for _ in 0..32 {
             let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::DivStep);

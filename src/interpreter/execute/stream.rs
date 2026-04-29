@@ -85,7 +85,11 @@ impl StreamOps {
 
                 log::info!(
                     "[STREAM] WriteScalar: value=0x{:08X} port={} blocking={} (tile {},{})",
-                    value, port, blocking, tile.col, tile.row
+                    value,
+                    port,
+                    blocking,
+                    tile.col,
+                    tile.row
                 );
 
                 // Hardware stream output FIFO is 4 words deep per port.
@@ -94,7 +98,10 @@ impl StreamOps {
                 if blocking && tile.stream_output_len(port) >= STREAM_FIFO_DEPTH {
                     log::debug!(
                         "[STREAM] Write stall: port {} FIFO full (tile {},{}, pc=0x{:X})",
-                        port, tile.col, tile.row, ctx.pc()
+                        port,
+                        tile.col,
+                        tile.row,
+                        ctx.pc()
                     );
                     return StreamResult::Stall { port };
                 }
@@ -112,7 +119,11 @@ impl StreamOps {
 
                 log::info!(
                     "[STREAM] WritePacketHeader: header=0x{:08X} port={} blocking={} (tile {},{})",
-                    header, port, blocking, tile.col, tile.row
+                    header,
+                    port,
+                    blocking,
+                    tile.col,
+                    tile.row
                 );
 
                 // Hardware stream output FIFO is 4 words deep per port.
@@ -120,7 +131,10 @@ impl StreamOps {
                 if blocking && tile.stream_output_len(port) >= STREAM_FIFO_DEPTH {
                     log::debug!(
                         "[STREAM] PacketHeader stall: port {} FIFO full (tile {},{}, pc=0x{:X})",
-                        port, tile.col, tile.row, ctx.pc()
+                        port,
+                        tile.col,
+                        tile.row,
+                        ctx.pc()
                     );
                     return StreamResult::Stall { port };
                 }
@@ -146,7 +160,9 @@ impl StreamOps {
                     // No data but non-blocking - write 0 and continue
                     log::debug!(
                         "[STREAM] Non-blocking read: port {} empty, writing 0 (tile {},{})",
-                        port, tile.col, tile.row
+                        port,
+                        tile.col,
+                        tile.row
                     );
                     write_dest(op, ctx, 0);
                     StreamResult::Completed
@@ -199,9 +215,7 @@ impl StreamOps {
     ///
     /// Stream writes typically take a single source operand (scalar register).
     fn get_source_value(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
-        op.sources
-            .first()
-            .map_or(0, |src| read_operand(src, ctx))
+        op.sources.first().map_or(0, |src| read_operand(src, ctx))
     }
 
     /// Get the stream port from operands.
@@ -220,7 +234,6 @@ impl StreamOps {
         // Default to port 0 (core port)
         0
     }
-
 }
 
 #[cfg(test)]
@@ -248,10 +261,7 @@ mod tests {
             .with_blocking(true)
             .with_source(Operand::ScalarReg(0));
 
-        assert_eq!(
-            StreamOps::execute(&op, &mut ctx, &mut tile),
-            StreamResult::Completed
-        );
+        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
 
         // Verify data was actually pushed to stream output
         assert_eq!(tile.pop_stream_output(0), Some(0xDEADBEEF));
@@ -270,10 +280,7 @@ mod tests {
             .with_source(Operand::ScalarReg(0))
             .with_source(Operand::Immediate(3)); // Port 3
 
-        assert_eq!(
-            StreamOps::execute(&op, &mut ctx, &mut tile),
-            StreamResult::Completed
-        );
+        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
 
         // Verify data went to port 3, not port 0
         assert_eq!(tile.pop_stream_output(0), None);
@@ -291,10 +298,7 @@ mod tests {
             .with_blocking(false)
             .with_source(Operand::ScalarReg(1));
 
-        assert_eq!(
-            StreamOps::execute(&op, &mut ctx, &mut tile),
-            StreamResult::Completed
-        );
+        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
 
         // Verify packet header was pushed to stream output
         assert_eq!(tile.pop_stream_output(0), Some(0x12345678));
@@ -314,10 +318,7 @@ mod tests {
             .with_blocking(true)
             .with_dest(Operand::ScalarReg(5));
 
-        assert_eq!(
-            StreamOps::execute(&op, &mut ctx, &mut tile),
-            StreamResult::Completed
-        );
+        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
 
         // Should have read the actual data
         assert_eq!(ctx.scalar.read(5), 0xCAFEBABE);
@@ -333,10 +334,7 @@ mod tests {
             .with_blocking(true)
             .with_dest(Operand::ScalarReg(5));
 
-        assert_eq!(
-            StreamOps::execute(&op, &mut ctx, &mut tile),
-            StreamResult::Stall { port: 0 }
-        );
+        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Stall { port: 0 });
     }
 
     #[test]
@@ -351,10 +349,7 @@ mod tests {
             .with_blocking(false)
             .with_dest(Operand::ScalarReg(5));
 
-        assert_eq!(
-            StreamOps::execute(&op, &mut ctx, &mut tile),
-            StreamResult::Completed
-        );
+        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
 
         // Non-blocking returns 0 when empty
         assert_eq!(ctx.scalar.read(5), 0);
@@ -371,10 +366,7 @@ mod tests {
             .with_source(Operand::ScalarReg(0))
             .with_source(Operand::ScalarReg(1));
 
-        assert_eq!(
-            StreamOps::execute(&op, &mut ctx, &mut tile),
-            StreamResult::NotStreamOp
-        );
+        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::NotStreamOp);
     }
 
     #[test]
@@ -387,10 +379,7 @@ mod tests {
             .with_blocking(true)
             .with_source(Operand::Immediate(42));
 
-        assert_eq!(
-            StreamOps::execute(&op, &mut ctx, &mut tile),
-            StreamResult::Completed
-        );
+        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
     }
 
     #[test]
@@ -410,10 +399,7 @@ mod tests {
         }
 
         // 5th write should stall
-        assert_eq!(
-            StreamOps::execute(&op, &mut ctx, &mut tile),
-            StreamResult::Stall { port: 0 }
-        );
+        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Stall { port: 0 });
     }
 
     #[test]
@@ -433,10 +419,7 @@ mod tests {
         }
 
         // Non-blocking write should still succeed (unbounded for non-blocking)
-        assert_eq!(
-            StreamOps::execute(&op, &mut ctx, &mut tile),
-            StreamResult::Completed
-        );
+        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
     }
 
     #[test]
@@ -447,13 +430,9 @@ mod tests {
         // Push data - even without dest, should read and discard
         tile.push_stream_input(0, 0x12345678);
 
-        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamRead)
-            .with_blocking(false);
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamRead).with_blocking(false);
 
         // Should return Completed (data consumed but discarded)
-        assert_eq!(
-            StreamOps::execute(&op, &mut ctx, &mut tile),
-            StreamResult::Completed
-        );
+        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
     }
 }

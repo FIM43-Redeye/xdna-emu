@@ -63,12 +63,7 @@ impl NeighborMemory {
     ///
     /// Does NOT clone any neighbor memory yet -- snapshots are lazy.
     pub fn new(col: usize, row: usize) -> Self {
-        Self {
-            col,
-            row,
-            snapshots: [None, None, None, None],
-            pending_writes: Vec::new(),
-        }
+        Self { col, row, snapshots: [None, None, None, None], pending_writes: Vec::new() }
     }
 
     /// Resolve a cardinal direction to the neighbor tile coordinates.
@@ -86,7 +81,11 @@ impl NeighborMemory {
                 }
             }
             MemoryQuadrant::West => {
-                if self.col > 0 { Some((self.col - 1, self.row)) } else { None }
+                if self.col > 0 {
+                    Some((self.col - 1, self.row))
+                } else {
+                    None
+                }
             }
             MemoryQuadrant::North => Some((self.col, self.row + 1)),
             MemoryQuadrant::East => Some((self.col + 1, self.row)),
@@ -107,7 +106,8 @@ impl NeighborMemory {
             return; // Already loaded
         }
 
-        let snapshot = self.neighbor_coords(dir)
+        let snapshot = self
+            .neighbor_coords(dir)
             .and_then(|(c, r)| device.tile(c, r))
             .map(|tile| tile.data_memory().to_vec());
 
@@ -119,9 +119,7 @@ impl NeighborMemory {
     /// Returns None if the neighbor doesn't exist or hasn't been snapshotted.
     pub fn get_memory(&self, dir: MemoryQuadrant) -> Option<&[u8]> {
         let idx = dir_index(dir)?;
-        self.snapshots[idx]
-            .as_ref()
-            .and_then(|opt| opt.as_deref())
+        self.snapshots[idx].as_ref().and_then(|opt| opt.as_deref())
     }
 
     /// Buffer a cross-tile write for deferred application.
@@ -138,12 +136,20 @@ impl NeighborMemory {
         let row = self.row;
         for (dir, offset, data) in self.pending_writes {
             let coords = match dir {
-                MemoryQuadrant::South => if row > SHIM_ROW as usize {
-                    Some((col, row - 1))
-                } else {
-                    None
-                },
-                MemoryQuadrant::West => if col > 0 { Some((col - 1, row)) } else { None },
+                MemoryQuadrant::South => {
+                    if row > SHIM_ROW as usize {
+                        Some((col, row - 1))
+                    } else {
+                        None
+                    }
+                }
+                MemoryQuadrant::West => {
+                    if col > 0 {
+                        Some((col - 1, row))
+                    } else {
+                        None
+                    }
+                }
                 MemoryQuadrant::North => Some((col, row + 1)),
                 MemoryQuadrant::East => Some((col + 1, row)),
                 MemoryQuadrant::Local => None,
