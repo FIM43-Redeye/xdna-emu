@@ -56,8 +56,8 @@ pub use traits::{Decoder, Executor, StateAccess, ExecuteResult, DecodeError};
 
 // Bundle types
 pub use bundle::{
-    BundleFormat, Operand, SlotIndex, SlotMask, SlotOp, VliwBundle,
-    BranchCondition, ElementType, MemWidth, PostModify, Predicate, ShufflePattern,
+    BundleFormat, Operand, SlotIndex, SlotMask, SlotOp, VliwBundle, BranchCondition, ElementType, MemWidth,
+    PostModify, Predicate, ShufflePattern,
 };
 
 // Decoder types
@@ -66,8 +66,8 @@ pub use decode::InstructionDecoder;
 // State types
 pub use state::{ExecutionContext, SpRegister, TimingContext};
 pub use state::{
-    ScalarRegisterFile, VectorRegisterFile, AccumulatorRegisterFile,
-    PointerRegisterFile, ModifierRegisterFile,
+    ScalarRegisterFile, VectorRegisterFile, AccumulatorRegisterFile, PointerRegisterFile,
+    ModifierRegisterFile,
 };
 
 // Execute types

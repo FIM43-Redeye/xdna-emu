@@ -35,7 +35,8 @@ fn main() -> anyhow::Result<()> {
     if args.len() >= 2 && args.iter().any(|a| a == "test-suite") {
         #[cfg(feature = "tooling")]
         {
-            let path = args.iter()
+            let path = args
+                .iter()
                 .skip(1)
                 .find(|a| !a.starts_with('-') && a.as_str() != "test-suite")
                 .map(|s| s.as_str())
@@ -51,7 +52,8 @@ fn main() -> anyhow::Result<()> {
 
     // Check for GUI mode
     let gui_mode = args.iter().any(|a| a == "--gui" || a == "-g");
-    let file_arg: Option<&str> = args.iter()
+    let file_arg: Option<&str> = args
+        .iter()
         .skip(1)
         .find(|a| !a.starts_with('-') && a.as_str() != "--trace")
         .map(|s| s.as_str());
@@ -178,9 +180,19 @@ fn main() -> anyhow::Result<()> {
                                     for (j, cmd) in cdo.commands().enumerate() {
                                         if let CdoRaw::DmaWrite { address, data } = &cmd {
                                             let addr = TileAddress::decode(*address);
-                                            let subsystem = subsystem_from_offset(addr.offset, tile_kind_from_row(addr.row));
-                                            println!("  [{:2}] tile({},{}) offset=0x{:05X} {} {} bytes",
-                                                j, addr.col, addr.row, addr.offset, subsystem, data.len());
+                                            let subsystem = subsystem_from_offset(
+                                                addr.offset,
+                                                tile_kind_from_row(addr.row),
+                                            );
+                                            println!(
+                                                "  [{:2}] tile({},{}) offset=0x{:05X} {} {} bytes",
+                                                j,
+                                                addr.col,
+                                                addr.row,
+                                                addr.offset,
+                                                subsystem,
+                                                data.len()
+                                            );
                                         }
                                     }
 
@@ -238,7 +250,9 @@ fn print_register_analysis(cdo: &Cdo) {
     for cmd in cdo.commands() {
         if let Some((col, row, offset)) = cmd.decode_aie_address() {
             let tile = TileAddress { col, row, offset };
-            *module_counts.entry(subsystem_from_offset(tile.offset, tile_kind_from_row(tile.row))).or_insert(0) += 1;
+            *module_counts
+                .entry(subsystem_from_offset(tile.offset, tile_kind_from_row(tile.row)))
+                .or_insert(0) += 1;
             *tile_counts.entry((col, row)).or_insert(0) += 1;
 
             if let Some(info) = RegisterInfo::lookup_aie2(offset) {
@@ -287,28 +301,27 @@ fn print_command(idx: usize, cmd: &CdoRaw) {
         let tile = TileAddress { col, row, offset };
         let reg_info = RegisterInfo::lookup_aie2(offset);
 
-        let reg_name = reg_info
-            .as_ref()
-            .map(|r| r.name)
-            .unwrap_or_else(|| match subsystem_from_offset(tile.offset, tile_kind_from_row(tile.row)) {
+        let reg_name = reg_info.as_ref().map(|r| r.name).unwrap_or_else(|| {
+            match subsystem_from_offset(tile.offset, tile_kind_from_row(tile.row)) {
                 SubsystemKind::DataMemory => "DATA",
                 SubsystemKind::ProgramMemory => "CODE",
                 _ => "???",
-            });
+            }
+        });
 
         // Format based on command type
         match cmd {
             CdoRaw::Write { value, .. } => {
-                println!("  [{:2}] WRITE     tile({},{}) {} = 0x{:08X}",
-                    idx, col, row, reg_name, value);
+                println!("  [{:2}] WRITE     tile({},{}) {} = 0x{:08X}", idx, col, row, reg_name, value);
             }
             CdoRaw::MaskWrite { mask, value, .. } => {
-                println!("  [{:2}] MASKWRITE tile({},{}) {} mask=0x{:X} val=0x{:X}",
-                    idx, col, row, reg_name, mask, value);
+                println!(
+                    "  [{:2}] MASKWRITE tile({},{}) {} mask=0x{:X} val=0x{:X}",
+                    idx, col, row, reg_name, mask, value
+                );
             }
             CdoRaw::DmaWrite { data, .. } => {
-                println!("  [{:2}] DMAWRITE  tile({},{}) {} {} bytes",
-                    idx, col, row, reg_name, data.len());
+                println!("  [{:2}] DMAWRITE  tile({},{}) {} {} bytes", idx, col, row, reg_name, data.len());
             }
             _ => {
                 println!("  [{:2}] {:?}", idx, cmd);
@@ -393,11 +406,7 @@ fn print_help() {
 }
 
 #[cfg(feature = "gui")]
-fn run_gui(
-    _file_path: Option<&str>,
-    trace_hw: Option<&str>,
-    trace_emu: Option<&str>,
-) -> anyhow::Result<()> {
+fn run_gui(_file_path: Option<&str>, trace_hw: Option<&str>, trace_emu: Option<&str>) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 800.0])
