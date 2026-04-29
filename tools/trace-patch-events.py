@@ -405,17 +405,37 @@ def main() -> int:
     if args.multi_tile is not None:
         if any(x is not None for x in [args.col, args.row, args.tile_type]):
             ap.error("--multi-tile is mutually exclusive with --col/--row/--tile-type")
-        spec_list = json.loads(args.multi_tile.read_text())
+        if args.events is not None:
+            print("warning: --events ignored in --multi-tile mode; "
+                  "use the events field in the JSON spec",
+                  file=sys.stderr)
+        try:
+            spec_list = json.loads(args.multi_tile.read_text())
+        except json.JSONDecodeError as e:
+            ap.error(f"--multi-tile: invalid JSON in {args.multi_tile}: {e}")
+
+        if not isinstance(spec_list, list):
+            ap.error(f"--multi-tile: expected a JSON array, got "
+                     f"{type(spec_list).__name__}")
+
         data = Path(args.input).read_bytes()
         summaries: list[str] = []
         try:
             for s in spec_list:
-                col = int(s["col"]); row = int(s["row"])
-                tile_type = s["tile_type"]
+                try:
+                    col = int(s["col"])
+                    row = int(s["row"])
+                    tile_type = s["tile_type"]
+                except (KeyError, TypeError) as e:
+                    ap.error(f"--multi-tile: malformed spec entry {s!r}: {e}")
                 if "events" in s:
-                    events = _parse_events_arg(
-                        ",".join(str(e) for e in s["events"])
-                    )
+                    # JSON delivers events as a list of ints; consume directly
+                    # rather than round-tripping through _parse_events_arg's
+                    # string format. Trailing zeros are not trimmed here --
+                    # callers writing JSON should pass the exact slot list
+                    # they want; the CLI's "33,,," → [33] convenience is a
+                    # shell-quoting workaround that does not apply to JSON.
+                    events = [int(e) for e in s["events"]]
                     data, n = patch_events(data, col, row, tile_type, events)
                     summaries.append(
                         f"({col},{row},{tile_type}) events={events} ({n})"

@@ -48,6 +48,39 @@ _npu_address = _mod._npu_address
 _TRACE_EVENT_REGS = _mod._TRACE_EVENT_REGS
 _TRACE_CONTROL0_REGS = _mod._TRACE_CONTROL0_REGS
 
+
+# ---------------------------------------------------------------------------
+# CLI helper -- returns (rc, stdout, stderr) so error-message tests can assert
+# on stderr content without re-invoking the subprocess.
+# ---------------------------------------------------------------------------
+
+def run_patch(argv: List[str]):
+    """Invoke trace-patch-events.py as a subprocess.
+
+    Returns the int exit code for backward compatibility with `rc = run_patch(...)`,
+    while exposing stdout/stderr via the .stdout / .stderr attributes on the
+    returned object (a small wrapper class). Tests that only need the exit
+    code can keep doing `rc = run_patch(...)`; tests that need to assert on
+    stderr content can do `result = run_patch(...); assert "..." in result.stderr`.
+    """
+    proc = subprocess.run(
+        [sys.executable, str(_PATCHER_PATH)] + argv,
+        capture_output=True,
+        text=True,
+    )
+    return _RunResult(proc.returncode, proc.stdout, proc.stderr)
+
+
+class _RunResult(int):
+    """Int subclass: behaves like the exit code (so `assert rc == 0` works)
+    but carries stdout/stderr attributes for error-message assertions."""
+
+    def __new__(cls, returncode: int, stdout: str, stderr: str):
+        obj = super().__new__(cls, returncode)
+        obj.stdout = stdout
+        obj.stderr = stderr
+        return obj
+
 # ---------------------------------------------------------------------------
 # Fixture helpers
 # ---------------------------------------------------------------------------
@@ -69,17 +102,23 @@ def _write32_instruction(reg_off: int, value: int = 0) -> bytes:
 
 
 def _make_insts_bin(tile_specs: List[tuple]) -> bytes:
-    """Build a minimal insts.bin containing Trace_Event0+1 Write32 pairs.
+    """Build a minimal insts.bin containing Trace_Event0+1 + Trace_Control0
+    Write32 entries for each tile.
 
     tile_specs is a list of (col, row, tile_type) tuples. For each spec,
-    two Write32 instructions are emitted (Trace_Event0 and Trace_Event1)
-    so that patch_events() finds both slots (8-slot capacity).
+    three Write32 instructions are emitted: Trace_Event0, Trace_Event1
+    (so patch_events() finds both slots / 8-slot capacity) and
+    Trace_Control0 (so patch_trace_control() finds a target). The latter
+    is required for the combined-spec test exercising both code paths in
+    one --multi-tile entry.
     """
     payload = b""
     for col, row, tile_type in tile_specs:
         off_e0, off_e1 = _TRACE_EVENT_REGS[tile_type]
+        off_ctl = _TRACE_CONTROL0_REGS[tile_type]
         payload += _write32_instruction(_npu_address(col, row, off_e0))
         payload += _write32_instruction(_npu_address(col, row, off_e1))
+        payload += _write32_instruction(_npu_address(col, row, off_ctl))
     return _HEADER + payload
 
 
@@ -98,20 +137,6 @@ def sample_insts_bin(tmp_path) -> Path:
     p = tmp_path / "insts.bin"
     p.write_bytes(data)
     return p
-
-
-# ---------------------------------------------------------------------------
-# CLI helper
-# ---------------------------------------------------------------------------
-
-def run_patch(argv: List[str]) -> int:
-    """Invoke trace-patch-events.py as a subprocess; return its exit code."""
-    result = subprocess.run(
-        [sys.executable, str(_PATCHER_PATH)] + argv,
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode
 
 
 # ---------------------------------------------------------------------------
@@ -250,19 +275,134 @@ class TestMultiTileCLI:
 
         assert multi_out.read_bytes() == single_out.read_bytes()
 
-    def test_multi_tile_exits_zero_on_success(self, tmp_path, sample_insts_bin):
-        """Basic sanity: --multi-tile with valid spec returns exit code 0."""
+    def test_multi_tile_combined_events_and_control_matches_chained(
+        self, tmp_path, sample_insts_bin,
+    ):
+        """A spec entry with both events AND mode/start_event/stop_event must
+        produce the same bytes as two chained single-tile invocations.
+
+        Multi-tile path internally calls patch_events then patch_trace_control
+        on the same accumulated buffer; this test verifies that's byte-identical
+        to two separate subprocess invocations. This is the path Task 6's
+        sweep will hit when batching mode-flips alongside event slot changes.
+        """
+        spec = [
+            {"col": 0, "row": 2, "tile_type": "core",
+             "events": [37, 23, 26, 28],
+             "mode": 1, "start_event": 1, "stop_event": 0},
+        ]
+        spec_json = tmp_path / "spec.json"
+        spec_json.write_text(json.dumps(spec))
+
+        multi_out = tmp_path / "multi.bin"
+        rc = run_patch([
+            str(sample_insts_bin),
+            "--multi-tile", str(spec_json),
+            "--output", str(multi_out),
+        ])
+        assert rc == 0, f"multi-tile failed: {rc.stderr}"
+
+        # Chained: patch_events first, then patch_trace_control
+        intermediate = tmp_path / "intermediate.bin"
+        rc1 = run_patch([
+            str(sample_insts_bin),
+            "--col", "0", "--row", "2", "--tile-type", "core",
+            "--events", "37,23,26,28",
+            "--output", str(intermediate),
+        ])
+        assert rc1 == 0, f"events patch failed: {rc1.stderr}"
+        chain_out = tmp_path / "chain.bin"
+        rc2 = run_patch([
+            str(intermediate),
+            "--col", "0", "--row", "2", "--tile-type", "core",
+            "--mode", "1", "--start-event", "1", "--stop-event", "0",
+            "--output", str(chain_out),
+        ])
+        assert rc2 == 0, f"control patch failed: {rc2.stderr}"
+
+        assert multi_out.read_bytes() == chain_out.read_bytes()
+
+    # -----------------------------------------------------------------------
+    # Issue 1: clean error messages for malformed spec input
+    # -----------------------------------------------------------------------
+
+    def test_multi_tile_malformed_json_clean_error(self, tmp_path, sample_insts_bin):
+        """Invalid JSON in spec file must produce a clean argparse error,
+        not a raw json.JSONDecodeError traceback."""
+        spec_json = tmp_path / "spec.json"
+        spec_json.write_text("{not valid json")
+        out = tmp_path / "out.bin"
+
+        result = run_patch([
+            str(sample_insts_bin),
+            "--multi-tile", str(spec_json),
+            "--output", str(out),
+        ])
+        assert result != 0
+        assert "invalid JSON" in result.stderr
+        # No raw traceback:
+        assert "Traceback" not in result.stderr
+
+    def test_multi_tile_root_not_a_list_clean_error(self, tmp_path, sample_insts_bin):
+        """JSON root that isn't an array must produce a clean error."""
+        spec_json = tmp_path / "spec.json"
+        spec_json.write_text(json.dumps(
+            {"col": 0, "row": 2, "tile_type": "core", "events": [1]}
+        ))
+        out = tmp_path / "out.bin"
+
+        result = run_patch([
+            str(sample_insts_bin),
+            "--multi-tile", str(spec_json),
+            "--output", str(out),
+        ])
+        assert result != 0
+        assert "expected a JSON array" in result.stderr
+        assert "Traceback" not in result.stderr
+
+    def test_multi_tile_missing_required_key_clean_error(
+        self, tmp_path, sample_insts_bin,
+    ):
+        """A spec entry missing 'col' must produce a clean error, not a
+        raw KeyError traceback."""
+        spec_json = tmp_path / "spec.json"
+        spec_json.write_text(json.dumps([
+            {"row": 2, "tile_type": "core", "events": [1]},  # missing col
+        ]))
+        out = tmp_path / "out.bin"
+
+        result = run_patch([
+            str(sample_insts_bin),
+            "--multi-tile", str(spec_json),
+            "--output", str(out),
+        ])
+        assert result != 0
+        assert "malformed spec entry" in result.stderr
+        assert "Traceback" not in result.stderr
+
+    # -----------------------------------------------------------------------
+    # Suggestion 1: warning when --events used alongside --multi-tile
+    # -----------------------------------------------------------------------
+
+    def test_multi_tile_warns_when_events_also_passed(
+        self, tmp_path, sample_insts_bin,
+    ):
+        """Passing --events alongside --multi-tile must succeed (JSON wins)
+        but emit a stderr warning so the user sees their CLI flag was ignored."""
         spec = [{"col": 0, "row": 2, "tile_type": "core", "events": [1]}]
         spec_json = tmp_path / "spec.json"
         spec_json.write_text(json.dumps(spec))
         out = tmp_path / "out.bin"
 
-        rc = run_patch([
+        result = run_patch([
             str(sample_insts_bin),
             "--multi-tile", str(spec_json),
+            "--events", "42",
             "--output", str(out),
         ])
-        assert rc == 0
+        assert result == 0
+        assert "warning" in result.stderr.lower()
+        assert "--events" in result.stderr
 
 
 # ---------------------------------------------------------------------------
