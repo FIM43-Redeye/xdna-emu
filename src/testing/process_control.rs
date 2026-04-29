@@ -53,10 +53,7 @@ pub enum ProcessOutcome {
         exit_code: i32,
     },
     /// Process exceeded the timeout and was killed successfully.
-    Timeout {
-        stdout: String,
-        stderr: String,
-    },
+    Timeout { stdout: String, stderr: String },
     /// Process survived SIGKILL -- stuck in D-state (uninterruptible sleep).
     /// The device is wedged and no further hardware tests should run.
     Wedged {
@@ -94,10 +91,7 @@ pub fn configure_process_group(cmd: &mut Command) {
                 // Non-fatal: worst case we can only kill the top-level PID.
                 // This should never fail in practice (child is not already
                 // a session leader).
-                eprintln!(
-                    "warning: setsid() failed: {}",
-                    std::io::Error::last_os_error()
-                );
+                eprintln!("warning: setsid() failed: {}", std::io::Error::last_os_error());
             }
             Ok(())
         });
@@ -160,12 +154,8 @@ pub fn wait_with_timeout(mut child: Child, timeout_secs: u32) -> ProcessOutcome 
     });
 
     let join_threads = || {
-        let stdout = stdout_thread
-            .and_then(|t| t.join().ok())
-            .unwrap_or_default();
-        let stderr = stderr_thread
-            .and_then(|t| t.join().ok())
-            .unwrap_or_default();
+        let stdout = stdout_thread.and_then(|t| t.join().ok()).unwrap_or_default();
+        let stderr = stderr_thread.and_then(|t| t.join().ok()).unwrap_or_default();
         (stdout, stderr)
     };
 
@@ -188,9 +178,7 @@ pub fn wait_with_timeout(mut child: Child, timeout_secs: u32) -> ProcessOutcome 
                 std::thread::sleep(POLL_INTERVAL);
             }
             Err(e) => {
-                return ProcessOutcome::SpawnError(
-                    format!("Failed to wait for process: {}", e),
-                );
+                return ProcessOutcome::SpawnError(format!("Failed to wait for process: {}", e));
             }
         }
     }
@@ -229,10 +217,7 @@ where
         Ok(None) => {
             // Still alive after SIGKILL + 500ms. This is D-state.
             let state = check_proc_state(pid);
-            log::error!(
-                "Process {} survived SIGKILL (state: {}). Device is wedged.",
-                pid, state
-            );
+            log::error!("Process {} survived SIGKILL (state: {}). Device is wedged.", pid, state);
             ProcessOutcome::Wedged { pid, stdout, stderr }
         }
         Err(_) => {
@@ -260,7 +245,6 @@ fn check_proc_state(pid: u32) -> String {
         Err(_) => "unknown (proc unreadable)".to_string(),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -337,11 +321,7 @@ mod tests {
         let pid = std::process::id();
         let state = check_proc_state(pid);
         // Should start with R or S (sleeping is also common for test runner).
-        assert!(
-            state.starts_with('R') || state.starts_with('S'),
-            "unexpected state for self: {}",
-            state
-        );
+        assert!(state.starts_with('R') || state.starts_with('S'), "unexpected state for self: {}", state);
     }
 
     #[test]

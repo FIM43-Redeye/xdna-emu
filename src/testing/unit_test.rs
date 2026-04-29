@@ -67,14 +67,10 @@ pub struct UnitTestBuildResult {
 ///
 /// Returns tests sorted by name for deterministic ordering.
 pub fn discover(mlir_aie_path: &Path) -> Vec<UnitTest> {
-    let test_root = mlir_aie_path
-        .join("test/unit_tests/chess_compiler_tests_aie2");
+    let test_root = mlir_aie_path.join("test/unit_tests/chess_compiler_tests_aie2");
 
     if !test_root.is_dir() {
-        log::warn!(
-            "Unit test directory not found: {}",
-            test_root.display()
-        );
+        log::warn!("Unit test directory not found: {}", test_root.display());
         return Vec::new();
     }
 
@@ -118,7 +114,11 @@ pub fn discover(mlir_aie_path: &Path) -> Vec<UnitTest> {
                 if aie_row_mlir.exists() {
                     let alt = parse_mlir_annotations(&aie_row_mlir);
                     if alt.xfail {
-                        (aie_row_mlir, Some("XFAIL in both aie.mlir and aie_row.mlir".to_string()), alt.run_lines)
+                        (
+                            aie_row_mlir,
+                            Some("XFAIL in both aie.mlir and aie_row.mlir".to_string()),
+                            alt.run_lines,
+                        )
                     } else if alt.fixme {
                         (aie_row_mlir, Some(format!("FIXME: {}", alt.fixme_reason)), alt.run_lines)
                     } else {
@@ -148,9 +148,8 @@ pub fn discover(mlir_aie_path: &Path) -> Vec<UnitTest> {
 
         // Build steps: RUN lines excluding simulation commands.
         // Simulation (aiesim.sh) is handled separately by the runner.
-        let build_steps: Vec<String> = run_lines.into_iter()
-            .filter(|line| !line.contains("aiesim.sh"))
-            .collect();
+        let build_steps: Vec<String> =
+            run_lines.into_iter().filter(|line| !line.contains("aiesim.sh")).collect();
 
         // Collect kernel source files
         let mut kernel_sources = Vec::new();
@@ -202,12 +201,8 @@ struct MlirAnnotations {
 /// RUN lines are scanned from the entire file because LLVM lit allows them
 /// anywhere. XFAIL and FIXME are only meaningful in the header.
 fn parse_mlir_annotations(path: &Path) -> MlirAnnotations {
-    let mut annotations = MlirAnnotations {
-        xfail: false,
-        fixme: false,
-        fixme_reason: String::new(),
-        run_lines: Vec::new(),
-    };
+    let mut annotations =
+        MlirAnnotations { xfail: false, fixme: false, fixme_reason: String::new(), run_lines: Vec::new() };
 
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -251,9 +246,7 @@ mod tests {
 
     /// Create a unique temporary directory for tests.
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join("xdna_emu_unit_test_tests")
-            .join(name);
+        let dir = std::env::temp_dir().join("xdna_emu_unit_test_tests").join(name);
         // Clean up from any previous run
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -365,8 +358,7 @@ mod tests {
     #[test]
     fn test_discover_skips_no_test_cpp() {
         let dir = test_dir("no_cpp");
-        let test_root = dir
-            .join("test/unit_tests/chess_compiler_tests_aie2/00_itsalive");
+        let test_root = dir.join("test/unit_tests/chess_compiler_tests_aie2/00_itsalive");
         std::fs::create_dir_all(&test_root).unwrap();
         std::fs::write(test_root.join("aie.mlir"), "module {}").unwrap();
         // No test.cpp -- should be excluded
@@ -378,8 +370,7 @@ mod tests {
     #[test]
     fn test_discover_finds_valid_test_with_build_steps() {
         let dir = test_dir("valid");
-        let test_root = dir
-            .join("test/unit_tests/chess_compiler_tests_aie2/01_test");
+        let test_root = dir.join("test/unit_tests/chess_compiler_tests_aie2/01_test");
         std::fs::create_dir_all(&test_root).unwrap();
         std::fs::write(
             test_root.join("aie.mlir"),
@@ -387,7 +378,8 @@ mod tests {
              // RUN: %PYTHON aiecc.py --aiesim --xchesscc %s %test_lib_flags %S/test.cpp\n\
              // RUN: aie.mlir.prj/aiesim.sh | FileCheck %s\n\
              module {}\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(test_root.join("test.cpp"), "int main() {}").unwrap();
         std::fs::write(test_root.join("kernel.cc"), "void f() {}").unwrap();
 
@@ -405,21 +397,22 @@ mod tests {
     #[test]
     fn test_discover_build_steps_from_aie_row_on_xfail() {
         let dir = test_dir("xfail_fallback");
-        let test_root = dir
-            .join("test/unit_tests/chess_compiler_tests_aie2/04_shared");
+        let test_root = dir.join("test/unit_tests/chess_compiler_tests_aie2/04_shared");
         std::fs::create_dir_all(&test_root).unwrap();
         std::fs::write(
             test_root.join("aie.mlir"),
             "// XFAIL: *\n\
              // RUN: %PYTHON aiecc.py --xchesscc %s\n\
              module {}\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             test_root.join("aie_row.mlir"),
             "// RUN: %PYTHON aiecc.py --aiesim --xchesscc %s %test_lib_flags %S/test.cpp\n\
              // RUN: aie_row.mlir.prj/aiesim.sh | FileCheck %s\n\
              module {}\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(test_root.join("test.cpp"), "int main() {}").unwrap();
 
         let tests = discover(&dir);
@@ -434,8 +427,7 @@ mod tests {
     #[test]
     fn test_discover_bcf_pattern_build_steps() {
         let dir = test_dir("bcf_pattern");
-        let test_root = dir
-            .join("test/unit_tests/chess_compiler_tests_aie2/02_precompiled");
+        let test_root = dir.join("test/unit_tests/chess_compiler_tests_aie2/02_precompiled");
         std::fs::create_dir_all(&test_root).unwrap();
         std::fs::write(
             test_root.join("aie.mlir"),

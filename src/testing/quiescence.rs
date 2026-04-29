@@ -45,28 +45,29 @@ pub struct QuiescenceDiagnosis {
 impl fmt::Display for QuiescenceDiagnosis {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Core states (only non-halted or interesting ones)
-        let interesting_cores: Vec<_> = self.core_states.iter()
-            .filter(|(_, _, desc)| desc != "Halted")
-            .collect();
+        let interesting_cores: Vec<_> =
+            self.core_states.iter().filter(|(_, _, desc)| desc != "Halted").collect();
 
         if interesting_cores.is_empty() {
             write!(f, "all cores halted")?;
         } else {
             for (i, (col, row, desc)) in interesting_cores.iter().enumerate() {
-                if i > 0 { write!(f, ", ")?; }
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
                 write!(f, "core({},{}) {}", col, row, desc)?;
             }
         }
 
         // DMA states (only non-idle ones)
-        let active_dma: Vec<_> = self.dma_states.iter()
-            .filter(|(_, _, _, desc)| desc != "Idle")
-            .collect();
+        let active_dma: Vec<_> = self.dma_states.iter().filter(|(_, _, _, desc)| desc != "Idle").collect();
 
         if !active_dma.is_empty() {
             write!(f, "; DMA: ")?;
             for (i, (col, row, ch, desc)) in active_dma.iter().enumerate() {
-                if i > 0 { write!(f, ", ")?; }
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
                 write!(f, "({},{})ch{} {}", col, row, ch, desc)?;
             }
         }
@@ -75,7 +76,9 @@ impl fmt::Display for QuiescenceDiagnosis {
         if !self.pending_syncs.is_empty() {
             write!(f, "; pending syncs: ")?;
             for (i, sync) in self.pending_syncs.iter().enumerate() {
-                if i > 0 { write!(f, ", ")?; }
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
                 write!(f, "{}", sync)?;
             }
         }
@@ -95,10 +98,7 @@ pub struct QuiescenceDetector {
 impl QuiescenceDetector {
     /// Create a new detector with the given cycle threshold.
     pub fn new(threshold: u64) -> Self {
-        Self {
-            quiescent_cycles: 0,
-            threshold,
-        }
+        Self { quiescent_cycles: 0, threshold }
     }
 
     /// Check whether the system is quiescent this cycle.
@@ -221,10 +221,14 @@ impl QuiescenceDetector {
 
         // Pending syncs from the NPU executor.
         let pending_syncs = if let Some(executor) = npu_executor {
-            executor.pending_syncs().iter().map(|s| {
-                let dir = if s.direction == 0 { "S2MM" } else { "MM2S" };
-                format!("col={} row={} ch={} {}", s.column, s.row, s.channel, dir)
-            }).collect()
+            executor
+                .pending_syncs()
+                .iter()
+                .map(|s| {
+                    let dir = if s.direction == 0 { "S2MM" } else { "MM2S" };
+                    format!("col={} row={} ch={} {}", s.column, s.row, s.channel, dir)
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -279,12 +283,7 @@ pub struct StallDetector {
 impl StallDetector {
     /// Create a new stall detector with the given cycle threshold.
     pub fn new(threshold: u64) -> Self {
-        Self {
-            last_dma_bytes: 0,
-            last_lock_releases: 0,
-            cycles_since_progress: 0,
-            threshold,
-        }
+        Self { last_dma_bytes: 0, last_lock_releases: 0, cycles_since_progress: 0, threshold }
     }
 
     /// Check whether the system has stalled this cycle.
@@ -293,11 +292,7 @@ impl StallDetector {
     /// - `Progressing` if DMA bytes or lock releases are advancing
     /// - `Stalled(diagnosis)` if no progress for `threshold` cycles
     ///   with unsatisfied syncs
-    pub fn check(
-        &mut self,
-        engine: &InterpreterEngine,
-        npu_executor: Option<&NpuExecutor>,
-    ) -> StallStatus {
+    pub fn check(&mut self, engine: &InterpreterEngine, npu_executor: Option<&NpuExecutor>) -> StallStatus {
         // Only check if there are pending syncs to satisfy. Without syncs,
         // there is no DMA completion target and the test may be purely
         // compute-based (or hasn't started DMA yet).
@@ -315,9 +310,7 @@ impl StallDetector {
         let current_bytes = engine.device().array.total_dma_bytes_transferred();
         let current_lock_releases = engine.device().array.total_lock_releases();
 
-        if current_bytes != self.last_dma_bytes
-            || current_lock_releases != self.last_lock_releases
-        {
+        if current_bytes != self.last_dma_bytes || current_lock_releases != self.last_lock_releases {
             self.last_dma_bytes = current_bytes;
             self.last_lock_releases = current_lock_releases;
             self.cycles_since_progress = 0;
@@ -325,9 +318,7 @@ impl StallDetector {
         } else {
             self.cycles_since_progress += 1;
             if self.cycles_since_progress >= self.threshold {
-                StallStatus::Stalled(
-                    QuiescenceDetector::diagnose(engine, npu_executor)
-                )
+                StallStatus::Stalled(QuiescenceDetector::diagnose(engine, npu_executor))
             } else {
                 StallStatus::Progressing
             }
@@ -380,15 +371,10 @@ mod tests {
     #[test]
     fn test_diagnosis_display_all_halted() {
         let diag = QuiescenceDiagnosis {
-            core_states: vec![
-                (0, 2, "Halted".to_string()),
-                (0, 3, "Halted".to_string()),
-            ],
+            core_states: vec![(0, 2, "Halted".to_string()), (0, 3, "Halted".to_string())],
             dma_states: vec![],
             data_in_flight: false,
-            pending_syncs: vec![
-                "col=0 row=0 ch=0 S2MM".to_string(),
-            ],
+            pending_syncs: vec!["col=0 row=0 ch=0 S2MM".to_string()],
         };
         let s = diag.to_string();
         assert!(s.contains("all cores halted"), "got: {}", s);
@@ -399,13 +385,8 @@ mod tests {
     #[test]
     fn test_diagnosis_display_waiting_core() {
         let diag = QuiescenceDiagnosis {
-            core_states: vec![
-                (0, 2, "WaitingLock(5)".to_string()),
-                (0, 3, "Halted".to_string()),
-            ],
-            dma_states: vec![
-                (0, 2, 0, "WaitingForLock(5)".to_string()),
-            ],
+            core_states: vec![(0, 2, "WaitingLock(5)".to_string()), (0, 3, "Halted".to_string())],
+            dma_states: vec![(0, 2, 0, "WaitingForLock(5)".to_string())],
             data_in_flight: false,
             pending_syncs: vec![],
         };

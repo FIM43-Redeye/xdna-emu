@@ -13,9 +13,7 @@ use crate::npu::{NpuInstructionStream, NpuExecutor, HostBuffer};
 
 use super::opcode_collector::{OpcodeCollector, UnknownOpcode};
 use super::test_cpp_parser::{BufferSpec, BufferDir, ElementType, read_values, generate_input_data};
-use super::hardware_comparison::{
-    self, CrossValidation, HardwareValidation, Diagnosis,
-};
+use super::hardware_comparison::{self, CrossValidation, HardwareValidation, Diagnosis};
 use super::native_hw::TestCppPattern;
 use std::collections::HashMap;
 
@@ -69,34 +67,19 @@ pub enum TestOutcome {
         total: usize,
     },
     /// Test was skipped (e.g. requires xchesscc, missing binary).
-    Skipped {
-        reason: String,
-    },
+    Skipped { reason: String },
     /// Test requires a different hardware platform (e.g. npu2/Strix Point).
     /// Distinct from Skipped: these tests are gated by hardware generation,
     /// not by missing features or tooling.
-    Platform {
-        required: String,
-        reason: String,
-    },
+    Platform { required: String, reason: String },
     /// Test failed with an error.
-    Fail {
-        message: String,
-        cycles: u64,
-    },
+    Fail { message: String, cycles: u64 },
     /// Test hit an unknown instruction.
-    UnknownOpcode {
-        details: UnknownOpcode,
-        cycles: u64,
-    },
+    UnknownOpcode { details: UnknownOpcode, cycles: u64 },
     /// Test timed out (didn't halt within max cycles).
-    Timeout {
-        cycles: u64,
-    },
+    Timeout { cycles: u64 },
     /// Test couldn't be loaded.
-    LoadError {
-        message: String,
-    },
+    LoadError { message: String },
 }
 
 impl TestOutcome {
@@ -130,7 +113,9 @@ impl TestOutcome {
             TestOutcome::Fail { cycles, .. } => Some(*cycles),
             TestOutcome::UnknownOpcode { cycles, .. } => Some(*cycles),
             TestOutcome::Timeout { cycles } => Some(*cycles),
-            TestOutcome::Skipped { .. } | TestOutcome::Platform { .. } | TestOutcome::LoadError { .. } => None,
+            TestOutcome::Skipped { .. } | TestOutcome::Platform { .. } | TestOutcome::LoadError { .. } => {
+                None
+            }
         }
     }
 }
@@ -210,9 +195,13 @@ impl XclbinTest {
         // Some lit tests produce "test.exe", others just "test" (Linux ELF).
         let test_exe = parent.and_then(|p| {
             let exe = p.join("test.exe");
-            if exe.exists() { return Some(exe); }
+            if exe.exists() {
+                return Some(exe);
+            }
             let test = p.join("test");
-            if test.exists() && test.is_file() { return Some(test); }
+            if test.exists() && test.is_file() {
+                return Some(test);
+            }
             None
         });
         // Instruction file: most tests use insts.bin (raw NPU instructions),
@@ -220,9 +209,13 @@ impl XclbinTest {
         // loaded via xrt::elf experimental API).
         let insts_path = parent.and_then(|p| {
             let bin = p.join("insts.bin");
-            if bin.exists() { return Some(bin); }
+            if bin.exists() {
+                return Some(bin);
+            }
             let elf = p.join("insts.elf");
-            if elf.exists() { return Some(elf); }
+            if elf.exists() {
+                return Some(elf);
+            }
             None
         });
 
@@ -405,10 +398,7 @@ impl XclbinSuite {
     /// accepts tests that have already been built (e.g. by `batch_build_peano()`).
     /// Tests are used as-is, with their buffer specs already attached.
     pub fn from_tests(tests: Vec<XclbinTest>) -> Self {
-        Self {
-            tests,
-            ..Self::new()
-        }
+        Self { tests, ..Self::new() }
     }
 
     /// Set the absolute cycle safety net.
@@ -601,7 +591,10 @@ impl XclbinSuite {
     /// decodable by mlir-aie's `parse.py`.
     ///
     /// Returns (outcome, raw_output, binary_trace_buffer).
-    pub fn run_single_with_trace(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Option<Vec<u8>>) {
+    pub fn run_single_with_trace(
+        &self,
+        test: &XclbinTest,
+    ) -> (TestOutcome, Option<Vec<u8>>, Option<Vec<u8>>) {
         let (outcome, raw_output, trace_buf, _) = self.run_single_inner(test);
         (outcome, raw_output, trace_buf)
     }
@@ -610,7 +603,10 @@ impl XclbinSuite {
     ///
     /// Returns the test outcome, raw output, and optional hardware
     /// cross-validation diagnosis.
-    pub fn run_single_with_hw_validation(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Option<HardwareValidation>, Vec<String>) {
+    pub fn run_single_with_hw_validation(
+        &self,
+        test: &XclbinTest,
+    ) -> (TestOutcome, Option<Vec<u8>>, Option<HardwareValidation>, Vec<String>) {
         let (outcome, raw_output, _, warnings) = self.run_single_inner(test);
         let hw_validation = self.cross_validate(test, raw_output.as_deref());
         (outcome, raw_output, hw_validation, warnings)
@@ -626,7 +622,9 @@ impl XclbinSuite {
         let spec = test.buffer_spec.as_ref()?;
 
         // Find output buffer element type for comparison
-        let output_type = spec.buffers.iter()
+        let output_type = spec
+            .buffers
+            .iter()
             .find(|b| b.direction == BufferDir::Output)
             .map(|b| b.element_type)
             .unwrap_or(ElementType::I32);
@@ -634,12 +632,7 @@ impl XclbinSuite {
         // Load hardware reference output
         let hw_reference = hardware_comparison::load_hw_reference(npu_dir, &test.name);
 
-        let cv = CrossValidation::compare(
-            &test.name,
-            emu_output,
-            hw_reference.as_deref(),
-            output_type,
-        );
+        let cv = CrossValidation::compare(&test.name, emu_output, hw_reference.as_deref(), output_type);
 
         Some(HardwareValidation::classify(cv))
     }
@@ -650,21 +643,25 @@ impl XclbinSuite {
     /// The binary_trace_buffer contains raw packets from hardware trace units
     /// that flowed through the stream switch to host DDR, in the same format
     /// as real NPU hardware. Warnings are collected from the NPU executor.
-    fn run_single_inner(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Option<Vec<u8>>, Vec<String>) {
+    fn run_single_inner(
+        &self,
+        test: &XclbinTest,
+    ) -> (TestOutcome, Option<Vec<u8>>, Option<Vec<u8>>, Vec<String>) {
         // Check if test overrides say to skip this test
         if let Some(ref reason) = test.skip_reason {
-            return (TestOutcome::Skipped {
-                reason: reason.clone(),
-            }, None, None, Vec::new());
+            return (TestOutcome::Skipped { reason: reason.clone() }, None, None, Vec::new());
         }
 
         // Load xclbin
         let xclbin = match Xclbin::from_file(&test.xclbin_path) {
             Ok(x) => x,
             Err(e) => {
-                return (TestOutcome::LoadError {
-                    message: format!("Failed to load xclbin: {}", e),
-                }, None, None, Vec::new());
+                return (
+                    TestOutcome::LoadError { message: format!("Failed to load xclbin: {}", e) },
+                    None,
+                    None,
+                    Vec::new(),
+                );
             }
         };
 
@@ -672,9 +669,12 @@ impl XclbinSuite {
         let section = match xclbin.find_section(SectionKind::AiePartition) {
             Some(s) => s,
             None => {
-                return (TestOutcome::LoadError {
-                    message: "No AIE partition in xclbin".to_string(),
-                }, None, None, Vec::new());
+                return (
+                    TestOutcome::LoadError { message: "No AIE partition in xclbin".to_string() },
+                    None,
+                    None,
+                    Vec::new(),
+                );
             }
         };
 
@@ -682,9 +682,12 @@ impl XclbinSuite {
         let partition = match AiePartition::parse(section.data()) {
             Ok(p) => p,
             Err(e) => {
-                return (TestOutcome::LoadError {
-                    message: format!("Failed to parse AIE partition: {}", e),
-                }, None, None, Vec::new());
+                return (
+                    TestOutcome::LoadError { message: format!("Failed to parse AIE partition: {}", e) },
+                    None,
+                    None,
+                    Vec::new(),
+                );
             }
         };
 
@@ -692,27 +695,36 @@ impl XclbinSuite {
         let pdi = match partition.primary_pdi() {
             Some(p) => p,
             None => {
-                return (TestOutcome::LoadError {
-                    message: "No primary PDI in partition".to_string(),
-                }, None, None, Vec::new());
+                return (
+                    TestOutcome::LoadError { message: "No primary PDI in partition".to_string() },
+                    None,
+                    None,
+                    Vec::new(),
+                );
             }
         };
 
         let cdo_offset = match find_cdo_offset(pdi.pdi_image) {
             Some(o) => o,
             None => {
-                return (TestOutcome::LoadError {
-                    message: "No CDO found in PDI".to_string(),
-                }, None, None, Vec::new());
+                return (
+                    TestOutcome::LoadError { message: "No CDO found in PDI".to_string() },
+                    None,
+                    None,
+                    Vec::new(),
+                );
             }
         };
 
         let cdo = match Cdo::parse(&pdi.pdi_image[cdo_offset..]) {
             Ok(c) => c,
             Err(e) => {
-                return (TestOutcome::LoadError {
-                    message: format!("Failed to parse CDO: {}", e),
-                }, None, None, Vec::new());
+                return (
+                    TestOutcome::LoadError { message: format!("Failed to parse CDO: {}", e) },
+                    None,
+                    None,
+                    Vec::new(),
+                );
             }
         };
 
@@ -720,9 +732,12 @@ impl XclbinSuite {
         let mut engine = InterpreterEngine::new_npu1();
         engine.set_stall_threshold(self.stall_threshold);
         if let Err(e) = engine.device_mut().apply_cdo(&cdo) {
-            return (TestOutcome::LoadError {
-                message: format!("Failed to apply CDO: {}", e),
-            }, None, None, Vec::new());
+            return (
+                TestOutcome::LoadError { message: format!("Failed to apply CDO: {}", e) },
+                None,
+                None,
+                Vec::new(),
+            );
         }
 
         // Populate host memory - use buffer spec if available, else defaults.
@@ -744,7 +759,8 @@ impl XclbinSuite {
         // With multiple output buffers (e.g. data + trace), we want the
         // primary data output, not the trace buffer.
         let output_addr = if let Some(ref spec) = test.buffer_spec {
-            spec.buffers.iter()
+            spec.buffers
+                .iter()
                 .find(|b| b.direction == BufferDir::Output)
                 .map(|b| {
                     let bo_idx = b.group_id.saturating_sub(3) as usize;
@@ -767,8 +783,11 @@ impl XclbinSuite {
             let insts_data = match std::fs::read(&insts_path) {
                 Ok(d) => d,
                 Err(e) => {
-                    let msg = format!("Failed to read {}: {}",
-                        insts_path.file_name().unwrap_or_default().to_string_lossy(), e);
+                    let msg = format!(
+                        "Failed to read {}: {}",
+                        insts_path.file_name().unwrap_or_default().to_string_lossy(),
+                        e
+                    );
                     log::warn!("[{}] {}", test.name, msg);
                     test_warnings.push(msg);
                     // Continue without NPU instructions - some tests may not need them
@@ -779,8 +798,7 @@ impl XclbinSuite {
             if !insts_data.is_empty() {
                 match NpuInstructionStream::parse(&insts_data) {
                     Ok(stream) => {
-                        log::debug!("Loaded {} NPU instructions from {:?}",
-                            stream.len(), insts_path);
+                        log::debug!("Loaded {} NPU instructions from {:?}", stream.len(), insts_path);
 
                         let mut executor = NpuExecutor::new();
 
@@ -799,8 +817,11 @@ impl XclbinSuite {
                         npu_executor = Some(executor);
                     }
                     Err(e) => {
-                        let msg = format!("Failed to parse {}: {}",
-                            insts_path.file_name().unwrap_or_default().to_string_lossy(), e);
+                        let msg = format!(
+                            "Failed to parse {}: {}",
+                            insts_path.file_name().unwrap_or_default().to_string_lossy(),
+                            e
+                        );
                         log::warn!("[{}] {}", test.name, msg);
                         test_warnings.push(msg);
                     }
@@ -817,16 +838,24 @@ impl XclbinSuite {
             let data = match std::fs::read(path) {
                 Ok(d) => d,
                 Err(e) => {
-                    return (TestOutcome::LoadError {
-                        message: format!("Failed to read ELF {:?}: {}", path, e),
-                    }, None, None, Vec::new());
+                    return (
+                        TestOutcome::LoadError { message: format!("Failed to read ELF {:?}: {}", path, e) },
+                        None,
+                        None,
+                        Vec::new(),
+                    );
                 }
             };
 
             if let Err(e) = engine.load_elf_bytes(*col as usize, *row as usize, &data) {
-                return (TestOutcome::LoadError {
-                    message: format!("Failed to load ELF into ({},{}): {}", col, row, e),
-                }, None, None, Vec::new());
+                return (
+                    TestOutcome::LoadError {
+                        message: format!("Failed to load ELF into ({},{}): {}", col, row, e),
+                    },
+                    None,
+                    None,
+                    Vec::new(),
+                );
             }
         }
 
@@ -840,9 +869,14 @@ impl XclbinSuite {
             // execute. DMA-only tests (which have insts.bin) still run: the
             // NPU instructions configure and enqueue DMA transfers, and the
             // engine steps DMA engines + stream switches until completion.
-            return (TestOutcome::Skipped {
-                reason: "No core code and no NPU instructions to execute".to_string(),
-            }, None, None, Vec::new());
+            return (
+                TestOutcome::Skipped {
+                    reason: "No core code and no NPU instructions to execute".to_string(),
+                },
+                None,
+                None,
+                Vec::new(),
+            );
         }
 
         // Run until halt, sync completion, error, or timeout
@@ -868,7 +902,8 @@ impl XclbinSuite {
                 if data.iter().any(|&b| b != 0) {
                     log::info!(
                         "Captured {} bytes of binary trace data from host memory at 0x{:X}",
-                        data.len(), tb.address
+                        data.len(),
+                        tb.address
                     );
                     Some(data)
                 } else {
@@ -885,48 +920,42 @@ impl XclbinSuite {
                 // Test failed as expected -- wrap with details for diagnostics
                 TestOutcome::ValidationFail { cycles, correct, total, ref first_mismatch } => {
                     let actual = if let Some((idx, expected, got)) = first_mismatch {
-                        format!("ValidationFail: {}/{} correct, first mismatch at [{}]: expected {}, got {}",
-                            correct, total, idx, expected, got)
+                        format!(
+                            "ValidationFail: {}/{} correct, first mismatch at [{}]: expected {}, got {}",
+                            correct, total, idx, expected, got
+                        )
                     } else {
                         format!("ValidationFail: {}/{} correct", correct, total)
                     };
-                    TestOutcome::ExpectedFail {
-                        cycles,
-                        reason: reason.clone(),
-                        actual,
-                    }
+                    TestOutcome::ExpectedFail { cycles, reason: reason.clone(), actual }
                 }
-                TestOutcome::Fail { ref message, cycles } => {
-                    TestOutcome::ExpectedFail {
-                        cycles,
-                        reason: reason.clone(),
-                        actual: format!("Fail: {}", message),
-                    }
-                }
+                TestOutcome::Fail { ref message, cycles } => TestOutcome::ExpectedFail {
+                    cycles,
+                    reason: reason.clone(),
+                    actual: format!("Fail: {}", message),
+                },
                 TestOutcome::UnknownOpcode { ref details, cycles } => {
                     let mnemonic = details.mnemonic.as_deref().unwrap_or("unknown");
                     TestOutcome::ExpectedFail {
                         cycles,
                         reason: reason.clone(),
-                        actual: format!("UnknownOpcode: {:?} 0x{:04X} '{}' at PC {}",
-                            details.slot, details.opcode, mnemonic, details.pc),
+                        actual: format!(
+                            "UnknownOpcode: {:?} 0x{:04X} '{}' at PC {}",
+                            details.slot, details.opcode, mnemonic, details.pc
+                        ),
                     }
                 }
-                TestOutcome::Timeout { cycles } => {
-                    TestOutcome::ExpectedFail {
-                        cycles,
-                        reason: reason.clone(),
-                        actual: "Timeout".to_string(),
-                    }
-                }
+                TestOutcome::Timeout { cycles } => TestOutcome::ExpectedFail {
+                    cycles,
+                    reason: reason.clone(),
+                    actual: "Timeout".to_string(),
+                },
                 // Test passed when we expected failure -- override needs updating
-                TestOutcome::Pass { cycles, correct, total } => {
-                    TestOutcome::UnexpectedPass {
-                        cycles,
-                        correct: correct.unwrap_or(0),
-                        total: total.unwrap_or(0),
-                    }
-                }
+                TestOutcome::Pass { cycles, correct, total } => TestOutcome::UnexpectedPass {
+                    cycles,
+                    correct: correct.unwrap_or(0),
+                    total: total.unwrap_or(0),
+                },
                 // Other outcomes pass through unchanged
                 other => other,
             }
@@ -947,9 +976,15 @@ impl XclbinSuite {
     /// Reads from the given output buffer address.
     /// The size is determined by the buffer spec output definition,
     /// or defaults to 4KB if no buffer spec is available.
-    fn capture_output(&self, engine: &InterpreterEngine, test: &XclbinTest, output_addr: u64) -> Option<Vec<u8>> {
+    fn capture_output(
+        &self,
+        engine: &InterpreterEngine,
+        test: &XclbinTest,
+        output_addr: u64,
+    ) -> Option<Vec<u8>> {
         let output_size = if let Some(ref spec) = test.buffer_spec {
-            spec.buffers.iter()
+            spec.buffers
+                .iter()
                 .find(|b| b.direction == BufferDir::Output)
                 .map(|b| b.size_elements * b.element_type.byte_size())
                 .unwrap_or(4096)
@@ -981,10 +1016,7 @@ impl XclbinSuite {
         // Determine buffer object (BO) count from group_ids.
         // The MLIR_AIE kernel has: arg3=bo0(gid=3), arg4=bo1(gid=4), ..., arg7=bo4(gid=7).
         // DDR patches reference bo_index = group_id - 3.
-        let max_gid = spec.buffers.iter()
-            .map(|b| b.group_id)
-            .max()
-            .unwrap_or(5);
+        let max_gid = spec.buffers.iter().map(|b| b.group_id).max().unwrap_or(5);
         let num_bos = (max_gid.saturating_sub(3) + 1) as usize;
 
         // Allocate buffers sequentially in host memory to avoid overlaps.
@@ -1057,13 +1089,17 @@ impl XclbinSuite {
     ///
     /// Loads the reference from `{reference_dir}/{test_name}/output.bin`
     /// and compares element-by-element against the emulator's output.
-    fn validate_output(&self, engine: &InterpreterEngine, test: &XclbinTest, output_addr: u64) -> Option<(usize, usize, Option<(usize, i64, i64)>)> {
+    fn validate_output(
+        &self,
+        engine: &InterpreterEngine,
+        test: &XclbinTest,
+        output_addr: u64,
+    ) -> Option<(usize, usize, Option<(usize, i64, i64)>)> {
         let reference_dir = self.reference_dir.as_ref()?;
         let spec = test.buffer_spec.as_ref()?;
 
         // Find output buffer metadata
-        let output_buf = spec.buffers.iter()
-            .find(|b| b.direction == BufferDir::Output)?;
+        let output_buf = spec.buffers.iter().find(|b| b.direction == BufferDir::Output)?;
         let elem_type = output_buf.element_type;
 
         // Load hardware reference
@@ -1093,22 +1129,11 @@ impl XclbinSuite {
         output_addr: u64,
     ) -> TestOutcome {
         if test.buffer_spec.is_some() && self.reference_dir.is_some() {
-            if let Some((correct, total, first_mismatch)) =
-                self.validate_output(engine, test, output_addr)
-            {
+            if let Some((correct, total, first_mismatch)) = self.validate_output(engine, test, output_addr) {
                 if correct == total && total > 0 {
-                    return TestOutcome::Pass {
-                        cycles,
-                        correct: Some(correct),
-                        total: Some(total),
-                    };
+                    return TestOutcome::Pass { cycles, correct: Some(correct), total: Some(total) };
                 } else {
-                    return TestOutcome::ValidationFail {
-                        cycles,
-                        correct,
-                        total,
-                        first_mismatch,
-                    };
+                    return TestOutcome::ValidationFail { cycles, correct, total, first_mismatch };
                 }
             }
         }
@@ -1142,10 +1167,7 @@ impl XclbinSuite {
         mut npu_executor: Option<&mut NpuExecutor>,
         output_addr: u64,
     ) -> TestOutcome {
-        use super::quiescence::{
-            QuiescenceDetector, QuiescenceStatus,
-            StallDetector, StallStatus,
-        };
+        use super::quiescence::{QuiescenceDetector, QuiescenceStatus, StallDetector, StallStatus};
 
         const QUIESCENCE_CYCLES: u64 = 100;
 
@@ -1153,7 +1175,11 @@ impl XclbinSuite {
         let mut quiescence = QuiescenceDetector::new(QUIESCENCE_CYCLES);
         let mut stall = StallDetector::new(self.stall_threshold);
         // 0 means no hard limit -- rely on quiescence/stall detection only
-        let cycle_limit = if self.max_cycles == 0 { u64::MAX } else { self.max_cycles };
+        let cycle_limit = if self.max_cycles == 0 {
+            u64::MAX
+        } else {
+            self.max_cycles
+        };
 
         while cycles < cycle_limit {
             // Advance NPU instruction execution before engine step.
@@ -1193,10 +1219,7 @@ impl XclbinSuite {
                     if let Some(details) = self.extract_error_details(engine) {
                         return details;
                     }
-                    return TestOutcome::Fail {
-                        message: "Unknown execution error".to_string(),
-                        cycles,
-                    };
+                    return TestOutcome::Fail { message: "Unknown execution error".to_string(), cycles };
                 }
                 EngineStatus::Stalled => {
                     // Stall detection fired (adaptive timeout). Treat as a
@@ -1231,7 +1254,9 @@ impl XclbinSuite {
                 QuiescenceStatus::Quiescent(diagnosis) => {
                     log::info!(
                         "Quiescence detected after {} cycles in test {}: {}",
-                        cycles, test.name, diagnosis,
+                        cycles,
+                        test.name,
+                        diagnosis,
                     );
                     return TestOutcome::Timeout { cycles };
                 }
@@ -1246,7 +1271,10 @@ impl XclbinSuite {
                     let dma_bytes = engine.device().array.total_dma_bytes_transferred();
                     log::warn!(
                         "DMA stall after {} cycles in test {} ({} bytes transferred): {}",
-                        cycles, test.name, dma_bytes, diagnosis,
+                        cycles,
+                        test.name,
+                        dma_bytes,
+                        diagnosis,
                     );
                     return TestOutcome::Timeout { cycles };
                 }
@@ -1260,7 +1288,10 @@ impl XclbinSuite {
         let dma_bytes = engine.device().array.total_dma_bytes_transferred();
         log::warn!(
             "Hard cycle limit ({}) reached in test {} ({} bytes transferred): {}",
-            cycle_limit, test.name, dma_bytes, diagnosis,
+            cycle_limit,
+            test.name,
+            dma_bytes,
+            diagnosis,
         );
         TestOutcome::Timeout { cycles }
     }
@@ -1275,9 +1306,7 @@ impl XclbinSuite {
         for col in 0..cols {
             for row in 2..rows {
                 // Get PC from context
-                let pc = engine.core_context(col, row)
-                    .map(|ctx| ctx.pc())
-                    .unwrap_or(0);
+                let pc = engine.core_context(col, row).map(|ctx| ctx.pc()).unwrap_or(0);
 
                 // Check the last bundle for unknown operations (semantic: None)
                 if let Some(bundle) = engine.core_last_bundle(col, row) {
@@ -1325,9 +1354,15 @@ impl XclbinSuite {
             for (name, outcome, _) in &self.results {
                 match outcome {
                     TestOutcome::ValidationFail { cycles, correct, total, first_mismatch } => {
-                        report.push_str(&format!("{}: VALIDATION FAIL after {} cycles ({}/{} correct)\n", name, cycles, correct, total));
+                        report.push_str(&format!(
+                            "{}: VALIDATION FAIL after {} cycles ({}/{} correct)\n",
+                            name, cycles, correct, total
+                        ));
                         if let Some((idx, expected, actual)) = first_mismatch {
-                            report.push_str(&format!("  First mismatch at [{}]: expected {}, got {}\n", idx, expected, actual));
+                            report.push_str(&format!(
+                                "  First mismatch at [{}]: expected {}, got {}\n",
+                                idx, expected, actual
+                            ));
                         }
                     }
                     TestOutcome::Fail { message, cycles } => {
@@ -1384,7 +1419,10 @@ impl XclbinSuite {
             for (name, outcome, _) in &self.results {
                 if let TestOutcome::Pass { cycles, correct, total } = outcome {
                     if let (Some(c), Some(t)) = (correct, total) {
-                        report.push_str(&format!("{}: PASS ({} cycles, {}/{} validated)\n", name, cycles, c, t));
+                        report.push_str(&format!(
+                            "{}: PASS ({} cycles, {}/{} validated)\n",
+                            name, cycles, c, t
+                        ));
                     } else {
                         report.push_str(&format!("{}: PASS ({} cycles)\n", name, cycles));
                     }
@@ -1413,8 +1451,7 @@ impl XclbinSuite {
             report.push_str("--- Hardware Cross-Validation ---\n");
             report.push_str(&format!(
                 "Validated: {}, Correct: {}, Compiler Bug: {}, Emulator Bug: {}\n",
-                result.hw_validated, result.hw_correct,
-                result.hw_compiler_bug, result.hw_emulator_bug
+                result.hw_validated, result.hw_correct, result.hw_compiler_bug, result.hw_emulator_bug
             ));
 
             // List tests with non-trivial diagnoses
@@ -1466,7 +1503,6 @@ impl XclbinSuite {
         // Allocate output region (4KB at 0x2000, after input + middle)
         let _ = host_mem.allocate_region("output", 0x2000, 4096);
     }
-
 }
 
 impl Default for XclbinSuite {

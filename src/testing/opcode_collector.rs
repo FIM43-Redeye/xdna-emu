@@ -59,13 +59,7 @@ impl UnknownOpcode {
             SlotIndex::Scalar0
         };
 
-        Some(UnknownOpcode {
-            slot,
-            opcode,
-            pc,
-            tile,
-            mnemonic: None,
-        })
+        Some(UnknownOpcode { slot, opcode, pc, tile, mnemonic: None })
     }
 }
 
@@ -108,11 +102,7 @@ impl OpcodeCollector {
         } else {
             self.unknowns.insert(
                 key,
-                UnknownOpcodeStats {
-                    first: opcode,
-                    count: 1,
-                    tests: vec![test_name.to_string()],
-                },
+                UnknownOpcodeStats { first: opcode, count: 1, tests: vec![test_name.to_string()] },
             );
         }
     }
@@ -137,11 +127,7 @@ impl OpcodeCollector {
                 stats.first.slot,
                 stats.first.opcode
             ));
-            report.push_str(&format!(
-                "   Blocks {} tests, hit {} times\n",
-                stats.tests.len(),
-                stats.count
-            ));
+            report.push_str(&format!("   Blocks {} tests, hit {} times\n", stats.tests.len(), stats.count));
             if let Some(ref mnemonic) = stats.first.mnemonic {
                 report.push_str(&format!("   Mnemonic hint: {}\n", mnemonic));
             }

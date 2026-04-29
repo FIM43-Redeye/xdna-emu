@@ -187,10 +187,8 @@ fn walk(dir: &Path, prefix: &str, results: &mut Vec<BuildArtifact>) {
             _ => {
                 // Multiple xclbins: one entry per variant
                 for xclbin in &xclbins {
-                    let stem = xclbin
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default();
+                    let stem =
+                        xclbin.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                     let variant_name = format!("{}/{}", full_name, stem);
                     let insts = find_matching_insts(&path, &stem);
                     let prj = find_prj_dir(&path);
@@ -257,10 +255,7 @@ fn walk_examples(dir: &Path, root: &Path, results: &mut Vec<BuildArtifact>) {
 
         // Skip hidden dirs, build output dirs, and common non-test directories.
         // "build" is checked explicitly below, not treated as an example.
-        if dir_name.starts_with('.')
-            || dir_name.starts_with('_')
-            || dir_name == "build"
-        {
+        if dir_name.starts_with('.') || dir_name.starts_with('_') || dir_name == "build" {
             continue;
         }
 
@@ -297,10 +292,8 @@ fn walk_examples(dir: &Path, root: &Path, results: &mut Vec<BuildArtifact>) {
             } else {
                 // Multiple xclbins: one entry per variant
                 for xclbin in &xclbins {
-                    let stem = xclbin
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default();
+                    let stem =
+                        xclbin.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                     let insts = find_matching_insts(&artifact_dir, &stem);
                     results.push(BuildArtifact {
                         name: format!("{}/{}", base_name, stem),
@@ -382,20 +375,13 @@ impl Buildable for ExampleSource {
         }
     }
 
-    fn collect_artifacts(
-        &self,
-        output_dir: &Path,
-        result: &BuildResult,
-    ) -> Vec<BuiltArtifact> {
+    fn collect_artifacts(&self, output_dir: &Path, result: &BuildResult) -> Vec<BuiltArtifact> {
         // Use build manifest commands to discover all xclbin/insts pairs.
         // The build_commands are synthetic aiecc.py invocations parsed from
         // `make -nBs` output by the bridge build-manifest subcommand.
         if !result.build_commands.is_empty() {
             let build_dir = output_dir.join("build");
-            let all = chess_build::find_all_xclbin_results(
-                &build_dir,
-                &result.build_commands,
-            );
+            let all = chess_build::find_all_xclbin_results(&build_dir, &result.build_commands);
 
             if !all.is_empty() {
                 if all.len() == 1 {
@@ -410,15 +396,16 @@ impl Buildable for ExampleSource {
                 }
 
                 // Multi-xclbin: one artifact per variant
-                return all.iter().map(|(xclbin, insts, variant)| {
-                    BuiltArtifact {
+                return all
+                    .iter()
+                    .map(|(xclbin, insts, variant)| BuiltArtifact {
                         test_name: format!("{}/{}", self.name, variant),
                         xclbin: xclbin.clone(),
                         insts: insts.clone(),
                         prj_dir: result.prj_dir.clone(),
                         build_log: result.build_log.clone(),
-                    }
-                }).collect();
+                    })
+                    .collect();
             }
         }
 
@@ -454,11 +441,7 @@ pub fn discover_buildable_examples(examples_root: &Path) -> Vec<ExampleSource> {
 }
 
 /// Recursive walker for buildable programming_examples.
-fn walk_buildable_examples(
-    dir: &Path,
-    root: &Path,
-    results: &mut Vec<ExampleSource>,
-) {
+fn walk_buildable_examples(dir: &Path, root: &Path, results: &mut Vec<ExampleSource>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -499,8 +482,7 @@ fn walk_buildable_examples(
 
                 // Parse test.cpp for buffer metadata
                 let buffer_spec = super::test_cpp_parser::parse_test_cpp(&subdir);
-                let test_cpp_pattern = super::native_hw::detect_test_cpp(&subdir)
-                    .map(|(_, pattern)| pattern);
+                let test_cpp_pattern = super::native_hw::detect_test_cpp(&subdir).map(|(_, pattern)| pattern);
 
                 // Detect AIE2P-only examples
                 let skip = detect_aie2p(&makefile);
@@ -539,10 +521,7 @@ fn detect_aie2p(makefile: &Path) -> Option<String> {
             continue;
         }
         // devicename=npu2 or devicename ?= npu2 (hardcoded)
-        if trimmed.starts_with("devicename")
-            && trimmed.contains("npu2")
-            && !trimmed.starts_with('#')
-        {
+        if trimmed.starts_with("devicename") && trimmed.contains("npu2") && !trimmed.starts_with('#') {
             return Some("requires AIE2P (npu2) hardware".into());
         }
         // VPATH includes aie2p kernel source
@@ -563,11 +542,10 @@ fn find_python_source(dir: &Path) -> Option<PathBuf> {
         Err(_) => return None,
     };
 
-    let dir_stem = dir.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let dir_stem = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
 
-    let mut py_files: Vec<PathBuf> = entries.flatten()
+    let mut py_files: Vec<PathBuf> = entries
+        .flatten()
         .filter_map(|e| {
             let p = e.path();
             if p.extension().is_some_and(|ext| ext == "py") && p.is_file() {
@@ -740,9 +718,7 @@ mod tests {
         fs::write(dir.join("b.xclbin"), b"").unwrap();
         fs::write(dir.join("not_xclbin.txt"), b"").unwrap();
         let result = collect_xclbins(&dir);
-        let names: Vec<_> = result.iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap())
-            .collect();
+        let names: Vec<_> = result.iter().map(|p| p.file_name().unwrap().to_str().unwrap()).collect();
         assert_eq!(names, vec!["a.xclbin", "b.xclbin", "c.xclbin"]);
         fs::remove_dir_all(&dir).ok();
     }
@@ -913,10 +889,9 @@ mod tests {
     fn test_discover_examples_multiple() {
         let root = test_dir("examples_multi");
         // Two examples at different nesting levels
-        for (subpath, insts_name) in &[
-            ("basic/dma_transpose/build", "insts.bin"),
-            ("ml/matmul/build", "insts.elf"),
-        ] {
+        for (subpath, insts_name) in
+            &[("basic/dma_transpose/build", "insts.bin"), ("ml/matmul/build", "insts.elf")]
+        {
             let build = root.join(subpath);
             fs::create_dir_all(&build).unwrap();
             fs::write(build.join("final.xclbin"), b"xclbin").unwrap();
@@ -1019,9 +994,7 @@ mod tests {
     fn test_detect_aie2p_conditional_is_not_hardcoded() {
         let dir = test_dir("aie2p_conditional");
         let makefile = dir.join("Makefile");
-        fs::write(&makefile,
-            "devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)\n"
-        ).unwrap();
+        fs::write(&makefile, "devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)\n").unwrap();
         assert!(detect_aie2p(&makefile).is_none());
         fs::remove_dir_all(&dir).ok();
     }
@@ -1030,9 +1003,7 @@ mod tests {
     fn test_detect_aie2p_vpath_kernel() {
         let dir = test_dir("aie2p_vpath");
         let makefile = dir.join("Makefile");
-        fs::write(&makefile,
-            "VPATH :=${srcdir}/../../../aie_kernels/aie2p\n"
-        ).unwrap();
+        fs::write(&makefile, "VPATH :=${srcdir}/../../../aie_kernels/aie2p\n").unwrap();
         assert!(detect_aie2p(&makefile).is_some());
         fs::remove_dir_all(&dir).ok();
     }

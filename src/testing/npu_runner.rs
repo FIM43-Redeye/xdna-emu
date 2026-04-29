@@ -30,10 +30,7 @@ use super::process_control::{self, ProcessOutcome};
 use super::test_cpp_parser::{BufferSpec, BufferDef, BufferDir, generate_input_data, read_values};
 
 /// Well-known paths where the npu-runner binary might be found.
-const RUNNER_SEARCH_PATHS: &[&str] = &[
-    "tools/npu-runner/build/npu_runner",
-    "target/npu-runner/npu_runner",
-];
+const RUNNER_SEARCH_PATHS: &[&str] = &["tools/npu-runner/build/npu_runner", "target/npu-runner/npu_runner"];
 
 /// Build a sanitized LD_LIBRARY_PATH for npu-runner.
 ///
@@ -43,10 +40,7 @@ const RUNNER_SEARCH_PATHS: &[&str] = &[
 use super::sanitized_ld_library_path;
 
 /// NPU accelerator device nodes to probe.
-const ACCEL_DEVICE_NODES: &[&str] = &[
-    "/dev/accel/accel0",
-    "/dev/accel/accel1",
-];
+const ACCEL_DEVICE_NODES: &[&str] = &["/dev/accel/accel0", "/dev/accel/accel1"];
 
 /// Check whether NPU hardware is available on this machine.
 ///
@@ -129,19 +123,19 @@ const FALLBACK_ERROR_COOLDOWN_MS: u64 = 2000;
 /// Follows `/sys/class/accel/<node>/device/power/` which is a stable
 /// path through the sysfs symlink chain to the PCI device's runtime PM.
 fn npu_power_sysfs() -> Option<&'static Path> {
-    NPU_POWER_SYSFS.get_or_init(|| {
-        for node in ACCEL_DEVICE_NODES {
-            if let Some(dev_name) = Path::new(node).file_name() {
-                let power_dir = PathBuf::from("/sys/class/accel")
-                    .join(dev_name)
-                    .join("device/power");
-                if power_dir.exists() {
-                    return Some(power_dir);
+    NPU_POWER_SYSFS
+        .get_or_init(|| {
+            for node in ACCEL_DEVICE_NODES {
+                if let Some(dev_name) = Path::new(node).file_name() {
+                    let power_dir = PathBuf::from("/sys/class/accel").join(dev_name).join("device/power");
+                    if power_dir.exists() {
+                        return Some(power_dir);
+                    }
                 }
             }
-        }
-        None
-    }).as_deref()
+            None
+        })
+        .as_deref()
 }
 
 /// Wait for the NPU device to become idle after a test run.
@@ -162,7 +156,11 @@ fn npu_power_sysfs() -> Option<&'static Path> {
 pub fn wait_for_device_idle(after_error: bool) {
     let Some(power_dir) = npu_power_sysfs() else {
         // Sysfs not available -- fall back to fixed cooldown.
-        let ms = if after_error { FALLBACK_ERROR_COOLDOWN_MS } else { FALLBACK_COOLDOWN_MS };
+        let ms = if after_error {
+            FALLBACK_ERROR_COOLDOWN_MS
+        } else {
+            FALLBACK_COOLDOWN_MS
+        };
         std::thread::sleep(Duration::from_millis(ms));
         return;
     };
@@ -264,10 +262,7 @@ pub enum NpuRunError {
     /// Failed to generate input data from buffer spec.
     InputGeneration(String),
     /// npu-runner process failed.
-    ExecutionFailed {
-        exit_code: Option<i32>,
-        stderr: String,
-    },
+    ExecutionFailed { exit_code: Option<i32>, stderr: String },
     /// Kernel timed out on hardware.
     Timeout,
     /// Process survived SIGKILL -- device is in D-state (uninterruptible sleep).
@@ -389,19 +384,20 @@ fn run_single_kernel(
     }
 
     // Set up all output buffers (first is primary, rest are extra).
-    let output_bufs: Vec<&BufferDef> = spec.buffers.iter()
-        .filter(|b| b.direction == BufferDir::Output)
-        .collect();
+    let output_bufs: Vec<&BufferDef> =
+        spec.buffers.iter().filter(|b| b.direction == BufferDir::Output).collect();
     if output_bufs.is_empty() {
-        return Err(NpuRunError::InputGeneration(
-            "No output buffer defined in buffer spec".to_string(),
-        ));
+        return Err(NpuRunError::InputGeneration("No output buffer defined in buffer spec".to_string()));
     }
 
     let mut output_files: Vec<(String, PathBuf)> = Vec::new();
     for (i, buf) in output_bufs.iter().enumerate() {
         let size_bytes = buf.size_elements * buf.element_type.byte_size();
-        let filename = if i == 0 { "output.bin".to_string() } else { format!("output_{}.bin", buf.name) };
+        let filename = if i == 0 {
+            "output.bin".to_string()
+        } else {
+            format!("output_{}.bin", buf.name)
+        };
         let file_path = tmp_dir.join(&filename);
         args.extend_from_slice(&[
             "--out".to_string(),
@@ -412,14 +408,23 @@ fn run_single_kernel(
         output_files.push((buf.name.clone(), file_path));
     }
 
-    log::info!("Running on NPU (single-kernel): {} {}", runner.display(),
-        args.iter().map(|a| {
-            if a.contains(' ') { format!("\"{}\"", a) } else { a.clone() }
-        }).collect::<Vec<_>>().join(" "));
+    log::info!(
+        "Running on NPU (single-kernel): {} {}",
+        runner.display(),
+        args.iter()
+            .map(|a| {
+                if a.contains(' ') {
+                    format!("\"{}\"", a)
+                } else {
+                    a.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
 
     let mut cmd = Command::new(runner);
-    cmd.args(&args)
-        .env("LD_LIBRARY_PATH", sanitized_ld_library_path());
+    cmd.args(&args).env("LD_LIBRARY_PATH", sanitized_ld_library_path());
 
     match process_control::spawn_with_timeout(&mut cmd, timeout_sec) {
         ProcessOutcome::Completed { exit_code, stderr, .. } => {
@@ -468,11 +473,7 @@ fn handle_runner_exit(
                 }
             }
             let _ = std::fs::remove_dir_all(tmp_dir);
-            Ok(NpuRunResult {
-                output: output_data,
-                extra_outputs,
-                input_values,
-            })
+            Ok(NpuRunResult { output: output_data, extra_outputs, input_values })
         }
         2 => {
             let _ = std::fs::remove_dir_all(tmp_dir);
@@ -480,10 +481,7 @@ fn handle_runner_exit(
         }
         code => {
             let _ = std::fs::remove_dir_all(tmp_dir);
-            Err(NpuRunError::ExecutionFailed {
-                exit_code: Some(code),
-                stderr: stderr.to_string(),
-            })
+            Err(NpuRunError::ExecutionFailed { exit_code: Some(code), stderr: stderr.to_string() })
         }
     }
 }
@@ -618,9 +616,7 @@ mod tests {
 
     #[test]
     fn test_find_output_buffer_none() {
-        let buffers = vec![
-            make_input("bo_inA", 3, 4, InputPattern::Sequential { start: 1, step: 1 }),
-        ];
+        let buffers = vec![make_input("bo_inA", 3, 4, InputPattern::Sequential { start: 1, step: 1 })];
         assert!(find_output_buffer(&buffers).is_none());
     }
 }

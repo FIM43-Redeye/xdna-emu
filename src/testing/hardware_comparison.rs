@@ -123,11 +123,7 @@ impl ComparisonResult {
 /// Compare two byte buffers element-by-element using the given type.
 ///
 /// This is the core comparison primitive used by all validation layers.
-pub fn compare_buffers(
-    left: &[u8],
-    right: &[u8],
-    element_type: ElementType,
-) -> ComparisonResult {
+pub fn compare_buffers(left: &[u8], right: &[u8], element_type: ElementType) -> ComparisonResult {
     let left_vals = read_values(left, element_type);
     let right_vals = read_values(right, element_type);
     compare_value_slices(&left_vals, &right_vals)
@@ -147,22 +143,14 @@ pub fn compare_value_slices(left: &[i64], right: &[i64]) -> ComparisonResult {
         }
     }
 
-    ComparisonResult {
-        total,
-        matching,
-        first_mismatch,
-    }
+    ComparisonResult { total, matching, first_mismatch }
 }
 
 /// Compare emulator output against hardware output.
 ///
 /// A direct byte-level comparison (interpreted through the element type)
 /// that catches any divergence between the two execution environments.
-pub fn compare_emu_vs_hw(
-    emu_output: &[u8],
-    hw_output: &[u8],
-    element_type: ElementType,
-) -> ComparisonResult {
+pub fn compare_emu_vs_hw(emu_output: &[u8], hw_output: &[u8], element_type: ElementType) -> ComparisonResult {
     compare_buffers(emu_output, hw_output, element_type)
 }
 
@@ -189,10 +177,7 @@ impl CrossValidation {
             _ => None,
         };
 
-        CrossValidation {
-            test_name: test_name.to_string(),
-            emu_vs_reference,
-        }
+        CrossValidation { test_name: test_name.to_string(), emu_vs_reference }
     }
 }
 
@@ -221,14 +206,8 @@ pub fn format_report(results: &[CrossValidation]) -> String {
     report.push_str("=== Cross-Validation Report ===\n\n");
 
     // Header
-    report.push_str(&format!(
-        "{:<35} | {}\n",
-        "Test", "Emu vs HW Ref"
-    ));
-    report.push_str(&format!(
-        "{:-<35}-+-{:-<17}\n",
-        "", ""
-    ));
+    report.push_str(&format!("{:<35} | {}\n", "Test", "Emu vs HW Ref"));
+    report.push_str(&format!("{:-<35}-+-{:-<17}\n", "", ""));
 
     // Rows
     for cv in results {
@@ -238,27 +217,23 @@ pub fn format_report(results: &[CrossValidation]) -> String {
             &cv.test_name
         };
 
-        report.push_str(&format!(
-            "{:<35} | {}\n",
-            name,
-            format_column(&cv.emu_vs_reference),
-        ));
+        report.push_str(&format!("{:<35} | {}\n", name, format_column(&cv.emu_vs_reference),));
     }
 
     // Summary statistics
     let total = results.len();
-    let emu_ref_pass = results.iter()
+    let emu_ref_pass = results
+        .iter()
         .filter(|cv| cv.emu_vs_reference.as_ref().map_or(false, |r| r.is_match()))
         .count();
-    let emu_ref_total = results.iter()
-        .filter(|cv| cv.emu_vs_reference.is_some())
-        .count();
+    let emu_ref_total = results.iter().filter(|cv| cv.emu_vs_reference.is_some()).count();
 
     report.push_str(&format!("\n=== Summary ===\n"));
     if emu_ref_total > 0 {
         report.push_str(&format!(
             "Emulator matches hardware: {}/{} ({:.1}%)\n",
-            emu_ref_pass, emu_ref_total,
+            emu_ref_pass,
+            emu_ref_total,
             100.0 * emu_ref_pass as f64 / emu_ref_total as f64
         ));
     }
@@ -397,9 +372,13 @@ impl CompilerComparison {
             CompilerDiagnosis::EmulatorBug => {
                 // Both compilers wrong the same way on emulator.
                 // Check if hardware produces correct output.
-                let peano_hw_correct = self.peano_hw.as_ref()
+                let peano_hw_correct = self
+                    .peano_hw
+                    .as_ref()
                     .map(|hw| compare_value_slices(&read_values(hw, element_type), expected).is_match());
-                let chess_hw_correct = self.chess_hw.as_ref()
+                let chess_hw_correct = self
+                    .chess_hw
+                    .as_ref()
                     .map(|hw| compare_value_slices(&read_values(hw, element_type), expected).is_match());
 
                 match (peano_hw_correct, chess_hw_correct) {
@@ -414,9 +393,8 @@ impl CompilerComparison {
             CompilerDiagnosis::PeanoCompilerBug => {
                 // Chess-emu correct, Peano-emu wrong. Check Peano on hardware.
                 if let Some(hw) = &self.peano_hw {
-                    let hw_correct = compare_value_slices(
-                        &read_values(hw, element_type), expected,
-                    ).is_match();
+                    let hw_correct =
+                        compare_value_slices(&read_values(hw, element_type), expected).is_match();
                     if hw_correct {
                         // Peano binary is fine on hardware; emulator misexecutes it
                         return CompilerDiagnosis::EmulatorBug;
@@ -427,9 +405,8 @@ impl CompilerComparison {
             CompilerDiagnosis::ChessCompilerBug => {
                 // Peano-emu correct, Chess-emu wrong. Check Chess on hardware.
                 if let Some(hw) = &self.chess_hw {
-                    let hw_correct = compare_value_slices(
-                        &read_values(hw, element_type), expected,
-                    ).is_match();
+                    let hw_correct =
+                        compare_value_slices(&read_values(hw, element_type), expected).is_match();
                     if hw_correct {
                         // Chess binary is fine on hardware; emulator misexecutes it
                         return CompilerDiagnosis::EmulatorBug;
@@ -449,9 +426,7 @@ mod tests {
 
     #[test]
     fn test_compare_matching_buffers() {
-        let data: Vec<u8> = (1..=4i32)
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let data: Vec<u8> = (1..=4i32).flat_map(|v| v.to_le_bytes()).collect();
         let result = compare_buffers(&data, &data, ElementType::I32);
         assert!(result.is_match());
         assert_eq!(result.total, 4);
@@ -461,13 +436,8 @@ mod tests {
 
     #[test]
     fn test_compare_diverging_buffers() {
-        let left: Vec<u8> = (1..=4i32)
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let right: Vec<u8> = [1i32, 2, 99, 4]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let left: Vec<u8> = (1..=4i32).flat_map(|v| v.to_le_bytes()).collect();
+        let right: Vec<u8> = [1i32, 2, 99, 4].iter().flat_map(|v| v.to_le_bytes()).collect();
         let result = compare_buffers(&left, &right, ElementType::I32);
         assert!(!result.is_match());
         assert_eq!(result.total, 4);
@@ -486,12 +456,8 @@ mod tests {
     #[test]
     fn test_compare_different_lengths() {
         // Comparison uses the shorter length
-        let short: Vec<u8> = (1..=2i32)
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let long: Vec<u8> = (1..=4i32)
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let short: Vec<u8> = (1..=2i32).flat_map(|v| v.to_le_bytes()).collect();
+        let long: Vec<u8> = (1..=4i32).flat_map(|v| v.to_le_bytes()).collect();
         let result = compare_buffers(&short, &long, ElementType::I32);
         assert!(result.is_match());
         assert_eq!(result.total, 2);
@@ -499,45 +465,25 @@ mod tests {
 
     #[test]
     fn test_comparison_result_summary() {
-        let pass = ComparisonResult {
-            total: 64,
-            matching: 64,
-            first_mismatch: None,
-        };
+        let pass = ComparisonResult { total: 64, matching: 64, first_mismatch: None };
         assert_eq!(pass.summary(), "64/64 (MATCH)");
 
-        let fail = ComparisonResult {
-            total: 64,
-            matching: 60,
-            first_mismatch: Some((3, 4, 99)),
-        };
+        let fail = ComparisonResult { total: 64, matching: 60, first_mismatch: Some((3, 4, 99)) };
         assert_eq!(fail.summary(), "60/64 (DIVERGE)");
     }
 
     #[test]
     fn test_match_rate() {
-        let result = ComparisonResult {
-            total: 100,
-            matching: 75,
-            first_mismatch: Some((0, 0, 1)),
-        };
+        let result = ComparisonResult { total: 100, matching: 75, first_mismatch: Some((0, 0, 1)) };
         assert!((result.match_rate() - 75.0).abs() < 0.01);
     }
 
     #[test]
     fn test_cross_validation_match() {
         // Both emulator and hardware reference produce [2, 3, 4, 5]
-        let correct: Vec<u8> = [2i32, 3, 4, 5]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let correct: Vec<u8> = [2i32, 3, 4, 5].iter().flat_map(|v| v.to_le_bytes()).collect();
 
-        let cv = CrossValidation::compare(
-            "add_one",
-            Some(&correct),
-            Some(&correct),
-            ElementType::I32,
-        );
+        let cv = CrossValidation::compare("add_one", Some(&correct), Some(&correct), ElementType::I32);
 
         assert!(cv.emu_vs_reference.as_ref().unwrap().is_match());
     }
@@ -545,52 +491,29 @@ mod tests {
     #[test]
     fn test_cross_validation_diverge() {
         // Emulator wrong, hardware reference correct
-        let hw_correct: Vec<u8> = [2i32, 3, 4, 5]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let emu_wrong: Vec<u8> = [42i32, 43, 44, 45]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let hw_correct: Vec<u8> = [2i32, 3, 4, 5].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let emu_wrong: Vec<u8> = [42i32, 43, 44, 45].iter().flat_map(|v| v.to_le_bytes()).collect();
 
-        let cv = CrossValidation::compare(
-            "add_one",
-            Some(&emu_wrong),
-            Some(&hw_correct),
-            ElementType::I32,
-        );
+        let cv = CrossValidation::compare("add_one", Some(&emu_wrong), Some(&hw_correct), ElementType::I32);
 
         assert!(!cv.emu_vs_reference.as_ref().unwrap().is_match());
     }
 
     #[test]
     fn test_cross_validation_no_reference() {
-        let emu: Vec<u8> = [2i32, 3, 4, 5]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let emu: Vec<u8> = [2i32, 3, 4, 5].iter().flat_map(|v| v.to_le_bytes()).collect();
 
-        let cv = CrossValidation::compare(
-            "add_one",
-            Some(&emu),
-            None,
-            ElementType::I32,
-        );
+        let cv = CrossValidation::compare("add_one", Some(&emu), None, ElementType::I32);
 
         assert!(cv.emu_vs_reference.is_none());
     }
 
     #[test]
     fn test_format_report() {
-        let results = vec![
-            CrossValidation {
-                test_name: "add_one".to_string(),
-                emu_vs_reference: Some(ComparisonResult {
-                    total: 64, matching: 64, first_mismatch: None,
-                }),
-            },
-        ];
+        let results = vec![CrossValidation {
+            test_name: "add_one".to_string(),
+            emu_vs_reference: Some(ComparisonResult { total: 64, matching: 64, first_mismatch: None }),
+        }];
         let report = format_report(&results);
         assert!(report.contains("Cross-Validation Report"));
         assert!(report.contains("add_one"));
@@ -604,10 +527,7 @@ mod tests {
 
     #[test]
     fn test_diagnosis_correct() {
-        let cv = CrossValidation {
-            test_name: "t".to_string(),
-            emu_vs_reference: Some(make_match(4)),
-        };
+        let cv = CrossValidation { test_name: "t".to_string(), emu_vs_reference: Some(make_match(4)) };
         let hv = HardwareValidation::classify(cv);
         assert_eq!(hv.diagnosis, Diagnosis::Correct);
     }
@@ -617,7 +537,9 @@ mod tests {
         let cv = CrossValidation {
             test_name: "t".to_string(),
             emu_vs_reference: Some(ComparisonResult {
-                total: 4, matching: 0, first_mismatch: Some((0, 1, 99)),
+                total: 4,
+                matching: 0,
+                first_mismatch: Some((0, 1, 99)),
             }),
         };
         let hv = HardwareValidation::classify(cv);
@@ -626,10 +548,7 @@ mod tests {
 
     #[test]
     fn test_diagnosis_no_reference() {
-        let cv = CrossValidation {
-            test_name: "t".to_string(),
-            emu_vs_reference: None,
-        };
+        let cv = CrossValidation { test_name: "t".to_string(), emu_vs_reference: None };
         let hv = HardwareValidation::classify(cv);
         assert_eq!(hv.diagnosis, Diagnosis::NoReference);
     }

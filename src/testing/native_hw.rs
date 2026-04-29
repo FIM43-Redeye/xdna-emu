@@ -72,15 +72,19 @@ fn is_signal_death(exit_code: Option<i32>) -> bool {
     // wait4 and returns raw exit codes, where signal death shows as
     // negative or > 128.
     match exit_code {
-        Some(c) if c < 0 => true,       // negative = -(signal)
-        Some(c) if c > 128 => true,     // 128 + signal (shell convention)
+        Some(c) if c < 0 => true,   // negative = -(signal)
+        Some(c) if c > 128 => true, // 128 + signal (shell convention)
         _ => false,
     }
 }
 
 /// Get a human-readable signal name from an exit code.
 fn signal_name(exit_code: i32) -> &'static str {
-    let signum = if exit_code < 0 { -exit_code } else { exit_code - 128 };
+    let signum = if exit_code < 0 {
+        -exit_code
+    } else {
+        exit_code - 128
+    };
     match signum {
         4 => "SIGILL",
         6 => "SIGABRT",
@@ -174,10 +178,7 @@ fn classify_pattern(content: &str) -> TestCppPattern {
 /// XCLBIN is wrapped in `std::string()` to avoid ambiguity between the
 /// `xrt::xclbin(const std::string&)` and `xrt::xclbin(const std::string_view&)`
 /// constructors -- a bare `const char*` literal is equally convertible to both.
-fn preprocessor_defines(
-    xclbin_name: Option<&str>,
-    insts_name: Option<&str>,
-) -> Vec<String> {
+fn preprocessor_defines(xclbin_name: Option<&str>, insts_name: Option<&str>) -> Vec<String> {
     let xclbin = xclbin_name.unwrap_or("aie.xclbin");
     let insts = insts_name.unwrap_or("insts.bin");
     vec![
@@ -200,11 +201,7 @@ fn preprocessor_defines(
 /// * `mlir_aie_path` - Root of the mlir-aie tree (for test_utils headers)
 ///
 /// Returns the path to the compiled executable on success.
-pub fn compile_test_exe(
-    test_cpp: &Path,
-    output_dir: &Path,
-    mlir_aie_path: &Path,
-) -> Result<PathBuf, String> {
+pub fn compile_test_exe(test_cpp: &Path, output_dir: &Path, mlir_aie_path: &Path) -> Result<PathBuf, String> {
     compile_test_exe_with_artifacts(test_cpp, output_dir, mlir_aie_path, None, None)
 }
 
@@ -217,10 +214,7 @@ pub fn compile_test_exe(
 /// example's cache variables and target_compile_definitions. XCLBIN/INSTS_TXT
 /// are not needed at compile time -- these tests use xrt_test_wrapper.h which
 /// takes paths via CLI args at runtime.
-fn compile_test_exe_cmake(
-    source_dir: &Path,
-    build_dir: &Path,
-) -> Option<Result<PathBuf, String>> {
+fn compile_test_exe_cmake(source_dir: &Path, build_dir: &Path) -> Option<Result<PathBuf, String>> {
     let cmakelists = source_dir.join("CMakeLists.txt");
     if !cmakelists.exists() {
         return None;
@@ -233,8 +227,10 @@ fn compile_test_exe_cmake(
     // Configure. Use system default g++ (not g++-13) because XRT's
     // libxrt_coreutil.so requires CXXABI_1.3.15 from GCC 15's libstdc++.
     let configure = Command::new("cmake")
-        .arg("-S").arg(source_dir)
-        .arg("-B").arg(build_dir)
+        .arg("-S")
+        .arg(source_dir)
+        .arg("-B")
+        .arg(build_dir)
         .arg("-DTARGET_NAME=test")
         .arg("-DCMAKE_CXX_COMPILER=g++")
         .output();
@@ -243,23 +239,25 @@ fn compile_test_exe_cmake(
         Err(e) => return Some(Err(format!("cmake configure failed: {}", e))),
         Ok(out) if !out.status.success() => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Some(Err(format!("cmake configure failed: {}",
-                stderr.lines().take(5).collect::<Vec<_>>().join("\n"))));
+            return Some(Err(format!(
+                "cmake configure failed: {}",
+                stderr.lines().take(5).collect::<Vec<_>>().join("\n")
+            )));
         }
         _ => {}
     }
 
     // Build
-    let build = Command::new("cmake")
-        .arg("--build").arg(build_dir)
-        .output();
+    let build = Command::new("cmake").arg("--build").arg(build_dir).output();
 
     match build {
         Err(e) => return Some(Err(format!("cmake build failed: {}", e))),
         Ok(out) if !out.status.success() => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Some(Err(format!("cmake build failed: {}",
-                stderr.lines().take(5).collect::<Vec<_>>().join("\n"))));
+            return Some(Err(format!(
+                "cmake build failed: {}",
+                stderr.lines().take(5).collect::<Vec<_>>().join("\n")
+            )));
         }
         _ => {}
     }
@@ -274,8 +272,7 @@ fn compile_test_exe_cmake(
         if exe_alt.exists() {
             Some(Ok(exe_alt))
         } else {
-            Some(Err(format!("cmake build succeeded but no executable in {}",
-                build_dir.display())))
+            Some(Err(format!("cmake build succeeded but no executable in {}", build_dir.display())))
         }
     }
 }
@@ -299,19 +296,20 @@ pub fn compile_test_exe_with_artifacts(
     let test_alt = output_dir.join("test");
 
     // Cache check: skip if executable is newer than test.cpp
-    let cached = [&test_exe, &test_alt].iter()
-        .find(|p| p.exists())
-        .and_then(|exe_path| {
-            let src_time = std::fs::metadata(test_cpp).ok()?.modified().ok()?;
-            let exe_time = std::fs::metadata(exe_path).ok()?.modified().ok()?;
-            if exe_time > src_time { Some(exe_path.to_path_buf()) } else { None }
-        });
+    let cached = [&test_exe, &test_alt].iter().find(|p| p.exists()).and_then(|exe_path| {
+        let src_time = std::fs::metadata(test_cpp).ok()?.modified().ok()?;
+        let exe_time = std::fs::metadata(exe_path).ok()?.modified().ok()?;
+        if exe_time > src_time {
+            Some(exe_path.to_path_buf())
+        } else {
+            None
+        }
+    });
     if let Some(cached_path) = cached {
         return Ok(cached_path);
     }
 
-    std::fs::create_dir_all(output_dir)
-        .map_err(|e| format!("Failed to create output dir: {}", e))?;
+    std::fs::create_dir_all(output_dir).map_err(|e| format!("Failed to create output dir: {}", e))?;
 
     // Try CMake first (picks up buffer-size defines automatically).
     let source_dir = test_cpp.parent().unwrap_or(Path::new("."));
@@ -344,9 +342,11 @@ pub fn compile_test_exe_with_artifacts(
     let mut cmd = Command::new("g++");
     cmd.arg(test_cpp)
         .arg(&test_utils_cpp)
-        .arg("-o").arg(&test_exe)
+        .arg("-o")
+        .arg(&test_exe)
         .arg("-std=c++23")
-        .arg("-include").arg("stdfloat")
+        .arg("-include")
+        .arg("stdfloat")
         .arg("-DTEST_UTILS_USE_XRT")
         .arg(format!("-I{}", test_lib_include.display()))
         .arg(format!("-I{}", xrt_include.display()))
@@ -374,8 +374,7 @@ pub fn compile_test_exe_with_artifacts(
 
     log::debug!("Compiling test.cpp: {:?}", cmd);
 
-    let output = cmd.output()
-        .map_err(|e| format!("Failed to run g++: {}", e))?;
+    let output = cmd.output().map_err(|e| format!("Failed to run g++: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -429,9 +428,12 @@ pub fn run_native_test(
     match pattern {
         TestCppPattern::Cxxopts => {
             // Pass paths via CLI args (test_utils::add_default_options format)
-            cmd.arg("-x").arg(&abs_xclbin)
-                .arg("-i").arg(&abs_insts)
-                .arg("-k").arg("MLIR_AIE");
+            cmd.arg("-x")
+                .arg(&abs_xclbin)
+                .arg("-i")
+                .arg(&abs_insts)
+                .arg("-k")
+                .arg("MLIR_AIE");
         }
         TestCppPattern::Define => {
             // #define pattern: paths are baked in at compile time.
@@ -482,18 +484,16 @@ pub fn run_native_test(
                 wedged: true,
             }
         }
-        ProcessOutcome::SpawnError(msg) => {
-            NativeTestResult {
-                passed: false,
-                total_checks: 0,
-                correct_checks: 0,
-                stdout: String::new(),
-                stderr: msg,
-                elapsed_secs: start.elapsed().as_secs_f64(),
-                exit_code: None,
-                wedged: false,
-            }
-        }
+        ProcessOutcome::SpawnError(msg) => NativeTestResult {
+            passed: false,
+            total_checks: 0,
+            correct_checks: 0,
+            stdout: String::new(),
+            stderr: msg,
+            elapsed_secs: start.elapsed().as_secs_f64(),
+            exit_code: None,
+            wedged: false,
+        },
     }
 }
 
@@ -551,7 +551,6 @@ pub fn run_native_and_print(
     prefix: &str,
     compact: bool,
 ) -> HwRunResult {
-
     let result = run_native_test(test_exe, xclbin, insts, pattern, DEFAULT_HW_TIMEOUT_SECS);
 
     let (outcome, label) = if result.wedged {
@@ -571,7 +570,9 @@ pub fn run_native_and_print(
         (HwOutcome::Fail, format!("FAIL ({}/{})", result.correct_checks, result.total_checks))
     } else {
         // No element checks and no PASS -- extract meaningful error
-        let meaningful = result.stderr.lines()
+        let meaningful = result
+            .stderr
+            .lines()
             .filter(|l| !l.is_empty() && !l.contains("WARNING"))
             .last()
             .unwrap_or("unknown error");
@@ -597,12 +598,7 @@ pub fn run_native_and_print(
     // comparison pipeline (CompilerComparison::classify_full) can't get
     // peano_hw output from the native path; only the npu-runner path
     // (which reads raw bytes from a BO) can provide it.
-    HwRunResult {
-        outcome,
-        label,
-        output: Vec::new(),
-        elapsed_secs: elapsed,
-    }
+    HwRunResult { outcome, label, output: Vec::new(), elapsed_secs: elapsed }
 }
 
 #[cfg(test)]
@@ -753,10 +749,7 @@ FAIL!
         let dir = std::env::temp_dir().join("xdna_emu_native_hw_test_cxxopts");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("test.cpp"),
-            "test_utils::add_default_options(options);\n",
-        ).unwrap();
+        std::fs::write(dir.join("test.cpp"), "test_utils::add_default_options(options);\n").unwrap();
 
         let result = detect_test_cpp(&dir);
         assert!(result.is_some());
@@ -771,10 +764,8 @@ FAIL!
         let dir = std::env::temp_dir().join("xdna_emu_native_hw_test_define");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("test.cpp"),
-            "#ifndef XCLBIN\n#define XCLBIN \"final.xclbin\"\n#endif\n",
-        ).unwrap();
+        std::fs::write(dir.join("test.cpp"), "#ifndef XCLBIN\n#define XCLBIN \"final.xclbin\"\n#endif\n")
+            .unwrap();
 
         let result = detect_test_cpp(&dir);
         assert!(result.is_some());

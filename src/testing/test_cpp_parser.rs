@@ -176,10 +176,7 @@ pub fn parse_test_cpp_content(content: &str) -> Option<BufferSpec> {
         return None;
     }
 
-    Some(BufferSpec {
-        buffers,
-        multi_kernel,
-    })
+    Some(BufferSpec { buffers, multi_kernel })
 }
 
 /// Extract integer constants from `constexpr int NAME = EXPR;`,
@@ -194,16 +191,11 @@ pub fn parse_test_cpp_content(content: &str) -> Option<BufferSpec> {
 /// ```
 ///
 /// We extract the default value and map it to the variable name.
-fn extract_constants(
-    content: &str,
-    type_macros: &HashMap<String, ElementType>,
-) -> HashMap<String, usize> {
+fn extract_constants(content: &str, type_macros: &HashMap<String, ElementType>) -> HashMap<String, usize> {
     let mut constants = HashMap::new();
 
     // constexpr int NAME = EXPR;
-    let re_constexpr = Regex::new(
-        r"constexpr\s+int\s+(\w+)\s*=\s*(.+?)\s*;"
-    ).unwrap();
+    let re_constexpr = Regex::new(r"constexpr\s+int\s+(\w+)\s*=\s*(.+?)\s*;").unwrap();
     for cap in re_constexpr.captures_iter(content) {
         let name = cap[1].to_string();
         if let Some(val) = eval_const_expr(&cap[2], &constants, type_macros) {
@@ -212,16 +204,17 @@ fn extract_constants(
     }
 
     // #define NAME EXPR (integer/expression values, skip type/string macros)
-    let re_define = Regex::new(
-        r#"#define\s+(\w+)\s+(.+)"#
-    ).unwrap();
+    let re_define = Regex::new(r#"#define\s+(\w+)\s+(.+)"#).unwrap();
     for cap in re_define.captures_iter(content) {
         let name = cap[1].to_string();
         let value = cap[2].trim();
         // Skip type macros and string macros
-        if name.contains("DATATYPE") || name.contains("KERNEL")
-            || name.contains("XCLBIN") || name.contains("INSTS")
-            || value.starts_with("std::") || value.starts_with('"')
+        if name.contains("DATATYPE")
+            || name.contains("KERNEL")
+            || name.contains("XCLBIN")
+            || name.contains("INSTS")
+            || value.starts_with("std::")
+            || value.starts_with('"')
         {
             continue;
         }
@@ -240,9 +233,7 @@ fn extract_constants(
 
     // Step 2: Map variable assignments from vm["option_name"].as<type>().
     //   Pattern: int VAR = vm["option_name"].as<int>();
-    let re_vm_assign = Regex::new(
-        r#"int\s+(\w+)\s*=\s*vm\["(\w+)"\]\.as<int>\(\)"#
-    ).unwrap();
+    let re_vm_assign = Regex::new(r#"int\s+(\w+)\s*=\s*vm\["(\w+)"\]\.as<int>\(\)"#).unwrap();
     for cap in re_vm_assign.captures_iter(content) {
         let var_name = cap[1].to_string();
         let option_name = &cap[2];
@@ -267,9 +258,8 @@ fn extract_cxxopts_defaults(content: &str) -> HashMap<String, usize> {
     // Allow whitespace between ( and " for multiline chained options:
     //   options.add_options()("length,l", ..., default_value("4096"))(
     //       "repeat,r", ..., default_value("4"));
-    let re = Regex::new(
-        r#"\(\s*"(\w+)(?:,\w)?"[^)]*cxxopts::value<int>\(\)->default_value\("(\d+)"\)"#
-    ).unwrap();
+    let re =
+        Regex::new(r#"\(\s*"(\w+)(?:,\w)?"[^)]*cxxopts::value<int>\(\)->default_value\("(\d+)"\)"#).unwrap();
     for cap in re.captures_iter(content) {
         let option_name = cap[1].to_string();
         if let Ok(val) = cap[2].parse::<usize>() {
@@ -321,7 +311,7 @@ fn eval_const_expr(
     // Binary expressions: A * B, A + B, etc.
     // Handle parenthesized sub-expressions by stripping outer parens
     let expr = if expr.starts_with('(') && expr.ends_with(')') {
-        &expr[1..expr.len()-1]
+        &expr[1..expr.len() - 1]
     } else {
         expr
     };
@@ -329,14 +319,14 @@ fn eval_const_expr(
     // Try splitting on * (multiplication, most common in size expressions)
     if let Some(pos) = find_top_level_op(expr, '*') {
         let left = eval_const_expr(&expr[..pos], constants, type_macros)?;
-        let right = eval_const_expr(&expr[pos+1..], constants, type_macros)?;
+        let right = eval_const_expr(&expr[pos + 1..], constants, type_macros)?;
         return Some(left * right);
     }
 
     // Try splitting on + (addition)
     if let Some(pos) = find_top_level_op(expr, '+') {
         let left = eval_const_expr(&expr[..pos], constants, type_macros)?;
-        let right = eval_const_expr(&expr[pos+1..], constants, type_macros)?;
+        let right = eval_const_expr(&expr[pos + 1..], constants, type_macros)?;
         return Some(left + right);
     }
 
@@ -363,7 +353,7 @@ fn eval_const_expr_lenient(
 
     // Strip outer parens
     let expr = if expr.starts_with('(') && expr.ends_with(')') {
-        &expr[1..expr.len()-1]
+        &expr[1..expr.len() - 1]
     } else {
         expr
     };
@@ -371,7 +361,7 @@ fn eval_const_expr_lenient(
     // For addition: if one side resolves and the other doesn't, use the known side
     if let Some(pos) = find_top_level_op(expr, '+') {
         let left = eval_const_expr(&expr[..pos], constants, type_macros);
-        let right = eval_const_expr(&expr[pos+1..], constants, type_macros);
+        let right = eval_const_expr(&expr[pos + 1..], constants, type_macros);
         match (left, right) {
             (Some(l), Some(r)) => return Some(l + r),
             (Some(l), None) => return Some(l),
@@ -407,9 +397,7 @@ fn extract_type_macros(content: &str) -> HashMap<String, ElementType> {
     let mut macros = HashMap::new();
 
     // #define DATATYPE type
-    let re_define = Regex::new(
-        r"#define\s+(\w*DATATYPE\w*)\s+(\w+)"
-    ).unwrap();
+    let re_define = Regex::new(r"#define\s+(\w*DATATYPE\w*)\s+(\w+)").unwrap();
     for cap in re_define.captures_iter(content) {
         let name = cap[1].to_string();
         if let Some(elem_type) = ElementType::from_cpp_type(&cap[2]) {
@@ -418,9 +406,7 @@ fn extract_type_macros(content: &str) -> HashMap<String, ElementType> {
     }
 
     // using NAME = std::type; (with or without std:: prefix)
-    let re_using = Regex::new(
-        r"using\s+(\w+)\s*=\s*(?:std::)?(\w+)\s*;"
-    ).unwrap();
+    let re_using = Regex::new(r"using\s+(\w+)\s*=\s*(?:std::)?(\w+)\s*;").unwrap();
     for cap in re_using.captures_iter(content) {
         let name = cap[1].to_string();
         if let Some(elem_type) = ElementType::from_cpp_type(&cap[2]) {
@@ -465,7 +451,7 @@ fn extract_buffer_objects(
             group_id,
             size_elements,
             element_type: elem_type,
-            direction: BufferDir::Input, // Will be classified later
+            direction: BufferDir::Input,        // Will be classified later
             input_pattern: InputPattern::Zeros, // Will be extracted later
         });
     }
@@ -494,8 +480,7 @@ fn parse_size_expr(
         let count = eval_const_expr(count_part, constants, type_macros).unwrap_or(64);
 
         // Resolve type from sizeof argument
-        let elem_type = parse_sizeof_type(sizeof_part, type_macros)
-            .unwrap_or(default_type);
+        let elem_type = parse_sizeof_type(sizeof_part, type_macros).unwrap_or(default_type);
 
         return (count, elem_type);
     }
@@ -524,10 +509,7 @@ fn parse_size_expr(
 }
 
 /// Extract the element type from a sizeof() expression.
-fn parse_sizeof_type(
-    sizeof_expr: &str,
-    type_macros: &HashMap<String, ElementType>,
-) -> Option<ElementType> {
+fn parse_sizeof_type(sizeof_expr: &str, type_macros: &HashMap<String, ElementType>) -> Option<ElementType> {
     // Extract the argument: sizeof(TYPE) or sizeof(TYPE *)
     let re = Regex::new(r"sizeof\(\s*(\w+)").unwrap();
     let cap = re.captures(sizeof_expr)?;
@@ -588,9 +570,7 @@ fn extract_input_patterns(
     // We match push_back expressions to the buffer via variable naming.
 
     // Collect all push_back expressions with their vector names
-    let re_pushback = Regex::new(
-        r"(\w+)\.push_back\((.+?)\)"
-    ).unwrap();
+    let re_pushback = Regex::new(r"(\w+)\.push_back\((.+?)\)").unwrap();
 
     let mut vec_patterns: HashMap<String, InputPattern> = HashMap::new();
     for cap in re_pushback.captures_iter(content) {
@@ -608,9 +588,7 @@ fn extract_input_patterns(
 
     // Match vectors to buffer objects via memcpy:
     //   memcpy(bufInA, srcVecA.data(), ...)
-    let re_memcpy = Regex::new(
-        r"memcpy\(\s*(\w+)\s*,\s*(\w+)\.data\(\)"
-    ).unwrap();
+    let re_memcpy = Regex::new(r"memcpy\(\s*(\w+)\s*,\s*(\w+)\.data\(\)").unwrap();
 
     let mut buf_to_vec: HashMap<String, String> = HashMap::new();
     for cap in re_memcpy.captures_iter(content) {
@@ -621,9 +599,7 @@ fn extract_input_patterns(
 
     // Also match direct map + assignment patterns (matrix_transpose style):
     //   TYPE *buf_ptr = bo_var.map<TYPE *>();
-    let re_map = Regex::new(
-        r"(\w+)\s*\*\s*(\w+)\s*=\s*(\w+)\.map<"
-    ).unwrap();
+    let re_map = Regex::new(r"(\w+)\s*\*\s*(\w+)\s*=\s*(\w+)\.map<").unwrap();
 
     let mut bo_to_ptr: HashMap<String, String> = HashMap::new();
     for cap in re_map.captures_iter(content) {
@@ -633,9 +609,7 @@ fn extract_input_patterns(
     }
 
     // Check for memset(ptr, 0, ...) patterns
-    let re_memset = Regex::new(
-        r"memset\(\s*(\w+)\s*,\s*0\s*,"
-    ).unwrap();
+    let re_memset = Regex::new(r"memset\(\s*(\w+)\s*,\s*0\s*,").unwrap();
     let mut zeroed_ptrs: Vec<String> = Vec::new();
     for cap in re_memset.captures_iter(content) {
         zeroed_ptrs.push(cap[1].to_string());
@@ -643,9 +617,7 @@ fn extract_input_patterns(
 
     // Also check for direct indexed assignment patterns:
     //   buf_ptr[i] = EXPR;
-    let re_indexed = Regex::new(
-        r"(\w+)\[(\w+)\]\s*=\s*(.+?)\s*;"
-    ).unwrap();
+    let re_indexed = Regex::new(r"(\w+)\[(\w+)\]\s*=\s*(.+?)\s*;").unwrap();
     let mut ptr_patterns: HashMap<String, InputPattern> = HashMap::new();
     for cap in re_indexed.captures_iter(content) {
         let ptr_name = cap[1].to_string();
@@ -695,7 +667,11 @@ fn extract_input_patterns(
 
         // Try matching via naming convention (bufInA -> srcVecA pattern)
         // The naming convention is: bo_inA -> mapped as bufInA -> filled from srcVecA
-        let suffix = buf.name.trim_start_matches("bo_").trim_start_matches("bo0_").trim_start_matches("bo1_");
+        let suffix = buf
+            .name
+            .trim_start_matches("bo_")
+            .trim_start_matches("bo0_")
+            .trim_start_matches("bo1_");
         for (ptr_name, vec_name) in &buf_to_vec {
             // Check if the pointer name contains the buffer suffix
             if ptr_name.to_lowercase().contains(&suffix.to_lowercase()) {
@@ -767,9 +743,7 @@ pub fn generate_input_data(buf: &BufferDef) -> Vec<u8> {
             write_pattern(&mut data, buf.element_type, buf.size_elements, |_| *val);
         }
         InputPattern::Sequential { start, step } => {
-            write_pattern(&mut data, buf.element_type, buf.size_elements, |i| {
-                start + (i as i64) * step
-            });
+            write_pattern(&mut data, buf.element_type, buf.size_elements, |i| start + (i as i64) * step);
         }
         InputPattern::Opaque => {} // Leave as zeros; hardware reference will catch mismatches
     }
@@ -778,12 +752,7 @@ pub fn generate_input_data(buf: &BufferDef) -> Vec<u8> {
 }
 
 /// Write a pattern into a byte buffer using the given element type.
-fn write_pattern(
-    data: &mut [u8],
-    elem_type: ElementType,
-    count: usize,
-    value_fn: impl Fn(usize) -> i64,
-) {
+fn write_pattern(data: &mut [u8], elem_type: ElementType, count: usize, value_fn: impl Fn(usize) -> i64) {
     let elem_size = elem_type.byte_size();
     for i in 0..count {
         let val = value_fn(i);
@@ -797,15 +766,15 @@ fn write_pattern(
             }
             ElementType::I16 | ElementType::U16 => {
                 let bytes = (val as u16).to_le_bytes();
-                data[offset..offset+2].copy_from_slice(&bytes);
+                data[offset..offset + 2].copy_from_slice(&bytes);
             }
             ElementType::I32 | ElementType::U32 => {
                 let bytes = (val as u32).to_le_bytes();
-                data[offset..offset+4].copy_from_slice(&bytes);
+                data[offset..offset + 4].copy_from_slice(&bytes);
             }
             ElementType::I64 | ElementType::U64 => {
                 let bytes = (val as u64).to_le_bytes();
-                data[offset..offset+8].copy_from_slice(&bytes);
+                data[offset..offset + 8].copy_from_slice(&bytes);
             }
         }
     }
@@ -826,27 +795,27 @@ pub fn read_values(data: &[u8], elem_type: ElementType) -> Vec<i64> {
             ElementType::I8 => data[offset] as i8 as i64,
             ElementType::U8 => data[offset] as u8 as i64,
             ElementType::I16 => {
-                let bytes: [u8; 2] = data[offset..offset+2].try_into().unwrap();
+                let bytes: [u8; 2] = data[offset..offset + 2].try_into().unwrap();
                 i16::from_le_bytes(bytes) as i64
             }
             ElementType::U16 => {
-                let bytes: [u8; 2] = data[offset..offset+2].try_into().unwrap();
+                let bytes: [u8; 2] = data[offset..offset + 2].try_into().unwrap();
                 u16::from_le_bytes(bytes) as i64
             }
             ElementType::I32 => {
-                let bytes: [u8; 4] = data[offset..offset+4].try_into().unwrap();
+                let bytes: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
                 i32::from_le_bytes(bytes) as i64
             }
             ElementType::U32 => {
-                let bytes: [u8; 4] = data[offset..offset+4].try_into().unwrap();
+                let bytes: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
                 u32::from_le_bytes(bytes) as i64
             }
             ElementType::I64 => {
-                let bytes: [u8; 8] = data[offset..offset+8].try_into().unwrap();
+                let bytes: [u8; 8] = data[offset..offset + 8].try_into().unwrap();
                 i64::from_le_bytes(bytes)
             }
             ElementType::U64 => {
-                let bytes: [u8; 8] = data[offset..offset+8].try_into().unwrap();
+                let bytes: [u8; 8] = data[offset..offset + 8].try_into().unwrap();
                 u64::from_le_bytes(bytes) as i64
             }
         };
@@ -956,14 +925,8 @@ constexpr int OUT_SIZE = 64;
     #[test]
     fn test_parse_fill_expr_sequential() {
         let constants = HashMap::new();
-        assert_eq!(
-            parse_fill_expr("i + 1", &constants),
-            InputPattern::Sequential { start: 1, step: 1 }
-        );
-        assert_eq!(
-            parse_fill_expr("i", &constants),
-            InputPattern::Sequential { start: 0, step: 1 }
-        );
+        assert_eq!(parse_fill_expr("i + 1", &constants), InputPattern::Sequential { start: 1, step: 1 });
+        assert_eq!(parse_fill_expr("i", &constants), InputPattern::Sequential { start: 0, step: 1 });
     }
 
     // ---------------------------------------------------------------
@@ -1195,9 +1158,7 @@ auto bo1_out = xrt::bo(device, OUT_SIZE * sizeof(int32_t),
 
     #[test]
     fn test_read_values_i32() {
-        let data: Vec<u8> = [1i32, 2, 3, 4].iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let data: Vec<u8> = [1i32, 2, 3, 4].iter().flat_map(|v| v.to_le_bytes()).collect();
         let values = read_values(&data, ElementType::I32);
         assert_eq!(values, vec![1, 2, 3, 4]);
     }

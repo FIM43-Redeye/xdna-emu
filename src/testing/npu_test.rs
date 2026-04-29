@@ -122,11 +122,7 @@ impl Buildable for NpuTestSource {
             .join(&self.name)
     }
 
-    fn collect_artifacts(
-        &self,
-        output_dir: &Path,
-        result: &BuildResult,
-    ) -> Vec<BuiltArtifact> {
+    fn collect_artifacts(&self, output_dir: &Path, result: &BuildResult) -> Vec<BuiltArtifact> {
         let all = find_all_xclbin_results(output_dir, &self.build_steps);
         let mut artifacts = Vec::new();
 
@@ -185,10 +181,7 @@ pub fn discover(mlir_aie_path: &Path) -> Vec<NpuTestSource> {
     let test_root_raw = mlir_aie_path.join("test/npu-xrt");
 
     if !test_root_raw.is_dir() {
-        log::warn!(
-            "NPU test source directory not found: {}",
-            test_root_raw.display()
-        );
+        log::warn!("NPU test source directory not found: {}", test_root_raw.display());
         return Vec::new();
     }
 
@@ -226,9 +219,7 @@ fn discover_recursive(base: &Path, dir: &Path, tests: &mut Vec<NpuTestSource>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            let name = path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             // Skip known non-test directories
             if name == "makefile-common" || name.starts_with('.') || name == "__pycache__" {
                 continue;
@@ -241,7 +232,8 @@ fn discover_recursive(base: &Path, dir: &Path, tests: &mut Vec<NpuTestSource>) {
     if let Some((entry_file, annotations)) = find_entry_point(dir) {
         let name = match dir.strip_prefix(base) {
             Ok(rel) => rel.to_string_lossy().to_string(),
-            Err(_) => dir.file_name()
+            Err(_) => dir
+                .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
         };
@@ -253,11 +245,10 @@ fn discover_recursive(base: &Path, dir: &Path, tests: &mut Vec<NpuTestSource>) {
         let buffer_spec = super::test_cpp_parser::parse_test_cpp(dir);
 
         // Detect test.cpp and its argument pattern for native HW execution
-        let (test_cpp_path, test_cpp_pattern) =
-            match super::native_hw::detect_test_cpp(dir) {
-                Some((path, pattern)) => (Some(path), Some(pattern)),
-                None => (None, None),
-            };
+        let (test_cpp_path, test_cpp_pattern) = match super::native_hw::detect_test_cpp(dir) {
+            Some((path, pattern)) => (Some(path), Some(pattern)),
+            None => (None, None),
+        };
 
         tests.push(NpuTestSource {
             name,
@@ -317,7 +308,8 @@ pub fn find_entry_point(dir: &Path) -> Option<(PathBuf, Annotations)> {
     //    Matches lit's suffix rule: all .py files are potential tests.
     //    Only skip aie2.py (already checked above) and util.py (lit excludes it).
     if let Ok(entries) = std::fs::read_dir(dir) {
-        let mut py_files: Vec<_> = entries.flatten()
+        let mut py_files: Vec<_> = entries
+            .flatten()
             .filter_map(|e| {
                 let path = e.path();
                 if path.extension().map_or(false, |e| e == "py") {
@@ -360,11 +352,7 @@ pub fn find_entry_point(dir: &Path) -> Option<(PathBuf, Annotations)> {
 ///
 /// Also parses REQUIRES: and XFAIL: annotations from the first 40 lines.
 pub fn parse_annotations(path: &Path) -> Annotations {
-    let mut annotations = Annotations {
-        run_lines: Vec::new(),
-        requires: Vec::new(),
-        xfail: false,
-    };
+    let mut annotations = Annotations { run_lines: Vec::new(), requires: Vec::new(), xfail: false };
 
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -383,7 +371,8 @@ pub fn parse_annotations(path: &Path) -> Annotations {
 
         // REQUIRES, XFAIL: only check first 40 lines (header area)
         if idx < 40 {
-            let requires_text = trimmed.strip_prefix("// REQUIRES:")
+            let requires_text = trimmed
+                .strip_prefix("// REQUIRES:")
                 .or_else(|| trimmed.strip_prefix("# REQUIRES:"));
             if let Some(rest) = requires_text {
                 for feature in rest.split(',') {
@@ -572,15 +561,13 @@ impl TestOverrides {
     /// Returns default (empty) overrides if the file is missing or unparseable.
     pub fn load(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
-            Ok(content) => {
-                match toml::from_str(&content) {
-                    Ok(overrides) => overrides,
-                    Err(e) => {
-                        log::warn!("Failed to parse {}: {}", path.display(), e);
-                        Self::default()
-                    }
+            Ok(content) => match toml::from_str(&content) {
+                Ok(overrides) => overrides,
+                Err(e) => {
+                    log::warn!("Failed to parse {}: {}", path.display(), e);
+                    Self::default()
                 }
-            }
+            },
             Err(_) => Self::default(),
         }
     }
@@ -627,9 +614,7 @@ mod tests {
 
     /// Create a unique temporary directory for tests.
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join("xdna_emu_npu_test_tests")
-            .join(name);
+        let dir = std::env::temp_dir().join("xdna_emu_npu_test_tests").join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -710,7 +695,8 @@ mod tests {
     fn test_filter_build_steps_aie2_py() {
         let run_lines = vec![
             "%python %S/aie2.py > ./aie2.mlir".to_string(),
-            "%python aiecc.py --no-aiesim --xclbin-name=final.xclbin --npu-insts-name=insts.bin ./aie2.mlir".to_string(),
+            "%python aiecc.py --no-aiesim --xclbin-name=final.xclbin --npu-insts-name=insts.bin ./aie2.mlir"
+                .to_string(),
             "clang %S/test.cpp -o test.exe -std=c++17".to_string(),
             "%run_on_npu1% ./test.exe".to_string(),
         ];
@@ -740,9 +726,7 @@ mod tests {
 
     #[test]
     fn test_filter_build_steps_filecheck() {
-        let run_lines = vec![
-            "%python aiecc.py %s | FileCheck %s".to_string(),
-        ];
+        let run_lines = vec!["%python aiecc.py %s | FileCheck %s".to_string()];
 
         let steps = filter_build_steps(&run_lines);
         assert_eq!(steps.len(), 1);
@@ -766,7 +750,8 @@ mod tests {
     fn test_filter_build_steps_chess_only() {
         // Test without NPUDEVICE substitution (chess-only, direct %S/aie.mlir)
         let run_lines = vec![
-            "%python aiecc.py --no-aiesim --xclbin-name=aie.xclbin --npu-insts-name=insts.bin %S/aie.mlir".to_string(),
+            "%python aiecc.py --no-aiesim --xclbin-name=aie.xclbin --npu-insts-name=insts.bin %S/aie.mlir"
+                .to_string(),
             "clang %S/test.cpp -o test.exe -std=c++17 -Wall %xrt_flags".to_string(),
             "%run_on_npu1% ./test.exe -x aie.xclbin -k MLIR_AIE -i insts.bin".to_string(),
         ];
@@ -957,7 +942,8 @@ mod tests {
              // RUN: %python aiecc.py --no-aiesim %s\n\
              // RUN: clang %S/test.cpp -o test.exe\n\
              // RUN: %run_on_npu1% ./test.exe\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(test_root.join("aie.mlir"), "module {}").unwrap();
         std::fs::write(test_root.join("test.cpp"), "int main() {}").unwrap();
 
@@ -982,7 +968,8 @@ mod tests {
              // RUN: %python aiecc.py --no-aiesim %S/aie.mlir\n\
              // RUN: clang %S/test.cpp -o test.exe\n\
              // RUN: %run_on_npu1% ./test.exe\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(test_root.join("aie.mlir"), "module {}").unwrap();
         std::fs::write(test_root.join("test.cpp"), "int main() {}").unwrap();
 
@@ -1008,7 +995,8 @@ mod tests {
              # RUN: %run_on_npu1% ./test.exe\n\
              \n\
              import numpy as np\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(test_root.join("test.cpp"), "int main() {}").unwrap();
 
         let tests = discover(&dir);
@@ -1033,7 +1021,8 @@ mod tests {
              # RUN: %python aiecc.py --no-aiesim --xclbin-name=final.xclbin ./aie2.mlir\n\
              # RUN: clang %S/test.cpp -o test.exe\n\
              # RUN: ./test.exe\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(test_root.join("test.cpp"), "int main() {}").unwrap();
 
         let tests = discover(&dir);
@@ -1052,7 +1041,8 @@ mod tests {
             test_root.join("run.lit"),
             "// REQUIRES: dont_run\n\
              // RUN: echo hello\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let tests = discover(&dir);
         assert!(tests.is_empty());
@@ -1067,10 +1057,8 @@ mod tests {
 
         let test_root = dir.join("test/npu-xrt/real_test");
         std::fs::create_dir_all(&test_root).unwrap();
-        std::fs::write(
-            test_root.join("run.lit"),
-            "// REQUIRES: ryzen_ai\n// RUN: %python aiecc.py %s\n",
-        ).unwrap();
+        std::fs::write(test_root.join("run.lit"), "// REQUIRES: ryzen_ai\n// RUN: %python aiecc.py %s\n")
+            .unwrap();
 
         let tests = discover(&dir);
         assert_eq!(tests.len(), 1);
@@ -1083,10 +1071,8 @@ mod tests {
         for name in &["zebra", "alpha", "middle"] {
             let test_root = dir.join(format!("test/npu-xrt/{}", name));
             std::fs::create_dir_all(&test_root).unwrap();
-            std::fs::write(
-                test_root.join("run.lit"),
-                "// REQUIRES: ryzen_ai\n// RUN: %python aiecc.py %s\n",
-            ).unwrap();
+            std::fs::write(test_root.join("run.lit"), "// REQUIRES: ryzen_ai\n// RUN: %python aiecc.py %s\n")
+                .unwrap();
         }
 
         let tests = discover(&dir);
@@ -1104,10 +1090,8 @@ mod tests {
         for name in &["dma_configure_task_lock", "dma_configure_task_token"] {
             let test_root = dir.join(format!("test/npu-xrt/core_dmas/{}", name));
             std::fs::create_dir_all(&test_root).unwrap();
-            std::fs::write(
-                test_root.join("run.lit"),
-                "// REQUIRES: ryzen_ai\n// RUN: %python aiecc.py %s\n",
-            ).unwrap();
+            std::fs::write(test_root.join("run.lit"), "// REQUIRES: ryzen_ai\n// RUN: %python aiecc.py %s\n")
+                .unwrap();
         }
 
         let tests = discover(&dir);
@@ -1123,14 +1107,10 @@ mod tests {
         std::fs::create_dir_all(&test_root).unwrap();
 
         // Both run.lit and aie2.py exist -- run.lit should win
-        std::fs::write(
-            test_root.join("run.lit"),
-            "// REQUIRES: ryzen_ai\n// RUN: echo from_run_lit\n",
-        ).unwrap();
-        std::fs::write(
-            test_root.join("aie2.py"),
-            "# REQUIRES: ryzen_ai\n# RUN: echo from_aie2_py\n",
-        ).unwrap();
+        std::fs::write(test_root.join("run.lit"), "// REQUIRES: ryzen_ai\n// RUN: echo from_run_lit\n")
+            .unwrap();
+        std::fs::write(test_root.join("aie2.py"), "# REQUIRES: ryzen_ai\n# RUN: echo from_aie2_py\n")
+            .unwrap();
 
         let tests = discover(&dir);
         assert_eq!(tests.len(), 1);
@@ -1194,13 +1174,17 @@ mod tests {
     fn test_load_overrides_applies_skip_and_expected_fail() {
         let dir = test_dir("load_overrides");
         let overrides_path = dir.join("test_overrides.toml");
-        std::fs::write(&overrides_path, r#"
+        std::fs::write(
+            &overrides_path,
+            r#"
 [skip]
 skip_me = "Platform not supported"
 
 [expected_fail]
 flaky_test = "Known emulator limitation"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let mut tests = vec![
             NpuTestSource {
@@ -1263,14 +1247,18 @@ flaky_test = "Known emulator limitation"
     fn test_overrides_compiler_build_xfail_parses() {
         let dir = test_dir("overrides_build_xfail");
         let path = dir.join("test_overrides.toml");
-        std::fs::write(&path, r#"
+        std::fs::write(
+            &path,
+            r#"
 [peano_build_xfail]
 ctrl_packet_reconfig = "i8 vector legalization (llvm-aie#480)"
 "examples-ml-matmul" = "bfp16 vector legalization"
 
 [chess_build_xfail]
 some_chess_test = "Chess intrinsic issue"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let overrides = TestOverrides::load(&path);
         assert_eq!(overrides.peano_build_xfail.len(), 2);
@@ -1312,10 +1300,14 @@ some_chess_test = "Chess intrinsic issue"
     fn test_load_overrides_nested_test_name() {
         let dir = test_dir("overrides_nested");
         let overrides_path = dir.join("test_overrides.toml");
-        std::fs::write(&overrides_path, r#"
+        std::fs::write(
+            &overrides_path,
+            r#"
 [skip]
 "adjacent_memtile_access/two_memtiles" = "Requires NPU2"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let mut tests = vec![NpuTestSource {
             name: "adjacent_memtile_access/two_memtiles".to_string(),
@@ -1378,7 +1370,8 @@ some_chess_test = "Chess intrinsic issue"
         // aie2.py tests typically use final.xclbin
         let run_lines = vec![
             "%python %S/aie2.py > ./aie2.mlir".to_string(),
-            "%python aiecc.py --no-aiesim --xclbin-name=final.xclbin --npu-insts-name=insts.bin ./aie2.mlir".to_string(),
+            "%python aiecc.py --no-aiesim --xclbin-name=final.xclbin --npu-insts-name=insts.bin ./aie2.mlir"
+                .to_string(),
             "clang %S/test.cpp -o test.exe -std=c++17".to_string(),
             "%run_on_npu1% ./test.exe -x final.xclbin -k MLIR_AIE -i insts.bin".to_string(),
         ];
