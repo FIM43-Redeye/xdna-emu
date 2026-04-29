@@ -61,7 +61,8 @@ fn main() {
                 let dst = xrt_lib.join("libxrt_driver_emu.so.2.21.0");
                 let link = xrt_lib.join("libxrt_driver_emu.so.2");
                 if src.exists() {
-                    let dst_resolves_to_src = dst.read_link()
+                    let dst_resolves_to_src = dst
+                        .read_link()
                         .ok()
                         .and_then(|target| fs::canonicalize(xrt_lib.join(target)).ok())
                         .map_or(false, |resolved| {

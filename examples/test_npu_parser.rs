@@ -5,9 +5,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 
 fn main() {
     let config = xdna_emu::config::Config::get();
-    let insts_path = config.mlir_aie_subpath(
-        "build/test/npu-xrt/add_one_using_dma/insts.bin",
-    );
+    let insts_path = config.mlir_aie_subpath("build/test/npu-xrt/add_one_using_dma/insts.bin");
     let data = std::fs::read(&insts_path)
         .unwrap_or_else(|e| panic!("Failed to read {}: {} (set MLIR_AIE_PATH)", insts_path.display(), e));
     println!("File size: {} bytes", data.len());
@@ -51,8 +49,12 @@ fn main() {
                     let reg_off = cursor.read_u64::<LittleEndian>().unwrap();
                     let value = cursor.read_u32::<LittleEndian>().unwrap();
                     let _size = cursor.read_u32::<LittleEndian>().unwrap();
-                    println!("Write32 reg=0x{:08X} val=0x{:08X} end=0x{:02X}",
-                        reg_off as u32, value, cursor.position());
+                    println!(
+                        "Write32 reg=0x{:08X} val=0x{:08X} end=0x{:02X}",
+                        reg_off as u32,
+                        value,
+                        cursor.position()
+                    );
                 }
                 1 => {
                     // BlockWrite: 8 header + 4 reg_off + 4 size + payload
@@ -64,8 +66,13 @@ fn main() {
                     for _ in 0..num_words {
                         cursor.read_u32::<LittleEndian>().unwrap();
                     }
-                    println!("BlockWrite reg=0x{:08X} size={} words={} end=0x{:02X}",
-                        reg_off, size, num_words, cursor.position());
+                    println!(
+                        "BlockWrite reg=0x{:08X} size={} words={} end=0x{:02X}",
+                        reg_off,
+                        size,
+                        num_words,
+                        cursor.position()
+                    );
                 }
                 3 => {
                     // MaskWrite: 8 header + 8 reg_off + 4 value + 4 mask + 4 size = 28 bytes
@@ -73,8 +80,13 @@ fn main() {
                     let value = cursor.read_u32::<LittleEndian>().unwrap();
                     let mask = cursor.read_u32::<LittleEndian>().unwrap();
                     let _size = cursor.read_u32::<LittleEndian>().unwrap();
-                    println!("MaskWrite reg=0x{:08X} val=0x{:08X} mask=0x{:08X} end=0x{:02X}",
-                        reg_off as u32, value, mask, cursor.position());
+                    println!(
+                        "MaskWrite reg=0x{:08X} val=0x{:08X} mask=0x{:08X} end=0x{:02X}",
+                        reg_off as u32,
+                        value,
+                        mask,
+                        cursor.position()
+                    );
                 }
                 4 => {
                     // MaskPoll: 8 header + 8 reg_off + 4 value + 4 mask + 4 size = 28 bytes
@@ -82,8 +94,13 @@ fn main() {
                     let value = cursor.read_u32::<LittleEndian>().unwrap();
                     let mask = cursor.read_u32::<LittleEndian>().unwrap();
                     let _size = cursor.read_u32::<LittleEndian>().unwrap();
-                    println!("MaskPoll reg=0x{:08X} val=0x{:08X} mask=0x{:08X} end=0x{:02X}",
-                        reg_off as u32, value, mask, cursor.position());
+                    println!(
+                        "MaskPoll reg=0x{:08X} val=0x{:08X} mask=0x{:08X} end=0x{:02X}",
+                        reg_off as u32,
+                        value,
+                        mask,
+                        cursor.position()
+                    );
                 }
                 _ => {
                     println!("Unknown (pad2=0x{:08X})", padding2);
