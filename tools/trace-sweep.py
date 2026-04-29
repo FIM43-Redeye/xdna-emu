@@ -236,6 +236,113 @@ def _merge_anchored(
 
 
 # ---------------------------------------------------------------------------
+# Lockstep multi-tile batching (A.2 mode-1 sweep)
+# ---------------------------------------------------------------------------
+
+def _build_lockstep_batches(cursors: dict) -> list:
+    """Generate per-batch event assignments across all tile cursors.
+
+    Each cursor (one per (tile, module-type)) holds a sweep list and a
+    remaining_slots count (= 8 - len(grounding)). Per batch, each cursor
+    consumes its next remaining_slots events. Total batch count =
+    max(ceil(per-cursor sweep length / per-cursor remaining_slots)).
+    A cursor with an empty sweep still contributes one batch (so the
+    caller gets at least one grounding-only batch). Cursors that exhaust
+    early emit empty assignments (grounding-only) for the remaining batches.
+    """
+    if not cursors:
+        return []
+    n_batches = max(
+        (1 if not c["sweep"]
+         else (len(c["sweep"]) + c["remaining_slots"] - 1) // c["remaining_slots"])
+        for c in cursors.values()
+    )
+    batches: list = []
+    for batch_idx in range(n_batches):
+        batch: dict = {}
+        for key, c in cursors.items():
+            start = batch_idx * c["remaining_slots"]
+            end = start + c["remaining_slots"]
+            batch[key] = list(c["sweep"][start:end])
+        batches.append(batch)
+    return batches
+
+
+# ---------------------------------------------------------------------------
+# Grounding-PC consistency check (A.2b cross-batch invariance)
+# ---------------------------------------------------------------------------
+
+def _check_grounding_pc_invariance(batches_dir: Path,
+                                   grounding_events: List[str]) -> dict:
+    """Verify that HW grounding-event PCs are batch-invariant.
+
+    Reads hw/trace.events.json from each batch_NNN subdirectory of
+    batches_dir. For each grounding event name, checks that the set of
+    `ts` values observed in the first batch matches every subsequent batch.
+    A mismatch means the kernel's entry PC shifted between batches (e.g.
+    the kernel was recompiled or the patch altered something it shouldn't
+    have), making cross-batch PC join unreliable.
+
+    Returns a dict with keys:
+      - "unsafe_for_pc_join": bool
+      - "reason": str | None  (human-readable explanation on failure)
+      - "per_batch_grounding_pcs": {batch_idx: {event_name: [sorted ts list]}}
+    """
+    per_batch: Dict[int, Dict[str, set]] = {}
+    for batch_dir in sorted(batches_dir.glob("batch_*")):
+        events_json = batch_dir / "hw" / "trace.events.json"
+        if not events_json.exists():
+            continue
+        try:
+            bidx = int(batch_dir.name.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        per_batch[bidx] = {}
+        try:
+            records = json.loads(events_json.read_text())
+        except Exception:
+            continue
+        events_list = (
+            records.get("events", records)
+            if isinstance(records, dict) else records
+        )
+        for rec in events_list:
+            name = rec.get("name", "")
+            if name in grounding_events:
+                per_batch[bidx].setdefault(name, set()).add(rec["ts"])
+
+    for ev in grounding_events:
+        seen_pcs: Optional[set] = None
+        for bidx, by_ev in sorted(per_batch.items()):
+            if ev not in by_ev:
+                continue
+            if seen_pcs is None:
+                seen_pcs = by_ev[ev]
+            elif by_ev[ev] != seen_pcs:
+                return {
+                    "unsafe_for_pc_join": True,
+                    "reason": (
+                        f"grounding event {ev} PC drifted: "
+                        f"first_batch={sorted(seen_pcs)} "
+                        f"batch_{bidx}={sorted(by_ev[ev])}"
+                    ),
+                    "per_batch_grounding_pcs": {
+                        k: {n: sorted(s) for n, s in v.items()}
+                        for k, v in per_batch.items()
+                    },
+                }
+
+    return {
+        "unsafe_for_pc_join": False,
+        "reason": None,
+        "per_batch_grounding_pcs": {
+            k: {n: sorted(s) for n, s in v.items()}
+            for k, v in per_batch.items()
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Runner wrappers
 # ---------------------------------------------------------------------------
 
@@ -1296,6 +1403,368 @@ def sweep_multi(
     return summaries
 
 
+_GROUNDING_BY_TILE_TYPE = {
+    "core":    "PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1",
+    "memmod":  "PERF_CNT_0",
+    "memtile": "PERF_CNT_0",
+    "shim":    "PERF_CNT_0",
+}
+
+_MODE_INT = {
+    "event_time": 0,
+    "event_pc":   1,
+    "inst_exec":  2,
+}
+
+
+def _build_lockstep_patch_spec(
+    tiles: "List[TileSpec]",
+    batch_assignment: dict,
+    grounding_by_type: "Dict[str, List[str]]",
+    all_events_by_type: "Dict[str, List[EventDef]]",
+    mode: str,
+) -> list:
+    """Build the JSON spec list for trace-patch-events.py --multi-tile.
+
+    For each tile in the batch, combines grounding event IDs (fixed slots,
+    always present) with this batch's sweep event IDs. Core tiles get the
+    requested mode; all other tile types get mode 0 (event-time) since only
+    cores support mode-1 PC recording.
+
+    Returns a list of dicts suitable for JSON serialization.
+    """
+    spec = []
+    for tile in tiles:
+        cursor_key = f"{tile.tile_type}_{tile.col}_{tile.row}"
+        sweep_names = batch_assignment.get(cursor_key, [])
+        grounding_names = grounding_by_type.get(tile.tile_type, [])
+        ev_by_name = {e.name: e.id for e in all_events_by_type.get(tile.tile_type, [])}
+        # Grounding events occupy the first N slots; sweep events follow.
+        event_ids = []
+        for name in grounding_names:
+            eid = ev_by_name.get(name)
+            if eid is not None:
+                event_ids.append(eid)
+        for name in sweep_names:
+            eid = ev_by_name.get(name)
+            if eid is not None:
+                event_ids.append(eid)
+        # Pad to 8 slots with 0 (trace unit ignores slot 0 = event-ID 0)
+        event_ids = (event_ids + [0] * 8)[:8]
+        tile_mode = _MODE_INT.get(mode, 0) if tile.tile_type == "core" else 0
+        entry: dict = {
+            "col": tile.col,
+            "row": tile.row,
+            "tile_type": tile.tile_type,
+            "events": event_ids,
+            "mode": tile_mode,
+        }
+        spec.append(entry)
+    return spec
+
+
+def sweep_lockstep(
+    test_name: str,
+    compiler: str,
+    tiles: "List[TileSpec]",
+    build_dir: Path,
+    out_dir: Path,
+    run_hw: bool = True,
+    run_emu: bool = True,
+    ctrlpkt: Optional[Path] = None,
+    mode: str = "event_pc",
+    core_grounding: Optional[List[str]] = None,
+    memmod_grounding: Optional[List[str]] = None,
+    memtile_grounding: Optional[List[str]] = None,
+    shim_grounding: Optional[List[str]] = None,
+    core_sweep: Optional[List[str]] = None,
+    memmod_sweep: Optional[List[str]] = None,
+    memtile_sweep: Optional[List[str]] = None,
+    shim_sweep: Optional[List[str]] = None,
+    perfcnt_period: int = 1024,
+    with_mode2_baseline: bool = True,
+    reuse_ctx: bool = False,
+) -> None:
+    """Mode-1 lockstep sweep across mixed-type tiles (A.2 path).
+
+    Unlike sweep_multi, tiles may have different tile_types (cores,
+    memmods, memtiles, shims). Per-type grounding events are reserved
+    in fixed slots. Per-type sweep event lists advance in lockstep
+    using _build_lockstep_batches.
+
+    Each batch applies all tile patches in a single --multi-tile
+    invocation, then runs HW + EMU together. After the sweep, an
+    optional HW-only mode-2 (inst_exec) baseline batch is captured.
+    A sweep-manifest.json is written to out_dir with per-batch grounding
+    PC sets and the cross-batch invariance check result.
+    """
+    if not tiles:
+        raise ValueError("sweep_lockstep requires at least one tile")
+
+    cfg = discover_test_config(test_name)
+    xclbin = build_dir / "aie.xclbin"
+    insts = build_dir / cfg.insts_name
+    for path, label in [(xclbin, "xclbin"), (insts, cfg.insts_name)]:
+        if not path.exists():
+            raise FileNotFoundError(f"{label} missing in {build_dir}")
+    if ctrlpkt is None and cfg.ctrlpkt_name:
+        cand = build_dir / cfg.ctrlpkt_name
+        if cand.is_file():
+            ctrlpkt = cand
+    mlir = _find_post_lowering_mlir(build_dir)
+    if mlir is None:
+        raise FileNotFoundError(
+            f"no input_with_addresses.mlir under {build_dir}/*.prj/; "
+            f"parse-trace cannot decode without it"
+        )
+
+    # Defaults for grounding event lists.
+    grounding_by_type: Dict[str, List[str]] = {
+        "core":    (core_grounding or
+                    [s.strip() for s in _GROUNDING_BY_TILE_TYPE["core"].split(",")]),
+        "memmod":  (memmod_grounding or
+                    [s.strip() for s in _GROUNDING_BY_TILE_TYPE["memmod"].split(",")]),
+        "memtile": (memtile_grounding or
+                    [s.strip() for s in _GROUNDING_BY_TILE_TYPE["memtile"].split(",")]),
+        "shim":    (shim_grounding or
+                    [s.strip() for s in _GROUNDING_BY_TILE_TYPE["shim"].split(",")]),
+    }
+    sweep_filter_by_type: Dict[str, Optional[List[str]]] = {
+        "core":    core_sweep,
+        "memmod":  memmod_sweep,
+        "memtile": memtile_sweep,
+        "shim":    shim_sweep,
+    }
+
+    # Load event tables once per tile type present.
+    tile_types_present = {t.tile_type for t in tiles}
+    all_events_by_type: Dict[str, List[EventDef]] = {}
+    for tt in tile_types_present:
+        all_events_by_type[tt] = load_events(tt)
+
+    # Build cursors: one per tile (col,row,tile_type).
+    # remaining_slots = 8 - len(grounding events for this tile_type).
+    cursors: dict = {}
+    for tile in tiles:
+        tt = tile.tile_type
+        grounding = grounding_by_type.get(tt, [])
+        remaining = max(1, 8 - len(grounding))
+        sweep_filter = sweep_filter_by_type.get(tt)
+        ev_names_all = [e.name for e in all_events_by_type.get(tt, [])]
+        if sweep_filter is not None:
+            sweep_names = [n for n in ev_names_all if n in sweep_filter]
+        else:
+            sweep_names = [n for n in ev_names_all if n not in grounding]
+        cursor_key = f"{tt}_{tile.col}_{tile.row}"
+        cursors[cursor_key] = {
+            "sweep": sweep_names,
+            "remaining_slots": remaining,
+        }
+
+    batches = _build_lockstep_batches(cursors)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = out_dir / f"{test_name}.{compiler}.lockstep.work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    patched = work_dir / "insts.patched.bin"
+
+    hw_runner_env: Dict[str, str] = {}
+    emu_runner_env: Dict[str, str] = {
+        "XDNA_EMU": os.environ.get("XDNA_EMU", "debug"),
+        "XDNA_EMU_LOG_LEVEL": os.environ.get("XDNA_EMU_LOG_LEVEL", "info"),
+        "XRT_DEVICE_BDF": "ffff:ff:1f.0",
+    }
+    trace_buf_idx: Optional[int] = None
+    cdo_preambles: List[Path] = []
+    if reuse_ctx:
+        trace_buf_idx = _discover_trace_buf_idx(insts)
+        if trace_buf_idx is None:
+            raise FileNotFoundError(
+                f"--reuse-ctx requested but trace_buf_idx could not be "
+                f"discovered from {insts}"
+            )
+        cdo_preambles = _find_cdo_preambles(mlir)
+        if not cdo_preambles:
+            raise FileNotFoundError(
+                f"--reuse-ctx requested but CDO preambles missing under {mlir.parent}"
+            )
+
+    hw_session: Optional[RunnerSession] = None
+    emu_session: Optional[RunnerSession] = None
+    if run_hw:
+        hw_session = RunnerSession(
+            xclbin=xclbin, runner_env=hw_runner_env, side="HW",
+            stderr_log=work_dir / "hw.runner.log",
+            cdo_preambles=cdo_preambles, trace_buf_idx=trace_buf_idx,
+            reuse_ctx=reuse_ctx,
+        )
+    if run_emu:
+        emu_session = RunnerSession(
+            xclbin=xclbin, runner_env=emu_runner_env, side="EMU",
+            stderr_log=work_dir / "emu.runner.log",
+            cdo_preambles=cdo_preambles, trace_buf_idx=trace_buf_idx,
+            reuse_ctx=reuse_ctx,
+        )
+    hw_parser: Optional[ParseSession] = None
+    emu_parser: Optional[ParseSession] = None
+    if run_hw:
+        hw_parser = ParseSession(side="HW", stderr_log=work_dir / "hw.parser.log")
+    if run_emu:
+        emu_parser = ParseSession(side="EMU", stderr_log=work_dir / "emu.parser.log")
+
+    t_start = time.time()
+    mode2_succeeded = False
+
+    try:
+        for b_idx, batch_assignment in enumerate(batches):
+            batch_dir = out_dir / f"batch_{b_idx:02d}"
+            hw_dir = batch_dir / "hw"
+            emu_dir = batch_dir / "emu"
+            hw_dir.mkdir(parents=True, exist_ok=True)
+            emu_dir.mkdir(parents=True, exist_ok=True)
+
+            # Build multi-tile patch spec and apply it in one subprocess call.
+            patch_spec = _build_lockstep_patch_spec(
+                tiles, batch_assignment, grounding_by_type,
+                all_events_by_type, mode,
+            )
+            spec_path = work_dir / f"b{b_idx:02d}.patch.json"
+            spec_path.write_text(json.dumps(patch_spec, indent=2))
+            subprocess.run([
+                sys.executable, str(PATCH_TOOL), str(insts),
+                "--multi-tile", str(spec_path),
+                "--output", str(patched),
+            ], check=True, capture_output=True)
+
+            hw_events_out = hw_dir / "trace.events.json"
+            emu_events_out = emu_dir / "trace.events.json"
+
+            hw_res = (
+                RunResult(ok=False, cycles=None, events_count=None, error="hw skipped")
+                if not run_hw else _run_one_side(
+                    side="HW",
+                    session=hw_session,
+                    runner_env=hw_runner_env,
+                    instr=patched,
+                    trace_bin=hw_dir / "trace.bin",
+                    mlir=mlir,
+                    events_out=hw_events_out,
+                    cycles_out=hw_dir / "cycles.txt",
+                    parse_log=hw_dir / "parse.log",
+                    ctrlpkt=ctrlpkt,
+                    parser_session=hw_parser,
+                )
+            )
+            emu_res = (
+                RunResult(ok=False, cycles=None, events_count=None, error="emu skipped")
+                if not run_emu else _run_one_side(
+                    side="EMU",
+                    session=emu_session,
+                    runner_env=emu_runner_env,
+                    instr=patched,
+                    trace_bin=emu_dir / "trace.bin",
+                    mlir=mlir,
+                    events_out=emu_events_out,
+                    cycles_out=emu_dir / "cycles.txt",
+                    parse_log=emu_dir / "parse.log",
+                    ctrlpkt=ctrlpkt,
+                    parser_session=emu_parser,
+                )
+            )
+            print(
+                f"[sweep-lockstep] batch {b_idx + 1}/{len(batches)}: "
+                f"hw_ok={hw_res.ok} emu_ok={emu_res.ok} "
+                f"hw_cyc={hw_res.cycles} emu_cyc={emu_res.cycles}",
+                flush=True,
+            )
+
+        # ----------------------------------------------------------------
+        # Mode-2 finishing batch (HW only, inst_exec).
+        # ----------------------------------------------------------------
+        if with_mode2_baseline and run_hw and hw_session is not None:
+            compute_tiles = [t for t in tiles if t.tile_type == "core"]
+            if compute_tiles:
+                mode2_spec = [
+                    {"col": t.col, "row": t.row, "tile_type": "core", "mode": 2}
+                    for t in compute_tiles
+                ]
+                mode2_spec_path = out_dir / "mode2_patch.json"
+                mode2_spec_path.write_text(json.dumps(mode2_spec, indent=2))
+                mode2_insts = work_dir / "mode2_insts.bin"
+                subprocess.run([
+                    sys.executable, str(PATCH_TOOL), str(insts),
+                    "--multi-tile", str(mode2_spec_path),
+                    "--output", str(mode2_insts),
+                ], check=True, capture_output=True)
+
+                mode2_dir = out_dir / "mode2-baseline"
+                mode2_hw_dir = mode2_dir / "hw"
+                mode2_hw_dir.mkdir(parents=True, exist_ok=True)
+                mode2_trace_bin = mode2_hw_dir / "trace.bin"
+                mode2_events_out = mode2_hw_dir / "trace.events.json"
+                mode2_cycles_out = mode2_hw_dir / "cycles.txt"
+
+                mode2_res = _run_one_side(
+                    side="HW",
+                    session=hw_session,
+                    runner_env=hw_runner_env,
+                    instr=mode2_insts,
+                    trace_bin=mode2_trace_bin,
+                    mlir=mlir,
+                    events_out=mode2_events_out,
+                    cycles_out=mode2_cycles_out,
+                    parse_log=mode2_hw_dir / "parse.log",
+                    ctrlpkt=ctrlpkt,
+                    parser_session=hw_parser,
+                )
+                mode2_succeeded = mode2_res.ok
+                print(
+                    f"[sweep-lockstep] mode-2 baseline: ok={mode2_res.ok} "
+                    f"cyc={mode2_res.cycles}",
+                    flush=True,
+                )
+
+    finally:
+        if hw_session is not None:
+            hw_session.close()
+        if emu_session is not None:
+            emu_session.close()
+        if hw_parser is not None:
+            hw_parser.close()
+        if emu_parser is not None:
+            emu_parser.close()
+
+    # ----------------------------------------------------------------
+    # Grounding-PC invariance check + manifest.
+    # ----------------------------------------------------------------
+    core_grounding_names = grounding_by_type.get("core", [])
+    invariance = _check_grounding_pc_invariance(out_dir, core_grounding_names)
+
+    elapsed = round(time.time() - t_start, 2)
+    manifest = {
+        "test_name": test_name,
+        "compiler": compiler,
+        "mode": mode,
+        "perfcnt_period": perfcnt_period,
+        "tiles": [
+            {"col": t.col, "row": t.row, "type": t.tile_type}
+            for t in tiles
+        ],
+        "n_batches": len(batches),
+        "grounding": {
+            "core":    grounding_by_type.get("core", []),
+            "memmod":  grounding_by_type.get("memmod", []),
+            "memtile": grounding_by_type.get("memtile", []),
+            "shim":    grounding_by_type.get("shim", []),
+        },
+        "mode2_baseline_captured": (with_mode2_baseline and mode2_succeeded),
+        "elapsed_sec": elapsed,
+        **invariance,
+    }
+    manifest_path = out_dir / "sweep-manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"[sweep-lockstep] manifest written to {manifest_path}", flush=True)
+
+
 def sweep(
     test_name: str,
     compiler: str,
@@ -1396,6 +1865,42 @@ def main() -> int:
                          "latency from ~90ms to ~10ms on Phoenix; requires "
                          "main_aie_cdo_init.bin and main_aie_cdo_enable.bin "
                          "alongside the lowered MLIR.")
+    # A.2 mode-1 lockstep sweep flags. When any of these are set alongside
+    # --tiles, sweep_lockstep is invoked instead of the legacy sweep_multi.
+    ap.add_argument("--mode", choices=("event_time", "event_pc"),
+                    default="event_time",
+                    help="trace mode for compute-core trace units; "
+                         "matches mlir-trace-inject's --trace-mode")
+    ap.add_argument("--core-grounding",
+                    default="PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1",
+                    help="grounding events reserved in fixed slots per batch "
+                         "(cores). Comma-separated event names.")
+    ap.add_argument("--memmod-grounding", default="PERF_CNT_0",
+                    help="grounding events for memmod trace units")
+    ap.add_argument("--memtile-grounding", default="PERF_CNT_0",
+                    help="grounding events for memtile trace units")
+    ap.add_argument("--shim-grounding", default="PERF_CNT_0",
+                    help="grounding events for shim trace units")
+    ap.add_argument("--core-sweep", default="all",
+                    help="comma-separated event names to sweep on cores; "
+                         "'all' enumerates from the event header")
+    ap.add_argument("--memmod-sweep", default="all",
+                    help="comma-separated event names to sweep on memmods; "
+                         "'all' enumerates from the event header")
+    ap.add_argument("--memtile-sweep", default="all",
+                    help="comma-separated event names to sweep on memtiles; "
+                         "'all' enumerates from the event header")
+    ap.add_argument("--shim-sweep", default="all",
+                    help="comma-separated event names to sweep on shims; "
+                         "'all' enumerates from the event header")
+    ap.add_argument("--perfcnt-period", type=int, default=1024,
+                    help="reserved for sanity-checking against the xclbin's "
+                         "baked-in perfcnt period value")
+    ap.add_argument("--with-mode2-baseline", action="store_true", default=True,
+                    help="capture one HW-only mode-2 (inst_exec) batch per "
+                         "test after the mode-1 sweep (for A.2b)")
+    ap.add_argument("--no-mode2-baseline", action="store_false",
+                    dest="with_mode2_baseline")
     args = ap.parse_args()
 
     build_dir = args.build_dir or (
@@ -1418,20 +1923,46 @@ def main() -> int:
                 ))
             except ValueError as e:
                 ap.error(f"bad --tiles entry {spec!r}: {e}")
-        summaries = sweep_multi(
-            test_name=args.test, compiler=args.compiler,
-            tiles=tiles, build_dir=build_dir, out_dir=args.out_dir,
-            events_filter=events_filter,
-            run_hw=not args.no_hw, run_emu=not args.no_emu,
-            ctrlpkt=args.ctrlpkt,
-            ground_event_name=args.ground_event,
-            reuse_ctx=args.reuse_ctx,
-        )
-        for s in summaries:
-            tile = s["tile"]
-            print(f"[sweep-multi] wrote {args.out_dir}/"
-                  f"{args.test}.{args.compiler}.{tile['type']}_c{tile['col']}r{tile['row']}.json "
-                  f"({len(s['events'])} events, {s['elapsed_sec']}s)")
+        # Route to sweep_lockstep when tiles are mixed-type (sweep_multi
+        # explicitly rejects those) or when the caller opts in via --mode
+        # event_pc (the A.2 mode-1 sweep path).
+        tile_types_seen = {t.tile_type for t in tiles}
+        use_lockstep = (args.mode == "event_pc") or (len(tile_types_seen) > 1)
+        if use_lockstep:
+            sweep_lockstep(
+                test_name=args.test, compiler=args.compiler,
+                tiles=tiles, build_dir=build_dir, out_dir=args.out_dir,
+                run_hw=not args.no_hw, run_emu=not args.no_emu,
+                ctrlpkt=args.ctrlpkt,
+                mode=args.mode,
+                core_grounding=[s.strip() for s in args.core_grounding.split(",")],
+                memmod_grounding=[s.strip() for s in args.memmod_grounding.split(",")],
+                memtile_grounding=[s.strip() for s in args.memtile_grounding.split(",")],
+                shim_grounding=[s.strip() for s in args.shim_grounding.split(",")],
+                core_sweep=None if args.core_sweep == "all" else [s.strip() for s in args.core_sweep.split(",")],
+                memmod_sweep=None if args.memmod_sweep == "all" else [s.strip() for s in args.memmod_sweep.split(",")],
+                memtile_sweep=None if args.memtile_sweep == "all" else [s.strip() for s in args.memtile_sweep.split(",")],
+                shim_sweep=None if args.shim_sweep == "all" else [s.strip() for s in args.shim_sweep.split(",")],
+                perfcnt_period=args.perfcnt_period,
+                with_mode2_baseline=args.with_mode2_baseline,
+                reuse_ctx=args.reuse_ctx,
+            )
+            print(f"[sweep-lockstep] manifest: {args.out_dir}/sweep-manifest.json")
+        else:
+            summaries = sweep_multi(
+                test_name=args.test, compiler=args.compiler,
+                tiles=tiles, build_dir=build_dir, out_dir=args.out_dir,
+                events_filter=events_filter,
+                run_hw=not args.no_hw, run_emu=not args.no_emu,
+                ctrlpkt=args.ctrlpkt,
+                ground_event_name=args.ground_event,
+                reuse_ctx=args.reuse_ctx,
+            )
+            for s in summaries:
+                tile = s["tile"]
+                print(f"[sweep-multi] wrote {args.out_dir}/"
+                      f"{args.test}.{args.compiler}.{tile['type']}_c{tile['col']}r{tile['row']}.json "
+                      f"({len(s['events'])} events, {s['elapsed_sec']}s)")
         return 0
 
     # Legacy single-tile path
