@@ -2474,8 +2474,11 @@ fn tile_module_name(key: &TileKey) -> &'static str {
 // Sweep directory support
 // ============================================================================
 
+/// Legacy sweep manifest written by sweep_multi / the old sweep orchestrator.
+/// Has a `batches[]` array listing per-batch status information.
 #[derive(Deserialize)]
 struct SweepManifest {
+    #[serde(default)]
     batches: Vec<SweepBatchInfo>,
 }
 
@@ -2490,6 +2493,43 @@ struct SweepBatchInfo {
     emu_status: String,
 }
 
+/// Discover batch indices from a sweep directory by filesystem scan.
+///
+/// Walks `sweep_dir/batch_NN/` entries and returns a sorted list of (index,
+/// hw_events_path, emu_events_path) tuples for every batch that has both HW
+/// and EMU events JSON files.  Used when the manifest does not carry a
+/// `batches[]` list (lockstep / mode-1 manifests omit it).
+fn discover_batches_from_fs(
+    sweep_dir: &Path,
+) -> Vec<(usize, std::path::PathBuf, std::path::PathBuf)> {
+    let mut results = Vec::new();
+    // Pattern: sweep_dir/batch_NN/  where NN is zero-padded decimal.
+    let rd = match fs::read_dir(sweep_dir) {
+        Ok(rd) => rd,
+        Err(_) => return results,
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("batch_") {
+            continue;
+        }
+        let idx_str = &name_str["batch_".len()..];
+        let idx: usize = match idx_str.parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let batch_dir = entry.path();
+        let hw = batch_dir.join("hw").join("trace.events.json");
+        let emu = batch_dir.join("emu").join("trace.events.json");
+        if hw.exists() && emu.exists() {
+            results.push((idx, hw, emu));
+        }
+    }
+    results.sort_by_key(|(idx, _, _)| *idx);
+    results
+}
+
 /// Compare all batches in a trace-sweep.py output directory.
 ///
 /// Reads `sweep-manifest.json`, iterates successful batches, and produces
@@ -2499,6 +2539,11 @@ pub fn compare_sweep_dir(sweep_dir: &Path) -> Result<String, String> {
 }
 
 /// Compare all batches with extended analysis options.
+///
+/// Supports two manifest formats:
+///   - Legacy (sweep_multi): `batches: [{batch, status, hw_status, emu_status}, ...]`
+///   - Lockstep (sweep_lockstep / mode-1): no `batches[]` field; batches are
+///     discovered from `batch_NN/` subdirectories.
 pub fn compare_sweep_dir_with_opts(
     sweep_dir: &Path,
     opts: &AnalysisOptions,
@@ -2509,20 +2554,40 @@ pub fn compare_sweep_dir_with_opts(
     let manifest: SweepManifest = serde_json::from_str(&manifest_text)
         .map_err(|e| format!("parse manifest: {}", e))?;
 
+    // Build the batch list from the manifest's `batches[]` array when present,
+    // or fall back to filesystem discovery (lockstep manifest format).
+    let discovered: Vec<(usize, std::path::PathBuf, std::path::PathBuf)>;
+    let batch_triples: &[(usize, std::path::PathBuf, std::path::PathBuf)] = if manifest.batches.is_empty() {
+        discovered = discover_batches_from_fs(sweep_dir);
+        &discovered
+    } else {
+        // Filter legacy batches to only those that completed successfully.
+        // All three status fields must be "ok" (original behaviour); batches
+        // where all status fields are empty are also included because some
+        // manifest versions omit status when every batch succeeded.
+        discovered = manifest.batches.iter()
+            .filter(|info| {
+                (info.status == "ok" && info.hw_status == "ok" && info.emu_status == "ok")
+                    || (info.status.is_empty() && info.hw_status.is_empty() && info.emu_status.is_empty())
+            })
+            .map(|info| {
+                let batch_dir = sweep_dir.join(format!("batch_{:02}", info.batch));
+                let hw = batch_dir.join("hw").join("trace.events.json");
+                let emu = batch_dir.join("emu").join("trace.events.json");
+                (info.batch, hw, emu)
+            })
+            .collect();
+        &discovered
+    };
+
     let mut batch_results = Vec::new();
 
-    for info in &manifest.batches {
-        if info.status != "ok" || info.hw_status != "ok" || info.emu_status != "ok" {
-            continue;
-        }
+    for (batch_idx, hw_events, emu_events) in batch_triples {
+        let batch_idx = *batch_idx;
+        let batch_dir = sweep_dir.join(format!("batch_{:02}", batch_idx));
 
-        let batch_dir = sweep_dir.join(format!("batch_{:02}", info.batch));
-        // Sweep mode expects per-batch events JSONs produced upstream
-        // (tools/parse-trace.py). The legacy layout put raw .bin files here;
-        // the sweep orchestrator now writes .events.json alongside.
-        let hw_events = batch_dir.join("hw").join("trace.events.json");
-        let emu_events = batch_dir.join("emu").join("trace.events.json");
-
+        // hw_events / emu_events come from the discovery step above; verify
+        // they still exist before reading (race-free on the hot path).
         if !hw_events.exists() || !emu_events.exists() {
             continue;
         }
@@ -2540,10 +2605,10 @@ pub fn compare_sweep_dir_with_opts(
             EventsConfig::default()
         };
 
-        match compare_batch_with_opts(&hw_events, &emu_events, &config, info.batch, opts) {
+        match compare_batch_with_opts(hw_events, emu_events, &config, batch_idx, opts) {
             Ok(result) => batch_results.push(result),
             Err(e) => {
-                eprintln!("Warning: batch {} failed: {}", info.batch, e);
+                eprintln!("Warning: batch {} failed: {}", batch_idx, e);
             }
         }
     }

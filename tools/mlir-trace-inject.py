@@ -242,14 +242,29 @@ def _emit_perfcnt_config(
     """Emit an aie.trace.config block that programs the performance counter.
 
     The config block contains three aie.trace.reg ops:
-      Performance_Control0  Cnt0_Start_Event = 28 (ACTIVE -- core executing)
-      Performance_Control1  Cnt0_Reset_Event = 5  (PERF_CNT_0 -- self-reset on fire)
-      Performance_Counter0_Event_Value      = period (cycles between fires)
+      Performance_Control0  raw = 28  (Cnt0_Start_Event = 28 = ACTIVE, bits[6:0])
+      Performance_Control2  raw = 5   (Cnt0_Reset_Event = 5 = PERF_CNT_0, bits[6:0])
+      Performance_Counter0_Event_Value = period (cycles between fires)
 
-    Hardware derivation:
-      - Start event 28 = ACTIVE per AM020/AM025; counts only while core executes.
-      - Reset event 5 = PERF_CNT_0_EVENT per AM020; free-running with self-reset.
+    Hardware derivation (aie-rt xaiemlgbl_params.h):
+      - Performance_Control0 Cnt0_Start_Event at bits[6:0]: event 28 = ACTIVE,
+        counts only while core is executing.
+      - Performance_Control2 Cnt0_Reset_Event at bits[6:0]: event 5 = PERF_CNT_0,
+        self-resets the counter on every fire.
       - Period = user-specified via --perfcnt-period (default 1024).
+
+    NOTE: Performance_Control{0,1,2} have no named fields in the aie-rt regdb
+    (aie_registers_aie2.json), so field= cannot be used with mlir-aie's
+    AIETraceRegPackWritesPass -- it would fail with "Field not found in register".
+    We write raw integer values instead; the AIEXInlineTraceConfig pass generates
+    a full-register write32 with the value placed at bits[6:0] (the pre-shifted
+    raw encoding for these start/reset event fields).
+
+    The correct register mapping per aie-rt (XAIEMLGBL_CORE_MODULE_PERFORMANCE_*):
+      Performance_Control0: Cnt0_Start_Event [6:0], Cnt0_Stop_Event [15:8],
+                            Cnt1_Start_Event [22:16], Cnt1_Stop_Event [31:24]
+      Performance_Control2: Cnt0_Reset_Event [6:0], Cnt1_Reset_Event [15:8],
+                            Cnt2_Reset_Event [22:16], Cnt3_Reset_Event [31:24]
 
     Lowering: mlir-aie's AIEXInlineTraceConfig pass translates each trace.reg
     into npu.write32 ops in the runtime sequence. No new dialect ops required.
@@ -269,13 +284,13 @@ def _emit_perfcnt_config(
     cfg_region = cfg.operation.regions[0]
     cfg_block = cfg_region.blocks.append()
     with InsertionPoint.at_block_begin(cfg_block):
-        # Start counting on ACTIVE (event 28): core is executing.
-        # stop_event = 0 (no stop).
-        aied.trace_reg("Performance_Control0", mk_i32(28),
-                       field="Cnt0_Start_Event")
-        # Self-reset: when PERF_CNT_0 fires (event 5), zero the counter.
-        aied.trace_reg("Performance_Control1", mk_i32(5),
-                       field="Cnt0_Reset_Event")
+        # Cnt0_Start_Event = 28 (ACTIVE) at bits[6:0] of Performance_Control0.
+        # Raw value 28 writes only the LSB 7 bits; stop_event=0, cnt1 fields=0.
+        # field= is NOT used: the aie2 regdb has no named fields for these regs.
+        aied.trace_reg("Performance_Control0", mk_i32(28))
+        # Cnt0_Reset_Event = 5 (PERF_CNT_0) at bits[6:0] of Performance_Control2.
+        # Counter resets itself every `period` active cycles (self-reset loop).
+        aied.trace_reg("Performance_Control2", mk_i32(5))
         # Counter threshold: fires every `period` active cycles.
         aied.trace_reg("Performance_Counter0_Event_Value", mk_i32(period))
         # Explicit terminator required by SingleBlockImplicitTerminator<EndOp>.

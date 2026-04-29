@@ -90,6 +90,7 @@ VERBOSE=false
 COMPILER_MODE="both"  # "both", "chess", "peano"
 NO_TRACE="${NO_TRACE:-true}"
 SWEEP=false
+PC_ANCHORED=false
 RUN_AIESIM=false
 NO_TIMEOUT=false
 WITH_HW_CYCLES=${WITH_HW_CYCLES:-false}
@@ -124,6 +125,7 @@ while [[ $# -gt 0 ]]; do
     --no-trace)            NO_TRACE=true; shift ;;
     --trace)               NO_TRACE=false; shift ;;
     --sweep)               SWEEP=true; shift ;;
+    --trace=pc-anchored)   PC_ANCHORED=true; shift ;;
     --aiesim)              RUN_AIESIM=true; shift ;;
     --serial-hw)           NPU_HW_JOBS=1; shift ;;
     --parallel-hw)         NPU_HW_JOBS="${NPU_HW_JOBS_PARALLEL:-5}"; shift ;;
@@ -141,6 +143,11 @@ Options:
   --trace         Enable trace injection and comparison (default: off)
   --no-trace      Disable trace preparation (default; kept for back-compat)
   --sweep         Run full event sweep (trace-sweep.py) on passing tests after runs
+  --trace=pc-anchored
+                  Run mode-1 (event_pc) lockstep sweep on passing tests and
+                  produce a PC-anchored HW/EMU comparison report per test.
+                  Auto-detects compute tiles from the MLIR source. Outputs go
+                  to RESULTS_DIR/<test>.<compiler>.pc-anchored/.
   --aiesim        Run aiesimulator on Chess builds + VCD coverage audit
   --list          List available tests and exit
   -jN             Override parallelism (default: nproc)
@@ -188,7 +195,7 @@ for _c in "${COMPILERS[@]}"; do
 done
 
 # Export variables that parallel jobs need.
-export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP RUN_AIESIM NO_TIMEOUT WITH_HW_CYCLES WITH_CYCLE_DIFF
+export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP PC_ANCHORED RUN_AIESIM NO_TIMEOUT WITH_HW_CYCLES WITH_CYCLE_DIFF
 export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT SCRIPT_DIR TRACE_QUARANTINE_FILE
 export XRT_DIR XRT_INCLUDE XRT_LIB
 export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
@@ -2872,6 +2879,123 @@ main() {
       done
     else
       info "Phase 5b: no tests eligible for sweep"
+    fi
+  fi
+
+  # ---- Phase 5b': PC-anchored sweep (optional) ----------------------------
+  #
+  # Runs a mode-1 (event_pc) lockstep sweep on passing tests and produces a
+  # PC-anchored HW/EMU coverage report.  Requires --trace=pc-anchored.
+  #
+  # Tile discovery: greps the test's aie.mlir for aie.tile(col, row) lines
+  # where row >= 2 (compute rows) and formats them as col:row:core.  If no
+  # compute tiles are found the test is skipped with a warning.
+  #
+  # Grounding: PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1 (default for mode-1).
+  # The sweep uses --reuse-ctx to cut per-batch latency on Phoenix.
+
+  if [[ "$PC_ANCHORED" == "true" ]]; then
+    local tc_bin=""
+    if [[ -x "$EMU_ROOT/target/release/trace-compare" ]]; then
+      tc_bin="$EMU_ROOT/target/release/trace-compare"
+    elif [[ -x "$EMU_ROOT/target/debug/trace-compare" ]]; then
+      tc_bin="$EMU_ROOT/target/debug/trace-compare"
+    fi
+
+    if [[ -z "$tc_bin" ]]; then
+      info "Phase 5b': SKIP -- trace-compare binary not found (cargo build --release --bin trace-compare)"
+    else
+      # Collect passing tests (same eligibility as Phase 5b sweep).
+      local pa_targets=()
+      declare -A _pa_seen=()
+      for entry in "${all_jobs[@]}"; do
+        local pa_name pa_compiler pa_vsuffix
+        pa_name="$(_job_name "$entry")"
+        pa_compiler="$(_job_compiler "$entry")"
+        pa_vsuffix="$(_job_vsuffix "$entry")"
+        [[ -n "${_pa_seen[$pa_name]+x}" ]] && continue
+        is_trace_quarantined "$pa_name" && continue
+        local pa_safe
+        pa_safe="$(sanitize_name "$pa_name")"
+        local pa_found=false
+        for suffix in hw bridge; do
+          local rf="$RESULTS_DIR/${pa_safe}${pa_vsuffix}.${pa_compiler}.${suffix}.result"
+          if [[ -f "$rf" ]] && [[ "$(< "$rf")" == "PASS" ]]; then
+            pa_found=true
+            break
+          fi
+        done
+        $pa_found && { pa_targets+=("$pa_name"); _pa_seen["$pa_name"]=1; }
+      done
+
+      if [[ ${#pa_targets[@]} -gt 0 ]]; then
+        info "Phase 5b': PC-anchored sweep for ${#pa_targets[@]} test(s)"
+        for name in "${pa_targets[@]}"; do
+          local safe
+          safe="$(sanitize_name "$name")"
+          local src_dir="$TEST_SRC/$name"
+
+          # Discover compute tiles from aie.mlir:
+          #   grep for  aie.tile(col, row)  where row >= 2
+          local mlir_src="$src_dir/aie.mlir"
+          local tile_spec=""
+          if [[ -f "$mlir_src" ]]; then
+            tile_spec="$(grep -oP 'aie\.tile\(\K[0-9]+,\s*[0-9]+(?=\))' "$mlir_src" \
+              | awk -F',' '{ col=$1; row=$2+0; if(row>=2) { printf "%s%d:%d:core", sep, col, row; sep="," } }' \
+              | sed 's/ //g')"
+          fi
+          if [[ -z "$tile_spec" ]]; then
+            echo "  PC-ANCHORED $name: SKIP -- no compute tiles found in $mlir_src"
+            continue
+          fi
+
+          for compiler in "${compilers[@]}"; do
+            local build_dir="$BUILD_BASE/$name/$compiler"
+            local sweep_dir="$RESULTS_DIR/${safe}.${compiler}.pc-anchored"
+            local sweep_log="$RESULTS_DIR/${safe}.${compiler}.pc-anchored.sweep.log"
+            local report="$RESULTS_DIR/${safe}.${compiler}.pc-anchored.report.txt"
+
+            # Skip if this compiler didn't compile successfully.
+            local cr="FAIL"
+            [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] && \
+              cr="$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")"
+            [[ "$cr" != "OK" ]] && continue
+
+            [[ -f "$build_dir/insts.bin" ]] || continue
+
+            local sweep_args=(
+              --test "$name"
+              --compiler "$compiler"
+              --tiles "$tile_spec"
+              --out-dir "$sweep_dir"
+              --mode event_pc
+              --core-grounding "PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1"
+              --with-mode2-baseline
+              --reuse-ctx
+            )
+            $RUN_HW || sweep_args+=(--no-hw)
+            $RUN_EMU || sweep_args+=(--no-emu)
+
+            echo "  PC-ANCHORED sweep $name ($compiler) ..."
+            if python3 "$EMU_ROOT/tools/trace-sweep.py" "${sweep_args[@]}" \
+                > "$sweep_log" 2>&1; then
+              echo "  PC-ANCHORED sweep $name ($compiler): OK"
+              # Run trace-compare --pc-anchored on the sweep output.
+              if "$tc_bin" --sweep "$sweep_dir" --pc-anchored -o "$report" 2>&1; then
+                local top_event
+                top_event="$(grep 'set_diff' "$report" | sort -t= -k2 -rn | head -1 | awk '{print $1}')"
+                echo "  PC-ANCHORED compare $name ($compiler): OK (top event: ${top_event:-none}; report: $report)"
+              else
+                echo "  PC-ANCHORED compare $name ($compiler): FAIL (see $report)"
+              fi
+            else
+              echo "  PC-ANCHORED sweep $name ($compiler): FAIL (see $sweep_log)"
+            fi
+          done
+        done
+      else
+        info "Phase 5b': no tests eligible for PC-anchored sweep"
+      fi
     fi
   fi
 

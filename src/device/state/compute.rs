@@ -277,13 +277,24 @@ impl DeviceState {
         use xdna_archspec::types::DmaDirection;
 
         let reg_layout = regdb::device_reg_layout();
-        let lay = &reg_layout.memory_channel;
 
         // Per-tile S2MM count -- the boundary between S2MM and MM2S in
         // the tile's flat dma_channels vector.  Compute=2, memtile=6,
         // shim=2 per AIE2 archspec; routing through ArchConfig keeps
         // AIE2P/AIE1 ports correct without code changes.
         let tile_kind = self.array.arch().tile_kind(col, row);
+
+        // Use the per-tile-kind channel field layout so that Start_BD_ID
+        // is extracted with the correct bit width.  Compute and shim have
+        // a 4-bit BD index (16 BDs), MemTile has a 6-bit BD index (48 BDs).
+        // Using the compute layout for MemTile truncates bits [5:4], turning
+        // BD 24 into 8, BD 26 into 10, etc., causing the engine to reject
+        // the combination as an "invalid BD-channel" constraint violation.
+        let lay = if tile_kind.is_mem() {
+            &reg_layout.memtile_channel
+        } else {
+            &reg_layout.memory_channel
+        };
         let num_s2mm = self.array.arch().dma_s2mm_channels(tile_kind);
         let ch_idx = match dir {
             DmaDirection::S2mm => channel as usize,
