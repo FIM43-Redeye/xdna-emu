@@ -60,6 +60,7 @@ Usage
 """
 import argparse
 import io
+import json
 import struct
 import sys
 from pathlib import Path
@@ -365,11 +366,20 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("input", help="path to compiled insts.bin")
-    ap.add_argument("--col", type=int, required=True, help="absolute tile column")
-    ap.add_argument("--row", type=int, required=True, help="absolute tile row")
-    ap.add_argument("--tile-type", required=True,
+    ap.add_argument("--multi-tile", type=Path, default=None,
+                    help="JSON file containing a list of patch specs: "
+                         "[{col, row, tile_type, events?, start_event?, "
+                         "stop_event?, mode?}, ...]. Applies all patches in "
+                         "one process invocation (avoids per-tile subprocess "
+                         "overhead in trace-sweep). Mutually exclusive with "
+                         "--col/--row/--tile-type.")
+    ap.add_argument("--col", type=int, default=None,
+                    help="absolute tile column (single-tile mode)")
+    ap.add_argument("--row", type=int, default=None,
+                    help="absolute tile row (single-tile mode)")
+    ap.add_argument("--tile-type", default=None,
                     choices=sorted(_TRACE_EVENT_REGS),
-                    help="tile-type event-register set to patch")
+                    help="tile-type event-register set to patch (single-tile mode)")
     ap.add_argument("--events", default=None,
                     help="comma-separated event IDs (decimal or 0xHEX), "
                          "up to 8; missing trailing slots default to 0. "
@@ -390,6 +400,47 @@ def main() -> int:
                          "(0=event-time, 1=event-PC, 2=instr-exec)")
     ap.add_argument("--output", required=True, help="path to write patched insts.bin")
     args = ap.parse_args()
+
+    # --multi-tile: batch mode -- one invocation, N tile patches.
+    if args.multi_tile is not None:
+        if any(x is not None for x in [args.col, args.row, args.tile_type]):
+            ap.error("--multi-tile is mutually exclusive with --col/--row/--tile-type")
+        spec_list = json.loads(args.multi_tile.read_text())
+        data = Path(args.input).read_bytes()
+        summaries: list[str] = []
+        try:
+            for s in spec_list:
+                col = int(s["col"]); row = int(s["row"])
+                tile_type = s["tile_type"]
+                if "events" in s:
+                    events = _parse_events_arg(
+                        ",".join(str(e) for e in s["events"])
+                    )
+                    data, n = patch_events(data, col, row, tile_type, events)
+                    summaries.append(
+                        f"({col},{row},{tile_type}) events={events} ({n})"
+                    )
+                if any(k in s for k in ("start_event", "stop_event", "mode")):
+                    data, n = patch_trace_control(
+                        data, col, row, tile_type,
+                        start_event=s.get("start_event"),
+                        stop_event=s.get("stop_event"),
+                        mode=s.get("mode"),
+                    )
+                    summaries.append(f"({col},{row},{tile_type}) control ({n})")
+        except ValueError as e:
+            print(f"trace-patch-events: {e}", file=sys.stderr)
+            return 2
+        Path(args.output).write_bytes(data)
+        print("trace-patch-events multi-tile: " + (
+            "; ".join(summaries) if summaries else "(no patches)"
+        ))
+        return 0
+
+    # Single-tile mode: validate that required args are present.
+    if args.col is None or args.row is None or args.tile_type is None:
+        ap.error("single-tile mode requires --col, --row, and --tile-type "
+                 "(or use --multi-tile for batch patching)")
 
     if (args.events is None and args.start_event is None
             and args.stop_event is None and args.mode is None):
