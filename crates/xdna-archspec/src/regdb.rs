@@ -122,7 +122,11 @@ impl BitField {
     /// Build a BitField from LSB and MSB bit positions.
     pub fn from_range(name: String, lsb: u8, msb: u8) -> Self {
         let width = msb - lsb + 1;
-        let mask = if width >= 32 { u32::MAX } else { (1u32 << width) - 1 };
+        let mask = if width >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << width) - 1
+        };
         Self { name, lsb, msb, width, mask, shift: lsb }
     }
 }
@@ -207,7 +211,8 @@ impl ModuleDef {
     /// Iterate over (offset, reset_value) pairs for registers with non-zero
     /// reset values.
     pub fn non_zero_reset_values(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.registers.iter()
+        self.registers
+            .iter()
             .filter(|r| r.reset_value != 0)
             .map(|r| (r.offset, r.reset_value))
     }
@@ -230,8 +235,8 @@ pub struct RegisterDb {
 impl RegisterDb {
     /// Load a register database from a JSON file.
     pub fn from_file(path: &Path) -> Result<Self, String> {
-        let data = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        let data =
+            std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
         Self::from_json(&data)
     }
 
@@ -249,7 +254,9 @@ impl RegisterDb {
             for raw_reg in raw_module.registers {
                 let offset = parse_hex_offset(&raw_reg.offset)?;
 
-                let fields: Vec<BitField> = raw_reg.bit_fields.iter()
+                let fields: Vec<BitField> = raw_reg
+                    .bit_fields
+                    .iter()
                     .filter(|f| f.name != "Reserved")
                     .map(|f| {
                         if f.bit_range.len() != 2 {
@@ -265,12 +272,8 @@ impl RegisterDb {
                     .collect::<Result<Vec<_>, _>>()?;
 
                 let width = raw_reg.width.unwrap_or(32);
-                let access = AccessMode::from_json(
-                    raw_reg.access_type.as_deref().unwrap_or("rwNormal")
-                );
-                let reset_value = raw_reg.reset.as_deref()
-                    .map(parse_reset_value)
-                    .unwrap_or(0);
+                let access = AccessMode::from_json(raw_reg.access_type.as_deref().unwrap_or("rwNormal"));
+                let reset_value = raw_reg.reset.as_deref().map(parse_reset_value).unwrap_or(0);
 
                 let idx = registers.len();
                 register_index.insert(raw_reg.name.clone(), idx);
@@ -285,17 +288,10 @@ impl RegisterDb {
                 });
             }
 
-            modules.insert(mod_name.clone(), ModuleDef {
-                name: mod_name,
-                registers,
-                register_index,
-            });
+            modules.insert(mod_name.clone(), ModuleDef { name: mod_name, registers, register_index });
         }
 
-        Ok(Self {
-            version: raw.version,
-            modules,
-        })
+        Ok(Self { version: raw.version, modules })
     }
 
     /// Get a module by name.
@@ -310,18 +306,17 @@ impl RegisterDb {
 /// offset (the lower portion). Since tile-local offsets fit in u32, we parse
 /// as u64 then truncate.
 fn parse_hex_offset(s: &str) -> Result<u32, String> {
-    let hex_str = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))
+    let hex_str = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
         .ok_or_else(|| format!("Expected hex string, got: {}", s))?;
-    let full = u64::from_str_radix(hex_str, 16)
-        .map_err(|e| format!("Invalid hex '{}': {}", s, e))?;
+    let full = u64::from_str_radix(hex_str, 16).map_err(|e| format!("Invalid hex '{}': {}", s, e))?;
     Ok(full as u32)
 }
 
 /// Parse a hex reset value string like "0x000006DB" into a u32.
 fn parse_reset_value(s: &str) -> u32 {
-    let hex_str = s.strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-        .unwrap_or(s);
+    let hex_str = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
     u32::from_str_radix(hex_str, 16).unwrap_or(0)
 }
 

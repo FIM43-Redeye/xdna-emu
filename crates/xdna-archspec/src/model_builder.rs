@@ -113,8 +113,8 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
     for tile_type in &mut model.tile_types {
         if let Some(ref mut mem) = tile_type.memory {
             let (num_banks, bank_size) = match tile_type.kind {
-                TileKind::Compute => (8u8, 8 * 1024u64),   // 64KB / 8 banks
-                TileKind::Mem => (16u8, 32 * 1024u64),     // 512KB / 16 banks
+                TileKind::Compute => (8u8, 8 * 1024u64), // 64KB / 8 banks
+                TileKind::Mem => (16u8, 32 * 1024u64),   // 512KB / 16 banks
                 _ => continue,
             };
             if mem.physical.is_none() {
@@ -139,10 +139,10 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
     for tile_type in &mut model.tile_types {
         if tile_type.kind == TileKind::Compute {
             tile_type.core_address_map = Some(CoreAddressMap {
-                data_mem_addr: 0x40000,   // AieMlCoreMod.DataMemAddr
-                data_mem_shift: 16,       // AieMlCoreMod.DataMemShift
-                is_checkerboard: false,   // AieMlCoreMod.IsCheckerBoard = 0
-                program_mem_host_offset: 0x20000,  // XAIEMLGBL_CORE_MODULE_PROGRAM_MEMORY
+                data_mem_addr: 0x40000,           // AieMlCoreMod.DataMemAddr
+                data_mem_shift: 16,               // AieMlCoreMod.DataMemShift
+                is_checkerboard: false,           // AieMlCoreMod.IsCheckerBoard = 0
+                program_mem_host_offset: 0x20000, // XAIEMLGBL_CORE_MODULE_PROGRAM_MEMORY
                 source: addr_src.clone(),
             });
         }
@@ -150,11 +150,7 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
 
     // -- Timing model --
     model.timing = Some(TimingModel {
-        lock: LockTiming {
-            acquire_latency: 1,
-            release_latency: 1,
-            retry_interval: 1,
-        },
+        lock: LockTiming { acquire_latency: 1, release_latency: 1, retry_interval: 1 },
         dma: DmaTiming {
             bd_setup_cycles: 4,
             channel_start_cycles: 2,
@@ -177,10 +173,7 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             external_to_local_latency: 3,
             packet_arbitration_overhead: 1,
         },
-        instruction: InstructionTiming {
-            data_memory_latency: 5,
-            branch_penalty: 3,
-        },
+        instruction: InstructionTiming { data_memory_latency: 5, branch_penalty: 3 },
         source: src.clone(),
     });
 
@@ -210,12 +203,7 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             op_write_incr: 2,
             op_block_write: 3,
         },
-        fot: FotConfig {
-            disabled: 0,
-            no_counts: 1,
-            counts_with_tokens: 2,
-            counts_from_register: 3,
-        },
+        fot: FotConfig { disabled: 0, no_counts: 1, counts_with_tokens: 2, counts_from_register: 3 },
         source: src.clone(),
     });
 
@@ -257,11 +245,7 @@ mod tests {
     use types::*;
 
     fn test_source(origin: Source, detail: &str) -> SourceAttribution {
-        SourceAttribution {
-            origin,
-            file: "test".into(),
-            detail: detail.into(),
-        }
+        SourceAttribution { origin, file: "test".into(), detail: detail.into() }
     }
 
     /// Build a minimal ArchModel with one tile type, one module, and one
@@ -279,11 +263,7 @@ mod tests {
             offset_end: Confirmed::new(offset_start + 0x1000, src.clone()),
             registers: vec![],
         };
-        let module = ModuleModel {
-            kind: mod_kind,
-            subsystems: vec![subsystem],
-            source: src.clone(),
-        };
+        let module = ModuleModel { kind: mod_kind, subsystems: vec![subsystem], source: src.clone() };
         let tile = TileTypeModel {
             kind: tile_kind,
             name: format!("{:?}", tile_kind),
@@ -320,12 +300,8 @@ mod tests {
 
     #[test]
     fn confirm_subsystem_ranges_matching_value_adds_source() {
-        let mut model = minimal_model_with_subsystem(
-            TileKind::Compute,
-            ModuleKind::Memory,
-            SubsystemKind::Dma,
-            0x1D000,
-        );
+        let mut model =
+            minimal_model_with_subsystem(TileKind::Compute, ModuleKind::Memory, SubsystemKind::Dma, 0x1D000);
 
         // Before confirmation: 1 source (AM025)
         let dma = &model.tile_types[0].modules[0].subsystems[0];
@@ -351,12 +327,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "GRAPH CONFLICT")]
     fn confirm_subsystem_ranges_mismatched_value_panics() {
-        let mut model = minimal_model_with_subsystem(
-            TileKind::Compute,
-            ModuleKind::Memory,
-            SubsystemKind::Dma,
-            0x1D000,
-        );
+        let mut model =
+            minimal_model_with_subsystem(TileKind::Compute, ModuleKind::Memory, SubsystemKind::Dma, 0x1D000);
 
         // Confirm with WRONG aie-rt value -- should panic
         let confirmations = vec![(
@@ -371,12 +343,8 @@ mod tests {
 
     #[test]
     fn confirm_subsystem_ranges_missing_tile_skips_gracefully() {
-        let mut model = minimal_model_with_subsystem(
-            TileKind::Compute,
-            ModuleKind::Memory,
-            SubsystemKind::Dma,
-            0x1D000,
-        );
+        let mut model =
+            minimal_model_with_subsystem(TileKind::Compute, ModuleKind::Memory, SubsystemKind::Dma, 0x1D000);
 
         // Try to confirm a tile type that doesn't exist -- should skip
         let confirmations = vec![(
@@ -395,12 +363,8 @@ mod tests {
 
     #[test]
     fn confirm_subsystem_ranges_missing_subsystem_skips_gracefully() {
-        let mut model = minimal_model_with_subsystem(
-            TileKind::Compute,
-            ModuleKind::Memory,
-            SubsystemKind::Dma,
-            0x1D000,
-        );
+        let mut model =
+            minimal_model_with_subsystem(TileKind::Compute, ModuleKind::Memory, SubsystemKind::Dma, 0x1D000);
 
         // Try to confirm a subsystem that doesn't exist in this module
         let confirmations = vec![(

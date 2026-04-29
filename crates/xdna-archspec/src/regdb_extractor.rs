@@ -17,9 +17,9 @@
 use crate::regdb;
 use crate::types::{
     Access, BdFieldRole, BdFieldSpec, BdSchema, BitRange, Confirmed, DmaChannelFieldRole,
-    DmaChannelFieldSpec, DmaChannelRegKind, DmaChannelSchema, DmaDirection, FieldModel,
-    FieldSemantics, ModuleKind, ModuleModel, RegisterModel, Relationship, Source,
-    SourceAttribution, SubsystemKind, SubsystemModel, TileKind,
+    DmaChannelFieldSpec, DmaChannelRegKind, DmaChannelSchema, DmaDirection, FieldModel, FieldSemantics,
+    ModuleKind, ModuleModel, RegisterModel, Relationship, Source, SourceAttribution, SubsystemKind,
+    SubsystemModel, TileKind,
 };
 
 // ============================================================================
@@ -108,10 +108,7 @@ pub struct SubsystemProfile {
 /// Given all registers belonging to a single subsystem (e.g., all lock
 /// registers in a module), groups them, classifies each, and derives
 /// behavioral properties.
-pub fn build_subsystem_profile(
-    subsystem: &str,
-    registers: &[regdb::RegisterDef],
-) -> SubsystemProfile {
+pub fn build_subsystem_profile(subsystem: &str, registers: &[regdb::RegisterDef]) -> SubsystemProfile {
     let groups = group_registers(registers);
 
     // Build a set of register names that belong to groups, so we can
@@ -288,12 +285,7 @@ pub fn group_registers(registers: &[regdb::RegisterDef]) -> Vec<RegisterGroup> {
         // Collect field names from the first register (shared across group)
         let field_names: Vec<String> = regs[0].fields.iter().map(|f| f.name.clone()).collect();
 
-        groups.push(RegisterGroup {
-            pattern,
-            base_offset,
-            dimensions,
-            field_names,
-        });
+        groups.push(RegisterGroup { pattern, base_offset, dimensions, field_names });
     }
 
     groups
@@ -362,16 +354,9 @@ fn placeholder_count(pattern: &str) -> usize {
 ///    where all offsets are uniformly spaced. Uses the number of `{}`
 ///    placeholders in the pattern to know dimensionality, then extracts
 ///    actual index values to determine group sizes.
-fn detect_dimensions(
-    regs: &[&regdb::RegisterDef],
-    offsets: &[u32],
-    pattern: &str,
-) -> Vec<IndexDimension> {
+fn detect_dimensions(regs: &[&regdb::RegisterDef], offsets: &[u32], pattern: &str) -> Vec<IndexDimension> {
     if offsets.len() < 2 {
-        return vec![IndexDimension {
-            count: offsets.len() as u32,
-            stride: 0,
-        }];
+        return vec![IndexDimension { count: offsets.len() as u32, stride: 0 }];
     }
 
     // Compute consecutive deltas
@@ -398,10 +383,7 @@ fn detect_dimensions(
     }
 
     // Fallback: flat 1D
-    vec![IndexDimension {
-        count: offsets.len() as u32,
-        stride: inner_stride,
-    }]
+    vec![IndexDimension { count: offsets.len() as u32, stride: inner_stride }]
 }
 
 /// Detect 2D structure from stride breaks in the offset sequence.
@@ -435,14 +417,8 @@ fn detect_dimensions_by_stride_break(
     debug_assert_eq!(outer_count * inner_count, offsets.len() as u32);
 
     Some(vec![
-        IndexDimension {
-            count: outer_count,
-            stride: outer_stride,
-        },
-        IndexDimension {
-            count: inner_count,
-            stride: inner_stride,
-        },
+        IndexDimension { count: outer_count, stride: outer_stride },
+        IndexDimension { count: inner_count, stride: inner_stride },
     ])
 }
 
@@ -464,10 +440,7 @@ fn detect_dimensions_by_index_extraction(
         if indices.len() < 2 {
             return None;
         }
-        by_first_index
-            .entry(indices[0])
-            .or_default()
-            .push(reg.offset);
+        by_first_index.entry(indices[0]).or_default().push(reg.offset);
     }
 
     let groups: Vec<&Vec<u32>> = by_first_index.values().collect();
@@ -494,14 +467,8 @@ fn detect_dimensions_by_index_extraction(
     };
 
     Some(vec![
-        IndexDimension {
-            count: outer_count,
-            stride: outer_stride,
-        },
-        IndexDimension {
-            count: inner_count,
-            stride: inner_stride,
-        },
+        IndexDimension { count: outer_count, stride: outer_stride },
+        IndexDimension { count: inner_count, stride: inner_stride },
     ])
 }
 
@@ -532,10 +499,7 @@ pub fn register_def_to_model(reg: &regdb::RegisterDef, module_name: &str) -> Reg
         .iter()
         .map(|f| FieldModel {
             name: f.name.clone(),
-            bits: BitRange::Contiguous {
-                msb: f.msb,
-                lsb: f.lsb,
-            },
+            bits: BitRange::Contiguous { msb: f.msb, lsb: f.lsb },
             meaning: FieldSemantics::Unknown,
             source: SourceAttribution {
                 origin: Source::Am025Json,
@@ -630,9 +594,7 @@ pub fn populate_subsystems(module: &mut ModuleModel, registers: Vec<RegisterMode
     }
 
     // Sort subsystems by offset_start for deterministic ordering
-    module
-        .subsystems
-        .sort_by_key(|s| *s.offset_start.value());
+    module.subsystems.sort_by_key(|s| *s.offset_start.value());
 }
 
 // ============================================================================
@@ -661,9 +623,7 @@ pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
     let mut new_edges: Vec<Relationship> = Vec::new();
 
     for tile_type in &mut model.tile_types {
-        let mapping = TILE_MODULE_MAP
-            .iter()
-            .find(|(name, _)| *name == tile_type.name);
+        let mapping = TILE_MODULE_MAP.iter().find(|(name, _)| *name == tile_type.name);
 
         if let Some((_, module_pairs)) = mapping {
             for &(kind, am025_name) in *module_pairs {
@@ -689,11 +649,8 @@ pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
                     //        Register -> RegisterField (Contains),
                     //        Register -> Subsystem (BelongsTo)
                     for reg in &module_def.registers {
-                        let reg_node = NodeId::Register {
-                            tile: tile_type.kind,
-                            module: kind,
-                            name: reg.name.clone(),
-                        };
+                        let reg_node =
+                            NodeId::Register { tile: tile_type.kind, module: kind, name: reg.name.clone() };
 
                         new_edges.push(Relationship {
                             from: NodeId::Module { tile: tile_type.kind, module: kind },
@@ -744,16 +701,10 @@ pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
                         };
                         match profile.kind {
                             SubsystemKind::Lock => {
-                                tile_type.instances.locks.confirm(
-                                    profile.instance_count as u8,
-                                    am025_source,
-                                );
+                                tile_type.instances.locks.confirm(profile.instance_count as u8, am025_source);
                             }
                             SubsystemKind::Dma => {
-                                tile_type.instances.bds.confirm(
-                                    profile.instance_count as u8,
-                                    am025_source,
-                                );
+                                tile_type.instances.bds.confirm(profile.instance_count as u8, am025_source);
                             }
                             _ => {}
                         }
@@ -762,12 +713,8 @@ pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
                     // Extract BD schema from DMA BD registers if this
                     // module contains them and we haven't extracted one yet.
                     if tile_type.bd_schema.is_none() {
-                        let (schema, edges) = extract_bd_schema(
-                            &module_def.registers,
-                            am025_name,
-                            tile_type.kind,
-                            kind,
-                        );
+                        let (schema, edges) =
+                            extract_bd_schema(&module_def.registers, am025_name, tile_type.kind, kind);
                         tile_type.bd_schema = schema;
                         new_edges.extend(edges);
                     }
@@ -775,12 +722,8 @@ pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
                     // Extract DMA channel schema from channel control/status
                     // registers if this module contains them.
                     if tile_type.channel_schema.is_none() {
-                        let (schema, edges) = extract_channel_schema(
-                            &module_def.registers,
-                            am025_name,
-                            tile_type.kind,
-                            kind,
-                        );
+                        let (schema, edges) =
+                            extract_channel_schema(&module_def.registers, am025_name, tile_type.kind, kind);
                         tile_type.channel_schema = schema;
                         new_edges.extend(edges);
                     }
@@ -792,14 +735,15 @@ pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
         // cross-resource References edges between schemas and subsystems.
         // We need to find the module kind that contains the DMA subsystem
         // to correctly address the Lock subsystem node.
-        let dma_module_kind = TILE_MODULE_MAP
-            .iter()
-            .find(|(name, _)| *name == tile_type.name)
-            .and_then(|(_, pairs)| {
-                // The module containing DMA registers (Memory for compute,
-                // MemTile for memtile, Shim for shim).
-                pairs.iter().find(|(_, am025)| *am025 != "core").map(|(k, _)| *k)
-            });
+        let dma_module_kind =
+            TILE_MODULE_MAP
+                .iter()
+                .find(|(name, _)| *name == tile_type.name)
+                .and_then(|(_, pairs)| {
+                    // The module containing DMA registers (Memory for compute,
+                    // MemTile for memtile, Shim for shim).
+                    pairs.iter().find(|(_, am025)| *am025 != "core").map(|(k, _)| *k)
+                });
 
         if let Some(mod_kind) = dma_module_kind {
             new_edges.extend(emit_cross_reference_edges(
@@ -881,10 +825,8 @@ fn extract_bd_schema(
     use crate::types::{NodeId, Relationship, RelationshipKind};
 
     // Find all BD0 registers: DMA_BD0_0, DMA_BD0_1, ... sorted by offset.
-    let mut bd0_regs: Vec<&regdb::RegisterDef> = registers
-        .iter()
-        .filter(|r| r.name.starts_with("DMA_BD0_"))
-        .collect();
+    let mut bd0_regs: Vec<&regdb::RegisterDef> =
+        registers.iter().filter(|r| r.name.starts_with("DMA_BD0_")).collect();
 
     if bd0_regs.is_empty() {
         return (None, Vec::new());
@@ -906,10 +848,7 @@ fn extract_bd_schema(
         for field_def in &reg.fields {
             let role = bd_field_name_to_role(&field_def.name);
             let bits = if field_def.msb >= field_def.lsb {
-                BitRange::Contiguous {
-                    msb: field_def.msb as u8,
-                    lsb: field_def.lsb as u8,
-                }
+                BitRange::Contiguous { msb: field_def.msb as u8, lsb: field_def.lsb as u8 }
             } else {
                 BitRange::Contiguous { msb: 0, lsb: 0 }
             };
@@ -924,10 +863,7 @@ fn extract_bd_schema(
             // Emit DerivedFrom edge for non-Reserved fields.
             if role != BdFieldRole::Reserved {
                 edges.push(Relationship {
-                    from: NodeId::BdField {
-                        tile: tile_kind,
-                        role,
-                    },
+                    from: NodeId::BdField { tile: tile_kind, role },
                     to: NodeId::RegisterField {
                         tile: tile_kind,
                         module: module_kind,
@@ -1056,9 +992,7 @@ fn channel_field_name_to_role(name: &str) -> DmaChannelFieldRole {
 /// - Status:     `DMA_{S2MM|MM2S}_Status_{ch}`
 /// - WriteCount: `DMA_S2MM_Current_Write_Count_{ch}`
 /// - FoT FIFO:   `DMA_S2MM_FoT_Count_FIFO_Pop_{ch}`
-fn classify_channel_register(
-    name: &str,
-) -> Option<(DmaChannelRegKind, DmaDirection, u8, &str)> {
+fn classify_channel_register(name: &str) -> Option<(DmaChannelRegKind, DmaDirection, u8, &str)> {
     // Must start with DMA_ and not be a BD register
     if !name.starts_with("DMA_") || name.contains("_BD") {
         return None;
@@ -1147,8 +1081,7 @@ fn extract_channel_schema(
     use crate::types::{NodeId, Relationship, RelationshipKind};
 
     // Classify all DMA channel registers
-    let mut channel_regs: Vec<(DmaChannelRegKind, DmaDirection, u8, &str, &regdb::RegisterDef)> =
-        Vec::new();
+    let mut channel_regs: Vec<(DmaChannelRegKind, DmaDirection, u8, &str, &regdb::RegisterDef)> = Vec::new();
     for reg in registers {
         if let Some((kind, dir, ch, queue_name)) = classify_channel_register(&reg.name) {
             channel_regs.push((kind, dir, ch, queue_name, reg));
@@ -1190,10 +1123,7 @@ fn extract_channel_schema(
         for field_def in &reg.fields {
             let role = channel_field_name_to_role(&field_def.name);
             let bits = if field_def.msb >= field_def.lsb {
-                BitRange::Contiguous {
-                    msb: field_def.msb as u8,
-                    lsb: field_def.lsb as u8,
-                }
+                BitRange::Contiguous { msb: field_def.msb as u8, lsb: field_def.lsb as u8 }
             } else {
                 BitRange::Contiguous { msb: 0, lsb: 0 }
             };
@@ -1209,11 +1139,7 @@ fn extract_channel_schema(
             // Emit DerivedFrom edge for non-Reserved fields.
             if role != DmaChannelFieldRole::Reserved {
                 edges.push(Relationship {
-                    from: NodeId::ChannelField {
-                        tile: tile_kind,
-                        direction: dir,
-                        role,
-                    },
+                    from: NodeId::ChannelField { tile: tile_kind, direction: dir, role },
                     to: NodeId::RegisterField {
                         tile: tile_kind,
                         module: module_kind,
@@ -1250,11 +1176,10 @@ fn extract_channel_schema(
     let has_compression = has_role(&DmaChannelFieldRole::CompressionEnable)
         || has_role(&DmaChannelFieldRole::DecompressionEnable);
     let has_out_of_order = has_role(&DmaChannelFieldRole::EnableOutOfOrder);
-    let has_pause =
-        has_role(&DmaChannelFieldRole::PauseMem) || has_role(&DmaChannelFieldRole::PauseStream);
+    let has_pause = has_role(&DmaChannelFieldRole::PauseMem) || has_role(&DmaChannelFieldRole::PauseStream);
     let has_fot = has_role(&DmaChannelFieldRole::FotMode);
-    let has_axi_errors = has_role(&DmaChannelFieldRole::AxiMmDecodeError)
-        || has_role(&DmaChannelFieldRole::AxiMmSlaveError);
+    let has_axi_errors =
+        has_role(&DmaChannelFieldRole::AxiMmDecodeError) || has_role(&DmaChannelFieldRole::AxiMmSlaveError);
     let has_cross_tile_errors = has_role(&DmaChannelFieldRole::ErrorLockAccessUnavailable)
         || has_role(&DmaChannelFieldRole::ErrorDmAccessUnavailable);
 
@@ -1312,17 +1237,11 @@ fn emit_cross_reference_edges(
         detail: "cross-resource field references".into(),
     };
 
-    let lock_subsystem = NodeId::Subsystem {
-        tile: tile_kind,
-        module: module_kind,
-        subsystem: SubsystemKind::Lock,
-    };
+    let lock_subsystem =
+        NodeId::Subsystem { tile: tile_kind, module: module_kind, subsystem: SubsystemKind::Lock };
 
     // BD field -> ValidBd is the representative node for the BD resource space.
-    let bd_space = NodeId::BdField {
-        tile: tile_kind,
-        role: BdFieldRole::ValidBd,
-    };
+    let bd_space = NodeId::BdField { tile: tile_kind, role: BdFieldRole::ValidBd };
 
     // BD fields that reference other resource spaces
     if let Some(schema) = bd_schema {
@@ -1509,9 +1428,7 @@ pub fn classify_register_subsystem(name: &str) -> SubsystemKind {
 /// 1. Partition registers by `subsystem_key()` (name-stem extraction)
 /// 2. Build a `SubsystemProfile` for each partition
 /// 3. Return sorted by subsystem name
-pub fn extract_module_profiles(
-    registers: &[regdb::RegisterDef],
-) -> Vec<SubsystemProfile> {
+pub fn extract_module_profiles(registers: &[regdb::RegisterDef]) -> Vec<SubsystemProfile> {
     let segments = segment_by_subsystem(registers);
     let mut profiles: Vec<SubsystemProfile> = segments
         .into_iter()
@@ -1558,14 +1475,7 @@ mod tests {
             description: None,
             fields: field_names
                 .iter()
-                .map(|n| BitField {
-                    name: n.to_string(),
-                    lsb: 0,
-                    msb: 0,
-                    width: 1,
-                    mask: 1,
-                    shift: 0,
-                })
+                .map(|n| BitField { name: n.to_string(), lsb: 0, msb: 0, width: 1, mask: 1, shift: 0 })
                 .collect(),
         }
     }
@@ -1649,14 +1559,7 @@ mod tests {
             description: None,
             fields: field_names
                 .iter()
-                .map(|n| BitField {
-                    name: n.to_string(),
-                    lsb: 0,
-                    msb: 0,
-                    width: 1,
-                    mask: 1,
-                    shift: 0,
-                })
+                .map(|n| BitField { name: n.to_string(), lsb: 0, msb: 0, width: 1, mask: 1, shift: 0 })
                 .collect(),
         }
     }
@@ -1664,12 +1567,7 @@ mod tests {
     #[test]
     fn classify_readonly_as_operations() {
         // Lock_Request: read-only, returns operation result in bit 0
-        let reg = make_reg_with_access(
-            "Lock_Request",
-            0x40000,
-            AccessMode::ReadOnly,
-            &["Request_Result"],
-        );
+        let reg = make_reg_with_access("Lock_Request", 0x40000, AccessMode::ReadOnly, &["Request_Result"]);
         assert_eq!(classify_register(&reg, false), RegisterCategory::Operations);
     }
 
@@ -1688,26 +1586,15 @@ mod tests {
     #[test]
     fn classify_rw_grouped_as_state() {
         // Lock0_value: R/W, part of a numbered group -> per-instance state
-        let reg = make_reg(
-            "Lock0_value",
-            0x1F000,
-            &["Lock_value"],
-        );
+        let reg = make_reg("Lock0_value", 0x1F000, &["Lock_value"]);
         assert_eq!(classify_register(&reg, true), RegisterCategory::State);
     }
 
     #[test]
     fn classify_rw_singleton_as_unclassified() {
         // A generic R/W singleton needs more context to classify
-        let reg = make_reg(
-            "Some_Config_Register",
-            0x10000,
-            &["Some_Field"],
-        );
-        assert_eq!(
-            classify_register(&reg, false),
-            RegisterCategory::Unclassified
-        );
+        let reg = make_reg("Some_Config_Register", 0x10000, &["Some_Field"]);
+        assert_eq!(classify_register(&reg, false), RegisterCategory::Unclassified);
     }
 
     #[test]
@@ -1731,20 +1618,11 @@ mod tests {
 
         // 16 lock value registers (R/W, grouped -> State)
         for i in 0..16u32 {
-            regs.push(make_reg(
-                &format!("Lock{}_value", i),
-                0x1F000 + i * 0x10,
-                &["Lock_value"],
-            ));
+            regs.push(make_reg(&format!("Lock{}_value", i), 0x1F000 + i * 0x10, &["Lock_value"]));
         }
 
         // Lock_Request (ReadOnly -> Operations)
-        regs.push(make_reg_with_access(
-            "Lock_Request",
-            0x40000,
-            AccessMode::ReadOnly,
-            &["Request_Result"],
-        ));
+        regs.push(make_reg_with_access("Lock_Request", 0x40000, AccessMode::ReadOnly, &["Request_Result"]));
 
         // 8 event selection registers (R/W, grouped -> State)
         for i in 0..8u32 {
@@ -1800,13 +1678,11 @@ mod tests {
         assert!(profile
             .singletons
             .iter()
-            .any(|(cat, name)| *cat == RegisterCategory::Operations
-                && name == "Lock_Request"));
+            .any(|(cat, name)| *cat == RegisterCategory::Operations && name == "Lock_Request"));
         assert!(profile
             .singletons
             .iter()
-            .any(|(cat, name)| *cat == RegisterCategory::Status
-                && name == "Locks_Overflow"));
+            .any(|(cat, name)| *cat == RegisterCategory::Status && name == "Locks_Overflow"));
     }
 
     // ====================================================================
@@ -1871,10 +1747,7 @@ mod tests {
         // Lock_Request is an address-encoded command interface, not a lock
         // value register. It must be classified as LockRequest to avoid
         // the Lock subsystem spanning from 0x1F000 to 0x40004.
-        assert_eq!(
-            classify_register_subsystem("Lock_Request"),
-            SubsystemKind::LockRequest
-        );
+        assert_eq!(classify_register_subsystem("Lock_Request"), SubsystemKind::LockRequest);
     }
 
     #[test]
@@ -1960,10 +1833,7 @@ mod tests {
     }
 
     /// Helper: extract one subsystem profile from a module's registers.
-    fn profile_from_module(
-        module: &regdb::ModuleDef,
-        subsystem: &str,
-    ) -> Option<SubsystemProfile> {
+    fn profile_from_module(module: &regdb::ModuleDef, subsystem: &str) -> Option<SubsystemProfile> {
         let profiles = extract_module_profiles(&module.registers);
         profiles.into_iter().find(|p| p.subsystem == subsystem)
     }
@@ -1976,8 +1846,8 @@ mod tests {
         };
 
         let mem = db.module("memory").expect("memory module should exist");
-        let profile = profile_from_module(mem, "Lock")
-            .expect("Lock profile should be extracted from memory module");
+        let profile =
+            profile_from_module(mem, "Lock").expect("Lock profile should be extracted from memory module");
 
         assert_eq!(profile.kind, SubsystemKind::Lock);
         assert_eq!(profile.instance_count, 16);
@@ -2003,23 +1873,26 @@ mod tests {
 
         // Lock_Request: singleton, classified as Operations (ReadOnly)
         assert!(
-            profile.singletons.iter().any(|(cat, name)| {
-                *cat == RegisterCategory::Operations && name == "Lock_Request"
-            }),
+            profile
+                .singletons
+                .iter()
+                .any(|(cat, name)| { *cat == RegisterCategory::Operations && name == "Lock_Request" }),
             "Lock_Request should be a singleton classified as Operations"
         );
 
         // Overflow and Underflow: singletons, classified as Status
         assert!(
-            profile.singletons.iter().any(|(cat, name)| {
-                *cat == RegisterCategory::Status && name == "Locks_Overflow"
-            }),
+            profile
+                .singletons
+                .iter()
+                .any(|(cat, name)| { *cat == RegisterCategory::Status && name == "Locks_Overflow" }),
             "Locks_Overflow should be Status"
         );
         assert!(
-            profile.singletons.iter().any(|(cat, name)| {
-                *cat == RegisterCategory::Status && name == "Locks_Underflow"
-            }),
+            profile
+                .singletons
+                .iter()
+                .any(|(cat, name)| { *cat == RegisterCategory::Status && name == "Locks_Underflow" }),
             "Locks_Underflow should be Status"
         );
     }
@@ -2032,8 +1905,7 @@ mod tests {
         };
 
         let mt = db.module("memory_tile").expect("memory_tile module should exist");
-        let profile = profile_from_module(mt, "Lock")
-            .expect("Lock profile should be extracted from memtile");
+        let profile = profile_from_module(mt, "Lock").expect("Lock profile should be extracted from memtile");
 
         assert_eq!(profile.kind, SubsystemKind::Lock);
         assert_eq!(profile.instance_count, 64);
@@ -2056,8 +1928,7 @@ mod tests {
         };
 
         let shim = db.module("shim").expect("shim module should exist");
-        let profile = profile_from_module(shim, "Lock")
-            .expect("Lock profile should be extracted from shim");
+        let profile = profile_from_module(shim, "Lock").expect("Lock profile should be extracted from shim");
 
         assert_eq!(profile.kind, SubsystemKind::Lock);
         assert_eq!(profile.instance_count, 16);
@@ -2081,26 +1952,14 @@ mod tests {
 
     #[test]
     fn extract_indices_single_index() {
-        assert_eq!(
-            extract_indices("Lock15_value", "Lock{}_value"),
-            Some(vec![15])
-        );
+        assert_eq!(extract_indices("Lock15_value", "Lock{}_value"), Some(vec![15]));
     }
 
     #[test]
     fn extract_indices_multi_index() {
-        assert_eq!(
-            extract_indices("DMA_BD15_5", "DMA_BD{}_{}"),
-            Some(vec![15, 5])
-        );
-        assert_eq!(
-            extract_indices("DMA_BD0_0", "DMA_BD{}_{}"),
-            Some(vec![0, 0])
-        );
-        assert_eq!(
-            extract_indices("DMA_BD47_7", "DMA_BD{}_{}"),
-            Some(vec![47, 7])
-        );
+        assert_eq!(extract_indices("DMA_BD15_5", "DMA_BD{}_{}"), Some(vec![15, 5]));
+        assert_eq!(extract_indices("DMA_BD0_0", "DMA_BD{}_{}"), Some(vec![0, 0]));
+        assert_eq!(extract_indices("DMA_BD47_7", "DMA_BD{}_{}"), Some(vec![47, 7]));
     }
 
     #[test]
@@ -2126,11 +1985,7 @@ mod tests {
         let regs: Vec<RegisterDef> = (0..4)
             .flat_map(|bd| {
                 (0..8).map(move |word| {
-                    make_reg(
-                        &format!("DMA_BD{}_{}", bd, word),
-                        0x1D000 + bd * 0x20 + word * 0x4,
-                        &["field"],
-                    )
+                    make_reg(&format!("DMA_BD{}_{}", bd, word), 0x1D000 + bd * 0x20 + word * 0x4, &["field"])
                 })
             })
             .collect();
@@ -2175,11 +2030,7 @@ mod tests {
         let regs: Vec<RegisterDef> = (0..16)
             .flat_map(|bd| {
                 (0..6).map(move |word| {
-                    make_reg(
-                        &format!("DMA_BD{}_{}", bd, word),
-                        0x1D000 + bd * 0x20 + word * 0x4,
-                        &["field"],
-                    )
+                    make_reg(&format!("DMA_BD{}_{}", bd, word), 0x1D000 + bd * 0x20 + word * 0x4, &["field"])
                 })
             })
             .collect();
@@ -2191,12 +2042,7 @@ mod tests {
         assert_eq!(g.pattern, "DMA_BD{}_{}");
 
         // Should detect 2 dimensions, not a flat count of 96
-        assert_eq!(
-            g.dimensions.len(),
-            2,
-            "BD registers should have 2 dimensions, got {:?}",
-            g.dimensions
-        );
+        assert_eq!(g.dimensions.len(), 2, "BD registers should have 2 dimensions, got {:?}", g.dimensions);
 
         // Outer dimension: 16 BDs, stride 0x20
         assert_eq!(g.dimensions[0].count, 16);
@@ -2238,10 +2084,7 @@ mod tests {
         assert_eq!(ctrl_s2mm.unwrap().total_count(), 2);
 
         let ctrl_mm2s = groups.iter().find(|g| g.pattern == "DMA_MM{}S_{}_Ctrl");
-        assert!(
-            ctrl_mm2s.is_some(),
-            "MM2S Ctrl should group under DMA_MM{{}}S_{{}}_Ctrl"
-        );
+        assert!(ctrl_mm2s.is_some(), "MM2S Ctrl should group under DMA_MM{{}}S_{{}}_Ctrl");
         assert_eq!(ctrl_mm2s.unwrap().total_count(), 2);
     }
 
@@ -2435,11 +2278,7 @@ mod tests {
         // and the typed SubsystemKind on each profile.
         let mut regs = Vec::new();
         for i in 0..16u32 {
-            regs.push(make_reg(
-                &format!("Lock{}_value", i),
-                0x1F000 + i * 0x10,
-                &["Lock_value"],
-            ));
+            regs.push(make_reg(&format!("Lock{}_value", i), 0x1F000 + i * 0x10, &["Lock_value"]));
         }
         regs.push(make_reg("DMA_BD0_0", 0x1D000, &["field"]));
         regs.push(make_reg("DMA_BD0_1", 0x1D004, &["field"]));
@@ -2455,10 +2294,7 @@ mod tests {
     #[test]
     fn profile_unknown_kind_for_naming_artifacts() {
         // Register name stems that don't map to real subsystems get Unknown.
-        let regs = vec![
-            make_reg("Tile_Status", 0x0, &["field"]),
-            make_reg("Tile_Control", 0x4, &["field"]),
-        ];
+        let regs = vec![make_reg("Tile_Status", 0x0, &["field"]), make_reg("Tile_Control", 0x4, &["field"])];
 
         let profiles = extract_module_profiles(&regs);
         let tile_p = profiles.iter().find(|p| p.subsystem == "Tile").unwrap();
@@ -2490,8 +2326,8 @@ mod tests {
         };
 
         let mem = db.module("memory").expect("memory module should exist");
-        let profile = profile_from_module(mem, "DMA")
-            .expect("DMA profile should be extracted from memory module");
+        let profile =
+            profile_from_module(mem, "DMA").expect("DMA profile should be extracted from memory module");
 
         assert_eq!(profile.kind, SubsystemKind::Dma);
 
@@ -2511,10 +2347,7 @@ mod tests {
             .register_groups
             .iter()
             .find(|(_, g)| g.pattern.contains("S{}MM") && g.pattern.contains("Ctrl"));
-        assert!(
-            s2mm_ctrl.is_some(),
-            "S2MM Ctrl group should exist in DMA profile"
-        );
+        assert!(s2mm_ctrl.is_some(), "S2MM Ctrl group should exist in DMA profile");
 
         assert_eq!(profile.instance_count, 16, "DMA instance count = BD count");
     }
@@ -2527,8 +2360,7 @@ mod tests {
         };
 
         let mt = db.module("memory_tile").expect("memory_tile module should exist");
-        let profile = profile_from_module(mt, "DMA")
-            .expect("DMA profile should be extracted from memtile");
+        let profile = profile_from_module(mt, "DMA").expect("DMA profile should be extracted from memtile");
 
         assert_eq!(profile.kind, SubsystemKind::Dma);
 
@@ -2552,8 +2384,7 @@ mod tests {
         };
 
         let shim = db.module("shim").expect("shim module should exist");
-        let profile = profile_from_module(shim, "DMA")
-            .expect("DMA profile should be extracted from shim");
+        let profile = profile_from_module(shim, "DMA").expect("DMA profile should be extracted from shim");
 
         assert_eq!(profile.kind, SubsystemKind::Dma);
 
@@ -2569,10 +2400,7 @@ mod tests {
         assert_eq!(profile.instance_count, 16, "Shim DMA: 16 BD instances");
 
         // Shim uses "Task_Queue" instead of "Start_Queue"
-        let has_task_queue = profile
-            .register_groups
-            .iter()
-            .any(|(_, g)| g.pattern.contains("Task_Queue"));
+        let has_task_queue = profile.register_groups.iter().any(|(_, g)| g.pattern.contains("Task_Queue"));
         assert!(has_task_queue, "Shim should have Task_Queue registers");
     }
 
@@ -2605,8 +2433,11 @@ mod tests {
                 let found = profiles.iter().find(|p| p.subsystem == *name);
                 assert!(found.is_some(), "{} should have {} subsystem", module_name, name);
                 assert_ne!(
-                    found.unwrap().kind, SubsystemKind::Unknown,
-                    "{}: {} should have a typed kind", module_name, name
+                    found.unwrap().kind,
+                    SubsystemKind::Unknown,
+                    "{}: {} should have a typed kind",
+                    module_name,
+                    name
                 );
             }
 
@@ -2616,15 +2447,14 @@ mod tests {
                 assert!(
                     p.instance_count <= 2 && p.register_groups.len() <= 1,
                     "{}: '{}' is Unknown but has {} instances and {} groups -- should it be mapped?",
-                    module_name, p.subsystem, p.instance_count, p.register_groups.len()
+                    module_name,
+                    p.subsystem,
+                    p.instance_count,
+                    p.register_groups.len()
                 );
             }
 
-            eprintln!(
-                "  -> {} known, {} unknown (naming artifacts)",
-                known.len(),
-                unknown.len()
-            );
+            eprintln!("  -> {} known, {} unknown (naming artifacts)", known.len(), unknown.len());
         }
     }
 
@@ -2638,10 +2468,9 @@ mod tests {
             return;
         };
 
-        let json_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tools/aie-device-models.json");
-        let mut model = device_model::extract_device_model(&json_path, "npu1")
-            .expect("device model parse failed");
+        let json_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
+        let mut model =
+            device_model::extract_device_model(&json_path, "npu1").expect("device model parse failed");
 
         // Before: modules are empty
         let core_tt = model.tile_types.iter().find(|t| t.name == "core").unwrap();
@@ -2688,10 +2517,7 @@ mod tests {
 
         // Core module has NO lock registers (locks are in the memory module)
         let lock = profile_from_module(core, "Lock");
-        assert!(
-            lock.is_none(),
-            "Core module should have no Lock subsystem"
-        );
+        assert!(lock.is_none(), "Core module should have no Lock subsystem");
     }
 
     // ====================================================================
@@ -2700,12 +2526,7 @@ mod tests {
 
     #[test]
     fn converts_regdb_register_to_register_model() {
-        let reg = make_reg_with_access(
-            "Lock0_value",
-            0x1F000,
-            AccessMode::ReadWrite,
-            &["Lock_value"],
-        );
+        let reg = make_reg_with_access("Lock0_value", 0x1F000, AccessMode::ReadWrite, &["Lock_value"]);
 
         let model = register_def_to_model(&reg, "memory");
 
@@ -2722,12 +2543,7 @@ mod tests {
 
     #[test]
     fn converts_readonly_access_mode() {
-        let reg = make_reg_with_access(
-            "Lock_Request",
-            0x40000,
-            AccessMode::ReadOnly,
-            &["Request_Result"],
-        );
+        let reg = make_reg_with_access("Lock_Request", 0x40000, AccessMode::ReadOnly, &["Request_Result"]);
 
         let model = register_def_to_model(&reg, "memory");
         assert_eq!(model.access, crate::types::Access::ReadOnly);
@@ -2757,18 +2573,21 @@ mod tests {
         assert!(
             total_regs > 0 && total_regs <= mem.registers.len(),
             "registers should be distributed across subsystems, got {} vs {} raw",
-            total_regs, mem.registers.len()
+            total_regs,
+            mem.registers.len()
         );
 
         // Spot-check: Lock0_value should have SubsystemKind::Lock
-        let lock0 = module_model.all_registers()
+        let lock0 = module_model
+            .all_registers()
             .find(|r| r.name == "Lock0_value")
             .expect("Lock0_value should exist");
         assert_eq!(lock0.subsystem, SubsystemKind::Lock);
         assert_eq!(lock0.offset, 0x1F000);
 
         // DMA_BD0_0 should have SubsystemKind::Dma
-        let dma0 = module_model.all_registers()
+        let dma0 = module_model
+            .all_registers()
             .find(|r| r.name == "DMA_BD0_0")
             .expect("DMA_BD0_0 should exist");
         assert_eq!(dma0.subsystem, SubsystemKind::Dma);
@@ -2785,10 +2604,9 @@ mod tests {
             return;
         };
 
-        let json_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tools/aie-device-models.json");
-        let mut model = device_model::extract_device_model(&json_path, "npu1")
-            .expect("device model parse failed");
+        let json_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
+        let mut model =
+            device_model::extract_device_model(&json_path, "npu1").expect("device model parse failed");
 
         // Before populate: instances come from device model only (1 source each)
         let core = model.tile_types.iter().find(|t| t.name == "core").unwrap();
@@ -2843,8 +2661,7 @@ mod tests {
 
         let json_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
-        let mut model =
-            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        let mut model = crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let core = model.tile_types.iter().find(|t| t.name == "core").unwrap();
@@ -2857,22 +2674,18 @@ mod tests {
         assert!(!schema.has_axi_fields, "compute tile has no AXI fields");
 
         // Check key fields exist with correct bit widths
-        let buf_len = schema.field(&BdFieldRole::BufferLength)
-            .expect("should have BufferLength");
+        let buf_len = schema.field(&BdFieldRole::BufferLength).expect("should have BufferLength");
         assert_eq!(buf_len.word, 0);
         assert_eq!(buf_len.bits.width(), 14);
 
-        let base_addr = schema.field(&BdFieldRole::BaseAddress)
-            .expect("should have BaseAddress");
+        let base_addr = schema.field(&BdFieldRole::BaseAddress).expect("should have BaseAddress");
         assert_eq!(base_addr.word, 0);
         assert_eq!(base_addr.bits.width(), 14);
 
-        let d0_step = schema.field(&BdFieldRole::Stepsize(0))
-            .expect("should have D0_Stepsize");
+        let d0_step = schema.field(&BdFieldRole::Stepsize(0)).expect("should have D0_Stepsize");
         assert_eq!(d0_step.bits.width(), 13);
 
-        let lock_acq_id = schema.field(&BdFieldRole::LockAcqId)
-            .expect("should have LockAcqId");
+        let lock_acq_id = schema.field(&BdFieldRole::LockAcqId).expect("should have LockAcqId");
         assert_eq!(lock_acq_id.bits.width(), 4);
 
         // No shim-only or memtile-only fields
@@ -2892,8 +2705,7 @@ mod tests {
 
         let json_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
-        let mut model =
-            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        let mut model = crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let mt = model.tile_types.iter().find(|t| t.name == "mem_tile").unwrap();
@@ -2938,8 +2750,7 @@ mod tests {
 
         let json_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
-        let mut model =
-            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        let mut model = crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let shim = model.tile_types.iter().find(|t| t.name == "shim_noc").unwrap();
@@ -2958,7 +2769,8 @@ mod tests {
         let base_low = schema.field(&BdFieldRole::BaseAddress).unwrap();
         assert_eq!(base_low.bits.width(), 30);
 
-        let base_high = schema.field(&BdFieldRole::BaseAddressHigh)
+        let base_high = schema
+            .field(&BdFieldRole::BaseAddressHigh)
             .expect("shim has split base address");
         assert_eq!(base_high.bits.width(), 16);
 
@@ -2988,15 +2800,11 @@ mod tests {
 
         let json_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
-        let mut model =
-            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        let mut model = crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let core = model.tile_types.iter().find(|t| t.name == "core").unwrap();
-        let schema = core
-            .channel_schema
-            .as_ref()
-            .expect("compute tile should have channel schema");
+        let schema = core.channel_schema.as_ref().expect("compute tile should have channel schema");
 
         // Compute tile: 2 channels per direction
         assert_eq!(schema.channels_per_direction, 2);
@@ -3059,11 +2867,15 @@ mod tests {
         assert_eq!(cur_bd.bits.width(), 4);
 
         // S2MM-specific stall
-        assert!(s2mm_status.iter().any(|f| f.role == DmaChannelFieldRole::StalledStreamStarvation));
+        assert!(s2mm_status
+            .iter()
+            .any(|f| f.role == DmaChannelFieldRole::StalledStreamStarvation));
 
         // MM2S-specific stall
         let mm2s_status = schema.fields_for(DmaChannelRegKind::Status, DmaDirection::Mm2s);
-        assert!(mm2s_status.iter().any(|f| f.role == DmaChannelFieldRole::StalledStreamBackpressure));
+        assert!(mm2s_status
+            .iter()
+            .any(|f| f.role == DmaChannelFieldRole::StalledStreamBackpressure));
     }
 
     #[test]
@@ -3077,15 +2889,11 @@ mod tests {
 
         let json_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
-        let mut model =
-            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        let mut model = crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let memtile = model.tile_types.iter().find(|t| t.name == "mem_tile").unwrap();
-        let schema = memtile
-            .channel_schema
-            .as_ref()
-            .expect("memtile should have channel schema");
+        let schema = memtile.channel_schema.as_ref().expect("memtile should have channel schema");
 
         // MemTile: 6 channels per direction
         assert_eq!(schema.channels_per_direction, 6);
@@ -3111,11 +2919,15 @@ mod tests {
 
         // Cross-tile error fields
         assert!(
-            s2mm_status.iter().any(|f| f.role == DmaChannelFieldRole::ErrorLockAccessUnavailable),
+            s2mm_status
+                .iter()
+                .any(|f| f.role == DmaChannelFieldRole::ErrorLockAccessUnavailable),
             "memtile S2MM Status should have Error_Lock_Access_to_Unavailable"
         );
         assert!(
-            s2mm_status.iter().any(|f| f.role == DmaChannelFieldRole::ErrorDmAccessUnavailable),
+            s2mm_status
+                .iter()
+                .any(|f| f.role == DmaChannelFieldRole::ErrorDmAccessUnavailable),
             "memtile S2MM Status should have Error_DM_Access_to_Unavailable"
         );
 
@@ -3140,15 +2952,11 @@ mod tests {
 
         let json_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
-        let mut model =
-            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        let mut model = crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let shim = model.tile_types.iter().find(|t| t.name == "shim_noc").unwrap();
-        let schema = shim
-            .channel_schema
-            .as_ref()
-            .expect("shim should have channel schema");
+        let schema = shim.channel_schema.as_ref().expect("shim should have channel schema");
 
         // Shim: 2 channels per direction
         assert_eq!(schema.channels_per_direction, 2);
@@ -3207,8 +3015,7 @@ mod tests {
 
         let json_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
-        let mut model =
-            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        let mut model = crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         // Every BD field in the compute tile schema should have a DerivedFrom
@@ -3223,21 +3030,12 @@ mod tests {
             .collect();
 
         // There should be at least one DerivedFrom edge per non-Reserved BD field
-        let non_reserved_fields: Vec<_> = schema
-            .fields
-            .iter()
-            .filter(|f| f.role != BdFieldRole::Reserved)
-            .collect();
-        assert!(
-            !non_reserved_fields.is_empty(),
-            "BD schema should have non-reserved fields"
-        );
+        let non_reserved_fields: Vec<_> =
+            schema.fields.iter().filter(|f| f.role != BdFieldRole::Reserved).collect();
+        assert!(!non_reserved_fields.is_empty(), "BD schema should have non-reserved fields");
 
         // Check that Buffer_Length has a DerivedFrom edge to a RegisterField
-        let buf_len_node = NodeId::BdField {
-            tile: TileKind::Compute,
-            role: BdFieldRole::BufferLength,
-        };
+        let buf_len_node = NodeId::BdField { tile: TileKind::Compute, role: BdFieldRole::BufferLength };
         let buf_len_edge = derived_edges
             .iter()
             .find(|e| e.from == buf_len_node)
@@ -3264,8 +3062,7 @@ mod tests {
 
         let json_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
-        let mut model =
-            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        let mut model = crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let derived_edges: Vec<_> = model
@@ -3306,8 +3103,7 @@ mod tests {
 
         let json_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
-        let mut model =
-            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        let mut model = crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let contains: Vec<_> = model
@@ -3322,19 +3118,14 @@ mod tests {
             .filter(|e| matches!(&e.from, NodeId::TileType { kind: TileKind::Compute }))
             .filter(|e| matches!(&e.to, NodeId::Module { .. }))
             .collect();
-        assert_eq!(
-            tile_to_module.len(),
-            2,
-            "compute tile should contain 2 modules (Core + Memory)"
-        );
+        assert_eq!(tile_to_module.len(), 2, "compute tile should contain 2 modules (Core + Memory)");
 
         // Module -> Register: memory module should contain many registers
         let module_to_reg: Vec<_> = contains
             .iter()
-            .filter(|e| matches!(
-                &e.from,
-                NodeId::Module { tile: TileKind::Compute, module: ModuleKind::Memory }
-            ))
+            .filter(|e| {
+                matches!(&e.from, NodeId::Module { tile: TileKind::Compute, module: ModuleKind::Memory })
+            })
             .filter(|e| matches!(&e.to, NodeId::Register { .. }))
             .collect();
         assert!(
@@ -3346,22 +3137,23 @@ mod tests {
         // Register -> RegisterField: DMA_BD0_0 should contain its fields
         let bd0_0_to_fields: Vec<_> = contains
             .iter()
-            .filter(|e| matches!(
-                &e.from,
-                NodeId::Register { name, .. } if name == "DMA_BD0_0"
-            ))
+            .filter(|e| {
+                matches!(
+                    &e.from,
+                    NodeId::Register { name, .. } if name == "DMA_BD0_0"
+                )
+            })
             .filter(|e| matches!(&e.to, NodeId::RegisterField { .. }))
             .collect();
-        assert!(
-            !bd0_0_to_fields.is_empty(),
-            "DMA_BD0_0 should contain field edges"
-        );
+        assert!(!bd0_0_to_fields.is_empty(), "DMA_BD0_0 should contain field edges");
 
         // Verify a specific field exists
-        let has_buf_len = bd0_0_to_fields.iter().any(|e| matches!(
-            &e.to,
-            NodeId::RegisterField { field, .. } if field == "Buffer_Length"
-        ));
+        let has_buf_len = bd0_0_to_fields.iter().any(|e| {
+            matches!(
+                &e.to,
+                NodeId::RegisterField { field, .. } if field == "Buffer_Length"
+            )
+        });
         assert!(has_buf_len, "DMA_BD0_0 should contain Buffer_Length field");
     }
 
@@ -3376,8 +3168,7 @@ mod tests {
 
         let json_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
-        let mut model =
-            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        let mut model = crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let belongs_to: Vec<_> = model
@@ -3387,10 +3178,12 @@ mod tests {
             .collect();
 
         // DMA registers should belong to DMA subsystem
-        let dma_bd0_belongs = belongs_to.iter().find(|e| matches!(
-            &e.from,
-            NodeId::Register { name, .. } if name == "DMA_BD0_0"
-        ));
+        let dma_bd0_belongs = belongs_to.iter().find(|e| {
+            matches!(
+                &e.from,
+                NodeId::Register { name, .. } if name == "DMA_BD0_0"
+            )
+        });
         assert!(dma_bd0_belongs.is_some(), "DMA_BD0_0 should have a BelongsTo edge");
         match &dma_bd0_belongs.unwrap().to {
             NodeId::Subsystem { subsystem, .. } => {
@@ -3400,10 +3193,12 @@ mod tests {
         }
 
         // Lock registers should belong to Lock subsystem
-        let lock_belongs = belongs_to.iter().find(|e| matches!(
-            &e.from,
-            NodeId::Register { name, .. } if name == "Lock0_value"
-        ));
+        let lock_belongs = belongs_to.iter().find(|e| {
+            matches!(
+                &e.from,
+                NodeId::Register { name, .. } if name == "Lock0_value"
+            )
+        });
         assert!(lock_belongs.is_some(), "Lock0_value should have a BelongsTo edge");
         match &lock_belongs.unwrap().to {
             NodeId::Subsystem { subsystem, .. } => {
@@ -3416,8 +3211,7 @@ mod tests {
     #[test]
     fn references_edges_connect_cross_resource_fields() {
         use crate::types::{
-            BdFieldRole, DmaChannelFieldRole, DmaDirection, NodeId, RelationshipKind,
-            SubsystemKind,
+            BdFieldRole, DmaChannelFieldRole, DmaDirection, NodeId, RelationshipKind, SubsystemKind,
         };
 
         let Some(db) = load_test_db() else {
@@ -3427,8 +3221,7 @@ mod tests {
 
         let json_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
-        let mut model =
-            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        let mut model = crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let refs: Vec<_> = model
@@ -3440,10 +3233,9 @@ mod tests {
         assert!(!refs.is_empty(), "should have References edges");
 
         // BD LockAcqId -> Lock subsystem
-        let lock_acq_ref = refs.iter().find(|e| matches!(
-            &e.from,
-            NodeId::BdField { role: BdFieldRole::LockAcqId, .. }
-        ));
+        let lock_acq_ref = refs
+            .iter()
+            .find(|e| matches!(&e.from, NodeId::BdField { role: BdFieldRole::LockAcqId, .. }));
         assert!(lock_acq_ref.is_some(), "LockAcqId should reference Lock subsystem");
         match &lock_acq_ref.unwrap().to {
             NodeId::Subsystem { subsystem, .. } => {
@@ -3453,17 +3245,15 @@ mod tests {
         }
 
         // BD LockRelId -> Lock subsystem
-        let lock_rel_ref = refs.iter().find(|e| matches!(
-            &e.from,
-            NodeId::BdField { role: BdFieldRole::LockRelId, .. }
-        ));
+        let lock_rel_ref = refs
+            .iter()
+            .find(|e| matches!(&e.from, NodeId::BdField { role: BdFieldRole::LockRelId, .. }));
         assert!(lock_rel_ref.is_some(), "LockRelId should reference Lock subsystem");
 
         // BD NextBd -> BD resource space (ValidBd as representative)
-        let next_bd_ref = refs.iter().find(|e| matches!(
-            &e.from,
-            NodeId::BdField { role: BdFieldRole::NextBd, .. }
-        ));
+        let next_bd_ref = refs
+            .iter()
+            .find(|e| matches!(&e.from, NodeId::BdField { role: BdFieldRole::NextBd, .. }));
         assert!(next_bd_ref.is_some(), "NextBd should reference BD space");
         match &next_bd_ref.unwrap().to {
             NodeId::BdField { role: BdFieldRole::ValidBd, .. } => {}
@@ -3471,14 +3261,16 @@ mod tests {
         }
 
         // Channel StartBdId -> BD resource space
-        let start_bd_ref = refs.iter().find(|e| matches!(
-            &e.from,
-            NodeId::ChannelField {
-                role: DmaChannelFieldRole::StartBdId,
-                direction: DmaDirection::S2mm,
-                ..
-            }
-        ));
+        let start_bd_ref = refs.iter().find(|e| {
+            matches!(
+                &e.from,
+                NodeId::ChannelField {
+                    role: DmaChannelFieldRole::StartBdId,
+                    direction: DmaDirection::S2mm,
+                    ..
+                }
+            )
+        });
         assert!(start_bd_ref.is_some(), "StartBdId should reference BD space");
         match &start_bd_ref.unwrap().to {
             NodeId::BdField { role: BdFieldRole::ValidBd, .. } => {}
@@ -3486,14 +3278,16 @@ mod tests {
         }
 
         // Channel CurrentBdId -> BD resource space
-        let cur_bd_ref = refs.iter().find(|e| matches!(
-            &e.from,
-            NodeId::ChannelField {
-                role: DmaChannelFieldRole::CurrentBdId,
-                direction: DmaDirection::S2mm,
-                ..
-            }
-        ));
+        let cur_bd_ref = refs.iter().find(|e| {
+            matches!(
+                &e.from,
+                NodeId::ChannelField {
+                    role: DmaChannelFieldRole::CurrentBdId,
+                    direction: DmaDirection::S2mm,
+                    ..
+                }
+            )
+        });
         assert!(cur_bd_ref.is_some(), "CurrentBdId should reference BD space");
     }
 
@@ -3505,11 +3299,7 @@ mod tests {
     fn populate_subsystems_groups_by_kind() {
         // Synthetic test: build a module with DMA and Lock registers,
         // verify populate_subsystems creates the right subsystem entries.
-        let src = SourceAttribution {
-            origin: Source::Am025Json,
-            file: "test".into(),
-            detail: "test".into(),
-        };
+        let src = SourceAttribution { origin: Source::Am025Json, file: "test".into(), detail: "test".into() };
         let registers = vec![
             RegisterModel {
                 name: "DMA_BD0_0".into(),
@@ -3552,11 +3342,7 @@ mod tests {
                 source: src.clone(),
             },
         ];
-        let mut module = ModuleModel {
-            kind: ModuleKind::Memory,
-            subsystems: Vec::new(),
-            source: src,
-        };
+        let mut module = ModuleModel { kind: ModuleKind::Memory, subsystems: Vec::new(), source: src };
 
         populate_subsystems(&mut module, registers);
 
@@ -3598,11 +3384,7 @@ mod tests {
     #[test]
     fn populate_subsystems_sorted_by_offset() {
         // Verify subsystems are sorted by offset_start for determinism
-        let src = SourceAttribution {
-            origin: Source::Am025Json,
-            file: "test".into(),
-            detail: "test".into(),
-        };
+        let src = SourceAttribution { origin: Source::Am025Json, file: "test".into(), detail: "test".into() };
         let registers = vec![
             RegisterModel {
                 name: "Trace_Reg".into(),
@@ -3635,11 +3417,7 @@ mod tests {
                 source: src.clone(),
             },
         ];
-        let mut module = ModuleModel {
-            kind: ModuleKind::Core,
-            subsystems: Vec::new(),
-            source: src,
-        };
+        let mut module = ModuleModel { kind: ModuleKind::Core, subsystems: Vec::new(), source: src };
 
         populate_subsystems(&mut module, registers);
 
@@ -3652,11 +3430,7 @@ mod tests {
 
     #[test]
     fn populate_subsystems_contains_offset_works() {
-        let src = SourceAttribution {
-            origin: Source::Am025Json,
-            file: "test".into(),
-            detail: "test".into(),
-        };
+        let src = SourceAttribution { origin: Source::Am025Json, file: "test".into(), detail: "test".into() };
         let registers = vec![
             RegisterModel {
                 name: "DMA_BD0_0".into(),
@@ -3679,11 +3453,7 @@ mod tests {
                 source: src.clone(),
             },
         ];
-        let mut module = ModuleModel {
-            kind: ModuleKind::Memory,
-            subsystems: Vec::new(),
-            source: src,
-        };
+        let mut module = ModuleModel { kind: ModuleKind::Memory, subsystems: Vec::new(), source: src };
 
         populate_subsystems(&mut module, registers);
 
@@ -3714,10 +3484,9 @@ mod tests {
             return;
         };
 
-        let json_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tools/aie-device-models.json");
-        let mut model = device_model::extract_device_model(&json_path, "npu1")
-            .expect("device model parse failed");
+        let json_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
+        let mut model =
+            device_model::extract_device_model(&json_path, "npu1").expect("device model parse failed");
 
         populate_tile_modules(&mut model, &db);
 
@@ -3730,10 +3499,7 @@ mod tests {
             .expect("compute tile should have Memory module");
 
         // Should have at least DMA, Lock, Event, Trace subsystems
-        assert!(
-            !mem_mod.subsystems.is_empty(),
-            "Memory module should have populated subsystems"
-        );
+        assert!(!mem_mod.subsystems.is_empty(), "Memory module should have populated subsystems");
 
         let dma_sub = mem_mod
             .subsystems
@@ -3742,15 +3508,8 @@ mod tests {
             .expect("Memory module should have DMA subsystem");
 
         // DMA BD base for compute tiles is 0x1D000 (well-known value)
-        assert_eq!(
-            *dma_sub.offset_start.value(),
-            0x1D000,
-            "DMA subsystem should start at BD base 0x1D000"
-        );
-        assert!(
-            !dma_sub.registers.is_empty(),
-            "DMA subsystem should have register indices"
-        );
+        assert_eq!(*dma_sub.offset_start.value(), 0x1D000, "DMA subsystem should start at BD base 0x1D000");
+        assert!(!dma_sub.registers.is_empty(), "DMA subsystem should have register indices");
         // DMA has BDs (16 * 6 words = 96 registers) + channel regs
         assert!(
             dma_sub.registers.len() > 90,
@@ -3769,20 +3528,11 @@ mod tests {
             lock_sub.contains_offset(0x1F000),
             "Lock subsystem should contain the lock value base 0x1F000"
         );
-        assert!(
-            !lock_sub.registers.is_empty(),
-            "Lock subsystem should have register indices"
-        );
+        assert!(!lock_sub.registers.is_empty(), "Lock subsystem should have register indices");
 
         // contains_offset works for known DMA offsets
-        assert!(
-            dma_sub.contains_offset(0x1D000),
-            "BD0 word 0 should be in DMA"
-        );
-        assert!(
-            dma_sub.contains_offset(0x1D004),
-            "BD0 word 1 should be in DMA"
-        );
+        assert!(dma_sub.contains_offset(0x1D000), "BD0 word 0 should be in DMA");
+        assert!(dma_sub.contains_offset(0x1D004), "BD0 word 1 should be in DMA");
 
         // -- Compute tile: Core module --
         let core_mod = core_tt
@@ -3790,84 +3540,49 @@ mod tests {
             .iter()
             .find(|m| m.kind == ModuleKind::Core)
             .expect("compute tile should have Core module");
-        assert!(
-            !core_mod.subsystems.is_empty(),
-            "Core module should have populated subsystems"
-        );
+        assert!(!core_mod.subsystems.is_empty(), "Core module should have populated subsystems");
         // Core module should have Processor subsystem
         assert!(
-            core_mod
-                .subsystems
-                .iter()
-                .any(|s| s.kind == SubsystemKind::Processor),
+            core_mod.subsystems.iter().any(|s| s.kind == SubsystemKind::Processor),
             "Core module should have Processor subsystem"
         );
         // Core module should NOT have Lock or DMA
         assert!(
-            !core_mod
-                .subsystems
-                .iter()
-                .any(|s| s.kind == SubsystemKind::Lock),
+            !core_mod.subsystems.iter().any(|s| s.kind == SubsystemKind::Lock),
             "Core module should not have Lock subsystem"
         );
         assert!(
-            !core_mod
-                .subsystems
-                .iter()
-                .any(|s| s.kind == SubsystemKind::Dma),
+            !core_mod.subsystems.iter().any(|s| s.kind == SubsystemKind::Dma),
             "Core module should not have DMA subsystem"
         );
 
         // -- MemTile --
-        let mt_tt = model
-            .tile_types
-            .iter()
-            .find(|t| t.name == "mem_tile")
-            .unwrap();
+        let mt_tt = model.tile_types.iter().find(|t| t.name == "mem_tile").unwrap();
         let mt_mod = &mt_tt.modules[0];
-        assert!(
-            !mt_mod.subsystems.is_empty(),
-            "MemTile module should have populated subsystems"
-        );
+        assert!(!mt_mod.subsystems.is_empty(), "MemTile module should have populated subsystems");
         let mt_dma = mt_mod
             .subsystems
             .iter()
             .find(|s| s.kind == SubsystemKind::Dma)
             .expect("MemTile should have DMA subsystem");
-        assert!(
-            !mt_dma.registers.is_empty(),
-            "MemTile DMA should have registers"
-        );
+        assert!(!mt_dma.registers.is_empty(), "MemTile DMA should have registers");
         let mt_lock = mt_mod
             .subsystems
             .iter()
             .find(|s| s.kind == SubsystemKind::Lock)
             .expect("MemTile should have Lock subsystem");
-        assert!(
-            !mt_lock.registers.is_empty(),
-            "MemTile Lock should have registers"
-        );
+        assert!(!mt_lock.registers.is_empty(), "MemTile Lock should have registers");
 
         // -- Shim --
-        let shim_tt = model
-            .tile_types
-            .iter()
-            .find(|t| t.name == "shim_noc")
-            .unwrap();
+        let shim_tt = model.tile_types.iter().find(|t| t.name == "shim_noc").unwrap();
         let shim_mod = &shim_tt.modules[0];
-        assert!(
-            !shim_mod.subsystems.is_empty(),
-            "Shim module should have populated subsystems"
-        );
+        assert!(!shim_mod.subsystems.is_empty(), "Shim module should have populated subsystems");
         let shim_dma = shim_mod
             .subsystems
             .iter()
             .find(|s| s.kind == SubsystemKind::Dma)
             .expect("Shim should have DMA subsystem");
-        assert!(
-            !shim_dma.registers.is_empty(),
-            "Shim DMA should have registers"
-        );
+        assert!(!shim_dma.registers.is_empty(), "Shim DMA should have registers");
 
         // Report what we found
         eprintln!("=== Subsystem Summary ===");

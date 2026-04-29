@@ -259,10 +259,7 @@ pub struct Confirmed<T> {
 impl<T: FactEquals> Confirmed<T> {
     /// Create a new fact with its first source.
     pub fn new(value: T, source: SourceAttribution) -> Self {
-        Self {
-            value,
-            sources: vec![source],
-        }
+        Self { value, sources: vec![source] }
     }
 
     /// Confirm the fact from an additional source.
@@ -274,13 +271,8 @@ impl<T: FactEquals> Confirmed<T> {
         if self.value.fact_equals(&value) {
             self.sources.push(source);
         } else {
-            let existing: Vec<String> =
-                self.sources.iter().map(|s| format!("{}", s)).collect();
-            panic!(
-                "GRAPH CONFLICT: {} disagrees with existing source(s) [{}]",
-                source,
-                existing.join(", "),
-            );
+            let existing: Vec<String> = self.sources.iter().map(|s| format!("{}", s)).collect();
+            panic!("GRAPH CONFLICT: {} disagrees with existing source(s) [{}]", source, existing.join(", "),);
         }
     }
 
@@ -361,9 +353,7 @@ impl BitRange {
     pub fn width(&self) -> u8 {
         match self {
             Self::Contiguous { msb, lsb } => msb - lsb + 1,
-            Self::Split(fragments) => {
-                fragments.iter().map(|(msb, lsb)| msb - lsb + 1).sum()
-            }
+            Self::Split(fragments) => fragments.iter().map(|(msb, lsb)| msb - lsb + 1).sum(),
         }
     }
 }
@@ -436,11 +426,7 @@ impl FactEquals for RegisterModel {
             && self.subsystem == other.subsystem
             && self.access == other.access
             && self.fields.len() == other.fields.len()
-            && self
-                .fields
-                .iter()
-                .zip(other.fields.iter())
-                .all(|(a, b)| a.fact_equals(b))
+            && self.fields.iter().zip(other.fields.iter()).all(|(a, b)| a.fact_equals(b))
     }
 }
 
@@ -637,10 +623,7 @@ impl FactEquals for ModuleModel {
     fn fact_equals(&self, other: &Self) -> bool {
         self.kind == other.kind
             && self.register_count() == other.register_count()
-            && self
-                .all_registers()
-                .zip(other.all_registers())
-                .all(|(a, b)| a.fact_equals(b))
+            && self.all_registers().zip(other.all_registers()).all(|(a, b)| a.fact_equals(b))
     }
 }
 
@@ -726,13 +709,7 @@ impl MemoryModel {
                 size_bytes,
             );
         }
-        Self {
-            size_bytes,
-            logical,
-            physical,
-            program_memory_bytes,
-            source,
-        }
+        Self { size_bytes, logical, physical, program_memory_bytes, source }
     }
 
     /// Return the effective physical banking model.
@@ -1134,22 +1111,12 @@ pub struct DmaChannelSchema {
 
 impl DmaChannelSchema {
     /// Find a field by its semantic role and direction.
-    pub fn field(
-        &self,
-        role: &DmaChannelFieldRole,
-        direction: DmaDirection,
-    ) -> Option<&DmaChannelFieldSpec> {
-        self.fields
-            .iter()
-            .find(|f| &f.role == role && f.direction == direction)
+    pub fn field(&self, role: &DmaChannelFieldRole, direction: DmaDirection) -> Option<&DmaChannelFieldSpec> {
+        self.fields.iter().find(|f| &f.role == role && f.direction == direction)
     }
 
     /// Find all fields for a given register kind and direction.
-    pub fn fields_for(
-        &self,
-        reg: DmaChannelRegKind,
-        direction: DmaDirection,
-    ) -> Vec<&DmaChannelFieldSpec> {
+    pub fn fields_for(&self, reg: DmaChannelRegKind, direction: DmaDirection) -> Vec<&DmaChannelFieldSpec> {
         self.fields
             .iter()
             .filter(|f| f.register == reg && f.direction == direction)
@@ -1461,15 +1428,10 @@ pub struct ArrayTopology {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeId {
     /// A tile type definition.
-    TileType {
-        kind: TileKind,
-    },
+    TileType { kind: TileKind },
 
     /// A hardware module within a tile type.
-    Module {
-        tile: TileKind,
-        module: ModuleKind,
-    },
+    Module { tile: TileKind, module: ModuleKind },
 
     /// A register within a module.
     Register {
@@ -1487,10 +1449,7 @@ pub enum NodeId {
     },
 
     /// A field in the BD programming schema.
-    BdField {
-        tile: TileKind,
-        role: BdFieldRole,
-    },
+    BdField { tile: TileKind, role: BdFieldRole },
 
     /// A field in the DMA channel programming schema.
     ChannelField {
@@ -1619,11 +1578,7 @@ mod tests {
     use super::*;
 
     fn test_source(origin: Source, detail: &str) -> SourceAttribution {
-        SourceAttribution {
-            origin,
-            file: "test.json".to_string(),
-            detail: detail.to_string(),
-        }
+        SourceAttribution { origin, file: "test.json".to_string(), detail: detail.to_string() }
     }
 
     /// Convenience: create an InstanceCount with a test source for all fields.
@@ -1839,8 +1794,8 @@ mod tests {
     #[test]
     fn test_bit_range_split() {
         let range = BitRange::Split(vec![
-            (23, 20),  // 4 bits
-            (7, 4),    // 4 bits
+            (23, 20), // 4 bits
+            (7, 4),   // 4 bits
         ]);
         assert_eq!(range.width(), 8);
     }
@@ -1869,16 +1824,22 @@ mod tests {
                 kind: ModuleKind::Core,
                 subsystems: vec![SubsystemModel {
                     kind: SubsystemKind::Dma,
-                    offset_start: Confirmed::new(0x1D000, SourceAttribution {
-                        origin: Source::Am025Json,
-                        file: "test.json".to_string(),
-                        detail: "test".to_string(),
-                    }),
-                    offset_end: Confirmed::new(0x1D004, SourceAttribution {
-                        origin: Source::Am025Json,
-                        file: "test.json".to_string(),
-                        detail: "test".to_string(),
-                    }),
+                    offset_start: Confirmed::new(
+                        0x1D000,
+                        SourceAttribution {
+                            origin: Source::Am025Json,
+                            file: "test.json".to_string(),
+                            detail: "test".to_string(),
+                        },
+                    ),
+                    offset_end: Confirmed::new(
+                        0x1D004,
+                        SourceAttribution {
+                            origin: Source::Am025Json,
+                            file: "test.json".to_string(),
+                            detail: "test".to_string(),
+                        },
+                    ),
                     registers: vec![RegisterModel {
                         name: "DMA_BD0_0".to_string(),
                         offset: 0x1D000,
@@ -1984,10 +1945,7 @@ mod tests {
             address_gen_granularity: 32,
             accumulator_cascade_bits: Some(512),
             mem_base_addresses: mem_bases,
-            properties: DeviceProperties {
-                uses_semaphore_locks: true,
-                uses_multi_dim_bds: true,
-            },
+            properties: DeviceProperties { uses_semaphore_locks: true, uses_multi_dim_bds: true },
             source: SourceAttribution {
                 origin: Source::DeviceModel,
                 file: "test.json".to_string(),
@@ -2009,18 +1967,8 @@ mod tests {
             row: 2,
             tile_type: "core".to_string(),
             is_internal: true,
-            edges: CardinalFlags {
-                north: false,
-                south: false,
-                east: false,
-                west: false,
-            },
-            mem_affinity: Some(CardinalFlags {
-                south: true,
-                west: false,
-                north: true,
-                east: false,
-            }),
+            edges: CardinalFlags { north: false, south: false, east: false, west: false },
+            mem_affinity: Some(CardinalFlags { south: true, west: false, north: true, east: false }),
         };
         assert!(placement.is_internal);
         assert!(placement.mem_affinity.unwrap().south);
@@ -2068,24 +2016,14 @@ mod tests {
         let src = test_source(Source::DeviceModel, "test");
         let compute_mem = MemoryModel::new(
             65536,
-            BankingModel {
-                num_banks: 4,
-                bank_size: 16384,
-                bank_width_bits: 32,
-                source: src.clone(),
-            },
+            BankingModel { num_banks: 4, bank_size: 16384, bank_width_bits: 32, source: src.clone() },
             None,
             Some(16384),
             src.clone(),
         );
         let memtile_mem = MemoryModel::new(
             524288,
-            BankingModel {
-                num_banks: 8,
-                bank_size: 65536,
-                bank_width_bits: 128,
-                source: src.clone(),
-            },
+            BankingModel { num_banks: 8, bank_size: 65536, bank_width_bits: 128, source: src.clone() },
             None,
             None,
             src,
@@ -2108,10 +2046,7 @@ mod tests {
             address_gen_granularity: 32,
             accumulator_cascade_bits: Some(512),
             mem_base_addresses: mem_bases,
-            properties: DeviceProperties {
-                uses_semaphore_locks: true,
-                uses_multi_dim_bds: true,
-            },
+            properties: DeviceProperties { uses_semaphore_locks: true, uses_multi_dim_bds: true },
             source: SourceAttribution {
                 origin: Source::DeviceModel,
                 file: "test.json".to_string(),
@@ -2131,9 +2066,7 @@ mod tests {
                     row: 0,
                     tile_type: "shim_noc".to_string(),
                     is_internal: false,
-                    edges: CardinalFlags {
-                        north: false, south: true, east: false, west: true,
-                    },
+                    edges: CardinalFlags { north: false, south: true, east: false, west: true },
                     mem_affinity: None,
                 },
                 TilePlacement {
@@ -2141,12 +2074,8 @@ mod tests {
                     row: 2,
                     tile_type: "core".to_string(),
                     is_internal: true,
-                    edges: CardinalFlags {
-                        north: false, south: false, east: false, west: false,
-                    },
-                    mem_affinity: Some(CardinalFlags {
-                        south: true, west: false, north: true, east: false,
-                    }),
+                    edges: CardinalFlags { north: false, south: false, east: false, west: false },
+                    mem_affinity: Some(CardinalFlags { south: true, west: false, north: true, east: false }),
                 },
             ],
             source: SourceAttribution {
@@ -2176,12 +2105,7 @@ mod tests {
         let src = test_source(Source::DeviceModel, "compute tile");
         let mem = MemoryModel::new(
             65536,
-            BankingModel {
-                num_banks: 4,
-                bank_size: 16384,
-                bank_width_bits: 32,
-                source: src.clone(),
-            },
+            BankingModel { num_banks: 4, bank_size: 16384, bank_width_bits: 32, source: src.clone() },
             None,
             Some(16384),
             src,
@@ -2200,18 +2124,8 @@ mod tests {
         let phys_src = test_source(Source::Am025Json, "AM020 SRAM");
         let mem = MemoryModel::new(
             65536,
-            BankingModel {
-                num_banks: 4,
-                bank_size: 16384,
-                bank_width_bits: 32,
-                source: src.clone(),
-            },
-            Some(BankingModel {
-                num_banks: 8,
-                bank_size: 8192,
-                bank_width_bits: 128,
-                source: phys_src,
-            }),
+            BankingModel { num_banks: 4, bank_size: 16384, bank_width_bits: 32, source: src.clone() },
+            Some(BankingModel { num_banks: 8, bank_size: 8192, bank_width_bits: 128, source: phys_src }),
             Some(16384),
             src,
         );
@@ -2231,12 +2145,7 @@ mod tests {
         let src = test_source(Source::DeviceModel, "compute tile");
         let mem = MemoryModel::new(
             65536,
-            BankingModel {
-                num_banks: 4,
-                bank_size: 16384,
-                bank_width_bits: 32,
-                source: src.clone(),
-            },
+            BankingModel { num_banks: 4, bank_size: 16384, bank_width_bits: 32, source: src.clone() },
             None,
             None,
             src,
@@ -2255,12 +2164,7 @@ mod tests {
         // 4 banks * 8192 = 32768, not 65536
         MemoryModel::new(
             65536,
-            BankingModel {
-                num_banks: 4,
-                bank_size: 8192,
-                bank_width_bits: 32,
-                source: src.clone(),
-            },
+            BankingModel { num_banks: 4, bank_size: 8192, bank_width_bits: 32, source: src.clone() },
             None,
             None,
             src,
@@ -2275,18 +2179,8 @@ mod tests {
         // physical is wrong: 8 * 4096 = 32768, not 65536
         MemoryModel::new(
             65536,
-            BankingModel {
-                num_banks: 4,
-                bank_size: 16384,
-                bank_width_bits: 32,
-                source: src.clone(),
-            },
-            Some(BankingModel {
-                num_banks: 8,
-                bank_size: 4096,
-                bank_width_bits: 128,
-                source: src.clone(),
-            }),
+            BankingModel { num_banks: 4, bank_size: 16384, bank_width_bits: 32, source: src.clone() },
+            Some(BankingModel { num_banks: 8, bank_size: 4096, bank_width_bits: 128, source: src.clone() }),
             None,
             src,
         );
@@ -2351,8 +2245,8 @@ mod tests {
             offset_end: Confirmed::new(0x1F100, src),
             registers: vec![],
         };
-        assert!(sub.contains_offset(0x1F000));  // inclusive start
-        assert!(sub.contains_offset(0x1F0FF));  // last byte before end
+        assert!(sub.contains_offset(0x1F000)); // inclusive start
+        assert!(sub.contains_offset(0x1F0FF)); // last byte before end
         assert!(!sub.contains_offset(0x1F100)); // exclusive end
         assert!(!sub.contains_offset(0x1D000)); // outside
     }

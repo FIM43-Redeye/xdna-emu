@@ -73,12 +73,10 @@ pub fn extract_device_models(path: &Path) -> Result<HashMap<String, ArchModel>, 
     let content = std::fs::read_to_string(path)?;
     let root: Value = serde_json::from_str(&content)?;
 
-    let root_obj = root
-        .as_object()
-        .ok_or_else(|| ExtractError::MissingField {
-            context: "root".into(),
-            field: "(expected object)".into(),
-        })?;
+    let root_obj = root.as_object().ok_or_else(|| ExtractError::MissingField {
+        context: "root".into(),
+        field: "(expected object)".into(),
+    })?;
 
     check_keys(root_obj, &["generator", "mlir_aie_python_path", "devices"], "root")?;
 
@@ -109,9 +107,7 @@ pub fn extract_device_model(path: &Path, device: &str) -> Result<ArchModel, Extr
         .into_iter()
         .find(|(name, _)| name == device)
         .map(|(_, model)| model)
-        .ok_or_else(|| ExtractError::UnknownDevice {
-            name: device.to_string(),
-        })
+        .ok_or_else(|| ExtractError::UnknownDevice { name: device.to_string() })
 }
 
 // ============================================================================
@@ -123,10 +119,7 @@ pub fn extract_device_model(path: &Path, device: &str) -> Result<ArchModel, Extr
 fn check_keys(obj: &Map<String, Value>, known: &[&str], context: &str) -> Result<(), ExtractError> {
     for key in obj.keys() {
         if !known.contains(&key.as_str()) {
-            return Err(ExtractError::UnknownField {
-                context: context.into(),
-                field: key.clone(),
-            });
+            return Err(ExtractError::UnknownField { context: context.into(), field: key.clone() });
         }
     }
     Ok(())
@@ -138,10 +131,8 @@ fn require_field<'a>(
     field: &str,
     context: &str,
 ) -> Result<&'a Value, ExtractError> {
-    obj.get(field).ok_or_else(|| ExtractError::MissingField {
-        context: context.into(),
-        field: field.into(),
-    })
+    obj.get(field)
+        .ok_or_else(|| ExtractError::MissingField { context: context.into(), field: field.into() })
 }
 
 /// Get a required integer field.
@@ -154,11 +145,7 @@ fn require_u64(obj: &Map<String, Value>, field: &str, context: &str) -> Result<u
 }
 
 /// Get a required boolean field.
-fn require_bool(
-    obj: &Map<String, Value>,
-    field: &str,
-    context: &str,
-) -> Result<bool, ExtractError> {
+fn require_bool(obj: &Map<String, Value>, field: &str, context: &str) -> Result<bool, ExtractError> {
     let val = require_field(obj, field, context)?;
     val.as_bool().ok_or_else(|| ExtractError::MissingField {
         context: context.into(),
@@ -180,9 +167,7 @@ fn infer_architecture(name: &str) -> Result<Architecture, ExtractError> {
         // Versal AIE2 devices (e.g., xcve2802)
         Ok(Architecture::Aie2)
     } else {
-        Err(ExtractError::UnknownDevice {
-            name: name.to_string(),
-        })
+        Err(ExtractError::UnknownDevice { name: name.to_string() })
     }
 }
 
@@ -273,14 +258,9 @@ fn extract_constants(
     // LLVM 23 update. Use architecture-appropriate defaults when absent.
     // AIE2/AIE2P: max_lock_value=63 (signed 7-bit counter, aie-rt
     // VAL_UPPER_BOUND), address_gen_granularity=32 bytes.
-    let max_lock_value = obj
-        .get("max_lock_value")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(63) as u32;
-    let address_gen_granularity = obj
-        .get("address_gen_granularity")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(32) as u32;
+    let max_lock_value = obj.get("max_lock_value").and_then(|v| v.as_u64()).unwrap_or(63) as u32;
+    let address_gen_granularity =
+        obj.get("address_gen_granularity").and_then(|v| v.as_u64()).unwrap_or(32) as u32;
 
     let mem_ctx = format!("{}.mem_base_addresses", ctx);
     let mem_val = require_field(obj, "mem_base_addresses", ctx)?;
@@ -354,14 +334,8 @@ fn extract_tile_types(
     let mut result = Vec::new();
     for (type_name, type_val) in types_obj {
         let tile_ctx = format!("{}.{}", ctx, type_name);
-        let model = extract_tile_type(
-            type_name,
-            type_val,
-            &tile_ctx,
-            file,
-            local_memory_size,
-            mem_tile_size,
-        )?;
+        let model =
+            extract_tile_type(type_name, type_val, &tile_ctx, file, local_memory_size, mem_tile_size)?;
         result.push(model);
     }
     Ok(result)
@@ -397,25 +371,23 @@ fn extract_tile_type(
     // after LLVM 23. Derive from architecture defaults when absent:
     // AIE2 compute: 4 banks of 16KB (64KB total), memtile: 8 banks of
     // 64KB (512KB total). These come from aie-rt NUM_MEM_WORD_BANKS.
-    let num_banks = obj
-        .get("num_banks")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(match name {
-            "core" => 4,
-            "mem_tile" => 8,
-            _ => 1, // shim tiles don't have meaningful banking
-        }) as u8;
-    let bank_size = obj
-        .get("bank_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or_else(|| {
-            // Derive from total memory / num_banks.
-            let total = match name {
-                "mem_tile" => mem_tile_size,
-                _ => local_memory_size,
-            };
-            if num_banks > 0 { total / num_banks as u64 } else { total }
-        });
+    let num_banks = obj.get("num_banks").and_then(|v| v.as_u64()).unwrap_or(match name {
+        "core" => 4,
+        "mem_tile" => 8,
+        _ => 1, // shim tiles don't have meaningful banking
+    }) as u8;
+    let bank_size = obj.get("bank_size").and_then(|v| v.as_u64()).unwrap_or_else(|| {
+        // Derive from total memory / num_banks.
+        let total = match name {
+            "mem_tile" => mem_tile_size,
+            _ => local_memory_size,
+        };
+        if num_banks > 0 {
+            total / num_banks as u64
+        } else {
+            total
+        }
+    });
 
     let representative = if let Some(rep_val) = obj.get("representative") {
         let arr = rep_val.as_array().ok_or_else(|| ExtractError::MissingField {
@@ -431,9 +403,7 @@ fn extract_tile_type(
         None
     };
 
-    let program_memory_bytes = obj
-        .get("program_memory_size")
-        .and_then(|v| v.as_u64());
+    let program_memory_bytes = obj.get("program_memory_size").and_then(|v| v.as_u64());
 
     // Memory model: compute tiles use local_memory_size, memtiles use mem_tile_size,
     // shim tiles use bank_size * num_banks.
@@ -478,20 +448,16 @@ fn extract_tile_type(
     // DMA channel count: derived from DMA master count in the appropriate
     // port namespace. Shim tiles use shim_mux_ports, others use switchbox_ports.
     let channels = match kind {
-        TileKind::ShimNoc | TileKind::ShimPl => {
-            shim_mux_ports
-                .iter()
-                .find(|p| p.bundle == "DMA")
-                .map(|p| p.masters)
-                .unwrap_or(0)
-        }
-        _ => {
-            switchbox_ports
-                .iter()
-                .find(|p| p.bundle == "DMA")
-                .map(|p| p.masters)
-                .unwrap_or(0)
-        }
+        TileKind::ShimNoc | TileKind::ShimPl => shim_mux_ports
+            .iter()
+            .find(|p| p.bundle == "DMA")
+            .map(|p| p.masters)
+            .unwrap_or(0),
+        _ => switchbox_ports
+            .iter()
+            .find(|p| p.bundle == "DMA")
+            .map(|p| p.masters)
+            .unwrap_or(0),
     };
 
     let instance_source = SourceAttribution {
@@ -513,14 +479,10 @@ fn extract_tile_type(
         core_address_map: None, // populated by manual constants
         switchbox_ports,
         shim_mux_ports,
-        modules: Vec::new(), // populated by AM025 regdb extractor
-        bd_schema: None,        // populated by BD schema extraction
-        channel_schema: None,   // populated by channel schema extraction
-        source: SourceAttribution {
-            origin: Source::DeviceModel,
-            file: file.into(),
-            detail: ctx.into(),
-        },
+        modules: Vec::new(),  // populated by AM025 regdb extractor
+        bd_schema: None,      // populated by BD schema extraction
+        channel_schema: None, // populated by channel schema extraction
+        source: SourceAttribution { origin: Source::DeviceModel, file: file.into(), detail: ctx.into() },
     })
 }
 
@@ -547,11 +509,7 @@ fn extract_ports(value: &Value, ctx: &str) -> Result<Vec<PortBundle>, ExtractErr
         let masters = require_u64(bundle_obj, "master", &bundle_ctx)? as u8;
         let slaves = require_u64(bundle_obj, "slave", &bundle_ctx)? as u8;
 
-        result.push(PortBundle {
-            bundle: bundle_name.clone(),
-            masters,
-            slaves,
-        });
+        result.push(PortBundle { bundle: bundle_name.clone(), masters, slaves });
     }
 
     // Sort by bundle name for deterministic ordering.
@@ -563,14 +521,7 @@ fn extract_ports(value: &Value, ctx: &str) -> Result<Vec<PortBundle>, ExtractErr
 // Tile map extraction
 // ============================================================================
 
-const TILE_MAP_ENTRY_KNOWN_FIELDS: &[&str] = &[
-    "col",
-    "row",
-    "type",
-    "is_internal",
-    "edges",
-    "mem_affinity",
-];
+const TILE_MAP_ENTRY_KNOWN_FIELDS: &[&str] = &["col", "row", "type", "is_internal", "edges", "mem_affinity"];
 
 const CARDINAL_KNOWN_FIELDS: &[&str] = &["north", "south", "east", "west"];
 
@@ -621,14 +572,7 @@ fn extract_tile_map(
             None
         };
 
-        result.push(TilePlacement {
-            col,
-            row,
-            tile_type,
-            is_internal,
-            edges,
-            mem_affinity,
-        });
+        result.push(TilePlacement { col, row, tile_type, is_internal, edges, mem_affinity });
     }
 
     let _ = file; // file is used at the device level for SourceAttribution
@@ -662,8 +606,7 @@ mod tests {
 
     fn json_path() -> PathBuf {
         // CARGO_MANIFEST_DIR is crates/xdna-archspec/, go up to xdna-emu root
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tools/aie-device-models.json")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json")
     }
 
     // Test 1: Full parse -- all 13 devices parse without error.
@@ -677,9 +620,18 @@ mod tests {
 
         // Verify all expected device names are present.
         let expected = [
-            "npu1", "npu1_1col", "npu1_2col", "npu1_3col",
-            "npu2", "npu2_1col", "npu2_2col", "npu2_3col",
-            "npu2_4col", "npu2_5col", "npu2_6col", "npu2_7col",
+            "npu1",
+            "npu1_1col",
+            "npu1_2col",
+            "npu1_3col",
+            "npu2",
+            "npu2_1col",
+            "npu2_2col",
+            "npu2_3col",
+            "npu2_4col",
+            "npu2_5col",
+            "npu2_6col",
+            "npu2_7col",
             "xcve2802",
         ];
         for name in &expected {

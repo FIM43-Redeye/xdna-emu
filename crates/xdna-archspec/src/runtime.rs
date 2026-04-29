@@ -328,17 +328,18 @@ pub struct ModelConfig {
 /// `xdna-emu/tools/aie-device-models.json`. The path is resolved at runtime
 /// using `CARGO_MANIFEST_DIR` (crate root = `crates/xdna-archspec/`) and
 /// navigating up two levels to the workspace root.
-pub static ARCHSPEC_MODELS: LazyLock<HashMap<String, ArchModel>> =
-    LazyLock::new(|| {
-        let json_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tools/aie-device-models.json");
-        crate::device_model::extract_device_models(&json_path)
-            .unwrap_or_else(|e| panic!(
-                "Failed to load device models from {}: {}. \
+pub static ARCHSPEC_MODELS: LazyLock<HashMap<String, ArchModel>> = LazyLock::new(|| {
+    let json_path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
+    crate::device_model::extract_device_models(&json_path).unwrap_or_else(|e| {
+        panic!(
+            "Failed to load device models from {}: {}. \
                  Run: python3 tools/aie-device-dump.py > tools/aie-device-models.json",
-                json_path.display(), e
-            ))
-    });
+            json_path.display(),
+            e
+        )
+    })
+});
 
 impl ModelConfig {
     /// Create a `ModelConfig` from an `ArchModel`.
@@ -361,23 +362,26 @@ impl ModelConfig {
                 TileKind::ShimNoc | TileKind::ShimPl => &tile.shim_mux_ports,
                 _ => &tile.switchbox_ports,
             };
-            let dma = ports.iter()
-                .find(|p| p.bundle == "DMA")
-                .expect("DMA bundle missing from tile type; \
-                         regenerate device model with tools/aie-device-dump.py");
+            let dma = ports.iter().find(|p| p.bundle == "DMA").expect(
+                "DMA bundle missing from tile type; \
+                         regenerate device model with tools/aie-device-dump.py",
+            );
             (dma.slaves as usize, dma.masters as usize)
         };
 
-        let compute = model.tile_types.iter().find(|t| t.kind == TileKind::Compute)
+        let compute = model
+            .tile_types
+            .iter()
+            .find(|t| t.kind == TileKind::Compute)
             .expect("core tile type missing from device model JSON; regenerate with aie-device-dump.py");
         let (compute_s2mm, compute_mm2s) = dma_channels(compute);
         // Data memory: from model or AIE2 default (64 KB).
-        let compute_data_size = compute.memory.as_ref()
-            .map(|m| m.size_bytes as usize)
-            .unwrap_or(65536);
+        let compute_data_size = compute.memory.as_ref().map(|m| m.size_bytes as usize).unwrap_or(65536);
         // Program memory: from model's `program_memory_bytes`, or 0 if absent.
         // This is distinct from data memory -- 16 KB on AIE2 compute tiles.
-        let compute_prog_size = compute.memory.as_ref()
+        let compute_prog_size = compute
+            .memory
+            .as_ref()
             .and_then(|m| m.program_memory_bytes)
             .map(|b| b as usize)
             .unwrap_or(0);
@@ -390,13 +394,13 @@ impl ModelConfig {
             dma_mm2s: compute_mm2s,
         };
 
-        let memtile = model.tile_types.iter().find(|t| t.kind == TileKind::Mem)
-            .expect("mem_tile tile type missing from device model JSON; regenerate with aie-device-dump.py");
+        let memtile =
+            model.tile_types.iter().find(|t| t.kind == TileKind::Mem).expect(
+                "mem_tile tile type missing from device model JSON; regenerate with aie-device-dump.py",
+            );
         let (mem_s2mm, mem_mm2s) = dma_channels(memtile);
         // Mem tiles have no program memory.
-        let mem_data_size = memtile.memory.as_ref()
-            .map(|m| m.size_bytes as usize)
-            .unwrap_or(524288); // AIE2 default: 512 KB
+        let mem_data_size = memtile.memory.as_ref().map(|m| m.size_bytes as usize).unwrap_or(524288); // AIE2 default: 512 KB
         let mem_tile_params = TileTypeParams {
             data_memory_size: mem_data_size,
             program_memory_size: 0,
@@ -406,8 +410,10 @@ impl ModelConfig {
             dma_mm2s: mem_mm2s,
         };
 
-        let shim = model.tile_types.iter().find(|t| t.kind == TileKind::ShimNoc)
-            .expect("shim_noc tile type missing from device model JSON; regenerate with aie-device-dump.py");
+        let shim =
+            model.tile_types.iter().find(|t| t.kind == TileKind::ShimNoc).expect(
+                "shim_noc tile type missing from device model JSON; regenerate with aie-device-dump.py",
+            );
         let (shim_s2mm, shim_mm2s) = dma_channels(shim);
         // Shim tiles have no local data memory (the device model reports
         // address space size, not physical SRAM).  No program memory either.
@@ -420,11 +426,11 @@ impl ModelConfig {
             dma_mm2s: shim_mm2s,
         };
 
-        let topo = model.array_topology.as_ref()
+        let topo = model
+            .array_topology
+            .as_ref()
             .expect("array topology missing from device model JSON; regenerate with aie-device-dump.py");
-        let max_lock_value = model.device_constants.as_ref()
-            .map(|dc| dc.max_lock_value)
-            .unwrap_or(63); // AIE2/AIE2P default
+        let max_lock_value = model.device_constants.as_ref().map(|dc| dc.max_lock_value).unwrap_or(63); // AIE2/AIE2P default
 
         Self {
             // The emulator adds 1 column to the model's count for the
@@ -433,9 +439,10 @@ impl ModelConfig {
             // checked_add is purely a defensive guard against a
             // catastrophic regenerated model -- we'd rather panic loudly
             // than silently wrap to 0.
-            columns: topo.columns.checked_add(1)
-                .expect("array_topology.columns + 1 overflowed usize; \
-                         device model JSON is corrupt"),
+            columns: topo.columns.checked_add(1).expect(
+                "array_topology.columns + 1 overflowed usize; \
+                         device model JSON is corrupt",
+            ),
             rows: topo.rows,
             num_mem_tile_rows: topo.num_mem_tile_rows,
             max_lock_value,
@@ -466,7 +473,8 @@ impl ModelConfig {
     /// first call).  The JSON path is resolved relative to the workspace root:
     /// `tools/aie-device-models.json`.
     pub fn npu1() -> Arc<dyn ArchConfig> {
-        let model = ARCHSPEC_MODELS.get("npu1")
+        let model = ARCHSPEC_MODELS
+            .get("npu1")
             .expect("npu1 device not found in device model JSON; regenerate with aie-device-dump.py");
         Arc::new(Self::from_arch_model(model, "AIE2 (NPU1 - Phoenix/HawkPoint)"))
     }
@@ -475,7 +483,8 @@ impl ModelConfig {
     ///
     /// Loads from the device model JSON via `ARCHSPEC_MODELS`.
     pub fn npu2() -> Arc<dyn ArchConfig> {
-        let model = ARCHSPEC_MODELS.get("npu2")
+        let model = ARCHSPEC_MODELS
+            .get("npu2")
             .expect("npu2 device not found in device model JSON; regenerate with aie-device-dump.py");
         Arc::new(Self::from_arch_model(model, "AIE2P (NPU2+ - Strix/Krackan)"))
     }
@@ -485,7 +494,8 @@ impl ModelConfig {
     /// VC2802 is the 38-column x 11-row AIE2 array that aiesimulator uses for
     /// all AIE2 targets.  Same tile silicon as NPU1, just a larger array.
     pub fn xcve2802() -> Arc<dyn ArchConfig> {
-        let model = ARCHSPEC_MODELS.get("xcve2802")
+        let model = ARCHSPEC_MODELS
+            .get("xcve2802")
             .expect("xcve2802 device not found in device model JSON; add to tools/aie-device-models.json");
         Arc::new(Self::from_arch_model(model, "AIE2 (VC2802 - Versal, aiesim validation)"))
     }
@@ -548,9 +558,7 @@ impl ArchConfig for ModelConfig {
 
     fn dma_model(&self) -> &'static dyn crate::dma::DmaModel {
         match self.architecture {
-            Architecture::Aie2 | Architecture::Aie2p => {
-                &crate::aie2::dma::AIE2_DMA_MODEL
-            }
+            Architecture::Aie2 | Architecture::Aie2p => &crate::aie2::dma::AIE2_DMA_MODEL,
             Architecture::Aie => {
                 unimplemented!(
                     "AIE1 DmaModel not populated until AIE1 support lands \
@@ -562,9 +570,7 @@ impl ArchConfig for ModelConfig {
 
     fn lock_model(&self) -> &'static dyn crate::locks::LockModel {
         match self.architecture {
-            Architecture::Aie2 | Architecture::Aie2p => {
-                &crate::aie2::locks::AIE2_LOCK_MODEL
-            }
+            Architecture::Aie2 | Architecture::Aie2p => &crate::aie2::locks::AIE2_LOCK_MODEL,
             Architecture::Aie => {
                 unimplemented!(
                     "AIE1 LockModel not populated until AIE1 support lands \
@@ -588,9 +594,7 @@ impl ArchConfig for ModelConfig {
 
     fn isa_executor(&self) -> &'static dyn crate::isa_execute::IsaExecutor {
         match self.architecture {
-            Architecture::Aie2 | Architecture::Aie2p => {
-                &crate::aie2::isa_execute_model::AIE2_ISA_EXECUTOR
-            }
+            Architecture::Aie2 | Architecture::Aie2p => &crate::aie2::isa_execute_model::AIE2_ISA_EXECUTOR,
             Architecture::Aie => unimplemented!(
                 "AIE1 IsaExecutor not populated; add \
                  xdna_archspec::aie1::isa_execute_model::Aie1IsaExecutor"
@@ -663,12 +667,7 @@ mod tests {
         // Compute tiles (rows 2-5)
         for col in 0..5 {
             for row in 2..6 {
-                assert!(
-                    arch.is_compute_tile(col, row),
-                    "({}, {}) should be compute",
-                    col,
-                    row
-                );
+                assert!(arch.is_compute_tile(col, row), "({}, {}) should be compute", col, row);
                 assert_eq!(arch.tile_kind(col, row), TileKind::Compute);
             }
         }
@@ -775,18 +774,9 @@ mod tests {
         // Same AIE2 silicon -- per-tile-type params should be identical
         let vc = ModelConfig::xcve2802();
         let npu = ModelConfig::npu1();
-        assert_eq!(
-            vc.data_memory_size(TileKind::Compute),
-            npu.data_memory_size(TileKind::Compute),
-        );
-        assert_eq!(
-            vc.lock_count(TileKind::Compute),
-            npu.lock_count(TileKind::Compute),
-        );
-        assert_eq!(
-            vc.dma_s2mm_channels(TileKind::Compute),
-            npu.dma_s2mm_channels(TileKind::Compute),
-        );
+        assert_eq!(vc.data_memory_size(TileKind::Compute), npu.data_memory_size(TileKind::Compute),);
+        assert_eq!(vc.lock_count(TileKind::Compute), npu.lock_count(TileKind::Compute),);
+        assert_eq!(vc.dma_s2mm_channels(TileKind::Compute), npu.dma_s2mm_channels(TileKind::Compute),);
     }
 
     #[test]
@@ -829,10 +819,11 @@ mod tests {
                 let expected: &dyn crate::isa_execute::IsaExecutor =
                     &crate::aie2::isa_execute_model::AIE2_ISA_EXECUTOR;
                 // Both AIE2 and AIE2P should dispatch to the same singleton
-                assert!(core::ptr::eq(
-                    executor as *const _ as *const (),
-                    expected as *const _ as *const ()
-                ), "{}: isa_executor must dispatch to AIE2_ISA_EXECUTOR", name);
+                assert!(
+                    core::ptr::eq(executor as *const _ as *const (), expected as *const _ as *const ()),
+                    "{}: isa_executor must dispatch to AIE2_ISA_EXECUTOR",
+                    name
+                );
             }
         }
     }
@@ -847,11 +838,7 @@ mod tests {
         for name in &["npu1", "npu2", "npu4", "npu5", "npu6"] {
             if let Some(model) = ARCHSPEC_MODELS.get(*name) {
                 let cfg = ModelConfig::from_arch_model(model, name);
-                assert!(
-                    cfg.has_cascade_link(),
-                    "{}: AIE2-family must have has_cascade_link=true",
-                    name
-                );
+                assert!(cfg.has_cascade_link(), "{}: AIE2-family must have has_cascade_link=true", name);
             }
         }
     }

@@ -9,13 +9,7 @@ use super::LockValueLayout;
 /// sign_bit=5, min=-64, max=63). Duplicated here so the trait-side
 /// tests are independent of the AIE2 impl.
 fn aie2_layout() -> LockValueLayout {
-    LockValueLayout {
-        width: 6,
-        mask: 0x3F,
-        sign_bit: 5,
-        min: -64,
-        max: 63,
-    }
+    LockValueLayout { width: 6, mask: 0x3F, sign_bit: 5, min: -64, max: 63 }
 }
 
 #[test]
