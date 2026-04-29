@@ -101,8 +101,7 @@ pub unsafe extern "C" fn xdna_emu_load_xclbin(
 /// here.  Finds CDO within the bootgen container, parses it, and applies
 /// it to the device.
 pub(super) fn apply_pdi_data(handle: &mut XdnaEmuHandle, data: &[u8]) -> XdnaEmuResult {
-    log::info!("apply_pdi_data: {} bytes, head={:02x?}",
-               data.len(), &data[..data.len().min(16)]);
+    log::info!("apply_pdi_data: {} bytes, head={:02x?}", data.len(), &data[..data.len().min(16)]);
 
     // Find CDO within bootgen container.
     let cdo_offset = match find_cdo_offset(data) {
@@ -124,12 +123,15 @@ pub(super) fn apply_pdi_data(handle: &mut XdnaEmuHandle, data: &[u8]) -> XdnaEmu
             c
         }
         Err(e) => {
-            let msg = format!("Failed to parse CDO from PDI ({} bytes, offset {}): {}",
-                              data.len(), cdo_offset, e);
+            let msg =
+                format!("Failed to parse CDO from PDI ({} bytes, offset {}): {}", data.len(), cdo_offset, e);
             log::error!("{}", msg);
             if data.len() >= 8 {
-                log::error!("  At offset {}: {:02x?}", cdo_offset,
-                            &data[cdo_offset..data.len().min(cdo_offset + 20)]);
+                log::error!(
+                    "  At offset {}: {:02x?}",
+                    cdo_offset,
+                    &data[cdo_offset..data.len().min(cdo_offset + 20)]
+                );
             }
             set_last_error(msg);
             return XdnaEmuResult::ParseError;

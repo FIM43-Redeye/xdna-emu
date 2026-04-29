@@ -95,7 +95,11 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
 
     log::info!(
         "Running emulator (max {})",
-        if unbounded { "unbounded".to_string() } else { format!("{} cycles", max) }
+        if unbounded {
+            "unbounded".to_string()
+        } else {
+            format!("{} cycles", max)
+        }
     );
 
     // Warm-up: let cores run to their first blocking point before
@@ -198,9 +202,7 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         // fires -- DMA channels may still be running (trace channels,
         // BD chains with use_next_bd, etc.) but the host transfer is
         // done.  Do NOT require all DMA to be idle here.
-        if handle.npu_executor.is_done()
-            && handle.npu_executor.syncs_satisfied(handle.engine.device())
-        {
+        if handle.npu_executor.is_done() && handle.npu_executor.syncs_satisfied(handle.engine.device()) {
             log::info!("All DMA syncs satisfied after {} cycles", cycles);
             natural_halt = true;
             break 'run;
@@ -213,8 +215,7 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
     handle.engine.flush_trace_to_host();
 
     let halted = handle.engine.status() == EngineStatus::Halted
-        || (handle.npu_executor.is_done()
-            && handle.npu_executor.syncs_satisfied(handle.engine.device()));
+        || (handle.npu_executor.is_done() && handle.npu_executor.syncs_satisfied(handle.engine.device()));
 
     // If we didn't exit naturally (halted/stalled/syncs), the while-loop
     // condition `cycles >= max` ended the run — budget was exhausted.
@@ -224,10 +225,5 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         XdnaEmuHaltReason::Budget
     };
 
-    XdnaEmuExecStatus {
-        result: XdnaEmuResult::Success,
-        cycles_executed: cycles,
-        halted,
-        halt_reason,
-    }
+    XdnaEmuExecStatus { result: XdnaEmuResult::Success, cycles_executed: cycles, halted, halt_reason }
 }

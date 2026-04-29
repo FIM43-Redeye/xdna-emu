@@ -8,8 +8,8 @@
 // test imports from `xdna_emu::` directly.
 
 use xdna_emu::{
-    xdna_emu_create, xdna_emu_destroy, xdna_emu_run, xdna_emu_set_max_cycles,
-    XdnaEmuHaltReason, XdnaEmuResult,
+    xdna_emu_create, xdna_emu_destroy, xdna_emu_run, xdna_emu_set_max_cycles, XdnaEmuHaltReason,
+    XdnaEmuResult,
 };
 
 #[test]

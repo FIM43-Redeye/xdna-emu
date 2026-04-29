@@ -123,9 +123,7 @@ pub unsafe extern "C" fn xdna_emu_read_host_memory(
 /// Clear host buffer list for NPU executor.
 /// Call this before adding buffers for a new execution.
 #[no_mangle]
-pub unsafe extern "C" fn xdna_emu_clear_host_buffers(
-    handle: *mut XdnaEmuHandle,
-) -> XdnaEmuResult {
+pub unsafe extern "C" fn xdna_emu_clear_host_buffers(handle: *mut XdnaEmuHandle) -> XdnaEmuResult {
     if handle.is_null() {
         return XdnaEmuResult::InvalidHandle;
     }
@@ -167,10 +165,7 @@ pub unsafe extern "C" fn xdna_emu_add_host_buffer(
 /// # Safety
 /// - `handle` must be valid
 #[no_mangle]
-pub unsafe extern "C" fn xdna_emu_alloc_buffer(
-    handle: *mut XdnaEmuHandle,
-    size: u64,
-) -> u64 {
+pub unsafe extern "C" fn xdna_emu_alloc_buffer(handle: *mut XdnaEmuHandle, size: u64) -> u64 {
     if handle.is_null() || size == 0 {
         return 0;
     }
@@ -211,10 +206,7 @@ pub unsafe extern "C" fn xdna_emu_alloc_buffer(
 /// - `handle` must be valid
 /// - `addr` should be a value previously returned by `xdna_emu_alloc_buffer`
 #[no_mangle]
-pub unsafe extern "C" fn xdna_emu_free_buffer(
-    handle: *mut XdnaEmuHandle,
-    addr: u64,
-) {
+pub unsafe extern "C" fn xdna_emu_free_buffer(handle: *mut XdnaEmuHandle, addr: u64) {
     if handle.is_null() {
         return;
     }

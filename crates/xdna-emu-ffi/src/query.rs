@@ -121,10 +121,7 @@ pub unsafe extern "C" fn xdna_emu_read_tile_memory(
     let end = start + size as usize;
 
     if end > mem.len() {
-        log::warn!(
-            "read_tile_memory: offset {} + size {} exceeds memory size {}",
-            offset, size, mem.len()
-        );
+        log::warn!("read_tile_memory: offset {} + size {} exceeds memory size {}", offset, size, mem.len());
         return -3;
     }
 
@@ -174,10 +171,7 @@ pub unsafe extern "C" fn xdna_emu_write_tile_memory(
 
     let data_slice = slice::from_raw_parts(data, size as usize);
     if !tile.write_data(offset as usize, data_slice) {
-        log::warn!(
-            "write_tile_memory: offset {} + size {} exceeds memory bounds",
-            offset, size
-        );
+        log::warn!("write_tile_memory: offset {} + size {} exceeds memory bounds", offset, size);
         return -3;
     }
 
@@ -256,8 +250,8 @@ pub unsafe extern "C" fn xdna_emu_set_log_level(level: *const c_char) -> i32 {
 
     let filter = match level_str {
         "error" => log::LevelFilter::Error,
-        "warn"  => log::LevelFilter::Warn,
-        "info"  => log::LevelFilter::Info,
+        "warn" => log::LevelFilter::Warn,
+        "info" => log::LevelFilter::Info,
         "debug" => log::LevelFilter::Debug,
         "trace" => log::LevelFilter::Trace,
         _ => {
@@ -294,9 +288,7 @@ pub unsafe extern "C" fn xdna_emu_get_lock_value(
     let tile = match device.tile(col as usize, row as usize) {
         Some(t) => t,
         None => {
-            set_last_error(format!(
-                "get_lock_value: tile ({}, {}) out of bounds", col, row
-            ));
+            set_last_error(format!("get_lock_value: tile ({}, {}) out of bounds", col, row));
             return -128;
         }
     };
@@ -307,7 +299,8 @@ pub unsafe extern "C" fn xdna_emu_get_lock_value(
     } else {
         set_last_error(format!(
             "get_lock_value: lock_id {} out of range (tile has {})",
-            lock_id, tile.locks.len()
+            lock_id,
+            tile.locks.len()
         ));
         -128
     }
@@ -420,9 +413,7 @@ pub unsafe extern "C" fn xdna_emu_get_dma_channel_stats(
             0
         }
         None => {
-            set_last_error(format!(
-                "get_dma_channel_stats: channel {} out of range", abs_ch
-            ));
+            set_last_error(format!("get_dma_channel_stats: channel {} out of range", abs_ch));
             -3
         }
     }

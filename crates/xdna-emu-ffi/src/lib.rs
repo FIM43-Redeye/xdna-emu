@@ -184,10 +184,7 @@ pub unsafe extern "C" fn xdna_emu_destroy(handle: *mut XdnaEmuHandle) {
 /// - `buffer` must point to at least `buffer_size` bytes
 /// - Returns the number of bytes written (excluding null terminator)
 #[no_mangle]
-pub unsafe extern "C" fn xdna_emu_get_error(
-    buffer: *mut c_char,
-    buffer_size: u64,
-) -> u64 {
+pub unsafe extern "C" fn xdna_emu_get_error(buffer: *mut c_char, buffer_size: u64) -> u64 {
     if buffer.is_null() || buffer_size == 0 {
         return 0;
     }
@@ -443,15 +440,11 @@ mod tests {
     fn test_tile_memory_null_handle() {
         unsafe {
             let mut buf = [0u8; 4];
-            let rc = xdna_emu_read_tile_memory(
-                std::ptr::null_mut(), 0, 2, 0, 4, buf.as_mut_ptr(),
-            );
+            let rc = xdna_emu_read_tile_memory(std::ptr::null_mut(), 0, 2, 0, 4, buf.as_mut_ptr());
             assert_eq!(rc, -1, "null handle should return -1");
 
             let data = [0u8; 4];
-            let rc = xdna_emu_write_tile_memory(
-                std::ptr::null_mut(), 0, 2, 0, 4, data.as_ptr(),
-            );
+            let rc = xdna_emu_write_tile_memory(std::ptr::null_mut(), 0, 2, 0, 4, data.as_ptr());
             assert_eq!(rc, -1, "null handle should return -1");
         }
     }
@@ -638,7 +631,10 @@ mod tests {
             // Trigger an error by querying an invalid tile.
             let _ = xdna_emu_get_lock_value(
                 // Need a valid handle but invalid tile.
-                xdna_emu_create(), 99, 99, 0,
+                xdna_emu_create(),
+                99,
+                99,
+                0,
             );
 
             let mut buf = [0i8; 256];
@@ -719,7 +715,9 @@ mod tests {
 
         // Navigate from the FFI crate back to the repo root.
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let repo_root = manifest_dir.join("../..").canonicalize()
+        let repo_root = manifest_dir
+            .join("../..")
+            .canonicalize()
             .expect("cannot find repo root from FFI crate");
         let cpp_path = repo_root.join("xrt-plugin/src/transport_inprocess.cpp");
         let ffi_src_dir = manifest_dir.join("src");
@@ -796,11 +794,7 @@ mod tests {
             .map(|s| s.as_str())
             .collect();
         if !extra.is_empty() {
-            eprintln!(
-                "Note: {} Rust FFI symbols not consumed by C++ transport: {:?}",
-                extra.len(),
-                extra
-            );
+            eprintln!("Note: {} Rust FFI symbols not consumed by C++ transport: {:?}", extra.len(), extra);
         }
     }
 

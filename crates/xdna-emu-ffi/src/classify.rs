@@ -184,14 +184,7 @@ mod tests {
     #[test]
     fn null_insts_returns_error_code() {
         let rc = unsafe {
-            xdna_emu_classify_kernargs(
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                0,
-                std::ptr::null_mut(),
-                0,
-            )
+            xdna_emu_classify_kernargs(std::ptr::null(), 0, std::ptr::null(), 0, std::ptr::null_mut(), 0)
         };
         assert_eq!(rc, -1);
     }
@@ -233,15 +226,8 @@ mod tests {
             )
         };
         assert!(rc_query >= 0, "query returned {}", rc_query);
-        let mut out = vec![
-            XdnaEmuKernargRole {
-                arg_idx: 0,
-                role: 0,
-                _pad: [0; 2],
-                bd_reg_addr: 0,
-            };
-            rc_query as usize
-        ];
+        let mut out =
+            vec![XdnaEmuKernargRole { arg_idx: 0, role: 0, _pad: [0; 2], bd_reg_addr: 0 }; rc_query as usize];
         let rc_fill = unsafe {
             xdna_emu_classify_kernargs(
                 std::ptr::null(),
