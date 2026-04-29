@@ -32,16 +32,7 @@ impl StreamPacket {
         dest_row: u8,
         dest_port: u8,
     ) -> Self {
-        Self {
-            data,
-            src_col,
-            src_row,
-            src_port,
-            dest_col,
-            dest_row,
-            dest_port,
-            is_last: false,
-        }
+        Self { data, src_col, src_row, src_port, dest_col, dest_row, dest_port, is_last: false }
     }
 
     /// Mark as last packet in transfer.
@@ -160,24 +151,20 @@ impl PacketHeader {
         let stream_id = (word & xdna_archspec::aie2::packet::STREAM_ID_MASK) as u8;
 
         let packet_type = PacketType::from_u8(
-            ((word >> xdna_archspec::aie2::packet::TYPE_SHIFT as usize) & xdna_archspec::aie2::packet::TYPE_MASK) as u8,
+            ((word >> xdna_archspec::aie2::packet::TYPE_SHIFT as usize)
+                & xdna_archspec::aie2::packet::TYPE_MASK) as u8,
         );
 
-        let src_row =
-            ((word >> xdna_archspec::aie2::packet::SRC_ROW_SHIFT as usize) & xdna_archspec::aie2::packet::SRC_ROW_MASK) as u8;
+        let src_row = ((word >> xdna_archspec::aie2::packet::SRC_ROW_SHIFT as usize)
+            & xdna_archspec::aie2::packet::SRC_ROW_MASK) as u8;
 
-        let src_col =
-            ((word >> xdna_archspec::aie2::packet::SRC_COL_SHIFT as usize) & xdna_archspec::aie2::packet::SRC_COL_MASK) as u8;
+        let src_col = ((word >> xdna_archspec::aie2::packet::SRC_COL_SHIFT as usize)
+            & xdna_archspec::aie2::packet::SRC_COL_MASK) as u8;
 
         // Check parity (odd parity means total 1-bits should be odd)
         let parity_ok = word.count_ones() & 1 == 1;
 
-        let header = Self {
-            stream_id,
-            packet_type,
-            src_row,
-            src_col,
-        };
+        let header = Self { stream_id, packet_type, src_row, src_col };
 
         (header, parity_ok)
     }
@@ -205,20 +192,12 @@ pub struct PacketRoute {
 impl PacketRoute {
     /// Create a new packet route.
     pub fn new(stream_id: u8, dest_port: u8) -> Self {
-        Self {
-            stream_id,
-            dest_ports: vec![dest_port],
-            enabled: true,
-        }
+        Self { stream_id, dest_ports: vec![dest_port], enabled: true }
     }
 
     /// Create a multicast route to multiple ports.
     pub fn multicast(stream_id: u8, dest_ports: Vec<u8>) -> Self {
-        Self {
-            stream_id,
-            dest_ports,
-            enabled: true,
-        }
+        Self { stream_id, dest_ports, enabled: true }
     }
 
     /// Add a destination port (for multicast).

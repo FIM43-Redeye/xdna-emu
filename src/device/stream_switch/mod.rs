@@ -73,7 +73,6 @@ pub struct StreamSwitch {
     pub external_latency: u8,
 
     // === Packet routing state ===
-
     /// Per-slave packet slot config (4 slots per port), indexed by slave port.
     slave_slots: Vec<[PacketSlot; 4]>,
     /// Per-master packet config, indexed by master port.
@@ -118,9 +117,7 @@ impl StreamSwitch {
         layout
             .iter()
             .enumerate()
-            .map(|(idx, &encoded)| {
-                StreamPort::new(idx as u8, direction, PortType::from_spec(encoded))
-            })
+            .map(|(idx, &encoded)| StreamPort::new(idx as u8, direction, PortType::from_spec(encoded)))
             .collect()
     }
 
@@ -265,22 +262,30 @@ impl StreamSwitch {
 
     /// Find a DMA master port (for MM2S).
     pub fn dma_master(&self, channel: u8) -> Option<&StreamPort> {
-        self.masters.iter().find(|p| matches!(p.port_type, PortType::Dma(ch) if ch == channel))
+        self.masters
+            .iter()
+            .find(|p| matches!(p.port_type, PortType::Dma(ch) if ch == channel))
     }
 
     /// Find a mutable DMA master port (for MM2S).
     pub fn dma_master_mut(&mut self, channel: u8) -> Option<&mut StreamPort> {
-        self.masters.iter_mut().find(|p| matches!(p.port_type, PortType::Dma(ch) if ch == channel))
+        self.masters
+            .iter_mut()
+            .find(|p| matches!(p.port_type, PortType::Dma(ch) if ch == channel))
     }
 
     /// Find a DMA slave port (for S2MM).
     pub fn dma_slave(&self, channel: u8) -> Option<&StreamPort> {
-        self.slaves.iter().find(|p| matches!(p.port_type, PortType::Dma(ch) if ch == channel))
+        self.slaves
+            .iter()
+            .find(|p| matches!(p.port_type, PortType::Dma(ch) if ch == channel))
     }
 
     /// Find a mutable DMA slave port (for S2MM).
     pub fn dma_slave_mut(&mut self, channel: u8) -> Option<&mut StreamPort> {
-        self.slaves.iter_mut().find(|p| matches!(p.port_type, PortType::Dma(ch) if ch == channel))
+        self.slaves
+            .iter_mut()
+            .find(|p| matches!(p.port_type, PortType::Dma(ch) if ch == channel))
     }
 
     /// Check if any port or pipeline has pending data.
@@ -348,19 +353,21 @@ impl StreamSwitch {
         // Add the local route with latency based on port types (avoid duplicates)
         let slave_type = self.slaves.get(slave_idx).map(|p| p.port_type).unwrap_or(PortType::Core);
         let master_type = self.masters.get(master_idx).map(|p| p.port_type).unwrap_or(PortType::Core);
-        let route = LocalRoute::with_port_latency(slave_idx as u8, master_idx as u8, &slave_type, &master_type);
-        if !self.local_routes.iter().any(|r| {
-            r.slave_idx == route.slave_idx && r.master_idx == route.master_idx
-        }) {
+        let route =
+            LocalRoute::with_port_latency(slave_idx as u8, master_idx as u8, &slave_type, &master_type);
+        if !self
+            .local_routes
+            .iter()
+            .any(|r| r.slave_idx == route.slave_idx && r.master_idx == route.master_idx)
+        {
             self.local_routes.push(route);
         }
     }
 
     /// Remove a local route.
     pub fn remove_local_route(&mut self, slave_idx: usize, master_idx: usize) {
-        self.local_routes.retain(|r| {
-            !(r.slave_idx == slave_idx as u8 && r.master_idx == master_idx as u8)
-        });
+        self.local_routes
+            .retain(|r| !(r.slave_idx == slave_idx as u8 && r.master_idx == master_idx as u8));
     }
 
     /// Clear all local routes.
@@ -417,9 +424,15 @@ impl StreamSwitch {
 
             let slave_has_data = self.slaves[slave_idx].has_data();
 
-            log::trace!("TileSwitch({},{}): route slave[{}]->master[{}] has_data={} fifo_len={}",
-                self.col, self.row, slave_idx, master_idx, slave_has_data,
-                self.slaves[slave_idx].fifo.len());
+            log::trace!(
+                "TileSwitch({},{}): route slave[{}]->master[{}] has_data={} fifo_len={}",
+                self.col,
+                self.row,
+                slave_idx,
+                master_idx,
+                slave_has_data,
+                self.slaves[slave_idx].fifo.len()
+            );
 
             if slave_has_data {
                 // Pop once from slave
@@ -449,10 +462,17 @@ impl StreamSwitch {
                             cycles_remaining: peer.latency,
                         });
                         dest_count += 1;
-                        log::debug!("TileSwitch({},{}): slave[{}] -> pipeline({}) -> master[{}] data=0x{:08X}{}{}",
-                            self.col, self.row, slave_idx, peer.latency, peer_master, data,
+                        log::debug!(
+                            "TileSwitch({},{}): slave[{}] -> pipeline({}) -> master[{}] data=0x{:08X}{}{}",
+                            self.col,
+                            self.row,
+                            slave_idx,
+                            peer.latency,
+                            peer_master,
+                            data,
                             if tlast { " TLAST" } else { "" },
-                            if dest_count > 1 { " (multicast)" } else { "" });
+                            if dest_count > 1 { " (multicast)" } else { "" }
+                        );
                     }
                     let _ = dest_count; // used in log messages above
                 }
@@ -529,9 +549,18 @@ impl StreamSwitch {
     pub fn configure_slave_slot(&mut self, slave_port: usize, slot: usize, value: u32) {
         if slave_port < self.slave_slots.len() && slot < 4 {
             let parsed = PacketSlot::from_register(value);
-            log::debug!("TileSwitch({},{}): slave[{}] slot[{}] = id={} mask=0x{:02X} en={} msel={} arb={}",
-                self.col, self.row, slave_port, slot,
-                parsed.pkt_id, parsed.mask, parsed.enable, parsed.msel, parsed.arbiter);
+            log::debug!(
+                "TileSwitch({},{}): slave[{}] slot[{}] = id={} mask=0x{:02X} en={} msel={} arb={}",
+                self.col,
+                self.row,
+                slave_port,
+                slot,
+                parsed.pkt_id,
+                parsed.mask,
+                parsed.enable,
+                parsed.msel,
+                parsed.arbiter
+            );
             self.slave_slots[slave_port][slot] = parsed;
         }
     }
@@ -542,9 +571,16 @@ impl StreamSwitch {
     pub fn configure_master_packet(&mut self, master_port: usize, value: u32) {
         if master_port < self.master_packet_config.len() {
             let parsed = MasterPacketConfig::from_register(value);
-            log::debug!("TileSwitch({},{}): master[{}] pkt_en={} drop_hdr={} arb={} msel_en=0b{:04b}",
-                self.col, self.row, master_port,
-                parsed.packet_enable, parsed.drop_header, parsed.arbiter, parsed.msel_enable);
+            log::debug!(
+                "TileSwitch({},{}): master[{}] pkt_en={} drop_hdr={} arb={} msel_en=0b{:04b}",
+                self.col,
+                self.row,
+                master_port,
+                parsed.packet_enable,
+                parsed.drop_header,
+                parsed.arbiter,
+                parsed.msel_enable
+            );
             self.master_packet_config[master_port] = parsed;
         }
     }
@@ -610,7 +646,9 @@ impl StreamSwitch {
             }
 
             // Also skip if no slots are configured (defensive)
-            let has_any_slot = self.slave_slots.get(slave_idx)
+            let has_any_slot = self
+                .slave_slots
+                .get(slave_idx)
                 .map_or(false, |slots| slots.iter().any(|s| s.enable));
             if !has_any_slot {
                 continue;
@@ -639,8 +677,14 @@ impl StreamSwitch {
                         if let Some(locked_by) = self.arbiter_locks[arbiter as usize] {
                             if locked_by != slave_idx {
                                 self.slaves[slave_idx].cycle_stalled = true;
-                                log::trace!("TileSwitch({},{}): slave[{}] waiting for arbiter {} (held by slave[{}])",
-                                    self.col, self.row, slave_idx, arbiter, locked_by);
+                                log::trace!(
+                                    "TileSwitch({},{}): slave[{}] waiting for arbiter {} (held by slave[{}])",
+                                    self.col,
+                                    self.row,
+                                    slave_idx,
+                                    arbiter,
+                                    locked_by
+                                );
                                 continue;
                             }
                         }
@@ -656,17 +700,27 @@ impl StreamSwitch {
                             // also wants this arbiter and has higher RR priority
                             let mut dominated = false;
                             for other in 0..num_slaves {
-                                if other == slave_idx { continue; }
-                                if !self.slaves[other].packet_enable { continue; }
-                                if self.active_packets[other].is_some() { continue; }
-                                if !self.slaves[other].has_data() { continue; }
+                                if other == slave_idx {
+                                    continue;
+                                }
+                                if !self.slaves[other].packet_enable {
+                                    continue;
+                                }
+                                if self.active_packets[other].is_some() {
+                                    continue;
+                                }
+                                if !self.slaves[other].has_data() {
+                                    continue;
+                                }
                                 // Check if 'other' also routes to this arbiter
                                 let other_header = match self.slaves[other].peek() {
                                     Some(w) => w,
                                     None => continue,
                                 };
                                 let (other_hdr, _) = PacketHeader::decode(other_header);
-                                if let Some((_, _, other_arb)) = self.resolve_packet_route(other, other_hdr.stream_id) {
+                                if let Some((_, _, other_arb)) =
+                                    self.resolve_packet_route(other, other_hdr.stream_id)
+                                {
                                     if other_arb == arbiter {
                                         // Both want the same arbiter. Compare RR distance.
                                         let my_dist = (slave_idx + num_slaves - priority) % num_slaves;
@@ -680,8 +734,13 @@ impl StreamSwitch {
                             }
                             if dominated {
                                 self.slaves[slave_idx].cycle_stalled = true;
-                                log::trace!("TileSwitch({},{}): slave[{}] deferred by RR priority for arbiter {}",
-                                    self.col, self.row, slave_idx, arbiter);
+                                log::trace!(
+                                    "TileSwitch({},{}): slave[{}] deferred by RR priority for arbiter {}",
+                                    self.col,
+                                    self.row,
+                                    slave_idx,
+                                    arbiter
+                                );
                                 continue;
                             }
                         }
@@ -698,8 +757,12 @@ impl StreamSwitch {
                             });
                             if !all_can_accept {
                                 self.slaves[slave_idx].cycle_stalled = true;
-                                log::trace!("TileSwitch({},{}): slave[{}] header backpressure (master full)",
-                                    self.col, self.row, slave_idx);
+                                log::trace!(
+                                    "TileSwitch({},{}): slave[{}] header backpressure (master full)",
+                                    self.col,
+                                    self.row,
+                                    slave_idx
+                                );
                                 continue;
                             }
                         }
@@ -729,11 +792,8 @@ impl StreamSwitch {
                         } else {
                             // Lock the arbiter for this multi-word packet
                             self.arbiter_locks[arbiter as usize] = Some(slave_idx);
-                            self.active_packets[slave_idx] = Some(ActivePacket {
-                                target_masters: masters,
-                                words_forwarded: 0,
-                                arbiter,
-                            });
+                            self.active_packets[slave_idx] =
+                                Some(ActivePacket { target_masters: masters, words_forwarded: 0, arbiter });
                         }
                     }
                     None => {
@@ -743,18 +803,26 @@ impl StreamSwitch {
                         //
                         // Dump full slot config for this slave to aid diagnosis.
                         let port_type = &self.slaves[slave_idx].port_type;
-                        let slots: Vec<String> = self.slave_slots[slave_idx].iter()
+                        let slots: Vec<String> = self.slave_slots[slave_idx]
+                            .iter()
                             .enumerate()
-                            .map(|(i, s)| format!(
-                                "slot[{}]: en={} id={} mask=0x{:02X} msel={} arb={}",
-                                i, s.enable, s.pkt_id, s.mask, s.msel, s.arbiter
-                            ))
+                            .map(|(i, s)| {
+                                format!(
+                                    "slot[{}]: en={} id={} mask=0x{:02X} msel={} arb={}",
+                                    i, s.enable, s.pkt_id, s.mask, s.msel, s.arbiter
+                                )
+                            })
                             .collect();
                         let msg = format!(
                             "TileSwitch({},{}): no packet route for pkt_id={} on slave[{}] ({:?}) \
                              header=0x{:08X} -- configured slots: [{}]",
-                            self.col, self.row, pkt_id, slave_idx, port_type,
-                            header_word, slots.join(", "),
+                            self.col,
+                            self.row,
+                            pkt_id,
+                            slave_idx,
+                            port_type,
+                            header_word,
+                            slots.join(", "),
                         );
                         log::error!("{}", msg);
                         self.fatal_errors.push(msg);
@@ -774,8 +842,12 @@ impl StreamSwitch {
                 });
                 if !all_can_accept {
                     self.slaves[slave_idx].cycle_stalled = true;
-                    log::trace!("TileSwitch({},{}): slave[{}] data backpressure (master full)",
-                        self.col, self.row, slave_idx);
+                    log::trace!(
+                        "TileSwitch({},{}): slave[{}] data backpressure (master full)",
+                        self.col,
+                        self.row,
+                        slave_idx
+                    );
                     continue;
                 }
 
@@ -807,12 +879,24 @@ impl StreamSwitch {
                         self.arbiter_locks[arb] = None;
                         self.arbiter_priority[arb] = (slave_idx + 1) % num_slaves;
                     }
-                    log::debug!("TileSwitch({},{}): pkt data 0x{:08X} slave[{}] -> {:?} TLAST (end of pkt)",
-                        self.col, self.row, data, slave_idx, targets);
+                    log::debug!(
+                        "TileSwitch({},{}): pkt data 0x{:08X} slave[{}] -> {:?} TLAST (end of pkt)",
+                        self.col,
+                        self.row,
+                        data,
+                        slave_idx,
+                        targets
+                    );
                     self.active_packets[slave_idx] = None;
                 } else {
-                    log::trace!("TileSwitch({},{}): pkt data 0x{:08X} slave[{}] -> {:?}",
-                        self.col, self.row, data, slave_idx, targets);
+                    log::trace!(
+                        "TileSwitch({},{}): pkt data 0x{:08X} slave[{}] -> {:?}",
+                        self.col,
+                        self.row,
+                        data,
+                        slave_idx,
+                        targets
+                    );
                 }
             }
         }
@@ -829,7 +913,9 @@ impl StreamSwitch {
             if !self.slaves[slave_idx].packet_enable {
                 continue;
             }
-            let has_any_slot = self.slave_slots.get(slave_idx)
+            let has_any_slot = self
+                .slave_slots
+                .get(slave_idx)
                 .map_or(false, |slots| slots.iter().any(|s| s.enable));
             if has_any_slot && self.slaves[slave_idx].has_data() {
                 return true;

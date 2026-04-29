@@ -92,9 +92,7 @@ impl MasterPacketConfig {
 
     /// Check if this master accepts packets from the given arbiter and msel.
     pub fn accepts(&self, arbiter: u8, msel: u8) -> bool {
-        self.packet_enable
-            && self.arbiter == arbiter
-            && (self.msel_enable >> msel) & 1 != 0
+        self.packet_enable && self.arbiter == arbiter && (self.msel_enable >> msel) & 1 != 0
     }
 }
 
@@ -139,12 +137,17 @@ impl LocalRoute {
     }
 
     /// Create a route with latency determined by port types.
-    pub fn with_port_latency(slave_idx: u8, master_idx: u8, slave_type: &super::PortType, master_type: &super::PortType) -> Self {
+    pub fn with_port_latency(
+        slave_idx: u8,
+        master_idx: u8,
+        slave_type: &super::PortType,
+        master_type: &super::PortType,
+    ) -> Self {
         let latency = match (slave_type.is_external(), master_type.is_external()) {
             (false, false) => arch_timing::STREAM_LOCAL_TO_LOCAL_LATENCY,
-            (false, true)  => arch_timing::STREAM_LOCAL_TO_EXTERNAL_LATENCY,
-            (true, false)  => arch_timing::STREAM_LOCAL_TO_LOCAL_LATENCY, // ext->local same as local->local
-            (true, true)   => arch_timing::STREAM_EXTERNAL_TO_EXTERNAL_LATENCY,
+            (false, true) => arch_timing::STREAM_LOCAL_TO_EXTERNAL_LATENCY,
+            (true, false) => arch_timing::STREAM_LOCAL_TO_LOCAL_LATENCY, // ext->local same as local->local
+            (true, true) => arch_timing::STREAM_EXTERNAL_TO_EXTERNAL_LATENCY,
         };
         Self { slave_idx, master_idx, enabled: true, latency }
     }

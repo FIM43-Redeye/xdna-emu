@@ -265,8 +265,10 @@ fn test_has_pending_local() {
     // Data delivered to master -- master has data so has_pending_data is true
     // but has_pending_local checks slaves and pipeline, not masters
     // Pipeline should be empty now, and slave is empty
-    assert!(!ss.switch_pipeline.is_empty() || ss.masters[0].has_data(),
-        "Data should be delivered or in pipeline");
+    assert!(
+        !ss.switch_pipeline.is_empty() || ss.masters[0].has_data(),
+        "Data should be delivered or in pipeline"
+    );
     // Clear pipeline check
     ss.masters[0].pop();
     assert!(!ss.has_pending_local(), "Pipeline empty after delivery and drain");
@@ -410,12 +412,7 @@ fn test_packet_header_encode_decode() {
 
 #[test]
 fn test_packet_header_encode_decode_all_types() {
-    for ptype in [
-        PacketType::Data,
-        PacketType::Control,
-        PacketType::Config,
-        PacketType::Trace,
-    ] {
+    for ptype in [PacketType::Data, PacketType::Control, PacketType::Config, PacketType::Trace] {
         let original = PacketHeader::new(15, 5, 6).with_type(ptype);
         let encoded = original.encode();
         let (decoded, parity_ok) = PacketHeader::decode(encoded);
@@ -429,10 +426,10 @@ fn test_packet_header_encode_decode_all_types() {
 fn test_packet_header_field_masks() {
     // Test with maximum values for each field
     let header = PacketHeader {
-        stream_id: 0x1F,   // 5 bits max
+        stream_id: 0x1F, // 5 bits max
         packet_type: PacketType::Reserved,
-        src_row: 0x1F,     // 5 bits max
-        src_col: 0x7F,     // 7 bits max
+        src_row: 0x1F, // 5 bits max
+        src_col: 0x7F, // 7 bits max
     };
 
     let encoded = header.encode();
@@ -613,7 +610,8 @@ fn make_slot_reg(pkt_id: u8, mask: u8, msel: u8, arbiter: u8) -> u32 {
 /// Helper: build a master packet config register value.
 /// Layout: enable[31], packet_enable[30], drop_header[7], msel_enable[6:3], arbiter[2:0]
 fn make_master_pkt_reg(arbiter: u8, msel_enable: u8, drop_header: bool) -> u32 {
-    (1 << 31) | (1 << 30)
+    (1 << 31)
+        | (1 << 30)
         | if drop_header { 1 << 7 } else { 0 }
         | ((msel_enable as u32) << 3)
         | (arbiter as u32)
@@ -673,16 +671,14 @@ fn test_arbiter_lock_prevents_interleave() {
 
     // Words 1-3 of first packet: 0xAAAA_xxxx
     for i in 1..4 {
-        assert_eq!(output[i] >> 16, 0xAAAA,
-            "word {} should be from packet 1, got 0x{:08X}", i, output[i]);
+        assert_eq!(output[i] >> 16, 0xAAAA, "word {} should be from packet 1, got 0x{:08X}", i, output[i]);
     }
 
     // Second packet: words 4-7
     let second_pkt_id = output[4] & 0x1F;
     assert_eq!(second_pkt_id, 2, "packet 2 should follow");
     for i in 5..8 {
-        assert_eq!(output[i] >> 16, 0xBBBB,
-            "word {} should be from packet 2, got 0x{:08X}", i, output[i]);
+        assert_eq!(output[i] >> 16, 0xBBBB, "word {} should be from packet 2, got 0x{:08X}", i, output[i]);
     }
 }
 
@@ -724,8 +720,12 @@ fn test_different_arbiters_no_contention() {
     // Verify master 7 got packet 1, master 8 got packet 2
     let mut m7: Vec<u32> = Vec::new();
     let mut m8: Vec<u32> = Vec::new();
-    while let Some(w) = ss.masters[7].pop() { m7.push(w); }
-    while let Some(w) = ss.masters[8].pop() { m8.push(w); }
+    while let Some(w) = ss.masters[7].pop() {
+        m7.push(w);
+    }
+    while let Some(w) = ss.masters[8].pop() {
+        m8.push(w);
+    }
 
     assert_eq!(m7.len(), 2, "master 7 should have 2 words");
     assert_eq!(m8.len(), 2, "master 8 should have 2 words");
@@ -807,12 +807,9 @@ fn test_begin_routing_cycle_seeds_from_fifo() {
     // begin_routing_cycle seeds cycle_active from existing FIFO state
     ss.begin_routing_cycle();
 
-    assert!(ss.slaves[1].cycle_active,
-        "slave with existing data should be active");
-    assert!(!ss.slaves[0].cycle_active,
-        "empty slave should not be active");
-    assert!(!ss.masters[0].cycle_active,
-        "empty master should not be active");
+    assert!(ss.slaves[1].cycle_active, "slave with existing data should be active");
+    assert!(!ss.slaves[0].cycle_active, "empty slave should not be active");
+    assert!(!ss.masters[0].cycle_active, "empty master should not be active");
 }
 
 #[test]
@@ -828,8 +825,7 @@ fn test_begin_routing_cycle_clears_previous() {
 
     // begin_routing_cycle clears the stale active flag
     ss.begin_routing_cycle();
-    assert!(!ss.slaves[0].cycle_active,
-        "empty port should not be active after begin_routing_cycle");
+    assert!(!ss.slaves[0].cycle_active, "empty port should not be active after begin_routing_cycle");
 }
 
 #[test]
@@ -919,8 +915,7 @@ fn test_packet_routing_basic_memtile() {
 
     // No other master should have data (spot-check DMA and South masters)
     for m in [0, 1, 7, 8, 9, 10, 11, 13] {
-        assert!(!ss.masters[m].has_data(),
-            "master[{}] should be empty but has data", m);
+        assert!(!ss.masters[m].has_data(), "master[{}] should be empty but has data", m);
     }
 }
 
@@ -996,8 +991,7 @@ fn test_packet_routing_drop_header() {
     while let Some((w, _)) = ss.masters[0].pop_with_tlast() {
         output.push(w);
     }
-    assert_eq!(output.len(), 2,
-        "drop_header should remove header, leaving 2 data words: {:08X?}", output);
+    assert_eq!(output.len(), 2, "drop_header should remove header, leaving 2 data words: {:08X?}", output);
     assert_eq!(output[0], 0xDA7A_0001);
     assert_eq!(output[1], 0xDA7A_0002);
 
@@ -1024,8 +1018,10 @@ fn test_packet_routing_no_route_is_fatal() {
     ss.step();
 
     // Should produce a fatal error
-    assert!(!ss.fatal_errors.is_empty(),
-        "unroutable packet should produce fatal error");
-    assert!(ss.fatal_errors[0].contains("no packet route"),
-        "error should mention 'no packet route': {}", ss.fatal_errors[0]);
+    assert!(!ss.fatal_errors.is_empty(), "unroutable packet should produce fatal error");
+    assert!(
+        ss.fatal_errors[0].contains("no packet route"),
+        "error should mention 'no packet route': {}",
+        ss.fatal_errors[0]
+    );
 }
