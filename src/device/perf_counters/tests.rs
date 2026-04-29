@@ -645,7 +645,9 @@ fn active_core_ticks_only_while_core_active() {
     // Configure counter 0: start=ACTIVE_CORE, stop=0 (none), counter_hi=1, event_width=7
     bank.write_control_start_stop(
         EVENT_ACTIVE_CORE as u32, // start0=0x1C, stop0=0, start1=0, stop1=0
-        0, 1, 7,
+        0,
+        1,
+        7,
     );
     // Fire start event -> counter 0 becomes Active.
     bank.handle_event(EVENT_ACTIVE_CORE);
@@ -716,12 +718,7 @@ fn threshold_fires_once_at_event_value() {
     // Cycles 1-9: counter ticks but threshold not yet reached.
     for cycle in 1..10 {
         let fired = bank.tick_active_cycles();
-        assert!(
-            fired.is_empty(),
-            "cycle {} fired prematurely: {:?}",
-            cycle,
-            fired
-        );
+        assert!(fired.is_empty(), "cycle {} fired prematurely: {:?}", cycle, fired);
     }
 
     // Cycle 10: counter hits threshold, should report counter index 0.
@@ -730,10 +727,7 @@ fn threshold_fires_once_at_event_value() {
 
     // Cycle 11+: no re-fire without a reset event.
     let fired = bank.tick_active_cycles();
-    assert!(
-        fired.is_empty(),
-        "cycle 11 should not re-fire (no reset configured)"
-    );
+    assert!(fired.is_empty(), "cycle 11 should not re-fire (no reset configured)");
 }
 
 /// Self-reset path coverage: a counter whose `reset_event` matches its own

@@ -233,12 +233,7 @@ impl PerfCounterBank {
     /// aie-rt PerfMod with StartStopShift=16.
     ///
     /// `event_width` is 7 for core/memory/shim, 8 for memtile.
-    pub fn read_control_start_stop(
-        &self,
-        counter_lo: usize,
-        counter_hi: usize,
-        event_width: u32,
-    ) -> u32 {
+    pub fn read_control_start_stop(&self, counter_lo: usize, counter_hi: usize, event_width: u32) -> u32 {
         let _ = event_width; // Width is used for masking on write; reads return full stored value
         let mut val = 0u32;
         if counter_lo < self.num_counters {
@@ -407,9 +402,7 @@ impl PerfCounterBank {
 
             // Check threshold: fire event when counter reaches event_value.
             // event_value of 0 means no threshold configured.
-            if self.event_value[i] != 0
-                && self.counter_value[i] == self.event_value[i]
-            {
+            if self.event_value[i] != 0 && self.counter_value[i] == self.event_value[i] {
                 threshold_events.push(i);
             }
         }
