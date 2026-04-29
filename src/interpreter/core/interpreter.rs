@@ -10,8 +10,7 @@ use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::traits::{DecodeError, Decoder, ExecuteResult, Executor};
 
 /// Core execution status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CoreStatus {
     /// Core is ready to execute.
     #[default]
@@ -30,7 +29,6 @@ pub enum CoreStatus {
     /// Core encountered an error.
     Error,
 }
-
 
 /// Result of a single step execution.
 #[derive(Debug, Clone)]
@@ -162,8 +160,11 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                 log::debug!(
                     "DecodeError at PC=0x{:x}, {} bytes avail, prog_len=0x{:x}, \
                      pending_branch={:?}: {:?}",
-                    pc, bytes.len(), program_mem.len(),
-                    ctx.pending_branch_target(), e
+                    pc,
+                    bytes.len(),
+                    program_mem.len(),
+                    ctx.pending_branch_target(),
+                    e
                 );
                 self.status = CoreStatus::Error;
                 return StepResult::DecodeError(e);
@@ -257,12 +258,7 @@ where
 {
     /// Create a new interpreter with the given decoder and executor.
     pub fn new(decoder: D, executor: E) -> Self {
-        Self {
-            decoder,
-            executor,
-            status: CoreStatus::Ready,
-            last_bundle: None,
-        }
+        Self { decoder, executor, status: CoreStatus::Ready, last_bundle: None }
     }
 
     /// Get the current core status.
@@ -279,9 +275,7 @@ where
     pub fn is_stalled(&self) -> bool {
         matches!(
             self.status,
-            CoreStatus::WaitingLock { .. }
-                | CoreStatus::WaitingDma { .. }
-                | CoreStatus::WaitingStream { .. }
+            CoreStatus::WaitingLock { .. } | CoreStatus::WaitingDma { .. } | CoreStatus::WaitingStream { .. }
         )
     }
 
@@ -391,24 +385,39 @@ where
             }
 
             ExecuteResult::WaitLock { raw_lock_id } => {
-                log::info!("Core({},{}) stall: WaitingLock raw_lock={} pc=0x{:X}",
-                    tile.col, tile.row, raw_lock_id, ctx.pc());
+                log::info!(
+                    "Core({},{}) stall: WaitingLock raw_lock={} pc=0x{:X}",
+                    tile.col,
+                    tile.row,
+                    raw_lock_id,
+                    ctx.pc()
+                );
                 self.status = CoreStatus::WaitingLock { raw_lock_id };
                 ctx.record_stall(1);
                 StepResult::WaitLock { raw_lock_id }
             }
 
             ExecuteResult::WaitDma { channel } => {
-                log::info!("Core({},{}) stall: WaitingDma ch={} pc=0x{:X}",
-                    tile.col, tile.row, channel, ctx.pc());
+                log::info!(
+                    "Core({},{}) stall: WaitingDma ch={} pc=0x{:X}",
+                    tile.col,
+                    tile.row,
+                    channel,
+                    ctx.pc()
+                );
                 self.status = CoreStatus::WaitingDma { channel };
                 ctx.record_stall(1);
                 StepResult::WaitDma { channel }
             }
 
             ExecuteResult::WaitStream { port } => {
-                log::info!("Core({},{}) stall: WaitingStream port={} pc=0x{:X}",
-                    tile.col, tile.row, port, ctx.pc());
+                log::info!(
+                    "Core({},{}) stall: WaitingStream port={} pc=0x{:X}",
+                    tile.col,
+                    tile.row,
+                    port,
+                    ctx.pc()
+                );
                 self.status = CoreStatus::WaitingStream { port };
                 ctx.record_stall(1);
                 StepResult::WaitStream { port }
@@ -548,7 +557,9 @@ where
                 result @ StepResult::DecodeError(_) => return (result, ctx.cycles - start_cycles),
                 result @ StepResult::ExecError(_) => return (result, ctx.cycles - start_cycles),
                 // On stall, count as one cycle and continue
-                StepResult::WaitLock { .. } | StepResult::WaitDma { .. } | StepResult::WaitStream { .. } => continue,
+                StepResult::WaitLock { .. } | StepResult::WaitDma { .. } | StepResult::WaitStream { .. } => {
+                    continue
+                }
             }
         }
 
@@ -596,10 +607,7 @@ mod tests {
         let mut ctx = ExecutionContext::new();
         // 4 NOP instructions
         let mut tile = make_tile_with_program(&[
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ]);
 
         for i in 0..4 {
