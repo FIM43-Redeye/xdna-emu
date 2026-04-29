@@ -101,16 +101,12 @@ impl Config {
     ///
     /// Returns the configured path, or "../llvm-aie" as fallback.
     pub fn llvm_aie_path(&self) -> String {
-        self.llvm_aie_path
-            .clone()
-            .unwrap_or_else(|| "../llvm-aie".to_string())
+        self.llvm_aie_path.clone().unwrap_or_else(|| "../llvm-aie".to_string())
     }
 
     /// Get the mlir-aie path, with fallback to default.
     pub fn mlir_aie_path(&self) -> String {
-        self.mlir_aie_path
-            .clone()
-            .unwrap_or_else(|| "../mlir-aie".to_string())
+        self.mlir_aie_path.clone().unwrap_or_else(|| "../mlir-aie".to_string())
     }
 
     /// Get the XRT path, with fallback to platform-appropriate default.
@@ -175,9 +171,7 @@ impl Config {
     /// This is the most commonly used test binary across the test suite.
     /// Returns `None` if the file does not exist at the resolved path.
     pub fn add_one_xclbin(&self) -> Option<PathBuf> {
-        let path = self.mlir_aie_subpath(
-            "build/test/npu-xrt/add_one_objFifo/aie.xclbin",
-        );
+        let path = self.mlir_aie_subpath("build/test/npu-xrt/add_one_objFifo/aie.xclbin");
         path.exists().then_some(path)
     }
 
@@ -185,9 +179,8 @@ impl Config {
     ///
     /// Returns `None` if the file does not exist at the resolved path.
     pub fn add_one_elf(&self) -> Option<PathBuf> {
-        let path = self.mlir_aie_subpath(
-            "build/test/npu-xrt/add_one_objFifo/aie_arch.mlir.prj/main_core_0_2.elf",
-        );
+        let path =
+            self.mlir_aie_subpath("build/test/npu-xrt/add_one_objFifo/aie_arch.mlir.prj/main_core_0_2.elf");
         path.exists().then_some(path)
     }
 
@@ -400,10 +393,7 @@ mod tests {
 
     #[test]
     fn test_fixture_helpers() {
-        let config = Config {
-            mlir_aie_path: Some("/test/mlir-aie".to_string()),
-            ..Default::default()
-        };
+        let config = Config { mlir_aie_path: Some("/test/mlir-aie".to_string()), ..Default::default() };
         // mlir_aie_subpath joins correctly
         let sub = config.mlir_aie_subpath("build/test/npu-xrt");
         assert!(sub.ends_with("build/test/npu-xrt"));
@@ -472,10 +462,8 @@ mod tests {
 
     #[test]
     fn test_aietools_path_nonexistent() {
-        let config = Config {
-            aietools_path: Some("/nonexistent/aietools".to_string()),
-            ..Default::default()
-        };
+        let config =
+            Config { aietools_path: Some("/nonexistent/aietools".to_string()), ..Default::default() };
         // Configured but path does not exist on disk -> returns None
         assert!(config.aietools_path().is_none());
     }

@@ -65,13 +65,21 @@ fn extract_build_diagnostic(error: &str) -> String {
             || trimmed.starts_with("KeyError:")
             || trimmed.starts_with("subprocess.CalledProcessError:")
         {
-            let short = if trimmed.len() > 80 { &trimmed[..80] } else { trimmed };
+            let short = if trimmed.len() > 80 {
+                &trimmed[..80]
+            } else {
+                trimmed
+            };
             return format!("Python: {}", short);
         }
 
         // make error
         if trimmed.starts_with("make:") && trimmed.contains("***") {
-            let short = if trimmed.len() > 80 { &trimmed[..80] } else { trimmed };
+            let short = if trimmed.len() > 80 {
+                &trimmed[..80]
+            } else {
+                trimmed
+            };
             return short.to_string();
         }
     }
@@ -153,30 +161,39 @@ impl CellState {
             Both => match (self.peano, self.chess) {
                 (NotStarted, NotStarted) => ('X', style::Color::DarkGrey),
                 // One or both building, neither done
-                (Building, NotStarted) | (NotStarted, Building) |
-                (Building, Building) => ('.', style::Color::Yellow),
+                (Building, NotStarted) | (NotStarted, Building) | (Building, Building) => {
+                    ('.', style::Color::Yellow)
+                }
                 // Peano done, Chess building -- flicker
-                (Passed, Building) => if flicker_phase {
-                    ('P', style::Color::Green)
-                } else {
-                    ('.', style::Color::Yellow)
-                },
-                (Failed, Building) => if flicker_phase {
-                    ('P', style::Color::Red)
-                } else {
-                    ('.', style::Color::Yellow)
-                },
+                (Passed, Building) => {
+                    if flicker_phase {
+                        ('P', style::Color::Green)
+                    } else {
+                        ('.', style::Color::Yellow)
+                    }
+                }
+                (Failed, Building) => {
+                    if flicker_phase {
+                        ('P', style::Color::Red)
+                    } else {
+                        ('.', style::Color::Yellow)
+                    }
+                }
                 // Chess done, Peano building -- flicker
-                (Building, Passed) => if flicker_phase {
-                    ('.', style::Color::Yellow)
-                } else {
-                    ('C', style::Color::Green)
-                },
-                (Building, Failed) => if flicker_phase {
-                    ('.', style::Color::Yellow)
-                } else {
-                    ('C', style::Color::Red)
-                },
+                (Building, Passed) => {
+                    if flicker_phase {
+                        ('.', style::Color::Yellow)
+                    } else {
+                        ('C', style::Color::Green)
+                    }
+                }
+                (Building, Failed) => {
+                    if flicker_phase {
+                        ('.', style::Color::Yellow)
+                    } else {
+                        ('C', style::Color::Red)
+                    }
+                }
                 // Both done
                 (Passed, Passed) => ('O', style::Color::Green),
                 (Passed, NotStarted) => ('P', style::Color::Green),
@@ -218,22 +235,14 @@ pub trait Buildable: Send + Sync {
     ///
     /// `output_dir` is determined by the orchestrator (compiler-specific).
     /// `build_env` provides environment, cache checks, and tool paths.
-    fn build(
-        &self,
-        build_env: &BuildEnv,
-        output_dir: &Path,
-        opts: &BuildOpts,
-    ) -> Result<BuildResult, String>;
+    fn build(&self, build_env: &BuildEnv, output_dir: &Path, opts: &BuildOpts)
+        -> Result<BuildResult, String>;
 
     /// Determine the output directory for this test and compiler.
     fn output_dir(&self, use_chess: bool) -> PathBuf;
 
     /// Collect result artifacts from a successful build.
-    fn collect_artifacts(
-        &self,
-        output_dir: &Path,
-        result: &BuildResult,
-    ) -> Vec<BuiltArtifact>;
+    fn collect_artifacts(&self, output_dir: &Path, result: &BuildResult) -> Vec<BuiltArtifact>;
 
     /// Enrich an XclbinTest with source-level metadata (buffer_spec, etc.).
     fn enrich_test(&self, test: &mut XclbinTest);
@@ -366,11 +375,7 @@ fn frame_height(layout: &GridLayout) -> u16 {
 /// This avoids `cursor::position()` / `cursor::MoveTo()` which rely on DSR
 /// queries and absolute row numbers -- both fragile across terminal emulators
 /// (known issue with Ghostty) and invalidated by scrolling.
-fn render_frame(
-    progress: &BuildProgress,
-    is_first_frame: bool,
-    flicker_phase: bool,
-) {
+fn render_frame(progress: &BuildProgress, is_first_frame: bool, flicker_phase: bool) {
     let mut stdout = io::stdout();
     let layout = &progress.layout;
 
@@ -387,12 +392,8 @@ fn render_frame(
             if idx < layout.total {
                 let cell = progress.get_cell(idx);
                 let (ch, color) = cell.display_char(flicker_phase);
-                let _ = execute!(
-                    stdout,
-                    style::SetForegroundColor(color),
-                    style::Print(ch),
-                    style::Print(' '),
-                );
+                let _ =
+                    execute!(stdout, style::SetForegroundColor(color), style::Print(ch), style::Print(' '),);
             } else {
                 // Empty cell in last row
                 let _ = execute!(stdout, style::Print("  "));
@@ -409,10 +410,7 @@ fn render_frame(
     let _ = execute!(
         stdout,
         style::ResetColor,
-        style::Print(format!(
-            "\rBuilding: {}/{} ({:.1}s)    ",
-            completed, progress.total_builds, elapsed
-        )),
+        style::Print(format!("\rBuilding: {}/{} ({:.1}s)    ", completed, progress.total_builds, elapsed)),
     );
     let _ = stdout.flush();
 }
@@ -612,10 +610,7 @@ pub fn run_parallel_builds<T: Buildable>(
     );
 
     if total_buildable == 0 {
-        return ParallelBuildResult {
-            primary_tests: Vec::new(),
-            chess_artifacts: HashMap::new(),
-        };
+        return ParallelBuildResult { primary_tests: Vec::new(), chess_artifacts: HashMap::new() };
     }
 
     // Decide display mode: grid vs verbose
@@ -626,28 +621,46 @@ pub fn run_parallel_builds<T: Buildable>(
     let thread_count = if config.thread_count > 0 {
         config.thread_count
     } else {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
     };
 
     let progress = BuildProgress::new(cells, total_builds);
     let work_counter = AtomicUsize::new(0);
     let results: Mutex<Vec<BuildTaskResult>> = Mutex::new(Vec::with_capacity(total_builds));
-    let nice = if config.nice_level > 0 { Some(config.nice_level) } else { None };
+    let nice = if config.nice_level > 0 {
+        Some(config.nice_level)
+    } else {
+        None
+    };
     let force_rebuild = config.force_rebuild;
 
     if use_grid {
         run_with_grid(
-            build_env, tests, &progress, &work_queue, &work_counter,
-            &results, thread_count, nice, force_rebuild,
-            &config.peano_build_xfail, &config.chess_build_xfail,
+            build_env,
+            tests,
+            &progress,
+            &work_queue,
+            &work_counter,
+            &results,
+            thread_count,
+            nice,
+            force_rebuild,
+            &config.peano_build_xfail,
+            &config.chess_build_xfail,
         );
     } else {
         run_verbose(
-            build_env, tests, &progress, &work_queue, &work_counter,
-            &results, thread_count, nice, force_rebuild,
-            &config.peano_build_xfail, &config.chess_build_xfail,
+            build_env,
+            tests,
+            &progress,
+            &work_queue,
+            &work_counter,
+            &results,
+            thread_count,
+            nice,
+            force_rebuild,
+            &config.peano_build_xfail,
+            &config.chess_build_xfail,
         );
     }
 
@@ -661,8 +674,7 @@ fn grid_fits_terminal(layout: &GridLayout) -> bool {
     match terminal::size() {
         Ok((w, h)) => {
             // Grid needs: width for cells (with brackets) + blank line + status + legend
-            layout.display_width() <= w as usize
-                && (layout.display_height() + 5) <= h as usize
+            layout.display_width() <= w as usize && (layout.display_height() + 5) <= h as usize
         }
         Err(_) => false,
     }
@@ -712,9 +724,16 @@ fn run_with_grid<T: Buildable>(
             .map(|_| {
                 s.spawn(|| {
                     run_worker(
-                        build_env, tests, progress, work_queue,
-                        work_counter, results, nice, force_rebuild,
-                        peano_build_xfail, chess_build_xfail,
+                        build_env,
+                        tests,
+                        progress,
+                        work_queue,
+                        work_counter,
+                        results,
+                        nice,
+                        force_rebuild,
+                        peano_build_xfail,
+                        chess_build_xfail,
                     );
                 })
             })
@@ -752,15 +771,22 @@ fn run_verbose<T: Buildable>(
     // Parallel with atomic per-build output: each build prints its
     // status line when it completes, so output order reflects completion
     // order rather than submission order.
-    eprintln!(
-        "Building {} tasks with {} threads...",
-        work_queue.len(),
-        thread_count,
-    );
+    eprintln!("Building {} tasks with {} threads...", work_queue.len(), thread_count,);
     std::thread::scope(|s| {
         for _ in 0..thread_count {
             s.spawn(|| {
-                run_worker(build_env, tests, progress, work_queue, work_counter, results, nice, force_rebuild, peano_build_xfail, chess_build_xfail);
+                run_worker(
+                    build_env,
+                    tests,
+                    progress,
+                    work_queue,
+                    work_counter,
+                    results,
+                    nice,
+                    force_rebuild,
+                    peano_build_xfail,
+                    chess_build_xfail,
+                );
             });
         }
     });
@@ -819,18 +845,21 @@ fn run_worker<T: Buildable>(
                 let completed = progress.completed.fetch_add(1, Ordering::Relaxed) + 1;
                 eprintln!(
                     "[{:2}/{}] {:40} {} {} ({:.1}s)",
-                    completed, progress.total_builds,
+                    completed,
+                    progress.total_builds,
                     &name[..name.len().min(40)],
-                    track_name, label, elapsed.as_secs_f64(),
+                    track_name,
+                    label,
+                    elapsed.as_secs_f64(),
                 );
 
                 progress.update_cell(task.cell_idx, task.track, TrackResult::Passed);
 
                 let artifacts = test.collect_artifacts(&output_dir, &result);
-                results.lock().unwrap().push(BuildTaskResult::Success {
-                    track: task.track,
-                    artifacts,
-                });
+                results
+                    .lock()
+                    .unwrap()
+                    .push(BuildTaskResult::Success { track: task.track, artifacts });
             }
             Err(e) => {
                 let elapsed = task_start.elapsed();
@@ -845,14 +874,19 @@ fn run_worker<T: Buildable>(
                 let status = if is_xfail { "XFAIL" } else { "FAILED" };
                 eprintln!(
                     "[{:2}/{}] {:40} {} {} ({:.1}s): {}",
-                    completed, progress.total_builds,
+                    completed,
+                    progress.total_builds,
                     &name[..name.len().min(40)],
-                    track_name, status, elapsed.as_secs_f64(), diag,
+                    track_name,
+                    status,
+                    elapsed.as_secs_f64(),
+                    diag,
                 );
                 if !is_xfail {
                     eprintln!(
                         "         log: build/logs/{}-{}.log",
-                        name.replace('/', "-"), track_name.to_lowercase(),
+                        name.replace('/', "-"),
+                        track_name.to_lowercase(),
                     );
                 }
 
@@ -933,11 +967,14 @@ fn collect_results<T: Buildable>(
                                     artifact.test_name.clone()
                                 };
 
-                                chess_artifacts.insert(base_name, ChessArtifacts {
-                                    xclbin: artifact.xclbin.clone(),
-                                    insts: artifact.insts.clone(),
-                                    prj_dir: artifact.prj_dir.clone(),
-                                });
+                                chess_artifacts.insert(
+                                    base_name,
+                                    ChessArtifacts {
+                                        xclbin: artifact.xclbin.clone(),
+                                        insts: artifact.insts.clone(),
+                                        prj_dir: artifact.prj_dir.clone(),
+                                    },
+                                );
                             }
                         }
                     }
@@ -957,10 +994,7 @@ fn collect_results<T: Buildable>(
     // Sort primary tests by name for consistent ordering
     primary_tests.sort_by(|a, b| a.name.cmp(&b.name));
 
-    ParallelBuildResult {
-        primary_tests,
-        chess_artifacts,
-    }
+    ParallelBuildResult { primary_tests, chess_artifacts }
 }
 
 // ---------------------------------------------------------------------------
