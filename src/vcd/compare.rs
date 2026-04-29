@@ -135,10 +135,7 @@ pub struct ComparisonInput {
 impl ComparisonInput {
     /// Total number of aligned pairs (signals present in both VCDs).
     pub fn both_count(&self) -> usize {
-        self.pairs
-            .iter()
-            .filter(|p| p.emu.is_some() && p.sim.is_some())
-            .count()
+        self.pairs.iter().filter(|p| p.emu.is_some() && p.sim.is_some()).count()
     }
 }
 
@@ -183,8 +180,7 @@ fn convert_signal_value(sv: &wellen::SignalValue<'_>) -> SignalValue {
             };
             SignalValue::Integer(result & mask)
         }
-        wellen::SignalValue::FourValue(_, _)
-        | wellen::SignalValue::NineValue(_, _) => {
+        wellen::SignalValue::FourValue(_, _) | wellen::SignalValue::NineValue(_, _) => {
             let s = sv.to_bit_string().unwrap_or_default();
             SignalValue::FourState(s)
         }
@@ -192,9 +188,7 @@ fn convert_signal_value(sv: &wellen::SignalValue<'_>) -> SignalValue {
             // Reals are uncommon in hardware VCD; store the bit pattern.
             SignalValue::Integer(r.to_bits() as u128)
         }
-        wellen::SignalValue::String(s) => {
-            SignalValue::FourState(s.to_string())
-        }
+        wellen::SignalValue::String(s) => SignalValue::FourState(s.to_string()),
         wellen::SignalValue::Event => {
             // Events have no data value; record as zero.
             SignalValue::Integer(0)
@@ -222,8 +216,8 @@ pub fn extract_timelines(
         return Err(format!("VCD file not found: {}", vcd_path));
     }
 
-    let mut waveform = wellen::simple::read(vcd_path)
-        .map_err(|e| format!("Failed to read VCD '{}': {:?}", vcd_path, e))?;
+    let mut waveform =
+        wellen::simple::read(vcd_path).map_err(|e| format!("Failed to read VCD '{}': {:?}", vcd_path, e))?;
 
     let hierarchy = waveform.hierarchy();
 
@@ -261,18 +255,12 @@ pub fn extract_timelines(
 
         let mut changes = Vec::new();
         for (time_idx, sv) in signal.iter_changes() {
-            let time = time_table
-                .get(time_idx as usize)
-                .copied()
-                .unwrap_or(time_idx as u64);
+            let time = time_table.get(time_idx as usize).copied().unwrap_or(time_idx as u64);
             let value = convert_signal_value(&sv);
             changes.push(ValueChange { time, value });
         }
 
-        let timeline = SignalTimeline {
-            path: state_path.clone(),
-            changes,
-        };
+        let timeline = SignalTimeline { path: state_path.clone(), changes };
 
         timelines.insert(state_path.clone(), timeline);
     }
@@ -294,11 +282,7 @@ pub fn extract_timelines(
 /// # Errors
 ///
 /// Returns a descriptive error string if either VCD file cannot be read.
-pub fn load_and_align(
-    emu_path: &str,
-    sim_path: &str,
-    tree: &MappingTree,
-) -> Result<ComparisonInput, String> {
+pub fn load_and_align(emu_path: &str, sim_path: &str, tree: &MappingTree) -> Result<ComparisonInput, String> {
     let emu_signals = extract_timelines(emu_path, tree)?;
     let sim_signals = extract_timelines(sim_path, tree)?;
 
@@ -330,18 +314,10 @@ pub fn load_and_align(
             _ => {}
         }
 
-        pairs.push(AlignedPair {
-            path,
-            emu: emu_tl,
-            sim: sim_tl,
-        });
+        pairs.push(AlignedPair { path, emu: emu_tl, sim: sim_tl });
     }
 
-    Ok(ComparisonInput {
-        pairs,
-        emu_only,
-        sim_only,
-    })
+    Ok(ComparisonInput { pairs, emu_only, sim_only })
 }
 
 // ---------------------------------------------------------------------------
@@ -463,24 +439,16 @@ impl ComparisonResult {
 /// Returns `None` if the timelines cannot be reconciled by a timing shift (i.e.,
 /// some changes have no counterpart within tolerance, or the value sequences
 /// differ fundamentally).
-fn try_timing_offset(
-    emu_tl: &SignalTimeline,
-    sim_tl: &SignalTimeline,
-    tol: u64,
-) -> Option<SignalResult> {
+fn try_timing_offset(emu_tl: &SignalTimeline, sim_tl: &SignalTimeline, tol: u64) -> Option<SignalResult> {
     // Collect per-change offsets (emu_time - sim_time) for matched pairs.
     let mut offsets: Vec<i64> = Vec::new();
 
     // Every emu change must have a sim change with the same value within tol.
     for ec in &emu_tl.changes {
-        let best = sim_tl
-            .changes
-            .iter()
-            .filter(|sc| sc.value == ec.value)
-            .min_by_key(|sc| {
-                let delta = ec.time as i64 - sc.time as i64;
-                delta.unsigned_abs()
-            });
+        let best = sim_tl.changes.iter().filter(|sc| sc.value == ec.value).min_by_key(|sc| {
+            let delta = ec.time as i64 - sc.time as i64;
+            delta.unsigned_abs()
+        });
         match best {
             Some(sc) => {
                 let delta = ec.time as i64 - sc.time as i64;
@@ -495,14 +463,10 @@ fn try_timing_offset(
 
     // Every sim change must also have an emu counterpart (symmetric check).
     for sc in &sim_tl.changes {
-        let best = emu_tl
-            .changes
-            .iter()
-            .filter(|ec| ec.value == sc.value)
-            .min_by_key(|ec| {
-                let delta = sc.time as i64 - ec.time as i64;
-                delta.unsigned_abs()
-            });
+        let best = emu_tl.changes.iter().filter(|ec| ec.value == sc.value).min_by_key(|ec| {
+            let delta = sc.time as i64 - ec.time as i64;
+            delta.unsigned_abs()
+        });
         match best {
             Some(ec) => {
                 let delta = ec.time as i64 - sc.time as i64;
@@ -521,10 +485,7 @@ fn try_timing_offset(
     offsets.sort_unstable();
     let median = offsets[offsets.len() / 2];
 
-    Some(SignalResult::TimingOffset {
-        offset_cycles: median,
-        change_count: offsets.len(),
-    })
+    Some(SignalResult::TimingOffset { offset_cycles: median, change_count: offsets.len() })
 }
 
 /// Compare one aligned signal pair and return the result.
@@ -619,11 +580,7 @@ pub fn compare_pair(pair: &AlignedPair, tolerance: &ToleranceConfig) -> SignalRe
     // values at every point).
     if diff_count == 0
         && emu_tl.changes.len() == sim_tl.changes.len()
-        && emu_tl
-            .changes
-            .iter()
-            .zip(sim_tl.changes.iter())
-            .all(|(e, s)| e.time == s.time)
+        && emu_tl.changes.iter().zip(sim_tl.changes.iter()).all(|(e, s)| e.time == s.time)
     {
         return SignalResult::ExactMatch;
     }
@@ -651,11 +608,7 @@ pub fn compare_pair(pair: &AlignedPair, tolerance: &ToleranceConfig) -> SignalRe
     }
 
     // Genuine value differences that cannot be explained by timing offset.
-    SignalResult::Mismatch {
-        diff_count,
-        total_count,
-        first_diff_time: first_diff_time.unwrap_or(0),
-    }
+    SignalResult::Mismatch { diff_count, total_count, first_diff_time: first_diff_time.unwrap_or(0) }
 }
 
 // ---------------------------------------------------------------------------
@@ -671,9 +624,7 @@ pub fn compare_pair(pair: &AlignedPair, tolerance: &ToleranceConfig) -> SignalRe
 /// The result ordering is: aligned pairs (in input order), then `emu_only`
 /// paths, then `sim_only` paths.
 pub fn compare_signals(input: &ComparisonInput, tolerance: &ToleranceConfig) -> ComparisonResult {
-    let mut results = Vec::with_capacity(
-        input.pairs.len() + input.emu_only.len() + input.sim_only.len(),
-    );
+    let mut results = Vec::with_capacity(input.pairs.len() + input.emu_only.len() + input.sim_only.len());
 
     for pair in &input.pairs {
         let result = compare_pair(pair, tolerance);
@@ -740,10 +691,8 @@ mod tests {
 
     #[test]
     fn signal_timeline_len_and_empty() {
-        let empty_tl = SignalTimeline {
-            path: StatePath::LockValue { col: 0, row: 1, idx: 0 },
-            changes: vec![],
-        };
+        let empty_tl =
+            SignalTimeline { path: StatePath::LockValue { col: 0, row: 1, idx: 0 }, changes: vec![] };
         assert!(empty_tl.is_empty());
         assert_eq!(empty_tl.len(), 0);
 
@@ -766,11 +715,7 @@ mod tests {
             path: path.clone(),
             changes: vec![ValueChange { time: 0, value: SignalValue::Integer(0) }],
         };
-        let pair = AlignedPair {
-            path: path.clone(),
-            emu: Some(tl.clone()),
-            sim: Some(tl),
-        };
+        let pair = AlignedPair { path: path.clone(), emu: Some(tl.clone()), sim: Some(tl) };
         assert!(pair.emu.is_some());
         assert!(pair.sim.is_some());
     }
@@ -807,27 +752,13 @@ mod tests {
     fn comparison_input_both_count() {
         let path_a = StatePath::LockValue { col: 0, row: 1, idx: 0 };
         let path_b = StatePath::LockValue { col: 0, row: 1, idx: 1 };
-        let tl_a = SignalTimeline {
-            path: path_a.clone(),
-            changes: vec![],
-        };
-        let tl_b = SignalTimeline {
-            path: path_b.clone(),
-            changes: vec![],
-        };
+        let tl_a = SignalTimeline { path: path_a.clone(), changes: vec![] };
+        let tl_b = SignalTimeline { path: path_b.clone(), changes: vec![] };
 
         let input = ComparisonInput {
             pairs: vec![
-                AlignedPair {
-                    path: path_a.clone(),
-                    emu: Some(tl_a.clone()),
-                    sim: Some(tl_a),
-                },
-                AlignedPair {
-                    path: path_b.clone(),
-                    emu: Some(tl_b),
-                    sim: None,
-                },
+                AlignedPair { path: path_a.clone(), emu: Some(tl_a.clone()), sim: Some(tl_a) },
+                AlignedPair { path: path_b.clone(), emu: Some(tl_b), sim: None },
             ],
             emu_only: vec![path_b],
             sim_only: vec![],
@@ -1096,12 +1027,7 @@ mod tests {
             .done_tile_group()
             .build();
 
-        let result = load_and_align(
-            emu_path.to_str().unwrap(),
-            sim_path.to_str().unwrap(),
-            &tree,
-        )
-        .unwrap();
+        let result = load_and_align(emu_path.to_str().unwrap(), sim_path.to_str().unwrap(), &tree).unwrap();
 
         // value_0: present in both -> aligned pair with both timelines.
         // value_1: emu only.
@@ -1175,10 +1101,7 @@ mod tests {
 
         let timelines = extract_timelines(vcd_path, &tree).unwrap();
 
-        assert!(
-            !timelines.is_empty(),
-            "expected at least some mapped timelines from real VCD"
-        );
+        assert!(!timelines.is_empty(), "expected at least some mapped timelines from real VCD");
 
         // Print a summary of what we found.
         eprintln!("Extracted {} timelines from real VCD:", timelines.len());
@@ -1224,7 +1147,7 @@ mod tests {
                 path: path.clone(),
                 changes: vec![
                     ValueChange { time: 0, value: SignalValue::Integer(0) },
-                    ValueChange { time: 10, value: SignalValue::Integer(2) },  // different!
+                    ValueChange { time: 10, value: SignalValue::Integer(2) }, // different!
                 ],
             }),
         };
@@ -1263,19 +1186,17 @@ mod tests {
     fn compare_signals_summary() {
         // A ComparisonInput with one exact-match pair, one emu_only, one sim_only.
         let input = ComparisonInput {
-            pairs: vec![
-                AlignedPair {
+            pairs: vec![AlignedPair {
+                path: StatePath::LockValue { col: 0, row: 1, idx: 0 },
+                emu: Some(SignalTimeline {
                     path: StatePath::LockValue { col: 0, row: 1, idx: 0 },
-                    emu: Some(SignalTimeline {
-                        path: StatePath::LockValue { col: 0, row: 1, idx: 0 },
-                        changes: vec![ValueChange { time: 0, value: SignalValue::Integer(0) }],
-                    }),
-                    sim: Some(SignalTimeline {
-                        path: StatePath::LockValue { col: 0, row: 1, idx: 0 },
-                        changes: vec![ValueChange { time: 0, value: SignalValue::Integer(0) }],
-                    }),
-                },
-            ],
+                    changes: vec![ValueChange { time: 0, value: SignalValue::Integer(0) }],
+                }),
+                sim: Some(SignalTimeline {
+                    path: StatePath::LockValue { col: 0, row: 1, idx: 0 },
+                    changes: vec![ValueChange { time: 0, value: SignalValue::Integer(0) }],
+                }),
+            }],
             emu_only: vec![StatePath::LockValue { col: 0, row: 1, idx: 1 }],
             sim_only: vec![StatePath::LockValue { col: 0, row: 1, idx: 2 }],
         };
@@ -1319,7 +1240,8 @@ mod tests {
         // With tol>0 and differing timestamps, we expect TimingOffset.
         assert!(
             matches!(result, SignalResult::TimingOffset { .. } | SignalResult::ExactMatch),
-            "expected TimingOffset or ExactMatch, got {:?}", result
+            "expected TimingOffset or ExactMatch, got {:?}",
+            result
         );
     }
 
@@ -1331,15 +1253,11 @@ mod tests {
             path: path.clone(),
             emu: Some(SignalTimeline {
                 path: path.clone(),
-                changes: vec![
-                    ValueChange { time: 10, value: SignalValue::Integer(99) },
-                ],
+                changes: vec![ValueChange { time: 10, value: SignalValue::Integer(99) }],
             }),
             sim: Some(SignalTimeline {
                 path: path.clone(),
-                changes: vec![
-                    ValueChange { time: 10, value: SignalValue::Integer(42) },
-                ],
+                changes: vec![ValueChange { time: 10, value: SignalValue::Integer(42) }],
             }),
         };
         let tolerance = ToleranceConfig::relaxed();
@@ -1358,11 +1276,7 @@ mod tests {
 
     #[test]
     fn compare_signals_empty_input_yields_empty_results() {
-        let input = ComparisonInput {
-            pairs: vec![],
-            emu_only: vec![],
-            sim_only: vec![],
-        };
+        let input = ComparisonInput { pairs: vec![], emu_only: vec![], sim_only: vec![] };
         let result = compare_signals(&input, &ToleranceConfig::strict());
         assert!(result.results.is_empty());
         let summary = result.summary();
@@ -1433,11 +1347,14 @@ mod tests {
         assert!(
             summary.exact_match > 0 || summary.both_empty > 0,
             "expected some matched signals, got exact={} empty={}",
-            summary.exact_match, summary.both_empty
+            summary.exact_match,
+            summary.both_empty
         );
         eprintln!(
             "Self-comparison: {} exact, {} empty, {} timing_offset, {} total",
-            summary.exact_match, summary.both_empty, summary.timing_offset,
+            summary.exact_match,
+            summary.both_empty,
+            summary.timing_offset,
             summary.exact_match + summary.both_empty + summary.timing_offset
         );
     }

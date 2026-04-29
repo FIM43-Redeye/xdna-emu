@@ -126,12 +126,7 @@ fn write_summary_table(out: &mut String, summary: &ComparisonSummary) {
         // structurally present but differ only within tolerance, or have no
         // activity to compare). Missing signals are not counted as pass or fail.
         let pass = summary.exact_match + summary.timing_offset + summary.both_empty;
-        writeln!(
-            out,
-            "  PASS rate:      {:>5.1}%",
-            pass as f64 / total as f64 * 100.0
-        )
-        .unwrap();
+        writeln!(out, "  PASS rate:      {:>5.1}%", pass as f64 / total as f64 * 100.0).unwrap();
     }
     writeln!(out).unwrap();
 }
@@ -155,12 +150,7 @@ fn write_subsystem_breakdown(out: &mut String, result: &ComparisonResult) {
         "Subsystem", "exact", "offset", "mismatch", "miss/emu", "miss/sim"
     )
     .unwrap();
-    writeln!(
-        out,
-        "  {:-<12}  {:-<7}  {:-<7}  {:-<8}  {:-<7}  {:-<7}",
-        "", "", "", "", "", ""
-    )
-    .unwrap();
+    writeln!(out, "  {:-<12}  {:-<7}  {:-<7}  {:-<8}  {:-<7}  {:-<7}", "", "", "", "", "", "").unwrap();
 
     for &sub in Subsystem::ALL {
         if let Some(c) = breakdown.get(&sub) {
@@ -356,9 +346,8 @@ pub fn json_report(result: &ComparisonResult) -> String {
         "missing": missing,
     });
 
-    serde_json::to_string_pretty(&root).unwrap_or_else(|e| {
-        format!("{{\"error\": \"JSON serialisation failed: {}\"}}", e)
-    })
+    serde_json::to_string_pretty(&root)
+        .unwrap_or_else(|e| format!("{{\"error\": \"JSON serialisation failed: {}\"}}", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -375,17 +364,10 @@ mod tests {
     fn make_test_result() -> ComparisonResult {
         ComparisonResult {
             results: vec![
-                (
-                    StatePath::LockValue { col: 0, row: 1, idx: 0 },
-                    SignalResult::ExactMatch,
-                ),
+                (StatePath::LockValue { col: 0, row: 1, idx: 0 }, SignalResult::ExactMatch),
                 (
                     StatePath::LockValue { col: 0, row: 1, idx: 1 },
-                    SignalResult::Mismatch {
-                        diff_count: 3,
-                        total_count: 10,
-                        first_diff_time: 42,
-                    },
+                    SignalResult::Mismatch { diff_count: 3, total_count: 10, first_diff_time: 42 },
                 ),
                 (
                     StatePath::DmaAddress { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 },
@@ -456,9 +438,7 @@ mod tests {
     fn text_report_no_mismatches_shows_none() {
         // A result with only exact matches should say "(none)" in the mismatch section.
         let result = ComparisonResult {
-            results: vec![
-                (StatePath::LockValue { col: 0, row: 0, idx: 0 }, SignalResult::ExactMatch),
-            ],
+            results: vec![(StatePath::LockValue { col: 0, row: 0, idx: 0 }, SignalResult::ExactMatch)],
         };
         let tolerance = ToleranceConfig::strict();
         let text = text_report(&result, &tolerance);
@@ -546,8 +526,7 @@ mod tests {
         let result = ComparisonResult { results: vec![] };
         let json = json_report(&result);
         assert!(json.starts_with('{'));
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json).expect("empty result JSON invalid");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("empty result JSON invalid");
         assert_eq!(parsed["summary"]["total"], 0);
         assert_eq!(parsed["mismatches"].as_array().unwrap().len(), 0);
         assert_eq!(parsed["missing"].as_array().unwrap().len(), 0);
@@ -573,9 +552,7 @@ mod tests {
     #[test]
     fn text_report_both_empty_counted() {
         let result = ComparisonResult {
-            results: vec![
-                (StatePath::LockValue { col: 0, row: 0, idx: 0 }, SignalResult::BothEmpty),
-            ],
+            results: vec![(StatePath::LockValue { col: 0, row: 0, idx: 0 }, SignalResult::BothEmpty)],
         };
         let tolerance = ToleranceConfig::strict();
         let text = text_report(&result, &tolerance);

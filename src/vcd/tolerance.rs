@@ -222,11 +222,7 @@ mod tests {
     #[test]
     fn aie2_default_stream_is_two() {
         let config = ToleranceConfig::aie2_default();
-        let path = StatePath::StreamPortData {
-            col: 0,
-            row: 1,
-            port: PortId::named("sSouth0"),
-        };
+        let path = StatePath::StreamPortData { col: 0, row: 1, port: PortId::named("sSouth0") };
         assert_eq!(config.tolerance_for(&path), 2);
     }
 
@@ -247,12 +243,8 @@ mod tests {
     #[test]
     fn aie2_default_event_is_zero() {
         let config = ToleranceConfig::aie2_default();
-        let path = StatePath::EventTrace {
-            col: 0,
-            row: 2,
-            event_code: 0x42,
-            event_name: "core_active".to_string(),
-        };
+        let path =
+            StatePath::EventTrace { col: 0, row: 2, event_code: 0x42, event_name: "core_active".to_string() };
         assert_eq!(config.tolerance_for(&path), 0);
     }
 
@@ -271,11 +263,7 @@ mod tests {
             StatePath::DmaAddress { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 },
             StatePath::LockValue { col: 0, row: 1, idx: 0 },
             StatePath::CorePc { col: 0, row: 2, stage: 0 },
-            StatePath::StreamPortData {
-                col: 0,
-                row: 1,
-                port: PortId::named("sSouth0"),
-            },
+            StatePath::StreamPortData { col: 0, row: 1, port: PortId::named("sSouth0") },
             StatePath::MemBankConflict { col: 0, row: 1, bank: 0 },
             StatePath::PerfCounter { col: 0, row: 1, idx: 0 },
         ];
@@ -311,17 +299,9 @@ mod tests {
         let config = ToleranceConfig::new(10)
             .with_subsystem(Subsystem::Core, 0)
             .with_subsystem(Subsystem::Dma, 3);
+        assert_eq!(config.tolerance_for(&StatePath::CorePc { col: 0, row: 1, stage: 0 }), 0);
         assert_eq!(
-            config.tolerance_for(&StatePath::CorePc { col: 0, row: 1, stage: 0 }),
-            0
-        );
-        assert_eq!(
-            config.tolerance_for(&StatePath::DmaFsmState {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0
-            }),
+            config.tolerance_for(&StatePath::DmaFsmState { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }),
             3
         );
         // Stream not configured -- should use default.

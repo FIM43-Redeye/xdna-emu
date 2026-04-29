@@ -138,7 +138,6 @@ pub fn shim_stream_ports() -> Vec<String> {
     ports
 }
 
-
 // ---------------------------------------------------------------------------
 // StreamPortMapping -- custom mapping for stream ports
 // ---------------------------------------------------------------------------
@@ -169,10 +168,7 @@ impl StreamPortMapping {
         StreamPortMapping {
             ports: port_names
                 .iter()
-                .map(|name| PortEntry {
-                    scope: format!("from_{}", name),
-                    port_id: PortId::named(name),
-                })
+                .map(|name| PortEntry { scope: format!("from_{}", name), port_id: PortId::named(name) })
                 .collect(),
         }
     }
@@ -202,24 +198,16 @@ impl StreamPortMapping {
         for entry in &self.ports {
             let port_name = entry.port_id.name();
             if signal == format!("event_idle_{}", port_name) {
-                return Some(StatePath::StreamPortIdle {
-                    col, row, port: PortId::named(port_name),
-                });
+                return Some(StatePath::StreamPortIdle { col, row, port: PortId::named(port_name) });
             }
             if signal == format!("event_running_{}", port_name) {
-                return Some(StatePath::StreamPortRunning {
-                    col, row, port: PortId::named(port_name),
-                });
+                return Some(StatePath::StreamPortRunning { col, row, port: PortId::named(port_name) });
             }
             if signal == format!("event_stalled_{}", port_name) {
-                return Some(StatePath::StreamPortStalled {
-                    col, row, port: PortId::named(port_name),
-                });
+                return Some(StatePath::StreamPortStalled { col, row, port: PortId::named(port_name) });
             }
             if signal == format!("event_tlast_{}", port_name) {
-                return Some(StatePath::StreamPortTlast {
-                    col, row, port: PortId::named(port_name),
-                });
+                return Some(StatePath::StreamPortTlast { col, row, port: PortId::named(port_name) });
             }
         }
         None
@@ -231,28 +219,18 @@ impl StreamPortMapping {
         let port_name = port_id.name();
 
         match signal {
-            "data" => Some(StatePath::StreamPortData {
-                col, row, port: PortId::named(port_name),
-            }),
+            "data" => Some(StatePath::StreamPortData { col, row, port: PortId::named(port_name) }),
             _ if signal == format!("event_idle_{}", port_name) => {
-                Some(StatePath::StreamPortIdle {
-                    col, row, port: PortId::named(port_name),
-                })
+                Some(StatePath::StreamPortIdle { col, row, port: PortId::named(port_name) })
             }
             _ if signal == format!("event_running_{}", port_name) => {
-                Some(StatePath::StreamPortRunning {
-                    col, row, port: PortId::named(port_name),
-                })
+                Some(StatePath::StreamPortRunning { col, row, port: PortId::named(port_name) })
             }
             _ if signal == format!("event_stalled_{}", port_name) => {
-                Some(StatePath::StreamPortStalled {
-                    col, row, port: PortId::named(port_name),
-                })
+                Some(StatePath::StreamPortStalled { col, row, port: PortId::named(port_name) })
             }
             _ if signal == format!("event_tlast_{}", port_name) => {
-                Some(StatePath::StreamPortTlast {
-                    col, row, port: PortId::named(port_name),
-                })
+                Some(StatePath::StreamPortTlast { col, row, port: PortId::named(port_name) })
             }
             _ => None,
         }
@@ -432,11 +410,7 @@ mod tests {
         let result = mapping.resolve(&["from_sSouth3", "data"], 0, 1);
         assert_eq!(
             result,
-            Some(StatePath::StreamPortData {
-                col: 0,
-                row: 1,
-                port: PortId::named("sSouth3"),
-            })
+            Some(StatePath::StreamPortData { col: 0, row: 1, port: PortId::named("sSouth3") })
         );
     }
 
@@ -447,11 +421,7 @@ mod tests {
         let result = mapping.resolve(&["from_sSouth3", "event_idle_sSouth3"], 0, 1);
         assert_eq!(
             result,
-            Some(StatePath::StreamPortIdle {
-                col: 0,
-                row: 1,
-                port: PortId::named("sSouth3"),
-            })
+            Some(StatePath::StreamPortIdle { col: 0, row: 1, port: PortId::named("sSouth3") })
         );
     }
 
@@ -461,11 +431,7 @@ mod tests {
         let result = mapping.resolve(&["from_sSouth3", "event_running_sSouth3"], 0, 1);
         assert_eq!(
             result,
-            Some(StatePath::StreamPortRunning {
-                col: 0,
-                row: 1,
-                port: PortId::named("sSouth3"),
-            })
+            Some(StatePath::StreamPortRunning { col: 0, row: 1, port: PortId::named("sSouth3") })
         );
     }
 
@@ -475,11 +441,7 @@ mod tests {
         let result = mapping.resolve(&["from_sSouth3", "event_stalled_sSouth3"], 2, 3);
         assert_eq!(
             result,
-            Some(StatePath::StreamPortStalled {
-                col: 2,
-                row: 3,
-                port: PortId::named("sSouth3"),
-            })
+            Some(StatePath::StreamPortStalled { col: 2, row: 3, port: PortId::named("sSouth3") })
         );
     }
 
@@ -489,11 +451,7 @@ mod tests {
         let result = mapping.resolve(&["from_sSouth3", "event_tlast_sSouth3"], 1, 2);
         assert_eq!(
             result,
-            Some(StatePath::StreamPortTlast {
-                col: 1,
-                row: 2,
-                port: PortId::named("sSouth3"),
-            })
+            Some(StatePath::StreamPortTlast { col: 1, row: 2, port: PortId::named("sSouth3") })
         );
     }
 
@@ -502,28 +460,14 @@ mod tests {
         // Verifies that having multiple ports in the mapping doesn't cause cross-port confusion.
         let mapping = stream_mapping(&["sSouth3", "sDMA0"]);
         let result = mapping.resolve(&["from_sDMA0", "data"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::StreamPortData {
-                col: 0,
-                row: 1,
-                port: PortId::named("sDMA0"),
-            })
-        );
+        assert_eq!(result, Some(StatePath::StreamPortData { col: 0, row: 1, port: PortId::named("sDMA0") }));
     }
 
     #[test]
     fn stream_resolves_dma_port_idle() {
         let mapping = stream_mapping(&["sDMA0"]);
         let result = mapping.resolve(&["from_sDMA0", "event_idle_sDMA0"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::StreamPortIdle {
-                col: 0,
-                row: 1,
-                port: PortId::named("sDMA0"),
-            })
-        );
+        assert_eq!(result, Some(StatePath::StreamPortIdle { col: 0, row: 1, port: PortId::named("sDMA0") }));
     }
 
     #[test]
@@ -536,20 +480,14 @@ mod tests {
     #[test]
     fn stream_rejects_unknown_signal() {
         let mapping = stream_mapping(&["sSouth3"]);
-        assert_eq!(
-            mapping.resolve(&["from_sSouth3", "nonexistent_signal"], 0, 1),
-            None
-        );
+        assert_eq!(mapping.resolve(&["from_sSouth3", "nonexistent_signal"], 0, 1), None);
     }
 
     #[test]
     fn stream_rejects_event_signal_with_wrong_port_suffix() {
         // "event_idle_sNorth0" is not valid for the "from_sSouth3" scope.
         let mapping = stream_mapping(&["sSouth3"]);
-        assert_eq!(
-            mapping.resolve(&["from_sSouth3", "event_idle_sNorth0"], 0, 1),
-            None
-        );
+        assert_eq!(mapping.resolve(&["from_sSouth3", "event_idle_sNorth0"], 0, 1), None);
     }
 
     #[test]
@@ -567,16 +505,8 @@ mod tests {
         let a = mapping.resolve(&["from_sSouth3", "data"], 0, 1).unwrap();
         let b = mapping.resolve(&["from_sSouth3", "data"], 3, 5).unwrap();
         assert_ne!(a, b);
-        assert_eq!(a, StatePath::StreamPortData {
-            col: 0,
-            row: 1,
-            port: PortId::named("sSouth3"),
-        });
-        assert_eq!(b, StatePath::StreamPortData {
-            col: 3,
-            row: 5,
-            port: PortId::named("sSouth3"),
-        });
+        assert_eq!(a, StatePath::StreamPortData { col: 0, row: 1, port: PortId::named("sSouth3") });
+        assert_eq!(b, StatePath::StreamPortData { col: 3, row: 5, port: PortId::named("sSouth3") });
     }
 
     #[test]

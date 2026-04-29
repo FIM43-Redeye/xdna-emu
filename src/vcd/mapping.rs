@@ -107,10 +107,7 @@ impl NestedScopeMapping {
     /// `scope` is the outer VCD scope name. `inner` is the mapping that
     /// handles the inner scope and its signals.
     pub fn new(scope: &str, inner: Box<dyn TileMapping>) -> Self {
-        NestedScopeMapping {
-            scope: scope.to_string(),
-            inner,
-        }
+        NestedScopeMapping { scope: scope.to_string(), inner }
     }
 }
 
@@ -241,39 +238,18 @@ impl SubsystemMapping {
     ///
     /// The `factory` receives `(col, row, idx)` where `idx` is parsed from the
     /// signal name suffix.
-    pub fn indexed_signal(
-        mut self,
-        prefix: &str,
-        count: u8,
-        width: u32,
-        factory: SignalFactory,
-    ) -> Self {
-        self.signals.push(SignalDef {
-            prefix: prefix.to_string(),
-            count,
-            width,
-            indexed: true,
-            factory,
-        });
+    pub fn indexed_signal(mut self, prefix: &str, count: u8, width: u32, factory: SignalFactory) -> Self {
+        self.signals
+            .push(SignalDef { prefix: prefix.to_string(), count, width, indexed: true, factory });
         self
     }
 
     /// Add a single fixed-name signal (no index suffix).
     ///
     /// The `factory` receives `(col, row, 0)`.
-    pub fn fixed_signal(
-        mut self,
-        name: &str,
-        width: u32,
-        factory: SignalFactory,
-    ) -> Self {
-        self.signals.push(SignalDef {
-            prefix: name.to_string(),
-            count: 1,
-            width,
-            indexed: false,
-            factory,
-        });
+    pub fn fixed_signal(mut self, name: &str, width: u32, factory: SignalFactory) -> Self {
+        self.signals
+            .push(SignalDef { prefix: name.to_string(), count: 1, width, indexed: false, factory });
         self
     }
 
@@ -294,11 +270,7 @@ impl SubsystemMapping {
             count,
             children: children
                 .into_iter()
-                .map(|(name, width, factory)| NestedSignalDef {
-                    name: name.to_string(),
-                    width,
-                    factory,
-                })
+                .map(|(name, width, factory)| NestedSignalDef { name: name.to_string(), width, factory })
                 .collect(),
         });
         self
@@ -347,13 +319,7 @@ impl SubsystemMapping {
     }
 
     /// Resolve a nested signal like `["s2mm_state0", "cur_bd"]`.
-    fn resolve_nested(
-        &self,
-        group_name: &str,
-        child_name: &str,
-        col: u8,
-        row: u8,
-    ) -> Option<StatePath> {
+    fn resolve_nested(&self, group_name: &str, child_name: &str, col: u8, row: u8) -> Option<StatePath> {
         for group in &self.nested_groups {
             // Match "{prefix}{idx}" (no underscore between prefix and index)
             if let Some(idx_str) = group_name.strip_prefix(&group.prefix) {
@@ -424,16 +390,11 @@ impl TileMapping for SubsystemMapping {
 enum MappingNode {
     /// A fixed scope level (e.g. "top", "math_engine"). Matches a single
     /// segment exactly and has one child.
-    Scope {
-        name: String,
-        child: Box<MappingNode>,
-    },
+    Scope { name: String, child: Box<MappingNode> },
 
     /// A fan-out node containing one or more tile groups and/or scope children.
     /// Used when multiple tile groups (mem_row, array, shim) are siblings.
-    FanOut {
-        children: Vec<MappingNode>,
-    },
+    FanOut { children: Vec<MappingNode> },
 
     /// A tile group: matches "tile_{col}_{row}" for a known set of tiles,
     /// then delegates to subsystem mappings.
@@ -470,11 +431,7 @@ impl MappingNode {
                 None
             }
 
-            MappingNode::TileGroup {
-                prefix,
-                tiles,
-                mappings,
-            } => {
+            MappingNode::TileGroup { prefix, tiles, mappings } => {
                 // Need at least 3 segments: prefix, tile_C_R, subsystem scope
                 // (+ at least 1 for the signal leaf).
                 if segments.len() < 3 {
@@ -513,9 +470,7 @@ impl MappingNode {
                 paths
             }
 
-            MappingNode::TileGroup {
-                tiles, mappings, ..
-            } => {
+            MappingNode::TileGroup { tiles, mappings, .. } => {
                 let mut paths = Vec::new();
                 // Enumerate in deterministic order: sort tiles by (col, row).
                 let mut tile_list: Vec<(u8, u8)> = tiles.keys().copied().collect();
@@ -553,10 +508,7 @@ pub struct MappingTree {
 impl MappingTree {
     /// Start building a new mapping tree.
     pub fn builder() -> TreeBuilder {
-        TreeBuilder {
-            scopes: Vec::new(),
-            tile_groups: Vec::new(),
-        }
+        TreeBuilder { scopes: Vec::new(), tile_groups: Vec::new() }
     }
 
     /// Resolve a VCD signal path (split into segments) to a [`StatePath`].
@@ -619,9 +571,7 @@ impl TreeBuilder {
         let inner = if self.tile_groups.len() == 1 {
             self.tile_groups.into_iter().next().unwrap()
         } else {
-            MappingNode::FanOut {
-                children: self.tile_groups,
-            }
+            MappingNode::FanOut { children: self.tile_groups }
         };
 
         // Wrap in scope chain (innermost scope wraps the inner node first).
@@ -629,10 +579,7 @@ impl TreeBuilder {
             .scopes
             .into_iter()
             .rev()
-            .fold(inner, |child, name| MappingNode::Scope {
-                name,
-                child: Box::new(child),
-            });
+            .fold(inner, |child, name| MappingNode::Scope { name, child: Box::new(child) });
 
         MappingTree { root }
     }
@@ -675,11 +622,7 @@ impl TileGroupBuilder {
 
     /// Finish this tile group and return to the parent tree builder.
     pub fn done_tile_group(mut self) -> TreeBuilder {
-        let node = MappingNode::TileGroup {
-            prefix: self.prefix,
-            tiles: self.tiles,
-            mappings: self.mappings,
-        };
+        let node = MappingNode::TileGroup { prefix: self.prefix, tiles: self.tiles, mappings: self.mappings };
         self.parent.tile_groups.push(node);
         self.parent
     }
@@ -719,9 +662,7 @@ pub fn build_aie2_mapping_tree() -> MappingTree {
     use super::dma_mapping::{dma_mapping, shim_dma_mapping};
     use super::event_mapping::event_mapping;
     use super::lock_mapping::lock_mapping;
-    use super::stream_mapping::{
-        compute_stream_mapping, memtile_stream_mapping, shim_stream_mapping,
-    };
+    use super::stream_mapping::{compute_stream_mapping, memtile_stream_mapping, shim_stream_mapping};
 
     // NPU1 (Phoenix) dimensions from device model.
     let cols: Vec<u8> = (0..4).collect();
@@ -730,36 +671,34 @@ pub fn build_aie2_mapping_tree() -> MappingTree {
     // Tile coordinate sets.
     let shim_tiles: Vec<(u8, u8)> = cols.iter().map(|&c| (c, 0)).collect();
     let mem_tiles: Vec<(u8, u8)> = cols.iter().map(|&c| (c, 1)).collect();
-    let compute_tiles: Vec<(u8, u8)> = cols
-        .iter()
-        .flat_map(|&c| rows_compute.iter().map(move |&r| (c, r)))
-        .collect();
+    let compute_tiles: Vec<(u8, u8)> =
+        cols.iter().flat_map(|&c| rows_compute.iter().map(move |&r| (c, r))).collect();
 
     MappingTree::builder()
         .scope("top")
         .scope("math_engine")
         // -- Shim tiles (row 0) --
         .tile_group("shim", &shim_tiles)
-            .mapping(lock_mapping(16))
-            .mapping(shim_dma_mapping(2, 2))
-            .mapping(shim_stream_mapping())
-            .mapping(event_mapping())
-            .done_tile_group()
+        .mapping(lock_mapping(16))
+        .mapping(shim_dma_mapping(2, 2))
+        .mapping(shim_stream_mapping())
+        .mapping(event_mapping())
+        .done_tile_group()
         // -- Mem tiles (row 1) --
         .tile_group("mem_row", &mem_tiles)
-            .mapping(lock_mapping(64))
-            .mapping(dma_mapping(6, 6))
-            .mapping(memtile_stream_mapping())
-            .mapping(event_mapping())
-            .done_tile_group()
+        .mapping(lock_mapping(64))
+        .mapping(dma_mapping(6, 6))
+        .mapping(memtile_stream_mapping())
+        .mapping(event_mapping())
+        .done_tile_group()
         // -- Compute tiles (rows 2-5) --
         .tile_group("array", &compute_tiles)
-            .mapping(lock_mapping(16))
-            .mapping(NestedScopeMapping::new("mm", Box::new(dma_mapping(2, 2))))
-            .mapping(compute_stream_mapping())
-            .mapping(core_mapping())
-            .mapping(event_mapping())
-            .done_tile_group()
+        .mapping(lock_mapping(16))
+        .mapping(NestedScopeMapping::new("mm", Box::new(dma_mapping(2, 2))))
+        .mapping(compute_stream_mapping())
+        .mapping(core_mapping())
+        .mapping(event_mapping())
+        .done_tile_group()
         .build()
 }
 
@@ -782,9 +721,7 @@ pub fn build_vc2802_mapping_tree() -> MappingTree {
     use super::dma_mapping::{dma_mapping, shim_dma_mapping};
     use super::event_mapping::event_mapping;
     use super::lock_mapping::lock_mapping;
-    use super::stream_mapping::{
-        compute_stream_mapping, memtile_stream_mapping, shim_stream_mapping,
-    };
+    use super::stream_mapping::{compute_stream_mapping, memtile_stream_mapping, shim_stream_mapping};
 
     // VC2802 dimensions from aiesimulator device model.
     let cols: Vec<u8> = (0..38).collect();
@@ -792,14 +729,10 @@ pub fn build_vc2802_mapping_tree() -> MappingTree {
     let rows_compute: Vec<u8> = (3..11).collect();
 
     let shim_tiles: Vec<(u8, u8)> = cols.iter().map(|&c| (c, 0)).collect();
-    let mem_tiles: Vec<(u8, u8)> = cols
-        .iter()
-        .flat_map(|&c| rows_memtile.iter().map(move |&r| (c, r)))
-        .collect();
-    let compute_tiles: Vec<(u8, u8)> = cols
-        .iter()
-        .flat_map(|&c| rows_compute.iter().map(move |&r| (c, r)))
-        .collect();
+    let mem_tiles: Vec<(u8, u8)> =
+        cols.iter().flat_map(|&c| rows_memtile.iter().map(move |&r| (c, r))).collect();
+    let compute_tiles: Vec<(u8, u8)> =
+        cols.iter().flat_map(|&c| rows_compute.iter().map(move |&r| (c, r))).collect();
 
     MappingTree::builder()
         .scope("SystemC")
@@ -809,26 +742,26 @@ pub fn build_vc2802_mapping_tree() -> MappingTree {
         .scope("math_engine")
         // -- Shim tiles (row 0) --
         .tile_group("shim", &shim_tiles)
-            .mapping(lock_mapping(16))
-            .mapping(shim_dma_mapping(2, 2))
-            .mapping(shim_stream_mapping())
-            .mapping(event_mapping())
-            .done_tile_group()
+        .mapping(lock_mapping(16))
+        .mapping(shim_dma_mapping(2, 2))
+        .mapping(shim_stream_mapping())
+        .mapping(event_mapping())
+        .done_tile_group()
         // -- Mem tiles (rows 1-2) --
         .tile_group("mem_row", &mem_tiles)
-            .mapping(lock_mapping(64))
-            .mapping(dma_mapping(6, 6))
-            .mapping(memtile_stream_mapping())
-            .mapping(event_mapping())
-            .done_tile_group()
+        .mapping(lock_mapping(64))
+        .mapping(dma_mapping(6, 6))
+        .mapping(memtile_stream_mapping())
+        .mapping(event_mapping())
+        .done_tile_group()
         // -- Compute tiles (rows 3-10) --
         .tile_group("array", &compute_tiles)
-            .mapping(NestedScopeMapping::new("mm", Box::new(lock_mapping(16))))
-            .mapping(NestedScopeMapping::new("mm", Box::new(dma_mapping(2, 2))))
-            .mapping(compute_stream_mapping())
-            .mapping(core_mapping_vc2802())
-            .mapping(event_mapping())
-            .done_tile_group()
+        .mapping(NestedScopeMapping::new("mm", Box::new(lock_mapping(16))))
+        .mapping(NestedScopeMapping::new("mm", Box::new(dma_mapping(2, 2))))
+        .mapping(compute_stream_mapping())
+        .mapping(core_mapping_vc2802())
+        .mapping(event_mapping())
+        .done_tile_group()
         .build()
 }
 
@@ -852,14 +785,7 @@ mod tests {
             |col, row, idx| StatePath::LockValue { col, row, idx },
         );
         let result = mapping.resolve(&["value_3"], 2, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::LockValue {
-                col: 2,
-                row: 1,
-                idx: 3,
-            })
-        );
+        assert_eq!(result, Some(StatePath::LockValue { col: 2, row: 1, idx: 3 }));
     }
 
     #[test]
@@ -878,170 +804,88 @@ mod tests {
 
     #[test]
     fn subsystem_mapping_fixed_signal() {
-        let mapping = SubsystemMapping::new("cm", Subsystem::Core).fixed_signal(
-            "pm_address",
-            32,
-            |col, row, _idx| StatePath::CorePmAddress { col, row },
-        );
+        let mapping =
+            SubsystemMapping::new("cm", Subsystem::Core)
+                .fixed_signal("pm_address", 32, |col, row, _idx| StatePath::CorePmAddress { col, row });
         let result = mapping.resolve(&["pm_address"], 1, 3);
-        assert_eq!(
-            result,
-            Some(StatePath::CorePmAddress { col: 1, row: 3 })
-        );
+        assert_eq!(result, Some(StatePath::CorePmAddress { col: 1, row: 3 }));
     }
 
     #[test]
     fn subsystem_mapping_fixed_signal_no_match() {
-        let mapping = SubsystemMapping::new("cm", Subsystem::Core).fixed_signal(
-            "pm_address",
-            32,
-            |col, row, _idx| StatePath::CorePmAddress { col, row },
-        );
+        let mapping =
+            SubsystemMapping::new("cm", Subsystem::Core)
+                .fixed_signal("pm_address", 32, |col, row, _idx| StatePath::CorePmAddress { col, row });
         assert_eq!(mapping.resolve(&["pm_data"], 0, 0), None);
     }
 
     #[test]
     fn subsystem_mapping_nested_group() {
-        let mapping =
-            SubsystemMapping::new("dma", Subsystem::Dma).nested_group(
-                "s2mm_state",
-                2,
-                vec![
-                    ("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd {
-                        col,
-                        row,
-                        dir: DmaDir::S2mm,
-                        ch,
-                    }),
-                    ("fsm_state", 4, |col, row, ch| StatePath::DmaFsmState {
-                        col,
-                        row,
-                        dir: DmaDir::S2mm,
-                        ch,
-                    }),
-                ],
-            );
+        let mapping = SubsystemMapping::new("dma", Subsystem::Dma).nested_group(
+            "s2mm_state",
+            2,
+            vec![
+                ("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd { col, row, dir: DmaDir::S2mm, ch }),
+                ("fsm_state", 4, |col, row, ch| StatePath::DmaFsmState { col, row, dir: DmaDir::S2mm, ch }),
+            ],
+        );
         let result = mapping.resolve(&["s2mm_state0", "cur_bd"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaCurrentBd {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaCurrentBd { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
         let result2 = mapping.resolve(&["s2mm_state1", "fsm_state"], 0, 1);
-        assert_eq!(
-            result2,
-            Some(StatePath::DmaFsmState {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 1,
-            })
-        );
+        assert_eq!(result2, Some(StatePath::DmaFsmState { col: 0, row: 1, dir: DmaDir::S2mm, ch: 1 }));
     }
 
     #[test]
     fn subsystem_mapping_nested_group_out_of_range() {
-        let mapping =
-            SubsystemMapping::new("dma", Subsystem::Dma).nested_group(
-                "s2mm_state",
-                2,
-                vec![("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd {
-                    col,
-                    row,
-                    dir: DmaDir::S2mm,
-                    ch,
-                })],
-            );
+        let mapping = SubsystemMapping::new("dma", Subsystem::Dma).nested_group(
+            "s2mm_state",
+            2,
+            vec![("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd { col, row, dir: DmaDir::S2mm, ch })],
+        );
         // idx=2 is out of range
         assert_eq!(mapping.resolve(&["s2mm_state2", "cur_bd"], 0, 0), None);
     }
 
     #[test]
     fn subsystem_mapping_nested_unknown_child() {
-        let mapping =
-            SubsystemMapping::new("dma", Subsystem::Dma).nested_group(
-                "s2mm_state",
-                2,
-                vec![("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd {
-                    col,
-                    row,
-                    dir: DmaDir::S2mm,
-                    ch,
-                })],
-            );
-        assert_eq!(
-            mapping.resolve(&["s2mm_state0", "nonexistent"], 0, 0),
-            None
+        let mapping = SubsystemMapping::new("dma", Subsystem::Dma).nested_group(
+            "s2mm_state",
+            2,
+            vec![("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd { col, row, dir: DmaDir::S2mm, ch })],
         );
+        assert_eq!(mapping.resolve(&["s2mm_state0", "nonexistent"], 0, 0), None);
     }
 
     #[test]
     fn subsystem_mapping_enumerate() {
         let mapping = SubsystemMapping::new("locks", Subsystem::Lock)
-            .indexed_signal("value", 4, 32, |col, row, idx| StatePath::LockValue {
-                col,
-                row,
-                idx,
-            })
-            .indexed_signal("lock_op", 4, 32, |col, row, idx| StatePath::LockOp {
-                col,
-                row,
-                idx,
-            });
+            .indexed_signal("value", 4, 32, |col, row, idx| StatePath::LockValue { col, row, idx })
+            .indexed_signal("lock_op", 4, 32, |col, row, idx| StatePath::LockOp { col, row, idx });
         let paths = mapping.enumerate(0, 1);
         assert_eq!(paths.len(), 8); // 4 values + 4 ops
-        assert!(paths.contains(&StatePath::LockValue {
-            col: 0,
-            row: 1,
-            idx: 0,
-        }));
-        assert!(paths.contains(&StatePath::LockOp {
-            col: 0,
-            row: 1,
-            idx: 3,
-        }));
+        assert!(paths.contains(&StatePath::LockValue { col: 0, row: 1, idx: 0 }));
+        assert!(paths.contains(&StatePath::LockOp { col: 0, row: 1, idx: 3 }));
     }
 
     #[test]
     fn subsystem_mapping_enumerate_mixed() {
         let mapping = SubsystemMapping::new("cm", Subsystem::Core)
-            .fixed_signal("pm_address", 32, |col, row, _| {
-                StatePath::CorePmAddress { col, row }
-            })
-            .indexed_signal("pc_E", 2, 32, |col, row, idx| StatePath::CorePc {
-                col,
-                row,
-                stage: idx,
-            });
+            .fixed_signal("pm_address", 32, |col, row, _| StatePath::CorePmAddress { col, row })
+            .indexed_signal("pc_E", 2, 32, |col, row, idx| StatePath::CorePc { col, row, stage: idx });
         let paths = mapping.enumerate(1, 3);
         assert_eq!(paths.len(), 3); // 1 fixed + 2 indexed
     }
 
     #[test]
     fn subsystem_mapping_enumerate_nested() {
-        let mapping =
-            SubsystemMapping::new("dma", Subsystem::Dma).nested_group(
-                "s2mm_state",
-                2,
-                vec![
-                    ("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd {
-                        col,
-                        row,
-                        dir: DmaDir::S2mm,
-                        ch,
-                    }),
-                    ("fsm_state", 4, |col, row, ch| StatePath::DmaFsmState {
-                        col,
-                        row,
-                        dir: DmaDir::S2mm,
-                        ch,
-                    }),
-                ],
-            );
+        let mapping = SubsystemMapping::new("dma", Subsystem::Dma).nested_group(
+            "s2mm_state",
+            2,
+            vec![
+                ("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd { col, row, dir: DmaDir::S2mm, ch }),
+                ("fsm_state", 4, |col, row, ch| StatePath::DmaFsmState { col, row, dir: DmaDir::S2mm, ch }),
+            ],
+        );
         let paths = mapping.enumerate(0, 1);
         // 2 channels x 2 signals = 4
         assert_eq!(paths.len(), 4);
@@ -1069,16 +913,8 @@ mod tests {
     /// Minimal test tree: locks in two mem_row tiles.
     fn build_test_tree() -> MappingTree {
         let lock_mapping = SubsystemMapping::new("locks", Subsystem::Lock)
-            .indexed_signal("value", 64, 32, |col, row, idx| StatePath::LockValue {
-                col,
-                row,
-                idx,
-            })
-            .indexed_signal("lock_op", 64, 32, |col, row, idx| StatePath::LockOp {
-                col,
-                row,
-                idx,
-            });
+            .indexed_signal("value", 64, 32, |col, row, idx| StatePath::LockValue { col, row, idx })
+            .indexed_signal("lock_op", 64, 32, |col, row, idx| StatePath::LockOp { col, row, idx });
 
         MappingTree::builder()
             .scope("top")
@@ -1094,36 +930,15 @@ mod tests {
         let tree = build_test_tree();
         let segments = ["top", "math_engine", "mem_row", "tile_0_1", "locks", "value_3"];
         let result = tree.resolve(&segments);
-        assert_eq!(
-            result,
-            Some(StatePath::LockValue {
-                col: 0,
-                row: 1,
-                idx: 3,
-            })
-        );
+        assert_eq!(result, Some(StatePath::LockValue { col: 0, row: 1, idx: 3 }));
     }
 
     #[test]
     fn resolve_lock_op_signal() {
         let tree = build_test_tree();
-        let segments = [
-            "top",
-            "math_engine",
-            "mem_row",
-            "tile_1_1",
-            "locks",
-            "lock_op_15",
-        ];
+        let segments = ["top", "math_engine", "mem_row", "tile_1_1", "locks", "lock_op_15"];
         let result = tree.resolve(&segments);
-        assert_eq!(
-            result,
-            Some(StatePath::LockOp {
-                col: 1,
-                row: 1,
-                idx: 15,
-            })
-        );
+        assert_eq!(result, Some(StatePath::LockOp { col: 1, row: 1, idx: 15 }));
     }
 
     #[test]
@@ -1137,28 +952,14 @@ mod tests {
     fn resolve_unknown_tile_returns_none() {
         let tree = build_test_tree();
         // Tile (2, 1) is not in the tree.
-        let segments = [
-            "top",
-            "math_engine",
-            "mem_row",
-            "tile_2_1",
-            "locks",
-            "value_0",
-        ];
+        let segments = ["top", "math_engine", "mem_row", "tile_2_1", "locks", "value_0"];
         assert_eq!(tree.resolve(&segments), None);
     }
 
     #[test]
     fn resolve_unknown_subsystem_returns_none() {
         let tree = build_test_tree();
-        let segments = [
-            "top",
-            "math_engine",
-            "mem_row",
-            "tile_0_1",
-            "dma",
-            "something",
-        ];
+        let segments = ["top", "math_engine", "mem_row", "tile_0_1", "dma", "something"];
         assert_eq!(tree.resolve(&segments), None);
     }
 
@@ -1179,40 +980,12 @@ mod tests {
     #[test]
     fn resolve_different_tiles() {
         let tree = build_test_tree();
-        let seg_a = [
-            "top",
-            "math_engine",
-            "mem_row",
-            "tile_0_1",
-            "locks",
-            "value_0",
-        ];
-        let seg_b = [
-            "top",
-            "math_engine",
-            "mem_row",
-            "tile_1_1",
-            "locks",
-            "value_0",
-        ];
+        let seg_a = ["top", "math_engine", "mem_row", "tile_0_1", "locks", "value_0"];
+        let seg_b = ["top", "math_engine", "mem_row", "tile_1_1", "locks", "value_0"];
         let a = tree.resolve(&seg_a).unwrap();
         let b = tree.resolve(&seg_b).unwrap();
-        assert_eq!(
-            a,
-            StatePath::LockValue {
-                col: 0,
-                row: 1,
-                idx: 0,
-            }
-        );
-        assert_eq!(
-            b,
-            StatePath::LockValue {
-                col: 1,
-                row: 1,
-                idx: 0,
-            }
-        );
+        assert_eq!(a, StatePath::LockValue { col: 0, row: 1, idx: 0 });
+        assert_eq!(b, StatePath::LockValue { col: 1, row: 1, idx: 0 });
     }
 
     #[test]
@@ -1238,17 +1011,16 @@ mod tests {
     // -- Multi-tile-group (FanOut) tests --
 
     fn build_multi_group_tree() -> MappingTree {
-        let lock_mapping = SubsystemMapping::new("locks", Subsystem::Lock)
-            .indexed_signal("value", 4, 32, |col, row, idx| StatePath::LockValue {
-                col,
-                row,
-                idx,
-            });
+        let lock_mapping = SubsystemMapping::new("locks", Subsystem::Lock).indexed_signal(
+            "value",
+            4,
+            32,
+            |col, row, idx| StatePath::LockValue { col, row, idx },
+        );
 
-        let core_mapping = SubsystemMapping::new("cm", Subsystem::Core)
-            .fixed_signal("pm_address", 32, |col, row, _| {
-                StatePath::CorePmAddress { col, row }
-            });
+        let core_mapping =
+            SubsystemMapping::new("cm", Subsystem::Core)
+                .fixed_signal("pm_address", 32, |col, row, _| StatePath::CorePmAddress { col, row });
 
         MappingTree::builder()
             .scope("top")
@@ -1267,36 +1039,12 @@ mod tests {
         let tree = build_multi_group_tree();
 
         // mem_row tile
-        let seg_lock = [
-            "top",
-            "math_engine",
-            "mem_row",
-            "tile_0_1",
-            "locks",
-            "value_2",
-        ];
-        assert_eq!(
-            tree.resolve(&seg_lock),
-            Some(StatePath::LockValue {
-                col: 0,
-                row: 1,
-                idx: 2,
-            })
-        );
+        let seg_lock = ["top", "math_engine", "mem_row", "tile_0_1", "locks", "value_2"];
+        assert_eq!(tree.resolve(&seg_lock), Some(StatePath::LockValue { col: 0, row: 1, idx: 2 }));
 
         // array tile
-        let seg_core = [
-            "top",
-            "math_engine",
-            "array",
-            "tile_0_3",
-            "cm",
-            "pm_address",
-        ];
-        assert_eq!(
-            tree.resolve(&seg_core),
-            Some(StatePath::CorePmAddress { col: 0, row: 3 })
-        );
+        let seg_core = ["top", "math_engine", "array", "tile_0_3", "cm", "pm_address"];
+        assert_eq!(tree.resolve(&seg_core), Some(StatePath::CorePmAddress { col: 0, row: 3 }));
     }
 
     #[test]
@@ -1315,12 +1063,7 @@ mod tests {
         let dma = SubsystemMapping::new("dma", Subsystem::Dma).nested_group(
             "s2mm_state",
             2,
-            vec![("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd {
-                col,
-                row,
-                dir: DmaDir::S2mm,
-                ch,
-            })],
+            vec![("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd { col, row, dir: DmaDir::S2mm, ch })],
         );
 
         let tree = MappingTree::builder()
@@ -1331,23 +1074,10 @@ mod tests {
             .done_tile_group()
             .build();
 
-        let segments = [
-            "top",
-            "math_engine",
-            "mem_row",
-            "tile_0_1",
-            "dma",
-            "s2mm_state1",
-            "cur_bd",
-        ];
+        let segments = ["top", "math_engine", "mem_row", "tile_0_1", "dma", "s2mm_state1", "cur_bd"];
         assert_eq!(
             tree.resolve(&segments),
-            Some(StatePath::DmaCurrentBd {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 1,
-            })
+            Some(StatePath::DmaCurrentBd { col: 0, row: 1, dir: DmaDir::S2mm, ch: 1 })
         );
     }
 
@@ -1361,11 +1091,9 @@ mod tests {
             32,
             |col, row, idx| StatePath::LockValue { col, row, idx },
         );
-        let core = SubsystemMapping::new("cm", Subsystem::Core).fixed_signal(
-            "pm_address",
-            32,
-            |col, row, _| StatePath::CorePmAddress { col, row },
-        );
+        let core =
+            SubsystemMapping::new("cm", Subsystem::Core)
+                .fixed_signal("pm_address", 32, |col, row, _| StatePath::CorePmAddress { col, row });
 
         let tree = MappingTree::builder()
             .scope("top")
@@ -1377,21 +1105,11 @@ mod tests {
 
         // Lock signal
         let seg_lock = ["top", "array", "tile_0_2", "locks", "value_1"];
-        assert_eq!(
-            tree.resolve(&seg_lock),
-            Some(StatePath::LockValue {
-                col: 0,
-                row: 2,
-                idx: 1,
-            })
-        );
+        assert_eq!(tree.resolve(&seg_lock), Some(StatePath::LockValue { col: 0, row: 2, idx: 1 }));
 
         // Core signal
         let seg_core = ["top", "array", "tile_0_2", "cm", "pm_address"];
-        assert_eq!(
-            tree.resolve(&seg_core),
-            Some(StatePath::CorePmAddress { col: 0, row: 2 })
-        );
+        assert_eq!(tree.resolve(&seg_core), Some(StatePath::CorePmAddress { col: 0, row: 2 }));
 
         // Enumerate: 4 lock values + 1 core signal = 5
         let paths = tree.enumerate_all();
@@ -1405,25 +1123,12 @@ mod tests {
         let dma = SubsystemMapping::new("dma", Subsystem::Dma).nested_group(
             "s2mm_state",
             2,
-            vec![("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd {
-                col,
-                row,
-                dir: DmaDir::S2mm,
-                ch,
-            })],
+            vec![("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd { col, row, dir: DmaDir::S2mm, ch })],
         );
         let nested = NestedScopeMapping::new("mm", Box::new(dma));
         // Segments after "mm" has been consumed by the tree: ["dma", "s2mm_state0", "cur_bd"]
         let result = nested.resolve(&["dma", "s2mm_state0", "cur_bd"], 0, 3);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaCurrentBd {
-                col: 0,
-                row: 3,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaCurrentBd { col: 0, row: 3, dir: DmaDir::S2mm, ch: 0 }));
     }
 
     #[test]
@@ -1431,12 +1136,7 @@ mod tests {
         let dma = SubsystemMapping::new("dma", Subsystem::Dma).nested_group(
             "s2mm_state",
             2,
-            vec![("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd {
-                col,
-                row,
-                dir: DmaDir::S2mm,
-                ch,
-            })],
+            vec![("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd { col, row, dir: DmaDir::S2mm, ch })],
         );
         let nested = NestedScopeMapping::new("mm", Box::new(dma));
         // Wrong inner scope
@@ -1455,12 +1155,7 @@ mod tests {
         let dma = SubsystemMapping::new("dma", Subsystem::Dma).nested_group(
             "s2mm_state",
             2,
-            vec![("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd {
-                col,
-                row,
-                dir: DmaDir::S2mm,
-                ch,
-            })],
+            vec![("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd { col, row, dir: DmaDir::S2mm, ch })],
         );
         let nested = NestedScopeMapping::new("mm", Box::new(dma));
         let paths = nested.enumerate(1, 3);
@@ -1473,12 +1168,7 @@ mod tests {
         let dma = SubsystemMapping::new("dma", Subsystem::Dma).nested_group(
             "s2mm_state",
             2,
-            vec![("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd {
-                col,
-                row,
-                dir: DmaDir::S2mm,
-                ch,
-            })],
+            vec![("cur_bd", 4, |col, row, ch| StatePath::DmaCurrentBd { col, row, dir: DmaDir::S2mm, ch })],
         );
 
         let tree = MappingTree::builder()
@@ -1491,12 +1181,7 @@ mod tests {
         let segments = ["top", "array", "tile_0_3", "mm", "dma", "s2mm_state1", "cur_bd"];
         assert_eq!(
             tree.resolve(&segments),
-            Some(StatePath::DmaCurrentBd {
-                col: 0,
-                row: 3,
-                dir: DmaDir::S2mm,
-                ch: 1,
-            })
+            Some(StatePath::DmaCurrentBd { col: 0, row: 3, dir: DmaDir::S2mm, ch: 1 })
         );
     }
 
@@ -1527,70 +1212,42 @@ mod tests {
     #[test]
     fn aie2_tree_resolves_lock_in_mem_tile() {
         let tree = build_aie2_mapping_tree();
-        let segments = [
-            "top", "math_engine", "mem_row", "tile_2_1", "locks", "value_63",
-        ];
-        assert_eq!(
-            tree.resolve(&segments),
-            Some(StatePath::LockValue { col: 2, row: 1, idx: 63 })
-        );
+        let segments = ["top", "math_engine", "mem_row", "tile_2_1", "locks", "value_63"];
+        assert_eq!(tree.resolve(&segments), Some(StatePath::LockValue { col: 2, row: 1, idx: 63 }));
     }
 
     #[test]
     fn aie2_tree_resolves_dma_in_compute_tile() {
         let tree = build_aie2_mapping_tree();
         // Compute tile DMA is under mm.dma
-        let segments = [
-            "top", "math_engine", "array", "tile_1_3", "mm", "dma",
-            "s2mm_state0", "cur_bd",
-        ];
+        let segments = ["top", "math_engine", "array", "tile_1_3", "mm", "dma", "s2mm_state0", "cur_bd"];
         assert_eq!(
             tree.resolve(&segments),
-            Some(StatePath::DmaCurrentBd {
-                col: 1,
-                row: 3,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
+            Some(StatePath::DmaCurrentBd { col: 1, row: 3, dir: DmaDir::S2mm, ch: 0 })
         );
     }
 
     #[test]
     fn aie2_tree_resolves_stream_in_compute_tile() {
         let tree = build_aie2_mapping_tree();
-        let segments = [
-            "top", "math_engine", "array", "tile_0_2",
-            "stream_switch", "from_sSouth3", "data",
-        ];
+        let segments = ["top", "math_engine", "array", "tile_0_2", "stream_switch", "from_sSouth3", "data"];
         assert_eq!(
             tree.resolve(&segments),
-            Some(StatePath::StreamPortData {
-                col: 0,
-                row: 2,
-                port: PortId::named("sSouth3"),
-            })
+            Some(StatePath::StreamPortData { col: 0, row: 2, port: PortId::named("sSouth3") })
         );
     }
 
     #[test]
     fn aie2_tree_resolves_core_in_compute_tile() {
         let tree = build_aie2_mapping_tree();
-        let segments = [
-            "top", "math_engine", "array", "tile_3_5", "cm", "pc_E1",
-        ];
-        assert_eq!(
-            tree.resolve(&segments),
-            Some(StatePath::CorePc { col: 3, row: 5, stage: 1 })
-        );
+        let segments = ["top", "math_engine", "array", "tile_3_5", "cm", "pc_E1"];
+        assert_eq!(tree.resolve(&segments), Some(StatePath::CorePc { col: 3, row: 5, stage: 1 }));
     }
 
     #[test]
     fn aie2_tree_resolves_event_in_shim_tile() {
         let tree = build_aie2_mapping_tree();
-        let segments = [
-            "top", "math_engine", "shim", "tile_0_0",
-            "event_trace", "event73_INSTR_VECTOR",
-        ];
+        let segments = ["top", "math_engine", "shim", "tile_0_0", "event_trace", "event73_INSTR_VECTOR"];
         assert_eq!(
             tree.resolve(&segments),
             Some(StatePath::EventTrace {
@@ -1614,11 +1271,7 @@ mod tests {
         //
         // This is a sanity check -- the exact count may drift as mappings evolve.
         // We check for a reasonable minimum rather than an exact value.
-        assert!(
-            paths.len() > 5000,
-            "Expected > 5000 enumerated paths, got {}",
-            paths.len()
-        );
+        assert!(paths.len() > 5000, "Expected > 5000 enumerated paths, got {}", paths.len());
 
         // Verify all subsystem types are represented.
         assert!(paths.iter().any(|p| p.subsystem() == Subsystem::Lock));
@@ -1632,9 +1285,7 @@ mod tests {
     fn aie2_tree_unknown_tile_returns_none() {
         let tree = build_aie2_mapping_tree();
         // Col 4 does not exist in NPU1 (only 0-3).
-        let segments = [
-            "top", "math_engine", "array", "tile_4_2", "locks", "value_0",
-        ];
+        let segments = ["top", "math_engine", "array", "tile_4_2", "locks", "value_0"];
         assert_eq!(tree.resolve(&segments), None);
     }
 
@@ -1642,74 +1293,53 @@ mod tests {
     fn aie2_tree_resolves_dma_in_mem_tile() {
         let tree = build_aie2_mapping_tree();
         // Mem tile DMA is directly under dma (no mm wrapper).
-        let segments = [
-            "top", "math_engine", "mem_row", "tile_1_1", "dma",
-            "mm2s_state5", "address",
-        ];
+        let segments = ["top", "math_engine", "mem_row", "tile_1_1", "dma", "mm2s_state5", "address"];
         assert_eq!(
             tree.resolve(&segments),
-            Some(StatePath::DmaAddress {
-                col: 1,
-                row: 1,
-                dir: DmaDir::Mm2s,
-                ch: 5,
-            })
+            Some(StatePath::DmaAddress { col: 1, row: 1, dir: DmaDir::Mm2s, ch: 5 })
         );
     }
 
     #[test]
     fn aie2_tree_resolves_stream_in_shim_tile() {
         let tree = build_aie2_mapping_tree();
-        let segments = [
-            "top", "math_engine", "shim", "tile_0_0",
-            "stream_switch", "from_sDMA1", "data",
-        ];
+        let segments = ["top", "math_engine", "shim", "tile_0_0", "stream_switch", "from_sDMA1", "data"];
         assert_eq!(
             tree.resolve(&segments),
-            Some(StatePath::StreamPortData {
-                col: 0,
-                row: 0,
-                port: PortId::named("sDMA1"),
-            })
+            Some(StatePath::StreamPortData { col: 0, row: 0, port: PortId::named("sDMA1") })
         );
     }
 
     #[test]
     fn aie2_tree_resolves_lock_in_shim_tile() {
         let tree = build_aie2_mapping_tree();
-        let segments = [
-            "top", "math_engine", "shim", "tile_3_0", "locks", "value_15",
-        ];
-        assert_eq!(
-            tree.resolve(&segments),
-            Some(StatePath::LockValue { col: 3, row: 0, idx: 15 })
-        );
+        let segments = ["top", "math_engine", "shim", "tile_3_0", "locks", "value_15"];
+        assert_eq!(tree.resolve(&segments), Some(StatePath::LockValue { col: 3, row: 0, idx: 15 }));
     }
 
     #[test]
     fn aie2_tree_resolves_stream_event_in_compute_tile() {
         let tree = build_aie2_mapping_tree();
         let segments = [
-            "top", "math_engine", "array", "tile_2_4",
-            "stream_switch", "from_sNorth0", "event_idle_sNorth0",
+            "top",
+            "math_engine",
+            "array",
+            "tile_2_4",
+            "stream_switch",
+            "from_sNorth0",
+            "event_idle_sNorth0",
         ];
         assert_eq!(
             tree.resolve(&segments),
-            Some(StatePath::StreamPortIdle {
-                col: 2,
-                row: 4,
-                port: PortId::named("sNorth0"),
-            })
+            Some(StatePath::StreamPortIdle { col: 2, row: 4, port: PortId::named("sNorth0") })
         );
     }
 
     #[test]
     fn aie2_tree_resolves_event_in_compute_tile() {
         let tree = build_aie2_mapping_tree();
-        let segments = [
-            "top", "math_engine", "array", "tile_0_2",
-            "event_trace", "event85_DMA_S2MM_0_START_TASK",
-        ];
+        let segments =
+            ["top", "math_engine", "array", "tile_0_2", "event_trace", "event85_DMA_S2MM_0_START_TASK"];
         assert_eq!(
             tree.resolve(&segments),
             Some(StatePath::EventTrace {
@@ -1725,9 +1355,7 @@ mod tests {
     fn aie2_tree_wrong_scope_chain_returns_none() {
         let tree = build_aie2_mapping_tree();
         // Wrong root scope
-        let segments = [
-            "bottom", "math_engine", "array", "tile_0_2", "cm", "pc_E1",
-        ];
+        let segments = ["bottom", "math_engine", "array", "tile_0_2", "cm", "pc_E1"];
         assert_eq!(tree.resolve(&segments), None);
     }
 
@@ -1758,17 +1386,9 @@ mod tests {
         // Every tile in the NPU1 array should appear in enumeration.
         for col in 0..4u8 {
             // Shim (row 0)
-            assert!(
-                paths.iter().any(|p| p.tile() == (col, 0)),
-                "Missing shim tile ({}, 0)",
-                col
-            );
+            assert!(paths.iter().any(|p| p.tile() == (col, 0)), "Missing shim tile ({}, 0)", col);
             // Mem (row 1)
-            assert!(
-                paths.iter().any(|p| p.tile() == (col, 1)),
-                "Missing mem tile ({}, 1)",
-                col
-            );
+            assert!(paths.iter().any(|p| p.tile() == (col, 1)), "Missing mem tile ({}, 1)", col);
             // Compute (rows 2-5)
             for row in 2..6u8 {
                 assert!(
@@ -1788,13 +1408,18 @@ mod tests {
         // Real VCD path: tl.aie_logical.aie_xtlm.math_engine.array.tile_7_3.cm.proc.pc_E1
         let tree = build_vc2802_mapping_tree();
         let segments = [
-            "SystemC", "tl", "aie_logical", "aie_xtlm", "math_engine",
-            "array", "tile_7_3", "cm", "proc", "pc_E1",
+            "SystemC",
+            "tl",
+            "aie_logical",
+            "aie_xtlm",
+            "math_engine",
+            "array",
+            "tile_7_3",
+            "cm",
+            "proc",
+            "pc_E1",
         ];
-        assert_eq!(
-            tree.resolve(&segments),
-            Some(StatePath::CorePc { col: 7, row: 3, stage: 1 })
-        );
+        assert_eq!(tree.resolve(&segments), Some(StatePath::CorePc { col: 7, row: 3, stage: 1 }));
     }
 
     #[test]
@@ -1802,13 +1427,19 @@ mod tests {
         // Real VCD path: ...array.tile_7_3.cm.proc.iss.pm_rd_in
         let tree = build_vc2802_mapping_tree();
         let segments = [
-            "SystemC", "tl", "aie_logical", "aie_xtlm", "math_engine",
-            "array", "tile_7_3", "cm", "proc", "iss", "pm_rd_in",
+            "SystemC",
+            "tl",
+            "aie_logical",
+            "aie_xtlm",
+            "math_engine",
+            "array",
+            "tile_7_3",
+            "cm",
+            "proc",
+            "iss",
+            "pm_rd_in",
         ];
-        assert_eq!(
-            tree.resolve(&segments),
-            Some(StatePath::CorePmData { col: 7, row: 3 })
-        );
+        assert_eq!(tree.resolve(&segments), Some(StatePath::CorePmData { col: 7, row: 3 }));
     }
 
     #[test]
@@ -1816,13 +1447,19 @@ mod tests {
         // Real VCD path: ...array.tile_7_3.cm.proc.iss.reset
         let tree = build_vc2802_mapping_tree();
         let segments = [
-            "SystemC", "tl", "aie_logical", "aie_xtlm", "math_engine",
-            "array", "tile_7_3", "cm", "proc", "iss", "reset",
+            "SystemC",
+            "tl",
+            "aie_logical",
+            "aie_xtlm",
+            "math_engine",
+            "array",
+            "tile_7_3",
+            "cm",
+            "proc",
+            "iss",
+            "reset",
         ];
-        assert_eq!(
-            tree.resolve(&segments),
-            Some(StatePath::CoreReset { col: 7, row: 3 })
-        );
+        assert_eq!(tree.resolve(&segments), Some(StatePath::CoreReset { col: 7, row: 3 }));
     }
 
     #[test]
@@ -1830,13 +1467,18 @@ mod tests {
         // Real VCD path: ...array.tile_7_3.mm.locks.value_0
         let tree = build_vc2802_mapping_tree();
         let segments = [
-            "SystemC", "tl", "aie_logical", "aie_xtlm", "math_engine",
-            "array", "tile_7_3", "mm", "locks", "value_0",
+            "SystemC",
+            "tl",
+            "aie_logical",
+            "aie_xtlm",
+            "math_engine",
+            "array",
+            "tile_7_3",
+            "mm",
+            "locks",
+            "value_0",
         ];
-        assert_eq!(
-            tree.resolve(&segments),
-            Some(StatePath::LockValue { col: 7, row: 3, idx: 0 })
-        );
+        assert_eq!(tree.resolve(&segments), Some(StatePath::LockValue { col: 7, row: 3, idx: 0 }));
     }
 
     #[test]
@@ -1844,16 +1486,20 @@ mod tests {
         // Real VCD path: ...shim.tile_0_0.stream_switch.from_sSouth0.data
         let tree = build_vc2802_mapping_tree();
         let segments = [
-            "SystemC", "tl", "aie_logical", "aie_xtlm", "math_engine",
-            "shim", "tile_0_0", "stream_switch", "from_sSouth0", "data",
+            "SystemC",
+            "tl",
+            "aie_logical",
+            "aie_xtlm",
+            "math_engine",
+            "shim",
+            "tile_0_0",
+            "stream_switch",
+            "from_sSouth0",
+            "data",
         ];
         assert_eq!(
             tree.resolve(&segments),
-            Some(StatePath::StreamPortData {
-                col: 0,
-                row: 0,
-                port: PortId::named("sSouth0"),
-            })
+            Some(StatePath::StreamPortData { col: 0, row: 0, port: PortId::named("sSouth0") })
         );
     }
 
@@ -1862,12 +1508,16 @@ mod tests {
         // Real VCD: ...mem_row.tile_2_1.locks.value_63
         let tree = build_vc2802_mapping_tree();
         let segments = [
-            "SystemC", "tl", "aie_logical", "aie_xtlm", "math_engine",
-            "mem_row", "tile_2_1", "locks", "value_63",
+            "SystemC",
+            "tl",
+            "aie_logical",
+            "aie_xtlm",
+            "math_engine",
+            "mem_row",
+            "tile_2_1",
+            "locks",
+            "value_63",
         ];
-        assert_eq!(
-            tree.resolve(&segments),
-            Some(StatePath::LockValue { col: 2, row: 1, idx: 63 })
-        );
+        assert_eq!(tree.resolve(&segments), Some(StatePath::LockValue { col: 2, row: 1, idx: 63 }));
     }
 }

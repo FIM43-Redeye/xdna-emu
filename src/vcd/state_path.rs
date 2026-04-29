@@ -223,7 +223,6 @@ pub enum StatePath {
     // ------------------------------------------------------------------
     // Lock subsystem
     // ------------------------------------------------------------------
-
     /// Current numerical value of a lock register.
     LockValue { col: u8, row: u8, idx: u8 },
     /// Lock operation (acquire / release) in progress.
@@ -232,7 +231,6 @@ pub enum StatePath {
     // ------------------------------------------------------------------
     // DMA subsystem
     // ------------------------------------------------------------------
-
     /// DMA channel FSM state.
     DmaFsmState { col: u8, row: u8, dir: DmaDir, ch: u8 },
     /// Index of the BD currently being processed.
@@ -277,7 +275,6 @@ pub enum StatePath {
     // ------------------------------------------------------------------
     // Stream subsystem
     // ------------------------------------------------------------------
-
     /// Data word present on a stream switch port.
     StreamPortData { col: u8, row: u8, port: PortId },
     /// Port is idle (no transfer in progress).
@@ -292,7 +289,6 @@ pub enum StatePath {
     // ------------------------------------------------------------------
     // Core subsystem
     // ------------------------------------------------------------------
-
     /// Program counter at a specific pipeline stage.
     CorePc { col: u8, row: u8, stage: u8 },
     /// Program memory address bus (read side).
@@ -317,7 +313,6 @@ pub enum StatePath {
     // ------------------------------------------------------------------
     // Memory subsystem
     // ------------------------------------------------------------------
-
     /// Memory bank conflict detected (stall inserted).
     MemBankConflict { col: u8, row: u8, bank: u8 },
     /// Address that caused a bank conflict.
@@ -328,14 +323,17 @@ pub enum StatePath {
     // ------------------------------------------------------------------
     // Event subsystem
     // ------------------------------------------------------------------
-
     /// A trace event fired at this tile with the given event code.
-    EventTrace { col: u8, row: u8, event_code: u16, event_name: String },
+    EventTrace {
+        col: u8,
+        row: u8,
+        event_code: u16,
+        event_name: String,
+    },
 
     // ------------------------------------------------------------------
     // Performance counter subsystem
     // ------------------------------------------------------------------
-
     /// Performance counter value.
     PerfCounter { col: u8, row: u8, idx: u8 },
 }
@@ -743,7 +741,10 @@ mod tests {
     #[test]
     fn state_path_field_name() {
         assert_eq!(StatePath::LockValue { col: 0, row: 0, idx: 0 }.field_name(), "value");
-        assert_eq!(StatePath::DmaFsmState { col: 0, row: 0, dir: DmaDir::S2mm, ch: 0 }.field_name(), "fsm_state");
+        assert_eq!(
+            StatePath::DmaFsmState { col: 0, row: 0, dir: DmaDir::S2mm, ch: 0 }.field_name(),
+            "fsm_state"
+        );
         assert_eq!(StatePath::CorePc { col: 0, row: 0, stage: 0 }.field_name(), "pc");
         assert_eq!(StatePath::PerfCounter { col: 0, row: 0, idx: 0 }.field_name(), "counter");
     }
@@ -770,11 +771,7 @@ mod tests {
 
     #[test]
     fn mem_port_access_display() {
-        let p = StatePath::MemPortAccess {
-            col: 1,
-            row: 3,
-            port: MemPortId { name: "portA".to_string() },
-        };
+        let p = StatePath::MemPortAccess { col: 1, row: 3, port: MemPortId { name: "portA".to_string() } };
         let s = p.to_string();
         assert!(s.contains("memory"));
         assert!(s.contains("portA"));
@@ -782,11 +779,7 @@ mod tests {
 
     #[test]
     fn stream_port_data_display() {
-        let p = StatePath::StreamPortData {
-            col: 0,
-            row: 1,
-            port: PortId::indexed(PortBundle::North, 0),
-        };
+        let p = StatePath::StreamPortData { col: 0, row: 1, port: PortId::indexed(PortBundle::North, 0) };
         let s = p.to_string();
         assert!(s.contains("stream"));
         assert!(s.contains("sNorth0"));

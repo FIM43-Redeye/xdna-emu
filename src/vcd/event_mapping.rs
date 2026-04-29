@@ -138,12 +138,7 @@ fn parse_event_signal(name: &str, col: u8, row: u8) -> Option<StatePath> {
     // Parse the event code as a decimal integer.
     let event_code: u16 = code_str.parse().ok()?;
 
-    Some(StatePath::EventTrace {
-        col,
-        row,
-        event_code,
-        event_name: event_name.to_string(),
-    })
+    Some(StatePath::EventTrace { col, row, event_code, event_name: event_name.to_string() })
 }
 
 // ---------------------------------------------------------------------------
@@ -202,12 +197,7 @@ mod tests {
         let result = mapping.resolve(&["event0_none"], 0, 1);
         assert_eq!(
             result,
-            Some(StatePath::EventTrace {
-                col: 0,
-                row: 1,
-                event_code: 0,
-                event_name: "none".to_string(),
-            })
+            Some(StatePath::EventTrace { col: 0, row: 1, event_code: 0, event_name: "none".to_string() })
         );
     }
 
@@ -217,12 +207,7 @@ mod tests {
         let result = mapping.resolve(&["event1_true"], 0, 1);
         assert_eq!(
             result,
-            Some(StatePath::EventTrace {
-                col: 0,
-                row: 1,
-                event_code: 1,
-                event_name: "true".to_string(),
-            })
+            Some(StatePath::EventTrace { col: 0, row: 1, event_code: 1, event_name: "true".to_string() })
         );
     }
 
@@ -394,12 +379,7 @@ mod tests {
         let result = parse_event_signal("event65535_max", 0, 0);
         assert_eq!(
             result,
-            Some(StatePath::EventTrace {
-                col: 0,
-                row: 0,
-                event_code: 65535,
-                event_name: "max".to_string(),
-            })
+            Some(StatePath::EventTrace { col: 0, row: 0, event_code: 65535, event_name: "max".to_string() })
         );
     }
 

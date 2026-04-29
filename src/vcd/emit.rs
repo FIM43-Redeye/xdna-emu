@@ -84,14 +84,10 @@ impl<W: Write> VcdRecorder<W> {
             .map_err(|e| format!("VCD timescale: {}", e))?;
 
         // Outer scope: top
-        vcd_writer
-            .add_module("top")
-            .map_err(|e| format!("VCD scope top: {}", e))?;
+        vcd_writer.add_module("top").map_err(|e| format!("VCD scope top: {}", e))?;
 
         // Inner scope: emu (emulator -- distinguishes our VCDs from aiesimulator VCDs)
-        vcd_writer
-            .add_module("emu")
-            .map_err(|e| format!("VCD scope emu: {}", e))?;
+        vcd_writer.add_module("emu").map_err(|e| format!("VCD scope emu: {}", e))?;
 
         // Enumerate every StatePath the tree can produce.
         let paths = tree.enumerate_all();
@@ -106,24 +102,13 @@ impl<W: Write> VcdRecorder<W> {
         }
 
         // Close the two scopes.
-        vcd_writer
-            .upscope()
-            .map_err(|e| format!("VCD upscope emu: {}", e))?;
-        vcd_writer
-            .upscope()
-            .map_err(|e| format!("VCD upscope top: {}", e))?;
+        vcd_writer.upscope().map_err(|e| format!("VCD upscope emu: {}", e))?;
+        vcd_writer.upscope().map_err(|e| format!("VCD upscope top: {}", e))?;
 
         // End of header declarations.
-        vcd_writer
-            .enddefinitions()
-            .map_err(|e| format!("VCD enddefinitions: {}", e))?;
+        vcd_writer.enddefinitions().map_err(|e| format!("VCD enddefinitions: {}", e))?;
 
-        Ok(VcdRecorder {
-            writer: vcd_writer,
-            path_to_id,
-            current_time: 0,
-            timestamp_written: false,
-        })
+        Ok(VcdRecorder { writer: vcd_writer, path_to_id, current_time: 0, timestamp_written: false })
     }
 
     /// Record a state change at the given simulation time.
@@ -171,9 +156,13 @@ impl<W: Write> VcdRecorder<W> {
             self.writer
                 .change_vector(
                     id,
-                    (0..width)
-                        .rev()
-                        .map(|i| if (value >> i) & 1 == 1 { vcd::Value::V1 } else { vcd::Value::V0 }),
+                    (0..width).rev().map(|i| {
+                        if (value >> i) & 1 == 1 {
+                            vcd::Value::V1
+                        } else {
+                            vcd::Value::V0
+                        }
+                    }),
                 )
                 .map_err(|e| format!("VCD change_vector for {}: {}", path, e))?;
         }
@@ -186,9 +175,7 @@ impl<W: Write> VcdRecorder<W> {
     /// Must be called to ensure all buffered data is written to the underlying
     /// `Write` implementation.
     pub fn finish(mut self) -> Result<(), String> {
-        self.writer
-            .flush()
-            .map_err(|e| format!("VCD flush: {}", e))?;
+        self.writer.flush().map_err(|e| format!("VCD flush: {}", e))?;
         Ok(())
     }
 }
@@ -418,10 +405,7 @@ mod tests {
         let mut recorder = VcdRecorder::new(&mut buf, &tree).unwrap();
         // Tile (9, 9) is not in this tree.
         let unknown = StatePath::LockValue { col: 9, row: 9, idx: 0 };
-        assert!(
-            recorder.record(0, &unknown, 0).is_err(),
-            "should reject unknown StatePath"
-        );
+        assert!(recorder.record(0, &unknown, 0).is_err(), "should reject unknown StatePath");
     }
 
     // ------------------------------------------------------------------
@@ -435,9 +419,15 @@ mod tests {
         assert_eq!(signal_width(&StatePath::DmaBdValid { col: 0, row: 0, dir: DmaDir::S2mm, ch: 0 }), 1);
         assert_eq!(signal_width(&StatePath::DmaEnablePacket { col: 0, row: 0, dir: DmaDir::S2mm, ch: 0 }), 1);
         assert_eq!(signal_width(&StatePath::DmaUseNextBd { col: 0, row: 0, dir: DmaDir::S2mm, ch: 0 }), 1);
-        assert_eq!(signal_width(&StatePath::DmaTlastSuppress { col: 0, row: 0, dir: DmaDir::S2mm, ch: 0 }), 1);
+        assert_eq!(
+            signal_width(&StatePath::DmaTlastSuppress { col: 0, row: 0, dir: DmaDir::S2mm, ch: 0 }),
+            1
+        );
         use crate::vcd::state_path::PortId;
-        assert_eq!(signal_width(&StatePath::StreamPortIdle { col: 0, row: 0, port: PortId::named("sSouth0") }), 1);
+        assert_eq!(
+            signal_width(&StatePath::StreamPortIdle { col: 0, row: 0, port: PortId::named("sSouth0") }),
+            1
+        );
     }
 
     #[test]

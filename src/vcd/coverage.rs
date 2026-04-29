@@ -67,8 +67,8 @@ pub fn coverage_audit(vcd_path: &str, tree: &MappingTree) -> Result<CoverageRepo
     // Load the VCD hierarchy. wellen reads the full header (scopes and
     // variable declarations) during this call; the signal body data is also
     // loaded but we do not use it here.
-    let waveform = wellen::simple::read(vcd_path)
-        .map_err(|e| format!("Failed to read VCD '{}': {:?}", vcd_path, e))?;
+    let waveform =
+        wellen::simple::read(vcd_path).map_err(|e| format!("Failed to read VCD '{}': {:?}", vcd_path, e))?;
     let hierarchy = waveform.hierarchy();
 
     let mut total = 0usize;
@@ -93,12 +93,7 @@ pub fn coverage_audit(vcd_path: &str, tree: &MappingTree) -> Result<CoverageRepo
             // Group unmapped signals by their first 3 hierarchy levels.
             // This groups together all signals under e.g. "top.math_engine.shim"
             // so the report highlights which areas are entirely unmapped.
-            let prefix = segments
-                .iter()
-                .take(3)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(".");
+            let prefix = segments.iter().take(3).cloned().collect::<Vec<_>>().join(".");
             *unmapped_groups.entry(prefix).or_insert(0) += 1;
         }
     }
@@ -130,11 +125,7 @@ impl fmt::Display for CoverageReport {
                 0.0
             }
         )?;
-        writeln!(
-            f,
-            "  UNMAPPED:  {:>6} signals (no emulator counterpart)",
-            self.unmapped_count
-        )?;
+        writeln!(f, "  UNMAPPED:  {:>6} signals (no emulator counterpart)", self.unmapped_count)?;
 
         if !self.mapped_by_subsystem.is_empty() {
             writeln!(f, "\n  Mapped by subsystem:")?;
@@ -182,9 +173,7 @@ mod tests {
     /// for NPU1 programs.
     fn build_npu1_tree() -> MappingTree {
         // Compute column range 0-3, row range 2-5 (above mem row at 1)
-        let array_tiles: Vec<(u8, u8)> = (0u8..4)
-            .flat_map(|c| (2u8..6).map(move |r| (c, r)))
-            .collect();
+        let array_tiles: Vec<(u8, u8)> = (0u8..4).flat_map(|c| (2u8..6).map(move |r| (c, r))).collect();
 
         // Shim tiles at row 0, columns 0-3
         let shim_tiles: Vec<(u8, u8)> = (0u8..4).map(|c| (c, 0u8)).collect();
@@ -217,10 +206,7 @@ mod tests {
     fn coverage_report_from_real_vcd() {
         let vcd_path = "/tmp/aiesim-test2/trace.vcd";
         if !std::path::Path::new(vcd_path).exists() {
-            eprintln!(
-                "Skipping: {} not found (run aiesim to generate)",
-                vcd_path
-            );
+            eprintln!("Skipping: {} not found (run aiesim to generate)", vcd_path);
             return;
         }
 
@@ -235,11 +221,7 @@ mod tests {
         );
 
         // Even a partial tree should map at least some lock signals.
-        assert!(
-            report.mapped_count > 0,
-            "Expected some mapped signals; total={}",
-            report.total_count
-        );
+        assert!(report.mapped_count > 0, "Expected some mapped signals; total={}", report.total_count);
 
         eprintln!("{}", report);
     }
@@ -258,10 +240,7 @@ mod tests {
                 ("foo.bar.baz".to_string(), 150),
                 ("foo.bar.qux".to_string(), 50),
             ]),
-            mapped_by_subsystem: BTreeMap::from([
-                (Subsystem::Lock, 500),
-                (Subsystem::Dma, 300),
-            ]),
+            mapped_by_subsystem: BTreeMap::from([(Subsystem::Lock, 500), (Subsystem::Dma, 300)]),
         };
         let text = format!("{}", report);
         assert!(text.contains("80.0%"), "Expected '80.0%' in:\n{}", text);
@@ -281,10 +260,7 @@ mod tests {
         let text = format!("{}", report);
         assert!(text.contains("100.0%"), "Expected '100.0%' in:\n{}", text);
         // No unmapped groups: the section should be absent.
-        assert!(
-            !text.contains("Unmapped by prefix"),
-            "Expected no unmapped prefix section"
-        );
+        assert!(!text.contains("Unmapped by prefix"), "Expected no unmapped prefix section");
     }
 
     #[test]
@@ -305,9 +281,8 @@ mod tests {
     #[test]
     fn coverage_report_display_shows_top_20_unmapped() {
         // Build a report with 25 unmapped prefix groups; only top 20 shown.
-        let groups: BTreeMap<String, usize> = (0u32..25)
-            .map(|i| (format!("top.scope.group_{}", i), i as usize + 1))
-            .collect();
+        let groups: BTreeMap<String, usize> =
+            (0u32..25).map(|i| (format!("top.scope.group_{}", i), i as usize + 1)).collect();
         let report = CoverageReport {
             total_count: 300,
             mapped_count: 0,
@@ -318,11 +293,7 @@ mod tests {
         let text = format!("{}", report);
         // Count how many "group_" entries appear. Should be exactly 20.
         let group_count = text.matches("group_").count();
-        assert_eq!(
-            group_count, 20,
-            "Expected exactly 20 unmapped groups displayed, got {}",
-            group_count
-        );
+        assert_eq!(group_count, 20, "Expected exactly 20 unmapped groups displayed, got {}", group_count);
     }
 
     // -----------------------------------------------------------------------
@@ -365,8 +336,7 @@ $enddefinitions $end\n\
         // Write the synthetic VCD to a temp file.
         let dir = std::env::temp_dir();
         let vcd_file = dir.join("xdna_emu_coverage_test.vcd");
-        std::fs::write(&vcd_file, make_synthetic_vcd())
-            .expect("Failed to write synthetic VCD");
+        std::fs::write(&vcd_file, make_synthetic_vcd()).expect("Failed to write synthetic VCD");
 
         // Build a tree that covers the two mapped signals.
         let tree = MappingTree::builder()
@@ -391,11 +361,7 @@ $enddefinitions $end\n\
             Some(&2),
             "expected 2 lock signals mapped"
         );
-        assert_eq!(
-            report.mapped_by_subsystem.get(&Subsystem::Dma),
-            None,
-            "no DMA signals expected"
-        );
+        assert_eq!(report.mapped_by_subsystem.get(&Subsystem::Dma), None, "no DMA signals expected");
 
         // The unmapped group prefix should be the 3-segment prefix of "top.other_scope.some_signal".
         assert!(
@@ -411,9 +377,6 @@ $enddefinitions $end\n\
     fn coverage_audit_missing_file_returns_error() {
         let tree = MappingTree::builder().build();
         let result = coverage_audit("/nonexistent/path/to/trace.vcd", &tree);
-        assert!(
-            result.is_err(),
-            "Expected error for missing file, got Ok"
-        );
+        assert!(result.is_err(), "Expected error for missing file, got Ok");
     }
 }

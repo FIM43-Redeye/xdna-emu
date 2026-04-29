@@ -82,9 +82,7 @@ pub fn core_mapping() -> SubsystemMapping {
         .fixed_signal("tm_st_out", 1, |col, row, _| StatePath::CoreTmStore { col, row })
         // Core control signals.
         .fixed_signal("reset", 1, |col, row, _| StatePath::CoreReset { col, row })
-        .fixed_signal("pc_breakpoint_halted", 1, |col, row, _| {
-            StatePath::CoreBreakpointHalted { col, row }
-        })
+        .fixed_signal("pc_breakpoint_halted", 1, |col, row, _| StatePath::CoreBreakpointHalted { col, row })
 }
 
 /// Build the core mapping for VC2802 aiesimulator VCD format.
@@ -123,16 +121,14 @@ pub fn core_mapping_vc2802() -> CompositeMapping {
         .fixed_signal("tm_ld_out", 1, |col, row, _| StatePath::CoreTmLoad { col, row })
         .fixed_signal("tm_st_out", 1, |col, row, _| StatePath::CoreTmStore { col, row })
         .fixed_signal("reset", 1, |col, row, _| StatePath::CoreReset { col, row })
-        .fixed_signal("pc_breakpoint_halted", 1, |col, row, _| {
-            StatePath::CoreBreakpointHalted { col, row }
-        });
+        .fixed_signal("pc_breakpoint_halted", 1, |col, row, _| StatePath::CoreBreakpointHalted { col, row });
 
     // Combine: cm contains proc (with PCs) and proc.iss (with ISS signals).
     // The CompositeMapping tries each child in order.
-    CompositeMapping::new("cm", vec![
-        Box::new(pc_mapping),
-        Box::new(NestedScopeMapping::new("proc", Box::new(iss_mapping))),
-    ])
+    CompositeMapping::new(
+        "cm",
+        vec![Box::new(pc_mapping), Box::new(NestedScopeMapping::new("proc", Box::new(iss_mapping)))],
+    )
 }
 
 /// A composite mapping that tries multiple child mappings in order.
@@ -148,10 +144,7 @@ pub struct CompositeMapping {
 
 impl CompositeMapping {
     pub fn new(scope: &str, children: Vec<Box<dyn TileMapping>>) -> Self {
-        CompositeMapping {
-            scope: scope.to_string(),
-            children,
-        }
+        CompositeMapping { scope: scope.to_string(), children }
     }
 }
 

@@ -60,18 +60,8 @@ fn channel_signals(dir: DmaDir) -> Vec<(&'static str, u32, NestedSignalFactory)>
 fn s2mm_signals() -> Vec<(&'static str, u32, NestedSignalFactory)> {
     vec![
         // BD descriptor fields
-        ("cur_bd", 32, |col, row, ch| StatePath::DmaCurrentBd {
-            col,
-            row,
-            dir: DmaDir::S2mm,
-            ch,
-        }),
-        ("cur_bd_valid", 1, |col, row, ch| StatePath::DmaBdValid {
-            col,
-            row,
-            dir: DmaDir::S2mm,
-            ch,
-        }),
+        ("cur_bd", 32, |col, row, ch| StatePath::DmaCurrentBd { col, row, dir: DmaDir::S2mm, ch }),
+        ("cur_bd_valid", 1, |col, row, ch| StatePath::DmaBdValid { col, row, dir: DmaDir::S2mm, ch }),
         // cur_bd_lock_acq_ID: lock to acquire before starting the BD
         ("cur_bd_lock_acq_ID", 32, |col, row, ch| StatePath::DmaLockAcqId {
             col,
@@ -93,26 +83,11 @@ fn s2mm_signals() -> Vec<(&'static str, u32, NestedSignalFactory)> {
             dir: DmaDir::S2mm,
             ch,
         }),
-        ("cur_bd_length", 32, |col, row, ch| StatePath::DmaBdLength {
-            col,
-            row,
-            dir: DmaDir::S2mm,
-            ch,
-        }),
+        ("cur_bd_length", 32, |col, row, ch| StatePath::DmaBdLength { col, row, dir: DmaDir::S2mm, ch }),
         // cur_bd_next_BD: next BD index for linked-list chaining
-        ("cur_bd_next_BD", 32, |col, row, ch| StatePath::DmaNextBd {
-            col,
-            row,
-            dir: DmaDir::S2mm,
-            ch,
-        }),
+        ("cur_bd_next_BD", 32, |col, row, ch| StatePath::DmaNextBd { col, row, dir: DmaDir::S2mm, ch }),
         // cur_bd_use_next_BD: whether to follow the next-BD chain
-        ("cur_bd_use_next_BD", 1, |col, row, ch| StatePath::DmaUseNextBd {
-            col,
-            row,
-            dir: DmaDir::S2mm,
-            ch,
-        }),
+        ("cur_bd_use_next_BD", 1, |col, row, ch| StatePath::DmaUseNextBd { col, row, dir: DmaDir::S2mm, ch }),
         ("cur_bd_tlast_suppress", 1, |col, row, ch| StatePath::DmaTlastSuppress {
             col,
             row,
@@ -138,12 +113,7 @@ fn s2mm_signals() -> Vec<(&'static str, u32, NestedSignalFactory)> {
             ch,
         }),
         // cur_bd_packet_ID: packet ID in packet-mode transfers
-        ("cur_bd_packet_ID", 32, |col, row, ch| StatePath::DmaPacketId {
-            col,
-            row,
-            dir: DmaDir::S2mm,
-            ch,
-        }),
+        ("cur_bd_packet_ID", 32, |col, row, ch| StatePath::DmaPacketId { col, row, dir: DmaDir::S2mm, ch }),
         ("cur_bd_enable_packet", 1, |col, row, ch| StatePath::DmaEnablePacket {
             col,
             row,
@@ -151,36 +121,16 @@ fn s2mm_signals() -> Vec<(&'static str, u32, NestedSignalFactory)> {
             ch,
         }),
         // Channel status and pipeline observability signals
-        ("status", 32, |col, row, ch| StatePath::DmaStatus {
-            col,
-            row,
-            dir: DmaDir::S2mm,
-            ch,
-        }),
+        ("status", 32, |col, row, ch| StatePath::DmaStatus { col, row, dir: DmaDir::S2mm, ch }),
         ("processed_stream", 32, |col, row, ch| StatePath::DmaProcessedStream {
             col,
             row,
             dir: DmaDir::S2mm,
             ch,
         }),
-        ("processed_mem", 32, |col, row, ch| StatePath::DmaProcessedMem {
-            col,
-            row,
-            dir: DmaDir::S2mm,
-            ch,
-        }),
-        ("address", 32, |col, row, ch| StatePath::DmaAddress {
-            col,
-            row,
-            dir: DmaDir::S2mm,
-            ch,
-        }),
-        ("data", 128, |col, row, ch| StatePath::DmaData {
-            col,
-            row,
-            dir: DmaDir::S2mm,
-            ch,
-        }),
+        ("processed_mem", 32, |col, row, ch| StatePath::DmaProcessedMem { col, row, dir: DmaDir::S2mm, ch }),
+        ("address", 32, |col, row, ch| StatePath::DmaAddress { col, row, dir: DmaDir::S2mm, ch }),
+        ("data", 128, |col, row, ch| StatePath::DmaData { col, row, dir: DmaDir::S2mm, ch }),
     ]
 }
 
@@ -189,18 +139,8 @@ fn s2mm_signals() -> Vec<(&'static str, u32, NestedSignalFactory)> {
 /// The field set is identical to S2MM; only the direction discriminant differs.
 fn mm2s_signals() -> Vec<(&'static str, u32, NestedSignalFactory)> {
     vec![
-        ("cur_bd", 32, |col, row, ch| StatePath::DmaCurrentBd {
-            col,
-            row,
-            dir: DmaDir::Mm2s,
-            ch,
-        }),
-        ("cur_bd_valid", 1, |col, row, ch| StatePath::DmaBdValid {
-            col,
-            row,
-            dir: DmaDir::Mm2s,
-            ch,
-        }),
+        ("cur_bd", 32, |col, row, ch| StatePath::DmaCurrentBd { col, row, dir: DmaDir::Mm2s, ch }),
+        ("cur_bd_valid", 1, |col, row, ch| StatePath::DmaBdValid { col, row, dir: DmaDir::Mm2s, ch }),
         ("cur_bd_lock_acq_ID", 32, |col, row, ch| StatePath::DmaLockAcqId {
             col,
             row,
@@ -219,24 +159,9 @@ fn mm2s_signals() -> Vec<(&'static str, u32, NestedSignalFactory)> {
             dir: DmaDir::Mm2s,
             ch,
         }),
-        ("cur_bd_length", 32, |col, row, ch| StatePath::DmaBdLength {
-            col,
-            row,
-            dir: DmaDir::Mm2s,
-            ch,
-        }),
-        ("cur_bd_next_BD", 32, |col, row, ch| StatePath::DmaNextBd {
-            col,
-            row,
-            dir: DmaDir::Mm2s,
-            ch,
-        }),
-        ("cur_bd_use_next_BD", 1, |col, row, ch| StatePath::DmaUseNextBd {
-            col,
-            row,
-            dir: DmaDir::Mm2s,
-            ch,
-        }),
+        ("cur_bd_length", 32, |col, row, ch| StatePath::DmaBdLength { col, row, dir: DmaDir::Mm2s, ch }),
+        ("cur_bd_next_BD", 32, |col, row, ch| StatePath::DmaNextBd { col, row, dir: DmaDir::Mm2s, ch }),
+        ("cur_bd_use_next_BD", 1, |col, row, ch| StatePath::DmaUseNextBd { col, row, dir: DmaDir::Mm2s, ch }),
         ("cur_bd_tlast_suppress", 1, |col, row, ch| StatePath::DmaTlastSuppress {
             col,
             row,
@@ -261,48 +186,23 @@ fn mm2s_signals() -> Vec<(&'static str, u32, NestedSignalFactory)> {
             dir: DmaDir::Mm2s,
             ch,
         }),
-        ("cur_bd_packet_ID", 32, |col, row, ch| StatePath::DmaPacketId {
-            col,
-            row,
-            dir: DmaDir::Mm2s,
-            ch,
-        }),
+        ("cur_bd_packet_ID", 32, |col, row, ch| StatePath::DmaPacketId { col, row, dir: DmaDir::Mm2s, ch }),
         ("cur_bd_enable_packet", 1, |col, row, ch| StatePath::DmaEnablePacket {
             col,
             row,
             dir: DmaDir::Mm2s,
             ch,
         }),
-        ("status", 32, |col, row, ch| StatePath::DmaStatus {
-            col,
-            row,
-            dir: DmaDir::Mm2s,
-            ch,
-        }),
+        ("status", 32, |col, row, ch| StatePath::DmaStatus { col, row, dir: DmaDir::Mm2s, ch }),
         ("processed_stream", 32, |col, row, ch| StatePath::DmaProcessedStream {
             col,
             row,
             dir: DmaDir::Mm2s,
             ch,
         }),
-        ("processed_mem", 32, |col, row, ch| StatePath::DmaProcessedMem {
-            col,
-            row,
-            dir: DmaDir::Mm2s,
-            ch,
-        }),
-        ("address", 32, |col, row, ch| StatePath::DmaAddress {
-            col,
-            row,
-            dir: DmaDir::Mm2s,
-            ch,
-        }),
-        ("data", 128, |col, row, ch| StatePath::DmaData {
-            col,
-            row,
-            dir: DmaDir::Mm2s,
-            ch,
-        }),
+        ("processed_mem", 32, |col, row, ch| StatePath::DmaProcessedMem { col, row, dir: DmaDir::Mm2s, ch }),
+        ("address", 32, |col, row, ch| StatePath::DmaAddress { col, row, dir: DmaDir::Mm2s, ch }),
+        ("data", 128, |col, row, ch| StatePath::DmaData { col, row, dir: DmaDir::Mm2s, ch }),
     ]
 }
 
@@ -364,60 +264,28 @@ mod tests {
     fn dma_resolves_s2mm_cur_bd() {
         let mapping = dma_mapping(2, 2);
         let result = mapping.resolve(&["s2mm_state0", "cur_bd"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaCurrentBd {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaCurrentBd { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
     }
 
     #[test]
     fn dma_resolves_s2mm_ch1_cur_bd() {
         let mapping = dma_mapping(2, 2);
         let result = mapping.resolve(&["s2mm_state1", "cur_bd"], 1, 2);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaCurrentBd {
-                col: 1,
-                row: 2,
-                dir: DmaDir::S2mm,
-                ch: 1,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaCurrentBd { col: 1, row: 2, dir: DmaDir::S2mm, ch: 1 }));
     }
 
     #[test]
     fn dma_resolves_mm2s_status() {
         let mapping = dma_mapping(2, 2);
         let result = mapping.resolve(&["mm2s_state1", "status"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaStatus {
-                col: 0,
-                row: 1,
-                dir: DmaDir::Mm2s,
-                ch: 1,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaStatus { col: 0, row: 1, dir: DmaDir::Mm2s, ch: 1 }));
     }
 
     #[test]
     fn dma_resolves_s2mm_bd_length() {
         let mapping = dma_mapping(2, 2);
         let result = mapping.resolve(&["s2mm_state0", "cur_bd_length"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaBdLength {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaBdLength { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
     }
 
     #[test]
@@ -425,45 +293,21 @@ mod tests {
         // Real VCD field name: cur_bd_lock_acq_ID (capital ID)
         let mapping = dma_mapping(2, 2);
         let result = mapping.resolve(&["s2mm_state0", "cur_bd_lock_acq_ID"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaLockAcqId {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaLockAcqId { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
     }
 
     #[test]
     fn dma_resolves_s2mm_acquire_value() {
         let mapping = dma_mapping(2, 2);
         let result = mapping.resolve(&["s2mm_state0", "cur_bd_acquire_value"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaLockAcqValue {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaLockAcqValue { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
     }
 
     #[test]
     fn dma_resolves_s2mm_release_value() {
         let mapping = dma_mapping(2, 2);
         let result = mapping.resolve(&["s2mm_state0", "cur_bd_release_value"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaLockRelValue {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaLockRelValue { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
     }
 
     #[test]
@@ -471,15 +315,7 @@ mod tests {
         // Real VCD field name: cur_bd_next_BD (capital BD)
         let mapping = dma_mapping(2, 2);
         let result = mapping.resolve(&["s2mm_state0", "cur_bd_next_BD"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaNextBd {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaNextBd { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
     }
 
     #[test]
@@ -487,30 +323,14 @@ mod tests {
         // Real VCD field name: cur_bd_use_next_BD (capital BD)
         let mapping = dma_mapping(2, 2);
         let result = mapping.resolve(&["s2mm_state0", "cur_bd_use_next_BD"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaUseNextBd {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaUseNextBd { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
     }
 
     #[test]
     fn dma_resolves_s2mm_tlast_suppress() {
         let mapping = dma_mapping(2, 2);
         let result = mapping.resolve(&["s2mm_state0", "cur_bd_tlast_suppress"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaTlastSuppress {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaTlastSuppress { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
     }
 
     #[test]
@@ -518,65 +338,25 @@ mod tests {
         // Real VCD field name: cur_bd_packet_ID (capital ID)
         let mapping = dma_mapping(2, 2);
         let result = mapping.resolve(&["s2mm_state0", "cur_bd_packet_ID"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaPacketId {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaPacketId { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
     }
 
     #[test]
     fn dma_resolves_s2mm_enable_packet() {
         let mapping = dma_mapping(2, 2);
         let result = mapping.resolve(&["s2mm_state0", "cur_bd_enable_packet"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaEnablePacket {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaEnablePacket { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
     }
 
     #[test]
     fn dma_resolves_s2mm_iter_fields() {
         let mapping = dma_mapping(2, 2);
         let result = mapping.resolve(&["s2mm_state0", "cur_bd_iteration_stepsize"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaIterStepsize {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaIterStepsize { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
         let result = mapping.resolve(&["s2mm_state0", "cur_bd_iteration_current"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaIterCurrent {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaIterCurrent { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
         let result = mapping.resolve(&["s2mm_state0", "cur_bd_iteration_wrap"], 0, 1);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaIterWrap {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaIterWrap { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
     }
 
     #[test]
@@ -584,45 +364,13 @@ mod tests {
         let mapping = dma_mapping(2, 2);
 
         let r = mapping.resolve(&["s2mm_state0", "processed_stream"], 0, 1);
-        assert_eq!(
-            r,
-            Some(StatePath::DmaProcessedStream {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(r, Some(StatePath::DmaProcessedStream { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
         let r = mapping.resolve(&["s2mm_state0", "processed_mem"], 0, 1);
-        assert_eq!(
-            r,
-            Some(StatePath::DmaProcessedMem {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(r, Some(StatePath::DmaProcessedMem { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
         let r = mapping.resolve(&["s2mm_state0", "address"], 0, 1);
-        assert_eq!(
-            r,
-            Some(StatePath::DmaAddress {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(r, Some(StatePath::DmaAddress { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
         let r = mapping.resolve(&["s2mm_state0", "data"], 0, 1);
-        assert_eq!(
-            r,
-            Some(StatePath::DmaData {
-                col: 0,
-                row: 1,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(r, Some(StatePath::DmaData { col: 0, row: 1, dir: DmaDir::S2mm, ch: 0 }));
     }
 
     #[test]
@@ -630,35 +378,11 @@ mod tests {
         let mapping = dma_mapping(2, 2);
 
         let r = mapping.resolve(&["mm2s_state0", "cur_bd"], 0, 1);
-        assert_eq!(
-            r,
-            Some(StatePath::DmaCurrentBd {
-                col: 0,
-                row: 1,
-                dir: DmaDir::Mm2s,
-                ch: 0,
-            })
-        );
+        assert_eq!(r, Some(StatePath::DmaCurrentBd { col: 0, row: 1, dir: DmaDir::Mm2s, ch: 0 }));
         let r = mapping.resolve(&["mm2s_state0", "address"], 0, 1);
-        assert_eq!(
-            r,
-            Some(StatePath::DmaAddress {
-                col: 0,
-                row: 1,
-                dir: DmaDir::Mm2s,
-                ch: 0,
-            })
-        );
+        assert_eq!(r, Some(StatePath::DmaAddress { col: 0, row: 1, dir: DmaDir::Mm2s, ch: 0 }));
         let r = mapping.resolve(&["mm2s_state1", "data"], 3, 2);
-        assert_eq!(
-            r,
-            Some(StatePath::DmaData {
-                col: 3,
-                row: 2,
-                dir: DmaDir::Mm2s,
-                ch: 1,
-            })
-        );
+        assert_eq!(r, Some(StatePath::DmaData { col: 3, row: 2, dir: DmaDir::Mm2s, ch: 1 }));
     }
 
     // -- Boundary and rejection tests --
@@ -674,10 +398,7 @@ mod tests {
     #[test]
     fn dma_rejects_unknown_field() {
         let mapping = dma_mapping(2, 2);
-        assert_eq!(
-            mapping.resolve(&["s2mm_state0", "nonexistent_field"], 0, 0),
-            None
-        );
+        assert_eq!(mapping.resolve(&["s2mm_state0", "nonexistent_field"], 0, 0), None);
     }
 
     #[test]
@@ -685,10 +406,7 @@ mod tests {
         let mapping = dma_mapping(2, 2);
         // Only accepts "dma" as scope.
         assert_eq!(mapping.resolve(&["cur_bd"], 0, 0), None);
-        assert_eq!(
-            mapping.resolve(&["s2mm_state0", "cur_bd", "extra"], 0, 0),
-            None
-        );
+        assert_eq!(mapping.resolve(&["s2mm_state0", "cur_bd", "extra"], 0, 0), None);
     }
 
     #[test]
@@ -767,15 +485,7 @@ mod tests {
     fn shim_dma_resolves_signals() {
         let shim = shim_dma_mapping(2, 2);
         let result = shim.resolve(&["s2mm_state0", "cur_bd"], 0, 0);
-        assert_eq!(
-            result,
-            Some(StatePath::DmaCurrentBd {
-                col: 0,
-                row: 0,
-                dir: DmaDir::S2mm,
-                ch: 0,
-            })
-        );
+        assert_eq!(result, Some(StatePath::DmaCurrentBd { col: 0, row: 0, dir: DmaDir::S2mm, ch: 0 }));
     }
 
     #[test]

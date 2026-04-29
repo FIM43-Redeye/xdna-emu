@@ -22,12 +22,8 @@ use crate::vcd::state_path::{StatePath, Subsystem};
 /// mem tiles. The mapping rejects any index outside `[0, num_locks)`.
 pub fn lock_mapping(num_locks: u8) -> SubsystemMapping {
     SubsystemMapping::new("locks", Subsystem::Lock)
-        .indexed_signal("value", num_locks, 32, |col, row, idx| {
-            StatePath::LockValue { col, row, idx }
-        })
-        .indexed_signal("lock_op", num_locks, 32, |col, row, idx| {
-            StatePath::LockOp { col, row, idx }
-        })
+        .indexed_signal("value", num_locks, 32, |col, row, idx| StatePath::LockValue { col, row, idx })
+        .indexed_signal("lock_op", num_locks, 32, |col, row, idx| StatePath::LockOp { col, row, idx })
 }
 
 // ---------------------------------------------------------------------------
@@ -98,10 +94,7 @@ mod tests {
             mapping.resolve(&["value_0"], 1, 2),
             Some(StatePath::LockValue { col: 1, row: 2, idx: 0 })
         );
-        assert_eq!(
-            mapping.resolve(&["lock_op_0"], 1, 2),
-            Some(StatePath::LockOp { col: 1, row: 2, idx: 0 })
-        );
+        assert_eq!(mapping.resolve(&["lock_op_0"], 1, 2), Some(StatePath::LockOp { col: 1, row: 2, idx: 0 }));
     }
 
     #[test]
