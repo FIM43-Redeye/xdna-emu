@@ -123,11 +123,7 @@ impl NpuInstructionStream {
         }
 
         if total_size as usize > data.len() {
-            return Err(format!(
-                "NPU instruction size {} exceeds data length {}",
-                total_size,
-                data.len()
-            ));
+            return Err(format!("NPU instruction size {} exceeds data length {}", total_size, data.len()));
         }
 
         // Parse instructions
@@ -142,7 +138,12 @@ impl NpuInstructionStream {
             match Self::parse_instruction(&mut cursor, data) {
                 Ok(instr) => {
                     let end_pos = cursor.position() as usize;
-                    log::debug!("  Instruction {} parsed, ends at 0x{:X}, size={}", i, end_pos, end_pos - pos);
+                    log::debug!(
+                        "  Instruction {} parsed, ends at 0x{:X}, size={}",
+                        i,
+                        end_pos,
+                        end_pos - pos
+                    );
                     instructions.push(instr);
                 }
                 Err(e) => {
@@ -192,7 +193,8 @@ impl NpuInstructionStream {
         if shdr_end > data.len() {
             return Err(format!(
                 "Section headers extend past end of ELF (need {}, have {})",
-                shdr_end, data.len()
+                shdr_end,
+                data.len()
             ));
         }
 
@@ -229,14 +231,13 @@ impl NpuInstructionStream {
                     return Err(format!(
                         ".ctrltext section extends past end of ELF \
                          (offset={}, size={}, file={})",
-                        offset, size, data.len()
+                        offset,
+                        size,
+                        data.len()
                     ));
                 }
                 let ctrltext = &data[offset..offset + size];
-                log::info!(
-                    "Extracted {} bytes from .ctrltext section in instruction ELF",
-                    size
-                );
+                log::info!("Extracted {} bytes from .ctrltext section in instruction ELF", size);
                 return Self::parse(ctrltext);
             }
         }
@@ -297,19 +298,9 @@ impl NpuInstructionStream {
                 let column_num = ((word3 >> 16) & 0xFF) as u8;
                 let channel = ((word3 >> 24) & 0xFF) as u8;
 
-                log::debug!(
-                    "Sync parsed: dir={} row={} col={} ch={}",
-                    direction, row, column, channel
-                );
+                log::debug!("Sync parsed: dir={} row={} col={} ch={}", direction, row, column, channel);
 
-                Ok(NpuInstruction::Sync {
-                    channel,
-                    column,
-                    direction,
-                    column_num,
-                    row,
-                    row_num,
-                })
+                Ok(NpuInstruction::Sync { channel, column, direction, column_num, row, row_num })
             } else if opcode == NpuOpcode::DdrPatch {
                 // DDR patch payload structure (from AIETargetNPU.cpp appendAddressPatch):
                 // Instruction is 12 words total (48 bytes):
@@ -339,29 +330,20 @@ impl NpuInstructionStream {
                     ));
                 }
 
-                let reg_addr = u32::from_le_bytes([
-                    payload[16], payload[17], payload[18], payload[19],
-                ]);
+                let reg_addr = u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]);
                 let arg_idx = payload[24];
-                let arg_plus = u32::from_le_bytes([
-                    payload[32], payload[33], payload[34], payload[35],
-                ]);
+                let arg_plus = u32::from_le_bytes([payload[32], payload[33], payload[34], payload[35]]);
 
                 log::debug!(
                     "DdrPatch parsed: reg_addr=0x{:08X} arg_idx={} arg_plus={}",
-                    reg_addr, arg_idx, arg_plus
-                );
-
-                Ok(NpuInstruction::DdrPatch {
                     reg_addr,
                     arg_idx,
-                    arg_plus,
-                })
+                    arg_plus
+                );
+
+                Ok(NpuInstruction::DdrPatch { reg_addr, arg_idx, arg_plus })
             } else {
-                Ok(NpuInstruction::Unknown {
-                    opcode: opcode_byte,
-                    data: payload,
-                })
+                Ok(NpuInstruction::Unknown { opcode: opcode_byte, data: payload })
             }
         } else {
             // Standard op: 8-byte header (4 opcode + 4 zeros), then op-specific fields
@@ -427,11 +409,15 @@ impl NpuInstructionStream {
                     Ok(NpuInstruction::Unknown { opcode: opcode_byte, data: vec![] })
                 }
 
-                NpuOpcode::Preempt | NpuOpcode::MaskPollBusy |
-                NpuOpcode::LoadPdi | NpuOpcode::LoadPmStart |
-                NpuOpcode::CreateScratchpad | NpuOpcode::UpdateStateTable |
-                NpuOpcode::UpdateReg | NpuOpcode::UpdateScratch |
-                NpuOpcode::LoadPmEndInternal => {
+                NpuOpcode::Preempt
+                | NpuOpcode::MaskPollBusy
+                | NpuOpcode::LoadPdi
+                | NpuOpcode::LoadPmStart
+                | NpuOpcode::CreateScratchpad
+                | NpuOpcode::UpdateStateTable
+                | NpuOpcode::UpdateReg
+                | NpuOpcode::UpdateScratch
+                | NpuOpcode::LoadPmEndInternal => {
                     log::debug!("NPU opcode {:?} -- firmware-level, skipping", opcode);
                     let _zeros = cursor.read_u32::<LittleEndian>().ok();
                     // These may have payloads; skip 8 more bytes conservatively
@@ -464,7 +450,9 @@ impl NpuInstructionStream {
                          downstream parsing, or they may configure hardware \
                          state that affects test results. Add a handler in \
                          src/npu/parser.rs.",
-                        opcode_byte, opcode_byte, cursor.position().saturating_sub(4)
+                        opcode_byte,
+                        opcode_byte,
+                        cursor.position().saturating_sub(4)
                     );
                 }
             }
@@ -513,11 +501,7 @@ mod tests {
         assert!(result.is_err());
         // Should complain about ELF parsing, not about "Unknown NPU instruction magic"
         let err = result.unwrap_err();
-        assert!(
-            err.contains("ELF") || err.contains("elf"),
-            "Expected ELF-related error, got: {}",
-            err
-        );
+        assert!(err.contains("ELF") || err.contains("elf"), "Expected ELF-related error, got: {}", err);
     }
 
     #[test]
@@ -526,10 +510,7 @@ mod tests {
         let elf = build_minimal_elf32(None);
         let result = NpuInstructionStream::parse(&elf);
         assert!(result.is_err());
-        assert!(
-            result.unwrap_err().contains("no .ctrltext"),
-            "Expected missing .ctrltext error"
-        );
+        assert!(result.unwrap_err().contains("no .ctrltext"), "Expected missing .ctrltext error");
     }
 
     #[test]
@@ -576,11 +557,11 @@ mod tests {
         let shdr_offset = strtab_offset + strtab.len();
 
         // ELF header (52 bytes)
-        buf.extend_from_slice(b"\x7fELF");       // e_ident[0..4]: magic
-        buf.push(1);                               // EI_CLASS: ELFCLASS32
-        buf.push(1);                               // EI_DATA: ELFDATA2LSB
-        buf.push(1);                               // EI_VERSION: EV_CURRENT
-        buf.extend_from_slice(&[0; 9]);             // EI_PAD
+        buf.extend_from_slice(b"\x7fELF"); // e_ident[0..4]: magic
+        buf.push(1); // EI_CLASS: ELFCLASS32
+        buf.push(1); // EI_DATA: ELFDATA2LSB
+        buf.push(1); // EI_VERSION: EV_CURRENT
+        buf.extend_from_slice(&[0; 9]); // EI_PAD
         buf.extend_from_slice(&2u16.to_le_bytes()); // e_type: ET_EXEC
         buf.extend_from_slice(&0u16.to_le_bytes()); // e_machine
         buf.extend_from_slice(&1u32.to_le_bytes()); // e_version

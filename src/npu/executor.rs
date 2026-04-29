@@ -201,7 +201,9 @@ impl NpuExecutor {
     fn sync_abs_channel(sync: &PendingSync, device: &DeviceState) -> u8 {
         // S2MM channels come first, then MM2S. The number of S2MM channels
         // varies by tile type: 2 for Compute/Shim, 6 for MemTile.
-        let s2mm_count = device.array.dma_engine(sync.column, sync.row)
+        let s2mm_count = device
+            .array
+            .dma_engine(sync.column, sync.row)
             .map_or(2, |dma| dma.s2mm_channel_count() as u8);
         if sync.direction == 1 {
             s2mm_count + sync.channel
@@ -254,9 +256,7 @@ impl NpuExecutor {
             //    The channel has no pending work AND has done at least one
             //    transfer (not just initial idle).
             if let Some(stats) = dma.channel_stats(abs_channel) {
-                if stats.transfers_completed > 0
-                    && dma.task_queue_size(abs_channel) == 0
-                {
+                if stats.transfers_completed > 0 && dma.task_queue_size(abs_channel) == 0 {
                     return true;
                 }
             }
@@ -325,7 +325,10 @@ impl NpuExecutor {
             for instr in &instructions {
                 match instr {
                     NpuInstruction::Sync { .. } => syncs += 1,
-                    NpuInstruction::BlockWrite { .. } => { enqueues += 1; writes += 1; },
+                    NpuInstruction::BlockWrite { .. } => {
+                        enqueues += 1;
+                        writes += 1;
+                    }
                     NpuInstruction::Write32 { .. } => writes += 1,
                     NpuInstruction::DdrPatch { .. } => patches += 1,
                     _ => {}
@@ -333,7 +336,11 @@ impl NpuExecutor {
             }
             log::debug!(
                 "NPU instruction buffer: {} total ({} Write, {} BlockWrite, {} DdrPatch, {} Sync)",
-                instructions.len(), writes, enqueues, patches, syncs
+                instructions.len(),
+                writes,
+                enqueues,
+                patches,
+                syncs
             );
         }
         self.instructions = instructions;
@@ -356,11 +363,7 @@ impl NpuExecutor {
     /// parameters and retries on the next call. The caller's engine.step()
     /// naturally drains the queue by stepping the full system (DMA + cores +
     /// stream routing), so the queue will eventually have space.
-    pub fn try_advance(
-        &mut self,
-        device: &mut DeviceState,
-        host_memory: &mut HostMemory,
-    ) -> AdvanceResult {
+    pub fn try_advance(&mut self, device: &mut DeviceState, host_memory: &mut HostMemory) -> AdvanceResult {
         match self.state.clone() {
             ExecutorState::Idle => AdvanceResult::Idle,
             ExecutorState::Done => AdvanceResult::Done,
@@ -410,12 +413,21 @@ impl NpuExecutor {
             }
 
             ExecutorState::BlockedOnQueue {
-                next_index, col, row, channel, bd_id, repeat, enable_token, ..
+                next_index,
+                col,
+                row,
+                channel,
+                bd_id,
+                repeat,
+                enable_token,
+                ..
             } => {
                 use crate::device::dma::MAX_TASK_QUEUE_DEPTH;
 
                 // Check if the queue has drained enough for our enqueue
-                let has_space = device.array.dma_engine(col, row)
+                let has_space = device
+                    .array
+                    .dma_engine(col, row)
                     .map_or(true, |dma| dma.task_queue_size(channel) < MAX_TASK_QUEUE_DEPTH);
 
                 if has_space {
@@ -446,19 +458,13 @@ impl NpuExecutor {
                 // returns (or Channel_Running goes idle). We poll the same
                 // Channel_Running status.
                 let satisfied = if sync_index < self.pending_syncs.len() {
-                    Self::is_sync_satisfied(
-                        &mut self.pending_syncs[sync_index],
-                        device,
-                    )
+                    Self::is_sync_satisfied(&mut self.pending_syncs[sync_index], device)
                 } else {
                     true // Invalid index -- treat as satisfied
                 };
 
                 if satisfied {
-                    log::info!(
-                        "NPU Sync #{} satisfied, resuming instruction {}",
-                        sync_index, next_index,
-                    );
+                    log::info!("NPU Sync #{} satisfied, resuming instruction {}", sync_index, next_index,);
                     if next_index >= self.instructions.len() {
                         self.state = ExecutorState::Done;
                         AdvanceResult::Done
@@ -471,10 +477,8 @@ impl NpuExecutor {
                         // the same delay by waiting before executing the next
                         // instruction.
                         const STREAM_FLUSH_CYCLES: u8 = 4;
-                        self.state = ExecutorState::FlushingStreams {
-                            next_index,
-                            remaining: STREAM_FLUSH_CYCLES,
-                        };
+                        self.state =
+                            ExecutorState::FlushingStreams { next_index, remaining: STREAM_FLUSH_CYCLES };
                         AdvanceResult::Progressed
                     }
                 } else {
@@ -484,13 +488,11 @@ impl NpuExecutor {
 
             ExecutorState::BlockedOnPoll { next_index, reg_off, value, mask } => {
                 let (col, row, offset) = decode_npu_address(reg_off);
-                let current = device.tile_mut(col as usize, row as usize)
+                let current = device
+                    .tile_mut(col as usize, row as usize)
                     .map_or(0, |tile| tile.read_register(offset));
                 if (current & mask) == value {
-                    log::debug!(
-                        "NPU MaskPoll: reg=0x{:08X} satisfied (current=0x{:08X})",
-                        reg_off, current
-                    );
+                    log::debug!("NPU MaskPoll: reg=0x{:08X} satisfied (current=0x{:08X})", reg_off, current);
                     if next_index >= self.instructions.len() {
                         self.state = ExecutorState::Done;
                         AdvanceResult::Done
@@ -510,10 +512,7 @@ impl NpuExecutor {
                 if remaining <= 1 {
                     self.state = ExecutorState::Executing { next_index };
                 } else {
-                    self.state = ExecutorState::FlushingStreams {
-                        next_index,
-                        remaining: remaining - 1,
-                    };
+                    self.state = ExecutorState::FlushingStreams { next_index, remaining: remaining - 1 };
                 }
                 AdvanceResult::Progressed
             }
@@ -529,7 +528,12 @@ impl NpuExecutor {
     ///
     /// For interleaved execution (where full system stepping handles queue
     /// draining), use `load()` + `try_advance()` from the engine loop instead.
-    pub fn execute(&mut self, stream: &NpuInstructionStream, device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
+    pub fn execute(
+        &mut self,
+        stream: &NpuInstructionStream,
+        device: &mut DeviceState,
+        host_memory: &mut HostMemory,
+    ) -> Result<(), String> {
         self.load(stream);
 
         const MAX_BLOCKED_CYCLES: u32 = 100_000;
@@ -547,16 +551,17 @@ impl NpuExecutor {
                         device.array.step_all_dma(host_memory);
                         match self.try_advance(device, host_memory) {
                             AdvanceResult::Blocked => continue,
-                            AdvanceResult::Progressed => { drained = true; break; }
+                            AdvanceResult::Progressed => {
+                                drained = true;
+                                break;
+                            }
                             AdvanceResult::Done | AdvanceResult::Idle => return Ok(()),
                             AdvanceResult::Error(msg) => return Err(msg),
                         }
                     }
                     if !drained {
                         let msg = match self.state.clone() {
-                            ExecutorState::BlockedOnQueue {
-                                col, row, channel, bd_id, ..
-                            } => format!(
+                            ExecutorState::BlockedOnQueue { col, row, channel, bd_id, .. } => format!(
                                 "DMA tile({},{}) ch{} task queue full, BD {} dropped \
                                  (batch mode: queue could not drain) -- task lost",
                                 col, row, channel, bd_id,
@@ -567,8 +572,7 @@ impl NpuExecutor {
                                 format!(
                                     "Sync #{} on ({},{}) {} ch{} not satisfied after {} DMA-only cycles \
                                      (batch mode: needs full engine loop)",
-                                    sync_index, sync.column, sync.row, dir, sync.channel,
-                                    MAX_BLOCKED_CYCLES,
+                                    sync_index, sync.column, sync.row, dir, sync.channel, MAX_BLOCKED_CYCLES,
                                 )
                             }
                             _ => "Blocked state could not resolve (batch mode)".to_string(),
@@ -582,7 +586,12 @@ impl NpuExecutor {
     }
 
     /// Execute a single instruction.
-    fn execute_instruction(&mut self, instr: &NpuInstruction, device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
+    fn execute_instruction(
+        &mut self,
+        instr: &NpuInstruction,
+        device: &mut DeviceState,
+        host_memory: &mut HostMemory,
+    ) -> Result<(), String> {
         match instr {
             NpuInstruction::Write32 { reg_off, value } => {
                 self.execute_write32(*reg_off, *value, device, host_memory)
@@ -601,7 +610,8 @@ impl NpuExecutor {
                 // Check the condition now; if not met, transition to
                 // BlockedOnPoll and let try_advance() poll each cycle.
                 let (col, row, offset) = decode_npu_address(*reg_off);
-                let current = device.tile_mut(col as usize, row as usize)
+                let current = device
+                    .tile_mut(col as usize, row as usize)
                     .map_or(0, |tile| tile.read_register(offset));
                 if (current & mask) == *value {
                     log::debug!(
@@ -632,7 +642,11 @@ impl NpuExecutor {
                 let dir_str = if *direction == 0 { "S2MM" } else { "MM2S" };
                 log::info!(
                     "NPU Sync: blocking on ({},{}) {} ch{} (sync #{})",
-                    column, row, dir_str, channel, self.pending_syncs.len(),
+                    column,
+                    row,
+                    dir_str,
+                    channel,
+                    self.pending_syncs.len(),
                 );
                 // Record this sync condition and block until it's satisfied.
                 // On real hardware, the firmware blocks at dma_await_task until
@@ -656,19 +670,23 @@ impl NpuExecutor {
                 Ok(())
             }
 
-            NpuInstruction::Unknown { opcode, data } => {
-                Err(format!(
-                    "NPU Unknown instruction: opcode=0x{:02X} data_len={} -- \
+            NpuInstruction::Unknown { opcode, data } => Err(format!(
+                "NPU Unknown instruction: opcode=0x{:02X} data_len={} -- \
                      unrecognized opcode, cannot continue",
-                    opcode,
-                    data.len()
-                ))
-            }
+                opcode,
+                data.len()
+            )),
         }
     }
 
     /// Execute a Write32 instruction.
-    fn execute_write32(&mut self, reg_off: u32, value: u32, device: &mut DeviceState, _host_memory: &mut HostMemory) -> Result<(), String> {
+    fn execute_write32(
+        &mut self,
+        reg_off: u32,
+        value: u32,
+        device: &mut DeviceState,
+        _host_memory: &mut HostMemory,
+    ) -> Result<(), String> {
         log::debug!("NPU Write32: reg=0x{:08X} value=0x{:08X}", reg_off, value);
 
         // Decode tile address from register offset
@@ -676,13 +694,19 @@ impl NpuExecutor {
         let (col, row, offset) = decode_npu_address(reg_off);
 
         // Data memory writes go directly to tile memory (not the register bus).
-        let is_data_mem = device.tile(col as usize, row as usize)
+        let is_data_mem = device
+            .tile(col as usize, row as usize)
             .map_or(false, |tile| is_data_memory_offset(tile, offset));
 
         if is_data_mem {
             if let Some(tile) = device.tile_mut(col as usize, row as usize) {
-                log::debug!("NPU Write32 -> data memory: tile({},{}) offset=0x{:05X} value=0x{:08X}",
-                    col, row, offset, value);
+                log::debug!(
+                    "NPU Write32 -> data memory: tile({},{}) offset=0x{:05X} value=0x{:08X}",
+                    col,
+                    row,
+                    offset,
+                    value
+                );
                 tile.write_data_u32(offset as usize, value);
             }
         } else if device.tile(col as usize, row as usize).is_some() {
@@ -706,23 +730,31 @@ impl NpuExecutor {
     }
 
     /// Execute a BlockWrite instruction.
-    fn execute_blockwrite(&mut self, reg_off: u32, values: &[u32], device: &mut DeviceState, _host_memory: &mut HostMemory) -> Result<(), String> {
-        log::debug!(
-            "NPU BlockWrite: reg=0x{:08X} count={}",
-            reg_off,
-            values.len()
-        );
+    fn execute_blockwrite(
+        &mut self,
+        reg_off: u32,
+        values: &[u32],
+        device: &mut DeviceState,
+        _host_memory: &mut HostMemory,
+    ) -> Result<(), String> {
+        log::debug!("NPU BlockWrite: reg=0x{:08X} count={}", reg_off, values.len());
 
         let (col, row, base_offset) = decode_npu_address(reg_off);
 
         // Data memory writes go directly to tile memory (contiguous block).
-        let is_data_mem = device.tile(col as usize, row as usize)
+        let is_data_mem = device
+            .tile(col as usize, row as usize)
             .map_or(false, |tile| is_data_memory_offset(tile, base_offset));
 
         if is_data_mem {
             if let Some(tile) = device.tile_mut(col as usize, row as usize) {
-                log::debug!("NPU BlockWrite -> data memory: tile({},{}) offset=0x{:05X} count={}",
-                    col, row, base_offset, values.len());
+                log::debug!(
+                    "NPU BlockWrite -> data memory: tile({},{}) offset=0x{:05X} count={}",
+                    col,
+                    row,
+                    base_offset,
+                    values.len()
+                );
                 let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
                 tile.write_data(base_offset as usize, &bytes);
             }
@@ -745,28 +777,50 @@ impl NpuExecutor {
     }
 
     /// Execute a MaskWrite instruction.
-    fn execute_maskwrite(&mut self, reg_off: u32, value: u32, mask: u32, device: &mut DeviceState, _host_memory: &mut HostMemory) -> Result<(), String> {
+    fn execute_maskwrite(
+        &mut self,
+        reg_off: u32,
+        value: u32,
+        mask: u32,
+        device: &mut DeviceState,
+        _host_memory: &mut HostMemory,
+    ) -> Result<(), String> {
         let (col, row, offset) = decode_npu_address(reg_off);
         log::debug!(
             "NPU MaskWrite: reg=0x{:08X} -> tile({},{}) offset=0x{:05X} value=0x{:08X} mask=0x{:08X}",
-            reg_off, col, row, offset, value, mask
+            reg_off,
+            col,
+            row,
+            offset,
+            value,
+            mask
         );
 
-        let is_data_mem = device.tile(col as usize, row as usize)
+        let is_data_mem = device
+            .tile(col as usize, row as usize)
             .map_or(false, |tile| is_data_memory_offset(tile, offset));
 
         if is_data_mem {
             if let Some(tile) = device.tile_mut(col as usize, row as usize) {
                 let current = tile.read_data_u32(offset as usize).unwrap_or(0);
                 let new_value = (current & !mask) | (value & mask);
-                log::info!("NPU MaskWrite -> data memory: tile({},{}) offset=0x{:05X} \
-                    current=0x{:08X} -> 0x{:08X}", col, row, offset, current, new_value);
+                log::info!(
+                    "NPU MaskWrite -> data memory: tile({},{}) offset=0x{:05X} \
+                    current=0x{:08X} -> 0x{:08X}",
+                    col,
+                    row,
+                    offset,
+                    current,
+                    new_value
+                );
                 tile.write_data_u32(offset as usize, new_value);
             }
         } else if device.tile(col as usize, row as usize).is_some() {
             // Read current value, apply mask, write through unified register bus.
-            let current = device.tile_mut(col as usize, row as usize)
-                .map(|t| t.read_register(offset)).unwrap_or(0);
+            let current = device
+                .tile_mut(col as usize, row as usize)
+                .map(|t| t.read_register(offset))
+                .unwrap_or(0);
             let new_value = (current & !mask) | (value & mask);
             if self.would_block_on_queue(col, row, offset, new_value, device) {
                 return Ok(());
@@ -792,7 +846,13 @@ impl NpuExecutor {
     ///    the current register, subtract the DDR offset to translate from the
     ///    AIE address space to our emulator address space, and write back.
     ///    This models the hardware's DDR address translation.
-    fn execute_ddr_patch(&mut self, reg_addr: u32, arg_idx: u8, arg_plus: u32, device: &mut DeviceState) -> Result<(), String> {
+    fn execute_ddr_patch(
+        &mut self,
+        reg_addr: u32,
+        arg_idx: u8,
+        arg_plus: u32,
+        device: &mut DeviceState,
+    ) -> Result<(), String> {
         let (col, row, offset) = decode_npu_address(reg_addr);
 
         if self.host_buffers.is_empty() {
@@ -809,9 +869,7 @@ impl NpuExecutor {
         // This happens with trace-injected xclbins: trace injection adds an
         // extra DDR buffer for HW packet trace collection.
         while self.host_buffers.len() <= arg_idx as usize {
-            let trace_addr = self.host_buffers.last()
-                .map(|b| b.address + b.size as u64)
-                .unwrap_or(0x10_0000);
+            let trace_addr = self.host_buffers.last().map(|b| b.address + b.size as u64).unwrap_or(0x10_0000);
             let trace_size = 1_048_576;
             log::info!(
                 "DDR patch references arg_idx {} beyond {} known buffers -- \
@@ -822,10 +880,7 @@ impl NpuExecutor {
                 trace_addr,
                 trace_size / 1024,
             );
-            self.host_buffers.push(HostBuffer {
-                address: trace_addr,
-                size: trace_size,
-            });
+            self.host_buffers.push(HostBuffer { address: trace_addr, size: trace_size });
         }
 
         let buffer = &self.host_buffers[arg_idx as usize];
@@ -833,7 +888,10 @@ impl NpuExecutor {
 
         log::debug!(
             "NPU DdrPatch: reg=0x{:08X} arg_idx={} arg_plus={} -> addr=0x{:016X}",
-            reg_addr, arg_idx, arg_plus, patched_addr
+            reg_addr,
+            arg_idx,
+            arg_plus,
+            patched_addr
         );
 
         self.write_bd_address(col, row, offset, patched_addr, device);
@@ -853,17 +911,25 @@ impl NpuExecutor {
     /// controller handles this; in the emulator we do it explicitly.
     fn execute_ddr_patch_prepatched(
         &self,
-        col: u8, row: u8, offset: u32,
-        reg_addr: u32, arg_idx: u8, arg_plus: u32,
+        col: u8,
+        row: u8,
+        offset: u32,
+        reg_addr: u32,
+        arg_idx: u8,
+        arg_plus: u32,
         device: &mut DeviceState,
     ) -> Result<(), String> {
         const DDR_AIE_ADDR_OFFSET: u64 = 0x8000_0000;
 
         // Read the current BD word pair (set by the preceding block-write).
-        let word_lo = device.tile_mut(col as usize, row as usize)
-            .map(|t| t.read_register(offset)).unwrap_or(0);
-        let word_hi = device.tile_mut(col as usize, row as usize)
-            .map(|t| t.read_register(offset + 4)).unwrap_or(0);
+        let word_lo = device
+            .tile_mut(col as usize, row as usize)
+            .map(|t| t.read_register(offset))
+            .unwrap_or(0);
+        let word_hi = device
+            .tile_mut(col as usize, row as usize)
+            .map(|t| t.read_register(offset + 4))
+            .unwrap_or(0);
 
         // Reconstruct the 48-bit address (shim BD format: low 32 in word 1,
         // high 16 in word 2 bits[15:0]).
@@ -875,7 +941,11 @@ impl NpuExecutor {
         log::debug!(
             "NPU DdrPatch (pre-patched): reg=0x{:08X} arg_idx={} arg_plus={} \
              xrt_addr=0x{:012X} -> emu_addr=0x{:012X}",
-            reg_addr, arg_idx, arg_plus, xrt_addr, emu_addr
+            reg_addr,
+            arg_idx,
+            arg_plus,
+            xrt_addr,
+            emu_addr
         );
 
         self.write_bd_address(col, row, offset, emu_addr, device);
@@ -895,8 +965,10 @@ impl NpuExecutor {
         let high_bits = (addr >> 32) as u32;
         let is_shim_bd = row == SHIM_ROW && bd_index_for_blockwrite(row, offset).is_some();
         if is_shim_bd {
-            let current = device.tile_mut(col as usize, row as usize)
-                .map(|t| t.read_register(offset + 4)).unwrap_or(0);
+            let current = device
+                .tile_mut(col as usize, row as usize)
+                .map(|t| t.read_register(offset + 4))
+                .unwrap_or(0);
             let merged = (current & 0xFFFF_0000) | (high_bits & 0x0000_FFFF);
             device.write_tile_register(col, row, offset + 4, merged);
         } else {
@@ -918,13 +990,16 @@ impl NpuExecutor {
     /// block BEFORE the write (matching real hardware where firmware polls
     /// Task_Queue_Size before writing Start_Queue).
     fn would_block_on_queue(
-        &mut self, col: u8, row: u8, offset: u32, value: u32,
+        &mut self,
+        col: u8,
+        row: u8,
+        offset: u32,
+        value: u32,
         device: &DeviceState,
     ) -> bool {
         use crate::device::dma::MAX_TASK_QUEUE_DEPTH;
 
-        let tile_kind = match device.tile(col as usize, row as usize)
-            .map(|t| t.tile_kind) {
+        let tile_kind = match device.tile(col as usize, row as usize).map(|t| t.tile_kind) {
             Some(tt) => tt,
             None => return false,
         };
@@ -943,7 +1018,13 @@ impl NpuExecutor {
             TileKind::Compute => {
                 let base = reg_layout.memory_channel_base;
                 let stride = reg_layout.memory_channel_stride;
-                match Self::channel_from_queue_write(offset, base, stride, s2mm_channels, s2mm_channels + mm2s_channels) {
+                match Self::channel_from_queue_write(
+                    offset,
+                    base,
+                    stride,
+                    s2mm_channels,
+                    s2mm_channels + mm2s_channels,
+                ) {
                     Some(r) => r,
                     None => return false,
                 }
@@ -952,9 +1033,13 @@ impl NpuExecutor {
                 let stride = reg_layout.memtile_channel_stride;
                 let s2mm_base = reg_layout.memtile_channel_s2mm_base;
                 let mm2s_base = reg_layout.memtile_channel_mm2s_base;
-                if let Some((ch, _)) = Self::channel_from_queue_write(offset, s2mm_base, stride, s2mm_channels, s2mm_channels) {
+                if let Some((ch, _)) =
+                    Self::channel_from_queue_write(offset, s2mm_base, stride, s2mm_channels, s2mm_channels)
+                {
                     (ch, false)
-                } else if let Some((ch, _)) = Self::channel_from_queue_write(offset, mm2s_base, stride, mm2s_channels, mm2s_channels) {
+                } else if let Some((ch, _)) =
+                    Self::channel_from_queue_write(offset, mm2s_base, stride, mm2s_channels, mm2s_channels)
+                {
                     (s2mm_channels + ch, true)
                 } else {
                     return false;
@@ -963,7 +1048,13 @@ impl NpuExecutor {
             TileKind::ShimNoc | TileKind::ShimPl => {
                 let base = reg_layout.shim_channel_base;
                 let stride = reg_layout.shim_channel_stride;
-                match Self::channel_from_queue_write(offset, base, stride, s2mm_channels, s2mm_channels + mm2s_channels) {
+                match Self::channel_from_queue_write(
+                    offset,
+                    base,
+                    stride,
+                    s2mm_channels,
+                    s2mm_channels + mm2s_channels,
+                ) {
                     Some(r) => r,
                     None => return false,
                 }
@@ -971,7 +1062,9 @@ impl NpuExecutor {
         };
 
         // Check queue depth
-        let queue_full = device.array.dma_engine(col, row)
+        let queue_full = device
+            .array
+            .dma_engine(col, row)
             .map_or(false, |dma| dma.task_queue_size(abs_channel) >= MAX_TASK_QUEUE_DEPTH);
 
         if queue_full {
@@ -985,11 +1078,15 @@ impl NpuExecutor {
 
             log::debug!(
                 "DMA tile({},{}) ch{} queue full, deferring BD {} enqueue",
-                col, row, abs_channel, bd_id
+                col,
+                row,
+                abs_channel,
+                bd_id
             );
             self.state = ExecutorState::BlockedOnQueue {
                 next_index: self.executed_count + 1,
-                col, row,
+                col,
+                row,
                 channel: abs_channel,
                 bd_id,
                 repeat,
@@ -1006,7 +1103,11 @@ impl NpuExecutor {
     /// Returns `(absolute_channel_index, is_mm2s)` if the offset matches a queue
     /// register. Queue registers are at base + ch*stride + 4 within each block.
     fn channel_from_queue_write(
-        offset: u32, base: u32, stride: u32, s2mm_count: u8, total: u8,
+        offset: u32,
+        base: u32,
+        stride: u32,
+        s2mm_count: u8,
+        total: u8,
     ) -> Option<(u8, bool)> {
         if offset < base || stride == 0 {
             return None;
@@ -1202,9 +1303,7 @@ mod tests {
 
         // Write to a compute tile register (col 0, row 2, offset 0)
         let addr = (0u32 << 25) | (2u32 << 20) | 0x0;
-        executor.load_instructions(vec![
-            NpuInstruction::Write32 { reg_off: addr, value: 0x42 },
-        ]);
+        executor.load_instructions(vec![NpuInstruction::Write32 { reg_off: addr, value: 0x42 }]);
 
         assert_eq!(executor.try_advance(&mut device, &mut host_mem), AdvanceResult::Done);
         // After executing the only instruction, state should be Done
@@ -1241,10 +1340,7 @@ mod tests {
 
         // Before any DMA activity, the channel is idle but the sync should
         // NOT be satisfied (channel was never running).
-        assert!(
-            !executor.syncs_satisfied(&device),
-            "sync must not be satisfied on initial idle"
-        );
+        assert!(!executor.syncs_satisfied(&device), "sync must not be satisfied on initial idle");
 
         // Verify Channel_Running bit is 0 initially.
         let abs_ch = 2u8; // MM2S ch0 = abs channel 2
@@ -1269,32 +1365,26 @@ mod tests {
         dma.start_channel(abs_ch, 0).unwrap();
 
         // Channel should now be running.
-        let status = device.array.dma_engine(test_col, test_row).unwrap()
-            .get_channel_status(abs_ch);
+        let status = device.array.dma_engine(test_col, test_row).unwrap().get_channel_status(abs_ch);
         assert!(
             reg_layout.memory_status.channel_running.extract_bool(status),
             "Channel_Running should be 1 after start"
         );
 
         // Sync still not satisfied (channel is running).
-        assert!(
-            !executor.syncs_satisfied(&device),
-            "sync must not be satisfied while channel is running"
-        );
+        assert!(!executor.syncs_satisfied(&device), "sync must not be satisfied while channel is running");
 
         // Step DMA until the channel completes.
         for _ in 0..10_000 {
             device.array.step_dma(test_col, test_row, &mut host_mem);
-            let status = device.array.dma_engine(test_col, test_row).unwrap()
-                .get_channel_status(abs_ch);
+            let status = device.array.dma_engine(test_col, test_row).unwrap().get_channel_status(abs_ch);
             if !reg_layout.memory_status.channel_running.extract_bool(status) {
                 break;
             }
         }
 
         // Channel should be done.
-        let status = device.array.dma_engine(test_col, test_row).unwrap()
-            .get_channel_status(abs_ch);
+        let status = device.array.dma_engine(test_col, test_row).unwrap().get_channel_status(abs_ch);
         assert!(
             !reg_layout.memory_status.channel_running.extract_bool(status),
             "Channel_Running should be 0 after completion"

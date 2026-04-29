@@ -148,9 +148,8 @@ fn classify_inner(
         match instr {
             NpuInstruction::BlockWrite { reg_off, values } => {
                 if let Some(bd_base_full) = shim_bd_base(*reg_off) {
-                    let word_at_reg_off = ((*reg_off & TILE_LOCAL_MASK)
-                        - (bd_base_full & TILE_LOCAL_MASK))
-                        / 4;
+                    let word_at_reg_off =
+                        ((*reg_off & TILE_LOCAL_MASK) - (bd_base_full & TILE_LOCAL_MASK)) / 4;
                     if let Some(w2_idx) = 2u32.checked_sub(word_at_reg_off) {
                         if let Some(&w2) = values.get(w2_idx as usize) {
                             bd_word_2.insert(bd_base_full, w2);
@@ -176,11 +175,7 @@ fn classify_inner(
                     });
                 }
             }
-            NpuInstruction::DdrPatch {
-                reg_addr,
-                arg_idx,
-                arg_plus,
-            } => {
+            NpuInstruction::DdrPatch { reg_addr, arg_idx, arg_plus } => {
                 let bd_base_full = reg_addr.saturating_sub(4);
                 // Tier 1: BD EnPkt.
                 if let Some(&w2) = bd_word_2.get(&bd_base_full) {
@@ -190,17 +185,11 @@ fn classify_inner(
                             role: KernargRole::Ctrlpkt,
                             bd_reg_addr: *reg_addr,
                         });
-                        patch_log
-                            .entry((*arg_idx, bd_base_full))
-                            .or_default()
-                            .push(*arg_plus);
+                        patch_log.entry((*arg_idx, bd_base_full)).or_default().push(*arg_plus);
                         continue;
                     }
                 }
-                patch_log
-                    .entry((*arg_idx, bd_base_full))
-                    .or_default()
-                    .push(*arg_plus);
+                patch_log.entry((*arg_idx, bd_base_full)).or_default().push(*arg_plus);
                 let local = bd_base_full & TILE_LOCAL_MASK;
                 let bd_id = (local - SHIM_BD_BASE_LOCAL) / SHIM_BD_STRIDE;
                 pending.push(PendingPatch {
@@ -245,8 +234,7 @@ fn classify_inner(
     // -- the two signals measure different things (post-init state vs.
     // packet content) and disagreement is information, not a conclusion.
     if let Some(topology) = topology {
-        let has_ctrlpkt_class =
-            roles.values().any(|c| c.role == KernargRole::Ctrlpkt);
+        let has_ctrlpkt_class = roles.values().any(|c| c.role == KernargRole::Ctrlpkt);
         let cdo_has_shim_packet = topology
             .packet_slaves()
             .any(|(addr, off, _)| is_shim_row(addr) && is_shim_south_slave(off));
@@ -276,9 +264,7 @@ struct PendingPatch {
 
 fn shim_bd_base(reg_off: u32) -> Option<u32> {
     let local = reg_off & TILE_LOCAL_MASK;
-    if local >= SHIM_BD_BASE_LOCAL
-        && local < SHIM_BD_BASE_LOCAL + SHIM_BD_COUNT * SHIM_BD_STRIDE
-    {
+    if local >= SHIM_BD_BASE_LOCAL && local < SHIM_BD_BASE_LOCAL + SHIM_BD_COUNT * SHIM_BD_STRIDE {
         let bd_base_local =
             SHIM_BD_BASE_LOCAL + ((local - SHIM_BD_BASE_LOCAL) / SHIM_BD_STRIDE) * SHIM_BD_STRIDE;
         Some((reg_off & !TILE_LOCAL_MASK) | bd_base_local)
@@ -349,15 +335,8 @@ mod tests {
     #[test]
     fn tier1_bd_enpkt_detects_ctrlpkt() {
         let stream = build_stream(vec![
-            NpuInstruction::BlockWrite {
-                reg_off: 0x0001_D000,
-                values: bd_words(true),
-            },
-            NpuInstruction::DdrPatch {
-                reg_addr: 0x0001_D004,
-                arg_idx: 2,
-                arg_plus: 0,
-            },
+            NpuInstruction::BlockWrite { reg_off: 0x0001_D000, values: bd_words(true) },
+            NpuInstruction::DdrPatch { reg_addr: 0x0001_D004, arg_idx: 2, arg_plus: 0 },
         ]);
         let roles = classify_kernargs(&stream);
         assert_eq!(roles[0].role, KernargRole::Ctrlpkt);
@@ -369,19 +348,9 @@ mod tests {
         // patches at stride 24.
         let mut instrs = Vec::new();
         for plus in [0u32, 24, 48, 72] {
-            instrs.push(NpuInstruction::BlockWrite {
-                reg_off: 0x0001_D000,
-                values: bd_words(false),
-            });
-            instrs.push(NpuInstruction::DdrPatch {
-                reg_addr: 0x0001_D004,
-                arg_idx: 2,
-                arg_plus: plus,
-            });
-            instrs.push(NpuInstruction::Write32 {
-                reg_off: SHIM_MM2S_0_TASK_QUEUE_LOCAL,
-                value: 0,
-            });
+            instrs.push(NpuInstruction::BlockWrite { reg_off: 0x0001_D000, values: bd_words(false) });
+            instrs.push(NpuInstruction::DdrPatch { reg_addr: 0x0001_D004, arg_idx: 2, arg_plus: plus });
+            instrs.push(NpuInstruction::Write32 { reg_off: SHIM_MM2S_0_TASK_QUEUE_LOCAL, value: 0 });
         }
         let roles = classify_kernargs(&build_stream(instrs));
         assert_eq!(roles.len(), 1);
@@ -391,19 +360,9 @@ mod tests {
     #[test]
     fn tier2_does_not_trigger_on_single_patch() {
         let stream = build_stream(vec![
-            NpuInstruction::BlockWrite {
-                reg_off: 0x0001_D000,
-                values: bd_words(false),
-            },
-            NpuInstruction::DdrPatch {
-                reg_addr: 0x0001_D004,
-                arg_idx: 0,
-                arg_plus: 0,
-            },
-            NpuInstruction::Write32 {
-                reg_off: SHIM_MM2S_0_TASK_QUEUE_LOCAL,
-                value: 0,
-            },
+            NpuInstruction::BlockWrite { reg_off: 0x0001_D000, values: bd_words(false) },
+            NpuInstruction::DdrPatch { reg_addr: 0x0001_D004, arg_idx: 0, arg_plus: 0 },
+            NpuInstruction::Write32 { reg_off: SHIM_MM2S_0_TASK_QUEUE_LOCAL, value: 0 },
         ]);
         let roles = classify_kernargs(&stream);
         assert_eq!(roles[0].role, KernargRole::DataMm2s);
@@ -415,37 +374,16 @@ mod tests {
         // patches then 1 data patch. Both args go through MM2S_0.
         let mut instrs = Vec::new();
         for plus in [0u32, 24, 48] {
-            instrs.push(NpuInstruction::BlockWrite {
-                reg_off: 0x0001_D000,
-                values: bd_words(false),
-            });
-            instrs.push(NpuInstruction::DdrPatch {
-                reg_addr: 0x0001_D004,
-                arg_idx: 2,
-                arg_plus: plus,
-            });
-            instrs.push(NpuInstruction::Write32 {
-                reg_off: SHIM_MM2S_0_TASK_QUEUE_LOCAL,
-                value: 0,
-            });
+            instrs.push(NpuInstruction::BlockWrite { reg_off: 0x0001_D000, values: bd_words(false) });
+            instrs.push(NpuInstruction::DdrPatch { reg_addr: 0x0001_D004, arg_idx: 2, arg_plus: plus });
+            instrs.push(NpuInstruction::Write32 { reg_off: SHIM_MM2S_0_TASK_QUEUE_LOCAL, value: 0 });
         }
         // Now the data transfer on the same BD with a different arg.
-        instrs.push(NpuInstruction::BlockWrite {
-            reg_off: 0x0001_D000,
-            values: bd_words(false),
-        });
-        instrs.push(NpuInstruction::DdrPatch {
-            reg_addr: 0x0001_D004,
-            arg_idx: 0,
-            arg_plus: 0,
-        });
-        instrs.push(NpuInstruction::Write32 {
-            reg_off: SHIM_MM2S_0_TASK_QUEUE_LOCAL,
-            value: 0,
-        });
+        instrs.push(NpuInstruction::BlockWrite { reg_off: 0x0001_D000, values: bd_words(false) });
+        instrs.push(NpuInstruction::DdrPatch { reg_addr: 0x0001_D004, arg_idx: 0, arg_plus: 0 });
+        instrs.push(NpuInstruction::Write32 { reg_off: SHIM_MM2S_0_TASK_QUEUE_LOCAL, value: 0 });
         let roles = classify_kernargs(&build_stream(instrs));
-        let map: HashMap<u8, KernargRole> =
-            roles.iter().map(|r| (r.arg_idx, r.role)).collect();
+        let map: HashMap<u8, KernargRole> = roles.iter().map(|r| (r.arg_idx, r.role)).collect();
         assert_eq!(map[&2], KernargRole::Ctrlpkt);
         assert_eq!(map[&0], KernargRole::DataMm2s);
     }
@@ -453,19 +391,9 @@ mod tests {
     #[test]
     fn data_s2mm_from_task_queue_offset() {
         let stream = build_stream(vec![
-            NpuInstruction::BlockWrite {
-                reg_off: 0x0001_D020,
-                values: bd_words(false),
-            },
-            NpuInstruction::DdrPatch {
-                reg_addr: 0x0001_D024,
-                arg_idx: 1,
-                arg_plus: 0,
-            },
-            NpuInstruction::Write32 {
-                reg_off: SHIM_S2MM_0_TASK_QUEUE_LOCAL,
-                value: 1,
-            },
+            NpuInstruction::BlockWrite { reg_off: 0x0001_D020, values: bd_words(false) },
+            NpuInstruction::DdrPatch { reg_addr: 0x0001_D024, arg_idx: 1, arg_plus: 0 },
+            NpuInstruction::Write32 { reg_off: SHIM_S2MM_0_TASK_QUEUE_LOCAL, value: 1 },
         ]);
         let roles = classify_kernargs(&stream);
         assert_eq!(roles[0].role, KernargRole::DataS2mm);
@@ -477,15 +405,8 @@ mod tests {
         // slave, plus a stream whose arg is Ctrlpkt-classified via
         // tier 1. Cross-check should agree (no warning).
         let stream = build_stream(vec![
-            NpuInstruction::BlockWrite {
-                reg_off: 0x0001_D000,
-                values: bd_words(true),
-            },
-            NpuInstruction::DdrPatch {
-                reg_addr: 0x0001_D004,
-                arg_idx: 2,
-                arg_plus: 0,
-            },
+            NpuInstruction::BlockWrite { reg_off: 0x0001_D000, values: bd_words(true) },
+            NpuInstruction::DdrPatch { reg_addr: 0x0001_D004, arg_idx: 2, arg_plus: 0 },
         ]);
         let topo = StreamSwitchTopology::from_device_ops(vec![DeviceOp::RegWrite {
             tile: TileAddr::new(0, 0),
@@ -499,15 +420,8 @@ mod tests {
     #[test]
     fn multi_column_tile_prefix_preserved() {
         let stream = build_stream(vec![
-            NpuInstruction::BlockWrite {
-                reg_off: 0x0021_D000,
-                values: bd_words(true),
-            },
-            NpuInstruction::DdrPatch {
-                reg_addr: 0x0021_D004,
-                arg_idx: 5,
-                arg_plus: 0,
-            },
+            NpuInstruction::BlockWrite { reg_off: 0x0021_D000, values: bd_words(true) },
+            NpuInstruction::DdrPatch { reg_addr: 0x0021_D004, arg_idx: 5, arg_plus: 0 },
         ]);
         let roles = classify_kernargs(&stream);
         assert_eq!(roles[0].bd_reg_addr, 0x0021_D004);
@@ -515,11 +429,8 @@ mod tests {
 
     #[test]
     fn ddr_patch_without_prior_bd_config_falls_to_unknown() {
-        let stream = build_stream(vec![NpuInstruction::DdrPatch {
-            reg_addr: 0x0001_D004,
-            arg_idx: 7,
-            arg_plus: 0,
-        }]);
+        let stream =
+            build_stream(vec![NpuInstruction::DdrPatch { reg_addr: 0x0001_D004, arg_idx: 7, arg_plus: 0 }]);
         let roles = classify_kernargs(&stream);
         assert_eq!(roles[0].role, KernargRole::Unknown);
     }
