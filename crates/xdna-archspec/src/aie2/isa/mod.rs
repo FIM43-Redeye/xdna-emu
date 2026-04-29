@@ -33,11 +33,10 @@ pub fn load_from_generated() -> types::TblgenOutput {
 // can `use xdna_archspec::aie2::isa::*;` to get the full tablegen API.
 pub use types::*;
 pub use resolver::{
-    build_decoder_tables, AddressingMode, CompositeEncoder, DecoderIndex, InstrEncoding,
-    InstrMemWidth, OperandField, OperandType, RegisterKind, ResolveError, Resolver, SlotIndex,
-    classify_operand_type, detect_addressing_mode, detect_mem_width,
-    infer_branch_condition, infer_dual_element_types, infer_element_type, infer_select_variant,
-    refine_branch_semantic,
+    build_decoder_tables, AddressingMode, CompositeEncoder, DecoderIndex, InstrEncoding, InstrMemWidth,
+    OperandField, OperandType, RegisterKind, ResolveError, Resolver, SlotIndex, classify_operand_type,
+    detect_addressing_mode, detect_mem_width, infer_branch_condition, infer_dual_element_types,
+    infer_element_type, infer_select_variant, refine_branch_semantic,
 };
 
 #[cfg(test)]
@@ -54,14 +53,21 @@ mod tests {
         let acq_imm = alu_encodings.iter().find(|e| e.name == "ACQ_mLockId_imm");
         let acq_reg = alu_encodings.iter().find(|e| e.name == "ACQ_mLockId_reg");
         if let (Some(imm), Some(reg)) = (acq_imm, acq_reg) {
-            assert_ne!(imm.fixed_bits, reg.fixed_bits,
-                "ACQ_mLockId_imm and ACQ_mLockId_reg should have different fixed_bits");
-            assert_ne!(imm.fixed_mask & imm.fixed_bits, reg.fixed_mask & reg.fixed_bits,
-                "Masked bits should differ");
+            assert_ne!(
+                imm.fixed_bits, reg.fixed_bits,
+                "ACQ_mLockId_imm and ACQ_mLockId_reg should have different fixed_bits"
+            );
+            assert_ne!(
+                imm.fixed_mask & imm.fixed_bits,
+                reg.fixed_mask & reg.fixed_bits,
+                "Masked bits should differ"
+            );
         } else {
-            let acq_names: Vec<_> = alu_encodings.iter()
+            let acq_names: Vec<_> = alu_encodings
+                .iter()
                 .filter(|e| e.name.to_lowercase().contains("acq"))
-                .map(|e| &e.name).collect();
+                .map(|e| &e.name)
+                .collect();
             panic!("Expected both ACQ variants, found: {:?}", acq_names);
         }
     }
@@ -72,12 +78,21 @@ mod tests {
     fn test_acq_lock_id_field_type() {
         let output = load_from_generated();
         let alu = output.encodings_by_slot.get("alu").expect("No alu slot");
-        let enc = alu.iter().find(|e| e.name == "ACQ_mLockId_imm")
+        let enc = alu
+            .iter()
+            .find(|e| e.name == "ACQ_mLockId_imm")
             .expect("ACQ_mLockId_imm should exist");
-        let id_field = enc.operand_fields.iter().find(|f| f.name == "id")
+        let id_field = enc
+            .operand_fields
+            .iter()
+            .find(|f| f.name == "id")
             .expect("ACQ_mLockId_imm should have 'id' field");
-        assert_eq!(id_field.operand_type, OperandType::LockId,
-            "Lock ID field should be LockId, not {:?}", id_field.operand_type);
+        assert_eq!(
+            id_field.operand_type,
+            OperandType::LockId,
+            "Lock ID field should be LockId, not {:?}",
+            id_field.operand_type
+        );
     }
 
     /// Structural semantic inference: every instruction must have a
@@ -108,9 +123,12 @@ mod tests {
         }
 
         let total_with_semantic = all.iter().filter(|e| e.semantic.is_some()).count();
-        assert_eq!(total_with_semantic, all.len(),
+        assert_eq!(
+            total_with_semantic,
+            all.len(),
             "Expected 100% semantic coverage ({} missing)",
-            all.len() - total_with_semantic);
+            all.len() - total_with_semantic
+        );
     }
 
     /// Processor scheduling model matches AIE2SchedModel expectations.

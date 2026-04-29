@@ -145,11 +145,21 @@ pub mod port_type {
     pub const WEST_BASE: u8 = 40;
     pub const DMA_BASE: u8 = 50;
 
-    pub const fn north(n: u8) -> u8 { NORTH_BASE + n }
-    pub const fn south(n: u8) -> u8 { SOUTH_BASE + n }
-    pub const fn east(n: u8) -> u8 { EAST_BASE + n }
-    pub const fn west(n: u8) -> u8 { WEST_BASE + n }
-    pub const fn dma(n: u8) -> u8 { DMA_BASE + n }
+    pub const fn north(n: u8) -> u8 {
+        NORTH_BASE + n
+    }
+    pub const fn south(n: u8) -> u8 {
+        SOUTH_BASE + n
+    }
+    pub const fn east(n: u8) -> u8 {
+        EAST_BASE + n
+    }
+    pub const fn west(n: u8) -> u8 {
+        WEST_BASE + n
+    }
+    pub const fn dma(n: u8) -> u8 {
+        DMA_BASE + n
+    }
 }
 
 /// aie-rt cross-validation data. Each submodule wraps a
@@ -233,21 +243,26 @@ mod tests {
     #[test]
     fn instruction_latency_constants_match_aie2schedule_td() {
         // Scalar pipeline latencies
-        assert_eq!(instruction_latency::SCALAR_MUL, 2,
-            "II_MUL operand_cycles[0] = 2 per AIE2Schedule.td");
-        assert_eq!(instruction_latency::SCALAR_DIV, 6,
-            "6-cycle iterative division per AM020 Ch4 + hardware observation");
+        assert_eq!(instruction_latency::SCALAR_MUL, 2, "II_MUL operand_cycles[0] = 2 per AIE2Schedule.td");
+        assert_eq!(
+            instruction_latency::SCALAR_DIV,
+            6,
+            "6-cycle iterative division per AM020 Ch4 + hardware observation"
+        );
 
         // Vector pipeline latencies
-        assert_eq!(instruction_latency::VECTOR_SIMPLE, 2,
-            "II_VADD/II_VSUB operand_cycles[0] = 2 per AIE2Schedule.td");
-        assert_eq!(instruction_latency::VECTOR_MUL, 5,
-            "II_VMUL operand_cycles[0] = 5 per AIE2Schedule.td");
-        assert_eq!(instruction_latency::VECTOR_MAC, 5,
-            "II_VMAC operand_cycles[0] = 5 per AIE2Schedule.td");
-        assert_eq!(instruction_latency::VECTOR_SHUFFLE, 2,
-            "II_VSHUFFLE operand_cycles[0] = 2 per AIE2Schedule.td");
-        assert_eq!(instruction_latency::VECTOR_PACK, 2,
-            "II_VPACK operand_cycles[0] = 2 per AIE2Schedule.td");
+        assert_eq!(
+            instruction_latency::VECTOR_SIMPLE,
+            2,
+            "II_VADD/II_VSUB operand_cycles[0] = 2 per AIE2Schedule.td"
+        );
+        assert_eq!(instruction_latency::VECTOR_MUL, 5, "II_VMUL operand_cycles[0] = 5 per AIE2Schedule.td");
+        assert_eq!(instruction_latency::VECTOR_MAC, 5, "II_VMAC operand_cycles[0] = 5 per AIE2Schedule.td");
+        assert_eq!(
+            instruction_latency::VECTOR_SHUFFLE,
+            2,
+            "II_VSHUFFLE operand_cycles[0] = 2 per AIE2Schedule.td"
+        );
+        assert_eq!(instruction_latency::VECTOR_PACK, 2, "II_VPACK operand_cycles[0] = 2 per AIE2Schedule.td");
     }
 }

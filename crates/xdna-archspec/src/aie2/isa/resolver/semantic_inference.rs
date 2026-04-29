@@ -5,9 +5,7 @@
 //! using mnemonic conventions. Also infers element types, branch conditions,
 //! and select variants.
 
-use super::super::types::{
-    BranchCondition, ElementType, SelectVariant, SemanticOp,
-};
+use super::super::types::{BranchCondition, ElementType, SelectVariant, SemanticOp};
 
 /// Infer semantic operation from structured TableGen data.
 ///
@@ -100,7 +98,6 @@ pub fn infer_element_type(mnemonic: &str) -> Option<ElementType> {
     super::super::element_type_logic::infer_type_tag_from_mnemonic(mnemonic).map(tag_to_element_type)
 }
 
-
 /// Infer both element types for dual-type instructions (SRS/UPS/CONV/FLOOR).
 ///
 /// Delegates to shared logic in `element_type_logic.rs`.
@@ -121,9 +118,7 @@ pub fn refine_branch_semantic(mnemonic: &str, semantic: Option<SemanticOp>) -> O
         return semantic;
     }
     let mn = mnemonic.to_lowercase();
-    if mn.starts_with("jnz") || mn.starts_with("jz")
-        || (mn.starts_with('b') && !mn.starts_with("bswap"))
-    {
+    if mn.starts_with("jnz") || mn.starts_with("jz") || (mn.starts_with('b') && !mn.starts_with("bswap")) {
         Some(SemanticOp::BrCond)
     } else {
         semantic
@@ -242,61 +237,40 @@ mod tests {
     fn test_semantic_inference_from_structure() {
         // Call: Defs=[lr] + hasDelaySlot (JL, JL_IND)
         assert_eq!(
-            infer_semantic_from_structure(
-                &["lr".into()], &[], false, false, true, &[],
-            ),
+            infer_semantic_from_structure(&["lr".into()], &[], false, false, true, &[],),
             Some(SemanticOp::Call),
         );
 
         // Return: Uses=[lr] + hasDelaySlot (RET)
         assert_eq!(
-            infer_semantic_from_structure(
-                &[], &["lr".into()], false, false, true, &[],
-            ),
+            infer_semantic_from_structure(&[], &["lr".into()], false, false, true, &[],),
             Some(SemanticOp::Ret),
         );
 
         // Load: mayLoad=true (VLDA, LDA, etc.)
-        assert_eq!(
-            infer_semantic_from_structure(
-                &[], &[], true, false, false, &[],
-            ),
-            Some(SemanticOp::Load),
-        );
+        assert_eq!(infer_semantic_from_structure(&[], &[], true, false, false, &[],), Some(SemanticOp::Load),);
 
         // Store: mayStore=true (VST, ST, etc.)
         assert_eq!(
-            infer_semantic_from_structure(
-                &[], &[], false, true, false, &[],
-            ),
+            infer_semantic_from_structure(&[], &[], false, true, false, &[],),
             Some(SemanticOp::Store),
         );
 
         // Done: parent class chain contains "_done_"
         assert_eq!(
-            infer_semantic_from_structure(
-                &[], &[], false, false, false,
-                &["AIE2_done_inst_alu".into()],
-            ),
+            infer_semantic_from_structure(&[], &[], false, false, false, &["AIE2_done_inst_alu".into()],),
             Some(SemanticOp::Done),
         );
 
         // hasDelaySlot alone (without lr) returns Br (baseline branch).
         // Callers use refine_branch_semantic() to upgrade to BrCond.
         assert_eq!(
-            infer_semantic_from_structure(
-                &["srCarry".into()], &[], false, false, true, &[],
-            ),
+            infer_semantic_from_structure(&["srCarry".into()], &[], false, false, true, &[],),
             Some(SemanticOp::Br),
         );
 
         // Pure arithmetic: no structural signals -> None
-        assert_eq!(
-            infer_semantic_from_structure(
-                &["srCarry".into()], &[], false, false, false, &[],
-            ),
-            None,
-        );
+        assert_eq!(infer_semantic_from_structure(&["srCarry".into()], &[], false, false, false, &[],), None,);
     }
 
     #[test]
@@ -387,8 +361,8 @@ mod tests {
         // Standalone VCONV: VCONV_{OUT}_{IN} (same convention as SRS/UPS)
         // VCONV_FP32_BF16 = bf16 input -> fp32 output
         let (et, ft) = infer_dual_element_types("VCONV_FP32_BF16");
-        assert_eq!(et, Some(ElementType::Float32));    // output = FP32
-        assert_eq!(ft, Some(ElementType::BFloat16));   // from = BF16
+        assert_eq!(et, Some(ElementType::Float32)); // output = FP32
+        assert_eq!(ft, Some(ElementType::BFloat16)); // from = BF16
 
         let (et, ft) = infer_dual_element_types("VCONV_BF16_FP32");
         assert_eq!(et, Some(ElementType::BFloat16));
@@ -397,8 +371,8 @@ mod tests {
         // VFLOOR: VFLOOR_{OUT}_{IN}_* (same as SRS/UPS convention)
         // VFLOOR_S32_BF16 = floor BF16 input to S32 output
         let (et, ft) = infer_dual_element_types("VFLOOR_S32_BF16_mFl2FxSrc_AM");
-        assert_eq!(et, Some(ElementType::Int32));     // output = S32
-        assert_eq!(ft, Some(ElementType::BFloat16));  // from = BF16
+        assert_eq!(et, Some(ElementType::Int32)); // output = S32
+        assert_eq!(ft, Some(ElementType::BFloat16)); // from = BF16
 
         // Fused CONV: VLDA_2D_CONV_FP32_BF16
         // Same {OUT}_{IN} convention: FP32 is output, BF16 is input.
@@ -473,14 +447,8 @@ mod tests {
     #[test]
     fn test_refine_fused_semantic_standalone_pack_unpack() {
         // Standalone VUNPACK/VPACK have no mayLoad/mayStore -> semantic=None
-        assert_eq!(
-            refine_fused_semantic("VUNPACK_D16_D8", None),
-            Some(SemanticOp::Unpack),
-        );
-        assert_eq!(
-            refine_fused_semantic("VPACK_S4_S8", None),
-            Some(SemanticOp::Pack),
-        );
+        assert_eq!(refine_fused_semantic("VUNPACK_D16_D8", None), Some(SemanticOp::Unpack),);
+        assert_eq!(refine_fused_semantic("VPACK_S4_S8", None), Some(SemanticOp::Pack),);
     }
 
     #[test]
@@ -498,18 +466,12 @@ mod tests {
     #[test]
     fn test_refine_fused_semantic_passthrough() {
         // Plain load/store without fused suffix -> unchanged
-        assert_eq!(
-            refine_fused_semantic("VLDA_ag_idx_imm", Some(SemanticOp::Load)),
-            Some(SemanticOp::Load),
-        );
+        assert_eq!(refine_fused_semantic("VLDA_ag_idx_imm", Some(SemanticOp::Load)), Some(SemanticOp::Load),);
         assert_eq!(
             refine_fused_semantic("VST_dmw_sts_w_ag_idx", Some(SemanticOp::Store)),
             Some(SemanticOp::Store),
         );
         // Non-memory semantics -> unchanged
-        assert_eq!(
-            refine_fused_semantic("VADD_32", Some(SemanticOp::Add)),
-            Some(SemanticOp::Add),
-        );
+        assert_eq!(refine_fused_semantic("VADD_32", Some(SemanticOp::Add)), Some(SemanticOp::Add),);
     }
 }

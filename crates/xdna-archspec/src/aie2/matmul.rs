@@ -54,23 +54,113 @@ pub struct GeometryEntry {
 /// Each entry: (bits_x, bits_y, acc_cmb, bfloat, rows, inner, cols)
 pub const DENSE_GEOMETRY_TABLE: &[GeometryEntry] = &[
     // int8 x int4 -> int32 (mmode 0: 8x4 acc_cmb=1)
-    GeometryEntry { bits_x: 8, bits_y: 4, rows: 4, inner: 16, cols: 8, acc_cmb: 1, bfloat: false, sparse: false },
+    GeometryEntry {
+        bits_x: 8,
+        bits_y: 4,
+        rows: 4,
+        inner: 16,
+        cols: 8,
+        acc_cmb: 1,
+        bfloat: false,
+        sparse: false,
+    },
     // int8 x int8 -> int32 (mmode 1: 8x8 acc_cmb=1)
-    GeometryEntry { bits_x: 8, bits_y: 8, rows: 4, inner: 8, cols: 8, acc_cmb: 1, bfloat: false, sparse: false },
+    GeometryEntry {
+        bits_x: 8,
+        bits_y: 8,
+        rows: 4,
+        inner: 8,
+        cols: 8,
+        acc_cmb: 1,
+        bfloat: false,
+        sparse: false,
+    },
     // int16 x int8 -> int32 (mmode 2: 16x8 acc_cmb=1)
-    GeometryEntry { bits_x: 16, bits_y: 8, rows: 4, inner: 4, cols: 8, acc_cmb: 1, bfloat: false, sparse: false },
+    GeometryEntry {
+        bits_x: 16,
+        bits_y: 8,
+        rows: 4,
+        inner: 4,
+        cols: 8,
+        acc_cmb: 1,
+        bfloat: false,
+        sparse: false,
+    },
     // int16 x int16 -> int32 (mmode 3: 16x16 acc_cmb=1)
-    GeometryEntry { bits_x: 16, bits_y: 16, rows: 4, inner: 2, cols: 8, acc_cmb: 1, bfloat: false, sparse: false },
+    GeometryEntry {
+        bits_x: 16,
+        bits_y: 16,
+        rows: 4,
+        inner: 2,
+        cols: 8,
+        acc_cmb: 1,
+        bfloat: false,
+        sparse: false,
+    },
     // int16 x int8 -> int64 (mmode 4: 16x8 acc_cmb=2) -- two variants
-    GeometryEntry { bits_x: 16, bits_y: 8, rows: 2, inner: 8, cols: 8, acc_cmb: 2, bfloat: false, sparse: false },
-    GeometryEntry { bits_x: 16, bits_y: 8, rows: 4, inner: 8, cols: 4, acc_cmb: 2, bfloat: false, sparse: false },
+    GeometryEntry {
+        bits_x: 16,
+        bits_y: 8,
+        rows: 2,
+        inner: 8,
+        cols: 8,
+        acc_cmb: 2,
+        bfloat: false,
+        sparse: false,
+    },
+    GeometryEntry {
+        bits_x: 16,
+        bits_y: 8,
+        rows: 4,
+        inner: 8,
+        cols: 4,
+        acc_cmb: 2,
+        bfloat: false,
+        sparse: false,
+    },
     // int16 x int16 -> int64 (mmode 5: 16x16 acc_cmb=2) -- two variants
-    GeometryEntry { bits_x: 16, bits_y: 16, rows: 2, inner: 4, cols: 8, acc_cmb: 2, bfloat: false, sparse: false },
-    GeometryEntry { bits_x: 16, bits_y: 16, rows: 4, inner: 4, cols: 4, acc_cmb: 2, bfloat: false, sparse: false },
+    GeometryEntry {
+        bits_x: 16,
+        bits_y: 16,
+        rows: 2,
+        inner: 4,
+        cols: 8,
+        acc_cmb: 2,
+        bfloat: false,
+        sparse: false,
+    },
+    GeometryEntry {
+        bits_x: 16,
+        bits_y: 16,
+        rows: 4,
+        inner: 4,
+        cols: 4,
+        acc_cmb: 2,
+        bfloat: false,
+        sparse: false,
+    },
     // bf16 x bf16 -> fp32 (mmode 6: 16x16 bfloat acc_cmb=1, acc_num=16)
-    GeometryEntry { bits_x: 16, bits_y: 16, rows: 4, inner: 8, cols: 4, acc_cmb: 1, bfloat: true, sparse: false },
+    GeometryEntry {
+        bits_x: 16,
+        bits_y: 16,
+        rows: 4,
+        inner: 8,
+        cols: 4,
+        acc_cmb: 1,
+        bfloat: true,
+        sparse: false,
+    },
     // int32 x int16 -> int64 (mmode 7: 32x16 acc_cmb=2)
-    GeometryEntry { bits_x: 32, bits_y: 16, rows: 4, inner: 2, cols: 4, acc_cmb: 2, bfloat: false, sparse: false },
+    GeometryEntry {
+        bits_x: 32,
+        bits_y: 16,
+        rows: 4,
+        inner: 2,
+        cols: 4,
+        acc_cmb: 2,
+        bfloat: false,
+        sparse: false,
+    },
 ];
 
 /// Sparse matrix multiply geometries.
@@ -79,15 +169,60 @@ pub const DENSE_GEOMETRY_TABLE: &[GeometryEntry] = &[
 /// permute window and control signals selecting which elements are non-zero.
 pub const SPARSE_GEOMETRY_TABLE: &[GeometryEntry] = &[
     // sparse int8 x int4 (inner doubles vs dense)
-    GeometryEntry { bits_x: 8, bits_y: 4, rows: 4, inner: 32, cols: 8, acc_cmb: 1, bfloat: false, sparse: true },
+    GeometryEntry {
+        bits_x: 8,
+        bits_y: 4,
+        rows: 4,
+        inner: 32,
+        cols: 8,
+        acc_cmb: 1,
+        bfloat: false,
+        sparse: true,
+    },
     // sparse int8 x int8
-    GeometryEntry { bits_x: 8, bits_y: 8, rows: 4, inner: 16, cols: 8, acc_cmb: 1, bfloat: false, sparse: true },
+    GeometryEntry {
+        bits_x: 8,
+        bits_y: 8,
+        rows: 4,
+        inner: 16,
+        cols: 8,
+        acc_cmb: 1,
+        bfloat: false,
+        sparse: true,
+    },
     // sparse int16 x int8
-    GeometryEntry { bits_x: 16, bits_y: 8, rows: 2, inner: 16, cols: 8, acc_cmb: 2, bfloat: false, sparse: true },
+    GeometryEntry {
+        bits_x: 16,
+        bits_y: 8,
+        rows: 2,
+        inner: 16,
+        cols: 8,
+        acc_cmb: 2,
+        bfloat: false,
+        sparse: true,
+    },
     // sparse int16 x int16
-    GeometryEntry { bits_x: 16, bits_y: 16, rows: 2, inner: 8, cols: 8, acc_cmb: 2, bfloat: false, sparse: true },
+    GeometryEntry {
+        bits_x: 16,
+        bits_y: 16,
+        rows: 2,
+        inner: 8,
+        cols: 8,
+        acc_cmb: 2,
+        bfloat: false,
+        sparse: true,
+    },
     // sparse bf16 x bf16
-    GeometryEntry { bits_x: 16, bits_y: 16, rows: 4, inner: 16, cols: 4, acc_cmb: 1, bfloat: true, sparse: true },
+    GeometryEntry {
+        bits_x: 16,
+        bits_y: 16,
+        rows: 4,
+        inner: 16,
+        cols: 4,
+        acc_cmb: 1,
+        bfloat: true,
+        sparse: true,
+    },
 ];
 
 /// Hardware config word (amode, bmode, variant) to geometry lookup table.
@@ -99,33 +234,214 @@ pub const SPARSE_GEOMETRY_TABLE: &[GeometryEntry] = &[
 pub const CONFIG_GEOMETRY_TABLE: &[(u32, u32, u32, GeometryEntry)] = &[
     // amode=0: acc_cmb=1 (32-bit accumulator lanes)
     // i8 x i4 -> acc32
-    (0, 0, 0, GeometryEntry { bits_x: 8, bits_y: 4, rows: 4, inner: 16, cols: 8, acc_cmb: 1, bfloat: false, sparse: false }),
+    (
+        0,
+        0,
+        0,
+        GeometryEntry {
+            bits_x: 8,
+            bits_y: 4,
+            rows: 4,
+            inner: 16,
+            cols: 8,
+            acc_cmb: 1,
+            bfloat: false,
+            sparse: false,
+        },
+    ),
     // i8 x i4 sparse -> acc32
-    (0, 0, 1, GeometryEntry { bits_x: 8, bits_y: 4, rows: 4, inner: 32, cols: 8, acc_cmb: 1, bfloat: false, sparse: true }),
+    (
+        0,
+        0,
+        1,
+        GeometryEntry {
+            bits_x: 8,
+            bits_y: 4,
+            rows: 4,
+            inner: 32,
+            cols: 8,
+            acc_cmb: 1,
+            bfloat: false,
+            sparse: true,
+        },
+    ),
     // i8 x i8 -> acc32
-    (0, 1, 0, GeometryEntry { bits_x: 8, bits_y: 8, rows: 4, inner: 8, cols: 8, acc_cmb: 1, bfloat: false, sparse: false }),
+    (
+        0,
+        1,
+        0,
+        GeometryEntry {
+            bits_x: 8,
+            bits_y: 8,
+            rows: 4,
+            inner: 8,
+            cols: 8,
+            acc_cmb: 1,
+            bfloat: false,
+            sparse: false,
+        },
+    ),
     // i8 x i8 sparse -> acc32
-    (0, 1, 5, GeometryEntry { bits_x: 8, bits_y: 8, rows: 4, inner: 16, cols: 8, acc_cmb: 1, bfloat: false, sparse: true }),
+    (
+        0,
+        1,
+        5,
+        GeometryEntry {
+            bits_x: 8,
+            bits_y: 8,
+            rows: 4,
+            inner: 16,
+            cols: 8,
+            acc_cmb: 1,
+            bfloat: false,
+            sparse: true,
+        },
+    ),
     // i16 x i8 -> acc32
-    (0, 2, 0, GeometryEntry { bits_x: 16, bits_y: 8, rows: 4, inner: 4, cols: 8, acc_cmb: 1, bfloat: false, sparse: false }),
+    (
+        0,
+        2,
+        0,
+        GeometryEntry {
+            bits_x: 16,
+            bits_y: 8,
+            rows: 4,
+            inner: 4,
+            cols: 8,
+            acc_cmb: 1,
+            bfloat: false,
+            sparse: false,
+        },
+    ),
     // i16 x i16 -> acc32
-    (0, 3, 0, GeometryEntry { bits_x: 16, bits_y: 16, rows: 4, inner: 2, cols: 8, acc_cmb: 1, bfloat: false, sparse: false }),
-
+    (
+        0,
+        3,
+        0,
+        GeometryEntry {
+            bits_x: 16,
+            bits_y: 16,
+            rows: 4,
+            inner: 2,
+            cols: 8,
+            acc_cmb: 1,
+            bfloat: false,
+            sparse: false,
+        },
+    ),
     // amode=1: acc_cmb=2 (64-bit accumulator lanes)
     // i32 x i16 -> acc64
-    (1, 0, 0, GeometryEntry { bits_x: 32, bits_y: 16, rows: 4, inner: 2, cols: 4, acc_cmb: 2, bfloat: false, sparse: false }),
+    (
+        1,
+        0,
+        0,
+        GeometryEntry {
+            bits_x: 32,
+            bits_y: 16,
+            rows: 4,
+            inner: 2,
+            cols: 4,
+            acc_cmb: 2,
+            bfloat: false,
+            sparse: false,
+        },
+    ),
     // i16 x i8 -> acc64 (variant 0: 2x8x8)
-    (1, 2, 0, GeometryEntry { bits_x: 16, bits_y: 8, rows: 2, inner: 8, cols: 8, acc_cmb: 2, bfloat: false, sparse: false }),
+    (
+        1,
+        2,
+        0,
+        GeometryEntry {
+            bits_x: 16,
+            bits_y: 8,
+            rows: 2,
+            inner: 8,
+            cols: 8,
+            acc_cmb: 2,
+            bfloat: false,
+            sparse: false,
+        },
+    ),
     // i16 x i8 -> acc64 (variant 1: 4x8x4)
-    (1, 2, 1, GeometryEntry { bits_x: 16, bits_y: 8, rows: 4, inner: 8, cols: 4, acc_cmb: 2, bfloat: false, sparse: false }),
+    (
+        1,
+        2,
+        1,
+        GeometryEntry {
+            bits_x: 16,
+            bits_y: 8,
+            rows: 4,
+            inner: 8,
+            cols: 4,
+            acc_cmb: 2,
+            bfloat: false,
+            sparse: false,
+        },
+    ),
     // i16 x i8 sparse -> acc64
-    (1, 2, 2, GeometryEntry { bits_x: 16, bits_y: 8, rows: 2, inner: 16, cols: 8, acc_cmb: 2, bfloat: false, sparse: true }),
+    (
+        1,
+        2,
+        2,
+        GeometryEntry {
+            bits_x: 16,
+            bits_y: 8,
+            rows: 2,
+            inner: 16,
+            cols: 8,
+            acc_cmb: 2,
+            bfloat: false,
+            sparse: true,
+        },
+    ),
     // i16 x i16 -> acc64 (variant 0: 2x4x8)
-    (1, 3, 0, GeometryEntry { bits_x: 16, bits_y: 16, rows: 2, inner: 4, cols: 8, acc_cmb: 2, bfloat: false, sparse: false }),
+    (
+        1,
+        3,
+        0,
+        GeometryEntry {
+            bits_x: 16,
+            bits_y: 16,
+            rows: 2,
+            inner: 4,
+            cols: 8,
+            acc_cmb: 2,
+            bfloat: false,
+            sparse: false,
+        },
+    ),
     // i16 x i16 -> acc64 (variant 1: 4x4x4)
-    (1, 3, 1, GeometryEntry { bits_x: 16, bits_y: 16, rows: 4, inner: 4, cols: 4, acc_cmb: 2, bfloat: false, sparse: false }),
+    (
+        1,
+        3,
+        1,
+        GeometryEntry {
+            bits_x: 16,
+            bits_y: 16,
+            rows: 4,
+            inner: 4,
+            cols: 4,
+            acc_cmb: 2,
+            bfloat: false,
+            sparse: false,
+        },
+    ),
     // i16 x i16 sparse -> acc64
-    (1, 3, 5, GeometryEntry { bits_x: 16, bits_y: 16, rows: 2, inner: 8, cols: 8, acc_cmb: 2, bfloat: false, sparse: true }),
+    (
+        1,
+        3,
+        5,
+        GeometryEntry {
+            bits_x: 16,
+            bits_y: 16,
+            rows: 2,
+            inner: 8,
+            cols: 8,
+            acc_cmb: 2,
+            bfloat: false,
+            sparse: true,
+        },
+    ),
 ];
 
 #[cfg(test)]

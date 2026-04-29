@@ -29,8 +29,7 @@ use super::{cardinal, compute, memtile, DATA_MEM_HOST_OFFSET};
 /// The core accesses tile configuration registers through this window when
 /// `tile.processor_bus_enabled` is true. Derived as `(cardinal::EAST + 1)
 /// * compute::MEMORY_SIZE`.
-pub const PROC_BUS_BASE: u32 =
-    (cardinal::EAST as u32 + 1) * compute::MEMORY_SIZE as u32;
+pub const PROC_BUS_BASE: u32 = (cardinal::EAST as u32 + 1) * compute::MEMORY_SIZE as u32;
 
 /// Exclusive end address of the processor bus window (base + 256KB).
 ///
@@ -49,8 +48,7 @@ pub const PROC_BUS_END: u32 = PROC_BUS_BASE + 4 * compute::MEMORY_SIZE as u32;
 /// Source: aie-rt `_XAie_GetTargetTileLoc()` --
 /// `CardDir = Addr / DataMemSize`, where CardDir 7 = East = local tile
 /// (for AIE2 with IsCheckerBoard=0).
-pub const AIE_DATA_MEMORY_BASE: u32 =
-    cardinal::EAST as u32 * compute::MEMORY_SIZE as u32;
+pub const AIE_DATA_MEMORY_BASE: u32 = cardinal::EAST as u32 * compute::MEMORY_SIZE as u32;
 
 /// Program memory base offset in host/CDO address space.
 ///

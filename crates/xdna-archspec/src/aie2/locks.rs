@@ -79,15 +79,15 @@ pub mod quadrants {
         fn quadrant_boundaries_partition_lock_id_space() {
             // Each quadrant covers exactly 16 IDs.
             assert_eq!(SOUTH_END - SOUTH_START, 16, "South quadrant must have 16 IDs");
-            assert_eq!(WEST_END - WEST_START,   16, "West quadrant must have 16 IDs");
+            assert_eq!(WEST_END - WEST_START, 16, "West quadrant must have 16 IDs");
             assert_eq!(NORTH_END - NORTH_START, 16, "North quadrant must have 16 IDs");
-            assert_eq!(EAST_END  - EAST_START,  16, "East quadrant must have 16 IDs");
+            assert_eq!(EAST_END - EAST_START, 16, "East quadrant must have 16 IDs");
 
             // Quadrants must be contiguous and start at 0.
             assert_eq!(SOUTH_START, 0, "South quadrant must start at 0");
-            assert_eq!(WEST_START,  SOUTH_END, "West must start where South ends");
-            assert_eq!(NORTH_START, WEST_END,  "North must start where West ends");
-            assert_eq!(EAST_START,  NORTH_END, "East must start where North ends");
+            assert_eq!(WEST_START, SOUTH_END, "West must start where South ends");
+            assert_eq!(NORTH_START, WEST_END, "North must start where West ends");
+            assert_eq!(EAST_START, NORTH_END, "East must start where North ends");
 
             // Total coverage = 64 IDs (full 6-bit field).
             assert_eq!(EAST_END, 64, "East quadrant must end at 64");
@@ -99,13 +99,8 @@ pub mod quadrants {
 ///
 /// Static so hot-path consumers can cache `&'static LockValueLayout`
 /// at construction time.
-pub static AIE2_LOCK_VALUE_LAYOUT: LockValueLayout = LockValueLayout {
-    width: 6,
-    mask: 0x3F,
-    sign_bit: 5,
-    min: -64,
-    max: 63,
-};
+pub static AIE2_LOCK_VALUE_LAYOUT: LockValueLayout =
+    LockValueLayout { width: 6, mask: 0x3F, sign_bit: 5, min: -64, max: 63 };
 
 /// AIE2 lock model.
 ///
@@ -140,10 +135,8 @@ mod tests {
 
     #[test]
     fn aie2_lock_model_feature_flags() {
-        assert!(AIE2_LOCK_MODEL.supports_acquire_eq(),
-                "AIE2 supports acq-EQ");
-        assert!(AIE2_LOCK_MODEL.supports_dynamic_value_ops(),
-                "AIE2 supports GetValue/SetValue");
+        assert!(AIE2_LOCK_MODEL.supports_acquire_eq(), "AIE2 supports acq-EQ");
+        assert!(AIE2_LOCK_MODEL.supports_dynamic_value_ops(), "AIE2 supports GetValue/SetValue");
     }
 
     #[test]
@@ -171,22 +164,24 @@ mod tests {
             .join("mlir-aie/lib/Dialect/AIE/Util/aie_registers_aie2.json");
 
         if !json_path.exists() {
-            eprintln!("Skipping drift test: register DB JSON not found at {}",
-                      json_path.display());
+            eprintln!("Skipping drift test: register DB JSON not found at {}", json_path.display());
             return;
         }
 
-        let db = RegisterDb::from_file(&json_path)
-            .expect("Failed to load register DB JSON");
+        let db = RegisterDb::from_file(&json_path).expect("Failed to load register DB JSON");
         let field = db
             .module("memory")
             .and_then(|m| m.register("Lock0_value"))
             .and_then(|r| r.field("Lock_value"))
             .expect("memory.Lock0_value.Lock_value field not found in JSON");
 
-        assert_eq!(field.width, AIE2_LOCK_VALUE_LAYOUT.width,
-                   "Lock_value field width drifted from static constant");
-        assert_eq!(field.mask, AIE2_LOCK_VALUE_LAYOUT.mask,
-                   "Lock_value field mask drifted from static constant");
+        assert_eq!(
+            field.width, AIE2_LOCK_VALUE_LAYOUT.width,
+            "Lock_value field width drifted from static constant"
+        );
+        assert_eq!(
+            field.mask, AIE2_LOCK_VALUE_LAYOUT.mask,
+            "Lock_value field mask drifted from static constant"
+        );
     }
 }

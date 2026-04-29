@@ -118,19 +118,10 @@ pub mod dma {
             assert_eq!(COMPUTE_DMA_MM2S_0_CTRL, 0x1DE10);
             assert_eq!(COMPUTE_DMA_MM2S_1_CTRL, 0x1DE18);
             // Adjacent channels are 0x08 bytes apart (Ctrl + Start_Queue).
-            assert_eq!(
-                COMPUTE_DMA_S2MM_1_CTRL - COMPUTE_DMA_S2MM_0_CTRL,
-                CHANNEL_STRIDE,
-            );
-            assert_eq!(
-                COMPUTE_DMA_MM2S_1_CTRL - COMPUTE_DMA_MM2S_0_CTRL,
-                CHANNEL_STRIDE,
-            );
+            assert_eq!(COMPUTE_DMA_S2MM_1_CTRL - COMPUTE_DMA_S2MM_0_CTRL, CHANNEL_STRIDE,);
+            assert_eq!(COMPUTE_DMA_MM2S_1_CTRL - COMPUTE_DMA_MM2S_0_CTRL, CHANNEL_STRIDE,);
             // MM2S_0 follows S2MM_1 with one more stride of gap.
-            assert_eq!(
-                COMPUTE_DMA_MM2S_0_CTRL - COMPUTE_DMA_S2MM_1_CTRL,
-                CHANNEL_STRIDE,
-            );
+            assert_eq!(COMPUTE_DMA_MM2S_0_CTRL - COMPUTE_DMA_S2MM_1_CTRL, CHANNEL_STRIDE,);
         }
 
         /// Drift-detection: asserts Start_Queue offsets match Ctrl + 4.
@@ -143,14 +134,8 @@ pub mod dma {
             assert_eq!(COMPUTE_DMA_MM2S_0_START_QUEUE, 0x1DE14);
             assert_eq!(COMPUTE_DMA_MM2S_1_START_QUEUE, 0x1DE1C);
             // Each Start_Queue is 4 bytes past its Ctrl.
-            assert_eq!(
-                COMPUTE_DMA_S2MM_0_START_QUEUE - COMPUTE_DMA_S2MM_0_CTRL,
-                START_QUEUE_OFFSET_IN_SLOT,
-            );
-            assert_eq!(
-                COMPUTE_DMA_MM2S_1_START_QUEUE - COMPUTE_DMA_MM2S_1_CTRL,
-                START_QUEUE_OFFSET_IN_SLOT,
-            );
+            assert_eq!(COMPUTE_DMA_S2MM_0_START_QUEUE - COMPUTE_DMA_S2MM_0_CTRL, START_QUEUE_OFFSET_IN_SLOT,);
+            assert_eq!(COMPUTE_DMA_MM2S_1_START_QUEUE - COMPUTE_DMA_MM2S_1_CTRL, START_QUEUE_OFFSET_IN_SLOT,);
         }
 
         /// Drift-detection: memtile S2MM/MM2S Start_Queue base offsets,

@@ -70,9 +70,9 @@ pub struct RawInstrInfo {
     pub flags: u64,
     pub num_operands: u16,
     pub num_defs: u8,
-    pub latency: i16,        // operand_cycles[0], or -1 if unavailable
-    pub stage_latency: i16,  // Pipeline stage sum, or -1 if unavailable
-    pub sched_class: u16,    // Itinerary class index (opaque)
+    pub latency: i16,       // operand_cycles[0], or -1 if unavailable
+    pub stage_latency: i16, // Pipeline stage sum, or -1 if unavailable
+    pub sched_class: u16,   // Itinerary class index (opaque)
 }
 
 extern "C" {
@@ -165,16 +165,11 @@ pub fn decode_slot(slot: Slot, insn_bits: u64) -> Option<DecodeResult> {
         match op.kind {
             OpKind::Reg => {
                 let reg_name = if !op.reg_name.is_null() {
-                    unsafe { CStr::from_ptr(op.reg_name) }
-                        .to_string_lossy()
-                        .into_owned()
+                    unsafe { CStr::from_ptr(op.reg_name) }.to_string_lossy().into_owned()
                 } else {
                     format!("?{}", op.value)
                 };
-                operands.push(DecodedOperand::Reg {
-                    id: op.value as u32,
-                    name: reg_name,
-                });
+                operands.push(DecodedOperand::Reg { id: op.value as u32, name: reg_name });
             }
             OpKind::Imm => {
                 operands.push(DecodedOperand::Imm(op.value));
@@ -183,12 +178,7 @@ pub fn decode_slot(slot: Slot, insn_bits: u64) -> Option<DecodeResult> {
         }
     }
 
-    Some(DecodeResult {
-        name,
-        opcode: raw.opcode,
-        num_defs: raw.num_defs,
-        operands,
-    })
+    Some(DecodeResult { name, opcode: raw.opcode, num_defs: raw.num_defs, operands })
 }
 
 /// Decode a slot and return just the instruction name (legacy interface).
@@ -235,7 +225,11 @@ pub fn get_reg_name(reg_id: u32) -> Option<String> {
         return None;
     }
     let name = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
-    if name.is_empty() { None } else { Some(name) }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 /// Map a slot name string (e.g., "mv", "alu") to a Slot enum value.
@@ -259,19 +253,19 @@ pub fn slot_from_name(name: &str) -> Option<Slot> {
 
 /// MCID flag bit positions (from llvm/MC/MCInstrDesc.h).
 pub mod mcid {
-    pub const RETURN: u64          = 1 << 5;
-    pub const CALL: u64            = 1 << 7;
-    pub const BARRIER: u64         = 1 << 8;
-    pub const TERMINATOR: u64      = 1 << 9;
-    pub const BRANCH: u64          = 1 << 10;
+    pub const RETURN: u64 = 1 << 5;
+    pub const CALL: u64 = 1 << 7;
+    pub const BARRIER: u64 = 1 << 8;
+    pub const TERMINATOR: u64 = 1 << 9;
+    pub const BRANCH: u64 = 1 << 10;
     pub const INDIRECT_BRANCH: u64 = 1 << 11;
-    pub const COMPARE: u64         = 1 << 12;
-    pub const MOVE_IMM: u64        = 1 << 13;
-    pub const MOVE_REG: u64        = 1 << 14;
-    pub const MAY_LOAD: u64        = 1 << 19;
-    pub const MAY_STORE: u64       = 1 << 20;
-    pub const COMMUTABLE: u64      = 1 << 25;
-    pub const ADD: u64             = 1 << 37;
+    pub const COMPARE: u64 = 1 << 12;
+    pub const MOVE_IMM: u64 = 1 << 13;
+    pub const MOVE_REG: u64 = 1 << 14;
+    pub const MAY_LOAD: u64 = 1 << 19;
+    pub const MAY_STORE: u64 = 1 << 20;
+    pub const COMMUTABLE: u64 = 1 << 25;
+    pub const ADD: u64 = 1 << 37;
 }
 
 /// Per-instruction metadata from LLVM's MCInstrDesc and itinerary model.
@@ -293,16 +287,36 @@ pub struct InstrInfo {
 }
 
 impl InstrInfo {
-    pub fn is_load(&self) -> bool { self.flags & mcid::MAY_LOAD != 0 }
-    pub fn is_store(&self) -> bool { self.flags & mcid::MAY_STORE != 0 }
-    pub fn is_branch(&self) -> bool { self.flags & mcid::BRANCH != 0 }
-    pub fn is_call(&self) -> bool { self.flags & mcid::CALL != 0 }
-    pub fn is_return(&self) -> bool { self.flags & mcid::RETURN != 0 }
-    pub fn is_terminator(&self) -> bool { self.flags & mcid::TERMINATOR != 0 }
-    pub fn is_compare(&self) -> bool { self.flags & mcid::COMPARE != 0 }
-    pub fn is_commutable(&self) -> bool { self.flags & mcid::COMMUTABLE != 0 }
-    pub fn is_move_reg(&self) -> bool { self.flags & mcid::MOVE_REG != 0 }
-    pub fn is_move_imm(&self) -> bool { self.flags & mcid::MOVE_IMM != 0 }
+    pub fn is_load(&self) -> bool {
+        self.flags & mcid::MAY_LOAD != 0
+    }
+    pub fn is_store(&self) -> bool {
+        self.flags & mcid::MAY_STORE != 0
+    }
+    pub fn is_branch(&self) -> bool {
+        self.flags & mcid::BRANCH != 0
+    }
+    pub fn is_call(&self) -> bool {
+        self.flags & mcid::CALL != 0
+    }
+    pub fn is_return(&self) -> bool {
+        self.flags & mcid::RETURN != 0
+    }
+    pub fn is_terminator(&self) -> bool {
+        self.flags & mcid::TERMINATOR != 0
+    }
+    pub fn is_compare(&self) -> bool {
+        self.flags & mcid::COMPARE != 0
+    }
+    pub fn is_commutable(&self) -> bool {
+        self.flags & mcid::COMMUTABLE != 0
+    }
+    pub fn is_move_reg(&self) -> bool {
+        self.flags & mcid::MOVE_REG != 0
+    }
+    pub fn is_move_imm(&self) -> bool {
+        self.flags & mcid::MOVE_IMM != 0
+    }
 }
 
 /// Query instruction metadata for all opcodes at init time.
@@ -401,8 +415,7 @@ mod tests {
     #[test]
     fn test_vpush_hi_32_disambiguation() {
         let r4_bits: u64 = 0x02903D;
-        let decoded = decode_slot(Slot::Mv, r4_bits)
-            .expect("r4 bits should decode");
+        let decoded = decode_slot(Slot::Mv, r4_bits).expect("r4 bits should decode");
         assert_eq!(decoded.name, "VPUSH_HI_32");
     }
 
@@ -420,9 +433,17 @@ mod tests {
     fn test_register_names_populated() {
         let decoded = decode_slot(Slot::Mv, 0x028C3D).expect("should decode");
         assert_eq!(decoded.name, "VPUSH_HI_32");
-        let reg_names: Vec<&str> = decoded.operands.iter().filter_map(|op| {
-            if let DecodedOperand::Reg { name, .. } = op { Some(name.as_str()) } else { None }
-        }).collect();
+        let reg_names: Vec<&str> = decoded
+            .operands
+            .iter()
+            .filter_map(|op| {
+                if let DecodedOperand::Reg { name, .. } = op {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert!(!reg_names.is_empty(), "Should have register operands");
     }
 
@@ -445,18 +466,20 @@ mod tests {
     #[test]
     fn test_vmac_f_untied_acc_operands() {
         let vec_bits: u64 = 0x0040001;
-        let decoded = decode_slot(Slot::Vec, vec_bits)
-            .expect("VMAC_F with untied acc should decode");
-        assert!(decoded.name.starts_with("VMAC_F"),
-            "Expected VMAC_F, got {}", decoded.name);
+        let decoded = decode_slot(Slot::Vec, vec_bits).expect("VMAC_F with untied acc should decode");
+        assert!(decoded.name.starts_with("VMAC_F"), "Expected VMAC_F, got {}", decoded.name);
         assert_eq!(decoded.num_defs, 1, "one output def");
-        let reg_names: Vec<&str> = decoded.operands.iter().filter_map(|op| {
-            if let DecodedOperand::Reg { name, .. } = op {
-                Some(name.as_str())
-            } else {
-                None
-            }
-        }).collect();
+        let reg_names: Vec<&str> = decoded
+            .operands
+            .iter()
+            .filter_map(|op| {
+                if let DecodedOperand::Reg { name, .. } = op {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert!(reg_names.len() >= 2, "Need at least dst + acc1 registers");
         assert_eq!(reg_names[0], "bml0", "dst should be bml0");
         assert_eq!(reg_names[1], "bml2", "acc1 should be bml2");
@@ -471,11 +494,9 @@ mod tests {
         let infos = query_all_instr_info();
         assert!(infos.len() > 600, "Should have 600+ opcodes, got {}", infos.len());
         let with_latency = infos.iter().filter(|i| i.latency.is_some()).count();
-        assert!(with_latency > 100,
-            "Should have 100+ opcodes with latency, got {}", with_latency);
+        assert!(with_latency > 100, "Should have 100+ opcodes with latency, got {}", with_latency);
         let with_sched = infos.iter().filter(|i| i.sched_class > 0).count();
-        assert!(with_sched > 100,
-            "Should have 100+ opcodes with sched class, got {}", with_sched);
+        assert!(with_sched > 100, "Should have 100+ opcodes with sched class, got {}", with_sched);
     }
 
     #[test]

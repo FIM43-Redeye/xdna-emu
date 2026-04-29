@@ -65,16 +65,32 @@ impl TileTopology for Aie2Topology {
     fn neighbor(&self, col: u8, row: u8, dir: Direction) -> Option<(u8, u8)> {
         match dir {
             Direction::South => {
-                if row == 0 { None } else { Some((col, row - 1)) }
+                if row == 0 {
+                    None
+                } else {
+                    Some((col, row - 1))
+                }
             }
             Direction::North => {
-                if row + 1 >= self.rows { None } else { Some((col, row + 1)) }
+                if row + 1 >= self.rows {
+                    None
+                } else {
+                    Some((col, row + 1))
+                }
             }
             Direction::East => {
-                if col + 1 >= self.columns { None } else { Some((col + 1, row)) }
+                if col + 1 >= self.columns {
+                    None
+                } else {
+                    Some((col + 1, row))
+                }
             }
             Direction::West => {
-                if col == 0 { None } else { Some((col - 1, row)) }
+                if col == 0 {
+                    None
+                } else {
+                    Some((col - 1, row))
+                }
             }
         }
     }

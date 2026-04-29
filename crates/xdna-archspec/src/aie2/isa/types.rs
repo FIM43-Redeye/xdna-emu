@@ -60,14 +60,9 @@ pub enum EncodingPart {
     /// Literal bit pattern.
     /// - `0b11` -> Literal { value: 0b11, width: 2 }
     /// - `0b0` -> Literal { value: 0, width: 1 }
-    Literal {
-        value: u64,
-        width: u8,
-    },
+    Literal { value: u64, width: u8 },
     /// A dontcare field: `dontcare{N}` or `dontcare{high-low}`
-    DontCare {
-        width: u8,
-    },
+    DontCare { width: u8 },
 }
 
 impl EncodingPart {
@@ -243,8 +238,8 @@ pub enum SemanticOp {
     // Arithmetic
     Add,
     Sub,
-    Adc,  // Add with carry (reads carry flag before computation)
-    Sbc,  // Subtract with borrow (reads carry flag before computation)
+    Adc, // Add with carry (reads carry flag before computation)
+    Sbc, // Subtract with borrow (reads carry flag before computation)
     Mul,
     SDiv,
     UDiv,
@@ -258,46 +253,46 @@ pub enum SemanticOp {
     Or,
     Xor,
     Not,
-    Shl,   // Shift left
-    Sra,   // Shift right arithmetic (signed)
-    Srl,   // Shift right logical (unsigned)
+    Shl, // Shift left
+    Sra, // Shift right arithmetic (signed)
+    Srl, // Shift right logical (unsigned)
     // Bidirectional shifts (AIE2 ASHL/LSHL hardware instructions).
     // Positive shift amount = left, negative = right.
     // ASHL: right-shifts are arithmetic (sign-preserving).
     // LSHL: right-shifts are logical (zero-filling).
     AshlBidir,
     LshlBidir,
-    Rotl,  // Rotate left
-    Rotr,  // Rotate right
+    Rotl, // Rotate left
+    Rotr, // Rotate right
 
     // Comparison (result is 0 or 1)
-    SetEq,   // ==
-    SetNe,   // !=
-    SetLt,   // < (signed)
-    SetLe,   // <= (signed)
-    SetGt,   // > (signed)
-    SetGe,   // >= (signed)
-    SetUlt,  // < (unsigned)
-    SetUle,  // <= (unsigned)
-    SetUgt,  // > (unsigned)
-    SetUge,  // >= (unsigned)
+    SetEq,  // ==
+    SetNe,  // !=
+    SetLt,  // < (signed)
+    SetLe,  // <= (signed)
+    SetGt,  // > (signed)
+    SetGe,  // >= (signed)
+    SetUlt, // < (unsigned)
+    SetUle, // <= (unsigned)
+    SetUgt, // > (unsigned)
+    SetUge, // >= (unsigned)
 
     // Bit manipulation
-    Ctlz,    // Count leading zeros
-    Cttz,    // Count trailing zeros
-    Ctpop,   // Population count (count ones)
-    Bswap,   // Byte swap
+    Ctlz,  // Count leading zeros
+    Cttz,  // Count trailing zeros
+    Ctpop, // Population count (count ones)
+    Bswap, // Byte swap
 
     // Memory
     Load,
     Store,
 
     // Control flow
-    Br,      // Unconditional branch
-    BrCond,  // Conditional branch
-    Call,    // Call subroutine (jl: sets LR after delay slots)
-    Ret,     // Return from subroutine
-    Select,  // Conditional select (ternary)
+    Br,     // Unconditional branch
+    BrCond, // Conditional branch
+    Call,   // Call subroutine (jl: sets LR after delay slots)
+    Ret,    // Return from subroutine
+    Select, // Conditional select (ternary)
 
     // Sign/zero extension
     SignExtend,
@@ -312,12 +307,12 @@ pub enum SemanticOp {
     DivStep, // Iterative signed division step (dstep via r31)
 
     // Synchronization (AIE-specific)
-    LockAcquire,  // Acquire lock
-    LockRelease,  // Release lock
+    LockAcquire, // Acquire lock
+    LockRelease, // Release lock
 
     // Bit manipulation (scalar-only)
-    Clb,  // Count leading bits (ones or zeros, != CLZ)
-    Cmp,  // Compare (flag-setting, no destination register)
+    Clb, // Count leading bits (ones or zeros, != CLZ)
+    Cmp, // Compare (flag-setting, no destination register)
 
     // Vector-specific operations
     Mac,             // Multiply-accumulate: acc += A * B
@@ -344,40 +339,40 @@ pub enum SemanticOp {
     Max,             // Maximum (scalar or vector)
 
     // Conditional vector operations (AIE2 compound ops)
-    SubLt,        // dst[i] = (a < b) ? a - b : a
-    SubGe,        // dst[i] = (a >= b) ? a - b : a
-    MaxDiffLt,    // dst[i] = max(a - b, 0) when a < b
-    MaxLt,        // dst = max(a, b) with less-than flag
-    MinGe,        // dst = min(a, b) with greater-equal flag
-    AbsGtz,       // dst[i] = (src > 0) ? abs(src) : src
-    NegGtz,       // dst[i] = (src > 0) ? -src : src
-    NegLtz,       // dst[i] = (src < 0) ? -src : src
-    NegAdd,       // dst = -src1 + src2
-    NegMul,       // acc += -(src1 * src2)
-    Accumulate,   // acc += src (no multiply)
-    AccumSub,     // acc1 - acc2 (vadd with md2=1 / vsub)
-    AccumNegAdd,  // -acc1 + acc2 (vnegadd)
-    AccumNegSub,  // -acc1 - acc2 (vnegsub)
+    SubLt,       // dst[i] = (a < b) ? a - b : a
+    SubGe,       // dst[i] = (a >= b) ? a - b : a
+    MaxDiffLt,   // dst[i] = max(a - b, 0) when a < b
+    MaxLt,       // dst = max(a, b) with less-than flag
+    MinGe,       // dst = min(a, b) with greater-equal flag
+    AbsGtz,      // dst[i] = (src > 0) ? abs(src) : src
+    NegGtz,      // dst[i] = (src > 0) ? -src : src
+    NegLtz,      // dst[i] = (src < 0) ? -src : src
+    NegAdd,      // dst = -src1 + src2
+    NegMul,      // acc += -(src1 * src2)
+    Accumulate,  // acc += src (no multiply)
+    AccumSub,    // acc1 - acc2 (vadd with md2=1 / vsub)
+    AccumNegAdd, // -acc1 + acc2 (vnegadd)
+    AccumNegSub, // -acc1 - acc2 (vnegsub)
 
     // Side-effect operations
-    CascadeRead,            // Read from cascade input
-    CascadeWrite,           // Write to cascade output
-    StreamRead,             // Read from slave stream
-    StreamWrite,            // Write to master stream
+    CascadeRead,             // Read from cascade input
+    CascadeWrite,            // Write to cascade output
+    StreamRead,              // Read from slave stream
+    StreamWrite,             // Write to master stream
     StreamWritePacketHeader, // Write packet header to master stream
-    DmaStart,               // Start DMA transfer
-    DmaWait,                // Wait for DMA completion
-    Halt,                   // Core termination (halt)
+    DmaStart,                // Start DMA transfer
+    DmaWait,                 // Wait for DMA completion
+    Halt,                    // Core termination (halt)
 
     // Hardware state reads
-    ReadCycleCounter,       // MOV_CNTR: read per-core cycle counter
+    ReadCycleCounter, // MOV_CNTR: read per-core cycle counter
 
     // Pointer operations
-    PointerAdd,  // Pointer arithmetic: ptr + offset
-    PointerMov,  // Pointer move: ptr = value
+    PointerAdd, // Pointer arithmetic: ptr + offset
+    PointerMov, // Pointer move: ptr = value
 
     // Target-specific intrinsic (needs name lookup)
-    Intrinsic(u32),  // Index into intrinsic name table
+    Intrinsic(u32), // Index into intrinsic name table
 }
 
 impl SemanticOp {
@@ -619,20 +614,23 @@ impl SemanticOp {
 
     /// Returns true if this is a commutative operation.
     pub fn is_commutative(&self) -> bool {
-        matches!(
-            self,
-            Self::Add | Self::Mul | Self::And | Self::Or | Self::Xor |
-            Self::SetEq | Self::SetNe
-        )
+        matches!(self, Self::Add | Self::Mul | Self::And | Self::Or | Self::Xor | Self::SetEq | Self::SetNe)
     }
 
     /// Returns true if this is a comparison operation.
     pub fn is_comparison(&self) -> bool {
         matches!(
             self,
-            Self::SetEq | Self::SetNe |
-            Self::SetLt | Self::SetLe | Self::SetGt | Self::SetGe |
-            Self::SetUlt | Self::SetUle | Self::SetUgt | Self::SetUge
+            Self::SetEq
+                | Self::SetNe
+                | Self::SetLt
+                | Self::SetLe
+                | Self::SetGt
+                | Self::SetGe
+                | Self::SetUlt
+                | Self::SetUle
+                | Self::SetUgt
+                | Self::SetUge
         )
     }
 }
@@ -1075,19 +1073,11 @@ mod tests {
         fields.insert("mRx".to_string(), 5);
 
         // Field reference without slice
-        let part = EncodingPart::FieldRef {
-            name: "mRx".to_string(),
-            high: None,
-            low: None,
-        };
+        let part = EncodingPart::FieldRef { name: "mRx".to_string(), high: None, low: None };
         assert_eq!(part.width(&fields), Some(5));
 
         // Field reference with slice
-        let part = EncodingPart::FieldRef {
-            name: "i".to_string(),
-            high: Some(10),
-            low: Some(6),
-        };
+        let part = EncodingPart::FieldRef { name: "i".to_string(), high: Some(10), low: Some(6) };
         assert_eq!(part.width(&fields), Some(5)); // 10-6+1 = 5
 
         // Literal
@@ -1110,33 +1100,14 @@ mod tests {
         let format = FormatClass {
             name: "AIE2_alu_r_rr_inst_alu".to_string(),
             parent: Some("AIE2_inst_alu_instr32".to_string()),
-            template_params: vec![TemplateParam {
-                name: "op".to_string(),
-                bits: 4,
-            }],
+            template_params: vec![TemplateParam { name: "op".to_string(), bits: 4 }],
             fields: fields.clone(),
             slot_field: Some("alu".to_string()),
             encoding: vec![
-                EncodingPart::FieldRef {
-                    name: "mRx0".to_string(),
-                    high: None,
-                    low: None,
-                },
-                EncodingPart::FieldRef {
-                    name: "mRx".to_string(),
-                    high: None,
-                    low: None,
-                },
-                EncodingPart::FieldRef {
-                    name: "mRy".to_string(),
-                    high: None,
-                    low: None,
-                },
-                EncodingPart::FieldRef {
-                    name: "op".to_string(),
-                    high: None,
-                    low: None,
-                },
+                EncodingPart::FieldRef { name: "mRx0".to_string(), high: None, low: None },
+                EncodingPart::FieldRef { name: "mRx".to_string(), high: None, low: None },
+                EncodingPart::FieldRef { name: "mRy".to_string(), high: None, low: None },
+                EncodingPart::FieldRef { name: "op".to_string(), high: None, low: None },
                 EncodingPart::Literal { value: 1, width: 1 },
             ],
             field_sources: HashMap::new(),
@@ -1164,16 +1135,8 @@ mod tests {
                 name: "mRx".to_string(),
             }],
             inputs: vec![
-                OperandDef {
-                    is_output: false,
-                    reg_class: "eR".to_string(),
-                    name: "mRx0".to_string(),
-                },
-                OperandDef {
-                    is_output: false,
-                    reg_class: "eR".to_string(),
-                    name: "mRy".to_string(),
-                },
+                OperandDef { is_output: false, reg_class: "eR".to_string(), name: "mRx0".to_string() },
+                OperandDef { is_output: false, reg_class: "eR".to_string(), name: "mRy".to_string() },
             ],
             implicit_regs: vec![],
             attributes: InstrAttributes {
@@ -1233,24 +1196,12 @@ mod tests {
     #[test]
     fn test_from_intrinsic_matmul_family() {
         // _mul_conf -> MatMul
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_I512_I512_acc64_mul_conf"),
-            Some(SemanticOp::MatMul)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_I512_I512_acc32_mul_conf"),
-            Some(SemanticOp::MatMul)
-        );
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_I512_I512_acc64_mul_conf"), Some(SemanticOp::MatMul));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_I512_I512_acc32_mul_conf"), Some(SemanticOp::MatMul));
         // _mac_conf -> Mac
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_I512_I512_acc64_mac_conf"),
-            Some(SemanticOp::Mac)
-        );
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_I512_I512_acc64_mac_conf"), Some(SemanticOp::Mac));
         // _msc_conf -> Mac
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_I512_I512_acc64_msc_conf"),
-            Some(SemanticOp::Mac)
-        );
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_I512_I512_acc64_msc_conf"), Some(SemanticOp::Mac));
         // _negmul_conf -> NegMatMul
         assert_eq!(
             SemanticOp::from_intrinsic("int_aie2_I512_I512_acc64_negmul_conf"),
@@ -1290,62 +1241,29 @@ mod tests {
 
     #[test]
     fn test_from_intrinsic_neg_conf() {
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_I512_neg_conf"),
-            Some(SemanticOp::Neg)
-        );
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_I512_neg_conf"), Some(SemanticOp::Neg));
     }
 
     #[test]
     fn test_from_intrinsic_ups_srs() {
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_acc32_v16_I256_ups"),
-            Some(SemanticOp::Ups)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_acc64_v16_I256_ups"),
-            Some(SemanticOp::Ups)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_I256_v16_acc32_srs"),
-            Some(SemanticOp::Srs)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_I256_v16_acc64_srs"),
-            Some(SemanticOp::Srs)
-        );
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_acc32_v16_I256_ups"), Some(SemanticOp::Ups));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_acc64_v16_I256_ups"), Some(SemanticOp::Ups));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_I256_v16_acc32_srs"), Some(SemanticOp::Srs));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_I256_v16_acc64_srs"), Some(SemanticOp::Srs));
     }
 
     #[test]
     fn test_from_intrinsic_vector_ops() {
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vshuffle"),
-            Some(SemanticOp::Shuffle)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vshuffle_bf16"),
-            Some(SemanticOp::Shuffle)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vbcst_shuffle_bf512"),
-            Some(SemanticOp::Shuffle)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vshift_I512_I512"),
-            Some(SemanticOp::Align)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vsel32"),
-            Some(SemanticOp::VectorSelect)
-        );
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vshuffle"), Some(SemanticOp::Shuffle));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vshuffle_bf16"), Some(SemanticOp::Shuffle));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vbcst_shuffle_bf512"), Some(SemanticOp::Shuffle));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vshift_I512_I512"), Some(SemanticOp::Align));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vsel32"), Some(SemanticOp::VectorSelect));
         assert_eq!(
             SemanticOp::from_intrinsic("int_aie2_vbroadcast_zero_acc1024"),
             Some(SemanticOp::VectorClear)
         );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vbroadcast32"),
-            Some(SemanticOp::VectorBroadcast)
-        );
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vbroadcast32"), Some(SemanticOp::VectorBroadcast));
         assert_eq!(
             SemanticOp::from_intrinsic("int_aie2_vextract_broadcast_I512"),
             Some(SemanticOp::VectorBroadcast)
@@ -1354,136 +1272,58 @@ mod tests {
             SemanticOp::from_intrinsic("int_aie2_vextract_elem32_I512"),
             Some(SemanticOp::VectorExtract)
         );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vinsert32"),
-            Some(SemanticOp::VectorInsert)
-        );
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vinsert32"), Some(SemanticOp::VectorInsert));
     }
 
     #[test]
     fn test_from_intrinsic_compound_ops() {
         // vaddsub ends with _conf, handled by the _conf suffix matcher
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vaddsub_conf"),
-            Some(SemanticOp::Add)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vaddsub16_conf"),
-            Some(SemanticOp::Add)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vmaxdiff_lt8"),
-            Some(SemanticOp::MaxDiffLt)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vsub_lt16"),
-            Some(SemanticOp::SubLt)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vsub_ge32"),
-            Some(SemanticOp::SubGe)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vmax_lt8"),
-            Some(SemanticOp::MaxLt)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vmin_ge16"),
-            Some(SemanticOp::MinGe)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_veqz32"),
-            Some(SemanticOp::SetEq)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vabs_gtz16"),
-            Some(SemanticOp::AbsGtz)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vneg_gtz32"),
-            Some(SemanticOp::NegGtz)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_vbneg_ltz16"),
-            Some(SemanticOp::NegLtz)
-        );
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vaddsub_conf"), Some(SemanticOp::Add));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vaddsub16_conf"), Some(SemanticOp::Add));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vmaxdiff_lt8"), Some(SemanticOp::MaxDiffLt));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vsub_lt16"), Some(SemanticOp::SubLt));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vsub_ge32"), Some(SemanticOp::SubGe));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vmax_lt8"), Some(SemanticOp::MaxLt));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vmin_ge16"), Some(SemanticOp::MinGe));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_veqz32"), Some(SemanticOp::SetEq));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vabs_gtz16"), Some(SemanticOp::AbsGtz));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vneg_gtz32"), Some(SemanticOp::NegGtz));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_vbneg_ltz16"), Some(SemanticOp::NegLtz));
     }
 
     #[test]
     fn test_from_intrinsic_conversion() {
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_v16int32_to_v16float"),
-            Some(SemanticOp::Convert)
-        );
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_v16int32_to_v16float"), Some(SemanticOp::Convert));
     }
 
     #[test]
     fn test_from_intrinsic_load_and_copy() {
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_load_4x16_lo"),
-            Some(SemanticOp::Load)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_load_4x32_hi"),
-            Some(SemanticOp::Load)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_upd_I512_I256"),
-            Some(SemanticOp::Copy)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_set_I512_I256"),
-            Some(SemanticOp::Copy)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_ext_I256_I512"),
-            Some(SemanticOp::Copy)
-        );
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_load_4x16_lo"), Some(SemanticOp::Load));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_load_4x32_hi"), Some(SemanticOp::Load));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_upd_I512_I256"), Some(SemanticOp::Copy));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_set_I512_I256"), Some(SemanticOp::Copy));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_ext_I256_I512"), Some(SemanticOp::Copy));
     }
 
     #[test]
     fn test_from_intrinsic_lock_ops() {
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_acquire"),
-            Some(SemanticOp::LockAcquire)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_acquire_cond"),
-            Some(SemanticOp::LockAcquire)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_release"),
-            Some(SemanticOp::LockRelease)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_release_cond"),
-            Some(SemanticOp::LockRelease)
-        );
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_acquire"), Some(SemanticOp::LockAcquire));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_acquire_cond"), Some(SemanticOp::LockAcquire));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_release"), Some(SemanticOp::LockRelease));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_release_cond"), Some(SemanticOp::LockRelease));
     }
 
     #[test]
     fn test_from_intrinsic_exact_matches() {
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_done"),
-            Some(SemanticOp::Done)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_event"),
-            Some(SemanticOp::Event)
-        );
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_clb"),
-            Some(SemanticOp::Clb)
-        );
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_done"), Some(SemanticOp::Done));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_event"), Some(SemanticOp::Event));
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_clb"), Some(SemanticOp::Clb));
     }
 
     #[test]
     fn test_from_intrinsic_bf_mul() {
         // BFloat16 multiply uses PatInaccessibleMem in the .td file
-        assert_eq!(
-            SemanticOp::from_intrinsic("int_aie2_bf_mul16_conf"),
-            Some(SemanticOp::MatMul)
-        );
+        assert_eq!(SemanticOp::from_intrinsic("int_aie2_bf_mul16_conf"), Some(SemanticOp::MatMul));
         assert_eq!(
             SemanticOp::from_intrinsic("int_aie2_I1024_I1024_ACC1024_accfloat_bf_mul_conf"),
             Some(SemanticOp::MatMul)

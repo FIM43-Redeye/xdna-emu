@@ -91,9 +91,7 @@ pub fn detect_mem_width_full(instr_name: &str, mnemonic: &str) -> InstrMemWidth 
     }
 
     let lower = mnemonic.to_lowercase();
-    if lower.starts_with("vlda") || lower.starts_with("vldb")
-        || lower.starts_with("vst")
-    {
+    if lower.starts_with("vlda") || lower.starts_with("vldb") || lower.starts_with("vst") {
         // Check for 128-bit variant before defaulting to 256-bit.
         if lower.contains(".128") || lower.contains("_128") {
             InstrMemWidth::QuadWord
@@ -209,26 +207,26 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> OperandType {
     // 1. Composite register operands (OP_* prefix from TableGen operand classes).
     // Lookup table mapping reg_class names to their CompositeEncoder variant.
     const COMPOSITE_LOOKUP: &[(&str, CompositeEncoder)] = &[
-        ("OP_mLdaScl",    CompositeEncoder::LdaScl),
-        ("OP_mSclSt",     CompositeEncoder::LdaScl),
-        ("OP_mSclMS",     CompositeEncoder::LdaScl),
-        ("OP_mLdbScl",    CompositeEncoder::LdaScl),
-        ("OP_mMvSclSrc",  CompositeEncoder::MvSclSrc),
-        ("OP_mMvSclDst",  CompositeEncoder::MvSclSrc),
-        ("OP_mMvSclDstCg",CompositeEncoder::MvSclSrc),
-        ("OP_mLdaCg",     CompositeEncoder::LdaCg),
-        ("OP_mLdbCg",     CompositeEncoder::LdaCg),
-        ("OP_mAluCg",     CompositeEncoder::AluCg),
+        ("OP_mLdaScl", CompositeEncoder::LdaScl),
+        ("OP_mSclSt", CompositeEncoder::LdaScl),
+        ("OP_mSclMS", CompositeEncoder::LdaScl),
+        ("OP_mLdbScl", CompositeEncoder::LdaScl),
+        ("OP_mMvSclSrc", CompositeEncoder::MvSclSrc),
+        ("OP_mMvSclDst", CompositeEncoder::MvSclSrc),
+        ("OP_mMvSclDstCg", CompositeEncoder::MvSclSrc),
+        ("OP_mLdaCg", CompositeEncoder::LdaCg),
+        ("OP_mLdbCg", CompositeEncoder::LdaCg),
+        ("OP_mAluCg", CompositeEncoder::AluCg),
         ("OP_mMvAMWQDst", CompositeEncoder::MvAMWQDst),
         ("OP_mMvAMWQSrc", CompositeEncoder::MvAMWQSrc),
-        ("OP_mMvBMXSrc",  CompositeEncoder::MvBMXSrc),
-        ("OP_mMvBMXDst",  CompositeEncoder::MvBMXDst),
-        ("OP_mMcdSrc",    CompositeEncoder::MvBMXDst),
-        ("OP_mScdDst",    CompositeEncoder::MvBMXDst),
-        ("OP_eRS4",       CompositeEncoder::ERS4),
-        ("OP_mShflDst",   CompositeEncoder::ShflDst),
-        ("OP_mWm_1",      CompositeEncoder::Wm1),
-        ("OP_mQXHLb",     CompositeEncoder::QXHLb),
+        ("OP_mMvBMXSrc", CompositeEncoder::MvBMXSrc),
+        ("OP_mMvBMXDst", CompositeEncoder::MvBMXDst),
+        ("OP_mMcdSrc", CompositeEncoder::MvBMXDst),
+        ("OP_mScdDst", CompositeEncoder::MvBMXDst),
+        ("OP_eRS4", CompositeEncoder::ERS4),
+        ("OP_mShflDst", CompositeEncoder::ShflDst),
+        ("OP_mWm_1", CompositeEncoder::Wm1),
+        ("OP_mQXHLb", CompositeEncoder::QXHLb),
     ];
     if let Some((_, encoder)) = COMPOSITE_LOOKUP.iter().find(|(name, _)| *name == reg_class) {
         return OperandType::CompositeRegister(*encoder);
@@ -258,9 +256,12 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> OperandType {
     if reg_class.starts_with("eY") {
         return OperandType::Register(RegisterKind::Vector1024);
     }
-    if reg_class.starts_with("eAM") || reg_class.starts_with("mAMm")
-        || reg_class.starts_with("eBM") || reg_class.starts_with("mBMm")
-        || reg_class.starts_with("eCM") || reg_class.starts_with("mBMS")
+    if reg_class.starts_with("eAM")
+        || reg_class.starts_with("mAMm")
+        || reg_class.starts_with("eBM")
+        || reg_class.starts_with("mBMm")
+        || reg_class.starts_with("eCM")
+        || reg_class.starts_with("mBMS")
     {
         return OperandType::Register(RegisterKind::Accumulator);
     }
@@ -382,42 +383,21 @@ mod tests {
     #[test]
     fn test_detect_addressing_mode() {
         // Post-modify immediate
-        assert_eq!(
-            detect_addressing_mode("LDA_dms_lda_pstm_nrm_imm"),
-            AddressingMode::PostModifyImmediate
-        );
-        assert_eq!(
-            detect_addressing_mode("ST_dms_st_pstm_nrm_imm"),
-            AddressingMode::PostModifyImmediate
-        );
+        assert_eq!(detect_addressing_mode("LDA_dms_lda_pstm_nrm_imm"), AddressingMode::PostModifyImmediate);
+        assert_eq!(detect_addressing_mode("ST_dms_st_pstm_nrm_imm"), AddressingMode::PostModifyImmediate);
 
         // Post-modify register
-        assert_eq!(
-            detect_addressing_mode("LDA_dms_lda_pstm_nrm"),
-            AddressingMode::PostModifyRegister
-        );
+        assert_eq!(detect_addressing_mode("LDA_dms_lda_pstm_nrm"), AddressingMode::PostModifyRegister);
 
         // Indexed immediate
-        assert_eq!(
-            detect_addressing_mode("LDA_S8_ag_idx_imm"),
-            AddressingMode::IndexedImmediate
-        );
-        assert_eq!(
-            detect_addressing_mode("LDA_dms_lda_idx_imm"),
-            AddressingMode::IndexedImmediate
-        );
+        assert_eq!(detect_addressing_mode("LDA_S8_ag_idx_imm"), AddressingMode::IndexedImmediate);
+        assert_eq!(detect_addressing_mode("LDA_dms_lda_idx_imm"), AddressingMode::IndexedImmediate);
 
         // Indexed register
-        assert_eq!(
-            detect_addressing_mode("LDA_dms_lda_idx"),
-            AddressingMode::IndexedRegister
-        );
+        assert_eq!(detect_addressing_mode("LDA_dms_lda_idx"), AddressingMode::IndexedRegister);
 
         // Unknown (non-memory instructions)
-        assert_eq!(
-            detect_addressing_mode("ADD_add_r_ri"),
-            AddressingMode::Unknown
-        );
+        assert_eq!(detect_addressing_mode("ADD_add_r_ri"), AddressingMode::Unknown);
     }
 
     #[test]
@@ -445,58 +425,22 @@ mod tests {
 
     #[test]
     fn test_classify_simple_registers() {
-        assert_eq!(
-            classify_operand_type("eR", "mRx"),
-            OperandType::Register(RegisterKind::Scalar)
-        );
-        assert_eq!(
-            classify_operand_type("eP", "ptr"),
-            OperandType::Register(RegisterKind::Pointer)
-        );
-        assert_eq!(
-            classify_operand_type("eM", "mod"),
-            OperandType::Register(RegisterKind::ModifierM)
-        );
-        assert_eq!(
-            classify_operand_type("eDN", "dn"),
-            OperandType::Register(RegisterKind::ModifierDN)
-        );
-        assert_eq!(
-            classify_operand_type("eDJ", "dj"),
-            OperandType::Register(RegisterKind::ModifierDJ)
-        );
-        assert_eq!(
-            classify_operand_type("eDC", "dc"),
-            OperandType::Register(RegisterKind::ModifierDC)
-        );
+        assert_eq!(classify_operand_type("eR", "mRx"), OperandType::Register(RegisterKind::Scalar));
+        assert_eq!(classify_operand_type("eP", "ptr"), OperandType::Register(RegisterKind::Pointer));
+        assert_eq!(classify_operand_type("eM", "mod"), OperandType::Register(RegisterKind::ModifierM));
+        assert_eq!(classify_operand_type("eDN", "dn"), OperandType::Register(RegisterKind::ModifierDN));
+        assert_eq!(classify_operand_type("eDJ", "dj"), OperandType::Register(RegisterKind::ModifierDJ));
+        assert_eq!(classify_operand_type("eDC", "dc"), OperandType::Register(RegisterKind::ModifierDC));
     }
 
     #[test]
     fn test_classify_vector_accumulator_registers() {
-        assert_eq!(
-            classify_operand_type("eWLE", "mW"),
-            OperandType::Register(RegisterKind::Vector256)
-        );
-        assert_eq!(
-            classify_operand_type("mWm", "mWm"),
-            OperandType::Register(RegisterKind::Vector256)
-        );
-        assert_eq!(
-            classify_operand_type("mXm", "mXm"),
-            OperandType::Register(RegisterKind::Vector512)
-        );
-        assert_eq!(
-            classify_operand_type("eAM", "mAM"),
-            OperandType::Register(RegisterKind::Accumulator)
-        );
-        assert_eq!(
-            classify_operand_type("mAMm", "mAMm"),
-            OperandType::Register(RegisterKind::Accumulator)
-        );
-        assert_eq!(
-            classify_operand_type("mBMm", "mBMm"),
-            OperandType::Register(RegisterKind::Accumulator)
-        );
+        assert_eq!(classify_operand_type("eWLE", "mW"), OperandType::Register(RegisterKind::Vector256));
+        assert_eq!(classify_operand_type("mWm", "mWm"), OperandType::Register(RegisterKind::Vector256));
+        assert_eq!(classify_operand_type("mXm", "mXm"), OperandType::Register(RegisterKind::Vector512));
+        assert_eq!(classify_operand_type("eAM", "mAM"), OperandType::Register(RegisterKind::Accumulator));
+        assert_eq!(classify_operand_type("mAMm", "mAMm"), OperandType::Register(RegisterKind::Accumulator));
+        assert_eq!(classify_operand_type("mBMm", "mBMm"), OperandType::Register(RegisterKind::Accumulator));
     }
 
     #[test]
@@ -529,10 +473,7 @@ mod tests {
 
     #[test]
     fn test_classify_immediates() {
-        assert_eq!(
-            classify_operand_type("simm7", "imm"),
-            OperandType::Immediate { signed: true, scale: 1 }
-        );
+        assert_eq!(classify_operand_type("simm7", "imm"), OperandType::Immediate { signed: true, scale: 1 });
         // AIE2 convention: imm* classes are signed (immx4, immx32, etc.)
         assert_eq!(
             classify_operand_type("imm12x4", "imm"),
@@ -542,10 +483,7 @@ mod tests {
             classify_operand_type("imm6x32", "imm"),
             OperandType::Immediate { signed: true, scale: 32 }
         );
-        assert_eq!(
-            classify_operand_type("imm5", "imm"),
-            OperandType::Immediate { signed: true, scale: 1 }
-        );
+        assert_eq!(classify_operand_type("imm5", "imm"), OperandType::Immediate { signed: true, scale: 1 });
         assert_eq!(
             classify_operand_type("addr20", "cpmaddr"),
             OperandType::Immediate { signed: false, scale: 1 }
@@ -562,14 +500,8 @@ mod tests {
         assert_eq!(classify_operand_type("simm6", "mLockId"), OperandType::LockId);
 
         // Constant fields from field name
-        assert_eq!(
-            classify_operand_type("", "c11s"),
-            OperandType::Immediate { signed: true, scale: 1 }
-        );
-        assert_eq!(
-            classify_operand_type("", "c5u"),
-            OperandType::Immediate { signed: false, scale: 1 }
-        );
+        assert_eq!(classify_operand_type("", "c11s"), OperandType::Immediate { signed: true, scale: 1 });
+        assert_eq!(classify_operand_type("", "c5u"), OperandType::Immediate { signed: false, scale: 1 });
 
         // Unknown fallback
         assert_eq!(classify_operand_type("", "unknown"), OperandType::Unknown);

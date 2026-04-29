@@ -30,13 +30,12 @@ mod operand_classification;
 mod semantic_inference;
 
 pub use operand_classification::{
-    AddressingMode, CompositeEncoder, InstrMemWidth, OperandType, RegisterKind,
-    classify_operand_type, detect_addressing_mode, detect_mem_width, detect_mem_width_full,
+    AddressingMode, CompositeEncoder, InstrMemWidth, OperandType, RegisterKind, classify_operand_type,
+    detect_addressing_mode, detect_mem_width, detect_mem_width_full,
 };
 pub use semantic_inference::{
-    infer_branch_condition, infer_dual_element_types, infer_element_type,
-    infer_select_variant, infer_semantic_from_structure,
-    refine_branch_semantic, refine_fused_semantic,
+    infer_branch_condition, infer_dual_element_types, infer_element_type, infer_select_variant,
+    infer_semantic_from_structure, refine_branch_semantic, refine_fused_semantic,
 };
 
 use std::collections::HashMap;
@@ -229,7 +228,6 @@ pub struct InstrEncoding {
     pub has_complete_decoder: bool,
 
     // ── Pre-resolved metadata (populated once at TableGen load time) ──
-
     /// Element type inferred from the mnemonic (e.g., "vadd_8" -> Int8).
     /// None for instructions that don't have an element type suffix.
     pub element_type: Option<ElementType>,
@@ -275,17 +273,11 @@ pub enum ResolveError {
     /// Slot not found
     SlotNotFound(String),
     /// Template parameter count mismatch
-    TemplateArgsMismatch {
-        expected: usize,
-        got: usize,
-    },
+    TemplateArgsMismatch { expected: usize, got: usize },
     /// Unknown field in encoding
     UnknownField(String),
     /// Encoding width mismatch
-    WidthMismatch {
-        expected: u8,
-        computed: u8,
-    },
+    WidthMismatch { expected: u8, computed: u8 },
 }
 
 impl std::fmt::Display for ResolveError {
@@ -325,11 +317,7 @@ impl<'a> Resolver<'a> {
     /// 1. The format class itself
     /// 2. Each mixin class used by the instruction
     /// 3. Parent classes of the mixin classes (inheritance chain)
-    fn merge_field_sources(
-        &self,
-        format: &FormatClass,
-        instr: &InstrDef,
-    ) -> HashMap<String, Vec<String>> {
+    fn merge_field_sources(&self, format: &FormatClass, instr: &InstrDef) -> HashMap<String, Vec<String>> {
         let mut merged = format.field_sources.clone();
 
         // Helper to collect field_sources from a mixin and its parent chain
@@ -362,7 +350,10 @@ impl<'a> Resolver<'a> {
     /// Resolve a single instruction definition to its encoding.
     pub fn resolve_instruction(&self, instr: &InstrDef) -> Result<InstrEncoding, ResolveError> {
         // Find the format class
-        let format = self.data.formats.get(&instr.format)
+        let format = self
+            .data
+            .formats
+            .get(&instr.format)
             .ok_or_else(|| ResolveError::FormatNotFound(instr.format.clone()))?;
 
         // Find the slot
@@ -395,22 +386,14 @@ impl<'a> Resolver<'a> {
         // Process encoding parts to compute masks and fields
         // Pass merged field_sources to trace derived fields back to source operands
         let (fixed_mask, fixed_bits, mut operand_fields) =
-            self.process_encoding(
-                &format.encoding,
-                &field_widths,
-                &template_values,
-                &merged_field_sources,
-            )?;
+            self.process_encoding(&format.encoding, &field_widths, &template_values, &merged_field_sources)?;
 
         // Populate operand_type on each field using OperandDef.reg_class
-        let all_operand_defs: Vec<&super::types::OperandDef> = instr.outputs.iter()
-            .chain(instr.inputs.iter())
-            .collect();
+        let all_operand_defs: Vec<&super::types::OperandDef> =
+            instr.outputs.iter().chain(instr.inputs.iter()).collect();
 
         for field in &mut operand_fields {
-            if let Some(opdef) = all_operand_defs.iter()
-                .find(|od| od.name == field.name)
-            {
+            if let Some(opdef) = all_operand_defs.iter().find(|od| od.name == field.name) {
                 field.operand_type = classify_operand_type(&opdef.reg_class, &field.name);
                 field.is_output = opdef.is_output;
             } else {
@@ -432,14 +415,20 @@ impl<'a> Resolver<'a> {
         // entries for (they're selected in C++, not TableGen patterns).
         let defs_vec: Vec<String> = instr.attributes.defs.iter().cloned().collect();
         let uses_vec: Vec<String> = instr.attributes.uses.iter().cloned().collect();
-        let semantic = self.data.semantic_for_instruction(&instr.name)
+        let semantic = self
+            .data
+            .semantic_for_instruction(&instr.name)
             .map(|p| p.operation)
-            .or_else(|| infer_semantic_from_structure(
-                &defs_vec, &uses_vec,
-                instr.attributes.may_load, instr.attributes.may_store,
-                false, // regex parser doesn't extract hasDelaySlot
-                &[],   // regex parser doesn't have parent class chain
-            ));
+            .or_else(|| {
+                infer_semantic_from_structure(
+                    &defs_vec,
+                    &uses_vec,
+                    instr.attributes.may_load,
+                    instr.attributes.may_store,
+                    false, // regex parser doesn't extract hasDelaySlot
+                    &[],   // regex parser doesn't have parent class chain
+                )
+            });
 
         // Refine Br -> BrCond for conditional branches
         let semantic = refine_branch_semantic(&instr.mnemonic, semantic);
@@ -496,17 +485,16 @@ impl<'a> Resolver<'a> {
 
     /// Resolve all instructions in the TableGen data.
     pub fn resolve_all(&self) -> Vec<Result<InstrEncoding, ResolveError>> {
-        self.data.instructions.values()
+        self.data
+            .instructions
+            .values()
             .map(|instr| self.resolve_instruction(instr))
             .collect()
     }
 
     /// Resolve all instructions, filtering out errors.
     pub fn resolve_all_ok(&self) -> Vec<InstrEncoding> {
-        self.resolve_all()
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect()
+        self.resolve_all().into_iter().filter_map(|r| r.ok()).collect()
     }
 
     /// Resolve all instructions and group by slot.
@@ -514,9 +502,7 @@ impl<'a> Resolver<'a> {
         let mut by_slot: HashMap<String, Vec<InstrEncoding>> = HashMap::new();
 
         for encoding in self.resolve_all_ok() {
-            by_slot.entry(encoding.slot.clone())
-                .or_default()
-                .push(encoding);
+            by_slot.entry(encoding.slot.clone()).or_default().push(encoding);
         }
 
         by_slot
@@ -559,7 +545,8 @@ impl<'a> Resolver<'a> {
         // First, compute total width
         let mut total_width: u8 = 0;
         for part in parts {
-            let width = part.width(field_widths)
+            let width = part
+                .width(field_widths)
                 .ok_or_else(|| ResolveError::UnknownField(format!("{:?}", part)))?;
             total_width = total_width.saturating_add(width);
         }
@@ -640,9 +627,8 @@ impl<'a> Resolver<'a> {
                                 // fragment. The logical field width is in field_widths.
                                 // First fragment covers the MSB, so target_bit =
                                 // total_logical_width - existing.width.
-                                let logical_width = field_widths.get(name)
-                                    .copied()
-                                    .unwrap_or(existing.width + w);
+                                let logical_width =
+                                    field_widths.get(name).copied().unwrap_or(existing.width + w);
                                 let first_target = logical_width.saturating_sub(existing.width);
                                 existing.fragments.push(FieldFragment {
                                     inst_bit: existing.bit_position,
@@ -718,16 +704,10 @@ impl SlotIndex {
     ) -> Self {
         let slot_name = slot_name.into();
 
-        let by_name: HashMap<String, InstrEncoding> = encodings
-            .into_iter()
-            .map(|e| (e.name.clone(), e))
-            .collect();
+        let by_name: HashMap<String, InstrEncoding> =
+            encodings.into_iter().map(|e| (e.name.clone(), e)).collect();
 
-        Self {
-            slot_name,
-            by_name,
-            decoder_table,
-        }
+        Self { slot_name, by_name, decoder_table }
     }
 
     /// Decode a word using LLVM's disassembler (via FFI) with bytecode fallback.
@@ -893,13 +873,16 @@ mod tests {
         let mut data = TableGenData::new();
 
         // Add ALU slot
-        data.slots.insert("alu_slot".to_string(), SlotDef {
-            name: "alu_slot".to_string(),
-            display_name: "Alu".to_string(),
-            bits: 20,
-            field: "alu".to_string(),
-            artificial: false,
-        });
+        data.slots.insert(
+            "alu_slot".to_string(),
+            SlotDef {
+                name: "alu_slot".to_string(),
+                display_name: "Alu".to_string(),
+                bits: 20,
+                field: "alu".to_string(),
+                artificial: false,
+            },
+        );
 
         // Add format class: ALU r,r,r format
         // Encoding: {mRx0[4:0], mRx[4:0], mRy[4:0], op[3:0], 0b1}
@@ -909,64 +892,65 @@ mod tests {
         fields.insert("mRx".to_string(), 5);
         fields.insert("mRy".to_string(), 5);
 
-        data.formats.insert("AIE2_alu_r_rr_inst_alu".to_string(), FormatClass {
-            name: "AIE2_alu_r_rr_inst_alu".to_string(),
-            parent: Some("AIE2_inst_alu_instr32".to_string()),
-            template_params: vec![TemplateParam { name: "op".to_string(), bits: 4 }],
-            fields,
-            slot_field: Some("alu".to_string()),
-            encoding: vec![
-                EncodingPart::FieldRef { name: "mRx0".to_string(), high: None, low: None },
-                EncodingPart::FieldRef { name: "mRx".to_string(), high: None, low: None },
-                EncodingPart::FieldRef { name: "mRy".to_string(), high: None, low: None },
-                EncodingPart::FieldRef { name: "op".to_string(), high: None, low: None },
-                EncodingPart::Literal { value: 0b1, width: 1 },
-            ],
-            field_sources: HashMap::new(),
-        });
+        data.formats.insert(
+            "AIE2_alu_r_rr_inst_alu".to_string(),
+            FormatClass {
+                name: "AIE2_alu_r_rr_inst_alu".to_string(),
+                parent: Some("AIE2_inst_alu_instr32".to_string()),
+                template_params: vec![TemplateParam { name: "op".to_string(), bits: 4 }],
+                fields,
+                slot_field: Some("alu".to_string()),
+                encoding: vec![
+                    EncodingPart::FieldRef { name: "mRx0".to_string(), high: None, low: None },
+                    EncodingPart::FieldRef { name: "mRx".to_string(), high: None, low: None },
+                    EncodingPart::FieldRef { name: "mRy".to_string(), high: None, low: None },
+                    EncodingPart::FieldRef { name: "op".to_string(), high: None, low: None },
+                    EncodingPart::Literal { value: 0b1, width: 1 },
+                ],
+                field_sources: HashMap::new(),
+            },
+        );
 
         // Add ADD instruction: op = 0b0000
-        data.instructions.insert("ADD".to_string(), InstrDef {
-            name: "ADD".to_string(),
-            format: "AIE2_alu_r_rr_inst_alu".to_string(),
-            mixin_classes: vec![],
-            template_args: vec![0b0000],
-            mnemonic: "add".to_string(),
-            asm_string: "$mRx, $mRx0, $mRy".to_string(),
-            outputs: vec![OperandDef {
-                is_output: true,
-                reg_class: "eR".to_string(),
-                name: "mRx".to_string(),
-            }],
-            inputs: vec![
-                OperandDef {
-                    is_output: false,
+        data.instructions.insert(
+            "ADD".to_string(),
+            InstrDef {
+                name: "ADD".to_string(),
+                format: "AIE2_alu_r_rr_inst_alu".to_string(),
+                mixin_classes: vec![],
+                template_args: vec![0b0000],
+                mnemonic: "add".to_string(),
+                asm_string: "$mRx, $mRx0, $mRy".to_string(),
+                outputs: vec![OperandDef {
+                    is_output: true,
                     reg_class: "eR".to_string(),
-                    name: "mRx0".to_string(),
-                },
-                OperandDef {
-                    is_output: false,
-                    reg_class: "eR".to_string(),
-                    name: "mRy".to_string(),
-                },
-            ],
-            implicit_regs: vec![],
-            attributes: InstrAttributes::default(),
-        });
+                    name: "mRx".to_string(),
+                }],
+                inputs: vec![
+                    OperandDef { is_output: false, reg_class: "eR".to_string(), name: "mRx0".to_string() },
+                    OperandDef { is_output: false, reg_class: "eR".to_string(), name: "mRy".to_string() },
+                ],
+                implicit_regs: vec![],
+                attributes: InstrAttributes::default(),
+            },
+        );
 
         // Add SUB instruction: op = 0b0001
-        data.instructions.insert("SUB".to_string(), InstrDef {
-            name: "SUB".to_string(),
-            format: "AIE2_alu_r_rr_inst_alu".to_string(),
-            mixin_classes: vec![],
-            template_args: vec![0b0001],
-            mnemonic: "sub".to_string(),
-            asm_string: "$mRx, $mRx0, $mRy".to_string(),
-            outputs: vec![],
-            inputs: vec![],
-            implicit_regs: vec![],
-            attributes: InstrAttributes::default(),
-        });
+        data.instructions.insert(
+            "SUB".to_string(),
+            InstrDef {
+                name: "SUB".to_string(),
+                format: "AIE2_alu_r_rr_inst_alu".to_string(),
+                mixin_classes: vec![],
+                template_args: vec![0b0001],
+                mnemonic: "sub".to_string(),
+                asm_string: "$mRx, $mRx0, $mRy".to_string(),
+                outputs: vec![],
+                inputs: vec![],
+                implicit_regs: vec![],
+                attributes: InstrAttributes::default(),
+            },
+        );
 
         data
     }
@@ -1148,7 +1132,6 @@ mod tests {
         assert_eq!(encoding.output_order, vec!["mRx"]);
     }
 
-
     #[test]
     fn test_operand_type_populated_on_resolve() {
         // Verify that resolve_instruction populates operand_type and is_output on fields
@@ -1178,5 +1161,4 @@ mod tests {
             );
         }
     }
-
 }

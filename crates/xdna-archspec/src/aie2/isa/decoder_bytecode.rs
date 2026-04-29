@@ -138,10 +138,7 @@ impl DecoderTable {
                 }
 
                 _ => {
-                    eprintln!(
-                        "[UNKNOWN OPCODE] {} at offset {} (insn=0x{:X})",
-                        opcode, ptr - 1, insn_bits
-                    );
+                    eprintln!("[UNKNOWN OPCODE] {} at offset {} (insn=0x{:X})", opcode, ptr - 1, insn_bits);
                     return None;
                 }
             }
@@ -241,12 +238,8 @@ mod tests {
 
     #[test]
     fn test_simple_decode() {
-        let bytes = vec![
-            opc::EXTRACT_FIELD, 0, 2,
-            opc::FILTER_VALUE, 1, 4, 0, 0,
-            opc::DECODE, 42, 0,
-            opc::FAIL,
-        ];
+        let bytes =
+            vec![opc::EXTRACT_FIELD, 0, 2, opc::FILTER_VALUE, 1, 4, 0, 0, opc::DECODE, 42, 0, opc::FAIL];
 
         let mut names = HashMap::new();
         names.insert(42, "TEST_INSTR".to_string());
@@ -259,11 +252,7 @@ mod tests {
 
     #[test]
     fn test_try_decode_fallthrough() {
-        let bytes = vec![
-            opc::TRY_DECODE, 42, 0, 0, 0, 0,
-            opc::DECODE, 99, 0,
-            opc::FAIL,
-        ];
+        let bytes = vec![opc::TRY_DECODE, 42, 0, 0, 0, 0, opc::DECODE, 99, 0, opc::FAIL];
 
         let mut names = HashMap::new();
         names.insert(99, "FALLBACK".to_string());
@@ -274,11 +263,7 @@ mod tests {
 
     #[test]
     fn test_check_field() {
-        let bytes = vec![
-            opc::CHECK_FIELD, 4, 2, 3, 4, 0, 0,
-            opc::DECODE, 10, 0,
-            opc::FAIL,
-        ];
+        let bytes = vec![opc::CHECK_FIELD, 4, 2, 3, 4, 0, 0, opc::DECODE, 10, 0, opc::FAIL];
 
         let mut names = HashMap::new();
         names.insert(10, "MATCHED".to_string());

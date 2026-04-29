@@ -31,13 +31,27 @@ pub struct Aie2DmaModel;
 pub static AIE2_DMA_MODEL: Aie2DmaModel = Aie2DmaModel;
 
 impl DmaModel for Aie2DmaModel {
-    fn supports_task_queue(&self) -> bool { true }
-    fn supports_ooo_mode(&self) -> bool { true }
-    fn supports_compression(&self) -> bool { true }
-    fn supports_bd_iteration(&self) -> bool { true }
-    fn supports_independent_lock_ids(&self) -> bool { true }
-    fn supports_interleave_mode(&self) -> bool { false }
-    fn supports_double_buffer(&self) -> bool { false }
+    fn supports_task_queue(&self) -> bool {
+        true
+    }
+    fn supports_ooo_mode(&self) -> bool {
+        true
+    }
+    fn supports_compression(&self) -> bool {
+        true
+    }
+    fn supports_bd_iteration(&self) -> bool {
+        true
+    }
+    fn supports_independent_lock_ids(&self) -> bool {
+        true
+    }
+    fn supports_interleave_mode(&self) -> bool {
+        false
+    }
+    fn supports_double_buffer(&self) -> bool {
+        false
+    }
 
     fn max_tensor_dims(&self, tile: TileKind) -> u8 {
         match tile {

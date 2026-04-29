@@ -57,7 +57,7 @@ pub struct UpsMode {
 /// the aietools Python model.
 pub fn ups_mode(scale: UpsScale, acc: UpsAccMode) -> UpsMode {
     match (scale, acc) {
-        (UpsScale::Half, UpsAccMode::Acc32) => UpsMode { lanes: 32, bits_in: 8,  bits_out: 32 },
+        (UpsScale::Half, UpsAccMode::Acc32) => UpsMode { lanes: 32, bits_in: 8, bits_out: 32 },
         (UpsScale::Full, UpsAccMode::Acc32) => UpsMode { lanes: 32, bits_in: 16, bits_out: 32 },
         (UpsScale::Half, UpsAccMode::Acc64) => UpsMode { lanes: 16, bits_in: 16, bits_out: 64 },
         (UpsScale::Full, UpsAccMode::Acc64) => UpsMode { lanes: 16, bits_in: 32, bits_out: 64 },
@@ -74,7 +74,7 @@ mod tests {
     #[test]
     fn ups_mode_table_all_four_entries() {
         let cases = [
-            (UpsScale::Half, UpsAccMode::Acc32, UpsMode { lanes: 32, bits_in: 8,  bits_out: 32 }),
+            (UpsScale::Half, UpsAccMode::Acc32, UpsMode { lanes: 32, bits_in: 8, bits_out: 32 }),
             (UpsScale::Full, UpsAccMode::Acc32, UpsMode { lanes: 32, bits_in: 16, bits_out: 32 }),
             (UpsScale::Half, UpsAccMode::Acc64, UpsMode { lanes: 16, bits_in: 16, bits_out: 64 }),
             (UpsScale::Full, UpsAccMode::Acc64, UpsMode { lanes: 16, bits_in: 32, bits_out: 64 }),
