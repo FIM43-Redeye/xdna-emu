@@ -31,5 +31,12 @@ array_width = 100
 # Allow single-line attribute-like attributes (similar threshold to fn_call_width).
 attr_fn_like_width = 100
 
+# Note: rustfmt 1.8 prints a misleading "cannot exceed max_width" warning
+# for the three options above on every `cargo fmt` invocation, even though
+# 100 < 110. The warning is wrong; the values ARE respected (verified via
+# drift comparison: setting them produces different output than leaving
+# them unset, which would default to 60). The pre-commit hook suppresses
+# the warnings via 2>/dev/null; interactive `cargo fmt` runs surface them.
+
 # Keep derives merged. Project already writes merged derives consistently.
 merge_derives = true

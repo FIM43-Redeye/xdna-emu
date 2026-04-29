@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Pre-commit hook: enforce rustfmt on staged Rust changes.
+#
+# Activation (one-time per checkout):
+#     git config core.hooksPath scripts/git-hooks
+#
+# To bypass for a single commit (use sparingly):
+#     git commit --no-verify
+#
+# This hook runs `cargo fmt --check` over the whole workspace. If any
+# file has drift from the project's `rustfmt.toml`, the commit is
+# blocked with an actionable message. Cost: ~1-2s on warm cache.
+
+set -e
+
+# Skip if there are no staged *.rs changes -- saves ~1s on non-Rust
+# commits (e.g., docs-only edits).
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '\.rs$'; then
+    exit 0
+fi
+
+# Run from repo root regardless of where `git commit` was invoked from.
+cd "$(git rev-parse --show-toplevel)"
+
+if ! cargo fmt --check 2>/dev/null; then
+    echo "" >&2
+    echo "pre-commit: rustfmt drift detected." >&2
+    echo "  Fix locally:    cargo fmt && git add -u" >&2
+    echo "  Bypass (rare):  git commit --no-verify" >&2
+    echo "" >&2
+    exit 1
+fi
+
+exit 0

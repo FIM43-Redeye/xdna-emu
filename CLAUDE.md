@@ -614,18 +614,24 @@ The codebase is **fully fmt'd** as of the Path B convergence sprint
    on any `.rs` file Claude edits (via `.claude/hooks/rustfmt-edited.sh`,
    which uses stdin mode to avoid module recursion).
 2. **Editor format-on-save** handles the same role for human edits.
-3. **Pre-commit hook + CI** (TODO -- to be added now that convergence
-   is complete): `cargo fmt --check` blocks commits on drift.
+3. **Pre-commit hook** at `scripts/git-hooks/pre-commit`. Runs
+   `cargo fmt --check` on commits that touch `*.rs`. Blocks the
+   commit on drift with an actionable message.
+4. **CI check** (TODO -- no CI workflow yet): once added, run
+   `cargo fmt --check` as a required step.
 
-**One-time local setup per checkout:**
+**One-time local setup per checkout (two configs):**
 
 ```bash
+git config core.hooksPath scripts/git-hooks
 git config blame.ignoreRevsFile .git-blame-ignore-revs
 ```
 
-This makes `git blame` skip the chunked `cargo fmt` commits listed in
+The first activates the pre-commit hook. The second makes `git blame`
+skip the chunked `cargo fmt` commits listed in
 `.git-blame-ignore-revs` and attribute lines to the original content
-author. GitHub honors the file automatically; no per-user setup there.
+author. GitHub honors the blame-revs file automatically; no per-user
+setup there.
 
 **Don't run `cargo fmt` repo-wide in one commit.** Even now that
 everything's clean, future bulk reformats (e.g., from a config tweak)
