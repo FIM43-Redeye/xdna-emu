@@ -534,7 +534,7 @@ def test_sweep_lockstep_writes_manifest_on_patch_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(_mod, "ParseSession", StubParser)
 
     tiles = [TileSpec(col=0, row=2, tile_type="core")]
-    with pytest.raises(RuntimeError, match="sweep_lockstep failed"):
+    with pytest.raises(RuntimeError, match="sweep_lockstep failed") as excinfo:
         _mod.sweep_lockstep(
             test_name="fake",
             compiler="chess",
@@ -558,3 +558,110 @@ def test_sweep_lockstep_writes_manifest_on_patch_failure(tmp_path, monkeypatch):
     # mode2_baseline_captured must be False because the sweep didn't
     # reach the mode-2 stage.
     assert manifest["mode2_baseline_captured"] is False
+    # Traceback chain: the original CalledProcessError must be the
+    # __cause__ of the wrapper RuntimeError so debuggers and pytest -v
+    # can navigate to the actual subprocess failure site, not just the
+    # re-raise statement.
+    assert excinfo.value.__cause__ is not None
+    assert isinstance(excinfo.value.__cause__, _sp.CalledProcessError)
+
+
+# ---------------------------------------------------------------------------
+# Grounding / sweep overlap: when --core-sweep contains a grounding-set
+# event, it must NOT also appear in the per-batch sweep tail. Cursor's
+# sweep list is the source of truth, so we test the cursor build path
+# by invoking sweep_lockstep with a sweep filter that overlaps grounding
+# and inspecting the patch spec the patcher subprocess receives.
+# ---------------------------------------------------------------------------
+
+def test_sweep_lockstep_excludes_grounding_from_sweep_filter(tmp_path, monkeypatch):
+    """If --core-sweep contains an event that is also a grounding event,
+    that event must appear exactly once -- in its grounding slot, not
+    in the sweep tail."""
+    TileSpec = _mod.TileSpec
+    EventDef = _mod.EventDef
+    build_dir, out_dir, _ = _make_min_lockstep_env(tmp_path)
+
+    # Event table: 4 events, two of which (PERF_CNT_0, INSTR_EVENT_0)
+    # are also in the grounding set.
+    monkeypatch.setattr(_mod, "load_events", lambda tt: [
+        EventDef(name="PERF_CNT_0",    id=1),
+        EventDef(name="INSTR_EVENT_0", id=2),
+        EventDef(name="INSTR_EVENT_1", id=3),
+        EventDef(name="INSTR_VECTOR",  id=4),
+    ])
+    monkeypatch.setattr(_mod, "discover_test_config",
+                        lambda name: _mod.TestConfig(insts_name="insts.bin", ctrlpkt_name=None))
+
+    # Capture every patch-spec JSON the patcher subprocess receives so
+    # we can inspect what the cursor produced after grounding exclusion.
+    patcher_specs: list[list] = []
+
+    def fake_run(cmd, **kwargs):
+        # cmd shape: [python, PATCH_TOOL, insts, "--multi-tile", spec_path, "--output", out]
+        # Only intercept patcher invocations.
+        if isinstance(cmd, list) and "--multi-tile" in cmd:
+            spec_path = cmd[cmd.index("--multi-tile") + 1]
+            patcher_specs.append(json.loads(Path(spec_path).read_text()))
+        m = MagicMock(); m.returncode = 0; return m
+
+    monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+    class StubRunner:
+        def __init__(self, *a, **kw): pass
+        def run_one(self, **kw):
+            Path(kw["trace_out"]).parent.mkdir(parents=True, exist_ok=True)
+            Path(kw["trace_out"]).write_bytes(b"\x00")
+            return {"ok": True}
+        def close(self): pass
+
+    class StubParser:
+        def __init__(self, *a, **kw): pass
+        def parse_one(self, **kw):
+            if "out_events" in kw:
+                Path(kw["out_events"]).parent.mkdir(parents=True, exist_ok=True)
+                Path(kw["out_events"]).write_text(json.dumps({"events": []}))
+            return {"ok": True, "events_count": 0, "cycles": 0, "empty": True}
+        def close(self): pass
+
+    monkeypatch.setattr(_mod, "RunnerSession", StubRunner)
+    monkeypatch.setattr(_mod, "ParseSession", StubParser)
+
+    tiles = [TileSpec(col=0, row=2, tile_type="core")]
+    _mod.sweep_lockstep(
+        test_name="fake",
+        compiler="chess",
+        tiles=tiles,
+        build_dir=build_dir,
+        out_dir=out_dir,
+        run_hw=True,
+        run_emu=False,
+        mode="event_pc",
+        # Grounding includes PERF_CNT_0 and INSTR_EVENT_0; sweep filter
+        # also includes them PLUS the truly-swept INSTR_VECTOR.
+        core_grounding=["PERF_CNT_0", "INSTR_EVENT_0", "INSTR_EVENT_1"],
+        core_sweep=["PERF_CNT_0", "INSTR_EVENT_0", "INSTR_VECTOR"],
+        with_mode2_baseline=False,
+    )
+
+    # We expect exactly one mode-1 batch since only INSTR_VECTOR (id=4)
+    # remains in the sweep after grounding exclusion. That fits in
+    # remaining=5 slots, so n_batches=1.
+    mode1_specs = [s for s in patcher_specs
+                   if any(entry.get("mode", 0) == 1 for entry in s)]
+    assert len(mode1_specs) >= 1
+    core_entry = mode1_specs[0][0]
+    # Slot layout: [PERF_CNT_0=1, INSTR_EVENT_0=2, INSTR_EVENT_1=3,
+    #               INSTR_VECTOR=4, 0, 0, 0, 0]
+    # If grounding exclusion was missing, slot 3 would be PERF_CNT_0
+    # again (duplicate) and INSTR_VECTOR would be pushed off the end.
+    events = core_entry["events"]
+    assert events.count(1) == 1, (  # PERF_CNT_0 exactly once
+        f"PERF_CNT_0 (id=1) appears more than once in slots: {events}"
+    )
+    assert events.count(2) == 1, (  # INSTR_EVENT_0 exactly once
+        f"INSTR_EVENT_0 (id=2) appears more than once in slots: {events}"
+    )
+    assert 4 in events, (  # INSTR_VECTOR survives the grounding exclusion
+        f"INSTR_VECTOR (id=4) missing from slots: {events}"
+    )

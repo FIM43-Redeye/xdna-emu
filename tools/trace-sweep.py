@@ -1577,8 +1577,14 @@ def sweep_lockstep(
         remaining = max(1, 8 - len(grounding))
         sweep_filter = sweep_filter_by_type.get(tt)
         ev_names_all = [e.name for e in all_events_by_type.get(tt, [])]
+        # Always exclude grounding events from the sweep list. Grounding
+        # events occupy fixed leading slots in every batch; allowing them
+        # to also land in the sweep tail would emit them twice in
+        # _build_lockstep_patch_spec, and the `(event_ids + [0]*8)[:8]`
+        # truncation would silently drop sweep slots off the end.
         if sweep_filter is not None:
-            sweep_names = [n for n in ev_names_all if n in sweep_filter]
+            sweep_names = [n for n in ev_names_all
+                           if n in sweep_filter and n not in grounding]
         else:
             sweep_names = [n for n in ev_names_all if n not in grounding]
         cursor_key = f"{tt}_{tile.col}_{tile.row}"
@@ -1643,6 +1649,7 @@ def sweep_lockstep(
     mode2_succeeded = False
     completed_batches = 0
     sweep_error: Optional[str] = None
+    sweep_exc_obj: Optional[BaseException] = None
 
     try:
         for b_idx, batch_assignment in enumerate(batches):
@@ -1716,6 +1723,14 @@ def sweep_lockstep(
         if with_mode2_baseline and run_hw and hw_session is not None:
             compute_tiles = [t for t in tiles if t.tile_type == "core"]
             if compute_tiles:
+                # No "events" key on purpose: trace-patch-events.py's
+                # multi-tile mode treats absent "events" as "skip the
+                # event-slot patch for this entry," and mode-2
+                # (inst_exec) ignores Trace_Event registers anyway --
+                # the per-instruction stream comes from the core, not
+                # from the event-slot configuration. Leaving the slots
+                # at whatever the last mode-1 batch wrote keeps the
+                # patcher diff minimal.
                 mode2_spec = [
                     {"col": t.col, "row": t.row, "tile_type": "core", "mode": 2}
                     for t in compute_tiles
@@ -1761,8 +1776,11 @@ def sweep_lockstep(
         # Sweep raised partway through. Record the failure but do NOT
         # re-raise here -- we need the cleanup + manifest write to land
         # before propagating. The exception is captured in sweep_error
-        # and re-raised from the trailing block below.
+        # for the manifest, and the original is preserved in
+        # sweep_exc_obj so the trailing block can `raise ... from` it
+        # and keep the original traceback discoverable.
         sweep_error = f"{type(e).__name__}: {e}"
+        sweep_exc_obj = e
         print(f"[sweep-lockstep] sweep raised: {sweep_error}", flush=True)
     finally:
         if hw_session is not None:
@@ -1826,9 +1844,14 @@ def sweep_lockstep(
         print(f"[sweep-lockstep] manifest WRITE FAILED: {e}", flush=True)
 
     # If the sweep itself raised, propagate now so the caller still sees
-    # the failure even though the manifest landed.
+    # the failure even though the manifest landed. Use `raise ... from`
+    # so the original traceback is preserved and the failure site (the
+    # subprocess call deep in batch N) stays visible to debuggers and
+    # pytest -v output.
     if sweep_error is not None:
-        raise RuntimeError(f"sweep_lockstep failed: {sweep_error}")
+        raise RuntimeError(
+            f"sweep_lockstep failed: {sweep_error}"
+        ) from sweep_exc_obj
 
 
 def sweep(
@@ -2027,6 +2050,33 @@ def main() -> int:
             )
             print(f"[sweep-lockstep] manifest: {args.out_dir}/sweep-manifest.json")
         else:
+            # Symmetric to the lockstep path's --ground-event warning:
+            # if a user passes lockstep-only flags (--core-grounding,
+            # --core-sweep, etc.) but the routing landed on sweep_multi
+            # because --mode is event_time and tiles are same-type, the
+            # flags are silently ignored. Warn once so the typo is caught.
+            _lockstep_only_set = (
+                args.core_grounding != "PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1"
+                or args.memmod_grounding != "PERF_CNT_0"
+                or args.memtile_grounding != "PERF_CNT_0"
+                or args.shim_grounding != "PERF_CNT_0"
+                or args.core_sweep != "all"
+                or args.memmod_sweep != "all"
+                or args.memtile_sweep != "all"
+                or args.shim_sweep != "all"
+            )
+            if _lockstep_only_set:
+                print(
+                    "[sweep-multi] warning: lockstep-only flags "
+                    "(--core-grounding / --memmod-grounding / "
+                    "--memtile-grounding / --shim-grounding / "
+                    "--core-sweep / --memmod-sweep / --memtile-sweep / "
+                    "--shim-sweep) ignored on the sweep_multi path; "
+                    "pass --mode event_pc or use mixed-type --tiles to "
+                    "route to the lockstep sweep, or use --ground-event "
+                    "for sweep_multi grounding",
+                    file=sys.stderr,
+                )
             summaries = sweep_multi(
                 test_name=args.test, compiler=args.compiler,
                 tiles=tiles, build_dir=build_dir, out_dir=args.out_dir,
