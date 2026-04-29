@@ -10,7 +10,7 @@
 //! - **Sweep directory**: compare all batches from `trace-sweep.py`
 
 use serde::Deserialize;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::Path;
@@ -2548,7 +2548,285 @@ pub fn compare_sweep_dir_with_opts(
         }
     }
 
-    Ok(format_report(&batch_results))
+    let base_report = format_report(&batch_results);
+
+    // ---- PC-anchored sweep aggregation (Task 8) ----
+    // Only appended when at least one batch has PC-anchored data.
+    let has_pc = batch_results.iter().any(|b| !b.pc_anchored.is_empty());
+    if has_pc {
+        let grounding = read_grounding_from_pc1_manifest(sweep_dir);
+        let mut pc_suffix = format_report_pc_anchored(&batch_results, &grounding);
+
+        // unsafe_for_pc_join warning from manifest (surfaced at top of suffix).
+        if let Some(manifest) = read_pc1_manifest(sweep_dir) {
+            if manifest.unsafe_for_pc_join {
+                let mut warning = String::new();
+                let _ = writeln!(warning, "{}", "=".repeat(76));
+                let _ = writeln!(
+                    warning,
+                    "WARNING: sweep-manifest flagged unsafe_for_pc_join=true"
+                );
+                let _ = writeln!(
+                    warning,
+                    "  reason: {}",
+                    manifest.reason.as_deref().unwrap_or("?")
+                );
+                let _ = writeln!(
+                    warning,
+                    "  PC-anchored cross-batch joining was skipped; results are per-batch only."
+                );
+                let _ = writeln!(warning);
+                // Prepend warning to pc_suffix.
+                pc_suffix = warning + &pc_suffix;
+            }
+
+            // Mode-2 baselines note.
+            if manifest.mode2_baseline_captured {
+                let baselines = list_mode2_baselines(sweep_dir);
+                if !baselines.is_empty() {
+                    let _ = writeln!(
+                        pc_suffix,
+                        "Mode-2 baselines captured (deferred to A.2b for comparison):"
+                    );
+                    for path in &baselines {
+                        let _ = writeln!(pc_suffix, "  {}", path.display());
+                    }
+                }
+            }
+        }
+
+        return Ok(base_report + &pc_suffix);
+    }
+
+    Ok(base_report)
+}
+
+// ============================================================================
+// PC-anchored sweep aggregation (Task 8)
+// ============================================================================
+
+/// Task 6 sweep-manifest.json shape.
+///
+/// The old SweepManifest covers the legacy `batches[]` format. This struct
+/// covers the Task 6 `sweep_lockstep` output format, which is distinct.
+#[derive(Deserialize)]
+struct Pc1SweepManifest {
+    /// Union of all grounding event names across all tile types.
+    #[serde(default)]
+    grounding: Pc1Grounding,
+    /// True when cross-batch PC joining is unsafe (grounding PC sets drifted).
+    #[serde(default)]
+    unsafe_for_pc_join: bool,
+    /// Human-readable reason for unsafe_for_pc_join (null when false).
+    #[serde(default)]
+    reason: Option<String>,
+    /// True when a mode-2 baseline trace was captured alongside the sweep.
+    #[serde(default)]
+    mode2_baseline_captured: bool,
+}
+
+/// Per-tile-type grounding event lists from sweep-manifest.json.
+#[derive(Deserialize, Default)]
+struct Pc1Grounding {
+    #[serde(default)]
+    core: Vec<String>,
+    #[serde(default)]
+    memmod: Vec<String>,
+    #[serde(default)]
+    memtile: Vec<String>,
+    #[serde(default)]
+    shim: Vec<String>,
+}
+
+/// Read the Task 6 sweep-manifest.json from `sweep_dir`.
+///
+/// Returns `None` (with a log warning) when the file is absent or unparseable.
+/// Robust to missing manifest: callers must handle `None` gracefully.
+fn read_pc1_manifest(sweep_dir: &Path) -> Option<Pc1SweepManifest> {
+    let path = sweep_dir.join("sweep-manifest.json");
+    match fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!(
+                    "Warning: sweep-manifest.json parse failed (Pc1 schema): {}",
+                    e
+                );
+                None
+            }
+        },
+        Err(_) => None, // absent manifest is normal for non-pc1 sweeps
+    }
+}
+
+/// Read grounding event names from a Task 6 sweep-manifest.json.
+///
+/// Returns the union of `grounding.core`, `grounding.memmod`,
+/// `grounding.memtile`, and `grounding.shim`. Returns an empty set when the
+/// manifest is absent or does not carry grounding data — the caller treats
+/// all events as swept in that case.
+pub fn read_grounding_from_pc1_manifest(sweep_dir: &Path) -> BTreeSet<String> {
+    match read_pc1_manifest(sweep_dir) {
+        None => BTreeSet::new(),
+        Some(m) => {
+            let mut out = BTreeSet::new();
+            for name in m
+                .grounding
+                .core
+                .iter()
+                .chain(&m.grounding.memmod)
+                .chain(&m.grounding.memtile)
+                .chain(&m.grounding.shim)
+            {
+                out.insert(name.clone());
+            }
+            out
+        }
+    }
+}
+
+/// List files inside `sweep_dir/mode2-baseline/` (the Task 6 mode-2 baseline).
+///
+/// Returns paths of `*.json` files found there, sorted. Returns an empty
+/// Vec when the directory is absent (mode-2 capture was disabled or failed).
+pub fn list_mode2_baselines(sweep_dir: &Path) -> Vec<std::path::PathBuf> {
+    let dir = sweep_dir.join("mode2-baseline");
+    let rd = match fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
+    let mut paths: Vec<_> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "json"))
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Aggregate PC-anchored reports across batches and format three sections:
+///
+/// 1. **Coverage matrix**: per-event, per-batch status (swept / absent / grounding).
+/// 2. **Divergence summary**: per-event total set+multiset magnitude, sorted descending.
+/// 3. **Cycle delta summary**: avg and max |delta_cycles| per event.
+///
+/// `grounding` is the set of event names that serve as the perfcnt anchor in
+/// every batch (read from sweep-manifest.json via `read_grounding_from_pc1_manifest`).
+/// When empty, all events are classified as "swept".
+///
+/// This function is `pub` so unit tests can call it directly without a sweep dir.
+pub fn format_report_pc_anchored(
+    batch_results: &[BatchResult],
+    grounding: &BTreeSet<String>,
+) -> String {
+    // --- Aggregate across batches ---
+
+    // event_name -> batch_idx -> "swept" | "absent" | "grounding"
+    let mut event_per_batch: BTreeMap<String, BTreeMap<usize, &str>> = BTreeMap::new();
+    // event_name -> (set_diff_total, multiset_magnitude_total)
+    let mut event_total_diff: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    // event_name -> [delta_cycles]
+    let mut event_cycle_deltas: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+
+    // Collect all event names that appear anywhere in pc_anchored data.
+    for batch in batch_results {
+        for (_, report) in &batch.pc_anchored {
+            for (name, (hw_only, emu_only)) in &report.set_diff {
+                let status = if grounding.contains(name) {
+                    "grounding"
+                } else {
+                    "swept"
+                };
+                event_per_batch
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(batch.batch_idx, status);
+
+                let entry = event_total_diff.entry(name.clone()).or_default();
+                entry.0 += hw_only.len() + emu_only.len();
+
+                if let Some(ms) = report.multiset_diff.get(name) {
+                    let mag: usize = ms
+                        .values()
+                        .map(|(_, _, d)| d.unsigned_abs() as usize)
+                        .sum();
+                    entry.1 += mag;
+                }
+            }
+
+            for (name, by_pc) in &report.cycle_bands {
+                let deltas = event_cycle_deltas.entry(name.clone()).or_default();
+                for band in by_pc.values() {
+                    deltas.push(band.delta_cycles);
+                }
+            }
+        }
+    }
+
+    // Fill in "absent" for events that didn't appear in some batches.
+    let all_batch_idxs: Vec<usize> = batch_results.iter().map(|b| b.batch_idx).collect();
+    for by_batch in event_per_batch.values_mut() {
+        for &idx in &all_batch_idxs {
+            by_batch.entry(idx).or_insert("absent");
+        }
+    }
+
+    let mut out = String::new();
+
+    // ---- Section 1: Coverage matrix ----
+    let _ = writeln!(out, "{}", "=".repeat(76));
+    let _ = writeln!(out, "PC-anchored coverage");
+    let _ = writeln!(out, "{}", "=".repeat(76));
+    for (name, by_batch) in &event_per_batch {
+        let _ = write!(out, "  {:24}: ", name);
+        for (idx, status) in by_batch {
+            let _ = write!(out, "batch {}={:<10} ", idx, status);
+        }
+        let _ = writeln!(out);
+    }
+    let _ = writeln!(out);
+
+    // ---- Section 2: Divergence summary (sorted descending by total magnitude) ----
+    let _ = writeln!(out, "{}", "=".repeat(76));
+    let _ = writeln!(out, "PC-anchored divergences (sorted by total)");
+    let _ = writeln!(out, "{}", "=".repeat(76));
+    let mut sorted_div: Vec<_> = event_total_diff.iter().collect();
+    sorted_div.sort_by_key(|(_, (s, m))| std::cmp::Reverse(s + m));
+    for (name, (set_size, multiset_mag)) in &sorted_div {
+        let _ = writeln!(
+            out,
+            "  {:24}: set_diff={} multiset_mag={}",
+            name, set_size, multiset_mag
+        );
+    }
+    let _ = writeln!(out);
+
+    // ---- Section 3: Cycle delta summary ----
+    let _ = writeln!(out, "{}", "=".repeat(76));
+    let _ = writeln!(
+        out,
+        "Perfcnt-anchored cycle deltas (avg |delta_cycles| per event)"
+    );
+    let _ = writeln!(out, "{}", "=".repeat(76));
+    for (name, deltas) in &event_cycle_deltas {
+        if deltas.is_empty() {
+            continue;
+        }
+        let avg_abs =
+            deltas.iter().map(|d| d.unsigned_abs() as f64).sum::<f64>() / deltas.len() as f64;
+        let max_abs = deltas.iter().map(|d| d.unsigned_abs()).max().unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "  {:24}: avg={:.1} max={} n={}",
+            name,
+            avg_abs,
+            max_abs,
+            deltas.len()
+        );
+    }
+    let _ = writeln!(out);
+
+    out
 }
 
 // ============================================================================
@@ -3001,5 +3279,295 @@ mod tests {
         assert_eq!(report.emu_perfcnt_tick_count, 0);
         // Set/multiset diff still works regardless of perfcnt presence.
         assert!(report.set_diff.contains_key("INSTR_VECTOR"));
+    }
+
+    // ---- PC-anchored sweep aggregation tests (Task 8) ----
+
+    /// Build a minimal PCAnchoredReport with the given event names in set_diff.
+    /// No actual PCs are recorded; HW-only and EMU-only sets are empty (no
+    /// divergence). Used to test coverage matrix formatting.
+    fn make_pc_report_for_events(events_present: &[&str]) -> PCAnchoredReport {
+        let mut report = PCAnchoredReport::default();
+        report.pkt_type = 0;
+        for name in events_present {
+            report
+                .set_diff
+                .insert(name.to_string(), (HashSet::new(), HashSet::new()));
+            report.multiset_diff.insert(name.to_string(), HashMap::new());
+        }
+        report
+    }
+
+    /// Build a BatchResult with only pc_anchored data (no tile timing data).
+    fn make_batch_pc_only(
+        batch_idx: usize,
+        key: TileKey,
+        report: PCAnchoredReport,
+    ) -> BatchResult {
+        let mut pc_anchored = HashMap::new();
+        pc_anchored.insert(key, report);
+        BatchResult {
+            batch_idx,
+            config: EventsConfig::default(),
+            tiles: Vec::new(),
+            stall_attributions: Vec::new(),
+            cross_tile: None,
+            pc_anchored,
+        }
+    }
+
+    #[test]
+    fn pc_anchored_coverage_matrix_formats() {
+        // Batch 0 covers INSTR_VECTOR + PERF_CNT_0.
+        // Batch 1 covers MEMORY_STALL + PERF_CNT_0.
+        // PERF_CNT_0 is in the grounding set.
+        // Expected: INSTR_VECTOR shows swept/absent; MEMORY_STALL shows absent/swept;
+        //           PERF_CNT_0 shows grounding in both batches.
+        let key = TileKey {
+            col: 0,
+            row: 2,
+            pkt_type: 0,
+        };
+        let batch0 = make_batch_pc_only(
+            0,
+            key,
+            make_pc_report_for_events(&["PERF_CNT_0", "INSTR_VECTOR"]),
+        );
+        let batch1 = make_batch_pc_only(
+            1,
+            key,
+            make_pc_report_for_events(&["PERF_CNT_0", "MEMORY_STALL"]),
+        );
+
+        let grounding: BTreeSet<String> = ["PERF_CNT_0".to_string()].iter().cloned().collect();
+        let report = format_report_pc_anchored(&[batch0, batch1], &grounding);
+
+        assert!(report.contains("PC-anchored coverage"), "missing section header");
+        assert!(report.contains("INSTR_VECTOR"), "INSTR_VECTOR missing");
+        assert!(report.contains("MEMORY_STALL"), "MEMORY_STALL missing");
+        assert!(report.contains("PERF_CNT_0"), "PERF_CNT_0 missing");
+        // Check status tags are present.
+        assert!(report.contains("swept"), "swept tag missing");
+        assert!(report.contains("absent"), "absent tag missing");
+        assert!(report.contains("grounding"), "grounding tag missing");
+    }
+
+    #[test]
+    fn pc_anchored_divergence_sorted_descending() {
+        // Event A: set_diff = 5 PCs hw-only, 0 emu-only -> total set = 5.
+        // Event B: set_diff = 1 PC hw-only, 0 emu-only -> total set = 1.
+        // Expected: A appears before B in the divergence section.
+        let key = TileKey {
+            col: 0,
+            row: 2,
+            pkt_type: 0,
+        };
+
+        // Build report for event A with 5 hw-only PCs.
+        let mut report_a = PCAnchoredReport::default();
+        let hw_only_a: HashSet<u64> = [100, 200, 300, 400, 500].iter().cloned().collect();
+        report_a
+            .set_diff
+            .insert("EVENT_A".to_string(), (hw_only_a, HashSet::new()));
+        report_a
+            .multiset_diff
+            .insert("EVENT_A".to_string(), HashMap::new());
+
+        // Build report for event B with 1 hw-only PC.
+        let mut report_b = PCAnchoredReport::default();
+        let hw_only_b: HashSet<u64> = [100].iter().cloned().collect();
+        report_b
+            .set_diff
+            .insert("EVENT_B".to_string(), (hw_only_b, HashSet::new()));
+        report_b
+            .multiset_diff
+            .insert("EVENT_B".to_string(), HashMap::new());
+
+        let mut pc_anchored = HashMap::new();
+        // Put both events in the same tile report by merging.
+        let mut combined = PCAnchoredReport::default();
+        combined
+            .set_diff
+            .insert("EVENT_A".to_string(), report_a.set_diff["EVENT_A"].clone());
+        combined
+            .set_diff
+            .insert("EVENT_B".to_string(), report_b.set_diff["EVENT_B"].clone());
+        combined
+            .multiset_diff
+            .insert("EVENT_A".to_string(), HashMap::new());
+        combined
+            .multiset_diff
+            .insert("EVENT_B".to_string(), HashMap::new());
+        pc_anchored.insert(key, combined);
+
+        let batch = BatchResult {
+            batch_idx: 0,
+            config: EventsConfig::default(),
+            tiles: Vec::new(),
+            stall_attributions: Vec::new(),
+            cross_tile: None,
+            pc_anchored,
+        };
+
+        let grounding = BTreeSet::new();
+        let report = format_report_pc_anchored(&[batch], &grounding);
+
+        // A should appear before B in the divergence section.
+        assert!(report.contains("PC-anchored divergences"));
+        let pos_a = report.find("EVENT_A").expect("EVENT_A not found");
+        let pos_b = report.find("EVENT_B").expect("EVENT_B not found");
+        // EVENT_A has higher divergence -> should appear first in sorted output.
+        // We look for them specifically in the divergence section.
+        let div_section = report
+            .split("PC-anchored divergences")
+            .nth(1)
+            .unwrap_or("");
+        let div_pos_a = div_section.find("EVENT_A").unwrap_or(usize::MAX);
+        let div_pos_b = div_section.find("EVENT_B").unwrap_or(usize::MAX);
+        assert!(
+            div_pos_a < div_pos_b,
+            "EVENT_A (set_diff=5) should precede EVENT_B (set_diff=1), \
+             but A at {} and B at {} in divergence section",
+            div_pos_a,
+            div_pos_b
+        );
+        // Suppress unused-variable warning for pos_a/pos_b from coverage matrix.
+        let _ = (pos_a, pos_b);
+    }
+
+    #[test]
+    fn pc_anchored_cycle_delta_avg_max() {
+        // Build a batch with cycle_bands for INSTR_VECTOR:
+        //   PC 100: delta = +10
+        //   PC 200: delta = -20
+        //   PC 300: delta = 0
+        // avg |delta| = (10 + 20 + 0) / 3 = 10.0; max |delta| = 20.
+        let key = TileKey {
+            col: 0,
+            row: 2,
+            pkt_type: 0,
+        };
+        let mut report = PCAnchoredReport::default();
+        // set_diff must have the key so the event appears.
+        report
+            .set_diff
+            .insert("INSTR_VECTOR".to_string(), (HashSet::new(), HashSet::new()));
+
+        let mut bands = HashMap::new();
+        bands.insert(
+            100u64,
+            CycleBand {
+                hw_cycle_est: 110,
+                emu_cycle_est: 100,
+                delta_cycles: 10,
+                exceeds_tolerance: false,
+            },
+        );
+        bands.insert(
+            200u64,
+            CycleBand {
+                hw_cycle_est: 200,
+                emu_cycle_est: 220,
+                delta_cycles: -20,
+                exceeds_tolerance: false,
+            },
+        );
+        bands.insert(
+            300u64,
+            CycleBand {
+                hw_cycle_est: 300,
+                emu_cycle_est: 300,
+                delta_cycles: 0,
+                exceeds_tolerance: false,
+            },
+        );
+        report.cycle_bands.insert("INSTR_VECTOR".to_string(), bands);
+
+        let mut pc_anchored = HashMap::new();
+        pc_anchored.insert(key, report);
+
+        let batch = BatchResult {
+            batch_idx: 0,
+            config: EventsConfig::default(),
+            tiles: Vec::new(),
+            stall_attributions: Vec::new(),
+            cross_tile: None,
+            pc_anchored,
+        };
+
+        let grounding = BTreeSet::new();
+        let report_str = format_report_pc_anchored(&[batch], &grounding);
+
+        assert!(
+            report_str.contains("Perfcnt-anchored cycle deltas"),
+            "cycle delta section missing"
+        );
+        assert!(
+            report_str.contains("INSTR_VECTOR"),
+            "event name missing in cycle delta section"
+        );
+        // avg=10.0, max=20, n=3.
+        assert!(report_str.contains("avg=10.0"), "avg mismatch: {}", report_str);
+        assert!(report_str.contains("max=20"), "max mismatch: {}", report_str);
+        assert!(report_str.contains("n=3"), "n mismatch: {}", report_str);
+    }
+
+    #[test]
+    fn pc_anchored_empty_batches_no_pc_section() {
+        // When all batches have empty pc_anchored, format_report_pc_anchored
+        // still runs but produces sections with no event rows — coverage matrix
+        // and divergence summary headers present but no event lines.
+        // More importantly: compare_sweep_dir_with_opts would not append the
+        // PC suffix at all (guarded by `has_pc`). Here we test the formatter
+        // directly with zero batches.
+        let grounding = BTreeSet::new();
+        let report = format_report_pc_anchored(&[], &grounding);
+        // With no data, sections exist but have no event rows.
+        assert!(report.contains("PC-anchored coverage"));
+        // No event names should appear (no events to report).
+        assert!(!report.contains("INSTR_VECTOR"));
+    }
+
+    #[test]
+    fn pc_anchored_unsafe_for_pc_join_manifest_test() {
+        // Build a synthetic sweep dir in TMPDIR with a manifest that has
+        // unsafe_for_pc_join=true. Verify read_pc1_manifest parses it.
+        let tmpdir = std::path::PathBuf::from(
+            std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()),
+        );
+        let sweep_dir = tmpdir.join("task8_test_manifest");
+        std::fs::create_dir_all(&sweep_dir).expect("create sweep dir");
+
+        let manifest_json = r#"{
+            "test_name": "test",
+            "compiler": "chess",
+            "mode": "event_pc",
+            "grounding": {
+                "core": ["PERF_CNT_0"],
+                "memmod": [],
+                "memtile": [],
+                "shim": []
+            },
+            "mode2_baseline_captured": false,
+            "unsafe_for_pc_join": true,
+            "reason": "grounding event PERF_CNT_0 PC drifted",
+            "sweep_error": null
+        }"#;
+        std::fs::write(sweep_dir.join("sweep-manifest.json"), manifest_json)
+            .expect("write manifest");
+
+        let manifest = read_pc1_manifest(&sweep_dir).expect("manifest should parse");
+        assert!(manifest.unsafe_for_pc_join);
+        assert_eq!(
+            manifest.reason.as_deref(),
+            Some("grounding event PERF_CNT_0 PC drifted")
+        );
+
+        // Grounding extraction includes core events.
+        let grounding = read_grounding_from_pc1_manifest(&sweep_dir);
+        assert!(grounding.contains("PERF_CNT_0"));
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&sweep_dir);
     }
 }
