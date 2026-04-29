@@ -25,10 +25,7 @@ pub fn lower_to_cpp(params: &FuzzParams) -> String {
         }
         LoopStyle::HardwareLoop => {
             // chess_prepare_for_pipelining / chess_loop_range hint
-            out.push_str(&format!(
-                "    for (int i = 0; i < {}; i++) chess_prepare_for_pipelining {{\n",
-                n
-            ));
+            out.push_str(&format!("    for (int i = 0; i < {}; i++) chess_prepare_for_pipelining {{\n", n));
         }
     }
 
@@ -67,11 +64,7 @@ fn max_var_id(ops: &[KernelOp]) -> u8 {
     for op in ops {
         match op {
             KernelOp::ScalarArith { dst, .. } => max = max.max(dst.0),
-            KernelOp::Branch {
-                then_ops,
-                else_ops,
-                ..
-            } => {
+            KernelOp::Branch { then_ops, else_ops, .. } => {
                 max = max.max(max_var_id(then_ops));
                 max = max.max(max_var_id(else_ops));
             }
@@ -87,12 +80,7 @@ fn max_var_id(ops: &[KernelOp]) -> u8 {
 /// Lower a single KernelOp to C++ text, appending to `out`.
 fn lower_op(out: &mut String, op: &KernelOp, indent: &str) {
     match op {
-        KernelOp::ScalarArith {
-            op: sop,
-            dst,
-            src1,
-            src2,
-        } => {
+        KernelOp::ScalarArith { op: sop, dst, src1, src2 } => {
             out.push_str(&format!(
                 "{}t{} = {} {} {};\n",
                 indent,
@@ -112,11 +100,7 @@ fn lower_op(out: &mut String, op: &KernelOp, indent: &str) {
                 lower_operand(val),
             ));
         }
-        KernelOp::Branch {
-            cond,
-            then_ops,
-            else_ops,
-        } => {
+        KernelOp::Branch { cond, then_ops, else_ops } => {
             out.push_str(&format!("{}if ({}) {{\n", indent, lower_operand(cond)));
             let inner = format!("{}    ", indent);
             for op in then_ops {
@@ -131,10 +115,7 @@ fn lower_op(out: &mut String, op: &KernelOp, indent: &str) {
             out.push_str(&format!("{}}}\n", indent));
         }
         KernelOp::HwLoop { count, body } => {
-            out.push_str(&format!(
-                "{}for (int _hw = 0; _hw < {}; _hw++) {{\n",
-                indent, count
-            ));
+            out.push_str(&format!("{}for (int _hw = 0; _hw < {}; _hw++) {{\n", indent, count));
             let inner = format!("{}    ", indent);
             for op in body {
                 lower_op(out, op, &inner);
@@ -182,10 +163,7 @@ mod tests {
             seed: 1,
             buffer_size: 64,
             dtype: ScalarType::I32,
-            body: KernelBody {
-                ops: vec![],
-                loop_style: LoopStyle::Simple,
-            },
+            body: KernelBody { ops: vec![], loop_style: LoopStyle::Simple },
         };
         let cpp = lower_to_cpp(&params);
         // Should contain function signature, loop, and buffer copy
@@ -205,24 +183,17 @@ mod tests {
                     KernelOp::ScalarArith {
                         op: ScalarOp::Add,
                         dst: Var(0),
-                        src1: Operand::Load {
-                            buf: BufRef(0),
-                            idx: Box::new(Operand::Var(Var(1))),
-                        },
+                        src1: Operand::Load { buf: BufRef(0), idx: Box::new(Operand::Var(Var(1))) },
                         src2: Operand::Literal(1),
                     },
-                    KernelOp::Store {
-                        buf: BufRef(1),
-                        idx: Operand::Var(Var(1)),
-                        val: Operand::Var(Var(0)),
-                    },
+                    KernelOp::Store { buf: BufRef(1), idx: Operand::Var(Var(1)), val: Operand::Var(Var(0)) },
                 ],
                 loop_style: LoopStyle::Simple,
             },
         };
         let cpp = lower_to_cpp(&params);
-        assert!(cpp.contains("buf_in["));  // loads from input
-        assert!(cpp.contains("+ 1"));      // adds literal
+        assert!(cpp.contains("buf_in[")); // loads from input
+        assert!(cpp.contains("+ 1")); // adds literal
         assert!(cpp.contains("buf_out[")); // stores to output
     }
 
@@ -232,10 +203,7 @@ mod tests {
             seed: 3,
             buffer_size: 32,
             dtype: ScalarType::I16,
-            body: KernelBody {
-                ops: vec![],
-                loop_style: LoopStyle::Simple,
-            },
+            body: KernelBody { ops: vec![], loop_style: LoopStyle::Simple },
         };
         let cpp = lower_to_cpp(&params);
         assert!(cpp.contains("int16_t"));
@@ -248,10 +216,7 @@ mod tests {
             seed: 4,
             buffer_size: 128,
             dtype: ScalarType::I8,
-            body: KernelBody {
-                ops: vec![],
-                loop_style: LoopStyle::Simple,
-            },
+            body: KernelBody { ops: vec![], loop_style: LoopStyle::Simple },
         };
         let cpp = lower_to_cpp(&params);
         assert!(cpp.contains("int8_t"));
@@ -264,10 +229,7 @@ mod tests {
             seed: 5,
             buffer_size: 64,
             dtype: ScalarType::I32,
-            body: KernelBody {
-                ops: vec![],
-                loop_style: LoopStyle::HardwareLoop,
-            },
+            body: KernelBody { ops: vec![], loop_style: LoopStyle::HardwareLoop },
         };
         let cpp = lower_to_cpp(&params);
         assert!(cpp.contains("chess_prepare_for_pipelining"));
@@ -355,12 +317,7 @@ mod tests {
                 },
             };
             let cpp = lower_to_cpp(&params);
-            assert!(
-                cpp.contains(expected_str),
-                "Missing operator '{}' for {:?}",
-                expected_str,
-                sop
-            );
+            assert!(cpp.contains(expected_str), "Missing operator '{}' for {:?}", expected_str, sop);
         }
     }
 
@@ -406,14 +363,8 @@ mod tests {
                 ops: vec![KernelOp::ScalarArith {
                     op: ScalarOp::Add,
                     dst: Var(0),
-                    src1: Operand::Load {
-                        buf: BufRef(0),
-                        idx: Box::new(Operand::Var(Var(1))),
-                    },
-                    src2: Operand::Load {
-                        buf: BufRef(1),
-                        idx: Box::new(Operand::Var(Var(1))),
-                    },
+                    src1: Operand::Load { buf: BufRef(0), idx: Box::new(Operand::Var(Var(1))) },
+                    src2: Operand::Load { buf: BufRef(1), idx: Box::new(Operand::Var(Var(1))) },
                 }],
                 loop_style: LoopStyle::Simple,
             },

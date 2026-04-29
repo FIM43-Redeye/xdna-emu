@@ -48,10 +48,7 @@ mod tests {
             seed: 42,
             buffer_size: 64,
             dtype: ScalarType::I32,
-            body: KernelBody {
-                ops: vec![],
-                loop_style: LoopStyle::Simple,
-            },
+            body: KernelBody { ops: vec![], loop_style: LoopStyle::Simple },
         };
         let debug = format!("{:?}", params);
         assert!(debug.contains("42"));

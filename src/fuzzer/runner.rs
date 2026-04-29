@@ -87,8 +87,7 @@ impl ToolPaths {
 
         // Build PATH with mlir-aie bin + peano bin
         let mut path = std::env::var("PATH").unwrap_or_default();
-        path = format!("{}:{}:{}", self.mlir_aie_bin.display(),
-            self.peano_dir.join("bin").display(), path);
+        path = format!("{}:{}:{}", self.mlir_aie_bin.display(), self.peano_dir.join("bin").display(), path);
         if let Some(ref aietools) = self.aietools_root {
             path = format!("{}:{}", aietools.join("bin").display(), path);
             cmd.env("XILINX_VITIS_AIETOOLS", aietools);
@@ -164,13 +163,15 @@ pub fn run_fuzz(opts: &FuzzOptions) {
 
     // Phase 1: Generate and compile all cases (parallel).
     let compile_start = Instant::now();
-    let (compiled, compile_errors) = compile_all(
-        &tools, base_seed, iterations, &fuzz_dir, jobs, opts.verbose, trace_sweep,
-    );
+    let (compiled, compile_errors) =
+        compile_all(&tools, base_seed, iterations, &fuzz_dir, jobs, opts.verbose, trace_sweep);
     let compile_elapsed = compile_start.elapsed().as_secs_f64();
     println!(
         "Compile: {} ok, {} error ({:.1}s, {} threads)",
-        compiled.len(), compile_errors, compile_elapsed, jobs,
+        compiled.len(),
+        compile_errors,
+        compile_elapsed,
+        jobs,
     );
 
     if compiled.is_empty() {
@@ -184,14 +185,8 @@ pub fn run_fuzz(opts: &FuzzOptions) {
     let exec_elapsed = exec_start.elapsed().as_secs_f64();
 
     let total_errors = compile_errors + exec_errors;
-    println!(
-        "Execute: {} pass, {} fail, {} error ({:.1}s)",
-        pass, fail, exec_errors, exec_elapsed,
-    );
-    println!(
-        "Fuzz complete: {} pass, {} fail, {} error",
-        pass, fail, total_errors,
-    );
+    println!("Execute: {} pass, {} fail, {} error ({:.1}s)", pass, fail, exec_errors, exec_elapsed,);
+    println!("Fuzz complete: {} pass, {} fail, {} error", pass, fail, total_errors,);
 
     // Phase 3 (optional): Trace event group sweep.
     if trace_sweep {
@@ -373,18 +368,18 @@ fn execute_all(
         // Emulator workers: parallel, work-stealing.
         for _ in 0..jobs {
             let emu_next = &emu_next;
-            s.spawn(move || {
-                loop {
-                    let idx = emu_next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if idx >= total { break; }
-                    let case = &cases[idx];
-                    let xclbin_path = case.case_dir.join("aie.xclbin");
-                    let result = run_emulator(&xclbin_path, &case.params, max_cycles);
-                    *emu_results[idx].lock().unwrap() = Some(result);
-                    let n = emu_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if verbose {
-                        eprintln!("  emu {}/{} (seed {})", n, total, case.seed);
-                    }
+            s.spawn(move || loop {
+                let idx = emu_next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if idx >= total {
+                    break;
+                }
+                let case = &cases[idx];
+                let xclbin_path = case.case_dir.join("aie.xclbin");
+                let result = run_emulator(&xclbin_path, &case.params, max_cycles);
+                *emu_results[idx].lock().unwrap() = Some(result);
+                let n = emu_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if verbose {
+                    eprintln!("  emu {}/{} (seed {})", n, total, case.seed);
                 }
             });
         }
@@ -398,9 +393,13 @@ fn execute_all(
                 *npu_results[i].lock().unwrap() = Some(result);
                 let n = npu_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if !verbose {
-                    eprint!("\r  emu {}/{}, npu {}/{}",
-                        emu_done.load(std::sync::atomic::Ordering::Relaxed), total,
-                        n, total);
+                    eprint!(
+                        "\r  emu {}/{}, npu {}/{}",
+                        emu_done.load(std::sync::atomic::Ordering::Relaxed),
+                        total,
+                        n,
+                        total
+                    );
                 }
             }
         });
@@ -427,16 +426,20 @@ fn execute_all(
                     if all_zero {
                         vacuous += 1;
                         if verbose {
-                            println!("seed {} MATCH (vacuous -- both zero, {} elements)",
+                            println!(
+                                "seed {} MATCH (vacuous -- both zero, {} elements)",
                                 case.seed,
-                                emu_output.len() / case.params.dtype.byte_size());
+                                emu_output.len() / case.params.dtype.byte_size()
+                            );
                         }
                     } else {
                         pass += 1;
                         if verbose {
-                            println!("seed {} MATCH ({} elements)",
+                            println!(
+                                "seed {} MATCH ({} elements)",
                                 case.seed,
-                                emu_output.len() / case.params.dtype.byte_size());
+                                emu_output.len() / case.params.dtype.byte_size()
+                            );
                         }
                     }
                 } else {
@@ -500,45 +503,52 @@ fn execute_emulator_only(
             let done = &done;
             let pass = &pass;
             let error = &error;
-            s.spawn(move || {
-                loop {
-                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if idx >= total { break; }
-                    let case = &cases[idx];
-                    let xclbin_path = case.case_dir.join("aie.xclbin");
-                    match run_emulator(&xclbin_path, &case.params, max_cycles) {
-                        Ok((output, trace)) if !output.is_empty() => {
-                            pass.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if verbose {
-                                let trace_msg = trace.as_ref()
-                                    .map(|t| format!(", trace {} bytes", t.len()))
-                                    .unwrap_or_default();
-                                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                                println!("[{}/{}] seed {} emulator: {} bytes{}",
-                                    n, total, case.seed, output.len(), trace_msg);
-                                if let Some(ref trace_data) = trace {
-                                    let _ = std::fs::write(case.case_dir.join("emu_trace.bin"), trace_data);
-                                }
-                            } else {
-                                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                                let p = pass.load(std::sync::atomic::Ordering::Relaxed);
-                                let e = error.load(std::sync::atomic::Ordering::Relaxed);
-                                eprint!("\r[{}/{}] {} pass, {} error", n, total, p, e);
-                            }
-                        }
-                        Ok(_) => {
-                            error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            s.spawn(move || loop {
+                let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if idx >= total {
+                    break;
+                }
+                let case = &cases[idx];
+                let xclbin_path = case.case_dir.join("aie.xclbin");
+                match run_emulator(&xclbin_path, &case.params, max_cycles) {
+                    Ok((output, trace)) if !output.is_empty() => {
+                        pass.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if verbose {
+                            let trace_msg = trace
+                                .as_ref()
+                                .map(|t| format!(", trace {} bytes", t.len()))
+                                .unwrap_or_default();
                             let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                            if verbose {
-                                eprintln!("[{}/{}] seed {} emulator produced empty output", n, total, case.seed);
+                            println!(
+                                "[{}/{}] seed {} emulator: {} bytes{}",
+                                n,
+                                total,
+                                case.seed,
+                                output.len(),
+                                trace_msg
+                            );
+                            if let Some(ref trace_data) = trace {
+                                let _ = std::fs::write(case.case_dir.join("emu_trace.bin"), trace_data);
                             }
-                        }
-                        Err(e) => {
-                            error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else {
                             let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                            if verbose {
-                                eprintln!("[{}/{}] seed {} emulator error: {}", n, total, case.seed, e);
-                            }
+                            let p = pass.load(std::sync::atomic::Ordering::Relaxed);
+                            let e = error.load(std::sync::atomic::Ordering::Relaxed);
+                            eprint!("\r[{}/{}] {} pass, {} error", n, total, p, e);
+                        }
+                    }
+                    Ok(_) => {
+                        error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if verbose {
+                            eprintln!("[{}/{}] seed {} emulator produced empty output", n, total, case.seed);
+                        }
+                    }
+                    Err(e) => {
+                        error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if verbose {
+                            eprintln!("[{}/{}] seed {} emulator error: {}", n, total, case.seed, e);
                         }
                     }
                 }
@@ -563,9 +573,8 @@ fn execute_emulator_only(
 /// 5. Write per-seed results to `trace_sweep/` subdirectory.
 fn execute_trace_sweep(cases: &[CompiledCase], opts: &FuzzOptions) {
     use crate::fuzzer::trace_sweep::{
-        TRACE_EVENT_GROUPS, NUM_GROUPS, check_determinism, compare_event_sequences,
-        compare_canonical, decode_binary_trace, write_sweep_summary,
-        cleanup_trace_binaries, DeterminismReport, SlotClass,
+        TRACE_EVENT_GROUPS, NUM_GROUPS, check_determinism, compare_event_sequences, compare_canonical,
+        decode_binary_trace, write_sweep_summary, cleanup_trace_binaries, DeterminismReport, SlotClass,
     };
 
     let reps = opts.trace_sweep_reps;
@@ -682,10 +691,7 @@ fn execute_trace_sweep(cases: &[CompiledCase], opts: &FuzzOptions) {
                         }
                         Err(e) => {
                             if verbose {
-                                eprintln!(
-                                    "seed {} group {} NPU error: {}",
-                                    case.seed, group_idx, e
-                                );
+                                eprintln!("seed {} group {} NPU error: {}", case.seed, group_idx, e);
                             }
                             None
                         }
@@ -698,13 +704,10 @@ fn execute_trace_sweep(cases: &[CompiledCase], opts: &FuzzOptions) {
             // Emulator trace for this group.
             let emu_trace_path = sweep_dir.join(format!("group_{}_emu.bin", group_idx));
             let emu_trace = {
-                let test = XclbinTest::from_path(&xclbin_path)
-                    .with_buffer_spec(make_fuzz_buffer_spec(&case.params));
+                let test =
+                    XclbinTest::from_path(&xclbin_path).with_buffer_spec(make_fuzz_buffer_spec(&case.params));
                 // Override insts path to use the group-specific patched file.
-                let test = XclbinTest {
-                    insts_path: Some(case.group_insts_paths[group_idx].clone()),
-                    ..test
-                };
+                let test = XclbinTest { insts_path: Some(case.group_insts_paths[group_idx].clone()), ..test };
                 let suite = XclbinSuite::new().with_max_cycles(max_cycles);
                 let (_outcome, _raw_output, binary_trace) = suite.run_single_with_trace(&test);
                 if let Some(ref trace) = binary_trace {
@@ -722,10 +725,8 @@ fn execute_trace_sweep(cases: &[CompiledCase], opts: &FuzzOptions) {
                 // to filter out non-deterministic slots. Other groups use
                 // raw comparison (no determinism data for their slots).
                 let comp = if group_idx == 0 {
-                    let (c, _filtered) = compare_canonical(
-                        &npu_events, &emu_events,
-                        &determinism.slot_classes, group.name,
-                    );
+                    let (c, _filtered) =
+                        compare_canonical(&npu_events, &emu_events, &determinism.slot_classes, group.name);
                     c
                 } else {
                     compare_event_sequences(&npu_events, &emu_events, group.name)
@@ -747,11 +748,11 @@ fn execute_trace_sweep(cases: &[CompiledCase], opts: &FuzzOptions) {
                 Some(comp)
             } else {
                 if verbose && emu_trace.is_some() {
-                    println!("  seed {} group {} emulator-only ({} events)",
-                        case.seed, group_idx,
-                        emu_trace.as_ref()
-                            .map(|t| decode_binary_trace(t).len())
-                            .unwrap_or(0),
+                    println!(
+                        "  seed {} group {} emulator-only ({} events)",
+                        case.seed,
+                        group_idx,
+                        emu_trace.as_ref().map(|t| decode_binary_trace(t).len()).unwrap_or(0),
                     );
                 }
                 None
@@ -783,16 +784,16 @@ fn execute_trace_sweep(cases: &[CompiledCase], opts: &FuzzOptions) {
             if matches + mismatches > 0 {
                 println!(
                     "  {}: {}/{} match, {}/{} mismatch",
-                    group.name, matches, matches + mismatches,
-                    mismatches, matches + mismatches,
+                    group.name,
+                    matches,
+                    matches + mismatches,
+                    mismatches,
+                    matches + mismatches,
                 );
             }
         }
         if !nondeterministic_seeds.is_empty() {
-            println!(
-                "  Non-deterministic seeds: {:?}",
-                nondeterministic_seeds,
-            );
+            println!("  Non-deterministic seeds: {:?}", nondeterministic_seeds,);
         }
     }
     println!("  Trace data: build/fuzz/seed_*/trace_sweep/");
@@ -800,9 +801,7 @@ fn execute_trace_sweep(cases: &[CompiledCase], opts: &FuzzOptions) {
 
 /// Build the standard fuzz buffer spec (shared between emulator and NPU paths).
 fn make_fuzz_buffer_spec(params: &FuzzParams) -> crate::testing::test_cpp_parser::BufferSpec {
-    use crate::testing::test_cpp_parser::{
-        BufferDef, BufferDir, BufferSpec, ElementType, InputPattern,
-    };
+    use crate::testing::test_cpp_parser::{BufferDef, BufferDir, BufferSpec, ElementType, InputPattern};
 
     let elem_type = match params.dtype {
         ScalarType::I32 => ElementType::I32,
@@ -885,7 +884,10 @@ fn format_mismatch(
     if emu.len() != npu.len() {
         return format!(
             "size mismatch: emulator={} bytes ({} elems), npu={} bytes ({} elems)",
-            emu.len(), emu_elems, npu.len(), npu_elems,
+            emu.len(),
+            emu_elems,
+            npu.len(),
+            npu_elems,
         );
     }
 
@@ -917,21 +919,13 @@ fn read_elem(bytes: &[u8], size: usize) -> i64 {
 }
 
 /// Compile a fuzz case: kernel.cc -> kernel.o, template -> aie.mlir -> xclbin.
-fn compile_fuzz_case(
-    tools: &ToolPaths,
-    params: &FuzzParams,
-    case_dir: &Path,
-) -> Result<(), String> {
+fn compile_fuzz_case(tools: &ToolPaths, params: &FuzzParams, case_dir: &Path) -> Result<(), String> {
     // Skip if already compiled (xclbin exists and is newer than source).
     let xclbin = case_dir.join("aie.xclbin");
     let kernel_cc = case_dir.join("fuzz_kernel.cc");
     if xclbin.exists() {
-        if let (Ok(src_meta), Ok(xclbin_meta)) =
-            (std::fs::metadata(&kernel_cc), std::fs::metadata(&xclbin))
-        {
-            if let (Ok(src_time), Ok(xclbin_time)) =
-                (src_meta.modified(), xclbin_meta.modified())
-            {
+        if let (Ok(src_meta), Ok(xclbin_meta)) = (std::fs::metadata(&kernel_cc), std::fs::metadata(&xclbin)) {
+            if let (Ok(src_time), Ok(xclbin_time)) = (src_meta.modified(), xclbin_meta.modified()) {
                 if xclbin_time > src_time {
                     return Ok(());
                 }
@@ -952,32 +946,43 @@ fn compile_fuzz_case(
         .arg(&kernel_obj);
     tools.apply_env(&mut compile_cmd);
 
-    let compile_out = compile_cmd.output()
+    let compile_out = compile_cmd
+        .output()
         .map_err(|e| format!("Failed to spawn Peano clang: {}", e))?;
     if !compile_out.status.success() {
         let stderr = String::from_utf8_lossy(&compile_out.stderr);
-        return Err(format!("Kernel compilation failed:\n{}",
-            stderr.lines().take(10).collect::<Vec<_>>().join("\n")));
+        return Err(format!(
+            "Kernel compilation failed:\n{}",
+            stderr.lines().take(10).collect::<Vec<_>>().join("\n")
+        ));
     }
 
     // Step 2: Generate MLIR template (always with trace instrumentation)
     let mut template_cmd = Command::new(&tools.python);
     template_cmd
         .arg(&tools.template_script)
-        .arg("--kernel").arg("fuzz_kernel.cc")
-        .arg("--size").arg(params.buffer_size.to_string())
-        .arg("--dtype").arg(dtype_str(params.dtype))
-        .arg("--outdir").arg(case_dir)
-        .arg("--device").arg("npu1_1col")
+        .arg("--kernel")
+        .arg("fuzz_kernel.cc")
+        .arg("--size")
+        .arg(params.buffer_size.to_string())
+        .arg("--dtype")
+        .arg(dtype_str(params.dtype))
+        .arg("--outdir")
+        .arg(case_dir)
+        .arg("--device")
+        .arg("npu1_1col")
         .arg("--trace");
     tools.apply_env(&mut template_cmd);
 
-    let template_out = template_cmd.output()
+    let template_out = template_cmd
+        .output()
         .map_err(|e| format!("Failed to spawn fuzz_template.py: {}", e))?;
     if !template_out.status.success() {
         let stderr = String::from_utf8_lossy(&template_out.stderr);
-        return Err(format!("MLIR template generation failed:\n{}",
-            stderr.lines().take(10).collect::<Vec<_>>().join("\n")));
+        return Err(format!(
+            "MLIR template generation failed:\n{}",
+            stderr.lines().take(10).collect::<Vec<_>>().join("\n")
+        ));
     }
 
     // Step 3: Compile MLIR to xclbin via aiecc.py
@@ -998,14 +1003,15 @@ fn compile_fuzz_case(
     aiecc_cmd.current_dir(case_dir);
     tools.apply_env(&mut aiecc_cmd);
 
-    let aiecc_out = aiecc_cmd.output()
-        .map_err(|e| format!("Failed to spawn aiecc.py: {}", e))?;
+    let aiecc_out = aiecc_cmd.output().map_err(|e| format!("Failed to spawn aiecc.py: {}", e))?;
     if !aiecc_out.status.success() {
         let stderr = String::from_utf8_lossy(&aiecc_out.stderr);
         let stdout = String::from_utf8_lossy(&aiecc_out.stdout);
         let combined = if stderr.is_empty() { stdout } else { stderr };
-        return Err(format!("aiecc.py failed:\n{}",
-            combined.lines().take(10).collect::<Vec<_>>().join("\n")));
+        return Err(format!(
+            "aiecc.py failed:\n{}",
+            combined.lines().take(10).collect::<Vec<_>>().join("\n")
+        ));
     }
 
     // Verify outputs exist
@@ -1024,16 +1030,11 @@ fn compile_fuzz_case(
 ///
 /// Reads the original `insts.bin`, patches the trace event register values
 /// for each group, and writes `insts_group_N.bin` files. Returns the paths.
-fn generate_group_insts(
-    case_dir: &Path,
-    _seed: u64,
-    _verbose: bool,
-) -> Result<Vec<PathBuf>, String> {
+fn generate_group_insts(case_dir: &Path, _seed: u64, _verbose: bool) -> Result<Vec<PathBuf>, String> {
     use crate::fuzzer::trace_sweep::{TRACE_EVENT_GROUPS, NUM_GROUPS, patch_insts_for_group};
 
     let insts_path = case_dir.join("insts.bin");
-    let insts_bytes = std::fs::read(&insts_path)
-        .map_err(|e| format!("Failed to read insts.bin: {}", e))?;
+    let insts_bytes = std::fs::read(&insts_path).map_err(|e| format!("Failed to read insts.bin: {}", e))?;
 
     let mut paths = Vec::with_capacity(NUM_GROUPS);
 

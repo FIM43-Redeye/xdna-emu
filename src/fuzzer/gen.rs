@@ -35,18 +35,9 @@ pub fn generate(seed: u64) -> FuzzParams {
     }
 
     // Always end with a store to output buffer so there's something to compare.
-    ops.push(KernelOp::Store {
-        buf: BufRef(1),
-        idx: Operand::Var(Var(1)),
-        val: Operand::Var(Var(0)),
-    });
+    ops.push(KernelOp::Store { buf: BufRef(1), idx: Operand::Var(Var(1)), val: Operand::Var(Var(0)) });
 
-    FuzzParams {
-        seed,
-        buffer_size,
-        dtype,
-        body: KernelBody { ops, loop_style },
-    }
+    FuzzParams { seed, buffer_size, dtype, body: KernelBody { ops, loop_style } }
 }
 
 /// Generate a single kernel operation.
@@ -66,22 +57,14 @@ fn gen_op(rng: &mut Xorshift64) -> KernelOp {
             }
         }
         // 20% chance: store to output buffer
-        6 | 7 => KernelOp::Store {
-            buf: BufRef(1),
-            idx: Operand::Var(Var(1)),
-            val: gen_operand(rng),
-        },
+        6 | 7 => KernelOp::Store { buf: BufRef(1), idx: Operand::Var(Var(1)), val: gen_operand(rng) },
         // 10% chance: branch
         8 => {
             let then_count = 1 + (rng.next() % 3) as usize;
             let else_count = rng.next() % 2;
             let then_ops: Vec<_> = (0..then_count).map(|_| gen_simple_op(rng)).collect();
             let else_ops: Vec<_> = (0..else_count).map(|_| gen_simple_op(rng)).collect();
-            KernelOp::Branch {
-                cond: Operand::Var(Var(0)),
-                then_ops,
-                else_ops,
-            }
+            KernelOp::Branch { cond: Operand::Var(Var(0)), then_ops, else_ops }
         }
         // 10% chance: hw loop
         _ => {
@@ -96,11 +79,7 @@ fn gen_op(rng: &mut Xorshift64) -> KernelOp {
 /// Generate a non-nested operation (for use inside branches/loops to bound depth).
 fn gen_simple_op(rng: &mut Xorshift64) -> KernelOp {
     if rng.next() % 3 == 0 {
-        KernelOp::Store {
-            buf: BufRef(1),
-            idx: Operand::Var(Var(1)),
-            val: gen_operand(rng),
-        }
+        KernelOp::Store { buf: BufRef(1), idx: Operand::Var(Var(1)), val: gen_operand(rng) }
     } else {
         KernelOp::ScalarArith {
             op: gen_scalar_op(rng),
@@ -139,10 +118,7 @@ fn gen_operand(rng: &mut Xorshift64) -> Operand {
             Operand::Literal(val)
         }
         // 25% buffer load
-        _ => Operand::Load {
-            buf: BufRef(0),
-            idx: Box::new(Operand::Var(Var(1))),
-        },
+        _ => Operand::Load { buf: BufRef(0), idx: Box::new(Operand::Var(Var(1))) },
     }
 }
 

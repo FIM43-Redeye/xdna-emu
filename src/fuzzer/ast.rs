@@ -30,11 +30,7 @@ pub enum KernelOp {
         src2: Operand,
     },
     /// `buf[idx] = val`
-    Store {
-        buf: BufRef,
-        idx: Operand,
-        val: Operand,
-    },
+    Store { buf: BufRef, idx: Operand, val: Operand },
     /// `if (cond) { then_ops } else { else_ops }`
     Branch {
         cond: Operand,
@@ -42,10 +38,7 @@ pub enum KernelOp {
         else_ops: Vec<KernelOp>,
     },
     /// Hardware loop with fixed count.
-    HwLoop {
-        count: u32,
-        body: Vec<KernelOp>,
-    },
+    HwLoop { count: u32, body: Vec<KernelOp> },
 }
 
 /// Scalar arithmetic operations.
@@ -83,10 +76,7 @@ mod tests {
 
     #[test]
     fn test_kernel_body_empty_is_valid() {
-        let body = KernelBody {
-            ops: vec![],
-            loop_style: LoopStyle::Simple,
-        };
+        let body = KernelBody { ops: vec![], loop_style: LoopStyle::Simple };
         assert!(body.ops.is_empty());
     }
 
@@ -95,10 +85,7 @@ mod tests {
         let op = KernelOp::ScalarArith {
             op: ScalarOp::Add,
             dst: Var(0),
-            src1: Operand::Load {
-                buf: BufRef(0),
-                idx: Box::new(Operand::Var(Var(1))),
-            },
+            src1: Operand::Load { buf: BufRef(0), idx: Box::new(Operand::Var(Var(1))) },
             src2: Operand::Literal(1),
         };
         let _ = format!("{:?}", op);

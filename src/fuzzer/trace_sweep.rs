@@ -35,22 +35,12 @@ pub struct TraceEventGroup {
 impl TraceEventGroup {
     /// Compute the Trace_Event0 register value (slots 0-3, little-endian).
     pub fn event0_value(&self) -> u32 {
-        u32::from_le_bytes([
-            self.event_ids[0],
-            self.event_ids[1],
-            self.event_ids[2],
-            self.event_ids[3],
-        ])
+        u32::from_le_bytes([self.event_ids[0], self.event_ids[1], self.event_ids[2], self.event_ids[3]])
     }
 
     /// Compute the Trace_Event1 register value (slots 4-7, little-endian).
     pub fn event1_value(&self) -> u32 {
-        u32::from_le_bytes([
-            self.event_ids[4],
-            self.event_ids[5],
-            self.event_ids[6],
-            self.event_ids[7],
-        ])
+        u32::from_le_bytes([self.event_ids[4], self.event_ids[5], self.event_ids[6], self.event_ids[7]])
     }
 }
 
@@ -296,77 +286,49 @@ pub fn sweepable_event_ids() -> Vec<u8> {
 // -------------------------------------------------------------------------
 
 /// Group 0: timer + pipeline stalls + debug/status.
-const SWEEP_00: TraceEventGroup = TraceEventGroup {
-    name: "timer_stall_debug",
-    event_ids: [3, 4, 23, 24, 25, 26, 27, 28],
-};
+const SWEEP_00: TraceEventGroup =
+    TraceEventGroup { name: "timer_stall_debug", event_ids: [3, 4, 23, 24, 25, 26, 27, 28] };
 /// Group 1: status/ECC + instruction events (begin).
-const SWEEP_01: TraceEventGroup = TraceEventGroup {
-    name: "status_instr_a",
-    event_ids: [29, 30, 31, 33, 34, 35, 36, 37],
-};
+const SWEEP_01: TraceEventGroup =
+    TraceEventGroup { name: "status_instr_a", event_ids: [29, 30, 31, 33, 34, 35, 36, 37] };
 /// Group 2: instruction events (load/store/stream/cascade/lock).
-const SWEEP_02: TraceEventGroup = TraceEventGroup {
-    name: "instr_mem_sync",
-    event_ids: [38, 39, 40, 41, 42, 43, 44, 45],
-};
+const SWEEP_02: TraceEventGroup =
+    TraceEventGroup { name: "instr_mem_sync", event_ids: [38, 39, 40, 41, 42, 43, 44, 45] };
 /// Group 3: compute errors + first access errors.
-const SWEEP_03: TraceEventGroup = TraceEventGroup {
-    name: "error_compute",
-    event_ids: [48, 49, 50, 51, 52, 53, 55, 56],
-};
+const SWEEP_03: TraceEventGroup =
+    TraceEventGroup { name: "error_compute", event_ids: [48, 49, 50, 51, 52, 53, 55, 56] };
 /// Group 4: access/system errors (a).
-const SWEEP_04: TraceEventGroup = TraceEventGroup {
-    name: "error_access_a",
-    event_ids: [57, 58, 59, 60, 61, 62, 63, 64],
-};
+const SWEEP_04: TraceEventGroup =
+    TraceEventGroup { name: "error_access_a", event_ids: [57, 58, 59, 60, 61, 62, 63, 64] };
 /// Group 5: access/system errors (b).
-const SWEEP_05: TraceEventGroup = TraceEventGroup {
-    name: "error_access_b",
-    event_ids: [65, 66, 67, 68, 69, 70, 71, 72],
-};
+const SWEEP_05: TraceEventGroup =
+    TraceEventGroup { name: "error_access_b", event_ids: [65, 66, 67, 68, 69, 70, 71, 72] };
 /// Group 6: stream port events (ports 0-1).
-const SWEEP_06: TraceEventGroup = TraceEventGroup {
-    name: "port_01",
-    event_ids: [74, 75, 76, 77, 78, 79, 80, 81],
-};
+const SWEEP_06: TraceEventGroup =
+    TraceEventGroup { name: "port_01", event_ids: [74, 75, 76, 77, 78, 79, 80, 81] };
 /// Group 7: stream port events (ports 2-3).
-const SWEEP_07: TraceEventGroup = TraceEventGroup {
-    name: "port_23",
-    event_ids: [82, 83, 84, 85, 86, 87, 88, 89],
-};
+const SWEEP_07: TraceEventGroup =
+    TraceEventGroup { name: "port_23", event_ids: [82, 83, 84, 85, 86, 87, 88, 89] };
 /// Group 8: stream port events (ports 4-5).
-const SWEEP_08: TraceEventGroup = TraceEventGroup {
-    name: "port_45",
-    event_ids: [90, 91, 92, 93, 94, 95, 96, 97],
-};
+const SWEEP_08: TraceEventGroup =
+    TraceEventGroup { name: "port_45", event_ids: [90, 91, 92, 93, 94, 95, 96, 97] };
 /// Group 9: stream port events (ports 6-7).
-const SWEEP_09: TraceEventGroup = TraceEventGroup {
-    name: "port_67",
-    event_ids: [98, 99, 100, 101, 102, 103, 104, 105],
-};
+const SWEEP_09: TraceEventGroup =
+    TraceEventGroup { name: "port_67", event_ids: [98, 99, 100, 101, 102, 103, 104, 105] };
 /// Group 10: broadcast channels 0-7.
-const SWEEP_10: TraceEventGroup = TraceEventGroup {
-    name: "broadcast_0to7",
-    event_ids: [107, 108, 109, 110, 111, 112, 113, 114],
-};
+const SWEEP_10: TraceEventGroup =
+    TraceEventGroup { name: "broadcast_0to7", event_ids: [107, 108, 109, 110, 111, 112, 113, 114] };
 /// Group 11: broadcast channels 8-15.
-const SWEEP_11: TraceEventGroup = TraceEventGroup {
-    name: "broadcast_8to15",
-    event_ids: [115, 116, 117, 118, 119, 120, 121, 122],
-};
+const SWEEP_11: TraceEventGroup =
+    TraceEventGroup { name: "broadcast_8to15", event_ids: [115, 116, 117, 118, 119, 120, 121, 122] };
 /// Group 12: user-defined events (padded with NONE).
-const SWEEP_12: TraceEventGroup = TraceEventGroup {
-    name: "user_event",
-    event_ids: [124, 125, 126, 127, 0, 0, 0, 0],
-};
+const SWEEP_12: TraceEventGroup =
+    TraceEventGroup { name: "user_event", event_ids: [124, 125, 126, 127, 0, 0, 0, 0] };
 
 /// All sweep groups in order. Used by the trace sweep orchestration.
 pub const TRACE_EVENT_GROUPS: &[&TraceEventGroup] = &[
-    &SWEEP_00, &SWEEP_01, &SWEEP_02, &SWEEP_03,
-    &SWEEP_04, &SWEEP_05, &SWEEP_06, &SWEEP_07,
-    &SWEEP_08, &SWEEP_09, &SWEEP_10, &SWEEP_11,
-    &SWEEP_12,
+    &SWEEP_00, &SWEEP_01, &SWEEP_02, &SWEEP_03, &SWEEP_04, &SWEEP_05, &SWEEP_06, &SWEEP_07, &SWEEP_08,
+    &SWEEP_09, &SWEEP_10, &SWEEP_11, &SWEEP_12,
 ];
 
 /// Number of sweep groups.
@@ -428,18 +390,10 @@ fn find_write32_value_offset(insts: &[u8], target_reg_off: u32) -> Option<usize>
             let pad_ok = insts[i + 1..i + 8].iter().all(|&b| b == 0);
             if pad_ok {
                 // Read reg_off (u64 LE at offset 8)
-                let reg_off_lo = u32::from_le_bytes([
-                    insts[i + 8],
-                    insts[i + 9],
-                    insts[i + 10],
-                    insts[i + 11],
-                ]);
-                let reg_off_hi = u32::from_le_bytes([
-                    insts[i + 12],
-                    insts[i + 13],
-                    insts[i + 14],
-                    insts[i + 15],
-                ]);
+                let reg_off_lo =
+                    u32::from_le_bytes([insts[i + 8], insts[i + 9], insts[i + 10], insts[i + 11]]);
+                let reg_off_hi =
+                    u32::from_le_bytes([insts[i + 12], insts[i + 13], insts[i + 14], insts[i + 15]]);
 
                 if reg_off_lo == target_reg_off && reg_off_hi == 0 {
                     return Some(i + 16);
@@ -461,16 +415,10 @@ pub fn patch_insts_for_group(insts: &[u8], group: &TraceEventGroup) -> Result<Ve
     let event1_addr = npu_address(TRACE_TILE_COL, TRACE_TILE_ROW, TRACE_EVENT1_OFFSET);
 
     let off0 = find_write32_value_offset(insts, event0_addr).ok_or_else(|| {
-        format!(
-            "Write32 for Trace_Event0 (addr 0x{:08X}) not found in insts.bin",
-            event0_addr
-        )
+        format!("Write32 for Trace_Event0 (addr 0x{:08X}) not found in insts.bin", event0_addr)
     })?;
     let off1 = find_write32_value_offset(insts, event1_addr).ok_or_else(|| {
-        format!(
-            "Write32 for Trace_Event1 (addr 0x{:08X}) not found in insts.bin",
-            event1_addr
-        )
+        format!("Write32 for Trace_Event1 (addr 0x{:08X}) not found in insts.bin", event1_addr)
     })?;
 
     let mut patched = insts.to_vec();
@@ -512,12 +460,8 @@ pub fn trim_trace_buffer(data: &[u8]) -> usize {
         if word == 0xFEFEFEFE {
             // Check if next two words are 0x00000000.
             if i + 2 < word_count {
-                let w1 = u32::from_le_bytes([
-                    data[off + 4], data[off + 5], data[off + 6], data[off + 7],
-                ]);
-                let w2 = u32::from_le_bytes([
-                    data[off + 8], data[off + 9], data[off + 10], data[off + 11],
-                ]);
+                let w1 = u32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
+                let w2 = u32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
                 if w1 == 0 && w2 == 0 {
                     // Include the sentinel word itself (matches mlir-aie behavior).
                     return (i + 1) * 4;
@@ -664,10 +608,7 @@ pub fn decode_binary_trace(data: &[u8]) -> Vec<DecodedEvent> {
                 for _ in 0..repeats {
                     abs_cycle += last_delta;
                     for ev in &last_events {
-                        events.push(DecodedEvent {
-                            slot: ev.slot,
-                            abs_cycle,
-                        });
+                        events.push(DecodedEvent { slot: ev.slot, abs_cycle });
                     }
                 }
                 i += 1;
@@ -687,10 +628,7 @@ pub fn decode_binary_trace(data: &[u8]) -> Vec<DecodedEvent> {
                 for _ in 0..repeats {
                     abs_cycle += last_delta;
                     for ev in &last_events {
-                        events.push(DecodedEvent {
-                            slot: ev.slot,
-                            abs_cycle,
-                        });
+                        events.push(DecodedEvent { slot: ev.slot, abs_cycle });
                     }
                 }
                 i += 2;
@@ -701,8 +639,7 @@ pub fn decode_binary_trace(data: &[u8]) -> Vec<DecodedEvent> {
                 if i + 4 > 28 {
                     break;
                 }
-                let event_mask =
-                    ((b as u16 & 0x03) << 6) | ((payload[i + 1] as u16) >> 2);
+                let event_mask = ((b as u16 & 0x03) << 6) | ((payload[i + 1] as u16) >> 2);
                 let delta = (((payload[i + 1] & 0x03) as u64) << 16)
                     | ((payload[i + 2] as u64) << 8)
                     | (payload[i + 3] as u64);
@@ -724,10 +661,8 @@ pub fn decode_binary_trace(data: &[u8]) -> Vec<DecodedEvent> {
                 if i + 3 > 28 {
                     break;
                 }
-                let event_mask =
-                    ((b as u16 & 0x03) << 6) | ((payload[i + 1] as u16) >> 2);
-                let delta = (((payload[i + 1] & 0x03) as u64) << 8)
-                    | (payload[i + 2] as u64);
+                let event_mask = ((b as u16 & 0x03) << 6) | ((payload[i + 1] as u16) >> 2);
+                let delta = (((payload[i + 1] & 0x03) as u64) << 8) | (payload[i + 2] as u64);
                 abs_cycle += delta;
                 last_delta = delta;
                 last_events.clear();
@@ -746,8 +681,7 @@ pub fn decode_binary_trace(data: &[u8]) -> Vec<DecodedEvent> {
                 if i + 2 > 28 {
                     break;
                 }
-                let event_mask =
-                    ((b as u16 & 0x0F) << 4) | ((payload[i + 1] as u16) >> 4);
+                let event_mask = ((b as u16 & 0x0F) << 4) | ((payload[i + 1] as u16) >> 4);
                 let delta = (payload[i + 1] & 0x0F) as u64;
                 abs_cycle += delta;
                 last_delta = delta;
@@ -768,9 +702,8 @@ pub fn decode_binary_trace(data: &[u8]) -> Vec<DecodedEvent> {
                     break;
                 }
                 let slot = (b >> 2) & 0x07;
-                let delta = (((b & 0x03) as u64) << 16)
-                    | ((payload[i + 1] as u64) << 8)
-                    | (payload[i + 2] as u64);
+                let delta =
+                    (((b & 0x03) as u64) << 16) | ((payload[i + 1] as u64) << 8) | (payload[i + 2] as u64);
                 abs_cycle += delta;
                 last_delta = delta;
                 last_events.clear();
@@ -786,8 +719,7 @@ pub fn decode_binary_trace(data: &[u8]) -> Vec<DecodedEvent> {
                     break;
                 }
                 let slot = (b >> 2) & 0x07;
-                let delta =
-                    (((b & 0x03) as u64) << 8) | (payload[i + 1] as u64);
+                let delta = (((b & 0x03) as u64) << 8) | (payload[i + 1] as u64);
                 abs_cycle += delta;
                 last_delta = delta;
                 last_events.clear();
@@ -903,14 +835,14 @@ impl std::fmt::Display for TraceComparison {
         } else {
             String::new()
         };
-        let label = if self.filtered_count > 0 { "canon" } else { "events" };
+        let label = if self.filtered_count > 0 {
+            "canon"
+        } else {
+            "events"
+        };
 
         if self.sequence_match {
-            write!(
-                f,
-                "{}: MATCH ({} {}){}",
-                self.group_name, self.npu_event_count, label, suffix,
-            )
+            write!(f, "{}: MATCH ({} {}){}", self.group_name, self.npu_event_count, label, suffix,)
         } else if let Some((idx, npu_s, emu_s)) = self.first_divergence {
             write!(
                 f,
@@ -1081,10 +1013,7 @@ pub struct CanonicalTrace {
 
 /// Produce a canonical trace by filtering out non-deterministic slots
 /// and aligning to cycle 0.
-pub fn canonicalize(
-    events: &[DecodedEvent],
-    slot_classes: &[SlotClass; 8],
-) -> CanonicalTrace {
+pub fn canonicalize(events: &[DecodedEvent], slot_classes: &[SlotClass; 8]) -> CanonicalTrace {
     let mut filtered_counts = [0usize; 8];
 
     // Count filtered events per slot.
@@ -1100,27 +1029,17 @@ pub fn canonicalize(
     // Keep only Deterministic and Boundary events, align to cycle 0.
     let kept: Vec<DecodedEvent> = events
         .iter()
-        .filter(|e| matches!(
-            slot_classes[e.slot as usize],
-            SlotClass::Deterministic | SlotClass::Boundary,
-        ))
+        .filter(|e| matches!(slot_classes[e.slot as usize], SlotClass::Deterministic | SlotClass::Boundary,))
         .cloned()
         .collect();
 
     let base = kept.first().map(|e| e.abs_cycle).unwrap_or(0);
     let aligned = kept
         .into_iter()
-        .map(|e| DecodedEvent {
-            slot: e.slot,
-            abs_cycle: e.abs_cycle.saturating_sub(base),
-        })
+        .map(|e| DecodedEvent { slot: e.slot, abs_cycle: e.abs_cycle.saturating_sub(base) })
         .collect();
 
-    CanonicalTrace {
-        events: aligned,
-        slot_classes: *slot_classes,
-        filtered_counts,
-    }
+    CanonicalTrace { events: aligned, slot_classes: *slot_classes, filtered_counts }
 }
 
 /// Compare NPU and emulator traces after canonicalizing both.
@@ -1135,8 +1054,8 @@ pub fn compare_canonical(
 ) -> (TraceComparison, usize) {
     let npu_canon = canonicalize(npu_events, slot_classes);
     let emu_canon = canonicalize(emu_events, slot_classes);
-    let total_filtered = npu_canon.filtered_counts.iter().sum::<usize>()
-        + emu_canon.filtered_counts.iter().sum::<usize>();
+    let total_filtered =
+        npu_canon.filtered_counts.iter().sum::<usize>() + emu_canon.filtered_counts.iter().sum::<usize>();
     let mut comp = compare_event_sequences(&npu_canon.events, &emu_canon.events, group_name);
     comp.filtered_count = total_filtered;
     (comp, total_filtered)
@@ -1181,35 +1100,42 @@ impl std::fmt::Display for DeterminismReport {
 
         let total = self.dimensions.len();
         let det_count = self.dimensions.iter().filter(|d| d.deterministic).count();
-        let varying: Vec<&DimensionVerdict> = self.dimensions
-            .iter()
-            .filter(|d| !d.deterministic)
-            .collect();
+        let varying: Vec<&DimensionVerdict> = self.dimensions.iter().filter(|d| !d.deterministic).collect();
 
         if self.compute_deterministic {
-            write!(f, "PASS (compute deterministic, {} reps, {}/{} dims)",
-                   self.num_reps, det_count, total)?;
+            write!(f, "PASS (compute deterministic, {} reps, {}/{} dims)", self.num_reps, det_count, total)?;
         } else {
             // List the failing sequence dimensions for quick diagnosis.
-            let failing_seqs: Vec<&str> = self.dimensions.iter()
+            let failing_seqs: Vec<&str> = self
+                .dimensions
+                .iter()
                 .filter(|d| !d.deterministic && d.summary.contains("diverge"))
                 .map(|d| d.name.as_str())
                 .collect();
             if failing_seqs.is_empty() {
-                write!(f, "FAIL ({} reps, {}/{} dims)",
-                       self.num_reps, det_count, total)?;
+                write!(f, "FAIL ({} reps, {}/{} dims)", self.num_reps, det_count, total)?;
             } else {
-                write!(f, "FAIL ({} diverge, {} reps, {}/{} dims)",
-                       failing_seqs.join("+"), self.num_reps, det_count, total)?;
+                write!(
+                    f,
+                    "FAIL ({} diverge, {} reps, {}/{} dims)",
+                    failing_seqs.join("+"),
+                    self.num_reps,
+                    det_count,
+                    total
+                )?;
             }
         }
 
         if !varying.is_empty() {
-            write!(f, " [varying: {}]",
-                   varying.iter()
-                       .map(|d| format!("{}={}", d.name, d.summary))
-                       .collect::<Vec<_>>()
-                       .join(", "))?;
+            write!(
+                f,
+                " [varying: {}]",
+                varying
+                    .iter()
+                    .map(|d| format!("{}={}", d.name, d.summary))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
         }
 
         Ok(())
@@ -1224,10 +1150,7 @@ fn align_events(events: &[DecodedEvent]) -> Vec<DecodedEvent> {
     let base = events[0].abs_cycle;
     events
         .iter()
-        .map(|e| DecodedEvent {
-            slot: e.slot,
-            abs_cycle: e.abs_cycle.saturating_sub(base),
-        })
+        .map(|e| DecodedEvent { slot: e.slot, abs_cycle: e.abs_cycle.saturating_sub(base) })
         .collect()
 }
 
@@ -1319,10 +1242,7 @@ fn extract_deltas(events: &[DecodedEvent]) -> Vec<u64> {
     if unique_cycles.len() < 2 {
         return Vec::new();
     }
-    unique_cycles
-        .windows(2)
-        .map(|w| w[1].saturating_sub(w[0]))
-        .collect()
+    unique_cycles.windows(2).map(|w| w[1].saturating_sub(w[0])).collect()
 }
 
 // -------------------------------------------------------------------------
@@ -1413,11 +1333,7 @@ fn scalar_dim(dims: &mut Vec<DimensionVerdict>, name: &str, values: &[u64]) {
         let max = *values.iter().max().unwrap();
         format!("{}-{}", min, max)
     };
-    dims.push(DimensionVerdict {
-        name: name.to_string(),
-        deterministic,
-        summary,
-    });
+    dims.push(DimensionVerdict { name: name.to_string(), deterministic, summary });
 }
 
 /// Add a sequence dimension: one Vec<u64> per rep, compared element-by-element.
@@ -1457,11 +1373,7 @@ fn sequence_dim(dims: &mut Vec<DimensionVerdict>, name: &str, sequences: &[Vec<u
         format!("diverge@{}/{}", match_count, max_len)
     };
 
-    dims.push(DimensionVerdict {
-        name: name.to_string(),
-        deterministic,
-        summary,
-    });
+    dims.push(DimensionVerdict { name: name.to_string(), deterministic, summary });
 }
 
 /// Analyze all dimensions from aligned event streams.
@@ -1469,10 +1381,7 @@ fn sequence_dim(dims: &mut Vec<DimensionVerdict>, name: &str, sequences: &[Vec<u
 /// Automatically generates global scalar, global sequence, and per-slot
 /// dimensions. Per-slot dimensions are only included for slots that fire
 /// in at least one rep.
-fn analyze_dimensions(
-    reps: &[Vec<DecodedEvent>],
-    start_times: &[u64],
-) -> Vec<DimensionVerdict> {
+fn analyze_dimensions(reps: &[Vec<DecodedEvent>], start_times: &[u64]) -> Vec<DimensionVerdict> {
     let mut dims = Vec::new();
     if reps.len() < 2 {
         return dims;
@@ -1485,41 +1394,58 @@ fn analyze_dimensions(
     let total_events: Vec<u64> = reps.iter().map(|e| e.len() as u64).collect();
     scalar_dim(&mut dims, "total_events", &total_events);
 
-    let unique_cycles: Vec<u64> = reps.iter().map(|e| {
-        let mut set = std::collections::BTreeSet::new();
-        for ev in e { set.insert(ev.abs_cycle); }
-        set.len() as u64
-    }).collect();
+    let unique_cycles: Vec<u64> = reps
+        .iter()
+        .map(|e| {
+            let mut set = std::collections::BTreeSet::new();
+            for ev in e {
+                set.insert(ev.abs_cycle);
+            }
+            set.len() as u64
+        })
+        .collect();
     scalar_dim(&mut dims, "unique_cycles", &unique_cycles);
 
-    let durations: Vec<u64> = reps.iter().map(|e| {
-        if e.len() < 2 { 0 }
-        else { e.last().unwrap().abs_cycle - e.first().unwrap().abs_cycle }
-    }).collect();
+    let durations: Vec<u64> = reps
+        .iter()
+        .map(|e| {
+            if e.len() < 2 {
+                0
+            } else {
+                e.last().unwrap().abs_cycle - e.first().unwrap().abs_cycle
+            }
+        })
+        .collect();
     scalar_dim(&mut dims, "duration", &durations);
 
     // --- Global sequence dimensions ---
-    let all_deltas: Vec<Vec<u64>> = reps.iter()
-        .map(|e| extract_deltas(e))
-        .collect();
+    let all_deltas: Vec<Vec<u64>> = reps.iter().map(|e| extract_deltas(e)).collect();
     sequence_dim(&mut dims, "deltas", &all_deltas);
 
-    let all_transitions: Vec<Vec<u64>> = reps.iter()
+    let all_transitions: Vec<Vec<u64>> = reps
+        .iter()
         .map(|e| extract_transitions(e).iter().map(|slots| slot_bitmask(slots)).collect())
         .collect();
     sequence_dim(&mut dims, "transitions", &all_transitions);
 
-    let all_skeletons: Vec<Vec<u64>> = reps.iter().map(|e| {
-        extract_skeleton(e).iter().map(|entry| match entry {
-            SkeletonEntry::Single(s) => 1u64 << *s,
-            SkeletonEntry::Multiple(ss) => slot_bitmask(ss),
-        }).collect()
-    }).collect();
+    let all_skeletons: Vec<Vec<u64>> = reps
+        .iter()
+        .map(|e| {
+            extract_skeleton(e)
+                .iter()
+                .map(|entry| match entry {
+                    SkeletonEntry::Single(s) => 1u64 << *s,
+                    SkeletonEntry::Multiple(ss) => slot_bitmask(ss),
+                })
+                .collect()
+        })
+        .collect();
     sequence_dim(&mut dims, "skeleton", &all_skeletons);
 
     // --- Per-slot dimensions (auto-generated for all 8 slots) ---
     for slot in 0..8u8 {
-        let fires: Vec<u64> = reps.iter()
+        let fires: Vec<u64> = reps
+            .iter()
             .map(|e| e.iter().filter(|ev| ev.slot == slot).count() as u64)
             .collect();
 
@@ -1532,29 +1458,25 @@ fn analyze_dimensions(
 
         scalar_dim(&mut dims, &format!("{}_fires", slot_name), &fires);
 
-        let edges: Vec<u64> = reps.iter()
-            .map(|e| count_slot_edges(e, slot) as u64)
-            .collect();
+        let edges: Vec<u64> = reps.iter().map(|e| count_slot_edges(e, slot) as u64).collect();
         scalar_dim(&mut dims, &format!("{}_edges", slot_name), &edges);
 
-        let first_cycles: Vec<u64> = reps.iter()
+        let first_cycles: Vec<u64> = reps
+            .iter()
             .map(|e| e.iter().find(|ev| ev.slot == slot).map(|ev| ev.abs_cycle).unwrap_or(0))
             .collect();
         scalar_dim(&mut dims, &format!("{}_first_cycle", slot_name), &first_cycles);
 
-        let last_cycles: Vec<u64> = reps.iter()
+        let last_cycles: Vec<u64> = reps
+            .iter()
             .map(|e| e.iter().rev().find(|ev| ev.slot == slot).map(|ev| ev.abs_cycle).unwrap_or(0))
             .collect();
         scalar_dim(&mut dims, &format!("{}_last_cycle", slot_name), &last_cycles);
 
-        let max_runs: Vec<u64> = reps.iter()
-            .map(|e| max_consecutive_run(e, slot) as u64)
-            .collect();
+        let max_runs: Vec<u64> = reps.iter().map(|e| max_consecutive_run(e, slot) as u64).collect();
         scalar_dim(&mut dims, &format!("{}_max_run", slot_name), &max_runs);
 
-        let slot_dts: Vec<Vec<u64>> = reps.iter()
-            .map(|e| extract_slot_deltas(e, slot))
-            .collect();
+        let slot_dts: Vec<Vec<u64>> = reps.iter().map(|e| extract_slot_deltas(e, slot)).collect();
         sequence_dim(&mut dims, &format!("{}_deltas", slot_name), &slot_dts);
     }
 
@@ -1570,10 +1492,7 @@ pub fn check_determinism(traces: &[Vec<u8>]) -> DeterminismReport {
     let num_reps = traces.len();
 
     // Decode all traces.
-    let all_events: Vec<Vec<DecodedEvent>> = traces
-        .iter()
-        .map(|t| decode_binary_trace(t))
-        .collect();
+    let all_events: Vec<Vec<DecodedEvent>> = traces.iter().map(|t| decode_binary_trace(t)).collect();
 
     // Start times (pre-alignment).
     let start_times: Vec<u64> = all_events
@@ -1582,10 +1501,7 @@ pub fn check_determinism(traces: &[Vec<u8>]) -> DeterminismReport {
         .collect();
 
     // Align all events to start at cycle 0.
-    let aligned: Vec<Vec<DecodedEvent>> = all_events
-        .iter()
-        .map(|events| align_events(events))
-        .collect();
+    let aligned: Vec<Vec<DecodedEvent>> = all_events.iter().map(|events| align_events(events)).collect();
 
     // Classify slots from the aligned events.
     let slot_classes = classify_slots_from_reps(&aligned);
@@ -1604,12 +1520,7 @@ pub fn check_determinism(traces: &[Vec<u8>]) -> DeterminismReport {
         .map(|d| d.deterministic)
         .unwrap_or(true);
 
-    DeterminismReport {
-        num_reps,
-        dimensions,
-        compute_deterministic,
-        slot_classes,
-    }
+    DeterminismReport { num_reps, dimensions, compute_deterministic, slot_classes }
 }
 
 /// Write a sweep summary file.
@@ -1667,9 +1578,7 @@ pub struct MergedEvent {
 ///
 /// This produces an "all-event trace" when given traces from all sweep groups.
 /// Requires deterministic execution across groups (verified separately).
-pub fn merge_sweep_traces(
-    group_traces: &[(&TraceEventGroup, &[DecodedEvent])],
-) -> Vec<MergedEvent> {
+pub fn merge_sweep_traces(group_traces: &[(&TraceEventGroup, &[DecodedEvent])]) -> Vec<MergedEvent> {
     let mut merged = Vec::new();
     for &(group, events) in group_traces {
         for ev in events {
@@ -1678,10 +1587,7 @@ pub fn merge_sweep_traces(
                 let event_id = group.event_ids[slot];
                 // Skip NONE (0) padding slots in the last group.
                 if event_id != 0 {
-                    merged.push(MergedEvent {
-                        event_id,
-                        abs_cycle: ev.abs_cycle,
-                    });
+                    merged.push(MergedEvent { event_id, abs_cycle: ev.abs_cycle });
                 }
             }
         }
@@ -1720,10 +1626,7 @@ mod tests {
     #[test]
     fn test_event_group_packing() {
         // Verify packing of known event IDs into register values.
-        let group = TraceEventGroup {
-            name: "test",
-            event_ids: [1, 2, 3, 4, 5, 6, 7, 8],
-        };
+        let group = TraceEventGroup { name: "test", event_ids: [1, 2, 3, 4, 5, 6, 7, 8] };
         assert_eq!(group.event0_value(), u32::from_le_bytes([1, 2, 3, 4]));
         assert_eq!(group.event1_value(), u32::from_le_bytes([5, 6, 7, 8]));
     }
@@ -1749,7 +1652,7 @@ mod tests {
         // reg_off as u64 LE
         instr.extend_from_slice(&reg_off.to_le_bytes());
         instr.extend_from_slice(&0u32.to_le_bytes()); // high 32 bits
-        // value as u32 LE
+                                                      // value as u32 LE
         instr.extend_from_slice(&value.to_le_bytes());
         // size as u32 LE
         instr.extend_from_slice(&24u32.to_le_bytes());
@@ -1838,12 +1741,8 @@ mod tests {
 
         for word_idx in 0..7 {
             let base = word_idx * 4;
-            let word = u32::from_be_bytes([
-                padded[base],
-                padded[base + 1],
-                padded[base + 2],
-                padded[base + 3],
-            ]);
+            let word =
+                u32::from_be_bytes([padded[base], padded[base + 1], padded[base + 2], padded[base + 3]]);
             packet.extend_from_slice(&word.to_le_bytes());
         }
 
@@ -1857,7 +1756,7 @@ mod tests {
         // slot=1, delta=3: byte = (1 << 4) | 3 = 0x13
         // slot=2, delta=5: byte = (2 << 4) | 5 = 0x25
         let events = vec![
-            0xF0, 0, 0, 0, 0, 0, 0, 100, // Start marker: timer=100
+            0xF0, 0, 0, 0, 0, 0, 0, 100,  // Start marker: timer=100
             0x13, // slot=1, delta=3 -> abs=103
             0x25, // slot=2, delta=5 -> abs=108
         ];
@@ -1920,7 +1819,7 @@ mod tests {
     fn test_decode_trims_padding() {
         // One packet of real data followed by padding sentinel + zeros.
         let events = vec![
-            0xF0, 0, 0, 0, 0, 0, 0, 100, // Start marker: timer=100
+            0xF0, 0, 0, 0, 0, 0, 0, 100,  // Start marker: timer=100
             0x13, // slot=1, delta=3
         ];
         let mut buf = make_trace_packet(&events);
@@ -1962,10 +1861,7 @@ mod tests {
 
     #[test]
     fn test_compare_divergent_slot() {
-        let npu = vec![
-            DecodedEvent { slot: 1, abs_cycle: 100 },
-            DecodedEvent { slot: 3, abs_cycle: 200 },
-        ];
+        let npu = vec![DecodedEvent { slot: 1, abs_cycle: 100 }, DecodedEvent { slot: 3, abs_cycle: 200 }];
         let emu = vec![
             DecodedEvent { slot: 1, abs_cycle: 100 },
             DecodedEvent { slot: 4, abs_cycle: 200 }, // slot mismatch
@@ -1982,10 +1878,7 @@ mod tests {
             DecodedEvent { slot: 3, abs_cycle: 200 },
             DecodedEvent { slot: 5, abs_cycle: 300 },
         ];
-        let emu = vec![
-            DecodedEvent { slot: 1, abs_cycle: 100 },
-            DecodedEvent { slot: 3, abs_cycle: 200 },
-        ];
+        let emu = vec![DecodedEvent { slot: 1, abs_cycle: 100 }, DecodedEvent { slot: 3, abs_cycle: 200 }];
         let comp = compare_event_sequences(&npu, &emu, "test");
         assert!(!comp.sequence_match);
         assert_eq!(comp.first_divergence, Some((2, 5, u8::MAX)));
@@ -2071,12 +1964,12 @@ mod tests {
         // This is the real-world case: host scheduling jitter shifts the
         // start time but the kernel executes identically.
         let trace_a = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 100, // timer=100
+            0xF0, 0, 0, 0, 0, 0, 0, 100,  // timer=100
             0x13, // slot=1, delta=3
             0x25, // slot=2, delta=5
         ]);
         let trace_b = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 200, // timer=200 (different start!)
+            0xF0, 0, 0, 0, 0, 0, 0, 200,  // timer=200 (different start!)
             0x13, // slot=1, delta=3 (same)
             0x25, // slot=2, delta=5 (same)
         ]);
@@ -2092,13 +1985,11 @@ mod tests {
         // Same transitions but different inter-event deltas: this is a real
         // timing difference in instruction execution, not just DMA jitter.
         let trace_a = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 0,
-            0x13, // slot=1, delta=3
+            0xF0, 0, 0, 0, 0, 0, 0, 0, 0x13, // slot=1, delta=3
             0x25, // slot=2, delta=5
         ]);
         let trace_b = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 0,
-            0x1A, // slot=1, delta=10 (different!)
+            0xF0, 0, 0, 0, 0, 0, 0, 0, 0x1A, // slot=1, delta=10 (different!)
             0x2F, // slot=2, delta=15 (different!)
         ]);
         let report = check_determinism(&[trace_a, trace_b]);
@@ -2111,14 +2002,12 @@ mod tests {
     fn test_determinism_pass_prefix_match() {
         // One trace has fewer events but is a prefix of the other.
         let trace_long = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 0,
-            0x13, // slot=1
+            0xF0, 0, 0, 0, 0, 0, 0, 0, 0x13, // slot=1
             0x25, // slot=2
             0x37, // slot=3
         ]);
         let trace_short = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 0,
-            0x13, // slot=1
+            0xF0, 0, 0, 0, 0, 0, 0, 0, 0x13, // slot=1
             0x25, // slot=2
         ]);
         let report = check_determinism(&[trace_long, trace_short]);
@@ -2130,13 +2019,11 @@ mod tests {
         // Two traces with the same number of events but different timing.
         // This represents a genuine instruction-level divergence.
         let trace_a = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 0,
-            0x13, // slot=1, delta=3
+            0xF0, 0, 0, 0, 0, 0, 0, 0, 0x13, // slot=1, delta=3
             0x25, // slot=2, delta=5 -> delta between events = 5
         ]);
         let trace_b = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 0,
-            0x13, // slot=1, delta=3
+            0xF0, 0, 0, 0, 0, 0, 0, 0, 0x13, // slot=1, delta=3
             0x29, // slot=2, delta=9 -> delta between events = 9 (different!)
         ]);
         let report = check_determinism(&[trace_a, trace_b]);
@@ -2152,12 +2039,10 @@ mod tests {
         // but there are no deltas to compare, so compute_deterministic
         // is vacuously true (insufficient data to determine).
         let trace_a = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 0,
-            0x13, // slot=1
+            0xF0, 0, 0, 0, 0, 0, 0, 0, 0x13, // slot=1
         ]);
         let trace_b = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 0,
-            0x23, // slot=2 (different!)
+            0xF0, 0, 0, 0, 0, 0, 0, 0, 0x23, // slot=2 (different!)
         ]);
         let report = check_determinism(&[trace_a, trace_b]);
         assert!(!report.is_deterministic("transitions"), "transitions should diverge");
@@ -2184,25 +2069,27 @@ mod tests {
         // Trace A: stall phase with delta=0, repeated via repeat0.
         let trace_a = make_trace_packet(&[
             0xF0, 0, 0, 0, 0, 0, 0, 0, // START timer=0
-            0xCA, 0x00,                   // Multiple0: slots 5+7, delta=0
-            0xE5,                         // Repeat0 x5
-            0x70,                         // Single0: slot=7, delta=0
-            0xE3,                         // Repeat0 x3
+            0xCA, 0x00, // Multiple0: slots 5+7, delta=0
+            0xE5, // Repeat0 x5
+            0x70, // Single0: slot=7, delta=0
+            0xE3, // Repeat0 x3
         ]);
         // Trace B: same pattern but longer stall (more repeats).
         let trace_b = make_trace_packet(&[
             0xF0, 0, 0, 0, 0, 0, 0, 0, // START timer=0
-            0xCA, 0x00,                   // Multiple0: slots 5+7, delta=0
-            0xEF,                         // Repeat0 x15  (much longer stall!)
-            0x70,                         // Single0: slot=7, delta=0
-            0xE3,                         // Repeat0 x3
+            0xCA, 0x00, // Multiple0: slots 5+7, delta=0
+            0xEF, // Repeat0 x15  (much longer stall!)
+            0x70, // Single0: slot=7, delta=0
+            0xE3, // Repeat0 x3
         ]);
         let report = check_determinism(&[trace_a, trace_b]);
         assert!(report.is_deterministic("transitions"), "transitions should match");
         assert!(report.compute_deterministic, "compute should be deterministic");
         // Slot 5 (LOCK_STALL proxy) should have different fire counts.
-        assert!(!report.is_deterministic("slot5_fires"),
-            "slot 5 fire counts should differ due to repeat count variance");
+        assert!(
+            !report.is_deterministic("slot5_fires"),
+            "slot 5 fire counts should differ due to repeat count variance"
+        );
     }
 
     #[test]
@@ -2210,14 +2097,12 @@ mod tests {
         // Two traces where slot 1 fires identically but slot 2 fires different
         // amounts (via repeat count variation).
         let trace_a = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 0,
-            0x11, // slot=1, delta=1
+            0xF0, 0, 0, 0, 0, 0, 0, 0, 0x11, // slot=1, delta=1
             0x21, // slot=2, delta=1
             0xE3, // Repeat0 x3 (replays slot=2 three more times)
         ]);
         let trace_b = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 0,
-            0x11, // slot=1, delta=1
+            0xF0, 0, 0, 0, 0, 0, 0, 0, 0x11, // slot=1, delta=1
             0x21, // slot=2, delta=1
             0xE7, // Repeat0 x7 (replays slot=2 seven more times)
         ]);
@@ -2239,14 +2124,12 @@ mod tests {
         // Verify that the dimension framework produces per-slot dimensions
         // for active slots and skips inactive ones.
         let trace_a = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 0,
-            0x13, // slot=1, delta=3
+            0xF0, 0, 0, 0, 0, 0, 0, 0, 0x13, // slot=1, delta=3
             0x25, // slot=2, delta=5
             0x13, // slot=1, delta=3
         ]);
         let trace_b = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 0,
-            0x13, // slot=1, delta=3
+            0xF0, 0, 0, 0, 0, 0, 0, 0, 0x13, // slot=1, delta=3
             0x25, // slot=2, delta=5
             0x13, // slot=1, delta=3
         ]);
@@ -2274,12 +2157,10 @@ mod tests {
     fn test_dimension_display_shows_varying() {
         // Verify the Display impl lists varying dimensions.
         let trace_a = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 100,
-            0x13, // slot=1, delta=3
+            0xF0, 0, 0, 0, 0, 0, 0, 100, 0x13, // slot=1, delta=3
         ]);
         let trace_b = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 200,
-            0x13, // slot=1, delta=3
+            0xF0, 0, 0, 0, 0, 0, 0, 200, 0x13, // slot=1, delta=3
         ]);
         let report = check_determinism(&[trace_a, trace_b]);
         let display = format!("{}", report);
@@ -2340,10 +2221,18 @@ mod tests {
             );
         }
         // Config-dependent events.
-        for id in 5..=8 { assert!(!CORE_EVENTS[id].sweepable, "PERF_CNT_{}", id - 5); }
-        for id in 9..=12 { assert!(!CORE_EVENTS[id].sweepable, "COMBO_{}", id - 9); }
-        for id in 13..=14 { assert!(!CORE_EVENTS[id].sweepable, "EDGE_{}", id - 13); }
-        for id in 16..=21 { assert!(!CORE_EVENTS[id].sweepable, "PC_{}", id - 16); }
+        for id in 5..=8 {
+            assert!(!CORE_EVENTS[id].sweepable, "PERF_CNT_{}", id - 5);
+        }
+        for id in 9..=12 {
+            assert!(!CORE_EVENTS[id].sweepable, "COMBO_{}", id - 9);
+        }
+        for id in 13..=14 {
+            assert!(!CORE_EVENTS[id].sweepable, "EDGE_{}", id - 13);
+        }
+        for id in 16..=21 {
+            assert!(!CORE_EVENTS[id].sweepable, "PC_{}", id - 16);
+        }
     }
 
     #[test]
@@ -2352,13 +2241,15 @@ mod tests {
         let mut actual: Vec<u8> = Vec::new();
         for group in TRACE_EVENT_GROUPS {
             for &id in &group.event_ids {
-                if id != 0 { // Skip NONE padding
+                if id != 0 {
+                    // Skip NONE padding
                     actual.push(id);
                 }
             }
         }
         assert_eq!(
-            actual, expected,
+            actual,
+            expected,
             "Sweep groups should cover all sweepable events in order.\n\
              Missing: {:?}\nExtra: {:?}",
             expected.iter().filter(|id| !actual.contains(id)).collect::<Vec<_>>(),
@@ -2385,14 +2276,8 @@ mod tests {
     #[test]
     fn test_merge_sweep_traces() {
         // Two groups, each with some events at different cycles.
-        let group_a = TraceEventGroup {
-            name: "a",
-            event_ids: [10, 20, 30, 40, 50, 60, 70, 80],
-        };
-        let group_b = TraceEventGroup {
-            name: "b",
-            event_ids: [11, 21, 31, 41, 51, 61, 71, 81],
-        };
+        let group_a = TraceEventGroup { name: "a", event_ids: [10, 20, 30, 40, 50, 60, 70, 80] };
+        let group_b = TraceEventGroup { name: "b", event_ids: [11, 21, 31, 41, 51, 61, 71, 81] };
         let events_a = vec![
             DecodedEvent { slot: 0, abs_cycle: 100 }, // event_id=10
             DecodedEvent { slot: 2, abs_cycle: 300 }, // event_id=30
@@ -2401,10 +2286,7 @@ mod tests {
             DecodedEvent { slot: 1, abs_cycle: 200 }, // event_id=21
             DecodedEvent { slot: 3, abs_cycle: 400 }, // event_id=41
         ];
-        let merged = merge_sweep_traces(&[
-            (&group_a, &events_a),
-            (&group_b, &events_b),
-        ]);
+        let merged = merge_sweep_traces(&[(&group_a, &events_a), (&group_b, &events_b)]);
         assert_eq!(merged.len(), 4);
         // Sorted by abs_cycle.
         assert_eq!(merged[0], MergedEvent { event_id: 10, abs_cycle: 100 });
@@ -2416,10 +2298,7 @@ mod tests {
     #[test]
     fn test_merge_skips_none_padding() {
         // Group with NONE padding slots (like SWEEP_12).
-        let group = TraceEventGroup {
-            name: "padded",
-            event_ids: [124, 125, 0, 0, 0, 0, 0, 0],
-        };
+        let group = TraceEventGroup { name: "padded", event_ids: [124, 125, 0, 0, 0, 0, 0, 0] };
         let events = vec![
             DecodedEvent { slot: 0, abs_cycle: 100 }, // event_id=124
             DecodedEvent { slot: 1, abs_cycle: 200 }, // event_id=125
@@ -2458,10 +2337,7 @@ mod tests {
     fn test_classify_slots_timing_dependent() {
         // Slot 5 fires different amounts across reps -> TimingDependent.
         let reps = vec![
-            vec![
-                DecodedEvent { slot: 5, abs_cycle: 10 },
-                DecodedEvent { slot: 5, abs_cycle: 20 },
-            ],
+            vec![DecodedEvent { slot: 5, abs_cycle: 10 }, DecodedEvent { slot: 5, abs_cycle: 20 }],
             vec![
                 DecodedEvent { slot: 5, abs_cycle: 10 },
                 DecodedEvent { slot: 5, abs_cycle: 20 },
@@ -2478,13 +2354,9 @@ mod tests {
     fn test_classify_slots_boundary() {
         // Slot 2 fires 0 or 1 times across reps -> Boundary.
         let reps = vec![
-            vec![
-                DecodedEvent { slot: 2, abs_cycle: 10 },
-            ],
-            vec![],  // slot 2 doesn't fire
-            vec![
-                DecodedEvent { slot: 2, abs_cycle: 30 },
-            ],
+            vec![DecodedEvent { slot: 2, abs_cycle: 10 }],
+            vec![], // slot 2 doesn't fire
+            vec![DecodedEvent { slot: 2, abs_cycle: 30 }],
         ];
         let classes = classify_slots_from_reps(&reps);
         assert_eq!(classes[2], SlotClass::Boundary);
@@ -2557,10 +2429,8 @@ mod tests {
             DecodedEvent { slot: 1, abs_cycle: 115 },
             DecodedEvent { slot: 5, abs_cycle: 120 }, // stall (filtered)
         ];
-        let emu_events = vec![
-            DecodedEvent { slot: 1, abs_cycle: 10 },
-            DecodedEvent { slot: 1, abs_cycle: 20 },
-        ];
+        let emu_events =
+            vec![DecodedEvent { slot: 1, abs_cycle: 10 }, DecodedEvent { slot: 1, abs_cycle: 20 }];
         let mut classes = [SlotClass::Inactive; 8];
         classes[1] = SlotClass::Deterministic;
         classes[5] = SlotClass::TimingDependent;
