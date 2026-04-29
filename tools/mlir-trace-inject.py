@@ -146,19 +146,26 @@ def parse_args():
                    help="grounding events for shim PL trace unit.")
 
     # Sweep events (rotated per batch; injection writes the initial pattern).
+    # 'all' is reserved for future use (auto-enumeration from the event DB);
+    # currently the resolver treats it the same as None (= use defaults).
     p.add_argument("--core-sweep-events", default=None,
-                   help="comma-separated event names to sweep on compute cores; "
-                        "'all' enumerates from the event header. Default uses "
-                        "the existing 5 hard-coded core defaults.")
+                   help="comma-separated event names to sweep on compute cores. "
+                        "Default uses the 5 hard-coded core sweep events (the "
+                        "_TRACE_DEFAULT_CORE_EVENTS minus whatever appears in "
+                        "--core-grounding). 'all' is reserved for future use; "
+                        "currently behaves the same as the default.")
     p.add_argument("--memmod-sweep-events", default=None,
                    help="comma-separated event names to sweep on compute memmod. "
-                        "Default: don't inject memmod trace.")
+                        "Default: don't inject memmod trace. 'all' is reserved "
+                        "for future use; currently behaves the same as the default.")
     p.add_argument("--memtile-sweep-events", default=None,
                    help="comma-separated event names to sweep on memtile. "
-                        "Default: don't inject memtile trace.")
+                        "Default: don't inject memtile trace. 'all' is reserved "
+                        "for future use; currently behaves the same as the default.")
     p.add_argument("--shim-sweep-events", default=None,
                    help="comma-separated event names to sweep on shim. "
-                        "Default: don't inject shim trace.")
+                        "Default: don't inject shim trace. 'all' is reserved "
+                        "for future use; currently behaves the same as the default.")
 
     p.add_argument("--perfcnt-period", type=int, default=1024,
                    help="cycles between PERF_CNT_0_EVENT fires when grounding "
@@ -379,11 +386,17 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
     # Resolve per-module-type event lists from CLI args.
     # _resolve_events(grounding, sweep, defaults) -> list of up to 8 event names.
     #
-    # Core defaults: the 5 sweep events from _TRACE_DEFAULT_CORE_EVENTS that are
-    # NOT in the default grounding set (PERF_CNT_0, INSTR_EVENT_0, INSTR_EVENT_1).
-    _DEFAULT_GROUNDING_NAMES = {"PERF_CNT_0", "INSTR_EVENT_0", "INSTR_EVENT_1"}
+    # Compute the actual core grounding set from --core-grounding (NOT from a
+    # hardcoded default), so that a user passing a custom grounding set still
+    # gets a non-overlapping sweep default. The dedup in _resolve_events would
+    # save us from a real bug today, but driving the sweep-default exclusion
+    # off the hardcoded set would be silently misleading the moment someone
+    # changes --core-grounding.
+    core_grounding_names = {
+        s.strip() for s in args.core_grounding.split(",") if s.strip()
+    }
     _core_sweep_defaults = tuple(
-        e for e in _TRACE_DEFAULT_CORE_EVENTS if e not in _DEFAULT_GROUNDING_NAMES
+        e for e in _TRACE_DEFAULT_CORE_EVENTS if e not in core_grounding_names
     )
 
     core_events = _resolve_events(
@@ -398,9 +411,6 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
         else aied.TraceMode.EventTime
     )
     # Whether to emit perf counter config blocks (only when PERF_CNT_0 is in grounding).
-    core_grounding_names = {
-        s.strip() for s in args.core_grounding.split(",") if s.strip()
-    }
     emit_core_perfcnt = "PERF_CNT_0" in core_grounding_names
 
     # Inject into every device that has a runtime_sequence. Each device gets
@@ -441,9 +451,6 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
 
         with InsertionPoint(terminator.operation):
             for col, row, tile_val in compute_tiles:
-                # Capture loop variables for the decorator closure.
-                _events = core_events
-                _mode = mode_attr
                 # The @aied.trace(tile, sym) decorator-form builder:
                 #   1. Constructs TraceOp(tile=tile_val, sym_name=sym_name)
                 #   2. Appends a block to the op's single region
@@ -453,13 +460,16 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                 # This exactly mirrors how mlir-aie's configure_trace() works.
                 # The decorator invokes _trace_body synchronously before the next
                 # loop iteration reassigns the name, so redefinition is safe.
+                # core_events / mode_attr are loop-invariant, so the closure
+                # references them directly; when per-tile event sets are
+                # introduced this becomes a per-iteration capture.
                 @aied.trace(tile_val, _trace_sym(col, row))
                 def _trace_body():  # noqa: F811 -- redefinition is intentional (one per tile)
-                    aied.trace_mode(_mode)
+                    aied.trace_mode(mode_attr)
                     # packet id is the conventional starting id; AIEInsertTraceFlows
                     # reassigns ids when it lowers the declarative ops.
                     aied.trace_packet(_TRACE_PACKET_ID_START, aied.TracePacketType.Core)
-                    for event_name in _events:
+                    for event_name in core_events:
                         aied.trace_event(event_name)
                     aied.trace_start(broadcast=_TRACE_BROADCAST_START)
                     aied.trace_stop(broadcast=_TRACE_BROADCAST_STOP)
@@ -503,6 +513,13 @@ def main():
     # (per the AM025 register database); memmod, memtile, and shim trace units
     # have no Mode field and always operate in event_time (mode 0). This is a
     # portability warning: the non-core events will be recorded, just in mode 0.
+    #
+    # TODO: when memmod/memtile/shim injection actually lands, extend this
+    # trigger to also check whether the user passed a non-default value for
+    # --memmod-grounding / --memtile-grounding / --shim-grounding.  The Mode
+    # constraint applies to grounding too, but today the grounding flags are
+    # inert (only sweep events drive injection), so warning on sweep alone is
+    # the only condition that produces a misleading outcome.
     if args.trace_mode == "event_pc" and any(
         s for s in [
             args.memmod_sweep_events,

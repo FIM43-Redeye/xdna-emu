@@ -2,10 +2,11 @@
 
 Two separate test sections:
 
-1. Tests for trace-inject.py (shim DMA channel conflict guard, target assignment,
-   control overlay detection).  These functions are pure Python and do not require
-   the mlir-aie environment.  trace-inject.py itself is not yet committed, so these
-   tests are skipped at collection time if the file is absent.
+1. Tests for the deprecated trace-inject.py at tools/deprecated/trace-inject.py
+   (shim DMA channel conflict guard, target assignment, control overlay
+   detection).  These functions are pure Python and do not require the
+   mlir-aie environment.  The deprecated tool is still the authoritative
+   implementation of these helpers until they're ported to the new injector.
 
 2. Tests for mlir-trace-inject.py (Task 4 of the A.2 PC-anchored validation plan):
    --trace-mode, per-module grounding/sweep flags, and perfcnt config block emission.
@@ -21,11 +22,17 @@ from pathlib import Path
 import pytest
 
 # ---------------------------------------------------------------------------
-# Section 1: trace-inject.py imports (conditional -- file may not exist yet)
+# Section 1: deprecated trace-inject.py imports
 # ---------------------------------------------------------------------------
 import importlib.util
 
-_TRACE_INJECT_PATH = Path(__file__).parent / "trace-inject.py"
+# The original trace-inject.py was moved to tools/deprecated/ when the new
+# mlir-trace-inject.py replaced it as the active injector.  The helper
+# functions tested here (find_occupied_shim_dma_channels, has_control_overlay,
+# assign_targets_to_shims) are still authoritative for the regex-based shim
+# DMA channel conflict guard and have not been ported to the new injector;
+# we keep them under test from the deprecated location.
+_TRACE_INJECT_PATH = Path(__file__).parent / "deprecated" / "trace-inject.py"
 _trace_inject_missing = not _TRACE_INJECT_PATH.exists()
 
 if not _trace_inject_missing:
@@ -40,16 +47,16 @@ if not _trace_inject_missing:
     has_control_overlay = _mod.has_control_overlay
 else:
     # Provide stubs so the name resolution at module level succeeds.
-    # Tests in Section 1 are skipped via the pytestmark below.
+    # Tests in Section 1 are skipped via _skip_section1 below.
     def find_occupied_shim_dma_channels(text):  # noqa: F811
-        raise NotImplementedError("trace-inject.py not present")
+        raise NotImplementedError("deprecated/trace-inject.py not present")
 
     def has_control_overlay(text):  # noqa: F811
-        raise NotImplementedError("trace-inject.py not present")
+        raise NotImplementedError("deprecated/trace-inject.py not present")
 
 _skip_section1 = pytest.mark.skipif(
     _trace_inject_missing,
-    reason="trace-inject.py not yet committed",
+    reason="tools/deprecated/trace-inject.py not present",
 )
 
 
@@ -487,6 +494,19 @@ class TestAssignTargetsToShims:
 
 _MLIR_INJECT = Path(__file__).parent / "mlir-trace-inject.py"
 
+# Import the helper functions directly (not the whole module) for pure-Python
+# unit testing of _resolve_events.  The hyphen in the filename means we need
+# importlib here too.  Importing the module's top level does NOT import the
+# heavy mlir-aie deps -- those are imported lazily inside main().
+_mti_spec = importlib.util.spec_from_file_location(
+    "mlir_trace_inject", _MLIR_INJECT,
+)
+_mti_mod = importlib.util.module_from_spec(_mti_spec)
+sys.modules["mlir_trace_inject"] = _mti_mod
+_mti_spec.loader.exec_module(_mti_mod)
+
+_resolve_events = _mti_mod._resolve_events
+
 # Minimal MLIR with one compute tile (col=0, row=2) and a non-empty
 # runtime_sequence so the injector can walk both the device body and
 # the runtime sequence block.
@@ -526,6 +546,67 @@ def run_inject(argv: list) -> int:
         # capsys.readouterr() can capture them.
     )
     return result.returncode
+
+
+class TestResolveEvents:
+    """Pure-Python unit tests for _resolve_events() (no mlir-aie env needed).
+
+    Validates the dedup + cap-at-8 contract that drives event-slot assignment
+    in the injector.
+    """
+
+    def test_grounding_only(self):
+        """No sweep, no defaults -> just grounding."""
+        result = _resolve_events("PERF_CNT_0,INSTR_EVENT_0", None, None)
+        assert result == ["PERF_CNT_0", "INSTR_EVENT_0"]
+
+    def test_grounding_plus_sweep(self):
+        """Explicit sweep is appended after grounding."""
+        result = _resolve_events(
+            "PERF_CNT_0",
+            "INSTR_VECTOR,MEMORY_STALL",
+            None,
+        )
+        assert result == ["PERF_CNT_0", "INSTR_VECTOR", "MEMORY_STALL"]
+
+    def test_dedup_sweep_against_grounding(self):
+        """Sweep events that already appear in grounding are deduplicated."""
+        result = _resolve_events(
+            grounding="PERF_CNT_0,INSTR_VECTOR",
+            sweep="INSTR_VECTOR,MEMORY_STALL,LOCK_STALL",
+            defaults=None,
+        )
+        assert result == [
+            "PERF_CNT_0", "INSTR_VECTOR", "MEMORY_STALL", "LOCK_STALL",
+        ]
+        # INSTR_VECTOR must appear exactly once (in its grounding slot).
+        assert result.count("INSTR_VECTOR") == 1
+
+    def test_defaults_used_when_sweep_none(self):
+        """sweep=None falls back to defaults."""
+        result = _resolve_events(
+            "PERF_CNT_0", None, ("INSTR_VECTOR", "MEMORY_STALL"),
+        )
+        assert result == ["PERF_CNT_0", "INSTR_VECTOR", "MEMORY_STALL"]
+
+    def test_all_treated_as_default(self):
+        """sweep='all' is reserved; today it behaves like sweep=None."""
+        result = _resolve_events(
+            "PERF_CNT_0", "all", ("INSTR_VECTOR", "MEMORY_STALL"),
+        )
+        assert result == ["PERF_CNT_0", "INSTR_VECTOR", "MEMORY_STALL"]
+
+    def test_caps_at_eight(self):
+        """Result is capped at 8 slots (hardware trace-unit limit)."""
+        sweep = ",".join(f"E{i}" for i in range(20))
+        result = _resolve_events("G0,G1", sweep, None)
+        assert len(result) == 8
+        assert result[:2] == ["G0", "G1"]
+
+    def test_empty_grounding(self):
+        """Empty grounding -> sweep fills all slots."""
+        result = _resolve_events("", "A,B,C", None)
+        assert result == ["A", "B", "C"]
 
 
 class TestMlirTraceInjectMode:
