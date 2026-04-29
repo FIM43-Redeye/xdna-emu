@@ -470,11 +470,7 @@ mod tests {
             L1_REG_BLOCK_NORTH_VALUE_A,
         ];
         for off in offsets {
-            assert!(
-                ctrl.read_register(off).is_some(),
-                "offset {:#x} not readable",
-                off
-            );
+            assert!(ctrl.read_register(off).is_some(), "offset {:#x} not readable", off);
         }
     }
 
@@ -493,11 +489,7 @@ mod tests {
             L1_REG_BLOCK_NORTH_VALUE_A + L1_SWITCH_OFFSET,
         ];
         for off in offsets {
-            assert!(
-                ctrl.read_register(off).is_some(),
-                "offset {:#x} not readable",
-                off
-            );
+            assert!(ctrl.read_register(off).is_some(), "offset {:#x} not readable", off);
         }
     }
 
@@ -737,19 +729,9 @@ mod tests {
     #[test]
     fn l2_all_register_offsets_readable() {
         let ctrl = L2InterruptController::new();
-        let offsets = [
-            L2_REG_MASK,
-            L2_REG_ENABLE,
-            L2_REG_DISABLE,
-            L2_REG_STATUS,
-            L2_REG_INTERRUPT,
-        ];
+        let offsets = [L2_REG_MASK, L2_REG_ENABLE, L2_REG_DISABLE, L2_REG_STATUS, L2_REG_INTERRUPT];
         for off in offsets {
-            assert!(
-                ctrl.read_register(off).is_some(),
-                "offset {:#x} not readable",
-                off
-            );
+            assert!(ctrl.read_register(off).is_some(), "offset {:#x} not readable", off);
         }
     }
 

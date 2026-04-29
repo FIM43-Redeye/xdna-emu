@@ -34,9 +34,8 @@
 //! - **Block_North_Set/Clear**: Write-to-set/clear bits in Block_North_Value.
 
 use super::{
-    L1_BLOCK_VALID_MASK, L1_IRQ_EVENT_FIELD_MASK, L1_IRQ_EVENT_FIELD_STRIDE,
-    L1_NUM_IRQ_EVENTS, L1_REG_BLOCK_NORTH_VALUE_A, L1_REG_MASK_A,
-    L1_SWITCH_OFFSET, L1_VALID_MASK,
+    L1_BLOCK_VALID_MASK, L1_IRQ_EVENT_FIELD_MASK, L1_IRQ_EVENT_FIELD_STRIDE, L1_NUM_IRQ_EVENTS,
+    L1_REG_BLOCK_NORTH_VALUE_A, L1_REG_MASK_A, L1_SWITCH_OFFSET, L1_VALID_MASK,
 };
 
 /// Identifies which switch (A or B) within the L1 interrupt controller.
@@ -73,13 +72,7 @@ struct SwitchState {
 
 impl Default for SwitchState {
     fn default() -> Self {
-        Self {
-            mask: 0,
-            status: 0,
-            irq_no: 0,
-            irq_event: 0,
-            block_north_value: 0,
-        }
+        Self { mask: 0, status: 0, irq_no: 0, irq_event: 0, block_north_value: 0 }
     }
 }
 
@@ -99,9 +92,7 @@ impl L1InterruptController {
     ///
     /// Both switches start disabled (mask=0, status=0).
     pub fn new() -> Self {
-        Self {
-            switches: [SwitchState::default(), SwitchState::default()],
-        }
+        Self { switches: [SwitchState::default(), SwitchState::default()] }
     }
 
     // -- Mask (enable state) --
@@ -202,8 +193,7 @@ impl L1InterruptController {
         let s = &mut self.switches[sw as usize];
         let shift = slot as u32 * L1_IRQ_EVENT_FIELD_STRIDE as u32;
         let field_mask = L1_IRQ_EVENT_FIELD_MASK << shift;
-        s.irq_event = (s.irq_event & !field_mask)
-            | (((event_id as u32) & L1_IRQ_EVENT_FIELD_MASK) << shift);
+        s.irq_event = (s.irq_event & !field_mask) | (((event_id as u32) & L1_IRQ_EVENT_FIELD_MASK) << shift);
     }
 
     /// Read a single IRQ event slot.
@@ -256,8 +246,7 @@ impl L1InterruptController {
         let s = &mut self.switches[sw as usize];
         for slot in 0..L1_NUM_IRQ_EVENTS {
             let shift = slot as u32 * L1_IRQ_EVENT_FIELD_STRIDE as u32;
-            let mapped_event =
-                ((s.irq_event >> shift) & L1_IRQ_EVENT_FIELD_MASK) as u8;
+            let mapped_event = ((s.irq_event >> shift) & L1_IRQ_EVENT_FIELD_MASK) as u8;
             if mapped_event == event_id {
                 let interrupt_id = slot + 16;
                 let bit = 1u32 << interrupt_id;
@@ -298,15 +287,15 @@ impl L1InterruptController {
     pub fn read_register(&self, offset: u32) -> Option<u32> {
         let (sw, local) = Self::resolve_switch(offset)?;
         match local {
-            0x00 => Some(self.read_mask(sw)),                  // Mask
-            0x04 => Some(self.read_mask(sw)),                  // Enable (reads as mask)
-            0x08 => Some(0),                                   // Disable (write-only)
-            0x0C => Some(self.read_status(sw)),                // Status
-            0x10 => Some(self.read_irq_no(sw)),                // IRQ_NO
-            0x14 => Some(self.read_irq_event(sw)),             // IRQ_EVENT
-            0x18 => Some(self.read_block_north_value(sw)),     // Block_Set (reads value)
-            0x1C => Some(0),                                   // Block_Clear (write-only)
-            0x20 => Some(self.read_block_north_value(sw)),     // Block_Value
+            0x00 => Some(self.read_mask(sw)),              // Mask
+            0x04 => Some(self.read_mask(sw)),              // Enable (reads as mask)
+            0x08 => Some(0),                               // Disable (write-only)
+            0x0C => Some(self.read_status(sw)),            // Status
+            0x10 => Some(self.read_irq_no(sw)),            // IRQ_NO
+            0x14 => Some(self.read_irq_event(sw)),         // IRQ_EVENT
+            0x18 => Some(self.read_block_north_value(sw)), // Block_Set (reads value)
+            0x1C => Some(0),                               // Block_Clear (write-only)
+            0x20 => Some(self.read_block_north_value(sw)), // Block_Value
             _ => None,
         }
     }
@@ -323,7 +312,7 @@ impl L1InterruptController {
             0x00 => { /* Mask is read-only */ }
             0x04 => self.write_enable(sw, value),
             0x08 => self.write_disable(sw, value),
-            0x0C => self.clear_status(sw, value),              // Write-to-clear (ack)
+            0x0C => self.clear_status(sw, value), // Write-to-clear (ack)
             0x10 => self.write_irq_no(sw, value),
             0x14 => self.write_irq_event(sw, value),
             0x18 => self.write_block_north_set(sw, value),

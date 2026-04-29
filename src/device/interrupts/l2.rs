@@ -27,8 +27,10 @@
 //! - `NumBroadcastIds = 16`
 //! - `NumNoCIntr = 4`
 
-use super::{L2_REG_DISABLE, L2_REG_ENABLE, L2_REG_INTERRUPT, L2_REG_MASK,
-            L2_REG_STATUS, L2_VALID_MASK, L2_NOC_INTERRUPT_MASK};
+use super::{
+    L2_REG_DISABLE, L2_REG_ENABLE, L2_REG_INTERRUPT, L2_REG_MASK, L2_REG_STATUS, L2_VALID_MASK,
+    L2_NOC_INTERRUPT_MASK,
+};
 
 /// Level 2 interrupt controller for a shim NoC tile.
 ///
@@ -50,10 +52,7 @@ impl L2InterruptController {
     ///
     /// All channels start disabled (mask=0, status=0).
     pub fn new() -> Self {
-        Self {
-            mask: 0,
-            status: 0,
-        }
+        Self { mask: 0, status: 0 }
     }
 
     // -- Mask (enable state) --
