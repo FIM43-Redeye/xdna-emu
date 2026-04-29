@@ -285,9 +285,9 @@ fn test_lazy_bd_parsing_single_word_writes() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn start_dma_channel_memtile_preserves_bd_high_bits() {
+fn dma_start_queue_memtile_preserves_bd_high_bits() {
     use crate::device::regdb::device_reg_layout;
-    use xdna_archspec::types::DmaDirection;
+    use xdna_archspec::aie2::registers::dma::MEMTILE_DMA_S2MM_0_START_QUEUE;
 
     let mut state = DeviceState::new_npu1();
     let col: u8 = 0;
@@ -300,7 +300,11 @@ fn start_dma_channel_memtile_preserves_bd_high_bits() {
     let lay = &device_reg_layout().memtile_channel;
     let bd_id_raw = lay.start_bd_id.insert(0, 26);
 
-    state.start_dma_channel(col, row, /*channel*/ 0, DmaDirection::S2mm, bd_id_raw);
+    // Drive the universal register bus on the MemTile S2MM ch0 Start_Queue
+    // offset; this routes through `write_memtile_dma_channel`, the live
+    // path that both CDO and non-CDO writes traverse post-D.3.
+    let addr = TileAddress::encode(col, row, MEMTILE_DMA_S2MM_0_START_QUEUE);
+    state.write_register(addr, bd_id_raw).unwrap();
 
     let tile = state.array.tile(col, row);
     assert_eq!(
@@ -312,13 +316,13 @@ fn start_dma_channel_memtile_preserves_bd_high_bits() {
 }
 
 #[test]
-fn start_dma_channel_compute_uses_4bit_field() {
+fn dma_start_queue_compute_uses_4bit_field() {
     // Compute Start_BD_ID is 4-bit; values >= 16 are intentionally
     // truncated by hardware (compute tiles only have 16 BDs).  This
     // pins the negative side of the helper -- compute tiles must keep
     // the legacy 4-bit semantics.
     use crate::device::regdb::device_reg_layout;
-    use xdna_archspec::types::DmaDirection;
+    use xdna_archspec::aie2::registers::dma::COMPUTE_DMA_S2MM_0_START_QUEUE;
 
     let mut state = DeviceState::new_npu1();
     let col: u8 = 0;
@@ -328,7 +332,11 @@ fn start_dma_channel_compute_uses_4bit_field() {
     let lay = &device_reg_layout().memory_channel;
     let bd_id_raw = lay.start_bd_id.insert(0, 7);
 
-    state.start_dma_channel(col, row, /*channel*/ 0, DmaDirection::S2mm, bd_id_raw);
+    // Drive the universal register bus on the Compute S2MM ch0 Start_Queue
+    // offset; this routes through `write_dma_channel`, the live path that
+    // both CDO and non-CDO writes traverse post-D.3.
+    let addr = TileAddress::encode(col, row, COMPUTE_DMA_S2MM_0_START_QUEUE);
+    state.write_register(addr, bd_id_raw).unwrap();
 
     let tile = state.array.tile(col, row);
     assert_eq!(tile.dma_channels[0].current_bd, 7);
@@ -336,9 +344,9 @@ fn start_dma_channel_compute_uses_4bit_field() {
 
 #[test]
 fn channel_field_layout_helper_picks_memtile_for_memtile_kind() {
-    // Direct test of the helper that both `start_dma_channel` and
-    // `mask_write_dma_channel` (and `write_dma_channel`) now consult
-    // before extracting Start_BD_ID / Repeat_Count / Enable_Token_Issue.
+    // Direct test of the helper that `write_dma_channel` and
+    // `mask_write_dma_channel` consult before extracting
+    // Start_BD_ID / Repeat_Count / Enable_Token_Issue.
     //
     // Note: dispatch routes MemTile DMA mask-writes to
     // `mask_write_memtile_dma_channel` (a separate handler), so the
@@ -377,11 +385,11 @@ fn channel_field_layout_helper_picks_memtile_for_memtile_kind() {
 /// Regression test for D.3 Bug 1: CORE_CONTROL readback divergence.
 ///
 /// A CDO write to CORE_CONTROL must be visible via the register-bus
-/// read path (`tile.read_register_pure(offset)`). The CDO promotion
-/// path currently routes through `apply_core_enable` which only
-/// updates the typed `tile.core.control` mirror and skips
-/// `tile.registers`. After D.3 commit 2 the promotion path goes
-/// through `write_register` which stores raw, fixing this.
+/// read path (`tile.read_register_pure(offset)`). Pre-D.3 the CDO
+/// promotion path bypassed `tile.registers` (only the typed
+/// `tile.core.control` mirror was updated). Post-D.3 the promotion
+/// path runs through `apply_device_op::CoreEnable -> write_register`,
+/// which stores raw, fixing this.
 #[test]
 fn core_control_cdo_write_is_readable_via_register_bus() {
     use crate::parser::cdo::semantics::lower;
@@ -411,11 +419,10 @@ fn core_control_cdo_write_is_readable_via_register_bus() {
 ///
 /// A CDO MaskWrite to CORE_CONTROL with a partial mask must only
 /// modify the bits covered by the mask, leaving other bits unchanged.
-/// The current CDO promotion path drops the mask in
-/// `lower_mask_write` and `apply_core_enable` overwrites the full
-/// word, corrupting bits 31..1. After D.3 commit 2 MaskWrite stops
-/// promoting and rides through `mask_write_register` which mask-
-/// blends correctly.
+/// Pre-D.3 the CDO promotion path dropped the mask in
+/// `lower_mask_write` and overwrote the full word, corrupting bits
+/// 31..1. Post-D.3 MaskWrite is no longer promoted and rides through
+/// `mask_write_register`, which mask-blends correctly.
 #[test]
 fn core_control_cdo_mask_write_preserves_unmasked_bits() {
     use crate::parser::cdo::semantics::lower;
