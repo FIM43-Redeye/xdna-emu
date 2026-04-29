@@ -275,16 +275,10 @@ fn update_stalls_reflected_in_status() {
     assert_ne!(state.read_status() & (1 << STATUS_LOCK_STALL_S_LSB), 0);
 
     state.update_stalls(false, false, true, false);
-    assert_ne!(
-        state.read_status() & (1 << STATUS_STREAM_STALL_SS0_LSB),
-        0
-    );
+    assert_ne!(state.read_status() & (1 << STATUS_STREAM_STALL_SS0_LSB), 0);
 
     state.update_stalls(false, false, false, true);
-    assert_ne!(
-        state.read_status() & (1 << STATUS_CASCADE_STALL_SCD_LSB),
-        0
-    );
+    assert_ne!(state.read_status() & (1 << STATUS_CASCADE_STALL_SCD_LSB), 0);
 }
 
 #[test]
@@ -334,10 +328,7 @@ fn single_step_via_debug_control0() {
 
     // Read back.
     let readback = state.read_debug_control0();
-    assert_eq!(
-        (readback & DBG_CTRL0_SSTEP_COUNT_MASK) >> DBG_CTRL0_SSTEP_COUNT_LSB,
-        3
-    );
+    assert_eq!((readback & DBG_CTRL0_SSTEP_COUNT_MASK) >> DBG_CTRL0_SSTEP_COUNT_LSB, 3);
 }
 
 #[test]
@@ -539,10 +530,7 @@ fn full_lifecycle_enable_run_halt_resume_done() {
     // Step 3: halt.
     assert!(state.request_halt());
     assert!(state.is_halted());
-    assert_ne!(
-        state.read_status() & (1 << STATUS_DEBUG_HALT_LSB),
-        0
-    );
+    assert_ne!(state.read_status() & (1 << STATUS_DEBUG_HALT_LSB), 0);
 
     // Step 4: resume.
     assert!(state.request_resume());
@@ -601,12 +589,6 @@ fn status_register_combined_bits() {
 
     // Check unexpected bits are clear.
     assert_eq!(status & (1 << STATUS_RESET_LSB), 0);
-    assert_eq!(
-        status & (1 << STATUS_STREAM_STALL_SS0_LSB),
-        0
-    );
-    assert_eq!(
-        status & (1 << STATUS_CASCADE_STALL_SCD_LSB),
-        0
-    );
+    assert_eq!(status & (1 << STATUS_STREAM_STALL_SS0_LSB), 0);
+    assert_eq!(status & (1 << STATUS_CASCADE_STALL_SCD_LSB), 0);
 }

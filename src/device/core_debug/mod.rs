@@ -369,13 +369,7 @@ impl CoreDebugState {
     ///
     /// These are transient -- they reflect the current cycle's state and
     /// should be called every cycle (or at least before any status read).
-    pub fn update_stalls(
-        &mut self,
-        mem: bool,
-        lock: bool,
-        stream: bool,
-        cascade: bool,
-    ) {
+    pub fn update_stalls(&mut self, mem: bool, lock: bool, stream: bool, cascade: bool) {
         self.mem_stall = mem;
         self.lock_stall = lock;
         self.stream_stall = stream;
@@ -462,8 +456,7 @@ impl CoreDebugState {
             self.request_resume();
         }
 
-        let sstep_count =
-            ((value & DBG_CTRL0_SSTEP_COUNT_MASK) >> DBG_CTRL0_SSTEP_COUNT_LSB) as u8;
+        let sstep_count = ((value & DBG_CTRL0_SSTEP_COUNT_MASK) >> DBG_CTRL0_SSTEP_COUNT_LSB) as u8;
         self.single_step_count = sstep_count;
         self.single_step = sstep_count > 0;
     }
@@ -542,8 +535,7 @@ impl CoreDebugState {
                 true
             }
             // Read-only registers: accept the write (return true) but drop it.
-            REG_CORE_STATUS | REG_DEBUG_STATUS | REG_CORE_PC | REG_CORE_SP
-            | REG_CORE_LR => true,
+            REG_CORE_STATUS | REG_DEBUG_STATUS | REG_CORE_PC | REG_CORE_SP | REG_CORE_LR => true,
             _ => false,
         }
     }
