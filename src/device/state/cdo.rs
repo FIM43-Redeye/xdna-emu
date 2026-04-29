@@ -124,11 +124,14 @@ impl DeviceState {
     /// compute routing as the single source of truth for raw register
     /// writes and avoids duplicating tile-local effect logic.
     ///
-    /// Structured ops (`CoreEnable`, `DmaStart`) call dedicated helpers
-    /// (`apply_core_enable`, `start_dma_channel`) that
-    /// replicate the CDO-specific side effects that used to live
-    /// inline in `write_core_register`'s CORE_CONTROL branch and
-    /// `write_dma_channel`'s Start_Queue branch.
+    /// Structured ops (`CoreEnable`, `DmaStart`) also route through
+    /// `write_register`: the existing offset-dispatch branches in
+    /// `write_core_register` (CORE_CONTROL) and `write_dma_channel`
+    /// (Start_Queue) are the single source of truth for the typed
+    /// effects, so the CDO and non-CDO paths produce identical
+    /// observable state. The typed variants survive on `DeviceOp`
+    /// as parser-side semantic markers, not parallel device
+    /// handlers (see D.3 spec for the rationale).
     pub(super) fn apply_device_op(&mut self, op: &DeviceOp) -> Result<()> {
         match op {
             DeviceOp::RegWrite { tile, offset, value } => {
@@ -150,11 +153,27 @@ impl DeviceState {
                 }
                 self.dma_write(addr, &bytes)?;
             }
-            DeviceOp::CoreEnable { tile, enabled, value } => {
-                self.apply_core_enable(tile.col, tile.row, *enabled, *value);
+            DeviceOp::CoreEnable { tile, enabled: _, value } => {
+                // Route through the universal register bus. The
+                // typed `enabled` flag is intentionally ignored on
+                // apply -- `write_core_register`'s CORE_CONTROL
+                // branch derives it from `value & 1`. The variant
+                // keeps `enabled` as a parser-side semantic marker
+                // (room for option (a) future work; see D.3 spec).
+                let addr = encode_addr(*tile, xdna_archspec::aie2::registers::CORE_CONTROL);
+                self.write_register(addr, *value)?;
             }
             DeviceOp::DmaStart { tile, channel, dir, bd_id } => {
-                self.start_dma_channel(tile.col, tile.row, *channel, *dir, *bd_id);
+                // Route through the universal register bus.
+                // `start_queue_offset` reconstructs the offset from
+                // (row, channel, dir); `write_register` then dispatches
+                // to `write_dma_channel` (compute) or
+                // `write_memtile_dma_channel` / `write_shim_dma_channel`
+                // (memtile / shim), each of which has the existing
+                // Start_Queue branch that does the typed effect.
+                let offset = start_queue_offset(tile.row, *channel, *dir)?;
+                let addr = encode_addr(*tile, offset);
+                self.write_register(addr, *bd_id)?;
             }
             DeviceOp::MaskPoll { .. } => {
                 // On real hardware MaskPoll blocks until the condition is
@@ -180,4 +199,71 @@ impl DeviceState {
 #[inline]
 fn encode_addr(tile: TileAddr, offset: u32) -> u32 {
     TileAddress::encode(tile.col, tile.row, offset)
+}
+
+/// Inverse of `match_dma_start_queue` in `parser::cdo::semantics`:
+/// reconstruct the Start_Queue / Task_Queue offset for a tile
+/// from `(row, channel, dir)`. Used by `apply_device_op::DmaStart`
+/// to build the address it routes through `write_register`.
+///
+/// Returns an error for invalid (channel, dir) combinations on the
+/// detected tile kind. The lowering side never produces such
+/// combinations (it derives them by matching valid offsets), so
+/// this branch is defensive: an error here means an upstream bug.
+fn start_queue_offset(
+    row: u8,
+    channel: u8,
+    dir: xdna_archspec::types::DmaDirection,
+) -> Result<u32> {
+    use xdna_archspec::aie2::registers::dma::{
+        COMPUTE_DMA_MM2S_0_START_QUEUE, COMPUTE_DMA_MM2S_1_START_QUEUE,
+        COMPUTE_DMA_S2MM_0_START_QUEUE, COMPUTE_DMA_S2MM_1_START_QUEUE,
+        MEMTILE_CHANNELS_PER_DIR, MEMTILE_CHANNEL_STRIDE,
+        MEMTILE_DMA_MM2S_0_START_QUEUE, MEMTILE_DMA_S2MM_0_START_QUEUE,
+        SHIM_CHANNELS_PER_DIR, SHIM_CHANNEL_STRIDE,
+        SHIM_DMA_MM2S_0_TASK_QUEUE, SHIM_DMA_S2MM_0_TASK_QUEUE,
+    };
+    use xdna_archspec::types::DmaDirection;
+
+    match tile_kind_from_row(row) {
+        TileKind::Compute => match (dir, channel) {
+            (DmaDirection::S2mm, 0) => Ok(COMPUTE_DMA_S2MM_0_START_QUEUE),
+            (DmaDirection::S2mm, 1) => Ok(COMPUTE_DMA_S2MM_1_START_QUEUE),
+            (DmaDirection::Mm2s, 0) => Ok(COMPUTE_DMA_MM2S_0_START_QUEUE),
+            (DmaDirection::Mm2s, 1) => Ok(COMPUTE_DMA_MM2S_1_START_QUEUE),
+            _ => anyhow::bail!(
+                "start_queue_offset: invalid compute DMA channel dir={:?} ch={}",
+                dir, channel
+            ),
+        },
+        TileKind::Mem => {
+            if channel >= MEMTILE_CHANNELS_PER_DIR {
+                anyhow::bail!(
+                    "start_queue_offset: memtile channel {} >= {}",
+                    channel, MEMTILE_CHANNELS_PER_DIR
+                );
+            }
+            let base = match dir {
+                DmaDirection::S2mm => MEMTILE_DMA_S2MM_0_START_QUEUE,
+                DmaDirection::Mm2s => MEMTILE_DMA_MM2S_0_START_QUEUE,
+            };
+            Ok(base + (channel as u32) * MEMTILE_CHANNEL_STRIDE)
+        }
+        TileKind::ShimNoc | TileKind::ShimPl => {
+            // tile_kind_from_row currently always returns ShimNoc for row 0;
+            // ShimPl is matched here for enum exhaustiveness so the helper
+            // stays correct if the row->kind classification ever changes.
+            if channel >= SHIM_CHANNELS_PER_DIR {
+                anyhow::bail!(
+                    "start_queue_offset: shim channel {} >= {}",
+                    channel, SHIM_CHANNELS_PER_DIR
+                );
+            }
+            let base = match dir {
+                DmaDirection::S2mm => SHIM_DMA_S2MM_0_TASK_QUEUE,
+                DmaDirection::Mm2s => SHIM_DMA_MM2S_0_TASK_QUEUE,
+            };
+            Ok(base + (channel as u32) * SHIM_CHANNEL_STRIDE)
+        }
+    }
 }

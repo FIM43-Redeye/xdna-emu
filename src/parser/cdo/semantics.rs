@@ -266,33 +266,18 @@ fn lower_write(address: u32, value: u32) -> DeviceOp {
     DeviceOp::RegWrite { tile, offset, value }
 }
 
-/// Lower a `CdoRaw::MaskWrite` to either a promoted `CoreEnable` or a
-/// `RegMask`.
-///
-/// CoreEnable only promotes when the mask touches bit 0 (the enable
-/// bit); a MaskWrite that writes only some other bit of CORE_CONTROL is
-/// not changing the enable state and should remain a masked write.
-/// DMA channel Ctrl writes are rare in MaskWrite form and are not
-/// promoted -- the MaskWrite shape carries enough information for
-/// `device::state` to apply it as a register-level op without losing
-/// semantic data.
+/// Lower a `CdoRaw::MaskWrite` to a `RegMask`.
 fn lower_mask_write(address: u32, mask: u32, value: u32) -> DeviceOp {
     let (tile, offset) = decode_aie2_address(address);
 
-    if offset == CORE_CONTROL && is_compute_row(tile.row) && (mask & 1) != 0 {
-        // Raw `value` is forwarded as-is, matching what the pre-refactor
-        // `mask_write_core_register` CORE_CONTROL branch saw. `device::
-        // state` applies the full mask-blend (read current, replace
-        // masked bits) when it handles the CoreEnable op; the typed op
-        // only needs enough to reconstruct that effect, so the raw
-        // incoming word + enabled flag is sufficient.
-        return DeviceOp::CoreEnable {
-            tile,
-            enabled: (value & 1) != 0,
-            value,
-        };
-    }
-
+    // MaskWrites are NOT promoted to typed ops. Mask-blending lives
+    // on the apply side (`mask_write_register` -> module-specific
+    // mask handler), so the typed handler would either duplicate
+    // it or drop the mask. Letting MaskWrite ride as `RegMask`
+    // keeps mask-blend correctness in one place. If we later want
+    // mask-aware promotion, add `mask: Option<u32>` to
+    // `DeviceOp::CoreEnable` (see D.3 spec, "room preserved for
+    // option (a)").
     DeviceOp::RegMask { tile, offset, mask, value }
 }
 
@@ -621,24 +606,25 @@ mod tests {
     }
 
     #[test]
-    fn core_control_mask_write_touching_bit0_promotes_to_core_enable() {
+    fn core_control_mask_write_touching_bit0_stays_reg_mask() {
+        // Post-D.3: MaskWrites are never promoted to CoreEnable, even
+        // when the mask touches bit 0. Mask-blend correctness lives
+        // on the apply side (mask_write_register -> mask_write_core_register).
         let (col, row) = compute_tile_addr();
         let addr = aie_addr(col, row, CORE_CONTROL);
-        let ops = lower(&CdoRaw::MaskWrite {
-            address: addr,
-            mask: 0x1,
-            value: 0x1,
-        });
-        assert_eq!(ops.len(), 1);
-        match &ops[0] {
-            DeviceOp::CoreEnable { tile, enabled, value } => {
-                assert_eq!(*tile, TileAddr::new(col, row));
-                assert!(*enabled);
-                // MaskWrite forwards the raw value; device::state does
-                // the mask-blend when it applies the op.
-                assert_eq!(*value, 0x1);
+        let op = lower_mask_write(addr, 0x1, 0x0);
+        match op {
+            DeviceOp::RegMask { tile, offset, mask, value } => {
+                assert_eq!(tile.col, col);
+                assert_eq!(tile.row, row);
+                assert_eq!(offset, CORE_CONTROL);
+                assert_eq!(mask, 0x1);
+                assert_eq!(value, 0x0);
             }
-            _ => panic!("expected CoreEnable, got {:?}", ops[0]),
+            other => panic!(
+                "MaskWrite to CORE_CONTROL must lower to RegMask post-D.3, got {:?}",
+                other
+            ),
         }
     }
 
