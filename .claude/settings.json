@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/triple/npu-work/xdna-emu/.claude/hooks/rustfmt-edited.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
