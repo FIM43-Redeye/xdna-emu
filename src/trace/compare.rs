@@ -295,18 +295,30 @@ pub struct CycleBand {
 /// mode-1 trace data for one HW/EMU batch pair.
 #[derive(Debug, Default, Clone)]
 pub struct PCAnchoredReport {
-    /// pkt_type from the TileKey (0 = Core, 3 = MemTile, etc.).
+    /// Tile packet type (0=core, 1=memmod, 2=shim/PL, 3=memtile per mlir-aie
+    /// PacketType enum). Stored as u32 for formatting ergonomics; values 0-7.
     pub pkt_type: u32,
     /// Per event-name PC set diff: (PCs only in HW, PCs only in EMU).
     pub set_diff: HashMap<String, (HashSet<u64>, HashSet<u64>)>,
     /// Per event-name multiset diff: PC -> (hw_count, emu_count, delta).
     pub multiset_diff: HashMap<String, HashMap<u64, (u32, u32, i32)>>,
-    /// Per event-name, per-PC cycle band (populated when perfcnt slot found).
+    /// Per event-name, per-PC cycle band. Populated only when BOTH HW and
+    /// EMU have at least one perfcnt overflow tick; one-sided perfcnt
+    /// presence suppresses cycle-band generation entirely (otherwise the
+    /// missing-side estimate is 0 and every event would falsely flag as
+    /// "exceeds tolerance"). See hw_perfcnt_tick_count / emu_perfcnt_tick_count
+    /// to detect that case.
     pub cycle_bands: HashMap<String, HashMap<u64, CycleBand>>,
     /// Events dropped because abs_cycle == 0 (no-PC sentinel) on HW side.
     pub unanchored_count_hw: usize,
     /// Events dropped because abs_cycle == 0 (no-PC sentinel) on EMU side.
     pub unanchored_count_emu: usize,
+    /// Number of perfcnt overflow ticks observed in HW. Zero means HW had
+    /// no perfcnt clock; cycle bands are skipped entirely.
+    pub hw_perfcnt_tick_count: usize,
+    /// Number of perfcnt overflow ticks observed in EMU. Zero means EMU had
+    /// no perfcnt clock; cycle bands are skipped entirely.
+    pub emu_perfcnt_tick_count: usize,
 }
 
 /// Comparison result for one tile.
@@ -1461,10 +1473,13 @@ fn pair_events(src: &[u64], dst: &[u64]) -> Vec<CorrelationPair> {
 // PC-Anchored analysis (Task 7)
 // ============================================================================
 
-/// Candidate names for the perfcnt overflow event slot.
+/// Canonical event name for the perfcnt overflow slot.
 ///
-/// mlir-aie's trace injection may use either spelling depending on the
-/// version of the event table. We accept both and pick the first match.
+/// mlir-aie consistently uses "PERF_CNT_0" (enum value 5 in all
+/// architecture event tables: aie.py, aie2.py, aie2p.py). The
+/// AM020/AM025 documentation uses "PERF_CNT_0_EVENT" for the same
+/// hardware event; we keep it as a fallback in case a non-mlir-aie
+/// tool ever writes events.json using the documentation name.
 const PERFCNT_SLOT_NAMES: &[&str] = &["PERF_CNT_0", "PERF_CNT_0_EVENT"];
 
 /// Return true if this event name is the perfcnt overflow sentinel.
@@ -1587,8 +1602,22 @@ pub fn compare_pc_anchored_for_tile(
         .cloned()
         .unwrap_or_default();
 
+    // Record perfcnt tick counts so consumers can detect asymmetric or
+    // missing perfcnt clocks without rederiving them from the cycle_bands map.
+    report.hw_perfcnt_tick_count = hw_perfcnt_pcs.len();
+    report.emu_perfcnt_tick_count = emu_perfcnt_pcs.len();
+
+    // Cycle bands require BOTH sides to have at least one perfcnt overflow.
+    // One-sided absence would make `interpolate_cycle_from_perfcnt` return 0
+    // for the missing side, manufacturing a fake "exceeds tolerance" delta
+    // for every event. "No data" is a clearer signal than "fake data".
+    let bands_enabled = !hw_perfcnt_pcs.is_empty() && !emu_perfcnt_pcs.is_empty();
+
     // Estimate perfcnt period from the median inter-overflow PC distance.
     // Falls back to a wide default when there are fewer than 2 ticks.
+    // 1024 matches the default --perfcnt-period in mlir-trace-inject.py.
+    // If fewer than 2 ticks are present on both sides, we cannot estimate
+    // the real period and fall back to this safe default.
     let period: u64 = estimate_perfcnt_period(&hw_perfcnt_pcs)
         .or_else(|| estimate_perfcnt_period(&emu_perfcnt_pcs))
         .unwrap_or(1024);
@@ -1608,11 +1637,17 @@ pub fn compare_pc_anchored_for_tile(
             .insert(name.clone(), (hw_only, emu_only));
 
         // Per-PC multiset diff: count occurrences on each side.
+        // hw_pcs and emu_pcs are sorted (above), so partition_point gives
+        // O(log n) range bounds rather than O(n) linear scans.
         let union: HashSet<u64> = hw_set.union(&emu_set).copied().collect();
         let mut multiset: HashMap<u64, (u32, u32, i32)> = HashMap::new();
         for pc in union {
-            let hw_count = hw_pcs.iter().filter(|&&p| p == pc).count() as u32;
-            let emu_count = emu_pcs.iter().filter(|&&p| p == pc).count() as u32;
+            let hw_lo = hw_pcs.partition_point(|&p| p < pc);
+            let hw_hi = hw_pcs.partition_point(|&p| p <= pc);
+            let hw_count = (hw_hi - hw_lo) as u32;
+            let emu_lo = emu_pcs.partition_point(|&p| p < pc);
+            let emu_hi = emu_pcs.partition_point(|&p| p <= pc);
+            let emu_count = (emu_hi - emu_lo) as u32;
             let delta = hw_count as i32 - emu_count as i32;
             multiset.insert(pc, (hw_count, emu_count, delta));
         }
@@ -1622,7 +1657,8 @@ pub fn compare_pc_anchored_for_tile(
         if perfcnt_name.as_deref() == Some(name.as_str()) {
             continue;
         }
-        if hw_perfcnt_pcs.is_empty() && emu_perfcnt_pcs.is_empty() {
+        // Skip if either side lacks a perfcnt clock (see bands_enabled comment).
+        if !bands_enabled {
             continue;
         }
 
@@ -2929,5 +2965,41 @@ mod tests {
         let period = estimate_perfcnt_period(&pcs).unwrap();
         // Gaps: 90, 100, 110 -> median (idx 1 of 3) = 100.
         assert_eq!(period, 100);
+    }
+
+    #[test]
+    fn estimate_perfcnt_period_two_ticks_uses_single_gap() {
+        // With exactly 2 ticks there is one gap; gaps[gaps.len()/2] == gaps[0].
+        let pcs = vec![100u64, 1124];
+        assert_eq!(estimate_perfcnt_period(&pcs), Some(1024));
+    }
+
+    #[test]
+    fn pc_anchored_one_sided_perfcnt_does_not_produce_misleading_bands() {
+        // HW has perfcnt overflow events; EMU doesn't (the perfcnt clock
+        // isn't reaching the trace unit on the EMU side yet). With a
+        // one-sided perfcnt clock, every interpolated EMU estimate would
+        // be 0 and every band would falsely flag "exceeds tolerance".
+        // Expected: cycle_bands stays empty; tick counts reflect reality.
+        let names = vec!["PERF_CNT_0".to_string(), "INSTR_VECTOR".to_string()];
+        let hw_events = vec![
+            TileEvent { slot: 0, abs_cycle: 100 }, // perfcnt tick
+            TileEvent { slot: 0, abs_cycle: 200 }, // perfcnt tick
+            TileEvent { slot: 1, abs_cycle: 150 }, // INSTR_VECTOR
+        ];
+        let emu_events = vec![
+            // No slot-0 (perfcnt) events on EMU side.
+            TileEvent { slot: 1, abs_cycle: 150 }, // INSTR_VECTOR
+        ];
+        let key = TileKey { col: 0, row: 2, pkt_type: 0 };
+        let report = compare_pc_anchored_for_tile(key, &hw_events, &emu_events, &names);
+        assert!(
+            report.cycle_bands.is_empty(),
+            "asymmetric perfcnt should suppress cycle band generation"
+        );
+        assert_eq!(report.hw_perfcnt_tick_count, 2);
+        assert_eq!(report.emu_perfcnt_tick_count, 0);
+        // Set/multiset diff still works regardless of perfcnt presence.
+        assert!(report.set_diff.contains_key("INSTR_VECTOR"));
     }
 }
