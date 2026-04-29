@@ -2554,11 +2554,16 @@ pub fn compare_sweep_dir_with_opts(
     // Only appended when at least one batch has PC-anchored data.
     let has_pc = batch_results.iter().any(|b| !b.pc_anchored.is_empty());
     if has_pc {
+        let manifest_opt = read_pc1_manifest(sweep_dir);
         let grounding = read_grounding_from_pc1_manifest(sweep_dir);
         let mut pc_suffix = format_report_pc_anchored(&batch_results, &grounding);
 
-        // unsafe_for_pc_join warning from manifest (surfaced at top of suffix).
-        if let Some(manifest) = read_pc1_manifest(sweep_dir) {
+        // unsafe_for_pc_join warning from manifest. Placement note: we keep
+        // the warning inside the PC suffix (rather than prepending to
+        // base_report) because it qualifies the PC-anchored data, not the
+        // standard per-batch report. Anyone reading the PC sections sees
+        // the safety caveat directly above them.
+        if let Some(manifest) = &manifest_opt {
             if manifest.unsafe_for_pc_join {
                 let mut warning = String::new();
                 let _ = writeln!(warning, "{}", "=".repeat(76));
@@ -2579,18 +2584,30 @@ pub fn compare_sweep_dir_with_opts(
                 // Prepend warning to pc_suffix.
                 pc_suffix = warning + &pc_suffix;
             }
+        }
 
-            // Mode-2 baselines note.
-            if manifest.mode2_baseline_captured {
-                let baselines = list_mode2_baselines(sweep_dir);
-                if !baselines.is_empty() {
+        // Mode-2 baselines note. Always list whatever physical files are
+        // present in the mode2-baseline/ directory; the manifest flag is
+        // only a confirmation hint. A corrupted or missing manifest must
+        // not silently suppress real baseline files.
+        let baselines = list_mode2_baselines(sweep_dir);
+        if !baselines.is_empty() {
+            let _ = writeln!(
+                pc_suffix,
+                "Mode-2 baselines captured (deferred to A.2b for comparison):"
+            );
+            for path in &baselines {
+                let _ = writeln!(pc_suffix, "  {}", path.display());
+            }
+            // Cross-check: if the manifest disagrees with the filesystem,
+            // flag it so the user can investigate.
+            if let Some(m) = &manifest_opt {
+                if !m.mode2_baseline_captured {
                     let _ = writeln!(
                         pc_suffix,
-                        "Mode-2 baselines captured (deferred to A.2b for comparison):"
+                        "  (warning: sweep-manifest reports mode2_baseline_captured=false but {} files exist)",
+                        baselines.len()
                     );
-                    for path in &baselines {
-                        let _ = writeln!(pc_suffix, "  {}", path.display());
-                    }
                 }
             }
         }
@@ -2754,6 +2771,13 @@ pub fn format_report_pc_anchored(
                 }
             }
 
+            // Note: cycle_bands.keys() is a strict subset of set_diff.keys()
+            // by construction in compare_pc_anchored_for_tile (every event
+            // with a cycle band also has a set_diff entry, even when that
+            // entry is empty). We therefore don't update event_per_batch
+            // from this loop -- it would already have been populated by
+            // the set_diff iteration above. Cycle deltas alone do not
+            // imply coverage; coverage is defined by set_diff presence.
             for (name, by_pc) in &report.cycle_bands {
                 let deltas = event_cycle_deltas.entry(name.clone()).or_default();
                 for band in by_pc.values() {
@@ -2791,7 +2815,12 @@ pub fn format_report_pc_anchored(
     let _ = writeln!(out, "PC-anchored divergences (sorted by total)");
     let _ = writeln!(out, "{}", "=".repeat(76));
     let mut sorted_div: Vec<_> = event_total_diff.iter().collect();
-    sorted_div.sort_by_key(|(_, (s, m))| std::cmp::Reverse(s + m));
+    // Sort descending by combined magnitude, with alphabetical tie-break.
+    // The explicit secondary key keeps output deterministic across BTreeMap
+    // iteration changes and Rust's sort stability guarantees.
+    sorted_div.sort_by(|(na, (sa, ma)), (nb, (sb, mb))| {
+        (sb + mb).cmp(&(sa + ma)).then_with(|| na.cmp(nb))
+    });
     for (name, (set_size, multiset_mag)) in &sorted_div {
         let _ = writeln!(
             out,
@@ -3514,16 +3543,18 @@ mod tests {
 
     #[test]
     fn pc_anchored_empty_batches_no_pc_section() {
-        // When all batches have empty pc_anchored, format_report_pc_anchored
-        // still runs but produces sections with no event rows — coverage matrix
-        // and divergence summary headers present but no event lines.
-        // More importantly: compare_sweep_dir_with_opts would not append the
-        // PC suffix at all (guarded by `has_pc`). Here we test the formatter
-        // directly with zero batches.
+        // When format_report_pc_anchored runs with zero batches, all three
+        // section headers (coverage, divergence, cycle deltas) are emitted
+        // but contain no event rows. compare_sweep_dir_with_opts would not
+        // append the PC suffix at all in this case (guarded by `has_pc`),
+        // so this test exercises the formatter directly to confirm clean
+        // empty output rather than a panic or malformed sections.
         let grounding = BTreeSet::new();
         let report = format_report_pc_anchored(&[], &grounding);
-        // With no data, sections exist but have no event rows.
+        // All three section headers present.
         assert!(report.contains("PC-anchored coverage"));
+        assert!(report.contains("PC-anchored divergences"));
+        assert!(report.contains("Perfcnt-anchored cycle deltas"));
         // No event names should appear (no events to report).
         assert!(!report.contains("INSTR_VECTOR"));
     }
@@ -3566,6 +3597,98 @@ mod tests {
         // Grounding extraction includes core events.
         let grounding = read_grounding_from_pc1_manifest(&sweep_dir);
         assert!(grounding.contains("PERF_CNT_0"));
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&sweep_dir);
+    }
+
+    #[test]
+    fn pc_anchored_divergence_alphabetical_tiebreak() {
+        // Two events with identical set+multiset magnitude: the secondary
+        // alphabetical key must produce stable, deterministic ordering
+        // (EVENT_AAA before EVENT_ZZZ regardless of HashMap iteration order).
+        let key = TileKey {
+            col: 0,
+            row: 2,
+            pkt_type: 0,
+        };
+        let mut combined = PCAnchoredReport::default();
+        // Both events have a single hw-only PC -> set_diff total = 1 each.
+        let single_pc: HashSet<u64> = [42].iter().cloned().collect();
+        combined
+            .set_diff
+            .insert("EVENT_ZZZ".to_string(), (single_pc.clone(), HashSet::new()));
+        combined
+            .set_diff
+            .insert("EVENT_AAA".to_string(), (single_pc, HashSet::new()));
+        combined
+            .multiset_diff
+            .insert("EVENT_AAA".to_string(), HashMap::new());
+        combined
+            .multiset_diff
+            .insert("EVENT_ZZZ".to_string(), HashMap::new());
+
+        let mut pc_anchored = HashMap::new();
+        pc_anchored.insert(key, combined);
+
+        let batch = BatchResult {
+            batch_idx: 0,
+            config: EventsConfig::default(),
+            tiles: Vec::new(),
+            stall_attributions: Vec::new(),
+            cross_tile: None,
+            pc_anchored,
+        };
+
+        let grounding = BTreeSet::new();
+        let report = format_report_pc_anchored(&[batch], &grounding);
+
+        // Find positions in the divergence section only.
+        let div_section = report
+            .split("PC-anchored divergences")
+            .nth(1)
+            .expect("divergence section");
+        let pos_aaa = div_section
+            .find("EVENT_AAA")
+            .expect("EVENT_AAA in divergence section");
+        let pos_zzz = div_section
+            .find("EVENT_ZZZ")
+            .expect("EVENT_ZZZ in divergence section");
+        assert!(
+            pos_aaa < pos_zzz,
+            "Equal-magnitude events should sort alphabetically: \
+             EVENT_AAA at {} should precede EVENT_ZZZ at {}",
+            pos_aaa,
+            pos_zzz
+        );
+    }
+
+    #[test]
+    fn pc_anchored_lists_mode2_baselines_even_without_manifest() {
+        // Build a synthetic sweep dir with a mode2-baseline/ directory but
+        // NO sweep-manifest.json. compare_sweep_dir_with_opts must list the
+        // baseline files anyway -- a missing/corrupted manifest must not
+        // silently suppress real on-disk artifacts.
+        let tmpdir = std::path::PathBuf::from(
+            std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()),
+        );
+        let sweep_dir = tmpdir.join("task8_test_baseline_no_manifest");
+        let _ = std::fs::remove_dir_all(&sweep_dir);
+        std::fs::create_dir_all(&sweep_dir).expect("create sweep dir");
+        let mode2_dir = sweep_dir.join("mode2-baseline");
+        std::fs::create_dir(&mode2_dir).expect("create mode2 dir");
+        let baseline_path = mode2_dir.join("test_0_2.events.json");
+        std::fs::write(&baseline_path, "{}").expect("write baseline file");
+
+        // list_mode2_baselines returns the file even with no manifest.
+        let baselines = list_mode2_baselines(&sweep_dir);
+        assert_eq!(baselines.len(), 1);
+        assert_eq!(baselines[0], baseline_path);
+
+        // read_pc1_manifest returns None gracefully (no panic).
+        assert!(read_pc1_manifest(&sweep_dir).is_none());
+        // Grounding extraction is empty when manifest is absent.
+        assert!(read_grounding_from_pc1_manifest(&sweep_dir).is_empty());
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&sweep_dir);
