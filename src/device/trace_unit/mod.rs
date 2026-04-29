@@ -198,8 +198,9 @@ impl TraceUnit {
     /// Per regdb (aie_registers_aie2.json), only core's Trace_Control0
     /// has a Mode bitfield; memmod, memtile, and shim trace units don't
     /// have the field, so setting EventPc on them would be a HW-impossible
-    /// state.
-    pub fn mode_supports_pc(&self) -> bool {
+    /// state. Private: only `apply_mode` consumes this; exposing it would
+    /// leak a public API surface with no production caller.
+    fn mode_supports_pc(&self) -> bool {
         self.packet_type == 0
     }
 
@@ -405,6 +406,11 @@ impl TraceUnit {
         if self.state == TraceState::Idle && hw_event_id == self.start_event {
             self.state = TraceState::Running;
             self.timer = cycle;
+            // last_event_cycle is read only by mode-0's commit_pending_frame.
+            // In mode 1 it's set here but unused; if a trace unit is ever
+            // reconfigured from EventPc back to EventTime mid-session, this
+            // value will be stale -- but we don't currently support
+            // mid-session mode flips, so the assignment is harmless either way.
             self.last_event_cycle = cycle;
             self.pending_cycle = cycle;
             self.pending_slot_mask = 0;
@@ -451,6 +457,12 @@ impl TraceUnit {
             match pc {
                 Some(p) => self.pending_pc = p,
                 None => {
+                    // Last-seen-wins: if a Some(pc) call earlier in this same
+                    // cycle had recorded a real PC, this None call overwrites
+                    // it with the sentinel. HW records one PC per frame
+                    // regardless of how many slots coalesce; we mirror that
+                    // by letting the most recent notify win, including the
+                    // sentinel.
                     if self.no_pc_warnings < 4 {
                         log::warn!(
                             "TraceUnit ({},{}): EventPc mode received event \
