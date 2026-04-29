@@ -307,8 +307,8 @@ impl DeviceState {
             // current_cycle so trace unit deltas reflect real simulation time;
             // passing a hardcoded 0 here causes every generated event to look
             // like it fired at cycle 0.
-            tile.core_trace.notify_event(event_id, current_cycle);
-            tile.mem_trace.notify_event(event_id, current_cycle);
+            tile.core_trace.notify_event(event_id, current_cycle, None);
+            tile.mem_trace.notify_event(event_id, current_cycle, None);
 
             // Check broadcast channel mapping in the EventModule: if the
             // generated event matches any broadcast channel's configured

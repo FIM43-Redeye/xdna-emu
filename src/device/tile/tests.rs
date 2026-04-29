@@ -617,7 +617,7 @@ fn test_lock_event_reaches_trace_unit() {
     tile.mem_trace.write_register(0x10, 1 | (45 << 8) | (46 << 16)); // slots 0-2
 
     // Start the trace unit by firing TRUE event
-    tile.mem_trace.notify_event(1, 0); // TRUE at cycle 0
+    tile.mem_trace.notify_event(1, 0, None); // TRUE at cycle 0
     assert!(tile.mem_trace.is_configured());
 
     // Submit and resolve a lock acquire on lock 0
@@ -651,7 +651,7 @@ fn test_lock_event_reaches_trace_unit() {
 
     // Notify the trace unit and flush to check capture.
     // Flush drains any pending per-cycle mask before padding the final packet.
-    tile.mem_trace.notify_event(45, 100);
+    tile.mem_trace.notify_event(45, 100, None);
     tile.mem_trace.flush();
     assert!(
         tile.mem_trace.has_pending_packets(),
@@ -667,7 +667,7 @@ fn test_lock_release_event_reaches_trace_unit() {
     tile.mem_trace.write_register(0x00, 0 | (1 << 16)); // start=TRUE(1)
     tile.mem_trace.write_register(0x04, (1 << 12) | 1);
     tile.mem_trace.write_register(0x10, 1 | (46 << 8)); // slot0=TRUE, slot1=LOCK_0_REL
-    tile.mem_trace.notify_event(1, 0); // start
+    tile.mem_trace.notify_event(1, 0, None); // start
 
     // Submit a lock release on lock 0
     tile.submit_lock_request(LockRequest {
@@ -690,7 +690,7 @@ fn test_lock_release_event_reaches_trace_unit() {
     assert_eq!(hw_id, Some(46), "LOCK_0_REL should be event ID 46");
 
     // Notify, flush, and verify capture
-    tile.mem_trace.notify_event(46, 50);
+    tile.mem_trace.notify_event(46, 50, None);
     tile.mem_trace.flush();
     assert!(
         tile.mem_trace.has_pending_packets(),

@@ -117,6 +117,7 @@ pub struct TraceUnit {
     /// Slot-to-hardware-event-ID mapping (8 slots).
     pub(super) event_slots: [u8; 8],
     /// Packet type field for the header (Trace_Control1 bits [14:12]).
+    /// 0=core, 1=memmod, 2=shim/PL, 3=memtile.
     pub(super) packet_type: u8,
     /// Packet ID field for the header (Trace_Control1 bits [4:0]).
     pub(super) packet_id: u8,
@@ -136,6 +137,13 @@ pub struct TraceUnit {
     /// Bitmask of slots whose events have fired during `pending_cycle`.
     /// Flushed by `commit_cycle()` or lazily on next-cycle event arrival.
     pub(super) pending_slot_mask: u8,
+    /// PC value associated with the most recent event in `pending_cycle`
+    /// (mode 1 only). Mode 0 ignores this field entirely.
+    pending_pc: u32,
+    /// Rate-limit counter for PC truncation warnings (mode 1).
+    pc_truncate_warnings: u32,
+    /// Rate-limit counter for missing-PC sentinel warnings (mode 1).
+    no_pc_warnings: u32,
     /// Accumulated encoded bytes waiting to be packed into packets.
     pub(super) byte_buffer: Vec<u8>,
     /// Individual words ready for emission to the stream switch.
@@ -171,12 +179,80 @@ impl TraceUnit {
             last_event_cycle: 0,
             pending_cycle: 0,
             pending_slot_mask: 0,
+            pending_pc: 0,
+            pc_truncate_warnings: 0,
+            no_pc_warnings: 0,
             byte_buffer: Vec::with_capacity(64),
             pending_words: VecDeque::new(),
             col,
             row,
             configured: false,
         }
+    }
+
+    // -- Test helpers (pub(crate) for trace_unit::tests and tile::tests) --
+
+    /// True only when this trace unit is configured as a core-module
+    /// packet type and may legitimately enter EventPc mode.
+    ///
+    /// Per regdb (aie_registers_aie2.json), only core's Trace_Control0
+    /// has a Mode bitfield; memmod, memtile, and shim trace units don't
+    /// have the field, so setting EventPc on them would be a HW-impossible
+    /// state.
+    pub fn mode_supports_pc(&self) -> bool {
+        self.packet_type == 0
+    }
+
+    /// Apply a new mode with a config-time guard: EventPc is only valid on
+    /// core trace units (packet_type == 0). Non-core units that attempt to
+    /// enter EventPc mode are clamped to EventTime with a logged error.
+    fn apply_mode(&mut self, new_mode: TraceMode) {
+        if matches!(new_mode, TraceMode::EventPc) && !self.mode_supports_pc() {
+            log::error!(
+                "TraceUnit ({},{}): EventPc mode requested on non-core \
+                 packet_type={} (regdb: no Mode bitfield on this trace unit); \
+                 clamping to EventTime",
+                self.col, self.row, self.packet_type
+            );
+            self.mode = TraceMode::EventTime;
+        } else {
+            self.mode = new_mode;
+        }
+    }
+
+    /// Return the current operating mode.
+    #[cfg(test)]
+    pub(crate) fn mode(&self) -> TraceMode {
+        self.mode
+    }
+
+    /// Set the operating mode (test helper; routes through `apply_mode` guard).
+    #[cfg(test)]
+    pub(crate) fn set_mode(&mut self, mode: TraceMode) {
+        self.apply_mode(mode);
+    }
+
+    /// Set the packet type (0=core, 1=memmod, 2=shim/PL, 3=memtile).
+    /// Test helper -- the real path comes through `write_register(0x04, ...)`.
+    #[cfg(test)]
+    pub(crate) fn set_packet_type(&mut self, pkt_type: u8) {
+        self.packet_type = pkt_type;
+    }
+
+    /// Map hw_event_id into slot `slot_idx` (0-7).
+    /// Test helper -- the real path is `write_register(0x10/0x14, ...)`.
+    #[cfg(test)]
+    pub(crate) fn set_event_slot(&mut self, slot_idx: usize, hw_event_id: u8) {
+        assert!(slot_idx < 8, "slot index out of range");
+        self.event_slots[slot_idx] = hw_event_id;
+    }
+
+    /// Set the start event ID.
+    /// Test helper -- the real path is `write_register(0x00, ...)`.
+    #[cfg(test)]
+    pub(crate) fn set_start_event(&mut self, hw_event_id: u8) {
+        self.start_event = hw_event_id;
+        self.configured = true;
     }
 
     /// Read a trace register (offset relative to the trace register block).
@@ -242,7 +318,8 @@ impl TraceUnit {
                 // AM025 claims 7-bit fields [22:16] and [30:24], but mlir-aie
                 // uses the full byte (MemTile events go up to 160). Use 8 bits
                 // to match real hardware behavior.
-                self.mode = TraceMode::from_u32(value);
+                let new_mode = TraceMode::from_u32(value);
+                self.apply_mode(new_mode);
                 self.start_event = ((value >> 16) & 0xFF) as u8;
                 self.stop_event = ((value >> 24) & 0xFF) as u8;
                 self.configured = true;
@@ -302,13 +379,18 @@ impl TraceUnit {
 
     /// Notify the trace unit of a hardware event at the given cycle.
     ///
+    /// `pc` is the program counter at the time of the event, used only
+    /// when the trace unit is in EventPc mode (mode 1). Mode 0 ignores it.
+    /// Pass `None` when the PC is not known; mode 1 will encode a sentinel
+    /// pc=0 and rate-limit-warn.
+    ///
     /// If the event matches a configured slot, its bit is set in the
     /// pending cycle mask but not encoded immediately. Bytes are emitted
     /// at cycle boundaries by `commit_cycle()` (or lazily when a new cycle
     /// arrives), which matches HW's "one frame per cycle" behavior.
     ///
     /// Start/stop events control the tracing state machine.
-    pub fn notify_event(&mut self, hw_event_id: u8, cycle: u64) {
+    pub fn notify_event(&mut self, hw_event_id: u8, cycle: u64, pc: Option<u32>) {
         if !self.configured {
             return;
         }
@@ -326,7 +408,8 @@ impl TraceUnit {
             self.last_event_cycle = cycle;
             self.pending_cycle = cycle;
             self.pending_slot_mask = 0;
-            // Emit a Start marker with the current timer value
+            // Emit a Start marker with the current timer value.
+            // Mode 1 uses 0xF1 (bit 0 set) to distinguish from mode 0's 0xF0.
             self.encode_start(cycle);
             log::debug!(
                 "TraceUnit ({},{}) started at cycle {}",
@@ -360,6 +443,26 @@ impl TraceUnit {
         // Accumulate into the pending-cycle mask.
         self.pending_cycle = cycle;
         self.pending_slot_mask |= 1 << slot;
+
+        // PC tracking for mode 1: record the PC for this pending frame.
+        // When multiple slots fire in the same cycle, we use the last PC
+        // seen (hardware records one PC per EventPC frame regardless of mask).
+        if matches!(self.mode, TraceMode::EventPc) {
+            match pc {
+                Some(p) => self.pending_pc = p,
+                None => {
+                    if self.no_pc_warnings < 4 {
+                        log::warn!(
+                            "TraceUnit ({},{}): EventPc mode received event \
+                             hw_id={} with no PC; encoding sentinel pc=0",
+                            self.col, self.row, hw_event_id
+                        );
+                        self.no_pc_warnings += 1;
+                    }
+                    self.pending_pc = 0;
+                }
+            }
+        }
     }
 
     /// Commit any accumulated slot activity for cycles <= `cycle`.
@@ -477,30 +580,76 @@ impl TraceUnit {
     // -- Internal encoding methods --
 
     /// Commit the pending slot mask for `pending_cycle` as one HW-accurate
-    /// trace frame. The encoding is chosen from the mask's popcount:
+    /// trace frame.
     ///
-    /// - popcount == 1: Single0/1/2 (1/2/3 bytes)
-    /// - popcount >= 2: Multiple0/1/2 (2/3/4 bytes)
+    /// Mode 0 (EventTime):
+    ///   - popcount == 1: Single0/1/2 (1/2/3 bytes)
+    ///   - popcount >= 2: Multiple0/1/2 (2/3/4 bytes)
     ///
-    /// This matches AM020 event-time mode, which creates at most one frame
-    /// per cycle and groups simultaneous slot activity with the Multiple
-    /// encodings documented in mlir-aie's parse.py.
+    /// Mode 1 (EventPc):
+    ///   - always 4-byte EventPC frame: 8-bit mask + 14-bit PC
+    ///   - cycle deltas are NOT emitted in mode 1
+    ///
+    /// This matches AM020/AM025 behavior and the mode1.py decoder.
     fn commit_pending_frame(&mut self) {
         let mask = self.pending_slot_mask;
         if mask == 0 {
             return;
         }
-        let delta = self.pending_cycle.saturating_sub(self.last_event_cycle);
-        self.last_event_cycle = self.pending_cycle;
         self.pending_slot_mask = 0;
 
-        if mask.count_ones() == 1 {
-            let slot = mask.trailing_zeros() as u8;
-            self.encode_single(slot, delta);
-        } else {
-            self.encode_multiple(mask, delta);
+        match self.mode {
+            TraceMode::EventTime => {
+                let delta = self.pending_cycle.saturating_sub(self.last_event_cycle);
+                self.last_event_cycle = self.pending_cycle;
+                if mask.count_ones() == 1 {
+                    let slot = mask.trailing_zeros() as u8;
+                    self.encode_single(slot, delta);
+                } else {
+                    self.encode_multiple(mask, delta);
+                }
+            }
+            TraceMode::EventPc => {
+                let pc_full = self.pending_pc;
+                let pc14 = (pc_full & 0x3FFF) as u16;
+                if pc_full > 0x3FFF && self.pc_truncate_warnings < 4 {
+                    log::warn!(
+                        "TraceUnit ({},{}): PC 0x{:X} truncated to 14 bits (0x{:X})",
+                        self.col, self.row, pc_full, pc14
+                    );
+                    self.pc_truncate_warnings += 1;
+                }
+                self.encode_event_pc(mask, pc14);
+            }
+            TraceMode::Execution | TraceMode::Reserved => {
+                // Mode 2 not implemented per A.2 spec; mode 3 is reserved.
+                // Skip rather than corrupt the stream.
+            }
         }
         self.try_emit_packet();
+    }
+
+    /// Encode a 4-byte EventPC frame: 8-bit event mask + 14-bit PC.
+    ///
+    /// Layout (MSB-first), per tools/trace_decoder/modes/mode1.py:
+    ///   byte0 = 0b1100_0100 | (mask >> 6)   (top 6 bits opcode = 0x31; low 2 = mask[7:6])
+    ///   byte1 = (mask & 0x3F) << 2           (mask[5:0] + 2 reserved bits = 0)
+    ///   byte2 = (pc >> 8) & 0x3F             (2 reserved bits = 0 + PC[13:8])
+    ///   byte3 = pc & 0xFF                    (PC[7:0])
+    ///
+    /// The decoder checks `(b & 0b11111100) == 0b11000100`, then:
+    ///   mask = ((b & 0b11) << 6) | (b1 >> 2)
+    ///   pc   = ((b2 & 0b00111111) << 8) | b3
+    fn encode_event_pc(&mut self, mask: u8, pc: u16) {
+        debug_assert!(pc < (1 << 14), "PC {} exceeds 14-bit range", pc);
+        let byte0 = 0b1100_0100u8 | ((mask >> 6) & 0b11);
+        let byte1 = (mask & 0b0011_1111) << 2;
+        let byte2 = ((pc >> 8) as u8) & 0b0011_1111;
+        let byte3 = (pc & 0xFF) as u8;
+        self.byte_buffer.push(byte0);
+        self.byte_buffer.push(byte1);
+        self.byte_buffer.push(byte2);
+        self.byte_buffer.push(byte3);
     }
 
     /// Encode a single event with a cycle delta.
@@ -605,9 +754,17 @@ impl TraceUnit {
 
     /// Encode a Start marker with 56-bit timer value.
     ///
-    /// Format: 0xF0 prefix byte + 7 bytes of timer (big-endian).
+    /// Mode 0: prefix byte 0xF0 (bit 0 = 0, trace-mode discriminator)
+    /// Mode 1: prefix byte 0xF1 (bit 0 = 1, signals EventPc stream)
+    ///
+    /// The mode1.py decoder matches `(b & 0b11110011) == 0b11110001`,
+    /// which catches 0xF1 (segment start) and 0xF5 (mid-stream re-anchor).
     fn encode_start(&mut self, timer: u64) {
-        self.byte_buffer.push(0xF0);
+        let prefix = match self.mode {
+            TraceMode::EventPc => 0xF1u8,
+            _ => 0xF0u8,
+        };
+        self.byte_buffer.push(prefix);
         // 7 bytes of timer, big-endian (56 bits)
         for i in (0..7).rev() {
             self.byte_buffer.push(((timer >> (i * 8)) & 0xFF) as u8);

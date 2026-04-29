@@ -970,10 +970,10 @@ impl InterpreterEngine {
             const TRUE_EVENT: u8 = 1;
             for tile in &mut self.device.array.tiles {
                 if tile.core_trace.is_configured() {
-                    tile.core_trace.notify_event(TRUE_EVENT, cycle);
+                    tile.core_trace.notify_event(TRUE_EVENT, cycle, None);
                 }
                 if tile.mem_trace.is_configured() {
-                    tile.mem_trace.notify_event(TRUE_EVENT, cycle);
+                    tile.mem_trace.notify_event(TRUE_EVENT, cycle, None);
                 }
             }
         }

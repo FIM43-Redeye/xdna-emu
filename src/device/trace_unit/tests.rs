@@ -8,7 +8,7 @@ use super::*;
 /// Single0/1/2 encoding paths see byte-buffer growth right after the call
 /// without needing to chain an extra notify on a later cycle.
 fn notify_commit(tu: &mut TraceUnit, hw_id: u8, cycle: u64) {
-    tu.notify_event(hw_id, cycle);
+    tu.notify_event(hw_id, cycle, None);
     tu.commit_cycle(cycle);
 }
 
@@ -69,7 +69,7 @@ fn test_start_stop_state_machine() {
     assert!(tu.is_configured());
 
     // Start event triggers Running state
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
     assert_eq!(tu.state, TraceState::Running);
 
     // Matched event is encoded while running (per-cycle commit)
@@ -78,11 +78,11 @@ fn test_start_stop_state_machine() {
     assert!(tu.byte_buffer.len() > before);
 
     // Stop event transitions to Stopped
-    tu.notify_event(29, 300);
+    tu.notify_event(29, 300, None);
     assert_eq!(tu.state, TraceState::Stopped);
 
     // Events after stop are ignored
-    tu.notify_event(37, 400);
+    tu.notify_event(37, 400, None);
     // No crash, no data
 }
 
@@ -93,7 +93,7 @@ fn test_single0_encoding() {
     tu.write_register(0x10, 37); // slot 0 = event 37
 
     // Start tracing
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len(); // Start marker = 8 bytes
 
     // Event with delta=5 (fits in Single0: 4-bit delta)
@@ -110,7 +110,7 @@ fn test_single1_encoding() {
     tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
     tu.write_register(0x10, 37 | (38 << 8)); // slot 0=37, slot 1=38
 
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
     // Event with delta=500 (fits in Single1: 10-bit delta)
@@ -131,7 +131,7 @@ fn test_single1_encoding_nonzero_slot() {
     tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
     tu.write_register(0x10, 37 | (38 << 8) | (39 << 16)); // slot 0=37, slot 1=38, slot 2=39
 
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
     // Slot 1, delta=500: format 0b100EEETT
@@ -150,7 +150,7 @@ fn test_single2_encoding() {
     tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
     tu.write_register(0x10, 37); // slot 0 = event 37
 
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
     // Event with delta=100000 (fits in Single2: 18-bit delta)
@@ -174,7 +174,7 @@ fn test_single2_encoding_nonzero_slot() {
     tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (40 << 24));
     tu.write_register(0x14, 23 | (24 << 8) | (35 << 16) | (36 << 24));
 
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
     // Slot 3, delta=100000 = 0x186A0
@@ -202,7 +202,7 @@ fn test_packet_formation() {
     tu.write_register(0x14, 23 | (24 << 8) | (35 << 16) | (36 << 24));
 
     // Start tracing (emits 8-byte Start marker)
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
 
     // Generate enough Single0 events to fill 28 bytes. Each event fires on
     // its own cycle and the per-cycle commit encodes it as 1 byte.
@@ -237,7 +237,7 @@ fn test_flush_pads_partial_packet() {
     tu.write_register(0x10, 37);
 
     // Start tracing and emit a few events
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
     notify_commit(&mut tu, 37, 5);
     notify_commit(&mut tu, 37, 10);
 
@@ -261,8 +261,8 @@ fn test_flush_pads_partial_packet() {
 fn test_unconfigured_ignores_events() {
     let mut tu = TraceUnit::new(0, 2);
     // Don't write Control0 (unconfigured)
-    tu.notify_event(28, 100);
-    tu.notify_event(37, 200);
+    tu.notify_event(28, 100, None);
+    tu.notify_event(37, 200, None);
     assert!(!tu.has_pending_packets());
     assert!(tu.byte_buffer.is_empty());
 }
@@ -273,7 +273,7 @@ fn test_unmatched_event_ignored() {
     tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
     tu.write_register(0x10, 37); // Only slot 0 = 37
 
-    tu.notify_event(28, 0); // Start
+    tu.notify_event(28, 0, None); // Start
     let len_after_start = tu.byte_buffer.len();
 
     // Event 99 is not in any slot -- should be ignored
@@ -291,7 +291,7 @@ fn test_start_marker_encoding() {
     assert!(tu.byte_buffer.is_empty());
 
     // Fire start event to begin tracing
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
 
     // Start marker: 0xF0 prefix + 7 bytes timer (big-endian, timer=0)
     assert_eq!(tu.byte_buffer.len(), 8);
@@ -309,7 +309,7 @@ fn test_packet_header_parity() {
     tu.write_register(0x04, (3 << 12) | 7); // pkt_type=3, pkt_id=7
     tu.write_register(0x10, 37);
 
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
     // Generate 20 events (each on its own cycle) to fill a packet
     for i in 1..=20 {
         notify_commit(&mut tu, 37, i as u64);
@@ -329,7 +329,7 @@ fn test_slot_index_in_encoding() {
     // Slots 0-3 = events 37,38,39,40
     tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (40 << 24));
 
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
     // Slot 0, delta=1: 0b00000001 = 0x01
@@ -403,7 +403,7 @@ fn test_roundtrip_all_slots_all_formats() {
             let evt1 = 41u32 | (42 << 8) | (43 << 16) | (44 << 24);
             tu.write_register(0x10, evt0);
             tu.write_register(0x14, evt1);
-            tu.notify_event(28, 0); // start
+            tu.notify_event(28, 0, None); // start
             let start_len = tu.byte_buffer.len(); // 8 bytes start marker
 
             let event_id = 37 + slot;
@@ -455,11 +455,11 @@ fn test_read_register_roundtrip() {
     assert_eq!(tu.read_register(0x08), 0);
 
     // Start tracing -> state becomes Running
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
     assert_eq!(tu.read_register(0x08), 1 << 8); // Running=1 at bits [9:8]
 
     // Stop tracing -> state becomes Stopped
-    tu.notify_event(29, 100);
+    tu.notify_event(29, 100, None);
     assert_eq!(tu.read_register(0x08), 2 << 8); // Stopped=2 at bits [9:8]
 }
 
@@ -510,7 +510,7 @@ fn test_packet_header_matches_mlir_aie_decoder() {
         tu.write_register(0x04, ((pkt_type as u32) << 12) | (pkt_id as u32));
         tu.write_register(0x10, 37);
 
-        tu.notify_event(28, 0);
+        tu.notify_event(28, 0, None);
         for i in 1..=20 {
             notify_commit(&mut tu, 37, i as u64);
         }
@@ -546,12 +546,12 @@ fn test_multiple0_two_slots_same_cycle() {
     // slot 0 = 37, slot 3 = 40
     tu.write_register(0x10, 37 | (40 << 24));
 
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
     // Two events fire on cycle 5 (delta=5 from last emitted frame at 0).
-    tu.notify_event(37, 5);
-    tu.notify_event(40, 5);
+    tu.notify_event(37, 5, None);
+    tu.notify_event(40, 5, None);
     tu.commit_cycle(5);
 
     // Multiple0 = 2 bytes. Expected mask = 0b00001001 (slots 0 and 3).
@@ -572,12 +572,12 @@ fn test_multiple1_three_slots_delta_500() {
     tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
     tu.write_register(0x10, 37 | (38 << 8) | (40 << 24)); // slots 0,1,3
 
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
-    tu.notify_event(37, 500);
-    tu.notify_event(38, 500);
-    tu.notify_event(40, 500);
+    tu.notify_event(37, 500, None);
+    tu.notify_event(38, 500, None);
+    tu.notify_event(40, 500, None);
     tu.commit_cycle(500);
 
     // Multiple1 = 3 bytes, mask=0b00001011, delta=500=0x1F4
@@ -606,11 +606,11 @@ fn test_multiple2_all_slots_delta_100000() {
     tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (40 << 24));
     tu.write_register(0x14, 41 | (42 << 8) | (43 << 16) | (44 << 24));
 
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
     for id in 37..=44 {
-        tu.notify_event(id, 100000);
+        tu.notify_event(id, 100000, None);
     }
     tu.commit_cycle(100000);
 
@@ -671,12 +671,12 @@ fn test_multiple_roundtrip_matches_mlir_aie() {
         tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (40 << 24));
         tu.write_register(0x14, 41 | (42 << 8) | (43 << 16) | (44 << 24));
 
-        tu.notify_event(28, 0);
+        tu.notify_event(28, 0, None);
         let base = tu.byte_buffer.len();
 
         for i in 0u8..8 {
             if mask & (1 << i) != 0 {
-                tu.notify_event(37 + i, delta);
+                tu.notify_event(37 + i, delta, None);
             }
         }
         tu.commit_cycle(delta);
@@ -703,16 +703,16 @@ fn test_lazy_commit_on_cycle_change() {
     tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
     tu.write_register(0x10, 37 | (38 << 8)); // slot 0 = 37, slot 1 = 38
 
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
     // Cycle 5: slot 0 fires. No commit yet.
-    tu.notify_event(37, 5);
+    tu.notify_event(37, 5, None);
     assert_eq!(tu.byte_buffer.len(), start_len);
     assert_eq!(tu.pending_slot_mask, 0b0000_0001);
 
     // Cycle 10: slot 1 fires. Previous cycle's frame commits first.
-    tu.notify_event(38, 10);
+    tu.notify_event(38, 10, None);
     // Single0 for slot 0 delta=5 = 0x05 (1 byte committed)
     assert_eq!(tu.byte_buffer.len(), start_len + 1);
     assert_eq!(tu.byte_buffer[start_len], 0x05);
@@ -736,13 +736,13 @@ fn test_per_cycle_coalesce_bounds_byte_rate() {
     tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (40 << 24));
     tu.write_register(0x14, 41 | (42 << 8) | (43 << 16) | (44 << 24));
 
-    tu.notify_event(28, 0);
+    tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
     const CYCLES: u64 = 100;
     for cycle in 1..=CYCLES {
         for id in 37..=44 {
-            tu.notify_event(id, cycle);
+            tu.notify_event(id, cycle, None);
         }
         tu.commit_cycle(cycle);
     }
@@ -761,5 +761,155 @@ fn test_per_cycle_coalesce_bounds_byte_rate() {
         bytes_emitted as u64 >= CYCLES * 2,
         "expected at least {} bytes for {} cycles of Multiple0, got {}",
         CYCLES * 2, CYCLES, bytes_emitted
+    );
+}
+
+// ===== Mode-1 (EventPC) encoder tests =====
+
+/// Decoded frame from a mode-1 byte stream.
+/// Used by `decode_mode1_for_test` to verify encoder round-trips.
+#[derive(Debug, PartialEq, Eq)]
+enum DecodedFrame {
+    Start { timer_value: u64 },
+    EventPc { mask: u8, pc: u16 },
+}
+
+/// Minimal mode-1 byte-stream decoder, ported from
+/// tools/trace_decoder/modes/mode1.py. Handles only Start and EventPC;
+/// Skip (0xFE) is ignored. Enough to validate encoder round-trips.
+fn decode_mode1_for_test(bytes: &[u8]) -> Vec<DecodedFrame> {
+    let mut frames = Vec::new();
+    let n = bytes.len();
+    let mut cursor = 0usize;
+
+    while cursor < n {
+        let b = bytes[cursor];
+
+        // Skip (idle filler)
+        if b == 0xFE {
+            cursor += 1;
+            continue;
+        }
+
+        // Start: 1111 0XX1 + 7 timer bytes
+        // Matches mode-1 Start (0xF1 / 0xF5). bit 0 = 1 is the mode discriminator.
+        if (b & 0b1111_0011) == 0b1111_0001 {
+            if cursor + 7 >= n {
+                break;
+            }
+            let mut timer_value: u64 = 0;
+            for i in 0..7 {
+                timer_value = (timer_value << 8) | (bytes[cursor + 1 + i] as u64);
+            }
+            frames.push(DecodedFrame::Start { timer_value });
+            cursor += 8;
+            continue;
+        }
+
+        // EventPC: 1100 01EE EEEEEERR RRPPPPPP PPPPPPPP  (4 bytes)
+        // Discriminator: (b & 0b11111100) == 0b11000100
+        if (b & 0b1111_1100) == 0b1100_0100 {
+            if cursor + 3 >= n {
+                break;
+            }
+            let b1 = bytes[cursor + 1];
+            let b2 = bytes[cursor + 2];
+            let b3 = bytes[cursor + 3];
+            let mask = ((b & 0b11) << 6) | (b1 >> 2);
+            let pc = (((b2 & 0b0011_1111) as u16) << 8) | (b3 as u16);
+            frames.push(DecodedFrame::EventPc { mask, pc });
+            cursor += 4;
+            continue;
+        }
+
+        // Unknown byte: skip
+        cursor += 1;
+    }
+
+    frames
+}
+
+/// Verify encoder output round-trips through the mode-1 decoder with the
+/// expected byte layout documented in tools/trace_decoder/modes/mode1.py.
+///
+/// Slot 3 carries LOCK_STALL (hw_id 26). Two consecutive EventPC frames
+/// with the same PC are expected because the events fire on cycles 0 and 1.
+#[test]
+fn mode1_encoder_byte_equivalent_to_decoder_fixture() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.set_packet_type(0); // core
+    tu.set_mode(TraceMode::EventPc);
+    tu.set_event_slot(3, 26); // LOCK_STALL = hw_id 26 in slot 3
+    tu.set_start_event(1);
+
+    tu.notify_event(1, 0, None);              // start (fires state machine)
+    tu.notify_event(26, 0, Some(816));        // EventPC mask=0b1000 (slot 3), pc=816
+    tu.commit_cycle(0);
+    tu.notify_event(26, 1, Some(816));        // next cycle, same PC, same slot
+    tu.commit_cycle(1);
+
+    let bytes = tu.encoded_bytes();
+    let decoded = decode_mode1_for_test(bytes);
+
+    // Expect Start + 2x EventPC
+    assert_eq!(decoded.len(), 3, "expected Start + 2 EventPC frames, got: {:?}", decoded);
+    assert!(
+        matches!(decoded[0], DecodedFrame::Start { .. }),
+        "first frame must be Start, got {:?}", decoded[0]
+    );
+    assert_eq!(
+        decoded[1],
+        DecodedFrame::EventPc { mask: 0b1000, pc: 816 },
+        "first EventPC frame mismatch"
+    );
+    assert_eq!(
+        decoded[2],
+        DecodedFrame::EventPc { mask: 0b1000, pc: 816 },
+        "second EventPC frame mismatch"
+    );
+}
+
+/// Non-core trace units (packet_type != 0) must be clamped to EventTime when
+/// EventPc mode is requested. Per regdb (aie_registers_aie2.json), only the
+/// core-module Trace_Control0 has a Mode bitfield; setting EventPc on
+/// memtile/memmod/shim trace units would be a HW-impossible state.
+#[test]
+fn mode1_on_non_core_trace_unit_clamps_to_event_time() {
+    let mut tu = TraceUnit::new(0, 1);
+    tu.set_packet_type(3); // memtile
+    tu.set_mode(TraceMode::EventPc); // attempt mode 1 on non-core
+    assert_eq!(
+        tu.mode(),
+        TraceMode::EventTime,
+        "memtile trace unit must reject EventPc mode (regdb: no Mode bitfield on memtile Trace_Control0)"
+    );
+}
+
+/// When mode-1 receives an event with no PC (pc=None), it encodes a sentinel
+/// pc=0 frame rather than crashing or dropping the event. This allows
+/// no-PC callers (like the current coordinator path) to still produce a
+/// valid trace stream.
+#[test]
+fn mode1_no_pc_emits_sentinel_zero() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.set_packet_type(0); // core
+    tu.set_mode(TraceMode::EventPc);
+    tu.set_event_slot(0, 23); // MEMORY_STALL
+    tu.set_start_event(1);
+
+    tu.notify_event(1, 0, None);    // start
+    tu.notify_event(23, 0, None);   // memory stall, no PC -> sentinel pc=0
+    tu.commit_cycle(0);
+
+    let frames = decode_mode1_for_test(tu.encoded_bytes());
+    let event_frames: Vec<&DecodedFrame> = frames
+        .iter()
+        .filter(|f| matches!(f, DecodedFrame::EventPc { .. }))
+        .collect();
+    assert_eq!(event_frames.len(), 1, "expected exactly one EventPC frame");
+    assert_eq!(
+        *event_frames[0],
+        DecodedFrame::EventPc { mask: 0b0000_0001, pc: 0 },
+        "no-PC event should encode sentinel pc=0 with mask=0b1 (slot 0)"
     );
 }

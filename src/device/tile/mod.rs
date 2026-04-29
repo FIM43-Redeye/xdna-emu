@@ -560,7 +560,7 @@ impl Tile {
     /// active for the core module edge detectors this cycle.
     #[inline]
     pub fn notify_core_trace_event(&mut self, hw_id: u8, cycle: u64) {
-        self.core_trace.notify_event(hw_id, cycle);
+        self.core_trace.notify_event(hw_id, cycle, None);
         for det in &mut self.core_edge_detectors {
             if det.input_event == hw_id {
                 det.curr_active = true;
@@ -574,7 +574,7 @@ impl Tile {
     /// active for the memory module edge detectors this cycle.
     #[inline]
     pub fn notify_mem_trace_event(&mut self, hw_id: u8, cycle: u64) {
-        self.mem_trace.notify_event(hw_id, cycle);
+        self.mem_trace.notify_event(hw_id, cycle, None);
         for det in &mut self.mem_edge_detectors {
             if det.input_event == hw_id {
                 det.curr_active = true;
@@ -600,7 +600,7 @@ impl Tile {
                 } else {
                     crate::trace::core_edge_detection_event_hw_id(i as u8)
                 };
-                self.core_trace.notify_event(hw_id, cycle);
+                self.core_trace.notify_event(hw_id, cycle, None);
             }
         }
         // Memory module edge detectors -> mem_trace
@@ -614,7 +614,7 @@ impl Tile {
                 } else {
                     crate::trace::mem_edge_detection_event_hw_id(i as u8)
                 };
-                self.mem_trace.notify_event(hw_id, cycle);
+                self.mem_trace.notify_event(hw_id, cycle, None);
             }
         }
         // Advance state: current becomes previous, reset current
