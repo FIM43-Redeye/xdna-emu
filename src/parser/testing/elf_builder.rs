@@ -40,11 +40,7 @@ impl ElfBuilder {
     /// New builder with defaults: EM_AIE, AIE2 flags, 16 bytes of zero
     /// program data (one PT_LOAD segment at vaddr 0).
     pub fn new() -> Self {
-        Self {
-            e_machine: EM_AIE,
-            e_flags: EF_AIE_AIE2,
-            program_bytes: vec![0u8; 16],
-        }
+        Self { e_machine: EM_AIE, e_flags: EF_AIE_AIE2, program_bytes: vec![0u8; 16] }
     }
 
     /// Override the e_machine field. Use for negative-path tests that
@@ -91,9 +87,7 @@ impl ElfBuilder {
         // e_phoff = 52 (directly after header)
         out[28..32].copy_from_slice(&(ELF_HEADER_SIZE as u32).to_le_bytes());
         // e_shoff = 84 (after one program header) -- unused with e_shnum = 0
-        out[32..36].copy_from_slice(
-            &((ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE) as u32).to_le_bytes(),
-        );
+        out[32..36].copy_from_slice(&((ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE) as u32).to_le_bytes());
         // e_flags
         out[36..40].copy_from_slice(&self.e_flags.to_le_bytes());
         // e_ehsize
@@ -129,8 +123,7 @@ impl ElfBuilder {
         out[ph + 28..ph + 32].copy_from_slice(&16u32.to_le_bytes());
 
         // Program bytes
-        out[PROGRAM_OFFSET..PROGRAM_OFFSET + program_len]
-            .copy_from_slice(&self.program_bytes);
+        out[PROGRAM_OFFSET..PROGRAM_OFFSET + program_len].copy_from_slice(&self.program_bytes);
 
         out
     }
@@ -160,9 +153,7 @@ mod tests {
     #[test]
     fn builder_with_custom_program_bytes_round_trips() {
         let program: Vec<u8> = (0u8..32).collect();
-        let bytes = ElfBuilder::new()
-            .with_program_bytes(program.clone())
-            .build();
+        let bytes = ElfBuilder::new().with_program_bytes(program.clone()).build();
         let elf = AieElf::parse(&bytes).unwrap();
 
         let segments: Vec<_> = elf.load_segments().collect();
@@ -178,9 +169,6 @@ mod tests {
         let bytes = ElfBuilder::new().with_e_machine(0x3E).build();
         let err = AieElf::parse(&bytes).expect_err("non-AIE e_machine must be rejected");
         let msg = err.to_string();
-        assert!(
-            msg.contains("e_machine") && msg.contains("not an AIE ELF"),
-            "unexpected error: {msg}"
-        );
+        assert!(msg.contains("e_machine") && msg.contains("not an AIE ELF"), "unexpected error: {msg}");
     }
 }

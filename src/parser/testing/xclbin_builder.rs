@@ -44,9 +44,7 @@ pub struct XclbinBuilder {
 impl XclbinBuilder {
     /// New builder with no sections.
     pub fn new() -> Self {
-        Self {
-            sections: Vec::new(),
-        }
+        Self { sections: Vec::new() }
     }
 
     /// Add an AIE_PARTITION section with the given bytes.
@@ -117,9 +115,7 @@ impl XclbinBuilder {
         //   20  u32  _padding (implicit, for u64 alignment)
         //   24  u64  section_offset
         //   32  u64  section_size
-        for (i, ((kind, data), &offset)) in
-            self.sections.iter().zip(section_offsets.iter()).enumerate()
-        {
+        for (i, ((kind, data), &offset)) in self.sections.iter().zip(section_offsets.iter()).enumerate() {
             let sh = SECTIONS_OFFSET + i * SECTION_HEADER_SIZE;
             out[sh..sh + 4].copy_from_slice(&kind.to_le_bytes());
             // section_name: leave zero (null-terminated empty string).

@@ -193,12 +193,11 @@ impl Xclbin {
     /// Load and parse an XCLBIN file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("Failed to open {}", path.display()))?;
+        let file = std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
 
         // Memory-map the file for efficient access
-        let mmap = unsafe { Mmap::map(&file) }
-            .with_context(|| format!("Failed to mmap {}", path.display()))?;
+        let mmap =
+            unsafe { Mmap::map(&file) }.with_context(|| format!("Failed to mmap {}", path.display()))?;
 
         Self::from_mmap(mmap)
     }
@@ -235,8 +234,8 @@ impl Xclbin {
 
         // Parse header (starts at offset 0x130 = 304)
         const HEADER_OFFSET: usize = 0x130;
-        let (header, _) = RawHeader::read_from_prefix(&data_slice[HEADER_OFFSET..])
-            .map_err(|e| ParseError::External {
+        let (header, _) =
+            RawHeader::read_from_prefix(&data_slice[HEADER_OFFSET..]).map_err(|e| ParseError::External {
                 offset: HEADER_OFFSET,
                 context: "XCLBIN header",
                 message: format!("{:?}", e),
@@ -270,23 +269,14 @@ impl Xclbin {
                 .into());
             }
 
-            let (section, _) = RawSectionHeader::read_from_prefix(&data_slice[offset..])
-                .map_err(|e| ParseError::External {
-                    offset,
-                    context: "XCLBIN section header",
-                    message: format!("{:?}", e),
-                })?;
+            let (section, _) = RawSectionHeader::read_from_prefix(&data_slice[offset..]).map_err(|e| {
+                ParseError::External { offset, context: "XCLBIN section header", message: format!("{:?}", e) }
+            })?;
 
             section_headers.push(section);
         }
 
-        Ok(Self {
-            _mmap: mmap,
-            data,
-            data_len,
-            header,
-            section_headers,
-        })
+        Ok(Self { _mmap: mmap, data, data_len, header, section_headers })
     }
 
     /// Get the underlying data slice
@@ -331,11 +321,7 @@ impl Xclbin {
             };
 
             // Parse name (null-terminated)
-            let name_end = hdr
-                .section_name
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(16);
+            let name_end = hdr.section_name.iter().position(|&b| b == 0).unwrap_or(16);
             let name = String::from_utf8_lossy(&hdr.section_name[..name_end]).into_owned();
 
             Section {

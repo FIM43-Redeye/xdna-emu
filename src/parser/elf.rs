@@ -195,7 +195,9 @@ impl<'a> AieElf<'a> {
 
     /// Iterate over loadable segments
     pub fn load_segments(&self) -> impl Iterator<Item = LoadSegment<'a>> + '_ {
-        self.elf.program_headers.iter()
+        self.elf
+            .program_headers
+            .iter()
             .filter(|ph| ph.p_type == PT_LOAD && ph.p_filesz > 0)
             .map(|ph| {
                 let offset = ph.p_offset as usize;
@@ -247,7 +249,9 @@ impl<'a> AieElf<'a> {
 
     /// Get the .text section (program code)
     pub fn text_section(&self) -> Option<&'a [u8]> {
-        self.elf.section_headers.iter()
+        self.elf
+            .section_headers
+            .iter()
             .find(|sh| {
                 if let Some(name) = self.elf.shdr_strtab.get_at(sh.sh_name) {
                     name == ".text"
@@ -264,7 +268,9 @@ impl<'a> AieElf<'a> {
 
     /// Get the .text section address
     pub fn text_address(&self) -> Option<u32> {
-        self.elf.section_headers.iter()
+        self.elf
+            .section_headers
+            .iter()
             .find(|sh| {
                 if let Some(name) = self.elf.shdr_strtab.get_at(sh.sh_name) {
                     name == ".text"
@@ -313,7 +319,9 @@ impl<'a> AieElf<'a> {
 
     /// Get the compiler comment string if present
     pub fn compiler_info(&self) -> Option<&str> {
-        self.elf.section_headers.iter()
+        self.elf
+            .section_headers
+            .iter()
             .find(|sh| {
                 if let Some(name) = self.elf.shdr_strtab.get_at(sh.sh_name) {
                     name == ".comment"
@@ -326,12 +334,11 @@ impl<'a> AieElf<'a> {
                 let size = sh.sh_size as usize;
                 let data = &self.data[offset..offset + size];
                 // Comment section may have null bytes
-                std::str::from_utf8(data).ok()
-                    .or_else(|| {
-                        // Try to find first null-terminated string
-                        let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-                        std::str::from_utf8(&data[..end]).ok()
-                    })
+                std::str::from_utf8(data).ok().or_else(|| {
+                    // Try to find first null-terminated string
+                    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+                    std::str::from_utf8(&data[..end]).ok()
+                })
             })
     }
 
@@ -351,7 +358,8 @@ impl<'a> AieElf<'a> {
         println!();
         println!("Load Segments:");
         for (i, seg) in self.load_segments().enumerate() {
-            println!("  [{}] 0x{:08X} - 0x{:08X} ({} bytes, {:?}{}{})",
+            println!(
+                "  [{}] 0x{:08X} - 0x{:08X} ({} bytes, {:?}{}{})",
                 i,
                 seg.vaddr,
                 seg.vaddr + seg.memsz,
@@ -380,10 +388,15 @@ impl<'a> AieElf<'a> {
         println!();
         println!("Functions:");
         for sym in self.functions() {
-            println!("  0x{:08X} {} ({}{}bytes)",
+            println!(
+                "  0x{:08X} {} ({}{}bytes)",
                 sym.address,
                 sym.name,
-                if sym.size > 0 { format!("{} ", sym.size) } else { "".to_string() },
+                if sym.size > 0 {
+                    format!("{} ", sym.size)
+                } else {
+                    "".to_string()
+                },
                 if sym.is_global { "global, " } else { "" },
             );
         }
@@ -408,9 +421,9 @@ mod tests {
         elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
 
         // ELF32, little-endian, version 1
-        elf[4] = 1;  // ELFCLASS32
-        elf[5] = 1;  // ELFDATA2LSB
-        elf[6] = 1;  // EV_CURRENT
+        elf[4] = 1; // ELFCLASS32
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
 
         // e_type = ET_EXEC (2)
         elf[16..18].copy_from_slice(&2u16.to_le_bytes());
@@ -471,10 +484,8 @@ mod tests {
 
         // Code at offset 128
         elf[128..144].copy_from_slice(&[
-            0x15, 0x01, 0x00, 0x40,  // Sample AIE instruction
-            0x01, 0x00, 0x55, 0x00,
-            0xe0, 0x0c, 0x07, 0x00,
-            0x01, 0x00, 0x01, 0x00,
+            0x15, 0x01, 0x00, 0x40, // Sample AIE instruction
+            0x01, 0x00, 0x55, 0x00, 0xe0, 0x0c, 0x07, 0x00, 0x01, 0x00, 0x01, 0x00,
         ]);
 
         elf
@@ -572,8 +583,7 @@ mod tests {
         assert!(!segments.is_empty());
 
         // Should have an entry function: __start (Peano) or _main_init (Chess)
-        let start = elf.find_symbol("__start")
-            .or_else(|| elf.find_symbol("_main_init"));
+        let start = elf.find_symbol("__start").or_else(|| elf.find_symbol("_main_init"));
         assert!(start.is_some(), "expected __start (Peano) or _main_init (Chess)");
         assert!(start.unwrap().is_function);
 
@@ -619,7 +629,9 @@ mod tests {
         }
 
         // Entry function at address 0: __start (Peano) or _main_init (Chess)
-        let start = funcs.iter().find(|f| f.name == "__start")
+        let start = funcs
+            .iter()
+            .find(|f| f.name == "__start")
             .or_else(|| funcs.iter().find(|f| f.name == "_main_init"));
         assert!(start.is_some(), "expected __start or _main_init in functions");
         assert_eq!(start.unwrap().address, 0);

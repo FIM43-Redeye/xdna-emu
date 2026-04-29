@@ -40,11 +40,7 @@ pub struct CdoBuilder {
 impl CdoBuilder {
     /// New builder with defaults: ident = "CDO\0", version = 0x0200 (V2.00).
     pub fn new() -> Self {
-        Self {
-            version: 0x0200,
-            ident: CDO_MAGIC_CDO,
-            command_words: Vec::new(),
-        }
+        Self { version: 0x0200, ident: CDO_MAGIC_CDO, command_words: Vec::new() }
     }
 
     /// Override the version field (useful for Unknown-version negative tests).
@@ -118,8 +114,7 @@ impl CdoBuilder {
             .wrapping_add(self.version)
             .wrapping_add(cdo_len_words));
 
-        let mut out =
-            Vec::with_capacity(CDO_HEADER_SIZE + self.command_words.len() * 4);
+        let mut out = Vec::with_capacity(CDO_HEADER_SIZE + self.command_words.len() * 4);
         out.extend_from_slice(&num_words.to_le_bytes());
         out.extend_from_slice(&self.ident.to_le_bytes());
         out.extend_from_slice(&self.version.to_le_bytes());
@@ -136,10 +131,7 @@ impl CdoBuilder {
     /// (< 0xFF); this builder does not emit the extended-length sentinel.
     fn push_cmd(&mut self, opcode: u16, payload: &[u32]) {
         let payload_len = payload.len() as u32;
-        debug_assert!(
-            payload_len < 0xFF,
-            "CdoBuilder does not emit CDOv2 extended-length (payload >= 0xFF)"
-        );
+        debug_assert!(payload_len < 0xFF, "CdoBuilder does not emit CDOv2 extended-length (payload >= 0xFF)");
         let cmd_word = (payload_len << 16) | opcode as u32;
         self.command_words.push(cmd_word);
         self.command_words.extend_from_slice(payload);
@@ -169,10 +161,7 @@ mod tests {
 
     #[test]
     fn round_trip_write_and_end_mark() {
-        let bytes = CdoBuilder::new()
-            .with_write32(0x0020_0000, 0xDEADBEEF)
-            .with_end_mark()
-            .build();
+        let bytes = CdoBuilder::new().with_write32(0x0020_0000, 0xDEADBEEF).with_end_mark().build();
 
         let cdo = Cdo::parse(&bytes).expect("builder should produce a parseable CDO");
         let commands: Vec<_> = cdo.commands().collect();
@@ -202,14 +191,7 @@ mod tests {
         let commands: Vec<_> = cdo.commands().collect();
         assert_eq!(commands.len(), 5);
 
-        assert!(matches!(
-            commands[0],
-            CdoRaw::MaskWrite {
-                address: 0x1000,
-                mask: 0x0000_00FF,
-                value: 0x42
-            }
-        ));
+        assert!(matches!(commands[0], CdoRaw::MaskWrite { address: 0x1000, mask: 0x0000_00FF, value: 0x42 }));
         match &commands[1] {
             CdoRaw::DmaWrite { address, data } => {
                 assert_eq!(*address, 0x0022_0000);

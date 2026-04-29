@@ -157,12 +157,7 @@ impl StreamSwitchTopology {
     pub fn apply(&mut self, op: DeviceOp) {
         match op {
             DeviceOp::RegWrite { tile, offset, value } => self.apply_write(tile, offset, value),
-            DeviceOp::RegMask {
-                tile,
-                offset,
-                mask,
-                value,
-            } => {
+            DeviceOp::RegMask { tile, offset, mask, value } => {
                 let prior = self.read_raw(tile, offset).unwrap_or(0);
                 self.apply_write(tile, offset, (prior & !mask) | (value & mask));
             }
@@ -212,15 +207,15 @@ impl StreamSwitchTopology {
     }
 
     pub fn packet_masters(&self) -> impl Iterator<Item = (TileAddr, u32, &MasterPortConfig)> {
-        self.tiles.iter().flat_map(|(addr, ts)| {
-            ts.packet_masters().map(move |(off, m)| (*addr, off, m))
-        })
+        self.tiles
+            .iter()
+            .flat_map(|(addr, ts)| ts.packet_masters().map(move |(off, m)| (*addr, off, m)))
     }
 
     pub fn packet_slaves(&self) -> impl Iterator<Item = (TileAddr, u32, &SlavePortConfig)> {
-        self.tiles.iter().flat_map(|(addr, ts)| {
-            ts.packet_slaves().map(move |(off, s)| (*addr, off, s))
-        })
+        self.tiles
+            .iter()
+            .flat_map(|(addr, ts)| ts.packet_slaves().map(move |(off, s)| (*addr, off, s)))
     }
 }
 
@@ -292,25 +287,10 @@ mod tests {
         // arbiter=1, mask=0x1F.
         // Value bit layout: [31:Valid=1][28:29:arb=01][24:26:msel=010]
         //                   [16:20:mask=11111][12:14:ptype=011][0:4:pid=00101]
-        let v: u32 = (1 << 31)
-            | (0b01 << 28)
-            | (0b010 << 24)
-            | (0b11111 << 16)
-            | (0b011 << 12)
-            | 0b00101;
-        let ops = vec![DeviceOp::RegWrite {
-            tile: tile(0, 2),
-            offset: 0x3F200,
-            value: v,
-        }];
+        let v: u32 = (1 << 31) | (0b01 << 28) | (0b010 << 24) | (0b11111 << 16) | (0b011 << 12) | 0b00101;
+        let ops = vec![DeviceOp::RegWrite { tile: tile(0, 2), offset: 0x3F200, value: v }];
         let topo = StreamSwitchTopology::from_device_ops(ops);
-        let slot = topo
-            .tiles
-            .get(&tile(0, 2))
-            .unwrap()
-            .slots
-            .get(&0x3F200)
-            .unwrap();
+        let slot = topo.tiles.get(&tile(0, 2)).unwrap().slots.get(&0x3F200).unwrap();
         assert!(slot.valid);
         assert_eq!(slot.arbiter, 1);
         assert_eq!(slot.master_select, 0b010);
@@ -335,13 +315,7 @@ mod tests {
             },
         ];
         let topo = StreamSwitchTopology::from_device_ops(ops);
-        let m = topo
-            .tiles
-            .get(&tile(0, 0))
-            .unwrap()
-            .masters
-            .get(&0x3F034)
-            .unwrap();
+        let m = topo.tiles.get(&tile(0, 0)).unwrap().masters.get(&0x3F034).unwrap();
         assert!(m.enabled);
         assert!(m.packet_mode);
     }
@@ -372,8 +346,7 @@ mod tests {
             },
         ];
         let topo = StreamSwitchTopology::from_device_ops(ops);
-        let pkt_offsets: Vec<u32> =
-            topo.packet_masters().map(|(_, off, _)| off).collect();
+        let pkt_offsets: Vec<u32> = topo.packet_masters().map(|(_, off, _)| off).collect();
         assert_eq!(pkt_offsets, vec![0x3F008]);
     }
 }

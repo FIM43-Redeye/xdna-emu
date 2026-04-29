@@ -211,12 +211,11 @@ impl<'a> Cdo<'a> {
             .into());
         }
 
-        let (header, _) = RawCdoHeader::read_from_prefix(data)
-            .map_err(|e| ParseError::External {
-                offset: 0,
-                context: "CDO header",
-                message: format!("{:?}", e),
-            })?;
+        let (header, _) = RawCdoHeader::read_from_prefix(data).map_err(|e| ParseError::External {
+            offset: 0,
+            context: "CDO header",
+            message: format!("{:?}", e),
+        })?;
 
         // Validate magic
         if header.ident_word != CDO_MAGIC_CDO && header.ident_word != CDO_MAGIC_XLNX {
@@ -230,21 +229,17 @@ impl<'a> Cdo<'a> {
         }
 
         // Validate checksum
-        let computed_checksum =
-            !(header.num_words + header.ident_word + header.version + header.cdo_length);
+        let computed_checksum = !(header.num_words + header.ident_word + header.version + header.cdo_length);
         if header.checksum != computed_checksum {
             // Warn but don't fail -- some tools may not set checksum correctly.
             log::warn!(
                 "CDO checksum mismatch: expected 0x{:08X}, got 0x{:08X}",
-                computed_checksum, header.checksum
+                computed_checksum,
+                header.checksum
             );
         }
 
-        Ok(Self {
-            data,
-            header,
-            commands_offset: CDO_HEADER_SIZE,
-        })
+        Ok(Self { data, header, commands_offset: CDO_HEADER_SIZE })
     }
 
     /// Get the CDO version
@@ -274,10 +269,7 @@ impl<'a> Cdo<'a> {
 
     /// Iterate over all commands
     pub fn commands(&self) -> CdoRawIterator<'a> {
-        CdoRawIterator {
-            data: self.command_data(),
-            offset: 0,
-        }
+        CdoRawIterator { data: self.command_data(), offset: 0 }
     }
 
     /// Count commands by type
@@ -357,10 +349,7 @@ impl<'a> Iterator for CdoRawIterator<'a> {
         let payload_len = if inline_len == 0xFF {
             if self.offset + 4 > self.data.len() {
                 self.offset = self.data.len();
-                return Some(CdoRaw::Unknown {
-                    opcode: (cmd_word & 0xFFFF) as u16,
-                    payload: Vec::new(),
-                });
+                return Some(CdoRaw::Unknown { opcode: (cmd_word & 0xFFFF) as u16, payload: Vec::new() });
             }
             let actual_len = u32::from_le_bytes([
                 self.data[self.offset],
@@ -379,10 +368,7 @@ impl<'a> Iterator for CdoRawIterator<'a> {
         if self.offset + payload_bytes > self.data.len() {
             // Truncated command - return what we can
             self.offset = self.data.len();
-            return Some(CdoRaw::Unknown {
-                opcode: (cmd_word & 0xFFFF) as u16,
-                payload: Vec::new(),
-            });
+            return Some(CdoRaw::Unknown { opcode: (cmd_word & 0xFFFF) as u16, payload: Vec::new() });
         }
 
         let payload: Vec<u32> = (0..payload_len)
@@ -403,16 +389,11 @@ impl<'a> Iterator for CdoRawIterator<'a> {
         let cmd = match opcode {
             CdoOpcode::EndMark => CdoRaw::EndMark,
 
-            CdoOpcode::Write if payload_len >= 2 => CdoRaw::Write {
-                address: payload[0],
-                value: payload[1],
-            },
+            CdoOpcode::Write if payload_len >= 2 => CdoRaw::Write { address: payload[0], value: payload[1] },
 
-            CdoOpcode::MaskWrite if payload_len >= 3 => CdoRaw::MaskWrite {
-                address: payload[0],
-                mask: payload[1],
-                value: payload[2],
-            },
+            CdoOpcode::MaskWrite if payload_len >= 3 => {
+                CdoRaw::MaskWrite { address: payload[0], mask: payload[1], value: payload[2] }
+            }
 
             CdoOpcode::Write64 if payload_len >= 3 => CdoRaw::Write64 {
                 address: ((payload[0] as u64) << 32) | (payload[1] as u64),
@@ -441,22 +422,18 @@ impl<'a> Iterator for CdoRawIterator<'a> {
                     log::warn!(
                         "CDO DmaWrite has 64-bit addr 0x{:08X}_{:08X} (>4GB); \
                          emulator only supports 32-bit tile addresses, using low 32 bits",
-                        addr_hi, addr_lo
+                        addr_hi,
+                        addr_lo
                     );
                     addr_lo
                 };
-                let data: Vec<u8> = payload[2..]
-                    .iter()
-                    .flat_map(|w| w.to_le_bytes())
-                    .collect();
+                let data: Vec<u8> = payload[2..].iter().flat_map(|w| w.to_le_bytes()).collect();
                 CdoRaw::DmaWrite { address, data }
             }
 
-            CdoOpcode::MaskPoll if payload_len >= 3 => CdoRaw::MaskPoll {
-                address: payload[0],
-                mask: payload[1],
-                expected: payload[2],
-            },
+            CdoOpcode::MaskPoll if payload_len >= 3 => {
+                CdoRaw::MaskPoll { address: payload[0], mask: payload[1], expected: payload[2] }
+            }
 
             CdoOpcode::MaskPoll64 if payload_len >= 4 => CdoRaw::MaskPoll64 {
                 address: ((payload[0] as u64) << 32) | (payload[1] as u64),
@@ -466,16 +443,11 @@ impl<'a> Iterator for CdoRawIterator<'a> {
 
             CdoOpcode::Delay if payload_len >= 1 => CdoRaw::Delay { cycles: payload[0] },
 
-            CdoOpcode::Nop => CdoRaw::Nop {
-                words: payload_len as u16,
-            },
+            CdoOpcode::Nop => CdoRaw::Nop { words: payload_len as u16 },
 
             CdoOpcode::Marker if payload_len >= 1 => CdoRaw::Marker { value: payload[0] },
 
-            _ => CdoRaw::Unknown {
-                opcode: (cmd_word & 0xFFFF) as u16,
-                payload,
-            },
+            _ => CdoRaw::Unknown { opcode: (cmd_word & 0xFFFF) as u16, payload },
         };
 
         Some(cmd)
@@ -550,10 +522,7 @@ mod tests {
     fn test_aie_address_decode() {
         // Address for tile (1, 2) with offset 0x1234
         let addr: u32 = (1 << 25) | (2 << 20) | 0x1234;
-        let cmd = CdoRaw::Write {
-            address: addr,
-            value: 0,
-        };
+        let cmd = CdoRaw::Write { address: addr, value: 0 };
         let (col, row, offset) = cmd.decode_aie_address().unwrap();
         assert_eq!(col, 1);
         assert_eq!(row, 2);
@@ -575,10 +544,10 @@ mod tests {
         // CDO v2 format: [addr_hi, addr_lo, data...]
         let cmd_word: u32 = 0x0004_0105;
         data[20..24].copy_from_slice(&cmd_word.to_le_bytes());
-        data[24..28].copy_from_slice(&0u32.to_le_bytes());           // addr_hi = 0
+        data[24..28].copy_from_slice(&0u32.to_le_bytes()); // addr_hi = 0
         data[28..32].copy_from_slice(&0x0022_0000u32.to_le_bytes()); // addr_lo = tile(0,2) program mem
-        data[32..36].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());  // data word 0
-        data[36..40].copy_from_slice(&0xCAFEBABEu32.to_le_bytes());  // data word 1
+        data[32..36].copy_from_slice(&0xDEADBEEFu32.to_le_bytes()); // data word 0
+        data[36..40].copy_from_slice(&0xCAFEBABEu32.to_le_bytes()); // data word 1
 
         // NOP to fill out the 6 words
         data[40..44].copy_from_slice(&0x0000_0111u32.to_le_bytes());
@@ -613,7 +582,10 @@ mod tests {
         data[4..8].copy_from_slice(&CDO_MAGIC_CDO.to_le_bytes());
         data[8..12].copy_from_slice(&0x0200u32.to_le_bytes());
         data[12..16].copy_from_slice(&(cdo_len as u32).to_le_bytes());
-        let checksum = !(4u32.wrapping_add(CDO_MAGIC_CDO).wrapping_add(0x0200).wrapping_add(cdo_len as u32));
+        let checksum = !(4u32
+            .wrapping_add(CDO_MAGIC_CDO)
+            .wrapping_add(0x0200)
+            .wrapping_add(cdo_len as u32));
         data[16..20].copy_from_slice(&checksum.to_le_bytes());
 
         let mut off = CDO_HEADER_SIZE;

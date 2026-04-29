@@ -121,12 +121,12 @@ mod tests {
 
         // Write CDO header at offset 100
         let offset = 100;
-        data[offset..offset + 4].copy_from_slice(&4u32.to_le_bytes());           // num_words
+        data[offset..offset + 4].copy_from_slice(&4u32.to_le_bytes()); // num_words
         data[offset + 4..offset + 8].copy_from_slice(&CDO_MAGIC_CDO.to_le_bytes()); // ident
-        data[offset + 8..offset + 12].copy_from_slice(&0x0200u32.to_le_bytes());  // version
-        data[offset + 12..offset + 16].copy_from_slice(&0u32.to_le_bytes());      // length
+        data[offset + 8..offset + 12].copy_from_slice(&0x0200u32.to_le_bytes()); // version
+        data[offset + 12..offset + 16].copy_from_slice(&0u32.to_le_bytes()); // length
         let checksum = !(4 + CDO_MAGIC_CDO + 0x0200);
-        data[offset + 16..offset + 20].copy_from_slice(&checksum.to_le_bytes());  // checksum
+        data[offset + 16..offset + 20].copy_from_slice(&checksum.to_le_bytes()); // checksum
 
         let found = find_cdo_offset(&data);
         assert_eq!(found, Some(100));

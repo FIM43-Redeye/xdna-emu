@@ -39,12 +39,10 @@
 use smallvec::SmallVec;
 
 use xdna_archspec::aie2::registers::dma::{
-    COMPUTE_DMA_MM2S_0_START_QUEUE, COMPUTE_DMA_MM2S_1_START_QUEUE,
-    COMPUTE_DMA_S2MM_0_START_QUEUE, COMPUTE_DMA_S2MM_1_START_QUEUE,
-    MEMTILE_CHANNELS_PER_DIR, MEMTILE_CHANNEL_STRIDE,
-    MEMTILE_DMA_MM2S_0_START_QUEUE, MEMTILE_DMA_S2MM_0_START_QUEUE,
-    SHIM_CHANNELS_PER_DIR, SHIM_CHANNEL_STRIDE,
-    SHIM_DMA_MM2S_0_TASK_QUEUE, SHIM_DMA_S2MM_0_TASK_QUEUE,
+    COMPUTE_DMA_MM2S_0_START_QUEUE, COMPUTE_DMA_MM2S_1_START_QUEUE, COMPUTE_DMA_S2MM_0_START_QUEUE,
+    COMPUTE_DMA_S2MM_1_START_QUEUE, MEMTILE_CHANNELS_PER_DIR, MEMTILE_CHANNEL_STRIDE,
+    MEMTILE_DMA_MM2S_0_START_QUEUE, MEMTILE_DMA_S2MM_0_START_QUEUE, SHIM_CHANNELS_PER_DIR,
+    SHIM_CHANNEL_STRIDE, SHIM_DMA_MM2S_0_TASK_QUEUE, SHIM_DMA_S2MM_0_TASK_QUEUE,
 };
 use xdna_archspec::aie2::registers::CORE_CONTROL;
 use xdna_archspec::aie2::{TILE_COL_SHIFT, TILE_OFFSET_MASK, TILE_ROW_SHIFT};
@@ -194,21 +192,11 @@ pub fn lower(raw: &CdoRaw) -> SmallVec<[DeviceOp; 4]> {
         }
         CdoRaw::MaskPoll { address, mask, expected } => {
             let (tile, offset) = decode_aie2_address(*address);
-            out.push(DeviceOp::MaskPoll {
-                tile,
-                offset,
-                mask: *mask,
-                expected: *expected,
-            });
+            out.push(DeviceOp::MaskPoll { tile, offset, mask: *mask, expected: *expected });
         }
         CdoRaw::MaskPoll64 { address, mask, expected } => {
             let (tile, offset) = decode_aie2_address(*address as u32);
-            out.push(DeviceOp::MaskPoll {
-                tile,
-                offset,
-                mask: *mask,
-                expected: *expected,
-            });
+            out.push(DeviceOp::MaskPoll { tile, offset, mask: *mask, expected: *expected });
         }
         CdoRaw::Delay { cycles } => {
             out.push(DeviceOp::Delay { cycles: *cycles });
@@ -243,11 +231,7 @@ fn lower_write(address: u32, value: u32) -> DeviceOp {
     // so `device::state` can store it verbatim into `tile.core.control`
     // for readback (hardware stores the full 32-bit word, not just bit 0).
     if offset == CORE_CONTROL && is_compute_row(tile.row) {
-        return DeviceOp::CoreEnable {
-            tile,
-            enabled: (value & 1) != 0,
-            value,
-        };
+        return DeviceOp::CoreEnable { tile, enabled: (value & 1) != 0, value };
     }
 
     // DMA channel start on any tile (compute, memtile, or shim): any
@@ -352,11 +336,7 @@ mod tests {
     fn mask_write_non_special_offset_lowers_to_regmask() {
         let (col, row) = compute_tile_addr();
         let addr = aie_addr(col, row, 0x1D000);
-        let raw = CdoRaw::MaskWrite {
-            address: addr,
-            mask: 0x0000_FFFF,
-            value: 0x0000_1234,
-        };
+        let raw = CdoRaw::MaskWrite { address: addr, mask: 0x0000_FFFF, value: 0x0000_1234 };
         let ops = lower(&raw);
         assert_eq!(ops.len(), 1);
         match &ops[0] {
@@ -392,11 +372,7 @@ mod tests {
     fn mask_write64_truncates_address_and_lowers_to_regmask() {
         let (col, row) = compute_tile_addr();
         let lo = aie_addr(col, row, 0x1D000);
-        let raw = CdoRaw::MaskWrite64 {
-            address: lo as u64,
-            mask: 0xFF,
-            value: 0x55,
-        };
+        let raw = CdoRaw::MaskWrite64 { address: lo as u64, mask: 0xFF, value: 0x55 };
         let ops = lower(&raw);
         assert_eq!(ops.len(), 1);
         match &ops[0] {
@@ -432,11 +408,7 @@ mod tests {
     fn mask_poll64_truncates_address() {
         let (col, row) = compute_tile_addr();
         let addr = aie_addr(col, row, 0x1DF00);
-        let raw = CdoRaw::MaskPoll64 {
-            address: addr as u64,
-            mask: 0x3,
-            expected: 0x2,
-        };
+        let raw = CdoRaw::MaskPoll64 { address: addr as u64, mask: 0x3, expected: 0x2 };
         let ops = lower(&raw);
         assert_eq!(ops.len(), 1);
         match &ops[0] {
@@ -484,10 +456,7 @@ mod tests {
     fn unknown_produces_empty_and_warns() {
         // The log::warn! side effect isn't asserted here (we don't
         // instrument a test logger); the empty result is the contract.
-        let ops = lower(&CdoRaw::Unknown {
-            opcode: 0xFFF,
-            payload: vec![1, 2, 3],
-        });
+        let ops = lower(&CdoRaw::Unknown { opcode: 0xFFF, payload: vec![1, 2, 3] });
         assert!(ops.is_empty(), "Unknown should lower to no DeviceOps");
     }
 
@@ -500,11 +469,7 @@ mod tests {
         let (col, row) = compute_tile_addr();
         let addr = aie_addr(col, row, 0x0);
         // 3 little-endian words: 0x0000_0001, 0xDEAD_BEEF, 0xCAFE_BABE
-        let data: Vec<u8> = vec![
-            0x01, 0x00, 0x00, 0x00,
-            0xEF, 0xBE, 0xAD, 0xDE,
-            0xBE, 0xBA, 0xFE, 0xCA,
-        ];
+        let data: Vec<u8> = vec![0x01, 0x00, 0x00, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, 0xBE, 0xBA, 0xFE, 0xCA];
         let raw = CdoRaw::DmaWrite { address: addr, data };
         let ops = lower(&raw);
         assert_eq!(ops.len(), 1);
@@ -524,10 +489,7 @@ mod tests {
         // Pathological: 5 bytes, not a whole word multiple. Real CDOs
         // always align, but we still want defensive behavior: pad to a
         // whole word, don't truncate.
-        let raw = CdoRaw::DmaWrite {
-            address: aie_addr(1, 2, 0),
-            data: vec![0x11, 0x22, 0x33, 0x44, 0xAA],
-        };
+        let raw = CdoRaw::DmaWrite { address: aie_addr(1, 2, 0), data: vec![0x11, 0x22, 0x33, 0x44, 0xAA] };
         let ops = lower(&raw);
         assert_eq!(ops.len(), 1);
         match &ops[0] {
@@ -622,10 +584,7 @@ mod tests {
                 assert_eq!(mask, 0x1);
                 assert_eq!(value, 0x0);
             }
-            other => panic!(
-                "MaskWrite to CORE_CONTROL must lower to RegMask, got {:?}",
-                other
-            ),
+            other => panic!("MaskWrite to CORE_CONTROL must lower to RegMask, got {:?}", other),
         }
     }
 
@@ -634,11 +593,7 @@ mod tests {
         let (col, row) = compute_tile_addr();
         let addr = aie_addr(col, row, CORE_CONTROL);
         // Mask touches bit 1 only; enable bit is untouched.
-        let ops = lower(&CdoRaw::MaskWrite {
-            address: addr,
-            mask: 0x2,
-            value: 0x2,
-        });
+        let ops = lower(&CdoRaw::MaskWrite { address: addr, mask: 0x2, value: 0x2 });
         assert_eq!(ops.len(), 1);
         assert!(
             matches!(ops[0], DeviceOp::RegMask { .. }),

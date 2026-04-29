@@ -23,8 +23,8 @@ use super::error::ParseError;
 #[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable)]
 #[repr(C)]
 pub struct ArrayOffset {
-    pub count: u32,   // Number of elements
-    pub offset: u32,  // Byte offset from section start
+    pub count: u32,  // Number of elements
+    pub offset: u32, // Byte offset from section start
 }
 
 /// CDO type identifier
@@ -52,12 +52,12 @@ impl From<u8> for CdoType {
 #[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable)]
 #[repr(C)]
 pub struct RawCdoGroup {
-    pub mpo_name: u32,           // Offset to name string
-    pub cdo_type: u8,            // CDO_Type enum
+    pub mpo_name: u32, // Offset to name string
+    pub cdo_type: u8,  // CDO_Type enum
     pub padding: [u8; 3],
-    pub pdi_id: u64,             // PDI ID
-    pub dpu_kernel_ids: ArrayOffset,  // Array of kernel IDs
-    pub pre_cdo_groups: ArrayOffset,  // Array of pre-CDO group IDs
+    pub pdi_id: u64,                 // PDI ID
+    pub dpu_kernel_ids: ArrayOffset, // Array of kernel IDs
+    pub pre_cdo_groups: ArrayOffset, // Array of pre-CDO group IDs
     pub reserved: [u8; 64],
 }
 
@@ -75,9 +75,9 @@ pub struct RawAiePdi {
 #[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable)]
 #[repr(C)]
 pub struct RawAiePartitionInfo {
-    pub column_width: u16,           // Width of partition in columns
+    pub column_width: u16, // Width of partition in columns
     pub padding: [u8; 6],
-    pub start_columns: ArrayOffset,  // Array of start column IDs (u16)
+    pub start_columns: ArrayOffset, // Array of start column IDs (u16)
     pub reserved: [u8; 72],
 }
 
@@ -87,14 +87,14 @@ pub struct RawAiePartitionInfo {
 pub struct RawAiePartition {
     pub schema_version: u8,
     pub padding0: [u8; 3],
-    pub mpo_name: u32,               // Offset to name string
-    pub operations_per_cycle: u32,   // For TOPS calculation
+    pub mpo_name: u32,             // Offset to name string
+    pub operations_per_cycle: u32, // For TOPS calculation
     pub padding1: [u8; 4],
-    pub inference_fingerprint: u64,  // Hash of inference function
-    pub pre_post_fingerprint: u64,   // Hash of pre/post processing
-    pub info: RawAiePartitionInfo,   // Partition info (88 bytes)
-    pub aie_pdi: ArrayOffset,        // Array of aie_pdi
-    pub kernel_commit_id: u32,       // Git commit ID offset
+    pub inference_fingerprint: u64, // Hash of inference function
+    pub pre_post_fingerprint: u64,  // Hash of pre/post processing
+    pub info: RawAiePartitionInfo,  // Partition info (88 bytes)
+    pub aie_pdi: ArrayOffset,       // Array of aie_pdi
+    pub kernel_commit_id: u32,      // Git commit ID offset
     pub reserved: [u8; 52],
 }
 
@@ -127,12 +127,11 @@ impl<'a> AiePartition<'a> {
             .into());
         }
 
-        let (header, _) = RawAiePartition::read_from_prefix(data)
-            .map_err(|e| ParseError::External {
-                offset: 0,
-                context: "AIE Partition header",
-                message: format!("{:?}", e),
-            })?;
+        let (header, _) = RawAiePartition::read_from_prefix(data).map_err(|e| ParseError::External {
+            offset: 0,
+            context: "AIE Partition header",
+            message: format!("{:?}", e),
+        })?;
 
         Ok(Self { data, header })
     }
@@ -223,11 +222,7 @@ impl<'a> AiePartition<'a> {
                 CdoType::Unknown
             };
 
-            Some(AiePdi {
-                uuid: uuid::Uuid::from_bytes(raw_pdi.uuid),
-                pdi_image,
-                cdo_type,
-            })
+            Some(AiePdi { uuid: uuid::Uuid::from_bytes(raw_pdi.uuid), pdi_image, cdo_type })
         })
     }
 
@@ -303,7 +298,7 @@ mod tests {
         data[0x20..0x22].copy_from_slice(&2u16.to_le_bytes());
 
         // start_columns array_offset at 0x28: count=2, offset=200
-        data[0x28..0x2C].copy_from_slice(&2u32.to_le_bytes());  // count
+        data[0x28..0x2C].copy_from_slice(&2u32.to_le_bytes()); // count
         data[0x2C..0x30].copy_from_slice(&200u32.to_le_bytes()); // offset
 
         // Start columns at offset 200: [0, 2]
@@ -336,7 +331,8 @@ mod tests {
         };
 
         let xclbin = Xclbin::from_file(&test_xclbin).unwrap();
-        let section = xclbin.find_section(SectionKind::AiePartition)
+        let section = xclbin
+            .find_section(SectionKind::AiePartition)
             .expect("XCLBIN should have AIE_PARTITION section");
 
         let partition = AiePartition::parse(section.data()).unwrap();
@@ -377,5 +373,4 @@ mod tests {
         let cdo_offset = find_cdo_offset(pdi.pdi_image);
         assert!(cdo_offset.is_some(), "Should find CDO within PDI image");
     }
-
 }
