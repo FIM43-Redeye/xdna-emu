@@ -111,18 +111,12 @@ pub struct TestRunner {
 impl TestRunner {
     /// Create a new test runner for NPU1.
     pub fn new() -> Self {
-        Self {
-            engine: InterpreterEngine::new_npu1(),
-            active_cores: Vec::new(),
-        }
+        Self { engine: InterpreterEngine::new_npu1(), active_cores: Vec::new() }
     }
 
     /// Create a new test runner for NPU2.
     pub fn new_npu2() -> Self {
-        Self {
-            engine: InterpreterEngine::new_npu2(),
-            active_cores: Vec::new(),
-        }
+        Self { engine: InterpreterEngine::new_npu2(), active_cores: Vec::new() }
     }
 
     /// Get a reference to the underlying engine.
@@ -144,8 +138,7 @@ impl TestRunner {
     /// 4. Sets the PC to the entry point
     /// 5. Enables the core
     pub fn load_elf(&mut self, col: u8, row: u8, path: &str) -> Result<()> {
-        let data = std::fs::read(path)
-            .map_err(|e| anyhow!("Failed to read ELF: {}", e))?;
+        let data = std::fs::read(path).map_err(|e| anyhow!("Failed to read ELF: {}", e))?;
 
         self.load_elf_bytes(col, row, &data)
     }
@@ -155,7 +148,10 @@ impl TestRunner {
         let elf = AieElf::parse(data)?;
 
         // Get tile
-        let tile = self.engine.device_mut().tile_mut(col as usize, row as usize)
+        let tile = self
+            .engine
+            .device_mut()
+            .tile_mut(col as usize, row as usize)
             .ok_or_else(|| anyhow!("Invalid tile coordinates ({}, {})", col, row))?;
 
         elf.load_into(tile);
@@ -172,7 +168,10 @@ impl TestRunner {
     ///
     /// Address is relative to data memory base (AIE_DATA_MEMORY_BASE in AIE address space).
     pub fn write_tile_memory(&mut self, col: u8, row: u8, offset: usize, data: &[u8]) -> Result<()> {
-        let tile = self.engine.device_mut().tile_mut(col as usize, row as usize)
+        let tile = self
+            .engine
+            .device_mut()
+            .tile_mut(col as usize, row as usize)
             .ok_or_else(|| anyhow!("Invalid tile coordinates ({}, {})", col, row))?;
 
         let dm = tile.data_memory_mut();
@@ -186,7 +185,10 @@ impl TestRunner {
 
     /// Read data from tile data memory.
     pub fn read_tile_memory(&self, col: u8, row: u8, offset: usize, len: usize) -> Result<Vec<u8>> {
-        let tile = self.engine.device().tile(col as usize, row as usize)
+        let tile = self
+            .engine
+            .device()
+            .tile(col as usize, row as usize)
             .ok_or_else(|| anyhow!("Invalid tile coordinates ({}, {})", col, row))?;
 
         let dm = tile.data_memory();
@@ -211,7 +213,11 @@ impl TestRunner {
 
     /// Configure a DMA buffer descriptor.
     pub fn configure_dma_bd(&mut self, col: u8, row: u8, bd_index: u8, config: BdConfig) -> Result<()> {
-        let dma = self.engine.device_mut().array.dma_engine_mut(col, row)
+        let dma = self
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(col, row)
             .ok_or_else(|| anyhow!("Invalid tile coordinates ({}, {})", col, row))?;
 
         dma.configure_bd(bd_index, config)
@@ -232,8 +238,12 @@ impl TestRunner {
     /// * `s2mm_channel` - S2MM DMA channel index (0-1 for compute tiles)
     pub fn configure_dma_route(
         &mut self,
-        src_col: u8, src_row: u8, mm2s_channel: u8,
-        dst_col: u8, dst_row: u8, s2mm_channel: u8,
+        src_col: u8,
+        src_row: u8,
+        mm2s_channel: u8,
+        dst_col: u8,
+        dst_row: u8,
+        s2mm_channel: u8,
     ) {
         // Map DMA channel index to stream switch port index.
         //
@@ -274,8 +284,12 @@ impl TestRunner {
 
         log::debug!(
             "configure_dma_route: ({},{}) DMA slave[{}] -> ({},{}) DMA master[{}]",
-            src_col, src_row, dma_slave,
-            dst_col, dst_row, dma_master
+            src_col,
+            src_row,
+            dma_slave,
+            dst_col,
+            dst_row,
+            dma_master
         );
 
         // Cross-column routing requires East/West inter-tile hops which are
@@ -284,7 +298,10 @@ impl TestRunner {
         if src_col != dst_col {
             log::error!(
                 "configure_dma_route: cross-column ({},{}) -> ({},{}) not supported in test_runner",
-                src_col, src_row, dst_col, dst_row
+                src_col,
+                src_row,
+                dst_col,
+                dst_row
             );
             return;
         }
@@ -302,21 +319,36 @@ impl TestRunner {
                     // Source tile: DMA slave -> North master
                     let north_master = north_master_start(row) as usize;
                     tile.stream_switch.configure_local_route(dma_slave as usize, north_master);
-                    log::debug!("  Route ({},{}) slave[{}] -> master[{}] (DMA->North)",
-                        src_col, row, dma_slave, north_master);
+                    log::debug!(
+                        "  Route ({},{}) slave[{}] -> master[{}] (DMA->North)",
+                        src_col,
+                        row,
+                        dma_slave,
+                        north_master
+                    );
                 } else if row == dst_row {
                     // Destination tile: South slave -> DMA master
                     let south_slave = south_slave_start(row) as usize;
                     tile.stream_switch.configure_local_route(south_slave, dma_master as usize);
-                    log::debug!("  Route ({},{}) slave[{}] -> master[{}] (South->DMA)",
-                        src_col, row, south_slave, dma_master);
+                    log::debug!(
+                        "  Route ({},{}) slave[{}] -> master[{}] (South->DMA)",
+                        src_col,
+                        row,
+                        south_slave,
+                        dma_master
+                    );
                 } else {
                     // Intermediate tile: South slave -> North master (passthrough)
                     let south_slave = south_slave_start(row) as usize;
                     let north_master = north_master_start(row) as usize;
                     tile.stream_switch.configure_local_route(south_slave, north_master);
-                    log::debug!("  Route ({},{}) slave[{}] -> master[{}] (passthrough)",
-                        src_col, row, south_slave, north_master);
+                    log::debug!(
+                        "  Route ({},{}) slave[{}] -> master[{}] (passthrough)",
+                        src_col,
+                        row,
+                        south_slave,
+                        north_master
+                    );
                 }
             }
         } else if dst_row < src_row {
@@ -329,30 +361,51 @@ impl TestRunner {
                     // Source tile: DMA slave -> South master
                     let south_master = south_master_start(row) as usize;
                     tile.stream_switch.configure_local_route(dma_slave as usize, south_master);
-                    log::debug!("  Route ({},{}) slave[{}] -> master[{}] (DMA->South)",
-                        src_col, row, dma_slave, south_master);
+                    log::debug!(
+                        "  Route ({},{}) slave[{}] -> master[{}] (DMA->South)",
+                        src_col,
+                        row,
+                        dma_slave,
+                        south_master
+                    );
                 } else if row == dst_row {
                     // Destination tile: North slave -> DMA master
                     let north_slave = north_slave_start(row) as usize;
                     tile.stream_switch.configure_local_route(north_slave, dma_master as usize);
-                    log::debug!("  Route ({},{}) slave[{}] -> master[{}] (North->DMA)",
-                        src_col, row, north_slave, dma_master);
+                    log::debug!(
+                        "  Route ({},{}) slave[{}] -> master[{}] (North->DMA)",
+                        src_col,
+                        row,
+                        north_slave,
+                        dma_master
+                    );
                 } else {
                     // Intermediate tile: North slave -> South master (passthrough)
                     let north_slave = north_slave_start(row) as usize;
                     let south_master = south_master_start(row) as usize;
                     tile.stream_switch.configure_local_route(north_slave, south_master);
-                    log::debug!("  Route ({},{}) slave[{}] -> master[{}] (passthrough)",
-                        src_col, row, north_slave, south_master);
+                    log::debug!(
+                        "  Route ({},{}) slave[{}] -> master[{}] (passthrough)",
+                        src_col,
+                        row,
+                        north_slave,
+                        south_master
+                    );
                 }
             }
         } else {
             // Same tile: DMA slave → DMA master (loopback)
             let tile_idx = (src_col as usize) * (array.rows() as usize) + (src_row as usize);
             let tile = &mut array.tiles[tile_idx];
-            tile.stream_switch.configure_local_route(dma_slave as usize, dma_master as usize);
-            log::debug!("  Route ({},{}) slave[{}] -> master[{}] (loopback)",
-                src_col, src_row, dma_slave, dma_master);
+            tile.stream_switch
+                .configure_local_route(dma_slave as usize, dma_master as usize);
+            log::debug!(
+                "  Route ({},{}) slave[{}] -> master[{}] (loopback)",
+                src_col,
+                src_row,
+                dma_slave,
+                dma_master
+            );
         }
     }
 
@@ -363,9 +416,13 @@ impl TestRunner {
         self.engine.run(max_cycles);
 
         // Check core status
-        let core_halted: Vec<_> = self.active_cores.iter()
+        let core_halted: Vec<_> = self
+            .active_cores
+            .iter()
             .map(|&(col, row)| {
-                let halted = self.engine.core_status(col as usize, row as usize)
+                let halted = self
+                    .engine
+                    .core_status(col as usize, row as usize)
                     .map(|s| matches!(s, crate::interpreter::CoreStatus::Halted))
                     .unwrap_or(false);
                 (col, row, halted)
@@ -391,7 +448,8 @@ impl TestRunner {
         if !result.halted {
             return Err(anyhow!(
                 "Execution did not complete within {} cycles (status: {:?})",
-                max_cycles, result.status
+                max_cycles,
+                result.status
             ));
         }
 
@@ -411,19 +469,21 @@ impl TestRunner {
 
     /// Get the PC of a core.
     pub fn core_pc(&self, col: u8, row: u8) -> Option<u32> {
-        self.engine.core_context(col as usize, row as usize)
-            .map(|ctx| ctx.pc())
+        self.engine.core_context(col as usize, row as usize).map(|ctx| ctx.pc())
     }
 
     /// Get a scalar register value.
     pub fn scalar_reg(&self, col: u8, row: u8, reg: u8) -> Option<u32> {
-        self.engine.core_context(col as usize, row as usize)
+        self.engine
+            .core_context(col as usize, row as usize)
             .map(|ctx| ctx.scalar.read(reg))
     }
 
     /// Set a scalar register value.
     pub fn set_scalar_reg(&mut self, col: u8, row: u8, reg: u8, value: u32) -> Result<()> {
-        let ctx = self.engine.core_context_mut(col as usize, row as usize)
+        let ctx = self
+            .engine
+            .core_context_mut(col as usize, row as usize)
             .ok_or_else(|| anyhow!("Invalid tile coordinates ({}, {})", col, row))?;
 
         ctx.scalar.write(reg, value);
@@ -431,7 +491,14 @@ impl TestRunner {
     }
 
     /// Write input data pattern: sequential u32 values.
-    pub fn write_sequential_u32(&mut self, col: u8, row: u8, offset: usize, count: usize, start: u32) -> Result<()> {
+    pub fn write_sequential_u32(
+        &mut self,
+        col: u8,
+        row: u8,
+        offset: usize,
+        count: usize,
+        start: u32,
+    ) -> Result<()> {
         let values: Vec<u32> = (0..count).map(|i| start + i as u32).collect();
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         self.write_tile_memory(col, row, offset, &bytes)
@@ -440,7 +507,8 @@ impl TestRunner {
     /// Read output data as u32 values.
     pub fn read_u32_values(&self, col: u8, row: u8, offset: usize, count: usize) -> Result<Vec<u32>> {
         let bytes = self.read_tile_memory(col, row, offset, count * 4)?;
-        let values: Vec<u32> = bytes.chunks(4)
+        let values: Vec<u32> = bytes
+            .chunks(4)
             .map(|chunk| {
                 let arr: [u8; 4] = chunk.try_into().unwrap();
                 u32::from_le_bytes(arr)
@@ -455,10 +523,7 @@ impl TestRunner {
 
         for (i, (exp, act)) in expected.iter().zip(actual.iter()).enumerate() {
             if exp != act {
-                return Err(anyhow!(
-                    "Mismatch at index {}: expected {}, got {}",
-                    i, exp, act
-                ));
+                return Err(anyhow!("Mismatch at index {}: expected {}, got {}", i, exp, act));
             }
         }
 
@@ -494,9 +559,9 @@ mod tests {
         elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
 
         // ELF32, little-endian, version 1
-        elf[4] = 1;  // ELFCLASS32
-        elf[5] = 1;  // ELFDATA2LSB
-        elf[6] = 1;  // EV_CURRENT
+        elf[4] = 1; // ELFCLASS32
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
 
         // e_type = ET_EXEC (2)
         elf[16..18].copy_from_slice(&2u16.to_le_bytes());
@@ -745,8 +810,8 @@ mod tests {
         runner.engine.enable_core(1, 2);
 
         // Set up some registers via direct access
-        runner.set_scalar_reg(1, 2, 0, 100).unwrap();  // r0 = 100
-        runner.set_scalar_reg(1, 2, 1, 42).unwrap();   // r1 = 42
+        runner.set_scalar_reg(1, 2, 0, 100).unwrap(); // r0 = 100
+        runner.set_scalar_reg(1, 2, 1, 42).unwrap(); // r1 = 42
 
         // Write NOPs to program memory (we don't have a simple ADD encoding yet)
         if let Some(tile) = runner.engine.device_mut().tile_mut(1, 2) {
@@ -817,7 +882,11 @@ mod tests {
         }
 
         let total = decoded + unknown;
-        let coverage = if total > 0 { decoded as f64 / total as f64 * 100.0 } else { 0.0 };
+        let coverage = if total > 0 {
+            decoded as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
         eprintln!("Decoder coverage: {}/{} instructions ({:.1}%)", decoded, total, coverage);
 
         // We should decode at least some instructions
@@ -856,19 +925,24 @@ mod tests {
         runner.configure_dma_bd(dst_col, dst_row, 0, s2mm_bd).unwrap();
 
         // Configure stream routing: source tile MM2S_0 -> dest tile S2MM_0
-        runner.configure_dma_route(
-            src_col, src_row, mm2s_channel,
-            dst_col, dst_row, s2mm_channel,
-        );
+        runner.configure_dma_route(src_col, src_row, mm2s_channel, dst_col, dst_row, s2mm_channel);
 
         // Start both DMA channels
         // MM2S_0 is channel index 2, S2MM_0 is channel index 0
-        runner.engine.device_mut().array.dma_engine_mut(src_col, src_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(src_col, src_row)
             .unwrap()
             .start_channel(mm2s_channel, 0) // BD 0
             .unwrap();
 
-        runner.engine.device_mut().array.dma_engine_mut(dst_col, dst_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(dst_col, dst_row)
             .unwrap()
             .start_channel(s2mm_channel, 0) // BD 0
             .unwrap();
@@ -883,10 +957,7 @@ mod tests {
         let result = runner.read_tile_memory(dst_col, dst_row, 0x2000, 64).unwrap();
 
         // Verify exact byte-for-byte match
-        assert_eq!(
-            result, test_data,
-            "Data mismatch in two-tile DMA stream transfer"
-        );
+        assert_eq!(result, test_data, "Data mismatch in two-tile DMA stream transfer");
         eprintln!("Two-tile DMA stream transfer: 64 bytes transferred correctly");
     }
 
@@ -916,18 +987,23 @@ mod tests {
         runner.configure_dma_bd(dst_col, dst_row, 0, s2mm_bd).unwrap();
 
         // Configure stream routing
-        runner.configure_dma_route(
-            src_col, src_row, mm2s_channel,
-            dst_col, dst_row, s2mm_channel,
-        );
+        runner.configure_dma_route(src_col, src_row, mm2s_channel, dst_col, dst_row, s2mm_channel);
 
         // Start both DMA channels
-        runner.engine.device_mut().array.dma_engine_mut(src_col, src_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(src_col, src_row)
             .unwrap()
             .start_channel(mm2s_channel, 0)
             .unwrap();
 
-        runner.engine.device_mut().array.dma_engine_mut(dst_col, dst_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(dst_col, dst_row)
             .unwrap()
             .start_channel(s2mm_channel, 0)
             .unwrap();
@@ -939,10 +1015,7 @@ mod tests {
 
         // Verify exact match
         let result = runner.read_tile_memory(dst_col, dst_row, 0x2000, 256).unwrap();
-        assert_eq!(
-            result, test_data,
-            "256-byte transfer data mismatch"
-        );
+        assert_eq!(result, test_data, "256-byte transfer data mismatch");
         eprintln!("Two-tile DMA stream transfer: 256 bytes transferred correctly");
     }
 
@@ -970,10 +1043,10 @@ mod tests {
         // Channel assignments:
         // A -> B direction: A's MM2S channel 2 (port 2) -> B's S2MM channel 0 (port 0)
         // B -> A direction: B's MM2S channel 3 (port 3) -> A's S2MM channel 1 (port 1)
-        let a_to_b_mm2s = 2u8;  // MM2S_0 on tile A
-        let a_to_b_s2mm = 0u8;  // S2MM_0 on tile B
-        let b_to_a_mm2s = 3u8;  // MM2S_1 on tile B
-        let b_to_a_s2mm = 1u8;  // S2MM_1 on tile A
+        let a_to_b_mm2s = 2u8; // MM2S_0 on tile A
+        let a_to_b_s2mm = 0u8; // S2MM_0 on tile B
+        let b_to_a_mm2s = 3u8; // MM2S_1 on tile B
+        let b_to_a_s2mm = 1u8; // S2MM_1 on tile A
 
         // Create distinct test patterns for each direction
         // A -> B: 256 bytes starting at 0xA0
@@ -990,8 +1063,12 @@ mod tests {
         let b_dst_offset = 0x4000usize;
 
         // Write source data to each tile
-        runner.write_tile_memory(tile_a_col, tile_a_row, a_src_offset, &a_to_b_data).unwrap();
-        runner.write_tile_memory(tile_b_col, tile_b_row, b_src_offset, &b_to_a_data).unwrap();
+        runner
+            .write_tile_memory(tile_a_col, tile_a_row, a_src_offset, &a_to_b_data)
+            .unwrap();
+        runner
+            .write_tile_memory(tile_b_col, tile_b_row, b_src_offset, &b_to_a_data)
+            .unwrap();
 
         // Configure buffer descriptors for A -> B transfer
         // BD 0 on tile A: MM2S reads from 0x1000
@@ -1013,16 +1090,10 @@ mod tests {
 
         // Configure stream routing for both directions
         // A -> B: tile A MM2S -> tile B S2MM
-        runner.configure_dma_route(
-            tile_a_col, tile_a_row, a_to_b_mm2s,
-            tile_b_col, tile_b_row, a_to_b_s2mm,
-        );
+        runner.configure_dma_route(tile_a_col, tile_a_row, a_to_b_mm2s, tile_b_col, tile_b_row, a_to_b_s2mm);
 
         // B -> A: tile B MM2S -> tile A S2MM
-        runner.configure_dma_route(
-            tile_b_col, tile_b_row, b_to_a_mm2s,
-            tile_a_col, tile_a_row, b_to_a_s2mm,
-        );
+        runner.configure_dma_route(tile_b_col, tile_b_row, b_to_a_mm2s, tile_a_col, tile_a_row, b_to_a_s2mm);
 
         // Verify destination buffers are zeroed before transfer
         let pre_b = runner.read_tile_memory(tile_b_col, tile_b_row, b_dst_offset, 256).unwrap();
@@ -1032,25 +1103,41 @@ mod tests {
 
         // Start all DMA channels simultaneously
         // A -> B direction: MM2S on A, S2MM on B
-        runner.engine.device_mut().array.dma_engine_mut(tile_a_col, tile_a_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(tile_a_col, tile_a_row)
             .unwrap()
-            .start_channel(a_to_b_mm2s, 0)  // BD 0
+            .start_channel(a_to_b_mm2s, 0) // BD 0
             .unwrap();
 
-        runner.engine.device_mut().array.dma_engine_mut(tile_b_col, tile_b_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(tile_b_col, tile_b_row)
             .unwrap()
-            .start_channel(a_to_b_s2mm, 0)  // BD 0
+            .start_channel(a_to_b_s2mm, 0) // BD 0
             .unwrap();
 
         // B -> A direction: MM2S on B, S2MM on A
-        runner.engine.device_mut().array.dma_engine_mut(tile_b_col, tile_b_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(tile_b_col, tile_b_row)
             .unwrap()
-            .start_channel(b_to_a_mm2s, 1)  // BD 1
+            .start_channel(b_to_a_mm2s, 1) // BD 1
             .unwrap();
 
-        runner.engine.device_mut().array.dma_engine_mut(tile_a_col, tile_a_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(tile_a_col, tile_a_row)
             .unwrap()
-            .start_channel(b_to_a_s2mm, 1)  // BD 1
+            .start_channel(b_to_a_s2mm, 1) // BD 1
             .unwrap();
 
         // Step until both transfers complete
@@ -1118,7 +1205,9 @@ mod tests {
         let c_dst_offset = 0x3000usize;
 
         // Write source data to tile A
-        runner.write_tile_memory(tile_a_col, tile_a_row, a_src_offset, &test_data).unwrap();
+        runner
+            .write_tile_memory(tile_a_col, tile_a_row, a_src_offset, &test_data)
+            .unwrap();
 
         // ============================================
         // Configure DMA buffer descriptors
@@ -1141,8 +1230,12 @@ mod tests {
         runner.configure_dma_bd(tile_c_col, tile_c_row, 0, c_s2mm_bd).unwrap();
 
         // Verify destinations are zeroed before transfer
-        let pre_b = runner.read_tile_memory(tile_b_col, tile_b_row, b_buffer_offset, transfer_size as usize).unwrap();
-        let pre_c = runner.read_tile_memory(tile_c_col, tile_c_row, c_dst_offset, transfer_size as usize).unwrap();
+        let pre_b = runner
+            .read_tile_memory(tile_b_col, tile_b_row, b_buffer_offset, transfer_size as usize)
+            .unwrap();
+        let pre_c = runner
+            .read_tile_memory(tile_c_col, tile_c_row, c_dst_offset, transfer_size as usize)
+            .unwrap();
         assert!(pre_b.iter().all(|&b| b == 0), "Tile B buffer should be zeroed before transfer");
         assert!(pre_c.iter().all(|&b| b == 0), "Tile C destination should be zeroed before transfer");
 
@@ -1152,14 +1245,22 @@ mod tests {
 
         // Route A -> B: tile A MM2S (channel 2) -> tile B S2MM (channel 0)
         runner.configure_dma_route(
-            tile_a_col, tile_a_row, mm2s_channel,
-            tile_b_col, tile_b_row, s2mm_channel,
+            tile_a_col,
+            tile_a_row,
+            mm2s_channel,
+            tile_b_col,
+            tile_b_row,
+            s2mm_channel,
         );
 
         // Route B -> C: tile B MM2S (channel 2) -> tile C S2MM (channel 0)
         runner.configure_dma_route(
-            tile_b_col, tile_b_row, mm2s_channel,
-            tile_c_col, tile_c_row, s2mm_channel,
+            tile_b_col,
+            tile_b_row,
+            mm2s_channel,
+            tile_c_col,
+            tile_c_row,
+            s2mm_channel,
         );
 
         // ============================================
@@ -1168,19 +1269,31 @@ mod tests {
 
         // Phase 1: Start A -> B transfer
         // Start tile A's MM2S channel with BD 0
-        runner.engine.device_mut().array.dma_engine_mut(tile_a_col, tile_a_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(tile_a_col, tile_a_row)
             .unwrap()
             .start_channel(mm2s_channel, 0)
             .unwrap();
 
         // Start tile B's S2MM channel with BD 0
-        runner.engine.device_mut().array.dma_engine_mut(tile_b_col, tile_b_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(tile_b_col, tile_b_row)
             .unwrap()
             .start_channel(s2mm_channel, 0)
             .unwrap();
 
         // Start tile C's S2MM channel with BD 0 (ready to receive from B)
-        runner.engine.device_mut().array.dma_engine_mut(tile_c_col, tile_c_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(tile_c_col, tile_c_row)
             .unwrap()
             .start_channel(s2mm_channel, 0)
             .unwrap();
@@ -1192,7 +1305,9 @@ mod tests {
         }
 
         // Verify intermediate result: data should be at tile B's buffer
-        let received_at_b = runner.read_tile_memory(tile_b_col, tile_b_row, b_buffer_offset, transfer_size as usize).unwrap();
+        let received_at_b = runner
+            .read_tile_memory(tile_b_col, tile_b_row, b_buffer_offset, transfer_size as usize)
+            .unwrap();
         assert_eq!(
             received_at_b, test_data,
             "A -> B transfer data mismatch: expected data from tile A at tile B's buffer"
@@ -1201,7 +1316,11 @@ mod tests {
 
         // Phase 2: Start B -> C transfer (B now has data to forward)
         // Start tile B's MM2S channel with BD 1 (reads from same buffer that received data)
-        runner.engine.device_mut().array.dma_engine_mut(tile_b_col, tile_b_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(tile_b_col, tile_b_row)
             .unwrap()
             .start_channel(mm2s_channel, 1)
             .unwrap();
@@ -1216,18 +1335,19 @@ mod tests {
         // ============================================
 
         // Data should have arrived at tile C's destination
-        let received_at_c = runner.read_tile_memory(tile_c_col, tile_c_row, c_dst_offset, transfer_size as usize).unwrap();
+        let received_at_c = runner
+            .read_tile_memory(tile_c_col, tile_c_row, c_dst_offset, transfer_size as usize)
+            .unwrap();
         assert_eq!(
             received_at_c, test_data,
             "B -> C transfer data mismatch: expected data from tile B at tile C's destination"
         );
 
         // Also verify tile B still has the data (it was a pass-through, not consumed)
-        let still_at_b = runner.read_tile_memory(tile_b_col, tile_b_row, b_buffer_offset, transfer_size as usize).unwrap();
-        assert_eq!(
-            still_at_b, test_data,
-            "Tile B buffer should still contain the data after forwarding"
-        );
+        let still_at_b = runner
+            .read_tile_memory(tile_b_col, tile_b_row, b_buffer_offset, transfer_size as usize)
+            .unwrap();
+        assert_eq!(still_at_b, test_data, "Tile B buffer should still contain the data after forwarding");
 
         eprintln!("Three-tile DMA pipeline test passed:");
         eprintln!("  Source:      tile ({},{}) @ 0x{:04X}", tile_a_col, tile_a_row, a_src_offset);
@@ -1255,8 +1375,8 @@ mod tests {
         let dst_row = 3u8;
 
         // DMA channel assignments
-        let mm2s_channel = 2u8;  // MM2S_0 on source
-        let s2mm_channel = 0u8;  // S2MM_0 on destination
+        let mm2s_channel = 2u8; // MM2S_0 on source
+        let s2mm_channel = 0u8; // S2MM_0 on destination
 
         // Memory offsets
         let src_offset = 0x1000usize;
@@ -1264,37 +1384,43 @@ mod tests {
 
         // Generate test pattern: each byte is (pattern_seed + index) mod 256
         // This creates a recognizable pattern that varies with both position and seed
-        let test_data: Vec<u8> = (0..size)
-            .map(|i| pattern_seed.wrapping_add((i % 256) as u8))
-            .collect();
+        let test_data: Vec<u8> = (0..size).map(|i| pattern_seed.wrapping_add((i % 256) as u8)).collect();
 
         // Write source data to source tile memory
-        runner.write_tile_memory(src_col, src_row, src_offset, &test_data)
+        runner
+            .write_tile_memory(src_col, src_row, src_offset, &test_data)
             .map_err(|e| format!("Failed to write source memory: {}", e))?;
 
         // Configure MM2S BD on source tile: read from src_offset
         let mm2s_bd = BdConfig::simple_1d(src_offset as u64, size);
-        runner.configure_dma_bd(src_col, src_row, 0, mm2s_bd)
+        runner
+            .configure_dma_bd(src_col, src_row, 0, mm2s_bd)
             .map_err(|e| format!("Failed to configure MM2S BD: {}", e))?;
 
         // Configure S2MM BD on destination tile: write to dst_offset
         let s2mm_bd = BdConfig::simple_1d(dst_offset as u64, size);
-        runner.configure_dma_bd(dst_col, dst_row, 0, s2mm_bd)
+        runner
+            .configure_dma_bd(dst_col, dst_row, 0, s2mm_bd)
             .map_err(|e| format!("Failed to configure S2MM BD: {}", e))?;
 
         // Configure stream routing: source tile MM2S -> dest tile S2MM
-        runner.configure_dma_route(
-            src_col, src_row, mm2s_channel,
-            dst_col, dst_row, s2mm_channel,
-        );
+        runner.configure_dma_route(src_col, src_row, mm2s_channel, dst_col, dst_row, s2mm_channel);
 
         // Start both DMA channels
-        runner.engine.device_mut().array.dma_engine_mut(src_col, src_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(src_col, src_row)
             .ok_or_else(|| "Failed to get source DMA engine".to_string())?
             .start_channel(mm2s_channel, 0)
             .map_err(|e| format!("Failed to start MM2S channel: {}", e))?;
 
-        runner.engine.device_mut().array.dma_engine_mut(dst_col, dst_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(dst_col, dst_row)
             .ok_or_else(|| "Failed to get destination DMA engine".to_string())?
             .start_channel(s2mm_channel, 0)
             .map_err(|e| format!("Failed to start S2MM channel: {}", e))?;
@@ -1307,14 +1433,16 @@ mod tests {
         }
 
         // Read destination memory and verify
-        let result = runner.read_tile_memory(dst_col, dst_row, dst_offset, size as usize)
+        let result = runner
+            .read_tile_memory(dst_col, dst_row, dst_offset, size as usize)
             .map_err(|e| format!("Failed to read destination memory: {}", e))?;
 
         // Compare byte-by-byte for detailed error reporting
         if result.len() != test_data.len() {
             return Err(format!(
                 "Length mismatch: expected {} bytes, got {} bytes",
-                test_data.len(), result.len()
+                test_data.len(),
+                result.len()
             ));
         }
 
@@ -1377,7 +1505,8 @@ mod tests {
         assert!(
             failed.is_empty(),
             "DMA transfer tests failed:\n{}",
-            failed.iter()
+            failed
+                .iter()
                 .map(|(desc, err)| format!("  - {}: {}", desc, err))
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -1421,29 +1550,51 @@ mod tests {
         // Use array.tile() which returns &Tile directly (bounds are known valid)
         let memtile = runner.engine.device().array.tile(memtile_col, memtile_row);
         assert!(memtile.is_mem(), "Tile at ({},{}) should be a memory tile", memtile_col, memtile_row);
-        eprintln!("Memory tile ({},{}) confirmed: 512KB memory, 64 locks, 12 DMA channels",
-            memtile_col, memtile_row);
+        eprintln!(
+            "Memory tile ({},{}) confirmed: 512KB memory, 64 locks, 12 DMA channels",
+            memtile_col, memtile_row
+        );
 
         // Check memory size is 512KB
         let memtile_memory_size = memtile.data_memory().len();
-        assert_eq!(memtile_memory_size, 512 * 1024,
-            "Memory tile should have 512KB data memory, got {} bytes", memtile_memory_size);
+        assert_eq!(
+            memtile_memory_size,
+            512 * 1024,
+            "Memory tile should have 512KB data memory, got {} bytes",
+            memtile_memory_size
+        );
 
         // Verify compute tile
         let compute_tile = runner.engine.device().array.tile(compute_col, compute_row);
-        assert!(compute_tile.is_compute(), "Tile at ({},{}) should be a compute tile", compute_col, compute_row);
+        assert!(
+            compute_tile.is_compute(),
+            "Tile at ({},{}) should be a compute tile",
+            compute_col,
+            compute_row
+        );
 
         // Verify DMA engine channel counts
         let memtile_dma = runner.engine.device().array.dma_engine(memtile_col, memtile_row).unwrap();
-        assert_eq!(memtile_dma.num_channels(), 12,
-            "Memory tile should have 12 DMA channels (6 S2MM + 6 MM2S), got {}", memtile_dma.num_channels());
+        assert_eq!(
+            memtile_dma.num_channels(),
+            12,
+            "Memory tile should have 12 DMA channels (6 S2MM + 6 MM2S), got {}",
+            memtile_dma.num_channels()
+        );
 
         let compute_dma = runner.engine.device().array.dma_engine(compute_col, compute_row).unwrap();
-        assert_eq!(compute_dma.num_channels(), 4,
-            "Compute tile should have 4 DMA channels (2 S2MM + 2 MM2S), got {}", compute_dma.num_channels());
+        assert_eq!(
+            compute_dma.num_channels(),
+            4,
+            "Compute tile should have 4 DMA channels (2 S2MM + 2 MM2S), got {}",
+            compute_dma.num_channels()
+        );
 
-        eprintln!("Tile properties verified: memtile={} channels, compute={} channels",
-            memtile_dma.num_channels(), compute_dma.num_channels());
+        eprintln!(
+            "Tile properties verified: memtile={} channels, compute={} channels",
+            memtile_dma.num_channels(),
+            compute_dma.num_channels()
+        );
 
         // ============================================
         // Phase 2: Set up test data
@@ -1458,17 +1609,28 @@ mod tests {
         let compute_dst_offset = 0x2000usize;
 
         // Verify compute destination is zeroed before transfer
-        let pre_dst = runner.read_tile_memory(compute_col, compute_row, compute_dst_offset, transfer_size as usize).unwrap();
+        let pre_dst = runner
+            .read_tile_memory(compute_col, compute_row, compute_dst_offset, transfer_size as usize)
+            .unwrap();
         assert!(pre_dst.iter().all(|&b| b == 0), "Compute destination should be zeroed before transfer");
 
         // Write test data to memory tile
-        runner.write_tile_memory(memtile_col, memtile_row, memtile_src_offset, &test_data).unwrap();
+        runner
+            .write_tile_memory(memtile_col, memtile_row, memtile_src_offset, &test_data)
+            .unwrap();
 
         // Verify source data was written correctly
-        let readback = runner.read_tile_memory(memtile_col, memtile_row, memtile_src_offset, transfer_size as usize).unwrap();
+        let readback = runner
+            .read_tile_memory(memtile_col, memtile_row, memtile_src_offset, transfer_size as usize)
+            .unwrap();
         assert_eq!(readback, test_data, "Memtile source data readback mismatch");
-        eprintln!("Wrote {} bytes to memtile ({},{}) at offset 0x{:04X}",
-            test_data.len(), memtile_col, memtile_row, memtile_src_offset);
+        eprintln!(
+            "Wrote {} bytes to memtile ({},{}) at offset 0x{:04X}",
+            test_data.len(),
+            memtile_col,
+            memtile_row,
+            memtile_src_offset
+        );
 
         // ============================================
         // Phase 3: Configure DMA buffer descriptors
@@ -1477,12 +1639,12 @@ mod tests {
         // Memory tile DMA channels:
         // - Channels 0-5: S2MM (stream to memory)
         // - Channels 6-11: MM2S (memory to stream)
-        let memtile_mm2s_channel = 6u8;  // First MM2S channel on memtile
+        let memtile_mm2s_channel = 6u8; // First MM2S channel on memtile
 
         // Compute tile DMA channels:
         // - Channels 0-1: S2MM (stream to memory)
         // - Channels 2-3: MM2S (memory to stream)
-        let compute_s2mm_channel = 0u8;  // First S2MM channel on compute tile
+        let compute_s2mm_channel = 0u8; // First S2MM channel on compute tile
 
         // Configure MM2S BD on memtile: read from local offset 0x1000, send to stream.
         // MemTile DMA addresses use a windowed space: West=[0,0x80000), Own=[0x80000,
@@ -1504,26 +1666,39 @@ mod tests {
 
         // Route memtile MM2S output to compute tile S2MM input
         runner.configure_dma_route(
-            memtile_col, memtile_row, memtile_mm2s_channel,
-            compute_col, compute_row, compute_s2mm_channel,
+            memtile_col,
+            memtile_row,
+            memtile_mm2s_channel,
+            compute_col,
+            compute_row,
+            compute_s2mm_channel,
         );
-        eprintln!("Stream route configured: memtile({},{}) ch{} -> compute({},{}) ch{}",
-            memtile_col, memtile_row, memtile_mm2s_channel,
-            compute_col, compute_row, compute_s2mm_channel);
+        eprintln!(
+            "Stream route configured: memtile({},{}) ch{} -> compute({},{}) ch{}",
+            memtile_col, memtile_row, memtile_mm2s_channel, compute_col, compute_row, compute_s2mm_channel
+        );
 
         // ============================================
         // Phase 5: Start DMA channels
         // ============================================
 
         // Start memtile MM2S channel with BD 0
-        runner.engine.device_mut().array.dma_engine_mut(memtile_col, memtile_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(memtile_col, memtile_row)
             .unwrap()
             .start_channel(memtile_mm2s_channel, 0)
             .unwrap();
         eprintln!("Started memtile MM2S channel {}", memtile_mm2s_channel);
 
         // Start compute tile S2MM channel with BD 0
-        runner.engine.device_mut().array.dma_engine_mut(compute_col, compute_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(compute_col, compute_row)
             .unwrap()
             .start_channel(compute_s2mm_channel, 0)
             .unwrap();
@@ -1540,10 +1715,16 @@ mod tests {
             runner.step();
 
             // Check if both channels have completed
-            let memtile_done = !runner.engine.device().array
+            let memtile_done = !runner
+                .engine
+                .device()
+                .array
                 .dma_engine(memtile_col, memtile_row)
                 .map_or(false, |e| e.channel_active(memtile_mm2s_channel));
-            let compute_done = !runner.engine.device().array
+            let compute_done = !runner
+                .engine
+                .device()
+                .array
                 .dma_engine(compute_col, compute_row)
                 .map_or(false, |e| e.channel_active(compute_s2mm_channel));
 
@@ -1553,8 +1734,10 @@ mod tests {
             }
 
             if cycle == max_cycles - 1 {
-                eprintln!("WARNING: Reached max cycles. Memtile done: {}, Compute done: {}",
-                    memtile_done, compute_done);
+                eprintln!(
+                    "WARNING: Reached max cycles. Memtile done: {}, Compute done: {}",
+                    memtile_done, compute_done
+                );
             }
         }
 
@@ -1563,21 +1746,23 @@ mod tests {
         // ============================================
 
         // Read destination memory from compute tile
-        let received_data = runner.read_tile_memory(compute_col, compute_row, compute_dst_offset, transfer_size as usize).unwrap();
+        let received_data = runner
+            .read_tile_memory(compute_col, compute_row, compute_dst_offset, transfer_size as usize)
+            .unwrap();
 
         // Verify exact byte-for-byte match
-        assert_eq!(
-            received_data, test_data,
-            "Data mismatch in memtile -> compute transfer"
-        );
+        assert_eq!(received_data, test_data, "Data mismatch in memtile -> compute transfer");
 
         eprintln!("\nMemory tile to compute tile transfer test PASSED:");
-        eprintln!("  Source:      memtile ({},{}) @ 0x{:04X} (MM2S channel {})",
-            memtile_col, memtile_row, memtile_src_offset, memtile_mm2s_channel);
-        eprintln!("  Destination: compute ({},{}) @ 0x{:04X} (S2MM channel {})",
-            compute_col, compute_row, compute_dst_offset, compute_s2mm_channel);
-        eprintln!("  Data:        {} bytes transferred correctly (pattern starting 0xD0)",
-            transfer_size);
+        eprintln!(
+            "  Source:      memtile ({},{}) @ 0x{:04X} (MM2S channel {})",
+            memtile_col, memtile_row, memtile_src_offset, memtile_mm2s_channel
+        );
+        eprintln!(
+            "  Destination: compute ({},{}) @ 0x{:04X} (S2MM channel {})",
+            compute_col, compute_row, compute_dst_offset, compute_s2mm_channel
+        );
+        eprintln!("  Data:        {} bytes transferred correctly (pattern starting 0xD0)", transfer_size);
         eprintln!("\nMemory tile properties validated:");
         eprintln!("  - 512KB data memory");
         eprintln!("  - 12 DMA channels (6 S2MM + 6 MM2S)");
@@ -1634,13 +1819,21 @@ mod tests {
         // ============================================
 
         // Producer tile: lock 0 = 1 (buffer is ready for DMA to read)
-        if let Some(tile) = runner.engine.device_mut().tile_mut(producer_col as usize, producer_row as usize) {
+        if let Some(tile) = runner
+            .engine
+            .device_mut()
+            .tile_mut(producer_col as usize, producer_row as usize)
+        {
             tile.locks[producer_lock_id as usize].set(1);
         }
         eprintln!("Producer lock {} initialized to 1 (buffer ready)", producer_lock_id);
 
         // Consumer tile: lock 0 = 1 (buffer is ready for DMA to write)
-        if let Some(tile) = runner.engine.device_mut().tile_mut(consumer_col as usize, consumer_row as usize) {
+        if let Some(tile) = runner
+            .engine
+            .device_mut()
+            .tile_mut(consumer_col as usize, consumer_row as usize)
+        {
             tile.locks[consumer_lock_id as usize].set(1);
         }
         eprintln!("Consumer lock {} initialized to 1 (buffer ready)", consumer_lock_id);
@@ -1650,11 +1843,15 @@ mod tests {
         // ============================================
 
         // Verify consumer destination is zeroed before transfer
-        let pre_dst = runner.read_tile_memory(consumer_col, consumer_row, consumer_dst_offset, transfer_size as usize).unwrap();
+        let pre_dst = runner
+            .read_tile_memory(consumer_col, consumer_row, consumer_dst_offset, transfer_size as usize)
+            .unwrap();
         assert!(pre_dst.iter().all(|&b| b == 0), "Consumer destination should be zeroed before transfer");
 
         // Write test data to producer's memory (simulating core writing to buffer)
-        runner.write_tile_memory(producer_col, producer_row, producer_src_offset, &test_data).unwrap();
+        runner
+            .write_tile_memory(producer_col, producer_row, producer_src_offset, &test_data)
+            .unwrap();
         eprintln!("Producer wrote {} bytes to offset 0x{:04X}", test_data.len(), producer_src_offset);
 
         // ============================================
@@ -1664,57 +1861,76 @@ mod tests {
         // Producer's MM2S BD: acquire lock 0, read from memory, release lock 0
         // This simulates: DMA waits for buffer to be ready, reads it, signals done
         let producer_bd = BdConfig::simple_1d(producer_src_offset as u64, transfer_size)
-            .with_acquire(producer_lock_id, 1)   // Acquire: wait for lock >= 1, decrement
-            .with_release(producer_lock_id, 1);  // Release: increment lock after transfer
+            .with_acquire(producer_lock_id, 1) // Acquire: wait for lock >= 1, decrement
+            .with_release(producer_lock_id, 1); // Release: increment lock after transfer
         runner.configure_dma_bd(producer_col, producer_row, 0, producer_bd).unwrap();
 
         // Consumer's S2MM BD: acquire lock 0, write to memory, release lock 0
         // This simulates: DMA waits for buffer to be available, writes to it, signals done
         let consumer_bd = BdConfig::simple_1d(consumer_dst_offset as u64, transfer_size)
-            .with_acquire(consumer_lock_id, 1)   // Acquire: wait for lock >= 1, decrement
-            .with_release(consumer_lock_id, 1);  // Release: increment lock after transfer
+            .with_acquire(consumer_lock_id, 1) // Acquire: wait for lock >= 1, decrement
+            .with_release(consumer_lock_id, 1); // Release: increment lock after transfer
         runner.configure_dma_bd(consumer_col, consumer_row, 0, consumer_bd).unwrap();
 
         // Configure stream routing: producer MM2S -> consumer S2MM
         runner.configure_dma_route(
-            producer_col, producer_row, mm2s_channel,
-            consumer_col, consumer_row, s2mm_channel,
+            producer_col,
+            producer_row,
+            mm2s_channel,
+            consumer_col,
+            consumer_row,
+            s2mm_channel,
         );
-        eprintln!("Stream route configured: ({},{}) ch{} -> ({},{}) ch{}",
-            producer_col, producer_row, mm2s_channel,
-            consumer_col, consumer_row, s2mm_channel);
+        eprintln!(
+            "Stream route configured: ({},{}) ch{} -> ({},{}) ch{}",
+            producer_col, producer_row, mm2s_channel, consumer_col, consumer_row, s2mm_channel
+        );
 
         // ============================================
         // Phase 4: Verify initial lock state
         // ============================================
 
         // Check that locks are in expected initial state
-        let producer_lock_initial = runner.engine.device()
+        let producer_lock_initial = runner
+            .engine
+            .device()
             .tile(producer_col as usize, producer_row as usize)
             .map(|t| t.locks[producer_lock_id as usize].value)
             .unwrap_or(-1);
-        let consumer_lock_initial = runner.engine.device()
+        let consumer_lock_initial = runner
+            .engine
+            .device()
             .tile(consumer_col as usize, consumer_row as usize)
             .map(|t| t.locks[consumer_lock_id as usize].value)
             .unwrap_or(-1);
         assert_eq!(producer_lock_initial, 1, "Producer lock should be 1 initially");
         assert_eq!(consumer_lock_initial, 1, "Consumer lock should be 1 initially");
-        eprintln!("Initial lock states verified: producer={}, consumer={}",
-            producer_lock_initial, consumer_lock_initial);
+        eprintln!(
+            "Initial lock states verified: producer={}, consumer={}",
+            producer_lock_initial, consumer_lock_initial
+        );
 
         // ============================================
         // Phase 5: Start both DMA channels
         // ============================================
 
         // Start producer's MM2S channel (will acquire lock, read, release)
-        runner.engine.device_mut().array.dma_engine_mut(producer_col, producer_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(producer_col, producer_row)
             .unwrap()
             .start_channel(mm2s_channel, 0)
             .unwrap();
         eprintln!("Producer DMA started (acquire lock {}, read, release)", producer_lock_id);
 
         // Start consumer's S2MM channel (will acquire lock, write, release)
-        runner.engine.device_mut().array.dma_engine_mut(consumer_col, consumer_row)
+        runner
+            .engine
+            .device_mut()
+            .array
+            .dma_engine_mut(consumer_col, consumer_row)
             .unwrap()
             .start_channel(s2mm_channel, 0)
             .unwrap();
@@ -1732,10 +1948,16 @@ mod tests {
             runner.step();
 
             // Check if both channels are idle (transfers complete)
-            let producer_done = !runner.engine.device().array
+            let producer_done = !runner
+                .engine
+                .device()
+                .array
                 .dma_engine(producer_col, producer_row)
                 .map_or(false, |e| e.channel_active(mm2s_channel));
-            let consumer_done = !runner.engine.device().array
+            let consumer_done = !runner
+                .engine
+                .device()
+                .array
                 .dma_engine(consumer_col, consumer_row)
                 .map_or(false, |e| e.channel_active(s2mm_channel));
 
@@ -1746,8 +1968,10 @@ mod tests {
             }
 
             if cycle == max_cycles - 1 {
-                eprintln!("WARNING: Reached max cycles. Producer done: {}, Consumer done: {}",
-                    producer_done, consumer_done);
+                eprintln!(
+                    "WARNING: Reached max cycles. Producer done: {}, Consumer done: {}",
+                    producer_done, consumer_done
+                );
             }
         }
 
@@ -1758,43 +1982,49 @@ mod tests {
         // ============================================
 
         // After acquire(-1) and release(+1), locks should be back to 1
-        let producer_lock_final = runner.engine.device()
+        let producer_lock_final = runner
+            .engine
+            .device()
             .tile(producer_col as usize, producer_row as usize)
             .map(|t| t.locks[producer_lock_id as usize].value)
             .unwrap_or(-1);
-        let consumer_lock_final = runner.engine.device()
+        let consumer_lock_final = runner
+            .engine
+            .device()
             .tile(consumer_col as usize, consumer_row as usize)
             .map(|t| t.locks[consumer_lock_id as usize].value)
             .unwrap_or(-1);
-        eprintln!("Final lock states: producer={}, consumer={}",
-            producer_lock_final, consumer_lock_final);
+        eprintln!("Final lock states: producer={}, consumer={}", producer_lock_final, consumer_lock_final);
 
         // Verify producer lock was properly acquired and released
-        assert_eq!(producer_lock_final, 1,
-            "Producer lock should be 1 after acquire+release cycle");
+        assert_eq!(producer_lock_final, 1, "Producer lock should be 1 after acquire+release cycle");
 
         // Verify consumer lock was properly acquired and released
-        assert_eq!(consumer_lock_final, 1,
-            "Consumer lock should be 1 after acquire+release cycle");
+        assert_eq!(consumer_lock_final, 1, "Consumer lock should be 1 after acquire+release cycle");
 
         // ============================================
         // Phase 8: Verify data transfer
         // ============================================
 
         // Verify consumer received the correct data
-        let received_data = runner.read_tile_memory(consumer_col, consumer_row, consumer_dst_offset, transfer_size as usize).unwrap();
+        let received_data = runner
+            .read_tile_memory(consumer_col, consumer_row, consumer_dst_offset, transfer_size as usize)
+            .unwrap();
         assert_eq!(
             received_data, test_data,
             "Consumer should have received the producer's data via stream transfer"
         );
 
         eprintln!("Lock-synchronized producer-consumer test passed:");
-        eprintln!("  Producer: tile ({},{}) @ 0x{:04X}, lock {} (1->0->1)",
-            producer_col, producer_row, producer_src_offset, producer_lock_id);
-        eprintln!("  Consumer: tile ({},{}) @ 0x{:04X}, lock {} (1->0->1)",
-            consumer_col, consumer_row, consumer_dst_offset, consumer_lock_id);
-        eprintln!("  Data:     {} bytes transferred correctly in {} cycles",
-            transfer_size, completed_cycle);
+        eprintln!(
+            "  Producer: tile ({},{}) @ 0x{:04X}, lock {} (1->0->1)",
+            producer_col, producer_row, producer_src_offset, producer_lock_id
+        );
+        eprintln!(
+            "  Consumer: tile ({},{}) @ 0x{:04X}, lock {} (1->0->1)",
+            consumer_col, consumer_row, consumer_dst_offset, consumer_lock_id
+        );
+        eprintln!("  Data:     {} bytes transferred correctly in {} cycles", transfer_size, completed_cycle);
     }
 
     /// Test core stream operations (StreamWriteScalar -> StreamReadScalar).
@@ -1831,8 +2061,7 @@ mod tests {
         let dst_tile = array.tile_mut(dst_col, dst_row);
         dst_tile.stream_switch.configure_local_route(5, 0); // South0 -> Core
 
-        eprintln!("Configured route: ({},{}) port 0 -> ({},{}) port 0",
-            src_col, src_row, dst_col, dst_row);
+        eprintln!("Configured route: ({},{}) port 0 -> ({},{}) port 0", src_col, src_row, dst_col, dst_row);
 
         // Step 1: Push test data to source tile's stream output (simulates StreamWriteScalar)
         let test_values = [0xCAFEBABE_u32, 0xDEADBEEF_u32, 0x12345678_u32, 0xABCDEF00_u32];
@@ -1872,19 +2101,22 @@ mod tests {
         eprintln!("Received {} words at destination after {} cycles", received.len(), cycles);
 
         // Verify all data arrived correctly
-        assert_eq!(received.len(), test_values.len(),
-            "Should receive all {} values, got {}", test_values.len(), received.len());
+        assert_eq!(
+            received.len(),
+            test_values.len(),
+            "Should receive all {} values, got {}",
+            test_values.len(),
+            received.len()
+        );
 
         for (i, (expected, actual)) in test_values.iter().zip(received.iter()).enumerate() {
-            assert_eq!(*actual, *expected,
-                "Word {}: expected 0x{:08X}, got 0x{:08X}", i, expected, actual);
+            assert_eq!(*actual, *expected, "Word {}: expected 0x{:08X}, got 0x{:08X}", i, expected, actual);
         }
 
         eprintln!("Core stream write/read test passed:");
         eprintln!("  Source: tile ({},{}) port 0", src_col, src_row);
         eprintln!("  Destination: tile ({},{}) port 0", dst_col, dst_row);
-        eprintln!("  Data: {} words transferred correctly in {} cycles",
-            test_values.len(), cycles);
+        eprintln!("  Data: {} words transferred correctly in {} cycles", test_values.len(), cycles);
     }
 
     /// Test that loads and executes a real XCLBIN file.
@@ -1915,8 +2147,7 @@ mod tests {
         // Try multiple potential locations for add_one kernel
         let xclbin_candidates = Config::get().add_one_xclbin_candidates();
 
-        let xclbin_path = xclbin_candidates.iter()
-            .find(|p| p.exists());
+        let xclbin_path = xclbin_candidates.iter().find(|p| p.exists());
 
         let xclbin_path = match xclbin_path {
             Some(path) => path,
@@ -1949,8 +2180,14 @@ mod tests {
         // List all sections
         eprintln!("\n--- Sections ---");
         for (i, section) in xclbin.sections().enumerate() {
-            eprintln!("  [{:2}] {:?} \"{}\" @ 0x{:x}, {} bytes",
-                i, section.kind, section.name(), section.offset, section.size());
+            eprintln!(
+                "  [{:2}] {:?} \"{}\" @ 0x{:x}, {} bytes",
+                i,
+                section.kind,
+                section.name(),
+                section.offset,
+                section.size()
+            );
         }
 
         // Step 3: Extract AIE Partition section
@@ -2023,9 +2260,11 @@ mod tests {
         eprintln!("\n--- CDO Summary ---");
         eprintln!("  Magic: {}", cdo.magic());
         eprintln!("  Version: {:?}", cdo.version());
-        eprintln!("  Length: {} words ({} bytes)",
+        eprintln!(
+            "  Length: {} words ({} bytes)",
             cdo.command_length_words(),
-            cdo.command_length_words() * 4);
+            cdo.command_length_words() * 4
+        );
 
         // Count commands by type
         let counts = cdo.command_counts();
@@ -2067,10 +2306,7 @@ mod tests {
 
         // Search for ELF files using standard library
         // Check common locations: *.elf in current dir and aie_arch.mlir.prj/*.elf
-        let search_dirs = [
-            xclbin_dir.to_path_buf(),
-            xclbin_dir.join("aie_arch.mlir.prj"),
-        ];
+        let search_dirs = [xclbin_dir.to_path_buf(), xclbin_dir.join("aie_arch.mlir.prj")];
 
         for dir in &search_dirs {
             if let Ok(entries) = std::fs::read_dir(dir) {
@@ -2149,11 +2385,13 @@ mod tests {
                     match seg.region {
                         MemoryRegion::Program => eprintln!(
                             "    Loading {} bytes to program memory @ 0x{:x}",
-                            seg.data.len(), vaddr
+                            seg.data.len(),
+                            vaddr
                         ),
                         MemoryRegion::Data => eprintln!(
                             "    Loading {} bytes to data memory @ vaddr 0x{:x}",
-                            seg.data.len(), vaddr
+                            seg.data.len(),
+                            vaddr
                         ),
                         _ => {}
                     }
@@ -2243,7 +2481,7 @@ mod tests {
         // Try to find "core" followed by two numbers
         for i in 0..parts.len().saturating_sub(2) {
             if parts[i] == "core" {
-                if let (Ok(col), Ok(row)) = (parts[i+1].parse::<u8>(), parts[i+2].parse::<u8>()) {
+                if let (Ok(col), Ok(row)) = (parts[i + 1].parse::<u8>(), parts[i + 2].parse::<u8>()) {
                     return Some((col, row));
                 }
             }

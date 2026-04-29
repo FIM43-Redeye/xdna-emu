@@ -43,12 +43,7 @@ impl Flags {
     /// Create flags from a 32-bit result value.
     #[inline]
     pub fn from_result(result: u32) -> Self {
-        Self {
-            z: result == 0,
-            n: (result as i32) < 0,
-            c: false,
-            v: false,
-        }
+        Self { z: result == 0, n: (result as i32) < 0, c: false, v: false }
     }
 
     /// Create flags from an addition operation (with carry/overflow detection).
@@ -61,7 +56,7 @@ impl Flags {
         Self {
             z: result == 0,
             n: r_sign,
-            c: result < a, // Unsigned overflow
+            c: result < a,                               // Unsigned overflow
             v: (a_sign == b_sign) && (r_sign != a_sign), // Signed overflow
         }
     }
@@ -76,7 +71,7 @@ impl Flags {
         Self {
             z: result == 0,
             n: r_sign,
-            c: a >= b, // No borrow occurred
+            c: a >= b,                                   // No borrow occurred
             v: (a_sign != b_sign) && (r_sign != a_sign), // Signed overflow
         }
     }
@@ -243,12 +238,7 @@ pub trait Executor: Send {
     /// # Returns
     ///
     /// The result of execution (continue, branch, wait, halt, or error).
-    fn execute(
-        &mut self,
-        bundle: &VliwBundle,
-        ctx: &mut ExecutionContext,
-        tile: &mut Tile,
-    ) -> ExecuteResult;
+    fn execute(&mut self, bundle: &VliwBundle, ctx: &mut ExecutionContext, tile: &mut Tile) -> ExecuteResult;
 
     /// Check if this executor models cycle-accurate behavior.
     ///
