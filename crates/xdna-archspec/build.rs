@@ -98,15 +98,10 @@ fn main() {
 
     // Build the validated ArchModel (cross-validated against aie-rt via extract_aiert).
     let regdb = regdb::RegisterDb::from_file(&am025_path).unwrap_or_else(|e| {
-        panic!(
-            "Cannot load AM025 register database at {}:\n  {}",
-            am025_path.display(),
-            e
-        )
+        panic!("Cannot load AM025 register database at {}:\n  {}", am025_path.display(), e)
     });
-    let mut arch_model =
-        crate::model_builder::build_arch_model(&device_model_path, &regdb, "npu1")
-            .unwrap_or_else(|e| panic!("Failed to build ArchModel: {}", e));
+    let mut arch_model = crate::model_builder::build_arch_model(&device_model_path, &regdb, "npu1")
+        .unwrap_or_else(|e| panic!("Failed to build ArchModel: {}", e));
 
     // Cross-validate subsystem ranges via aie-rt, and emit gen_aiert_*.rs
     // files consumed by xdna_archspec::aie2::aiert::* (and from there by
@@ -147,32 +142,49 @@ fn main() {
     }));
 
     // Rebuild triggers for build_helpers source files
-    for helper in &["mod.rs", "extract.rs", "records.rs", "semantics.rs",
-                     "cpp_switch.rs", "bytecode.rs", "codegen.rs"] {
+    for helper in
+        &["mod.rs", "extract.rs", "records.rs", "semantics.rs", "cpp_switch.rs", "bytecode.rs", "codegen.rs"]
+    {
         println!("cargo:rerun-if-changed=build_helpers/{}", helper);
     }
 
     let aie2_td = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2.td");
     if aie2_td.exists() {
         println!("cargo:rerun-if-changed={}", aie2_td.display());
-        for td in &["AIE2InstrFormats.td", "AIE2InstrInfo.td", "AIE2InstrPatterns.td",
-                     "AIE2Slots.td", "AIE2Schedule.td", "AIE2RegisterInfo.td"] {
+        for td in &[
+            "AIE2InstrFormats.td",
+            "AIE2InstrInfo.td",
+            "AIE2InstrPatterns.td",
+            "AIE2Slots.td",
+            "AIE2Schedule.td",
+            "AIE2RegisterInfo.td",
+        ] {
             let p = llvm_aie_path.join(format!("llvm/lib/Target/AIE/{}", td));
-            if p.exists() { println!("cargo:rerun-if-changed={}", p.display()); }
+            if p.exists() {
+                println!("cargo:rerun-if-changed={}", p.display());
+            }
         }
         let cpp = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2InstrInfo.cpp");
-        if cpp.exists() { println!("cargo:rerun-if-changed={}", cpp.display()); }
+        if cpp.exists() {
+            println!("cargo:rerun-if-changed={}", cpp.display());
+        }
 
         let extracted = build_helpers::extract::extract_all(&llvm_aie_path)
             .unwrap_or_else(|e| panic!("TableGen extraction failed: {}", e));
         // Status emitted to stderr (visible only with `cargo build -vv`);
         // using `cargo:warning=` instead would clutter normal builds.
-        eprintln!("TableGen: extracted {} instructions across {} slots",
-            extracted.total_instructions(), extracted.slot_count());
+        eprintln!(
+            "TableGen: extracted {} instructions across {} slots",
+            extracted.total_instructions(),
+            extracted.slot_count()
+        );
         build_helpers::codegen::generate_tablegen_file(&extracted, &out_dir);
     } else {
-        panic!("llvm-aie not found at {} -- required for build-time TableGen extraction.\n\
-                Set LLVM_AIE_PATH to override.", llvm_aie_path.display());
+        panic!(
+            "llvm-aie not found at {} -- required for build-time TableGen extraction.\n\
+                Set LLVM_AIE_PATH to override.",
+            llvm_aie_path.display()
+        );
     }
 
     println!("cargo:rerun-if-changed={}", llvm_aie_path.display());
@@ -265,11 +277,8 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
     }
 
     // Per-tile-type modules
-    let tile_types: &[(&str, TileKind)] = &[
-        ("compute", TileKind::Compute),
-        ("memtile", TileKind::Mem),
-        ("shim", TileKind::ShimNoc),
-    ];
+    let tile_types: &[(&str, TileKind)] =
+        &[("compute", TileKind::Compute), ("memtile", TileKind::Mem), ("shim", TileKind::ShimNoc)];
 
     for &(mod_name, kind) in tile_types {
         let tile = model.tile_types.iter().find(|t| t.kind == kind);
@@ -295,7 +304,8 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
                 writeln!(out, "    /// Physical bank size in bytes.").unwrap();
                 writeln!(out, "    pub const PHYSICAL_BANK_SIZE: u64 = {};", phys.bank_size).unwrap();
                 writeln!(out, "    /// Physical bank width in bits (SRAM word width).").unwrap();
-                writeln!(out, "    pub const PHYSICAL_BANK_WIDTH_BITS: u16 = {};", phys.bank_width_bits).unwrap();
+                writeln!(out, "    pub const PHYSICAL_BANK_WIDTH_BITS: u16 = {};", phys.bank_width_bits)
+                    .unwrap();
             }
             if let Some(pmem) = mem.program_memory_bytes {
                 writeln!(out, "    /// Program (instruction) memory size in bytes.").unwrap();
@@ -328,7 +338,12 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             writeln!(out, "    pub const IS_CHECKERBOARD: bool = {};", cam.is_checkerboard).unwrap();
             writeln!(out, "    /// Program memory offset in host/CDO address space.").unwrap();
             writeln!(out, "    /// Source: aie-rt XAIEMLGBL_CORE_MODULE_PROGRAM_MEMORY.").unwrap();
-            writeln!(out, "    pub const PROGRAM_MEM_HOST_OFFSET: u32 = 0x{:X};", cam.program_mem_host_offset).unwrap();
+            writeln!(
+                out,
+                "    pub const PROGRAM_MEM_HOST_OFFSET: u32 = 0x{:X};",
+                cam.program_mem_host_offset
+            )
+            .unwrap();
         }
 
         writeln!(out, "}}\n").unwrap();
@@ -374,37 +389,83 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
 
         writeln!(out, "    // Instruction timing").unwrap();
         writeln!(out, "    /// Data memory access pipeline depth.").unwrap();
-        writeln!(out, "    pub const DATA_MEMORY_LATENCY: u8 = {};", t.instruction.data_memory_latency).unwrap();
+        writeln!(out, "    pub const DATA_MEMORY_LATENCY: u8 = {};", t.instruction.data_memory_latency)
+            .unwrap();
         writeln!(out, "    /// Branch penalty: cycles lost on taken branch.").unwrap();
         writeln!(out, "    pub const BRANCH_PENALTY: u8 = {};", t.instruction.branch_penalty).unwrap();
         writeln!(out).unwrap();
 
         writeln!(out, "    // DMA timing").unwrap();
         writeln!(out, "    pub const DMA_BD_SETUP_CYCLES: u8 = {};", t.dma.bd_setup_cycles).unwrap();
-        writeln!(out, "    pub const DMA_CHANNEL_START_CYCLES: u8 = {};", t.dma.channel_start_cycles).unwrap();
+        writeln!(out, "    pub const DMA_CHANNEL_START_CYCLES: u8 = {};", t.dma.channel_start_cycles)
+            .unwrap();
         writeln!(out, "    pub const DMA_WORDS_PER_CYCLE: u8 = {};", t.dma.words_per_cycle).unwrap();
-        writeln!(out, "    pub const DMA_MEMORY_LATENCY_CYCLES: u8 = {};", t.dma.memory_latency_cycles).unwrap();
+        writeln!(out, "    pub const DMA_MEMORY_LATENCY_CYCLES: u8 = {};", t.dma.memory_latency_cycles)
+            .unwrap();
         writeln!(out, "    pub const DMA_LOCK_ACQUIRE_CYCLES: u8 = {};", t.dma.lock_acquire_cycles).unwrap();
         writeln!(out, "    pub const DMA_LOCK_RELEASE_CYCLES: u8 = {};", t.dma.lock_release_cycles).unwrap();
         writeln!(out, "    pub const DMA_BD_CHAIN_CYCLES: u8 = {};", t.dma.bd_chain_cycles).unwrap();
-        writeln!(out, "    pub const DMA_HOST_MEMORY_LATENCY_CYCLES: u16 = {};", t.dma.host_memory_latency_cycles).unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_HOST_MEMORY_LATENCY_CYCLES: u16 = {};",
+            t.dma.host_memory_latency_cycles
+        )
+        .unwrap();
         writeln!(out).unwrap();
 
         writeln!(out, "    // Stream switch timing").unwrap();
-        writeln!(out, "    pub const STREAM_LOCAL_SLAVE_FIFO_DEPTH: u8 = {};", t.stream_switch.local_slave_fifo_depth).unwrap();
-        writeln!(out, "    pub const STREAM_LOCAL_MASTER_FIFO_DEPTH: u8 = {};", t.stream_switch.local_master_fifo_depth).unwrap();
-        writeln!(out, "    pub const STREAM_LOCAL_TO_LOCAL_LATENCY: u8 = {};", t.stream_switch.local_to_local_latency).unwrap();
-        writeln!(out, "    pub const STREAM_LOCAL_TO_EXTERNAL_LATENCY: u8 = {};", t.stream_switch.local_to_external_latency).unwrap();
-        writeln!(out, "    pub const STREAM_EXTERNAL_TO_EXTERNAL_LATENCY: u8 = {};", t.stream_switch.external_to_external_latency).unwrap();
-        writeln!(out, "    pub const STREAM_EXTERNAL_TO_LOCAL_LATENCY: u8 = {};", t.stream_switch.external_to_local_latency).unwrap();
-        writeln!(out, "    pub const PACKET_ARBITRATION_OVERHEAD: u8 = {};", t.stream_switch.packet_arbitration_overhead).unwrap();
+        writeln!(
+            out,
+            "    pub const STREAM_LOCAL_SLAVE_FIFO_DEPTH: u8 = {};",
+            t.stream_switch.local_slave_fifo_depth
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const STREAM_LOCAL_MASTER_FIFO_DEPTH: u8 = {};",
+            t.stream_switch.local_master_fifo_depth
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const STREAM_LOCAL_TO_LOCAL_LATENCY: u8 = {};",
+            t.stream_switch.local_to_local_latency
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const STREAM_LOCAL_TO_EXTERNAL_LATENCY: u8 = {};",
+            t.stream_switch.local_to_external_latency
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const STREAM_EXTERNAL_TO_EXTERNAL_LATENCY: u8 = {};",
+            t.stream_switch.external_to_external_latency
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const STREAM_EXTERNAL_TO_LOCAL_LATENCY: u8 = {};",
+            t.stream_switch.external_to_local_latency
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const PACKET_ARBITRATION_OVERHEAD: u8 = {};",
+            t.stream_switch.packet_arbitration_overhead
+        )
+        .unwrap();
         writeln!(out).unwrap();
 
         writeln!(out, "    // Route latency (derived from stream switch timing)").unwrap();
         writeln!(out, "    pub const ROUTE_LOCAL_TO_LOCAL: u8 = STREAM_LOCAL_TO_LOCAL_LATENCY;").unwrap();
-        writeln!(out, "    pub const ROUTE_LOCAL_TO_EXTERNAL: u8 = STREAM_LOCAL_TO_EXTERNAL_LATENCY;").unwrap();
-        writeln!(out, "    pub const ROUTE_EXTERNAL_TO_LOCAL: u8 = STREAM_EXTERNAL_TO_LOCAL_LATENCY;").unwrap();
-        writeln!(out, "    pub const ROUTE_EXTERNAL_TO_EXTERNAL: u8 = STREAM_EXTERNAL_TO_EXTERNAL_LATENCY;").unwrap();
+        writeln!(out, "    pub const ROUTE_LOCAL_TO_EXTERNAL: u8 = STREAM_LOCAL_TO_EXTERNAL_LATENCY;")
+            .unwrap();
+        writeln!(out, "    pub const ROUTE_EXTERNAL_TO_LOCAL: u8 = STREAM_EXTERNAL_TO_LOCAL_LATENCY;")
+            .unwrap();
+        writeln!(out, "    pub const ROUTE_EXTERNAL_TO_EXTERNAL: u8 = STREAM_EXTERNAL_TO_EXTERNAL_LATENCY;")
+            .unwrap();
         writeln!(out, "    pub const ROUTE_PER_HOP: u8 = ROUTE_EXTERNAL_TO_EXTERNAL;").unwrap();
 
         writeln!(out, "}}\n").unwrap();
@@ -471,14 +532,16 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
 
         // Derived byte sizes (commonly needed)
         writeln!(out, "    // Derived byte sizes").unwrap();
-        writeln!(out, "    pub const VECTOR_REGISTER_BYTES: usize = {} / 8;", proc.vector_register_bits).unwrap();
+        writeln!(out, "    pub const VECTOR_REGISTER_BYTES: usize = {} / 8;", proc.vector_register_bits)
+            .unwrap();
         writeln!(out, "    pub const VECTOR_PAIR_BYTES: usize = {} / 8;", proc.vector_pair_bits).unwrap();
         writeln!(out).unwrap();
 
         // Pipeline constants
         writeln!(out, "    // Pipeline constants").unwrap();
         writeln!(out, "    pub const BRANCH_DELAY_SLOTS: u8 = {};", proc.branch_delay_slots).unwrap();
-        writeln!(out, "    pub const PARTIAL_STORE_DATA_LATENCY: u8 = {};", proc.partial_store_data_latency).unwrap();
+        writeln!(out, "    pub const PARTIAL_STORE_DATA_LATENCY: u8 = {};", proc.partial_store_data_latency)
+            .unwrap();
         writeln!(out, "    pub const SRS_SHIFT_BIAS: u8 = {};", proc.srs_shift_bias).unwrap();
         writeln!(out, "}}\n").unwrap();
     }
@@ -570,9 +633,7 @@ fn gen_subsystems(model: &crate::types::ArchModel, out_dir: &Path) {
 
         for &(mk, sub) in &entries {
             let base_name = subsystem_mod_name(sub.kind);
-            let needs_prefix = kind_modules
-                .get(&sub.kind)
-                .map_or(false, |mods| mods.len() > 1);
+            let needs_prefix = kind_modules.get(&sub.kind).map_or(false, |mods| mods.len() > 1);
 
             let full_name = if needs_prefix {
                 let prefix = match mk {
@@ -591,19 +652,9 @@ fn gen_subsystems(model: &crate::types::ArchModel, out_dir: &Path) {
             let doc_label = full_name.replace('_', " ");
 
             writeln!(out, "    pub mod {} {{", full_name).unwrap();
-            writeln!(
-                out,
-                "        /// Start of {} register space (inclusive).",
-                doc_label
-            )
-            .unwrap();
+            writeln!(out, "        /// Start of {} register space (inclusive).", doc_label).unwrap();
             writeln!(out, "        pub const OFFSET_START: u32 = 0x{:X};", start).unwrap();
-            writeln!(
-                out,
-                "        /// End of {} register space (exclusive).",
-                doc_label
-            )
-            .unwrap();
+            writeln!(out, "        /// End of {} register space (exclusive).", doc_label).unwrap();
             writeln!(out, "        pub const OFFSET_END: u32 = 0x{:X};", end).unwrap();
             writeln!(out, "    }}").unwrap();
         }
@@ -624,25 +675,17 @@ fn gen_subsystems(model: &crate::types::ArchModel, out_dir: &Path) {
 /// The generated files are consumed by `xdna_archspec::aie2::aiert::*`,
 /// which xdna-emu's `aiert_validation.rs` imports instead of including
 /// from its own OUT_DIR.
-fn extract_aiert(
-    workspace_root: &Path,
-    out_dir: &Path,
-    arch_model: &mut crate::types::ArchModel,
-) {
-    use crate::types::{
-        ModuleKind, Source, SourceAttribution, SubsystemKind, TileKind,
-    };
+fn extract_aiert(workspace_root: &Path, out_dir: &Path, arch_model: &mut crate::types::ArchModel) {
+    use crate::types::{ModuleKind, Source, SourceAttribution, SubsystemKind, TileKind};
 
     // Rebuild trigger already set in main() above.
 
-    let aiert_dir = env::var("AIE_RT_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            workspace_root
-                .parent()
-                .expect("workspace root has no parent directory -- set AIE_RT_PATH to override")
-                .join("aie-rt/driver/src")
-        });
+    let aiert_dir = env::var("AIE_RT_PATH").map(PathBuf::from).unwrap_or_else(|_| {
+        workspace_root
+            .parent()
+            .expect("workspace root has no parent directory -- set AIE_RT_PATH to override")
+            .join("aie-rt/driver/src")
+    });
 
     let reginit_path = aiert_dir.join("global/xaiemlgbl_reginit.c");
     if reginit_path.exists() {
@@ -722,19 +765,33 @@ fn run_aiert_preprocessor(aiert_dir: &Path) -> Option<String> {
 
     let reginit = aiert_dir.join("global/xaiemlgbl_reginit.c");
     if !reginit.exists() {
-        eprintln!(
-            "cargo:warning=aie-rt not found at {}, skipping aie-rt extraction",
-            aiert_dir.display()
-        );
+        eprintln!("cargo:warning=aie-rt not found at {}, skipping aie-rt extraction", aiert_dir.display());
         return None;
     }
 
     // All subdirectories that contain headers
     let subdirs = [
-        "", "common", "core", "device", "dma", "events", "global",
-        "interrupt", "io_backend", "lite", "locks", "memory", "npi",
-        "perfcnt", "pl", "pm", "routing", "stream_switch", "timer",
-        "trace", "util",
+        "",
+        "common",
+        "core",
+        "device",
+        "dma",
+        "events",
+        "global",
+        "interrupt",
+        "io_backend",
+        "lite",
+        "locks",
+        "memory",
+        "npi",
+        "perfcnt",
+        "pl",
+        "pm",
+        "routing",
+        "stream_switch",
+        "timer",
+        "trace",
+        "util",
     ];
 
     let mut cmd = Command::new("gcc");
@@ -753,17 +810,11 @@ fn run_aiert_preprocessor(aiert_dir: &Path) -> Option<String> {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            eprintln!(
-                "cargo:warning=gcc -E failed ({}): {}, skipping aie-rt extraction",
-                o.status, stderr
-            );
+            eprintln!("cargo:warning=gcc -E failed ({}): {}, skipping aie-rt extraction", o.status, stderr);
             return None;
         }
         Err(e) => {
-            eprintln!(
-                "cargo:warning=Cannot run gcc ({}), skipping aie-rt extraction",
-                e
-            );
+            eprintln!("cargo:warning=Cannot run gcc ({}), skipping aie-rt extraction", e);
             return None;
         }
     };
@@ -877,10 +928,7 @@ fn parse_port_maps(text: &str) -> Vec<PortMapData> {
 
 /// Generic parser for C struct initializers of a given type name.
 /// Returns Vec of (instance_name, field_map).
-fn parse_struct_initializers(
-    text: &str,
-    type_name: &str,
-) -> Vec<(String, HashMap<String, String>)> {
+fn parse_struct_initializers(text: &str, type_name: &str) -> Vec<(String, HashMap<String, String>)> {
     let mut results = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
@@ -937,10 +985,7 @@ fn parse_struct_initializers(
 fn extract_identifier(line: &str, type_name: &str) -> Option<String> {
     let idx = line.find(type_name)? + type_name.len();
     let rest = line[idx..].trim();
-    let ident: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
+    let ident: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
     if ident.is_empty() {
         None
     } else {
@@ -964,10 +1009,7 @@ fn parse_field_assignment(line: &str) -> Option<(String, String)> {
 
     let value_part = line[eq_idx + 1..].trim();
     // Strip trailing comma and any trailing comment
-    let value = value_part
-        .trim_end_matches(',')
-        .trim()
-        .to_string();
+    let value = value_part.trim_end_matches(',').trim().to_string();
 
     // Skip function pointer values
     if value.starts_with('&') || value.contains("((void *)0)") {
@@ -1004,10 +1046,7 @@ fn extract_field_value(line: &str, field: &str) -> Option<String> {
     let pattern = format!(".{} =", field);
     if let Some(idx) = line.find(&pattern) {
         let after = line[idx + pattern.len()..].trim();
-        let value: String = after
-            .chars()
-            .take_while(|c| *c != ',' && *c != '}')
-            .collect();
+        let value: String = after.chars().take_while(|c| *c != ',' && *c != '}').collect();
         Some(value.trim().to_string())
     } else {
         None
@@ -1062,17 +1101,51 @@ fn gen_aiert_dma(modules: &[DmaModData], out_dir: &Path) {
         let mod_name = dma_mod_name(&m.name);
         writeln!(out, "/// DMA constants from aie-rt {} ({})", m.name, mod_name).unwrap();
         writeln!(out, "pub mod {} {{", mod_name).unwrap();
-        writeln!(out, "    pub const BD_BASE: u32 = {:#010X};", get_field(&m.fields, "BaseAddr", &m.name)).unwrap();
-        writeln!(out, "    pub const BD_STRIDE: u32 = {:#06X};", get_field(&m.fields, "IdxOffset", &m.name)).unwrap();
+        writeln!(out, "    pub const BD_BASE: u32 = {:#010X};", get_field(&m.fields, "BaseAddr", &m.name))
+            .unwrap();
+        writeln!(out, "    pub const BD_STRIDE: u32 = {:#06X};", get_field(&m.fields, "IdxOffset", &m.name))
+            .unwrap();
         writeln!(out, "    pub const NUM_BDS: usize = {};", get_field(&m.fields, "NumBds", &m.name)).unwrap();
-        writeln!(out, "    pub const NUM_LOCKS: usize = {};", get_field(&m.fields, "NumLocks", &m.name)).unwrap();
-        writeln!(out, "    pub const START_QUEUE_BASE: u32 = {:#010X};", get_field(&m.fields, "StartQueueBase", &m.name)).unwrap();
-        writeln!(out, "    pub const CH_CTRL_BASE: u32 = {:#010X};", get_field(&m.fields, "ChCtrlBase", &m.name)).unwrap();
-        writeln!(out, "    pub const NUM_CHANNELS: usize = {};", get_field(&m.fields, "NumChannels", &m.name)).unwrap();
-        writeln!(out, "    pub const CH_STRIDE: u32 = {:#06X};", get_field(&m.fields, "ChIdxOffset", &m.name)).unwrap();
-        writeln!(out, "    pub const CH_STATUS_BASE: u32 = {:#010X};", get_field(&m.fields, "ChStatusBase", &m.name)).unwrap();
-        writeln!(out, "    pub const CH_STATUS_STRIDE: u32 = {:#06X};", get_field(&m.fields, "ChStatusOffset", &m.name)).unwrap();
-        writeln!(out, "    pub const NUM_ADDR_DIM: usize = {};", get_field(&m.fields, "NumAddrDim", &m.name)).unwrap();
+        writeln!(out, "    pub const NUM_LOCKS: usize = {};", get_field(&m.fields, "NumLocks", &m.name))
+            .unwrap();
+        writeln!(
+            out,
+            "    pub const START_QUEUE_BASE: u32 = {:#010X};",
+            get_field(&m.fields, "StartQueueBase", &m.name)
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const CH_CTRL_BASE: u32 = {:#010X};",
+            get_field(&m.fields, "ChCtrlBase", &m.name)
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const NUM_CHANNELS: usize = {};",
+            get_field(&m.fields, "NumChannels", &m.name)
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const CH_STRIDE: u32 = {:#06X};",
+            get_field(&m.fields, "ChIdxOffset", &m.name)
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const CH_STATUS_BASE: u32 = {:#010X};",
+            get_field(&m.fields, "ChStatusBase", &m.name)
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const CH_STATUS_STRIDE: u32 = {:#06X};",
+            get_field(&m.fields, "ChStatusOffset", &m.name)
+        )
+        .unwrap();
+        writeln!(out, "    pub const NUM_ADDR_DIM: usize = {};", get_field(&m.fields, "NumAddrDim", &m.name))
+            .unwrap();
         writeln!(out, "}}\n").unwrap();
     }
 
@@ -1086,15 +1159,52 @@ fn gen_aiert_locks(modules: &[LockModData], out_dir: &Path) {
         let mod_name = lock_mod_name(&m.name);
         writeln!(out, "/// Lock constants from aie-rt {} ({})", m.name, mod_name).unwrap();
         writeln!(out, "pub mod {} {{", mod_name).unwrap();
-        writeln!(out, "    pub const BASE: u32 = {:#010X};", get_field(&m.fields, "BaseAddr", &m.name)).unwrap();
-        writeln!(out, "    pub const NUM_LOCKS: usize = {};", get_field(&m.fields, "NumLocks", &m.name)).unwrap();
-        writeln!(out, "    pub const LOCK_ID_STRIDE: u32 = {:#06X};", get_field(&m.fields, "LockIdOff", &m.name)).unwrap();
-        writeln!(out, "    pub const REL_ACQ_OFFSET: u32 = {:#06X};", get_field(&m.fields, "RelAcqOff", &m.name)).unwrap();
-        writeln!(out, "    pub const LOCK_VAL_OFFSET: u32 = {:#06X};", get_field(&m.fields, "LockValOff", &m.name)).unwrap();
-        writeln!(out, "    pub const VAL_UPPER_BOUND: i32 = {};", get_field(&m.fields, "LockValUpperBound", &m.name) as i32).unwrap();
-        writeln!(out, "    pub const VAL_LOWER_BOUND: i32 = {};", get_field(&m.fields, "LockValLowerBound", &m.name) as i32).unwrap();
-        writeln!(out, "    pub const SET_VAL_BASE: u32 = {:#010X};", get_field(&m.fields, "LockSetValBase", &m.name)).unwrap();
-        writeln!(out, "    pub const SET_VAL_STRIDE: u32 = {:#06X};", get_field(&m.fields, "LockSetValOff", &m.name)).unwrap();
+        writeln!(out, "    pub const BASE: u32 = {:#010X};", get_field(&m.fields, "BaseAddr", &m.name))
+            .unwrap();
+        writeln!(out, "    pub const NUM_LOCKS: usize = {};", get_field(&m.fields, "NumLocks", &m.name))
+            .unwrap();
+        writeln!(
+            out,
+            "    pub const LOCK_ID_STRIDE: u32 = {:#06X};",
+            get_field(&m.fields, "LockIdOff", &m.name)
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const REL_ACQ_OFFSET: u32 = {:#06X};",
+            get_field(&m.fields, "RelAcqOff", &m.name)
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const LOCK_VAL_OFFSET: u32 = {:#06X};",
+            get_field(&m.fields, "LockValOff", &m.name)
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const VAL_UPPER_BOUND: i32 = {};",
+            get_field(&m.fields, "LockValUpperBound", &m.name) as i32
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const VAL_LOWER_BOUND: i32 = {};",
+            get_field(&m.fields, "LockValLowerBound", &m.name) as i32
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const SET_VAL_BASE: u32 = {:#010X};",
+            get_field(&m.fields, "LockSetValBase", &m.name)
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const SET_VAL_STRIDE: u32 = {:#06X};",
+            get_field(&m.fields, "LockSetValOff", &m.name)
+        )
+        .unwrap();
         writeln!(out, "}}\n").unwrap();
     }
 
@@ -1116,12 +1226,7 @@ fn gen_aiert_ports(port_maps: &[PortMapData], out_dir: &Path) {
     for pm in port_maps {
         let const_name = port_map_rust_name(&pm.name);
         writeln!(out, "/// {} (from aie-rt {})", const_name, pm.name).unwrap();
-        writeln!(
-            out,
-            "pub const {}: &[(AieRtPortType, u8)] = &[",
-            const_name
-        )
-        .unwrap();
+        writeln!(out, "pub const {}: &[(AieRtPortType, u8)] = &[", const_name).unwrap();
 
         for (i, (port_type, port_num)) in pm.entries.iter().enumerate() {
             let rust_variant = match port_type.as_str() {
@@ -1136,12 +1241,7 @@ fn gen_aiert_ports(port_maps: &[PortMapData], out_dir: &Path) {
                 "TRACE" => "Trace",
                 other => panic!("Unknown port type '{}' in {}", other, pm.name),
             };
-            writeln!(
-                out,
-                "    (AieRtPortType::{}, {}), // {}",
-                rust_variant, port_num, i
-            )
-            .unwrap();
+            writeln!(out, "    (AieRtPortType::{}, {}), // {}", rust_variant, port_num, i).unwrap();
         }
 
         writeln!(out, "];\n").unwrap();
@@ -1259,9 +1359,7 @@ pub const MEMTILE_SLAVE_PORTS: &[(AieRtPortType, u8)] = &[];
 // ============================================================================
 
 fn gen_core_module(regdb: &regdb::RegisterDb, out_dir: &Path) {
-    let core = regdb
-        .module("core")
-        .expect("AM025 JSON missing 'core' module");
+    let core = regdb.module("core").expect("AM025 JSON missing 'core' module");
 
     // Map of JSON register name -> Rust constant name
     let register_map: &[(&str, &str)] = &[
@@ -1282,9 +1380,7 @@ fn gen_core_module(regdb: &regdb::RegisterDb, out_dir: &Path) {
     for &(json_name, const_name) in register_map {
         let reg = core
             .register(json_name)
-            .unwrap_or_else(|| {
-                panic!("Core register '{}' not found in AM025 JSON", json_name)
-            });
+            .unwrap_or_else(|| panic!("Core register '{}' not found in AM025 JSON", json_name));
         writeln!(out, "/// {} (AM025: {})", const_name, json_name).unwrap();
         writeln!(out, "pub const {}: u32 = {:#07X};", const_name, reg.offset).unwrap();
         writeln!(out).unwrap();
@@ -1301,10 +1397,7 @@ fn gen_core_module(regdb: &regdb::RegisterDb, out_dir: &Path) {
         .filter(|&o| (0x30000..0x3F000).contains(&o))
         .collect();
 
-    assert!(
-        !core_proper_offsets.is_empty(),
-        "No core-module registers found in 0x30000..0x3F000"
-    );
+    assert!(!core_proper_offsets.is_empty(), "No core-module registers found in 0x30000..0x3F000");
 
     let min_offset = *core_proper_offsets.iter().min().unwrap();
     // Round start down to 4K page boundary for clean dispatch
@@ -1315,11 +1408,7 @@ fn gen_core_module(regdb: &regdb::RegisterDb, out_dir: &Path) {
     writeln!(out, "/// Core module offset range start (derived from AM025)").unwrap();
     writeln!(out, "pub const OFFSET_START: u32 = {:#07X};", offset_start).unwrap();
     writeln!(out).unwrap();
-    writeln!(
-        out,
-        "/// Core module offset range end (before stream switch at 0x3F000)"
-    )
-    .unwrap();
+    writeln!(out, "/// Core module offset range end (before stream switch at 0x3F000)").unwrap();
     writeln!(out, "pub const OFFSET_END: u32 = {:#07X};", offset_end).unwrap();
 
     fs::write(out_dir.join("gen_core_module.rs"), out).unwrap();
@@ -1329,24 +1418,14 @@ fn gen_core_module(regdb: &regdb::RegisterDb, out_dir: &Path) {
 // Step 2: Lock_Request constants
 // ============================================================================
 
-fn gen_lock_request(
-    regdb: &regdb::RegisterDb,
-    out_dir: &Path,
-    module_name: &str,
-    output_file: &str,
-) {
+fn gen_lock_request(regdb: &regdb::RegisterDb, out_dir: &Path, module_name: &str, output_file: &str) {
     let module = regdb
         .module(module_name)
         .unwrap_or_else(|| panic!("AM025 JSON missing '{}' module", module_name));
 
     let lock_req = module
         .register("Lock_Request")
-        .unwrap_or_else(|| {
-            panic!(
-                "Lock_Request register not found in '{}' module",
-                module_name
-            )
-        });
+        .unwrap_or_else(|| panic!("Lock_Request register not found in '{}' module", module_name));
 
     let base_offset = lock_req.offset;
     let desc = lock_req.description.as_deref().unwrap_or("");
@@ -1389,18 +1468,9 @@ fn gen_lock_request(
     writeln!(out, "pub const LOCK_REQUEST_ID_SHIFT: u32 = {};", id_shift).unwrap();
     writeln!(out, "pub const LOCK_REQUEST_ID_MASK: u32 = {:#X};", id_mask).unwrap();
     writeln!(out).unwrap();
-    writeln!(
-        out,
-        "/// Lock_Request address field: Acq_Rel ({}) (1=acquire, 0=release)",
-        acq_rel_bit
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "pub const LOCK_REQUEST_ACQ_REL_BIT: u32 = {};",
-        acq_rel_bit
-    )
-    .unwrap();
+    writeln!(out, "/// Lock_Request address field: Acq_Rel ({}) (1=acquire, 0=release)", acq_rel_bit)
+        .unwrap();
+    writeln!(out, "pub const LOCK_REQUEST_ACQ_REL_BIT: u32 = {};", acq_rel_bit).unwrap();
     writeln!(out).unwrap();
     writeln!(
         out,
@@ -1421,10 +1491,7 @@ fn gen_lock_request(
 fn parse_lock_end_address(desc: &str, module_name: &str) -> u32 {
     // Pattern: "0xBASE - 0xLAST"
     let dash_idx = desc.find(" - 0x").unwrap_or_else(|| {
-        panic!(
-            "Lock_Request in '{}' has no ' - 0x' in description: {}",
-            module_name, desc
-        )
+        panic!("Lock_Request in '{}' has no ' - 0x' in description: {}", module_name, desc)
     });
     let after_dash = &desc[dash_idx + 3..]; // skip " - "
     let hex_str: String = after_dash
@@ -1433,10 +1500,7 @@ fn parse_lock_end_address(desc: &str, module_name: &str) -> u32 {
         .collect();
     let hex_str = hex_str.trim_start_matches("0x").trim_start_matches("0X");
     let last_addr = u32::from_str_radix(hex_str, 16).unwrap_or_else(|e| {
-        panic!(
-            "Bad end address in Lock_Request description for '{}': {}",
-            module_name, e
-        )
+        panic!("Bad end address in Lock_Request description for '{}': {}", module_name, e)
     });
     last_addr + 4 // exclusive end
 }
@@ -1445,10 +1509,7 @@ fn parse_lock_end_address(desc: &str, module_name: &str) -> u32 {
 fn parse_desc_range(desc: &str, field_name: &str, module_name: &str) -> (u32, u32) {
     let pattern = format!("{} [", field_name);
     let start = desc.find(&pattern).unwrap_or_else(|| {
-        panic!(
-            "Field '{}' not found in Lock_Request description for '{}': {}",
-            field_name, module_name, desc
-        )
+        panic!("Field '{}' not found in Lock_Request description for '{}': {}", field_name, module_name, desc)
     });
     let after = &desc[start + pattern.len()..];
     let bracket_end = after.find(']').unwrap();
@@ -1464,10 +1525,7 @@ fn parse_desc_range(desc: &str, field_name: &str, module_name: &str) -> (u32, u3
 fn parse_desc_single_bit(desc: &str, field_name: &str, module_name: &str) -> u32 {
     let pattern = format!("{} (", field_name);
     let start = desc.find(&pattern).unwrap_or_else(|| {
-        panic!(
-            "Field '{}' not found in Lock_Request description for '{}': {}",
-            field_name, module_name, desc
-        )
+        panic!("Field '{}' not found in Lock_Request description for '{}': {}", field_name, module_name, desc)
     });
     let after = &desc[start + pattern.len()..];
     let paren_end = after.find(')').unwrap();
@@ -1499,18 +1557,12 @@ fn gen_stream_ports(regdb: &regdb::RegisterDb, out_dir: &Path) -> PortArrayData 
     // Note: the generated code references `port_type::*` which is defined
     // in the `aie2` module (aie2/mod.rs), before the include!() point.
 
-    let compute_master =
-        collect_port_array(regdb, "core", "Stream_Switch_Master_Config_");
-    let compute_slave =
-        collect_port_array(regdb, "core", "Stream_Switch_Slave_Config_");
-    let memtile_master =
-        collect_port_array(regdb, "memory_tile", "Stream_Switch_Master_Config_");
-    let memtile_slave =
-        collect_port_array(regdb, "memory_tile", "Stream_Switch_Slave_Config_");
-    let shim_master =
-        collect_port_array(regdb, "shim", "Stream_Switch_Master_Config_");
-    let shim_slave =
-        collect_port_array(regdb, "shim", "Stream_Switch_Slave_Config_");
+    let compute_master = collect_port_array(regdb, "core", "Stream_Switch_Master_Config_");
+    let compute_slave = collect_port_array(regdb, "core", "Stream_Switch_Slave_Config_");
+    let memtile_master = collect_port_array(regdb, "memory_tile", "Stream_Switch_Master_Config_");
+    let memtile_slave = collect_port_array(regdb, "memory_tile", "Stream_Switch_Slave_Config_");
+    let shim_master = collect_port_array(regdb, "shim", "Stream_Switch_Master_Config_");
+    let shim_slave = collect_port_array(regdb, "shim", "Stream_Switch_Slave_Config_");
 
     write_port_array(
         &mut out,
@@ -1547,13 +1599,7 @@ fn gen_stream_ports(regdb: &regdb::RegisterDb, out_dir: &Path) -> PortArrayData 
         "PL_MODULE",
         &shim_master,
     );
-    write_port_array(
-        &mut out,
-        "SHIM_SLAVE_PORTS",
-        "Shim tile stream switch slave",
-        "PL_MODULE",
-        &shim_slave,
-    );
+    write_port_array(&mut out, "SHIM_SLAVE_PORTS", "Shim tile stream switch slave", "PL_MODULE", &shim_slave);
 
     fs::write(out_dir.join("gen_stream_ports.rs"), out).unwrap();
 
@@ -1568,11 +1614,7 @@ fn gen_stream_ports(regdb: &regdb::RegisterDb, out_dir: &Path) -> PortArrayData 
 }
 
 /// Collect and sort port entries for a given module and register prefix.
-fn collect_port_array(
-    regdb: &regdb::RegisterDb,
-    module_name: &str,
-    prefix: &str,
-) -> Vec<PortEntry> {
+fn collect_port_array(regdb: &regdb::RegisterDb, module_name: &str, prefix: &str) -> Vec<PortEntry> {
     let module = regdb
         .module(module_name)
         .unwrap_or_else(|| panic!("AM025 JSON missing '{}' module", module_name));
@@ -1584,14 +1626,7 @@ fn collect_port_array(
         .map(|r| {
             let suffix = r.name[prefix.len()..].to_string();
             let (port_type_value, port_type_expr) = suffix_to_port_type(&suffix);
-            (
-                r.offset,
-                PortEntry {
-                    port_type_value,
-                    port_type_expr,
-                    suffix,
-                },
-            )
+            (r.offset, PortEntry { port_type_value, port_type_expr, suffix })
         })
         .collect();
 
@@ -1629,9 +1664,9 @@ fn suffix_to_port_type(suffix: &str) -> (u8, String) {
         if let Some(rest) = suffix.strip_prefix(dir_prefix) {
             // Handle both "North0" and "North_0" formats
             let num_str = rest.strip_prefix('_').unwrap_or(rest);
-            let n: u8 = num_str.parse().unwrap_or_else(|e| {
-                panic!("Cannot parse port index from suffix '{}': {}", suffix, e)
-            });
+            let n: u8 = num_str
+                .parse()
+                .unwrap_or_else(|e| panic!("Cannot parse port index from suffix '{}': {}", suffix, e));
             return (base + n, format!("port_type::{}({})", fn_name, n));
         }
     }
@@ -1651,22 +1686,10 @@ fn write_port_array(
     am025_section: &str,
     entries: &[PortEntry],
 ) {
-    writeln!(
-        out,
-        "/// {} port layout (AM025 {}).",
-        doc_prefix, am025_section
-    )
-    .unwrap();
+    writeln!(out, "/// {} port layout (AM025 {}).", doc_prefix, am025_section).unwrap();
     writeln!(out, "pub const {}: &[u8] = &[", const_name).unwrap();
     for (i, entry) in entries.iter().enumerate() {
-        writeln!(
-            out,
-            "    {:<26} // {}: {}",
-            format!("{},", entry.port_type_expr),
-            i,
-            entry.suffix
-        )
-        .unwrap();
+        writeln!(out, "    {:<26} // {}: {}", format!("{},", entry.port_type_expr), i, entry.suffix).unwrap();
     }
     writeln!(out, "];\n").unwrap();
 }
@@ -1675,29 +1698,17 @@ fn write_port_array(
 // gen_stream_ranges: Stream switch port ranges and config bits
 // ============================================================================
 
-fn gen_stream_ranges(
-    regdb: &regdb::RegisterDb,
-    port_data: &PortArrayData,
-    out_dir: &Path,
-) {
+fn gen_stream_ranges(regdb: &regdb::RegisterDb, port_data: &PortArrayData, out_dir: &Path) {
     let mut out = gen_header("AM025 stream switch port ranges");
 
     // Extract ENABLE_BIT from any Master_Config register's Master_Enable field
     let enable_bit = find_master_enable_bit(regdb);
-    writeln!(
-        out,
-        "/// Stream switch master enable bit position (AM025: Master_Enable)"
-    )
-    .unwrap();
+    writeln!(out, "/// Stream switch master enable bit position (AM025: Master_Enable)").unwrap();
     writeln!(out, "pub const ENABLE_BIT: u32 = {};", enable_bit).unwrap();
     writeln!(out).unwrap();
     // SLAVE_SELECT_MASK stays hardcoded -- it's a sub-field within the
     // Configuration field that the JSON doesn't break out separately.
-    writeln!(
-        out,
-        "/// Slave select mask (5-bit sub-field, not individually specified in AM025)"
-    )
-    .unwrap();
+    writeln!(out, "/// Slave select mask (5-bit sub-field, not individually specified in AM025)").unwrap();
     writeln!(out, "pub const SLAVE_SELECT_MASK: u32 = 0x1F;").unwrap();
     writeln!(out).unwrap();
 
@@ -1714,18 +1725,8 @@ fn gen_stream_ranges(
     // MemTile port ranges
     writeln!(out, "/// MemTile port ranges").unwrap();
     writeln!(out, "pub mod mem_tile {{").unwrap();
-    write_direction_ranges(
-        &mut out,
-        "SOUTH",
-        &port_data.memtile_master,
-        &port_data.memtile_slave,
-    );
-    write_direction_ranges(
-        &mut out,
-        "NORTH",
-        &port_data.memtile_master,
-        &port_data.memtile_slave,
-    );
+    write_direction_ranges(&mut out, "SOUTH", &port_data.memtile_master, &port_data.memtile_slave);
+    write_direction_ranges(&mut out, "NORTH", &port_data.memtile_master, &port_data.memtile_slave);
     write_bundle_ranges(&mut out, "DMA", PT_DMA_BASE, &port_data.memtile_master, &port_data.memtile_slave);
     write_bundle_ranges(&mut out, "TRACE", PT_TRACE, &port_data.memtile_master, &port_data.memtile_slave);
     writeln!(out, "}}\n").unwrap();
@@ -1733,18 +1734,8 @@ fn gen_stream_ranges(
     // Compute tile port ranges
     writeln!(out, "/// Compute tile port ranges").unwrap();
     writeln!(out, "pub mod compute {{").unwrap();
-    write_direction_ranges(
-        &mut out,
-        "SOUTH",
-        &port_data.compute_master,
-        &port_data.compute_slave,
-    );
-    write_direction_ranges(
-        &mut out,
-        "NORTH",
-        &port_data.compute_master,
-        &port_data.compute_slave,
-    );
+    write_direction_ranges(&mut out, "SOUTH", &port_data.compute_master, &port_data.compute_slave);
+    write_direction_ranges(&mut out, "NORTH", &port_data.compute_master, &port_data.compute_slave);
     write_direction_ranges(&mut out, "EAST", &port_data.compute_master, &port_data.compute_slave);
     write_direction_ranges(&mut out, "WEST", &port_data.compute_master, &port_data.compute_slave);
     write_bundle_ranges(&mut out, "DMA", PT_DMA_BASE, &port_data.compute_master, &port_data.compute_slave);
@@ -1781,18 +1772,8 @@ fn write_direction_ranges(
             end - start + 1
         )
         .unwrap();
-        writeln!(
-            out,
-            "    pub const {}_MASTER_START: u8 = {};",
-            direction, start
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "    pub const {}_MASTER_END: u8 = {};",
-            direction, end
-        )
-        .unwrap();
+        writeln!(out, "    pub const {}_MASTER_START: u8 = {};", direction, start).unwrap();
+        writeln!(out, "    pub const {}_MASTER_END: u8 = {};", direction, end).unwrap();
     }
 
     // Find index range for this direction in slave ports
@@ -1806,18 +1787,8 @@ fn write_direction_ranges(
             end - start + 1
         )
         .unwrap();
-        writeln!(
-            out,
-            "    pub const {}_SLAVE_START: u8 = {};",
-            direction, start
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "    pub const {}_SLAVE_END: u8 = {};",
-            direction, end
-        )
-        .unwrap();
+        writeln!(out, "    pub const {}_SLAVE_START: u8 = {};", direction, start).unwrap();
+        writeln!(out, "    pub const {}_SLAVE_END: u8 = {};", direction, end).unwrap();
     }
 }
 
@@ -1914,10 +1885,7 @@ fn find_master_enable_bit(regdb: &regdb::RegisterDb) -> u32 {
             if reg.name.starts_with("Stream_Switch_Master_Config_") {
                 if let Some(field) = reg.field("Master_Enable") {
                     // Graph crate's BitField has lsb/msb already parsed.
-                    assert_eq!(
-                        field.lsb, field.msb,
-                        "Master_Enable should be a single bit"
-                    );
+                    assert_eq!(field.lsb, field.msb, "Master_Enable should be a single bit");
                     return field.lsb as u32;
                 }
             }
@@ -1959,10 +1927,7 @@ fn gen_trace_events(workspace_root: &Path, bridge_path: &Path, out_dir: &Path) {
         PathBuf::from("python3")
     };
 
-    let output = Command::new(&python)
-        .arg(bridge_path)
-        .arg("trace-events")
-        .output();
+    let output = Command::new(&python).arg(bridge_path).arg("trace-events").output();
 
     let output = match output {
         Ok(o) if o.status.success() => o,
@@ -1976,10 +1941,7 @@ fn gen_trace_events(workspace_root: &Path, bridge_path: &Path, out_dir: &Path) {
             return;
         }
         Err(e) => {
-            eprintln!(
-                "cargo:warning=Could not run mlir-aie bridge ({}), using stub",
-                e
-            );
+            eprintln!("cargo:warning=Could not run mlir-aie bridge ({}), using stub", e);
             write_trace_event_stub(out_dir);
             return;
         }
@@ -1988,10 +1950,7 @@ fn gen_trace_events(workspace_root: &Path, bridge_path: &Path, out_dir: &Path) {
     let json: serde_json::Value = match serde_json::from_slice(&output.stdout) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
-                "cargo:warning=mlir-aie bridge returned invalid JSON ({}), using stub",
-                e
-            );
+            eprintln!("cargo:warning=mlir-aie bridge returned invalid JSON ({}), using stub", e);
             write_trace_event_stub(out_dir);
             return;
         }
@@ -2013,12 +1972,7 @@ fn gen_trace_events(workspace_root: &Path, bridge_path: &Path, out_dir: &Path) {
     // Generate modules for each event enum.
     let enum_order = ["CoreEvent", "MemEvent", "MemTileEvent", "ShimTileEvent"];
     let mod_names = ["core_events", "mem_events", "memtile_events", "shim_events"];
-    let fn_names = [
-        "core_event_name",
-        "mem_event_name",
-        "memtile_event_name",
-        "shim_event_name",
-    ];
+    let fn_names = ["core_event_name", "mem_event_name", "memtile_event_name", "shim_event_name"];
 
     for (i, enum_name) in enum_order.iter().enumerate() {
         let mod_name = mod_names[i];
@@ -2044,12 +1998,7 @@ fn gen_trace_events(workspace_root: &Path, bridge_path: &Path, out_dir: &Path) {
             writeln!(out, "}}\n").unwrap();
 
             // Name lookup function.
-            writeln!(
-                out,
-                "/// Look up {} event name by hardware code.",
-                enum_name
-            )
-            .unwrap();
+            writeln!(out, "/// Look up {} event name by hardware code.", enum_name).unwrap();
             writeln!(out, "pub fn {}(code: u8) -> &'static str {{", fn_name).unwrap();
             writeln!(out, "    match code {{").unwrap();
             for (name, value) in &entries {
@@ -2184,11 +2133,7 @@ fn run_llvm_config(llvm_config: &Path, args: &[&str]) -> String {
         .output()
         .unwrap_or_else(|e| panic!("Failed to run llvm-config: {}", e));
     if !output.status.success() {
-        panic!(
-            "llvm-config {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        panic!("llvm-config {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr));
     }
     String::from_utf8(output.stdout).unwrap()
 }

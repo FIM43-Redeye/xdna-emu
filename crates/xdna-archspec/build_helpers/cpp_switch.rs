@@ -15,11 +15,7 @@ pub fn parse_cpp_opcode_switch(llvm_aie_path: &Path) -> HashMap<String, Vec<Stri
     let content = match std::fs::read_to_string(&cpp_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "cargo:warning=Could not read AIE2InstrInfo.cpp at {}: {}",
-                cpp_path.display(),
-                e
-            );
+            eprintln!("cargo:warning=Could not read AIE2InstrInfo.cpp at {}: {}", cpp_path.display(), e);
             return HashMap::new();
         }
     };
@@ -31,11 +27,7 @@ pub fn parse_cpp_opcode_switch(llvm_aie_path: &Path) -> HashMap<String, Vec<Stri
 }
 
 /// Parse a single switch function, extracting case/return pairs.
-fn parse_switch_function(
-    content: &str,
-    function_name: &str,
-    result: &mut HashMap<String, Vec<String>>,
-) {
+fn parse_switch_function(content: &str, function_name: &str, result: &mut HashMap<String, Vec<String>>) {
     let needle = format!("AIE2InstrInfo::{}", function_name);
     let func_start = match content.find(&needle) {
         Some(pos) => pos,

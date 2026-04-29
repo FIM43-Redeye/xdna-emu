@@ -149,20 +149,13 @@ fn parse_immediate_type(reg_class: &str) -> Option<String> {
     if reg_class.starts_with("simm") {
         let rest = &reg_class[4..];
         let scale = extract_scale_suffix(rest);
-        return Some(format!(
-            "OperandType::Immediate {{ signed: true, scale: {} }}",
-            scale
-        ));
+        return Some(format!("OperandType::Immediate {{ signed: true, scale: {} }}", scale));
     }
     if reg_class.starts_with("imm") {
         let is_unsigned = reg_class.contains("unsigned");
         let rest = &reg_class[3..];
         let scale = extract_scale_suffix(rest);
-        return Some(format!(
-            "OperandType::Immediate {{ signed: {}, scale: {} }}",
-            !is_unsigned,
-            scale
-        ));
+        return Some(format!("OperandType::Immediate {{ signed: {}, scale: {} }}", !is_unsigned, scale));
     }
     if reg_class.starts_with("addr") {
         return Some("OperandType::Immediate { signed: false, scale: 1 }".to_string());
@@ -171,10 +164,7 @@ fn parse_immediate_type(reg_class: &str) -> Option<String> {
         let last = reg_class.as_bytes()[reg_class.len() - 1];
         if last == b'u' || last == b's' {
             let signed = last == b's';
-            return Some(format!(
-                "OperandType::Immediate {{ signed: {}, scale: 1 }}",
-                signed
-            ));
+            return Some(format!("OperandType::Immediate {{ signed: {}, scale: 1 }}", signed));
         }
     }
     None
@@ -374,10 +364,7 @@ pub fn refine_branch_semantic(mnemonic: &str, semantic: Option<String>) -> Optio
         return semantic;
     }
     let mn = mnemonic.to_lowercase();
-    if mn.starts_with("jnz")
-        || mn.starts_with("jz")
-        || (mn.starts_with('b') && !mn.starts_with("bswap"))
-    {
+    if mn.starts_with("jnz") || mn.starts_with("jz") || (mn.starts_with('b') && !mn.starts_with("bswap")) {
         Some("SemanticOp::BrCond".to_string())
     } else {
         semantic
@@ -562,9 +549,7 @@ impl BuildInstrRecord {
             .collect();
 
         for field in &mut operand_fields {
-            if let Some((reg_class, _)) =
-                all_operands.iter().find(|(_, name)| *name == field.name)
-            {
+            if let Some((reg_class, _)) = all_operands.iter().find(|(_, name)| *name == field.name) {
                 field.operand_type = classify_operand_type(reg_class, &field.name);
                 if field.operand_type.contains("signed: true") {
                     field.signed = true;
@@ -616,11 +601,7 @@ impl BuildInstrRecord {
                     .collect::<String>()
                     .parse()
                     .unwrap_or(0);
-                BuildImplicitReg {
-                    reg_class: r.clone(),
-                    reg_num,
-                    is_use: false,
-                }
+                BuildImplicitReg { reg_class: r.clone(), reg_num, is_use: false }
             })
             .chain(self.uses.iter().map(|r| {
                 let reg_num = r
@@ -629,11 +610,7 @@ impl BuildInstrRecord {
                     .collect::<String>()
                     .parse()
                     .unwrap_or(0);
-                BuildImplicitReg {
-                    reg_class: r.clone(),
-                    reg_num,
-                    is_use: true,
-                }
+                BuildImplicitReg { reg_class: r.clone(), reg_num, is_use: true }
             }))
             .collect();
 
@@ -642,10 +619,8 @@ impl BuildInstrRecord {
         let (dual_et, dual_ft) = infer_dual_element_types(&self.name);
         let element_type = dual_et.or_else(|| infer_element_type(&self.mnemonic));
         let from_type = dual_ft;
-        let branch_condition =
-            infer_branch_condition(&self.mnemonic, semantic.as_deref());
-        let select_variant =
-            infer_select_variant(&self.mnemonic, semantic.as_deref());
+        let branch_condition = infer_branch_condition(&self.mnemonic, semantic.as_deref());
+        let select_variant = infer_select_variant(&self.mnemonic, semantic.as_deref());
         let is_ptr_arithmetic = semantic.as_deref() == Some("SemanticOp::PointerAdd");
 
         Some(BuildInstrEncoding {

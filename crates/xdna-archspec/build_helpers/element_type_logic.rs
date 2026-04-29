@@ -71,32 +71,21 @@ pub fn infer_dual_type_tags(name: &str) -> (Option<TypeTag>, Option<TypeTag>) {
     let parts: Vec<&str> = name.split('_').collect();
 
     // Pattern 1: V{SRS|UPS|FLOOR|CONV}_{OUT}_{IN}_*
-    if parts.len() >= 3
-        && matches!(
-            parts[0],
-            "VSRS" | "VSRSM" | "VUPS" | "VFLOOR" | "VCONV"
-        )
-    {
+    if parts.len() >= 3 && matches!(parts[0], "VSRS" | "VSRSM" | "VUPS" | "VFLOOR" | "VCONV") {
         if let (Some(out), Some(inp)) = (parse_type_tag(parts[1]), parse_type_tag(parts[2])) {
             return (Some(out), Some(inp));
         }
     }
 
     // Pattern 2: V{LDA|ST}_{2D|3D}_{UPS|SRS}_{OUT}_{IN}*
-    if parts.len() >= 5
-        && matches!(parts[0], "VLDA" | "VST")
-        && matches!(parts[2], "UPS" | "SRS")
-    {
+    if parts.len() >= 5 && matches!(parts[0], "VLDA" | "VST") && matches!(parts[2], "UPS" | "SRS") {
         if let (Some(out), Some(inp)) = (parse_type_tag(parts[3]), parse_type_tag(parts[4])) {
             return (Some(out), Some(inp));
         }
     }
 
     // Pattern 3: V{LDA|ST}_{UPS|SRS}_{OUT}_{IN}_* (no 2D/3D prefix)
-    if parts.len() >= 4
-        && matches!(parts[0], "VLDA" | "VST")
-        && matches!(parts[1], "UPS" | "SRS")
-    {
+    if parts.len() >= 4 && matches!(parts[0], "VLDA" | "VST") && matches!(parts[1], "UPS" | "SRS") {
         if let (Some(out), Some(inp)) = (parse_type_tag(parts[2]), parse_type_tag(parts[3])) {
             return (Some(out), Some(inp));
         }
@@ -106,10 +95,7 @@ pub fn infer_dual_type_tags(name: &str) -> (Option<TypeTag>, Option<TypeTag>) {
     if parts.len() >= 4 && matches!(parts[0], "VLDA" | "VST") {
         if let Some(conv_pos) = parts.iter().position(|&p| p == "CONV") {
             // Skip optional 2D/3D after CONV keyword.
-            let type_start = if parts
-                .get(conv_pos + 1)
-                .map_or(false, |p| *p == "2D" || *p == "3D")
-            {
+            let type_start = if parts.get(conv_pos + 1).map_or(false, |p| *p == "2D" || *p == "3D") {
                 conv_pos + 2
             } else {
                 conv_pos + 1
@@ -144,16 +130,32 @@ pub fn infer_type_tag_from_mnemonic(mnemonic: &str) -> Option<TypeTag> {
     let is_unsigned = mnemonic.contains(".u") || has_dot_d_digit;
 
     if mnemonic.ends_with('8') || mnemonic.contains(".i8") || mnemonic.contains(".u8") {
-        Some(if is_unsigned { TypeTag::UInt8 } else { TypeTag::Int8 })
+        Some(if is_unsigned {
+            TypeTag::UInt8
+        } else {
+            TypeTag::Int8
+        })
     } else if mnemonic.ends_with("16") || mnemonic.contains(".i16") || mnemonic.contains(".u16") {
         if mnemonic.contains("bf16") || mnemonic.contains(".bf") {
             return Some(TypeTag::BFloat16);
         }
-        Some(if is_unsigned { TypeTag::UInt16 } else { TypeTag::Int16 })
+        Some(if is_unsigned {
+            TypeTag::UInt16
+        } else {
+            TypeTag::Int16
+        })
     } else if mnemonic.ends_with("32") || mnemonic.contains(".i32") || mnemonic.contains(".u32") {
-        Some(if is_unsigned { TypeTag::UInt32 } else { TypeTag::Int32 })
+        Some(if is_unsigned {
+            TypeTag::UInt32
+        } else {
+            TypeTag::Int32
+        })
     } else if mnemonic.ends_with("64") || mnemonic.contains(".i64") || mnemonic.contains(".u64") {
-        Some(if is_unsigned { TypeTag::UInt64 } else { TypeTag::Int64 })
+        Some(if is_unsigned {
+            TypeTag::UInt64
+        } else {
+            TypeTag::Int64
+        })
     } else if mnemonic.contains("bf16") || mnemonic.contains(".bf") {
         Some(TypeTag::BFloat16)
     } else if mnemonic.contains("f32") || mnemonic.contains("float") || mnemonic.ends_with(".f") {

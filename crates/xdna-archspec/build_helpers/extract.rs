@@ -64,10 +64,7 @@ pub struct BuildRegisterModel {
 
 impl Default for BuildRegisterModel {
     fn default() -> Self {
-        Self {
-            registers: HashMap::new(),
-            classes: HashMap::new(),
-        }
+        Self { registers: HashMap::new(), classes: HashMap::new() }
     }
 }
 
@@ -113,19 +110,14 @@ impl BuildTblgenOutput {
 // TableGen parsing
 // ============================================================================
 
-fn parse_td_file<'a>(
-    td_file: &Path,
-    include_paths: &[&Path],
-) -> Result<tblgen::RecordKeeper<'a>, String> {
+fn parse_td_file<'a>(td_file: &Path, include_paths: &[&Path]) -> Result<tblgen::RecordKeeper<'a>, String> {
     let td_str = td_file.to_str().ok_or("non-UTF8 .td path")?;
     let mut parser = TableGenParser::new().add_source_file(td_str);
     for inc in include_paths {
         let inc_str = inc.to_str().ok_or("non-UTF8 include path")?;
         parser = parser.add_include_directory(inc_str);
     }
-    parser
-        .parse()
-        .map_err(|e| format!("TableGen parse failed: {}", e))
+    parser.parse().map_err(|e| format!("TableGen parse failed: {}", e))
 }
 
 // ============================================================================
@@ -145,10 +137,7 @@ fn load_instruction_records(
         }
     }
 
-    eprintln!(
-        "cargo:warning=TableGen: {} instruction records extracted",
-        records.len()
-    );
+    eprintln!("cargo:warning=TableGen: {} instruction records extracted", records.len());
     Ok(records)
 }
 
@@ -197,10 +186,7 @@ fn extract_instruction_record(record: &tblgen::Record<'_>) -> Option<BuildInstrR
             }
         };
         if let Some((field_name, bit_idx)) = bit.as_var_bit() {
-            parts.push(BuildEncodingBit::FieldBit {
-                field: field_name.to_string(),
-                bit: bit_idx as u8,
-            });
+            parts.push(BuildEncodingBit::FieldBit { field: field_name.to_string(), bit: bit_idx as u8 });
         } else if let Some(val) = bit.as_literal() {
             parts.push(if val {
                 BuildEncodingBit::One
@@ -223,11 +209,7 @@ fn extract_instruction_record(record: &tblgen::Record<'_>) -> Option<BuildInstrR
         _ => return None,
     };
 
-    let slot_encoding = Some(BuildSlotEncoding {
-        slot: slot.to_string(),
-        width: width as u8,
-        parts,
-    });
+    let slot_encoding = Some(BuildSlotEncoding { slot: slot.to_string(), width: width as u8, parts });
 
     let inputs = extract_dag_operands(record, "InOperandList");
     let outputs = extract_dag_operands(record, "OutOperandList");
@@ -263,13 +245,7 @@ fn extract_instruction_record(record: &tblgen::Record<'_>) -> Option<BuildInstrR
     });
 
     let mut parents = Vec::new();
-    for class in &[
-        "AIE2Inst",
-        "AIE2SlotInst",
-        "AIE2_brcc_base",
-        "AIE2_br_base",
-        "AIE2_call_base",
-    ] {
+    for class in &["AIE2Inst", "AIE2SlotInst", "AIE2_brcc_base", "AIE2_br_base", "AIE2_call_base"] {
         if record.subclass_of(class) {
             parents.push(class.to_string());
         }
@@ -353,10 +329,7 @@ fn extract_def_list(record: &tblgen::Record<'_>, field_name: &str) -> Vec<String
 // Pattern records: Pat<> -> semantic string mapping
 // ============================================================================
 
-fn load_pattern_records(
-    td_file: &Path,
-    include_paths: &[&Path],
-) -> Result<HashMap<String, String>, String> {
+fn load_pattern_records(td_file: &Path, include_paths: &[&Path]) -> Result<HashMap<String, String>, String> {
     let keeper = parse_td_file(td_file, include_paths)?;
     let mut candidates: HashMap<String, Vec<(String, bool)>> = HashMap::new();
 
@@ -416,10 +389,7 @@ fn load_pattern_records(
         let has_compound_result = result_dag_has_compound_ops(&result_dag);
         let is_simple = !is_swap && !has_compound_result;
 
-        candidates
-            .entry(instr_name)
-            .or_default()
-            .push((semantic, is_simple));
+        candidates.entry(instr_name).or_default().push((semantic, is_simple));
     }
 
     let mut result: HashMap<String, String> = HashMap::new();
@@ -736,9 +706,7 @@ fn load_processor_model(
     let keeper = parse_td_file(td_file, include_paths)?;
 
     for record in keeper.all_derived_definitions("SchedMachineModel") {
-        let int_field = |name: &str, default: i64| -> i64 {
-            record.int_value(name).unwrap_or(default)
-        };
+        let int_field = |name: &str, default: i64| -> i64 { record.int_value(name).unwrap_or(default) };
 
         let itinerary_name = record
             .value("Itineraries")
@@ -798,14 +766,7 @@ fn load_itinerary_data(
             },
             Err(_) => Vec::new(),
         };
-        stages_map.insert(
-            name,
-            BuildPipelineStage {
-                cycles,
-                units,
-                time_inc,
-            },
-        );
+        stages_map.insert(name, BuildPipelineStage { cycles, units, time_inc });
     }
 
     let mut result: HashMap<String, BuildItineraryInfo> = HashMap::new();
@@ -883,13 +844,7 @@ fn load_itinerary_data(
 
         result.insert(
             class_name.clone(),
-            BuildItineraryInfo {
-                class_name,
-                total_latency,
-                operand_cycles,
-                stages,
-                bypasses,
-            },
+            BuildItineraryInfo { class_name, total_latency, operand_cycles, stages, bypasses },
         );
     }
 
@@ -917,10 +872,7 @@ fn collect_dag_register_refs(dag: &tblgen::init::DagInit, out: &mut Vec<String>)
     }
 }
 
-fn load_register_model(
-    td_file: &Path,
-    include_paths: &[&Path],
-) -> Result<BuildRegisterModel, String> {
+fn load_register_model(td_file: &Path, include_paths: &[&Path]) -> Result<BuildRegisterModel, String> {
     let keeper = parse_td_file(td_file, include_paths)?;
 
     let mut registers: HashMap<String, BuildRegisterDef> = HashMap::new();
@@ -961,25 +913,12 @@ fn load_register_model(
             }
         }
 
-        registers.insert(
-            name.clone(),
-            BuildRegisterDef {
-                name,
-                hw_encoding,
-                parents,
-            },
-        );
+        registers.insert(name.clone(), BuildRegisterDef { name, hw_encoding, parents });
     }
 
     let mut classes: HashMap<String, BuildRegisterClassDef> = HashMap::new();
-    let class_names = [
-        "RegisterClass",
-        "AIE2RegisterClass",
-        "AIEBaseRegisterClass",
-    ];
-    let class_iter = class_names
-        .iter()
-        .flat_map(|cn| keeper.all_derived_definitions(cn));
+    let class_names = ["RegisterClass", "AIE2RegisterClass", "AIEBaseRegisterClass"];
+    let class_iter = class_names.iter().flat_map(|cn| keeper.all_derived_definitions(cn));
     for record in class_iter {
         let name = match record.name() {
             Ok(n) => n.to_string(),
@@ -1010,21 +949,10 @@ fn load_register_model(
                 parents.push(class.to_string());
             }
         }
-        classes.insert(
-            name.clone(),
-            BuildRegisterClassDef {
-                name,
-                members,
-                alignment,
-                parents,
-            },
-        );
+        classes.insert(name.clone(), BuildRegisterClassDef { name, members, alignment, parents });
     }
 
-    Ok(BuildRegisterModel {
-        registers,
-        classes,
-    })
+    Ok(BuildRegisterModel { registers, classes })
 }
 
 // ============================================================================
@@ -1067,10 +995,7 @@ fn extract_composite_format(record: &tblgen::Record<'_>) -> Option<BuildComposit
             None => continue,
         };
         if let Some((var_name, var_bit)) = bit.as_var_bit() {
-            slot_bits
-                .entry(var_name.to_string())
-                .or_default()
-                .push((var_bit, i));
+            slot_bits.entry(var_name.to_string()).or_default().push((var_bit, i));
         } else if let Some(val) = bit.as_literal() {
             fixed_mask |= 1u128 << i;
             if val {
@@ -1158,10 +1083,7 @@ const ITINERARY_SEMANTICS: &[(&str, &str)] = &[
 /// propagation layers (Pat<>, pseudo expansion, C++ switch, itinerary).
 pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
     let td_file = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2.td");
-    let inc_path_bufs = vec![
-        llvm_aie_path.join("llvm/include"),
-        llvm_aie_path.join("llvm/lib/Target/AIE"),
-    ];
+    let inc_path_bufs = vec![llvm_aie_path.join("llvm/include"), llvm_aie_path.join("llvm/lib/Target/AIE")];
     let inc_refs: Vec<&Path> = inc_path_bufs.iter().map(|p| p.as_path()).collect();
 
     // Extract instruction records
@@ -1171,10 +1093,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
     let mut by_slot: HashMap<String, Vec<BuildInstrEncoding>> = HashMap::new();
     for record in records {
         if let Some(encoding) = record.to_build_encoding() {
-            by_slot
-                .entry(encoding.slot.clone())
-                .or_default()
-                .push(encoding);
+            by_slot.entry(encoding.slot.clone()).or_default().push(encoding);
         }
     }
 
@@ -1189,10 +1108,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
             }
         }
     }
-    eprintln!(
-        "cargo:warning=TableGen: {} pattern semantics applied",
-        pattern_upgraded
-    );
+    eprintln!("cargo:warning=TableGen: {} pattern semantics applied", pattern_upgraded);
 
     // Layer 2: Pseudo expansion propagation
     let pseudo_map = load_pseudo_expansion_map(&td_file, &inc_refs).unwrap_or_default();
@@ -1216,10 +1132,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
         }
     }
     if pseudo_propagated > 0 {
-        eprintln!(
-            "cargo:warning=TableGen: {} pseudo semantics propagated",
-            pseudo_propagated
-        );
+        eprintln!("cargo:warning=TableGen: {} pseudo semantics propagated", pseudo_propagated);
     }
 
     // Layer 3: C++ selection propagation
@@ -1240,10 +1153,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
         }
     }
     if cpp_propagated > 0 {
-        eprintln!(
-            "cargo:warning=TableGen: {} C++ semantics propagated",
-            cpp_propagated
-        );
+        eprintln!("cargo:warning=TableGen: {} C++ semantics propagated", cpp_propagated);
     }
 
     // Layer 4: Itinerary-based inference
@@ -1264,10 +1174,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
         }
     }
     if itinerary_inferred > 0 {
-        eprintln!(
-            "cargo:warning=TableGen: {} itinerary semantics inferred",
-            itinerary_inferred
-        );
+        eprintln!("cargo:warning=TableGen: {} itinerary semantics inferred", itinerary_inferred);
     }
 
     // Layer 5a: Cascade detection via implicit control register uses.
@@ -1290,10 +1197,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
         }
     }
     if cascade_overridden > 0 {
-        eprintln!(
-            "cargo:warning=TableGen: {} cascade semantics via implicit regs",
-            cascade_overridden
-        );
+        eprintln!("cargo:warning=TableGen: {} cascade semantics via implicit regs", cascade_overridden);
     }
 
     // Layer 5b: Encoding-name corrections. OVERRIDES earlier layers when they
@@ -1311,10 +1215,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
         }
     }
     if encoding_corrected > 0 {
-        eprintln!(
-            "cargo:warning=TableGen: {} encoding-name semantics corrected",
-            encoding_corrected
-        );
+        eprintln!("cargo:warning=TableGen: {} encoding-name semantics corrected", encoding_corrected);
     }
 
     // Post-propagation: derive is_ptr_arithmetic from resolved semantics
@@ -1350,9 +1251,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
 // ============================================================================
 
 /// Run llvm-tblgen -gen-disassembler and parse the output.
-fn run_disassembler_and_parse(
-    llvm_aie_path: &Path,
-) -> HashMap<String, super::bytecode::BuildDecoderTable> {
+fn run_disassembler_and_parse(llvm_aie_path: &Path) -> HashMap<String, super::bytecode::BuildDecoderTable> {
     let base = llvm_aie_path.join("llvm/lib/Target/AIE");
 
     // Find llvm-tblgen binary (same search logic as the runtime version)
@@ -1365,10 +1264,7 @@ fn run_disassembler_and_parse(
         }
     };
 
-    eprintln!(
-        "cargo:warning=Running llvm-tblgen -gen-disassembler from {}",
-        tblgen_path.display()
-    );
+    eprintln!("cargo:warning=Running llvm-tblgen -gen-disassembler from {}", tblgen_path.display());
 
     let output = match std::process::Command::new(&tblgen_path)
         .arg("-gen-disassembler")
@@ -1377,15 +1273,10 @@ fn run_disassembler_and_parse(
         .env_remove("LD_LIBRARY_PATH")
         .output()
     {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).into_owned()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            eprintln!(
-                "cargo:warning=llvm-tblgen -gen-disassembler failed: {}",
-                stderr
-            );
+            eprintln!("cargo:warning=llvm-tblgen -gen-disassembler failed: {}", stderr);
             return HashMap::new();
         }
         Err(e) => {
@@ -1413,27 +1304,19 @@ fn find_aie_tblgen(llvm_aie_path: &Path) -> Option<std::path::PathBuf> {
     };
 
     let candidates: Vec<Option<std::path::PathBuf>> = vec![
-        llvm_aie_path.parent().map(|p| {
-            p.join(format!(
-                "mlir-aie/ironenv/lib/python3.13/site-packages/llvm-aie/bin/{exe}"
-            ))
-        }),
-        llvm_aie_path.parent().map(|p| {
-            p.join(format!(
-                "mlir-aie/ironenv/lib/python3.12/site-packages/llvm-aie/bin/{exe}"
-            ))
-        }),
-        llvm_aie_path.parent().map(|p| {
-            p.join(format!(
-                "mlir-aie/ironenv/lib/python3.11/site-packages/llvm-aie/bin/{exe}"
-            ))
-        }),
+        llvm_aie_path
+            .parent()
+            .map(|p| p.join(format!("mlir-aie/ironenv/lib/python3.13/site-packages/llvm-aie/bin/{exe}"))),
+        llvm_aie_path
+            .parent()
+            .map(|p| p.join(format!("mlir-aie/ironenv/lib/python3.12/site-packages/llvm-aie/bin/{exe}"))),
+        llvm_aie_path
+            .parent()
+            .map(|p| p.join(format!("mlir-aie/ironenv/lib/python3.11/site-packages/llvm-aie/bin/{exe}"))),
         llvm_aie_path
             .parent()
             .map(|p| p.join(format!("mlir-aie/my_install/mlir/bin/{exe}"))),
-        llvm_aie_path
-            .parent()
-            .map(|p| p.join(format!("mlir-aie/install/bin/{exe}"))),
+        llvm_aie_path.parent().map(|p| p.join(format!("mlir-aie/install/bin/{exe}"))),
         Some(llvm_aie_path.join(format!("build/bin/{exe}"))),
         Some(llvm_aie_path.join(format!("build/Release/bin/{exe}"))),
     ];

@@ -46,19 +46,15 @@ pub fn parse_opcode_names_from_disasm(disasm_output: &str) -> HashMap<u32, Strin
     for line in disasm_output.lines() {
         let line = line.trim();
 
-        let (is_decode, is_try_decode) = (
-            line.contains("MCD::OPC_Decode,"),
-            line.contains("MCD::OPC_TryDecode,"),
-        );
+        let (is_decode, is_try_decode) =
+            (line.contains("MCD::OPC_Decode,"), line.contains("MCD::OPC_TryDecode,"));
         if !is_decode && !is_try_decode {
             continue;
         }
 
         let name = if let Some(idx) = line.find("// Opcode: ") {
             let rest = &line[idx + 11..];
-            let end = rest
-                .find(|c: char| c == ',' || c == '\n')
-                .unwrap_or(rest.len());
+            let end = rest.find(|c: char| c == ',' || c == '\n').unwrap_or(rest.len());
             rest[..end].trim().to_string()
         } else {
             continue;
@@ -81,10 +77,7 @@ pub fn parse_opcode_names_from_disasm(disasm_output: &str) -> HashMap<u32, Strin
             after_marker
         };
 
-        let byte_values: Vec<u8> = bytes_str
-            .split(',')
-            .filter_map(|s| s.trim().parse::<u8>().ok())
-            .collect();
+        let byte_values: Vec<u8> = bytes_str.split(',').filter_map(|s| s.trim().parse::<u8>().ok()).collect();
 
         if byte_values.is_empty() {
             continue;
@@ -105,11 +98,7 @@ pub fn parse_decoder_table_bytes(table_text: &str) -> Vec<u8> {
     for line in table_text.lines() {
         let line = line.trim();
 
-        if line.is_empty()
-            || line == "{"
-            || line.starts_with("};")
-            || line.starts_with("static ")
-        {
+        if line.is_empty() || line == "{" || line.starts_with("};") || line.starts_with("static ") {
             continue;
         }
 
@@ -182,13 +171,7 @@ pub fn extract_all_tables(disasm_output: &str) -> HashMap<String, BuildDecoderTa
                 let opcode_names = parse_opcode_names_from_disasm(table_text);
 
                 if !bytes.is_empty() {
-                    result.insert(
-                        slot_name.to_string(),
-                        BuildDecoderTable {
-                            bytes,
-                            opcode_names,
-                        },
-                    );
+                    result.insert(slot_name.to_string(), BuildDecoderTable { bytes, opcode_names });
                 }
             }
         }

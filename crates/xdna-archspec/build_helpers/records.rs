@@ -187,10 +187,7 @@ impl BuildSlotEncoding {
         for (i, part) in self.parts.iter().enumerate() {
             if let BuildEncodingBit::FieldBit { field, bit } = part {
                 let inst_bit = (self.width as usize - 1 - i) as u8;
-                field_bits
-                    .entry(field.clone())
-                    .or_default()
-                    .push((inst_bit, *bit));
+                field_bits.entry(field.clone()).or_default().push((inst_bit, *bit));
             }
         }
 
@@ -199,12 +196,7 @@ impl BuildSlotEncoding {
             .map(|(name, mut bit_pairs)| {
                 bit_pairs.sort_by_key(|&(_, target)| target);
 
-                let logical_width = bit_pairs
-                    .iter()
-                    .map(|&(_, target)| target)
-                    .max()
-                    .unwrap_or(0)
-                    + 1;
+                let logical_width = bit_pairs.iter().map(|&(_, target)| target).max().unwrap_or(0) + 1;
                 let low_inst_bit = bit_pairs.iter().map(|&(inst, _)| inst).min().unwrap_or(0);
 
                 let is_contiguous = bit_pairs.windows(2).all(|w| {
@@ -261,11 +253,7 @@ fn build_fragments(bit_pairs: &[(u8, u8)]) -> Vec<BuildFieldFragment> {
         if is_break {
             let (inst_bit, target_bit) = bit_pairs[run_start];
             let width = (i - run_start) as u8;
-            fragments.push(BuildFieldFragment {
-                inst_bit,
-                width,
-                target_bit,
-            });
+            fragments.push(BuildFieldFragment { inst_bit, width, target_bit });
             run_start = i;
         }
     }
