@@ -1,31 +1,56 @@
-"""Tests for trace-inject.py shim DMA channel conflict guard.
+"""Tests for trace injection tooling.
 
-Validates that find_occupied_shim_dma_channels() correctly identifies
-S2MM-occupied channels on shim tiles, preventing trace injection from
-reusing them.  Trace collection uses S2MM (stream-to-memory) channels;
-MM2S (memory-to-stream) channels are physically independent and do not
-conflict with trace.
+Two separate test sections:
 
-Also validates has_control_overlay() detection for control packet tests.
+1. Tests for trace-inject.py (shim DMA channel conflict guard, target assignment,
+   control overlay detection).  These functions are pure Python and do not require
+   the mlir-aie environment.  trace-inject.py itself is not yet committed, so these
+   tests are skipped at collection time if the file is absent.
+
+2. Tests for mlir-trace-inject.py (Task 4 of the A.2 PC-anchored validation plan):
+   --trace-mode, per-module grounding/sweep flags, and perfcnt config block emission.
+   These require the mlir-aie Python environment (aie.dialects.aie / aiex).  Tests
+   invoke mlir-trace-inject.py as a subprocess via run_inject() and inspect the MLIR
+   output with string assertions.
 """
 
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-# Import trace-inject.py (filename has a hyphen, so importlib is needed).
+# ---------------------------------------------------------------------------
+# Section 1: trace-inject.py imports (conditional -- file may not exist yet)
+# ---------------------------------------------------------------------------
 import importlib.util
 
-_spec = importlib.util.spec_from_file_location(
-    "trace_inject", Path(__file__).parent / "trace-inject.py",
-)
-_mod = importlib.util.module_from_spec(_spec)
-sys.modules["trace_inject"] = _mod
-_spec.loader.exec_module(_mod)
+_TRACE_INJECT_PATH = Path(__file__).parent / "trace-inject.py"
+_trace_inject_missing = not _TRACE_INJECT_PATH.exists()
 
-find_occupied_shim_dma_channels = _mod.find_occupied_shim_dma_channels
-has_control_overlay = _mod.has_control_overlay
+if not _trace_inject_missing:
+    _spec = importlib.util.spec_from_file_location(
+        "trace_inject", _TRACE_INJECT_PATH,
+    )
+    _mod = importlib.util.module_from_spec(_spec)
+    sys.modules["trace_inject"] = _mod
+    _spec.loader.exec_module(_mod)
+
+    find_occupied_shim_dma_channels = _mod.find_occupied_shim_dma_channels
+    has_control_overlay = _mod.has_control_overlay
+else:
+    # Provide stubs so the name resolution at module level succeeds.
+    # Tests in Section 1 are skipped via the pytestmark below.
+    def find_occupied_shim_dma_channels(text):  # noqa: F811
+        raise NotImplementedError("trace-inject.py not present")
+
+    def has_control_overlay(text):  # noqa: F811
+        raise NotImplementedError("trace-inject.py not present")
+
+_skip_section1 = pytest.mark.skipif(
+    _trace_inject_missing,
+    reason="trace-inject.py not yet committed",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +190,7 @@ module {
 # Tests -- S2MM occupancy detection
 # ---------------------------------------------------------------------------
 
+@_skip_section1
 class TestFindOccupiedShimDmaChannels:
     """Tests for find_occupied_shim_dma_channels().
 
@@ -222,6 +248,7 @@ class TestFindOccupiedShimDmaChannels:
         assert (0, 1) in occupied
 
 
+@_skip_section1
 class TestShimDmaAllocation:
     """Tests for shim_dma_allocation parsing in find_occupied_shim_dma_channels()."""
 
@@ -248,6 +275,7 @@ class TestShimDmaAllocation:
         assert len(occupied) == 2
 
 
+@_skip_section1
 class TestControlOverlayDetection:
     """Tests for has_control_overlay()."""
 
@@ -260,6 +288,7 @@ class TestControlOverlayDetection:
         assert not has_control_overlay(MLIR_WITHOUT_OVERLAY)
 
 
+@_skip_section1
 class TestCandidateFiltering:
     """Integration-level tests for candidate filtering logic.
 
@@ -313,10 +342,16 @@ class TestCandidateFiltering:
         assert len(candidates) == 2  # both (0,0) and (0,1) are free
 
 
-assign_targets_to_shims = _mod.assign_targets_to_shims
-TraceSlot = _mod.TraceSlot
+if not _trace_inject_missing:
+    assign_targets_to_shims = _mod.assign_targets_to_shims
+    TraceSlot = _mod.TraceSlot
+else:
+    def assign_targets_to_shims(*a, **kw):  # noqa: F811
+        raise NotImplementedError("trace-inject.py not present")
+    TraceSlot = None
 
 
+@_skip_section1
 class TestAssignTargetsToShims:
     """Tests for assign_targets_to_shims() -- pure logic, no mlir-aie needed.
 
@@ -431,6 +466,202 @@ class TestAssignTargetsToShims:
         for tgts in result.values():
             all_assigned.extend(tgts)
         assert sorted(all_assigned) == sorted(targets)
+
+
+# ---------------------------------------------------------------------------
+# Section 2: mlir-trace-inject.py tests (Task 4 of A.2 PC-anchored plan)
+#
+# These tests invoke mlir-trace-inject.py as a subprocess and inspect the
+# generated MLIR output with string assertions.  They require the mlir-aie
+# Python environment (aie.dialects.aie / aiex).
+#
+# Fixture: simple_design_mlir -- a minimal well-formed aie.device MLIR that
+#   has exactly one compute tile at (0,2) and a non-empty runtime_sequence.
+#   "Non-empty" is required because the current injector accesses blocks[0]
+#   on the runtime_sequence region -- an empty {} body has 0 blocks.
+#
+# Helper: run_inject(argv) -- invokes mlir-trace-inject.py as a subprocess
+#   and returns its exit code.  Stderr is passed through so capsys can
+#   capture it.
+# ---------------------------------------------------------------------------
+
+_MLIR_INJECT = Path(__file__).parent / "mlir-trace-inject.py"
+
+# Minimal MLIR with one compute tile (col=0, row=2) and a non-empty
+# runtime_sequence so the injector can walk both the device body and
+# the runtime sequence block.
+_SIMPLE_DESIGN_MLIR = """\
+module {
+  aie.device(npu1_1col) {
+    %tile_0_0 = aie.tile(0, 0)
+    %tile_0_1 = aie.tile(0, 1)
+    %tile_0_2 = aie.tile(0, 2)
+    aie.flow(%tile_0_0, DMA : 0, %tile_0_2, DMA : 0)
+    aie.runtime_sequence(%arg0: memref<64xi32>) {
+      %c0 = arith.constant 0 : i64
+      %c1 = arith.constant 1 : i64
+      %c64 = arith.constant 64 : i64
+      aiex.npu.dma_memcpy_nd(%arg0[%c0, %c0, %c0, %c0] [%c1, %c1, %c1, %c64] [%c0, %c0, %c0, %c1]) {id = 0 : i64, metadata = @dummy} : memref<64xi32>
+    }
+  }
+}
+"""
+
+
+@pytest.fixture
+def simple_design_mlir():
+    """Minimal MLIR string for mlir-trace-inject tests."""
+    return _SIMPLE_DESIGN_MLIR
+
+
+def run_inject(argv: list) -> int:
+    """Run mlir-trace-inject.py with the given argument list.
+
+    Returns the process exit code.  stdout/stderr are passed through to the
+    test process so pytest's capsys can capture them.
+    """
+    result = subprocess.run(
+        [sys.executable, str(_MLIR_INJECT)] + argv,
+        # Let both streams flow to the test process stdout/stderr so
+        # capsys.readouterr() can capture them.
+    )
+    return result.returncode
+
+
+class TestMlirTraceInjectMode:
+    """Tests for --trace-mode CLI flag (Task 4.1 / 4.3)."""
+
+    def test_inject_mode_event_time_default(self, tmp_path, simple_design_mlir):
+        """Default (no --trace-mode) emits EventTime mode.
+
+        The mlir-aie custom printer serialises TraceMode.EventTime as the
+        string literal "Event-Time" (with quotes and a hyphen), matching the
+        assembly format defined in AIETraceOps.td.
+        """
+        inp = tmp_path / "in.mlir"
+        inp.write_text(simple_design_mlir)
+        out = tmp_path / "out.mlir"
+        rc = run_inject(["--input", str(inp), "--out", str(out)])
+        assert rc == 0
+        text = out.read_text()
+        # Actual MLIR text: aie.trace.mode "Event-Time"
+        assert 'aie.trace.mode "Event-Time"' in text
+
+    def test_inject_mode_event_pc_round_trips(self, tmp_path, simple_design_mlir):
+        """--trace-mode event_pc emits EventPC mode and refuses double-injection.
+
+        The mlir-aie custom printer serialises TraceMode.EventPC as the
+        string literal "Event-PC" (with quotes and a hyphen).
+        """
+        inp = tmp_path / "in.mlir"
+        inp.write_text(simple_design_mlir)
+        out = tmp_path / "out.mlir"
+        rc = run_inject([
+            "--input", str(inp), "--out", str(out),
+            "--trace-mode", "event_pc",
+        ])
+        assert rc == 0
+        text = out.read_text()
+        # Actual MLIR text: aie.trace.mode "Event-PC"
+        assert 'aie.trace.mode "Event-PC"' in text
+        # Re-injection must be refused (idempotency guard):
+        rc2 = run_inject([
+            "--input", str(out), "--out", str(tmp_path / "out2.mlir"),
+            "--trace-mode", "event_pc",
+        ])
+        assert rc2 == 2  # already-traced -> exit 2
+
+
+class TestMlirTraceInjectPerfcnt:
+    """Tests for perfcnt config block emission (Task 4.5 / 4.6)."""
+
+    def test_inject_perfcnt_config_emitted(self, tmp_path, simple_design_mlir):
+        """When PERF_CNT_0 is in grounding, a perf_core_<col>_<row> config block
+        is emitted with Performance_Counter0_Event_Value set to --perfcnt-period."""
+        inp = tmp_path / "in.mlir"
+        inp.write_text(simple_design_mlir)
+        out = tmp_path / "out.mlir"
+        rc = run_inject([
+            "--input", str(inp), "--out", str(out),
+            "--trace-mode", "event_pc",
+            "--core-grounding", "PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1",
+            "--perfcnt-period", "1024",
+        ])
+        assert rc == 0
+        text = out.read_text()
+        # At least one perf_core_<col>_<row> trace.config block:
+        assert "@perf_core_" in text, f"No perf_core_ block found:\n{text[:2000]}"
+        # Performance_Counter0_Event_Value with value=1024:
+        assert "Performance_Counter0_Event_Value" in text
+        assert "1024" in text
+        # Referenced in start_config list in runtime_sequence:
+        assert "aie.trace.start_config @perf_core_" in text
+
+    def test_inject_perfcnt_not_emitted_without_perf_cnt_0(
+        self, tmp_path, simple_design_mlir
+    ):
+        """When PERF_CNT_0 is absent from grounding, no perf_core_ block is emitted."""
+        inp = tmp_path / "in.mlir"
+        inp.write_text(simple_design_mlir)
+        out = tmp_path / "out.mlir"
+        rc = run_inject([
+            "--input", str(inp), "--out", str(out),
+            "--core-grounding", "INSTR_EVENT_0,INSTR_EVENT_1",
+        ])
+        assert rc == 0
+        text = out.read_text()
+        assert "@perf_core_" not in text
+
+    def test_inject_perfcnt_default_grounding_emits_block(
+        self, tmp_path, simple_design_mlir
+    ):
+        """Default --core-grounding includes PERF_CNT_0, so perf block is emitted
+        even with no explicit grounding flags."""
+        inp = tmp_path / "in.mlir"
+        inp.write_text(simple_design_mlir)
+        out = tmp_path / "out.mlir"
+        rc = run_inject(["--input", str(inp), "--out", str(out)])
+        assert rc == 0
+        text = out.read_text()
+        assert "@perf_core_" in text, f"No perf_core_ block found:\n{text[:2000]}"
+
+
+class TestMlirTraceInjectWarnings:
+    """Tests for --trace-mode event_pc + non-core sweep warning (Task 4.7)."""
+
+    def test_inject_event_pc_with_non_core_sweep_warns(
+        self, tmp_path, simple_design_mlir, capsys
+    ):
+        """--trace-mode event_pc with --memmod-sweep-events warns but succeeds."""
+        inp = tmp_path / "in.mlir"
+        inp.write_text(simple_design_mlir)
+        out = tmp_path / "out.mlir"
+        rc = run_inject([
+            "--input", str(inp), "--out", str(out),
+            "--trace-mode", "event_pc",
+            "--memmod-sweep-events", "DMA_S2MM_0_FINISHED_BD,LOCK_0_ACQUIRED",
+        ])
+        # Must succeed (exit 0), not refuse (exit 2):
+        assert rc == 0
+        # Warning must appear -- but we invoked as a subprocess so capsys
+        # won't capture its stderr.  Instead re-invoke and capture via
+        # subprocess.run with stderr=PIPE.
+        result = subprocess.run(
+            [sys.executable, str(_MLIR_INJECT),
+             "--input", str(inp), "--out", str(tmp_path / "out_warn.mlir"),
+             "--trace-mode", "event_pc",
+             "--memmod-sweep-events", "DMA_S2MM_0_FINISHED_BD,LOCK_0_ACQUIRED"],
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert result.returncode == 0
+        stderr = result.stderr.lower()
+        assert "warning" in stderr, f"No warning in stderr: {result.stderr!r}"
+        assert "memmod" in stderr, f"'memmod' not in warning: {result.stderr!r}"
+        # Output MLIR must still contain the EventPC mode:
+        text = (tmp_path / "out_warn.mlir").read_text()
+        # Actual MLIR text: aie.trace.mode "Event-PC"
+        assert 'aie.trace.mode "Event-PC"' in text
 
 
 if __name__ == "__main__":

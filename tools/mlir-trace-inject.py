@@ -122,6 +122,48 @@ def parse_args():
     p.add_argument("--no-op", action="store_true",
                    help="parse and reserialize without injecting "
                         "(testing only -- skips injection)")
+
+    # Trace mode.
+    p.add_argument("--trace-mode", choices=("event_time", "event_pc"),
+                   default="event_time",
+                   help="trace mode for compute-core trace units. "
+                        "event_time (mode 0, default) records cycle deltas; "
+                        "event_pc (mode 1) records PCs. Mode 1 is core-only -- "
+                        "memmod/memtile/shim trace units always remain in mode 0 "
+                        "(their Trace_Control0 has no Mode bitfield per regdb).")
+
+    # Grounding events (fixed slots, always present, never overwritten by sweep).
+    p.add_argument("--core-grounding",
+                   default="PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1",
+                   help="comma-separated event names reserved in fixed slots "
+                        "of every compute-core trace unit. Default reserves "
+                        "perfcnt cycle clock + two software pin events.")
+    p.add_argument("--memmod-grounding", default="PERF_CNT_0",
+                   help="grounding events for compute-tile memmod trace unit.")
+    p.add_argument("--memtile-grounding", default="PERF_CNT_0",
+                   help="grounding events for memtile trace unit.")
+    p.add_argument("--shim-grounding", default="PERF_CNT_0",
+                   help="grounding events for shim PL trace unit.")
+
+    # Sweep events (rotated per batch; injection writes the initial pattern).
+    p.add_argument("--core-sweep-events", default=None,
+                   help="comma-separated event names to sweep on compute cores; "
+                        "'all' enumerates from the event header. Default uses "
+                        "the existing 5 hard-coded core defaults.")
+    p.add_argument("--memmod-sweep-events", default=None,
+                   help="comma-separated event names to sweep on compute memmod. "
+                        "Default: don't inject memmod trace.")
+    p.add_argument("--memtile-sweep-events", default=None,
+                   help="comma-separated event names to sweep on memtile. "
+                        "Default: don't inject memtile trace.")
+    p.add_argument("--shim-sweep-events", default=None,
+                   help="comma-separated event names to sweep on shim. "
+                        "Default: don't inject shim trace.")
+
+    p.add_argument("--perfcnt-period", type=int, default=1024,
+                   help="cycles between PERF_CNT_0_EVENT fires when grounding "
+                        "includes PERF_CNT_0 (default: 1024).")
+
     return p.parse_args()
 
 
@@ -143,17 +185,125 @@ def _has_trace_ops(operation) -> bool:
     return False
 
 
-def _inject_trace_ops(module, input_path: str, aied, buffer_size: int) -> int:
+def _resolve_events(
+    grounding: str,
+    sweep: str | None,
+    defaults: tuple[str, ...] | None,
+) -> list[str]:
+    """Combine grounding (fixed) + sweep (rotated) into up to 8 trace slots.
+
+    Grounding events fill the first slots; sweep events fill the remainder.
+    The returned list is de-duplicated (grounding wins) and capped at 8.
+
+    Args:
+        grounding: comma-separated event names that must always appear first.
+        sweep: comma-separated event names to fill remaining slots, or None to
+               use ``defaults``, or 'all' (reserved for future use -- treated
+               the same as None here since enumeration requires the event DB).
+        defaults: fallback sweep events when ``sweep`` is None; if also None,
+                  the module gets no sweep events (grounding only).
+
+    Returns:
+        Ordered list of up to 8 event name strings (grounding + sweep).
+    """
+    g = [s.strip() for s in grounding.split(",") if s.strip()]
+    if sweep is None or sweep == "all":
+        if defaults is None:
+            s_list = []
+        else:
+            s_list = list(defaults)
+    else:
+        s_list = [e.strip() for e in sweep.split(",") if e.strip()]
+
+    seen: set[str] = set(g)
+    final = list(g)
+    for ev in s_list:
+        if ev not in seen and len(final) < 8:
+            final.append(ev)
+            seen.add(ev)
+    return final
+
+
+def _emit_perfcnt_config(
+    aied,
+    tile_val,
+    module_type: str,
+    col: int,
+    row: int,
+    period: int,
+) -> str:
+    """Emit an aie.trace.config block that programs the performance counter.
+
+    The config block contains three aie.trace.reg ops:
+      Performance_Control0  Cnt0_Start_Event = 28 (ACTIVE -- core executing)
+      Performance_Control1  Cnt0_Reset_Event = 5  (PERF_CNT_0 -- self-reset on fire)
+      Performance_Counter0_Event_Value      = period (cycles between fires)
+
+    Hardware derivation:
+      - Start event 28 = ACTIVE per AM020/AM025; counts only while core executes.
+      - Reset event 5 = PERF_CNT_0_EVENT per AM020; free-running with self-reset.
+      - Period = user-specified via --perfcnt-period (default 1024).
+
+    Lowering: mlir-aie's AIEXInlineTraceConfig pass translates each trace.reg
+    into npu.write32 ops in the runtime sequence. No new dialect ops required.
+
+    Returns:
+        The symbol name of the emitted trace.config op.
+    """
+    from aie.ir import InsertionPoint, IntegerAttr, IntegerType
+
+    sym = f"perf_{module_type}_{col}_{row}"
+    i32 = IntegerType.get_signless(32)
+
+    def mk_i32(v: int):
+        return IntegerAttr.get(i32, v)
+
+    cfg = aied.trace_config(tile_val, sym)
+    cfg_region = cfg.operation.regions[0]
+    cfg_block = cfg_region.blocks.append()
+    with InsertionPoint.at_block_begin(cfg_block):
+        # Start counting on ACTIVE (event 28): core is executing.
+        # stop_event = 0 (no stop).
+        aied.trace_reg("Performance_Control0", mk_i32(28),
+                       field="Cnt0_Start_Event")
+        # Self-reset: when PERF_CNT_0 fires (event 5), zero the counter.
+        aied.trace_reg("Performance_Control1", mk_i32(5),
+                       field="Cnt0_Reset_Event")
+        # Counter threshold: fires every `period` active cycles.
+        aied.trace_reg("Performance_Counter0_Event_Value", mk_i32(period))
+        # Explicit terminator required by SingleBlockImplicitTerminator<EndOp>.
+        # The implicit-terminator mechanism only applies when the block is
+        # created by the MLIR parser; we create it manually, so we must add
+        # aie.end ourselves.
+        aied.end()
+
+    return sym
+
+
+def _inject_trace_ops(module, input_path: str, aied, args) -> int:
     """Walk module, find compute tiles (row >= 2), inject one aie.trace per tile,
     and prepend aie.trace.host_config + aie.trace.start_config ops to the
     aie.runtime_sequence body.
+
+    Args:
+        module: the parsed MLIR module
+        input_path: source file path (for error messages)
+        aied: aie.dialects.aie module (imported lazily)
+        args: argparse.Namespace with CLI flags:
+          - buffer_size: trace buffer size in bytes
+          - trace_mode: "event_time" or "event_pc"
+          - core_grounding, core_sweep_events
+          - memmod_grounding, memmod_sweep_events (not yet injected)
+          - memtile_grounding, memtile_sweep_events (not yet injected)
+          - shim_grounding, shim_sweep_events (not yet injected)
+          - perfcnt_period: PERF_CNT_0 firing period in cycles
 
     Compute tile classification for npu1 / npu1_1col:
       row 0  -- shim tile (NoC interface)
       row 1  -- memory tile (shared SRAM, no core)
       row >= 2 -- compute tile (VLIW core + vector unit)
 
-    Per-tile trace injection (Task 4):
+    Per-tile trace injection:
     Construction uses the decorator-form lowercase builder aied.trace(tile, sym),
     which matches how mlir-aie's own configure_trace() (python/utils/trace/setup.py)
     constructs these ops.  The decorator creates the TraceOp with a proper region
@@ -161,11 +311,19 @@ def _inject_trace_ops(module, input_path: str, aied, buffer_size: int) -> int:
     and returns the completed op -- identical to how aied.core() and aied.device()
     work.  This is Path A (direct Python binding constructors).
 
-    Runtime sequence injection (Task 5):
+    Perfcnt config blocks:
+    When PERF_CNT_0 is in the core grounding set, one aie.trace.config block is
+    emitted per compute tile alongside the aie.trace block.  The config block
+    programs Performance_Control0/1 and Performance_Counter0_Event_Value so the
+    hardware counter free-runs at args.perfcnt_period cycles.
+    mlir-aie's AIEXInlineTraceConfig pass lowers each trace.reg to npu.write32.
+
+    Runtime sequence injection:
     After the per-tile traces are inserted, we find aie.runtime_sequence and
     prepend two classes of ops at block-begin (before any existing runtime ops):
       aie.trace.host_config buffer_size = <N>
       aie.trace.start_config @trace_t{col}_{row}   (one per compute tile)
+      aie.trace.start_config @perf_core_{col}_{row} (one per perfcnt block)
     This mirrors mlir-aie's own configure_trace() in python/utils/trace/setup.py
     (lines 534-542).  mlir-aie's AIEInsertTraceFlows pass then lowers these
     declarative ops to register-write sequences during aiecc.py compilation.
@@ -218,6 +376,33 @@ def _inject_trace_ops(module, input_path: str, aied, buffer_size: int) -> int:
         )
         return 0
 
+    # Resolve per-module-type event lists from CLI args.
+    # _resolve_events(grounding, sweep, defaults) -> list of up to 8 event names.
+    #
+    # Core defaults: the 5 sweep events from _TRACE_DEFAULT_CORE_EVENTS that are
+    # NOT in the default grounding set (PERF_CNT_0, INSTR_EVENT_0, INSTR_EVENT_1).
+    _DEFAULT_GROUNDING_NAMES = {"PERF_CNT_0", "INSTR_EVENT_0", "INSTR_EVENT_1"}
+    _core_sweep_defaults = tuple(
+        e for e in _TRACE_DEFAULT_CORE_EVENTS if e not in _DEFAULT_GROUNDING_NAMES
+    )
+
+    core_events = _resolve_events(
+        args.core_grounding,
+        args.core_sweep_events,
+        _core_sweep_defaults,
+    )
+    # Determine trace mode attribute for core tiles.
+    mode_attr = (
+        aied.TraceMode.EventPC
+        if args.trace_mode == "event_pc"
+        else aied.TraceMode.EventTime
+    )
+    # Whether to emit perf counter config blocks (only when PERF_CNT_0 is in grounding).
+    core_grounding_names = {
+        s.strip() for s in args.core_grounding.split(",") if s.strip()
+    }
+    emit_core_perfcnt = "PERF_CNT_0" in core_grounding_names
+
     # Inject into every device that has a runtime_sequence. Each device gets
     # its own set of trace decls for its own compute tiles, and its own
     # runtime-sequence prologue (host_config + one start_config per tile).
@@ -251,8 +436,14 @@ def _inject_trace_ops(module, input_path: str, aied, buffer_size: int) -> int:
             return 1
         terminator = ops_list[-1]
 
+        # Track perfcnt config symbols so we can add trace_start_config for them.
+        perf_syms: list[str] = []
+
         with InsertionPoint(terminator.operation):
             for col, row, tile_val in compute_tiles:
+                # Capture loop variables for the decorator closure.
+                _events = core_events
+                _mode = mode_attr
                 # The @aied.trace(tile, sym) decorator-form builder:
                 #   1. Constructs TraceOp(tile=tile_val, sym_name=sym_name)
                 #   2. Appends a block to the op's single region
@@ -264,14 +455,25 @@ def _inject_trace_ops(module, input_path: str, aied, buffer_size: int) -> int:
                 # loop iteration reassigns the name, so redefinition is safe.
                 @aied.trace(tile_val, _trace_sym(col, row))
                 def _trace_body():  # noqa: F811 -- redefinition is intentional (one per tile)
-                    aied.trace_mode(aied.TraceMode.EventTime)
+                    aied.trace_mode(_mode)
                     # packet id is the conventional starting id; AIEInsertTraceFlows
                     # reassigns ids when it lowers the declarative ops.
                     aied.trace_packet(_TRACE_PACKET_ID_START, aied.TracePacketType.Core)
-                    for event_name in _TRACE_DEFAULT_CORE_EVENTS:
+                    for event_name in _events:
                         aied.trace_event(event_name)
                     aied.trace_start(broadcast=_TRACE_BROADCAST_START)
                     aied.trace_stop(broadcast=_TRACE_BROADCAST_STOP)
+
+                # Emit perfcnt config block alongside the trace op, if grounding
+                # includes PERF_CNT_0.  The block programs Performance_Control0/1
+                # and Performance_Counter0_Event_Value so the counter free-runs at
+                # the requested period.  mlir-aie's AIEXInlineTraceConfig pass
+                # lowers each trace.reg into npu.write32 at runtime-sequence emit.
+                if emit_core_perfcnt:
+                    sym = _emit_perfcnt_config(
+                        aied, tile_val, "core", col, row, args.perfcnt_period
+                    )
+                    perf_syms.append(sym)
 
         rs_block = rs_op.operation.regions[0].blocks[0]
         with InsertionPoint.at_block_begin(rs_block):
@@ -280,19 +482,43 @@ def _inject_trace_ops(module, input_path: str, aied, buffer_size: int) -> int:
             # Signature: trace_host_config(buffer_size, *, arg_idx=4,
             #                              routing=TraceShimRouting.Single, ...)
             # Mirror of mlir-aie python/utils/trace/setup.py line 534.
-            aied.trace_host_config(buffer_size=buffer_size)
+            aied.trace_host_config(buffer_size=args.buffer_size)
             # trace_start_config(name) emits:
             #   aie.trace.start_config @<name>
-            # One per compute tile, matching the trace decl symbols inserted above.
+            # One per compute tile trace decl, then one per perfcnt config block.
             # Mirror of mlir-aie python/utils/trace/setup.py line 542.
             for col, row, _ in compute_tiles:
                 aied.trace_start_config(_trace_sym(col, row))
+            for sym in perf_syms:
+                aied.trace_start_config(sym)
 
     return 0
 
 
 def main():
     args = parse_args()
+
+    # Warn when --trace-mode event_pc is combined with non-core sweep events.
+    # The Mode bitfield exists only in the core tile's Trace_Control0 register
+    # (per the AM025 register database); memmod, memtile, and shim trace units
+    # have no Mode field and always operate in event_time (mode 0). This is a
+    # portability warning: the non-core events will be recorded, just in mode 0.
+    if args.trace_mode == "event_pc" and any(
+        s for s in [
+            args.memmod_sweep_events,
+            args.memtile_sweep_events,
+            args.shim_sweep_events,
+        ]
+        if s
+    ):
+        print(
+            "warning: --trace-mode event_pc applies to compute-core trace units "
+            "only; memmod/memtile/shim trace units stay in event_time per regdb "
+            "(Mode bitfield exists only in core's Trace_Control0). Non-core "
+            "sweep events will be recorded in mode 0.",
+            file=sys.stderr,
+        )
+
     text = Path(args.input).read_text()
     # Import here so --help works without the mlir-aie env activated.
     # Importing aiex (before creating a Context) triggers the module-level
@@ -312,7 +538,7 @@ def main():
                     file=sys.stderr,
                 )
                 return 2
-            rc = _inject_trace_ops(module, args.input, aied, args.buffer_size)
+            rc = _inject_trace_ops(module, args.input, aied, args)
             if rc != 0:
                 return rc
         buf = io.StringIO()
