@@ -122,9 +122,7 @@ impl DeviceState {
         println!();
         println!("Configured Tiles:");
         for tile in self.array.iter() {
-            let has_code = tile.program_memory()
-                .map(|pm| pm.iter().any(|&b| b != 0))
-                .unwrap_or(false);
+            let has_code = tile.program_memory().map(|pm| pm.iter().any(|&b| b != 0)).unwrap_or(false);
             let has_locks = tile.locks.iter().any(|l| l.value != 0);
             let has_bds = tile.dma_bds.iter().any(|bd| bd.is_valid());
 
@@ -156,12 +154,9 @@ impl DeviceState {
 
     /// Get count of tiles with program code.
     pub fn tiles_with_code(&self) -> usize {
-        self.array.compute_tiles()
-            .filter(|t| {
-                t.program_memory()
-                    .map(|pm| pm.iter().any(|&b| b != 0))
-                    .unwrap_or(false)
-            })
+        self.array
+            .compute_tiles()
+            .filter(|t| t.program_memory().map(|pm| pm.iter().any(|&b| b != 0)).unwrap_or(false))
             .count()
     }
 

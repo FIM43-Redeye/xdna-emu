@@ -64,8 +64,14 @@ impl DeviceState {
             CdoRaw::Write { address, value } => {
                 self.stats.writes += 1;
                 let tile_addr = TileAddress::decode(*address);
-                log::trace!("CDO Write: addr=0x{:08X} -> tile({},{}) offset=0x{:05X} value=0x{:08X}",
-                    address, tile_addr.col, tile_addr.row, tile_addr.offset, value);
+                log::trace!(
+                    "CDO Write: addr=0x{:08X} -> tile({},{}) offset=0x{:05X} value=0x{:08X}",
+                    address,
+                    tile_addr.col,
+                    tile_addr.row,
+                    tile_addr.offset,
+                    value
+                );
             }
             CdoRaw::MaskWrite { address, mask, value } => {
                 self.stats.mask_writes += 1;
@@ -77,22 +83,40 @@ impl DeviceState {
                 self.stats.writes += 1;
                 let addr32 = *address as u32;
                 let tile_addr = TileAddress::decode(addr32);
-                log::trace!("CDO Write64: addr=0x{:016X} -> tile({},{}) offset=0x{:05X} value=0x{:08X}",
-                    address, tile_addr.col, tile_addr.row, tile_addr.offset, value);
+                log::trace!(
+                    "CDO Write64: addr=0x{:016X} -> tile({},{}) offset=0x{:05X} value=0x{:08X}",
+                    address,
+                    tile_addr.col,
+                    tile_addr.row,
+                    tile_addr.offset,
+                    value
+                );
             }
             CdoRaw::MaskWrite64 { address, mask: _, value: _ } => {
                 self.stats.mask_writes += 1;
                 let addr32 = *address as u32;
                 let tile_addr = TileAddress::decode(addr32);
-                log::trace!("CDO MaskWrite64: addr=0x{:016X} -> tile({},{}) offset=0x{:05X}",
-                    address, tile_addr.col, tile_addr.row, tile_addr.offset);
+                log::trace!(
+                    "CDO MaskWrite64: addr=0x{:016X} -> tile({},{}) offset=0x{:05X}",
+                    address,
+                    tile_addr.col,
+                    tile_addr.row,
+                    tile_addr.offset
+                );
             }
             CdoRaw::DmaWrite { address, data } => {
                 self.stats.dma_writes += 1;
                 let tile_addr = TileAddress::decode(*address);
                 let subsystem = subsystem_from_offset(tile_addr.offset, tile_kind_from_row(tile_addr.row));
-                log::debug!("CDO DmaWrite: addr=0x{:08X} -> tile({},{}) offset=0x{:05X} subsystem={:?} len={}",
-                    address, tile_addr.col, tile_addr.row, tile_addr.offset, subsystem, data.len());
+                log::debug!(
+                    "CDO DmaWrite: addr=0x{:08X} -> tile({},{}) offset=0x{:05X} subsystem={:?} len={}",
+                    address,
+                    tile_addr.col,
+                    tile_addr.row,
+                    tile_addr.offset,
+                    subsystem,
+                    data.len()
+                );
             }
             CdoRaw::MaskPoll { .. } | CdoRaw::MaskPoll64 { .. } => {
                 log::trace!("CDO MaskPoll: skipped (emulator writes are synchronous)");
@@ -210,18 +234,12 @@ fn encode_addr(tile: TileAddr, offset: u32) -> u32 {
 /// detected tile kind. The lowering side never produces such
 /// combinations (it derives them by matching valid offsets), so
 /// this branch is defensive: an error here means an upstream bug.
-fn start_queue_offset(
-    row: u8,
-    channel: u8,
-    dir: xdna_archspec::types::DmaDirection,
-) -> Result<u32> {
+fn start_queue_offset(row: u8, channel: u8, dir: xdna_archspec::types::DmaDirection) -> Result<u32> {
     use xdna_archspec::aie2::registers::dma::{
-        COMPUTE_DMA_MM2S_0_START_QUEUE, COMPUTE_DMA_MM2S_1_START_QUEUE,
-        COMPUTE_DMA_S2MM_0_START_QUEUE, COMPUTE_DMA_S2MM_1_START_QUEUE,
-        MEMTILE_CHANNELS_PER_DIR, MEMTILE_CHANNEL_STRIDE,
-        MEMTILE_DMA_MM2S_0_START_QUEUE, MEMTILE_DMA_S2MM_0_START_QUEUE,
-        SHIM_CHANNELS_PER_DIR, SHIM_CHANNEL_STRIDE,
-        SHIM_DMA_MM2S_0_TASK_QUEUE, SHIM_DMA_S2MM_0_TASK_QUEUE,
+        COMPUTE_DMA_MM2S_0_START_QUEUE, COMPUTE_DMA_MM2S_1_START_QUEUE, COMPUTE_DMA_S2MM_0_START_QUEUE,
+        COMPUTE_DMA_S2MM_1_START_QUEUE, MEMTILE_CHANNELS_PER_DIR, MEMTILE_CHANNEL_STRIDE,
+        MEMTILE_DMA_MM2S_0_START_QUEUE, MEMTILE_DMA_S2MM_0_START_QUEUE, SHIM_CHANNELS_PER_DIR,
+        SHIM_CHANNEL_STRIDE, SHIM_DMA_MM2S_0_TASK_QUEUE, SHIM_DMA_S2MM_0_TASK_QUEUE,
     };
     use xdna_archspec::types::DmaDirection;
 
@@ -231,16 +249,16 @@ fn start_queue_offset(
             (DmaDirection::S2mm, 1) => Ok(COMPUTE_DMA_S2MM_1_START_QUEUE),
             (DmaDirection::Mm2s, 0) => Ok(COMPUTE_DMA_MM2S_0_START_QUEUE),
             (DmaDirection::Mm2s, 1) => Ok(COMPUTE_DMA_MM2S_1_START_QUEUE),
-            _ => anyhow::bail!(
-                "start_queue_offset: invalid compute DMA channel dir={:?} ch={}",
-                dir, channel
-            ),
+            _ => {
+                anyhow::bail!("start_queue_offset: invalid compute DMA channel dir={:?} ch={}", dir, channel)
+            }
         },
         TileKind::Mem => {
             if channel >= MEMTILE_CHANNELS_PER_DIR {
                 anyhow::bail!(
                     "start_queue_offset: memtile channel {} >= {}",
-                    channel, MEMTILE_CHANNELS_PER_DIR
+                    channel,
+                    MEMTILE_CHANNELS_PER_DIR
                 );
             }
             let base = match dir {
@@ -254,10 +272,7 @@ fn start_queue_offset(
             // ShimPl is matched here for enum exhaustiveness so the helper
             // stays correct if the row->kind classification ever changes.
             if channel >= SHIM_CHANNELS_PER_DIR {
-                anyhow::bail!(
-                    "start_queue_offset: shim channel {} >= {}",
-                    channel, SHIM_CHANNELS_PER_DIR
-                );
+                anyhow::bail!("start_queue_offset: shim channel {} >= {}", channel, SHIM_CHANNELS_PER_DIR);
             }
             let base = match dir {
                 DmaDirection::S2mm => SHIM_DMA_S2MM_0_TASK_QUEUE,

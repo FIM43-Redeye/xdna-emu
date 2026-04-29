@@ -53,8 +53,14 @@ impl DeviceState {
             let signed = crate::device::arch_handle::lock_value_layout().sign_extend(value);
             tile.locks[lock_idx].set(signed);
             if value != 0 {
-                log::info!("CDO init {} lock {} on tile ({},{}) = {}",
-                    tile_kind, lock_idx, tile_addr.col, tile_addr.row, signed);
+                log::info!(
+                    "CDO init {} lock {} on tile ({},{}) = {}",
+                    tile_kind,
+                    lock_idx,
+                    tile_addr.col,
+                    tile_addr.row,
+                    signed
+                );
             }
         }
     }
@@ -91,8 +97,14 @@ impl DeviceState {
             })
             .collect();
 
-        log::debug!("dma_write_bd_data tile({},{}) offset=0x{:05X} data_len={} words={:X?}",
-            col, row, offset, data.len(), words);
+        log::debug!(
+            "dma_write_bd_data tile({},{}) offset=0x{:05X} data_len={} words={:X?}",
+            col,
+            row,
+            offset,
+            data.len(),
+            words
+        );
 
         for (i, &word) in words.iter().enumerate() {
             let reg_offset = offset + (i as u32) * 4;
@@ -114,7 +126,9 @@ impl DeviceState {
         // Shim and compute share the same BD base and stride, but shim uses
         // 8 words per BD while compute uses 6.
         let (bd_base, bd_stride, max_words) = match tile_kind {
-            TileKind::ShimNoc | TileKind::ShimPl => (reg_layout.shim_bd_base, reg_layout.shim_bd_stride, reg_layout.shim_bd_words),
+            TileKind::ShimNoc | TileKind::ShimPl => {
+                (reg_layout.shim_bd_base, reg_layout.shim_bd_stride, reg_layout.shim_bd_words)
+            }
             _ => (reg_layout.memory_bd_base, reg_layout.memory_bd_stride, reg_layout.memory_bd_words),
         };
 
@@ -155,8 +169,7 @@ impl DeviceState {
             dma.mark_bd_dirty(bd_idx as u8);
         }
 
-        log::trace!("  BD {} word {} = 0x{:08X} tile({},{}) marked dirty",
-            bd_idx, word, value, col, row);
+        log::trace!("  BD {} word {} = 0x{:08X} tile({},{}) marked dirty", bd_idx, word, value, col, row);
     }
 
     /// Write to a compute-tile DMA channel register.
@@ -236,12 +249,7 @@ impl DeviceState {
                 };
                 let compress_en = if is_s2mm { false } else { compression_enable };
 
-                dma.set_channel_compression_config(
-                    ch_idx as u8,
-                    compress_en,
-                    decompression_en,
-                    ooo_en,
-                );
+                dma.set_channel_compression_config(ch_idx as u8, compress_en, decompression_en, ooo_en);
             }
         }
 
@@ -253,7 +261,9 @@ impl DeviceState {
 
             // Read controller_id and fot_mode from the tile's channel state
             // (which was set earlier when the control register was written)
-            let (controller_id, fot_mode) = self.array.get(col, row)
+            let (controller_id, fot_mode) = self
+                .array
+                .get(col, row)
                 .map(|t| {
                     let dma_ch = &t.dma_channels[ch_idx];
                     (dma_ch.controller_id, dma_ch.fot_mode)
@@ -274,14 +284,23 @@ impl DeviceState {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, enable_token_issue) {
                     log::warn!(
                         "DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
-                        col, row, ch_idx, bd_idx,
+                        col,
+                        row,
+                        ch_idx,
+                        bd_idx,
                     );
                 } else if enable_token_issue {
                     log::debug!("CDO enqueued DMA channel {} BD {} repeat={} token_issue=true controller_id={} on tile ({},{})",
                         ch_idx, bd_idx, repeat_count, controller_id, col, row);
                 } else {
-                    log::info!("CDO enqueued DMA channel {} BD {} repeat={} on tile ({},{})",
-                        ch_idx, bd_idx, repeat_count, col, row);
+                    log::info!(
+                        "CDO enqueued DMA channel {} BD {} repeat={} on tile ({},{})",
+                        ch_idx,
+                        bd_idx,
+                        repeat_count,
+                        col,
+                        row
+                    );
                 }
             }
         }
@@ -343,11 +362,20 @@ impl DeviceState {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     log::warn!(
                         "DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
-                        col, row, ch_idx, bd_idx,
+                        col,
+                        row,
+                        ch_idx,
+                        bd_idx,
                     );
                 } else {
-                    log::info!("CDO enqueued DMA channel {} BD {} repeat={} on tile ({},{})",
-                        ch_idx, bd_idx, repeat_count, col, row);
+                    log::info!(
+                        "CDO enqueued DMA channel {} BD {} repeat={} on tile ({},{})",
+                        ch_idx,
+                        bd_idx,
+                        repeat_count,
+                        col,
+                        row
+                    );
                 }
             }
         }
@@ -417,7 +445,9 @@ impl DeviceState {
             let bd_idx = lay.start_bd_id.extract(value) as u8;
             let repeat_count = lay.repeat_count.extract(value) as u8;
 
-            let (controller_id, fot_mode) = self.array.get(col, row)
+            let (controller_id, fot_mode) = self
+                .array
+                .get(col, row)
                 .map(|t| {
                     let dma_ch = &t.dma_channels[ch_idx];
                     (dma_ch.controller_id, dma_ch.fot_mode)
@@ -433,18 +463,34 @@ impl DeviceState {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, enable_token_issue) {
                     log::warn!(
                         "Shim DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
-                        col, row, ch_idx, bd_idx,
+                        col,
+                        row,
+                        ch_idx,
+                        bd_idx,
                     );
                 } else {
-                    log::info!("CDO enqueued Shim DMA channel {} BD {} repeat={} on tile ({},{})",
-                        ch_idx, bd_idx, repeat_count, col, row);
+                    log::info!(
+                        "CDO enqueued Shim DMA channel {} BD {} repeat={} on tile ({},{})",
+                        ch_idx,
+                        bd_idx,
+                        repeat_count,
+                        col,
+                        row
+                    );
                 }
             }
         }
     }
 
     /// Masked write to a shim DMA channel register.
-    pub(super) fn mask_write_shim_dma_channel(&mut self, col: u8, row: u8, offset: u32, mask: u32, value: u32) {
+    pub(super) fn mask_write_shim_dma_channel(
+        &mut self,
+        col: u8,
+        row: u8,
+        offset: u32,
+        mask: u32,
+        value: u32,
+    ) {
         let reg_layout = regdb::device_reg_layout();
         let lay = &reg_layout.memory_channel; // Same bit layout as compute
         let rel = offset - reg_layout.shim_channel_base;
@@ -479,11 +525,20 @@ impl DeviceState {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     log::warn!(
                         "Shim DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
-                        col, row, ch_idx, bd_idx,
+                        col,
+                        row,
+                        ch_idx,
+                        bd_idx,
                     );
                 } else {
-                    log::info!("CDO enqueued Shim DMA channel {} BD {} repeat={} on tile ({},{})",
-                        ch_idx, bd_idx, repeat_count, col, row);
+                    log::info!(
+                        "CDO enqueued Shim DMA channel {} BD {} repeat={} on tile ({},{})",
+                        ch_idx,
+                        bd_idx,
+                        repeat_count,
+                        col,
+                        row
+                    );
                 }
             }
         }
@@ -513,8 +568,12 @@ impl DeviceState {
                 tile.core.control = value;
                 tile.core.enabled = value & 1 != 0;
                 if tile.core.enabled != was_enabled {
-                    log::info!("Core ({},{}) {}", col, row,
-                        if tile.core.enabled { "ENABLED" } else { "DISABLED" });
+                    log::info!(
+                        "Core ({},{}) {}",
+                        col,
+                        row,
+                        if tile.core.enabled { "ENABLED" } else { "DISABLED" }
+                    );
                     self.pending_core_enables.push((col, row, tile.core.enabled));
                 }
             }
@@ -532,8 +591,16 @@ impl DeviceState {
             }
             CORE_PROCESSOR_BUS => {
                 tile.processor_bus_enabled = value & 1 != 0;
-                log::info!("Core ({},{}) processor bus {}",
-                    col, row, if tile.processor_bus_enabled { "ENABLED" } else { "DISABLED" });
+                log::info!(
+                    "Core ({},{}) processor bus {}",
+                    col,
+                    row,
+                    if tile.processor_bus_enabled {
+                        "ENABLED"
+                    } else {
+                        "DISABLED"
+                    }
+                );
             }
             _ => {}
         }
@@ -555,8 +622,12 @@ impl DeviceState {
                 tile.core.control = (tile.core.control & !mask) | (value & mask);
                 tile.core.enabled = tile.core.control & 1 != 0;
                 if tile.core.enabled != was_enabled {
-                    log::info!("Core ({},{}) {}", col, row,
-                        if tile.core.enabled { "ENABLED" } else { "DISABLED" });
+                    log::info!(
+                        "Core ({},{}) {}",
+                        col,
+                        row,
+                        if tile.core.enabled { "ENABLED" } else { "DISABLED" }
+                    );
                     self.pending_core_enables.push((col, row, tile.core.enabled));
                 }
             }
@@ -566,8 +637,16 @@ impl DeviceState {
             CORE_PROCESSOR_BUS => {
                 let masked = (value & mask) | (if tile.processor_bus_enabled { 1 } else { 0 } & !mask);
                 tile.processor_bus_enabled = masked & 1 != 0;
-                log::info!("Core ({},{}) processor bus {}",
-                    col, row, if tile.processor_bus_enabled { "ENABLED" } else { "DISABLED" });
+                log::info!(
+                    "Core ({},{}) processor bus {}",
+                    col,
+                    row,
+                    if tile.processor_bus_enabled {
+                        "ENABLED"
+                    } else {
+                        "DISABLED"
+                    }
+                );
             }
             _ => {
                 // For other registers, do full write
@@ -601,7 +680,9 @@ impl DeviceState {
 
                     if packet_enable {
                         // Packet mode: routing is done by arbiter/msel, not circuit route
-                        let (dh, arb, msel) = tile.stream_switch.master_packet_cfg(port)
+                        let (dh, arb, msel) = tile
+                            .stream_switch
+                            .master_packet_cfg(port)
                             .map_or((false, 0, 0), |c| (c.drop_header, c.arbiter, c.msel_enable));
                         log::info!("Tile ({},{}) stream switch: master[{}] packet mode = 0x{:08X} (drop_hdr={} arb={} msel_en=0b{:04b})",
                             col, row, port, value, dh, arb, msel);
@@ -630,8 +711,12 @@ impl DeviceState {
                     tile.stream_switch.slaves[port].packet_enable = packet_enable;
 
                     if packet_enable {
-                        log::info!("Tile ({},{}) stream switch: slave[{}] packet mode enabled",
-                            col, row, port);
+                        log::info!(
+                            "Tile ({},{}) stream switch: slave[{}] packet mode enabled",
+                            col,
+                            row,
+                            port
+                        );
                     }
                 }
             }
@@ -643,8 +728,14 @@ impl DeviceState {
 
             if let Some(tile) = self.array.get_mut(col, row) {
                 tile.stream_switch.configure_slave_slot(slave_port, slot, value);
-                log::info!("Tile ({},{}) stream switch: slave[{}] slot[{}] = 0x{:08X}",
-                    col, row, slave_port, slot, value);
+                log::info!(
+                    "Tile ({},{}) stream switch: slave[{}] slot[{}] = 0x{:08X}",
+                    col,
+                    row,
+                    slave_port,
+                    slot,
+                    value
+                );
             }
         }
     }

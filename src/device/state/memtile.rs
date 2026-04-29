@@ -63,8 +63,13 @@ impl DeviceState {
             dma.mark_bd_dirty(bd_idx as u8);
         }
 
-        log::trace!("  MemTile BD {} word {} tile({},{}) marked dirty (deferred parse)",
-            bd_idx, word, col, row);
+        log::trace!(
+            "  MemTile BD {} word {} tile({},{}) marked dirty (deferred parse)",
+            bd_idx,
+            word,
+            col,
+            row
+        );
     }
 
     /// Parse MemTile BD words into a BdConfig using the data-driven parser.
@@ -95,10 +100,11 @@ impl DeviceState {
     pub(crate) fn reparse_dirty_bd(&mut self, col: u8, row: u8, bd_idx: usize) {
         use crate::device::dma::bd::BufferDescriptor;
 
-        let is_dirty = self.array.dma_engine(col, row)
+        let is_dirty = self
+            .array
+            .dma_engine(col, row)
             .map_or(false, |dma| dma.is_bd_dirty(bd_idx as u8));
-        log::debug!("reparse_dirty_bd: tile({},{}) BD {} is_dirty={}",
-            col, row, bd_idx, is_dirty);
+        log::debug!("reparse_dirty_bd: tile({},{}) BD {} is_dirty={}", col, row, bd_idx, is_dirty);
         if !is_dirty {
             return;
         }
@@ -106,57 +112,65 @@ impl DeviceState {
         let tile_kind = self.array.arch().tile_kind(col, row);
         let reg_layout = regdb::device_reg_layout();
 
-        let bd_config = self.array.get(col, row).map(|tile| {
-            if bd_idx >= tile.dma_bds.len() {
-                return None;
-            }
-            let bd = &tile.dma_bds[bd_idx];
+        let bd_config = self
+            .array
+            .get(col, row)
+            .map(|tile| {
+                if bd_idx >= tile.dma_bds.len() {
+                    return None;
+                }
+                let bd = &tile.dma_bds[bd_idx];
 
-            match tile_kind {
-                TileKind::Mem => {
-                    let w6_off = reg_layout.memtile_bd_base
-                        + (bd_idx as u32) * reg_layout.memtile_bd_stride + 24;
-                    let w7_off = reg_layout.memtile_bd_base
-                        + (bd_idx as u32) * reg_layout.memtile_bd_stride + 28;
-                    let w6 = *tile.registers_ref().get(&w6_off).unwrap_or(&0);
-                    let w7 = *tile.registers_ref().get(&w7_off).unwrap_or(&0);
-                    let words = [bd.addr_low, bd.addr_high, bd.length,
-                                 bd.control, bd.d0, bd.d1, w6, w7];
-                    Some(self.parse_memtile_bd_from_words(&words))
-                }
-                TileKind::ShimNoc | TileKind::ShimPl => {
-                    let w6_off = reg_layout.shim_bd_base
-                        + (bd_idx as u32) * reg_layout.shim_bd_stride + 24;
-                    let w7_off = reg_layout.shim_bd_base
-                        + (bd_idx as u32) * reg_layout.shim_bd_stride + 28;
-                    let w6 = *tile.registers_ref().get(&w6_off).unwrap_or(&0);
-                    let w7 = *tile.registers_ref().get(&w7_off).unwrap_or(&0);
-                    let words = [bd.addr_low, bd.addr_high, bd.length,
-                                 bd.control, bd.d0, bd.d1, w6, w7];
-                    let parsed = BufferDescriptor::from_registers(&words, TileKind::ShimNoc);
-                    let mut config = parsed.to_bd_config();
-                    if !config.valid && words.iter().any(|&w| w != 0) {
-                        config.valid = true;
+                match tile_kind {
+                    TileKind::Mem => {
+                        let w6_off =
+                            reg_layout.memtile_bd_base + (bd_idx as u32) * reg_layout.memtile_bd_stride + 24;
+                        let w7_off =
+                            reg_layout.memtile_bd_base + (bd_idx as u32) * reg_layout.memtile_bd_stride + 28;
+                        let w6 = *tile.registers_ref().get(&w6_off).unwrap_or(&0);
+                        let w7 = *tile.registers_ref().get(&w7_off).unwrap_or(&0);
+                        let words = [bd.addr_low, bd.addr_high, bd.length, bd.control, bd.d0, bd.d1, w6, w7];
+                        Some(self.parse_memtile_bd_from_words(&words))
                     }
-                    Some(config)
-                }
-                _ => {
-                    // Compute tile: 6 words
-                    let words = [bd.addr_low, bd.addr_high, bd.length,
-                                 bd.control, bd.d0, bd.d1];
-                    let parsed = BufferDescriptor::from_registers(&words, TileKind::Compute);
-                    let mut config = parsed.to_bd_config();
-                    if !config.valid && words.iter().any(|&w| w != 0) {
-                        config.valid = true;
+                    TileKind::ShimNoc | TileKind::ShimPl => {
+                        let w6_off =
+                            reg_layout.shim_bd_base + (bd_idx as u32) * reg_layout.shim_bd_stride + 24;
+                        let w7_off =
+                            reg_layout.shim_bd_base + (bd_idx as u32) * reg_layout.shim_bd_stride + 28;
+                        let w6 = *tile.registers_ref().get(&w6_off).unwrap_or(&0);
+                        let w7 = *tile.registers_ref().get(&w7_off).unwrap_or(&0);
+                        let words = [bd.addr_low, bd.addr_high, bd.length, bd.control, bd.d0, bd.d1, w6, w7];
+                        let parsed = BufferDescriptor::from_registers(&words, TileKind::ShimNoc);
+                        let mut config = parsed.to_bd_config();
+                        if !config.valid && words.iter().any(|&w| w != 0) {
+                            config.valid = true;
+                        }
+                        Some(config)
                     }
-                    Some(config)
+                    _ => {
+                        // Compute tile: 6 words
+                        let words = [bd.addr_low, bd.addr_high, bd.length, bd.control, bd.d0, bd.d1];
+                        let parsed = BufferDescriptor::from_registers(&words, TileKind::Compute);
+                        let mut config = parsed.to_bd_config();
+                        if !config.valid && words.iter().any(|&w| w != 0) {
+                            config.valid = true;
+                        }
+                        Some(config)
+                    }
                 }
-            }
-        }).flatten();
+            })
+            .flatten();
 
         if let Some(config) = bd_config {
-            log::debug!("Re-parsed dirty BD {} on tile ({},{}) addr=0x{:X} len={} valid={}",
-                bd_idx, col, row, config.base_addr, config.length, config.valid);
+            log::debug!(
+                "Re-parsed dirty BD {} on tile ({},{}) addr=0x{:X} len={} valid={}",
+                bd_idx,
+                col,
+                row,
+                config.base_addr,
+                config.length,
+                config.valid
+            );
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 // configure_bd automatically clears the dirty flag
                 let _ = dma.configure_bd(bd_idx as u8, config);
@@ -171,8 +185,7 @@ impl DeviceState {
     /// BD. Without this, chained BDs (e.g., BD0->BD1 for double buffering)
     /// remain unconfigured and cause BdNotValid errors at chain time.
     pub(super) fn reparse_all_dirty_bds(&mut self, col: u8, row: u8) {
-        let num_bds = self.array.dma_engine(col, row)
-            .map_or(0, |dma| dma.num_bds());
+        let num_bds = self.array.dma_engine(col, row).map_or(0, |dma| dma.num_bds());
         for i in 0..num_bds {
             self.reparse_dirty_bd(col, row, i);
         }
@@ -195,8 +208,13 @@ impl DeviceState {
             .collect();
 
         if words.len() >= 8 {
-            log::debug!("MemTile BD raw: tile({},{}) offset=0x{:05X} words=[{:08X?}]",
-                col, row, offset, &words[..8]);
+            log::debug!(
+                "MemTile BD raw: tile({},{}) offset=0x{:05X} words=[{:08X?}]",
+                col,
+                row,
+                offset,
+                &words[..8]
+            );
         }
 
         // MemTile BDs: base/stride derived from register database
@@ -208,12 +226,24 @@ impl DeviceState {
         if let Some(tile) = self.array.get_mut(col, row) {
             if bd_idx < tile.dma_bds.len() {
                 let bd = &mut tile.dma_bds[bd_idx];
-                if !words.is_empty() { bd.addr_low = words[0]; }
-                if words.len() > 1 { bd.addr_high = words[1]; }
-                if words.len() > 2 { bd.length = words[2]; }
-                if words.len() > 3 { bd.control = words[3]; }
-                if words.len() > 4 { bd.d0 = words[4]; }
-                if words.len() > 5 { bd.d1 = words[5]; }
+                if !words.is_empty() {
+                    bd.addr_low = words[0];
+                }
+                if words.len() > 1 {
+                    bd.addr_high = words[1];
+                }
+                if words.len() > 2 {
+                    bd.length = words[2];
+                }
+                if words.len() > 3 {
+                    bd.control = words[3];
+                }
+                if words.len() > 4 {
+                    bd.d0 = words[4];
+                }
+                if words.len() > 5 {
+                    bd.d1 = words[5];
+                }
             }
         }
 
@@ -278,29 +308,56 @@ impl DeviceState {
         if is_start_queue {
             let bd_idx = lay.start_bd_id.extract(value) as u8;
             let repeat_count = lay.repeat_count.extract(value) as u8;
-            log::debug!("MemTile Start_Queue raw=0x{:08X} bd={} repeat={} (actual {}x) ch={}",
-                value, bd_idx, repeat_count, repeat_count as u32 + 1, ch_idx);
+            log::debug!(
+                "MemTile Start_Queue raw=0x{:08X} bd={} repeat={} (actual {}x) ch={}",
+                value,
+                bd_idx,
+                repeat_count,
+                repeat_count as u32 + 1,
+                ch_idx
+            );
             // Re-parse ALL dirty BDs so chained BDs are also configured
             self.reparse_all_dirty_bds(col, row);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     log::warn!(
                         "MemTile DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
-                        col, row, ch_idx, bd_idx,
+                        col,
+                        row,
+                        ch_idx,
+                        bd_idx,
                     );
                 } else {
                     let mt_s2mm = xdna_archspec::aie2::memtile::NUM_DMA_CHANNELS as usize;
                     let dir = if ch_idx < mt_s2mm { "S2MM" } else { "MM2S" };
-                    let local_ch = if ch_idx < mt_s2mm { ch_idx } else { ch_idx - mt_s2mm };
-                    log::info!("CDO enqueued MemTile DMA {} ch {} BD {} repeat={} on tile ({},{})",
-                        dir, local_ch, bd_idx, repeat_count, col, row);
+                    let local_ch = if ch_idx < mt_s2mm {
+                        ch_idx
+                    } else {
+                        ch_idx - mt_s2mm
+                    };
+                    log::info!(
+                        "CDO enqueued MemTile DMA {} ch {} BD {} repeat={} on tile ({},{})",
+                        dir,
+                        local_ch,
+                        bd_idx,
+                        repeat_count,
+                        col,
+                        row
+                    );
                 }
             }
         }
     }
 
     /// Masked write to MemTile DMA channel register.
-    pub(super) fn mask_write_memtile_dma_channel(&mut self, col: u8, row: u8, offset: u32, mask: u32, value: u32) {
+    pub(super) fn mask_write_memtile_dma_channel(
+        &mut self,
+        col: u8,
+        row: u8,
+        offset: u32,
+        mask: u32,
+        value: u32,
+    ) {
         let reg_layout = regdb::device_reg_layout();
         let lay = &reg_layout.memtile_channel;
         let (ch_idx, is_start_queue) = self.decode_memtile_channel_offset(offset);
@@ -337,14 +394,28 @@ impl DeviceState {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     log::warn!(
                         "MemTile DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
-                        col, row, ch_idx, bd_idx,
+                        col,
+                        row,
+                        ch_idx,
+                        bd_idx,
                     );
                 } else {
                     let mt_s2mm = xdna_archspec::aie2::memtile::NUM_DMA_CHANNELS as usize;
                     let dir = if ch_idx < mt_s2mm { "S2MM" } else { "MM2S" };
-                    let local_ch = if ch_idx < mt_s2mm { ch_idx } else { ch_idx - mt_s2mm };
-                    log::info!("CDO enqueued MemTile DMA {} ch {} BD {} repeat={} on tile ({},{})",
-                        dir, local_ch, bd_idx, repeat_count, col, row);
+                    let local_ch = if ch_idx < mt_s2mm {
+                        ch_idx
+                    } else {
+                        ch_idx - mt_s2mm
+                    };
+                    log::info!(
+                        "CDO enqueued MemTile DMA {} ch {} BD {} repeat={} on tile ({},{})",
+                        dir,
+                        local_ch,
+                        bd_idx,
+                        repeat_count,
+                        col,
+                        row
+                    );
                 }
             }
         }
@@ -406,20 +477,39 @@ impl DeviceState {
             tile.stream_switch.configure_master_packet(port, value);
 
             if packet_enable {
-                log::info!("MemTile ({},{}) stream switch master[{}] packet mode = 0x{:08X}",
-                    col, row, port, value);
+                log::info!(
+                    "MemTile ({},{}) stream switch master[{}] packet mode = 0x{:08X}",
+                    col,
+                    row,
+                    port,
+                    value
+                );
             } else {
-                log::debug!("MemTile ({},{}) stream switch master[{}] = 0x{:08X} (en={}, slave={})",
-                    col, row, port, value, enable, slave_select);
+                log::debug!(
+                    "MemTile ({},{}) stream switch master[{}] = 0x{:08X} (en={}, slave={})",
+                    col,
+                    row,
+                    port,
+                    value,
+                    enable,
+                    slave_select
+                );
 
                 // Circuit mode: create local route if enabled
-                if enable && slave_select < tile.stream_switch.slaves.len() && port < tile.stream_switch.masters.len() {
+                if enable
+                    && slave_select < tile.stream_switch.slaves.len()
+                    && port < tile.stream_switch.masters.len()
+                {
                     tile.stream_switch.configure_local_route(slave_select, port);
-                    log::info!("MemTile ({},{}) local route: slave[{}] -> master[{}]",
-                        col, row, slave_select, port);
+                    log::info!(
+                        "MemTile ({},{}) local route: slave[{}] -> master[{}]",
+                        col,
+                        row,
+                        slave_select,
+                        port
+                    );
                 }
             }
-
         } else if (ss.slave_base..ss.slave_end).contains(&offset) {
             let port = ((offset - ss.slave_base) / 4) as usize;
             let enable = (value >> ENABLE_BIT) & 1 != 0;
@@ -438,11 +528,22 @@ impl DeviceState {
             }
 
             if packet_enable {
-                log::info!("MemTile ({},{}) stream switch slave[{}] packet mode (0x{:08X})",
-                    col, row, port, value);
+                log::info!(
+                    "MemTile ({},{}) stream switch slave[{}] packet mode (0x{:08X})",
+                    col,
+                    row,
+                    port,
+                    value
+                );
             } else {
-                log::debug!("MemTile ({},{}) stream switch slave[{}] = 0x{:08X} (en={})",
-                    col, row, port, value, enable);
+                log::debug!(
+                    "MemTile ({},{}) stream switch slave[{}] = 0x{:08X} (en={})",
+                    col,
+                    row,
+                    port,
+                    value,
+                    enable
+                );
             }
         // Slave slot registers (packet routing config per slave port)
         } else if (ss.slave_slot_base..ss.slave_slot_end).contains(&offset) {
@@ -452,8 +553,14 @@ impl DeviceState {
 
             if let Some(tile) = self.array.get_mut(col, row) {
                 tile.stream_switch.configure_slave_slot(slave_port, slot, value);
-                log::info!("MemTile ({},{}) stream switch: slave[{}] slot[{}] = 0x{:08X}",
-                    col, row, slave_port, slot, value);
+                log::info!(
+                    "MemTile ({},{}) stream switch: slave[{}] slot[{}] = 0x{:08X}",
+                    col,
+                    row,
+                    slave_port,
+                    slot,
+                    value
+                );
             }
         }
     }

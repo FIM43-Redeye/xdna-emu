@@ -33,9 +33,18 @@ impl DeviceState {
             tile.cascade_output_dir = ((value >> 1) & 0x1) as u8;
             log::info!(
                 "Tile ({},{}) cascade config: input_dir={} output_dir={}",
-                col, row,
-                if tile.cascade_input_dir == 0 { "North" } else { "West" },
-                if tile.cascade_output_dir == 0 { "South" } else { "East" },
+                col,
+                row,
+                if tile.cascade_input_dir == 0 {
+                    "North"
+                } else {
+                    "West"
+                },
+                if tile.cascade_output_dir == 0 {
+                    "South"
+                } else {
+                    "East"
+                },
             );
         }
 
@@ -161,9 +170,7 @@ impl DeviceState {
             TileKind::Compute | TileKind::ShimNoc | TileKind::ShimPl => {
                 ce.event_port_select.map(|[r0, r1]| (r0, r1))
             }
-            TileKind::Mem => {
-                mte.event_port_select.map(|[r0, r1]| (r0, r1))
-            }
+            TileKind::Mem => mte.event_port_select.map(|[r0, r1]| (r0, r1)),
         };
         if let Some((reg0, reg1)) = port_sel_base {
             if offset == reg0 || offset == reg1 {
@@ -176,7 +183,10 @@ impl DeviceState {
                 }
                 log::debug!(
                     "Tile({},{}) event port sel @0x{:X}: {:?}",
-                    col, row, offset, &tile.event_port_selection[base_slot..base_slot+4]
+                    col,
+                    row,
+                    offset,
+                    &tile.event_port_selection[base_slot..base_slot + 4]
                 );
             }
         }
@@ -300,7 +310,11 @@ impl DeviceState {
             let event_id = (value & 0x7F) as u8;
             log::info!(
                 "Tile({},{}) Event_Generate: event_id={} (offset=0x{:X}) cycle={}",
-                col, row, event_id, offset, current_cycle
+                col,
+                row,
+                event_id,
+                offset,
+                current_cycle
             );
 
             // Fire the event directly on local trace units. Use the array's
@@ -328,7 +342,11 @@ impl DeviceState {
                         let broadcast_hw_id = broadcast_base + ch;
                         log::info!(
                             "Tile({},{}) Event_Generate: event {} -> BROADCAST_{} (hw_id={})",
-                            col, row, event_id, ch, broadcast_hw_id
+                            col,
+                            row,
+                            event_id,
+                            ch,
+                            broadcast_hw_id
                         );
                         tile.pending_broadcasts.push(broadcast_hw_id);
                     }
@@ -368,7 +386,12 @@ impl DeviceState {
         for hw_id in &broadcasts {
             log::info!(
                 "Propagating BROADCAST_{} (hw_id={}) from tile ({},{}) to column {} at cycle {}",
-                hw_id - 107, hw_id, col, source_row, col, current_cycle
+                hw_id - 107,
+                hw_id,
+                col,
+                source_row,
+                col,
+                current_cycle
             );
             for row in 0..rows {
                 if let Some(tile) = self.array.get_mut(col as u8, row as u8) {

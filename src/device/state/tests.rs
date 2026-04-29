@@ -34,8 +34,7 @@ fn test_apply_real_cdo() {
     // Verify something was configured
     assert!(state.stats.commands > 0, "Expected commands to be processed");
     assert!(state.stats.dma_writes > 0, "Expected DMA writes (shim control packets)");
-    assert!(state.stats.writes > 0 || state.stats.mask_writes > 0,
-        "Expected register writes");
+    assert!(state.stats.writes > 0 || state.stats.mask_writes > 0, "Expected register writes");
 
     // Note: For this xclbin, DMA_WRITE goes to shim tile for control packets,
     // not to compute tiles for code/data. That's expected - core code is loaded
@@ -176,18 +175,20 @@ fn test_cdo_writes_tile_init_data() {
     let mut values = Vec::new();
     for i in 0..256 {
         let off = 0x400 + i * 4;
-        let word = u32::from_le_bytes([dm[off], dm[off+1], dm[off+2], dm[off+3]]);
+        let word = u32::from_le_bytes([dm[off], dm[off + 1], dm[off + 2], dm[off + 3]]);
         values.push(word);
     }
 
     for i in 0..256 {
-        assert_eq!(values[i], i as u32,
-            "in2_mem_buff_0[{}] should be {} but was {}", i, i, values[i]);
+        assert_eq!(values[i], i as u32, "in2_mem_buff_0[{}] should be {} but was {}", i, i, values[i]);
     }
 
     // Also verify data_bytes was counted
-    assert!(state.stats.data_bytes >= 1024,
-        "Expected at least 1024 data bytes written, got {}", state.stats.data_bytes);
+    assert!(
+        state.stats.data_bytes >= 1024,
+        "Expected at least 1024 data bytes written, got {}",
+        state.stats.data_bytes
+    );
 }
 
 /// Test that single-word BD writes (as from control packets) defer parsing
@@ -202,7 +203,7 @@ fn test_lazy_bd_parsing_single_word_writes() {
     let row: u8 = 2; // Compute tile
 
     let reg_layout = device_reg_layout();
-    let bd_base = reg_layout.memory_bd_base;   // 0x1D000
+    let bd_base = reg_layout.memory_bd_base; // 0x1D000
     let bd_stride = reg_layout.memory_bd_stride; // 0x20
     let bd_idx: usize = 3;
 
@@ -210,12 +211,11 @@ fn test_lazy_bd_parsing_single_word_writes() {
     // Use the real parser to construct expected values, then write
     // those words one at a time.
     let base_addr_words: u32 = 0x100; // 256 words = 1024 bytes
-    let length_words: u32 = 64;       // 64 words = 256 bytes
+    let length_words: u32 = 64; // 64 words = 256 bytes
 
     // Word 0: Base_Address | Buffer_Length (from regdb field layout)
     let lay = &reg_layout.memory_bd;
-    let w0 = lay.base_address.insert(0, base_addr_words)
-               | lay.buffer_length.insert(0, length_words);
+    let w0 = lay.base_address.insert(0, base_addr_words) | lay.buffer_length.insert(0, length_words);
     // Word 1-4: leave as zero (no packet, no strides, no iteration)
     let w1: u32 = 0;
     let w2: u32 = 0;
@@ -235,22 +235,19 @@ fn test_lazy_bd_parsing_single_word_writes() {
 
     // Verify the BD is marked dirty in the DMA engine
     let dma = state.array.dma_engine(col, row).unwrap();
-    assert!(dma.is_bd_dirty(bd_idx as u8),
-        "BD should be dirty after single-word writes");
+    assert!(dma.is_bd_dirty(bd_idx as u8), "BD should be dirty after single-word writes");
 
     // Verify the BD config has NOT been updated yet (should be default)
     let bd_before = dma.get_bd(bd_idx as u8).unwrap();
-    assert_eq!(bd_before.base_addr, 0,
-        "BD config should not be updated until channel start");
-    assert_eq!(bd_before.length, 0,
-        "BD length should be 0 before channel start");
+    assert_eq!(bd_before.base_addr, 0, "BD config should not be updated until channel start");
+    assert_eq!(bd_before.length, 0, "BD length should be 0 before channel start");
 
     // Now write the channel start queue register to trigger re-parse.
     // MM2S channel 0 = channel index 2 (after S2MM_0, S2MM_1).
     // Start queue offset = channel_base + ch_idx * stride + 4
     let ch_idx: usize = 2; // MM2S_0
-    let start_queue_offset = reg_layout.memory_channel_base
-        + (ch_idx as u32) * reg_layout.memory_channel_stride + 4;
+    let start_queue_offset =
+        reg_layout.memory_channel_base + (ch_idx as u32) * reg_layout.memory_channel_stride + 4;
 
     // Start_BD_ID field value = bd_idx, repeat_count = 0
     let queue_val = reg_layout.memory_channel.start_bd_id.insert(0, bd_idx as u32);
@@ -260,16 +257,17 @@ fn test_lazy_bd_parsing_single_word_writes() {
 
     // Now the BD should have been re-parsed and configured
     let dma = state.array.dma_engine(col, row).unwrap();
-    assert!(!dma.is_bd_dirty(bd_idx as u8),
-        "BD should no longer be dirty after channel start");
+    assert!(!dma.is_bd_dirty(bd_idx as u8), "BD should no longer be dirty after channel start");
 
     let bd_after = dma.get_bd(bd_idx as u8).unwrap();
-    assert_eq!(bd_after.base_addr, (base_addr_words * 4) as u64,
-        "BD base_addr should be {} bytes", base_addr_words * 4);
-    assert_eq!(bd_after.length, length_words * 4,
-        "BD length should be {} bytes", length_words * 4);
-    assert!(bd_after.valid,
-        "BD should be valid after re-parse");
+    assert_eq!(
+        bd_after.base_addr,
+        (base_addr_words * 4) as u64,
+        "BD base_addr should be {} bytes",
+        base_addr_words * 4
+    );
+    assert_eq!(bd_after.length, length_words * 4, "BD length should be {} bytes", length_words * 4);
+    assert!(bd_after.valid, "BD should be valid after re-parse");
 }
 
 // ---------------------------------------------------------------------------
@@ -364,10 +362,7 @@ fn channel_field_layout_helper_picks_memtile_for_memtile_kind() {
     let reg_layout = device_reg_layout();
 
     let lay_mem = channel_field_layout(reg_layout, TileKind::Mem);
-    assert_eq!(
-        lay_mem.start_bd_id.width, 6,
-        "MemTile Start_BD_ID is 6-bit per aie-rt xaiemlgbl_params.h"
-    );
+    assert_eq!(lay_mem.start_bd_id.width, 6, "MemTile Start_BD_ID is 6-bit per aie-rt xaiemlgbl_params.h");
 
     let lay_compute = channel_field_layout(reg_layout, TileKind::Compute);
     assert_eq!(
@@ -376,10 +371,7 @@ fn channel_field_layout_helper_picks_memtile_for_memtile_kind() {
     );
 
     let lay_shim = channel_field_layout(reg_layout, TileKind::ShimNoc);
-    assert_eq!(
-        lay_shim.start_bd_id.width, 4,
-        "Shim Start_BD_ID is 4-bit (same as compute)"
-    );
+    assert_eq!(lay_shim.start_bd_id.width, 4, "Shim Start_BD_ID is 4-bit (same as compute)");
 }
 
 /// Regression test: a CDO write to CORE_CONTROL must be visible via

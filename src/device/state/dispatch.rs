@@ -20,8 +20,7 @@ impl DeviceState {
     pub fn write_tile_register(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         let address = TileAddress::encode(col, row, offset);
         if let Err(e) = self.write_register(address, value) {
-            log::error!("write_tile_register failed: tile({},{}) offset=0x{:05X}: {:?}",
-                col, row, offset, e);
+            log::error!("write_tile_register failed: tile({},{}) offset=0x{:05X}: {:?}", col, row, offset, e);
         }
     }
 
@@ -48,16 +47,34 @@ impl DeviceState {
                 if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
                     match tile_kind {
                         TileKind::Mem => {
-                            Self::write_lock_value(tile, tile_addr,
-                                reg_layout.memtile_lock_base, reg_layout.memtile_lock_stride, value, "MemTile");
+                            Self::write_lock_value(
+                                tile,
+                                tile_addr,
+                                reg_layout.memtile_lock_base,
+                                reg_layout.memtile_lock_stride,
+                                value,
+                                "MemTile",
+                            );
                         }
                         TileKind::Compute => {
-                            Self::write_lock_value(tile, tile_addr,
-                                reg_layout.memory_lock_base, reg_layout.memory_lock_stride, value, "Compute");
+                            Self::write_lock_value(
+                                tile,
+                                tile_addr,
+                                reg_layout.memory_lock_base,
+                                reg_layout.memory_lock_stride,
+                                value,
+                                "Compute",
+                            );
                         }
                         TileKind::ShimNoc | TileKind::ShimPl => {
-                            Self::write_lock_value(tile, tile_addr,
-                                reg_layout.shim_lock_base, reg_layout.shim_lock_stride, value, "Shim");
+                            Self::write_lock_value(
+                                tile,
+                                tile_addr,
+                                reg_layout.shim_lock_base,
+                                reg_layout.shim_lock_stride,
+                                value,
+                                "Shim",
+                            );
                         }
                     }
                 }
@@ -71,7 +88,12 @@ impl DeviceState {
                         if tile_addr.offset < reg_layout.memtile_channel_s2mm_base {
                             self.write_memtile_dma_bd(tile_addr.col, tile_addr.row, tile_addr.offset, value);
                         } else {
-                            self.write_memtile_dma_channel(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+                            self.write_memtile_dma_channel(
+                                tile_addr.col,
+                                tile_addr.row,
+                                tile_addr.offset,
+                                value,
+                            );
                         }
                     }
                     TileKind::ShimNoc | TileKind::ShimPl => {
@@ -80,7 +102,12 @@ impl DeviceState {
                         let shim_ch_base = reg_layout.shim_channel_base;
                         let shim_ch_end = shim_ch_base + 4 * reg_layout.shim_channel_stride;
                         if (shim_ch_base..shim_ch_end).contains(&tile_addr.offset) {
-                            self.write_shim_dma_channel(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+                            self.write_shim_dma_channel(
+                                tile_addr.col,
+                                tile_addr.row,
+                                tile_addr.offset,
+                                value,
+                            );
                         } else {
                             self.write_dma_bd(tile_addr.col, tile_addr.row, tile_addr.offset, value);
                         }
@@ -99,16 +126,14 @@ impl DeviceState {
                 self.write_core_register(tile_addr.col, tile_addr.row, tile_addr.offset, value);
             }
 
-            SubsystemKind::StreamSwitch => {
-                match tile_kind {
-                    TileKind::Mem => {
-                        self.write_memtile_stream_switch(tile_addr.col, tile_addr.row, tile_addr.offset, value);
-                    }
-                    _ => {
-                        self.write_stream_switch(tile_addr.col, tile_addr.row, tile_addr.offset, value);
-                    }
+            SubsystemKind::StreamSwitch => match tile_kind {
+                TileKind::Mem => {
+                    self.write_memtile_stream_switch(tile_addr.col, tile_addr.row, tile_addr.offset, value);
                 }
-            }
+                _ => {
+                    self.write_stream_switch(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+                }
+            },
 
             SubsystemKind::ProgramMemory => {
                 // Write 32-bit value to program memory. Control packets
@@ -148,8 +173,14 @@ impl DeviceState {
         let tile_kind = tile_kind_from_row(tile_addr.row);
         let subsystem = subsystem_from_offset(tile_addr.offset, tile_kind);
 
-        log::trace!("mask_write_register: addr=0x{:08X} tile({},{}) offset=0x{:05X} subsystem={:?}",
-            address, tile_addr.col, tile_addr.row, tile_addr.offset, subsystem);
+        log::trace!(
+            "mask_write_register: addr=0x{:08X} tile({},{}) offset=0x{:05X} subsystem={:?}",
+            address,
+            tile_addr.col,
+            tile_addr.row,
+            tile_addr.offset,
+            subsystem
+        );
 
         if self.array.get_mut(tile_addr.col, tile_addr.row).is_none() {
             log::trace!("mask_write_register: tile({},{}) not in array", tile_addr.col, tile_addr.row);
@@ -168,22 +199,38 @@ impl DeviceState {
             let tile = self.array.get_mut(tile_addr.col, tile_addr.row).unwrap();
 
             match subsystem {
-                SubsystemKind::Lock => {
-                    match tile_kind {
-                        TileKind::Mem => {
-                            Self::mask_write_lock_value(tile, tile_addr.offset,
-                                reg_layout.memtile_lock_base, reg_layout.memtile_lock_stride, mask, value);
-                        }
-                        TileKind::Compute => {
-                            Self::mask_write_lock_value(tile, tile_addr.offset,
-                                reg_layout.memory_lock_base, reg_layout.memory_lock_stride, mask, value);
-                        }
-                        TileKind::ShimNoc | TileKind::ShimPl => {
-                            Self::mask_write_lock_value(tile, tile_addr.offset,
-                                reg_layout.shim_lock_base, reg_layout.shim_lock_stride, mask, value);
-                        }
+                SubsystemKind::Lock => match tile_kind {
+                    TileKind::Mem => {
+                        Self::mask_write_lock_value(
+                            tile,
+                            tile_addr.offset,
+                            reg_layout.memtile_lock_base,
+                            reg_layout.memtile_lock_stride,
+                            mask,
+                            value,
+                        );
                     }
-                }
+                    TileKind::Compute => {
+                        Self::mask_write_lock_value(
+                            tile,
+                            tile_addr.offset,
+                            reg_layout.memory_lock_base,
+                            reg_layout.memory_lock_stride,
+                            mask,
+                            value,
+                        );
+                    }
+                    TileKind::ShimNoc | TileKind::ShimPl => {
+                        Self::mask_write_lock_value(
+                            tile,
+                            tile_addr.offset,
+                            reg_layout.shim_lock_base,
+                            reg_layout.shim_lock_stride,
+                            mask,
+                            value,
+                        );
+                    }
+                },
 
                 _ => {}
             }
@@ -198,7 +245,13 @@ impl DeviceState {
                 match tile_kind {
                     TileKind::Mem => {
                         if tile_addr.offset >= reg_layout.memtile_channel_s2mm_base {
-                            self.mask_write_memtile_dma_channel(tile_addr.col, tile_addr.row, tile_addr.offset, mask, value);
+                            self.mask_write_memtile_dma_channel(
+                                tile_addr.col,
+                                tile_addr.row,
+                                tile_addr.offset,
+                                mask,
+                                value,
+                            );
                         }
                         // BD mask writes for memtile: not implemented (uncommon in CDO)
                     }
@@ -206,13 +259,25 @@ impl DeviceState {
                         let shim_ch_base = reg_layout.shim_channel_base;
                         let shim_ch_end = shim_ch_base + 4 * reg_layout.shim_channel_stride;
                         if (shim_ch_base..shim_ch_end).contains(&tile_addr.offset) {
-                            self.mask_write_shim_dma_channel(tile_addr.col, tile_addr.row, tile_addr.offset, mask, value);
+                            self.mask_write_shim_dma_channel(
+                                tile_addr.col,
+                                tile_addr.row,
+                                tile_addr.offset,
+                                mask,
+                                value,
+                            );
                         }
                         // BD mask writes for shim: not implemented (uncommon in CDO)
                     }
                     TileKind::Compute => {
                         if tile_addr.offset >= reg_layout.memory_channel_base {
-                            self.mask_write_dma_channel(tile_addr.col, tile_addr.row, tile_addr.offset, mask, value);
+                            self.mask_write_dma_channel(
+                                tile_addr.col,
+                                tile_addr.row,
+                                tile_addr.offset,
+                                mask,
+                                value,
+                            );
                         }
                         // BD mask writes for compute: not implemented (uncommon in CDO)
                     }
@@ -302,10 +367,9 @@ impl DeviceState {
                 use xdna_archspec::aie2::memory_map::MEM_TILE_DATA_MEMORY_END;
                 // Could be register array writes - handle as data
                 let tile = self.array.get_mut(tile_addr.col, tile_addr.row).unwrap();
-                if offset <= MEM_TILE_DATA_MEMORY_END as usize
-                    && tile.write_data(offset, data) {
-                        self.stats.data_bytes += data.len();
-                    }
+                if offset <= MEM_TILE_DATA_MEMORY_END as usize && tile.write_data(offset, data) {
+                    self.stats.data_bytes += data.len();
+                }
             }
         }
 
