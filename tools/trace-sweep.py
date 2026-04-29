@@ -674,8 +674,15 @@ class ParseSession:
         out_cycles: Optional[Path] = None,
         out_perfetto: Optional[Path] = None,
         out_commands: Optional[Path] = None,
+        trace_mode: str = "event_time",
     ) -> dict:
         """Send one decode request, return parsed response dict.
+
+        ``trace_mode`` selects the per-tile decoder used by parse-trace's
+        ``--decoder=ours`` backend (server default). Supported values:
+        ``"event_time"`` (mode 0), ``"event_pc"`` (mode 1), ``"inst_exec"``
+        (mode 2). Defaulting to ``"event_time"`` preserves the existing
+        sweep_multi behavior so older callers don't have to thread it.
 
         The response shape is what parse-trace.py's server_loop emits:
             {"ok": True, "events_count": N, "cycles": <span or None>,
@@ -689,6 +696,10 @@ class ParseSession:
         if out_cycles:   req["out_cycles"]   = str(out_cycles)
         if out_perfetto: req["out_perfetto"] = str(out_perfetto)
         if out_commands: req["out_commands"] = str(out_commands)
+        # Always include trace_mode -- the server defaults to "event_time"
+        # on absence, but being explicit keeps the request self-describing
+        # and makes mode-2 baseline batches debuggable from the request log.
+        req["trace_mode"] = trace_mode
         try:
             self.proc.stdin.write(json.dumps(req) + "\n")
             self.proc.stdin.flush()
@@ -733,6 +744,7 @@ def _parse_trace_bin(
     parse_log: Path,
     env_for_parse: Dict[str, str],
     parser_session: Optional[ParseSession] = None,
+    trace_mode: str = "event_time",
 ) -> Tuple[bool, Optional[str], Optional[int], Optional[int]]:
     """Run parse-trace on a trace binary. Returns (ok, error,
     cycles, events_count). ok=True with cycles=0/events_count=0 means
@@ -744,6 +756,11 @@ def _parse_trace_bin(
     a fresh Python startup (~620 ms -> ~100 ms per call). When None,
     falls back to the old subprocess.run() path so this helper still
     works outside a session-managed sweep.
+
+    ``trace_mode`` selects the decoder mode (event_time / event_pc /
+    inst_exec). Mode-2 baseline batches must pass ``"inst_exec"`` here
+    or the server silently decodes them as event_time and emits
+    structurally wrong events.
     """
     if parser_session is not None:
         try:
@@ -752,6 +769,7 @@ def _parse_trace_bin(
                 xclbin_mlir=mlir,
                 out_events=events_out,
                 out_cycles=cycles_out,
+                trace_mode=trace_mode,
             )
         except RuntimeError as e:
             return False, f"parse-trace session: {e}", None, None
@@ -782,6 +800,7 @@ def _parse_trace_bin(
         "--xclbin-mlir", str(mlir),
         "--out-events", str(events_out),
         "--out-cycles", str(cycles_out),
+        "--trace-mode", trace_mode,
     ]
     parse_env = env_for_parse.copy()
     parse_env["PYTHONPATH"] = str(MLIR_AIE_ROOT / "install" / "python")
@@ -822,12 +841,18 @@ def _run_one_side(
     parse_log: Path,
     ctrlpkt: Optional[Path],
     parser_session: Optional["ParseSession"] = None,
+    trace_mode: str = "event_time",
 ) -> RunResult:
     """One (run → parse) cycle.
 
     The runner session is shared across all batches of a sweep; this
     function just dispatches a single run_one() and then parses. The
     trace_bin is written by the runner and read back by parse-trace.
+
+    ``trace_mode`` is forwarded to the parse-trace decoder so mode-1 /
+    mode-2 traces decode through the right per-tile decoder. Defaults
+    to ``"event_time"`` to preserve the legacy single/multi-tile sweep
+    behavior.
 
     Failures are recorded in the RunResult, not raised -- a single
     batch failure must not kill the sweep.
@@ -854,6 +879,7 @@ def _run_one_side(
     ok, err, cycles, events_count = _parse_trace_bin(
         trace_bin, mlir, events_out, cycles_out, parse_log, env_for_parse,
         parser_session=parser_session,
+        trace_mode=trace_mode,
     )
     if not ok:
         return RunResult(ok=False, cycles=None, events_count=None,
@@ -1612,7 +1638,11 @@ def sweep_lockstep(
         emu_parser = ParseSession(side="EMU", stderr_log=work_dir / "emu.parser.log")
 
     t_start = time.time()
+    # Counters tracked at outer scope so the manifest can describe the
+    # state we reached even if the sweep loop or mode-2 batch raises.
     mode2_succeeded = False
+    completed_batches = 0
+    sweep_error: Optional[str] = None
 
     try:
         for b_idx, batch_assignment in enumerate(batches):
@@ -1652,6 +1682,7 @@ def sweep_lockstep(
                     parse_log=hw_dir / "parse.log",
                     ctrlpkt=ctrlpkt,
                     parser_session=hw_parser,
+                    trace_mode=mode,
                 )
             )
             emu_res = (
@@ -1668,8 +1699,10 @@ def sweep_lockstep(
                     parse_log=emu_dir / "parse.log",
                     ctrlpkt=ctrlpkt,
                     parser_session=emu_parser,
+                    trace_mode=mode,
                 )
             )
+            completed_batches = b_idx + 1
             print(
                 f"[sweep-lockstep] batch {b_idx + 1}/{len(batches)}: "
                 f"hw_ok={hw_res.ok} emu_ok={emu_res.ok} "
@@ -1715,6 +1748,7 @@ def sweep_lockstep(
                     parse_log=mode2_hw_dir / "parse.log",
                     ctrlpkt=ctrlpkt,
                     parser_session=hw_parser,
+                    trace_mode="inst_exec",
                 )
                 mode2_succeeded = mode2_res.ok
                 print(
@@ -1723,6 +1757,13 @@ def sweep_lockstep(
                     flush=True,
                 )
 
+    except Exception as e:
+        # Sweep raised partway through. Record the failure but do NOT
+        # re-raise here -- we need the cleanup + manifest write to land
+        # before propagating. The exception is captured in sweep_error
+        # and re-raised from the trailing block below.
+        sweep_error = f"{type(e).__name__}: {e}"
+        print(f"[sweep-lockstep] sweep raised: {sweep_error}", flush=True)
     finally:
         if hw_session is not None:
             hw_session.close()
@@ -1735,9 +1776,22 @@ def sweep_lockstep(
 
     # ----------------------------------------------------------------
     # Grounding-PC invariance check + manifest.
+    #
+    # This block sits OUTSIDE the try/finally above on purpose: the
+    # spec mandates the manifest lands "even on partial failures." If
+    # the invariance check itself raises, swallow it into the manifest
+    # so an unrelated decode error in one batch doesn't take the whole
+    # manifest down with it.
     # ----------------------------------------------------------------
     core_grounding_names = grounding_by_type.get("core", [])
-    invariance = _check_grounding_pc_invariance(out_dir, core_grounding_names)
+    try:
+        invariance = _check_grounding_pc_invariance(out_dir, core_grounding_names)
+    except Exception as e:
+        invariance = {
+            "unsafe_for_pc_join": True,
+            "reason": f"invariance check failed: {type(e).__name__}: {e}",
+            "per_batch_grounding_pcs": {},
+        }
 
     elapsed = round(time.time() - t_start, 2)
     manifest = {
@@ -1750,6 +1804,7 @@ def sweep_lockstep(
             for t in tiles
         ],
         "n_batches": len(batches),
+        "n_batches_completed": completed_batches,
         "grounding": {
             "core":    grounding_by_type.get("core", []),
             "memmod":  grounding_by_type.get("memmod", []),
@@ -1758,11 +1813,22 @@ def sweep_lockstep(
         },
         "mode2_baseline_captured": (with_mode2_baseline and mode2_succeeded),
         "elapsed_sec": elapsed,
+        "sweep_error": sweep_error,
         **invariance,
     }
     manifest_path = out_dir / "sweep-manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-    print(f"[sweep-lockstep] manifest written to {manifest_path}", flush=True)
+    try:
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        print(f"[sweep-lockstep] manifest written to {manifest_path}", flush=True)
+    except OSError as e:
+        # Last-ditch: if even the manifest write fails (disk full, etc),
+        # surface it loudly. Don't mask the original sweep_error.
+        print(f"[sweep-lockstep] manifest WRITE FAILED: {e}", flush=True)
+
+    # If the sweep itself raised, propagate now so the caller still sees
+    # the failure even though the manifest landed.
+    if sweep_error is not None:
+        raise RuntimeError(f"sweep_lockstep failed: {sweep_error}")
 
 
 def sweep(
@@ -1929,6 +1995,18 @@ def main() -> int:
         tile_types_seen = {t.tile_type for t in tiles}
         use_lockstep = (args.mode == "event_pc") or (len(tile_types_seen) > 1)
         if use_lockstep:
+            # Warn once if a legacy --ground-event was passed alongside the
+            # lockstep path. The lockstep flow uses --core-grounding /
+            # --memmod-grounding / etc instead, so --ground-event would
+            # silently do nothing.
+            if args.ground_event:
+                print(
+                    f"[sweep-lockstep] warning: --ground-event "
+                    f"{args.ground_event!r} ignored in lockstep mode; "
+                    f"use --core-grounding / --memmod-grounding / "
+                    f"--memtile-grounding / --shim-grounding instead",
+                    file=sys.stderr,
+                )
             sweep_lockstep(
                 test_name=args.test, compiler=args.compiler,
                 tiles=tiles, build_dir=build_dir, out_dir=args.out_dir,

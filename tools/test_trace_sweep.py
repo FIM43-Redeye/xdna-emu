@@ -9,6 +9,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -283,3 +284,277 @@ def test_check_grounding_pc_invariance_multiple_grounding_events(tmp_path):
     result = _check_grounding_pc_invariance(tmp_path, ["INSTR_EVENT_0", "INSTR_EVENT_1"])
     assert result["unsafe_for_pc_join"] is True
     assert "INSTR_EVENT_1" in result["reason"]
+
+
+# ---------------------------------------------------------------------------
+# trace_mode threading: ParseSession.parse_one builds the right request,
+# _run_one_side forwards trace_mode through to it.
+# ---------------------------------------------------------------------------
+
+def _fake_parse_session(canned_response: dict | None = None):
+    """Build a fake ParseSession-like object.
+
+    Only what ParseSession.parse_one writes to / reads from is mocked:
+    a stdin-like object with .write/.flush, a stdout-like that yields
+    a canned line, and a .proc.poll() returning None. Captures every
+    request line so tests can assert on the JSON shape.
+    """
+    sess = _mod.ParseSession.__new__(_mod.ParseSession)
+    sess.side = "TEST"
+    sent: list[str] = []
+
+    class _StdinLike:
+        def write(self, s):
+            sent.append(s)
+        def flush(self):
+            pass
+
+    response_line = json.dumps(canned_response or {
+        "ok": True, "events_count": 0, "cycles": 0, "empty": True,
+    }) + "\n"
+
+    class _StdoutLike:
+        def __init__(self):
+            self._lines = [response_line]
+        def readline(self):
+            return self._lines.pop(0) if self._lines else ""
+
+    proc = MagicMock()
+    proc.poll.return_value = None
+    proc.stdin = _StdinLike()
+    proc.stdout = _StdoutLike()
+    sess.proc = proc
+    sess.stderr_log = Path("/dev/null")
+    sess._stderr_fh = None
+    return sess, sent
+
+
+def test_parse_session_request_includes_trace_mode_event_pc(tmp_path):
+    sess, sent = _fake_parse_session()
+    sess.parse_one(
+        trace_bin=tmp_path / "trace.bin",
+        xclbin_mlir=tmp_path / "x.mlir",
+        trace_mode="event_pc",
+    )
+    assert len(sent) == 1
+    req = json.loads(sent[0])
+    assert req["trace_mode"] == "event_pc"
+
+
+def test_parse_session_request_includes_trace_mode_inst_exec(tmp_path):
+    """The mode-2 finishing batch's load-bearing case: server must see
+    trace_mode='inst_exec' so it routes through the right decoder."""
+    sess, sent = _fake_parse_session()
+    sess.parse_one(
+        trace_bin=tmp_path / "trace.bin",
+        xclbin_mlir=tmp_path / "x.mlir",
+        trace_mode="inst_exec",
+    )
+    req = json.loads(sent[0])
+    assert req["trace_mode"] == "inst_exec"
+
+
+def test_parse_session_default_trace_mode_event_time(tmp_path):
+    """Legacy callers (sweep_multi) get event_time when they don't pass
+    trace_mode -- preserves backwards-compatible behavior."""
+    sess, sent = _fake_parse_session()
+    sess.parse_one(
+        trace_bin=tmp_path / "trace.bin",
+        xclbin_mlir=tmp_path / "x.mlir",
+    )
+    req = json.loads(sent[0])
+    assert req["trace_mode"] == "event_time"
+
+
+# ---------------------------------------------------------------------------
+# sweep_lockstep: mode-2 batch decodes with trace_mode="inst_exec";
+# manifest written even on patch-subprocess failure.
+# ---------------------------------------------------------------------------
+
+def _make_min_lockstep_env(tmp_path: Path):
+    """Set up the minimum filesystem state sweep_lockstep expects so the
+    setup phase passes and we reach the patch-and-run loop. Returns the
+    patches we need to install on the trace_sweep module."""
+    build_dir = tmp_path / "build"
+    build_dir.mkdir()
+    (build_dir / "aie.xclbin").write_bytes(b"\x00" * 64)
+    (build_dir / "insts.bin").write_bytes(b"\x00" * 64)
+    prj = build_dir / "x.mlir.prj"
+    prj.mkdir()
+    mlir = prj / "input_with_addresses.mlir"
+    mlir.write_text("// fake mlir\n")
+    out_dir = tmp_path / "out"
+    return build_dir, out_dir, mlir
+
+
+def test_sweep_lockstep_mode2_calls_parse_with_inst_exec(tmp_path, monkeypatch):
+    """The mode-2 finishing batch must dispatch a parse with
+    trace_mode='inst_exec'. We mock everything below sweep_lockstep so
+    the test runs purely in-process and verifies the call site arguments."""
+    TileSpec = _mod.TileSpec
+    EventDef = _mod.EventDef
+    build_dir, out_dir, _ = _make_min_lockstep_env(tmp_path)
+
+    # Stub out load_events to return a deterministic small list.
+    monkeypatch.setattr(_mod, "load_events", lambda tt: [
+        EventDef(name="PERF_CNT_0", id=1),
+        EventDef(name="INSTR_EVENT_0", id=2),
+        EventDef(name="INSTR_EVENT_1", id=3),
+        EventDef(name="INSTR_VECTOR", id=4),
+    ])
+    # Stub run_lit discovery to use insts.bin.
+    monkeypatch.setattr(_mod, "discover_test_config",
+                        lambda name: _mod.TestConfig(insts_name="insts.bin", ctrlpkt_name=None))
+
+    # Stub subprocess.run for the patch tool to no-op.
+    fake_completed = MagicMock()
+    fake_completed.returncode = 0
+    monkeypatch.setattr(_mod.subprocess, "run", MagicMock(return_value=fake_completed))
+
+    # Replace RunnerSession + ParseSession with stubs that record calls.
+    runner_calls: list[dict] = []
+
+    class StubRunner:
+        def __init__(self, *a, **kw):
+            self.side = kw.get("side", "?")
+        def run_one(self, **kw):
+            runner_calls.append(kw)
+            # Side-effect: create the trace_out file so downstream code
+            # is happy if it inspects the path.
+            Path(kw["trace_out"]).parent.mkdir(parents=True, exist_ok=True)
+            Path(kw["trace_out"]).write_bytes(b"\x00")
+            return {"ok": True}
+        def close(self): pass
+
+    parse_calls: list[dict] = []
+
+    class StubParser:
+        def __init__(self, *a, **kw): pass
+        def parse_one(self, **kw):
+            parse_calls.append(kw)
+            # Write a minimal events.json so the invariance check has
+            # something to read (and stays happy).
+            if "out_events" in kw:
+                Path(kw["out_events"]).parent.mkdir(parents=True, exist_ok=True)
+                Path(kw["out_events"]).write_text(json.dumps({
+                    "events": [{"name": "INSTR_EVENT_0", "ts": 100, "slot": 0,
+                                "row": 2, "col": 0, "pkt_type": 0}],
+                }))
+            return {"ok": True, "events_count": 1, "cycles": 100, "empty": False}
+        def close(self): pass
+
+    monkeypatch.setattr(_mod, "RunnerSession", StubRunner)
+    monkeypatch.setattr(_mod, "ParseSession", StubParser)
+
+    tiles = [TileSpec(col=0, row=2, tile_type="core")]
+    _mod.sweep_lockstep(
+        test_name="fake",
+        compiler="chess",
+        tiles=tiles,
+        build_dir=build_dir,
+        out_dir=out_dir,
+        run_hw=True,
+        run_emu=False,  # keep mocking surface small
+        mode="event_pc",
+        with_mode2_baseline=True,
+    )
+
+    # Expect parse_one called for: each regular batch + the mode-2 batch.
+    # Mode-2 must have trace_mode="inst_exec"; regular ones have "event_pc".
+    modes_seen = [c.get("trace_mode") for c in parse_calls]
+    assert "inst_exec" in modes_seen, (
+        f"mode-2 batch never decoded with inst_exec; saw: {modes_seen}"
+    )
+    # All non-mode-2 calls should be event_pc.
+    non_inst_exec = [m for m in modes_seen if m != "inst_exec"]
+    assert all(m == "event_pc" for m in non_inst_exec), (
+        f"regular batches should decode with event_pc; saw: {non_inst_exec}"
+    )
+
+    # Manifest should also exist and report mode2_baseline_captured=True.
+    manifest = json.loads((out_dir / "sweep-manifest.json").read_text())
+    assert manifest["mode2_baseline_captured"] is True
+    assert manifest["mode"] == "event_pc"
+
+
+def test_sweep_lockstep_writes_manifest_on_patch_failure(tmp_path, monkeypatch):
+    """If the patch subprocess raises CalledProcessError partway through,
+    the manifest still lands and reports completed_batches < n_batches."""
+    import subprocess as _sp
+
+    TileSpec = _mod.TileSpec
+    EventDef = _mod.EventDef
+    build_dir, out_dir, _ = _make_min_lockstep_env(tmp_path)
+
+    # Force enough events to produce 3 batches. Per cursor: 4 events,
+    # 5 remaining slots (8 - 3 grounding). 4/5 = 1 batch. To get 3
+    # batches, give 13 events (ceil(13/5) = 3).
+    monkeypatch.setattr(_mod, "load_events", lambda tt: [
+        EventDef(name="PERF_CNT_0", id=1),
+        EventDef(name="INSTR_EVENT_0", id=2),
+        EventDef(name="INSTR_EVENT_1", id=3),
+    ] + [EventDef(name=f"E{i}", id=10 + i) for i in range(13)])
+    monkeypatch.setattr(_mod, "discover_test_config",
+                        lambda name: _mod.TestConfig(insts_name="insts.bin", ctrlpkt_name=None))
+
+    # Make the patch subprocess fail on the 2nd batch (calls 0 and 1
+    # are the regular patch calls; we fail call index 1).
+    call_count = {"n": 0}
+
+    def fake_run(cmd, **kwargs):
+        # Only count calls that look like the patcher; let other
+        # subprocess.run uses (none currently inside sweep_lockstep,
+        # but just in case) pass through unscathed.
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise _sp.CalledProcessError(returncode=2, cmd=cmd, stderr=b"boom")
+        m = MagicMock(); m.returncode = 0; return m
+
+    monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+    class StubRunner:
+        def __init__(self, *a, **kw): pass
+        def run_one(self, **kw):
+            Path(kw["trace_out"]).parent.mkdir(parents=True, exist_ok=True)
+            Path(kw["trace_out"]).write_bytes(b"\x00")
+            return {"ok": True}
+        def close(self): pass
+
+    class StubParser:
+        def __init__(self, *a, **kw): pass
+        def parse_one(self, **kw):
+            if "out_events" in kw:
+                Path(kw["out_events"]).parent.mkdir(parents=True, exist_ok=True)
+                Path(kw["out_events"]).write_text(
+                    json.dumps({"events": []}))
+            return {"ok": True, "events_count": 0, "cycles": 0, "empty": True}
+        def close(self): pass
+
+    monkeypatch.setattr(_mod, "RunnerSession", StubRunner)
+    monkeypatch.setattr(_mod, "ParseSession", StubParser)
+
+    tiles = [TileSpec(col=0, row=2, tile_type="core")]
+    with pytest.raises(RuntimeError, match="sweep_lockstep failed"):
+        _mod.sweep_lockstep(
+            test_name="fake",
+            compiler="chess",
+            tiles=tiles,
+            build_dir=build_dir,
+            out_dir=out_dir,
+            run_hw=True,
+            run_emu=False,
+            mode="event_pc",
+            with_mode2_baseline=False,  # focus on the sweep failure path
+        )
+
+    # Despite the raise, the manifest must exist and report partial
+    # completion + the error.
+    manifest_path = out_dir / "sweep-manifest.json"
+    assert manifest_path.exists(), "manifest must land even on patch failure"
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["n_batches_completed"] < manifest["n_batches"]
+    assert manifest["sweep_error"] is not None
+    assert "CalledProcessError" in manifest["sweep_error"]
+    # mode2_baseline_captured must be False because the sweep didn't
+    # reach the mode-2 stage.
+    assert manifest["mode2_baseline_captured"] is False
