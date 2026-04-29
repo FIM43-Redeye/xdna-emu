@@ -39,18 +39,14 @@ impl OperationTiming {
     pub const fn simple(latency: u8) -> Self {
         Self {
             latency,
-            throughput: 1,  // Can issue every cycle
+            throughput: 1, // Can issue every cycle
             result_stage: latency.saturating_sub(1),
         }
     }
 
     /// Create timing with explicit throughput.
     pub const fn with_throughput(latency: u8, throughput: u8) -> Self {
-        Self {
-            latency,
-            throughput,
-            result_stage: latency.saturating_sub(1),
-        }
+        Self { latency, throughput, result_stage: latency.saturating_sub(1) }
     }
 }
 
@@ -216,9 +212,7 @@ impl LatencyTable {
     /// Create the AIE2 latency table, populated with LLVM itinerary data.
     pub fn aie2() -> Self {
         let infos = decoder_ffi::query_all_instr_info();
-        let llvm_latencies = infos.into_iter()
-            .map(|info| info.latency)
-            .collect();
+        let llvm_latencies = infos.into_iter().map(|info| info.latency).collect();
         Self { llvm_latencies }
     }
 
@@ -229,54 +223,81 @@ impl LatencyTable {
     pub fn timing_from_semantic(semantic: SemanticOp, is_vector: bool) -> OperationTiming {
         match semantic {
             // ── Arithmetic ──────────────────────────────────────────────
-            SemanticOp::Add | SemanticOp::Adc | SemanticOp::Abs | SemanticOp::Neg
-                if !is_vector => TIMING_SCALAR_1,
-            SemanticOp::Add | SemanticOp::Adc | SemanticOp::Abs | SemanticOp::Neg
-                => TIMING_VECTOR_SIMPLE,
+            SemanticOp::Add | SemanticOp::Adc | SemanticOp::Abs | SemanticOp::Neg if !is_vector => {
+                TIMING_SCALAR_1
+            }
+            SemanticOp::Add | SemanticOp::Adc | SemanticOp::Abs | SemanticOp::Neg => TIMING_VECTOR_SIMPLE,
             SemanticOp::Sub | SemanticOp::Sbc if !is_vector => TIMING_SCALAR_1,
             SemanticOp::Sub | SemanticOp::Sbc => TIMING_VECTOR_SIMPLE,
             SemanticOp::Mul if !is_vector => TIMING_SCALAR_MUL,
             SemanticOp::Mul => TIMING_VECTOR_MUL,
-            SemanticOp::SDiv | SemanticOp::UDiv | SemanticOp::SRem | SemanticOp::URem
+            SemanticOp::SDiv
+            | SemanticOp::UDiv
+            | SemanticOp::SRem
+            | SemanticOp::URem
             | SemanticOp::DivStep
-                if !is_vector => TIMING_SCALAR_DIV,
-            SemanticOp::SDiv | SemanticOp::UDiv | SemanticOp::SRem | SemanticOp::URem
-            | SemanticOp::DivStep
-                => TIMING_VECTOR_MAC, // Vector div uses MAC pipeline
+                if !is_vector =>
+            {
+                TIMING_SCALAR_DIV
+            }
+            SemanticOp::SDiv
+            | SemanticOp::UDiv
+            | SemanticOp::SRem
+            | SemanticOp::URem
+            | SemanticOp::DivStep => TIMING_VECTOR_MAC, // Vector div uses MAC pipeline
 
             // ── Bitwise ─────────────────────────────────────────────────
-            SemanticOp::And | SemanticOp::Or | SemanticOp::Xor | SemanticOp::Not
-                if !is_vector => TIMING_SCALAR_1,
-            SemanticOp::And | SemanticOp::Or | SemanticOp::Xor | SemanticOp::Not
-                => TIMING_VECTOR_SIMPLE, // Vector bitwise uses ALU pipeline
+            SemanticOp::And | SemanticOp::Or | SemanticOp::Xor | SemanticOp::Not if !is_vector => {
+                TIMING_SCALAR_1
+            }
+            SemanticOp::And | SemanticOp::Or | SemanticOp::Xor | SemanticOp::Not => TIMING_VECTOR_SIMPLE, // Vector bitwise uses ALU pipeline
 
             // ── Shifts ──────────────────────────────────────────────────
-            SemanticOp::Shl | SemanticOp::Sra | SemanticOp::Srl
-            | SemanticOp::AshlBidir | SemanticOp::LshlBidir
-                if !is_vector => TIMING_SCALAR_1,
-            SemanticOp::Shl | SemanticOp::Sra | SemanticOp::Srl
-            | SemanticOp::AshlBidir | SemanticOp::LshlBidir
-                => TIMING_VECTOR_SIMPLE,
+            SemanticOp::Shl
+            | SemanticOp::Sra
+            | SemanticOp::Srl
+            | SemanticOp::AshlBidir
+            | SemanticOp::LshlBidir
+                if !is_vector =>
+            {
+                TIMING_SCALAR_1
+            }
+            SemanticOp::Shl
+            | SemanticOp::Sra
+            | SemanticOp::Srl
+            | SemanticOp::AshlBidir
+            | SemanticOp::LshlBidir => TIMING_VECTOR_SIMPLE,
             SemanticOp::Rotl | SemanticOp::Rotr if !is_vector => TIMING_SCALAR_1,
             SemanticOp::Rotl | SemanticOp::Rotr => TIMING_VECTOR_SHUFFLE,
 
             // ── Comparisons ─────────────────────────────────────────────
-            SemanticOp::SetEq | SemanticOp::SetNe
-            | SemanticOp::SetLt | SemanticOp::SetLe
-            | SemanticOp::SetGt | SemanticOp::SetGe
-            | SemanticOp::SetUlt | SemanticOp::SetUle
-            | SemanticOp::SetUgt | SemanticOp::SetUge
-                if !is_vector => TIMING_SCALAR_1,
-            SemanticOp::SetEq | SemanticOp::SetNe
-            | SemanticOp::SetLt | SemanticOp::SetLe
-            | SemanticOp::SetGt | SemanticOp::SetGe
-            | SemanticOp::SetUlt | SemanticOp::SetUle
-            | SemanticOp::SetUgt | SemanticOp::SetUge
-                => TIMING_VECTOR_SIMPLE,
+            SemanticOp::SetEq
+            | SemanticOp::SetNe
+            | SemanticOp::SetLt
+            | SemanticOp::SetLe
+            | SemanticOp::SetGt
+            | SemanticOp::SetGe
+            | SemanticOp::SetUlt
+            | SemanticOp::SetUle
+            | SemanticOp::SetUgt
+            | SemanticOp::SetUge
+                if !is_vector =>
+            {
+                TIMING_SCALAR_1
+            }
+            SemanticOp::SetEq
+            | SemanticOp::SetNe
+            | SemanticOp::SetLt
+            | SemanticOp::SetLe
+            | SemanticOp::SetGt
+            | SemanticOp::SetGe
+            | SemanticOp::SetUlt
+            | SemanticOp::SetUle
+            | SemanticOp::SetUgt
+            | SemanticOp::SetUge => TIMING_VECTOR_SIMPLE,
 
             // ── Bit manipulation (scalar only in practice) ──────────────
-            SemanticOp::Ctlz | SemanticOp::Cttz | SemanticOp::Ctpop | SemanticOp::Bswap
-                => TIMING_SCALAR_1,
+            SemanticOp::Ctlz | SemanticOp::Cttz | SemanticOp::Ctpop | SemanticOp::Bswap => TIMING_SCALAR_1,
             SemanticOp::Clb | SemanticOp::Cmp => TIMING_SCALAR_1,
 
             // ── Memory ──────────────────────────────────────────────────
@@ -291,10 +312,10 @@ impl LatencyTable {
             SemanticOp::Select => TIMING_VECTOR_SIMPLE,
 
             // ── Type conversion ─────────────────────────────────────────
-            SemanticOp::SignExtend | SemanticOp::ZeroExtend | SemanticOp::Truncate
-                if !is_vector => TIMING_SCALAR_1,
-            SemanticOp::SignExtend | SemanticOp::ZeroExtend | SemanticOp::Truncate
-                => TIMING_VECTOR_PACK,
+            SemanticOp::SignExtend | SemanticOp::ZeroExtend | SemanticOp::Truncate if !is_vector => {
+                TIMING_SCALAR_1
+            }
+            SemanticOp::SignExtend | SemanticOp::ZeroExtend | SemanticOp::Truncate => TIMING_VECTOR_PACK,
 
             // ── Move / NOP / Halt ───────────────────────────────────────
             SemanticOp::Copy if !is_vector => TIMING_SCALAR_1,
@@ -307,42 +328,52 @@ impl LatencyTable {
             SemanticOp::LockAcquire | SemanticOp::LockRelease => TIMING_LOCK,
 
             // ── Vector-specific operations ──────────────────────────────
-            SemanticOp::Mac | SemanticOp::MatMul | SemanticOp::MatMulSub
-            | SemanticOp::NegMatMul | SemanticOp::AddMac | SemanticOp::SubMac
-            | SemanticOp::NegMul | SemanticOp::Accumulate
-            | SemanticOp::AccumSub | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub
-                => TIMING_VECTOR_MAC,
-            SemanticOp::Srs | SemanticOp::Ups | SemanticOp::Convert
-            | SemanticOp::Pack | SemanticOp::Unpack
-                => TIMING_VECTOR_PACK,
-            SemanticOp::Shuffle | SemanticOp::Align
-                => TIMING_VECTOR_SHUFFLE,
-            SemanticOp::VectorBroadcast | SemanticOp::VectorExtract
-            | SemanticOp::VectorInsert | SemanticOp::VectorPush
-            | SemanticOp::VectorPushHi | SemanticOp::VectorSelect
-            | SemanticOp::VectorClear
-                => TIMING_VECTOR_SIMPLE,
+            SemanticOp::Mac
+            | SemanticOp::MatMul
+            | SemanticOp::MatMulSub
+            | SemanticOp::NegMatMul
+            | SemanticOp::AddMac
+            | SemanticOp::SubMac
+            | SemanticOp::NegMul
+            | SemanticOp::Accumulate
+            | SemanticOp::AccumSub
+            | SemanticOp::AccumNegAdd
+            | SemanticOp::AccumNegSub => TIMING_VECTOR_MAC,
+            SemanticOp::Srs
+            | SemanticOp::Ups
+            | SemanticOp::Convert
+            | SemanticOp::Pack
+            | SemanticOp::Unpack => TIMING_VECTOR_PACK,
+            SemanticOp::Shuffle | SemanticOp::Align => TIMING_VECTOR_SHUFFLE,
+            SemanticOp::VectorBroadcast
+            | SemanticOp::VectorExtract
+            | SemanticOp::VectorInsert
+            | SemanticOp::VectorPush
+            | SemanticOp::VectorPushHi
+            | SemanticOp::VectorSelect
+            | SemanticOp::VectorClear => TIMING_VECTOR_SIMPLE,
             SemanticOp::Min | SemanticOp::Max => TIMING_VECTOR_SIMPLE,
 
             // ── Conditional vector operations ───────────────────────────
-            SemanticOp::SubLt | SemanticOp::SubGe | SemanticOp::MaxDiffLt
-            | SemanticOp::MaxLt | SemanticOp::MinGe
-            | SemanticOp::AbsGtz | SemanticOp::NegGtz | SemanticOp::NegLtz
-            | SemanticOp::NegAdd
-                => TIMING_VECTOR_SIMPLE,
+            SemanticOp::SubLt
+            | SemanticOp::SubGe
+            | SemanticOp::MaxDiffLt
+            | SemanticOp::MaxLt
+            | SemanticOp::MinGe
+            | SemanticOp::AbsGtz
+            | SemanticOp::NegGtz
+            | SemanticOp::NegLtz
+            | SemanticOp::NegAdd => TIMING_VECTOR_SIMPLE,
 
             // ── Side-effect operations ──────────────────────────────────
-            SemanticOp::CascadeRead | SemanticOp::CascadeWrite
-                => TIMING_VECTOR_SIMPLE,
-            SemanticOp::StreamRead | SemanticOp::StreamWrite
-            | SemanticOp::StreamWritePacketHeader
-                => TIMING_SCALAR_1,
-            SemanticOp::DmaStart | SemanticOp::DmaWait
-                => TIMING_DEFAULT, // Actual wait modeled separately
+            SemanticOp::CascadeRead | SemanticOp::CascadeWrite => TIMING_VECTOR_SIMPLE,
+            SemanticOp::StreamRead | SemanticOp::StreamWrite | SemanticOp::StreamWritePacketHeader => {
+                TIMING_SCALAR_1
+            }
+            SemanticOp::DmaStart | SemanticOp::DmaWait => TIMING_DEFAULT, // Actual wait modeled separately
 
             // ── Pointer operations ──────────────────────────────────────
-            SemanticOp::PointerAdd | SemanticOp::PointerMov
-                => TIMING_SCALAR_1,
+            SemanticOp::PointerAdd | SemanticOp::PointerMov => TIMING_SCALAR_1,
 
             // ── Hardware state reads ──────────────────────────────────────
             SemanticOp::ReadCycleCounter => TIMING_SCALAR_1,
@@ -385,24 +416,29 @@ impl LatencyTable {
         // LATENCY_MEMORY (7) is the full instruction result latency including
         // 2 extra writeback stages visible in AIE2Schedule.td itineraries.
         assert_eq!(
-            model.load_latency + 2, LATENCY_MEMORY,
+            model.load_latency + 2,
+            LATENCY_MEMORY,
             "LATENCY_MEMORY should be ProcessorModel.load_latency ({}) + 2 writeback cycles = {}",
-            model.load_latency, LATENCY_MEMORY
+            model.load_latency,
+            LATENCY_MEMORY
         );
         assert_eq!(
-            model.mispredict_penalty, LATENCY_BRANCH_TAKEN + 1,
+            model.mispredict_penalty,
+            LATENCY_BRANCH_TAKEN + 1,
             "ProcessorModel.mispredict_penalty ({}) != LATENCY_BRANCH_TAKEN+1 ({})",
-            model.mispredict_penalty, LATENCY_BRANCH_TAKEN + 1
+            model.mispredict_penalty,
+            LATENCY_BRANCH_TAKEN + 1
         );
 
         let table = Self::aie2();
 
         // Verify LLVM itinerary data was populated.
-        let with_latency = table.llvm_latencies.iter()
-            .filter(|l| l.is_some())
-            .count();
-        log::info!("LatencyTable: {} / {} opcodes have LLVM itinerary latency",
-            with_latency, table.llvm_latencies.len());
+        let with_latency = table.llvm_latencies.iter().filter(|l| l.is_some()).count();
+        log::info!(
+            "LatencyTable: {} / {} opcodes have LLVM itinerary latency",
+            with_latency,
+            table.llvm_latencies.len()
+        );
 
         table
     }
@@ -421,14 +457,14 @@ pub fn itinerary_to_timing(class_name: &str) -> Option<OperationTiming> {
         "II_AND" | "II_OR" | "II_XOR" => TIMING_SCALAR_1,
         "II_ASHL" | "II_LSHL" => TIMING_SCALAR_1,
         "II_MOV" | "II_MOVA" | "II_MOVX" | "II_MOV_SCL" => TIMING_SCALAR_1,
-        "II_EQ" | "II_NE" | "II_GE" | "II_GEU" | "II_LT" | "II_LTU"
-        | "II_EQZ" | "II_NEZ" => TIMING_SCALAR_1,
+        "II_EQ" | "II_NE" | "II_GE" | "II_GEU" | "II_LT" | "II_LTU" | "II_EQZ" | "II_NEZ" => TIMING_SCALAR_1,
         "II_DIVS" => TIMING_SCALAR_DIV,
         "II_SELEQZ" | "II_SELNEZ" => TIMING_SCALAR_1,
         // Memory
         "II_LDA" | "II_LDA_POST_1D" | "II_LDA_POST_2D" | "II_LDA_POST_3D" => TIMING_LOAD,
-        "II_VLDB" | "II_VLDB_POSTINC" | "II_VLDB_2D" | "II_VLDB_3D"
-        | "II_VLDA_W" | "II_VLDA_AM" => TIMING_LOAD,
+        "II_VLDB" | "II_VLDB_POSTINC" | "II_VLDB_2D" | "II_VLDB_3D" | "II_VLDA_W" | "II_VLDA_AM" => {
+            TIMING_LOAD
+        }
         "II_ST" | "II_ST_POST_1D" | "II_ST_POST_2D" | "II_ST_POST_3D" => TIMING_STORE,
         "II_VST_W" | "II_VST_AM" | "II_VST_POSTINC" => TIMING_STORE,
         // Control flow
@@ -441,8 +477,7 @@ pub fn itinerary_to_timing(class_name: &str) -> Option<OperationTiming> {
         // Vector compute
         "II_VADD" | "II_VSUB" => TIMING_VECTOR_SIMPLE,
         "II_VMUL" | "II_VNEGMUL" => TIMING_VECTOR_MUL,
-        "II_VMAC" | "II_VMSC" | "II_VNEGMAC" | "II_VNEGMSC"
-        | "II_VACC" | "II_VADDMAC" => TIMING_VECTOR_MAC,
+        "II_VMAC" | "II_VMSC" | "II_VNEGMAC" | "II_VNEGMSC" | "II_VACC" | "II_VADDMAC" => TIMING_VECTOR_MAC,
         "II_VSHUFFLE" | "II_VBCSTSHFL" => TIMING_VECTOR_SHUFFLE,
         "II_VPACK" => TIMING_VECTOR_PACK,
         "II_VCMP" => TIMING_VECTOR_SIMPLE,
@@ -618,12 +653,15 @@ mod tests {
 
         // Should not panic -- our constants match AIE2's ProcessorModel
         let table = LatencyTable::validated_aie2(&model);
-        assert_eq!(table.timing_for_slot_op(
-            &SlotOp::from_semantic(
-                crate::interpreter::bundle::SlotIndex::LoadA,
-                SemanticOp::Load,
-            )
-        ).latency, 7);
+        assert_eq!(
+            table
+                .timing_for_slot_op(&SlotOp::from_semantic(
+                    crate::interpreter::bundle::SlotIndex::LoadA,
+                    SemanticOp::Load,
+                ))
+                .latency,
+            7
+        );
     }
 
     #[test]
@@ -664,7 +702,13 @@ mod tests {
         // For these we verify the relationship rather than asserting equality.
         let known_difference_classes: &[&str] = &[
             // Branch/call/return: TableGen models operand timing, not flush penalty.
-            "II_J", "II_JNZ", "II_JZ", "II_JNZD", "II_JL", "II_JL_IND", "II_RET",
+            "II_J",
+            "II_JNZ",
+            "II_JZ",
+            "II_JNZD",
+            "II_JL",
+            "II_JL_IND",
+            "II_RET",
             // NOP: TableGen has 1-cycle stage, we model as 0 (just advances PC).
             "II_NOP",
             // Division: TableGen models operand_cycles[0]=1 because the pipeline
@@ -702,7 +746,9 @@ mod tests {
         if !mismatches.is_empty() {
             panic!(
                 "Latency mismatches between LatencyTable and TableGen itineraries ({}/{} checked):\n{}",
-                mismatches.len(), checked, mismatches.join("\n"),
+                mismatches.len(),
+                checked,
+                mismatches.join("\n"),
             );
         }
     }
@@ -720,37 +766,43 @@ mod tests {
         let infos = decoder_ffi::query_all_instr_info();
 
         // Find a VMAC instruction (latency should be 5 from LLVM itinerary).
-        let vmac_opcode = infos.iter().enumerate()
+        let vmac_opcode = infos
+            .iter()
+            .enumerate()
             .find(|(_, info)| info.latency == Some(5) && !info.is_load())
             .map(|(opcode, _)| opcode as u32);
 
         if let Some(opcode) = vmac_opcode {
-            let mut op = SlotOp::from_semantic(
-                crate::interpreter::bundle::SlotIndex::Vector,
-                SemanticOp::Mac,
-            );
+            let mut op =
+                SlotOp::from_semantic(crate::interpreter::bundle::SlotIndex::Vector, SemanticOp::Mac);
             op.llvm_opcode = Some(opcode);
 
             let timing = table.timing_for_slot_op(&op);
-            assert_eq!(timing.latency, 5,
-                "LLVM itinerary path should return latency 5 for opcode {}", opcode);
+            assert_eq!(
+                timing.latency, 5,
+                "LLVM itinerary path should return latency 5 for opcode {}",
+                opcode
+            );
         }
 
         // Find a load instruction (latency should be 7).
-        let load_opcode = infos.iter().enumerate()
+        let load_opcode = infos
+            .iter()
+            .enumerate()
             .find(|(_, info)| info.latency == Some(7) && info.is_load())
             .map(|(opcode, _)| opcode as u32);
 
         if let Some(opcode) = load_opcode {
-            let mut op = SlotOp::from_semantic(
-                crate::interpreter::bundle::SlotIndex::LoadA,
-                SemanticOp::Load,
-            );
+            let mut op =
+                SlotOp::from_semantic(crate::interpreter::bundle::SlotIndex::LoadA, SemanticOp::Load);
             op.llvm_opcode = Some(opcode);
 
             let timing = table.timing_for_slot_op(&op);
-            assert_eq!(timing.latency, 7,
-                "LLVM itinerary path should return latency 7 for load opcode {}", opcode);
+            assert_eq!(
+                timing.latency, 7,
+                "LLVM itinerary path should return latency 7 for load opcode {}",
+                opcode
+            );
         }
     }
 
@@ -760,14 +812,10 @@ mod tests {
         let table = LatencyTable::aie2();
 
         // SlotOp without llvm_opcode should use SemanticOp path.
-        let op = SlotOp::from_semantic(
-            crate::interpreter::bundle::SlotIndex::Scalar0,
-            SemanticOp::Add,
-        );
+        let op = SlotOp::from_semantic(crate::interpreter::bundle::SlotIndex::Scalar0, SemanticOp::Add);
         assert!(op.llvm_opcode.is_none());
 
         let timing = table.timing_for_slot_op(&op);
-        assert_eq!(timing.latency, LATENCY_SCALAR_ADD,
-            "Without llvm_opcode, should fall back to SemanticOp");
+        assert_eq!(timing.latency, LATENCY_SCALAR_ADD, "Without llvm_opcode, should fall back to SemanticOp");
     }
 }

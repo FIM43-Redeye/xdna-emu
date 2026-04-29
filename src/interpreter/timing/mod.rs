@@ -47,6 +47,8 @@ pub use memory::{MemoryModel, MemoryAccess, BankConflict, AlignmentError, Memory
 pub use hazards::{HazardDetector, HazardType, HazardStats, Hazard, StallReason};
 pub use sync::{LockTimingState, LockStats, SyncTimingConfig, AggregateStats};
 pub use deadlock::{DeadlockDetector, DeadlockCycle, DeadlockConfig, TileId, LockId};
-pub use barrier::{BarrierTracker, BarrierState, BarrierConfig, BarrierStats, BarrierPhase, BarrierId, AggregateBarrierStats};
+pub use barrier::{
+    BarrierTracker, BarrierState, BarrierConfig, BarrierStats, BarrierPhase, BarrierId, AggregateBarrierStats,
+};
 pub use slots::{ExecutionResource, StructuralHazard, check_bundle_conflicts, bundle_structural_penalty};
 pub use arbitration::{MemTileArbiter, ArbiterSource, ArbiterStats};

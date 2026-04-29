@@ -142,18 +142,20 @@ impl MemoryQuadrant {
         let card_dir = (address / bank_size) as u8;
         match card_dir {
             SOUTH => Self::South,
-            WEST  => Self::West,
+            WEST => Self::West,
             NORTH => Self::North,
-            EAST  => if map.is_checkerboard {
-                // AIE1: East is the eastern neighbor (cross-tile access).
-                // A row-parity check would refine the West/East mapping;
-                // we don't have an AIE1 path today, so treat both halves
-                // as cross-tile until that arch lands.
-                Self::East
-            } else {
-                // AIE2/AIE2P: East is always local.
-                Self::Local
-            },
+            EAST => {
+                if map.is_checkerboard {
+                    // AIE1: East is the eastern neighbor (cross-tile access).
+                    // A row-parity check would refine the West/East mapping;
+                    // we don't have an AIE1 path today, so treat both halves
+                    // as cross-tile until that arch lands.
+                    Self::East
+                } else {
+                    // AIE2/AIE2P: East is always local.
+                    Self::Local
+                }
+            }
             _ => Self::Local,
         }
     }
@@ -325,9 +327,7 @@ impl MemoryAccess {
         let end_offset = start_offset + self.width as u32;
         let num_banks = ((end_offset + bytes_per_bank - 1) / bytes_per_bank) as u8;
 
-        (0..num_banks)
-            .map(|i| (start_bank + i) % NUM_BANKS as u8)
-            .collect()
+        (0..num_banks).map(|i| (start_bank + i) % NUM_BANKS as u8).collect()
     }
 
     /// Get the memory quadrant for this access.
@@ -365,10 +365,7 @@ pub struct BankConflict {
 
 impl BankConflict {
     /// No conflict.
-    pub const NONE: Self = Self {
-        stall_cycles: 0,
-        conflict_banks: 0,
-    };
+    pub const NONE: Self = Self { stall_cycles: 0, conflict_banks: 0 };
 
     /// Check if there was any conflict.
     #[inline]
@@ -441,10 +438,7 @@ impl MemoryModel {
             }
         }
 
-        BankConflict {
-            stall_cycles: max_stall,
-            conflict_banks,
-        }
+        BankConflict { stall_cycles: max_stall, conflict_banks }
     }
 
     /// Record a memory access and return any conflict penalty.
@@ -502,10 +496,7 @@ impl MemoryModel {
             stall_cycles = stall_cycles.saturating_add(prev_conflict.stall_cycles);
         }
 
-        BankConflict {
-            stall_cycles,
-            conflict_banks,
-        }
+        BankConflict { stall_cycles, conflict_banks }
     }
 
     /// Get total latency for a memory access (base + conflict penalty + cross-tile).
@@ -517,9 +508,7 @@ impl MemoryModel {
     pub fn access_latency(&self, access: &MemoryAccess) -> u8 {
         let conflict = self.check_conflict(access);
         let cross_tile = access.cross_tile_latency();
-        BASE_LATENCY
-            .saturating_add(conflict.stall_cycles)
-            .saturating_add(cross_tile)
+        BASE_LATENCY.saturating_add(conflict.stall_cycles).saturating_add(cross_tile)
     }
 
     /// Get just the cross-tile routing latency for an access.
@@ -591,10 +580,7 @@ mod tests {
     fn test_bank_width_matches_aiert() {
         // aie-rt: XAIEMLGBL_MEMORY_MODULE_DATAMEMORY_WIDTH = 128 bits = 16 bytes
         assert_eq!(BANK_WIDTH_BYTES, 16);
-        assert_eq!(
-            BANK_WIDTH_BYTES,
-            xdna_archspec::aie2::compute::PHYSICAL_BANK_WIDTH_BITS as usize / 8,
-        );
+        assert_eq!(BANK_WIDTH_BYTES, xdna_archspec::aie2::compute::PHYSICAL_BANK_WIDTH_BITS as usize / 8,);
     }
 
     #[test]
@@ -780,11 +766,7 @@ mod tests {
 
     #[test]
     fn test_alignment_error_display() {
-        let err = AlignmentError {
-            address: 0x123,
-            width: 4,
-            required_alignment: 4,
-        };
+        let err = AlignmentError { address: 0x123, width: 4, required_alignment: 4 };
         let msg = format!("{}", err);
         assert!(msg.contains("0x00000123"));
         assert!(msg.contains("width 4"));

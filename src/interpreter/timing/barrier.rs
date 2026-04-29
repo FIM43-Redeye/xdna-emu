@@ -68,20 +68,12 @@ pub struct BarrierConfig {
 impl BarrierConfig {
     /// Create a new barrier configuration.
     pub fn new(participants: u8) -> Self {
-        Self {
-            participants,
-            timeout_cycles: 0,
-            auto_reset: true,
-        }
+        Self { participants, timeout_cycles: 0, auto_reset: true }
     }
 
     /// Create with a timeout.
     pub fn with_timeout(participants: u8, timeout_cycles: u64) -> Self {
-        Self {
-            participants,
-            timeout_cycles,
-            auto_reset: true,
-        }
+        Self { participants, timeout_cycles, auto_reset: true }
     }
 
     /// Set auto-reset behavior.
@@ -354,19 +346,12 @@ pub struct BarrierTracker {
 impl BarrierTracker {
     /// Create a new barrier tracker.
     pub fn new() -> Self {
-        Self {
-            barriers: HashMap::new(),
-            stats: HashMap::new(),
-            enabled: true,
-        }
+        Self { barriers: HashMap::new(), stats: HashMap::new(), enabled: true }
     }
 
     /// Create a disabled tracker (for fast simulation).
     pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            ..Default::default()
-        }
+        Self { enabled: false, ..Default::default() }
     }
 
     /// Check if tracking is enabled.
@@ -446,16 +431,12 @@ impl BarrierTracker {
 
     /// Check if a barrier is complete.
     pub fn is_complete(&self, barrier_id: BarrierId) -> bool {
-        self.barriers
-            .get(&barrier_id)
-            .map_or(false, |s| s.is_complete())
+        self.barriers.get(&barrier_id).map_or(false, |s| s.is_complete())
     }
 
     /// Check if a barrier is waiting for more participants.
     pub fn is_waiting(&self, barrier_id: BarrierId) -> bool {
-        self.barriers
-            .get(&barrier_id)
-            .map_or(false, |s| s.is_waiting())
+        self.barriers.get(&barrier_id).map_or(false, |s| s.is_waiting())
     }
 
     /// Get wait cycles for a tile at a barrier.
@@ -613,7 +594,7 @@ mod tests {
         // Wait cycles = completion - arrival
         assert_eq!(state.wait_cycles(tile1), Some(30)); // 130 - 100
         assert_eq!(state.wait_cycles(tile2), Some(15)); // 130 - 115
-        assert_eq!(state.wait_cycles(tile3), Some(0));  // 130 - 130 (last arrival)
+        assert_eq!(state.wait_cycles(tile3), Some(0)); // 130 - 130 (last arrival)
 
         // Sync delay = last - first
         assert_eq!(state.sync_delay(), Some(30)); // 130 - 100

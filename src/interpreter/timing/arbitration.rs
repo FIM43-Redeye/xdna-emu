@@ -118,10 +118,7 @@ impl MemTileArbiter {
         }
 
         // Add this request
-        self.pending.push(PendingRequest {
-            source,
-            _request_cycle: cycle,
-        });
+        self.pending.push(PendingRequest { source, _request_cycle: cycle });
 
         // If this is the only request, grant immediately
         if self.pending.len() == 1 {

@@ -91,10 +91,7 @@ impl LockId {
     /// Create from raw coordinates.
     #[inline]
     pub const fn from_coords(col: u8, row: u8, index: u8) -> Self {
-        Self {
-            tile: TileId::new(col, row),
-            index,
-        }
+        Self { tile: TileId::new(col, row), index }
     }
 }
 
@@ -174,10 +171,7 @@ impl DeadlockDetector {
 
     /// Create a disabled detector (for fast simulation).
     pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            ..Default::default()
-        }
+        Self { enabled: false, ..Default::default() }
     }
 
     /// Check if detection is enabled.
@@ -293,18 +287,13 @@ impl DeadlockDetector {
             for &holder in holders {
                 // Found a cycle back to start!
                 if holder == start && path_tiles.len() > 1 {
-                    return Some(DeadlockCycle {
-                        tiles: path_tiles.clone(),
-                        locks: path_locks.clone(),
-                    });
+                    return Some(DeadlockCycle { tiles: path_tiles.clone(), locks: path_locks.clone() });
                 }
 
                 // Continue DFS if not visited and holder is also waiting
                 if !visited.contains(&holder) && self.waiting_for.contains_key(&holder) {
                     visited.insert(holder);
-                    if let Some(cycle) =
-                        self.dfs_cycle(holder, start, visited, path_tiles, path_locks)
-                    {
+                    if let Some(cycle) = self.dfs_cycle(holder, start, visited, path_tiles, path_locks) {
                         return Some(cycle);
                     }
                     visited.remove(&holder);
@@ -390,7 +379,7 @@ impl Default for DeadlockConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_cycle_length: 16, // Reasonable limit for AIE2 arrays
+            max_cycle_length: 16,    // Reasonable limit for AIE2 arrays
             check_on_acquire: false, // Only check on explicit request
         }
     }
@@ -399,11 +388,7 @@ impl Default for DeadlockConfig {
 impl DeadlockConfig {
     /// Create a disabled configuration for fast simulation.
     pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            max_cycle_length: 0,
-            check_on_acquire: false,
-        }
+        Self { enabled: false, max_cycle_length: 0, check_on_acquire: false }
     }
 
     /// Create an aggressive configuration that checks on every acquire.
@@ -607,10 +592,7 @@ mod tests {
     fn test_deadlock_cycle_display() {
         let cycle = DeadlockCycle {
             tiles: vec![TileId::new(0, 2), TileId::new(0, 3)],
-            locks: vec![
-                LockId::from_coords(0, 2, 5),
-                LockId::from_coords(0, 2, 7),
-            ],
+            locks: vec![LockId::from_coords(0, 2, 5), LockId::from_coords(0, 2, 7)],
         };
 
         let display = format!("{}", cycle);

@@ -64,11 +64,7 @@ impl SyncTimingConfig {
 
     /// Create instant timing (no delays, for fast simulation).
     pub fn instant() -> Self {
-        Self {
-            acquire_latency: 0,
-            release_latency: 0,
-            retry_interval: 0,
-        }
+        Self { acquire_latency: 0, release_latency: 0, retry_interval: 0 }
     }
 }
 
@@ -139,10 +135,7 @@ impl LockTimingState {
 
     /// Create with custom configuration.
     pub fn with_config(num_locks: usize, config: SyncTimingConfig) -> Self {
-        Self {
-            config,
-            stats: vec![LockStats::default(); num_locks],
-        }
+        Self { config, stats: vec![LockStats::default(); num_locks] }
     }
 
     /// Get the timing configuration.

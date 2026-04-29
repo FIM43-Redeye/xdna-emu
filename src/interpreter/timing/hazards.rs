@@ -44,29 +44,15 @@ pub enum StallReason {
         cycles: u8,
     },
     /// Memory bank conflict.
-    MemoryConflict {
-        bank: u8,
-        cycles: u8,
-    },
+    MemoryConflict { bank: u8, cycles: u8 },
     /// Branch taken penalty (pipeline flush).
-    BranchPenalty {
-        cycles: u8,
-    },
+    BranchPenalty { cycles: u8 },
     /// Structural hazard (resource conflict between slots).
-    StructuralHazard {
-        resource: &'static str,
-        cycles: u8,
-    },
+    StructuralHazard { resource: &'static str, cycles: u8 },
     /// Lock contention (waiting to acquire lock).
-    LockContention {
-        lock_id: u8,
-        cycles: u64,
-    },
+    LockContention { lock_id: u8, cycles: u64 },
     /// DMA wait (waiting for transfer to complete).
-    DmaWait {
-        channel: u8,
-        cycles: u64,
-    },
+    DmaWait { channel: u8, cycles: u64 },
 }
 
 impl StallReason {
@@ -532,11 +518,7 @@ mod tests {
     #[test]
     fn test_stall_reason_cycles() {
         // Pipeline stalls (u8 cycles)
-        let reg_hazard = StallReason::RegisterHazard {
-            hazard_type: HazardType::Raw,
-            register: 5,
-            cycles: 3,
-        };
+        let reg_hazard = StallReason::RegisterHazard { hazard_type: HazardType::Raw, register: 5, cycles: 3 };
         assert_eq!(reg_hazard.cycles(), 3);
 
         let mem_conflict = StallReason::MemoryConflict { bank: 2, cycles: 4 };
@@ -545,71 +527,38 @@ mod tests {
         let branch = StallReason::BranchPenalty { cycles: 7 };
         assert_eq!(branch.cycles(), 7);
 
-        let structural = StallReason::StructuralHazard {
-            resource: "VectorUnit",
-            cycles: 2,
-        };
+        let structural = StallReason::StructuralHazard { resource: "VectorUnit", cycles: 2 };
         assert_eq!(structural.cycles(), 2);
 
         // Long stalls (u64 cycles)
-        let lock = StallReason::LockContention {
-            lock_id: 3,
-            cycles: 1000,
-        };
+        let lock = StallReason::LockContention { lock_id: 3, cycles: 1000 };
         assert_eq!(lock.cycles(), 1000);
 
-        let dma = StallReason::DmaWait {
-            channel: 1,
-            cycles: 5000,
-        };
+        let dma = StallReason::DmaWait { channel: 1, cycles: 5000 };
         assert_eq!(dma.cycles(), 5000);
     }
 
     #[test]
     fn test_stall_reason_is_pipeline_stall() {
         // Pipeline stalls
-        assert!(StallReason::RegisterHazard {
-            hazard_type: HazardType::Raw,
-            register: 0,
-            cycles: 1
-        }
-        .is_pipeline_stall());
+        assert!(StallReason::RegisterHazard { hazard_type: HazardType::Raw, register: 0, cycles: 1 }
+            .is_pipeline_stall());
         assert!(StallReason::MemoryConflict { bank: 0, cycles: 1 }.is_pipeline_stall());
         assert!(StallReason::BranchPenalty { cycles: 3 }.is_pipeline_stall());
-        assert!(StallReason::StructuralHazard {
-            resource: "ALU",
-            cycles: 1
-        }
-        .is_pipeline_stall());
+        assert!(StallReason::StructuralHazard { resource: "ALU", cycles: 1 }.is_pipeline_stall());
 
         // Non-pipeline stalls (external waits)
-        assert!(!StallReason::LockContention {
-            lock_id: 0,
-            cycles: 100
-        }
-        .is_pipeline_stall());
-        assert!(!StallReason::DmaWait {
-            channel: 0,
-            cycles: 100
-        }
-        .is_pipeline_stall());
+        assert!(!StallReason::LockContention { lock_id: 0, cycles: 100 }.is_pipeline_stall());
+        assert!(!StallReason::DmaWait { channel: 0, cycles: 100 }.is_pipeline_stall());
     }
 
     #[test]
     fn test_hazard_to_stall_reason() {
-        let hazard = Hazard {
-            hazard_type: HazardType::Raw,
-            register: 7,
-            stall_cycles: 3,
-        };
+        let hazard = Hazard { hazard_type: HazardType::Raw, register: 7, stall_cycles: 3 };
 
         let reason = hazard.to_stall_reason();
         match reason {
-            StallReason::RegisterHazard {
-                hazard_type,
-                register,
-                cycles,
-            } => {
+            StallReason::RegisterHazard { hazard_type, register, cycles } => {
                 assert_eq!(hazard_type, HazardType::Raw);
                 assert_eq!(register, 7);
                 assert_eq!(cycles, 3);
@@ -625,21 +574,13 @@ mod tests {
         let mut stats = HazardStats::default();
 
         // Record RAW hazard
-        stats.record(&StallReason::RegisterHazard {
-            hazard_type: HazardType::Raw,
-            register: 5,
-            cycles: 2,
-        });
+        stats.record(&StallReason::RegisterHazard { hazard_type: HazardType::Raw, register: 5, cycles: 2 });
         assert_eq!(stats.raw_hazards, 1);
         assert_eq!(stats.register_stall_cycles, 2);
         assert_eq!(stats.total_stall_cycles, 2);
 
         // Record WAW hazard
-        stats.record(&StallReason::RegisterHazard {
-            hazard_type: HazardType::Waw,
-            register: 3,
-            cycles: 3,
-        });
+        stats.record(&StallReason::RegisterHazard { hazard_type: HazardType::Waw, register: 3, cycles: 3 });
         assert_eq!(stats.raw_hazards, 1);
         assert_eq!(stats.waw_hazards, 1);
         assert_eq!(stats.register_stall_cycles, 5);
@@ -650,17 +591,10 @@ mod tests {
     fn test_hazard_stats_record_all_types() {
         let mut stats = HazardStats::default();
 
-        stats.record(&StallReason::RegisterHazard {
-            hazard_type: HazardType::Raw,
-            register: 0,
-            cycles: 2,
-        });
+        stats.record(&StallReason::RegisterHazard { hazard_type: HazardType::Raw, register: 0, cycles: 2 });
         stats.record(&StallReason::MemoryConflict { bank: 1, cycles: 3 });
         stats.record(&StallReason::BranchPenalty { cycles: 7 });
-        stats.record(&StallReason::StructuralHazard {
-            resource: "VectorUnit",
-            cycles: 4,
-        });
+        stats.record(&StallReason::StructuralHazard { resource: "VectorUnit", cycles: 4 });
 
         assert_eq!(stats.register_stall_cycles, 2);
         assert_eq!(stats.memory_stall_cycles, 3);
@@ -674,14 +608,8 @@ mod tests {
         // Lock/DMA waits are external and not counted in pipeline stall total
         let mut stats = HazardStats::default();
 
-        stats.record(&StallReason::LockContention {
-            lock_id: 5,
-            cycles: 100,
-        });
-        stats.record(&StallReason::DmaWait {
-            channel: 0,
-            cycles: 200,
-        });
+        stats.record(&StallReason::LockContention { lock_id: 5, cycles: 100 });
+        stats.record(&StallReason::DmaWait { channel: 0, cycles: 200 });
 
         // These should NOT affect pipeline stall counts
         assert_eq!(stats.register_stall_cycles, 0);
