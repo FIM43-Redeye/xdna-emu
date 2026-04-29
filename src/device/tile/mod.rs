@@ -558,9 +558,13 @@ impl Tile {
     ///
     /// Forwards the event to `core_trace.notify_event()` and marks it as
     /// active for the core module edge detectors this cycle.
+    ///
+    /// `pc` should be `Some(addr)` for instruction-class events (InstrVector,
+    /// InstrLoad, etc.) and `None` for stalls, synthetic events, and any
+    /// event where a meaningful program counter is not available.
     #[inline]
-    pub fn notify_core_trace_event(&mut self, hw_id: u8, cycle: u64) {
-        self.core_trace.notify_event(hw_id, cycle, None);
+    pub fn notify_core_trace_event(&mut self, hw_id: u8, cycle: u64, pc: Option<u32>) {
+        self.core_trace.notify_event(hw_id, cycle, pc);
         for det in &mut self.core_edge_detectors {
             if det.input_event == hw_id {
                 det.curr_active = true;
@@ -572,9 +576,12 @@ impl Tile {
     ///
     /// Forwards the event to `mem_trace.notify_event()` and marks it as
     /// active for the memory module edge detectors this cycle.
+    ///
+    /// Memory-module events (DMA, lock, port) do not carry a program counter;
+    /// always pass `None`.
     #[inline]
-    pub fn notify_mem_trace_event(&mut self, hw_id: u8, cycle: u64) {
-        self.mem_trace.notify_event(hw_id, cycle, None);
+    pub fn notify_mem_trace_event(&mut self, hw_id: u8, cycle: u64, pc: Option<u32>) {
+        self.mem_trace.notify_event(hw_id, cycle, pc);
         for det in &mut self.mem_edge_detectors {
             if det.input_event == hw_id {
                 det.curr_active = true;

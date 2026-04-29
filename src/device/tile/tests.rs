@@ -322,7 +322,7 @@ fn test_edge_detector_rising_edge() {
     tile.core_trace.write_register(0x10, 37 | (13 << 8)); // slot 0=37, slot 1=13
 
     // Cycle 1: event 37 fires (0->1 = rising edge)
-    tile.notify_core_trace_event(37, 100);
+    tile.notify_core_trace_event(37, 100, None);
     tile.evaluate_edge_detectors(100);
     // The edge detector should have detected rising edge and fired event 13
 
@@ -331,7 +331,7 @@ fn test_edge_detector_rising_edge() {
     // No event should fire (falling not configured)
 
     // Cycle 3: event 37 fires again (0->1 = rising edge again)
-    tile.notify_core_trace_event(37, 300);
+    tile.notify_core_trace_event(37, 300, None);
     tile.evaluate_edge_detectors(300);
     // Rising edge detected again
 }
@@ -344,7 +344,7 @@ fn test_edge_detector_falling_edge() {
     tile.mem_edge_detectors[1].trigger_falling = true;
 
     // Cycle 1: event fires (0->1), no trigger (falling only)
-    tile.notify_mem_trace_event(77, 100);
+    tile.notify_mem_trace_event(77, 100, None);
     tile.evaluate_edge_detectors(100);
 
     // Cycle 2: event does NOT fire (1->0 = falling edge)
@@ -405,7 +405,7 @@ fn test_edge_detector_no_trigger_when_unconfigured() {
     let mut tile = Tile::compute(0, 2);
     // Default: no edge detection configured (input_event=0, no triggers)
     // Notify event 37
-    tile.notify_core_trace_event(37, 100);
+    tile.notify_core_trace_event(37, 100, None);
     tile.evaluate_edge_detectors(100);
     // No edge events should fire (detectors not configured)
     // Just verify it doesn't panic
@@ -449,7 +449,7 @@ fn test_shim_dma_event_notification() {
     // Shim DMA events go through core_trace (PL module)
     // DMA_S2MM_0_START_TASK = PL event 14
     let tile = device.array.get_mut(0, 0).unwrap();
-    tile.notify_core_trace_event(14, 100);
+    tile.notify_core_trace_event(14, 100, None);
     // Should not panic, trace unit accepts it
 }
 

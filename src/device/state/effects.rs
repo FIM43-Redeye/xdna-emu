@@ -374,8 +374,9 @@ impl DeviceState {
                 if let Some(tile) = self.array.get_mut(col as u8, row as u8) {
                     // Notify both trace units -- the trace unit checks if the
                     // event matches its configured start/stop event.
-                    tile.notify_core_trace_event(*hw_id, current_cycle);
-                    tile.notify_mem_trace_event(*hw_id, current_cycle);
+                    // Broadcast re-emission carries no live PC.
+                    tile.notify_core_trace_event(*hw_id, current_cycle, None);
+                    tile.notify_mem_trace_event(*hw_id, current_cycle, None);
                 }
             }
         }

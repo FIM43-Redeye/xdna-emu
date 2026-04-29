@@ -678,7 +678,8 @@ impl InterpreterEngine {
                         let cycle = self.total_cycles;
                         for evt in &events[new_start..] {
                             if let Some(hw_id) = crate::trace::core_event_to_hw_id(&evt.event) {
-                                tile.notify_core_trace_event(hw_id, cycle);
+                                let pc = crate::trace::event_pc(&evt.event);
+                                tile.notify_core_trace_event(hw_id, cycle, pc);
                             }
                         }
                         core.trace_events_consumed = events.len();
@@ -783,15 +784,16 @@ impl InterpreterEngine {
             if let Some(tile) = self.device.array.get_mut(col, row) {
                 if tile.is_shim() {
                     if let Some(id) = crate::trace::shim_event_to_hw_id(&event) {
-                        tile.notify_core_trace_event(id, cycle);
+                        // Shim DMA/lock events have no program counter.
+                        tile.notify_core_trace_event(id, cycle, None);
                     }
                 } else if tile.is_mem() {
                     if let Some(id) = crate::trace::memtile_event_to_hw_id(&event) {
-                        tile.notify_mem_trace_event(id, cycle);
+                        tile.notify_mem_trace_event(id, cycle, None);
                     }
                 } else {
                     if let Some(id) = crate::trace::mem_event_to_hw_id(&event) {
-                        tile.notify_mem_trace_event(id, cycle);
+                        tile.notify_mem_trace_event(id, cycle, None);
                     }
                 }
             }
@@ -872,10 +874,11 @@ impl InterpreterEngine {
                 // Compute tiles: core_trace (CoreEvent namespace)
                 // Shim tiles: core_trace (PL module, single trace unit)
                 // MemTiles: mem_trace (MemTileEvent namespace)
+                // Port events are level-triggered and post-hoc; no PC.
                 if tt.is_mem() {
-                    tile.notify_mem_trace_event(hw_id, cycle);
+                    tile.notify_mem_trace_event(hw_id, cycle, None);
                 } else {
-                    tile.notify_core_trace_event(hw_id, cycle);
+                    tile.notify_core_trace_event(hw_id, cycle, None);
                 }
             }
         }
@@ -933,7 +936,8 @@ impl InterpreterEngine {
                 } else {
                     crate::trace::mem_conflict_dm_bank_hw_id(bank)
                 };
-                tile.notify_mem_trace_event(hw_id, cycle);
+                // Memory-module event; no program counter.
+                tile.notify_mem_trace_event(hw_id, cycle, None);
             }
             // Emit MEMORY_STALL (core event 23) for each core that lost a
             // bank to the DMA this cycle. Bump the core's stall counter too.
@@ -946,7 +950,9 @@ impl InterpreterEngine {
                         &crate::interpreter::state::EventType::MemoryStall { cycles: 1 },
                     );
                     if let Some(id) = hw_id {
-                        tile.notify_core_trace_event(id, cycle);
+                        // MEMORY_STALL is a stall event; MemoryStall carries no pc field.
+                        // TODO: thread PC for synthetic MEMORY_STALL once available.
+                        tile.notify_core_trace_event(id, cycle, None);
                     }
                 }
                 let ctx = &mut self.cores[core_idx].context;
@@ -1035,8 +1041,9 @@ impl InterpreterEngine {
                 for cnt_idx in core_fired {
                     let hw_id = PERF_CNT_BASE + cnt_idx as u8;
                     // Feed back so self-reset configs work, then trace-notify.
+                    // Perf counter threshold events carry no instruction PC.
                     tile.core_perf_counters.handle_event(hw_id);
-                    tile.notify_core_trace_event(hw_id, cycle);
+                    tile.notify_core_trace_event(hw_id, cycle, None);
                 }
 
                 // Memory module perf counters tick unconditionally.
@@ -1044,7 +1051,7 @@ impl InterpreterEngine {
                 for cnt_idx in mem_fired {
                     let hw_id = PERF_CNT_BASE + cnt_idx as u8;
                     tile.mem_perf_counters.handle_event(hw_id);
-                    tile.notify_mem_trace_event(hw_id, cycle);
+                    tile.notify_mem_trace_event(hw_id, cycle, None);
                 }
             }
         }
@@ -1862,6 +1869,100 @@ mod tests {
              coalesced at cycle 4); got {} Multiple frames total, {} with mask=0b11. \
              Buffer: {:02X?}",
             multiple_count, multiple_with_mask_3, bytes
+        );
+    }
+
+    /// Verifies that PC values are threaded from the core EventLog through
+    /// the coordinator drain loop into the trace unit's mode-1 (EventPc) encoder.
+    ///
+    /// Flow under test:
+    ///   EventType::InstrVector { pc: 0x100 }
+    ///     -> core.context.timing_context().events
+    ///     -> coordinator Phase 2 drain
+    ///     -> trace::event_pc(&evt.event) = Some(0x100)
+    ///     -> notify_core_trace_event(37, cycle, Some(0x100))
+    ///     -> TraceUnit::notify_event(37, 0, Some(0x100))
+    ///     -> pending_pc = 0x100, pending_slot_mask = 0b1
+    ///     -> Phase 3f commit_cycle -> encode_event_pc(mask=1, pc=0x100)
+    ///     -> byte_buffer[8..12] = [0xC4, 0x04, 0x01, 0x00]
+    ///
+    /// The test locks in that PC threading actually flows end-to-end from the
+    /// EventType variant through event_pc() to the encoded EventPC frame.
+    #[test]
+    fn test_instr_vector_pc_threads_into_mode1_event_pc_frame() {
+        use crate::interpreter::state::EventType;
+
+        let mut engine = InterpreterEngine::new_npu1();
+
+        // Enable core (0,2) with NOPs so the step doesn't halt.
+        engine.enable_core(0, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+            tile.write_program(0, &[0x00u8; 256]);
+        }
+
+        // Configure core_trace on tile (0,2) in EventPc mode (mode=1):
+        //   start_event = TRUE (hw_id=1), stop_event = NONE (hw_id=0)
+        //   slot 0 = INSTR_VECTOR (hw_id=37)
+        {
+            let tile = engine.device_mut().array.tile_mut(0, 2);
+            // Trace_Control0: stop[31:24]=0, start[23:16]=1, mode[1:0]=1
+            let ctrl0 = (0u32 << 24) | (1u32 << 16) | 1u32;
+            tile.core_trace.write_register(0x00, ctrl0);
+            // Trace_Event0: slot 0 = INSTR_VECTOR = 37
+            tile.core_trace.write_register(0x10, 37u32);
+
+            // Pre-arm: fire the start event (TRUE=1) directly so the trace
+            // unit transitions Idle->Running before the coordinator's Phase 2.
+            // This mirrors what Phase 3c would do one cycle later, but we
+            // need it done before Phase 2 drains the synthetic event below.
+            tile.core_trace.notify_event(1, 0, None);
+        }
+
+        // Inject a synthetic InstrVector event at cycle 0 into core (0,2).
+        // The coordinator drain loop reads from trace_events_consumed=0,
+        // which points to this event, and will call notify_core_trace_event
+        // with the pc extracted by trace::event_pc().
+        {
+            let ctx = engine.core_context_mut(0, 2).unwrap();
+            ctx.timing_context_mut().events.record(0, EventType::InstrVector { pc: 0x100 });
+        }
+
+        // Run 1 cycle: the drain loop processes the synthetic InstrVector event,
+        // calls notify_core_trace_event(37, 0, Some(0x100)), which sets
+        // pending_slot_mask=0b1 and pending_pc=0x100. Phase 3f commits the
+        // frame: encode_event_pc(mask=1, pc=0x0100) appends 4 bytes.
+        let _cycles = engine.run(1);
+
+        let tile = engine.device().array.tile(0, 2);
+        let bytes = tile.core_trace.encoded_bytes();
+
+        // Start marker for mode 1 is 0xF1 (not 0xF0).
+        assert_eq!(
+            bytes.first().copied(),
+            Some(0xF1),
+            "expected mode-1 Start marker 0xF1 as first byte; got {:02X?}",
+            bytes
+        );
+        assert!(
+            bytes.len() >= 12,
+            "expected at least 12 bytes (8 start marker + 4 EventPC frame); \
+             got {} bytes: {:02X?}",
+            bytes.len(), bytes
+        );
+
+        // Decode the EventPC frame at bytes[8..12].
+        // encode_event_pc(mask=0b00000001, pc14=0x0100):
+        //   byte0 = 0b1100_0100 | (mask >> 6 & 0b11) = 0xC4 | 0 = 0xC4
+        //   byte1 = (mask & 0b0011_1111) << 2 = (1 & 63) << 2 = 0x04
+        //   byte2 = (pc14 >> 8) & 0x3F = (0x100 >> 8) & 0x3F = 0x01
+        //   byte3 = pc14 & 0xFF = 0x00
+        let frame = &bytes[8..12];
+        assert_eq!(
+            frame, &[0xC4, 0x04, 0x01, 0x00],
+            "EventPC frame mismatch: expected [0xC4, 0x04, 0x01, 0x00] \
+             (mask=0b1, pc=0x100), got {:02X?}. \
+             Full buffer: {:02X?}",
+            frame, bytes
         );
     }
 }

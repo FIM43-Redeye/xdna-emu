@@ -126,6 +126,33 @@ pub fn core_event_to_hw_id(event: &EventType) -> Option<u8> {
     }
 }
 
+/// Extract the PC field from an EventType variant, if it carries one.
+///
+/// Returns `Some(pc)` for instruction-class events (InstrVector, InstrLoad,
+/// InstrStore, InstrCall, InstrReturn, InstrLockAcquireReq, InstrLockReleaseReq,
+/// InstrStreamGet, InstrStreamPut, InstrEvent). These are the 10 variants that
+/// carry an actual program counter at the point the instruction retired.
+///
+/// Returns `None` for core-state events (CoreActive, CoreDisabled), stall events
+/// (MemoryStall, LockStall, StreamStall), memory-module events (DMA, lock, port),
+/// branch events, and any other variant whose PC is either not meaningful or not
+/// directly available at notify time.
+pub fn event_pc(event: &EventType) -> Option<u32> {
+    match event {
+        EventType::InstrVector { pc }           |
+        EventType::InstrLoad { pc }             |
+        EventType::InstrStore { pc }            |
+        EventType::InstrCall { pc }             |
+        EventType::InstrReturn { pc }           |
+        EventType::InstrLockAcquireReq { pc }   |
+        EventType::InstrLockReleaseReq { pc }   |
+        EventType::InstrStreamGet { pc }        |
+        EventType::InstrStreamPut { pc }        => Some(*pc),
+        EventType::InstrEvent { pc, .. }        => Some(*pc),
+        _ => None,
+    }
+}
+
 /// Map an emulator `EventType` to its AIE2 compute tile memory module event ID.
 ///
 /// DMA events are per-channel. The channel field encodes:
@@ -726,5 +753,28 @@ mod tests {
         assert_eq!(shim_event_to_hw_id(&EventType::LockAcquire { lock_id: 6 }), None); // Only 6 locks
         assert_eq!(shim_event_to_hw_id(&EventType::LockRelease { lock_id: 0 }), Some(41));
         assert_eq!(shim_event_to_hw_id(&EventType::LockRelease { lock_id: 5 }), Some(61));
+    }
+
+    #[test]
+    fn event_pc_extracts_from_instruction_variants() {
+        // All 10 instruction-class variants carry a PC.
+        assert_eq!(event_pc(&EventType::InstrVector { pc: 0x100 }), Some(0x100));
+        assert_eq!(event_pc(&EventType::InstrLoad { pc: 0x104 }), Some(0x104));
+        assert_eq!(event_pc(&EventType::InstrStore { pc: 0x108 }), Some(0x108));
+        assert_eq!(event_pc(&EventType::InstrCall { pc: 0x10C }), Some(0x10C));
+        assert_eq!(event_pc(&EventType::InstrReturn { pc: 0x110 }), Some(0x110));
+        assert_eq!(event_pc(&EventType::InstrLockAcquireReq { pc: 0x114 }), Some(0x114));
+        assert_eq!(event_pc(&EventType::InstrLockReleaseReq { pc: 0x118 }), Some(0x118));
+        assert_eq!(event_pc(&EventType::InstrStreamGet { pc: 0x11C }), Some(0x11C));
+        assert_eq!(event_pc(&EventType::InstrStreamPut { pc: 0x120 }), Some(0x120));
+        assert_eq!(event_pc(&EventType::InstrEvent { pc: 0x300, id: 1 }), Some(0x300));
+
+        // Non-instruction variants return None.
+        assert_eq!(event_pc(&EventType::MemoryStall { cycles: 5 }), None);
+        assert_eq!(event_pc(&EventType::LockStall { cycles: 3 }), None);
+        assert_eq!(event_pc(&EventType::StreamStall { cycles: 1 }), None);
+        assert_eq!(event_pc(&EventType::CoreActive), None);
+        assert_eq!(event_pc(&EventType::CoreDisabled), None);
+        assert_eq!(event_pc(&EventType::DmaStartTask { channel: 0 }), None);
     }
 }
