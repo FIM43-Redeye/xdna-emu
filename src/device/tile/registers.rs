@@ -155,7 +155,8 @@ impl Tile {
         if (lock_base..lock_end).contains(&offset) {
             let lock_id = ((offset - lock_base) / lock_stride) as usize;
             if lock_id < self.locks.len() {
-                return self.locks[lock_id].value as u32 & crate::device::arch_handle::lock_value_layout().mask;
+                return self.locks[lock_id].value as u32
+                    & crate::device::arch_handle::lock_value_layout().mask;
             }
         }
 
@@ -214,12 +215,24 @@ impl Tile {
         use xdna_archspec::aie2::registers::memory as mm;
         use xdna_archspec::aie2::registers::mem_tile as mt;
 
-        let base = if is_memtile { mt::LOCK_REQUEST_BASE } else { mm::LOCK_REQUEST_BASE };
+        let base = if is_memtile {
+            mt::LOCK_REQUEST_BASE
+        } else {
+            mm::LOCK_REQUEST_BASE
+        };
         let addr = offset - base;
 
         // Extract fields from address
-        let id_shift = if is_memtile { mt::LOCK_REQUEST_ID_SHIFT } else { mm::LOCK_REQUEST_ID_SHIFT };
-        let id_mask = if is_memtile { mt::LOCK_REQUEST_ID_MASK } else { mm::LOCK_REQUEST_ID_MASK };
+        let id_shift = if is_memtile {
+            mt::LOCK_REQUEST_ID_SHIFT
+        } else {
+            mm::LOCK_REQUEST_ID_SHIFT
+        };
+        let id_mask = if is_memtile {
+            mt::LOCK_REQUEST_ID_MASK
+        } else {
+            mm::LOCK_REQUEST_ID_MASK
+        };
 
         let lock_id = ((addr >> id_shift) & id_mask) as usize;
         let is_acquire = (addr >> mm::LOCK_REQUEST_ACQ_REL_BIT) & 1 != 0;
@@ -263,7 +276,11 @@ impl Tile {
         };
 
         // Return success bit
-        if matches!(result, LockResult::Success) { 1 } else { 0 }
+        if matches!(result, LockResult::Success) {
+            1
+        } else {
+            0
+        }
     }
 
     /// Get lock overflow bits for a range of locks.

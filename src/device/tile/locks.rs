@@ -142,7 +142,6 @@ impl LockArbiter {
             return &self.results;
         }
 
-
         // Group pending requests by lock_id using simple O(n^2) grouping.
         let mut processed = vec![false; self.pending.len()];
 
@@ -539,10 +538,16 @@ mod tests {
     #[test]
     fn lock_bounds_match_archspec() {
         use xdna_archspec::aie2::locks::AIE2_LOCK_VALUE_LAYOUT;
-        assert_eq!(Lock::MIN_VALUE, AIE2_LOCK_VALUE_LAYOUT.min,
-                   "Lock::MIN_VALUE must match AIE2_LOCK_VALUE_LAYOUT.min; \
-                    update the constant (or split per-arch) when AIE1 lands");
-        assert_eq!(Lock::MAX_VALUE, AIE2_LOCK_VALUE_LAYOUT.max,
-                   "Lock::MAX_VALUE must match AIE2_LOCK_VALUE_LAYOUT.max");
+        assert_eq!(
+            Lock::MIN_VALUE,
+            AIE2_LOCK_VALUE_LAYOUT.min,
+            "Lock::MIN_VALUE must match AIE2_LOCK_VALUE_LAYOUT.min; \
+                    update the constant (or split per-arch) when AIE1 lands"
+        );
+        assert_eq!(
+            Lock::MAX_VALUE,
+            AIE2_LOCK_VALUE_LAYOUT.max,
+            "Lock::MAX_VALUE must match AIE2_LOCK_VALUE_LAYOUT.max"
+        );
     }
 }

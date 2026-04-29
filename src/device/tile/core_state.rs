@@ -56,10 +56,20 @@ pub struct LegacyStreamPort {
 #[derive(Debug)]
 pub enum CtrlPacketAction {
     /// Write a value to a tile-local register offset.
-    WriteRegister { col: u8, row: u8, offset: u32, value: u32 },
+    WriteRegister {
+        col: u8,
+        row: u8,
+        offset: u32,
+        value: u32,
+    },
     /// Read registers starting at offset (not yet implemented; logged).
-    ReadRegisters { col: u8, row: u8, offset: u32, count: u8, response_id: u8 },
+    ReadRegisters {
+        col: u8,
+        row: u8,
+        offset: u32,
+        count: u8,
+        response_id: u8,
+    },
     /// An error occurred during control packet processing.
     Error(String),
 }
-

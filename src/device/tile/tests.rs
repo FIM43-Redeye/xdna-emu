@@ -90,7 +90,7 @@ fn test_lock_max_value() {
     lock.set(50);
     assert_eq!(lock.value, 50);
     lock.set(Lock::MAX_VALUE + 1); // would be 64, but i8 can't hold it; test boundary
-    // i8 max is 127, so test with explicit value
+                                   // i8 max is 127, so test with explicit value
     lock.set(100); // > 63
     assert_eq!(lock.value, 63); // Clamped
     lock.set(-100); // < -64
@@ -318,7 +318,7 @@ fn test_edge_detector_rising_edge() {
     // Configure core trace to accept edge events (need start event)
     tile.core_trace.write_register(0x00, 0x01); // mode=EventTime
     tile.core_trace.write_register(0x10, 37); // event slot 0 = event 37
-    // Also configure slot for edge detection event (ID 13)
+                                              // Also configure slot for edge detection event (ID 13)
     tile.core_trace.write_register(0x10, 37 | (13 << 8)); // slot 0=37, slot 1=13
 
     // Cycle 1: event 37 fires (0->1 = rising edge)
@@ -642,7 +642,8 @@ fn test_lock_event_reaches_trace_unit() {
     assert_eq!(cycle, 100);
     assert!(
         matches!(event, crate::interpreter::state::EventType::LockAcquire { lock_id: 0 }),
-        "Expected LockAcquire{{lock_id:0}}, got {:?}", event
+        "Expected LockAcquire{{lock_id:0}}, got {:?}",
+        event
     );
 
     // Map through mem_event_to_hw_id -- should return 45
@@ -692,10 +693,7 @@ fn test_lock_release_event_reaches_trace_unit() {
     // Notify, flush, and verify capture
     tile.mem_trace.notify_event(46, 50, None);
     tile.mem_trace.flush();
-    assert!(
-        tile.mem_trace.has_pending_packets(),
-        "Trace unit should have recorded the lock release event"
-    );
+    assert!(tile.mem_trace.has_pending_packets(), "Trace unit should have recorded the lock release event");
 }
 
 // === Performance Counter Integration Tests ===

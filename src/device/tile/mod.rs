@@ -60,7 +60,6 @@ pub struct Tile {
     pub processor_bus_enabled: bool,
 
     // === Hot data (accessed every cycle) ===
-
     /// Core processor state (compute tiles only)
     pub core: CoreState,
 
@@ -77,7 +76,6 @@ pub struct Tile {
     pub lock_arbiter: LockArbiter,
 
     // === Warm data (accessed during DMA) ===
-
     /// DMA buffer descriptors (sized from TileParams: 16 for compute, 48 for mem tile)
     pub dma_bds: Vec<DmaBufferDescriptor>,
 
@@ -85,7 +83,6 @@ pub struct Tile {
     pub dma_channels: Vec<DmaChannel>,
 
     // === Stream port buffers (for core direct stream access) ===
-
     /// Stream input buffer for core direct reads (StreamReadScalar)
     /// Maps port number to queue of incoming data
     pub stream_input: [std::collections::VecDeque<u32>; 8],
@@ -94,12 +91,10 @@ pub struct Tile {
     pub stream_output: [std::collections::VecDeque<u32>; 8],
 
     // === Cold data (routing configuration) ===
-
     /// Stream switch configuration (full functional model with FIFOs and local routes)
     pub stream_switch: FunctionalStreamSwitch,
 
     // === Large data (memory) ===
-
     /// Data memory (64KB for compute, 512KB for mem tile)
     /// Boxed to avoid huge stack allocation
     data_memory: Box<[u8]>,
@@ -115,7 +110,6 @@ pub struct Tile {
 
     // Control packet FSM has moved to control_packets::StreamReassembler
     // owned by TileArray (array.rs). The tile no longer tracks packet state.
-
     /// Shim Mux: which switchbox South slave port each DMA MM2S channel feeds.
     /// Parsed from Mux_Config register (0x1F000). Index 0 = MM2S ch0, etc.
     /// Value is the switchbox slave port index (e.g., 5 for South3).
@@ -127,7 +121,6 @@ pub struct Tile {
     pub shim_mux_s2mm_masters: Vec<Option<usize>>,
 
     // === Trace Units ===
-
     /// Core module trace unit (compute tiles only).
     ///
     /// Configured by writes to offsets 0x340D0-0x340E4. Monitors core module
@@ -153,7 +146,6 @@ pub struct Tile {
     pub mem_trace_pending: Vec<(u64, crate::interpreter::state::EventType)>,
 
     // === Event Modules (new -- subsystem will absorb broadcast/port selection) ===
-
     /// Core module event system (compute and shim tiles only).
     /// None for MemTile (which has no core module).
     pub core_events: Option<super::events::EventModule>,
@@ -176,7 +168,6 @@ pub struct Tile {
     pub event_port_selection: [Option<(u8, bool)>; 8],
 
     // === Cascade Stream (compute tiles only) ===
-
     /// Cascade input FIFO (SCD). 384-bit width, depth 1.
     /// Dedicated point-to-point link between adjacent compute tiles,
     /// entirely separate from the stream switch fabric.
@@ -195,7 +186,6 @@ pub struct Tile {
     pub cascade_output_dir: u8,
 
     // === Performance Counters ===
-
     /// Core module performance counters (compute: 4 counters, shim/PL: 2).
     ///
     /// Configured by PERFORMANCE_CONTROL/COUNTER/EVENT_VALUE registers:
@@ -215,26 +205,22 @@ pub struct Tile {
     pub mem_perf_counters: super::perf_counters::PerfCounterBank,
 
     // === Timers ===
-
     /// Core module timer (compute and shim tiles).
     pub core_timer: super::timer::TileTimer,
     /// Memory module timer (compute and mem tiles).
     pub mem_timer: super::timer::TileTimer,
 
     // === Core Debug ===
-
     /// Core debug state (compute tiles only -- halt, step, PC/SP/LR reads).
     pub core_debug: super::core_debug::CoreDebugState,
 
     // === Memory Bank Conflict Detection ===
-
     /// Bitmask of memory banks accessed by DMA during this cycle.
     /// Bit N set = bank N was accessed. Supports up to 16 banks (MemTile).
     /// Reset at the start of each coordinator step.
     pub cycle_dma_banks: u16,
 
     // === Edge Detection ===
-
     /// Core module edge detectors (two independent circuits).
     /// Configured by Edge_Detection_event_control register at 0x34408 (compute).
     /// Monitor core module event signals for rising/falling transitions.
@@ -247,14 +233,12 @@ pub struct Tile {
     pub mem_edge_detectors: [EdgeDetector; 2],
 
     // === Interrupt Controllers (shim tiles only) ===
-
     /// L1 interrupt controller (shim tiles only).
     pub l1_irq: Option<super::interrupts::L1InterruptController>,
     /// L2 interrupt controller (shim NoC tiles only).
     pub l2_irq: Option<super::interrupts::L2InterruptController>,
 
     // === Event Broadcast ===
-
     /// Event broadcast channel mapping (16 channels).
     ///
     /// Each entry stores the local event ID that triggers that broadcast channel.
@@ -350,13 +334,21 @@ impl Tile {
             mem_timer: super::timer::TileTimer::new(),
             core_debug: super::core_debug::CoreDebugState::new(),
             core_events: match tile_kind {
-                TileKind::Compute => Some(super::events::EventModule::new(super::events::EventModuleType::Core)),
-                TileKind::ShimNoc | TileKind::ShimPl => Some(super::events::EventModule::new(super::events::EventModuleType::Pl)),
+                TileKind::Compute => {
+                    Some(super::events::EventModule::new(super::events::EventModuleType::Core))
+                }
+                TileKind::ShimNoc | TileKind::ShimPl => {
+                    Some(super::events::EventModule::new(super::events::EventModuleType::Pl))
+                }
                 TileKind::Mem => None, // MemTile has no core module
             },
             mem_events: match tile_kind {
-                TileKind::Compute => Some(super::events::EventModule::new(super::events::EventModuleType::Memory)),
-                TileKind::Mem => Some(super::events::EventModule::new(super::events::EventModuleType::MemTile)),
+                TileKind::Compute => {
+                    Some(super::events::EventModule::new(super::events::EventModuleType::Memory))
+                }
+                TileKind::Mem => {
+                    Some(super::events::EventModule::new(super::events::EventModuleType::MemTile))
+                }
                 TileKind::ShimNoc | TileKind::ShimPl => None, // Shim has no memory module
             },
             l1_irq: if tile_kind.is_shim() {
@@ -655,8 +647,12 @@ impl Tile {
 
         log::debug!(
             "Edge detectors configured: det0(event={}, rise={}, fall={}), det1(event={}, rise={}, fall={})",
-            detectors[0].input_event, detectors[0].trigger_rising, detectors[0].trigger_falling,
-            detectors[1].input_event, detectors[1].trigger_rising, detectors[1].trigger_falling,
+            detectors[0].input_event,
+            detectors[0].trigger_rising,
+            detectors[0].trigger_falling,
+            detectors[1].input_event,
+            detectors[1].trigger_rising,
+            detectors[1].trigger_falling,
         );
     }
 
@@ -677,9 +673,16 @@ impl Tile {
     /// The request is queued until `resolve_lock_requests()` is called.
     #[inline]
     pub fn submit_lock_request(&mut self, request: LockRequest) {
-        log::debug!("Tile({},{}) submit_lock_request: {:?} lock={} acquire={} expected={} delta={}",
-            self.col, self.row, request.requestor, request.lock_id,
-            request.is_acquire, request.expected, request.delta);
+        log::debug!(
+            "Tile({},{}) submit_lock_request: {:?} lock={} acquire={} expected={} delta={}",
+            self.col,
+            self.row,
+            request.requestor,
+            request.lock_id,
+            request.is_acquire,
+            request.expected,
+            request.delta
+        );
         self.lock_arbiter.submit(request);
     }
 
@@ -691,8 +694,13 @@ impl Tile {
     #[inline]
     pub fn defer_core_lock_release(&mut self, lock_id: usize, delta: i8) {
         if lock_id < self.locks.len() {
-            log::debug!("Tile({},{}) defer_core_lock_release lock {} delta {}",
-                self.col, self.row, lock_id, delta);
+            log::debug!(
+                "Tile({},{}) defer_core_lock_release lock {} delta {}",
+                self.col,
+                self.row,
+                lock_id,
+                delta
+            );
             self.lock_arbiter.submit(LockRequest {
                 requestor: LockRequestor::Core,
                 lock_id,
@@ -790,8 +798,14 @@ impl Tile {
             if select == 1 && dma_ch < self.shim_mux_mm2s_slaves.len() {
                 // DMA source -> this South slave gets MM2S output
                 self.shim_mux_mm2s_slaves[dma_ch] = Some(mf.port_index);
-                log::info!("Shim Mux ({},{}): MM2S ch{} -> slave[{}] ({})",
-                    self.col, self.row, dma_ch, mf.port_index, mf.field.name);
+                log::info!(
+                    "Shim Mux ({},{}): MM2S ch{} -> slave[{}] ({})",
+                    self.col,
+                    self.row,
+                    dma_ch,
+                    mf.port_index,
+                    mf.field.name
+                );
                 dma_ch += 1;
             }
         }
@@ -821,8 +835,14 @@ impl Tile {
             let select = df.field.extract(value);
             if select == 1 && dma_ch < self.shim_mux_s2mm_masters.len() {
                 self.shim_mux_s2mm_masters[dma_ch] = Some(df.port_index);
-                log::info!("Shim Mux ({},{}): S2MM ch{} <- master[{}] ({})",
-                    self.col, self.row, dma_ch, df.port_index, df.field.name);
+                log::info!(
+                    "Shim Mux ({},{}): S2MM ch{} <- master[{}] ({})",
+                    self.col,
+                    self.row,
+                    dma_ch,
+                    df.port_index,
+                    df.field.name
+                );
             }
         }
     }
