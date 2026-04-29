@@ -75,7 +75,10 @@ pub use addressing::{AddressGenerator, DimensionConfig, AddressIterator, Iterati
 pub use bd::{BufferDescriptor, bd_base_address, bd_register_count, BD_SPACING};
 pub use stream_io::StreamWord;
 pub use transfer::{Transfer, TransferDirection, TransferEndpoint, parse_source_tile_from_header};
-pub use engine::{DmaEngine, ChannelState, ChannelId, StreamData, ChannelTaskConfig, TaskQueueEntry, MAX_TASK_QUEUE_DEPTH, LockTarget, NeighborTiles};
+pub use engine::{
+    DmaEngine, ChannelState, ChannelId, StreamData, ChannelTaskConfig, TaskQueueEntry, MAX_TASK_QUEUE_DEPTH,
+    LockTarget, NeighborTiles,
+};
 pub use token::{Token, TokenState, TaskQueue};
 pub use channel::{ChannelFsm, ChannelContext, CompletionInfo};
 pub use timing::DmaTimingConfig;
@@ -207,22 +210,19 @@ impl BdConfig {
     /// Width and stride should account for the 4-byte word granularity.
     pub fn transfer_2d(
         base_addr: u64,
-        width: u32,      // Bytes per row (must be multiple of 4)
-        height: u32,     // Number of rows
-        stride: i32,     // Bytes between row starts
+        width: u32,  // Bytes per row (must be multiple of 4)
+        height: u32, // Number of rows
+        stride: i32, // Bytes between row starts
     ) -> Self {
         Self {
             base_addr,
             length: width * height,
             // D0: words per row, 4-byte stride for contiguous elements
             d0: DimensionConfig {
-                size: width / 4,  // Convert bytes to words
-                stride: 4,        // 4 bytes per word
+                size: width / 4, // Convert bytes to words
+                stride: 4,       // 4 bytes per word
             },
-            d1: DimensionConfig {
-                size: height,
-                stride,
-            },
+            d1: DimensionConfig { size: height, stride },
             valid: true,
             ..Default::default()
         }
@@ -301,7 +301,11 @@ pub enum DmaError {
     /// Channel already active
     ChannelBusy(u8),
     /// Memory transfer address wraps past end of memory
-    AddressWrap { offset: u64, bytes: usize, memory_size: usize },
+    AddressWrap {
+        offset: u64,
+        bytes: usize,
+        memory_size: usize,
+    },
     /// Stream input buffer full, data was dropped
     StreamBufferFull { channel: u8 },
     /// S2MM channel stalled waiting for stream data
@@ -353,8 +357,11 @@ impl std::fmt::Display for DmaError {
             }
             Self::ChannelBusy(ch) => write!(f, "Channel {} is already active", ch),
             Self::AddressWrap { offset, bytes, memory_size } => {
-                write!(f, "Address 0x{:08x} + {} bytes wraps past memory end (size: 0x{:x})",
-                    offset, bytes, memory_size)
+                write!(
+                    f,
+                    "Address 0x{:08x} + {} bytes wraps past memory end (size: 0x{:x})",
+                    offset, bytes, memory_size
+                )
             }
             Self::StreamBufferFull { channel } => {
                 write!(f, "Stream input buffer full, ch{} data dropped", channel)
@@ -386,7 +393,7 @@ mod tests {
         let bd = BdConfig::transfer_2d(0x2000, 64, 8, 128);
         assert_eq!(bd.base_addr, 0x2000);
         assert_eq!(bd.length, 512); // 64 * 8
-        // d0.size is in words (64 bytes / 4 = 16 words per row)
+                                    // d0.size is in words (64 bytes / 4 = 16 words per row)
         assert_eq!(bd.d0.size, 16);
         assert_eq!(bd.d0.stride, 4); // 4 bytes per word
         assert_eq!(bd.d1.size, 8);
@@ -395,9 +402,7 @@ mod tests {
 
     #[test]
     fn test_bd_config_with_locks() {
-        let bd = BdConfig::simple_1d(0x3000, 128)
-            .with_acquire(5, 1)
-            .with_release(5, -1);
+        let bd = BdConfig::simple_1d(0x3000, 128).with_acquire(5, 1).with_release(5, -1);
 
         assert_eq!(bd.acquire_lock, Some(5));
         assert_eq!(bd.acquire_value, 1);

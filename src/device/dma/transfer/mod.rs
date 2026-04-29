@@ -29,11 +29,6 @@ mod tests;
 // Re-export all public types so external callers see no difference.
 pub use self::padding::{PadAction, ZeroPadState};
 pub use self::core::{
-    LockAcquireMode,
-    Transfer,
-    TransferDirection,
-    TransferEndpoint,
-    parse_packet_type_from_header,
-    parse_source_tile_from_header,
-    parse_stream_id_from_header,
+    LockAcquireMode, Transfer, TransferDirection, TransferEndpoint, parse_packet_type_from_header,
+    parse_source_tile_from_header, parse_stream_id_from_header,
 };

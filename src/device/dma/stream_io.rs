@@ -29,20 +29,12 @@ pub struct StreamWord {
 impl StreamWord {
     /// Create a new stream word with data only
     pub fn new(data: u32) -> Self {
-        Self {
-            data,
-            tlast: false,
-            parity: false,
-        }
+        Self { data, tlast: false, parity: false }
     }
 
     /// Create a new stream word with TLAST set
     pub fn with_tlast(data: u32) -> Self {
-        Self {
-            data,
-            tlast: true,
-            parity: false,
-        }
+        Self { data, tlast: true, parity: false }
     }
 
     /// Set TLAST on this word
@@ -58,11 +50,7 @@ impl StreamWord {
 
     /// Create with computed parity
     pub fn with_parity(data: u32) -> Self {
-        Self {
-            data,
-            tlast: false,
-            parity: Self::compute_parity(data),
-        }
+        Self { data, tlast: false, parity: Self::compute_parity(data) }
     }
 }
 
@@ -88,7 +76,9 @@ pub mod compute {
         assert!(
             ranges::DMA_MASTER_START + channel <= ranges::DMA_MASTER_END,
             "Invalid S2MM channel {} for compute tile (DMA master range {}-{})",
-            channel, ranges::DMA_MASTER_START, ranges::DMA_MASTER_END
+            channel,
+            ranges::DMA_MASTER_START,
+            ranges::DMA_MASTER_END
         );
         ranges::DMA_MASTER_START + channel
     }
@@ -99,7 +89,9 @@ pub mod compute {
         assert!(
             ranges::DMA_SLAVE_START + channel <= ranges::DMA_SLAVE_END,
             "Invalid MM2S channel {} for compute tile (DMA slave range {}-{})",
-            channel, ranges::DMA_SLAVE_START, ranges::DMA_SLAVE_END
+            channel,
+            ranges::DMA_SLAVE_START,
+            ranges::DMA_SLAVE_END
         );
         ranges::DMA_SLAVE_START + channel
     }
@@ -120,7 +112,9 @@ pub mod memtile {
         assert!(
             ranges::DMA_MASTER_START + channel <= ranges::DMA_MASTER_END,
             "Invalid S2MM channel {} for memtile (DMA master range {}-{})",
-            channel, ranges::DMA_MASTER_START, ranges::DMA_MASTER_END
+            channel,
+            ranges::DMA_MASTER_START,
+            ranges::DMA_MASTER_END
         );
         ranges::DMA_MASTER_START + channel
     }
@@ -131,7 +125,9 @@ pub mod memtile {
         assert!(
             ranges::DMA_SLAVE_START + channel <= ranges::DMA_SLAVE_END,
             "Invalid MM2S channel {} for memtile (DMA slave range {}-{})",
-            channel, ranges::DMA_SLAVE_START, ranges::DMA_SLAVE_END
+            channel,
+            ranges::DMA_SLAVE_START,
+            ranges::DMA_SLAVE_END
         );
         ranges::DMA_SLAVE_START + channel
     }
@@ -150,7 +146,9 @@ pub mod shim {
         assert!(
             ranges::SOUTH_MASTER_START + channel <= ranges::SOUTH_MASTER_END,
             "Invalid S2MM channel {} for shim (South master range {}-{})",
-            channel, ranges::SOUTH_MASTER_START, ranges::SOUTH_MASTER_END
+            channel,
+            ranges::SOUTH_MASTER_START,
+            ranges::SOUTH_MASTER_END
         );
         ranges::SOUTH_MASTER_START + channel
     }
@@ -160,7 +158,9 @@ pub mod shim {
         assert!(
             ranges::SOUTH_SLAVE_START + channel <= ranges::SOUTH_SLAVE_END,
             "Invalid MM2S channel {} for shim (South slave range {}-{})",
-            channel, ranges::SOUTH_SLAVE_START, ranges::SOUTH_SLAVE_END
+            channel,
+            ranges::SOUTH_SLAVE_START,
+            ranges::SOUTH_SLAVE_END
         );
         ranges::SOUTH_SLAVE_START + channel
     }
@@ -282,14 +282,8 @@ mod tests {
             connections::shim_north_to_memtile_south(sr::NORTH_MASTER_START),
             Some(mr::SOUTH_SLAVE_START)
         );
-        assert_eq!(
-            connections::shim_north_to_memtile_south(sr::NORTH_MASTER_END),
-            Some(mr::SOUTH_SLAVE_END)
-        );
-        assert_eq!(
-            connections::shim_north_to_memtile_south(sr::NORTH_MASTER_START - 1),
-            None
-        );
+        assert_eq!(connections::shim_north_to_memtile_south(sr::NORTH_MASTER_END), Some(mr::SOUTH_SLAVE_END));
+        assert_eq!(connections::shim_north_to_memtile_south(sr::NORTH_MASTER_START - 1), None);
 
         // MemTile North -> Compute South
         assert_eq!(

@@ -276,7 +276,7 @@ impl BufferDescriptor {
             // BD_2: TLAST and D0 addressing
             tlast_suppress: lay.tlast_suppress.extract_bool(w2),
             d0_wrap: lay.d0_wrap.extract(w2) as u16,
-            d0_stepsize: lay.d0_stepsize.extract(w2) + 1,  // stored as actual-1
+            d0_stepsize: lay.d0_stepsize.extract(w2) + 1, // stored as actual-1
 
             // BD_3: D1 zero-padding and addressing
             d1_zero_before: lay.d1_zero_before.extract(w3) as u8,
@@ -293,20 +293,20 @@ impl BufferDescriptor {
             d2_zero_after: lay.d2_zero_after.extract(w5) as u8,
             d1_zero_after: lay.d1_zero_after.extract(w5) as u8,
             d0_zero_after: lay.d0_zero_after.extract(w5) as u8,
-            d3_stepsize: lay.d3_stepsize.extract(w5) + 1,  // MemTile has D3
+            d3_stepsize: lay.d3_stepsize.extract(w5) + 1, // MemTile has D3
 
             // BD_6: iteration control
             iteration_current: lay.iteration_current.extract(w6) as u8,
-            iteration_wrap: (lay.iteration_wrap.extract(w6) + 1) as u8,  // stored as actual-1
+            iteration_wrap: (lay.iteration_wrap.extract(w6) + 1) as u8, // stored as actual-1
             iteration_stepsize: lay.iteration_stepsize.extract(w6) + 1,
 
             // BD_7: validity and lock synchronization
             valid: lay.valid_bd.extract_bool(w7),
             lock_rel_value: sign_extend_7bit(lay.lock_rel_value.extract(w7) as u8),
-            lock_rel_id: lay.lock_rel_id.extract(w7) as u8,  // 8 bits for MemTile
+            lock_rel_id: lay.lock_rel_id.extract(w7) as u8, // 8 bits for MemTile
             lock_acq_enable: lay.lock_acq_enable.extract_bool(w7),
             lock_acq_value: sign_extend_7bit(lay.lock_acq_value.extract(w7) as u8),
-            lock_acq_id: lay.lock_acq_id.extract(w7) as u8,  // 8 bits for MemTile
+            lock_acq_id: lay.lock_acq_id.extract(w7) as u8, // 8 bits for MemTile
 
             // Not used in MemTile
             burst_length: 0,
@@ -339,8 +339,8 @@ impl BufferDescriptor {
         let w7 = words[7];
 
         // 46-bit word address from low and high parts
-        let addr_low = lay.base_address_low.extract(w1) as u64;    // 30 bits
-        let addr_high = lay.base_address_high.extract(w2) as u64;  // 16 bits
+        let addr_low = lay.base_address_low.extract(w1) as u64; // 30 bits
+        let addr_high = lay.base_address_high.extract(w2) as u64; // 16 bits
         let base_addr = addr_low | (addr_high << 30);
 
         Self {
@@ -359,7 +359,7 @@ impl BufferDescriptor {
             // BD_3: secure access + D0
             secure_access: lay.secure_access.extract_bool(w3),
             d0_wrap: lay.d0_wrap.extract(w3) as u16,
-            d0_stepsize: lay.d0_stepsize.extract(w3) + 1,  // stored as actual-1
+            d0_stepsize: lay.d0_stepsize.extract(w3) + 1, // stored as actual-1
 
             // BD_4: burst length + D1
             burst_length: lay.burst_length.extract(w4) as u8,
@@ -437,12 +437,8 @@ impl BufferDescriptor {
         for i in 0..reg_count {
             let addr = offset + i * 4;
             if addr + 4 <= memory.len() {
-                let word = u32::from_le_bytes([
-                    memory[addr],
-                    memory[addr + 1],
-                    memory[addr + 2],
-                    memory[addr + 3],
-                ]);
+                let word =
+                    u32::from_le_bytes([memory[addr], memory[addr + 1], memory[addr + 2], memory[addr + 3]]);
                 words.push(word);
             } else {
                 words.push(0);
@@ -487,7 +483,11 @@ impl BufferDescriptor {
 
         // Convert word strides to byte strides: stride_bytes = stride_words * 4
         // d0_wrap of 0 means simple contiguous transfer -- use length_words as size
-        let d0_size = if self.d0_wrap == 0 { self.length_words } else { self.d0_wrap as u32 };
+        let d0_size = if self.d0_wrap == 0 {
+            self.length_words
+        } else {
+            self.d0_wrap as u32
+        };
         let d0_stride = (self.d0_stepsize as i32) * 4;
 
         let d1_size = self.d1_wrap as u32;
@@ -539,11 +539,23 @@ impl BufferDescriptor {
         };
 
         // Lock configuration: acquire if enabled, release if value is non-zero
-        let acquire_lock = if self.lock_acq_enable { Some(self.lock_acq_id) } else { None };
-        let release_lock = if self.lock_rel_value != 0 { Some(self.lock_rel_id) } else { None };
+        let acquire_lock = if self.lock_acq_enable {
+            Some(self.lock_acq_id)
+        } else {
+            None
+        };
+        let release_lock = if self.lock_rel_value != 0 {
+            Some(self.lock_rel_id)
+        } else {
+            None
+        };
 
         // BD chaining: chain if use_next_bd is set AND the BD is valid
-        let next_bd = if self.use_next_bd { Some(self.next_bd) } else { None };
+        let next_bd = if self.use_next_bd {
+            Some(self.next_bd)
+        } else {
+            None
+        };
 
         BdConfig {
             base_addr,
@@ -627,20 +639,20 @@ mod tests {
         assert_eq!(sign_extend_7bit(0), 0);
         assert_eq!(sign_extend_7bit(1), 1);
         assert_eq!(sign_extend_7bit(63), 63);
-        assert_eq!(sign_extend_7bit(64), -64);  // 0x40 -> -64
-        assert_eq!(sign_extend_7bit(127), -1);  // 0x7F -> -1
+        assert_eq!(sign_extend_7bit(64), -64); // 0x40 -> -64
+        assert_eq!(sign_extend_7bit(127), -1); // 0x7F -> -1
     }
 
     #[test]
     fn test_compute_bd_parsing() {
         // Sample BD registers for compute tile
         let words = [
-            0x0004_1000,  // BD_0: base=0x10, length=0x1000
-            0x4000_0000,  // BD_1: packet enabled
-            0x0000_0001,  // BD_2: d0_step=2, d1_step=1
-            0x0000_0000,  // BD_3: no wrap
-            0x0000_0000,  // BD_4: no iteration
-            0x0200_0000,  // BD_5: valid=1
+            0x0004_1000, // BD_0: base=0x10, length=0x1000
+            0x4000_0000, // BD_1: packet enabled
+            0x0000_0001, // BD_2: d0_step=2, d1_step=1
+            0x0000_0000, // BD_3: no wrap
+            0x0000_0000, // BD_4: no iteration
+            0x0200_0000, // BD_5: valid=1
         ];
 
         let bd = BufferDescriptor::from_registers(&words, TileKind::Compute);
@@ -649,8 +661,8 @@ mod tests {
         assert_eq!(bd.base_addr_words, 0x10);
         assert_eq!(bd.length_words, 0x1000);
         assert!(bd.enable_packet);
-        assert_eq!(bd.d0_stepsize, 2);  // stored 1 + 1 = 2
-        assert_eq!(bd.d1_stepsize, 1);  // stored 0 + 1 = 1
+        assert_eq!(bd.d0_stepsize, 2); // stored 1 + 1 = 2
+        assert_eq!(bd.d1_stepsize, 1); // stored 0 + 1 = 1
     }
 
     #[test]
@@ -662,14 +674,14 @@ mod tests {
         // For addr=0x100: bits 18:0 = 0x00000100
         // Combined: 0x00280100
         let words = [
-            0x8000_0400,  // BD_0: packet=1, length=0x400
-            0x0028_0100,  // BD_1: next_bd=2, use_next=1, addr=0x100
-            0x0000_0003,  // BD_2: d0_step=4
-            0x0000_0000,  // BD_3
-            0x0000_0000,  // BD_4
-            0x0000_0000,  // BD_5
-            0x0000_0000,  // BD_6
-            0x8000_0000,  // BD_7: valid=1
+            0x8000_0400, // BD_0: packet=1, length=0x400
+            0x0028_0100, // BD_1: next_bd=2, use_next=1, addr=0x100
+            0x0000_0003, // BD_2: d0_step=4
+            0x0000_0000, // BD_3
+            0x0000_0000, // BD_4
+            0x0000_0000, // BD_5
+            0x0000_0000, // BD_6
+            0x8000_0000, // BD_7: valid=1
         ];
 
         let bd = BufferDescriptor::from_registers(&words, TileKind::Mem);
@@ -687,14 +699,14 @@ mod tests {
     fn test_shim_bd_parsing() {
         // Sample BD registers for shim tile
         let words = [
-            0x0000_1000,  // BD_0: length=0x1000
-            0x0000_0400,  // BD_1: addr_low=0x100
-            0x0000_0000,  // BD_2: addr_high=0
-            0x0010_0003,  // BD_3: d0_wrap=1, d0_step=4
-            0x0000_0000,  // BD_4
-            0x0000_0000,  // BD_5
-            0x0000_0000,  // BD_6
-            0x0200_0000,  // BD_7: valid=1
+            0x0000_1000, // BD_0: length=0x1000
+            0x0000_0400, // BD_1: addr_low=0x100
+            0x0000_0000, // BD_2: addr_high=0
+            0x0010_0003, // BD_3: d0_wrap=1, d0_step=4
+            0x0000_0000, // BD_4
+            0x0000_0000, // BD_5
+            0x0000_0000, // BD_6
+            0x0200_0000, // BD_7: valid=1
         ];
 
         let bd = BufferDescriptor::from_registers(&words, TileKind::ShimNoc);
@@ -729,11 +741,11 @@ mod tests {
 
         let w0: u32 = (0x1AB << 14) | 0x2345;
         let w1: u32 = (1 << 31) | (1 << 30) | (0x15 << 24) | (0x0A << 19) | (0x5 << 16);
-        let w2: u32 = (99 << 13) | 49;              // D1_Step[25:13]=99, D0_Step[12:0]=49
-        let w3: u32 = (7 << 21) | (3 << 13) | 19;   // D1_Wrap[28:21]=7, D0_Wrap[20:13]=3, D2_Step[12:0]=19
-        let w4: u32 = (5 << 19) | (2 << 13) | 9;    // Iter_Cur[24:19]=5, Iter_Wrap[18:13]=2, Iter_Step[12:0]=9
-        let w5: u32 = (1 << 31) | (5 << 27) | (1 << 26) | (1 << 25)
-            | (3 << 18) | (2 << 13) | (1 << 12) | (1 << 5) | 7;
+        let w2: u32 = (99 << 13) | 49; // D1_Step[25:13]=99, D0_Step[12:0]=49
+        let w3: u32 = (7 << 21) | (3 << 13) | 19; // D1_Wrap[28:21]=7, D0_Wrap[20:13]=3, D2_Step[12:0]=19
+        let w4: u32 = (5 << 19) | (2 << 13) | 9; // Iter_Cur[24:19]=5, Iter_Wrap[18:13]=2, Iter_Step[12:0]=9
+        let w5: u32 =
+            (1 << 31) | (5 << 27) | (1 << 26) | (1 << 25) | (3 << 18) | (2 << 13) | (1 << 12) | (1 << 5) | 7;
 
         let words = [w0, w1, w2, w3, w4, w5];
         let bd = BufferDescriptor::from_registers(&words, TileKind::Compute);
@@ -802,11 +814,11 @@ mod tests {
 
         let w0: u32 = (1 << 31) | (5 << 28) | (0x0A << 23) | (0x15 << 17) | 0x1234;
         let w1: u32 = (3 << 26) | (7 << 20) | (1 << 19) | 0x3_ABCD;
-        let w2: u32 = (1 << 31) | (5 << 17) | 99;            // tlast, d0_wrap=5, d0_step stored=99
-        let w3: u32 = (2 << 27) | (8 << 17) | 49;            // d1_zero_before=2, d1_wrap=8, d1_step=49
+        let w2: u32 = (1 << 31) | (5 << 17) | 99; // tlast, d0_wrap=5, d0_step stored=99
+        let w3: u32 = (2 << 27) | (8 << 17) | 49; // d1_zero_before=2, d1_wrap=8, d1_step=49
         let w4: u32 = (1 << 31) | (3 << 27) | (6 << 17) | 29; // compress, d2_zero_before=3, d2_wrap=6, d2_step=29
         let w5: u32 = (4 << 28) | (5 << 23) | (6 << 17) | 19; // d2_zero_after=4, d1_zero_after=5, d0_zero_after=6, d3_step=19
-        let w6: u32 = (10 << 23) | (3 << 17) | 39;           // iter_cur=10, iter_wrap stored=3, iter_step stored=39
+        let w6: u32 = (10 << 23) | (3 << 17) | 39; // iter_cur=10, iter_wrap stored=3, iter_step stored=39
         let w7: u32 = (1u32 << 31) | (3 << 24) | (0x42 << 16) | (1 << 15) | (2 << 8) | 0x37;
 
         let words = [w0, w1, w2, w3, w4, w5, w6, w7];
@@ -871,15 +883,15 @@ mod tests {
             valid: true,
             base_addr_words: 0x1000,
             length_words: 256,
-            d0_stepsize: 4,     // actual words
+            d0_stepsize: 4, // actual words
             d0_wrap: 16,
             d1_stepsize: 8,
             d1_wrap: 4,
             d2_stepsize: 16,
             d2_wrap: 2,
-            d3_stepsize: 32,    // MemTile only
+            d3_stepsize: 32,        // MemTile only
             iteration_stepsize: 10, // actual words
-            iteration_wrap: 3,     // actual count
+            iteration_wrap: 3,      // actual count
             iteration_current: 0,
             lock_acq_enable: true,
             lock_acq_id: 5,
@@ -945,11 +957,11 @@ mod tests {
             valid: true,
             length_words: 64,
             lock_acq_enable: false,
-            lock_acq_id: 3,        // Should be ignored
-            lock_rel_value: 0,     // 0 means no release
-            lock_rel_id: 3,        // Should be ignored
+            lock_acq_id: 3,    // Should be ignored
+            lock_rel_value: 0, // 0 means no release
+            lock_rel_id: 3,    // Should be ignored
             use_next_bd: false,
-            next_bd: 5,            // Should be ignored
+            next_bd: 5, // Should be ignored
             ..Default::default()
         };
 
@@ -966,8 +978,8 @@ mod tests {
         let bd = BufferDescriptor {
             valid: true,
             length_words: 128,
-            d0_stepsize: 1,  // 1 word stride
-            d0_wrap: 0,      // 0 means simple contiguous
+            d0_stepsize: 1, // 1 word stride
+            d0_wrap: 0,     // 0 means simple contiguous
             ..Default::default()
         };
 
@@ -985,14 +997,14 @@ mod tests {
     fn test_to_bd_config_shim_round_trip() {
         // Use the existing shim BD parsing test values
         let words: [u32; 8] = [
-            0x0000_1000,  // BD_0: length=0x1000 words
-            0x0000_0400,  // BD_1: addr_low=0x100
-            0x0000_0000,  // BD_2: addr_high=0
-            0x0010_0003,  // BD_3: d0_wrap=1, d0_step stored=3 (actual=4)
-            0x0000_0000,  // BD_4
-            0x0000_0000,  // BD_5
-            0x0000_0000,  // BD_6
-            0x0200_0000,  // BD_7: valid=1
+            0x0000_1000, // BD_0: length=0x1000 words
+            0x0000_0400, // BD_1: addr_low=0x100
+            0x0000_0000, // BD_2: addr_high=0
+            0x0010_0003, // BD_3: d0_wrap=1, d0_step stored=3 (actual=4)
+            0x0000_0000, // BD_4
+            0x0000_0000, // BD_5
+            0x0000_0000, // BD_6
+            0x0200_0000, // BD_7: valid=1
         ];
 
         let bd = BufferDescriptor::from_registers(&words, TileKind::ShimNoc);
@@ -1015,9 +1027,9 @@ mod tests {
         // In word units: D0=16 words (stride 1), D1=64 (stride 16), D2 stride=1024
         // Buffer_Length = 16*64*4 = 4096 words = 16384 bytes
         let words: [u32; 8] = [
-            4096,                  // BD_0: length=4096 words (16384 bytes)
-            0x0000_0400,           // BD_1: addr_low
-            0x0000_0000,           // BD_2: no packet
+            4096,        // BD_0: length=4096 words (16384 bytes)
+            0x0000_0400, // BD_1: addr_low
+            0x0000_0000, // BD_2: no packet
             // BD_3: d0_wrap=16, d0_step stored=0 (actual=1)
             (16 << 20) | 0,
             // BD_4: d1_wrap=64, d1_step stored=15 (actual=16)
@@ -1047,14 +1059,14 @@ mod tests {
     #[test]
     fn test_shim_bd_simple_no_d2_wrap() {
         let words: [u32; 8] = [
-            64,           // BD_0: length=64 words
-            0,            // BD_1
-            0,            // BD_2
-            0,            // BD_3: d0_wrap=0 (simple), d0_step=0
-            0,            // BD_4: d1_wrap=0, d1_step=0
-            0,            // BD_5: d2_step=0
-            0,            // BD_6
-            1u32 << 25,   // BD_7: valid=1
+            64,         // BD_0: length=64 words
+            0,          // BD_1
+            0,          // BD_2
+            0,          // BD_3: d0_wrap=0 (simple), d0_step=0
+            0,          // BD_4: d1_wrap=0, d1_step=0
+            0,          // BD_5: d2_step=0
+            0,          // BD_6
+            1u32 << 25, // BD_7: valid=1
         ];
 
         let bd = BufferDescriptor::from_registers(&words, TileKind::ShimNoc);
@@ -1094,14 +1106,14 @@ mod tests {
         //   BD_5: D3_Stepsize[16:0]     (no D3_Wrap -- size is implicit)
         //   BD_7: Valid_BD[31]
         let words: [u32; 8] = [
-            160,                              // BD_0: buffer_length = 160 words
-            0x2_8000,                         // BD_1: base_address = 0x28000
-            (5u32 << 17) | 0,                 // BD_2: d0_wrap=5, d0_step stored=0
-            (8u32 << 17) | 4,                 // BD_3: d1_wrap=8, d1_step stored=4
-            (1u32 << 17) | 4,                 // BD_4: d2_wrap=1, d2_step stored=4
-            39,                               // BD_5: d3_step stored=39 (actual=40)
-            0,                                // BD_6: no iteration
-            1u32 << 31,                       // BD_7: valid=1
+            160,              // BD_0: buffer_length = 160 words
+            0x2_8000,         // BD_1: base_address = 0x28000
+            (5u32 << 17) | 0, // BD_2: d0_wrap=5, d0_step stored=0
+            (8u32 << 17) | 4, // BD_3: d1_wrap=8, d1_step stored=4
+            (1u32 << 17) | 4, // BD_4: d2_wrap=1, d2_step stored=4
+            39,               // BD_5: d3_step stored=39 (actual=40)
+            0,                // BD_6: no iteration
+            1u32 << 31,       // BD_7: valid=1
         ];
 
         let bd = BufferDescriptor::from_registers(&words, TileKind::Mem);
@@ -1136,14 +1148,14 @@ mod tests {
         // 1D contiguous BD: d0_wrap=64, others unused.
         // D0_Wrap field at [26:17] per AM025.
         let words: [u32; 8] = [
-            64,                               // length=64 words
-            0,                                // addr=0
-            (64u32 << 17) | 0,                // d0_wrap=64, d0_step stored=0
+            64,                // length=64 words
+            0,                 // addr=0
+            (64u32 << 17) | 0, // d0_wrap=64, d0_step stored=0
             0,
             0,
-            0,                                // d3_step stored=0 (actual=1 after +1)
+            0, // d3_step stored=0 (actual=1 after +1)
             0,
-            1u32 << 31,                       // valid
+            1u32 << 31, // valid
         ];
 
         // Note: parse_memtile stores d3_stepsize = extract + 1. With

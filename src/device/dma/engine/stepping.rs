@@ -7,7 +7,12 @@ impl DmaEngine {
     ///
     /// This processes all active channels, moving data between memory and streams.
     /// Returns the overall result of the step.
-    pub fn step(&mut self, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>, host_memory: &mut HostMemory) -> DmaResult {
+    pub fn step(
+        &mut self,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+        host_memory: &mut HostMemory,
+    ) -> DmaResult {
         let mut any_active = false;
         let mut any_waiting = false;
 
@@ -19,11 +24,23 @@ impl DmaEngine {
                     // Check for queued BD from chaining or task queue
                     if let Some(next_bd) = self.channels[ch_idx].queued_bd.take() {
                         let repeat_count = self.channels[ch_idx].repeat_count as u8;
-                        log::debug!("DMA tile({},{}) ch{} starting queued BD {} (repeat={})",
-                            self.col, self.row, ch_idx, next_bd, repeat_count);
+                        log::debug!(
+                            "DMA tile({},{}) ch{} starting queued BD {} (repeat={})",
+                            self.col,
+                            self.row,
+                            ch_idx,
+                            next_bd,
+                            repeat_count
+                        );
                         if let Err(e) = self.start_channel_with_repeat(ch_idx as u8, next_bd, repeat_count) {
-                            log::warn!("DMA tile({},{}) ch{} failed to start BD {}: {:?}",
-                                self.col, self.row, ch_idx, next_bd, e);
+                            log::warn!(
+                                "DMA tile({},{}) ch{} failed to start BD {}: {:?}",
+                                self.col,
+                                self.row,
+                                ch_idx,
+                                next_bd,
+                                e
+                            );
                             self.channels[ch_idx].fsm = ChannelFsm::Error;
                         } else {
                             any_active = true;
@@ -34,7 +51,8 @@ impl DmaEngine {
                 _ => {
                     // Active channel -- run one FSM cycle
                     self.step_channel_fsm(ch_idx, tile, neighbors, host_memory);
-                    if matches!(self.channels[ch_idx].fsm, ChannelFsm::AcquiringLock { acquired: false, .. }) {
+                    if matches!(self.channels[ch_idx].fsm, ChannelFsm::AcquiringLock { acquired: false, .. })
+                    {
                         any_waiting = true;
                     } else {
                         any_active = true;
@@ -45,8 +63,14 @@ impl DmaEngine {
             // Log transitions
             let phase_after = self.channels[ch_idx].fsm.phase_name();
             if phase_before != phase_after {
-                log::info!("DMA({},{}) ch{}: {} -> {}",
-                    self.col, self.row, ch_idx, phase_before, phase_after);
+                log::info!(
+                    "DMA({},{}) ch{}: {} -> {}",
+                    self.col,
+                    self.row,
+                    ch_idx,
+                    phase_before,
+                    phase_after
+                );
             }
         }
 
@@ -64,7 +88,13 @@ impl DmaEngine {
     /// Each match arm does ONE cycle of work and optionally transitions to
     /// a new state. This replaces the old step_channel() + step_channel_timed() +
     /// complete_transfer() + finish_complete_transfer() chain.
-    fn step_channel_fsm(&mut self, ch_idx: usize, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>, host_memory: &mut HostMemory) {
+    fn step_channel_fsm(
+        &mut self,
+        ch_idx: usize,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+        host_memory: &mut HostMemory,
+    ) {
         // Take the FSM out temporarily so we can match on it while
         // mutating self (for stream buffers, do_transfer, etc.)
         let fsm = std::mem::take(&mut self.channels[ch_idx].fsm);
@@ -95,10 +125,7 @@ impl DmaEngine {
                         }
                     }
                 } else {
-                    ChannelFsm::BdSetup {
-                        cycles_remaining: cycles_remaining - 1,
-                        transfer,
-                    }
+                    ChannelFsm::BdSetup { cycles_remaining: cycles_remaining - 1, transfer }
                 }
             }
 
@@ -124,21 +151,11 @@ impl DmaEngine {
                 } else {
                     // Check if arbiter granted the acquire (submitted in pre-step pass)
                     if self.check_acquire_granted(lock_id, tile, neighbors, ch_idx) {
-                        ChannelFsm::AcquiringLock {
-                            lock_id,
-                            cycles_remaining,
-                            acquired: true,
-                            transfer,
-                        }
+                        ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired: true, transfer }
                     } else {
                         self.channels[ch_idx].stats.lock_wait_cycles += 1;
                         self.trace(EventType::DmaStalledLock { channel: ch_idx as u8 });
-                        ChannelFsm::AcquiringLock {
-                            lock_id,
-                            cycles_remaining,
-                            acquired: false,
-                            transfer,
-                        }
+                        ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired: false, transfer }
                     }
                 }
             }
@@ -151,18 +168,12 @@ impl DmaEngine {
                     // fills, throughput is 1 word/cycle (same as tile memory).
                     let host_lat = self.timing_config.host_memory_latency_cycles;
                     if host_lat > 0 && transfer.involves_host_memory() {
-                        ChannelFsm::HostPipelineLatency {
-                            cycles_remaining: host_lat,
-                            transfer,
-                        }
+                        ChannelFsm::HostPipelineLatency { cycles_remaining: host_lat, transfer }
                     } else {
                         ChannelFsm::Transferring { transfer }
                     }
                 } else {
-                    ChannelFsm::MemoryLatency {
-                        cycles_remaining: cycles_remaining - 1,
-                        transfer,
-                    }
+                    ChannelFsm::MemoryLatency { cycles_remaining: cycles_remaining - 1, transfer }
                 }
             }
 
@@ -170,10 +181,7 @@ impl DmaEngine {
                 if cycles_remaining <= 1 {
                     ChannelFsm::Transferring { transfer }
                 } else {
-                    ChannelFsm::HostPipelineLatency {
-                        cycles_remaining: cycles_remaining - 1,
-                        transfer,
-                    }
+                    ChannelFsm::HostPipelineLatency { cycles_remaining: cycles_remaining - 1, transfer }
                 }
             }
 
@@ -201,9 +209,7 @@ impl DmaEngine {
                         // Early finish on TLAST (FoT mode)
                         self.begin_completion(ch_idx, transfer)
                     }
-                    TransferCycleResult::Error => {
-                        ChannelFsm::Error
-                    }
+                    TransferCycleResult::Error => ChannelFsm::Error,
                 }
             }
 
@@ -227,7 +233,14 @@ impl DmaEngine {
                 if cycles_remaining <= 1 {
                     // Load next BD and start transfer
                     let bd_addr = self.bd_configs.get(next_bd as usize).map(|c| c.base_addr).unwrap_or(0);
-                    log::info!("DMA tile({},{}) ch{} BD chain -> BD{} (base_addr=0x{:X})", self.col, self.row, ch_idx, next_bd, bd_addr);
+                    log::info!(
+                        "DMA tile({},{}) ch{} BD chain -> BD{} (base_addr=0x{:X})",
+                        self.col,
+                        self.row,
+                        ch_idx,
+                        next_bd,
+                        bd_addr
+                    );
                     match self.create_transfer_from_bd(next_bd, ch_idx as u8) {
                         Ok(transfer) => {
                             self.channels[ch_idx].current_bd = Some(next_bd);
@@ -237,16 +250,19 @@ impl DmaEngine {
                             }
                         }
                         Err(e) => {
-                            log::warn!("DMA tile({},{}) ch{} BD chain to {} failed: {:?}",
-                                self.col, self.row, ch_idx, next_bd, e);
+                            log::warn!(
+                                "DMA tile({},{}) ch{} BD chain to {} failed: {:?}",
+                                self.col,
+                                self.row,
+                                ch_idx,
+                                next_bd,
+                                e
+                            );
                             ChannelFsm::Error
                         }
                     }
                 } else {
-                    ChannelFsm::BdChaining {
-                        cycles_remaining: cycles_remaining - 1,
-                        next_bd,
-                    }
+                    ChannelFsm::BdChaining { cycles_remaining: cycles_remaining - 1, next_bd }
                 }
             }
 
@@ -304,7 +320,8 @@ impl DmaEngine {
         self.channels[ch_idx].stats.cycles_spent += completion.cycles_elapsed;
 
         // Emit DMA_FINISHED_BD
-        self.trace_events.push((self.current_cycle, EventType::DmaFinishedBd { channel: ch_idx as u8 }));
+        self.trace_events
+            .push((self.current_cycle, EventType::DmaFinishedBd { channel: ch_idx as u8 }));
 
         // Check for BD chaining.
         //
@@ -317,8 +334,14 @@ impl DmaEngine {
         // The repeat_count then controls how many additional times the chain
         // is re-executed from chain_start_bd.
         if let Some(next_bd) = completion.next_bd {
-            log::debug!("DMA tile({},{}) ch{} chaining to BD {} (from BD {})",
-                self.col, self.row, ch_idx, next_bd, completion.bd_index);
+            log::debug!(
+                "DMA tile({},{}) ch{} chaining to BD {} (from BD {})",
+                self.col,
+                self.row,
+                ch_idx,
+                next_bd,
+                completion.bd_index
+            );
             return ChannelFsm::BdChaining {
                 cycles_remaining: self.timing_config.bd_chain_cycles as u16,
                 next_bd,
@@ -329,8 +352,14 @@ impl DmaEngine {
         if self.channels[ch_idx].repeat_count > 0 {
             self.channels[ch_idx].repeat_count -= 1;
             if let Some(start_bd) = self.channels[ch_idx].chain_start_bd {
-                log::debug!("DMA tile({},{}) ch{} repeating chain from BD {} ({} remaining)",
-                    self.col, self.row, ch_idx, start_bd, self.channels[ch_idx].repeat_count);
+                log::debug!(
+                    "DMA tile({},{}) ch{} repeating chain from BD {} ({} remaining)",
+                    self.col,
+                    self.row,
+                    ch_idx,
+                    start_bd,
+                    self.channels[ch_idx].repeat_count
+                );
                 return ChannelFsm::BdChaining {
                     cycles_remaining: self.timing_config.bd_chain_cycles as u16,
                     next_bd: start_bd,
@@ -343,11 +372,14 @@ impl DmaEngine {
         self.maybe_emit_task_token(ch_idx);
 
         // Check for more tasks in the queue (AIE2+ only).
-        if self.dma_model.supports_task_queue()
-            && !self.channels[ch_idx].task_queue.is_empty()
-        {
-            log::debug!("DMA tile({},{}) ch{} task complete, {} tasks remaining in queue",
-                self.col, self.row, ch_idx, self.channels[ch_idx].task_queue.len());
+        if self.dma_model.supports_task_queue() && !self.channels[ch_idx].task_queue.is_empty() {
+            log::debug!(
+                "DMA tile({},{}) ch{} task complete, {} tasks remaining in queue",
+                self.col,
+                self.row,
+                ch_idx,
+                self.channels[ch_idx].task_queue.len()
+            );
             self.start_next_queued_task(ch_idx as u8);
             // start_next_queued_task sets the FSM, return what it set
             return std::mem::take(&mut self.channels[ch_idx].fsm);
@@ -385,11 +417,8 @@ impl DmaEngine {
             match action {
                 PadAction::Zero => {
                     let should_assert_tlast = is_last_word && !tlast_suppress;
-                    self.stream_out.push_back(StreamData {
-                        data: 0,
-                        tlast: should_assert_tlast,
-                        channel,
-                    });
+                    self.stream_out
+                        .push_back(StreamData { data: 0, tlast: should_assert_tlast, channel });
                     transfer.advance(4);
                     self.channels[ch_idx].stats.bytes_transferred += 4;
                     TransferCycleResult::Continue
@@ -398,8 +427,16 @@ impl DmaEngine {
                     let source = transfer.source;
                     let dest = transfer.dest;
                     let result = self.do_transfer(
-                        source, dest, addr, 4, channel,
-                        is_last_word, tlast_suppress, tile, neighbors, host_memory,
+                        source,
+                        dest,
+                        addr,
+                        4,
+                        channel,
+                        is_last_word,
+                        tlast_suppress,
+                        tile,
+                        neighbors,
+                        host_memory,
                     );
 
                     if result.stall {
@@ -443,8 +480,16 @@ impl DmaEngine {
                 let is_last = transfer.remaining_bytes() <= 4;
 
                 let result = self.do_transfer(
-                    source, dest, addr, 4, channel,
-                    is_last, tlast_suppress, tile, neighbors, host_memory,
+                    source,
+                    dest,
+                    addr,
+                    4,
+                    channel,
+                    is_last,
+                    tlast_suppress,
+                    tile,
+                    neighbors,
+                    host_memory,
                 );
 
                 if result.stall {
@@ -509,8 +554,16 @@ impl DmaEngine {
         let requestor = self.channel_requestor(ch_idx as u8);
         let granted = target_tile.lock_was_granted(requestor, local_id as usize);
 
-        log::info!("DMA check_acquire_granted tile({},{}) ch{} bd_lock={} target={:?} local_lock={} granted={}",
-            self.col, self.row, ch_idx, lock_id, lock_target, local_id, granted);
+        log::info!(
+            "DMA check_acquire_granted tile({},{}) ch{} bd_lock={} target={:?} local_lock={} granted={}",
+            self.col,
+            self.row,
+            ch_idx,
+            lock_id,
+            lock_target,
+            local_id,
+            granted
+        );
 
         if let Some(ref mut timing) = self.lock_timing {
             timing.track_acquire(local_id as usize, granted);
@@ -531,8 +584,13 @@ impl DmaEngine {
         _tile: &mut Tile,
         _neighbors: &mut NeighborTiles<'_>,
     ) {
-        log::info!("DMA tile({},{}) lock release bd_lock={} delta={} (applied by arbiter)",
-            self.col, self.row, lock_id, release_value);
+        log::info!(
+            "DMA tile({},{}) lock release bd_lock={} delta={} (applied by arbiter)",
+            self.col,
+            self.row,
+            lock_id,
+            release_value
+        );
     }
 
     /// Insert a packet header from a Transfer reference (used during BdSetup).
@@ -547,9 +605,15 @@ impl DmaEngine {
     pub(super) fn maybe_insert_packet_header_from_transfer(&mut self, transfer: &mut Transfer) {
         if !transfer.needs_packet_header() || transfer.direction != TransferDirection::MM2S {
             if transfer.enable_packet && transfer.direction == TransferDirection::MM2S {
-                log::warn!("DMA({},{}) ch{} BD{}: enable_packet=true but needs_packet_header()={} header_sent={}",
-                    self.col, self.row, transfer.channel, transfer.bd_index,
-                    transfer.needs_packet_header(), transfer.packet_header_sent);
+                log::warn!(
+                    "DMA({},{}) ch{} BD{}: enable_packet=true but needs_packet_header()={} header_sent={}",
+                    self.col,
+                    self.row,
+                    transfer.channel,
+                    transfer.bd_index,
+                    transfer.needs_packet_header(),
+                    transfer.packet_header_sent
+                );
             }
             return;
         }
@@ -562,9 +626,16 @@ impl DmaEngine {
             });
             transfer.mark_packet_header_sent();
             let (hdr, _) = crate::device::stream_switch::PacketHeader::decode(header_word);
-            log::info!("DMA({},{}) ch{} BD{} packet header: 0x{:08X} (pkt_id={}, type={:?})",
-                self.col, self.row, transfer.channel, transfer.bd_index,
-                header_word, hdr.stream_id, hdr.packet_type);
+            log::info!(
+                "DMA({},{}) ch{} BD{} packet header: 0x{:08X} (pkt_id={}, type={:?})",
+                self.col,
+                self.row,
+                transfer.channel,
+                transfer.bd_index,
+                header_word,
+                hdr.stream_id,
+                hdr.packet_type
+            );
         }
     }
 
@@ -612,7 +683,11 @@ impl DmaEngine {
                     if fot_finish {
                         log::debug!(
                             "DMA({},{}) ch{} FoT mode {} triggered by TLAST ({} bytes written)",
-                            self.col, self.row, channel, fot_mode, result.bytes_written
+                            self.col,
+                            self.row,
+                            channel,
+                            fot_mode,
+                            result.bytes_written
                         );
                     }
 
@@ -660,7 +735,11 @@ impl DmaEngine {
                     if fot_finish {
                         log::debug!(
                             "DMA({},{}) Shim S2MM ch{} FoT mode {} triggered by TLAST ({} bytes written)",
-                            self.col, self.row, channel, fot_mode, result.bytes_written
+                            self.col,
+                            self.row,
+                            channel,
+                            fot_mode,
+                            result.bytes_written
                         );
                     }
 
@@ -705,12 +784,12 @@ impl DmaEngine {
         }
         match MemTileTarget::resolve(addr, mem_size) {
             Ok((MemTileTarget::Own, off)) => Some((own, off)),
-            Ok((MemTileTarget::West, off)) => Some(
-                neighbors.west.as_deref().map(|t| (t, off)).unwrap_or((own, off)),
-            ),
-            Ok((MemTileTarget::East, off)) => Some(
-                neighbors.east.as_deref().map(|t| (t, off)).unwrap_or((own, off)),
-            ),
+            Ok((MemTileTarget::West, off)) => {
+                Some(neighbors.west.as_deref().map(|t| (t, off)).unwrap_or((own, off)))
+            }
+            Ok((MemTileTarget::East, off)) => {
+                Some(neighbors.east.as_deref().map(|t| (t, off)).unwrap_or((own, off)))
+            }
             Err(e) => {
                 let msg = format!(
                     "DMA MemTile({},{}) MM2S addr=0x{:X} outside three-window MemTile space (window_size=0x{:X})",
@@ -741,18 +820,14 @@ impl DmaEngine {
         }
         match MemTileTarget::resolve(addr, mem_size) {
             Ok((MemTileTarget::Own, off)) => Some((own, off)),
-            Ok((MemTileTarget::West, off)) => Some(
-                match neighbors.west.as_deref_mut() {
-                    Some(t) => (t, off),
-                    None => (own, off),
-                },
-            ),
-            Ok((MemTileTarget::East, off)) => Some(
-                match neighbors.east.as_deref_mut() {
-                    Some(t) => (t, off),
-                    None => (own, off),
-                },
-            ),
+            Ok((MemTileTarget::West, off)) => Some(match neighbors.west.as_deref_mut() {
+                Some(t) => (t, off),
+                None => (own, off),
+            }),
+            Ok((MemTileTarget::East, off)) => Some(match neighbors.east.as_deref_mut() {
+                Some(t) => (t, off),
+                None => (own, off),
+            }),
             Err(e) => {
                 let msg = format!(
                     "DMA MemTile({},{}) S2MM addr=0x{:X} outside three-window MemTile space (window_size=0x{:X})",
@@ -794,9 +869,8 @@ impl DmaEngine {
         };
 
         // Record bank access for conflict detection (offset is local to the target tile)
-        self.cycle_dma_banks |= crate::device::banking::banks_for_access(
-            offset as u32, bytes, self.num_banks,
-        );
+        self.cycle_dma_banks |=
+            crate::device::banking::banks_for_access(offset as u32, bytes, self.num_banks);
 
         if offset + bytes > mem_size {
             let msg = format!(
@@ -819,9 +893,16 @@ impl DmaEngine {
         // Uncompressed path: read data from tile memory in 32-bit words
         let word_count = (bytes + 3) / 4;
 
-        log::debug!("DMA({},{}) MM2S ch{}: addr=0x{:X} offset=0x{:X} bytes={} words={}",
-            self.col, self.row, channel, addr, offset, bytes, word_count);
-
+        log::debug!(
+            "DMA({},{}) MM2S ch{}: addr=0x{:X} offset=0x{:X} bytes={} words={}",
+            self.col,
+            self.row,
+            channel,
+            addr,
+            offset,
+            bytes,
+            word_count
+        );
 
         for i in 0..word_count {
             let word_offset = offset + i * 4;
@@ -844,14 +925,24 @@ impl DmaEngine {
             };
 
             if i < 2 || i == word_count - 1 {
-                log::debug!("DMA({},{}) MM2S ch{} word[{}]: offset=0x{:X} value=0x{:08X}",
-                    self.col, self.row, channel, i, word_offset, word);
+                log::debug!(
+                    "DMA({},{}) MM2S ch{} word[{}]: offset=0x{:X} value=0x{:08X}",
+                    self.col,
+                    self.row,
+                    channel,
+                    i,
+                    word_offset,
+                    word
+                );
             }
 
             if crate::debug::watch::is_watched(word_offset as u64, 4) {
                 crate::debug::watch::log_dma_read(
-                    self.current_cycle, self.col, self.row,
-                    word_offset as u64, word,
+                    self.current_cycle,
+                    self.col,
+                    self.row,
+                    word_offset as u64,
+                    word,
                     &format!("MM2S{}", channel),
                 );
             }
@@ -860,11 +951,8 @@ impl DmaEngine {
             // AM025: TLAST_Suppress (Word 5, bit 31) prevents TLAST assertion
             let is_last_word = is_last && (i == word_count - 1);
             let should_assert_tlast = is_last_word && !tlast_suppress;
-            self.stream_out.push_back(StreamData {
-                data: word,
-                tlast: should_assert_tlast,
-                channel,
-            });
+            self.stream_out
+                .push_back(StreamData { data: word, tlast: should_assert_tlast, channel });
         }
 
         true
@@ -887,8 +975,14 @@ impl DmaEngine {
     ) -> bool {
         const BLOCK_SIZE: usize = 32;
 
-        log::debug!("DMA({},{}) MM2S ch{} COMPRESSED: offset=0x{:X} bytes={}",
-            self.col, self.row, channel, offset, bytes);
+        log::debug!(
+            "DMA({},{}) MM2S ch{} COMPRESSED: offset=0x{:X} bytes={}",
+            self.col,
+            self.row,
+            channel,
+            offset,
+            bytes
+        );
 
         let num_blocks = (bytes + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
@@ -914,8 +1008,15 @@ impl DmaEngine {
                 }
             };
 
-            log::debug!("DMA({},{}) MM2S ch{} block {}: {} bytes -> {} compressed bytes",
-                self.col, self.row, channel, block_idx, BLOCK_SIZE, compressed.len());
+            log::debug!(
+                "DMA({},{}) MM2S ch{} block {}: {} bytes -> {} compressed bytes",
+                self.col,
+                self.row,
+                channel,
+                block_idx,
+                BLOCK_SIZE,
+                compressed.len()
+            );
 
             // Push compressed bytes as 32-bit stream words
             let compressed_words = compressed.len() / 4;
@@ -932,11 +1033,8 @@ impl DmaEngine {
 
                 let is_last_word = is_last_block && w == compressed_words - 1;
                 let should_assert_tlast = is_last_word && !tlast_suppress;
-                self.stream_out.push_back(StreamData {
-                    data: word,
-                    tlast: should_assert_tlast,
-                    channel,
-                });
+                self.stream_out
+                    .push_back(StreamData { data: word, tlast: should_assert_tlast, channel });
             }
         }
 
@@ -962,13 +1060,14 @@ impl DmaEngine {
         // tiles wrap at mem_size.
         let (target_tile, offset) = match self.resolve_s2mm_target(addr, mem_size, tile, neighbors) {
             Some(r) => r,
-            None => return S2mmResult { success: false, stall: false, tlast_received: false, bytes_written: 0 },
+            None => {
+                return S2mmResult { success: false, stall: false, tlast_received: false, bytes_written: 0 }
+            }
         };
 
         // Record bank access for conflict detection (offset is local to the target tile)
-        self.cycle_dma_banks |= crate::device::banking::banks_for_access(
-            offset as u32, bytes, self.num_banks,
-        );
+        self.cycle_dma_banks |=
+            crate::device::banking::banks_for_access(offset as u32, bytes, self.num_banks);
 
         if offset + bytes > mem_size {
             let msg = format!(
@@ -1011,8 +1110,16 @@ impl DmaEngine {
         let word_count = (bytes + 3) / 4;
         let mut tlast_received = false;
 
-        log::debug!("DMA({},{}) S2MM ch{}: addr=0x{:X} offset=0x{:X} bytes={} words={}",
-            self.col, self.row, channel, addr, offset, bytes, word_count);
+        log::debug!(
+            "DMA({},{}) S2MM ch{}: addr=0x{:X} offset=0x{:X} bytes={} words={}",
+            self.col,
+            self.row,
+            channel,
+            addr,
+            offset,
+            bytes,
+            word_count
+        );
         for word_idx in 0..word_count {
             // Get data from stream for this specific channel
             if let Some(stream_data) = self.pop_stream_in_for_channel(channel) {
@@ -1020,8 +1127,15 @@ impl DmaEngine {
                 let word_bytes = word.to_le_bytes();
 
                 if word_idx < 2 || word_idx == word_count - 1 {
-                    log::debug!("DMA({},{}) S2MM ch{} word[{}]: offset=0x{:X} value=0x{:08X}",
-                        self.col, self.row, channel, word_idx, offset + bytes_written, word);
+                    log::debug!(
+                        "DMA({},{}) S2MM ch{} word[{}]: offset=0x{:X} value=0x{:08X}",
+                        self.col,
+                        self.row,
+                        channel,
+                        word_idx,
+                        offset + bytes_written,
+                        word
+                    );
                 }
                 for j in 0..4 {
                     if bytes_written + j < bytes && offset + bytes_written + j < data.len() {
@@ -1031,8 +1145,11 @@ impl DmaEngine {
 
                 if crate::debug::watch::is_watched((offset + bytes_written) as u64, 4) {
                     crate::debug::watch::log_dma_write(
-                        self.current_cycle, self.col, self.row,
-                        (offset + bytes_written) as u64, word,
+                        self.current_cycle,
+                        self.col,
+                        self.row,
+                        (offset + bytes_written) as u64,
+                        word,
                         &format!("S2MM{}", channel),
                     );
                 }
@@ -1073,8 +1190,14 @@ impl DmaEngine {
     ) -> S2mmResult {
         const BLOCK_SIZE: usize = 32;
 
-        log::debug!("DMA({},{}) S2MM ch{} DECOMPRESSED: offset=0x{:X} bytes={}",
-            self.col, self.row, channel, offset, bytes);
+        log::debug!(
+            "DMA({},{}) S2MM ch{} DECOMPRESSED: offset=0x{:X} bytes={}",
+            self.col,
+            self.row,
+            channel,
+            offset,
+            bytes
+        );
 
         let mut mem_bytes_written: usize = 0;
         let mut tlast_received = false;
@@ -1140,7 +1263,9 @@ impl DmaEngine {
                     log::error!("{}", msg);
                     self.fatal_errors.push(msg);
                     return S2mmResult {
-                        success: false, stall: false, tlast_received: false,
+                        success: false,
+                        stall: false,
+                        tlast_received: false,
                         bytes_written: mem_bytes_written,
                     };
                 }
@@ -1176,7 +1301,12 @@ impl DmaEngine {
         // When compression is enabled, read 32-byte blocks and compress
         if self.is_compression_enabled(channel) {
             return self.transfer_host_to_stream_compressed(
-                addr, bytes, channel, is_last, tlast_suppress, host_memory,
+                addr,
+                bytes,
+                channel,
+                is_last,
+                tlast_suppress,
+                host_memory,
             );
         }
 
@@ -1190,8 +1320,11 @@ impl DmaEngine {
 
             if crate::debug::watch::is_watched(word_addr, 4) {
                 crate::debug::watch::log_dma_read(
-                    self.current_cycle, self.col, self.row,
-                    word_addr, word,
+                    self.current_cycle,
+                    self.col,
+                    self.row,
+                    word_addr,
+                    word,
                     &format!("MM2S{}", channel),
                 );
             }
@@ -1204,11 +1337,8 @@ impl DmaEngine {
             // AM025: TLAST_Suppress (Word 5, bit 31) prevents TLAST assertion
             let is_last_word = is_last && i == word_count - 1;
             let should_assert_tlast = is_last_word && !tlast_suppress;
-            self.stream_out.push_back(StreamData {
-                data: word,
-                channel,
-                tlast: should_assert_tlast,
-            });
+            self.stream_out
+                .push_back(StreamData { data: word, channel, tlast: should_assert_tlast });
         }
 
         true
@@ -1268,11 +1398,8 @@ impl DmaEngine {
 
                 let is_last_word = is_last_block && w == compressed_words - 1;
                 let should_assert_tlast = is_last_word && !tlast_suppress;
-                self.stream_out.push_back(StreamData {
-                    data: word,
-                    channel,
-                    tlast: should_assert_tlast,
-                });
+                self.stream_out
+                    .push_back(StreamData { data: word, channel, tlast: should_assert_tlast });
             }
         }
 
@@ -1329,8 +1456,11 @@ impl DmaEngine {
 
             if crate::debug::watch::is_watched(word_addr, 4) {
                 crate::debug::watch::log_dma_write(
-                    self.current_cycle, self.col, self.row,
-                    word_addr, word,
+                    self.current_cycle,
+                    self.col,
+                    self.row,
+                    word_addr,
+                    word,
                     &format!("S2MM{}", channel),
                 );
             }
@@ -1428,7 +1558,9 @@ impl DmaEngine {
                 None => {
                     log::error!("Shim S2MM ch{} decompression failed (mask=0x{:08X})", channel, mask);
                     return S2mmResult {
-                        success: false, stall: false, tlast_received: false,
+                        success: false,
+                        stall: false,
+                        tlast_received: false,
                         bytes_written: mem_bytes_written,
                     };
                 }
@@ -1507,7 +1639,10 @@ impl DmaEngine {
         if config.enable_token_issue {
             log::debug!(
                 "DMA tile({},{}) ch{} emitting task complete token (controller_id={})",
-                self.col, self.row, ch_idx, config.controller_id
+                self.col,
+                self.row,
+                ch_idx,
+                config.controller_id
             );
 
             self.task_tokens.issue(ch_idx as u8, config.controller_id);

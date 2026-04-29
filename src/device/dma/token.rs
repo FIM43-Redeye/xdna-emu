@@ -138,11 +138,7 @@ impl TaskQueueEntry {
     ///
     /// `repeat_count` is in hardware encoding (actual - 1).
     pub fn new(start_bd: u8, repeat_count: u8, enable_token_issue: bool) -> Self {
-        Self {
-            start_bd,
-            repeat_count,
-            enable_token_issue,
-        }
+        Self { start_bd, repeat_count, enable_token_issue }
     }
 
     /// Get the actual number of times this task will execute.
@@ -223,11 +219,7 @@ impl TaskQueue {
     /// The hardware capacity is `MAX_TASK_QUEUE_DEPTH` (8), but this
     /// constructor accepts an arbitrary capacity for testing flexibility.
     pub fn new(capacity: usize) -> Self {
-        Self {
-            entries: VecDeque::with_capacity(capacity),
-            capacity,
-            overflow: false,
-        }
+        Self { entries: VecDeque::with_capacity(capacity), capacity, overflow: false }
     }
 
     /// Create a task queue with the standard hardware capacity (8 entries).
@@ -332,10 +324,7 @@ pub struct Token {
 impl Token {
     /// Create a new completion token.
     pub fn new(channel_id: u8, controller_id: u8) -> Self {
-        Self {
-            channel_id,
-            controller_id,
-        }
+        Self { channel_id, controller_id }
     }
 }
 
@@ -355,9 +344,7 @@ pub struct TokenState {
 impl TokenState {
     /// Create a new token state with no pending tokens.
     pub fn new() -> Self {
-        Self {
-            pending: VecDeque::new(),
-        }
+        Self { pending: VecDeque::new() }
     }
 
     /// Issue a completion token.
@@ -760,9 +747,9 @@ mod tests {
         let mut q = TaskQueue::new_default();
         let mut ts = TokenState::new();
 
-        q.push(TaskQueueEntry::new(0, 0, true)).unwrap();   // token
-        q.push(TaskQueueEntry::new(1, 2, false)).unwrap();   // no token
-        q.push(TaskQueueEntry::new(2, 0, true)).unwrap();    // token
+        q.push(TaskQueueEntry::new(0, 0, true)).unwrap(); // token
+        q.push(TaskQueueEntry::new(1, 2, false)).unwrap(); // no token
+        q.push(TaskQueueEntry::new(2, 0, true)).unwrap(); // token
 
         // Simulate processing each task
         let controller_id = 7u8;

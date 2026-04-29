@@ -80,12 +80,7 @@ pub struct ZeroPadState {
 
 impl ZeroPadState {
     /// Create a new padding state from BD dimensions and padding config.
-    pub fn new(
-        config: ZeroPadConfig,
-        d0_size: u32,
-        d1_size: u32,
-        d2_size: u32,
-    ) -> Self {
+    pub fn new(config: ZeroPadConfig, d0_size: u32, d1_size: u32, d2_size: u32) -> Self {
         let d0_eff = if d0_size == 0 { 1 } else { d0_size };
         let d1_eff = if d1_size == 0 { 1 } else { d1_size };
         let d2_eff = if d2_size == 0 { 1 } else { d2_size };
@@ -173,9 +168,8 @@ impl ZeroPadState {
         match self.phase {
             PadPhase::D2Before => {
                 // D2 before padding done, start first D1 iteration
-                let (phase, remaining) = Self::enter_d1_iteration(
-                    &self.config, self.d0_size, self.d0_wrap_size,
-                );
+                let (phase, remaining) =
+                    Self::enter_d1_iteration(&self.config, self.d0_size, self.d0_wrap_size);
                 self.phase = phase;
                 self.phase_remaining = remaining;
             }
@@ -220,12 +214,11 @@ impl ZeroPadState {
                     // Start next D2 iteration
                     if self.config.d2_before > 0 {
                         self.phase = PadPhase::D2Before;
-                        self.phase_remaining = self.config.d2_before as u32
-                            * self.d1_total * self.d0_wrap_size;
+                        self.phase_remaining =
+                            self.config.d2_before as u32 * self.d1_total * self.d0_wrap_size;
                     } else {
-                        let (phase, remaining) = Self::enter_d1_iteration(
-                            &self.config, self.d0_size, self.d0_wrap_size,
-                        );
+                        let (phase, remaining) =
+                            Self::enter_d1_iteration(&self.config, self.d0_size, self.d0_wrap_size);
                         self.phase = phase;
                         self.phase_remaining = remaining;
                     }
@@ -276,20 +269,17 @@ impl ZeroPadState {
         if self.config.d2_after > 0 {
             self.phase = PadPhase::D2After;
             // Each D2 after unit = one complete D1 block of zeros
-            self.phase_remaining = self.config.d2_after as u32
-                * self.d1_total * self.d0_wrap_size;
+            self.phase_remaining = self.config.d2_after as u32 * self.d1_total * self.d0_wrap_size;
         } else {
             self.d2_counter += 1;
             if self.d2_counter < self.d2_size {
                 self.d1_counter = 0;
                 if self.config.d2_before > 0 {
                     self.phase = PadPhase::D2Before;
-                    self.phase_remaining = self.config.d2_before as u32
-                        * self.d1_total * self.d0_wrap_size;
+                    self.phase_remaining = self.config.d2_before as u32 * self.d1_total * self.d0_wrap_size;
                 } else {
-                    let (phase, remaining) = Self::enter_d1_iteration(
-                        &self.config, self.d0_size, self.d0_wrap_size,
-                    );
+                    let (phase, remaining) =
+                        Self::enter_d1_iteration(&self.config, self.d0_size, self.d0_wrap_size);
                     self.phase = phase;
                     self.phase_remaining = remaining;
                 }
@@ -304,9 +294,7 @@ impl ZeroPadState {
     ///
     /// D1 before padding = d1_before complete D0 wraps of zeros (per AM025:
     /// "wraps of dim0 before dim1").
-    fn enter_d1_iteration(
-        config: &ZeroPadConfig, d0_size: u32, d0_wrap_size: u32,
-    ) -> (PadPhase, u32) {
+    fn enter_d1_iteration(config: &ZeroPadConfig, d0_size: u32, d0_wrap_size: u32) -> (PadPhase, u32) {
         if config.d1_before > 0 {
             // Each D1 before unit = one complete D0 output row of zeros
             (PadPhase::D1Before, config.d1_before as u32 * d0_wrap_size)

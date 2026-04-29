@@ -48,7 +48,11 @@ impl DimensionConfig {
     /// Get effective size (0 = 1 iteration)
     #[inline]
     pub fn effective_size(&self) -> u32 {
-        if self.size == 0 { 1 } else { self.size }
+        if self.size == 0 {
+            1
+        } else {
+            self.size
+        }
     }
 
     /// Check if this dimension is enabled (has iterations)
@@ -155,9 +159,12 @@ pub struct ZeroPadConfig {
 impl ZeroPadConfig {
     /// Check if any padding is configured.
     pub fn is_enabled(&self) -> bool {
-        self.d0_before > 0 || self.d0_after > 0
-            || self.d1_before > 0 || self.d1_after > 0
-            || self.d2_before > 0 || self.d2_after > 0
+        self.d0_before > 0
+            || self.d0_after > 0
+            || self.d1_before > 0
+            || self.d1_after > 0
+            || self.d2_before > 0
+            || self.d2_after > 0
     }
 
     /// Total padding words per complete dimensional pattern (one iteration).
@@ -222,11 +229,7 @@ impl ZeroPadConfig {
         const PAD_MAX_D0_WORDS: u8 = 63;
         const PAD_MAX_D1_ITERS: u8 = 31;
         const PAD_MAX_D2_ITERS: u8 = 15;
-        let dim_maxes: [u8; 3] = [
-            PAD_MAX_D0_WORDS,
-            PAD_MAX_D1_ITERS,
-            PAD_MAX_D2_ITERS,
-        ];
+        let dim_maxes: [u8; 3] = [PAD_MAX_D0_WORDS, PAD_MAX_D1_ITERS, PAD_MAX_D2_ITERS];
 
         let befores = [self.d0_before, self.d1_before, self.d2_before];
         let afters = [self.d0_after, self.d1_after, self.d2_after];
@@ -238,14 +241,18 @@ impl ZeroPadConfig {
             if befores[dim] > dim_maxes[dim] {
                 log::warn!(
                     "MemTile zero-padding: {} before ({}) exceeds max ({})",
-                    dim_names[dim], befores[dim], dim_maxes[dim]
+                    dim_names[dim],
+                    befores[dim],
+                    dim_maxes[dim]
                 );
                 valid = false;
             }
             if afters[dim] > dim_maxes[dim] {
                 log::warn!(
                     "MemTile zero-padding: {} after ({}) exceeds max ({})",
-                    dim_names[dim], afters[dim], dim_maxes[dim]
+                    dim_names[dim],
+                    afters[dim],
+                    dim_maxes[dim]
                 );
                 valid = false;
             }
@@ -258,7 +265,9 @@ impl ZeroPadConfig {
                 if afters[dim] != 0 {
                     log::warn!(
                         "MemTile zero-padding: {} after ({}) must be 0 when {} wrap is 0",
-                        dim_names[dim], afters[dim], dim_names[dim]
+                        dim_names[dim],
+                        afters[dim],
+                        dim_names[dim]
                     );
                     valid = false;
                 }
@@ -266,14 +275,18 @@ impl ZeroPadConfig {
                     if befores[higher] != 0 {
                         log::warn!(
                             "MemTile zero-padding: {} before ({}) must be 0 when {} wrap is 0",
-                            dim_names[higher], befores[higher], dim_names[dim]
+                            dim_names[higher],
+                            befores[higher],
+                            dim_names[dim]
                         );
                         valid = false;
                     }
                     if afters[higher] != 0 {
                         log::warn!(
                             "MemTile zero-padding: {} after ({}) must be 0 when {} wrap is 0",
-                            dim_names[higher], afters[higher], dim_names[dim]
+                            dim_names[higher],
+                            afters[higher],
+                            dim_names[dim]
                         );
                         valid = false;
                     }
@@ -336,28 +349,28 @@ pub struct AddressGenerator {
 impl AddressGenerator {
     /// Create a new address generator for 1D transfer.
     pub fn new_1d(base: u64, count: u32, stride: i32) -> Self {
-        Self::new(base, [
-            DimensionConfig::new(count, stride),
-            DimensionConfig::default(),
-            DimensionConfig::default(),
-            DimensionConfig::default(),
-        ])
+        Self::new(
+            base,
+            [
+                DimensionConfig::new(count, stride),
+                DimensionConfig::default(),
+                DimensionConfig::default(),
+                DimensionConfig::default(),
+            ],
+        )
     }
 
     /// Create a new address generator for 2D transfer.
-    pub fn new_2d(
-        base: u64,
-        d0_size: u32,
-        d0_stride: i32,
-        d1_size: u32,
-        d1_stride: i32,
-    ) -> Self {
-        Self::new(base, [
-            DimensionConfig::new(d0_size, d0_stride),
-            DimensionConfig::new(d1_size, d1_stride),
-            DimensionConfig::default(),
-            DimensionConfig::default(),
-        ])
+    pub fn new_2d(base: u64, d0_size: u32, d0_stride: i32, d1_size: u32, d1_stride: i32) -> Self {
+        Self::new(
+            base,
+            [
+                DimensionConfig::new(d0_size, d0_stride),
+                DimensionConfig::new(d1_size, d1_stride),
+                DimensionConfig::default(),
+                DimensionConfig::default(),
+            ],
+        )
     }
 
     /// Create a new address generator for 3D transfer.
@@ -370,12 +383,15 @@ impl AddressGenerator {
         d2_size: u32,
         d2_stride: i32,
     ) -> Self {
-        Self::new(base, [
-            DimensionConfig::new(d0_size, d0_stride),
-            DimensionConfig::new(d1_size, d1_stride),
-            DimensionConfig::new(d2_size, d2_stride),
-            DimensionConfig::default(),
-        ])
+        Self::new(
+            base,
+            [
+                DimensionConfig::new(d0_size, d0_stride),
+                DimensionConfig::new(d1_size, d1_stride),
+                DimensionConfig::new(d2_size, d2_stride),
+                DimensionConfig::default(),
+            ],
+        )
     }
 
     /// Create a new address generator with custom dimensions (no iteration).
@@ -388,14 +404,8 @@ impl AddressGenerator {
     /// Iteration acts as an outermost loop: the dimensional pattern is repeated
     /// `iteration.wrap + 1` times, with `iteration.stepsize_bytes()` added to
     /// the base address each iteration.
-    pub fn with_iteration(
-        base: u64,
-        dimensions: [DimensionConfig; 4],
-        iteration: IterationConfig,
-    ) -> Self {
-        let elements_per_iteration: u64 = dimensions.iter()
-            .map(|d| d.effective_size() as u64)
-            .product();
+    pub fn with_iteration(base: u64, dimensions: [DimensionConfig; 4], iteration: IterationConfig) -> Self {
+        let elements_per_iteration: u64 = dimensions.iter().map(|d| d.effective_size() as u64).product();
 
         let iteration_count = iteration.total_iterations() as u64;
         let total_elements = elements_per_iteration * iteration_count;
@@ -512,9 +522,7 @@ impl AddressGenerator {
 
     /// Create an iterator over all addresses.
     pub fn iter(&self) -> AddressIterator {
-        AddressIterator {
-            generator: self.clone(),
-        }
+        AddressIterator { generator: self.clone() }
     }
 }
 
@@ -573,16 +581,18 @@ mod tests {
         // 4x2 matrix, row-major, 4 bytes per element
         // Row stride = 4 elements * 4 bytes = 16 bytes
         let gen = AddressGenerator::new_2d(
-            0x1000,
-            4, 4,   // D0: 4 elements, stride 4
-            2, 16,  // D1: 2 rows, stride 16
+            0x1000, 4, 4, // D0: 4 elements, stride 4
+            2, 16, // D1: 2 rows, stride 16
         );
         let addrs: Vec<u64> = gen.iter().collect();
 
-        assert_eq!(addrs, vec![
-            0x1000, 0x1004, 0x1008, 0x100C,  // Row 0
-            0x1010, 0x1014, 0x1018, 0x101C,  // Row 1
-        ]);
+        assert_eq!(
+            addrs,
+            vec![
+                0x1000, 0x1004, 0x1008, 0x100C, // Row 0
+                0x1010, 0x1014, 0x1018, 0x101C, // Row 1
+            ]
+        );
     }
 
     #[test]
@@ -590,43 +600,47 @@ mod tests {
         // 2x2 matrix with row padding (stride > row_size * element_size)
         // Each row is 2 elements but stride is 32 bytes (padding of 24 bytes)
         let gen = AddressGenerator::new_2d(
-            0x1000,
-            2, 4,   // D0: 2 elements per row
-            2, 32,  // D1: 2 rows, 32-byte stride
+            0x1000, 2, 4, // D0: 2 elements per row
+            2, 32, // D1: 2 rows, 32-byte stride
         );
         let addrs: Vec<u64> = gen.iter().collect();
 
-        assert_eq!(addrs, vec![
-            0x1000, 0x1004,  // Row 0
-            0x1020, 0x1024,  // Row 1 (starts at base + 32)
-        ]);
+        assert_eq!(
+            addrs,
+            vec![
+                0x1000, 0x1004, // Row 0
+                0x1020, 0x1024, // Row 1 (starts at base + 32)
+            ]
+        );
     }
 
     #[test]
     fn test_3d_transfer() {
         // 2x2x2 3D array
         let gen = AddressGenerator::new_3d(
-            0x1000,
-            2, 4,    // D0: 2 elements, stride 4
-            2, 8,    // D1: 2 rows, stride 8
-            2, 16,   // D2: 2 planes, stride 16
+            0x1000, 2, 4, // D0: 2 elements, stride 4
+            2, 8, // D1: 2 rows, stride 8
+            2, 16, // D2: 2 planes, stride 16
         );
         let addrs: Vec<u64> = gen.iter().collect();
 
-        assert_eq!(addrs, vec![
-            // Plane 0
-            0x1000, 0x1004,  // Row 0
-            0x1008, 0x100C,  // Row 1
-            // Plane 1
-            0x1010, 0x1014,  // Row 0
-            0x1018, 0x101C,  // Row 1
-        ]);
+        assert_eq!(
+            addrs,
+            vec![
+                // Plane 0
+                0x1000, 0x1004, // Row 0
+                0x1008, 0x100C, // Row 1
+                // Plane 1
+                0x1010, 0x1014, // Row 0
+                0x1018, 0x101C, // Row 1
+            ]
+        );
     }
 
     #[test]
     fn test_total_elements() {
         let gen = AddressGenerator::new_2d(0x1000, 4, 4, 3, 16);
-        assert_eq!(gen.total_elements(), 12);  // 4 * 3
+        assert_eq!(gen.total_elements(), 12); // 4 * 3
     }
 
     #[test]
@@ -693,18 +707,20 @@ mod tests {
         // Access:   [0,0] [1,0] [0,1] [1,1] [0,2] [1,2] [0,3] [1,3]
         // Row stride is 16 bytes (4 elements * 4 bytes)
         let gen = AddressGenerator::new_2d(
-            0x1000,
-            2, 16,  // D0: 2 rows (stride is row_size = 16)
-            4, 4,   // D1: 4 columns (stride is element_size = 4)
+            0x1000, 2, 16, // D0: 2 rows (stride is row_size = 16)
+            4, 4, // D1: 4 columns (stride is element_size = 4)
         );
         let addrs: Vec<u64> = gen.iter().collect();
 
-        assert_eq!(addrs, vec![
-            0x1000, 0x1010,  // Column 0: [0,0], [1,0]
-            0x1004, 0x1014,  // Column 1: [0,1], [1,1]
-            0x1008, 0x1018,  // Column 2: [0,2], [1,2]
-            0x100C, 0x101C,  // Column 3: [0,3], [1,3]
-        ]);
+        assert_eq!(
+            addrs,
+            vec![
+                0x1000, 0x1010, // Column 0: [0,0], [1,0]
+                0x1004, 0x1014, // Column 1: [0,1], [1,1]
+                0x1008, 0x1018, // Column 2: [0,2], [1,2]
+                0x100C, 0x101C, // Column 3: [0,3], [1,3]
+            ]
+        );
     }
 
     #[test]
@@ -715,24 +731,25 @@ mod tests {
         let gen = AddressGenerator::with_iteration(
             0x1000,
             [
-                DimensionConfig::new(2, 4),  // 2 elements, 4-byte stride
+                DimensionConfig::new(2, 4), // 2 elements, 4-byte stride
                 DimensionConfig::default(),
                 DimensionConfig::default(),
                 DimensionConfig::default(),
             ],
-            IterationConfig::new(2, 1),  // wrap=2 (3 iterations), stepsize=1 (actual=2 words=8 bytes)
+            IterationConfig::new(2, 1), // wrap=2 (3 iterations), stepsize=1 (actual=2 words=8 bytes)
         );
         let addrs: Vec<u64> = gen.iter().collect();
 
-        assert_eq!(addrs, vec![
-            // Iteration 0: base + 0
-            0x1000, 0x1004,
-            // Iteration 1: base + 8
-            0x1008, 0x100C,
-            // Iteration 2: base + 16
-            0x1010, 0x1014,
-        ]);
-        assert_eq!(addrs.len(), 6);  // 2 elements * 3 iterations
+        assert_eq!(
+            addrs,
+            vec![
+                // Iteration 0: base + 0
+                0x1000, 0x1004, // Iteration 1: base + 8
+                0x1008, 0x100C, // Iteration 2: base + 16
+                0x1010, 0x1014,
+            ]
+        );
+        assert_eq!(addrs.len(), 6); // 2 elements * 3 iterations
     }
 
     #[test]
@@ -744,24 +761,27 @@ mod tests {
         let gen = AddressGenerator::with_iteration(
             0x1000,
             [
-                DimensionConfig::new(2, 4),   // 2 elements per row
-                DimensionConfig::new(2, 16),  // 2 rows
+                DimensionConfig::new(2, 4),  // 2 elements per row
+                DimensionConfig::new(2, 16), // 2 rows
                 DimensionConfig::default(),
                 DimensionConfig::default(),
             ],
-            IterationConfig::new(1, 3),  // wrap=1 (2 iterations), stepsize=3 (actual=4 words=16 bytes)
+            IterationConfig::new(1, 3), // wrap=1 (2 iterations), stepsize=3 (actual=4 words=16 bytes)
         );
         let addrs: Vec<u64> = gen.iter().collect();
 
-        assert_eq!(addrs, vec![
-            // Iteration 0: base + 0
-            0x1000, 0x1004,  // Row 0
-            0x1010, 0x1014,  // Row 1
-            // Iteration 1: base + 16
-            0x1010, 0x1014,  // Row 0 (offset by 16)
-            0x1020, 0x1024,  // Row 1 (offset by 16)
-        ]);
-        assert_eq!(addrs.len(), 8);  // 4 elements * 2 iterations
+        assert_eq!(
+            addrs,
+            vec![
+                // Iteration 0: base + 0
+                0x1000, 0x1004, // Row 0
+                0x1010, 0x1014, // Row 1
+                // Iteration 1: base + 16
+                0x1010, 0x1014, // Row 0 (offset by 16)
+                0x1020, 0x1024, // Row 1 (offset by 16)
+            ]
+        );
+        assert_eq!(addrs.len(), 8); // 4 elements * 2 iterations
     }
 
     #[test]
@@ -775,12 +795,12 @@ mod tests {
                 DimensionConfig::default(),
                 DimensionConfig::default(),
             ],
-            IterationConfig::new(0, 10),  // wrap=0 (1 iteration), stepsize doesn't matter
+            IterationConfig::new(0, 10), // wrap=0 (1 iteration), stepsize doesn't matter
         );
         let addrs: Vec<u64> = gen.iter().collect();
 
         assert_eq!(addrs, vec![0x1000, 0x1004, 0x1008, 0x100C]);
-        assert_eq!(addrs.len(), 4);  // No iteration repeat
+        assert_eq!(addrs.len(), 4); // No iteration repeat
     }
 
     #[test]
@@ -789,12 +809,12 @@ mod tests {
         let gen = AddressGenerator::with_iteration(
             0x1000,
             [
-                DimensionConfig::new(3, 4),   // 3 elements
-                DimensionConfig::new(2, 12),  // 2 rows
+                DimensionConfig::new(3, 4),  // 3 elements
+                DimensionConfig::new(2, 12), // 2 rows
                 DimensionConfig::default(),
                 DimensionConfig::default(),
             ],
-            IterationConfig::new(3, 0),  // wrap=3 (4 iterations)
+            IterationConfig::new(3, 0), // wrap=3 (4 iterations)
         );
 
         // 3 * 2 * 4 = 24 elements
@@ -811,7 +831,7 @@ mod tests {
                 DimensionConfig::default(),
                 DimensionConfig::default(),
             ],
-            IterationConfig::new(1, 1),  // 2 iterations
+            IterationConfig::new(1, 1), // 2 iterations
         );
 
         // Consume some elements
@@ -822,7 +842,7 @@ mod tests {
 
         // Reset
         gen.reset();
-        assert_eq!(gen.remaining(), 4);  // 2 elements * 2 iterations
+        assert_eq!(gen.remaining(), 4); // 2 elements * 2 iterations
         assert_eq!(gen.current(), 0x1000);
     }
 
@@ -835,11 +855,7 @@ mod tests {
 
     #[test]
     fn test_zero_pad_d0_only() {
-        let pad = ZeroPadConfig {
-            d0_before: 2,
-            d0_after: 3,
-            ..Default::default()
-        };
+        let pad = ZeroPadConfig { d0_before: 2, d0_after: 3, ..Default::default() };
         assert!(pad.is_enabled());
         // d0_size=4: total = (2+4+3)*1*1 - 4*1*1 = 9-4 = 5
         assert_eq!(pad.total_pad_words(4, 1, 1), 5);
@@ -852,14 +868,8 @@ mod tests {
     #[test]
     fn test_zero_pad_all_dimensions() {
         // d0 before=2 after=3, d1 before=2 after=3, d2 before=3 after=3
-        let pad = ZeroPadConfig {
-            d0_before: 2,
-            d0_after: 3,
-            d1_before: 2,
-            d1_after: 3,
-            d2_before: 3,
-            d2_after: 3,
-        };
+        let pad =
+            ZeroPadConfig { d0_before: 2, d0_after: 3, d1_before: 2, d1_after: 3, d2_before: 3, d2_after: 3 };
         // d0_size=8, d1=10, d2=1
         // d0_wrap = 2+8+3 = 13
         // d1_total = 2+10+3 = 15
@@ -875,13 +885,8 @@ mod tests {
         // Matches the add_12_i8_using_2d_dma_op_with_padding test:
         // d0_size=14 (56 i8 elements), d1_size=61, d2_size=1
         // d0_before=1, d0_after=1, d1_before=2, d1_after=1
-        let pad = ZeroPadConfig {
-            d0_before: 1,
-            d0_after: 1,
-            d1_before: 2,
-            d1_after: 1,
-            ..Default::default()
-        };
+        let pad =
+            ZeroPadConfig { d0_before: 1, d0_after: 1, d1_before: 2, d1_after: 1, ..Default::default() };
         // d0_wrap = 1+14+1 = 16
         // d1_total = 2+61+1 = 64
         // d2_total = 1
@@ -894,13 +899,8 @@ mod tests {
     #[test]
     fn test_validate_padding_valid_config() {
         // Normal valid padding: wraps are non-zero, values within limits
-        let pad = ZeroPadConfig {
-            d0_before: 2,
-            d0_after: 3,
-            d1_before: 2,
-            d1_after: 1,
-            ..Default::default()
-        };
+        let pad =
+            ZeroPadConfig { d0_before: 2, d0_after: 3, d1_before: 2, d1_after: 1, ..Default::default() };
         assert!(pad.validate_padding(14, 61, 0));
     }
 
@@ -916,7 +916,7 @@ mod tests {
         // d0_wrap == 0 means d0_after must be 0
         let pad = ZeroPadConfig {
             d0_before: 1,
-            d0_after: 2,  // invalid when d0_wrap == 0
+            d0_after: 2, // invalid when d0_wrap == 0
             ..Default::default()
         };
         assert!(!pad.validate_padding(0, 4, 2));
@@ -927,7 +927,7 @@ mod tests {
         // d0_wrap == 0 means d1 and d2 before/after must all be 0
         let pad = ZeroPadConfig {
             d0_before: 1,
-            d1_before: 3,  // invalid when d0_wrap == 0
+            d1_before: 3, // invalid when d0_wrap == 0
             ..Default::default()
         };
         assert!(!pad.validate_padding(0, 4, 2));
@@ -939,7 +939,7 @@ mod tests {
         let pad = ZeroPadConfig {
             d0_before: 1,
             d0_after: 1,
-            d2_before: 5,  // invalid when d1_wrap == 0
+            d2_before: 5, // invalid when d1_wrap == 0
             ..Default::default()
         };
         assert!(!pad.validate_padding(8, 0, 2));
@@ -950,7 +950,7 @@ mod tests {
         // d1_wrap == 0 means d1_after must be 0
         let pad = ZeroPadConfig {
             d0_before: 1,
-            d1_after: 2,  // invalid when d1_wrap == 0
+            d1_after: 2, // invalid when d1_wrap == 0
             ..Default::default()
         };
         assert!(!pad.validate_padding(8, 0, 2));
@@ -961,7 +961,7 @@ mod tests {
         // d2_wrap == 0 means d2_after must be 0
         let pad = ZeroPadConfig {
             d0_before: 1,
-            d2_after: 3,  // invalid when d2_wrap == 0
+            d2_after: 3, // invalid when d2_wrap == 0
             ..Default::default()
         };
         assert!(!pad.validate_padding(8, 4, 0));
@@ -971,7 +971,7 @@ mod tests {
     fn test_validate_padding_field_width_d0_overflow() {
         // D0 max is 63 (6 bits)
         let pad = ZeroPadConfig {
-            d0_before: 64,  // exceeds 63
+            d0_before: 64, // exceeds 63
             ..Default::default()
         };
         assert!(!pad.validate_padding(8, 4, 2));
@@ -981,7 +981,7 @@ mod tests {
     fn test_validate_padding_field_width_d1_overflow() {
         // D1 max is 31 (5 bits)
         let pad = ZeroPadConfig {
-            d1_after: 32,  // exceeds 31
+            d1_after: 32, // exceeds 31
             ..Default::default()
         };
         assert!(!pad.validate_padding(8, 4, 2));
@@ -991,7 +991,7 @@ mod tests {
     fn test_validate_padding_field_width_d2_overflow() {
         // D2 max is 15 (4 bits)
         let pad = ZeroPadConfig {
-            d2_before: 16,  // exceeds 15
+            d2_before: 16, // exceeds 15
             ..Default::default()
         };
         assert!(!pad.validate_padding(8, 4, 2));

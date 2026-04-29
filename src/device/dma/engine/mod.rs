@@ -164,9 +164,7 @@ impl DmaEngine {
         log::debug!("DmaEngine::new col={} row={} tile_kind={:?} num_channels={} (s2mm={}, mm2s={}) num_bds={} num_locks={}",
             col, row, tile_kind, num_channels, s2mm_channels, mm2s_channels, num_bds, num_locks);
 
-        let channels = (0..num_channels)
-            .map(|i| ChannelContext::new(i as u8))
-            .collect();
+        let channels = (0..num_channels).map(|i| ChannelContext::new(i as u8)).collect();
 
         Self {
             col,
@@ -202,28 +200,19 @@ impl DmaEngine {
     /// ArchConfig-derived values (see `DeviceArray::new()`).
     #[cfg(test)]
     pub fn new_compute_tile(col: u8, row: u8) -> Self {
-        Self::new(
-            col, row, TileKind::Compute, 2, 2, 16, 16,
-            &xdna_archspec::aie2::dma::AIE2_DMA_MODEL,
-        )
+        Self::new(col, row, TileKind::Compute, 2, 2, 16, 16, &xdna_archspec::aie2::dma::AIE2_DMA_MODEL)
     }
 
     /// Create a memory tile DMA engine with AIE2 defaults (6+6 channels, 48 BDs).
     #[cfg(test)]
     pub fn new_mem_tile(col: u8, row: u8) -> Self {
-        Self::new(
-            col, row, TileKind::Mem, 6, 6, 48, 64,
-            &xdna_archspec::aie2::dma::AIE2_DMA_MODEL,
-        )
+        Self::new(col, row, TileKind::Mem, 6, 6, 48, 64, &xdna_archspec::aie2::dma::AIE2_DMA_MODEL)
     }
 
     /// Create a shim tile DMA engine with AIE2 defaults (2+2 channels, 16 BDs).
     #[cfg(test)]
     pub fn new_shim_tile(col: u8, row: u8) -> Self {
-        Self::new(
-            col, row, TileKind::ShimNoc, 2, 2, 16, 0,
-            &xdna_archspec::aie2::dma::AIE2_DMA_MODEL,
-        )
+        Self::new(col, row, TileKind::ShimNoc, 2, 2, 16, 0, &xdna_archspec::aie2::dma::AIE2_DMA_MODEL)
     }
 
     /// Configure custom timing parameters.
@@ -439,7 +428,9 @@ impl DmaEngine {
                 "DMA tile({},{}) invalid MemTile BD-channel combination: \
                  BD {} is only valid for {} channels, but per-direction channel {} is {} \
                  -- rejecting per AM025 invariant",
-                self.col, self.row, bd_index,
+                self.col,
+                self.row,
+                bd_index,
                 if bd_index < 24 { "even" } else { "odd" },
                 dir_ch,
                 if dir_ch % 2 == 0 { "even" } else { "odd" },
@@ -461,7 +452,8 @@ impl DmaEngine {
         };
 
         // Create transfer
-        let transfer = Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_kind)?;
+        let transfer =
+            Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_kind)?;
 
         log::info!("DMA tile({},{}) ch{} BD{} start: total_bytes={} base_addr=0x{:X} next_bd={:?} acq_lock={:?}(val={}) rel_lock={:?}(val={}) pkt={}(id={}) dir={:?}",
             self.col, self.row, channel, bd_index,
@@ -499,8 +491,14 @@ impl DmaEngine {
         }
 
         if repeat_count > 0 {
-            log::info!("DMA tile({},{}) ch{} started BD {} with repeat_count={}",
-                self.col, self.row, channel, bd_index, repeat_count);
+            log::info!(
+                "DMA tile({},{}) ch{} started BD {} with repeat_count={}",
+                self.col,
+                self.row,
+                channel,
+                bd_index,
+                repeat_count
+            );
         }
 
         self.trace(EventType::DmaStartTask { channel });
@@ -589,7 +587,8 @@ impl DmaEngine {
         // The actual transfer will start when start_channel is called with a BD
         log::debug!(
             "DmaEngine ({}, {}): enabled {} channel {}",
-            self.col, self.row,
+            self.col,
+            self.row,
             if is_mm2s { "MM2S" } else { "S2MM" },
             relative_channel
         );

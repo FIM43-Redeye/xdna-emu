@@ -95,12 +95,11 @@ impl DmaEngine {
     ) {
         use crate::device::tile::LockRequest;
 
-        let lock_target = match Self::resolve_lock_id_static(
-            self.tile_kind, self.col, self.row, self.num_locks, lock_id,
-        ) {
-            Some(target) => target,
-            None => return,
-        };
+        let lock_target =
+            match Self::resolve_lock_id_static(self.tile_kind, self.col, self.row, self.num_locks, lock_id) {
+                Some(target) => target,
+                None => return,
+            };
 
         let (target_tile, local_id): (&mut Tile, u8) = match lock_target {
             LockTarget::Own(id) => (tile, id),
@@ -141,7 +140,13 @@ impl DmaEngine {
     ///   - IDs 2*num_locks .. 3*num_locks-1: East neighbor (col+1) locks
     ///
     /// Compute/shim: 4-bit field, always Own tile.
-    pub fn resolve_lock_id_static(tile_kind: TileKind, col: u8, row: u8, num_locks: u8, lock_id: u8) -> Option<LockTarget> {
+    pub fn resolve_lock_id_static(
+        tile_kind: TileKind,
+        col: u8,
+        row: u8,
+        num_locks: u8,
+        lock_id: u8,
+    ) -> Option<LockTarget> {
         if !tile_kind.is_mem() {
             // Compute/shim: 4-bit field, always local
             return Some(LockTarget::Own(lock_id));
@@ -157,7 +162,10 @@ impl DmaEngine {
         } else {
             let msg = format!(
                 "DMA tile({},{}) lock_id={} out of {}-entry address space",
-                col, row, lock_id, num_locks as u16 * 3,
+                col,
+                row,
+                lock_id,
+                num_locks as u16 * 3,
             );
             log::error!("{}", msg);
             // Cannot push to fatal_errors from static method; caller must handle None.

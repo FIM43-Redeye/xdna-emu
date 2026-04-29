@@ -78,9 +78,7 @@ pub enum ChannelFsm {
     /// Actively moving data word by word.
     /// Exits when transfer.remaining_bytes() == 0 or FoT TLAST received.
     /// S2MM stalls transparently (stays in this state, no advancement).
-    Transferring {
-        transfer: Box<Transfer>,
-    },
+    Transferring { transfer: Box<Transfer> },
 
     /// Releasing lock after all data moved.
     /// Latency: DmaTimingConfig::lock_release_cycles (default 1).
@@ -93,15 +91,10 @@ pub enum ChannelFsm {
 
     /// Transitioning between chained BDs.
     /// Latency: DmaTimingConfig::bd_chain_cycles (default 2).
-    BdChaining {
-        cycles_remaining: u16,
-        next_bd: u8,
-    },
+    BdChaining { cycles_remaining: u16, next_bd: u8 },
 
     /// Channel paused by host. Resumes to saved state.
-    Paused {
-        saved: Box<ChannelFsm>,
-    },
+    Paused { saved: Box<ChannelFsm> },
 
     /// Unrecoverable error.
     Error,
@@ -164,22 +157,26 @@ impl fmt::Display for ChannelFsm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ChannelFsm::Idle => write!(f, "Idle"),
-            ChannelFsm::BdSetup { cycles_remaining, .. } =>
-                write!(f, "BdSetup(cycles={})", cycles_remaining),
-            ChannelFsm::AcquiringLock { lock_id, acquired, .. } =>
-                write!(f, "AcquiringLock(lock={}, acquired={})", lock_id, acquired),
-            ChannelFsm::MemoryLatency { cycles_remaining, .. } =>
-                write!(f, "MemoryLatency(cycles={})", cycles_remaining),
-            ChannelFsm::HostPipelineLatency { cycles_remaining, .. } =>
-                write!(f, "HostPipelineLatency(cycles={})", cycles_remaining),
-            ChannelFsm::Transferring { transfer } =>
-                write!(f, "Transferring({} bytes remaining)", transfer.remaining_bytes()),
-            ChannelFsm::ReleasingLock { lock_id, cycles_remaining, .. } =>
-                write!(f, "ReleasingLock(lock={}, cycles={})", lock_id, cycles_remaining),
-            ChannelFsm::BdChaining { cycles_remaining, next_bd } =>
-                write!(f, "BdChaining(next_bd={}, cycles={})", next_bd, cycles_remaining),
-            ChannelFsm::Paused { saved } =>
-                write!(f, "Paused(was={})", saved.phase_name()),
+            ChannelFsm::BdSetup { cycles_remaining, .. } => write!(f, "BdSetup(cycles={})", cycles_remaining),
+            ChannelFsm::AcquiringLock { lock_id, acquired, .. } => {
+                write!(f, "AcquiringLock(lock={}, acquired={})", lock_id, acquired)
+            }
+            ChannelFsm::MemoryLatency { cycles_remaining, .. } => {
+                write!(f, "MemoryLatency(cycles={})", cycles_remaining)
+            }
+            ChannelFsm::HostPipelineLatency { cycles_remaining, .. } => {
+                write!(f, "HostPipelineLatency(cycles={})", cycles_remaining)
+            }
+            ChannelFsm::Transferring { transfer } => {
+                write!(f, "Transferring({} bytes remaining)", transfer.remaining_bytes())
+            }
+            ChannelFsm::ReleasingLock { lock_id, cycles_remaining, .. } => {
+                write!(f, "ReleasingLock(lock={}, cycles={})", lock_id, cycles_remaining)
+            }
+            ChannelFsm::BdChaining { cycles_remaining, next_bd } => {
+                write!(f, "BdChaining(next_bd={}, cycles={})", next_bd, cycles_remaining)
+            }
+            ChannelFsm::Paused { saved } => write!(f, "Paused(was={})", saved.phase_name()),
             ChannelFsm::Error => write!(f, "Error"),
         }
     }
@@ -284,12 +281,10 @@ impl ChannelContext {
                 format!("HostPipelineLatency({})", cycles_remaining)
             }
             ChannelFsm::Transferring { transfer } => {
-                format!("Transferring({}/{})",
-                    transfer.bytes_transferred, transfer.total_bytes)
+                format!("Transferring({}/{})", transfer.bytes_transferred, transfer.total_bytes)
             }
             ChannelFsm::ReleasingLock { lock_id, release_value, cycles_remaining, .. } => {
-                format!("ReleasingLock({}, delta={}, {}cyc)",
-                    lock_id, release_value, cycles_remaining)
+                format!("ReleasingLock({}, delta={}, {}cyc)", lock_id, release_value, cycles_remaining)
             }
             ChannelFsm::BdChaining { cycles_remaining, next_bd } => {
                 format!("BdChaining(bd={}, {}cyc)", next_bd, cycles_remaining)
@@ -316,9 +311,16 @@ impl ChannelContext {
 
     /// One-call debug dump.
     pub fn debug_string(&self, col: u8, row: u8) -> String {
-        format!("DMA({},{}) ch{}: fsm={}, bd={:?}, repeat={}, queue={}",
-            col, row, self.index, self.fsm, self.current_bd,
-            self.repeat_count, self.task_queue.len())
+        format!(
+            "DMA({},{}) ch{}: fsm={}, bd={:?}, repeat={}, queue={}",
+            col,
+            row,
+            self.index,
+            self.fsm,
+            self.current_bd,
+            self.repeat_count,
+            self.task_queue.len()
+        )
     }
 
     /// Reset to initial state.
@@ -375,12 +377,7 @@ mod tests {
             lock_id: 0,
             release_value: 1,
             cycles_remaining: 1,
-            completion: CompletionInfo {
-                bd_index: 0,
-                next_bd: None,
-                cycles_elapsed: 0,
-                channel: 0,
-            },
+            completion: CompletionInfo { bd_index: 0, next_bd: None, cycles_elapsed: 0, channel: 0 },
         };
         assert!(releasing.transfer().is_none());
     }
@@ -407,12 +404,7 @@ mod tests {
             lock_id: 3,
             release_value: -1,
             cycles_remaining: 1,
-            completion: CompletionInfo {
-                bd_index: 0,
-                next_bd: None,
-                cycles_elapsed: 100,
-                channel: 0,
-            },
+            completion: CompletionInfo { bd_index: 0, next_bd: None, cycles_elapsed: 100, channel: 0 },
         };
         assert_eq!(format!("{}", fsm), "ReleasingLock(lock=3, cycles=1)");
     }
@@ -495,7 +487,9 @@ mod tests {
         ctx.queued_bd = Some(6);
         ctx.repeat_count = 10;
         // Trigger overflow by filling the queue
-        for _ in 0..9 { let _ = ctx.task_queue.push(TaskQueueEntry::new(0, 0, false)); }
+        for _ in 0..9 {
+            let _ = ctx.task_queue.push(TaskQueueEntry::new(0, 0, false));
+        }
         ctx.error_bd_unavailable = true;
         ctx.stats.bytes_transferred = 1024;
 

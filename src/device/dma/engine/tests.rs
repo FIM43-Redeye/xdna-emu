@@ -125,8 +125,11 @@ fn test_simple_transfer() {
     assert_eq!(stats.bytes_transferred, 32);
 
     // Verify the source data is still intact (DMA read shouldn't modify it)
-    assert_eq!(&tile.data_memory()[0x100..0x100 + 32], &source_data[..],
-        "Source data should remain intact after MM2S read");
+    assert_eq!(
+        &tile.data_memory()[0x100..0x100 + 32],
+        &source_data[..],
+        "Source data should remain intact after MM2S read"
+    );
 }
 
 #[test]
@@ -164,8 +167,8 @@ fn test_transfer_with_lock() {
     // Per AMD spec: release_value=1 means add +1 to lock after transfer
     // release_value=0 would mean NO release per AM025
     let bd = BdConfig::simple_1d(0x100, 32)
-        .with_acquire(5, 1)   // Wait for lock==1, decrement by 1 (1->0)
-        .with_release(5, 1);  // After transfer, add +1 to lock (0->1)
+        .with_acquire(5, 1) // Wait for lock==1, decrement by 1 (1->0)
+        .with_release(5, 1); // After transfer, add +1 to lock (0->1)
     engine.configure_bd(0, bd).unwrap();
 
     // Start should trigger lock acquire on MM2S channel
@@ -202,7 +205,9 @@ fn test_execute_1d_transfer() {
     // Use MM2S channel (channel 2) for testing
     engine.configure_bd(0, BdConfig::simple_1d(0x100, 64)).unwrap();
 
-    let cycles = engine.execute_1d_transfer(2, 0, &mut tile, &mut NeighborTiles::empty(), &mut host_mem).unwrap();
+    let cycles = engine
+        .execute_1d_transfer(2, 0, &mut tile, &mut NeighborTiles::empty(), &mut host_mem)
+        .unwrap();
     assert!(cycles > 0, "Transfer should take at least one cycle");
 
     let stats = engine.channel_stats(2).unwrap();
@@ -210,8 +215,11 @@ fn test_execute_1d_transfer() {
     assert_eq!(stats.transfers_completed, 1);
 
     // Source data should still be intact
-    assert_eq!(&tile.data_memory()[0x100..0x100 + 64], &source_data[..],
-        "Source data should remain intact after 1D transfer");
+    assert_eq!(
+        &tile.data_memory()[0x100..0x100 + 64],
+        &source_data[..],
+        "Source data should remain intact after 1D transfer"
+    );
 }
 
 #[test]
@@ -244,8 +252,8 @@ fn test_cycle_accurate_transfer() {
     let mut host_mem = make_host_memory();
 
     // Write recognizable data to source address
-    let source_data: [u8; 16] = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-                                  0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+    let source_data: [u8; 16] =
+        [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
     let dm = tile.data_memory_mut();
     dm[0x100..0x100 + 16].copy_from_slice(&source_data);
 
@@ -274,15 +282,17 @@ fn test_cycle_accurate_transfer() {
     assert_eq!(stats.transfers_completed, 1);
 
     // Source data should be unchanged
-    assert_eq!(&tile.data_memory()[0x100..0x100 + 16], &source_data[..],
-        "Source data integrity after cycle-accurate transfer");
+    assert_eq!(
+        &tile.data_memory()[0x100..0x100 + 16],
+        &source_data[..],
+        "Source data integrity after cycle-accurate transfer"
+    );
 }
 
 #[test]
 fn test_lock_timing_integration() {
     // Create engine with lock timing enabled (cycle-accurate is default)
-    let mut engine = DmaEngine::new_compute_tile(1, 2)
-        .with_lock_timing(16);
+    let mut engine = DmaEngine::new_compute_tile(1, 2).with_lock_timing(16);
     let mut tile = make_tile();
     let mut host_mem = make_host_memory();
 
@@ -319,8 +329,7 @@ fn test_lock_timing_integration() {
 #[test]
 fn test_lock_timing_success() {
     // Test that successful lock acquire is tracked
-    let mut engine = DmaEngine::new_compute_tile(1, 2)
-        .with_lock_timing(16);
+    let mut engine = DmaEngine::new_compute_tile(1, 2).with_lock_timing(16);
     let mut tile = make_tile();
     let _host_mem = make_host_memory();
 
@@ -515,13 +524,13 @@ fn test_bd_chain_with_repeat_restarts_from_start() {
 
     let stats = engine.channel_stats(2).unwrap();
     // 2 iterations x 2 BDs per chain = 4 transfers
-    assert_eq!(stats.transfers_completed, 4,
+    assert_eq!(
+        stats.transfers_completed, 4,
         "Expected 4 transfers (2 chain iterations x 2 BDs), got {}",
-        stats.transfers_completed);
+        stats.transfers_completed
+    );
     // 4 transfers x 16 bytes = 64 bytes total
-    assert_eq!(stats.bytes_transferred, 64,
-        "Expected 64 bytes (4 x 16), got {}",
-        stats.bytes_transferred);
+    assert_eq!(stats.bytes_transferred, 64, "Expected 64 bytes (4 x 16), got {}", stats.bytes_transferred);
 }
 
 /// Self-chaining BD (next_bd == self) with Use_Next_BD=1 loops indefinitely
@@ -545,13 +554,17 @@ fn test_self_chaining_bd_loops_indefinitely() {
         engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
     }
 
-    assert!(engine.channel_has_pending_work(2),
-        "Self-chaining BD should still be running (hardware loops indefinitely)");
+    assert!(
+        engine.channel_has_pending_work(2),
+        "Self-chaining BD should still be running (hardware loops indefinitely)"
+    );
 
     let stats = engine.channel_stats(2).unwrap();
-    assert!(stats.transfers_completed > 2,
+    assert!(
+        stats.transfers_completed > 2,
         "Expected multiple transfers from self-chaining loop, got {}",
-        stats.transfers_completed);
+        stats.transfers_completed
+    );
 }
 
 // === Stream Port Integration Tests ===
@@ -592,11 +605,7 @@ fn test_memtile_port_mappings() {
 fn test_stream_data_to_word_conversion() {
     use crate::device::dma::stream_io::StreamWord;
 
-    let data = StreamData {
-        data: 0x12345678,
-        tlast: true,
-        channel: 2,
-    };
+    let data = StreamData { data: 0x12345678, tlast: true, channel: 2 };
 
     // Convert to StreamWord
     let word: StreamWord = data.into();
@@ -610,11 +619,7 @@ fn test_stream_data_to_word_conversion() {
 fn test_stream_word_to_data_conversion() {
     use crate::device::dma::stream_io::StreamWord;
 
-    let word = StreamWord {
-        data: 0xDEADBEEF,
-        tlast: false,
-        parity: true,
-    };
+    let word = StreamWord { data: 0xDEADBEEF, tlast: false, parity: true };
 
     // Convert to StreamData with channel
     let data = StreamData::from_stream_word(word, 3);
@@ -638,11 +643,9 @@ fn test_engine_stream_word_interface() {
     assert_eq!(engine.stream_in_len(), 1);
 
     // Add stream output data directly
-    engine.stream_out.push_back(StreamData {
-        data: 0x11111111,
-        tlast: false,
-        channel: 2,
-    });
+    engine
+        .stream_out
+        .push_back(StreamData { data: 0x11111111, tlast: false, channel: 2 });
 
     // Pop as StreamWord
     let (out_word, channel) = engine.pop_stream_out_as_word().unwrap();
@@ -714,11 +717,7 @@ fn test_s2mm_decompression_round_trip() {
 
     // Route compressed data from stream_out to stream_in (channel 0)
     while let Some(sd) = engine.stream_out.pop_front() {
-        engine.push_stream_in(StreamData {
-            data: sd.data,
-            tlast: sd.tlast,
-            channel: 0,
-        });
+        engine.push_stream_in(StreamData { data: sd.data, tlast: sd.tlast, channel: 0 });
     }
 
     // S2MM decompress to offset 256
@@ -764,11 +763,7 @@ fn test_s2mm_no_decompression_when_disabled() {
     let mut engine = DmaEngine::new_compute_tile(1, 2);
     let mut tile = make_tile();
 
-    engine.push_stream_in(StreamData {
-        data: 0xDEADBEEF,
-        tlast: true,
-        channel: 0,
-    });
+    engine.push_stream_in(StreamData { data: 0xDEADBEEF, tlast: true, channel: 0 });
 
     assert!(!engine.is_decompression_enabled(0));
 
@@ -777,10 +772,7 @@ fn test_s2mm_no_decompression_when_disabled() {
     assert_eq!(result.bytes_written, 4);
 
     let data = tile.data_memory();
-    assert_eq!(
-        u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
-        0xDEADBEEF,
-    );
+    assert_eq!(u32::from_le_bytes([data[0], data[1], data[2], data[3]]), 0xDEADBEEF,);
 }
 
 #[test]
@@ -823,40 +815,22 @@ fn test_resolve_lock_id_memtile() {
     let num_locks = 64;
 
     // West neighbor: IDs 0-63
-    assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 0),
-        Some(LockTarget::West(0))
-    );
-    assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 63),
-        Some(LockTarget::West(63))
-    );
+    assert_eq!(DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 0), Some(LockTarget::West(0)));
+    assert_eq!(DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 63), Some(LockTarget::West(63)));
 
     // Own tile: IDs 64-127
-    assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 64),
-        Some(LockTarget::Own(0))
-    );
-    assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 127),
-        Some(LockTarget::Own(63))
-    );
+    assert_eq!(DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 64), Some(LockTarget::Own(0)));
+    assert_eq!(DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 127), Some(LockTarget::Own(63)));
 
     // East neighbor: IDs 128-191
-    assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 128),
-        Some(LockTarget::East(0))
-    );
+    assert_eq!(DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 128), Some(LockTarget::East(0)));
     assert_eq!(
         DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 191),
         Some(LockTarget::East(63))
     );
 
     // Out of range
-    assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 192),
-        None
-    );
+    assert_eq!(DmaEngine::resolve_lock_id_static(tile_kind, 1, 1, num_locks, 192), None);
 }
 
 #[test]
@@ -864,10 +838,7 @@ fn test_resolve_lock_id_compute() {
     // Compute tiles: 4-bit field, always Own
     let tile_kind = TileKind::Compute;
     let num_locks = 16;
-    assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_kind, 1, 2, num_locks, 5),
-        Some(LockTarget::Own(5))
-    );
+    assert_eq!(DmaEngine::resolve_lock_id_static(tile_kind, 1, 2, num_locks, 5), Some(LockTarget::Own(5)));
 }
 
 #[test]
@@ -885,8 +856,7 @@ fn test_cross_tile_lock_acquire_west() {
     // Configure BD with acquire on west neighbor lock 5.
     // West locks are IDs 0-63, so lock_id=5 means west lock 5.
     // Address 0x80100 = Own window (0x80000) + offset 0x100; see MemTileTarget.
-    let bd = BdConfig::simple_1d(0x80100, 32)
-        .with_acquire(5, 1);  // acq_eq: wait for value == 1
+    let bd = BdConfig::simple_1d(0x80100, 32).with_acquire(5, 1); // acq_eq: wait for value == 1
     engine.configure_bd(0, bd).unwrap();
 
     // Write data to own tile memory (MM2S reads from here)
@@ -898,25 +868,22 @@ fn test_cross_tile_lock_acquire_west() {
 
     // Submit lock requests, resolve arbiters, then step
     {
-        let mut neighbors = NeighborTiles {
-            west: Some(&mut west_tile),
-            east: None,
-        };
+        let mut neighbors = NeighborTiles { west: Some(&mut west_tile), east: None };
         engine.submit_lock_requests(&mut own_tile, &mut neighbors);
     }
     own_tile.resolve_lock_requests(0);
     west_tile.resolve_lock_requests(0);
 
-    let mut neighbors = NeighborTiles {
-        west: Some(&mut west_tile),
-        east: None,
-    };
+    let mut neighbors = NeighborTiles { west: Some(&mut west_tile), east: None };
     let mut host_mem = make_host_memory();
     engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
 
     // Channel should now be active (lock acquired from west neighbor)
-    assert_eq!(engine.channel_state(6), ChannelState::Active,
-        "Channel should be active after acquiring west neighbor lock");
+    assert_eq!(
+        engine.channel_state(6),
+        ChannelState::Active,
+        "Channel should be active after acquiring west neighbor lock"
+    );
 }
 
 #[test]
@@ -932,8 +899,7 @@ fn test_cross_tile_lock_acquire_east() {
 
     // East locks are IDs 128-191, so lock_id=138 means east lock 10.
     // Address 0x80100 = Own window (0x80000) + offset 0x100; see MemTileTarget.
-    let bd = BdConfig::simple_1d(0x80100, 32)
-        .with_acquire(138, 1);  // acq_eq on east lock 10
+    let bd = BdConfig::simple_1d(0x80100, 32).with_acquire(138, 1); // acq_eq on east lock 10
     engine.configure_bd(0, bd).unwrap();
     own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xBB; 32]);
 
@@ -941,24 +907,21 @@ fn test_cross_tile_lock_acquire_east() {
     assert!(matches!(engine.channel_state(6), ChannelState::WaitingForLock(138)));
 
     {
-        let mut neighbors = NeighborTiles {
-            west: None,
-            east: Some(&mut east_tile),
-        };
+        let mut neighbors = NeighborTiles { west: None, east: Some(&mut east_tile) };
         engine.submit_lock_requests(&mut own_tile, &mut neighbors);
     }
     own_tile.resolve_lock_requests(0);
     east_tile.resolve_lock_requests(0);
 
-    let mut neighbors = NeighborTiles {
-        west: None,
-        east: Some(&mut east_tile),
-    };
+    let mut neighbors = NeighborTiles { west: None, east: Some(&mut east_tile) };
     let mut host_mem = make_host_memory();
     engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
 
-    assert_eq!(engine.channel_state(6), ChannelState::Active,
-        "Channel should be active after acquiring east neighbor lock");
+    assert_eq!(
+        engine.channel_state(6),
+        ChannelState::Active,
+        "Channel should be active after acquiring east neighbor lock"
+    );
 }
 
 #[test]
@@ -967,8 +930,7 @@ fn test_cross_tile_lock_acquire_fails_without_neighbor() {
     let mut engine = DmaEngine::new_mem_tile(0, 1);
     let mut own_tile = Tile::mem_tile(0, 1);
     // Address 0x80100 = Own window (0x80000) + offset 0x100; see MemTileTarget.
-    let bd = BdConfig::simple_1d(0x80100, 32)
-        .with_acquire(5, 1);  // West lock -- but no west neighbor at col 0
+    let bd = BdConfig::simple_1d(0x80100, 32).with_acquire(5, 1); // West lock -- but no west neighbor at col 0
     engine.configure_bd(0, bd).unwrap();
     own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xCC; 32]);
 
@@ -979,8 +941,10 @@ fn test_cross_tile_lock_acquire_fails_without_neighbor() {
     engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
 
     // Should remain waiting -- no neighbor to satisfy lock
-    assert!(matches!(engine.channel_state(6), ChannelState::WaitingForLock(5)),
-        "Should stay waiting when neighbor tile is absent");
+    assert!(
+        matches!(engine.channel_state(6), ChannelState::WaitingForLock(5)),
+        "Should stay waiting when neighbor tile is absent"
+    );
 }
 
 #[test]
@@ -993,8 +957,8 @@ fn test_cross_tile_lock_release_west() {
     // BD: acquire own lock 0 (ID 64), release west lock 3 (ID 3).
     // Address 0x80100 = Own window (0x80000) + offset 0x100; see MemTileTarget.
     let bd = BdConfig::simple_1d(0x80100, 32)
-        .with_acquire(64, 1)   // own lock 0, acq_eq value=1
-        .with_release(3, 1);   // west lock 3, release delta +1
+        .with_acquire(64, 1) // own lock 0, acq_eq value=1
+        .with_release(3, 1); // west lock 3, release delta +1
     engine.configure_bd(0, bd).unwrap();
     own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xDD; 32]);
 
@@ -1007,18 +971,12 @@ fn test_cross_tile_lock_release_west() {
     let mut cycles = 0;
     while engine.channel_active(6) {
         {
-            let mut neighbors = NeighborTiles {
-                west: Some(&mut west_tile),
-                east: None,
-            };
+            let mut neighbors = NeighborTiles { west: Some(&mut west_tile), east: None };
             engine.submit_lock_requests(&mut own_tile, &mut neighbors);
         }
         own_tile.resolve_lock_requests(0);
         west_tile.resolve_lock_requests(0);
-        let mut neighbors = NeighborTiles {
-            west: Some(&mut west_tile),
-            east: None,
-        };
+        let mut neighbors = NeighborTiles { west: Some(&mut west_tile), east: None };
         let mut host_mem = make_host_memory();
         engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
         cycles += 1;
@@ -1028,8 +986,7 @@ fn test_cross_tile_lock_release_west() {
     }
 
     // West tile lock 3 should have been incremented by +1 (release delta)
-    assert_eq!(west_tile.locks[3].value, 1,
-        "West neighbor lock 3 should be 1 after release with delta +1");
+    assert_eq!(west_tile.locks[3].value, 1, "West neighbor lock 3 should be 1 after release with delta +1");
 }
 
 #[test]
@@ -1043,7 +1000,7 @@ fn test_cross_tile_lock_release_east() {
     // BD: acquire own lock 0 (ID 64), release east lock 7 (ID 128+7=135)
     // Address 0x80100 = Own window (0x80000) + offset 0x100; see MemTileTarget.
     let bd = BdConfig::simple_1d(0x80100, 32)
-        .with_acquire(64, 1)   // own lock 0, acq_eq value=1
+        .with_acquire(64, 1) // own lock 0, acq_eq value=1
         .with_release(135, 1); // east lock 7, release delta +1
     engine.configure_bd(0, bd).unwrap();
     own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xEE; 32]);
@@ -1057,18 +1014,12 @@ fn test_cross_tile_lock_release_east() {
     let mut cycles = 0;
     while engine.channel_active(6) {
         {
-            let mut neighbors = NeighborTiles {
-                west: None,
-                east: Some(&mut east_tile),
-            };
+            let mut neighbors = NeighborTiles { west: None, east: Some(&mut east_tile) };
             engine.submit_lock_requests(&mut own_tile, &mut neighbors);
         }
         own_tile.resolve_lock_requests(0);
         east_tile.resolve_lock_requests(0);
-        let mut neighbors = NeighborTiles {
-            west: None,
-            east: Some(&mut east_tile),
-        };
+        let mut neighbors = NeighborTiles { west: None, east: Some(&mut east_tile) };
         let mut host_mem = make_host_memory();
         engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
         cycles += 1;
@@ -1078,8 +1029,7 @@ fn test_cross_tile_lock_release_east() {
     }
 
     // East tile lock 7 should have been incremented by +1 (release delta)
-    assert_eq!(east_tile.locks[7].value, 1,
-        "East neighbor lock 7 should be 1 after release with delta +1");
+    assert_eq!(east_tile.locks[7].value, 1, "East neighbor lock 7 should be 1 after release with delta +1");
 }
 
 #[test]
@@ -1093,8 +1043,7 @@ fn test_cross_tile_lock_own_acquire_memtile() {
     own_tile.locks[10].set(1);
 
     // Address 0x80100 = Own window (0x80000) + offset 0x100; see MemTileTarget.
-    let bd = BdConfig::simple_1d(0x80100, 32)
-        .with_acquire(74, 1);  // own lock 10, acq_eq value=1
+    let bd = BdConfig::simple_1d(0x80100, 32).with_acquire(74, 1); // own lock 10, acq_eq value=1
     engine.configure_bd(0, bd).unwrap();
     own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xCC; 32]);
 
@@ -1112,8 +1061,11 @@ fn test_cross_tile_lock_own_acquire_memtile() {
     let mut host_mem = make_host_memory();
     engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
 
-    assert_eq!(engine.channel_state(6), ChannelState::Active,
-        "Channel should be active after acquiring own lock via memtile ID 74");
+    assert_eq!(
+        engine.channel_state(6),
+        ChannelState::Active,
+        "Channel should be active after acquiring own lock via memtile ID 74"
+    );
 }
 
 #[test]
@@ -1125,8 +1077,7 @@ fn test_cross_tile_lock_acquire_no_east_neighbor() {
 
     // East lock 0 = lock_id 128.
     // Address 0x80100 = Own window (0x80000) + offset 0x100; see MemTileTarget.
-    let bd = BdConfig::simple_1d(0x80100, 32)
-        .with_acquire(128, 1);
+    let bd = BdConfig::simple_1d(0x80100, 32).with_acquire(128, 1);
     engine.configure_bd(0, bd).unwrap();
     own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xDD; 32]);
 
@@ -1137,8 +1088,10 @@ fn test_cross_tile_lock_acquire_no_east_neighbor() {
     engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
 
     // Should remain waiting -- no east neighbor to satisfy lock
-    assert!(matches!(engine.channel_state(6), ChannelState::WaitingForLock(128)),
-        "Should stay waiting when east neighbor tile is absent");
+    assert!(
+        matches!(engine.channel_state(6), ChannelState::WaitingForLock(128)),
+        "Should stay waiting when east neighbor tile is absent"
+    );
 }
 
 // === Cross-MemTile data access tests ===
@@ -1205,18 +1158,17 @@ fn test_memtile_mm2s_reads_from_east_neighbor() {
     engine.configure_bd(0, bd).unwrap();
     engine.start_channel(6, 0).unwrap();
 
-    run_memtile_mm2s_to_completion(
-        &mut engine, 6, &mut own_tile,
-        None, Some(&mut east_tile),
-        500,
-    );
+    run_memtile_mm2s_to_completion(&mut engine, 6, &mut own_tile, None, Some(&mut east_tile), 500);
 
     // The four stream words must contain east_tile's 0xEE pattern.
     let expected_word = u32::from_le_bytes([0xEE; 4]);
     assert_eq!(engine.stream_out_len(), 4, "expected 4 stream words from east tile");
     while let Some(w) = engine.stream_out.pop_front() {
-        assert_eq!(w.data, expected_word,
-            "stream word should carry east-neighbour byte pattern (0xEE), got 0x{:08X}", w.data);
+        assert_eq!(
+            w.data, expected_word,
+            "stream word should carry east-neighbour byte pattern (0xEE), got 0x{:08X}",
+            w.data
+        );
     }
 }
 
@@ -1237,17 +1189,16 @@ fn test_memtile_mm2s_reads_from_west_neighbor() {
     engine.configure_bd(0, bd).unwrap();
     engine.start_channel(6, 0).unwrap();
 
-    run_memtile_mm2s_to_completion(
-        &mut engine, 6, &mut own_tile,
-        Some(&mut west_tile), None,
-        500,
-    );
+    run_memtile_mm2s_to_completion(&mut engine, 6, &mut own_tile, Some(&mut west_tile), None, 500);
 
     let expected_word = u32::from_le_bytes([0x77; 4]);
     assert_eq!(engine.stream_out_len(), 4, "expected 4 stream words from west tile");
     while let Some(w) = engine.stream_out.pop_front() {
-        assert_eq!(w.data, expected_word,
-            "stream word should carry west-neighbour byte pattern (0x77), got 0x{:08X}", w.data);
+        assert_eq!(
+            w.data, expected_word,
+            "stream word should carry west-neighbour byte pattern (0x77), got 0x{:08X}",
+            w.data
+        );
     }
 }
 
@@ -1266,11 +1217,7 @@ fn test_memtile_s2mm_writes_to_east_neighbor() {
     // Push 4 stream words for a 16-byte S2MM transfer on channel 0.
     let payload_word = u32::from_le_bytes([0xC3; 4]);
     for i in 0..4 {
-        engine.push_stream_in(StreamData {
-            data: payload_word,
-            tlast: i == 3,
-            channel: 0,
-        });
+        engine.push_stream_in(StreamData { data: payload_word, tlast: i == 3, channel: 0 });
     }
 
     // BD writes into the East window at offset 0x300, length 16.
@@ -1279,21 +1226,23 @@ fn test_memtile_s2mm_writes_to_east_neighbor() {
     engine.configure_bd(0, bd).unwrap();
     engine.start_channel(0, 0).unwrap();
 
-    run_memtile_mm2s_to_completion(
-        &mut engine, 0, &mut own_tile,
-        None, Some(&mut east_tile),
-        500,
-    );
+    run_memtile_mm2s_to_completion(&mut engine, 0, &mut own_tile, None, Some(&mut east_tile), 500);
 
     // East tile should now hold the payload at offset 0x300.
     let east_data = &east_tile.data_memory()[0x300..0x310];
-    assert!(east_data.iter().all(|&b| b == 0xC3),
-        "east neighbour memory should hold S2MM payload (0xC3), got {:?}", east_data);
+    assert!(
+        east_data.iter().all(|&b| b == 0xC3),
+        "east neighbour memory should hold S2MM payload (0xC3), got {:?}",
+        east_data
+    );
 
     // Own tile must remain untouched at the same offset.
     let own_data = &own_tile.data_memory()[0x300..0x310];
-    assert!(own_data.iter().all(|&b| b == 0x55),
-        "own tile memory should be unchanged (0x55), got {:?}", own_data);
+    assert!(
+        own_data.iter().all(|&b| b == 0x55),
+        "own tile memory should be unchanged (0x55), got {:?}",
+        own_data
+    );
 }
 
 #[test]
@@ -1308,28 +1257,29 @@ fn test_memtile_mm2s_missing_neighbour_falls_back_to_own() {
     // Real hardware silently aliases such accesses to Own when the
     // addressed neighbour does not exist. We mirror that: no fatal error,
     // and the read returns local data at the same byte offset.
-    let mut engine = DmaEngine::new_mem_tile(3, 1);  // last col, no east
+    let mut engine = DmaEngine::new_mem_tile(3, 1); // last col, no east
     let mut own_tile = Tile::mem_tile(3, 1);
     own_tile.data_memory_mut()[0x100..0x110].copy_from_slice(&[0x42; 16]);
 
-    let bd = BdConfig::simple_1d(0x100100, 16);  // East-window addr, no east tile
+    let bd = BdConfig::simple_1d(0x100100, 16); // East-window addr, no east tile
     engine.configure_bd(0, bd).unwrap();
     engine.start_channel(6, 0).unwrap();
 
-    run_memtile_mm2s_to_completion(
-        &mut engine, 6, &mut own_tile,
-        None, None,
-        500,
-    );
+    run_memtile_mm2s_to_completion(&mut engine, 6, &mut own_tile, None, None, 500);
 
-    assert!(engine.fatal_errors.is_empty(),
+    assert!(
+        engine.fatal_errors.is_empty(),
         "missing East neighbour should fall back to Own, not fatal-error: {:?}",
-        engine.fatal_errors);
+        engine.fatal_errors
+    );
     let expected_word = u32::from_le_bytes([0x42; 4]);
     assert_eq!(engine.stream_out_len(), 4, "expected 4 stream words from own tile");
     while let Some(w) = engine.stream_out.pop_front() {
-        assert_eq!(w.data, expected_word,
-            "stream word should fall back to own-tile data (0x42), got 0x{:08X}", w.data);
+        assert_eq!(
+            w.data, expected_word,
+            "stream word should fall back to own-tile data (0x42), got 0x{:08X}",
+            w.data
+        );
     }
 }
 
@@ -1358,8 +1308,7 @@ fn test_memtile_mm2s_out_of_window_addr_records_fatal_error() {
         }
     }
 
-    assert!(!engine.fatal_errors.is_empty(),
-        "addr beyond 3*mem_size should fatal-error, got none");
+    assert!(!engine.fatal_errors.is_empty(), "addr beyond 3*mem_size should fatal-error, got none");
     assert!(
         engine.fatal_errors.iter().any(|e| e.contains("outside three-window")),
         "fatal_errors should mention out-of-window, got: {:?}",
@@ -1443,14 +1392,8 @@ fn test_resolve_lock_id_shim_passthrough() {
     // Shim tiles use a small lock ID field, always maps to Own.
     let tile_kind = TileKind::ShimNoc;
     let num_locks = 16;
-    assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_kind, 0, 0, num_locks, 0),
-        Some(LockTarget::Own(0))
-    );
-    assert_eq!(
-        DmaEngine::resolve_lock_id_static(tile_kind, 0, 0, num_locks, 15),
-        Some(LockTarget::Own(15))
-    );
+    assert_eq!(DmaEngine::resolve_lock_id_static(tile_kind, 0, 0, num_locks, 0), Some(LockTarget::Own(0)));
+    assert_eq!(DmaEngine::resolve_lock_id_static(tile_kind, 0, 0, num_locks, 15), Some(LockTarget::Own(15)));
 }
 
 #[test]
@@ -1464,21 +1407,14 @@ fn test_stream_in_per_channel_isolation() {
     // Fill stream_in with channel 1 (trace) data up to capacity.
     // With a shared buffer of 256 entries, this would block channel 0.
     for i in 0..256 {
-        let pushed = engine.push_stream_in(StreamData {
-            data: 0xFEED_0000 | i as u32,
-            tlast: false,
-            channel: 1,
-        });
+        let pushed =
+            engine.push_stream_in(StreamData { data: 0xFEED_0000 | i as u32, tlast: false, channel: 1 });
         assert!(pushed, "channel 1 push {} should succeed", i);
     }
 
     // Channel 0 (output) must still be able to receive data.
     // On real hardware, channel 0's FIFO is independent of channel 1's.
-    let pushed = engine.push_stream_in(StreamData {
-        data: 0x0010_0001,
-        tlast: false,
-        channel: 0,
-    });
+    let pushed = engine.push_stream_in(StreamData { data: 0x0010_0001, tlast: false, channel: 0 });
     assert!(pushed, "channel 0 push must succeed even when channel 1 is full");
 
     // And channel 0 data must be readable
@@ -1506,24 +1442,18 @@ fn test_memtile_mm2s_packet_header_insertion() {
     bd.d0.stride = 4;
 
     // Create a Transfer from this BD (as MemTile MM2S)
-    let transfer = Transfer::new(
-        &bd, 1, 6, TransferDirection::MM2S, 0, 1, TileKind::Mem
-    ).expect("should create transfer");
+    let transfer = Transfer::new(&bd, 1, 6, TransferDirection::MM2S, 0, 1, TileKind::Mem)
+        .expect("should create transfer");
 
     // The transfer must carry the packet config from the BD
-    assert!(transfer.enable_packet,
-        "Transfer.enable_packet must be true when BD has it");
-    assert_eq!(transfer.packet_id, 5,
-        "Transfer.packet_id must match BD");
-    assert!(transfer.needs_packet_header(),
-        "needs_packet_header() should be true before sending");
+    assert!(transfer.enable_packet, "Transfer.enable_packet must be true when BD has it");
+    assert_eq!(transfer.packet_id, 5, "Transfer.packet_id must match BD");
+    assert!(transfer.needs_packet_header(), "needs_packet_header() should be true before sending");
 
     // Generate the header
-    let header_word = transfer.generate_packet_header()
-        .expect("should generate packet header");
+    let header_word = transfer.generate_packet_header().expect("should generate packet header");
     let (hdr, _) = crate::device::stream_switch::PacketHeader::decode(header_word);
-    assert_eq!(hdr.stream_id, 5,
-        "header stream_id should match BD packet_id");
+    assert_eq!(hdr.stream_id, 5, "header stream_id should match BD packet_id");
 }
 
 #[test]
@@ -1563,10 +1493,12 @@ fn test_memtile_mm2s_engine_inserts_header() {
     let ch = &engine.channels[mm2s_ch as usize];
     match &ch.fsm {
         ChannelFsm::BdSetup { transfer, .. } => {
-            assert!(transfer.enable_packet,
+            assert!(
+                transfer.enable_packet,
                 "Transfer in BdSetup must have enable_packet=true, got false \
                  (BD enable_packet={}, packet_id={})",
-                bd.enable_packet, bd.packet_id);
+                bd.enable_packet, bd.packet_id
+            );
         }
         other => panic!("Expected BdSetup, got {:?}", std::mem::discriminant(other)),
     }
@@ -1684,8 +1616,5 @@ fn memtile_invalid_bd_channel_combination_returns_error() {
     engine.configure_bd(24, bd).unwrap();
 
     let result = engine.start_channel_with_repeat(0, 24, 0);
-    assert!(
-        matches!(result, Err(DmaError::InvalidBd(24))),
-        "expected InvalidBd(24), got {:?}", result
-    );
+    assert!(matches!(result, Err(DmaError::InvalidBd(24))), "expected InvalidBd(24), got {:?}", result);
 }

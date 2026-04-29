@@ -120,10 +120,7 @@ pub fn decompress(input: &[u8]) -> Option<[u8; 32]> {
 /// 4 (mask) + non_zero_count + padding_to_4_byte_boundary
 pub fn compressed_size(input: &[u8]) -> usize {
     if input.len() != 32 {
-        log::warn!(
-            "DMA compressed_size: expected 32-byte input, got {}; returning 0",
-            input.len()
-        );
+        log::warn!("DMA compressed_size: expected 32-byte input, got {}; returning 0", input.len());
         return 0;
     }
 
@@ -139,10 +136,7 @@ pub fn compressed_size(input: &[u8]) -> usize {
 /// Returns true if the compressed size would be smaller than uncompressed.
 pub fn is_compressible(input: &[u8]) -> bool {
     if input.len() != 32 {
-        log::warn!(
-            "DMA is_compressible: expected 32-byte input, got {}; returning false",
-            input.len()
-        );
+        log::warn!("DMA is_compressible: expected 32-byte input, got {}; returning false", input.len());
         return false;
     }
 
@@ -194,9 +188,9 @@ mod tests {
     #[test]
     fn test_compress_sparse() {
         let mut input = [0u8; 32];
-        input[0] = 5;  // bit 0
-        input[3] = 3;  // bit 3
-        input[8] = 7;  // bit 8
+        input[0] = 5; // bit 0
+        input[3] = 3; // bit 3
+        input[8] = 7; // bit 8
 
         let compressed = compress(&input).unwrap();
 

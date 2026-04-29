@@ -358,10 +358,7 @@ impl FotCountFifo {
 
     /// Create a FoT Count FIFO with a specific capacity.
     pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            entries: VecDeque::with_capacity(capacity),
-            capacity,
-        }
+        Self { entries: VecDeque::with_capacity(capacity), capacity }
     }
 
     /// Push a completed transfer entry. Returns `true` if accepted,
@@ -850,11 +847,7 @@ mod tests {
 
     #[test]
     fn fot_entry_to_register_encoding() {
-        let entry = FotCountEntry {
-            bd_id: 5,
-            write_count: 256,
-            last_in_task: false,
-        };
+        let entry = FotCountEntry { bd_id: 5, write_count: 256, last_in_task: false };
         let reg = entry.to_register();
         // Bit 31 = Valid = 1
         assert_ne!(reg & (1 << 31), 0);
@@ -868,11 +861,7 @@ mod tests {
 
     #[test]
     fn fot_entry_last_in_task() {
-        let entry = FotCountEntry {
-            bd_id: 15,
-            write_count: 1024,
-            last_in_task: true,
-        };
+        let entry = FotCountEntry { bd_id: 15, write_count: 1024, last_in_task: true };
         let reg = entry.to_register();
         assert_ne!(reg & (1 << 31), 0); // Valid
         assert_ne!(reg & (1 << 30), 0); // Last_in_Task
@@ -883,7 +872,7 @@ mod tests {
     #[test]
     fn fot_entry_max_fields() {
         let entry = FotCountEntry {
-            bd_id: 63,           // 6-bit max
+            bd_id: 63,            // 6-bit max
             write_count: 0x3FFFF, // 18-bit max
             last_in_task: true,
         };
@@ -905,11 +894,7 @@ mod tests {
     #[test]
     fn fot_fifo_push_pop_roundtrip() {
         let mut fifo = FotCountFifo::new();
-        let entry = FotCountEntry {
-            bd_id: 3,
-            write_count: 128,
-            last_in_task: false,
-        };
+        let entry = FotCountEntry { bd_id: 3, write_count: 128, last_in_task: false };
         assert!(fifo.push(entry));
         assert_eq!(fifo.len(), 1);
         assert!(!fifo.is_empty());
@@ -925,11 +910,7 @@ mod tests {
     fn fot_fifo_ordering() {
         let mut fifo = FotCountFifo::new();
         for i in 0..4 {
-            fifo.push(FotCountEntry {
-                bd_id: i,
-                write_count: (i as u32 + 1) * 100,
-                last_in_task: i == 3,
-            });
+            fifo.push(FotCountEntry { bd_id: i, write_count: (i as u32 + 1) * 100, last_in_task: i == 3 });
         }
         assert_eq!(fifo.len(), 4);
 

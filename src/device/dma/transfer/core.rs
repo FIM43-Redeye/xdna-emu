@@ -96,16 +96,11 @@ pub enum TransferDirection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferEndpoint {
     /// Tile local memory (compute tile: 64KB, mem tile: 512KB)
-    TileMemory {
-        col: u8,
-        row: u8,
-    },
+    TileMemory { col: u8, row: u8 },
     /// Host/DDR memory (via shim tile)
     HostMemory,
     /// Stream switch connection
-    Stream {
-        port: u8,
-    },
+    Stream { port: u8 },
 }
 
 /// An active DMA transfer.
@@ -211,27 +206,19 @@ impl Transfer {
         // Create address generator based on BD dimensions and iteration config
         let address_gen = AddressGenerator::with_iteration(
             bd_config.base_addr,
-            [
-                bd_config.d0,
-                bd_config.d1,
-                bd_config.d2,
-                bd_config.d3,
-            ],
+            [bd_config.d0, bd_config.d1, bd_config.d2, bd_config.d3],
             bd_config.iteration,
         );
 
         // Total transfer size: BD length (per-iteration) * number of iterations.
         // Buffer_Length sets the per-iteration data volume; iteration repeats
         // the entire dimensional pattern with an address offset.
-        let data_bytes = bd_config.length as u64
-            * bd_config.iteration.total_iterations() as u64;
+        let data_bytes = bd_config.length as u64 * bd_config.iteration.total_iterations() as u64;
 
         // Zero-padding adds extra output words for MemTile MM2S only.
         // The padding state machine tracks where to insert zeros.
         let pad = &bd_config.zero_padding;
-        let zero_pad_state = if pad.is_enabled()
-            && direction == TransferDirection::MM2S
-            && tile_kind.is_mem()
+        let zero_pad_state = if pad.is_enabled() && direction == TransferDirection::MM2S && tile_kind.is_mem()
         {
             Some(ZeroPadState::new(
                 *pad,

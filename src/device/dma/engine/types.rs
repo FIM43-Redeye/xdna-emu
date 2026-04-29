@@ -181,8 +181,7 @@ pub(super) struct S2mmResult {
 pub type ChannelId = u8;
 
 /// State of a DMA channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelState {
     /// Channel is idle (no active transfer)
     #[default]
@@ -196,7 +195,6 @@ pub enum ChannelState {
     /// Channel encountered an error
     Error,
 }
-
 
 /// Statistics for a DMA channel.
 #[derive(Debug, Clone, Default)]

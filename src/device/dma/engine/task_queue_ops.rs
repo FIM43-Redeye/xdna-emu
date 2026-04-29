@@ -22,7 +22,9 @@ impl DmaEngine {
             // layers check the flag), but guard defensively.
             log::trace!(
                 "DMA tile({},{}) ch{} enqueue_task ignored: arch has no task queue",
-                self.col, self.row, channel
+                self.col,
+                self.row,
+                channel
             );
             return false;
         }
@@ -39,14 +41,23 @@ impl DmaEngine {
         if ch.task_queue.push(entry).is_err() {
             log::trace!(
                 "DMA tile({},{}) ch{} task queue full (BD {} rejected, queue_len={})",
-                self.col, self.row, channel, start_bd, ch.task_queue.len()
+                self.col,
+                self.row,
+                channel,
+                start_bd,
+                ch.task_queue.len()
             );
             return false;
         }
 
         log::debug!(
             "DMA tile({},{}) ch{} enqueued task: BD={} repeat={} token={} (queue_size={})",
-            self.col, self.row, channel, start_bd, repeat_count, enable_token_issue,
+            self.col,
+            self.row,
+            channel,
+            start_bd,
+            repeat_count,
+            enable_token_issue,
             ch.task_queue.len()
         );
 
@@ -75,7 +86,11 @@ impl DmaEngine {
         if task.start_bd as usize >= self.bd_configs.len() {
             log::error!(
                 "DMA tile({},{}) ch{} queued task has invalid BD {} (max={})",
-                self.col, self.row, channel, task.start_bd, self.bd_configs.len()
+                self.col,
+                self.row,
+                channel,
+                task.start_bd,
+                self.bd_configs.len()
             );
             self.channels[ch_idx].fsm = ChannelFsm::Error;
             return;
@@ -83,7 +98,11 @@ impl DmaEngine {
 
         log::debug!(
             "DMA tile({},{}) ch{} starting queued task: BD={} repeat={} (remaining={})",
-            self.col, self.row, channel, task.start_bd, task.repeat_count,
+            self.col,
+            self.row,
+            channel,
+            task.start_bd,
+            task.repeat_count,
             self.channels[ch_idx].task_queue.len()
         );
 
@@ -95,7 +114,11 @@ impl DmaEngine {
         if let Err(e) = self.start_channel_with_repeat(channel, start_bd, task.repeat_count) {
             log::error!(
                 "DMA tile({},{}) ch{} failed to start queued task BD {}: {}",
-                self.col, self.row, channel, start_bd, e
+                self.col,
+                self.row,
+                channel,
+                start_bd,
+                e
             );
             self.channels[ch_idx].fsm = ChannelFsm::Error;
         } else {
@@ -108,10 +131,7 @@ impl DmaEngine {
         if !self.dma_model.supports_task_queue() {
             return 0;
         }
-        self.channels
-            .get(channel as usize)
-            .map(|ch| ch.task_queue.len())
-            .unwrap_or(0)
+        self.channels.get(channel as usize).map(|ch| ch.task_queue.len()).unwrap_or(0)
     }
 
     /// Check if the task queue overflow flag is set for a channel.
@@ -149,7 +169,9 @@ impl DmaEngine {
             ch.error_bd_unavailable = true;
             log::warn!(
                 "DMA tile({},{}) S2MM ch{} Error_BD_Unavailable: invalid BD in OOO packet header",
-                self.col, self.row, channel
+                self.col,
+                self.row,
+                channel
             );
         }
     }

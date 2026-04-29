@@ -5,14 +5,8 @@ use crate::device::dma::addressing::{AddressGenerator, ZeroPadConfig};
 use crate::device::dma::{BdConfig, DmaError};
 use xdna_archspec::types::TileKind;
 
-
 fn simple_bd() -> BdConfig {
-    BdConfig {
-        base_addr: 0x1000,
-        length: 256,
-        valid: true,
-        ..Default::default()
-    }
+    BdConfig { base_addr: 0x1000, length: 256, valid: true, ..Default::default() }
 }
 
 #[test]
@@ -159,8 +153,8 @@ fn test_packet_header_disabled_by_default() {
 fn test_packet_header_generation() {
     let mut bd = simple_bd();
     bd.enable_packet = true;
-    bd.packet_id = 0x1F;     // 5-bit value, max
-    bd.packet_type = 0x3;    // 3-bit value (Trace)
+    bd.packet_id = 0x1F; // 5-bit value, max
+    bd.packet_type = 0x3; // 3-bit value (Trace)
 
     // Create transfer at tile (3, 5)
     let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 3, 5, TileKind::Compute).unwrap();
@@ -261,7 +255,8 @@ fn test_transfer_acquire_mode() {
     let mut bd_locked = simple_bd();
     bd_locked.acquire_lock = Some(5);
     bd_locked.acquire_value = 1;
-    let transfer_locked = Transfer::new(&bd_locked, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
+    let transfer_locked =
+        Transfer::new(&bd_locked, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
     assert_eq!(transfer_locked.acquire_mode(), Some(LockAcquireMode::Equal(1)));
 
     // Transfer with lock in GE mode
@@ -295,11 +290,7 @@ fn test_pad_state_no_padding() {
 fn test_pad_state_d0_only() {
     // D0 before=2, after=1, d0_size=3, d1=1, d2=1
     // Expected output: [0,0, D,D,D, 0] = 6 words total
-    let config = ZeroPadConfig {
-        d0_before: 2,
-        d0_after: 1,
-        ..Default::default()
-    };
+    let config = ZeroPadConfig { d0_before: 2, d0_after: 1, ..Default::default() };
     let mut state = ZeroPadState::new(config, 3, 1, 1);
     let gen = AddressGenerator::new_1d(0x1000, 3, 4);
 
@@ -313,12 +304,12 @@ fn test_pad_state_d0_only() {
     }
 
     assert_eq!(actions.len(), 6);
-    assert_eq!(actions[0], PadAction::Zero);  // d0_before
-    assert_eq!(actions[1], PadAction::Zero);  // d0_before
-    assert!(matches!(actions[2], PadAction::Data(_)));  // data
-    assert!(matches!(actions[3], PadAction::Data(_)));  // data
-    assert!(matches!(actions[4], PadAction::Data(_)));  // data
-    assert_eq!(actions[5], PadAction::Zero);  // d0_after
+    assert_eq!(actions[0], PadAction::Zero); // d0_before
+    assert_eq!(actions[1], PadAction::Zero); // d0_before
+    assert!(matches!(actions[2], PadAction::Data(_))); // data
+    assert!(matches!(actions[3], PadAction::Data(_))); // data
+    assert!(matches!(actions[4], PadAction::Data(_))); // data
+    assert_eq!(actions[5], PadAction::Zero); // d0_after
 }
 
 #[test]
@@ -326,11 +317,7 @@ fn test_pad_state_d0_with_d1_iterations() {
     // D0 before=1, after=1, d0_size=2, d1_size=3, d2=1
     // Per D1 iteration: [0, D,D, 0] = 4 words
     // Total: 4 * 3 = 12 words
-    let config = ZeroPadConfig {
-        d0_before: 1,
-        d0_after: 1,
-        ..Default::default()
-    };
+    let config = ZeroPadConfig { d0_before: 1, d0_after: 1, ..Default::default() };
     let mut state = ZeroPadState::new(config, 2, 3, 1);
     let gen = AddressGenerator::new_2d(0x1000, 2, 4, 3, 8);
 
@@ -373,14 +360,8 @@ fn test_pad_state_all_dimensions() {
     // D2 after = 1 D1 block = 12 zero words
     //
     // Total = 12 + (3+3+3)*2 + 12 = 12 + 18 + 12 = 42 words
-    let config = ZeroPadConfig {
-        d0_before: 1,
-        d0_after: 0,
-        d1_before: 1,
-        d1_after: 1,
-        d2_before: 1,
-        d2_after: 1,
-    };
+    let config =
+        ZeroPadConfig { d0_before: 1, d0_after: 0, d1_before: 1, d1_after: 1, d2_before: 1, d2_after: 1 };
     let mut state = ZeroPadState::new(config, 2, 2, 1);
     let gen = AddressGenerator::new_2d(0x1000, 2, 4, 2, 8);
 
@@ -423,29 +404,28 @@ fn test_pad_state_all_dimensions() {
     //   D1 wrap 3 (d1_after): 3 zeros
     // D2 block 2 (d2_after): all zeros = 12 zeros
     // Total: 12 + 3 + 3 + 3 + 3 + 12 = 36
-    assert_eq!(pattern, "000000000000" // D2 before (12 zeros)
+    assert_eq!(
+        pattern,
+        "000000000000" // D2 before (12 zeros)
         .to_owned()
         + "000" // D1 before wrap (3 zeros)
         + "0DD" // data D1 iter 0
         + "0DD" // data D1 iter 1
         + "000" // D1 after wrap (3 zeros)
-        + "000000000000"); // D2 after (12 zeros)
+        + "000000000000"
+    ); // D2 after (12 zeros)
 }
 
 #[test]
 fn test_pad_state_advance_returns_is_data() {
     // Verify advance() returns true for data words, false for padding
-    let config = ZeroPadConfig {
-        d0_before: 1,
-        d0_after: 1,
-        ..Default::default()
-    };
+    let config = ZeroPadConfig { d0_before: 1, d0_after: 1, ..Default::default() };
     let mut state = ZeroPadState::new(config, 2, 1, 1);
 
     // Expected: [Zero, Data, Data, Zero]
     assert!(!state.advance()); // d0_before zero
-    assert!(state.advance());  // data
-    assert!(state.advance());  // data
+    assert!(state.advance()); // data
+    assert!(state.advance()); // data
     assert!(!state.advance()); // d0_after zero
     assert!(state.is_finished());
 }
@@ -465,36 +445,27 @@ fn test_transfer_with_padding_total_bytes() {
     // CDO sets Buffer_Length = 14 words (total output including padding)
     let bd = BdConfig {
         base_addr: 0x80000,
-        length: 56,  // 14 words * 4 bytes (CDO: data + padding)
+        length: 56, // 14 words * 4 bytes (CDO: data + padding)
         d0: DimensionConfig::new(5, 4),
         d1: DimensionConfig::new(2, 20),
         valid: true,
-        zero_padding: ZeroPadConfig {
-            d0_before: 1,
-            d0_after: 1,
-            ..Default::default()
-        },
+        zero_padding: ZeroPadConfig { d0_before: 1, d0_after: 1, ..Default::default() },
         ..Default::default()
     };
 
     // MemTile MM2S: padding active, total_bytes = Buffer_Length
-    let transfer = Transfer::new(
-        &bd, 0, 0, TransferDirection::MM2S, 1, 1, TileKind::Mem,
-    ).unwrap();
+    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 1, TileKind::Mem).unwrap();
     assert_eq!(transfer.total_bytes, 56);
     assert!(transfer.has_zero_padding());
 
     // Same BD on compute tile -- no padding applied (compute doesn't pad)
-    let transfer_compute = Transfer::new(
-        &bd, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute,
-    ).unwrap();
+    let transfer_compute =
+        Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileKind::Compute).unwrap();
     assert_eq!(transfer_compute.total_bytes, 56);
     assert!(!transfer_compute.has_zero_padding());
 
     // MemTile S2MM -- no padding (S2MM ignores padding config)
-    let transfer_s2mm = Transfer::new(
-        &bd, 0, 0, TransferDirection::S2MM, 1, 1, TileKind::Mem,
-    ).unwrap();
+    let transfer_s2mm = Transfer::new(&bd, 0, 0, TransferDirection::S2MM, 1, 1, TileKind::Mem).unwrap();
     assert!(!transfer_s2mm.has_zero_padding());
 }
 
@@ -515,8 +486,8 @@ fn test_pad_state_i8_cdo_path() {
     // add_21_i8_using_dma_op_with_padding test:
     // memref<16xi8>, size=8, stride=1, pad_before=4, pad_after=4
     let config = ZeroPadConfig {
-        d0_before: 1,  // 4 i8 elements -> 1 word (CDO converts)
-        d0_after: 1,   // 4 i8 elements -> 1 word (CDO converts)
+        d0_before: 1, // 4 i8 elements -> 1 word (CDO converts)
+        d0_after: 1,  // 4 i8 elements -> 1 word (CDO converts)
         ..Default::default()
     };
     // d0_size = 2 words (8 i8 elements)
@@ -533,10 +504,10 @@ fn test_pad_state_i8_cdo_path() {
     }
 
     assert_eq!(actions.len(), 4);
-    assert_eq!(actions[0], PadAction::Zero);  // 1 word of zeros (4 i8 zeros)
+    assert_eq!(actions[0], PadAction::Zero); // 1 word of zeros (4 i8 zeros)
     assert!(matches!(actions[1], PadAction::Data(_)));
     assert!(matches!(actions[2], PadAction::Data(_)));
-    assert_eq!(actions[3], PadAction::Zero);  // 1 word of zeros (4 i8 zeros)
+    assert_eq!(actions[3], PadAction::Zero); // 1 word of zeros (4 i8 zeros)
 }
 
 /// Validates transfer total_bytes for the add_378_i32 padding scenario.
@@ -550,20 +521,14 @@ fn test_transfer_padding_no_double_count() {
 
     let bd = BdConfig {
         base_addr: 0x80000,
-        length: 64,  // 16 words * 4 bytes (CDO: total including padding)
-        d0: DimensionConfig::new(13, 4),  // 13 data words
+        length: 64,                      // 16 words * 4 bytes (CDO: total including padding)
+        d0: DimensionConfig::new(13, 4), // 13 data words
         valid: true,
-        zero_padding: ZeroPadConfig {
-            d0_before: 2,
-            d0_after: 1,
-            ..Default::default()
-        },
+        zero_padding: ZeroPadConfig { d0_before: 2, d0_after: 1, ..Default::default() },
         ..Default::default()
     };
 
-    let transfer = Transfer::new(
-        &bd, 0, 0, TransferDirection::MM2S, 1, 1, TileKind::Mem,
-    ).unwrap();
+    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 1, TileKind::Mem).unwrap();
 
     // total_bytes must equal Buffer_Length (64), not Buffer_Length + pad (76)
     assert_eq!(transfer.total_bytes, 64);

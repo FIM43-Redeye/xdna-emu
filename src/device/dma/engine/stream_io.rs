@@ -44,7 +44,10 @@ impl DmaEngine {
         if ch >= self.stream_in.len() {
             let msg = format!(
                 "DMA({},{}) push_stream_in: channel {} out of range (have {} S2MM channels)",
-                self.col, self.row, ch, self.stream_in.len()
+                self.col,
+                self.row,
+                ch,
+                self.stream_in.len()
             );
             log::error!("{}", msg);
             self.fatal_errors.push(msg);
@@ -81,7 +84,9 @@ impl DmaEngine {
 
     /// Check if a specific S2MM channel's stream input buffer has space.
     pub fn can_accept_stream_in_for_channel(&self, channel: u8) -> bool {
-        self.stream_in.get(channel as usize).map_or(false, |q| q.len() < STREAM_BUFFER_CAPACITY_WORDS)
+        self.stream_in
+            .get(channel as usize)
+            .map_or(false, |q| q.len() < STREAM_BUFFER_CAPACITY_WORDS)
     }
 
     /// Get the number of words in stream output buffer.
@@ -118,7 +123,8 @@ impl DmaEngine {
         for ch_idx in 0..self.channels.len() {
             if self.channel_type(ch_idx as u8) == ChannelType::S2MM {
                 let is_pending = self.channels[ch_idx].is_active();
-                if is_pending && self.stream_in.len() < 256 { // TODO(phase2): This compares channel count to 256 -- likely a latent bug; see subsys3 audit
+                if is_pending && self.stream_in.len() < 256 {
+                    // TODO(phase2): This compares channel count to 256 -- likely a latent bug; see subsys3 audit
                     return Some(ch_idx as u8);
                 }
             }
@@ -173,11 +179,7 @@ impl DmaEngine {
     /// This bridges the stream_io module's `StreamWord` (used by stream switches)
     /// with the engine's `StreamData` (which tracks channel ownership).
     pub fn stream_word_to_data(word: super::super::stream_io::StreamWord, channel: u8) -> StreamData {
-        StreamData {
-            data: word.data,
-            tlast: word.tlast,
-            channel,
-        }
+        StreamData { data: word.data, tlast: word.tlast, channel }
     }
 
     /// Convert a StreamData to StreamWord.
@@ -196,15 +198,19 @@ impl DmaEngine {
     ///
     /// Returns the word and the channel it came from.
     pub fn pop_stream_out_as_word(&mut self) -> Option<(super::super::stream_io::StreamWord, u8)> {
-        self.stream_out.pop_front().map(|data| {
-            (Self::stream_data_to_word(&data), data.channel)
-        })
+        self.stream_out
+            .pop_front()
+            .map(|data| (Self::stream_data_to_word(&data), data.channel))
     }
 
     /// Push stream input from StreamWord (for stream switch integration).
     ///
     /// Requires specifying which S2MM channel should receive this data.
-    pub fn push_stream_in_from_word(&mut self, word: super::super::stream_io::StreamWord, channel: u8) -> bool {
+    pub fn push_stream_in_from_word(
+        &mut self,
+        word: super::super::stream_io::StreamWord,
+        channel: u8,
+    ) -> bool {
         self.push_stream_in(Self::stream_word_to_data(word, channel))
     }
 }
@@ -215,21 +221,13 @@ impl DmaEngine {
 
 impl From<StreamData> for super::super::stream_io::StreamWord {
     fn from(data: StreamData) -> Self {
-        Self {
-            data: data.data,
-            tlast: data.tlast,
-            parity: Self::compute_parity(data.data),
-        }
+        Self { data: data.data, tlast: data.tlast, parity: Self::compute_parity(data.data) }
     }
 }
 
 impl StreamData {
     /// Create StreamData from a StreamWord with specified channel.
     pub fn from_stream_word(word: super::super::stream_io::StreamWord, channel: u8) -> Self {
-        Self {
-            data: word.data,
-            tlast: word.tlast,
-            channel,
-        }
+        Self { data: word.data, tlast: word.tlast, channel }
     }
 }

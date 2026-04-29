@@ -132,7 +132,12 @@ impl DmaEngine {
 
             log::trace!(
                 "DMA tile({},{}) ch{} set task config: token_issue={} controller_id={} fot_mode={}",
-                self.col, self.row, ch_idx, enable_token_issue, controller_id, fot_mode
+                self.col,
+                self.row,
+                ch_idx,
+                enable_token_issue,
+                controller_id,
+                fot_mode
             );
         }
     }
@@ -162,9 +167,15 @@ impl DmaEngine {
             log::trace!(
                 "DMA tile({},{}) ch{} set compression config: compress={} decompress={} ooo={} \
                  (requested compress={} decompress={} ooo={})",
-                self.col, self.row, ch_idx,
-                effective_compress, effective_decompress, effective_ooo,
-                compression_enable, decompression_enable, out_of_order_enable,
+                self.col,
+                self.row,
+                ch_idx,
+                effective_compress,
+                effective_decompress,
+                effective_ooo,
+                compression_enable,
+                decompression_enable,
+                out_of_order_enable,
             );
         }
     }
