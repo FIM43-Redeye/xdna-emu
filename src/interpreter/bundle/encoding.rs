@@ -40,12 +40,12 @@ pub enum BundleFormat {
 
 impl BundleFormat {
     /// Format marker constants (low 4 bits of first halfword).
-    pub const MARKER_NOP16: u8 = 0b0001;   // 0x1
+    pub const MARKER_NOP16: u8 = 0b0001; // 0x1
     pub const MARKER_SHORT32: u8 = 0b1001; // 0x9
     pub const MARKER_MEDIUM48: u8 = 0b0101; // 0x5
     pub const MARKER_MEDIUM64: u8 = 0b0011; // 0x3
-    pub const MARKER_LONG80: u8 = 0b1011;  // 0xB
-    pub const MARKER_LONG96: u8 = 0b0111;  // 0x7
+    pub const MARKER_LONG80: u8 = 0b1011; // 0xB
+    pub const MARKER_LONG96: u8 = 0b0111; // 0x7
     pub const MARKER_LONG112: u8 = 0b1111; // 0xF
     pub const MARKER_FULL128: u8 = 0b0000; // 0x0
 
@@ -288,7 +288,9 @@ pub fn validate_bundle_formats(formats: &[xdna_archspec::aie2::isa::CompositeFor
             known_sizes.contains(&fmt.total_bytes),
             "Parsed composite format '{}' has size {} bytes, which doesn't match \
              any known BundleFormat size (expected one of {:?})",
-            fmt.name, fmt.total_bytes, known_sizes
+            fmt.name,
+            fmt.total_bytes,
+            known_sizes
         );
     }
 

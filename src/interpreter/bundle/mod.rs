@@ -46,8 +46,8 @@ pub mod slot_layout;
 pub use encoding::{detect_format, is_nop_encoding, BundleFormat, SlotMask, NOP_ENCODINGS};
 pub use slot_layout::{extract_slots, ExtractedBundle, ExtractedSlot, FormatTable, SlotType};
 pub use slot::{
-    BranchCondition, ElementType, MemWidth, Operand, PostModify, Predicate,
-    SelectVariant, ShufflePattern, SlotIndex, SlotOp,
+    BranchCondition, ElementType, MemWidth, Operand, PostModify, Predicate, SelectVariant, ShufflePattern,
+    SlotIndex, SlotOp,
 };
 
 /// A decoded VLIW instruction bundle.
@@ -103,13 +103,7 @@ impl VliwBundle {
 
         let format = detect_format(bytes);
 
-        Self {
-            raw,
-            slots: Default::default(),
-            size: format.size_bytes(),
-            format,
-            pc,
-        }
+        Self { raw, slots: Default::default(), size: format.size_bytes(), format, pc }
     }
 
     /// Get the raw instruction bytes.
@@ -220,8 +214,7 @@ impl VliwBundle {
 
     /// Get the control flow operation if present.
     pub fn control_op(&self) -> Option<&SlotOp> {
-        self.slot(SlotIndex::Control)
-            .filter(|s| s.is_control_flow())
+        self.slot(SlotIndex::Control).filter(|s| s.is_control_flow())
     }
 
     /// Get a disassembly string for this bundle.
@@ -318,40 +311,130 @@ fn disassemble_from_semantic(slot_op: &SlotOp) -> String {
 
     match semantic {
         // Arithmetic
-        SemanticOp::Add => if is_vec { vec_et("vadd") } else { "add".into() },
-        SemanticOp::Sub => if is_vec { vec_et("vsub") } else { "sub".into() },
-        SemanticOp::Mul => if is_vec { vec_et("vmul") } else { "mul".into() },
+        SemanticOp::Add => {
+            if is_vec {
+                vec_et("vadd")
+            } else {
+                "add".into()
+            }
+        }
+        SemanticOp::Sub => {
+            if is_vec {
+                vec_et("vsub")
+            } else {
+                "sub".into()
+            }
+        }
+        SemanticOp::Mul => {
+            if is_vec {
+                vec_et("vmul")
+            } else {
+                "mul".into()
+            }
+        }
         SemanticOp::Adc => "adc".into(),
         SemanticOp::Sbc => "sbc".into(),
         SemanticOp::Abs => "abs".into(),
-        SemanticOp::Neg => if is_vec { vec_et("vneg") } else { "neg".into() },
+        SemanticOp::Neg => {
+            if is_vec {
+                vec_et("vneg")
+            } else {
+                "neg".into()
+            }
+        }
         SemanticOp::SDiv => "divs".into(),
         SemanticOp::UDiv => "divu".into(),
         SemanticOp::SRem | SemanticOp::URem => "mod".into(),
 
         // Bitwise
-        SemanticOp::And => if is_vec { vec_et("vband") } else { "and".into() },
-        SemanticOp::Or => if is_vec { vec_et("vbor") } else { "or".into() },
-        SemanticOp::Xor => if is_vec { vec_et("vbxor") } else { "xor".into() },
-        SemanticOp::Not => if is_vec { vec_et("vbnot") } else { "not".into() },
-        SemanticOp::Shl => if is_vec { vec_et("vshl") } else { "shl".into() },
-        SemanticOp::Srl => if is_vec { vec_et("vshr") } else { "shr".into() },
-        SemanticOp::Sra => if is_vec { vec_et("vasr") } else { "asr".into() },
+        SemanticOp::And => {
+            if is_vec {
+                vec_et("vband")
+            } else {
+                "and".into()
+            }
+        }
+        SemanticOp::Or => {
+            if is_vec {
+                vec_et("vbor")
+            } else {
+                "or".into()
+            }
+        }
+        SemanticOp::Xor => {
+            if is_vec {
+                vec_et("vbxor")
+            } else {
+                "xor".into()
+            }
+        }
+        SemanticOp::Not => {
+            if is_vec {
+                vec_et("vbnot")
+            } else {
+                "not".into()
+            }
+        }
+        SemanticOp::Shl => {
+            if is_vec {
+                vec_et("vshl")
+            } else {
+                "shl".into()
+            }
+        }
+        SemanticOp::Srl => {
+            if is_vec {
+                vec_et("vshr")
+            } else {
+                "shr".into()
+            }
+        }
+        SemanticOp::Sra => {
+            if is_vec {
+                vec_et("vasr")
+            } else {
+                "asr".into()
+            }
+        }
         SemanticOp::Rotl => "rotl".into(),
         SemanticOp::Rotr => "rotr".into(),
 
         // Comparison
-        SemanticOp::SetLt => if is_vec { vec_et("vlt") } else { "lt".into() },
+        SemanticOp::SetLt => {
+            if is_vec {
+                vec_et("vlt")
+            } else {
+                "lt".into()
+            }
+        }
         SemanticOp::SetLe => "le".into(),
         SemanticOp::SetGt => "gt".into(),
-        SemanticOp::SetGe => if is_vec { vec_et("vge") } else { "ge".into() },
-        SemanticOp::SetEq => if is_vec { vec_et("veqz") } else { "eq".into() },
+        SemanticOp::SetGe => {
+            if is_vec {
+                vec_et("vge")
+            } else {
+                "ge".into()
+            }
+        }
+        SemanticOp::SetEq => {
+            if is_vec {
+                vec_et("veqz")
+            } else {
+                "eq".into()
+            }
+        }
         SemanticOp::SetNe => "ne".into(),
         SemanticOp::SetUlt => "ltu".into(),
         SemanticOp::SetUle => "leu".into(),
         SemanticOp::SetUgt => "gtu".into(),
         SemanticOp::SetUge => "geu".into(),
-        SemanticOp::Cmp => if is_vec { vec_et("vcmp") } else { "cmp".into() },
+        SemanticOp::Cmp => {
+            if is_vec {
+                vec_et("vcmp")
+            } else {
+                "cmp".into()
+            }
+        }
         SemanticOp::Clb => "clb".into(),
 
         // Bit manipulation
@@ -361,7 +444,13 @@ fn disassemble_from_semantic(slot_op: &SlotOp) -> String {
         SemanticOp::Bswap => "bswap".into(),
 
         // Copy/extend
-        SemanticOp::Copy => if is_vec { vec_et("vmov") } else { "mov".into() },
+        SemanticOp::Copy => {
+            if is_vec {
+                vec_et("vmov")
+            } else {
+                "mov".into()
+            }
+        }
         SemanticOp::SignExtend => "ext.s".into(),
         SemanticOp::ZeroExtend => "ext.u".into(),
         SemanticOp::Truncate => "trunc".into(),
@@ -431,8 +520,20 @@ fn disassemble_from_semantic(slot_op: &SlotOp) -> String {
         SemanticOp::VectorPushHi => vec_et("vpush.hi"),
         SemanticOp::VectorSelect => vec_et("vsel"),
         SemanticOp::VectorClear => "vclr".into(),
-        SemanticOp::Min => if is_vec { vec_et("vmin") } else { "min".into() },
-        SemanticOp::Max => if is_vec { vec_et("vmax") } else { "max".into() },
+        SemanticOp::Min => {
+            if is_vec {
+                vec_et("vmin")
+            } else {
+                "min".into()
+            }
+        }
+        SemanticOp::Max => {
+            if is_vec {
+                vec_et("vmax")
+            } else {
+                "max".into()
+            }
+        }
 
         // Conditional vector
         SemanticOp::SubLt => vec_et("vsub_lt"),
@@ -456,16 +557,25 @@ fn disassemble_from_semantic(slot_op: &SlotOp) -> String {
         SemanticOp::CascadeRead => "vmov.scd".into(),
         SemanticOp::CascadeWrite => "vmov.mcd".into(),
         SemanticOp::StreamRead => {
-            if slot_op.blocking { "stream.read.scl.blocking".into() }
-            else { "stream.read.scl".into() }
+            if slot_op.blocking {
+                "stream.read.scl.blocking".into()
+            } else {
+                "stream.read.scl".into()
+            }
         }
         SemanticOp::StreamWrite => {
-            if slot_op.blocking { "stream.write.scl.blocking".into() }
-            else { "stream.write.scl".into() }
+            if slot_op.blocking {
+                "stream.write.scl.blocking".into()
+            } else {
+                "stream.write.scl".into()
+            }
         }
         SemanticOp::StreamWritePacketHeader => {
-            if slot_op.blocking { "stream.write.ph.blocking".into() }
-            else { "stream.write.ph".into() }
+            if slot_op.blocking {
+                "stream.write.ph.blocking".into()
+            } else {
+                "stream.write.ph".into()
+            }
         }
 
         // Pointer
@@ -637,8 +747,7 @@ mod tests {
     #[test]
     fn test_disassemble_vector() {
         let mut bundle = VliwBundle::empty();
-        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add)
-            .as_vector(ElementType::Int32);
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add).as_vector(ElementType::Int32);
         bundle.set_slot(op);
 
         assert_eq!(bundle.disassemble(), "vadd.i32");
@@ -649,8 +758,7 @@ mod tests {
         let mut bundle = VliwBundle::empty();
         bundle.set_slot(SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add));
         bundle.set_slot(
-            SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Mul)
-                .as_vector(ElementType::Int16),
+            SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Mul).as_vector(ElementType::Int16),
         );
 
         let dis = bundle.disassemble();

@@ -71,11 +71,7 @@ impl ExtractedBundle {
 
     /// Add a slot to this bundle.
     pub fn add_slot(&mut self, slot_type: SlotType, bits: u64, width: u8) {
-        self.slots.push(ExtractedSlot {
-            slot_type,
-            bits,
-            width,
-        });
+        self.slots.push(ExtractedSlot { slot_type, bits, width });
     }
 
     /// Check if this bundle is empty (no slots extracted).
@@ -128,21 +124,25 @@ impl FormatTable {
             }
 
             let group_idx = match fmt.total_bytes {
-                2 => 0,   // Nop16
-                4 => 1,   // Short32
-                6 => 2,   // Medium48
-                8 => 3,   // Medium64
-                10 => 4,  // Long80
-                12 => 5,  // Long96
-                14 => 6,  // Long112
-                16 => 7,  // Full128
+                2 => 0,  // Nop16
+                4 => 1,  // Short32
+                6 => 2,  // Medium48
+                8 => 3,  // Medium64
+                10 => 4, // Long80
+                12 => 5, // Long96
+                14 => 6, // Long112
+                16 => 7, // Full128
                 _ => continue,
             };
 
-            let slots: Vec<(SlotType, u8, u8)> = fmt.slot_maps.iter().filter_map(|sm| {
-                let slot_type = slot_name_to_type(&sm.slot_name)?;
-                Some((slot_type, sm.start_bit, sm.width))
-            }).collect();
+            let slots: Vec<(SlotType, u8, u8)> = fmt
+                .slot_maps
+                .iter()
+                .filter_map(|sm| {
+                    let slot_type = slot_name_to_type(&sm.slot_name)?;
+                    Some((slot_type, sm.start_bit, sm.width))
+                })
+                .collect();
 
             groups[group_idx].push(FormatEntry {
                 name: fmt.name.clone(),
@@ -158,7 +158,8 @@ impl FormatTable {
             group.sort_by(|a, b| {
                 let ones_a = (a.fixed_value & a.fixed_mask).count_ones();
                 let ones_b = (b.fixed_value & b.fixed_mask).count_ones();
-                ones_b.cmp(&ones_a)
+                ones_b
+                    .cmp(&ones_a)
                     .then_with(|| a.fixed_mask.count_ones().cmp(&b.fixed_mask.count_ones()).reverse())
             });
         }
@@ -184,7 +185,11 @@ impl FormatTable {
             if (word & entry.fixed_mask) == entry.fixed_value {
                 let mut bundle = ExtractedBundle::new();
                 for &(slot_type, start_bit, width) in &entry.slots {
-                    let mask = if width >= 128 { u128::MAX } else { (1u128 << width) - 1 };
+                    let mask = if width >= 128 {
+                        u128::MAX
+                    } else {
+                        (1u128 << width) - 1
+                    };
                     let bits = ((word >> start_bit) & mask) as u64;
                     bundle.add_slot(slot_type, bits, width);
                 }
@@ -460,9 +465,8 @@ pub fn extract_64bit(bytes: &[u8]) -> ExtractedBundle {
     }
 
     // Read 64 bits as u64 (little-endian)
-    let word = u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ]);
+    let word =
+        u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]);
 
     // Verify format marker (low 4 bits should be 0b0011 = 3)
     if (word & 0xF) != 0b0011 {
@@ -741,8 +745,12 @@ pub fn extract_80bit(bytes: &[u8]) -> ExtractedBundle {
             let alu_bits = ((instr80 >> 30) & ((1u128 << ALU_WIDTH) - 1)) as u64;
             bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
             bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
-            log::trace!("[80bit] I80_LDA_ALU_MV: lda=0x{:05X} mv=0x{:06X} alu=0x{:05X}",
-                lda_bits, mv_bits, alu_bits);
+            log::trace!(
+                "[80bit] I80_LDA_ALU_MV: lda=0x{:05X} mv=0x{:06X} alu=0x{:05X}",
+                lda_bits,
+                mv_bits,
+                alu_bits
+            );
         } else {
             // I80_LDA_LNG: bits 8-49 = lng (42 bits)
             let lng_bits = ((instr80 >> 8) & ((1u128 << LNG_WIDTH) - 1)) as u64;
@@ -1236,10 +1244,8 @@ pub fn extract_128bit(bytes: &[u8]) -> ExtractedBundle {
 
     // Read 128 bits (16 bytes) as u128 (little-endian)
     let word = u128::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5], bytes[6], bytes[7],
-        bytes[8], bytes[9], bytes[10], bytes[11],
-        bytes[12], bytes[13], bytes[14], bytes[15],
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
     ]);
 
     // Verify format marker (bit 0 should be 0)
@@ -1432,12 +1438,12 @@ mod tests {
         // - lda[20:0] at Inst[111:91]
         // - ldb[15:0] at Inst[127:112]
 
-        let vec_value: u128 = 0x2ABCDEF;   // 26 bits
-        let mv_value: u128 = 0x3ABCDE;     // 22 bits
-        let alu_value: u128 = 0x89ABC;     // 20 bits
-        let st_value: u128 = 0x1BCDEF;     // 21 bits
-        let lda_value: u128 = 0x1CDEF0;    // 21 bits
-        let ldb_value: u128 = 0xABCD;      // 16 bits
+        let vec_value: u128 = 0x2ABCDEF; // 26 bits
+        let mv_value: u128 = 0x3ABCDE; // 22 bits
+        let alu_value: u128 = 0x89ABC; // 20 bits
+        let st_value: u128 = 0x1BCDEF; // 21 bits
+        let lda_value: u128 = 0x1CDEF0; // 21 bits
+        let ldb_value: u128 = 0xABCD; // 16 bits
 
         // Construct the 128-bit word
         let word: u128 = 0                           // bit 0 = 0 (marker)
@@ -1447,7 +1453,7 @@ mod tests {
             | (alu_value << 50)                      // bits [69:50]
             | (st_value << 70)                       // bits [90:70]
             | (lda_value << 91)                      // bits [111:91]
-            | (ldb_value << 112);                    // bits [127:112]
+            | (ldb_value << 112); // bits [127:112]
 
         let bytes = word.to_le_bytes();
         let bundle = extract_128bit(&bytes);
@@ -1489,11 +1495,11 @@ mod tests {
         // - lda[20:0] at Inst[111:91]
         // - ldb[15:0] at Inst[127:112]
 
-        let vec_value: u128 = 0x1234567;       // 26 bits
-        let lng_value: u128 = 0x2ABCDEF0123;   // 42 bits
-        let st_value: u128 = 0x1ABCDE;         // 21 bits
-        let lda_value: u128 = 0x1BCDEF;        // 21 bits
-        let ldb_value: u128 = 0xCDEF;          // 16 bits
+        let vec_value: u128 = 0x1234567; // 26 bits
+        let lng_value: u128 = 0x2ABCDEF0123; // 42 bits
+        let st_value: u128 = 0x1ABCDE; // 21 bits
+        let lda_value: u128 = 0x1BCDEF; // 21 bits
+        let ldb_value: u128 = 0xCDEF; // 16 bits
 
         // Construct the 128-bit word
         let word: u128 = 0                           // bit 0 = 0 (marker)
@@ -1502,7 +1508,7 @@ mod tests {
             | (lng_value << 28)                      // bits [69:28]
             | (st_value << 70)                       // bits [90:70]
             | (lda_value << 91)                      // bits [111:91]
-            | (ldb_value << 112);                    // bits [127:112]
+            | (ldb_value << 112); // bits [127:112]
 
         let bytes = word.to_le_bytes();
         let bundle = extract_128bit(&bytes);
@@ -1580,12 +1586,14 @@ mod tests {
     fn test_format_table_builds_all_78() {
         let table = match try_build_format_table() {
             Some(t) => t,
-            None => { eprintln!("Skipping: llvm-aie not found"); return; }
+            None => {
+                eprintln!("Skipping: llvm-aie not found");
+                return;
+            }
         };
 
         // Should have all 78 composite formats
-        assert_eq!(table.total_entries(), 78,
-            "Expected 78 format entries, got {}", table.total_entries());
+        assert_eq!(table.total_entries(), 78, "Expected 78 format entries, got {}", table.total_entries());
 
         // Each size group should have entries
         assert!(table.has_entries(BundleFormat::Short32));
@@ -1601,16 +1609,24 @@ mod tests {
     fn test_format_table_discrimination_uniqueness() {
         let table = match try_build_format_table() {
             Some(t) => t,
-            None => { eprintln!("Skipping: llvm-aie not found"); return; }
+            None => {
+                eprintln!("Skipping: llvm-aie not found");
+                return;
+            }
         };
 
         // For each size group, verify no two formats match the same word.
         // Build a synthetic word for each format using its fixed_value and
         // check that no other format in the same group also matches.
         for format in [
-            BundleFormat::Nop16, BundleFormat::Short32, BundleFormat::Medium48,
-            BundleFormat::Medium64, BundleFormat::Long80, BundleFormat::Long96,
-            BundleFormat::Long112, BundleFormat::Full128,
+            BundleFormat::Nop16,
+            BundleFormat::Short32,
+            BundleFormat::Medium48,
+            BundleFormat::Medium64,
+            BundleFormat::Long80,
+            BundleFormat::Long96,
+            BundleFormat::Long112,
+            BundleFormat::Full128,
         ] {
             let group = table.group_entries(format);
             for (i, entry_i) in group.iter().enumerate() {
@@ -1623,12 +1639,15 @@ mod tests {
                     }
                 }
                 // The first match should be this entry (or earlier, more-specific one)
-                assert!(!matches.is_empty(),
-                    "Format {} should match its own fixed_value", entry_i.name);
+                assert!(!matches.is_empty(), "Format {} should match its own fixed_value", entry_i.name);
                 // Entry i should be among the matches
-                assert!(matches.contains(&i),
+                assert!(
+                    matches.contains(&i),
                     "Format {} (idx {}) not in its own match set {:?}",
-                    entry_i.name, i, matches);
+                    entry_i.name,
+                    i,
+                    matches
+                );
             }
         }
     }
@@ -1661,7 +1680,11 @@ mod tests {
                 // Use a test pattern: alternating bits within the slot width
                 let test_val = 0x5A5A5A5A5A5A5A5Au64 & ((1u64 << sm.width) - 1);
                 // Insert into the word
-                let mask = if sm.width >= 128 { u128::MAX } else { (1u128 << sm.width) - 1 };
+                let mask = if sm.width >= 128 {
+                    u128::MAX
+                } else {
+                    (1u128 << sm.width) - 1
+                };
                 word &= !(mask << sm.start_bit); // clear slot region
                 word |= (test_val as u128) << sm.start_bit; // set test value
 
@@ -1677,22 +1700,26 @@ mod tests {
 
             // Extract using the table
             let result = table.extract(bundle_bytes, format);
-            assert!(result.is_some(),
+            assert!(
+                result.is_some(),
                 "Format {} ({}b): no table match for word=0x{:032X}",
-                fmt.name, total_bits, word);
+                fmt.name,
+                total_bits,
+                word
+            );
             let bundle = result.unwrap();
 
             // Verify each expected slot
             for (exp_type, exp_val, exp_width) in &expected {
                 let slot = bundle.slots.iter().find(|s| s.slot_type == *exp_type);
-                assert!(slot.is_some(),
-                    "Format {}: missing {:?} slot", fmt.name, exp_type);
+                assert!(slot.is_some(), "Format {}: missing {:?} slot", fmt.name, exp_type);
                 let slot = slot.unwrap();
-                assert_eq!(slot.bits, *exp_val,
+                assert_eq!(
+                    slot.bits, *exp_val,
                     "Format {}: {:?} slot value mismatch (got 0x{:X}, expected 0x{:X})",
-                    fmt.name, exp_type, slot.bits, exp_val);
-                assert_eq!(slot.width, *exp_width,
-                    "Format {}: {:?} slot width mismatch", fmt.name, exp_type);
+                    fmt.name, exp_type, slot.bits, exp_val
+                );
+                assert_eq!(slot.width, *exp_width, "Format {}: {:?} slot width mismatch", fmt.name, exp_type);
             }
         }
     }
@@ -1701,7 +1728,10 @@ mod tests {
     fn test_format_table_backward_compat_32bit_alu() {
         let table = match try_build_format_table() {
             Some(t) => t,
-            None => { eprintln!("Skipping: llvm-aie not found"); return; }
+            None => {
+                eprintln!("Skipping: llvm-aie not found");
+                return;
+            }
         };
 
         // I32_ALU: {0b00010, alu[19:0], 0b001, 0b1001}
@@ -1714,8 +1744,7 @@ mod tests {
         // Data-driven path
         let driven = table.extract(&bytes, BundleFormat::Short32).unwrap();
 
-        assert_eq!(legacy.slots.len(), driven.slots.len(),
-            "Slot count mismatch for I32_ALU");
+        assert_eq!(legacy.slots.len(), driven.slots.len(), "Slot count mismatch for I32_ALU");
         assert_eq!(driven.slots[0].slot_type, SlotType::Alu);
         assert_eq!(driven.slots[0].bits, alu_value as u64);
     }
@@ -1724,7 +1753,10 @@ mod tests {
     fn test_format_table_backward_compat_128bit() {
         let table = match try_build_format_table() {
             Some(t) => t,
-            None => { eprintln!("Skipping: llvm-aie not found"); return; }
+            None => {
+                eprintln!("Skipping: llvm-aie not found");
+                return;
+            }
         };
 
         // I128_LDB_LDA_ST_ALU_MV_VEC
@@ -1755,13 +1787,16 @@ mod tests {
 
         // Compare each slot by type
         for legacy_slot in &legacy.slots {
-            let driven_slot = driven.slots.iter()
-                .find(|s| s.slot_type == legacy_slot.slot_type);
-            assert!(driven_slot.is_some(),
-                "Missing {:?} in data-driven result", legacy_slot.slot_type);
-            assert_eq!(driven_slot.unwrap().bits, legacy_slot.bits,
+            let driven_slot = driven.slots.iter().find(|s| s.slot_type == legacy_slot.slot_type);
+            assert!(driven_slot.is_some(), "Missing {:?} in data-driven result", legacy_slot.slot_type);
+            assert_eq!(
+                driven_slot.unwrap().bits,
+                legacy_slot.bits,
                 "Mismatch for {:?}: legacy=0x{:X} driven=0x{:X}",
-                legacy_slot.slot_type, legacy_slot.bits, driven_slot.unwrap().bits);
+                legacy_slot.slot_type,
+                legacy_slot.bits,
+                driven_slot.unwrap().bits
+            );
         }
     }
 }

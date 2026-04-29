@@ -145,8 +145,7 @@ pub enum PostModify {
 }
 
 /// Shuffle pattern for vector permute operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShufflePattern {
     /// No shuffle (identity).
     #[default]
@@ -162,9 +161,6 @@ pub enum ShufflePattern {
     /// Custom pattern (encoded).
     Custom(u32),
 }
-
-
-
 
 /// Operand specification.
 ///
@@ -252,7 +248,6 @@ pub struct SlotOp {
     //
     // These fields carry disambiguation and addressing info, populated
     // from InstrEncoding at decode time.
-
     /// Whether this is a vector (SIMD) operation.
     pub is_vector: bool,
     /// Whether this operates on 512-bit (x) registers rather than 256-bit (w).
@@ -280,7 +275,6 @@ pub struct SlotOp {
     pub shuffle_pattern: ShufflePattern,
 
     // ── Operands ───────────────────────────────────────────────────────
-
     /// Source operands (ordered per InstrDef.inputs when semantic is set).
     pub sources: SmallVec<[Operand; 4]>,
     /// Destination operand (if any).
@@ -320,40 +314,86 @@ impl SlotOp {
             Some(SemanticOp::Mul) if !self.is_vector => SlotIndex::Scalar1,
 
             // Scalar ops use Scalar0
-            Some(SemanticOp::Add | SemanticOp::Sub | SemanticOp::And | SemanticOp::Or
-                | SemanticOp::Xor | SemanticOp::Shl | SemanticOp::Srl | SemanticOp::Sra
-                | SemanticOp::Copy | SemanticOp::Cmp | SemanticOp::Abs | SemanticOp::Ctlz
-                | SemanticOp::Clb | SemanticOp::Adc | SemanticOp::Sbc
-                | SemanticOp::SignExtend | SemanticOp::ZeroExtend
-                | SemanticOp::SetLt | SemanticOp::SetUlt | SemanticOp::SetLe
-                | SemanticOp::SetUle | SemanticOp::SetGt | SemanticOp::SetUgt
-                | SemanticOp::SetGe | SemanticOp::SetUge | SemanticOp::SetEq
-                | SemanticOp::SetNe | SemanticOp::Select
-                | SemanticOp::SDiv | SemanticOp::UDiv | SemanticOp::SRem
-                | SemanticOp::Neg | SemanticOp::Truncate | SemanticOp::Event
-                | SemanticOp::ReadCycleCounter
+            Some(
+                SemanticOp::Add
+                | SemanticOp::Sub
+                | SemanticOp::And
+                | SemanticOp::Or
+                | SemanticOp::Xor
+                | SemanticOp::Shl
+                | SemanticOp::Srl
+                | SemanticOp::Sra
+                | SemanticOp::Copy
+                | SemanticOp::Cmp
+                | SemanticOp::Abs
+                | SemanticOp::Ctlz
+                | SemanticOp::Clb
+                | SemanticOp::Adc
+                | SemanticOp::Sbc
+                | SemanticOp::SignExtend
+                | SemanticOp::ZeroExtend
+                | SemanticOp::SetLt
+                | SemanticOp::SetUlt
+                | SemanticOp::SetLe
+                | SemanticOp::SetUle
+                | SemanticOp::SetGt
+                | SemanticOp::SetUgt
+                | SemanticOp::SetGe
+                | SemanticOp::SetUge
+                | SemanticOp::SetEq
+                | SemanticOp::SetNe
+                | SemanticOp::Select
+                | SemanticOp::SDiv
+                | SemanticOp::UDiv
+                | SemanticOp::SRem
+                | SemanticOp::Neg
+                | SemanticOp::Truncate
+                | SemanticOp::Event
+                | SemanticOp::ReadCycleCounter,
             ) if !self.is_vector => SlotIndex::Scalar0,
 
             // MAC/MatMul/Accumulate -> Accumulator slot
-            Some(SemanticOp::Mac | SemanticOp::MatMul | SemanticOp::MatMulSub
-                | SemanticOp::NegMatMul | SemanticOp::AddMac | SemanticOp::SubMac
-                | SemanticOp::Accumulate | SemanticOp::AccumSub
-                | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub) => SlotIndex::Accumulator,
+            Some(
+                SemanticOp::Mac
+                | SemanticOp::MatMul
+                | SemanticOp::MatMulSub
+                | SemanticOp::NegMatMul
+                | SemanticOp::AddMac
+                | SemanticOp::SubMac
+                | SemanticOp::Accumulate
+                | SemanticOp::AccumSub
+                | SemanticOp::AccumNegAdd
+                | SemanticOp::AccumNegSub,
+            ) => SlotIndex::Accumulator,
 
             // Load/PointerAdd/Cascade -> LoadA
-            Some(SemanticOp::Load | SemanticOp::PointerAdd | SemanticOp::PointerMov
-                | SemanticOp::CascadeRead | SemanticOp::CascadeWrite) => SlotIndex::LoadA,
+            Some(
+                SemanticOp::Load
+                | SemanticOp::PointerAdd
+                | SemanticOp::PointerMov
+                | SemanticOp::CascadeRead
+                | SemanticOp::CascadeWrite,
+            ) => SlotIndex::LoadA,
 
             // Store -> Store slot
             Some(SemanticOp::Store) => SlotIndex::Store,
 
             // Control flow and synchronization -> Control slot
-            Some(SemanticOp::Br | SemanticOp::BrCond | SemanticOp::Call | SemanticOp::Ret
-                | SemanticOp::LockAcquire | SemanticOp::LockRelease
-                | SemanticOp::DmaStart | SemanticOp::DmaWait
-                | SemanticOp::StreamRead | SemanticOp::StreamWrite
+            Some(
+                SemanticOp::Br
+                | SemanticOp::BrCond
+                | SemanticOp::Call
+                | SemanticOp::Ret
+                | SemanticOp::LockAcquire
+                | SemanticOp::LockRelease
+                | SemanticOp::DmaStart
+                | SemanticOp::DmaWait
+                | SemanticOp::StreamRead
+                | SemanticOp::StreamWrite
                 | SemanticOp::StreamWritePacketHeader
-                | SemanticOp::Halt | SemanticOp::Done) => SlotIndex::Control,
+                | SemanticOp::Halt
+                | SemanticOp::Done,
+            ) => SlotIndex::Control,
 
             // Vector ops -> Vector slot (catch-all for is_vector)
             _ if self.is_vector => SlotIndex::Vector,
@@ -362,7 +402,6 @@ impl SlotOp {
             _ => SlotIndex::Scalar0,
         }
     }
-
 }
 
 // Builder and query methods on SlotOp.
@@ -484,10 +523,7 @@ impl SlotOp {
     /// Check if this slot operation is a memory operation.
     #[inline]
     pub fn is_memory(&self) -> bool {
-        matches!(
-            self.semantic,
-            Some(SemanticOp::Load | SemanticOp::Store)
-        )
+        matches!(self.semantic, Some(SemanticOp::Load | SemanticOp::Store))
     }
 
     /// Check if this slot operation is a synchronization operation.
@@ -495,8 +531,12 @@ impl SlotOp {
     pub fn is_sync(&self) -> bool {
         matches!(
             self.semantic,
-            Some(SemanticOp::LockAcquire | SemanticOp::LockRelease
-                | SemanticOp::DmaStart | SemanticOp::DmaWait)
+            Some(
+                SemanticOp::LockAcquire
+                    | SemanticOp::LockRelease
+                    | SemanticOp::DmaStart
+                    | SemanticOp::DmaWait
+            )
         )
     }
 
