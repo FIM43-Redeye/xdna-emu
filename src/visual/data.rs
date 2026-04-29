@@ -266,6 +266,7 @@ mod tests {
             tiles: Vec::new(),
             stall_attributions: Vec::new(),
             cross_tile: None,
+            pc_anchored: std::collections::HashMap::new(),
         };
         let key = TileKey {
             col: 0,
@@ -292,6 +293,7 @@ mod tests {
             )],
             stall_attributions: Vec::new(),
             cross_tile: None,
+            pc_anchored: std::collections::HashMap::new(),
         };
         let missing_key = TileKey { col: 99, row: 99, pkt_type: 0 };
         assert_eq!(divergence_count(&batch, &missing_key), 0);

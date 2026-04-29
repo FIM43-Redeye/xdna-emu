@@ -32,6 +32,7 @@ fn usage() -> ! {
     eprintln!("  --stalls         Stall attribution (level stalls -> resolving events)");
     eprintln!("  --cross-tile     Cross-tile event correlation (edge-to-edge pairing)");
     eprintln!("  --remap-columns  Normalize physical cols to logical 0-indexed");
+    eprintln!("  --pc-anchored    PC-set/multiset diff + perfcnt cycle bands (mode-1 traces)");
     process::exit(1);
 }
 
@@ -87,6 +88,9 @@ fn main() {
             }
             "--remap-columns" => {
                 opts.remap_columns = true;
+            }
+            "--pc-anchored" => {
+                opts.pc_anchored = true;
             }
             "--help" | "-h" => usage(),
             other => {

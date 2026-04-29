@@ -10,7 +10,7 @@
 //! - **Sweep directory**: compare all batches from `trace-sweep.py`
 
 use serde::Deserialize;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::Path;
@@ -101,6 +101,10 @@ pub struct AnalysisOptions {
     /// Use for serial-vs-parallel HW traces where the driver assigns
     /// different physical columns to each run.
     pub remap_columns: bool,
+    /// Enable PC-anchored set/multiset diff and perfcnt cycle bands.
+    /// Applied to core tiles (pkt_type == 0) in mode-1 traces where
+    /// abs_cycle carries the PC at event fire time.
+    pub pc_anchored: bool,
 }
 
 impl AnalysisOptions {
@@ -111,12 +115,13 @@ impl AnalysisOptions {
             stalls: true,
             cross_tile: true,
             remap_columns: false,
+            pc_anchored: false,
         }
     }
 
     /// True if any extended analysis is enabled.
     pub fn any_enabled(&self) -> bool {
-        self.iterations || self.stalls || self.cross_tile
+        self.iterations || self.stalls || self.cross_tile || self.pc_anchored
     }
 }
 
@@ -262,6 +267,48 @@ pub struct CrossTileResult {
     pub correlations: Vec<CorrelationResult>,
 }
 
+// ============================================================================
+// PC-Anchored types (Task 7)
+// ============================================================================
+
+/// Cycle estimate derived from perfcnt overflow anchoring.
+///
+/// The perfcnt counter overflows at a fixed period, emitting a PC sample
+/// each time it wraps. We use those PC-stamped overflows to build a
+/// monotone clock: each overflow tick is one period. Any other event PC
+/// is linearly interpolated between the two bounding ticks.
+#[derive(Debug, Clone, Copy)]
+pub struct CycleBand {
+    /// Estimated cycle for this PC in the HW trace.
+    pub hw_cycle_est: u64,
+    /// Estimated cycle for this PC in the EMU trace.
+    pub emu_cycle_est: u64,
+    /// hw_cycle_est as i64 - emu_cycle_est as i64.
+    pub delta_cycles: i64,
+    /// True when |delta_cycles| > period / 2.
+    pub exceeds_tolerance: bool,
+}
+
+/// Per-tile PC-anchored comparison report.
+///
+/// Produced by `compare_pc_anchored_for_tile`. Covers one tile's
+/// mode-1 trace data for one HW/EMU batch pair.
+#[derive(Debug, Default, Clone)]
+pub struct PCAnchoredReport {
+    /// pkt_type from the TileKey (0 = Core, 3 = MemTile, etc.).
+    pub pkt_type: u32,
+    /// Per event-name PC set diff: (PCs only in HW, PCs only in EMU).
+    pub set_diff: HashMap<String, (HashSet<u64>, HashSet<u64>)>,
+    /// Per event-name multiset diff: PC -> (hw_count, emu_count, delta).
+    pub multiset_diff: HashMap<String, HashMap<u64, (u32, u32, i32)>>,
+    /// Per event-name, per-PC cycle band (populated when perfcnt slot found).
+    pub cycle_bands: HashMap<String, HashMap<u64, CycleBand>>,
+    /// Events dropped because abs_cycle == 0 (no-PC sentinel) on HW side.
+    pub unanchored_count_hw: usize,
+    /// Events dropped because abs_cycle == 0 (no-PC sentinel) on EMU side.
+    pub unanchored_count_emu: usize,
+}
+
 /// Comparison result for one tile.
 pub struct TileResult {
     pub hw_t0: u64,
@@ -281,6 +328,9 @@ pub struct BatchResult {
     pub stall_attributions: Vec<StallAttribution>,
     /// Cross-tile correlation (populated when AnalysisOptions.cross_tile is set).
     pub cross_tile: Option<CrossTileResult>,
+    /// PC-anchored set/multiset diff per tile (populated when
+    /// AnalysisOptions.pc_anchored is set). Keyed by TileKey.
+    pub pc_anchored: HashMap<TileKey, PCAnchoredReport>,
 }
 
 // ============================================================================
@@ -1408,6 +1458,217 @@ fn pair_events(src: &[u64], dst: &[u64]) -> Vec<CorrelationPair> {
 }
 
 // ============================================================================
+// PC-Anchored analysis (Task 7)
+// ============================================================================
+
+/// Candidate names for the perfcnt overflow event slot.
+///
+/// mlir-aie's trace injection may use either spelling depending on the
+/// version of the event table. We accept both and pick the first match.
+const PERFCNT_SLOT_NAMES: &[&str] = &["PERF_CNT_0", "PERF_CNT_0_EVENT"];
+
+/// Return true if this event name is the perfcnt overflow sentinel.
+fn is_perfcnt_event(name: &str) -> bool {
+    PERFCNT_SLOT_NAMES.contains(&name)
+}
+
+/// Linearly interpolate a cycle estimate from a sorted perfcnt PC sequence.
+///
+/// `perfcnt_pcs` is a sorted slice of PC values at which the perfcnt
+/// counter overflowed (one per overflow tick). Each tick corresponds to
+/// exactly `period` cycles. A PC that falls between tick[i-1] and tick[i]
+/// gets a fractional estimate by linear interpolation across that interval.
+///
+/// Returns 0 if `perfcnt_pcs` is empty or `pc` is before the first tick.
+pub fn interpolate_cycle_from_perfcnt(pc: u64, perfcnt_pcs: &[u64], period: u64) -> u64 {
+    if perfcnt_pcs.is_empty() {
+        return 0;
+    }
+    // partition_point returns the index of the first element >= pc.
+    let idx = perfcnt_pcs.partition_point(|&p| p < pc);
+    if idx == 0 {
+        // Before first tick: estimate 0.
+        return 0;
+    }
+    if idx >= perfcnt_pcs.len() {
+        // After last tick: clamp to last tick's cycle.
+        return (perfcnt_pcs.len() as u64 - 1) * period;
+    }
+    let pc_below = perfcnt_pcs[idx - 1];
+    let pc_above = perfcnt_pcs[idx];
+    // Avoid division by zero if two ticks have the same PC (degenerate case).
+    let span = pc_above.saturating_sub(pc_below).max(1);
+    let frac = (pc - pc_below) as f64 / span as f64;
+    ((idx as f64 - 1.0 + frac) * period as f64) as u64
+}
+
+/// Compare one tile's HW vs EMU mode-1 events using PC-set and multiset diff.
+///
+/// In mode-1 traces, `TileEvent.abs_cycle` carries the PC (program counter)
+/// at which the traced event fired, not an absolute cycle timestamp. The
+/// perfcnt overflow slot provides a deterministic PC clock: each overflow
+/// at a known PC corresponds to one `period` of elapsed cycles. We use
+/// those anchors to assign approximate cycle estimates to every other event.
+///
+/// Events with `abs_cycle == 0` are the "no-PC" sentinel emitted when the
+/// trace packet carried no PC information (mode-2 / fallback frames). They
+/// are excluded from the diff and counted separately.
+pub fn compare_pc_anchored_for_tile(
+    key: TileKey,
+    hw_events: &[TileEvent],
+    emu_events: &[TileEvent],
+    slot_names: &[String],
+) -> PCAnchoredReport {
+    let mut report = PCAnchoredReport {
+        pkt_type: key.pkt_type as u32,
+        ..Default::default()
+    };
+
+    // Partition anchored (abs_cycle > 0) vs unanchored (abs_cycle == 0).
+    let mut hw_anchored: Vec<&TileEvent> = Vec::new();
+    let mut emu_anchored: Vec<&TileEvent> = Vec::new();
+    for e in hw_events {
+        if e.abs_cycle == 0 {
+            report.unanchored_count_hw += 1;
+        } else {
+            hw_anchored.push(e);
+        }
+    }
+    for e in emu_events {
+        if e.abs_cycle == 0 {
+            report.unanchored_count_emu += 1;
+        } else {
+            emu_anchored.push(e);
+        }
+    }
+
+    // Group by event name (slot -> name lookup).
+    let mut hw_by_name: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut emu_by_name: HashMap<String, Vec<u64>> = HashMap::new();
+    for ev in &hw_anchored {
+        let name = slot_name(ev.slot, slot_names);
+        hw_by_name.entry(name).or_default().push(ev.abs_cycle);
+    }
+    for ev in &emu_anchored {
+        let name = slot_name(ev.slot, slot_names);
+        emu_by_name.entry(name).or_default().push(ev.abs_cycle);
+    }
+
+    // Sort each per-name list so set ops are deterministic.
+    for v in hw_by_name.values_mut() {
+        v.sort();
+    }
+    for v in emu_by_name.values_mut() {
+        v.sort();
+    }
+
+    // Collect all event names seen in either side.
+    let all_names: BTreeSet<String> = hw_by_name
+        .keys()
+        .chain(emu_by_name.keys())
+        .cloned()
+        .collect();
+
+    // Locate perfcnt overflow PCs from HW side (HW is ground truth).
+    // We use the first slot name that matches a known perfcnt spelling.
+    let perfcnt_name: Option<String> = all_names
+        .iter()
+        .find(|n| is_perfcnt_event(n.as_str()))
+        .cloned();
+
+    let hw_perfcnt_pcs: Vec<u64> = perfcnt_name
+        .as_ref()
+        .and_then(|n| hw_by_name.get(n))
+        .cloned()
+        .unwrap_or_default();
+    let emu_perfcnt_pcs: Vec<u64> = perfcnt_name
+        .as_ref()
+        .and_then(|n| emu_by_name.get(n))
+        .cloned()
+        .unwrap_or_default();
+
+    // Estimate perfcnt period from the median inter-overflow PC distance.
+    // Falls back to a wide default when there are fewer than 2 ticks.
+    let period: u64 = estimate_perfcnt_period(&hw_perfcnt_pcs)
+        .or_else(|| estimate_perfcnt_period(&emu_perfcnt_pcs))
+        .unwrap_or(1024);
+
+    // Set and multiset diff per event name.
+    for name in &all_names {
+        let hw_pcs: &[u64] = hw_by_name.get(name).map(|v| v.as_slice()).unwrap_or(&[]);
+        let emu_pcs: &[u64] = emu_by_name.get(name).map(|v| v.as_slice()).unwrap_or(&[]);
+
+        let hw_set: HashSet<u64> = hw_pcs.iter().copied().collect();
+        let emu_set: HashSet<u64> = emu_pcs.iter().copied().collect();
+
+        let hw_only: HashSet<u64> = hw_set.difference(&emu_set).copied().collect();
+        let emu_only: HashSet<u64> = emu_set.difference(&hw_set).copied().collect();
+        report
+            .set_diff
+            .insert(name.clone(), (hw_only, emu_only));
+
+        // Per-PC multiset diff: count occurrences on each side.
+        let union: HashSet<u64> = hw_set.union(&emu_set).copied().collect();
+        let mut multiset: HashMap<u64, (u32, u32, i32)> = HashMap::new();
+        for pc in union {
+            let hw_count = hw_pcs.iter().filter(|&&p| p == pc).count() as u32;
+            let emu_count = emu_pcs.iter().filter(|&&p| p == pc).count() as u32;
+            let delta = hw_count as i32 - emu_count as i32;
+            multiset.insert(pc, (hw_count, emu_count, delta));
+        }
+        report.multiset_diff.insert(name.clone(), multiset);
+
+        // Cycle bands: skip perfcnt slot itself (it IS the clock reference).
+        if perfcnt_name.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        if hw_perfcnt_pcs.is_empty() && emu_perfcnt_pcs.is_empty() {
+            continue;
+        }
+
+        // For every PC that appears in either side, interpolate cycle estimates.
+        let all_pcs: HashSet<u64> = hw_pcs.iter().chain(emu_pcs.iter()).copied().collect();
+        let tolerance = period / 2;
+        let mut bands: HashMap<u64, CycleBand> = HashMap::new();
+        for pc in all_pcs {
+            let hw_est = interpolate_cycle_from_perfcnt(pc, &hw_perfcnt_pcs, period);
+            let emu_est = interpolate_cycle_from_perfcnt(pc, &emu_perfcnt_pcs, period);
+            let delta = hw_est as i64 - emu_est as i64;
+            bands.insert(
+                pc,
+                CycleBand {
+                    hw_cycle_est: hw_est,
+                    emu_cycle_est: emu_est,
+                    delta_cycles: delta,
+                    exceeds_tolerance: delta.unsigned_abs() > tolerance,
+                },
+            );
+        }
+        if !bands.is_empty() {
+            report.cycle_bands.insert(name.clone(), bands);
+        }
+    }
+
+    report
+}
+
+/// Estimate the perfcnt overflow period from a sorted list of overflow PCs.
+///
+/// Takes the median inter-overflow PC distance. Returns `None` when fewer
+/// than 2 ticks are available.
+fn estimate_perfcnt_period(perfcnt_pcs: &[u64]) -> Option<u64> {
+    if perfcnt_pcs.len() < 2 {
+        return None;
+    }
+    let mut gaps: Vec<u64> = perfcnt_pcs
+        .windows(2)
+        .map(|w| w[1].saturating_sub(w[0]))
+        .collect();
+    gaps.sort();
+    Some(gaps[gaps.len() / 2])
+}
+
+// ============================================================================
 // Comparison (core)
 // ============================================================================
 
@@ -1572,12 +1833,32 @@ pub fn compare_batch_with_opts(
         None
     };
 
+    // PC-anchored analysis (core tiles only, pkt_type == 0).
+    let pc_anchored = if opts.pc_anchored {
+        let mut map = HashMap::new();
+        for key in hw_tiles.keys().chain(emu_tiles.keys()).copied().collect::<BTreeSet<_>>() {
+            // Only run on core tiles in mode-1 configuration.
+            if key.pkt_type != 0 {
+                continue;
+            }
+            let hw_ev = hw_tiles.get(&key).map(|v| v.as_slice()).unwrap_or(&[]);
+            let emu_ev = emu_tiles.get(&key).map(|v| v.as_slice()).unwrap_or(&[]);
+            let names = &config.core_events;
+            let report = compare_pc_anchored_for_tile(key, hw_ev, emu_ev, names);
+            map.insert(key, report);
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+
     Ok(BatchResult {
         batch_idx,
         config: config.clone(),
         tiles,
         stall_attributions,
         cross_tile,
+        pc_anchored,
     })
 }
 
@@ -2456,6 +2737,7 @@ mod tests {
         assert!(!opts.iterations);
         assert!(!opts.stalls);
         assert!(!opts.cross_tile);
+        assert!(!opts.pc_anchored);
         assert!(!opts.any_enabled());
     }
 
@@ -2465,6 +2747,16 @@ mod tests {
         assert!(opts.iterations);
         assert!(opts.stalls);
         assert!(opts.cross_tile);
+        assert!(!opts.pc_anchored); // pc_anchored is opt-in via --pc-anchored, not --extended
+        assert!(opts.any_enabled());
+    }
+
+    #[test]
+    fn test_analysis_options_pc_anchored_any_enabled() {
+        let opts = AnalysisOptions {
+            pc_anchored: true,
+            ..Default::default()
+        };
         assert!(opts.any_enabled());
     }
 
@@ -2477,10 +2769,165 @@ mod tests {
             tiles: Vec::new(),
             stall_attributions: Vec::new(),
             cross_tile: None,
+            pc_anchored: HashMap::new(),
         };
         let report = format_report(&[batch]);
         assert!(report.contains("Edge event types:"));
         assert!(report.contains("Level event types:"));
         assert!(report.contains("Batches:             1"));
+    }
+
+    // ---- PC-Anchored analysis tests (Task 7) ----
+
+    #[test]
+    fn pc_anchored_set_diff_finds_hw_only_and_emu_only() {
+        // HW: INSTR_VECTOR fires at PCs {100, 200, 300}
+        // EMU: INSTR_VECTOR fires at PCs {100, 250, 300}
+        // Expected hw_only={200}, emu_only={250}.
+        let hw_events = vec![
+            TileEvent { slot: 0, abs_cycle: 100 },
+            TileEvent { slot: 0, abs_cycle: 200 },
+            TileEvent { slot: 0, abs_cycle: 300 },
+        ];
+        let emu_events = vec![
+            TileEvent { slot: 0, abs_cycle: 100 },
+            TileEvent { slot: 0, abs_cycle: 250 },
+            TileEvent { slot: 0, abs_cycle: 300 },
+        ];
+        let names = vec!["INSTR_VECTOR".to_string()];
+        let key = TileKey { col: 0, row: 2, pkt_type: 0 };
+        let report = compare_pc_anchored_for_tile(key, &hw_events, &emu_events, &names);
+        let (hw_only, emu_only) = &report.set_diff["INSTR_VECTOR"];
+        assert_eq!(*hw_only, HashSet::from([200u64]));
+        assert_eq!(*emu_only, HashSet::from([250u64]));
+    }
+
+    #[test]
+    fn pc_anchored_multiset_diff_counts_repeated_pcs() {
+        // PC 100 fires twice on HW, once on EMU -> delta = +1.
+        // PC 200 fires once on each -> delta = 0.
+        let hw_events = vec![
+            TileEvent { slot: 0, abs_cycle: 100 },
+            TileEvent { slot: 0, abs_cycle: 100 },
+            TileEvent { slot: 0, abs_cycle: 200 },
+        ];
+        let emu_events = vec![
+            TileEvent { slot: 0, abs_cycle: 100 },
+            TileEvent { slot: 0, abs_cycle: 200 },
+        ];
+        let names = vec!["INSTR_VECTOR".to_string()];
+        let key = TileKey { col: 0, row: 2, pkt_type: 0 };
+        let report = compare_pc_anchored_for_tile(key, &hw_events, &emu_events, &names);
+        let ms = &report.multiset_diff["INSTR_VECTOR"];
+        let (hw_c, emu_c, delta) = ms[&100];
+        assert_eq!(hw_c, 2);
+        assert_eq!(emu_c, 1);
+        assert_eq!(delta, 1);
+        let (hw_c2, emu_c2, delta2) = ms[&200];
+        assert_eq!(hw_c2, 1);
+        assert_eq!(emu_c2, 1);
+        assert_eq!(delta2, 0);
+    }
+
+    #[test]
+    fn pc_anchored_unanchored_events_excluded_from_diff() {
+        // Events with abs_cycle == 0 are the "no-PC" sentinel: they should
+        // accumulate into unanchored_count_* and NOT appear in set_diff.
+        let hw_events = vec![
+            TileEvent { slot: 0, abs_cycle: 0 },   // unanchored
+            TileEvent { slot: 0, abs_cycle: 100 },
+        ];
+        let emu_events = vec![
+            TileEvent { slot: 0, abs_cycle: 0 },   // unanchored
+            TileEvent { slot: 0, abs_cycle: 0 },   // unanchored
+            TileEvent { slot: 0, abs_cycle: 100 },
+        ];
+        let names = vec!["INSTR_VECTOR".to_string()];
+        let key = TileKey { col: 0, row: 2, pkt_type: 0 };
+        let report = compare_pc_anchored_for_tile(key, &hw_events, &emu_events, &names);
+        assert_eq!(report.unanchored_count_hw, 1);
+        assert_eq!(report.unanchored_count_emu, 2);
+        // Only PC 100 should appear; zero should not be in set_diff.
+        let (hw_only, emu_only) = &report.set_diff["INSTR_VECTOR"];
+        assert!(hw_only.is_empty(), "no hw-only PCs expected");
+        assert!(emu_only.is_empty(), "no emu-only PCs expected");
+    }
+
+    #[test]
+    fn cycle_band_linear_interpolation() {
+        // perfcnt PCs at [10, 60, 110] correspond to cycles [0, 50, 100] (period=50).
+        // PC 35 is between tick[0]=10 and tick[1]=60.
+        // Linear: cycle ~= 0 + 50 * (35-10)/(60-10) = 25.
+        let perfcnt_pcs = vec![10u64, 60, 110];
+        let period = 50u64;
+        let est = interpolate_cycle_from_perfcnt(35, &perfcnt_pcs, period);
+        assert_eq!(est, 25);
+        // PC 85 is between tick[1]=60 and tick[2]=110.
+        // Linear: cycle ~= 50 + 50 * (85-60)/(110-60) = 75.
+        let est2 = interpolate_cycle_from_perfcnt(85, &perfcnt_pcs, period);
+        assert_eq!(est2, 75);
+    }
+
+    #[test]
+    fn cycle_band_boundary_cases() {
+        let perfcnt_pcs = vec![10u64, 60, 110];
+        let period = 50u64;
+        // Exactly at tick[0]: returns 0 cycles.
+        assert_eq!(interpolate_cycle_from_perfcnt(10, &perfcnt_pcs, period), 0);
+        // Exactly at tick[1]: returns 1 * 50 = 50 cycles.
+        assert_eq!(interpolate_cycle_from_perfcnt(60, &perfcnt_pcs, period), 50);
+        // Before first tick: returns 0.
+        assert_eq!(interpolate_cycle_from_perfcnt(5, &perfcnt_pcs, period), 0);
+        // After last tick: clamps to (len-1)*period = 100.
+        assert_eq!(interpolate_cycle_from_perfcnt(200, &perfcnt_pcs, period), 100);
+        // Empty perfcnt: always 0.
+        assert_eq!(interpolate_cycle_from_perfcnt(50, &[], period), 0);
+    }
+
+    #[test]
+    fn pc_anchored_cycle_bands_with_perfcnt_anchor() {
+        // Perfcnt slot (slot 1) fires at PCs [0x100, 0x200] -> period ~256.
+        // INSTR_VECTOR (slot 0) fires at PC 0x180 on HW, PC 0x180 on EMU.
+        // Both traces have the same perfcnt PCs -> delta_cycles == 0.
+        let hw_events = vec![
+            TileEvent { slot: 1, abs_cycle: 0x100 }, // perfcnt tick 0
+            TileEvent { slot: 1, abs_cycle: 0x200 }, // perfcnt tick 1
+            TileEvent { slot: 0, abs_cycle: 0x180 }, // INSTR_VECTOR
+        ];
+        let emu_events = vec![
+            TileEvent { slot: 1, abs_cycle: 0x100 }, // perfcnt tick 0
+            TileEvent { slot: 1, abs_cycle: 0x200 }, // perfcnt tick 1
+            TileEvent { slot: 0, abs_cycle: 0x180 }, // INSTR_VECTOR
+        ];
+        let names = vec!["INSTR_VECTOR".to_string(), "PERF_CNT_0".to_string()];
+        let key = TileKey { col: 0, row: 2, pkt_type: 0 };
+        let report = compare_pc_anchored_for_tile(key, &hw_events, &emu_events, &names);
+        // INSTR_VECTOR set diff should be empty (both see 0x180).
+        let (hw_only, emu_only) = &report.set_diff["INSTR_VECTOR"];
+        assert!(hw_only.is_empty());
+        assert!(emu_only.is_empty());
+        // Cycle band for INSTR_VECTOR at 0x180: delta_cycles should be 0.
+        let bands = report.cycle_bands.get("INSTR_VECTOR").expect("cycle_bands populated");
+        let band = bands[&0x180];
+        assert_eq!(band.delta_cycles, 0);
+        assert!(!band.exceeds_tolerance);
+    }
+
+    #[test]
+    fn pc_anchored_perfcnt_slot_name_variant() {
+        // Verify both spellings of the perfcnt event name are recognized.
+        assert!(is_perfcnt_event("PERF_CNT_0"));
+        assert!(is_perfcnt_event("PERF_CNT_0_EVENT"));
+        assert!(!is_perfcnt_event("INSTR_VECTOR"));
+        assert!(!is_perfcnt_event("PERF_CNT_1"));
+    }
+
+    #[test]
+    fn estimate_perfcnt_period_median() {
+        // Gaps: [90, 100, 110] -> sorted -> median = 100.
+        let pcs = vec![0u64, 90, 190, 300];
+        let period = estimate_perfcnt_period(&pcs).unwrap();
+        // Gaps: 90, 100, 110 -> median (idx 1 of 3) = 100.
+        assert_eq!(period, 100);
     }
 }
