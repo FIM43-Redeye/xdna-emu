@@ -33,10 +33,12 @@ impl InstructionDecoder {
     /// the cached instance for all subsequent calls. Each caller gets a clone
     /// with independent statistics.
     pub fn load_cached() -> Self {
-        CACHED_DECODER.get_or_init(|| {
-            log::info!("Initializing cached instruction decoder");
-            Self::load_fresh()
-        }).clone()
+        CACHED_DECODER
+            .get_or_init(|| {
+                log::info!("Initializing cached instruction decoder");
+                Self::load_fresh()
+            })
+            .clone()
     }
 
     /// Load a fresh decoder (not cached).
@@ -61,20 +63,14 @@ impl InstructionDecoder {
         // Build data-driven format table from composite format Inst fields
         let format_table = if output.composite_formats.iter().any(|f| !f.slot_maps.is_empty()) {
             let table = crate::interpreter::bundle::FormatTable::build(&output.composite_formats);
-            log::info!(
-                "Built data-driven format table: {} entries",
-                table.total_entries(),
-            );
+            log::info!("Built data-driven format table: {} entries", table.total_entries(),);
             Some(table)
         } else {
             log::warn!("No Inst-derived format layouts; falling back to hand-coded extraction");
             None
         };
 
-        let mut decoder = Self::from_tables_with_decoders(
-            output.encodings_by_slot,
-            output.decoder_tables,
-        );
+        let mut decoder = Self::from_tables_with_decoders(output.encodings_by_slot, output.decoder_tables);
         decoder.format_table = format_table;
 
         // Populate per-opcode metadata from LLVM's MCInstrDesc + itinerary model.

@@ -4,9 +4,7 @@
 //! element type, memory width, implicit registers, etc.).
 
 use crate::interpreter::bundle::{MemWidth, Operand, PostModify, SlotIndex, SlotOp};
-use xdna_archspec::aie2::isa::{
-    CompositeEncoder, InstrMemWidth, OperandType, RegisterKind, SemanticOp,
-};
+use xdna_archspec::aie2::isa::{CompositeEncoder, InstrMemWidth, OperandType, RegisterKind, SemanticOp};
 
 use super::decoder::{DecodedInstr, InstructionDecoder};
 
@@ -32,10 +30,14 @@ impl InstructionDecoder {
         // matching. The is_ptr_arithmetic flag (from mnemonic "padd*") corrects it.
         let effective_semantic = if enc.is_ptr_arithmetic {
             Some(SemanticOp::PointerAdd)
-        } else if enc.semantic.is_none() && dest.is_some() && (
-            enc.mnemonic == "mov" || enc.mnemonic == "mova"
-            || enc.mnemonic == "movx" || enc.mnemonic == "movxm"
-        ) && !enc.is_vector {
+        } else if enc.semantic.is_none()
+            && dest.is_some()
+            && (enc.mnemonic == "mov"
+                || enc.mnemonic == "mova"
+                || enc.mnemonic == "movx"
+                || enc.mnemonic == "movxm")
+            && !enc.is_vector
+        {
             // Move instructions that lack a Pat<> pattern (e.g., MOVX_mvx_scl
             // writes to a control register). LLVM marks these isMoveReg=1 or
             // isMoveImm=1 but the regex parser doesn't extract those flags.
@@ -68,15 +70,20 @@ impl InstructionDecoder {
         slot_op.is_vector = enc.is_vector;
         // Detect 512+ bit operations: any operand uses Vector512, Vector1024,
         // or a composite register that can encode x-registers (MvBMXSrc/Dst).
-        slot_op.is_wide_vector = enc.operand_fields.iter()
-            .any(|f| matches!(f.operand_type,
+        slot_op.is_wide_vector = enc.operand_fields.iter().any(|f| {
+            matches!(
+                f.operand_type,
                 OperandType::Register(RegisterKind::Vector512)
-                | OperandType::Register(RegisterKind::Vector1024)
-                | OperandType::CompositeRegister(CompositeEncoder::MvBMXSrc)
-                | OperandType::CompositeRegister(CompositeEncoder::MvBMXDst)
-                | OperandType::CompositeRegister(CompositeEncoder::ShflDst)));
+                    | OperandType::Register(RegisterKind::Vector1024)
+                    | OperandType::CompositeRegister(CompositeEncoder::MvBMXSrc)
+                    | OperandType::CompositeRegister(CompositeEncoder::MvBMXDst)
+                    | OperandType::CompositeRegister(CompositeEncoder::ShflDst)
+            )
+        });
         // Detect 1024-bit (y-register) operations for sparse MAC wide variants.
-        slot_op.is_quad_vector = enc.operand_fields.iter()
+        slot_op.is_quad_vector = enc
+            .operand_fields
+            .iter()
             .any(|f| f.operand_type == OperandType::Register(RegisterKind::Vector1024));
         slot_op.element_type = enc.element_type;
         slot_op.from_type = enc.from_type;

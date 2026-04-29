@@ -9,8 +9,7 @@ use xdna_archspec::aie2::isa::decoder_ffi::*;
 
 use crate::interpreter::bundle::slot::Operand;
 use crate::interpreter::state::{
-    LR_REG_INDEX, LS_REG_INDEX, LE_REG_INDEX, LC_REG_INDEX,
-    DP_REG_INDEX, CORE_ID_REG_INDEX, SP_PTR_INDEX,
+    LR_REG_INDEX, LS_REG_INDEX, LE_REG_INDEX, LC_REG_INDEX, DP_REG_INDEX, CORE_ID_REG_INDEX, SP_PTR_INDEX,
     MOD_BASE_M, MOD_BASE_DN, MOD_BASE_DJ, MOD_BASE_DC,
 };
 
@@ -81,53 +80,32 @@ fn parse_reg_name(name: &str) -> Option<(&str, u8)> {
 pub fn classify_reg_name(name: &str) -> Option<MappedOperand> {
     // Special registers (no trailing index).
     match name {
-        "lr" => return Some(MappedOperand {
-            operand: Operand::ScalarReg(LR_REG_INDEX),
-            accum_width: None,
-        }),
-        "SP" | "sp" => return Some(MappedOperand {
-            operand: Operand::PointerReg(SP_PTR_INDEX),
-            accum_width: None,
-        }),
-        "LS" | "ls" => return Some(MappedOperand {
-            operand: Operand::ScalarReg(LS_REG_INDEX),
-            accum_width: None,
-        }),
-        "LE" | "le" => return Some(MappedOperand {
-            operand: Operand::ScalarReg(LE_REG_INDEX),
-            accum_width: None,
-        }),
-        "LC" | "lc" => return Some(MappedOperand {
-            operand: Operand::ScalarReg(LC_REG_INDEX),
-            accum_width: None,
-        }),
-        "DP" | "dp" => return Some(MappedOperand {
-            operand: Operand::ScalarReg(DP_REG_INDEX),
-            accum_width: None,
-        }),
-        "CORE_ID" | "core_id" => return Some(MappedOperand {
-            operand: Operand::ScalarReg(CORE_ID_REG_INDEX),
-            accum_width: None,
-        }),
+        "lr" => return Some(MappedOperand { operand: Operand::ScalarReg(LR_REG_INDEX), accum_width: None }),
+        "SP" | "sp" => {
+            return Some(MappedOperand { operand: Operand::PointerReg(SP_PTR_INDEX), accum_width: None })
+        }
+        "LS" | "ls" => {
+            return Some(MappedOperand { operand: Operand::ScalarReg(LS_REG_INDEX), accum_width: None })
+        }
+        "LE" | "le" => {
+            return Some(MappedOperand { operand: Operand::ScalarReg(LE_REG_INDEX), accum_width: None })
+        }
+        "LC" | "lc" => {
+            return Some(MappedOperand { operand: Operand::ScalarReg(LC_REG_INDEX), accum_width: None })
+        }
+        "DP" | "dp" => {
+            return Some(MappedOperand { operand: Operand::ScalarReg(DP_REG_INDEX), accum_width: None })
+        }
+        "CORE_ID" | "core_id" => {
+            return Some(MappedOperand { operand: Operand::ScalarReg(CORE_ID_REG_INDEX), accum_width: None })
+        }
         // DMA 3D addressing descriptor registers (d0_3d - d3_3d).
         // These select 3D stride patterns for loads/stores. Map to ModifierReg
         // in the 3D descriptor range (indices 32-35).
-        "d0_3d" => return Some(MappedOperand {
-            operand: Operand::ModifierReg(32),
-            accum_width: None,
-        }),
-        "d1_3d" => return Some(MappedOperand {
-            operand: Operand::ModifierReg(33),
-            accum_width: None,
-        }),
-        "d2_3d" => return Some(MappedOperand {
-            operand: Operand::ModifierReg(34),
-            accum_width: None,
-        }),
-        "d3_3d" => return Some(MappedOperand {
-            operand: Operand::ModifierReg(35),
-            accum_width: None,
-        }),
+        "d0_3d" => return Some(MappedOperand { operand: Operand::ModifierReg(32), accum_width: None }),
+        "d1_3d" => return Some(MappedOperand { operand: Operand::ModifierReg(33), accum_width: None }),
+        "d2_3d" => return Some(MappedOperand { operand: Operand::ModifierReg(34), accum_width: None }),
+        "d3_3d" => return Some(MappedOperand { operand: Operand::ModifierReg(35), accum_width: None }),
         _ => {}
     }
 
@@ -137,25 +115,22 @@ pub fn classify_reg_name(name: &str) -> Option<MappedOperand> {
     //   crMCDEn=4, crPackSign=5, crRnd=6, crSCDEn=7,
     //   crSRSSign=8, crSat=9, crUPSSign=10, crUnpackSign=11
     let cr_id = match name {
-        "crVaddSign"   => Some(0u8),
-        "crF2FMask"    => Some(1),
-        "crF2IMask"    => Some(2),
-        "crFPMask"     => Some(3),
-        "crMCDEn"      => Some(4),
-        "crPackSign"   => Some(5),
-        "crRnd"        => Some(6),
-        "crSCDEn"      => Some(7),
-        "crSRSSign"    => Some(8),
-        "crSat"        => Some(9),
-        "crUPSSign"    => Some(10),
+        "crVaddSign" => Some(0u8),
+        "crF2FMask" => Some(1),
+        "crF2IMask" => Some(2),
+        "crFPMask" => Some(3),
+        "crMCDEn" => Some(4),
+        "crPackSign" => Some(5),
+        "crRnd" => Some(6),
+        "crSCDEn" => Some(7),
+        "crSRSSign" => Some(8),
+        "crSat" => Some(9),
+        "crUPSSign" => Some(10),
         "crUnpackSign" => Some(11),
         _ => None,
     };
     if let Some(id) = cr_id {
-        return Some(MappedOperand {
-            operand: Operand::ControlReg(id),
-            accum_width: None,
-        });
+        return Some(MappedOperand { operand: Operand::ControlReg(id), accum_width: None });
     }
 
     // Status registers -- currently no Operand variant for these.
@@ -209,7 +184,7 @@ pub fn classify_reg_name(name: &str) -> Option<MappedOperand> {
         "amhh" => Some(accum(Operand::AccumReg(idx * 2 + 1), AccumWidth::QuarterHigh)),
 
         // Modifier sub-registers.
-        "m"  => Some(simple(Operand::ModifierReg(MOD_BASE_M + idx))),
+        "m" => Some(simple(Operand::ModifierReg(MOD_BASE_M + idx))),
         "dn" => Some(simple(Operand::ModifierReg(MOD_BASE_DN + idx))),
         "dj" => Some(simple(Operand::ModifierReg(MOD_BASE_DJ + idx))),
         "dc" => Some(simple(Operand::ModifierReg(MOD_BASE_DC + idx))),
@@ -338,8 +313,7 @@ mod tests {
         let (mapped, unmapped) = reg_map_coverage();
 
         // LLVM knows ~135 physical registers for AIE2. We should map most of them.
-        assert!(mapped > 80,
-            "Should map 80+ registers from MCRegisterInfo, got {}", mapped);
+        assert!(mapped > 80, "Should map 80+ registers from MCRegisterInfo, got {}", mapped);
 
         // Unmapped registers are intentional (mask regs, DMA regs, status regs).
         // Verify the unmapped list contains expected categories.
@@ -357,8 +331,10 @@ mod tests {
         for (name, mapped) in &map.map {
             let direct = classify_reg_name(name);
             assert_eq!(
-                direct.as_ref(), Some(mapped),
-                "RegisterMap and classify_reg_name disagree for '{}'", name
+                direct.as_ref(),
+                Some(mapped),
+                "RegisterMap and classify_reg_name disagree for '{}'",
+                name
             );
         }
     }
@@ -368,19 +344,18 @@ mod tests {
         // operand_from_reg_name (HashMap path) should match classify_reg_name
         // for all known register names.
         let test_names = [
-            "r0", "r15", "r31", "p0", "p7", "lr", "SP", "LS", "LE", "LC", "DP",
-            "x0", "x4", "wl0", "wh3", "y2",
-            "bml0", "bmh0", "cm0", "cm3",
-            "amll0", "amhh1",
-            "m0", "dn3", "dj7", "dc0",
-            "crRnd", "crSat",
-            "s0",
+            "r0", "r15", "r31", "p0", "p7", "lr", "SP", "LS", "LE", "LC", "DP", "x0", "x4", "wl0", "wh3",
+            "y2", "bml0", "bmh0", "cm0", "cm3", "amll0", "amhh1", "m0", "dn3", "dj7", "dc0", "crRnd",
+            "crSat", "s0",
         ];
         for name in &test_names {
             let from_map = operand_from_reg_name(name);
             let from_classify = classify_reg_name(name);
-            assert_eq!(from_map, from_classify,
-                "Mismatch for '{}': map={:?} classify={:?}", name, from_map, from_classify);
+            assert_eq!(
+                from_map, from_classify,
+                "Mismatch for '{}': map={:?} classify={:?}",
+                name, from_map, from_classify
+            );
         }
     }
 
@@ -540,15 +515,14 @@ mod tests {
     fn test_unmapped_regs_never_appear_as_explicit_operands() {
         use xdna_archspec::aie2::isa::decoder_ffi::{DecodedOperand, Slot, decode_slot};
         let (_, unmapped) = reg_map_coverage();
-        let unmapped_set: std::collections::HashSet<&str> =
-            unmapped.iter().map(|s| s.as_str()).collect();
+        let unmapped_set: std::collections::HashSet<&str> = unmapped.iter().map(|s| s.as_str()).collect();
 
         let slots = [
             (Slot::Alu, 20u64),
             (Slot::Lda, 21),
             (Slot::Ldb, 16),
-            (Slot::Mv,  22),
-            (Slot::St,  21),
+            (Slot::Mv, 22),
+            (Slot::St, 21),
             (Slot::Vec, 26),
         ];
 
@@ -578,10 +552,7 @@ mod tests {
             for h in &hits {
                 eprintln!("  {}", h);
             }
-            panic!(
-                "{} unmapped register(s) appear as explicit operands -- need mapping",
-                hits.len()
-            );
+            panic!("{} unmapped register(s) appear as explicit operands -- need mapping", hits.len());
         }
     }
 
@@ -590,19 +561,14 @@ mod tests {
     #[test]
     fn test_llvm_decode_operands_map_correctly() {
         use xdna_archspec::aie2::isa::decoder_ffi::{DecodedOperand, Slot, decode_slot};
-        let decoded = decode_slot(Slot::Mv, 0x028C3D)
-            .expect("VPUSH_HI_32 should decode");
+        let decoded = decode_slot(Slot::Mv, 0x028C3D).expect("VPUSH_HI_32 should decode");
         assert_eq!(decoded.name, "VPUSH_HI_32");
 
         let mut mapped = 0;
         for op in &decoded.operands {
             if let DecodedOperand::Reg { name, .. } = op {
                 let result = operand_from_reg_name(name);
-                assert!(
-                    result.is_some(),
-                    "LLVM register '{}' should map to an Operand",
-                    name,
-                );
+                assert!(result.is_some(), "LLVM register '{}' should map to an Operand", name,);
                 mapped += 1;
             }
         }

@@ -21,15 +21,9 @@
 
 use std::collections::HashMap;
 
-use crate::interpreter::bundle::{
-    ExtractedBundle, Operand, SlotIndex, SlotOp, VliwBundle,
-    extract_slots,
-};
+use crate::interpreter::bundle::{ExtractedBundle, Operand, SlotIndex, SlotOp, VliwBundle, extract_slots};
 use crate::interpreter::traits::{DecodeError, Decoder};
-use xdna_archspec::aie2::isa::{
-    DecoderIndex, InstrEncoding, SemanticOp,
-    decoder_ffi,
-};
+use xdna_archspec::aie2::isa::{DecoderIndex, InstrEncoding, SemanticOp, decoder_ffi};
 
 /// A decoded instruction from TableGen data.
 #[derive(Debug, Clone)]
@@ -54,11 +48,7 @@ impl DecodedInstr {
     /// Get an operand as a signed immediate.
     pub fn signed_imm(&self, name: &str) -> Option<i32> {
         // Find the field to get its width for sign extension
-        let field = self
-            .encoding
-            .operand_fields
-            .iter()
-            .find(|f| f.name == name)?;
+        let field = self.encoding.operand_fields.iter().find(|f| f.name == name)?;
         let value = self.operand(name)?;
 
         if field.signed {
@@ -174,44 +164,60 @@ impl InstructionDecoder {
             );
         }
         // Branch: LLVM says Branch but we don't have Br/BrCond?
-        if info.is_branch() && !matches!(semantic,
-            SemanticOp::Br | SemanticOp::BrCond | SemanticOp::Call | SemanticOp::Ret
-        ) {
+        if info.is_branch()
+            && !matches!(semantic, SemanticOp::Br | SemanticOp::BrCond | SemanticOp::Call | SemanticOp::Ret)
+        {
             log::warn!(
                 "[semantic-flag mismatch] {} (opcode {}): LLVM says Branch but SemanticOp::{:?}",
-                op.encoding_name.as_deref().unwrap_or("?"), opcode, semantic,
+                op.encoding_name.as_deref().unwrap_or("?"),
+                opcode,
+                semantic,
             );
         }
         // Call: LLVM says Call but we don't?
         if info.is_call() && !matches!(semantic, SemanticOp::Call) {
             log::warn!(
                 "[semantic-flag mismatch] {} (opcode {}): LLVM says Call but SemanticOp::{:?}",
-                op.encoding_name.as_deref().unwrap_or("?"), opcode, semantic,
+                op.encoding_name.as_deref().unwrap_or("?"),
+                opcode,
+                semantic,
             );
         }
         // Return: LLVM says Return but we don't?
         if info.is_return() && !matches!(semantic, SemanticOp::Ret) {
             log::warn!(
                 "[semantic-flag mismatch] {} (opcode {}): LLVM says Return but SemanticOp::{:?}",
-                op.encoding_name.as_deref().unwrap_or("?"), opcode, semantic,
+                op.encoding_name.as_deref().unwrap_or("?"),
+                opcode,
+                semantic,
             );
         }
 
         // Reverse: we say Load but LLVM says no MayLoad?
         // (Skip pointer ops and cascade reads -- they use the load slot but
         // aren't memory loads in LLVM's sense.)
-        if info.is_load() && !matches!(semantic,
-            SemanticOp::Load | SemanticOp::PointerAdd | SemanticOp::PointerMov
-            | SemanticOp::CascadeRead | SemanticOp::CascadeWrite
-            | SemanticOp::Copy
-        ) && !matches!(semantic,
-            // Intrinsics and vector ops that load (UPS, etc.) may have MayLoad
-            // from LLVM but aren't SemanticOp::Load. That's expected.
-            SemanticOp::Ups | SemanticOp::Intrinsic(_)
-        ) {
+        if info.is_load()
+            && !matches!(
+                semantic,
+                SemanticOp::Load
+                    | SemanticOp::PointerAdd
+                    | SemanticOp::PointerMov
+                    | SemanticOp::CascadeRead
+                    | SemanticOp::CascadeWrite
+                    | SemanticOp::Copy
+            )
+            && !matches!(
+                semantic,
+                // Intrinsics and vector ops that load (UPS, etc.) may have MayLoad
+                // from LLVM but aren't SemanticOp::Load. That's expected.
+                SemanticOp::Ups | SemanticOp::Intrinsic(_)
+            )
+        {
             log::debug!(
                 "[semantic-flag note] {} (opcode {}): LLVM MayLoad but SemanticOp::{:?}",
-                op.encoding_name.as_deref().unwrap_or("?"), opcode, semantic,
+                op.encoding_name.as_deref().unwrap_or("?"),
+                opcode,
+                semantic,
             );
         }
     }
@@ -278,10 +284,7 @@ impl InstructionDecoder {
 
         // O(1) lookup via DecoderIndex
         if let Some((encoding, operands)) = self.index.decode_slot(slot_name, bits) {
-            return Some(DecodedInstr {
-                encoding: encoding.clone(),
-                operands,
-            });
+            return Some(DecodedInstr { encoding: encoding.clone(), operands });
         }
 
         None
@@ -293,10 +296,7 @@ impl Decoder for InstructionDecoder {
         use crate::interpreter::bundle::SlotType;
 
         if bytes.len() < 2 {
-            return Err(DecodeError::Incomplete {
-                needed: 2,
-                have: bytes.len(),
-            });
+            return Err(DecodeError::Incomplete { needed: 2, have: bytes.len() });
         }
 
         // Detect format from the low nibble
@@ -312,10 +312,7 @@ impl Decoder for InstructionDecoder {
             } else if bytes.len() >= 2 {
                 u16::from_le_bytes([bytes[0], bytes[1]]) as u32
             } else {
-                return Err(DecodeError::Incomplete {
-                    needed: 2,
-                    have: bytes.len(),
-                });
+                return Err(DecodeError::Incomplete { needed: 2, have: bytes.len() });
             };
 
             // Special case: all zeros is a NOP regardless of format marker
@@ -324,10 +321,7 @@ impl Decoder for InstructionDecoder {
                 bytes.len().min(4)
             } else {
                 // Not enough data and not a NOP
-                return Err(DecodeError::Incomplete {
-                    needed: bundle_size,
-                    have: bytes.len(),
-                });
+                return Err(DecodeError::Incomplete { needed: bundle_size, have: bytes.len() });
             }
         } else {
             bundle_size
@@ -342,7 +336,13 @@ impl Decoder for InstructionDecoder {
             static DECODE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let count = DECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if count < 20 {
-                log::trace!("[DECODE#{}] PC=0x{:04X} format={:?} slots={}", count, pc, format, extracted.slots.len());
+                log::trace!(
+                    "[DECODE#{}] PC=0x{:04X} format={:?} slots={}",
+                    count,
+                    pc,
+                    format,
+                    extracted.slots.len()
+                );
                 for s in &extracted.slots {
                     log::trace!("  slot: {:?} bits=0x{:010X}", s.slot_type, s.bits);
                 }
@@ -375,15 +375,19 @@ impl Decoder for InstructionDecoder {
                 // discriminator bits that build_bundle_32 re-adds.
                 if slot.slot_type == SlotType::Nop {
                     bundle.set_slot(SlotOp::nop(slot_index));
-                } else if let Some((decoded, dest, sources, extracted_pm, ffi_opcode, extra_defs,
-                                     accum_width)) =
-                    self.try_decode_via_ffi(slot.bits, slot.slot_type)
+                } else if let Some((
+                    decoded,
+                    dest,
+                    sources,
+                    extracted_pm,
+                    ffi_opcode,
+                    extra_defs,
+                    accum_width,
+                )) = self.try_decode_via_ffi(slot.bits, slot.slot_type)
                 {
                     // LLVM FFI is the sole production decoder for both instruction
                     // identification and operand extraction.
-                    let mut slot_op = self.build_slot_op(
-                        slot_index, &decoded, dest, sources, extracted_pm,
-                    );
+                    let mut slot_op = self.build_slot_op(slot_index, &decoded, dest, sources, extracted_pm);
                     slot_op.llvm_opcode = ffi_opcode;
                     slot_op.accum_width = accum_width;
                     // Attach secondary destinations (e.g., cmp register for
@@ -417,8 +421,12 @@ impl Decoder for InstructionDecoder {
                     bundle.set_slot(slot_op);
                 } else {
                     // Slot extracted but not recognized - mark as unknown with slot info
-                    log::warn!("[{:?} DECODE FAIL] PC=0x{:04X} bits=0x{:010X} - no matching encoding",
-                        slot.slot_type, pc, slot.bits);
+                    log::warn!(
+                        "[{:?} DECODE FAIL] PC=0x{:04X} bits=0x{:010X} - no matching encoding",
+                        slot.slot_type,
+                        pc,
+                        slot.bits
+                    );
                     let slot_name = match slot.slot_type {
                         SlotType::Lda => "lda",
                         SlotType::Ldb => "ldb",
@@ -460,10 +468,7 @@ impl Decoder for InstructionDecoder {
 
     fn instruction_size(&self, bytes: &[u8]) -> Result<u8, DecodeError> {
         if bytes.len() < 2 {
-            return Err(DecodeError::Incomplete {
-                needed: 2,
-                have: bytes.len(),
-            });
+            return Err(DecodeError::Incomplete { needed: 2, have: bytes.len() });
         }
 
         // Use the format marker to determine size
@@ -477,10 +482,7 @@ impl Decoder for InstructionDecoder {
             } else if bytes.len() >= 2 {
                 u16::from_le_bytes([bytes[0], bytes[1]]) as u32
             } else {
-                return Err(DecodeError::Incomplete {
-                    needed: 2,
-                    have: bytes.len(),
-                });
+                return Err(DecodeError::Incomplete { needed: 2, have: bytes.len() });
             };
 
             // All zeros or known NOP patterns: treat as 4-byte
@@ -531,8 +533,8 @@ mod tests {
         }
 
         // Load decoder with bytecode tables (the only real decode path)
-        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
-            .expect("Failed to load via tblgen");
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
 
         let encoding_count = decoder.decoder_index().all_encodings().count();
         eprintln!("Loaded {} encodings", encoding_count);
@@ -545,11 +547,7 @@ mod tests {
 
         // Get stats
         let (decode_count, unknown_count) = decoder.stats();
-        eprintln!(
-            "Decoder stats: {} decoded, {} unknown",
-            decode_count,
-            unknown_count
-        );
+        eprintln!("Decoder stats: {} decoded, {} unknown", decode_count, unknown_count);
     }
 
     #[test]
@@ -570,8 +568,8 @@ mod tests {
         }
 
         // Load decoder with bytecode tables
-        let decoder = InstructionDecoder::try_load_via_tblgen(&llvm_aie_path)
-            .expect("Failed to load via tblgen");
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(&llvm_aie_path).expect("Failed to load via tblgen");
 
         // Read ELF using proper parser
         let elf_data = std::fs::read(&elf_path).expect("Failed to read ELF");
@@ -654,10 +652,7 @@ mod tests {
 
         // We expect some unknowns - this is a real binary!
         // But we should decode SOMETHING
-        assert!(
-            decoded_count + unknown_count > 0,
-            "Should have processed some instructions"
-        );
+        assert!(decoded_count + unknown_count > 0, "Should have processed some instructions");
     }
 
     #[test]
@@ -667,18 +662,21 @@ mod tests {
             eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
             return;
         }
-        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
-            .expect("Failed to load via tblgen");
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
 
         // done instruction: bytes from llvm-objdump, encodes to ALU slot
         let done_bytes: [u8; 4] = [0x19, 0x08, 0x00, 0x10];
         let bundle = decoder.decode(&done_bytes, 0xbc).expect("Should decode 'done'");
 
-        let has_halt = bundle.active_slots().any(|s|
-            matches!(s.semantic, Some(SemanticOp::Halt) | Some(SemanticOp::Done))
+        let has_halt = bundle
+            .active_slots()
+            .any(|s| matches!(s.semantic, Some(SemanticOp::Halt) | Some(SemanticOp::Done)));
+        assert!(
+            has_halt,
+            "done instruction must decode to SemanticOp::Halt or Done, got: {:?}",
+            bundle.active_slots().map(|s| format!("{:?}", s.semantic)).collect::<Vec<_>>()
         );
-        assert!(has_halt, "done instruction must decode to SemanticOp::Halt or Done, got: {:?}",
-            bundle.active_slots().map(|s| format!("{:?}", s.semantic)).collect::<Vec<_>>());
     }
 
     #[test]
@@ -688,22 +686,23 @@ mod tests {
             eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
             return;
         }
-        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
-            .expect("Failed to load via tblgen");
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
 
         // REL r0, r1 from Chess listing: bytes 0x10 0x10 0x12 0x19
         // (memory order, decoder reads with from_le_bytes)
         let rel_bytes: [u8; 4] = [0x19, 0x12, 0x10, 0x10];
         let bundle = decoder.decode(&rel_bytes, 0x250).expect("Should decode 'rel'");
 
-        let has_lock_release = bundle.active_slots().any(|s|
-            matches!(s.semantic, Some(SemanticOp::LockRelease))
+        let has_lock_release = bundle
+            .active_slots()
+            .any(|s| matches!(s.semantic, Some(SemanticOp::LockRelease)));
+        let slot_semantics: Vec<_> = bundle.active_slots().map(|s| format!("{:?}", s.semantic)).collect();
+        assert!(
+            has_lock_release,
+            "REL instruction must decode to SemanticOp::LockRelease, got: {:?}",
+            slot_semantics
         );
-        let slot_semantics: Vec<_> = bundle.active_slots()
-            .map(|s| format!("{:?}", s.semantic))
-            .collect();
-        assert!(has_lock_release,
-            "REL instruction must decode to SemanticOp::LockRelease, got: {:?}", slot_semantics);
     }
 
     #[test]
@@ -713,21 +712,22 @@ mod tests {
             eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
             return;
         }
-        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
-            .expect("Failed to load via tblgen");
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
 
         // ACQ r0, r1 from Chess listing: bytes 0x10 0x12 0x12 0x19
         let acq_bytes: [u8; 4] = [0x19, 0x12, 0x12, 0x10];
         let bundle = decoder.decode(&acq_bytes, 0x230).expect("Should decode 'acq'");
 
-        let has_lock_acquire = bundle.active_slots().any(|s|
-            matches!(s.semantic, Some(SemanticOp::LockAcquire))
+        let has_lock_acquire = bundle
+            .active_slots()
+            .any(|s| matches!(s.semantic, Some(SemanticOp::LockAcquire)));
+        let slot_semantics: Vec<_> = bundle.active_slots().map(|s| format!("{:?}", s.semantic)).collect();
+        assert!(
+            has_lock_acquire,
+            "ACQ instruction must decode to SemanticOp::LockAcquire, got: {:?}",
+            slot_semantics
         );
-        let slot_semantics: Vec<_> = bundle.active_slots()
-            .map(|s| format!("{:?}", s.semantic))
-            .collect();
-        assert!(has_lock_acquire,
-            "ACQ instruction must decode to SemanticOp::LockAcquire, got: {:?}", slot_semantics);
     }
 
     #[test]
@@ -739,37 +739,25 @@ mod tests {
         }
 
         // Load decoder via tblgen
-        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
-            .expect("Failed to load via tblgen");
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
 
         let index = decoder.decoder_index();
         let encoding_count = index.all_encodings().count();
         eprintln!("Loaded {} encodings via tblgen", encoding_count);
 
         // Verify we loaded many encodings
-        assert!(
-            encoding_count > 100,
-            "Should have loaded many encodings"
-        );
+        assert!(encoding_count > 100, "Should have loaded many encodings");
 
         // Verify ACQ instructions are distinguished
         let acq_imm = index.all_encodings().find(|e| e.name == "ACQ_mLockId_imm");
         let acq_reg = index.all_encodings().find(|e| e.name == "ACQ_mLockId_reg");
 
         if let (Some(imm), Some(reg)) = (acq_imm, acq_reg) {
-            eprintln!(
-                "ACQ_mLockId_imm: mask=0x{:05X}, bits=0x{:05X}",
-                imm.fixed_mask, imm.fixed_bits
-            );
-            eprintln!(
-                "ACQ_mLockId_reg: mask=0x{:05X}, bits=0x{:05X}",
-                reg.fixed_mask, reg.fixed_bits
-            );
+            eprintln!("ACQ_mLockId_imm: mask=0x{:05X}, bits=0x{:05X}", imm.fixed_mask, imm.fixed_bits);
+            eprintln!("ACQ_mLockId_reg: mask=0x{:05X}, bits=0x{:05X}", reg.fixed_mask, reg.fixed_bits);
 
-            assert_ne!(
-                imm.fixed_bits, reg.fixed_bits,
-                "ACQ instructions should have different fixed bits"
-            );
+            assert_ne!(imm.fixed_bits, reg.fixed_bits, "ACQ instructions should have different fixed bits");
         }
 
         // Test NOP decoding still works
@@ -781,9 +769,11 @@ mod tests {
     // === Composite Register LUT Integration Tests ===
     /// Decode an 80-bit VLIW bundle and return (mnemonic, dest, sources) for each slot.
     /// Helper for the bundle decode diagnosis tests below.
-    fn decode_80bit_bundle_slots(decoder: &InstructionDecoder, bytes: &[u8], _pc: u32)
-        -> Vec<(String, Option<Operand>, Vec<Operand>)>
-    {
+    fn decode_80bit_bundle_slots(
+        decoder: &InstructionDecoder,
+        bytes: &[u8],
+        _pc: u32,
+    ) -> Vec<(String, Option<Operand>, Vec<Operand>)> {
         use crate::interpreter::bundle::SlotType;
 
         let extracted = decoder.extract_bundle_slots(bytes);
@@ -820,8 +810,8 @@ mod tests {
             eprintln!("Skipping test: llvm-aie not found");
             return;
         }
-        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
-            .expect("Failed to load via tblgen");
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
 
         // First, show raw slot extraction
         use crate::interpreter::bundle::extract_slots;
@@ -857,7 +847,10 @@ mod tests {
         // Now drill into the MV slot specifically to see field details
         eprintln!("\n=== MV slot deep dive ===");
         for (label, ext) in [("add_314", &ext_314), ("add_one", &ext_one)] {
-            let mv_slot = ext.slots.iter().find(|s| s.slot_type == crate::interpreter::bundle::SlotType::Mv);
+            let mv_slot = ext
+                .slots
+                .iter()
+                .find(|s| s.slot_type == crate::interpreter::bundle::SlotType::Mv);
             if let Some(mv) = mv_slot {
                 eprintln!("{} MV bits: 0x{:06X} ({:022b})", label, mv.bits, mv.bits);
                 if let Some(decoded) = decoder.decode_slot_bits(mv.bits, mv.slot_type) {
@@ -865,9 +858,16 @@ mod tests {
                     eprintln!("  operand fields:");
                     for field in &decoded.encoding.operand_fields {
                         let raw = decoded.operand(&field.name).unwrap_or(0);
-                        eprintln!("    {}: raw={} (0x{:X}), bit_pos={}, width={}, signed={}, type={:?}",
-                            field.name, raw, raw, field.bit_position, field.width, field.signed,
-                            field.operand_type);
+                        eprintln!(
+                            "    {}: raw={} (0x{:X}), bit_pos={}, width={}, signed={}, type={:?}",
+                            field.name,
+                            raw,
+                            raw,
+                            field.bit_position,
+                            field.width,
+                            field.signed,
+                            field.operand_type
+                        );
                     }
                     eprintln!("  input_order: {:?}", decoded.encoding.input_order);
                     eprintln!("  output_order: {:?}", decoded.encoding.output_order);
@@ -876,7 +876,11 @@ mod tests {
         }
 
         // Verify the key assertion: add_314 MV slot should decode to mov r6, #6
-        let mv_314 = ext_314.slots.iter().find(|s| s.slot_type == crate::interpreter::bundle::SlotType::Mv).unwrap();
+        let mv_314 = ext_314
+            .slots
+            .iter()
+            .find(|s| s.slot_type == crate::interpreter::bundle::SlotType::Mv)
+            .unwrap();
         let decoded_mv_314 = decoder.decode_slot_bits(mv_314.bits, mv_314.slot_type).unwrap();
         let (dest, sources, _, _) = decoder.extract_operands(&decoded_mv_314);
         assert_eq!(dest, Some(Operand::ScalarReg(6)), "Expected dest=r6");
@@ -903,8 +907,8 @@ mod tests {
             eprintln!("Skipping test: llvm-aie not found");
             return;
         }
-        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
-            .expect("Failed to load via tblgen");
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
 
         // Helper: build a 42-bit LNG slot word for movxm
         let build_movxm = |imm: u32, dst_enc: u8| -> u64 {
@@ -917,7 +921,8 @@ mod tests {
         // Case 1: movxm r3, #0x7ff
         // r3 in MvSclSrc: encode = (3 << 2) | 0b00 = 12
         let bits = build_movxm(0x7ff, 12);
-        let decoded = decoder.decode_slot_bits(bits, SlotType::Lng)
+        let decoded = decoder
+            .decode_slot_bits(bits, SlotType::Lng)
             .expect("Should decode movxm r3, #0x7ff");
         assert_eq!(decoded.encoding.mnemonic, "movxm");
         let (dest, sources, _, _) = decoder.extract_operands(&decoded);
@@ -927,7 +932,8 @@ mod tests {
         // Case 2: movxm p2, #0x100
         // p2 in MvSclSrc: encode = (2 << 4) | 0b0011 = 35
         let bits = build_movxm(0x100, 35);
-        let decoded = decoder.decode_slot_bits(bits, SlotType::Lng)
+        let decoded = decoder
+            .decode_slot_bits(bits, SlotType::Lng)
             .expect("Should decode movxm p2, #0x100");
         let (dest, sources, _, _) = decoder.extract_operands(&decoded);
         assert_eq!(dest, Some(Operand::PointerReg(2)));
@@ -936,10 +942,15 @@ mod tests {
         // Case 3: movxm sp, #0x70000
         // SP in MvSclSrc: HWEncoding = 103 = (12 << 3) | 0b111
         let bits = build_movxm(0x70000, 103);
-        let decoded = decoder.decode_slot_bits(bits, SlotType::Lng)
+        let decoded = decoder
+            .decode_slot_bits(bits, SlotType::Lng)
             .expect("Should decode movxm sp, #0x70000");
         let (dest, sources, _, _) = decoder.extract_operands(&decoded);
-        assert_eq!(dest, Some(Operand::PointerReg(crate::interpreter::state::SP_PTR_INDEX)), "SP should map to dedicated SP");
+        assert_eq!(
+            dest,
+            Some(Operand::PointerReg(crate::interpreter::state::SP_PTR_INDEX)),
+            "SP should map to dedicated SP"
+        );
         assert_eq!(sources, vec![Operand::Immediate(0x70000)]);
 
         // Case 4: movxm lr, #0x1234
@@ -949,11 +960,15 @@ mod tests {
         // checks bits[2:0] == 0b111 first, correctly routing to
         // ScalarReg(LR_REG_INDEX).
         let bits = build_movxm(0x1234, 39);
-        let decoded = decoder.decode_slot_bits(bits, SlotType::Lng)
+        let decoded = decoder
+            .decode_slot_bits(bits, SlotType::Lng)
             .expect("Should decode movxm lr, #0x1234");
         let (dest, sources, _, _) = decoder.extract_operands(&decoded);
-        assert_eq!(dest, Some(Operand::ScalarReg(LR_REG_INDEX)),
-            "lr must decode as ScalarReg(LR), not PointerReg(2)");
+        assert_eq!(
+            dest,
+            Some(Operand::ScalarReg(LR_REG_INDEX)),
+            "lr must decode as ScalarReg(LR), not PointerReg(2)"
+        );
         assert_eq!(sources, vec![Operand::Immediate(0x1234)]);
     }
 
@@ -971,7 +986,11 @@ mod tests {
         let make_load_enc = |slot: &str, is_vector: bool| -> InstrEncoding {
             InstrEncoding {
                 name: format!("TEST_LOAD_{}", slot),
-                mnemonic: if is_vector { format!("v{}", slot) } else { slot.to_string() },
+                mnemonic: if is_vector {
+                    format!("v{}", slot)
+                } else {
+                    slot.to_string()
+                },
                 asm_string: String::new(),
                 slot: slot.to_string(),
                 width: 20,
@@ -985,7 +1004,11 @@ mod tests {
                 output_order: vec![],
                 implicit_regs: vec![],
                 addressing_mode: AddressingMode::Unknown,
-                mem_width: if is_vector { InstrMemWidth::Vector256 } else { InstrMemWidth::Word },
+                mem_width: if is_vector {
+                    InstrMemWidth::Vector256
+                } else {
+                    InstrMemWidth::Word
+                },
                 has_complete_decoder: true,
                 element_type: None,
                 from_type: None,
@@ -993,34 +1016,25 @@ mod tests {
                 is_vector,
                 select_variant: None,
                 is_ptr_arithmetic: false,
-            is_sp_relative: false,
+                is_sp_relative: false,
                 sched_class: None,
             }
         };
 
         // Vector load A (slot=lda, is_vector=true) -> Load + is_vector
-        let decoded_vlda = DecodedInstr {
-            encoding: make_load_enc("lda", true),
-            operands: HashMap::new(),
-        };
+        let decoded_vlda = DecodedInstr { encoding: make_load_enc("lda", true), operands: HashMap::new() };
         let op = decoder.build_slot_op(SlotIndex::LoadA, &decoded_vlda, None, vec![], None);
         assert_eq!(op.semantic, Some(SemanticOp::Load));
         assert!(op.is_vector, "slot=lda + is_vector should produce vector Load");
 
         // Vector load B (slot=ldb, is_vector=true) -> Load + is_vector
-        let decoded_vldb = DecodedInstr {
-            encoding: make_load_enc("ldb", true),
-            operands: HashMap::new(),
-        };
+        let decoded_vldb = DecodedInstr { encoding: make_load_enc("ldb", true), operands: HashMap::new() };
         let op = decoder.build_slot_op(SlotIndex::LoadB, &decoded_vldb, None, vec![], None);
         assert_eq!(op.semantic, Some(SemanticOp::Load));
         assert!(op.is_vector, "slot=ldb + is_vector should produce vector Load");
 
         // Scalar load in lda slot (is_vector=false) -> Load + !is_vector
-        let decoded_scl = DecodedInstr {
-            encoding: make_load_enc("lda", false),
-            operands: HashMap::new(),
-        };
+        let decoded_scl = DecodedInstr { encoding: make_load_enc("lda", false), operands: HashMap::new() };
         let op = decoder.build_slot_op(SlotIndex::LoadA, &decoded_scl, None, vec![], None);
         assert_eq!(op.semantic, Some(SemanticOp::Load));
         assert!(!op.is_vector, "slot=lda + !is_vector should produce scalar Load");
@@ -1030,10 +1044,7 @@ mod tests {
         store_enc.semantic = Some(SemanticOp::Store);
         store_enc.may_load = false;
         store_enc.may_store = true;
-        let decoded_vst = DecodedInstr {
-            encoding: store_enc,
-            operands: HashMap::new(),
-        };
+        let decoded_vst = DecodedInstr { encoding: store_enc, operands: HashMap::new() };
         let op = decoder.build_slot_op(SlotIndex::Store, &decoded_vst, None, vec![], None);
         assert_eq!(op.semantic, Some(SemanticOp::Store));
         assert!(op.is_vector, "slot=st + is_vector should produce vector Store");
@@ -1088,36 +1099,37 @@ mod tests {
         operands.insert("ptr".to_string(), 3u64);
         operands.insert("imm".to_string(), 5u64);
 
-        let decoded = DecodedInstr {
-            encoding: padd_enc,
-            operands,
-        };
+        let decoded = DecodedInstr { encoding: padd_enc, operands };
 
         let (dest, sources, _post_modify, _) = decoder.extract_operands(&decoded);
 
         // PADD: ptr becomes destination, imm becomes source
-        assert_eq!(dest, Some(Operand::PointerReg(3)),
-            "PADD should produce PointerReg destination");
-        assert!(sources.iter().any(|s| matches!(s, Operand::Immediate(5))),
-            "PADD should have immediate source, got {:?}", sources);
+        assert_eq!(dest, Some(Operand::PointerReg(3)), "PADD should produce PointerReg destination");
+        assert!(
+            sources.iter().any(|s| matches!(s, Operand::Immediate(5))),
+            "PADD should have immediate source, got {:?}",
+            sources
+        );
 
         // Verify that a non-padd encoding with same fields produces Memory operand
         let mut load_enc = decoded.encoding.clone();
         load_enc.is_ptr_arithmetic = false;
         load_enc.name = "LDA_test".to_string();
         load_enc.mnemonic = "lda".to_string();
-        let load_decoded = DecodedInstr {
-            encoding: load_enc,
-            operands: decoded.operands.clone(),
-        };
+        let load_decoded = DecodedInstr { encoding: load_enc, operands: decoded.operands.clone() };
 
         let (dest, sources, _, _) = decoder.extract_operands(&load_decoded);
 
         // Non-padd: ptr+imm combine into Memory operand as source
-        assert!(dest.is_none() || !matches!(dest, Some(Operand::PointerReg(3))),
-            "Non-PADD should not produce PointerReg destination");
-        assert!(sources.iter().any(|s| matches!(s, Operand::Memory { base: 3, offset: 5 })),
-            "Non-PADD should produce Memory source, got {:?}", sources);
+        assert!(
+            dest.is_none() || !matches!(dest, Some(Operand::PointerReg(3))),
+            "Non-PADD should not produce PointerReg destination"
+        );
+        assert!(
+            sources.iter().any(|s| matches!(s, Operand::Memory { base: 3, offset: 5 })),
+            "Non-PADD should produce Memory source, got {:?}",
+            sources
+        );
     }
 
     /// Regression test: LDA instruction must not be overwritten by LDB NOP.
@@ -1135,48 +1147,35 @@ mod tests {
             eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
             return;
         }
-        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
-            .expect("Failed to load via tblgen");
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
 
         // Raw 128-bit bundle from add_314_using_dma_op at PC=0x2A0:
         // nopb; mova r0, #0x30; nops; movx r1, #0x1; mov r20, p7; nopv
-        let bytes: [u8; 16] = [
-            0xc0, 0x03, 0x00, 0x28, 0x3b, 0x87, 0x2a, 0x10,
-            0x00, 0x00, 0x00, 0x08, 0x00, 0x06, 0x00, 0x00,
-        ];
+        let bytes: [u8; 16] =
+            [0xc0, 0x03, 0x00, 0x28, 0x3b, 0x87, 0x2a, 0x10, 0x00, 0x00, 0x00, 0x08, 0x00, 0x06, 0x00, 0x00];
 
         let bundle = decoder.decode(&bytes, 0x2A0).expect("Should decode 128-bit bundle");
         assert_eq!(bundle.size(), 16);
 
         // LoadA slot must contain the mova instruction (LDA slot).
-        let load_a = bundle.slot(SlotIndex::LoadA)
-            .expect("LoadA slot should be present");
-        assert!(
-            !load_a.is_nop(),
-            "LoadA slot should have mova r0, #0x30"
-        );
-        assert_eq!(load_a.dest, Some(Operand::ScalarReg(0)),
-            "mova destination should be r0");
+        let load_a = bundle.slot(SlotIndex::LoadA).expect("LoadA slot should be present");
+        assert!(!load_a.is_nop(), "LoadA slot should have mova r0, #0x30");
+        assert_eq!(load_a.dest, Some(Operand::ScalarReg(0)), "mova destination should be r0");
         assert_eq!(load_a.sources.len(), 1, "mova should have one source");
-        assert_eq!(load_a.sources[0], Operand::Immediate(0x30),
-            "mova source should be immediate 0x30");
+        assert_eq!(load_a.sources[0], Operand::Immediate(0x30), "mova source should be immediate 0x30");
 
         // LoadB slot should be NOP (nopb = LDB NOP).
-        let load_b = bundle.slot(SlotIndex::LoadB)
-            .expect("LoadB slot should be present (NOP)");
+        let load_b = bundle.slot(SlotIndex::LoadB).expect("LoadB slot should be present (NOP)");
         assert!(load_b.is_nop(), "LoadB slot should be NOP (nopb)");
 
         // Scalar0 (ALU) should have movx r1, #0x1
-        let scalar0 = bundle.slot(SlotIndex::Scalar0)
-            .expect("Scalar0 slot should be present");
-        assert_eq!(scalar0.dest, Some(Operand::ScalarReg(1)),
-            "movx destination should be r1");
+        let scalar0 = bundle.slot(SlotIndex::Scalar0).expect("Scalar0 slot should be present");
+        assert_eq!(scalar0.dest, Some(Operand::ScalarReg(1)), "movx destination should be r1");
 
         // Scalar1 (MV) should have mov r20, p7
-        let scalar1 = bundle.slot(SlotIndex::Scalar1)
-            .expect("Scalar1 slot should be present");
-        assert_eq!(scalar1.dest, Some(Operand::ScalarReg(20)),
-            "mov destination should be r20");
+        let scalar1 = bundle.slot(SlotIndex::Scalar1).expect("Scalar1 slot should be present");
+        assert_eq!(scalar1.dest, Some(Operand::ScalarReg(20)), "mov destination should be r20");
     }
 
     /// Helper: create a minimal vector encoding with the given mnemonic.
@@ -1218,10 +1217,7 @@ mod tests {
     fn dispatch_semantic(mnemonic: &str, semantic: SemanticOp) -> SlotOp {
         let mut enc = make_vec_encoding(mnemonic);
         enc.semantic = Some(semantic);
-        let decoded = DecodedInstr {
-            encoding: enc,
-            operands: HashMap::new(),
-        };
+        let decoded = DecodedInstr { encoding: enc, operands: HashMap::new() };
         let decoder = InstructionDecoder::load_default();
         decoder.build_slot_op(SlotIndex::Vector, &decoded, None, vec![], None)
     }
@@ -1229,9 +1225,14 @@ mod tests {
     /// Helper: assert a dispatch result matches expected SemanticOp.
     fn assert_sem(mnemonic: &str, semantic: SemanticOp) {
         let op = dispatch_semantic(mnemonic, semantic);
-        assert_eq!(op.semantic, Some(semantic),
+        assert_eq!(
+            op.semantic,
+            Some(semantic),
             "mnemonic '{}' with {:?} should dispatch correctly, got {:?}",
-            mnemonic, semantic, op.semantic);
+            mnemonic,
+            semantic,
+            op.semantic
+        );
     }
 
     #[test]
@@ -1358,8 +1359,8 @@ mod tests {
             return;
         };
 
-        let objdump_path = std::path::PathBuf::from(Config::get().llvm_aie_path())
-            .join("build/bin/llvm-objdump");
+        let objdump_path =
+            std::path::PathBuf::from(Config::get().llvm_aie_path()).join("build/bin/llvm-objdump");
         if !objdump_path.exists() {
             eprintln!(
                 "Skipping test_crossref_integration: llvm-objdump not found at {}",
@@ -1369,15 +1370,11 @@ mod tests {
         }
 
         let decoder = InstructionDecoder::load_default();
-        let report = cross_reference_elf(&elf_path, &objdump_path, &decoder)
-            .expect("Cross-reference failed");
+        let report = cross_reference_elf(&elf_path, &objdump_path, &decoder).expect("Cross-reference failed");
 
         eprintln!("{}", report);
 
-        assert!(
-            report.total_instructions > 0,
-            "Should decode at least one instruction"
-        );
+        assert!(report.total_instructions > 0, "Should decode at least one instruction");
 
         // Require >= 95% match rate, leaving room for known mnemonic
         // normalization gaps (dot-suffixed variants, NOP aliasing, etc.)
@@ -1460,7 +1457,6 @@ mod tests {
         let mut divergence_details: Vec<String> = Vec::new();
 
         for path in &elf_paths {
-
             let data = std::fs::read(&path).unwrap();
             let elf = match goblin::elf::Elf::parse(&data) {
                 Ok(e) => e,
@@ -1473,7 +1469,9 @@ mod tests {
                 }
                 let start = section.sh_offset as usize;
                 let end = start + section.sh_size as usize;
-                if end > data.len() { continue; }
+                if end > data.len() {
+                    continue;
+                }
 
                 let code = &data[start..end];
                 let mut offset = 0;
@@ -1481,7 +1479,9 @@ mod tests {
                 while offset + 4 <= code.len() {
                     let format = crate::interpreter::bundle::detect_format(&code[offset..]);
                     let size = format.size_bytes() as usize;
-                    if offset + size > code.len() { break; }
+                    if offset + size > code.len() {
+                        break;
+                    }
 
                     let extracted = decoder.extract_bundle_slots(&code[offset..offset + size]);
 
@@ -1492,14 +1492,16 @@ mod tests {
                         total += 1;
 
                         let ffi_result = decoder.try_decode_via_ffi(slot.bits, slot.slot_type);
-                        let legacy_result = decoder.decode_slot_bits(slot.bits, slot.slot_type)
-                            .map(|d| {
-                                let (dest, sources, pm, _extra) = decoder.extract_operands(&d);
-                                (d, dest, sources, pm)
-                            });
+                        let legacy_result = decoder.decode_slot_bits(slot.bits, slot.slot_type).map(|d| {
+                            let (dest, sources, pm, _extra) = decoder.extract_operands(&d);
+                            (d, dest, sources, pm)
+                        });
 
                         match (ffi_result, legacy_result) {
-                            (Some((_, ffi_dest, ffi_src, ffi_pm, _, _, _)), Some((_, leg_dest, leg_src, leg_pm))) => {
+                            (
+                                Some((_, ffi_dest, ffi_src, ffi_pm, _, _, _)),
+                                Some((_, leg_dest, leg_src, leg_pm)),
+                            ) => {
                                 ffi_hits += 1;
                                 if ffi_dest == leg_dest && ffi_src == leg_src && ffi_pm == leg_pm {
                                     matches += 1;
@@ -1515,7 +1517,9 @@ mod tests {
                                     }
                                 }
                             }
-                            (None, Some(_)) => { ffi_misses += 1; }
+                            (None, Some(_)) => {
+                                ffi_misses += 1;
+                            }
                             _ => {}
                         }
                     }
@@ -1527,15 +1531,22 @@ mod tests {
 
         eprintln!("\n=== FFI vs Legacy Cross-Validation ===");
         eprintln!("Total slot decodes:    {}", total);
-        eprintln!("FFI hits:              {} ({:.1}%)", ffi_hits,
-            if total > 0 { 100.0 * ffi_hits as f64 / total as f64 } else { 0.0 });
+        eprintln!(
+            "FFI hits:              {} ({:.1}%)",
+            ffi_hits,
+            if total > 0 {
+                100.0 * ffi_hits as f64 / total as f64
+            } else {
+                0.0
+            }
+        );
         eprintln!("FFI misses (fallback): {}", ffi_misses);
         eprintln!("Operand matches:       {}", matches);
         eprintln!("Operand divergences:   {}", divergences);
 
         // Categorize divergences.
-        let mut cat_store_dest = 0u64;  // Store: FFI dest=None, legacy has ModifierReg dest
-        let mut cat_ptr_arith = 0u64;   // Pointer arith: FFI has extra PointerReg in sources
+        let mut cat_store_dest = 0u64; // Store: FFI dest=None, legacy has ModifierReg dest
+        let mut cat_ptr_arith = 0u64; // Pointer arith: FFI has extra PointerReg in sources
         let mut cat_memory_offset = 0u64; // Memory offset differs
         let mut cat_missing_memory = 0u64; // FFI has raw operands, legacy has Memory{}
         let mut cat_post_modify = 0u64; // PostModify differs
@@ -1543,29 +1554,45 @@ mod tests {
 
         // Re-scan to categorize (the details vec was capped at 20)
         for path in &elf_paths {
-            let data = match std::fs::read(path) { Ok(d) => d, Err(_) => continue };
-            let elf = match goblin::elf::Elf::parse(&data) { Ok(e) => e, Err(_) => continue };
+            let data = match std::fs::read(path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let elf = match goblin::elf::Elf::parse(&data) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
             for section in &elf.section_headers {
-                if section.sh_flags & 0x4 == 0 { continue; }
+                if section.sh_flags & 0x4 == 0 {
+                    continue;
+                }
                 let start = section.sh_offset as usize;
                 let end = start + section.sh_size as usize;
-                if end > data.len() { continue; }
+                if end > data.len() {
+                    continue;
+                }
                 let code = &data[start..end];
                 let mut offset = 0;
                 while offset + 4 <= code.len() {
                     let format = crate::interpreter::bundle::detect_format(&code[offset..]);
                     let size = format.size_bytes() as usize;
-                    if offset + size > code.len() { break; }
+                    if offset + size > code.len() {
+                        break;
+                    }
                     let extracted = decoder.extract_bundle_slots(&code[offset..offset + size]);
                     for slot in &extracted.slots {
-                        if slot.slot_type == SlotType::Nop || slot.bits == 0 { continue; }
+                        if slot.slot_type == SlotType::Nop || slot.bits == 0 {
+                            continue;
+                        }
                         let ffi = decoder.try_decode_via_ffi(slot.bits, slot.slot_type);
                         let leg = decoder.decode_slot_bits(slot.bits, slot.slot_type).map(|d| {
                             let (dest, sources, pm, _) = decoder.extract_operands(&d);
                             (d, dest, sources, pm)
                         });
                         if let (Some((_, fd, fs, fp, _, _, _)), Some((_, ld, ls, lp))) = (ffi, leg) {
-                            if fd == ld && fs == ls && fp == lp { continue; }
+                            if fd == ld && fs == ls && fp == lp {
+                                continue;
+                            }
                             // Categorize
                             if ld.is_some() && fd.is_none() && matches!(ld, Some(Operand::ModifierReg(_))) {
                                 cat_store_dest += 1;
@@ -1633,8 +1660,9 @@ mod tests {
                     if let Ok(entries) = std::fs::read_dir(dir) {
                         for entry in entries.flatten() {
                             let path = entry.path();
-                            if path.is_dir() { collect_elfs(&path, out); }
-                            else if path.extension().map(|e| e == "elf" || e == "o").unwrap_or(false) {
+                            if path.is_dir() {
+                                collect_elfs(&path, out);
+                            } else if path.extension().map(|e| e == "elf" || e == "o").unwrap_or(false) {
                                 out.push(path);
                             }
                         }
@@ -1645,7 +1673,7 @@ mod tests {
         }
         // Also check bridge test ELFs
         let bridge_elf = std::path::Path::new(
-            "../mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie_arch.mlir.prj/main_core_0_2.elf"
+            "../mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie_arch.mlir.prj/main_core_0_2.elf",
         );
         if bridge_elf.exists() {
             elf_paths.push(bridge_elf.to_path_buf());
@@ -1655,28 +1683,48 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
 
         for path in &elf_paths {
-            let data = match std::fs::read(path) { Ok(d) => d, Err(_) => continue };
-            let elf = match goblin::elf::Elf::parse(&data) { Ok(e) => e, Err(_) => continue };
+            let data = match std::fs::read(path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let elf = match goblin::elf::Elf::parse(&data) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
             for section in &elf.section_headers {
-                if section.sh_flags & 0x4 == 0 { continue; }
+                if section.sh_flags & 0x4 == 0 {
+                    continue;
+                }
                 let start = section.sh_offset as usize;
                 let end = start + section.sh_size as usize;
-                if end > data.len() { continue; }
+                if end > data.len() {
+                    continue;
+                }
                 let code = &data[start..end];
                 let mut offset = 0;
                 while offset + 4 <= code.len() {
                     let format = crate::interpreter::bundle::detect_format(&code[offset..]);
                     let size = format.size_bytes() as usize;
-                    if offset + size > code.len() { break; }
+                    if offset + size > code.len() {
+                        break;
+                    }
                     let extracted = decoder.extract_bundle_slots(&code[offset..offset + size]);
                     for slot in &extracted.slots {
-                        if slot.slot_type == SlotType::Nop || slot.bits == 0 { continue; }
-                        if !matches!(slot.slot_type, SlotType::Lda | SlotType::Ldb) { continue; }
+                        if slot.slot_type == SlotType::Nop || slot.bits == 0 {
+                            continue;
+                        }
+                        if !matches!(slot.slot_type, SlotType::Lda | SlotType::Ldb) {
+                            continue;
+                        }
 
                         let ffi_slot = InstructionDecoder::slot_type_to_ffi(slot.slot_type);
-                        if ffi_slot.is_none() { continue; }
+                        if ffi_slot.is_none() {
+                            continue;
+                        }
                         let raw = decoder_ffi::decode_slot(ffi_slot.unwrap(), slot.bits);
-                        if raw.is_none() { continue; }
+                        if raw.is_none() {
+                            continue;
+                        }
                         let raw = raw.unwrap();
 
                         // Only show post-modify instructions
@@ -1689,17 +1737,32 @@ mod tests {
                             },
                             enc_name,
                         );
-                        if encoding.is_none() { continue; }
+                        if encoding.is_none() {
+                            continue;
+                        }
                         let encoding = encoding.unwrap();
-                        if !matches!(encoding.addressing_mode,
+                        if !matches!(
+                            encoding.addressing_mode,
                             AddressingMode::PostModifyImmediate | AddressingMode::PostModifyRegister
-                        ) { continue; }
+                        ) {
+                            continue;
+                        }
 
-                        let key = format!("{} nd={} ops={:?}", enc_name, raw.num_defs,
-                            raw.operands.iter().map(|o| match o {
-                                xdna_archspec::aie2::isa::decoder_ffi::DecodedOperand::Reg { name, .. } => format!("Reg({})", name),
-                                xdna_archspec::aie2::isa::decoder_ffi::DecodedOperand::Imm(v) => format!("Imm({})", v),
-                            }).collect::<Vec<_>>()
+                        let key = format!(
+                            "{} nd={} ops={:?}",
+                            enc_name,
+                            raw.num_defs,
+                            raw.operands
+                                .iter()
+                                .map(|o| match o {
+                                    xdna_archspec::aie2::isa::decoder_ffi::DecodedOperand::Reg {
+                                        name,
+                                        ..
+                                    } => format!("Reg({})", name),
+                                    xdna_archspec::aie2::isa::decoder_ffi::DecodedOperand::Imm(v) =>
+                                        format!("Imm({})", v),
+                                })
+                                .collect::<Vec<_>>()
                         );
                         if seen.insert(key.clone()) {
                             eprintln!("{}", key);
@@ -1729,10 +1792,14 @@ mod tests {
         let decoder = InstructionDecoder::load_default();
 
         for section in &elf.section_headers {
-            if section.sh_flags & 0x4 == 0 { continue; }
+            if section.sh_flags & 0x4 == 0 {
+                continue;
+            }
             let start = section.sh_offset as usize;
             let end = start + section.sh_size as usize;
-            if end > data.len() { continue; }
+            if end > data.len() {
+                continue;
+            }
             let code = &data[start..end];
             let mut offset = 0;
             let mut instr_num = 0;
@@ -1740,11 +1807,15 @@ mod tests {
             while offset + 4 <= code.len() {
                 let format = crate::interpreter::bundle::detect_format(&code[offset..]);
                 let size = format.size_bytes() as usize;
-                if offset + size > code.len() { break; }
+                if offset + size > code.len() {
+                    break;
+                }
 
                 let extracted = decoder.extract_bundle_slots(&code[offset..offset + size]);
                 for slot in &extracted.slots {
-                    if slot.slot_type == SlotType::Nop || slot.bits == 0 { continue; }
+                    if slot.slot_type == SlotType::Nop || slot.bits == 0 {
+                        continue;
+                    }
                     instr_num += 1;
 
                     let ffi = decoder.try_decode_via_ffi(slot.bits, slot.slot_type);
@@ -1754,16 +1825,24 @@ mod tests {
                         (name, dest, sources, pm)
                     });
 
-                    let ffi_name = ffi.as_ref().map(|(d, _, _, _, _, _, _)| d.encoding.name.as_str()).unwrap_or("FAIL");
+                    let ffi_name = ffi
+                        .as_ref()
+                        .map(|(d, _, _, _, _, _, _)| d.encoding.name.as_str())
+                        .unwrap_or("FAIL");
                     let leg_name = leg.as_ref().map(|(n, _, _, _)| n.as_str()).unwrap_or("FAIL");
 
-                    let ffi_ops = ffi.as_ref().map(|(_, d, s, p, _, _, _)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
-                    let leg_ops = leg.as_ref().map(|(_, d, s, p)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
+                    let ffi_ops = ffi
+                        .as_ref()
+                        .map(|(_, d, s, p, _, _, _)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
+                    let leg_ops =
+                        leg.as_ref().map(|(_, d, s, p)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
 
                     let status = if ffi_ops == leg_ops { "OK" } else { "DIFF" };
 
-                    eprintln!("[{:3}] {:?} 0x{:010X} {} name_ffi={} name_leg={}",
-                        instr_num, slot.slot_type, slot.bits, status, ffi_name, leg_name);
+                    eprintln!(
+                        "[{:3}] {:?} 0x{:010X} {} name_ffi={} name_leg={}",
+                        instr_num, slot.slot_type, slot.bits, status, ffi_name, leg_name
+                    );
                     if status == "DIFF" {
                         eprintln!("  FFI:    {}", ffi_ops.unwrap_or_default());
                         eprintln!("  LEGACY: {}", leg_ops.unwrap_or_default());
@@ -1809,7 +1888,9 @@ mod tests {
             let bits = enc.fixed_bits;
             if let Some(ffi_result) = decoder_ffi::decode_slot(ffi_slot, bits) {
                 if let Some(info) = decoder.get_instr_info(ffi_result.opcode) {
-                    if info.flags == 0 { continue; } // No flags to validate.
+                    if info.flags == 0 {
+                        continue;
+                    } // No flags to validate.
 
                     let semantic = enc.semantic.unwrap();
 
@@ -1847,8 +1928,8 @@ mod tests {
             eprintln!("Skipping test: llvm-aie not found");
             return;
         }
-        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
-            .expect("Failed to load via tblgen");
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
 
         // vbcstshfl.8 x0, r0, r29 = 0x180027b9
         // MV bits = (0x180027b9 >> 5) & 0x3FFFFF = 0x00013D
@@ -1859,7 +1940,10 @@ mod tests {
         // Try native decoder
         let native_result = decoder.decode_slot_bits(mv_bits, SlotType::Mv);
         if let Some(decoded) = &native_result {
-            eprintln!("Native decode: name={:?} mnemonic={:?}", decoded.encoding.name, decoded.encoding.mnemonic);
+            eprintln!(
+                "Native decode: name={:?} mnemonic={:?}",
+                decoded.encoding.name, decoded.encoding.mnemonic
+            );
         } else {
             eprintln!("Native decode: FAILED");
         }
@@ -1867,8 +1951,10 @@ mod tests {
         // Try FFI decoder
         let ffi_result = decoder.try_decode_via_ffi(mv_bits, SlotType::Mv);
         if let Some((decoded, dest, sources, _, _, _, _)) = &ffi_result {
-            eprintln!("FFI decode: name={:?} mnemonic={:?} dest={:?} sources={:?}",
-                decoded.encoding.name, decoded.encoding.mnemonic, dest, sources);
+            eprintln!(
+                "FFI decode: name={:?} mnemonic={:?} dest={:?} sources={:?}",
+                decoded.encoding.name, decoded.encoding.mnemonic, dest, sources
+            );
         } else {
             eprintln!("FFI decode: FAILED");
         }
@@ -1880,8 +1966,10 @@ mod tests {
                 for (i, slot) in bundle.slots().iter().enumerate() {
                     if let Some(ref op) = slot {
                         if !op.is_nop() {
-                            eprintln!("Bundle slot {}: semantic={:?} encoding={:?} is_vector={}",
-                                i, op.semantic, op.encoding_name, op.is_vector);
+                            eprintln!(
+                                "Bundle slot {}: semantic={:?} encoding={:?} is_vector={}",
+                                i, op.semantic, op.encoding_name, op.is_vector
+                            );
                         }
                     }
                 }
@@ -1890,8 +1978,7 @@ mod tests {
         }
 
         // The instruction should decode as VBCSTSHFL_8 with VectorBroadcast semantic
-        assert!(ffi_result.is_some() || native_result.is_some(),
-            "VBCSTSHFL_8 should be decodable");
+        assert!(ffi_result.is_some() || native_result.is_some(), "VBCSTSHFL_8 should be decodable");
     }
 
     /// Debug test: check VMAXDIFF_LT_S16 FFI operand ordering.
@@ -1906,7 +1993,11 @@ mod tests {
         let decoder = InstructionDecoder::load_default();
 
         let bundle = decoder.decode(&bundle_bytes, 0).expect("decode bundle");
-        let mv_slot = bundle.slots().iter().flatten().find(|s| !s.is_nop())
+        let mv_slot = bundle
+            .slots()
+            .iter()
+            .flatten()
+            .find(|s| !s.is_nop())
             .expect("should have a non-NOP slot");
 
         eprintln!("Encoding: {:?}", mv_slot.encoding_name);
@@ -1919,15 +2010,12 @@ mod tests {
         assert_eq!(mv_slot.encoding_name.as_deref(), Some("vmaxdiff_lt.s16"));
 
         // dest should be x0 = VectorReg(0)
-        assert_eq!(mv_slot.dest, Some(Operand::VectorReg(0)),
-            "dest should be x0");
+        assert_eq!(mv_slot.dest, Some(Operand::VectorReg(0)), "dest should be x0");
 
         // sources[0] should be s1=x2 = VectorReg(4), sources[1] should be s2=x0 = VectorReg(0)
         assert!(mv_slot.sources.len() >= 2, "should have 2 sources");
-        assert_eq!(mv_slot.sources[0], Operand::VectorReg(4),
-            "sources[0] should be s1=x2 (VectorReg(4))");
-        assert_eq!(mv_slot.sources[1], Operand::VectorReg(0),
-            "sources[1] should be s2=x0 (VectorReg(0))");
+        assert_eq!(mv_slot.sources[0], Operand::VectorReg(4), "sources[0] should be s1=x2 (VectorReg(4))");
+        assert_eq!(mv_slot.sources[1], Operand::VectorReg(0), "sources[1] should be s2=x0 (VectorReg(0))");
     }
 
     /// Debug test: check VFLOOR_S32_BF16 operand layout.
@@ -1939,7 +2027,11 @@ mod tests {
         let decoder = InstructionDecoder::load_default();
 
         let bundle = decoder.decode(&bundle_bytes, 0).expect("decode bundle");
-        let slot = bundle.slots().iter().flatten().find(|s| !s.is_nop())
+        let slot = bundle
+            .slots()
+            .iter()
+            .flatten()
+            .find(|s| !s.is_nop())
             .expect("should have a non-NOP slot");
 
         eprintln!("Encoding: {:?}", slot.encoding_name);
@@ -1958,10 +2050,14 @@ mod tests {
         // Also check ST slot FFI decode directly
         let st_bits: u64 = 0x000001;
         let ffi_result = xdna_archspec::aie2::isa::decoder_ffi::decode_slot(
-            xdna_archspec::aie2::isa::decoder_ffi::Slot::St, st_bits);
+            xdna_archspec::aie2::isa::decoder_ffi::Slot::St,
+            st_bits,
+        );
         if let Some(result) = &ffi_result {
-            eprintln!("ST FFI: name={} num_defs={} operands={:?}",
-                result.name, result.num_defs, result.operands);
+            eprintln!(
+                "ST FFI: name={} num_defs={} operands={:?}",
+                result.name, result.num_defs, result.operands
+            );
         } else {
             eprintln!("ST FFI: FAILED to decode bits 0x{:06X}", st_bits);
         }
@@ -1995,10 +2091,14 @@ mod tests {
         // Also try direct FFI decode
         let st_bits: u64 = 0x000007;
         let ffi_result = xdna_archspec::aie2::isa::decoder_ffi::decode_slot(
-            xdna_archspec::aie2::isa::decoder_ffi::Slot::St, st_bits);
+            xdna_archspec::aie2::isa::decoder_ffi::Slot::St,
+            st_bits,
+        );
         if let Some(result) = &ffi_result {
-            eprintln!("ST FFI: name={} num_defs={} operands={:?}",
-                result.name, result.num_defs, result.operands);
+            eprintln!(
+                "ST FFI: name={} num_defs={} operands={:?}",
+                result.name, result.num_defs, result.operands
+            );
         } else {
             eprintln!("ST FFI: FAILED to decode bits 0x{:06X}", st_bits);
         }
@@ -2019,16 +2119,22 @@ mod tests {
 
         // Verify that the mnemonic fallback logic in build_slot_op assigns Copy.
         let has_dest = true; // MOVX_mvx_scl writes to a ControlReg
-        let effective_semantic = if enc.semantic.is_none() && has_dest
-            && (enc.mnemonic == "mov" || enc.mnemonic == "mova"
-                || enc.mnemonic == "movx" || enc.mnemonic == "movxm")
+        let effective_semantic = if enc.semantic.is_none()
+            && has_dest
+            && (enc.mnemonic == "mov"
+                || enc.mnemonic == "mova"
+                || enc.mnemonic == "movx"
+                || enc.mnemonic == "movxm")
             && !enc.is_vector
         {
             Some(xdna_archspec::aie2::isa::SemanticOp::Copy)
         } else {
             enc.semantic
         };
-        assert_eq!(effective_semantic, Some(xdna_archspec::aie2::isa::SemanticOp::Copy),
-            "MOVX_mvx_scl should get Copy semantic from mnemonic fallback");
+        assert_eq!(
+            effective_semantic,
+            Some(xdna_archspec::aie2::isa::SemanticOp::Copy),
+            "MOVX_mvx_scl should get Copy semantic from mnemonic fallback"
+        );
     }
 }

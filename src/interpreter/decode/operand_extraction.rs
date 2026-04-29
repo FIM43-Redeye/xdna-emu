@@ -52,15 +52,17 @@ impl InstructionDecoder {
     // -----------------------------------------------------------------------
 
     /// Convert SlotType to decoder_ffi::Slot for LLVM decoding.
-    pub(super) fn slot_type_to_ffi(slot_type: crate::interpreter::bundle::SlotType) -> Option<decoder_ffi::Slot> {
+    pub(super) fn slot_type_to_ffi(
+        slot_type: crate::interpreter::bundle::SlotType,
+    ) -> Option<decoder_ffi::Slot> {
         use crate::interpreter::bundle::SlotType;
         match slot_type {
             SlotType::Alu => Some(decoder_ffi::Slot::Alu),
             SlotType::Lda => Some(decoder_ffi::Slot::Lda),
             SlotType::Ldb => Some(decoder_ffi::Slot::Ldb),
             SlotType::Lng => Some(decoder_ffi::Slot::Lng),
-            SlotType::Mv  => Some(decoder_ffi::Slot::Mv),
-            SlotType::St  => Some(decoder_ffi::Slot::St),
+            SlotType::Mv => Some(decoder_ffi::Slot::Mv),
+            SlotType::St => Some(decoder_ffi::Slot::St),
             SlotType::Vec => Some(decoder_ffi::Slot::Vec),
             SlotType::Nop => None,
         }
@@ -81,8 +83,15 @@ impl InstructionDecoder {
         &self,
         bits: u64,
         slot_type: crate::interpreter::bundle::SlotType,
-    ) -> Option<(DecodedInstr, Option<Operand>, Vec<Operand>, Option<PostModify>, Option<u32>, Vec<Operand>,
-                  Option<AccumWidth>)> {
+    ) -> Option<(
+        DecodedInstr,
+        Option<Operand>,
+        Vec<Operand>,
+        Option<PostModify>,
+        Option<u32>,
+        Vec<Operand>,
+        Option<AccumWidth>,
+    )> {
         let ffi_slot = Self::slot_type_to_ffi(slot_type)?;
         let ffi_result = decoder_ffi::decode_slot(ffi_slot, bits)?;
 
@@ -91,8 +100,8 @@ impl InstructionDecoder {
             crate::interpreter::bundle::SlotType::Lda => "lda",
             crate::interpreter::bundle::SlotType::Ldb => "ldb",
             crate::interpreter::bundle::SlotType::Alu => "alu",
-            crate::interpreter::bundle::SlotType::Mv  => "mv",
-            crate::interpreter::bundle::SlotType::St  => "st",
+            crate::interpreter::bundle::SlotType::Mv => "mv",
+            crate::interpreter::bundle::SlotType::St => "st",
             crate::interpreter::bundle::SlotType::Vec => "vec",
             crate::interpreter::bundle::SlotType::Lng => "lng",
             _ => return None,
@@ -100,8 +109,7 @@ impl InstructionDecoder {
 
         let encoding = self.index.encoding_by_name(slot_name, &ffi_result.name);
         if encoding.is_none() {
-            log::warn!("[FFI-LOOKUP MISS] slot={} name={} -- not in index",
-                slot_name, ffi_result.name);
+            log::warn!("[FFI-LOOKUP MISS] slot={} name={} -- not in index", slot_name, ffi_result.name);
         }
         let encoding = encoding?;
 
@@ -112,13 +120,9 @@ impl InstructionDecoder {
         // Build a minimal DecodedInstr with empty raw operands (we don't need
         // them since we're using LLVM's operands, but build_slot_op reads
         // encoding metadata from it).
-        let decoded_instr = DecodedInstr {
-            encoding: encoding.clone(),
-            operands: HashMap::new(),
-        };
+        let decoded_instr = DecodedInstr { encoding: encoding.clone(), operands: HashMap::new() };
 
-        Some((decoded_instr, dest, sources, post_modify, Some(ffi_result.opcode), extra_defs,
-              accum_width))
+        Some((decoded_instr, dest, sources, post_modify, Some(ffi_result.opcode), extra_defs, accum_width))
     }
 
     /// Extract dest, sources, and post-modify from LLVM FFI decode result.
@@ -129,8 +133,7 @@ impl InstructionDecoder {
     pub(super) fn extract_operands_from_ffi(
         ffi_result: &DecodeResult,
         encoding: &InstrEncoding,
-    ) -> (Option<Operand>, Vec<Operand>, Option<PostModify>, Vec<Operand>,
-          Option<AccumWidth>) {
+    ) -> (Option<Operand>, Vec<Operand>, Option<PostModify>, Vec<Operand>, Option<AccumWidth>) {
         let num_defs = ffi_result.num_defs as usize;
 
         // Map all LLVM operands to our Operand type.
@@ -145,21 +148,19 @@ impl InstructionDecoder {
         // (e.g., bml -> Half, cm -> Full). This flows to SlotOp.accum_width
         // for use in accumulator execution paths.
         let mut first_accum_width: Option<AccumWidth> = None;
-        let mapped: Vec<Option<Operand>> = ffi_result.operands.iter().map(|op| {
-            match op {
-                DecodedOperand::Reg { name, .. } => {
-                    operand_from_reg_name(name).map(|m| {
-                        if first_accum_width.is_none() {
-                            first_accum_width = m.accum_width;
-                        }
-                        m.operand
-                    })
-                }
-                DecodedOperand::Imm(val) => {
-                    Some(Operand::Immediate(*val as i32))
-                }
-            }
-        }).collect();
+        let mapped: Vec<Option<Operand>> = ffi_result
+            .operands
+            .iter()
+            .map(|op| match op {
+                DecodedOperand::Reg { name, .. } => operand_from_reg_name(name).map(|m| {
+                    if first_accum_width.is_none() {
+                        first_accum_width = m.accum_width;
+                    }
+                    m.operand
+                }),
+                DecodedOperand::Imm(val) => Some(Operand::Immediate(*val as i32)),
+            })
+            .collect();
 
         // Split into defs (outputs) and uses (inputs).
         let split_at = num_defs.min(mapped.len());
@@ -195,9 +196,16 @@ impl InstructionDecoder {
         // For load instructions, promote the first writable non-address register
         // to dest so the executor writes the loaded data.
         if dest.is_none() && encoding.may_load {
-            if let Some(pos) = use_ops.iter().position(|o| matches!(o,
-                Operand::ControlReg(_) | Operand::AccumReg(_) | Operand::VectorReg(_) | Operand::ScalarReg(_) | Operand::SparseQxReg(_)
-            )) {
+            if let Some(pos) = use_ops.iter().position(|o| {
+                matches!(
+                    o,
+                    Operand::ControlReg(_)
+                        | Operand::AccumReg(_)
+                        | Operand::VectorReg(_)
+                        | Operand::ScalarReg(_)
+                        | Operand::SparseQxReg(_)
+                )
+            }) {
                 dest = Some(use_ops.remove(pos));
             }
         }
@@ -234,8 +242,8 @@ impl InstructionDecoder {
                         _ => unreachable!(),
                     };
                     // Next Immediate after the pointer (now at ptr_pos since we removed ptr).
-                    let offset = if let Some(imm_pos) = use_ops[ptr_pos..].iter()
-                        .position(|o| matches!(o, Operand::Immediate(_)))
+                    let offset = if let Some(imm_pos) =
+                        use_ops[ptr_pos..].iter().position(|o| matches!(o, Operand::Immediate(_)))
                     {
                         match use_ops.remove(ptr_pos + imm_pos) {
                             Operand::Immediate(v) => v as i16,
@@ -252,8 +260,8 @@ impl InstructionDecoder {
                 if let Some(ptr_pos) = use_ops.iter().position(|o| matches!(o, Operand::PointerReg(_))) {
                     let ptr_reg = use_ops.remove(ptr_pos);
                     // Find the modify amount.
-                    let modify = if let Some(imm_pos) = use_ops[ptr_pos..].iter()
-                        .position(|o| matches!(o, Operand::Immediate(_)))
+                    let modify = if let Some(imm_pos) =
+                        use_ops[ptr_pos..].iter().position(|o| matches!(o, Operand::Immediate(_)))
                     {
                         match use_ops.remove(ptr_pos + imm_pos) {
                             Operand::Immediate(v) => v as i16,
@@ -270,8 +278,8 @@ impl InstructionDecoder {
                 if let Some(ptr_pos) = use_ops.iter().position(|o| matches!(o, Operand::PointerReg(_))) {
                     let ptr_reg = use_ops.remove(ptr_pos);
                     // Find the modifier register.
-                    if let Some(mod_pos) = use_ops[ptr_pos..].iter()
-                        .position(|o| matches!(o, Operand::ModifierReg(_)))
+                    if let Some(mod_pos) =
+                        use_ops[ptr_pos..].iter().position(|o| matches!(o, Operand::ModifierReg(_)))
                     {
                         let mod_reg = match use_ops.remove(ptr_pos + mod_pos) {
                             Operand::ModifierReg(r) => r,
@@ -316,7 +324,10 @@ impl InstructionDecoder {
     /// Legacy bit-field extraction method. Retained for cross-validation tests
     /// against the LLVM FFI operand extraction. Not used in production.
     #[cfg(test)]
-    pub(super) fn extract_operands(&self, decoded: &DecodedInstr) -> (Option<Operand>, Vec<Operand>, Option<PostModify>, Vec<Operand>) {
+    pub(super) fn extract_operands(
+        &self,
+        decoded: &DecodedInstr,
+    ) -> (Option<Operand>, Vec<Operand>, Option<PostModify>, Vec<Operand>) {
         let mut field_operands: HashMap<String, Operand> = HashMap::new();
         let mut direct_dest: Option<Operand> = None;
         let mut extra_sources: Vec<Operand> = Vec::new();
@@ -329,20 +340,20 @@ impl InstructionDecoder {
             // this is structural addressing, not a register encoding issue.
             if field.name.starts_with("ag") {
                 self.decode_ag_field(
-                    field, raw, decoded,
-                    &mut direct_dest, &mut extra_sources, &mut extracted_post_modify,
+                    field,
+                    raw,
+                    decoded,
+                    &mut direct_dest,
+                    &mut extra_sources,
+                    &mut extracted_post_modify,
                 );
                 continue;
             }
 
             // Data-driven dispatch on operand_type
             let operand = match &field.operand_type {
-                OperandType::Register(kind) => {
-                    Self::decode_register(*kind, raw as u8, 0)
-                }
-                OperandType::RegisterWithOffset(kind, base) => {
-                    Self::decode_register(*kind, raw as u8, *base)
-                }
+                OperandType::Register(kind) => Self::decode_register(*kind, raw as u8, 0),
+                OperandType::RegisterWithOffset(kind, base) => Self::decode_register(*kind, raw as u8, *base),
                 OperandType::CompositeRegister(encoder) => {
                     // Composite registers are decoded by the LLVM FFI layer
                     // in production. This minimal inline decode covers the
@@ -470,12 +481,8 @@ impl InstructionDecoder {
         }
 
         // Extract dest and sources using TableGen ordering
-        let (dest, sources) = self.extract_ordered_operands(
-            decoded,
-            &field_operands,
-            direct_dest,
-            extra_sources,
-        );
+        let (dest, sources) =
+            self.extract_ordered_operands(decoded, &field_operands, direct_dest, extra_sources);
 
         // Legacy path doesn't extract extra defs (dual-result support is
         // FFI-only).
@@ -489,7 +496,7 @@ impl InstructionDecoder {
         match kind {
             RegisterKind::Scalar => Operand::ScalarReg(reg),
             RegisterKind::Pointer => Operand::PointerReg(reg),
-            RegisterKind::ModifierM  => Operand::ModifierReg(reg + MOD_BASE_M),
+            RegisterKind::ModifierM => Operand::ModifierReg(reg + MOD_BASE_M),
             RegisterKind::ModifierDN => Operand::ModifierReg(reg + MOD_BASE_DN),
             RegisterKind::ModifierDJ => Operand::ModifierReg(reg + MOD_BASE_DJ),
             RegisterKind::ModifierDC => Operand::ModifierReg(reg + MOD_BASE_DC),
@@ -524,14 +531,14 @@ impl InstructionDecoder {
                     // Special registers: id = (raw >> 3) & 0xF
                     use crate::interpreter::state::*;
                     match (raw >> 3) & 0xF {
-                        0  => Operand::ScalarReg(LS_REG_INDEX),
-                        2  => Operand::ScalarReg(DP_REG_INDEX),
-                        4  => Operand::ScalarReg(LR_REG_INDEX),
-                        6  => Operand::ScalarReg(CORE_ID_REG_INDEX),
-                        8  => Operand::ScalarReg(LE_REG_INDEX),
+                        0 => Operand::ScalarReg(LS_REG_INDEX),
+                        2 => Operand::ScalarReg(DP_REG_INDEX),
+                        4 => Operand::ScalarReg(LR_REG_INDEX),
+                        6 => Operand::ScalarReg(CORE_ID_REG_INDEX),
+                        8 => Operand::ScalarReg(LE_REG_INDEX),
                         10 => Operand::ScalarReg(LC_REG_INDEX),
                         12 => Operand::PointerReg(SP_PTR_INDEX),
-                        _  => Operand::ScalarReg(0),
+                        _ => Operand::ScalarReg(0),
                     }
                 } else if raw & 0xF == 0b0011 {
                     Operand::PointerReg(((raw >> 4) & 0x7) as u8)
@@ -554,13 +561,9 @@ impl InstructionDecoder {
                 }
             }
             // AluCg: LC=0b000001, scalar=raw>>1
-            CompositeEncoder::AluCg => {
-                Operand::ScalarReg((raw >> 1) as u8)
-            }
+            CompositeEncoder::AluCg => Operand::ScalarReg((raw >> 1) as u8),
             // ERS4: r16..r31
-            CompositeEncoder::ERS4 => {
-                Operand::ScalarReg((raw as u8).wrapping_add(16))
-            }
+            CompositeEncoder::ERS4 => Operand::ScalarReg((raw as u8).wrapping_add(16)),
             // Fallback for other encoders
             _ => Operand::Immediate(raw as i32),
         }
@@ -598,9 +601,7 @@ impl InstructionDecoder {
                 let (mode_bits, imm_bits) = if is_ag_all { (3, 7) } else { (2, 4) };
                 let data = value >> mode_bits;
                 let ptr = ((data >> imm_bits) & 0x7) as u8;
-                let imm_raw = sign_extend(
-                    (data & ((1 << imm_bits) - 1)) as i32, imm_bits as u32
-                );
+                let imm_raw = sign_extend((data & ((1 << imm_bits) - 1)) as i32, imm_bits as u32);
                 let imm_bytes = if is_ag_all { imm_raw * 4 } else { imm_raw };
                 extra_sources.push(Operand::PointerReg(ptr));
                 *extracted_post_modify = Some(PostModify::Immediate(imm_bytes as i16));
@@ -712,7 +713,8 @@ impl InstructionDecoder {
             Some(d) if !can_be_dest(&d) => {
                 log::trace!(
                     "[DECODE] Non-writable {:?} in dest for '{}', moving to sources",
-                    d, decoded.encoding.name,
+                    d,
+                    decoded.encoding.name,
                 );
                 extra_sources.insert(0, d);
                 None

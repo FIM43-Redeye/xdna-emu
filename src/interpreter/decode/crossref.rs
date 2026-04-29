@@ -95,9 +95,7 @@ impl CrossRefReport {
 
     /// Total number of discrepancies.
     pub fn discrepancy_count(&self) -> usize {
-        self.mnemonic_mismatches.len()
-            + self.decode_failures.len()
-            + self.size_mismatches.len()
+        self.mnemonic_mismatches.len() + self.decode_failures.len() + self.size_mismatches.len()
     }
 }
 
@@ -113,11 +111,7 @@ impl fmt::Display for CrossRefReport {
             self.match_rate()
         )?;
         if !self.mnemonic_mismatches.is_empty() {
-            writeln!(
-                f,
-                "Mnemonic mismatch: {}",
-                self.mnemonic_mismatches.len()
-            )?;
+            writeln!(f, "Mnemonic mismatch: {}", self.mnemonic_mismatches.len())?;
         }
         if !self.decode_failures.is_empty() {
             writeln!(f, "Decode failure: {}", self.decode_failures.len())?;
@@ -148,13 +142,7 @@ impl fmt::Display for CrossRefReport {
             writeln!(f, "DECODE FAILURES:")?;
             for comp in &self.decode_failures {
                 if let InstrComparison::DecodeFailed { pc, objdump, error } = comp {
-                    writeln!(
-                        f,
-                        "  PC 0x{:04X}: objdump=[{}] error={}",
-                        pc,
-                        objdump.join(", "),
-                        error
-                    )?;
+                    writeln!(f, "  PC 0x{:04X}: objdump=[{}] error={}", pc, objdump.join(", "), error)?;
                 }
             }
         }
@@ -163,17 +151,8 @@ impl fmt::Display for CrossRefReport {
             writeln!(f)?;
             writeln!(f, "SIZE MISMATCHES:")?;
             for comp in &self.size_mismatches {
-                if let InstrComparison::SizeMismatch {
-                    pc,
-                    objdump_size,
-                    emu_size,
-                } = comp
-                {
-                    writeln!(
-                        f,
-                        "  PC 0x{:04X}: objdump={} bytes, emu={} bytes",
-                        pc, objdump_size, emu_size
-                    )?;
+                if let InstrComparison::SizeMismatch { pc, objdump_size, emu_size } = comp {
+                    writeln!(f, "  PC 0x{:04X}: objdump={} bytes, emu={} bytes", pc, objdump_size, emu_size)?;
                 }
             }
         }
@@ -187,10 +166,7 @@ impl fmt::Display for CrossRefReport {
 // ---------------------------------------------------------------------------
 
 /// Run llvm-objdump and parse its output into a PC-indexed map.
-pub fn parse_objdump(
-    elf_path: &Path,
-    objdump_path: &Path,
-) -> Result<BTreeMap<u32, ObjdumpInstr>, String> {
+pub fn parse_objdump(elf_path: &Path, objdump_path: &Path) -> Result<BTreeMap<u32, ObjdumpInstr>, String> {
     let output = Command::new(objdump_path)
         .arg("-d")
         .arg(elf_path)
@@ -272,14 +248,7 @@ fn parse_objdump_text(text: &str) -> Result<BTreeMap<u32, ObjdumpInstr>, String>
         // Parse sub-instructions (VLIW bundles use ";\t\t" or ";  " separators)
         let sub_instrs = parse_sub_instructions(asm_str);
 
-        result.insert(
-            pc,
-            ObjdumpInstr {
-                pc,
-                bytes,
-                sub_instrs,
-            },
-        );
+        result.insert(pc, ObjdumpInstr { pc, bytes, sub_instrs });
     }
 
     Ok(result)
@@ -374,13 +343,9 @@ pub fn cross_reference_elf(
     let objdump_map = parse_objdump(elf_path, objdump_path)?;
 
     // Step 2: Load ELF and get .text bytes
-    let elf_data = std::fs::read(elf_path)
-        .map_err(|e| format!("Failed to read ELF: {}", e))?;
-    let elf = AieElf::parse(&elf_data)
-        .map_err(|e| format!("Failed to parse ELF: {}", e))?;
-    let text = elf
-        .text_section()
-        .ok_or_else(|| "No .text section in ELF".to_string())?;
+    let elf_data = std::fs::read(elf_path).map_err(|e| format!("Failed to read ELF: {}", e))?;
+    let elf = AieElf::parse(&elf_data).map_err(|e| format!("Failed to parse ELF: {}", e))?;
+    let text = elf.text_section().ok_or_else(|| "No .text section in ELF".to_string())?;
 
     // Step 3: Walk through .text, decode with our decoder, compare
     let mut report = CrossRefReport {
@@ -430,9 +395,8 @@ pub fn cross_reference_elf(
                     .active_slots()
                     .filter(|s| !is_nop_slot(s))
                     .map(|s| {
-                        s.semantic.map_or("unknown".to_string(), |sem| {
-                            format!("{:?}", sem).to_lowercase()
-                        })
+                        s.semantic
+                            .map_or("unknown".to_string(), |sem| format!("{:?}", sem).to_lowercase())
                     })
                     .collect();
 
@@ -469,46 +433,30 @@ pub fn cross_reference_elf(
                             .collect();
 
                         // Compare mnemonics -- try matching by position
-                        let all_match = compare_mnemonic_sets(
-                            &ref_mnemonics,
-                            &emu_raw_mnemonics,
-                            &emu_mnemonics,
-                        );
+                        let all_match =
+                            compare_mnemonic_sets(&ref_mnemonics, &emu_raw_mnemonics, &emu_mnemonics);
 
                         if all_match {
                             report.matches += 1;
                         } else {
-                            let ref_all: Vec<String> = ref_instr
-                                .sub_instrs
-                                .iter()
-                                .map(|(m, _)| m.clone())
-                                .collect();
-                            let emu_all: Vec<String> = bundle
-                                .active_slots()
-                                .map(|s| slot_mnemonic(s))
-                                .collect();
-                            report
-                                .mnemonic_mismatches
-                                .push(InstrComparison::MnemonicMismatch {
-                                    pc,
-                                    objdump: ref_all,
-                                    emu: emu_all,
-                                });
+                            let ref_all: Vec<String> =
+                                ref_instr.sub_instrs.iter().map(|(m, _)| m.clone()).collect();
+                            let emu_all: Vec<String> =
+                                bundle.active_slots().map(|s| slot_mnemonic(s)).collect();
+                            report.mnemonic_mismatches.push(InstrComparison::MnemonicMismatch {
+                                pc,
+                                objdump: ref_all,
+                                emu: emu_all,
+                            });
                         }
                     }
                     None => {
                         // We decoded something but objdump didn't have it
                         // (shouldn't happen for well-formed ELFs)
-                        let emu_all: Vec<String> = bundle
-                            .active_slots()
-                            .map(|s| slot_mnemonic(s))
-                            .collect();
+                        let emu_all: Vec<String> = bundle.active_slots().map(|s| slot_mnemonic(s)).collect();
                         report
                             .extra_instructions
-                            .push(InstrComparison::ExtraInstruction {
-                                pc,
-                                emu: emu_all,
-                            });
+                            .push(InstrComparison::ExtraInstruction { pc, emu: emu_all });
                     }
                 }
 
@@ -516,11 +464,8 @@ pub fn cross_reference_elf(
             }
             Err(e) => {
                 if let Some(ref_instr) = reference {
-                    let ref_mnemonics: Vec<String> = ref_instr
-                        .sub_instrs
-                        .iter()
-                        .map(|(m, _)| m.clone())
-                        .collect();
+                    let ref_mnemonics: Vec<String> =
+                        ref_instr.sub_instrs.iter().map(|(m, _)| m.clone()).collect();
                     report.decode_failures.push(InstrComparison::DecodeFailed {
                         pc,
                         objdump: ref_mnemonics,
@@ -547,9 +492,8 @@ fn slot_mnemonic(slot: &crate::interpreter::bundle::SlotOp) -> String {
     if let Some(ref name) = slot.encoding_name {
         name.to_lowercase()
     } else {
-        slot.semantic.map_or("unknown".to_string(), |sem| {
-            format!("{:?}", sem).to_lowercase()
-        })
+        slot.semantic
+            .map_or("unknown".to_string(), |sem| format!("{:?}", sem).to_lowercase())
     }
 }
 
@@ -557,11 +501,7 @@ fn slot_mnemonic(slot: &crate::interpreter::bundle::SlotOp) -> String {
 ///
 /// Returns true if all non-NOP mnemonics match (after normalization).
 /// Tries both the raw encoding mnemonic and the semantic-derived mnemonic.
-fn compare_mnemonic_sets(
-    reference: &[&str],
-    emu_raw: &[String],
-    emu_op: &[String],
-) -> bool {
+fn compare_mnemonic_sets(reference: &[&str], emu_raw: &[String], emu_op: &[String]) -> bool {
     // If reference has no non-NOP instructions, it's a NOP bundle -- always match
     if reference.is_empty() {
         return true;
@@ -569,10 +509,7 @@ fn compare_mnemonic_sets(
 
     // Try matching against raw encoding mnemonics first
     if reference.len() == emu_raw.len() {
-        let all_match = reference
-            .iter()
-            .zip(emu_raw.iter())
-            .all(|(r, e)| mnemonics_match(e, r));
+        let all_match = reference.iter().zip(emu_raw.iter()).all(|(r, e)| mnemonics_match(e, r));
         if all_match {
             return true;
         }
@@ -597,10 +534,7 @@ fn compare_mnemonic_sets(
 
     // Try semantic-derived mnemonics as last resort
     if reference.len() == emu_op.len() {
-        let all_match = reference
-            .iter()
-            .zip(emu_op.iter())
-            .all(|(r, e)| mnemonics_match(e, r));
+        let all_match = reference.iter().zip(emu_op.iter()).all(|(r, e)| mnemonics_match(e, r));
         if all_match {
             return true;
         }
@@ -664,10 +598,7 @@ pub fn print_summary(reports: &[CrossRefReport]) {
     };
 
     eprintln!("=== Cross-Reference Summary ({} ELFs) ===", reports.len());
-    eprintln!(
-        "Total: {} instructions, Match: {} ({:.1}%)",
-        total_instrs, total_matches, rate
-    );
+    eprintln!("Total: {} instructions, Match: {} ({:.1}%)", total_instrs, total_matches, rate);
     if total_mismatch > 0 {
         eprintln!("Mnemonic mismatches: {}", total_mismatch);
     }
@@ -876,16 +807,12 @@ Disassembly of section .text:
         }
 
         let decoder = InstructionDecoder::load_default();
-        let report = cross_reference_elf(elf_path, objdump, &decoder)
-            .expect("Cross-reference failed");
+        let report = cross_reference_elf(elf_path, objdump, &decoder).expect("Cross-reference failed");
 
         eprintln!("{}", report);
 
         // We expect a high match rate but don't enforce 100% yet
-        assert!(
-            report.total_instructions > 0,
-            "Should decode at least one instruction"
-        );
+        assert!(report.total_instructions > 0, "Should decode at least one instruction");
     }
 
     #[test]
