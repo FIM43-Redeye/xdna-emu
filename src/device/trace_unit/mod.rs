@@ -435,6 +435,7 @@ impl TraceUnit {
     /// has been encoded since the last flush. Crate-internal accessor used
     /// by integration tests that verify event routing without inspecting
     /// packet content; not part of the external API.
+    #[cfg(test)]
     pub(crate) fn encoded_bytes_len(&self) -> usize {
         self.byte_buffer.len()
     }
