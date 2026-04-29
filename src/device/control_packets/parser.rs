@@ -113,8 +113,11 @@ impl fmt::Display for ParseError {
         match self {
             Self::InvalidOpCode(v) => write!(f, "invalid control packet opcode: {}", v),
             Self::PayloadLengthMismatch { expected, actual } => {
-                write!(f, "payload length mismatch: header declares {} beat(s), got {} word(s)",
-                    expected, actual)
+                write!(
+                    f,
+                    "payload length mismatch: header declares {} beat(s), got {} word(s)",
+                    expected, actual
+                )
             }
             Self::ReadWithPayload(n) => {
                 write!(f, "OP_READ should have no payload, but got {} word(s)", n)
@@ -160,28 +163,16 @@ pub fn parse_header(header: u32) -> Result<HeaderFields, ParseError> {
     let response_id = ((header >> RESPONSE_ID_SHIFT) & RESPONSE_ID_MASK) as u8;
     let parity = (header >> PARITY_BIT) & 1 != 0;
 
-    let opcode = CtrlOpCode::from_raw(op_raw)
-        .ok_or(ParseError::InvalidOpCode(op_raw))?;
+    let opcode = CtrlOpCode::from_raw(op_raw).ok_or(ParseError::InvalidOpCode(op_raw))?;
 
-    Ok(HeaderFields {
-        address,
-        beats,
-        opcode,
-        response_id,
-        parity,
-    })
+    Ok(HeaderFields { address, beats, opcode, response_id, parity })
 }
 
 /// Build a control packet header word from structured fields.
 ///
 /// This is the inverse of [`parse_header`]. Useful for test construction
 /// and response packet generation.
-pub fn build_header(
-    address: u32,
-    beats: u8,
-    opcode: CtrlOpCode,
-    response_id: u8,
-) -> u32 {
+pub fn build_header(address: u32, beats: u8, opcode: CtrlOpCode, response_id: u8) -> u32 {
     use xdna_archspec::aie2::ctrl_packet::*;
 
     let length_val = beats.saturating_sub(1) as u32;
@@ -229,10 +220,7 @@ impl ControlPacket {
                 return Err(ParseError::ReadWithPayload(payload.len()));
             }
         } else if payload.len() != fields.beats as usize {
-            return Err(ParseError::PayloadLengthMismatch {
-                expected: fields.beats,
-                actual: payload.len(),
-            });
+            return Err(ParseError::PayloadLengthMismatch { expected: fields.beats, actual: payload.len() });
         }
 
         Ok(Self {
@@ -246,48 +234,24 @@ impl ControlPacket {
 
     /// Create a Write packet programmatically.
     pub fn write(address: u32, value: u32) -> Self {
-        Self {
-            opcode: CtrlOpCode::Write,
-            address,
-            data: vec![value],
-            response_id: 0,
-            beats: 1,
-        }
+        Self { opcode: CtrlOpCode::Write, address, data: vec![value], response_id: 0, beats: 1 }
     }
 
     /// Create a Read packet programmatically.
     pub fn read(address: u32, beats: u8, response_id: u8) -> Self {
-        Self {
-            opcode: CtrlOpCode::Read,
-            address,
-            data: Vec::new(),
-            response_id,
-            beats,
-        }
+        Self { opcode: CtrlOpCode::Read, address, data: Vec::new(), response_id, beats }
     }
 
     /// Create a BlockWrite packet programmatically.
     pub fn block_write(address: u32, data: Vec<u32>) -> Self {
         let beats = data.len() as u8;
-        Self {
-            opcode: CtrlOpCode::BlockWrite,
-            address,
-            data,
-            response_id: 0,
-            beats,
-        }
+        Self { opcode: CtrlOpCode::BlockWrite, address, data, response_id: 0, beats }
     }
 
     /// Create a WriteIncr packet programmatically.
     pub fn write_incr(address: u32, data: Vec<u32>) -> Self {
         let beats = data.len() as u8;
-        Self {
-            opcode: CtrlOpCode::WriteIncr,
-            address,
-            data,
-            response_id: 0,
-            beats,
-        }
+        Self { opcode: CtrlOpCode::WriteIncr, address, data, response_id: 0, beats }
     }
 
     /// Whether this packet requires register writes.
@@ -305,9 +269,10 @@ impl ControlPacket {
     /// Each successive word targets address + 4*i (consecutive 32-bit registers).
     /// Returns an empty iterator for Read operations.
     pub fn write_pairs(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.data.iter().enumerate().map(move |(i, &val)| {
-            (self.address + (i as u32) * 4, val)
-        })
+        self.data
+            .iter()
+            .enumerate()
+            .map(move |(i, &val)| (self.address + (i as u32) * 4, val))
     }
 }
 
@@ -320,7 +285,9 @@ impl fmt::Display for ControlPacket {
         if !self.data.is_empty() {
             write!(f, " data=[")?;
             for (i, val) in self.data.iter().enumerate() {
-                if i > 0 { write!(f, ", ")?; }
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
                 write!(f, "0x{:08X}", val)?;
             }
             write!(f, "]")?;
@@ -584,11 +551,7 @@ mod tests {
     fn write_pairs_consecutive_addresses() {
         let pkt = ControlPacket::block_write(0x1000, vec![0xAA, 0xBB, 0xCC]);
         let pairs: Vec<_> = pkt.write_pairs().collect();
-        assert_eq!(pairs, vec![
-            (0x1000, 0xAA),
-            (0x1004, 0xBB),
-            (0x1008, 0xCC),
-        ]);
+        assert_eq!(pairs, vec![(0x1000, 0xAA), (0x1004, 0xBB), (0x1008, 0xCC),]);
     }
 
     #[test]

@@ -35,20 +35,12 @@ pub struct ControlPacketResponse {
 impl ControlPacketResponse {
     /// Create a response for a single-register read.
     pub fn single(address: u32, value: u32, response_id: u8) -> Self {
-        Self {
-            address,
-            data: vec![value],
-            response_id,
-        }
+        Self { address, data: vec![value], response_id }
     }
 
     /// Create a response for a multi-register read.
     pub fn multi(address: u32, values: Vec<u32>, response_id: u8) -> Self {
-        Self {
-            address,
-            data: values,
-            response_id,
-        }
+        Self { address, data: values, response_id }
     }
 
     /// Number of register values in this response.
@@ -68,12 +60,7 @@ impl ControlPacketResponse {
 
         // Response header: same format as control packet header.
         // Use OP_READ opcode, original address, beat count, and response_id.
-        let header = build_header(
-            self.address,
-            self.beat_count(),
-            CtrlOpCode::Read,
-            self.response_id,
-        );
+        let header = build_header(self.address, self.beat_count(), CtrlOpCode::Read, self.response_id);
 
         let total = 1 + self.data.len();
         words.push((header, total == 1));
@@ -92,12 +79,7 @@ impl ControlPacketResponse {
     /// contexts where tlast tracking is not needed.
     pub fn to_raw_words(&self) -> Vec<u32> {
         let mut words = Vec::with_capacity(1 + self.data.len());
-        let header = build_header(
-            self.address,
-            self.beat_count(),
-            CtrlOpCode::Read,
-            self.response_id,
-        );
+        let header = build_header(self.address, self.beat_count(), CtrlOpCode::Read, self.response_id);
         words.push(header);
         words.extend_from_slice(&self.data);
         words
@@ -108,7 +90,9 @@ impl std::fmt::Display for ControlPacketResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "CtrlResp(addr=0x{:05X} resp_id={} data=[", self.address, self.response_id)?;
         for (i, val) in self.data.iter().enumerate() {
-            if i > 0 { write!(f, ", ")?; }
+            if i > 0 {
+                write!(f, ", ")?;
+            }
             write!(f, "0x{:08X}", val)?;
         }
         write!(f, "])")
@@ -173,7 +157,7 @@ mod tests {
         assert!(!words[0].1); // header
         assert!(!words[1].1); // data[0]
         assert!(!words[2].1); // data[1]
-        assert!(words[3].1);  // data[2]
+        assert!(words[3].1); // data[2]
 
         // Verify data values
         assert_eq!(words[1].0, 0xAA);
@@ -222,11 +206,7 @@ mod tests {
     fn empty_data_response_stream_words() {
         // Edge case: a response with no data (shouldn't happen in practice
         // but the code should handle it gracefully).
-        let resp = ControlPacketResponse {
-            address: 0x100,
-            data: vec![],
-            response_id: 0,
-        };
+        let resp = ControlPacketResponse { address: 0x100, data: vec![], response_id: 0 };
         let words = resp.to_stream_words();
         // Just the header, which is also the last word
         assert_eq!(words.len(), 1);

@@ -65,12 +65,7 @@ impl StreamReassembler {
     /// Initially in `Idle` state (assumes Drop_Header=true). Call
     /// `set_drop_header(false)` to enable stream header consumption.
     pub fn new(col: u8, row: u8) -> Self {
-        Self {
-            state: ReassemblerState::Idle,
-            drop_header: true,
-            col,
-            row,
-        }
+        Self { state: ReassemblerState::Idle, drop_header: true, col, row }
     }
 
     /// Configure whether stream headers are forwarded to this port.
@@ -106,7 +101,11 @@ impl StreamReassembler {
                 let pkt_type = (word >> 12) & 0x7;
                 log::debug!(
                     "Tile ({},{}) ctrl_pkt: consuming stream header 0x{:08X} (pkt_id={}, pkt_type={})",
-                    self.col, self.row, word, pkt_id, pkt_type
+                    self.col,
+                    self.row,
+                    word,
+                    pkt_id,
+                    pkt_type
                 );
                 self.state = ReassemblerState::Idle;
                 ReassembleResult::Pending
@@ -126,7 +125,13 @@ impl StreamReassembler {
 
                 log::info!(
                     "Tile ({},{}) ctrl_pkt: header 0x{:08X} addr=0x{:05X} op={:?} beats={} resp_id={}",
-                    self.col, self.row, word, header.address, header.opcode, header.beats, header.response_id
+                    self.col,
+                    self.row,
+                    word,
+                    header.address,
+                    header.opcode,
+                    header.beats,
+                    header.response_id
                 );
 
                 // OP_READ has no data payload -- complete immediately.
@@ -146,26 +151,21 @@ impl StreamReassembler {
                     ));
                 }
 
-                self.state = ReassemblerState::Collecting {
-                    header,
-                    beats_collected: 0,
-                    data: [0; 4],
-                };
+                self.state = ReassemblerState::Collecting { header, beats_collected: 0, data: [0; 4] };
                 ReassembleResult::Pending
             }
-            ReassemblerState::Collecting {
-                header,
-                mut beats_collected,
-                mut data,
-            } => {
+            ReassemblerState::Collecting { header, mut beats_collected, mut data } => {
                 data[beats_collected as usize] = word;
                 beats_collected += 1;
 
                 log::debug!(
                     "Tile ({},{}) ctrl_pkt: data[{}] = 0x{:08X} ({}/{}){}",
-                    self.col, self.row,
-                    beats_collected - 1, word,
-                    beats_collected, header.beats,
+                    self.col,
+                    self.row,
+                    beats_collected - 1,
+                    word,
+                    beats_collected,
+                    header.beats,
                     if tlast { " TLAST" } else { "" }
                 );
 
@@ -176,20 +176,14 @@ impl StreamReassembler {
                         CtrlOpCode::Write | CtrlOpCode::BlockWrite => {
                             ControlPacket::block_write(header.address, payload.to_vec())
                         }
-                        CtrlOpCode::WriteIncr => {
-                            ControlPacket::write_incr(header.address, payload.to_vec())
-                        }
+                        CtrlOpCode::WriteIncr => ControlPacket::write_incr(header.address, payload.to_vec()),
                         CtrlOpCode::Read => unreachable!("Read handled above"),
                     };
                     self.transition_after_complete(tlast);
                     ReassembleResult::Complete(packet)
                 } else {
                     // Still collecting.
-                    self.state = ReassemblerState::Collecting {
-                        header,
-                        beats_collected,
-                        data,
-                    };
+                    self.state = ReassemblerState::Collecting { header, beats_collected, data };
                     ReassembleResult::Pending
                 }
             }
@@ -214,7 +208,6 @@ impl StreamReassembler {
         };
     }
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -53,21 +53,11 @@ pub trait RegisterAccess {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessError {
     /// A register read failed during OP_READ processing.
-    ReadFailed {
-        offset: u32,
-        reason: String,
-    },
+    ReadFailed { offset: u32, reason: String },
     /// A register write failed during OP_WRITE/BLOCK_WRITE/WRITE_INCR.
-    WriteFailed {
-        offset: u32,
-        value: u32,
-        reason: String,
-    },
+    WriteFailed { offset: u32, value: u32, reason: String },
     /// A register read failed during MaskWrite (read phase).
-    MaskWriteReadFailed {
-        offset: u32,
-        reason: String,
-    },
+    MaskWriteReadFailed { offset: u32, reason: String },
     /// A register write failed during MaskWrite (write phase).
     MaskWriteWriteFailed {
         offset: u32,
@@ -83,15 +73,17 @@ impl fmt::Display for ProcessError {
                 write!(f, "register read failed at 0x{:05X}: {}", offset, reason)
             }
             Self::WriteFailed { offset, value, reason } => {
-                write!(f, "register write failed at 0x{:05X} (value=0x{:08X}): {}",
-                    offset, value, reason)
+                write!(f, "register write failed at 0x{:05X} (value=0x{:08X}): {}", offset, value, reason)
             }
             Self::MaskWriteReadFailed { offset, reason } => {
                 write!(f, "mask-write read phase failed at 0x{:05X}: {}", offset, reason)
             }
             Self::MaskWriteWriteFailed { offset, new_value, reason } => {
-                write!(f, "mask-write write phase failed at 0x{:05X} (new=0x{:08X}): {}",
-                    offset, new_value, reason)
+                write!(
+                    f,
+                    "mask-write write phase failed at 0x{:05X} (new=0x{:08X}): {}",
+                    offset, new_value, reason
+                )
             }
         }
     }
@@ -118,9 +110,7 @@ pub struct ControlPacketProcessor {
 impl ControlPacketProcessor {
     /// Create a new processor with an empty response queue.
     pub fn new() -> Self {
-        Self {
-            pending_responses: VecDeque::new(),
-        }
+        Self { pending_responses: VecDeque::new() }
     }
 
     /// Process a control packet, performing register operations via the
@@ -163,20 +153,15 @@ impl ControlPacketProcessor {
         op: &MaskWriteOp,
         access: &mut dyn RegisterAccess,
     ) -> Result<(u32, u32), ProcessError> {
-        let current = access.read_register(op.address)
-            .map_err(|reason| ProcessError::MaskWriteReadFailed {
-                offset: op.address,
-                reason,
-            })?;
+        let current = access
+            .read_register(op.address)
+            .map_err(|reason| ProcessError::MaskWriteReadFailed { offset: op.address, reason })?;
 
         let new_value = op.apply(current);
 
-        access.write_register(op.address, new_value)
-            .map_err(|reason| ProcessError::MaskWriteWriteFailed {
-                offset: op.address,
-                new_value,
-                reason,
-            })?;
+        access
+            .write_register(op.address, new_value)
+            .map_err(|reason| ProcessError::MaskWriteWriteFailed { offset: op.address, new_value, reason })?;
 
         Ok((op.address, new_value))
     }
@@ -218,12 +203,11 @@ impl ControlPacketProcessor {
 
         for (i, &value) in packet.data.iter().enumerate() {
             let addr = packet.address + (i as u32) * 4;
-            access.write_register(addr, value)
-                .map_err(|reason| ProcessError::WriteFailed {
-                    offset: addr,
-                    value,
-                    reason,
-                })?;
+            access.write_register(addr, value).map_err(|reason| ProcessError::WriteFailed {
+                offset: addr,
+                value,
+                reason,
+            })?;
             writes.push((addr, value));
         }
 
@@ -243,19 +227,13 @@ impl ControlPacketProcessor {
 
         for i in 0..packet.beats {
             let addr = packet.address + (i as u32) * 4;
-            let value = access.read_register(addr)
-                .map_err(|reason| ProcessError::ReadFailed {
-                    offset: addr,
-                    reason,
-                })?;
+            let value = access
+                .read_register(addr)
+                .map_err(|reason| ProcessError::ReadFailed { offset: addr, reason })?;
             values.push(value);
         }
 
-        let response = ControlPacketResponse::multi(
-            packet.address,
-            values,
-            packet.response_id,
-        );
+        let response = ControlPacketResponse::multi(packet.address, values, packet.response_id);
 
         self.pending_responses.push_back(response);
         Ok(())
@@ -284,11 +262,7 @@ mod tests {
 
     impl SimpleRegisterAccess {
         fn new() -> Self {
-            Self {
-                registers: HashMap::new(),
-                write_log: Vec::new(),
-                default_value: Some(0),
-            }
+            Self { registers: HashMap::new(), write_log: Vec::new(), default_value: Some(0) }
         }
 
         fn with_registers(regs: &[(u32, u32)]) -> Self {
@@ -301,11 +275,7 @@ mod tests {
 
         /// Create an access that errors on unknown addresses.
         fn strict() -> Self {
-            Self {
-                registers: HashMap::new(),
-                write_log: Vec::new(),
-                default_value: None,
-            }
+            Self { registers: HashMap::new(), write_log: Vec::new(), default_value: None }
         }
     }
 
@@ -431,11 +401,7 @@ mod tests {
 
         let writes = proc.process(&pkt, &mut access).unwrap();
 
-        assert_eq!(writes, vec![
-            (0x1000, 0xAA),
-            (0x1004, 0xBB),
-            (0x1008, 0xCC),
-        ]);
+        assert_eq!(writes, vec![(0x1000, 0xAA), (0x1004, 0xBB), (0x1008, 0xCC),]);
         assert_eq!(access.registers[&0x1000], 0xAA);
         assert_eq!(access.registers[&0x1004], 0xBB);
         assert_eq!(access.registers[&0x1008], 0xCC);
@@ -526,7 +492,9 @@ mod tests {
         // Use a wrapper that fails on specific addresses.
         struct FailOnWrite;
         impl RegisterAccess for FailOnWrite {
-            fn read_register(&self, _offset: u32) -> Result<u32, String> { Ok(0) }
+            fn read_register(&self, _offset: u32) -> Result<u32, String> {
+                Ok(0)
+            }
             fn write_register(&mut self, offset: u32, _value: u32) -> Result<(), String> {
                 Err(format!("write blocked at 0x{:05X}", offset))
             }
@@ -579,7 +547,9 @@ mod tests {
         // Reads succeed but writes fail
         struct ReadOnlyAccess;
         impl RegisterAccess for ReadOnlyAccess {
-            fn read_register(&self, _offset: u32) -> Result<u32, String> { Ok(0xFFFF_FFFF) }
+            fn read_register(&self, _offset: u32) -> Result<u32, String> {
+                Ok(0xFFFF_FFFF)
+            }
             fn write_register(&mut self, _offset: u32, _value: u32) -> Result<(), String> {
                 Err("read-only".to_string())
             }
@@ -600,11 +570,8 @@ mod tests {
     #[test]
     fn pending_response_fifo_ordering() {
         let mut proc = ControlPacketProcessor::new();
-        let mut access = SimpleRegisterAccess::with_registers(&[
-            (0x100, 0xAAAA),
-            (0x200, 0xBBBB),
-            (0x300, 0xCCCC),
-        ]);
+        let mut access =
+            SimpleRegisterAccess::with_registers(&[(0x100, 0xAAAA), (0x200, 0xBBBB), (0x300, 0xCCCC)]);
 
         // Issue three reads
         proc.process(&ControlPacket::read(0x100, 1, 1), &mut access).unwrap();
@@ -667,10 +634,8 @@ mod tests {
         assert_eq!(resp.data, vec![0xAAAA]);
 
         // Block write multiple registers
-        proc.process(
-            &ControlPacket::block_write(0x200, vec![0x11, 0x22]),
-            &mut access,
-        ).unwrap();
+        proc.process(&ControlPacket::block_write(0x200, vec![0x11, 0x22]), &mut access)
+            .unwrap();
 
         // Read them back
         proc.process(&ControlPacket::read(0x200, 2, 10), &mut access).unwrap();
@@ -689,7 +654,8 @@ mod tests {
         let mut access = SimpleRegisterAccess::new();
 
         proc.process(&ControlPacket::write(0x100, 1), &mut access).unwrap();
-        proc.process(&ControlPacket::block_write(0x200, vec![2, 3]), &mut access).unwrap();
+        proc.process(&ControlPacket::block_write(0x200, vec![2, 3]), &mut access)
+            .unwrap();
         proc.process(&ControlPacket::write_incr(0x300, vec![4]), &mut access).unwrap();
 
         assert!(!proc.has_pending_response());
@@ -702,10 +668,8 @@ mod tests {
         use crate::device::control_packets::parser::parse_header;
 
         let mut proc = ControlPacketProcessor::new();
-        let mut access = SimpleRegisterAccess::with_registers(&[
-            (0x1A000, 0xDEAD_BEEF),
-            (0x1A004, 0xCAFE_BABE),
-        ]);
+        let mut access =
+            SimpleRegisterAccess::with_registers(&[(0x1A000, 0xDEAD_BEEF), (0x1A004, 0xCAFE_BABE)]);
 
         proc.process(&ControlPacket::read(0x1A000, 2, 33), &mut access).unwrap();
         let resp = proc.pop_response().unwrap();
@@ -759,9 +723,13 @@ mod tests {
     fn blockwrite_stops_on_first_write_error() {
         let mut proc = ControlPacketProcessor::new();
 
-        struct FailAtSecond { count: u32 }
+        struct FailAtSecond {
+            count: u32,
+        }
         impl RegisterAccess for FailAtSecond {
-            fn read_register(&self, _offset: u32) -> Result<u32, String> { Ok(0) }
+            fn read_register(&self, _offset: u32) -> Result<u32, String> {
+                Ok(0)
+            }
             fn write_register(&mut self, offset: u32, _value: u32) -> Result<(), String> {
                 self.count += 1;
                 if self.count == 2 {
