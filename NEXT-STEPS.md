@@ -3,11 +3,28 @@
 Recovery document for picking up this refactor in a future session. Read
 this first, then dive into the authoritative artifacts below.
 
-**Last updated:** 2026-04-25 (Phase 2 hygiene partial -- D.1/D.2/D.4/D.5/D.6/D.7 landed; D.3 design doc, implementation deferred to its own brainstorm)
-**Current branch:** `dev` (no master merges until D.3 lands or `phase1-complete` is tagged)
-**Latest tag:** `phase1-subsys-parser-ergonomics` (Subsystem 8 Stage 8c completion; Phase 1 done)
+**Last updated:** 2026-04-29 (D.8 master merge complete; A.2 PC-anchored validation landed; D.3 still open)
+**Current branch:** `dev` (master is fast-forwarded to dev at `phase1-complete`)
+**Latest tag:** `phase1-complete` (D.8 milestone -- all 8 subsystems + Phase 2 hygiene partial + A.2 + threads A/C closeout)
 
-**Session-resume entry point**: read `docs/superpowers/findings/2026-04-25-session-summary.md` first. It maps the 6 commits from 2026-04-25, the 6 findings docs from threads A and C, and what's still open (A.2 sweep + PC-anchored joining; D.3 universal-DeviceOp refactor; C.3/#6 debugfs-blocked; D.8 master merge milestone).
+**Session-resume entry point**: read `docs/superpowers/findings/2026-04-25-session-summary.md` for thread context, then this file for the refactor + milestone state.
+
+**What's still open after D.8:**
+- **D.3** -- extend `DeviceOp` to non-CDO write paths. Design at
+  `docs/superpowers/specs/2026-04-25-d3-deviceop-universal-design.md` (Option A
+  recommended). Needs brainstorm -> plan -> execute. Touches 9+ call sites
+  with subtle side-effect ordering risk; not a sed-replace.
+- **A.2b** -- EMU mode-2 (Execution) trace encoder + comparator. Tracking at
+  `docs/superpowers/findings/2026-04-28-a2b-mode2-decoder-deferred.md`. HW-only
+  baselines already captured by `trace-sweep --with-mode2-baseline`; EMU side
+  is the work.
+- **aie-translate tile discovery** -- replace grep+awk in `emu-bridge-test.sh`.
+  Tracking at `docs/superpowers/findings/2026-04-28-aie-translate-tile-discovery-followup.md`.
+- **C.3 / observability lead #6** -- ftrace + FW log/trace rings. Blocked on
+  debugfs from a kernel rebuild.
+- **bridge-trace-runner ctrlpkt protocol** -- documented bug in
+  `docs/superpowers/findings/2026-04-25-ctrl-packet-reconfig-bridge-runner.md`.
+  Doesn't block the validation pipeline.
 
 ---
 
