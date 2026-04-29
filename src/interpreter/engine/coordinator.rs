@@ -24,8 +24,7 @@ use crate::interpreter::timing::MemoryQuadrant;
 use xdna_archspec::aie2::SHIM_ROW;
 
 /// Engine execution status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EngineStatus {
     /// Engine is ready to run.
     #[default]
@@ -272,9 +271,7 @@ impl InterpreterEngine {
                             self.device.write_tile_register(col, row, offset, value);
                         }
                         CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id } => {
-                            self.device.array.handle_read_registers(
-                                col, row, offset, count, response_id,
-                            );
+                            self.device.array.handle_read_registers(col, row, offset, count, response_id);
                         }
                         CtrlPacketAction::Error(msg) => {
                             self.device.array.fatal_errors.push(msg);
@@ -298,10 +295,7 @@ impl InterpreterEngine {
             }
         }
         if total_flush_words > 0 {
-            log::info!(
-                "Post-flush routing: {} words in {} iterations",
-                total_flush_words, flush_iters
-            );
+            log::info!("Post-flush routing: {} words in {} iterations", total_flush_words, flush_iters);
         }
     }
 
@@ -326,8 +320,7 @@ impl InterpreterEngine {
         // any control packet actions that were generated.  Limit to a few
         // iterations; control packets traverse at most 4-5 hops.
         for _ in 0..8 {
-            let (_, _, words) =
-                self.device.array.step_data_movement(&mut self.host_memory);
+            let (_, _, words) = self.device.array.step_data_movement(&mut self.host_memory);
 
             let ctrl_actions = self.device.array.drain_ctrl_packet_actions();
             if ctrl_actions.is_empty() && words == 0 {
@@ -341,9 +334,7 @@ impl InterpreterEngine {
                         self.device.write_tile_register(col, row, offset, value);
                     }
                     CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id } => {
-                        self.device.array.handle_read_registers(
-                            col, row, offset, count, response_id,
-                        );
+                        self.device.array.handle_read_registers(col, row, offset, count, response_id);
                     }
                     CtrlPacketAction::Error(msg) => {
                         self.device.array.fatal_errors.push(msg);
@@ -405,9 +396,7 @@ impl InterpreterEngine {
 
     /// Check if a core is enabled.
     pub fn is_core_enabled(&self, col: usize, row: usize) -> bool {
-        self.get_core(col, row)
-            .map(|c| c.enabled)
-            .unwrap_or(false)
+        self.get_core(col, row).map(|c| c.enabled).unwrap_or(false)
     }
 
     /// Drain pending core enable/disable events from device state.
@@ -490,7 +479,9 @@ impl InterpreterEngine {
 
         // Load segments into tile memory
         {
-            let tile = self.device.tile_mut(col, row)
+            let tile = self
+                .device
+                .tile_mut(col, row)
                 .ok_or_else(|| format!("Invalid tile coordinates ({}, {})", col, row))?;
             elf.load_into(tile);
         }
@@ -615,7 +606,8 @@ impl InterpreterEngine {
                     };
 
                     let result = core.interpreter.step_with_neighbor_locks(
-                        &mut core.context, tile,
+                        &mut core.context,
+                        tile,
                         &mut nlocks,
                         Some(&mut neighbors),
                     );
@@ -653,12 +645,24 @@ impl InterpreterEngine {
                             tile.core_debug.update_stalls(false, false, false, false);
                         }
                         StepResult::DecodeError(ref e) => {
-                            log::error!("Core({},{}) DecodeError at cycle {}: {:?}", col, row, self.total_cycles, e);
+                            log::error!(
+                                "Core({},{}) DecodeError at cycle {}: {:?}",
+                                col,
+                                row,
+                                self.total_cycles,
+                                e
+                            );
                             self.status = EngineStatus::Error;
                             return;
                         }
                         StepResult::ExecError(ref e) => {
-                            log::error!("Core({},{}) ExecError at cycle {}: {:?}", col, row, self.total_cycles, e);
+                            log::error!(
+                                "Core({},{}) ExecError at cycle {}: {:?}",
+                                col,
+                                row,
+                                self.total_cycles,
+                                e
+                            );
                             self.status = EngineStatus::Error;
                             return;
                         }
@@ -700,7 +704,8 @@ impl InterpreterEngine {
                 fn writeback_locks(
                     device: &mut DeviceState,
                     locks: Option<Vec<crate::device::tile::Lock>>,
-                    ncol: usize, nrow: usize,
+                    ncol: usize,
+                    nrow: usize,
                 ) {
                     if let Some(modified) = locks {
                         if let Some(neighbor) = device.tile_mut(ncol, nrow) {
@@ -763,9 +768,7 @@ impl InterpreterEngine {
                     self.device.write_tile_register(col, row, offset, value);
                 }
                 CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id } => {
-                    self.device.array.handle_read_registers(
-                        col, row, offset, count, response_id,
-                    );
+                    self.device.array.handle_read_registers(col, row, offset, count, response_id);
                 }
                 CtrlPacketAction::Error(msg) => {
                     self.device.array.fatal_errors.push(msg);
@@ -836,14 +839,18 @@ impl InterpreterEngine {
                             let hw_id = match tt {
                                 TileKind::Compute => crate::trace::core_port_running_hw_id(event_port),
                                 TileKind::Mem => crate::trace::memtile_port_running_hw_id(event_port),
-                                TileKind::ShimNoc | TileKind::ShimPl => crate::trace::shim_port_running_hw_id(event_port),
+                                TileKind::ShimNoc | TileKind::ShimPl => {
+                                    crate::trace::shim_port_running_hw_id(event_port)
+                                }
                             };
                             (hw_id, EventType::PortRunning { port: event_port })
                         } else {
                             let hw_id = match tt {
                                 TileKind::Compute => crate::trace::core_port_idle_hw_id(event_port),
                                 TileKind::Mem => crate::trace::memtile_port_idle_hw_id(event_port),
-                                TileKind::ShimNoc | TileKind::ShimPl => crate::trace::shim_port_idle_hw_id(event_port),
+                                TileKind::ShimNoc | TileKind::ShimPl => {
+                                    crate::trace::shim_port_idle_hw_id(event_port)
+                                }
                             };
                             (hw_id, EventType::PortIdle { port: event_port })
                         };
@@ -853,7 +860,9 @@ impl InterpreterEngine {
                             let hw_id = match tt {
                                 TileKind::Compute => crate::trace::core_port_stalled_hw_id(event_port),
                                 TileKind::Mem => crate::trace::memtile_port_stalled_hw_id(event_port),
-                                TileKind::ShimNoc | TileKind::ShimPl => crate::trace::shim_port_stalled_hw_id(event_port),
+                                TileKind::ShimNoc | TileKind::ShimPl => {
+                                    crate::trace::shim_port_stalled_hw_id(event_port)
+                                }
                             };
                             port_events.push((idx, hw_id, EventType::PortStalled { port: event_port }, tt));
                         }
@@ -862,7 +871,9 @@ impl InterpreterEngine {
                             let hw_id = match tt {
                                 TileKind::Compute => crate::trace::core_port_tlast_hw_id(event_port),
                                 TileKind::Mem => crate::trace::memtile_port_tlast_hw_id(event_port),
-                                TileKind::ShimNoc | TileKind::ShimPl => crate::trace::shim_port_tlast_hw_id(event_port),
+                                TileKind::ShimNoc | TileKind::ShimPl => {
+                                    crate::trace::shim_port_tlast_hw_id(event_port)
+                                }
                             };
                             port_events.push((idx, hw_id, EventType::PortTlast { port: event_port }, tt));
                         }
@@ -965,10 +976,8 @@ impl InterpreterEngine {
                 }
                 let ctx = &mut self.cores[core_idx].context;
                 ctx.timing_context_mut().memory_stalls += 1;
-                ctx.timing_context_mut().record_event(
-                    cycle,
-                    crate::interpreter::state::EventType::MemoryStall { cycles: 1 },
-                );
+                ctx.timing_context_mut()
+                    .record_event(cycle, crate::interpreter::state::EventType::MemoryStall { cycles: 1 });
             }
         }
 
@@ -1111,7 +1120,11 @@ impl InterpreterEngine {
         let any_cores_enabled = self.cores.iter().any(|c| c.enabled);
 
         // All compute work is done when cores have halted (or none exist).
-        let cores_done = if any_cores_enabled { all_halted } else { !any_running };
+        let cores_done = if any_cores_enabled {
+            all_halted
+        } else {
+            !any_running
+        };
 
         if cores_done && !dma_active {
             self.status = EngineStatus::Halted;
@@ -1318,10 +1331,7 @@ impl InterpreterEngine {
 
     /// Get the number of running (non-halted) cores.
     pub fn active_cores(&self) -> usize {
-        self.cores
-            .iter()
-            .filter(|c| c.enabled && !c.interpreter.is_halted())
-            .count()
+        self.cores.iter().filter(|c| c.enabled && !c.interpreter.is_halted()).count()
     }
 
     /// Check if all enabled cores are blocked (stalled on lock/DMA or halted).
@@ -1333,10 +1343,7 @@ impl InterpreterEngine {
     /// acquire) before any host-issued writes modify tile memory.
     pub fn all_cores_blocked(&self) -> bool {
         let enabled: Vec<_> = self.cores.iter().filter(|c| c.enabled).collect();
-        !enabled.is_empty()
-            && enabled.iter().all(|c| {
-                c.interpreter.is_stalled() || c.interpreter.is_halted()
-            })
+        !enabled.is_empty() && enabled.iter().all(|c| c.interpreter.is_stalled() || c.interpreter.is_halted())
     }
 
     /// Set auto-run mode.
@@ -1599,7 +1606,9 @@ mod tests {
                 let stats = dma.channel_stats(2).unwrap();
                 panic!(
                     "DMA taking too long. State: {:?}, bytes transferred: {}, active: {}",
-                    state, stats.bytes_transferred, dma.channel_active(2)
+                    state,
+                    stats.bytes_transferred,
+                    dma.channel_active(2)
                 );
             }
         }
@@ -1808,13 +1817,7 @@ mod tests {
         // cycle-4 frame is committed at end of cycle 4 itself).
         let _ = engine.run(6);
 
-        let bytes = engine
-            .device()
-            .array
-            .tile(0, 2)
-            .core_trace
-            .encoded_bytes()
-            .to_vec();
+        let bytes = engine.device().array.tile(0, 2).core_trace.encoded_bytes().to_vec();
 
         // Skip the 8-byte Start marker (byte 0 = 0xF0 + 7 timer bytes).
         assert_eq!(
@@ -1823,11 +1826,7 @@ mod tests {
             "expected Start marker as first byte; got buffer {:02X?}",
             bytes
         );
-        assert!(
-            bytes.len() > 8,
-            "buffer must hold more than just the Start marker; got {:02X?}",
-            bytes
-        );
+        assert!(bytes.len() > 8, "buffer must hold more than just the Start marker; got {:02X?}", bytes);
 
         // Walk the post-marker bytes and locate any Multiple0 frame.
         // Multiple0 has top 4 bits = 0b1100, so byte0 & 0xF0 == 0xC0.
@@ -1958,7 +1957,8 @@ mod tests {
             bytes.len() >= 12,
             "expected at least 12 bytes (8 start marker + 4 EventPC frame); \
              got {} bytes: {:02X?}",
-            bytes.len(), bytes
+            bytes.len(),
+            bytes
         );
 
         // bytes 0-7: Start marker (0xF1 + 7 timer bytes in EventPc mode).
@@ -1970,11 +1970,13 @@ mod tests {
         //   byte3 = pc14 & 0xFF = 0x00
         let frame = &bytes[8..12];
         assert_eq!(
-            frame, &[0xC4, 0x04, 0x01, 0x00],
+            frame,
+            &[0xC4, 0x04, 0x01, 0x00],
             "EventPC frame mismatch: expected [0xC4, 0x04, 0x01, 0x00] \
              (mask=0b1, pc=0x100), got {:02X?}. \
              Full buffer: {:02X?}",
-            frame, bytes
+            frame,
+            bytes
         );
     }
 
@@ -2049,14 +2051,17 @@ mod tests {
         assert!(
             bytes.len() >= 12,
             "expected >= 12 bytes (8-byte Start + 4-byte EventPC); got {}: {:02X?}",
-            bytes.len(), bytes
+            bytes.len(),
+            bytes
         );
         let frame = &bytes[8..12];
         assert_eq!(
-            frame, &[0xC4, 0x04, 0x00, 0x00],
+            frame,
+            &[0xC4, 0x04, 0x00, 0x00],
             "perfcnt threshold did not produce expected mode-1 EventPC frame \
              (mask=0b1, sentinel pc=0); got {:02X?}.  Full buffer: {:02X?}",
-            frame, bytes
+            frame,
+            bytes
         );
     }
 }
