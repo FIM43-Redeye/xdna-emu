@@ -127,10 +127,7 @@ fn parse_device(name: &str) -> MappingTree {
         "npu1" => build_aie2_mapping_tree(),
         "vc2802" => build_vc2802_mapping_tree(),
         other => {
-            eprintln!(
-                "Error: unknown device '{}'. Use npu1 or vc2802.",
-                other
-            );
+            eprintln!("Error: unknown device '{}'. Use npu1 or vc2802.", other);
             process::exit(1);
         }
     }
@@ -143,10 +140,7 @@ fn parse_tolerance(name: &str) -> ToleranceConfig {
         "relaxed" => ToleranceConfig::relaxed(),
         "default" => ToleranceConfig::aie2_default(),
         other => {
-            eprintln!(
-                "Error: unknown tolerance '{}'. Use strict, relaxed, or default.",
-                other
-            );
+            eprintln!("Error: unknown tolerance '{}'. Use strict, relaxed, or default.", other);
             process::exit(1);
         }
     }
@@ -175,7 +169,11 @@ fn run_compare(
 
     let result = compare_signals(&input, tolerance);
 
-    let report = if json { json_report(&result) } else { text_report(&result, tolerance) };
+    let report = if json {
+        json_report(&result)
+    } else {
+        text_report(&result, tolerance)
+    };
 
     write_output(&report, output);
 }

@@ -12,9 +12,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json;
 
-use xdna_archspec::aie2::isa::{
-    self as tablegen, InstrEncoding, OperandType, RegisterKind,
-};
+use xdna_archspec::aie2::isa::{self as tablegen, InstrEncoding, OperandType, RegisterKind};
 
 // ---------------------------------------------------------------------------
 // Serializable mirror types (we don't want to add Serialize to core types)
@@ -69,21 +67,24 @@ fn register_kind_str(ot: &OperandType) -> Option<String> {
         }
         _ => return None,
     };
-    Some(match kind {
-        RegisterKind::Scalar => "scalar",
-        RegisterKind::Pointer => "pointer",
-        RegisterKind::ModifierM => "modifier_m",
-        RegisterKind::ModifierDN => "modifier_dn",
-        RegisterKind::ModifierDJ => "modifier_dj",
-        RegisterKind::ModifierDC => "modifier_dc",
-        RegisterKind::Vector256 => "vector256",
-        RegisterKind::Vector512 => "vector512",
-        RegisterKind::Vector1024 => "vector1024",
-        RegisterKind::Accumulator => "accumulator",
-        RegisterKind::Control => "control",
-        RegisterKind::SparseQx => "sparse_qx",
-        RegisterKind::ScalarPair => "scalar_pair",
-    }.to_string())
+    Some(
+        match kind {
+            RegisterKind::Scalar => "scalar",
+            RegisterKind::Pointer => "pointer",
+            RegisterKind::ModifierM => "modifier_m",
+            RegisterKind::ModifierDN => "modifier_dn",
+            RegisterKind::ModifierDJ => "modifier_dj",
+            RegisterKind::ModifierDC => "modifier_dc",
+            RegisterKind::Vector256 => "vector256",
+            RegisterKind::Vector512 => "vector512",
+            RegisterKind::Vector1024 => "vector1024",
+            RegisterKind::Accumulator => "accumulator",
+            RegisterKind::Control => "control",
+            RegisterKind::SparseQx => "sparse_qx",
+            RegisterKind::ScalarPair => "scalar_pair",
+        }
+        .to_string(),
+    )
 }
 
 fn imm_scale(ot: &OperandType) -> Option<i32> {
@@ -129,9 +130,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     let output_path = if let Some(pos) = args.iter().position(|a| a == "--output") {
-        args.get(pos + 1)
-            .expect("--output requires a path argument")
-            .clone()
+        args.get(pos + 1).expect("--output requires a path argument").clone()
     } else {
         "tools/aie2-isa.json".to_string()
     };
@@ -144,23 +143,17 @@ fn main() {
     let mut total = 0usize;
 
     for (slot, encodings) in &tblgen.encodings_by_slot {
-        let mut converted: Vec<IsaInstruction> = encodings
-            .iter()
-            .map(convert_instruction)
-            .collect();
+        let mut converted: Vec<IsaInstruction> = encodings.iter().map(convert_instruction).collect();
         converted.sort_by(|a, b| a.name.cmp(&b.name));
         total += converted.len();
         by_slot.insert(slot.clone(), converted);
     }
 
-    eprintln!("Exporting {} instructions across {} slots to {}",
-        total, by_slot.len(), output_path);
+    eprintln!("Exporting {} instructions across {} slots to {}", total, by_slot.len(), output_path);
 
-    let json = serde_json::to_string_pretty(&by_slot)
-        .expect("JSON serialization failed");
+    let json = serde_json::to_string_pretty(&by_slot).expect("JSON serialization failed");
 
-    std::fs::write(&output_path, &json)
-        .unwrap_or_else(|e| panic!("Failed to write {}: {}", output_path, e));
+    std::fs::write(&output_path, &json).unwrap_or_else(|e| panic!("Failed to write {}: {}", output_path, e));
 
     eprintln!("Done. {} bytes written.", json.len());
 }
