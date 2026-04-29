@@ -1473,16 +1473,36 @@ fn pair_events(src: &[u64], dst: &[u64]) -> Vec<CorrelationPair> {
 // PC-Anchored analysis (Task 7)
 // ============================================================================
 
-/// Canonical event name for the perfcnt overflow slot.
-///
-/// mlir-aie consistently uses "PERF_CNT_0" (enum value 5 in all
-/// architecture event tables: aie.py, aie2.py, aie2p.py). The
-/// AM020/AM025 documentation uses "PERF_CNT_0_EVENT" for the same
-/// hardware event; we keep it as a fallback in case a non-mlir-aie
-/// tool ever writes events.json using the documentation name.
-const PERFCNT_SLOT_NAMES: &[&str] = &["PERF_CNT_0", "PERF_CNT_0_EVENT"];
+/// Default cycles between perfcnt overflows when none can be derived
+/// from observed PCs. Matches `tools/perfcnt_defaults.py`'s
+/// `DEFAULT_PERFCNT_PERIOD` -- keep the two in sync if either changes.
+pub const DEFAULT_PERFCNT_PERIOD: u64 = 1024;
 
-/// Return true if this event name is the perfcnt overflow sentinel.
+/// Canonical event names for the perfcnt overflow slots.
+///
+/// All four counters per module are recognized as anchor candidates:
+/// PERF_CNT_0..3 in core/mem/memtile event tables, PERF_CNT0..3_EVENT
+/// in shim event tables (mlir-aie's distinct naming for shim, observed
+/// in `xdna-archspec` generated tables). PERF_CNT_0_EVENT is the
+/// AM020/AM025 documentation form, kept for non-mlir-aie writers.
+///
+/// Today the inject pipeline only configures counter 0, so PERF_CNT_0
+/// is the practical default. Recognizing 1..3 is forward-looking for
+/// tests that might use a non-zero counter as the trace anchor without
+/// having to update this list.
+const PERFCNT_SLOT_NAMES: &[&str] = &[
+    "PERF_CNT_0",
+    "PERF_CNT_1",
+    "PERF_CNT_2",
+    "PERF_CNT_3",
+    "PERF_CNT0_EVENT",
+    "PERF_CNT1_EVENT",
+    "PERF_CNT2_EVENT",
+    "PERF_CNT3_EVENT",
+    "PERF_CNT_0_EVENT",
+];
+
+/// Return true if this event name is a perfcnt overflow sentinel.
 fn is_perfcnt_event(name: &str) -> bool {
     PERFCNT_SLOT_NAMES.contains(&name)
 }
@@ -1494,27 +1514,43 @@ fn is_perfcnt_event(name: &str) -> bool {
 /// exactly `period` cycles. A PC that falls between tick[i-1] and tick[i]
 /// gets a fractional estimate by linear interpolation across that interval.
 ///
-/// Returns 0 if `perfcnt_pcs` is empty or `pc` is before the first tick.
-pub fn interpolate_cycle_from_perfcnt(pc: u64, perfcnt_pcs: &[u64], period: u64) -> u64 {
+/// Returns `None` when `perfcnt_pcs` is empty -- there's no anchor at all,
+/// so any cycle answer would be invented. Returns `Some(0)` when `pc`
+/// precedes the first tick (cycle 0..period can't be pinned tighter without
+/// an earlier anchor; the lower bound is honest) and `Some((n-1) * period)`
+/// when `pc` is at or beyond the last tick (clamped to the last anchored
+/// cycle).
+///
+/// The "two consecutive ticks share the same retire PC" degenerate case
+/// (tight loop straddling an overflow boundary) is unreachable under
+/// `partition_point`'s semantics: a probe PC strictly equal to a colliding
+/// tick value lands on the first occurrence of that value, putting
+/// `pc_below` on the previous *distinct* tick. The function still
+/// `debug_assert!`s that the span is positive as a guard against future
+/// changes to idx selection.
+pub fn interpolate_cycle_from_perfcnt(pc: u64, perfcnt_pcs: &[u64], period: u64) -> Option<u64> {
     if perfcnt_pcs.is_empty() {
-        return 0;
+        return None;
     }
     // partition_point returns the index of the first element >= pc.
     let idx = perfcnt_pcs.partition_point(|&p| p < pc);
     if idx == 0 {
-        // Before first tick: estimate 0.
-        return 0;
+        // Before first tick: lower-bound estimate.
+        return Some(0);
     }
     if idx >= perfcnt_pcs.len() {
-        // After last tick: clamp to last tick's cycle.
-        return (perfcnt_pcs.len() as u64 - 1) * period;
+        // At or after last tick: clamp to last tick's cycle.
+        return Some((perfcnt_pcs.len() as u64 - 1) * period);
     }
     let pc_below = perfcnt_pcs[idx - 1];
     let pc_above = perfcnt_pcs[idx];
-    // Avoid division by zero if two ticks have the same PC (degenerate case).
-    let span = pc_above.saturating_sub(pc_below).max(1);
+    debug_assert!(
+        pc_above > pc_below,
+        "partition_point invariant violated: idx={idx} pc_below={pc_below} pc_above={pc_above}"
+    );
+    let span = pc_above - pc_below;
     let frac = (pc - pc_below) as f64 / span as f64;
-    ((idx as f64 - 1.0 + frac) * period as f64) as u64
+    Some(((idx as f64 - 1.0 + frac) * period as f64) as u64)
 }
 
 /// Compare one tile's HW vs EMU mode-1 events using PC-set and multiset diff.
@@ -1607,20 +1643,21 @@ pub fn compare_pc_anchored_for_tile(
     report.hw_perfcnt_tick_count = hw_perfcnt_pcs.len();
     report.emu_perfcnt_tick_count = emu_perfcnt_pcs.len();
 
-    // Cycle bands require BOTH sides to have at least one perfcnt overflow.
-    // One-sided absence would make `interpolate_cycle_from_perfcnt` return 0
-    // for the missing side, manufacturing a fake "exceeds tolerance" delta
-    // for every event. "No data" is a clearer signal than "fake data".
-    let bands_enabled = !hw_perfcnt_pcs.is_empty() && !emu_perfcnt_pcs.is_empty();
+    // Cycle bands require BOTH sides to have at least 2 perfcnt overflows.
+    // With only 1 tick on a side, `interpolate_cycle_from_perfcnt` clamps to
+    // 0 (before the tick) or 0 (at the tick), which is silently bogus rather
+    // than a real estimate. With <1 tick, fake "exceeds tolerance" deltas
+    // would appear for every event. "No data" is a clearer signal than "fake
+    // data" -- callers who want loose anchors can request them explicitly.
+    let bands_enabled = hw_perfcnt_pcs.len() >= 2 && emu_perfcnt_pcs.len() >= 2;
 
     // Estimate perfcnt period from the median inter-overflow PC distance.
-    // Falls back to a wide default when there are fewer than 2 ticks.
-    // 1024 matches the default --perfcnt-period in mlir-trace-inject.py.
-    // If fewer than 2 ticks are present on both sides, we cannot estimate
-    // the real period and fall back to this safe default.
+    // Falls back to DEFAULT_PERFCNT_PERIOD when neither side has 2+ ticks.
+    // (When bands_enabled is true, both sides have 2+ ticks and at least one
+    // estimate succeeds; the unwrap_or only fires for inert callers.)
     let period: u64 = estimate_perfcnt_period(&hw_perfcnt_pcs)
         .or_else(|| estimate_perfcnt_period(&emu_perfcnt_pcs))
-        .unwrap_or(1024);
+        .unwrap_or(DEFAULT_PERFCNT_PERIOD);
 
     // Set and multiset diff per event name.
     for name in &all_names {
@@ -1663,12 +1700,19 @@ pub fn compare_pc_anchored_for_tile(
         }
 
         // For every PC that appears in either side, interpolate cycle estimates.
+        // Skip PCs where either side returns None -- the degenerate cases
+        // (empty anchors, same-PC tick collision) shouldn't pollute the band
+        // map with bogus zero estimates.
         let all_pcs: HashSet<u64> = hw_pcs.iter().chain(emu_pcs.iter()).copied().collect();
         let tolerance = period / 2;
         let mut bands: HashMap<u64, CycleBand> = HashMap::new();
         for pc in all_pcs {
-            let hw_est = interpolate_cycle_from_perfcnt(pc, &hw_perfcnt_pcs, period);
-            let emu_est = interpolate_cycle_from_perfcnt(pc, &emu_perfcnt_pcs, period);
+            let (Some(hw_est), Some(emu_est)) = (
+                interpolate_cycle_from_perfcnt(pc, &hw_perfcnt_pcs, period),
+                interpolate_cycle_from_perfcnt(pc, &emu_perfcnt_pcs, period),
+            ) else {
+                continue;
+            };
             let delta = hw_est as i64 - emu_est as i64;
             bands.insert(
                 pc,
@@ -3288,27 +3332,43 @@ mod tests {
         let perfcnt_pcs = vec![10u64, 60, 110];
         let period = 50u64;
         let est = interpolate_cycle_from_perfcnt(35, &perfcnt_pcs, period);
-        assert_eq!(est, 25);
+        assert_eq!(est, Some(25));
         // PC 85 is between tick[1]=60 and tick[2]=110.
         // Linear: cycle ~= 50 + 50 * (85-60)/(110-60) = 75.
         let est2 = interpolate_cycle_from_perfcnt(85, &perfcnt_pcs, period);
-        assert_eq!(est2, 75);
+        assert_eq!(est2, Some(75));
     }
 
     #[test]
     fn cycle_band_boundary_cases() {
         let perfcnt_pcs = vec![10u64, 60, 110];
         let period = 50u64;
-        // Exactly at tick[0]: returns 0 cycles.
-        assert_eq!(interpolate_cycle_from_perfcnt(10, &perfcnt_pcs, period), 0);
-        // Exactly at tick[1]: returns 1 * 50 = 50 cycles.
-        assert_eq!(interpolate_cycle_from_perfcnt(60, &perfcnt_pcs, period), 50);
-        // Before first tick: returns 0.
-        assert_eq!(interpolate_cycle_from_perfcnt(5, &perfcnt_pcs, period), 0);
-        // After last tick: clamps to (len-1)*period = 100.
-        assert_eq!(interpolate_cycle_from_perfcnt(200, &perfcnt_pcs, period), 100);
-        // Empty perfcnt: always 0.
-        assert_eq!(interpolate_cycle_from_perfcnt(50, &[], period), 0);
+        // Exactly at tick[0]: returns Some(0) cycles.
+        assert_eq!(interpolate_cycle_from_perfcnt(10, &perfcnt_pcs, period), Some(0));
+        // Exactly at tick[1]: returns Some(1 * 50) = Some(50) cycles.
+        assert_eq!(interpolate_cycle_from_perfcnt(60, &perfcnt_pcs, period), Some(50));
+        // Before first tick: returns Some(0).
+        assert_eq!(interpolate_cycle_from_perfcnt(5, &perfcnt_pcs, period), Some(0));
+        // After last tick: clamps to Some((len-1)*period) = Some(100).
+        assert_eq!(interpolate_cycle_from_perfcnt(200, &perfcnt_pcs, period), Some(100));
+        // Empty perfcnt: returns None (no anchor).
+        assert_eq!(interpolate_cycle_from_perfcnt(50, &[], period), None);
+    }
+
+    #[test]
+    fn cycle_band_handles_duplicate_ticks() {
+        // Two consecutive overflows at the same retire PC -- a tight loop
+        // straddling the overflow boundary. partition_point places probes
+        // such that pc_below is always the previous *distinct* tick, so the
+        // span is positive and the standard interpolation applies.
+        let perfcnt_pcs = vec![10u64, 50, 50, 100];
+        let period = 50u64;
+        // PC=50 lands at idx=1 (first tick >= 50), pc_below=10, pc_above=50.
+        // Linear: cycle = 0 + 50 * (50-10)/(50-10) = 50.
+        assert_eq!(interpolate_cycle_from_perfcnt(50, &perfcnt_pcs, period), Some(50));
+        // PC=51 lands at idx=3 (past the run of 50s), pc_below=50, pc_above=100.
+        // Linear: cycle = 100 + 50 * (51-50)/(100-50) = 101.
+        assert_eq!(interpolate_cycle_from_perfcnt(51, &perfcnt_pcs, period), Some(101));
     }
 
     #[test]
@@ -3341,12 +3401,49 @@ mod tests {
     }
 
     #[test]
+    fn pc_anchored_single_tick_per_side_suppresses_bands() {
+        // Only one perfcnt tick on each side -- bands_enabled requires
+        // >= 2 per side, so cycle_bands should be empty (or absent) for
+        // every non-perfcnt event. This prevents silently-bogus zero
+        // cycle estimates from one-anchor cases.
+        let hw_events = vec![
+            TileEvent { slot: 1, abs_cycle: 0x100 }, // single perfcnt tick
+            TileEvent { slot: 0, abs_cycle: 0x180 }, // INSTR_VECTOR
+        ];
+        let emu_events = vec![
+            TileEvent { slot: 1, abs_cycle: 0x100 }, // single perfcnt tick
+            TileEvent { slot: 0, abs_cycle: 0x180 }, // INSTR_VECTOR
+        ];
+        let names = vec!["INSTR_VECTOR".to_string(), "PERF_CNT_0".to_string()];
+        let key = TileKey { col: 0, row: 2, pkt_type: 0 };
+        let report = compare_pc_anchored_for_tile(key, &hw_events, &emu_events, &names);
+        assert_eq!(report.hw_perfcnt_tick_count, 1);
+        assert_eq!(report.emu_perfcnt_tick_count, 1);
+        // No cycle band for INSTR_VECTOR -- one-tick anchor is insufficient.
+        assert!(
+            report.cycle_bands.get("INSTR_VECTOR").is_none(),
+            "single-tick anchor should suppress cycle bands"
+        );
+    }
+
+    #[test]
     fn pc_anchored_perfcnt_slot_name_variant() {
-        // Verify both spellings of the perfcnt event name are recognized.
+        // Core/mem/memtile naming: PERF_CNT_{0,1,2,3}.
         assert!(is_perfcnt_event("PERF_CNT_0"));
+        assert!(is_perfcnt_event("PERF_CNT_1"));
+        assert!(is_perfcnt_event("PERF_CNT_2"));
+        assert!(is_perfcnt_event("PERF_CNT_3"));
+        // Shim naming (mlir-aie's distinct enum): PERF_CNT{0,1,2,3}_EVENT.
+        assert!(is_perfcnt_event("PERF_CNT0_EVENT"));
+        assert!(is_perfcnt_event("PERF_CNT1_EVENT"));
+        assert!(is_perfcnt_event("PERF_CNT2_EVENT"));
+        assert!(is_perfcnt_event("PERF_CNT3_EVENT"));
+        // Legacy AM020 documentation form for counter 0.
         assert!(is_perfcnt_event("PERF_CNT_0_EVENT"));
+        // Non-perfcnt events are rejected.
         assert!(!is_perfcnt_event("INSTR_VECTOR"));
-        assert!(!is_perfcnt_event("PERF_CNT_1"));
+        assert!(!is_perfcnt_event("PERF_CNT_4")); // hardware doesn't go past 3
+        assert!(!is_perfcnt_event("PERF_CNT4_EVENT"));
     }
 
     #[test]

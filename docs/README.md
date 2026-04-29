@@ -17,6 +17,11 @@ Living technical reference material:
 - [programmatic-sources.md](programmatic-sources.md) -- Survey of
   programmatically-extractable sources of hardware truth
 
+## Trace Tooling
+
+- [trace/pc-anchored.md](trace/pc-anchored.md) -- PC-anchored mode-1
+  trace sweep + comparison workflow
+
 ## Format Specifications
 
 - [XCLBIN Format](formats/xclbin.md) -- Container format for NPU binaries

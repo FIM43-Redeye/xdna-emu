@@ -1034,7 +1034,10 @@ impl InterpreterEngine {
         // must be coalesced into a single Multiple frame, not split across
         // two frames.
         {
-            const PERF_CNT_BASE: u8 = 5;
+            // PERF_CNT_0 has the same numeric ID (5) across every module type
+            // per aie-rt xaie_events_aieml.h, so core_events::PERF_CNT_0 is
+            // safe to use as the base for both core and memmod perf counters.
+            use xdna_archspec::aie2::trace_events::core_events::PERF_CNT_0 as PERF_CNT_BASE;
             let cycle = self.total_cycles;
             for (i, tile) in self.device.array.tiles.iter_mut().enumerate() {
                 tile.core_timer.tick();
@@ -1971,6 +1974,88 @@ mod tests {
             "EventPC frame mismatch: expected [0xC4, 0x04, 0x01, 0x00] \
              (mask=0b1, pc=0x100), got {:02X?}. \
              Full buffer: {:02X?}",
+            frame, bytes
+        );
+    }
+
+    /// End-to-end perfcnt -> mode-1 round-trip.
+    ///
+    /// Drives the full chain that the test_perfcnt_threshold_routes_to_trace_unit
+    /// test only covers in mode-0:
+    ///   perfcnt threshold fires
+    ///     -> coordinator Phase 3e drain
+    ///     -> notify_core_trace_event(PERF_CNT_0, cycle, None)  [no PC]
+    ///     -> TraceUnit::notify_event in EventPc mode
+    ///     -> pending_pc = 0 (sentinel for None)
+    ///     -> commit_cycle -> encode_event_pc(mask, pc=0)
+    ///     -> 4-byte EventPC frame in byte_buffer
+    ///
+    /// The sentinel pc=0 is expected behavior per the trace_unit doc comment:
+    /// hardware records one PC per frame, and perfcnt threshold events carry
+    /// no instruction PC, so we encode PC=0.  This test pins down that the
+    /// pipeline doesn't crash, drop the event, or emit a malformed frame.
+    #[test]
+    fn perfcnt_threshold_routes_to_mode1_event_pc_frame_with_sentinel_pc() {
+        use xdna_archspec::aie2::trace_events::core_events::PERF_CNT_0;
+
+        let mut engine = InterpreterEngine::new_npu1();
+
+        engine.enable_core(0, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+            tile.write_program(0, &[0x00u8; 256]);
+        }
+
+        // Perf counter 0: start=TRUE, threshold=5.  Fires at cycle 4 (5 ticks
+        // across cycles 0..4 with active-cycle tick).
+        {
+            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let ctrl0 = 1u32 | (0u32 << 8); // start=TRUE(1), stop=NONE(0)
+            tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
+            tile.core_perf_counters.write_event_value(0, 5);
+            tile.core_perf_counters.handle_event(1); // arm
+        }
+
+        // Trace: mode=EventPc(1), start=TRUE(1), slot 0 = PERF_CNT_0.
+        {
+            let tile = engine.device_mut().array.tile_mut(0, 2);
+            // Trace_Control0: stop[31:24]=0, start[23:16]=1, mode[1:0]=1
+            let ctrl0 = (0u32 << 24) | (1u32 << 16) | 1u32;
+            tile.core_trace.write_register(0x00, ctrl0);
+            tile.core_trace.write_register(0x10, PERF_CNT_0 as u32);
+        }
+
+        // Run enough cycles for the threshold to fire and Phase 3f to commit.
+        let _cycles = engine.run(10);
+
+        let tile = engine.device().array.tile(0, 2);
+        let bytes = tile.core_trace.encoded_bytes();
+
+        // Start marker = 0xF1 for mode 1.
+        assert_eq!(
+            bytes.first().copied(),
+            Some(0xF1),
+            "mode-1 Start marker 0xF1 expected; got {:02X?}",
+            bytes
+        );
+
+        // After 8-byte start marker, expect at least one EventPC frame.
+        // Discriminator: (b & 0b1111_1100) == 0b1100_0100.
+        // The threshold-firing frame uses mask = 0b00000001 (slot 0) and
+        // pc = 0 (sentinel for perfcnt's None PC):
+        //   byte0 = 0xC4 | 0 = 0xC4
+        //   byte1 = (1 & 0x3F) << 2 = 0x04
+        //   byte2 = (0 >> 8) & 0x3F = 0x00
+        //   byte3 = 0 & 0xFF = 0x00
+        assert!(
+            bytes.len() >= 12,
+            "expected >= 12 bytes (8-byte Start + 4-byte EventPC); got {}: {:02X?}",
+            bytes.len(), bytes
+        );
+        let frame = &bytes[8..12];
+        assert_eq!(
+            frame, &[0xC4, 0x04, 0x00, 0x00],
+            "perfcnt threshold did not produce expected mode-1 EventPC frame \
+             (mask=0b1, sentinel pc=0); got {:02X?}.  Full buffer: {:02X?}",
             frame, bytes
         );
     }

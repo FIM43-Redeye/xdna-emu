@@ -64,6 +64,11 @@ import io
 import sys
 from pathlib import Path
 
+# Shared default for --perfcnt-period.  Lives in tools/perfcnt_defaults.py
+# so trace-sweep.py and the Rust trace-compare can reference the same value.
+sys.path.insert(0, str(Path(__file__).parent))
+from perfcnt_defaults import DEFAULT_PERFCNT_PERIOD  # noqa: E402
+
 # MLIR op name used by mlir-aie for the declarative trace op. If the
 # aie dialect is ever renamed upstream, only this constant needs updating.
 TRACE_OP_NAME = "aie.trace"
@@ -167,9 +172,9 @@ def parse_args():
                         "Default: don't inject shim trace. 'all' is reserved "
                         "for future use; currently behaves the same as the default.")
 
-    p.add_argument("--perfcnt-period", type=int, default=1024,
-                   help="cycles between PERF_CNT_0_EVENT fires when grounding "
-                        "includes PERF_CNT_0 (default: 1024).")
+    p.add_argument("--perfcnt-period", type=int, default=DEFAULT_PERFCNT_PERIOD,
+                   help=f"cycles between PERF_CNT_0_EVENT fires when grounding "
+                        f"includes PERF_CNT_0 (default: {DEFAULT_PERFCNT_PERIOD}).")
 
     return p.parse_args()
 
@@ -251,7 +256,8 @@ def _emit_perfcnt_config(
         counts only while core is executing.
       - Performance_Control2 Cnt0_Reset_Event at bits[6:0]: event 5 = PERF_CNT_0,
         self-resets the counter on every fire.
-      - Period = user-specified via --perfcnt-period (default 1024).
+      - Period = user-specified via --perfcnt-period (default
+        DEFAULT_PERFCNT_PERIOD from tools/perfcnt_defaults.py).
 
     NOTE: Performance_Control{0,1,2} have no named fields in the aie-rt regdb
     (aie_registers_aie2.json), so field= cannot be used with mlir-aie's

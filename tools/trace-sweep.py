@@ -57,6 +57,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Shared default for --perfcnt-period.  See tools/perfcnt_defaults.py.
+sys.path.insert(0, str(Path(__file__).parent))
+from perfcnt_defaults import DEFAULT_PERFCNT_PERIOD  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Paths and constants
@@ -1507,7 +1511,7 @@ def sweep_lockstep(
     memmod_sweep: Optional[List[str]] = None,
     memtile_sweep: Optional[List[str]] = None,
     shim_sweep: Optional[List[str]] = None,
-    perfcnt_period: int = 1024,
+    perfcnt_period: int = DEFAULT_PERFCNT_PERIOD,
     with_mode2_baseline: bool = True,
     reuse_ctx: bool = False,
 ) -> None:
@@ -1982,7 +1986,7 @@ def main() -> int:
     ap.add_argument("--shim-sweep", default="all",
                     help="comma-separated event names to sweep on shims; "
                          "'all' enumerates from the event header")
-    ap.add_argument("--perfcnt-period", type=int, default=1024,
+    ap.add_argument("--perfcnt-period", type=int, default=DEFAULT_PERFCNT_PERIOD,
                     help="reserved for sanity-checking against the xclbin's "
                          "baked-in perfcnt period value")
     ap.add_argument("--with-mode2-baseline", action="store_true", default=True,
