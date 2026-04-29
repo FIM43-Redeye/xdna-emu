@@ -11,9 +11,8 @@
 //! was deleted in the same subsystem.
 
 use crate::dma::field_layouts::{
-    BdFieldLayout, ChannelFieldLayout, StatusFieldLayout,
-    MemTileBdFieldLayout, ShimBdFieldLayout, ShimMuxLayout,
-    StreamSwitchLayout, ModuleEventLayout,
+    BdFieldLayout, ChannelFieldLayout, StatusFieldLayout, MemTileBdFieldLayout, ShimBdFieldLayout,
+    ShimMuxLayout, StreamSwitchLayout, ModuleEventLayout,
 };
 use crate::regdb::RegisterDb;
 
@@ -208,14 +207,14 @@ impl DeviceRegLayout {
         let memtile_bd_stride = reg_offset("memory_tile", "DMA_BD1_0")? - memtile_bd_base;
 
         let mt = db.module("memory_tile").unwrap();
-        let memtile_bd_words = (0..16)
-            .take_while(|i| mt.register(&format!("DMA_BD0_{}", i)).is_some())
-            .count();
+        let memtile_bd_words =
+            (0..16).take_while(|i| mt.register(&format!("DMA_BD0_{}", i)).is_some()).count();
 
         // -- MemTile channels --
         let memtile_channel_s2mm_base = reg_offset("memory_tile", "DMA_S2MM_0_Ctrl")?;
         let memtile_channel_mm2s_base = reg_offset("memory_tile", "DMA_MM2S_0_Ctrl")?;
-        let memtile_channel_stride = reg_offset("memory_tile", "DMA_S2MM_1_Ctrl")? - memtile_channel_s2mm_base;
+        let memtile_channel_stride =
+            reg_offset("memory_tile", "DMA_S2MM_1_Ctrl")? - memtile_channel_s2mm_base;
 
         // -- Stream switch --
         // Note: AM025 JSON places compute tile stream switch registers under
@@ -241,9 +240,7 @@ impl DeviceRegLayout {
         let shim_bd_stride = reg_offset("shim", "DMA_BD1_0")? - shim_bd_base;
 
         let sh = db.module("shim").unwrap();
-        let shim_bd_words = (0..16)
-            .take_while(|i| sh.register(&format!("DMA_BD0_{}", i)).is_some())
-            .count();
+        let shim_bd_words = (0..16).take_while(|i| sh.register(&format!("DMA_BD0_{}", i)).is_some()).count();
 
         // -- Shim channels --
         let shim_channel_base = reg_offset("shim", "DMA_S2MM_0_Ctrl")?;
@@ -253,10 +250,7 @@ impl DeviceRegLayout {
         // Helper: look up a register offset, returning 0 if not found
         // (some modules may not have all event registers).
         let reg_offset_opt = |module: &str, reg: &str| -> u32 {
-            db.module(module)
-                .and_then(|m| m.register(reg))
-                .map(|r| r.offset)
-                .unwrap_or(0)
+            db.module(module).and_then(|m| m.register(reg)).map(|r| r.offset).unwrap_or(0)
         };
 
         let build_event_layout = |module: &str| -> ModuleEventLayout {

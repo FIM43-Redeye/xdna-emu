@@ -6,9 +6,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::dma::{
-        BdFieldLayout, ChannelFieldLayout, DeviceRegLayout, StreamSwitchLayout,
-    };
+    use crate::dma::{BdFieldLayout, ChannelFieldLayout, DeviceRegLayout, StreamSwitchLayout};
     use crate::regdb::{AccessMode, BitField, RegisterDb};
 
     // ====================================================================
@@ -95,17 +93,23 @@ mod tests {
     fn test_bitfield_insert_roundtrip() {
         // Verify insert -> extract roundtrip for various field positions
         let fields = [
-            BitField::from_range("low".to_string(), 0, 3),     // bits 3:0
-            BitField::from_range("mid".to_string(), 8, 15),    // bits 15:8
-            BitField::from_range("high".to_string(), 24, 31),  // bits 31:24
+            BitField::from_range("low".to_string(), 0, 3),      // bits 3:0
+            BitField::from_range("mid".to_string(), 8, 15),     // bits 15:8
+            BitField::from_range("high".to_string(), 24, 31),   // bits 31:24
             BitField::from_range("single".to_string(), 19, 19), // single bit
         ];
 
         for bf in &fields {
             let max_val = bf.mask;
             let word = bf.insert(0, max_val);
-            assert_eq!(bf.extract(word), max_val,
-                "Roundtrip failed for field '{}' [{},{}]", bf.name, bf.lsb, bf.msb);
+            assert_eq!(
+                bf.extract(word),
+                max_val,
+                "Roundtrip failed for field '{}' [{},{}]",
+                bf.name,
+                bf.lsb,
+                bf.msb
+            );
         }
     }
 
@@ -131,8 +135,11 @@ mod tests {
 
         // Verify register counts are substantial
         let mem = db.module("memory").unwrap();
-        assert!(mem.registers.len() > 100,
-            "Expected >100 registers in memory module, got {}", mem.registers.len());
+        assert!(
+            mem.registers.len() > 100,
+            "Expected >100 registers in memory module, got {}",
+            mem.registers.len()
+        );
     }
 
     #[test]
@@ -142,8 +149,7 @@ mod tests {
             return;
         };
 
-        let layout = BdFieldLayout::from_regdb(&db, "memory")
-            .expect("Failed to build BdFieldLayout");
+        let layout = BdFieldLayout::from_regdb(&db, "memory").expect("Failed to build BdFieldLayout");
 
         // Verify Buffer_Length
         assert_eq!(layout.buffer_length.lsb, 0);
@@ -167,8 +173,8 @@ mod tests {
             return;
         };
 
-        let layout = ChannelFieldLayout::from_regdb(&db, "memory")
-            .expect("Failed to build ChannelFieldLayout");
+        let layout =
+            ChannelFieldLayout::from_regdb(&db, "memory").expect("Failed to build ChannelFieldLayout");
 
         // Verify FoT_Mode: bits 17:16
         assert_eq!(layout.fot_mode.lsb, 16);
@@ -188,8 +194,7 @@ mod tests {
             return;
         };
 
-        let layout = DeviceRegLayout::from_regdb(db)
-            .expect("Failed to build DeviceRegLayout");
+        let layout = DeviceRegLayout::from_regdb(db).expect("Failed to build DeviceRegLayout");
 
         // Verify lock layout (AM025) -- structural offsets only; lock-value field
         // widths (lock_value_width / mask / sign_bit) live in archspec's LockModel.
@@ -232,14 +237,16 @@ mod tests {
         assert_eq!(layout.shim_channel_stride, 0x08, "Shim channel stride");
 
         // Verify stream switch slave slot layout (AM025)
-        assert_eq!(layout.memory_stream_switch.slave_slot_port_stride, 0x10,
-            "Compute slave slot port stride");
-        assert_eq!(layout.memory_stream_switch.slave_slot_count, 4,
-            "Compute slave slots per port");
-        assert_eq!(layout.memtile_stream_switch.slave_slot_port_stride, 0x10,
-            "MemTile slave slot port stride");
-        assert_eq!(layout.memtile_stream_switch.slave_slot_count, 4,
-            "MemTile slave slots per port");
+        assert_eq!(
+            layout.memory_stream_switch.slave_slot_port_stride, 0x10,
+            "Compute slave slot port stride"
+        );
+        assert_eq!(layout.memory_stream_switch.slave_slot_count, 4, "Compute slave slots per port");
+        assert_eq!(
+            layout.memtile_stream_switch.slave_slot_port_stride, 0x10,
+            "MemTile slave slot port stride"
+        );
+        assert_eq!(layout.memtile_stream_switch.slave_slot_count, 4, "MemTile slave slots per port");
 
         // Verify shim BD field layout was populated
         assert_eq!(layout.shim_bd.buffer_length.width, 32, "Shim buffer_length is 32-bit");
@@ -273,8 +280,7 @@ mod tests {
             return;
         };
 
-        let layout = DeviceRegLayout::from_regdb(db)
-            .expect("Failed to build DeviceRegLayout");
+        let layout = DeviceRegLayout::from_regdb(db).expect("Failed to build DeviceRegLayout");
 
         // Compute tile status fields (DMA_S2MM_Status_0)
         let cs = &layout.memory_status;
@@ -311,8 +317,7 @@ mod tests {
             return;
         };
 
-        let layout = DeviceRegLayout::from_regdb(db)
-            .expect("Failed to build DeviceRegLayout");
+        let layout = DeviceRegLayout::from_regdb(db).expect("Failed to build DeviceRegLayout");
 
         let mux = &layout.shim_mux;
 
@@ -642,8 +647,7 @@ mod tests {
             return;
         };
 
-        let layout = DeviceRegLayout::from_regdb(db)
-            .expect("Failed to build DeviceRegLayout");
+        let layout = DeviceRegLayout::from_regdb(db).expect("Failed to build DeviceRegLayout");
 
         // Construct a realistic BD word 0:
         // Buffer_Length = 1024 words (0x400), Base_Address = 0x100
@@ -674,26 +678,27 @@ mod tests {
         let core = db.module("core").unwrap();
 
         // Most core registers are 32-bit, but some (e.g. Program_Memory) are wider
-        let wide_regs: Vec<&str> = core.registers.iter()
+        let wide_regs: Vec<&str> = core
+            .registers
+            .iter()
             .filter(|r| r.width != 32)
             .map(|r| r.name.as_str())
             .collect();
         // Program_Memory is 128-bit (VLIW bundle interface)
-        assert!(wide_regs.contains(&"Program_Memory"),
-            "Program_Memory should be wider than 32 bits");
+        assert!(wide_regs.contains(&"Program_Memory"), "Program_Memory should be wider than 32 bits");
         let pm = core.register("Program_Memory").unwrap();
         assert_eq!(pm.width, 128, "Program_Memory should be 128-bit");
 
         // Core_Status is read-only (hardware reports core state)
         let status = core.register("Core_Status").unwrap();
-        assert_eq!(status.access, AccessMode::ReadOnly,
-            "Core_Status should be read-only");
+        assert_eq!(status.access, AccessMode::ReadOnly, "Core_Status should be read-only");
 
         // Core_Control is mixed (some bits are w1tc, others rw)
         let ctrl = core.register("Core_Control").unwrap();
         assert!(
             ctrl.access == AccessMode::Mixed || ctrl.access == AccessMode::ReadWrite,
-            "Core_Control should be mixed or rw, got {:?}", ctrl.access
+            "Core_Control should be mixed or rw, got {:?}",
+            ctrl.access
         );
     }
 
@@ -708,13 +713,11 @@ mod tests {
 
         // Core_LE (Loop End) has a non-zero reset value (0x000FFFFF per AM025)
         let core_le = core.register("Core_LE").unwrap();
-        assert_ne!(core_le.reset_value, 0,
-            "Core_LE should have non-zero reset value");
+        assert_ne!(core_le.reset_value, 0, "Core_LE should have non-zero reset value");
 
         // Core_Control has reset 0x00000002 (bit 1 = Reset set on power-on)
         let core_ctrl = core.register("Core_Control").unwrap();
-        assert_eq!(core_ctrl.reset_value, 0x00000002,
-            "Core_Control reset should be 0x02 (Reset bit set)");
+        assert_eq!(core_ctrl.reset_value, 0x00000002, "Core_Control reset should be 0x02 (Reset bit set)");
     }
 
     #[test]
@@ -728,12 +731,13 @@ mod tests {
         let non_zero: Vec<(u32, u32)> = core.non_zero_reset_values().collect();
 
         // There should be some non-zero reset values in the core module
-        assert!(!non_zero.is_empty(),
-            "Core module should have at least one non-zero reset value");
+        assert!(!non_zero.is_empty(), "Core module should have at least one non-zero reset value");
 
         // Core_Control @ 0x32000 should be in the list with reset=0x02
-        assert!(non_zero.iter().any(|&(off, val)| off == 0x32000 && val == 0x02),
-            "Core_Control (0x32000) with reset 0x02 should be in non-zero list");
+        assert!(
+            non_zero.iter().any(|&(off, val)| off == 0x32000 && val == 0x02),
+            "Core_Control (0x32000) with reset 0x02 should be in non-zero list"
+        );
     }
 
     #[test]
@@ -779,53 +783,51 @@ mod tests {
 
         // Core module (compute tile) stream switch
         // AM025 JSON classifies these under "core", not "memory"
-        let core_ss = StreamSwitchLayout::from_regdb(&db, "core")
-            .expect("core stream switch layout");
+        let core_ss = StreamSwitchLayout::from_regdb(&db, "core").expect("core stream switch layout");
         // Base addresses must match exactly (first register in each group)
-        assert_eq!(core_ss.master_base, 0x3F000,
-            "core master_base should be 0x3F000");
-        assert_eq!(core_ss.slave_base, 0x3F100,
-            "core slave_base should be 0x3F100");
-        assert_eq!(core_ss.slave_slot_base, 0x3F200,
-            "core slave_slot_base should be 0x3F200");
+        assert_eq!(core_ss.master_base, 0x3F000, "core master_base should be 0x3F000");
+        assert_eq!(core_ss.slave_base, 0x3F100, "core slave_base should be 0x3F100");
+        assert_eq!(core_ss.slave_slot_base, 0x3F200, "core slave_slot_base should be 0x3F200");
         // End addresses are last_register + 4. The old hardcoded values were
         // padded round numbers (0x3F058, 0x3F180, 0x3F390). The JSON-derived
         // values are tighter: exact end of the defined register space. Verify
         // they are above base and within the same address block.
-        assert!(core_ss.master_end > core_ss.master_base
-            && core_ss.master_end <= 0x3F100,
+        assert!(
+            core_ss.master_end > core_ss.master_base && core_ss.master_end <= 0x3F100,
             "core master_end {:#X} should be in (0x3F000, 0x3F100]",
-            core_ss.master_end);
-        assert!(core_ss.slave_end > core_ss.slave_base
-            && core_ss.slave_end <= 0x3F200,
+            core_ss.master_end
+        );
+        assert!(
+            core_ss.slave_end > core_ss.slave_base && core_ss.slave_end <= 0x3F200,
             "core slave_end {:#X} should be in (0x3F100, 0x3F200]",
-            core_ss.slave_end);
-        assert!(core_ss.slave_slot_end > core_ss.slave_slot_base
-            && core_ss.slave_slot_end <= 0x3F400,
+            core_ss.slave_end
+        );
+        assert!(
+            core_ss.slave_slot_end > core_ss.slave_slot_base && core_ss.slave_slot_end <= 0x3F400,
             "core slave_slot_end {:#X} should be in (0x3F200, 0x3F400]",
-            core_ss.slave_slot_end);
+            core_ss.slave_slot_end
+        );
 
         // Memory tile stream switch
-        let mt_ss = StreamSwitchLayout::from_regdb(&db, "memory_tile")
-            .expect("memtile stream switch layout");
-        assert_eq!(mt_ss.master_base, 0xB0000,
-            "memtile master_base should be 0xB0000");
-        assert_eq!(mt_ss.slave_base, 0xB0100,
-            "memtile slave_base should be 0xB0100");
-        assert_eq!(mt_ss.slave_slot_base, 0xB0200,
-            "memtile slave_slot_base should be 0xB0200");
-        assert!(mt_ss.master_end > mt_ss.master_base
-            && mt_ss.master_end <= 0xB0100,
+        let mt_ss = StreamSwitchLayout::from_regdb(&db, "memory_tile").expect("memtile stream switch layout");
+        assert_eq!(mt_ss.master_base, 0xB0000, "memtile master_base should be 0xB0000");
+        assert_eq!(mt_ss.slave_base, 0xB0100, "memtile slave_base should be 0xB0100");
+        assert_eq!(mt_ss.slave_slot_base, 0xB0200, "memtile slave_slot_base should be 0xB0200");
+        assert!(
+            mt_ss.master_end > mt_ss.master_base && mt_ss.master_end <= 0xB0100,
             "memtile master_end {:#X} should be in (0xB0000, 0xB0100]",
-            mt_ss.master_end);
-        assert!(mt_ss.slave_end > mt_ss.slave_base
-            && mt_ss.slave_end <= 0xB0200,
+            mt_ss.master_end
+        );
+        assert!(
+            mt_ss.slave_end > mt_ss.slave_base && mt_ss.slave_end <= 0xB0200,
             "memtile slave_end {:#X} should be in (0xB0100, 0xB0200]",
-            mt_ss.slave_end);
-        assert!(mt_ss.slave_slot_end > mt_ss.slave_slot_base
-            && mt_ss.slave_slot_end <= 0xB0400,
+            mt_ss.slave_end
+        );
+        assert!(
+            mt_ss.slave_slot_end > mt_ss.slave_slot_base && mt_ss.slave_slot_end <= 0xB0400,
             "memtile slave_slot_end {:#X} should be in (0xB0200, 0xB0400]",
-            mt_ss.slave_slot_end);
+            mt_ss.slave_slot_end
+        );
     }
 
     #[test]
@@ -838,18 +840,21 @@ mod tests {
         let core = db.module("core").unwrap();
 
         // Core_Status should be in the read-only set
-        let ro_regs: Vec<&str> = core.registers_with_access(AccessMode::ReadOnly)
+        let ro_regs: Vec<&str> = core
+            .registers_with_access(AccessMode::ReadOnly)
             .map(|r| r.name.as_str())
             .collect();
-        assert!(ro_regs.contains(&"Core_Status"),
-            "Core_Status should be in read-only registers");
+        assert!(ro_regs.contains(&"Core_Status"), "Core_Status should be in read-only registers");
 
         // DMA status registers are typically read-only
         let mem = db.module("memory").unwrap();
-        let mem_ro: Vec<&str> = mem.registers_with_access(AccessMode::ReadOnly)
+        let mem_ro: Vec<&str> = mem
+            .registers_with_access(AccessMode::ReadOnly)
             .map(|r| r.name.as_str())
             .collect();
-        assert!(mem_ro.iter().any(|n| n.contains("Status")),
-            "Memory module should have read-only status registers");
+        assert!(
+            mem_ro.iter().any(|n| n.contains("Status")),
+            "Memory module should have read-only status registers"
+        );
     }
 }

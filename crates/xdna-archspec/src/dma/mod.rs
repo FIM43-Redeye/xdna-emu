@@ -32,10 +32,8 @@ pub mod layouts;
 mod layouts_tests;
 
 pub use field_layouts::{
-    BdFieldLayout, ChannelFieldLayout, StatusFieldLayout,
-    MemTileBdFieldLayout, ShimBdFieldLayout,
-    ShimMuxField, ShimMuxLayout,
-    StreamSwitchLayout, ModuleEventLayout,
+    BdFieldLayout, ChannelFieldLayout, StatusFieldLayout, MemTileBdFieldLayout, ShimBdFieldLayout,
+    ShimMuxField, ShimMuxLayout, StreamSwitchLayout, ModuleEventLayout,
 };
 
 pub use layouts::DeviceRegLayout;
@@ -152,8 +150,7 @@ impl crate::types::ArchModel {
     /// the same pattern when they land.
     pub fn dma_model(&self) -> &'static dyn DmaModel {
         match self.arch {
-            crate::types::Architecture::Aie2
-            | crate::types::Architecture::Aie2p => {
+            crate::types::Architecture::Aie2 | crate::types::Architecture::Aie2p => {
                 &crate::aie2::dma::AIE2_DMA_MODEL
             }
             crate::types::Architecture::Aie => {

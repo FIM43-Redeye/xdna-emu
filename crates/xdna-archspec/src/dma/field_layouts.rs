@@ -62,12 +62,14 @@ impl BdFieldLayout {
     ///
     /// Resolves all BD fields from DMA_BD0_0 through DMA_BD0_5 registers.
     pub fn from_regdb(db: &RegisterDb, module: &str) -> Result<Self, String> {
-        let m = db.module(module)
+        let m = db
+            .module(module)
             .ok_or_else(|| format!("Module '{}' not found in register database", module))?;
 
         // Helper to get a field from a register, with clear error messages
         let get_field = |reg_name: &str, field_name: &str| -> Result<BitField, String> {
-            let reg = m.register(reg_name)
+            let reg = m
+                .register(reg_name)
                 .ok_or_else(|| format!("{}.{} not found", module, reg_name))?;
             reg.field(field_name)
                 .cloned()
@@ -137,11 +139,13 @@ impl ChannelFieldLayout {
     /// Uses DMA_S2MM_0_Ctrl and DMA_S2MM_0_Start_Queue as the canonical
     /// source (all channels share the same field layout).
     pub fn from_regdb(db: &RegisterDb, module: &str) -> Result<Self, String> {
-        let m = db.module(module)
+        let m = db
+            .module(module)
             .ok_or_else(|| format!("Module '{}' not found in register database", module))?;
 
         let get_field = |reg_name: &str, field_name: &str| -> Result<BitField, String> {
-            let reg = m.register(reg_name)
+            let reg = m
+                .register(reg_name)
                 .ok_or_else(|| format!("{}.{} not found", module, reg_name))?;
             reg.field(field_name)
                 .cloned()
@@ -190,11 +194,13 @@ impl StatusFieldLayout {
     /// Uses `DMA_S2MM_Status_0` as the canonical source (all channels
     /// share the same field layout within a module).
     pub fn from_regdb(db: &RegisterDb, module: &str) -> Result<Self, String> {
-        let m = db.module(module)
+        let m = db
+            .module(module)
             .ok_or_else(|| format!("Module '{}' not found in register database", module))?;
 
         let reg_name = "DMA_S2MM_Status_0";
-        let reg = m.register(reg_name)
+        let reg = m
+            .register(reg_name)
             .ok_or_else(|| format!("{}.{} not found", module, reg_name))?;
 
         let get_field = |field_name: &str| -> Result<BitField, String> {
@@ -289,11 +295,13 @@ impl MemTileBdFieldLayout {
     /// Resolves all BD fields from DMA_BD0_0 through DMA_BD0_7 registers.
     pub fn from_regdb(db: &RegisterDb) -> Result<Self, String> {
         let module = "memory_tile";
-        let m = db.module(module)
+        let m = db
+            .module(module)
             .ok_or_else(|| format!("Module '{}' not found in register database", module))?;
 
         let get_field = |reg_name: &str, field_name: &str| -> Result<BitField, String> {
-            let reg = m.register(reg_name)
+            let reg = m
+                .register(reg_name)
                 .ok_or_else(|| format!("{}.{} not found", module, reg_name))?;
             reg.field(field_name)
                 .cloned()
@@ -409,11 +417,13 @@ impl ShimBdFieldLayout {
     /// Resolves all BD fields from DMA_BD0_0 through DMA_BD0_7 registers.
     pub fn from_regdb(db: &RegisterDb) -> Result<Self, String> {
         let module = "shim";
-        let m = db.module(module)
+        let m = db
+            .module(module)
             .ok_or_else(|| format!("Module '{}' not found in register database", module))?;
 
         let get_field = |reg_name: &str, field_name: &str| -> Result<BitField, String> {
-            let reg = m.register(reg_name)
+            let reg = m
+                .register(reg_name)
                 .ok_or_else(|| format!("{}.{} not found", module, reg_name))?;
             reg.field(field_name)
                 .cloned()
@@ -501,22 +511,17 @@ impl ShimMuxLayout {
     /// Scans Mux_Config and Demux_Config register fields for "SouthN"
     /// names. Port index = N + 2 (South0=port[2] in shim switchbox layout).
     pub fn from_regdb(db: &RegisterDb) -> Result<Self, String> {
-        let shim = db.module("shim")
-            .ok_or("Module 'shim' not found in register database")?;
+        let shim = db.module("shim").ok_or("Module 'shim' not found in register database")?;
 
         let parse_south_fields = |reg_name: &str| -> Result<(u32, Vec<ShimMuxField>), String> {
-            let reg = shim.register(reg_name)
-                .ok_or_else(|| format!("shim.{} not found", reg_name))?;
+            let reg = shim.register(reg_name).ok_or_else(|| format!("shim.{} not found", reg_name))?;
             let mut fields = Vec::new();
             for bf in &reg.fields {
                 if let Some(n_str) = bf.name.strip_prefix("South") {
                     if let Ok(n) = n_str.parse::<usize>() {
                         // SouthN maps to switchbox port N+2
                         // (South0=slave[2] / master[2] in shim layout)
-                        fields.push(ShimMuxField {
-                            field: bf.clone(),
-                            port_index: n + 2,
-                        });
+                        fields.push(ShimMuxField { field: bf.clone(), port_index: n + 2 });
                     }
                 }
             }
@@ -528,12 +533,7 @@ impl ShimMuxLayout {
         let (mux_offset, mux_fields) = parse_south_fields("Mux_Config")?;
         let (demux_offset, demux_fields) = parse_south_fields("Demux_Config")?;
 
-        Ok(Self {
-            mux_offset,
-            mux_fields,
-            demux_offset,
-            demux_fields,
-        })
+        Ok(Self { mux_offset, mux_fields, demux_offset, demux_fields })
     }
 }
 
@@ -574,7 +574,8 @@ impl StreamSwitchLayout {
     /// `Stream_Switch_Slave_Config_*`, and `Stream_Switch_Slave_*_Slot*`
     /// registers to determine the exact address ranges.
     pub fn from_regdb(db: &RegisterDb, module: &str) -> Result<Self, String> {
-        let m = db.module(module)
+        let m = db
+            .module(module)
             .ok_or_else(|| format!("Module '{}' not found in register database", module))?;
 
         // Find all registers matching each group prefix
@@ -619,29 +620,28 @@ impl StreamSwitchLayout {
         // Within a port, slots are 4 bytes apart. Between ports, the stride is larger.
         // Find the first gap > 4 to determine where port 0 ends and port 1 begins.
         let num_slave_ports = slave_config_offsets.len();
-        let (slave_slot_port_stride, slave_slot_count) = if num_slave_ports > 1
-            && slave_slot_offsets.len() > 1
-        {
-            // Total slot registers / number of slave ports = slots per port
-            let slots_per_port = slave_slot_offsets.len() / num_slave_ports;
-            // Port stride = offset of port 1's first slot - offset of port 0's first slot
-            let port_stride = if slots_per_port > 0 && slave_slot_offsets.len() > slots_per_port {
-                slave_slot_offsets[slots_per_port] - slave_slot_offsets[0]
-            } else {
-                // Fallback: derive from gaps
-                let mut stride = 0u32;
-                for pair in slave_slot_offsets.windows(2) {
-                    if pair[1] - pair[0] > 4 {
-                        stride = pair[1] - pair[0] + 4 * (slots_per_port as u32 - 1);
-                        break;
+        let (slave_slot_port_stride, slave_slot_count) =
+            if num_slave_ports > 1 && slave_slot_offsets.len() > 1 {
+                // Total slot registers / number of slave ports = slots per port
+                let slots_per_port = slave_slot_offsets.len() / num_slave_ports;
+                // Port stride = offset of port 1's first slot - offset of port 0's first slot
+                let port_stride = if slots_per_port > 0 && slave_slot_offsets.len() > slots_per_port {
+                    slave_slot_offsets[slots_per_port] - slave_slot_offsets[0]
+                } else {
+                    // Fallback: derive from gaps
+                    let mut stride = 0u32;
+                    for pair in slave_slot_offsets.windows(2) {
+                        if pair[1] - pair[0] > 4 {
+                            stride = pair[1] - pair[0] + 4 * (slots_per_port as u32 - 1);
+                            break;
+                        }
                     }
-                }
-                stride
+                    stride
+                };
+                (port_stride, slots_per_port)
+            } else {
+                (0x10, 4) // Shouldn't happen, but safe defaults
             };
-            (port_stride, slots_per_port)
-        } else {
-            (0x10, 4) // Shouldn't happen, but safe defaults
-        };
 
         Ok(Self {
             master_base,
