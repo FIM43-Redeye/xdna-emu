@@ -14,3 +14,45 @@
 # This project is in the middle of a Path B rustfmt convergence; entries
 # below are the chunked `cargo fmt` commits. See CLAUDE.md "Code
 # formatting" for the broader plan.
+
+# Path B convergence sprint (2026-04-29):
+b705ac8f5ff54d0d50c6c9ada54dd5c01c490c47 # style: cargo fmt src/aiesim/
+b14bae9403330eb3185aecd53252d32e77e5d2fe # style: cargo fmt src/bin/
+ca5690e0a25842945a10083c99fffaea593611d8 # style: cargo fmt src/debug/
+ac07a138fa20c593c15c2b9c643a93964da293b5 # style: cargo fmt src/npu/
+36bccaa121864d1eee26f5f7ac28402d99d261c1 # style: cargo fmt src/trace/
+79568447d605808c352ca3286a69996e83d02c39 # style: cargo fmt src/fuzzer/
+e3166f51643ecb5be0807445b41e881d1d096987 # style: cargo fmt src/integration/
+cb9b86ce7b18c67833c9ab651019e507ebdec7a1 # style: cargo fmt src/visual/
+597a20d99910b8d30e4677577e9341e19a3ccf73 # style: cargo fmt src/testing/
+5a5f44f94588b3f9056e0aa8e79c27beecbc1635 # style: cargo fmt src/vcd/
+076a34fd1841dbc7136cf47cc67af54901ae8dbc # style: cargo fmt src/parser/
+e8e223843a32c5b452d85af9ea072bc547b03424 # style: cargo fmt src/interpreter/bundle/
+fc682478d454054fadaf86f65166a7c473d9a2e2 # style: cargo fmt src/interpreter/core/
+255ad019db866cd440040694cb72197610c3d651 # style: cargo fmt src/interpreter/decode/
+fcefee40df7fcecb241a019e787f37996a669264 # style: cargo fmt src/interpreter/engine/
+9601d5f84f51a8827c271bcf0ab38aa6d507628c # style: cargo fmt src/interpreter/execute/
+1e9f3ee7bcf4599a1a3cecca2384a14fb35ee69f # style: cargo fmt src/interpreter/state/
+30ce4c212afa95ba12cd446cec9ce08e01ea6f94 # style: cargo fmt src/interpreter/timing/
+0c844fb0d0994fddf4366b63baad9ea0adab93fe # style: cargo fmt src/interpreter/{test_runner,traits}.rs
+ee8a2237d5c37ddd945be060429f7bf8f6e71c32 # style: cargo fmt src/device/array/
+4637deb1898b8cf16e6cde1f6b07038bd262d71b # style: cargo fmt src/device/control_packets/
+7a2744fbda8ee9a4b5fb0f95ca894b083d93b69e # style: cargo fmt src/device/core_debug/
+c4362388059e8b5a2dda3d2e9f3428cee0138740 # style: cargo fmt src/device/dma/
+d1a9f64cd111832323c6dfba96d495a1aa5e7fb2 # style: cargo fmt src/device/events/
+00b6beb10631c4d5680dc2c5fb2cb2cd11c8bbb5 # style: cargo fmt src/device/interrupts/
+6bee3f6e56aaca9a0e2487c036d10ad87895da25 # style: cargo fmt src/device/perf_counters/
+b21f15a5b54f111b65709b18f9f457fbf54b428d # style: cargo fmt src/device/regdb/
+1c536fd54961c9b2fc800a11d7afdb618b51cda1 # style: cargo fmt src/device/state/
+0eafd93c22a563a31f39a97f9e1aac8840c8b941 # style: cargo fmt src/device/stream_switch/
+9ba3fe835937eaaf925966ca71e8dc3b57f14c5d # style: cargo fmt src/device/tile/
+ab3cb58819ed6cd5e9b517c24eacd83d16c33d87 # style: cargo fmt src/device/trace_unit/
+918e5e023e99f8b0ecd93b9d14343fb4cac5d43c # style: cargo fmt src/device top-level files
+ac2f4abfd986a19381c0296f544b83683e2ea9f4 # style: cargo fmt src/{build_progress,config}.rs
+ce55b26f2e75bbf0f40d4f72fd5912e4a776d307 # style: rustfmt src/{lib,main,interpreter/mod}.rs
+604506a589fc456be6e05ec6a8f982661b5a7d39 # style: cargo fmt crates/xdna-archspec/{build.rs,build_helpers/}
+089e4ff645f9533bef47c4a9e3bd63288c904cda # style: cargo fmt crates/xdna-archspec/src/aie2/
+a024ef25651bfcd9ecf6e7ecf901aaa3da5582e4 # style: cargo fmt crates/xdna-archspec/src/dma/
+190c06df1e69136e61ba02a486792bcaa80625a3 # style: cargo fmt crates/xdna-archspec/src/ remaining files
+e2be3a507ebccf230679f8ca4885a3122a538be8 # style: cargo fmt crates/xdna-emu-ffi/
+2f725fb7b87d841a80a260d39bcb1b0e3e1d7aa4 # style: cargo fmt examples/ + build.rs

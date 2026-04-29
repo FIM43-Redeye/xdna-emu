@@ -605,28 +605,32 @@ profile) flushes it.
 The repo has a tuned `rustfmt.toml` at the root. Stable rustfmt only;
 non-default settings preserve the project's semantic conventions
 (import groups, compact struct literals, ~110-char lines, in-line method
-chains). The codebase is **not yet fully fmt'd**; convergence is in
-progress (see "Path B" below).
+chains).
 
-**Path B → E → pre-commit hook.** The plan:
+The codebase is **fully fmt'd** as of the Path B convergence sprint
+(2026-04-29). New code stays clean via two enforcement layers:
 
-1. **Path B (current):** Run `cargo fmt` on subtrees one at a time,
-   each in its own commit. Add each commit's SHA to
-   `.git-blame-ignore-revs` so `git blame` skips the formatting commit
-   and attributes lines to the original content author. Run locally
-   once: `git config blame.ignoreRevsFile .git-blame-ignore-revs`.
-   GitHub honors the file automatically; no per-user setup there.
-2. **Path E (after convergence):** Stay clean during edits. The
-   project ships a `PostToolUse` hook in `.claude/settings.json` that
-   auto-runs `cargo fmt` on any `.rs` file Claude edits. Editor
-   format-on-save handles the same role for human edits.
-3. **Pre-commit hook (after convergence):** Once everything checks
-   clean, enable `cargo fmt --check` as a local pre-commit hook + a
-   CI step. Both block on drift. This is the final guard.
+1. **`PostToolUse` hook** in `.claude/settings.json` auto-runs rustfmt
+   on any `.rs` file Claude edits (via `.claude/hooks/rustfmt-edited.sh`,
+   which uses stdin mode to avoid module recursion).
+2. **Editor format-on-save** handles the same role for human edits.
+3. **Pre-commit hook + CI** (TODO -- to be added now that convergence
+   is complete): `cargo fmt --check` blocks commits on drift.
 
-**Don't run `cargo fmt` repo-wide in one commit.** It'd be 3500+
-drift blocks of mostly mechanical change in one ungrokkable diff;
-chunked Path B commits stay reviewable.
+**One-time local setup per checkout:**
+
+```bash
+git config blame.ignoreRevsFile .git-blame-ignore-revs
+```
+
+This makes `git blame` skip the chunked `cargo fmt` commits listed in
+`.git-blame-ignore-revs` and attribute lines to the original content
+author. GitHub honors the file automatically; no per-user setup there.
+
+**Don't run `cargo fmt` repo-wide in one commit.** Even now that
+everything's clean, future bulk reformats (e.g., from a config tweak)
+should stay chunked by subtree -- each commit reviewable, each SHA
+appended to `.git-blame-ignore-revs`.
 
 ### Test suite costs
 
