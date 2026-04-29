@@ -635,7 +635,9 @@ impl TraceUnit {
             }
             TraceMode::Execution | TraceMode::Reserved => {
                 // Mode 2 not implemented per A.2 spec; mode 3 is reserved.
-                // Skip rather than corrupt the stream.
+                // Skip rather than corrupt the stream.  Mode 2 work is
+                // tracked in docs/superpowers/findings/
+                // 2026-04-28-a2b-mode2-decoder-deferred.md
             }
         }
         self.try_emit_packet();

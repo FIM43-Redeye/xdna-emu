@@ -2941,6 +2941,8 @@ main() {
           #   row 1 is memtile in NPU1).  A long-term improvement would
           #   be to invoke aie-translate for an authoritative tile list,
           #   but the regex covers every test currently in the suite.
+          #   Tracked in docs/superpowers/findings/
+          #   2026-04-28-aie-translate-tile-discovery-followup.md
           local mlir_src="$src_dir/aie.mlir"
           local tile_spec=""
           if [[ -f "$mlir_src" ]]; then
