@@ -14,8 +14,7 @@ fn test_load_for_device_uses_config() {
     match result {
         Ok(layout) => {
             // If it loaded, do a quick sanity check on a well-known offset.
-            assert_eq!(layout.memory_bd_base, 0x1D000,
-                "Compute BD base should be 0x1D000 per AM025");
+            assert_eq!(layout.memory_bd_base, 0x1D000, "Compute BD base should be 0x1D000 per AM025");
         }
         Err(e) => {
             eprintln!("Skipping: load_for_device failed: {}", e);

@@ -15,10 +15,8 @@ mod tests;
 pub use xdna_archspec::regdb::*;
 pub use xdna_archspec::dma::DeviceRegLayout;
 pub use xdna_archspec::dma::field_layouts::{
-    BdFieldLayout, ChannelFieldLayout, StatusFieldLayout,
-    MemTileBdFieldLayout, ShimBdFieldLayout,
-    ShimMuxField, ShimMuxLayout,
-    StreamSwitchLayout, ModuleEventLayout,
+    BdFieldLayout, ChannelFieldLayout, StatusFieldLayout, MemTileBdFieldLayout, ShimBdFieldLayout,
+    ShimMuxField, ShimMuxLayout, StreamSwitchLayout, ModuleEventLayout,
 };
 
 use std::sync::OnceLock;
@@ -49,9 +47,7 @@ pub fn device_reg_layout() -> &'static DeviceRegLayout {
 /// `Config` for path resolution.
 pub fn load_for_device(device: &str) -> Result<DeviceRegLayout, String> {
     let config = crate::config::Config::get();
-    let json_path = config.mlir_aie_subpath(
-        &format!("lib/Dialect/AIE/Util/aie_registers_{}.json", device)
-    );
+    let json_path = config.mlir_aie_subpath(&format!("lib/Dialect/AIE/Util/aie_registers_{}.json", device));
     let db = RegisterDb::from_file(&json_path)?;
     DeviceRegLayout::from_regdb(db)
 }
