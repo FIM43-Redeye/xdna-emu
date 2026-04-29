@@ -107,7 +107,6 @@ pub(super) enum TraceState {
 #[derive(Debug)]
 pub struct TraceUnit {
     // -- Configuration (from register writes) --
-
     /// Operating mode.
     pub(super) mode: TraceMode,
     /// Hardware event ID that starts tracing.
@@ -123,7 +122,6 @@ pub struct TraceUnit {
     pub(super) packet_id: u8,
 
     // -- Runtime state --
-
     /// Current state (Idle/Running/Stopped).
     pub(super) state: TraceState,
     /// Cycle counter (starts when tracing begins).
@@ -153,7 +151,6 @@ pub struct TraceUnit {
     pending_words: VecDeque<(u32, bool)>,
 
     // -- Tile identity (for packet headers) --
-
     /// Column of the owning tile.
     col: u8,
     /// Row of the owning tile.
@@ -213,7 +210,9 @@ impl TraceUnit {
                 "TraceUnit ({},{}): EventPc mode requested on non-core \
                  packet_type={} (regdb: no Mode bitfield on this trace unit); \
                  clamping to EventTime",
-                self.col, self.row, self.packet_type
+                self.col,
+                self.row,
+                self.packet_type
             );
             self.mode = TraceMode::EventTime;
         } else {
@@ -268,9 +267,7 @@ impl TraceUnit {
         match offset {
             0x00 => {
                 // Trace_Control0: mode[1:0], start_event[23:16], stop_event[31:24]
-                (self.mode as u32)
-                    | ((self.start_event as u32) << 16)
-                    | ((self.stop_event as u32) << 24)
+                (self.mode as u32) | ((self.start_event as u32) << 16) | ((self.stop_event as u32) << 24)
             }
             0x04 => {
                 // Trace_Control1: packet_type[14:12], packet_id[4:0]
@@ -334,7 +331,11 @@ impl TraceUnit {
 
                 log::debug!(
                     "TraceUnit ({},{}) Control0: mode={:?} start={} stop={} -> {:?}",
-                    self.col, self.row, self.mode, self.start_event, self.stop_event,
+                    self.col,
+                    self.row,
+                    self.mode,
+                    self.start_event,
+                    self.stop_event,
                     self.state
                 );
             }
@@ -344,7 +345,10 @@ impl TraceUnit {
                 self.packet_id = (value & 0x1F) as u8;
                 log::debug!(
                     "TraceUnit ({},{}) Control1: pkt_type={} pkt_id={}",
-                    self.col, self.row, self.packet_type, self.packet_id
+                    self.col,
+                    self.row,
+                    self.packet_type,
+                    self.packet_id
                 );
             }
             0x10 => {
@@ -355,7 +359,9 @@ impl TraceUnit {
                 self.event_slots[3] = ((value >> 24) & 0xFF) as u8;
                 log::debug!(
                     "TraceUnit ({},{}) Event0: slots[0-3]={:?}",
-                    self.col, self.row, &self.event_slots[0..4]
+                    self.col,
+                    self.row,
+                    &self.event_slots[0..4]
                 );
             }
             0x14 => {
@@ -366,14 +372,13 @@ impl TraceUnit {
                 self.event_slots[7] = ((value >> 24) & 0xFF) as u8;
                 log::debug!(
                     "TraceUnit ({},{}) Event1: slots[4-7]={:?}",
-                    self.col, self.row, &self.event_slots[4..8]
+                    self.col,
+                    self.row,
+                    &self.event_slots[4..8]
                 );
             }
             _ => {
-                log::debug!(
-                    "TraceUnit ({},{}) unknown register offset 0x{:X}",
-                    self.col, self.row, offset
-                );
+                log::debug!("TraceUnit ({},{}) unknown register offset 0x{:X}", self.col, self.row, offset);
             }
         }
     }
@@ -417,19 +422,13 @@ impl TraceUnit {
             // Emit a Start marker with the current timer value.
             // Mode 1 uses 0xF1 (bit 0 set) to distinguish from mode 0's 0xF0.
             self.encode_start(cycle);
-            log::debug!(
-                "TraceUnit ({},{}) started at cycle {}",
-                self.col, self.row, cycle
-            );
+            log::debug!("TraceUnit ({},{}) started at cycle {}", self.col, self.row, cycle);
             return;
         }
 
         if self.state == TraceState::Running && hw_event_id == self.stop_event {
             self.state = TraceState::Stopped;
-            log::debug!(
-                "TraceUnit ({},{}) stopped at cycle {}",
-                self.col, self.row, cycle
-            );
+            log::debug!("TraceUnit ({},{}) stopped at cycle {}", self.col, self.row, cycle);
             // Flush remaining data as a final packet
             self.flush();
             return;
@@ -467,7 +466,9 @@ impl TraceUnit {
                         log::warn!(
                             "TraceUnit ({},{}): EventPc mode received event \
                              hw_id={} with no PC; encoding sentinel pc=0",
-                            self.col, self.row, hw_event_id
+                            self.col,
+                            self.row,
+                            hw_event_id
                         );
                         self.no_pc_warnings += 1;
                     }
@@ -578,7 +579,10 @@ impl TraceUnit {
 
         log::trace!(
             "TraceUnit ({},{}) flush: {} bytes -> padded packet (packets so far: {})",
-            self.col, self.row, self.byte_buffer.len(), self.pending_words.len() / 8
+            self.col,
+            self.row,
+            self.byte_buffer.len(),
+            self.pending_words.len() / 8
         );
 
         // Pad to 28 bytes with 0xFE
@@ -627,7 +631,10 @@ impl TraceUnit {
                 if pc_full > 0x3FFF && self.pc_truncate_warnings < 4 {
                     log::warn!(
                         "TraceUnit ({},{}): PC 0x{:X} truncated to 14 bits (0x{:X})",
-                        self.col, self.row, pc_full, pc14
+                        self.col,
+                        self.row,
+                        pc_full,
+                        pc14
                     );
                     self.pc_truncate_warnings += 1;
                 }

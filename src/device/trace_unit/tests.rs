@@ -197,7 +197,7 @@ fn test_packet_formation() {
     let mut tu = TraceUnit::new(1, 3);
     tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
     tu.write_register(0x04, (0 << 12) | 5); // pkt_type=0, pkt_id=5
-    // Fill all 8 slots so we can generate many events
+                                            // Fill all 8 slots so we can generate many events
     tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (40 << 24));
     tu.write_register(0x14, 23 | (24 << 8) | (35 << 16) | (36 << 24));
 
@@ -374,9 +374,7 @@ fn test_roundtrip_all_slots_all_formats() {
         } else if (b0 & 0xE0) == 0xA0 {
             // Single2: 0b101EEETT TTTTTTTT TTTTTTTT
             let event = (b0 >> 2) & 0x07;
-            let cycles = ((b0 & 0x03) as u64) * 65536
-                + (buf[1] as u64) * 256
-                + buf[2] as u64;
+            let cycles = ((b0 & 0x03) as u64) * 65536 + (buf[1] as u64) * 256 + buf[2] as u64;
             (event, cycles, 3)
         } else {
             panic!("unexpected byte 0x{:02X}", b0);
@@ -388,11 +386,20 @@ fn test_roundtrip_all_slots_all_formats() {
     // from packet emission (try_emit_packet drains at 28 bytes).
     let all_deltas: &[(u64, usize)] = &[
         // Single0 (1 byte)
-        (0, 1), (1, 1), (7, 1), (15, 1),
+        (0, 1),
+        (1, 1),
+        (7, 1),
+        (15, 1),
         // Single1 (2 bytes)
-        (16, 2), (100, 2), (500, 2), (1023, 2),
+        (16, 2),
+        (100, 2),
+        (500, 2),
+        (1023, 2),
         // Single2 (3 bytes)
-        (1024, 3), (10000, 3), (100000, 3), (262143, 3),
+        (1024, 3),
+        (10000, 3),
+        (100000, 3),
+        (262143, 3),
     ];
 
     for slot in 0u8..8 {
@@ -412,7 +419,10 @@ fn test_roundtrip_all_slots_all_formats() {
             assert!(
                 tu.byte_buffer.len() >= base + expected_size,
                 "buffer too short for slot={} delta={}: have {} bytes, need {}",
-                slot, d, tu.byte_buffer.len() - base, expected_size
+                slot,
+                d,
+                tu.byte_buffer.len() - base,
+                expected_size
             );
             let (dec_slot, dec_delta, consumed) = decode_single(&tu.byte_buffer[base..]);
             assert_eq!(
@@ -420,10 +430,7 @@ fn test_roundtrip_all_slots_all_formats() {
                 "slot mismatch: slot={} delta={} byte0=0x{:02X}",
                 slot, d, tu.byte_buffer[base]
             );
-            assert_eq!(
-                dec_delta, d,
-                "delta mismatch: slot={} delta={}", slot, d
-            );
+            assert_eq!(dec_delta, d, "delta mismatch: slot={} delta={}", slot, d);
             assert_eq!(consumed, expected_size, "size mismatch: slot={} delta={}", slot, d);
         }
     }
@@ -521,7 +528,8 @@ fn test_packet_header_matches_mlir_aie_decoder() {
         assert!(
             mlir_aie_valid(header),
             "pkt_type={}: header 0x{:08X} rejected by mlir-aie decoder",
-            pkt_type, header
+            pkt_type,
+            header
         );
 
         let (dec_col, dec_row, dec_type, dec_id) = extract_tile(header);
@@ -555,8 +563,11 @@ fn test_multiple0_two_slots_same_cycle() {
     tu.commit_cycle(5);
 
     // Multiple0 = 2 bytes. Expected mask = 0b00001001 (slots 0 and 3).
-    assert_eq!(tu.byte_buffer.len(), start_len + 2,
-        "popcount=2 events should coalesce into Multiple0 (2 bytes)");
+    assert_eq!(
+        tu.byte_buffer.len(),
+        start_len + 2,
+        "popcount=2 events should coalesce into Multiple0 (2 bytes)"
+    );
 
     // byte0 bits [7:4] = 0b1100, bits [3:0] = mask[7:4] = 0b0000
     // byte1 bits [7:4] = mask[3:0] = 0b1001, bits [3:0] = delta = 5
@@ -587,10 +598,7 @@ fn test_multiple1_three_slots_delta_500() {
     // byte0 = 0b110100EE where E is mask[7:6]
     assert_eq!(tu.byte_buffer[start_len], 0xD0 | (mask >> 6));
     // byte1 = mask[5:0] in [7:2], delta[9:8] in [1:0]
-    assert_eq!(
-        tu.byte_buffer[start_len + 1],
-        ((mask & 0x3F) << 2) | ((delta >> 8) as u8 & 0x03)
-    );
+    assert_eq!(tu.byte_buffer[start_len + 1], ((mask & 0x3F) << 2) | ((delta >> 8) as u8 & 0x03));
     assert_eq!(tu.byte_buffer[start_len + 2], (delta & 0xFF) as u8);
 }
 
@@ -619,10 +627,7 @@ fn test_multiple2_all_slots_delta_100000() {
     let mask: u8 = 0xFF;
     let delta: u32 = 100000;
     assert_eq!(tu.byte_buffer[start_len], 0xD4 | (mask >> 6));
-    assert_eq!(
-        tu.byte_buffer[start_len + 1],
-        ((mask & 0x3F) << 2) | ((delta >> 16) as u8 & 0x03)
-    );
+    assert_eq!(tu.byte_buffer[start_len + 1], ((mask & 0x3F) << 2) | ((delta >> 16) as u8 & 0x03));
     assert_eq!(tu.byte_buffer[start_len + 2], ((delta >> 8) & 0xFF) as u8);
     assert_eq!(tu.byte_buffer[start_len + 3], (delta & 0xFF) as u8);
 }
@@ -647,9 +652,7 @@ fn test_multiple_roundtrip_matches_mlir_aie() {
         } else if (b0 & 0xFC) == 0xD4 {
             // Multiple2
             let mask = ((b0 & 0x03) << 6) | (buf[1] >> 2);
-            let cycles = (((buf[1] & 0x03) as u64) << 16)
-                | ((buf[2] as u64) << 8)
-                | buf[3] as u64;
+            let cycles = (((buf[1] & 0x03) as u64) << 16) | ((buf[2] as u64) << 8) | buf[3] as u64;
             (mask, cycles, 4)
         } else {
             panic!("not a Multiple byte: 0x{:02X}", b0);
@@ -657,12 +660,12 @@ fn test_multiple_roundtrip_matches_mlir_aie() {
     }
 
     let cases: &[(u8, u64, usize)] = &[
-        (0b0000_0011, 0, 2),        // Multiple0, delta=0
-        (0b1100_0011, 15, 2),       // Multiple0, max delta
-        (0b0101_0101, 16, 3),       // Multiple1 threshold
-        (0b1111_1111, 1023, 3),     // Multiple1 max
-        (0b1111_0000, 1024, 4),     // Multiple2 threshold
-        (0b1100_0011, 262143, 4),   // Multiple2 max
+        (0b0000_0011, 0, 2),      // Multiple0, delta=0
+        (0b1100_0011, 15, 2),     // Multiple0, max delta
+        (0b0101_0101, 16, 3),     // Multiple1 threshold
+        (0b1111_1111, 1023, 3),   // Multiple1 max
+        (0b1111_0000, 1024, 4),   // Multiple2 threshold
+        (0b1100_0011, 262143, 4), // Multiple2 max
     ];
 
     for &(mask, delta, expected_size) in cases {
@@ -685,7 +688,8 @@ fn test_multiple_roundtrip_matches_mlir_aie() {
             tu.byte_buffer.len(),
             base + expected_size,
             "mask=0b{:08b} delta={}: encoded size",
-            mask, delta
+            mask,
+            delta
         );
         let (dec_mask, dec_delta, consumed) = decode_multiple(&tu.byte_buffer[base..]);
         assert_eq!(dec_mask, mask, "mask roundtrip for 0b{:08b} delta={}", mask, delta);
@@ -755,12 +759,16 @@ fn test_per_cycle_coalesce_bounds_byte_rate() {
     assert!(
         bytes_emitted as u64 <= CYCLES * 3,
         "8 slots over {} cycles should coalesce to <= {} bytes, got {}",
-        CYCLES, CYCLES * 3, bytes_emitted
+        CYCLES,
+        CYCLES * 3,
+        bytes_emitted
     );
     assert!(
         bytes_emitted as u64 >= CYCLES * 2,
         "expected at least {} bytes for {} cycles of Multiple0, got {}",
-        CYCLES * 2, CYCLES, bytes_emitted
+        CYCLES * 2,
+        CYCLES,
+        bytes_emitted
     );
 }
 
@@ -842,10 +850,10 @@ fn mode1_encoder_byte_equivalent_to_decoder_fixture() {
     tu.set_event_slot(3, 26); // LOCK_STALL = hw_id 26 in slot 3
     tu.set_start_event(1);
 
-    tu.notify_event(1, 0, None);              // start (fires state machine)
-    tu.notify_event(26, 0, Some(816));        // EventPC mask=0b1000 (slot 3), pc=816
+    tu.notify_event(1, 0, None); // start (fires state machine)
+    tu.notify_event(26, 0, Some(816)); // EventPC mask=0b1000 (slot 3), pc=816
     tu.commit_cycle(0);
-    tu.notify_event(26, 1, Some(816));        // next cycle, same PC, same slot
+    tu.notify_event(26, 1, Some(816)); // next cycle, same PC, same slot
     tu.commit_cycle(1);
 
     let bytes = tu.encoded_bytes();
@@ -855,18 +863,11 @@ fn mode1_encoder_byte_equivalent_to_decoder_fixture() {
     assert_eq!(decoded.len(), 3, "expected Start + 2 EventPC frames, got: {:?}", decoded);
     assert!(
         matches!(decoded[0], DecodedFrame::Start { .. }),
-        "first frame must be Start, got {:?}", decoded[0]
+        "first frame must be Start, got {:?}",
+        decoded[0]
     );
-    assert_eq!(
-        decoded[1],
-        DecodedFrame::EventPc { mask: 0b1000, pc: 816 },
-        "first EventPC frame mismatch"
-    );
-    assert_eq!(
-        decoded[2],
-        DecodedFrame::EventPc { mask: 0b1000, pc: 816 },
-        "second EventPC frame mismatch"
-    );
+    assert_eq!(decoded[1], DecodedFrame::EventPc { mask: 0b1000, pc: 816 }, "first EventPC frame mismatch");
+    assert_eq!(decoded[2], DecodedFrame::EventPc { mask: 0b1000, pc: 816 }, "second EventPC frame mismatch");
 }
 
 /// Non-core trace units (packet_type != 0) must be clamped to EventTime when
@@ -897,15 +898,13 @@ fn mode1_no_pc_emits_sentinel_zero() {
     tu.set_event_slot(0, 23); // MEMORY_STALL
     tu.set_start_event(1);
 
-    tu.notify_event(1, 0, None);    // start
-    tu.notify_event(23, 0, None);   // memory stall, no PC -> sentinel pc=0
+    tu.notify_event(1, 0, None); // start
+    tu.notify_event(23, 0, None); // memory stall, no PC -> sentinel pc=0
     tu.commit_cycle(0);
 
     let frames = decode_mode1_for_test(tu.encoded_bytes());
-    let event_frames: Vec<&DecodedFrame> = frames
-        .iter()
-        .filter(|f| matches!(f, DecodedFrame::EventPc { .. }))
-        .collect();
+    let event_frames: Vec<&DecodedFrame> =
+        frames.iter().filter(|f| matches!(f, DecodedFrame::EventPc { .. })).collect();
     assert_eq!(event_frames.len(), 1, "expected exactly one EventPC frame");
     assert_eq!(
         *event_frames[0],
