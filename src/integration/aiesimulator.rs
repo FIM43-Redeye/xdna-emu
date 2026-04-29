@@ -64,7 +64,8 @@ pub fn check_environment() -> Result<(), String> {
                  sandboxed environment that blocks filesystem access. \
                  Run outside the sandbox (aiesimulator also needs network \
                  access for FlexLM license verification).",
-                license_path.display(), e
+                license_path.display(),
+                e
             ));
         }
     }
@@ -138,26 +139,21 @@ pub fn run_simulation(
     }
 
     // Create working directories alongside the .prj
-    let work_dir = prj_dir.parent()
-        .unwrap_or(Path::new("."));
+    let work_dir = prj_dir.parent().unwrap_or(Path::new("."));
     let input_dir = work_dir.join("aiesim_input");
     let output_dir = work_dir.join("aiesim_output");
 
     // Clean and recreate output directory
     if output_dir.exists() {
-        std::fs::remove_dir_all(&output_dir)
-            .map_err(|e| format!("Failed to clean output dir: {}", e))?;
+        std::fs::remove_dir_all(&output_dir).map_err(|e| format!("Failed to clean output dir: {}", e))?;
     }
-    std::fs::create_dir_all(&output_dir)
-        .map_err(|e| format!("Failed to create output dir: {}", e))?;
+    std::fs::create_dir_all(&output_dir).map_err(|e| format!("Failed to create output dir: {}", e))?;
 
     // Write input data files
-    std::fs::create_dir_all(&input_dir)
-        .map_err(|e| format!("Failed to create input dir: {}", e))?;
+    std::fs::create_dir_all(&input_dir).map_err(|e| format!("Failed to create input dir: {}", e))?;
     for (name, data) in input_data {
         let path = input_dir.join(name);
-        std::fs::write(&path, data)
-            .map_err(|e| format!("Failed to write input file {}: {}", name, e))?;
+        std::fs::write(&path, data).map_err(|e| format!("Failed to write input file {}: {}", name, e))?;
     }
 
     // Ensure libxaienginecdo.so is available alongside ps.so
@@ -166,8 +162,7 @@ pub fn run_simulation(
     // aiesimulator is a complex bash wrapper that sources setupEnv.sh,
     // chess_env_LNa64.sh, and manages its own LD_LIBRARY_PATH/PATH.
     // We invoke via bash -c to ensure proper shell environment setup.
-    let aiesim_path = tools.aiesimulator.as_ref()
-        .ok_or("aiesimulator not available in aietools")?;
+    let aiesim_path = tools.aiesimulator.as_ref().ok_or("aiesimulator not available in aietools")?;
 
     // Build the shell command string with LD_LIBRARY_PATH prepended
     // (the wrapper script prepends its own dirs, so ours go in front).
@@ -188,13 +183,9 @@ pub fn run_simulation(
     cmd.arg(&shell_cmd);
     cmd.current_dir(work_dir);
 
-    log::info!(
-        "Running aiesimulator: pkg-dir={}, timeout={}",
-        sim_dir.display(), timeout_cycles
-    );
+    log::info!("Running aiesimulator: pkg-dir={}, timeout={}", sim_dir.display(), timeout_cycles);
 
-    let output = cmd.output()
-        .map_err(|e| format!("Failed to execute aiesimulator: {}", e))?;
+    let output = cmd.output().map_err(|e| format!("Failed to execute aiesimulator: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -211,12 +202,7 @@ pub fn run_simulation(
     // Auto-convert VCD traces to Perfetto JSON
     convert_vcd_traces(work_dir);
 
-    Ok(SimResult {
-        output_dir,
-        exit_code,
-        stdout,
-        stderr,
-    })
+    Ok(SimResult { output_dir, exit_code, stdout, stderr })
 }
 
 /// Run aiesimulator on a unit test .prj directory.
@@ -249,10 +235,7 @@ pub fn run_unit_simulation(
     // Unit tests use aiesim.sh which wraps aiesimulator with the right flags
     let aiesim_sh = prj_dir.join("aiesim.sh");
     if !aiesim_sh.exists() {
-        return Err(format!(
-            "No aiesim.sh in {} -- was the build run with --aiesim?",
-            prj_dir.display()
-        ));
+        return Err(format!("No aiesim.sh in {} -- was the build run with --aiesim?", prj_dir.display()));
     }
 
     // Ensure libxaienginecdo.so is available in the ps/ directory
@@ -263,12 +246,8 @@ pub fn run_unit_simulation(
 
     // Run aiesim.sh with the timeout. The script internally calls
     // aiesimulator with --pkg-dir pointing to sim/.
-    let shell_cmd = format!(
-        "{}bash {} --simulation-cycle-timeout={}",
-        ld_prefix,
-        aiesim_sh.display(),
-        timeout_cycles,
-    );
+    let shell_cmd =
+        format!("{}bash {} --simulation-cycle-timeout={}", ld_prefix, aiesim_sh.display(), timeout_cycles,);
 
     let work_dir = prj_dir.parent().unwrap_or(Path::new("."));
 
@@ -277,14 +256,10 @@ pub fn run_unit_simulation(
     cmd.arg(&shell_cmd);
     cmd.current_dir(work_dir);
 
-    log::info!(
-        "Running unit sim: prj={}, timeout={}",
-        prj_dir.display(), timeout_cycles
-    );
+    log::info!("Running unit sim: prj={}, timeout={}", prj_dir.display(), timeout_cycles);
 
     let start = std::time::Instant::now();
-    let output = cmd.output()
-        .map_err(|e| format!("Failed to execute aiesim.sh: {}", e))?;
+    let output = cmd.output().map_err(|e| format!("Failed to execute aiesim.sh: {}", e))?;
     let wall_time_secs = start.elapsed().as_secs_f64();
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -303,13 +278,7 @@ pub fn run_unit_simulation(
     // Auto-convert VCD traces to Perfetto JSON
     convert_vcd_traces(work_dir);
 
-    Ok(UnitSimResult {
-        passed,
-        stdout,
-        stderr,
-        exit_code,
-        wall_time_secs,
-    })
+    Ok(UnitSimResult { passed, stdout, stderr, exit_code, wall_time_secs })
 }
 
 /// Find VCD files in a directory and convert them to Perfetto JSON.
@@ -340,10 +309,7 @@ fn convert_vcd_traces(dir: &Path) {
                     );
                 }
                 Err(e) => {
-                    log::warn!(
-                        "Failed to convert VCD {}: {}",
-                        path.display(), e
-                    );
+                    log::warn!("Failed to convert VCD {}: {}", path.display(), e);
                 }
             }
         }
@@ -351,20 +317,14 @@ fn convert_vcd_traces(dir: &Path) {
 }
 
 /// Convert a single VCD file to Perfetto JSON.
-fn convert_single_vcd(
-    vcd_path: &Path,
-    json_path: &Path,
-) -> Result<vcd::VcdConvertResult, String> {
-    let vcd_file = std::fs::File::open(vcd_path)
-        .map_err(|e| format!("open VCD: {}", e))?;
+fn convert_single_vcd(vcd_path: &Path, json_path: &Path) -> Result<vcd::VcdConvertResult, String> {
+    let vcd_file = std::fs::File::open(vcd_path).map_err(|e| format!("open VCD: {}", e))?;
     let reader = std::io::BufReader::new(vcd_file);
 
-    let json_file = std::fs::File::create(json_path)
-        .map_err(|e| format!("create JSON: {}", e))?;
+    let json_file = std::fs::File::create(json_path).map_err(|e| format!("create JSON: {}", e))?;
     let mut writer = std::io::BufWriter::new(json_file);
 
-    vcd::vcd_to_perfetto(reader, &mut writer, None)
-        .map_err(|e| format!("conversion: {}", e))
+    vcd::vcd_to_perfetto(reader, &mut writer, None).map_err(|e| format!("conversion: {}", e))
 }
 
 /// Symlink libxaienginecdo.so into a sim/ps/ directory if not already present.
@@ -381,10 +341,8 @@ fn ensure_xaiengine_symlink(sim_dir: &Path) {
 
     let config = crate::config::Config::get();
     let mlir_aie = PathBuf::from(config.mlir_aie_path());
-    let xaiengine_src_raw = mlir_aie
-        .join("install/runtime_lib/x86_64/xaiengine/lib/libxaienginecdo.so");
-    let xaiengine_src = xaiengine_src_raw.canonicalize()
-        .unwrap_or(xaiengine_src_raw);
+    let xaiengine_src_raw = mlir_aie.join("install/runtime_lib/x86_64/xaiengine/lib/libxaienginecdo.so");
+    let xaiengine_src = xaiengine_src_raw.canonicalize().unwrap_or(xaiengine_src_raw);
     let xaiengine_link = ps_dir.join("libxaienginecdo.so");
 
     if xaiengine_src.exists() && !xaiengine_link.exists() {
@@ -404,10 +362,8 @@ fn ensure_xaiengine_symlink(sim_dir: &Path) {
 fn xaiengine_ld_prefix() -> String {
     let config = crate::config::Config::get();
     let mlir_aie = PathBuf::from(config.mlir_aie_path());
-    let xaiengine_lib_raw = mlir_aie
-        .join("install/runtime_lib/x86_64/xaiengine/lib");
-    let xaiengine_lib = xaiengine_lib_raw.canonicalize()
-        .unwrap_or(xaiengine_lib_raw);
+    let xaiengine_lib_raw = mlir_aie.join("install/runtime_lib/x86_64/xaiengine/lib");
+    let xaiengine_lib = xaiengine_lib_raw.canonicalize().unwrap_or(xaiengine_lib_raw);
 
     if xaiengine_lib.is_dir() {
         format!("LD_LIBRARY_PATH={}:$LD_LIBRARY_PATH ", xaiengine_lib.display())
@@ -446,9 +402,7 @@ pub fn read_output_data(sim_result: &SimResult) -> Result<Vec<u8>, String> {
         }
 
         // Read .bin files (raw binary) and .txt files (text format)
-        let ext = path.extension()
-            .map(|e| e.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let ext = path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
 
         match ext.as_str() {
             "bin" => {
@@ -480,17 +434,15 @@ pub fn read_output_data(sim_result: &SimResult) -> Result<Vec<u8>, String> {
     }
 
     if found_files.is_empty() {
-        return Err(format!(
-            "No output files found in {}",
-            search_dir.display()
-        ));
+        return Err(format!("No output files found in {}", search_dir.display()));
     }
 
     log::info!(
         "Read {} bytes from {} output file(s): {:?}",
         output.len(),
         found_files.len(),
-        found_files.iter()
+        found_files
+            .iter()
             .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
             .collect::<Vec<_>>()
     );

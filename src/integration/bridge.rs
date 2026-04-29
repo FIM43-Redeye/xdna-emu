@@ -53,9 +53,7 @@ pub fn invoke_bridge(
         cmd.arg(arg);
     }
 
-    let output = cmd
-        .output()
-        .map_err(|e| format!("Failed to run bridge: {}", e))?;
+    let output = cmd.output().map_err(|e| format!("Failed to run bridge: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -96,22 +94,14 @@ impl PlatformInfo {
         Ok(Self {
             npu_model: hardware["npu_model"].as_str().map(|s| s.to_string()),
             arch: hardware["arch"].as_str().map(|s| s.to_string()),
-            npu_generation: hardware["npu_generation"]
-                .as_str()
-                .map(|s| s.to_string()),
+            npu_generation: hardware["npu_generation"].as_str().map(|s| s.to_string()),
             features: json["features"]
                 .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default(),
             has_peano: tools["peano"]["found"].as_bool().unwrap_or(false),
             has_chess: tools["chess"]["found"].as_bool().unwrap_or(false),
-            has_aiesimulator: tools["aiesimulator"]["found"]
-                .as_bool()
-                .unwrap_or(false),
+            has_aiesimulator: tools["aiesimulator"]["found"].as_bool().unwrap_or(false),
         })
     }
 
@@ -132,11 +122,7 @@ impl PlatformInfo {
 /// command strings that `find_all_xclbin_results()` can parse.
 ///
 /// Returns `None` if the bridge fails or finds no aiecc.py calls.
-pub fn query_build_manifest(
-    bridge: &BridgePath,
-    example_dir: &Path,
-    use_chess: bool,
-) -> Option<Vec<String>> {
+pub fn query_build_manifest(bridge: &BridgePath, example_dir: &Path, use_chess: bool) -> Option<Vec<String>> {
     let dir_str = example_dir.to_string_lossy().to_string();
     let mut args = vec!["--dir", &dir_str];
     if use_chess {
@@ -175,8 +161,7 @@ pub struct BuildFeasibility {
 impl BuildFeasibility {
     /// Whether the test has enough prerequisites to attempt a build.
     pub fn is_buildable(&self) -> bool {
-        self.makefile_exists
-            && self.missing_dependencies.is_empty()
+        self.makefile_exists && self.missing_dependencies.is_empty()
     }
 
     /// Human-readable reason why the test cannot be built.
@@ -215,11 +200,7 @@ pub struct TestManifest {
 
 impl TestManifest {
     /// Query the bridge for a test manifest.
-    pub fn from_bridge(
-        bridge: &BridgePath,
-        npu_xrt_dir: &Path,
-        examples_dir: &Path,
-    ) -> Result<Self, String> {
+    pub fn from_bridge(bridge: &BridgePath, npu_xrt_dir: &Path, examples_dir: &Path) -> Result<Self, String> {
         let json = invoke_bridge(
             bridge,
             "test-manifest",
@@ -239,71 +220,42 @@ impl TestManifest {
                         .map(|t| {
                             let feasibility = &t["build_feasibility"];
                             TestEntry {
-                                name: t["name"]
-                                    .as_str()
-                                    .unwrap_or("")
-                                    .to_string(),
-                                path: t["path"]
-                                    .as_str()
-                                    .unwrap_or("")
-                                    .to_string(),
-                                target_device: t["target_device"]
-                                    .as_str()
-                                    .unwrap_or("npu1")
-                                    .to_string(),
-                                target_arch: t["target_arch"]
-                                    .as_str()
-                                    .unwrap_or("AIE2")
-                                    .to_string(),
+                                name: t["name"].as_str().unwrap_or("").to_string(),
+                                path: t["path"].as_str().unwrap_or("").to_string(),
+                                target_device: t["target_device"].as_str().unwrap_or("npu1").to_string(),
+                                target_arch: t["target_arch"].as_str().unwrap_or("AIE2").to_string(),
                                 requires: t["requires"]
                                     .as_array()
                                     .map(|a| {
-                                        a.iter()
-                                            .filter_map(|v| {
-                                                v.as_str().map(|s| s.to_string())
-                                            })
-                                            .collect()
+                                        a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
                                     })
                                     .unwrap_or_default(),
                                 compilers: t["compilers"]
                                     .as_array()
                                     .map(|a| {
-                                        a.iter()
-                                            .filter_map(|v| {
-                                                v.as_str().map(|s| s.to_string())
-                                            })
-                                            .collect()
+                                        a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
                                     })
                                     .unwrap_or_default(),
                                 build_feasibility: BuildFeasibility {
-                                    makefile_exists: feasibility
-                                        ["makefile_exists"]
+                                    makefile_exists: feasibility["makefile_exists"]
                                         .as_bool()
                                         .unwrap_or(false),
-                                    kernel_sources_exist: feasibility
-                                        ["kernel_sources_exist"]
+                                    kernel_sources_exist: feasibility["kernel_sources_exist"]
                                         .as_bool()
                                         .unwrap_or(false),
-                                    python_generator_exists: feasibility
-                                        ["python_generator_exists"]
+                                    python_generator_exists: feasibility["python_generator_exists"]
                                         .as_bool()
                                         .unwrap_or(false),
-                                    missing_dependencies: feasibility
-                                        ["missing_dependencies"]
+                                    missing_dependencies: feasibility["missing_dependencies"]
                                         .as_array()
                                         .map(|a| {
                                             a.iter()
-                                                .filter_map(|v| {
-                                                    v.as_str()
-                                                        .map(|s| s.to_string())
-                                                })
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
                                                 .collect()
                                         })
                                         .unwrap_or_default(),
                                 },
-                                skip_reason: t["skip_reason"]
-                                    .as_str()
-                                    .map(|s| s.to_string()),
+                                skip_reason: t["skip_reason"].as_str().map(|s| s.to_string()),
                             }
                         })
                         .collect()
@@ -402,10 +354,7 @@ mod tests {
         let json = result.unwrap();
         let core = &json["enums"]["CoreEvent"];
         // INSTR_VECTOR should be defined.
-        assert!(
-            core["INSTR_VECTOR"].as_u64().is_some(),
-            "missing INSTR_VECTOR"
-        );
+        assert!(core["INSTR_VECTOR"].as_u64().is_some(), "missing INSTR_VECTOR");
     }
 
     #[test]
@@ -468,10 +417,7 @@ mod tests {
         assert!(commands.is_some(), "build-manifest returned None");
         let commands = commands.unwrap();
         assert!(!commands.is_empty());
-        assert!(
-            commands[0].contains("--xclbin-name="),
-            "command should contain --xclbin-name"
-        );
+        assert!(commands[0].contains("--xclbin-name="), "command should contain --xclbin-name");
     }
 
     #[test]
@@ -481,11 +427,7 @@ mod tests {
             None => return,
         };
 
-        let result = query_build_manifest(
-            &bridge,
-            Path::new("/nonexistent_example_dir_12345"),
-            false,
-        );
+        let result = query_build_manifest(&bridge, Path::new("/nonexistent_example_dir_12345"), false);
         assert!(result.is_none());
     }
 }

@@ -220,10 +220,18 @@ impl AieTools {
     /// Summary of discovered tools for display.
     pub fn summary(&self) -> String {
         let mut tools = Vec::new();
-        if self.elfanalyzer.is_some() { tools.push("elfanalyzer"); }
-        if self.xchesscc.is_some() { tools.push("xchesscc"); }
-        if self.aiesimulator.is_some() { tools.push("aiesimulator"); }
-        if self.hwanalyze.is_some() { tools.push("hwanalyze"); }
+        if self.elfanalyzer.is_some() {
+            tools.push("elfanalyzer");
+        }
+        if self.xchesscc.is_some() {
+            tools.push("xchesscc");
+        }
+        if self.aiesimulator.is_some() {
+            tools.push("aiesimulator");
+        }
+        if self.hwanalyze.is_some() {
+            tools.push("hwanalyze");
+        }
 
         format!("aietools at {} ({})", self.root.display(), tools.join(", "))
     }

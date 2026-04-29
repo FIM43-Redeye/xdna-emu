@@ -70,16 +70,13 @@ pub fn analyze(tools: &AieTools, elf_path: &Path) -> Result<ElfAnalysis, String>
 
 /// Run a single elfanalyzer analysis and return stdout.
 fn run_analysis(tools: &AieTools, elf_path: &Path, analysis: &str) -> Result<String, String> {
-    let mut cmd = tools.command(Tool::Elfanalyzer)
-        .ok_or("elfanalyzer not available")?;
+    let mut cmd = tools.command(Tool::Elfanalyzer).ok_or("elfanalyzer not available")?;
 
-    cmd.arg(format!("--analysis={}", analysis))
-        .arg(elf_path);
+    cmd.arg(format!("--analysis={}", analysis)).arg(elf_path);
 
     log::debug!("Running elfanalyzer --analysis={} on {}", analysis, elf_path.display());
 
-    let output = cmd.output()
-        .map_err(|e| format!("Failed to execute elfanalyzer: {}", e))?;
+    let output = cmd.output().map_err(|e| format!("Failed to execute elfanalyzer: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -168,10 +165,7 @@ fn parse_globals(output: &str) -> Vec<GlobalEntry> {
 
     for line in output.lines() {
         let line = line.trim();
-        if line.is_empty()
-            || line.starts_with("Name")
-            || line.starts_with("----")
-        {
+        if line.is_empty() || line.starts_with("Name") || line.starts_with("----") {
             continue;
         }
 
@@ -182,12 +176,7 @@ fn parse_globals(output: &str) -> Vec<GlobalEntry> {
             let size = parts[2].parse::<usize>().unwrap_or(0);
             let section = parts[3].to_string();
 
-            globals.push(GlobalEntry {
-                name,
-                address,
-                size,
-                section,
-            });
+            globals.push(GlobalEntry { name, address, size, section });
         }
     }
 
@@ -239,10 +228,7 @@ pub fn format_analysis(analysis: &ElfAnalysis, elf_name: &str) -> String {
         }
     }
 
-    if analysis.pm_sizes.is_empty()
-        && analysis.stack_sizes.is_empty()
-        && analysis.globals.is_empty()
-    {
+    if analysis.pm_sizes.is_empty() && analysis.stack_sizes.is_empty() && analysis.globals.is_empty() {
         out.push_str("  (no analysis data)\n");
     }
 
@@ -287,8 +273,7 @@ impl CrossValidation {
         if self.is_consistent() {
             format!("{} functions match", self.matching.len())
         } else {
-            format!("{} match, {} discrepancies",
-                self.matching.len(), self.discrepancies.len())
+            format!("{} match, {} discrepancies", self.matching.len(), self.discrepancies.len())
         }
     }
 }
@@ -298,14 +283,14 @@ impl CrossValidation {
 /// Compares function names and program memory sizes. Discrepancies may be
 /// benign (different size measurement methods) or indicate parser bugs.
 pub fn cross_validate(analysis: &ElfAnalysis, elf_data: &[u8]) -> Result<CrossValidation, String> {
-    let aie_elf = AieElf::parse(elf_data)
-        .map_err(|e| format!("Failed to parse ELF: {}", e))?;
+    let aie_elf = AieElf::parse(elf_data).map_err(|e| format!("Failed to parse ELF: {}", e))?;
 
     let mut matching = Vec::new();
     let mut discrepancies = Vec::new();
 
     // Build a map of our parser's function symbols
-    let our_functions: HashMap<String, u32> = aie_elf.functions()
+    let our_functions: HashMap<String, u32> = aie_elf
+        .functions()
         .filter(|f| f.size > 0)
         .map(|f| (f.name.clone(), f.size))
         .collect();
@@ -318,18 +303,13 @@ pub fn cross_validate(analysis: &ElfAnalysis, elf_data: &[u8]) -> Result<CrossVa
             } else {
                 discrepancies.push(Discrepancy {
                     symbol: name.clone(),
-                    kind: DiscrepancyKind::SizeMismatch {
-                        our_size,
-                        elfanalyzer_size: ea_size,
-                    },
+                    kind: DiscrepancyKind::SizeMismatch { our_size, elfanalyzer_size: ea_size },
                 });
             }
         } else {
             discrepancies.push(Discrepancy {
                 symbol: name.clone(),
-                kind: DiscrepancyKind::MissingFromParser {
-                    elfanalyzer_size: ea_size,
-                },
+                kind: DiscrepancyKind::MissingFromParser { elfanalyzer_size: ea_size },
             });
         }
     }
@@ -352,17 +332,11 @@ pub fn format_cross_validation(cv: &CrossValidation, elf_name: &str) -> String {
     let mut out = String::new();
 
     if cv.is_consistent() {
-        out.push_str(&format!(
-            "      elfanalyzer vs parser: {} -- {}\n",
-            elf_name, cv.summary()
-        ));
+        out.push_str(&format!("      elfanalyzer vs parser: {} -- {}\n", elf_name, cv.summary()));
         return out;
     }
 
-    out.push_str(&format!(
-        "      elfanalyzer vs parser: {} -- {}\n",
-        elf_name, cv.summary()
-    ));
+    out.push_str(&format!("      elfanalyzer vs parser: {} -- {}\n", elf_name, cv.summary()));
 
     for d in &cv.discrepancies {
         match &d.kind {
@@ -460,10 +434,7 @@ counter                0x20400    4       .bss
     #[test]
     fn test_cross_validation_matching() {
         let _analysis = ElfAnalysis {
-            pm_sizes: [
-                ("main".to_string(), 256),
-                ("helper".to_string(), 64),
-            ].into_iter().collect(),
+            pm_sizes: [("main".to_string(), 256), ("helper".to_string(), 64)].into_iter().collect(),
             ..Default::default()
         };
 
@@ -481,15 +452,10 @@ counter                0x20400    4       .bss
     fn test_cross_validation_with_discrepancies() {
         let cv = CrossValidation {
             matching: vec![("main".to_string(), 256)],
-            discrepancies: vec![
-                Discrepancy {
-                    symbol: "helper".to_string(),
-                    kind: DiscrepancyKind::SizeMismatch {
-                        our_size: 64,
-                        elfanalyzer_size: 72,
-                    },
-                },
-            ],
+            discrepancies: vec![Discrepancy {
+                symbol: "helper".to_string(),
+                kind: DiscrepancyKind::SizeMismatch { our_size: 64, elfanalyzer_size: 72 },
+            }],
         };
         assert!(!cv.is_consistent());
         assert!(cv.summary().contains("1 match"));

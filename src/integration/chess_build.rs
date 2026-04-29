@@ -145,27 +145,29 @@ impl BuildEnv {
         }
         // Canonicalize so all derived paths are absolute -- critical because
         // build() changes the working directory to the output dir.
-        let mlir_aie = mlir_aie_raw.canonicalize()
+        let mlir_aie = mlir_aie_raw
+            .canonicalize()
             .map_err(|e| format!("Failed to canonicalize {}: {}", mlir_aie_raw.display(), e))?;
 
         // Python venv
         let ironenv = mlir_aie.join("ironenv");
         let python = ironenv.join("bin/python3");
         if !python.exists() {
-            return Err(format!(
-                "ironenv not found at {} -- build mlir-aie first",
-                ironenv.display()
-            ));
+            return Err(format!("ironenv not found at {} -- build mlir-aie first", ironenv.display()));
         }
 
         // aiecc.py: prefer install/bin over build/bin
         let aiecc = Self::find_first_existing(&[
             mlir_aie.join("install/bin/aiecc.py"),
             mlir_aie.join("build/bin/aiecc.py"),
-        ]).ok_or_else(|| format!(
-            "aiecc.py not found in {}/install/bin or {}/build/bin",
-            mlir_aie.display(), mlir_aie.display()
-        ))?;
+        ])
+        .ok_or_else(|| {
+            format!(
+                "aiecc.py not found in {}/install/bin or {}/build/bin",
+                mlir_aie.display(),
+                mlir_aie.display()
+            )
+        })?;
 
         // PYTHONPATH: all Python module directories that exist (canonicalized)
         let python_dirs: Vec<String> = [
@@ -196,15 +198,14 @@ impl BuildEnv {
         }
 
         // mlir-aie bin directory (same as aiecc.py's parent)
-        let mlir_aie_bin = aiecc.parent()
-            .ok_or("aiecc.py has no parent directory")?
-            .to_path_buf();
+        let mlir_aie_bin = aiecc.parent().ok_or("aiecc.py has no parent directory")?.to_path_buf();
 
         // Peano: env var first, then sibling directory fallback
         let peano_dir = Self::find_peano(&mlir_aie)?;
 
         // aietools: optional, from env or config
-        let aietools_root = config.aietools_path()
+        let aietools_root = config
+            .aietools_path()
             .or_else(|| std::env::var("XILINX_VITIS_AIETOOLS").ok().map(PathBuf::from))
             .filter(|p| p.exists());
 
@@ -212,20 +213,25 @@ impl BuildEnv {
         // These are built by mlir-aie's test_lib cmake target.
         let test_lib_include = {
             let p = mlir_aie.join("install/runtime_lib/x86_64/test_lib/include");
-            if p.is_dir() { Some(p) } else { None }
+            if p.is_dir() {
+                Some(p)
+            } else {
+                None
+            }
         };
         let test_lib_lib = {
             let p = mlir_aie.join("install/runtime_lib/x86_64/test_lib/lib");
-            if p.is_dir() { Some(p) } else { None }
+            if p.is_dir() {
+                Some(p)
+            } else {
+                None
+            }
         };
 
         // Toolchain mtime: use aie-opt as sentinel for mlir-aie rebuilds.
         // aie-opt is always rebuilt when mlir-aie changes; aiecc.py in the
         // install dir can have a stale timestamp from the initial copy.
-        let toolchain_mtime = mlir_aie_bin.join("aie-opt")
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok();
+        let toolchain_mtime = mlir_aie_bin.join("aie-opt").metadata().and_then(|m| m.modified()).ok();
 
         Ok(BuildEnv {
             python,
@@ -331,8 +337,7 @@ impl BuildEnv {
         let compiler_label = if opts.use_chess { "Chess" } else { "Peano" };
         log::info!("Building with {} in {}", compiler_label, output_dir.display());
 
-        let output = cmd.output()
-            .map_err(|e| format!("Failed to execute aiecc.py: {}", e))?;
+        let output = cmd.output().map_err(|e| format!("Failed to execute aiecc.py: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -346,12 +351,15 @@ impl BuildEnv {
             if xclbin_path.exists() {
                 log::warn!(
                     "{} build exited with {} but xclbin was produced (partial success)",
-                    compiler_label, output.status.code().unwrap_or(-1)
+                    compiler_label,
+                    output.status.code().unwrap_or(-1)
                 );
             } else if let Some(found) = artifacts::collect_xclbins(output_dir).into_iter().next() {
                 log::warn!(
                     "{} build exited with {} but found {} (partial success)",
-                    compiler_label, output.status.code().unwrap_or(-1), found.display()
+                    compiler_label,
+                    output.status.code().unwrap_or(-1),
+                    found.display()
                 );
                 return Ok(BuildResult {
                     xclbin: found,
@@ -384,7 +392,8 @@ impl BuildEnv {
             }
             return Err(format!(
                 "{} build succeeded but no xclbin found in {}",
-                compiler_label, output_dir.display()
+                compiler_label,
+                output_dir.display()
             ));
         }
 
@@ -423,9 +432,13 @@ impl BuildEnv {
         nice: Option<i32>,
     ) -> Result<crate::testing::unit_test::UnitTestBuildResult, String> {
         // Check test_lib availability (required for %test_lib_flags expansion)
-        let test_lib_include = self.test_lib_include.as_ref()
+        let test_lib_include = self
+            .test_lib_include
+            .as_ref()
             .ok_or("test_lib include dir not found -- build mlir-aie test_lib target")?;
-        let test_lib_lib = self.test_lib_lib.as_ref()
+        let test_lib_lib = self
+            .test_lib_lib
+            .as_ref()
             .ok_or("test_lib lib dir not found -- build mlir-aie test_lib target")?;
 
         // Check cache: if .prj/sim/ps/ps.so exists and is newer than all sources
@@ -434,10 +447,7 @@ impl BuildEnv {
         }
 
         if test.build_steps.is_empty() {
-            return Err(format!(
-                "No build steps found in {} (no // RUN: lines)",
-                test.mlir_file.display()
-            ));
+            return Err(format!("No build steps found in {} (no // RUN: lines)", test.mlir_file.display()));
         }
 
         // Create output directory
@@ -445,13 +455,9 @@ impl BuildEnv {
             .map_err(|e| format!("Failed to create {}: {}", output_dir.display(), e))?;
 
         // Copy source files to output directory
-        let mlir_filename = test.mlir_file.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+        let mlir_filename = test.mlir_file.file_name().unwrap_or_default().to_string_lossy().to_string();
         let work_mlir = output_dir.join(&mlir_filename);
-        std::fs::copy(&test.mlir_file, &work_mlir)
-            .map_err(|e| format!("Failed to copy MLIR: {}", e))?;
+        std::fs::copy(&test.mlir_file, &work_mlir).map_err(|e| format!("Failed to copy MLIR: {}", e))?;
 
         std::fs::copy(&test.test_cpp, output_dir.join("test.cpp"))
             .map_err(|e| format!("Failed to copy test.cpp: {}", e))?;
@@ -466,10 +472,7 @@ impl BuildEnv {
         let mut build_log = String::new();
         let step_count = test.build_steps.len();
 
-        log::info!(
-            "Building unit test {} ({} steps) in {}",
-            test.name, step_count, output_dir.display()
-        );
+        log::info!("Building unit test {} ({} steps) in {}", test.name, step_count, output_dir.display());
 
         for (step_idx, step) in test.build_steps.iter().enumerate() {
             let expanded = expand_lit_subs(
@@ -480,14 +483,11 @@ impl BuildEnv {
                 &mlir_filename,
                 Some(test_lib_include.as_path()),
                 Some(test_lib_lib.as_path()),
-                None,  // source_dir: use output_dir for %S (unit test behavior)
-                None,  // aietools: not needed for unit tests
+                None, // source_dir: use output_dir for %S (unit test behavior)
+                None, // aietools: not needed for unit tests
             );
 
-            log::info!(
-                "  step {}/{}: {}",
-                step_idx + 1, step_count, expanded
-            );
+            log::info!("  step {}/{}: {}", step_idx + 1, step_count, expanded);
 
             // Execute via sh -c so shell constructs (pipes, quoting) work
             // and PATH from apply_env() is inherited by child processes.
@@ -503,17 +503,19 @@ impl BuildEnv {
             cmd.current_dir(output_dir);
             self.apply_env(&mut cmd);
 
-            let output = cmd.output()
-                .map_err(|e| format!(
-                    "Build step {}/{} failed to execute: {}",
-                    step_idx + 1, step_count, e
-                ))?;
+            let output = cmd.output().map_err(|e| {
+                format!("Build step {}/{} failed to execute: {}", step_idx + 1, step_count, e)
+            })?;
 
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             build_log.push_str(&format!(
                 "--- step {}/{} ---\n{}\n--- stdout ---\n{}\n--- stderr ---\n{}\n",
-                step_idx + 1, step_count, expanded, stdout, stderr
+                step_idx + 1,
+                step_count,
+                expanded,
+                stdout,
+                stderr
             ));
 
             if !output.status.success() {
@@ -522,7 +524,8 @@ impl BuildEnv {
                 if artifacts::find_prj_dir(output_dir).is_some() {
                     log::warn!(
                         "Build step {}/{} exited with {} but .prj exists (partial success)",
-                        step_idx + 1, step_count,
+                        step_idx + 1,
+                        step_count,
                         output.status.code().unwrap_or(-1)
                     );
                     build_log.push_str(&format!(
@@ -532,7 +535,8 @@ impl BuildEnv {
                 } else {
                     return Err(format!(
                         "Build step {}/{} failed (exit {}):\n{}",
-                        step_idx + 1, step_count,
+                        step_idx + 1,
+                        step_count,
                         output.status.code().unwrap_or(-1),
                         build_log
                     ));
@@ -541,15 +545,11 @@ impl BuildEnv {
         }
 
         // Find the .prj directory produced by aiecc.py
-        let prj_dir = artifacts::find_prj_dir(output_dir).ok_or_else(|| format!(
-            "Build completed but no .prj directory found in {}",
-            output_dir.display()
-        ))?;
+        let prj_dir = artifacts::find_prj_dir(output_dir).ok_or_else(|| {
+            format!("Build completed but no .prj directory found in {}", output_dir.display())
+        })?;
 
-        Ok(crate::testing::unit_test::UnitTestBuildResult {
-            prj_dir,
-            build_log,
-        })
+        Ok(crate::testing::unit_test::UnitTestBuildResult { prj_dir, build_log })
     }
 
     /// Build an NPU test from source using RUN-line-driven build steps.
@@ -584,10 +584,7 @@ impl BuildEnv {
         }
 
         if test.build_steps.is_empty() {
-            return Err(format!(
-                "No build steps for test {} (no RUN lines after filtering)",
-                test.name
-            ));
+            return Err(format!("No build steps for test {} (no RUN lines after filtering)", test.name));
         }
 
         // Create output directory
@@ -601,22 +598,20 @@ impl BuildEnv {
 
         log::info!(
             "Building NPU test {} with {} ({} steps) in {}",
-            test.name, compiler_label, step_count, output_dir.display()
+            test.name,
+            compiler_label,
+            step_count,
+            output_dir.display()
         );
 
         // Entry filename for %s substitution (rarely used in NPU tests)
-        let entry_filename = test.entry_file.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+        let entry_filename = test.entry_file.file_name().unwrap_or_default().to_string_lossy().to_string();
 
         for (step_idx, step) in test.build_steps.iter().enumerate() {
             // Apply compiler override (Peano/Chess flags) to aiecc.py and
             // xchesscc_wrapper lines
             let peano_clang = self.peano_dir.join("bin/clang");
-            let overridden = apply_compiler_override(
-                step, opts.use_chess, Some(&peano_clang),
-            );
+            let overridden = apply_compiler_override(step, opts.use_chess, Some(&peano_clang));
 
             // Expand lit substitutions (%S -> source_dir, %python, %aietools, etc.)
             let expanded = expand_lit_subs(
@@ -631,10 +626,7 @@ impl BuildEnv {
                 self.aietools_root.as_deref(),
             );
 
-            log::info!(
-                "  step {}/{}: {}",
-                step_idx + 1, step_count, expanded
-            );
+            log::info!("  step {}/{}: {}", step_idx + 1, step_count, expanded);
 
             // Execute via sh -c so shell constructs (pipes, redirects) work
             let mut cmd = if let Some(n) = opts.nice {
@@ -649,17 +641,19 @@ impl BuildEnv {
             cmd.current_dir(output_dir);
             self.apply_env(&mut cmd);
 
-            let output = cmd.output()
-                .map_err(|e| format!(
-                    "Build step {}/{} failed to execute: {}",
-                    step_idx + 1, step_count, e
-                ))?;
+            let output = cmd.output().map_err(|e| {
+                format!("Build step {}/{} failed to execute: {}", step_idx + 1, step_count, e)
+            })?;
 
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             build_log.push_str(&format!(
                 "--- step {}/{} ---\n{}\n--- stdout ---\n{}\n--- stderr ---\n{}\n",
-                step_idx + 1, step_count, expanded, stdout, stderr
+                step_idx + 1,
+                step_count,
+                expanded,
+                stdout,
+                stderr
             ));
 
             if !output.status.success() {
@@ -668,14 +662,16 @@ impl BuildEnv {
                 if !artifacts::collect_xclbins(output_dir).is_empty() {
                     log::warn!(
                         "Build step {}/{} exited with {} but xclbin exists (partial success)",
-                        step_idx + 1, step_count,
+                        step_idx + 1,
+                        step_count,
                         output.status.code().unwrap_or(-1)
                     );
                 } else {
                     return Err(format!(
                         "{} build step {}/{} failed (exit {}):\n{}",
                         compiler_label,
-                        step_idx + 1, step_count,
+                        step_idx + 1,
+                        step_count,
                         output.status.code().unwrap_or(-1),
                         build_log
                     ));
@@ -684,10 +680,9 @@ impl BuildEnv {
         }
 
         // Find produced artifacts
-        let xclbin = artifacts::collect_xclbins(output_dir).into_iter().next().ok_or_else(|| format!(
-            "{} build completed but no xclbin found in {}",
-            compiler_label, output_dir.display()
-        ))?;
+        let xclbin = artifacts::collect_xclbins(output_dir).into_iter().next().ok_or_else(|| {
+            format!("{} build completed but no xclbin found in {}", compiler_label, output_dir.display())
+        })?;
 
         Ok(BuildResult {
             xclbin,
@@ -731,10 +726,7 @@ impl BuildEnv {
         }
 
         let compiler_label = if opts.use_chess { "Chess" } else { "Peano" };
-        log::info!(
-            "Building example with {} in {}",
-            compiler_label, output_dir.display()
-        );
+        log::info!("Building example with {} in {}", compiler_label, output_dir.display());
 
         // For Chess: create symlinked workspace
         if opts.use_chess && output_dir != source_dir {
@@ -745,7 +737,8 @@ impl BuildEnv {
             // source_dir may be relative (e.g. "../mlir-aie/programming_examples/...")
             // and relative symlink targets break when the link lives in a
             // different directory tree (build/chess_examples/).
-            let abs_source = source_dir.canonicalize()
+            let abs_source = source_dir
+                .canonicalize()
                 .map_err(|e| format!("Cannot resolve {}: {}", source_dir.display(), e))?;
 
             // Symlink key files from source_dir into output_dir
@@ -814,8 +807,7 @@ impl BuildEnv {
         cmd.arg(format!("CHESS={}", chess_flag));
         self.apply_env(&mut cmd);
 
-        let output = cmd.output()
-            .map_err(|e| format!("Failed to execute make: {}", e))?;
+        let output = cmd.output().map_err(|e| format!("Failed to execute make: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -826,7 +818,8 @@ impl BuildEnv {
             if find_example_xclbin(&build_dir).is_some() {
                 log::warn!(
                     "{} example build exited with {} but xclbin was produced",
-                    compiler_label, output.status.code().unwrap_or(-1)
+                    compiler_label,
+                    output.status.code().unwrap_or(-1)
                 );
             } else {
                 return Err(format!(
@@ -841,7 +834,8 @@ impl BuildEnv {
         let xclbin_path = find_example_xclbin(&build_dir).ok_or_else(|| {
             format!(
                 "{} example build completed but no xclbin found in {}",
-                compiler_label, build_dir.display()
+                compiler_label,
+                build_dir.display()
             )
         })?;
 
@@ -855,11 +849,7 @@ impl BuildEnv {
     }
 
     /// Check if a cached example build result exists and is still valid.
-    fn check_example_cache(
-        &self,
-        python_source: &Path,
-        build_dir: &Path,
-    ) -> Option<BuildResult> {
+    fn check_example_cache(&self, python_source: &Path, build_dir: &Path) -> Option<BuildResult> {
         let xclbins = artifacts::collect_xclbins(build_dir);
         if xclbins.is_empty() {
             return None;
@@ -876,11 +866,7 @@ impl BuildEnv {
             }
         }
 
-        log::info!(
-            "Using cached example build ({} xclbin(s)) in {}",
-            xclbins.len(),
-            build_dir.display()
-        );
+        log::info!("Using cached example build ({} xclbin(s)) in {}", xclbins.len(), build_dir.display());
         Some(BuildResult {
             xclbin: xclbins.into_iter().next().unwrap(),
             insts: artifacts::find_insts(build_dir),
@@ -951,12 +937,7 @@ impl BuildEnv {
     ///
     /// Returns `Some(BuildResult)` if the xclbin is newer than the MLIR source,
     /// meaning we can skip the build.
-    fn check_cache(
-        &self,
-        mlir_source: &Path,
-        output_dir: &Path,
-        xclbin_path: &Path,
-    ) -> Option<BuildResult> {
+    fn check_cache(&self, mlir_source: &Path, output_dir: &Path, xclbin_path: &Path) -> Option<BuildResult> {
         if !xclbin_path.exists() {
             return None;
         }
@@ -1008,10 +989,7 @@ impl BuildEnv {
         }
 
         log::info!("Using cached unit test build in {}", output_dir.display());
-        Some(crate::testing::unit_test::UnitTestBuildResult {
-            prj_dir,
-            build_log: "(cached)".to_string(),
-        })
+        Some(crate::testing::unit_test::UnitTestBuildResult { prj_dir, build_log: "(cached)".to_string() })
     }
 
     /// Apply standard environment variables to a Command.
@@ -1057,7 +1035,9 @@ impl BuildEnv {
         }
 
         // Clean LD_LIBRARY_PATH: strip aietools lib entries
-        let aietools_root_str = self.aietools_root.as_ref()
+        let aietools_root_str = self
+            .aietools_root
+            .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
         let clean_ld_path: String = std::env::var("LD_LIBRARY_PATH")
@@ -1085,7 +1065,8 @@ impl BuildEnv {
         if let Ok(dir) = std::env::var("PEANO_INSTALL_DIR") {
             let p = PathBuf::from(&dir);
             if p.exists() {
-                return p.canonicalize()
+                return p
+                    .canonicalize()
                     .map_err(|e| format!("Failed to canonicalize PEANO_INSTALL_DIR: {}", e));
             }
         }
@@ -1094,7 +1075,8 @@ impl BuildEnv {
         if let Some(parent) = mlir_aie.parent() {
             let llvm_aie_install = parent.join("llvm-aie/install");
             if llvm_aie_install.join("bin").exists() {
-                return llvm_aie_install.canonicalize()
+                return llvm_aie_install
+                    .canonicalize()
                     .map_err(|e| format!("Failed to canonicalize llvm-aie path: {}", e));
             }
         }
@@ -1102,13 +1084,12 @@ impl BuildEnv {
         // ironenv pip package fallback
         let ironenv_peano = mlir_aie.join("ironenv/lib/python3.13/site-packages/llvm-aie");
         if ironenv_peano.exists() {
-            return ironenv_peano.canonicalize()
+            return ironenv_peano
+                .canonicalize()
                 .map_err(|e| format!("Failed to canonicalize ironenv peano: {}", e));
         }
 
-        Err(
-            "Peano compiler not found. Set PEANO_INSTALL_DIR or build llvm-aie".to_string()
-        )
+        Err("Peano compiler not found. Set PEANO_INSTALL_DIR or build llvm-aie".to_string())
     }
 
     /// Return the first path that exists from a list of candidates.
@@ -1349,13 +1330,11 @@ pub fn find_all_xclbin_results(
     build_steps: &[String],
 ) -> Vec<(PathBuf, Option<PathBuf>, String)> {
     // Parse xclbin -> insts mapping from build step flags
-    let mut xclbin_to_insts: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut xclbin_to_insts: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for step in build_steps {
-        if let (Some(xname), Some(iname)) = (
-            extract_flag_value(step, "--xclbin-name="),
-            extract_flag_value(step, "--npu-insts-name="),
-        ) {
+        if let (Some(xname), Some(iname)) =
+            (extract_flag_value(step, "--xclbin-name="), extract_flag_value(step, "--npu-insts-name="))
+        {
             xclbin_to_insts.insert(xname, iname);
         }
     }
@@ -1364,14 +1343,8 @@ pub fn find_all_xclbin_results(
 
     let mut results = Vec::new();
     for xclbin in &xclbins {
-        let xclbin_name = xclbin.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let variant = xclbin.file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+        let xclbin_name = xclbin.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let variant = xclbin.file_stem().unwrap_or_default().to_string_lossy().to_string();
 
         // Try to find matching insts file
         let insts = if let Some(insts_name) = xclbin_to_insts.get(&xclbin_name) {
@@ -1381,10 +1354,13 @@ pub fn find_all_xclbin_results(
                 Some(insts_path)
             } else {
                 // Try .bin extension variant
-                let bin_variant = insts_name
-                    .replace(".txt", ".bin");
+                let bin_variant = insts_name.replace(".txt", ".bin");
                 let bin_path = output_dir.join(&bin_variant);
-                if bin_path.exists() { Some(bin_path) } else { None }
+                if bin_path.exists() {
+                    Some(bin_path)
+                } else {
+                    None
+                }
             }
         } else {
             // No parsed mapping -- fall back to standard insts.bin
@@ -1565,10 +1541,7 @@ mod tests {
             Some(Path::new("/src/test")),
             Some(Path::new("/opt/aietools")),
         );
-        assert_eq!(
-            result,
-            "xchesscc_wrapper aie2 -I /opt/aietools/include -c /src/test/kernel.cc"
-        );
+        assert_eq!(result, "xchesscc_wrapper aie2 -I /opt/aietools/include -c /src/test/kernel.cc");
     }
 
     #[test]
@@ -1589,11 +1562,8 @@ mod tests {
 
     #[test]
     fn test_compiler_override_peano() {
-        let result = apply_compiler_override(
-            "%python aiecc.py --xchesscc --xbridge --no-aiesim %s",
-            false,
-            None,
-        );
+        let result =
+            apply_compiler_override("%python aiecc.py --xchesscc --xbridge --no-aiesim %s", false, None);
         assert!(result.contains("--no-xchesscc"));
         assert!(result.contains("--no-xbridge"));
         assert!(!result.contains(" --xchesscc"));
@@ -1602,11 +1572,8 @@ mod tests {
 
     #[test]
     fn test_compiler_override_chess() {
-        let result = apply_compiler_override(
-            "%python aiecc.py --no-xchesscc --no-xbridge --no-aiesim %s",
-            true,
-            None,
-        );
+        let result =
+            apply_compiler_override("%python aiecc.py --no-xchesscc --no-xbridge --no-aiesim %s", true, None);
         assert!(result.contains("--xchesscc"));
         assert!(result.contains("--xbridge"));
         assert!(!result.contains("--no-xchesscc"));
@@ -1616,11 +1583,7 @@ mod tests {
     #[test]
     fn test_compiler_override_adds_missing_flags() {
         // aiecc.py line with no compiler flags should get them added
-        let result = apply_compiler_override(
-            "%python aiecc.py --no-aiesim %s",
-            false,
-            None,
-        );
+        let result = apply_compiler_override("%python aiecc.py --no-aiesim %s", false, None);
         assert!(result.contains("--no-xchesscc"));
         assert!(result.contains("--no-xbridge"));
     }
@@ -1635,11 +1598,7 @@ mod tests {
 
     #[test]
     fn test_compiler_override_no_double_spaces() {
-        let result = apply_compiler_override(
-            "%python aiecc.py --xchesscc --xbridge %s",
-            false,
-            None,
-        );
+        let result = apply_compiler_override("%python aiecc.py --xchesscc --xbridge %s", false, None);
         assert!(!result.contains("  "));
     }
 
@@ -1704,10 +1663,7 @@ mod tests {
             ),
             Some("insts2_plain.txt".to_string())
         );
-        assert_eq!(
-            extract_flag_value("aiecc.py --no-aiesim foo.mlir", "--xclbin-name="),
-            None
-        );
+        assert_eq!(extract_flag_value("aiecc.py --no-aiesim foo.mlir", "--xclbin-name="), None);
     }
 
     #[test]
@@ -1720,9 +1676,8 @@ mod tests {
         std::fs::write(dir.join("aie.xclbin"), b"xclbin").unwrap();
         std::fs::write(dir.join("insts.bin"), b"insts").unwrap();
 
-        let build_steps = vec![
-            "aiecc.py --xclbin-name=aie.xclbin --npu-insts-name=insts.bin aie.mlir".to_string(),
-        ];
+        let build_steps =
+            vec!["aiecc.py --xclbin-name=aie.xclbin --npu-insts-name=insts.bin aie.mlir".to_string()];
 
         let results = find_all_xclbin_results(&dir, &build_steps);
         assert_eq!(results.len(), 1);
@@ -1813,8 +1768,8 @@ mod tests {
 
         let now = SystemTime::now();
         let xclbin_mtime = now - Duration::from_secs(200);
-        let source_mtime = now - Duration::from_secs(100);  // source newer than xclbin
-        let toolchain_mtime = now - Duration::from_secs(300);  // toolchain older than both
+        let source_mtime = now - Duration::from_secs(100); // source newer than xclbin
+        let toolchain_mtime = now - Duration::from_secs(300); // toolchain older than both
 
         assert!(is_cache_valid(xclbin_mtime, source_mtime, Some(toolchain_mtime)) == false);
     }
