@@ -706,6 +706,56 @@ class TestMlirTraceInjectPerfcnt:
         text = out.read_text()
         assert "@perf_core_" in text, f"No perf_core_ block found:\n{text[:2000]}"
 
+    def test_inject_perfcnt_uses_correct_registers(
+        self, tmp_path, simple_design_mlir
+    ):
+        """The perfcnt block must reference Performance_Control2 (not _Control1)
+        for Cnt0_Reset_Event, and must NOT use field= on Performance_Control{0,2}.
+
+        Per aie-rt xaiemlgbl_params.h:
+          - Performance_Control0 holds Cnt0_Start_Event at bits[6:0]  (event 28).
+          - Performance_Control2 holds Cnt0_Reset_Event at bits[6:0]  (event 5).
+        The aie_registers_aie2.json regdb has NO named bitfields for these
+        registers, so `aie.trace.reg ... field="..."` would fail at lower-time
+        with "Field not found in register: ...".  This test pins the
+        regression fix from gate-A.2 Task 9.
+        """
+        inp = tmp_path / "in.mlir"
+        inp.write_text(simple_design_mlir)
+        out = tmp_path / "out.mlir"
+        rc = run_inject([
+            "--input", str(inp), "--out", str(out),
+            "--trace-mode", "event_pc",
+            "--core-grounding", "PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1",
+            "--perfcnt-period", "2048",
+        ])
+        assert rc == 0
+        text = out.read_text()
+
+        # Cnt0_Reset_Event lives in Performance_Control2 on the core module.
+        assert "Performance_Control2" in text, (
+            "Performance_Control2 must be written for Cnt0_Reset_Event"
+        )
+        # Performance_Control1 must NOT be written -- that was the original bug
+        # (Cnt0_Reset_Event isn't in _Control1 on the core module).
+        assert "Performance_Control1" not in text, (
+            "Performance_Control1 must not be written; Cnt0_Reset_Event is in "
+            "Performance_Control2 on the core module per aie-rt headers"
+        )
+        # Performance_Counter0_Event_Value must reflect --perfcnt-period.
+        assert "Performance_Counter0_Event_Value" in text
+        assert "2048" in text
+        # The perf trace.reg ops must NOT carry field= on Performance_Control{0,2}
+        # -- the regdb has no named fields for those registers, and field=
+        # would fail in AIETraceRegPackWritesPass.  Look for the substring on
+        # the same line as Performance_Control to be safe.
+        for line in text.splitlines():
+            if "Performance_Control" in line and "aie.trace.reg" in line:
+                assert "field" not in line, (
+                    f"aie.trace.reg on Performance_Control* must not use field=: "
+                    f"{line!r}"
+                )
+
 
 class TestMlirTraceInjectWarnings:
     """Tests for --trace-mode event_pc + non-core sweep warning (Task 4.7)."""

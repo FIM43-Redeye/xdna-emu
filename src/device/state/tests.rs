@@ -271,3 +271,105 @@ fn test_lazy_bd_parsing_single_word_writes() {
     assert!(bd_after.valid,
         "BD should be valid after re-parse");
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for the MemTile DMA Start_BD_ID field width.
+//
+// The compute/shim Start_Queue Start_BD_ID is 4-bit (16 BDs); the MemTile
+// Start_Queue Start_BD_ID is 6-bit (48 BDs).  Using the compute layout to
+// extract a MemTile BD silently truncates bits [5:4], turning BD 24 -> 8
+// and BD 26 -> 10.  The DMA engine's BD-channel-validity check then
+// rejects the start (BD 8 is even, channel 1 is odd -> "invalid"), and
+// the channel deadlocks.  These tests pin the fix at both DMA channel
+// entry points that may run for MemTile.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn start_dma_channel_memtile_preserves_bd_high_bits() {
+    use crate::device::regdb::device_reg_layout;
+    use xdna_archspec::types::DmaDirection;
+
+    let mut state = DeviceState::new_npu1();
+    let col: u8 = 0;
+    let row: u8 = 1; // MemTile row in NPU1.
+
+    // Build a Start_Queue value that pushes BD 26 (>= 16, exercises the
+    // 6-bit field).  Insert via the MemTile layout so the bits land at
+    // [5:0]; using a literal would make the test depend on a specific
+    // bit position.
+    let lay = &device_reg_layout().memtile_channel;
+    let bd_id_raw = lay.start_bd_id.insert(0, 26);
+
+    state.start_dma_channel(col, row, /*channel*/ 0, DmaDirection::S2mm, bd_id_raw);
+
+    let tile = state.array.tile(col, row);
+    assert_eq!(
+        tile.dma_channels[0].current_bd, 26,
+        "MemTile BD>=16 must be preserved by the 6-bit memtile_channel layout; \
+         got {} (4-bit truncation would yield 10)",
+        tile.dma_channels[0].current_bd,
+    );
+}
+
+#[test]
+fn start_dma_channel_compute_uses_4bit_field() {
+    // Compute Start_BD_ID is 4-bit; values >= 16 are intentionally
+    // truncated by hardware (compute tiles only have 16 BDs).  This
+    // pins the negative side of the helper -- compute tiles must keep
+    // the legacy 4-bit semantics.
+    use crate::device::regdb::device_reg_layout;
+    use xdna_archspec::types::DmaDirection;
+
+    let mut state = DeviceState::new_npu1();
+    let col: u8 = 0;
+    let row: u8 = 2; // Compute row.
+
+    // Stuff BD 7 (a normal compute BD) into the compute layout.
+    let lay = &device_reg_layout().memory_channel;
+    let bd_id_raw = lay.start_bd_id.insert(0, 7);
+
+    state.start_dma_channel(col, row, /*channel*/ 0, DmaDirection::S2mm, bd_id_raw);
+
+    let tile = state.array.tile(col, row);
+    assert_eq!(tile.dma_channels[0].current_bd, 7);
+}
+
+#[test]
+fn channel_field_layout_helper_picks_memtile_for_memtile_kind() {
+    // Direct test of the helper that both `start_dma_channel` and
+    // `mask_write_dma_channel` (and `write_dma_channel`) now consult
+    // before extracting Start_BD_ID / Repeat_Count / Enable_Token_Issue.
+    //
+    // Note: dispatch routes MemTile DMA mask-writes to
+    // `mask_write_memtile_dma_channel` (a separate handler), so the
+    // legacy `mask_write_dma_channel` site is reached only on Compute
+    // today.  The helper still routes by tile_kind there as
+    // defense-in-depth: if a future FFI / control-packet path lands a
+    // MaskWrite to a MemTile Start_Queue, the BD field will be extracted
+    // with the right width even though the offset arithmetic in that
+    // function is still compute-tile-shaped (and the bounds check will
+    // refuse the address before the truncation matters).
+    use crate::device::regdb::device_reg_layout;
+    use crate::device::state::compute::channel_field_layout;
+    use xdna_archspec::types::TileKind;
+
+    let reg_layout = device_reg_layout();
+
+    let lay_mem = channel_field_layout(reg_layout, TileKind::Mem);
+    assert_eq!(
+        lay_mem.start_bd_id.width, 6,
+        "MemTile Start_BD_ID is 6-bit per aie-rt xaiemlgbl_params.h"
+    );
+
+    let lay_compute = channel_field_layout(reg_layout, TileKind::Compute);
+    assert_eq!(
+        lay_compute.start_bd_id.width, 4,
+        "Compute Start_BD_ID is 4-bit per aie-rt xaiemlgbl_params.h"
+    );
+
+    let lay_shim = channel_field_layout(reg_layout, TileKind::ShimNoc);
+    assert_eq!(
+        lay_shim.start_bd_id.width, 4,
+        "Shim Start_BD_ID is 4-bit (same as compute)"
+    );
+}

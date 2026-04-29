@@ -2474,12 +2474,24 @@ fn tile_module_name(key: &TileKey) -> &'static str {
 // Sweep directory support
 // ============================================================================
 
-/// Legacy sweep manifest written by sweep_multi / the old sweep orchestrator.
-/// Has a `batches[]` array listing per-batch status information.
+/// Sweep manifest written by `tools/trace-sweep.py`.
+///
+/// Two formats coexist:
+///   - **Legacy** (sweep_multi / older orchestrator): top-level `batches`
+///     field present, an array of `SweepBatchInfo`.  An empty array means
+///     "legacy run produced zero passing batches"; we still go down the
+///     legacy path (which yields an empty result, not fs discovery).
+///   - **Lockstep** (sweep_lockstep / mode-1): top-level `batches` field
+///     absent; per-batch state is recorded only via the `batch_NN/`
+///     subdirectories on disk.  We use `Option<Vec<...>>` rather than
+///     `Vec<...>` + `#[serde(default)]` so that "field missing" and
+///     "field is `[]`" are distinguishable -- a typo in the field name
+///     in a future legacy manifest would otherwise silently kick us into
+///     the fs-discovery branch and miss real batches.
 #[derive(Deserialize)]
 struct SweepManifest {
-    #[serde(default)]
-    batches: Vec<SweepBatchInfo>,
+    /// Present in legacy manifests, absent in lockstep manifests.
+    batches: Option<Vec<SweepBatchInfo>>,
 }
 
 #[derive(Deserialize)]
@@ -2554,30 +2566,37 @@ pub fn compare_sweep_dir_with_opts(
     let manifest: SweepManifest = serde_json::from_str(&manifest_text)
         .map_err(|e| format!("parse manifest: {}", e))?;
 
-    // Build the batch list from the manifest's `batches[]` array when present,
-    // or fall back to filesystem discovery (lockstep manifest format).
+    // Build the batch list.  See `SweepManifest` doc for format policy:
+    //   - `batches: None`     -> lockstep manifest, scan batch_NN/ on disk.
+    //   - `batches: Some([])` -> legacy manifest with zero passing batches;
+    //                            keep the empty result (do NOT fall back to fs).
+    //   - `batches: Some(_)`  -> legacy manifest, filter by status fields.
     let discovered: Vec<(usize, std::path::PathBuf, std::path::PathBuf)>;
-    let batch_triples: &[(usize, std::path::PathBuf, std::path::PathBuf)] = if manifest.batches.is_empty() {
-        discovered = discover_batches_from_fs(sweep_dir);
-        &discovered
-    } else {
-        // Filter legacy batches to only those that completed successfully.
-        // All three status fields must be "ok" (original behaviour); batches
-        // where all status fields are empty are also included because some
-        // manifest versions omit status when every batch succeeded.
-        discovered = manifest.batches.iter()
-            .filter(|info| {
-                (info.status == "ok" && info.hw_status == "ok" && info.emu_status == "ok")
-                    || (info.status.is_empty() && info.hw_status.is_empty() && info.emu_status.is_empty())
-            })
-            .map(|info| {
-                let batch_dir = sweep_dir.join(format!("batch_{:02}", info.batch));
-                let hw = batch_dir.join("hw").join("trace.events.json");
-                let emu = batch_dir.join("emu").join("trace.events.json");
-                (info.batch, hw, emu)
-            })
-            .collect();
-        &discovered
+    let batch_triples: &[(usize, std::path::PathBuf, std::path::PathBuf)] = match &manifest.batches {
+        None => {
+            discovered = discover_batches_from_fs(sweep_dir);
+            &discovered
+        }
+        Some(legacy) => {
+            // Filter legacy batches to only those that completed successfully.
+            // All three status fields must be "ok" (original behaviour); batches
+            // where all status fields are empty are also included because some
+            // manifest versions omit status when every batch succeeded.
+            discovered = legacy
+                .iter()
+                .filter(|info| {
+                    (info.status == "ok" && info.hw_status == "ok" && info.emu_status == "ok")
+                        || (info.status.is_empty() && info.hw_status.is_empty() && info.emu_status.is_empty())
+                })
+                .map(|info| {
+                    let batch_dir = sweep_dir.join(format!("batch_{:02}", info.batch));
+                    let hw = batch_dir.join("hw").join("trace.events.json");
+                    let emu = batch_dir.join("emu").join("trace.events.json");
+                    (info.batch, hw, emu)
+                })
+                .collect();
+            &discovered
+        }
     };
 
     let mut batch_results = Vec::new();
@@ -3756,6 +3775,179 @@ mod tests {
         assert!(read_grounding_from_pc1_manifest(&sweep_dir).is_empty());
 
         // Cleanup.
+        let _ = std::fs::remove_dir_all(&sweep_dir);
+    }
+
+    // ---- Manifest format compatibility tests --------------------------------
+    //
+    // `SweepManifest` accepts both the legacy and lockstep manifest shapes.
+    // These tests pin the dispatch logic in `compare_sweep_dir_with_opts`:
+    // missing `batches` -> filesystem discovery; present `batches: []` ->
+    // legacy path with empty result; present `batches: [..]` -> legacy path
+    // with the listed batches.
+
+    /// Helper: build a synthetic batch_NN/{hw,emu}/trace.events.json pair.
+    fn write_batch_events_json(batch_dir: &std::path::Path) {
+        let hw_dir = batch_dir.join("hw");
+        let emu_dir = batch_dir.join("emu");
+        std::fs::create_dir_all(&hw_dir).expect("create hw dir");
+        std::fs::create_dir_all(&emu_dir).expect("create emu dir");
+        // Minimal events JSON that parse-trace.py would emit; just enough
+        // structure that compare_batch_with_opts doesn't choke on parsing.
+        // We only care that discovery finds these paths -- their content
+        // doesn't drive the dispatch test.
+        let stub = r#"{"tiles": []}"#;
+        std::fs::write(hw_dir.join("trace.events.json"), stub).expect("write hw");
+        std::fs::write(emu_dir.join("trace.events.json"), stub).expect("write emu");
+    }
+
+    /// Parse a legacy-shape manifest with explicit `batches[]` array.
+    /// Verifies the `Some(_)` arm is taken and the array is preserved.
+    #[test]
+    fn sweep_manifest_legacy_format_parses_batches_array() {
+        let json = r#"{
+            "batches": [
+                {"batch": 0, "status": "ok", "hw_status": "ok", "emu_status": "ok"},
+                {"batch": 1, "status": "ok", "hw_status": "ok", "emu_status": "ok"}
+            ]
+        }"#;
+        let m: SweepManifest = serde_json::from_str(json).expect("legacy parse");
+        let batches = m.batches.expect("legacy manifest must have Some(batches)");
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].batch, 0);
+        assert_eq!(batches[1].batch, 1);
+    }
+
+    /// Parse a lockstep-shape manifest where `batches` is absent.
+    /// Verifies the `None` arm is taken (rather than serde defaulting to []).
+    #[test]
+    fn sweep_manifest_lockstep_format_yields_none() {
+        let json = r#"{
+            "test_name": "test",
+            "compiler": "chess",
+            "mode": "event_pc",
+            "n_batches": 5,
+            "n_batches_completed": 5,
+            "unsafe_for_pc_join": false,
+            "mode2_baseline_captured": true,
+            "grounding": {
+                "core": ["PERF_CNT_0"],
+                "memmod": [],
+                "memtile": [],
+                "shim": []
+            }
+        }"#;
+        let m: SweepManifest = serde_json::from_str(json).expect("lockstep parse");
+        assert!(
+            m.batches.is_none(),
+            "lockstep manifest must round-trip as None, not Some([])"
+        );
+    }
+
+    /// Empty `batches: []` is the "legacy run with zero passing batches"
+    /// case. The dispatch must NOT fall back to fs discovery here -- if
+    /// the orchestrator wrote zero passing batches, the result should be
+    /// zero, not whatever batch_NN dirs happen to be on disk.
+    #[test]
+    fn sweep_manifest_legacy_empty_batches_is_some_not_none() {
+        let json = r#"{ "batches": [] }"#;
+        let m: SweepManifest = serde_json::from_str(json).expect("empty parse");
+        let batches = m.batches.expect("Some(empty), not None");
+        assert!(batches.is_empty());
+    }
+
+    /// End-to-end: lockstep manifest + on-disk batch_NN dirs ->
+    /// `compare_sweep_dir_with_opts` should discover the batches via fs.
+    #[test]
+    fn compare_sweep_dir_lockstep_uses_fs_discovery() {
+        let tmpdir = std::path::PathBuf::from(
+            std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()),
+        );
+        let sweep_dir = tmpdir.join("compare_lockstep_fs_discovery_fixture");
+        let _ = std::fs::remove_dir_all(&sweep_dir);
+        std::fs::create_dir_all(&sweep_dir).expect("create sweep dir");
+
+        // Lockstep manifest -- no `batches` field.
+        let manifest = r#"{
+            "test_name": "test",
+            "compiler": "chess",
+            "mode": "event_pc",
+            "n_batches": 2,
+            "n_batches_completed": 2,
+            "unsafe_for_pc_join": false,
+            "mode2_baseline_captured": false,
+            "grounding": {
+                "core": ["PERF_CNT_0"],
+                "memmod": [],
+                "memtile": [],
+                "shim": []
+            }
+        }"#;
+        std::fs::write(sweep_dir.join("sweep-manifest.json"), manifest)
+            .expect("write manifest");
+
+        // Two batch_NN dirs on disk; compare_sweep_dir_with_opts should
+        // discover both via fs since manifest.batches is None.
+        write_batch_events_json(&sweep_dir.join("batch_00"));
+        write_batch_events_json(&sweep_dir.join("batch_01"));
+
+        // Verify discover_batches_from_fs sees both batches.
+        let triples = discover_batches_from_fs(&sweep_dir);
+        assert_eq!(triples.len(), 2, "fs discovery should find 2 batches");
+        assert_eq!(triples[0].0, 0);
+        assert_eq!(triples[1].0, 1);
+
+        // The full compare path may produce an error from compare_batch_with_opts
+        // (the stub events JSON has empty tiles), but it must NOT error on
+        // missing `batches` field -- that's the regression we're pinning.
+        // We accept both Ok and Err here; the assertion is that we got past
+        // the manifest deserializer.
+        let result = compare_sweep_dir_with_opts(&sweep_dir, &AnalysisOptions::default());
+        let err_msg = result.err().unwrap_or_default();
+        assert!(
+            !err_msg.contains("missing field `batches`"),
+            "lockstep manifest must not error on missing `batches`: {}",
+            err_msg
+        );
+
+        let _ = std::fs::remove_dir_all(&sweep_dir);
+    }
+
+    /// End-to-end: legacy manifest with empty `batches: []` should NOT
+    /// fall back to fs discovery -- even if batch_NN/ dirs exist.
+    #[test]
+    fn compare_sweep_dir_legacy_empty_batches_does_not_fall_back_to_fs() {
+        let tmpdir = std::path::PathBuf::from(
+            std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()),
+        );
+        let sweep_dir = tmpdir.join("compare_legacy_empty_no_fs_fallback_fixture");
+        let _ = std::fs::remove_dir_all(&sweep_dir);
+        std::fs::create_dir_all(&sweep_dir).expect("create sweep dir");
+
+        // Legacy manifest with empty batches array.
+        std::fs::write(sweep_dir.join("sweep-manifest.json"), r#"{ "batches": [] }"#)
+            .expect("write manifest");
+
+        // A stray batch_00/ on disk that the legacy run did NOT validate.
+        // If we wrongly fell back to fs discovery this would be picked up.
+        write_batch_events_json(&sweep_dir.join("batch_00"));
+
+        // The legacy path with an empty batches array yields an empty
+        // result.  The function still returns Ok with a (possibly empty)
+        // report; we just need to confirm we didn't pick up the stray
+        // batch_00/ via fs discovery.
+        //
+        // We can't easily count consumed batches from the public API
+        // (the report is text), so instead we check the discovery path
+        // is correctly NOT entered: parse manifest -> Some([]) -> empty
+        // collect -> zero batch_results.  No panic, no fs fallback.
+        let result = compare_sweep_dir_with_opts(&sweep_dir, &AnalysisOptions::default());
+        // compare_sweep_dir_with_opts on zero batches returns Ok with a
+        // base report and no PC-anchored suffix.  The key invariant is
+        // that we don't error AND we don't accidentally consume the
+        // stray batch (which would change the report text).
+        assert!(result.is_ok(), "legacy empty batches should produce Ok report, got {:?}", result);
+
         let _ = std::fs::remove_dir_all(&sweep_dir);
     }
 }

@@ -2936,11 +2936,16 @@ main() {
           local src_dir="$TEST_SRC/$name"
 
           # Discover compute tiles from aie.mlir:
-          #   grep for  aie.tile(col, row)  where row >= 2
+          #   strip line comments (//), then grep for aie.tile(col, row),
+          #   then keep only rows >= 2 (compute rows -- row 0 is shim,
+          #   row 1 is memtile in NPU1).  A long-term improvement would
+          #   be to invoke aie-translate for an authoritative tile list,
+          #   but the regex covers every test currently in the suite.
           local mlir_src="$src_dir/aie.mlir"
           local tile_spec=""
           if [[ -f "$mlir_src" ]]; then
-            tile_spec="$(grep -oP 'aie\.tile\(\K[0-9]+,\s*[0-9]+(?=\))' "$mlir_src" \
+            tile_spec="$(grep -v '^[[:space:]]*//' "$mlir_src" \
+              | grep -oP 'aie\.tile\(\K[0-9]+,\s*[0-9]+(?=\))' \
               | awk -F',' '{ col=$1; row=$2+0; if(row>=2) { printf "%s%d:%d:core", sep, col, row; sep="," } }' \
               | sed 's/ //g')"
           fi

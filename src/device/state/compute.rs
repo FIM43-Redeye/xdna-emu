@@ -2,6 +2,35 @@
 
 use super::*;
 
+/// Pick the DMA channel field layout that matches a tile kind.
+///
+/// Per aie-rt `xaiemlgbl_params.h`:
+///   - `XAIEMLGBL_MEM_TILE_DMA_*_TASK_QUEUE` Start_BD_ID is bits[5:0]
+///     (6-bit, 48 BDs) -- use `reg_layout.memtile_channel`.
+///   - `XAIEMLGBL_MEMORY_DMA_*_TASK_QUEUE` (compute) Start_BD_ID is
+///     bits[3:0] (4-bit, 16 BDs) -- use `reg_layout.memory_channel`.
+///   - Shim `XAIEMLGBL_NOC_MODULE_DMA_*_TASK_QUEUE` Start_BD_ID is also
+///     4-bit; the compute layout is bit-compatible (same field widths)
+///     so we route shim through `memory_channel` here.
+///
+/// Anti-pattern guard: any DMA channel handler that may run for a
+/// MemTile must call this rather than reaching for `memory_channel`
+/// directly. The 4-bit field silently truncates BDs 16+, and the BD-
+/// channel invariant in `start_channel_with_repeat` then rejects the
+/// (valid) MemTile BD as "even-only / odd-only" wiring -- masking the
+/// real bug behind a misleading log line.
+#[inline]
+pub(super) fn channel_field_layout(
+    reg_layout: &'static regdb::DeviceRegLayout,
+    tile_kind: TileKind,
+) -> &'static regdb::ChannelFieldLayout {
+    if tile_kind.is_mem() {
+        &reg_layout.memtile_channel
+    } else {
+        &reg_layout.memory_channel
+    }
+}
+
 impl DeviceState {
     // =========================================================================
     // Lock helper functions (consolidate duplicate compute/memtile code)
@@ -141,7 +170,15 @@ impl DeviceState {
     /// the commit message on Stage 8b Half 2 for the rationale.
     pub(super) fn write_dma_channel(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         let reg_layout = regdb::device_reg_layout();
-        let lay = &reg_layout.memory_channel;
+        // Pick layout by tile kind.  Dispatch routes MemTile DMA writes to
+        // `write_memtile_dma_channel` (a separate handler) and Shim writes
+        // to `write_shim_dma_channel`, so this site is reached only on
+        // Compute today -- but using the helper rather than `memory_channel`
+        // hardcoded means if dispatch ever changes (e.g. a future FFI or
+        // control-packet path lands a MemTile write here) we won't silently
+        // truncate BDs 16+.
+        let tile_kind = self.array.arch().tile_kind(col, row);
+        let lay = channel_field_layout(reg_layout, tile_kind);
 
         // Channel registers: base/stride derived from register database
         // Layout: S2MM_0, S2MM_1, MM2S_0, MM2S_1
@@ -284,17 +321,10 @@ impl DeviceState {
         // AIE2P/AIE1 ports correct without code changes.
         let tile_kind = self.array.arch().tile_kind(col, row);
 
-        // Use the per-tile-kind channel field layout so that Start_BD_ID
-        // is extracted with the correct bit width.  Compute and shim have
-        // a 4-bit BD index (16 BDs), MemTile has a 6-bit BD index (48 BDs).
-        // Using the compute layout for MemTile truncates bits [5:4], turning
-        // BD 24 into 8, BD 26 into 10, etc., causing the engine to reject
-        // the combination as an "invalid BD-channel" constraint violation.
-        let lay = if tile_kind.is_mem() {
-            &reg_layout.memtile_channel
-        } else {
-            &reg_layout.memory_channel
-        };
+        // Pick the field layout matching the tile kind.  See
+        // `channel_field_layout` doc for the anti-pattern this guards
+        // against (silent BD truncation on MemTile BDs >= 16).
+        let lay = channel_field_layout(reg_layout, tile_kind);
         let num_s2mm = self.array.arch().dma_s2mm_channels(tile_kind);
         let ch_idx = match dir {
             DmaDirection::S2mm => channel as usize,
@@ -386,7 +416,13 @@ impl DeviceState {
     /// live for both cases.
     pub(super) fn mask_write_dma_channel(&mut self, col: u8, row: u8, offset: u32, mask: u32, value: u32) {
         let reg_layout = regdb::device_reg_layout();
-        let lay = &reg_layout.memory_channel;
+        // Pick layout by tile kind.  See `write_dma_channel` for the
+        // dispatch-contract rationale -- this site is compute-only today
+        // but the helper makes the right choice if a non-CDO path (NPU
+        // instructions, control packets, FFI) ever lands a MaskWrite to
+        // a MemTile Start_Queue here.
+        let tile_kind = self.array.arch().tile_kind(col, row);
+        let lay = channel_field_layout(reg_layout, tile_kind);
         let rel = offset - reg_layout.memory_channel_base;
         let ch_idx = (rel / reg_layout.memory_channel_stride) as usize;
         let is_start_queue = (rel % reg_layout.memory_channel_stride) >= 4;
