@@ -9,8 +9,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::trace::compare::{
-    AnalysisOptions, BatchResult, EventsConfig, TileEvent, TileKey,
-    compare_batch_with_opts, load_events_json,
+    AnalysisOptions, BatchResult, EventsConfig, TileEvent, TileKey, compare_batch_with_opts, load_events_json,
 };
 
 use super::alignment::AlignmentMap;
@@ -126,11 +125,7 @@ impl LoadedComparison {
         };
 
         // Sort tile keys by divergence count (most divergent first).
-        let mut sorted_keys: Vec<TileKey> = batch
-            .tiles
-            .iter()
-            .map(|(key, _)| *key)
-            .collect();
+        let mut sorted_keys: Vec<TileKey> = batch.tiles.iter().map(|(key, _)| *key).collect();
         sorted_keys.sort_by(|a, b| {
             let da = divergence_count(&batch, a);
             let db = divergence_count(&batch, b);
@@ -148,14 +143,7 @@ impl LoadedComparison {
             AlignmentMap::identity()
         };
 
-        Ok(Self {
-            sorted_keys,
-            config,
-            hw_events,
-            emu_events,
-            batch,
-            alignment,
-        })
+        Ok(Self { sorted_keys, config, hw_events, emu_events, batch, alignment })
     }
 }
 
@@ -169,17 +157,11 @@ impl TraceSource for LoadedComparison {
     }
 
     fn hw_events(&self, tile: &TileKey) -> &[TileEvent] {
-        self.hw_events
-            .get(tile)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        self.hw_events.get(tile).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     fn emu_events(&self, tile: &TileKey) -> &[TileEvent] {
-        self.emu_events
-            .get(tile)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        self.emu_events.get(tile).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     fn batch_result(&self) -> &BatchResult {
@@ -210,17 +192,9 @@ pub fn divergence_count(batch: &BatchResult, key: &TileKey) -> usize {
         None => return 0,
     };
 
-    let edge_divergences = tile_result
-        .edge_results
-        .iter()
-        .filter(|er| er.diverge_idx.is_some())
-        .count();
+    let edge_divergences = tile_result.edge_results.iter().filter(|er| er.diverge_idx.is_some()).count();
 
-    let level_divergences = tile_result
-        .level_results
-        .iter()
-        .filter(|lr| lr.diverge_idx.is_some())
-        .count();
+    let level_divergences = tile_result.level_results.iter().filter(|lr| lr.diverge_idx.is_some()).count();
 
     edge_divergences + level_divergences
 }
@@ -233,20 +207,17 @@ pub fn load_events_config(dir: &Path) -> Result<EventsConfig, String> {
     // Try dir/events.json first.
     let path = dir.join("events.json");
     if path.exists() {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("read {}: {}", path.display(), e))?;
-        return serde_json::from_str(&text)
-            .map_err(|e| format!("parse {}: {}", path.display(), e));
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+        return serde_json::from_str(&text).map_err(|e| format!("parse {}: {}", path.display(), e));
     }
 
     // Try parent/events.json as fallback.
     if let Some(parent) = dir.parent() {
         let path = parent.join("events.json");
         if path.exists() {
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| format!("read {}: {}", path.display(), e))?;
-            return serde_json::from_str(&text)
-                .map_err(|e| format!("parse {}: {}", path.display(), e));
+            let text =
+                std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+            return serde_json::from_str(&text).map_err(|e| format!("parse {}: {}", path.display(), e));
         }
     }
 
@@ -268,11 +239,7 @@ mod tests {
             cross_tile: None,
             pc_anchored: std::collections::HashMap::new(),
         };
-        let key = TileKey {
-            col: 0,
-            row: 2,
-            pkt_type: 0,
-        };
+        let key = TileKey { col: 0, row: 2, pkt_type: 0 };
         assert_eq!(divergence_count(&batch, &key), 0);
     }
 

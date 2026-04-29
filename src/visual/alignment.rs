@@ -31,16 +31,12 @@ pub struct AlignmentMap {
 impl AlignmentMap {
     /// Create an empty alignment map (identity mapping).
     pub fn identity() -> Self {
-        Self {
-            anchors: Vec::new(),
-        }
+        Self { anchors: Vec::new() }
     }
 
     /// Create an alignment map from a single anchor pair.
     pub fn from_single_anchor(hw: u64, emu: u64) -> Self {
-        Self {
-            anchors: vec![Anchor { hw, emu }],
-        }
+        Self { anchors: vec![Anchor { hw, emu }] }
     }
 
     /// Insert an anchor, maintaining sort order by hw_cycle.
@@ -87,10 +83,7 @@ impl AlignmentMap {
                 } else {
                     // Between two anchors: find the segment and interpolate.
                     // Binary search for the right segment.
-                    let idx = self
-                        .anchors
-                        .partition_point(|a| a.hw <= hw_cycle)
-                        .saturating_sub(1);
+                    let idx = self.anchors.partition_point(|a| a.hw <= hw_cycle).saturating_sub(1);
                     let a = &self.anchors[idx];
                     let b = &self.anchors[idx + 1];
 

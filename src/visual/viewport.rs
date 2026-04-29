@@ -29,11 +29,7 @@ pub struct Viewport {
 
 impl Default for Viewport {
     fn default() -> Self {
-        Self {
-            start_cycle: 0.0,
-            px_per_cycle: 0.1,
-            width_px: 1000.0,
-        }
+        Self { start_cycle: 0.0, px_per_cycle: 0.1, width_px: 1000.0 }
     }
 }
 
@@ -126,11 +122,7 @@ mod tests {
 
     #[test]
     fn end_cycle_and_visible_cycles() {
-        let vp = Viewport {
-            start_cycle: 100.0,
-            px_per_cycle: 0.5,
-            width_px: 500.0,
-        };
+        let vp = Viewport { start_cycle: 100.0, px_per_cycle: 0.5, width_px: 500.0 };
         // visible_cycles = 500 / 0.5 = 1000
         assert!((vp.visible_cycles() - 1000.0).abs() < f64::EPSILON);
         // end_cycle = 100 + 1000 = 1100
@@ -139,11 +131,7 @@ mod tests {
 
     #[test]
     fn roundtrip_cycle_to_px_and_back() {
-        let vp = Viewport {
-            start_cycle: 50.0,
-            px_per_cycle: 2.0,
-            width_px: 800.0,
-        };
+        let vp = Viewport { start_cycle: 50.0, px_per_cycle: 2.0, width_px: 800.0 };
         let cycle = 175.0;
         let px = vp.cycle_to_px(cycle);
         let back = vp.px_to_cycle(px);
@@ -152,11 +140,7 @@ mod tests {
 
     #[test]
     fn cycle_to_px_basic() {
-        let vp = Viewport {
-            start_cycle: 100.0,
-            px_per_cycle: 2.0,
-            width_px: 800.0,
-        };
+        let vp = Viewport { start_cycle: 100.0, px_per_cycle: 2.0, width_px: 800.0 };
         // cycle 100 -> px 0 (left edge)
         assert!((vp.cycle_to_px(100.0) - 0.0).abs() < f32::EPSILON);
         // cycle 200 -> px 200 (200-100)*2 = 200
@@ -167,11 +151,7 @@ mod tests {
 
     #[test]
     fn px_to_cycle_basic() {
-        let vp = Viewport {
-            start_cycle: 100.0,
-            px_per_cycle: 2.0,
-            width_px: 800.0,
-        };
+        let vp = Viewport { start_cycle: 100.0, px_per_cycle: 2.0, width_px: 800.0 };
         // px 0 -> cycle 100
         assert!((vp.px_to_cycle(0.0) - 100.0).abs() < f64::EPSILON);
         // px 200 -> cycle 200
@@ -180,11 +160,7 @@ mod tests {
 
     #[test]
     fn is_visible_range() {
-        let vp = Viewport {
-            start_cycle: 100.0,
-            px_per_cycle: 1.0,
-            width_px: 500.0,
-        };
+        let vp = Viewport { start_cycle: 100.0, px_per_cycle: 1.0, width_px: 500.0 };
         // Visible range: [100, 600]
         assert!(vp.is_visible(100.0));
         assert!(vp.is_visible(300.0));
@@ -195,11 +171,7 @@ mod tests {
 
     #[test]
     fn zoom_preserves_anchor() {
-        let mut vp = Viewport {
-            start_cycle: 0.0,
-            px_per_cycle: 1.0,
-            width_px: 1000.0,
-        };
+        let mut vp = Viewport { start_cycle: 0.0, px_per_cycle: 1.0, width_px: 1000.0 };
 
         // Place anchor at pixel 400 -> cycle 400.
         let anchor_px = 400.0_f32;
@@ -235,11 +207,7 @@ mod tests {
 
     #[test]
     fn pan_moves_start_cycle() {
-        let mut vp = Viewport {
-            start_cycle: 100.0,
-            px_per_cycle: 2.0,
-            width_px: 800.0,
-        };
+        let mut vp = Viewport { start_cycle: 100.0, px_per_cycle: 2.0, width_px: 800.0 };
 
         // Pan right by 100 pixels -> start_cycle decreases by 100/2 = 50.
         vp.pan_px(100.0);
@@ -252,11 +220,7 @@ mod tests {
 
     #[test]
     fn fit_range_normal() {
-        let mut vp = Viewport {
-            start_cycle: 0.0,
-            px_per_cycle: 1.0,
-            width_px: 1000.0,
-        };
+        let mut vp = Viewport { start_cycle: 0.0, px_per_cycle: 1.0, width_px: 1000.0 };
 
         vp.fit_range(200.0, 400.0);
 
@@ -281,11 +245,7 @@ mod tests {
 
     #[test]
     fn fit_range_degenerate() {
-        let mut vp = Viewport {
-            start_cycle: 999.0,
-            px_per_cycle: 50.0,
-            width_px: 500.0,
-        };
+        let mut vp = Viewport { start_cycle: 999.0, px_per_cycle: 50.0, width_px: 500.0 };
 
         // Same min and max -> should default to 100-cycle span.
         vp.fit_range(1000.0, 1000.0);

@@ -49,28 +49,21 @@ pub fn show_tile_selector(
     ui.heading("Tiles");
     ui.separator();
 
-    egui::ScrollArea::vertical()
-        .auto_shrink([false; 2])
-        .show(ui, |ui| {
-            let batch = source.batch_result();
-            for key in source.tile_keys() {
-                let div_count = divergence_count(batch, key);
-                let is_selected = selected == Some(key);
+    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+        let batch = source.batch_result();
+        for key in source.tile_keys() {
+            let div_count = divergence_count(batch, key);
+            let is_selected = selected == Some(key);
 
-                let label = format!(
-                    "({},{}) {} [{}]",
-                    key.col,
-                    key.row,
-                    tile_type_label(key.pkt_type),
-                    div_count,
-                );
+            let label =
+                format!("({},{}) {} [{}]", key.col, key.row, tile_type_label(key.pkt_type), div_count,);
 
-                let response = ui.selectable_label(is_selected, &label);
-                if response.clicked() && !is_selected {
-                    clicked = Some(*key);
-                }
+            let response = ui.selectable_label(is_selected, &label);
+            if response.clicked() && !is_selected {
+                clicked = Some(*key);
             }
-        });
+        }
+    });
 
     clicked
 }

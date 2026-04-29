@@ -60,18 +60,14 @@ impl Default for TraceViewerApp {
 impl TraceViewerApp {
     /// Open a file dialog to select HW and EMU trace directories, then load.
     fn open_trace_pair(&mut self) {
-        let hw_dir = rfd::FileDialog::new()
-            .set_title("Select HW trace directory")
-            .pick_folder();
+        let hw_dir = rfd::FileDialog::new().set_title("Select HW trace directory").pick_folder();
 
         let hw_dir = match hw_dir {
             Some(d) => d,
             None => return, // User cancelled.
         };
 
-        let emu_dir = rfd::FileDialog::new()
-            .set_title("Select EMU trace directory")
-            .pick_folder();
+        let emu_dir = rfd::FileDialog::new().set_title("Select EMU trace directory").pick_folder();
 
         let emu_dir = match emu_dir {
             Some(d) => d,
@@ -95,12 +91,8 @@ impl TraceViewerApp {
                 self.source = Some(comparison);
                 self.selected_tile = first_tile;
                 self.selected_event = None;
-                self.status = format!(
-                    "Loaded {} tiles from {} / {}",
-                    tile_count,
-                    hw_dir.display(),
-                    emu_dir.display(),
-                );
+                self.status =
+                    format!("Loaded {} tiles from {} / {}", tile_count, hw_dir.display(), emu_dir.display(),);
                 self.error = None;
             }
             Err(e) => {
@@ -207,20 +199,16 @@ impl eframe::App for TraceViewerApp {
         // ====================================================================
         // Status bar (bottom panel, below everything)
         // ====================================================================
-        egui::TopBottomPanel::bottom("status_bar")
-            .max_height(20.0)
-            .show(ctx, |ui| {
-                ui.label(&self.status);
-            });
+        egui::TopBottomPanel::bottom("status_bar").max_height(20.0).show(ctx, |ui| {
+            ui.label(&self.status);
+        });
 
         // ====================================================================
         // Event detail panel (bottom, above status bar)
         // ====================================================================
-        egui::TopBottomPanel::bottom("detail_panel")
-            .max_height(40.0)
-            .show(ctx, |ui| {
-                event_detail::show_event_detail(ui, self.selected_event.as_ref());
-            });
+        egui::TopBottomPanel::bottom("detail_panel").max_height(40.0).show(ctx, |ui| {
+            event_detail::show_event_detail(ui, self.selected_event.as_ref());
+        });
 
         // ====================================================================
         // Error popup (if any)
@@ -245,19 +233,15 @@ impl eframe::App for TraceViewerApp {
         // Tile sidebar (left panel, only when data is loaded)
         // ====================================================================
         if let Some(ref source) = self.source {
-            egui::SidePanel::left("tile_sidebar")
-                .default_width(160.0)
-                .show(ctx, |ui| {
-                    if let Some(new_tile) = tile_selector::show_tile_selector(
-                        ui,
-                        source,
-                        self.selected_tile.as_ref(),
-                    ) {
-                        self.selected_tile = Some(new_tile);
-                        self.selected_event = None;
-                        self.timeline_state.reset();
-                    }
-                });
+            egui::SidePanel::left("tile_sidebar").default_width(160.0).show(ctx, |ui| {
+                if let Some(new_tile) =
+                    tile_selector::show_tile_selector(ui, source, self.selected_tile.as_ref())
+                {
+                    self.selected_tile = Some(new_tile);
+                    self.selected_event = None;
+                    self.timeline_state.reset();
+                }
+            });
         }
 
         // ====================================================================
@@ -265,12 +249,9 @@ impl eframe::App for TraceViewerApp {
         // ====================================================================
         egui::CentralPanel::default().show(ctx, |ui| {
             if let (Some(ref source), Some(ref tile)) = (&self.source, &self.selected_tile) {
-                if let Some(event) = timeline::show_timeline(
-                    ui,
-                    source as &dyn TraceSource,
-                    tile,
-                    &mut self.timeline_state,
-                ) {
+                if let Some(event) =
+                    timeline::show_timeline(ui, source as &dyn TraceSource, tile, &mut self.timeline_state)
+                {
                     self.selected_event = Some(event);
                 }
             } else if self.source.is_some() {

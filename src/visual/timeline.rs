@@ -55,10 +55,7 @@ struct Lane {
 /// Returns (hw_lanes, emu_lanes, total_height). Each source block gets one
 /// lane per unique event name found in the comparison results. HW lanes
 /// come first (top), then a gap, then EMU lanes.
-fn compute_lanes(
-    source: &dyn TraceSource,
-    tile: &TileKey,
-) -> (Vec<Lane>, Vec<Lane>, f32) {
+fn compute_lanes(source: &dyn TraceSource, tile: &TileKey) -> (Vec<Lane>, Vec<Lane>, f32) {
     let config = source.batch_config();
 
     // Determine which event list to use based on pkt_type.
@@ -160,17 +157,10 @@ fn compute_extent(
 /// Draw a minimap bar showing the full trace extent with the current
 /// viewport highlighted. Clicking on the minimap pans the viewport to
 /// center on the clicked position.
-fn draw_minimap(
-    ui: &mut egui::Ui,
-    total_min: f64,
-    total_max: f64,
-    viewport: &mut Viewport,
-) {
+fn draw_minimap(ui: &mut egui::Ui, total_min: f64, total_max: f64, viewport: &mut Viewport) {
     let available_width = ui.available_width();
-    let (response, painter) = ui.allocate_painter(
-        egui::Vec2::new(available_width, theme::MINIMAP_HEIGHT),
-        egui::Sense::click(),
-    );
+    let (response, painter) =
+        ui.allocate_painter(egui::Vec2::new(available_width, theme::MINIMAP_HEIGHT), egui::Sense::click());
     let rect = response.rect;
 
     // Fill background.
@@ -182,10 +172,8 @@ fn draw_minimap(
     }
 
     // Calculate viewport position as fraction of total range.
-    let vp_start_frac = ((viewport.start_cycle - total_min) / total_span)
-        .clamp(0.0, 1.0) as f32;
-    let vp_end_frac = ((viewport.end_cycle() - total_min) / total_span)
-        .clamp(0.0, 1.0) as f32;
+    let vp_start_frac = ((viewport.start_cycle - total_min) / total_span).clamp(0.0, 1.0) as f32;
+    let vp_end_frac = ((viewport.end_cycle() - total_min) / total_span).clamp(0.0, 1.0) as f32;
 
     // Ensure the viewport indicator is at least 2 pixels wide so it is
     // always visible even when zoomed far out.
@@ -209,8 +197,7 @@ fn draw_minimap(
     // Click to pan: center the viewport on the clicked position.
     if response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            let click_frac = ((pos.x - rect.left()) / rect.width())
-                .clamp(0.0, 1.0) as f64;
+            let click_frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
             let target_cycle = total_min + click_frac * total_span;
             // Center the viewport on the target cycle.
             let half_visible = viewport.visible_cycles() / 2.0;
@@ -274,9 +261,7 @@ pub fn show_timeline(
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll.abs() > 0.1 {
             let factor = if scroll > 0.0 { 1.1 } else { 1.0 / 1.1 };
-            let mouse_x = ui.input(|i| {
-                i.pointer.hover_pos().map(|p| p.x).unwrap_or(rect.center().x)
-            });
+            let mouse_x = ui.input(|i| i.pointer.hover_pos().map(|p| p.x).unwrap_or(rect.center().x));
             state.viewport.zoom_at(factor, mouse_x - rect.left());
         }
     }
@@ -438,9 +423,7 @@ fn draw_ticks(
         let end_cycle = viewport.end_cycle();
 
         // Find the EdgeResult for this slot's event name (for divergence info).
-        let edge_result = tile_result.and_then(|tr| {
-            tr.edge_results.iter().find(|er| er.name == lane.name)
-        });
+        let edge_result = tile_result.and_then(|tr| tr.edge_results.iter().find(|er| er.name == lane.name));
 
         // Per-slot event counter for mapping to EdgeResult.deltas indices.
         // EdgeResult.deltas[i] corresponds to the i-th occurrence of this
@@ -491,19 +474,13 @@ fn draw_ticks(
 
             // Draw the tick as a short vertical line.
             painter.line_segment(
-                [
-                    egui::pos2(screen_x, lane_top + 2.0),
-                    egui::pos2(screen_x, lane_bottom - 2.0),
-                ],
+                [egui::pos2(screen_x, lane_top + 2.0), egui::pos2(screen_x, lane_bottom - 2.0)],
                 egui::Stroke::new(1.0, tick_color),
             );
 
             // Hover detection.
             if let Some(pos) = hover_pos {
-                if (pos.x - screen_x).abs() < hover_tolerance
-                    && pos.y >= lane_top
-                    && pos.y <= lane_bottom
-                {
+                if (pos.x - screen_x).abs() < hover_tolerance && pos.y >= lane_top && pos.y <= lane_bottom {
                     let delta = if let Some(er) = edge_result {
                         er.deltas.get(slot_event_idx).copied()
                     } else {
