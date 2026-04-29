@@ -91,11 +91,7 @@ pub struct ComboEvent {
 impl ComboEvent {
     /// Create a new combo event with default (disabled) state.
     pub fn new() -> Self {
-        Self {
-            input_a: 0,
-            input_b: 0,
-            logic: ComboLogic::And,
-        }
+        Self { input_a: 0, input_b: 0, logic: ComboLogic::And }
     }
 
     /// Configure this combo event with input events and logic.
@@ -146,12 +142,7 @@ impl ComboEventConfig {
     /// Create a new combo event configuration in reset state.
     pub fn new() -> Self {
         Self {
-            combos: [
-                ComboEvent::new(),
-                ComboEvent::new(),
-                ComboEvent::new(),
-                ComboEvent::new(),
-            ],
+            combos: [ComboEvent::new(), ComboEvent::new(), ComboEvent::new(), ComboEvent::new()],
         }
     }
 
@@ -159,13 +150,7 @@ impl ComboEventConfig {
     ///
     /// For combo_id 2 (meta-combo), input_a and input_b are ignored --
     /// the hardware always uses combo 0 and combo 1 outputs.
-    pub fn configure(
-        &mut self,
-        combo_id: usize,
-        input_a: EventId,
-        input_b: EventId,
-        logic: ComboLogic,
-    ) {
+    pub fn configure(&mut self, combo_id: usize, input_a: EventId, input_b: EventId, logic: ComboLogic) {
         if combo_id >= 4 {
             return;
         }
@@ -184,11 +169,7 @@ impl ComboEventConfig {
     /// ID of COMBO_EVENT_0 in this module's event space.
     ///
     /// Returns a list of hardware event IDs for fired combo events.
-    pub fn evaluate(
-        &self,
-        is_active: &dyn Fn(EventId) -> bool,
-        combo_event_base: EventId,
-    ) -> Vec<EventId> {
+    pub fn evaluate(&self, is_active: &dyn Fn(EventId) -> bool, combo_event_base: EventId) -> Vec<EventId> {
         let mut fired = Vec::new();
 
         // Evaluate combo 0.
@@ -310,10 +291,10 @@ mod tests {
     #[test]
     fn test_combo_logic_or_not() {
         // OrNot(e1, e2) = e1 || !e2
-        assert!(ComboLogic::OrNot.evaluate(true, true));   // true || !true = true
-        assert!(ComboLogic::OrNot.evaluate(true, false));   // true || !false = true
-        assert!(!ComboLogic::OrNot.evaluate(false, true));  // false || !true = false
-        // false || !false == false || true == true
+        assert!(ComboLogic::OrNot.evaluate(true, true)); // true || !true = true
+        assert!(ComboLogic::OrNot.evaluate(true, false)); // true || !false = true
+        assert!(!ComboLogic::OrNot.evaluate(false, true)); // false || !true = false
+                                                           // false || !false == false || true == true
         assert!(ComboLogic::OrNot.evaluate(false, false));
     }
 
@@ -410,7 +391,7 @@ mod tests {
         cfg.configure(0, 5, 10, ComboLogic::And);
 
         let base = 9; // COMBO_EVENT_0 base ID
-        // Both active -> combo 0 fires.
+                      // Both active -> combo 0 fires.
         let fired = cfg.evaluate(&|id| id == 5 || id == 10, base);
         assert!(fired.contains(&9));
 
@@ -449,7 +430,7 @@ mod tests {
 
         // Only combo 0 inputs active -> combo 0 fires, combo 2 fires.
         let fired = cfg.evaluate(&|id| id == 5 || id == 10, base);
-        assert!(fired.contains(&9));  // combo 0
+        assert!(fired.contains(&9)); // combo 0
         assert!(!fired.contains(&10)); // combo 1
         assert!(fired.contains(&11)); // combo 2 (meta OR)
 
@@ -476,12 +457,12 @@ mod tests {
 
         // Only combo 0 fires -> combo 2 does not.
         let fired = cfg.evaluate(&|id| id == 5 || id == 10, base);
-        assert!(fired.contains(&9));  // combo 0
+        assert!(fired.contains(&9)); // combo 0
         assert!(!fired.contains(&11)); // combo 2
 
         // Both combo 0 and combo 1 fire -> combo 2 fires.
         let fired = cfg.evaluate(&|id| id == 5 || id == 10 || id == 20 || id == 30, base);
-        assert!(fired.contains(&9));  // combo 0
+        assert!(fired.contains(&9)); // combo 0
         assert!(fired.contains(&10)); // combo 1
         assert!(fired.contains(&11)); // combo 2
     }
@@ -517,10 +498,10 @@ mod tests {
         cfg.configure(1, 0x56, 0x78, ComboLogic::And);
 
         let reg = cfg.read_input_register();
-        assert_eq!(reg & 0xFF, 0x12);           // EventA
-        assert_eq!((reg >> 8) & 0xFF, 0x34);    // EventB
-        assert_eq!((reg >> 16) & 0xFF, 0x56);   // EventC
-        assert_eq!((reg >> 24) & 0xFF, 0x78);   // EventD
+        assert_eq!(reg & 0xFF, 0x12); // EventA
+        assert_eq!((reg >> 8) & 0xFF, 0x34); // EventB
+        assert_eq!((reg >> 16) & 0xFF, 0x56); // EventC
+        assert_eq!((reg >> 24) & 0xFF, 0x78); // EventD
 
         // Write a different value.
         cfg.write_input_register(0xAB_CD_EF_01);
@@ -533,14 +514,14 @@ mod tests {
     #[test]
     fn test_control_register_rw() {
         let mut cfg = ComboEventConfig::new();
-        cfg.combos[0].logic = ComboLogic::Or;      // 2
-        cfg.combos[1].logic = ComboLogic::AndNot;   // 1
-        cfg.combos[2].logic = ComboLogic::OrNot;    // 3
+        cfg.combos[0].logic = ComboLogic::Or; // 2
+        cfg.combos[1].logic = ComboLogic::AndNot; // 1
+        cfg.combos[2].logic = ComboLogic::OrNot; // 3
 
         let reg = cfg.read_control_register();
-        assert_eq!(reg & 0x3, 2);            // combo 0
-        assert_eq!((reg >> 8) & 0x3, 1);     // combo 1
-        assert_eq!((reg >> 16) & 0x3, 3);    // combo 2
+        assert_eq!(reg & 0x3, 2); // combo 0
+        assert_eq!((reg >> 8) & 0x3, 1); // combo 1
+        assert_eq!((reg >> 16) & 0x3, 3); // combo 2
 
         cfg.write_control_register(0x0003_0000); // combo2=OrNot(3), combo1=And(0), combo0=And(0)
         assert_eq!(cfg.combos[0].logic, ComboLogic::And);

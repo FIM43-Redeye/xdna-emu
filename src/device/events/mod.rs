@@ -153,9 +153,9 @@ impl EventModuleType {
     pub fn port_idle_event_base(self) -> Option<EventId> {
         match self {
             EventModuleType::Core => Some(74),    // XAIEML_EVENTS_CORE_PORT_IDLE_0
-            EventModuleType::Memory => None,       // No port events
-            EventModuleType::Pl => Some(77),       // XAIEML_EVENTS_PL_PORT_IDLE_0
-            EventModuleType::MemTile => Some(79),  // XAIEML_EVENTS_MEM_TILE_PORT_IDLE_0
+            EventModuleType::Memory => None,      // No port events
+            EventModuleType::Pl => Some(77),      // XAIEML_EVENTS_PL_PORT_IDLE_0
+            EventModuleType::MemTile => Some(79), // XAIEML_EVENTS_MEM_TILE_PORT_IDLE_0
         }
     }
 }
@@ -348,10 +348,7 @@ impl EventModule {
     /// combo events to react to the current event state.
     pub fn evaluate_combos(&mut self) {
         let base = self.module_type.combo_event_base();
-        let fired = self.combo_events.evaluate(
-            &|id| self.is_event_active(id),
-            base,
-        );
+        let fired = self.combo_events.evaluate(&|id| self.is_event_active(id), base);
         for event_id in fired {
             self.generate_event(event_id);
         }
@@ -482,23 +479,53 @@ impl EventModule {
 
             // Broadcast block SET registers.
             // South=0x4050, West=0x4060, North=0x4070, East=0x4080
-            0x4050 => { self.broadcast.write_block_set(BroadcastDir::South, value as u16); true }
-            0x4060 => { self.broadcast.write_block_set(BroadcastDir::West, value as u16); true }
-            0x4070 => { self.broadcast.write_block_set(BroadcastDir::North, value as u16); true }
-            0x4080 => { self.broadcast.write_block_set(BroadcastDir::East, value as u16); true }
+            0x4050 => {
+                self.broadcast.write_block_set(BroadcastDir::South, value as u16);
+                true
+            }
+            0x4060 => {
+                self.broadcast.write_block_set(BroadcastDir::West, value as u16);
+                true
+            }
+            0x4070 => {
+                self.broadcast.write_block_set(BroadcastDir::North, value as u16);
+                true
+            }
+            0x4080 => {
+                self.broadcast.write_block_set(BroadcastDir::East, value as u16);
+                true
+            }
 
             // Broadcast block CLR registers.
             // South=0x4054, West=0x4064, North=0x4074, East=0x4084
-            0x4054 => { self.broadcast.write_block_clr(BroadcastDir::South, value as u16); true }
-            0x4064 => { self.broadcast.write_block_clr(BroadcastDir::West, value as u16); true }
-            0x4074 => { self.broadcast.write_block_clr(BroadcastDir::North, value as u16); true }
-            0x4084 => { self.broadcast.write_block_clr(BroadcastDir::East, value as u16); true }
+            0x4054 => {
+                self.broadcast.write_block_clr(BroadcastDir::South, value as u16);
+                true
+            }
+            0x4064 => {
+                self.broadcast.write_block_clr(BroadcastDir::West, value as u16);
+                true
+            }
+            0x4074 => {
+                self.broadcast.write_block_clr(BroadcastDir::North, value as u16);
+                true
+            }
+            0x4084 => {
+                self.broadcast.write_block_clr(BroadcastDir::East, value as u16);
+                true
+            }
 
             // Combo_Event_Inputs
-            0x4400 => { self.combo_events.write_input_register(value); true }
+            0x4400 => {
+                self.combo_events.write_input_register(value);
+                true
+            }
 
             // Combo_Event_Control
-            0x4404 => { self.combo_events.write_control_register(value); true }
+            0x4404 => {
+                self.combo_events.write_control_register(value);
+                true
+            }
 
             // Event_Group_*_Enable: 0x4500 + group * 4
             off @ 0x4500..=0x4520 if (off - 0x4500) % 4 == 0 => {
@@ -510,8 +537,14 @@ impl EventModule {
             }
 
             // Stream_Switch_Event_Port_Selection_0/1
-            0x4FF0 => { self.port_events.write_register(0, value); true }
-            0x4FF4 => { self.port_events.write_register(1, value); true }
+            0x4FF0 => {
+                self.port_events.write_register(0, value);
+                true
+            }
+            0x4FF4 => {
+                self.port_events.write_register(1, value);
+                true
+            }
 
             _ => false,
         }
@@ -833,7 +866,7 @@ mod tests {
         // Set south block for channels 0 and 2.
         assert!(em.write_register(0x4050, 0x0005));
         assert_eq!(em.read_register(0x4058), Some(0x0005)); // VALUE register
-        // Clear channel 0 block.
+                                                            // Clear channel 0 block.
         assert!(em.write_register(0x4054, 0x0001));
         assert_eq!(em.read_register(0x4058), Some(0x0004));
     }

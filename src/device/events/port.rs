@@ -51,12 +51,8 @@ pub enum PortEventType {
 
 impl PortEventType {
     /// All port event types for iteration.
-    pub const ALL: [PortEventType; 4] = [
-        PortEventType::Idle,
-        PortEventType::Running,
-        PortEventType::Stalled,
-        PortEventType::Tlast,
-    ];
+    pub const ALL: [PortEventType; 4] =
+        [PortEventType::Idle, PortEventType::Running, PortEventType::Stalled, PortEventType::Tlast];
 }
 
 /// Configuration for a single port event selection slot.
@@ -75,10 +71,7 @@ pub struct PortEventSlot {
 impl PortEventSlot {
     /// Create a new slot in reset state (slave port 0).
     pub fn new() -> Self {
-        Self {
-            port_id: 0,
-            is_master: false,
-        }
+        Self { port_id: 0, is_master: false }
     }
 
     /// Configure this slot.
@@ -95,10 +88,7 @@ impl PortEventSlot {
 
     /// Unpack from the 8-bit register field.
     pub fn from_register_field(val: u8) -> Self {
-        Self {
-            port_id: val & 0x1F,
-            is_master: (val & (1 << 5)) != 0,
-        }
+        Self { port_id: val & 0x1F, is_master: (val & (1 << 5)) != 0 }
     }
 
     /// Reset to default state.
@@ -134,10 +124,7 @@ impl PortEventConfig {
     /// `available` should be false for memory modules of AIE tiles,
     /// which do not have stream switch event port selection.
     pub fn new(available: bool) -> Self {
-        Self {
-            slots: std::array::from_fn(|_| PortEventSlot::new()),
-            available,
-        }
+        Self { slots: std::array::from_fn(|_| PortEventSlot::new()), available }
     }
 
     /// Configure a port event slot.
@@ -196,8 +183,11 @@ impl PortEventConfig {
         if !self.available || slot >= NUM_PORT_EVENT_SLOTS {
             return None;
         }
-        Some(port_idle_base.wrapping_add((slot * PORT_EVENTS_PER_SLOT) as u8)
-            .wrapping_add(event_type as u8))
+        Some(
+            port_idle_base
+                .wrapping_add((slot * PORT_EVENTS_PER_SLOT) as u8)
+                .wrapping_add(event_type as u8),
+        )
     }
 
     /// Reset all slots to default state.
@@ -332,10 +322,10 @@ mod tests {
     #[test]
     fn test_config_read_register_0() {
         let mut cfg = PortEventConfig::new(true);
-        cfg.configure_slot(0, 3, false);  // 0x03
-        cfg.configure_slot(1, 7, true);   // 0x27
-        cfg.configure_slot(2, 0, false);  // 0x00
-        cfg.configure_slot(3, 15, true);  // 0x2F
+        cfg.configure_slot(0, 3, false); // 0x03
+        cfg.configure_slot(1, 7, true); // 0x27
+        cfg.configure_slot(2, 0, false); // 0x00
+        cfg.configure_slot(3, 15, true); // 0x2F
 
         let reg = cfg.read_register(0);
         assert_eq!(reg & 0xFF, 0x03);
@@ -347,8 +337,8 @@ mod tests {
     #[test]
     fn test_config_read_register_1() {
         let mut cfg = PortEventConfig::new(true);
-        cfg.configure_slot(4, 1, false);  // 0x01
-        cfg.configure_slot(5, 2, true);   // 0x22
+        cfg.configure_slot(4, 1, false); // 0x01
+        cfg.configure_slot(5, 2, true); // 0x22
 
         let reg = cfg.read_register(1);
         assert_eq!(reg & 0xFF, 0x01);

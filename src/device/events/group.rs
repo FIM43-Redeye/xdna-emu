@@ -35,10 +35,7 @@ impl GroupEvent {
     /// Create a new group event with the given reset mask.
     /// Starts with all sub-events enabled (reset value).
     pub fn new(reset_mask: u32) -> Self {
-        Self {
-            enable_mask: reset_mask,
-            reset_mask,
-        }
+        Self { enable_mask: reset_mask, reset_mask }
     }
 
     /// Configure which sub-events contribute to this group event.

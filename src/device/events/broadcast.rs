@@ -52,12 +52,8 @@ impl BroadcastDir {
     pub const COUNT: usize = 4;
 
     /// All directions for iteration.
-    pub const ALL: [BroadcastDir; 4] = [
-        BroadcastDir::South,
-        BroadcastDir::West,
-        BroadcastDir::North,
-        BroadcastDir::East,
-    ];
+    pub const ALL: [BroadcastDir; 4] =
+        [BroadcastDir::South, BroadcastDir::West, BroadcastDir::North, BroadcastDir::East];
 
     /// Convert from direction index (0-3).
     pub fn from_index(idx: usize) -> Option<Self> {
