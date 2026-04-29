@@ -1422,7 +1422,6 @@ mod tests {
     #[test]
     fn test_ffi_vs_legacy_operand_crosscheck() {
         use crate::interpreter::bundle::SlotType;
-        use xdna_archspec::aie2::isa::AddressingMode;
 
         // Find ELF files from fuzz dir (recursive) or ISA test harness.
         let mut elf_paths = Vec::new();

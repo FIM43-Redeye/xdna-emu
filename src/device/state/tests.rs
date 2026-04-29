@@ -301,8 +301,8 @@ fn dma_start_queue_memtile_preserves_bd_high_bits() {
     let bd_id_raw = lay.start_bd_id.insert(0, 26);
 
     // Drive the universal register bus on the MemTile S2MM ch0 Start_Queue
-    // offset; this routes through `write_memtile_dma_channel`, the live
-    // path that both CDO and non-CDO writes traverse post-D.3.
+    // offset; this routes through `write_memtile_dma_channel`, the single
+    // path both CDO and non-CDO writes traverse.
     let addr = TileAddress::encode(col, row, MEMTILE_DMA_S2MM_0_START_QUEUE);
     state.write_register(addr, bd_id_raw).unwrap();
 
@@ -333,8 +333,8 @@ fn dma_start_queue_compute_uses_4bit_field() {
     let bd_id_raw = lay.start_bd_id.insert(0, 7);
 
     // Drive the universal register bus on the Compute S2MM ch0 Start_Queue
-    // offset; this routes through `write_dma_channel`, the live path that
-    // both CDO and non-CDO writes traverse post-D.3.
+    // offset; this routes through `write_dma_channel`, the single path both
+    // CDO and non-CDO writes traverse.
     let addr = TileAddress::encode(col, row, COMPUTE_DMA_S2MM_0_START_QUEUE);
     state.write_register(addr, bd_id_raw).unwrap();
 
@@ -382,14 +382,15 @@ fn channel_field_layout_helper_picks_memtile_for_memtile_kind() {
     );
 }
 
-/// Regression test for D.3 Bug 1: CORE_CONTROL readback divergence.
+/// Regression test: a CDO write to CORE_CONTROL must be visible via
+/// the register-bus read path (`tile.read_register_pure(offset)`).
 ///
-/// A CDO write to CORE_CONTROL must be visible via the register-bus
-/// read path (`tile.read_register_pure(offset)`). Pre-D.3 the CDO
-/// promotion path bypassed `tile.registers` (only the typed
-/// `tile.core.control` mirror was updated). Post-D.3 the promotion
-/// path runs through `apply_device_op::CoreEnable -> write_register`,
-/// which stores raw, fixing this.
+/// The bug being pinned: a typed `apply_core_enable` handler used to
+/// update only `tile.core.control` and skip `tile.registers`, so a
+/// subsequent `read_register_pure(CORE_CONTROL)` returned 0 instead
+/// of the written value. The fix routes `apply_device_op::CoreEnable`
+/// through `write_register`, which stores the raw word in
+/// `tile.registers` alongside running the offset-dispatch branch.
 #[test]
 fn core_control_cdo_write_is_readable_via_register_bus() {
     use crate::parser::cdo::semantics::lower;
@@ -414,15 +415,16 @@ fn core_control_cdo_write_is_readable_via_register_bus() {
     );
 }
 
-/// Regression test for D.3 Bug 2: MaskWrite-to-CORE_CONTROL bit
-/// corruption.
+/// Regression test: a CDO MaskWrite to CORE_CONTROL with a partial
+/// mask must only modify the bits covered by the mask, leaving other
+/// bits unchanged.
 ///
-/// A CDO MaskWrite to CORE_CONTROL with a partial mask must only
-/// modify the bits covered by the mask, leaving other bits unchanged.
-/// Pre-D.3 the CDO promotion path dropped the mask in
-/// `lower_mask_write` and overwrote the full word, corrupting bits
-/// 31..1. Post-D.3 MaskWrite is no longer promoted and rides through
-/// `mask_write_register`, which mask-blends correctly.
+/// The bug being pinned: `lower_mask_write` used to promote
+/// `MaskWrite` to a typed `CoreEnable` op that dropped the mask, then
+/// the apply path overwrote the full word — corrupting bits 31..1.
+/// The fix removes the promotion entirely; MaskWrite rides through
+/// `mask_write_register` -> `mask_write_core_register`, which
+/// mask-blends correctly.
 #[test]
 fn core_control_cdo_mask_write_preserves_unmasked_bits() {
     use crate::parser::cdo::semantics::lower;

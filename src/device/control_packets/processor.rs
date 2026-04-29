@@ -278,8 +278,6 @@ mod tests {
         registers: HashMap<u32, u32>,
         /// Track all writes for verification.
         write_log: Vec<(u32, u32)>,
-        /// Track all reads for verification.
-        read_log: Vec<u32>,
         /// If set, reads from unlisted addresses return this instead of error.
         default_value: Option<u32>,
     }
@@ -289,7 +287,6 @@ mod tests {
             Self {
                 registers: HashMap::new(),
                 write_log: Vec::new(),
-                read_log: Vec::new(),
                 default_value: Some(0),
             }
         }
@@ -307,7 +304,6 @@ mod tests {
             Self {
                 registers: HashMap::new(),
                 write_log: Vec::new(),
-                read_log: Vec::new(),
                 default_value: None,
             }
         }
@@ -316,8 +312,6 @@ mod tests {
     impl RegisterAccess for SimpleRegisterAccess {
         fn read_register(&self, offset: u32) -> Result<u32, String> {
             if let Some(&val) = self.registers.get(&offset) {
-                // Note: can't push to read_log since &self is immutable.
-                // Tests that need read tracking use a wrapper.
                 Ok(val)
             } else if let Some(default) = self.default_value {
                 Ok(default)

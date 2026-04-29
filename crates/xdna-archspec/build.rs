@@ -165,7 +165,9 @@ fn main() {
 
         let extracted = build_helpers::extract::extract_all(&llvm_aie_path)
             .unwrap_or_else(|e| panic!("TableGen extraction failed: {}", e));
-        println!("cargo:warning=TableGen: extracted {} instructions across {} slots",
+        // Status emitted to stderr (visible only with `cargo build -vv`);
+        // using `cargo:warning=` instead would clutter normal builds.
+        eprintln!("TableGen: extracted {} instructions across {} slots",
             extracted.total_instructions(), extracted.slot_count());
         build_helpers::codegen::generate_tablegen_file(&extracted, &out_dir);
     } else {
@@ -2128,6 +2130,12 @@ fn compile_llvm_decoder_ffi(llvm_aie_path: &Path) {
     println!("cargo:rerun-if-changed=decoder_ffi/aie2_decoder.h");
 
     // Compile aie2_decoder.cpp with the cc crate.
+    //
+    // -Wno-unused-parameter silences a noisy class of warnings from
+    // upstream LLVM virtual-method declarations (Dwarf, MCContext,
+    // MCDisassembler, MCSubtargetInfo, etc.) where the base class
+    // names parameters its empty default body doesn't use. Those
+    // headers are external and not ours to fix.
     cc::Build::new()
         .cpp(true)
         .std("c++17")
@@ -2142,6 +2150,7 @@ fn compile_llvm_decoder_ffi(llvm_aie_path: &Path) {
         .define("_GNU_SOURCE", None)
         .flag("-fno-exceptions")
         .flag("-funwind-tables")
+        .flag_if_supported("-Wno-unused-parameter")
         .compile("aie2_decoder");
 
     // Link LLVM libraries. Use llvm-config to get the authoritative list.

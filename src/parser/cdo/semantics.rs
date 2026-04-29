@@ -607,9 +607,10 @@ mod tests {
 
     #[test]
     fn core_control_mask_write_touching_bit0_stays_reg_mask() {
-        // Post-D.3: MaskWrites are never promoted to CoreEnable, even
-        // when the mask touches bit 0. Mask-blend correctness lives
-        // on the apply side (mask_write_register -> mask_write_core_register).
+        // MaskWrites are never promoted to CoreEnable, even when the
+        // mask touches bit 0. Mask-blend correctness lives on the
+        // apply side (mask_write_register -> mask_write_core_register),
+        // so promotion would either duplicate the blend or drop the mask.
         let (col, row) = compute_tile_addr();
         let addr = aie_addr(col, row, CORE_CONTROL);
         let op = lower_mask_write(addr, 0x1, 0x0);
@@ -622,7 +623,7 @@ mod tests {
                 assert_eq!(value, 0x0);
             }
             other => panic!(
-                "MaskWrite to CORE_CONTROL must lower to RegMask post-D.3, got {:?}",
+                "MaskWrite to CORE_CONTROL must lower to RegMask, got {:?}",
                 other
             ),
         }
