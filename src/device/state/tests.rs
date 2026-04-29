@@ -373,3 +373,184 @@ fn channel_field_layout_helper_picks_memtile_for_memtile_kind() {
         "Shim Start_BD_ID is 4-bit (same as compute)"
     );
 }
+
+/// Regression test for D.3 Bug 1: CORE_CONTROL readback divergence.
+///
+/// A CDO write to CORE_CONTROL must be visible via the register-bus
+/// read path (`tile.read_register_pure(offset)`). The CDO promotion
+/// path currently routes through `apply_core_enable` which only
+/// updates the typed `tile.core.control` mirror and skips
+/// `tile.registers`. After D.3 commit 2 the promotion path goes
+/// through `write_register` which stores raw, fixing this.
+#[test]
+fn core_control_cdo_write_is_readable_via_register_bus() {
+    use crate::parser::cdo::semantics::lower;
+    use crate::parser::cdo::CdoRaw;
+
+    let mut state = DeviceState::new_npu1();
+    let col: u8 = 1;
+    let row: u8 = 2; // compute row
+    let cc_offset = xdna_archspec::aie2::registers::CORE_CONTROL;
+    let address = TileAddress::encode(col, row, cc_offset);
+
+    let cmd = CdoRaw::Write { address, value: 0x1 };
+    for op in lower(&cmd) {
+        state.apply_device_op(&op).unwrap();
+    }
+
+    let tile = state.array.tile(col, row);
+    assert_eq!(
+        tile.read_register_pure(cc_offset),
+        0x1,
+        "CDO write to CORE_CONTROL must be visible via register-bus reads"
+    );
+}
+
+/// Regression test for D.3 Bug 2: MaskWrite-to-CORE_CONTROL bit
+/// corruption.
+///
+/// A CDO MaskWrite to CORE_CONTROL with a partial mask must only
+/// modify the bits covered by the mask, leaving other bits unchanged.
+/// The current CDO promotion path drops the mask in
+/// `lower_mask_write` and `apply_core_enable` overwrites the full
+/// word, corrupting bits 31..1. After D.3 commit 2 MaskWrite stops
+/// promoting and rides through `mask_write_register` which mask-
+/// blends correctly.
+#[test]
+fn core_control_cdo_mask_write_preserves_unmasked_bits() {
+    use crate::parser::cdo::semantics::lower;
+    use crate::parser::cdo::CdoRaw;
+
+    let mut state = DeviceState::new_npu1();
+    let col: u8 = 1;
+    let row: u8 = 2; // compute row
+    let cc_offset = xdna_archspec::aie2::registers::CORE_CONTROL;
+    let address = TileAddress::encode(col, row, cc_offset);
+
+    // Pre-set tile.core.control directly, bypassing the register bus.
+    // The test is proving a bug in the write path itself, so we cannot
+    // use the write path to set up the precondition.
+    {
+        let tile = state.array.get_mut(col, row).unwrap();
+        tile.core.control = 0xABCD_0001;
+        tile.core.enabled = true;
+    }
+
+    // Clear bit 0 (disable) but leave bits 31..1 alone.
+    let cmd = CdoRaw::MaskWrite { address, mask: 0x1, value: 0x0 };
+    for op in lower(&cmd) {
+        state.apply_device_op(&op).unwrap();
+    }
+
+    let tile = state.array.tile(col, row);
+    assert_eq!(
+        tile.core.control, 0xABCD_0000,
+        "MaskWrite with mask=0x1 must only clear bit 0, preserving bits 31..1"
+    );
+    assert!(!tile.core.enabled, "Bit 0 cleared -> core disabled");
+}
+
+/// Invariant proof for D.3 commit 2: writing CORE_CONTROL via the
+/// register bus does not match any branch of
+/// `apply_tile_local_effects` (cascade, shim mux, lock overflow/
+/// underflow clear, perf counters, trace registers).
+///
+/// The non-CDO path already exercises this code path; this test
+/// pins the invariant so that when D.3 commit 2 routes the CDO
+/// promotion path through `write_register` (and thus through
+/// `apply_tile_local_effects`), no surprise side effect fires.
+///
+/// GREEN today, GREEN after commit 2.
+#[test]
+fn register_bus_write_to_core_control_does_not_trigger_unrelated_tile_effects() {
+    let mut state = DeviceState::new_npu1();
+    let col: u8 = 1;
+    let row: u8 = 2; // compute row
+    let cc_offset = xdna_archspec::aie2::registers::CORE_CONTROL;
+    let cc_addr = TileAddress::encode(col, row, cc_offset);
+
+    // Snapshot fields apply_tile_local_effects can touch.
+    let tile = state.array.tile(col, row);
+    let cascade_in_pre = tile.cascade_input_dir;
+    let cascade_out_pre = tile.cascade_output_dir;
+    let lock_over_pre: Vec<bool> = tile.locks.iter().map(|l| l.overflow).collect();
+    let lock_under_pre: Vec<bool> = tile.locks.iter().map(|l| l.underflow).collect();
+    let mut reg_pre: Vec<(u32, u32)> = tile
+        .registers_ref()
+        .iter()
+        .filter(|(&offset, _)| offset != cc_offset)
+        .map(|(&offset, &value)| (offset, value))
+        .collect();
+    reg_pre.sort_by_key(|(o, _)| *o);
+
+    // The register-map snapshot above is the catch-all: shim-mux config,
+    // perf-counter latches, and trace-register state all live in
+    // `tile.registers` as raw u32 entries (apply_tile_local_effects writes
+    // them via `tile.registers.insert(...)`), so any side effect on those
+    // subsystems would show up as a new (offset, value) entry in `reg_post`.
+    // No separate accessor checks are needed.
+    state.write_register(cc_addr, 0x1).unwrap();
+
+    let tile = state.array.tile(col, row);
+    assert_eq!(tile.cascade_input_dir, cascade_in_pre, "cascade_input_dir must not change");
+    assert_eq!(tile.cascade_output_dir, cascade_out_pre, "cascade_output_dir must not change");
+
+    let lock_over_post: Vec<bool> = tile.locks.iter().map(|l| l.overflow).collect();
+    let lock_under_post: Vec<bool> = tile.locks.iter().map(|l| l.underflow).collect();
+    assert_eq!(lock_over_pre, lock_over_post, "lock overflow bits must not change");
+    assert_eq!(lock_under_pre, lock_under_post, "lock underflow bits must not change");
+
+    let mut reg_post: Vec<(u32, u32)> = tile
+        .registers_ref()
+        .iter()
+        .filter(|(&offset, _)| offset != cc_offset)
+        .map(|(&offset, &value)| (offset, value))
+        .collect();
+    reg_post.sort_by_key(|(o, _)| *o);
+    assert_eq!(
+        reg_pre, reg_post,
+        "Only CORE_CONTROL should change in the register map; other entries must be untouched"
+    );
+
+    // Sanity: the targeted effects DID happen.
+    assert_eq!(tile.core.control, 0x1);
+    assert_eq!(*tile.registers_ref().get(&cc_offset).unwrap(), 0x1);
+}
+
+/// Same invariant as the CORE_CONTROL test, but for a compute
+/// Start_Queue offset. Verifies that writing Start_Queue via the
+/// register bus does not trigger any apply_tile_local_effects branch.
+#[test]
+fn register_bus_write_to_compute_start_queue_does_not_trigger_unrelated_tile_effects() {
+    use xdna_archspec::aie2::registers::dma::COMPUTE_DMA_S2MM_0_START_QUEUE;
+
+    let mut state = DeviceState::new_npu1();
+    let col: u8 = 1;
+    let row: u8 = 2;
+    let sq_offset = COMPUTE_DMA_S2MM_0_START_QUEUE;
+    let sq_addr = TileAddress::encode(col, row, sq_offset);
+
+    let tile = state.array.tile(col, row);
+    let cascade_in_pre = tile.cascade_input_dir;
+    let cascade_out_pre = tile.cascade_output_dir;
+    let lock_over_pre: Vec<bool> = tile.locks.iter().map(|l| l.overflow).collect();
+    let lock_under_pre: Vec<bool> = tile.locks.iter().map(|l| l.underflow).collect();
+
+    // Write 0 (BD 0, no repeat) -- innocuous payload, just need the
+    // write to land on the offset.
+    // This test is intentionally shallower than the CORE_CONTROL twin:
+    // Start_Queue writes legitimately mutate DMA-channel state (BD enqueue),
+    // so a full `tile.registers` snapshot would be noisy. Cascade and lock
+    // overflow/underflow are the only fields apply_tile_local_effects could
+    // touch that are safely orthogonal to a Start_Queue write.
+    state.write_register(sq_addr, 0x0).unwrap();
+
+    let tile = state.array.tile(col, row);
+    assert_eq!(tile.cascade_input_dir, cascade_in_pre);
+    assert_eq!(tile.cascade_output_dir, cascade_out_pre);
+
+    let lock_over_post: Vec<bool> = tile.locks.iter().map(|l| l.overflow).collect();
+    let lock_under_post: Vec<bool> = tile.locks.iter().map(|l| l.underflow).collect();
+    assert_eq!(lock_over_pre, lock_over_post);
+    assert_eq!(lock_under_pre, lock_under_post);
+}
