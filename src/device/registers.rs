@@ -54,7 +54,6 @@ impl TileAddress {
         use xdna_archspec::aie2::{TILE_COL_SHIFT, TILE_ROW_SHIFT, TILE_OFFSET_MASK};
         ((col as u32) << TILE_COL_SHIFT) | ((row as u32) << TILE_ROW_SHIFT) | (offset & TILE_OFFSET_MASK)
     }
-
 }
 
 impl fmt::Display for TileAddress {
@@ -62,7 +61,6 @@ impl fmt::Display for TileAddress {
         write!(f, "tile({},{}) @ 0x{:05X}", self.col, self.row, self.offset)
     }
 }
-
 
 /// Information about a specific register.
 #[derive(Debug, Clone)]
@@ -137,7 +135,7 @@ fn lookup_dma_bd(offset: u32) -> Option<RegisterInfo> {
     let word = (rel % lay.memory_bd_stride) / 4;
 
     if word as usize >= lay.memory_bd_words {
-        return None;  // Gap between BDs
+        return None; // Gap between BDs
     }
 
     let name: &'static str = match word {
@@ -163,7 +161,8 @@ fn lookup_dma_bd(offset: u32) -> Option<RegisterInfo> {
 /// Lock base/stride derived from register database (AM025).
 fn lookup_lock(offset: u32) -> Option<RegisterInfo> {
     let lay = super::regdb::device_reg_layout();
-    let lock_end = lay.memory_lock_base + xdna_archspec::aie2::compute::NUM_LOCKS as u32 * lay.memory_lock_stride;
+    let lock_end =
+        lay.memory_lock_base + xdna_archspec::aie2::compute::NUM_LOCKS as u32 * lay.memory_lock_stride;
 
     if !(lay.memory_lock_base..lock_end).contains(&offset) {
         return None;
@@ -408,13 +407,9 @@ pub fn decode_register(addr: u32) -> (TileAddress, Option<RegisterInfo>) {
 /// overlaps DMA, NoC, Performance, Timer, Event, and Trace. Specific
 /// subsystems are checked first; Interrupt is returned only for offsets
 /// that don't match any more specific subsystem.
-pub fn subsystem_from_offset(
-    offset: u32,
-    tile_kind: TileKind,
-) -> SubsystemKind {
+pub fn subsystem_from_offset(offset: u32, tile_kind: TileKind) -> SubsystemKind {
     use xdna_archspec::aie2 as arch;
     use xdna_archspec::aie2::subsystems as subsystem;
-
 
     // Strategy: check most-specific (smallest) ranges first, then broader
     // encompassing ranges. Within overlapping clusters, the order is:
@@ -428,79 +423,124 @@ pub fn subsystem_from_offset(
                 return SubsystemKind::DataMemory;
             }
             // DMA (non-overlapping)
-            if in_range(offset, subsystem::compute::dma::OFFSET_START,
-                       subsystem::compute::dma::OFFSET_END) {
+            if in_range(offset, subsystem::compute::dma::OFFSET_START, subsystem::compute::dma::OFFSET_END) {
                 SubsystemKind::Dma
             }
             // Lock value registers (non-overlapping)
-            else if in_range(offset, subsystem::compute::lock::OFFSET_START,
-                            subsystem::compute::lock::OFFSET_END) {
+            else if in_range(
+                offset,
+                subsystem::compute::lock::OFFSET_START,
+                subsystem::compute::lock::OFFSET_END,
+            ) {
                 SubsystemKind::Lock
             }
             // Program memory: full 64KB address window (0x20000..0x30000).
             // The generated constant covers only the AM025 register group;
             // CDO writes fill the whole window.
             else if offset >= arch::compute::PROGRAM_MEM_HOST_OFFSET
-                && offset < arch::compute::PROGRAM_MEM_HOST_OFFSET + 0x10000 {
+                && offset < arch::compute::PROGRAM_MEM_HOST_OFFSET + 0x10000
+            {
                 SubsystemKind::ProgramMemory
             }
             // Stream switch (non-overlapping)
-            else if in_range(offset, subsystem::compute::stream_switch::OFFSET_START,
-                            subsystem::compute::stream_switch::OFFSET_END) {
+            else if in_range(
+                offset,
+                subsystem::compute::stream_switch::OFFSET_START,
+                subsystem::compute::stream_switch::OFFSET_END,
+            ) {
                 SubsystemKind::StreamSwitch
             }
             // Lock request (non-overlapping)
-            else if in_range(offset, subsystem::compute::lock_request::OFFSET_START,
-                            subsystem::compute::lock_request::OFFSET_END) {
+            else if in_range(
+                offset,
+                subsystem::compute::lock_request::OFFSET_START,
+                subsystem::compute::lock_request::OFFSET_END,
+            ) {
                 SubsystemKind::LockRequest
             }
             // --- Memory module secondary cluster (0x11000-0x14520) ---
             // Performance (non-overlapping with timer/event/trace cluster)
-            else if in_range(offset, subsystem::compute::memory_performance::OFFSET_START,
-                            subsystem::compute::memory_performance::OFFSET_END) {
+            else if in_range(
+                offset,
+                subsystem::compute::memory_performance::OFFSET_START,
+                subsystem::compute::memory_performance::OFFSET_END,
+            ) {
                 SubsystemKind::Performance
             }
             // Trace < WatchPoint < Timer < Event (most specific first)
-            else if in_range(offset, subsystem::compute::memory_trace::OFFSET_START,
-                            subsystem::compute::memory_trace::OFFSET_END) {
+            else if in_range(
+                offset,
+                subsystem::compute::memory_trace::OFFSET_START,
+                subsystem::compute::memory_trace::OFFSET_END,
+            ) {
                 SubsystemKind::Trace
-            } else if in_range(offset, subsystem::compute::watchpoint::OFFSET_START,
-                              subsystem::compute::watchpoint::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::compute::watchpoint::OFFSET_START,
+                subsystem::compute::watchpoint::OFFSET_END,
+            ) {
                 SubsystemKind::WatchPoint
-            } else if in_range(offset, subsystem::compute::memory_timer::OFFSET_START,
-                              subsystem::compute::memory_timer::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::compute::memory_timer::OFFSET_START,
+                subsystem::compute::memory_timer::OFFSET_END,
+            ) {
                 SubsystemKind::Timer
-            } else if in_range(offset, subsystem::compute::memory_event::OFFSET_START,
-                              subsystem::compute::memory_event::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::compute::memory_event::OFFSET_START,
+                subsystem::compute::memory_event::OFFSET_END,
+            ) {
                 SubsystemKind::Event
             }
             // --- Core module secondary cluster (0x30000-0x3503C) ---
             // Debug, ProgramCounter, Performance are nested inside Processor.
             // Check them first so they get specific classification.
-            else if in_range(offset, subsystem::compute::debug::OFFSET_START,
-                            subsystem::compute::debug::OFFSET_END) {
+            else if in_range(
+                offset,
+                subsystem::compute::debug::OFFSET_START,
+                subsystem::compute::debug::OFFSET_END,
+            ) {
                 SubsystemKind::Debug
-            } else if in_range(offset, subsystem::compute::program_counter::OFFSET_START,
-                              subsystem::compute::program_counter::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::compute::program_counter::OFFSET_START,
+                subsystem::compute::program_counter::OFFSET_END,
+            ) {
                 SubsystemKind::ProgramCounter
-            } else if in_range(offset, subsystem::compute::core_performance::OFFSET_START,
-                              subsystem::compute::core_performance::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::compute::core_performance::OFFSET_START,
+                subsystem::compute::core_performance::OFFSET_END,
+            ) {
                 SubsystemKind::Performance
             }
             // Core trace < core timer < core event (most specific first)
-            else if in_range(offset, subsystem::compute::core_trace::OFFSET_START,
-                            subsystem::compute::core_trace::OFFSET_END) {
+            else if in_range(
+                offset,
+                subsystem::compute::core_trace::OFFSET_START,
+                subsystem::compute::core_trace::OFFSET_END,
+            ) {
                 SubsystemKind::Trace
-            } else if in_range(offset, subsystem::compute::core_timer::OFFSET_START,
-                              subsystem::compute::core_timer::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::compute::core_timer::OFFSET_START,
+                subsystem::compute::core_timer::OFFSET_END,
+            ) {
                 SubsystemKind::Timer
-            } else if in_range(offset, subsystem::compute::core_event::OFFSET_START,
-                              subsystem::compute::core_event::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::compute::core_event::OFFSET_START,
+                subsystem::compute::core_event::OFFSET_END,
+            ) {
                 SubsystemKind::Event
             }
             // Processor: broad range, checked after its nested subsystems.
-            else if in_range(offset, subsystem::compute::processor::OFFSET_START,
-                            subsystem::compute::processor::OFFSET_END) {
+            else if in_range(
+                offset,
+                subsystem::compute::processor::OFFSET_START,
+                subsystem::compute::processor::OFFSET_END,
+            ) {
                 SubsystemKind::Processor
             } else {
                 SubsystemKind::Unknown
@@ -512,36 +552,59 @@ pub fn subsystem_from_offset(
                 return SubsystemKind::DataMemory;
             }
             // Primary non-overlapping subsystems
-            if in_range(offset, subsystem::memtile::dma::OFFSET_START,
-                       subsystem::memtile::dma::OFFSET_END) {
+            if in_range(offset, subsystem::memtile::dma::OFFSET_START, subsystem::memtile::dma::OFFSET_END) {
                 SubsystemKind::Dma
-            } else if in_range(offset, subsystem::memtile::lock::OFFSET_START,
-                              subsystem::memtile::lock::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::memtile::lock::OFFSET_START,
+                subsystem::memtile::lock::OFFSET_END,
+            ) {
                 SubsystemKind::Lock
-            } else if in_range(offset, subsystem::memtile::stream_switch::OFFSET_START,
-                              subsystem::memtile::stream_switch::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::memtile::stream_switch::OFFSET_START,
+                subsystem::memtile::stream_switch::OFFSET_END,
+            ) {
                 SubsystemKind::StreamSwitch
-            } else if in_range(offset, subsystem::memtile::lock_request::OFFSET_START,
-                              subsystem::memtile::lock_request::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::memtile::lock_request::OFFSET_START,
+                subsystem::memtile::lock_request::OFFSET_END,
+            ) {
                 SubsystemKind::LockRequest
             }
             // Performance (non-overlapping with timer/event/trace cluster)
-            else if in_range(offset, subsystem::memtile::performance::OFFSET_START,
-                            subsystem::memtile::performance::OFFSET_END) {
+            else if in_range(
+                offset,
+                subsystem::memtile::performance::OFFSET_START,
+                subsystem::memtile::performance::OFFSET_END,
+            ) {
                 SubsystemKind::Performance
             }
             // Trace < WatchPoint < Timer < Event (most specific first)
-            else if in_range(offset, subsystem::memtile::trace::OFFSET_START,
-                            subsystem::memtile::trace::OFFSET_END) {
+            else if in_range(
+                offset,
+                subsystem::memtile::trace::OFFSET_START,
+                subsystem::memtile::trace::OFFSET_END,
+            ) {
                 SubsystemKind::Trace
-            } else if in_range(offset, subsystem::memtile::watchpoint::OFFSET_START,
-                              subsystem::memtile::watchpoint::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::memtile::watchpoint::OFFSET_START,
+                subsystem::memtile::watchpoint::OFFSET_END,
+            ) {
                 SubsystemKind::WatchPoint
-            } else if in_range(offset, subsystem::memtile::timer::OFFSET_START,
-                              subsystem::memtile::timer::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::memtile::timer::OFFSET_START,
+                subsystem::memtile::timer::OFFSET_END,
+            ) {
                 SubsystemKind::Timer
-            } else if in_range(offset, subsystem::memtile::event::OFFSET_START,
-                              subsystem::memtile::event::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::memtile::event::OFFSET_START,
+                subsystem::memtile::event::OFFSET_END,
+            ) {
                 SubsystemKind::Event
             } else {
                 SubsystemKind::Unknown
@@ -552,41 +615,59 @@ pub fn subsystem_from_offset(
             //
             // Check specific subsystems before the broad Interrupt envelope
             // (0x15000-0x35054), which overlaps many other ranges.
-            if in_range(offset, subsystem::shim::lock::OFFSET_START,
-                       subsystem::shim::lock::OFFSET_END) {
+            if in_range(offset, subsystem::shim::lock::OFFSET_START, subsystem::shim::lock::OFFSET_END) {
                 SubsystemKind::Lock
-            } else if in_range(offset, subsystem::shim::dma::OFFSET_START,
-                              subsystem::shim::dma::OFFSET_END) {
+            } else if in_range(offset, subsystem::shim::dma::OFFSET_START, subsystem::shim::dma::OFFSET_END) {
                 SubsystemKind::Dma
-            } else if in_range(offset, subsystem::shim::noc::OFFSET_START,
-                              subsystem::shim::noc::OFFSET_END) {
+            } else if in_range(offset, subsystem::shim::noc::OFFSET_START, subsystem::shim::noc::OFFSET_END) {
                 SubsystemKind::NoC
-            } else if in_range(offset, subsystem::shim::stream_switch::OFFSET_START,
-                              subsystem::shim::stream_switch::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::shim::stream_switch::OFFSET_START,
+                subsystem::shim::stream_switch::OFFSET_END,
+            ) {
                 SubsystemKind::StreamSwitch
-            } else if in_range(offset, subsystem::shim::lock_request::OFFSET_START,
-                              subsystem::shim::lock_request::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::shim::lock_request::OFFSET_START,
+                subsystem::shim::lock_request::OFFSET_END,
+            ) {
                 SubsystemKind::LockRequest
             }
             // Performance (non-overlapping with timer/event/trace cluster)
-            else if in_range(offset, subsystem::shim::performance::OFFSET_START,
-                            subsystem::shim::performance::OFFSET_END) {
+            else if in_range(
+                offset,
+                subsystem::shim::performance::OFFSET_START,
+                subsystem::shim::performance::OFFSET_END,
+            ) {
                 SubsystemKind::Performance
             }
             // Trace < Timer < Event (most specific first)
-            else if in_range(offset, subsystem::shim::trace::OFFSET_START,
-                            subsystem::shim::trace::OFFSET_END) {
+            else if in_range(
+                offset,
+                subsystem::shim::trace::OFFSET_START,
+                subsystem::shim::trace::OFFSET_END,
+            ) {
                 SubsystemKind::Trace
-            } else if in_range(offset, subsystem::shim::timer::OFFSET_START,
-                              subsystem::shim::timer::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::shim::timer::OFFSET_START,
+                subsystem::shim::timer::OFFSET_END,
+            ) {
                 SubsystemKind::Timer
-            } else if in_range(offset, subsystem::shim::event::OFFSET_START,
-                              subsystem::shim::event::OFFSET_END) {
+            } else if in_range(
+                offset,
+                subsystem::shim::event::OFFSET_START,
+                subsystem::shim::event::OFFSET_END,
+            ) {
                 SubsystemKind::Event
             }
             // Interrupt controller: broad envelope, checked last
-            else if in_range(offset, subsystem::shim::interrupt::OFFSET_START,
-                            subsystem::shim::interrupt::OFFSET_END) {
+            else if in_range(
+                offset,
+                subsystem::shim::interrupt::OFFSET_START,
+                subsystem::shim::interrupt::OFFSET_END,
+            ) {
                 SubsystemKind::Interrupt
             } else {
                 SubsystemKind::Unknown
@@ -733,8 +814,6 @@ mod tests {
 
     #[test]
     fn test_subsystem_from_offset_compute_primary() {
-    
-
         // Data memory: full 64KB SRAM range
         assert_eq!(subsystem_from_offset(0x00000, TileKind::Compute), SubsystemKind::DataMemory);
         assert_eq!(subsystem_from_offset(0x00100, TileKind::Compute), SubsystemKind::DataMemory);
@@ -769,8 +848,6 @@ mod tests {
 
     #[test]
     fn test_subsystem_from_offset_compute_secondary() {
-    
-
         // Memory module performance counters
         assert_eq!(subsystem_from_offset(0x11000, TileKind::Compute), SubsystemKind::Performance);
         // Core module performance counters
@@ -793,8 +870,6 @@ mod tests {
 
     #[test]
     fn test_subsystem_from_offset_compute_unknown() {
-    
-
         // Gap between data memory (0x10000) and performance (0x11000)
         assert_eq!(subsystem_from_offset(0x10800, TileKind::Compute), SubsystemKind::Unknown);
         // Gap between lock and program memory
@@ -803,8 +878,6 @@ mod tests {
 
     #[test]
     fn test_subsystem_from_offset_memtile() {
-    
-
         // Data memory: full 512KB SRAM range
         assert_eq!(subsystem_from_offset(0x00000, TileKind::Mem), SubsystemKind::DataMemory);
         assert_eq!(subsystem_from_offset(0x7FFFF, TileKind::Mem), SubsystemKind::DataMemory);
@@ -833,8 +906,6 @@ mod tests {
 
     #[test]
     fn test_subsystem_from_offset_shim() {
-    
-
         // DMA
         assert_eq!(subsystem_from_offset(0x1D000, TileKind::ShimNoc), SubsystemKind::Dma);
 
@@ -863,8 +934,6 @@ mod tests {
 
     #[test]
     fn test_subsystem_from_offset_tile_sensitivity() {
-    
-
         // Same offset (0x1D000) is DMA on both compute and shim
         assert_eq!(subsystem_from_offset(0x1D000, TileKind::Compute), SubsystemKind::Dma);
         assert_eq!(subsystem_from_offset(0x1D000, TileKind::ShimNoc), SubsystemKind::Dma);
@@ -898,9 +967,13 @@ mod tests {
         // Compute tile: subsystems duplicated across Core and Memory modules
         // are prefixed with the module name to avoid collisions.
         assert!(subsystem::compute::core_event::OFFSET_END > subsystem::compute::core_event::OFFSET_START);
-        assert!(subsystem::compute::memory_event::OFFSET_END > subsystem::compute::memory_event::OFFSET_START);
+        assert!(
+            subsystem::compute::memory_event::OFFSET_END > subsystem::compute::memory_event::OFFSET_START
+        );
         assert!(subsystem::compute::core_trace::OFFSET_END > subsystem::compute::core_trace::OFFSET_START);
-        assert!(subsystem::compute::memory_trace::OFFSET_END > subsystem::compute::memory_trace::OFFSET_START);
+        assert!(
+            subsystem::compute::memory_trace::OFFSET_END > subsystem::compute::memory_trace::OFFSET_START
+        );
 
         // MemTile: DMA at 0xA0000 (single module, no prefix needed)
         assert_eq!(subsystem::memtile::dma::OFFSET_START, 0xA0000);

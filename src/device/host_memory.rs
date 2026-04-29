@@ -160,11 +160,7 @@ impl HostMemory {
 
     /// Create a new empty host memory.
     pub fn new() -> Self {
-        Self {
-            pages: BTreeMap::new(),
-            regions: Vec::new(),
-            total_bytes_written: 0,
-        }
+        Self { pages: BTreeMap::new(), regions: Vec::new(), total_bytes_written: 0 }
     }
 
     /// Allocate a named memory region.
@@ -239,9 +235,7 @@ impl HostMemory {
     /// Get or create a page for the given address.
     fn get_or_create_page(&mut self, addr: u64) -> &mut [u8; Self::PAGE_SIZE] {
         let page_addr = addr & Self::PAGE_MASK;
-        self.pages
-            .entry(page_addr)
-            .or_insert_with(|| Box::new([0u8; Self::PAGE_SIZE]))
+        self.pages.entry(page_addr).or_insert_with(|| Box::new([0u8; Self::PAGE_SIZE]))
     }
 
     /// Get a page for reading, if it exists.
@@ -345,9 +339,7 @@ impl HostMemory {
     /// Write a slice of u32 values (convenience method for test data).
     pub fn write_slice<T: Copy>(&mut self, addr: u64, data: &[T]) {
         let byte_len = std::mem::size_of_val(data);
-        let bytes = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len)
-        };
+        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
         self.write_bytes(addr, bytes);
 
         // Update region stats
@@ -369,11 +361,7 @@ impl HostMemory {
 
         let mut result = vec![T::default(); count];
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                result.as_mut_ptr() as *mut u8,
-                byte_len,
-            );
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), result.as_mut_ptr() as *mut u8, byte_len);
         }
         result
     }

@@ -76,7 +76,8 @@ mod tests {
         assert_eq!(xdna_archspec::aie2::memtile::PHYSICAL_BANKS, 16);
         assert_eq!(xdna_archspec::aie2::memtile::PHYSICAL_BANK_SIZE, 32 * 1024);
         assert_eq!(
-            xdna_archspec::aie2::memtile::PHYSICAL_BANKS as u64 * xdna_archspec::aie2::memtile::PHYSICAL_BANK_SIZE,
+            xdna_archspec::aie2::memtile::PHYSICAL_BANKS as u64
+                * xdna_archspec::aie2::memtile::PHYSICAL_BANK_SIZE,
             512 * 1024
         );
         // Bank width: 128 bits per aie-rt XAIEMLGBL_MEM_TILE_MODULE_DATAMEMORY_WIDTH.

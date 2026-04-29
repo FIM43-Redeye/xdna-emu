@@ -13,17 +13,15 @@ mod aiert_dma {
     #[test]
     fn memtile_dma_bd_base_matches_regdb() {
         let layout = crate::device::regdb::device_reg_layout();
-        assert_eq!(
-            memtile_dma::BD_BASE, layout.memtile_bd_base,
-            "MemTile BD base: aie-rt vs regdb mismatch"
-        );
+        assert_eq!(memtile_dma::BD_BASE, layout.memtile_bd_base, "MemTile BD base: aie-rt vs regdb mismatch");
     }
 
     #[test]
     fn memtile_dma_bd_stride_matches_regdb() {
         let layout = crate::device::regdb::device_reg_layout();
         assert_eq!(
-            memtile_dma::BD_STRIDE, layout.memtile_bd_stride,
+            memtile_dma::BD_STRIDE,
+            layout.memtile_bd_stride,
             "MemTile BD stride: aie-rt vs regdb mismatch"
         );
     }
@@ -31,17 +29,15 @@ mod aiert_dma {
     #[test]
     fn compute_dma_bd_base_matches_regdb() {
         let layout = crate::device::regdb::device_reg_layout();
-        assert_eq!(
-            compute_dma::BD_BASE, layout.memory_bd_base,
-            "Compute BD base: aie-rt vs regdb mismatch"
-        );
+        assert_eq!(compute_dma::BD_BASE, layout.memory_bd_base, "Compute BD base: aie-rt vs regdb mismatch");
     }
 
     #[test]
     fn compute_dma_bd_stride_matches_regdb() {
         let layout = crate::device::regdb::device_reg_layout();
         assert_eq!(
-            compute_dma::BD_STRIDE, layout.memory_bd_stride,
+            compute_dma::BD_STRIDE,
+            layout.memory_bd_stride,
             "Compute BD stride: aie-rt vs regdb mismatch"
         );
     }
@@ -49,26 +45,21 @@ mod aiert_dma {
     #[test]
     fn shim_dma_bd_base_matches_regdb() {
         let layout = crate::device::regdb::device_reg_layout();
-        assert_eq!(
-            shim_dma::BD_BASE, layout.shim_bd_base,
-            "Shim BD base: aie-rt vs regdb mismatch"
-        );
+        assert_eq!(shim_dma::BD_BASE, layout.shim_bd_base, "Shim BD base: aie-rt vs regdb mismatch");
     }
 
     #[test]
     fn shim_dma_bd_stride_matches_regdb() {
         let layout = crate::device::regdb::device_reg_layout();
-        assert_eq!(
-            shim_dma::BD_STRIDE, layout.shim_bd_stride,
-            "Shim BD stride: aie-rt vs regdb mismatch"
-        );
+        assert_eq!(shim_dma::BD_STRIDE, layout.shim_bd_stride, "Shim BD stride: aie-rt vs regdb mismatch");
     }
 
     #[test]
     fn compute_dma_channel_base_matches_regdb() {
         let layout = crate::device::regdb::device_reg_layout();
         assert_eq!(
-            compute_dma::CH_CTRL_BASE, layout.memory_channel_base,
+            compute_dma::CH_CTRL_BASE,
+            layout.memory_channel_base,
             "Compute channel base: aie-rt vs regdb mismatch"
         );
     }
@@ -77,7 +68,8 @@ mod aiert_dma {
     fn shim_dma_channel_base_matches_regdb() {
         let layout = crate::device::regdb::device_reg_layout();
         assert_eq!(
-            shim_dma::CH_CTRL_BASE, layout.shim_channel_base,
+            shim_dma::CH_CTRL_BASE,
+            layout.shim_channel_base,
             "Shim channel base: aie-rt vs regdb mismatch"
         );
     }
@@ -86,7 +78,8 @@ mod aiert_dma {
     fn compute_dma_status_base_matches_regdb() {
         let layout = crate::device::regdb::device_reg_layout();
         assert_eq!(
-            compute_dma::CH_STATUS_BASE, layout.memory_status_base,
+            compute_dma::CH_STATUS_BASE,
+            layout.memory_status_base,
             "Compute status base: aie-rt vs regdb mismatch"
         );
     }
@@ -102,7 +95,8 @@ mod aiert_locks {
     fn compute_lock_set_val_base_matches_regdb() {
         let layout = crate::device::regdb::device_reg_layout();
         assert_eq!(
-            compute_locks::SET_VAL_BASE, layout.memory_lock_base,
+            compute_locks::SET_VAL_BASE,
+            layout.memory_lock_base,
             "Compute lock set-val base: aie-rt vs regdb mismatch"
         );
     }
@@ -111,7 +105,8 @@ mod aiert_locks {
     fn compute_lock_set_val_stride_matches_regdb() {
         let layout = crate::device::regdb::device_reg_layout();
         assert_eq!(
-            compute_locks::SET_VAL_STRIDE, layout.memory_lock_stride,
+            compute_locks::SET_VAL_STRIDE,
+            layout.memory_lock_stride,
             "Compute lock set-val stride: aie-rt vs regdb mismatch"
         );
     }
@@ -120,7 +115,8 @@ mod aiert_locks {
     fn memtile_lock_set_val_base_matches_regdb() {
         let layout = crate::device::regdb::device_reg_layout();
         assert_eq!(
-            memtile_locks::SET_VAL_BASE, layout.memtile_lock_base,
+            memtile_locks::SET_VAL_BASE,
+            layout.memtile_lock_base,
             "MemTile lock set-val base: aie-rt vs regdb mismatch"
         );
     }
@@ -129,7 +125,8 @@ mod aiert_locks {
     fn memtile_lock_set_val_stride_matches_regdb() {
         let layout = crate::device::regdb::device_reg_layout();
         assert_eq!(
-            memtile_locks::SET_VAL_STRIDE, layout.memtile_lock_stride,
+            memtile_locks::SET_VAL_STRIDE,
+            layout.memtile_lock_stride,
             "MemTile lock set-val stride: aie-rt vs regdb mismatch"
         );
     }

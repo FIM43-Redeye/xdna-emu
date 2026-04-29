@@ -26,9 +26,7 @@ static LOCK_VALUE_LAYOUT: OnceLock<&'static LockValueLayout> = OnceLock::new();
 /// First call lazily resolves through `default_arch().lock_model()`;
 /// subsequent calls return the cached pointer directly.
 pub fn lock_value_layout() -> &'static LockValueLayout {
-    LOCK_VALUE_LAYOUT.get_or_init(|| {
-        xdna_archspec::runtime::default_arch().lock_model().value_layout()
-    })
+    LOCK_VALUE_LAYOUT.get_or_init(|| xdna_archspec::runtime::default_arch().lock_model().value_layout())
 }
 
 static STREAM_SWITCH_TOPOLOGY: OnceLock<&'static StreamSwitchTopology> = OnceLock::new();
@@ -38,9 +36,8 @@ static STREAM_SWITCH_TOPOLOGY: OnceLock<&'static StreamSwitchTopology> = OnceLoc
 /// First call lazily resolves through `default_arch().stream_switch_model()`;
 /// subsequent calls return the cached pointer directly.
 pub fn stream_switch_topology() -> &'static StreamSwitchTopology {
-    STREAM_SWITCH_TOPOLOGY.get_or_init(|| {
-        xdna_archspec::runtime::default_arch().stream_switch_model().topology()
-    })
+    STREAM_SWITCH_TOPOLOGY
+        .get_or_init(|| xdna_archspec::runtime::default_arch().stream_switch_model().topology())
 }
 
 static ISA_EXECUTOR: OnceLock<&'static dyn IsaExecutor> = OnceLock::new();
@@ -51,9 +48,7 @@ static ISA_EXECUTOR: OnceLock<&'static dyn IsaExecutor> = OnceLock::new();
 /// arch. Ships empty per Subsystem 7's Approach A audit; anchored
 /// for future seams.
 pub fn isa_executor() -> &'static dyn IsaExecutor {
-    *ISA_EXECUTOR.get_or_init(|| {
-        xdna_archspec::runtime::default_arch().isa_executor()
-    })
+    *ISA_EXECUTOR.get_or_init(|| xdna_archspec::runtime::default_arch().isa_executor())
 }
 
 static CORE_ADDRESS_MAP: OnceLock<Option<&'static CoreAddressMap>> = OnceLock::new();
@@ -75,7 +70,8 @@ pub fn core_address_map() -> Option<&'static CoreAddressMap> {
         // Leak the clone to a static reference so the OnceLock can hold a
         // 'static borrow.  One allocation per process; same lifetime
         // shape as lock_value_layout() / stream_switch_topology() above.
-        xdna_archspec::runtime::default_arch().core_address_map()
+        xdna_archspec::runtime::default_arch()
+            .core_address_map()
             .map(|m| Box::leak(Box::new(m.clone())) as &'static _)
     })
 }
@@ -90,9 +86,7 @@ static HAS_CASCADE_LINK: OnceLock<bool> = OnceLock::new();
 /// `cascade.rs` gates all cascade operations on this flag, so a future
 /// AIE1 path gets no-op cascade handlers without touching execute-layer logic.
 pub fn has_cascade_link() -> bool {
-    *HAS_CASCADE_LINK.get_or_init(|| {
-        xdna_archspec::runtime::default_arch().has_cascade_link()
-    })
+    *HAS_CASCADE_LINK.get_or_init(|| xdna_archspec::runtime::default_arch().has_cascade_link())
 }
 
 static LATENCY_TABLE: OnceLock<LatencyTable> = OnceLock::new();

@@ -65,10 +65,7 @@ pub fn validate_against_spec(model: &ArchModel) -> Result<(), DeviceModelError> 
             let model_val = $model_val as i64;
             let expected = $expected as i64;
             if model_val != expected {
-                mismatches.push(format!(
-                    "{}: model={}, expected={}",
-                    $name, model_val, expected
-                ));
+                mismatches.push(format!("{}: model={}, expected={}", $name, model_val, expected));
             }
         };
     }
@@ -80,11 +77,7 @@ pub fn validate_against_spec(model: &ArchModel) -> Result<(), DeviceModelError> 
         check!("max_lock_value", dc.max_lock_value as i32, arch::MAX_LOCK_VALUE);
 
         // Cross-validate against Lock::MAX_VALUE compile-time const.
-        check!(
-            "Lock::MAX_VALUE vs model",
-            crate::device::tile::Lock::MAX_VALUE as u32,
-            dc.max_lock_value
-        );
+        check!("Lock::MAX_VALUE vs model", crate::device::tile::Lock::MAX_VALUE as u32, dc.max_lock_value);
 
         // address_gen_granularity: 32-byte alignment (no arch const yet).
         check!("address_gen_granularity", dc.address_gen_granularity, 32_u32);
@@ -288,7 +281,11 @@ mod tests {
         assert_eq!(*mem.instances.locks.value(), 64);
         assert_eq!(*mem.instances.bds.value(), 48);
 
-        let shim = model.tile_types.iter().find(|t| t.kind == TileKind::ShimNoc).expect("no shim_noc");
+        let shim = model
+            .tile_types
+            .iter()
+            .find(|t| t.kind == TileKind::ShimNoc)
+            .expect("no shim_noc");
         assert_eq!(*shim.instances.locks.value(), 16);
         assert_eq!(*shim.instances.bds.value(), 16);
     }
@@ -304,7 +301,10 @@ mod tests {
 
         // Verify classification matches expected layout.
         let find = |col: u8, row: u8| {
-            topo.tile_map.iter().find(|t| t.col == col && t.row == row).map(|t| t.tile_type.as_str())
+            topo.tile_map
+                .iter()
+                .find(|t| t.col == col && t.row == row)
+                .map(|t| t.tile_type.as_str())
         };
         assert_eq!(find(0, 0), Some("shim_noc"));
         assert_eq!(find(0, 1), Some("mem_tile"));
@@ -335,7 +335,7 @@ mod tests {
         let core = model.tile_types.iter().find(|t| t.kind == TileKind::Compute).expect("no core");
         let dma = core.switchbox_ports.iter().find(|p| p.bundle == "DMA").expect("DMA ports");
         assert_eq!(dma.masters, 2); // MM2S channels
-        assert_eq!(dma.slaves, 2);  // S2MM channels
+        assert_eq!(dma.slaves, 2); // S2MM channels
 
         let mem = model.tile_types.iter().find(|t| t.kind == TileKind::Mem).expect("no mem_tile");
         let dma = mem.switchbox_ports.iter().find(|p| p.bundle == "DMA").expect("DMA ports");
@@ -359,12 +359,7 @@ mod tests {
     fn npu1_column_variants() {
         let models = extract_device_models(&json_path()).expect("parse failed");
 
-        for (name, expected_cols) in [
-            ("npu1_1col", 1u8),
-            ("npu1_2col", 2),
-            ("npu1_3col", 3),
-            ("npu1", 4),
-        ] {
+        for (name, expected_cols) in [("npu1_1col", 1u8), ("npu1_2col", 2), ("npu1_3col", 3), ("npu1", 4)] {
             let dev = models.get(name).unwrap_or_else(|| panic!("missing {}", name));
             let topo = dev.array_topology.as_ref().expect("missing topology");
             assert_eq!(topo.columns, expected_cols, "{} columns", name);

@@ -30,7 +30,6 @@ use xdna_archspec::types::{DmaDirection, TileAddr};
 #[derive(Debug, Clone)]
 pub enum DeviceOp {
     // --- Register-level writes (escape hatch; ~75% of CDO commands) ---
-
     /// Single 32-bit register write.
     /// Produced by: `CdoRaw::Write`, and by `CdoRaw::Write64` after
     /// address truncation (see `RegMask` doc for the CDO-Write64
@@ -42,7 +41,12 @@ pub enum DeviceOp {
     /// after address truncation (Write64/MaskWrite64 in CDO mean
     /// 64-bit *address*, not 64-bit value -- the high 32 bits of the
     /// address are always zero for AIE and the written value is u32).
-    RegMask { tile: TileAddr, offset: u32, mask: u32, value: u32 },
+    RegMask {
+        tile: TileAddr,
+        offset: u32,
+        mask: u32,
+        value: u32,
+    },
 
     /// Bulk write: `words.len()` consecutive 32-bit words starting at
     /// `offset`.
@@ -52,10 +56,13 @@ pub enum DeviceOp {
     /// patterns (BD configuration, program loads). Larger bursts spill
     /// to the heap.
     /// Produced by: `CdoRaw::DmaWrite`.
-    RegBurst { tile: TileAddr, offset: u32, words: SmallVec<[u32; 64]> },
+    RegBurst {
+        tile: TileAddr,
+        offset: u32,
+        words: SmallVec<[u32; 64]>,
+    },
 
     // --- Coarse control (local single-register promotions) ---
-
     /// Enable or disable a compute core.
     /// Produced by: `CdoRaw::Write` or `CdoRaw::MaskWrite` targeting
     /// the Core_Control register.
@@ -65,7 +72,11 @@ pub enum DeviceOp {
     /// mask-blended value) that state stores into `tile.core.control`
     /// for readback-correctness. Carrying the raw word keeps the typed
     /// op self-describing so `device::state` never has to re-derive it.
-    CoreEnable { tile: TileAddr, enabled: bool, value: u32 },
+    CoreEnable {
+        tile: TileAddr,
+        enabled: bool,
+        value: u32,
+    },
 
     /// Start a DMA channel.
     /// Produced by: `CdoRaw::Write` targeting a DMA channel Start_Queue
@@ -77,10 +88,14 @@ pub enum DeviceOp {
     /// parameters that `device::state` decodes before enqueueing the
     /// task. Passing the raw value avoids splitting field extraction
     /// between the parser and state.
-    DmaStart { tile: TileAddr, channel: u8, dir: DmaDirection, bd_id: u32 },
+    DmaStart {
+        tile: TileAddr,
+        channel: u8,
+        dir: DmaDirection,
+        bd_id: u32,
+    },
 
     // --- Synchronization / timing ---
-
     /// Poll a register until `(value & mask) == expected`.
     ///
     /// On real hardware: blocks until the condition is met (e.g. DMA
@@ -88,7 +103,12 @@ pub enum DeviceOp {
     /// register writes are synchronous; retained to preserve semantic
     /// information for future cycle-accurate work.
     /// Produced by: `CdoRaw::MaskPoll`, `CdoRaw::MaskPoll64`.
-    MaskPoll { tile: TileAddr, offset: u32, mask: u32, expected: u32 },
+    MaskPoll {
+        tile: TileAddr,
+        offset: u32,
+        mask: u32,
+        expected: u32,
+    },
 
     /// Timing delay for N cycles.
     ///
@@ -170,36 +190,15 @@ mod tests {
 
     #[test]
     fn dma_start_both_directions() {
-        let s2mm = DeviceOp::DmaStart {
-            tile: t(0, 0),
-            channel: 0,
-            dir: DmaDirection::S2mm,
-            bd_id: 0x7,
-        };
-        let mm2s = DeviceOp::DmaStart {
-            tile: t(0, 0),
-            channel: 1,
-            dir: DmaDirection::Mm2s,
-            bd_id: 0x3,
-        };
-        assert!(matches!(
-            s2mm,
-            DeviceOp::DmaStart { dir: DmaDirection::S2mm, channel: 0, bd_id: 0x7, .. }
-        ));
-        assert!(matches!(
-            mm2s,
-            DeviceOp::DmaStart { dir: DmaDirection::Mm2s, channel: 1, bd_id: 0x3, .. }
-        ));
+        let s2mm = DeviceOp::DmaStart { tile: t(0, 0), channel: 0, dir: DmaDirection::S2mm, bd_id: 0x7 };
+        let mm2s = DeviceOp::DmaStart { tile: t(0, 0), channel: 1, dir: DmaDirection::Mm2s, bd_id: 0x3 };
+        assert!(matches!(s2mm, DeviceOp::DmaStart { dir: DmaDirection::S2mm, channel: 0, bd_id: 0x7, .. }));
+        assert!(matches!(mm2s, DeviceOp::DmaStart { dir: DmaDirection::Mm2s, channel: 1, bd_id: 0x3, .. }));
     }
 
     #[test]
     fn mask_poll_constructs() {
-        let op = DeviceOp::MaskPoll {
-            tile: t(0, 2),
-            offset: 0x1D004,
-            mask: 0x3,
-            expected: 0x2,
-        };
+        let op = DeviceOp::MaskPoll { tile: t(0, 2), offset: 0x1D004, mask: 0x3, expected: 0x2 };
         if let DeviceOp::MaskPoll { mask, expected, .. } = op {
             assert_eq!(mask, 0x3);
             assert_eq!(expected, 0x2);
