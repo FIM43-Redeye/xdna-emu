@@ -990,23 +990,6 @@ impl InterpreterEngine {
             }
         }
 
-        // Phase 3f: Commit per-cycle trace frames.
-        //
-        // Per AM020 event-time mode, a trace unit creates at most one frame
-        // per cycle. `notify_event` accumulates slot activity into a bitmask;
-        // committing here emits one Single/Multiple frame for this cycle.
-        // Without this step the mask only commits lazily on the next cycle's
-        // event, which can leave the last cycle's frame uncommitted past the
-        // simulation's natural end and inflate routing pressure for the
-        // uncommitted bytes when they eventually land at flush time.
-        {
-            let cycle = self.total_cycles;
-            for tile in &mut self.device.array.tiles {
-                tile.core_trace.commit_cycle(cycle);
-                tile.mem_trace.commit_cycle(cycle);
-            }
-        }
-
         // Phase 3e: Tick tile timers and performance counters; route firings.
         //
         // Each tile has two 64-bit timers (core module and memory module)
@@ -1029,31 +1012,62 @@ impl InterpreterEngine {
         // 5..6). Each counter that crossed its threshold this cycle is fed
         // back through handle_event (so self-resetting configs can recycle)
         // and forwarded to the owning module's trace unit.
-        const PERF_CNT_BASE: u8 = 5;
-        let cycle = self.total_cycles;
-        for (i, tile) in self.device.array.tiles.iter_mut().enumerate() {
-            tile.core_timer.tick();
-            tile.mem_timer.tick();
+        //
+        // ORDERING: this phase runs *before* Phase 3f (commit_cycle) so that
+        // perfcnt notify_event() calls accumulate into the same cycle's
+        // pending_slot_mask as TRUE/edge-detector events. AM020 specifies
+        // one frame per cycle: when multiple events fire in cycle N, they
+        // must be coalesced into a single Multiple frame, not split across
+        // two frames.
+        {
+            const PERF_CNT_BASE: u8 = 5;
+            let cycle = self.total_cycles;
+            for (i, tile) in self.device.array.tiles.iter_mut().enumerate() {
+                tile.core_timer.tick();
+                tile.mem_timer.tick();
 
-            let core_active = self.cores.get(i).map_or(false, |c| c.active_this_cycle);
-            let core_fired = if core_active {
-                tile.core_perf_counters.tick_active_cycles()
-            } else {
-                tile.core_perf_counters.tick_idle_cycles()
-            };
-            for cnt_idx in core_fired {
-                let hw_id = PERF_CNT_BASE + cnt_idx as u8;
-                // Feed back so self-reset configs work, then trace-notify.
-                tile.core_perf_counters.handle_event(hw_id);
-                tile.notify_core_trace_event(hw_id, cycle);
+                let core_active = self.cores.get(i).map_or(false, |c| c.active_this_cycle);
+                let core_fired = if core_active {
+                    tile.core_perf_counters.tick_active_cycles()
+                } else {
+                    tile.core_perf_counters.tick_idle_cycles()
+                };
+                for cnt_idx in core_fired {
+                    let hw_id = PERF_CNT_BASE + cnt_idx as u8;
+                    // Feed back so self-reset configs work, then trace-notify.
+                    tile.core_perf_counters.handle_event(hw_id);
+                    tile.notify_core_trace_event(hw_id, cycle);
+                }
+
+                // Memory module perf counters tick unconditionally.
+                let mem_fired = tile.mem_perf_counters.tick_active_cycles();
+                for cnt_idx in mem_fired {
+                    let hw_id = PERF_CNT_BASE + cnt_idx as u8;
+                    tile.mem_perf_counters.handle_event(hw_id);
+                    tile.notify_mem_trace_event(hw_id, cycle);
+                }
             }
+        }
 
-            // Memory module perf counters tick unconditionally.
-            let mem_fired = tile.mem_perf_counters.tick_active_cycles();
-            for cnt_idx in mem_fired {
-                let hw_id = PERF_CNT_BASE + cnt_idx as u8;
-                tile.mem_perf_counters.handle_event(hw_id);
-                tile.notify_mem_trace_event(hw_id, cycle);
+        // Phase 3f: Commit per-cycle trace frames.
+        //
+        // Per AM020 event-time mode, a trace unit creates at most one frame
+        // per cycle. `notify_event` accumulates slot activity into a bitmask;
+        // committing here emits one Single/Multiple frame for this cycle.
+        // Without this step the mask only commits lazily on the next cycle's
+        // event, which can leave the last cycle's frame uncommitted past the
+        // simulation's natural end and inflate routing pressure for the
+        // uncommitted bytes when they eventually land at flush time.
+        //
+        // This phase MUST run after all event-emitting phases (3a-3e) so
+        // every event for `cycle` is already in pending_slot_mask. Otherwise
+        // events that fire after the commit get carried into the next
+        // cycle's frame, splitting a HW Multiple frame into two.
+        {
+            let cycle = self.total_cycles;
+            for tile in &mut self.device.array.tiles {
+                tile.core_trace.commit_cycle(cycle);
+                tile.mem_trace.commit_cycle(cycle);
             }
         }
 
@@ -1720,6 +1734,134 @@ mod tests {
             "trace has only {} encoded bytes (just the start marker): \
              perfcnt threshold was not routed to trace unit",
             encoded
+        );
+    }
+
+    /// Verifies AM020 "one frame per cycle" invariant when a perf counter
+    /// fires in the same cycle as another slot event (here, TRUE).
+    ///
+    /// HW emits a single Multiple frame whose mask carries both slot bits.
+    /// The emulator must do the same; if Phase 3e (perfcnt route) ran AFTER
+    /// Phase 3f (commit_cycle), the perfcnt notify would land in the next
+    /// cycle's pending_slot_mask, splitting one HW frame into two emulator
+    /// frames.
+    ///
+    /// Setup: counter 0 fires at cycle 4 (threshold=5, 5 ticks across cycles
+    /// 0..4). Trace slots: slot 0 = PERF_CNT_0 (hw_id=5), slot 1 = TRUE
+    /// (hw_id=1). After 6 steps the byte buffer contains an 8-byte Start
+    /// marker plus a stream of Single0 TRUE frames, with one Multiple0
+    /// frame at cycle 4 carrying mask=0b11.
+    ///
+    /// Multiple0 byte format (from encode_multiple):
+    ///   byte0 = 0xC0 | (mask >> 4)
+    ///   byte1 = ((mask & 0x0F) << 4) | (delta & 0x0F)
+    /// For mask=0b00000011: byte0=0xC0, byte1=0x30 | delta.
+    #[test]
+    fn test_perfcnt_and_true_same_cycle_coalesce_into_multiple_frame() {
+        let mut engine = InterpreterEngine::new_npu1();
+
+        engine.enable_core(0, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+            tile.write_program(0, &[0x00u8; 256]);
+        }
+
+        // Perf counter 0: start=TRUE(1), threshold=5. Fires at cycle 4.
+        {
+            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let ctrl0 = 1u32 | (0u32 << 8);
+            tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
+            tile.core_perf_counters.write_event_value(0, 5);
+            tile.core_perf_counters.handle_event(1); // arm
+        }
+
+        // Trace: start=TRUE(1), slot 0 = PERF_CNT_0 (5), slot 1 = TRUE (1).
+        {
+            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let ctrl0 = (0u32 << 24) | (1u32 << 16) | 0u32;
+            tile.core_trace.write_register(0x00, ctrl0);
+            // Trace_Event0: slot0=5 (PERF_CNT_0), slot1=1 (TRUE), slot2=0, slot3=0
+            let evt0 = 5u32 | (1u32 << 8);
+            tile.core_trace.write_register(0x10, evt0);
+        }
+
+        // 6 steps covers: trace start at cycle 0, TRUE frames at 1..3, the
+        // coalesced frame at cycle 4, plus one more cycle so cycle 4's frame
+        // is committed (commit_cycle in same step runs after notify, so the
+        // cycle-4 frame is committed at end of cycle 4 itself).
+        let _ = engine.run(6);
+
+        let bytes = engine
+            .device()
+            .array
+            .tile(0, 2)
+            .core_trace
+            .encoded_bytes()
+            .to_vec();
+
+        // Skip the 8-byte Start marker (byte 0 = 0xF0 + 7 timer bytes).
+        assert_eq!(
+            bytes.first().copied(),
+            Some(0xF0),
+            "expected Start marker as first byte; got buffer {:02X?}",
+            bytes
+        );
+        assert!(
+            bytes.len() > 8,
+            "buffer must hold more than just the Start marker; got {:02X?}",
+            bytes
+        );
+
+        // Walk the post-marker bytes and locate any Multiple0 frame.
+        // Multiple0 has top 4 bits = 0b1100, so byte0 & 0xF0 == 0xC0.
+        // Single0 has top bit = 0 (byte < 0x80), Single1 = 0x80..0x9F,
+        // Single2 = 0xA0..0xBF.
+        //
+        // We expect exactly one Multiple0 frame (at cycle 4) with mask=0b11.
+        let mut multiple_count = 0usize;
+        let mut multiple_with_mask_3 = 0usize;
+        let mut i = 8; // past Start marker
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b & 0xF0 == 0xC0 {
+                // Multiple0: 2 bytes
+                multiple_count += 1;
+                let mask_hi = b & 0x0F;
+                let byte1 = bytes.get(i + 1).copied().unwrap_or(0);
+                let mask_lo = (byte1 >> 4) & 0x0F;
+                let mask = (mask_hi << 4) | mask_lo;
+                if mask == 0b0000_0011 {
+                    multiple_with_mask_3 += 1;
+                }
+                i += 2;
+            } else if b & 0xFC == 0xD0 {
+                // Multiple1: 3 bytes
+                multiple_count += 1;
+                i += 3;
+            } else if b & 0xFC == 0xD4 {
+                // Multiple2: 4 bytes
+                multiple_count += 1;
+                i += 4;
+            } else if b & 0x80 == 0 {
+                // Single0: 1 byte
+                i += 1;
+            } else if b & 0xE0 == 0x80 {
+                // Single1: 2 bytes
+                i += 2;
+            } else if b & 0xE0 == 0xA0 {
+                // Single2: 3 bytes
+                i += 3;
+            } else {
+                // Unknown -- stop walking to avoid runaway.
+                break;
+            }
+        }
+
+        assert_eq!(
+            multiple_with_mask_3, 1,
+            "expected exactly one Multiple frame with mask=0b11 (TRUE+PERF_CNT_0 \
+             coalesced at cycle 4); got {} Multiple frames total, {} with mask=0b11. \
+             Buffer: {:02X?}",
+            multiple_count, multiple_with_mask_3, bytes
         );
     }
 }

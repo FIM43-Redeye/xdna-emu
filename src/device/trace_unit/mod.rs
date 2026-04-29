@@ -432,10 +432,19 @@ impl TraceUnit {
     ///
     /// Bytes accumulate as events are committed and are consumed when packed
     /// into 8-word packets. A non-zero value means at least one trace frame
-    /// has been encoded since the last flush. Useful for integration tests
-    /// that verify event routing without inspecting packet content.
-    pub fn encoded_bytes_len(&self) -> usize {
+    /// has been encoded since the last flush. Crate-internal accessor used
+    /// by integration tests that verify event routing without inspecting
+    /// packet content; not part of the external API.
+    pub(crate) fn encoded_bytes_len(&self) -> usize {
         self.byte_buffer.len()
+    }
+
+    /// Crate-internal read access to the encoded byte buffer for tests that
+    /// need to decode the exact frame layout (e.g., verifying same-cycle
+    /// events coalesce into one Multiple frame). Not part of the external API.
+    #[cfg(test)]
+    pub(crate) fn encoded_bytes(&self) -> &[u8] {
+        &self.byte_buffer
     }
 
     /// Flush any remaining bytes as a padded final packet.

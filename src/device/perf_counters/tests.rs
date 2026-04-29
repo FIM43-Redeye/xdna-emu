@@ -736,6 +736,63 @@ fn threshold_fires_once_at_event_value() {
     );
 }
 
+/// Self-reset path coverage: a counter whose `reset_event` matches its own
+/// PERF_CNT_N hw event (5 + counter_index) recycles when the wired feedback
+/// fires `handle_event(hw_id)` on threshold. This nails down the
+/// "self-resetting configs recycle" claim that motivates the coordinator's
+/// post-tick `handle_event(hw_id)` call in Phase 3e.
+///
+/// Mirrors the coordinator's loop:
+///   for cnt_idx in tick_active_cycles() {
+///       bank.handle_event(PERF_CNT_BASE + cnt_idx);   // self-reset feedback
+///       tile.notify_..._trace_event(...);
+///   }
+/// Plus an explicit re-arm via TRUE event each cycle (the coordinator does
+/// not currently broadcast TRUE to perf counter banks, so this test models
+/// that as a per-cycle handle_event(1) call). Verifies the counter fires
+/// twice within 12 cycles -- once at cycle 5, once at cycle 10.
+#[test]
+fn self_reset_counter_recycles_via_handle_event_feedback() {
+    const PERF_CNT_BASE: u8 = 5;
+    let mut bank = PerfCounterBank::new(4);
+
+    // Counter 0: start=TRUE(1), stop=NONE(0), threshold=5, reset=PERF_CNT_0(5).
+    let ctrl0 = 1u32 | (0u32 << 8);
+    bank.write_control_start_stop(ctrl0, 0, 1, 7);
+    bank.write_event_value(0, 5);
+    bank.write_control_reset(5u32, 7); // reset_event[0] = 5
+
+    bank.handle_event(1); // arm via TRUE
+    assert!(bank.is_active(0));
+
+    let mut firings = Vec::new();
+    for cycle in 1..=12 {
+        // Re-assert start each cycle so the post-reset Idle counter re-arms.
+        // (Real hardware: TRUE is always-asserted; coordinator does not yet
+        // wire TRUE to perf counter banks, so the unit test models it here.)
+        bank.handle_event(1);
+        let fired = bank.tick_active_cycles();
+        for cnt_idx in fired {
+            firings.push((cycle, cnt_idx));
+            // Mirror the coordinator's feedback: reset via own hw_id.
+            bank.handle_event(PERF_CNT_BASE + cnt_idx as u8);
+        }
+    }
+
+    assert_eq!(
+        firings,
+        vec![(5, 0), (10, 0)],
+        "self-reset counter should fire at cycles 5 and 10 (5-cycle period); \
+         got {:?}",
+        firings
+    );
+
+    // After cycle 10's reset, cycles 11 and 12 each re-arm and tick once,
+    // so the counter holds 2.
+    assert!(bank.is_active(0));
+    assert_eq!(bank.read_counter(0), 2);
+}
+
 #[test]
 fn deprecated_tick_shim_behaves_as_active_cycles() {
     // The deprecated tick() shim must forward to tick_active_cycles(),
