@@ -950,8 +950,16 @@ impl InterpreterEngine {
                         &crate::interpreter::state::EventType::MemoryStall { cycles: 1 },
                     );
                     if let Some(id) = hw_id {
-                        // MEMORY_STALL is a stall event; MemoryStall carries no pc field.
-                        // TODO: thread PC for synthetic MEMORY_STALL once available.
+                        // MEMORY_STALL fires from the core side, so HW would record
+                        // the core's current PC. We don't thread it because
+                        // EventType::MemoryStall carries `cycles: u8` but no `pc`
+                        // field, and snapshotting `self.cores[core_idx].context.pc()`
+                        // here conflicts with the &mut self.cores[core_idx] borrow
+                        // taken at line 958 below for ctx.
+                        // TODO: extend EventType::MemoryStall with `pc: Option<u32>`,
+                        // capture the core PC before the ctx borrow, then pass
+                        // Some(pc) here. Deferred: requires EventType change +
+                        // a small reorder of this block.
                         tile.notify_core_trace_event(id, cycle, None);
                     }
                 }
@@ -1950,7 +1958,8 @@ mod tests {
             bytes.len(), bytes
         );
 
-        // Decode the EventPC frame at bytes[8..12].
+        // bytes 0-7: Start marker (0xF1 + 7 timer bytes in EventPc mode).
+        // bytes 8-11: the EventPC frame for the InstrVector event.
         // encode_event_pc(mask=0b00000001, pc14=0x0100):
         //   byte0 = 0b1100_0100 | (mask >> 6 & 0b11) = 0xC4 | 0 = 0xC4
         //   byte1 = (mask & 0b0011_1111) << 2 = (1 & 63) << 2 = 0x04

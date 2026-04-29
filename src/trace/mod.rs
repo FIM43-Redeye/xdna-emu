@@ -137,7 +137,7 @@ pub fn core_event_to_hw_id(event: &EventType) -> Option<u8> {
 /// (MemoryStall, LockStall, StreamStall), memory-module events (DMA, lock, port),
 /// branch events, and any other variant whose PC is either not meaningful or not
 /// directly available at notify time.
-pub fn event_pc(event: &EventType) -> Option<u32> {
+pub(crate) fn event_pc(event: &EventType) -> Option<u32> {
     match event {
         EventType::InstrVector { pc }           |
         EventType::InstrLoad { pc }             |
@@ -149,6 +149,10 @@ pub fn event_pc(event: &EventType) -> Option<u32> {
         EventType::InstrStreamGet { pc }        |
         EventType::InstrStreamPut { pc }        => Some(*pc),
         EventType::InstrEvent { pc, .. }        => Some(*pc),
+        // If you add a new InstrXxx variant carrying `pc: u32`, add a matching
+        // arm above and extend `event_pc_extracts_from_instruction_variants` --
+        // otherwise the new variant will silently fall through to None and
+        // PC threading will break for it.
         _ => None,
     }
 }
