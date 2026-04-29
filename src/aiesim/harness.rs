@@ -177,16 +177,10 @@ impl AiesimHarness {
     /// - Contain `config/scsim_config.json` (the simulator's main config)
     pub fn validate_pkg_dir(path: &Path) -> Result<(), AiesimError> {
         if !path.exists() {
-            return Err(AiesimError::InvalidPackage(format!(
-                "directory does not exist: {}",
-                path.display()
-            )));
+            return Err(AiesimError::InvalidPackage(format!("directory does not exist: {}", path.display())));
         }
         if !path.is_dir() {
-            return Err(AiesimError::InvalidPackage(format!(
-                "not a directory: {}",
-                path.display()
-            )));
+            return Err(AiesimError::InvalidPackage(format!("not a directory: {}", path.display())));
         }
 
         let config_file = path.join("config/scsim_config.json");
@@ -220,11 +214,7 @@ impl AiesimHarness {
     pub fn run(config: &AiesimConfig) -> Result<AiesimResult, AiesimError> {
         // Resolve the package directory to an absolute path.
         let pkg_dir = config.pkg_dir.canonicalize().map_err(|e| {
-            AiesimError::InvalidPackage(format!(
-                "cannot resolve path {}: {}",
-                config.pkg_dir.display(),
-                e
-            ))
+            AiesimError::InvalidPackage(format!("cannot resolve path {}: {}", config.pkg_dir.display(), e))
         })?;
 
         Self::validate_pkg_dir(&pkg_dir)?;
@@ -252,10 +242,7 @@ impl AiesimHarness {
         }
 
         if config.cycle_timeout > 0 {
-            cmd.arg(format!(
-                "--simulation-cycle-timeout={}",
-                config.cycle_timeout
-            ));
+            cmd.arg(format!("--simulation-cycle-timeout={}", config.cycle_timeout));
         }
 
         // Run from the package directory's parent so relative paths in the
@@ -278,14 +265,7 @@ impl AiesimHarness {
         // Search for VCD files in the output directory.
         let vcd_path = Self::find_vcd(&output_dir);
 
-        let result = AiesimResult {
-            status: output.status,
-            vcd_path,
-            output_dir,
-            duration,
-            stdout,
-            stderr,
-        };
+        let result = AiesimResult { status: output.status, vcd_path, output_dir, duration, stdout, stderr };
 
         // Return the result even on non-zero exit -- the caller may want
         // to inspect stdout/stderr for diagnostics. Only return an error
@@ -367,11 +347,7 @@ mod tests {
         let err = AiesimHarness::validate_pkg_dir(Path::new("/nonexistent/pkg_dir_12345"));
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
-        assert!(
-            msg.contains("does not exist"),
-            "error should mention non-existence: {}",
-            msg
-        );
+        assert!(msg.contains("does not exist"), "error should mention non-existence: {}", msg);
     }
 
     #[test]
@@ -383,11 +359,7 @@ mod tests {
         let err = AiesimHarness::validate_pkg_dir(&tmp);
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
-        assert!(
-            msg.contains("not a directory"),
-            "error should mention not a directory: {}",
-            msg
-        );
+        assert!(msg.contains("not a directory"), "error should mention not a directory: {}", msg);
 
         fs::remove_file(&tmp).ok();
     }
@@ -401,11 +373,7 @@ mod tests {
         let err = AiesimHarness::validate_pkg_dir(&tmp);
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
-        assert!(
-            msg.contains("scsim_config.json"),
-            "error should mention missing config: {}",
-            msg
-        );
+        assert!(msg.contains("scsim_config.json"), "error should mention missing config: {}", msg);
 
         fs::remove_dir_all(&tmp).ok();
     }
@@ -443,10 +411,7 @@ mod tests {
 
         let found = AiesimHarness::find_vcd(&tmp);
         assert!(found.is_some(), "should find the .vcd file");
-        assert_eq!(
-            found.unwrap().file_name().unwrap().to_str().unwrap(),
-            "default.vcd"
-        );
+        assert_eq!(found.unwrap().file_name().unwrap().to_str().unwrap(), "default.vcd");
 
         fs::remove_dir_all(&tmp).ok();
     }
@@ -518,10 +483,6 @@ mod tests {
             binary_override: None,
         };
         let err = AiesimHarness::run(&config).unwrap_err();
-        assert!(
-            matches!(err, AiesimError::InvalidPackage(_)),
-            "expected InvalidPackage, got: {}",
-            err
-        );
+        assert!(matches!(err, AiesimError::InvalidPackage(_)), "expected InvalidPackage, got: {}", err);
     }
 }
