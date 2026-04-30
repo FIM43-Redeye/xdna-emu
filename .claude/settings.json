@@ -1,4 +1,7 @@
 {
+  "env": {
+    "BASH_ENV": "/home/triple/npu-work/toolchain-build/claude-bash-init.sh"
+  },
   "hooks": {
     "PostToolUse": [
       {
