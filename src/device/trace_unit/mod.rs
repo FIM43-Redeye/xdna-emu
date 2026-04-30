@@ -116,21 +116,13 @@ enum PendingMode2Frame {
     Lc { flag: u8, count: u32 },
 }
 
-/// Derive the LC frame's bit-28 flag from the loop boundary state.
-///
-/// **Placeholder rule**: until Phase 0 reverse-engineering lands the
-/// HW-observed semantics, we use a "last iteration" heuristic -- flag = 1
-/// iff this iteration's decrement brought LC to 0. When the findings doc
-/// at `docs/superpowers/findings/2026-04-29-mode2-lc-flag-semantics.md`
-/// lands, this rule MUST be replaced with the pinned semantics, and any
-/// emu-side LC-flag divergences in bridge tests should disappear.
-fn compute_lc_flag(_lc_before: u32, lc_after: u32) -> u8 {
-    if lc_after == 0 {
-        1
-    } else {
-        0
-    }
-}
+// Mode-2 LC frame bit-28 ("flag") is held at 0 by HW for all observed
+// normal ZOL executions on Phoenix (NPU1, AIE2). 576 LC frames captured
+// across N in {1,2,4,8,16,64,256,1024,16384} -- zero flag=1 sightings.
+// See docs/superpowers/findings/2026-04-30-mode2-lc-flag-semantics.md.
+// The exact trigger for flag=1 is unknown; nested-loop save/restore and
+// branch-out-of-loop are the leading suspects but were not reproduced
+// in our fixtures.
 
 /// Hardware trace unit for one tile module (Core or Memory).
 ///
@@ -199,6 +191,13 @@ pub struct TraceUnit {
     /// commit_pending_frame.
     pending_mode2_frames: Vec<PendingMode2Frame>,
 
+    // Mode-2 only: true while we are inside an active ZOL run (between the
+    // first iteration's LE_PC boundary and the iteration where LC reaches 0).
+    // HW emits exactly one LC frame per ZOL invocation, at the start, with
+    // count = trip count. We use this flag to suppress per-iteration LC
+    // emissions in `notify_loop_boundary`.
+    mode2_zol_active: bool,
+
     // -- Tile identity (for packet headers) --
     /// Column of the owning tile.
     col: u8,
@@ -234,6 +233,7 @@ impl TraceUnit {
             pending_word_bits: 0,
             pending_atoms_run: None,
             pending_mode2_frames: Vec::new(),
+            mode2_zol_active: false,
             col,
             row,
             configured: false,
@@ -462,6 +462,7 @@ impl TraceUnit {
         // Check for start/stop events
         if self.state == TraceState::Idle && hw_event_id == self.start_event {
             self.state = TraceState::Running;
+            self.mode2_zol_active = false;
             self.timer = cycle;
             // last_event_cycle is read only by mode-0's commit_pending_frame.
             // In mode 1 it's set here but unused; if a trace unit is ever
@@ -487,6 +488,7 @@ impl TraceUnit {
 
         if self.state == TraceState::Running && hw_event_id == self.stop_event {
             self.state = TraceState::Stopped;
+            self.mode2_zol_active = false;
             log::debug!("TraceUnit ({},{}) stopped at cycle {}", self.col, self.row, cycle);
             if matches!(self.mode, TraceMode::Execution) {
                 // Drain any pending mode-2 state, then emit Stop.
@@ -569,17 +571,27 @@ impl TraceUnit {
         self.pending_mode2_frames.push(PendingMode2Frame::NewPc { pc });
     }
 
-    /// Mode-2 only: queue an LC frame for the current cycle.
-    /// Flag bit semantics pinned by Phase 0 (deferred); see
-    /// docs/superpowers/findings/2026-04-29-mode2-lc-flag-semantics.md
-    /// when Phase 0 lands.
+    /// Mode-2 only: called at every ZOL iteration's LE_PC boundary.
+    ///
+    /// HW emits exactly one LC frame per ZOL invocation -- at the first
+    /// iteration -- with `count` set to the trip count loaded into LC at
+    /// loop start (the value `lc_before` carries on the first call) and
+    /// `flag` always 0. Subsequent iterations of the same ZOL produce
+    /// no LC frame; the per-cycle E_atom / N_atom stream already records
+    /// the body's execution. See
+    /// docs/superpowers/findings/2026-04-30-mode2-lc-flag-semantics.md.
     pub fn notify_loop_boundary(&mut self, _cycle: u64, lc_before: u32, lc_after: u32) {
         if !self.is_mode2_running() {
             return;
         }
-        let flag = compute_lc_flag(lc_before, lc_after);
-        let count = lc_before & 0x0FFFFFFF;
-        self.pending_mode2_frames.push(PendingMode2Frame::Lc { flag, count });
+        if !self.mode2_zol_active {
+            let count = lc_before & 0x0FFFFFFF;
+            self.pending_mode2_frames.push(PendingMode2Frame::Lc { flag: 0, count });
+            self.mode2_zol_active = true;
+        }
+        if lc_after == 0 {
+            self.mode2_zol_active = false;
+        }
     }
 
     /// True iff the trace unit is currently running.

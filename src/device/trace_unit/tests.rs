@@ -1203,6 +1203,70 @@ fn mode2_notify_when_idle_is_noop() {
 }
 
 #[test]
+fn mode2_notify_loop_boundary_emits_once_per_zol() {
+    // Phase 0 finding: HW emits exactly ONE LC frame per ZOL invocation,
+    // at loop start, with count = trip count and flag = 0. The interpreter
+    // calls notify_loop_boundary at every iteration's LE_PC; the trace_unit
+    // must dedupe and only emit on the first call.
+    let mut tu = TraceUnit::new(0, 1);
+    tu.set_packet_type(0);
+    tu.set_mode(TraceMode::Execution);
+    tu.set_event_slot(0, 1);
+    tu.set_start_event(1);
+    tu.notify_event(1, 0, None);
+
+    // Simulate an 8-iteration ZOL: lc_before walks 8,7,6,5,4,3,2,1; lc_after = lc_before-1.
+    for lc in (1..=8u32).rev() {
+        tu.notify_loop_boundary(0, lc, lc - 1);
+    }
+
+    let lc_frames: Vec<_> = tu
+        .pending_mode2_frames
+        .iter()
+        .filter(|f| matches!(f, super::PendingMode2Frame::Lc { .. }))
+        .collect();
+    assert_eq!(lc_frames.len(), 1, "expected exactly 1 LC frame, got {:?}", lc_frames);
+    match lc_frames[0] {
+        super::PendingMode2Frame::Lc { flag, count } => {
+            assert_eq!(*flag, 0, "flag should be 0 (Phase 0 finding)");
+            assert_eq!(*count, 8, "count should equal trip count, got {}", count);
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn mode2_notify_loop_boundary_back_to_back_zols() {
+    // Two ZOL invocations should produce two LC frames: state must reset
+    // when LC reaches 0 so the next ZOL's first iteration emits afresh.
+    let mut tu = TraceUnit::new(0, 1);
+    tu.set_packet_type(0);
+    tu.set_mode(TraceMode::Execution);
+    tu.set_event_slot(0, 1);
+    tu.set_start_event(1);
+    tu.notify_event(1, 0, None);
+
+    // First ZOL: 4 iterations.
+    for lc in (1..=4u32).rev() {
+        tu.notify_loop_boundary(0, lc, lc - 1);
+    }
+    // Second ZOL: 6 iterations.
+    for lc in (1..=6u32).rev() {
+        tu.notify_loop_boundary(0, lc, lc - 1);
+    }
+
+    let counts: Vec<u32> = tu
+        .pending_mode2_frames
+        .iter()
+        .filter_map(|f| match f {
+            super::PendingMode2Frame::Lc { count, .. } => Some(*count),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(counts, vec![4, 6], "expected one LC per ZOL with the trip count");
+}
+
+#[test]
 fn mode2_start_uses_real_pc_anchor() {
     let mut tu = TraceUnit::new(0, 1);
     tu.set_packet_type(0);
