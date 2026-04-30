@@ -100,7 +100,6 @@ pub(super) enum TraceState {
 
 /// In-flight RLE state for consecutive atoms of the same polarity.
 /// Only used in mode-2 (Execution); never set in other modes.
-#[allow(dead_code)] // activated by mode-2 atom emitter (Task 1.8); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
 #[derive(Debug, Clone, Copy)]
 struct AtomRun {
     /// True for E_atom (executed), false for N_atom (stalled).
@@ -111,11 +110,26 @@ struct AtomRun {
 
 /// A non-atom frame queued for the current cycle (mode-2 only).
 /// Drained by drain_mode2_pending() at cycle commit.
-#[allow(dead_code)] // activated by mode-2 New_PC / LC encoders (Task 1.9); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
 #[derive(Debug, Clone, Copy)]
 enum PendingMode2Frame {
     NewPc { pc: u16 },
     Lc { flag: u8, count: u32 },
+}
+
+/// Derive the LC frame's bit-28 flag from the loop boundary state.
+///
+/// **Placeholder rule**: until Phase 0 reverse-engineering lands the
+/// HW-observed semantics, we use a "last iteration" heuristic -- flag = 1
+/// iff this iteration's decrement brought LC to 0. When the findings doc
+/// at `docs/superpowers/findings/2026-04-29-mode2-lc-flag-semantics.md`
+/// lands, this rule MUST be replaced with the pinned semantics, and any
+/// emu-side LC-flag divergences in bridge tests should disappear.
+fn compute_lc_flag(_lc_before: u32, lc_after: u32) -> u8 {
+    if lc_after == 0 {
+        1
+    } else {
+        0
+    }
 }
 
 /// Hardware trace unit for one tile module (Core or Memory).
@@ -178,15 +192,11 @@ pub struct TraceUnit {
     pending_word_bits: u8,
 
     /// In-flight RLE state for consecutive E/N atoms (mode-2 only).
-    #[allow(dead_code)]
-    // populated by mode-2 atom emitter (Task 1.8); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
     pending_atoms_run: Option<AtomRun>,
 
     /// Non-atom frames (New_PC, LC) queued for the current cycle
     /// (mode-2 only). Drained by drain_mode2_pending() in
     /// commit_pending_frame.
-    #[allow(dead_code)]
-    // populated by mode-2 New_PC / LC encoders (Task 1.9); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
     pending_mode2_frames: Vec<PendingMode2Frame>,
 
     // -- Tile identity (for packet headers) --
@@ -462,9 +472,16 @@ impl TraceUnit {
             self.last_event_cycle = cycle;
             self.pending_cycle = cycle;
             self.pending_slot_mask = 0;
-            // Emit a Start marker with the current timer value.
-            // Mode 1 uses 0xF1 (bit 0 set) to distinguish from mode 0's 0xF0.
-            self.encode_start(cycle);
+            // Emit a Start marker. Mode 0 emits the timer-sync byte
+            // sequence (0xF0); mode 1 uses 0xF1; mode 2 uses its own
+            // Start long frame with the anchor PC.
+            match self.mode {
+                TraceMode::Execution => {
+                    let anchor_pc = pc.map(|p| (p & 0x3FFF) as u16).unwrap_or(0);
+                    self.encode_mode2_start(anchor_pc);
+                }
+                _ => self.encode_start(cycle),
+            }
             log::debug!("TraceUnit ({},{}) started at cycle {}", self.col, self.row, cycle);
             return;
         }
@@ -472,6 +489,11 @@ impl TraceUnit {
         if self.state == TraceState::Running && hw_event_id == self.stop_event {
             self.state = TraceState::Stopped;
             log::debug!("TraceUnit ({},{}) stopped at cycle {}", self.col, self.row, cycle);
+            if matches!(self.mode, TraceMode::Execution) {
+                // Drain any pending mode-2 state, then emit Stop.
+                self.drain_mode2_pending();
+                self.encode_mode2_stop();
+            }
             // Flush remaining data as a final packet
             self.flush();
             return;
@@ -521,6 +543,55 @@ impl TraceUnit {
         }
     }
 
+    /// Mode-2 only: record that the core retired an instruction this cycle.
+    /// No-op outside `mode == Execution && state == Running`.
+    pub fn notify_core_active(&mut self, _cycle: u64) {
+        if !self.is_mode2_running() {
+            return;
+        }
+        self.append_atom_to_run(true);
+    }
+
+    /// Mode-2 only: record that the core stalled this cycle.
+    pub fn notify_core_stalled(&mut self, _cycle: u64) {
+        if !self.is_mode2_running() {
+            return;
+        }
+        self.append_atom_to_run(false);
+    }
+
+    /// Mode-2 only: queue a New_PC frame for the current cycle.
+    /// Drained alongside the cycle's atom by commit_cycle.
+    pub fn notify_branch_taken(&mut self, _cycle: u64, retire_pc: u32) {
+        if !self.is_mode2_running() {
+            return;
+        }
+        let pc = (retire_pc & 0x3FFF) as u16;
+        self.pending_mode2_frames.push(PendingMode2Frame::NewPc { pc });
+    }
+
+    /// Mode-2 only: queue an LC frame for the current cycle.
+    /// Flag bit semantics pinned by Phase 0 (deferred); see
+    /// docs/superpowers/findings/2026-04-29-mode2-lc-flag-semantics.md
+    /// when Phase 0 lands.
+    pub fn notify_loop_boundary(&mut self, _cycle: u64, lc_before: u32, lc_after: u32) {
+        if !self.is_mode2_running() {
+            return;
+        }
+        let flag = compute_lc_flag(lc_before, lc_after);
+        let count = lc_before & 0x0FFFFFFF;
+        self.pending_mode2_frames.push(PendingMode2Frame::Lc { flag, count });
+    }
+
+    /// True iff the trace unit is currently running.
+    pub fn is_running(&self) -> bool {
+        self.state == TraceState::Running
+    }
+
+    fn is_mode2_running(&self) -> bool {
+        matches!(self.mode, TraceMode::Execution) && self.is_running()
+    }
+
     /// Commit any accumulated slot activity for cycles <= `cycle`.
     ///
     /// Called by the coordinator at the end of every cycle in which one or
@@ -531,11 +602,16 @@ impl TraceUnit {
         if self.state != TraceState::Running {
             return;
         }
-        if self.pending_slot_mask == 0 {
-            return;
-        }
-        if self.pending_cycle > cycle {
-            return;
+        // Mode-2 doesn't use the slot-based mask; it always drains its
+        // own per-cycle queues. Mode 0/1 only commit when at least one
+        // event fired this cycle.
+        if !matches!(self.mode, TraceMode::Execution) {
+            if self.pending_slot_mask == 0 {
+                return;
+            }
+            if self.pending_cycle > cycle {
+                return;
+            }
         }
         self.commit_pending_frame();
     }
@@ -616,6 +692,16 @@ impl TraceUnit {
             self.commit_pending_frame();
         }
 
+        // Mode-2: drain any in-flight atom run / queued frames, then
+        // align the pending bit accumulator out to a 32-bit word so
+        // the byte buffer captures all encoded data before padding.
+        if matches!(self.mode, TraceMode::Execution) {
+            self.drain_mode2_pending();
+            if self.pending_word_bits > 0 {
+                self.align_to_word_via_filler0();
+            }
+        }
+
         if self.byte_buffer.is_empty() {
             return;
         }
@@ -652,7 +738,9 @@ impl TraceUnit {
     /// This matches AM020/AM025 behavior and the mode1.py decoder.
     fn commit_pending_frame(&mut self) {
         let mask = self.pending_slot_mask;
-        if mask == 0 {
+        // Mode-2 doesn't gate on the slot mask; the drain handles its
+        // own queues. Other modes early-return when no slot fired.
+        if mask == 0 && !matches!(self.mode, TraceMode::Execution) {
             return;
         }
         self.pending_slot_mask = 0;
@@ -683,11 +771,15 @@ impl TraceUnit {
                 }
                 self.encode_event_pc(mask, pc14);
             }
-            TraceMode::Execution | TraceMode::Reserved => {
-                // Mode 2 not implemented per A.2 spec; mode 3 is reserved.
-                // Skip rather than corrupt the stream.  Mode 2 work is
-                // tracked in docs/superpowers/findings/
-                // 2026-04-28-a2b-mode2-decoder-deferred.md
+            TraceMode::Execution => {
+                // Mode-2 doesn't use the slot-based mask. Atoms are
+                // queued via notify_core_active/stalled, branches via
+                // notify_branch_taken, loop boundaries via
+                // notify_loop_boundary. Drain here at cycle commit.
+                self.drain_mode2_pending();
+            }
+            TraceMode::Reserved => {
+                // mode 3 not defined per xaie_trace.h; ignore.
             }
         }
         self.try_emit_packet();
@@ -844,14 +936,12 @@ impl TraceUnit {
 
     /// Encode a single E_atom (executed=true) or N_atom (executed=false).
     /// 4-bit frame: 0001 for E, 0000 for N.
-    #[allow(dead_code)] // consumed by mode-2 coordinator wiring (Phase 3 Task 3.1); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
     fn encode_atom(&mut self, executed: bool) {
         let prefix = if executed { 0b0001 } else { 0b0000 };
         self.push_bits(prefix, 4);
     }
 
     /// Encode a New_PC frame: 2-bit prefix `10` + 14-bit PC.
-    #[allow(dead_code)] // consumed by mode-2 coordinator wiring (Phase 3 Task 3.2); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
     fn encode_new_pc(&mut self, pc: u16) {
         debug_assert!(pc < (1 << 14), "PC {:#x} exceeds 14 bits", pc);
         let frame = (0b10u32 << 14) | (pc as u32 & 0x3FFF);
@@ -865,7 +955,6 @@ impl TraceUnit {
     /// The flag bit's semantics are pinned by Phase 0 reverse-engineering
     /// (see docs/superpowers/findings/2026-04-29-mode2-lc-flag-semantics.md
     /// when Phase 0 lands).
-    #[allow(dead_code)] // consumed by mode-2 coordinator wiring (Phase 3 Task 3.3); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
     fn encode_lc(&mut self, flag: u8, count: u32) {
         debug_assert!(flag <= 1, "LC flag must be 0 or 1");
         debug_assert!(count < (1u32 << 28), "LC count exceeds 28 bits");
@@ -874,7 +963,6 @@ impl TraceUnit {
     }
 
     /// Encode a Repeat0 frame: 4-bit prefix 1110 + 4-bit count.
-    #[allow(dead_code)] // consumed by RLE flush state machine (Task 1.8); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
     fn encode_repeat0(&mut self, n: u8) {
         debug_assert!(n < 16, "Repeat0 count {} exceeds 4 bits", n);
         let frame = (0b1110u32 << 4) | (n as u32 & 0xF);
@@ -882,7 +970,6 @@ impl TraceUnit {
     }
 
     /// Encode a Repeat1 frame: 6-bit prefix 110110 + 10-bit count.
-    #[allow(dead_code)] // consumed by RLE flush state machine (Task 1.8); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
     fn encode_repeat1(&mut self, n: u16) {
         debug_assert!(n < 1024, "Repeat1 count {} exceeds 10 bits", n);
         let frame = (0b110110u32 << 10) | (n as u32 & 0x3FF);
@@ -891,7 +978,6 @@ impl TraceUnit {
 
     /// Encode a mode-2 Start frame: 5-bit prefix 11110 + 1-bit flag
     /// (0 = initial start) + 12 reserved bits + 14-bit anchor PC.
-    #[allow(dead_code)] // consumed by mode-2 segment-boundary wiring (Task 1.9); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
     fn encode_mode2_start(&mut self, anchor_pc: u16) {
         debug_assert!(anchor_pc < (1 << 14));
         let word = (0b11110u32 << 27) | (anchor_pc as u32 & 0x3FFF);
@@ -900,7 +986,6 @@ impl TraceUnit {
 
     /// Encode a mode-2 Stop frame: 6-bit prefix 110111 + 26 reserved
     /// bits.
-    #[allow(dead_code)] // consumed by mode-2 segment-boundary wiring (Task 1.9); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
     fn encode_mode2_stop(&mut self) {
         let word = 0b110111u32 << 26;
         self.emit_long_frame(word);
@@ -912,7 +997,6 @@ impl TraceUnit {
     /// The flush itself caps each Repeat1 chunk at 10 bits (1023), so a
     /// run can grow arbitrarily large -- chaining is handled at flush
     /// time, not on append.
-    #[allow(dead_code)] // consumed by mode-2 coordinator wiring (Phase 3 Task 3.1); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
     fn append_atom_to_run(&mut self, executed: bool) {
         match &mut self.pending_atoms_run {
             Some(run) if run.exec == executed => {
@@ -941,7 +1025,6 @@ impl TraceUnit {
     ///   count <= 1024  : atom + Repeat1(count - 1)   [10-bit field, 0..1023]
     ///   count >  1024  : atom + chained Repeat1 frames (1023 each, then
     ///                    a final shorter Repeat1 for the remainder)
-    #[allow(dead_code)] // consumed by mode-2 coordinator wiring + drain_mode2_pending (Task 1.9 / Phase 3); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
     fn flush_atoms_run(&mut self) {
         let Some(run) = self.pending_atoms_run.take() else {
             return;
@@ -961,13 +1044,26 @@ impl TraceUnit {
         }
     }
 
+    /// Mode-2 per-cycle drain: flush the in-flight atom run, then any
+    /// queued non-atom frames in the order they were recorded.
+    fn drain_mode2_pending(&mut self) {
+        // Flush atoms run first (atom precedes PC/LC for current cycle
+        // per the spec's ordering rule).
+        self.flush_atoms_run();
+        for frame in std::mem::take(&mut self.pending_mode2_frames) {
+            match frame {
+                PendingMode2Frame::NewPc { pc } => self.encode_new_pc(pc),
+                PendingMode2Frame::Lc { flag, count } => self.encode_lc(flag, count),
+            }
+        }
+    }
+
     /// Push `count` bits of `value` MSB-first into the bit accumulator.
     /// Used by mode-2 frame encoders only. Triggers flush_word_if_full
     /// after each push.
     ///
     /// `count` must be <= 32. `value` must fit in `count` bits (caller
     /// invariant; debug_assert enforced).
-    #[allow(dead_code)] // consumed by mode-2 frame encoders (Tasks 1.2-1.7); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
     fn push_bits(&mut self, value: u32, count: u8) {
         debug_assert!(count <= 32);
         debug_assert!(count == 32 || value < (1u32 << count));
@@ -983,7 +1079,6 @@ impl TraceUnit {
 
     /// If 32 bits are accumulated, push as 4 big-endian bytes to
     /// byte_buffer and reset the accumulator. No-op otherwise.
-    #[allow(dead_code)] // called from push_bits (Tasks 1.2-1.7); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
     fn flush_word_if_full(&mut self) {
         if self.pending_word_bits < 32 {
             return;
@@ -1005,7 +1100,6 @@ impl TraceUnit {
     /// word has a multiple of 4 bits already accumulated. That
     /// invariant is upheld by all mode-2 frame encoders, which only
     /// push 4-, 8-, 16-, or 32-bit frames. Debug-asserted.
-    #[allow(dead_code)] // consumed by emit_long_frame (Task 1.2) and mode-2 encoders (Tasks 1.5-1.7); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
     fn align_to_word_via_filler0(&mut self) {
         if self.pending_word_bits == 0 {
             return;
