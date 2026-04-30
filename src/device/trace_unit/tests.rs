@@ -994,3 +994,26 @@ fn round_trip_new_pc() {
         .iter()
         .any(|f| matches!(f, crate::trace::mode2_decode::Mode2Frame::NewPc { pc: 0x0042 })));
 }
+
+#[test]
+fn round_trip_lc() {
+    let mut tu = TraceUnit::new(0, 1);
+    tu.encode_lc(1, 0xABCDEF);
+    let frames = crate::trace::mode2_decode::decode(tu.encoded_bytes());
+    assert!(frames
+        .iter()
+        .any(|f| matches!(f, crate::trace::mode2_decode::Mode2Frame::Lc { flag: 1, count: 0xABCDEF })));
+}
+
+#[test]
+fn round_trip_lc_after_partial_word() {
+    let mut tu = TraceUnit::new(0, 1);
+    tu.encode_atom(true); // 4 bits
+    tu.encode_atom(false); // 4 bits
+    tu.encode_lc(0, 8); // long frame: aligns first
+    let frames = crate::trace::mode2_decode::decode(tu.encoded_bytes());
+    let summary = crate::trace::mode2_decode::frame_summary(&frames);
+    // Expect E + N + 6 Filler0s + LC(0,8)
+    assert!(summary.contains("EN"));
+    assert!(summary.contains("LC(0,8)"));
+}

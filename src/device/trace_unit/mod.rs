@@ -858,6 +858,21 @@ impl TraceUnit {
         self.push_bits(frame, 16);
     }
 
+    /// Encode an LC (loop count) long frame: 3-bit prefix 010 +
+    /// 1-bit flag + 28-bit count = 32-bit total.
+    ///
+    /// Aligns to word boundary via Filler0 padding before emitting.
+    /// The flag bit's semantics are pinned by Phase 0 reverse-engineering
+    /// (see docs/superpowers/findings/2026-04-29-mode2-lc-flag-semantics.md
+    /// when Phase 0 lands).
+    #[allow(dead_code)] // consumed by mode-2 coordinator wiring (Phase 3 Task 3.3); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+    fn encode_lc(&mut self, flag: u8, count: u32) {
+        debug_assert!(flag <= 1, "LC flag must be 0 or 1");
+        debug_assert!(count < (1u32 << 28), "LC count exceeds 28 bits");
+        let word = (0b010u32 << 29) | ((flag as u32 & 1) << 28) | (count & 0x0FFFFFFF);
+        self.emit_long_frame(word);
+    }
+
     /// Push `count` bits of `value` MSB-first into the bit accumulator.
     /// Used by mode-2 frame encoders only. Triggers flush_word_if_full
     /// after each push.
@@ -921,7 +936,6 @@ impl TraceUnit {
 
     /// Emit a 32-bit "long frame" (Start, LC, Stop). Aligns to word
     /// boundary first via Filler0 padding, then pushes the whole word.
-    #[allow(dead_code)] // consumed by mode-2 Start/Stop/LC encoders (Tasks 1.5-1.7); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
     fn emit_long_frame(&mut self, word: u32) {
         self.align_to_word_via_filler0();
         debug_assert_eq!(self.pending_word_bits, 0);
