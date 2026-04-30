@@ -12,6 +12,7 @@
 
 use crate::device::dma::ChannelState;
 use crate::device::host_memory::HostMemory;
+use crate::device::trace_unit::TraceMode;
 use xdna_archspec::types::TileKind;
 use crate::device::DeviceState;
 use crate::parser::AieElf;
@@ -1092,7 +1093,18 @@ impl InterpreterEngine {
         // cycle's frame, splitting a HW Multiple frame into two.
         {
             let cycle = self.total_cycles;
-            for tile in &mut self.device.array.tiles {
+            for (i, tile) in self.device.array.tiles.iter_mut().enumerate() {
+                // Mode-2 only: emit per-cycle atom before commit. mem_trace
+                // doesn't get atoms (mode-2 is core-only per the regdb's
+                // single Mode bitfield on Core_Module.Trace_Control0).
+                if matches!(tile.core_trace.mode(), TraceMode::Execution) && tile.core_trace.is_running() {
+                    let core_active = self.cores.get(i).map_or(false, |c| c.active_this_cycle);
+                    if core_active {
+                        tile.core_trace.notify_core_active(cycle);
+                    } else {
+                        tile.core_trace.notify_core_stalled(cycle);
+                    }
+                }
                 tile.core_trace.commit_cycle(cycle);
                 tile.mem_trace.commit_cycle(cycle);
             }

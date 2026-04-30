@@ -274,7 +274,6 @@ impl TraceUnit {
     }
 
     /// Return the current operating mode.
-    #[cfg(test)]
     pub(crate) fn mode(&self) -> TraceMode {
         self.mode
     }
