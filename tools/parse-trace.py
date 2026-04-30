@@ -97,8 +97,14 @@ def parse_args():
             p.error("--server is mutually exclusive with --trace-bin / "
                     "--out-* flags; pass those in stdin requests instead")
     else:
-        if not args.trace_bin or not args.xclbin_mlir:
-            p.error("--trace-bin and --xclbin-mlir are required (or use --server)")
+        if not args.trace_bin:
+            p.error("--trace-bin is required (or use --server)")
+        # Mode 2 emits PC/atom records and never needs the MLIR for
+        # slot-name lookup, so --xclbin-mlir is optional there.  Modes
+        # 0 and 1 still require it.
+        if args.trace_mode != "inst_exec" and not args.xclbin_mlir:
+            p.error("--xclbin-mlir is required for trace_mode={!r} (or use "
+                    "--server)".format(args.trace_mode))
         if not any([args.out_events, args.out_cycles, args.out_perfetto, args.out_commands]):
             p.error("at least one --out-* option is required")
     return args
@@ -330,21 +336,22 @@ def decode_one_ours(np_mod, td_mod,
       --out-cycles     scalar max(ts) - min(ts) over emitted events.
 
     ``trace_mode`` selects the per-tile decoder; supported values are
-    ``"event_time"`` (mode 0, default) and ``"event_pc"`` (mode 1).
+    ``"event_time"`` (mode 0, default), ``"event_pc"`` (mode 1), and
+    ``"inst_exec"`` (mode 2).  Mode 2 has its own native output shape
+    (E/N_atom + New_PC + LC + Repeat + Start/Stop/Sync); see
+    ``_decode_mode2_to_outputs`` for details.
 
     --out-perfetto is supported for ``trace_mode='event_time'`` (mode 0)
     only -- modes 1 (PC anchors instead of cycle anchors) and 2 (per-
     cycle E_atom/N_atom records) don't have an established B/E pair
     convention yet, so we reject them rather than emit a malformed
     timeline.
-    """
-    if out_perfetto and trace_mode != "event_time":
-        raise ValueError(
-            f"--decoder=ours --out-perfetto: trace_mode={trace_mode!r} "
-            "not supported; only event_time (mode 0) emits Perfetto B/E "
-            "pairs in this iteration"
-        )
 
+    --out-cycles is rejected for mode 2 because mode-2 frames don't
+    carry cycle deltas in a form ``max(ts) - min(ts)`` would summarize
+    meaningfully -- the cycle count is the number of E/N_atom frames,
+    which downstream tools can derive from --out-events.
+    """
     mode_lookup = {
         "event_time": td_mod.TraceMode.EVENT_TIME,
         "event_pc": td_mod.TraceMode.EVENT_PC,
@@ -355,6 +362,26 @@ def decode_one_ours(np_mod, td_mod,
             f"--decoder=ours: unsupported trace_mode {trace_mode!r}; "
             f"expected one of {sorted(mode_lookup)}"
         )
+
+    if out_perfetto and trace_mode != "event_time":
+        raise ValueError(
+            f"--decoder=ours --out-perfetto: trace_mode={trace_mode!r} "
+            "not supported; only event_time (mode 0) emits Perfetto B/E "
+            "pairs in this iteration"
+        )
+
+    if trace_mode == "inst_exec":
+        # Mode 2 has a different command vocabulary (atoms, New_PC, LC)
+        # that doesn't fit the cycles/timeline model of modes 0/1, so it
+        # gets its own decode/emit path entirely.
+        return _decode_mode2_to_outputs(
+            np_mod, td_mod,
+            trace_bin=trace_bin,
+            out_events=out_events,
+            out_cycles=out_cycles,
+            out_commands=out_commands,
+        )
+
     mode_enum = mode_lookup[trace_mode]
 
     raw = np_mod.fromfile(trace_bin, dtype=np_mod.uint32)
@@ -420,6 +447,122 @@ def decode_one_ours(np_mod, td_mod,
         "events_count": len(flat),
         "cycles": cycles,
         "empty": (out_events or out_cycles) and not flat,
+    }
+
+
+def _mode2_cmd_to_dict(cmd) -> dict:
+    """Serialize one mode-2 ``TraceCommand`` to its fixture-shape dict.
+
+    Schema is the one frozen by
+    ``tools/trace_decoder/fixtures/mode2_mixed_r0_core_expected.json``
+    and used by ``test_trace_decoder.py::_mode2_cmd_to_dict`` -- the
+    canonical mode-2 emission format for this project.  Keeping the two
+    in lockstep means parse-trace.py output can be diffed directly
+    against fixtures without an adapter layer.
+    """
+    # Imported lazily inside the function so callers that never touch
+    # mode 2 don't pay for the modes/mode2 import.
+    from trace_decoder.modes.mode2 import CycleCmd, LoopCountCmd
+    from trace_decoder.frame import (
+        EventCmd, RepeatCmd, StartCmd, StopCmd, SyncCmd,
+    )
+
+    if isinstance(cmd, StartCmd):
+        return {"type": "Start", "anchor_pc": cmd.timer_value}
+    if isinstance(cmd, CycleCmd):
+        return {"type": "N_atom" if cmd.stalled else "E_atom"}
+    if isinstance(cmd, EventCmd):
+        # In mode 2 EventCmd is reused for New_PC; event_bits is always
+        # 0 and ``cycles`` carries the 14-bit absolute PC.
+        return {"type": "New_PC", "pc": cmd.cycles}
+    if isinstance(cmd, RepeatCmd):
+        return {"type": "Repeat", "count": cmd.count}
+    if isinstance(cmd, LoopCountCmd):
+        return {"type": "LC", "flag": cmd.flag, "count": cmd.count}
+    if isinstance(cmd, SyncCmd):
+        return {"type": "Sync"}
+    if isinstance(cmd, StopCmd):
+        return {"type": "Stop"}
+    raise AssertionError(f"unhandled mode-2 cmd: {cmd!r}")
+
+
+def _decode_mode2_to_outputs(np_mod, td_mod, *,
+                             trace_bin: str,
+                             out_events: str = None,
+                             out_cycles: str = None,
+                             out_commands: str = None) -> dict:
+    """Decode a mode-2 (INST_EXEC) trace and write per-tile event lists.
+
+    Output JSON shape (matches the frozen fixture schema):
+
+      {
+        "schema_version": 1,
+        "trace_mode": "inst_exec",
+        "tiles": {
+          "<pkt_type>,<row>,<col>": [
+            {"type": "Start", "anchor_pc": 816},
+            {"type": "New_PC", "pc": 368},
+            {"type": "E_atom"},
+            {"type": "N_atom"},
+            {"type": "LC", "flag": 1, "count": 8},
+            {"type": "Repeat", "count": 5},
+            {"type": "Sync"},
+            {"type": "Stop"}
+          ],
+          ...
+        }
+      }
+
+    Each per-tile list has the same shape as
+    ``mode2_mixed_r0_core_expected.json``, so single-tile fixtures can
+    be diffed via ``tiles["0,2,1"]`` directly.
+
+    --out-cycles is rejected (no cycle scalar in mode 2 -- callers can
+    count atoms in --out-events if they need a length proxy).
+    --out-commands is accepted as an alias for --out-events in mode 2;
+    the per-tile list is the typed command stream (no separate
+    Single/Multiple reshape happens).
+    """
+    if out_cycles:
+        raise ValueError(
+            "--decoder=ours --trace-mode=inst_exec: --out-cycles not "
+            "supported; mode 2 has no cycle delta to summarize. Count "
+            "atoms in --out-events for a length proxy."
+        )
+
+    raw = np_mod.fromfile(trace_bin, dtype=np_mod.uint32)
+    words = raw.tolist()
+
+    commands_per_tile = td_mod.decode_words(
+        words, mode=td_mod.TraceMode.INST_EXEC
+    )
+
+    tiles = {}
+    total_cmds = 0
+    for (pt, row, col), cmds in commands_per_tile.items():
+        key = f"{int(pt)},{row},{col}"
+        tiles[key] = [_mode2_cmd_to_dict(c) for c in cmds]
+        total_cmds += len(cmds)
+
+    payload = {
+        "schema_version": 1,
+        "trace_mode": "inst_exec",
+        "tiles": tiles,
+    }
+    if out_events:
+        Path(out_events).write_text(json.dumps(payload, indent=2))
+    if out_commands:
+        # Mode 2's typed-command output is already the per-tile list
+        # we just wrote; --out-commands is functionally an alias for
+        # --out-events here, but we honour it so callers can ask for
+        # both files without special-casing.
+        Path(out_commands).write_text(json.dumps(payload, indent=2))
+
+    return {
+        "ok": True,
+        "events_count": total_cmds,
+        "cycles": None,
+        "empty": (out_events or out_commands) and total_cmds == 0,
     }
 
 
