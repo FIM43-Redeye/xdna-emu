@@ -126,8 +126,8 @@ while [[ $# -gt 0 ]]; do
     --no-trace)            NO_TRACE=true; shift ;;
     --trace)               NO_TRACE=false; shift ;;
     --sweep)               SWEEP=true; shift ;;
-    --trace=pc-anchored)   PC_ANCHORED=true; shift ;;
-    --mode2)               MODE2=true; PC_ANCHORED=true; shift ;;
+    --trace=pc-anchored)   PC_ANCHORED=true; NO_TRACE=false; shift ;;
+    --mode2)               MODE2=true; PC_ANCHORED=true; NO_TRACE=false; shift ;;
     --aiesim)              RUN_AIESIM=true; shift ;;
     --serial-hw)           NPU_HW_JOBS=1; shift ;;
     --parallel-hw)         NPU_HW_JOBS="${NPU_HW_JOBS_PARALLEL:-5}"; shift ;;
@@ -3037,7 +3037,7 @@ main() {
               # Run trace-compare --pc-anchored on the sweep output.
               if "$tc_bin" --sweep "$sweep_dir" --pc-anchored -o "$report" 2>&1; then
                 local top_event
-                top_event="$(grep 'set_diff' "$report" | sort -t= -k2 -rn | head -1 | awk '{print $1}')"
+                top_event="$(grep 'set_diff' "$report" | sort -t '=' -k2 -rn | head -1 | awk '{print $1}')"
                 echo "  PC-ANCHORED compare $name ($compiler): OK (top event: ${top_event:-none}; report: $report)"
               else
                 echo "  PC-ANCHORED compare $name ($compiler): FAIL (see $report)"

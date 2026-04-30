@@ -129,13 +129,17 @@ def parse_args():
                         "(testing only -- skips injection)")
 
     # Trace mode.
-    p.add_argument("--trace-mode", choices=("event_time", "event_pc"),
+    p.add_argument("--trace-mode",
+                   choices=("event_time", "event_pc", "inst_exec"),
                    default="event_time",
                    help="trace mode for compute-core trace units. "
                         "event_time (mode 0, default) records cycle deltas; "
-                        "event_pc (mode 1) records PCs. Mode 1 is core-only -- "
-                        "memmod/memtile/shim trace units always remain in mode 0 "
-                        "(their Trace_Control0 has no Mode bitfield per regdb).")
+                        "event_pc (mode 1) records PCs; inst_exec (mode 2) "
+                        "records the executed instruction stream as a "
+                        "compressed bit-packed frame tree (LC/PC/atom/RLE). "
+                        "All three modes are core-only -- memmod/memtile/shim "
+                        "trace units always remain in mode 0 (their "
+                        "Trace_Control0 has no Mode bitfield per regdb).")
 
     # Grounding events (fixed slots, always present, never overwritten by sweep).
     p.add_argument("--core-grounding",
@@ -426,11 +430,10 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
         _core_sweep_defaults,
     )
     # Determine trace mode attribute for core tiles.
-    mode_attr = (
-        aied.TraceMode.EventPC
-        if args.trace_mode == "event_pc"
-        else aied.TraceMode.EventTime
-    )
+    mode_attr = {
+        "event_pc": aied.TraceMode.EventPC,
+        "inst_exec": aied.TraceMode.Execution,
+    }.get(args.trace_mode, aied.TraceMode.EventTime)
     # Whether to emit perf counter config blocks (only when PERF_CNT_0 is in grounding).
     emit_core_perfcnt = "PERF_CNT_0" in core_grounding_names
 
@@ -541,7 +544,7 @@ def main():
     # constraint applies to grounding too, but today the grounding flags are
     # inert (only sweep events drive injection), so warning on sweep alone is
     # the only condition that produces a misleading outcome.
-    if args.trace_mode == "event_pc" and any(
+    if args.trace_mode in ("event_pc", "inst_exec") and any(
         s for s in [
             args.memmod_sweep_events,
             args.memtile_sweep_events,
@@ -550,10 +553,10 @@ def main():
         if s
     ):
         print(
-            "warning: --trace-mode event_pc applies to compute-core trace units "
-            "only; memmod/memtile/shim trace units stay in event_time per regdb "
-            "(Mode bitfield exists only in core's Trace_Control0). Non-core "
-            "sweep events will be recorded in mode 0.",
+            f"warning: --trace-mode {args.trace_mode} applies to compute-core "
+            "trace units only; memmod/memtile/shim trace units stay in "
+            "event_time per regdb (Mode bitfield exists only in core's "
+            "Trace_Control0). Non-core sweep events will be recorded in mode 0.",
             file=sys.stderr,
         )
 
