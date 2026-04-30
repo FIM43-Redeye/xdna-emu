@@ -276,18 +276,38 @@ void
 platform_drv_emu::
 destroy_bo(shim_xdna::destroy_bo_arg& arg) const
 {
-  if (!delete_bo_info(arg.bo.handle))
-    return;
+  // Drain the base class's refcount entry, but do NOT use its return
+  // value to gate the actual free. The base class's delete_bo_info uses
+  // a refcount that load_bo_info bumps on every lookup -- and the EMU
+  // plugin calls load_bo_info during sync_bo, submit_cmd, and ctx
+  // configuration without a matching decrement (those are pure reads in
+  // our model). The result is that the base count never reaches 1, so
+  // delete_bo_info's "true (erase) on refcount==1" path never fires,
+  // and the legacy gate `if (!delete_bo_info(...)) return;` would skip
+  // the free forever -- the bug that left run 2+ trace BOs allocated
+  // at fresh addresses while the shim DMA channel still pointed at the
+  // run 1 address.
+  //
+  // Treat m_bo_map as the authoritative ownership record instead. xrt::bo
+  // destruction is the unambiguous "no more user-side refs" signal that
+  // triggered this destroy_bo call, so the first destroy for a handle
+  // should always free; subsequent destroys (e.g. from sub-handles XRT
+  // duplicates internally) find no entry in m_bo_map and become no-ops.
+  delete_bo_info(arg.bo.handle); // drain base-class entry; ignore result
 
   bo_entry entry{};
+  bool present = false;
   {
     const std::lock_guard<std::mutex> lock(m_bo_lock);
     auto it = m_bo_map.find(arg.bo.handle);
     if (it != m_bo_map.end()) {
       entry = it->second;
       m_bo_map.erase(it);
+      present = true;
     }
   }
+  if (!present)
+    return; // already freed by an earlier destroy_bo for this handle.
 
   // Regular BOs are backed by memfd (freed when fd is closed).
   // User-pointer BOs have caller-owned memory -- never freed by us.
