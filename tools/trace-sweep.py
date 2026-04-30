@@ -744,7 +744,7 @@ def _parse_trace_bin(
     trace_bin: Path,
     mlir: Path,
     events_out: Path,
-    cycles_out: Path,
+    cycles_out: Optional[Path],
     parse_log: Path,
     env_for_parse: Dict[str, str],
     parser_session: Optional[ParseSession] = None,
@@ -803,9 +803,10 @@ def _parse_trace_bin(
         "--trace-bin", str(trace_bin),
         "--xclbin-mlir", str(mlir),
         "--out-events", str(events_out),
-        "--out-cycles", str(cycles_out),
         "--trace-mode", trace_mode,
     ]
+    if cycles_out is not None:
+        parse_cmd.extend(["--out-cycles", str(cycles_out)])
     parse_env = env_for_parse.copy()
     parse_env["PYTHONPATH"] = str(MLIR_AIE_ROOT / "install" / "python")
     with parse_log.open("w") as lf:
@@ -816,14 +817,17 @@ def _parse_trace_bin(
         empty_markers = ("no timestamped events", "empty or all zeros")
         if any(m in log_text for m in empty_markers):
             events_out.write_text('{"schema_version":1,"events":[],"slot_names":{}}\n')
-            cycles_out.write_text("0\n")
+            if cycles_out is not None:
+                cycles_out.write_text("0\n")
             return True, None, 0, 0
         return False, f"parse-trace exit {rc}", None, None
 
-    try:
-        cycles = int(cycles_out.read_text().strip() or "0")
-    except ValueError:
-        cycles = 0
+    cycles = 0
+    if cycles_out is not None:
+        try:
+            cycles = int(cycles_out.read_text().strip() or "0")
+        except (ValueError, FileNotFoundError):
+            cycles = 0
     events_count = 0
     if events_out.exists():
         try:
@@ -880,8 +884,12 @@ def _run_one_side(
 
     env_for_parse = os.environ.copy()
     env_for_parse.update(runner_env)
+    # Mode 2 (inst_exec) has no cycle scalar -- parse-trace.py rejects
+    # --out-cycles for it. Suppress cycles_out so the parse session
+    # doesn't fail before writing events_out.
+    cycles_arg = None if trace_mode == "inst_exec" else cycles_out
     ok, err, cycles, events_count = _parse_trace_bin(
-        trace_bin, mlir, events_out, cycles_out, parse_log, env_for_parse,
+        trace_bin, mlir, events_out, cycles_arg, parse_log, env_for_parse,
         parser_session=parser_session,
         trace_mode=trace_mode,
     )
