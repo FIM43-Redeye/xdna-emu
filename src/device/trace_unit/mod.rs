@@ -889,6 +889,23 @@ impl TraceUnit {
         self.push_bits(frame, 16);
     }
 
+    /// Encode a mode-2 Start frame: 5-bit prefix 11110 + 1-bit flag
+    /// (0 = initial start) + 12 reserved bits + 14-bit anchor PC.
+    #[allow(dead_code)] // consumed by mode-2 segment-boundary wiring (Task 1.9); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+    fn encode_mode2_start(&mut self, anchor_pc: u16) {
+        debug_assert!(anchor_pc < (1 << 14));
+        let word = (0b11110u32 << 27) | (anchor_pc as u32 & 0x3FFF);
+        self.emit_long_frame(word);
+    }
+
+    /// Encode a mode-2 Stop frame: 6-bit prefix 110111 + 26 reserved
+    /// bits.
+    #[allow(dead_code)] // consumed by mode-2 segment-boundary wiring (Task 1.9); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+    fn encode_mode2_stop(&mut self) {
+        let word = 0b110111u32 << 26;
+        self.emit_long_frame(word);
+    }
+
     /// Push `count` bits of `value` MSB-first into the bit accumulator.
     /// Used by mode-2 frame encoders only. Triggers flush_word_if_full
     /// after each push.

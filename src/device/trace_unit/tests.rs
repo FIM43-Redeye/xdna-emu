@@ -1039,3 +1039,21 @@ fn round_trip_repeat1() {
         .iter()
         .any(|f| matches!(f, crate::trace::mode2_decode::Mode2Frame::Repeat1 { count: 0x1FF })));
 }
+
+#[test]
+fn round_trip_mode2_start() {
+    let mut tu = TraceUnit::new(0, 1);
+    tu.encode_mode2_start(0x100);
+    let frames = crate::trace::mode2_decode::decode(tu.encoded_bytes());
+    assert!(frames
+        .iter()
+        .any(|f| matches!(f, crate::trace::mode2_decode::Mode2Frame::Start { anchor_pc: 0x100 })));
+}
+
+#[test]
+fn round_trip_mode2_stop() {
+    let mut tu = TraceUnit::new(0, 1);
+    tu.encode_mode2_stop();
+    let frames = crate::trace::mode2_decode::decode(tu.encoded_bytes());
+    assert!(frames.iter().any(|f| matches!(f, crate::trace::mode2_decode::Mode2Frame::Stop)));
+}
