@@ -1057,3 +1057,83 @@ fn round_trip_mode2_stop() {
     let frames = crate::trace::mode2_decode::decode(tu.encoded_bytes());
     assert!(frames.iter().any(|f| matches!(f, crate::trace::mode2_decode::Mode2Frame::Stop)));
 }
+
+// -- RLE state machine (Task 1.8) --
+//
+// `append_atom_to_run` accumulates same-polarity atoms into a run; the
+// run is flushed by `flush_atoms_run` as one base atom plus zero or more
+// Repeat0/Repeat1 frames.  Polarity flips force a flush before starting
+// a new run.
+
+#[test]
+fn rle_single_atom_no_repeat() {
+    let mut tu = TraceUnit::new(0, 1);
+    tu.append_atom_to_run(true);
+    tu.flush_atoms_run();
+    tu.align_to_word_via_filler0();
+    let frames = crate::trace::mode2_decode::decode(tu.encoded_bytes());
+    let summary = crate::trace::mode2_decode::frame_summary(&frames);
+    assert!(summary.starts_with("E"), "got: {}", summary);
+    assert!(!summary.contains("R0") && !summary.contains("R1"), "single atom should not RLE: {}", summary);
+}
+
+#[test]
+fn rle_uses_repeat0_for_short_runs() {
+    let mut tu = TraceUnit::new(0, 1);
+    for _ in 0..16 {
+        tu.append_atom_to_run(true);
+    }
+    tu.flush_atoms_run();
+    tu.align_to_word_via_filler0();
+    let frames = crate::trace::mode2_decode::decode(tu.encoded_bytes());
+    let summary = crate::trace::mode2_decode::frame_summary(&frames);
+    // Expect: E + R0(15)
+    assert!(summary.starts_with("ER0(15)"), "got: {}", summary);
+}
+
+#[test]
+fn rle_uses_repeat1_for_medium_runs() {
+    let mut tu = TraceUnit::new(0, 1);
+    for _ in 0..1024 {
+        tu.append_atom_to_run(false);
+    }
+    tu.flush_atoms_run();
+    tu.align_to_word_via_filler0();
+    let frames = crate::trace::mode2_decode::decode(tu.encoded_bytes());
+    let summary = crate::trace::mode2_decode::frame_summary(&frames);
+    // Expect: N + R1(1023)
+    assert!(summary.starts_with("NR1(1023)"), "got: {}", summary);
+}
+
+#[test]
+fn rle_chains_repeat1_for_long_runs() {
+    let mut tu = TraceUnit::new(0, 1);
+    for _ in 0..1500 {
+        tu.append_atom_to_run(true);
+    }
+    tu.flush_atoms_run();
+    tu.align_to_word_via_filler0();
+    let frames = crate::trace::mode2_decode::decode(tu.encoded_bytes());
+    let summary = crate::trace::mode2_decode::frame_summary(&frames);
+    // 1500 atoms = atom(E) + R1(1023) + R1(476): each R1(N) represents
+    // N additional same-polarity atoms beyond the base. 1 + 1023 + 476 = 1500.
+    // (The plan's draft expected R1(475) but that totals 1499; corrected here.)
+    assert!(summary.starts_with("ER1(1023)R1(476)"), "got: {}", summary);
+}
+
+#[test]
+fn rle_polarity_flip_breaks_run() {
+    let mut tu = TraceUnit::new(0, 1);
+    for _ in 0..5 {
+        tu.append_atom_to_run(true);
+    }
+    for _ in 0..3 {
+        tu.append_atom_to_run(false);
+    }
+    tu.flush_atoms_run();
+    tu.align_to_word_via_filler0();
+    let frames = crate::trace::mode2_decode::decode(tu.encoded_bytes());
+    let summary = crate::trace::mode2_decode::frame_summary(&frames);
+    // 5 E + 3 N => E + R0(4) + N + R0(2)
+    assert!(summary.starts_with("ER0(4)NR0(2)"), "got: {}", summary);
+}

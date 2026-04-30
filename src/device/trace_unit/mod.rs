@@ -906,6 +906,61 @@ impl TraceUnit {
         self.emit_long_frame(word);
     }
 
+    /// Append one atom to the in-flight RLE run. If the run's polarity
+    /// flips (E to N or vice versa), flush the previous run first.
+    ///
+    /// The flush itself caps each Repeat1 chunk at 10 bits (1023), so a
+    /// run can grow arbitrarily large -- chaining is handled at flush
+    /// time, not on append.
+    #[allow(dead_code)] // consumed by mode-2 coordinator wiring (Phase 3 Task 3.1); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+    fn append_atom_to_run(&mut self, executed: bool) {
+        match &mut self.pending_atoms_run {
+            Some(run) if run.exec == executed => {
+                run.count += 1;
+            }
+            Some(_) => {
+                // Polarity flipped -- flush previous run, start new.
+                self.flush_atoms_run();
+                self.pending_atoms_run = Some(AtomRun { exec: executed, count: 1 });
+            }
+            None => {
+                self.pending_atoms_run = Some(AtomRun { exec: executed, count: 1 });
+            }
+        }
+    }
+
+    /// Flush the in-flight RLE run, emitting one base atom plus zero or
+    /// more Repeat0/Repeat1 frames sufficient to cover the recorded
+    /// count. Each Repeat0(n) / Repeat1(n) represents `n` *additional*
+    /// same-polarity atoms beyond the base, so the total run length is
+    /// `1 + sum(repeat counts)`.
+    ///
+    /// Encoding rule:
+    ///   count == 1     : just the atom
+    ///   count <= 16    : atom + Repeat0(count - 1)   [4-bit field, 0..15]
+    ///   count <= 1024  : atom + Repeat1(count - 1)   [10-bit field, 0..1023]
+    ///   count >  1024  : atom + chained Repeat1 frames (1023 each, then
+    ///                    a final shorter Repeat1 for the remainder)
+    #[allow(dead_code)] // consumed by mode-2 coordinator wiring + drain_mode2_pending (Task 1.9 / Phase 3); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+    fn flush_atoms_run(&mut self) {
+        let Some(run) = self.pending_atoms_run.take() else {
+            return;
+        };
+        self.encode_atom(run.exec);
+        let mut remaining = run.count.saturating_sub(1);
+        // Use Repeat0 only when the entire remaining count fits in 4 bits.
+        // Anything larger goes through Repeat1 (possibly chained).
+        if remaining > 0 && remaining <= 15 {
+            self.encode_repeat0(remaining as u8);
+            remaining = 0;
+        }
+        while remaining > 0 {
+            let chunk = remaining.min(1023) as u16;
+            self.encode_repeat1(chunk);
+            remaining -= chunk as u32;
+        }
+    }
+
     /// Push `count` bits of `value` MSB-first into the bit accumulator.
     /// Used by mode-2 frame encoders only. Triggers flush_word_if_full
     /// after each push.
