@@ -71,6 +71,53 @@ pub fn decode(bytes: &[u8]) -> Vec<Mode2Frame> {
     out
 }
 
+/// Compact stringification of a frame sequence for snapshot tests.
+///
+/// Encoder unit tests use this to assert "after encoding these
+/// frames, decoding produces the same sequence" without having to
+/// reach into individual variants.
+///
+/// Encoding:
+/// - `E` / `N`  -- E_atom / N_atom
+/// - `.`        -- Filler0
+/// - `,`        -- Filler1
+/// - `S`        -- Sync
+/// - `PC(...)`  -- New_PC
+/// - `R0(...)`  -- Repeat0
+/// - `R1(...)`  -- Repeat1
+/// - `Start(...)` -- Start
+/// - `LC(...)`  -- LC (flag, count)
+/// - `Stop`     -- Stop
+pub fn frame_summary(frames: &[Mode2Frame]) -> String {
+    let mut s = String::new();
+    for f in frames {
+        match f {
+            Mode2Frame::Atom { executed: true } => s.push('E'),
+            Mode2Frame::Atom { executed: false } => s.push('N'),
+            Mode2Frame::Filler0 => s.push('.'),
+            Mode2Frame::Filler1 => s.push(','),
+            Mode2Frame::Sync => s.push('S'),
+            Mode2Frame::NewPc { pc } => {
+                s.push_str(&format!("PC({:#x})", pc));
+            }
+            Mode2Frame::Repeat0 { count } => {
+                s.push_str(&format!("R0({})", count));
+            }
+            Mode2Frame::Repeat1 { count } => {
+                s.push_str(&format!("R1({})", count));
+            }
+            Mode2Frame::Start { anchor_pc } => {
+                s.push_str(&format!("Start({:#x})", anchor_pc));
+            }
+            Mode2Frame::Lc { flag, count } => {
+                s.push_str(&format!("LC({},{})", flag, count));
+            }
+            Mode2Frame::Stop => s.push_str("Stop"),
+        }
+    }
+    s
+}
+
 fn decode_one(bits: &mut BitStream) -> Option<Mode2Frame> {
     let b0 = bits.next_bit()?;
     if b0 == 0 {
@@ -312,5 +359,22 @@ mod tests {
             frames.len(),
             py_count
         );
+    }
+
+    #[test]
+    fn frame_summary_formats_frames() {
+        let frames = vec![
+            Mode2Frame::Atom { executed: true },
+            Mode2Frame::Atom { executed: false },
+            Mode2Frame::Filler0,
+            Mode2Frame::NewPc { pc: 0x1234 },
+            Mode2Frame::Repeat0 { count: 5 },
+            Mode2Frame::Repeat1 { count: 100 },
+            Mode2Frame::Start { anchor_pc: 0x100 },
+            Mode2Frame::Lc { flag: 1, count: 8 },
+            Mode2Frame::Stop,
+        ];
+        let s = frame_summary(&frames);
+        assert_eq!(s, "EN.PC(0x1234)R0(5)R1(100)Start(0x100)LC(1,8)Stop");
     }
 }
