@@ -1201,3 +1201,23 @@ fn mode2_notify_when_idle_is_noop() {
     assert!(tu.pending_atoms_run.is_none());
     assert!(tu.pending_mode2_frames.is_empty());
 }
+
+#[test]
+fn mode2_start_uses_real_pc_anchor() {
+    let mut tu = TraceUnit::new(0, 1);
+    tu.set_packet_type(0);
+    tu.set_mode(TraceMode::Execution);
+    tu.set_event_slot(0, 1);
+    tu.set_start_event(1);
+    tu.notify_event(1, 0, Some(0x1234));
+    // Don't flush() -- it drains byte_buffer into pending_words.
+    // Start is a 32-bit long frame so it's already byte-aligned.
+    let frames = crate::trace::mode2_decode::decode(tu.encoded_bytes());
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, crate::trace::mode2_decode::Mode2Frame::Start { anchor_pc: 0x1234 })),
+        "expected Start with anchor 0x1234, got {:?}",
+        frames
+    );
+}
