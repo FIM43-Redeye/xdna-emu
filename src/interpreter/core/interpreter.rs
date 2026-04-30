@@ -191,7 +191,7 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
                 } else {
-                    ctx.check_hardware_loop(pc);
+                    let _ = ctx.check_hardware_loop(pc); // wired to event log + trace unit in Task 2.3
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -204,7 +204,7 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                     ctx.set_pc(branch_target);
                     ctx.delay_pending_writes(1);
                 } else {
-                    ctx.check_hardware_loop(pc);
+                    let _ = ctx.check_hardware_loop(pc); // wired to event log + trace unit in Task 2.3
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -217,7 +217,7 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                     ctx.set_pc(branch_target);
                     ctx.delay_pending_writes(1);
                 } else {
-                    ctx.check_hardware_loop(pc);
+                    let _ = ctx.check_hardware_loop(pc); // wired to event log + trace unit in Task 2.3
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -346,7 +346,7 @@ where
                     ctx.set_pc(branch_target);
                     ctx.delay_pending_writes(1);
                 } else {
-                    ctx.check_hardware_loop(pc);
+                    let _ = ctx.check_hardware_loop(pc); // wired to event log + trace unit in Task 2.3
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -362,7 +362,7 @@ where
                     ctx.set_pc(branch_target);
                     ctx.delay_pending_writes(1);
                 } else {
-                    ctx.check_hardware_loop(pc);
+                    let _ = ctx.check_hardware_loop(pc); // wired to event log + trace unit in Task 2.3
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -378,7 +378,7 @@ where
                     ctx.set_pc(branch_target);
                     ctx.delay_pending_writes(1);
                 } else {
-                    ctx.check_hardware_loop(pc);
+                    let _ = ctx.check_hardware_loop(pc); // wired to event log + trace unit in Task 2.3
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue

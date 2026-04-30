@@ -29,6 +29,21 @@ use crate::interpreter::traits::{Flags, StateAccess};
 pub use super::event_trace::{EventLog, EventType, TimestampedEvent};
 pub use super::timing_context::{PendingBranch, SrsConfig, TimingContext};
 
+/// Snapshot of a ZOL boundary event for trace + diagnostic use.
+///
+/// Returned by [`ExecutionContext::check_hardware_loop`] when the just-fetched
+/// PC matches LE and LC was non-zero (i.e. a hardware loop iteration just
+/// completed). Carries the LC counter values around the decrement and the
+/// LE PC at which the boundary was observed so callers can route the event
+/// to the trace unit (mode-2 LC frames) or event log without re-reading
+/// register state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopBoundaryInfo {
+    pub lc_before: u32,
+    pub lc_after: u32,
+    pub le_pc: u32,
+}
+
 // ============================================================================
 // Load Latency: Pending Write Queue
 // ============================================================================
@@ -422,32 +437,31 @@ impl ExecutionContext {
     /// If a branch resolved this cycle, the branch target takes priority
     /// and this check is skipped by the caller.
     #[inline]
-    pub fn check_hardware_loop(&mut self, fetch_pc: u32) {
+    pub fn check_hardware_loop(&mut self, fetch_pc: u32) -> Option<LoopBoundaryInfo> {
         let le = self.scalar.read(super::registers::LE_REG_INDEX);
-        if fetch_pc == le {
-            let lc = self.scalar.read(super::registers::LC_REG_INDEX);
-            if lc > 0 {
-                let new_lc = lc - 1;
-                self.scalar.write(super::registers::LC_REG_INDEX, new_lc);
-                if new_lc > 0 {
-                    let ls = self.scalar.read(super::registers::LS_REG_INDEX);
-                    self.pc = ls;
-                    log::debug!(
-                        "ZLS loop: executed instr at LE=0x{:X}, LC {} -> {}, jumping to LS=0x{:X}",
-                        le,
-                        lc,
-                        new_lc,
-                        ls
-                    );
-                } else {
-                    log::debug!(
-                        "ZLS loop: final iteration at LE=0x{:X}, LC {} -> 0, falling through",
-                        le,
-                        lc
-                    );
-                }
-            }
+        if fetch_pc != le {
+            return None;
         }
+        let lc = self.scalar.read(super::registers::LC_REG_INDEX);
+        if lc == 0 {
+            return None;
+        }
+        let new_lc = lc - 1;
+        self.scalar.write(super::registers::LC_REG_INDEX, new_lc);
+        if new_lc > 0 {
+            let ls = self.scalar.read(super::registers::LS_REG_INDEX);
+            self.pc = ls;
+            log::debug!(
+                "ZLS loop: executed instr at LE=0x{:X}, LC {} -> {}, jumping to LS=0x{:X}",
+                le,
+                lc,
+                new_lc,
+                ls
+            );
+        } else {
+            log::debug!("ZLS loop: final iteration at LE=0x{:X}, LC {} -> 0, falling through", le, lc);
+        }
+        Some(LoopBoundaryInfo { lc_before: lc, lc_after: new_lc, le_pc: le })
     }
 
     /// Get the condition flags.
@@ -1173,6 +1187,36 @@ impl std::fmt::Debug for ExecutionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_hardware_loop_returns_some_on_boundary() {
+        use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(LE_REG_INDEX, 0x200);
+        ctx.scalar.write(LS_REG_INDEX, 0x100);
+        ctx.scalar.write(LC_REG_INDEX, 3);
+        let info = ctx.check_hardware_loop(0x200);
+        assert_eq!(info, Some(LoopBoundaryInfo { lc_before: 3, lc_after: 2, le_pc: 0x200 }));
+    }
+
+    #[test]
+    fn check_hardware_loop_returns_none_off_boundary() {
+        use crate::interpreter::state::LE_REG_INDEX;
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(LE_REG_INDEX, 0x200);
+        let info = ctx.check_hardware_loop(0x180);
+        assert_eq!(info, None);
+    }
+
+    #[test]
+    fn check_hardware_loop_returns_none_when_lc_zero() {
+        use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX};
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(LE_REG_INDEX, 0x200);
+        ctx.scalar.write(LC_REG_INDEX, 0);
+        let info = ctx.check_hardware_loop(0x200);
+        assert_eq!(info, None);
+    }
 
     #[test]
     fn test_context_creation() {
