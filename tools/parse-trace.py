@@ -260,6 +260,37 @@ def _import_numpy():
     return np
 
 
+def _load_trace_words(np_mod, trace_bin: str):
+    """Read trace_bin as uint32 dwords and trim the leading and trailing
+    zero-padding runs. Returns a trimmed numpy array; callers needing a
+    Python list can call .tolist() on the result.
+
+    Why both ends: the bridge runner allocates trace_size bytes for the
+    BO (typically 1 MB) and the kernel only fills the slice it actually
+    used. Trailing zeros are uninitialized BO past the trace tail.
+    Leading zeros happen because the trace channel can append into the
+    BO at an offset (mode-1 sweeps reuse the BO across batches and each
+    batch's frames land where the previous one's ended), and the
+    leading-zero region is simply "this batch wrote bytes [N..M); the
+    rest stayed zero from prior runs / from BO init".
+
+    Inner zeros are preserved -- mode-2 streams legitimately encode
+    N_atom frames as 0x00 nibbles, and a long N_atom run inside the
+    real trace must not be conflated with padding. Empty BOs (no
+    non-zero dwords anywhere) return a single zero dword so downstream
+    "empty trace" branches still fire.
+    """
+    raw = np_mod.fromfile(trace_bin, dtype=np_mod.uint32)
+    if raw.size == 0:
+        return raw
+    non_zero = np_mod.flatnonzero(raw)
+    if non_zero.size == 0:
+        return raw[:1]
+    first = int(non_zero[0])
+    last = int(non_zero[-1])
+    return raw[first:last + 1]
+
+
 def _import_mlir_aie_parse_trace():
     """Import the heavy mlir-aie trace decoder.  Returns ``parse_trace`` or
     raises ImportError with a hint if the env isn't set up.  Lazy because
@@ -384,7 +415,7 @@ def decode_one_ours(np_mod, td_mod,
 
     mode_enum = mode_lookup[trace_mode]
 
-    raw = np_mod.fromfile(trace_bin, dtype=np_mod.uint32)
+    raw = _load_trace_words(np_mod, trace_bin)
     words = raw.tolist()
 
     # Compute slot_names once if anything downstream needs them.
@@ -530,7 +561,7 @@ def _decode_mode2_to_outputs(np_mod, td_mod, *,
             "atoms in --out-events for a length proxy."
         )
 
-    raw = np_mod.fromfile(trace_bin, dtype=np_mod.uint32)
+    raw = _load_trace_words(np_mod, trace_bin)
     words = raw.tolist()
 
     commands_per_tile = td_mod.decode_words(
@@ -641,7 +672,7 @@ def decode_one(np_mod, parse_trace_fn,
         treats empty as a hard failure to preserve the historic exit
         code; server mode lets callers handle it.)
     """
-    raw = np_mod.fromfile(trace_bin, dtype=np_mod.uint32)
+    raw = _load_trace_words(np_mod, trace_bin)
     mlir_text = Path(xclbin_mlir).read_text()
     try:
         perfetto_events = parse_trace_fn(raw, mlir_text)
