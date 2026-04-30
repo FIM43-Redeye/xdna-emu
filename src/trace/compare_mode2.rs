@@ -128,6 +128,50 @@ fn compare_layer2(hw: &[(u8, u32)], emu: &[(u8, u32)]) -> LcLayer {
     LcLayer { hw_count: hw.len(), emu_count: emu.len(), first_diverge: first, samples }
 }
 
+fn extract_pc_segments(stream: &[u8]) -> Vec<(u16, u16, usize)> {
+    let mut out = Vec::new();
+    let mut current_anchor: Option<u16> = None;
+    let mut atom_count_in_segment: usize = 0;
+    for f in decode(stream) {
+        match f {
+            Mode2Frame::Atom { .. } => {
+                atom_count_in_segment += 1;
+            }
+            Mode2Frame::Repeat0 { count } => {
+                atom_count_in_segment += count as usize;
+            }
+            Mode2Frame::Repeat1 { count } => {
+                atom_count_in_segment += count as usize;
+            }
+            Mode2Frame::NewPc { pc } => {
+                if let Some(prev) = current_anchor {
+                    out.push((prev, pc, atom_count_in_segment));
+                }
+                current_anchor = Some(pc);
+                atom_count_in_segment = 0;
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn compare_layer3(hw: &[u8], emu: &[u8]) -> AtomWindowLayer {
+    let hw_segs = extract_pc_segments(hw);
+    let emu_segs = extract_pc_segments(emu);
+    let mut windows = Vec::new();
+    let n = hw_segs.len().min(emu_segs.len());
+    for i in 0..n {
+        windows.push(AtomWindow {
+            from_pc: hw_segs[i].0,
+            to_pc: hw_segs[i].1,
+            hw_atoms: hw_segs[i].2,
+            emu_atoms: emu_segs[i].2,
+        });
+    }
+    AtomWindowLayer { windows }
+}
+
 /// Compare HW and EMU mode-2 byte streams for one tile.
 ///
 /// Returns a result with all three layers populated. `passed` is `true`
@@ -141,7 +185,7 @@ pub fn compare_mode2_for_tile(hw_stream: &[u8], emu_stream: &[u8], tile: TileKey
     let hw_lcs = extract_lcs(hw_stream);
     let emu_lcs = extract_lcs(emu_stream);
     let layer2 = compare_layer2(&hw_lcs, &emu_lcs);
-    let layer3 = AtomWindowLayer::default(); // populated in Task 5.4
+    let layer3 = compare_layer3(hw_stream, emu_stream);
     let passed = layer1.first_diverge.is_none() && layer2.first_diverge.is_none();
     Mode2CompareResult { tile, layer1, layer2, layer3, passed }
 }
@@ -246,5 +290,59 @@ mod tests {
         let r = compare_mode2_for_tile(&hw, &emu, key());
         assert_eq!(r.layer2.first_diverge, Some(1));
         assert!(!r.passed);
+    }
+
+    #[test]
+    fn layer3_reports_atoms_per_pc_segment() {
+        // Build streams: PC(0x100) + 5 E_atoms + PC(0x200) + 3 E_atoms + PC(0x300)
+        // For both HW and EMU. Atom counts include only inter-PC region.
+        let hw = build_pc_atom_stream(&[(0x100, 5), (0x200, 3), (0x300, 0)]);
+        let emu = hw.clone();
+        let r = compare_mode2_for_tile(&hw, &emu, key());
+        // Expect 2 windows: 0x100->0x200 (5 atoms) and 0x200->0x300 (3 atoms).
+        assert_eq!(r.layer3.windows.len(), 2);
+        assert_eq!(r.layer3.windows[0].from_pc, 0x100);
+        assert_eq!(r.layer3.windows[0].to_pc, 0x200);
+        assert_eq!(r.layer3.windows[0].hw_atoms, 5);
+        assert_eq!(r.layer3.windows[0].emu_atoms, 5);
+        assert_eq!(r.layer3.windows[1].from_pc, 0x200);
+        assert_eq!(r.layer3.windows[1].to_pc, 0x300);
+        assert_eq!(r.layer3.windows[1].hw_atoms, 3);
+        assert_eq!(r.layer3.windows[1].emu_atoms, 3);
+    }
+
+    /// Build a stream that interleaves PC anchors and trailing E_atoms.
+    /// Each tuple is (PC, atom_count) — atom_count atoms get emitted after
+    /// the PC anchor. Stream ends with Filler0 padding to word boundary.
+    fn build_pc_atom_stream(specs: &[(u16, usize)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut bit_pos: u32 = 0;
+        let mut word: u32 = 0;
+        let push_bits = |val: u32, count: u32, out: &mut Vec<u8>, word: &mut u32, bit_pos: &mut u32| {
+            for i in (0..count).rev() {
+                let b = (val >> i) & 1;
+                *word = (*word << 1) | b;
+                *bit_pos += 1;
+                if *bit_pos == 32 {
+                    out.push((*word >> 24) as u8);
+                    out.push((*word >> 16) as u8);
+                    out.push((*word >> 8) as u8);
+                    out.push(*word as u8);
+                    *word = 0;
+                    *bit_pos = 0;
+                }
+            }
+        };
+        for &(pc, atoms) in specs {
+            let frame = (0b10u32 << 14) | (pc as u32 & 0x3FFF);
+            push_bits(frame, 16, &mut out, &mut word, &mut bit_pos);
+            for _ in 0..atoms {
+                push_bits(0b0001, 4, &mut out, &mut word, &mut bit_pos); // E_atom
+            }
+        }
+        while bit_pos != 0 {
+            push_bits(0b0010, 4, &mut out, &mut word, &mut bit_pos);
+        }
+        out
     }
 }
