@@ -850,6 +850,14 @@ impl TraceUnit {
         self.push_bits(prefix, 4);
     }
 
+    /// Encode a New_PC frame: 2-bit prefix `10` + 14-bit PC.
+    #[allow(dead_code)] // consumed by mode-2 coordinator wiring (Phase 3 Task 3.2); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+    fn encode_new_pc(&mut self, pc: u16) {
+        debug_assert!(pc < (1 << 14), "PC {:#x} exceeds 14 bits", pc);
+        let frame = (0b10u32 << 14) | (pc as u32 & 0x3FFF);
+        self.push_bits(frame, 16);
+    }
+
     /// Push `count` bits of `value` MSB-first into the bit accumulator.
     /// Used by mode-2 frame encoders only. Triggers flush_word_if_full
     /// after each push.

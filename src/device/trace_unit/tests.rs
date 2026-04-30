@@ -979,3 +979,18 @@ fn round_trip_atoms() {
     // Expect ENE then 5 Filler0 nibbles to reach word boundary.
     assert!(summary.starts_with("ENE"), "got: {}", summary);
 }
+
+#[test]
+fn round_trip_new_pc() {
+    let mut tu = TraceUnit::new(0, 1);
+    tu.encode_new_pc(0x1234);
+    tu.encode_new_pc(0x0042);
+    tu.align_to_word_via_filler0();
+    let frames = crate::trace::mode2_decode::decode(tu.encoded_bytes());
+    assert!(frames
+        .iter()
+        .any(|f| matches!(f, crate::trace::mode2_decode::Mode2Frame::NewPc { pc: 0x1234 })));
+    assert!(frames
+        .iter()
+        .any(|f| matches!(f, crate::trace::mode2_decode::Mode2Frame::NewPc { pc: 0x0042 })));
+}
