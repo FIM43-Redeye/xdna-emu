@@ -966,3 +966,16 @@ fn emit_long_frame_aligns_then_pushes_word() {
     // Then long frame as next word: 0xCAFEBABE
     assert_eq!(tu.encoded_bytes(), &[0xE3, 0x22, 0x22, 0x22, 0xCA, 0xFE, 0xBA, 0xBE]);
 }
+
+#[test]
+fn round_trip_atoms() {
+    let mut tu = TraceUnit::new(0, 1);
+    tu.encode_atom(true); // E_atom
+    tu.encode_atom(false); // N_atom
+    tu.encode_atom(true); // E_atom
+    tu.align_to_word_via_filler0();
+    let frames = crate::trace::mode2_decode::decode(tu.encoded_bytes());
+    let summary = crate::trace::mode2_decode::frame_summary(&frames);
+    // Expect ENE then 5 Filler0 nibbles to reach word boundary.
+    assert!(summary.starts_with("ENE"), "got: {}", summary);
+}

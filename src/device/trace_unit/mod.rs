@@ -842,6 +842,14 @@ impl TraceUnit {
         }
     }
 
+    /// Encode a single E_atom (executed=true) or N_atom (executed=false).
+    /// 4-bit frame: 0001 for E, 0000 for N.
+    #[allow(dead_code)] // consumed by mode-2 coordinator wiring (Phase 3 Task 3.1); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+    fn encode_atom(&mut self, executed: bool) {
+        let prefix = if executed { 0b0001 } else { 0b0000 };
+        self.push_bits(prefix, 4);
+    }
+
     /// Push `count` bits of `value` MSB-first into the bit accumulator.
     /// Used by mode-2 frame encoders only. Triggers flush_word_if_full
     /// after each push.
