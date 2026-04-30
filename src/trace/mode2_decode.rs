@@ -87,7 +87,15 @@ fn decode_one(bits: &mut BitStream) -> Option<Mode2Frame> {
                 _ => return None, // 0011 unused; treat as EOF
             });
         }
-        // 01x prefix -- LC (Task 4.4) or unknown
+        // 01x prefix
+        let b2 = bits.next_bit()?;
+        if b2 == 0 {
+            // 010 -- LC: 1b flag + 28b count
+            let flag = bits.next_bit()?;
+            let count = bits.take(28)?;
+            return Some(Mode2Frame::Lc { flag, count });
+        }
+        // 011 unused
         return None;
     }
     // 1xxx prefix
@@ -113,8 +121,26 @@ fn decode_one(bits: &mut BitStream) -> Option<Mode2Frame> {
             // 11110 -- Start (Task 4.5)
             return None;
         }
-        // 1100/1101 -- Multiple/Repeat/Stop (Task 4.4)
-        return None;
+        // 110x -- Repeat0, Repeat1, Stop
+        if b2 == 1 && b3 == 0 {
+            // 1110 -- Repeat0: 4b count
+            let count = bits.take(4)? as u8;
+            return Some(Mode2Frame::Repeat0 { count });
+        }
+        // b2==0 (i.e. 110x where x is bit b3)
+        let b4 = bits.next_bit()?;
+        let b5 = bits.next_bit()?;
+        if b4 == 1 && b5 == 0 {
+            // 110110 -- Repeat1: 10b count
+            let count = bits.take(10)? as u16;
+            return Some(Mode2Frame::Repeat1 { count });
+        }
+        if b4 == 1 && b5 == 1 {
+            // 110111 -- Stop: 26b payload, discarded
+            bits.take(26)?;
+            return Some(Mode2Frame::Stop);
+        }
+        return None; // unknown 110x prefix
     }
     // 10 -- New_PC: 14-bit PC follows
     let pc = bits.take(14)? as u16;
@@ -183,5 +209,60 @@ mod tests {
         let frames = decode(&bytes);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0], Mode2Frame::NewPc { pc: 0x0000 });
+    }
+
+    #[test]
+    fn decodes_lc() {
+        // LC prefix 010, then 1b flag + 28b count. Total 32 bits.
+        // flag=1, count=0xABCDEF: bits 010 1 (28b 0x0ABCDEF aligned)
+        // 010_1_0000_1010_1011_1100_1101_1110_1111
+        // = 0x50ABCDEF. As BE bytes: [0x50, 0xAB, 0xCD, 0xEF]
+        let bytes = [0x50, 0xAB, 0xCD, 0xEF];
+        let frames = decode(&bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], Mode2Frame::Lc { flag: 1, count: 0x0ABCDEF });
+    }
+
+    #[test]
+    fn decodes_lc_flag_zero() {
+        // flag=0, count=8: 010 0 (28b 0x0000008)
+        // bits: 010_0_0000_0000_0000_0000_0000_0000_1000 = 0x40000008
+        // BE bytes: [0x40, 0x00, 0x00, 0x08]
+        let bytes = [0x40, 0x00, 0x00, 0x08];
+        let frames = decode(&bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], Mode2Frame::Lc { flag: 0, count: 8 });
+    }
+
+    #[test]
+    fn decodes_repeat0() {
+        // Repeat0 prefix 1110, then 4b count. count=5: 1110_0101 = 0xE5
+        let bytes = [0xE5];
+        let frames = decode(&bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], Mode2Frame::Repeat0 { count: 5 });
+    }
+
+    #[test]
+    fn decodes_repeat1() {
+        // Repeat1 prefix 110110, then 10b count. count=0x1FF (511):
+        // bits 110110 + 01_1111_1111 = 110110_0111111111
+        // = 0xD9FF. BE bytes: [0xD9, 0xFF]
+        let bytes = [0xD9, 0xFF];
+        let frames = decode(&bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], Mode2Frame::Repeat1 { count: 0x1FF });
+    }
+
+    #[test]
+    fn decodes_stop() {
+        // Stop prefix 110111, then 26b payload (consumes word).
+        // Payload value doesn't matter; we discard it.
+        // bits 110111 + 26 zeros = 110111_00_00000000_00000000_00000000
+        // = 0xDC000000. BE bytes: [0xDC, 0x00, 0x00, 0x00]
+        let bytes = [0xDC, 0x00, 0x00, 0x00];
+        let frames = decode(&bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], Mode2Frame::Stop);
     }
 }
