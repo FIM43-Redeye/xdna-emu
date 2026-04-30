@@ -94,6 +94,40 @@ fn compare_layer1(hw: &[u16], emu: &[u16]) -> PcSequenceLayer {
     PcSequenceLayer { hw_count: hw.len(), emu_count: emu.len(), first_diverge: first, samples }
 }
 
+fn extract_lcs(stream: &[u8]) -> Vec<(u8, u32)> {
+    decode(stream)
+        .into_iter()
+        .filter_map(|f| match f {
+            Mode2Frame::Lc { flag, count } => Some((flag, count)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn compare_layer2(hw: &[(u8, u32)], emu: &[(u8, u32)]) -> LcLayer {
+    let mut samples = Vec::new();
+    let mut first = None;
+    let n = hw.len().min(emu.len());
+    for i in 0..n {
+        if hw[i] != emu[i] {
+            samples.push(LcSampleRow {
+                idx: i,
+                hw_flag: hw[i].0,
+                hw_count_value: hw[i].1,
+                emu_flag: emu[i].0,
+                emu_count_value: emu[i].1,
+            });
+            if first.is_none() {
+                first = Some(i);
+            }
+        }
+    }
+    if hw.len() != emu.len() && first.is_none() {
+        first = Some(n);
+    }
+    LcLayer { hw_count: hw.len(), emu_count: emu.len(), first_diverge: first, samples }
+}
+
 /// Compare HW and EMU mode-2 byte streams for one tile.
 ///
 /// Returns a result with all three layers populated. `passed` is `true`
@@ -104,7 +138,9 @@ pub fn compare_mode2_for_tile(hw_stream: &[u8], emu_stream: &[u8], tile: TileKey
     let emu_pcs = extract_pcs(emu_stream);
     let layer1 = compare_layer1(&hw_pcs, &emu_pcs);
 
-    let layer2 = LcLayer { hw_count: 0, emu_count: 0, first_diverge: None, samples: Vec::new() }; // populated in Task 5.3
+    let hw_lcs = extract_lcs(hw_stream);
+    let emu_lcs = extract_lcs(emu_stream);
+    let layer2 = compare_layer2(&hw_lcs, &emu_lcs);
     let layer3 = AtomWindowLayer::default(); // populated in Task 5.4
     let passed = layer1.first_diverge.is_none() && layer2.first_diverge.is_none();
     Mode2CompareResult { tile, layer1, layer2, layer3, passed }
@@ -146,6 +182,20 @@ mod tests {
         out
     }
 
+    /// Encode a sequence of LC long frames.
+    /// Each (flag, count) pair becomes one 32-bit aligned LC frame.
+    fn encode_lcs(pairs: &[(u8, u32)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &(flag, count) in pairs {
+            let word = (0b010u32 << 29) | ((flag as u32 & 1) << 28) | (count & 0x0FFFFFFF);
+            out.push((word >> 24) as u8);
+            out.push((word >> 16) as u8);
+            out.push((word >> 8) as u8);
+            out.push(word as u8);
+        }
+        out
+    }
+
     fn key() -> TileKey {
         TileKey { col: 0, row: 2, pkt_type: 0 }
     }
@@ -178,5 +228,23 @@ mod tests {
         assert_eq!(r.layer1.hw_count, 3);
         assert_eq!(r.layer1.emu_count, 2);
         assert!(r.layer1.first_diverge.is_some() || !r.passed);
+    }
+
+    #[test]
+    fn layer2_lc_count_match() {
+        let hw = encode_lcs(&[(1, 8), (1, 4)]);
+        let emu = encode_lcs(&[(1, 8), (1, 4)]);
+        let r = compare_mode2_for_tile(&hw, &emu, key());
+        assert!(r.layer2.first_diverge.is_none());
+        assert!(r.passed);
+    }
+
+    #[test]
+    fn layer2_lc_count_mismatch() {
+        let hw = encode_lcs(&[(1, 8), (1, 4)]);
+        let emu = encode_lcs(&[(1, 8), (0, 4)]); // flag differs
+        let r = compare_mode2_for_tile(&hw, &emu, key());
+        assert_eq!(r.layer2.first_diverge, Some(1));
+        assert!(!r.passed);
     }
 }
