@@ -2522,15 +2522,83 @@ pub fn compare_sweep_dir_with_opts(sweep_dir: &Path, opts: &AnalysisOptions) -> 
             }
         }
 
-        // Mode-2 baselines note. Always list whatever physical files are
-        // present in the mode2-baseline/ directory; the manifest flag is
-        // only a confirmation hint. A corrupted or missing manifest must
-        // not silently suppress real baseline files.
+        // Mode-2 comparison. For each baseline file in mode2-baseline/,
+        // attempt to find the matching EMU mode-2 raw stream and run the
+        // three-layer comparator. Path conventions are tentative until
+        // Phase 6 finalizes the bridge-test layout (see Task 6.2).
+        //
+        // We always list whatever physical files are present; the manifest
+        // flag is only a confirmation hint. A corrupted or missing manifest
+        // must not silently suppress real baseline files.
         let baselines = list_mode2_baselines(sweep_dir);
         if !baselines.is_empty() {
-            let _ = writeln!(pc_suffix, "Mode-2 baselines captured (deferred to A.2b for comparison):");
-            for path in &baselines {
-                let _ = writeln!(pc_suffix, "  {}", path.display());
+            let _ = writeln!(pc_suffix, "Mode-2 comparison:");
+            for hw_path in &baselines {
+                let display_name =
+                    hw_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+
+                // TODO(Phase 6): derive emu path from a sweep manifest
+                // rather than guessing. Current heuristic: the baseline
+                // file's grandparent (sweep_dir) joined with the test
+                // subdir (the baseline's parent file_name), then the
+                // baseline's file_stem with `.emu-mode2-raw.bin`. This
+                // will be replaced by manifest-driven path resolution
+                // once real fixtures land in Phase 6 Task 6.2.
+                let emu_path = hw_path.parent().and_then(|test_dir| {
+                    let test_name = test_dir.file_name()?;
+                    let stem = hw_path.file_stem()?;
+                    Some(sweep_dir.join(test_name).join(stem).with_extension("emu-mode2-raw.bin"))
+                });
+
+                let emu_path = match emu_path {
+                    Some(p) => p,
+                    None => {
+                        let _ = writeln!(pc_suffix, "  {}: SKIP (couldn't derive EMU path)", display_name);
+                        continue;
+                    }
+                };
+
+                if !emu_path.exists() {
+                    let _ = writeln!(
+                        pc_suffix,
+                        "  {}: SKIP (EMU stream {} not present)",
+                        display_name,
+                        emu_path.display()
+                    );
+                    continue;
+                }
+                let hw_bytes = match fs::read(hw_path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = writeln!(pc_suffix, "  {}: SKIP (read HW: {})", display_name, e);
+                        continue;
+                    }
+                };
+                let emu_bytes = match fs::read(&emu_path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = writeln!(pc_suffix, "  {}: SKIP (read EMU: {})", display_name, e);
+                        continue;
+                    }
+                };
+                // TODO(Phase 6): parse tile key from sweep manifest. For
+                // now we assume a single compute tile at (col=0, row=2)
+                // with packet type 0; this is the typical bridge-test
+                // configuration but obviously won't generalize.
+                let tile = TileKey { col: 0, row: 2, pkt_type: 0 };
+                let result = crate::trace::compare_mode2::compare_mode2_for_tile(&hw_bytes, &emu_bytes, tile);
+                let status = if result.passed { "PASS" } else { "FAIL" };
+                let _ = writeln!(
+                    pc_suffix,
+                    "  {} [{}]: PC seq {}/{}, LC {}/{}, atom windows: {}",
+                    display_name,
+                    status,
+                    result.layer1.hw_count,
+                    result.layer1.emu_count,
+                    result.layer2.hw_count,
+                    result.layer2.emu_count,
+                    result.layer3.windows.len()
+                );
             }
             // Cross-check: if the manifest disagrees with the filesystem,
             // flag it so the user can investigate.
