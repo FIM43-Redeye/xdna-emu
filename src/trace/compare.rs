@@ -2530,84 +2530,63 @@ pub fn compare_sweep_dir_with_opts(sweep_dir: &Path, opts: &AnalysisOptions) -> 
         // We always list whatever physical files are present; the manifest
         // flag is only a confirmation hint. A corrupted or missing manifest
         // must not silently suppress real baseline files.
-        let baselines = list_mode2_baselines(sweep_dir);
-        if !baselines.is_empty() {
+        let mode2_pair = find_mode2_baseline_pair(sweep_dir);
+        if let Some((hw_path, emu_path)) = mode2_pair {
             let _ = writeln!(pc_suffix, "Mode-2 comparison:");
-            for hw_path in &baselines {
-                let display_name =
-                    hw_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-
-                // TODO(Phase 6): derive emu path from a sweep manifest
-                // rather than guessing. Current heuristic: the baseline
-                // file's grandparent (sweep_dir) joined with the test
-                // subdir (the baseline's parent file_name), then the
-                // baseline's file_stem with `.emu-mode2-raw.bin`. This
-                // will be replaced by manifest-driven path resolution
-                // once real fixtures land in Phase 6 Task 6.2.
-                let emu_path = hw_path.parent().and_then(|test_dir| {
-                    let test_name = test_dir.file_name()?;
-                    let stem = hw_path.file_stem()?;
-                    Some(sweep_dir.join(test_name).join(stem).with_extension("emu-mode2-raw.bin"))
-                });
-
-                let emu_path = match emu_path {
-                    Some(p) => p,
-                    None => {
-                        let _ = writeln!(pc_suffix, "  {}: SKIP (couldn't derive EMU path)", display_name);
-                        continue;
-                    }
-                };
-
-                if !emu_path.exists() {
-                    let _ = writeln!(
-                        pc_suffix,
-                        "  {}: SKIP (EMU stream {} not present)",
-                        display_name,
-                        emu_path.display()
-                    );
-                    continue;
-                }
-                let hw_bytes = match fs::read(hw_path) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = writeln!(pc_suffix, "  {}: SKIP (read HW: {})", display_name, e);
-                        continue;
-                    }
-                };
-                let emu_bytes = match fs::read(&emu_path) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = writeln!(pc_suffix, "  {}: SKIP (read EMU: {})", display_name, e);
-                        continue;
-                    }
-                };
-                // TODO(Phase 6): parse tile key from sweep manifest. For
-                // now we assume a single compute tile at (col=0, row=2)
-                // with packet type 0; this is the typical bridge-test
-                // configuration but obviously won't generalize.
-                let tile = TileKey { col: 0, row: 2, pkt_type: 0 };
-                let result = crate::trace::compare_mode2::compare_mode2_for_tile(&hw_bytes, &emu_bytes, tile);
-                let status = if result.passed { "PASS" } else { "FAIL" };
+            if !emu_path.exists() {
                 let _ = writeln!(
                     pc_suffix,
-                    "  {} [{}]: PC seq {}/{}, LC {}/{}, atom windows: {}",
-                    display_name,
-                    status,
-                    result.layer1.hw_count,
-                    result.layer1.emu_count,
-                    result.layer2.hw_count,
-                    result.layer2.emu_count,
-                    result.layer3.windows.len()
+                    "  hw={} -- SKIP (EMU events JSON {} not present; rerun with --mode2 after rebuilding the FFI plugin)",
+                    hw_path.display(),
+                    emu_path.display(),
                 );
+            } else {
+                match crate::trace::compare_mode2::compare_mode2_from_events_files(&hw_path, &emu_path) {
+                    Err(e) => {
+                        let _ = writeln!(pc_suffix, "  ERROR loading events: {}", e);
+                    }
+                    Ok(report) => {
+                        if report.per_tile.is_empty() {
+                            let _ = writeln!(pc_suffix, "  no tiles common to HW and EMU events JSON",);
+                        }
+                        for r in &report.per_tile {
+                            let status = if r.passed { "PASS" } else { "FAIL" };
+                            let _ = writeln!(
+                                pc_suffix,
+                                "  tile pt={} ({},{}) [{}]: PC seq {}/{}, LC {}/{}, atom windows: {}",
+                                r.tile.pkt_type,
+                                r.tile.col,
+                                r.tile.row,
+                                status,
+                                r.layer1.hw_count,
+                                r.layer1.emu_count,
+                                r.layer2.hw_count,
+                                r.layer2.emu_count,
+                                r.layer3.windows.len(),
+                            );
+                        }
+                        for tile in &report.hw_only {
+                            let _ = writeln!(
+                                pc_suffix,
+                                "  tile pt={} ({},{}): HW only -- no EMU events for tile",
+                                tile.pkt_type, tile.col, tile.row,
+                            );
+                        }
+                        for tile in &report.emu_only {
+                            let _ = writeln!(
+                                pc_suffix,
+                                "  tile pt={} ({},{}): EMU only -- no HW events for tile",
+                                tile.pkt_type, tile.col, tile.row,
+                            );
+                        }
+                    }
+                }
             }
-            // Cross-check: if the manifest disagrees with the filesystem,
-            // flag it so the user can investigate.
             if let Some(m) = &manifest_opt {
                 if !m.mode2_baseline_captured {
                     let _ = writeln!(
                         pc_suffix,
-                        "  (warning: sweep-manifest reports mode2_baseline_captured=false but {} files exist)",
-                        baselines.len()
+                        "  (warning: sweep-manifest reports mode2_baseline_captured=false but baseline files exist)",
                     );
                 }
             }
@@ -2700,23 +2679,25 @@ pub fn read_grounding_from_pc1_manifest(sweep_dir: &Path) -> BTreeSet<String> {
     }
 }
 
-/// List files inside `sweep_dir/mode2-baseline/` (the Task 6 mode-2 baseline).
+/// Locate the mode-2 baseline events JSONs produced by trace-sweep.py
+/// (Task 6 mode-2 capture). The sweep writes:
 ///
-/// Returns paths of `*.json` files found there, sorted. Returns an empty
-/// Vec when the directory is absent (mode-2 capture was disabled or failed).
-pub fn list_mode2_baselines(sweep_dir: &Path) -> Vec<std::path::PathBuf> {
-    let dir = sweep_dir.join("mode2-baseline");
-    let rd = match fs::read_dir(&dir) {
-        Ok(rd) => rd,
-        Err(_) => return Vec::new(),
-    };
-    let mut paths: Vec<_> = rd
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "json"))
-        .collect();
-    paths.sort();
-    paths
+/// ```text
+/// <sweep_dir>/mode2-baseline/hw/trace.events.json
+/// <sweep_dir>/mode2-baseline/emu/trace.events.json   (when EMU-side mode-2 ran)
+/// ```
+///
+/// Returns `Some((hw, emu))` when the HW events JSON exists, with `emu`
+/// pointing at its sibling whether or not it's been written yet. Returns
+/// `None` when no mode-2 baseline was captured at all -- callers should
+/// treat that as "nothing to compare," not an error.
+pub fn find_mode2_baseline_pair(sweep_dir: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let hw = sweep_dir.join("mode2-baseline/hw/trace.events.json");
+    if !hw.is_file() {
+        return None;
+    }
+    let emu = sweep_dir.join("mode2-baseline/emu/trace.events.json");
+    Some((hw, emu))
 }
 
 /// Aggregate PC-anchored reports across batches and format three sections:
@@ -3647,24 +3628,27 @@ mod tests {
     }
 
     #[test]
-    fn pc_anchored_lists_mode2_baselines_even_without_manifest() {
-        // Build a synthetic sweep dir with a mode2-baseline/ directory but
-        // NO sweep-manifest.json. compare_sweep_dir_with_opts must list the
-        // baseline files anyway -- a missing/corrupted manifest must not
-        // silently suppress real on-disk artifacts.
+    fn pc_anchored_finds_mode2_baseline_pair_even_without_manifest() {
+        // Build a synthetic sweep dir with a mode2-baseline/hw/trace.events.json
+        // file but NO sweep-manifest.json. find_mode2_baseline_pair must locate
+        // the HW file anyway -- a missing/corrupted manifest must not silently
+        // suppress real on-disk artifacts. The EMU sibling is returned too, even
+        // when the file isn't present (caller decides what to do with it).
         let tmpdir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
         let sweep_dir = tmpdir.join("task8_test_baseline_no_manifest");
         let _ = std::fs::remove_dir_all(&sweep_dir);
         std::fs::create_dir_all(&sweep_dir).expect("create sweep dir");
-        let mode2_dir = sweep_dir.join("mode2-baseline");
-        std::fs::create_dir(&mode2_dir).expect("create mode2 dir");
-        let baseline_path = mode2_dir.join("test_0_2.events.json");
-        std::fs::write(&baseline_path, "{}").expect("write baseline file");
+        let hw_dir = sweep_dir.join("mode2-baseline/hw");
+        std::fs::create_dir_all(&hw_dir).expect("create hw dir");
+        let hw_path = hw_dir.join("trace.events.json");
+        std::fs::write(&hw_path, "{}").expect("write hw events file");
 
-        // list_mode2_baselines returns the file even with no manifest.
-        let baselines = list_mode2_baselines(&sweep_dir);
-        assert_eq!(baselines.len(), 1);
-        assert_eq!(baselines[0], baseline_path);
+        let pair = find_mode2_baseline_pair(&sweep_dir);
+        assert!(pair.is_some());
+        let (hw, emu) = pair.unwrap();
+        assert_eq!(hw, hw_path);
+        assert_eq!(emu, sweep_dir.join("mode2-baseline/emu/trace.events.json"));
+        assert!(!emu.exists());
 
         // read_pc1_manifest returns None gracefully (no panic).
         assert!(read_pc1_manifest(&sweep_dir).is_none());
@@ -3672,6 +3656,16 @@ mod tests {
         assert!(read_grounding_from_pc1_manifest(&sweep_dir).is_empty());
 
         // Cleanup.
+        let _ = std::fs::remove_dir_all(&sweep_dir);
+    }
+
+    #[test]
+    fn pc_anchored_returns_none_when_no_mode2_baseline_dir() {
+        let tmpdir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
+        let sweep_dir = tmpdir.join("task8_test_no_mode2_baseline");
+        let _ = std::fs::remove_dir_all(&sweep_dir);
+        std::fs::create_dir_all(&sweep_dir).expect("create sweep dir");
+        assert!(find_mode2_baseline_pair(&sweep_dir).is_none());
         let _ = std::fs::remove_dir_all(&sweep_dir);
     }
 

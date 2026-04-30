@@ -66,11 +66,11 @@ pub struct AtomWindow {
     pub emu_atoms: usize,
 }
 
-fn extract_pcs(stream: &[u8]) -> Vec<u16> {
-    decode(stream)
-        .into_iter()
+fn extract_pcs(frames: &[Mode2Frame]) -> Vec<u16> {
+    frames
+        .iter()
         .filter_map(|f| match f {
-            Mode2Frame::NewPc { pc } => Some(pc),
+            Mode2Frame::NewPc { pc } => Some(*pc),
             _ => None,
         })
         .collect()
@@ -94,11 +94,11 @@ fn compare_layer1(hw: &[u16], emu: &[u16]) -> PcSequenceLayer {
     PcSequenceLayer { hw_count: hw.len(), emu_count: emu.len(), first_diverge: first, samples }
 }
 
-fn extract_lcs(stream: &[u8]) -> Vec<(u8, u32)> {
-    decode(stream)
-        .into_iter()
+fn extract_lcs(frames: &[Mode2Frame]) -> Vec<(u8, u32)> {
+    frames
+        .iter()
         .filter_map(|f| match f {
-            Mode2Frame::Lc { flag, count } => Some((flag, count)),
+            Mode2Frame::Lc { flag, count } => Some((*flag, *count)),
             _ => None,
         })
         .collect()
@@ -128,26 +128,26 @@ fn compare_layer2(hw: &[(u8, u32)], emu: &[(u8, u32)]) -> LcLayer {
     LcLayer { hw_count: hw.len(), emu_count: emu.len(), first_diverge: first, samples }
 }
 
-fn extract_pc_segments(stream: &[u8]) -> Vec<(u16, u16, usize)> {
+fn extract_pc_segments(frames: &[Mode2Frame]) -> Vec<(u16, u16, usize)> {
     let mut out = Vec::new();
     let mut current_anchor: Option<u16> = None;
     let mut atom_count_in_segment: usize = 0;
-    for f in decode(stream) {
+    for f in frames {
         match f {
             Mode2Frame::Atom { .. } => {
                 atom_count_in_segment += 1;
             }
             Mode2Frame::Repeat0 { count } => {
-                atom_count_in_segment += count as usize;
+                atom_count_in_segment += *count as usize;
             }
             Mode2Frame::Repeat1 { count } => {
-                atom_count_in_segment += count as usize;
+                atom_count_in_segment += *count as usize;
             }
             Mode2Frame::NewPc { pc } => {
                 if let Some(prev) = current_anchor {
-                    out.push((prev, pc, atom_count_in_segment));
+                    out.push((prev, *pc, atom_count_in_segment));
                 }
-                current_anchor = Some(pc);
+                current_anchor = Some(*pc);
                 atom_count_in_segment = 0;
             }
             _ => {}
@@ -156,7 +156,7 @@ fn extract_pc_segments(stream: &[u8]) -> Vec<(u16, u16, usize)> {
     out
 }
 
-fn compare_layer3(hw: &[u8], emu: &[u8]) -> AtomWindowLayer {
+fn compare_layer3(hw: &[Mode2Frame], emu: &[Mode2Frame]) -> AtomWindowLayer {
     let hw_segs = extract_pc_segments(hw);
     let emu_segs = extract_pc_segments(emu);
     let mut windows = Vec::new();
@@ -174,20 +174,195 @@ fn compare_layer3(hw: &[u8], emu: &[u8]) -> AtomWindowLayer {
 
 /// Compare HW and EMU mode-2 byte streams for one tile.
 ///
+/// Use this entry point only for synthetic single-tile streams (unit
+/// tests, hand-encoded fixtures) -- real captures from the runner
+/// arrive packet-framed and must be demuxed via parse-trace.py first.
+/// For sweep results, use [`compare_mode2_from_events_files`].
+pub fn compare_mode2_for_tile(hw_stream: &[u8], emu_stream: &[u8], tile: TileKey) -> Mode2CompareResult {
+    let hw_frames = decode(hw_stream);
+    let emu_frames = decode(emu_stream);
+    compare_mode2_for_tile_from_frames(&hw_frames, &emu_frames, tile)
+}
+
+/// Compare HW and EMU mode-2 frame streams for one tile.
+///
 /// Returns a result with all three layers populated. `passed` is `true`
 /// iff Layer 1 (PC sequence) and Layer 2 (LC count + flag) both have
 /// zero divergences. Layer 3 (atom windows) is informational only.
-pub fn compare_mode2_for_tile(hw_stream: &[u8], emu_stream: &[u8], tile: TileKey) -> Mode2CompareResult {
-    let hw_pcs = extract_pcs(hw_stream);
-    let emu_pcs = extract_pcs(emu_stream);
+pub fn compare_mode2_for_tile_from_frames(
+    hw_frames: &[Mode2Frame],
+    emu_frames: &[Mode2Frame],
+    tile: TileKey,
+) -> Mode2CompareResult {
+    let hw_pcs = extract_pcs(hw_frames);
+    let emu_pcs = extract_pcs(emu_frames);
     let layer1 = compare_layer1(&hw_pcs, &emu_pcs);
 
-    let hw_lcs = extract_lcs(hw_stream);
-    let emu_lcs = extract_lcs(emu_stream);
+    let hw_lcs = extract_lcs(hw_frames);
+    let emu_lcs = extract_lcs(emu_frames);
     let layer2 = compare_layer2(&hw_lcs, &emu_lcs);
-    let layer3 = compare_layer3(hw_stream, emu_stream);
+    let layer3 = compare_layer3(hw_frames, emu_frames);
     let passed = layer1.first_diverge.is_none() && layer2.first_diverge.is_none();
     Mode2CompareResult { tile, layer1, layer2, layer3, passed }
+}
+
+/// Outcome of loading + comparing a sweep's mode-2 events JSON pair.
+#[derive(Debug, Clone)]
+pub struct Mode2EventsCompareReport {
+    /// Per-tile results for tiles present in BOTH HW and EMU.
+    pub per_tile: Vec<Mode2CompareResult>,
+    /// Tile keys that appear in HW only.
+    pub hw_only: Vec<TileKey>,
+    /// Tile keys that appear in EMU only.
+    pub emu_only: Vec<TileKey>,
+}
+
+#[derive(Debug)]
+pub enum Mode2EventsCompareError {
+    Read {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    Parse {
+        path: std::path::PathBuf,
+        message: String,
+    },
+}
+
+impl std::fmt::Display for Mode2EventsCompareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read { path, source } => write!(f, "read {}: {}", path.display(), source),
+            Self::Parse { path, message } => write!(f, "parse {}: {}", path.display(), message),
+        }
+    }
+}
+
+impl std::error::Error for Mode2EventsCompareError {}
+
+/// Load HW and EMU events-JSON files (as produced by `parse-trace.py
+/// --trace-mode inst_exec`), pair tiles, and run the three-layer
+/// comparator on each pair.
+pub fn compare_mode2_from_events_files(
+    hw_path: &std::path::Path,
+    emu_path: &std::path::Path,
+) -> Result<Mode2EventsCompareReport, Mode2EventsCompareError> {
+    let hw_tiles = load_events_file(hw_path)?;
+    let emu_tiles = load_events_file(emu_path)?;
+
+    let mut per_tile = Vec::new();
+    let mut hw_only = Vec::new();
+    let mut emu_only = Vec::new();
+
+    let mut emu_keys: std::collections::BTreeSet<TileKey> = emu_tiles.keys().copied().collect();
+    let mut hw_keys: Vec<TileKey> = hw_tiles.keys().copied().collect();
+    hw_keys.sort();
+    for tile in hw_keys {
+        match emu_tiles.get(&tile) {
+            Some(emu_frames) => {
+                let hw_frames = &hw_tiles[&tile];
+                per_tile.push(compare_mode2_for_tile_from_frames(hw_frames, emu_frames, tile));
+                emu_keys.remove(&tile);
+            }
+            None => hw_only.push(tile),
+        }
+    }
+    emu_only.extend(emu_keys);
+
+    Ok(Mode2EventsCompareReport { per_tile, hw_only, emu_only })
+}
+
+/// Parse a parse-trace events JSON into per-tile frame lists.
+///
+/// The JSON shape is:
+/// ```text
+/// { "tiles": { "<pkt_type>,<row>,<col>": [ {"type": "..."}, ... ], ... } }
+/// ```
+fn load_events_file(
+    path: &std::path::Path,
+) -> Result<std::collections::BTreeMap<TileKey, Vec<Mode2Frame>>, Mode2EventsCompareError> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| Mode2EventsCompareError::Read { path: path.to_path_buf(), source: e })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| Mode2EventsCompareError::Parse { path: path.to_path_buf(), message: e.to_string() })?;
+    let tiles =
+        value
+            .get("tiles")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| Mode2EventsCompareError::Parse {
+                path: path.to_path_buf(),
+                message: "missing or non-object \"tiles\" field".into(),
+            })?;
+    let mut out = std::collections::BTreeMap::new();
+    for (key, events) in tiles {
+        let tile = parse_tile_key(key)
+            .map_err(|message| Mode2EventsCompareError::Parse { path: path.to_path_buf(), message })?;
+        let arr = events.as_array().ok_or_else(|| Mode2EventsCompareError::Parse {
+            path: path.to_path_buf(),
+            message: format!("tile {} value is not an array", key),
+        })?;
+        let mut frames = Vec::with_capacity(arr.len());
+        for ev in arr {
+            if let Some(frame) = event_to_frame(ev) {
+                frames.push(frame);
+            }
+        }
+        out.insert(tile, frames);
+    }
+    Ok(out)
+}
+
+/// "<pkt_type>,<row>,<col>" -> TileKey.
+fn parse_tile_key(s: &str) -> Result<TileKey, String> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 3 {
+        return Err(format!("tile key {:?} not 'pkt_type,row,col'", s));
+    }
+    let pkt_type: u8 = parts[0].trim().parse().map_err(|_| format!("tile key {:?}: bad pkt_type", s))?;
+    let row: u8 = parts[1].trim().parse().map_err(|_| format!("tile key {:?}: bad row", s))?;
+    let col: u8 = parts[2].trim().parse().map_err(|_| format!("tile key {:?}: bad col", s))?;
+    Ok(TileKey { col, row, pkt_type })
+}
+
+/// Map one parse-trace event dict to a [`Mode2Frame`].
+///
+/// Returns None for event types we don't model (currently none reach
+/// here -- Filler frames are absorbed by the upstream decoder before
+/// they reach this JSON shape).
+fn event_to_frame(ev: &serde_json::Value) -> Option<Mode2Frame> {
+    let ty = ev.get("type")?.as_str()?;
+    match ty {
+        "Start" => {
+            let anchor_pc = ev.get("anchor_pc").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            Some(Mode2Frame::Start { anchor_pc })
+        }
+        "New_PC" => {
+            let pc = ev.get("pc").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            Some(Mode2Frame::NewPc { pc })
+        }
+        "E_atom" => Some(Mode2Frame::Atom { executed: true }),
+        "N_atom" => Some(Mode2Frame::Atom { executed: false }),
+        "LC" => {
+            let flag = ev.get("flag").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+            let count = ev.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            Some(Mode2Frame::Lc { flag, count })
+        }
+        "Repeat" => {
+            // Upstream decoder collapses Repeat0 (4-bit count) and
+            // Repeat1 (10-bit count) into one "Repeat" event. The
+            // distinction doesn't matter to any layer of the
+            // comparator, so just pick one variant by count.
+            let count = ev.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+            if count <= 0xF {
+                Some(Mode2Frame::Repeat0 { count: count as u8 })
+            } else {
+                Some(Mode2Frame::Repeat1 { count: count as u16 })
+            }
+        }
+        "Sync" => Some(Mode2Frame::Sync),
+        "Stop" => Some(Mode2Frame::Stop),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -344,5 +519,92 @@ mod tests {
             push_bits(0b0010, 4, &mut out, &mut word, &mut bit_pos);
         }
         out
+    }
+
+    fn write_events_json(path: &std::path::Path, tile_key: &str, events_json: &str) {
+        let body = format!(
+            "{{\"schema_version\":1,\"trace_mode\":\"inst_exec\",\"tiles\":{{\"{}\":{}}}}}",
+            tile_key, events_json
+        );
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn events_json_round_trips_pc_and_lc() {
+        let tmpdir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
+        let dir = tmpdir.join("compare_mode2_events_json_round_trip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hw = dir.join("hw.json");
+        let emu = dir.join("emu.json");
+        let body = r#"[
+            {"type":"Start","anchor_pc":256},
+            {"type":"New_PC","pc":256},
+            {"type":"E_atom"},
+            {"type":"New_PC","pc":512},
+            {"type":"LC","flag":0,"count":8},
+            {"type":"Stop"}
+        ]"#;
+        write_events_json(&hw, "0,2,0", body);
+        write_events_json(&emu, "0,2,0", body);
+
+        let report = compare_mode2_from_events_files(&hw, &emu).unwrap();
+        assert_eq!(report.per_tile.len(), 1);
+        assert_eq!(report.hw_only, vec![]);
+        assert_eq!(report.emu_only, vec![]);
+        let r = &report.per_tile[0];
+        assert!(r.passed);
+        assert_eq!(r.tile, TileKey { col: 0, row: 2, pkt_type: 0 });
+        assert_eq!(r.layer1.hw_count, 2);
+        assert_eq!(r.layer2.hw_count, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn events_json_reports_tiles_only_in_one_side() {
+        let tmpdir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
+        let dir = tmpdir.join("compare_mode2_events_json_one_side");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hw = dir.join("hw.json");
+        let emu = dir.join("emu.json");
+        let pc = r#"[{"type":"New_PC","pc":256}]"#;
+        std::fs::write(&hw, format!(r#"{{"tiles":{{"0,2,0":{},"0,3,0":{}}}}}"#, pc, pc)).unwrap();
+        std::fs::write(&emu, format!(r#"{{"tiles":{{"0,2,0":{}}}}}"#, pc)).unwrap();
+
+        let report = compare_mode2_from_events_files(&hw, &emu).unwrap();
+        assert_eq!(report.per_tile.len(), 1);
+        assert_eq!(report.per_tile[0].tile.row, 2);
+        assert_eq!(report.hw_only, vec![TileKey { col: 0, row: 3, pkt_type: 0 }]);
+        assert_eq!(report.emu_only, vec![]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn events_json_handles_repeat_count() {
+        let tmpdir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
+        let dir = tmpdir.join("compare_mode2_events_json_repeat");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hw = dir.join("hw.json");
+        let emu = dir.join("emu.json");
+        let body = r#"[
+            {"type":"New_PC","pc":256},
+            {"type":"E_atom"},
+            {"type":"Repeat","count":7},
+            {"type":"New_PC","pc":512}
+        ]"#;
+        write_events_json(&hw, "0,2,0", body);
+        write_events_json(&emu, "0,2,0", body);
+
+        let report = compare_mode2_from_events_files(&hw, &emu).unwrap();
+        let r = &report.per_tile[0];
+        assert_eq!(r.layer3.windows.len(), 1);
+        assert_eq!(r.layer3.windows[0].hw_atoms, 8);
+        assert_eq!(r.layer3.windows[0].emu_atoms, 8);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
