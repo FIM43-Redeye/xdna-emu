@@ -935,3 +935,34 @@ fn bit_accumulator_flushes_at_32_bits() {
     let bytes = tu.encoded_bytes();
     assert_eq!(bytes, &[0xDE, 0xAD, 0xBE, 0xEF]);
 }
+
+#[test]
+fn align_pads_partial_word_with_filler0() {
+    let mut tu = TraceUnit::new(0, 1);
+    // Push 12 bits (3 nibbles); align should pad 5 nibbles of Filler0
+    // (each Filler0 = 4 bits 0010), then flush.
+    tu.push_bits(0xABC, 12);
+    tu.align_to_word_via_filler0();
+    // Expect: 0xABC followed by 5 nibbles of 0010 = 0x22222
+    // Total: 0xABC22222 -> bytes [0xAB, 0xC2, 0x22, 0x22]
+    assert_eq!(tu.encoded_bytes(), &[0xAB, 0xC2, 0x22, 0x22]);
+}
+
+#[test]
+fn align_is_noop_when_word_boundary() {
+    let mut tu = TraceUnit::new(0, 1);
+    tu.push_bits(0xDEADBEEF, 32);
+    let before = tu.encoded_bytes().len();
+    tu.align_to_word_via_filler0();
+    assert_eq!(tu.encoded_bytes().len(), before);
+}
+
+#[test]
+fn emit_long_frame_aligns_then_pushes_word() {
+    let mut tu = TraceUnit::new(0, 1);
+    tu.push_bits(0b1110_0011, 8); // partial word (Repeat0 example)
+    tu.emit_long_frame(0xCAFEBABE);
+    // Expect: partial word padded with 6 nibbles Filler0 = 0xE3222222
+    // Then long frame as next word: 0xCAFEBABE
+    assert_eq!(tu.encoded_bytes(), &[0xE3, 0x22, 0x22, 0x22, 0xCA, 0xFE, 0xBA, 0xBE]);
+}

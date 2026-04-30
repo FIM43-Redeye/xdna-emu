@@ -879,6 +879,39 @@ impl TraceUnit {
         self.try_emit_packet();
     }
 
+    /// Pad the current word with Filler0 (0010) nibbles until aligned
+    /// to a 32-bit boundary. No-op if already aligned.
+    ///
+    /// Filler0 is a 4-bit frame, so this only works when the partial
+    /// word has a multiple of 4 bits already accumulated. That
+    /// invariant is upheld by all mode-2 frame encoders, which only
+    /// push 4-, 8-, 16-, or 32-bit frames. Debug-asserted.
+    #[allow(dead_code)] // consumed by emit_long_frame (Task 1.2) and mode-2 encoders (Tasks 1.5-1.7); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+    fn align_to_word_via_filler0(&mut self) {
+        if self.pending_word_bits == 0 {
+            return;
+        }
+        debug_assert!(
+            self.pending_word_bits % 4 == 0,
+            "align_to_word_via_filler0 called with non-nibble-aligned bits ({}); \
+             only 4-bit-multiple frames are supported in mode 2",
+            self.pending_word_bits
+        );
+        let nibbles_remaining = (32 - self.pending_word_bits) / 4;
+        for _ in 0..nibbles_remaining {
+            self.push_bits(0b0010, 4);
+        }
+    }
+
+    /// Emit a 32-bit "long frame" (Start, LC, Stop). Aligns to word
+    /// boundary first via Filler0 padding, then pushes the whole word.
+    #[allow(dead_code)] // consumed by mode-2 Start/Stop/LC encoders (Tasks 1.5-1.7); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+    fn emit_long_frame(&mut self, word: u32) {
+        self.align_to_word_via_filler0();
+        debug_assert_eq!(self.pending_word_bits, 0);
+        self.push_bits(word, 32);
+    }
+
     /// Consume 28 bytes from the buffer and emit one packet as individual words.
     fn emit_packet_from_buffer(&mut self) {
         // Word 0: packet header
