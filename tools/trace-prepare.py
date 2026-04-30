@@ -7,10 +7,17 @@ the same traced artifacts are used for both.
 
 Steps:
 1. Read aie.mlir, apply NPUDEVICE substitution -> aie_arch.mlir (implicit)
-2. Call trace-inject.py functions as library -> aie_traced.mlir + manifest
+2. Inject trace via mlir-trace-inject.py (declarative aie.trace ops) -> aie_traced.mlir + manifest
 3. Patch test.cpp via tree-sitter (cpp_trace_patch) + BDF patch -> test_traced.cpp
-4. Write events.json from trace-inject manifest
+4. Write events.json from injected MLIR (tiles_traced; trace_ddr_id is
+   derived later by aiecc lowering and patched in via cpp_trace_patch's
+   heuristic when None here)
 5. Write prepare-status.txt (OK / FAIL / SKIP)
+
+Source-detect / route-planning utilities live in tools/deprecated/trace-inject.py
+(loaded as a module). Their imports of mlir-aie's old per-tile-type setup
+helpers were removed upstream, so we no longer call inject_trace from there;
+all injection now goes through the declarative path in mlir-trace-inject.py.
 
 Usage:
     trace-prepare.py <test_source_dir> --output <dir> [--trace-size BYTES]
@@ -21,7 +28,10 @@ Usage:
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -87,6 +97,72 @@ def write_status(output_dir: Path, status: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Declarative trace injection (replaces the deprecated imperative path)
+# ---------------------------------------------------------------------------
+
+# Per-tile aie.trace declaration in the injected MLIR. Symbol form is
+# emitted by mlir-trace-inject._trace_sym as "trace_t<col>_<row>"; we match
+# it back out here to build the tiles_traced manifest entry.
+_TRACE_DECL_RE = re.compile(
+    r"aie\.trace\s+@trace_t(\d+)_(\d+)\s*\(\s*%[A-Za-z0-9_]+\s*\)"
+)
+
+
+def inject_trace_declarative(
+    mlir_text: str, trace_size: int
+) -> tuple[str, dict]:
+    """Run mlir-trace-inject.py on the MLIR text; return (traced, manifest).
+
+    Replaces the deprecated trace-inject.py inject_trace() call. The
+    declarative path lets aiecc lower the trace setup the same way it
+    handles every other aie.trace.* op, which avoids the brittle
+    aie.utils.trace.setup imports that broke when mlir-aie deprecated
+    the per-tile-type configure_*_aie2 helpers.
+
+    Manifest fields:
+      - trace_size: passed through (aie.trace.host_config buffer_size)
+      - trace_ddr_id: None. The trace BO arg index is added by aiecc
+        during runtime-sequence lowering, after this step. Downstream
+        consumers (cpp_trace_patch) fall back to a positional heuristic
+        when this is None.
+      - tiles_traced: derived from the injected aie.trace declarations
+        by symbol-name parsing. Currently only compute cores (rows >= 2)
+        get trace declarations from mlir-trace-inject.
+    """
+    inject_tool = Path(__file__).parent / "mlir-trace-inject.py"
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        in_path = td_path / "in.mlir"
+        out_path = td_path / "out.mlir"
+        in_path.write_text(mlir_text)
+        proc = subprocess.run(
+            [sys.executable, str(inject_tool),
+             "--input", str(in_path),
+             "--out", str(out_path),
+             "--buffer-size", str(trace_size)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"mlir-trace-inject failed (exit {proc.returncode}):\n"
+                f"{proc.stderr.strip()}"
+            )
+        traced_text = out_path.read_text()
+
+    tiles_traced = [
+        {"col": int(col), "row": int(row), "tile_type": "core",
+         "events": "default_core_8"}
+        for col, row in _TRACE_DECL_RE.findall(traced_text)
+    ]
+    manifest = {
+        "trace_size": trace_size,
+        "trace_ddr_id": None,
+        "tiles_traced": tiles_traced,
+    }
+    return traced_text, manifest
+
+
+# ---------------------------------------------------------------------------
 # Main logic
 # ---------------------------------------------------------------------------
 
@@ -122,10 +198,10 @@ def prepare_trace(
     manifest_partial = None  # set by MLIR injection below; None when skipped
 
     if not skip_mlir:
-        # Import trace_inject as a library.  The file is named with a
-        # hyphen (trace-inject.py), so we use importlib for the import.
-        # Module-level functions (detect_source_type, get_mlir_text) work
-        # without the mlir-aie Python API.
+        # Source-type detection / MLIR loading / route planning still come
+        # from the deprecated trace-inject module -- those helpers don't
+        # touch the broken aie.utils.trace.setup imports. Only inject_trace
+        # is migrated to the declarative path (mlir-trace-inject.py).
         tools_dir = str(Path(__file__).parent)
         if tools_dir not in sys.path:
             sys.path.insert(0, tools_dir)
@@ -133,11 +209,9 @@ def prepare_trace(
         import importlib.util
         _spec = importlib.util.spec_from_file_location(
             "trace_inject",
-            os.path.join(tools_dir, "trace-inject.py"),
+            os.path.join(tools_dir, "deprecated", "trace-inject.py"),
         )
         trace_inject = importlib.util.module_from_spec(_spec)
-        # Register in sys.modules so ProcessPoolExecutor workers can
-        # pickle/unpickle functions defined in trace-inject.py.
         sys.modules["trace_inject"] = trace_inject
         _spec.loader.exec_module(trace_inject)
 
@@ -159,7 +233,10 @@ def prepare_trace(
                   file=sys.stderr)
             return 0
 
-        # Plan trace route.
+        # Plan trace route. With the declarative injection path, aiecc
+        # picks the routing automatically so the planner is advisory --
+        # but if it says infeasible, declarative injection is unlikely
+        # to find a route either, so we still gate on it.
         plan = trace_inject.plan_trace_route(mlir_text)
         if not plan.feasible:
             msg = f"FAIL trace route infeasible: {plan.reason}"
@@ -167,17 +244,14 @@ def prepare_trace(
             print(f"FAIL {test_name}: {msg}", file=sys.stderr)
             return 1
 
-        # If the planner widened the device for trace routing room,
-        # apply the same widening to the MLIR before injection.
         if plan.widened_device:
             mlir_text, _ = trace_inject.widen_device(mlir_text)
             print(f"  {test_name}: widened to {plan.widened_device} for trace",
                   file=sys.stderr)
 
-        # Inject trace.
         try:
-            traced_mlir, manifest_partial = trace_inject.inject_trace(
-                mlir_text, trace_size, plan,
+            traced_mlir, manifest_partial = inject_trace_declarative(
+                mlir_text, trace_size,
             )
         except Exception as e:
             msg = f"FAIL trace injection: {e}"
