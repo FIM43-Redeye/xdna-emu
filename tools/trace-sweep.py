@@ -1524,7 +1524,9 @@ def sweep_lockstep(
 
     Each batch applies all tile patches in a single --multi-tile
     invocation, then runs HW + EMU together. After the sweep, an
-    optional HW-only mode-2 (inst_exec) baseline batch is captured.
+    optional mode-2 (inst_exec) baseline batch is captured for whichever
+    sides are enabled (HW under mode2-baseline/hw/, EMU under
+    mode2-baseline/emu/).
     A sweep-manifest.json is written to out_dir with per-batch grounding
     PC sets and the cross-batch invariance check result.
     """
@@ -1724,7 +1726,10 @@ def sweep_lockstep(
         # ----------------------------------------------------------------
         # Mode-2 finishing batch (HW only, inst_exec).
         # ----------------------------------------------------------------
-        if with_mode2_baseline and run_hw and hw_session is not None:
+        if with_mode2_baseline and (
+            (run_hw and hw_session is not None)
+            or (run_emu and emu_session is not None)
+        ):
             compute_tiles = [t for t in tiles if t.tile_type == "core"]
             if compute_tiles:
                 # No "events" key on purpose: trace-patch-events.py's
@@ -1749,30 +1754,54 @@ def sweep_lockstep(
                 ], check=True, capture_output=True)
 
                 mode2_dir = out_dir / "mode2-baseline"
-                mode2_hw_dir = mode2_dir / "hw"
-                mode2_hw_dir.mkdir(parents=True, exist_ok=True)
-                mode2_trace_bin = mode2_hw_dir / "trace.bin"
-                mode2_events_out = mode2_hw_dir / "trace.events.json"
-                mode2_cycles_out = mode2_hw_dir / "cycles.txt"
 
-                mode2_res = _run_one_side(
-                    side="HW",
-                    session=hw_session,
-                    runner_env=hw_runner_env,
-                    instr=mode2_insts,
-                    trace_bin=mode2_trace_bin,
-                    mlir=mlir,
-                    events_out=mode2_events_out,
-                    cycles_out=mode2_cycles_out,
-                    parse_log=mode2_hw_dir / "parse.log",
-                    ctrlpkt=ctrlpkt,
-                    parser_session=hw_parser,
-                    trace_mode="inst_exec",
-                )
-                mode2_succeeded = mode2_res.ok
+                hw_ok: Optional[bool] = None
+                emu_ok: Optional[bool] = None
+
+                if run_hw and hw_session is not None:
+                    mode2_hw_dir = mode2_dir / "hw"
+                    mode2_hw_dir.mkdir(parents=True, exist_ok=True)
+                    mode2_hw_res = _run_one_side(
+                        side="HW",
+                        session=hw_session,
+                        runner_env=hw_runner_env,
+                        instr=mode2_insts,
+                        trace_bin=mode2_hw_dir / "trace.bin",
+                        mlir=mlir,
+                        events_out=mode2_hw_dir / "trace.events.json",
+                        cycles_out=mode2_hw_dir / "cycles.txt",
+                        parse_log=mode2_hw_dir / "parse.log",
+                        ctrlpkt=ctrlpkt,
+                        parser_session=hw_parser,
+                        trace_mode="inst_exec",
+                    )
+                    hw_ok = mode2_hw_res.ok
+
+                if run_emu and emu_session is not None:
+                    mode2_emu_dir = mode2_dir / "emu"
+                    mode2_emu_dir.mkdir(parents=True, exist_ok=True)
+                    mode2_emu_res = _run_one_side(
+                        side="EMU",
+                        session=emu_session,
+                        runner_env=emu_runner_env,
+                        instr=mode2_insts,
+                        trace_bin=mode2_emu_dir / "trace.bin",
+                        mlir=mlir,
+                        events_out=mode2_emu_dir / "trace.events.json",
+                        cycles_out=mode2_emu_dir / "cycles.txt",
+                        parse_log=mode2_emu_dir / "parse.log",
+                        ctrlpkt=ctrlpkt,
+                        parser_session=emu_parser,
+                        trace_mode="inst_exec",
+                    )
+                    emu_ok = mode2_emu_res.ok
+
+                # Manifest captured-flag is true if either side produced
+                # a baseline -- the mode-2 comparator's job is to handle
+                # one-sided baselines gracefully (it currently SKIPs).
+                mode2_succeeded = bool(hw_ok) or bool(emu_ok)
                 print(
-                    f"[sweep-lockstep] mode-2 baseline: ok={mode2_res.ok} "
-                    f"cyc={mode2_res.cycles}",
+                    f"[sweep-lockstep] mode-2 baseline: hw_ok={hw_ok} emu_ok={emu_ok}",
                     flush=True,
                 )
 

@@ -2907,33 +2907,13 @@ main() {
   #
   # Mode-2 baseline (Phase 6 / Task 6.2):
   #   trace-sweep.py's --with-mode2-baseline is on by default, so each
-  #   sweep already drops a HW-only mode-2 (inst_exec) batch into
-  #   <sweep_dir>/mode2-baseline/ alongside the mode-1 sweep. The
-  #   trace-compare aggregator (Task 5.5) consumes these via
-  #   list_mode2_baselines() and pairs each baseline with an EMU
-  #   counterpart at <sweep_dir>/<test>/<stem>.emu-mode2-raw.bin.
-  #
-  # TODO(Phase 6 follow-up): mode-2 EMU trace activation. The emulator's
-  # trace unit honors Trace_Control0 mode=2, which is set via CDO writes
-  # from the test program. If a kernel doesn't configure mode 2 itself,
-  # the EMU won't emit mode-2 frames. We rely on the Phase 0 hand-written
-  # ZOL kernels (forthcoming) to write Trace_Control0 mode=2 explicitly.
-  # Once those land, this script needs no further runtime-mode plumbing.
-  #
-  # TODO(Phase 6 follow-up): EMU mode-2 raw-stream output path. The
-  # comparator expects <sweep_dir>/<test>/<stem>.emu-mode2-raw.bin (see
-  # src/trace/compare.rs:2547-2551) but the XRT plugin doesn't yet
-  # write that file. Two options under discussion: (a) extend the
-  # plugin/coordinator to dump the per-tile mode-2 byte stream after
-  # the EMU run, (b) post-process the existing trace_raw.bin via a new
-  # tools/extract-mode2.py. Until one of those lands, the comparator
-  # path will SKIP each baseline with "EMU stream not present" -- which
-  # is the harmless current behavior, not a regression.
-  #
-  # TODO(Phase 6 smoke-test): real mode-2 capture on add_one_using_dma
-  # is intentionally deferred until Phase 0 lands the hand-written ZOL
-  # kernel materials. Once those exist, `--mode2 add_one_using_dma`
-  # exercises the full HW + (eventual) EMU path end-to-end.
+  #   sweep drops mode-2 (inst_exec) baselines into
+  #   <sweep_dir>/mode2-baseline/{hw,emu}/trace.events.json after the
+  #   mode-1 sweep. The trace-compare aggregator pairs them via
+  #   find_mode2_baseline_pair() and runs the three-layer comparator
+  #   per tile (PC sequence + LC sequence gate; atom windows are
+  #   informational). One-sided baselines (HW or EMU only) get a SKIP
+  #   line, which is harmless rather than a regression.
 
   if [[ "$PC_ANCHORED" == "true" ]]; then
     local tc_bin=""
