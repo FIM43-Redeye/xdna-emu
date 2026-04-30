@@ -419,19 +419,36 @@ scientific instruments, not tests.
 - Bridge integration: alongside existing bridge sweep, no new HW-time cost.
 - Round-trip decoder tests: Rust-only fixtures, no HW required.
 
-## 10. Phase 7 — Upstream contribution
+## 10. Phase 7 — Upstream check-in
 
-After Phase 0 lands the bit-28 finding and the encoder ships, package
-the result for upstream submission to mlir-aie:
+Cautious, two-step. mlir-aie's `python/utils/trace/parse.py` and
+`event_ir.py` handle modes 0 and 1 only — no mode-2 decoder upstream.
+Before doing anything more substantial, we want to know whether
+maintainers or community members already have internal knowledge of
+bit-28 we couldn't find publicly.
 
-- Captures + decoded fixtures demonstrating the flag semantics.
-- Rust mode-2 decoder ported back to Python, contributed as a
-  `mlir-aie/python/utils/trace/parse_mode2.py` enhancement.
-- Documentation note explaining the bit-28 flag (the project that owns
-  the trace tooling deserves to know what their own format means).
+**Step 1: Ask.** File a single GitHub issue on mlir-aie summarizing
+what we found (mode-2 frame tree we recovered, the bit-28 flag we
+don't yet understand) and asking whether anyone has prior knowledge.
+The issue goes up *only after* Phase 0 captures are in hand, so it's
+specific and answerable. Exact wording is reviewed with the user
+before posting (per the project rule on external communications).
 
-This is a publishable artifact — the project's MIT licensing and
-open-source posture make contributing back natural.
+**Step 2: Respond to whatever happens.**
+
+- If a maintainer or contributor knows bit-28: confirm against our
+  captures, document the source in the findings doc, done.
+- If nobody knows but maintainers are interested in a public answer:
+  follow up with our captures + findings as an issue comment or doc
+  PR, depending on what fits their workflow.
+- If maintainers express interest in a Python mode-2 decoder
+  upstream: at that point — and not before — draft a contribution.
+
+We do *not* preemptively prepare a decoder PR. AMD/mlir-aie
+maintainers may have constraints we can't see (e.g., preferring users
+go through AMD tooling for mode-2). The right posture is "we found
+something, do you want to know about it" rather than "we wrote you a
+patch."
 
 ## 11. Phase ordering and ownership
 
@@ -444,7 +461,7 @@ open-source posture make contributing back natural.
 | 4 | Rust decoder | Port mode2.py to Rust | trace/mode2_decode.rs |
 | 5 | Comparator | Three-layer compare + aggregator hook | trace/compare_mode2.rs + compare.rs |
 | 6 | Bridge integration | Test wiring + sweep updates | scripts + tools/parse-trace.py |
-| 7 | Upstream | Findings + decoder contributed to mlir-aie | PR to mlir-aie |
+| 7 | Upstream | File mlir-aie issue asking about bit-28; respond per maintainer guidance | GitHub issue (wording user-reviewed) |
 
 Phases 1–3 can proceed in parallel after Phase 0 lands. Phase 4 unblocks
 both the encoder's round-trip tests and the comparator. Phase 5 needs
