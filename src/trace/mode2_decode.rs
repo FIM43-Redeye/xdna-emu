@@ -118,8 +118,11 @@ fn decode_one(bits: &mut BitStream) -> Option<Mode2Frame> {
                     _ => None, // unknown 11111xxx
                 };
             }
-            // 11110 -- Start (Task 4.5)
-            return None;
+            // 11110 -- Start: 27 bits remaining. Top 13 bits are
+            // flag(1) + reserved(12), bottom 14 are anchor_pc.
+            let rest = bits.take(27)?;
+            let anchor_pc = (rest & 0x3FFF) as u16;
+            return Some(Mode2Frame::Start { anchor_pc });
         }
         // 110x -- Repeat0, Repeat1, Stop
         if b2 == 1 && b3 == 0 {
@@ -264,5 +267,50 @@ mod tests {
         let frames = decode(&bytes);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0], Mode2Frame::Stop);
+    }
+
+    #[test]
+    fn decodes_filler1() {
+        // Filler1 prefix is 11111110 (full byte) = 0xFE
+        let bytes = [0xFE];
+        let frames = decode(&bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], Mode2Frame::Filler1);
+    }
+
+    #[test]
+    fn decodes_start() {
+        // Start prefix 11110, then 27b (1b flag + 12b reserved + 14b PC).
+        // Anchor PC = 0x100, flag = 0:
+        // 11110 + 0 + 12 zeros + 14b 0x100
+        // = 0xF0000100. BE bytes: [0xF0, 0x00, 0x01, 0x00]
+        let bytes = [0xF0, 0x00, 0x01, 0x00];
+        let frames = decode(&bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], Mode2Frame::Start { anchor_pc: 0x100 });
+    }
+
+    #[test]
+    fn parity_with_mode2_py_single_loop() {
+        // Phase 0 produces this fixture. If absent (Phase 0 still
+        // pending), skip without failing.
+        let raw_path = "tools/mode2_capture_fixtures/raw/single_loop_fixed.bin";
+        let json_path = "tools/mode2_capture_fixtures/decoded/single_loop_fixed.json";
+        if !std::path::Path::new(raw_path).exists() {
+            eprintln!("skipping parity test: Phase 0 fixture not present");
+            return;
+        }
+        let raw = std::fs::read(raw_path).unwrap();
+        let frames = decode(&raw);
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(json_path).unwrap()).unwrap();
+        let py_count = json.as_array().map(|a| a.len()).unwrap_or(0);
+        // Allow off-by-one for any leading/trailing sentinel difference.
+        assert!(
+            (frames.len() as isize - py_count as isize).abs() <= 1,
+            "Rust decoder: {} frames, Python decoder: {} frames",
+            frames.len(),
+            py_count
+        );
     }
 }
