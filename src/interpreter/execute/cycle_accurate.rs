@@ -583,6 +583,7 @@ impl CycleAccurateExecutor {
             let branch_cycle = ctx.cycles;
             ctx.timing_context_mut()
                 .record_event(branch_cycle, EventType::BranchTaken { from_pc: pc, to_pc: target });
+            tile.core_trace.notify_branch_taken(branch_cycle, target);
         }
 
         // Advance cycle counter by 1 (pipelined issue rate).
