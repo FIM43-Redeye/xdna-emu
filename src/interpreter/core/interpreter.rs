@@ -6,7 +6,7 @@ use crate::device::tile::Tile;
 use crate::interpreter::bundle::VliwBundle;
 use crate::interpreter::decode::InstructionDecoder;
 use crate::interpreter::execute::CycleAccurateExecutor;
-use crate::interpreter::state::ExecutionContext;
+use crate::interpreter::state::{EventType, ExecutionContext};
 use crate::interpreter::traits::{DecodeError, Decoder, ExecuteResult, Executor};
 
 /// Core execution status.
@@ -191,7 +191,17 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
                 } else {
-                    let _ = ctx.check_hardware_loop(pc); // wired to event log + trace unit in Task 2.3
+                    if let Some(info) = ctx.check_hardware_loop(pc) {
+                        let cycle = ctx.cycles;
+                        ctx.timing_context_mut().record_event(
+                            cycle,
+                            EventType::LoopBoundary {
+                                lc_before: info.lc_before,
+                                lc_after: info.lc_after,
+                                le_pc: info.le_pc,
+                            },
+                        );
+                    }
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -204,7 +214,17 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                     ctx.set_pc(branch_target);
                     ctx.delay_pending_writes(1);
                 } else {
-                    let _ = ctx.check_hardware_loop(pc); // wired to event log + trace unit in Task 2.3
+                    if let Some(info) = ctx.check_hardware_loop(pc) {
+                        let cycle = ctx.cycles;
+                        ctx.timing_context_mut().record_event(
+                            cycle,
+                            EventType::LoopBoundary {
+                                lc_before: info.lc_before,
+                                lc_after: info.lc_after,
+                                le_pc: info.le_pc,
+                            },
+                        );
+                    }
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -217,7 +237,17 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                     ctx.set_pc(branch_target);
                     ctx.delay_pending_writes(1);
                 } else {
-                    let _ = ctx.check_hardware_loop(pc); // wired to event log + trace unit in Task 2.3
+                    if let Some(info) = ctx.check_hardware_loop(pc) {
+                        let cycle = ctx.cycles;
+                        ctx.timing_context_mut().record_event(
+                            cycle,
+                            EventType::LoopBoundary {
+                                lc_before: info.lc_before,
+                                lc_after: info.lc_after,
+                                le_pc: info.le_pc,
+                            },
+                        );
+                    }
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -346,7 +376,17 @@ where
                     ctx.set_pc(branch_target);
                     ctx.delay_pending_writes(1);
                 } else {
-                    let _ = ctx.check_hardware_loop(pc); // wired to event log + trace unit in Task 2.3
+                    if let Some(info) = ctx.check_hardware_loop(pc) {
+                        let cycle = ctx.cycles;
+                        ctx.timing_context_mut().record_event(
+                            cycle,
+                            EventType::LoopBoundary {
+                                lc_before: info.lc_before,
+                                lc_after: info.lc_after,
+                                le_pc: info.le_pc,
+                            },
+                        );
+                    }
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -362,7 +402,17 @@ where
                     ctx.set_pc(branch_target);
                     ctx.delay_pending_writes(1);
                 } else {
-                    let _ = ctx.check_hardware_loop(pc); // wired to event log + trace unit in Task 2.3
+                    if let Some(info) = ctx.check_hardware_loop(pc) {
+                        let cycle = ctx.cycles;
+                        ctx.timing_context_mut().record_event(
+                            cycle,
+                            EventType::LoopBoundary {
+                                lc_before: info.lc_before,
+                                lc_after: info.lc_after,
+                                le_pc: info.le_pc,
+                            },
+                        );
+                    }
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -378,7 +428,17 @@ where
                     ctx.set_pc(branch_target);
                     ctx.delay_pending_writes(1);
                 } else {
-                    let _ = ctx.check_hardware_loop(pc); // wired to event log + trace unit in Task 2.3
+                    if let Some(info) = ctx.check_hardware_loop(pc) {
+                        let cycle = ctx.cycles;
+                        ctx.timing_context_mut().record_event(
+                            cycle,
+                            EventType::LoopBoundary {
+                                lc_before: info.lc_before,
+                                lc_after: info.lc_after,
+                                le_pc: info.le_pc,
+                            },
+                        );
+                    }
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
