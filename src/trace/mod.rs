@@ -8,6 +8,7 @@
 //! and VCD-to-Perfetto conversion for aiesimulator integration.
 
 pub mod compare;
+pub mod mode2_decode;
 pub mod store;
 pub mod vcd;
 
