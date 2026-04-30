@@ -374,6 +374,29 @@ impl TraceUnit {
                 self.stop_event = ((value >> 24) & 0xFF) as u8;
                 self.configured = true;
 
+                // Programming Trace_Control0 starts a fresh trace session. On
+                // real HW, writing the configuration register naturally moves
+                // the trace unit to a clean Idle state -- no sticky Stopped
+                // status carries forward across reconfigurations. Without this
+                // reset, batch-stdin mode (where Trace_Control0 is rewritten
+                // at the start of each batch's insts.bin) would only record
+                // the first batch: state would latch in Stopped after the
+                // first stop_event and no subsequent start_event could
+                // re-arm it. Clear the per-session bookkeeping (state,
+                // buffers, mode-2 ZOL tracking) so the next start_event
+                // begins recording cleanly.
+                self.state = TraceState::Idle;
+                self.mode2_zol_active = false;
+                self.byte_buffer.clear();
+                self.pending_words.clear();
+                self.pending_word = 0;
+                self.pending_word_bits = 0;
+                self.pending_atoms_run = None;
+                self.pending_mode2_frames.clear();
+                self.pending_slot_mask = 0;
+                self.pending_pc = 0;
+                self.pending_cycle = 0;
+
                 // Trace unit waits in Idle state until its start_event fires.
                 // The CDO sequence configures broadcast channels, then writes
                 // Event_Generate to fire USER_EVENT -> BROADCAST_N -> trace

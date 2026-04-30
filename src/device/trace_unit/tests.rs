@@ -1267,6 +1267,35 @@ fn mode2_notify_loop_boundary_back_to_back_zols() {
 }
 
 #[test]
+fn rewriting_control0_resets_state_for_rerun() {
+    // Models the bridge-runner batch-stdin pattern: each batch's insts.bin
+    // re-issues the Trace_Control0 write as part of its trace setup. A new
+    // configuration must yield a clean Idle state -- otherwise after the
+    // first batch's stop_event fires, the unit latches in Stopped and no
+    // subsequent start_event can re-arm it.
+    let mut tu = TraceUnit::new(0, 1);
+    tu.set_packet_type(0);
+    // Arm: mode=EventTime(0), start_event=28, stop_event=29
+    tu.write_register(0x00, (29 << 24) | (28 << 16));
+    tu.set_event_slot(0, 28);
+    tu.notify_event(28, 0, None); // start
+    tu.notify_event(29, 100, None); // stop -- transitions to Stopped + flush
+    assert!(matches!(tu.state, super::TraceState::Stopped));
+    let after_first = tu.encoded_bytes_len();
+
+    // Second "batch": rewrite Control0 with the same config. State should
+    // reset to Idle and buffers should be cleared so the next start fires.
+    tu.write_register(0x00, (29 << 24) | (28 << 16));
+    assert!(matches!(tu.state, super::TraceState::Idle), "state after re-config");
+    assert_eq!(tu.encoded_bytes_len(), 0, "byte_buffer should be cleared on reconfigure");
+
+    // Re-arm and verify start works again.
+    tu.notify_event(28, 200, None);
+    assert!(matches!(tu.state, super::TraceState::Running), "rerun start should fire");
+    let _ = after_first; // silence unused-var lint
+}
+
+#[test]
 fn mode2_start_uses_real_pc_anchor() {
     let mut tu = TraceUnit::new(0, 1);
     tu.set_packet_type(0);
