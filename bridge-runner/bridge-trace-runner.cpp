@@ -1626,6 +1626,23 @@ RunOutcome execute_run(
 
         // Trace BO: zero every launch (the trace unit writes a prefix;
         // stale bytes beyond the prefix would corrupt later parses).
+        //
+        // Note on cumulative offsets across batches: the trace shim DMA
+        // BD (configured once per run by insts.bin via npu_writebd) is
+        // valid but never completes -- the trace stream is open-ended
+        // and there is no length check that fires. Re-pushing the same
+        // BD on the next run does not reset the channel's internal
+        // write-byte counter, so each batch's events land at the
+        // cumulative offset where the previous batch's writes stopped.
+        // Empty batches (no matching events) leave the pointer untouched,
+        // which is why some sweep batches start exactly where the last
+        // non-empty batch ended. Data integrity is preserved (the BO
+        // here is genuinely zero before each run; new data is at fresh
+        // offsets, never overlapping prior runs); only the buffer's
+        // *effective capacity* shrinks linearly across the batch-stdin
+        // session. With trace_size_bytes=1MB this is fine for sweeps in
+        // the low thousands of batches. A future improvement could
+        // inject an explicit DMA channel reset between runs.
         {
             xrt::bo& bo = prep.pool_bos[prep.pool_trace_bo_idx];
             std::memset(bo.map<void*>(), 0, args.trace_size_bytes);
