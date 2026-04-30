@@ -91,6 +91,7 @@ COMPILER_MODE="both"  # "both", "chess", "peano"
 NO_TRACE="${NO_TRACE:-true}"
 SWEEP=false
 PC_ANCHORED=false
+MODE2=false
 RUN_AIESIM=false
 NO_TIMEOUT=false
 WITH_HW_CYCLES=${WITH_HW_CYCLES:-false}
@@ -126,6 +127,7 @@ while [[ $# -gt 0 ]]; do
     --trace)               NO_TRACE=false; shift ;;
     --sweep)               SWEEP=true; shift ;;
     --trace=pc-anchored)   PC_ANCHORED=true; shift ;;
+    --mode2)               MODE2=true; PC_ANCHORED=true; shift ;;
     --aiesim)              RUN_AIESIM=true; shift ;;
     --serial-hw)           NPU_HW_JOBS=1; shift ;;
     --parallel-hw)         NPU_HW_JOBS="${NPU_HW_JOBS_PARALLEL:-5}"; shift ;;
@@ -148,6 +150,13 @@ Options:
                   produce a PC-anchored HW/EMU comparison report per test.
                   Auto-detects compute tiles from the MLIR source. Outputs go
                   to RESULTS_DIR/<test>.<compiler>.pc-anchored/.
+  --mode2         Implies --trace=pc-anchored, additionally captures a
+                  mode-2 (inst_exec) HW baseline per test (already the
+                  default behavior of trace-sweep.py, made explicit here).
+                  Mode-2 capture currently relies on the test/CDO writing
+                  Trace_Control0 mode=2; see TODOs in this script for the
+                  Phase 0 kernel work and the EMU-side raw-stream output
+                  path needed to fully wire HW vs EMU mode-2 comparison.
   --aiesim        Run aiesimulator on Chess builds + VCD coverage audit
   --list          List available tests and exit
   -jN             Override parallelism (default: nproc)
@@ -195,7 +204,7 @@ for _c in "${COMPILERS[@]}"; do
 done
 
 # Export variables that parallel jobs need.
-export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP PC_ANCHORED RUN_AIESIM NO_TIMEOUT WITH_HW_CYCLES WITH_CYCLE_DIFF
+export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP PC_ANCHORED MODE2 RUN_AIESIM NO_TIMEOUT WITH_HW_CYCLES WITH_CYCLE_DIFF
 export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT SCRIPT_DIR TRACE_QUARANTINE_FILE
 export XRT_DIR XRT_INCLUDE XRT_LIB
 export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
@@ -2885,7 +2894,9 @@ main() {
   # ---- Phase 5b': PC-anchored sweep (optional) ----------------------------
   #
   # Runs a mode-1 (event_pc) lockstep sweep on passing tests and produces a
-  # PC-anchored HW/EMU coverage report.  Requires --trace=pc-anchored.
+  # PC-anchored HW/EMU coverage report.  Requires --trace=pc-anchored
+  # (or its superset --mode2, which additionally enables mode-2 baseline
+  # capture documented below).
   #
   # Tile discovery: greps the test's aie.mlir for aie.tile(col, row) lines
   # where row >= 2 (compute rows) and formats them as col:row:core.  If no
@@ -2893,6 +2904,36 @@ main() {
   #
   # Grounding: PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1 (default for mode-1).
   # The sweep uses --reuse-ctx to cut per-batch latency on Phoenix.
+  #
+  # Mode-2 baseline (Phase 6 / Task 6.2):
+  #   trace-sweep.py's --with-mode2-baseline is on by default, so each
+  #   sweep already drops a HW-only mode-2 (inst_exec) batch into
+  #   <sweep_dir>/mode2-baseline/ alongside the mode-1 sweep. The
+  #   trace-compare aggregator (Task 5.5) consumes these via
+  #   list_mode2_baselines() and pairs each baseline with an EMU
+  #   counterpart at <sweep_dir>/<test>/<stem>.emu-mode2-raw.bin.
+  #
+  # TODO(Phase 6 follow-up): mode-2 EMU trace activation. The emulator's
+  # trace unit honors Trace_Control0 mode=2, which is set via CDO writes
+  # from the test program. If a kernel doesn't configure mode 2 itself,
+  # the EMU won't emit mode-2 frames. We rely on the Phase 0 hand-written
+  # ZOL kernels (forthcoming) to write Trace_Control0 mode=2 explicitly.
+  # Once those land, this script needs no further runtime-mode plumbing.
+  #
+  # TODO(Phase 6 follow-up): EMU mode-2 raw-stream output path. The
+  # comparator expects <sweep_dir>/<test>/<stem>.emu-mode2-raw.bin (see
+  # src/trace/compare.rs:2547-2551) but the XRT plugin doesn't yet
+  # write that file. Two options under discussion: (a) extend the
+  # plugin/coordinator to dump the per-tile mode-2 byte stream after
+  # the EMU run, (b) post-process the existing trace_raw.bin via a new
+  # tools/extract-mode2.py. Until one of those lands, the comparator
+  # path will SKIP each baseline with "EMU stream not present" -- which
+  # is the harmless current behavior, not a regression.
+  #
+  # TODO(Phase 6 smoke-test): real mode-2 capture on add_one_using_dma
+  # is intentionally deferred until Phase 0 lands the hand-written ZOL
+  # kernel materials. Once those exist, `--mode2 add_one_using_dma`
+  # exercises the full HW + (eventual) EMU path end-to-end.
 
   if [[ "$PC_ANCHORED" == "true" ]]; then
     local tc_bin=""
@@ -2977,9 +3018,15 @@ main() {
               --out-dir "$sweep_dir"
               --mode event_pc
               --core-grounding "PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1"
-              --with-mode2-baseline
               --reuse-ctx
             )
+            # Mode-2 baseline capture: trace-sweep.py defaults this on, but
+            # we pass it explicitly when --mode2 is set so a future default
+            # flip upstream cannot silently turn it off here. Without
+            # --mode2 we inherit whatever the Python tool's default is.
+            if [[ "$MODE2" == "true" ]]; then
+              sweep_args+=(--with-mode2-baseline)
+            fi
             $RUN_HW || sweep_args+=(--no-hw)
             $RUN_EMU || sweep_args+=(--no-emu)
 
