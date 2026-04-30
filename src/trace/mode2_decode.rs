@@ -46,6 +46,9 @@ impl<'a> BitStream<'a> {
         Some(bit)
     }
 
+    // Used starting in Task 4.3 when New_PC begins consuming a 14b payload.
+    // The allow expires the moment 4.3 lands.
+    #[allow(dead_code)]
     fn take(&mut self, n: usize) -> Option<u32> {
         let mut val = 0u32;
         for _ in 0..n {
