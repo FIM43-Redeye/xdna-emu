@@ -110,6 +110,13 @@ pub enum EventType {
     // -- Branch events (emulator-internal, no direct HW trace event) --
     /// Branch taken with source and target PCs.
     BranchTaken { from_pc: u32, to_pc: u32 },
+    /// Zero-overhead-loop boundary fired this cycle. Emitted from
+    /// `Context::check_hardware_loop` after LC decrement.
+    LoopBoundary {
+        lc_before: u32,
+        lc_after: u32,
+        le_pc: u32,
+    },
 }
 
 /// A timestamped event for profiling.
@@ -297,6 +304,8 @@ mod tests {
             EventType::CoreDisabled,
             // Branch (emulator-internal)
             EventType::BranchTaken { from_pc: 0x100, to_pc: 0x200 },
+            // Loop boundary (emulator-internal)
+            EventType::LoopBoundary { lc_before: 5, lc_after: 4, le_pc: 0x300 },
         ];
 
         let mut log = EventLog::new();
@@ -306,6 +315,6 @@ mod tests {
             log.record(i as u64, event);
         }
 
-        assert_eq!(log.len(), 24);
+        assert_eq!(log.len(), 25);
     }
 }
