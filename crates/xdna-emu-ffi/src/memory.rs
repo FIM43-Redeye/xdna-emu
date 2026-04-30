@@ -162,6 +162,16 @@ pub unsafe extern "C" fn xdna_emu_add_host_buffer(
 /// The address is automatically assigned from an internal allocator and
 /// registered with the emulator's host memory system.
 ///
+/// **Address reuse:** prefers a previously-freed range whose aligned size
+/// exactly matches the request; only falls back to advancing
+/// `next_alloc_addr` when no match exists. This mirrors what real HW kernel
+/// drivers do (recycle physical BO addresses) and keeps DMA channels whose
+/// internal pointers persist across runs (e.g. the trace shim-DMA channel)
+/// pointed at the same DDR location across the bridge runner's per-run pool
+/// teardown. Without it, every batch in batch-stdin mode gets a fresh BO,
+/// the channel keeps writing to the stale previous address, and the new
+/// run's trace BO reads back as zeros.
+///
 /// # Safety
 /// - `handle` must be valid
 #[no_mangle]
@@ -176,46 +186,83 @@ pub unsafe extern "C" fn xdna_emu_alloc_buffer(handle: *mut XdnaEmuHandle, size:
     let page_size: u64 = 4096;
     let aligned_size = (size + page_size - 1) & !(page_size - 1);
 
-    // The address is already page-aligned because next_alloc_addr starts
-    // page-aligned and we always advance by page-aligned sizes.
-    let addr = handle.next_alloc_addr;
+    // Prefer a recycled address whose aligned size matches exactly.
+    // Exact-size match (rather than first-fit) keeps the recycled region
+    // self-contained -- no leftover slack to manage and no risk of the
+    // returned region overlapping a still-live allocation.
+    let recycled = handle
+        .free_list
+        .iter()
+        .position(|&(_, sz)| sz == aligned_size)
+        .map(|i| handle.free_list.swap_remove(i).0);
+
+    let addr = recycled.unwrap_or(handle.next_alloc_addr);
 
     let host_mem = handle.engine.host_memory_mut();
     let name = format!("alloc_{:x}", addr);
     if host_mem.allocate_region(&name, addr, aligned_size as usize).is_err() {
         log::error!("Failed to allocate buffer at 0x{:x} size {}", addr, aligned_size);
+        // Recycled addresses go back on the free list; bumping
+        // next_alloc_addr would have stranded a fresh range.
+        if recycled.is_some() {
+            handle.free_list.push((addr, aligned_size));
+        }
         return 0;
     }
 
     // Also register with NPU executor for address patching.
     handle.npu_executor.add_host_buffer(addr, aligned_size as usize);
 
-    handle.next_alloc_addr = addr + aligned_size;
+    if recycled.is_none() {
+        handle.next_alloc_addr = addr + aligned_size;
+    }
 
-    log::debug!("Allocated buffer at 0x{:x} size {}", addr, aligned_size);
+    log::debug!(
+        "Allocated buffer at 0x{:x} size {} ({})",
+        addr,
+        aligned_size,
+        if recycled.is_some() { "recycled" } else { "fresh" }
+    );
     addr
 }
 
 /// Free a previously allocated host memory buffer.
 ///
-/// Removes the region from host memory tracking. The underlying sparse
-/// pages are not deallocated (they will be reclaimed when the emulator
-/// handle is destroyed).
+/// Returns the address range to the free list for size-matched reuse on a
+/// later `xdna_emu_alloc_buffer` call. The underlying sparse pages are not
+/// deallocated (they are reclaimed when the emulator handle is destroyed),
+/// but the host_memory region tracking is removed so the next allocator call
+/// can re-register cleanly.
+///
+/// Returns `XdnaEmuResult::Success` on a successful free, `BufferError` if
+/// the address has no live region, or `InvalidHandle` for a null handle.
+/// (The XRT plugin's `transport_inprocess` calls this through a function
+/// pointer typed `Result (*)(XdnaEmuHandle*, uint64_t)` and bails on
+/// non-success, so a void return would surface garbage from EAX as a fake
+/// failure.)
 ///
 /// # Safety
 /// - `handle` must be valid
 /// - `addr` should be a value previously returned by `xdna_emu_alloc_buffer`
 #[no_mangle]
-pub unsafe extern "C" fn xdna_emu_free_buffer(handle: *mut XdnaEmuHandle, addr: u64) {
+pub unsafe extern "C" fn xdna_emu_free_buffer(handle: *mut XdnaEmuHandle, addr: u64) -> XdnaEmuResult {
     if handle.is_null() {
-        return;
+        return XdnaEmuResult::InvalidHandle;
     }
 
     let handle = &mut *handle;
     let host_mem = handle.engine.host_memory_mut();
+    // Look up the size BEFORE freeing so we can return the range to the
+    // free list with the same aligned size we registered it with.
+    let region_size = host_mem.region_at(addr).map(|r| r.size as u64);
     if !host_mem.free_region(addr) {
         log::warn!("free_buffer: no region at 0x{:x}", addr);
-    } else {
-        log::debug!("Freed buffer at 0x{:x}", addr);
+        return XdnaEmuResult::BufferError;
     }
+    log::debug!("Freed buffer at 0x{:x}", addr);
+
+    if let Some(sz) = region_size {
+        handle.free_list.push((addr, sz));
+    }
+    XdnaEmuResult::Success
 }

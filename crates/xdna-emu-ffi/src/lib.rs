@@ -76,6 +76,16 @@ pub struct XdnaEmuHandle {
     /// Next address to allocate for xdna_emu_alloc_buffer.
     /// Starts at a high address to avoid conflicts with user-specified regions.
     pub(crate) next_alloc_addr: u64,
+    /// Free list of (addr, aligned_size) pairs for size-matched address reuse.
+    /// Real HW kernel drivers' BO allocators reuse physical addresses across
+    /// allocate/free cycles; the bridge runner's per-run pool teardown relies
+    /// on that to keep cumulative shim-DMA channel pointers pointing at the
+    /// same DDR location across batches. Without reuse, the EMU's monotonic
+    /// next_alloc_addr produces a fresh BO per run and the trace channel's
+    /// active transfer (which still holds the previous run's address) writes
+    /// to a stale address. See bridge-trace-runner.cpp:1500-1738 for the
+    /// teardown rationale (alternating-TIMEOUT workaround on real HW).
+    pub(crate) free_list: Vec<(u64, u64)>,
 }
 
 /// Result codes for FFI operations.
@@ -155,6 +165,7 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
         // Start auto-allocation at 0x8000_0000_0000 to avoid conflicts
         // with user-specified host regions (typically < 0x1_0000_0000).
         next_alloc_addr: 0x8000_0000_0000,
+        free_list: Vec::new(),
     });
 
     Box::into_raw(handle)
@@ -289,6 +300,73 @@ mod tests {
                 xdna_emu_free_buffer(h, addr);
                 // Freeing a non-existent address should be a no-op (just logs).
                 xdna_emu_free_buffer(h, 0xDEAD_BEEF);
+            });
+        }
+    }
+
+    #[test]
+    fn test_alloc_after_free_recycles_address() {
+        // The bridge runner's per-run pool teardown (alloc -> free -> alloc
+        // with the same size) needs the same address back; the trace
+        // shim-DMA channel's persistent write pointer relies on it.
+        unsafe {
+            with_handle(|h| {
+                let a1 = xdna_emu_alloc_buffer(h, 4096);
+                xdna_emu_free_buffer(h, a1);
+                let a2 = xdna_emu_alloc_buffer(h, 4096);
+                assert_eq!(a1, a2, "freed addr should be recycled on same-size alloc");
+            });
+        }
+    }
+
+    #[test]
+    fn test_recycle_only_on_size_match() {
+        unsafe {
+            with_handle(|h| {
+                let small = xdna_emu_alloc_buffer(h, 4096);
+                xdna_emu_free_buffer(h, small);
+                // Different aligned size: must NOT recycle (would risk
+                // returning an under-sized region).
+                let big = xdna_emu_alloc_buffer(h, 8192);
+                assert_ne!(big, small);
+                // Now another 4K allocation should recycle the original.
+                let recycled = xdna_emu_alloc_buffer(h, 4096);
+                assert_eq!(recycled, small);
+            });
+        }
+    }
+
+    #[test]
+    fn test_recycle_survives_repeated_pool_cycles() {
+        // Models the bridge runner's batch-stdin loop: repeatedly allocate
+        // a fixed pool, then free it, then allocate again. The address
+        // allocator rotates within a stable working set rather than
+        // drifting monotonically, so DMA channel state from a previous
+        // run still resolves to a live physical location.
+        //
+        // Per-slot order may vary (free list is unordered), but:
+        //   - the unique-size slot (trace BO) must round-trip exactly
+        //   - the *set* of addresses across same-size slots must be stable
+        unsafe {
+            with_handle(|h| {
+                let mut first_trace: Option<u64> = None;
+                let mut first_4k: std::collections::HashSet<u64> = std::collections::HashSet::new();
+                for _ in 0..3 {
+                    let trace = xdna_emu_alloc_buffer(h, 1024 * 1024);
+                    let instr = xdna_emu_alloc_buffer(h, 4096);
+                    let input = xdna_emu_alloc_buffer(h, 4096);
+                    if let Some(t) = first_trace {
+                        assert_eq!(trace, t, "trace BO addr must round-trip");
+                        let cycle_4k: std::collections::HashSet<u64> = [instr, input].into_iter().collect();
+                        assert_eq!(cycle_4k, first_4k, "4K pool set must be stable");
+                    } else {
+                        first_trace = Some(trace);
+                        first_4k = [instr, input].into_iter().collect();
+                    }
+                    xdna_emu_free_buffer(h, trace);
+                    xdna_emu_free_buffer(h, instr);
+                    xdna_emu_free_buffer(h, input);
+                }
             });
         }
     }
