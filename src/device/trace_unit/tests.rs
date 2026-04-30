@@ -912,3 +912,26 @@ fn mode1_no_pc_emits_sentinel_zero() {
         "no-PC event should encode sentinel pc=0 with mask=0b1 (slot 0)"
     );
 }
+
+// ===== Mode-2 (Execution) bit accumulator scaffolding =====
+
+#[test]
+fn bit_accumulator_packs_msb_first() {
+    let mut tu = TraceUnit::new(0, 1);
+    tu.push_bits(0b1010, 4);
+    tu.push_bits(0b1100, 4);
+    // Now pending_word_bits == 8, pending_word == 0b1010_1100 << 24
+    // Continue to a full word:
+    tu.push_bits(0, 24);
+    // Should have flushed one word: 0xAC000000 -> bytes AC 00 00 00
+    let bytes = tu.encoded_bytes();
+    assert_eq!(bytes, &[0xAC, 0x00, 0x00, 0x00]);
+}
+
+#[test]
+fn bit_accumulator_flushes_at_32_bits() {
+    let mut tu = TraceUnit::new(0, 1);
+    tu.push_bits(0xDEADBEEF, 32);
+    let bytes = tu.encoded_bytes();
+    assert_eq!(bytes, &[0xDE, 0xAD, 0xBE, 0xEF]);
+}

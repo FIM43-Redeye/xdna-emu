@@ -98,6 +98,26 @@ pub(super) enum TraceState {
     Stopped,
 }
 
+/// In-flight RLE state for consecutive atoms of the same polarity.
+/// Only used in mode-2 (Execution); never set in other modes.
+#[allow(dead_code)] // activated by mode-2 atom emitter (Task 1.8); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+#[derive(Debug, Clone, Copy)]
+struct AtomRun {
+    /// True for E_atom (executed), false for N_atom (stalled).
+    exec: bool,
+    /// Number of cycles with this polarity. Always >= 1 when set.
+    count: u32,
+}
+
+/// A non-atom frame queued for the current cycle (mode-2 only).
+/// Drained by drain_mode2_pending() at cycle commit.
+#[allow(dead_code)] // activated by mode-2 New_PC / LC encoders (Task 1.9); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+#[derive(Debug, Clone, Copy)]
+enum PendingMode2Frame {
+    NewPc { pc: u16 },
+    Lc { flag: u8, count: u32 },
+}
+
 /// Hardware trace unit for one tile module (Core or Memory).
 ///
 /// Configured by register writes from CDO/control packets. When active,
@@ -150,6 +170,25 @@ pub struct TraceUnit {
     /// routing layer to push one word at a time, respecting FIFO backpressure.
     pending_words: VecDeque<(u32, bool)>,
 
+    /// Bit accumulator for mode-2 frame encoding. Bits are packed
+    /// MSB-first into pending_word; when 32 bits are accumulated,
+    /// flush_word_if_full() pushes 4 big-endian bytes to byte_buffer
+    /// and resets the accumulator.
+    pending_word: u32,
+    pending_word_bits: u8,
+
+    /// In-flight RLE state for consecutive E/N atoms (mode-2 only).
+    #[allow(dead_code)]
+    // populated by mode-2 atom emitter (Task 1.8); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+    pending_atoms_run: Option<AtomRun>,
+
+    /// Non-atom frames (New_PC, LC) queued for the current cycle
+    /// (mode-2 only). Drained by drain_mode2_pending() in
+    /// commit_pending_frame.
+    #[allow(dead_code)]
+    // populated by mode-2 New_PC / LC encoders (Task 1.9); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+    pending_mode2_frames: Vec<PendingMode2Frame>,
+
     // -- Tile identity (for packet headers) --
     /// Column of the owning tile.
     col: u8,
@@ -181,6 +220,10 @@ impl TraceUnit {
             no_pc_warnings: 0,
             byte_buffer: Vec::with_capacity(64),
             pending_words: VecDeque::new(),
+            pending_word: 0,
+            pending_word_bits: 0,
+            pending_atoms_run: None,
+            pending_mode2_frames: Vec::new(),
             col,
             row,
             configured: false,
@@ -797,6 +840,43 @@ impl TraceUnit {
         while self.byte_buffer.len() >= 28 {
             self.emit_packet_from_buffer();
         }
+    }
+
+    /// Push `count` bits of `value` MSB-first into the bit accumulator.
+    /// Used by mode-2 frame encoders only. Triggers flush_word_if_full
+    /// after each push.
+    ///
+    /// `count` must be <= 32. `value` must fit in `count` bits (caller
+    /// invariant; debug_assert enforced).
+    #[allow(dead_code)] // consumed by mode-2 frame encoders (Tasks 1.2-1.7); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+    fn push_bits(&mut self, value: u32, count: u8) {
+        debug_assert!(count <= 32);
+        debug_assert!(count == 32 || value < (1u32 << count));
+        for i in (0..count).rev() {
+            let bit = (value >> i) & 1;
+            self.pending_word = (self.pending_word << 1) | bit;
+            self.pending_word_bits += 1;
+            if self.pending_word_bits == 32 {
+                self.flush_word_if_full();
+            }
+        }
+    }
+
+    /// If 32 bits are accumulated, push as 4 big-endian bytes to
+    /// byte_buffer and reset the accumulator. No-op otherwise.
+    #[allow(dead_code)] // called from push_bits (Tasks 1.2-1.7); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+    fn flush_word_if_full(&mut self) {
+        if self.pending_word_bits < 32 {
+            return;
+        }
+        let w = self.pending_word;
+        self.byte_buffer.push((w >> 24) as u8);
+        self.byte_buffer.push((w >> 16) as u8);
+        self.byte_buffer.push((w >> 8) as u8);
+        self.byte_buffer.push(w as u8);
+        self.pending_word = 0;
+        self.pending_word_bits = 0;
+        self.try_emit_packet();
     }
 
     /// Consume 28 bytes from the buffer and emit one packet as individual words.
