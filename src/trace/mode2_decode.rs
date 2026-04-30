@@ -46,9 +46,6 @@ impl<'a> BitStream<'a> {
         Some(bit)
     }
 
-    // Used starting in Task 4.3 when New_PC begins consuming a 14b payload.
-    // The allow expires the moment 4.3 lands.
-    #[allow(dead_code)]
     fn take(&mut self, n: usize) -> Option<u32> {
         let mut val = 0u32;
         for _ in 0..n {
@@ -62,8 +59,9 @@ impl<'a> BitStream<'a> {
 ///
 /// Bit ordering is MSB-first within each byte. Stops at end-of-stream
 /// or first frame that fails to decode (returns the frames decoded so
-/// far). Unknown prefixes drain the rest of the stream silently --
-/// real captures may interleave tiles configured for different modes.
+/// far). Unknown prefixes terminate decoding -- real captures may interleave
+/// tiles configured for different modes, but in those cases the caller
+/// should be filtering by tile-key before invoking decode().
 pub fn decode(bytes: &[u8]) -> Vec<Mode2Frame> {
     let mut bits = BitStream::new(bytes);
     let mut out = Vec::new();
@@ -118,8 +116,9 @@ fn decode_one(bits: &mut BitStream) -> Option<Mode2Frame> {
         // 1100/1101 -- Multiple/Repeat/Stop (Task 4.4)
         return None;
     }
-    // 10x -- New_PC (Task 4.3)
-    None
+    // 10 -- New_PC: 14-bit PC follows
+    let pc = bits.take(14)? as u16;
+    Some(Mode2Frame::NewPc { pc })
 }
 
 #[cfg(test)]
@@ -164,5 +163,25 @@ mod tests {
         let frames = decode(&bytes);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0], Mode2Frame::Sync);
+    }
+
+    #[test]
+    fn decodes_new_pc() {
+        // New_PC prefix is 10, then 14b PC. Pack PC = 0x1234 (binary
+        // 01_0010_0011_0100). Full 16-bit frame: 10 01_0010_0011_0100
+        // = 0x9234. As bytes (MSB-first): [0x92, 0x34].
+        let bytes = [0x92, 0x34];
+        let frames = decode(&bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], Mode2Frame::NewPc { pc: 0x1234 });
+    }
+
+    #[test]
+    fn decodes_new_pc_zero() {
+        // PC = 0x0000: bits 10 00_0000_0000_0000 = 0x8000 -> [0x80, 0x00]
+        let bytes = [0x80, 0x00];
+        let frames = decode(&bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], Mode2Frame::NewPc { pc: 0x0000 });
     }
 }
