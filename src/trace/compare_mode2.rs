@@ -120,7 +120,7 @@ mod tests {
         let mut out = Vec::new();
         let mut bit_pos: u32 = 0;
         let mut word: u32 = 0;
-        let mut push_bits = |val: u32, count: u32, out: &mut Vec<u8>, word: &mut u32, bit_pos: &mut u32| {
+        let push_bits = |val: u32, count: u32, out: &mut Vec<u8>, word: &mut u32, bit_pos: &mut u32| {
             for i in (0..count).rev() {
                 let b = (val >> i) & 1;
                 *word = (*word << 1) | b;
