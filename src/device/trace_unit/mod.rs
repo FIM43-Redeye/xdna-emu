@@ -873,6 +873,22 @@ impl TraceUnit {
         self.emit_long_frame(word);
     }
 
+    /// Encode a Repeat0 frame: 4-bit prefix 1110 + 4-bit count.
+    #[allow(dead_code)] // consumed by RLE flush state machine (Task 1.8); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+    fn encode_repeat0(&mut self, n: u8) {
+        debug_assert!(n < 16, "Repeat0 count {} exceeds 4 bits", n);
+        let frame = (0b1110u32 << 4) | (n as u32 & 0xF);
+        self.push_bits(frame, 8);
+    }
+
+    /// Encode a Repeat1 frame: 6-bit prefix 110110 + 10-bit count.
+    #[allow(dead_code)] // consumed by RLE flush state machine (Task 1.8); see docs/superpowers/plans/2026-04-29-a2b-mode2.md
+    fn encode_repeat1(&mut self, n: u16) {
+        debug_assert!(n < 1024, "Repeat1 count {} exceeds 10 bits", n);
+        let frame = (0b110110u32 << 10) | (n as u32 & 0x3FF);
+        self.push_bits(frame, 16);
+    }
+
     /// Push `count` bits of `value` MSB-first into the bit accumulator.
     /// Used by mode-2 frame encoders only. Triggers flush_word_if_full
     /// after each push.

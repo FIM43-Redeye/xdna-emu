@@ -1017,3 +1017,25 @@ fn round_trip_lc_after_partial_word() {
     assert!(summary.contains("EN"));
     assert!(summary.contains("LC(0,8)"));
 }
+
+#[test]
+fn round_trip_repeat0() {
+    let mut tu = TraceUnit::new(0, 1);
+    tu.encode_repeat0(5);
+    tu.align_to_word_via_filler0();
+    let frames = crate::trace::mode2_decode::decode(tu.encoded_bytes());
+    assert!(frames
+        .iter()
+        .any(|f| matches!(f, crate::trace::mode2_decode::Mode2Frame::Repeat0 { count: 5 })));
+}
+
+#[test]
+fn round_trip_repeat1() {
+    let mut tu = TraceUnit::new(0, 1);
+    tu.encode_repeat1(0x1FF);
+    tu.align_to_word_via_filler0();
+    let frames = crate::trace::mode2_decode::decode(tu.encoded_bytes());
+    assert!(frames
+        .iter()
+        .any(|f| matches!(f, crate::trace::mode2_decode::Mode2Frame::Repeat1 { count: 0x1FF })));
+}
