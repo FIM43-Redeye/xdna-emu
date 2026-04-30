@@ -201,6 +201,7 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                                 le_pc: info.le_pc,
                             },
                         );
+                        tile.core_trace.notify_loop_boundary(cycle, info.lc_before, info.lc_after);
                     }
                 }
                 self.status = CoreStatus::Ready;
@@ -224,6 +225,7 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                                 le_pc: info.le_pc,
                             },
                         );
+                        tile.core_trace.notify_loop_boundary(cycle, info.lc_before, info.lc_after);
                     }
                 }
                 self.status = CoreStatus::Ready;
@@ -247,6 +249,7 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                                 le_pc: info.le_pc,
                             },
                         );
+                        tile.core_trace.notify_loop_boundary(cycle, info.lc_before, info.lc_after);
                     }
                 }
                 self.status = CoreStatus::Ready;
@@ -386,6 +389,7 @@ where
                                 le_pc: info.le_pc,
                             },
                         );
+                        tile.core_trace.notify_loop_boundary(cycle, info.lc_before, info.lc_after);
                     }
                 }
                 self.status = CoreStatus::Ready;
@@ -412,6 +416,7 @@ where
                                 le_pc: info.le_pc,
                             },
                         );
+                        tile.core_trace.notify_loop_boundary(cycle, info.lc_before, info.lc_after);
                     }
                 }
                 self.status = CoreStatus::Ready;
@@ -438,6 +443,7 @@ where
                                 le_pc: info.le_pc,
                             },
                         );
+                        tile.core_trace.notify_loop_boundary(cycle, info.lc_before, info.lc_after);
                     }
                 }
                 self.status = CoreStatus::Ready;
