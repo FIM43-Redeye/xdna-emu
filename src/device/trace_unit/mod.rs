@@ -274,6 +274,7 @@ impl TraceUnit {
     }
 
     /// Return the current operating mode.
+    #[cfg(test)]
     pub(crate) fn mode(&self) -> TraceMode {
         self.mode
     }
@@ -567,25 +568,29 @@ impl TraceUnit {
         }
     }
 
-    /// Mode-2 only: record that the core retired an instruction this cycle.
-    /// No-op outside `mode == Execution && state == Running`.
-    pub fn notify_core_active(&mut self, _cycle: u64) {
+    /// Mode-2 only: record the disposition of one conditional branch.
+    /// `taken=true` queues an E_atom; `taken=false` queues an N_atom.
+    ///
+    /// Per AM020 ch.2 (L299-305), mode-2 records "Conditional and
+    /// unconditional direct branches, all indirect branches, ZOL LC".
+    /// Atoms are emitted once per *conditional branch*, not once per
+    /// cycle: E for "condition fired", N for "fall-through".
+    /// Unconditional branches emit no atom (they always execute).
+    pub fn notify_atom(&mut self, taken: bool) {
         if !self.is_mode2_running() {
             return;
         }
-        self.append_atom_to_run(true);
-    }
-
-    /// Mode-2 only: record that the core stalled this cycle.
-    pub fn notify_core_stalled(&mut self, _cycle: u64) {
-        if !self.is_mode2_running() {
-            return;
-        }
-        self.append_atom_to_run(false);
+        self.append_atom_to_run(taken);
     }
 
     /// Mode-2 only: queue a New_PC frame for the current cycle.
-    /// Drained alongside the cycle's atom by commit_cycle.
+    ///
+    /// Per AM020, the trace records targets only for branches whose
+    /// destination cannot be statically deduced from the ELF: returns
+    /// (target = LR), indirect calls/jumps, and indirect-target
+    /// conditional taken (e.g. `JNZD r,r,p7`). Direct branches with an
+    /// immediate target emit no New_PC -- the offline debugger reads
+    /// the target from the instruction encoding.
     pub fn notify_branch_taken(&mut self, _cycle: u64, retire_pc: u32) {
         if !self.is_mode2_running() {
             return;

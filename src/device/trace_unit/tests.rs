@@ -1139,14 +1139,14 @@ fn rle_polarity_flip_breaks_run() {
 }
 
 #[test]
-fn mode2_notify_active_emits_e_atom_on_commit() {
+fn mode2_notify_atom_taken_emits_e_atom_on_commit() {
     let mut tu = TraceUnit::new(0, 1);
     tu.set_packet_type(0); // core
     tu.set_mode(TraceMode::Execution);
     tu.set_event_slot(0, 1); // TRUE = slot 0
     tu.set_start_event(1);
     tu.notify_event(1, 0, None); // start event fires at cycle 0
-    tu.notify_core_active(0);
+    tu.notify_atom(true);
     tu.commit_cycle(0);
     // Align pending bits out to bytes so the decoder can read them.
     // (We don't call flush() here because flush() drains byte_buffer
@@ -1166,7 +1166,7 @@ fn mode2_notify_branch_taken_queues_new_pc() {
     tu.set_event_slot(0, 1);
     tu.set_start_event(1);
     tu.notify_event(1, 0, None);
-    tu.notify_core_active(0);
+    tu.notify_atom(true);
     tu.notify_branch_taken(0, 0x300);
     tu.commit_cycle(0);
     tu.align_to_word_via_filler0();
@@ -1179,7 +1179,7 @@ fn mode2_notify_branch_taken_queues_new_pc() {
 fn mode2_notify_in_other_mode_is_noop() {
     let mut tu = TraceUnit::new(0, 1);
     tu.set_mode(TraceMode::EventTime);
-    tu.notify_core_active(0);
+    tu.notify_atom(true);
     tu.notify_branch_taken(0, 0x300);
     tu.notify_loop_boundary(0, 8, 7);
     // No mode-2 buffering happened.
@@ -1195,7 +1195,7 @@ fn mode2_notify_when_idle_is_noop() {
     tu.set_packet_type(0);
     tu.set_mode(TraceMode::Execution);
     // No start event fired -- state == Idle
-    tu.notify_core_active(0);
+    tu.notify_atom(true);
     tu.notify_branch_taken(0, 0x300);
     assert_eq!(tu.encoded_bytes_len(), 0);
     assert!(tu.pending_atoms_run.is_none());

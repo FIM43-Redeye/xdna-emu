@@ -575,6 +575,12 @@ impl CycleAccurateExecutor {
         //
         // Adding BRANCH_PENALTY_CYCLES on top of delay slots would
         // double-count: the pipeline flush IS the delay slots.
+        //
+        // Mode-2 trace notifications (notify_atom / notify_branch_taken) are
+        // emitted from `control.rs` at branch-resolution time, where the
+        // semantic context (conditional vs unconditional, direct vs
+        // indirect target) is still available. This event is
+        // timing-bookkeeping only.
         let branch_target = match final_result {
             ExecuteResult::Branch { target } | ExecuteResult::Call { target } => Some(target),
             _ => None,
@@ -583,7 +589,6 @@ impl CycleAccurateExecutor {
             let branch_cycle = ctx.cycles;
             ctx.timing_context_mut()
                 .record_event(branch_cycle, EventType::BranchTaken { from_pc: pc, to_pc: target });
-            tile.core_trace.notify_branch_taken(branch_cycle, target);
         }
 
         // Advance cycle counter by 1 (pipelined issue rate).

@@ -175,6 +175,20 @@ impl ControlUnit {
                     // For other conditions, check flags
                     _ => Self::evaluate_condition(condition, ctx.flags()),
                 };
+                // Mode-2 trace: per AM020 ch.2, every conditional branch
+                // emits an atom (E if taken, N if not). Unconditional
+                // branches emit no atom. New_PC is emitted only when the
+                // destination is dynamic (target came from a register, not
+                // an immediate); direct targets are deducible from the
+                // ELF.
+                let is_unconditional = matches!(condition, BranchCondition::Always);
+                let target_is_indirect = !Self::has_immediate_target(op);
+                if !is_unconditional {
+                    tile.core_trace.notify_atom(should_branch);
+                }
+                if should_branch && target_is_indirect {
+                    tile.core_trace.notify_branch_taken(ctx.cycles, target);
+                }
                 if should_branch {
                     Some(ExecuteResult::Branch { target })
                 } else {
@@ -185,12 +199,21 @@ impl ControlUnit {
             Some(SemanticOp::Call) => {
                 let target = Self::get_branch_target(op, ctx);
                 // Save return address (PC + instruction size handled by caller)
-                // Link register will be set by the executor after this returns
+                // Link register will be set by the executor after this returns.
+                // Mode-2 trace: direct call targets are in the ELF -- no
+                // New_PC. Indirect calls (`JL p`) need New_PC because the
+                // destination is dynamic.
+                if !Self::has_immediate_target(op) {
+                    tile.core_trace.notify_branch_taken(ctx.cycles, target);
+                }
                 Some(ExecuteResult::Branch { target })
             }
 
             Some(SemanticOp::Ret) => {
                 let target = ctx.lr();
+                // Ret's destination is always dynamic (read from LR), so
+                // mode-2 always emits New_PC.
+                tile.core_trace.notify_branch_taken(ctx.cycles, target);
                 Some(ExecuteResult::Branch { target })
             }
 
@@ -353,6 +376,15 @@ impl ControlUnit {
     /// handled by the caller). For unconditional branches (jl), the first source
     /// is the Immediate target directly. For register-indirect branches (jl pN,
     /// ret lr, jnzd), a PointerReg operand provides the target.
+    /// True iff the branch operand list carries an Immediate target,
+    /// matching the preference order of `get_branch_target`. Used by the
+    /// mode-2 trace path to distinguish direct-target branches (target
+    /// known from the ELF) from indirect-target branches (target in a
+    /// register, must emit New_PC).
+    fn has_immediate_target(op: &SlotOp) -> bool {
+        op.sources.iter().any(|s| matches!(s, Operand::Immediate(_)))
+    }
+
     fn get_branch_target(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
         // Prefer Immediate operand (the branch target address)
         for src in &op.sources {
