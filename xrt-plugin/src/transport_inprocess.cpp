@@ -173,12 +173,14 @@ emu_transport_inprocess::~emu_transport_inprocess()
 void emu_transport_inprocess::load_xclbin(const std::string& path,
                                           uint8_t uuid_out[16])
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     Result rc = sym_load_xclbin_(emu_, path.c_str(), uuid_out);
     check(rc, "load_xclbin");
 }
 
 void emu_transport_inprocess::load_pdi(const void* data, size_t size)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     Result rc = sym_load_pdi_(emu_,
                               static_cast<const uint8_t*>(data),
                               static_cast<uint64_t>(size));
@@ -191,6 +193,7 @@ void emu_transport_inprocess::load_pdi(const void* data, size_t size)
 
 uint64_t emu_transport_inprocess::alloc_buffer(size_t size)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     // Prefer the dedicated alloc_buffer FFI if available.
     if (sym_alloc_buffer_)
         return sym_alloc_buffer_(emu_, static_cast<uint64_t>(size));
@@ -207,6 +210,7 @@ uint64_t emu_transport_inprocess::alloc_buffer(size_t size)
 
 void emu_transport_inprocess::free_buffer(uint64_t addr)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     if (sym_free_buffer_) {
         Result rc = sym_free_buffer_(emu_, addr);
         check(rc, "free_buffer");
@@ -219,6 +223,7 @@ void emu_transport_inprocess::free_buffer(uint64_t addr)
 
 void emu_transport_inprocess::reset_context()
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     // Optional symbol -- older emulator builds will not export it. The
     // call site (create_ctx) has been wired up unconditionally; if the
     // symbol is missing we silently fall through, matching the prior
@@ -232,6 +237,7 @@ void emu_transport_inprocess::reset_context()
 void emu_transport_inprocess::write_memory(uint64_t addr, const void* data,
                                            size_t size)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     Result rc = sym_write_host_memory_(
         emu_, addr, static_cast<const uint8_t*>(data),
         static_cast<uint64_t>(size));
@@ -241,6 +247,7 @@ void emu_transport_inprocess::write_memory(uint64_t addr, const void* data,
 void emu_transport_inprocess::read_memory(uint64_t addr, void* data,
                                           size_t size)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     Result rc = sym_read_host_memory_(
         emu_, addr, static_cast<uint8_t*>(data),
         static_cast<uint64_t>(size));
@@ -253,12 +260,14 @@ void emu_transport_inprocess::read_memory(uint64_t addr, void* data,
 
 void emu_transport_inprocess::clear_host_buffers()
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     Result rc = sym_clear_host_buffers_(emu_);
     check(rc, "clear_host_buffers");
 }
 
 void emu_transport_inprocess::add_host_buffer(uint64_t addr, uint64_t size)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     Result rc = sym_add_host_buffer_(emu_, addr, size);
     check(rc, "add_host_buffer");
 }
@@ -269,6 +278,7 @@ void emu_transport_inprocess::add_host_buffer(uint64_t addr, uint64_t size)
 
 void emu_transport_inprocess::execute(const void* instructions, size_t size)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     // Submit NPU instructions (patches addresses, configures shim DMA).
     Result rc = sym_exec_npu_instr_(
         emu_, static_cast<const uint8_t*>(instructions),
@@ -302,6 +312,7 @@ void emu_transport_inprocess::execute(const void* instructions, size_t size)
 void emu_transport_inprocess::execute_from_device(uint64_t dev_addr,
                                                    uint32_t size)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     // Read the instruction bytes from emulator memory, then execute them
     // through the normal path.  This is the XRT flow: the host wrote
     // instructions into a BO, sync'd it to device, and the ert_packet
@@ -315,6 +326,7 @@ void emu_transport_inprocess::execute_from_device(uint64_t dev_addr,
 
 bool emu_transport_inprocess::poll_completion()
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     return last_run_complete_;
 }
 
@@ -325,6 +337,7 @@ bool emu_transport_inprocess::poll_completion()
 uint32_t emu_transport_inprocess::read_reg(uint16_t col, uint16_t row,
                                            uint32_t addr)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     if (!sym_read_register_)
         throw std::runtime_error("read_reg: FFI function not available");
     return sym_read_register_(emu_, col, row, addr);
@@ -333,6 +346,7 @@ uint32_t emu_transport_inprocess::read_reg(uint16_t col, uint16_t row,
 void emu_transport_inprocess::write_reg(uint16_t col, uint16_t row,
                                         uint32_t addr, uint32_t val)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     if (!sym_write_register_)
         throw std::runtime_error("write_reg: FFI function not available");
     Result rc = sym_write_register_(emu_, col, row, addr, val);
@@ -343,6 +357,7 @@ void emu_transport_inprocess::read_tile_memory(uint16_t col, uint16_t row,
                                                uint32_t offset, uint32_t size,
                                                void* out)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     if (!sym_read_tile_mem_)
         throw std::runtime_error("read_tile_memory: FFI function not available");
     Result rc = sym_read_tile_mem_(emu_, col, row, offset, size, out);
@@ -353,6 +368,7 @@ void emu_transport_inprocess::write_tile_memory(uint16_t col, uint16_t row,
                                                 uint32_t offset, uint32_t size,
                                                 const void* data)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     if (!sym_write_tile_mem_)
         throw std::runtime_error("write_tile_memory: FFI function not available");
     Result rc = sym_write_tile_mem_(emu_, col, row, offset, size, data);
@@ -365,6 +381,7 @@ void emu_transport_inprocess::write_tile_memory(uint16_t col, uint16_t row,
 
 uint8_t emu_transport_inprocess::get_columns()
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     if (sym_get_columns_)
         return sym_get_columns_(emu_);
     return 5;  // Phoenix default
@@ -372,6 +389,7 @@ uint8_t emu_transport_inprocess::get_columns()
 
 uint8_t emu_transport_inprocess::get_rows()
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     if (sym_get_rows_)
         return sym_get_rows_(emu_);
     return 6;  // Phoenix default
@@ -379,6 +397,7 @@ uint8_t emu_transport_inprocess::get_rows()
 
 std::string emu_transport_inprocess::get_device_name()
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     if (sym_get_device_name_) {
         char buf[256];
         int32_t len = sym_get_device_name_(emu_, buf, sizeof(buf));
@@ -395,6 +414,7 @@ std::string emu_transport_inprocess::get_device_name()
 int8_t emu_transport_inprocess::get_lock_value(uint16_t col, uint16_t row,
                                                uint8_t lock_id)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     if (sym_get_lock_value_)
         return sym_get_lock_value_(emu_, col, row, lock_id);
     return -128;  // not available
@@ -405,6 +425,7 @@ uint32_t emu_transport_inprocess::get_dma_channel_state(uint16_t col,
                                                          uint8_t is_s2mm,
                                                          uint8_t channel_index)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     if (sym_get_dma_ch_state_)
         return sym_get_dma_ch_state_(emu_, col, row, is_s2mm, channel_index);
     return 0;  // Idle
@@ -416,6 +437,7 @@ bool emu_transport_inprocess::get_dma_channel_stats(uint16_t col,
                                                      uint8_t channel_index,
                                                      DmaChannelStats& out)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     if (!sym_get_dma_ch_stats_)
         return false;
 
@@ -428,6 +450,7 @@ bool emu_transport_inprocess::get_dma_channel_stats(uint16_t col,
 
 bool emu_transport_inprocess::set_log_level(const std::string& level)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     if (!sym_set_log_level_)
         return false;
     return sym_set_log_level_(level.c_str()) == 0;
@@ -436,6 +459,7 @@ bool emu_transport_inprocess::set_log_level(const std::string& level)
 std::string emu_transport_inprocess::dump_tile_state(uint16_t col,
                                                       uint16_t row)
 {
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     if (!sym_dump_tile_state_)
         return {};
 

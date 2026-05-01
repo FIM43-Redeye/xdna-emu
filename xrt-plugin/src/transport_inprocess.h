@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 
 // Forward-declare the opaque handle so we don't pull in xdna_emu.h here.
@@ -166,6 +167,22 @@ private:
 
     void*           dl_handle_ = nullptr;   // dlopen handle
     XdnaEmuHandle*  emu_       = nullptr;   // emulator instance
+
+    // Serialize every FFI call into the Rust handle. The Rust side has
+    // no internal locking on XdnaEmuHandle's mutable state (free_list,
+    // next_alloc_addr, engine, npu_executor, host_memory), and the
+    // bridge runner's async ctx-builder/destroyer threads can call
+    // through this transport concurrently with the main submit thread.
+    // Without this lock, alloc_buffer racing destroy_bo's free_buffer
+    // produced glibc heap corruption ("double free or corruption (!prev)")
+    // and "free_buffer: no region at <addr>" warnings, both of which
+    // were intermittent failures roughly 1-in-3 trace sweep runs.
+    //
+    // Recursive because execute_from_device locks, then calls execute()
+    // which locks again -- keeping the lock held across the read+execute
+    // pair preserves atomicity vs. a destroyer thread tearing down state
+    // between the two calls.
+    mutable std::recursive_mutex ffi_lock_;
 
     // Tracks whether the last execute() has finished.
     bool            last_run_complete_ = true;
