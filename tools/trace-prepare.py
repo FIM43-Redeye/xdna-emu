@@ -74,6 +74,7 @@ def apply_bdf_patch(source: str) -> str:
     This is the same transformation the bridge script applies via sed:
       unsigned int device_index = 0;  ->  const char* _bdf = ...
       auto device = xrt::device(device_index);  ->  auto device = _bdf ? ... : ...
+      xrt::device device = xrt::device(device_index);  ->  xrt::device device = _bdf ? ...
     """
     source = source.replace(
         "unsigned int device_index = 0;",
@@ -82,6 +83,11 @@ def apply_bdf_patch(source: str) -> str:
     source = source.replace(
         "auto device = xrt::device(device_index);",
         'auto device = _bdf ? xrt::device(std::string(_bdf)) : xrt::device(0);',
+    )
+    source = source.replace(
+        "xrt::device device = xrt::device(device_index);",
+        "xrt::device device = "
+        "_bdf ? xrt::device(std::string(_bdf)) : xrt::device(0);",
     )
     return source
 

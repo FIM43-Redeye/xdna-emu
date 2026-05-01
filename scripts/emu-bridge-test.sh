@@ -582,6 +582,14 @@ apply_lit_subs() {
   cmd="${cmd//'%S'/$src_dir}"
   [[ -n "$lit_file" ]] && cmd="${cmd//'%s'/$lit_file}"
   cmd="${cmd//'%aietools'/$AIETOOLS_DIR}"
+  # %PEANO_INSTALL_DIR is set by mlir-aie's lit.site.cfg from cmake's
+  # PEANO_INSTALL_DIR. Tests that compile their own kernel via Peano clang
+  # (func-link-with-peano, matrix_transpose, sync_task_complete_token, etc.)
+  # use it to find clang. Without this substitution, the literal %PEANO_...
+  # leaks into the shell and bash interprets the leading % as a job spec.
+  local _peano_install_dir
+  _peano_install_dir="${PEANO_INSTALL_DIR:-${MLIR_AIE}/../llvm-aie/install}"
+  cmd="${cmd//'%PEANO_INSTALL_DIR'/$_peano_install_dir}"
   # %python aiecc.py: aiecc.py has a python3 shebang and lives on PATH after
   # env activation, but `python3 aiecc.py` makes python3 search CWD only and
   # fails. Strip the python3 prefix and let the shebang handle it.
@@ -613,11 +621,33 @@ extract_build_commands() {
   local src_dir="$2"
   [[ -f "$lit_file" ]] || return 1
 
+  # Determine target NPU so we can drop the wrong-target lit RUN lines.
+  # %run_on_npu1% and %run_on_npu2% are conditional-execution markers that
+  # apply_lit_subs strips to empty -- without filtering on the raw line
+  # first, both branches fire and the npu2 step clobbers the npu1 output
+  # (e.g., aie2p kernel.o overwriting aie2 kernel.o for func-link tests).
+  local target_npu1=true target_npu2=false
+  if requires_npu2 "$src_dir"; then
+    target_npu1=false
+    target_npu2=true
+  fi
+
   while IFS= read -r line; do
     [[ "$line" == *"RUN:"* ]] || continue
+    if ! $target_npu2 && [[ "$line" == *"%run_on_npu2%"* ]]; then
+      continue
+    fi
+    if ! $target_npu1 && [[ "$line" == *"%run_on_npu1%"* ]]; then
+      continue
+    fi
     local cmd
     cmd="$(apply_lit_subs "$src_dir" "$line")"
     [[ "$cmd" == *"./test.exe"* ]] && continue
+    # Some newer tests build to bare `./test` rather than `./test.exe`
+    # (matrix_transpose, sync_task_complete_token, ...). Skip those run
+    # lines too -- bridge always rebuilds the host binary as test.exe.
+    [[ "$cmd" == "./test" ]] && continue
+    [[ "$cmd" == "./test "* ]] && continue
     [[ "$cmd" == *"test.py"* ]] && continue
     [[ "$cmd" == *"run_on_npu"* ]] && continue
     [[ "$cmd" == *"NPUDEVICE"* ]] && continue
@@ -1603,9 +1633,12 @@ compile_one() {
       cp "$traced_dir/test_traced.cpp" "$build_dir/test.cpp"
     else
       # No tracing -- just apply BDF patch.
+      # Some newer tests use explicit `xrt::device device = xrt::device(device_index);`
+      # instead of `auto`; cover both forms or device_index leaks unresolved.
       sed \
         -e 's/unsigned int device_index = 0;/const char* _bdf = std::getenv("XRT_DEVICE_BDF");/' \
         -e 's/auto device = xrt::device(device_index);/auto device = _bdf ? xrt::device(std::string(_bdf)) : xrt::device(0);/' \
+        -e 's/xrt::device device = xrt::device(device_index);/xrt::device device = _bdf ? xrt::device(std::string(_bdf)) : xrt::device(0);/' \
         "$src_dir/test.cpp" > "$build_dir/test.cpp"
     fi
   fi
