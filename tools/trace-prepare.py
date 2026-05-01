@@ -168,6 +168,41 @@ def inject_trace_declarative(
     return traced_text, manifest
 
 
+def lower_trace_ops_with_lateral_routing(mlir_text: str) -> str:
+    """Run aiecc's trace lowering pipeline externally with lateral-routing on.
+
+    Mirrors aiecc.cpp's `runTraceLoweringPipeline`: 4 device-level passes,
+    but adds `lateral-routing=true` on the first one so trace destinations
+    can move to spare shim columns when col 0's S2MM channels are taken.
+    aiecc itself has no CLI knob for that option; doing it here keeps
+    mlir-aie vanilla.
+
+    aiecc skips its own trace lowering when `hasTraceOps()` is false, which
+    holds after these passes consume every aie.trace op.
+    """
+    pipeline = (
+        "builtin.module(aie.device("
+        "aie-insert-trace-flows{lateral-routing=true},"
+        "aie-trace-to-config,"
+        "aie-trace-pack-reg-writes,"
+        "aie-inline-trace-config"
+        "))"
+    )
+    proc = subprocess.run(
+        ["aie-opt", f"--pass-pipeline={pipeline}", "-"],
+        input=mlir_text,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"aie-opt trace lowering failed (exit {proc.returncode}): "
+            f"{proc.stderr.strip().splitlines()[-1] if proc.stderr else ''}"
+        )
+    return proc.stdout
+
+
 # ---------------------------------------------------------------------------
 # Main logic
 # ---------------------------------------------------------------------------
@@ -261,6 +296,22 @@ def prepare_trace(
             )
         except Exception as e:
             msg = f"FAIL trace injection: {e}"
+            write_status(output_dir, msg)
+            print(f"FAIL {test_name}: {msg}", file=sys.stderr)
+            return 1
+
+        # Lower the trace ops via aie-opt before handing the MLIR to aiecc.
+        # We run the same 4-pass trace pipeline aiecc would have run in-memory,
+        # but with `lateral-routing=true` so the AIEInsertTraceFlows pass can
+        # redirect trace destinations to spare shim columns when the
+        # application has saturated col 0's S2MM channels (ctrl-packet,
+        # packet_flow_fanout, etc.). Vanilla aiecc has no CLI knob for this
+        # option, so we lower externally; aiecc's `hasTraceOps` check sees
+        # the ops are already gone and skips its own (un-lateral) lowering.
+        try:
+            traced_mlir = lower_trace_ops_with_lateral_routing(traced_mlir)
+        except Exception as e:
+            msg = f"FAIL trace lowering: {e}"
             write_status(output_dir, msg)
             print(f"FAIL {test_name}: {msg}", file=sys.stderr)
             return 1
