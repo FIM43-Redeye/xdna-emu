@@ -638,6 +638,19 @@ impl InterpreterEngine {
                             tile.core_debug.update_stalls(false, true, false, false);
                             all_halted = false;
                             any_running = true;
+                            // Pipeline-PC adjustment: HW's fetch+decode is
+                            // several stages ahead of execute. When ACQ stalls
+                            // in execute, the fetch PC pins at the start of
+                            // the last delay slot of the next branch (RET in
+                            // the acquire stub). Override tile.core.pc so the
+                            // trace unit sees the same PC HW would, instead
+                            // of the execute PC where ACQ is parked.
+                            let stall_pc = core.context.pc();
+                            if let Some(prog_mem) = tile.program_memory() {
+                                let pipeline_pc = core.interpreter.lock_stall_pipeline_pc(prog_mem, stall_pc);
+                                tile.core.pc = pipeline_pc;
+                                tile.core_debug.update_pc(pipeline_pc);
+                            }
                         }
                         StepResult::WaitDma { .. } => {
                             tile.core_debug.update_stalls(true, false, false, false);

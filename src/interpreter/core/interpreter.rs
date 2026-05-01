@@ -317,6 +317,77 @@ where
         self.last_bundle.as_ref()
     }
 
+    /// Compute the trace-visible PC for a core stalled in a lock-acquire.
+    ///
+    /// AIE2's pipeline fetches and decodes several instructions ahead of
+    /// execute. When ACQ stalls in execute, fetch+decode have already
+    /// advanced through the function epilog (RET + delay slots) and pin
+    /// at the start of the last delay slot, where the pipeline buffer
+    /// fills (the next instruction can't be issued until the branch
+    /// commits, and the branch can't commit until ACQ resolves). The
+    /// trace unit reports this fetch PC as the core's PC -- not the
+    /// execute PC where ACQ is parked.
+    ///
+    /// This helper looks ahead from the WaitLock-stall PC, finds the
+    /// next branch (typically the RET in the lock-acquire stub), and
+    /// returns the start of that branch's last delay slot. Falls back
+    /// to `stall_pc` if the lookahead can't decode or no branch is
+    /// found within a small lookahead window.
+    pub fn lock_stall_pipeline_pc(&self, program_mem: &[u8], stall_pc: u32) -> u32 {
+        use xdna_archspec::aie2::isa::SemanticOp;
+
+        let decode_at = |pc: u32| -> Option<VliwBundle> {
+            let off = pc as usize;
+            if off >= program_mem.len() {
+                return None;
+            }
+            let end = (off + 16).min(program_mem.len());
+            self.decoder.decode(&program_mem[off..end], pc).ok()
+        };
+
+        let is_branch = |bundle: &VliwBundle| {
+            bundle.slots().iter().flatten().any(|op| {
+                matches!(
+                    op.semantic,
+                    Some(SemanticOp::Br | SemanticOp::BrCond | SemanticOp::Call | SemanticOp::Ret)
+                )
+            })
+        };
+
+        // Decode the stall instruction itself (typically the ACQ); advance
+        // past it so we can scan the function epilog for a branch.
+        let stall_bundle = match decode_at(stall_pc) {
+            Some(b) => b,
+            None => return stall_pc,
+        };
+        let mut pc = stall_pc + stall_bundle.size() as u32;
+
+        // Walk forward up to 5 instructions looking for a branch (covers
+        // the common acquire-stub layout: ACQ, then immediately RET).
+        for _ in 0..5 {
+            let bundle = match decode_at(pc) {
+                Some(b) => b,
+                None => return stall_pc,
+            };
+            if is_branch(&bundle) {
+                // Found the branch -- walk forward 4 more bundles past it
+                // (delay slots 1..=4); the start of the 5th delay slot is
+                // where HW's fetch PC pins. AIE2 has 5 branch delay slots.
+                let mut delay_pc = pc + bundle.size() as u32;
+                for _ in 0..4 {
+                    let dbundle = match decode_at(delay_pc) {
+                        Some(b) => b,
+                        None => return stall_pc,
+                    };
+                    delay_pc += dbundle.size() as u32;
+                }
+                return delay_pc;
+            }
+            pc += bundle.size() as u32;
+        }
+        stall_pc
+    }
+
     /// Execute a single instruction cycle.
     ///
     /// Returns the result of execution which indicates how to proceed.
