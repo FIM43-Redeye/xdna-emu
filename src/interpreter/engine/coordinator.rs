@@ -994,7 +994,12 @@ impl InterpreterEngine {
             const TRUE_EVENT: u8 = 1;
             for tile in &mut self.device.array.tiles {
                 if tile.core_trace.is_configured() {
-                    tile.core_trace.notify_event(TRUE_EVENT, cycle, None);
+                    // Pass the core's current PC so mode-2's Start frame
+                    // captures the real anchor PC instead of defaulting to
+                    // 0. Mode 0/1 ignore the PC arg here (mode 0 has no
+                    // PC field, mode 1 only records PCs on slot fires).
+                    let pc = Some(tile.core.pc);
+                    tile.core_trace.notify_event(TRUE_EVENT, cycle, pc);
                 }
                 if tile.mem_trace.is_configured() {
                     tile.mem_trace.notify_event(TRUE_EVENT, cycle, None);

@@ -243,12 +243,27 @@ impl std::error::Error for Mode2EventsCompareError {}
 /// Load HW and EMU events-JSON files (as produced by `parse-trace.py
 /// --trace-mode inst_exec`), pair tiles, and run the three-layer
 /// comparator on each pair.
+///
+/// `remap_columns`: when true, the column field of each side's tile keys
+/// is independently dense-remapped to 0..N-1. This lets HW (whose trace
+/// packets carry the absolute physical column from the kernel placement,
+/// e.g. col=1) compare against EMU (whose trace_unit emits the
+/// array-local column, always starting from 0) without spurious
+/// "HW only" / "EMU only" reports for what is logically the same tile.
+/// Mirrors `crate::trace::compare::remap_tile_columns` for the mode-1
+/// path. See note in `xdna-emu/CLAUDE.md` ("Trace column offset:
+/// emulator col=0 vs HW col=start_col").
 pub fn compare_mode2_from_events_files(
     hw_path: &std::path::Path,
     emu_path: &std::path::Path,
+    remap_columns: bool,
 ) -> Result<Mode2EventsCompareReport, Mode2EventsCompareError> {
-    let hw_tiles = load_events_file(hw_path)?;
-    let emu_tiles = load_events_file(emu_path)?;
+    let mut hw_tiles = load_events_file(hw_path)?;
+    let mut emu_tiles = load_events_file(emu_path)?;
+    if remap_columns {
+        hw_tiles = remap_tile_columns(&hw_tiles);
+        emu_tiles = remap_tile_columns(&emu_tiles);
+    }
 
     let mut per_tile = Vec::new();
     let mut hw_only = Vec::new();
@@ -270,6 +285,25 @@ pub fn compare_mode2_from_events_files(
     emu_only.extend(emu_keys);
 
     Ok(Mode2EventsCompareReport { per_tile, hw_only, emu_only })
+}
+
+/// Independently dense-remap each tile key's column to 0..N-1, preserving
+/// the row + pkt_type within each side. Per-side remap is intentional: HW
+/// and EMU may report different absolute columns for the same logical
+/// tile, so collapsing each side independently is what makes them line up.
+fn remap_tile_columns(
+    tiles: &std::collections::BTreeMap<TileKey, Vec<Mode2Frame>>,
+) -> std::collections::BTreeMap<TileKey, Vec<Mode2Frame>> {
+    let cols: std::collections::BTreeSet<u8> = tiles.keys().map(|k| k.col).collect();
+    let col_map: std::collections::HashMap<u8, u8> =
+        cols.into_iter().enumerate().map(|(i, c)| (c, i as u8)).collect();
+    tiles
+        .iter()
+        .map(|(k, v)| {
+            let new_key = TileKey { col: col_map[&k.col], row: k.row, pkt_type: k.pkt_type };
+            (new_key, v.clone())
+        })
+        .collect()
 }
 
 /// Parse a parse-trace events JSON into per-tile frame lists.
@@ -548,7 +582,7 @@ mod tests {
         write_events_json(&hw, "0,2,0", body);
         write_events_json(&emu, "0,2,0", body);
 
-        let report = compare_mode2_from_events_files(&hw, &emu).unwrap();
+        let report = compare_mode2_from_events_files(&hw, &emu, false).unwrap();
         assert_eq!(report.per_tile.len(), 1);
         assert_eq!(report.hw_only, vec![]);
         assert_eq!(report.emu_only, vec![]);
@@ -573,7 +607,7 @@ mod tests {
         std::fs::write(&hw, format!(r#"{{"tiles":{{"0,2,0":{},"0,3,0":{}}}}}"#, pc, pc)).unwrap();
         std::fs::write(&emu, format!(r#"{{"tiles":{{"0,2,0":{}}}}}"#, pc)).unwrap();
 
-        let report = compare_mode2_from_events_files(&hw, &emu).unwrap();
+        let report = compare_mode2_from_events_files(&hw, &emu, false).unwrap();
         assert_eq!(report.per_tile.len(), 1);
         assert_eq!(report.per_tile[0].tile.row, 2);
         assert_eq!(report.hw_only, vec![TileKey { col: 0, row: 3, pkt_type: 0 }]);
@@ -599,11 +633,47 @@ mod tests {
         write_events_json(&hw, "0,2,0", body);
         write_events_json(&emu, "0,2,0", body);
 
-        let report = compare_mode2_from_events_files(&hw, &emu).unwrap();
+        let report = compare_mode2_from_events_files(&hw, &emu, false).unwrap();
         let r = &report.per_tile[0];
         assert_eq!(r.layer3.windows.len(), 1);
         assert_eq!(r.layer3.windows[0].hw_atoms, 8);
         assert_eq!(r.layer3.windows[0].emu_atoms, 8);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn events_json_remap_columns_pairs_offset_tiles() {
+        // HW reports the absolute placement column (e.g., col=1 when the
+        // kernel was placed starting at column 1). EMU emits its
+        // array-local column, always starting at 0. Without remap, the
+        // mode-2 comparator would log "HW only (1,2)" + "EMU only (0,2)"
+        // for the same logical tile. With remap, both sides dense-remap
+        // to col=0 and the comparator pairs them.
+        let tmpdir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
+        let dir = tmpdir.join("compare_mode2_remap_columns");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hw = dir.join("hw.json");
+        let emu = dir.join("emu.json");
+        let body = r#"[{"type":"Start","anchor_pc":256},{"type":"New_PC","pc":256}]"#;
+        write_events_json(&hw, "0,2,1", body);
+        write_events_json(&emu, "0,2,0", body);
+
+        // Without remap: no common tile.
+        let no_remap = compare_mode2_from_events_files(&hw, &emu, false).unwrap();
+        assert_eq!(no_remap.per_tile.len(), 0);
+        assert_eq!(no_remap.hw_only.len(), 1);
+        assert_eq!(no_remap.emu_only.len(), 1);
+
+        // With remap: both sides collapse to col=0 and pair up.
+        let with_remap = compare_mode2_from_events_files(&hw, &emu, true).unwrap();
+        assert_eq!(with_remap.per_tile.len(), 1);
+        assert_eq!(with_remap.hw_only, vec![]);
+        assert_eq!(with_remap.emu_only, vec![]);
+        let r = &with_remap.per_tile[0];
+        assert_eq!(r.tile, TileKey { col: 0, row: 2, pkt_type: 0 });
+        assert!(r.passed);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

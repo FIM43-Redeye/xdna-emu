@@ -2541,7 +2541,11 @@ pub fn compare_sweep_dir_with_opts(sweep_dir: &Path, opts: &AnalysisOptions) -> 
                     emu_path.display(),
                 );
             } else {
-                match crate::trace::compare_mode2::compare_mode2_from_events_files(&hw_path, &emu_path) {
+                match crate::trace::compare_mode2::compare_mode2_from_events_files(
+                    &hw_path,
+                    &emu_path,
+                    opts.remap_columns,
+                ) {
                     Err(e) => {
                         let _ = writeln!(pc_suffix, "  ERROR loading events: {}", e);
                     }

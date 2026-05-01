@@ -3048,7 +3048,15 @@ main() {
                 > "$sweep_log" 2>&1; then
               echo "  PC-ANCHORED sweep $name ($compiler): OK"
               # Run trace-compare --pc-anchored on the sweep output.
-              if "$tc_bin" --sweep "$sweep_dir" --pc-anchored -o "$report" 2>&1; then
+              # --remap-columns dense-remaps each side's columns to 0..N-1
+              # before pairing tiles. HW packet headers carry the
+              # absolute placement column (e.g., col=1 for a kernel placed
+              # starting at col 1), while the emulator's trace_unit emits
+              # the array-local column (always starting at 0). Without
+              # remap, mode-2 baselines log "HW only" + "EMU only" for
+              # the same logical tile; the mode-1 PC-anchored aggregator
+              # honours the same flag.
+              if "$tc_bin" --sweep "$sweep_dir" --pc-anchored --remap-columns -o "$report" 2>&1; then
                 local top_event
                 top_event="$(grep 'set_diff' "$report" | sort -t '=' -k2 -rn | head -1 | awk '{print $1}')"
                 echo "  PC-ANCHORED compare $name ($compiler): OK (top event: ${top_event:-none}; report: $report)"
