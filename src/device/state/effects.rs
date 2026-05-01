@@ -396,9 +396,13 @@ impl DeviceState {
             for row in 0..rows {
                 if let Some(tile) = self.array.get_mut(col as u8, row as u8) {
                     // Notify both trace units -- the trace unit checks if the
-                    // event matches its configured start/stop event.
-                    // Broadcast re-emission carries no live PC.
-                    tile.notify_core_trace_event(*hw_id, current_cycle, None);
+                    // event matches its configured start/stop event. Pass the
+                    // recipient's core PC so mode-2's Start frame anchors at
+                    // the PC the core was at when the broadcast arrived
+                    // (matches HW: BROADCAST_15 typically fires while the
+                    // core is already mid-kernel and stalled in acquire).
+                    let core_pc = Some(tile.core.pc);
+                    tile.notify_core_trace_event(*hw_id, current_cycle, core_pc);
                     tile.notify_mem_trace_event(*hw_id, current_cycle, None);
                 }
             }

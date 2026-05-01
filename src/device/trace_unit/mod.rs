@@ -506,7 +506,15 @@ impl TraceUnit {
                 }
                 _ => self.encode_start(cycle),
             }
-            log::debug!("TraceUnit ({},{}) started at cycle {}", self.col, self.row, cycle);
+            log::debug!(
+                "TraceUnit ({},{}) START: cycle={} hw_event={} mode={:?} pc={:?}",
+                self.col,
+                self.row,
+                cycle,
+                hw_event_id,
+                self.mode,
+                pc
+            );
             return;
         }
 

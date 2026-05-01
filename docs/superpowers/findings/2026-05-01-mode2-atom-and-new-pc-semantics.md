@@ -1,6 +1,6 @@
 ---
 date: 2026-05-01
-status: phases-1+2-landed, phase-3-pending
+status: phases-1+2+3-landed
 relates_to: bridge-test #318, mode-2 trace divergence
 sources: AM020 §2 (chapter-2-aie-ml-tile-architecture.md L299-305), live HW
   trace from add_one_using_dma.chess pc-anchored sweep, Chess listing
@@ -248,6 +248,50 @@ Frame structure now mirrors HW iteration-by-iteration.
 
 Net: PC-sequence delta of 3 frames, atom-count delta of 2. Both are
 narrow, localized issues -- no longer the sweeping per-cycle inflation.
+
+## Phase 3 results (2026-05-01)
+
+Two fixes:
+
+1. `src/device/state/effects.rs` -- `propagate_broadcasts()` now passes
+   `Some(tile.core.pc)` to the recipient's trace unit instead of `None`,
+   so mode-2's Start frame anchors at the receiving tile's actual core
+   PC at the moment the broadcast arrives.
+2. `src/interpreter/engine/coordinator.rs` -- mirror the live interpreter
+   PC onto `tile.core.pc` after every step, alongside the existing
+   `core_debug.update_pc(...)`. Without this, the broadcast handler in
+   (1) would still read the stale CDO-loaded entry value (typically 0).
+
+Result: `anchor_pc` went 0 -> 816 (HW: 832).
+
+Both PCs are inside `llvm___aie2___acquire`. The 16-byte residual
+reflects a deeper modelling difference: HW's lock-acquire polls in a
+software loop whose PC advances through NOPs while the lock is
+unavailable, whereas our emulator models the wait as a single
+`WaitLock` stall pinned at the LockAcquire's own PC. Closing this gap
+needs proper lock-acquire poll-loop modelling -- noted as a follow-up,
+not a blocker for the comparator's usefulness.
+
+The "iter-1 leading 336" delta has the same root cause: HW's broadcast
+fires deeper in the acquire stall (past the first acquire's RET in
+this kernel), so HW skips recording New_PC=336 (the first RET
+destination) while EMU's earlier broadcast catches it.
+
+### Final state of `add_one_using_dma.chess` mode-2
+
+| Quantity   | HW  | EMU before fixes | EMU after Phase 1+2+3 |
+|------------|-----|------------------|------------------------|
+| Total frames | 42 | 810             | 43                    |
+| New_PC     | 34  | 69               | 37                    |
+| E_atom     | 4   | 582              | 3                     |
+| N_atom     | 2   | 157              | 1                     |
+| anchor_pc  | 832 | 0                | **816**               |
+
+Comparator PC-sequence diff: `34/69` -> `34/37`. Anchor inside the
+correct stall region. Sufficient as a structural-correctness baseline
+for #305 (sweep-wide rollout); the 3 residual frame deltas (lock-acquire
+poll modelling, JNZD-indirect quirk, kernel halt timing) are tracked as
+individual follow-ups.
 
 ## Cross-references
 

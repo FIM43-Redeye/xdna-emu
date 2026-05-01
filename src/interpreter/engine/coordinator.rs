@@ -617,6 +617,15 @@ impl InterpreterEngine {
                     // space so host reads of Core_Status/Core_PC return
                     // correct values (matching real hardware behavior).
                     tile.core_debug.update_pc(core.context.pc());
+
+                    // Mirror the live PC onto tile.core.pc as well, so any
+                    // path that reads tile-side state (broadcast
+                    // propagation, register effects) sees the running PC
+                    // instead of the stale CDO-loaded entry value. Without
+                    // this sync, mode-2's Start anchor_pc reads 0
+                    // regardless of what the core was actually doing when
+                    // start_event fired.
+                    tile.core.pc = core.context.pc();
                     match result {
                         StepResult::Continue => {
                             tile.core_debug.update_stalls(false, false, false, false);
