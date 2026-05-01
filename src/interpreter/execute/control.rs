@@ -180,13 +180,17 @@ impl ControlUnit {
                 // branches emit no atom. New_PC is emitted only when the
                 // destination is dynamic (target came from a register, not
                 // an immediate); direct targets are deducible from the
-                // ELF.
+                // ELF. For conditional-indirect (e.g. JNZD reg, reg, p7),
+                // the atom alone suffices -- HW does not emit a New_PC for
+                // the indirect destination of a conditional branch. Only
+                // unconditional indirect branches (RET, indirect JL) need
+                // New_PC.
                 let is_unconditional = matches!(condition, BranchCondition::Always);
                 let target_is_indirect = !Self::has_immediate_target(op);
                 if !is_unconditional {
                     tile.core_trace.notify_atom(should_branch);
                 }
-                if should_branch && target_is_indirect {
+                if should_branch && target_is_indirect && is_unconditional {
                     tile.core_trace.notify_branch_taken(ctx.cycles, target);
                 }
                 if should_branch {
