@@ -187,6 +187,32 @@ pub unsafe extern "C" fn xdna_emu_destroy(handle: *mut XdnaEmuHandle) {
     }
 }
 
+/// Reset per-hw-context tile state to match a column reset on real HW.
+///
+/// Clears locks, DMA channel queues + BD configs, stream switch routing,
+/// and resets cores. Host memory (BO contents) is intentionally preserved
+/// -- the user-side XRT layer drives BO contents via sync_to_device.
+///
+/// Call this on `xrt::hw_context` creation so each fresh context starts
+/// on a clean column. Without it, stale lock state from a prior run can
+/// leave a DMA acquire blocked indefinitely on the next run.
+///
+/// Returns `Success` on a clean reset, `InvalidHandle` for a null handle.
+///
+/// # Safety
+/// - `handle` must be valid
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_reset_context(handle: *mut XdnaEmuHandle) -> XdnaEmuResult {
+    if handle.is_null() {
+        return XdnaEmuResult::InvalidHandle;
+    }
+
+    let handle = &mut *handle;
+    handle.engine.reset_for_new_context();
+    log::debug!("xdna_emu_reset_context: cleared per-context tile state");
+    XdnaEmuResult::Success
+}
+
 /// Get the last error message (for debugging).
 ///
 /// Reads the thread-local error string set by failed FFI operations.

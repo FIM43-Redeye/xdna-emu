@@ -105,16 +105,26 @@ config_ctx_cu_config(shim_xdna::config_ctx_cu_config_arg& arg) const
 
   shim_debug("config_ctx_cu_config: ctx %u, %u CUs", arg.ctx_handle, conf->num_cus);
 
-  // Track CU config per context for diagnostics.
+  // Track CU config per context for diagnostics, and clear any
+  // previously stored PDI blobs (config_ctx_cu_config can be called
+  // more than once on a context to reconfigure CUs).
   {
     const std::lock_guard<std::mutex> lock(m_ctx_lock);
     auto it = m_ctx_map.find(arg.ctx_handle);
     if (it != m_ctx_map.end()) {
       it->second.num_cus = conf->num_cus;
+      it->second.pdi_blobs.clear();
     }
   }
 
-  // Load each CU's PDI into the emulator.
+  // Read each CU's PDI from the memfd. We *capture* the bytes here
+  // and store them on the ctx; we no longer apply them to the
+  // emulator at this point. Application now happens at submit_cmd
+  // time, after a fresh reset, so each kernel run starts from a
+  // clean array state. Loading PDI here would race with the
+  // currently-running submit (the async ctx pipeline pre-builds the
+  // next hw_context while the previous run executes), and would
+  // also leak lock/DMA drift across batches in a long trace sweep.
   for (uint16_t i = 0; i < conf->num_cus; i++) {
     auto& cu = conf->cu_configs[i];
     shim_debug("  CU[%u]: bo=%u func=%u", i, cu.cu_bo, cu.cu_func);
@@ -174,7 +184,16 @@ config_ctx_cu_config(shim_xdna::config_ctx_cu_config_arg& arg) const
                cu.cu_bo, pdi_data.size(), nr, dump_len, hex.c_str());
     }
 
-    m_transport->load_pdi(pdi_data.data(), pdi_data.size());
+    // Stash for replay at submit_cmd time. We deliberately do *not*
+    // call m_transport->load_pdi(...) here -- see the rationale at
+    // the top of this function.
+    {
+      const std::lock_guard<std::mutex> lock(m_ctx_lock);
+      auto it = m_ctx_map.find(arg.ctx_handle);
+      if (it != m_ctx_map.end()) {
+        it->second.pdi_blobs.push_back(std::move(pdi_data));
+      }
+    }
   }
 }
 
@@ -412,6 +431,29 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
 {
   if (!m_transport)
     shim_err(ENODEV, "submit_cmd: transport not initialized");
+
+  // Per-submit fresh start: wipe array state (locks, DMAs, stream
+  // switches, cores) and replay this hw_context's stored PDI(s).
+  // This is what we rely on for trace-sweep stability past the
+  // first few batches -- without it, lock and DMA-channel state
+  // from earlier submits drifts into the next submit's run and
+  // stalls on lock acquires. The replay is no-op if no PDI was
+  // captured (defensive: legacy callers / future test paths that
+  // skip config_ctx_cu_config still get a clean reset).
+  {
+    std::vector<std::vector<uint8_t>> pdi_blobs_copy;
+    {
+      const std::lock_guard<std::mutex> lock(m_ctx_lock);
+      auto it = m_ctx_map.find(arg.ctx_handle);
+      if (it != m_ctx_map.end())
+        pdi_blobs_copy = it->second.pdi_blobs;
+    }
+    m_transport->reset_context();
+    for (const auto& blob : pdi_blobs_copy) {
+      if (!blob.empty())
+        m_transport->load_pdi(blob.data(), blob.size());
+    }
+  }
 
   // Look up the command BO's mmap offset in the memfd so we can read
   // the instruction payload and write back the completion state.

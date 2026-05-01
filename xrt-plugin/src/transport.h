@@ -28,6 +28,12 @@ public:
     /// Load raw PDI data (CDO + ELFs) into the emulator.
     virtual void load_pdi(const void* data, size_t size) = 0;
 
+    /// Reset per-hw-context tile state (locks, DMAs, stream switches, cores)
+    /// to mirror a real-HW column reset on hw_context teardown / re-creation.
+    /// Host memory contents are preserved -- callers re-upload via the BO
+    /// sync path. No-op if the backing FFI symbol is not available.
+    virtual void reset_context() {}
+
     // -- Buffer management ---------------------------------------------------
 
     /// Allocate a host-visible buffer.  Returns the device address.

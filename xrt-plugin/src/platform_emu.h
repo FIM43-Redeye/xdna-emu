@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace xdna_emu {
 
@@ -162,6 +163,15 @@ private:
     uint64_t completions = 0;
     uint16_t num_cus   = 0;
     uint32_t debug_bo  = 0;  // 0 = no debug buffer attached
+    // Stored PDI blobs for this hw_context. Captured in
+    // config_ctx_cu_config and replayed at submit_cmd time after a
+    // fresh reset_context, so each submit starts from a clean array
+    // state regardless of what previous submits left behind. This is
+    // what makes long trace sweeps (mode-1 and mode-2) stable past
+    // the first few batches -- without per-submit reset, lock and
+    // DMA-channel state from prior submits drift into the next
+    // submit's run and stall on lock acquires.
+    std::vector<std::vector<uint8_t>> pdi_blobs;
   };
   mutable std::mutex m_ctx_lock;
   mutable std::unordered_map<uint32_t, ctx_entry> m_ctx_map;

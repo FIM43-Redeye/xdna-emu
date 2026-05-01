@@ -29,12 +29,12 @@ mod routing;
 #[cfg(test)]
 mod tests;
 
-use xdna_archspec::runtime::{ArchConfig, ModelConfig};
 use super::dma::{self, DmaEngine, DmaResult};
 use super::host_memory::HostMemory;
-use super::tile::{Tile, TileParams, TileKind};
+use super::tile::{Tile, TileKind, TileParams};
 use crate::interpreter::state::EventType;
 use std::sync::Arc;
+use xdna_archspec::runtime::{ArchConfig, ModelConfig};
 
 /// Maximum supported columns (VC2802 has 38 columns)
 pub const MAX_COLS: usize = 38;

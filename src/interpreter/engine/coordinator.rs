@@ -13,16 +13,16 @@
 use crate::device::dma::ChannelState;
 use crate::device::host_memory::HostMemory;
 use crate::device::trace_unit::TraceMode;
-use xdna_archspec::types::TileKind;
 use crate::device::DeviceState;
-use crate::parser::AieElf;
 use crate::interpreter::bundle::VliwBundle;
 use crate::interpreter::core::{CoreInterpreter, CoreStatus, StepResult};
 use crate::interpreter::decode::InstructionDecoder;
 use crate::interpreter::execute::{CycleAccurateExecutor, NeighborMemory};
 use crate::interpreter::state::{EventType, ExecutionContext};
 use crate::interpreter::timing::MemoryQuadrant;
+use crate::parser::AieElf;
 use xdna_archspec::aie2::SHIM_ROW;
+use xdna_archspec::types::TileKind;
 
 /// Engine execution status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1307,6 +1307,27 @@ impl InterpreterEngine {
         self.last_lock_releases = 0;
         self.last_instructions = 0;
         self.stall_cycles = 0;
+    }
+
+    /// Reset all per-context tile state on hw_context teardown / re-creation.
+    ///
+    /// Mirrors what real HW does on hw_context destroy: a column reset that
+    /// clears locks, DMA channel queues + BD configs, stream switch routing,
+    /// and trace state. Host memory (BO contents) is intentionally NOT
+    /// touched -- the bridge runner zeroes the trace BO via sync_to_device
+    /// before each new run, and input BOs are re-uploaded the same way.
+    ///
+    /// Called from the FFI on a fresh xrt::hw_context creation so the new
+    /// run starts on a clean column. Without this, lock state from a prior
+    /// run can leave an acquire stuck (target_value reached but the queued
+    /// release never fires for the new BD), and the new run stalls at the
+    /// stall threshold without making forward progress. Each reset also
+    /// nudges the trace_unit clear via Trace_Control0 rewrites in the new
+    /// run's insts.bin, but locks/BDs need this explicit reset because no
+    /// existing register write paths reach them.
+    pub fn reset_for_new_context(&mut self) {
+        self.reset();
+        self.device.array.reset();
     }
 
     /// Sync core enabled state and PC from device tiles.

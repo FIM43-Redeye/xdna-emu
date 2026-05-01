@@ -32,12 +32,12 @@
 //! }
 //! ```
 
-mod types;
-mod stepping;
 mod locks;
+mod status;
+mod stepping;
 mod stream_io;
 mod task_queue_ops;
-mod status;
+mod types;
 
 #[cfg(test)]
 mod tests;
@@ -46,11 +46,11 @@ pub use types::*;
 
 use std::collections::VecDeque;
 
-use super::{BdConfig, ChannelType, DmaError, DmaResult};
+use super::channel::{ChannelContext, ChannelFsm, CompletionInfo};
 use super::compression;
-use super::transfer::{Transfer, TransferDirection, TransferEndpoint, PadAction};
-use super::channel::{ChannelFsm, ChannelContext, CompletionInfo};
 use super::timing::DmaTimingConfig;
+use super::transfer::{PadAction, Transfer, TransferDirection, TransferEndpoint};
+use super::{BdConfig, ChannelType, DmaError, DmaResult};
 use crate::device::host_memory::HostMemory;
 use crate::device::tile::{Tile, TileKind};
 use crate::interpreter::state::EventType;
@@ -692,9 +692,22 @@ impl DmaEngine {
         for ch in &mut self.channels {
             ch.reset();
         }
-        self.stream_out.clear();
-        self.stream_in.clear();
         self.task_tokens.reset();
+        self.stream_out.clear();
+        // stream_in is Vec<VecDeque<_>> with one entry per S2MM channel.
+        // We want to drain each per-channel queue but keep the outer Vec
+        // shaped so subsequent stream_in[ch] indexing still finds its
+        // FIFO. A bare `self.stream_in.clear()` empties the outer Vec
+        // and turns push_stream_in() into a "channel out of range"
+        // fatal error -- which is what made early reset_for_new_context
+        // attempts hang the kernel: the first DMA push after reset
+        // failed silently and the consuming core stalled on a never-
+        // arriving lock release.
+        for q in &mut self.stream_in {
+            q.clear();
+        }
         // Don't clear BD configs - those are persistent configuration
+        // (mirrors real HW where BD registers are sticky across the
+        // reset surface we model here).
     }
 }
