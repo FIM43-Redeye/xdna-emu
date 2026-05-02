@@ -33,7 +33,7 @@
 //! When additional arches come online the helper will move behind an
 //! arch trait per the original Stage 8b design note.
 //!
-//! See docs/superpowers/specs/2026-04-23-subsys8-parser-design.md
+//! See docs/archive/specs/2026-04-23-subsys8-parser-design.md
 //! §Stage 8b for the two-halves rationale.
 
 use smallvec::SmallVec;

@@ -5,7 +5,7 @@
 //! `crate::parser::cdo::semantics::lower()`; consumed by
 //! `crate::device::state::apply()`.
 //!
-//! See docs/superpowers/specs/2026-04-23-subsys8-parser-design.md
+//! See docs/archive/specs/2026-04-23-subsys8-parser-design.md
 //! §"DeviceOp vocabulary" for the design rationale (Option B naming:
 //! existing `DmaDirection` reused, `u8` channel, fresh `TileAddr`).
 //!

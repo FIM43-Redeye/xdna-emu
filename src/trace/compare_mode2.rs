@@ -1,6 +1,6 @@
 //! Mode-2 trace comparator: three-layer HW/EMU comparison.
 //!
-//! See spec section 8 of `docs/superpowers/specs/2026-04-29-a2b-mode2-design.md`.
+//! See spec section 8 of `docs/archive/specs/2026-04-29-a2b-mode2-design.md`.
 //! The Layer 1 + Layer 2 results gate test pass/fail; Layer 3 (atom windows)
 //! is informational only -- DMA-stall nondeterminism makes it noisy in
 //! aggregate, so it never gates a test.

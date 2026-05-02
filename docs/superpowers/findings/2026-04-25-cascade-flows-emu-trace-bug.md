@@ -2,7 +2,7 @@
 
 ## Original bug (Phase E, 2026-04-23)
 
-`docs/superpowers/plans/2026-04-23-phase-e-validation.md` recorded:
+`docs/archive/plans/2026-04-23-phase-e-validation.md` recorded:
 > `cascade_flows.chess`: HW captures 2 timestamped events (9-cycle span);
 > EMU captures *nothing*. Classification: EMU_TRACE_BUG.
 

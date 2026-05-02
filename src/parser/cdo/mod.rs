@@ -1,6 +1,6 @@
 //! CDO (Configuration Data Object) parser.
 //!
-//! See docs/superpowers/specs/2026-04-23-subsys8-parser-design.md for the
+//! See docs/archive/specs/2026-04-23-subsys8-parser-design.md for the
 //! two-layer design: framing (byte-level), syntax (CdoRaw typed
 //! commands), semantics (CdoRaw -> DeviceOp in Half 2; pass-through
 //! in Half 1).

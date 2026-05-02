@@ -251,7 +251,7 @@ Subsystem 6, the full build.rs shrinkage is also deferred.
    state: what still lives there, why, and that Subsystem 6 is the cleanup trigger.
 2. Added per-line comments to `xdna-emu/Cargo.toml`'s `[build-dependencies]`
    block, explaining why each dep is still needed and which subsystem removes it.
-3. Updated the plan (`docs/superpowers/plans/2026-04-17-subsys1-regs-mem.md`)
+3. Updated the plan (`docs/archive/plans/2026-04-17-subsys1-regs-mem.md`)
    with a Task 10 deferral note and replaced Task 11's step list with a
    reduced-scope note.
 4. Updated this audit with Task 10 Deferral and Task 11 Reduced Scope sections.

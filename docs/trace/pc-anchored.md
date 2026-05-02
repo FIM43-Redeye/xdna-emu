@@ -187,7 +187,7 @@ Tuning the period:
 
 ## References
 
-- Plan: `docs/superpowers/plans/2026-04-25-a2-pc-anchored-validation.md`
+- Plan: `docs/archive/plans/2026-04-25-a2-pc-anchored-validation.md`
 - Mode-1 byte format: `tools/trace_decoder/modes/mode1.py`
 - Encoder: `src/device/trace_unit/mod.rs::encode_event_pc`
 - Comparator: `src/trace/compare.rs::compare_pc_anchored_for_tile`
