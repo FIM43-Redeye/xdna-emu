@@ -25,7 +25,7 @@ pub struct TimingContext {
 
     /// Operation latency lookup table.
     // TODO(subsys7-followup): Use arch_handle::latency_table() instead of owning a copy.
-    // See NEXT-STEPS.md or docs/arch/subsys7-audit.md Completion section.
+    // See docs/arch/subsys7-audit.md "Completion" section.
     pub latencies: LatencyTable,
 
     /// Total hazard stall cycles.
