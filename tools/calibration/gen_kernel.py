@@ -2,18 +2,38 @@
 """Generate parameterized calibration kernels for control-path cycle measurement.
 
 A calibration kernel issues N copies of one specific control-packet kind
-between two trace anchors (USER_EVENT_0 at the start, USER_EVENT_1 at the
-end). The trace tile captures both anchor cycle stamps; the slope of
-(cycle_delta vs N) recovers the marginal per-packet cost.
+between two trace anchors and measures their cycle delta on real silicon.
 
-Anchors target the same tile as the calibration packets so the CMP issue
-queue can't pipeline anchor B ahead of the calibration train.
+# Design
+
+The kernel has a minimal compute core on tile (0,2) that runs a tight loop
+firing `aie.event(0)` (= INSTR_EVENT_0). This keeps the trace controller
+warm: without a steady stream of trace events the controller never flushes
+its packet buffer, and our anchor events alone (only two!) won't be enough
+to fill a packet.
+
+The runtime_sequence:
+  1. Sets up trace on the compute tile (mode=Event-Time, packet id=1).
+     Trace listens for INSTR_EVENT_0 (background tick) plus USER_EVENT_0
+     and USER_EVENT_1 (our anchors).
+  2. Fires USER_EVENT_0 via Event_Generate on the compute tile -> anchor A.
+  3. Issues N calibration packets targeting the compute tile.
+  4. Fires USER_EVENT_1 -> anchor B.
+  5. Pads with extra anchor B firings so the trace BD's S2MM DMA has time
+     to drain to the host buffer before the kernel exits.
+
+Downstream parsing finds the FIRST occurrence of USER_EVENT_0 and USER_EVENT_1
+in the events stream; the cycle delta is the calibration measurement.
+
+Anchor target == calibration target: this prevents the CMP issue queue from
+pipelining anchor B ahead of the calibration train. With same-tile ordering,
+anchor B retires after the last calibration packet retires.
 
 Usage:
   python3 gen_kernel.py --kind write32 --target compute --count 1024 \\
       --out build/calib/write32_compute_n1024/
 
-Output layout per invocation:
+Output layout:
   <out>/aie.mlir       # generated MLIR
   <out>/params.json    # echo of the parameters for downstream tools
 """
@@ -23,41 +43,34 @@ import json
 import sys
 from pathlib import Path
 
-# AIE2 USER_EVENT IDs and Event_Generate offsets per aie-rt xaie_events_aieml.h
-# and xaiemlgbl_params.h.
+# AIE2 USER_EVENT IDs and Event_Generate offsets per aie-rt
+# xaie_events_aieml.h and xaiemlgbl_params.h.
 TILE_SPEC = {
     "compute": {
         "row": 2,
         "event_generate_offset": 0x34008,
         "user_event_0": 124,
         "user_event_1": 125,
-        "trace_packet_type": "core",
-        "trace_id": 1,
     },
     "mem": {
         "row": 1,
         "event_generate_offset": 0x94008,
         "user_event_0": 159,
         "user_event_1": 160,
-        "trace_packet_type": "memtile",
-        "trace_id": 2,
     },
     "shim": {
         "row": 0,
         "event_generate_offset": 0x34008,
         "user_event_0": 126,
         "user_event_1": 127,
-        "trace_packet_type": "shimtile",
-        "trace_id": 4,
     },
 }
 
-# Calibration-target register within the destination tile. We pick a write-only
-# scratch register that's safe to spam: the tile's Performance_Counter0 (offset
-# 0x31000 on core, 0x91000 on memtile, 0x31000 on shim/PL). Writing a value to
-# a perf-counter register is a benign control-path action that exercises the
-# CMP -> fabric -> register-write path without disturbing the calibration tile's
-# state (DMA, locks, core).
+# Calibration-target register: a write-only scratch we can spam without
+# disturbing tile state. Performance_Counter0 lives at:
+#  - 0x31000 on a compute tile (CORE module)
+#  - 0x91000 on a memtile
+#  - 0x31000 on a shim tile (PL module)
 PERF_COUNTER_OFFSET = {
     "compute": 0x31000,
     "mem": 0x91000,
@@ -66,26 +79,15 @@ PERF_COUNTER_OFFSET = {
 
 
 def render_mlir(kind: str, target: str, count: int, payload: int) -> str:
-    """Build the .mlir text for a calibration kernel.
-
-    Parameters
-    ----------
-    kind     : "write32" | "blockwrite" | "maskwrite" | "maskpoll" | "sync"
-    target   : "compute" | "mem" | "shim" -- where the calibration packets land
-    count    : number of calibration packets to issue
-    payload  : payload word count (BlockWrite only; ignored for others)
-    """
+    """Generate a calibration kernel as MLIR text."""
     spec = TILE_SPEC[target]
     target_col = 0
     target_row = spec["row"]
     event_gen_addr = spec["event_generate_offset"]
     ev_a = spec["user_event_0"]
     ev_b = spec["user_event_1"]
-    trace_id = spec["trace_id"]
-    pkt_type = spec["trace_packet_type"]
     calib_reg = PERF_COUNTER_OFFSET[target]
 
-    # Calibration packet line generators.
     def write32_line(_i: int) -> str:
         return (
             f'      aiex.npu.write32 {{address = {hex(calib_reg)} : ui32, '
@@ -101,9 +103,6 @@ def render_mlir(kind: str, target: str, count: int, payload: int) -> str:
         )
 
     def blockwrite_line(_i: int) -> str:
-        # BlockWrite needs a memref source. We synthesize a global with `payload`
-        # words and reference it. One global shared across all N writes is fine
-        # since we only care about issue-cost timing, not destination state.
         return (
             f'      aiex.npu.blockwrite(%blkdata) {{address = {hex(calib_reg)} : ui32, '
             f'column = {target_col} : i32, row = {target_row} : i32}} : '
@@ -118,7 +117,7 @@ def render_mlir(kind: str, target: str, count: int, payload: int) -> str:
         )
 
     def maskpoll_line(_i: int) -> str:
-        # Poll a register that's already at the expected value -> 1 iter.
+        # Predicate `(reg & 0) == 0` is trivially true -> 1 iteration.
         return (
             f'      aiex.npu.maskpoll {{address = {hex(calib_reg)} : ui32, '
             f'column = {target_col} : i32, row = {target_row} : i32, '
@@ -133,7 +132,6 @@ def render_mlir(kind: str, target: str, count: int, payload: int) -> str:
         "maskpoll": maskpoll_line,
     }[kind]
 
-    # Anchor packets fire USER_EVENT_0/_1 on the trace tile.
     anchor_a = (
         f'      aiex.npu.write32 {{address = {hex(event_gen_addr)} : ui32, '
         f'column = {target_col} : i32, row = {target_row} : i32, '
@@ -147,8 +145,6 @@ def render_mlir(kind: str, target: str, count: int, payload: int) -> str:
 
     calib_body = "\n".join(line_for(i) for i in range(count))
 
-    # BlockWrite needs a global memref with `payload` zeros; everything else
-    # doesn't.
     blockwrite_global = ""
     blockwrite_get_global = ""
     if kind == "blockwrite":
@@ -161,67 +157,70 @@ def render_mlir(kind: str, target: str, count: int, payload: int) -> str:
             f'      %blkdata = memref.get_global @blkdata_g : memref<{payload}xi32>\n'
         )
 
-    # Trace tile MLIR fragments. We always trace on the same tile we're hitting
-    # so anchor events are observed by the same trace controller.
-    if target == "compute":
-        trace_decl = (
-            f'    aie.trace @trace_target(%target_tile) {{\n'
-            f'      aie.trace.mode "Event-Time"\n'
-            f'      aie.trace.packet id={trace_id} type={pkt_type}\n'
-            f'      aie.trace.event<"USER_EVENT_0">\n'
-            f'      aie.trace.event<"USER_EVENT_1">\n'
-            f'      aie.trace.start event=<"TRUE">\n'
-            f'      aie.trace.stop event=<"NONE">\n'
-            f'    }}\n'
-        )
-    elif target == "mem":
-        trace_decl = (
-            f'    aie.trace @trace_target(%target_tile) {{\n'
-            f'      aie.trace.packet id={trace_id} type={pkt_type}\n'
-            f'      aie.trace.event<"USER_EVENT_0">\n'
-            f'      aie.trace.event<"USER_EVENT_1">\n'
-            f'      aie.trace.start event=<"TRUE">\n'
-            f'      aie.trace.stop event=<"NONE">\n'
-            f'    }}\n'
-        )
-    else:  # shim
-        trace_decl = (
-            f'    aie.trace @trace_target(%target_tile) {{\n'
-            f'      aie.trace.packet id={trace_id} type={pkt_type}\n'
-            f'      aie.trace.event<"USER_EVENT_0">\n'
-            f'      aie.trace.event<"USER_EVENT_1">\n'
-            f'      aie.trace.start event=<"TRUE">\n'
-            f'      aie.trace.stop event=<"NONE">\n'
-            f'    }}\n'
-        )
-
-    target_tile_decl = f'%target_tile = aie.tile({target_col}, {target_row})'
-    # Always need a shim tile for the trace DMA path.
-    shim_tile_decl = '%shim_noc_tile_0_0 = aie.tile(0, 0)' if target != "shim" else ""
+    # Trail: pad with USER_EVENT_1 firings to give the trace shim DMA time to
+    # drain to the host buffer before the kernel exits. The first USER_EVENT_1
+    # in the trace is anchor B; the rest are flush filler.
+    TRAIL_PADDING = 256
+    trail_pad = "\n".join([anchor_b] * TRAIL_PADDING)
 
     return f"""// Auto-generated calibration kernel. Do not edit by hand.
 // kind={kind} target={target} count={count} payload={payload}
 module {{
   aie.device(npu1_1col) {{
-    {target_tile_decl}
-    {shim_tile_decl}
+    %tile_0_0 = aie.tile(0, 0)
+    %tile_0_2 = aie.tile(0, 2)
 
 {blockwrite_global}
-{trace_decl}
+    // Compute core: tight loop firing INSTR_EVENT_0 every iteration. This
+    // keeps the trace controller's stream busy so anchor events flush to
+    // the shim DMA promptly. The core runs until the kernel terminates.
+    %core_0_2 = aie.core(%tile_0_2) {{
+      %c0 = arith.constant 0 : index
+      %c_max = arith.constant 9223372036854775807 : index
+      %c1 = arith.constant 1 : index
+      %c_inner = arith.constant 256 : index
+      // Outer loop fires INSTR_EVENT_0 occasionally (every ~256 inner steps)
+      // so the trace stream stays warm without saturating the trace
+      // controller's input queue. Each anchor event needs a timestamp slot;
+      // a busy event source would queue them up and bias B-A measurement.
+      scf.for %i = %c0 to %c_max step %c1 {{
+        aie.event(0)
+        scf.for %j = %c0 to %c_inner step %c1 {{
+        }}
+      }}
+      aie.end
+    }}
+
+    // Trace config: capture INSTR_EVENT_0 (background tick) plus our two
+    // anchor events. Trace runs from kernel start to broadcast 14 stop.
+    aie.trace @core_trace(%tile_0_2) {{
+      aie.trace.mode "Event-Time"
+      aie.trace.packet id=1 type=core
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.event<"USER_EVENT_0">
+      aie.trace.event<"USER_EVENT_1">
+      aie.trace.start event=<"TRUE">
+      aie.trace.stop broadcast=14
+    }}
 
     aie.runtime_sequence @seq() {{
       aie.trace.host_config buffer_size = 65536
-      aie.trace.start_config @trace_target
+      aie.trace.start_config @core_trace
 
-{blockwrite_get_global}      // Anchor A: USER_EVENT_0 on trace tile.
+{blockwrite_get_global}
+      // Anchor A: fire USER_EVENT_0 on the trace tile.
 {anchor_a}
 
-      // === Calibration packets (count={count}) =====================
+      // === Calibration packet train (count={count}) =====================
 {calib_body}
-      // === End of calibration train ================================
+      // === End of calibration train ====================================
 
-      // Anchor B: USER_EVENT_1 on trace tile.
+      // Anchor B: fire USER_EVENT_1 on the trace tile.
 {anchor_b}
+
+      // Trace flush filler: extra USER_EVENT_1 firings give the trace
+      // shim DMA time to drain to the host buffer before kernel exit.
+{trail_pad}
     }}
   }}
 }}
