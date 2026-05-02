@@ -80,42 +80,10 @@ pub enum NpuInstruction {
     },
 }
 
-impl NpuInstruction {
-    /// Number of simulation cycles this instruction takes to retire on the
-    /// IPU command processor side.
-    ///
-    /// Real hardware retires control packets through a multi-stage path:
-    /// the host writes the doorbell, the IPU CMP fetches the packet from
-    /// its queue, decodes the header, and issues one or more AXI writes
-    /// to the target tile. Each stage has its own latency, and multi-word
-    /// payloads (BlockWrite to a DMA buffer descriptor) consume one AXI
-    /// write per word. EMU's executor charges this many cycles between
-    /// successive instruction retirements so trace-event timing reflects
-    /// the host-side latency the kernel observes in real silicon.
-    ///
-    /// Phase 1 of the cycle-cost framework: every variant returns 1, which
-    /// matches EMU's current "one instruction per cycle" behavior. This
-    /// preserves the cycle accounting that all existing tests are
-    /// calibrated against. Phase 2 will populate realistic per-variant
-    /// costs once we have HW timing data to calibrate against. See
-    /// docs/superpowers/findings/2026-05-01-task-319-cause-b-npu-instr-cycle-cost.md
-    /// for the analysis that motivated this framework.
-    pub fn cycle_cost(&self) -> u64 {
-        match self {
-            // Phase 1: all variants return 1 (current behavior). The
-            // explicit per-variant arms make the future calibration
-            // surface obvious -- each one is a knob waiting for the
-            // right value.
-            NpuInstruction::Write32 { .. } => 1,
-            NpuInstruction::BlockWrite { .. } => 1,
-            NpuInstruction::MaskWrite { .. } => 1,
-            NpuInstruction::MaskPoll { .. } => 1,
-            NpuInstruction::DdrPatch { .. } => 1,
-            NpuInstruction::Sync { .. } => 1,
-            NpuInstruction::Unknown { .. } => 1,
-        }
-    }
-}
+// Cycle-cost calculation moved to `super::cycle_cost::CycleCostModel`,
+// which mirrors AMD's `AIE_CONTROL_PATH_LATENCY` JSON schema discovered in
+// libaie2_cluster_msm_v1_0_0.osci.so and integrates documented stream-switch
+// fabric / PLIO bridge / register-write costs from open sources.
 
 /// A stream of NPU instructions parsed from binary data.
 #[derive(Debug)]

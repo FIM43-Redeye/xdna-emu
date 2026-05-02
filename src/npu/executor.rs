@@ -172,6 +172,11 @@ pub struct NpuExecutor {
     state: ExecutorState,
     /// Loaded instructions for interleaved execution via try_advance().
     instructions: Vec<NpuInstruction>,
+    /// Cycle-cost model used to compute per-instruction retirement cycles.
+    /// Default is `legacy_one_per_packet` which preserves prior behaviour;
+    /// callers can opt into `with_known_constants` (or future calibrated
+    /// profiles) via `set_cycle_model`.
+    cycle_model: super::CycleCostModel,
 }
 
 impl NpuExecutor {
@@ -184,7 +189,19 @@ impl NpuExecutor {
             warnings: Vec::new(),
             state: ExecutorState::Idle,
             instructions: Vec::new(),
+            cycle_model: super::CycleCostModel::default(),
         }
+    }
+
+    /// Replace the cycle-cost model used to compute retirement cycles.
+    ///
+    /// `CycleCostModel::with_known_constants()` engages stream-switch
+    /// fabric / PLIO bridge / register-write costs derived from open
+    /// sources. Calibrated per-tile-type CMP costs land later via
+    /// #322 and a JSON config file mirroring AMD's
+    /// `AIE_CONTROL_PATH_LATENCY` schema.
+    pub fn set_cycle_model(&mut self, model: super::CycleCostModel) {
+        self.cycle_model = model;
     }
 
     /// Get warnings collected during execution.
@@ -430,7 +447,7 @@ impl NpuExecutor {
                     self.state = ExecutorState::Done;
                     AdvanceResult::Done
                 } else {
-                    let retire_cycles = instr.cycle_cost().saturating_sub(1);
+                    let retire_cycles = self.cycle_model.cost_of(&instr).saturating_sub(1);
                     if retire_cycles > 0 {
                         self.state = ExecutorState::RetiringInstruction {
                             next_index: new_index,

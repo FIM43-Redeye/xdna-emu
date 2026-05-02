@@ -23,12 +23,14 @@
 //! - `DDR_PATCH` (129): Patch address with host buffer address
 
 mod classify;
+mod cycle_cost;
 mod parser;
 mod executor;
 
 pub use classify::{
     classify_bytes, classify_kernargs, classify_with_topology, KernargClassification, KernargRole,
 };
+pub use cycle_cost::CycleCostModel;
 pub use parser::{NpuInstruction, NpuInstructionStream};
 pub use executor::{NpuExecutor, HostBuffer, AdvanceResult};
 
