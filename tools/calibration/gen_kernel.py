@@ -79,14 +79,29 @@ PERF_COUNTER_OFFSET = {
 
 
 def render_mlir(kind: str, target: str, count: int, payload: int) -> str:
-    """Generate a calibration kernel as MLIR text."""
-    spec = TILE_SPEC[target]
+    """Generate a calibration kernel as MLIR text.
+
+    The trace tile and anchor events are always on the compute tile (0,2)
+    regardless of the calibration target. This decouples the measurement
+    infrastructure from the variable: we measure how the calibration target
+    affects the cycle delta between two anchors that themselves always land
+    on the same tile. The CMP issues all packets serially on the AXI bus,
+    so anchor B issues after the last calibration packet -- the slope of
+    (delta vs N) reveals the per-packet contribution of the target tile to
+    the CMP issue path.
+    """
+    target_spec = TILE_SPEC[target]
     target_col = 0
-    target_row = spec["row"]
-    event_gen_addr = spec["event_generate_offset"]
-    ev_a = spec["user_event_0"]
-    ev_b = spec["user_event_1"]
+    target_row = target_spec["row"]
     calib_reg = PERF_COUNTER_OFFSET[target]
+
+    # Anchor / trace tile is fixed at compute (0,2) so all sweeps share the
+    # same trace infrastructure.
+    anchor_spec = TILE_SPEC["compute"]
+    anchor_row = anchor_spec["row"]
+    anchor_event_gen = anchor_spec["event_generate_offset"]
+    ev_a = anchor_spec["user_event_0"]
+    ev_b = anchor_spec["user_event_1"]
 
     def write32_line(_i: int) -> str:
         return (
@@ -133,13 +148,13 @@ def render_mlir(kind: str, target: str, count: int, payload: int) -> str:
     }[kind]
 
     anchor_a = (
-        f'      aiex.npu.write32 {{address = {hex(event_gen_addr)} : ui32, '
-        f'column = {target_col} : i32, row = {target_row} : i32, '
+        f'      aiex.npu.write32 {{address = {hex(anchor_event_gen)} : ui32, '
+        f'column = 0 : i32, row = {anchor_row} : i32, '
         f'value = {ev_a} : ui32}}'
     )
     anchor_b = (
-        f'      aiex.npu.write32 {{address = {hex(event_gen_addr)} : ui32, '
-        f'column = {target_col} : i32, row = {target_row} : i32, '
+        f'      aiex.npu.write32 {{address = {hex(anchor_event_gen)} : ui32, '
+        f'column = 0 : i32, row = {anchor_row} : i32, '
         f'value = {ev_b} : ui32}}'
     )
 

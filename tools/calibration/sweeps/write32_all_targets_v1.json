@@ -1,0 +1,17 @@
+[
+  {
+    "kind": "write32",
+    "target": "compute",
+    "counts": [16, 64, 256, 1024, 4096]
+  },
+  {
+    "kind": "write32",
+    "target": "mem",
+    "counts": [16, 64, 256, 1024, 4096]
+  },
+  {
+    "kind": "write32",
+    "target": "shim",
+    "counts": [16, 64, 256, 1024, 4096]
+  }
+]
