@@ -19,8 +19,11 @@ bridge-runner/build/
 # clangd index cache
 bridge-runner/.cache/
 
-# aiecc.py per-MLIR project directory (created next to traced .mlir output)
+# aiecc.py per-MLIR project directories (created next to .mlir input/output)
+aie.mlir.prj/
 aie_traced.mlir.prj/
+test-traced-verify.mlir.prj/
+*.mlir.prj/
 
 # Captured NPU hardware outputs (machine-specific, regenerate with capture_npu_outputs)
 tests/npu-outputs/
@@ -39,6 +42,17 @@ stdout
 
 # Documentation drafts (not ready for commit)
 CURRENT-REFACTOR.md
+
+# Scratch outputs from manual aiecc.py / chess runs at repo root
+/Release/
+/k*.o
+/k*.o.lst
+/insts.bin
+/aie.xclbin
+/raw
+/*.rlib
+/*.patch
+/*.log
 
 # xdna-driver (external dependency, not a submodule -- see patches/)
 /xdna-driver
