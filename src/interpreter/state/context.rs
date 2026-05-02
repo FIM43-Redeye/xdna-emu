@@ -344,35 +344,11 @@ impl ExecutionContext {
         }
     }
 
-    /// Create a new context with cycle-accurate timing enabled.
-    ///
-    /// This is an alias for `new()` - all execution is now cycle-accurate.
-    #[deprecated(since = "0.2.0", note = "All execution is now cycle-accurate. Use new() instead.")]
-    pub fn new_with_timing() -> Self {
-        Self::new()
-    }
-
     /// Create a new context with initial stack pointer.
     pub fn with_stack(stack_addr: u32) -> Self {
         let mut ctx = Self::new();
         ctx.set_sp(stack_addr);
         ctx
-    }
-
-    /// Enable cycle-accurate timing.
-    ///
-    /// This is now a no-op - all execution is cycle-accurate.
-    #[deprecated(since = "0.2.0", note = "All execution is now cycle-accurate. This method is a no-op.")]
-    pub fn enable_timing(&mut self) {
-        // No-op - timing is always enabled
-    }
-
-    /// Disable cycle-accurate timing.
-    ///
-    /// This is now a no-op - all execution is cycle-accurate.
-    #[deprecated(since = "0.2.0", note = "All execution is now cycle-accurate. This method is a no-op.")]
-    pub fn disable_timing(&mut self) {
-        // No-op - timing cannot be disabled
     }
 
     /// Check if cycle-accurate timing is enabled.
@@ -1357,36 +1333,12 @@ mod tests {
     }
 
     #[test]
-    fn test_timing_always_enabled() {
-        // All contexts now have timing enabled
-        let ctx = ExecutionContext::new();
-        assert!(ctx.has_timing());
-
-        // Legacy constructor also has timing
-        #[allow(deprecated)]
-        let ctx_timed = ExecutionContext::new_with_timing();
-        assert!(ctx_timed.has_timing());
-    }
-
-    #[test]
     fn test_timing_context_access() {
         let mut ctx = ExecutionContext::new();
-
-        // Can always access timing context
         assert!(ctx.has_timing());
 
-        // Access timing context directly (no longer Option)
         ctx.timing_context_mut().hazard_stalls = 5;
         assert_eq!(ctx.timing_context().hazard_stalls, 5);
-
-        // Deprecated methods are no-ops
-        #[allow(deprecated)]
-        ctx.enable_timing();
-        assert!(ctx.has_timing());
-
-        #[allow(deprecated)]
-        ctx.disable_timing();
-        assert!(ctx.has_timing()); // Still enabled - disable is now a no-op
     }
 
     #[test]

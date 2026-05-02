@@ -192,21 +192,21 @@ fn counter_increments_each_tick_while_active() {
     bank.write_control_start_stop(42 | (43 << 8), 0, 1, 7);
 
     // Not active yet -- tick should not increment
-    bank.tick();
+    bank.tick_active_cycles();
     assert_eq!(bank.read_counter(0), 0);
 
     // Start counting
     bank.handle_event(42);
-    bank.tick();
+    bank.tick_active_cycles();
     assert_eq!(bank.read_counter(0), 1);
-    bank.tick();
+    bank.tick_active_cycles();
     assert_eq!(bank.read_counter(0), 2);
-    bank.tick();
+    bank.tick_active_cycles();
     assert_eq!(bank.read_counter(0), 3);
 
     // Stop counting
     bank.handle_event(43);
-    bank.tick();
+    bank.tick_active_cycles();
     assert_eq!(bank.read_counter(0), 3); // Value preserved
 }
 
@@ -215,7 +215,7 @@ fn counter_does_not_increment_when_idle() {
     let mut bank = PerfCounterBank::new(2);
     // No start event configured
     for _ in 0..100 {
-        bank.tick();
+        bank.tick_active_cycles();
     }
     assert_eq!(bank.read_counter(0), 0);
     assert_eq!(bank.read_counter(1), 0);
@@ -231,7 +231,7 @@ fn reset_event_zeroes_counter_and_goes_idle() {
 
     bank.handle_event(10); // start
     for _ in 0..50 {
-        bank.tick();
+        bank.tick_active_cycles();
     }
     assert_eq!(bank.read_counter(0), 50);
     assert!(bank.is_active(0));
@@ -266,7 +266,7 @@ fn multiple_counters_independent() {
     // Start counter 0 only
     bank.handle_event(10);
     for _ in 0..5 {
-        bank.tick();
+        bank.tick_active_cycles();
     }
     assert_eq!(bank.read_counter(0), 5);
     assert_eq!(bank.read_counter(2), 0);
@@ -274,7 +274,7 @@ fn multiple_counters_independent() {
     // Now start counter 2
     bank.handle_event(20);
     for _ in 0..3 {
-        bank.tick();
+        bank.tick_active_cycles();
     }
     assert_eq!(bank.read_counter(0), 8); // 5 + 3
     assert_eq!(bank.read_counter(2), 3);
@@ -282,7 +282,7 @@ fn multiple_counters_independent() {
     // Stop counter 0
     bank.handle_event(11);
     for _ in 0..2 {
-        bank.tick();
+        bank.tick_active_cycles();
     }
     assert_eq!(bank.read_counter(0), 8); // Stopped
     assert_eq!(bank.read_counter(2), 5); // Still counting
@@ -295,14 +295,14 @@ fn stopped_counter_can_restart() {
 
     bank.handle_event(10); // start
     for _ in 0..5 {
-        bank.tick();
+        bank.tick_active_cycles();
     }
     bank.handle_event(11); // stop
     assert_eq!(bank.read_counter(0), 5);
 
     bank.handle_event(10); // restart from current value
     for _ in 0..3 {
-        bank.tick();
+        bank.tick_active_cycles();
     }
     assert_eq!(bank.read_counter(0), 8); // 5 + 3, continues from where stopped
 }
@@ -327,7 +327,7 @@ fn direct_write_does_not_affect_state() {
 
     // Start and verify it counts from the written value
     bank.handle_event(10);
-    bank.tick();
+    bank.tick_active_cycles();
     assert_eq!(bank.read_counter(0), 1001);
 }
 
@@ -343,13 +343,13 @@ fn tick_fires_threshold_event_when_counter_reaches_event_value() {
 
     // Tick 4 times -- no threshold yet
     for _ in 0..4 {
-        let events = bank.tick();
+        let events = bank.tick_active_cycles();
         assert!(events.is_empty());
     }
     assert_eq!(bank.read_counter(0), 4);
 
     // Tick once more -- counter hits 5 = event_value
-    let events = bank.tick();
+    let events = bank.tick_active_cycles();
     assert_eq!(events, vec![0]);
     assert_eq!(bank.read_counter(0), 5);
 }
@@ -363,13 +363,13 @@ fn threshold_event_fires_only_once_at_exact_value() {
     bank.handle_event(10);
 
     // Tick to threshold
-    bank.tick(); // 1
-    bank.tick(); // 2
-    let events = bank.tick(); // 3 -- fires
+    bank.tick_active_cycles(); // 1
+    bank.tick_active_cycles(); // 2
+    let events = bank.tick_active_cycles(); // 3 -- fires
     assert_eq!(events, vec![0]);
 
     // Subsequent ticks should not re-fire
-    let events = bank.tick(); // 4
+    let events = bank.tick_active_cycles(); // 4
     assert!(events.is_empty());
 }
 
@@ -381,7 +381,7 @@ fn event_value_zero_means_no_threshold() {
 
     bank.handle_event(10);
     for _ in 0..100 {
-        let events = bank.tick();
+        let events = bank.tick_active_cycles();
         assert!(events.is_empty());
     }
 }
@@ -395,9 +395,9 @@ fn multiple_counters_can_fire_threshold_same_tick() {
     bank.write_event_value(1, 3);
 
     bank.handle_event(10);
-    bank.tick(); // 1
-    bank.tick(); // 2
-    let events = bank.tick(); // 3
+    bank.tick_active_cycles(); // 1
+    bank.tick_active_cycles(); // 2
+    let events = bank.tick_active_cycles(); // 3
     assert_eq!(events, vec![0, 1]);
 }
 
@@ -408,7 +408,7 @@ fn counter_wraps_at_u32_max() {
     bank.write_counter(0, u32::MAX);
 
     bank.handle_event(10);
-    bank.tick();
+    bank.tick_active_cycles();
     assert_eq!(bank.read_counter(0), 0); // Wrapped
 }
 
@@ -493,7 +493,7 @@ fn full_lifecycle_start_count_threshold_stop_reset() {
     bank.write_event_value(0, 5);
 
     // Idle: should not count
-    bank.tick();
+    bank.tick_active_cycles();
     assert_eq!(bank.read_counter(0), 0);
 
     // Start
@@ -502,23 +502,23 @@ fn full_lifecycle_start_count_threshold_stop_reset() {
 
     // Count to threshold
     for _ in 0..4 {
-        let ev = bank.tick();
+        let ev = bank.tick_active_cycles();
         assert!(ev.is_empty());
     }
     assert_eq!(bank.read_counter(0), 4);
 
-    let ev = bank.tick(); // counter hits 5
+    let ev = bank.tick_active_cycles(); // counter hits 5
     assert_eq!(ev, vec![0]);
     assert_eq!(bank.read_counter(0), 5);
 
     // Counter keeps going past threshold
-    bank.tick();
+    bank.tick_active_cycles();
     assert_eq!(bank.read_counter(0), 6);
 
     // Stop
     bank.handle_event(11);
     assert!(!bank.is_active(0));
-    bank.tick();
+    bank.tick_active_cycles();
     assert_eq!(bank.read_counter(0), 6); // Preserved
 
     // Reset
@@ -546,7 +546,7 @@ fn two_counter_module_ignores_counters_2_and_3() {
 
     // But counter 0 and 1 should work fine
     bank.handle_event(10);
-    bank.tick();
+    bank.tick_active_cycles();
     assert_eq!(bank.read_counter(0), 1);
 }
 
@@ -558,7 +558,7 @@ fn stop_event_preserves_value_across_restart() {
     // First run: count to 10
     bank.handle_event(10);
     for _ in 0..10 {
-        bank.tick();
+        bank.tick_active_cycles();
     }
     bank.handle_event(11);
     assert_eq!(bank.read_counter(0), 10);
@@ -566,7 +566,7 @@ fn stop_event_preserves_value_across_restart() {
     // Second run: count continues from 10
     bank.handle_event(10);
     for _ in 0..5 {
-        bank.tick();
+        bank.tick_active_cycles();
     }
     assert_eq!(bank.read_counter(0), 15);
 }
@@ -579,7 +579,7 @@ fn reset_while_stopped_zeroes_value() {
 
     bank.handle_event(10); // start
     for _ in 0..5 {
-        bank.tick();
+        bank.tick_active_cycles();
     }
     bank.handle_event(11); // stop
     assert_eq!(bank.read_counter(0), 5);
@@ -598,13 +598,13 @@ fn threshold_wraps_around() {
 
     bank.handle_event(10);
     // u32::MAX - 1 -> u32::MAX (no threshold, event_value=1 != u32::MAX)
-    let ev = bank.tick();
+    let ev = bank.tick_active_cycles();
     assert!(ev.is_empty());
     // u32::MAX -> 0 (wraps, 0 != 1)
-    let ev = bank.tick();
+    let ev = bank.tick_active_cycles();
     assert!(ev.is_empty());
     // 0 -> 1 (matches threshold!)
-    let ev = bank.tick();
+    let ev = bank.tick_active_cycles();
     assert_eq!(ev, vec![0]);
 }
 
@@ -629,7 +629,7 @@ fn same_event_for_multiple_counters() {
     assert!(bank.is_active(0));
     assert!(bank.is_active(1));
 
-    bank.tick();
+    bank.tick_active_cycles();
     assert_eq!(bank.read_counter(0), 1);
     assert_eq!(bank.read_counter(1), 1);
 }
@@ -798,7 +798,7 @@ fn deprecated_tick_shim_behaves_as_active_cycles() {
     #[allow(deprecated)]
     {
         for _ in 0..5 {
-            bank.tick();
+            bank.tick_active_cycles();
         }
     }
     assert_eq!(bank.read_counter(0), 5);

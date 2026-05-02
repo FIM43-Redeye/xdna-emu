@@ -759,15 +759,6 @@ impl Tile {
         }
     }
 
-    /// Get the current lock value (same as effective_lock_value).
-    ///
-    /// Compatibility shim -- previously returned the snapshot value.
-    /// Now returns the live committed value.
-    #[inline]
-    pub fn lock_snapshot_value(&self, lock_id: usize) -> i8 {
-        self.effective_lock_value(lock_id)
-    }
-
     /// Cumulative count of granted lock releases on this tile.
     ///
     /// Monotonically increasing -- incremented each time `resolve_lock_requests()`

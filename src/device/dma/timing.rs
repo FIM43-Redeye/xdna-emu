@@ -72,17 +72,6 @@ impl DmaTimingConfig {
         }
     }
 
-    /// Create timing config from AIE2 architecture constants.
-    ///
-    /// Kept for backwards compatibility with the few remaining callers
-    /// that don't have a `DmaModel` in scope (primarily tests).
-    /// Deprecated in favor of `from_model`; remove once all callers
-    /// have `dma_model` in hand.
-    #[deprecated(note = "use from_model(&AIE2_DMA_MODEL) instead")]
-    pub fn from_arch() -> Self {
-        Self::from_model(&xdna_archspec::aie2::dma::AIE2_DMA_MODEL)
-    }
-
     /// Calculate total cycles for a transfer of given size.
     pub fn transfer_cycles(&self, bytes: u64, has_acquire_lock: bool, has_release_lock: bool) -> u64 {
         let words = (bytes + 3) / 4; // Round up to words

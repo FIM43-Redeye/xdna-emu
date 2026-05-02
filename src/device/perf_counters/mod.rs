@@ -410,21 +410,6 @@ impl PerfCounterBank {
         threshold_events
     }
 
-    /// Advance all active counters by one cycle.
-    ///
-    /// # Deprecated
-    ///
-    /// Prefer [`tick_active_cycles`] or [`tick_idle_cycles`] at call sites
-    /// where core state is known. This shim forwards to `tick_active_cycles`
-    /// to preserve backward compatibility for unmigrated callers.
-    ///
-    /// [`tick_active_cycles`]: PerfCounterBank::tick_active_cycles
-    /// [`tick_idle_cycles`]: PerfCounterBank::tick_idle_cycles
-    #[deprecated(note = "use tick_active_cycles() or tick_idle_cycles()")]
-    pub fn tick(&mut self) -> Vec<usize> {
-        self.tick_active_cycles()
-    }
-
     // -- Register Interface --
 
     /// Read a register by offset relative to the performance counter block base.
