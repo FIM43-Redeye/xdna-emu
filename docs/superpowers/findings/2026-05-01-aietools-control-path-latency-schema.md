@@ -53,13 +53,53 @@ The accompanying human-readable strings:
 
 confirmed the schema's intent.
 
-## What's still hidden
+## What's still hidden -- and why disassembly resolved it
 
-The numeric defaults each subkey takes when no config file is provided
-are hardcoded inside the `.so` and would need disassembly to recover.
-The library logs `"Reading AIE Control Path latency information from
-file"` only when a JSON path is supplied -- without one, defaults apply
-silently.
+Initial hypothesis: numeric defaults are hardcoded immediates that
+disassembly could recover. We followed that path. Result: **the
+defaults do not exist as hardcoded constants.**
+
+Walking the `MathEngine` constructor disassembly:
+
+```
+e441ec:  cmpq   $0x0, -0x2e0(%rbp)        # is the property tree node empty?
+e441f4:  je     e444f2                    # if empty -> skip parsing (default branch)
+e441fa:  lea    0x1cb4727(%rip),%rdi  # 0x2af8928 = "[INFO]: Reading ..."
+e44201:  call   c893f0                    # log the message + parse JSON
+
+e444f2:  ... close ifstream ... jmp to merge point at e408f7
+```
+
+The "default branch" at `0xe444f2` contains zero immediate-value writes
+to MathEngine member fields -- it just closes the file handle and
+joins the merge point. There are no implicit defaults loaded earlier
+in the constructor either.
+
+Two `.bss`-located globals confirm the picture:
+
+```
+nm -D libaie2_cluster_msm_v1_0_0.osci.so | grep latency
+  0000000003575f41 B g_disable_stream_switch_latency
+  000000000357c6e0 B g_aie_func_latency_offset
+```
+
+Both are uninitialised globals (`B` = `.bss`), zero-initialised at
+program start. Latency only takes a non-zero value if the JSON config
+is supplied or environment-variable overrides are set.
+
+## Implication
+
+aietools' default behaviour is **no control-path latency modelling**.
+This matches the project's prior assessment that aiesimulator is
+"not cycle-accurate" (per `CLAUDE.md`): the timing model is opt-in.
+AMD likely ships internal calibration JSONs for their own validation
+work, but those aren't part of the distribution we have.
+
+For us: the numerical defaults are **not** something we can extract
+from any open or proprietary source. Calibration against real NPU
+traces is the only path to truthful numbers. The framework now mirrors
+the schema so calibrated values can ship as a sidecar JSON without
+code churn.
 
 ## Why this is high-leverage even without the numbers
 
