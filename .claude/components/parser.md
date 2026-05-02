@@ -12,7 +12,13 @@ Read this file when working on anything in `src/parser/`.
 | `xclbin.rs` | `Xclbin` -- XCLBIN container parser (sections, metadata, AIE partition extraction) |
 | `aie_partition.rs` | `AiePartition` -- extracts PDI/CDO data and per-core ELF binaries from the AIE partition section |
 | `elf.rs` | `AieElf` -- AIE core ELF parser (text/data segments, entry point, `MemoryRegion` mapping) |
-| `cdo.rs` | `Cdo` -- Configuration Data Object parser (tile setup commands: register writes, DMA config, routing) |
+| `cdo/mod.rs` | `Cdo` -- Configuration Data Object parser (top-level entry) |
+| `cdo/framing.rs` | CDO command framing (op headers, lengths, validation) |
+| `cdo/syntax.rs` | Per-op syntactic decoding (Write32, BlockWrite, MaskWrite, ...) |
+| `cdo/semantics.rs` | Op-to-`DeviceOp` lowering for the unified write vocabulary |
+| `error.rs` | `ParseError` diagnostics for binary loaders |
+| `stream_switch_topology.rs` | Stream-switch topology helpers shared with device-side parsing |
+| `testing/` | Test fixture builders for parser unit tests |
 
 ## Binary Format Chain
 

@@ -46,9 +46,9 @@ Host-to-NPU communication protocol (XRT instruction stream).
 | Path | Purpose |
 |------|---------|
 | `tests/test_overrides.toml` | Skip gates and expected-fail annotations (replaces per-test manifest files) |
-| `tests/npu-outputs/` | Captured NPU hardware reference outputs (machine-specific, regenerate with `capture_npu_outputs`) |
-| `tests/xclbin_integration.rs` | Integration tests loading real xclbin binaries (requires `--features xclbin-tests`) |
-| `tests/hardware_comparison.rs` | Cross-validation integration tests (requires `--features hardware-compare`) |
+| `tests/npu-outputs/` | Captured NPU hardware reference outputs (machine-specific, gitignored) |
+| `tests/mlir-aie-extracted/` | Extracted/generated test files (regenerable from mlir-aie) |
+| `tests/mlir-aie/` | Pointers/snapshots into the local mlir-aie build |
 
 ### Scripts
 
@@ -70,26 +70,20 @@ cargo test --lib
 # Doc tests only (slow, loads TableGen files)
 ./scripts/run-tests.sh --doc
 
-# Run full mlir-aie test suite (emulator + optional hardware comparison)
-cargo run --bin npu-test
+# Bridge test suite -- the primary validation path
+./scripts/emu-bridge-test.sh                    # full HW + EMU dual-compiler run
+./scripts/emu-bridge-test.sh --no-hw            # emulator only, no NPU needed
+./scripts/emu-bridge-test.sh --no-hw add_one    # single test, EMU only
+./scripts/emu-bridge-test.sh --trace=sweep ...  # add cycle trace comparison
 
-# Single test
-cargo run --bin npu-test -- add_one_using_dma
+# ISA test harness (real NPU only)
+./scripts/isa-test.sh
 
-# Lit wrapper mode (standard LLVM lit execution)
-cargo run --bin npu-test -- --lit
-
-# Trace collection mode
-cargo run --bin npu-test -- --trace
-
-# Triple trace comparison (HW + emulator + optional aiesimulator)
-cargo run --bin npu-test -- --trace-all
-
-# Capture NPU hardware reference outputs (requires NPU hardware)
-cargo run --example capture_npu_outputs
-
-# Cross-validate emulator vs hardware
-cargo run --example compare_emu_hw
+# Standalone Rust binaries
+cargo run --release --bin trace-compare -- ...   # HW vs EMU events JSON diff
+cargo run --release --bin export-isa             # dump TableGen ISA tables
+cargo run --release --bin npu-archspec           # archspec inspector
+cargo run --release --bin vcd-compare -- ...     # aiesimulator VCD diff (--features analysis)
 ```
 
 ## Test Validation Architecture
@@ -99,12 +93,16 @@ computed expected values. The pipeline is:
 
 1. `test_cpp_parser` extracts buffer metadata (sizes, types, input patterns)
    from mlir-aie's test.cpp files
-2. `capture_npu_outputs` runs each test on real NPU hardware and saves
-   the output to `tests/npu-outputs/<test_name>/output.bin`
+2. `native_hw` (preferred) compiles each test's own test.cpp on real NPU
+   hardware and runs it; `npu_runner` is the fallback path; either way
+   the captured output lands under `tests/npu-outputs/<test_name>/`
 3. `xclbin_suite` sets up emulator input buffers from `BufferSpec`, runs
    the emulation, and compares output against the hardware reference
 4. `test_overrides.toml` provides skip gates and expected-fail annotations
    for tests that cannot run or have known issues
+5. The bridge test suite (`scripts/emu-bridge-test.sh`) is a parallel,
+   broader validation path that runs each test's own `test.exe` against
+   both real NPU and the emulator XRT plugin
 
 This replaces the previous manifest system (68 TOML files with hardcoded
 expected values) with automatic test discovery and hardware-as-oracle
@@ -136,18 +134,21 @@ for reference.
 **Active pipeline:**
 - `tools/mlir-trace-inject.py` -- inject trace routing into MLIR (uses mlir-aie API)
 - `bridge-runner/bridge-trace-runner` -- multi-batch sweep orchestrator
-- `tools/trace-to-cycles.py` -- parse trace buffers and compute cycles
+- `tools/parse-trace.py` -- single-source decoder wrapping mlir-aie's `parse_trace`; emits flat events JSON, cycles scalar, raw Perfetto, or raw command stream
 - `src/bin/trace_compare.rs` -- Rust binary comparison (replaced Python OOM)
-- `src/trace/compare.rs` -- core comparison logic
-- `src/trace/vcd.rs` -- aiesimulator VCD parser
+- `src/trace/compare.rs` -- core comparison logic (mode 0)
+- `src/trace/compare_mode2.rs`, `src/trace/mode2_decode.rs` -- mode-2 (INST_EXEC) PC-anchored comparator
+- `src/trace/vcd.rs`, `src/vcd/` -- aiesimulator VCD parser and mapper
 
 Build: `cargo build --release --bin trace-compare`
 
 **Deprecated tools** (do not add new callers):
 - `tools/deprecated/trace-inject.py` -- legacy MLIR trace injection
-- `tools/deprecated/trace-sweep.py` -- legacy multi-batch orchestrator
+- `tools/deprecated/trace-sweep.py` -- pre-IRON-API multi-batch orchestrator (note: `tools/trace-sweep.py` at the top level is the second-gen still in active use)
 - `tools/deprecated/trace-trim.py` -- buffer trimming
 - `tools/deprecated/trace-merge.py` -- Perfetto JSON merge
-- `tools/deprecated/trace-patch-events.py` -- in-place event patching
+- `tools/deprecated/trace-patch-events.py` -- pre-IRON-API event patching (note: `tools/trace-patch-events.py` at the top level is the second-gen still in active use)
+- `tools/deprecated/trace-bridge.sh` -- shell driver superseded by `scripts/emu-bridge-test.sh`
+- `tools/deprecated/trace-compare.py` -- Python comparator superseded by `src/bin/trace_compare.rs`
 
 See `tools/deprecated/README.md`.

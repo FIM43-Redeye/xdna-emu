@@ -1,6 +1,7 @@
-# Visual Debugger
+# Visual Layer
 
-egui-based GUI for visualizing NPU emulation state: tile grid, core details, memory hex view, and emulation controls.
+egui-based trace comparison viewer. The visual layer was retargeted from
+a generic emulator state debugger to a HW vs EMU trace timeline tool.
 
 Read this file when working on anything in `src/visual/`.
 
@@ -8,35 +9,40 @@ Read this file when working on anything in `src/visual/`.
 
 | File | Purpose |
 |------|---------|
-| `mod.rs` | Module root, re-exports `EmulatorApp` |
-| `app.rs` | `EmulatorApp` -- main egui application, top-level layout and state management |
-| `tile_grid.rs` | Tile array visualization -- grid of tiles with status-colored cells |
-| `tile_detail.rs` | Detail panels -- core state (PC, registers), locks, DMA buffer descriptors |
-| `controls.rs` | Emulation controls -- Run, Step, Pause, Reset buttons |
-| `memory_view.rs` | Hex memory viewer -- displays tile memory contents |
+| `mod.rs` | Module root, re-exports `TraceViewerApp` |
+| `app.rs` | `TraceViewerApp` -- main egui application; top-level layout and state |
+| `data.rs` | Loaded trace data (events, tiles, metadata) |
+| `theme.rs` | Color palette, typography, layout constants |
+| `viewport.rs` | Viewport / pan-zoom state for the timeline |
+| `timeline.rs` | Per-tile event-track rendering (HW track + EMU track + divergence overlay) |
+| `tile_selector.rs` | Tile picker / filter UI |
+| `event_detail.rs` | Detail panel for the currently selected event |
+| `alignment.rs` | Piecewise alignment between HW and EMU timelines (phase-aware comparison) |
 
 ## Key Types
 
-- `EmulatorApp` -- implements `eframe::App`, holds all GUI state and a reference to the emulator engine
+- `TraceViewerApp` -- implements `eframe::App`, owns loaded HW/EMU
+  traces and the alignment state
 
-## GUI Framework
+## What It Shows
 
-Uses **egui** via `eframe`:
-- Immediate-mode rendering (no retained widget tree)
-- Pure Rust, no system GUI dependencies
-- Cross-platform (Linux, Windows, macOS, web via WASM)
+- Two horizontal tracks per tile (HW above, EMU below)
+- Divergence highlighting where the two streams disagree
+- Piecewise alignment: anchor points let the user re-align segments to
+  see whether divergences are timing drift or genuine semantic
+  differences
 
-## Current State
+## What It Does Not Do
 
-The GUI framework renders and the tile grid displays. However:
-- No debugging features (breakpoints, watchpoints) are implemented
-- No execution timeline or profiling views exist
-- The GUI was last exercised several weeks ago and may need updates to match current data structures in the device and interpreter modules
-- This is Phase 3 work (Developer Experience) and is not the current priority
+The trace viewer is a comparison tool, not a live debugger. It does not
+attach to a running emulator instance, set breakpoints, or step
+execution. Those Phase-3-Developer-Experience features are not built;
+this viewer was the higher-leverage GUI investment.
 
 ## Launch
 
 ```bash
-# Launch with GUI (requires a display server)
-cargo run -- --gui path/to/binary.xclbin
+cargo run --release -- --visual <hw_events.json> <emu_events.json>
 ```
+
+(See `src/main.rs` for current CLI flags.)

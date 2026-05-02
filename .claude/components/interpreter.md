@@ -33,6 +33,12 @@ TableGen-driven instruction decoder.
 |------|---------|
 | `mod.rs` | Module re-exports |
 | `decoder.rs` | `InstructionDecoder` -- O(1) lookup decoder built from TableGen data |
+| `loader.rs` | Loads decoder tables from generated artifacts at startup |
+| `composite.rs` | Composite-instruction handling (multi-bundle ops) |
+| `crossref.rs` | Cross-references decoder output against expected operand layouts |
+| `operand_extraction.rs` | Operand extraction helpers (split fields, immediate handling) |
+| `register_map.rs` | Maps decoded register identifiers to register-file slots |
+| `slot_builder.rs` | Builds `SlotOp` values from raw decoder output |
 
 ### State (`state/`)
 
@@ -43,6 +49,8 @@ Processor state: registers, flags, execution context.
 | `mod.rs` | Module re-exports |
 | `registers.rs` | `ScalarRegisterFile`, `VectorRegisterFile`, `AccumulatorRegisterFile`, `PointerRegisterFile`, `ModifierRegisterFile` |
 | `context.rs` | `ExecutionContext` -- per-core state (PC, registers, flags, memory view) |
+| `timing_context.rs` | `TimingContext` -- per-core hazard / stall / latency state |
+| `event_trace.rs` | Per-core event log used by the trace pipeline |
 
 ### Execute (`execute/`)
 
@@ -51,22 +59,23 @@ Execution units implementing instruction semantics.
 | File | Purpose |
 |------|---------|
 | `mod.rs` | Module re-exports |
-| `scalar.rs` | `ScalarAlu` -- GPR operations, ALU, comparisons |
-| `vector.rs` | `VectorAlu` -- dispatch, helpers, SRS/UPS, accumulator ops, wide bridges |
+| `vector_dispatch.rs` | `VectorAlu` -- top-level dispatch, accumulator ops, wide bridges |
+| `vector_helpers.rs` | Shared vector helpers used across dispatch paths |
 | `vector_arith.rs` | Arithmetic ops (add, sub, mul, min, max, shifts, negate, abs, floor) |
 | `vector_compare.rs` | Comparison ops (eq, ge, lt, eqz, select) |
 | `vector_misc.rs` | Misc ops (shuffle, broadcast, extract, insert, align, bitwise) |
-| `vector_matmul.rs` | Dense and sparse matrix multiply (config-driven, all type combos) |
-| `vector_matmul_sparse.rs` | Sparse matmul helpers |
+| `vector_matmul/` | Dense and sparse matrix multiply (config-driven, all type combos) |
 | `vmac_hw.rs` | Hardware-faithful sparse vmac pipeline (oracle-verified crossbar routing) |
 | `vector_permute.rs` | VSHUFFLE routing tables (40+ modes) |
 | `vector_srs.rs` | Shift-Round-Saturate (10 rounding modes) |
 | `vector_ups.rs` | UPS widening conversion |
 | `vector_pack.rs` | Pack/unpack operations |
+| `vector_convert.rs` | Type conversion (int<->float, narrow<->wide) |
 | `vector_float.rs` | Float32/BFloat16 compute helpers (NaN, FTZ, PSA) |
 | `vector_config.rs` | MAC configuration word parsing and geometry tables |
 | `vector_semantic.rs` | SemanticOp-based vector dispatch |
-| `memory.rs` | `MemoryUnit` -- load/store with post-modify addressing |
+| `vector_validate.rs` | Cross-checks vector outputs against golden tables |
+| `memory/` | Load/store with post-modify addressing (split into submodules) |
 | `control.rs` | `ControlUnit` -- branches, calls, loops, delay slots |
 | `stream.rs` | Stream put/get instruction execution |
 | `cascade.rs` | Cascade stream operations |
@@ -89,6 +98,10 @@ Cycle-accurate timing model.
 | `slots.rs` | Slot-level timing constraints |
 | `arbitration.rs` | Multi-core resource arbitration |
 
+Note: there is no `barrier.rs` companion file outside `timing/`; the
+old `interpreter::traits` `Flags` abstraction has been folded into the
+register-file types and `TimingContext`.
+
 ### Core (`core/`)
 
 Per-core interpreter.
@@ -109,7 +122,7 @@ Multi-core coordinator.
 
 ## Key Types
 
-- `VliwBundle` -- decoded 128-bit VLIW instruction (up to 7 slot operations)
+- `VliwBundle` -- decoded 128-bit VLIW instruction (up to 8 slot operations)
 - `InstructionDecoder` -- TableGen-driven decoder with O(1) per-slot lookup
 - `ExecutionContext` -- all per-core state (registers, PC, flags, memory)
 - `CoreInterpreter` -- single-core fetch/decode/execute loop
@@ -118,18 +131,21 @@ Multi-core coordinator.
 
 ## Slot Architecture
 
-AIE2 defines 8 hardware slots. The interpreter maps these to 7 functional slots (the `nop` slot is handled implicitly):
+AIE2 defines 8 hardware slots. The interpreter's `SlotIndex` enum has 8
+matching variants -- `LoadA` and `LoadB` are independent ports that can
+issue together in 128-bit bundles, even though they share the load
+execution unit.
 
-| Slot | Field | Bits | Function |
-|------|-------|------|----------|
-| lda | lda | 21 | Load A (pointer-based) |
-| ldb | ldb | 16 | Load B (pointer-based) |
-| alu | alu | 20 | Scalar ALU |
-| mv | mv | 22 | Move/register transfer |
-| st | st | 21 | Store |
-| vec | vec | 26 | Vector ALU |
-| lng | lng | 42 | Long instruction (two-slot) |
-| nop | nop | 1 | NOP (implicit) |
+| AIE2 slot | SlotIndex | Bits | Function |
+|-----------|-----------|------|----------|
+| lda | LoadA | 21 | Load A (pointer-based) |
+| ldb | LoadB | 16 | Load B (pointer-based, only present in 128-bit bundles) |
+| alu | Scalar0 | 20 | Scalar ALU |
+| mv | Scalar1 | 22 | Move / scalar ALU 1 |
+| st | Store | 21 | Store |
+| vec | Vector | 26 | Vector ALU |
+| lng | Accumulator | 42 | Long instruction (accumulator-class operations) |
+| nop | Control | 1 | Branches, calls, control flow |
 
 ## Execution Model
 

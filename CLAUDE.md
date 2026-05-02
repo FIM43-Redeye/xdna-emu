@@ -102,7 +102,7 @@ See [ROADMAP.md](ROADMAP.md) for detailed status with confidence markers
 
 | Phase | Status | Summary |
 |-------|--------|---------|
-| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | **100% ISA** | 4815/4815 ISA test points; 2660+ unit tests; bridge tests pass |
+| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | **100% ISA** | 4815/4815 ISA test points; bridge tests pass on ~75 mlir-aie kernels |
 | [2. Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) | Partial | XRT plugin works; bridge tests run; Peano compilation not integrated |
 | [3. Developer Experience](docs/roadmap/phase3-developer-experience.md) | GUI exists | GUI renders; debugging features not built |
 | [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | Active | Dual-compiler bridge tests, trace sweep, parallel HW |
@@ -333,7 +333,7 @@ the relevant file when working on that area of the codebase.
 | Device model | [`.claude/components/device.md`](.claude/components/device.md) | Working on tiles, array, DMA, streams, locks, host memory (`src/device/`) |
 | Interpreter | [`.claude/components/interpreter.md`](.claude/components/interpreter.md) | Working on instruction decode, execution, timing, multi-core (`src/interpreter/`) |
 | Parser | [`.claude/components/parser.md`](.claude/components/parser.md) | Working on XCLBIN, ELF, or CDO parsing (`src/parser/`) |
-| TableGen | [`.claude/components/tablegen.md`](.claude/components/tablegen.md) | Working on ISA definitions, decoder tables, llvm-aie integration (`src/tablegen/`) |
+| TableGen | [`.claude/components/tablegen.md`](.claude/components/tablegen.md) | Working on ISA definitions, decoder tables, llvm-aie integration (`crates/xdna-archspec/src/aie2/isa/`, with consumers in `src/interpreter/decode/`) |
 | Testing | [`.claude/components/testing.md`](.claude/components/testing.md) | Working on tests, test runner, FFI, NPU instructions, config (`src/testing/`, `src/npu/`, `src/ffi/`, `tests/`) |
 | Visual | [`.claude/components/visual.md`](.claude/components/visual.md) | Working on the GUI debugger (`src/visual/`) |
 
@@ -466,10 +466,13 @@ Flags: `--chess-only`, `--peano-only`, `--no-hw`, `--compile`,
 **Results**: `build/bridge-test-results/YYYYMMDD/` (symlink at `build/bridge-test-results/latest`)
 **Plugin**: `pkexec cp xrt-plugin/build/libxrt_driver_emu.so.2 /opt/xilinx/xrt/lib/`
 
-### Backup: npu-test (standalone harness)
+### Backup: in-process xclbin runner
 
-`npu-test` bypasses XRT entirely -- useful for isolated subsystem testing.
-**NEVER run inside the Claude Code sandbox** (license checks, filesystem issues).
+`src/testing/xclbin_suite.rs` runs xclbins in-process against the emulator
+without going through XRT, useful for isolated subsystem testing. Driven
+from unit tests; not a separate binary. **NEVER run a real-NPU capture
+inside the Claude Code sandbox** -- license checks and filesystem
+isolation will fail.
 
 ## Tracing Ecosystem
 
