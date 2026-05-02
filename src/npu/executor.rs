@@ -101,6 +101,24 @@ pub(crate) enum ExecutorState {
         /// Remaining routing cycles before resuming.
         remaining: u8,
     },
+    /// Charging cycles for a previously-issued instruction to retire.
+    ///
+    /// AIE2's IPU command processor takes multiple cycles to drain a
+    /// control packet's writes through the AXI fabric to the target
+    /// tile. While those writes are in flight, the next instruction
+    /// can't be issued. EMU models this by parking in this state for
+    /// `cycles_remaining` extra cycles after each non-trivial instruction.
+    /// See `NpuInstruction::cycle_cost` for the per-variant cost
+    /// (Phase 1: all variants return 1, so this state is never entered;
+    /// Phase 2 will calibrate against HW timing).
+    RetiringInstruction {
+        /// Index of the NEXT instruction to issue once retire completes.
+        next_index: usize,
+        /// Cycles still owed before the previously-issued instruction
+        /// can be considered fully retired. Strictly > 0; reaching 0
+        /// transitions back to Executing.
+        cycles_remaining: u64,
+    },
     /// All instructions executed.
     Done,
 }
@@ -401,13 +419,26 @@ impl NpuExecutor {
                     _ => {}
                 }
 
-                // Normal progression
+                // Normal progression. If the instruction's cycle_cost is
+                // greater than 1, park in RetiringInstruction so the next
+                // issue is delayed by (cost - 1) cycles. With Phase 1's
+                // all-1 defaults this branch transitions straight back to
+                // Executing; the retire state only engages once Phase 2
+                // populates realistic costs.
                 let new_index = next_index + 1;
                 if new_index >= self.instructions.len() {
                     self.state = ExecutorState::Done;
                     AdvanceResult::Done
                 } else {
-                    self.state = ExecutorState::Executing { next_index: new_index };
+                    let retire_cycles = instr.cycle_cost().saturating_sub(1);
+                    if retire_cycles > 0 {
+                        self.state = ExecutorState::RetiringInstruction {
+                            next_index: new_index,
+                            cycles_remaining: retire_cycles,
+                        };
+                    } else {
+                        self.state = ExecutorState::Executing { next_index: new_index };
+                    }
                     AdvanceResult::Progressed
                 }
             }
@@ -515,6 +546,21 @@ impl NpuExecutor {
                     self.state = ExecutorState::FlushingStreams { next_index, remaining: remaining - 1 };
                 }
                 AdvanceResult::Progressed
+            }
+
+            ExecutorState::RetiringInstruction { next_index, cycles_remaining } => {
+                // Decrement the cycles-owed counter; resume issuing
+                // instructions when it drains. Mirrors the FlushingStreams
+                // pattern above.
+                if cycles_remaining <= 1 {
+                    self.state = ExecutorState::Executing { next_index };
+                } else {
+                    self.state = ExecutorState::RetiringInstruction {
+                        next_index,
+                        cycles_remaining: cycles_remaining - 1,
+                    };
+                }
+                AdvanceResult::Blocked
             }
         }
     }
