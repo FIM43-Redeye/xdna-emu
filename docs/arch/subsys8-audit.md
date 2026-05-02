@@ -1,8 +1,8 @@
 # Subsystem 8 -- Parser Audit
 
 **Subsystem:** 8 of 8 (Phase 1b of the device-family refactor, final)
-**Spec:** [../superpowers/specs/2026-04-23-subsys8-parser-design.md](../superpowers/specs/2026-04-23-subsys8-parser-design.md)
-**Plan:** [../superpowers/plans/2026-04-23-subsys8-parser-plan.md](../superpowers/plans/2026-04-23-subsys8-parser-plan.md)
+**Spec:** [../archive/specs/2026-04-23-subsys8-parser-design.md](../archive/specs/2026-04-23-subsys8-parser-design.md)
+**Plan:** [../archive/plans/2026-04-23-subsys8-parser-plan.md](../archive/plans/2026-04-23-subsys8-parser-plan.md)
 
 ## Baseline (pre-subsystem, at phase1-subsys-isa-execute tag / HEAD)
 

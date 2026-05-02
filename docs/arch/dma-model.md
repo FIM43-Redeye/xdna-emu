@@ -2,7 +2,7 @@
 
 **Subsystem:** 3 (Phase 1b)
 **Tag:** `phase1-subsys-dma`
-**Spec:** [../superpowers/specs/2026-04-21-subsys3-dma-engine-design.md](../superpowers/specs/2026-04-21-subsys3-dma-engine-design.md)
+**Spec:** [../archive/specs/2026-04-21-subsys3-dma-engine-design.md](../archive/specs/2026-04-21-subsys3-dma-engine-design.md)
 
 This document is the mandatory per-seam design note required by the
 parent device-family refactor. It explains the shape difference that

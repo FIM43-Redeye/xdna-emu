@@ -7,7 +7,15 @@ transcriptions with data derived directly from the compiler and runtime
 toolchain -- the same source of truth that the real hardware toolchain uses.
 
 **Created**: 2026-02-14
-**Status**: Research complete, implementation planned
+**Status**: Research complete; the toolchain-derivation principle this
+document advocates is now the project's working policy (see
+[CLAUDE.md](../CLAUDE.md) "Correctness Principle"). The
+`xdna-archspec` crate is the runtime arch source-of-truth, the
+TableGen pipeline emits decoder bytecode at build time, and the BD
+field parsing reads the AM025 register database JSON. The "116-variant
+Operation enum" mentioned at the bottom of this document is gone:
+SemanticOp now lives in `crates/xdna-archspec/src/aie2/isa/types.rs`
+and has ~48 variants resolved from TableGen.
 
 ---
 

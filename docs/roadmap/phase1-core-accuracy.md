@@ -220,7 +220,8 @@ builds O(1) decoder tables.
 | Encoding resolution (210+ instructions) | VERIFIED | Unit tests |
 | Nested template parameter handling | VERIFIED | Unit tests |
 
-**Files**: `src/tablegen/`
+**Files**: `crates/xdna-archspec/src/aie2/isa/` (parser, resolver, decoder
+bytecode emission); `src/interpreter/decode/` (runtime decoder consumer).
 
 ---
 

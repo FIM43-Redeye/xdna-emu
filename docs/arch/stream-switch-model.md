@@ -2,7 +2,7 @@
 
 **Subsystem:** 5 (Phase 1b)
 **Tag:** `phase1-subsys-stream-switch`
-**Spec:** [../superpowers/specs/2026-04-21-subsys5-stream-switch-design.md](../superpowers/specs/2026-04-21-subsys5-stream-switch-design.md)
+**Spec:** [../archive/specs/2026-04-21-subsys5-stream-switch-design.md](../archive/specs/2026-04-21-subsys5-stream-switch-design.md)
 
 This document is the mandatory per-seam design note required by the
 parent device-family refactor. It explains the shape difference that

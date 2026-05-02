@@ -1,8 +1,8 @@
 # Subsystem 7 -- ISA Execute Audit
 
 **Subsystem:** 7 of 8 (Phase 1b of the device-family refactor)
-**Spec:** [../superpowers/specs/2026-04-21-subsys7-isa-execute-design.md](../superpowers/specs/2026-04-21-subsys7-isa-execute-design.md)
-**Plan:** [../superpowers/plans/2026-04-21-subsys7-isa-execute.md](../superpowers/plans/2026-04-21-subsys7-isa-execute.md)
+**Spec:** [../archive/specs/2026-04-21-subsys7-isa-execute-design.md](../archive/specs/2026-04-21-subsys7-isa-execute-design.md)
+**Plan:** [../archive/plans/2026-04-21-subsys7-isa-execute.md](../archive/plans/2026-04-21-subsys7-isa-execute.md)
 
 ## Baseline (pre-subsystem, at phase1-subsys-stream-switch tag / HEAD)
 

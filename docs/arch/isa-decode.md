@@ -2,7 +2,7 @@
 
 **Subsystem:** 6 (Phase 1b)
 **Tag:** `phase1-subsys-isa-decode`
-**Spec:** [../superpowers/specs/2026-04-17-subsys6-isa-decode-design.md](../superpowers/specs/2026-04-17-subsys6-isa-decode-design.md)
+**Spec:** [../archive/specs/2026-04-17-subsys6-isa-decode-design.md](../archive/specs/2026-04-17-subsys6-isa-decode-design.md)
 
 This document is the mandatory per-seam design note required by the
 parent device-family refactor. Subsystem 6 adds no trait seam; this

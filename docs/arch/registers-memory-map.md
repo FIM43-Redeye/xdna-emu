@@ -2,7 +2,7 @@
 
 **Subsystem:** 1 (Phase 1b)
 **Tag:** `phase1-subsys-regs-mem`
-**Spec:** [2026-04-17-subsys1-regs-mem-design.md](../superpowers/specs/2026-04-17-subsys1-regs-mem-design.md)
+**Spec:** [2026-04-17-subsys1-regs-mem-design.md](../archive/specs/2026-04-17-subsys1-regs-mem-design.md)
 
 This document is the mandatory per-seam design note required by the
 parent device-family refactor. Subsystem 1 adds no trait seam, so this

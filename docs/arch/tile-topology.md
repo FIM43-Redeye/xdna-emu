@@ -2,7 +2,7 @@
 
 **Subsystem:** 2 (Phase 1b)
 **Tag:** `phase1-subsys-tile-topo`
-**Spec:** [../superpowers/specs/2026-04-18-subsys2-tile-topology-design.md](../superpowers/specs/2026-04-18-subsys2-tile-topology-design.md)
+**Spec:** [../archive/specs/2026-04-18-subsys2-tile-topology-design.md](../archive/specs/2026-04-18-subsys2-tile-topology-design.md)
 
 This document is the mandatory per-seam design note required by the
 parent device-family refactor. Unlike Subsystem 6 (which adds no trait),
