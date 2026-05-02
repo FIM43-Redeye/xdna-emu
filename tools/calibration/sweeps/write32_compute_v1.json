@@ -1,0 +1,7 @@
+[
+  {
+    "kind": "write32",
+    "target": "compute",
+    "counts": [16, 64, 256, 1024, 4096]
+  }
+]
