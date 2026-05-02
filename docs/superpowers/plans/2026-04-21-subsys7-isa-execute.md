@@ -16,6 +16,9 @@
 
 ---
 
+> **Sweep-as-of 2026-05-01:** Subsystem 7 completed -- tag `phase1-subsys-isa-execute`. SemanticOp execution path consolidated; cycle-accurate executor in place. Steps below were executed organically rather than ticked one-by-one; this sweep flips the checkboxes to match the verified completion state.
+
+
 ## Two-Phase Structure
 
 Subsystem 7 is the largest Phase 1b subsystem by source volume. Rather
@@ -224,7 +227,7 @@ agent merges into a single `subsys7-audit.md`. The three-question
 closing section is synthesized by the executing agent from all six
 agents' findings, not dispatched separately.
 
-- [ ] **Step 1: Create the audit scaffold with baseline + structure**
+- [x] **Step 1: Create the audit scaffold with baseline + structure**
 
 Create `docs/arch/subsys7-audit.md` with this exact content:
 
@@ -347,7 +350,7 @@ Generated using Claude Code."
 
 Expected: clean commit.
 
-- [ ] **Step 2: Create the design-note scaffold**
+- [x] **Step 2: Create the design-note scaffold**
 
 Create `docs/arch/isa-execute-model.md` with this exact content:
 
@@ -405,7 +408,7 @@ Generated using Claude Code."
 
 Expected: clean commit.
 
-- [ ] **Step 3: Dispatch Explore agent for Dispatcher / orchestration area**
+- [x] **Step 3: Dispatch Explore agent for Dispatcher / orchestration area**
 
 Dispatch via the `Explore` agent (subagent_type=Explore) with this prompt:
 
@@ -463,7 +466,7 @@ Generated using Claude Code."
 
 Expected: clean commit with ~400-800 words of audit content.
 
-- [ ] **Step 4: Dispatch Explore agent for Scalar / control / stream / cascade area**
+- [x] **Step 4: Dispatch Explore agent for Scalar / control / stream / cascade area**
 
 Dispatch via the `Explore` agent with this prompt:
 
@@ -510,7 +513,7 @@ Generated using Claude Code."
 
 Expected: clean commit.
 
-- [ ] **Step 5: Dispatch Explore agent for Memory area (deep dive)**
+- [x] **Step 5: Dispatch Explore agent for Memory area (deep dive)**
 
 Dispatch via the `Explore` agent with this prompt:
 
@@ -566,7 +569,7 @@ Generated using Claude Code."
 
 Expected: clean commit with ~900-1500 words.
 
-- [ ] **Step 6: Dispatch Explore agent for Vector ALU area**
+- [x] **Step 6: Dispatch Explore agent for Vector ALU area**
 
 Dispatch via the `Explore` agent with this prompt:
 
@@ -642,7 +645,7 @@ Generated using Claude Code."
 
 Expected: clean commit with ~1200-1800 words.
 
-- [ ] **Step 7: Dispatch Explore agent for VMAC / matmul area (deep dive)**
+- [x] **Step 7: Dispatch Explore agent for VMAC / matmul area (deep dive)**
 
 Dispatch via the `Explore` agent with this prompt:
 
@@ -714,7 +717,7 @@ Generated using Claude Code."
 
 Expected: clean commit with ~900-1500 words.
 
-- [ ] **Step 8: Dispatch Explore agent for Timing area**
+- [x] **Step 8: Dispatch Explore agent for Timing area**
 
 Dispatch via the `Explore` agent with this prompt:
 
@@ -783,7 +786,7 @@ Generated using Claude Code."
 
 Expected: clean commit with ~600-1000 words.
 
-- [ ] **Step 9: Synthesize closing summary (trait list + data migrations + AIE1 projection)**
+- [x] **Step 9: Synthesize closing summary (trait list + data migrations + AIE1 projection)**
 
 Read the six area sections you just filled in (dispatcher, scalar/
 control, memory, vector ALU, VMAC, timing). Synthesize into the
@@ -838,7 +841,7 @@ Generated using Claude Code."
 
 Expected: clean commit.
 
-- [ ] **Step 10: Verify audit integrity and global invariants**
+- [x] **Step 10: Verify audit integrity and global invariants**
 
 Sanity-check that the audit is complete and the repo is still green.
 
@@ -883,7 +886,7 @@ singleton, `ArchConfig::isa_executor()` dispatch method (matches
 test. After Task 2 lands, adding a trait method in Part B is one edit
 to `isa_execute/mod.rs` + one method body in `aie2/isa_execute_model.rs`.
 
-- [ ] **Step 1: Create the empty `IsaExecutor` trait module**
+- [x] **Step 1: Create the empty `IsaExecutor` trait module**
 
 Create `crates/xdna-archspec/src/isa_execute/mod.rs`:
 
@@ -917,7 +920,7 @@ pub trait IsaExecutor: Send + Sync + core::fmt::Debug {
 }
 ```
 
-- [ ] **Step 2: Create the AIE2 impl + singleton**
+- [x] **Step 2: Create the AIE2 impl + singleton**
 
 Create `crates/xdna-archspec/src/aie2/isa_execute_model.rs`:
 
@@ -959,7 +962,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Wire the modules into `lib.rs` and `aie2/mod.rs`**
+- [x] **Step 3: Wire the modules into `lib.rs` and `aie2/mod.rs`**
 
 Modify `crates/xdna-archspec/src/lib.rs`. Find the line `pub mod stream_switch;` and add after it:
 
@@ -975,7 +978,7 @@ pub mod isa_execute_model;
 
 (The exact existing line may differ; use Grep to find a similar `pub mod *_model;` line and add the new one immediately after to preserve ordering.)
 
-- [ ] **Step 4: Add `isa_executor()` method to ArchConfig trait + impl**
+- [x] **Step 4: Add `isa_executor()` method to ArchConfig trait + impl**
 
 Modify `crates/xdna-archspec/src/runtime.rs`. Find the `stream_switch_model` trait method declaration on `ArchConfig` and add immediately after it:
 
@@ -1003,7 +1006,7 @@ Find the `stream_switch_model` impl on `ModelConfig` (the one that returns `&AIE
     }
 ```
 
-- [ ] **Step 5: Add dispatch test**
+- [x] **Step 5: Add dispatch test**
 
 In the same `crates/xdna-archspec/src/runtime.rs`, find the existing test `stream_switch_model_dispatches_to_aie2_for_aie2_family` and add a sibling test immediately after it:
 
@@ -1030,7 +1033,7 @@ In the same `crates/xdna-archspec/src/runtime.rs`, find the existing test `strea
     }
 ```
 
-- [ ] **Step 6: Verify archspec builds and tests pass**
+- [x] **Step 6: Verify archspec builds and tests pass**
 
 Run:
 ```bash
@@ -1041,7 +1044,7 @@ Expected: test result OK. Count should be `300 passed; 0 failed; 2 ignored` (pre
 
 If the test count is not 300, investigate: check all three new tests exist in the modules just created, and that the modules are wired into `lib.rs` / `aie2/mod.rs`.
 
-- [ ] **Step 7: Commit archspec-side scaffold**
+- [x] **Step 7: Commit archspec-side scaffold**
 
 ```bash
 git add crates/xdna-archspec/src/isa_execute/mod.rs \
@@ -1070,7 +1073,7 @@ Generated using Claude Code."
 
 Expected: clean commit.
 
-- [ ] **Step 8: Add `isa_executor()` accessor to `arch_handle.rs`**
+- [x] **Step 8: Add `isa_executor()` accessor to `arch_handle.rs`**
 
 Modify `src/device/arch_handle.rs`. Find the `stream_switch_topology()` accessor (the most recent addition from Subsystem 5) and add a sibling accessor immediately after it.
 
@@ -1101,7 +1104,7 @@ pub fn isa_executor() -> &'static dyn IsaExecutor {
 }
 ```
 
-- [ ] **Step 9: Verify xdna-emu builds and tests pass**
+- [x] **Step 9: Verify xdna-emu builds and tests pass**
 
 Run:
 ```bash
@@ -1116,7 +1119,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail
 
 Expected: `2684 passed; 0 failed; 5 ignored` (no change -- no new xdna-emu tests yet, accessor is not yet consumed).
 
-- [ ] **Step 10: Commit xdna-emu-side wiring**
+- [x] **Step 10: Commit xdna-emu-side wiring**
 
 ```bash
 git add src/device/arch_handle.rs
@@ -1135,7 +1138,7 @@ Generated using Claude Code."
 
 Expected: clean commit.
 
-- [ ] **Step 11: Bridge smoke + full-tree sanity**
+- [x] **Step 11: Bridge smoke + full-tree sanity**
 
 Rebuild the FFI cdylib, then run a bridge smoke test:
 
@@ -1239,7 +1242,7 @@ pattern is proven. This preserves green tests at every commit.
 
 For each sub-bundle below, the pattern is: (1) verify the constant's archspec destination exists; if not, add it to archspec with a test; (2) find all call sites in the target xdna-emu file via grep; (3) replace each literal with the accessor call; (4) `cargo test --lib` (expect unchanged count); (5) commit.
 
-- [ ] **Step 1: Bundle 3a -- Control register IDs in `semantic.rs`**
+- [x] **Step 1: Bundle 3a -- Control register IDs in `semantic.rs`**
 
 Audit reference: `semantic.rs` uses lock-quadrant-style IDs `crSat`, `crRnd`, `crSRSSign` and q-regs (~30 sites). Find them with:
 
@@ -1274,7 +1277,7 @@ migrations (audit item 7).
 Generated using Claude Code."
 ```
 
-- [ ] **Step 2: Bundle 3b -- Lock quadrant boundaries in `control.rs`**
+- [x] **Step 2: Bundle 3b -- Lock quadrant boundaries in `control.rs`**
 
 Audit reference: the quadrant boundaries are 0-15 (South), 16-31 (West), 32-47 (North), 48-63 (East/Internal). Find them:
 
@@ -1295,7 +1298,7 @@ Subsystem 7 Part B accessor migrations (audit item 8).
 Generated using Claude Code."
 ```
 
-- [ ] **Step 3: Bundle 3c -- Latency constants in `timing/latency.rs`**
+- [x] **Step 3: Bundle 3c -- Latency constants in `timing/latency.rs`**
 
 Audit reference: 8 raw numeric literals duplicating archspec values (`LATENCY_MEMORY`, `LATENCY_SCALAR_MUL`, etc.). Find them:
 
@@ -1307,7 +1310,7 @@ For each, check if `ProcessorModel` (or another archspec module) already has the
 
 Commit: `refactor: latency constants read from archspec in timing/latency.rs`
 
-- [ ] **Step 4: Bundle 3d -- PROC_BUS_* in `memory/mod.rs`**
+- [x] **Step 4: Bundle 3d -- PROC_BUS_* in `memory/mod.rs`**
 
 Audit reference: `PROC_BUS_BASE`, `PROC_BUS_END` literals. Find them:
 
@@ -1319,7 +1322,7 @@ Verify the constants exist in archspec `aie2::compute` (or equivalent). If not, 
 
 Commit: `refactor: PROC_BUS_* literals read from archspec in memory/mod.rs`
 
-- [ ] **Step 5: Bundle 3e -- LatencyTable::aie2() + delay-slot in `cycle_accurate.rs`**
+- [x] **Step 5: Bundle 3e -- LatencyTable::aie2() + delay-slot in `cycle_accurate.rs`**
 
 Audit reference: `LatencyTable::aie2()` constructor call + delay-slot constant. Find them:
 
@@ -1331,7 +1334,7 @@ The `LatencyTable::aie2()` call at line ~87 should route through `default_arch()
 
 Commit: `refactor: cycle_accurate reads LatencyTable + delay slot from archspec`
 
-- [ ] **Step 6: Verify Task 3 close**
+- [x] **Step 6: Verify Task 3 close**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1365,7 +1368,7 @@ Five commits for Task 3 if all sub-bundles land cleanly. If any sub-bundle surfa
 
 **Goal:** Move four bounded data artifacts from execute/ to archspec, each with a drift-detection test and its own commit.
 
-- [ ] **Step 1: `RoundingMode` dedup (pre-verified safe)**
+- [x] **Step 1: `RoundingMode` dedup (pre-verified safe)**
 
 `vector_srs.rs:34-87` and `vector_float.rs:34-70` define the same 10-variant enum plus an identical `from_raw()` method. Verified identical 2026-04-21 apart from cosmetic doc-comment variation. Merge:
 
@@ -1490,7 +1493,7 @@ Part of Subsystem 7 Part B (audit item 3).
 Generated using Claude Code."
 ```
 
-- [ ] **Step 2: Matmul geometry tables**
+- [x] **Step 2: Matmul geometry tables**
 
 `vector_config.rs` has `DENSE_GEOMETRY_TABLE` and `SPARSE_GEOMETRY_TABLE`. Find them:
 
@@ -1502,7 +1505,7 @@ Move the table constants to `crates/xdna-archspec/src/aie2/matmul.rs` (new modul
 
 Commit: `refactor: matmul geometry tables moved to archspec::aie2::matmul`
 
-- [ ] **Step 3: UPS mode table**
+- [x] **Step 3: UPS mode table**
 
 `vector_ups.rs::ups_mode()` contains a 4-entry valid type-pair table. Find it:
 
@@ -1514,7 +1517,7 @@ Move the table to `crates/xdna-archspec/src/aie2/ups.rs` (new module). Update `v
 
 Commit: `refactor: UPS mode table moved to archspec::aie2::ups`
 
-- [ ] **Step 4: Cascade data + `has_cascade_link` feature flag**
+- [x] **Step 4: Cascade data + `has_cascade_link` feature flag**
 
 This is the one migration with real plumbing work. Three sub-parts, all in one commit:
 
@@ -1560,7 +1563,7 @@ Part of Subsystem 7 Part B (audit item 6).
 Generated using Claude Code."
 ```
 
-- [ ] **Step 5: Verify Task 4 close**
+- [x] **Step 5: Verify Task 4 close**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -1582,7 +1585,7 @@ Expected: all tests green, bridge smoke PASS. Four commits for Task 4.
 
 **Goal:** Move `SHUFFLE_ROUTING: [[u8; 64]; 48]` (3072 bytes of hardware-probed routing data) and the 26-variant `MacPermuteMode` enum from `vector_permute.rs` into `xdna_archspec::aie2::permute`. This is the second-largest data migration after `vmac_routing.rs`.
 
-- [ ] **Step 1: Locate the tables + enum in `vector_permute.rs`**
+- [x] **Step 1: Locate the tables + enum in `vector_permute.rs`**
 
 ```bash
 grep -nE "SHUFFLE_ROUTING|pub enum MacPermuteMode|^pub enum MacPermuteMode" src/interpreter/execute/vector_permute.rs
@@ -1593,7 +1596,7 @@ Note the line ranges for:
 - The `MacPermuteMode` enum (all 26 variants)
 - Any associated `impl` blocks (e.g., `MacPermuteMode::from_raw`, `as_u8`, etc.)
 
-- [ ] **Step 2: Create `crates/xdna-archspec/src/aie2/permute.rs`**
+- [x] **Step 2: Create `crates/xdna-archspec/src/aie2/permute.rs`**
 
 Open a new file and transplant the `SHUFFLE_ROUTING` static + `MacPermuteMode` enum + attached impl blocks verbatim. Preserve existing doc comments. Add a module header:
 
@@ -1637,11 +1640,11 @@ mod tests {
 
 (Adjust tests to match how the codebase actually locks table invariants elsewhere -- see `aie2_topology_matches_generated_constants` in Subsystem 5 for the pattern. If the variant enum doesn't derive `EnumCount`, do a manual assertion listing all expected variants.)
 
-- [ ] **Step 3: Wire the module in `aie2/mod.rs`**
+- [x] **Step 3: Wire the module in `aie2/mod.rs`**
 
 Add `pub mod permute;` after the other model-ish modules in `aie2/mod.rs`.
 
-- [ ] **Step 4: Remove local definitions from `vector_permute.rs`**
+- [x] **Step 4: Remove local definitions from `vector_permute.rs`**
 
 Delete the `SHUFFLE_ROUTING` static, the `MacPermuteMode` enum, and all attached `impl` blocks. Add at the top of `vector_permute.rs`:
 
@@ -1649,7 +1652,7 @@ Delete the `SHUFFLE_ROUTING` static, the `MacPermuteMode` enum, and all attached
 use xdna_archspec::aie2::permute::{SHUFFLE_ROUTING, MacPermuteMode};
 ```
 
-- [ ] **Step 5: Build + test**
+- [x] **Step 5: Build + test**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build 2>&1 | tail -10
@@ -1662,7 +1665,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec 
 
 If the build fails with "unresolved import" errors, trace each back -- it's likely a transplanted impl that referenced a private type in vector_permute.rs. Either make the referenced type `pub` (if it's appropriate for archspec) or split: leave the offending impl in vector_permute.rs and reach back through archspec for the data parts.
 
-- [ ] **Step 6: Bridge smoke + commit**
+- [x] **Step 6: Bridge smoke + commit**
 
 ```bash
 cargo build -p xdna-emu-ffi 2>&1 | tail -3
@@ -1704,7 +1707,7 @@ One commit for Task 5.
 
 **Goal:** Move the entire 234 KB static crossbar routing data file wholesale from execute/ to archspec. Consumers (`vmac_hw.rs` line 15 `include!` + uses of `eval_prmx`/`eval_prmy`) update to read through archspec module path.
 
-- [ ] **Step 1: Inspect the current consumer pattern**
+- [x] **Step 1: Inspect the current consumer pattern**
 
 ```bash
 head -30 /home/triple/npu-work/xdna-emu/src/interpreter/execute/vmac_hw.rs
@@ -1713,7 +1716,7 @@ grep -nE "vmac_routing|eval_prmx|eval_prmy" src/interpreter/execute/vmac_hw.rs
 
 Identify exactly how `vmac_hw.rs` pulls in `vmac_routing.rs`: is it `include!("vmac_routing.rs")`, or `mod vmac_routing;` in `execute/mod.rs` + `use`, or something else? The audit reported it's `include!`'d from line 15 of `vmac_hw.rs`; verify.
 
-- [ ] **Step 2: Create the archspec destination**
+- [x] **Step 2: Create the archspec destination**
 
 Create `crates/xdna-archspec/src/aie2/vmac/mod.rs`:
 
@@ -1735,11 +1738,11 @@ pub use routing::{eval_prmx, eval_prmy};
 
 Create `crates/xdna-archspec/src/aie2/vmac/routing.rs` and COPY the contents of `src/interpreter/execute/vmac_routing.rs` into it verbatim (including the auto-generated-file comment banner at the top). Any `pub fn eval_prmx`, `pub fn eval_prmy` (or whatever the exported symbols are) should remain `pub`.
 
-- [ ] **Step 3: Wire the vmac module in `aie2/mod.rs`**
+- [x] **Step 3: Wire the vmac module in `aie2/mod.rs`**
 
 Add `pub mod vmac;` to `crates/xdna-archspec/src/aie2/mod.rs` in the appropriate alphabetical position.
 
-- [ ] **Step 4: Update `vmac_hw.rs` consumer**
+- [x] **Step 4: Update `vmac_hw.rs` consumer**
 
 Replace the `include!` (or `mod vmac_routing; use vmac_routing::*;`) with an import from archspec:
 
@@ -1750,7 +1753,7 @@ use xdna_archspec::aie2::vmac::{eval_prmx, eval_prmy};
 
 (Or whatever symbol set the file actually exports. Verify first.)
 
-- [ ] **Step 5: Delete `src/interpreter/execute/vmac_routing.rs`**
+- [x] **Step 5: Delete `src/interpreter/execute/vmac_routing.rs`**
 
 ```bash
 git rm src/interpreter/execute/vmac_routing.rs
@@ -1758,7 +1761,7 @@ git rm src/interpreter/execute/vmac_routing.rs
 
 If `execute/mod.rs` declared `mod vmac_routing;`, remove that line.
 
-- [ ] **Step 6: Build + test**
+- [x] **Step 6: Build + test**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build 2>&1 | tail -10
@@ -1791,7 +1794,7 @@ mod tests {
 
 (Adjust to match the actual signatures of `eval_prmx`/`eval_prmy`.)
 
-- [ ] **Step 7: Bridge smoke + commit**
+- [x] **Step 7: Bridge smoke + commit**
 
 ```bash
 cargo build -p xdna-emu-ffi 2>&1 | tail -3
@@ -1833,7 +1836,7 @@ One commit for Task 6.
 
 **Goal:** Close Part B and land the subsystem tag. This task has no source-code changes -- it documents the state, runs the full gate, and tags.
 
-- [ ] **Step 1: Fill in `docs/arch/isa-execute-model.md`**
+- [x] **Step 1: Fill in `docs/arch/isa-execute-model.md`**
 
 Replace each `(Filled in at Part B close.)` placeholder with content. The design-note template is structured as:
 
@@ -1849,7 +1852,7 @@ Replace each `(Filled in at Part B close.)` placeholder with content. The design
 
 No commit yet (combine with Step 2 below).
 
-- [ ] **Step 2: Fill in `## Completion` section of `docs/arch/subsys7-audit.md`**
+- [x] **Step 2: Fill in `## Completion` section of `docs/arch/subsys7-audit.md`**
 
 Replace `(Filled in at the end of Subsystem 7, in the Part B final task.)` with a completion section structured like Subsystem 5's audit completion:
 
@@ -1890,7 +1893,7 @@ Replace `(Filled in at the end of Subsystem 7, in the Part B final task.)` with 
 - (list anything surfaced during migration that's a genuinely-separate workstream)
 ```
 
-- [ ] **Step 3: Update `NEXT-STEPS.md`**
+- [x] **Step 3: Update `NEXT-STEPS.md`**
 
 Follow the pattern from Subsystem 5's update:
 - Update "Last updated" to today's date.
@@ -1912,7 +1915,7 @@ and AIE2P ports now require only archspec additions.
 Generated using Claude Code."
 ```
 
-- [ ] **Step 4: Run the full-tree gate (sequential)**
+- [x] **Step 4: Run the full-tree gate (sequential)**
 
 Per CLAUDE.md: never run two hardware test suites concurrently. Run bridge first, then ISA.
 
@@ -1950,7 +1953,7 @@ Expected outcomes:
 
 If any of these fail unexpectedly, do NOT tag. Diagnose and fix before tagging.
 
-- [ ] **Step 5: Tag `phase1-subsys-isa-execute`**
+- [x] **Step 5: Tag `phase1-subsys-isa-execute`**
 
 ```bash
 git tag phase1-subsys-isa-execute
@@ -1959,7 +1962,7 @@ git log --oneline phase1-subsys-stream-switch..phase1-subsys-isa-execute | head 
 
 Report the tag SHA.
 
-- [ ] **Step 6: Amend the Completion section with final numbers**
+- [x] **Step 6: Amend the Completion section with final numbers**
 
 Re-open `docs/arch/subsys7-audit.md` and fill in the actual SHA, date, commit count, test counts, bridge/ISA results into the Completion section's placeholders from Step 2. Commit with:
 
@@ -2014,24 +2017,24 @@ Documented in `NEXT-STEPS.md`:
 
 Run before closing Part A:
 
-- [ ] `docs/arch/subsys7-audit.md` exists, all six area sections have
+- [x] `docs/arch/subsys7-audit.md` exists, all six area sections have
       content, closing summary has the three subsections.
-- [ ] `docs/arch/isa-execute-model.md` scaffold exists (placeholders
+- [x] `docs/arch/isa-execute-model.md` scaffold exists (placeholders
       for Part B close are fine).
-- [ ] `crates/xdna-archspec/src/isa_execute/mod.rs` exists with
+- [x] `crates/xdna-archspec/src/isa_execute/mod.rs` exists with
       empty `IsaExecutor` trait.
-- [ ] `crates/xdna-archspec/src/aie2/isa_execute_model.rs` exists
+- [x] `crates/xdna-archspec/src/aie2/isa_execute_model.rs` exists
       with `Aie2IsaExecutor` + `AIE2_ISA_EXECUTOR` + 2 tests.
-- [ ] `crates/xdna-archspec/src/lib.rs` has `pub mod isa_execute;`.
-- [ ] `crates/xdna-archspec/src/aie2/mod.rs` has `pub mod isa_execute_model;`.
-- [ ] `crates/xdna-archspec/src/runtime.rs` has `isa_executor` trait
+- [x] `crates/xdna-archspec/src/lib.rs` has `pub mod isa_execute;`.
+- [x] `crates/xdna-archspec/src/aie2/mod.rs` has `pub mod isa_execute_model;`.
+- [x] `crates/xdna-archspec/src/runtime.rs` has `isa_executor` trait
       method + impl + dispatch test.
-- [ ] `src/device/arch_handle.rs` has `isa_executor()` accessor +
+- [x] `src/device/arch_handle.rs` has `isa_executor()` accessor +
       `OnceLock`.
-- [ ] `cargo test --lib` = 2684/0/5.
-- [ ] `cargo test -p xdna-archspec --lib` = 300/0/2.
-- [ ] Bridge smoke `--no-hw -v add_one_cpp_aiecc` = green.
-- [ ] ~11 commits since `phase1-subsys-stream-switch`.
+- [x] `cargo test --lib` = 2684/0/5.
+- [x] `cargo test -p xdna-archspec --lib` = 300/0/2.
+- [x] Bridge smoke `--no-hw -v add_one_cpp_aiecc` = green.
+- [x] ~11 commits since `phase1-subsys-stream-switch`.
 
 If any item is missing or incorrect, fix before declaring Part A
 complete.

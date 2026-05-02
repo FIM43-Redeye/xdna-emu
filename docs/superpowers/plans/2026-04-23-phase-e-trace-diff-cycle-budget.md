@@ -10,6 +10,9 @@
 
 ---
 
+> **Sweep-as-of 2026-05-01:** Plan completed. Closing commits visible on dev: cb0dba7 (dual-bound EMU timing from HW), f251341 (calibrate EMU_SECONDS_PER_CYCLE to 2e-9), f1fb71b (NO_CORE classification), 1e41dcd (skip trace injection for incompat tests), d6f3004 (CYCLES column + drift summary), 330f89a (re-classify cycle diffs after Phase 3+4), d2de5f4 (`docs(phase-e): validation results` -- the formal completion marker). Steps below were executed organically rather than ticked one-by-one; this sweep flips the checkboxes to match the verified completion state.
+
+
 ## Scope Check
 
 This plan covers a single subsystem: integrating EMU-side trace capture and binary trace comparison into the bridge test flow, plus the surrounding UX (dual-bound timing, compile-fail surfacing, overrides, reporter). It builds directly on Phase B (2026-04-22) which is shipped. It does not touch emulator internals unless the Task 1 validation gate exposes a real bug — in which case the bug fix is tracked as a discovered sub-task at that point, not as a pre-planned task.
@@ -66,7 +69,7 @@ This plan covers a single subsystem: integrating EMU-side trace capture and bina
 
 **Purpose:** Gate the rest of the plan on proof that EMU's existing trace emission is HW-binary-compatible. If the emulator produces empty or unparseable bytes, we debug the emulator (not the bridge) before any further Phase E work. The plan's task list stops here until this validation passes.
 
-- [ ] **Step 1: Ensure a known-good traced `vector_scalar_using_dma` xclbin exists**
+- [x] **Step 1: Ensure a known-good traced `vector_scalar_using_dma` xclbin exists**
 
 Run:
 ```bash
@@ -87,7 +90,7 @@ Expected: every file exists; the cycles file contains a non-zero integer.
 
 If missing, step 1 failed — run with `--compile` to force rebuild, or debug the Phase B pipeline before continuing.
 
-- [ ] **Step 2: Ensure the latest emulator .so is installed**
+- [x] **Step 2: Ensure the latest emulator .so is installed**
 
 Run:
 ```bash
@@ -97,7 +100,7 @@ cargo build --release --bin trace-compare
 ```
 Expected: build succeeds; `/opt/xilinx/xrt/lib/libxrt_driver_emu.so.2` is updated (pkexec prompt).
 
-- [ ] **Step 3: Capture EMU trace via bridge-trace-runner under XDNA_EMU**
+- [x] **Step 3: Capture EMU trace via bridge-trace-runner under XDNA_EMU**
 
 Run (from the xdna-emu repo root):
 ```bash
@@ -117,7 +120,7 @@ Expected: exit code 0; `trace_emu.chess.bin` is 8192 bytes; runner.log mentions 
 
 If the runner exits non-zero or the plugin doesn't load, check `runner.log` — most likely causes are missing `.so`, `XRT_DEVICE_BDF` issue, or a kernarg classification regression in the runner.
 
-- [ ] **Step 4: Extract EMU cycles**
+- [x] **Step 4: Extract EMU cycles**
 
 Run:
 ```bash
@@ -132,7 +135,7 @@ cat /tmp/claude-1000/phase-e-task1/cycles.EMU.txt
 ```
 Expected: a non-zero integer on stdout. "Within the same order of magnitude as 41181" is a bonus; "non-zero, parseable, repeatable" is the gate.
 
-- [ ] **Step 5: Decision gate**
+- [x] **Step 5: Decision gate**
 
 **If step 4 produced a non-zero integer:** write the validation note (next step) and proceed to Task 2.
 
@@ -147,7 +150,7 @@ Expected: a non-zero integer on stdout. "Within the same order of magnitude as 4
   xxd build/bridge-test-results/latest/vector_scalar_using_dma.hw-cycles/trace.chess.bin | head -20
   ```
 
-- [ ] **Step 6: Write the validation note**
+- [x] **Step 6: Write the validation note**
 
 Create `docs/superpowers/notes/2026-04-23-phase-e-task1-validation.md` with the following content, filling in the measured numbers:
 
@@ -181,7 +184,7 @@ or
 - `/tmp/claude-1000/phase-e-task1/cycles.EMU.txt`
 ```
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -207,7 +210,7 @@ EOF
 
 **Purpose:** Symmetric naming for the HW and EMU bins going forward. One-line change with a re-run smoke test.
 
-- [ ] **Step 1: Edit `_run_hw_cycles_pipeline`**
+- [x] **Step 1: Edit `_run_hw_cycles_pipeline`**
 
 In `scripts/emu-bridge-test.sh`, locate:
 
@@ -220,7 +223,7 @@ In `scripts/emu-bridge-test.sh`, locate:
     local trace_bin="$work_dir/trace_hw.$variant.bin"
 ```
 
-- [ ] **Step 2: Re-run to generate the renamed artifact**
+- [x] **Step 2: Re-run to generate the renamed artifact**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -229,7 +232,7 @@ ls build/bridge-test-results/latest/vector_scalar_using_dma.hw-cycles/
 ```
 Expected: listing contains `trace_hw.chess.bin` (no `trace.chess.bin`).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -254,7 +257,7 @@ EOF
 
 **Purpose:** Introduce the flag surface now so downstream tasks can gate behavior on it. No runtime behavior change in this task — the flag merely sets and exports `WITH_CYCLE_DIFF`, and implies `WITH_HW_CYCLES=true`.
 
-- [ ] **Step 1: Add default near the top of the flag block**
+- [x] **Step 1: Add default near the top of the flag block**
 
 Find the `WITH_HW_CYCLES=${WITH_HW_CYCLES:-false}` line (around line 95). Add immediately after:
 
@@ -262,7 +265,7 @@ Find the `WITH_HW_CYCLES=${WITH_HW_CYCLES:-false}` line (around line 95). Add im
 WITH_CYCLE_DIFF=${WITH_CYCLE_DIFF:-false}
 ```
 
-- [ ] **Step 2: Add flag parsing**
+- [x] **Step 2: Add flag parsing**
 
 Find the `--with-hw-cycles)` case (around line 119). Add immediately after:
 
@@ -270,7 +273,7 @@ Find the `--with-hw-cycles)` case (around line 119). Add immediately after:
     --with-cycle-diff)     WITH_CYCLE_DIFF=true; WITH_HW_CYCLES=true; shift ;;
 ```
 
-- [ ] **Step 3: Extend the help text**
+- [x] **Step 3: Extend the help text**
 
 Find the `--with-hw-cycles` help line (around line 140). Add below it:
 
@@ -280,7 +283,7 @@ Find the `--with-hw-cycles` help line (around line 140). Add below it:
                     --with-hw-cycles.
 ```
 
-- [ ] **Step 4: Add `WITH_CYCLE_DIFF` to the `export` list**
+- [x] **Step 4: Add `WITH_CYCLE_DIFF` to the `export` list**
 
 Find the `export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP RUN_AIESIM NO_TIMEOUT WITH_HW_CYCLES` line (around line 175). Append `WITH_CYCLE_DIFF`:
 
@@ -288,7 +291,7 @@ Find the `export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP RUN_AI
 export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP RUN_AIESIM NO_TIMEOUT WITH_HW_CYCLES WITH_CYCLE_DIFF
 ```
 
-- [ ] **Step 5: Smoke test**
+- [x] **Step 5: Smoke test**
 
 Run:
 ```bash
@@ -303,7 +306,7 @@ Run:
 ```
 Expected: the command accepts the flag without error.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh
@@ -327,7 +330,7 @@ EOF
 
 **Purpose:** Replace `_run_hw_cycles_pipeline <build_dir> <xclbin> <kernel> <instr> <variant>` with a `_run_trace_cycles_pipeline <side> <build_dir> <xclbin> <kernel> <instr> <variant>` that takes `side ∈ {HW, EMU}` and does the side-specific env/output selection internally. The HW caller is updated in this task; the EMU caller comes in Task 5.
 
-- [ ] **Step 1: Rewrite the helper**
+- [x] **Step 1: Rewrite the helper**
 
 Replace the entire body of `_run_hw_cycles_pipeline` (between the opening `{` and the closing `}` exposed by `export -f` around line 815) with this side-parameterized version. Preserve surrounding comments:
 
@@ -422,7 +425,7 @@ _run_trace_cycles_pipeline() {
 }
 ```
 
-- [ ] **Step 2: Update the HW caller in `run_one_hardware`**
+- [x] **Step 2: Update the HW caller in `run_one_hardware`**
 
 Find (around line 1304):
 
@@ -442,7 +445,7 @@ And update the adjacent log prefix (the line right below that reads `echo "[hw-c
           echo "[trace-cycles:HW] $name (${compiler}${vsuffix}): missing xclbin or insts.bin in $build_dir; skipping" >&2
 ```
 
-- [ ] **Step 3: Update `export -f` line to match renamed function**
+- [x] **Step 3: Update `export -f` line to match renamed function**
 
 Find (around line 815):
 
@@ -456,7 +459,7 @@ Replace with:
 export -f _strip_trace_flags _variant_from_cmd _run_trace_cycles_pipeline
 ```
 
-- [ ] **Step 4: Smoke test — HW path still works**
+- [x] **Step 4: Smoke test — HW path still works**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -466,7 +469,7 @@ cat build/bridge-test-results/latest/vector_scalar_using_dma.chess.cycles.HW.txt
 ```
 Expected: `trace_hw.chess.bin` present; cycles file non-empty integer identical to Phase B's (~41181).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh
@@ -490,7 +493,7 @@ EOF
 
 **Purpose:** After the EMU bridge test produces a `result`, when `WITH_CYCLE_DIFF=true` and the test PASSed, invoke `_run_trace_cycles_pipeline EMU` on the same build dir. Mirrors Phase B's HW-side call in `run_one_hardware`.
 
-- [ ] **Step 1: Add the EMU-side invocation**
+- [x] **Step 1: Add the EMU-side invocation**
 
 In `run_one_bridge` (around line 1436 just after `echo "$result" > "$result_file"`), locate this region:
 
@@ -517,7 +520,7 @@ Insert between those two statements (before the events.json copy):
   fi
 ```
 
-- [ ] **Step 2: End-to-end smoke test**
+- [x] **Step 2: End-to-end smoke test**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -533,7 +536,7 @@ cat build/bridge-test-results/latest/vector_scalar_using_dma.chess.cycles.EMU.tx
 ```
 Expected: both non-zero. Within an order of magnitude is plausible; identical is unlikely (emulator models, not replays).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh
@@ -558,7 +561,7 @@ EOF
 
 **Purpose:** After both `trace_hw.<variant>.bin` and `trace_emu.<variant>.bin` exist for a given run, invoke `target/release/trace-compare` with `--stalls --extended` and write the report to `RESULTS_DIR/<safe>.<variant>.cycles.compare.txt`. Classification is the next task; this one produces the report only.
 
-- [ ] **Step 1: Add the helper**
+- [x] **Step 1: Add the helper**
 
 In `scripts/emu-bridge-test.sh`, immediately after `_run_trace_cycles_pipeline` (just before the `export -f` line), add:
 
@@ -600,7 +603,7 @@ _run_trace_compare() {
 }
 ```
 
-- [ ] **Step 2: Update the `export -f` line**
+- [x] **Step 2: Update the `export -f` line**
 
 Find:
 
@@ -614,7 +617,7 @@ Replace with:
 export -f _strip_trace_flags _variant_from_cmd _run_trace_cycles_pipeline _run_trace_compare
 ```
 
-- [ ] **Step 3: Invoke from `run_one_bridge`**
+- [x] **Step 3: Invoke from `run_one_bridge`**
 
 In `run_one_bridge`, directly after the Task 5 EMU-side invocation block, add:
 
@@ -625,7 +628,7 @@ In `run_one_bridge`, directly after the Task 5 EMU-side invocation block, add:
   fi
 ```
 
-- [ ] **Step 4: Smoke test**
+- [x] **Step 4: Smoke test**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -635,7 +638,7 @@ cat build/bridge-test-results/latest/vector_scalar_using_dma.chess.cycles.compar
 ```
 Expected: a non-empty report with `Edge event types:` and `Level event types:` summary lines.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh
@@ -675,7 +678,7 @@ The rules in bash (Phase E spec §Classification rules and §Error handling):
 
 `<ratio>` is formatted to 2 decimal places. Default bounds are `[0.5, 2.0]`; per-test overrides from `cycle-drift-overrides.txt` (Task 11) take precedence and load via a helper lookup function. In this task the override lookup is stubbed as a function that always returns the defaults; Task 11 replaces the stub with a real lookup.
 
-- [ ] **Step 1: Add the override-lookup stub**
+- [x] **Step 1: Add the override-lookup stub**
 
 Add near the top of the script (after the existing `is_trace_quarantined` function around line 249):
 
@@ -692,7 +695,7 @@ _lookup_drift_bounds() {
 export -f _lookup_drift_bounds
 ```
 
-- [ ] **Step 2: Add the classifier**
+- [x] **Step 2: Add the classifier**
 
 Add near `_run_trace_compare` (just before the `export -f` line that follows it):
 
@@ -796,7 +799,7 @@ _classify_cycle_diff() {
 }
 ```
 
-- [ ] **Step 3: Update `export -f`**
+- [x] **Step 3: Update `export -f`**
 
 Find the `export -f` line that currently lists `_strip_trace_flags _variant_from_cmd _run_trace_cycles_pipeline _run_trace_compare`. Replace with:
 
@@ -804,7 +807,7 @@ Find the `export -f` line that currently lists `_strip_trace_flags _variant_from
 export -f _strip_trace_flags _variant_from_cmd _run_trace_cycles_pipeline _run_trace_compare _classify_cycle_diff
 ```
 
-- [ ] **Step 4: Invoke the classifier from `run_one_bridge`**
+- [x] **Step 4: Invoke the classifier from `run_one_bridge`**
 
 In `run_one_bridge`, immediately after the Task 6 `_run_trace_compare` call, add:
 
@@ -815,7 +818,7 @@ In `run_one_bridge`, immediately after the Task 6 `_run_trace_compare` call, add
   fi
 ```
 
-- [ ] **Step 5: Smoke test**
+- [x] **Step 5: Smoke test**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -848,7 +851,7 @@ Restore the HW cycles file by re-running the bridge test:
 ./scripts/emu-bridge-test.sh --with-cycle-diff --no-timeout --chess-only -v '^vector_scalar_using_dma$'
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh
@@ -873,7 +876,7 @@ EOF
 
 **Purpose:** When a HW cycles file exists for the current test+variant, set `XDNA_EMU_MAX_CYCLES = ceil(HW_cycles * 2.0)` (Phase A cycle budget) AND scale the wall-clock timeout to `max(600, ceil(HW_cycles * 2.0 * SECONDS_PER_CYCLE))` with `SECONDS_PER_CYCLE = 1e-3`. Preserve `--no-timeout` semantics unchanged (it disables both bounds). Tests with no HW cycles file keep today's 600 s timeout and no cycle budget.
 
-- [ ] **Step 1: Add the `SECONDS_PER_CYCLE` constant**
+- [x] **Step 1: Add the `SECONDS_PER_CYCLE` constant**
 
 Near the top of the script (after the `WITH_CYCLE_DIFF=${WITH_CYCLE_DIFF:-false}` added in Task 3), add:
 
@@ -886,7 +889,7 @@ EMU_CYCLE_BUDGET_MULTIPLIER=${EMU_CYCLE_BUDGET_MULTIPLIER:-2.0}
 export EMU_SECONDS_PER_CYCLE EMU_CYCLE_BUDGET_MULTIPLIER
 ```
 
-- [ ] **Step 2: Compute the bounds in `run_one_bridge`**
+- [x] **Step 2: Compute the bounds in `run_one_bridge`**
 
 Locate in `run_one_bridge` (around line 1380) the existing block:
 
@@ -950,7 +953,7 @@ Replace the entire block (including the `local rc=0` line) with:
   ) > "$log_file" 2>&1 || rc=$?
 ```
 
-- [ ] **Step 3: Smoke test — cycle budget path**
+- [x] **Step 3: Smoke test — cycle budget path**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -963,7 +966,7 @@ grep 'XDNA_EMU_STATUS' build/bridge-test-results/latest/vector_scalar_using_dma.
 ```
 Expected: `PASS` for the test, and the `XDNA_EMU_STATUS:` line shows `halt_reason=completed` with cycles well under the budget (budget ≈ 82362 for this test).
 
-- [ ] **Step 4: Smoke test — `--no-timeout` still overrides**
+- [x] **Step 4: Smoke test — `--no-timeout` still overrides**
 
 ```bash
 ./scripts/emu-bridge-test.sh --with-cycle-diff --no-timeout --chess-only -v '^vector_scalar_using_dma$' 2>&1 | tee /tmp/claude-1000/phase-e-task8b.log
@@ -971,7 +974,7 @@ grep -E 'PASS|FAIL|TIMEOUT' /tmp/claude-1000/phase-e-task8b.log | head -5
 ```
 Expected: PASS; no timeout invocation at all.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh
@@ -996,7 +999,7 @@ EOF
 
 **Purpose:** When `HW_CYCLES_TRACED_MLIR` is set and the compile fails, it is specifically the trace-injected path that broke. The bridge already knows this locally; surface it so users can retry without `--with-hw-cycles`.
 
-- [ ] **Step 1: Write `FAIL_TRACED` from `compile_one_compiler`**
+- [x] **Step 1: Write `FAIL_TRACED` from `compile_one_compiler`**
 
 Find in `compile_one_compiler` (around line 1041-1044):
 
@@ -1026,7 +1029,7 @@ Replace with:
 
 (The xclbin-missing-after-compile case a few lines below — around line 1052 — keeps plain `FAIL`. That path indicates aiecc reported success but produced no xclbin, which is a different bug class than "trace injection broke the build." Only the `$failed` branch is tagged.)
 
-- [ ] **Step 2: Render `COMPILE-FAIL(traced)` in `print_report`**
+- [x] **Step 2: Render `COMPILE-FAIL(traced)` in `print_report`**
 
 Find in `print_report` (around line 1603):
 
@@ -1090,7 +1093,7 @@ Replace with:
   fi
 ```
 
-- [ ] **Step 3: Smoke test**
+- [x] **Step 3: Smoke test**
 
 The natural test is `ctrl_packet_reconfig`, which Phase B validation showed fails under trace injection:
 
@@ -1109,7 +1112,7 @@ Also confirm a non-traced run still prints plain `FAIL*`:
 ```
 Expected: no crash; no `t*` footnote (because no tests matched).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh
@@ -1135,7 +1138,7 @@ EOF
 
 **Purpose:** Known trace-incompatible tests (e.g., `ctrl_packet_reconfig` — Phase B Limitation 4) still produce a useful HW result path; the bridge should skip injection for them up-front rather than eating a noisy compile failure every run.
 
-- [ ] **Step 1: Create the skip list file**
+- [x] **Step 1: Create the skip list file**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1154,7 +1157,7 @@ ctrl_packet_reconfig
 EOF
 ```
 
-- [ ] **Step 2: Add a loader after the existing `TRACE_QUARANTINE` block**
+- [x] **Step 2: Add a loader after the existing `TRACE_QUARANTINE` block**
 
 Find the end of the `is_trace_quarantined` function (around line 249, right after `export -f is_trace_quarantined`). Add:
 
@@ -1196,7 +1199,7 @@ is_trace_incompat() {
 export -f is_trace_incompat
 ```
 
-- [ ] **Step 3: Skip injection for incompat tests in `compile_one`**
+- [x] **Step 3: Skip injection for incompat tests in `compile_one`**
 
 Find the existing pre-compile injection block in `compile_one` (around line 1118). Before the `if [[ "$WITH_HW_CYCLES" == "true" ]] && [[ -f "$src_dir/aie.mlir" ]]` guard, extend the conditional so incompat tests bypass injection:
 
@@ -1223,7 +1226,7 @@ And add a user-visible log just before that block to document the skip:
 
 Place it immediately before the updated `if` guard.
 
-- [ ] **Step 4: Smoke test**
+- [x] **Step 4: Smoke test**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1233,7 +1236,7 @@ cat build/bridge-test-results/latest/ctrl_packet_reconfig.chess.compile.result
 ```
 Expected: log shows `HW-CYCLES INJECT ctrl_packet_reconfig: SKIP (in trace-incompat-tests.txt)`; compile result is `OK` (not `FAIL_TRACED`).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh scripts/trace-incompat-tests.txt
@@ -1260,7 +1263,7 @@ EOF
 
 **Purpose:** Replace the stubbed `_lookup_drift_bounds` (always returns `[0.5, 2.0]`) with a real per-test override loader. Most tests will continue to use defaults; specific tests can tighten or loosen their bounds.
 
-- [ ] **Step 1: Create the overrides file**
+- [x] **Step 1: Create the overrides file**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1279,7 +1282,7 @@ cat > scripts/cycle-drift-overrides.txt <<'EOF'
 EOF
 ```
 
-- [ ] **Step 2: Replace the stubbed loader**
+- [x] **Step 2: Replace the stubbed loader**
 
 Find the Task 7 stub:
 
@@ -1352,7 +1355,7 @@ _lookup_drift_bounds() {
 export -f _lookup_drift_bounds
 ```
 
-- [ ] **Step 3: Smoke test**
+- [x] **Step 3: Smoke test**
 
 Add a test override to confirm parsing:
 
@@ -1370,7 +1373,7 @@ Revert the test override:
 git checkout -- scripts/cycle-drift-overrides.txt
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh scripts/cycle-drift-overrides.txt
@@ -1395,7 +1398,7 @@ EOF
 
 **Purpose:** Render a per-compiler `CYCLES` column when `WITH_CYCLE_DIFF=true`, and add a summary block that counts `MATCH`/`DRIFT`/`EMPTY`/`*_TRACE_BUG`/`NO_DATA` per compiler. Tests not listed as DRIFT/BUG are healthy and don't warrant a detailed row — the block lists only outliers plus an EMPTY reminder.
 
-- [ ] **Step 1: Thread `WITH_CYCLE_DIFF` through `print_report`**
+- [x] **Step 1: Thread `WITH_CYCLE_DIFF` through `print_report`**
 
 At the top of `print_report` (around line 1473), after the existing `has_trace=false` block, add:
 
@@ -1404,7 +1407,7 @@ At the top of `print_report` (around line 1473), after the existing `has_trace=f
   [[ "$WITH_CYCLE_DIFF" == "true" ]] && has_cycle=true
 ```
 
-- [ ] **Step 2: Extend the header print**
+- [x] **Step 2: Extend the header print**
 
 Find the `if $has_trace; then` block in the header section (around line 1504). After its closing `fi`, add:
 
@@ -1428,7 +1431,7 @@ And the corresponding separator (around line 1521):
   fi
 ```
 
-- [ ] **Step 3: Add per-compiler counters**
+- [x] **Step 3: Add per-compiler counters**
 
 Around line 1553 (after the existing `trace_clean/diverge/...` declarations), add:
 
@@ -1447,7 +1450,7 @@ Around line 1553 (after the existing `trace_clean/diverge/...` declarations), ad
   declare -a cycle_empty_list=()
 ```
 
-- [ ] **Step 4: Render the column**
+- [x] **Step 4: Render the column**
 
 Find the `# Trace columns ...` loop (around line 1666). After its closing `fi` (end of the `$has_trace` block), add:
 
@@ -1482,7 +1485,7 @@ Find the `# Trace columns ...` loop (around line 1666). After its closing `fi` (
     fi
 ```
 
-- [ ] **Step 5: Append summary blocks after the main table**
+- [x] **Step 5: Append summary blocks after the main table**
 
 Find the overall-summary printing block near the end of `print_report`. After the per-compiler trace summaries (look for where `trace_clean`/`trace_diverge` are printed — around line 1800+), add a new summary block:
 
@@ -1522,7 +1525,7 @@ Find the overall-summary printing block near the end of `print_report`. After th
   fi
 ```
 
-- [ ] **Step 6: Smoke test**
+- [x] **Step 6: Smoke test**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1531,7 +1534,7 @@ grep -E 'CYCLES|CYCLE DRIFT|MATCH|DRIFT' /tmp/claude-1000/phase-e-task12.log
 ```
 Expected: header includes `Chess/CYCLES` column; data row shows `MATCH(...)` or `DRIFT(...)`; summary block lists per-compiler counts; no offenders if it's a match.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh
@@ -1556,7 +1559,7 @@ EOF
 
 **Purpose:** A small standalone script that reads the latest results directory and prints cycle-diff results sorted by |log(EMU/HW)| (i.e., "how far off is this one?"), for manual inspection.
 
-- [ ] **Step 1: Write the script**
+- [x] **Step 1: Write the script**
 
 ```bash
 cat > /home/triple/npu-work/xdna-emu/scripts/show-cycle-drift.sh <<'SCRIPT'
@@ -1650,7 +1653,7 @@ SCRIPT
 chmod +x /home/triple/npu-work/xdna-emu/scripts/show-cycle-drift.sh
 ```
 
-- [ ] **Step 2: Smoke test**
+- [x] **Step 2: Smoke test**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1659,7 +1662,7 @@ cd /home/triple/npu-work/xdna-emu
 ```
 Expected: first command prints a table with at most 5 rows, sorted with the worst (|log|) first; `--help` prints the usage header.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add scripts/show-cycle-drift.sh
@@ -1684,7 +1687,7 @@ EOF
 
 **Purpose:** Run the full Phase E pipeline against the 7-test batch Phase B validated. Record the results as a validation doc (mirrors Phase B's validation record). Update the parent cycle-budget plan to note Phase C and Phase D.3 are superseded.
 
-- [ ] **Step 1: Run the batch**
+- [x] **Step 1: Run the batch**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1703,7 +1706,7 @@ done
 ./scripts/show-cycle-drift.sh
 ```
 
-- [ ] **Step 2: Write the validation doc**
+- [x] **Step 2: Write the validation doc**
 
 Create `docs/superpowers/plans/2026-04-23-phase-e-validation.md` following the shape of `docs/superpowers/plans/2026-04-22-phase-b-trace-cycle-capture-validation.md`:
 
@@ -1757,7 +1760,7 @@ or
 <REGRESSION: <describe>; follow-up tasks opened.>
 ```
 
-- [ ] **Step 3: Update the parent cycle-budget plan**
+- [x] **Step 3: Update the parent cycle-budget plan**
 
 Open `docs/superpowers/plans/2026-04-22-cycle-budget-testing.md`. Near the bottom (after any existing Phase B pivot note), append a one-line pointer:
 
@@ -1775,7 +1778,7 @@ for the replacement design and
 for empirical results.
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu

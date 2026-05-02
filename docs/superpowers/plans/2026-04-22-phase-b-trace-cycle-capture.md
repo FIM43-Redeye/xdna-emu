@@ -10,6 +10,9 @@
 
 ---
 
+> **Sweep-as-of 2026-05-01:** All 15 tasks landed per the in-document update note in the parent plan (`2026-04-22-cycle-budget-testing.md`) and the validation results captured in `2026-04-22-phase-b-trace-cycle-capture-validation.md`. Pipeline produces valid `cycles.HW.<test>.<compiler>.txt` files for vector-bearing tests; `vector_scalar_using_dma`=41181 cycles is the reference success. Steps below were executed organically rather than ticked one-by-one; this sweep flips the checkboxes to match the verified completion state.
+
+
 ## Scope Check
 
 This plan covers a single subsystem: automated HW cycle capture via mlir-aie trace infrastructure. It depends only on Phase A (already shipped) and a compiled xclbin — it does not touch emulator internals. Phase C (budget calculation + override file loader) is a separate plan that consumes the `cycles.HW.*.txt` files this plan produces.
@@ -69,13 +72,13 @@ This plan covers a single subsystem: automated HW cycle capture via mlir-aie tra
 - Move: `tools/trace-inject.py`, `tools/trace-sweep.py`, `tools/trace-trim.py`, `tools/trace-merge.py`, `tools/trace-patch-events.py` → `tools/deprecated/`
 - Create: `tools/deprecated/README.md`
 
-- [ ] **Step 1: Create deprecated directory**
+- [x] **Step 1: Create deprecated directory**
 
 ```bash
 mkdir -p /home/triple/npu-work/xdna-emu/tools/deprecated
 ```
 
-- [ ] **Step 2: Move the five trace tools**
+- [x] **Step 2: Move the five trace tools**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -86,7 +89,7 @@ git mv tools/trace-merge.py tools/deprecated/
 git mv tools/trace-patch-events.py tools/deprecated/
 ```
 
-- [ ] **Step 3: Create README explaining the move**
+- [x] **Step 3: Create README explaining the move**
 
 Create `tools/deprecated/README.md` with this content:
 
@@ -127,13 +130,13 @@ mainline pipeline lacks a capability you need, extend it — don't reach back
 for these.
 ```
 
-- [ ] **Step 4: Grep for any remaining references to the moved tools**
+- [x] **Step 4: Grep for any remaining references to the moved tools**
 
 Run: `grep -rn "tools/trace-inject\|tools/trace-sweep\|tools/trace-trim\|tools/trace-merge\|tools/trace-patch-events" /home/triple/npu-work/xdna-emu --include='*.sh' --include='*.py' --include='*.md' --include='*.rs'`
 
 Expected: only matches inside `tools/deprecated/` (the tools referencing themselves) and maybe CLAUDE.md. Fix CLAUDE.md references if any — point them at `tools/deprecated/`.
 
-- [ ] **Step 5: Verify nothing in the repo is broken by the move**
+- [x] **Step 5: Verify nothing in the repo is broken by the move**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -142,7 +145,7 @@ cd /home/triple/npu-work/xdna-emu
 
 Expected: test passes with no "trace-inject.py: not found" errors. (This filter picks a single quick test; the goal is "nothing explodes," not a full run.)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add tools/deprecated/ tools/ docs/ CLAUDE.md
@@ -165,7 +168,7 @@ case any of them have capabilities the new pipeline misses.
 - Create: `tools/tests/test_mlir_trace_inject.py`
 - Create: `tools/tests/fixtures/sample_untraced.mlir`
 
-- [ ] **Step 1: Verify the mlir-aie Python API is available**
+- [x] **Step 1: Verify the mlir-aie Python API is available**
 
 Run this probe to confirm the bindings exist:
 
@@ -189,7 +192,7 @@ If the list is empty or only shows unrelated symbols (e.g., just `trace_utils`),
 
 Record what you find in the injector source as a comment at the top, so future readers know which specific symbols we depend on.
 
-- [ ] **Step 2: Create the sample fixture**
+- [x] **Step 2: Create the sample fixture**
 
 Create `tools/tests/fixtures/sample_untraced.mlir`:
 
@@ -212,7 +215,7 @@ module {
 
 If this MLIR doesn't parse cleanly under the mlir-aie version in `install/`, adjust the syntax minimally — the goal is a valid untraced design, not a specific shape. Document any syntax adjustments needed as a comment in the fixture file.
 
-- [ ] **Step 3: Write the failing injector test (round-trip identity with --no-op mode)**
+- [x] **Step 3: Write the failing injector test (round-trip identity with --no-op mode)**
 
 Create `tools/tests/test_mlir_trace_inject.py`:
 
@@ -254,13 +257,13 @@ def test_injector_no_op_mode_round_trips(tmp_path):
     assert result.count("aie.device") == original.count("aie.device")
 ```
 
-- [ ] **Step 4: Run the test to verify it fails**
+- [x] **Step 4: Run the test to verify it fails**
 
 Run: `cd /home/triple/npu-work/xdna-emu && PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python pytest tools/tests/test_mlir_trace_inject.py -v`
 
 Expected: FAIL with "No such file or directory: .../mlir-trace-inject.py" or similar.
 
-- [ ] **Step 5: Write the minimal injector skeleton**
+- [x] **Step 5: Write the minimal injector skeleton**
 
 Create `tools/mlir-trace-inject.py`:
 
@@ -324,7 +327,7 @@ if __name__ == "__main__":
     sys.exit(main() or 0)
 ```
 
-- [ ] **Step 6: Make the script executable and rerun the test**
+- [x] **Step 6: Make the script executable and rerun the test**
 
 ```bash
 chmod +x /home/triple/npu-work/xdna-emu/tools/mlir-trace-inject.py
@@ -334,7 +337,7 @@ PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python pytest tools/tests/test
 
 Expected: both tests PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add tools/mlir-trace-inject.py tools/tests/test_mlir_trace_inject.py tools/tests/fixtures/sample_untraced.mlir
@@ -357,7 +360,7 @@ No trace injection yet -- that lands in Tasks 3-5."
 - Modify: `tools/tests/test_mlir_trace_inject.py`
 - Create: `tools/tests/fixtures/sample_already_traced.mlir`
 
-- [ ] **Step 1: Create the already-traced fixture**
+- [x] **Step 1: Create the already-traced fixture**
 
 Create `tools/tests/fixtures/sample_already_traced.mlir` — copy of `sample_untraced.mlir` with a single `aie.trace` op added inside the device body. Use whatever exact trace op spelling the mlir-aie bindings exposed in Task 2 Step 1. A reasonable template:
 
@@ -384,7 +387,7 @@ module {
 
 If this syntax doesn't parse under the installed mlir-aie, simplify until it does. What matters is that the fixture contains at least one `aie.trace` op.
 
-- [ ] **Step 2: Add the failing test**
+- [x] **Step 2: Add the failing test**
 
 Append to `tools/tests/test_mlir_trace_inject.py`:
 
@@ -404,13 +407,13 @@ def test_injector_bails_on_already_traced(tmp_path):
     assert not out.exists(), "output file should not be written when injector refuses"
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [x] **Step 3: Run the test to verify it fails**
 
 Run: `cd /home/triple/npu-work/xdna-emu && PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python pytest tools/tests/test_mlir_trace_inject.py::test_injector_bails_on_already_traced -v`
 
 Expected: FAIL (currently injector raises `NotImplementedError`, not exit 2).
 
-- [ ] **Step 4: Implement the idempotency check**
+- [x] **Step 4: Implement the idempotency check**
 
 In `tools/mlir-trace-inject.py`, replace the `if not args.no_op:` body with:
 
@@ -448,13 +451,13 @@ Note: MLIR Python binding op-traversal syntax varies. The exact
 based on what Task 2 Step 1 revealed. If your traversal API differs,
 adapt the `_walk` function to match.
 
-- [ ] **Step 5: Run the test to verify it passes**
+- [x] **Step 5: Run the test to verify it passes**
 
 Run: `cd /home/triple/npu-work/xdna-emu && PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python pytest tools/tests/test_mlir_trace_inject.py -v`
 
 Expected: all tests PASS (including the previous round-trip tests).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add tools/mlir-trace-inject.py tools/tests/test_mlir_trace_inject.py tools/tests/fixtures/sample_already_traced.mlir
@@ -474,7 +477,7 @@ double-injection when a test has been manually instrumented.
 - Modify: `tools/mlir-trace-inject.py`
 - Modify: `tools/tests/test_mlir_trace_inject.py`
 
-- [ ] **Step 1: Add the failing test**
+- [x] **Step 1: Add the failing test**
 
 Append to `tools/tests/test_mlir_trace_inject.py`:
 
@@ -493,13 +496,13 @@ def test_injector_adds_trace_decl_per_compute_tile(tmp_path):
     assert "%t02" in result or "tile(0, 2)" in result.replace(" ", "")
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cd /home/triple/npu-work/xdna-emu && PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python pytest tools/tests/test_mlir_trace_inject.py::test_injector_adds_trace_decl_per_compute_tile -v`
 
 Expected: FAIL with `NotImplementedError` or similar.
 
-- [ ] **Step 3: Implement tile discovery and trace op construction**
+- [x] **Step 3: Implement tile discovery and trace op construction**
 
 This is the heart of the injector. You have two construction paths, and which one works depends on what Task 2 Step 1 revealed about the mlir-aie Python bindings:
 
@@ -581,13 +584,13 @@ aie.trace @trace_t{col}_{row}(%arg0) {{
 
 Document in the commit message which path (A or B) you took and why.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cd /home/triple/npu-work/xdna-emu && PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python pytest tools/tests/test_mlir_trace_inject.py -v`
 
 Expected: all tests PASS.
 
-- [ ] **Step 5: Visually inspect a traced output**
+- [x] **Step 5: Visually inspect a traced output**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -601,7 +604,7 @@ diff tools/tests/fixtures/sample_untraced.mlir /tmp/claude-1000/trace-test/sampl
 
 Expected: diff shows added `aie.trace` op(s). Skim the output for obvious wrongness (e.g., trace ops outside the device body).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add tools/mlir-trace-inject.py tools/tests/test_mlir_trace_inject.py
@@ -623,7 +626,7 @@ Runtime-sequence host_config + start_config lands in Task 5.
 - Modify: `tools/mlir-trace-inject.py`
 - Modify: `tools/tests/test_mlir_trace_inject.py`
 
-- [ ] **Step 1: Add the failing test**
+- [x] **Step 1: Add the failing test**
 
 Append to `tools/tests/test_mlir_trace_inject.py`:
 
@@ -645,13 +648,13 @@ def test_injector_adds_runtime_sequence_trace_config(tmp_path):
     assert "16384" in result, "custom buffer size did not reach the output"
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cd /home/triple/npu-work/xdna-emu && PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python pytest tools/tests/test_mlir_trace_inject.py::test_injector_adds_runtime_sequence_trace_config -v`
 
 Expected: FAIL — no `aie.trace.host_config` in the output yet.
 
-- [ ] **Step 3: Implement runtime-sequence injection**
+- [x] **Step 3: Implement runtime-sequence injection**
 
 Extend the injector logic inside `main()` (after compute-tile trace-op insertion, still inside `if not args.no_op:`):
 
@@ -691,13 +694,13 @@ with ir.InsertionPoint.at_block_begin(rt_body):
 
 If the Python constructors for `TraceHostConfigOp` / `TraceStartConfigOp` don't exist, fall back to Path B (construct MLIR text and splice). Document which path you took.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cd /home/triple/npu-work/xdna-emu && PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python pytest tools/tests/test_mlir_trace_inject.py -v`
 
 Expected: all tests PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tools/mlir-trace-inject.py tools/tests/test_mlir_trace_inject.py
@@ -722,7 +725,7 @@ writes during aiecc.py compilation.
 
 This task has no new product code — just proves the injector output survives a real compile.
 
-- [ ] **Step 1: Pick a real bridge test MLIR to use as a compile target**
+- [x] **Step 1: Pick a real bridge test MLIR to use as a compile target**
 
 Find a small, known-good test. Good candidates include `add_one`, `add_256`, or similar. The test's MLIR typically lives at `mlir-aie/test/npu-xrt/<name>/aie.mlir` (or is generated from a .py).
 
@@ -732,7 +735,7 @@ find /home/triple/npu-work/mlir-aie/test/npu-xrt -maxdepth 3 -name "aie*.mlir" |
 
 Pick one. Record the path in the integration test.
 
-- [ ] **Step 2: Add the integration test**
+- [x] **Step 2: Add the integration test**
 
 Append to `tools/tests/test_mlir_trace_inject.py`:
 
@@ -785,7 +788,7 @@ def test_injector_output_compiles_with_aiecc(tmp_path):
     assert (build_dir / "aie-traced.xclbin").exists()
 ```
 
-- [ ] **Step 3: Run the test**
+- [x] **Step 3: Run the test**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -801,7 +804,7 @@ Common failure modes and how to read them:
 - `operation must be in aie.device region` — trace ops went to the module body instead of device body
 - `unknown op 'aie.trace'` — bindings version mismatch; check that mlir-aie install is the one with PR #2988
 
-- [ ] **Step 4: Verify the compiled xclbin has a `trace` kernarg**
+- [x] **Step 4: Verify the compiled xclbin has a `trace` kernarg**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -810,7 +813,7 @@ xclbinutil --info --input /tmp/pytest-of-*/pytest-current/test_injector_output_c
 
 Expected: output mentions `trace` in a kernarg entry. If it doesn't, the trace injection didn't survive lowering — investigate `AIEInsertTraceFlows` pass in mlir-aie.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tools/tests/test_mlir_trace_inject.py
@@ -831,7 +834,7 @@ a 'trace' kernarg. Skips if aiecc.py is not on PATH.
 - Create: `bridge-runner/bridge-trace-runner.cpp`
 - Create: `bridge-runner/README.md`
 
-- [ ] **Step 1: Create the CMakeLists**
+- [x] **Step 1: Create the CMakeLists**
 
 Create `bridge-runner/CMakeLists.txt`:
 
@@ -854,7 +857,7 @@ target_compile_options(bridge-trace-runner PRIVATE -Wall -Wextra)
 install(TARGETS bridge-trace-runner RUNTIME DESTINATION bin)
 ```
 
-- [ ] **Step 2: Create the runner skeleton**
+- [x] **Step 2: Create the runner skeleton**
 
 Create `bridge-runner/bridge-trace-runner.cpp`:
 
@@ -948,7 +951,7 @@ int main(int argc, char** argv) {
 }
 ```
 
-- [ ] **Step 3: Create the README**
+- [x] **Step 3: Create the README**
 
 Create `bridge-runner/README.md`:
 
@@ -994,7 +997,7 @@ kernel metadata:
 Exit 0 on success.
 ```
 
-- [ ] **Step 4: Build the skeleton**
+- [x] **Step 4: Build the skeleton**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1004,7 +1007,7 @@ cmake --build bridge-runner/build
 
 Expected: builds cleanly, produces `bridge-runner/build/bridge-trace-runner`.
 
-- [ ] **Step 5: Smoke-test the CLI**
+- [x] **Step 5: Smoke-test the CLI**
 
 ```bash
 /home/triple/npu-work/xdna-emu/bridge-runner/build/bridge-trace-runner --help
@@ -1014,7 +1017,7 @@ Expected: builds cleanly, produces `bridge-runner/build/bridge-trace-runner`.
 Expected: `--help` prints usage (returns 0); the second invocation prints the
 `xclbin=...` line and exits 0. No XRT calls yet.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add bridge-runner/
@@ -1033,7 +1036,7 @@ kernarg-name dispatch convention we'll implement in Tasks 8-10.
 **Files:**
 - Modify: `bridge-runner/bridge-trace-runner.cpp`
 
-- [ ] **Step 1: Add metadata enumeration to the runner**
+- [x] **Step 1: Add metadata enumeration to the runner**
 
 In `bridge-runner/bridge-trace-runner.cpp`, add after the `CliArgs`
 struct / before `main()`:
@@ -1109,7 +1112,7 @@ And in `main()`, replace the single-line debug print with:
     return 0;
 ```
 
-- [ ] **Step 2: Build**
+- [x] **Step 2: Build**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1118,7 +1121,7 @@ cmake --build bridge-runner/build
 
 Expected: builds cleanly.
 
-- [ ] **Step 3: Smoke-test against a real xclbin**
+- [x] **Step 3: Smoke-test against a real xclbin**
 
 Find a recently-built traced xclbin (from Task 6's integration test output or from a fresh run of the bridge test). If none exists, run:
 
@@ -1149,7 +1152,7 @@ Expected output shows a list of kernargs with names matching the mlir-aie
 convention (opcode, instr, instr_size, in*, out*, trace, and possibly
 ctrlpkts). Exits 0.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add bridge-runner/bridge-trace-runner.cpp
@@ -1167,7 +1170,7 @@ Allocation + execution lands in next tasks.
 **Files:**
 - Modify: `bridge-runner/bridge-trace-runner.cpp`
 
-- [ ] **Step 1: Add buffer allocation + binding logic**
+- [x] **Step 1: Add buffer allocation + binding logic**
 
 Expand `main()` to allocate BOs based on arg name. Insert between the
 `kargs` enumeration and the `return 0;` line:
@@ -1255,7 +1258,7 @@ Expand `main()` to allocate BOs based on arg name. Insert between the
 
 Note: `std::variant<uint32_t, xrt::bo*>` with `std::monostate` requires `#include <variant>`. Add it with the other includes.
 
-- [ ] **Step 2: Build**
+- [x] **Step 2: Build**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1264,7 +1267,7 @@ cmake --build bridge-runner/build
 
 Expected: builds cleanly.
 
-- [ ] **Step 3: Run smoke test (allocation only, no kernel run yet)**
+- [x] **Step 3: Run smoke test (allocation only, no kernel run yet)**
 
 Using the traced xclbin from Task 8 Step 3:
 
@@ -1278,7 +1281,7 @@ Using the traced xclbin from Task 8 Step 3:
 
 Expected: prints arg list, "loaded N instruction words", exits 0. No crashes.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add bridge-runner/bridge-trace-runner.cpp
@@ -1299,7 +1302,7 @@ names throw.
 **Files:**
 - Modify: `bridge-runner/bridge-trace-runner.cpp`
 
-- [ ] **Step 1: Add kernel launch + trace sync-back**
+- [x] **Step 1: Add kernel launch + trace sync-back**
 
 After the kernarg-binding loop in `main()`, before `return 0;`:
 
@@ -1364,7 +1367,7 @@ After the kernarg-binding loop in `main()`, before `return 0;`:
 
 Add `#include <chrono>` and `#include "xrt/xrt_bo.h"` if not already present.
 
-- [ ] **Step 2: Build**
+- [x] **Step 2: Build**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1373,7 +1376,7 @@ cmake --build bridge-runner/build
 
 Expected: builds cleanly.
 
-- [ ] **Step 3: Run on real hardware**
+- [x] **Step 3: Run on real hardware**
 
 Using the traced xclbin from earlier, run against the actual NPU:
 
@@ -1398,7 +1401,7 @@ timestamps). If it's all zeros, trace wasn't activated — debug via
 `RUST_LOG=info` XRT dmesg output and check that `AIEInsertTraceFlows`
 actually emitted the register writes.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add bridge-runner/bridge-trace-runner.cpp
@@ -1419,7 +1422,7 @@ it to --trace-out. Outputs optionally written to --output paths.
 - Create: `tools/tests/test_trace_to_cycles.py`
 - Create: `tools/tests/fixtures/sample_traced_trace.json` (canned Perfetto JSON)
 
-- [ ] **Step 1: Create the canned Perfetto fixture**
+- [x] **Step 1: Create the canned Perfetto fixture**
 
 Create `tools/tests/fixtures/sample_traced_trace.json`:
 
@@ -1437,7 +1440,7 @@ Create `tools/tests/fixtures/sample_traced_trace.json`:
 
 Expected cycle count from this fixture: `510 - 100 = 410`.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Create `tools/tests/test_trace_to_cycles.py`:
 
@@ -1473,13 +1476,13 @@ def test_extractor_reads_json_and_emits_cycles(tmp_path):
     assert content == "410", f"expected '410', got {content!r}"
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [x] **Step 3: Run the test to verify it fails**
 
 Run: `cd /home/triple/npu-work/xdna-emu && pytest tools/tests/test_trace_to_cycles.py -v`
 
 Expected: FAIL — extractor script doesn't exist.
 
-- [ ] **Step 4: Write the extractor**
+- [x] **Step 4: Write the extractor**
 
 Create `tools/trace-to-cycles.py`:
 
@@ -1558,7 +1561,7 @@ if __name__ == "__main__":
     sys.exit(main() or 0)
 ```
 
-- [ ] **Step 5: Make executable and run the test**
+- [x] **Step 5: Make executable and run the test**
 
 ```bash
 chmod +x /home/triple/npu-work/xdna-emu/tools/trace-to-cycles.py
@@ -1568,7 +1571,7 @@ pytest tools/tests/test_trace_to_cycles.py -v
 
 Expected: both tests PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add tools/trace-to-cycles.py tools/tests/test_trace_to_cycles.py tools/tests/fixtures/sample_traced_trace.json
@@ -1588,7 +1591,7 @@ max_ts - min_ts across all timestamped events.
 **Files:**
 - Modify: `scripts/emu-bridge-test.sh`
 
-- [ ] **Step 1: Add the flag handler**
+- [x] **Step 1: Add the flag handler**
 
 Open `scripts/emu-bridge-test.sh`. Find the argument parsing section
 (look for the existing `--no-hw` or `--no-timeout` flag handling). Add
@@ -1618,7 +1621,7 @@ In the usage/help block, add:
                        the HW result.
 ```
 
-- [ ] **Step 2: Add the pipeline helper (stub)**
+- [x] **Step 2: Add the pipeline helper (stub)**
 
 Near the other `_` helper functions, add:
 
@@ -1637,7 +1640,7 @@ _run_hw_cycles_pipeline() {
 }
 ```
 
-- [ ] **Step 3: Verify the flag parses**
+- [x] **Step 3: Verify the flag parses**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1649,7 +1652,7 @@ Expected: `--help` lists the new flag; running with `--with-hw-cycles` and
 `--no-hw` (note: the `--no-hw` path doesn't run cycles pipeline yet, so this
 is just a flag-parse smoke test) exits cleanly.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh
@@ -1668,7 +1671,7 @@ full pipeline in Task 13.
 **Files:**
 - Modify: `scripts/emu-bridge-test.sh`
 
-- [ ] **Step 1: Replace the pipeline stub with the real thing**
+- [x] **Step 1: Replace the pipeline stub with the real thing**
 
 In `scripts/emu-bridge-test.sh`, replace the body of `_run_hw_cycles_pipeline`:
 
@@ -1733,7 +1736,7 @@ _run_hw_cycles_pipeline() {
 }
 ```
 
-- [ ] **Step 2: Add the pre-compile injector step**
+- [x] **Step 2: Add the pre-compile injector step**
 
 Find the compile phase (where `aiecc.py` is invoked per test). Before
 each `aiecc.py` invocation, when `WITH_HW_CYCLES=true` and we're
@@ -1769,7 +1772,7 @@ Place this where `aiecc.py`'s input MLIR is chosen. Usually the script
 has a local like `local src_mlir="..."`; you want to reassign `src_mlir`
 to `traced_mlir` on successful injection.
 
-- [ ] **Step 3: Call `_run_hw_cycles_pipeline` after each HW test**
+- [x] **Step 3: Call `_run_hw_cycles_pipeline` after each HW test**
 
 Find where the HW test is launched (likely near a `timeout` or `run.wait`
 equivalent in the run phase). Immediately after the HW result is determined
@@ -1785,7 +1788,7 @@ fi
 The `|| true` ensures a cycles-pipeline failure doesn't mark the test
 as failed — we treat cycle capture as best-effort.
 
-- [ ] **Step 4: Dry-run against a single test**
+- [x] **Step 4: Dry-run against a single test**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1797,7 +1800,7 @@ Expected: test runs HW (on the real NPU), then prints a
 `cycles.HW.peano.txt` file exists in the test's output directory with
 a single integer inside.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh
@@ -1821,7 +1824,7 @@ don't mark the test as failed.
 **Files:**
 - Create: `docs/superpowers/plans/2026-04-22-phase-b-trace-cycle-capture-validation.md`
 
-- [ ] **Step 1: Pick 10 representative bridge tests**
+- [x] **Step 1: Pick 10 representative bridge tests**
 
 Skim `mlir-aie/test/npu-xrt/` and pick 10 tests spanning:
 - Simple tests (add_one, add_256)
@@ -1831,7 +1834,7 @@ Skim `mlir-aie/test/npu-xrt/` and pick 10 tests spanning:
 
 Record the list in the validation doc.
 
-- [ ] **Step 2: Run the pipeline across the selected tests**
+- [x] **Step 2: Run the pipeline across the selected tests**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1846,7 +1849,7 @@ FILTER_RE="$(echo "$TESTS" | tr ' ' '|')"
 Expected: each test completes HW with a `cycles.HW.peano.txt` file
 beside the normal result file.
 
-- [ ] **Step 3: Collect cycle counts and sanity-check**
+- [x] **Step 3: Collect cycle counts and sanity-check**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1861,7 +1864,7 @@ Sanity checks to apply (these become the validation doc's verdict):
 If any test is missing a cycles file, investigate the `inject.log` and
 `runner.*.log` for that test before moving on.
 
-- [ ] **Step 4: Write the validation doc**
+- [x] **Step 4: Write the validation doc**
 
 Create `docs/superpowers/plans/2026-04-22-phase-b-trace-cycle-capture-validation.md`
 with a results table:
@@ -1883,7 +1886,7 @@ OK / needs fixes before Phase C can proceed.
 
 Fill it in from the actual results.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/superpowers/plans/2026-04-22-phase-b-trace-cycle-capture-validation.md
@@ -1903,7 +1906,7 @@ for the full results table and any follow-ups.
 - Modify: `NEXT-STEPS.md`
 - Modify: `docs/superpowers/plans/2026-04-22-cycle-budget-testing.md`
 
-- [ ] **Step 1: Update NEXT-STEPS.md**
+- [x] **Step 1: Update NEXT-STEPS.md**
 
 Update the Phase B section to reflect completion:
 
@@ -1911,13 +1914,13 @@ Update the Phase B section to reflect completion:
 - Add a pointer to the validation doc.
 - Note which tests have cycles files available, so Phase C knows where to read from.
 
-- [ ] **Step 2: Update the original cycle-budget plan**
+- [x] **Step 2: Update the original cycle-budget plan**
 
 In `docs/superpowers/plans/2026-04-22-cycle-budget-testing.md`, update the
 Phase B section to reference the new plan and its outcome. The original
 Phase B pivot note should now also link to the validation doc.
 
-- [ ] **Step 3: Surface Phase C readiness**
+- [x] **Step 3: Surface Phase C readiness**
 
 Phase C tasks (#82-#85 in the task tracker) become unblocked. They can
 now assume that `cycles.HW.<test>.<variant>.txt` files exist under
@@ -1928,7 +1931,7 @@ Decide: do Phase D.3 (HW spot-check, task #81) and Phase C tasks get
 bundled into one more plan, or executed individually from the existing
 cycle-budget plan? Note the decision in `NEXT-STEPS.md`.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add NEXT-STEPS.md docs/superpowers/plans/2026-04-22-cycle-budget-testing.md

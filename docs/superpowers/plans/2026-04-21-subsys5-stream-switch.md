@@ -16,6 +16,9 @@
 
 ---
 
+> **Sweep-as-of 2026-05-01:** Subsystem 5 completed -- tag `phase1-subsys-stream-switch`. Stream switch port topology + routing tables consolidated. Steps below were executed organically rather than ticked one-by-one; this sweep flips the checkboxes to match the verified completion state.
+
+
 ## Scope Note
 
 Single-part subsystem with one tag (`phase1-subsys-stream-switch`) at the end. Scope is intentionally small because `PortLayout` has zero external consumers (verified during spec self-review) -- migration concentrates on the one real consumer path (tile construction in `stream_switch/mod.rs`), with other direct archspec-constant consumers staying on direct access as AIE1-landing follow-ups.
@@ -134,7 +137,7 @@ Known pre-existing failure (carries through, documented in `NEXT-STEPS.md`):
 
 **Goal:** Capture the current-state audit and stub the design note so later tasks can fill them in as evidence accumulates. Mirrors `docs/arch/subsys4-audit.md` and `docs/arch/lock-model.md` from Subsystem 4.
 
-- [ ] **Step 1: Create `docs/arch/subsys5-audit.md` scaffold**
+- [x] **Step 1: Create `docs/arch/subsys5-audit.md` scaffold**
 
 ```markdown
 # Subsystem 5 -- Stream Switch Audit
@@ -205,7 +208,7 @@ Rows 2 (invariant), 3 (topology data per arch), 4 (TileKind-level), 5
 (Filled in at end of Subsystem 5.)
 ```
 
-- [ ] **Step 2: Create `docs/arch/stream-switch-model.md` scaffold**
+- [x] **Step 2: Create `docs/arch/stream-switch-model.md` scaffold**
 
 ```markdown
 # Stream Switch Model -- Design Note
@@ -311,7 +314,7 @@ runtime arch-dispatch). Including a flag whose only valid value is
 (Filled in at end of Subsystem 5.)
 ```
 
-- [ ] **Step 3: Commit scaffolds**
+- [x] **Step 3: Commit scaffolds**
 
 ```bash
 git add docs/arch/subsys5-audit.md docs/arch/stream-switch-model.md
@@ -345,7 +348,7 @@ Expected: clean commit, `cargo test --lib` and `cargo test -p xdna-archspec --li
 
 **Goal:** Establish the trait, carrier, AIE2 impl, and singleton statics. This is the heart of the seam; Task 3 wires it to `ArchConfig`, Task 4 routes call sites through it.
 
-- [ ] **Step 1: Create `crates/xdna-archspec/src/stream_switch/mod.rs`**
+- [x] **Step 1: Create `crates/xdna-archspec/src/stream_switch/mod.rs`**
 
 ```rust
 //! Stream switch model trait and data carrier.
@@ -513,7 +516,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Create `crates/xdna-archspec/src/aie2/stream_switch_model.rs`**
+- [x] **Step 2: Create `crates/xdna-archspec/src/aie2/stream_switch_model.rs`**
 
 ```rust
 //! AIE2 stream switch model implementation.
@@ -738,7 +741,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Export the new modules in `lib.rs`**
+- [x] **Step 3: Export the new modules in `lib.rs`**
 
 Open `crates/xdna-archspec/src/lib.rs` and add the new top-level module export. Find the line that currently reads `pub mod locks;` and add `pub mod stream_switch;` immediately after (maintaining alphabetical grouping of seam modules):
 
@@ -749,7 +752,7 @@ pub mod stream_switch;
 // ...
 ```
 
-- [ ] **Step 4: Export the AIE2 impl module in `aie2/mod.rs`**
+- [x] **Step 4: Export the AIE2 impl module in `aie2/mod.rs`**
 
 Open `crates/xdna-archspec/src/aie2/mod.rs` and add `pub mod stream_switch_model;` alongside the existing `pub mod locks;` / `pub mod dma;` declarations (the ones introduced by Subsystems 3 and 4, around lines 99-106):
 
@@ -765,7 +768,7 @@ pub mod locks;
 pub mod stream_switch_model;
 ```
 
-- [ ] **Step 5: Run archspec tests to verify the trait compiles and statics initialize**
+- [x] **Step 5: Run archspec tests to verify the trait compiles and statics initialize**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec --lib 2>&1 | tail -5
@@ -778,7 +781,7 @@ the drift-detection test -- it is the main safety net for this
 subsystem. If it fires, the hand-written aggregate and the generated
 constants have genuinely drifted; fix the aggregate to match.
 
-- [ ] **Step 6: Run xdna-emu tests (no regression expected; archspec changes only)**
+- [x] **Step 6: Run xdna-emu tests (no regression expected; archspec changes only)**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -786,7 +789,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail
 
 Expected: `test result: ok. 2687 passed; 0 failed; 5 ignored`.
 
-- [ ] **Step 7: Commit Task 2**
+- [x] **Step 7: Commit Task 2**
 
 ```bash
 git add crates/xdna-archspec/src/stream_switch/mod.rs \
@@ -832,7 +835,7 @@ EOF
 
 **Goal:** Wire the new trait through `ArchConfig`, mirroring the existing `dma_model()` and `lock_model()` accessors. After this task, any code path holding `&dyn ArchConfig` or `Arc<dyn ArchConfig>` can call `.stream_switch_model()` to get the architecture's model.
 
-- [ ] **Step 1: Add the trait method declaration**
+- [x] **Step 1: Add the trait method declaration**
 
 Open `crates/xdna-archspec/src/runtime.rs`. Locate the existing trait method declarations (search for `fn lock_model(&self)` -- that is the neighbor to mimic). Add the new method declaration immediately after:
 
@@ -849,7 +852,7 @@ Open `crates/xdna-archspec/src/runtime.rs`. Locate the existing trait method dec
     fn stream_switch_model(&self) -> &'static dyn crate::stream_switch::StreamSwitchModel;
 ```
 
-- [ ] **Step 2: Add the `ModelConfig` impl**
+- [x] **Step 2: Add the `ModelConfig` impl**
 
 Find the matching `impl ArchConfig for ModelConfig` block -- specifically the `fn lock_model` implementation -- and add the new method immediately after:
 
@@ -867,7 +870,7 @@ Find the matching `impl ArchConfig for ModelConfig` block -- specifically the `f
     }
 ```
 
-- [ ] **Step 3: Add a trait-dispatch test**
+- [x] **Step 3: Add a trait-dispatch test**
 
 Still in `runtime.rs`, scroll to the existing `#[cfg(test)] mod tests` block and add a test that verifies `stream_switch_model()` returns the AIE2 singleton for each AIE2-family device:
 
@@ -892,7 +895,7 @@ Still in `runtime.rs`, scroll to the existing `#[cfg(test)] mod tests` block and
 the `if let Some(model)` pattern keeps the test resilient to which set
 of devices is configured in the model JSON.)
 
-- [ ] **Step 4: Run archspec tests**
+- [x] **Step 4: Run archspec tests**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec --lib 2>&1 | tail -5
@@ -900,7 +903,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec 
 
 Expected: archspec test count grows by 1 (the new dispatch test). Total should be 294 passed. No failures.
 
-- [ ] **Step 5: Run xdna-emu tests (regression check for `ArchConfig` supertrait change)**
+- [x] **Step 5: Run xdna-emu tests (regression check for `ArchConfig` supertrait change)**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -910,7 +913,7 @@ Expected: `2687 passed; 0 failed; 5 ignored` (no regression). Adding a
 new trait method does not break existing implementations because the
 trait object supports the new method via the impl added in Step 2.
 
-- [ ] **Step 6: Commit Task 3**
+- [x] **Step 6: Commit Task 3**
 
 ```bash
 git add crates/xdna-archspec/src/runtime.rs
@@ -941,7 +944,7 @@ EOF
 
 **Goal:** Add the process-global `OnceLock` accessor on the xdna-emu side, then route the three `StreamSwitch::new_*` constructors through it instead of reading the archspec constants directly. Mirrors the `arch_handle::lock_value_layout()` pattern from Subsystem 4.
 
-- [ ] **Step 1: Add `stream_switch_topology()` accessor in `arch_handle.rs`**
+- [x] **Step 1: Add `stream_switch_topology()` accessor in `arch_handle.rs`**
 
 Open `src/device/arch_handle.rs`. Locate the existing `lock_value_layout()` function (added in Subsystem 4). Add the new accessor immediately after it, mirroring the same `OnceLock<&'static ...>` pattern:
 
@@ -969,7 +972,7 @@ pub fn stream_switch_topology() -> &'static xdna_archspec::stream_switch::Stream
 Subsystem 4; if the exact name differs, match whatever the existing
 `lock_value_layout()` uses -- they share the same seed helper.)
 
-- [ ] **Step 2: Migrate the 6 call sites in `stream_switch/mod.rs`**
+- [x] **Step 2: Migrate the 6 call sites in `stream_switch/mod.rs`**
 
 Open `src/device/stream_switch/mod.rs`. At lines 131-133, 163-165, and 193-195 (three pairs of `build_ports_from_spec` calls, one per `new_*_tile` constructor), rewrite each call to read through the new accessor.
 
@@ -1027,7 +1030,7 @@ After:
         let slaves = Self::build_ports_from_spec(ports.slave_ports, PortDirection::Slave);
 ```
 
-- [ ] **Step 3: Run xdna-emu tests**
+- [x] **Step 3: Run xdna-emu tests**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -1041,7 +1044,7 @@ If any test fails, inspect the diff at the three migration points and
 verify the `TileKind` variant selected matches the original constant
 (e.g., `new_compute_tile` -> `TileKind::Compute`).
 
-- [ ] **Step 4: Run archspec tests**
+- [x] **Step 4: Run archspec tests**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec --lib 2>&1 | tail -3
@@ -1049,7 +1052,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec 
 
 Expected: no change from Task 3 (no archspec code touched this task).
 
-- [ ] **Step 5: Fast bridge smoke**
+- [x] **Step 5: Fast bridge smoke**
 
 ```bash
 cargo build -p xdna-emu-ffi 2>&1 | tail -5
@@ -1060,7 +1063,7 @@ Expected: both Chess and Peano PASS. If the bridge test fails here, it
 indicates the tile-construction path is producing different port
 layouts than before -- pause and inspect.
 
-- [ ] **Step 6: Commit Task 4**
+- [x] **Step 6: Commit Task 4**
 
 ```bash
 git add src/device/arch_handle.rs src/device/stream_switch/mod.rs
@@ -1103,7 +1106,7 @@ EOF
 
 **Goal:** Delete the dead-code `PortLayout` extension trait, migrate its 3 tests to archspec with assertions restated against the new carrier, and clean up the 3 stale doc-comment references that still describe the old runtime-side-only rationale.
 
-- [ ] **Step 1: Migrate the 3 tests into archspec's stream_switch/mod.rs**
+- [x] **Step 1: Migrate the 3 tests into archspec's stream_switch/mod.rs**
 
 Open `crates/xdna-archspec/src/stream_switch/mod.rs`. In the existing `#[cfg(test)] mod tests` block (added in Task 2), append 3 more tests that restate the assertions from `src/device/port_layout.rs:138-229` against `AIE2_STREAM_SWITCH_TOPOLOGY`:
 
@@ -1185,7 +1188,7 @@ Open `crates/xdna-archspec/src/stream_switch/mod.rs`. In the existing `#[cfg(tes
     }
 ```
 
-- [ ] **Step 2: Run archspec tests to verify migrated tests pass**
+- [x] **Step 2: Run archspec tests to verify migrated tests pass**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec --lib stream_switch 2>&1 | tail -10
@@ -1193,7 +1196,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec 
 
 Expected: all three migrated tests pass (plus the Task 2 tests).
 
-- [ ] **Step 3: Delete `src/device/port_layout.rs`**
+- [x] **Step 3: Delete `src/device/port_layout.rs`**
 
 ```bash
 rm /home/triple/npu-work/xdna-emu/src/device/port_layout.rs
@@ -1207,7 +1210,7 @@ ls /home/triple/npu-work/xdna-emu/src/device/port_layout.rs 2>&1
 
 Expected: `ls: cannot access ... No such file or directory`.
 
-- [ ] **Step 4: Remove `pub mod port_layout;` from `src/device/mod.rs`**
+- [x] **Step 4: Remove `pub mod port_layout;` from `src/device/mod.rs`**
 
 Open `src/device/mod.rs`. Find line 52 (`pub mod port_layout;`) and delete it. Also scan the rest of the file for any `use port_layout::PortLayout;` re-exports and delete those too. Expected edit:
 
@@ -1217,7 +1220,7 @@ Open `src/device/mod.rs`. Find line 52 (`pub mod port_layout;`) and delete it. A
 // Now deleted.
 ```
 
-- [ ] **Step 5: Run `cargo check` to verify nothing else referenced PortLayout**
+- [x] **Step 5: Run `cargo check` to verify nothing else referenced PortLayout**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo check --lib 2>&1 | tail -20
@@ -1228,7 +1231,7 @@ Expected: clean compile. If anything complains about an unresolved
 that's a latent external consumer -- note it, migrate it to the seam,
 and retry.
 
-- [ ] **Step 6: Update 3 stale doc-comment references in archspec runtime.rs**
+- [x] **Step 6: Update 3 stale doc-comment references in archspec runtime.rs**
 
 Open `crates/xdna-archspec/src/runtime.rs`. At each of the three line numbers noted in the audit (13, 63, 221), there are doc-comments referring to `PortLayout` or its runtime-side rationale. Replace each with language describing the new seam.
 
@@ -1279,7 +1282,7 @@ grep -rn "PortLayout" /home/triple/npu-work/xdna-emu/crates/xdna-archspec/src/ \
 
 Expected: no hits.
 
-- [ ] **Step 7: Run full tests**
+- [x] **Step 7: Run full tests**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -1290,7 +1293,7 @@ Expected:
 - xdna-emu: `2684 passed; 0 failed; 5 ignored` (baseline 2687 minus the 3 tests that migrated to archspec).
 - archspec: `297 passed; 0 failed; 2 ignored` (Task 3 brought it to 294; 3 migrated tests land here).
 
-- [ ] **Step 8: Commit Task 5**
+- [x] **Step 8: Commit Task 5**
 
 ```bash
 git add -u src/device/port_layout.rs src/device/mod.rs \
@@ -1336,7 +1339,7 @@ EOF
 
 **Goal:** Before the tag, fill in the docs that were scaffolded in Task 1 with the real commit history, test counts, and file-layout snapshot. This is a "docs catch up with reality" pass.
 
-- [ ] **Step 1: Gather the task-by-task commit history**
+- [x] **Step 1: Gather the task-by-task commit history**
 
 ```bash
 git log --oneline phase1-subsys-locks..HEAD
@@ -1354,7 +1357,7 @@ Expected output (roughly):
 
 Copy the SHAs for the audit's Completion section.
 
-- [ ] **Step 2: Fill in `docs/arch/subsys5-audit.md` Completion section**
+- [x] **Step 2: Fill in `docs/arch/subsys5-audit.md` Completion section**
 
 Replace the `## Completion\n\n(Filled in at end of Subsystem 5.)` stub
 with a populated section matching the shape of
@@ -1457,7 +1460,7 @@ Follow-ups that fit naturally in later work, NOT blocking:
   (written in Task 7 at tag time).
 ```
 
-- [ ] **Step 3: Fill in `docs/arch/stream-switch-model.md`**
+- [x] **Step 3: Fill in `docs/arch/stream-switch-model.md`**
 
 Replace the stubs in the `## What lives where` and `## The trait surface` sections with real content now that the code exists:
 
@@ -1551,20 +1554,20 @@ archspec = 297 passed / 0 failed / 2 ignored; full HW bridge matches
 phase1-subsys-locks character; ISA 4815/4815 PASS.
 ```
 
-- [ ] **Step 4: Fill in actual commit SHAs from `git log --oneline`**
+- [x] **Step 4: Fill in actual commit SHAs from `git log --oneline`**
 
 Replace the `<sha>` placeholders in both docs with the real SHAs from
 `git log --oneline phase1-subsys-locks..HEAD`. Replace `YYYY-MM-DD`
 with today's date.
 
-- [ ] **Step 5: Fill in the Task 7 placeholder**
+- [x] **Step 5: Fill in the Task 7 placeholder**
 
 The audit + design note both reference "Task 7" for the tag and
 NEXT-STEPS update. Task 7 will commit both of these doc updates in
 the same commit as the NEXT-STEPS update, so no separate commit here
 -- just leave the docs in a staged-but-uncommitted state for Task 7.
 
-- [ ] **Step 6: Run tests once more as a regression check**
+- [x] **Step 6: Run tests once more as a regression check**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -1590,7 +1593,7 @@ the subsystem, and update `NEXT-STEPS.md` to point at Subsystem 7
 (ISA Execute). This is the one task that exercises HW-touching
 suites (full bridge + ISA) -- budget ~45-60 min for the runs.
 
-- [ ] **Step 1: Clean release build + FFI rebuild**
+- [x] **Step 1: Clean release build + FFI rebuild**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build --release 2>&1 | tail -5
@@ -1603,7 +1606,7 @@ appears that wasn't present at the Subsystem 4 baseline, pause and
 investigate -- it likely indicates an import or visibility
 misalignment from the port_layout deletion.
 
-- [ ] **Step 2: Fast bridge smoke**
+- [x] **Step 2: Fast bridge smoke**
 
 ```bash
 ./scripts/emu-bridge-test.sh --no-hw -v add_one_cpp_aiecc 2>&1 | tail -30
@@ -1611,7 +1614,7 @@ misalignment from the port_layout deletion.
 
 Expected: Chess PASS, Peano PASS.
 
-- [ ] **Step 3: Run full bridge (HW, ~30 min)**
+- [x] **Step 3: Run full bridge (HW, ~30 min)**
 
 ```bash
 ./scripts/emu-bridge-test.sh 2>&1 | tee /tmp/claude-1000/bridge-subsys5.log
@@ -1631,7 +1634,7 @@ candidates are:
 - An archspec `stream_switch_model()` dispatch mismatch.
 - A missed `PortLayout` reference still compiled into a release binary.
 
-- [ ] **Step 4: Run ISA test suite (~10 min)**
+- [x] **Step 4: Run ISA test suite (~10 min)**
 
 ```bash
 ./scripts/isa-test.sh 2>&1 | tee /tmp/claude-1000/isa-subsys5.log
@@ -1639,7 +1642,7 @@ candidates are:
 
 Expected: `4815/4815 PASS (100.0%); FAIL: 0`.
 
-- [ ] **Step 5: Update `NEXT-STEPS.md`**
+- [x] **Step 5: Update `NEXT-STEPS.md`**
 
 Open `NEXT-STEPS.md`. Update the following fields:
 
@@ -1670,7 +1673,7 @@ Open `NEXT-STEPS.md`. Update the following fields:
       (124KB) falls on each side of the seam.
     - What the `IsaExecutor` trait minimum surface looks like.
 
-- [ ] **Step 6: Commit all doc updates in a single "completion log" commit**
+- [x] **Step 6: Commit all doc updates in a single "completion log" commit**
 
 The docs updates from Task 6 (audit + design note) are still unstaged.
 Stage them along with NEXT-STEPS.md:
@@ -1705,7 +1708,7 @@ EOF
 )"
 ```
 
-- [ ] **Step 7: Tag the subsystem**
+- [x] **Step 7: Tag the subsystem**
 
 ```bash
 git tag -a phase1-subsys-stream-switch -m "$(cat <<'EOF'
@@ -1731,7 +1734,7 @@ EOF
 )"
 ```
 
-- [ ] **Step 8: Verify the tag landed**
+- [x] **Step 8: Verify the tag landed**
 
 ```bash
 git tag -l 'phase1-subsys-*'
@@ -1741,7 +1744,7 @@ git show --stat phase1-subsys-stream-switch 2>&1 | head -30
 Expected: new tag `phase1-subsys-stream-switch` in the list; `git show`
 displays the commit message and stats.
 
-- [ ] **Step 9: Final post-tag cleanup sweep**
+- [x] **Step 9: Final post-tag cleanup sweep**
 
 Run the global test suites one more time from a clean state to confirm
 nothing regressed between the gate and the tag:
@@ -1787,18 +1790,18 @@ Not rollback criteria:
 
 Before handing this plan off, verify:
 
-- [ ] All 7 tasks have concrete code blocks, not placeholders.
-- [ ] Type signatures for `StreamSwitchModel`, `StreamSwitchTopology`,
+- [x] All 7 tasks have concrete code blocks, not placeholders.
+- [x] Type signatures for `StreamSwitchModel`, `StreamSwitchTopology`,
   `TileStreamPorts`, `for_tile` match across all tasks.
-- [ ] The `for_tile` accessor takes `&self, TileKind` in every
+- [x] The `for_tile` accessor takes `&self, TileKind` in every
   reference (no drift to `&TileKind` or similar).
-- [ ] `&'static [u8]` (not `&'static [(AieRtPortType, u8)]`) for
+- [x] `&'static [u8]` (not `&'static [(AieRtPortType, u8)]`) for
   port-array fields -- matches the generated `gen_stream_ports.rs`.
-- [ ] Commit messages follow the convention (`refactor:`,
+- [x] Commit messages follow the convention (`refactor:`,
   `feat(archspec):`, `test(archspec):`, `docs:` prefixes; no emoji;
   ends with `Generated using Claude Code.`).
-- [ ] Test-count invariants: 2687 -> 2684 xdna-emu, 282 -> 297 archspec
+- [x] Test-count invariants: 2687 -> 2684 xdna-emu, 282 -> 297 archspec
   (baseline + 11 new archspec tests + 3 migrated + 1 dispatch test).
-- [ ] Drift-detection test is added (locked to generated constants).
-- [ ] No task introduces new runtime state in xdna-emu (seam is
+- [x] Drift-detection test is added (locked to generated constants).
+- [x] No task introduces new runtime state in xdna-emu (seam is
   construction-time only).

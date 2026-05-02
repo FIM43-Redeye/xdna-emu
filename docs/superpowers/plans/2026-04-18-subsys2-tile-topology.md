@@ -16,6 +16,9 @@
 
 ---
 
+> **Sweep-as-of 2026-05-01:** Subsystem 2 completed -- tag `phase1-subsys-tile-topo`. Topology data lifted into archspec via TileTopology; ArrayDimensions consumers migrated. Steps below were executed organically rather than ticked one-by-one; this sweep flips the checkboxes to match the verified completion state.
+
+
 ## Scope Note
 
 Single-part subsystem with one tag (`phase1-subsys-tile-topo`) at the end. Unlike Subsystem 6 (9,300 lines relocated, Part A/B) or Subsystem 1 (build-system surgery), Subsystem 2 is:
@@ -148,7 +151,7 @@ Record these in `docs/arch/subsys2-audit.md` (created in Task 1).
 - Create: `docs/arch/subsys2-audit.md`
 - Create: `docs/arch/tile-topology.md`
 
-- [ ] **Step 1: Create the audit doc skeleton**
+- [x] **Step 1: Create the audit doc skeleton**
 
 Write `docs/arch/subsys2-audit.md`:
 
@@ -218,7 +221,7 @@ Known pre-existing failures (carry through):
 *(To be filled in by Task 8.)*
 ```
 
-- [ ] **Step 2: Fill in the baseline numbers**
+- [x] **Step 2: Fill in the baseline numbers**
 
 Run:
 
@@ -229,7 +232,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec 
 
 Paste each output into the two `<paste output>` placeholders in `docs/arch/subsys2-audit.md`.
 
-- [ ] **Step 3: Create the design-note skeleton**
+- [x] **Step 3: Create the design-note skeleton**
 
 Write `docs/arch/tile-topology.md`:
 
@@ -377,7 +380,7 @@ Neither adds for AIE2 today.
 the specific commit shas.)*
 ```
 
-- [ ] **Step 4: Verify no test regression from the new docs**
+- [x] **Step 4: Verify no test regression from the new docs**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -385,7 +388,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail
 
 Expected: 2712 passed / 0 failed / 5 ignored. (Docs don't change test behavior, but verify anyway; a later task may accidentally regress this and bisect points here.)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/arch/subsys2-audit.md docs/arch/tile-topology.md
@@ -416,7 +419,7 @@ EOF
 - Modify: `crates/xdna-archspec/src/aie2/mod.rs` (add `pub mod topology;`)
 - Modify: `crates/xdna-archspec/src/types.rs` (add `impl ArchModel { pub fn topology() ... }`)
 
-- [ ] **Step 1: Write the trait + Direction enum**
+- [x] **Step 1: Write the trait + Direction enum**
 
 Create `crates/xdna-archspec/src/topology.rs`:
 
@@ -473,7 +476,7 @@ pub trait TileTopology: Send + Sync {
 }
 ```
 
-- [ ] **Step 2: Declare the module in archspec's lib.rs**
+- [x] **Step 2: Declare the module in archspec's lib.rs**
 
 Edit `crates/xdna-archspec/src/lib.rs`. Add (preserving existing alphabetical order among `pub mod` declarations):
 
@@ -481,7 +484,7 @@ Edit `crates/xdna-archspec/src/lib.rs`. Add (preserving existing alphabetical or
 pub mod topology;
 ```
 
-- [ ] **Step 3: Write the Aie2Topology impl**
+- [x] **Step 3: Write the Aie2Topology impl**
 
 Create `crates/xdna-archspec/src/aie2/topology.rs`:
 
@@ -674,7 +677,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Declare the aie2 submodule**
+- [x] **Step 4: Declare the aie2 submodule**
 
 Edit `crates/xdna-archspec/src/aie2/mod.rs`. Add (at the top with other `pub mod` declarations):
 
@@ -683,7 +686,7 @@ Edit `crates/xdna-archspec/src/aie2/mod.rs`. Add (at the top with other `pub mod
 pub mod topology;
 ```
 
-- [ ] **Step 5: Add `ArchModel::topology()` accessor**
+- [x] **Step 5: Add `ArchModel::topology()` accessor**
 
 Edit `crates/xdna-archspec/src/types.rs`. Find the `impl ArchModel { ... }` block. Add the method at the end of the impl:
 
@@ -712,7 +715,7 @@ pub fn topology(&self) -> Box<dyn crate::topology::TileTopology + '_> {
 
 (If the `impl ArchModel { ... }` block isn't obvious from reading the file, search for `pub struct ArchModel` near line 1447 and find the following impl block; add the method there. If no impl block exists, create one immediately after the struct definition.)
 
-- [ ] **Step 6: Verify archspec builds and tests**
+- [x] **Step 6: Verify archspec builds and tests**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build -p xdna-archspec 2>&1 | tail -5
@@ -725,7 +728,7 @@ Expected:
 
 If tests fail: check that `crate::topology::{Direction, TileTopology}` resolves inside `aie2/topology.rs` (should, since the new `topology.rs` is at crate root). Check that `ArchModel::array_topology.num_columns` / `total_rows` / `num_mem_tile_rows` field names match the actual struct definition; if the field names differ (e.g., `num_rows` instead of `total_rows`), adjust `from_model` and the test helpers accordingly.
 
-- [ ] **Step 7: Verify xdna-emu still builds**
+- [x] **Step 7: Verify xdna-emu still builds**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build 2>&1 | tail -5
@@ -734,7 +737,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail
 
 Expected: clean build, 2712 passed / 0 failed / 5 ignored.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/xdna-archspec/src/topology.rs crates/xdna-archspec/src/aie2/topology.rs crates/xdna-archspec/src/lib.rs crates/xdna-archspec/src/aie2/mod.rs crates/xdna-archspec/src/types.rs
@@ -762,7 +765,7 @@ EOF
 **Files:**
 - Modify: `crates/xdna-archspec/src/types.rs` (add impl block near TileKind at lines 62-77)
 
-- [ ] **Step 1: Add the impl block**
+- [x] **Step 1: Add the impl block**
 
 Edit `crates/xdna-archspec/src/types.rs`. After the `impl fmt::Display for TileKind` block (ending around line 78), add:
 
@@ -831,7 +834,7 @@ mod tile_kind_predicate_tests {
 }
 ```
 
-- [ ] **Step 2: Verify archspec builds and tests**
+- [x] **Step 2: Verify archspec builds and tests**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build -p xdna-archspec 2>&1 | tail -5
@@ -842,7 +845,7 @@ Expected:
 - Clean build.
 - Archspec test count increased by 4: `235 passed; 1 failed; 2 ignored`.
 
-- [ ] **Step 3: Verify xdna-emu still builds**
+- [x] **Step 3: Verify xdna-emu still builds**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build 2>&1 | tail -5
@@ -851,7 +854,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail
 
 Expected: clean, 2712 passed.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/xdna-archspec/src/types.rs
@@ -880,7 +883,7 @@ EOF
 - Modify: `src/npu/executor.rs` (line 895)
 - Modify: `src/device/array/routing.rs` (line 144)
 
-- [ ] **Step 1: Fix `src/npu/executor.rs:895`**
+- [x] **Step 1: Fix `src/npu/executor.rs:895`**
 
 Read the context at line 895 (already audited: `let is_shim_bd = row == 0 && bd_index_for_blockwrite(row, offset).is_some();`).
 
@@ -913,7 +916,7 @@ use xdna_archspec::aie2::SHIM_ROW;
 
 and change the line to `let is_shim_bd = row == SHIM_ROW && ...`.
 
-- [ ] **Step 2: Fix `src/device/array/routing.rs:144`**
+- [x] **Step 2: Fix `src/device/array/routing.rs:144`**
 
 Read the context at line 144 (audited: `if row == 0 { continue; }` inside the cascade south-routing match arm).
 
@@ -957,7 +960,7 @@ or via whatever accessor the device/array context exposes.
 
 **Default to the constant form** at this task unless the topology handle is already readily available. The hardcode-to-constant swap is all that's technically required for the spec's success criterion 7; the full trait migration for cascade routing is natural work for Subsystem 5 (Stream Switch) where stream-switch topology deltas surface together.
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build 2>&1 | tail -5
@@ -966,7 +969,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail
 
 Expected: clean build, 2712 passed. If `test_cascade_route_*` tests fail, the routing rewrite broke the semantic -- the constant-form rewrite (Step 2's fallback) should produce bit-identical behavior on AIE2.
 
-- [ ] **Step 4: Verify zero bare `row == 0` tile-classification sites remain**
+- [x] **Step 4: Verify zero bare `row == 0` tile-classification sites remain**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build 2>&1 | tail -3
@@ -985,7 +988,7 @@ Expected matches: only in code paths that are pure geometric (e.g., loop-index c
 
 If any matches are tile-classification, fix them the same way.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/npu/executor.rs src/device/array/routing.rs
@@ -1013,7 +1016,7 @@ EOF
 - Modify: `src/interpreter/execute/memory/neighbor.rs` (lines 80, 135)
 - Modify: `src/interpreter/engine/coordinator.rs` (lines 578, 705)
 
-- [ ] **Step 1: Inspect what's in scope at each site**
+- [x] **Step 1: Inspect what's in scope at each site**
 
 Read each of the four files around the target lines. For each site, identify:
 1. What coordinate types are in scope (likely `usize`, not `u8`).
@@ -1029,7 +1032,7 @@ sed -n '695,715p' src/interpreter/engine/coordinator.rs
 
 (Use Read with the appropriate offsets rather than sed if you're in the Claude Code interface.)
 
-- [ ] **Step 2: Decide on coordinate plumbing**
+- [x] **Step 2: Decide on coordinate plumbing**
 
 The topology's `neighbor()` takes and returns `u8`. The neighbor/coordinator code uses `usize`. Two options:
 
@@ -1051,7 +1054,7 @@ This captures the intent ("south neighbor exists only above the shim row") at th
 
 **Default to Option A.** Full trait dispatch is appropriate work for Subsystem 7 (ISA Execute) where per-arch memory semantics surface together. For Subsystem 2 the point is to eliminate the `row > 0` hardcode and route it through an archspec constant; the trait exists for future consumers to pick up.
 
-- [ ] **Step 3: Rewrite `src/interpreter/execute/memory/neighbor.rs:80`**
+- [x] **Step 3: Rewrite `src/interpreter/execute/memory/neighbor.rs:80`**
 
 Replace lines 78-88 (the `neighbor_coords` match arms):
 
@@ -1096,7 +1099,7 @@ fn neighbor_coords(&self, dir: MemoryQuadrant) -> Option<(usize, usize)> {
 }
 ```
 
-- [ ] **Step 4: Rewrite `src/interpreter/execute/memory/neighbor.rs:135` (the `apply_writes` arm)**
+- [x] **Step 4: Rewrite `src/interpreter/execute/memory/neighbor.rs:135` (the `apply_writes` arm)**
 
 Lines 134-140 currently:
 
@@ -1128,7 +1131,7 @@ let coords = match dir {
 
 (The `const SHIM_ROW: usize = ...` may be redundant if the outer function already declared it. If so, drop the local `const` and reuse the outer one.)
 
-- [ ] **Step 5: Rewrite `src/interpreter/engine/coordinator.rs:578`**
+- [x] **Step 5: Rewrite `src/interpreter/engine/coordinator.rs:578`**
 
 Line 578 currently: `if row > 0 {` (south-lock snapshot guard).
 
@@ -1140,13 +1143,13 @@ if row > xdna_archspec::aie2::SHIM_ROW as usize {
 
 (Assumes `row` is `usize` here; if it's `u8`, drop the `as usize`.)
 
-- [ ] **Step 6: Rewrite `src/interpreter/engine/coordinator.rs:705`**
+- [x] **Step 6: Rewrite `src/interpreter/engine/coordinator.rs:705`**
 
 Line 705 currently: `if row > 0 {` (south-lock writeback guard).
 
 Same rewrite as Step 5.
 
-- [ ] **Step 7: Verify tests pass**
+- [x] **Step 7: Verify tests pass**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build 2>&1 | tail -5
@@ -1165,7 +1168,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib test_memtil
 
 Expected: all pass.
 
-- [ ] **Step 8: Verify zero bare `row > 0` memory-neighbor sites remain**
+- [x] **Step 8: Verify zero bare `row > 0` memory-neighbor sites remain**
 
 ```
 rg 'row\s*>\s*0' src/interpreter/
@@ -1173,7 +1176,7 @@ rg 'row\s*>\s*0' src/interpreter/
 
 Expected: no matches outside `#[cfg(test)]` blocks. (If matches exist in non-memory-neighbor contexts, that's fine -- leave them alone.)
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add src/interpreter/execute/memory/neighbor.rs src/interpreter/engine/coordinator.rs
@@ -1200,7 +1203,7 @@ EOF
 **Files:**
 - Modify: ~13 files across `src/device/`, `src/interpreter/`, `src/npu/`, `src/trace/`. Exact list enumerated in Step 1.
 
-- [ ] **Step 1: Enumerate the consumer files**
+- [x] **Step 1: Enumerate the consumer files**
 
 ```bash
 rg -l 'TileType' src/ | grep -v 'src/trace/vcd.rs' | sort > /tmp/claude-1000/subsys2-tiletype-consumers.txt
@@ -1210,7 +1213,7 @@ cat /tmp/claude-1000/subsys2-tiletype-consumers.txt
 
 Expected: ~13 files. `src/trace/vcd.rs` is excluded because it defines an unrelated private `TileType` enum that should stay.
 
-- [ ] **Step 2: Per-file sed sweep -- variant names**
+- [x] **Step 2: Per-file sed sweep -- variant names**
 
 Apply the migration reference table's mechanical substitutions. A helper script:
 
@@ -1235,7 +1238,7 @@ chmod +x /tmp/claude-1000/subsys2-rename-sweep.sh
 /tmp/claude-1000/subsys2-rename-sweep.sh
 ```
 
-- [ ] **Step 3: `TileType::Shim` -- manual review**
+- [x] **Step 3: `TileType::Shim` -- manual review**
 
 `TileType::Shim` has two semantic roles:
 
@@ -1256,7 +1259,7 @@ For each site, inspect the context. The vast majority will be match arms (the `S
 
 Work through the list manually. Each site should take <30 seconds.
 
-- [ ] **Step 4: Remove prefix `TileType::` -> `TileKind::` globally (catch-all)**
+- [x] **Step 4: Remove prefix `TileType::` -> `TileKind::` globally (catch-all)**
 
 After Steps 2-3, any remaining `TileType::X` literals are errors or straggling references. A final sed pass:
 
@@ -1268,7 +1271,7 @@ done
 
 (This is a safety net for anything Step 2-3 missed. It also unsafely collapses `TileType::Shim` -> `TileKind::Shim`, which doesn't compile -- so if the build fails after this step, Step 3 missed sites.)
 
-- [ ] **Step 5: Rename bindings (`tile_type` -> `tile_kind`)**
+- [x] **Step 5: Rename bindings (`tile_type` -> `tile_kind`)**
 
 This is less critical but matches archspec terminology. For each file in the list:
 
@@ -1290,7 +1293,7 @@ rg 'tile_type' src/ | grep -v 'src/trace/vcd.rs' | grep -v 'tile_kind'
 
 Expected: zero or only safe variable-name uses (local `let tile_type = ...` bindings that aren't struct fields). Fix any remaining real field uses by hand.
 
-- [ ] **Step 6: Predicate method rename (`is_mem_tile` -> `is_mem`)**
+- [x] **Step 6: Predicate method rename (`is_mem_tile` -> `is_mem`)**
 
 Find every call to `.is_mem_tile()`:
 
@@ -1308,7 +1311,7 @@ done
 
 The `is_shim()` and `is_compute()` methods keep their names (same on both `TileType` and `TileKind`), so they don't need rewriting.
 
-- [ ] **Step 7: Handle imports**
+- [x] **Step 7: Handle imports**
 
 Any file that was importing `TileType` from `crate::device::tile` or `crate::device` now needs to import `TileKind` from `xdna_archspec`. The sed pass in Step 4 turned the type references but not the imports.
 
@@ -1328,7 +1331,7 @@ done
 
 The brace-group patterns are approximations; some may require manual fix-up.
 
-- [ ] **Step 8: Delete stale `TileType::from(..)` conversions**
+- [x] **Step 8: Delete stale `TileType::from(..)` conversions**
 
 With `TileType` gone, any `.into::<TileKind>()` or `TileKind::from(tile_type)` expressions become no-ops or are dead code. Find them:
 
@@ -1338,7 +1341,7 @@ rg -n 'TileKind::from|TileType::from' src/
 
 Review each site and either delete the conversion (if the source is already `TileKind`) or leave it as a Kind-to-Kind identity `match` if it was doing semantic work. For the sweep, most will be mechanical deletions.
 
-- [ ] **Step 9: Build and fix fallout**
+- [x] **Step 9: Build and fix fallout**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build 2>&1 | tail -30
@@ -1353,7 +1356,7 @@ Expected outcomes:
 
 Keep iterating the error list until `cargo build` is clean. This task's "manual review" time-cost is concentrated here.
 
-- [ ] **Step 10: Run tests**
+- [x] **Step 10: Run tests**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -1361,7 +1364,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail
 
 Expected: 2712 passed / 0 failed / 5 ignored (baseline preserved; the 3 bridge round-trip tests in `core_state.rs` haven't deleted yet -- that's Task 7). If tests fail, a match-arm rewrite changed behavior.
 
-- [ ] **Step 11: Run the tile-type-specific smoke list**
+- [x] **Step 11: Run the tile-type-specific smoke list**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib \
@@ -1383,7 +1386,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib \
 
 Expected: all pass.
 
-- [ ] **Step 12: FFI smoke**
+- [x] **Step 12: FFI smoke**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build -p xdna-emu-ffi 2>&1 | tail -5
@@ -1392,7 +1395,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build -p xdna-emu-ffi 
 
 Expected: FFI builds clean, bridge smoke passes.
 
-- [ ] **Step 13: Commit**
+- [x] **Step 13: Commit**
 
 ```bash
 git add -A
@@ -1425,7 +1428,7 @@ EOF
 - Modify: `src/device/mod.rs` (remove `TileType` from the re-export list)
 - Modify: `src/trace/vcd.rs` (add one-line note above the private `TileType` enum, if appropriate)
 
-- [ ] **Step 1: Verify zero remaining `TileType::` references**
+- [x] **Step 1: Verify zero remaining `TileType::` references**
 
 ```bash
 rg -l 'TileType::' src/
@@ -1433,7 +1436,7 @@ rg -l 'TileType::' src/
 
 Expected: only `src/device/tile/core_state.rs` (the enum definition + impls) and `src/trace/vcd.rs` (the unrelated private enum). If any other file appears, Task 6 missed it; fix before proceeding.
 
-- [ ] **Step 2: Delete `TileType` from core_state.rs**
+- [x] **Step 2: Delete `TileType` from core_state.rs**
 
 Edit `src/device/tile/core_state.rs`. Delete:
 
@@ -1446,7 +1449,7 @@ Edit `src/device/tile/core_state.rs`. Delete:
 
 After the deletion, the file should retain: `CoreState` struct + impl, `LegacyStreamPort` struct, `CtrlPacketAction` enum. That's it.
 
-- [ ] **Step 3: Remove `TileType` from `src/device/tile/mod.rs` re-exports**
+- [x] **Step 3: Remove `TileType` from `src/device/tile/mod.rs` re-exports**
 
 Edit `src/device/tile/mod.rs`. Find line ~38:
 
@@ -1460,7 +1463,7 @@ Replace with:
 pub use core_state::{CoreState, LegacyStreamPort, CtrlPacketAction};
 ```
 
-- [ ] **Step 4: Remove `TileType` from `src/device/mod.rs` re-exports**
+- [x] **Step 4: Remove `TileType` from `src/device/mod.rs` re-exports**
 
 Edit `src/device/mod.rs`. Find line ~71:
 
@@ -1476,7 +1479,7 @@ pub use tile::{Tile, Lock, LockResult, DmaBufferDescriptor, DmaChannel, CoreStat
 
 (If any consumer was using `use crate::device::TileType`, Task 6's Step 7 should have already rewritten it. If not, fix at next build error.)
 
-- [ ] **Step 5: Add the vcd.rs disambiguation comment**
+- [x] **Step 5: Add the vcd.rs disambiguation comment**
 
 Edit `src/trace/vcd.rs`. Find the `enum TileType` definition. Immediately above it, add:
 
@@ -1489,7 +1492,7 @@ Edit `src/trace/vcd.rs`. Find the `enum TileType` definition. Immediately above 
 
 If the enum definition already has adjacent docstring lines, fold the disambiguation into the existing comment instead of adding a new one.
 
-- [ ] **Step 6: Build and test**
+- [x] **Step 6: Build and test**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build 2>&1 | tail -10
@@ -1502,11 +1505,11 @@ Expected:
 
 Actual delta will land as one of those two numbers -- confirm exact count in Step 8 when capturing the audit.
 
-- [ ] **Step 7: Run the tile-type-specific smoke list**
+- [x] **Step 7: Run the tile-type-specific smoke list**
 
 Same as Task 6 Step 11. Expected: all 16 tests pass.
 
-- [ ] **Step 8: Verify FFI + bridge smoke**
+- [x] **Step 8: Verify FFI + bridge smoke**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build -p xdna-emu-ffi 2>&1 | tail -5
@@ -1515,7 +1518,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build -p xdna-emu-ffi 
 
 Expected: clean.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add -A
@@ -1550,7 +1553,7 @@ EOF
 - Modify: `docs/arch/tile-topology.md` (fill Completion)
 - Modify: `NEXT-STEPS.md` (update tag + pickup guide)
 
-- [ ] **Step 1: Fast verification**
+- [x] **Step 1: Fast verification**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build --release 2>&1 | tail -5
@@ -1569,7 +1572,7 @@ Expected:
 
 Record the exact xdna-emu and archspec test counts for the audit.
 
-- [ ] **Step 2: Verify success criteria sweep**
+- [x] **Step 2: Verify success criteria sweep**
 
 ```bash
 # Criterion 6: zero TileType references outside vcd.rs
@@ -1591,7 +1594,7 @@ rg -n 'From<TileKind> for TileType|From<TileType> for TileKind' src/
 
 If any of these fail, a prior task missed a cleanup. Find and fix before proceeding.
 
-- [ ] **Step 3: Full HW bridge run**
+- [x] **Step 3: Full HW bridge run**
 
 ```bash
 nice -n 19 ./scripts/emu-bridge-test.sh 2>&1 | tee /tmp/claude-1000/bridge-subsys2.log
@@ -1605,7 +1608,7 @@ Check the tail for the pass/fail summary:
 tail -30 /tmp/claude-1000/bridge-subsys2.log
 ```
 
-- [ ] **Step 4: ISA test suite**
+- [x] **Step 4: ISA test suite**
 
 ```bash
 nice -n 19 ./scripts/isa-test.sh 2>&1 | tee /tmp/claude-1000/isa-subsys2.log
@@ -1617,7 +1620,7 @@ Expected duration: ~10 minutes. Expected: `FAIL: 0`.
 tail -10 /tmp/claude-1000/isa-subsys2.log
 ```
 
-- [ ] **Step 5: Fill in `docs/arch/subsys2-audit.md` Completion section**
+- [x] **Step 5: Fill in `docs/arch/subsys2-audit.md` Completion section**
 
 Replace the `*(To be filled in by Task 8.)*` line in `docs/arch/subsys2-audit.md` with:
 
@@ -1681,7 +1684,7 @@ git log --oneline phase1-subsys-isa-decode..HEAD
 
 - Replace `2026-MM-DD` with the actual date (use `date +%Y-%m-%d`).
 
-- [ ] **Step 6: Fill in `docs/arch/tile-topology.md` Completion section**
+- [x] **Step 6: Fill in `docs/arch/tile-topology.md` Completion section**
 
 Replace the `*(To be filled in by Task 8...)*` line in `docs/arch/tile-topology.md` with:
 
@@ -1702,7 +1705,7 @@ Verification: `cargo test --lib` = <final count>, archspec = <final count>, full
 
 Fill in the numbers and date.
 
-- [ ] **Step 7: Update NEXT-STEPS.md**
+- [x] **Step 7: Update NEXT-STEPS.md**
 
 Edit `NEXT-STEPS.md`. Update the header (around the top):
 
@@ -1783,7 +1786,7 @@ This is the concrete next action. Start here in a fresh session.
 
 Fill in `<final count>` with the actual numbers.
 
-- [ ] **Step 8: Commit docs updates**
+- [x] **Step 8: Commit docs updates**
 
 ```bash
 git add docs/arch/subsys2-audit.md docs/arch/tile-topology.md NEXT-STEPS.md
@@ -1802,7 +1805,7 @@ EOF
 )"
 ```
 
-- [ ] **Step 9: Tag**
+- [x] **Step 9: Tag**
 
 ```bash
 git tag phase1-subsys-tile-topo -m "Phase 1b Subsystem 2: TileTopology trait + TileKind deep rename"
@@ -1814,7 +1817,7 @@ Verify the tag:
 git log --oneline phase1-subsys-tile-topo -5
 ```
 
-- [ ] **Step 10: Final sanity pass**
+- [x] **Step 10: Final sanity pass**
 
 ```bash
 # Confirm we're at the expected commit & tag

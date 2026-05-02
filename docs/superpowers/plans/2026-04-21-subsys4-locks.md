@@ -16,6 +16,9 @@
 
 ---
 
+> **Sweep-as-of 2026-05-01:** Subsystem 4 completed -- tag `phase1-subsys-locks`. Locks behavior consolidated. Steps below were executed organically rather than ticked one-by-one; this sweep flips the checkboxes to match the verified completion state.
+
+
 ## Scope Note
 
 Single-part subsystem with one tag (`phase1-subsys-locks`) at the end. Scope is intentionally small because Subsystem 3 did the heavy lifting on the `DeviceRegLayout` migration -- Subsystem 4 only needs to finish the lock-specific residue.
@@ -138,7 +141,7 @@ Record these in `docs/arch/subsys4-audit.md` (created in Task 1).
 - Create: `docs/arch/subsys4-audit.md`
 - Create: `docs/arch/lock-model.md`
 
-- [ ] **Step 1: Create the audit doc skeleton**
+- [x] **Step 1: Create the audit doc skeleton**
 
 Write `docs/arch/subsys4-audit.md`:
 
@@ -205,7 +208,7 @@ Non-divergences (for the record):
 *(To be filled in by Task 7.)*
 ```
 
-- [ ] **Step 2: Fill in the baseline numbers**
+- [x] **Step 2: Fill in the baseline numbers**
 
 Run:
 
@@ -216,7 +219,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec 
 
 Paste each output into the two `<paste output>` placeholders in `docs/arch/subsys4-audit.md`.
 
-- [ ] **Step 3: Create the design-note skeleton**
+- [x] **Step 3: Create the design-note skeleton**
 
 Write `docs/arch/lock-model.md`:
 
@@ -368,7 +371,7 @@ on `DmaModel` when Subsystem 3 added it.
 specific commit shas.)*
 ```
 
-- [ ] **Step 4: Verify no test regression from the new docs**
+- [x] **Step 4: Verify no test regression from the new docs**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -376,7 +379,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail
 
 Expected: 2687 passed / 0 failed / 5 ignored. (Docs don't change test behavior, but verify anyway.)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/arch/subsys4-audit.md docs/arch/lock-model.md
@@ -405,7 +408,7 @@ EOF
 - Modify: `crates/xdna-archspec/src/lib.rs` (add `pub mod locks;`)
 - Modify: `crates/xdna-archspec/src/aie2/mod.rs` (add `pub mod locks;`)
 
-- [ ] **Step 1: Write the trait + carrier struct**
+- [x] **Step 1: Write the trait + carrier struct**
 
 Create `crates/xdna-archspec/src/locks/mod.rs`:
 
@@ -507,7 +510,7 @@ pub trait LockModel: Send + Sync + core::fmt::Debug {
 }
 ```
 
-- [ ] **Step 2: Write the trait / carrier tests**
+- [x] **Step 2: Write the trait / carrier tests**
 
 Create `crates/xdna-archspec/src/locks/tests.rs`:
 
@@ -563,7 +566,7 @@ fn sign_extend_masks_extra_bits() {
 }
 ```
 
-- [ ] **Step 3: Declare the module in archspec's lib.rs**
+- [x] **Step 3: Declare the module in archspec's lib.rs**
 
 Edit `crates/xdna-archspec/src/lib.rs`. Find the block of `pub mod` declarations (around lines 16-25). Add `pub mod locks;` preserving alphabetical order:
 
@@ -581,7 +584,7 @@ pub mod topology;
 pub mod types;
 ```
 
-- [ ] **Step 4: Write the Aie2LockModel impl**
+- [x] **Step 4: Write the Aie2LockModel impl**
 
 Create `crates/xdna-archspec/src/aie2/locks.rs`:
 
@@ -706,7 +709,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 5: Declare the aie2/locks module**
+- [x] **Step 5: Declare the aie2/locks module**
 
 Edit `crates/xdna-archspec/src/aie2/mod.rs`. Find the existing `pub mod dma;` declaration (around line 99). Add `pub mod locks;` after it:
 
@@ -718,7 +721,7 @@ pub mod dma;
 pub mod locks;
 ```
 
-- [ ] **Step 6: Verify compilation + tests**
+- [x] **Step 6: Verify compilation + tests**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec --lib 2>&1 | tail -5
@@ -726,7 +729,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec 
 
 Expected: `273 + 9 = 282 passed; 0 failed; 2 ignored` (9 new tests: 5 in `locks/tests.rs` + 4 in `aie2/locks.rs`). The drift-detection test early-returns if the JSON path cannot be resolved (prints a skip message, counts as pass, not ignored).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/xdna-archspec/src/locks/ \
@@ -765,7 +768,7 @@ EOF
 **Files:**
 - Modify: `crates/xdna-archspec/src/runtime.rs` (add trait method + impl)
 
-- [ ] **Step 1: Locate the existing dma_model() pattern**
+- [x] **Step 1: Locate the existing dma_model() pattern**
 
 ```bash
 grep -n 'fn dma_model' crates/xdna-archspec/src/runtime.rs
@@ -773,7 +776,7 @@ grep -n 'fn dma_model' crates/xdna-archspec/src/runtime.rs
 
 Expected: one match in the trait definition (around line 171), one match in the impl (around line 468). Open the file to line ~160 and line ~465 to see both blocks.
 
-- [ ] **Step 2: Add the trait method**
+- [x] **Step 2: Add the trait method**
 
 In `crates/xdna-archspec/src/runtime.rs`, find the `dma_model` trait method (should look like):
 
@@ -802,7 +805,7 @@ Insert a `lock_model` method immediately before the closing `}`:
 }
 ```
 
-- [ ] **Step 3: Add the ModelConfig impl**
+- [x] **Step 3: Add the ModelConfig impl**
 
 Find the existing `fn dma_model(&self) -> ...` block in the `impl ArchConfig for ModelConfig`:
 
@@ -840,7 +843,7 @@ Add an analogous `lock_model` method immediately after:
     }
 ```
 
-- [ ] **Step 4: Verify compilation + tests**
+- [x] **Step 4: Verify compilation + tests**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build -p xdna-archspec 2>&1 | tail -5
@@ -850,7 +853,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail
 
 Expected: archspec tests still at ~282 pass (no new tests in this task). xdna-emu tests at 2687 pass (no change). Build clean for both.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/xdna-archspec/src/runtime.rs
@@ -882,7 +885,7 @@ EOF
 - Modify: `docs/archive/accuracy-sweep/verified/locks.md:91`
 - Modify: `docs/archive/accuracy-sweep/verified/shim-memtile.md:171`
 
-- [ ] **Step 1: Audit the callers that thread `reg_layout`**
+- [x] **Step 1: Audit the callers that thread `reg_layout`**
 
 Check where `write_lock_value` / `mask_write_lock_value` are called from, and where `read_register_pure` sits in the call graph:
 
@@ -899,7 +902,7 @@ grep -rn 'read_register_pure' src/
 
 Every call site then reads `crate::device::arch_handle::lock_value_layout().mask` etc. `default_arch()` already exists in Subsystem 1 and is the seed.
 
-- [ ] **Step 2: Create `src/device/arch_handle.rs`**
+- [x] **Step 2: Create `src/device/arch_handle.rs`**
 
 Create the new file:
 
@@ -945,7 +948,7 @@ Find the appropriate place in the module declarations (alphabetical or by theme;
 pub mod arch_handle;
 ```
 
-- [ ] **Step 3: Rewrite the three `.lock_value_mask` / `sign_extend_lock_value` call sites**
+- [x] **Step 3: Rewrite the three `.lock_value_mask` / `sign_extend_lock_value` call sites**
 
 Open `src/device/tile/registers.rs`. Replace line 158:
 
@@ -995,7 +998,7 @@ grep -n 'write_lock_value\|mask_write_lock_value' src/device/state/
 
 Update each call site to drop the `reg_layout` argument.
 
-- [ ] **Step 4: Delete the `sign_extend_lock_value` wrapper fn in `state/mod.rs`**
+- [x] **Step 4: Delete the `sign_extend_lock_value` wrapper fn in `state/mod.rs`**
 
 Open `src/device/state/mod.rs`. Find lines 43-49:
 
@@ -1011,7 +1014,7 @@ fn sign_extend_lock_value(reg_layout: &regdb::DeviceRegLayout, raw: u32) -> i8 {
 
 Delete this block. Also check whether `use super::regdb;` or similar is still needed after the deletion -- if no other code in the file uses `regdb`, remove the `use` too.
 
-- [ ] **Step 5: Update archive docs**
+- [x] **Step 5: Update archive docs**
 
 Open `docs/archive/accuracy-sweep/verified/locks.md` at line 91:
 
@@ -1037,7 +1040,7 @@ Replace with:
 `LockValueLayout::sign_extend()` operates on the archspec-side AIE2_LOCK_VALUE_LAYOUT (width=6 / mask=0x3F for AIE2).
 ```
 
-- [ ] **Step 6: Verify compilation + tests**
+- [x] **Step 6: Verify compilation + tests**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build 2>&1 | tail -20
@@ -1046,7 +1049,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail
 
 Expected: build clean; `2687 passed; 0 failed; 5 ignored` (no new tests yet; existing ones must still pass).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/device/arch_handle.rs \
@@ -1091,7 +1094,7 @@ EOF
 - Modify: `src/device/regdb/mod.rs` (significant shrink)
 - Modify: `src/device/regdb/tests.rs` (remove migrated tests)
 
-- [ ] **Step 1: Rewrite `src/device/regdb/mod.rs`**
+- [x] **Step 1: Rewrite `src/device/regdb/mod.rs`**
 
 Replace the file contents with the collapsed form:
 
@@ -1167,7 +1170,7 @@ If the old `load_for_device` (returning `RegisterDb`) was referenced, either:
 
 **Expected:** only `src/device/regdb/mod.rs` self-calls and tests reference `load_for_device`. The accessor is the main API.
 
-- [ ] **Step 2: Trim `src/device/regdb/tests.rs`**
+- [x] **Step 2: Trim `src/device/regdb/tests.rs`**
 
 Open `src/device/regdb/tests.rs`. Delete `test_device_reg_layout_lock_value_extension` (lines 17-38 in the current file -- the entire function including its doc comment if any). The 5 field/sign-extend assertions there are already covered by archspec-side tests added in Task 2.
 
@@ -1189,7 +1192,7 @@ Update the module doc-comment at the top to reflect the new scope:
 //! is tested here.
 ```
 
-- [ ] **Step 3: Verify compilation + tests**
+- [x] **Step 3: Verify compilation + tests**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build 2>&1 | tail -20
@@ -1206,7 +1209,7 @@ grep -rn 'sign_extend_lock_value\|lock_value_mask\|lock_value_width\|lock_value_
 
 Expected: all matches are either in comments / doc-strings, or in the (now-deleted) places. If any production code still references them, fix before commit.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/device/regdb/mod.rs src/device/regdb/tests.rs
@@ -1243,7 +1246,7 @@ EOF
 **Files:**
 - Modify: `src/device/tile/locks.rs` (tests module)
 
-- [ ] **Step 1: Locate or add the tests module**
+- [x] **Step 1: Locate or add the tests module**
 
 Open `src/device/tile/locks.rs`. Find the existing `#[cfg(test)] mod tests { ... }` at the end of the file.
 
@@ -1256,7 +1259,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Add the drift-detection test**
+- [x] **Step 2: Add the drift-detection test**
 
 Add this test inside the `mod tests` block:
 
@@ -1272,7 +1275,7 @@ Add this test inside the `mod tests` block:
     }
 ```
 
-- [ ] **Step 3: Verify the test passes**
+- [x] **Step 3: Verify the test passes**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib device::tile::locks::tests::lock_bounds_match_archspec 2>&1 | tail -5
@@ -1282,7 +1285,7 @@ Expected: `1 passed`. If it fails, either:
 - `Lock::MIN_VALUE` / `MAX_VALUE` differ from `-64` / `63` -- check `src/device/tile/locks.rs` and `crates/xdna-archspec/src/aie2/locks.rs`.
 - The `use` path is wrong -- verify the accessor name matches Task 2's static.
 
-- [ ] **Step 4: Full test suite**
+- [x] **Step 4: Full test suite**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -5
@@ -1290,7 +1293,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail
 
 Expected: `2687 passed; 0 failed; 5 ignored` (previous 2686 + 1 new drift test).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/device/tile/locks.rs
@@ -1321,7 +1324,7 @@ EOF
 - Modify: `docs/arch/lock-model.md` (Completion section)
 - Modify: `NEXT-STEPS.md`
 
-- [ ] **Step 1: Unit test gate**
+- [x] **Step 1: Unit test gate**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -1336,7 +1339,7 @@ Expected:
 
 Record the exact counts for the audit Completion section.
 
-- [ ] **Step 2: Rebuild FFI cdylib**
+- [x] **Step 2: Rebuild FFI cdylib**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build -p xdna-emu-ffi 2>&1 | tail -3
@@ -1344,7 +1347,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build -p xdna-emu-ffi 
 
 Expected: build clean. This is critical before the bridge runs -- a stale `.so` produces phantom "regressions."
 
-- [ ] **Step 3: Bridge smoke test**
+- [x] **Step 3: Bridge smoke test**
 
 ```bash
 ./scripts/emu-bridge-test.sh --no-hw -v add_one_cpp_aiecc 2>&1 | tail -15
@@ -1352,7 +1355,7 @@ Expected: build clean. This is critical before the bridge runs -- a stale `.so` 
 
 Expected: Chess PASS, Peano PASS.
 
-- [ ] **Step 4: Full HW bridge run**
+- [x] **Step 4: Full HW bridge run**
 
 ```bash
 mkdir -p /tmp/claude-1000
@@ -1367,7 +1370,7 @@ Check the tail for the pass/fail summary:
 tail -30 /tmp/claude-1000/bridge-subsys4.log
 ```
 
-- [ ] **Step 5: ISA test suite**
+- [x] **Step 5: ISA test suite**
 
 ```bash
 nice -n 19 ./scripts/isa-test.sh 2>&1 | tee /tmp/claude-1000/isa-subsys4.log
@@ -1379,7 +1382,7 @@ Expected duration: ~10 minutes. Expected: `FAIL: 0`. Note: bridge and ISA must r
 tail -10 /tmp/claude-1000/isa-subsys4.log
 ```
 
-- [ ] **Step 6: Success-criteria sweep**
+- [x] **Step 6: Success-criteria sweep**
 
 ```bash
 # Criterion 1: no stale references to the deleted xdna-emu fields
@@ -1407,7 +1410,7 @@ ls crates/xdna-archspec/src/aie2/locks.rs
 
 If any criterion fails, a prior task missed cleanup. Find and fix before proceeding.
 
-- [ ] **Step 7: Fill in `docs/arch/subsys4-audit.md` Completion section**
+- [x] **Step 7: Fill in `docs/arch/subsys4-audit.md` Completion section**
 
 Replace the `*(To be filled in by Task 7.)*` line with:
 
@@ -1470,7 +1473,7 @@ git log --oneline phase1-subsys-dma..HEAD
 
 - Replace `2026-MM-DD` with today's date (`date +%Y-%m-%d`).
 
-- [ ] **Step 8: Fill in `docs/arch/lock-model.md` Completion section**
+- [x] **Step 8: Fill in `docs/arch/lock-model.md` Completion section**
 
 Replace the `*(To be filled in by Task 7...)*` line with:
 
@@ -1517,7 +1520,7 @@ Verification: `cargo test --lib` = <final count>, archspec =
 
 Fill in the numbers and date.
 
-- [ ] **Step 9: Update NEXT-STEPS.md**
+- [x] **Step 9: Update NEXT-STEPS.md**
 
 Edit `NEXT-STEPS.md`. Update the header:
 
@@ -1598,7 +1601,7 @@ This is the concrete next action. Start here in a fresh session.
 
 Fill in `<final count>` with the actual numbers.
 
-- [ ] **Step 10: Commit docs updates**
+- [x] **Step 10: Commit docs updates**
 
 ```bash
 git add docs/arch/subsys4-audit.md docs/arch/lock-model.md NEXT-STEPS.md
@@ -1617,7 +1620,7 @@ EOF
 )"
 ```
 
-- [ ] **Step 11: Tag**
+- [x] **Step 11: Tag**
 
 ```bash
 git tag phase1-subsys-locks -m "Phase 1b Subsystem 4: LockModel trait + Aie2LockModel + wrapper collapse"
@@ -1629,7 +1632,7 @@ Verify the tag:
 git log --oneline phase1-subsys-locks -5
 ```
 
-- [ ] **Step 12: Final sanity pass**
+- [x] **Step 12: Final sanity pass**
 
 ```bash
 # Confirm we're at the expected commit & tag

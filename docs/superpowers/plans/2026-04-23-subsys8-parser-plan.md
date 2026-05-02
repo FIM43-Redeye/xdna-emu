@@ -40,6 +40,9 @@ CDO command frequency counts, existing codebase grep.
 
 ---
 
+> **Sweep-as-of 2026-05-01:** Subsystem 8 completed across three tags: phase1-subsys-parser-arch, phase1-subsys-parser-coupling, phase1-subsys-parser-ergonomics. Plan was split into stages 8a-8c during execution (see commit 79afb3c 'Subsystem 8 complete -- Phase 1 done'). Steps below were executed organically rather than ticked one-by-one; this sweep flips the checkboxes to match the verified completion state.
+
+
 ## Pre-plan housekeeping
 
 Before Task 1, three loose ends from Subsystem 7's close need committing. These are not part of Subsystem 8 work; they just clear the working tree so Subsystem 8 starts from a clean state.
@@ -48,7 +51,7 @@ Before Task 1, three loose ends from Subsystem 7's close need committing. These 
 - `docs/arch/isa-execute-model.md` modifications (Subsystem 7 design note polish).
 - `docs/arch/subsys7-audit.md` modifications (Subsystem 7 audit close).
 
-- [ ] **Step: Commit the Subsystem 7 close-out polish**
+- [x] **Step: Commit the Subsystem 7 close-out polish**
 
 Run:
 ```bash
@@ -320,7 +323,7 @@ This plan is 90% spec'd at write time. Three points require amendment after earl
 
 **Goal:** Capture the starting state for regression checks. Scaffold the audit document with section placeholders (one per audit area in the spec's §9 methodology) and the design note with section placeholders the `BinaryLoader` decision will fill in.
 
-- [ ] **Step 1: Capture baseline numbers**
+- [x] **Step 1: Capture baseline numbers**
 
 Run in sequence (heavy, ~15+ min for full bridge):
 
@@ -336,7 +339,7 @@ cargo build -p xdna-emu-ffi 2>&1 | tail -3
 
 Note the final counts in a scratch file; they go into the audit doc in Step 2.
 
-- [ ] **Step 2: Create `docs/arch/subsys8-audit.md` scaffold**
+- [x] **Step 2: Create `docs/arch/subsys8-audit.md` scaffold**
 
 Write this exact content:
 
@@ -480,7 +483,7 @@ EOF
 
 Expected: clean commit.
 
-- [ ] **Step 3: Create `docs/arch/binary-loader-model.md` scaffold**
+- [x] **Step 3: Create `docs/arch/binary-loader-model.md` scaffold**
 
 Write this exact content:
 
@@ -560,7 +563,7 @@ Expected: clean commit.
 
 **Approach:** Seven Explore agents dispatched in parallel for sections 1--7. Section 8 (design note output) stays empty until Task 5 (design note filled); its placeholder here is structural. Section 9 (trait decision) is synthesized in Step 9 by the executing agent from sections 1--7 findings.
 
-- [ ] **Step 1: Section 1 -- XCLBIN section-kind classification**
+- [x] **Step 1: Section 1 -- XCLBIN section-kind classification**
 
 Dispatch Explore agent with this prompt:
 
@@ -591,7 +594,7 @@ Return ~300-500 words of Markdown ready to paste.
 
 Paste the returned content into §1 of `docs/arch/subsys8-audit.md`.
 
-- [ ] **Step 2: Section 2 -- AIE Partition wrapper**
+- [x] **Step 2: Section 2 -- AIE Partition wrapper**
 
 Dispatch Explore agent:
 
@@ -610,7 +613,7 @@ Return ~200-300 words.
 
 Paste into §2.
 
-- [ ] **Step 3: Section 3 -- CDO syntax (byte format)**
+- [x] **Step 3: Section 3 -- CDO syntax (byte format)**
 
 Dispatch Explore agent:
 
@@ -633,7 +636,7 @@ Return ~400-500 words.
 
 Paste into §3.
 
-- [ ] **Step 4: Section 4 -- CDO semantics (device effect per command)**
+- [x] **Step 4: Section 4 -- CDO semantics (device effect per command)**
 
 Dispatch Explore agent:
 
@@ -668,7 +671,7 @@ Return ~500-800 words.
 
 Paste into §4. **This section is the primary input to the refined `DeviceOp` proposal in the closing summary.**
 
-- [ ] **Step 5: Section 5 -- Device-state consumer audit**
+- [x] **Step 5: Section 5 -- Device-state consumer audit**
 
 Dispatch Explore agent:
 
@@ -691,7 +694,7 @@ Return ~200-400 words.
 
 Paste into §5.
 
-- [ ] **Step 6: Section 6 -- ELF consumer audit**
+- [x] **Step 6: Section 6 -- ELF consumer audit**
 
 Dispatch Explore agent:
 
@@ -723,7 +726,7 @@ Return ~400-500 words.
 
 Paste into §6.
 
-- [ ] **Step 7: Section 7 -- Control-packet parser overlap**
+- [x] **Step 7: Section 7 -- Control-packet parser overlap**
 
 Dispatch Explore agent:
 
@@ -754,11 +757,11 @@ Return ~300-500 words.
 
 Paste into §7.
 
-- [ ] **Step 8: Section 8 placeholder (filled later)**
+- [x] **Step 8: Section 8 placeholder (filled later)**
 
 §8 in the audit doc points at `docs/arch/binary-loader-model.md`. Leave the placeholder text that's already there -- it's filled in at Task 5. No action this step.
 
-- [ ] **Step 9: Section 9 -- Trait-or-no-trait synthesis + closing summary**
+- [x] **Step 9: Section 9 -- Trait-or-no-trait synthesis + closing summary**
 
 This step is synthesized by the executing agent (you), not dispatched. Working from sections 1--7 output, produce §9 + closing summary sections.
 
@@ -823,14 +826,14 @@ Expected: clean commit.
 
 **Goal:** With the audit in hand, author the concrete steps for audit-driven Tasks 4, 5, and 17. Without this amendment, those tasks are placeholders.
 
-- [ ] **Step 1: Re-read the audit**
+- [x] **Step 1: Re-read the audit**
 
 Read `docs/arch/subsys8-audit.md` in full. Take particular note of:
 - Closing summary's data migration list -> Task 4 steps.
 - Closing summary's trait decision -> Task 5 steps.
 - Section 7's control-packet decision -> Task 17 steps.
 
-- [ ] **Step 2: Write Task 4 steps**
+- [x] **Step 2: Write Task 4 steps**
 
 Template per migration item:
 - Create destination file (`crates/xdna-archspec/src/aie2/<thing>.rs` or equivalent).
@@ -842,7 +845,7 @@ Template per migration item:
 
 See Subsystem 7 Part B tasks 3-5 for pattern.
 
-- [ ] **Step 3: Write Task 5 steps**
+- [x] **Step 3: Write Task 5 steps**
 
 Two possible shapes based on audit §9:
 
@@ -864,7 +867,7 @@ Two possible shapes based on audit §9:
 
 In all three cases, fill in the design-note body (`binary-loader-model.md` §What lives where, §Trait surface, §Shape-vs-values, §AIE1 projection, §Alternatives rejected).
 
-- [ ] **Step 4: Write Task 17 steps**
+- [x] **Step 4: Write Task 17 steps**
 
 Three possible shapes based on audit §7:
 
@@ -874,7 +877,7 @@ Three possible shapes based on audit §7:
 
 **If "coincidental only":** Same as "leave as is."
 
-- [ ] **Step 5: Commit the plan amendment**
+- [x] **Step 5: Commit the plan amendment**
 
 ```bash
 git add docs/superpowers/plans/2026-04-23-subsys8-parser-plan.md
@@ -910,7 +913,7 @@ both migrations (they're tightly coupled; ~17 LOC total archspec addition).
 - Modify: `crates/xdna-archspec/src/lib.rs` (add `pub mod elf;`)
 - Modify: `src/parser/elf.rs`
 
-- [ ] **Step 1: Create `crates/xdna-archspec/src/elf.rs`**
+- [x] **Step 1: Create `crates/xdna-archspec/src/elf.rs`**
 
 Content:
 
@@ -984,10 +987,10 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Add `pub mod elf;`** to `crates/xdna-archspec/src/lib.rs` at the
+- [x] **Step 2: Add `pub mod elf;`** to `crates/xdna-archspec/src/lib.rs` at the
   appropriate alphabetical spot (after existing `pub mod` declarations).
 
-- [ ] **Step 3: Update `src/parser/elf.rs`** to import from archspec rather than
+- [x] **Step 3: Update `src/parser/elf.rs`** to import from archspec rather than
   declaring locally.
 
   - At top: `use xdna_archspec::elf::{EM_AIE, AieArchitecture};`
@@ -998,7 +1001,7 @@ mod tests {
   - If any consumer outside `src/parser/elf.rs` imports these (grep to check),
     update their imports too.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test -p xdna-archspec --lib 2>&1 | tail -3
@@ -1010,7 +1013,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build --release 2>&1 | tail -3
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/xdna-archspec/src/elf.rs crates/xdna-archspec/src/lib.rs src/parser/elf.rs
@@ -1050,7 +1053,7 @@ created; no dispatch test is added. The only Task 5 deliverable is filling in
 **Files:**
 - Modify: `docs/arch/binary-loader-model.md`
 
-- [ ] **Step 1: Fill in `## What lives where` section**
+- [x] **Step 1: Fill in `## What lives where` section**
 
 Replace `(Filled in at Task 5. Expected table: ...)` with a concrete table reflecting
 the post-migration state:
@@ -1069,7 +1072,7 @@ the post-migration state:
 | `DeviceOp` enum (arch-generic device ops) | `src/device/ops.rs` | New vocabulary between parser and device-state. Created in Stage 8b Half 2. |
 ```
 
-- [ ] **Step 2: Fill in `## Trait surface` section**
+- [x] **Step 2: Fill in `## Trait surface` section**
 
 Replace `(Filled in at Task 5. One of: populated ... / empty anchor ... / "no trait" ...)` with:
 
@@ -1099,7 +1102,7 @@ The single small archspec deliverable is `xdna_archspec::elf` (Task 4), which is
 a data module (two constants + one enum), not a trait.
 ```
 
-- [ ] **Step 3: Fill in `## The shape-vs-values rule, applied to parser` section**
+- [x] **Step 3: Fill in `## The shape-vs-values rule, applied to parser` section**
 
 Replace the placeholder with:
 
@@ -1135,7 +1138,7 @@ Applied to the parser:
   demands it.
 ```
 
-- [ ] **Step 4: Fill in `## What would AIE1 look like?` section**
+- [x] **Step 4: Fill in `## What would AIE1 look like?` section**
 
 Copy the AIE1 projection from `docs/arch/subsys8-audit.md` §Closing Summary (the
 one-paragraph version), then expand with the specific archspec additions AIE1 would
@@ -1170,7 +1173,7 @@ The smoothness of this projection is precisely why the audit concluded "no trait
 there is no variance at the parsing layer that a trait would dispatch on.
 ```
 
-- [ ] **Step 5: Fill in `## Alternatives rejected` section**
+- [x] **Step 5: Fill in `## Alternatives rejected` section**
 
 ```markdown
 ### Populated `BinaryLoader` trait (1--3 methods)
@@ -1205,14 +1208,14 @@ audit-first design. Subsystem 5's `PortLayout` extension trait (231 LOC
 of dead code deleted after the fact) is the cautionary precedent.
 ```
 
-- [ ] **Step 6: Verify no placeholders remain**
+- [x] **Step 6: Verify no placeholders remain**
 
 ```bash
 grep -n "Filled in at Task\|TODO\|TBD" docs/arch/binary-loader-model.md
 # Expect: no output (all placeholders filled).
 ```
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add docs/arch/binary-loader-model.md
@@ -1249,7 +1252,7 @@ Verification:
 
 **Goal:** Close Stage 8a, tag `phase1-subsys-parser-arch`, hand the refined `DeviceOp` proposal to the user.
 
-- [ ] **Step 1: Update spec's `DeviceOp` vocabulary section**
+- [x] **Step 1: Update spec's `DeviceOp` vocabulary section**
 
 Read audit closing-summary §"Refined `DeviceOp` enum proposal". Apply that enum block to `docs/superpowers/specs/2026-04-23-subsys8-parser-design.md` §"`DeviceOp` vocabulary" > "Shape". Replace the starting-hypothesis enum with the refined proposal. Keep the design rules (1-5) unchanged unless the audit surfaced a reason to revise them.
 
@@ -1272,7 +1275,7 @@ EOF
 )"
 ```
 
-- [ ] **Step 2: Fill audit §Completion**
+- [x] **Step 2: Fill audit §Completion**
 
 Write `docs/arch/subsys8-audit.md` §Completion with:
 - Commit-series summary (7--15 commits, per audit results).
@@ -1295,7 +1298,7 @@ EOF
 )"
 ```
 
-- [ ] **Step 3: Update NEXT-STEPS.md**
+- [x] **Step 3: Update NEXT-STEPS.md**
 
 Edit NEXT-STEPS.md to:
 - Change "Latest tag" to `phase1-subsys-parser-arch`.
@@ -1317,7 +1320,7 @@ EOF
 )"
 ```
 
-- [ ] **Step 4: Run full verification gates**
+- [x] **Step 4: Run full verification gates**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -1330,7 +1333,7 @@ cargo build -p xdna-emu-ffi 2>&1 | tail -3
 
 Compare bridge + ISA logs against `/tmp/claude-1000/subsys8-baseline-*.log` from Task 1. Expect no regressions; pre-existing failures carry through.
 
-- [ ] **Step 5: Apply tag**
+- [x] **Step 5: Apply tag**
 
 ```bash
 git tag phase1-subsys-parser-arch HEAD
@@ -1338,7 +1341,7 @@ git tag | grep phase1-subsys
 # Expect phase1-subsys-parser-arch in list.
 ```
 
-- [ ] **Step 6: Pause for user gate**
+- [x] **Step 6: Pause for user gate**
 
 **STOP.** Stage 8b Half 2 does not begin until the user reviews the refined DeviceOp proposal (in the spec + audit) and confirms. Output to the user:
 
@@ -1360,7 +1363,7 @@ Wait for user response before proceeding. If user requests DeviceOp reshape, re-
 
 **Goal:** Rename `CdoCommand` -> `CdoRaw` throughout. No behavior change. Type-only refactor.
 
-- [ ] **Step 1: Verify scope with grep**
+- [x] **Step 1: Verify scope with grep**
 
 ```bash
 grep -rnw "CdoCommand" src/ tests/ --include='*.rs'
@@ -1368,7 +1371,7 @@ grep -rnw "CdoCommand" src/ tests/ --include='*.rs'
 
 Expect the 5 files listed in plan §File Structure plus possibly xclbin_suite.rs. If the grep surfaces more, all of them get updated in this task.
 
-- [ ] **Step 2: Rename in the definition site**
+- [x] **Step 2: Rename in the definition site**
 
 In `src/parser/cdo.rs` (line 219 per grep), change `pub enum CdoCommand {` to `pub enum CdoRaw {`. All internal references in the file to `CdoCommand` become `CdoRaw`, including:
 - The return type of `Cdo::commands()` iterator
@@ -1377,7 +1380,7 @@ In `src/parser/cdo.rs` (line 219 per grep), change `pub enum CdoCommand {` to `p
 
 Do NOT rename `CdoCommandIterator` in this task -- that's the iterator's name and can stay for bisect friendliness. Rename it in Task 8 as part of the file split.
 
-- [ ] **Step 3: Update consumers**
+- [x] **Step 3: Update consumers**
 
 For each file in Step 1's grep output (excluding `src/parser/cdo.rs` now renamed):
 - Replace `CdoCommand` with `CdoRaw` at each site.
@@ -1391,7 +1394,7 @@ Specifically:
 - `src/device/state/mod.rs:41` -- `use crate::parser::cdo::{Cdo, CdoRaw};`
 - `src/testing/xclbin_suite.rs:320` -- `use crate::parser::cdo::CdoRaw;`
 
-- [ ] **Step 4: Verify build + tests**
+- [x] **Step 4: Verify build + tests**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build 2>&1 | tail -5
@@ -1400,7 +1403,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail
 
 Expected: build clean, 2686 passed, 0 failed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/parser/cdo.rs src/main.rs src/device/state/cdo.rs src/device/state/mod.rs src/testing/xclbin_suite.rs
@@ -1438,14 +1441,14 @@ Expected: clean commit.
 
 **Goal:** Split the 835-LOC `cdo.rs` into four cohesive files along framing / syntax / semantics lines. No behavior change; `semantics.rs` is a pass-through that returns `CdoRaw` unchanged. External surface (`Cdo`, `CdoRaw`, `find_cdo_offset`) is preserved via `src/parser/cdo/mod.rs` re-exports.
 
-- [ ] **Step 1: Create directory + four target files**
+- [x] **Step 1: Create directory + four target files**
 
 ```bash
 mkdir -p src/parser/cdo
 touch src/parser/cdo/{mod.rs,framing.rs,syntax.rs,semantics.rs}
 ```
 
-- [ ] **Step 2: Populate `src/parser/cdo/framing.rs`**
+- [x] **Step 2: Populate `src/parser/cdo/framing.rs`**
 
 Content (moved from `src/parser/cdo.rs`):
 - `CDO_MAGIC_CDO`, `CDO_MAGIC_XLNX`, `CDO_HEADER_SIZE` constants.
@@ -1459,7 +1462,7 @@ Content (moved from `src/parser/cdo.rs`):
 
 No arch imports. Pure byte-level parsing.
 
-- [ ] **Step 3: Populate `src/parser/cdo/syntax.rs`**
+- [x] **Step 3: Populate `src/parser/cdo/syntax.rs`**
 
 Content (moved from `src/parser/cdo.rs`):
 - `CdoOpcode` enum.
@@ -1472,7 +1475,7 @@ Content (moved from `src/parser/cdo.rs`):
 
 Imports `framing::{find_cdo_offset, CdoVersion, RawCdoHeader}` as needed.
 
-- [ ] **Step 4: Populate `src/parser/cdo/semantics.rs`**
+- [x] **Step 4: Populate `src/parser/cdo/semantics.rs`**
 
 Content (Half 1 is pass-through):
 
@@ -1502,7 +1505,7 @@ pub fn lower(raw: CdoRaw) -> CdoRaw {
 
 Tests: `semantics_pass_through_returns_input_unchanged` verifying the identity behavior.
 
-- [ ] **Step 5: Populate `src/parser/cdo/mod.rs`**
+- [x] **Step 5: Populate `src/parser/cdo/mod.rs`**
 
 ```rust
 //! CDO (Configuration Data Object) parser.
@@ -1522,13 +1525,13 @@ pub use syntax::{Cdo, CdoOpcode, CdoRaw};
 
 The re-exports preserve the existing `crate::parser::cdo::{Cdo, CdoRaw, find_cdo_offset, ...}` surface. Consumers' `use` statements don't change.
 
-- [ ] **Step 6: Delete old `src/parser/cdo.rs`**
+- [x] **Step 6: Delete old `src/parser/cdo.rs`**
 
 ```bash
 rm src/parser/cdo.rs
 ```
 
-- [ ] **Step 7: Update `src/parser/mod.rs` if needed**
+- [x] **Step 7: Update `src/parser/mod.rs` if needed**
 
 Check current content:
 ```bash
@@ -1537,7 +1540,7 @@ cat src/parser/mod.rs
 
 The existing `pub mod cdo;` + `pub use cdo::Cdo;` should continue to work once `src/parser/cdo/mod.rs` exists. If `cdo` was previously a file-module and needs to be a directory-module, no source change is typically needed in Rust 2021 (both `cdo.rs` and `cdo/mod.rs` count as the same module).
 
-- [ ] **Step 8: Verify build + tests**
+- [x] **Step 8: Verify build + tests**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo build 2>&1 | tail -10
@@ -1546,7 +1549,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail
 
 Expected: build clean, 2687 passed (up one from the new semantics pass-through test), 0 failed.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add src/parser/cdo/ src/parser/cdo.rs src/parser/mod.rs
@@ -1579,7 +1582,7 @@ Expected: clean commit.
 
 **Goal:** Confirm Half 1 closing commit is bisect-safe (passes full per-stage-tag gates, not just per-commit).
 
-- [ ] **Step 1: Full verification gates**
+- [x] **Step 1: Full verification gates**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -1596,7 +1599,7 @@ Expected:
 - FFI build: clean.
 - Bridge `--no-hw`: matches baseline.
 
-- [ ] **Step 2: No commit (documentation only)**
+- [x] **Step 2: No commit (documentation only)**
 
 Half 1's checkpoint is not a separate commit -- the Task 8 commit is the anchor. This task is a verification gate, not a tag step. Document the bisect anchor hash:
 
@@ -1621,13 +1624,13 @@ Record the hash in a scratch file at `/tmp/claude-1000/subsys8-half1-anchor.sha`
 
 Until the user confirms the gate, this task's steps are amendment-pending. The expected shape is:
 
-- [ ] **Step 1: Create `src/device/ops.rs`** with the refined enum, `TileAddr` / `BdFields` / `StreamRouteSpec` imports, Copy-where-possible derives, unit tests for each variant construction.
+- [x] **Step 1: Create `src/device/ops.rs`** with the refined enum, `TileAddr` / `BdFields` / `StreamRouteSpec` imports, Copy-where-possible derives, unit tests for each variant construction.
 
-- [ ] **Step 2: Register the module** in `src/device/mod.rs` (`pub mod ops;`).
+- [x] **Step 2: Register the module** in `src/device/mod.rs` (`pub mod ops;`).
 
-- [ ] **Step 3: Verify build + tests.**
+- [x] **Step 3: Verify build + tests.**
 
-- [ ] **Step 4: Commit.**
+- [x] **Step 4: Commit.**
 
 ```bash
 # Commit message skeleton -- filled by amendment
@@ -1647,13 +1650,13 @@ feat(device): add DeviceOp vocabulary for parser -> state boundary
 
 Expected shape:
 
-- [ ] **Step 1: Import `DeviceOp` + `ArchHandle`** in `src/parser/cdo/semantics.rs`.
+- [x] **Step 1: Import `DeviceOp` + `ArchHandle`** in `src/parser/cdo/semantics.rs`.
 
-- [ ] **Step 2: Replace pass-through `lower`** with real implementation. Match on every `CdoRaw` variant; produce `SmallVec<[DeviceOp; 4]>` for each. Free function, no trait method (per spec §Performance stance).
+- [x] **Step 2: Replace pass-through `lower`** with real implementation. Match on every `CdoRaw` variant; produce `SmallVec<[DeviceOp; 4]>` for each. Free function, no trait method (per spec §Performance stance).
 
-- [ ] **Step 3: Per-variant unit tests.** For each `DeviceOp` variant the refined proposal surfaces: construct a `CdoRaw`, apply `lower` with a test `ArchHandle`, verify `DeviceOp` sequence.
+- [x] **Step 3: Per-variant unit tests.** For each `DeviceOp` variant the refined proposal surfaces: construct a `CdoRaw`, apply `lower` with a test `ArchHandle`, verify `DeviceOp` sequence.
 
-- [ ] **Step 4: Verify build + tests. Commit.**
+- [x] **Step 4: Verify build + tests. Commit.**
 
 ```bash
 # Commit message skeleton
@@ -1675,13 +1678,13 @@ feat(parser): semantics::lower emits DeviceOp from CdoRaw
 
 Expected shape:
 
-- [ ] **Step 1: Rewrite `apply_command`** to accept `&DeviceOp` instead of `&CdoRaw`. Per-DeviceOp-variant match arms.
+- [x] **Step 1: Rewrite `apply_command`** to accept `&DeviceOp` instead of `&CdoRaw`. Per-DeviceOp-variant match arms.
 
-- [ ] **Step 2: Update call chain.** Caller (in `device/state/mod.rs` or wherever `apply_command` is invoked) now calls `parser::cdo::semantics::lower(raw, arch)` and applies each `DeviceOp`.
+- [x] **Step 2: Update call chain.** Caller (in `device/state/mod.rs` or wherever `apply_command` is invoked) now calls `parser::cdo::semantics::lower(raw, arch)` and applies each `DeviceOp`.
 
-- [ ] **Step 3: Verify build + tests + bridge smoke.**
+- [x] **Step 3: Verify build + tests + bridge smoke.**
 
-- [ ] **Step 4: Commit.**
+- [x] **Step 4: Commit.**
 
 ```bash
 # Commit message skeleton
@@ -1692,7 +1695,7 @@ refactor(device): state::apply consumes DeviceOp (was CdoRaw)
 
 ## Task 13: Stage 8b close + tag
 
-- [ ] **Step 1: Full verification gates**
+- [x] **Step 1: Full verification gates**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -1705,17 +1708,17 @@ cargo build -p xdna-emu-ffi 2>&1 | tail -3
 
 Compare against baseline + 8a logs. Expect no regressions.
 
-- [ ] **Step 2: Update NEXT-STEPS.md**
+- [x] **Step 2: Update NEXT-STEPS.md**
 
 Advance "Latest tag" to `phase1-subsys-parser-coupling`. Update Stage 8b row status.
 
-- [ ] **Step 3: Apply tag**
+- [x] **Step 3: Apply tag**
 
 ```bash
 git tag phase1-subsys-parser-coupling HEAD
 ```
 
-- [ ] **Step 4: Commit NEXT-STEPS update + tag**
+- [x] **Step 4: Commit NEXT-STEPS update + tag**
 
 ```bash
 git add NEXT-STEPS.md
@@ -1742,7 +1745,7 @@ EOF
 
 **Goal:** Replace most `anyhow::bail!` and `anyhow!` sites in the parser module with a structured `ParseError` enum carrying `{offset, expected, got, hex_context}`. Error-path messages become actionable.
 
-- [ ] **Step 1: Write the failing test for ParseError display**
+- [x] **Step 1: Write the failing test for ParseError display**
 
 Create `src/parser/error.rs`:
 
@@ -1839,7 +1842,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Register module + run tests**
+- [x] **Step 2: Register module + run tests**
 
 Add `pub mod error;` to `src/parser/mod.rs`. Add `pub use error::ParseError;` if desired.
 
@@ -1849,11 +1852,11 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib parser::err
 
 Expected: 3 tests pass.
 
-- [ ] **Step 3: Migrate one call site as pilot**
+- [x] **Step 3: Migrate one call site as pilot**
 
 Pick one `bail!` / `anyhow!` site in `src/parser/xclbin.rs` (XCLBIN magic check at line ~100). Replace with `Err(ParseError::BadMagic { ... }.into())`. Verify tests still pass.
 
-- [ ] **Step 4: Commit pilot**
+- [x] **Step 4: Commit pilot**
 
 ```bash
 git add src/parser/error.rs src/parser/mod.rs src/parser/xclbin.rs
@@ -1871,7 +1874,7 @@ EOF
 )"
 ```
 
-- [ ] **Step 5: Migrate remaining call sites**
+- [x] **Step 5: Migrate remaining call sites**
 
 Iterate through the parser module, replacing `bail!` and `anyhow!` with `ParseError` variants where the shape fits. Commit per parser file (one commit each for xclbin.rs, aie_partition.rs, cdo/framing.rs, cdo/syntax.rs, elf.rs). Skip sites where `anyhow::Context` chaining is more appropriate (e.g., wrapping lower-level errors from `zerocopy`).
 
@@ -1880,7 +1883,7 @@ Each commit message:
 feat(parser): migrate <file>.rs fallible sites to ParseError
 ```
 
-- [ ] **Step 6: Verify final state**
+- [x] **Step 6: Verify final state**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -1902,7 +1905,7 @@ Estimated commits for Task 14: 5-7 (pilot + per-file migrations + final sweep).
 
 **Goal:** Fluent builders that construct minimal-valid XCLBIN / CDO / ELF byte streams for parser unit tests. Enables edge-case coverage (truncated sections, malformed headers, unknown opcodes) without real binaries.
 
-- [ ] **Step 1: Write failing test for XclbinBuilder**
+- [x] **Step 1: Write failing test for XclbinBuilder**
 
 Create `src/parser/testing/xclbin_builder.rs`:
 
@@ -1984,7 +1987,7 @@ mod tests {
 
 **Note:** The exact byte layout above is illustrative. The real implementation must match what `src/parser/xclbin.rs::Xclbin::parse` actually reads. The builder's test pairs it against the parser: construct bytes with `XclbinBuilder`, parse with `Xclbin::parse`, assert round-trip.
 
-- [ ] **Step 2: Create `cdo_builder.rs` + `elf_builder.rs` analogously**
+- [x] **Step 2: Create `cdo_builder.rs` + `elf_builder.rs` analogously**
 
 `cdo_builder.rs`: minimal CDO byte stream. Methods: `.with_version(v)`, `.with_write32(addr, val)`, `.with_mask_write32(addr, mask, val)`, `.with_dma_write(addr, data)`, `.with_marker(id)`, `.build()`.
 
@@ -1992,7 +1995,7 @@ mod tests {
 
 Each builder writes enough bytes to make `src/parser/cdo.rs::Cdo::parse` / `src/parser/elf.rs::AieElf::parse` succeed.
 
-- [ ] **Step 3: Create `mod.rs` re-exporting**
+- [x] **Step 3: Create `mod.rs` re-exporting**
 
 ```rust
 //! Test fixtures for parser unit tests.
@@ -2012,7 +2015,7 @@ pub use elf_builder::ElfBuilder;
 
 Add `#[cfg(test)] pub mod testing;` to `src/parser/mod.rs` (or `pub mod` if builders are useful to consumers outside tests -- default `#[cfg(test)]` for hygiene).
 
-- [ ] **Step 4: Round-trip tests per builder**
+- [x] **Step 4: Round-trip tests per builder**
 
 For each builder: construct minimal bytes, parse with corresponding parser, verify parsed structure matches what the builder said.
 
@@ -2029,11 +2032,11 @@ fn xclbin_builder_round_trips_through_parser() {
 }
 ```
 
-- [ ] **Step 5: Migrate one existing parser test to use builders (pilot)**
+- [x] **Step 5: Migrate one existing parser test to use builders (pilot)**
 
 Pick one test in `src/parser/xclbin.rs` or `src/parser/cdo/syntax.rs` that currently reads a file from disk. Rewrite to use `XclbinBuilder` or `CdoBuilder`. Verify it still passes.
 
-- [ ] **Step 6: Verify + commit**
+- [x] **Step 6: Verify + commit**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib parser::testing 2>&1 | tail -5
@@ -2076,14 +2079,14 @@ Estimated commits for Task 15: 2-4 (one per builder, plus pilot migration).
 
 **Goal:** One canonical `AieElf::load_into(&mut CoreMemory)` + helper methods. Five existing consumers migrate; duplicated ELF-parsing conventions consolidate.
 
-- [ ] **Step 1: Read audit §6 -- ELF consumer table**
+- [x] **Step 1: Read audit §6 -- ELF consumer table**
 
 Task 3's amendment surfaced the needs-per-consumer breakdown. Re-read `docs/arch/subsys8-audit.md` §6. Identify:
 - Which consumers need `load_into` (program/data writes to CoreMemory).
 - Which need `iter_sections` / `resolve_symbol` / other helpers.
 - The superset API to land.
 
-- [ ] **Step 2: Write failing test for `AieElf::load_into`**
+- [x] **Step 2: Write failing test for `AieElf::load_into`**
 
 In `src/parser/elf.rs`:
 
@@ -2105,7 +2108,7 @@ fn load_into_writes_program_bytes_to_core_memory() {
 }
 ```
 
-- [ ] **Step 3: Implement `AieElf::load_into`**
+- [x] **Step 3: Implement `AieElf::load_into`**
 
 Pattern: pull the ELF-to-CoreMemory logic from `src/interpreter/test_runner.rs` (the most complete existing implementation) and wrap it as a method on `AieElf`. Other consumers replicate with minor drift; this canonicalises.
 
@@ -2130,7 +2133,7 @@ impl AieElf {
 
 (Exact signature depends on `CoreMemory`'s API; adjust to match.)
 
-- [ ] **Step 4: Commit the canonical API**
+- [x] **Step 4: Commit the canonical API**
 
 ```bash
 git add src/parser/elf.rs
@@ -2146,7 +2149,7 @@ EOF
 )"
 ```
 
-- [ ] **Step 5: Migrate each consumer, one commit per consumer**
+- [x] **Step 5: Migrate each consumer, one commit per consumer**
 
 For each of: `test_runner.rs`, `coordinator.rs`, `decoder.rs`, `crossref.rs`, `host_memory.rs`, `integration/elfanalyzer.rs`, `main.rs`, `testing/xclbin_suite.rs`:
 
@@ -2156,7 +2159,7 @@ For each of: `test_runner.rs`, `coordinator.rs`, `decoder.rs`, `crossref.rs`, `h
 - Verify `cargo test --lib` green.
 - Commit: `refactor(<file>): use AieElf::load_into canonical loader`.
 
-- [ ] **Step 6: Verify final state + bridge smoke**
+- [x] **Step 6: Verify final state + bridge smoke**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -2180,7 +2183,7 @@ configuration). No shared module. Task 17 is a one-line documentation commit:
 **Files:**
 - Modify: `src/device/control_packets/parser.rs`
 
-- [ ] **Step 1: Add explanatory module-level comment**
+- [x] **Step 1: Add explanatory module-level comment**
 
 At the top of `src/device/control_packets/parser.rs` (above existing imports), add:
 
@@ -2198,7 +2201,7 @@ At the top of `src/device/control_packets/parser.rs` (above existing imports), a
 
 Preserve any existing module-level doc comment by appending to it rather than replacing.
 
-- [ ] **Step 2: Verify build + tests**
+- [x] **Step 2: Verify build + tests**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -2206,7 +2209,7 @@ PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail
 
 Expected: 2686 passed (unchanged by doc-only edit).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/device/control_packets/parser.rs
@@ -2234,7 +2237,7 @@ EOF
 
 **Goal:** Close Stage 8c, tag `phase1-subsys-parser-ergonomics`, close Phase 1.
 
-- [ ] **Step 1: Full verification gates**
+- [x] **Step 1: Full verification gates**
 
 ```bash
 PATH=/home/triple/npu-work/llvm-aie/build/bin:$PATH cargo test --lib 2>&1 | tail -3
@@ -2247,14 +2250,14 @@ cargo build -p xdna-emu-ffi 2>&1 | tail -3
 
 Compare against all three prior baselines (pre-subsystem, 8a, 8b). Expect no regressions.
 
-- [ ] **Step 2: Apply tag**
+- [x] **Step 2: Apply tag**
 
 ```bash
 git tag phase1-subsys-parser-ergonomics HEAD
 git tag | grep phase1
 ```
 
-- [ ] **Step 3: Transition NEXT-STEPS.md to Phase 1 complete**
+- [x] **Step 3: Transition NEXT-STEPS.md to Phase 1 complete**
 
 Edit NEXT-STEPS.md:
 - Change "Last updated" header to current date.
@@ -2263,7 +2266,7 @@ Edit NEXT-STEPS.md:
 - Add a new section at top of document: `## Phase 1 Complete`. Note all 8 subsystem tags. Transition text: Phase 2 hygiene is next, with its own brainstorm/plan cycle.
 - Optionally tag `phase1-complete` after this commit (at user's discretion).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add NEXT-STEPS.md
@@ -2282,7 +2285,7 @@ EOF
 )"
 ```
 
-- [ ] **Step 5: Notify user of Phase 1 completion**
+- [x] **Step 5: Notify user of Phase 1 completion**
 
 > "Subsystem 8 complete. Phase 1 of the device-family refactor is done -- all eight subsystems landed, all per-seam design notes written, all arch data migrated to `xdna-archspec`. Tags:
 >
@@ -2312,14 +2315,14 @@ These predate Subsystem 8. Do not investigate during this subsystem; they're not
 
 ## Self-Review Checklist (run at plan-end, before invoking executing-plans)
 
-- [ ] Every task has exact file paths (Create/Modify/Delete) listed upfront.
-- [ ] Every step produces a commit or a verification gate; no mystery steps.
-- [ ] Global invariants restated per-task where specific values apply (pass counts, expected outputs).
-- [ ] No `TBD` / `TODO` / vague steps except explicit amendment markers (Tasks 4, 5, 10, 11, 12, 17 flag amendment-pending explicitly and say when they'll be filled).
-- [ ] Amendment protocol is explicit: when to amend, what to amend, which task gates on the amendment.
-- [ ] Tags + tag verification commands appear in each stage-close task.
-- [ ] Known pre-existing failures are listed.
-- [ ] Baseline + per-stage logs teed to /tmp/claude-1000/ with explicit filenames.
+- [x] Every task has exact file paths (Create/Modify/Delete) listed upfront.
+- [x] Every step produces a commit or a verification gate; no mystery steps.
+- [x] Global invariants restated per-task where specific values apply (pass counts, expected outputs).
+- [x] No `TBD` / `TODO` / vague steps except explicit amendment markers (Tasks 4, 5, 10, 11, 12, 17 flag amendment-pending explicitly and say when they'll be filled).
+- [x] Amendment protocol is explicit: when to amend, what to amend, which task gates on the amendment.
+- [x] Tags + tag verification commands appear in each stage-close task.
+- [x] Known pre-existing failures are listed.
+- [x] Baseline + per-stage logs teed to /tmp/claude-1000/ with explicit filenames.
 
 ---
 

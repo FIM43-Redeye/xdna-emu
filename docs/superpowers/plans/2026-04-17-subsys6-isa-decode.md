@@ -14,6 +14,9 @@
 
 ---
 
+> **Sweep-as-of 2026-05-01:** Subsystem 6 completed -- tag `phase1-subsys-isa-decode`. Decoder migrated to data-driven TableGen tables; see commits feeding the tag. Steps below were executed organically rather than ticked one-by-one; this sweep flips the checkboxes to match the verified completion state.
+
+
 ## Scope Note
 
 **Part A (Tasks 1-12)** is pure relocation. Bit-identical codegen output at every step. Forwarder blocks (`pub mod arch`, `pub mod tablegen`) keep existing consumers compiling. Any regression in Part A is a missed import or a path mismatch, never a semantic change.
@@ -186,14 +189,14 @@ Record in `docs/arch/subsys6-audit.md` (created in Task 1).
 **Files:**
 - Create: `docs/arch/subsys6-audit.md`
 
-- [ ] **Step 1: Seed the audit doc**
+- [x] **Step 1: Seed the audit doc**
 
 ```bash
 mkdir -p docs/arch
 touch docs/arch/subsys6-audit.md
 ```
 
-- [ ] **Step 2: Capture baseline test numbers**
+- [x] **Step 2: Capture baseline test numbers**
 
 Run and record the output of each:
 
@@ -217,7 +220,7 @@ Append to `docs/arch/subsys6-audit.md`:
 Failures to carry through: `test_full_parse_all_devices` (archspec, pre-existing, device count 13 vs expected 12 -- unrelated).
 ```
 
-- [ ] **Step 3: Enumerate `crate::arch::*` consumers**
+- [x] **Step 3: Enumerate `crate::arch::*` consumers**
 
 ```bash
 rg -l 'crate::arch' src/ examples/ tests/ xrt-plugin/ 2>&1 | sort > /tmp/claude-1000/subsys6-arch-consumers.txt
@@ -226,7 +229,7 @@ wc -l /tmp/claude-1000/subsys6-arch-consumers.txt
 
 Append to audit under `## crate::arch Consumers`. Expected: 36 files under `src/`.
 
-- [ ] **Step 4: Enumerate `crate::tablegen::*` consumers**
+- [x] **Step 4: Enumerate `crate::tablegen::*` consumers**
 
 ```bash
 rg -l 'use crate::tablegen' src/ examples/ tests/ xrt-plugin/ 2>&1 | sort > /tmp/claude-1000/subsys6-tablegen-consumers.txt
@@ -235,7 +238,7 @@ wc -l /tmp/claude-1000/subsys6-tablegen-consumers.txt
 
 Append to audit under `## crate::tablegen Consumers`. Expected: ~25-38 files.
 
-- [ ] **Step 5: Enumerate current `xdna-emu/build.rs` codegen surface**
+- [x] **Step 5: Enumerate current `xdna-emu/build.rs` codegen surface**
 
 ```bash
 rg -n '^fn (gen_|extract_|compile_|run_)' build.rs
@@ -250,7 +253,7 @@ Append to audit under `## xdna-emu/build.rs Surface`. Expected:
 
 Line count expected: ~995.
 
-- [ ] **Step 6: Enumerate `decoder_ffi.rs` split-line location**
+- [x] **Step 6: Enumerate `decoder_ffi.rs` split-line location**
 
 ```bash
 rg -n '^use crate::interpreter' src/tablegen/decoder_ffi.rs
@@ -258,7 +261,7 @@ rg -n '^use crate::interpreter' src/tablegen/decoder_ffi.rs
 
 Append to audit under `## decoder_ffi.rs Split Line`. Expected: line 346 (`use crate::interpreter::bundle::slot::Operand;`). Everything above is pure FFI; everything from 346 onward is interpreter-coupled.
 
-- [ ] **Step 7: Commit the audit**
+- [x] **Step 7: Commit the audit**
 
 ```bash
 git add docs/arch/subsys6-audit.md
@@ -285,7 +288,7 @@ EOF
 - Create: `crates/xdna-archspec/src/aie2/isa/mod.rs`
 - Modify: `crates/xdna-archspec/src/aie2/mod.rs`
 
-- [ ] **Step 1: Create the empty `isa` module**
+- [x] **Step 1: Create the empty `isa` module**
 
 Write `crates/xdna-archspec/src/aie2/isa/mod.rs`:
 
@@ -309,7 +312,7 @@ Write `crates/xdna-archspec/src/aie2/isa/mod.rs`:
 //! `interpreter::decode::register_map`, not here.
 ```
 
-- [ ] **Step 2: Declare `isa` as a submodule of `aie2`**
+- [x] **Step 2: Declare `isa` as a submodule of `aie2`**
 
 Edit `crates/xdna-archspec/src/aie2/mod.rs`. Add at the end of the `pub mod` declarations (after `pub mod port_type { ... }` block):
 
@@ -319,7 +322,7 @@ Edit `crates/xdna-archspec/src/aie2/mod.rs`. Add at the end of the `pub mod` dec
 pub mod isa;
 ```
 
-- [ ] **Step 3: Verify build**
+- [x] **Step 3: Verify build**
 
 ```bash
 cargo build 2>&1 | tail -5
@@ -328,7 +331,7 @@ cargo test -p xdna-archspec --lib 2>&1 | tail -3
 
 Expected: clean build, archspec tests unchanged (138 pass / 1 pre-existing fail).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/xdna-archspec/src/aie2/mod.rs crates/xdna-archspec/src/aie2/isa/mod.rs
@@ -355,13 +358,13 @@ EOF
 - Modify: `src/tablegen/mod.rs`
 - Modify: `crates/xdna-archspec/src/aie2/isa/mod.rs`
 
-- [ ] **Step 1: Copy `types.rs` to archspec**
+- [x] **Step 1: Copy `types.rs` to archspec**
 
 ```bash
 cp src/tablegen/types.rs crates/xdna-archspec/src/aie2/isa/types.rs
 ```
 
-- [ ] **Step 2: Declare it in `isa/mod.rs`**
+- [x] **Step 2: Declare it in `isa/mod.rs`**
 
 Edit `crates/xdna-archspec/src/aie2/isa/mod.rs`. Add after the docstring:
 
@@ -370,7 +373,7 @@ pub mod types;
 pub use types::*;
 ```
 
-- [ ] **Step 3: Verify archspec builds**
+- [x] **Step 3: Verify archspec builds**
 
 ```bash
 cargo build -p xdna-archspec 2>&1 | tail -5
@@ -379,7 +382,7 @@ cargo test -p xdna-archspec --lib 2>&1 | tail -3
 
 Expected: clean; archspec tests still 138/1.
 
-- [ ] **Step 4: Replace xdna-emu's `types.rs` with a forwarder**
+- [x] **Step 4: Replace xdna-emu's `types.rs` with a forwarder**
 
 Overwrite `src/tablegen/types.rs` with:
 
@@ -391,7 +394,7 @@ Overwrite `src/tablegen/types.rs` with:
 pub use xdna_archspec::aie2::isa::types::*;
 ```
 
-- [ ] **Step 5: Verify xdna-emu builds and tests pass**
+- [x] **Step 5: Verify xdna-emu builds and tests pass**
 
 ```bash
 cargo build 2>&1 | tail -5
@@ -400,7 +403,7 @@ cargo test --lib 2>&1 | tail -3
 
 Expected: clean build, 2797 passed / 0 failed / 5 ignored.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/xdna-archspec/src/aie2/isa/mod.rs crates/xdna-archspec/src/aie2/isa/types.rs src/tablegen/types.rs
@@ -429,7 +432,7 @@ EOF
 - Modify: `src/tablegen/mod.rs`
 - Modify: `crates/xdna-archspec/src/aie2/isa/mod.rs`
 
-- [ ] **Step 1: Copy the resolver/ subtree to archspec**
+- [x] **Step 1: Copy the resolver/ subtree to archspec**
 
 ```bash
 mkdir -p crates/xdna-archspec/src/aie2/isa/resolver
@@ -438,7 +441,7 @@ cp src/tablegen/resolver/operand_classification.rs crates/xdna-archspec/src/aie2
 cp src/tablegen/resolver/semantic_inference.rs crates/xdna-archspec/src/aie2/isa/resolver/semantic_inference.rs
 ```
 
-- [ ] **Step 2: Declare it in `isa/mod.rs`**
+- [x] **Step 2: Declare it in `isa/mod.rs`**
 
 Edit `crates/xdna-archspec/src/aie2/isa/mod.rs`. Add after the `pub mod types;` line:
 
@@ -453,7 +456,7 @@ pub use resolver::{
 };
 ```
 
-- [ ] **Step 3: Verify archspec builds**
+- [x] **Step 3: Verify archspec builds**
 
 ```bash
 cargo build -p xdna-archspec 2>&1 | tail -5
@@ -462,7 +465,7 @@ cargo test -p xdna-archspec --lib 2>&1 | tail -3
 
 Expected: clean; archspec tests still 138/1.
 
-- [ ] **Step 4: Replace xdna-emu's resolver with forwarder directory**
+- [x] **Step 4: Replace xdna-emu's resolver with forwarder directory**
 
 First delete old files:
 
@@ -481,7 +484,7 @@ Write `src/tablegen/resolver/mod.rs`:
 pub use xdna_archspec::aie2::isa::resolver::*;
 ```
 
-- [ ] **Step 5: Verify xdna-emu builds and tests pass**
+- [x] **Step 5: Verify xdna-emu builds and tests pass**
 
 ```bash
 cargo build 2>&1 | tail -5
@@ -490,7 +493,7 @@ cargo test --lib 2>&1 | tail -3
 
 Expected: clean build, 2797 passed.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/xdna-archspec/src/aie2/isa/resolver crates/xdna-archspec/src/aie2/isa/mod.rs src/tablegen/resolver
@@ -518,13 +521,13 @@ EOF
 - Modify: `src/tablegen/mod.rs`
 - Modify: `crates/xdna-archspec/src/aie2/isa/mod.rs`
 
-- [ ] **Step 1: Copy to archspec**
+- [x] **Step 1: Copy to archspec**
 
 ```bash
 cp src/tablegen/decoder_bytecode.rs crates/xdna-archspec/src/aie2/isa/decoder_bytecode.rs
 ```
 
-- [ ] **Step 2: Declare it in `isa/mod.rs`**
+- [x] **Step 2: Declare it in `isa/mod.rs`**
 
 Edit `crates/xdna-archspec/src/aie2/isa/mod.rs`. Add:
 
@@ -532,7 +535,7 @@ Edit `crates/xdna-archspec/src/aie2/isa/mod.rs`. Add:
 pub mod decoder_bytecode;
 ```
 
-- [ ] **Step 3: Verify archspec builds**
+- [x] **Step 3: Verify archspec builds**
 
 ```bash
 cargo build -p xdna-archspec 2>&1 | tail -5
@@ -541,7 +544,7 @@ cargo test -p xdna-archspec --lib 2>&1 | tail -3
 
 Expected: clean; archspec tests still 138/1.
 
-- [ ] **Step 4: Replace xdna-emu's file with forwarder**
+- [x] **Step 4: Replace xdna-emu's file with forwarder**
 
 Overwrite `src/tablegen/decoder_bytecode.rs`:
 
@@ -553,7 +556,7 @@ Overwrite `src/tablegen/decoder_bytecode.rs`:
 pub use xdna_archspec::aie2::isa::decoder_bytecode::*;
 ```
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 ```bash
 cargo build 2>&1 | tail -5
@@ -562,7 +565,7 @@ cargo test --lib 2>&1 | tail -3
 
 Expected: clean, 2797 passed.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/xdna-archspec/src/aie2/isa/decoder_bytecode.rs crates/xdna-archspec/src/aie2/isa/mod.rs src/tablegen/decoder_bytecode.rs
@@ -590,19 +593,19 @@ EOF
 - Modify: `crates/xdna-archspec/src/aie2/isa/mod.rs`
 - Modify: `src/tablegen/mod.rs` (remove `#[path = "../../build_helpers/element_type_logic.rs"]` include)
 
-- [ ] **Step 1: Move build_helpers directory**
+- [x] **Step 1: Move build_helpers directory**
 
 ```bash
 git mv build_helpers crates/xdna-archspec/build_helpers
 ```
 
-- [ ] **Step 2: Copy element_type_logic.rs into isa/ for runtime use**
+- [x] **Step 2: Copy element_type_logic.rs into isa/ for runtime use**
 
 ```bash
 cp crates/xdna-archspec/build_helpers/element_type_logic.rs crates/xdna-archspec/src/aie2/isa/element_type_logic.rs
 ```
 
-- [ ] **Step 3: Declare `element_type_logic` in `isa/mod.rs`**
+- [x] **Step 3: Declare `element_type_logic` in `isa/mod.rs`**
 
 Edit `crates/xdna-archspec/src/aie2/isa/mod.rs`. Add:
 
@@ -610,7 +613,7 @@ Edit `crates/xdna-archspec/src/aie2/isa/mod.rs`. Add:
 pub mod element_type_logic;
 ```
 
-- [ ] **Step 4: Leave codegen string paths alone**
+- [x] **Step 4: Leave codegen string paths alone**
 
 The emitted `use super::super::types::*;` and `use super::super::resolver::*;`
 strings in `crates/xdna-archspec/build_helpers/codegen.rs` must stay
@@ -624,7 +627,7 @@ and simultaneously updates these strings to `super::types::*` /
 `super::resolver::*` (one level less). Updating them here would break
 xdna-emu's build until Task 7 lands.
 
-- [ ] **Step 5: Remove `#[path]`-include of element_type_logic from xdna-emu's tablegen**
+- [x] **Step 5: Remove `#[path]`-include of element_type_logic from xdna-emu's tablegen**
 
 Edit `src/tablegen/mod.rs`. Find:
 
@@ -638,7 +641,7 @@ mod element_type_logic;
 
 Delete that block (4 lines including comments).
 
-- [ ] **Step 6: Verify archspec's element_type_logic wires into resolver**
+- [x] **Step 6: Verify archspec's element_type_logic wires into resolver**
 
 Archspec's `resolver/semantic_inference.rs` uses `use super::super::element_type_logic::*;` (or similar). Check:
 
@@ -648,7 +651,7 @@ rg -n 'element_type_logic' crates/xdna-archspec/src/aie2/isa/
 
 If any import path is wrong post-move, fix it. The path from `resolver/semantic_inference.rs` up to `isa/element_type_logic.rs` is `super::super::element_type_logic`.
 
-- [ ] **Step 7: Do not yet wire build_helpers into archspec's build.rs**
+- [x] **Step 7: Do not yet wire build_helpers into archspec's build.rs**
 
 Archspec's build.rs still has no TableGen block. Task 7 adds the wiring + the `include!(gen_tablegen.rs)` line. At this step, xdna-emu's build.rs still owns the TableGen block via its own `#[path]` include. The directory move itself must update xdna-emu's build.rs path.
 
@@ -666,7 +669,7 @@ Replace with:
 mod build_helpers;
 ```
 
-- [ ] **Step 8: Verify build**
+- [x] **Step 8: Verify build**
 
 ```bash
 cargo clean -p xdna-emu 2>&1 | tail -3
@@ -684,7 +687,7 @@ via xdna-emu's `src/tablegen/{types,resolver}.rs` forwarders, which
 re-export from archspec. Task 7 flips both the include site and the
 emitter strings atomically.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add -A
@@ -715,7 +718,7 @@ EOF
 - Modify: `src/tablegen/mod.rs`: remove the `generated` module block
 - Modify: `crates/xdna-archspec/src/aie2/isa/mod.rs`: add the `generated` module and `load_from_generated` entry
 
-- [ ] **Step 1: Add `tblgen` to archspec's Cargo.toml**
+- [x] **Step 1: Add `tblgen` to archspec's Cargo.toml**
 
 Edit `crates/xdna-archspec/Cargo.toml`. Add to `[build-dependencies]`:
 
@@ -724,7 +727,7 @@ Edit `crates/xdna-archspec/Cargo.toml`. Add to `[build-dependencies]`:
 tblgen = { git = "https://github.com/FIM43-Redeye/tblgen-rs.git", branch = "feat/varbit-init", default-features = false, features = ["llvm21-0"] }
 ```
 
-- [ ] **Step 2: Add the `#[path]` include and generator call to archspec's build.rs**
+- [x] **Step 2: Add the `#[path]` include and generator call to archspec's build.rs**
 
 Edit `crates/xdna-archspec/build.rs`. At the top of the file (with other `#[path]` blocks):
 
@@ -747,7 +750,7 @@ println!("cargo:rerun-if-env-changed=LLVM_AIE_PATH");
 
 Copy `resolve_llvm_aie_path` (or its inline equivalent) from xdna-emu/build.rs.
 
-- [ ] **Step 3: Update codegen string paths and move the include site (atomic)**
+- [x] **Step 3: Update codegen string paths and move the include site (atomic)**
 
 These two changes must land together: the emitted paths in
 `gen_tablegen.rs` and the module that `include!()`s it must match.
@@ -811,7 +814,7 @@ correctly only when it's included inside archspec's
 `src/aie2/isa/mod.rs::generated` (one level deep over `src/aie2/isa/types.rs`).
 Either change without the other breaks the build.
 
-- [ ] **Step 4: Forward `load_from_generated` from xdna-emu**
+- [x] **Step 4: Forward `load_from_generated` from xdna-emu**
 
 Edit `src/tablegen/mod.rs`. Replace the removed `pub fn load_from_generated` with:
 
@@ -819,11 +822,11 @@ Edit `src/tablegen/mod.rs`. Replace the removed `pub fn load_from_generated` wit
 pub use xdna_archspec::aie2::isa::load_from_generated;
 ```
 
-- [ ] **Step 5: Remove `tblgen` from xdna-emu's Cargo.toml**
+- [x] **Step 5: Remove `tblgen` from xdna-emu's Cargo.toml**
 
 Edit `Cargo.toml`. In `[build-dependencies]`, remove the `tblgen = { ... }` line.
 
-- [ ] **Step 6: Remove `#[path]` include of build_helpers from xdna-emu's build.rs**
+- [x] **Step 6: Remove `#[path]` include of build_helpers from xdna-emu's build.rs**
 
 Edit `build.rs`. Remove:
 
@@ -834,7 +837,7 @@ mod build_helpers;
 
 Also remove wherever `build_helpers::extract::extract_all(...)` and `build_helpers::codegen::generate_tablegen_file(...)` are called in `main()`, plus the `LLVM_AIE_PATH` resolution if it's still present (it's still needed for `compile_llvm_decoder_ffi`; keep only that part).
 
-- [ ] **Step 7: Clean build and verify**
+- [x] **Step 7: Clean build and verify**
 
 ```bash
 cargo clean 2>&1 | tail -3
@@ -845,7 +848,7 @@ cargo test -p xdna-archspec --lib 2>&1 | tail -3
 
 Expected: clean build, 2797 passed / 0 failed on xdna-emu, 138/1 on archspec. Generator strings emit `super::types::*` / `super::resolver::*` which resolve against archspec's `src/aie2/isa/{types.rs, resolver/mod.rs}`.
 
-- [ ] **Step 8: Sharp verification -- bit-identical gen_tablegen.rs**
+- [x] **Step 8: Sharp verification -- bit-identical gen_tablegen.rs**
 
 Compare against baseline. Before Task 6 started, find the current gen_tablegen.rs path and save it:
 
@@ -855,7 +858,7 @@ find target/debug/build -name gen_tablegen.rs -path '*xdna-archspec*' | head -1
 
 After this task, run the same find; the file should exist under archspec's OUT_DIR, not xdna-emu's. Diff against git's `phase1-subsys-regs-mem` tag's gen_tablegen.rs if one was saved, or just verify it parses + `cargo test --lib` passes.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add -A
@@ -883,13 +886,13 @@ EOF
 - Move: `decoder_ffi/` → `crates/xdna-archspec/decoder_ffi/`
 - Modify: `build.rs` (xdna-emu): update path to point into crate
 
-- [ ] **Step 1: Move the directory**
+- [x] **Step 1: Move the directory**
 
 ```bash
 git mv decoder_ffi crates/xdna-archspec/decoder_ffi
 ```
 
-- [ ] **Step 2: Update xdna-emu's build.rs to reference the new location**
+- [x] **Step 2: Update xdna-emu's build.rs to reference the new location**
 
 Edit `build.rs`. Find every reference to `"decoder_ffi/..."` path strings (inside `compile_llvm_decoder_ffi` and `run_llvm_config`). Replace `"decoder_ffi/"` with `"crates/xdna-archspec/decoder_ffi/"`.
 
@@ -899,7 +902,7 @@ There should be two or three such references. A grep finds them:
 rg -n 'decoder_ffi' build.rs
 ```
 
-- [ ] **Step 3: Verify build**
+- [x] **Step 3: Verify build**
 
 ```bash
 cargo clean -p xdna-emu 2>&1 | tail -3
@@ -909,7 +912,7 @@ cargo test --lib 2>&1 | tail -3
 
 Expected: clean build, 2797 passed. The C++ compilation still happens from xdna-emu's build.rs but reads sources from the new location.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add -A
@@ -937,7 +940,7 @@ EOF
 - Modify: `Cargo.toml` (xdna-emu): remove `cc` from `[build-dependencies]`
 - Modify: `crates/xdna-archspec/Cargo.toml`: add `cc` to `[build-dependencies]`
 
-- [ ] **Step 1: Add `cc` to archspec's Cargo.toml**
+- [x] **Step 1: Add `cc` to archspec's Cargo.toml**
 
 Edit `crates/xdna-archspec/Cargo.toml`. Add to `[build-dependencies]`:
 
@@ -946,7 +949,7 @@ Edit `crates/xdna-archspec/Cargo.toml`. Add to `[build-dependencies]`:
 cc = "1"
 ```
 
-- [ ] **Step 2: Copy `compile_llvm_decoder_ffi` + `run_llvm_config` to archspec's build.rs**
+- [x] **Step 2: Copy `compile_llvm_decoder_ffi` + `run_llvm_config` to archspec's build.rs**
 
 Identify these functions in `build.rs` (xdna-emu). They are self-contained; they only take paths as arguments. Copy them verbatim to `crates/xdna-archspec/build.rs`.
 
@@ -954,7 +957,7 @@ Update the `main()` in archspec's build.rs to call `compile_llvm_decoder_ffi(&ll
 
 Check the function body for path strings. Anywhere it references the manifest or project root, make sure it refers to archspec's manifest, not xdna-emu's. The `CARGO_MANIFEST_DIR` env in the function will now point to `crates/xdna-archspec/`, so relative paths `decoder_ffi/aie2_decoder.cpp` still work as long as the function reads them relative to `CARGO_MANIFEST_DIR`.
 
-- [ ] **Step 3: Remove the functions and call sites from xdna-emu's build.rs**
+- [x] **Step 3: Remove the functions and call sites from xdna-emu's build.rs**
 
 Edit `build.rs` (xdna-emu). Remove:
 - `fn compile_llvm_decoder_ffi(...)` definition
@@ -962,7 +965,7 @@ Edit `build.rs` (xdna-emu). Remove:
 - The `compile_llvm_decoder_ffi(&llvm_aie_path)` call in `main()`
 - The `llvm_aie_path` resolution in `main()` (if it's no longer needed for anything else -- after Task 7 and this step, it shouldn't be)
 
-- [ ] **Step 4: Remove `cc` from xdna-emu's Cargo.toml**
+- [x] **Step 4: Remove `cc` from xdna-emu's Cargo.toml**
 
 Edit `Cargo.toml`. In `[build-dependencies]`, remove:
 
@@ -970,7 +973,7 @@ Edit `Cargo.toml`. In `[build-dependencies]`, remove:
 cc = "1"
 ```
 
-- [ ] **Step 5: Clean build and verify**
+- [x] **Step 5: Clean build and verify**
 
 ```bash
 cargo clean 2>&1 | tail -3
@@ -983,7 +986,7 @@ Expected: clean build. The FFI library is now emitted by archspec's build.rs int
 
 If the link step fails with unresolved symbols, double-check that the `cargo:rustc-link-lib=...` and `cargo:rustc-link-search=...` directives are still being emitted. They should be, since the function body is unchanged.
 
-- [ ] **Step 6: Verify FFI still works**
+- [x] **Step 6: Verify FFI still works**
 
 ```bash
 ./scripts/emu-bridge-test.sh --no-hw -v add_one 2>&1 | tail -5
@@ -991,7 +994,7 @@ If the link step fails with unresolved symbols, double-check that the `cargo:rus
 
 Expected: Chess 10/10 PASS, Peano 9/9 PASS. Bridge smoke specifically exercises the decoder.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add -A
@@ -1021,7 +1024,7 @@ EOF
 - Modify: `src/tablegen/mod.rs` (declare register_map; re-export from decoder_ffi forwarder)
 - Modify: `crates/xdna-archspec/src/aie2/isa/mod.rs` (declare decoder_ffi)
 
-- [ ] **Step 1: Extract top half (lines 1-345) to archspec**
+- [x] **Step 1: Extract top half (lines 1-345) to archspec**
 
 Read `src/tablegen/decoder_ffi.rs` lines 1-345. Copy those lines verbatim into `crates/xdna-archspec/src/aie2/isa/decoder_ffi.rs`. Confirm the split line is `use crate::interpreter::bundle::slot::Operand;` -- everything above stays; everything from that line downward moves to `register_map.rs`.
 
@@ -1029,7 +1032,7 @@ The top-half content: imports, `OpKind`, `RawOperand`, `RawDecodeResult`, `Slot`
 
 Adjust the top-half file: remove any `use crate::interpreter::...` imports (there should be none above line 346).
 
-- [ ] **Step 2: Declare decoder_ffi in `isa/mod.rs`**
+- [x] **Step 2: Declare decoder_ffi in `isa/mod.rs`**
 
 Edit `crates/xdna-archspec/src/aie2/isa/mod.rs`. Add:
 
@@ -1037,7 +1040,7 @@ Edit `crates/xdna-archspec/src/aie2/isa/mod.rs`. Add:
 pub mod decoder_ffi;
 ```
 
-- [ ] **Step 3: Create `src/tablegen/register_map.rs` with the bottom half**
+- [x] **Step 3: Create `src/tablegen/register_map.rs` with the bottom half**
 
 Read `src/tablegen/decoder_ffi.rs` lines 346-1185. Copy those lines to the new file `src/tablegen/register_map.rs`.
 
@@ -1071,7 +1074,7 @@ use xdna_archspec::aie2::isa::decoder_ffi::{
 
 (The exact imports depend on what the bottom half uses. Read each `use` statement in the original file below line 346 and carry it over unchanged. For names the bottom half referenced implicitly because they were in the same file, import them from `xdna_archspec::aie2::isa::decoder_ffi` now.)
 
-- [ ] **Step 4: Replace `src/tablegen/decoder_ffi.rs` with a forwarder**
+- [x] **Step 4: Replace `src/tablegen/decoder_ffi.rs` with a forwarder**
 
 Overwrite `src/tablegen/decoder_ffi.rs`:
 
@@ -1086,7 +1089,7 @@ pub use xdna_archspec::aie2::isa::decoder_ffi::*;
 pub use super::register_map::*;
 ```
 
-- [ ] **Step 5: Declare `register_map` in `src/tablegen/mod.rs`**
+- [x] **Step 5: Declare `register_map` in `src/tablegen/mod.rs`**
 
 Edit `src/tablegen/mod.rs`. After the `pub mod decoder_ffi;` line (or wherever submodules are declared), add:
 
@@ -1094,7 +1097,7 @@ Edit `src/tablegen/mod.rs`. After the `pub mod decoder_ffi;` line (or wherever s
 pub mod register_map;
 ```
 
-- [ ] **Step 6: Verify build and tests**
+- [x] **Step 6: Verify build and tests**
 
 ```bash
 cargo build 2>&1 | tail -10
@@ -1104,7 +1107,7 @@ cargo test -p xdna-archspec --lib 2>&1 | tail -3
 
 Expected: clean build, 2797 passed. All `use crate::tablegen::decoder_ffi::*` imports in the interpreter still resolve via the forwarder.
 
-- [ ] **Step 7: Verify FFI still works**
+- [x] **Step 7: Verify FFI still works**
 
 ```bash
 ./scripts/emu-bridge-test.sh --no-hw -v add_one 2>&1 | tail -5
@@ -1112,7 +1115,7 @@ Expected: clean build, 2797 passed. All `use crate::tablegen::decoder_ffi::*` im
 
 Expected: Chess 10/10 PASS, Peano 9/9 PASS.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add -A
@@ -1144,7 +1147,7 @@ EOF
 - Modify: `crates/xdna-archspec/src/aie2/mod.rs`: declare `pub mod aiert;`
 - Modify: `src/device/aiert_validation.rs`: import from `xdna_archspec::aie2::aiert::*` instead of `include!()`
 
-- [ ] **Step 1: Identify extract_aiert + friends in xdna-emu's build.rs**
+- [x] **Step 1: Identify extract_aiert + friends in xdna-emu's build.rs**
 
 ```bash
 rg -n '^fn (extract_aiert|gen_aiert_|parse_dma_|parse_lock_|parse_ports_)' build.rs
@@ -1152,7 +1155,7 @@ rg -n '^fn (extract_aiert|gen_aiert_|parse_dma_|parse_lock_|parse_ports_)' build
 
 Expected: ~6-10 functions. Note: archspec's build.rs ALREADY has a partial copy of `extract_aiert` for cross-validation (stripped of the file-writing calls). We'll merge the file-writing calls back into archspec's copy, then delete xdna-emu's copy entirely.
 
-- [ ] **Step 2: Add `gen_aiert_dma/locks/ports` to archspec's build.rs**
+- [x] **Step 2: Add `gen_aiert_dma/locks/ports` to archspec's build.rs**
 
 In `crates/xdna-archspec/build.rs`, find its `extract_aiert` function. After it parses the aie-rt modules (feeding `ArchModel`'s cross-validation), add the file-writing calls:
 
@@ -1164,7 +1167,7 @@ gen_aiert_ports(&port_maps, &out_dir);
 
 Copy the function definitions for `gen_aiert_dma`, `gen_aiert_locks`, `gen_aiert_ports` from xdna-emu's build.rs into archspec's build.rs (these three functions are self-contained file writers; they take parsed data and emit Rust).
 
-- [ ] **Step 3: Delete extract_aiert + gen_aiert_* from xdna-emu's build.rs**
+- [x] **Step 3: Delete extract_aiert + gen_aiert_* from xdna-emu's build.rs**
 
 Edit `build.rs` (xdna-emu). Remove:
 - `extract_aiert()` function
@@ -1174,7 +1177,7 @@ Edit `build.rs` (xdna-emu). Remove:
 
 This should drop xdna-emu's build.rs by several hundred lines. The remaining content at this point: the XRT plugin install block, `gen_header`, and minimal path/env setup.
 
-- [ ] **Step 4: Create `crates/xdna-archspec/src/aie2/aiert/mod.rs`**
+- [x] **Step 4: Create `crates/xdna-archspec/src/aie2/aiert/mod.rs`**
 
 Write:
 
@@ -1200,7 +1203,7 @@ pub mod ports {
 }
 ```
 
-- [ ] **Step 5: Declare `aiert` in `aie2/mod.rs`**
+- [x] **Step 5: Declare `aiert` in `aie2/mod.rs`**
 
 Edit `crates/xdna-archspec/src/aie2/mod.rs`. Add:
 
@@ -1210,7 +1213,7 @@ Edit `crates/xdna-archspec/src/aie2/mod.rs`. Add:
 pub mod aiert;
 ```
 
-- [ ] **Step 6: Rewrite `src/device/aiert_validation.rs` to import from archspec**
+- [x] **Step 6: Rewrite `src/device/aiert_validation.rs` to import from archspec**
 
 Edit `src/device/aiert_validation.rs`. Find the three `include!()` blocks:
 
@@ -1234,7 +1237,7 @@ use xdna_archspec::aie2::aiert::ports::*;
 
 Depending on the file's structure, these imports may need to live at the top of the file (with their consumers using `dma::AIERT_DMA_MODULES` or similar unqualified names). Match the existing call-site style; the goal is zero behavioral change.
 
-- [ ] **Step 7: Remove unused build-deps from xdna-emu's Cargo.toml**
+- [x] **Step 7: Remove unused build-deps from xdna-emu's Cargo.toml**
 
 Edit `Cargo.toml`. In `[build-dependencies]`, remove:
 
@@ -1244,7 +1247,7 @@ serde_json = "1"
 
 (kept only for extract_aiert, which just moved). If `xdna-archspec` is still listed there, keep it for now -- Task 17 decides whether to drop it entirely.
 
-- [ ] **Step 8: Clean build and verify**
+- [x] **Step 8: Clean build and verify**
 
 ```bash
 cargo clean 2>&1 | tail -3
@@ -1255,7 +1258,7 @@ cargo test -p xdna-archspec --lib 2>&1 | tail -3
 
 Expected: clean build, 2797 passed on xdna-emu, 138/1 on archspec. The archspec build's cross-validation still runs; the xdna-emu side now consumes the generated files via archspec.
 
-- [ ] **Step 9: Verify aiert_validation tests still pass**
+- [x] **Step 9: Verify aiert_validation tests still pass**
 
 ```bash
 cargo test --lib aiert_validation 2>&1 | tail -5
@@ -1263,7 +1266,7 @@ cargo test --lib aiert_validation 2>&1 | tail -5
 
 Expected: all aiert_validation tests pass.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add -A
@@ -1292,7 +1295,7 @@ EOF
 **Files:**
 - Modify: `docs/arch/subsys6-audit.md`
 
-- [ ] **Step 1: Fast verification smoke**
+- [x] **Step 1: Fast verification smoke**
 
 ```bash
 cargo build --release 2>&1 | tail -5
@@ -1307,7 +1310,7 @@ Expected:
 - `138 passed; 1 failed`
 - Chess 10/10 PASS, Peano 9/9 PASS
 
-- [ ] **Step 2: Full HW bridge run**
+- [x] **Step 2: Full HW bridge run**
 
 ```bash
 nice -n 19 ./scripts/emu-bridge-test.sh 2>&1 | tee /tmp/claude-1000/subsys6-partA-bridge.log
@@ -1315,7 +1318,7 @@ nice -n 19 ./scripts/emu-bridge-test.sh 2>&1 | tee /tmp/claude-1000/subsys6-part
 
 Expected duration: ~20-30 minutes. Expected pass/fail matrix: matches `phase1-subsys-regs-mem` baseline. Known pre-existing failure `bd_chain_repeat_on_memtile` remains.
 
-- [ ] **Step 3: ISA test suite**
+- [x] **Step 3: ISA test suite**
 
 ```bash
 nice -n 19 ./scripts/isa-test.sh 2>&1 | tee /tmp/claude-1000/subsys6-partA-isa.log
@@ -1323,7 +1326,7 @@ nice -n 19 ./scripts/isa-test.sh 2>&1 | tee /tmp/claude-1000/subsys6-partA-isa.l
 
 Expected duration: ~10 minutes. Expected: `FAIL: 0 / 4815`.
 
-- [ ] **Step 4: Append Part A completion to the audit**
+- [x] **Step 4: Append Part A completion to the audit**
 
 Edit `docs/arch/subsys6-audit.md`. Append:
 
@@ -1358,7 +1361,7 @@ Landed 2026-MM-DD. Tag: `phase1-subsys-isa-decode-partA`.
 - [x] Forwarders (`pub mod arch`, `pub mod tablegen`) still live; consumer rewrites deferred to Part B.
 ```
 
-- [ ] **Step 5: Commit audit update**
+- [x] **Step 5: Commit audit update**
 
 ```bash
 git add docs/arch/subsys6-audit.md
@@ -1374,7 +1377,7 @@ EOF
 )"
 ```
 
-- [ ] **Step 6: Tag**
+- [x] **Step 6: Tag**
 
 ```bash
 git tag phase1-subsys-isa-decode-partA -m "Phase 1b Subsystem 6 Part A: ISA decode infrastructure relocation"
@@ -1398,13 +1401,13 @@ git tag phase1-subsys-isa-decode-partA -m "Phase 1b Subsystem 6 Part A: ISA deco
 - Modify: `src/tablegen/mod.rs` (remove `pub mod register_map;`)
 - Modify: `src/tablegen/decoder_ffi.rs` (forwarder): remove `pub use super::register_map::*;`
 
-- [ ] **Step 1: Move the file**
+- [x] **Step 1: Move the file**
 
 ```bash
 git mv src/tablegen/register_map.rs src/interpreter/decode/register_map.rs
 ```
 
-- [ ] **Step 2: Declare it in interpreter::decode**
+- [x] **Step 2: Declare it in interpreter::decode**
 
 Edit `src/interpreter/decode/mod.rs`. Add (at the module-declarations section):
 
@@ -1412,7 +1415,7 @@ Edit `src/interpreter/decode/mod.rs`. Add (at the module-declarations section):
 pub mod register_map;
 ```
 
-- [ ] **Step 3: Update the forwarder in src/tablegen/mod.rs**
+- [x] **Step 3: Update the forwarder in src/tablegen/mod.rs**
 
 Edit `src/tablegen/mod.rs`. Remove:
 
@@ -1420,7 +1423,7 @@ Edit `src/tablegen/mod.rs`. Remove:
 pub mod register_map;
 ```
 
-- [ ] **Step 4: Update the forwarder in src/tablegen/decoder_ffi.rs**
+- [x] **Step 4: Update the forwarder in src/tablegen/decoder_ffi.rs**
 
 Edit `src/tablegen/decoder_ffi.rs`. Remove:
 
@@ -1428,7 +1431,7 @@ Edit `src/tablegen/decoder_ffi.rs`. Remove:
 pub use super::register_map::*;
 ```
 
-- [ ] **Step 5: Consumers of MappedOperand/RegisterMap update**
+- [x] **Step 5: Consumers of MappedOperand/RegisterMap update**
 
 Any file that imports `MappedOperand` or `RegisterMap` from `crate::tablegen::decoder_ffi::` must update to `crate::interpreter::decode::register_map::`. Find them:
 
@@ -1438,7 +1441,7 @@ rg -l 'MappedOperand|RegisterMap|classify_reg_name' src/ --type rust
 
 Edit each to replace `use crate::tablegen::decoder_ffi::{MappedOperand, ...}` with `use crate::interpreter::decode::register_map::{MappedOperand, ...}`. Preserve the specific items imported.
 
-- [ ] **Step 6: Verify**
+- [x] **Step 6: Verify**
 
 ```bash
 cargo build 2>&1 | tail -10
@@ -1447,7 +1450,7 @@ cargo test --lib 2>&1 | tail -3
 
 Expected: clean build, 2797 passed.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add -A
@@ -1476,14 +1479,14 @@ EOF
 
 Reference the "Consumer-Import Rewrite Reference" table at the top of this plan for the exact substitutions.
 
-- [ ] **Step 1: Enumerate the consumer files**
+- [x] **Step 1: Enumerate the consumer files**
 
 ```bash
 rg -l 'use crate::tablegen' src/ | sort > /tmp/claude-1000/subsys6-tablegen-consumers-pre-rewrite.txt
 wc -l /tmp/claude-1000/subsys6-tablegen-consumers-pre-rewrite.txt
 ```
 
-- [ ] **Step 2: Mechanical rewrite using sed**
+- [x] **Step 2: Mechanical rewrite using sed**
 
 Apply the substitution rules from the Consumer-Import Rewrite Reference table. For each file:
 
@@ -1527,7 +1530,7 @@ for f in $(cat /tmp/claude-1000/subsys6-tablegen-consumers-pre-rewrite.txt); do
 done
 ```
 
-- [ ] **Step 3: Verify zero remaining `crate::tablegen::*` references in consumers**
+- [x] **Step 3: Verify zero remaining `crate::tablegen::*` references in consumers**
 
 ```bash
 rg -l 'use crate::tablegen' src/
@@ -1545,7 +1548,7 @@ rg -l 'crate::tablegen' src/ | grep -v 'src/tablegen/'
 
 Expected: empty.
 
-- [ ] **Step 4: Build and test**
+- [x] **Step 4: Build and test**
 
 ```bash
 cargo build 2>&1 | tail -15
@@ -1554,7 +1557,7 @@ cargo test --lib 2>&1 | tail -3
 
 Expected: clean build, 2797 passed. If any import fails to resolve, the sed pass missed a path -- fix manually.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -1580,14 +1583,14 @@ EOF
 **Files:**
 - Modify: 36 files containing `crate::arch::...`
 
-- [ ] **Step 1: Enumerate**
+- [x] **Step 1: Enumerate**
 
 ```bash
 rg -l 'crate::arch' src/ | sort > /tmp/claude-1000/subsys6-arch-consumers-pre-rewrite.txt
 wc -l /tmp/claude-1000/subsys6-arch-consumers-pre-rewrite.txt
 ```
 
-- [ ] **Step 2: Mechanical rewrite**
+- [x] **Step 2: Mechanical rewrite**
 
 Helper script:
 
@@ -1603,7 +1606,7 @@ for f in $(cat /tmp/claude-1000/subsys6-arch-consumers-pre-rewrite.txt); do
 done
 ```
 
-- [ ] **Step 3: Verify zero remaining `crate::arch::*` references**
+- [x] **Step 3: Verify zero remaining `crate::arch::*` references**
 
 ```bash
 rg -l 'crate::arch' src/ | grep -v 'src/lib.rs'
@@ -1611,7 +1614,7 @@ rg -l 'crate::arch' src/ | grep -v 'src/lib.rs'
 
 Expected: empty (only `src/lib.rs` still has the forwarder block, which Task 16 deletes).
 
-- [ ] **Step 4: Build and test**
+- [x] **Step 4: Build and test**
 
 ```bash
 cargo build 2>&1 | tail -10
@@ -1620,7 +1623,7 @@ cargo test --lib 2>&1 | tail -3
 
 Expected: clean, 2797 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -1646,7 +1649,7 @@ EOF
 - Delete: `src/tablegen/` (entire directory)
 - Modify: `src/lib.rs` (remove `pub mod arch { ... }` and `pub mod tablegen;`)
 
-- [ ] **Step 1: Verify no consumers remain**
+- [x] **Step 1: Verify no consumers remain**
 
 ```bash
 rg -l 'crate::arch|crate::tablegen|use crate::tablegen|use crate::arch' src/
@@ -1654,17 +1657,17 @@ rg -l 'crate::arch|crate::tablegen|use crate::tablegen|use crate::arch' src/
 
 Expected: only `src/lib.rs` (forwarder block) and files inside `src/tablegen/`. If any other file matches, Tasks 14/15 missed something.
 
-- [ ] **Step 2: Delete `src/tablegen/` directory**
+- [x] **Step 2: Delete `src/tablegen/` directory**
 
 ```bash
 git rm -rf src/tablegen
 ```
 
-- [ ] **Step 3: Remove the forwarder blocks from src/lib.rs**
+- [x] **Step 3: Remove the forwarder blocks from src/lib.rs**
 
 Edit `src/lib.rs`. Remove the entire `pub mod arch { ... }` block (including the doc comment and the `subsystem` sub-mod). Remove the `pub mod tablegen;` line (if present).
 
-- [ ] **Step 4: Build and test**
+- [x] **Step 4: Build and test**
 
 ```bash
 cargo build 2>&1 | tail -10
@@ -1673,7 +1676,7 @@ cargo test --lib 2>&1 | tail -3
 
 Expected: clean, 2797 passed. If builds fail, some consumer still uses `crate::arch::` or `crate::tablegen::`. Grep, fix, retry.
 
-- [ ] **Step 5: Verify FFI still works**
+- [x] **Step 5: Verify FFI still works**
 
 ```bash
 ./scripts/emu-bridge-test.sh --no-hw -v add_one 2>&1 | tail -5
@@ -1681,7 +1684,7 @@ Expected: clean, 2797 passed. If builds fail, some consumer still uses `crate::a
 
 Expected: Chess 10/10 PASS, Peano 9/9 PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A
@@ -1707,7 +1710,7 @@ EOF
 - Modify: `build.rs` (xdna-emu)
 - Modify: `Cargo.toml` (xdna-emu)
 
-- [ ] **Step 1: Audit xdna-emu/build.rs current contents**
+- [x] **Step 1: Audit xdna-emu/build.rs current contents**
 
 ```bash
 rg -n '^fn ' build.rs
@@ -1716,11 +1719,11 @@ wc -l build.rs
 
 Expected after Tasks 6, 7, 9, 11: ~100-200 lines, with `main()`, `gen_header()`, and the XRT plugin install block.
 
-- [ ] **Step 2: Remove any now-unused functions**
+- [x] **Step 2: Remove any now-unused functions**
 
 Anything that's not called from `main()` or by `gen_header` or by the plugin install block is dead. Remove. Helper imports (`use std::collections::HashMap;` etc.) that are now unused get removed too (the Rust compiler warns on unused imports; remove until clean).
 
-- [ ] **Step 3: Update the header doc**
+- [x] **Step 3: Update the header doc**
 
 Replace the current header doc in `build.rs` (which explained the Subsystem 1 hybrid state) with the new post-Subsystem-6 state:
 
@@ -1737,7 +1740,7 @@ Replace the current header doc in `build.rs` (which explained the Subsystem 1 hy
 //!   None. (xdna-emu does not generate any Rust source anymore.)
 ```
 
-- [ ] **Step 4: Remove `xdna-archspec` from `[build-dependencies]` if unused**
+- [x] **Step 4: Remove `xdna-archspec` from `[build-dependencies]` if unused**
 
 Edit `Cargo.toml`. If `use xdna_archspec::...` no longer appears anywhere in `build.rs`, remove the line:
 
@@ -1749,7 +1752,7 @@ from `[build-dependencies]`. `xdna-archspec` stays in `[dependencies]` (runtime 
 
 After this, `[build-dependencies]` should be empty or absent. If empty, remove the `[build-dependencies]` section entirely.
 
-- [ ] **Step 5: Verify build**
+- [x] **Step 5: Verify build**
 
 ```bash
 cargo clean 2>&1 | tail -3
@@ -1760,7 +1763,7 @@ cargo test --lib 2>&1 | tail -3
 
 Expected: clean builds, 2797 passed.
 
-- [ ] **Step 6: Verify build.rs line count**
+- [x] **Step 6: Verify build.rs line count**
 
 ```bash
 wc -l build.rs
@@ -1768,7 +1771,7 @@ wc -l build.rs
 
 Expected: ~80 lines (target from the spec). Anything significantly over suggests leftover dead code.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add build.rs Cargo.toml
@@ -1793,7 +1796,7 @@ EOF
 **Files:**
 - Create: `docs/arch/isa-decode.md`
 
-- [ ] **Step 1: Write the design note**
+- [x] **Step 1: Write the design note**
 
 Create `docs/arch/isa-decode.md`:
 
@@ -1898,7 +1901,7 @@ The trait boundary rides the "behavior differs in shape" criterion. ISA
 decode is values. ISA execute is shapes.
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add docs/arch/isa-decode.md
@@ -1924,7 +1927,7 @@ EOF
 - Modify: `docs/arch/subsys6-audit.md`
 - Modify: `NEXT-STEPS.md`
 
-- [ ] **Step 1: Full verification**
+- [x] **Step 1: Full verification**
 
 ```bash
 cargo build --release 2>&1 | tail -5
@@ -1939,7 +1942,7 @@ Expected:
 - `138 passed; 1 failed`
 - Chess 10/10, Peano 9/9
 
-- [ ] **Step 2: Full HW bridge run**
+- [x] **Step 2: Full HW bridge run**
 
 ```bash
 nice -n 19 ./scripts/emu-bridge-test.sh 2>&1 | tee /tmp/claude-1000/subsys6-partB-bridge.log
@@ -1947,7 +1950,7 @@ nice -n 19 ./scripts/emu-bridge-test.sh 2>&1 | tee /tmp/claude-1000/subsys6-part
 
 Expected: matches `phase1-subsys-isa-decode-partA` baseline.
 
-- [ ] **Step 3: ISA test suite**
+- [x] **Step 3: ISA test suite**
 
 ```bash
 nice -n 19 ./scripts/isa-test.sh 2>&1 | tee /tmp/claude-1000/subsys6-partB-isa.log
@@ -1955,7 +1958,7 @@ nice -n 19 ./scripts/isa-test.sh 2>&1 | tee /tmp/claude-1000/subsys6-partB-isa.l
 
 Expected: `FAIL: 0 / 4815`.
 
-- [ ] **Step 4: Verify success criteria**
+- [x] **Step 4: Verify success criteria**
 
 Check each against the spec's Section "Success criteria":
 
@@ -1987,7 +1990,7 @@ Expected:
 7. empty
 8. ~80 lines +/- 10
 
-- [ ] **Step 5: Append Part B completion to the audit**
+- [x] **Step 5: Append Part B completion to the audit**
 
 Edit `docs/arch/subsys6-audit.md`. Append:
 
@@ -2031,7 +2034,7 @@ None that block Subsystem 2. Candidates for Phase 2 hygiene:
 - If AIE1 population begins, revisit whether IsaDecoder trait is warranted.
 ```
 
-- [ ] **Step 6: Rewrite NEXT-STEPS.md**
+- [x] **Step 6: Rewrite NEXT-STEPS.md**
 
 Edit `NEXT-STEPS.md`. Update the header:
 
@@ -2086,7 +2089,7 @@ This is the concrete next action. Start here in a fresh session.
    + NEXT-STEPS.md.
 ```
 
-- [ ] **Step 7: Commit the audit + NEXT-STEPS updates**
+- [x] **Step 7: Commit the audit + NEXT-STEPS updates**
 
 ```bash
 git add docs/arch/subsys6-audit.md NEXT-STEPS.md
@@ -2102,7 +2105,7 @@ EOF
 )"
 ```
 
-- [ ] **Step 8: Tag**
+- [x] **Step 8: Tag**
 
 ```bash
 git tag phase1-subsys-isa-decode -m "Phase 1b Subsystem 6: ISA decode relocation and consumer cleanup"

@@ -12,6 +12,9 @@
 
 ---
 
+> **Sweep-as-of 2026-05-01:** Phase 1 of this plan completed -- tag `phase1-complete` (commit 0e13979) marks the close. All eight subsystems landed via per-subsystem tags (phase1a-consolidate, phase1-subsys-regs-mem, phase1-subsys-tile-topo, phase1-subsys-dma, phase1-subsys-locks, phase1-subsys-stream-switch, phase1-subsys-isa-decode, phase1-subsys-isa-execute, phase1-subsys-parser-*). Phase 2 hygiene items D.1, D.2, D.4-D.7 also landed (see chore(phase2-hygiene) commits). D.3 (universal register bus) landed separately via tag-less commits (11d2b66 / 61d3a94 / 9e5fecf / d297b98). Steps below were executed organically rather than ticked one-by-one; this sweep flips the checkboxes to match the verified completion state.
+
+
 ## Scope Note
 
 This plan covers **Phase 1a in full bite-sized detail** (the archspec consolidation -- a self-contained, shippable deliverable). Phase 1b/1c subsystem passes and Phase 2 hygiene are sketched at section level; **each subsystem gets its own detailed plan at the moment we start that subsystem**, because the bite-sized task list depends on a fresh audit of then-current code. Writing 8 subsystem plans up-front would produce plausible fiction, not actionable tasks.
@@ -53,7 +56,7 @@ When starting any of sub-subsystems 1-8, invoke the `brainstorming` / `writing-p
 **Files:**
 - Create: `docs/arch/phase1a-audit.md`
 
-- [ ] **Step 1: Enumerate ArchConfig trait surface**
+- [x] **Step 1: Enumerate ArchConfig trait surface**
 
 Read `src/device/arch_config.rs` end-to-end. For each method on the `ArchConfig` trait, record:
 - Method signature (name, params, return type).
@@ -62,7 +65,7 @@ Read `src/device/arch_config.rs` end-to-end. For each method on the `ArchConfig`
 
 Write results to `docs/arch/phase1a-audit.md` under a `## ArchConfig Trait Surface` heading as a table.
 
-- [ ] **Step 2: Enumerate consumers**
+- [x] **Step 2: Enumerate consumers**
 
 Run:
 ```bash
@@ -71,14 +74,14 @@ rg -l 'use (crate::archspec|crate::device::arch_config|xdna_archspec)' src/
 
 For each file listed, grep for the specific symbols imported and record them in the audit under `## Consumers and Imports`. Include the exact `use` lines verbatim for the migration step later.
 
-- [ ] **Step 3: Identify type dependencies that must cross the crate boundary**
+- [x] **Step 3: Identify type dependencies that must cross the crate boundary**
 
 `ArchConfig` references `TileType` from `src/device/tile.rs`. The crate has its own `TileKind` in `xdna_archspec::types`. Record in the audit under `## Type Boundary`:
 - Is `TileType` structurally identical to `TileKind`? (Read both.)
 - If yes: plan a `From`/`Into` bridge or a rename-and-reuse.
 - If not: record the differences, then plan: move `TileType` into the crate (preferred), or adapt `ArchConfig` to use `TileKind` (acceptable).
 
-- [ ] **Step 4: Identify stream-switch port data dependency**
+- [x] **Step 4: Identify stream-switch port data dependency**
 
 `ArchConfig` port-layout methods (`master_ports`, `slave_ports`, `north_master_range`, etc.) use `crate::arch` -- a build.rs-generated module. The audit must answer: does `crate::arch` derive from `xdna-archspec` at build time, or from some other source? Run:
 ```bash
@@ -88,7 +91,7 @@ cat build.rs | head -80
 
 Record under `## Port Data Dependency`: where `crate::arch` comes from, and whether moving `ArchConfig` into the crate requires moving the port-data generation too. If the port tables are generated from archspec itself, the move is straightforward. If they're sourced from a separate AM025 path, either (a) move that path into the crate, or (b) keep port-layout methods as a thin runtime-side extension trait outside the crate.
 
-- [ ] **Step 5: Commit the audit**
+- [x] **Step 5: Commit the audit**
 
 ```bash
 mkdir -p docs/arch
@@ -115,14 +118,14 @@ EOF
 - Read: `src/device/tile.rs`, `crates/xdna-archspec/src/types.rs`
 - Modify one of: `crates/xdna-archspec/src/types.rs` (add variants if needed), or `src/device/tile.rs` (re-export `TileKind` as `TileType`).
 
-- [ ] **Step 1: Compare the two enums**
+- [x] **Step 1: Compare the two enums**
 
 Read both files. Write the comparison into the audit doc under `## TileType vs TileKind Resolution`, including:
 - Variants in each.
 - Any differences in derive traits (`PartialEq`, `Eq`, `Hash`, etc.).
 - Any methods on `TileType` not present on `TileKind`.
 
-- [ ] **Step 2: Add missing methods/derives to TileKind in the crate if needed**
+- [x] **Step 2: Add missing methods/derives to TileKind in the crate if needed**
 
 If `TileType` has methods or derives that `TileKind` lacks but consumers need, add them to `TileKind` in `crates/xdna-archspec/src/types.rs`. Keep `TileType` as a re-export alias in `src/device/tile.rs` for source-compatibility of the rest of the codebase:
 
@@ -131,14 +134,14 @@ If `TileType` has methods or derives that `TileKind` lacks but consumers need, a
 pub use xdna_archspec::types::TileKind as TileType;
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 ```bash
 cargo test --lib
 ```
 Expected: PASS (this task is source-compatible — `TileType` is the same type alias).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/device/tile.rs crates/xdna-archspec/src/types.rs
@@ -164,7 +167,7 @@ EOF
 - Modify: `crates/xdna-archspec/src/lib.rs` (add `pub mod runtime;`)
 - Reference (do not yet delete): `src/device/arch_config.rs`
 
-- [ ] **Step 1: Create runtime.rs**
+- [x] **Step 1: Create runtime.rs**
 
 Copy the *entire body* of `src/device/arch_config.rs` into `crates/xdna-archspec/src/runtime.rs`. Then:
 - Replace `use super::tile::TileType;` with `use crate::types::TileKind as TileType;` (or keep `TileType` alias).
@@ -172,7 +175,7 @@ Copy the *entire body* of `src/device/arch_config.rs` into `crates/xdna-archspec
 - Replace `crate::archspec::TileKind` with `crate::types::TileKind`.
 - For any reference to `crate::arch` (build.rs-generated), replace with the resolution chosen in Task 1 Step 4. If the port-data path is moving into the crate, import from the new crate-internal location; if it's staying runtime-side, add a `PortDataSource` trait parameter to the functions that need it and leave the callsite changes for later tasks.
 
-- [ ] **Step 2: Expose the module**
+- [x] **Step 2: Expose the module**
 
 Add to `crates/xdna-archspec/src/lib.rs`:
 ```rust
@@ -180,14 +183,14 @@ pub mod runtime;
 ```
 Place alphabetically among the other `pub mod` lines.
 
-- [ ] **Step 3: Build**
+- [x] **Step 3: Build**
 
 ```bash
 cargo build
 ```
 Expected: PASS. Fix compile errors in `runtime.rs` until clean. Errors here mean missing imports or a type mismatch the audit didn't catch — resolve before moving on.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/xdna-archspec/src/runtime.rs crates/xdna-archspec/src/lib.rs
@@ -213,7 +216,7 @@ EOF
 
 **Pattern:** one file per commit. Each commit leaves `cargo test --lib` green.
 
-- [ ] **Step 1: Migrate `src/device/model.rs`**
+- [x] **Step 1: Migrate `src/device/model.rs`**
 
 Replace `use crate::device::arch_config::{ArchConfig, ModelConfig, ...};` with `use xdna_archspec::runtime::{ArchConfig, ModelConfig, ...};`. Replace `use crate::archspec::{...};` with `use xdna_archspec::types::{...};`.
 
@@ -232,27 +235,27 @@ git commit -m "refactor: migrate device::model to xdna_archspec::runtime
 Generated using Claude Code."
 ```
 
-- [ ] **Step 2: Migrate `src/device/state/mod.rs`**
+- [x] **Step 2: Migrate `src/device/state/mod.rs`**
 
 Same pattern. Build + test + commit.
 
-- [ ] **Step 3: Migrate `src/device/registers.rs`**
+- [x] **Step 3: Migrate `src/device/registers.rs`**
 
 Same pattern. Build + test + commit.
 
-- [ ] **Step 4: Migrate `src/device/regdb/mod.rs`**
+- [x] **Step 4: Migrate `src/device/regdb/mod.rs`**
 
 Same pattern. Build + test + commit.
 
-- [ ] **Step 5: Migrate `src/device/regdb/field_layouts.rs`**
+- [x] **Step 5: Migrate `src/device/regdb/field_layouts.rs`**
 
 Same pattern. Build + test + commit.
 
-- [ ] **Step 6: Migrate `src/device/regdb/tests.rs`**
+- [x] **Step 6: Migrate `src/device/regdb/tests.rs`**
 
 Same pattern. Build + test + commit.
 
-- [ ] **Step 7: Sweep for any remaining consumers**
+- [x] **Step 7: Sweep for any remaining consumers**
 
 ```bash
 rg 'crate::archspec|crate::device::arch_config' src/
@@ -271,12 +274,12 @@ If any consumer was missed, migrate it following the same pattern and commit.
 - Modify: `src/lib.rs` (remove `pub mod archspec;`)
 - Modify: `src/device/mod.rs` (remove `pub mod arch_config;`)
 
-- [ ] **Step 1: Remove module declarations**
+- [x] **Step 1: Remove module declarations**
 
 Edit `src/lib.rs`: delete the `pub mod archspec;` line.
 Edit `src/device/mod.rs`: delete the `pub mod arch_config;` line.
 
-- [ ] **Step 2: Delete the files**
+- [x] **Step 2: Delete the files**
 
 ```bash
 git rm src/archspec/mod.rs
@@ -284,7 +287,7 @@ rmdir src/archspec
 git rm src/device/arch_config.rs
 ```
 
-- [ ] **Step 3: Build and test**
+- [x] **Step 3: Build and test**
 
 ```bash
 cargo build
@@ -292,14 +295,14 @@ cargo test --lib
 ```
 Expected: PASS. Any failures indicate a consumer was missed in Task 4 — go back and migrate it, then return here.
 
-- [ ] **Step 4: Verify nothing references the deleted paths**
+- [x] **Step 4: Verify nothing references the deleted paths**
 
 ```bash
 rg 'crate::archspec|crate::device::arch_config|src/archspec|src/device/arch_config' .
 ```
 Expected: no matches outside of git history / docs / archive.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -323,41 +326,41 @@ EOF
 
 **Files:** none modified. This is the gate.
 
-- [ ] **Step 1: Full library tests**
+- [x] **Step 1: Full library tests**
 
 ```bash
 cargo test --lib
 ```
 Expected: PASS, all tests.
 
-- [ ] **Step 2: Release build**
+- [x] **Step 2: Release build**
 
 ```bash
 cargo build --release
 ```
 Expected: PASS. Release-only compile errors occasionally surface here.
 
-- [ ] **Step 3: Bridge test no-hw smoke**
+- [x] **Step 3: Bridge test no-hw smoke**
 
 ```bash
 ./scripts/emu-bridge-test.sh --no-hw -v add_one
 ```
 Expected: PASS. The `add_one` test is a minimal bridge-path smoke.
 
-- [ ] **Step 4: Full bridge test (hardware)**
+- [x] **Step 4: Full bridge test (hardware)**
 
 ```bash
 ./scripts/emu-bridge-test.sh 2>&1 | tee /tmp/claude-1000/phase1a-bridge.log
 ```
 Expected: no regressions compared to pre-refactor baseline. If any test that was passing is now failing, stop and debug before tagging.
 
-- [ ] **Step 5: Tag**
+- [x] **Step 5: Tag**
 
 ```bash
 git tag phase1a-consolidate
 ```
 
-- [ ] **Step 6: Log completion**
+- [x] **Step 6: Log completion**
 
 Append to `docs/arch/phase1a-audit.md` a `## Completion` section recording: commit hashes, test counts before/after, any surprises found during migration, and any follow-up items flagged for later subsystems. Commit:
 

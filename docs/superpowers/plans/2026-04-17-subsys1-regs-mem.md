@@ -14,6 +14,9 @@
 
 ---
 
+> **Sweep-as-of 2026-05-01:** Subsystem 1 completed -- tag `phase1-subsys-regs-mem`. Audit + completion log in docs commits leading up to the tag. Steps below were executed organically rather than ticked one-by-one; this sweep flips the checkboxes to match the verified completion state.
+
+
 ## Scope Note
 
 Part A (Tasks 1-14) is a relocation of all of `xdna-emu`'s build-time arch-data machinery into `xdna-archspec`. Bit-identical outputs; failure in Part A is always a missed import or a path mismatch, never a semantic regression.
@@ -146,14 +149,14 @@ The only blocker is that `lib.rs`'s `build_arch_model`, `confirm_subsystem_range
 **Files:**
 - Create: `docs/arch/subsys1-audit.md`
 
-- [ ] **Step 1: Create directory if missing and seed audit doc**
+- [x] **Step 1: Create directory if missing and seed audit doc**
 
 ```bash
 mkdir -p docs/arch
 touch docs/arch/subsys1-audit.md
 ```
 
-- [ ] **Step 2: Capture baseline test numbers**
+- [x] **Step 2: Capture baseline test numbers**
 
 Run and record the output of each:
 
@@ -178,7 +181,7 @@ Failures to carry through: `test_full_parse_all_devices` (archspec, pre-existing
 device count 13 vs expected 12 -- unrelated).
 ```
 
-- [ ] **Step 3: Enumerate `crate::arch::*` consumers**
+- [x] **Step 3: Enumerate `crate::arch::*` consumers**
 
 ```bash
 rg -l 'crate::arch' src/ examples/ tests/ xrt-plugin/ 2>&1 | sort > /tmp/claude-1000/subsys1-arch-consumers.txt
@@ -187,7 +190,7 @@ wc -l /tmp/claude-1000/subsys1-arch-consumers.txt
 
 Append to the audit under `## crate::arch Consumers`. Expected count: ~37 files under `src/`, plus whatever shows up outside `src/`. Any file outside `src/` is a hidden consumer the spec's risk section calls out.
 
-- [ ] **Step 4: Enumerate codegen include sites**
+- [x] **Step 4: Enumerate codegen include sites**
 
 ```bash
 rg -n 'include!\(concat!\(env!\("OUT_DIR"\)' src/ build.rs
@@ -201,7 +204,7 @@ Append to audit under `## Codegen Include Sites`. Expected locations:
 
 Record the exact file:line for each.
 
-- [ ] **Step 5: Enumerate build.rs codegen functions and call sites**
+- [x] **Step 5: Enumerate build.rs codegen functions and call sites**
 
 ```bash
 rg -n '^fn gen_' build.rs
@@ -211,7 +214,7 @@ rg -n 'compile_llvm_decoder_ffi' build.rs
 
 Append to audit under `## build.rs Codegen Functions`. Each function with its line range.
 
-- [ ] **Step 6: Enumerate `sign_extend_7bit` call sites (for Part B)**
+- [x] **Step 6: Enumerate `sign_extend_7bit` call sites (for Part B)**
 
 ```bash
 rg -n 'sign_extend_7bit' src/
@@ -219,7 +222,7 @@ rg -n 'sign_extend_7bit' src/
 
 Append to audit under `## sign_extend_7bit Call Sites`. Expected: a small number; informs Part B Task 17's inline-vs-move decision.
 
-- [ ] **Step 7: Enumerate `registers_spec` consumers (for Part B)**
+- [x] **Step 7: Enumerate `registers_spec` consumers (for Part B)**
 
 ```bash
 rg -n 'device::registers_spec|registers_spec::' src/
@@ -227,7 +230,7 @@ rg -n 'device::registers_spec|registers_spec::' src/
 
 Append to audit under `## registers_spec.rs Consumers`.
 
-- [ ] **Step 8: Commit the audit**
+- [x] **Step 8: Commit the audit**
 
 ```bash
 git add docs/arch/subsys1-audit.md
@@ -254,7 +257,7 @@ EOF
 - Create: `crates/xdna-archspec/src/model_builder.rs`
 - Modify: `crates/xdna-archspec/src/lib.rs`
 
-- [ ] **Step 1: Create `model_builder.rs` with the moved content**
+- [x] **Step 1: Create `model_builder.rs` with the moved content**
 
 Cut from `crates/xdna-archspec/src/lib.rs`: the functions `build_arch_model`, `confirm_subsystem_ranges`, `populate_manual_constants`, `populate_aie2_manual_constants`, and the `#[cfg(test)] mod tests { ... }` block. Paste into `crates/xdna-archspec/src/model_builder.rs`. Top of the new file:
 
@@ -280,7 +283,7 @@ use std::path::Path;
 // <paste #[cfg(test)] mod tests { ... } here>
 ```
 
-- [ ] **Step 2: Slim `lib.rs` to re-exports**
+- [x] **Step 2: Slim `lib.rs` to re-exports**
 
 `crates/xdna-archspec/src/lib.rs` becomes:
 
@@ -310,7 +313,7 @@ pub mod types;
 pub use model_builder::{build_arch_model, confirm_subsystem_ranges};
 ```
 
-- [ ] **Step 3: Build and run tests**
+- [x] **Step 3: Build and run tests**
 
 ```bash
 cargo build
@@ -320,7 +323,7 @@ cargo test -p xdna-archspec --lib
 
 Expected: all previously-passing tests still pass (2798 lib + 137 passing archspec tests; `test_full_parse_all_devices` remains the single pre-existing failure).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/xdna-archspec/src/lib.rs crates/xdna-archspec/src/model_builder.rs
@@ -349,7 +352,7 @@ EOF
 - Create: `crates/xdna-archspec/build.rs`
 - Modify: `crates/xdna-archspec/Cargo.toml`
 
-- [ ] **Step 1: Add `build.rs` field and build-deps to `Cargo.toml`**
+- [x] **Step 1: Add `build.rs` field and build-deps to `Cargo.toml`**
 
 Edit `crates/xdna-archspec/Cargo.toml`. The file after edit:
 
@@ -375,7 +378,7 @@ tempfile = "3"
 
 Note: `tblgen` and `cc` will be added in Tasks 10 and 11 respectively; they are not needed until TableGen extraction and the C++ FFI compile move.
 
-- [ ] **Step 2: Create empty `build.rs`**
+- [x] **Step 2: Create empty `build.rs`**
 
 ```rust
 //! Build script for xdna-archspec.
@@ -444,7 +447,7 @@ fn main() {
 }
 ```
 
-- [ ] **Step 3: Verify the crate builds**
+- [x] **Step 3: Verify the crate builds**
 
 ```bash
 cargo build -p xdna-archspec
@@ -452,7 +455,7 @@ cargo build -p xdna-archspec
 
 Expected: clean build. If `#[path]`-included modules fail to compile, the fix is almost always resolving a `crate::` path that should be relative, or a module that implicitly relies on `runtime.rs` types.
 
-- [ ] **Step 4: Verify workspace build still works**
+- [x] **Step 4: Verify workspace build still works**
 
 ```bash
 cargo build
@@ -461,7 +464,7 @@ cargo test --lib
 
 Expected: clean. `xdna-archspec`'s `build.rs` runs during the workspace build but does nothing yet; outputs are unchanged.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/xdna-archspec/Cargo.toml crates/xdna-archspec/build.rs
@@ -495,7 +498,7 @@ This is the largest single codegen move -- `gen_arch.rs` produces the topology, 
 - Modify: `src/lib.rs` (xdna-emu, start dismantling `mod arch`)
 - Modify: numerous consumer files (import rewrites)
 
-- [ ] **Step 1: Copy `gen_arch` and `extract_aiert` from xdna-emu/build.rs into archspec/build.rs**
+- [x] **Step 1: Copy `gen_arch` and `extract_aiert` from xdna-emu/build.rs into archspec/build.rs**
 
 Open `build.rs` (xdna-emu). Locate `fn gen_arch` (~line 297) and `fn extract_aiert` (search with `rg -n '^fn extract_aiert'` -- likely above or below gen_arch). Copy the bodies into `crates/xdna-archspec/build.rs`, replacing `xdna_archspec::` prefixes with the local `crate::` equivalents (e.g., `xdna_archspec::types::ArchModel` -> `crate::types::ArchModel`). Also copy the `gen_header` helper.
 
@@ -515,7 +518,7 @@ gen_arch(&arch_model, &_out_dir);
 
 (Remove the leading underscore from `_out_dir` once it's used.)
 
-- [ ] **Step 2: Create `src/aie2/mod.rs` with `include!()`**
+- [x] **Step 2: Create `src/aie2/mod.rs` with `include!()`**
 
 ```rust
 //! AIE2 (NPU1 Phoenix / NPU2+ Strix) architecture constants.
@@ -567,7 +570,7 @@ pub mod port_type {
 }
 ```
 
-- [ ] **Step 3: Add `pub mod aie2;` to `crates/xdna-archspec/src/lib.rs`**
+- [x] **Step 3: Add `pub mod aie2;` to `crates/xdna-archspec/src/lib.rs`**
 
 After `pub mod types;`:
 
@@ -575,7 +578,7 @@ After `pub mod types;`:
 pub mod aie2;
 ```
 
-- [ ] **Step 4: Build the archspec crate in isolation to verify gen_arch produces parseable output**
+- [x] **Step 4: Build the archspec crate in isolation to verify gen_arch produces parseable output**
 
 ```bash
 cargo build -p xdna-archspec
@@ -583,7 +586,7 @@ cargo build -p xdna-archspec
 
 Expected: clean. If `gen_arch.rs` output fails to parse, the codegen function has a bug (unlikely since it's the same code that worked in xdna-emu/build.rs).
 
-- [ ] **Step 5: Rewrite consumers of `crate::arch::*` to `xdna_archspec::aie2::*`**
+- [x] **Step 5: Rewrite consumers of `crate::arch::*` to `xdna_archspec::aie2::*`**
 
 Use the audit's consumer list from Task 1 Step 3 as the work queue. For each file, replace `crate::arch::` with `xdna_archspec::aie2::`. The rewrites are mechanical; `sed` is appropriate here:
 
@@ -596,17 +599,17 @@ done < /tmp/claude-1000/subsys1-arch-consumers.txt
 
 (The consumer list should include `src/lib.rs` -- that file gets a separate hand-edit in Step 6. For now `sed` over it changes its internal `mod arch` content too, which we are about to delete, so the collateral damage is fine.)
 
-- [ ] **Step 6: Remove the `mod arch` block in `xdna-emu/src/lib.rs`**
+- [x] **Step 6: Remove the `mod arch` block in `xdna-emu/src/lib.rs`**
 
 Edit `src/lib.rs`. Delete lines 49-99 (the doc comment + `pub mod arch { ... }` block). Keep the `pub mod` declarations above and the conditional feature modules below.
 
-- [ ] **Step 7: Delete `gen_arch` / `extract_aiert` / `gen_header` from `xdna-emu/build.rs`**
+- [x] **Step 7: Delete `gen_arch` / `extract_aiert` / `gen_header` from `xdna-emu/build.rs`**
 
 Locate and delete: `fn gen_arch` (the full body), `fn extract_aiert` (the full body), `fn gen_header` (if it's still only used by the removed functions -- keep it if other `gen_*` still call it; it'll be removed incrementally through Tasks 5-8), and the call sites of those functions in `main()`. Also delete the `xdna_archspec::build_arch_model` call that feeds them, since the model is now built in archspec's build.rs.
 
 After Task 4, xdna-emu's build.rs no longer constructs an `ArchModel`; subsequent Tasks 5-9 delete the other `gen_*` functions and their dependencies one-by-one. Step 7 here deletes only what this task's move renders dead.
 
-- [ ] **Step 8: Build workspace**
+- [x] **Step 8: Build workspace**
 
 ```bash
 cargo build
@@ -614,7 +617,7 @@ cargo build
 
 Expected: clean. If a consumer file was missed, the compiler will flag `unresolved import crate::arch::X`. For each such error, rewrite the import to `xdna_archspec::aie2::X` and rebuild.
 
-- [ ] **Step 9: Run tests**
+- [x] **Step 9: Run tests**
 
 ```bash
 cargo test --lib
@@ -623,7 +626,7 @@ cargo test -p xdna-archspec --lib
 
 Expected: same pass counts as baseline.
 
-- [ ] **Step 10: Bridge smoke**
+- [x] **Step 10: Bridge smoke**
 
 ```bash
 ./scripts/emu-bridge-test.sh --no-hw -v add_one
@@ -631,7 +634,7 @@ Expected: same pass counts as baseline.
 
 Expected: Chess 10/10 PASS, Peano 9/9 PASS.
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add -A
@@ -669,7 +672,7 @@ EOF
 - Modify: `crates/xdna-archspec/src/aie2/mod.rs`
 - Modify: `build.rs` (xdna-emu)
 
-- [ ] **Step 1: Copy `gen_subsystems` + `subsystem_mod_name` helper into archspec/build.rs**
+- [x] **Step 1: Copy `gen_subsystems` + `subsystem_mod_name` helper into archspec/build.rs**
 
 From xdna-emu/build.rs (~line 583 `subsystem_mod_name` and line 619 `gen_subsystems`). Paste into archspec/build.rs, updating `xdna_archspec::types::...` to `crate::types::...`.
 
@@ -679,7 +682,7 @@ Add the call in archspec/build.rs's `main()` after the `gen_arch` call:
 gen_subsystems(&arch_model, &_out_dir);
 ```
 
-- [ ] **Step 2: Create `src/aie2/subsystems.rs`**
+- [x] **Step 2: Create `src/aie2/subsystems.rs`**
 
 ```rust
 //! Per-tile-type subsystem address ranges (from ArchModel).
@@ -693,7 +696,7 @@ gen_subsystems(&arch_model, &_out_dir);
 include!(concat!(env!("OUT_DIR"), "/gen_subsystems.rs"));
 ```
 
-- [ ] **Step 3: Declare the submodule in `aie2/mod.rs`**
+- [x] **Step 3: Declare the submodule in `aie2/mod.rs`**
 
 Add after the existing `port_type` module:
 
@@ -701,7 +704,7 @@ Add after the existing `port_type` module:
 pub mod subsystems;
 ```
 
-- [ ] **Step 4: Rewrite consumer imports**
+- [x] **Step 4: Rewrite consumer imports**
 
 The previous namespace was `crate::arch::subsystem::*` (singular, nested under `pub mod arch`). After Task 4 those became `xdna_archspec::aie2::subsystem::*`, but the target spec uses the plural `subsystems`. Rewrite:
 
@@ -712,11 +715,11 @@ rg -l 'use xdna_archspec::aie2::subsystem;' src/ examples/ tests/ xrt-plugin/ 2>
   | xargs -I{} sed -i 's|use xdna_archspec::aie2::subsystem;|use xdna_archspec::aie2::subsystems;|g' {}
 ```
 
-- [ ] **Step 5: Delete `gen_subsystems` and `subsystem_mod_name` from `xdna-emu/build.rs`**
+- [x] **Step 5: Delete `gen_subsystems` and `subsystem_mod_name` from `xdna-emu/build.rs`**
 
 Also delete their call site in `main()`. Delete the `pub mod subsystem { include!("...gen_subsystems.rs"); }` line if it still exists in `src/lib.rs` (it shouldn't after Task 4, but verify).
 
-- [ ] **Step 6: Build + test + bridge smoke**
+- [x] **Step 6: Build + test + bridge smoke**
 
 ```bash
 cargo build
@@ -727,7 +730,7 @@ cargo test -p xdna-archspec --lib
 
 Expected: baseline values.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add -A
@@ -755,7 +758,7 @@ EOF
 - Modify: `build.rs` (xdna-emu)
 - Modify: `src/device/registers_spec.rs`
 
-- [ ] **Step 1: Copy `gen_core_module`, `gen_lock_request`, and the three parser helpers**
+- [x] **Step 1: Copy `gen_core_module`, `gen_lock_request`, and the three parser helpers**
 
 From xdna-emu/build.rs: `fn gen_core_module` (~line 710), `fn gen_lock_request` (~line 781), `fn parse_lock_end_address` (~line 870), `fn parse_desc_range` (~line 894), `fn parse_desc_single_bit` (~line 913). Paste into archspec/build.rs.
 
@@ -767,7 +770,7 @@ gen_lock_request(&regdb, &_out_dir, "memory", "gen_memory_lock.rs");
 gen_lock_request(&regdb, &_out_dir, "memory_tile", "gen_memtile_lock.rs");
 ```
 
-- [ ] **Step 2: Create `src/aie2/registers.rs`**
+- [x] **Step 2: Create `src/aie2/registers.rs`**
 
 ```rust
 //! AIE2 register offset constants from the AM025 JSON.
@@ -792,13 +795,13 @@ pub mod mem_tile {
 }
 ```
 
-- [ ] **Step 3: Declare the module in `aie2/mod.rs`**
+- [x] **Step 3: Declare the module in `aie2/mod.rs`**
 
 ```rust
 pub mod registers;
 ```
 
-- [ ] **Step 4: Replace `include!()` sites in `src/device/registers_spec.rs` with `pub use` re-exports**
+- [x] **Step 4: Replace `include!()` sites in `src/device/registers_spec.rs` with `pub use` re-exports**
 
 `registers_spec.rs` currently includes the three generated files inside local `pub mod memory_module`, `core_module`, `mem_tile_module` blocks. Replace each include with a re-export from the archspec crate.
 
@@ -832,11 +835,11 @@ pub mod mem_tile_module {
 
 (Part B Task 16 migrates consumers *off* `registers_spec::*` entirely, deleting these re-export shells. Part A keeps them as forwarders.)
 
-- [ ] **Step 5: Delete the generator functions and their main() calls from `xdna-emu/build.rs`**
+- [x] **Step 5: Delete the generator functions and their main() calls from `xdna-emu/build.rs`**
 
 Functions to delete: `gen_core_module`, `gen_lock_request`, `parse_lock_end_address`, `parse_desc_range`, `parse_desc_single_bit`. Also delete their main() call sites.
 
-- [ ] **Step 6: Build + test + bridge smoke**
+- [x] **Step 6: Build + test + bridge smoke**
 
 ```bash
 cargo build
@@ -847,7 +850,7 @@ cargo test -p xdna-archspec --lib
 
 Expected: baseline values.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add -A
@@ -877,7 +880,7 @@ EOF
 - Create: `crates/xdna-archspec/src/aie2/stream_switch.rs`
 - Modify: `build.rs` (xdna-emu)
 
-- [ ] **Step 1: Copy the stream-switch codegen functions into archspec/build.rs**
+- [x] **Step 1: Copy the stream-switch codegen functions into archspec/build.rs**
 
 From xdna-emu/build.rs: `fn gen_stream_ports` (~line 946), `fn collect_port_array` (~line 1020), `fn suffix_to_port_type` (~line 1053), `fn write_port_array` (~line 1096), `fn gen_stream_ranges` (~line 1127), `fn write_direction_ranges`, `fn write_bundle_ranges`, `fn find_port_range_flex`, `fn find_port_range`, `fn find_master_enable_bit`. Also the `PortArrayData` and `PortEntry` structs and the `PT_*` constants at the top of xdna-emu/build.rs (lines 38-46). Paste into archspec/build.rs.
 
@@ -888,7 +891,7 @@ let port_data = gen_stream_ports(&regdb, &_out_dir);
 gen_stream_ranges(&regdb, &port_data, &_out_dir);
 ```
 
-- [ ] **Step 2: Include `gen_stream_ports.rs` at the `aie2` root**
+- [x] **Step 2: Include `gen_stream_ports.rs` at the `aie2` root**
 
 `gen_stream_ports.rs` defines top-level consts (`COMPUTE_MASTER_PORTS`, etc.) that callers expect at `xdna_archspec::aie2::COMPUTE_MASTER_PORTS`. Add after `port_type`:
 
@@ -901,7 +904,7 @@ include!(concat!(env!("OUT_DIR"), "/gen_stream_ports.rs"));
 pub mod stream_switch;
 ```
 
-- [ ] **Step 3: Create `src/aie2/stream_switch.rs`**
+- [x] **Step 3: Create `src/aie2/stream_switch.rs`**
 
 ```rust
 //! Stream switch port ranges and configuration bits (from AM025).
@@ -913,7 +916,7 @@ pub mod stream_switch;
 include!(concat!(env!("OUT_DIR"), "/gen_stream_ranges.rs"));
 ```
 
-- [ ] **Step 4: Rewrite consumers that reference `xdna_archspec::aie2::stream_switch::*`**
+- [x] **Step 4: Rewrite consumers that reference `xdna_archspec::aie2::stream_switch::*`**
 
 After Task 4's `sed`, consumers already use `xdna_archspec::aie2::stream_switch::...`. Verify no stragglers:
 
@@ -923,11 +926,11 @@ rg 'crate::arch::stream_switch|crate::arch::COMPUTE_MASTER_PORTS|crate::arch::ME
 
 Expected: no matches. If any appear, hand-edit those files to use the `xdna_archspec::aie2::...` path.
 
-- [ ] **Step 5: Delete the generators and their `PT_*` constants from `xdna-emu/build.rs`**
+- [x] **Step 5: Delete the generators and their `PT_*` constants from `xdna-emu/build.rs`**
 
 Delete the listed functions, structs, and the top-level `PT_CORE`/`PT_FIFO`/etc. constants.
 
-- [ ] **Step 6: Build + test + bridge smoke**
+- [x] **Step 6: Build + test + bridge smoke**
 
 ```bash
 cargo build
@@ -936,7 +939,7 @@ cargo test -p xdna-archspec --lib
 ./scripts/emu-bridge-test.sh --no-hw -v add_one
 ```
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add -A
@@ -968,7 +971,7 @@ EOF
 - Modify: `crates/xdna-archspec/src/aie2/mod.rs`
 - Modify: `build.rs` (xdna-emu)
 
-- [ ] **Step 1: Copy `gen_trace_events` and `write_trace_event_stub` into archspec/build.rs**
+- [x] **Step 1: Copy `gen_trace_events` and `write_trace_event_stub` into archspec/build.rs**
 
 From xdna-emu/build.rs: `fn gen_trace_events` (~line 1382) and any helpers it calls (`write_trace_event_stub`, Python-invocation logic). The bridge path resolves relative to the workspace root; the xdna-emu version uses `manifest_dir.parent()` -- archspec's version uses `workspace_root` directly.
 
@@ -980,7 +983,7 @@ println!("cargo:rerun-if-changed={}", bridge_path.display());
 gen_trace_events(&bridge_path, &_out_dir);
 ```
 
-- [ ] **Step 2: Create `src/aie2/trace_events.rs`**
+- [x] **Step 2: Create `src/aie2/trace_events.rs`**
 
 ```rust
 //! Trace event codes extracted from mlir-aie.
@@ -992,13 +995,13 @@ gen_trace_events(&bridge_path, &_out_dir);
 include!(concat!(env!("OUT_DIR"), "/gen_trace_events.rs"));
 ```
 
-- [ ] **Step 3: Declare the module in `aie2/mod.rs`**
+- [x] **Step 3: Declare the module in `aie2/mod.rs`**
 
 ```rust
 pub mod trace_events;
 ```
 
-- [ ] **Step 4: Rewrite consumer imports**
+- [x] **Step 4: Rewrite consumer imports**
 
 The previous path was `crate::arch::trace_events` or similar. Verify what Task 4's `sed` produced:
 
@@ -1008,11 +1011,11 @@ rg 'xdna_archspec::aie2::trace_events' src/
 
 If consumers were previously referring to a different path (e.g., `crate::arch::trace_event` or a top-level inclusion), hand-edit them to use `xdna_archspec::aie2::trace_events`.
 
-- [ ] **Step 5: Delete `gen_trace_events` + `write_trace_event_stub` from xdna-emu/build.rs**
+- [x] **Step 5: Delete `gen_trace_events` + `write_trace_event_stub` from xdna-emu/build.rs**
 
 Also delete the `bridge_path` rebuild trigger and the call site from `main()`.
 
-- [ ] **Step 6: Build + test + bridge smoke**
+- [x] **Step 6: Build + test + bridge smoke**
 
 ```bash
 cargo build
@@ -1021,7 +1024,7 @@ cargo test -p xdna-archspec --lib
 ./scripts/emu-bridge-test.sh --no-hw -v add_one
 ```
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add -A
@@ -1062,13 +1065,13 @@ EOF
 - Modify: `crates/xdna-archspec/src/aie2/mod.rs`
 - Modify: `build.rs` (xdna-emu)
 
-- [ ] **Step 1: Move the directory**
+- [x] **Step 1: Move the directory**
 
 ```bash
 git mv build_helpers crates/xdna-archspec/build_helpers
 ```
 
-- [ ] **Step 2: Add `tblgen` as a build-dep on `xdna-archspec`**
+- [x] **Step 2: Add `tblgen` as a build-dep on `xdna-archspec`**
 
 Edit `crates/xdna-archspec/Cargo.toml`'s `[build-dependencies]`:
 
@@ -1078,7 +1081,7 @@ serde_json = "1"
 tblgen = { git = "https://github.com/FIM43-Redeye/tblgen-rs.git", branch = "feat/varbit-init", default-features = false, features = ["llvm21-0"] }
 ```
 
-- [ ] **Step 3: Remove `tblgen` from xdna-emu's build-deps**
+- [x] **Step 3: Remove `tblgen` from xdna-emu's build-deps**
 
 Edit `Cargo.toml` (top-level)'s `[build-dependencies]`:
 
@@ -1092,7 +1095,7 @@ cc = "1"
 
 (The `tblgen` line is removed. `xdna-archspec` stays because xdna-emu's shrinking `build.rs` still calls it indirectly through the xrt-plugin install logic's environment setup, though not directly -- double-check post-Task 11.)
 
-- [ ] **Step 4: Add `mod build_helpers;` + `gen_tablegen` call to archspec/build.rs**
+- [x] **Step 4: Add `mod build_helpers;` + `gen_tablegen` call to archspec/build.rs**
 
 Copy the TableGen block from xdna-emu/build.rs (the section starting with `if aie2_td.exists()` around line 164 and the `build_helpers::extract::extract_all(...)` + `build_helpers::codegen::generate_tablegen_file(...)` calls). Paste into archspec/build.rs's `main()`. Also copy the `llvm_aie_path` resolution.
 
@@ -1105,7 +1108,7 @@ mod build_helpers;
 
 (Next to the other `#[path]` includes.)
 
-- [ ] **Step 5: Create `src/aie2/isa/mod.rs`**
+- [x] **Step 5: Create `src/aie2/isa/mod.rs`**
 
 ```rust
 //! AIE2 ISA decoder tables extracted from llvm-aie TableGen.
@@ -1113,7 +1116,7 @@ mod build_helpers;
 pub mod decoder_tables;
 ```
 
-- [ ] **Step 6: Create `src/aie2/isa/decoder_tables.rs`**
+- [x] **Step 6: Create `src/aie2/isa/decoder_tables.rs`**
 
 ```rust
 //! Complete instruction decoder tables extracted at build time from
@@ -1123,13 +1126,13 @@ pub mod decoder_tables;
 include!(concat!(env!("OUT_DIR"), "/gen_tablegen.rs"));
 ```
 
-- [ ] **Step 7: Declare the module in `aie2/mod.rs`**
+- [x] **Step 7: Declare the module in `aie2/mod.rs`**
 
 ```rust
 pub mod isa;
 ```
 
-- [ ] **Step 8: Rewrite interpreter-decoder imports to point at the new path**
+- [x] **Step 8: Rewrite interpreter-decoder imports to point at the new path**
 
 The interpreter currently imports decoder tables from `crate::tablegen` (xdna-emu's own module that includes `gen_tablegen.rs`). Find the consumer:
 
@@ -1143,11 +1146,11 @@ Whatever file currently does `include!(concat!(env!("OUT_DIR"), "/gen_tablegen.r
 
 Note: xdna-emu's `src/tablegen.rs` file may still exist and serve other purposes. Check whether it has hand-written content. If yes, keep the file but delete the `include!()` line.
 
-- [ ] **Step 9: Delete the TableGen block from xdna-emu/build.rs**
+- [x] **Step 9: Delete the TableGen block from xdna-emu/build.rs**
 
 Delete the `extract_all` / `generate_tablegen_file` section, the `llvm_aie_path` resolution (if not still needed for the decoder-FFI compile in Task 10), and the `#[path = "build_helpers/mod.rs"] mod build_helpers;` line (xdna-emu no longer has a build_helpers dir).
 
-- [ ] **Step 10: Build + test + bridge smoke**
+- [x] **Step 10: Build + test + bridge smoke**
 
 ```bash
 cargo build
@@ -1158,7 +1161,7 @@ cargo test -p xdna-archspec --lib
 
 Expected: baseline. `cargo build -p xdna-archspec` rebuilds the TableGen extraction from scratch on first run (LLVM-aware; takes ~30-60s).
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add -A
@@ -1201,13 +1204,13 @@ EOF
 - Modify: `build.rs` (xdna-emu)
 - Modify: `src/interpreter/decode/` files that import the FFI
 
-- [ ] **Step 1: Move the directory**
+- [x] **Step 1: Move the directory**
 
 ```bash
 git mv decoder_ffi crates/xdna-archspec/decoder_ffi
 ```
 
-- [ ] **Step 2: Add `cc` as a build-dep on `xdna-archspec`**
+- [x] **Step 2: Add `cc` as a build-dep on `xdna-archspec`**
 
 `crates/xdna-archspec/Cargo.toml`'s `[build-dependencies]`:
 
@@ -1218,7 +1221,7 @@ tblgen = { git = "https://github.com/FIM43-Redeye/tblgen-rs.git", branch = "feat
 cc = "1"
 ```
 
-- [ ] **Step 3: Remove `cc` from xdna-emu's build-deps**
+- [x] **Step 3: Remove `cc` from xdna-emu's build-deps**
 
 Top-level `Cargo.toml`'s `[build-dependencies]`:
 
@@ -1230,7 +1233,7 @@ xdna-archspec = { path = "crates/xdna-archspec" }
 
 (If `xdna-archspec` build-dep is no longer used by anything in xdna-emu/build.rs post-Task 11, it gets removed in Task 11. For now it stays.)
 
-- [ ] **Step 4: Copy `compile_llvm_decoder_ffi` and its helpers into archspec/build.rs**
+- [x] **Step 4: Copy `compile_llvm_decoder_ffi` and its helpers into archspec/build.rs**
 
 From xdna-emu/build.rs: locate `fn compile_llvm_decoder_ffi` and any helpers it calls (LLVM probe, library path resolution). Paste into archspec/build.rs. Update any `manifest_dir` references to `manifest_dir` (archspec's), and paths pointing to `decoder_ffi/...` still work because the directory moved alongside the script.
 
@@ -1242,7 +1245,7 @@ compile_llvm_decoder_ffi(&manifest_dir, llvm_aie_path);
 
 (The exact signature depends on the original; adjust to match.)
 
-- [ ] **Step 5: Create `src/aie2/decoder_ffi.rs`**
+- [x] **Step 5: Create `src/aie2/decoder_ffi.rs`**
 
 Copy any `extern "C"` declarations for `aie2_decoder.cpp` from xdna-emu's interpreter module. They are usually in `src/interpreter/decode/llvm_decoder.rs` or similar. Find:
 
@@ -1279,13 +1282,13 @@ extern "C" {
 
 (Copy the actual declarations from the source; this is illustrative.)
 
-- [ ] **Step 6: Declare the module in `aie2/mod.rs`**
+- [x] **Step 6: Declare the module in `aie2/mod.rs`**
 
 ```rust
 pub mod decoder_ffi;
 ```
 
-- [ ] **Step 7: Rewrite interpreter callers to import from the new path**
+- [x] **Step 7: Rewrite interpreter callers to import from the new path**
 
 In xdna-emu interpreter files (likely `src/interpreter/decode/llvm_decoder.rs` or equivalent), replace:
 
@@ -1304,11 +1307,11 @@ use xdna_archspec::aie2::decoder_ffi::{aie2_decoder_create, aie2_decode_instruct
 
 Delete the local `extern "C"` block.
 
-- [ ] **Step 8: Delete `compile_llvm_decoder_ffi` and its helpers from xdna-emu/build.rs**
+- [x] **Step 8: Delete `compile_llvm_decoder_ffi` and its helpers from xdna-emu/build.rs**
 
 Also delete the `llvm_aie_path` resolution if it's no longer used (xdna-emu/build.rs should have nothing referring to LLVM after this task).
 
-- [ ] **Step 9: Build + test + bridge smoke**
+- [x] **Step 9: Build + test + bridge smoke**
 
 ```bash
 cargo build
@@ -1319,7 +1322,7 @@ cargo test -p xdna-archspec --lib
 
 Expected: baseline. This build is the first time the archspec crate performs the C++ link step; if it fails, re-check the paths in `compile_llvm_decoder_ffi` (they must resolve relative to archspec's `manifest_dir`, not xdna-emu's).
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add -A
@@ -1422,7 +1425,7 @@ plan and audit docs).
 
 **Files:** none modified.
 
-- [ ] **Step 1: Full library tests**
+- [x] **Step 1: Full library tests**
 
 ```bash
 cargo test --lib 2>&1 | tail -3
@@ -1430,7 +1433,7 @@ cargo test --lib 2>&1 | tail -3
 
 Expected: `2798 passed; 0 failed; 5 ignored` (baseline).
 
-- [ ] **Step 2: Archspec tests**
+- [x] **Step 2: Archspec tests**
 
 ```bash
 cargo test -p xdna-archspec --lib 2>&1 | tail -3
@@ -1438,7 +1441,7 @@ cargo test -p xdna-archspec --lib 2>&1 | tail -3
 
 Expected: same as baseline (137 passing + 1 pre-existing failure).
 
-- [ ] **Step 3: Release build**
+- [x] **Step 3: Release build**
 
 ```bash
 cargo build --release
@@ -1446,7 +1449,7 @@ cargo build --release
 
 Expected: clean. Release-only compile errors (if any) surface here.
 
-- [ ] **Step 4: Bridge smoke**
+- [x] **Step 4: Bridge smoke**
 
 ```bash
 ./scripts/emu-bridge-test.sh --no-hw -v add_one
@@ -1454,7 +1457,7 @@ Expected: clean. Release-only compile errors (if any) surface here.
 
 Expected: Chess 10/10, Peano 9/9.
 
-- [ ] **Step 5: Full bridge HW run**
+- [x] **Step 5: Full bridge HW run**
 
 Long-running; ~15-30 minutes. Can be scheduled rather than run interactively.
 
@@ -1464,7 +1467,7 @@ Long-running; ~15-30 minutes. Can be scheduled rather than run interactively.
 
 Expected: no regressions vs. pre-Phase-1a baseline (Chess 64/64 PASS; Peano compiles with two pre-existing EMU timeouts + 1 XFAIL).
 
-- [ ] **Step 6: ISA test suite**
+- [x] **Step 6: ISA test suite**
 
 Long-running; ~5-10 minutes.
 
@@ -1474,13 +1477,13 @@ Long-running; ~5-10 minutes.
 
 Expected: no regressions vs. baseline pass count captured in Task 1.
 
-- [ ] **Step 7: Tag**
+- [x] **Step 7: Tag**
 
 ```bash
 git tag phase1-subsys-regs-mem-partA
 ```
 
-- [ ] **Step 8: Append Part A completion log to the audit**
+- [x] **Step 8: Append Part A completion log to the audit**
 
 Edit `docs/arch/subsys1-audit.md`. Append:
 
@@ -1528,7 +1531,7 @@ Generated using Claude Code."
 - Create: `crates/xdna-archspec/src/aie2/memory_map.rs`
 - Modify: `crates/xdna-archspec/src/aie2/mod.rs`
 
-- [ ] **Step 1: Create the module with the derived consts**
+- [x] **Step 1: Create the module with the derived consts**
 
 ```rust
 //! Derived memory-map constants for AIE2.
@@ -1579,13 +1582,13 @@ pub const COMPUTE_DATA_MEMORY_END: u32 = compute::MEMORY_SIZE as u32 - 1;
 pub const MEM_TILE_DATA_MEMORY_END: u32 = memtile::MEMORY_SIZE as u32 - 1;
 ```
 
-- [ ] **Step 2: Declare the module in `aie2/mod.rs`**
+- [x] **Step 2: Declare the module in `aie2/mod.rs`**
 
 ```rust
 pub mod memory_map;
 ```
 
-- [ ] **Step 3: Build and test the crate in isolation**
+- [x] **Step 3: Build and test the crate in isolation**
 
 ```bash
 cargo build -p xdna-archspec
@@ -1594,7 +1597,7 @@ cargo test -p xdna-archspec --lib
 
 Expected: clean, 138 passing + 1 pre-existing.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/xdna-archspec/src/aie2/memory_map.rs crates/xdna-archspec/src/aie2/mod.rs
@@ -1620,7 +1623,7 @@ EOF
 **Files:**
 - Modify: every file in the Task 1 Step 7 audit list that imports from `device::registers_spec` and uses one of the derived consts.
 
-- [ ] **Step 1: Identify which `registers_spec` imports are for derived consts vs. register offsets**
+- [x] **Step 1: Identify which `registers_spec` imports are for derived consts vs. register offsets**
 
 ```bash
 rg -n 'AIE_DATA_MEMORY_BASE|PROGRAM_MEMORY_BASE|PROGRAM_MEMORY_END|DATA_MEMORY_BASE|COMPUTE_DATA_MEMORY_END|MEM_TILE_DATA_MEMORY_END' src/
@@ -1628,7 +1631,7 @@ rg -n 'AIE_DATA_MEMORY_BASE|PROGRAM_MEMORY_BASE|PROGRAM_MEMORY_END|DATA_MEMORY_B
 
 Each match is a consumer that switches to `xdna_archspec::aie2::memory_map`.
 
-- [ ] **Step 2: Rewrite consumers**
+- [x] **Step 2: Rewrite consumers**
 
 For each file the grep found, edit the import. Patterns:
 
@@ -1655,7 +1658,7 @@ use xdna_archspec::aie2::memory_map::DATA_MEMORY_BASE;
 use crate::device::registers_spec::memory_module;  // still needed for now
 ```
 
-- [ ] **Step 3: Build and test**
+- [x] **Step 3: Build and test**
 
 ```bash
 cargo build
@@ -1665,13 +1668,13 @@ cargo test -p xdna-archspec --lib
 
 Expected: baseline.
 
-- [ ] **Step 4: Bridge smoke**
+- [x] **Step 4: Bridge smoke**
 
 ```bash
 ./scripts/emu-bridge-test.sh --no-hw -v add_one
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -1700,7 +1703,7 @@ EOF
 - Modify: `src/device/mod.rs` (drop `registers_spec` decl; add `bit_utils` if created)
 - Modify: consumers of `registers_spec::{memory_module, core_module, mem_tile_module}`
 
-- [ ] **Step 1: Check what's still in `registers_spec.rs`**
+- [x] **Step 1: Check what's still in `registers_spec.rs`**
 
 ```bash
 wc -l src/device/registers_spec.rs
@@ -1709,7 +1712,7 @@ rg '^pub|^fn|^use' src/device/registers_spec.rs
 
 Expected content: `sign_extend_7bit` helper + its test + three `pub mod` shells that `pub use xdna_archspec::aie2::registers{, ::memory, ::mem_tile}::*`.
 
-- [ ] **Step 2: Find `sign_extend_7bit` call sites**
+- [x] **Step 2: Find `sign_extend_7bit` call sites**
 
 ```bash
 rg -n 'sign_extend_7bit' src/
@@ -1717,7 +1720,7 @@ rg -n 'sign_extend_7bit' src/
 
 Record file:line for each.
 
-- [ ] **Step 3: Move `sign_extend_7bit`**
+- [x] **Step 3: Move `sign_extend_7bit`**
 
 If the audit (Task 1 Step 6) shows one or two call sites, inline it. Otherwise (3+ sites) move to a new `src/device/bit_utils.rs`:
 
@@ -1759,13 +1762,13 @@ Add to `src/device/mod.rs`:
 pub mod bit_utils;
 ```
 
-- [ ] **Step 4: Rewrite `sign_extend_7bit` callers**
+- [x] **Step 4: Rewrite `sign_extend_7bit` callers**
 
 If moved: callers switch from `use crate::device::registers_spec::sign_extend_7bit;` to `use crate::device::bit_utils::sign_extend_7bit;`.
 
 If inlined: delete the import and inline the two-line body at each call site.
 
-- [ ] **Step 5: Rewrite callers that use the `memory_module`/`core_module`/`mem_tile_module` shells**
+- [x] **Step 5: Rewrite callers that use the `memory_module`/`core_module`/`mem_tile_module` shells**
 
 ```bash
 rg -n 'registers_spec::memory_module|registers_spec::core_module|registers_spec::mem_tile_module' src/
@@ -1779,7 +1782,7 @@ For each, rewrite:
 | `use crate::device::registers_spec::core_module::CORE_PC;` | `use xdna_archspec::aie2::registers::CORE_PC;` |
 | `use crate::device::registers_spec::mem_tile_module::LOCK_REQUEST_BASE;` | `use xdna_archspec::aie2::registers::mem_tile::LOCK_REQUEST_BASE;` |
 
-- [ ] **Step 6: Delete `src/device/registers_spec.rs`**
+- [x] **Step 6: Delete `src/device/registers_spec.rs`**
 
 ```bash
 git rm src/device/registers_spec.rs
@@ -1787,7 +1790,7 @@ git rm src/device/registers_spec.rs
 
 Edit `src/device/mod.rs`: delete the `pub mod registers_spec;` line.
 
-- [ ] **Step 7: Build and test**
+- [x] **Step 7: Build and test**
 
 ```bash
 cargo build
@@ -1797,13 +1800,13 @@ cargo test -p xdna-archspec --lib
 
 Expected: baseline.
 
-- [ ] **Step 8: Bridge smoke**
+- [x] **Step 8: Bridge smoke**
 
 ```bash
 ./scripts/emu-bridge-test.sh --no-hw -v add_one
 ```
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add -A
@@ -1827,7 +1830,7 @@ EOF
 **Files:**
 - Create: `docs/arch/registers-memory-map.md`
 
-- [ ] **Step 1: Write the design note**
+- [x] **Step 1: Write the design note**
 
 Create `docs/arch/registers-memory-map.md`:
 
@@ -1941,7 +1944,7 @@ shape, lift it behind a trait. If it is only values, keep it in a
 const module.
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add docs/arch/registers-memory-map.md
@@ -1965,7 +1968,7 @@ EOF
 
 **Files:** none modified.
 
-- [ ] **Step 1: Full library tests**
+- [x] **Step 1: Full library tests**
 
 ```bash
 cargo test --lib 2>&1 | tail -3
@@ -1973,7 +1976,7 @@ cargo test --lib 2>&1 | tail -3
 
 Expected: baseline.
 
-- [ ] **Step 2: Archspec tests**
+- [x] **Step 2: Archspec tests**
 
 ```bash
 cargo test -p xdna-archspec --lib 2>&1 | tail -3
@@ -1981,7 +1984,7 @@ cargo test -p xdna-archspec --lib 2>&1 | tail -3
 
 Expected: baseline.
 
-- [ ] **Step 3: Release build**
+- [x] **Step 3: Release build**
 
 ```bash
 cargo build --release
@@ -1989,7 +1992,7 @@ cargo build --release
 
 Expected: clean.
 
-- [ ] **Step 4: Bridge smoke**
+- [x] **Step 4: Bridge smoke**
 
 ```bash
 ./scripts/emu-bridge-test.sh --no-hw -v add_one
@@ -1997,7 +2000,7 @@ Expected: clean.
 
 Expected: Chess 10/10, Peano 9/9.
 
-- [ ] **Step 5: Full bridge HW run**
+- [x] **Step 5: Full bridge HW run**
 
 ```bash
 ./scripts/emu-bridge-test.sh 2>&1 | tee /tmp/claude-1000/subsys1-partB-bridge.log
@@ -2005,7 +2008,7 @@ Expected: Chess 10/10, Peano 9/9.
 
 Expected: no regressions vs. pre-Phase-1a baseline.
 
-- [ ] **Step 6: ISA test suite**
+- [x] **Step 6: ISA test suite**
 
 ```bash
 ./scripts/isa-test.sh 2>&1 | tee /tmp/claude-1000/subsys1-partB-isa.log
@@ -2013,7 +2016,7 @@ Expected: no regressions vs. pre-Phase-1a baseline.
 
 Expected: no regressions.
 
-- [ ] **Step 7: Verify success criteria from the spec**
+- [x] **Step 7: Verify success criteria from the spec**
 
 Each success criterion from the spec `## Success criteria` section:
 
@@ -2041,13 +2044,13 @@ rg '^\s*fn ' crates/xdna-archspec/src/runtime.rs | grep -E 'fn (columns|rows|til
 
 Append a "Success Criteria" section with the above output to `docs/arch/subsys1-audit.md`.
 
-- [ ] **Step 8: Tag**
+- [x] **Step 8: Tag**
 
 ```bash
 git tag phase1-subsys-regs-mem
 ```
 
-- [ ] **Step 9: Append Part B completion log to the audit**
+- [x] **Step 9: Append Part B completion log to the audit**
 
 Edit `docs/arch/subsys1-audit.md`. Append:
 
@@ -2085,7 +2088,7 @@ git commit -m "docs: subsys1 part B completion log
 Generated using Claude Code."
 ```
 
-- [ ] **Step 10: Update `NEXT-STEPS.md`**
+- [x] **Step 10: Update `NEXT-STEPS.md`**
 
 Edit `NEXT-STEPS.md` to reflect Subsystem 1 completion and point to Subsystem 2 (Tile Topology) as the next pickup. Record:
 - Tag shipped: `phase1-subsys-regs-mem`.

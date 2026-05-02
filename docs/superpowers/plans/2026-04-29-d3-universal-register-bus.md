@@ -17,14 +17,17 @@
 
 ---
 
+> **Sweep-as-of 2026-05-01:** D.3 completed -- commits 11d2b66 (regression tests), 61d3a94 (refactor), 9e5fecf (delete dead typed-handler code), d297b98 (post-cleanup). No tag, but the three-commit landing structure called out in the plan was followed. Steps below were executed organically rather than ticked one-by-one; this sweep flips the checkboxes to match the verified completion state.
+
+
 ## Setup
 
-- [ ] **Step 0.1: Establish baseline**
+- [x] **Step 0.1: Establish baseline**
 
 Run: `cargo test --lib 2>&1 | tail -20`
 Expected: all tests pass. Note the test count for comparison.
 
-- [ ] **Step 0.2: Confirm spec is on disk**
+- [x] **Step 0.2: Confirm spec is on disk**
 
 Run: `ls -la docs/superpowers/specs/2026-04-29-d3-universal-register-bus-design.md`
 Expected: file exists, ~278 lines.
@@ -38,14 +41,14 @@ Expected: file exists, ~278 lines.
 
 **Goal:** Add three regression tests. Two are RED (proving the bugs exist); one is GREEN (proving the side-effect-ordering invariant). Commit them in the RED state so bisect tells the story.
 
-- [ ] **Step 1.1: Read the existing tests file to find the end and the import patterns**
+- [x] **Step 1.1: Read the existing tests file to find the end and the import patterns**
 
 Run: `wc -l src/device/state/tests.rs`
 Expected: a line count (no specific value; we're appending).
 
 Read `src/device/state/tests.rs` lines 1-15 to confirm the imports already at the top of the file (`use super::*;` etc.). The new tests don't need additional imports beyond what `super::*` provides plus a few specific items used in the tests — the imports go inline within each test for clarity.
 
-- [ ] **Step 1.2: Append Test A — CORE_CONTROL readback divergence**
+- [x] **Step 1.2: Append Test A — CORE_CONTROL readback divergence**
 
 Append the following test to `src/device/state/tests.rs` (at the end of the file):
 
@@ -83,7 +86,7 @@ fn core_control_cdo_write_is_readable_via_register_bus() {
 }
 ```
 
-- [ ] **Step 1.3: Append Test B — MaskWrite preservation**
+- [x] **Step 1.3: Append Test B — MaskWrite preservation**
 
 Append the following test to `src/device/state/tests.rs`:
 
@@ -132,7 +135,7 @@ fn core_control_cdo_mask_write_preserves_unmasked_bits() {
 }
 ```
 
-- [ ] **Step 1.4: Append Test C — Side-effect-ordering safety net**
+- [x] **Step 1.4: Append Test C — Side-effect-ordering safety net**
 
 Append the following test to `src/device/state/tests.rs`:
 
@@ -232,7 +235,7 @@ fn register_bus_write_to_compute_start_queue_does_not_trigger_unrelated_tile_eff
 }
 ```
 
-- [ ] **Step 1.5: Run the new tests, confirm A and B FAIL, C passes**
+- [x] **Step 1.5: Run the new tests, confirm A and B FAIL, C passes**
 
 Run: `cargo test --lib core_control_cdo_write_is_readable_via_register_bus core_control_cdo_mask_write_preserves_unmasked_bits register_bus_write_to_core_control_does_not_trigger_unrelated_tile_effects register_bus_write_to_compute_start_queue_does_not_trigger_unrelated_tile_effects 2>&1 | tail -40`
 
@@ -245,12 +248,12 @@ Expected:
 If A or B unexpectedly pass, the bug has already been fixed elsewhere — STOP and investigate before continuing.
 If C fails, the invariant assumed by the design is wrong — STOP and re-read the spec.
 
-- [ ] **Step 1.6: Run the full library test suite, confirm only the two new RED tests fail**
+- [x] **Step 1.6: Run the full library test suite, confirm only the two new RED tests fail**
 
 Run: `cargo test --lib 2>&1 | tail -15`
 Expected: total failures = 2; both are the two new RED tests.
 
-- [ ] **Step 1.7: Commit**
+- [x] **Step 1.7: Commit**
 
 Run:
 ```
@@ -294,7 +297,7 @@ Verify with `git log --oneline -3` that the commit landed.
 
 **Goal:** Make `apply_device_op::CoreEnable` and `apply_device_op::DmaStart` route through `write_register` instead of the typed handlers. Stop promoting MaskWrite-to-CORE_CONTROL. After this commit, all four tests from Task 1 pass.
 
-- [ ] **Step 2.1: Add the `start_queue_offset` helper to `src/device/state/cdo.rs`**
+- [x] **Step 2.1: Add the `start_queue_offset` helper to `src/device/state/cdo.rs`**
 
 Append this helper function at the bottom of `src/device/state/cdo.rs` (after the existing `encode_addr` helper at line 184; the file currently ends at line 184). The helper inverts `match_dma_start_queue` from `parser/cdo/semantics.rs`, reconstructing the Start_Queue offset from `(row, channel, dir)` so `apply_device_op::DmaStart` can call `write_register` with the right address.
 
@@ -365,12 +368,12 @@ fn start_queue_offset(
 }
 ```
 
-- [ ] **Step 2.2: Verify the helper compiles standalone**
+- [x] **Step 2.2: Verify the helper compiles standalone**
 
 Run: `cargo build --lib 2>&1 | tail -10`
 Expected: clean build. If any of the imported constants don't exist by that name in `xdna_archspec::aie2::registers::dma`, the compiler will say so — open `xdna-archspec/src/aie2/registers/dma.rs` (or similar path), find the actual constant name, and update the import. The constant names listed above are taken directly from the imports already used in `src/parser/cdo/semantics.rs` lines 42-47 and 129-132, so they should match.
 
-- [ ] **Step 2.3: Rewrite the `CoreEnable` arm in `apply_device_op`**
+- [x] **Step 2.3: Rewrite the `CoreEnable` arm in `apply_device_op`**
 
 In `src/device/state/cdo.rs`, locate the `apply_device_op` match — currently at lines 132-174. Replace the `DeviceOp::CoreEnable` arm. The current arm (around lines 153-155) reads:
 
@@ -395,7 +398,7 @@ Replace with:
             }
 ```
 
-- [ ] **Step 2.4: Rewrite the `DmaStart` arm in `apply_device_op`**
+- [x] **Step 2.4: Rewrite the `DmaStart` arm in `apply_device_op`**
 
 In `src/device/state/cdo.rs`, locate the `DeviceOp::DmaStart` arm (around lines 156-158). The current arm reads:
 
@@ -422,7 +425,7 @@ Replace with:
             }
 ```
 
-- [ ] **Step 2.5: Update the `apply_device_op` doc comment**
+- [x] **Step 2.5: Update the `apply_device_op` doc comment**
 
 In `src/device/state/cdo.rs`, the doc comment for `apply_device_op` (lines 118-131) currently describes the typed-handler architecture. Replace lines 127-131 — the section that reads:
 
@@ -447,7 +450,7 @@ with:
     /// handlers (see D.3 spec for the rationale).
 ```
 
-- [ ] **Step 2.6: Remove the CORE_CONTROL branch from `lower_mask_write`**
+- [x] **Step 2.6: Remove the CORE_CONTROL branch from `lower_mask_write`**
 
 In `src/parser/cdo/semantics.rs`, locate `lower_mask_write` (lines 269-297). The current implementation has a CORE_CONTROL promotion branch at lines 282-294. Replace the body of `lower_mask_write` so it stops promoting:
 
@@ -469,7 +472,7 @@ fn lower_mask_write(address: u32, mask: u32, value: u32) -> DeviceOp {
 
 The `use xdna_archspec::aie2::registers::CORE_CONTROL` import on line 49 is still used by `lower_write` (line 245) — leave it in place.
 
-- [ ] **Step 2.7: Update / remove tests in `semantics.rs` that asserted MaskWrite promotion**
+- [x] **Step 2.7: Update / remove tests in `semantics.rs` that asserted MaskWrite promotion**
 
 In `src/parser/cdo/semantics.rs`, the test module includes:
 - `core_control_mask_write_touching_bit0_promotes_to_core_enable` (around line 624) — this test now FAILS because the promotion was removed. Either update it to assert the new behavior (RegMask, not CoreEnable) or delete it.
@@ -502,7 +505,7 @@ Replace the `core_control_mask_write_touching_bit0_promotes_to_core_enable` test
     }
 ```
 
-- [ ] **Step 2.8: Build, then run targeted tests**
+- [x] **Step 2.8: Build, then run targeted tests**
 
 Run: `cargo build --lib 2>&1 | tail -10`
 Expected: clean build.
@@ -511,14 +514,14 @@ Run: `cargo test --lib core_control_cdo_write_is_readable_via_register_bus core_
 
 Expected: all tests PASS, including the four D.3 regression tests and the renamed `core_control_mask_write_touching_bit0_stays_reg_mask`.
 
-- [ ] **Step 2.9: Run full library suite to catch regressions**
+- [x] **Step 2.9: Run full library suite to catch regressions**
 
 Run: `cargo test --lib 2>&1 | tail -15`
 Expected: **0 failures**, total test count = baseline + 4 (the four new D.3 tests; one semantics test was renamed but count is unchanged for it).
 
 If any pre-existing tests now fail, STOP. The most likely candidate: a test in `src/device/state/tests.rs` or `src/parser/cdo/semantics.rs` that explicitly asserted the old promotion behavior. Read the test, decide if its assertion is now stale (update) or if the refactor actually broke something (back out the change and rethink).
 
-- [ ] **Step 2.10: Commit**
+- [x] **Step 2.10: Commit**
 
 Run:
 ```
@@ -563,18 +566,18 @@ Verify with `git log --oneline -3`.
 
 **Goal:** Run the bridge-test suite to confirm the refactor didn't regress any hardware-equivalent flow before deleting the dead code.
 
-- [ ] **Step 3.1: Rebuild the FFI crate so bridge tests pick up the new code**
+- [x] **Step 3.1: Rebuild the FFI crate so bridge tests pick up the new code**
 
 Run: `cargo build -p xdna-emu-ffi 2>&1 | tail -5`
 Expected: clean build.
 
-- [ ] **Step 3.2: Run the bridge test suite**
+- [x] **Step 3.2: Run the bridge test suite**
 
 Run: `./scripts/emu-bridge-test.sh 2>&1 | tee /tmp/claude-1000/d3-bridge-after-commit2.log`
 
 This takes 15-30 minutes. While it runs, do not start any other hardware-touching test. Once complete:
 
-- [ ] **Step 3.3: Inspect the bridge results**
+- [x] **Step 3.3: Inspect the bridge results**
 
 Run: `tail -60 /tmp/claude-1000/d3-bridge-after-commit2.log`
 Expected: PASS count = 116/118 (the two pre-existing failures are HW-side, unrelated to D.3). If the PASS count is lower, STOP. The most likely culprit is a side-effect-ordering issue we missed in the spec; read the failed test names, locate them in `mlir-aie/build/test/npu-xrt/<name>/`, and diagnose. Do NOT proceed to commit 3 — `apply_core_enable` / `start_dma_channel` are still on disk and provide a comparison reference.
@@ -591,24 +594,24 @@ If PASS count matches baseline, proceed.
 
 **Goal:** Remove `apply_core_enable` and `start_dma_channel`, plus update the inline doc comments in `write_core_register`, `write_dma_channel`, and their masked twins to drop the "non-CDO path" qualifier (the CDO and non-CDO paths are now indistinguishable).
 
-- [ ] **Step 4.1: Verify no callers of `apply_core_enable` and `start_dma_channel` remain**
+- [x] **Step 4.1: Verify no callers of `apply_core_enable` and `start_dma_channel` remain**
 
 Run: `grep -rn "apply_core_enable\|start_dma_channel" src/ --include="*.rs"`
 Expected output: only the function definitions themselves (in `src/device/state/compute.rs`) and possibly doc-comment references that mention them. No actual call sites.
 
 If a call site is found that we missed, stop and route it through `write_register` first.
 
-- [ ] **Step 4.2: Delete `apply_core_enable`**
+- [x] **Step 4.2: Delete `apply_core_enable`**
 
 In `src/device/state/compute.rs`, locate `apply_core_enable` (currently at lines 387-408 — a doc comment plus the function body). Delete the entire block (doc comment + function). The lines immediately preceding it (`mask_write_dma_channel`'s closing brace) and following it (`mask_write_dma_channel` documentation continues on the next item) should remain intact.
 
 After deletion, the section between `mask_write_dma_channel` (which closes around line 385) and the next function should flow smoothly. Verify with `grep -n "fn " src/device/state/compute.rs | head -10` that the function list looks intact (no stray fragments).
 
-- [ ] **Step 4.3: Delete `start_dma_channel`**
+- [x] **Step 4.3: Delete `start_dma_channel`**
 
 In `src/device/state/compute.rs`, locate `start_dma_channel` (currently at lines 292-385 — doc comment plus function body). Delete the entire block. Verify the surrounding functions (`write_dma_channel` before it, `apply_core_enable`'s old position which was already deleted in Step 4.2, then `mask_write_dma_channel`) are still well-formed.
 
-- [ ] **Step 4.4: Update the doc comment on `write_dma_channel`**
+- [x] **Step 4.4: Update the doc comment on `write_dma_channel`**
 
 In `src/device/state/compute.rs`, the doc comment for `write_dma_channel` (currently at lines 162-170) reads:
 
@@ -636,7 +639,7 @@ Replace with:
     /// via `write_tile_register`) reach this function.
 ```
 
-- [ ] **Step 4.5: Update the doc comment on `mask_write_dma_channel`**
+- [x] **Step 4.5: Update the doc comment on `mask_write_dma_channel`**
 
 In `src/device/state/compute.rs`, locate `mask_write_dma_channel`'s doc comment (around the function's current location after deletions, formerly at lines 410-416). It reads:
 
@@ -662,7 +665,7 @@ Replace with:
     /// and per-channel handlers, applied to the merged value here.
 ```
 
-- [ ] **Step 4.6: Update the doc comment on `write_core_register`**
+- [x] **Step 4.6: Update the doc comment on `write_core_register`**
 
 In `src/device/state/compute.rs`, the doc comment for `write_core_register` (currently lines 612-619) reads:
 
@@ -689,7 +692,7 @@ Replace with:
     /// `write_tile_register`) reach this function.
 ```
 
-- [ ] **Step 4.7: Build and run the full library suite**
+- [x] **Step 4.7: Build and run the full library suite**
 
 Run: `cargo build --lib 2>&1 | tail -5`
 Expected: clean build.
@@ -697,7 +700,7 @@ Expected: clean build.
 Run: `cargo test --lib 2>&1 | tail -15`
 Expected: 0 failures, total test count unchanged from end of Task 2.
 
-- [ ] **Step 4.8: Commit**
+- [x] **Step 4.8: Commit**
 
 Run:
 ```
@@ -731,17 +734,17 @@ Verify with `git log --oneline -4` that the three D.3 commits land in sequence.
 
 **Goal:** Run the bridge suite once more to confirm the deletions didn't regress anything.
 
-- [ ] **Step 5.1: Rebuild FFI crate**
+- [x] **Step 5.1: Rebuild FFI crate**
 
 Run: `cargo build -p xdna-emu-ffi 2>&1 | tail -5`
 Expected: clean build.
 
-- [ ] **Step 5.2: Run bridge tests**
+- [x] **Step 5.2: Run bridge tests**
 
 Run: `./scripts/emu-bridge-test.sh 2>&1 | tee /tmp/claude-1000/d3-bridge-after-commit3.log`
 Wait for completion (15-30 minutes).
 
-- [ ] **Step 5.3: Verify baseline**
+- [x] **Step 5.3: Verify baseline**
 
 Run: `tail -60 /tmp/claude-1000/d3-bridge-after-commit3.log`
 Expected: PASS count matches the post-commit-2 run (116/118).

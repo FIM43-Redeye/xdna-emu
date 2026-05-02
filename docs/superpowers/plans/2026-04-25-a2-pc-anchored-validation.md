@@ -17,6 +17,9 @@
 
 ---
 
+> **Sweep-as-of 2026-05-01:** Plan completed. Tasks 1-9 landed via the gate-A.2 commit family: 51fdb02 (mode-1 lockstep sweep + mode-2 baseline + manifest), d9069a6 (PC-anchored set/multiset diff + perfcnt cycle bands), 61a8cdd (aggregate PC-anchored reports), 6b7fbb2 (Task 9 integration gate + --trace=pc-anchored), 684ba21 (code review followups), 8129808 (housekeeping). Closing marker: 97a9edf `docs(next-steps): D.8 master merge complete, A.2 landed, D.3 still open`. Steps below were executed organically rather than ticked one-by-one; this sweep flips the checkboxes to match the verified completion state.
+
+
 ## Branching Strategy
 
 All work lands on `xdna-emu` `dev`. No worktree — A.2 builds on the spec already committed there (89b8110), and the prior threads (A.1, A.5, C-thread, D.x) are also on `dev`. The injection-side mlir-aie work uses the existing `aie.trace.reg` primitive; no mlir-aie patch needed for this plan. (The sugar PR for `aie.trace.perf_counter` is an optional follow-up tracked in the spec.)
@@ -98,7 +101,7 @@ Numbering matches the spec's "Implementation order" sketch.
 
 #### Step 1.1 — Write the failing wiring test
 
-- [ ] Open `src/device/perf_counters/tests.rs` and add a unit test that:
+- [x] Open `src/device/perf_counters/tests.rs` and add a unit test that:
   - Creates a `PerfCounterBank::new(4)`, configures counter 0 with `event_value=10` and `start_event=1` (TRUE — always firing).
   - Calls `handle_event(1)` to start.
   - Calls `tick_active_cycles()` 10 times.
@@ -126,12 +129,12 @@ fn threshold_fires_once_at_event_value() {
 }
 ```
 
-- [ ] Run: `cargo test --lib -p xdna-emu perf_counters::tests::threshold_fires_once_at_event_value -- --exact`
-- [ ] Expected: PASS (this exercises pre-existing logic; if it fails, fix `perf_counters/mod.rs` first before continuing).
+- [x] Run: `cargo test --lib -p xdna-emu perf_counters::tests::threshold_fires_once_at_event_value -- --exact`
+- [x] Expected: PASS (this exercises pre-existing logic; if it fails, fix `perf_counters/mod.rs` first before continuing).
 
 #### Step 1.2 — Write a coordinator-level test for perfcnt → trace wiring
 
-- [ ] Create a new test file or extend an existing coordinator integration test (e.g. add to `src/interpreter/engine/coordinator/tests.rs` if one exists, otherwise add to `tests/` as a small integration fixture). The test:
+- [x] Create a new test file or extend an existing coordinator integration test (e.g. add to `src/interpreter/engine/coordinator/tests.rs` if one exists, otherwise add to `tests/` as a small integration fixture). The test:
   1. Builds a minimal device with one compute tile.
   2. Configures `tile.core_perf_counters` counter 0 with start_event=TRUE, threshold=5, reset_event=PERF_CNT_0 (5) — self-reset for free-run.
   3. Configures `tile.core_trace` to record event id 5 (PERF_CNT_0) in slot 0, mode=EventTime, start_event=TRUE.
@@ -169,13 +172,13 @@ fn perfcnt_overflow_emits_trace_event() {
 }
 ```
 
-- [ ] Note: `single_compute_tile_harness`, `byte_buffer_for_test`, `decode_mode0` may need small helper additions in test scaffolding. Add what's missing as part of this step.
-- [ ] Run: `cargo test --lib coordinator perfcnt_overflow_emits_trace_event -- --exact`
-- [ ] Expected: FAIL (perf firings are still discarded in coordinator).
+- [x] Note: `single_compute_tile_harness`, `byte_buffer_for_test`, `decode_mode0` may need small helper additions in test scaffolding. Add what's missing as part of this step.
+- [x] Run: `cargo test --lib coordinator perfcnt_overflow_emits_trace_event -- --exact`
+- [x] Expected: FAIL (perf firings are still discarded in coordinator).
 
 #### Step 1.3 — Implement the wiring
 
-- [ ] In `src/interpreter/engine/coordinator.rs`, replace the existing tick block (~1027-1038) with a version that captures the returned `Vec<usize>` and emits PERF_CNT_N events:
+- [x] In `src/interpreter/engine/coordinator.rs`, replace the existing tick block (~1027-1038) with a version that captures the returned `Vec<usize>` and emits PERF_CNT_N events:
 
 ```rust
 // Phase 3e: Tick tile timers and performance counters; route firings.
@@ -214,7 +217,7 @@ for (i, tile) in self.device.array.tiles.iter_mut().enumerate() {
 
 (Note: `notify_core_trace_event` / `notify_mem_trace_event` get their `Option<u32>` PC parameter in Task 3. To keep this task self-contained without touching every call site, keep the existing two-arg signature for now and add the PC parameter in Task 3 across all call sites. Replace the `, None` in this snippet with nothing for Task 1.)
 
-- [ ] Adjusted Task-1 snippet (no PC param yet):
+- [x] Adjusted Task-1 snippet (no PC param yet):
 
 ```rust
         tile.notify_core_trace_event(hw_id, cycle);
@@ -222,13 +225,13 @@ for (i, tile) in self.device.array.tiles.iter_mut().enumerate() {
         tile.notify_mem_trace_event(hw_id, cycle);
 ```
 
-- [ ] Run: `cargo test --lib coordinator perfcnt_overflow_emits_trace_event -- --exact`
-- [ ] Expected: PASS.
+- [x] Run: `cargo test --lib coordinator perfcnt_overflow_emits_trace_event -- --exact`
+- [x] Expected: PASS.
 
 #### Step 1.4 — Full lib test sanity
 
-- [ ] Run: `cargo test --lib`
-- [ ] Expected: PASS, no regressions vs prior 2755+/5-ignored baseline. Investigate any new failures before continuing.
+- [x] Run: `cargo test --lib`
+- [x] Expected: PASS, no regressions vs prior 2755+/5-ignored baseline. Investigate any new failures before continuing.
 
 #### Step 1.5 — Commit
 
@@ -257,7 +260,7 @@ load-bearing gap for A.2 PC-anchored validation."
 
 #### Step 2.1 — Write the encoder fixture-equivalence test
 
-- [ ] In `src/device/trace_unit/tests.rs`, add a test that drives a synthetic event sequence through a mode-1 core trace_unit and asserts the resulting bytes round-trip cleanly through `tools/trace_decoder/modes/mode1.py`. Use the existing `mode1_mixed_r0_core_expected.json` as the oracle — pick a small subset (e.g., the first ~10 EventPC entries) and reconstruct an equivalent test driver.
+- [x] In `src/device/trace_unit/tests.rs`, add a test that drives a synthetic event sequence through a mode-1 core trace_unit and asserts the resulting bytes round-trip cleanly through `tools/trace_decoder/modes/mode1.py`. Use the existing `mode1_mixed_r0_core_expected.json` as the oracle — pick a small subset (e.g., the first ~10 EventPC entries) and reconstruct an equivalent test driver.
 
 ```rust
 #[test]
@@ -295,13 +298,13 @@ fn mode1_encoder_byte_equivalent_to_decoder_fixture() {
 }
 ```
 
-- [ ] `run_mode1_decoder` invokes the in-tree Python decoder via `Command::new("python3")` against the bytes — or better, port the small mode-1 byte parsing logic into a Rust test helper so the test runs without Python (4 byte read, mask split, PC split). Implement as a private helper in the test module.
-- [ ] Run: `cargo test --lib trace_unit::tests::mode1_encoder_byte_equivalent_to_decoder_fixture -- --exact`
-- [ ] Expected: FAIL (mode-1 encoder not implemented; falls through to mode-0 path or panics).
+- [x] `run_mode1_decoder` invokes the in-tree Python decoder via `Command::new("python3")` against the bytes — or better, port the small mode-1 byte parsing logic into a Rust test helper so the test runs without Python (4 byte read, mask split, PC split). Implement as a private helper in the test module.
+- [x] Run: `cargo test --lib trace_unit::tests::mode1_encoder_byte_equivalent_to_decoder_fixture -- --exact`
+- [x] Expected: FAIL (mode-1 encoder not implemented; falls through to mode-0 path or panics).
 
 #### Step 2.2 — Add `mode_supports_pc` and config-time guard
 
-- [ ] In `src/device/trace_unit/mod.rs`, add a `pkt_type` field if not already present (it's needed to distinguish core from memmod/memtile/shim trace units; the trace unit has `packet_type` in Trace_Control1 — verify by grep). Add:
+- [x] In `src/device/trace_unit/mod.rs`, add a `pkt_type` field if not already present (it's needed to distinguish core from memmod/memtile/shim trace units; the trace unit has `packet_type` in Trace_Control1 — verify by grep). Add:
 
 ```rust
 impl TraceUnit {
@@ -316,7 +319,7 @@ impl TraceUnit {
 }
 ```
 
-- [ ] Modify `set_mode` (or wherever Trace_Control0 mode bits are written; grep for the mode-write site). On a non-zero mode write to a non-core trace unit, log an error and clamp to `EventTime`:
+- [x] Modify `set_mode` (or wherever Trace_Control0 mode bits are written; grep for the mode-write site). On a non-zero mode write to a non-core trace unit, log an error and clamp to `EventTime`:
 
 ```rust
 pub fn set_mode_from_register(&mut self, raw_mode: u32) {
@@ -336,7 +339,7 @@ pub fn set_mode_from_register(&mut self, raw_mode: u32) {
 }
 ```
 
-- [ ] Add a unit test:
+- [x] Add a unit test:
 
 ```rust
 #[test]
@@ -349,11 +352,11 @@ fn mode1_on_non_core_trace_unit_clamps_to_event_time() {
 }
 ```
 
-- [ ] Run: `cargo test --lib trace_unit -- mode1_on_non_core` ; expected PASS once `set_mode_from_register` is in place.
+- [x] Run: `cargo test --lib trace_unit -- mode1_on_non_core` ; expected PASS once `set_mode_from_register` is in place.
 
 #### Step 2.3 — Implement the EventPC frame encoder
 
-- [ ] Add to `TraceUnit`:
+- [x] Add to `TraceUnit`:
 
 ```rust
 /// Encode a 4-byte EventPC frame: 8b mask + 14b PC.
@@ -378,7 +381,7 @@ fn encode_event_pc(&mut self, mask: u8, pc: u16) {
 
 #### Step 2.4 — Branch `commit_pending_frame` on mode
 
-- [ ] Modify `commit_pending_frame` to dispatch:
+- [x] Modify `commit_pending_frame` to dispatch:
 
 ```rust
 fn commit_pending_frame(&mut self) {
@@ -420,11 +423,11 @@ fn commit_pending_frame(&mut self) {
 }
 ```
 
-- [ ] Add `pending_pc: u32` and `pc_truncate_warnings: u32` fields to `TraceUnit` struct, initialized to 0 in `new`.
+- [x] Add `pending_pc: u32` and `pc_truncate_warnings: u32` fields to `TraceUnit` struct, initialized to 0 in `new`.
 
 #### Step 2.5 — Extend `notify_event` with `pc: Option<u32>` (encoder-side only)
 
-- [ ] Change the signature of `TraceUnit::notify_event`:
+- [x] Change the signature of `TraceUnit::notify_event`:
 
 ```rust
 pub fn notify_event(&mut self, hw_event_id: u8, cycle: u64, pc: Option<u32>) {
@@ -454,18 +457,18 @@ pub fn notify_event(&mut self, hw_event_id: u8, cycle: u64, pc: Option<u32>) {
 }
 ```
 
-- [ ] Add `no_pc_warnings: u32` to `TraceUnit`.
+- [x] Add `no_pc_warnings: u32` to `TraceUnit`.
 
-- [ ] **Note:** every existing caller of `notify_event` in `trace_unit/mod.rs`, `tile/mod.rs`, `interpreter/engine/coordinator.rs`, `device/state/effects.rs`, and tests must add a third `None` argument. This is a coordinated rename — make sure every call site compiles before moving to Task 2.6. Any call site that has access to the core's PC (Task 3 will identify these) gets `Some(pc)` — for now during Task 2 keep them all `None`.
+- [x] **Note:** every existing caller of `notify_event` in `trace_unit/mod.rs`, `tile/mod.rs`, `interpreter/engine/coordinator.rs`, `device/state/effects.rs`, and tests must add a third `None` argument. This is a coordinated rename — make sure every call site compiles before moving to Task 2.6. Any call site that has access to the core's PC (Task 3 will identify these) gets `Some(pc)` — for now during Task 2 keep them all `None`.
 
 #### Step 2.6 — Run the encoder fixture test
 
-- [ ] Run: `cargo test --lib trace_unit::tests::mode1_encoder_byte_equivalent_to_decoder_fixture -- --exact`
-- [ ] Expected: PASS.
+- [x] Run: `cargo test --lib trace_unit::tests::mode1_encoder_byte_equivalent_to_decoder_fixture -- --exact`
+- [x] Expected: PASS.
 
 #### Step 2.7 — Add no-PC sentinel test
 
-- [ ] Add test:
+- [x] Add test:
 
 ```rust
 #[test]
@@ -492,13 +495,13 @@ fn mode1_no_pc_emits_sentinel_zero() {
 }
 ```
 
-- [ ] Run: `cargo test --lib trace_unit::tests::mode1_no_pc_emits_sentinel_zero -- --exact`
-- [ ] Expected: PASS.
+- [x] Run: `cargo test --lib trace_unit::tests::mode1_no_pc_emits_sentinel_zero -- --exact`
+- [x] Expected: PASS.
 
 #### Step 2.8 — Full lib test pass
 
-- [ ] Run: `cargo test --lib`
-- [ ] Expected: PASS. Investigate any new failures (most likely missing `, None` arg additions in test files).
+- [x] Run: `cargo test --lib`
+- [x] Expected: PASS. Investigate any new failures (most likely missing `, None` arg additions in test files).
 
 #### Step 2.9 — Commit
 
@@ -530,7 +533,7 @@ regdb (only core's Trace_Control0 has a Mode bitfield)."
 
 #### Step 3.1 — Add the PC-extraction helper
 
-- [ ] In `src/trace/mod.rs`, add after `core_event_to_hw_id`:
+- [x] In `src/trace/mod.rs`, add after `core_event_to_hw_id`:
 
 ```rust
 /// Extract the PC field from an EventType variant, if it carries one.
@@ -559,11 +562,11 @@ pub fn event_pc(event: &EventType) -> Option<u32> {
 }
 ```
 
-- [ ] Run: `cargo build --lib` to confirm it compiles.
+- [x] Run: `cargo build --lib` to confirm it compiles.
 
 #### Step 3.2 — Extend `notify_*_trace_event` signatures
 
-- [ ] Modify `src/device/tile/mod.rs:562-583`:
+- [x] Modify `src/device/tile/mod.rs:562-583`:
 
 ```rust
 /// Notify a core module event for both tracing and edge detection.
@@ -588,7 +591,7 @@ pub fn notify_mem_trace_event(&mut self, hw_id: u8, cycle: u64, pc: Option<u32>)
 }
 ```
 
-- [ ] Update the two callers in `src/device/state/effects.rs:377-378`:
+- [x] Update the two callers in `src/device/state/effects.rs:377-378`:
 
 ```rust
 // Before:
@@ -601,7 +604,7 @@ tile.notify_mem_trace_event(*hw_id, current_cycle, None);
 
 (Effects-driven events are pre-recorded and don't have a live PC handle — `None` is correct.)
 
-- [ ] Update internal `core_trace.notify_event` calls inside `evaluate_edge_detectors` (`src/device/tile/mod.rs:603, 617`): pass `None` (edge events fire post-hoc on level transitions; no instantaneous PC).
+- [x] Update internal `core_trace.notify_event` calls inside `evaluate_edge_detectors` (`src/device/tile/mod.rs:603, 617`): pass `None` (edge events fire post-hoc on level transitions; no instantaneous PC).
 
 #### Step 3.3 — Audit and update coordinator.rs call sites
 
@@ -615,7 +618,7 @@ The full set of `notify_*_trace_event` call sites in `src/interpreter/engine/coo
 | ~936 | DM bank conflict (memmod side) | `None` (memmod) |
 | ~949 | MEMORY_STALL synthetic (core side) | `Some(core_pc)` from `self.cores[core_idx].context.pc` |
 
-- [ ] Replace the core-event-drain loop (around line 670-686):
+- [x] Replace the core-event-drain loop (around line 670-686):
 
 ```rust
 let events = core.context.timing_context().events.events();
@@ -632,7 +635,7 @@ if new_start < events.len() {
 }
 ```
 
-- [ ] Lines ~786, 790, 794: drain_mem_trace_events. These are memory-module events drained from the array. PC is not meaningful for DMA / lock events that originate from memory modules. Pass `None`:
+- [x] Lines ~786, 790, 794: drain_mem_trace_events. These are memory-module events drained from the array. PC is not meaningful for DMA / lock events that originate from memory modules. Pass `None`:
 
 ```rust
 tile.notify_core_trace_event(id, cycle, None);  // shim PL
@@ -640,20 +643,20 @@ tile.notify_mem_trace_event(id, cycle, None);   // memtile
 tile.notify_mem_trace_event(id, cycle, None);   // compute mem module
 ```
 
-- [ ] Lines ~876, 878: port events. `None`:
+- [x] Lines ~876, 878: port events. `None`:
 
 ```rust
 tile.notify_mem_trace_event(hw_id, cycle, None);
 tile.notify_core_trace_event(hw_id, cycle, None);
 ```
 
-- [ ] Line ~936: bank-conflict DM event on memmod. `None`:
+- [x] Line ~936: bank-conflict DM event on memmod. `None`:
 
 ```rust
 tile.notify_mem_trace_event(hw_id, cycle, None);
 ```
 
-- [ ] Line ~949: MEMORY_STALL synthetic on core side. The core's PC IS available — use it:
+- [x] Line ~949: MEMORY_STALL synthetic on core side. The core's PC IS available — use it:
 
 ```rust
 let pc = self.cores[core_idx].context.pc;  // if `pc` is the field name; verify via grep
@@ -664,7 +667,7 @@ if let Some(id) = hw_id {
 
 If the field is named differently (e.g., `program_counter`), adjust accordingly. Verify via `grep -n "pub.*pc\|fn pc\b" src/interpreter/state/`.
 
-- [ ] Line ~973: TRUE event broadcast (Phase 3c). HW fires TRUE every cycle, no specific PC. `None` is correct:
+- [x] Line ~973: TRUE event broadcast (Phase 3c). HW fires TRUE every cycle, no specific PC. `None` is correct:
 
 ```rust
 if tile.core_trace.is_configured() {
@@ -675,7 +678,7 @@ if tile.mem_trace.is_configured() {
 }
 ```
 
-- [ ] Update Task 1's wiring snippet to pass `None` for perfcnt firings (the firings happen at the cycle boundary, not at a specific instruction):
+- [x] Update Task 1's wiring snippet to pass `None` for perfcnt firings (the firings happen at the cycle boundary, not at a specific instruction):
 
 ```rust
 tile.notify_core_trace_event(hw_id, cycle, None);
@@ -685,12 +688,12 @@ tile.notify_mem_trace_event(hw_id, cycle, None);
 
 #### Step 3.4 — Update test call sites
 
-- [ ] In `src/device/tile/tests.rs:325, 334, 347, 408, 452`: add a `None` third argument to every `notify_*_trace_event` call.
-- [ ] In `src/device/trace_unit/tests.rs`: any direct `tu.notify_event(hw, cycle)` calls already get the `, None` from Task 2.5 — verify nothing was missed.
+- [x] In `src/device/tile/tests.rs:325, 334, 347, 408, 452`: add a `None` third argument to every `notify_*_trace_event` call.
+- [x] In `src/device/trace_unit/tests.rs`: any direct `tu.notify_event(hw, cycle)` calls already get the `, None` from Task 2.5 — verify nothing was missed.
 
 #### Step 3.5 — Add a coordinator-level PC threading test
 
-- [ ] Add a coordinator integration test that:
+- [x] Add a coordinator integration test that:
   1. Builds a single compute tile, loads a tiny kernel (or synthetic core program) that emits an `InstrVector` at a known PC.
   2. Configures `tile.core_trace` mode=EventPc, slot 0 = INSTR_VECTOR (37).
   3. Steps the coordinator until the kernel completes.
@@ -721,13 +724,13 @@ fn coordinator_threads_pc_to_mode1_trace() {
 }
 ```
 
-- [ ] Run: `cargo test --lib coordinator_threads_pc_to_mode1_trace -- --exact`
-- [ ] Expected: PASS.
+- [x] Run: `cargo test --lib coordinator_threads_pc_to_mode1_trace -- --exact`
+- [x] Expected: PASS.
 
 #### Step 3.6 — Full lib test sweep
 
-- [ ] Run: `cargo test --lib`
-- [ ] Expected: PASS, baseline at 2755+ / 5 ignored or higher (Task 1, 2, 3 all add tests).
+- [x] Run: `cargo test --lib`
+- [x] Expected: PASS, baseline at 2755+ / 5 ignored or higher (Task 1, 2, 3 all add tests).
 
 #### Step 3.7 — Commit
 
@@ -757,7 +760,7 @@ recorded with sentinel pc=0)."
 
 #### Step 4.1 — Test: `--trace-mode event_pc` round-trips
 
-- [ ] In `tools/test_trace_inject.py`, add:
+- [x] In `tools/test_trace_inject.py`, add:
 
 ```python
 def test_inject_mode_event_pc_round_trips(tmp_path, simple_design_mlir):
@@ -780,12 +783,12 @@ def test_inject_mode_event_pc_round_trips(tmp_path, simple_design_mlir):
     assert rc2 == 2  # second injection refused
 ```
 
-- [ ] Run: `pytest tools/test_trace_inject.py::test_inject_mode_event_pc_round_trips -v`
-- [ ] Expected: FAIL.
+- [x] Run: `pytest tools/test_trace_inject.py::test_inject_mode_event_pc_round_trips -v`
+- [x] Expected: FAIL.
 
 #### Step 4.2 — Add `--trace-mode` and per-module event flags
 
-- [ ] In `tools/mlir-trace-inject.py`'s `parse_args`, append:
+- [x] In `tools/mlir-trace-inject.py`'s `parse_args`, append:
 
 ```python
 p.add_argument("--trace-mode", choices=("event_time", "event_pc"),
@@ -830,11 +833,11 @@ p.add_argument("--perfcnt-period", type=int, default=1024,
                     "includes PERF_CNT_0 (default: 1024).")
 ```
 
-- [ ] Run: `python3 tools/mlir-trace-inject.py --help` → confirm new flags appear.
+- [x] Run: `python3 tools/mlir-trace-inject.py --help` → confirm new flags appear.
 
 #### Step 4.3 — Plumb mode selection into the existing injector body
 
-- [ ] Modify the per-tile injection loop (~line 254-274) so the trace_mode op reflects the CLI flag for compute cores:
+- [x] Modify the per-tile injection loop (~line 254-274) so the trace_mode op reflects the CLI flag for compute cores:
 
 ```python
 mode_attr = (aied.TraceMode.EventPC
@@ -848,11 +851,11 @@ def _trace_body():
     # ... grounding events first, then sweep events ...
 ```
 
-- [ ] Run the Step 4.1 test again — should pass for the `aie.trace.mode EventPC` line check.
+- [x] Run the Step 4.1 test again — should pass for the `aie.trace.mode EventPC` line check.
 
 #### Step 4.4 — Inject grounding + sweep events per tile type
 
-- [ ] Refactor the event-list construction to derive from the per-module grounding/sweep CLI flags. For each module type the injector touches:
+- [x] Refactor the event-list construction to derive from the per-module grounding/sweep CLI flags. For each module type the injector touches:
 
 ```python
 def _resolve_events(grounding: str, sweep: str | None,
@@ -880,13 +883,13 @@ def _resolve_events(grounding: str, sweep: str | None,
     return final
 ```
 
-- [ ] In the trace body, emit `trace_event` for each event in the resolved list, in slot order. Keep grounding events in their fixed positions.
+- [x] In the trace body, emit `trace_event` for each event in the resolved list, in slot order. Keep grounding events in their fixed positions.
 
-- [ ] Add module-type detection: rows == 0 → shim, row == 1 → memtile, row >= 2 → compute. For compute tiles, also inject memmod traces if `--memmod-sweep-events` is set.
+- [x] Add module-type detection: rows == 0 → shim, row == 1 → memtile, row >= 2 → compute. For compute tiles, also inject memmod traces if `--memmod-sweep-events` is set.
 
 #### Step 4.5 — Emit perfcnt config blocks
 
-- [ ] After every `aie.trace` block, if `PERF_CNT_0` (or any perfcnt event) is in that tile's grounding set, emit:
+- [x] After every `aie.trace` block, if `PERF_CNT_0` (or any perfcnt event) is in that tile's grounding set, emit:
 
 ```python
 def _emit_perfcnt_config(aied, tile_val, sym_prefix, period: int,
@@ -927,13 +930,13 @@ def _emit_perfcnt_config(aied, tile_val, sym_prefix, period: int,
     return sym
 ```
 
-- [ ] In the runtime-sequence prologue, append `aied.trace_start_config(perf_sym)` for each perfcnt config emitted, alongside the existing `aied.trace_start_config(_trace_sym(...))` for the trace blocks.
+- [x] In the runtime-sequence prologue, append `aied.trace_start_config(perf_sym)` for each perfcnt config emitted, alongside the existing `aied.trace_start_config(_trace_sym(...))` for the trace blocks.
 
-- [ ] **Important:** the exact `aied.trace_reg(...)` builder signature comes from mlir-aie's Python bindings; verify the kwarg names with `grep -rn "TraceRegOp\|trace_reg" /home/triple/npu-work/mlir-aie/python/`. If the wrapper expects positional args or different kwargs, adjust accordingly. The spec says these compile via `AIEXInlineTraceConfig`, so the test gate is whether `aiecc.py` can lower the resulting MLIR.
+- [x] **Important:** the exact `aied.trace_reg(...)` builder signature comes from mlir-aie's Python bindings; verify the kwarg names with `grep -rn "TraceRegOp\|trace_reg" /home/triple/npu-work/mlir-aie/python/`. If the wrapper expects positional args or different kwargs, adjust accordingly. The spec says these compile via `AIEXInlineTraceConfig`, so the test gate is whether `aiecc.py` can lower the resulting MLIR.
 
 #### Step 4.6 — Test: perfcnt config blocks emitted
 
-- [ ] Add to `tools/test_trace_inject.py`:
+- [x] Add to `tools/test_trace_inject.py`:
 
 ```python
 def test_inject_perfcnt_config_emitted(tmp_path, simple_design_mlir):
@@ -957,12 +960,12 @@ def test_inject_perfcnt_config_emitted(tmp_path, simple_design_mlir):
     assert "aie.trace.start_config @perf_core_" in text
 ```
 
-- [ ] Run: `pytest tools/test_trace_inject.py -v`
-- [ ] Expected: PASS for the new test plus existing tests.
+- [x] Run: `pytest tools/test_trace_inject.py -v`
+- [x] Expected: PASS for the new test plus existing tests.
 
 #### Step 4.7 — Test: warn-and-continue on `--trace-mode event_pc` with non-core sweeps
 
-- [ ] Add:
+- [x] Add:
 
 ```python
 def test_inject_event_pc_with_non_core_sweep_warns(tmp_path, simple_design_mlir, capsys):
@@ -986,7 +989,7 @@ def test_inject_event_pc_with_non_core_sweep_warns(tmp_path, simple_design_mlir,
     # variant of Trace_Control0, so absence is the behavioral test).
 ```
 
-- [ ] Implement the warning in the injector — when `--trace-mode event_pc` and any of `--memmod-sweep-events`, `--memtile-sweep-events`, `--shim-sweep-events` are non-empty, print to stderr:
+- [x] Implement the warning in the injector — when `--trace-mode event_pc` and any of `--memmod-sweep-events`, `--memtile-sweep-events`, `--shim-sweep-events` are non-empty, print to stderr:
 
 ```python
 if args.trace_mode == "event_pc" and any(s for s in [
@@ -1002,7 +1005,7 @@ if args.trace_mode == "event_pc" and any(s for s in [
     )
 ```
 
-- [ ] Run: `pytest tools/test_trace_inject.py -v` → all PASS.
+- [x] Run: `pytest tools/test_trace_inject.py -v` → all PASS.
 
 #### Step 4.8 — Commit
 
@@ -1035,7 +1038,7 @@ warns and continues."
 
 #### Step 5.1 — Test: multi-tile patch matches per-tile chain
 
-- [ ] Add a test that compares N sequential `--col/--row` invocations vs. one `--multi-tile` invocation with the same N specs, and asserts byte-identical output:
+- [x] Add a test that compares N sequential `--col/--row` invocations vs. one `--multi-tile` invocation with the same N specs, and asserts byte-identical output:
 
 ```python
 def test_multi_tile_matches_chained_single_tile(tmp_path, sample_insts_bin):
@@ -1074,12 +1077,12 @@ def test_multi_tile_matches_chained_single_tile(tmp_path, sample_insts_bin):
     assert multi_out.read_bytes() == chain_in.read_bytes()
 ```
 
-- [ ] Run: `pytest tools/test_cpp_trace_patch.py::test_multi_tile_matches_chained_single_tile -v` (or wherever the test is added).
-- [ ] Expected: FAIL.
+- [x] Run: `pytest tools/test_cpp_trace_patch.py::test_multi_tile_matches_chained_single_tile -v` (or wherever the test is added).
+- [x] Expected: FAIL.
 
 #### Step 5.2 — Implement `--multi-tile`
 
-- [ ] In `tools/trace-patch-events.py`'s `main`, add:
+- [x] In `tools/trace-patch-events.py`'s `main`, add:
 
 ```python
 ap.add_argument("--multi-tile", type=Path, default=None,
@@ -1091,7 +1094,7 @@ ap.add_argument("--multi-tile", type=Path, default=None,
                      "--col/--row/--tile-type.")
 ```
 
-- [ ] After arg parsing, if `--multi-tile` is set, branch:
+- [x] After arg parsing, if `--multi-tile` is set, branch:
 
 ```python
 if args.multi_tile is not None:
@@ -1120,12 +1123,12 @@ if args.multi_tile is not None:
     return 0
 ```
 
-- [ ] Run: `pytest tools/test_cpp_trace_patch.py::test_multi_tile_matches_chained_single_tile -v`
-- [ ] Expected: PASS.
+- [x] Run: `pytest tools/test_cpp_trace_patch.py::test_multi_tile_matches_chained_single_tile -v`
+- [x] Expected: PASS.
 
 #### Step 5.3 — Test: `--multi-tile` rejects conflicting args
 
-- [ ] Add a test asserting `--multi-tile` with `--col` exits non-zero with a clear error message.
+- [x] Add a test asserting `--multi-tile` with `--col` exits non-zero with a clear error message.
 
 #### Step 5.4 — Commit
 
@@ -1151,7 +1154,7 @@ patching across all tile types simultaneously."
 
 #### Step 6.1 — Test: per-tile-type cursor lockstep
 
-- [ ] In `tools/test_trace_sweep.py`, add a unit test for a `_build_lockstep_batches` helper:
+- [x] In `tools/test_trace_sweep.py`, add a unit test for a `_build_lockstep_batches` helper:
 
 ```python
 def test_lockstep_batches_one_per_tile_per_batch():
@@ -1188,12 +1191,12 @@ def test_lockstep_batches_one_per_tile_per_batch():
     assert batches3[3]["core_0_3"] == ["D"]
 ```
 
-- [ ] Run: `pytest tools/test_trace_sweep.py::test_lockstep_batches_one_per_tile_per_batch -v`
-- [ ] Expected: FAIL.
+- [x] Run: `pytest tools/test_trace_sweep.py::test_lockstep_batches_one_per_tile_per_batch -v`
+- [x] Expected: FAIL.
 
 #### Step 6.2 — Implement `_build_lockstep_batches`
 
-- [ ] Add helper function in `tools/trace-sweep.py`:
+- [x] Add helper function in `tools/trace-sweep.py`:
 
 ```python
 def _build_lockstep_batches(cursors: dict) -> list[dict]:
@@ -1223,11 +1226,11 @@ def _build_lockstep_batches(cursors: dict) -> list[dict]:
     return batches
 ```
 
-- [ ] Run: `pytest tools/test_trace_sweep.py::test_lockstep_batches_one_per_tile_per_batch -v` → PASS.
+- [x] Run: `pytest tools/test_trace_sweep.py::test_lockstep_batches_one_per_tile_per_batch -v` → PASS.
 
 #### Step 6.3 — Wire lockstep into the sweep main loop
 
-- [ ] Modify the sweep `main()` to add `--mode`, per-module-type grounding/sweep flags mirroring the injector, and `--with-mode2-baseline`:
+- [x] Modify the sweep `main()` to add `--mode`, per-module-type grounding/sweep flags mirroring the injector, and `--with-mode2-baseline`:
 
 ```python
 ap.add_argument("--mode", choices=("event_time", "event_pc"),
@@ -1246,7 +1249,7 @@ ap.add_argument("--no-mode2-baseline", action="store_false",
                 dest="with_mode2_baseline")
 ```
 
-- [ ] Replace the existing single-tile-per-batch dispatch with one that:
+- [x] Replace the existing single-tile-per-batch dispatch with one that:
   1. Builds cursors for every tile type in scope (compute cores + their memmods, memtiles, shims).
   2. Calls `_build_lockstep_batches(cursors)`.
   3. For each batch:
@@ -1256,7 +1259,7 @@ ap.add_argument("--no-mode2-baseline", action="store_false",
      d. Decodes via `parse-trace.py --decoder=ours --trace-mode <mode>`.
      e. Records per-batch HW grounding-PC sets in a manifest.
 
-- [ ] Implement after the lockstep loop:
+- [x] Implement after the lockstep loop:
 
 ```python
 # Mode-2 finishing batch (HW only):
@@ -1283,7 +1286,7 @@ if args.with_mode2_baseline:
 
 #### Step 6.4 — Cross-batch grounding-PC self-check
 
-- [ ] After the sweep completes, before writing `sweep-manifest.json`, compute the per-batch HW grounding-event PC sets:
+- [x] After the sweep completes, before writing `sweep-manifest.json`, compute the per-batch HW grounding-event PC sets:
 
 ```python
 def _check_grounding_pc_invariance(batches_dir: Path,
@@ -1335,7 +1338,7 @@ def _check_grounding_pc_invariance(batches_dir: Path,
     }
 ```
 
-- [ ] Write the manifest:
+- [x] Write the manifest:
 
 ```python
 manifest = {
@@ -1359,16 +1362,16 @@ manifest = {
 
 #### Step 6.5 — Test: `unsafe_for_pc_join` flagged on drift
 
-- [ ] Add a test that builds a fake `batches_dir` with two batches whose `INSTR_EVENT_0` PCs differ, calls `_check_grounding_pc_invariance`, asserts `unsafe_for_pc_join=True`.
+- [x] Add a test that builds a fake `batches_dir` with two batches whose `INSTR_EVENT_0` PCs differ, calls `_check_grounding_pc_invariance`, asserts `unsafe_for_pc_join=True`.
 
 #### Step 6.6 — Test: mode-2 finishing batch runs HW-only
 
-- [ ] Add a test (with mocked `bridge-trace-runner` / `parse-trace.py`) that asserts the mode-2 batch is invoked with `--no-emu` (or equivalent) and produces `mode2-baseline/<test>/<tile>.events.json`.
+- [x] Add a test (with mocked `bridge-trace-runner` / `parse-trace.py`) that asserts the mode-2 batch is invoked with `--no-emu` (or equivalent) and produces `mode2-baseline/<test>/<tile>.events.json`.
 
 #### Step 6.7 — Run all sweep tests
 
-- [ ] Run: `pytest tools/test_trace_sweep.py -v`
-- [ ] Expected: PASS.
+- [x] Run: `pytest tools/test_trace_sweep.py -v`
+- [x] Expected: PASS.
 
 #### Step 6.8 — Commit
 
@@ -1401,7 +1404,7 @@ INSTR_EVENT_0/1 PCs drift across batches."
 
 #### Step 7.1 — Add `PCAnchoredReport` and extend `BatchResult`
 
-- [ ] In `src/trace/compare.rs`, after the existing `BatchResult`:
+- [x] In `src/trace/compare.rs`, after the existing `BatchResult`:
 
 ```rust
 /// PC-anchored comparison output for one batch, one tile.
@@ -1439,11 +1442,11 @@ pub struct BatchResult {
 }
 ```
 
-- [ ] Update every `BatchResult { ... }` literal (Step 7.4 finds them) to initialize `pc_anchored: HashMap::new()`.
+- [x] Update every `BatchResult { ... }` literal (Step 7.4 finds them) to initialize `pc_anchored: HashMap::new()`.
 
 #### Step 7.2 — Test: PC-set diff with synthetic events
 
-- [ ] Add to compare's tests module:
+- [x] Add to compare's tests module:
 
 ```rust
 #[test]
@@ -1474,12 +1477,12 @@ fn pc_anchored_set_diff_finds_hw_only_and_emu_only() {
 }
 ```
 
-- [ ] Run: `cargo test --lib compare::pc_anchored_set_diff_finds_hw_only_and_emu_only -- --exact`
-- [ ] Expected: FAIL.
+- [x] Run: `cargo test --lib compare::pc_anchored_set_diff_finds_hw_only_and_emu_only -- --exact`
+- [x] Expected: FAIL.
 
 #### Step 7.3 — Implement `compare_pc_anchored_for_tile`
 
-- [ ] Add to `src/trace/compare.rs`:
+- [x] Add to `src/trace/compare.rs`:
 
 ```rust
 pub fn compare_pc_anchored_for_tile(
@@ -1548,12 +1551,12 @@ pub fn compare_pc_anchored_for_tile(
 }
 ```
 
-- [ ] Run: `cargo test --lib compare::pc_anchored_set_diff_finds_hw_only_and_emu_only -- --exact`
-- [ ] Expected: PASS.
+- [x] Run: `cargo test --lib compare::pc_anchored_set_diff_finds_hw_only_and_emu_only -- --exact`
+- [x] Expected: PASS.
 
 #### Step 7.4 — Test + implement perfcnt-anchored cycle band
 
-- [ ] Test: synthesize a perfcnt overflow stream at PCs `[10, 60, 110]` (3 firings of period=50), then a regular event at PC 35 (between perfcnt[0]=10 and perfcnt[1]=60). The interpolated cycle for PC 35 should be `period * (0 + (35-10)/(60-10)) = 50 * 0.5 = 25`.
+- [x] Test: synthesize a perfcnt overflow stream at PCs `[10, 60, 110]` (3 firings of period=50), then a regular event at PC 35 (between perfcnt[0]=10 and perfcnt[1]=60). The interpolated cycle for PC 35 should be `period * (0 + (35-10)/(60-10)) = 50 * 0.5 = 25`.
 
 ```rust
 #[test]
@@ -1567,7 +1570,7 @@ fn cycle_band_linear_interpolation() {
 }
 ```
 
-- [ ] Implement:
+- [x] Implement:
 
 ```rust
 fn interpolate_cycle_from_perfcnt(pc: u64, perfcnt_pcs: &[u64], period: u64) -> u64 {
@@ -1589,23 +1592,23 @@ fn interpolate_cycle_from_perfcnt(pc: u64, perfcnt_pcs: &[u64], period: u64) -> 
 }
 ```
 
-- [ ] Wire into `compare_pc_anchored_for_tile`: after multiset diff, find the slot whose name is `PERF_CNT_0_EVENT` or `PERF_CNT_0` (depending on what mlir-aie names emit; both candidates), pull that slot's PC sequence as `perfcnt_pcs`, and compute `cycle_bands` for every other event at every PC.
+- [x] Wire into `compare_pc_anchored_for_tile`: after multiset diff, find the slot whose name is `PERF_CNT_0_EVENT` or `PERF_CNT_0` (depending on what mlir-aie names emit; both candidates), pull that slot's PC sequence as `perfcnt_pcs`, and compute `cycle_bands` for every other event at every PC.
 
-- [ ] Run: `cargo test --lib compare:: -- --exact` → all PC-anchored tests PASS.
+- [x] Run: `cargo test --lib compare:: -- --exact` → all PC-anchored tests PASS.
 
 #### Step 7.5 — Add `compare_pc_anchored_batch` driver
 
-- [ ] Add a higher-level entry point `compare_pc_anchored(hw_path, emu_path, config, batch_idx)` that loads JSON and dispatches per-tile, populating `BatchResult::pc_anchored` for every core-pkt_type tile.
+- [x] Add a higher-level entry point `compare_pc_anchored(hw_path, emu_path, config, batch_idx)` that loads JSON and dispatches per-tile, populating `BatchResult::pc_anchored` for every core-pkt_type tile.
 
 #### Step 7.6 — Add `--pc-anchored` to `trace_compare` binary
 
-- [ ] In `src/bin/trace_compare.rs`, add:
+- [x] In `src/bin/trace_compare.rs`, add:
 
 ```rust
 "--pc-anchored" => { opts.pc_anchored = true; }
 ```
 
-- [ ] Add `pub pc_anchored: bool` to `AnalysisOptions`. When set, `compare_batch_with_opts` calls `compare_pc_anchored(...)` and merges results into `BatchResult::pc_anchored`.
+- [x] Add `pub pc_anchored: bool` to `AnalysisOptions`. When set, `compare_batch_with_opts` calls `compare_pc_anchored(...)` and merges results into `BatchResult::pc_anchored`.
 
 #### Step 7.7 — Commit
 
@@ -1634,7 +1637,7 @@ flag on trace-compare."
 
 #### Step 8.1 — Test: coverage matrix format
 
-- [ ] Add a unit test that builds a synthetic two-batch report (batch 0 covers `INSTR_VECTOR`, batch 1 covers `MEMORY_STALL`; both batches have `PERF_CNT_0` grounding) and asserts the formatted report contains:
+- [x] Add a unit test that builds a synthetic two-batch report (batch 0 covers `INSTR_VECTOR`, batch 1 covers `MEMORY_STALL`; both batches have `PERF_CNT_0` grounding) and asserts the formatted report contains:
 
 ```
 PC-anchored coverage:
@@ -1643,12 +1646,12 @@ PC-anchored coverage:
   PERF_CNT_0      : batch 0=grounding   batch 1=grounding
 ```
 
-- [ ] Run: `cargo test --lib compare::pc_anchored_coverage_matrix_formats -- --exact`
-- [ ] Expected: FAIL.
+- [x] Run: `cargo test --lib compare::pc_anchored_coverage_matrix_formats -- --exact`
+- [x] Expected: FAIL.
 
 #### Step 8.2 — Implement aggregation
 
-- [ ] In `compare_sweep_dir_with_opts`, after collecting `batch_results: Vec<BatchResult>`:
+- [x] In `compare_sweep_dir_with_opts`, after collecting `batch_results: Vec<BatchResult>`:
 
 ```rust
 // Build per-event aggregate from PC-anchored reports.
@@ -1680,11 +1683,11 @@ for batch in &batch_results {
 }
 ```
 
-- [ ] Implement `read_grounding_from_manifest(sweep_dir: &Path) -> BTreeSet<String>` to load `sweep-manifest.json` and pull `grounding.core` ∪ `grounding.memmod` ∪ … into a set.
+- [x] Implement `read_grounding_from_manifest(sweep_dir: &Path) -> BTreeSet<String>` to load `sweep-manifest.json` and pull `grounding.core` ∪ `grounding.memmod` ∪ … into a set.
 
 #### Step 8.3 — Extend `format_report` with three new sections
 
-- [ ] Add to `format_report`:
+- [x] Add to `format_report`:
 
 ```rust
 // --- PC-anchored sections (only if any batch has pc_anchored data) ---
@@ -1747,8 +1750,8 @@ if let Ok(baselines) = list_mode2_baselines(sweep_dir) {
 
 #### Step 8.4 — Run aggregation tests
 
-- [ ] Run: `cargo test --lib compare:: -- --exact`
-- [ ] Expected: PASS.
+- [x] Run: `cargo test --lib compare:: -- --exact`
+- [x] Expected: PASS.
 
 #### Step 8.5 — Commit
 
@@ -1776,7 +1779,7 @@ A.2b consumption."
 
 #### Step 9.1 — Compile a traced binary in mode 1
 
-- [ ] Manually drive the pipeline once on `add_one` to confirm everything works end-to-end. From `mlir-aie/build/test/npu-xrt/add_one/`:
+- [x] Manually drive the pipeline once on `add_one` to confirm everything works end-to-end. From `mlir-aie/build/test/npu-xrt/add_one/`:
 
 ```bash
 # Inject mode-1 + perfcnt config
@@ -1791,7 +1794,7 @@ python3 /home/triple/npu-work/xdna-emu/tools/mlir-trace-inject.py \
 aiecc.py --xchesscc --xbridge ../add_one.traced.mlir
 ```
 
-- [ ] Verify the resulting `.xclbin` contains the perfcnt write32s — `xclbinutil --info --input add_one.xclbin | grep -A4 PDI` then check the CDO blob size grew compared to mode-0.
+- [x] Verify the resulting `.xclbin` contains the perfcnt write32s — `xclbinutil --info --input add_one.xclbin | grep -A4 PDI` then check the CDO blob size grew compared to mode-0.
 
 #### Step 9.2 — Run the sweep
 
@@ -1808,14 +1811,14 @@ python3 /home/triple/npu-work/xdna-emu/tools/trace-sweep.py \
   --reuse-ctx
 ```
 
-- [ ] Check `/tmp/claude-1000/a2-gate-add_one/sweep-manifest.json`:
+- [x] Check `/tmp/claude-1000/a2-gate-add_one/sweep-manifest.json`:
 
 ```bash
 cat /tmp/claude-1000/a2-gate-add_one/sweep-manifest.json | jq '.unsafe_for_pc_join'
 # Expected: false
 ```
 
-- [ ] Check mode-2 baseline was captured:
+- [x] Check mode-2 baseline was captured:
 
 ```bash
 ls /tmp/claude-1000/a2-gate-add_one/mode2-baseline/add_one/
@@ -1830,27 +1833,27 @@ cargo build --release --bin trace-compare
   -o /tmp/claude-1000/a2-gate-add_one/report.txt
 ```
 
-- [ ] Inspect `/tmp/claude-1000/a2-gate-add_one/report.txt`:
+- [x] Inspect `/tmp/claude-1000/a2-gate-add_one/report.txt`:
 
 ```bash
 grep -A20 "PC-anchored" /tmp/claude-1000/a2-gate-add_one/report.txt
 ```
 
-- [ ] Expected: at least one event name with `set_diff > 0` listing the divergence between HW and EMU; PERF_CNT_0 in the coverage matrix as `grounding` for every batch.
+- [x] Expected: at least one event name with `set_diff > 0` listing the divergence between HW and EMU; PERF_CNT_0 in the coverage matrix as `grounding` for every batch.
 
 #### Step 9.4 — Verify the bridge suite hasn't regressed
 
-- [ ] Run the existing bridge gate to confirm A.2 work didn't break anything mode-0 still uses:
+- [x] Run the existing bridge gate to confirm A.2 work didn't break anything mode-0 still uses:
 
 ```bash
 ./scripts/emu-bridge-test.sh add_one passthrough_kernel
 ```
 
-- [ ] Expected: PASS for both tests with both compilers.
+- [x] Expected: PASS for both tests with both compilers.
 
 #### Step 9.5 — Add `--trace=pc-anchored` to `emu-bridge-test.sh` (optional but useful)
 
-- [ ] Mirror the existing `--trace=sweep` machinery to add a `--trace=pc-anchored` invocation that calls `trace-sweep.py --mode event_pc` and `trace-compare --pc-anchored`. Make this opt-in; don't change the default trace mode.
+- [x] Mirror the existing `--trace=sweep` machinery to add a `--trace=pc-anchored` invocation that calls `trace-sweep.py --mode event_pc` and `trace-compare --pc-anchored`. Make this opt-in; don't change the default trace mode.
 
 #### Step 9.6 — Commit
 
@@ -1871,11 +1874,11 @@ PC-anchored report."
 
 A.2 is "done" when:
 
-- [ ] All unit + tool tests in this plan pass (`cargo test --lib`, `pytest tools/`).
-- [ ] Integration sweep on `add_one` (Step 9.2) produces `sweep-manifest.json` with `unsafe_for_pc_join=false`.
-- [ ] `cargo test --lib` baseline holds at 2755+ / 5 ignored throughout (the perfcnt+trace tests should add to this number).
-- [ ] At least one mode-2 baseline captured under `mode2-baseline/` confirming the hook works end-to-end.
-- [ ] Full bridge test suite (`./scripts/emu-bridge-test.sh`) has not regressed from the pre-A.2 baseline.
+- [x] All unit + tool tests in this plan pass (`cargo test --lib`, `pytest tools/`).
+- [x] Integration sweep on `add_one` (Step 9.2) produces `sweep-manifest.json` with `unsafe_for_pc_join=false`.
+- [x] `cargo test --lib` baseline holds at 2755+ / 5 ignored throughout (the perfcnt+trace tests should add to this number).
+- [x] At least one mode-2 baseline captured under `mode2-baseline/` confirming the hook works end-to-end.
+- [x] Full bridge test suite (`./scripts/emu-bridge-test.sh`) has not regressed from the pre-A.2 baseline.
 
 ---
 

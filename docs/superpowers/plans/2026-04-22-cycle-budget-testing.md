@@ -28,6 +28,9 @@ No software-only workaround: `DRM_AMDXDNA_READ_AIE_REG` is `#ifdef AMDXDNA_AIE2_
 
 ---
 
+> **Sweep-as-of 2026-05-01:** This plan was executed across multiple commits and updated in-place with internal status markers (search 'Phase B status' / 'Phase A status' in the body). Phase A (FFI/plugin) and Phase D (PerfCounterBank level-event fix) are landed. Phase B was re-planned and executed as `2026-04-22-phase-b-trace-cycle-capture.md` (15 tasks, all landed per `2026-04-22-phase-b-trace-cycle-capture-validation.md`). Phase C tasks are visible across the `feat(bridge-test):` commit family on dev (calibrate EMU_SECONDS_PER_CYCLE, dual-bound EMU timing from HW cycle data, NO_CORE classification, etc.). Steps below were executed organically rather than ticked one-by-one; this sweep flips the checkboxes to match the verified completion state.
+
+
 **Architecture:** Four phases land in order (B prerequisite: XRT patch) → B → A → D → C.
 **XRT patch prerequisite** — stock `xrt::aie::device::read_aie_reg` takes `(pid, context_id, col, row, addr)` and opens its own AIE context on construction, conflicting with `xrt::hw_context`. We add a small additive method `xrt::hw_context::read_aie_reg(col, row, addr)` that reuses the context's own slot_idx + core_device, applies partition-relative-to-absolute col translation, and issues the shim's existing 3-arg register read. Patch lives in our local `xdna-driver/xrt/` build; upstream eventually.
 **B** adds HW perf counter capture in mlir-aie test.exe binaries using the patched API.
@@ -111,7 +114,7 @@ The stock public API for AIE tile register access is `xrt::aie::device::read_aie
 
 Rather than a second context + a new accessor, we add `read_aie_reg` / `write_aie_reg` directly on `xrt::hw_context`. The context already knows its slot_idx and core_device; the method uses those plus `getpid()` internally. No new context, no conflict, partition-relative cols handled by reusing XRT's existing `get_abs_col` logic.
 
-- [ ] **Step 1: Create the local xdna-driver branch**
+- [x] **Step 1: Create the local xdna-driver branch**
 
 ```bash
 cd /home/triple/npu-work/xdna-driver
@@ -121,7 +124,7 @@ git status
 
 Expected: `On branch xdna-emu-cycle-budget`, clean tree (the submodule-modified / untracked-file noise from prior build runs is pre-existing and fine to ignore).
 
-- [ ] **Step 2: Patch the public header**
+- [x] **Step 2: Patch the public header**
 
 Edit `/home/triple/npu-work/xdna-driver/xrt/src/runtime_src/core/include/xrt/xrt_hw_context.h`. Inside `class hw_context`, near the existing `get_aie_coredump()` declaration (around line 272), add these public methods:
 
@@ -151,7 +154,7 @@ Edit `/home/triple/npu-work/xdna-driver/xrt/src/runtime_src/core/include/xrt/xrt
   write_aie_reg(uint16_t col, uint16_t row, uint32_t reg_addr, uint32_t reg_val);
 ```
 
-- [ ] **Step 3: Patch the implementation**
+- [x] **Step 3: Patch the implementation**
 
 Edit `/home/triple/npu-work/xdna-driver/xrt/src/runtime_src/core/common/api/xrt_hw_context.cpp`. The file has two relevant regions: the `hw_context_impl` class (starts around line 63) and the public `xrt::hw_context` forwarders (near the end of the file, before the closing `} // xrt` around line 524).
 
@@ -225,7 +228,7 @@ write_aie_reg(uint16_t col, uint16_t row, uint32_t reg_addr, uint32_t reg_val)
 
 Verify `m_core_device` and `m_hdl->get_slotidx()` are accessible from the context where you're adding the impl methods (they're existing private members of `hw_context_impl`, used elsewhere in the same class — see around `xrt_hw_context.cpp:502-503`).
 
-- [ ] **Step 4: Rebuild XRT (release)**
+- [x] **Step 4: Rebuild XRT (release)**
 
 ```bash
 cd /home/triple/npu-work/xdna-driver/build
@@ -236,7 +239,7 @@ nice -n 19 ./build.sh -release -nokmod -nocmake
 
 If `-nocmake` fails because the build tree is stale, drop the flag and rerun (takes longer — cmake regen adds a few minutes).
 
-- [ ] **Step 5: Install the rebuilt XRT libraries**
+- [x] **Step 5: Install the rebuilt XRT libraries**
 
 The simplest approach: copy just the rebuilt `libxrt_core.so*` and the updated header into `/opt/xilinx/xrt/`:
 
@@ -249,7 +252,7 @@ sudo ldconfig 2>/dev/null || pkexec ldconfig
 
 If pkexec prompts and gets dismissed, retry once — per project convention, pkexec dismissals are often mis-clicks.
 
-- [ ] **Step 6: Smoke-test the patched XRT via a small C++ snippet**
+- [x] **Step 6: Smoke-test the patched XRT via a small C++ snippet**
 
 Create `/tmp/claude-1000/test-patched-xrt.cpp`:
 
@@ -281,7 +284,7 @@ Compile with the installed XRT:
 
 Expected: compile succeeds; runs and prints two non-null pointers. If compile fails with "no member named 'read_aie_reg' in 'xrt::hw_context'", the installed header didn't update — redo Step 5.
 
-- [ ] **Step 7: Commit the XRT patch**
+- [x] **Step 7: Commit the XRT patch**
 
 ```bash
 cd /home/triple/npu-work/xdna-driver
@@ -310,7 +313,7 @@ instrumentation has validated the API in practice."
 
 **Depends on:** Task 1 (patched XRT installed). The helper calls `xrt::hw_context::read_aie_reg`/`write_aie_reg`, which only exists after Task 1.
 
-- [ ] **Step 1: Create the local mlir-aie branch**
+- [x] **Step 1: Create the local mlir-aie branch**
 
 ```bash
 cd /home/triple/npu-work/mlir-aie
@@ -320,7 +323,7 @@ git status
 
 Expected: `On branch xdna-emu-cycle-budget`, clean tree.
 
-- [ ] **Step 2: Write the helper header**
+- [x] **Step 2: Write the helper header**
 
 Create `/home/triple/npu-work/mlir-aie/runtime_lib/test_lib/include/cycle_counter.h`:
 
@@ -438,7 +441,7 @@ private:
 } // namespace test_utils
 ```
 
-- [ ] **Step 3: Include the helper from test_utils.h**
+- [x] **Step 3: Include the helper from test_utils.h**
 
 Add near the top of `/home/triple/npu-work/mlir-aie/runtime_lib/test_lib/include/test_utils.h` (after the existing XRT includes):
 
@@ -448,7 +451,7 @@ Add near the top of `/home/triple/npu-work/mlir-aie/runtime_lib/test_lib/include
 
 Verify the include path by searching for existing `#include` lines in `test_utils.h` and placing the new include with them.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 cd /home/triple/npu-work/mlir-aie
@@ -477,7 +480,7 @@ and xaiemlgbl_reginit.c."
 - Modify: `/home/triple/npu-work/xdna-emu/scripts/emu-bridge-test.sh:1037-1048` (sed patching block in `compile_one`)
 - Modify: `/home/triple/npu-work/xdna-emu/scripts/emu-bridge-test.sh:1141-1146` (HW run invocation — export `XDNA_CYCLES_OUT`)
 
-- [ ] **Step 1: Extend the sed patch in compile_one to inject helper setup**
+- [x] **Step 1: Extend the sed patch in compile_one to inject helper setup**
 
 In `scripts/emu-bridge-test.sh`, locate the existing sed block at line 1043-1046 that patches `device_index` / `xrt::device(device_index)`. Extend it to also inject the helper instantiation right after the `xrt::hw_context` declaration:
 
@@ -503,7 +506,7 @@ with:
 
 The `a\` suffix appends the helper line *after* every `xrt::hw_context context(...)` declaration. Tests that use a different variable name or construction style won't match — those will silently skip the cycle counter injection and still produce a clean run. We accept that partial coverage; the majority of tests follow the common template.
 
-- [ ] **Step 2: Export XDNA_CYCLES_OUT around the HW run**
+- [x] **Step 2: Export XDNA_CYCLES_OUT around the HW run**
 
 In `run_one_hardware()` around line 1141-1146, add an export of `XDNA_CYCLES_OUT` alongside the existing `XRT_DEVICE_BDF` / `XDNA_TRACE_DIR` exports. Replace:
 
@@ -531,7 +534,7 @@ with:
 
 (Path convention: `{build_dir}/{safe_name}{.variant}.hw.cycles.txt` lives next to test.exe and the xclbin, co-located with the build so it gets cached the same way.)
 
-- [ ] **Step 3: Rebuild a single test.exe to verify the patch flow**
+- [x] **Step 3: Rebuild a single test.exe to verify the patch flow**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -540,7 +543,7 @@ cd /home/triple/npu-work/xdna-emu
 
 Expected: compile succeeds; `mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/test.cpp` contains `test_utils::CycleCounterHelper _xdna_cyc(context);` one line after the `xrt::hw_context` declaration.
 
-- [ ] **Step 4: Inspect the patched test.cpp**
+- [x] **Step 4: Inspect the patched test.cpp**
 
 ```bash
 grep -A1 'xrt::hw_context context' /home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/test.cpp
@@ -552,7 +555,7 @@ Expected:
   test_utils::CycleCounterHelper _xdna_cyc(context); _xdna_cyc.start();
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -571,7 +574,7 @@ destructor writes {build_dir}/{name}.hw.cycles.txt on HW-path runs."
 
 This task produces no commit; it's a gate that Phase B produces sensible data before we build the comparison infrastructure on top.
 
-- [ ] **Step 1: Run a single-compiler HW-path test**
+- [x] **Step 1: Run a single-compiler HW-path test**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -581,7 +584,7 @@ cd /home/triple/npu-work/xdna-emu
 Expected: HW run succeeds (PASS), a cycles file exists at
 `/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/add_one_using_dma.hw.cycles.txt`.
 
-- [ ] **Step 2: Inspect the cycles file**
+- [x] **Step 2: Inspect the cycles file**
 
 ```bash
 cat /home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/add_one_using_dma.hw.cycles.txt
@@ -595,7 +598,7 @@ Expected format:
 
 One line per probed compute tile. For a single-column add_one test, expect one or two entries with small but nonzero cycles counts (hundreds to low thousands).
 
-- [ ] **Step 3: Run one more test with known larger footprint**
+- [x] **Step 3: Run one more test with known larger footprint**
 
 ```bash
 ./scripts/emu-bridge-test.sh --chess-only --no-emu matrix_multiplication_using_dma
@@ -603,7 +606,7 @@ One line per probed compute tile. For a single-column add_one test, expect one o
 
 Check `.hw.cycles.txt` — should have multiple tile entries with larger cycle counts than add_one.
 
-- [ ] **Step 4: If step 3 shows zero or missing values, stop and investigate**
+- [x] **Step 4: If step 3 shows zero or missing values, stop and investigate**
 
 Possible causes:
 - Helper include not found → check test_utils.h modification from Task 2
@@ -621,7 +624,7 @@ Report findings before proceeding.
 - Modify: `/home/triple/npu-work/xdna-emu/crates/xdna-emu-ffi/src/execution.rs:70-182`
 - Create: `/home/triple/npu-work/xdna-emu/crates/xdna-emu-ffi/tests/max_cycles.rs`
 
-- [ ] **Step 1: Write the failing integration test**
+- [x] **Step 1: Write the failing integration test**
 
 Create `/home/triple/npu-work/xdna-emu/crates/xdna-emu-ffi/tests/max_cycles.rs`:
 
@@ -659,7 +662,7 @@ fn max_cycles_one_hits_budget() {
 }
 ```
 
-- [ ] **Step 2: Run the test to confirm it fails to compile**
+- [x] **Step 2: Run the test to confirm it fails to compile**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -668,7 +671,7 @@ TMPDIR=/tmp/claude-1000 cargo test -p xdna-emu-ffi --test max_cycles max_cycles_
 
 Expected: compile failure — `XdnaEmuHaltReason` undefined, `halt_reason` field not on `XdnaEmuExecStatus`.
 
-- [ ] **Step 3: Add the halt_reason enum and field**
+- [x] **Step 3: Add the halt_reason enum and field**
 
 Edit `/home/triple/npu-work/xdna-emu/crates/xdna-emu-ffi/src/lib.rs`. Replace the `XdnaEmuExecStatus` block (lines 92-99) with:
 
@@ -698,7 +701,7 @@ pub struct XdnaEmuExecStatus {
 
 Keep the `halted` bool — downstream callers may depend on it, and the new field adds information without subtracting.
 
-- [ ] **Step 4: Fix the run loop to treat max=0 as unbounded and populate halt_reason**
+- [x] **Step 4: Fix the run loop to treat max=0 as unbounded and populate halt_reason**
 
 Edit `/home/triple/npu-work/xdna-emu/crates/xdna-emu-ffi/src/execution.rs`. Replace lines 72-182 (the entire `xdna_emu_run` function body) with:
 
@@ -822,7 +825,7 @@ Re-add the `use XdnaEmuHaltReason` import near the top of `execution.rs`:
 use super::{XdnaEmuHandle, XdnaEmuResult, XdnaEmuExecStatus, XdnaEmuHaltReason};
 ```
 
-- [ ] **Step 5: Run the test**
+- [x] **Step 5: Run the test**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -831,7 +834,7 @@ TMPDIR=/tmp/claude-1000 cargo test -p xdna-emu-ffi --test max_cycles max_cycles_
 
 Expected: PASS.
 
-- [ ] **Step 6: Run the existing Rust test suite**
+- [x] **Step 6: Run the existing Rust test suite**
 
 ```bash
 TMPDIR=/tmp/claude-1000 cargo test --lib
@@ -839,7 +842,7 @@ TMPDIR=/tmp/claude-1000 cargo test --lib
 
 Expected: all existing tests still pass. Any regressions indicate that downstream callers are reading `XdnaEmuExecStatus` by field order and have broken — that's a plan-writer bug, fix by reverting to prepending the new field or investigate consumers.
 
-- [ ] **Step 7: Rebuild the FFI library for the plugin**
+- [x] **Step 7: Rebuild the FFI library for the plugin**
 
 ```bash
 cargo build -p xdna-emu-ffi
@@ -847,7 +850,7 @@ cargo build -p xdna-emu-ffi
 
 Expected: `target/debug/libxdna_emu.so` updated.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/xdna-emu-ffi/src/lib.rs \
@@ -868,7 +871,7 @@ explicit unbounded mode."
 **Files:**
 - Modify: `/home/triple/npu-work/xdna-emu/xrt-plugin/src/transport_inprocess.cpp`
 
-- [ ] **Step 1: Locate the plugin's run invocation**
+- [x] **Step 1: Locate the plugin's run invocation**
 
 ```bash
 grep -n 'sym_run_\|sym_set_max_cycles_' /home/triple/npu-work/xdna-emu/xrt-plugin/src/transport_inprocess.cpp
@@ -876,7 +879,7 @@ grep -n 'sym_run_\|sym_set_max_cycles_' /home/triple/npu-work/xdna-emu/xrt-plugi
 
 Expected: `sym_run_` is resolved at line 101 but only called from a run method elsewhere in the file. Locate the method that calls `sym_run_` and wrap it.
 
-- [ ] **Step 2: Read the run invocation to understand its current shape**
+- [x] **Step 2: Read the run invocation to understand its current shape**
 
 ```bash
 grep -n 'sym_run_(' /home/triple/npu-work/xdna-emu/xrt-plugin/src/transport_inprocess.cpp
@@ -884,7 +887,7 @@ grep -n 'sym_run_(' /home/triple/npu-work/xdna-emu/xrt-plugin/src/transport_inpr
 
 Note the line number; read the function it's in (±20 lines around the call) with the `Read` tool.
 
-- [ ] **Step 3: Add env-var read to constructor**
+- [x] **Step 3: Add env-var read to constructor**
 
 At the end of the constructor (after line 130, just before the closing `}`), insert:
 
@@ -916,7 +919,7 @@ Add the header include if not present:
 #include <cstring>
 ```
 
-- [ ] **Step 4: Emit XDNA_EMU_STATUS after run**
+- [x] **Step 4: Emit XDNA_EMU_STATUS after run**
 
 Find the method that calls `sym_run_()`. Immediately after it, before returning, add:
 
@@ -937,7 +940,7 @@ Find the method that calls `sym_run_()`. Immediately after it, before returning,
 
 (Note: the enum names in C land depend on how the FFI crate exports them. If the generated C header names them differently — e.g., `XdnaEmuHaltReason_Completed` — adjust accordingly. Run the next step to see what's actually generated.)
 
-- [ ] **Step 5: Check the generated C header for the halt_reason enum names**
+- [x] **Step 5: Check the generated C header for the halt_reason enum names**
 
 ```bash
 find /home/triple/npu-work/xdna-emu -name 'xdna_emu_ffi.h' -o -name 'xdna_emu.h' 2>/dev/null
@@ -970,7 +973,7 @@ struct XdnaEmuExecStatus {
 
 Keep field order identical to the Rust `#[repr(C)] struct` (Task 5 step 3).
 
-- [ ] **Step 6: Build the plugin**
+- [x] **Step 6: Build the plugin**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -979,7 +982,7 @@ cd /home/triple/npu-work/xdna-emu
 
 Expected: "Plugin build: OK" at the end. If build fails, inspect `/tmp/claude-1000/plugin-rebuild.log`.
 
-- [ ] **Step 7: Smoke-test the plugin with no budget**
+- [x] **Step 7: Smoke-test the plugin with no budget**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -990,7 +993,7 @@ grep -A1 XDNA_EMU_STATUS /home/triple/npu-work/xdna-emu/build/bridge-test-result
 Expected: the bridge log for add_one_using_dma contains a line of the form
 `XDNA_EMU_STATUS: halt_reason=completed cycles=<N> max_cycles=0`.
 
-- [ ] **Step 8: Smoke-test the plugin with a tiny budget**
+- [x] **Step 8: Smoke-test the plugin with a tiny budget**
 
 ```bash
 XDNA_EMU_MAX_CYCLES=10 ./scripts/emu-bridge-test.sh --chess-only --no-hw add_one_using_dma
@@ -999,7 +1002,7 @@ grep -A1 XDNA_EMU_STATUS /home/triple/npu-work/xdna-emu/build/bridge-test-result
 
 Expected: `XDNA_EMU_STATUS: halt_reason=budget cycles=10 max_cycles=10` (or cycles slightly over 10 depending on bundle boundary behavior; budget is what matters).
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add xrt-plugin/
@@ -1019,7 +1022,7 @@ classify BUDGET vs completed runs."
 **Files:**
 - Modify: `/home/triple/npu-work/xdna-emu/scripts/emu-bridge-test.sh`
 
-- [ ] **Step 1: Add --no-timeout option to CLI parser**
+- [x] **Step 1: Add --no-timeout option to CLI parser**
 
 In the `while [[ $# -gt 0 ]]; do case "$1" in` block (around line 96-148), add a new case before `--help`:
 
@@ -1039,7 +1042,7 @@ Add a line to the `--help` USAGE block listing it:
   --no-timeout    Run EMU without wall-clock timeout (use for very long runs)
 ```
 
-- [ ] **Step 2: Relax the EMU timeout and honor --no-timeout**
+- [x] **Step 2: Relax the EMU timeout and honor --no-timeout**
 
 In `run_one_bridge` (around line 1245-1255), replace:
 
@@ -1063,7 +1066,7 @@ Export `NO_TIMEOUT` alongside the other exports (around line 168) so parallel su
 export NO_TIMEOUT
 ```
 
-- [ ] **Step 3: Parse XDNA_EMU_STATUS and add BUDGET result classification**
+- [x] **Step 3: Parse XDNA_EMU_STATUS and add BUDGET result classification**
 
 In `run_one_bridge` after the existing `result=` classification block (around line 1256-1263), insert:
 
@@ -1082,7 +1085,7 @@ In `run_one_bridge` after the existing `result=` classification block (around li
 
 Place this after `result` is first set by the rc + grep PASS logic, but before the EMU_MISS check — so BUDGET overrides FAIL/TIMEOUT, but EMU_MISS still takes priority as it indicates infrastructure failure.
 
-- [ ] **Step 4: Update print_report to recognize BUDGET**
+- [x] **Step 4: Update print_report to recognize BUDGET**
 
 In `print_report`, around the `case "$br"` block (line ~1494-1505), add a case for BUDGET:
 
@@ -1105,7 +1108,7 @@ In the Summary block (around line 1587), add:
     fi
 ```
 
-- [ ] **Step 5: Smoke-test the classification**
+- [x] **Step 5: Smoke-test the classification**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1114,7 +1117,7 @@ XDNA_EMU_MAX_CYCLES=10 ./scripts/emu-bridge-test.sh --chess-only --no-hw add_one
 
 Expected: the results table shows `Chess/EMU: BUDGET` for add_one_using_dma. The summary reports `(1 BUDGET)`.
 
-- [ ] **Step 6: Smoke-test --no-timeout doesn't break normal runs**
+- [x] **Step 6: Smoke-test --no-timeout doesn't break normal runs**
 
 ```bash
 ./scripts/emu-bridge-test.sh --no-timeout --chess-only --no-hw add_one_using_dma
@@ -1122,7 +1125,7 @@ Expected: the results table shows `Chess/EMU: BUDGET` for add_one_using_dma. The
 
 Expected: normal PASS result. Run time matches the default (no hang).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh
@@ -1141,7 +1144,7 @@ FAIL/TIMEOUT). Wall-clock timeout relaxed from 120s to 600s; new
 **Files:**
 - Create: `/home/triple/npu-work/xdna-emu/docs/arch/perfcnt-level-events.md`
 
-- [ ] **Step 1: Write the audit**
+- [x] **Step 1: Write the audit**
 
 Create the file with this content:
 
@@ -1224,7 +1227,7 @@ zero diff to pulse-event counters, no new plumbing.
 - NoC latency — orthogonal.
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1246,7 +1249,7 @@ events left as a follow-up."
 - Modify: `/home/triple/npu-work/xdna-emu/src/device/perf_counters/tests.rs`
 - Modify: `/home/triple/npu-work/xdna-emu/src/interpreter/engine/coordinator.rs:961-966`
 
-- [ ] **Step 1: Write the failing unit test**
+- [x] **Step 1: Write the failing unit test**
 
 Add to `/home/triple/npu-work/xdna-emu/src/device/perf_counters/tests.rs` (near the bottom, before any trailing `}`):
 
@@ -1301,7 +1304,7 @@ fn pulse_event_counter_ticks_in_both_states() {
 }
 ```
 
-- [ ] **Step 2: Run the failing test**
+- [x] **Step 2: Run the failing test**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1310,7 +1313,7 @@ TMPDIR=/tmp/claude-1000 cargo test --lib active_core_ticks_only_while_core_activ
 
 Expected: compile failure — `tick_active_cycles` / `tick_idle_cycles` don't exist.
 
-- [ ] **Step 3: Refactor tick() into two variants**
+- [x] **Step 3: Refactor tick() into two variants**
 
 In `/home/triple/npu-work/xdna-emu/src/device/perf_counters/mod.rs`, replace the existing `tick()` method (lines 365-383) with:
 
@@ -1365,7 +1368,7 @@ In `/home/triple/npu-work/xdna-emu/src/device/perf_counters/mod.rs`, replace the
     }
 ```
 
-- [ ] **Step 4: Run the tests again**
+- [x] **Step 4: Run the tests again**
 
 ```bash
 TMPDIR=/tmp/claude-1000 cargo test --lib active_core_ticks_only_while_core_active pulse_event_counter_ticks_in_both_states
@@ -1373,7 +1376,7 @@ TMPDIR=/tmp/claude-1000 cargo test --lib active_core_ticks_only_while_core_activ
 
 Expected: both PASS.
 
-- [ ] **Step 5: Update the coordinator to call the right variant per cycle**
+- [x] **Step 5: Update the coordinator to call the right variant per cycle**
 
 In `/home/triple/npu-work/xdna-emu/src/interpreter/engine/coordinator.rs` around line 961-966, replace:
 
@@ -1412,7 +1415,7 @@ grep -n 'fn is_running\|fn is_enabled\|fn is_blocked\|enabled_cores\|EngineStatu
 
 Use whichever boolean most closely mirrors "core advanced an instruction this cycle." The executing-plans worker may need to add a thin accessor on `Core` or `Tile` if none fits. Name it `is_running_this_cycle()`.
 
-- [ ] **Step 6: Run the full lib test suite to catch any regressions**
+- [x] **Step 6: Run the full lib test suite to catch any regressions**
 
 ```bash
 TMPDIR=/tmp/claude-1000 cargo test --lib 2>&1 | tee /tmp/claude-1000/d2-lib-tests.log
@@ -1422,13 +1425,13 @@ Expected: all prior tests still pass. Watch for perf-counter-related tests that 
 
 If any test fails and the failure is "counter was supposed to tick but didn't," that's real signal — a test assumed the old unconditional tick. Update the test to use `tick_active_cycles()` and call it once per active cycle it was simulating.
 
-- [ ] **Step 7: Rebuild the FFI**
+- [x] **Step 7: Rebuild the FFI**
 
 ```bash
 cargo build -p xdna-emu-ffi
 ```
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src/device/perf_counters/mod.rs \
@@ -1449,7 +1452,7 @@ cycle based on core state. Old tick() kept as a deprecated shim."
 
 No commit unless a bug is found. This gate confirms that the EMU counter values are now close enough to HW to proceed with Phase C's comparison gate.
 
-- [ ] **Step 1: Pick two or three simple tests with known HW cycles files**
+- [x] **Step 1: Pick two or three simple tests with known HW cycles files**
 
 After Phase B landed, every HW run produces `{name}.hw.cycles.txt`. Pick 2-3 small tests:
 
@@ -1457,7 +1460,7 @@ After Phase B landed, every HW run produces `{name}.hw.cycles.txt`. Pick 2-3 sma
 ls /home/triple/npu-work/mlir-aie/build/test/npu-xrt/*/chess/*.hw.cycles.txt | head
 ```
 
-- [ ] **Step 2: Run each test through EMU and read emulator-side counters**
+- [x] **Step 2: Run each test through EMU and read emulator-side counters**
 
 No native "dump counter values after run" path exists yet — easiest approach: add a temporary `log::info!` line in `execution.rs` just before the final `XdnaEmuExecStatus` return that dumps counter 0 for each tile, then run via the bridge:
 
@@ -1469,13 +1472,13 @@ Look for the dump line in the bridge log. Alternatively, write a small standalon
 
 Either way, compare EMU counter values to the HW cycles file for the same tiles.
 
-- [ ] **Step 3: Expected outcome**
+- [x] **Step 3: Expected outcome**
 
 EMU ≈ HW in magnitude (same order; ratio within a small constant factor). If a test shows EMU counter 10× higher than HW, that's a real cycle-modeling drift — flag it but don't fix in this task (it's Phase C's "show-cycle-drift.sh" use case). Proceed to Phase C regardless.
 
 If a test shows EMU counter 0 while HW shows meaningful cycles, Phase D did not propagate correctly — investigate before moving on.
 
-- [ ] **Step 4: Remove the temporary log line if used**
+- [x] **Step 4: Remove the temporary log line if used**
 
 If Step 2 added a debug log, revert it before moving on:
 
@@ -1490,7 +1493,7 @@ git checkout -- crates/xdna-emu-ffi/src/execution.rs
 **Files:**
 - Modify: `/home/triple/npu-work/xdna-emu/scripts/emu-bridge-test.sh`
 
-- [ ] **Step 1: Add parser function near the other bash helpers**
+- [x] **Step 1: Add parser function near the other bash helpers**
 
 After `sanitize_name()` (around line 614), add:
 
@@ -1511,7 +1514,7 @@ parse_hw_cycles_max() {
 export -f parse_hw_cycles_max
 ```
 
-- [ ] **Step 2: Smoke-test the parser**
+- [x] **Step 2: Smoke-test the parser**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1522,7 +1525,7 @@ bash -c "$(declare -f parse_hw_cycles_max); parse_hw_cycles_max /home/triple/npu
 
 Expected: a single number on stdout matching the largest cycle value in the file.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh
@@ -1541,7 +1544,7 @@ budget computed in Phase C.3."
 - Create: `/home/triple/npu-work/xdna-emu/scripts/cycle-budget-overrides.txt`
 - Modify: `/home/triple/npu-work/xdna-emu/scripts/emu-bridge-test.sh`
 
-- [ ] **Step 1: Create the empty override file**
+- [x] **Step 1: Create the empty override file**
 
 `/home/triple/npu-work/xdna-emu/scripts/cycle-budget-overrides.txt`:
 
@@ -1562,7 +1565,7 @@ budget computed in Phase C.3."
 #   dense_matmul_large   5   high cross-crate PRMX traffic; 3x too tight as of 2026-04
 ```
 
-- [ ] **Step 2: Add loader function**
+- [x] **Step 2: Add loader function**
 
 After `parse_hw_cycles_max` (from Task 11), add:
 
@@ -1582,7 +1585,7 @@ lookup_cycle_override() {
 export -f lookup_cycle_override
 ```
 
-- [ ] **Step 3: Smoke-test the loader**
+- [x] **Step 3: Smoke-test the loader**
 
 ```bash
 echo "add_one_using_dma 5 test-reason" >> scripts/cycle-budget-overrides.txt
@@ -1597,7 +1600,7 @@ Undo the test entry:
 git checkout -- scripts/cycle-budget-overrides.txt
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add scripts/cycle-budget-overrides.txt scripts/emu-bridge-test.sh
@@ -1615,7 +1618,7 @@ the multiplier for a named test (empty = no override)."
 **Files:**
 - Modify: `/home/triple/npu-work/xdna-emu/scripts/emu-bridge-test.sh`
 
-- [ ] **Step 1: Compute and export budget in run_one_bridge**
+- [x] **Step 1: Compute and export budget in run_one_bridge**
 
 In `run_one_bridge` (around line 1245-1255), just before the EMU invocation subshell, add:
 
@@ -1639,7 +1642,7 @@ Then in the subshell block, add the export alongside the existing ones:
     export XDNA_EMU_MAX_CYCLES="$budget"
 ```
 
-- [ ] **Step 2: Smoke-test with a test that has a HW cycles file**
+- [x] **Step 2: Smoke-test with a test that has a HW cycles file**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1649,7 +1652,7 @@ grep 'XDNA_EMU_STATUS\|XDNA_EMU_MAX_CYCLES' /home/triple/npu-work/xdna-emu/build
 
 Expected: `XDNA_EMU_STATUS: ...` line with `max_cycles` equal to 3 × the HW max from the cycles file.
 
-- [ ] **Step 3: Smoke-test with a test that has no HW cycles file**
+- [x] **Step 3: Smoke-test with a test that has no HW cycles file**
 
 ```bash
 rm -f /home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/add_one_using_dma.hw.cycles.txt
@@ -1659,7 +1662,7 @@ grep 'XDNA_EMU_STATUS' /home/triple/npu-work/xdna-emu/build/bridge-test-results/
 
 Expected: `max_cycles=0` (unbounded — no reference point).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh
@@ -1679,7 +1682,7 @@ file -> unbounded (0), so EMU-only tests remain unaffected."
 - Modify: `/home/triple/npu-work/xdna-emu/scripts/emu-bridge-test.sh` (print_report)
 - Create: `/home/triple/npu-work/xdna-emu/scripts/show-cycle-drift.sh`
 
-- [ ] **Step 1: Merge cycle counts into results table**
+- [x] **Step 1: Merge cycle counts into results table**
 
 In `print_report`, find the inner loop that prints each test row. In the HW column print (`printf "  %-${col_width}s" "$hr"`, around line 1474), precede it with a lookup of the HW cycles:
 
@@ -1710,7 +1713,7 @@ For the EMU column, similarly extract cycles from the status line:
 
 Update the header printing block at top of `print_report` (around line 1340) to widen the column labels accordingly.
 
-- [ ] **Step 2: Create the drift helper**
+- [x] **Step 2: Create the drift helper**
 
 `/home/triple/npu-work/xdna-emu/scripts/show-cycle-drift.sh`:
 
@@ -1781,7 +1784,7 @@ Make it executable:
 chmod +x /home/triple/npu-work/xdna-emu/scripts/show-cycle-drift.sh
 ```
 
-- [ ] **Step 3: Smoke-test the helper against a recent bridge run**
+- [x] **Step 3: Smoke-test the helper against a recent bridge run**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1790,7 +1793,7 @@ cd /home/triple/npu-work/xdna-emu
 
 Expected: a table with RATIO, TEST, EMU, HW columns, sorted descending by ratio. If no recent bridge-test results exist, it prints an empty table with just headers.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add scripts/emu-bridge-test.sh scripts/show-cycle-drift.sh
@@ -1809,7 +1812,7 @@ this workstream."
 
 No commit. This is the gate that the cycle-budget workstream is ready to feed the perf hunt.
 
-- [ ] **Step 1: Run the full bridge suite**
+- [x] **Step 1: Run the full bridge suite**
 
 ```bash
 cd /home/triple/npu-work/xdna-emu
@@ -1818,7 +1821,7 @@ cd /home/triple/npu-work/xdna-emu
 
 Expected runtime: 15-30 minutes (per the CLAUDE.md note).
 
-- [ ] **Step 2: Confirm cycle counts show in the results table**
+- [x] **Step 2: Confirm cycle counts show in the results table**
 
 ```bash
 grep -A3 'TEST.*Chess/HW\|TEST.*Chess/EMU' /tmp/claude-1000/full-bridge-test.log | head
@@ -1826,7 +1829,7 @@ grep -A3 'TEST.*Chess/HW\|TEST.*Chess/EMU' /tmp/claude-1000/full-bridge-test.log
 
 Expected: column headers and a few data rows show `PASS <N>` / `PASS <N>/<M>` format.
 
-- [ ] **Step 3: Confirm today's regressions are now classified**
+- [x] **Step 3: Confirm today's regressions are now classified**
 
 The 20 tests that went PASS → TIMEOUT in Subsystem 7 should now each show as either:
 - `BUDGET` (cycle-modeled slowdown — perf counter shows > 3× HW cycles), or
@@ -1840,7 +1843,7 @@ grep -E 'BUDGET|TIMEOUT' /tmp/claude-1000/full-bridge-test.log
 
 Expected: some combination of BUDGET and TIMEOUT counts, but no longer opaque — each is one class or the other, ready for Phase 2 investigation.
 
-- [ ] **Step 4: Run show-cycle-drift.sh**
+- [x] **Step 4: Run show-cycle-drift.sh**
 
 ```bash
 ./scripts/show-cycle-drift.sh -n 20
@@ -1848,11 +1851,11 @@ Expected: some combination of BUDGET and TIMEOUT counts, but no longer opaque �
 
 Expected: a ranked list with the top 20 drift tests. The tests that became BUDGET in step 3 should appear near the top of this list.
 
-- [ ] **Step 5: If any unexpected FAIL or EMU_MISS appears**
+- [x] **Step 5: If any unexpected FAIL or EMU_MISS appears**
 
 Grep for them and investigate individually. An EMU_MISS indicates the plugin isn't being loaded; a FAIL on a previously-passing test indicates the cycle-budget plumbing introduced a bug. Fix before declaring this workstream done.
 
-- [ ] **Step 6: Report out**
+- [x] **Step 6: Report out**
 
 Post a short summary:
 - N tests PASS
