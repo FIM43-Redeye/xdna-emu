@@ -128,7 +128,8 @@ src/
   visual/       egui-based visual debugger
 xrt-plugin/     XRT driver plugin (C++, delegates to Rust emulator via FFI)
 scripts/        Build, test, and bridge test scripts
-tools/          Trace tooling (inject, sweep, compare, merge, trim)
+tools/          Trace tooling (mlir-trace-inject, parse-trace, trace-sweep,
+                trace-prepare); deprecated/ holds pre-IRON-API versions
 docs/           Architecture docs, format specs, roadmap phases
 ```
 
@@ -146,7 +147,7 @@ docs/           Architecture docs, format specs, roadmap phases
 
 ### What We Emulate (Per Tile)
 
-- **Compute Core**: VLIW processor with 7 functional slots, 256-bit vector unit
+- **Compute Core**: VLIW processor with 8 functional slots, 256-bit vector unit
 - **Local Memory**: 64 KB per compute tile, 512 KB per memory tile
 - **DMA Engine**: 2 channels with multi-dimensional addressing and BD chaining
 - **Locks**: Synchronization primitives with acquire/release semantics
@@ -174,4 +175,4 @@ via [Claude Code](https://claude.ai/code), with human guidance and direction.
 
 ## License
 
-[X11 License](LICENSE)
+[MIT License](LICENSE)

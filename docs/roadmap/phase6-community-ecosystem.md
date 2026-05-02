@@ -51,7 +51,7 @@ A healthy open-source project needs:
 
 ## Current State
 
-- Licensed under X11 License (MIT variant with advertising clause)
+- Licensed under MIT License (no advertising clause; same text the LICENSE file ships)
 - Repository: (to be published)
 - No releases yet
 

@@ -2,9 +2,10 @@
 
 **Goal**: Ensure correctness and maintain quality through automated testing.
 
-**Status**: A test harness exists and all tests pass. But coverage is
-unit-heavy with significant gaps in integration testing, real-binary
-validation, and hardware comparison.
+**Status**: Active. Two strong validation paths exist: the unit test suite
+(`cargo test --lib`) and the dual-compiler bridge test suite
+(`scripts/emu-bridge-test.sh`) which runs mlir-aie xclbins through the full
+XRT path with optional real-NPU HW comparison.
 
 For the confidence tier system, see [ROADMAP.md](../../ROADMAP.md).
 
@@ -38,7 +39,7 @@ These numbers reflect the approximate distribution, not exact counts
 
 ### What the Tests Actually Validate
 
-**VERIFIED by tests:**
+**VERIFIED by unit tests:**
 - Scalar ALU operations produce correct results for representative inputs
 - Vector operations produce correct results for basic element types
 - Memory loads/stores honor addressing modes and alignment
@@ -49,15 +50,21 @@ These numbers reflect the approximate distribution, not exact counts
 - TableGen parser extracts instruction encodings that match manual inspection
 - Bundle format detection works for all format sizes (16-128 bit)
 
+**VERIFIED by bridge tests against real NPU hardware:**
+- Output buffer correctness on ~75 mlir-aie kernels covering objFifo,
+  cascade flows, packet flow (incl. fanin/fanout), memtile, multi-column,
+  runlist, dynamic objFifo, and control-packet kernels
+- Dual-compiler agreement (Chess as ground truth, Peano as second compiler)
+- Multi-tile / multi-column data flow
+
+**VERIFIED by ISA harness against real NPU hardware:**
+- All 4815 ISA test points across the AIE2 ISA
+
 **NOT validated by tests:**
-- Correctness against real hardware output (no hardware comparison suite)
 - Correctness against aiesimulator (no comparison infrastructure)
-- Full ISA coverage (only 7 of 40+ SemanticOps have dedicated tests)
-- Float32 edge cases (NaN, infinity, denormals)
-- Multi-tile data flow under realistic conditions (only 3 multi-tile tests)
-- Continuous-loop kernels (test runner times out)
-- objFifo buffer convention (known wrong: produces input+41)
-- Cycle-count accuracy (no reference to compare against)
+- Float32 edge cases beyond what the ISA harness covers
+- Cycle-count accuracy beyond ~0.6% on clean kernels (broadcast/anchor
+  timing tracked under #321/#322/#323)
 - Performance regression (no benchmarks)
 
 ---
@@ -66,45 +73,37 @@ These numbers reflect the approximate distribution, not exact counts
 
 These are the areas where more testing would most improve confidence.
 
-### 1. Real-Binary Validation
+### 1. SemanticOp Coverage Matrix
 
-Currently only 1-2 mlir-aie kernels have been verified to produce correct
-output. 30 test binaries are available in the local mlir-aie build directory.
-
-**What "adequate" looks like:**
-- All 30 available mlir-aie test binaries load without crashes
-- At least 10 produce correct output values
-- Failures are triaged and tracked as known issues
-
-### 2. SemanticOp Coverage
-
-Only 7 of 40+ defined SemanticOps have tests. The most impactful gaps:
-- No tests for SemanticOps used in real kernels but untested in isolation
-- Vector operations tested with ~18 tests, but no float32 edge cases
-- No coverage matrix mapping SemanticOps to element types
+Most SemanticOps that appear in compiled mlir-aie kernels are exercised
+indirectly through bridge tests, but the dedicated SemanticOp test matrix
+is incomplete. Filling it out gives faster failure localization than a
+full bridge run.
 
 **What "adequate" looks like:**
 - Every SemanticOp that appears in a compiled mlir-aie kernel has at least
-  one test
-- Vector ops tested with at least int8, int16, int32, bf16
+  one dedicated unit test
+- Vector ops tested with int8, int16, int32, bf16, f32 element types
 
-### 3. Multi-Tile Integration
+### 2. Timing Validation Beyond ~0.6%
 
-Only 3 tests exercise more than 1 tile, and those are unit tests that
-construct tile arrays manually, not tests that load real multi-tile binaries.
-
-**What "adequate" looks like:**
-- At least 3 real multi-tile binaries run to completion with correct output
-- Cross-tile DMA, stream routing, and lock synchronization all exercised
-
-### 4. Timing Validation
-
-No timing comparisons exist against any reference. The timing model may be
-completely wrong.
+The trace-sweep pipeline compares EMU vs HW cycle counts on clean
+kernels and shows ~0.6% deviation in the easy cases. The harder cases
+-- broadcast-stop event timing (#321), per-NPU-instruction cycle cost
+(#322), and empirical calibration (#323) -- are tracked but not yet
+landed.
 
 **What "adequate" looks like:**
-- Cycle counts compared against aiesimulator for at least 3 kernels
-- Deviations documented and explained (acceptable vs. bugs)
+- Cycle counts compared against HW for the full bridge test set
+- Anchor window agreement within 1% on every PASSing test
+- aiesimulator differential as a stretch goal (lower priority than
+  real-HW comparison since real NPU is ground truth)
+
+### 3. Differential Kernel Fuzzing
+
+Bridge tests cover hand-written kernels with hand-checked outputs.
+Differential fuzzing against real HW (see Phase 4 "Advanced Testing"
+below) is the long-term path to catching subtle EMU/HW divergence.
 
 ---
 
@@ -134,7 +133,7 @@ These items are from the original Phase 4 plan and remain relevant.
 | Task | Status | Notes |
 |------|--------|-------|
 | Automated comparison with aiesimulator | Not started | |
-| Hardware comparison tests | Not started | Requires NPU access in CI |
+| Hardware comparison tests | VERIFIED | `scripts/emu-bridge-test.sh` runs HW + EMU and diffs outputs; trace-sweep compares cycle counts |
 | Fuzzing for decoder robustness | Not started | |
 | Property-based testing for DMA addressing | Not started | |
 | Differential kernel fuzzer | Not started | See below |

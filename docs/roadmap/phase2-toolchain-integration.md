@@ -50,9 +50,9 @@ still work if they use standard formats, but explicit support is not a priority.
 | Task | Status | Notes |
 |------|--------|-------|
 | Direct integration with mlir-aie build system | TODO | |
-| Run mlir-aie test suite in emulator | TODO | |
-| Support objectFifo patterns | TODO | |
-| Trace comparison with aiesimulator | TODO | |
+| Run mlir-aie test suite in emulator | VERIFIED | `scripts/emu-bridge-test.sh` runs ~75 mlir-aie xclbins through XRT |
+| Support objectFifo patterns | VERIFIED | `add_one_objFifo`, `objectfifo_repeat`, `dynamic_object_fifo` PASS bridge tests |
+| Trace comparison with aiesimulator | TODO | (HW comparison is the primary path; aiesimulator differential is lower priority) |
 
 ---
 

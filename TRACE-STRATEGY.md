@@ -144,116 +144,41 @@ Viewable at https://ui.perfetto.dev/ -- drag and drop the JSON file.
 
 ## Implementation Plan
 
-### Phase 1: Emulator Trace Output (Perfetto JSON)
+### Phases 1-3: Trace Emission, Collection, and Comparison -- LANDED
 
-**Goal:** Make xdna-emu emit the same Perfetto JSON format as the hardware
-trace parser. This is purely emulator-side work with no hardware dependency.
+The trace pipeline is built. Both EMU and HW emit comparable trace data
+through a single decoder, output buffers are diffed, and cycle counts are
+reported per (tile, event).
 
-**What we have today:** `EventLog` in `context.rs` already records timestamped
-events per core (instruction start/complete, lock acquire/release/contention,
-DMA start/complete, branch taken, memory conflict, halt). It just needs a
-Perfetto JSON serializer.
+**Pipeline:**
 
-**Mapping emulator events to hardware trace events:**
+| Stage | Tool / Component |
+|------|------------------|
+| Inject trace routing into kernel MLIR | `tools/mlir-trace-inject.py` (uses mlir-aie's declarative IRON API) |
+| Drive multi-batch event sweep | `bridge-runner/bridge-trace-runner` |
+| Decode raw HW trace to events JSON / cycles / Perfetto | `tools/parse-trace.py` (wraps mlir-aie's `parse_trace`) |
+| Emit EMU-side trace | `src/device/trace_unit/`, `src/trace/` -- writes the same packet-stream format HW does |
+| Compare HW vs EMU events JSON | `src/bin/trace_compare.rs` (Rust binary at `target/release/trace-compare`) |
+| End-to-end orchestration | `scripts/emu-bridge-test.sh --trace=sweep` |
 
-| Emulator EventType | Hardware Trace Event | Notes |
-|--------------------|---------------------|-------|
-| `InstructionStart { pc }` | `INSTR_VECTOR`, `INSTR_LOAD`, etc. | Need to classify by instruction type |
-| `LockAcquireStart` | `INSTR_LOCK_ACQUIRE_REQ` | Direct mapping |
-| `LockAcquired` | (end of LOCK_STALL) | |
-| `LockContention` | `LOCK_STALL` (begin) | |
-| `LockReleased` | `INSTR_LOCK_RELEASE_REQ` | Direct mapping |
-| `DmaStart` | `DMA_S2MM_x_START_TASK` / `DMA_MM2S_x_START_TASK` | Need channel direction |
-| `DmaComplete` | `DMA_S2MM_x_FINISHED_TASK` / `DMA_MM2S_x_FINISHED_TASK` | |
-| `MemoryConflict` | `MEMORY_STALL` | |
-| `BranchTaken` | (no direct hardware trace event) | Could use `INSTR_CALL` / `INSTR_RETURN` |
-| `Halt` | (core becomes idle) | |
+The Rust comparator handles event-sequence diffing with configurable
+tolerance, anchor alignment via the BROADCAST_15 timer-reset broadcast,
+and per-tile summary classification (MATCH / DRIFT / ORDER_MISMATCH /
+MISSING_EVENT). Output buffers are diffed by the bridge harness alongside
+trace events.
 
-**Work items:**
+Two trace modes are supported on both EMU and HW:
+- **Mode 0 (event-time):** the original event-stream format. Default for
+  bridge tests.
+- **Mode 2 (execution / INST_EXEC):** branch-only PC trace per AM020
+  ch.2. EMU mode-2 encoder + comparator landed under A.2b.
 
-1. Add a `TraceExporter` that converts `EventLog` to Perfetto JSON
-2. Expand `EventType` to distinguish instruction classes (vector, load, store,
-   stream, cascade) to match hardware granularity
-3. Add configurable event selection (8 events per tile, mirroring hardware)
-4. Add DMA direction and channel to DMA events
-5. Add port activity tracking (RUNNING/IDLE/STALLED per port)
-6. Emit per-tile process metadata matching mlir-aie conventions
-
-### Phase 2: Hardware Trace Collection
-
-**Goal:** Collect real hardware traces for comparison. This uses the existing
-mlir-aie trace infrastructure -- no new tools needed.
-
-**Workflow:**
-
-```bash
-# 1. Add trace configuration to the kernel's MLIR
-#    (configure_packet_tracing_aie2 in the runtime sequence)
-
-# 2. Compile and run on hardware
-npu-compile kernel_with_trace.py
-npu-run kernel_with_trace.xclbin
-
-# 3. Parse trace buffer to Perfetto JSON
-python mlir-aie/python/utils/trace/parse.py \
-    --input trace.txt \
-    --mlir kernel_with_trace.mlir \
-    --output hw_trace.json
-
-# 4. Also run on emulator
-cargo run -- kernel_with_trace.xclbin --trace emu_trace.json
-```
-
-**Work items:**
-
-1. Script to inject trace configuration into existing test kernels
-2. Validate that our existing test xclbins can have tracing added
-3. Collect reference traces for the 9 currently-passing tests
-4. Document the exact trace event selection used (for reproducibility)
-
-### Phase 3: Trace Comparison
-
-**Goal:** Automated diffing of emulator vs. hardware traces with meaningful
-error reporting.
-
-**Comparison levels (increasing strictness):**
-
-1. **Event ordering:** Do the same events happen in the same order?
-   (Ignoring exact cycle counts -- just the sequence.)
-
-2. **Relative timing:** Are event durations proportional? (e.g., if hardware
-   shows a lock stall of N cycles, does the emulator show a similar stall?)
-
-3. **Cycle-accurate timing:** Do events happen at the exact same cycle?
-   (This is the ultimate goal but may need per-event tolerance bands.)
-
-4. **Output data:** Does the kernel produce identical output buffers?
-   (We already check this in the test harness.)
-
-**Comparison algorithm:**
-
-```
-For each tile in both traces:
-    Align by start event (timer reset broadcast)
-    Extract event sequence: [(event_name, begin_cycle, end_cycle), ...]
-    Compare sequences:
-        - Missing events (in one trace but not the other)
-        - Reordered events (same events, different order)
-        - Timing deltas (same events, same order, different cycles)
-    Report per-tile summary:
-        - MATCH: identical within tolerance
-        - TIMING_DRIFT: same sequence, cycle differences
-        - ORDER_MISMATCH: events in different order
-        - MISSING_EVENT: events present in only one trace
-```
-
-**Work items:**
-
-1. Trace alignment (match start events between emulator and hardware)
-2. Event sequence extraction and normalization
-3. Diff algorithm with configurable tolerance
-4. Report generator (summary + detailed per-tile diffs)
-5. Integration into test harness (`--compare-trace hw_trace.json`)
+**Open follow-ons:**
+- #305: generalize mode-2 baseline collection across all bridge tests
+- #321: fix EMU broadcast/trace-stop timing so late-kernel events are captured
+- #322: populate per-NPU-instruction cycle costs (currently default 1)
+- #323: empirical calibration of those costs against HW timing
+- #306: investigate Peano trace BO empty failure (Chess works; Peano lowering issue)
 
 ### Phase 4: Logic Fuzzer
 
@@ -355,13 +280,13 @@ then cycle-accurate. Each level catches a different class of bugs.
 
 ## Success Criteria
 
-| Milestone | Criteria |
-|-----------|----------|
-| Phase 1 complete | Emulator emits Perfetto JSON; viewable in Perfetto; covers all current EventTypes |
-| Phase 2 complete | 5+ test kernels have matching hardware traces collected |
-| Phase 3 complete | Automated diff tool runs in CI; reports pass/fail per test |
-| Phase 4 complete | Fuzzer generates 100+ kernels/hour; all pass event-ordering comparison |
-| Validation target | Zero event-ordering mismatches on 10,000 fuzzed kernels |
+| Milestone | Criteria | Status |
+|-----------|----------|--------|
+| Phase 1 complete | Emulator emits HW-compatible trace; viewable in Perfetto via parse-trace.py | DONE |
+| Phase 2 complete | 5+ test kernels have matching hardware traces collected | DONE (trace-sweep covers most bridge tests) |
+| Phase 3 complete | Automated diff tool runs in bridge harness; reports pass/fail per test | DONE (`trace_compare.rs`; CI not yet wired) |
+| Phase 4 complete | Fuzzer generates 100+ kernels/hour; all pass event-ordering comparison | NOT STARTED |
+| Validation target | Zero event-ordering mismatches on 10,000 fuzzed kernels | NOT STARTED |
 
 ---
 

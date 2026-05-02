@@ -56,7 +56,7 @@ AIE2 and AIE2P share most of the architecture; AIE2P support will be incremental
 
 | Phase | Status | Confidence | Summary |
 |-------|--------|------------|---------|
-| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | **100% ISA accuracy** | VERIFIED | 4815/4815 ISA test points pass; 2660+ unit tests |
+| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | **100% ISA accuracy** | VERIFIED | 4815/4815 ISA test points pass; full lib test count via `cargo test --lib` |
 | [2. Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) | Partial | VERIFIED | XRT plugin works; bridge tests run; Peano compilation not integrated |
 | [3. Developer Experience](docs/roadmap/phase3-developer-experience.md) | GUI exists | OBSERVED | GUI renders; debugging features not built |
 | [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | Active | Mixed | Dual-compiler bridge tests, trace sweep, hardware comparison |
@@ -76,7 +76,7 @@ detailed breakdown with per-component confidence markers.
 
 The ISA validation harness tests 4815 instruction-level test points across
 the full AIE2 ISA, comparing emulator output against real NPU hardware.
-As of 2026-04-06, all 4815 points pass (100.0%).
+All 4815 points pass (100.0%).
 
 Key verified subsystems:
 - TableGen-driven instruction decoder with O(1) lookup
@@ -102,8 +102,9 @@ All of the above have dedicated unit tests that run on every `cargo test`.
 - Bidirectional ping-pong DMA transferred correctly
 - Trace comparison shows emulator within ~0.6% of hardware cycle counts on clean traces
 
-**Next:** Codebase cleanup (in progress), expand bridge test coverage, begin
-Phase 2 toolchain integration (direct Peano compilation from emulator).
+**Next:** Expand bridge test coverage, populate per-NPU-instruction cycle
+costs (#322), and begin Phase 2 toolchain integration (direct Peano
+compilation from emulator).
 
 ### Phase 2: Toolchain Integration
 
@@ -195,8 +196,6 @@ status that needs validation, or a known issue that lacks a regression test.
 
 ### DMA Subsystem
 
-- Zero-padding fields use element counts but state machine may treat as word counts
-  (known root cause, see `docs/plans/` for fix plan)
 - Token-based DMA synchronization not yet implemented
 
 ### Documentation Drift

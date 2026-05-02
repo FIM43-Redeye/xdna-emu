@@ -37,12 +37,12 @@ Living technical reference material:
   bugs and hardware behaviors (errata, silicon quirks)
 - [`xdna/`](xdna/) -- AMD AM020/AM025 hardware reference manual extracts
 - [`patches/`](patches/) -- Local patches against upstream projects
-- [`plans/`](plans/) -- Active implementation plans (when present)
-- [`superpowers/specs/`](superpowers/specs/) -- Active design specs from
-  brainstorming sessions
-- [`archive/`](archive/) -- Historical content (completed plans, dated
-  audits, superseded investigations). Not actively maintained; preserved
-  for reference when the git log isn't enough.
+- [`superpowers/findings/`](superpowers/findings/) -- Investigation notes
+  for in-flight issues. Closed findings are moved to `archive/findings/`.
+- [`archive/`](archive/) -- Historical content (completed plans + specs +
+  notes + closed findings, dated audits, superseded investigations). Not
+  actively maintained; preserved for reference when the git log isn't
+  enough.
 
 ## External References
 

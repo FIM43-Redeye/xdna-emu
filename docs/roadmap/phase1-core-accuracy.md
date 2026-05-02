@@ -2,9 +2,10 @@
 
 **Goal**: Make the emulator faithful to real AIE2 hardware behavior.
 
-**Status**: **100% ISA accuracy achieved (2026-04-06).** 4815/4815 instruction-level
-test points pass against real NPU hardware. 2660+ unit tests. Sparse vmac
-pipeline is hardware-faithful with oracle-verified routing.
+**Status**: **100% ISA accuracy.** 4815/4815 instruction-level test points
+pass against real NPU hardware. The library test suite is the authoritative
+unit-test count -- run `cargo test --lib`. Sparse vmac pipeline is
+hardware-faithful with oracle-verified routing.
 
 For the confidence tier system used in this document, see [ROADMAP.md](../../ROADMAP.md).
 
@@ -96,10 +97,12 @@ combinations, float edge cases, and sparse matrix multiply.
 
 **Files**: `src/interpreter/execute/memory.rs`, `src/interpreter/timing/memory.rs`
 
-### DMA Engine -- VERIFIED (unit), OBSERVED (integration)
+### DMA Engine -- VERIFIED (unit), VERIFIED (integration via bridge tests)
 
-The DMA engine has good unit test coverage. Multi-tile DMA integration was
-observed working in sessions but is covered by very few automated tests.
+The DMA engine has thorough unit test coverage and is exercised end-to-end
+by the bridge test suite, which loads real mlir-aie xclbins (single-tile,
+multi-tile, multi-column, memtile, runlist, dynamic objFifo) and checks
+output buffers against real NPU hardware.
 
 | Capability | Confidence | Evidence |
 |------------|------------|----------|
@@ -108,20 +111,15 @@ observed working in sessions but is covered by very few automated tests.
 | Transfer state machine with locks | VERIFIED | Unit tests in `dma/transfer.rs` |
 | BD chaining (Next_BD from word5) | VERIFIED | Unit tests |
 | Repeat count (task queue bits 23:16) | VERIFIED | Unit tests |
-| Channel start/stop/pause/resume | VERIFIED | Unit tests in `dma/engine.rs` |
+| Channel start/stop/pause/resume | VERIFIED | Unit tests |
 | Per-phase timing model | VERIFIED | Unit tests in `dma/timing.rs` |
 | Channel arbitration (round-robin) | VERIFIED | Unit tests |
 | Host memory interface (sparse 64-bit) | VERIFIED | Unit tests in `host_memory.rs` |
-| Two-tile DMA stream flow (256-byte) | OBSERVED | Worked in session |
-| Three-tile pipeline chain (128-byte) | OBSERVED | Worked in session |
-| Bidirectional ping-pong DMA | OBSERVED | Worked in session |
-| objFifo buffer convention | **BROKEN** | Produces input+41 instead of input+1 |
-| Continuous-loop kernel handling | **BROKEN** | Test runner times out |
-
-**Known issues**:
-- Dual-abstraction: `channel.rs` and `engine.rs` both define channel state
-- 8 `unwrap()` calls in `engine.rs` should use `expect()` with context
-- BD field parsing from AM029 has not been cross-checked against aie-rt
+| Multi-tile / multi-column DMA pipelines | VERIFIED | Bridge tests pass HW comparison |
+| objFifo buffer convention | VERIFIED | `add_one_objFifo`, `add_one_objFifo_elf` PASS on both compilers |
+| Cascade flows | VERIFIED | `cascade_flows` PASS |
+| Memtile / runlist / dynamic objFifo | VERIFIED | Bridge test suite |
+| Zero-padding (element vs word units) | VERIFIED | `*_using_dma_op_with_padding` tests PASS |
 
 **Files**: `src/device/dma/`, `src/device/host_memory.rs`
 
@@ -152,8 +150,8 @@ observed working in sessions but is covered by very few automated tests.
 | Packet-switched routing | VERIFIED | Unit tests |
 | Packet header/arbitration | VERIFIED | Unit tests |
 | Routing latency calculation | VERIFIED | Unit tests in `stream_router.rs` |
-| Tile-to-tile data movement | OBSERVED | Worked in session tests |
-| Multi-stream routing (>2 inputs) | **BROKEN** | Fails on shim port 12 |
+| Tile-to-tile data movement | VERIFIED | Bridge tests pass |
+| Multi-stream routing (>2 inputs) | VERIFIED | `cascade_flows`, `packet_flow_fanin/fanout`, `two_col` PASS |
 
 **Files**: `src/device/stream_switch.rs`, `src/device/stream_router.rs`
 
@@ -172,7 +170,7 @@ cycle counts that match real hardware is entirely unknown.
 | Stall cycle modeling | VERIFIED | Unit tests in `cycle_accurate.rs` |
 | Event tracing (13 event types) | VERIFIED | Unit tests |
 | CycleAccurateExecutor integration | VERIFIED | Unit tests |
-| Cycle counts match hardware | CLAIMED | No comparison has been done |
+| Cycle counts match hardware | OBSERVED | Trace-sweep matches HW within ~0.6% on clean kernels; broadcast/anchor handling tracked under #321/#322 |
 | Full pipeline model (F/D/E/WB) | Not implemented | Uses latency + hazard model |
 
 **Files**: `src/interpreter/timing/`, `src/interpreter/execute/cycle_accurate.rs`
@@ -185,21 +183,27 @@ cycle counts that match real hardware is entirely unknown.
 | Cross-tile memory latency (0/4/8 cycles) | VERIFIED | Unit tests |
 | Global cycle counter | VERIFIED | Unit tests |
 | DMA-lock timing integration | VERIFIED | Unit tests |
-| Realistic multi-tile workloads | CLAIMED | Only 3 unit tests exercise >1 tile |
+| Realistic multi-tile workloads | VERIFIED | Bridge tests run multi-tile and multi-column kernels against real HW |
 
 **Files**: `src/interpreter/timing/arbitration.rs`, `src/interpreter/core/`,
 `src/interpreter/engine/`
 
-### Kernel Execution -- VERIFIED (1 kernel), OBSERVED (2 kernels)
+### Kernel Execution -- VERIFIED (broad coverage)
+
+The bridge test suite runs ~75 distinct mlir-aie test kernels through the
+full XRT path against the emulator, with HW comparison enabled when an NPU
+is attached. Last broad run (2026-04-29 latest with HW): 116 PASS / 2 FAIL
+/ 1 XFAIL across both compilers.
 
 | Capability | Confidence | Evidence |
 |------------|------------|----------|
-| `add_one_using_dma`: correct outputs | VERIFIED | TestRunner regression test |
-| `add_314_using_dma_op`: correct outputs | OBSERVED | Worked in session (64/64) |
-| 24 xclbins load without unknown opcodes | OBSERVED | Worked in session |
-| General kernel correctness | CLAIMED | Only 1-2 kernels tested to completion |
+| `add_one_using_dma`, `add_*_using_dma_op` family | VERIFIED | Bridge tests PASS |
+| objFifo / objFifo_elf | VERIFIED | Bridge tests PASS |
+| Cascade / packet flow / fanin / fanout | VERIFIED | Bridge tests PASS |
+| Memtile / multi-column / runlist | VERIFIED | Bridge tests PASS |
+| Control-packet kernels | VERIFIED | `add_one_ctrl_packet*` PASS |
 
-**Files**: `src/interpreter/test_runner.rs`
+**Files**: `src/interpreter/test_runner.rs`, `scripts/emu-bridge-test.sh`
 
 ---
 
@@ -272,19 +276,21 @@ All constants defined in `src/device/aie2_spec.rs` with AM020 section references
 
 ## What Would "Done" Look Like?
 
-Phase 1 has no formal exit criteria. Here is a proposed definition of "done"
-that would justify moving focus to Phase 2:
+The original Phase 1 exit criteria were written before the bridge test
+suite existed. Most have been overtaken by it -- bridge tests are now the
+primary correctness gate, and a much stronger one than "kernels run to
+completion." A revised set of "done" criteria for Phase 1:
 
-1. **All 30 mlir-aie test binaries run without crashes or unknown opcodes**
-   (currently: OBSERVED for 24, untested for 6)
-2. **At least 10 kernels produce correct output**
-   (currently: 1-2 verified)
-3. **Timing model validated against aiesimulator on at least 3 kernels**
-   (currently: zero comparisons)
-4. **No known-broken features in the critical path**
-   (currently: objFifo results wrong, multi-stream routing broken, continuous
-   kernels timeout)
-5. **SemanticOp test coverage above 50%**
-   (currently: 17%)
+1. **Bridge test suite passes 100% across both compilers on attached HW.**
+   (Currently: 116 PASS / 2 FAIL / 1 XFAIL last broad HW run.)
+2. **Cycle accounting on traced kernels matches HW within 1% on the clean
+   anchor window**, with broadcast-stop and per-NPU-instruction cycle costs
+   modeled (#321/#322/#323).
+3. **No known-broken features in the critical path.**
+   (Currently: 2 FAIL tests are tracked; no broad subsystem is broken.)
+4. **SemanticOp test coverage tracked**, with each SemanticOp that appears
+   in a compiled mlir-aie kernel covered by at least one dedicated test.
 
-None of these criteria are met today. Phase 1 is functional but not complete.
+ISA accuracy (4815/4815 ISA test points), the original Phase 1 anchor goal,
+is already met. Phase 1 is functional and bridge-validated; the remaining
+work is mostly trace timing fidelity and edge cases.

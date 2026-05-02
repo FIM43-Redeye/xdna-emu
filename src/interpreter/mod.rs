@@ -3,7 +3,7 @@
 //! This module provides an accurate, modular implementation of the AIE2
 //! instruction set interpreter. It is designed for:
 //!
-//! - **Accurate VLIW handling**: Proper 128-bit bundle decoding with 7 slots
+//! - **Accurate VLIW handling**: Proper 128-bit bundle decoding with 8 slots
 //! - **TableGen-driven decoding**: Instruction definitions parsed from llvm-aie
 //! - **Cycle-accurate execution**: AM020-based latencies, hazard detection, memory conflicts
 //! - **Easy testing**: Trait abstractions enable mocking and unit testing
