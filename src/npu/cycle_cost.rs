@@ -254,8 +254,16 @@ impl CycleCostModel {
 }
 
 impl Default for CycleCostModel {
+    /// Default profile engages the open-source-derived structural costs
+    /// (fabric hops, PLIO bridge, register-write completion). Per-tile-
+    /// type CMP costs and CMP-to-shim NoC entry remain conservative
+    /// placeholders pending #322 calibration.
+    ///
+    /// To preserve the prior 1-cycle-per-packet behaviour for a specific
+    /// caller, opt in explicitly with
+    /// `CycleCostModel::legacy_one_per_packet()`.
     fn default() -> Self {
-        Self::legacy_one_per_packet()
+        Self::with_known_constants()
     }
 }
 
@@ -331,10 +339,10 @@ mod tests {
     }
 
     #[test]
-    fn default_is_legacy_profile() {
+    fn default_is_with_known_constants() {
         let d = CycleCostModel::default();
-        let l = CycleCostModel::legacy_one_per_packet();
+        let k = CycleCostModel::with_known_constants();
         let w = NpuInstruction::Write32 { reg_off: 0, value: 0 };
-        assert_eq!(d.cost_of(&w), l.cost_of(&w));
+        assert_eq!(d.cost_of(&w), k.cost_of(&w));
     }
 }
