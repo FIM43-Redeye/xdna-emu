@@ -26,6 +26,8 @@ path, so anyone needing a dropped capability can:
 | `trace-trim.py` | Strip sentinel padding from raw trace buffers |
 | `trace-merge.py` | Merge per-batch Perfetto JSON with TRUE anchor alignment |
 | `trace-patch-events.py` | Patch event slots in compiled insts.bin without recompilation |
+| `trace-bridge.sh` | End-to-end trace comparison shell driver, superseded by `scripts/emu-bridge-test.sh` |
+| `trace-compare.py` | Python HW/EMU comparator, superseded by `src/bin/trace_compare.rs` (the Rust binary at `target/release/trace-compare`) |
 
 ## Do not add new callers
 

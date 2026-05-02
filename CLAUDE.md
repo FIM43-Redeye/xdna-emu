@@ -494,6 +494,14 @@ Build: `cargo build --release --bin trace-compare`
 | `tools/deprecated/trace-trim.py` | Strip sentinel padding from raw trace buffers |
 | `tools/deprecated/trace-merge.py` | Merge per-batch Perfetto JSON with TRUE anchor alignment |
 | `tools/deprecated/trace-patch-events.py` | Patch event slots in compiled insts.bin without recompilation |
+| `tools/deprecated/trace-bridge.sh` | End-to-end shell driver, superseded by `scripts/emu-bridge-test.sh` |
+| `tools/deprecated/trace-compare.py` | Python HW/EMU comparator, superseded by `src/bin/trace_compare.rs` |
+
+Note: `tools/trace-sweep.py` and `tools/trace-patch-events.py` are still
+present at the top level. They are the **second-generation** versions of the
+older deprecated scripts of the same name and remain in active use by
+`scripts/isa-test.sh`, `scripts/emu-bridge-test.sh`, and
+`src/trace/compare.rs`. Don't confuse them with the deprecated copies.
 
 See `tools/deprecated/README.md` for rationale.
 
