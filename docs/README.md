@@ -6,6 +6,10 @@ Technical reference documentation for the xdna-emu project.
 
 Living technical reference material:
 
+- [coverage/architecture-index.md](coverage/architecture-index.md) -- Catalogue
+  of every AIE2 hardware subsystem with our coverage state (MODELED /
+  PARTIAL / STUBBED / MISSING / OUT_OF_SCOPE). Refresh when a subsystem's
+  coverage changes.
 - [aiesimulator.md](aiesimulator.md) -- AMD aiesimulator integration and usage
 - [dma-reference.md](dma-reference.md) -- DMA engine reference (BD fields,
   sequences, polling semantics)
