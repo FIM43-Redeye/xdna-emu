@@ -116,6 +116,21 @@ pub struct TileTimer {
     /// Whether the trigger event fired on the most recent tick. Downstream
     /// consumers (event broadcast, trace unit) can poll this.
     pub trigger_fired: bool,
+
+    /// Latched flag indicating the configured `Reset_Event` fired during
+    /// this cycle. Consumed by [`Self::tick`], which clears the timer to
+    /// 0 instead of incrementing on cycles where the flag is set. This
+    /// implements the multi-tile timer-sync protocol from
+    /// aie-rt's `XAie_SyncTimer`: the host configures every tile's
+    /// `Reset_Event` to the same broadcast event, then fires that event
+    /// once at shim col=0; the broadcast wave reaches every tile and
+    /// resets all timers to 0 in the same cycle.
+    ///
+    /// Latched (rather than reset-on-the-fly) so that ordering between
+    /// `notify_event` calls and `tick` within a single cycle does not
+    /// matter — whichever order the coordinator chooses, the post-cycle
+    /// timer value is always 0 if the reset event was seen.
+    pending_reset: bool,
 }
 
 impl TileTimer {
@@ -130,18 +145,50 @@ impl TileTimer {
             trig_high: 0xFFFF_FFFF,
             control: 0,
             trigger_fired: false,
+            pending_reset: false,
         }
     }
 
     /// Advance the timer by one clock cycle.
     ///
-    /// Wraps around on 64-bit overflow (matching hardware behavior -- the timer
-    /// is a free-running counter with no saturation). Checks the trigger
-    /// threshold after incrementing and sets `trigger_fired` if the timer
-    /// value matches.
+    /// If the configured `Reset_Event` was observed this cycle (via
+    /// [`Self::notify_event`]), the timer is reset to 0 instead of
+    /// incrementing. This matches the hardware behavior where the
+    /// reset-event signal overrides the per-cycle increment. Wraps
+    /// around on 64-bit overflow otherwise. Checks the trigger
+    /// threshold against the post-tick value and sets `trigger_fired`
+    /// accordingly.
     pub fn tick(&mut self) {
-        self.value = self.value.wrapping_add(1);
+        if self.pending_reset {
+            self.value = 0;
+            self.pending_reset = false;
+        } else {
+            self.value = self.value.wrapping_add(1);
+        }
         self.check_trigger();
+    }
+
+    /// Latch a "reset on next tick" flag if `event_id` matches the
+    /// currently configured `Reset_Event`.
+    ///
+    /// Called by the tile's per-cycle event-firing path (e.g.
+    /// `Tile::notify_core_trace_event`). Event id 0 is the unconfigured
+    /// sentinel and never triggers a reset. The flag is consumed by
+    /// the next [`Self::tick`] call within the same cycle.
+    pub fn notify_event(&mut self, event_id: u8) {
+        if event_id == 0 {
+            return;
+        }
+        if event_id == self.reset_event() {
+            self.pending_reset = true;
+        }
+    }
+
+    /// Whether the configured Reset_Event was observed this cycle and
+    /// the timer will reset on the next `tick`. Test-only accessor.
+    #[cfg(test)]
+    pub(crate) fn pending_reset(&self) -> bool {
+        self.pending_reset
     }
 
     /// Read the low 32 bits of the timer value.
@@ -181,9 +228,12 @@ impl TileTimer {
     ///
     /// This is the behavior triggered by writing 1 to bit 31 of Timer_Control,
     /// or by the reset event firing. Matches aie-rt `XAie_ResetTimer`.
+    /// Also clears the `pending_reset` latch so a stale event-driven
+    /// reset doesn't carry into the next cycle.
     pub fn reset(&mut self) {
         self.value = 0;
         self.trigger_fired = false;
+        self.pending_reset = false;
     }
 
     /// Get the currently configured reset event ID.
@@ -669,6 +719,131 @@ mod tests {
         timer.write_register(reg::CONTROL, control::RESET_MASK);
         assert!(!timer.trigger_fired, "control reset should clear trigger_fired");
         assert_eq!(timer.value(), 0);
+    }
+
+    #[test]
+    fn notify_event_no_reset_event_configured() {
+        // Reset_Event = 0 (default, "no event"). Notifying any event id
+        // must NOT latch a pending reset.
+        let mut timer = TileTimer::new();
+        timer.notify_event(5);
+        timer.notify_event(7);
+        assert!(!timer.pending_reset());
+    }
+
+    #[test]
+    fn notify_event_id_zero_never_latches() {
+        // Event id 0 is the unconfigured sentinel: even if Reset_Event
+        // were 0, we don't latch on a "no-op" notify.
+        let mut timer = TileTimer::new();
+        timer.write_register(reg::CONTROL, 0x0000_0000); // Reset_Event = 0
+        timer.notify_event(0);
+        assert!(!timer.pending_reset());
+    }
+
+    #[test]
+    fn notify_matching_event_latches_pending_reset() {
+        let mut timer = TileTimer::new();
+        // Configure Reset_Event = 0x42.
+        timer.write_register(reg::CONTROL, 0x0000_4200);
+        assert_eq!(timer.reset_event(), 0x42);
+        timer.notify_event(0x42);
+        assert!(timer.pending_reset());
+    }
+
+    #[test]
+    fn notify_nonmatching_event_does_not_latch() {
+        let mut timer = TileTimer::new();
+        timer.write_register(reg::CONTROL, 0x0000_4200);
+        timer.notify_event(0x41);
+        timer.notify_event(0x43);
+        assert!(!timer.pending_reset());
+    }
+
+    #[test]
+    fn pending_reset_cleared_by_tick_and_resets_value() {
+        let mut timer = TileTimer::new();
+        timer.write_register(reg::CONTROL, 0x0000_0500); // Reset_Event = 5
+
+        // Run the timer up to 100.
+        for _ in 0..100 {
+            timer.tick();
+        }
+        assert_eq!(timer.value(), 100);
+
+        // Notify the configured reset event; pending flag latches.
+        timer.notify_event(5);
+        assert!(timer.pending_reset());
+
+        // Next tick consumes the latch: value resets to 0 (no increment).
+        timer.tick();
+        assert_eq!(timer.value(), 0);
+        assert!(!timer.pending_reset());
+
+        // Subsequent ticks count up again from 0.
+        timer.tick();
+        timer.tick();
+        assert_eq!(timer.value(), 2);
+    }
+
+    #[test]
+    fn explicit_reset_clears_pending_flag() {
+        let mut timer = TileTimer::new();
+        timer.write_register(reg::CONTROL, 0x0000_0500); // Reset_Event = 5
+        timer.notify_event(5);
+        assert!(timer.pending_reset());
+
+        // Explicit register-driven reset should also clear the latch
+        // so the next tick increments normally.
+        timer.reset();
+        assert!(!timer.pending_reset());
+
+        timer.tick();
+        assert_eq!(timer.value(), 1);
+    }
+
+    #[test]
+    fn sync_timer_protocol_aligns_independent_timers() {
+        // Replays the high-level shape of aie-rt's XAie_SyncTimer:
+        // configure all tiles' Reset_Event to the same broadcast event,
+        // run them for divergent cycles, fire the event, observe
+        // simultaneous reset to zero.
+        let mut t1 = TileTimer::new();
+        let mut t2 = TileTimer::new();
+        let mut t3 = TileTimer::new();
+
+        let bcast_event: u8 = 117; // arbitrary broadcast event id
+        let ctrl = (bcast_event as u32) << control::RESET_EVENT_LSB;
+        t1.write_register(reg::CONTROL, ctrl);
+        t2.write_register(reg::CONTROL, ctrl);
+        t3.write_register(reg::CONTROL, ctrl);
+
+        // Each tile started at a different cycle phase (host setup, etc.).
+        for _ in 0..50 {
+            t1.tick();
+        }
+        for _ in 0..127 {
+            t2.tick();
+        }
+        for _ in 0..1024 {
+            t3.tick();
+        }
+        assert_eq!(t1.value(), 50);
+        assert_eq!(t2.value(), 127);
+        assert_eq!(t3.value(), 1024);
+
+        // The broadcast wave hits every tile in the same cycle.
+        t1.notify_event(bcast_event);
+        t2.notify_event(bcast_event);
+        t3.notify_event(bcast_event);
+
+        // Each tile's next tick consumes the latch and resets to 0.
+        t1.tick();
+        t2.tick();
+        t3.tick();
+        assert_eq!(t1.value(), 0);
+        assert_eq!(t2.value(), 0);
+        assert_eq!(t3.value(), 0);
     }
 
     #[test]

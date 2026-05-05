@@ -12,6 +12,26 @@ fn notify_commit(tu: &mut TraceUnit, hw_id: u8, cycle: u64) {
     tu.commit_cycle(cycle);
 }
 
+/// Fire `start_event` at cycle 0 AND immediately promote the trace unit to
+/// Running, so subsequent test events at cycle 0 are captured.
+///
+/// HW pipelines start by 1 cycle: `start_event` arms the controller, but
+/// events arriving in the same cycle as the arming event are NOT recorded.
+/// Production code preserves that pipelining; most unit tests, however,
+/// don't care about the pipeline gap — they just want a Running unit
+/// from a clean baseline so they can exercise encoding logic. This helper
+/// performs an unmatched-event notify on a +1 cycle to trip the promotion
+/// path, then leaves `last_event_cycle` / `pending_cycle` at 0 so deltas
+/// computed against later events match the pre-pipelining behavior.
+fn force_start(tu: &mut TraceUnit, start_event: u8) {
+    tu.notify_event(start_event, 0, None);
+    // Sentinel hw_event_id 0xFF is never in any slot; this notify just
+    // bumps the cycle counter past the arm cycle and triggers the
+    // arm-promotion check at the top of notify_event without writing
+    // any pending-frame state.
+    tu.notify_event(0xFF, 1, None);
+}
+
 #[test]
 fn test_trace_unit_default_unconfigured() {
     let tu = TraceUnit::new(0, 2);
@@ -68,13 +88,19 @@ fn test_start_stop_state_machine() {
     assert_eq!(tu.state, TraceState::Idle);
     assert!(tu.is_configured());
 
-    // Start event triggers Running state
+    // Start event arms the trace unit. HW pipelines the Idle→Running
+    // transition by 1 cycle; until cycle advances past the arm cycle,
+    // state remains Idle. (The arm-cycle latch is private; we can only
+    // observe the side effect: state stays Idle, the Start marker bytes
+    // are emitted into the buffer.)
     tu.notify_event(28, 0, None);
-    assert_eq!(tu.state, TraceState::Running);
+    assert_eq!(tu.state, TraceState::Idle);
+    assert!(tu.byte_buffer.len() >= 8); // Start marker = 1 prefix + 7 timer bytes
 
-    // Matched event is encoded while running (per-cycle commit)
+    // First event in a later cycle promotes to Running and is encoded.
     let before = tu.byte_buffer.len();
     notify_commit(&mut tu, 37, 100);
+    assert_eq!(tu.state, TraceState::Running);
     assert!(tu.byte_buffer.len() > before);
 
     // Stop event transitions to Stopped
@@ -410,7 +436,10 @@ fn test_roundtrip_all_slots_all_formats() {
             let evt1 = 41u32 | (42 << 8) | (43 << 16) | (44 << 24);
             tu.write_register(0x10, evt0);
             tu.write_register(0x14, evt1);
-            tu.notify_event(28, 0, None); // start
+            // HW pipelines start by 1 cycle; force_start arms the unit
+            // and trips the promotion path so the test can use cycle 0
+            // as its baseline (last_event_cycle = 0).
+            force_start(&mut tu, 28);
             let start_len = tu.byte_buffer.len(); // 8 bytes start marker
 
             let event_id = 37 + slot;
@@ -461,8 +490,13 @@ fn test_read_register_roundtrip() {
     // Read Status: should be Idle (0) + mode EventTime (0)
     assert_eq!(tu.read_register(0x08), 0);
 
-    // Start tracing -> state becomes Running
+    // Start tracing arms the unit; HW pipelines Idle→Running by 1 cycle,
+    // so the status register stays Idle until cycle advances.
     tu.notify_event(28, 0, None);
+    assert_eq!(tu.read_register(0x08), 0); // Idle (still arming)
+
+    // First event in a later cycle promotes to Running.
+    tu.notify_event(0xFF, 1, None); // sentinel cycle bump (unmatched event)
     assert_eq!(tu.read_register(0x08), 1 << 8); // Running=1 at bits [9:8]
 
     // Stop tracing -> state becomes Stopped
@@ -674,7 +708,7 @@ fn test_multiple_roundtrip_matches_mlir_aie() {
         tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (40 << 24));
         tu.write_register(0x14, 41 | (42 << 8) | (43 << 16) | (44 << 24));
 
-        tu.notify_event(28, 0, None);
+        force_start(&mut tu, 28);
         let base = tu.byte_buffer.len();
 
         for i in 0u8..8 {
@@ -850,7 +884,7 @@ fn mode1_encoder_byte_equivalent_to_decoder_fixture() {
     tu.set_event_slot(3, 26); // LOCK_STALL = hw_id 26 in slot 3
     tu.set_start_event(1);
 
-    tu.notify_event(1, 0, None); // start (fires state machine)
+    force_start(&mut tu, 1);
     tu.notify_event(26, 0, Some(816)); // EventPC mask=0b1000 (slot 3), pc=816
     tu.commit_cycle(0);
     tu.notify_event(26, 1, Some(816)); // next cycle, same PC, same slot
@@ -898,7 +932,7 @@ fn mode1_no_pc_emits_sentinel_zero() {
     tu.set_event_slot(0, 23); // MEMORY_STALL
     tu.set_start_event(1);
 
-    tu.notify_event(1, 0, None); // start
+    force_start(&mut tu, 1);
     tu.notify_event(23, 0, None); // memory stall, no PC -> sentinel pc=0
     tu.commit_cycle(0);
 
@@ -1145,7 +1179,7 @@ fn mode2_notify_atom_taken_emits_e_atom_on_commit() {
     tu.set_mode(TraceMode::Execution);
     tu.set_event_slot(0, 1); // TRUE = slot 0
     tu.set_start_event(1);
-    tu.notify_event(1, 0, None); // start event fires at cycle 0
+    force_start(&mut tu, 1);
     tu.notify_atom(true);
     tu.commit_cycle(0);
     // Align pending bits out to bytes so the decoder can read them.
@@ -1165,7 +1199,7 @@ fn mode2_notify_branch_taken_queues_new_pc() {
     tu.set_mode(TraceMode::Execution);
     tu.set_event_slot(0, 1);
     tu.set_start_event(1);
-    tu.notify_event(1, 0, None);
+    force_start(&mut tu, 1);
     tu.notify_atom(true);
     tu.notify_branch_taken(0, 0x300);
     tu.commit_cycle(0);
@@ -1213,7 +1247,7 @@ fn mode2_notify_loop_boundary_emits_once_per_zol() {
     tu.set_mode(TraceMode::Execution);
     tu.set_event_slot(0, 1);
     tu.set_start_event(1);
-    tu.notify_event(1, 0, None);
+    force_start(&mut tu, 1);
 
     // Simulate an 8-iteration ZOL: lc_before walks 8,7,6,5,4,3,2,1; lc_after = lc_before-1.
     for lc in (1..=8u32).rev() {
@@ -1244,7 +1278,7 @@ fn mode2_notify_loop_boundary_back_to_back_zols() {
     tu.set_mode(TraceMode::Execution);
     tu.set_event_slot(0, 1);
     tu.set_start_event(1);
-    tu.notify_event(1, 0, None);
+    force_start(&mut tu, 1);
 
     // First ZOL: 4 iterations.
     for lc in (1..=4u32).rev() {
@@ -1289,8 +1323,12 @@ fn rewriting_control0_resets_state_for_rerun() {
     assert!(matches!(tu.state, super::TraceState::Idle), "state after re-config");
     assert_eq!(tu.encoded_bytes_len(), 0, "byte_buffer should be cleared on reconfigure");
 
-    // Re-arm and verify start works again.
+    // Re-arm and verify start works again. HW pipelines start by 1 cycle:
+    // notify_event(28, 200) arms; state transitions to Running on the next
+    // notify with cycle > 200.
     tu.notify_event(28, 200, None);
+    assert!(matches!(tu.state, super::TraceState::Idle), "armed but not yet Running");
+    tu.notify_event(0xFF, 201, None); // unmatched event bumps cycle past arm
     assert!(matches!(tu.state, super::TraceState::Running), "rerun start should fire");
     let _ = after_first; // silence unused-var lint
 }

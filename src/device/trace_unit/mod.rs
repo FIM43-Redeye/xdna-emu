@@ -207,6 +207,21 @@ pub struct TraceUnit {
     /// Whether Control0 has been written (trace unit is configured).
     /// The trace unit only processes events after configuration.
     configured: bool,
+
+    /// Cycle at which `start_event` was observed, if a state transition
+    /// to `Running` is pending.
+    ///
+    /// Real HW's trace controller has a 1-cycle pipeline delay on the
+    /// `Idle → Running` transition: when start_event arrives in cycle S,
+    /// recording does NOT begin until cycle S+1. Our model originally
+    /// transitioned state immediately, which caused mode-2 EMU traces to
+    /// emit one extra `New_PC` at the kernel's loop entry compared to HW.
+    /// See `docs/coverage/trace-start-stop-latency-gap.md` (2026-05-04).
+    armed_start_cycle: Option<u64>,
+    /// Anchor PC captured at start-event arming time (mode-2 only).
+    /// Used when the deferred state transition activates and we emit the
+    /// Start frame.
+    armed_start_anchor: u16,
 }
 
 impl TraceUnit {
@@ -237,6 +252,8 @@ impl TraceUnit {
             col,
             row,
             configured: false,
+            armed_start_cycle: None,
+            armed_start_anchor: 0,
         }
     }
 
@@ -397,6 +414,8 @@ impl TraceUnit {
                 self.pending_slot_mask = 0;
                 self.pending_pc = 0;
                 self.pending_cycle = 0;
+                self.armed_start_cycle = None;
+                self.armed_start_anchor = 0;
 
                 // Trace unit waits in Idle state until its start_event fires.
                 // The CDO sequence configures broadcast channels, then writes
@@ -483,38 +502,53 @@ impl TraceUnit {
             self.commit_pending_frame();
         }
 
-        // Check for start/stop events
-        if self.state == TraceState::Idle && hw_event_id == self.start_event {
-            self.state = TraceState::Running;
-            self.mode2_zol_active = false;
-            self.timer = cycle;
-            // last_event_cycle is read only by mode-0's commit_pending_frame.
-            // In mode 1 it's set here but unused; if a trace unit is ever
-            // reconfigured from EventPc back to EventTime mid-session, this
-            // value will be stale -- but we don't currently support
-            // mid-session mode flips, so the assignment is harmless either way.
-            self.last_event_cycle = cycle;
-            self.pending_cycle = cycle;
-            self.pending_slot_mask = 0;
-            // Emit a Start marker. Mode 0 emits the timer-sync byte
-            // sequence (0xF0); mode 1 uses 0xF1; mode 2 uses its own
-            // Start long frame with the anchor PC.
-            match self.mode {
-                TraceMode::Execution => {
-                    let anchor_pc = pc.map(|p| (p & 0x3FFF) as u16).unwrap_or(0);
-                    self.encode_mode2_start(anchor_pc);
-                }
-                _ => self.encode_start(cycle),
+        // Promote a previously-armed start to active Running once the cycle
+        // counter has advanced past the cycle in which start_event arrived.
+        // This models HW's 1-cycle pipelined Idle→Running transition: events
+        // that arrive in the same cycle as start_event are NOT recorded, but
+        // events from the next cycle onward are. Without this latency, EMU
+        // captured an extra New_PC at the kernel's loop-entry address that
+        // HW never sees — see docs/coverage/trace-start-stop-latency-gap.md.
+        if let Some(arm_cycle) = self.armed_start_cycle {
+            if self.state == TraceState::Idle && cycle > arm_cycle {
+                self.activate_armed_start(cycle);
             }
-            log::debug!(
-                "TraceUnit ({},{}) START: cycle={} hw_event={} mode={:?} pc={:?}",
-                self.col,
-                self.row,
-                cycle,
-                hw_event_id,
-                self.mode,
-                pc
-            );
+        }
+
+        // Detect start/stop events. Start emits the Start marker
+        // immediately (so the byte stream's Start frame is at the
+        // beginning, matching HW), but the recording window itself is
+        // *armed* — only events from the next cycle onward are captured.
+        // Stop is immediate and discards same-cycle pending mode-2 frames.
+        if self.state == TraceState::Idle && hw_event_id == self.start_event {
+            if self.armed_start_cycle.is_none() {
+                let anchor_pc = pc.map(|p| (p & 0x3FFF) as u16).unwrap_or(0);
+                self.armed_start_cycle = Some(cycle);
+                self.armed_start_anchor = anchor_pc;
+                // Emit the Start marker now. State stays Idle until
+                // cycle advances past `cycle` (HW's pipelined start).
+                // last_event_cycle bookkeeping is also updated so that
+                // mode-0 delta encoding sees a consistent baseline; no
+                // events between now and the activation cycle will
+                // accumulate (state is Idle), so this is safe.
+                self.timer = cycle;
+                self.last_event_cycle = cycle;
+                self.pending_cycle = cycle;
+                self.pending_slot_mask = 0;
+                match self.mode {
+                    TraceMode::Execution => self.encode_mode2_start(anchor_pc),
+                    _ => self.encode_start(cycle),
+                }
+                log::debug!(
+                    "TraceUnit ({},{}) start armed: cycle={} hw_event={} mode={:?} pc={:?}",
+                    self.col,
+                    self.row,
+                    cycle,
+                    hw_event_id,
+                    self.mode,
+                    pc
+                );
+            }
             return;
         }
 
@@ -523,8 +557,15 @@ impl TraceUnit {
             self.mode2_zol_active = false;
             log::debug!("TraceUnit ({},{}) stopped at cycle {}", self.col, self.row, cycle);
             if matches!(self.mode, TraceMode::Execution) {
-                // Drain any pending mode-2 state, then emit Stop.
-                self.drain_mode2_pending();
+                // Discard pending mode-2 frames from the stop cycle. Real HW
+                // captures none of the cycle in which stop_event arrives
+                // (state goes inactive on the same cycle edge); previously
+                // we drained pending here, which emitted one extra New_PC
+                // beyond HW's window. Atoms-run and ZOL state are reset
+                // inside drain_mode2_pending, but we do NOT want to flush
+                // their bytes — clear them too.
+                self.pending_mode2_frames.clear();
+                self.pending_atoms_run = None;
                 self.encode_mode2_stop();
             }
             // Flush remaining data as a final packet
@@ -962,6 +1003,46 @@ impl TraceUnit {
     ///
     /// The mode1.py decoder matches `(b & 0b11110011) == 0b11110001`,
     /// which catches 0xF1 (segment start) and 0xF5 (mid-stream re-anchor).
+    /// Activate a previously-armed start: transition to Running, prime
+    /// per-cycle bookkeeping, and emit the Start marker.
+    ///
+    /// `cycle` is the *current* cycle (i.e. the cycle in which we noticed
+    /// the arm cycle had passed) — the trace timer starts here, since that
+    /// matches HW's behavior of beginning to record on the cycle following
+    /// start_event.
+    fn activate_armed_start(&mut self, current_cycle: u64) {
+        // Use the arm cycle (when start_event arrived) for the trace
+        // timer, matching the encoded "trace start time" in the byte
+        // stream. The current cycle is where the *first event* will
+        // accumulate. This split keeps mode-0 delta encoding stable:
+        // delta = pending_cycle (= current_cycle) - last_event_cycle
+        // (= arm_cycle), which equals the old immediate-start behavior
+        // for tests where start fires at cycle 0 and the first slot
+        // event fires at cycle N.
+        let arm_cycle = self.armed_start_cycle.take().unwrap_or(current_cycle);
+        let anchor_pc = self.armed_start_anchor;
+        self.armed_start_anchor = 0;
+
+        self.state = TraceState::Running;
+        self.mode2_zol_active = false;
+        // timer / last_event_cycle / pending_cycle were already primed at
+        // arm time. The Start marker bytes were also emitted at arm time so
+        // the byte stream's Start frame sits at the beginning, matching HW.
+        // We just flip state here. The first event captured will be from
+        // current_cycle onward, since events from the arm cycle were
+        // dropped while state == Idle.
+        let _ = arm_cycle; // arm_cycle now lives only in the timer field
+        log::debug!(
+            "TraceUnit ({},{}) START activated: arm_cycle={} current_cycle={} mode={:?} anchor_pc={:#x}",
+            self.col,
+            self.row,
+            arm_cycle,
+            current_cycle,
+            self.mode,
+            anchor_pc,
+        );
+    }
+
     fn encode_start(&mut self, timer: u64) {
         let prefix = match self.mode {
             TraceMode::EventPc => 0xF1u8,

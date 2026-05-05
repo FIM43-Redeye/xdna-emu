@@ -557,6 +557,10 @@ impl Tile {
     #[inline]
     pub fn notify_core_trace_event(&mut self, hw_id: u8, cycle: u64, pc: Option<u32>) {
         self.core_trace.notify_event(hw_id, cycle, pc);
+        // Auto-reset the core-module timer when the configured Reset_Event
+        // is observed (XAie_SyncTimer protocol; latched-then-applied at
+        // the next tick).
+        self.core_timer.notify_event(hw_id);
         for det in &mut self.core_edge_detectors {
             if det.input_event == hw_id {
                 det.curr_active = true;
@@ -574,6 +578,10 @@ impl Tile {
     #[inline]
     pub fn notify_mem_trace_event(&mut self, hw_id: u8, cycle: u64, pc: Option<u32>) {
         self.mem_trace.notify_event(hw_id, cycle, pc);
+        // Auto-reset the memory-module timer when the configured Reset_Event
+        // is observed (XAie_SyncTimer protocol; latched-then-applied at
+        // the next tick).
+        self.mem_timer.notify_event(hw_id);
         for det in &mut self.mem_edge_detectors {
             if det.input_event == hw_id {
                 det.curr_active = true;

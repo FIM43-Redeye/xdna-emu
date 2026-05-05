@@ -1978,7 +1978,13 @@ mod tests {
             // unit transitions Idle->Running before the coordinator's Phase 2.
             // This mirrors what Phase 3c would do one cycle later, but we
             // need it done before Phase 2 drains the synthetic event below.
+            //
+            // HW pipelines Idle->Running by 1 cycle: notify_event(start, 0)
+            // arms the unit; only events from cycle > 0 are recorded. The
+            // unmatched-event call at cycle 1 trips the cycle-advance
+            // promotion path so state is Running before the drain runs.
             tile.core_trace.notify_event(1, 0, None);
+            tile.core_trace.notify_event(0xFF, 1, None);
         }
 
         // Inject a synthetic InstrVector event at cycle 0 into core (0,2).
