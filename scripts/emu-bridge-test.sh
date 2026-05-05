@@ -1005,6 +1005,87 @@ _classify_cycle_diff() {
     return 0
 }
 
+# Classify the mode-2 comparison block of a PC-anchored report into a
+# single PASS / FAIL / SKIP / ERROR token.
+#
+#   $1 -- result file (single-token output)
+#   $2 -- summary file (one-line human-readable detail)
+#   $3 -- PC-anchored report.txt produced by trace-compare
+#
+# Tokens:
+#   PASS   -- one or more tile pairs and zero FAIL tiles
+#   FAIL   -- one or more tile pairs with at least one FAIL tile
+#   SKIP   -- mode-2 block present but no per-tile pairs (HW-only or EMU-only,
+#             or "no tiles common"), or the block was missing entirely
+#   ERROR  -- comparator could not load events JSON
+#
+# Always returns 0; the classification itself is advisory.
+_classify_mode2() {
+    local result_file="$1"
+    local summary_file="$2"
+    local report="$3"
+
+    if [[ ! -f "$report" ]]; then
+        echo "ERROR" > "$result_file"
+        echo "ERROR: report file missing ($report)" > "$summary_file"
+        return 0
+    fi
+
+    # Extract the Mode-2 comparison block (from the heading to EOF or the
+    # next top-level section heading).
+    local block
+    block="$(awk '
+        /^Mode-2 comparison:/ { in_block = 1; next }
+        in_block && /^[A-Z]/   { in_block = 0 }
+        in_block               { print }
+    ' "$report")"
+
+    if [[ -z "$block" ]]; then
+        echo "SKIP" > "$result_file"
+        echo "SKIP: no mode-2 baseline captured" > "$summary_file"
+        return 0
+    fi
+
+    # ERROR sentinels written by compare.rs.
+    if echo "$block" | grep -qE '^[[:space:]]+ERROR loading events:'; then
+        local errline
+        errline="$(echo "$block" | grep -m1 -oE 'ERROR loading events:.*')"
+        echo "ERROR" > "$result_file"
+        echo "${errline}" > "$summary_file"
+        return 0
+    fi
+
+    # grep -c returns exit 1 when there are zero matches; under `set -e`
+    # this would abort the parent script even though zero is the answer
+    # we want, so we trap the rc with `|| true` and split declaration
+    # from assignment so `local` doesn't mask the substitution failure.
+    local pass_count fail_count hw_only_count emu_only_count
+    pass_count="$(echo "$block" | grep -cE '^[[:space:]]+tile pt=.*\[PASS\]' || true)"
+    fail_count="$(echo "$block" | grep -cE '^[[:space:]]+tile pt=.*\[FAIL\]' || true)"
+    hw_only_count="$(echo "$block" | grep -cE 'HW only -- no EMU events' || true)"
+    emu_only_count="$(echo "$block" | grep -cE 'EMU only -- no HW events' || true)"
+
+    local total=$((pass_count + fail_count))
+    if [[ $total -eq 0 ]]; then
+        # Either "no tiles common" or every tile is one-sided. The
+        # comparator emitted "SKIP (EMU events JSON ... not present)" in
+        # the lone-side case; treat both as SKIP.
+        echo "SKIP" > "$result_file"
+        echo "SKIP: 0 tile pairs (hw_only=${hw_only_count} emu_only=${emu_only_count})" \
+            > "$summary_file"
+        return 0
+    fi
+
+    if [[ $fail_count -eq 0 ]]; then
+        echo "PASS" > "$result_file"
+        echo "PASS: ${pass_count}/${total} tiles" > "$summary_file"
+    else
+        echo "FAIL" > "$result_file"
+        echo "FAIL: ${fail_count}/${total} tiles diverged" > "$summary_file"
+    fi
+    return 0
+}
+
 # Derive a variant name from a run command's xclbin filename.
 # e.g., "aie2_cascade.xclbin" -> "cascade", "aie.xclbin" -> ""
 # Returns empty string for the standard "aie.xclbin" case.
@@ -1158,6 +1239,13 @@ transform_for_chess() {
     # Add --xbridge if not present
     if [[ "$cmd" != *"--xbridge"* ]]; then
       cmd="${cmd/aiecc.py/aiecc.py --xbridge}"
+    fi
+    # Add --unified if not present. compileCoresUnified merges all cores into a
+    # single xchesscc invocation, paying the ~21 s Synopsys pipeline startup
+    # once per device instead of once per core. Multi-core tests
+    # (cascade matmul, etc.) drop from minutes to ~30 s.
+    if [[ "$cmd" != *"--unified"* ]] && [[ "$cmd" != *"--no-unified"* ]]; then
+      cmd="${cmd/aiecc.py/aiecc.py --unified}"
     fi
     # Add --aiesim if requested (requires --xbridge, which Chess builds have)
     if [[ "${RUN_AIESIM:-false}" == "true" ]] && [[ "$cmd" != *"--aiesim"* ]]; then
@@ -1707,8 +1795,11 @@ run_one_hardware() {
   local log_file="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw.log"
   local result_file="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw.result"
 
-  # Symlink shared test.exe into per-compiler build dir
-  if [[ -f "$test_exe" ]] && [[ ! -f "$build_dir/test.exe" ]]; then
+  # Symlink shared test.exe into per-compiler build dir. Always relink so
+  # stale per-compiler test.exes (left over from older builds when test.exe
+  # was compiled per compiler) get replaced.
+  if [[ -f "$test_exe" ]]; then
+    rm -f "$build_dir/test.exe"
     ln -sf "$test_exe" "$build_dir/test.exe"
   fi
 
@@ -1788,10 +1879,11 @@ run_one_hardware() {
       fi
   fi
 
-  # Copy events.json for trace decoding.
+  # Mirror trace_config.json into the trace output dir so downstream
+  # tools see one self-contained directory per (test, compiler, side).
   local build_traced="$BUILD_BASE/$name/traced"
-  if [[ -f "$build_traced/events.json" ]]; then
-    cp "$build_traced/events.json" "$trace_out_dir/"
+  if [[ -f "$build_traced/trace_config.json" ]]; then
+    cp "$build_traced/trace_config.json" "$trace_out_dir/"
   fi
 
   # Trim trace buffer to actual data length.
@@ -1836,8 +1928,11 @@ run_one_bridge() {
   local log_file="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.bridge.log"
   local result_file="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.bridge.result"
 
-  # Symlink shared test.exe into per-compiler build dir.
-  if [[ -f "$test_exe" ]] && [[ ! -f "$build_dir/test.exe" ]]; then
+  # Symlink shared test.exe into per-compiler build dir. Always relink so
+  # stale per-compiler test.exes (left over from older builds when test.exe
+  # was compiled per compiler) get replaced.
+  if [[ -f "$test_exe" ]]; then
+    rm -f "$build_dir/test.exe"
     ln -sf "$test_exe" "$build_dir/test.exe"
   fi
 
@@ -1967,10 +2062,11 @@ run_one_bridge() {
       _classify_cycle_diff "$name" "${compiler}${vsuffix}" || true
   fi
 
-  # Copy events.json for trace decoding.
+  # Mirror trace_config.json into the trace output dir so downstream
+  # tools see one self-contained directory per (test, compiler, side).
   local build_traced="$BUILD_BASE/$name/traced"
-  if [[ -f "$build_traced/events.json" ]]; then
-    cp "$build_traced/events.json" "$trace_out_dir/"
+  if [[ -f "$build_traced/trace_config.json" ]]; then
+    cp "$build_traced/trace_config.json" "$trace_out_dir/"
   fi
 
   # Trim trace buffer to actual data length.
@@ -2054,6 +2150,8 @@ print_report() {
   [[ "$NO_TRACE" != "true" ]] && has_trace=true
   local has_cycle=false
   [[ "$WITH_CYCLE_DIFF" == "true" ]] && has_cycle=true
+  local has_mode2=false
+  [[ "$MODE2" == "true" ]] && has_mode2=true
 
   local compilers
   read -ra compilers <<< "$COMPILERS_STR"
@@ -2094,6 +2192,13 @@ print_report() {
       printf "  %-24s" "${label}/CYCLES"
     done
   fi
+  if $has_mode2; then
+    for compiler in "${compilers[@]}"; do
+      local label
+      label="$(echo "$compiler" | sed 's/./\U&/')"
+      printf "  %-${col_width}s" "${label}/MODE2"
+    done
+  fi
   echo ""
 
   # Print separator.
@@ -2112,6 +2217,11 @@ print_report() {
   if $has_cycle; then
     for _ in "${compilers[@]}"; do
       printf "  %-24s" "$(printf '%0.s-' $(seq 1 24))"
+    done
+  fi
+  if $has_mode2; then
+    for _ in "${compilers[@]}"; do
+      printf "  %-${col_width}s" "$(printf '%0.s-' $(seq 1 $col_width))"
     done
   fi
   echo ""
@@ -2165,11 +2275,22 @@ print_report() {
   declare -a cycle_empty_list=()
   declare -a cycle_no_core_list=()
 
+  # Mode-2 counters (Task 305).
+  declare -A mode2_pass mode2_fail mode2_skip mode2_error
+  for compiler in "${compilers[@]}"; do
+    mode2_pass[$compiler]=0
+    mode2_fail[$compiler]=0
+    mode2_skip[$compiler]=0
+    mode2_error[$compiler]=0
+  done
+  declare -a mode2_offenders=()
+
   local has_compile_fail=false
 
   # Track which test names have already been counted for compile stats
   # (compile is per-test, not per-variant).
   declare -A _compile_counted  # "name:compiler" -> 1
+  declare -A _mode2_counted    # "name:compiler" -> 1 (mode-2 is per-test, not per-variant)
 
   # --- Data rows ---
   # Each entry in test_list is "name:variant" where variant may be empty.
@@ -2323,6 +2444,39 @@ print_report() {
       done
     fi
 
+    # Mode-2 column (Task 305).
+    # Mode-2 baselines are captured per (name, compiler), not per variant,
+    # so we look up using $safe (no vsuffix) and only count once per
+    # name:compiler pair across variant rows.
+    if $has_mode2; then
+      for compiler in "${compilers[@]}"; do
+        local m2="-"
+        if [[ -f "$RESULTS_DIR/${safe}.${compiler}.mode2.result" ]]; then
+          m2="$(< "$RESULTS_DIR/${safe}.${compiler}.mode2.result")"
+        fi
+        printf "  %-${col_width}s" "$m2"
+        local m2k="${name}:${compiler}"
+        if [[ -z "${_mode2_counted[$m2k]+x}" ]]; then
+          _mode2_counted["$m2k"]=1
+          case "$m2" in
+            PASS)  mode2_pass[$compiler]=$(( ${mode2_pass[$compiler]} + 1 )) ;;
+            FAIL)  mode2_fail[$compiler]=$(( ${mode2_fail[$compiler]} + 1 ))
+                   local m2detail="-"
+                   [[ -f "$RESULTS_DIR/${safe}.${compiler}.mode2.summary" ]] && \
+                     m2detail="$(< "$RESULTS_DIR/${safe}.${compiler}.mode2.summary")"
+                   mode2_offenders+=("  $name ($compiler): $m2detail") ;;
+            ERROR) mode2_error[$compiler]=$(( ${mode2_error[$compiler]} + 1 ))
+                   local m2detail="-"
+                   [[ -f "$RESULTS_DIR/${safe}.${compiler}.mode2.summary" ]] && \
+                     m2detail="$(< "$RESULTS_DIR/${safe}.${compiler}.mode2.summary")"
+                   mode2_offenders+=("  $name ($compiler): $m2detail") ;;
+            SKIP|-) mode2_skip[$compiler]=$(( ${mode2_skip[$compiler]} + 1 )) ;;
+            *)      mode2_skip[$compiler]=$(( ${mode2_skip[$compiler]} + 1 )) ;;
+          esac
+        fi
+      done
+    fi
+
     echo ""
 
     # Verbose: show log tail on failure.
@@ -2468,6 +2622,29 @@ print_report() {
       echo ""
       echo "  No-core tests (DMA-only / passthrough; core trace events cannot fire by design):"
       for line in "${cycle_no_core_list[@]}"; do
+        echo "$line"
+      done
+    fi
+  fi
+
+  if $has_mode2; then
+    echo ""
+    echo "==========================================================================="
+    echo "  MODE-2 (per-tile PC + LC sequence comparison)"
+    echo "==========================================================================="
+    for compiler in "${compilers[@]}"; do
+      printf "  %-8s  %d PASS  %d FAIL  %d SKIP  %d ERROR\n" \
+        "$compiler" \
+        "${mode2_pass[$compiler]}" \
+        "${mode2_fail[$compiler]}" \
+        "${mode2_skip[$compiler]}" \
+        "${mode2_error[$compiler]}"
+    done
+
+    if [[ ${#mode2_offenders[@]} -gt 0 ]]; then
+      echo ""
+      echo "  Offenders (FAIL / ERROR):"
+      for line in "${mode2_offenders[@]}"; do
         echo "$line"
       done
     fi
@@ -2819,8 +2996,6 @@ main() {
 
       local hw_trace="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.hw/trace_raw.bin"
       local emu_trace="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.emu/trace_raw.bin"
-      local events_file="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.hw/events.json"
-      [[ ! -f "$events_file" ]] && events_file="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.emu/events.json"
       local summary_file="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.trace.summary"
       # parse-trace.py needs the post-lowering MLIR to resolve event slots.
       local t5_mlir="$BUILD_BASE/$t5_name/${t5_compiler}/aie_arch.mlir.prj/input_with_addresses.mlir"
@@ -3058,14 +3233,37 @@ main() {
               # the same logical tile; the mode-1 PC-anchored aggregator
               # honours the same flag.
               if "$tc_bin" --sweep "$sweep_dir" --pc-anchored --remap-columns -o "$report" 2>&1; then
+                # `grep set_diff` returns 1 when the report has zero divergence
+                # lines (e.g. Batches: 0). Under `set -e -o pipefail` that
+                # would abort the whole script, so guard the pipe with
+                # `|| true` and let the empty fallback below handle the
+                # display.
                 local top_event
-                top_event="$(grep 'set_diff' "$report" | sort -t '=' -k2 -rn | head -1 | awk '{print $1}')"
+                top_event="$( { grep 'set_diff' "$report" || true; } | sort -t '=' -k2 -rn | head -1 | awk '{print $1}')"
                 echo "  PC-ANCHORED compare $name ($compiler): OK (top event: ${top_event:-none}; report: $report)"
+                if [[ "$MODE2" == "true" ]]; then
+                  _classify_mode2 "$RESULTS_DIR/${safe}.${compiler}.mode2.result" \
+                                  "$RESULTS_DIR/${safe}.${compiler}.mode2.summary" \
+                                  "$report"
+                  local m2r
+                  m2r="$(< "$RESULTS_DIR/${safe}.${compiler}.mode2.result")"
+                  echo "  MODE2 $name ($compiler): $m2r"
+                fi
               else
                 echo "  PC-ANCHORED compare $name ($compiler): FAIL (see $report)"
+                if [[ "$MODE2" == "true" ]]; then
+                  echo "ERROR" > "$RESULTS_DIR/${safe}.${compiler}.mode2.result"
+                  echo "ERROR: trace-compare failed -- see $report" \
+                    > "$RESULTS_DIR/${safe}.${compiler}.mode2.summary"
+                fi
               fi
             else
               echo "  PC-ANCHORED sweep $name ($compiler): FAIL (see $sweep_log)"
+              if [[ "$MODE2" == "true" ]]; then
+                echo "ERROR" > "$RESULTS_DIR/${safe}.${compiler}.mode2.result"
+                echo "ERROR: trace-sweep.py failed -- see $sweep_log" \
+                  > "$RESULTS_DIR/${safe}.${compiler}.mode2.summary"
+              fi
             fi
           done
         done
