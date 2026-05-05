@@ -301,3 +301,14 @@ individual follow-ups.
 - `xdna-emu/src/interpreter/execute/cycle_accurate.rs:582-587` -- current branch hook
 - `xdna-emu/src/interpreter/engine/coordinator.rs:1100-1116` -- current per-cycle atom firing
 - `xdna-emu/docs/superpowers/findings/2026-04-30-mode2-lc-flag-semantics.md` -- LC findings
+
+## Public discussion
+
+Posted upstream as [mlir-aie #3047](https://github.com/Xilinx/mlir-aie/issues/3047)
+on 2026-05-05 — findings 2 (atoms fire at branch resolution, not per
+cycle), 3 (New_PC only at dynamic-destination branches), and 4 (JNZD
+conditional-indirect emits atom only, no New_PC) all derive from the
+analysis here. Anchor_PC reflects fetch PC (finding 5) is also rooted
+in the Phase 3 result above. Update this section if maintainers confirm
+the rules, contradict them, or point at a public reference for the
+mode-2 frame layout.

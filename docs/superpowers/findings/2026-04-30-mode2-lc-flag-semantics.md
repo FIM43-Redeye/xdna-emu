@@ -288,3 +288,11 @@ If Peano-traced builds matter for other workflows, the broken path is
 between aiecc.py's lowering and the trace shim DMA setup -- the
 runtime_sequence's Trace_Control0 register write looks correct, but
 no atom data ever reaches the BO. Investigation deferred.
+
+## Public discussion
+
+Posted upstream as [mlir-aie #3047](https://github.com/Xilinx/mlir-aie/issues/3047)
+on 2026-05-05 — finding 1 in that issue is the LC bit-28-inert
+observation captured here. Update this section if maintainers respond
+with the trigger condition for flag=1, fixtures that reproduce it, or
+confirmation that the bit is reserved/unused on AIE2.
