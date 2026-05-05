@@ -133,23 +133,59 @@ read it back after `run.wait()`. Uses the `xrt::hw_context::read_aie_reg`
 
 Wired up in `bridge-trace-runner.cpp` behind `--read-perf-counter`. The
 register-reads fail with `DRM_IOCTL_AMDXDNA_GET_ARRAY` returning EINVAL
-(setup) and EOPNOTSUPP (post-wait readback). The XRT shim correctly
-dispatches `DRM_AMDXDNA_AIE_TILE_READ` (the un-guarded path), and the
-loaded `amdxdna.ko` does export `aie2_rw_aie_reg`, but the wrapper
-function `aie2_read_aie_reg` (called by the dispatch case) has **no
-open-source definition** in our `xdna-driver` checkout. The open-source
-release ships call sites only; the implementation lives in the closed
-companion file under `#ifdef AMDXDNA_AIE2_PRIV`.
+(setup) and EOPNOTSUPP (post-wait readback).
 
-Result: even though XRT has the patch and the underlying
-`aie2_rw_aie_reg` symbol is present, the IOCTL dispatch rejects the
-request because the missing wrapper means the right code path doesn't
-match the param value at runtime.
+**Correction (2026-05-05):** the original "no open-source definition"
+diagnosis below was wrong about the userspace path but right about the
+endpoint being unreachable on NPU1 -- just for a different reason.
 
-This isn't fixable without either AMD shipping the implementation, us
-patching `xdna-driver` to add a one-liner that calls `aie2_rw_aie_reg`
-directly, or reverse-engineering the right parameter encoding for the
-existing dispatch. None of those are 30-minute jobs.
+What actually happens (verified 2026-05-05 with `strace -e ioctl` +
+verbose driver dmesg):
+
+The XRT shim and kernel paths are fully open. `xrt::hw_context::read_aie_reg`
+in the patched XRT routes to `xrt_core::query::aie_read` (open shim
+code in `xdna-driver/src/shim/device.cpp:1523`), which builds a
+`DRM_AMDXDNA_AIE_TILE_READ` (param=9) `amdxdna_drm_get_array` ioctl
+and submits it. The kernel dispatcher routes through
+`aie2_get_array` -> `aie2_aie_tile_read` (open, in `aie2_pci.c:1564`)
+-> `aie2_rw_aie_reg` (open, in `aie2_message.c:1765`).
+
+`aie2_rw_aie_reg` calls
+`aie2_is_supported_msg(ndev, MSG_OP_AIE_RW_ACCESS)`, which iterates
+the per-device firmware-feature table:
+
+- `npu1_regs.c` (Phoenix): table contains only `MSG_OP_CHAIN_EXEC_NPU`
+  at FW 5.8. **No `MSG_OP_AIE_RW_ACCESS` entry** -> returns false ->
+  `aie2_rw_aie_reg` returns EOPNOTSUPP at the mailbox layer.
+- `npu4_regs.c` (Strix): contains
+  `{ AIE2_FW_VERSION(6, 24), MSG_OP_AIE_RW_ACCESS }` -> Strix firmware
+  >= 6.24 supports it.
+
+So this is a **firmware-level limitation on Phoenix**, not closed
+source and not a userspace bug. AMD never shipped Phoenix firmware
+that implements opcode 0x203 (`MSG_OP_AIE_RW_ACCESS`). On NPU4 the
+path will work end-to-end.
+
+We additionally hit a setup-time EINVAL on the *first* call because
+the hwctx's partition (`hwctx->num_col`) is allocated lazily on first
+kernel run, so calling `read_aie_reg` before `run.start()` reaches the
+"Column %u outside partition range [0, 0)" check at `aie2_pci.c:1635`.
+The post-wait call gets past that (partition allocated) and is the one
+that hits the firmware-support EOPNOTSUPP. Both errors are real, but
+the firmware one is the showstopper for NPU1.
+
+The original (wrong) text follows for posterity:
+
+> The XRT shim correctly dispatches `DRM_AMDXDNA_AIE_TILE_READ` (the
+> un-guarded path), and the loaded `amdxdna.ko` does export
+> `aie2_rw_aie_reg`, but the wrapper function `aie2_read_aie_reg` (called
+> by the dispatch case) has **no open-source definition** in our
+> `xdna-driver` checkout.
+
+That wrapper belongs to the *legacy* gated path
+(`DRM_AMDXDNA_READ_AIE_REG`). The new path uses
+`aie2_aie_tile_read` (open). The actual block is the firmware feature
+table, not anything closed.
 
 ### Attempt B: lock-synchronised compute-core timing kernel
 

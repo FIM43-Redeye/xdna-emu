@@ -192,11 +192,19 @@ impl CycleCostModel {
     /// This is a horrible kludge excuse for a control-path / NoC cost model.
     /// AMD has the real numbers (gated behind the un-shipped
     /// `AIE_CONTROL_PATH_LATENCY` JSON that
-    /// `libaie2_cluster_msm_v1_0_0.osci.so` reads). We don't have access to
-    /// them, and the only on-NPU timing path that would produce
-    /// trace-independent ground truth (Performance_Counter0 readback via
-    /// `xrt::hw_context::read_aie_reg`) is currently broken in our driver
-    /// stack -- the IOCTL wrapper function is closed-source.
+    /// `libaie2_cluster_msm_v1_0_0.osci.so` reads). The on-NPU readback
+    /// path that would produce trace-independent ground truth
+    /// (Performance_Counter0 readback via `xrt::hw_context::read_aie_reg`)
+    /// is **firmware-gated on Phoenix (NPU1)**: the host-side stack is
+    /// fully open (XRT public API -> `xrt_core::query::aie_read` ->
+    /// `DRM_AMDXDNA_AIE_TILE_READ` -> `aie2_aie_tile_read` ->
+    /// `aie2_rw_aie_reg`), but `aie2_rw_aie_reg` calls
+    /// `aie2_is_supported_msg(MSG_OP_AIE_RW_ACCESS)` and Phoenix
+    /// firmware never implemented opcode 0x203. The check returns
+    /// EOPNOTSUPP at the mailbox layer. NPU4 (Strix) firmware >= 6.24
+    /// does implement the opcode (see `npu4_regs.c`), so this avenue
+    /// will work there and is a planned investigation when NPU4 hardware
+    /// is available. See #356 for the full diagnosis.
     ///
     /// What's encoded here:
     /// - `aie_tile_bd` / `mem_tile_bd` / `shim_tile_bd` / `write_32`: 100 cyc.
