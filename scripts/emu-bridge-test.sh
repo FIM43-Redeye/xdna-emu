@@ -88,7 +88,7 @@ RUN_EMU=true
 LIST_ONLY=false
 VERBOSE=false
 COMPILER_MODE="both"  # "both", "chess", "peano"
-NO_TRACE="${NO_TRACE:-true}"
+NO_TRACE="${NO_TRACE:-false}"
 SWEEP=false
 PC_ANCHORED=false
 MODE2=false
@@ -142,8 +142,9 @@ Options:
   --compile       Force recompile all xclbins (default: use cached)
   --no-hw         Skip real hardware runs (default: hardware enabled)
   --no-emu        Skip emulator runs (default: emulator enabled)
-  --trace         Enable trace injection and comparison (default: off)
-  --no-trace      Disable trace preparation (default; kept for back-compat)
+  --trace         Enable trace injection and comparison (default: on)
+  --no-trace      Disable trace preparation (e.g., when only validating
+                  functional correctness)
   --sweep         Run full event sweep (trace-sweep.py) on passing tests after runs
   --trace=pc-anchored
                   Run mode-1 (event_pc) lockstep sweep on passing tests and
