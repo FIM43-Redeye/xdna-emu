@@ -1,0 +1,158 @@
+[
+  {
+    "kind": "blockwrite",
+    "device": "npu1_1col",
+    "target_col": 0,
+    "target_row": 2,
+    "payload": 4,
+    "counts": [
+      64,
+      256,
+      1024,
+      4096
+    ]
+  },
+  {
+    "kind": "blockwrite",
+    "device": "npu1_1col",
+    "target_col": 0,
+    "target_row": 2,
+    "payload": 8,
+    "counts": [
+      64,
+      256,
+      1024,
+      4096
+    ]
+  },
+  {
+    "kind": "blockwrite",
+    "device": "npu1_1col",
+    "target_col": 0,
+    "target_row": 2,
+    "payload": 12,
+    "counts": [
+      64,
+      256,
+      1024,
+      4096
+    ]
+  },
+  {
+    "kind": "blockwrite",
+    "device": "npu1_1col",
+    "target_col": 0,
+    "target_row": 2,
+    "payload": 16,
+    "counts": [
+      64,
+      256,
+      1024,
+      4096
+    ]
+  },
+  {
+    "kind": "blockwrite",
+    "device": "npu1_1col",
+    "target_col": 0,
+    "target_row": 2,
+    "payload": 20,
+    "counts": [
+      64,
+      256,
+      1024,
+      4096
+    ]
+  },
+  {
+    "kind": "blockwrite",
+    "device": "npu1_1col",
+    "target_col": 0,
+    "target_row": 2,
+    "payload": 24,
+    "counts": [
+      64,
+      256,
+      1024,
+      4096
+    ]
+  },
+  {
+    "kind": "blockwrite",
+    "device": "npu1_1col",
+    "target_col": 0,
+    "target_row": 2,
+    "payload": 28,
+    "counts": [
+      64,
+      256,
+      1024,
+      4096
+    ]
+  },
+  {
+    "kind": "blockwrite",
+    "device": "npu1_1col",
+    "target_col": 0,
+    "target_row": 2,
+    "payload": 32,
+    "counts": [
+      64,
+      256,
+      1024,
+      4096
+    ]
+  },
+  {
+    "kind": "blockwrite",
+    "device": "npu1_1col",
+    "target_col": 0,
+    "target_row": 2,
+    "payload": 40,
+    "counts": [
+      64,
+      256,
+      1024,
+      4096
+    ]
+  },
+  {
+    "kind": "blockwrite",
+    "device": "npu1_1col",
+    "target_col": 0,
+    "target_row": 2,
+    "payload": 48,
+    "counts": [
+      64,
+      256,
+      1024,
+      4096
+    ]
+  },
+  {
+    "kind": "blockwrite",
+    "device": "npu1_1col",
+    "target_col": 0,
+    "target_row": 2,
+    "payload": 56,
+    "counts": [
+      64,
+      256,
+      1024,
+      4096
+    ]
+  },
+  {
+    "kind": "blockwrite",
+    "device": "npu1_1col",
+    "target_col": 0,
+    "target_row": 2,
+    "payload": 64,
+    "counts": [
+      64,
+      256,
+      1024,
+      4096
+    ]
+  }
+]

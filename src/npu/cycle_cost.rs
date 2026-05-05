@@ -186,6 +186,79 @@ impl CycleCostModel {
         }
     }
 
+    /// Provisional NPU1 calibration -- fast-mode empirical values from the
+    /// `tools/calibration/` harness. **The values here are likely garbage**.
+    ///
+    /// This is a horrible kludge excuse for a control-path / NoC cost model.
+    /// AMD has the real numbers (gated behind the un-shipped
+    /// `AIE_CONTROL_PATH_LATENCY` JSON that
+    /// `libaie2_cluster_msm_v1_0_0.osci.so` reads). We don't have access to
+    /// them, and the only on-NPU timing path that would produce
+    /// trace-independent ground truth (Performance_Counter0 readback via
+    /// `xrt::hw_context::read_aie_reg`) is currently broken in our driver
+    /// stack -- the IOCTL wrapper function is closed-source.
+    ///
+    /// What's encoded here:
+    /// - `aie_tile_bd` / `mem_tile_bd` / `shim_tile_bd` / `write_32`: 100 cyc.
+    ///   Empirical write32 cost on real NPU1 is ~100.5 cyc/pkt averaged
+    ///   over a period-2 modulation (87 cyc on even N, 114 cyc on odd N --
+    ///   a 5-stage CMP pipeline thing, presumably). Per-tile-type variation
+    ///   was within 0.5 cyc across shim/mem/compute targets. Distance from
+    ///   anchor was within 1.34 cyc across the npu1 4x6 array -- effectively
+    ///   free. So one number across all tile types, integer-rounded.
+    /// - `mask_write_overhead`: +110 cyc. Empirical maskwrite ~210 cyc/pkt
+    ///   (intrinsically noisy at ~50 cyc per-rep spread, period structure
+    ///   not resolved). Subtract write32 base for the RMW overhead.
+    /// - `block_write_per_word`: 13 cyc. Derived from blockwrite
+    ///   payload=8 = 203 cyc/pkt minus the 100 cyc write32 base, divided
+    ///   by 8 words. The legitimate per-word cost from AMD's schema is
+    ///   what should land here once we get it.
+    /// - `cmp_to_shim`: 0. Distance-independent slope confirmed empirically
+    ///   across 24 tiles and 6 distances; per-hop fit was -0.05 cyc with
+    ///   R^2=0.03 (noise).
+    /// - `sync` / `mask_poll_iter`: not calibrated, kept at 1.
+    ///
+    /// What's NOT modelled (deliberately):
+    /// - One-time +91 cyc step at write32 N=23 (and analogous events at
+    ///   blockwrite N=12, maskwrite ~N=12)
+    /// - Stochastic +2780 cyc slow-mode artifact starting at ~3500 NPU
+    ///   cycles into a kernel run, locking to 100% probability by ~8000
+    ///   cycles.
+    ///
+    /// Both artifacts trigger at fixed *cycle* thresholds across packet
+    /// kinds, which is the signature of a concurrent cycle-clock-driven
+    /// subsystem -- most likely the trace controller flushing on its own
+    /// internal timer, *not* real CMP behaviour. Working hypothesis: they
+    /// are measurement-side and would not apply to a no-trace kernel.
+    /// We can't confirm without on-NPU timing.
+    ///
+    /// See `docs/superpowers/findings/2026-05-04-control-path-cycle-calibration.md`
+    /// for the full methodology, the negative results from diagnostic
+    /// tests, and what it would take to ship a real model.
+    pub fn provisional_npu1() -> Self {
+        Self {
+            // Empirical fast-mode values. See doc-comment above.
+            aie_tile_bd: 100,
+            mem_tile_bd: 100,
+            shim_tile_bd: 100,
+            write_32: 100,
+            mask_write_overhead: 110,
+            block_write_per_word: 13,
+            cmp_to_shim: 0,
+
+            // Not calibrated -- kept at conservative placeholders.
+            sync: 1,
+            mask_poll_iter: 1,
+
+            // Derived from open sources (same as with_known_constants).
+            fabric_hop_local: 3,    // AM020 ch.2
+            fabric_hop_boundary: 4, // AM020 ch.2
+            plio_aie_to_pl: 4,      // aie_xtlm.cpp:202
+            plio_pl_to_aie: 3,      // aie_xtlm.cpp:232
+            register_write: 1,      // AM025
+        }
+    }
+
     /// Compute the total retirement cost of an instruction.
     ///
     /// This is the source of truth the executor calls. Decodes the
@@ -254,16 +327,18 @@ impl CycleCostModel {
 }
 
 impl Default for CycleCostModel {
-    /// Default profile engages the open-source-derived structural costs
-    /// (fabric hops, PLIO bridge, register-write completion). Per-tile-
-    /// type CMP costs and CMP-to-shim NoC entry remain conservative
-    /// placeholders pending #322 calibration.
+    /// Default profile uses the **provisional NPU1 calibration** -- the
+    /// best empirical numbers we have despite the caveats documented on
+    /// `CycleCostModel::provisional_npu1()`. Switching the default to
+    /// these values gives the executor cycle counts in the right ballpark
+    /// (~100 cyc per control packet) instead of the placeholder ~5-15 cyc
+    /// you got with `with_known_constants()`.
     ///
     /// To preserve the prior 1-cycle-per-packet behaviour for a specific
     /// caller, opt in explicitly with
     /// `CycleCostModel::legacy_one_per_packet()`.
     fn default() -> Self {
-        Self::with_known_constants()
+        Self::provisional_npu1()
     }
 }
 
@@ -339,10 +414,13 @@ mod tests {
     }
 
     #[test]
-    fn default_is_with_known_constants() {
+    fn default_is_provisional_npu1() {
         let d = CycleCostModel::default();
-        let k = CycleCostModel::with_known_constants();
+        let p = CycleCostModel::provisional_npu1();
         let w = NpuInstruction::Write32 { reg_off: 0, value: 0 };
-        assert_eq!(d.cost_of(&w), k.cost_of(&w));
+        assert_eq!(d.cost_of(&w), p.cost_of(&w));
+        // Sanity: provisional CMP cost should be ~100, far above the
+        // 1-cyc placeholder in with_known_constants.
+        assert!(p.write_32 >= 50, "provisional write_32 should reflect calibration");
     }
 }

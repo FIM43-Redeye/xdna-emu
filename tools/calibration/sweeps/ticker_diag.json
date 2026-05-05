@@ -1,0 +1,26 @@
+[
+  {
+    "kind": "write32",
+    "device": "npu1_1col",
+    "target_col": 0, "target_row": 2,
+    "anchor_col": 0, "anchor_row": 2,
+    "ticker_period": 64,
+    "counts": [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80, 100, 150]
+  },
+  {
+    "kind": "write32",
+    "device": "npu1_1col",
+    "target_col": 0, "target_row": 2,
+    "anchor_col": 0, "anchor_row": 2,
+    "ticker_period": 256,
+    "counts": [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80, 100, 150]
+  },
+  {
+    "kind": "write32",
+    "device": "npu1_1col",
+    "target_col": 0, "target_row": 2,
+    "anchor_col": 0, "anchor_row": 2,
+    "ticker_period": 1024,
+    "counts": [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80, 100, 150]
+  }
+]

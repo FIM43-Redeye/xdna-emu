@@ -1,0 +1,8 @@
+[
+  {"kind": "write32",    "target": "compute", "counts": [16, 64, 256, 1024, 4096]},
+  {"kind": "maskwrite",  "target": "compute", "counts": [16, 64, 256, 1024, 4096]},
+  {"kind": "blockwrite", "target": "compute", "counts": [16, 64, 256, 1024], "payload": 8},
+  {"kind": "blockwrite", "target": "compute", "counts": [16, 64, 256, 1024], "payload": 16},
+  {"kind": "blockwrite", "target": "compute", "counts": [16, 64, 256, 1024], "payload": 32},
+  {"kind": "blockwrite", "target": "compute", "counts": [16, 64, 256, 1024], "payload": 64}
+]

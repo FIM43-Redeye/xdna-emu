@@ -1,0 +1,26 @@
+[
+  {
+    "kind": "write32",
+    "target_col": 0,
+    "target_row": 2,
+    "counts": [
+      16,
+      64,
+      256,
+      1024,
+      4096
+    ]
+  },
+  {
+    "kind": "maskwrite",
+    "target_col": 0,
+    "target_row": 2,
+    "counts": [
+      16,
+      64,
+      256,
+      1024,
+      4096
+    ]
+  }
+]

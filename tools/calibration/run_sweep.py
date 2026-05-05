@@ -55,14 +55,30 @@ def run(cmd: list, cwd: Path = None, check: bool = True) -> subprocess.Completed
     return subprocess.run(cmd, cwd=cwd, check=check, capture_output=True, text=True)
 
 
-def gen_one(work_dir: Path, kind: str, target: str, count: int, payload: int) -> None:
+def gen_one(work_dir: Path, task: dict) -> None:
     work_dir.mkdir(parents=True, exist_ok=True)
-    run([
+    cmd = [
         sys.executable, str(GEN_KERNEL),
-        "--kind", kind, "--target", target,
-        "--count", str(count), "--payload", str(payload),
+        "--kind", task["kind"],
+        "--count", str(task["count"]),
+        "--payload", str(task["payload"]),
         "--out", str(work_dir),
-    ])
+    ]
+    # Either explicit target_col/target_row or the legacy --target shorthand.
+    if "target_col" in task or "target_row" in task:
+        cmd += ["--target-col", str(task.get("target_col", 0))]
+        cmd += ["--target-row", str(task.get("target_row", 2))]
+    elif "target" in task:
+        cmd += ["--target", task["target"]]
+    if "anchor_col" in task:
+        cmd += ["--anchor-col", str(task["anchor_col"])]
+    if "anchor_row" in task:
+        cmd += ["--anchor-row", str(task["anchor_row"])]
+    if "device" in task:
+        cmd += ["--device", task["device"]]
+    if "ticker_period" in task:
+        cmd += ["--ticker-period", str(task["ticker_period"])]
+    run(cmd)
 
 
 def compile_one(work_dir: Path) -> bool:
@@ -88,7 +104,7 @@ def compile_one(work_dir: Path) -> bool:
     return proc.returncode == 0 and (work_dir / "final.xclbin").exists()
 
 
-def run_on_hw(work_dir: Path, trace_size: int = 65536) -> bool:
+def run_on_hw(work_dir: Path, trace_size: int = 262144) -> bool:
     """Run the kernel on real NPU. Returns True on success."""
     log_path = work_dir / "run.log"
     cmd = [
@@ -132,11 +148,25 @@ def parse_one(work_dir: Path) -> dict:
     except (FileNotFoundError, KeyError, json.JSONDecodeError) as e:
         return {"hw_cycles": None, "error": f"events.json read: {e}"}
 
-    # Slot 0 = INSTR_EVENT_0, slot 1 = USER_EVENT_0, slot 2 = USER_EVENT_1
-    # (order matches the aie.trace.event<...> declarations in gen_kernel.py).
-    anchors_a = [e for e in events if e["slot"] == 1]
-    anchors_b = [e for e in events if e["slot"] == 2]
-    ticks = [e for e in events if e["slot"] == 0]
+    # Slot indices match positions in the aie.trace.event<...> declarations
+    # in gen_kernel.py. For compute anchor we declare three events
+    # (INSTR_EVENT_0, USER_EVENT_0, USER_EVENT_1) so anchors are at slots 1/2.
+    # For shim/memtile anchor the INSTR_EVENT_0 slot is dropped, so anchors
+    # are at slots 0/1.
+    try:
+        params = json.loads((work_dir / "params.json").read_text())
+        anchor_row = params.get("anchor_row", 2)
+    except (FileNotFoundError, json.JSONDecodeError):
+        anchor_row = 2
+    anchor_is_compute = anchor_row >= 2
+    if anchor_is_compute:
+        slot_a, slot_b, slot_tick = 1, 2, 0
+    else:
+        slot_a, slot_b, slot_tick = 0, 1, None
+
+    anchors_a = [e for e in events if e["slot"] == slot_a]
+    anchors_b = [e for e in events if e["slot"] == slot_b]
+    ticks = [e for e in events if slot_tick is not None and e["slot"] == slot_tick]
 
     if not anchors_a or not anchors_b:
         return {
@@ -152,18 +182,21 @@ def parse_one(work_dir: Path) -> dict:
 
 
 def expand_sweep(sweep_groups: list, reps: int) -> list:
-    """Expand sweep groups into individual (kind, target, count, rep) tasks."""
+    """Expand sweep groups into individual (kind, target, count, rep) tasks.
+
+    Each group may specify any of: kind, target (shorthand), target_col,
+    target_row, anchor_col, anchor_row, device, payload, counts.
+    """
     tasks = []
     for grp in sweep_groups:
-        kind = grp["kind"]
-        target = grp["target"]
-        payload = grp.get("payload", 0)
+        base = {k: v for k, v in grp.items() if k != "counts"}
+        base.setdefault("payload", 0)
         for count in grp["counts"]:
             for rep in range(reps):
-                tasks.append({
-                    "kind": kind, "target": target, "count": count,
-                    "payload": payload, "rep": rep,
-                })
+                t = dict(base)
+                t["count"] = count
+                t["rep"] = rep
+                tasks.append(t)
     return tasks
 
 
@@ -202,7 +235,7 @@ def main() -> int:
             # rep=0 generates+compiles; reps 1..N reuse rep=0's xclbin.
             if t["rep"] != 0:
                 continue
-            tag = f"{t['kind']}_{t['target']}_n{t['count']}_p{t['payload']}"
+            tag = task_tag(t)
             wd = args.workdir / tag
             t["work_dir"] = wd
             futs[pool.submit(_gen_compile, wd, t)] = tag
@@ -218,11 +251,10 @@ def main() -> int:
           f"{len(compile_failures)} compile failures", file=sys.stderr)
 
     # Wire up rep > 0 tasks to share rep=0's work_dir.
-    rep0_dirs = {(t["kind"], t["target"], t["count"], t["payload"]): t["work_dir"]
-                 for t in tasks if t["rep"] == 0}
+    rep0_dirs = {task_tag(t): t["work_dir"] for t in tasks if t["rep"] == 0}
     for t in tasks:
         if t["rep"] != 0:
-            t["work_dir"] = rep0_dirs[(t["kind"], t["target"], t["count"], t["payload"])]
+            t["work_dir"] = rep0_dirs[task_tag(t)]
 
     # Phase 2: HW runs (SERIAL -- NPU is single tenant).
     print("[phase 2/3] running on NPU (serial)...", file=sys.stderr)
@@ -250,24 +282,26 @@ def main() -> int:
     print("[phase 3/3] parsing traces...", file=sys.stderr)
     t0 = time.time()
     measurements = []
+    measurement_keys = (
+        "kind", "target", "target_col", "target_row",
+        "anchor_col", "anchor_row", "device", "ticker_period",
+        "count", "payload", "rep",
+    )
     for t in tasks:
         wd = t["work_dir"]
+        record = {k: t[k] for k in measurement_keys if k in t}
         if t.get("hw_status") != "ok":
-            measurements.append({
-                **{k: t[k] for k in ("kind", "target", "count", "payload", "rep")},
-                "hw_cycles": None,
-                "error": t.get("hw_status", "unknown"),
-            })
+            record["hw_cycles"] = None
+            record["error"] = t.get("hw_status", "unknown")
+            measurements.append(record)
             continue
         # Swap in this rep's trace and parse.
         rep_trace = wd / f"trace_rep{t['rep']}.bin"
         if rep_trace.exists():
             (wd / "trace.bin").write_bytes(rep_trace.read_bytes())
         result = parse_one(wd)
-        measurements.append({
-            **{k: t[k] for k in ("kind", "target", "count", "payload", "rep")},
-            **result,
-        })
+        record.update(result)
+        measurements.append(record)
     print(f"[phase 3/3] done in {time.time()-t0:.1f}s", file=sys.stderr)
 
     # Write the measurements JSON.
@@ -288,9 +322,33 @@ def main() -> int:
     return 0 if n_ok > 0 else 1
 
 
+def task_tag(task: dict) -> str:
+    """Stable identifier per (kind, target, anchor, device, count, payload).
+
+    Two tasks with the same tag share a build directory (so reps reuse the
+    rep=0 xclbin). The tag must distinguish every dimension that affects
+    the generated kernel.
+    """
+    if "target_col" in task or "target_row" in task:
+        target_part = f"c{task.get('target_col', 0)}r{task.get('target_row', 2)}"
+    else:
+        target_part = task.get("target", "compute")
+    anchor_part = ""
+    if "anchor_col" in task or "anchor_row" in task:
+        anchor_part = f"_a{task.get('anchor_col', 0)}r{task.get('anchor_row', 2)}"
+    device_part = ""
+    if task.get("device") and task["device"] != "npu1_1col":
+        device_part = f"_{task['device']}"
+    ticker_part = ""
+    if "ticker_period" in task and task["ticker_period"] != 256:
+        ticker_part = f"_t{task['ticker_period']}"
+    return (f"{task['kind']}_{target_part}{anchor_part}"
+            f"_n{task['count']}_p{task['payload']}{device_part}{ticker_part}")
+
+
 def _gen_compile(work_dir: Path, task: dict) -> bool:
     try:
-        gen_one(work_dir, task["kind"], task["target"], task["count"], task["payload"])
+        gen_one(work_dir, task)
         return compile_one(work_dir)
     except subprocess.CalledProcessError:
         return False
