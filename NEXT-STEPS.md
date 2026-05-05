@@ -28,57 +28,84 @@ document — read it first when picking up where we left off.
 
 ### What we discovered but haven't acted on yet
 
-#### `read_aie_reg` is firmware-blocked on NPU1 (today's sidetrack)
+#### `read_aie_reg` is **NOT** firmware-blocked on NPU1 — driver-table-blocked
 
-The earlier "closed-source" diagnosis was wrong. The host stack is
-fully open: `xrt::hw_context::read_aie_reg` → `xrt_core::query::aie_read`
-→ `DRM_AMDXDNA_AIE_TILE_READ` → `aie2_aie_tile_read` →
-`aie2_rw_aie_reg`. The block is at
-`aie2_is_supported_msg(MSG_OP_AIE_RW_ACCESS)`, which checks a per-device
-firmware feature table:
+**Major correction to the 2026-05-05 morning diagnosis.** Phoenix
+firmware (1.5.5.391, mailbox protocol 5.8) DOES implement
+`MSG_OP_AIE_RW_ACCESS` (opcode 0x203). The previous claim that "Phoenix
+firmware never implemented it" was wrong — the only obstacle was the
+*driver-side* op-table check.
 
-- `npu1_regs.c` (Phoenix) lists only `MSG_OP_CHAIN_EXEC_NPU` at
-  protocol 5.8. **`MSG_OP_AIE_RW_ACCESS` (opcode 0x203) is absent —
-  Phoenix firmware never implemented it.**
-- `npu4_regs.c` (Strix) lists `MSG_OP_AIE_RW_ACCESS` at protocol 6.24+.
+How we proved it: added a debugfs `nputest` test_case04 (raw mailbox
+send-and-capture) to `aie2_debugfs.c`, sent opcode 0x203 with a
+register-read request for TIMER_LOW (col=0, row=2, addr=0x340F8),
+and got back `status = 0x0 (AIE2_STATUS_SUCCESS)` with a
+register value that monotonically advanced ~13.4k cycles per read at
+400 MHz MP-NPU clock — exactly matching shell loop wall-time. The
+firmware understood the opcode, parsed the request, and returned a
+valid value.
 
-We tried bpftrace `override()` (rejected by BPF verifier — function not
-in `ALLOW_ERROR_INJECTION` allowlist), then a signed livepatch module
-(loaded fine — but `aie2_is_supported_msg` is **fully inlined by GCC at
--O2** into all callers, so symbol-level livepatch doesn't redirect any
-actual call site). Disassembly of `aie2_rw_aie_reg` shows zero
-`R_X86_64_PLT32` relocations to `aie2_is_supported_msg`. Dead end via
-livepatch.
+The actual block: `aie2_is_supported_msg()` iterates
+`ndev->priv->optional_msg`. On Phoenix that table only contained
+`MSG_OP_CHAIN_EXEC_NPU` — no entry for `MSG_OP_AIE_RW_ACCESS`. AMD's
+`npu1_regs.c` simply omitted the entry; nothing about the firmware
+gates the opcode.
 
-**The path that's still open**: we build `amdxdna.ko` from source via
-DKMS. A one-line driver-source patch removes the firmware-feature
-check entirely (or, equivalently, adds `MSG_OP_AIE_RW_ACCESS` to
-`npu1_regs.c`'s op table). Recompile, reload, retry. This is the
-proper way to bypass the gate, given we're already building the
-driver. **Most likely outcome**: Phoenix firmware returns "unknown
-opcode" status → driver returns `-EINVAL`. Lower probability: timeout
-→ mgmt channel destroyed → driver reload. All recovery paths
-documented in `xdna-emu/CLAUDE.md`.
+**Fix applied 2026-05-05 (this session):**
 
-We *also* have a separate lifecycle bug in
-`bridge-runner/bridge-trace-runner.cpp`: the pre-launch
-`read_aie_reg` call hits `Column 0 outside partition range [0, 0)`
-because `hwctx->num_col` is zero until the first `run.start()`. Move
-the perf-counter init/reset to after `run.start()` returns (the
-post-wait read works fine — it gets EOPNOTSUPP from the firmware
-gate, not from the partition check).
+```c
+// xdna-driver/src/driver/amdxdna/npu1_regs.c
+const struct msg_op_ver npu1_msg_op_tbl[] = {
+    { AIE2_FW_VERSION(5, 8), MSG_OP_CHAIN_EXEC_NPU },
+    { AIE2_FW_VERSION(5, 8), MSG_OP_AIE_RW_ACCESS },  /* added */
+    { 0 },
+};
+```
+
+Driver rebuilt and loaded. End-to-end XRT path verified:
+`bridge-trace-runner --read-perf-counter` now returns
+`perf_ok:true, core_cycles:0` instead of throwing on EOPNOTSUPP. The
+zero comes from the *separate* lifecycle bug below — counter never
+got configured.
+
+**Outstanding lifecycle bug** in `bridge-runner/bridge-trace-runner.cpp`:
+the pre-launch `read_aie_reg`/`write_aie_reg` calls (lines 1717-1724,
+which initialize PERF_CTRL0 and zero PERF_COUNTER0 BEFORE `run.start()`)
+fail with EINVAL. Reason: `hwctx->num_col` is set inside the runqueue
+connect path that fires on first kernel launch (`aie2_ctx_runqueue.c:316`,
+`ctx->num_col = part_num_col(part)`). Until `run.start()` is called,
+num_col is zero, and the partition-range check at `aie2_pci.c:1635`
+fails. The post-wait read at line 1740 succeeds fine.
+
+Workable options (none implemented yet):
+- Issue a no-op kernel run first to allocate the partition, then setup,
+  then run the real kernel.
+- Cache `core_cycles_start` from the post-wait read of run N, use it as
+  the baseline for run N+1's delta computation. Ugly but free.
+- Patch the driver to allocate the partition at hwctx creation rather
+  than first kernel run. Bigger surgery, risks regressing real workloads.
+
+**A different lifecycle bug we hit and survived**: writing PERF_CTRL0
+via raw mailbox (no active context) wedged the firmware, leading to a
+PM-suspend cascade that flushed our stale message into a freed-stack
+callback → kernel page-fault Oops in `aie2_dbgfs_raw_resp_cb`. Root
+cause was a stack-allocated response struct in our debugfs handler;
+fixed in the same session by moving to heap and intentionally leaking
+on timeout (commit included). Lesson: register writes that target
+per-tile state with no allocated context will hang firmware — only
+register *reads* are safe via the raw debugfs path without a partition.
 
 References:
-- src: `npu-work/xdna-driver/src/driver/amdxdna/aie2_message.c:1772`
-  (`aie2_rw_aie_reg`'s firmware-support check)
-- src: `npu-work/xdna-driver/src/driver/amdxdna/npu1_regs.c`
-  (Phoenix op table — add entry here)
-- src: `npu-work/xdna-driver/src/driver/amdxdna/npu4_regs.c:40`
-  (Strix already has it at FW 6.24)
-- finding: `docs/superpowers/findings/2026-05-04-control-path-cycle-calibration.md`
-  (corrected end-of-doc — the path *is* open, it's just firmware-gated)
-- task: #356 (closed; firmware diagnosis confirmed)
-- task: #357 (open; retry on NPU4 hardware when available)
+- src: `xdna-driver/src/driver/amdxdna/aie2_debugfs.c` (test_case04 added)
+- src: `xdna-driver/src/driver/amdxdna/npu1_regs.c` (op-table entry added)
+- src: `xdna-driver/src/driver/amdxdna/aie2_message.c:1772`
+  (`aie2_rw_aie_reg`'s table check — same code, now satisfied)
+- src: `xdna-driver/src/driver/amdxdna/npu4_regs.c:40`
+  (Strix's entry — was correct, ours wasn't)
+- finding: `docs/superpowers/findings/2026-05-05-aie-rw-access-firmware-actually-supported.md`
+  (the breakthrough doc, supersedes the calibration-doc's read_aie_reg analysis)
+- task: #356 (re-opened; in-progress for the npu1_regs.c entry verification)
+- task: #357 (re-scope: NPU4 still wanted for cross-arch confirmation, but Phoenix is no longer blocked)
 
 #### EMU trace divergence has multiple distinct causes (#321 re-scope)
 

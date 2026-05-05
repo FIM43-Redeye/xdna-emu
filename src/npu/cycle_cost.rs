@@ -195,16 +195,17 @@ impl CycleCostModel {
     /// `libaie2_cluster_msm_v1_0_0.osci.so` reads). The on-NPU readback
     /// path that would produce trace-independent ground truth
     /// (Performance_Counter0 readback via `xrt::hw_context::read_aie_reg`)
-    /// is **firmware-gated on Phoenix (NPU1)**: the host-side stack is
-    /// fully open (XRT public API -> `xrt_core::query::aie_read` ->
-    /// `DRM_AMDXDNA_AIE_TILE_READ` -> `aie2_aie_tile_read` ->
-    /// `aie2_rw_aie_reg`), but `aie2_rw_aie_reg` calls
-    /// `aie2_is_supported_msg(MSG_OP_AIE_RW_ACCESS)` and Phoenix
-    /// firmware never implemented opcode 0x203. The check returns
-    /// EOPNOTSUPP at the mailbox layer. NPU4 (Strix) firmware >= 6.24
-    /// does implement the opcode (see `npu4_regs.c`), so this avenue
-    /// will work there and is a planned investigation when NPU4 hardware
-    /// is available. See #356 for the full diagnosis.
+    /// **is now functional on Phoenix as of 2026-05-05** -- earlier
+    /// "firmware-gated" diagnoses were wrong. Phoenix firmware 1.5.5.391
+    /// fully implements `MSG_OP_AIE_RW_ACCESS`; the only obstacle was a
+    /// missing entry in the driver's `npu1_regs.c` op-table, which
+    /// `aie2_is_supported_msg` consults before letting the message through.
+    /// One-line driver fix unblocks the path. See
+    /// `docs/superpowers/findings/2026-05-05-aie-rw-access-firmware-actually-supported.md`
+    /// for the breakthrough writeup; #356 tracks the integration. A
+    /// separate lifecycle bug in `bridge-trace-runner.cpp` still prevents
+    /// trace-independent cycle counts from being recorded automatically;
+    /// the read path itself is good.
     ///
     /// What's encoded here:
     /// - `aie_tile_bd` / `mem_tile_bd` / `shim_tile_bd` / `write_32`: 100 cyc.

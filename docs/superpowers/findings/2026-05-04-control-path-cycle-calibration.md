@@ -6,6 +6,15 @@ type: project
 
 # Control-path cycle calibration -- provisional results
 
+> **2026-05-05 update**: the "read_aie_reg is firmware-blocked on
+> Phoenix" conclusion at the bottom of this document is **wrong**.
+> Phoenix firmware DOES implement `MSG_OP_AIE_RW_ACCESS`; the only
+> obstacle was a missing entry in `npu1_regs.c`'s op-table. See
+> `2026-05-05-aie-rw-access-firmware-actually-supported.md` for the
+> correct picture and the one-line driver fix. The calibration data
+> itself (write32 / blockwrite / maskwrite per-packet costs, the two
+> artifact classes) is unaffected and remains valid.
+
 ## TL;DR
 
 Calibration sweeps against real NPU1 hardware nailed down clean
