@@ -7,17 +7,20 @@ the same traced artifacts are used for both.
 
 Steps:
 1. Read aie.mlir, apply NPUDEVICE substitution -> aie_arch.mlir (implicit)
-2. Inject trace via mlir-trace-inject.py (declarative aie.trace ops) -> aie_traced.mlir + manifest
+2. Inject trace via mlir-trace-inject.py -> aie_traced.mlir + trace_config.json
 3. Patch test.cpp via tree-sitter (cpp_trace_patch) + BDF patch -> test_traced.cpp
-4. Write events.json from injected MLIR (tiles_traced; trace_ddr_id is
-   derived later by aiecc lowering and patched in via cpp_trace_patch's
-   heuristic when None here)
-5. Write prepare-status.txt (OK / FAIL / SKIP)
+4. Write prepare-status.txt (OK / FAIL / SKIP)
 
 Source-detect / route-planning utilities live in tools/deprecated/trace-inject.py
 (loaded as a module). Their imports of mlir-aie's old per-tile-type setup
 helpers were removed upstream, so we no longer call inject_trace from there;
 all injection now goes through the declarative path in mlir-trace-inject.py.
+
+Single source of truth: ``trace_config.json`` written by mlir-trace-inject;
+schema at ``tools/trace_config_schema.json``; spec at
+``docs/superpowers/findings/2026-05-05-trace-config-schema.md``. Every
+downstream tool (cpp_trace_patch, parse-trace, trace_compare, bridge script)
+reads this file. There is no ``events.json`` and no stdout-passed arg_idx.
 
 Usage:
     trace-prepare.py <test_source_dir> --output <dir> [--trace-size BYTES]
@@ -26,13 +29,14 @@ Usage:
 """
 
 import argparse
-import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from trace_config import load as trace_config_load  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -106,34 +110,36 @@ def write_status(output_dir: Path, status: str) -> None:
 # Declarative trace injection (replaces the deprecated imperative path)
 # ---------------------------------------------------------------------------
 
-# Per-tile aie.trace declaration in the injected MLIR. Symbol form is
-# emitted by mlir-trace-inject._trace_sym as "trace_t<col>_<row>"; we match
-# it back out here to build the tiles_traced manifest entry.
-_TRACE_DECL_RE = re.compile(
-    r"aie\.trace\s+@trace_t(\d+)_(\d+)\s*\(\s*%[A-Za-z0-9_]+\s*\)"
-)
-
-
 def inject_trace_declarative(
-    mlir_text: str, trace_size: int
+    mlir_text: str,
+    trace_size: int,
+    trace_config_path: Path,
+    *,
+    test_name: str,
+    src_mlir: Path,
 ) -> tuple[str, dict]:
-    """Run mlir-trace-inject.py on the MLIR text; return (traced, manifest).
+    """Run mlir-trace-inject.py on the MLIR text.
 
-    Replaces the deprecated trace-inject.py inject_trace() call. The
-    declarative path lets aiecc lower the trace setup the same way it
+    Returns ``(traced_mlir_text, trace_config_dict)``.  The injector writes
+    the trace_config.json at *trace_config_path*; this function reads it
+    back so the orchestrator can use it without re-parsing.
+
+    Args:
+        mlir_text: source MLIR (after device-name substitution and
+            widening); may be munged from the on-disk source.
+        trace_size: trace BO size in bytes.
+        trace_config_path: where the injector should write trace_config.json.
+        test_name: stable test identifier for the config's test_name field.
+        src_mlir: original on-disk MLIR path for the config's src_mlir
+            field. We pass the MLIR text through a tempfile (so widened/
+            substituted variants don't write back to source), but the
+            recorded path should still point at the real source so the
+            cache invalidation upstream uses a stable identifier.
+
+    The declarative path lets aiecc lower the trace setup the same way it
     handles every other aie.trace.* op, which avoids the brittle
     aie.utils.trace.setup imports that broke when mlir-aie deprecated
     the per-tile-type configure_*_aie2 helpers.
-
-    Manifest fields:
-      - trace_size: passed through (aie.trace.host_config buffer_size)
-      - trace_ddr_id: None. The trace BO arg index is added by aiecc
-        during runtime-sequence lowering, after this step. Downstream
-        consumers (cpp_trace_patch) fall back to a positional heuristic
-        when this is None.
-      - tiles_traced: derived from the injected aie.trace declarations
-        by symbol-name parsing. Currently only compute cores (rows >= 2)
-        get trace declarations from mlir-trace-inject.
     """
     inject_tool = Path(__file__).parent / "mlir-trace-inject.py"
     with tempfile.TemporaryDirectory() as td:
@@ -145,7 +151,10 @@ def inject_trace_declarative(
             [sys.executable, str(inject_tool),
              "--input", str(in_path),
              "--out", str(out_path),
-             "--buffer-size", str(trace_size)],
+             "--buffer-size", str(trace_size),
+             "--trace-config-out", str(trace_config_path),
+             "--config-test-name", test_name,
+             "--config-src-mlir", str(src_mlir.resolve())],
             capture_output=True, text=True,
         )
         if proc.returncode != 0:
@@ -155,17 +164,8 @@ def inject_trace_declarative(
             )
         traced_text = out_path.read_text()
 
-    tiles_traced = [
-        {"col": int(col), "row": int(row), "tile_type": "core",
-         "events": "default_core_8"}
-        for col, row in _TRACE_DECL_RE.findall(traced_text)
-    ]
-    manifest = {
-        "trace_size": trace_size,
-        "trace_ddr_id": None,
-        "tiles_traced": tiles_traced,
-    }
-    return traced_text, manifest
+    cfg = trace_config_load(trace_config_path)
+    return traced_text, cfg
 
 
 def lower_trace_ops_with_lateral_routing(mlir_text: str) -> str:
@@ -236,7 +236,7 @@ def prepare_trace(
 
     # -- MLIR preparation ---------------------------------------------------
 
-    manifest_partial = None  # set by MLIR injection below; None when skipped
+    trace_config = None  # set by MLIR injection below; None when skipped
 
     if not skip_mlir:
         # Source-type detection / MLIR loading / route planning still come
@@ -290,9 +290,14 @@ def prepare_trace(
             print(f"  {test_name}: widened to {plan.widened_device} for trace",
                   file=sys.stderr)
 
+        output_dir.mkdir(parents=True, exist_ok=True)
+        trace_config_path = output_dir / "trace_config.json"
+
         try:
-            traced_mlir, manifest_partial = inject_trace_declarative(
-                mlir_text, trace_size,
+            traced_mlir, trace_config = inject_trace_declarative(
+                mlir_text, trace_size, trace_config_path,
+                test_name=test_name,
+                src_mlir=test_dir / "aie.mlir",
             )
         except Exception as e:
             msg = f"FAIL trace injection: {e}"
@@ -316,19 +321,9 @@ def prepare_trace(
             print(f"FAIL {test_name}: {msg}", file=sys.stderr)
             return 1
 
-        # Write traced MLIR.
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # Write traced MLIR. (trace_config.json was already written by the
+        # injector via --trace-config-out above.)
         (output_dir / "aie_traced.mlir").write_text(traced_mlir)
-
-        # Write events.json from the manifest's tile trace info.
-        events_data = {
-            "trace_size": manifest_partial.get("trace_size", trace_size),
-            "trace_ddr_id": manifest_partial.get("trace_ddr_id"),
-            "tiles_traced": manifest_partial.get("tiles_traced", []),
-        }
-        (output_dir / "events.json").write_text(
-            json.dumps(events_data, indent=2) + "\n"
-        )
 
     # -- C++ patching -------------------------------------------------------
 
@@ -353,27 +348,22 @@ def prepare_trace(
             print(f"FAIL {test_name}: {msg}", file=sys.stderr)
             return 1
 
-        # Compute the kernel argument index for the trace buffer from the
-        # MLIR metadata.  trace_ddr_id is the runtime_sequence position;
-        # the kernel arg index is offset by 3 (opcode, instr BO, instr count).
-        # When --skip-mlir is used, manifest_partial is None -> falls back
-        # to heuristic in the patcher.
-        trace_arg_index = None
-        if manifest_partial is not None:
-            trace_ddr_id = manifest_partial.get("trace_ddr_id")
-            if trace_ddr_id is not None:
-                trace_arg_index = trace_ddr_id + 3
-
-        try:
-            cpp_source = patch_test_cpp(
-                cpp_source, trace_size=trace_size,
-                trace_arg_index=trace_arg_index,
-            )
-        except PatchError as e:
-            msg = f"FAIL C++ patching: {e}"
-            write_status(output_dir, msg)
-            print(f"FAIL {test_name}: {msg}", file=sys.stderr)
-            return 1
+        # The kernel arg slot for the trace BO comes from trace_config.json,
+        # the single source of truth written by mlir-trace-inject. When
+        # --skip-mlir is set we have no config -- apply only the BDF patch
+        # (already done above) and skip the trace BO injection.
+        if trace_config is not None:
+            try:
+                cpp_source = patch_test_cpp(
+                    cpp_source,
+                    trace_size=trace_config["buffer"]["size_bytes"],
+                    trace_arg_index=trace_config["buffer"]["kernel_arg_slot"],
+                )
+            except PatchError as e:
+                msg = f"FAIL C++ patching: {e}"
+                write_status(output_dir, msg)
+                print(f"FAIL {test_name}: {msg}", file=sys.stderr)
+                return 1
 
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "test_traced.cpp").write_text(cpp_source)

@@ -1,0 +1,231 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xdna-emu/schemas/trace_config-v1.json",
+  "title": "TraceConfig",
+  "description": "Single source of truth for trace-injection configuration. Read by mlir-trace-inject, cpp_trace_patch, parse-trace, trace_compare, and the bridge script. Written by trace-prepare. Spec: docs/superpowers/findings/2026-05-05-trace-config-schema.md.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "test_name",
+    "src_mlir",
+    "buffer",
+    "kernel_signature",
+    "tracing",
+    "tiles_traced",
+    "routing"
+  ],
+  "additionalProperties": false,
+  "properties": {
+
+    "schema_version": {
+      "const": 1,
+      "description": "Bump on any breaking change. Tools refuse to load mismatched majors."
+    },
+
+    "test_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable identifier (matches mlir-aie test directory name)."
+    },
+
+    "src_mlir": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Absolute path to the original (pre-injection) aie.mlir. The injector reads this; everyone else uses it for cache invalidation."
+    },
+
+    "buffer": {
+      "type": "object",
+      "required": ["size_bytes", "kernel_arg_slot"],
+      "additionalProperties": false,
+      "properties": {
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 4096,
+          "description": "Trace BO size. Multiple of 4 KiB. Both HW and EMU allocate exactly this much.",
+          "multipleOf": 4096
+        },
+        "kernel_arg_slot": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Authoritative kernel-arg slot for the trace BO. Used by aie.trace.host_config(arg_idx=...), aiex.npu.address_patch arg_idx=..., and kernel.group_id(...) in host code. ALL coordinate systems derive from this."
+        },
+        "embedded_in_memref_idx": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "If non-null, the trace BO is NOT a separate kernel arg — it's appended to the existing memref at runtime_sequence index N (mlir-aie's arg_idx=-1 semantics). When set, kernel_arg_slot refers to that memref's slot."
+        }
+      }
+    },
+
+    "kernel_signature": {
+      "type": "object",
+      "required": ["args"],
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["slot", "kind"],
+            "additionalProperties": false,
+            "properties": {
+              "slot": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Kernel arg position as XRT sees it (matches kernel.group_id(slot))."
+              },
+              "kind": {
+                "enum": ["scalar", "bo"],
+                "description": "scalar = pass-by-value, bo = pass-by-buffer-handle."
+              },
+              "name": {
+                "type": "string",
+                "description": "Human-readable name. For BOs, matches the host code's variable (e.g. bo_inA)."
+              },
+              "role": {
+                "enum": ["instruction_buffer", "data", "trace", "ctrl_packet", "phantom"],
+                "description": "What the BO is for. phantom = aiecc emitted a slot the host doesn't bind; we record it so the mismatch is visible."
+              },
+              "ctype": {
+                "type": "string",
+                "description": "C type for scalars (uint64_t, uint32_t, etc.)."
+              },
+              "memref_idx": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "description": "For data BOs: the index in the runtime_sequence's memref args list (0..N-1). null otherwise."
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "tracing": {
+      "type": "object",
+      "required": ["mode"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": ["event_time", "event_pc", "inst_exec"],
+          "description": "Trace unit mode. Determines event vs PC-anchored vs instruction-execution semantics."
+        },
+        "core_grounding": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Event names always traced on core tiles (e.g. PERF_CNT_0)."
+        },
+        "core_sweep": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Per-batch sweep events (variable across runs in a sweep)."
+        },
+        "shim_grounding": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "shim_sweep": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "memtile_grounding": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "memtile_sweep": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      }
+    },
+
+    "tiles_traced": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["col", "row", "kind", "events", "packet_id"],
+        "additionalProperties": false,
+        "properties": {
+          "col": {"type": "integer", "minimum": 0},
+          "row": {"type": "integer", "minimum": 0},
+          "kind": {
+            "enum": ["shim", "memtile", "core"],
+            "description": "Derived from row: 0 = shim, 1 = memtile, >=2 = core."
+          },
+          "events": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "items": {"type": "string"},
+            "description": "Up to 8 event slots in trace_unit. Decoders read these to label each 4B word."
+          },
+          "packet_id": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Stream-switch packet ID for this tile's trace channel. Matches aie.packet_flow(packet_id)."
+          },
+          "module": {
+            "enum": ["core", "mem"],
+            "description": "Which module's trace_unit (only meaningful for core tiles, which have both)."
+          }
+        }
+      }
+    },
+
+    "routing": {
+      "type": "object",
+      "required": ["shim_col", "shim_dma_channel", "trace_done"],
+      "additionalProperties": false,
+      "properties": {
+        "shim_col": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Column of the shim tile that drains all trace packets."
+        },
+        "shim_dma_channel": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Shim DMA S2MM channel (0 or 1). Channel 1 is the conventional trace channel."
+        },
+        "shim_bd_id": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 15,
+          "description": "Shim BD assigned to drive trace traffic. Defaults to 15."
+        },
+        "trace_done": {
+          "type": "object",
+          "required": ["broadcast", "user_event"],
+          "additionalProperties": false,
+          "properties": {
+            "broadcast": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 15,
+              "description": "Broadcast channel for trace_done finalizer (0..15)."
+            },
+            "user_event": {
+              "enum": ["USER_EVENT_0", "USER_EVENT_1", "USER_EVENT_2", "USER_EVENT_3"],
+              "description": "User event that gen_trace_done_aie2 fires."
+            }
+          }
+        }
+      }
+    },
+
+    "diagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional cross-checks. Mismatches are warnings, not errors — they surface drift between schema-derived expectations and actual generated artifacts.",
+      "properties": {
+        "expected_xclbin_bo_count": {"type": "integer", "minimum": 0},
+        "expected_address_patch_arg_idx": {"type": "integer", "minimum": 0},
+        "expected_runtime_sequence_memref_count": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

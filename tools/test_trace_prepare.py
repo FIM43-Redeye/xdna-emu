@@ -5,13 +5,15 @@ Run with:
     PYTHONPATH=tools python3 -m pytest tools/test_trace_prepare.py -v -k "not integration"
 """
 
-import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).parent))
+from trace_config import load as trace_config_load  # noqa: E402
 
 # The script under test.
 SCRIPT = Path(__file__).parent / "trace-prepare.py"
@@ -165,7 +167,12 @@ class TestQuarantine:
 
 class TestSkipMlir:
     def test_skip_mlir_produces_test_traced_cpp(self, tmp_path):
-        """--skip-mlir patches test.cpp but skips MLIR injection."""
+        """--skip-mlir applies BDF patch but skips trace BO injection.
+
+        Trace BO injection requires trace_config.json (single source of
+        truth for kernel_arg_slot); --skip-mlir bypasses the injector that
+        writes it, so trace patching is skipped too.
+        """
         test_dir = tmp_path / "skip_test"
         test_dir.mkdir()
         (test_dir / "aie.mlir").write_text("module {}\n")
@@ -194,15 +201,18 @@ class TestSkipMlir:
         )
         assert result.returncode == 0, f"stderr: {result.stderr}"
 
-        # test_traced.cpp should exist and contain BDF patch.
+        # test_traced.cpp should exist with BDF patch but NO trace BO.
         traced_cpp = output_dir / "test_traced.cpp"
         assert traced_cpp.exists(), "test_traced.cpp not created"
         content = traced_cpp.read_text()
         assert "XRT_DEVICE_BDF" in content, "BDF patch not applied"
-        assert "bo_trace" in content, "Trace buffer not injected"
+        assert "bo_trace" not in content, (
+            "Trace buffer injected without trace_config.json"
+        )
 
-        # aie_traced.mlir should NOT exist.
+        # No MLIR or trace_config artifacts should exist.
         assert not (output_dir / "aie_traced.mlir").exists()
+        assert not (output_dir / "trace_config.json").exists()
 
         # Status should be OK.
         status = (output_dir / "prepare-status.txt").read_text().strip()
@@ -331,14 +341,17 @@ class TestIntegration:
         # Check outputs.
         assert (output_dir / "aie_traced.mlir").exists()
         assert (output_dir / "test_traced.cpp").exists()
-        assert (output_dir / "events.json").exists()
+        assert (output_dir / "trace_config.json").exists()
 
         status = (output_dir / "prepare-status.txt").read_text().strip()
         assert status == "OK"
 
-        # events.json should be valid JSON with tile info.
-        events = json.loads((output_dir / "events.json").read_text())
-        assert "tiles_traced" in events
+        # trace_config.json: schema-validated load + sanity-check fields.
+        cfg = trace_config_load(output_dir / "trace_config.json")
+        assert cfg["schema_version"] == 1
+        assert cfg["test_name"] == "add_one_using_dma"
+        assert cfg["buffer"]["kernel_arg_slot"] >= 4  # past the 3 fixed slots
+        assert len(cfg["tiles_traced"]) >= 1
 
         # test_traced.cpp should have both BDF and trace patches.
         cpp_content = (output_dir / "test_traced.cpp").read_text()

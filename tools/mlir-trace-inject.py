@@ -68,6 +68,7 @@ from pathlib import Path
 # so trace-sweep.py and the Rust trace-compare can reference the same value.
 sys.path.insert(0, str(Path(__file__).parent))
 from perfcnt_defaults import DEFAULT_PERFCNT_PERIOD  # noqa: E402
+from trace_config import dump as trace_config_dump  # noqa: E402
 
 # MLIR op name used by mlir-aie for the declarative trace op. If the
 # aie dialect is ever renamed upstream, only this constant needs updating.
@@ -179,6 +180,21 @@ def parse_args():
     p.add_argument("--perfcnt-period", type=int, default=DEFAULT_PERFCNT_PERIOD,
                    help=f"cycles between PERF_CNT_0_EVENT fires when grounding "
                         f"includes PERF_CNT_0 (default: {DEFAULT_PERFCNT_PERIOD}).")
+
+    p.add_argument("--trace-config-out", type=Path, default=None,
+                   help="path to write trace_config.json (single source of "
+                        "truth for downstream tools). Required when injecting; "
+                        "schema at tools/trace_config_schema.json.")
+    p.add_argument("--config-test-name", default=None,
+                   help="value for trace_config.json's test_name field. "
+                        "Defaults to the input MLIR's parent directory name; "
+                        "callers that pipe through tempfiles (trace-prepare) "
+                        "should override this with the real test name.")
+    p.add_argument("--config-src-mlir", default=None,
+                   help="value for trace_config.json's src_mlir field. "
+                        "Defaults to the resolved input MLIR path; callers "
+                        "using tempfiles should override this with the path "
+                        "of the real (non-temp) source.")
 
     return p.parse_args()
 
@@ -312,6 +328,105 @@ def _emit_perfcnt_config(
     return sym
 
 
+def _build_trace_config(
+    *,
+    test_name: str,
+    src_mlir: str,
+    buffer_size: int,
+    kernel_arg_slot: int,
+    address_patch_arg_idx: int,
+    memref_arg_count: int,
+    trace_mode: str,
+    core_grounding: list[str],
+    core_sweep: list[str],
+    shim_grounding: list[str],
+    shim_sweep: list[str],
+    memtile_grounding: list[str],
+    memtile_sweep: list[str],
+    tiles: list[tuple[int, int, list[str]]],
+) -> dict:
+    """Construct the trace_config.json payload for the schema.
+
+    Schema lives at tools/trace_config_schema.json; spec at
+    docs/superpowers/findings/2026-05-05-trace-config-schema.md.
+
+    Args:
+        tiles: list of (col, row, events) for each compute tile traced.
+            ``kind`` is derived from row (0/1/>=2 → shim/memtile/core).
+    """
+    # Kernel signature: opcode + instr + ninstr + N memref-data args + trace BO.
+    # Slots 0/1/2 are bridge convention (opcode/instr/ninstr); slots 3..3+N-1
+    # carry the runtime_sequence memrefs as host-bound BOs; trace BO lands at
+    # `kernel_arg_slot` (== 3+N when not embedded).
+    args_list: list[dict] = [
+        {"slot": 0, "kind": "scalar", "name": "opcode", "ctype": "uint64_t"},
+        {"slot": 1, "kind": "bo", "name": "instr",
+         "role": "instruction_buffer"},
+        {"slot": 2, "kind": "scalar", "name": "ninstr", "ctype": "uint32_t"},
+    ]
+    for i in range(memref_arg_count):
+        args_list.append({
+            "slot": 3 + i,
+            "kind": "bo",
+            "name": f"bo_data{i}",
+            "role": "data",
+            "memref_idx": i,
+        })
+    args_list.append({
+        "slot": kernel_arg_slot,
+        "kind": "bo",
+        "name": "bo_trace",
+        "role": "trace",
+    })
+
+    tiles_traced = []
+    for col, row, events in tiles:
+        kind = "shim" if row == 0 else "memtile" if row == 1 else "core"
+        entry = {
+            "col": col, "row": row, "kind": kind,
+            "events": list(events),
+            "packet_id": 1,  # AIEInsertTraceFlows reassigns; record the seed.
+        }
+        if kind == "core":
+            entry["module"] = "core"
+        tiles_traced.append(entry)
+
+    return {
+        "schema_version": 1,
+        "test_name": test_name,
+        "src_mlir": src_mlir,
+        "buffer": {
+            "size_bytes": buffer_size,
+            "kernel_arg_slot": kernel_arg_slot,
+            "embedded_in_memref_idx": None,
+        },
+        "kernel_signature": {"args": args_list},
+        "tracing": {
+            "mode": trace_mode,
+            "core_grounding": core_grounding,
+            "core_sweep": core_sweep,
+            "shim_grounding": shim_grounding,
+            "shim_sweep": shim_sweep,
+            "memtile_grounding": memtile_grounding,
+            "memtile_sweep": [],
+        },
+        "tiles_traced": tiles_traced,
+        "routing": {
+            "shim_col": 0,
+            "shim_dma_channel": 1,
+            "shim_bd_id": 15,
+            "trace_done": {
+                "broadcast": _TRACE_BROADCAST_STOP,
+                "user_event": "USER_EVENT_2",
+            },
+        },
+        "diagnostics": {
+            "expected_address_patch_arg_idx": address_patch_arg_idx,
+            "expected_runtime_sequence_memref_count": memref_arg_count,
+        },
+    }
+
+
 def _inject_trace_ops(module, input_path: str, aied, args) -> int:
     """Walk module, find compute tiles (row >= 2), inject one aie.trace per tile,
     and prepend aie.trace.host_config + aie.trace.start_config ops to the
@@ -408,6 +523,25 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
         )
         return 0
 
+    # Pick the trace BO's BO arg index. Despite the name, address_patch's
+    # arg_idx is NOT the XRT kernel slot -- it's the 0-based index into the
+    # BO portion of the kernel regmap (firmware reads regmap[0x14 + N*8]
+    # where 0x14 is the offset past opcode/instr-BO/ninstr). So with N
+    # existing memref args at BO arg_idx 0..N-1 (XRT slots 3..3+N-1), the
+    # next free BO arg_idx for the trace BO is N, which corresponds to XRT
+    # slot 3+N on the host side. Upstream mlir-aie's setup.py defaults to
+    # arg_idx=4 and pads the host args list with fillers so the trace BO
+    # ends up at BO arg_idx 4; we instead just place it directly after the
+    # existing memrefs and skip the padding. cpp_trace_patch uses XRT slot
+    # (3+chosen_arg_idx) when emitting kernel.group_id(...) so the host BO
+    # binding lines up with where the firmware looks. Use the max across all
+    # target devices to keep a single arg_idx consistent if multiple devices
+    # share a trace BO.
+    max_existing_memref_args = max(
+        len(rs.operation.regions[0].blocks[0].arguments) for _, _, rs in targets
+    )
+    chosen_arg_idx = max_existing_memref_args
+
     # Resolve per-module-type event lists from CLI args.
     # _resolve_events(grounding, sweep, defaults) -> list of up to 8 event names.
     #
@@ -437,6 +571,9 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
     # Whether to emit perf counter config blocks (only when PERF_CNT_0 is in grounding).
     emit_core_perfcnt = "PERF_CNT_0" in core_grounding_names
 
+    # Track every traced tile across all target devices for trace_config.json.
+    all_traced_tiles: list[tuple[int, int, list[str]]] = []
+
     # Inject into every device that has a runtime_sequence. Each device gets
     # its own set of trace decls for its own compute tiles, and its own
     # runtime-sequence prologue (host_config + one start_config per tile).
@@ -456,6 +593,10 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
             # a runtime_sequence but no compute tiles is unusual but not an
             # error (e.g. a placeholder device).
             continue
+
+        # Record traced tiles for the trace_config.json payload.
+        for col, row, _ in compute_tiles:
+            all_traced_tiles.append((col, row, core_events))
 
         # Insert trace ops before the device body's terminator.  The aie.device
         # block's last op is always its terminator (aie.end for well-formed input,
@@ -511,12 +652,17 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
 
         rs_block = rs_op.operation.regions[0].blocks[0]
         with InsertionPoint.at_block_begin(rs_block):
-            # trace_host_config(buffer_size=N) emits:
-            #   aie.trace.host_config buffer_size = N
+            # trace_host_config(buffer_size=N, arg_idx=K) emits:
+            #   aie.trace.host_config buffer_size = N, arg_idx = K
             # Signature: trace_host_config(buffer_size, *, arg_idx=4,
             #                              routing=TraceShimRouting.Single, ...)
             # Mirror of mlir-aie python/utils/trace/setup.py line 534.
-            aied.trace_host_config(buffer_size=args.buffer_size)
+            # We override arg_idx (default 4) with chosen_arg_idx so the
+            # trace BD's address_patch lands on a free kernel arg slot rather
+            # than colliding with an existing memref arg.
+            aied.trace_host_config(
+                buffer_size=args.buffer_size, arg_idx=chosen_arg_idx,
+            )
             # trace_start_config(name) emits:
             #   aie.trace.start_config @<name>
             # One per compute tile trace decl, then one per perfcnt config block.
@@ -525,6 +671,45 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                 aied.trace_start_config(_trace_sym(col, row))
             for sym in perf_syms:
                 aied.trace_start_config(sym)
+
+    # Write trace_config.json -- the single source of truth consumed by
+    # cpp_trace_patch, parse-trace, trace_compare, and the bridge script.
+    # Spec: docs/superpowers/findings/2026-05-05-trace-config-schema.md.
+    # Required when injecting; without it downstream tools have nothing
+    # to read.
+    if args.trace_config_out is None:
+        print(
+            "error: --trace-config-out is required when injecting "
+            "(downstream tools read this file as the single source of truth)",
+            file=sys.stderr,
+        )
+        return 1
+
+    def _split(s: str | None) -> list[str]:
+        return [tok.strip() for tok in (s or "").split(",") if tok.strip()]
+
+    cfg = _build_trace_config(
+        test_name=(args.config_test_name
+                   if args.config_test_name
+                   else Path(input_path).parent.name),
+        src_mlir=(args.config_src_mlir
+                  if args.config_src_mlir
+                  else str(Path(input_path).resolve())),
+        buffer_size=args.buffer_size,
+        # XRT kernel slot for the trace BO = 3 (opcode/instr/ninstr) + BO arg_idx.
+        kernel_arg_slot=3 + chosen_arg_idx,
+        address_patch_arg_idx=chosen_arg_idx,
+        memref_arg_count=max_existing_memref_args,
+        trace_mode=args.trace_mode,
+        core_grounding=_split(args.core_grounding),
+        core_sweep=_split(args.core_sweep_events),
+        shim_grounding=_split(args.shim_grounding),
+        shim_sweep=_split(args.shim_sweep_events),
+        memtile_grounding=_split(args.memtile_grounding),
+        memtile_sweep=_split(args.memtile_sweep_events),
+        tiles=all_traced_tiles,
+    )
+    trace_config_dump(cfg, args.trace_config_out)
 
     return 0
 

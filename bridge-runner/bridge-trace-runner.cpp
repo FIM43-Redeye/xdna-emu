@@ -155,6 +155,14 @@ struct RunArgs {
     // trailing unused/ctrlpkt slots after it. The "last BO" heuristic
     // saves a zero buffer in those cases. -1 = use heuristic.
     int trace_buf_idx = -1;
+
+    // When set, configure compute tile (perf_col, perf_row) Performance_Counter0
+    // to count ACTIVE_CORE cycles before run.start(), then read after run.wait().
+    // Provides a measurement independent of the trace controller -- useful for
+    // diagnosing trace-induced artifacts in cycle measurements.
+    bool read_perf_counter = false;
+    uint16_t perf_col = 0;
+    uint16_t perf_row = 2;
 };
 
 void print_usage(const char* argv0) {
@@ -317,6 +325,20 @@ int parse_tokens(const std::vector<std::string>& tokens,
                 throw std::runtime_error(
                     "error: --trace-size must be a non-negative integer, got '" + val + "'");
             }
+        }
+        else if (a == "--read-perf-counter") {
+            run.read_perf_counter = true;
+        }
+        else if (a == "--perf-tile") {
+            // Format: col:row, e.g. "0:2". Defaults to (0,2).
+            std::string val = need_val("--perf-tile");
+            auto colon = val.find(':');
+            if (colon == std::string::npos) {
+                throw std::runtime_error(
+                    "error: --perf-tile must be col:row, got '" + val + "'");
+            }
+            run.perf_col = static_cast<uint16_t>(std::stoi(val.substr(0, colon)));
+            run.perf_row = static_cast<uint16_t>(std::stoi(val.substr(colon + 1)));
         }
         else if (a == "-v" || a == "--verbose") outer.verbose = true;
         else if (a == "-h" || a == "--help") { print_usage(argv0); std::exit(0); }
@@ -1286,6 +1308,14 @@ struct RunOutcome {
     bool ok = false;
     std::string error;
     uint64_t elapsed_ms = 0;
+    uint64_t elapsed_us = 0;
+    uint64_t kernel_us = 0;  // run.start() -> run.wait() returns
+    // Tile (0,2) Performance_Counter0 reading after kernel completes.
+    // Set when --read-perf-counter is enabled. Counter is configured before
+    // run.start() to count ACTIVE_CORE cycles, then read after run.wait().
+    // Independent of trace controller -- crosscheck for trace artifacts.
+    uint32_t core_cycles = 0;
+    bool perf_ok = false;
 };
 
 // Escape a string for single-line JSON. Handles the minimum set of chars
@@ -1675,8 +1705,48 @@ RunOutcome execute_run(
         if (verbose) {
             std::fprintf(stderr, "  launching kernel (timeout 30s)\n");
         }
+        // Configure perf counter on (perf_col, perf_row) to count ACTIVE_CORE
+        // cycles. Independent of the trace controller -- diagnostic for
+        // trace-induced artifacts. Stop event = 0 means counter increments
+        // on every cycle the start event has fired.
+        constexpr uint32_t PERF_CTRL0_OFFSET = 0x00031500;
+        constexpr uint32_t PERF_COUNTER0_OFFSET = 0x00031520;
+        constexpr uint8_t  EVENT_ACTIVE_CORE = 0x1C;
+        if (args.read_perf_counter) {
+            try {
+                uint32_t ctrl = prep.context.read_aie_reg(
+                    args.perf_col, args.perf_row, PERF_CTRL0_OFFSET);
+                ctrl &= ~uint32_t(0x7F7F);  // clear start[6:0] and stop[14:8]
+                ctrl |= uint32_t(EVENT_ACTIVE_CORE);
+                prep.context.write_aie_reg(
+                    args.perf_col, args.perf_row, PERF_CTRL0_OFFSET, ctrl);
+                prep.context.write_aie_reg(
+                    args.perf_col, args.perf_row, PERF_COUNTER0_OFFSET, 0);
+            } catch (const std::exception& e) {
+                if (verbose) {
+                    std::fprintf(stderr,
+                        "  perf counter setup failed: %s\n", e.what());
+                }
+            }
+        }
+        auto k0 = std::chrono::steady_clock::now();
         run.start();
         auto state = run.wait(std::chrono::seconds(30));
+        auto k1 = std::chrono::steady_clock::now();
+        result.kernel_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(k1 - k0).count());
+        if (args.read_perf_counter) {
+            try {
+                result.core_cycles = prep.context.read_aie_reg(
+                    args.perf_col, args.perf_row, PERF_COUNTER0_OFFSET);
+                result.perf_ok = true;
+            } catch (const std::exception& e) {
+                if (verbose) {
+                    std::fprintf(stderr,
+                        "  perf counter read failed: %s\n", e.what());
+                }
+            }
+        }
         if (verbose) {
             std::fprintf(stderr, "  run state after wait: %d\n", (int)state);
         }
@@ -1739,6 +1809,8 @@ RunOutcome execute_run(
     auto t1 = std::chrono::steady_clock::now();
     result.elapsed_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+    result.elapsed_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
     return result;
 }
 
@@ -1867,17 +1939,29 @@ int run_batch_stdin(Session& session, const OuterArgs& outer, const char* argv0)
                                args, session.verbose);
         if (out.ok) {
             std::printf(
-                "{\"run_idx\":%llu,\"ok\":true,\"trace_out\":\"%s\",\"elapsed_ms\":%llu}\n",
+                "{\"run_idx\":%llu,\"ok\":true,\"trace_out\":\"%s\","
+                "\"elapsed_ms\":%llu,\"elapsed_us\":%llu,\"kernel_us\":%llu,"
+                "\"perf_ok\":%s,\"core_cycles\":%lu}\n",
                 (unsigned long long)run_idx,
                 json_escape(args.trace_out).c_str(),
-                (unsigned long long)out.elapsed_ms);
+                (unsigned long long)out.elapsed_ms,
+                (unsigned long long)out.elapsed_us,
+                (unsigned long long)out.kernel_us,
+                out.perf_ok ? "true" : "false",
+                (unsigned long)out.core_cycles);
         } else {
             std::printf(
-                "{\"run_idx\":%llu,\"ok\":false,\"trace_out\":\"%s\",\"error\":\"%s\",\"elapsed_ms\":%llu}\n",
+                "{\"run_idx\":%llu,\"ok\":false,\"trace_out\":\"%s\","
+                "\"error\":\"%s\",\"elapsed_ms\":%llu,\"elapsed_us\":%llu,"
+                "\"kernel_us\":%llu,\"perf_ok\":%s,\"core_cycles\":%lu}\n",
                 (unsigned long long)run_idx,
                 json_escape(args.trace_out).c_str(),
                 json_escape(out.error).c_str(),
-                (unsigned long long)out.elapsed_ms);
+                (unsigned long long)out.elapsed_ms,
+                (unsigned long long)out.elapsed_us,
+                (unsigned long long)out.kernel_us,
+                out.perf_ok ? "true" : "false",
+                (unsigned long)out.core_cycles);
         }
         std::fflush(stdout);
         ++run_idx;

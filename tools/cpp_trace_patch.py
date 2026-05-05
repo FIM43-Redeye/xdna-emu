@@ -107,43 +107,6 @@ def _find_last_xrt_bo_declaration(root: Node, source_bytes: bytes) -> Optional[N
     return last
 
 
-def _extract_group_ids(
-    root: Node, source_bytes: bytes, kernel_name: str = "kernel"
-) -> list[int]:
-    """Extract integer arguments to <kernel_name>.group_id(N) calls.
-
-    When *kernel_name* is provided, only extracts group_ids for that
-    specific kernel variable (e.g., ``kernel0.group_id(3)`` but not
-    ``kernel1.group_id(3)``).  This is important for multi-kernel tests
-    where different kernels reuse the same group_id numbers.
-
-    Only matches leaf-level group_id call expressions (not their parents)
-    to avoid double-counting when a group_id call is nested inside an
-    xrt::bo constructor call.
-    """
-    expected_suffix = f"{kernel_name}.group_id"
-    ids: set[int] = set()
-    for node in _walk_all(root):
-        if node.type == "call_expression":
-            func = node.child_by_field_name("function")
-            if func is None:
-                continue
-            func_text = source_bytes[func.start_byte:func.end_byte].decode()
-            if not func_text.endswith(".group_id"):
-                continue
-            # For multi-kernel tests, only match the specific kernel
-            if not func_text.endswith(expected_suffix):
-                continue
-            args = node.child_by_field_name("arguments")
-            if args is None:
-                continue
-            args_text = source_bytes[args.start_byte:args.end_byte].decode()
-            m = re.search(r'\((\d+)\)', args_text)
-            if m:
-                ids.add(int(m.group(1)))
-    return sorted(ids)
-
-
 def _find_kernel_call(
     root: Node, source_bytes: bytes
 ) -> tuple[Optional[Node], str]:
@@ -341,7 +304,7 @@ class _SetArgPoints:
 
 def _find_insertion_points(
     source_bytes: bytes,
-    trace_arg_index: int | None = None,
+    trace_arg_index: int,
 ) -> _DirectCallPoints | _SetArgPoints:
     """Parse the source and locate injection points.
 
@@ -349,11 +312,9 @@ def _find_insertion_points(
     Raises PatchError if neither pattern is found.
 
     Args:
-        trace_arg_index: The kernel argument index for the trace buffer,
-            derived from the compiled xclbin (trace_ddr_id + 3).  When
-            provided, this is used as both the group_id for BO allocation
-            and the set_arg index.  When None, falls back to heuristics
-            (max existing group_id + 1, or argument count).
+        trace_arg_index: Kernel argument slot for the trace BO. Comes from
+            ``trace_config.json``'s ``buffer.kernel_arg_slot``. Used as
+            both the ``kernel.group_id(N)`` argument and the set_arg index.
     """
     tree = _PARSER.parse(source_bytes)
     root = tree.root_node
@@ -388,27 +349,18 @@ def _find_insertion_points(
         close_paren = arg_list.children[-1]
         assert close_paren.type == ")", f"Expected ')' but got {close_paren.type}"
 
-        # Determine group_id: prefer trace_arg_index from xclbin metadata,
-        # fall back to counting arguments in the call (call position = arg
-        # index on NPU where all data slots share the HOST bank).
-        if trace_arg_index is not None:
-            gid = trace_arg_index
-        else:
-            arg_count = len(arg_list.named_children)
-            gid = arg_count  # bo_trace will be at this position
-
         return _DirectCallPoints(
             last_bo_end=last_bo.end_byte,
             kernel_call_close_paren=close_paren.start_byte,
             wait_end=wait_stmt.end_byte,
-            trace_group_id=gid,
+            trace_group_id=trace_arg_index,
             kernel_name=kernel_name,
         )
 
     # 4. Try set_arg pattern: xrt::run(kernel) + run.set_arg(N, ...)
     run_var, kernel_name = _find_xrt_run_constructor(root, source_bytes)
     if run_var is not None and kernel_name is not None:
-        last_set_arg_stmt, max_idx = _find_last_set_arg(
+        last_set_arg_stmt, _max_idx = _find_last_set_arg(
             root, source_bytes, run_var
         )
         if last_set_arg_stmt is None:
@@ -417,24 +369,12 @@ def _find_insertion_points(
                 f"{run_var}.set_arg() calls."
             )
 
-        # Determine the set_arg index and group_id for the trace BO.
-        # With trace_arg_index from xclbin metadata, use the exact slot
-        # (overrides any padding at that index via a later set_arg call).
-        # Without metadata, append after the last existing set_arg.
-        if trace_arg_index is not None:
-            sa_idx = trace_arg_index
-            gid = trace_arg_index
-        else:
-            sa_idx = max_idx + 1
-            group_ids = _extract_group_ids(root, source_bytes, kernel_name)
-            gid = max(group_ids) + 1 if group_ids else sa_idx
-
         return _SetArgPoints(
             last_bo_end=last_bo.end_byte,
             last_set_arg_end=last_set_arg_stmt.end_byte,
-            trace_set_arg_index=sa_idx,
+            trace_set_arg_index=trace_arg_index,
             wait_end=wait_stmt.end_byte,
-            trace_group_id=gid,
+            trace_group_id=trace_arg_index,
             kernel_name=kernel_name,
             run_var=run_var,
         )
@@ -448,8 +388,8 @@ def _find_insertion_points(
 
 def patch_test_cpp(
     source: str,
-    trace_size: int = 1048576,
-    trace_arg_index: int | None = None,
+    trace_size: int,
+    trace_arg_index: int,
 ) -> str:
     """Apply trace buffer injection transforms to a test.cpp source.
 
@@ -462,11 +402,12 @@ def patch_test_cpp(
 
     Args:
         source: The C++ source code as a string.
-        trace_size: Size of the trace buffer in bytes (default: 1MB).
-        trace_arg_index: Kernel argument index for the trace buffer,
-            derived from the xclbin (trace_ddr_id + 3).  Determines
-            the group_id for BO allocation and the set_arg index.
-            When None, falls back to heuristics.
+        trace_size: Size of the trace buffer in bytes
+            (from ``trace_config.json``'s ``buffer.size_bytes``).
+        trace_arg_index: Kernel argument slot for the trace BO
+            (from ``trace_config.json``'s ``buffer.kernel_arg_slot``).
+            Used as both the ``kernel.group_id(N)`` argument and the
+            ``run.set_arg(N, ...)`` index.
 
     Returns:
         The transformed source code.
