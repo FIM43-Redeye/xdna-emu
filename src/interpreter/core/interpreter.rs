@@ -49,6 +49,14 @@ pub enum StepResult {
     ExecError(String),
 }
 
+/// Period (in cycles) at which a LOCK_STALL trace event is re-emitted
+/// while the core remains in `WaitingLock`. Matches HW's default
+/// perf-counter-driven cadence: with PERF_CTRL0 counting ACTIVE_CORE
+/// (which keeps incrementing during stall) and the typical threshold of
+/// 1024, the trace controller emits a LOCK_STALL roughly every 1024
+/// cycles of held stall. See finding 2026-05-05-355-cycle-divergence-diagnosis.
+const LOCK_STALL_TRACE_PERIOD: u64 = 1024;
+
 /// Per-core interpreter.
 ///
 /// Manages the execution of a single AIE2 compute core by coordinating
@@ -75,6 +83,10 @@ where
     status: CoreStatus,
     /// Last decoded bundle (for debugging).
     last_bundle: Option<VliwBundle>,
+    /// Cycles accumulated since the last periodic LOCK_STALL trace
+    /// emission while the core is in `WaitingLock`. Reset on acquire
+    /// and on `reset()`.
+    lock_stall_periodic: u64,
 }
 
 impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
@@ -291,7 +303,13 @@ where
 {
     /// Create a new interpreter with the given decoder and executor.
     pub fn new(decoder: D, executor: E) -> Self {
-        Self { decoder, executor, status: CoreStatus::Ready, last_bundle: None }
+        Self {
+            decoder,
+            executor,
+            status: CoreStatus::Ready,
+            last_bundle: None,
+            lock_stall_periodic: 0,
+        }
     }
 
     /// Get the current core status.
@@ -620,10 +638,24 @@ where
                 if lock_value > 0 {
                     log::info!("Lock {} available (value={}), resuming execution", raw_lock_id, lock_value);
                     self.status = CoreStatus::Ready;
+                    self.lock_stall_periodic = 0;
                     // Re-execute the instruction - it will acquire the lock
                     None
                 } else {
                     ctx.record_stall(1);
+                    // Periodic LOCK_STALL re-emission. HW emits one LOCK_STALL
+                    // event each time the trace controller's cycle-driven
+                    // sampler fires while the core is held in stall (typically
+                    // every 1024 cycles, driven by a perf counter counting
+                    // ACTIVE_CORE -- which keeps incrementing during stall).
+                    // The initial event is emitted by the executor on entry to
+                    // WaitLock; this path covers the held-stall window.
+                    self.lock_stall_periodic += 1;
+                    if self.lock_stall_periodic >= LOCK_STALL_TRACE_PERIOD {
+                        let cycle = ctx.cycles;
+                        ctx.timing_context_mut().record_event(cycle, EventType::LockStall { cycles: 1 });
+                        self.lock_stall_periodic = 0;
+                    }
                     Some(StepResult::WaitLock { raw_lock_id })
                 }
             }
@@ -707,6 +739,7 @@ where
     pub fn reset(&mut self) {
         self.status = CoreStatus::Ready;
         self.last_bundle = None;
+        self.lock_stall_periodic = 0;
     }
 }
 
