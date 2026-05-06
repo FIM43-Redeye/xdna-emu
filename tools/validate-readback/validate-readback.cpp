@@ -51,6 +51,22 @@ void print_result(const TestResult& r) {
     std::printf("[%s] %-4s %s\n", r.id.c_str(), verdict_str(r.v), r.detail.c_str());
 }
 
+TestResult test_L1(xrt::hw_context& ctx, int col, int row) {
+    // Same hwctx, AFTER the dummy run has completed and allocated the partition.
+    try {
+        uint32_t v = ctx.read_aie_reg(static_cast<uint16_t>(col),
+                                      static_cast<uint16_t>(row),
+                                      TIMER_LOW_OFFSET);
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+                      "post-warmup pre-launch read OK, TIMER_LOW=0x%08x", v);
+        return {"L1", Verdict::Pass, buf};
+    } catch (const std::exception& e) {
+        return {"L1", Verdict::Fail,
+                std::string("post-warmup read still failed: ") + e.what()};
+    }
+}
+
 TestResult test_L0(xrt::hw_context& ctx, int col, int row) {
     try {
         uint32_t v = ctx.read_aie_reg(static_cast<uint16_t>(col),
@@ -187,6 +203,9 @@ int main(int argc, char** argv) {
     auto dummy = run_kernel_once(device, kernel, instr_v, args.verbose);
     std::printf("[INFO] dummy run kernel_us=%lu\n",
                 static_cast<unsigned long>(dummy.kernel_us));
+
+    results.push_back(test_L1(ctx, args.col, args.row));
+    print_result(results.back());
 
     return 0;
 }
