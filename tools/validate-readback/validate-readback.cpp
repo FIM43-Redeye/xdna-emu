@@ -51,6 +51,28 @@ void print_result(const TestResult& r) {
     std::printf("[%s] %-4s %s\n", r.id.c_str(), verdict_str(r.v), r.detail.c_str());
 }
 
+TestResult test_V1(xrt::hw_context& ctx, int col, int row) {
+    constexpr uint32_t MAGIC = 0xDEADBEEFu;
+    try {
+        // Make sure the counter is not actively counting (clear start_event).
+        ctx.write_aie_reg(static_cast<uint16_t>(col), static_cast<uint16_t>(row),
+                          PERF_CTRL0_OFFSET, 0);
+        ctx.write_aie_reg(static_cast<uint16_t>(col), static_cast<uint16_t>(row),
+                          PERF_COUNTER0_OFFSET, MAGIC);
+        uint32_t got = ctx.read_aie_reg(static_cast<uint16_t>(col),
+                                        static_cast<uint16_t>(row),
+                                        PERF_COUNTER0_OFFSET);
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "wrote 0x%08x, read 0x%08x", MAGIC, got);
+        // Allow tiny advance if start_event leaked from prior state.
+        Verdict v = (got == MAGIC || (got > MAGIC && got - MAGIC < 100))
+                    ? Verdict::Pass : Verdict::Fail;
+        return {"V1", v, buf};
+    } catch (const std::exception& e) {
+        return {"V1", Verdict::Fail, std::string("threw: ") + e.what()};
+    }
+}
+
 TestResult test_V0(xrt::hw_context& ctx, int col, int row) {
     // Test that TIMER_LOW returns changing, wall-time-correlated values.
     // We do NOT assert a specific clock rate: the tile clock may be gated
@@ -236,6 +258,9 @@ int main(int argc, char** argv) {
     print_result(results.back());
 
     results.push_back(test_V0(ctx, args.col, args.row));
+    print_result(results.back());
+
+    results.push_back(test_V1(ctx, args.col, args.row));
     print_result(results.back());
 
     return 0;
