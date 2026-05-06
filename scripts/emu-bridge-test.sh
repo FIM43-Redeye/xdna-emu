@@ -3003,7 +3003,12 @@ main() {
       if [[ -f "$hw_trace" ]] && [[ -f "$emu_trace" ]] && [[ -f "$t5_mlir" ]]; then
         local cmp_log="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.trace.log"
         local cmp_out
-        cmp_out="$(run_trace_compare --hw "$hw_trace" --emu "$emu_trace" --xclbin-mlir "$t5_mlir" 2>&1)" || true
+        # --remap-columns normalizes HW's physical start_col vs EMU's
+        # always-col-0 placement; without it, identical events appear on
+        # tile (1,2) in HW vs (0,2) in EMU and the comparator reports
+        # ERROR for what is logically the same tile. Mirrors the cycle
+        # compare path in `_run_trace_compare`.
+        cmp_out="$(run_trace_compare --hw "$hw_trace" --emu "$emu_trace" --xclbin-mlir "$t5_mlir" --remap-columns 2>&1)" || true
         echo "$cmp_out" > "$cmp_log"
 
         if echo "$cmp_out" | grep -q "CLEAN"; then
