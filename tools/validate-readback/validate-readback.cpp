@@ -51,6 +51,34 @@ void print_result(const TestResult& r) {
     std::printf("[%s] %-4s %s\n", r.id.c_str(), verdict_str(r.v), r.detail.c_str());
 }
 
+TestResult test_V0(xrt::hw_context& ctx, int col, int row) {
+    // Test that TIMER_LOW returns changing, wall-time-correlated values.
+    // We do NOT assert a specific clock rate: the tile clock may be gated
+    // when the core is idle, so the observed effective rate is informational.
+    try {
+        uint32_t t0 = ctx.read_aie_reg(static_cast<uint16_t>(col),
+                                       static_cast<uint16_t>(row),
+                                       TIMER_LOW_OFFSET);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        uint32_t t1 = ctx.read_aie_reg(static_cast<uint16_t>(col),
+                                       static_cast<uint16_t>(row),
+                                       TIMER_LOW_OFFSET);
+        uint32_t delta = t1 - t0; // wraparound fine for any plausible delta
+        double effective_mhz = static_cast<double>(delta) / 1000.0; // cycles per us
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "timer_lo: 0x%08x -> 0x%08x (delta=%u over ~1ms, ~%.1f MHz effective)",
+                      t0, t1, delta, effective_mhz);
+        // PASS: counter is live and advancing at any rate from "barely" to
+        // "full AIE core clock." 100..2_000_000_000 covers idle clock-gating
+        // through full-speed; 0 or wildly higher would be suspicious.
+        Verdict v = (delta > 100u && delta < 2'000'000'000u) ? Verdict::Pass : Verdict::Fail;
+        return {"V0", v, buf};
+    } catch (const std::exception& e) {
+        return {"V0", Verdict::Fail, std::string("threw: ") + e.what()};
+    }
+}
+
 TestResult test_L1(xrt::hw_context& ctx, int col, int row) {
     // Same hwctx, AFTER the dummy run has completed and allocated the partition.
     try {
@@ -205,6 +233,9 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long>(dummy.kernel_us));
 
     results.push_back(test_L1(ctx, args.col, args.row));
+    print_result(results.back());
+
+    results.push_back(test_V0(ctx, args.col, args.row));
     print_result(results.back());
 
     return 0;
