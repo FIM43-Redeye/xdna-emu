@@ -30,6 +30,43 @@ constexpr const char* DEFAULT_XCLBIN =
 constexpr const char* DEFAULT_INSTS =
     "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/peano/insts.bin";
 
+enum class Verdict { Pass, Fail, Info, Skip };
+struct TestResult {
+    std::string id;
+    Verdict v;
+    std::string detail;
+};
+
+const char* verdict_str(Verdict v) {
+    switch (v) {
+        case Verdict::Pass: return "PASS";
+        case Verdict::Fail: return "FAIL";
+        case Verdict::Info: return "INFO";
+        case Verdict::Skip: return "SKIP";
+    }
+    return "?";
+}
+
+void print_result(const TestResult& r) {
+    std::printf("[%s] %-4s %s\n", r.id.c_str(), verdict_str(r.v), r.detail.c_str());
+}
+
+TestResult test_L0(xrt::hw_context& ctx, int col, int row) {
+    try {
+        uint32_t v = ctx.read_aie_reg(static_cast<uint16_t>(col),
+                                      static_cast<uint16_t>(row),
+                                      TIMER_LOW_OFFSET);
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "pre-launch read SUCCEEDED (lifecycle bug not present?), value=0x%08x",
+                      v);
+        return {"L0", Verdict::Info, buf};
+    } catch (const std::exception& e) {
+        return {"L0", Verdict::Pass,
+                std::string("pre-launch read threw as expected: ") + e.what()};
+    }
+}
+
 struct Args {
     std::string xclbin = DEFAULT_XCLBIN;
     std::string insts  = DEFAULT_INSTS;
@@ -138,6 +175,10 @@ int main(int argc, char** argv) {
     auto kernel = xrt::kernel(ctx, kernels[0].get_name());
 
     std::printf("[INFO] loaded xclbin, kernel=%s\n", kernels[0].get_name().c_str());
+
+    std::vector<TestResult> results;
+    results.push_back(test_L0(ctx, args.col, args.row));
+    print_result(results.back());
 
     auto instr_v = load_insts(args.insts);
     std::printf("[INFO] loaded %zu instr words\n", instr_v.size());
