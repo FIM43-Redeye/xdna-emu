@@ -685,25 +685,46 @@ When the NPU wedges, recovery escalates through:
    pkexec modprobe -r amdxdna && pkexec modprobe amdxdna
    ```
 
-2. **Secondary Bus Reset (SBR)** -- remove driver FIRST, then reset the
-   upstream bridge:
+2. **Bridge PM-cycle** -- reset the upstream bridge function:
    ```bash
    pkexec modprobe -r amdxdna
    pkexec sh -c 'echo 1 > /sys/bus/pci/devices/0000:00:08.2/reset'
    sleep 5
    pkexec modprobe amdxdna
    ```
+   Note: this is what the kernel calls "reset" on the bridge; per the
+   bridge's `reset_method = pm`, it's a D0->D3hot->D0 cycle of the bridge
+   function, NOT a true Secondary Bus Reset on bus c6.
 
-3. **Suspend/resume** -- `systemctl suspend` power-cycles the
-   SoC-integrated NPU.
+3. **True Secondary Bus Reset** -- toggle BCR.SBR on the bridge:
+   ```bash
+   pkexec modprobe -r amdxdna
+   pkexec setpci -s 00:08.2 BRIDGE_CONTROL=0x42  # assert SBR
+   sleep 0.1
+   pkexec setpci -s 00:08.2 BRIDGE_CONTROL=0x02  # deassert
+   pkexec sh -c 'echo 1 > /sys/bus/pci/rescan'
+   pkexec modprobe amdxdna
+   ```
+   This actually pulses PERST# on bus c6 (resets c6:00.0 + c6:00.1).
+   Useful when step 2 doesn't suffice. Confirmed working at the PCIe
+   layer (BAR enable cycles), but does NOT recover SMU/MGMT_ERT-level
+   wedges -- the on-NPU controllers live downstream of the PCIe reset
+   domain.
 
-4. **Reboot** -- last resort.
+4. **Suspend/resume** -- `systemctl suspend` drops the SoC to retention
+   voltage, clearing on-NPU controller state. Required for SMU wedges
+   from bring-up failures.
 
-FLR (Function Level Reset) on the NPU function is broken; SBR on the
-upstream bridge is the working path. Always remove `amdxdna` before any
-PCIe reset -- the driver holds state that corrupts the device on
-hot-reset. PCIe BDFs shift when hardware changes (e.g., GPU swaps
-renumber the bus); `lspci | grep "IPU Device"` finds the current BDF.
+5. **Reboot** -- last resort.
+
+FLR on the NPU function is advertised in DevCap (`FLReset+`) and listed
+as the kernel's `reset_method = flr` for c6:00.1, but per upstream
+xdna-driver feedback (May 2026) it's unreliable and unsupported in
+practice. SBR on the upstream bridge is the working PCIe-layer path.
+Always remove `amdxdna` before any PCIe reset -- the driver holds state
+that corrupts the device on hot-reset. PCIe BDFs shift when hardware
+changes (e.g., GPU swaps renumber the bus); `lspci | grep "IPU Device"`
+finds the current BDF.
 
 ### Working-directory conventions
 

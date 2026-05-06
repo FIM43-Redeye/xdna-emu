@@ -64,13 +64,13 @@ which class an opcode is in:
 ## Safety lesson learned the hard way
 
 Enabling `unsafe_accept_all_msg=1` at modprobe time on NPU1 wedges
-the SMU and only a full reboot recovers (SBR on the upstream PCIe
-bridge does NOT clear it). Cause: the driver's bring-up path
-(`aie2_hw_start` -> `aie2_mgmt_fw_init` -> `aie2_runtime_update_prop`)
-calls `MSG_OP_UPDATE_PROPERTY` (0x113), which the bypass lets through.
-Phoenix firmware returns `INVALID_COMMAND`, the bring-up code treats
-that as fatal `-EINVAL`, and the partial-init state leaves the SMU
-unable to take subsequent commands.
+the SMU and only S3-suspend or a full reboot recovers. Cause: the
+driver's bring-up path (`aie2_hw_start` -> `aie2_mgmt_fw_init` ->
+`aie2_runtime_update_prop`) calls `MSG_OP_UPDATE_PROPERTY` (0x113),
+which the bypass lets through. Phoenix firmware returns
+`INVALID_COMMAND`, the bring-up code treats that as fatal `-EINVAL`,
+and the partial-init state leaves the SMU unable to take subsequent
+commands.
 
 **Safe pattern**: load the module with the default off, wait for
 `/dev/accel/accel0` to appear, THEN toggle the param via sysfs:
@@ -83,7 +83,48 @@ pkexec sh -c 'echo Y > /sys/module/amdxdna/parameters/unsafe_accept_all_msg'
 pkexec sh -c 'echo N > /sys/module/amdxdna/parameters/unsafe_accept_all_msg'
 ```
 
-After a wedge, recover with a reboot, not with PCIe reset.
+### Why PCIe reset can't recover the SMU wedge
+
+Both the kernel's bridge "reset" (`echo 1 > .../00:08.2/reset`, which is
+actually a PM-cycle of the bridge function -- `reset_method = pm`) and a
+*real* Secondary Bus Reset (`setpci -s 00:08.2 BRIDGE_CONTROL=0x42`,
+hold, then `=0x02`) leave the wedge intact. Verified 2026-05-06 with a
+true SBR after a fresh wedge: BCR went 0x02 -> 0x42 -> 0x02, the device
+re-enumerated, command register cycled (`enabling device (0000 -> 0002)`
+in dmesg), but `smu cmd 4` still returned `0xffffffff` (canonical "no
+PCIe completion, all-ones phantom read").
+
+The architecture explains this:
+
+- The driver's "SMU" is an on-NPU controller, not the system MP1.
+  Evidence: `void __iomem *smu_base` in `aie2_pci.h:273` is a
+  BAR-resident pointer, and the register names use `MP1_C2PMSG_*_ALT_1`
+  -- the `_ALT_1` aperture is the NPU-side alias of an SMU-style
+  mailbox. NPU4 explicitly maps it to BAR5 (`NPU4_SMU_BAR_INDEX = 5`).
+- SBR on the upstream bridge resets the PCIe link and BAR-enable state
+  on bus c6 (proven: BAR command register went 0 -> 2). But the SMU
+  controller itself runs on memory/state outside the PCIe reset
+  domain -- either powered from a different SoC rail, or backed by
+  an AIE-array SRAM/microcontroller that survives PCIe-level reset.
+- Two separate mailbox paths are involved: the SMU mailbox (driver
+  <-> on-NPU SMU controller) and the MGMT_ERT mailbox (driver <->
+  NPU firmware running on a control core). The bypass poisons the
+  MGMT_ERT path; the wedge propagates to the SMU path because the
+  partial bring-up leaves the NPU in a state where the SMU's response
+  loop is waiting on something from MGMT_ERT that never arrives.
+
+Recovery escalation, in order:
+
+1. **Driver reload** -- doesn't help here, probe loops on `smu cmd 4`.
+2. **Bridge PM-cycle** (`echo 1 > .../00:08.2/reset`) -- doesn't help.
+3. **True SBR** (`setpci BRIDGE_CONTROL=0x42`, wait, =0x02) -- doesn't
+   help. Useful for normal PCIe-level wedges but not this one.
+4. **S3 suspend** (`systemctl suspend`) -- typically works because the
+   SoC enters retention voltage, clearing on-NPU controller state.
+5. **Reboot** -- always works.
+
+Bottom line: once the wedge is in, it lives downstream of PCIe.
+Don't waste time on resets; suspend or reboot.
 
 ## Results so far
 
