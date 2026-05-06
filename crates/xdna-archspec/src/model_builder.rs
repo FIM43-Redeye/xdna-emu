@@ -162,7 +162,13 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             lock_acquire_cycles: 1,
             lock_release_cycles: 1,
             bd_chain_cycles: 2,
-            host_memory_latency_cycles: 100,
+            // PCIe + NoC + DDR round-trip latency for the FIRST word of a
+            // shim DMA transfer. After this, throughput is 1 word/cycle.
+            // 100 was an initial guess; bumped to 500 (~1.25us at 400 MHz)
+            // as a first calibration step against HW pipeline-fill data.
+            // See #355a -- proper calibration requires a sweep across
+            // multiple test DMA patterns.
+            host_memory_latency_cycles: 500,
         },
         stream_switch: StreamSwitchTiming {
             local_slave_fifo_depth: 4,
