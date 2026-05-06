@@ -203,6 +203,9 @@ def test_cli_end_to_end_hw_fixture(tmp_path):
     # slot_names present; core slot 1 maps to INSTR_EVENT_0 for this kernel.
     assert data["slot_names"]["core"][1] == "INSTR_EVENT_0"
     assert data["slot_names"]["core"][2] == "INSTR_EVENT_1"
+    # Placement: smallest (col, row) corner that produced events. Used by
+    # trace-compare to normalize HW vs EMU when start_col differs.
+    assert data["placement"] == {"origin_col": 1, "origin_row": 2}
     assert all(e["col"] == 1 and e["row"] == 2 and e["pkt_type"] == 0
                for e in flat)
     slots = [e["slot"] for e in flat]

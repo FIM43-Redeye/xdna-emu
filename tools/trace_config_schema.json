@@ -17,6 +17,25 @@
   "additionalProperties": false,
   "properties": {
 
+    "placement": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Where the kernel's logical (col=0, row=0) corner lives in the physical tile array. Declarative (MLIR-intended) origin; runtime may shift by re-emitting events at absolute coordinates. Trace-compare uses the per-side observed origin in events.json to normalize HW vs EMU when one side runs at start_col!=0.",
+      "properties": {
+        "origin_col": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Smallest col index across tiles_traced. EMU honors MLIR coordinates literally, so its observed origin matches this value. HW's resource manager may pick a different physical start_col; in that case the per-side events.json carries the runtime-observed origin."
+        },
+        "origin_row": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Smallest row index across tiles_traced. Almost always 0 (shim row) when shim tiles are instrumented, otherwise 2 (first compute row)."
+        }
+      }
+    },
+
+
     "schema_version": {
       "const": 1,
       "description": "Bump on any breaking change. Tools refuse to load mismatched majors."

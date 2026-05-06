@@ -391,10 +391,20 @@ def _build_trace_config(
             entry["module"] = "core"
         tiles_traced.append(entry)
 
+    # MLIR-declared placement origin -- the smallest (col, row) corner of
+    # any instrumented tile. EMU honors this literally; HW may shift, in
+    # which case the per-side events.json carries the runtime-observed
+    # origin and trace-compare normalizes by it.
+    placement = {
+        "origin_col": min(t["col"] for t in tiles_traced),
+        "origin_row": min(t["row"] for t in tiles_traced),
+    }
+
     return {
         "schema_version": 1,
         "test_name": test_name,
         "src_mlir": src_mlir,
+        "placement": placement,
         "buffer": {
             "size_bytes": buffer_size,
             "kernel_arg_slot": kernel_arg_slot,

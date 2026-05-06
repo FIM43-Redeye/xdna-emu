@@ -113,8 +113,8 @@ impl LoadedComparison {
 
         // Re-load events for rendering (comparison consumed them but didn't
         // return the tile maps; fine for now since traces are small).
-        let (hw_events, hw_config) = load_events_json(&hw_events_path)?;
-        let (emu_events, _) = load_events_json(&emu_events_path)?;
+        let (hw_events, hw_config, _hw_placement) = load_events_json(&hw_events_path)?;
+        let (emu_events, _, _emu_placement) = load_events_json(&emu_events_path)?;
         let config = if !config_override.core_events.is_empty()
             || !config_override.mem_events.is_empty()
             || !config_override.memtile_events.is_empty()

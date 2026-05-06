@@ -457,14 +457,30 @@ struct EventsFile {
     events: Vec<EventRecord>,
     #[serde(default)]
     slot_names: Option<SlotNamesRecord>,
+    #[serde(default)]
+    placement: Option<PlacementRecord>,
+}
+
+/// Per-side observed placement origin emitted by parse-trace.py. The
+/// origin is the smallest (col, row) that produced trace events on this
+/// side. trace-compare subtracts it from each tile's coordinates so HW
+/// (which the resource manager may have placed at start_col != 0) and
+/// EMU (always honoring the MLIR origin) line up tile-for-tile.
+#[derive(Deserialize, Clone, Copy)]
+pub struct PlacementRecord {
+    pub origin_col: u8,
+    pub origin_row: u8,
 }
 
 /// Load a per-side events JSON produced by tools/parse-trace.py.
 ///
-/// Returns (per-tile events, slot-name config). The config is populated from
-/// the JSON's slot_names field when present; callers that want to override
-/// names (legacy aiecc events.json) can substitute their own config.
-pub fn load_events_json(path: &Path) -> Result<(TileEvents, EventsConfig), String> {
+/// Returns (per-tile events, slot-name config, optional placement). The
+/// config is populated from the JSON's slot_names field when present;
+/// callers that want to override names (legacy aiecc events.json) can
+/// substitute their own config. Placement, when present, is the per-side
+/// observed origin used by trace-compare to normalize HW-vs-EMU column
+/// offsets without resorting to the dense-remap heuristic.
+pub fn load_events_json(path: &Path) -> Result<(TileEvents, EventsConfig, Option<PlacementRecord>), String> {
     let text = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let file: EventsFile =
         serde_json::from_str(&text).map_err(|e| format!("parse {}: {}", path.display(), e))?;
@@ -489,7 +505,7 @@ pub fn load_events_json(path: &Path) -> Result<(TileEvents, EventsConfig), Strin
         None => EventsConfig::default(),
     };
 
-    Ok((tiles, config))
+    Ok((tiles, config, file.placement))
 }
 
 /// Remap physical columns to 0-indexed logical columns.
@@ -507,6 +523,30 @@ fn remap_tile_columns(tiles: &TileEvents) -> TileEvents {
         .iter()
         .map(|(key, events)| {
             let new_key = TileKey { col: col_map[&key.col], row: key.row, pkt_type: key.pkt_type };
+            (new_key, events.to_vec())
+        })
+        .collect()
+}
+
+/// Shift each tile's (col, row) by the side's declared placement origin.
+///
+/// Unlike `remap_tile_columns` (dense remap to 0..N-1), this is a
+/// uniform translation that preserves gaps -- so a kernel touching
+/// physical cols {1, 3} on HW becomes logical cols {0, 2}, NOT {0, 1}.
+/// That's the right answer when a non-contiguous placement on HW is
+/// being compared to a non-contiguous placement on EMU. For contiguous
+/// placements the result is identical to `remap_tile_columns`.
+///
+/// Tiles whose coordinates are below the origin (shouldn't happen for
+/// a well-formed events.json, but be defensive) are passed through
+/// unchanged.
+fn shift_tile_columns(tiles: &TileEvents, placement: PlacementRecord) -> TileEvents {
+    tiles
+        .iter()
+        .map(|(key, events)| {
+            let new_col = key.col.saturating_sub(placement.origin_col);
+            let new_row = key.row.saturating_sub(placement.origin_row);
+            let new_key = TileKey { col: new_col, row: new_row, pkt_type: key.pkt_type };
             (new_key, events.to_vec())
         })
         .collect()
@@ -1720,8 +1760,8 @@ pub fn compare_batch_with_opts(
     batch_idx: usize,
     opts: &AnalysisOptions,
 ) -> Result<BatchResult, String> {
-    let (hw_tiles, hw_config) = load_events_json(hw_events_path)?;
-    let (emu_tiles, emu_config) = load_events_json(emu_events_path)?;
+    let (hw_tiles, hw_config, hw_placement) = load_events_json(hw_events_path)?;
+    let (emu_tiles, emu_config, emu_placement) = load_events_json(emu_events_path)?;
 
     // Resolve slot-name config: caller override > HW-side JSON > EMU-side JSON.
     let effective_config = if !config.core_events.is_empty()
@@ -1739,12 +1779,24 @@ pub fn compare_batch_with_opts(
     };
     let config = &effective_config;
 
-    // When remap_columns is enabled, normalize physical columns to logical
-    // 0-indexed so traces from different NPU column assignments can be compared.
-    let (hw_tiles, emu_tiles) = if opts.remap_columns {
-        (remap_tile_columns(&hw_tiles), remap_tile_columns(&emu_tiles))
-    } else {
-        (hw_tiles, emu_tiles)
+    // Normalize HW vs EMU column placement. Two paths:
+    //   * Per-side `placement.origin_col` in events.json (preferred): uniform
+    //     translation that preserves gaps. Both sides use it independently
+    //     when present.
+    //   * `--remap-columns` legacy flag: dense-remap to 0..N-1 for whichever
+    //     side lacks placement. Backwards-compat for older events.json files.
+    // When neither is available, leave columns as-is (and HW vs EMU will
+    // appear on disjoint tile keys -- correct behavior for traces that
+    // genuinely live on different physical tiles).
+    let hw_tiles = match (hw_placement, opts.remap_columns) {
+        (Some(p), _) => shift_tile_columns(&hw_tiles, p),
+        (None, true) => remap_tile_columns(&hw_tiles),
+        (None, false) => hw_tiles,
+    };
+    let emu_tiles = match (emu_placement, opts.remap_columns) {
+        (Some(p), _) => shift_tile_columns(&emu_tiles, p),
+        (None, true) => remap_tile_columns(&emu_tiles),
+        (None, false) => emu_tiles,
     };
 
     let all_keys: BTreeSet<TileKey> = hw_tiles.keys().chain(emu_tiles.keys()).copied().collect();

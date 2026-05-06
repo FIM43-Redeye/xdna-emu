@@ -463,13 +463,21 @@ def decode_one_ours(np_mod, td_mod,
         # reuse the same one we used internally so downstream consumers
         # can render slot indices to names without re-reading the MLIR.
         slot_names_named = _slot_names_for_output(slot_names if (out_events and xclbin_mlir) else {})
-        Path(out_events).write_text(
-            json.dumps({
-                "schema_version": 1,
-                "events": flat,
-                "slot_names": slot_names_named,
-            }, indent=2)
-        )
+        # Per-side observed placement: smallest (col, row) corner that
+        # actually produced trace events. trace-compare uses this to
+        # normalize HW vs EMU when one side runs at start_col != 0,
+        # without relying on the dense-remap heuristic.
+        payload = {
+            "schema_version": 1,
+            "events": flat,
+            "slot_names": slot_names_named,
+        }
+        if flat:
+            payload["placement"] = {
+                "origin_col": min(e["col"] for e in flat),
+                "origin_row": min(e["row"] for e in flat),
+            }
+        Path(out_events).write_text(json.dumps(payload, indent=2))
     if out_cycles:
         Path(out_cycles).write_text(f"{cycles or 0}\n")
 
