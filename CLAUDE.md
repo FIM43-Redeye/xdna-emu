@@ -719,8 +719,21 @@ tees for a specific run) should use `/tmp/claude-1000/`.
 These describe the current machine's setup. Other contributors will
 substitute their own values.
 
-- **Kernel**: custom `7.0.0-rc5`. Out-of-tree `amdxdna` loaded via
-  `pkexec insmod path/to/amdxdna.ko` after driver removal.
+- **Kernel**: custom `7.0.3-custom`. Out-of-tree `amdxdna` is
+  managed by DKMS via `xrt-amdxdna/2.23.0`, source at
+  `/usr/src/xrt-amdxdna-2.23.0/` (auto-synced from
+  `xdna-driver/src/` when `./build.sh -release` runs). Module is
+  signed at install time with our MOK key
+  (`/var/lib/shim-signed/mok/MOK.{priv,der}`), so `modprobe amdxdna`
+  works after every kernel upgrade with no manual signing. After
+  editing driver source, refresh the installed module with:
+  ```bash
+  cd ~/npu-work/xdna-driver/build && ./build.sh -release
+  pkexec bash -c '
+    dkms remove xrt-amdxdna/2.23.0 -k $(uname -r) && \
+    dkms install xrt-amdxdna/2.23.0 -k $(uname -r) && \
+    modprobe -r amdxdna && modprobe amdxdna'
+  ```
 - **Chess license**: `HOSTID=f4289d05121f` (bound to current Wi-Fi
   card; 2 of 3 vendor-permitted swaps remaining).
 - **DNS**: UConn DNS is broken. Fix per-session:
