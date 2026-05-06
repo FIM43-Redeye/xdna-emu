@@ -65,6 +65,63 @@ std::vector<uint32_t> load_insts(const std::string& path) {
     return v;
 }
 
+struct RunResult {
+    uint64_t kernel_us = 0;
+};
+
+RunResult run_kernel_once(xrt::device& device, xrt::kernel& kernel,
+                          const std::vector<uint32_t>& instr_v,
+                          bool verbose) {
+    // add_one_using_dma kernarg layout (per peano build of MLIR_AIE):
+    //   0: opcode (3 = ELF kernel)
+    //   1: instr_bo
+    //   2: ninstrs
+    //   3: input BO   (group_id 3)
+    //   4: middle BO  (group_id 4, allocated by runtime_sequence but unused)
+    //   5: output BO  (group_id 5)
+    constexpr size_t IN_BYTES  = 64 * sizeof(int32_t);
+    constexpr size_t MID_BYTES = 32 * sizeof(int32_t);
+    constexpr size_t OUT_BYTES = 64 * sizeof(int32_t);
+
+    auto bo_instr = xrt::bo(device, instr_v.size() * sizeof(uint32_t),
+                            XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
+    std::memcpy(bo_instr.map<void*>(), instr_v.data(),
+                instr_v.size() * sizeof(uint32_t));
+    bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    auto bo_in  = xrt::bo(device, IN_BYTES,  XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3));
+    auto bo_mid = xrt::bo(device, MID_BYTES, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4));
+    auto bo_out = xrt::bo(device, OUT_BYTES, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(5));
+    std::memset(bo_in.map<void*>(),  0, IN_BYTES);
+    std::memset(bo_mid.map<void*>(), 0, MID_BYTES);
+    std::memset(bo_out.map<void*>(), 0, OUT_BYTES);
+    bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bo_mid.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bo_out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    auto run = xrt::run(kernel);
+    run.set_arg(0, 3u);
+    run.set_arg(1, bo_instr);
+    run.set_arg(2, static_cast<uint32_t>(instr_v.size()));
+    run.set_arg(3, bo_in);
+    run.set_arg(4, bo_mid);
+    run.set_arg(5, bo_out);
+
+    auto t0 = std::chrono::steady_clock::now();
+    run.start();
+    auto state = run.wait(std::chrono::seconds(30));
+    auto t1 = std::chrono::steady_clock::now();
+    if (state != ERT_CMD_STATE_COMPLETED) {
+        throw std::runtime_error("kernel did not complete (state=" +
+                                 std::to_string(static_cast<int>(state)) + ")");
+    }
+    RunResult r;
+    r.kernel_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    if (verbose) std::fprintf(stderr, "  run completed in %lu us\n",
+                              static_cast<unsigned long>(r.kernel_us));
+    return r;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -81,5 +138,14 @@ int main(int argc, char** argv) {
     auto kernel = xrt::kernel(ctx, kernels[0].get_name());
 
     std::printf("[INFO] loaded xclbin, kernel=%s\n", kernels[0].get_name().c_str());
+
+    auto instr_v = load_insts(args.insts);
+    std::printf("[INFO] loaded %zu instr words\n", instr_v.size());
+
+    std::printf("[INFO] running dummy kernel to allocate partition...\n");
+    auto dummy = run_kernel_once(device, kernel, instr_v, args.verbose);
+    std::printf("[INFO] dummy run kernel_us=%lu\n",
+                static_cast<unsigned long>(dummy.kernel_us));
+
     return 0;
 }
