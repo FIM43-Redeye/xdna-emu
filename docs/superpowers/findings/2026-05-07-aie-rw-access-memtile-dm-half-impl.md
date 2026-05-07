@@ -256,6 +256,59 @@ For step-debugger / emulator-readback designs:
 - Whether the bug is FW 1.5.5.391 specific. We have only this firmware
   loadable.
 
+## Driver-side mitigation: minimal patch verified
+
+A one-block patch to `aie2_send_mgmt_msg_wait` (xdna-driver
+`aie2_message.c:62-66`) — removing the `if (ret == -ETIME) { destroy
+mgmt_chann }` block — was tested 2026-05-07 and **works as intended**.
+
+After the patch:
+- V4 memtile read still hangs (firmware bug not fixed -- it can't be
+  fixed from the driver side).
+- The user-context mailbox channel survives.
+- `mgmt_chann` survives.
+- M0 (mailbox-opcode probe via DRM_AMDXDNA_AIE_COREDUMP) ran AFTER V4
+  hung and got valid responses (ENOTSUPP/EINVAL) -- previously M0
+  would skip with ENODEV due to the destroyed mgmt channel.
+- The device is left in a "memtile reads hang, everything else
+  responsive" state, recoverable without reboot in principle (driver
+  reload not yet tested).
+
+The patch is preserved at
+`xdna-emu/build/experiments/2026-05-07-aie-rw-access-channel-isolation/`
+and is **currently APPLIED to the working tree of xdna-driver and
+installed via DKMS** (uncommitted in the xdna-driver repo). Revert via
+`cd ~/npu-work/xdna-driver && git checkout src/driver/amdxdna/aie2_message.c`
+followed by build + DKMS reinstall.
+
+## Architectural fix attempted (and reverted)
+
+Routing AIE_RW_ACCESS through the per-hwctx user channel
+(`ctx->priv->mbox_chann`) instead of mgmt was tried as a more
+principled isolation mechanism: a hung memtile read would only kill
+that hwctx's channel rather than mgmt. The patch worked at the
+mailbox routing layer (response received, channel correctly bound),
+but firmware refused opcode 0x203 on the user channel with
+`AIE2_STATUS_INVALID_COMMAND` (status `0x4000002`). So opcode 0x203
+is firmware-side hard-routed to mgmt only, and the architectural fix
+is not viable without firmware changes. Reverted.
+
+## What V3, V6, and V5 told us this session
+
+- **V6** (compute DM read at offset 0x100): PASS. Compute-tile data
+  memory IS reachable via AIE_RW_ACCESS. So the "memtile-only" hang
+  finding is genuine; AIE_RW_ACCESS works for compute reg AND
+  compute DM.
+- **V5** (compute reg stress, 100 random round-trips): 100/100 exact
+  matches, zero jitter. Confirms compute-reg AIE_RW_ACCESS is
+  rock-solid.
+- **V3** (read at unclaimed cell (0, 5)): hung the firmware --
+  -ETIMEDOUT, not -EINVAL. The prior "INVALID_PARAM for unclaimed
+  cells" reading was likely a cascade artifact (status code from
+  destroyed mgmt channel), not actual firmware authorization
+  enforcement. Updates the per-tile-claim authorization finding:
+  unclaimed cells appear to hang the same way memtile reads do.
+
 ## See also
 
 - `xdna-driver` `aie2_message.c:68-72` -- driver-side timeout path that

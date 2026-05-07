@@ -491,28 +491,28 @@ TestResult test_V2_read_consistency(xrt::hw_context& ctx, int col) {
 
 TestResult test_V4_memtile_reg(xrt::hw_context& ctx, int col) {
     // Memtile register-space probe. TIMER_LOW (0x940F8) is read-only, no
-    // side effects, and the memtile timer is always running. Two reads
-    // ~1ms apart should differ if memtile reg-space is reachable at all.
+    // side effects, and the memtile timer is always running. Single read
+    // ONLY after a 1-second idle pause -- this tests the "hammering the
+    // mailbox too fast" hypothesis. If memtile reads hang even after 1s
+    // of idle, rate is conclusively ruled out and the firmware just
+    // can't service memtile reads via AIE_RW_ACCESS.
     //
-    // PASS: both reads succeed and timer advanced.
-    // FAIL/throw: memtile reg-space is broken just like memtile DM.
+    // PASS: read succeeds (memtile reachable + slow attempt sufficient).
+    // FAIL/throw: memtile reg-space is broken regardless of pacing
+    // (rate hypothesis ruled out, plain firmware bug).
+    std::this_thread::sleep_for(std::chrono::seconds(1));
     try {
         uint32_t t0 = ctx.read_aie_reg(static_cast<uint16_t>(col),
                                        static_cast<uint16_t>(MEMTILE_ROW),
                                        MEMTILE_TIMER_LOW_OFFSET);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        uint32_t t1 = ctx.read_aie_reg(static_cast<uint16_t>(col),
-                                       static_cast<uint16_t>(MEMTILE_ROW),
-                                       MEMTILE_TIMER_LOW_OFFSET);
-        uint32_t delta = t1 - t0;
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-            "memtile (%d,%d) TIMER_LOW: 0x%08x -> 0x%08x (delta=%u over ~1ms)",
-            col, MEMTILE_ROW, t0, t1, delta);
-        Verdict v = (delta > 100u && delta < 2'000'000'000u) ? Verdict::Pass : Verdict::Fail;
-        return {"V4", v, buf};
+            "memtile (%d,%d) TIMER_LOW after 1s idle: 0x%08x (rate hypothesis CONFIRMED -- pacing matters)",
+            col, MEMTILE_ROW, t0);
+        return {"V4", Verdict::Info, buf};
     } catch (const std::exception& e) {
-        return {"V4", Verdict::Fail, std::string("threw: ") + e.what()};
+        return {"V4", Verdict::Fail,
+                std::string("memtile read after 1s idle still hung (rate hypothesis RULED OUT): ") + e.what()};
     }
 }
 
@@ -627,16 +627,20 @@ TestResult test_V5_stress(xrt::hw_context& ctx, int col, int row, int iters) {
 TestResult test_V3_unclaimed_cell(xrt::hw_context& ctx, int col) {
     // Authorization probe: read PERF_COUNTER0 from a cell our hwctx does
     // NOT claim (row 5, last compute row -- add_one_using_dma uses only
-    // rows 0,1,2). We expect this to throw EINVAL: firmware returns
-    // AIE2_STATUS_INVALID_PARAM, driver translates to -EINVAL.
+    // rows 0,1,2).
     //
-    // Runs LAST so V2/V4/V5 land their answers before any potential
-    // mailbox-channel cascade. A SINGLE probe -- not multiple cells --
-    // to keep the firmware-side error queue from growing.
+    // EMPIRICAL UPDATE (2026-05-07): we previously believed unclaimed
+    // cell reads returned AIE2_STATUS_INVALID_PARAM (translated to
+    // -EINVAL). The actual observed behavior on Phoenix NPU1 is that
+    // the firmware HANGS just like memtile reads -- the read returns
+    // -ETIMEDOUT (-62) after 5s. The prior "INVALID_PARAM for
+    // unclaimed cells" reading was likely a misinterpretation of the
+    // cascade: once one read hung and destroyed mgmt_chann, subsequent
+    // reads got -EINVAL via the aie2_send_mgmt_msg_wait status path.
     //
-    // PASS if the read throws (authorization enforced); INFO if it
-    // unexpectedly succeeds (over-permissive firmware, would be a
-    // notable finding).
+    // PASS if the read throws (whatever the cause -- auth refusal or
+    // firmware hang). The mechanism distinction is captured in
+    // dmesg (status code 0x02000004 vs ETIMEDOUT).
     try {
         uint32_t got = ctx.read_aie_reg(static_cast<uint16_t>(col),
                                         static_cast<uint16_t>(UNCLAIMED_ROW),
@@ -739,16 +743,18 @@ int main(int argc, char** argv) {
         print_result(results.back());
     };
 
+    // Order: all SAFE tests (compute reg / DM, unclaimed-cell EINVAL)
+    // FIRST, so they land their answers before the known-risky memtile
+    // probe in V4 potentially destroys the channel.
     run_or_skip("V2", [&]{ return test_V2_read_consistency(ctx, args.col); });
-    run_or_skip("V4", [&]{ return test_V4_memtile_reg(ctx, args.col); });
     run_or_skip("V5", [&]{ return test_V5_stress(ctx, args.col, args.row, 100); });
     run_or_skip("V6", [&]{ return test_V6_compute_dm(ctx, args.col); });
-
-    // V3: deliberately reads from an unclaimed cell. Expected to throw
-    // (authorization enforced). One probe only -- enough to confirm the
-    // mechanism without flooding firmware with INVALID_PARAM responses.
-    // Runs after the safe sweeps but BEFORE the optional danger probe.
     run_or_skip("V3", [&]{ return test_V3_unclaimed_cell(ctx, args.col); });
+
+    // V4 LAST: memtile register read after 1s idle pause. Tests the
+    // "hammering the mailbox too fast" hypothesis. Single read -- if
+    // it hangs, the channel dies and any subsequent test would skip.
+    run_or_skip("V4", [&]{ return test_V4_memtile_reg(ctx, args.col); });
 
     // VD (DANGER ZONE) LAST: opt-in via --probe-dm-danger. Reproduces
     // the memtile-DM half-implementation: writes ack, reads hang. Will
