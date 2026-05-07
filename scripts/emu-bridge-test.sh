@@ -1646,6 +1646,7 @@ compile_one() {
       local hw_cycles_inject_log="$RESULTS_DIR/${safe}.hw-cycles-inject.log"
       local hw_cycles_target="$build_dir/aie-hw-cycles-traced.mlir"
       local hw_cycles_src="$build_dir/aie-hw-cycles-src.mlir"
+      local hw_cycles_config="$build_dir/aie-hw-cycles-trace-config.json"
       mkdir -p "$build_dir"
       : > "$hw_cycles_inject_log"
       # Resolve the source MLIR. Two cases:
@@ -1686,6 +1687,9 @@ compile_one() {
               --input "$hw_cycles_src" \
               --out "$hw_cycles_target" \
               --buffer-size 8192 \
+              --trace-config-out "$hw_cycles_config" \
+              --config-test-name "$name" \
+              --config-src-mlir "$hw_cycles_src" \
               >> "$hw_cycles_inject_log" 2>&1
           case $? in
               0) hw_cycles_traced_mlir="$hw_cycles_target"
