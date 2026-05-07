@@ -155,6 +155,39 @@ of the cleaner `-EOPNOTSUPP` we'd see if the driver could read the
 status. Worth fixing upstream: relax the check to accept smaller
 responses, copy what fits, and let callers act on the actual status.
 
+### MSG_OP_START_FW_TRACE (0x10F) -- NOT IMPLEMENTED on Phoenix
+
+Verified 2026-05-06 via the per-opcode-rebuild approach. Probe entry
+added to `npu1_msg_op_tbl[]` (paired with `MSG_OP_STOP_FW_TRACE` so the
+teardown path would be safe if START succeeded), driver rebuilt + DKMS
+reinstalled. **No userspace probe extension was needed**: `amdxdna_probe`
+auto-fires `aie2_start_fw_trace` during DPT init when a default trace
+size is configured. dmesg captured the full handshake:
+
+```
+xdna_mailbox.145: req opcode 0x10f size 24 id 0x1d00000f
+xdna_mailbox.145: resp opcode 0x10f size 4 id 0x1d00000f
+aie2_send_mgmt_msg_wait: command opcode 0x10f failed, status 0x4000002
+aie2_start_fw_trace: start fw trace failed, ret 0x4000002
+```
+
+The 4-byte response carrying `AIE2_STATUS_INVALID_COMMAND` came through
+cleanly thanks to the size-check relaxation in `a155466`; pre-relaxation
+this would have surfaced as a generic `-EMSGSIZE`. AMD's table is
+correctly conservative for this opcode. Do not add to NPU1 table.
+
+`MSG_OP_STOP_FW_TRACE` (0x110) is presumed unimplemented as well: it's
+paired with START in NPU4's table and Phoenix has no other path that
+would fire it. Not directly proven (firing STOP requires an active
+session, which START can't establish) but not worth a separate probe.
+
+**Methodology refinement**: for opcodes that the driver auto-fires
+during init or some other predictable internal path, just add the table
+entry -- no userspace probe extension needed. The driver's existing
+codepath becomes the trigger; dmesg captures the response. This applies
+to START_FW_TRACE (DPT init), GET_DEV_REVISION (mgmt_fw_init), and
+CALIBRATE_TIME (init).
+
 ### Other candidates -- not yet probed
 
 NPU4 table entries absent from NPU1's table that we have not yet
@@ -164,37 +197,38 @@ exercised on Phoenix:
 |--------|-------------------------------|-------------------------------|
 | 0x114  | MSG_OP_GET_APP_HEALTH         | DRM_AMDXDNA_FW_LOG via GET_INFO IOCTL or context creation/destroy |
 | 0x116  | MSG_OP_CONFIG_FW_LOG          | Setting fw log buffer params (unclear which IOCTL) |
-| 0x117  | MSG_OP_GET_DEV_REVISION       | Auto-fired during init -- needs separate hook to retrigger post-init |
-| 0x10F  | MSG_OP_START_FW_TRACE         | DRM_AMDXDNA_SET_FW_TRACE_STATE via SET_STATE IOCTL |
-| 0x110  | MSG_OP_STOP_FW_TRACE          | same path |
-| 0x111  | MSG_OP_SET_FW_TRACE_CATEGORIES| same path (with categories arg) |
-| 0x11C  | MSG_OP_CALIBRATE_TIME         | Auto-fired during init only -- not safely re-triggerable |
+| 0x117  | MSG_OP_GET_DEV_REVISION       | Auto-fired during init -- table-entry-only probe (driver auto-triggers) |
+| 0x111  | MSG_OP_SET_FW_TRACE_CATEGORIES| Moot now -- only fires if a START_FW_TRACE session is active |
+| 0x11C  | MSG_OP_CALIBRATE_TIME         | Auto-fired during init -- table-entry-only probe |
 
-`GET_DEV_REVISION` and `CALIBRATE_TIME` are init-only paths; the only
-way to probe them is to intentionally re-init, which historically
-wedged the SMU. With autosuspend pinned off
-(`/etc/modprobe.d/amdxdna.conf`) the resume-fail path no longer hits,
-so an init re-trigger may now be tractable.
+`GET_DEV_REVISION` and `CALIBRATE_TIME` are init-only paths. With
+autosuspend pinned off (`/etc/modprobe.d/amdxdna.conf`) the resume-fail
+path no longer hits, so simply adding a table entry and rebooting/
+reloading the driver should reproduce them in dmesg the same way
+START_FW_TRACE did.
 
 ## Recommended next moves
 
-1. **MSG_OP_START_FW_TRACE (0x10F)** -- next probe. If firmware
-   implements it, we get firmware-level event tracing, which complements
-   the AIE-level trace pipeline. Add table entry, rebuild, fire via
-   `DRM_AMDXDNA_SET_FW_TRACE_STATE` from a probe extension to
-   validate-readback (M1 test).
-2. **Upstream a `xdna_msg_cb` size-check relaxation patch.** The
-   one-shot diagnostic patch (`77e625b`) hex-dumps for visibility;
-   the principled fix is to copy `min(got, want)`, surface the
-   actual status, and translate AIE2_STATUS_INVALID_COMMAND to
-   `-EOPNOTSUPP` rather than `-EINVAL`. Cleaner errno semantics.
-3. **MSG_OP_GET_APP_HEALTH (0x114) and MSG_OP_CONFIG_FW_LOG (0x116).**
+1. **MSG_OP_GET_APP_HEALTH (0x114) and MSG_OP_CONFIG_FW_LOG (0x116).**
    Both touch firmware-level logging; if either implements, useful for
-   debugging.
-4. **For each opcode that returns SUCCESS**: keep its table entry as a
+   debugging. APP_HEALTH is fired on context creation/destroy paths
+   (likely table-entry-only probe -- shim_test or any hwctx round-trip
+   would trigger). CONFIG_FW_LOG triggers via firmware log level changes
+   through DRM_AMDXDNA_SET_FW_LOG_STATE.
+2. **MSG_OP_GET_DEV_REVISION (0x117) and MSG_OP_CALIBRATE_TIME (0x11C).**
+   Both auto-fired during driver init -- table-entry-only probe. Add
+   entry, modprobe -r/+, dmesg captures the response. With autosuspend
+   pinned off, the wedge-on-resume failure mode no longer applies.
+3. **For each opcode that returns SUCCESS**: keep its table entry as a
    commit, run shim_test #64/#65/#66 (filter expanded in `92ed2fa`) to
    validate not just acknowledgement but actual functional behavior --
    the half-implementation concern we flagged at survey start.
+4. **Possibly upstreamable**: the `a155466` `xdna_msg_cb` relaxation
+   patch is upstream-quality. The principled rationale (firmware error
+   replies are short, driver should not hide their status behind
+   EMSGSIZE) is now proven by both COREDUMP and START_FW_TRACE
+   verdicts. Could be paired with errno translation (status
+   `AIE2_STATUS_INVALID_COMMAND` -> `-EOPNOTSUPP`) for cleaner UAPI.
 
 ## See also
 
