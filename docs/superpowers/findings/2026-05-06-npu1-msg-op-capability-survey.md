@@ -188,47 +188,113 @@ codepath becomes the trigger; dmesg captures the response. This applies
 to START_FW_TRACE (DPT init), GET_DEV_REVISION (mgmt_fw_init), and
 CALIBRATE_TIME (init).
 
-### Other candidates -- not yet probed
+### MSG_OP_GET_APP_HEALTH (0x114) -- NOT IMPLEMENTED on Phoenix
 
-NPU4 table entries absent from NPU1's table that we have not yet
-exercised on Phoenix:
+Verified 2026-05-06. Probe entry added to `npu1_msg_op_tbl[]`,
+triggered manually by reading the debugfs `get_app_health` file at
+`/sys/kernel/debug/accel/0000:c6:00.1/get_app_health`. dmesg:
 
-| Opcode | Name                          | How to trigger from userspace |
-|--------|-------------------------------|-------------------------------|
-| 0x114  | MSG_OP_GET_APP_HEALTH         | DRM_AMDXDNA_FW_LOG via GET_INFO IOCTL or context creation/destroy |
-| 0x116  | MSG_OP_CONFIG_FW_LOG          | Setting fw log buffer params (unclear which IOCTL) |
-| 0x117  | MSG_OP_GET_DEV_REVISION       | Auto-fired during init -- table-entry-only probe (driver auto-triggers) |
-| 0x111  | MSG_OP_SET_FW_TRACE_CATEGORIES| Moot now -- only fires if a START_FW_TRACE session is active |
-| 0x11C  | MSG_OP_CALIBRATE_TIME         | Auto-fired during init -- table-entry-only probe |
+```
+req opcode 0x114 size 16 id 0x1d000010
+resp opcode 0x114 size 4 id 0x1d000010
+aie2_send_mgmt_msg_wait: command opcode 0x114 failed, status 0x4000002
+```
 
-`GET_DEV_REVISION` and `CALIBRATE_TIME` are init-only paths. With
-autosuspend pinned off (`/etc/modprobe.d/amdxdna.conf`) the resume-fail
-path no longer hits, so simply adding a table entry and rebooting/
-reloading the driver should reproduce them in dmesg the same way
-START_FW_TRACE did.
+4-byte short reply, INVALID_COMMAND. AMD's table is correctly
+conservative.
+
+### MSG_OP_GET_DEV_REVISION (0x117) -- NOT IMPLEMENTED on Phoenix
+
+Verified 2026-05-06. Probe entry added; auto-fired during driver
+bring-up via `amdxdna_vbnv_init -> get_dev_revision`. dmesg:
+
+```
+req opcode 0x117 size 4 id 0x1d00000f
+resp opcode 0x117 size 4 id 0x1d00000f
+aie2_send_mgmt_msg_wait: command opcode 0x117 failed, status 0x4000002
+```
+
+4-byte short reply, INVALID_COMMAND. Failure was non-fatal (vbnv
+fell back to `default_vbnv`). AMD's table is correctly conservative.
+
+### MSG_OP_CONFIG_FW_LOG (0x116) -- NOT IMPLEMENTED on Phoenix
+
+Verified 2026-05-06. Probe entry added; auto-fired during driver
+bring-up via `amdxdna_dpt_init -> amdxdna_fw_log_init` (the FW log
+init runs *before* the FW trace init we previously saw fail). dmesg:
+
+```
+req opcode 0x116 size 32 id 0x1d000010
+resp opcode 0x116 size 4 id 0x1d000010
+aie2_send_mgmt_msg_wait: command opcode 0x116 failed, status 0x4000002
+aie2_config_fw_log: Config fw log failed, ret 0x4000002
+amdxdna_fw_log_init: Failed to configure FW logging: -22
+```
+
+4-byte short reply, INVALID_COMMAND. Failure was non-fatal (dpt_init
+emits WARN and the rest of bring-up continues). AMD's table is
+correctly conservative.
+
+### Other candidates -- inferred or deferred
+
+| Opcode | Name                          | Status |
+|--------|-------------------------------|--------|
+| 0x110  | MSG_OP_STOP_FW_TRACE          | Inferred NOT IMPLEMENTED (paired with 0x10F in NPU4 table; can't be tested without an active session, which 0x10F can't establish). |
+| 0x111  | MSG_OP_SET_FW_TRACE_CATEGORIES| Moot -- only fires when a START_FW_TRACE session is active. |
+| 0x11C  | MSG_OP_CALIBRATE_TIME         | Deferred. Failure mode is fatal-on-init (`aie2_mgmt_fw_init` propagates the error and `amdxdna_probe` bails), and the prior bypass attempt showed mgmt_fw_init failure can wedge the SMU. Recovery is reboot-only. The pattern across all 5/5 directly-tested ops is so consistent that the marginal information from confirming this one isn't worth the risk. |
+
+## Survey-wide conclusion
+
+5/5 directly-tested NPU4-only opcodes return the same fingerprint on
+Phoenix: 4-byte short response carrying `0x4000002`
+(`AIE2_STATUS_INVALID_COMMAND`).
+
+| Opcode | Name | Verdict |
+|--------|------|---------|
+| 0x113 | UPDATE_PROPERTY | NOT IMPLEMENTED |
+| 0x114 | GET_APP_HEALTH | NOT IMPLEMENTED |
+| 0x116 | CONFIG_FW_LOG | NOT IMPLEMENTED |
+| 0x117 | GET_DEV_REVISION | NOT IMPLEMENTED |
+| 0x119 | GET_COREDUMP | NOT IMPLEMENTED |
+| 0x10F | START_FW_TRACE | NOT IMPLEMENTED |
+
+The headline finding is that AMD's NPU1 op-table is correctly
+conservative. The only NPU4-vs-NPU1 gap that turned out to be a
+driver-omission (rather than a silicon-level absence) was
+`MSG_OP_AIE_RW_ACCESS` (0x203), already added in xdna-driver
+`289c207`. The firmware-level
+logging/tracing/health/coredump/property/revision family is genuinely
+absent on Phoenix -- not a driver oversight.
+
+**No half-implementations were found**: every probe either succeeded
+cleanly (AIE_RW_ACCESS) or returned the same canonical
+INVALID_COMMAND fingerprint. The half-implementation concern that
+motivated the conservative dual-validation methodology (verdict +
+shim_test #64/#65/#66) turned out to be unwarranted for this opcode
+family on this firmware version (Phoenix 1.5.5.391, protocol 5.8).
+Future surveys on different firmware versions may behave differently.
 
 ## Recommended next moves
 
-1. **MSG_OP_GET_APP_HEALTH (0x114) and MSG_OP_CONFIG_FW_LOG (0x116).**
-   Both touch firmware-level logging; if either implements, useful for
-   debugging. APP_HEALTH is fired on context creation/destroy paths
-   (likely table-entry-only probe -- shim_test or any hwctx round-trip
-   would trigger). CONFIG_FW_LOG triggers via firmware log level changes
-   through DRM_AMDXDNA_SET_FW_LOG_STATE.
-2. **MSG_OP_GET_DEV_REVISION (0x117) and MSG_OP_CALIBRATE_TIME (0x11C).**
-   Both auto-fired during driver init -- table-entry-only probe. Add
-   entry, modprobe -r/+, dmesg captures the response. With autosuspend
-   pinned off, the wedge-on-resume failure mode no longer applies.
-3. **For each opcode that returns SUCCESS**: keep its table entry as a
-   commit, run shim_test #64/#65/#66 (filter expanded in `92ed2fa`) to
-   validate not just acknowledgement but actual functional behavior --
-   the half-implementation concern we flagged at survey start.
-4. **Possibly upstreamable**: the `a155466` `xdna_msg_cb` relaxation
-   patch is upstream-quality. The principled rationale (firmware error
-   replies are short, driver should not hide their status behind
-   EMSGSIZE) is now proven by both COREDUMP and START_FW_TRACE
-   verdicts. Could be paired with errno translation (status
-   `AIE2_STATUS_INVALID_COMMAND` -> `-EOPNOTSUPP`) for cleaner UAPI.
+1. **Possibly upstreamable: `a155466` xdna_msg_cb size-check
+   relaxation.** The patch is upstream-quality, and the principled
+   rationale (firmware error replies are short, driver should not hide
+   their status behind EMSGSIZE) is now proven by 5 independent
+   verdicts. Could be paired with errno translation
+   (`AIE2_STATUS_INVALID_COMMAND` -> `-EOPNOTSUPP`) for cleaner UAPI.
+2. **Re-survey on next firmware update.** When Phoenix firmware advances
+   (current `1.5.5.391`, protocol `5.8`), re-run the auto-fire batch
+   (add 0x113 + 0x10F + 0x114 + 0x116 + 0x117 + 0x119 simultaneously,
+   modprobe, observe). Each opcode is independent -- adding more table
+   entries simultaneously is safe as long as none have a fatal-on-init
+   path. CALIBRATE_TIME (0x11C) remains the only deferred opcode.
+3. **Methodology to remember**: for opcodes the driver auto-fires
+   during a non-fatal init path or via debugfs, just adding the
+   table entry is the entire probe -- no userspace extension needed.
+   The xdna-driver build cycle (~30s) is fast enough that batching
+   N opcodes per rebuild is the cheapest path. Record verdicts in
+   commit messages on the xdna-driver branch, revert the entries
+   in a single follow-up commit.
 
 ## See also
 
