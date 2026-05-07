@@ -64,12 +64,13 @@ impl DmaEngine {
             let phase_after = self.channels[ch_idx].fsm.phase_name();
             if phase_before != phase_after {
                 log::info!(
-                    "DMA({},{}) ch{}: {} -> {}",
+                    "DMA({},{}) ch{}: {} -> {} cycle={}",
                     self.col,
                     self.row,
                     ch_idx,
                     phase_before,
-                    phase_after
+                    phase_after,
+                    self.current_cycle,
                 );
             }
         }

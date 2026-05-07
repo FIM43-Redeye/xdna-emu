@@ -19,10 +19,15 @@ alone -- a value of ~3700 would be needed to match HW, which is
 implausible for any realistic PCIe + NoC + DDR fill estimate. Closing
 the gap end-to-end requires either:
 
-1. Adding the missing structural latencies (stream-switch fabric,
-   memtile DMA broadcast/fanout, NoC contention).
-2. Direct ground-truth HW cycle measurement via the now-working
-   `xrt::hw_context::read_aie_reg` path, which lets us calibrate
+1. Adding the missing structural latencies. **Note (2026-05-07):**
+   stream-switch fabric latency was originally listed here but a
+   follow-up audit found it is already correctly applied (intra-tile
+   via `LocalRoute.latency`, inter-tile via `ROUTE_PER_HOP`). The
+   leading remaining suspect is **DMA engine internal pipeline costs**
+   (shim + memtile BD-startup, address generation, request issue),
+   plus memtile DMA broadcast/fanout and NoC contention.
+2. Direct ground-truth HW cycle measurement via the now-validated
+   `AIE_RW_ACCESS` path on compute tiles, which lets us calibrate
    against actual cycle counts rather than inferred trace metrics.
 
 ## Measurement
@@ -77,10 +82,21 @@ The 11.2x gap on the trace-event side (HW core wait 2839 cyc vs EMU
 
 2. **EMU DMA pipeline fills too fast** (current bridge-log measurement).
    Even if host_memory_latency is tuned correctly, the chain's overall
-   fill is ~3700+ cyc shorter than HW. Suspects:
-   - Stream-switch fabric per-hop latency (3-4 cyc/hop x 2-3 hops),
-     model values exist (`local_to_local_latency: 3`) but are not
-     consumed by the data-path FSM.
+   fill is ~3700+ cyc shorter than HW. Suspects (re-evaluated 2026-05-07):
+   - ~~Stream-switch fabric per-hop latency~~ -- **already applied**.
+     Intra-tile: `LocalRoute.latency` set per-route by `with_port_latency`
+     (port-type-derived: 3 for local-to-local, 4 for paths involving
+     external) and consumed via `switch_pipeline.cycles_remaining` in
+     `StreamSwitch::step`. Inter-tile: `ROUTE_PER_HOP = 4` applied in
+     `array::routing::propagate_inter_tile`. Total per-hop contribution
+     is ~7-11 cyc, far too small to account for the ~3700 cyc gap.
+     (Dead-code cleanup opportunity: the `local_latency`/`external_latency`
+     fields on the `StreamSwitch` struct itself are written at construction
+     time but never read -- the live data-path uses `LocalRoute.latency`
+     and `ROUTE_PER_HOP` instead. Safe to delete.)
+   - Shim and memtile DMA engine internal pipeline costs (BD-startup,
+     address generation, request issue, response handling) likely
+     under-modeled in EMU. This is the leading suspect for the gap.
    - Memtile DMA broadcast/fanout per-port arbitration.
    - Missing NoC bandwidth contention (multiple shim transfers
      compete for the same NoC link in HW).
@@ -89,18 +105,34 @@ The 11.2x gap on the trace-event side (HW core wait 2839 cyc vs EMU
 
 Listed in order of expected payoff per engineering hour:
 
-1. **Wire stream-switch fabric latency into the data path FSM.** The
-   constants are already in `StreamSwitchTiming` but no consumer reads
-   them. Should add 6-12 cyc per stream hop to pipeline fill.
+1. ~~Wire stream-switch fabric latency into the data path FSM.~~
+   **Withdrawn 2026-05-07.** Audit found that both intra-tile and
+   inter-tile latency are already wired into the data-path FSM (see
+   Suspects above). The original observation about unused fields was
+   incomplete -- it spotted dead code on the `StreamSwitch` struct but
+   missed the live `LocalRoute.latency` / `ROUTE_PER_HOP` consumers.
+   Stream-switch contribution to the gap is at most ~50 cyc; cannot
+   close ~3700 cyc.
 
-2. **Calibrate against HW ground truth.** The `read_aie_reg` path now
-   works on Phoenix (op-table fix landed 2026-05-05). Use it to read
-   `Performance_Counter0` from the compute tile after a kernel run,
-   giving us a direct cycle measurement that bypasses trace
-   interpretation. Calibrate cycle-cost framework knobs against that
-   measurement.
+2. **Audit DMA engine internal pipeline timing.** Now the leading
+   suspect. Shim and memtile DMA engines have BD-startup, address
+   generation, request issue, and response handling phases. Compare
+   EMU's stepping logic against aie-rt's actual DMA programming
+   sequence (`../aie-rt/driver/src/dma/xaie_dma_aieml.c`) and AM020 Ch3
+   for the cycle costs of each phase. This is where the 3700-cyc gap
+   most likely lives.
 
-3. **Add NoC bandwidth/contention model.** Heavier engineering; not
+3. **Calibrate against HW ground truth via `AIE_RW_ACCESS`.** The path
+   now works on Phoenix for compute-tile registers and DM (op-table fix
+   landed 2026-05-05; functional validation completed 2026-05-07, see
+   `2026-05-07-aie-rw-access-memtile-dm-half-impl.md`). Read `TIMER_LOW`
+   on each compute tile pre/post-kernel for ground-truth total cycles
+   per tile -- bypasses trace interpretation entirely. Memtile reads
+   are NOT available (firmware bug); compute tile coverage is what
+   matters for cycle-cost calibration. Calibrate framework knobs
+   against this measurement.
+
+4. **Add NoC bandwidth/contention model.** Heavier engineering; not
    needed for single-input/single-output kernels, but matters for
    matmul-cascade-style tests with concurrent shim transfers.
 
