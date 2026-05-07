@@ -137,49 +137,76 @@ returned `status 0x4000002 = AIE2_STATUS_INVALID_COMMAND` when the
 driver's bring-up sent it. AMD's table is correctly conservative for
 this opcode. Do not add to NPU1 table.
 
+### MSG_OP_GET_COREDUMP (0x119) -- NOT IMPLEMENTED on Phoenix
+
+Verified 2026-05-06 via the per-opcode-rebuild approach. Probe entry
+added to `npu1_msg_op_tbl[]` (xdna-driver `7e641c9`, reverted in
+`0c5d393`); validate-readback's M0 fired `DRM_IOCTL_AMDXDNA_GET_ARRAY`
+with `param=DRM_AMDXDNA_AIE_COREDUMP`. Mailbox req went out, firmware
+sent a 4-byte response, and the hex-dump diagnostic patch (`77e625b`)
+revealed the bytes were `04 00 00 02` = `AIE2_STATUS_INVALID_COMMAND`.
+AMD's table is correctly conservative; do not add to NPU1 table.
+
+**Side discovery**: Phoenix firmware's INVALID_COMMAND response is
+**4 bytes (status only)**, not the 36-byte struct the open-source
+driver's `get_coredump_resp` expects. The driver's strict size check
+in `xdna_msg_cb` discards the response and surfaces `-EINVAL` instead
+of the cleaner `-EOPNOTSUPP` we'd see if the driver could read the
+status. Worth fixing upstream: relax the check to accept smaller
+responses, copy what fits, and let callers act on the actual status.
+
 ### Other candidates -- not yet probed
 
-The following are NPU4 table entries absent from NPU1's table; each
-needs probing via the bypass-then-trigger pattern, NOT at modprobe
-time.
+NPU4 table entries absent from NPU1's table that we have not yet
+exercised on Phoenix:
 
 | Opcode | Name                          | How to trigger from userspace |
 |--------|-------------------------------|-------------------------------|
 | 0x114  | MSG_OP_GET_APP_HEALTH         | DRM_AMDXDNA_FW_LOG via GET_INFO IOCTL or context creation/destroy |
 | 0x116  | MSG_OP_CONFIG_FW_LOG          | Setting fw log buffer params (unclear which IOCTL) |
 | 0x117  | MSG_OP_GET_DEV_REVISION       | Auto-fired during init -- needs separate hook to retrigger post-init |
-| 0x119  | MSG_OP_GET_COREDUMP           | DRM_AMDXDNA_AIE_COREDUMP via GET_INFO IOCTL |
 | 0x10F  | MSG_OP_START_FW_TRACE         | DRM_AMDXDNA_SET_FW_TRACE_STATE via SET_STATE IOCTL |
 | 0x110  | MSG_OP_STOP_FW_TRACE          | same path |
 | 0x111  | MSG_OP_SET_FW_TRACE_CATEGORIES| same path (with categories arg) |
 | 0x11C  | MSG_OP_CALIBRATE_TIME         | Auto-fired during init only -- not safely re-triggerable |
 
-`GET_DEV_REVISION` and `CALIBRATE_TIME` are tricky because they are
-init-only paths; the only way to probe them via bypass is to
-intentionally re-init, which is the unsafe path that wedges the SMU.
-For these, the raw-mailbox path remains useful (with the caveat that
-INVALID_PARAM from raw-mailbox is not a definitive signal).
+`GET_DEV_REVISION` and `CALIBRATE_TIME` are init-only paths; the only
+way to probe them is to intentionally re-init, which historically
+wedged the SMU. With autosuspend pinned off
+(`/etc/modprobe.d/amdxdna.conf`) the resume-fail path no longer hits,
+so an init re-trigger may now be tractable.
 
 ## Recommended next moves
 
-1. After NPU recovery (reboot): redo `MSG_OP_GET_DEV_REVISION` via the
-   raw-mailbox path with a properly-formatted request (the
-   `place_holder` field shape may differ from NPU4).
-2. With bypass enabled post-bring-up, trigger `MSG_OP_GET_COREDUMP`
-   via the existing `DRM_AMDXDNA_AIE_COREDUMP` IOCTL path -- this
-   would be hugely useful for the multi-run-on-same-hwctx hang we hit
-   in validate-readback (#355a-related work).
-3. Trigger `MSG_OP_START_FW_TRACE` via `DRM_AMDXDNA_SET_FW_TRACE_STATE`
-   to see if firmware-level event tracing works on Phoenix.
-4. For each opcode that returns SUCCESS: write a minimal patch adding
-   it to `npu1_msg_op_tbl[]` and verify the production XRT path now
-   works without the bypass. Each becomes its own commit.
+1. **MSG_OP_START_FW_TRACE (0x10F)** -- next probe. If firmware
+   implements it, we get firmware-level event tracing, which complements
+   the AIE-level trace pipeline. Add table entry, rebuild, fire via
+   `DRM_AMDXDNA_SET_FW_TRACE_STATE` from a probe extension to
+   validate-readback (M1 test).
+2. **Upstream a `xdna_msg_cb` size-check relaxation patch.** The
+   one-shot diagnostic patch (`77e625b`) hex-dumps for visibility;
+   the principled fix is to copy `min(got, want)`, surface the
+   actual status, and translate AIE2_STATUS_INVALID_COMMAND to
+   `-EOPNOTSUPP` rather than `-EINVAL`. Cleaner errno semantics.
+3. **MSG_OP_GET_APP_HEALTH (0x114) and MSG_OP_CONFIG_FW_LOG (0x116).**
+   Both touch firmware-level logging; if either implements, useful for
+   debugging.
+4. **For each opcode that returns SUCCESS**: keep its table entry as a
+   commit, run shim_test #64/#65/#66 (filter expanded in `92ed2fa`) to
+   validate not just acknowledgement but actual functional behavior --
+   the half-implementation concern we flagged at survey start.
 
 ## See also
 
-- `xdna-driver` `ceecace` -- the bypass module parameter (this work)
-- `xdna-driver` `289c207` -- yesterday's `MSG_OP_AIE_RW_ACCESS` table
-  entry (the success template for ops that probe to SUCCESS)
-- `xdna-driver` `25b3f51` -- `test_case04` raw-mailbox debugfs path
-- `tools/validate-readback/` -- end-to-end probe of the AIE_RW_ACCESS
-  path, demonstrates the post-table-fix workflow
+- `xdna-driver` `289c207` -- `MSG_OP_AIE_RW_ACCESS` table entry (the
+  SUCCESS template for ops that probe positively).
+- `xdna-driver` `7e641c9` + `0c5d393` -- probe and revert for COREDUMP
+  (the INVALID_COMMAND template).
+- `xdna-driver` `77e625b` -- hex-dump diagnostic patch in xdna_msg_cb
+  (the visibility tool that turned `0x400000d` from a mystery into the
+  4-byte answer).
+- `xdna-driver` `25b3f51` -- raw-mailbox debugfs (`test_case04`),
+  fallback for opcodes without a pre-built request constructor.
+- `xdna-driver` `cd6bf13` -- the abandoned bypass module parameter
+  (revert), retained in history for context.
+- `tools/validate-readback/` -- M0 probe + AIE_RW_ACCESS validation.
