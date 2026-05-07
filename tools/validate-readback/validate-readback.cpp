@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -401,6 +402,177 @@ ProbeResult probe_get_coredump(int slot, bool verbose) {
     return pr;
 }
 
+// ----- AIE_RW_ACCESS functional validation slots -----
+//
+// These exercise the production AIE_RW_ACCESS path on tiles that the
+// dummy kernel's hwctx CLAIMS. add_one_using_dma uses tiles (0,0) shim,
+// (0,1) memtile, (0,2) compute -- one of each tile type, conveniently.
+//
+// IMPORTANT: an earlier version of this file swept rows 2-5 of the
+// partition column. That blew up: the firmware enforces per-tile-claim
+// authorization (not just partition-column scoping), so reads at rows
+// 3-5 returned AIE2_STATUS_INVALID_PARAM. The driver translated each
+// non-success status to -EINVAL, and the accumulated mailbox traffic
+// eventually caused mgmt_chann to time out and tear down, cascading to
+// -ENODEV and an SMU wedge requiring reboot. Lesson: only touch the
+// kernel's claimed tiles, and run the "unclaimed-cell" probe last so
+// other answers land before any potential cascade.
+//
+// Half-implementation discriminators each test catches:
+//   V2: same-cell back-to-back reads (5x) return identical values
+//       (catches stale-cache / read-side-effect bugs)
+//   V3: read at unclaimed cell throws cleanly
+//       (catches over-permissive firmware; runs LAST)
+//   V4: memtile DM round-trip on the kernel's memtile
+//       (catches "compute-tile-only" half-impl, different tile type)
+//   V5: N=100 random-magic round-trip stress on the compute cell
+//       (catches flakiness / occasional corruption)
+
+constexpr int MEMTILE_ROW = 1;
+constexpr int COMPUTE_ROW = 2;
+constexpr int UNCLAIMED_ROW = 5;  // last compute row, NOT in add_one_using_dma's hwctx
+
+TestResult test_V2_read_consistency(xrt::hw_context& ctx, int col) {
+    // V1 left PERF_COUNTER0 = 0xDEADBEEF at (col, 2) with PERF_CTRL0 = 0
+    // (no event configured, so the counter does not advance). Read 5x in
+    // tight succession; values must be identical.
+    constexpr int N = 5;
+    std::vector<uint32_t> reads;
+    reads.reserve(N);
+    try {
+        for (int i = 0; i < N; ++i) {
+            reads.push_back(
+                ctx.read_aie_reg(static_cast<uint16_t>(col),
+                                 static_cast<uint16_t>(COMPUTE_ROW),
+                                 PERF_COUNTER0_OFFSET));
+        }
+    } catch (const std::exception& e) {
+        return {"V2", Verdict::Fail, std::string("threw on read ") +
+                std::to_string(reads.size()) + ": " + e.what()};
+    }
+    bool all_equal = true;
+    for (size_t i = 1; i < reads.size(); ++i)
+        if (reads[i] != reads[0]) { all_equal = false; break; }
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "%dx PERF_COUNTER0 @ (%d,%d): 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x %s",
+        N, col, COMPUTE_ROW, reads[0], reads[1], reads[2], reads[3], reads[4],
+        all_equal ? "all-equal" : "JITTER");
+    return {"V2", all_equal ? Verdict::Pass : Verdict::Fail, buf};
+}
+
+TestResult test_V4_memtile_dm(xrt::hw_context& ctx, int col) {
+    // Memtile DM round-trip on the hwctx's CLAIMED memtile (col, 1).
+    // Use a high offset (0x10000) past anything add_one_using_dma's
+    // objFifos might still occupy. Two distinct addresses to catch
+    // address-decoding / "all-addresses-alias-the-same-cell" bugs.
+    constexpr uint32_t OFF_A = 0x10000;
+    constexpr uint32_t OFF_B = 0x10100;
+    const uint32_t MAGIC_A = 0xBEEF0000u | (static_cast<uint32_t>(col & 0xff) << 8) | 0xAA;
+    const uint32_t MAGIC_B = 0xBEEF0000u | (static_cast<uint32_t>(col & 0xff) << 8) | 0xBB;
+    try {
+        ctx.write_aie_reg(static_cast<uint16_t>(col),
+                          static_cast<uint16_t>(MEMTILE_ROW), OFF_A, MAGIC_A);
+        ctx.write_aie_reg(static_cast<uint16_t>(col),
+                          static_cast<uint16_t>(MEMTILE_ROW), OFF_B, MAGIC_B);
+        uint32_t got_a = ctx.read_aie_reg(static_cast<uint16_t>(col),
+                                          static_cast<uint16_t>(MEMTILE_ROW), OFF_A);
+        uint32_t got_b = ctx.read_aie_reg(static_cast<uint16_t>(col),
+                                          static_cast<uint16_t>(MEMTILE_ROW), OFF_B);
+        bool ok_a = (got_a == MAGIC_A);
+        bool ok_b = (got_b == MAGIC_B);
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "memtile (%d,%d) off=0x%x: %s 0x%08x (want 0x%08x); off=0x%x: %s 0x%08x (want 0x%08x)",
+            col, MEMTILE_ROW, OFF_A, ok_a ? "ok" : "MISMATCH", got_a, MAGIC_A,
+            OFF_B, ok_b ? "ok" : "MISMATCH", got_b, MAGIC_B);
+        return {"V4", (ok_a && ok_b) ? Verdict::Pass : Verdict::Fail, buf};
+    } catch (const std::exception& e) {
+        return {"V4", Verdict::Fail, std::string("threw: ") + e.what()};
+    }
+}
+
+TestResult test_V5_stress(xrt::hw_context& ctx, int col, int row, int iters) {
+    // N=iters random-magic round-trips on the claimed compute cell.
+    // PERF_CTRL0 was set to 0 by V1; we re-set defensively.
+    try {
+        ctx.write_aie_reg(static_cast<uint16_t>(col),
+                          static_cast<uint16_t>(row), PERF_CTRL0_OFFSET, 0);
+    } catch (const std::exception& e) {
+        return {"V5", Verdict::Fail, std::string("ctrl0 write threw: ") + e.what()};
+    }
+    std::mt19937 rng(0xCAFEBABEu);
+    int exact = 0, near = 0, mismatch = 0;
+    uint32_t worst_delta = 0, last_got = 0, last_want = 0;
+    for (int i = 0; i < iters; ++i) {
+        uint32_t want = static_cast<uint32_t>(rng());
+        try {
+            ctx.write_aie_reg(static_cast<uint16_t>(col),
+                              static_cast<uint16_t>(row),
+                              PERF_COUNTER0_OFFSET, want);
+            uint32_t got = ctx.read_aie_reg(static_cast<uint16_t>(col),
+                                            static_cast<uint16_t>(row),
+                                            PERF_COUNTER0_OFFSET);
+            if (got == want) ++exact;
+            else if (got > want && got - want < 100u) {
+                ++near;
+                if (got - want > worst_delta) worst_delta = got - want;
+            } else {
+                ++mismatch; last_got = got; last_want = want;
+            }
+        } catch (const std::exception& e) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                "threw at iter %d/%d: exact=%d near=%d mismatch=%d msg=%s",
+                i, iters, exact, near, mismatch, e.what());
+            return {"V5", Verdict::Fail, buf};
+        }
+    }
+    char buf[256];
+    if (mismatch == 0) {
+        std::snprintf(buf, sizeof(buf),
+            "%d iters: exact=%d near=%d (worst delta=%u) mismatch=0",
+            iters, exact, near, worst_delta);
+    } else {
+        std::snprintf(buf, sizeof(buf),
+            "%d iters: exact=%d near=%d mismatch=%d last_mismatch want=0x%08x got=0x%08x",
+            iters, exact, near, mismatch, last_want, last_got);
+    }
+    Verdict v = (mismatch == 0 && (exact + near) == iters) ? Verdict::Pass : Verdict::Fail;
+    return {"V5", v, buf};
+}
+
+TestResult test_V3_unclaimed_cell(xrt::hw_context& ctx, int col) {
+    // Authorization probe: read PERF_COUNTER0 from a cell our hwctx does
+    // NOT claim (row 5, last compute row -- add_one_using_dma uses only
+    // rows 0,1,2). We expect this to throw EINVAL: firmware returns
+    // AIE2_STATUS_INVALID_PARAM, driver translates to -EINVAL.
+    //
+    // Runs LAST so V2/V4/V5 land their answers before any potential
+    // mailbox-channel cascade. A SINGLE probe -- not multiple cells --
+    // to keep the firmware-side error queue from growing.
+    //
+    // PASS if the read throws (authorization enforced); INFO if it
+    // unexpectedly succeeds (over-permissive firmware, would be a
+    // notable finding).
+    try {
+        uint32_t got = ctx.read_aie_reg(static_cast<uint16_t>(col),
+                                        static_cast<uint16_t>(UNCLAIMED_ROW),
+                                        PERF_COUNTER0_OFFSET);
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+            "UNEXPECTED: unclaimed cell (%d,%d) PERF_COUNTER0 read returned 0x%08x without throwing",
+            col, UNCLAIMED_ROW, got);
+        return {"V3", Verdict::Info, buf};
+    } catch (const std::exception& e) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "unclaimed (%d,%d) read threw as expected (auth enforced): %s",
+            col, UNCLAIMED_ROW, e.what());
+        return {"V3", Verdict::Pass, buf};
+    }
+}
+
 TestResult test_M0_coredump_scan(bool verbose) {
     // Brute-force scan ctx slots 1..16. Driver returns -EINVAL ("Context
     // not found") for unallocated slots. We always include every result
@@ -465,23 +637,34 @@ int main(int argc, char** argv) {
     results.push_back(test_V1(ctx, args.col, args.row));
     print_result(results.back());
 
-    // V2/V3/V4 require a SECOND kernel run on the same hwctx with the perf
-    // counter freshly programmed. Empirically that second run hangs with
-    // ERT_CMD_STATE_NORESPONSE: the add_one_using_dma compute core hits
-    // aie.end after its 4 iterations and is halted, and a subsequent
-    // run.start() does not reset the core. Bridge-runner gets multi-run
-    // working somehow (likely by recreating hwctx between batches); that
-    // workaround is out of scope for this validation pass. The core
-    // validation question -- "does read_aie_reg return real data?" --
-    // has been answered PASS by L0/L1/V0/V1, which is sufficient.
-    results.push_back({"V2", Verdict::Skip,
-                       "second-run-on-same-hwctx hangs (ERT_CMD_STATE_NORESPONSE); "
-                       "needs hwctx-recreate workaround, out of scope here"});
-    print_result(results.back());
-    results.push_back({"V3", Verdict::Skip, "blocked on V2"});
-    print_result(results.back());
-    results.push_back({"V4", Verdict::Skip, "blocked on V2"});
-    print_result(results.back());
+    // V2/V4/V5: AIE_RW_ACCESS functional sweeps on the dummy kernel's
+    // CLAIMED tiles. (See file-level comment for why we don't sweep
+    // unclaimed tiles -- prior version cascaded to SMU wedge.) Each
+    // test bails out on the first throw; if the channel goes south we
+    // stop sending requests rather than accumulate INVALID_PARAMs.
+    auto run_or_skip = [&](const char* id, auto&& fn) {
+        // Skip if any prior V/M test already thrown-bailed (likely channel
+        // is bad). Detect by scanning prior failures with a "threw" marker.
+        for (const auto& r : results) {
+            if (r.v == Verdict::Fail && r.detail.find("threw") != std::string::npos) {
+                results.push_back({id, Verdict::Skip,
+                    "prior test threw; not running to avoid mgmt_chann cascade"});
+                print_result(results.back());
+                return;
+            }
+        }
+        results.push_back(fn());
+        print_result(results.back());
+    };
+
+    run_or_skip("V2", [&]{ return test_V2_read_consistency(ctx, args.col); });
+    run_or_skip("V4", [&]{ return test_V4_memtile_dm(ctx, args.col); });
+    run_or_skip("V5", [&]{ return test_V5_stress(ctx, args.col, args.row, 100); });
+
+    // V3 LAST: deliberately reads from an unclaimed cell. Expected to throw
+    // (authorization enforced). One probe only -- enough to confirm the
+    // mechanism without flooding firmware with INVALID_PARAM responses.
+    run_or_skip("V3", [&]{ return test_V3_unclaimed_cell(ctx, args.col); });
 
     // Mailbox-opcode probe: fires DRM_AMDXDNA_AIE_COREDUMP for each candidate
     // hwctx slot. Run with `unsafe_accept_all_msg=N` (default) to confirm the
