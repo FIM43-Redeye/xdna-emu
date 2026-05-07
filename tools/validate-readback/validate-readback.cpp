@@ -402,14 +402,12 @@ ProbeResult probe_get_coredump(int slot, bool verbose) {
 }
 
 TestResult test_M0_coredump_scan(bool verbose) {
-    // Brute-force scan ctx slots 1..7 (slot 0 is AMDXDNA_INVALID_CTX_HANDLE
-    // and never assigned by xa_alloc_cyclic). The driver returns -EINVAL
-    // with "Context not found" for unallocated slots, so distinguishing
-    // "no context here" from "real firmware response" is straightforward.
+    // Brute-force scan ctx slots 1..16. Driver returns -EINVAL ("Context
+    // not found") for unallocated slots. We always include every result
+    // in the detail string so a bypass-less "all EINVAL" outcome is
+    // explicit, not silently elided.
     std::string detail;
-    int found_slot = -1;
-    ProbeResult found;
-    for (int slot = 1; slot <= 7; ++slot) {
+    for (int slot = 1; slot <= 16; ++slot) {
         ProbeResult pr = probe_get_coredump(slot, verbose);
         char line[256];
         if (pr.rc == 0) {
@@ -417,22 +415,16 @@ TestResult test_M0_coredump_scan(bool verbose) {
                 "slot=%d OK bytes=%zu zero=%d ones=%d nz_off=0x%x nz_val=0x%08x",
                 slot, pr.bytes, pr.all_zero ? 1 : 0, pr.all_ones ? 1 : 0,
                 pr.first_nonzero_offset, pr.first_nonzero_value);
-            found_slot = slot; found = pr;
         } else {
             std::snprintf(line, sizeof(line),
                 "slot=%d errno=%d (%s) bytes=%zu",
                 slot, pr.err, strerror(pr.err), pr.bytes);
-            // EINVAL means no such ctx in our process; skip silently in non-verbose.
-            if (pr.err == EINVAL && !verbose) continue;
-            if (found_slot < 0 && pr.err != EINVAL) { found_slot = slot; found = pr; }
         }
         if (verbose) std::fprintf(stderr, "  M0 %s\n", line);
         if (!detail.empty()) detail += "; ";
         detail += line;
     }
-    return TestResult{"M0", Verdict::Info, detail.empty()
-        ? std::string{"no slots responded (no hwctx?)"}
-        : detail};
+    return TestResult{"M0", Verdict::Info, detail};
 }
 
 } // namespace
