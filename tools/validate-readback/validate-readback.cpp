@@ -12,11 +12,18 @@
 #include <thread>
 #include <vector>
 
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_hw_context.h"
 #include "xrt/xrt_kernel.h"
 #include "xrt/experimental/xrt_xclbin.h"
+
+#include "amdxdna_accel.h"
 
 namespace {
 
@@ -287,6 +294,147 @@ RunResult run_kernel_once(xrt::device& device, xrt::kernel& kernel,
     return r;
 }
 
+// ----- Mailbox-opcode probe (Phase 1 of NPU1 capability survey) -----
+//
+// Fires DRM_IOCTL_AMDXDNA_GET_ARRAY for DRM_AMDXDNA_AIE_COREDUMP, which
+// causes the driver to dispatch MSG_OP_GET_COREDUMP (0x119) to firmware
+// IFF the opcode is present in `npu1_msg_op_tbl[]`. We probe by adding a
+// placeholder entry to that table for the opcode under test, rebuilding
+// the driver, then running this binary; firmware's response status word
+// is the final answer. (See finding doc 2026-05-06-npu1-msg-op-capability-survey.md.)
+//
+// Discriminator:
+//   EOPNOTSUPP/-95           -> opcode NOT in npu1_msg_op_tbl[] (gate active)
+//   0 (success) + real data  -> firmware implements opcode
+//   0 + all-zeros/all-ones   -> half-implementation suspect (firmware acked but no data)
+//   EINVAL/-22 + dmesg shows AIE2_STATUS_INVALID_COMMAND -> firmware does NOT
+//                             implement opcode (revert table entry)
+//   EIO / other              -> see dmesg
+
+struct ProbeResult {
+    int rc = -1;          // ioctl return value (0 = success, -1 = errno set)
+    int err = 0;          // errno
+    size_t bytes = 0;     // payload size after retry (driver hint or actual fill)
+    bool all_zero = false;
+    bool all_ones = false;
+    uint32_t first_nonzero_offset = 0;
+    uint32_t first_nonzero_value = 0;
+};
+
+ProbeResult probe_get_coredump(int slot, bool verbose) {
+    ProbeResult pr;
+    int fd = open("/dev/accel/accel0", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        pr.err = errno;
+        if (verbose) std::fprintf(stderr, "  open /dev/accel/accel0 failed: %s\n", strerror(errno));
+        return pr;
+    }
+
+    // Start with the minimum size that passes the driver's first sanity check
+    // (sizeof(amdxdna_drm_aie_coredump) = 16). We expect ENOSPC with a size
+    // hint in arg.element_size, then we retry with that size.
+    std::vector<char> buf(sizeof(amdxdna_drm_aie_coredump), 0);
+    auto fill_config = [&]() {
+        auto* cfg = reinterpret_cast<amdxdna_drm_aie_coredump*>(buf.data());
+        cfg->pid = static_cast<__u64>(getpid());
+        cfg->context_id = static_cast<__u32>(slot);
+        cfg->pad = 0;
+    };
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        fill_config();
+        amdxdna_drm_get_array arg = {};
+        arg.param = DRM_AMDXDNA_AIE_COREDUMP;
+        arg.element_size = static_cast<__u32>(buf.size());
+        arg.num_element = 1;
+        arg.buffer = reinterpret_cast<__u64>(buf.data());
+
+        int rc = ioctl(fd, DRM_IOCTL_AMDXDNA_GET_ARRAY, &arg);
+        if (rc == 0) {
+            pr.rc = 0;
+            pr.err = 0;
+            pr.bytes = buf.size();
+            break;
+        }
+        int e = errno;
+        if (e == ENOSPC && attempt == 0 && arg.element_size > buf.size()) {
+            if (verbose) std::fprintf(stderr,
+                "  slot=%d ENOSPC, hint=%u, retrying with full buffer\n",
+                slot, arg.element_size);
+            buf.assign(arg.element_size, 0);
+            continue;
+        }
+        pr.rc = -1;
+        pr.err = e;
+        pr.bytes = (e == ENOSPC) ? arg.element_size : 0;
+        break;
+    }
+
+    close(fd);
+
+    if (pr.rc == 0 && !buf.empty()) {
+        // Skip the config header in our content scan; data starts after it.
+        size_t hdr = sizeof(amdxdna_drm_aie_coredump);
+        size_t data_bytes = buf.size() > hdr ? buf.size() - hdr : 0;
+        bool z = true, o = true;
+        for (size_t i = 0; i < data_bytes; ++i) {
+            uint8_t b = static_cast<uint8_t>(buf[hdr + i]);
+            if (b != 0x00) z = false;
+            if (b != 0xFF) o = false;
+            if (!z && !o) break;
+        }
+        pr.all_zero = z;
+        pr.all_ones = o;
+        if (!z && !o) {
+            // Find first nonzero word for a content sample.
+            for (size_t i = 0; i + 4 <= data_bytes; i += 4) {
+                uint32_t v = 0;
+                std::memcpy(&v, buf.data() + hdr + i, 4);
+                if (v != 0) {
+                    pr.first_nonzero_offset = static_cast<uint32_t>(i);
+                    pr.first_nonzero_value = v;
+                    break;
+                }
+            }
+        }
+    }
+    return pr;
+}
+
+TestResult test_M0_coredump_scan(bool verbose) {
+    // Brute-force scan ctx slots 1..7 (slot 0 is AMDXDNA_INVALID_CTX_HANDLE
+    // and never assigned by xa_alloc_cyclic). The driver returns -EINVAL
+    // with "Context not found" for unallocated slots, so distinguishing
+    // "no context here" from "real firmware response" is straightforward.
+    std::string detail;
+    int found_slot = -1;
+    ProbeResult found;
+    for (int slot = 1; slot <= 7; ++slot) {
+        ProbeResult pr = probe_get_coredump(slot, verbose);
+        char line[256];
+        if (pr.rc == 0) {
+            std::snprintf(line, sizeof(line),
+                "slot=%d OK bytes=%zu zero=%d ones=%d nz_off=0x%x nz_val=0x%08x",
+                slot, pr.bytes, pr.all_zero ? 1 : 0, pr.all_ones ? 1 : 0,
+                pr.first_nonzero_offset, pr.first_nonzero_value);
+            found_slot = slot; found = pr;
+        } else {
+            std::snprintf(line, sizeof(line),
+                "slot=%d errno=%d (%s) bytes=%zu",
+                slot, pr.err, strerror(pr.err), pr.bytes);
+            // EINVAL means no such ctx in our process; skip silently in non-verbose.
+            if (pr.err == EINVAL && !verbose) continue;
+            if (found_slot < 0 && pr.err != EINVAL) { found_slot = slot; found = pr; }
+        }
+        if (verbose) std::fprintf(stderr, "  M0 %s\n", line);
+        if (!detail.empty()) detail += "; ";
+        detail += line;
+    }
+    return TestResult{"M0", Verdict::Info, detail.empty()
+        ? std::string{"no slots responded (no hwctx?)"}
+        : detail};
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -341,6 +489,13 @@ int main(int argc, char** argv) {
     results.push_back({"V3", Verdict::Skip, "blocked on V2"});
     print_result(results.back());
     results.push_back({"V4", Verdict::Skip, "blocked on V2"});
+    print_result(results.back());
+
+    // Mailbox-opcode probe: fires DRM_AMDXDNA_AIE_COREDUMP for each candidate
+    // hwctx slot. Run with `unsafe_accept_all_msg=N` (default) to confirm the
+    // op-table gate is in effect, then again with `=Y` to observe firmware's
+    // actual response to MSG_OP_GET_COREDUMP (0x119).
+    results.push_back(test_M0_coredump_scan(args.verbose));
     print_result(results.back());
 
     // Cleanup: disable any counter we left programmed, best-effort.

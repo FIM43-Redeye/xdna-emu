@@ -23,28 +23,36 @@ AIE_RW_ACCESS. Capability-discovery question: which is which?
 
 ## Approach
 
-Two probe paths, increasing in fidelity:
+Three probe paths considered; we settled on the third.
 
 1. **Raw mailbox via debugfs `test_case04`** (yesterday's tool).
    Sends arbitrary opcode + payload directly to the management
-   firmware, captures response. Limitations: we have to manually
-   reconstruct the request struct shape (firmware rejects malformed
-   inputs with INVALID_PARAM, indistinguishable in our sample run
-   from "opcode unknown"); cannot allocate DMA scratch buffers for
-   ops that need them.
+   firmware. Limitations: manual request struct construction (firmware
+   rejects malformed inputs with INVALID_PARAM, indistinguishable from
+   "opcode unknown" in our sample); no DMA scratch buffers for ops
+   that need them.
 
-2. **Driver bypass via module parameter** (today's tool, xdna-driver
-   `ceecace`). New `unsafe_accept_all_msg` module parameter turns
-   `aie2_is_supported_msg()` into a yes-machine. The driver's
-   existing per-IOCTL request constructors fire and use the production
-   codepath (proper struct layout, DMA buffers if needed). The
-   firmware's response is what production XRT would see if we'd
-   simply added the opcode to the table.
+2. **Driver bypass via module parameter** (briefly tried today, xdna-driver
+   `ceecace`, since reverted). A `unsafe_accept_all_msg=Y` module param
+   turned `aie2_is_supported_msg()` into a yes-machine. Problem: the
+   bypass leaks into driver-internal flows (PM resume, mgmt_fw_init),
+   which then fire gated opcodes the firmware doesn't implement, wedging
+   the SMU. Verified failure mode 2026-05-06: with bypass on, runtime
+   resume re-fires `MSG_OP_UPDATE_PROPERTY` (0x113), firmware returns
+   INVALID_COMMAND, driver destroys mgmt_chann, subsequent IOCTLs hit
+   `-ENODEV`. A correctly-scoped bypass (per-fd flag set via custom
+   IOCTL, env-var driven on the user side) was sketched but not built
+   -- the rebuild-per-opcode path below is faster for the small N of
+   opcodes we need to survey.
 
-Path 2 is the trustworthy one. Raw-mailbox is useful for an opcode
-without a pre-built request constructor in the driver, but for ops
-the driver already knows how to format, the bypass produces cleaner
-signal.
+3. **Per-opcode table entry + driver rebuild** (current approach).
+   For each candidate opcode: add a placeholder `{ AIE2_FW_VERSION(5,8),
+   MSG_OP_<x> }` entry to `npu1_msg_op_tbl[]`, rebuild + DKMS-install
+   the driver (~3 min), reload, run the probe. Firmware response
+   decides: SUCCESS = keep the entry, INVALID_COMMAND = revert. Each
+   opcode is its own clean commit to xdna-driver. Production code path
+   tested exactly as production XRT would call it. No bypass mechanism
+   shipped, no internal-leak risk.
 
 ## Discriminator
 
@@ -63,25 +71,19 @@ which class an opcode is in:
 
 ## Safety lesson learned the hard way
 
-Enabling `unsafe_accept_all_msg=1` at modprobe time on NPU1 wedges
-the SMU and only S3-suspend or a full reboot recovers. Cause: the
-driver's bring-up path (`aie2_hw_start` -> `aie2_mgmt_fw_init` ->
-`aie2_runtime_update_prop`) calls `MSG_OP_UPDATE_PROPERTY` (0x113),
-which the bypass lets through. Phoenix firmware returns
-`INVALID_COMMAND`, the bring-up code treats that as fatal `-EINVAL`,
-and the partial-init state leaves the SMU unable to take subsequent
-commands.
+Enabling `unsafe_accept_all_msg=1` (the abandoned bypass approach
+above) wedged the SMU twice: once at modprobe time, once again at
+runtime when PM resume re-fired `MSG_OP_UPDATE_PROPERTY` after the
+device autosuspended. Cause: the bypass affects ALL mailbox sends,
+including driver-internal ones (`aie2_mgmt_fw_init`, runtime resume),
+which then send opcodes the firmware doesn't implement. Phoenix returns
+`INVALID_COMMAND` and the driver bails on the bring-up; in the runtime
+case it destroys `mgmt_chann` so subsequent IOCTLs return `-ENODEV`.
 
-**Safe pattern**: load the module with the default off, wait for
-`/dev/accel/accel0` to appear, THEN toggle the param via sysfs:
-
-```bash
-pkexec modprobe amdxdna   # default: bypass off
-# ...wait for /dev/accel/accel0...
-pkexec sh -c 'echo Y > /sys/module/amdxdna/parameters/unsafe_accept_all_msg'
-# trigger the IOCTL of interest
-pkexec sh -c 'echo N > /sys/module/amdxdna/parameters/unsafe_accept_all_msg'
-```
+This is the structural reason we abandoned the bypass-flag approach.
+A correctly-scoped variant (per-fd flag set via custom IOCTL, env-var
+driven from userspace, internal flows never opt in) would avoid this,
+but for an 8-opcode survey the per-opcode-rebuild path is simpler.
 
 ### Why PCIe reset can't recover the SMU wedge
 
@@ -130,9 +132,10 @@ Don't waste time on resets; suspend or reboot.
 
 ### MSG_OP_UPDATE_PROPERTY (0x113) -- NOT IMPLEMENTED on Phoenix
 
-Verified 2026-05-06. Bypassed at bring-up; firmware returned
-`status 0x4000002 = AIE2_STATUS_INVALID_COMMAND`. AMD's table is
-correctly conservative for this opcode. Do not add to NPU1 table.
+Verified 2026-05-06 via the (now-abandoned) bypass approach. Firmware
+returned `status 0x4000002 = AIE2_STATUS_INVALID_COMMAND` when the
+driver's bring-up sent it. AMD's table is correctly conservative for
+this opcode. Do not add to NPU1 table.
 
 ### Other candidates -- not yet probed
 
