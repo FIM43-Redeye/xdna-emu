@@ -755,6 +755,18 @@ substitute their own values.
     dkms install xrt-amdxdna/2.23.0 -k $(uname -r) && \
     modprobe -r amdxdna && modprobe amdxdna'
   ```
+- **amdxdna autosuspend pinned off**: `/etc/modprobe.d/amdxdna.conf`
+  contains `options amdxdna autosuspend_ms=-1`. The NPU has been
+  observed to wedge on auto-resume after certain mailbox failures
+  (e.g. struct-size mismatches that leave firmware in an
+  unrecoverable state). Pinning autosuspend off keeps the device
+  alive so we never hit the broken resume path. Workaround for
+  development; revert if the underlying wedges are diagnosed and
+  fixed. Verify with
+  `cat /sys/module/amdxdna/parameters/autosuspend_ms` (should be -1).
+- **dmesg is unrestricted**: kernel built with `kernel.dmesg_restrict=0`
+  (or equivalent), so `dmesg` works without `pkexec`. Don't wrap dmesg
+  in pkexec on this machine.
 - **Chess license**: `HOSTID=f4289d05121f` (bound to current Wi-Fi
   card; 2 of 3 vendor-permitted swaps remaining).
 - **DNS**: UConn DNS is broken. Fix per-session:
