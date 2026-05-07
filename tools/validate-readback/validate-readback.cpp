@@ -28,10 +28,17 @@
 
 namespace {
 
-constexpr uint32_t TIMER_LOW_OFFSET     = 0x000340F8;
-constexpr uint32_t PERF_CTRL0_OFFSET    = 0x00031500;
-constexpr uint32_t PERF_COUNTER0_OFFSET = 0x00031520;
-constexpr uint8_t  EVENT_ACTIVE_CORE    = 0x1C;
+constexpr uint32_t TIMER_LOW_OFFSET         = 0x000340F8;
+constexpr uint32_t PERF_CTRL0_OFFSET        = 0x00031500;
+constexpr uint32_t PERF_COUNTER0_OFFSET     = 0x00031520;
+constexpr uint8_t  EVENT_ACTIVE_CORE        = 0x1C;
+// Memtile register space (per aie-rt xaiemlgbl_params.h):
+//   DATAMEMORY base       = 0x00000 (512KB DM, 0x00000-0x7FFFF)
+//   PERFORMANCE_COUNTER0  = 0x91020
+//   TIMER_LOW             = 0x940F8 (mirror of CORE_MODULE_TIMER_LOW at 0x340F8)
+constexpr uint32_t MEMTILE_TIMER_LOW_OFFSET = 0x000940F8;
+// Compute DM low addr; safe to probe with a single read (no write).
+constexpr uint32_t COMPUTE_DM_PROBE_OFFSET  = 0x00000100;
 
 constexpr const char* DEFAULT_XCLBIN =
     "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/peano/aie.xclbin";
@@ -213,6 +220,7 @@ struct Args {
     int col = 0;
     int row = 2;
     bool verbose = false;
+    bool probe_dm_danger = false;
 };
 
 Args parse_args(int argc, char** argv) {
@@ -224,6 +232,7 @@ Args parse_args(int argc, char** argv) {
         else if (s == "--col"    && i + 1 < argc) a.col    = std::atoi(argv[++i]);
         else if (s == "--row"    && i + 1 < argc) a.row    = std::atoi(argv[++i]);
         else if (s == "-v" || s == "--verbose")   a.verbose = true;
+        else if (s == "--probe-dm-danger")        a.probe_dm_danger = true;
         else {
             std::fprintf(stderr, "unknown arg: %s\n", s.c_str());
             std::exit(2);
@@ -418,15 +427,34 @@ ProbeResult probe_get_coredump(int slot, bool verbose) {
 // kernel's claimed tiles, and run the "unclaimed-cell" probe last so
 // other answers land before any potential cascade.
 //
+// SECOND IMPORTANT: a later version added V4 = memtile DM round-trip at
+// offset 0x10000. That uncovered a half-implementation: firmware ACKs
+// the writes (returns SUCCESS, driver logs them) but silently DROPS the
+// readback -- the response never arrives, the mailbox channel times out
+// after 5s, and the user-context channel is destroyed. SMU survived,
+// but it's still a hard hit on the device. So V4 is now memtile
+// register-space (read-only TIMER_LOW), and the DM round-trip moves
+// behind --probe-dm-danger (default off).
+// See finding doc 2026-05-07-aie-rw-access-memtile-dm-half-impl.md.
+//
+// Address-space coverage matrix (after this round of tests):
+//   compute reg  : V0/V1/V2/V5 -- VERIFIED working
+//   compute DM   : V6          -- TBD
+//   memtile reg  : V4          -- TBD
+//   memtile DM   : --danger    -- KNOWN broken (writes ack, reads hang)
+//   shim         : not exercised here (no claimed register space probed)
+//
 // Half-implementation discriminators each test catches:
 //   V2: same-cell back-to-back reads (5x) return identical values
 //       (catches stale-cache / read-side-effect bugs)
 //   V3: read at unclaimed cell throws cleanly
 //       (catches over-permissive firmware; runs LAST)
-//   V4: memtile DM round-trip on the kernel's memtile
-//       (catches "compute-tile-only" half-impl, different tile type)
+//   V4: memtile register read returns plausible non-zero, advancing values
+//       (probes whether memtile reg-space is reachable at all)
 //   V5: N=100 random-magic round-trip stress on the compute cell
 //       (catches flakiness / occasional corruption)
+//   V6: compute DM single read returns *something* without throwing
+//       (probes whether AIE_RW_ACCESS reaches DM, not just registers)
 
 constexpr int MEMTILE_ROW = 1;
 constexpr int COMPUTE_ROW = 2;
@@ -461,11 +489,64 @@ TestResult test_V2_read_consistency(xrt::hw_context& ctx, int col) {
     return {"V2", all_equal ? Verdict::Pass : Verdict::Fail, buf};
 }
 
-TestResult test_V4_memtile_dm(xrt::hw_context& ctx, int col) {
-    // Memtile DM round-trip on the hwctx's CLAIMED memtile (col, 1).
-    // Use a high offset (0x10000) past anything add_one_using_dma's
-    // objFifos might still occupy. Two distinct addresses to catch
-    // address-decoding / "all-addresses-alias-the-same-cell" bugs.
+TestResult test_V4_memtile_reg(xrt::hw_context& ctx, int col) {
+    // Memtile register-space probe. TIMER_LOW (0x940F8) is read-only, no
+    // side effects, and the memtile timer is always running. Two reads
+    // ~1ms apart should differ if memtile reg-space is reachable at all.
+    //
+    // PASS: both reads succeed and timer advanced.
+    // FAIL/throw: memtile reg-space is broken just like memtile DM.
+    try {
+        uint32_t t0 = ctx.read_aie_reg(static_cast<uint16_t>(col),
+                                       static_cast<uint16_t>(MEMTILE_ROW),
+                                       MEMTILE_TIMER_LOW_OFFSET);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        uint32_t t1 = ctx.read_aie_reg(static_cast<uint16_t>(col),
+                                       static_cast<uint16_t>(MEMTILE_ROW),
+                                       MEMTILE_TIMER_LOW_OFFSET);
+        uint32_t delta = t1 - t0;
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "memtile (%d,%d) TIMER_LOW: 0x%08x -> 0x%08x (delta=%u over ~1ms)",
+            col, MEMTILE_ROW, t0, t1, delta);
+        Verdict v = (delta > 100u && delta < 2'000'000'000u) ? Verdict::Pass : Verdict::Fail;
+        return {"V4", v, buf};
+    } catch (const std::exception& e) {
+        return {"V4", Verdict::Fail, std::string("threw: ") + e.what()};
+    }
+}
+
+TestResult test_V6_compute_dm(xrt::hw_context& ctx, int col) {
+    // Compute DM probe. Single read at low DM offset. add_one_using_dma
+    // uses compute DM for its objFifo buffers, so anything is possible
+    // here -- we don't assert a value, just that the read returns
+    // *something* without throwing or hanging.
+    //
+    // PASS: read returns successfully (any value).
+    // FAIL/throw: AIE_RW_ACCESS doesn't reach compute DM (same family
+    // as the memtile DM bug, or a different breakage).
+    try {
+        uint32_t v = ctx.read_aie_reg(static_cast<uint16_t>(col),
+                                      static_cast<uint16_t>(COMPUTE_ROW),
+                                      COMPUTE_DM_PROBE_OFFSET);
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+            "compute DM (%d,%d) off=0x%x: 0x%08x (any value OK)",
+            col, COMPUTE_ROW, COMPUTE_DM_PROBE_OFFSET, v);
+        return {"V6", Verdict::Pass, buf};
+    } catch (const std::exception& e) {
+        return {"V6", Verdict::Fail, std::string("threw: ") + e.what()};
+    }
+}
+
+TestResult test_VD_memtile_dm_danger(xrt::hw_context& ctx, int col) {
+    // KNOWN-BROKEN reproduction of the half-implementation. Writes will
+    // silently ack, the readback hangs in firmware, the user-context
+    // mailbox times out at 5s and is destroyed by the driver. SMU has
+    // survived this in our prior runs but the device needs a driver
+    // reload before another xclbin load.
+    //
+    // Gated behind --probe-dm-danger so it never fires by accident.
     constexpr uint32_t OFF_A = 0x10000;
     constexpr uint32_t OFF_B = 0x10100;
     const uint32_t MAGIC_A = 0xBEEF0000u | (static_cast<uint32_t>(col & 0xff) << 8) | 0xAA;
@@ -483,12 +564,13 @@ TestResult test_V4_memtile_dm(xrt::hw_context& ctx, int col) {
         bool ok_b = (got_b == MAGIC_B);
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-            "memtile (%d,%d) off=0x%x: %s 0x%08x (want 0x%08x); off=0x%x: %s 0x%08x (want 0x%08x)",
-            col, MEMTILE_ROW, OFF_A, ok_a ? "ok" : "MISMATCH", got_a, MAGIC_A,
-            OFF_B, ok_b ? "ok" : "MISMATCH", got_b, MAGIC_B);
-        return {"V4", (ok_a && ok_b) ? Verdict::Pass : Verdict::Fail, buf};
+            "memtile DM (%d,%d) off=0x%x: %s 0x%08x; off=0x%x: %s 0x%08x (UNEXPECTED PASS, finding may be obsolete)",
+            col, MEMTILE_ROW, OFF_A, ok_a ? "ok" : "MISMATCH", got_a,
+            OFF_B, ok_b ? "ok" : "MISMATCH", got_b);
+        return {"VD", (ok_a && ok_b) ? Verdict::Info : Verdict::Fail, buf};
     } catch (const std::exception& e) {
-        return {"V4", Verdict::Fail, std::string("threw: ") + e.what()};
+        return {"VD", Verdict::Pass,
+                std::string("memtile DM round-trip threw as expected (half-impl confirmed): ") + e.what()};
     }
 }
 
@@ -658,13 +740,24 @@ int main(int argc, char** argv) {
     };
 
     run_or_skip("V2", [&]{ return test_V2_read_consistency(ctx, args.col); });
-    run_or_skip("V4", [&]{ return test_V4_memtile_dm(ctx, args.col); });
+    run_or_skip("V4", [&]{ return test_V4_memtile_reg(ctx, args.col); });
     run_or_skip("V5", [&]{ return test_V5_stress(ctx, args.col, args.row, 100); });
+    run_or_skip("V6", [&]{ return test_V6_compute_dm(ctx, args.col); });
 
-    // V3 LAST: deliberately reads from an unclaimed cell. Expected to throw
+    // V3: deliberately reads from an unclaimed cell. Expected to throw
     // (authorization enforced). One probe only -- enough to confirm the
     // mechanism without flooding firmware with INVALID_PARAM responses.
+    // Runs after the safe sweeps but BEFORE the optional danger probe.
     run_or_skip("V3", [&]{ return test_V3_unclaimed_cell(ctx, args.col); });
+
+    // VD (DANGER ZONE) LAST: opt-in via --probe-dm-danger. Reproduces
+    // the memtile-DM half-implementation: writes ack, reads hang. Will
+    // destroy the user-context mailbox channel; subsequent xclbin loads
+    // require a driver reload (`pkexec modprobe -r/+ amdxdna`).
+    if (args.probe_dm_danger) {
+        std::printf("[INFO] --probe-dm-danger: running known-broken memtile DM round-trip; channel will likely die\n");
+        run_or_skip("VD", [&]{ return test_VD_memtile_dm_danger(ctx, args.col); });
+    }
 
     // Mailbox-opcode probe: fires DRM_AMDXDNA_AIE_COREDUMP for each candidate
     // hwctx slot. Run with `unsafe_accept_all_msg=N` (default) to confirm the
