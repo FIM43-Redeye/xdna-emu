@@ -3069,9 +3069,22 @@ main() {
         safe="$(sanitize_name "$name")"
         local src_dir="$TEST_SRC/$name"
 
+        # Discover compute tiles from aie.mlir (same logic as PC-anchored).
+        local mlir_src="$src_dir/aie.mlir"
+        local tile_spec=""
+        if [[ -f "$mlir_src" ]]; then
+          tile_spec="$(grep -v '^[[:space:]]*//' "$mlir_src" \
+            | grep -oP 'aie\.tile\(\K[0-9]+,\s*[0-9]+(?=\))' \
+            | awk -F',' '{ col=$1; row=$2+0; if(row>=2) { printf "%s%d:%d:core", sep, col, row; sep="," } }' \
+            | sed 's/ //g')"
+        fi
+        if [[ -z "$tile_spec" ]]; then
+          echo "  SWEEP $name: SKIP -- no compute tiles found in $mlir_src"
+          continue
+        fi
+
         for compiler in "${compilers[@]}"; do
           local build_dir="$BUILD_BASE/$name/$compiler"
-          local test_exe="$BUILD_BASE/$name/test.exe"
           local sweep_dir="$RESULTS_DIR/${safe}.${compiler}.sweep"
           local sweep_log="$RESULTS_DIR/${safe}.${compiler}.sweep.log"
 
@@ -3081,17 +3094,19 @@ main() {
             cr="$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")"
           [[ "$cr" != "OK" ]] && continue
 
-          [[ ! -f "$test_exe" ]] && continue
           [[ ! -f "$build_dir/insts.bin" ]] && continue
 
-          local run_cmd
-          run_cmd="$(get_run_cmd "$src_dir")"
-
+          # trace-sweep.py auto-discovers build_dir from --test/--compiler
+          # under MLIR_AIE_ROOT/build/test/npu-xrt/. Pass --build-dir
+          # explicitly for parity with our caching layout.
           local sweep_args=(
+            --test "$name"
+            --compiler "$compiler"
             --build-dir "$build_dir"
-            --test-exe "$test_exe"
-            --output "$sweep_dir"
-            --run-cmd "$run_cmd"
+            --tiles "$tile_spec"
+            --out-dir "$sweep_dir"
+            --core-sweep all
+            --reuse-ctx
           )
           $RUN_HW || sweep_args+=(--no-hw)
           $RUN_EMU || sweep_args+=(--no-emu)
