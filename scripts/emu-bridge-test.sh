@@ -1611,13 +1611,18 @@ compile_one() {
 
   if [[ "$NO_TRACE" != "true" ]] && ! is_trace_quarantined "$name"; then
     local trace_log="$RESULTS_DIR/${safe}.trace-prepare.log"
-    # --shim-sweep-events all enables shim trace injection on row-0 tiles
-    # so Phase 5b's lockstep sweep can rotate shim DMA events alongside
-    # core events. This is the data path #355a needs to calibrate the
-    # EMU/HW DMA pipeline-fill gap. Pre-stage-1 behavior (no shim trace)
-    # is preserved by omitting this flag.
+    # --shim-sweep-events all (#372 / stage 1), --memtile-sweep-events all
+    # (#373 / stage 2), and --memmod-sweep-events all (#374 / stage 3) all
+    # activate inject-time trace decls on the corresponding tile types.
+    # Phase 5b's lockstep sweep then rotates events on every type that has
+    # decls, giving full-array coverage. Pre-stage-1 behavior (core-only
+    # trace) is preserved by omitting these flags.
     if nice -n 19 python3 "$EMU_ROOT/tools/trace-prepare.py" "$src_dir" \
-        -o "$traced_dir" --shim-sweep-events all > "$trace_log" 2>&1; then
+        -o "$traced_dir" \
+        --shim-sweep-events all \
+        --memtile-sweep-events all \
+        --memmod-sweep-events all \
+        > "$trace_log" 2>&1; then
       if [[ -f "$traced_dir/prepare-status.txt" ]] \
           && grep -q '^OK' "$traced_dir/prepare-status.txt"; then
         trace_ok=true
@@ -3074,18 +3079,19 @@ main() {
         safe="$(sanitize_name "$name")"
         local src_dir="$TEST_SRC/$name"
 
-        # Discover tiles from aie.mlir. Row >= 2 = compute (core trace);
-        # row == 1 = memtile (since stage 2 of #373); row == 0 = shim
-        # (since stage 1 of #372). Memmod (compute mem-module) lands in
-        # stage 3 (#374) and will need a separate emit since it co-locates
-        # with the same row >= 2 tile.  Mixed-type tiles route
-        # trace-sweep.py to its lockstep path automatically.
+        # Discover tiles from aie.mlir. Row >= 2 emits both core and
+        # memmod entries (the compute tile has two trace units, sweep
+        # rotates events on each independently); row == 1 emits memtile
+        # (stage 2 / #373); row == 0 emits shim (stage 1 / #372). Memmod
+        # co-locates with the core tile, hence two entries per row >= 2
+        # line. Mixed-type tiles route trace-sweep.py to its lockstep
+        # path automatically.
         local mlir_src="$src_dir/aie.mlir"
         local tile_spec=""
         if [[ -f "$mlir_src" ]]; then
           tile_spec="$(grep -v '^[[:space:]]*//' "$mlir_src" \
             | grep -oP 'aie\.tile\(\K[0-9]+,\s*[0-9]+(?=\))' \
-            | awk -F',' '{ col=$1; row=$2+0; if(row>=2) { printf "%s%d:%d:core", sep, col, row; sep="," } else if(row==1) { printf "%s%d:%d:memtile", sep, col, row; sep="," } else if(row==0) { printf "%s%d:%d:shim", sep, col, row; sep="," } }' \
+            | awk -F',' '{ col=$1; row=$2+0; if(row>=2) { printf "%s%d:%d:core,%d:%d:memmod", sep, col, row, col, row; sep="," } else if(row==1) { printf "%s%d:%d:memtile", sep, col, row; sep="," } else if(row==0) { printf "%s%d:%d:shim", sep, col, row; sep="," } }' \
             | sed 's/ //g')"
         fi
         if [[ -z "$tile_spec" ]]; then
@@ -3202,19 +3208,19 @@ main() {
 
           # Discover tiles from aie.mlir:
           #   strip line comments (//), then grep for aie.tile(col, row),
-          #   then classify: row >= 2 (compute, core trace), row == 1
-          #   (memtile, since stage 2 of #373), row == 0 (shim, since
-          #   stage 1 of #372).  A long-term improvement would be to
-          #   invoke aie-translate for an authoritative tile list, but
-          #   the regex covers every test currently in the suite.
-          #   Tracked in docs/superpowers/findings/
+          #   then classify: row >= 2 emits core+memmod (compute tile has
+          #   two trace units, stage 3 / #374); row == 1 emits memtile
+          #   (stage 2 / #373); row == 0 emits shim (stage 1 / #372). A
+          #   long-term improvement would be to invoke aie-translate for
+          #   an authoritative tile list, but the regex covers every test
+          #   currently in the suite. Tracked in docs/superpowers/findings/
           #   2026-04-28-aie-translate-tile-discovery-followup.md
           local mlir_src="$src_dir/aie.mlir"
           local tile_spec=""
           if [[ -f "$mlir_src" ]]; then
             tile_spec="$(grep -v '^[[:space:]]*//' "$mlir_src" \
               | grep -oP 'aie\.tile\(\K[0-9]+,\s*[0-9]+(?=\))' \
-              | awk -F',' '{ col=$1; row=$2+0; if(row>=2) { printf "%s%d:%d:core", sep, col, row; sep="," } else if(row==1) { printf "%s%d:%d:memtile", sep, col, row; sep="," } else if(row==0) { printf "%s%d:%d:shim", sep, col, row; sep="," } }' \
+              | awk -F',' '{ col=$1; row=$2+0; if(row>=2) { printf "%s%d:%d:core,%d:%d:memmod", sep, col, row, col, row; sep="," } else if(row==1) { printf "%s%d:%d:memtile", sep, col, row; sep="," } else if(row==0) { printf "%s%d:%d:shim", sep, col, row; sep="," } }' \
               | sed 's/ //g')"
           fi
           if [[ -z "$tile_spec" ]]; then

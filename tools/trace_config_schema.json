@@ -156,6 +156,15 @@
         "memtile_sweep": {
           "type": "array",
           "items": {"type": "string"}
+        },
+        "memmod_grounding": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Grounding events for the compute tile's memory-module trace unit (sibling of core trace, packet type Mem)."
+        },
+        "memmod_sweep": {
+          "type": "array",
+          "items": {"type": "string"}
         }
       }
     },

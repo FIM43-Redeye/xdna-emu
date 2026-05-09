@@ -119,6 +119,7 @@ def inject_trace_declarative(
     src_mlir: Path,
     shim_sweep_events: str | None = None,
     memtile_sweep_events: str | None = None,
+    memmod_sweep_events: str | None = None,
 ) -> tuple[str, dict]:
     """Run mlir-trace-inject.py on the MLIR text.
 
@@ -165,6 +166,12 @@ def inject_trace_declarative(
         # pattern as shim above: None leaves row-1 tiles untraced.
         if memtile_sweep_events is not None:
             cmd += ["--memtile-sweep-events", memtile_sweep_events]
+        # Opt-in memmod trace injection (stage 3 / #374). Same pattern: None
+        # leaves the compute tile's memory-module trace unit alone; any
+        # non-None value emits a second aie.trace decl per compute tile
+        # alongside the core decl.
+        if memmod_sweep_events is not None:
+            cmd += ["--memmod-sweep-events", memmod_sweep_events]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
             raise RuntimeError(
@@ -226,6 +233,7 @@ def prepare_trace(
     trace_quarantine_path: Path,
     shim_sweep_events: str | None = None,
     memtile_sweep_events: str | None = None,
+    memmod_sweep_events: str | None = None,
 ) -> int:
     """Run the trace preparation pipeline.
 
@@ -311,6 +319,7 @@ def prepare_trace(
                 src_mlir=test_dir / "aie.mlir",
                 shim_sweep_events=shim_sweep_events,
                 memtile_sweep_events=memtile_sweep_events,
+                memmod_sweep_events=memmod_sweep_events,
             )
         except Exception as e:
             msg = f"FAIL trace injection: {e}"
@@ -446,6 +455,15 @@ def main():
              "Default (None) leaves row-1 tiles untraced. Pass 'all' (or a "
              "comma-separated event list) to inject memtile DMA-port trace ops.",
     )
+    parser.add_argument(
+        "--memmod-sweep-events",
+        default=None,
+        help="forward through to mlir-trace-inject's --memmod-sweep-events. "
+             "Default (None) leaves the compute-tile memory-module trace "
+             "unit alone. Pass 'all' (or a comma-separated event list) to "
+             "inject a second aie.trace decl per compute tile (memmod) "
+             "alongside its core trace.",
+    )
     args = parser.parse_args()
 
     test_dir = args.test_dir.resolve()
@@ -474,6 +492,7 @@ def main():
         trace_quarantine_path=trace_quarantine,
         shim_sweep_events=args.shim_sweep_events,
         memtile_sweep_events=args.memtile_sweep_events,
+        memmod_sweep_events=args.memmod_sweep_events,
     )
     sys.exit(rc)
 

@@ -335,6 +335,115 @@ def test_memtile_injection_in_trace_config(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Memmod injection (#374 / Stage 3)
+# ---------------------------------------------------------------------------
+
+
+def test_memmod_injection_default_off(tmp_path):
+    """Without --memmod-sweep-events, compute tiles must NOT receive a
+    second (memmod) aie.trace decl. Stage 3 must preserve pre-#374
+    behaviour for callers that haven't opted in.
+    """
+    out = tmp_path / "out.mlir"
+    r = _run(["--input", str(UNTRACED), "--out", str(out)])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    result = out.read_text()
+    # Core decl present.
+    assert "@trace_t0_2" in result
+    # Memmod decl absent.
+    assert "@trace_mem_0_2" not in result, (
+        f"memmod decl leaked without opt-in flag:\n{result}"
+    )
+    # Compute tile should appear exactly once in the trace_config (kind=core,
+    # module=core), NOT twice with module=mem.
+    cfg_path = out.with_name("trace_config.json")
+    if cfg_path.exists():
+        import json
+        cfg = json.loads(cfg_path.read_text())
+        compute_entries = [
+            t for t in cfg["tiles_traced"]
+            if t["kind"] == "core"
+        ]
+        assert len(compute_entries) == 1, (
+            f"expected 1 compute entry, got {compute_entries}"
+        )
+        assert compute_entries[0].get("module") == "core"
+
+
+def test_memmod_injection_with_sweep_flag(tmp_path):
+    """With --memmod-sweep-events all, every compute tile should get a
+    second aie.trace decl alongside its core decl, with packet type Mem
+    and the 8 default memmod events (DMA START_TASKs + bank conflicts +
+    edge detection)."""
+    out = tmp_path / "out.mlir"
+    r = _run([
+        "--input", str(UNTRACED),
+        "--out", str(out),
+        "--memmod-sweep-events", "all",
+    ])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    result = out.read_text()
+
+    # Both decls land on the same compute tile (0,2): core + memmod.
+    assert "@trace_t0_2" in result, "core decl missing"
+    assert "@trace_mem_0_2" in result, (
+        f"memmod decl missing:\n{result}"
+    )
+    # Packet type for memmod is `mem` (the dialect lowercases the enum).
+    assert "type = mem" in result, "memmod packet type missing"
+    # All 8 memmod default events should appear.
+    for ev in (
+        "DMA_S2MM_0_START_TASK", "DMA_MM2S_0_START_TASK",
+        "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1",
+        "CONFLICT_DM_BANK_2", "CONFLICT_DM_BANK_3",
+        "EDGE_DETECTION_EVENT_0", "EDGE_DETECTION_EVENT_1",
+    ):
+        assert ev in result, f"memmod default event {ev!r} missing"
+    # Memmod uses GenericEvents only, no aie.trace.port slot bindings.
+    # The fixture has no shim/memtile injection, so any aie.trace.port
+    # in the output would be unexpected.
+    assert "aie.trace.port" not in result, (
+        "memmod injection should not emit trace.port ops"
+    )
+    # Runtime sequence must reference the memmod sym in start_config.
+    assert "aie.trace.start_config @trace_mem_0_2" in result, (
+        "runtime_sequence missing memmod start_config"
+    )
+
+
+def test_memmod_injection_in_trace_config(tmp_path):
+    """Memmod entries must appear in trace_config.json as a second entry
+    on the same compute tile (col, row) with module='mem'."""
+    import json
+    out = tmp_path / "out.mlir"
+    cfg_path = tmp_path / "trace_config.json"
+    r = _run([
+        "--input", str(UNTRACED),
+        "--out", str(out),
+        "--memmod-sweep-events", "all",
+        "--trace-config-out", str(cfg_path),
+    ])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    cfg = json.loads(cfg_path.read_text())
+    compute_entries = [
+        t for t in cfg["tiles_traced"] if t["kind"] == "core"
+    ]
+    assert len(compute_entries) == 2, (
+        f"expected 2 compute entries (core+memmod), got {compute_entries}"
+    )
+    by_module = {t["module"]: t for t in compute_entries}
+    assert set(by_module.keys()) == {"core", "mem"}
+    # Same tile coords on both entries.
+    assert (by_module["core"]["col"], by_module["core"]["row"]) == (0, 2)
+    assert (by_module["mem"]["col"], by_module["mem"]["row"]) == (0, 2)
+    # Memmod events list mirrors the upstream defaults (8 GenericEvents).
+    assert len(by_module["mem"]["events"]) == 8
+    assert by_module["mem"]["events"][0] == "DMA_S2MM_0_START_TASK"
+    # tracing.memmod_sweep should reflect the resolved sweep when 'all'.
+    assert cfg["tracing"]["memmod_sweep"] == ["all"]
+
+
+# ---------------------------------------------------------------------------
 # Integration tests: injected MLIR survives a real aiecc.py compile
 # ---------------------------------------------------------------------------
 
