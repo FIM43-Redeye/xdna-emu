@@ -222,8 +222,201 @@ crash now fixed by `534383e`:
   sweep produced 60 chess `.sweep/` dirs that could be ingested for
   #359 calibration once the EMU side is also captured.
 
+## Continuation: 2026-05-09 evening -- read_aie_reg dead-end and the cascade we already knew about
+
+After a reboot to confirm the bug #6 repro on a clean state (TDR
+confirmed at 11s, EMU passes the same logic, system healthy), a second
+session set out to build a register-readback harness so we could see
+which DMA was stuck on which lock at hang time. The session ended in
+exactly the same SMU-wedge cascade that `2026-05-07-aie-rw-access-
+memtile-dm-half-impl.md` already documented two days earlier, and
+should have been cross-referenced before any harness work began.
+
+### What we built (and why it cannot debug bug #6 on Phoenix)
+
+`tools/aie-reg-probe/` -- a small C++ sidecar (CMake + ~280 LOC) that
+opens a hw_context, calls `force_connect`, optionally launches the
+failing kernel, and reads a curated set of memtile + shim DMA
+registers via `xrt::hw_context::read_aie_reg`.  Builds cleanly,
+links against `/opt/xilinx/xrt/lib/libxrt_coreutil.so`, runs on
+compute-tile reads.
+
+It cannot read memtile registers on Phoenix.  Per the May 7 finding,
+`MSG_OP_AIE_RW_ACCESS` (opcode 0x203) round-trips for compute-tile
+register space but **silently never responds for any memtile address**
+tested -- both memtile DM (0x10000) and memtile registers (TIMER_LOW
+at 0x940F8).  The driver kills the user-context mailbox after a 5s
+timeout and the device enters a degraded state from which `modprobe
+-r` cascades to SMU wedge and only reboot recovers.
+
+The harness still has a future: it works for compute-tile-side bugs.
+Don't throw it out, but don't aim it at the memtile, ever, on this
+firmware.
+
+### TDR knob mechanics (newly mapped)
+
+Two module parameters on `amdxdna`:
+
+- `timeout_in_sec` (default 2; 0 disables TDR).  **Honored only at
+  probe time** -- `aie2_tdr_start` checks `if (!timeout_in_sec)` and
+  skips timer setup.  Setting it to 0 at runtime via sysfs does
+  NOT stop the running timer; the next `mod_timer(t, jiffies + 0)`
+  fires immediately, DOS-firing the TDR work.  To disable TDR
+  entirely you must pass it as a module-load arg
+  (`/etc/modprobe.d/amdxdna.conf` is the right place).
+- `tdr_dump_ctx` (default 0).  **Live at runtime.**  Each TDR work
+  invocation re-reads the global; with `dump_only=true`
+  `aie2_tdr_force_recover` calls `aie2_rq_dump_all(rq)` and returns
+  -- no `stop_all`, no `restart_all`.  Hung context stays alive.
+  This is the right knob for keeping a hung kernel quiescent while
+  a debugger reads state.
+
+The TDR detect path (`aie2_tdr_work` -> `aie2_rq_dump_all` ->
+`aie2_dump_ctx`) calls `aie2_get_app_health` to retrieve a structured
+firmware health report (DPU PC, TXN OP ID, fatal error info, "timed
+out sub command ID").  We never see this block in dmesg because
+`MSG_OP_GET_APP_HEALTH` is gated -- listed in `npu4_regs.c` at FW
+6.18+, **not in `npu1_regs.c`**.  On Phoenix the call returns
+`-EOPNOTSUPP` from the gate, the `if (!ret)` guard skips the print
+block, and we get only the bare `JOB[0]: op/msg/fence` info.  That
+silence is by design of the gate, not a firmware bug.  Adding
+`MSG_OP_GET_APP_HEALTH` to `npu1_msg_op_tbl` is tempting (firmware
+might or might not have a handler), but `MSG_OP_GET_COREDUMP` was
+tried by the same path (commits `7e641c9` then `0c5d393`) and
+reverted -- proceed cautiously.
+
+### The actual cascade we walked into
+
+Sequence, captured live this session:
+
+1. Bridge test runs `memtile_dmas/dma_configure_task_lock` chess
+   `--no-trace` with `tdr_dump_ctx=0` (default).  HW TDR @ 11s.
+   Driver's `aie2_tdr_force_recover` runs `aie2_rq_stop_all +
+   aie2_rq_restart_all`.  Test exits.
+2. `xrt-smi validate` PASSES.  System looks healthy by SMI metrics.
+3. `tdr_dump_ctx=1` set via `pkexec tee
+   /sys/module/amdxdna/parameters/tdr_dump_ctx`.  Verified `Y`.
+4. `aie-reg-probe passive` against `add_one_using_dma`'s xclbin
+   tries first read on memtile (col 0, row 1, lock0_value @ 0xC0000).
+5. Mailbox req opcode 0x203 sent; firmware does not respond.
+6. After 5s, `xdna_send_msg_wait: Wait for completion timeout` ->
+   `aie2_rw_aie_reg: AIE reg read failed, ret -62`.  Driver
+   destroys the user-context mailbox channel.
+7. Probe is in D-state, eventually exits when each subsequent
+   read also `-ETIME`s.
+8. `pkexec sh -c 'modprobe -r amdxdna && modprobe amdxdna && echo
+   1 > .../tdr_dump_ctx'` is issued.  `modprobe -r` enters D-state
+   in `drm_dev_unplug` -> `__synchronize_srcu`.  No reader is
+   visibly active (`/proc/*/wchan` shows nothing else stuck), but
+   the DRM unplug SRCU grace period never completes.  modprobe
+   stuck for 7+ minutes; cannot be SIGKILL'd; only reboot recovers.
+9. The `&& modprobe amdxdna` second half never runs.  Device is
+   unbound from PCI driver, partial module state remains, `xrt-smi
+   examine` reports 0 devices.
+
+This matches the May 7 finding step-for-step.  We are now confident
+that **any memtile read attempt on Phoenix produces this cascade**
+and that **once the cascade starts, only reboot recovers** --
+including from the modprobe-r side, which itself wedges
+uninterruptibly.
+
+### Side fix that landed this session: pkexec fingerprint
+
+`pkexec` had been falling back to password despite an enrolled
+fingerprint and `pam_fprintd.so` being first in
+`/etc/pam.d/common-auth`.  Root cause: pkexec's PAM service is
+`polkit-1`; with no `/etc/pam.d/polkit-1` file the chain fell
+through to `/etc/pam.d/other` -> `common-auth`, where the chain
+starts with
+
+```
+auth [success=ignore default=1] pam_exec.so quiet \
+        /usr/local/bin/check-keyring-unlocked.sh
+```
+
+and the `default=1` skip on a non-zero exit jumps over `pam_fprintd`.
+Even when the script returned 0 (keyring unlocked, fingerprint
+allowed), some interaction in the pkexec PAM context was bypassing
+fprintd silently -- the password prompt appeared instantly with no
+fingerprint timeout.
+
+Fix: created `/etc/pam.d/polkit-1` with
+
+```
+auth      sufficient   pam_fprintd.so timeout=10 max-tries=1
+@include common-auth
+@include common-account
+@include common-password
+@include common-session-noninteractive
+```
+
+`sufficient` means fingerprint short-circuits the chain on success
+and falls through to common-auth (with its full keyring-aware
+chain) on failure.  Verified working: `pkexec true` now prompts the
+sensor first; password is the fallback if no swipe.
+
+### Plan revision for bug #6 (after the reboot)
+
+1. **Persist the TDR knob.**  Add to `/etc/modprobe.d/amdxdna.conf`,
+   joining the existing `autosuspend_ms=-1` line:
+   ```
+   options amdxdna autosuspend_ms=-1 tdr_dump_ctx=1
+   ```
+   This is general defense -- every future failing test will dump
+   on TDR rather than recover.  It does not unblock memtile reads,
+   but it stops the recover-side damage to the firmware that
+   compounds debugging.
+
+2. **Drop the `read_aie_reg` plan for memtile state.**  The May 7
+   wall is firm.  Until the Phoenix firmware grows memtile
+   `AIE_RW_ACCESS` support (or we get a non-mailbox path), memtile
+   register state is not directly readable on this hardware.
+
+3. **Pivot to MLIR-level diagnostics.**  Three options, cheapest
+   first:
+
+   - **Bisect via intermediate `aiex.npu.dma_await_task`.**  The
+     test ends with a single `dma_await_task(%t3)` on shim S2MM 0.
+     Replace with progressive awaits on `t0`, `t1`, `t2` to
+     identify which task's completion is missing when the test
+     hangs.  Cheap iteration.
+   - **Diff the runtime sequence.**  `add_one_using_dma` (passes)
+     and `dma_configure_task_lock` (TDRs) both go shim->memtile
+     ->shim with the same flow shape.  Decode `insts.bin` for both
+     via `tools/parse-trace.py --raw` and find the structural
+     delta (lock counts? BD-chain wraparound? `issue_token`
+     placement?).  EMU passes both, so EMU isn't enforcing
+     whatever HW constraint differs.
+   - **Embed `aiex.npu.read32` reads in the runtime sequence.**
+     Routes via control packets to a host BO, doesn't depend on
+     the firmware mailbox.  Reads after the hang point never
+     execute, so this is incremental: read state up to point N,
+     advance N until we find the line where state goes wrong.
+
+4. **Keep `tools/aie-reg-probe/` for compute-tile bugs.**  The
+   harness is fine for any future bug that lives in compute-tile
+   register state.  Don't throw it out; just don't aim it at
+   memtile on Phoenix.
+
+### Lessons / process notes
+
+- **Always grep findings first.**  `grep -rin AIE_RW_ACCESS
+  docs/superpowers/findings/` would have surfaced the May 7 doc
+  before any harness work this session.  Cost of skipping: one
+  reboot.
+- **Driver reload is not safe in a poisoned-mailbox state.**  The
+  CLAUDE.md operational note says "modprobe -r/+r handles most
+  TDR recoveries" -- true for default TDR-recover state, false
+  once the user mailbox has been killed.  In the killed-mailbox
+  state, modprobe -r itself wedges in `synchronize_srcu` and
+  reboot is the only path.  Update the recovery-escalation note.
+
 ## See also
 
+- `docs/superpowers/findings/2026-05-07-aie-rw-access-memtile-dm-half-impl.md`
+  -- the prior session that documented the memtile-read hang and
+  SMU-wedge cascade.  Should be cross-referenced before any
+  read_aie_reg harness work on Phoenix.
 - `docs/superpowers/findings/2026-05-06-355a-host-latency-response.md`
   -- prior #359/#355a calibration progress (the original target this
   session was supposed to advance, before the bridge test mess
