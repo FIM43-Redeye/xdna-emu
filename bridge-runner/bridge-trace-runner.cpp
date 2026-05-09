@@ -1830,36 +1830,117 @@ RunOutcome execute_run(
         // cycles. Independent of the trace controller -- diagnostic for
         // trace-induced artifacts. Stop event = 0 means counter increments
         // on every cycle the start event has fired.
-        constexpr uint32_t PERF_CTRL0_OFFSET = 0x00031500;
-        constexpr uint32_t PERF_COUNTER0_OFFSET = 0x00031520;
-        constexpr uint8_t  EVENT_ACTIVE_CORE = 0x1C;
-        if (args.read_perf_counter) {
-            try {
-                uint32_t ctrl = prep.context.read_aie_reg(
-                    args.perf_col, args.perf_row, PERF_CTRL0_OFFSET);
-                ctrl &= ~uint32_t(0x7F7F);  // clear start[6:0] and stop[14:8]
-                ctrl |= uint32_t(EVENT_ACTIVE_CORE);
-                prep.context.write_aie_reg(
-                    args.perf_col, args.perf_row, PERF_CTRL0_OFFSET, ctrl);
-                prep.context.write_aie_reg(
-                    args.perf_col, args.perf_row, PERF_COUNTER0_OFFSET, 0);
-            } catch (const std::exception& e) {
-                if (verbose) {
-                    std::fprintf(stderr,
-                        "  perf counter setup failed: %s\n", e.what());
-                }
-            }
-        }
+        //
+        // Lifecycle gotcha (#359 / 2026-05-05-aie-rw-access-firmware-actually-supported.md):
+        // hwctx->num_col is set inside the runqueue connect path, which fires
+        // off a kernel workqueue (aie2_ctx_runqueue.c::part_ctx_start) only
+        // after a kernel command has been queued. Until that workqueue runs,
+        // num_col == 0 and the partition-range check at aie2_pci.c rejects
+        // any read_aie_reg / write_aie_reg with EINVAL. So we cannot do this
+        // setup before run.start(). Instead we run.start() first, then poll
+        // read_aie_reg until it succeeds (signalling that the connect
+        // workqueue has run and the partition is allocated), then perform
+        // the writes. Race: the AIE core may have begun executing by the
+        // time setup completes -- in practice the kernel sits in pipeline
+        // fill for thousands of cycles before any ACTIVE_CORE cycle elapses,
+        // so the missed-cycles window is bounded and small relative to the
+        // measurement.
+        // Performance counter register block layout (per aie-rt
+        // xaiemlgbl_params.h). We use *counter 1*, not counter 0:
+        // mlir-trace-inject's perfcnt anchor config block writes cnt0 from
+        // the runtime sequence (via aie.trace.config -> npu.write32) every
+        // launch, which would overwrite anything we put there. cnt1 is
+        // free across the trace toolchain.
+        constexpr uint32_t PERF_CTRL0_OFFSET    = 0x00031500;
+        constexpr uint32_t PERF_CTRL2_OFFSET    = 0x00031508;
+        constexpr uint32_t PERF_COUNTER1_OFFSET = 0x00031524;
+        constexpr uint8_t  EVENT_ACTIVE_CORE    = 0x1C;
         auto k0 = std::chrono::steady_clock::now();
         run.start();
+        if (args.read_perf_counter) {
+            // Poll read_aie_reg with a short backoff until num_col is set
+            // (read succeeds) or we hit a small attempt cap. A failed read
+            // throws std::system_error / std::runtime_error from XRT;
+            // catch and retry. Cap at 50 attempts x 100us = 5ms upper bound,
+            // well below the kernel's 30s wait timeout.
+            //
+            // Lifecycle gotcha: hwctx->num_col is set by the runqueue
+            // workqueue (aie2_ctx_runqueue.c::part_ctx_start) which only
+            // fires after a kernel command is queued. Until that runs,
+            // num_col == 0 and read_aie_reg / write_aie_reg fail with
+            // EINVAL. We do run.start() first to trigger the queue, then
+            // poll for the partition to become accessible.
+            constexpr int kMaxAttempts = 50;
+            constexpr auto kBackoff = std::chrono::microseconds(100);
+            uint32_t ctrl0 = 0, ctrl2 = 0;
+            bool reads_ok = false;
+            for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+                try {
+                    ctrl0 = prep.context.read_aie_reg(
+                        args.perf_col, args.perf_row, PERF_CTRL0_OFFSET);
+                    ctrl2 = prep.context.read_aie_reg(
+                        args.perf_col, args.perf_row, PERF_CTRL2_OFFSET);
+                    reads_ok = true;
+                    break;
+                } catch (const std::exception&) {
+                    std::this_thread::sleep_for(kBackoff);
+                }
+            }
+            if (reads_ok) {
+                try {
+                    // PERF_CTRL0[22:16] = cnt1 start_event = ACTIVE_CORE
+                    // PERF_CTRL0[30:24] = cnt1 stop_event  = NONE
+                    // (preserve cnt0 fields owned by the trace anchor)
+                    ctrl0 &= ~uint32_t(0x7F7F0000);
+                    ctrl0 |= uint32_t(EVENT_ACTIVE_CORE) << 16;
+                    prep.context.write_aie_reg(
+                        args.perf_col, args.perf_row, PERF_CTRL0_OFFSET, ctrl0);
+                    // PERF_CTRL2[14:8] = cnt1 reset_event = NONE
+                    // (preserve cnt0/cnt2/cnt3 reset fields)
+                    ctrl2 &= ~uint32_t(0x7F00);
+                    prep.context.write_aie_reg(
+                        args.perf_col, args.perf_row, PERF_CTRL2_OFFSET, ctrl2);
+                    // Zero counter 1 so we measure cycles within the
+                    // post-setup -> run.wait() window.
+                    //
+                    // Caveat (residual issue, not the lifecycle bug):
+                    // because our writes land mid-launch (after the kernel
+                    // has been queued and the runtime sequence has run),
+                    // the kernel's brief ACTIVE_CORE window may overlap
+                    // our zero-write -- empirically core_cycles often
+                    // reads 0 on add_one_using_dma even though our writes
+                    // succeed. For 1-cycle-precision cycle measurement,
+                    // use trace BO PERF_CNT_0 events (anchored every 1024
+                    // cycles) plus inter-event timestamps; --read-perf-counter
+                    // remains a coarse crosscheck rather than a precise
+                    // measurement.
+                    prep.context.write_aie_reg(
+                        args.perf_col, args.perf_row, PERF_COUNTER1_OFFSET, 0);
+                } catch (const std::exception& e) {
+                    if (verbose) {
+                        std::fprintf(stderr,
+                            "  perf counter setup write failed: %s\n", e.what());
+                    }
+                }
+            } else if (verbose) {
+                std::fprintf(stderr,
+                    "  perf counter setup skipped: partition not allocated "
+                    "after %d attempts (%lldus)\n",
+                    kMaxAttempts,
+                    static_cast<long long>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            kMaxAttempts * kBackoff).count()));
+            }
+        }
         auto state = run.wait(std::chrono::seconds(30));
         auto k1 = std::chrono::steady_clock::now();
         result.kernel_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(k1 - k0).count());
         if (args.read_perf_counter) {
             try {
+                // Read counter 1 to match the cnt1-based setup above.
                 result.core_cycles = prep.context.read_aie_reg(
-                    args.perf_col, args.perf_row, PERF_COUNTER0_OFFSET);
+                    args.perf_col, args.perf_row, PERF_COUNTER1_OFFSET);
                 result.perf_ok = true;
             } catch (const std::exception& e) {
                 if (verbose) {
