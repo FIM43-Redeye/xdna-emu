@@ -1238,10 +1238,11 @@ fn mode2_notify_when_idle_is_noop() {
 
 #[test]
 fn mode2_notify_loop_boundary_emits_once_per_zol() {
-    // Phase 0 finding: HW emits exactly ONE LC frame per ZOL invocation,
-    // at loop start, with count = trip count and flag = 0. The interpreter
-    // calls notify_loop_boundary at every iteration's LE_PC; the trace_unit
-    // must dedupe and only emit on the first call.
+    // HW emits exactly ONE LC frame per ZOL invocation, at loop start,
+    // with count = trip_count mod 2^28 and flag = 1 iff trip_count >= 2^28.
+    // For a tiny ZOL (trip count = 8), flag must be 0 and count = 8. The
+    // interpreter calls notify_loop_boundary at every iteration's LE_PC;
+    // the trace_unit must dedupe and only emit on the first call.
     let mut tu = TraceUnit::new(0, 1);
     tu.set_packet_type(0);
     tu.set_mode(TraceMode::Execution);
@@ -1262,10 +1263,58 @@ fn mode2_notify_loop_boundary_emits_once_per_zol() {
     assert_eq!(lc_frames.len(), 1, "expected exactly 1 LC frame, got {:?}", lc_frames);
     match lc_frames[0] {
         super::PendingMode2Frame::Lc { flag, count } => {
-            assert_eq!(*flag, 0, "flag should be 0 (Phase 0 finding)");
+            assert_eq!(*flag, 0, "flag must be 0 for trip count < 2^28");
             assert_eq!(*count, 8, "count should equal trip count, got {}", count);
         }
         _ => unreachable!(),
+    }
+}
+
+#[test]
+fn mode2_notify_loop_boundary_overflow_flag() {
+    // LC overflow probe (2026-05-08) confirmed bit-28 is a saturated
+    // overflow flag: set iff trip_count >= 2^28. count = trip_count mod 2^28.
+    // Test the boundary cases: 2^28-1 (last clean), 2^28 (first overflow),
+    // 2^28+5 (overflow, low bits preserved), 2^29 (wraps cleanly to 0).
+    let cases: &[(u32, u8, u32)] = &[
+        ((1 << 28) - 1, 0, (1 << 28) - 1), // 0x0FFFFFFF: flag=0, count=0xFFFFFFF
+        (1 << 28, 1, 0),                   // 0x10000000: flag=1, count=0
+        ((1 << 28) + 5, 1, 5),             // 0x10000005: flag=1, count=5
+        (1 << 29, 1, 0),                   // 0x20000000: flag=1, count=0 again
+        ((1 << 29) + 5, 1, 5),             // 0x20000005: flag=1, count=5
+    ];
+
+    for &(trip, want_flag, want_count) in cases {
+        let mut tu = TraceUnit::new(0, 1);
+        tu.set_packet_type(0);
+        tu.set_mode(TraceMode::Execution);
+        tu.set_event_slot(0, 1);
+        tu.set_start_event(1);
+        force_start(&mut tu, 1);
+
+        // First call sets up the ZOL; subsequent calls must not re-emit.
+        // We don't need to walk the full count -- one call is enough to
+        // exercise the flag/count computation.
+        tu.notify_loop_boundary(0, trip, trip.saturating_sub(1));
+
+        let lc = tu
+            .pending_mode2_frames
+            .iter()
+            .find_map(|f| match f {
+                super::PendingMode2Frame::Lc { flag, count } => Some((*flag, *count)),
+                _ => None,
+            })
+            .expect("expected an LC frame");
+        assert_eq!(
+            lc,
+            (want_flag, want_count),
+            "trip={:#x}: expected flag={}, count={:#x}; got flag={}, count={:#x}",
+            trip,
+            want_flag,
+            want_count,
+            lc.0,
+            lc.1,
+        );
     }
 }
 

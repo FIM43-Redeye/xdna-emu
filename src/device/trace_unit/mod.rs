@@ -116,13 +116,18 @@ enum PendingMode2Frame {
     Lc { flag: u8, count: u32 },
 }
 
-// Mode-2 LC frame bit-28 ("flag") is held at 0 by HW for all observed
-// normal ZOL executions on Phoenix (NPU1, AIE2). 576 LC frames captured
-// across N in {1,2,4,8,16,64,256,1024,16384} -- zero flag=1 sightings.
-// See docs/superpowers/findings/2026-04-30-mode2-lc-flag-semantics.md.
-// The exact trigger for flag=1 is unknown; nested-loop save/restore and
-// branch-out-of-loop are the leading suspects but were not reproduced
-// in our fixtures.
+// Mode-2 LC frame bit-28 ("flag") is the 28-bit-overflow saturation
+// indicator: set iff the trip count loaded into LC at ZOL start has any
+// bit at position >= 28. Equivalently, set iff trip_count >= 2^28; the
+// 28-bit count field carries trip_count mod 2^28. Single saturated bit,
+// not a multi-overflow counter.
+//
+// Empirical confirmation: Phase 0 (2026-04-30) at N <= 16384 always
+// flag=0; LC overflow probe (2026-05-08) flipped flag=1 at exactly
+// N >= 2^28 and confirmed the count wraps cleanly modulo 2^28 through
+// 2^29+5.
+//   docs/superpowers/findings/2026-04-30-mode2-lc-flag-semantics.md
+//   docs/superpowers/findings/2026-05-08-lc-overflow-empirical.md
 
 /// Hardware trace unit for one tile module (Core or Memory).
 ///
@@ -651,19 +656,19 @@ impl TraceUnit {
     /// Mode-2 only: called at every ZOL iteration's LE_PC boundary.
     ///
     /// HW emits exactly one LC frame per ZOL invocation -- at the first
-    /// iteration -- with `count` set to the trip count loaded into LC at
-    /// loop start (the value `lc_before` carries on the first call) and
-    /// `flag` always 0. Subsequent iterations of the same ZOL produce
-    /// no LC frame; the per-cycle E_atom / N_atom stream already records
-    /// the body's execution. See
-    /// docs/superpowers/findings/2026-04-30-mode2-lc-flag-semantics.md.
+    /// iteration -- with `count` = trip_count mod 2^28 (the low 28 bits
+    /// of `lc_before` on the first call) and `flag` = 1 iff trip_count
+    /// has any bit at position >= 28 (i.e. trip_count >= 2^28). Subsequent
+    /// iterations of the same ZOL produce no LC frame; the per-cycle
+    /// E_atom / N_atom stream already records the body's execution.
     pub fn notify_loop_boundary(&mut self, _cycle: u64, lc_before: u32, lc_after: u32) {
         if !self.is_mode2_running() {
             return;
         }
         if !self.mode2_zol_active {
-            let count = lc_before & 0x0FFFFFFF;
-            self.pending_mode2_frames.push(PendingMode2Frame::Lc { flag: 0, count });
+            let count = lc_before & 0x0FFF_FFFF;
+            let flag = (lc_before >> 28 != 0) as u8;
+            self.pending_mode2_frames.push(PendingMode2Frame::Lc { flag, count });
             self.mode2_zol_active = true;
         }
         if lc_after == 0 {
@@ -1080,9 +1085,9 @@ impl TraceUnit {
     /// 1-bit flag + 28-bit count = 32-bit total.
     ///
     /// Aligns to word boundary via Filler0 padding before emitting.
-    /// The flag bit's semantics are pinned by Phase 0 reverse-engineering
-    /// (see docs/superpowers/findings/2026-04-29-mode2-lc-flag-semantics.md
-    /// when Phase 0 lands).
+    /// Flag = 1 iff trip count >= 2^28 (28-bit-overflow saturation);
+    /// count = trip_count mod 2^28. See
+    /// docs/superpowers/findings/2026-05-08-lc-overflow-empirical.md.
     fn encode_lc(&mut self, flag: u8, count: u32) {
         debug_assert!(flag <= 1, "LC flag must be 0 or 1");
         debug_assert!(count < (1u32 << 28), "LC count exceeds 28 bits");

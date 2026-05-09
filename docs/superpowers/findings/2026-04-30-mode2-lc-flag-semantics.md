@@ -275,6 +275,12 @@ single-pass tiny kernels.**
 
 ## Why Peano builds didn't trace
 
+> **2026-05-08 correction:** This section misdiagnosed the symptom.
+> See `docs/superpowers/findings/2026-05-08-mode2-flush-and-peano-non-bug.md`
+> for the corrected analysis.
+>
+> Original claim below preserved as the historical reasoning:
+
 A side discovery: building our fixture with Peano (the calibration
 choice in the original `tools/mode2_capture_fixtures/README.md`)
 produces an empty trace BO regardless of mode. The full bridge test
@@ -288,6 +294,21 @@ If Peano-traced builds matter for other workflows, the broken path is
 between aiecc.py's lowering and the trace shim DMA setup -- the
 runtime_sequence's Trace_Control0 register write looks correct, but
 no atom data ever reaches the BO. Investigation deferred.
+
+**What was actually happening:** Phase 0 only tested with `--mode2`
+(inst_exec). Mode-2 records core execution activity (E_atom/N_atom
+per cycle, branches, LC frames) -- *not* slot events the way modes 0
+and 1 do. Single-pass tiny kernels don't generate the >= 28 bytes
+needed to push one packet through the trace controller, so the
+partial buffer drops on the stop broadcast. The same pathology
+applies to **Chess** under the same conditions; we didn't notice
+because all our reproducible captures used `heavy_zol`'s 64-pass
+wrapper, which generates plenty of execution activity.
+
+Modes 0 and 1 work fine on Peano single-pass kernels (event_time:
+64 bytes; event_pc: 128 bytes). The new default trace mode in
+`mlir-trace-inject.py` is event_pc precisely because it's reliable
+on tiny kernels.
 
 ## Public discussion
 

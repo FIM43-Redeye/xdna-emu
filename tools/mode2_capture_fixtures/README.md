@@ -19,12 +19,25 @@ for the full empirical record and follow-on doc-search results.
 The methodology below is preserved as the template for future Phase-0-style
 hypothesis tests on undocumented HW behavior.
 
-> **Important build note**: Peano-traced builds produce empty trace BOs
-> (the trace shim DMA setup misbehaves under `--no-xchesscc --no-xbridge`).
-> The working path captured by Phase 0 was **Chess-built kernel.o + chess
-> aiecc with `--xchesscc --xbridge`**. The build script below uses Peano
-> by default; for trace captures, build with Chess (compile kernel.cc via
-> `xchesscc_wrapper aie2`, drop the `--no-` flags from aiecc).
+> **Build notes (2026-05-08 update)**:
+>
+> - **Mode-2 single-pass kernels capture zero trace bytes on both Peano
+>   and Chess.** Mode-2 records core execution (atoms, branches, LC
+>   frames), not slot events; tiny single-pass kernels generate < 28
+>   bytes -- below the trace controller's packet threshold -- so the
+>   partial buffer is dropped on the stop broadcast. This is HW
+>   behaviour, not a Peano bug. Modes 0 (event_time) and 1 (event_pc)
+>   capture cleanly even on single-pass kernels because slot events fire
+>   trace frames directly.
+> - **For mode-2 captures, use a multi-pass wrapper**, like `heavy_zol`
+>   (64 outer passes) or `lc_overflow_probe` (4-pass / runtime-driven).
+>   Both Peano and Chess work for these.
+> - **Cross-toolchain mixing was the original "Peano broken" bug.**
+>   Compiling kernel.cc with Peano clang while linking with Chess
+>   xbridge crashes the linker (NULL deref). The current `build_fixture.sh`
+>   compiles kernel.cc with whichever toolchain `--chess` or peano-default
+>   selects. See `docs/superpowers/findings/2026-05-08-mode2-flush-and-peano-non-bug.md`
+>   for the full corrected analysis.
 
 ## Why Peano kernels (not iron API)
 
