@@ -3152,7 +3152,7 @@ main() {
   # where row >= 2 (compute rows) and formats them as col:row:core.  If no
   # compute tiles are found the test is skipped with a warning.
   #
-  # Grounding: PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1 (default for mode-1).
+  # Grounding: PERF_CNT_2,INSTR_EVENT_0,INSTR_EVENT_1 (default for mode-1).
   # The sweep uses --reuse-ctx to cut per-batch latency on Phoenix.
   #
   # Mode-2 baseline (Phase 6 / Task 6.2):
@@ -3248,7 +3248,7 @@ main() {
               --tiles "$tile_spec"
               --out-dir "$sweep_dir"
               --mode event_pc
-              --core-grounding "PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1"
+              --core-grounding "PERF_CNT_2,INSTR_EVENT_0,INSTR_EVENT_1"
               --reuse-ctx
             )
             # Mode-2 baseline capture: trace-sweep.py defaults this on, but

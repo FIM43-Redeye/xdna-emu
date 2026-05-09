@@ -672,31 +672,34 @@ class TestMlirTraceInjectPerfcnt:
     """Tests for perfcnt config block emission (Task 4.5 / 4.6)."""
 
     def test_inject_perfcnt_config_emitted(self, tmp_path, simple_design_mlir):
-        """When PERF_CNT_0 is in grounding, a perf_core_<col>_<row> config block
-        is emitted with Performance_Counter0_Event_Value set to --perfcnt-period."""
+        """When PERF_CNT_2 is in grounding, a perf_core_<col>_<row> config block
+        is emitted with Performance_Counter2_Event_Value set to --perfcnt-period.
+
+        Counter 2 (not counter 0) is the trace anchor since the cnt2 move (#377);
+        userspace tools rely on counters 0/1 staying untouched."""
         inp = tmp_path / "in.mlir"
         inp.write_text(simple_design_mlir)
         out = tmp_path / "out.mlir"
         rc = run_inject([
             "--input", str(inp), "--out", str(out),
             "--trace-mode", "event_pc",
-            "--core-grounding", "PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1",
+            "--core-grounding", "PERF_CNT_2,INSTR_EVENT_0,INSTR_EVENT_1",
             "--perfcnt-period", "1024",
         ])
         assert rc == 0
         text = out.read_text()
         # At least one perf_core_<col>_<row> trace.config block:
         assert "@perf_core_" in text, f"No perf_core_ block found:\n{text[:2000]}"
-        # Performance_Counter0_Event_Value with value=1024:
-        assert "Performance_Counter0_Event_Value" in text
+        # Performance_Counter2_Event_Value with value=1024:
+        assert "Performance_Counter2_Event_Value" in text
         assert "1024" in text
         # Referenced in start_config list in runtime_sequence:
         assert "aie.trace.start_config @perf_core_" in text
 
-    def test_inject_perfcnt_not_emitted_without_perf_cnt_0(
+    def test_inject_perfcnt_not_emitted_without_perf_cnt_2(
         self, tmp_path, simple_design_mlir
     ):
-        """When PERF_CNT_0 is absent from grounding, no perf_core_ block is emitted."""
+        """When PERF_CNT_2 is absent from grounding, no perf_core_ block is emitted."""
         inp = tmp_path / "in.mlir"
         inp.write_text(simple_design_mlir)
         out = tmp_path / "out.mlir"
@@ -711,7 +714,7 @@ class TestMlirTraceInjectPerfcnt:
     def test_inject_perfcnt_default_grounding_emits_block(
         self, tmp_path, simple_design_mlir
     ):
-        """Default --core-grounding includes PERF_CNT_0, so perf block is emitted
+        """Default --core-grounding includes PERF_CNT_2, so perf block is emitted
         even with no explicit grounding flags."""
         inp = tmp_path / "in.mlir"
         inp.write_text(simple_design_mlir)
@@ -724,16 +727,18 @@ class TestMlirTraceInjectPerfcnt:
     def test_inject_perfcnt_uses_correct_registers(
         self, tmp_path, simple_design_mlir
     ):
-        """The perfcnt block must reference Performance_Control2 (not _Control1)
-        for Cnt0_Reset_Event, and must NOT use field= on Performance_Control{0,2}.
+        """The perfcnt block must write the cnt2-side registers and must NOT use
+        field= on Performance_Control{1,2}.
 
         Per aie-rt xaiemlgbl_params.h:
-          - Performance_Control0 holds Cnt0_Start_Event at bits[6:0]  (event 28).
-          - Performance_Control2 holds Cnt0_Reset_Event at bits[6:0]  (event 5).
+          - Performance_Control1 holds Cnt2_Start_Event at bits[6:0]   (event 28).
+          - Performance_Control2 holds Cnt2_Reset_Event at bits[22:16] (event 7).
+        We do NOT touch Performance_Control0 -- that holds cnt0 start/stop
+        fields, which we deliberately leave alone so userspace can use cnt0/cnt1.
         The aie_registers_aie2.json regdb has NO named bitfields for these
         registers, so `aie.trace.reg ... field="..."` would fail at lower-time
-        with "Field not found in register: ...".  This test pins the
-        regression fix from gate-A.2 Task 9.
+        with "Field not found in register: ..." -- this pins the regression
+        fix from gate-A.2 Task 9.
         """
         inp = tmp_path / "in.mlir"
         inp.write_text(simple_design_mlir)
@@ -741,24 +746,28 @@ class TestMlirTraceInjectPerfcnt:
         rc = run_inject([
             "--input", str(inp), "--out", str(out),
             "--trace-mode", "event_pc",
-            "--core-grounding", "PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1",
+            "--core-grounding", "PERF_CNT_2,INSTR_EVENT_0,INSTR_EVENT_1",
             "--perfcnt-period", "2048",
         ])
         assert rc == 0
         text = out.read_text()
 
-        # Cnt0_Reset_Event lives in Performance_Control2 on the core module.
+        # Cnt2_Start_Event lives in Performance_Control1 on the core module.
+        assert "Performance_Control1" in text, (
+            "Performance_Control1 must be written for Cnt2_Start_Event"
+        )
+        # Cnt2_Reset_Event lives in Performance_Control2 on the core module.
         assert "Performance_Control2" in text, (
-            "Performance_Control2 must be written for Cnt0_Reset_Event"
+            "Performance_Control2 must be written for Cnt2_Reset_Event"
         )
-        # Performance_Control1 must NOT be written -- that was the original bug
-        # (Cnt0_Reset_Event isn't in _Control1 on the core module).
-        assert "Performance_Control1" not in text, (
-            "Performance_Control1 must not be written; Cnt0_Reset_Event is in "
-            "Performance_Control2 on the core module per aie-rt headers"
+        # Performance_Control0 must NOT be written -- that holds cnt0 fields,
+        # which we leave alone so userspace can use cnt0 freely.
+        assert "Performance_Control0" not in text, (
+            "Performance_Control0 must not be written; cnt0 must remain "
+            "available to userspace tools after the cnt2 move (#377)"
         )
-        # Performance_Counter0_Event_Value must reflect --perfcnt-period.
-        assert "Performance_Counter0_Event_Value" in text
+        # Performance_Counter2_Event_Value must reflect --perfcnt-period.
+        assert "Performance_Counter2_Event_Value" in text
         assert "2048" in text
         # The perf trace.reg ops must NOT carry field= on Performance_Control{0,2}
         # -- the regdb has no named fields for those registers, and field=

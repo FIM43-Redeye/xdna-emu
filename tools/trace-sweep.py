@@ -1442,10 +1442,10 @@ def sweep_multi(
 
 
 _GROUNDING_BY_TILE_TYPE = {
-    "core":    "PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1",
-    "memmod":  "PERF_CNT_0",
-    "memtile": "PERF_CNT_0",
-    "shim":    "PERF_CNT_0",
+    "core":    "PERF_CNT_2,INSTR_EVENT_0,INSTR_EVENT_1",
+    "memmod":  "PERF_CNT_2",
+    "memtile": "PERF_CNT_2",
+    "shim":    "PERF_CNT_2",
 }
 
 _MODE_INT = {
@@ -2035,14 +2035,14 @@ def main() -> int:
                     help="trace mode for compute-core trace units; "
                          "matches mlir-trace-inject's --trace-mode")
     ap.add_argument("--core-grounding",
-                    default="PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1",
+                    default="PERF_CNT_2,INSTR_EVENT_0,INSTR_EVENT_1",
                     help="grounding events reserved in fixed slots per batch "
                          "(cores). Comma-separated event names.")
-    ap.add_argument("--memmod-grounding", default="PERF_CNT_0",
+    ap.add_argument("--memmod-grounding", default="PERF_CNT_2",
                     help="grounding events for memmod trace units")
-    ap.add_argument("--memtile-grounding", default="PERF_CNT_0",
+    ap.add_argument("--memtile-grounding", default="PERF_CNT_2",
                     help="grounding events for memtile trace units")
-    ap.add_argument("--shim-grounding", default="PERF_CNT_0",
+    ap.add_argument("--shim-grounding", default="PERF_CNT_2",
                     help="grounding events for shim trace units")
     ap.add_argument("--core-sweep", default="all",
                     help="comma-separated event names to sweep on cores; "
@@ -2130,10 +2130,10 @@ def main() -> int:
             # because --mode is event_time and tiles are same-type, the
             # flags are silently ignored. Warn once so the typo is caught.
             _lockstep_only_set = (
-                args.core_grounding != "PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1"
-                or args.memmod_grounding != "PERF_CNT_0"
-                or args.memtile_grounding != "PERF_CNT_0"
-                or args.shim_grounding != "PERF_CNT_0"
+                args.core_grounding != "PERF_CNT_2,INSTR_EVENT_0,INSTR_EVENT_1"
+                or args.memmod_grounding != "PERF_CNT_2"
+                or args.memtile_grounding != "PERF_CNT_2"
+                or args.shim_grounding != "PERF_CNT_2"
                 or args.core_sweep != "all"
                 or args.memmod_sweep != "all"
                 or args.memtile_sweep != "all"

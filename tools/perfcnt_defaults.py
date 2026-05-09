@@ -6,7 +6,7 @@ The Rust counterpart lives in `src/trace/compare.rs` as
 
 
 DEFAULT_PERFCNT_PERIOD = 1024
-"""Default cycles between PERF_CNT_0 overflows.
+"""Default cycles between PERF_CNT_2 overflows.
 
 Used by `mlir-trace-inject.py` when `--perfcnt-period` is not specified
 and by `trace-sweep.py` for the same flag.  `trace-compare`'s Rust side

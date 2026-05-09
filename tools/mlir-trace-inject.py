@@ -261,33 +261,35 @@ def parse_args():
 
     # Grounding events (fixed slots, always present, never overwritten by sweep).
     p.add_argument("--core-grounding",
-                   default="PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1",
+                   default="PERF_CNT_2,INSTR_EVENT_0,INSTR_EVENT_1",
                    help="comma-separated event names reserved in fixed slots "
                         "of every compute-core trace unit. Default reserves "
-                        "perfcnt cycle clock + two software pin events.")
+                        "perfcnt cycle clock (PERF_CNT_2 from counter 2) plus "
+                        "two software pin events. Counter 2 is used so "
+                        "userspace tools can keep using counters 0/1.")
     p.add_argument("--memmod-grounding", default="",
                    help="grounding events for compute-tile memmod trace unit. "
                         "Default is empty so all 8 default memmod sweep events "
-                        "fit. PERF_CNT_0 here is NOT useful today: the inject "
+                        "fit. PERF_CNT_* here is NOT useful today: the inject "
                         "tool emits no memmod performance counter config, so "
                         "the slot would be reserved for an event that never "
-                        "fires. Pass --memmod-grounding PERF_CNT_0 explicitly "
+                        "fires. Pass --memmod-grounding PERF_CNT_2 explicitly "
                         "once memmod perfcnt support lands.")
     p.add_argument("--memtile-grounding", default="",
                    help="grounding events for memtile trace unit. Default is "
                         "empty so all 8 default memtile sweep events fit. "
-                        "PERF_CNT_0 is NOT a useful memtile grounding today: "
+                        "PERF_CNT_* is NOT a useful memtile grounding today: "
                         "the inject tool emits no memtile performance counter "
                         "config, so the slot would be reserved for an event "
-                        "that never fires. Pass --memtile-grounding PERF_CNT_0 "
+                        "that never fires. Pass --memtile-grounding PERF_CNT_2 "
                         "explicitly once memtile perfcnt support lands.")
     p.add_argument("--shim-grounding", default="",
                    help="grounding events for shim PL trace unit. Default is "
                         "empty so all 8 default shim sweep events fit. "
-                        "PERF_CNT_0 is NOT a useful shim grounding today: "
+                        "PERF_CNT_* is NOT a useful shim grounding today: "
                         "the inject tool emits no shim performance counter "
                         "config, so the slot would be reserved for an event "
-                        "that never fires. Pass --shim-grounding PERF_CNT_0 "
+                        "that never fires. Pass --shim-grounding PERF_CNT_2 "
                         "explicitly once shim perfcnt support lands.")
 
     # Sweep events (rotated per batch; injection writes the initial pattern).
@@ -316,8 +318,8 @@ def parse_args():
                         "START/FINISHED + S2MM_0/1 STREAM_STARVATION).")
 
     p.add_argument("--perfcnt-period", type=int, default=DEFAULT_PERFCNT_PERIOD,
-                   help=f"cycles between PERF_CNT_0_EVENT fires when grounding "
-                        f"includes PERF_CNT_0 (default: {DEFAULT_PERFCNT_PERIOD}).")
+                   help=f"cycles between PERF_CNT_2 fires when grounding "
+                        f"includes PERF_CNT_2 (default: {DEFAULT_PERFCNT_PERIOD}).")
 
     p.add_argument("--trace-config-out", type=Path, default=None,
                    help="path to write trace_config.json (single source of "
@@ -402,17 +404,22 @@ def _emit_perfcnt_config(
     row: int,
     period: int,
 ) -> str:
-    """Emit an aie.trace.config block that programs the performance counter.
+    """Emit an aie.trace.config block that programs performance counter 2.
 
     The config block contains three aie.trace.reg ops:
-      Performance_Control0  raw = 28  (Cnt0_Start_Event = 28 = ACTIVE, bits[6:0])
-      Performance_Control2  raw = 5   (Cnt0_Reset_Event = 5 = PERF_CNT_0, bits[6:0])
-      Performance_Counter0_Event_Value = period (cycles between fires)
+      Performance_Control1  raw = 28        (Cnt2_Start_Event = 28 = ACTIVE, bits[6:0])
+      Performance_Control2  raw = 0x00070000 (Cnt2_Reset_Event = 7 = PERF_CNT_2, bits[22:16])
+      Performance_Counter2_Event_Value = period (cycles between fires)
+
+    Counter 2 (not counter 0) is used as the trace anchor.  Counters 0 and 1
+    are left untouched so userspace tools (e.g. bridge-trace-runner's
+    ``--read-perf-counter``) can use them without colliding with the trace
+    anchor's full-32-bit register writes.
 
     Hardware derivation (aie-rt xaiemlgbl_params.h):
-      - Performance_Control0 Cnt0_Start_Event at bits[6:0]: event 28 = ACTIVE,
+      - Performance_Control1 Cnt2_Start_Event at bits[6:0]: event 28 = ACTIVE,
         counts only while core is executing.
-      - Performance_Control2 Cnt0_Reset_Event at bits[6:0]: event 5 = PERF_CNT_0,
+      - Performance_Control2 Cnt2_Reset_Event at bits[22:16]: event 7 = PERF_CNT_2,
         self-resets the counter on every fire.
       - Period = user-specified via --perfcnt-period (default
         DEFAULT_PERFCNT_PERIOD from tools/perfcnt_defaults.py).
@@ -421,17 +428,22 @@ def _emit_perfcnt_config(
     (aie_registers_aie2.json), so field= cannot be used with mlir-aie's
     AIETraceRegPackWritesPass -- it would fail with "Field not found in register".
     We write raw integer values instead; the AIEXInlineTraceConfig pass generates
-    a full-register write32 with the value placed at bits[6:0] (the pre-shifted
-    raw encoding for these start/reset event fields).
+    a full-register write32 with the pre-shifted value.
 
     The correct register mapping per aie-rt (XAIEMLGBL_CORE_MODULE_PERFORMANCE_*):
       Performance_Control0: Cnt0_Start_Event [6:0], Cnt0_Stop_Event [15:8],
                             Cnt1_Start_Event [22:16], Cnt1_Stop_Event [31:24]
+      Performance_Control1: Cnt2_Start_Event [6:0], Cnt2_Stop_Event [15:8],
+                            Cnt3_Start_Event [22:16], Cnt3_Stop_Event [31:24]
       Performance_Control2: Cnt0_Reset_Event [6:0], Cnt1_Reset_Event [15:8],
                             Cnt2_Reset_Event [22:16], Cnt3_Reset_Event [31:24]
 
     Lowering: mlir-aie's AIEXInlineTraceConfig pass translates each trace.reg
-    into npu.write32 ops in the runtime sequence. No new dialect ops required.
+    into npu.write32 ops in the runtime sequence.  Because that lowering is
+    full-32-bit, our writes still clobber cnt3 fields in PERF_CTRL1 and
+    cnt0/cnt1/cnt3 reset fields in PERF_CTRL2 -- the longer-term fix is an
+    upstream maskwrite32 patch (tracked in #377 follow-up).  Picking cnt2
+    keeps the userspace-popular counters (0 and 1) coexistence-clean today.
 
     Returns:
         The symbol name of the emitted trace.config op.
@@ -448,15 +460,17 @@ def _emit_perfcnt_config(
     cfg_region = cfg.operation.regions[0]
     cfg_block = cfg_region.blocks.append()
     with InsertionPoint.at_block_begin(cfg_block):
-        # Cnt0_Start_Event = 28 (ACTIVE) at bits[6:0] of Performance_Control0.
-        # Raw value 28 writes only the LSB 7 bits; stop_event=0, cnt1 fields=0.
+        # Cnt2_Start_Event = 28 (ACTIVE) at bits[6:0] of Performance_Control1.
+        # Raw value 28 writes only the LSB 7 bits; stop_event=0, cnt3 fields=0.
         # field= is NOT used: the aie2 regdb has no named fields for these regs.
-        aied.trace_reg("Performance_Control0", mk_i32(28))
-        # Cnt0_Reset_Event = 5 (PERF_CNT_0) at bits[6:0] of Performance_Control2.
+        aied.trace_reg("Performance_Control1", mk_i32(28))
+        # Cnt2_Reset_Event = 7 (PERF_CNT_2) at bits[22:16] of Performance_Control2.
         # Counter resets itself every `period` active cycles (self-reset loop).
-        aied.trace_reg("Performance_Control2", mk_i32(5))
-        # Counter threshold: fires every `period` active cycles.
-        aied.trace_reg("Performance_Counter0_Event_Value", mk_i32(period))
+        # Other counter reset fields are zeroed (no-event), but those weren't
+        # configured by us anyway.
+        aied.trace_reg("Performance_Control2", mk_i32(7 << 16))
+        # Counter 2 threshold: fires PERF_CNT_2 every `period` active cycles.
+        aied.trace_reg("Performance_Counter2_Event_Value", mk_i32(period))
         # Explicit terminator required by SingleBlockImplicitTerminator<EndOp>.
         # The implicit-terminator mechanism only applies when the block is
         # created by the MLIR parser; we create it manually, so we must add
@@ -605,7 +619,7 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
           - memmod_grounding, memmod_sweep_events (live as of #374)
           - memtile_grounding, memtile_sweep_events (live as of #373)
           - shim_grounding, shim_sweep_events (live as of #372)
-          - perfcnt_period: PERF_CNT_0 firing period in cycles
+          - perfcnt_period: PERF_CNT_2 firing period in cycles
 
     Compute tile classification for npu1 / npu1_1col:
       row 0  -- shim tile (NoC interface)
@@ -621,10 +635,12 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
     work.  This is Path A (direct Python binding constructors).
 
     Perfcnt config blocks:
-    When PERF_CNT_0 is in the core grounding set, one aie.trace.config block is
+    When PERF_CNT_2 is in the core grounding set, one aie.trace.config block is
     emitted per compute tile alongside the aie.trace block.  The config block
-    programs Performance_Control0/1 and Performance_Counter0_Event_Value so the
-    hardware counter free-runs at args.perfcnt_period cycles.
+    programs Performance_Control1/2 and Performance_Counter2_Event_Value so the
+    hardware counter free-runs at args.perfcnt_period cycles.  Counter 2 is
+    used (not counter 0) so userspace tools can keep using counters 0/1 without
+    colliding with the trace anchor's full-32-bit register writes.
     mlir-aie's AIEXInlineTraceConfig pass lowers each trace.reg to npu.write32.
 
     Runtime sequence injection:
@@ -733,15 +749,15 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
         "event_pc": aied.TraceMode.EventPC,
         "inst_exec": aied.TraceMode.Execution,
     }.get(args.trace_mode, aied.TraceMode.EventTime)
-    # Whether to emit perf counter config blocks (only when PERF_CNT_0 is in grounding).
-    emit_core_perfcnt = "PERF_CNT_0" in core_grounding_names
+    # Whether to emit perf counter config blocks (only when PERF_CNT_2 is in grounding).
+    emit_core_perfcnt = "PERF_CNT_2" in core_grounding_names
 
     # Shim trace injection is opt-in. When --shim-sweep-events is unset (None)
     # we leave row-0 tiles alone, matching pre-stage-1 behavior. Any non-None
     # value (including "all") activates the shim injection path: row-0 tiles
     # get a TraceOp with packet type ShimTile, no trace_mode (shim has no
     # Mode bitfield per regdb), and no perfcnt config (shim has no
-    # Performance_Counter0 -- if --shim-grounding includes PERF_CNT_0 the
+    # Performance_Counter -- if --shim-grounding includes PERF_CNT_* the
     # slot is reserved but the event will never fire until shim perfcnt
     # support lands as its own feature).
     inject_shim = args.shim_sweep_events is not None
@@ -755,9 +771,9 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
     # --memtile-sweep-events value activates row-1 tile instrumentation:
     # TraceOp with packet type MemTile, no trace_mode (memtile has no Mode
     # bitfield per regdb), and one aie.trace.port slot config per
-    # PORT_RUNNING_<N> event. Memtile *does* expose Performance_Counter0
+    # PORT_RUNNING_<N> event. Memtile *does* expose Performance_Counter*
     # in its register space, but the perfcnt config emit path is currently
-    # core-only -- so PERF_CNT_0 in --memtile-grounding would reserve a
+    # core-only -- so PERF_CNT_* in --memtile-grounding would reserve a
     # slot for an event that never fires today (same caveat the shim
     # branch documents).
     inject_memtile = args.memtile_sweep_events is not None
