@@ -1074,12 +1074,36 @@ impl InterpreterEngine {
             // per aie-rt xaie_events_aieml.h, so core_events::PERF_CNT_0 is
             // safe to use as the base for both core and memmod perf counters.
             use xdna_archspec::aie2::trace_events::core_events::PERF_CNT_0 as PERF_CNT_BASE;
+            // TRUE (event 1) and ACTIVE_CORE (event 0x1C) are level-asserted
+            // start events on real hardware: TRUE is always asserted, and
+            // ACTIVE_CORE is asserted while the core is in Execute state.
+            // A counter configured with either as its start event needs to
+            // see the corresponding handle_event() each cycle to transition
+            // Idle->Active before the tick logic runs. Without this, the
+            // perfcnt anchor scheme emitted by mlir-trace-inject (start =
+            // ACTIVE_CORE, reset = PERF_CNT_0, threshold = period) would
+            // never fire because the counter stays stuck in Idle (#354).
+            const TRUE_EVENT: u8 = 1;
+            const ACTIVE_CORE_EVENT: u8 = 0x1C;
             let cycle = self.total_cycles;
             for (i, tile) in self.device.array.tiles.iter_mut().enumerate() {
                 tile.core_timer.tick();
                 tile.mem_timer.tick();
 
                 let core_active = self.cores.get(i).map_or(false, |c| c.active_this_cycle);
+
+                // Re-assert TRUE every cycle and ACTIVE_CORE only when the
+                // core is executing. handle_event() is idempotent: an
+                // already-Active counter stays Active; counters whose start
+                // event doesn't match are unaffected. Stop and reset events
+                // still take priority inside handle_event() per its existing
+                // ordering.
+                tile.core_perf_counters.handle_event(TRUE_EVENT);
+                if core_active {
+                    tile.core_perf_counters.handle_event(ACTIVE_CORE_EVENT);
+                }
+                tile.mem_perf_counters.handle_event(TRUE_EVENT);
+
                 let core_fired = if core_active {
                     tile.core_perf_counters.tick_active_cycles()
                 } else {
@@ -1769,14 +1793,16 @@ mod tests {
         //   start_event = TRUE (id=1), stop_event = NONE (id=0), threshold = 5.
         // write_control_start_stop(value, counter_lo, counter_hi, event_width)
         // bits [6:0]=start0, [14:8]=stop0
+        //
+        // No manual handle_event(1) here: the coordinator's Phase 3e fires
+        // TRUE every cycle into perf counter banks, which is what arms a
+        // TRUE-started counter from Idle->Active. Verifying the fix for
+        // #354 means relying on that wiring rather than poking it manually.
         {
             let tile = engine.device_mut().array.tile_mut(0, 2);
             let ctrl0 = 1u32 | (0u32 << 8); // start=TRUE(1), stop=NONE(0)
             tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
             tile.core_perf_counters.write_event_value(0, 5);
-            // Manually arm: TRUE event is always-asserted, so call handle_event(1)
-            // once to transition counter 0 into Active state.
-            tile.core_perf_counters.handle_event(1);
         }
 
         // Configure trace unit on tile (0,2) core module:
@@ -1813,6 +1839,69 @@ mod tests {
             encoded > 8,
             "trace has only {} encoded bytes (just the start marker): \
              perfcnt threshold was not routed to trace unit",
+            encoded
+        );
+    }
+
+    /// Regression for #354: a perf counter configured with start_event =
+    /// ACTIVE_CORE (the perfcnt anchor scheme that mlir-trace-inject emits)
+    /// must transition Idle->Active and reach its threshold without any
+    /// manual handle_event() poke. Before the Phase 3e wiring fix, the
+    /// counter sat in Idle forever and never fired, which is why HW
+    /// captured PERF_CNT_0 anchor pulses but EMU captured zero.
+    ///
+    /// Setup matches the mlir-trace-inject perfcnt config block on a
+    /// shorter threshold:
+    ///   Performance_Control0 = 0x1C  -> Cnt0_Start_Event = ACTIVE_CORE
+    ///   Performance_Control2 = 0x05  -> Cnt0_Reset_Event = PERF_CNT_0 (self-reset)
+    ///   Performance_Counter0_Event_Value = 5 (vs production 1024)
+    /// Then run 12 cycles and assert the trace unit recorded at least
+    /// two PERF_CNT_0 firings (the self-reset cycle gives 5-cycle period:
+    /// fires at cycle 5 and cycle 11 -- exact count depends on stop ordering).
+    #[test]
+    fn test_perfcnt_active_core_start_fires_without_manual_arm() {
+        let mut engine = InterpreterEngine::new_npu1();
+
+        engine.enable_core(0, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+            tile.write_program(0, &[0x00u8; 512]);
+        }
+
+        // Perf counter 0: start=ACTIVE_CORE(0x1C), reset=PERF_CNT_0(5), threshold=5.
+        // No manual handle_event() call -- the coordinator's Phase 3e wiring
+        // is what arms the counter. This is the bug reproducer for #354.
+        {
+            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let ctrl0 = 0x1Cu32 | (0u32 << 8); // start=ACTIVE_CORE, stop=NONE
+            tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
+            tile.core_perf_counters.write_event_value(0, 5);
+            // reset_event[0] = PERF_CNT_0 (5)
+            tile.core_perf_counters.write_control_reset(5u32, 7);
+        }
+
+        // Trace unit on tile (0,2) core: mode=0, start=TRUE(1), slot 0 = PERF_CNT_0(5).
+        {
+            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let ctrl0 = (0u32 << 24) | (1u32 << 16) | 0u32;
+            tile.core_trace.write_register(0x00, ctrl0);
+            tile.core_trace.write_register(0x10, 5u32);
+        }
+
+        // Run 12 cycles. With period=5 and self-reset, the counter should
+        // fire PERF_CNT_0 at cycle 5 and cycle 10 (5-cycle interval after
+        // reset).
+        let _cycles = engine.run(12);
+
+        // The trace unit should have encoded both PERF_CNT_0 firings as
+        // Single0 frames (1 byte each) on top of the 8-byte Start marker.
+        // Pre-fix this would be exactly 8 bytes (no firings ever land).
+        let tile = engine.device().array.tile(0, 2);
+        let encoded = tile.core_trace.encoded_bytes_len();
+        assert!(
+            encoded >= 10,
+            "expected >= 10 encoded bytes (start marker + 2x Single0 PERF_CNT_0 \
+             frames); got {} bytes -- ACTIVE_CORE-started counter never fired \
+             (#354 regression)",
             encoded
         );
     }
