@@ -201,6 +201,28 @@ XdnaEmuResult xdna_emu_load_elf(
 XdnaEmuResult xdna_emu_sync_cores(XdnaEmuHandle* handle);
 
 /**
+ * Set the partition's physical start column.
+ *
+ * CDO streams and runtime_sequence ops use partition-relative (logical)
+ * column indices; the emulator's device-state CDO applier and NPU
+ * executor shift `tile.col` by this amount to land at physical
+ * addresses.  Mirrors the xdna-driver allocator's choice from
+ * `aie_partition.start_col_list[0]`.
+ *
+ * Call this BEFORE `xdna_emu_load_pdi` if the caller wants the shift
+ * applied to the loaded CDO.  `xdna_emu_load_xclbin` sets this internally
+ * from the parsed partition section.
+ *
+ * @param handle Valid emulator handle.
+ * @param start_col Physical column the partition is relocated to (0 = no shift).
+ * @return XDNA_EMU_SUCCESS on success.
+ */
+XdnaEmuResult xdna_emu_set_start_col(
+    XdnaEmuHandle* handle,
+    uint8_t start_col
+);
+
+/**
  * Set maximum cycles for execution.
  *
  * @param handle Valid emulator handle.

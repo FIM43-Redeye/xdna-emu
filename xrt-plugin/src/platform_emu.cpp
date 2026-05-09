@@ -103,16 +103,21 @@ config_ctx_cu_config(shim_xdna::config_ctx_cu_config_arg& arg) const
   auto* conf = reinterpret_cast<const amdxdna_hwctx_param_config_cu*>(
     arg.conf_buf.data());
 
-  shim_debug("config_ctx_cu_config: ctx %u, %u CUs", arg.ctx_handle, conf->num_cus);
+  EMU_INFO("config_ctx_cu_config: ctx %u, %u CUs, start_col=%u",
+           arg.ctx_handle, conf->num_cus,
+           static_cast<unsigned>(arg.start_col));
 
   // Track CU config per context for diagnostics, and clear any
   // previously stored PDI blobs (config_ctx_cu_config can be called
-  // more than once on a context to reconfigure CUs).
+  // more than once on a context to reconfigure CUs).  Record the
+  // partition's physical start_col here so submit_cmd's PDI replay
+  // can re-apply the same shift after each reset_context.
   {
     const std::lock_guard<std::mutex> lock(m_ctx_lock);
     auto it = m_ctx_map.find(arg.ctx_handle);
     if (it != m_ctx_map.end()) {
       it->second.num_cus = conf->num_cus;
+      it->second.start_col = arg.start_col;
       it->second.pdi_blobs.clear();
     }
   }
@@ -442,13 +447,20 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
   // skip config_ctx_cu_config still get a clean reset).
   {
     std::vector<std::vector<uint8_t>> pdi_blobs_copy;
+    uint16_t ctx_start_col = 0;
     {
       const std::lock_guard<std::mutex> lock(m_ctx_lock);
       auto it = m_ctx_map.find(arg.ctx_handle);
-      if (it != m_ctx_map.end())
+      if (it != m_ctx_map.end()) {
         pdi_blobs_copy = it->second.pdi_blobs;
+        ctx_start_col = static_cast<uint16_t>(it->second.start_col);
+      }
     }
     m_transport->reset_context();
+    // reset_context wipes per-context tile state but leaves start_col
+    // intact on the emulator side; re-apply our hw_context's start_col
+    // before any load_pdi so the CDO's logical->physical shift is correct.
+    m_transport->set_start_col(static_cast<uint8_t>(ctx_start_col));
     for (const auto& blob : pdi_blobs_copy) {
       if (!blob.empty())
         m_transport->load_pdi(blob.data(), blob.size());

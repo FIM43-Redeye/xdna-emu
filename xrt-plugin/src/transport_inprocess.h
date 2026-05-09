@@ -38,6 +38,7 @@ public:
     void load_xclbin(const std::string& path,
                      uint8_t uuid_out[16]) override;
     void load_pdi(const void* data, size_t size) override;
+    void set_start_col(uint8_t start_col) override;
 
     uint64_t alloc_buffer(size_t size) override;
     void     free_buffer(uint64_t addr) override;
@@ -135,6 +136,7 @@ private:
     using fn_alloc_buffer       = uint64_t (*)(XdnaEmuHandle*, uint64_t);
     using fn_free_buffer        = Result (*)(XdnaEmuHandle*, uint64_t);
     using fn_reset_context      = Result (*)(XdnaEmuHandle*);
+    using fn_set_start_col      = Result (*)(XdnaEmuHandle*, uint8_t);
     using fn_read_register      = uint32_t (*)(XdnaEmuHandle*, uint16_t,
                                                uint16_t, uint32_t);
     using fn_write_register     = Result (*)(XdnaEmuHandle*, uint16_t,
@@ -214,6 +216,7 @@ private:
     fn_alloc_buffer       sym_alloc_buffer_       = nullptr;
     fn_free_buffer        sym_free_buffer_        = nullptr;
     fn_reset_context      sym_reset_context_      = nullptr;
+    fn_set_start_col      sym_set_start_col_      = nullptr;
     fn_read_register      sym_read_register_      = nullptr;
     fn_write_register     sym_write_register_     = nullptr;
     fn_read_tile_mem      sym_read_tile_mem_      = nullptr;

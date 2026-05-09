@@ -157,17 +157,23 @@ impl DeviceState {
     /// as parser-side semantic markers, not parallel device
     /// handlers (see D.3 spec for the rationale).
     pub(super) fn apply_device_op(&mut self, op: &DeviceOp) -> Result<()> {
+        // Rebase every operation's logical tile column to the partition's
+        // physical column, matching what the xdna-driver does at allocation
+        // time. Defaults to a no-op (`start_col == 0`) until the test
+        // runner calls `set_start_col`.
+        let shift = self.start_col;
+        let physical_tile = |t: TileAddr| TileAddr { col: t.col + shift, row: t.row };
         match op {
             DeviceOp::RegWrite { tile, offset, value } => {
-                let addr = encode_addr(*tile, *offset);
+                let addr = encode_addr(physical_tile(*tile), *offset);
                 self.write_register(addr, *value)?;
             }
             DeviceOp::RegMask { tile, offset, mask, value } => {
-                let addr = encode_addr(*tile, *offset);
+                let addr = encode_addr(physical_tile(*tile), *offset);
                 self.mask_write_register(addr, *mask, *value)?;
             }
             DeviceOp::RegBurst { tile, offset, words } => {
-                let addr = encode_addr(*tile, *offset);
+                let addr = encode_addr(physical_tile(*tile), *offset);
                 // Flatten back to a byte buffer for the existing
                 // `dma_write` path. Little-endian matches the
                 // round-trip used by `semantics::lower::bytes_to_words_le`.
@@ -184,7 +190,7 @@ impl DeviceState {
                 // branch derives it from `value & 1`. The variant
                 // keeps `enabled` as a parser-side semantic marker
                 // (room for option (a) future work; see D.3 spec).
-                let addr = encode_addr(*tile, xdna_archspec::aie2::registers::CORE_CONTROL);
+                let addr = encode_addr(physical_tile(*tile), xdna_archspec::aie2::registers::CORE_CONTROL);
                 self.write_register(addr, *value)?;
             }
             DeviceOp::DmaStart { tile, channel, dir, bd_id } => {
@@ -196,7 +202,7 @@ impl DeviceState {
                 // (memtile / shim), each of which has the existing
                 // Start_Queue branch that does the typed effect.
                 let offset = start_queue_offset(tile.row, *channel, *dir)?;
-                let addr = encode_addr(*tile, offset);
+                let addr = encode_addr(physical_tile(*tile), offset);
                 self.write_register(addr, *bd_id)?;
             }
             DeviceOp::MaskPoll { .. } => {

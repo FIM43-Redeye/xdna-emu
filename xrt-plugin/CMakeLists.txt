@@ -80,6 +80,16 @@ set_target_properties(xrt_driver_emu PROPERTIES
   SOVERSION 2
 )
 
+# -Bsymbolic-functions forces the dynamic linker to resolve calls within
+# this .so to our own definitions, even when the same global symbols exist
+# in another loaded plugin (libxrt_driver_xdna.so).  Without this,
+# first-loaded-wins semantics let the real driver's hwctx_kmq replace ours,
+# but our config_ctx_cu_config receiver still reads layout fields the
+# other plugin's struct never set -- the result is uninitialized memory
+# bleeding into start_col.  The flag affects intra-.so binding only; XRT
+# can still resolve our exported FFI through the normal global namespace.
+target_link_options(xrt_driver_emu PRIVATE -Wl,-Bsymbolic)
+
 target_compile_definitions(xrt_driver_emu PRIVATE
   XRT_ENABLE_AIE
   XRT_AIE_BUILD

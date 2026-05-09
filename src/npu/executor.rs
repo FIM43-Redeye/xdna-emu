@@ -535,7 +535,7 @@ impl NpuExecutor {
             }
 
             ExecutorState::BlockedOnPoll { next_index, reg_off, value, mask } => {
-                let (col, row, offset) = decode_npu_address(reg_off);
+                let (col, row, offset) = decode_npu_address(reg_off, device.start_col);
                 let current = device
                     .tile_mut(col as usize, row as usize)
                     .map_or(0, |tile| tile.read_register(offset));
@@ -672,7 +672,7 @@ impl NpuExecutor {
                 // MaskPoll blocks until (register & mask) == value.
                 // Check the condition now; if not met, transition to
                 // BlockedOnPoll and let try_advance() poll each cycle.
-                let (col, row, offset) = decode_npu_address(*reg_off);
+                let (col, row, offset) = decode_npu_address(*reg_off, device.start_col);
                 let current = device
                     .tile_mut(col as usize, row as usize)
                     .map_or(0, |tile| tile.read_register(offset));
@@ -703,9 +703,13 @@ impl NpuExecutor {
 
             NpuInstruction::Sync { channel, column, row, direction, .. } => {
                 let dir_str = if *direction == 0 { "S2MM" } else { "MM2S" };
+                // Sync's column field is a logical (partition-relative)
+                // tile column; shift to physical so the wait targets the
+                // correct DMA engine after partition relocation.
+                let physical_col = column.saturating_add(device.start_col);
                 log::info!(
                     "NPU Sync: blocking on ({},{}) {} ch{} (sync #{})",
-                    column,
+                    physical_col,
                     row,
                     dir_str,
                     channel,
@@ -716,7 +720,7 @@ impl NpuExecutor {
                 // the DMA channel signals completion. This prevents subsequent
                 // BD reconfiguration from racing against live transfers.
                 self.pending_syncs.push(PendingSync {
-                    column: *column,
+                    column: physical_col,
                     row: *row,
                     channel: *channel,
                     direction: *direction,
@@ -752,9 +756,8 @@ impl NpuExecutor {
     ) -> Result<(), String> {
         log::debug!("NPU Write32: reg=0x{:08X} value=0x{:08X}", reg_off, value);
 
-        // Decode tile address from register offset
-        // NPU1 address format: bits[31:25]=col, bits[24:20]=row, bits[19:0]=offset
-        let (col, row, offset) = decode_npu_address(reg_off);
+        // Decode tile address from register offset (logical -> physical via start_col).
+        let (col, row, offset) = decode_npu_address(reg_off, device.start_col);
 
         // Data memory writes go directly to tile memory (not the register bus).
         let is_data_mem = device
@@ -802,7 +805,7 @@ impl NpuExecutor {
     ) -> Result<(), String> {
         log::debug!("NPU BlockWrite: reg=0x{:08X} count={}", reg_off, values.len());
 
-        let (col, row, base_offset) = decode_npu_address(reg_off);
+        let (col, row, base_offset) = decode_npu_address(reg_off, device.start_col);
 
         // Data memory writes go directly to tile memory (contiguous block).
         let is_data_mem = device
@@ -848,7 +851,7 @@ impl NpuExecutor {
         device: &mut DeviceState,
         _host_memory: &mut HostMemory,
     ) -> Result<(), String> {
-        let (col, row, offset) = decode_npu_address(reg_off);
+        let (col, row, offset) = decode_npu_address(reg_off, device.start_col);
         log::debug!(
             "NPU MaskWrite: reg=0x{:08X} -> tile({},{}) offset=0x{:05X} value=0x{:08X} mask=0x{:08X}",
             reg_off,
@@ -916,7 +919,7 @@ impl NpuExecutor {
         arg_plus: u32,
         device: &mut DeviceState,
     ) -> Result<(), String> {
-        let (col, row, offset) = decode_npu_address(reg_addr);
+        let (col, row, offset) = decode_npu_address(reg_addr, device.start_col);
 
         if self.host_buffers.is_empty() {
             // ELF module path: addresses are pre-patched by XRT with DDR
@@ -1267,30 +1270,26 @@ fn bd_index_for_blockwrite(row: u8, offset: u32) -> Option<(u8, TileKind)> {
 
 /// Decode an NPU address into (col, row, offset).
 ///
+/// Decode a runtime_sequence register address into a *physical* tile
+/// address by extracting the logical column from the encoded bits and
+/// shifting it by the partition's `start_col`.
+///
 /// NPU1 address format:
-/// - bits[31:25]: Column (7 bits, but typically 0-4 for NPU1)
+/// - bits[31:25]: Column (7 bits)
 /// - bits[24:20]: Row (5 bits)
 /// - bits[19:0]: Register offset within tile (20 bits)
-fn decode_npu_address(addr: u32) -> (u8, u8, u32) {
-    // NPU1 uses a different encoding than what I described
-    // Looking at actual addresses like 0x1D000 for shim DMA:
-    // The high bits encode tile location, low bits are register offset
-    //
-    // For shim tiles (row 0), addresses are in the 0x1xxxx range
-    // For compute tiles, addresses are higher
-    //
-    // Let me use a simpler approach: assume shim tile for known ranges
-
-    // Shim DMA registers are typically at offset 0x1D000-0x1DFFF
-    // This is for column 0, row 0
-
-    // Tile address encoding: col|row|offset (AM020 Ch2, derived from ArchModel).
+///
+/// Runtime_sequence ops emit logical column indices (0 = leftmost partition
+/// column).  Real HW resolves these against the partition's start_col chosen
+/// by the driver allocator.  Mirroring that here keeps EMU in lockstep with
+/// HW: the same logical address lands on the same physical tile.
+fn decode_npu_address(addr: u32, start_col: u8) -> (u8, u8, u32) {
     use xdna_archspec::aie2::{TILE_COL_SHIFT, TILE_ROW_SHIFT, TILE_OFFSET_MASK};
-    let col = ((addr >> TILE_COL_SHIFT) & 0x7F) as u8;
+    let logical_col = ((addr >> TILE_COL_SHIFT) & 0x7F) as u8;
     let row = ((addr >> TILE_ROW_SHIFT) & 0x1F) as u8;
     let offset = addr & TILE_OFFSET_MASK;
-
-    (col, row, offset)
+    let physical_col = logical_col.saturating_add(start_col);
+    (physical_col, row, offset)
 }
 
 #[cfg(test)]
@@ -1299,11 +1298,26 @@ mod tests {
 
     #[test]
     fn test_decode_npu_address() {
-        // Test shim tile address (col 0, row 0)
-        let (col, row, offset) = decode_npu_address(0x0001D000);
+        // Test shim tile address (col 0, row 0) with no shift.
+        let (col, row, offset) = decode_npu_address(0x0001D000, 0);
         assert_eq!(col, 0);
         assert_eq!(row, 0);
         assert_eq!(offset, 0x1D000);
+    }
+
+    #[test]
+    fn test_decode_npu_address_with_start_col() {
+        // Same logical address, partition relocated to physical col 1.
+        let (col, row, offset) = decode_npu_address(0x0001D000, 1);
+        assert_eq!(col, 1, "logical 0 + start_col 1 -> physical 1");
+        assert_eq!(row, 0);
+        assert_eq!(offset, 0x1D000);
+
+        // Logical col 2 in the address bits + start_col 1 -> physical 3.
+        use xdna_archspec::aie2::TILE_COL_SHIFT;
+        let addr_logical_col2 = (2u32 << TILE_COL_SHIFT) | 0x0001D000;
+        let (col, _, _) = decode_npu_address(addr_logical_col2, 1);
+        assert_eq!(col, 3, "logical 2 + start_col 1 -> physical 3");
     }
 
     #[test]
@@ -1371,6 +1385,64 @@ mod tests {
         assert_eq!(executor.try_advance(&mut device, &mut host_mem), AdvanceResult::Done);
         // After executing the only instruction, state should be Done
         assert!(matches!(executor.state(), ExecutorState::Done));
+    }
+
+    /// With start_col=1, a Write32 to logical col 0 must land on physical col 1.
+    /// This is the core invariant for partition-aware addressing: runtime_sequence
+    /// ops emit logical column 0 (= leftmost partition column), and the executor
+    /// must shift them into the physical column the driver allocated.
+    #[test]
+    fn test_write32_respects_start_col() {
+        let mut executor = NpuExecutor::new();
+        let mut device = DeviceState::new_npu1();
+        let mut host_mem = HostMemory::new();
+
+        device.set_start_col(1);
+
+        // Write to logical (col 0, row 2) -- should land on physical (1, 2).
+        let logical_addr = (0u32 << 25) | (2u32 << 20) | 0x0;
+        let value = 0xdeadbeef;
+        executor.load_instructions(vec![NpuInstruction::Write32 { reg_off: logical_addr, value }]);
+
+        assert_eq!(executor.try_advance(&mut device, &mut host_mem), AdvanceResult::Done);
+
+        // Compute-tile offset 0 lands in data memory (write_data_u32).
+        // Physical (1, 2) data mem should hold the value; physical (0, 2) untouched.
+        let phys_target = device.tile_mut(1, 2).expect("physical (1,2) tile exists").read_data_u32(0);
+        let phys_orig = device.tile_mut(0, 2).expect("physical (0,2) tile exists").read_data_u32(0);
+        assert_eq!(phys_target, Some(value), "logical col 0 + start_col 1 must reach physical col 1",);
+        assert_eq!(phys_orig, Some(0), "physical col 0 must NOT be written when start_col=1",);
+    }
+
+    /// Sync's column field is also logical and must be shifted by start_col,
+    /// otherwise the executor waits on the wrong DMA engine and stalls forever.
+    #[test]
+    fn test_sync_respects_start_col() {
+        let mut executor = NpuExecutor::new();
+        let mut device = DeviceState::new_npu1();
+        let mut host_mem = HostMemory::new();
+
+        device.set_start_col(1);
+
+        // Sync on logical col 0 -- should record physical col 1 in pending_syncs.
+        executor.load_instructions(vec![NpuInstruction::Sync {
+            channel: 0,
+            column: 0,
+            direction: 1, // MM2S
+            column_num: 1,
+            row: 2,
+            row_num: 1,
+        }]);
+
+        // First try_advance issues the sync; subsequent advances poll until satisfied.
+        // We don't care about completion here -- just that the recorded column is shifted.
+        let _ = executor.try_advance(&mut device, &mut host_mem);
+
+        assert_eq!(executor.pending_syncs.len(), 1);
+        assert_eq!(
+            executor.pending_syncs[0].column, 1,
+            "Sync's logical col 0 + start_col 1 must record physical col 1",
+        );
     }
 
     /// Verify that sync completion requires the channel to have been running

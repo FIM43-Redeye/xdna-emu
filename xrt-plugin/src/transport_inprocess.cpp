@@ -108,6 +108,7 @@ emu_transport_inprocess::emu_transport_inprocess(const std::string& lib_path)
     sym_alloc_buffer_       = resolve_optional<fn_alloc_buffer>("xdna_emu_alloc_buffer");
     sym_free_buffer_        = resolve_optional<fn_free_buffer>("xdna_emu_free_buffer");
     sym_reset_context_      = resolve_optional<fn_reset_context>("xdna_emu_reset_context");
+    sym_set_start_col_      = resolve_optional<fn_set_start_col>("xdna_emu_set_start_col");
     sym_read_register_      = resolve_optional<fn_read_register>("xdna_emu_read_register");
     sym_write_register_     = resolve_optional<fn_write_register>("xdna_emu_write_register");
     sym_read_tile_mem_      = resolve_optional<fn_read_tile_mem>("xdna_emu_read_tile_memory");
@@ -185,6 +186,15 @@ void emu_transport_inprocess::load_pdi(const void* data, size_t size)
                               static_cast<const uint8_t*>(data),
                               static_cast<uint64_t>(size));
     check(rc, "load_pdi");
+}
+
+void emu_transport_inprocess::set_start_col(uint8_t start_col)
+{
+    if (!sym_set_start_col_)
+        return;  // Older emulator builds: no-op fallback.
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
+    Result rc = sym_set_start_col_(emu_, start_col);
+    check(rc, "set_start_col");
 }
 
 // ---------------------------------------------------------------------------

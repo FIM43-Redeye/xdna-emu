@@ -77,6 +77,18 @@ pub struct DeviceState {
     /// core state, matching how real hardware immediately reacts to the register
     /// write regardless of source (CDO, NPU instruction, or control packet).
     pub(crate) pending_core_enables: Vec<(u8, u8, bool)>,
+    /// Column offset applied to all CDO operations.
+    ///
+    /// CDO streams encode logical (partition-relative) tile columns
+    /// starting at 0. The real xdna-driver allocates a physical
+    /// `start_col` from `aie_partition.start_columns` (typically 1, since
+    /// col 0 is reserved for the shim DMA host channels) and rebases
+    /// every CDO write to that column. Setting this field replicates
+    /// that rebase: every `DeviceOp` that carries a `tile.col` is shifted
+    /// by `start_col` before address encoding, so the emulator's
+    /// trace-packet headers and per-tile state line up with the real
+    /// hardware's physical placement.
+    pub start_col: u8,
 }
 
 impl DeviceState {
@@ -86,7 +98,18 @@ impl DeviceState {
             array: TileArray::new(arch),
             stats: CdoStats::default(),
             pending_core_enables: Vec::new(),
+            start_col: 0,
         }
+    }
+
+    /// Set the partition's physical start column.
+    ///
+    /// Called once before applying CDOs, with the value the xdna-driver
+    /// would have chosen for the partition (typically `start_columns[0]`).
+    /// Subsequent `apply_device_op` calls shift every operation's
+    /// `tile.col` by this amount.
+    pub fn set_start_col(&mut self, start_col: u8) {
+        self.start_col = start_col;
     }
 
     /// Create an NPU1 device state.

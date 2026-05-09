@@ -85,6 +85,16 @@ pub unsafe extern "C" fn xdna_emu_load_xclbin(
         }
     };
 
+    // Mirror the xdna-driver allocator's "first available" choice: pick
+    // the first candidate from the partition's start_columns array as the
+    // physical start column.  The same shift gets applied to CDO ops
+    // (apply_device_op) and to NPU executor ops (decode_npu_address /
+    // Sync.column), so the load_xclbin path lands partition-aware
+    // addressing end to end.  Empty list (older xclbins): leave at 0.
+    let start_col = partition.start_columns().first().copied().unwrap_or(0);
+    handle.engine.device_mut().set_start_col(start_col as u8);
+    log::info!("load_xclbin: physical start_col = {}", start_col);
+
     // Apply PDI through the shared golden path.
     let result = apply_pdi_data(handle, pdi.pdi_image);
     if result != XdnaEmuResult::Success {
@@ -176,6 +186,12 @@ pub unsafe extern "C" fn xdna_emu_load_pdi(
     let handle = &mut *handle;
     let data = slice::from_raw_parts(pdi_data, pdi_size as usize);
 
+    // This entry point doesn't see the xclbin's partition section, so
+    // it can't pick a start_col itself.  The bridge-plugin is expected
+    // to call xdna_emu_set_start_col() *before* xdna_emu_load_pdi() to
+    // configure the partition shift.  If the caller skips the setter,
+    // start_col remains at whatever it was last set to (default 0).
+
     let result = apply_pdi_data(handle, data);
     if result == XdnaEmuResult::Success {
         log::info!("Loaded PDI ({} bytes)", pdi_size);
@@ -236,5 +252,33 @@ pub unsafe extern "C" fn xdna_emu_sync_cores(handle: *mut XdnaEmuHandle) -> Xdna
     let handle = &mut *handle;
     handle.engine.sync_cores_from_device();
 
+    XdnaEmuResult::Success
+}
+
+/// Set the partition's physical start column.
+///
+/// CDO streams and runtime_sequence ops use partition-relative (logical)
+/// column indices; consumers that need physical addressing -- the device
+/// state's CDO applier and the NPU executor -- shift `tile.col` by this
+/// amount.  The xdna-driver allocates this from `aie_partition.start_col_list`
+/// at hw_context create time; the bridge-plugin path forwards that choice
+/// here so the emulator mirrors HW addressing.  The xclbin path
+/// (`xdna_emu_load_xclbin`) sets this internally from the parsed partition.
+///
+/// Must be called *before* `xdna_emu_load_pdi` if the caller wants the
+/// shift applied to the loaded CDO.  Idempotent: callers can re-set it
+/// for each new hw_context.
+///
+/// # Safety
+/// - `handle` must be valid
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_set_start_col(handle: *mut XdnaEmuHandle, start_col: u8) -> XdnaEmuResult {
+    if handle.is_null() {
+        return XdnaEmuResult::InvalidHandle;
+    }
+
+    let handle = &mut *handle;
+    handle.engine.device_mut().set_start_col(start_col);
+    log::info!("xdna_emu_set_start_col: start_col = {}", start_col);
     XdnaEmuResult::Success
 }

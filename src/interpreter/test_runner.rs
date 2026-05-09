@@ -2278,6 +2278,15 @@ mod tests {
         // Step 5: Apply CDO to device state
         eprintln!("\n--- Applying CDO to Device State ---");
         let mut device_state = DeviceState::new_npu1();
+        // Pick the partition's physical start column the same way the
+        // xdna-driver allocator does: take the first entry of
+        // `start_columns` (col 0 is reserved for shim DMA host channels,
+        // so this is typically 1). With no contention here, "first
+        // available" reduces to "first entry."
+        if let Some(&start_col) = start_cols.first() {
+            device_state.set_start_col(start_col as u8);
+            eprintln!("  Using physical start_col: {}", start_col);
+        }
         let cdo_stats_commands;
         match device_state.apply_cdo(&cdo) {
             Ok(()) => {

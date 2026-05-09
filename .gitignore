@@ -19,6 +19,10 @@ bridge-runner/build/
 # clangd index cache
 bridge-runner/.cache/
 
+# validate-readback build artifacts + clangd cache
+tools/validate-readback/build/
+tools/validate-readback/.cache/
+
 # aiecc.py per-MLIR project directories (created next to .mlir input/output)
 aie.mlir.prj/
 aie_traced.mlir.prj/

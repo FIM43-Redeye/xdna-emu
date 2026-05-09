@@ -34,6 +34,14 @@ public:
     /// sync path. No-op if the backing FFI symbol is not available.
     virtual void reset_context() {}
 
+    /// Set the partition's physical start column.  CDO streams and
+    /// runtime_sequence ops use partition-relative (logical) columns; the
+    /// emulator shifts them by this amount to reach physical addresses.
+    /// Should be called immediately before load_pdi() so that newly
+    /// applied CDO ops see the correct shift.  No-op if the backing
+    /// FFI symbol is not available (older emulator builds).
+    virtual void set_start_col(uint8_t /*start_col*/) {}
+
     // -- Buffer management ---------------------------------------------------
 
     /// Allocate a host-visible buffer.  Returns the device address.
