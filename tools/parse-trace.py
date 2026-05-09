@@ -71,7 +71,7 @@ def parse_args():
                         "--out-perfetto is supported on both backends for "
                         "mode 0; 'ours' rejects --out-perfetto for modes "
                         "1/2 pending a B/E convention.")
-    p.add_argument("--trace-mode", choices=("event_time", "event_pc", "inst_exec"),
+    p.add_argument("--trace-mode", choices=("event_time", "event_pc", "inst_exec", "auto"),
                    default="event_time",
                    help="trace mode selector for --decoder=ours. 'event_time' "
                         "(default) decodes mode-0 traces with cycle-delta "
@@ -79,7 +79,12 @@ def parse_args():
                         "encoded quantity is the PC at each event fire. "
                         "'inst_exec' decodes mode-2 instruction-execution "
                         "traces (E/N_atom cycle records, New_PC branches, "
-                        "LC loop counts).")
+                        "LC loop counts). 'auto' inspects each per-tile "
+                        "payload's Start opcode and decodes that tile with "
+                        "its own mode -- needed for real BOs that mix "
+                        "compute (event_pc) and shim/memtile (event_time) "
+                        "in one capture; mode-2 tiles are skipped under "
+                        "'auto' since their output schema differs.")
     p.add_argument("--server", action="store_true",
                    help="run as a long-lived decode server. Reads one JSON "
                         "request per stdin line {trace_bin, xclbin_mlir, "
@@ -388,13 +393,13 @@ def decode_one_ours(np_mod, td_mod,
         "event_pc": td_mod.TraceMode.EVENT_PC,
         "inst_exec": td_mod.TraceMode.INST_EXEC,
     }
-    if trace_mode not in mode_lookup:
+    if trace_mode not in mode_lookup and trace_mode != "auto":
         raise ValueError(
             f"--decoder=ours: unsupported trace_mode {trace_mode!r}; "
-            f"expected one of {sorted(mode_lookup)}"
+            f"expected one of {sorted(mode_lookup) + ['auto']}"
         )
 
-    if out_perfetto and trace_mode != "event_time":
+    if out_perfetto and trace_mode not in ("event_time", "auto"):
         raise ValueError(
             f"--decoder=ours --out-perfetto: trace_mode={trace_mode!r} "
             "not supported; only event_time (mode 0) emits Perfetto B/E "
@@ -413,7 +418,8 @@ def decode_one_ours(np_mod, td_mod,
             out_commands=out_commands,
         )
 
-    mode_enum = mode_lookup[trace_mode]
+    auto = trace_mode == "auto"
+    mode_enum = None if auto else mode_lookup[trace_mode]
 
     raw = _load_trace_words(np_mod, trace_bin)
     words = raw.tolist()
@@ -425,6 +431,9 @@ def decode_one_ours(np_mod, td_mod,
         slot_names = _slot_names_from_mlir(mlir_text)
 
     if out_commands:
+        # In auto mode, decode_words(mode=None) per-tile-dispatches based on
+        # each Start opcode's mode discriminator, so single-mode and mixed-
+        # mode BOs both round-trip through this path.
         commands_per_tile = td_mod.decode_words(words, mode=mode_enum)
         # Reshape into the mlir-aie-compatible output: trace_types[pkt_type][f"{row},{col}"] = [...]
         max_pt = max((pt for (pt, _, _) in commands_per_tile), default=-1)
@@ -434,15 +443,28 @@ def decode_one_ours(np_mod, td_mod,
         Path(out_commands).write_text(json.dumps({"trace_types": trace_types}, indent=2))
 
     if out_perfetto:
+        # Auto mode emits Perfetto only for mode-0 tiles (the only mode
+        # with a defined B/E timeline); mode-1 tiles are silently
+        # skipped rather than producing a malformed timeline.
         commands_per_tile = td_mod.decode_words(words, mode=mode_enum)
+        if auto:
+            tile_modes = td_mod.detect_per_tile_modes(words)
+            commands_per_tile = {
+                k: cmds
+                for k, cmds in commands_per_tile.items()
+                if tile_modes.get(k) == td_mod.TraceMode.EVENT_TIME
+            }
         perfetto_events = td_mod.rebuild_perfetto_mode0(commands_per_tile, slot_names)
         Path(out_perfetto).write_text(json.dumps(perfetto_events, indent=2))
 
     flat = []
     cycles = None
     if out_events or out_cycles:
-        events = td_mod.parse_trace(words, slot_names=slot_names,
-                                    mode=mode_enum)
+        if auto:
+            events = td_mod.parse_trace_auto(words, slot_names=slot_names)
+        else:
+            events = td_mod.parse_trace(words, slot_names=slot_names,
+                                        mode=mode_enum)
         flat = [
             {
                 "col": e.col,

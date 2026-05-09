@@ -390,6 +390,33 @@ def test_decode_words_auto_picks_per_tile_mode():
     assert memtile_cmds[0].timer_value > 16383
 
 
+def test_parse_trace_auto_emits_events_for_both_modes():
+    """parse_trace_auto on the mixed mode-1 fixture must surface events
+    from BOTH the EVENT_PC core tile and the EVENT_TIME memtile tile.
+
+    Single-mode parse_trace cannot do this: forcing mode=EVENT_PC
+    misdecodes the memtile, and mode=EVENT_TIME misdecodes the core.
+    parse_trace_auto picks each tile's mode from its Start opcode and
+    rebuilds the timeline accordingly, so the returned Event list
+    covers both.
+    """
+    from trace_decoder import parse_trace_auto
+
+    raw = np.fromfile(FIXTURE_DIR / "mode1_mixed_r0.bin", dtype=np.uint32)
+    events = parse_trace_auto(raw.tolist())
+
+    pkt_types_with_events = {e.pkt_type for e in events}
+    # CORE = 0 (EVENT_PC) and MEMTILE = 3 (EVENT_TIME) must both
+    # contribute events.  Earlier per-tile-mode tests confirm the
+    # fixture has those two tiles configured that way.
+    assert PacketType.CORE in pkt_types_with_events, (
+        f"expected CORE events, got pkt_types={pkt_types_with_events}"
+    )
+    assert PacketType.MEMTILE in pkt_types_with_events, (
+        f"expected MEMTILE events, got pkt_types={pkt_types_with_events}"
+    )
+
+
 def test_decode_words_auto_skips_no_start():
     """Tiles with no recognisable Start opcode auto-detect to skip
     rather than crash the whole decode."""

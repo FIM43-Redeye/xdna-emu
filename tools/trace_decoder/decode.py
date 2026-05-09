@@ -460,10 +460,79 @@ def parse_trace(
     return rebuild_timeline_mode0(commands, slot_names or {})
 
 
+def parse_trace_auto(
+    trace_buffer,
+    slot_names: dict[int, dict[str, list[str]]] | None = None,
+) -> list[Event]:
+    """Decode a mixed-mode trace buffer.
+
+    Real captures interleave packets from several tiles, each programmed
+    with whatever ``Trace_Control0.MODE`` makes sense for its module:
+
+    * compute cores typically run in ``EVENT_PC`` (mode 1) so each event
+      carries the PC of the firing instruction;
+    * shim PL and memtile modules have no PC and run in ``EVENT_TIME``
+      (mode 0) so each event carries a cycle delta;
+    * mode 2 (``INST_EXEC``) emits a different command vocabulary (atom
+      / New_PC / LC) that doesn't fit the timeline ``Event`` schema
+      and is skipped here -- callers that need it should use
+      ``decode_words(mode=None)`` and dispatch to mode-2 rebuilders
+      directly.
+
+    ``parse_trace_auto`` reads each per-tile payload's Start opcode
+    discriminator, decodes that tile with its own mode, and rebuilds
+    its timeline with the matching ``rebuild_timeline_mode{0,1}``.
+    The returned ``Event`` list combines both mode-0 (``ts`` is a cycle)
+    and mode-1 (``ts`` is the PC of the firing instruction) records;
+    consumers disambiguate via ``pkt_type`` (cores in mode 1, shim/
+    memtile in mode 0).
+
+    Use ``parse_trace`` (single-mode) for fixtures whose configuration
+    is known up-front and uniform; use ``parse_trace_auto`` for whole
+    BOs from real or emulator captures where modes are mixed.
+    """
+    if isinstance(trace_buffer, (bytes, bytearray)):
+        words = list(np.frombuffer(bytes(trace_buffer), dtype=np.uint32))
+    elif hasattr(trace_buffer, "tolist"):
+        words = list(trace_buffer.tolist())
+    else:
+        words = list(trace_buffer)
+
+    word_list = trim_trailing_padding(words)
+    by_tile_words = deinterleave_packets(word_list)
+    names = slot_names or {}
+
+    all_events: list[Event] = []
+    for key, payload_words in by_tile_words.items():
+        bytes_ = words_to_bytes(payload_words)
+        tile_mode = _detect_tile_mode(bytes_)
+        if tile_mode is None or tile_mode not in _MODE_DECODER:
+            # No recognisable Start (or reserved mode 3): skip this
+            # tile.  Modes 0/1 are timeline-shaped; mode 2 has its own
+            # output shape (atoms, New_PC, LC) so it gets the same
+            # treatment as the unrecognised cases here -- callers who
+            # need mode-2 should drive it through decode_words/decode
+            # directly instead of expecting flat Event records.
+            continue
+        if tile_mode == TraceMode.INST_EXEC:
+            continue
+        commands = list(_MODE_DECODER[tile_mode](bytes_))
+        if tile_mode == TraceMode.EVENT_PC:
+            tile_events = rebuild_timeline_mode1({key: commands}, names)
+        else:
+            tile_events = rebuild_timeline_mode0({key: commands}, names)
+        all_events.extend(tile_events)
+
+    all_events.sort(key=lambda e: (e.col, e.row, e.pkt_type, e.ts, e.slot))
+    return all_events
+
+
 __all__ = [
     "decode_words",
     "rebuild_timeline_mode0",
+    "rebuild_timeline_mode1",
     "parse_trace",
+    "parse_trace_auto",
     "PacketType",
     "TraceMode",
 ]
