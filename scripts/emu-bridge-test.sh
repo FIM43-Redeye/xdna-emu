@@ -1611,8 +1611,13 @@ compile_one() {
 
   if [[ "$NO_TRACE" != "true" ]] && ! is_trace_quarantined "$name"; then
     local trace_log="$RESULTS_DIR/${safe}.trace-prepare.log"
+    # --shim-sweep-events all enables shim trace injection on row-0 tiles
+    # so Phase 5b's lockstep sweep can rotate shim DMA events alongside
+    # core events. This is the data path #355a needs to calibrate the
+    # EMU/HW DMA pipeline-fill gap. Pre-stage-1 behavior (no shim trace)
+    # is preserved by omitting this flag.
     if nice -n 19 python3 "$EMU_ROOT/tools/trace-prepare.py" "$src_dir" \
-        -o "$traced_dir" > "$trace_log" 2>&1; then
+        -o "$traced_dir" --shim-sweep-events all > "$trace_log" 2>&1; then
       if [[ -f "$traced_dir/prepare-status.txt" ]] \
           && grep -q '^OK' "$traced_dir/prepare-status.txt"; then
         trace_ok=true
@@ -3069,17 +3074,20 @@ main() {
         safe="$(sanitize_name "$name")"
         local src_dir="$TEST_SRC/$name"
 
-        # Discover compute tiles from aie.mlir (same logic as PC-anchored).
+        # Discover tiles from aie.mlir. Row >= 2 = compute (core trace);
+        # row == 0 = shim (shim trace, since stage 1 of #372). Row 1
+        # (memtile) lands in stage 2 (#373); skipped here. Mixed-type
+        # tiles route trace-sweep.py to its lockstep path automatically.
         local mlir_src="$src_dir/aie.mlir"
         local tile_spec=""
         if [[ -f "$mlir_src" ]]; then
           tile_spec="$(grep -v '^[[:space:]]*//' "$mlir_src" \
             | grep -oP 'aie\.tile\(\K[0-9]+,\s*[0-9]+(?=\))' \
-            | awk -F',' '{ col=$1; row=$2+0; if(row>=2) { printf "%s%d:%d:core", sep, col, row; sep="," } }' \
+            | awk -F',' '{ col=$1; row=$2+0; if(row>=2) { printf "%s%d:%d:core", sep, col, row; sep="," } else if(row==0) { printf "%s%d:%d:shim", sep, col, row; sep="," } }' \
             | sed 's/ //g')"
         fi
         if [[ -z "$tile_spec" ]]; then
-          echo "  SWEEP $name: SKIP -- no compute tiles found in $mlir_src"
+          echo "  SWEEP $name: SKIP -- no traceable tiles found in $mlir_src"
           continue
         fi
 
@@ -3203,11 +3211,11 @@ main() {
           if [[ -f "$mlir_src" ]]; then
             tile_spec="$(grep -v '^[[:space:]]*//' "$mlir_src" \
               | grep -oP 'aie\.tile\(\K[0-9]+,\s*[0-9]+(?=\))' \
-              | awk -F',' '{ col=$1; row=$2+0; if(row>=2) { printf "%s%d:%d:core", sep, col, row; sep="," } }' \
+              | awk -F',' '{ col=$1; row=$2+0; if(row>=2) { printf "%s%d:%d:core", sep, col, row; sep="," } else if(row==0) { printf "%s%d:%d:shim", sep, col, row; sep="," } }' \
               | sed 's/ //g')"
           fi
           if [[ -z "$tile_spec" ]]; then
-            echo "  PC-ANCHORED $name: SKIP -- no compute tiles found in $mlir_src"
+            echo "  PC-ANCHORED $name: SKIP -- no traceable tiles found in $mlir_src"
             continue
           fi
 

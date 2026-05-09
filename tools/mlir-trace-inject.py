@@ -105,17 +105,46 @@ _TRACE_DEFAULT_CORE_EVENTS = (
     "INSTR_LOCK_ACQUIRE_REQ",# lock acquire requested
     "INSTR_LOCK_RELEASE_REQ",# lock release requested
 )
+_TRACE_DEFAULT_SHIM_EVENTS = (
+    # Mirrors mlir-aie's own shim-tile defaults in
+    # python/utils/trace/setup.py::_get_default_events_for_tile.
+    # All eight are GenericEvents (not BasePortEvents), so unlike the
+    # core defaults there is no slot-port assignment to thread through;
+    # the declarative emit only needs trace_packet + trace_event ops.
+    #
+    # The set covers every shim DMA channel transition our designs
+    # actually use (S2MM 0/1 and MM2S 0; the second MM2S is rarely
+    # populated on Phoenix shim cols). START/FINISHED pairs anchor
+    # DMA pipeline-fill cycle measurement (#355a), and the two
+    # STREAM_STARVATION events flag back-pressure on S2MM ingestion.
+    "DMA_S2MM_0_START_TASK",
+    "DMA_S2MM_1_START_TASK",
+    "DMA_MM2S_0_START_TASK",
+    "DMA_S2MM_0_FINISHED_TASK",
+    "DMA_S2MM_1_FINISHED_TASK",
+    "DMA_MM2S_0_FINISHED_TASK",
+    "DMA_S2MM_0_STREAM_STARVATION",
+    "DMA_S2MM_1_STREAM_STARVATION",
+)
 
 
-def _trace_sym(col: int, row: int) -> str:
+def _trace_sym(col: int, row: int, kind: str = "core") -> str:
     """Symbol name for the aie.trace op attached to tile (col, row).
 
     Single source of truth so a future rename only touches one place.
-    Task 4 constructs the TraceOp with this name; Task 5's
-    trace_start_config must reference the same name -- drift between the
-    two sites would silently produce an unreachable trace config.
+    The TraceOp is constructed with this name; the matching
+    trace_start_config in the runtime sequence must reference the same
+    name -- drift between the two sites would silently produce an
+    unreachable trace config.
+
+    kind="core" preserves the legacy "trace_t{col}_{row}" format that
+    test_mlir_trace_inject.py asserts on. Other kinds use the
+    "trace_{kind}_{col}_{row}" convention so shim/memtile/memmod traces
+    are unambiguous in the lowered MLIR even when colocated.
     """
-    return f"trace_t{col}_{row}"
+    if kind == "core":
+        return f"trace_t{col}_{row}"
+    return f"trace_{kind}_{col}_{row}"
 
 
 def parse_args():
@@ -132,11 +161,12 @@ def parse_args():
     # Trace mode.
     p.add_argument("--trace-mode",
                    choices=("event_time", "event_pc", "inst_exec"),
-                   default="event_time",
+                   default="event_pc",
                    help="trace mode for compute-core trace units. "
-                        "event_time (mode 0, default) records cycle deltas; "
-                        "event_pc (mode 1) records PCs; inst_exec (mode 2) "
-                        "records the executed instruction stream as a "
+                        "event_pc (mode 1, default) records PC alongside each "
+                        "swept event -- easiest to ground in the disassembly; "
+                        "event_time (mode 0) records cycle deltas; inst_exec "
+                        "(mode 2) records the executed instruction stream as a "
                         "compressed bit-packed frame tree (LC/PC/atom/RLE). "
                         "All three modes are core-only -- memmod/memtile/shim "
                         "trace units always remain in mode 0 (their "
@@ -152,8 +182,14 @@ def parse_args():
                    help="grounding events for compute-tile memmod trace unit.")
     p.add_argument("--memtile-grounding", default="PERF_CNT_0",
                    help="grounding events for memtile trace unit.")
-    p.add_argument("--shim-grounding", default="PERF_CNT_0",
-                   help="grounding events for shim PL trace unit.")
+    p.add_argument("--shim-grounding", default="",
+                   help="grounding events for shim PL trace unit. Default is "
+                        "empty so all 8 default shim sweep events fit. "
+                        "PERF_CNT_0 is NOT a useful shim grounding today: "
+                        "the inject tool emits no shim performance counter "
+                        "config, so the slot would be reserved for an event "
+                        "that never fires. Pass --shim-grounding PERF_CNT_0 "
+                        "explicitly once shim perfcnt support lands.")
 
     # Sweep events (rotated per batch; injection writes the initial pattern).
     # 'all' is reserved for future use (auto-enumeration from the event DB);
@@ -174,8 +210,11 @@ def parse_args():
                         "for future use; currently behaves the same as the default.")
     p.add_argument("--shim-sweep-events", default=None,
                    help="comma-separated event names to sweep on shim. "
-                        "Default: don't inject shim trace. 'all' is reserved "
-                        "for future use; currently behaves the same as the default.")
+                        "Default (None): don't inject shim trace at all. "
+                        "Any non-None value activates shim injection: 'all' "
+                        "(or any unrecognized value) falls through to the "
+                        "8-event shim-DMA default (S2MM_0/1 + MM2S_0 "
+                        "START/FINISHED + S2MM_0/1 STREAM_STARVATION).")
 
     p.add_argument("--perfcnt-period", type=int, default=DEFAULT_PERFCNT_PERIOD,
                    help=f"cycles between PERF_CNT_0_EVENT fires when grounding "
@@ -536,17 +575,20 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
     # Pick the trace BO's BO arg index. Despite the name, address_patch's
     # arg_idx is NOT the XRT kernel slot -- it's the 0-based index into the
     # BO portion of the kernel regmap (firmware reads regmap[0x14 + N*8]
-    # where 0x14 is the offset past opcode/instr-BO/ninstr). So with N
-    # existing memref args at BO arg_idx 0..N-1 (XRT slots 3..3+N-1), the
-    # next free BO arg_idx for the trace BO is N, which corresponds to XRT
-    # slot 3+N on the host side. Upstream mlir-aie's setup.py defaults to
-    # arg_idx=4 and pads the host args list with fillers so the trace BO
-    # ends up at BO arg_idx 4; we instead just place it directly after the
-    # existing memrefs and skip the padding. cpp_trace_patch uses XRT slot
-    # (3+chosen_arg_idx) when emitting kernel.group_id(...) so the host BO
-    # binding lines up with where the firmware looks. Use the max across all
-    # target devices to keep a single arg_idx consistent if multiple devices
-    # share a trace BO.
+    # where 0x14 is the offset past opcode/instr-BO/ninstr). With N memref
+    # args at BO arg_idx 0..N-1 (XRT slots 3..3+N-1), the next free slot
+    # is N, which corresponds to XRT slot 3+N on the host side.
+    #
+    # Note on conventions: upstream IRON's start_trace defaults ddr_id=4
+    # (XRT slot 7) and xrt_test_wrapper.h hardcodes group_id(7), assuming
+    # a fixed 5-BO layout where slot 6 is a ctrlpkt placeholder. Our
+    # injector instead places the trace BO directly after the existing
+    # memrefs (matching what cpp_trace_patch will emit on the host side):
+    # 3 memrefs + bo_trace = 4 BO slots total, no placeholder. This means
+    # we land at arg_idx=N rather than 4; consumers need to derive the
+    # trace slot from trace_config.json's buffer.kernel_arg_slot or by
+    # scanning insts.bin's max DdrPatch arg_idx (the standalone runner
+    # heuristic). The 5-BO kernels.json template is harmless extra slots.
     max_existing_memref_args = max(
         len(rs.operation.regions[0].blocks[0].arguments) for _, _, rs in targets
     )
@@ -581,6 +623,21 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
     # Whether to emit perf counter config blocks (only when PERF_CNT_0 is in grounding).
     emit_core_perfcnt = "PERF_CNT_0" in core_grounding_names
 
+    # Shim trace injection is opt-in. When --shim-sweep-events is unset (None)
+    # we leave row-0 tiles alone, matching pre-stage-1 behavior. Any non-None
+    # value (including "all") activates the shim injection path: row-0 tiles
+    # get a TraceOp with packet type ShimTile, no trace_mode (shim has no
+    # Mode bitfield per regdb), and no perfcnt config (shim has no
+    # Performance_Counter0 -- if --shim-grounding includes PERF_CNT_0 the
+    # slot is reserved but the event will never fire until shim perfcnt
+    # support lands as its own feature).
+    inject_shim = args.shim_sweep_events is not None
+    shim_events = _resolve_events(
+        args.shim_grounding,
+        args.shim_sweep_events,
+        _TRACE_DEFAULT_SHIM_EVENTS,
+    ) if inject_shim else []
+
     # Track every traced tile across all target devices for trace_config.json.
     all_traced_tiles: list[tuple[int, int, list[str]]] = []
 
@@ -588,25 +645,35 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
     # its own set of trace decls for its own compute tiles, and its own
     # runtime-sequence prologue (host_config + one start_config per tile).
     for device_op, device_body, rs_op in targets:
-        # Collect compute tile SSA values from this device body.
-        # Keep them in declaration order so injected traces appear deterministically.
+        # Collect tile SSA values from this device body, partitioned by row.
+        # Keep them in declaration order so injected traces appear
+        # deterministically. compute_tiles always populated; shim_tiles only
+        # when shim injection is opted into.
         compute_tiles = []  # list of (col: int, row: int, tile_ssa_value)
+        shim_tiles = []     # list of (col: int, row: int, tile_ssa_value)
         for inner in device_body.operations:
             if inner.operation.name == "aie.tile":
                 col = int(IntegerAttr(inner.operation.attributes["col"]).value)
                 row = int(IntegerAttr(inner.operation.attributes["row"]).value)
                 if row >= 2:
                     compute_tiles.append((col, row, inner.operation.result))
+                elif row == 0 and inject_shim:
+                    shim_tiles.append((col, row, inner.operation.result))
 
         if not compute_tiles:
             # No kernels live on this device -- skip silently. A device with
             # a runtime_sequence but no compute tiles is unusual but not an
-            # error (e.g. a placeholder device).
+            # error (e.g. a placeholder device). Skip shim injection here too:
+            # tracing shim DMA without any compute tiles to drive it would
+            # produce an empty trace anyway.
             continue
 
-        # Record traced tiles for the trace_config.json payload.
+        # Record traced tiles for the trace_config.json payload. Core events
+        # apply to compute tiles; shim events apply to row-0 tiles.
         for col, row, _ in compute_tiles:
             all_traced_tiles.append((col, row, core_events))
+        for col, row, _ in shim_tiles:
+            all_traced_tiles.append((col, row, shim_events))
 
         # Insert trace ops before the device body's terminator.  The aie.device
         # block's last op is always its terminator (aie.end for well-formed input,
@@ -638,7 +705,7 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                 # core_events / mode_attr are loop-invariant, so the closure
                 # references them directly; when per-tile event sets are
                 # introduced this becomes a per-iteration capture.
-                @aied.trace(tile_val, _trace_sym(col, row))
+                @aied.trace(tile_val, _trace_sym(col, row, "core"))
                 def _trace_body():  # noqa: F811 -- redefinition is intentional (one per tile)
                     aied.trace_mode(mode_attr)
                     # packet id is the conventional starting id; AIEInsertTraceFlows
@@ -660,6 +727,27 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                     )
                     perf_syms.append(sym)
 
+            # Shim trace ops mirror configure_trace()'s shim-tile path in
+            # mlir-aie's setup.py. Differences from the core block:
+            #   - No trace_mode: shim Trace_Control0 has no Mode bitfield.
+            #   - TracePacketType.ShimTile.
+            #   - No perfcnt config: shim has no Performance_Counter0
+            #     register exposed for trace use today.
+            #   - No trace_port: the default shim events are GenericEvents
+            #     (DMA_*_TASK / DMA_*_STREAM_STARVATION), not BasePortEvents,
+            #     so no port-slot configuration is needed. If a future caller
+            #     passes shim PORT_RUNNING events via --shim-sweep-events,
+            #     we'd need to mirror configure_trace's port_configs handling
+            #     here -- punt until there's an actual user.
+            for col, row, tile_val in shim_tiles:
+                @aied.trace(tile_val, _trace_sym(col, row, "shim"))
+                def _shim_trace_body():  # noqa: F811 -- redefinition is intentional (one per tile)
+                    aied.trace_packet(_TRACE_PACKET_ID_START, aied.TracePacketType.ShimTile)
+                    for event_name in shim_events:
+                        aied.trace_event(event_name)
+                    aied.trace_start(broadcast=_TRACE_BROADCAST_START)
+                    aied.trace_stop(broadcast=_TRACE_BROADCAST_STOP)
+
         rs_block = rs_op.operation.regions[0].blocks[0]
         with InsertionPoint.at_block_begin(rs_block):
             # trace_host_config(buffer_size=N, arg_idx=K) emits:
@@ -675,10 +763,13 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
             )
             # trace_start_config(name) emits:
             #   aie.trace.start_config @<name>
-            # One per compute tile trace decl, then one per perfcnt config block.
+            # One per compute tile trace decl, then per shim tile trace decl,
+            # then one per perfcnt config block.
             # Mirror of mlir-aie python/utils/trace/setup.py line 542.
             for col, row, _ in compute_tiles:
-                aied.trace_start_config(_trace_sym(col, row))
+                aied.trace_start_config(_trace_sym(col, row, "core"))
+            for col, row, _ in shim_tiles:
+                aied.trace_start_config(_trace_sym(col, row, "shim"))
             for sym in perf_syms:
                 aied.trace_start_config(sym)
 
@@ -733,19 +824,18 @@ def main():
     # have no Mode field and always operate in event_time (mode 0). This is a
     # portability warning: the non-core events will be recorded, just in mode 0.
     #
-    # TODO: when memmod/memtile/shim injection actually lands, extend this
-    # trigger to also check whether the user passed a non-default value for
-    # --memmod-grounding / --memtile-grounding / --shim-grounding.  The Mode
-    # constraint applies to grounding too, but today the grounding flags are
-    # inert (only sweep events drive injection), so warning on sweep alone is
-    # the only condition that produces a misleading outcome.
+    # Shim injection is live as of stage 1 of #372; --shim-sweep-events drives
+    # it. Memmod/memtile injection (#373/#374) is still deferred -- when those
+    # land, this trigger should also fire when the user passes a non-default
+    # --memmod-grounding / --memtile-grounding (the Mode constraint applies
+    # to grounding too).
     if args.trace_mode in ("event_pc", "inst_exec") and any(
         s for s in [
             args.memmod_sweep_events,
             args.memtile_sweep_events,
             args.shim_sweep_events,
         ]
-        if s
+        if s is not None
     ):
         print(
             f"warning: --trace-mode {args.trace_mode} applies to compute-core "

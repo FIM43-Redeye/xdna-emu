@@ -117,6 +117,7 @@ def inject_trace_declarative(
     *,
     test_name: str,
     src_mlir: Path,
+    shim_sweep_events: str | None = None,
 ) -> tuple[str, dict]:
     """Run mlir-trace-inject.py on the MLIR text.
 
@@ -147,16 +148,19 @@ def inject_trace_declarative(
         in_path = td_path / "in.mlir"
         out_path = td_path / "out.mlir"
         in_path.write_text(mlir_text)
-        proc = subprocess.run(
-            [sys.executable, str(inject_tool),
-             "--input", str(in_path),
-             "--out", str(out_path),
-             "--buffer-size", str(trace_size),
-             "--trace-config-out", str(trace_config_path),
-             "--config-test-name", test_name,
-             "--config-src-mlir", str(src_mlir.resolve())],
-            capture_output=True, text=True,
-        )
+        cmd = [sys.executable, str(inject_tool),
+               "--input", str(in_path),
+               "--out", str(out_path),
+               "--buffer-size", str(trace_size),
+               "--trace-config-out", str(trace_config_path),
+               "--config-test-name", test_name,
+               "--config-src-mlir", str(src_mlir.resolve())]
+        # Opt-in shim trace injection. Only forward when set; the inject
+        # tool's default (None) leaves row-0 tiles untraced, preserving
+        # pre-stage-1 behavior for callers that don't pass this through.
+        if shim_sweep_events is not None:
+            cmd += ["--shim-sweep-events", shim_sweep_events]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
             raise RuntimeError(
                 f"mlir-trace-inject failed (exit {proc.returncode}):\n"
@@ -215,6 +219,7 @@ def prepare_trace(
     skip_mlir: bool,
     test_quarantine_path: Path,
     trace_quarantine_path: Path,
+    shim_sweep_events: str | None = None,
 ) -> int:
     """Run the trace preparation pipeline.
 
@@ -298,6 +303,7 @@ def prepare_trace(
                 mlir_text, trace_size, trace_config_path,
                 test_name=test_name,
                 src_mlir=test_dir / "aie.mlir",
+                shim_sweep_events=shim_sweep_events,
             )
         except Exception as e:
             msg = f"FAIL trace injection: {e}"
@@ -419,6 +425,13 @@ def main():
         default=None,
         help="Path to trace quarantine file (default: scripts/trace-quarantine.txt)",
     )
+    parser.add_argument(
+        "--shim-sweep-events",
+        default=None,
+        help="forward through to mlir-trace-inject's --shim-sweep-events. "
+             "Default (None) leaves row-0 tiles untraced. Pass 'all' (or a "
+             "comma-separated event list) to inject shim DMA trace ops.",
+    )
     args = parser.parse_args()
 
     test_dir = args.test_dir.resolve()
@@ -445,6 +458,7 @@ def main():
         skip_mlir=args.skip_mlir,
         test_quarantine_path=test_quarantine,
         trace_quarantine_path=trace_quarantine,
+        shim_sweep_events=args.shim_sweep_events,
     )
     sys.exit(rc)
 

@@ -539,7 +539,21 @@ def run_inject(argv: list) -> int:
 
     Returns the process exit code.  stdout/stderr are passed through to the
     test process so pytest's capsys can capture them.
+
+    Auto-supplies --trace-config-out next to --out when injecting; the
+    injector errors out without it, and every test here writes to a
+    tmp_path so the auto-derivation is correct by construction.
     """
+    argv = list(argv)
+    if (
+        "--no-op" not in argv
+        and "--help" not in argv
+        and "--trace-config-out" not in argv
+        and "--out" in argv
+    ):
+        out_path = Path(argv[argv.index("--out") + 1])
+        argv += ["--trace-config-out",
+                 str(out_path.with_name("trace_config.json"))]
     result = subprocess.run(
         [sys.executable, str(_MLIR_INJECT)] + argv,
         # Let both streams flow to the test process stdout/stderr so
@@ -612,12 +626,13 @@ class TestResolveEvents:
 class TestMlirTraceInjectMode:
     """Tests for --trace-mode CLI flag (Task 4.1 / 4.3)."""
 
-    def test_inject_mode_event_time_default(self, tmp_path, simple_design_mlir):
-        """Default (no --trace-mode) emits EventTime mode.
+    def test_inject_mode_event_pc_default(self, tmp_path, simple_design_mlir):
+        """Default (no --trace-mode) emits EventPC mode.
 
-        The mlir-aie custom printer serialises TraceMode.EventTime as the
-        string literal "Event-Time" (with quotes and a hyphen), matching the
-        assembly format defined in AIETraceOps.td.
+        Production default is event_pc (mode 1) -- it records PC alongside
+        each event, which is the easiest mode to ground in disassembly.
+        The mlir-aie custom printer serialises TraceMode.EventPC as the
+        string literal "Event-PC" (with quotes and a hyphen).
         """
         inp = tmp_path / "in.mlir"
         inp.write_text(simple_design_mlir)
@@ -625,8 +640,8 @@ class TestMlirTraceInjectMode:
         rc = run_inject(["--input", str(inp), "--out", str(out)])
         assert rc == 0
         text = out.read_text()
-        # Actual MLIR text: aie.trace.mode "Event-Time"
-        assert 'aie.trace.mode "Event-Time"' in text
+        # Actual MLIR text: aie.trace.mode "Event-PC"
+        assert 'aie.trace.mode "Event-PC"' in text
 
     def test_inject_mode_event_pc_round_trips(self, tmp_path, simple_design_mlir):
         """--trace-mode event_pc emits EventPC mode and refuses double-injection.
@@ -776,10 +791,14 @@ class TestMlirTraceInjectWarnings:
         assert rc == 0
         # Warning must appear -- but we invoked as a subprocess so capsys
         # won't capture its stderr.  Instead re-invoke and capture via
-        # subprocess.run with stderr=PIPE.
+        # subprocess.run with stderr=PIPE. This call doesn't go through
+        # run_inject's auto --trace-config-out wiring, so pass it
+        # explicitly here -- the injector requires it on injection paths.
+        out_warn = tmp_path / "out_warn.mlir"
         result = subprocess.run(
             [sys.executable, str(_MLIR_INJECT),
-             "--input", str(inp), "--out", str(tmp_path / "out_warn.mlir"),
+             "--input", str(inp), "--out", str(out_warn),
+             "--trace-config-out", str(tmp_path / "trace_config_warn.json"),
              "--trace-mode", "event_pc",
              "--memmod-sweep-events", "DMA_S2MM_0_FINISHED_BD,LOCK_0_ACQUIRED"],
             stderr=subprocess.PIPE,

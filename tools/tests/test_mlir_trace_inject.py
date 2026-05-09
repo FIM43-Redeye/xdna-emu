@@ -19,6 +19,22 @@ def _run(args, check=True):
     # Python (not the system python3) -- using sys.executable ensures the test
     # works whether pytest was invoked via the activated venv or via a direct
     # path to the ironenv interpreter.
+    #
+    # Auto-supply --trace-config-out when we're injecting (anything that
+    # writes an --out and isn't --no-op or --help). The injector errors out
+    # if the flag is missing on injection paths; deriving the config path
+    # from the --out parent dir keeps every test self-contained inside its
+    # own tmp_path without each test needing to wire it up by hand.
+    args = list(args)
+    if (
+        "--no-op" not in args
+        and "--help" not in args
+        and "--trace-config-out" not in args
+        and "--out" in args
+    ):
+        out_path = Path(args[args.index("--out") + 1])
+        args += ["--trace-config-out",
+                 str(out_path.with_name("trace_config.json"))]
     return subprocess.run(
         [sys.executable, str(INJECTOR), *args],
         capture_output=True,
@@ -91,7 +107,9 @@ def test_injector_adds_trace_decl_per_compute_tile(tmp_path):
     assert "@trace_t0_2" in result, f"sym_name missing; got:\n{result}"
     # Body must contain all the spec-mandated fields. Regressions that drop
     # the mode op, event list, or broadcast channels should fail this test.
-    assert "Event-Time" in result, "aie.trace.mode 'Event-Time' missing"
+    # Default mode is event_pc (mode 1) -- see mlir-trace-inject's
+    # parse_args. To assert against a different mode, pass --trace-mode.
+    assert "Event-PC" in result, "aie.trace.mode 'Event-PC' missing"
     assert "INSTR_VECTOR" in result, "INSTR_VECTOR event missing"
     assert "INSTR_EVENT_0" in result, "INSTR_EVENT_0 event missing"
     assert "INSTR_EVENT_1" in result, "INSTR_EVENT_1 event missing"

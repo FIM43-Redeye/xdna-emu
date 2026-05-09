@@ -1,0 +1,18 @@
+# xdna-emu Python tooling dependencies (separate from mlir-aie's).
+#
+# These are needed by tools/ scripts that aren't covered by mlir-aie's
+# python/requirements.txt:
+#   - jsonschema:        used by tools/trace_config.py to validate
+#                        trace_config.json against trace_config_schema.json
+#   - tree-sitter,
+#     tree-sitter-cpp:   used by tools/cpp_trace_patch.py to inject the
+#                        trace BO into test.cpp via AST manipulation
+#                        (rather than fragile regex)
+#
+# Install into the activated mlir-aie ironenv:
+#   pip install -r tools/requirements.txt
+#
+# When CLEAN_PYENV=1 forces ironenv recreation, rerun this install.
+jsonschema>=4.0
+tree-sitter>=0.20
+tree-sitter-cpp>=0.20
