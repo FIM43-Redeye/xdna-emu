@@ -1,37 +1,47 @@
 ---
-name: 'Bridge test reliability: HW/EMU contention masked all v1 "real bugs"; trace-injection wedges memtile-only tests'
-description: The mysterious memtile_dmas/cascade/packet_flow HW failures observed in v1 sweeps were all artifacts of EMU at -j16 starving HW dispatch. Switching Phase 3+4 to sequential (HW first solo, then EMU parallel) makes 95/95 HW tests pass cleanly. Five script tooling improvements landed. One real bug remains open: trace injection on shim+memtile-only tests (entire memtile_dmas family + others) reproducibly TDRs the NPU; both shim-only and memtile-only injection variants fail independently, so the cause is something common to all trace setups on no-compute-tile devices.
+name: 'Bridge test reliability: HW/EMU contention masked v1 failures; memtile_dmas family is broken on HW *independent* of trace'
+description: The mysterious memtile_dmas/cascade/packet_flow HW failures in v1 sweeps were artifacts of EMU at -j16 starving HW dispatch. Switching Phase 3+4 to sequential (HW first solo, then EMU parallel) makes 90/95 HW tests pass cleanly. Five script tooling improvements landed. The "trace wedge on memtile-only tests" hypothesis (Bug #6) was a RED HERRING -- post-reboot bisect showed memtile_dmas/* TDR even with --no-trace, both compilers, repeatedly. The trace prologue is bit-identical to passing tests. Real cause is unknown; suspect memtile DMA programming / firmware state. Bug #6 remains open with new scope.
 type: project
 ---
 
-# Bridge test reliability + trace-injection wedge -- 2026-05-09
+# Bridge test reliability + memtile_dmas regression -- 2026-05-09
 
 ## TL;DR
 
-A long debugging session unraveled the "memtile_dmas tests fail on real
-hardware" mystery into three independent causes:
+A long debugging session went through three phases:
 
 1. **CPU contention masquerading as HW bugs.** Phase 3+4 originally ran
    HW (-j1) and EMU (-j16) concurrently. EMU at -j16 starved HW's
    userspace dispatch enough to cause spurious TDRs and even data
-   corruption (FAIL) on memtile_dmas tests. Targeted reliability test
-   (5 v1-failing tests x 3 iterations, HW solo) showed **30/30 PASS**.
-   Hypothesis confirmed.
+   corruption (FAIL) on memtile_dmas tests. Confirmed by switching to
+   sequential ordering. The "30/30 PASS" reliability run that supported
+   this hypothesis was either run with trace enabled (different code
+   path than my variants) or hit a transient working window -- post-
+   reboot the same tests now fail consistently with --no-trace.
 
 2. **Trace pipeline crash on shim+memtile-only tests.** `mlir-trace-inject.py`
    bailed early when a device had no compute tiles, then `_build_trace_config`
    crashed downstream on `min(t["col"] for t in tiles_traced)`. Affected
-   the entire `memtile_dmas/*` family plus several others. Now fixed
-   (commit `534383e`).
+   the entire `memtile_dmas/*` family plus several others. Real bug,
+   now fixed (commit `534383e`).
 
-3. **Trace injection wedges memtile-only tests on real HW.** With trace
+3. **"Trace wedges memtile-only tests" -- RED HERRING.** With trace
    injection enabled, `memtile_dmas/dma_configure_task_lock` reproducibly
-   TDRs the NPU within 9-15s. Both shim-only and memtile-only injection
-   variants fail, so the cause is shared trace plumbing, not a
-   tile-type-specific issue. **Open bug.**
+   TDRs the NPU within 9-15s. Initial bisect showed both shim-only and
+   memtile-only injection variants fail, suggesting a shared trace
+   plumbing issue. **However, follow-up MLIR-level binary-search variants
+   (A-F below) ALL TDR, including a variant that drops the entire
+   shim trace BD setup. After clearing build caches and re-running with
+   --no-trace, the test STILL TDRs.** All four memtile_dmas tests we
+   tried (blockwrite_using_locks, dma_configure_task_lock,
+   dma_configure_task_token, writebd, writebd_tokens) TDR with --no-trace
+   on both compilers. add_one_using_dma --no-trace passes; xrt-smi
+   validate passes; system is healthy. The trace was incidental.
 
-The HW-only sweep with sequential ordering ran 95/95 PASS in 26 minutes,
-0 TDRs.
+The HW-only sweep with sequential ordering ran 95/95 PASS in 26 minutes
+in this session, but that was BEFORE the memtile_dmas regression
+manifested -- they appear in the doc-section "Tests confirmed PASSING"
+below but no longer pass.
 
 ## Bridge test improvements landed
 
@@ -60,78 +70,106 @@ run, so Phase 5 silently compared today's fresh HW against yesterday's
 stale EMU and the report displayed misleading "PASS PASS CLEAN" rows.
 The guard nukes the disabled side's artifacts before Phase 3+4 starts.
 
-## Bug #6: trace injection wedges memtile-only tests
+## Bug #6 (rescoped): memtile_dmas/* family TDRs on HW with --no-trace
 
 ### Repro
 
 ```bash
 pkexec modprobe -r amdxdna && pkexec modprobe amdxdna
 xrt-smi validate                      # confirm NPU healthy
-nice -n 19 ./scripts/emu-bridge-test.sh --no-emu \
+# clear cache so bridge test actually rebuilds
+rm -rf ../mlir-aie/build/test/npu-xrt/memtile_dmas/dma_configure_task_lock/{chess,peano,traced,test.exe,test.cpp}
+nice -n 19 ./scripts/emu-bridge-test.sh --no-emu --no-trace --chess-only \
     'memtile_dmas/dma_configure_task_lock$'
 ```
 
-Result: HW TDR at ~10s (chess) / ~16s (peano), 100% reproducible.
-Without trace (`--no-trace`), same test passes in ~5s.
+Result: HW TDR at ~7s, 100% reproducible. add_one_using_dma --no-trace
+PASSES under the same conditions, so the system itself is healthy.
 
-### Bisect findings (2026-05-09)
+### Variant-bisect ruling out the trace-prologue hypothesis (2026-05-09)
 
-Manually edited the `trace-prepare.py` invocation in
-`scripts/emu-bridge-test.sh` to omit one tile type at a time:
+Hand-edited `aie_traced.mlir` and recompiled via aiecc, then ran
+test_traced.exe directly with the modified xclbin/insts.bin. All
+variants TDR'd:
 
-| Variant | Result |
-|---|---|
-| Both shim + memtile (default) | TDR |
-| Shim only (`--shim-sweep-events all`, no memtile) | TDR |
-| Memtile only (`--memtile-sweep-events all`, no shim) | TDR |
-| No trace at all (`--no-trace`) | PASS |
+| Variant | What was changed | Result |
+|---|---|---|
+| Baseline | trace as injected | TDR @10s |
+| A | drop issue_token bit on trace BD push (0x8000000F → 0xF) | TDR |
+| B | drop shim event broadcast/timer setup (0x34000/0x3404C/0x34008) | TDR |
+| C | drop memtile trace config (0x94*** writes) + packet flows | TDR |
+| D | drop entire shim trace BD setup (writebd 15 + push) | TDR |
+| F | keep all writes, drop just the packet_flow blocks | TDR |
 
-So the wedge isn't tile-type-specific. Both modes share:
+After this dead-end, cleared the build cache and re-ran the bridge
+test with `--no-trace`. **Still TDR.** That eliminated trace as a
+cause entirely. Also confirmed:
 
-1. **Shim DMA channel 1** as the trace output sink. Both modes set up
-   shim BD 15 and `dma_configure_task` on channel 1 to drain trace
-   packets to a host buffer.
-2. **Trace control register prologue writes** before the test's own
-   `dma_configure_task` ops run (lines 12-29 in the
-   `traced/aie_traced.mlir` for this test).
-3. **address_patch with arg_idx=2** -- the trace BO patch targets arg
-   slot 2, but the original `runtime_sequence` declares only 2 args
-   (slots 0,1). Either the test_traced.cpp passes a 3rd arg slot that
-   XRT honors, or this is a real protocol gap.
+- 4/4 other memtile_dmas tests (blockwrite_using_locks,
+  dma_configure_task_token, writebd, writebd_tokens) all TDR with
+  --no-trace on chess.
+- The trace prologue is **bit-identical** to add_one_using_dma's
+  trace prologue (same controller_id collision pattern, same shim S2MM
+  1 BD push with token, same memtile Timer_Control = 0x9D00).
+  add_one_using_dma passes with trace, memtile_dmas tests TDR with or
+  without trace.
 
-### Likely root causes (need verification)
+So the original "trace wedges memtile-only tests" bisect (which I'd
+done by toggling --shim-sweep-events vs --memtile-sweep-events flags)
+was finding the same underlying TDR each time, NOT a trace-specific
+bug.
 
-- **Shim S2MM channel 1 conflict.** The test's data flows use shim
-  S2MM channel 0; trace uses channel 1. They shouldn't conflict on
-  paper, but the trace prologue writes to nearby register addresses
-  (0x340D0..0x340E4 for shim Trace_Control + Trace_Event regs), and
-  there's a `maskwrite32` to address 0x1D2C8 with mask 0xFF00 that
-  warrants checking against the regdb.
-- **Memtile register 0x94000 write at line 22** with value 0x9D00.
-  This is on memtile (row=1) and might be touching memtile DMA or
-  stream switch state the test relies on.
-- **arg_idx=2 protocol.** Worth checking `test_traced.cpp` (or the
-  template `tools/templates/test_traced.cpp.in` if it exists) to see
-  whether 3 BOs are passed and how arg_idx maps.
+### What dmesg actually shows
 
-### Suggested next steps for the open fix
+```
+amdxdna 0000:c6:00.1: aie2_tdr_work: Device isn't making progress... Count 13 timeout 2
+amdxdna 0000:c6:00.1: aie2_dump_ctx: Dumping ctx ...
+amdxdna 0000:c6:00.1: aie2_dump_ctx: 	op: 0x0
+amdxdna 0000:c6:00.1: aie2_dump_ctx: 	msg: 0x1d000001
+amdxdna 0000:c6:00.1: aie2_dump_ctx: 	fence: unsignaled
+```
 
-In rough order of cheap-first:
+Generic "kernel never completed". No firmware-side diagnostic. The
+kernel is just hung somewhere in the runtime sequence's DMA waits.
 
-1. Read `test_traced.cpp` for this test and confirm it passes 3 BOs
-   (input, output, trace_bo). Verify XRT arg_idx mapping is sane.
-2. Diff the trace prologue writes against AM025 regdb to identify
-   which registers are being touched and whether they overlap with
-   the test's memtile DMA channel state.
-3. Capture the runtime mailbox traffic via the new debugfs interface
-   (#358) to see what firmware sees vs what the kernel queues.
-4. Try a "shim DMA channel 1 only, no register prologue" variant by
-   manually editing the traced MLIR -- isolate whether the prologue
-   writes alone are enough to wedge.
+### Open questions for next session
 
-## Tests confirmed PASSING with HW solo (no contention, no trace)
+- Are these tests ACTUALLY broken, or is there persistent state from
+  trace TDRs that a stronger reset (suspend/resume, reboot) would
+  clear? `pkexec modprobe -r amdxdna && pkexec modprobe amdxdna` does
+  NOT clear it -- need to escalate.
+- If tests are genuinely broken: when did they regress? They were
+  added by mlir-aie commit `9c92428136` on 2026-02-06 and were
+  reportedly passing in earlier sessions.
+- WHERE is the wedge happening? The runtime sequence has chained
+  memtile S2MM 0 BDs (0,1,2,3) gated on prod_lock/cons_lock, then
+  memtile MM2S 0 (BD 4) acquires cons_lock 4× and reads, then shim
+  S2MM 0 receives. dmesg can't tell us which step hangs. Need to
+  read AIE registers post-TDR via `xrt::hw_context::read_aie_reg`
+  (#356 added this on NPU1) to see lock state, BD state, channel
+  state, etc.
 
-From `bahg41enj` reliability run (3 iterations, 30/30 PASS):
+### Suggested next steps (post-reboot)
+
+1. Reboot to clear any persistent NPU/firmware state.
+2. Re-run memtile_dmas/dma_configure_task_lock --no-trace and verify
+   it still TDRs (confirm regression vs accumulated state).
+3. If still TDRs: capture AIE register state at TDR time via
+   `xrt::hw_context::read_aie_reg`. Read in order of likely hangs:
+   - memtile prod_lock / cons_lock values
+   - memtile S2MM 0 channel CTRL + STATUS + current_BD
+   - memtile MM2S 0 channel CTRL + STATUS + current_BD
+   - shim S2MM 0 channel CTRL + STATUS
+   - shim MM2S 0 channel CTRL + STATUS
+4. From register state, identify which DMA is stuck on which lock.
+5. Cross-reference with mlir-aie git history near 9c92428136 to see
+   if any subsequent commit changed lock semantics or BD chain
+   behavior.
+
+## Tests reportedly PASSING earlier in session (now contradicted)
+
+The `bahg41enj` reliability run logged 30/30 PASS for these (3 iters,
+chess+peano):
 
 - `cascade_flows` (chess)
 - `memtile_dmas/blockwrite_using_locks` (chess)
@@ -141,7 +179,18 @@ From `bahg41enj` reliability run (3 iterations, 30/30 PASS):
 - `memtile_dmas/writebd_tokens` (chess)
 - `packet_flow_fanout` (chess + peano)
 
-All previously suspected of being real DMA bugs. None are.
+**But these now consistently TDR with --no-trace.** Possible
+explanations:
+
+- The reliability run may have used trace artifacts (it ran during
+  the same session as trace experiments and may have inherited
+  cached trace-injected artifacts).
+- Or the NPU was in a different state then; the many trace TDRs
+  since then have left persistent state nothing short of a reboot
+  clears.
+- Or a recent emulator/tooling change perturbed something.
+
+This needs to be re-verified after a reboot.
 
 ## HW-only full sweep summary
 
