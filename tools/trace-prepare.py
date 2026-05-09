@@ -118,6 +118,7 @@ def inject_trace_declarative(
     test_name: str,
     src_mlir: Path,
     shim_sweep_events: str | None = None,
+    memtile_sweep_events: str | None = None,
 ) -> tuple[str, dict]:
     """Run mlir-trace-inject.py on the MLIR text.
 
@@ -160,6 +161,10 @@ def inject_trace_declarative(
         # pre-stage-1 behavior for callers that don't pass this through.
         if shim_sweep_events is not None:
             cmd += ["--shim-sweep-events", shim_sweep_events]
+        # Opt-in memtile trace injection (stage 2 / #373). Same forwarding
+        # pattern as shim above: None leaves row-1 tiles untraced.
+        if memtile_sweep_events is not None:
+            cmd += ["--memtile-sweep-events", memtile_sweep_events]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
             raise RuntimeError(
@@ -220,6 +225,7 @@ def prepare_trace(
     test_quarantine_path: Path,
     trace_quarantine_path: Path,
     shim_sweep_events: str | None = None,
+    memtile_sweep_events: str | None = None,
 ) -> int:
     """Run the trace preparation pipeline.
 
@@ -304,6 +310,7 @@ def prepare_trace(
                 test_name=test_name,
                 src_mlir=test_dir / "aie.mlir",
                 shim_sweep_events=shim_sweep_events,
+                memtile_sweep_events=memtile_sweep_events,
             )
         except Exception as e:
             msg = f"FAIL trace injection: {e}"
@@ -432,6 +439,13 @@ def main():
              "Default (None) leaves row-0 tiles untraced. Pass 'all' (or a "
              "comma-separated event list) to inject shim DMA trace ops.",
     )
+    parser.add_argument(
+        "--memtile-sweep-events",
+        default=None,
+        help="forward through to mlir-trace-inject's --memtile-sweep-events. "
+             "Default (None) leaves row-1 tiles untraced. Pass 'all' (or a "
+             "comma-separated event list) to inject memtile DMA-port trace ops.",
+    )
     args = parser.parse_args()
 
     test_dir = args.test_dir.resolve()
@@ -459,6 +473,7 @@ def main():
         test_quarantine_path=test_quarantine,
         trace_quarantine_path=trace_quarantine,
         shim_sweep_events=args.shim_sweep_events,
+        memtile_sweep_events=args.memtile_sweep_events,
     )
     sys.exit(rc)
 

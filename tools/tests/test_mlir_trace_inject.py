@@ -214,6 +214,127 @@ def test_injector_no_devices_have_runtime_sequence_is_clean_noop(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Memtile injection (#373 / Stage 2)
+# ---------------------------------------------------------------------------
+
+_FIXTURE_WITH_MEMTILE = """\
+module {
+  aie.device(npu1_1col) {
+    %tile_0_0 = aie.tile(0, 0)
+    %tile_0_1 = aie.tile(0, 1)
+    %tile_0_2 = aie.tile(0, 2)
+    aie.core(%tile_0_2) {
+      aie.end
+    }
+    aie.runtime_sequence(%arg0: memref<16xi32>) {
+    }
+  }
+}
+"""
+
+
+def _write_memtile_fixture(tmp_path) -> Path:
+    """Build a self-contained MLIR fixture with shim+memtile+compute tiles."""
+    fp = tmp_path / "memtile_fixture.mlir"
+    fp.write_text(_FIXTURE_WITH_MEMTILE)
+    return fp
+
+
+def test_memtile_injection_default_off(tmp_path):
+    """Without --memtile-sweep-events, row-1 tiles must NOT receive trace ops.
+
+    Stage 2 must preserve pre-#373 behaviour for callers that haven't opted
+    in. The fixture has a memtile at (0,1); injecting with no flag should
+    produce a core trace at @trace_t0_2 only -- no @trace_memtile_0_1.
+    """
+    fixture = _write_memtile_fixture(tmp_path)
+    out = tmp_path / "out.mlir"
+    r = _run(["--input", str(fixture), "--out", str(out)])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    result = out.read_text()
+    assert "@trace_t0_2" in result, "core trace decl missing"
+    assert "@trace_memtile_0_1" not in result, (
+        f"memtile trace leaked without opt-in flag:\n{result}"
+    )
+    assert "TracePacketType.MemTile" not in result, (
+        "memtile packet type appeared without opt-in"
+    )
+
+
+def test_memtile_injection_with_sweep_flag(tmp_path):
+    """With --memtile-sweep-events all, row-1 tiles must receive a MemTile
+    trace op with the upstream PORT_RUNNING DMA-channel default events,
+    paired with one trace.port slot per event."""
+    fixture = _write_memtile_fixture(tmp_path)
+    out = tmp_path / "out.mlir"
+    r = _run([
+        "--input", str(fixture),
+        "--out", str(out),
+        "--memtile-sweep-events", "all",
+    ])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    result = out.read_text()
+
+    # Memtile trace decl should land on (0,1) with the conventional sym.
+    assert "@trace_memtile_0_1" in result, (
+        f"memtile trace decl missing:\n{result}"
+    )
+    # Packet type must be memtile, not core or shimtile. The aie dialect's
+    # custom printer uses lowercase keywords for the TracePacketType enum.
+    assert "type = memtile" in result, "memtile packet type missing"
+    # All 8 PORT_RUNNING events should be in the body.
+    for slot in range(8):
+        assert f"PORT_RUNNING_{slot}" in result, (
+            f"PORT_RUNNING_{slot} missing for memtile"
+        )
+    # Each PORT_RUNNING event needs a paired trace.port slot config.
+    # The aie.trace.port op is what binds slot N to (port=DMA, channel,
+    # direction). 8 events => 8 unique slot configs.
+    assert result.count("aie.trace.port") == 8, (
+        f"expected 8 aie.trace.port ops, got {result.count('aie.trace.port')}\n{result}"
+    )
+    # Both directions should appear (slots 0-3 are S2MM, 4-7 are MM2S).
+    assert "S2MM" in result, "S2MM direction missing on memtile port config"
+    assert "MM2S" in result, "MM2S direction missing on memtile port config"
+    # Runtime sequence must reference the memtile sym in start_config.
+    assert "aie.trace.start_config @trace_memtile_0_1" in result, (
+        "runtime_sequence missing memtile start_config"
+    )
+
+
+def test_memtile_injection_in_trace_config(tmp_path):
+    """Memtile entries must appear in the trace_config.json with kind=memtile."""
+    import json
+
+    fixture = _write_memtile_fixture(tmp_path)
+    out = tmp_path / "out.mlir"
+    cfg_path = tmp_path / "trace_config.json"
+    r = _run([
+        "--input", str(fixture),
+        "--out", str(out),
+        "--memtile-sweep-events", "all",
+        "--trace-config-out", str(cfg_path),
+    ])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    cfg = json.loads(cfg_path.read_text())
+    memtile_entries = [
+        t for t in cfg["tiles_traced"] if t["kind"] == "memtile"
+    ]
+    assert len(memtile_entries) == 1, (
+        f"expected 1 memtile entry, got {memtile_entries}"
+    )
+    entry = memtile_entries[0]
+    assert (entry["col"], entry["row"]) == (0, 1)
+    # Events list should mirror the upstream defaults (8 PORT_RUNNING_X).
+    assert len(entry["events"]) == 8
+    assert all(e.startswith("PORT_RUNNING_") for e in entry["events"])
+    # tracing.memtile_sweep should also reflect the resolved sweep when 'all'.
+    assert cfg["tracing"]["memtile_sweep"] == ["all"], (
+        f"unexpected memtile_sweep: {cfg['tracing']['memtile_sweep']}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Integration tests: injected MLIR survives a real aiecc.py compile
 # ---------------------------------------------------------------------------
 

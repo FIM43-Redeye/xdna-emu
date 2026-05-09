@@ -126,6 +126,58 @@ _TRACE_DEFAULT_SHIM_EVENTS = (
     "DMA_S2MM_0_STREAM_STARVATION",
     "DMA_S2MM_1_STREAM_STARVATION",
 )
+_TRACE_DEFAULT_MEMTILE_EVENTS = (
+    # Mirrors mlir-aie's own mem-tile defaults in
+    # python/utils/trace/setup.py::_get_default_events_for_tile.
+    # All eight are MemTilePortEvents (BasePortEvent subclass) bound
+    # to DMA channel ports: PORT_RUNNING_0..3 watch DMA channels 0-3
+    # in S2MM (master) direction, and PORT_RUNNING_4..7 watch the same
+    # channels in MM2S (slave) direction.
+    #
+    # Unlike shim/core, the memtile trace unit's slot-port mapping is
+    # not implicit in the event name -- each PORT_RUNNING_X must be
+    # paired with an aie.trace.port slot config. The default port
+    # configs are emitted alongside the events when this default set
+    # is in use; the per-slot (port, channel, direction) mapping is
+    # encoded in _memtile_default_port_config below.
+    #
+    # Memtile DMA channels carry inter-tile data movement (compute
+    # tiles below pulling from / pushing to the memtile's shared
+    # SRAM), so PORT_RUNNING events here flag stream activity at the
+    # memtile boundary -- complementing the shim DMA events at the
+    # NoC boundary and the core trace at the compute side.
+    "PORT_RUNNING_0",
+    "PORT_RUNNING_1",
+    "PORT_RUNNING_2",
+    "PORT_RUNNING_3",
+    "PORT_RUNNING_4",
+    "PORT_RUNNING_5",
+    "PORT_RUNNING_6",
+    "PORT_RUNNING_7",
+)
+
+
+def _memtile_default_port_config(event_name: str):
+    """Return (channel, master) for a memtile PORT_RUNNING_<N> event, else None.
+
+    Mirrors the default MemTilePortEvent layout used by mlir-aie's
+    setup.py::_get_default_events_for_tile for memtile:
+        slot 0..3 -> DMA channel 0..3, master=True  (S2MM, into tile)
+        slot 4..7 -> DMA channel 0..3, master=False (MM2S, out of tile)
+
+    The port bundle is always WireBundle.DMA for memtile defaults; if
+    a future caller wants to monitor non-DMA bundles, that needs a
+    richer override path than --memtile-sweep-events alone.
+    """
+    if not event_name.startswith("PORT_RUNNING_"):
+        return None
+    try:
+        slot = int(event_name.rsplit("_", 1)[1])
+    except ValueError:
+        return None
+    if not (0 <= slot < 8):
+        return None
+    return slot % 4, slot < 4
 
 
 def _trace_sym(col: int, row: int, kind: str = "core") -> str:
@@ -180,8 +232,14 @@ def parse_args():
                         "perfcnt cycle clock + two software pin events.")
     p.add_argument("--memmod-grounding", default="PERF_CNT_0",
                    help="grounding events for compute-tile memmod trace unit.")
-    p.add_argument("--memtile-grounding", default="PERF_CNT_0",
-                   help="grounding events for memtile trace unit.")
+    p.add_argument("--memtile-grounding", default="",
+                   help="grounding events for memtile trace unit. Default is "
+                        "empty so all 8 default memtile sweep events fit. "
+                        "PERF_CNT_0 is NOT a useful memtile grounding today: "
+                        "the inject tool emits no memtile performance counter "
+                        "config, so the slot would be reserved for an event "
+                        "that never fires. Pass --memtile-grounding PERF_CNT_0 "
+                        "explicitly once memtile perfcnt support lands.")
     p.add_argument("--shim-grounding", default="",
                    help="grounding events for shim PL trace unit. Default is "
                         "empty so all 8 default shim sweep events fit. "
@@ -457,7 +515,7 @@ def _build_trace_config(
             "shim_grounding": shim_grounding,
             "shim_sweep": shim_sweep,
             "memtile_grounding": memtile_grounding,
-            "memtile_sweep": [],
+            "memtile_sweep": memtile_sweep,
         },
         "tiles_traced": tiles_traced,
         "routing": {
@@ -490,8 +548,8 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
           - trace_mode: "event_time" or "event_pc"
           - core_grounding, core_sweep_events
           - memmod_grounding, memmod_sweep_events (not yet injected)
-          - memtile_grounding, memtile_sweep_events (not yet injected)
-          - shim_grounding, shim_sweep_events (not yet injected)
+          - memtile_grounding, memtile_sweep_events (live as of #373)
+          - shim_grounding, shim_sweep_events (live as of #372)
           - perfcnt_period: PERF_CNT_0 firing period in cycles
 
     Compute tile classification for npu1 / npu1_1col:
@@ -638,6 +696,22 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
         _TRACE_DEFAULT_SHIM_EVENTS,
     ) if inject_shim else []
 
+    # Memtile trace injection is opt-in on the same pattern. Any non-None
+    # --memtile-sweep-events value activates row-1 tile instrumentation:
+    # TraceOp with packet type MemTile, no trace_mode (memtile has no Mode
+    # bitfield per regdb), and one aie.trace.port slot config per
+    # PORT_RUNNING_<N> event. Memtile *does* expose Performance_Counter0
+    # in its register space, but the perfcnt config emit path is currently
+    # core-only -- so PERF_CNT_0 in --memtile-grounding would reserve a
+    # slot for an event that never fires today (same caveat the shim
+    # branch documents).
+    inject_memtile = args.memtile_sweep_events is not None
+    memtile_events = _resolve_events(
+        args.memtile_grounding,
+        args.memtile_sweep_events,
+        _TRACE_DEFAULT_MEMTILE_EVENTS,
+    ) if inject_memtile else []
+
     # Track every traced tile across all target devices for trace_config.json.
     all_traced_tiles: list[tuple[int, int, list[str]]] = []
 
@@ -651,27 +725,33 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
         # when shim injection is opted into.
         compute_tiles = []  # list of (col: int, row: int, tile_ssa_value)
         shim_tiles = []     # list of (col: int, row: int, tile_ssa_value)
+        memtile_tiles = []  # list of (col: int, row: int, tile_ssa_value)
         for inner in device_body.operations:
             if inner.operation.name == "aie.tile":
                 col = int(IntegerAttr(inner.operation.attributes["col"]).value)
                 row = int(IntegerAttr(inner.operation.attributes["row"]).value)
                 if row >= 2:
                     compute_tiles.append((col, row, inner.operation.result))
+                elif row == 1 and inject_memtile:
+                    memtile_tiles.append((col, row, inner.operation.result))
                 elif row == 0 and inject_shim:
                     shim_tiles.append((col, row, inner.operation.result))
 
         if not compute_tiles:
             # No kernels live on this device -- skip silently. A device with
             # a runtime_sequence but no compute tiles is unusual but not an
-            # error (e.g. a placeholder device). Skip shim injection here too:
-            # tracing shim DMA without any compute tiles to drive it would
-            # produce an empty trace anyway.
+            # error (e.g. a placeholder device). Skip shim/memtile injection
+            # here too: tracing DMA boundaries without any compute tiles to
+            # drive them would produce an empty trace anyway.
             continue
 
         # Record traced tiles for the trace_config.json payload. Core events
-        # apply to compute tiles; shim events apply to row-0 tiles.
+        # apply to compute tiles; shim events apply to row-0 tiles; memtile
+        # events apply to row-1 tiles.
         for col, row, _ in compute_tiles:
             all_traced_tiles.append((col, row, core_events))
+        for col, row, _ in memtile_tiles:
+            all_traced_tiles.append((col, row, memtile_events))
         for col, row, _ in shim_tiles:
             all_traced_tiles.append((col, row, shim_events))
 
@@ -748,6 +828,58 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                     aied.trace_start(broadcast=_TRACE_BROADCAST_START)
                     aied.trace_stop(broadcast=_TRACE_BROADCAST_STOP)
 
+            # Memtile trace ops mirror configure_trace()'s mem-tile path.
+            # Differences from the shim block:
+            #   - TracePacketType.MemTile.
+            #   - PORT_RUNNING_<N> events require a paired aie.trace.port
+            #     slot config (the upstream MemTilePortEvent class binds
+            #     each event to a (port, channel, direction) tuple before
+            #     calling trace_port). We derive the default DMA bundle
+            #     mapping from the slot index via _memtile_default_port_config.
+            #   - Non-PORT_RUNNING events fall through as plain GenericEvents
+            #     (no port slot needed) -- this lets a user pass a mixed
+            #     event list via --memtile-sweep-events without breaking.
+            #   - No perfcnt config emitted: memtile *does* expose
+            #     Performance_Counter0 in its register space (per the
+            #     AM025 regdb), but the perfcnt config emit path is
+            #     core-only today; PERF_CNT_0 in --memtile-grounding
+            #     would reserve a slot for an event that never fires
+            #     until that wiring is added.
+            for col, row, tile_val in memtile_tiles:
+                # Pre-compute the slot-port configs for this tile's events.
+                # Multiple events can share a slot (e.g. PORT_RUNNING_0 and
+                # PORT_TLAST_0 both monitor slot 0); the upstream code
+                # validates that they agree on (port, channel, direction).
+                # We just build the dict here -- _memtile_default_port_config
+                # returns the same answer for every PORT_*_X variant of the
+                # same X, so no per-tile validation is needed today.
+                memtile_port_cfgs: dict[int, tuple[int, bool]] = {}
+                for ev_name in memtile_events:
+                    cfg = _memtile_default_port_config(ev_name)
+                    if cfg is not None:
+                        slot = int(ev_name.rsplit("_", 1)[1])
+                        memtile_port_cfgs[slot] = cfg
+
+                @aied.trace(tile_val, _trace_sym(col, row, "memtile"))
+                def _memtile_trace_body():  # noqa: F811 -- redefinition is intentional (one per tile)
+                    aied.trace_packet(_TRACE_PACKET_ID_START, aied.TracePacketType.MemTile)
+                    for event_name in memtile_events:
+                        aied.trace_event(event_name)
+                    # Emit one trace_port per unique slot. Mirrors mlir-aie's
+                    # setup.py loop (line 499-502): "for slot, (config, _) in
+                    # port_configs.items(): trace_port(slot, port, channel,
+                    # direction)". master=True maps to S2MM, False to MM2S.
+                    for slot, (channel, master) in memtile_port_cfgs.items():
+                        direction = (
+                            aied.DMAChannelDir.S2MM if master
+                            else aied.DMAChannelDir.MM2S
+                        )
+                        aied.trace_port(
+                            slot, aied.WireBundle.DMA, channel, direction,
+                        )
+                    aied.trace_start(broadcast=_TRACE_BROADCAST_START)
+                    aied.trace_stop(broadcast=_TRACE_BROADCAST_STOP)
+
         rs_block = rs_op.operation.regions[0].blocks[0]
         with InsertionPoint.at_block_begin(rs_block):
             # trace_host_config(buffer_size=N, arg_idx=K) emits:
@@ -763,11 +895,15 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
             )
             # trace_start_config(name) emits:
             #   aie.trace.start_config @<name>
-            # One per compute tile trace decl, then per shim tile trace decl,
-            # then one per perfcnt config block.
+            # One per compute tile trace decl, then memtile decls, then
+            # shim tile decls, then one per perfcnt config block. Order
+            # only matters for human-readable diffs; aiecc's trace
+            # lowering passes don't care about emission order.
             # Mirror of mlir-aie python/utils/trace/setup.py line 542.
             for col, row, _ in compute_tiles:
                 aied.trace_start_config(_trace_sym(col, row, "core"))
+            for col, row, _ in memtile_tiles:
+                aied.trace_start_config(_trace_sym(col, row, "memtile"))
             for col, row, _ in shim_tiles:
                 aied.trace_start_config(_trace_sym(col, row, "shim"))
             for sym in perf_syms:
@@ -824,11 +960,11 @@ def main():
     # have no Mode field and always operate in event_time (mode 0). This is a
     # portability warning: the non-core events will be recorded, just in mode 0.
     #
-    # Shim injection is live as of stage 1 of #372; --shim-sweep-events drives
-    # it. Memmod/memtile injection (#373/#374) is still deferred -- when those
-    # land, this trigger should also fire when the user passes a non-default
-    # --memmod-grounding / --memtile-grounding (the Mode constraint applies
-    # to grounding too).
+    # Shim injection is live as of stage 1 (#372); memtile as of stage 2
+    # (#373); both are driven by their --*-sweep-events flags. Memmod
+    # (compute mem-module) injection (#374) is still deferred -- when that
+    # lands, this trigger should also fire when the user passes a non-default
+    # --memmod-grounding (the Mode constraint applies to grounding too).
     if args.trace_mode in ("event_pc", "inst_exec") and any(
         s for s in [
             args.memmod_sweep_events,
