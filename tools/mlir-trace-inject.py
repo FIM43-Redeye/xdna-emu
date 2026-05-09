@@ -832,12 +832,19 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                 elif row == 0 and inject_shim:
                     shim_tiles.append((col, row, inner.operation.result))
 
-        if not compute_tiles:
-            # No kernels live on this device -- skip silently. A device with
-            # a runtime_sequence but no compute tiles is unusual but not an
-            # error (e.g. a placeholder device). Skip shim/memtile injection
-            # here too: tracing DMA boundaries without any compute tiles to
-            # drive them would produce an empty trace anyway.
+        # Skip only if nothing on this device is going to be traced.
+        # Originally this skipped any device without compute tiles on the
+        # assumption that DMA-only traces would be empty -- but tests like
+        # memtile_dmas/* drive shim+memtile DMAs from the runtime_sequence
+        # via dma_configure_task without any compute core, and their trace
+        # output is meaningful. Allow the device through whenever any of
+        # the requested tile types has at least one tile to instrument.
+        will_trace_anything = (
+            bool(compute_tiles)
+            or (inject_memtile and memtile_tiles)
+            or (inject_shim and shim_tiles)
+        )
+        if not will_trace_anything:
             continue
 
         # Record traced tiles for the trace_config.json payload. Core events
