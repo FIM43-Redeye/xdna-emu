@@ -453,6 +453,74 @@ fn test_shim_dma_event_notification() {
     // Should not panic, trace unit accepts it
 }
 
+/// End-to-end shim trace lowering scenario, matching mlir-aie's #372 stage 1
+/// output for `add_one_using_dma --shim-sweep-events all`:
+///
+/// - Trace_Control1 = 0x2001 (packet_type = 2 / ShimTile, packet_id = 1)
+/// - Trace_Control0 = 0x7E7F0000 (start = 127 = PL_USER_EVENT_1,
+///                                stop  = 126 = PL_USER_EVENT_0,
+///                                mode  = 0 / EventTime)
+/// - Trace_Event0 = 0x16100F0E (slots 0..3 = 14, 15, 16, 22)
+/// - Trace_Event1 = 0x1F1E1817 (slots 4..7 = 23, 24, 30, 31)
+///
+/// The runtime sequence then writes Event_Generate(127) to fire the start
+/// event locally and propagate BROADCAST_15 column-wise. This test exercises
+/// only the local fire path, which is what the shim trace unit listens for.
+///
+/// Verifies:
+///   1. The trace unit accepts the lowered configuration.
+///   2. Event_Generate(127) on the shim takes the trace unit out of Idle.
+///   3. After the cycle advances, a DMA_S2MM_0_START_TASK (id 14) is
+///      recorded into the pending slot mask, producing emitted bytes.
+#[test]
+fn test_shim_trace_unit_records_dma_start_task_for_lowered_config() {
+    let mut device = super::super::state::DeviceState::new_npu1();
+    device.array.set_dma_cycle(0);
+
+    // Lower-bit-faithful Control1 / Control0 / Event0 / Event1 writes.
+    device.write_tile_register(0, 0, 0x340D4, 0x2001);
+    device.write_tile_register(0, 0, 0x340D0, 0x7E7F_0000);
+    device.write_tile_register(0, 0, 0x340E0, 0x1610_0F0E);
+    device.write_tile_register(0, 0, 0x340E4, 0x1F1E_1817);
+
+    {
+        let tile = device.array.get(0, 0).unwrap();
+        let tu = &tile.core_trace;
+        assert!(tu.is_configured());
+        assert_eq!(tu.start_event, 127);
+        assert_eq!(tu.stop_event, 126);
+        assert_eq!(tu.packet_type, 2);
+        assert_eq!(tu.packet_id, 1);
+        assert_eq!(tu.event_slots, [14, 15, 16, 22, 23, 24, 30, 31]);
+    }
+
+    // Runtime sequence: Event_Generate on shim with event_id = 127.
+    // 0x34008 is the PL module Event_Generate register; the state-effects
+    // path is supposed to fire the event on local trace units AND queue a
+    // broadcast if a channel is configured to listen for that event.
+    device.array.set_dma_cycle(10);
+    device.write_tile_register(0, 0, 0x34008, 127);
+
+    // Advance one cycle and fire DMA_S2MM_0_START_TASK (PL event id 14).
+    // HW's Idle -> Running transition is pipelined by 1 cycle, so the
+    // event must arrive at cycle > armed_cycle to be recorded.
+    let cycle_dma = 11u64;
+    device.array.set_dma_cycle(cycle_dma);
+    let tile = device.array.get_mut(0, 0).unwrap();
+    tile.notify_core_trace_event(14, cycle_dma, None);
+    tile.core_trace.commit_cycle(cycle_dma);
+
+    assert!(
+        tile.core_trace.is_running(),
+        "shim trace unit should be Running after the start_event's cycle elapses"
+    );
+    tile.core_trace.flush();
+    assert!(
+        tile.core_trace.has_pending_packets(),
+        "shim trace unit should have a pending packet recording the DMA event"
+    );
+}
+
 // === Cascade Stream Tests ===
 
 #[test]

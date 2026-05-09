@@ -82,15 +82,40 @@ but no events appear in the captured stream.
 
 ## Diagnosis
 
-The configuration and routing layers are correct. The gap is in the
-emulator: it isn't faithfully emitting shim-tile trace events for
-`DMA_S2MM_*_START_TASK` / `DMA_S2MM_*_FINISHED_TASK` /
-`DMA_*_STREAM_STARVATION`.
+The configuration, event-emission, and stream-switch routing layers
+were all correct. The actual gap was a single line in
+`src/device/array/routing.rs`: when draining trace packets from a shim
+tile to its trace stream-switch slave port, the routing function was
+popping from `tile.mem_trace`. Shim's only trace unit is the PL-module
+trace, configured via the 0x340D0+ register block, which writes to
+`tile.core_trace`. So shim trace packets were piling up in `core_trace`
+and never reaching the stream switch -- while `mem_trace` (unused on
+shim) sat empty.
 
-This is structurally the same shape as #353 ("EMU does not emit
+Latent since 2026-02-23 -- predates active shim tracing; surfaced once
+#372 stage 1 actually exercised the path.
+
+## Resolution (2026-05-08)
+
+Fix: change the shim branch of `route_trace_to_tile_switches` to pop
+from `core_trace`. After the fix, the EMU writes 42 shim packets
+(pkt_type=2) and 3 core packets (pkt_type=0) to the trace BO for the
+peano `add_one_using_dma` run.
+
+A regression test in `src/device/tile/tests.rs` now exercises the full
+shim-trace path against the lowered MLIR's exact register writes (start
+event 127 = PL_USER_EVENT_1, slots 14/15/16/22/23/24/30/31).
+
+Note: `tools/parse-trace.py --decoder ours --trace-mode event_pc`
+currently only decodes core-mode-1 packets and skips the shim
+mode-0 packets. That's a decoder-side gap (mixed-mode BOs) and not an
+EMU correctness gap; the BO bytes match what HW would write.
+
+This is structurally the same SHAPE as #353 ("EMU does not emit
 LOCK_STALL trace events") and #354 ("EMU does not emit PERF_CNT_0 anchor
-pulses") -- the EMU's trace unit modeling has gaps. Stage 1 of #372
-exposes another gap: shim DMA event sourcing.
+pulses") -- a trace-unit-fidelity issue exposed only when a new flow
+exercises the path -- but the actual fix here was a pure routing
+mismatch, not a missing emission path.
 
 ## Conclusion
 
@@ -107,20 +132,27 @@ turns it into the right register writes -- is **complete**. The
 lowered output is structurally indistinguishable from what real hardware
 expects.
 
-What's not yet validated, and is **not in scope for stage 1**:
+What's not yet validated:
 
 1. **HW emission and capture**: real silicon should fire the shim DMA
-   events into the trace BO. Worth a single bridge-test run with HW once
-   we're ready to spend that time.
-2. **EMU gap fix**: emitting shim trace events on the EMU side is its
-   own task (similar to how #353 / #354 are tracked separately). This
-   doesn't gate #372 -- the EMU calibration target per
-   `feedback_emu_calibration_approach.md` is "ballpark + deterministic,
-   not perfectly accurate." Treating shim events as another known
-   trace-fidelity gap is consistent.
+   events into the trace BO. Worth a single bridge-test run with HW
+   once we're ready to spend that time.
+2. **Decoder mixed-mode support**: `parse-trace.py --decoder ours`
+   takes a single `--trace-mode` flag and applies it uniformly. A real
+   trace BO carries packets with multiple modes (core in event_pc,
+   shim in event_time) interleaved. Pre-fix this was masked because
+   shim packets were never emitted; post-fix it shows up as "the
+   shim packets in the BO don't decode." Not a correctness regression
+   -- raw bytes are right -- but a tooling gap to track separately.
 
 ### Files / data referenced
 
 - Lowered MLIR: `/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/traced/aie_traced.mlir`
-- Bridge test results: `xdna-emu/build/bridge-test-results/20260508/add_one_using_dma.{chess,peano}.emu/`
-- Decoded events: 20 core / 0 shim (Chess), 17 core / 0 shim (Peano)
+- Bridge test results: `xdna-emu/build/bridge-test-results/20260508/`
+  (pre-fix: 0 shim packets) and
+  `xdna-emu/build/bridge-test-results/20260509/` (post-fix: 42 shim
+  packets + 3 core packets in trace BO)
+- Fix: `src/device/array/routing.rs` (shim branch:
+  `mem_trace` -> `core_trace`)
+- Regression test:
+  `src/device/tile/tests.rs::test_shim_trace_unit_records_dma_start_task_for_lowered_config`

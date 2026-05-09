@@ -483,7 +483,9 @@ impl TileArray {
     /// slave ports (indices from AM025 via gen_stream_ranges.rs):
     ///   - Compute tile: TRACE_SLAVE_START (core trace), TRACE_SLAVE_END (memory trace)
     ///   - MemTile: TRACE_SLAVE_START (memory trace)
-    ///   - Shim: TRACE_SLAVE_START (trace, rarely used)
+    ///   - Shim: TRACE_SLAVE_START (PL trace, sourced from `core_trace` --
+    ///     shim has only one trace unit and it's configured via the
+    ///     0x340D0+ "core module" register block)
     ///
     /// Once on the slave port, the existing packet routing infrastructure
     /// handles forwarding to shim DMA and ultimately to host DDR.
@@ -527,12 +529,17 @@ impl TileArray {
                     }
                 }
                 TileKind::ShimNoc | TileKind::ShimPl => {
+                    // Shim has a single PL-module trace unit. Its config
+                    // registers (0x340D0+) write to `core_trace`, and shim
+                    // DMA / lock / port events are routed there too -- so
+                    // pull pending words from `core_trace`, not `mem_trace`
+                    // (which is unused on shim).
                     let trace_port = shim::TRACE_SLAVE_START as usize;
 
-                    while self.tiles[i].mem_trace.has_pending_words()
+                    while self.tiles[i].core_trace.has_pending_words()
                         && self.tiles[i].stream_switch.slaves[trace_port].can_accept()
                     {
-                        let (word, tlast) = self.tiles[i].mem_trace.pop_word().unwrap();
+                        let (word, tlast) = self.tiles[i].core_trace.pop_word().unwrap();
                         self.tiles[i].stream_switch.slaves[trace_port].push_with_tlast(word, tlast);
                         words_routed += 1;
                     }
