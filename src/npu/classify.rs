@@ -13,10 +13,14 @@
 //! A kernarg is classified as **Ctrlpkt** if either:
 //!
 //! - **Tier 1** — the BD configuring its first transfer has `EnPkt = 1`
-//!   in BD word 2 (bit 30). Reference: aie-rt
+//!   in BD word 2 (bit 30) **and** is enqueued on an MM2S task queue
+//!   (host -> stream direction). Reference: aie-rt
 //!   `xaiemlgbl_reginit.c:713` (`AieMlShimDmaBdPktProp.EnPkt.Idx = 2`).
 //!   This signal catches the "BD-level packet mode" pattern used by
-//!   tests like `add_one_ctrl_packet`.
+//!   tests like `add_one_ctrl_packet`. A packet-routed S2MM BD is the
+//!   *trace* DMA, not ctrlpkt — same EnPkt bit, opposite direction —
+//!   so we defer commitment until the task queue write reveals
+//!   direction.
 //!
 //! - **Tier 2** — the arg_idx has ≥ `CTRLPKT_MIN_PATCHES` `DdrPatch`
 //!   records targeting the same BD register, with monotonically
@@ -163,9 +167,21 @@ fn classify_inner(
                     let tile_prefix = *reg_off & !TILE_LOCAL_MASK;
                     pending.retain(|p| {
                         if p.tile_prefix == tile_prefix && p.bd_id == bd_id {
+                            // Combine the BD's EnPkt bit (recorded at
+                            // patch time) with the task-queue direction
+                            // to disambiguate ctrlpkt (packet + MM2S)
+                            // from trace (packet + S2MM). Without the
+                            // direction check, packet-routed trace BDs
+                            // would be falsely labeled Ctrlpkt and fail
+                            // host binding.
+                            let role = if p.is_packet && dir == KernargRole::DataMm2s {
+                                KernargRole::Ctrlpkt
+                            } else {
+                                dir
+                            };
                             roles.entry(p.arg_idx).or_insert(KernargClassification {
                                 arg_idx: p.arg_idx,
-                                role: dir,
+                                role,
                                 bd_reg_addr: p.bd_src_reg,
                             });
                             false
@@ -177,18 +193,10 @@ fn classify_inner(
             }
             NpuInstruction::DdrPatch { reg_addr, arg_idx, arg_plus } => {
                 let bd_base_full = reg_addr.saturating_sub(4);
-                // Tier 1: BD EnPkt.
-                if let Some(&w2) = bd_word_2.get(&bd_base_full) {
-                    if w2 & BD_WORD_2_ENPKT_BIT != 0 {
-                        roles.entry(*arg_idx).or_insert(KernargClassification {
-                            arg_idx: *arg_idx,
-                            role: KernargRole::Ctrlpkt,
-                            bd_reg_addr: *reg_addr,
-                        });
-                        patch_log.entry((*arg_idx, bd_base_full)).or_default().push(*arg_plus);
-                        continue;
-                    }
-                }
+                // Tier 1: BD EnPkt -> mark the pending patch as
+                // packet-routed; commit to a role only when the
+                // task-queue direction is known (see Write32 branch).
+                let is_packet = bd_word_2.get(&bd_base_full).is_some_and(|w2| w2 & BD_WORD_2_ENPKT_BIT != 0);
                 patch_log.entry((*arg_idx, bd_base_full)).or_default().push(*arg_plus);
                 let local = bd_base_full & TILE_LOCAL_MASK;
                 let bd_id = (local - SHIM_BD_BASE_LOCAL) / SHIM_BD_STRIDE;
@@ -197,6 +205,7 @@ fn classify_inner(
                     bd_src_reg: *reg_addr,
                     tile_prefix: reg_addr & !TILE_LOCAL_MASK,
                     bd_id,
+                    is_packet,
                 });
             }
             _ => {}
@@ -260,6 +269,7 @@ struct PendingPatch {
     bd_src_reg: u32,
     tile_prefix: u32,
     bd_id: u32,
+    is_packet: bool,
 }
 
 fn shim_bd_base(reg_off: u32) -> Option<u32> {
@@ -333,13 +343,31 @@ mod tests {
     }
 
     #[test]
-    fn tier1_bd_enpkt_detects_ctrlpkt() {
+    fn tier1_bd_enpkt_plus_mm2s_detects_ctrlpkt() {
+        // Packet-routed BD enqueued on MM2S = host-to-stream ctrlpkt.
         let stream = build_stream(vec![
             NpuInstruction::BlockWrite { reg_off: 0x0001_D000, values: bd_words(true) },
             NpuInstruction::DdrPatch { reg_addr: 0x0001_D004, arg_idx: 2, arg_plus: 0 },
+            NpuInstruction::Write32 { reg_off: SHIM_MM2S_0_TASK_QUEUE_LOCAL, value: 0 },
         ]);
         let roles = classify_kernargs(&stream);
         assert_eq!(roles[0].role, KernargRole::Ctrlpkt);
+    }
+
+    #[test]
+    fn tier1_bd_enpkt_plus_s2mm_is_data_not_ctrlpkt() {
+        // Packet-routed BD enqueued on S2MM = trace DMA (stream-to-host).
+        // This shape exists because aie.trace lowering sets EnPkt=1 on
+        // the trace shim BD so the packet header survives the SS hop;
+        // the BD is still an S2MM data move, not a ctrlpkt.
+        let stream = build_stream(vec![
+            NpuInstruction::BlockWrite { reg_off: 0x0001_D1E0, values: bd_words(true) },
+            NpuInstruction::DdrPatch { reg_addr: 0x0001_D1E4, arg_idx: 4, arg_plus: 0 },
+            NpuInstruction::Write32 { reg_off: SHIM_S2MM_1_TASK_QUEUE_LOCAL, value: 15 },
+        ]);
+        let roles = classify_kernargs(&stream);
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].role, KernargRole::DataS2mm);
     }
 
     #[test]
@@ -407,6 +435,7 @@ mod tests {
         let stream = build_stream(vec![
             NpuInstruction::BlockWrite { reg_off: 0x0001_D000, values: bd_words(true) },
             NpuInstruction::DdrPatch { reg_addr: 0x0001_D004, arg_idx: 2, arg_plus: 0 },
+            NpuInstruction::Write32 { reg_off: SHIM_MM2S_0_TASK_QUEUE_LOCAL, value: 0 },
         ]);
         let topo = StreamSwitchTopology::from_device_ops(vec![DeviceOp::RegWrite {
             tile: TileAddr::new(0, 0),

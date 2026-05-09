@@ -831,6 +831,73 @@ std::vector<uint32_t> load_instr_binary(const std::string& path) {
     return words;
 }
 
+/// Walk insts.bin's DdrPatch ops and return the largest arg_idx, which is
+/// the BO regmap slot the firmware patches for the trace shim DMA. The
+/// trace BO is always added last by the inject flow, so its arg_idx
+/// dominates. Returns -1 if no DdrPatch ops are found, the file isn't a
+/// recognizable insts.bin, or the structure is malformed -- callers should
+/// fall back to the legacy "last buffer kernarg = trace" heuristic in that
+/// case. Mirrors tools/trace-sweep.py::_discover_trace_buf_idx so the
+/// standalone runner default lines up with how trace-sweep already drives
+/// --trace-buf-idx.
+int discover_trace_buf_idx_from_insts(const std::string& path) {
+    constexpr uint32_t INSTS_HEADER_BYTES = 16;
+    constexpr uint32_t INSTS_MAGIC = 0x06030100u;
+    constexpr uint8_t  OPCODE_WRITE32     = 0x00;
+    constexpr uint8_t  OPCODE_BLOCKWRITE  = 0x01;
+    constexpr uint8_t  OPCODE_MASKWRITE   = 0x03;
+    constexpr uint8_t  OPCODE_DDR_PATCH   = 0x81;
+
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return -1;
+    std::streamsize bytes = f.tellg();
+    if (bytes < static_cast<std::streamsize>(INSTS_HEADER_BYTES)) return -1;
+    f.seekg(0);
+    std::vector<uint8_t> data(static_cast<size_t>(bytes));
+    if (!f.read(reinterpret_cast<char*>(data.data()), bytes)) return -1;
+
+    uint32_t magic = static_cast<uint32_t>(data[0])
+                   | (static_cast<uint32_t>(data[1]) << 8)
+                   | (static_cast<uint32_t>(data[2]) << 16)
+                   | (static_cast<uint32_t>(data[3]) << 24);
+    if (magic != INSTS_MAGIC) return -1;
+
+    uint32_t total_size = static_cast<uint32_t>(data[12])
+                        | (static_cast<uint32_t>(data[13]) << 8)
+                        | (static_cast<uint32_t>(data[14]) << 16)
+                        | (static_cast<uint32_t>(data[15]) << 24);
+    size_t end = std::min<size_t>(data.size(), total_size);
+    size_t off = INSTS_HEADER_BYTES;
+    int max_arg_idx = -1;
+    while (off + 4 <= end) {
+        uint8_t opcode = data[off];
+        size_t op_size;
+        if (opcode == OPCODE_WRITE32) {
+            op_size = 24;
+        } else if (opcode == OPCODE_BLOCKWRITE) {
+            if (off + 16 > end) break;
+            op_size = static_cast<uint32_t>(data[off + 12])
+                    | (static_cast<uint32_t>(data[off + 13]) << 8)
+                    | (static_cast<uint32_t>(data[off + 14]) << 16)
+                    | (static_cast<uint32_t>(data[off + 15]) << 24);
+        } else if (opcode == OPCODE_MASKWRITE) {
+            op_size = 28;
+        } else if (opcode == OPCODE_DDR_PATCH) {
+            op_size = 48;
+            // Payload starts at off+8; arg_idx is one byte at payload[24].
+            if (off + 8 + 24 < end) {
+                int arg_idx = data[off + 8 + 24];
+                if (arg_idx > max_arg_idx) max_arg_idx = arg_idx;
+            }
+        } else {
+            // Unknown opcode -- can't trust the rest, stop walking.
+            break;
+        }
+        off += op_size;
+    }
+    return max_arg_idx;
+}
+
 /// Read the contents of a file into a BO's host-mapped memory, up to the BO's
 /// size.  If the file is shorter than expected_size, the tail is left as
 /// whatever the caller initialized the BO with (typically zero).  If the file
@@ -1350,30 +1417,91 @@ std::string json_escape(const std::string& s) {
 enum class Bind { Zero, InputFile, OutputSlot, CtrlpktFile };
 struct BindInfo { Bind kind; std::string path; size_t output_slot_index = 0; };
 
+// Map a middle-buffer kernarg slot to the address_patch arg_idx the
+// firmware uses for it. Slots 0/1/2 are opcode/instr/ninstr (handled by
+// XRT), so kernarg 3 is BO arg_idx 0.
+inline size_t kernarg_to_arg_idx(size_t kernarg) { return kernarg - 3; }
+
 std::vector<BindInfo> resolve_bindings(
     const KernArgPlan& plan,
-    const std::vector<size_t>& ctrlpkt_data_args,
+    const std::vector<ClassifierRole>& roles,
     const std::vector<std::string>& inputs,
     const std::vector<std::string>& outputs,
     const std::vector<std::string>& ctrlpkts)
 {
     std::vector<BindInfo> data_arg_binding(plan.middle_buf_indices.size(),
                                            BindInfo{Bind::Zero, {}, 0});
-    std::vector<bool> reserved(plan.middle_buf_indices.size(), false);
-    for (size_t i = 0; i < ctrlpkts.size(); ++i) {
-        size_t slot = ctrlpkt_data_args[i];
-        if (slot >= data_arg_binding.size()) {
-            throw std::runtime_error(
-                "classifier reports ctrlpkt at arg_idx " +
-                std::to_string(slot) + " but only " +
-                std::to_string(data_arg_binding.size()) + " middle buffers exist");
-        }
-        data_arg_binding[slot] = {Bind::CtrlpktFile, ctrlpkts[i], 0};
-        reserved[slot] = true;
+
+    // Build arg_idx -> role lookup. Only arg_idx values that appear in
+    // the instruction stream's DdrPatch ops show up here; unused slots
+    // (declared in the kernel template but never patched) fall through
+    // to a Bind::Zero placeholder, which is correct -- the kernel
+    // doesn't read them, so any binding works.
+    std::unordered_map<size_t, uint8_t> role_by_arg_idx;
+    for (const auto& r : roles) {
+        role_by_arg_idx[r.arg_idx] = r.role;
     }
+
+    // Classifier-aware path: assign --input/--output/--ctrlpkt files to
+    // the slots whose role matches, in order. This replaces the legacy
+    // round-robin which silently mis-bound --output for any kernel
+    // signature where the s2mm slot wasn't immediately after the mm2s
+    // slot (e.g., runtime_loop's `(mm2s, unused, s2mm)` shape).
+    if (!roles.empty()) {
+        size_t in_i = 0, out_i = 0, ctrl_i = 0;
+        for (size_t slot = 0; slot < plan.middle_buf_indices.size(); ++slot) {
+            size_t arg_idx = kernarg_to_arg_idx(plan.middle_buf_indices[slot]);
+            auto it = role_by_arg_idx.find(arg_idx);
+            if (it == role_by_arg_idx.end()) continue;  // unused -> Zero
+            switch (it->second) {
+            case ROLE_DATA_MM2S:
+                if (in_i < inputs.size()) {
+                    data_arg_binding[slot] = {Bind::InputFile, inputs[in_i++], 0};
+                }
+                break;
+            case ROLE_DATA_S2MM:
+                if (out_i < outputs.size()) {
+                    data_arg_binding[slot] = {Bind::OutputSlot,
+                                              outputs[out_i], out_i};
+                    ++out_i;
+                }
+                break;
+            case ROLE_CTRLPKT:
+                if (ctrl_i < ctrlpkts.size()) {
+                    data_arg_binding[slot] = {Bind::CtrlpktFile,
+                                              ctrlpkts[ctrl_i++], 0};
+                }
+                break;
+            default:
+                break;  // ROLE_UNKNOWN -> Zero
+            }
+        }
+        if (in_i < inputs.size()) {
+            throw std::runtime_error(
+                "more --input paths (" + std::to_string(inputs.size()) +
+                ") than mm2s middle slots (" + std::to_string(in_i) + ")");
+        }
+        if (out_i < outputs.size()) {
+            throw std::runtime_error(
+                "more --output paths (" + std::to_string(outputs.size()) +
+                ") than s2mm middle slots (" + std::to_string(out_i) + ")");
+        }
+        if (ctrl_i < ctrlpkts.size()) {
+            throw std::runtime_error(
+                "more --ctrlpkt paths (" + std::to_string(ctrlpkts.size()) +
+                ") than ctrlpkt middle slots (" + std::to_string(ctrl_i) + ")");
+        }
+        return data_arg_binding;
+    }
+
+    // Fallback: classifier unavailable (no FFI library, or empty roles
+    // result). Use the legacy round-robin: reserve any classifier-flagged
+    // ctrlpkt slots first (none in this branch since roles is empty),
+    // then assign inputs and outputs to remaining slots in order. This
+    // preserves the pre-classifier behavior for setups without
+    // libxdna_emu.so.
     size_t input_i = 0, output_i = 0;
     for (size_t slot = 0; slot < data_arg_binding.size(); ++slot) {
-        if (reserved[slot]) continue;
         if (input_i < inputs.size()) {
             data_arg_binding[slot] = {Bind::InputFile, inputs[input_i++], 0};
         } else if (output_i < outputs.size()) {
@@ -1493,13 +1621,6 @@ RunOutcome execute_run(
         }
         auto roles = classify_kernargs_via_ffi(
             classify_fn, args.xclbin, instr_words, verbose);
-        std::vector<size_t> ctrlpkt_data_args;
-        for (const auto& r : roles) {
-            if (r.role == ROLE_CTRLPKT) {
-                ctrlpkt_data_args.push_back(static_cast<size_t>(r.arg_idx));
-            }
-        }
-        std::sort(ctrlpkt_data_args.begin(), ctrlpkt_data_args.end());
         if (verbose && !roles.empty()) {
             std::fprintf(stderr, "  classifier roles:");
             for (const auto& r : roles) {
@@ -1508,6 +1629,11 @@ RunOutcome execute_run(
             std::fprintf(stderr, "\n");
         }
 
+        // When the classifier is unavailable (no FFI lib loaded or empty
+        // roles), --ctrlpkt has no slot to attach to; degrade by treating
+        // those paths as additional --input args (which is what the
+        // pre-classifier runner did). resolve_bindings's empty-roles
+        // branch then round-robins them across middle slots.
         std::vector<std::string> inputs = args.inputs;
         std::vector<std::string> ctrlpkts = args.ctrlpkts;
         if (classify_fn == nullptr || roles.empty()) {
@@ -1517,15 +1643,10 @@ RunOutcome execute_run(
             }
             inputs.insert(inputs.begin(), ctrlpkts.begin(), ctrlpkts.end());
             ctrlpkts.clear();
-        } else if (ctrlpkts.size() > ctrlpkt_data_args.size()) {
-            throw std::runtime_error(
-                "more --ctrlpkt paths (" + std::to_string(ctrlpkts.size()) +
-                ") than classifier-identified ctrlpkt args (" +
-                std::to_string(ctrlpkt_data_args.size()) + ")");
         }
 
         auto data_arg_binding = resolve_bindings(
-            plan, ctrlpkt_data_args, inputs, args.outputs, ctrlpkts);
+            plan, roles, inputs, args.outputs, ctrlpkts);
 
         // Rebuild hw_context + kernel per run to sidestep the
         // alternating-TIMEOUT pattern that hits on hw_context reuse.
@@ -1865,8 +1986,25 @@ int run_single_shot(Session& session, const RunArgs& args) {
                      args.inputs.size(), args.outputs.size());
     }
     try {
+        // If the user didn't pin --trace-buf-idx, scan insts.bin for the
+        // max DdrPatch arg_idx (= the trace BO's BO regmap slot) so we
+        // bind to the slot the firmware actually patches. The legacy
+        // "last buffer = trace" fallback only kicks in if we can't read
+        // the insts.bin (e.g., malformed file).
+        int trace_buf_idx = args.trace_buf_idx;
+        if (trace_buf_idx < 0) {
+            int discovered = discover_trace_buf_idx_from_insts(args.instr_bin);
+            if (discovered >= 0) {
+                if (session.verbose) {
+                    std::fprintf(stderr,
+                        "  discovered trace_buf_idx=%d from insts.bin\n",
+                        discovered);
+                }
+                trace_buf_idx = discovered;
+            }
+        }
         auto& prep = session.get_or_prepare(args.xclbin, args.kernel_name,
-                                            args.trace_buf_idx);
+                                            trace_buf_idx);
         auto out = execute_run(session.device, prep, session.classify_fn,
                                args, session.verbose);
         if (!out.ok) {
@@ -1913,11 +2051,20 @@ int run_batch_stdin(Session& session, const OuterArgs& outer, const char* argv0)
             continue;
         }
 
-        // Prep or reuse for this xclbin.
+        // Prep or reuse for this xclbin. Auto-discover trace_buf_idx
+        // from insts.bin's max DdrPatch arg_idx when the user didn't
+        // pin one (matches run_single_shot behavior); the cache key
+        // includes the resolved value so different instr files with
+        // different trace slots don't collide.
+        int trace_buf_idx_resolved = args.trace_buf_idx;
+        if (trace_buf_idx_resolved < 0 && !args.instr_bin.empty()) {
+            int discovered = discover_trace_buf_idx_from_insts(args.instr_bin);
+            if (discovered >= 0) trace_buf_idx_resolved = discovered;
+        }
         PreparedKernel* prep = nullptr;
         try {
             prep = &session.get_or_prepare(args.xclbin, args.kernel_name,
-                                           args.trace_buf_idx);
+                                           trace_buf_idx_resolved);
         } catch (const std::exception& e) {
             std::printf(
                 "{\"run_idx\":%llu,\"ok\":false,\"error\":\"prepare: %s\"}\n",
