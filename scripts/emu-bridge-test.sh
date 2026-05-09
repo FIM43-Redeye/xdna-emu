@@ -425,6 +425,14 @@ uptime_sec() {
 }
 export -f uptime_sec
 
+# Wall-clock seconds since this script started, for user-facing progress.
+SCRIPT_START_EPOCH=${SCRIPT_START_EPOCH:-$(date +%s)}
+export SCRIPT_START_EPOCH
+elapsed_sec() {
+  echo $(( $(date +%s) - SCRIPT_START_EPOCH ))
+}
+export -f elapsed_sec
+
 # Check NPU health: can it create contexts?  Returns 0 if healthy.
 npu_health_check() {
   xrt-smi examine -r aie-partitions &>/dev/null
@@ -2838,26 +2846,15 @@ main() {
   $RUN_EMU && emu_label="EMU -j${JOBS}"
   local q_label=""
   [[ ${#hw_quarantine_jobs[@]} -gt 0 ]] && q_label=", ${#hw_quarantine_jobs[@]} quarantined"
-  info "Phase 3+4: Running ${#all_jobs[@]} job(s) (${hw_label:+$hw_label }${emu_label:+$emu_label}${q_label})"
+  info "Phase 3+4: Running ${#all_jobs[@]} job(s) (${hw_label:+$hw_label first}${emu_label:+, then $emu_label}${q_label})"
 
-  # Launch EMU for all jobs (parallel, no NPU constraint).
-  # Each job is passed as a single "name:compiler:variant" tuple to avoid
-  # xargs token-splitting issues with empty variants.
+  # Sequential: run HW first (serial, NPU-bound), then EMU (parallel).
+  # Concurrent execution starved HW's host-side dispatch when EMU ran at
+  # -j$(nproc); doing HW solo makes its already-fast tests finish quickly
+  # while EMU then has the box to itself.
   local emu_pool_pid=""
-  if $RUN_EMU; then
-    printf '%s\n' "${all_jobs[@]}" \
-      | xargs -P"$JOBS" -I{} bash -c '
-          entry="$1"
-          j_name="${entry%%:*}"
-          tmp="${entry#*:}"
-          j_compiler="${tmp%%:*}"
-          j_variant="${tmp#*:}"
-          run_one_bridge "$j_name" "$j_compiler" "$j_variant"
-        ' _ {} &
-    emu_pool_pid=$!
-  fi
 
-  # Launch HW with NPU job pool (if enabled), concurrently with EMU.
+  # Launch HW with NPU job pool (if enabled).
   if $RUN_HW; then
     local tdr_suspect_file="$RESULTS_DIR/tdr_suspects.log"
     : > "$tdr_suspect_file"
@@ -2913,7 +2910,7 @@ main() {
               done
               echo "TDR @$(uptime_sec)s -- concurrent: $suspects" >> "$tdr_suspect_file"
             fi
-            echo "  [${hw_done}/${hw_total}] HW $fin_display ($fin_compiler): $hr  @$(uptime_sec)s${tdr_tag}"
+            echo "  [${hw_done}/${hw_total}] HW $fin_display ($fin_compiler): $hr  @$(elapsed_sec)s${tdr_tag}"
           fi
         fi
       done
@@ -2982,16 +2979,26 @@ main() {
         ((hw_done++)) || true
         local q_tag=""
         [[ "$qr" == "TDR" ]] && q_tag=" *** TDR ***"
-        echo "  [${hw_done}/${hw_total}] HW $q_display ($q_compiler): $qr  @$(uptime_sec)s [QUARANTINE]${q_tag}"
+        echo "  [${hw_done}/${hw_total}] HW $q_display ($q_compiler): $qr  @$(elapsed_sec)s [QUARANTINE]${q_tag}"
       done
     fi
 
     info "HW runs done"
   fi
 
-  # Wait for EMU pool to finish.
-  if [[ -n "$emu_pool_pid" ]]; then
-    wait "$emu_pool_pid" 2>/dev/null || true
+  # Now launch EMU for all jobs (parallel, no NPU constraint).
+  # Each job is passed as a single "name:compiler:variant" tuple to avoid
+  # xargs token-splitting issues with empty variants.
+  if $RUN_EMU; then
+    printf '%s\n' "${all_jobs[@]}" \
+      | xargs -P"$JOBS" -I{} bash -c '
+          entry="$1"
+          j_name="${entry%%:*}"
+          tmp="${entry#*:}"
+          j_compiler="${tmp%%:*}"
+          j_variant="${tmp#*:}"
+          run_one_bridge "$j_name" "$j_compiler" "$j_variant"
+        ' _ {}
   fi
   info "EMU runs done"
   echo ""
@@ -3073,10 +3080,13 @@ main() {
     done
 
     if [[ ${#sweep_targets[@]} -gt 0 ]]; then
-      info "Phase 5b: Event sweep for ${#sweep_targets[@]} test(s)"
+      info "Phase 5b: Event sweep for ${#sweep_targets[@]} test(s) (HW serial, EMU -j${JOBS})"
+
+      # Build the eligible (name, compiler) pair list once. Each pair is
+      # encoded as "name|compiler|tile_spec" so the per-arm helper does
+      # not need to re-parse the MLIR.
+      local sweep_pairs=()
       for name in "${sweep_targets[@]}"; do
-        local safe
-        safe="$(sanitize_name "$name")"
         local src_dir="$TEST_SRC/$name"
 
         # Discover tiles from aie.mlir. Row >= 2 emits both core and
@@ -3099,18 +3109,37 @@ main() {
           continue
         fi
 
+        local safe
+        safe="$(sanitize_name "$name")"
         for compiler in "${compilers[@]}"; do
           local build_dir="$BUILD_BASE/$name/$compiler"
-          local sweep_dir="$RESULTS_DIR/${safe}.${compiler}.sweep"
-          local sweep_log="$RESULTS_DIR/${safe}.${compiler}.sweep.log"
 
           # Skip if this compiler didn't compile successfully.
           local cr="FAIL"
           [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] && \
             cr="$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")"
           [[ "$cr" != "OK" ]] && continue
-
           [[ ! -f "$build_dir/insts.bin" ]] && continue
+
+          sweep_pairs+=("${name}|${compiler}|${tile_spec}")
+        done
+      done
+
+      if [[ ${#sweep_pairs[@]} -eq 0 ]]; then
+        info "Phase 5b: no tests eligible for sweep"
+      else
+        # Per-arm helper. Runs trace-sweep.py for one (name, compiler)
+        # pair with `arm` set to "hw" or "emu". Output is appended to a
+        # single per-pair log so humans can grep one file.
+        _phase5b_run_arm() {
+          local arm="$1" entry="$2"
+          local name compiler tile_spec
+          IFS='|' read -r name compiler tile_spec <<<"$entry"
+
+          local safe; safe="$(sanitize_name "$name")"
+          local build_dir="$BUILD_BASE/$name/$compiler"
+          local sweep_dir="$RESULTS_DIR/${safe}.${compiler}.sweep"
+          local sweep_log="$RESULTS_DIR/${safe}.${compiler}.sweep.log"
 
           # trace-sweep.py auto-discovers build_dir from --test/--compiler
           # under MLIR_AIE_ROOT/build/test/npu-xrt/. Pass --build-dir
@@ -3124,18 +3153,43 @@ main() {
             --core-sweep all
             --reuse-ctx
           )
-          $RUN_HW || sweep_args+=(--no-hw)
-          $RUN_EMU || sweep_args+=(--no-emu)
-
-          echo "  SWEEP $name ($compiler) ..."
-          if python3 "$EMU_ROOT/tools/trace-sweep.py" "${sweep_args[@]}" \
-              > "$sweep_log" 2>&1; then
-            echo "  SWEEP $name ($compiler): OK (see $sweep_dir/)"
+          if [[ "$arm" == "hw" ]]; then
+            sweep_args+=(--no-emu)
           else
-            echo "  SWEEP $name ($compiler): FAIL (see $sweep_log)"
+            sweep_args+=(--no-hw)
           fi
-        done
-      done
+
+          local label="SWEEP[${arm}] $name ($compiler)"
+          {
+            echo
+            echo "==== $label ===="
+            python3 "$EMU_ROOT/tools/trace-sweep.py" "${sweep_args[@]}"
+          } >>"$sweep_log" 2>&1
+          local rc=$?
+          if [[ $rc -eq 0 ]]; then
+            echo "  ${label}: OK (see $sweep_dir/)"
+          else
+            echo "  ${label}: FAIL (see $sweep_log)"
+          fi
+          return $rc
+        }
+        export -f _phase5b_run_arm
+
+        # HW arm: serial (only one NPU device on the host).
+        if $RUN_HW; then
+          info "Phase 5b: HW arm -- ${#sweep_pairs[@]} sweep(s), serial"
+          for entry in "${sweep_pairs[@]}"; do
+            _phase5b_run_arm hw "$entry" || true
+          done
+        fi
+
+        # EMU arm: parallel via xargs -P "$JOBS" (no device contention).
+        if $RUN_EMU; then
+          info "Phase 5b: EMU arm -- ${#sweep_pairs[@]} sweep(s), -j${JOBS}"
+          printf '%s\n' "${sweep_pairs[@]}" | \
+            xargs -d '\n' -I{} -P"$JOBS" bash -c '_phase5b_run_arm emu "$@"' _ {} || true
+        fi
+      fi
     else
       info "Phase 5b: no tests eligible for sweep"
     fi
