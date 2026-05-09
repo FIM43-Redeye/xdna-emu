@@ -3004,8 +3004,9 @@ main() {
   echo ""
 
   # ---- Phase 5: Automatic trace comparison --------------------------------
+  # Comparison requires both HW and EMU captures; skip when either is off.
 
-  if [[ "$NO_TRACE" != "true" ]]; then
+  if [[ "$NO_TRACE" != "true" ]] && $RUN_HW && $RUN_EMU; then
     info "Phase 5: Comparing traces"
     for entry in "${all_jobs[@]}"; do
       local t5_name t5_compiler t5_vsuffix
@@ -3048,6 +3049,11 @@ main() {
         echo "NONE" > "$summary_file"
       fi
     done
+  elif [[ "$NO_TRACE" != "true" ]]; then
+    local _t5_skip_reason=""
+    $RUN_HW || _t5_skip_reason="HW disabled"
+    $RUN_EMU || _t5_skip_reason="${_t5_skip_reason:+$_t5_skip_reason, }EMU disabled"
+    info "Phase 5: Skipping trace comparison ($_t5_skip_reason)"
   fi
 
   # ---- Phase 5b: Event sweep (optional) -----------------------------------
