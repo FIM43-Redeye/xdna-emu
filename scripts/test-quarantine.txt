@@ -1,11 +1,29 @@
-# test-quarantine.txt -- Tests that are fundamentally broken.
+# test-quarantine.txt -- Tests skipped entirely (no compile, no run, no trace).
 #
-# Tests listed here are skipped entirely: no compile, no run, no trace.
-# Unlike trace-quarantine.txt (which only skips trace injection), these
-# tests have structural problems (segfault, compile failure, missing
-# dependencies) that make them unable to run at all.
+# Two reasons to add here:
+#   1. Structural problems (segfault, compile failure, missing dependencies)
+#      that make the test unable to run at all.
+#   2. Persistent failures on this hardware/firmware configuration that
+#      we have triaged and confirmed are not bugs in our code.  Reference
+#      the upstream issue or our own finding doc when listing.
 #
-# Format: one test directory name per line.
+# Format: one test directory name per line (relative to test/npu-xrt/).
 # Lines starting with # are comments.
 
-# (none yet -- add tests here as they are identified)
+# memtile_dmas/* -- TDR on Phoenix (NPU1), pass on EMU.
+# All five tests in the family hang at run.wait() in
+# drm_syncobj_array_wait_timeout; runtime sequence executes cleanly,
+# shim S2MM TCT never fires.  Empirically ruled out self-loops and
+# lock semantics as triggers; bug is in the firmware-mediated memtile
+# DMA execution path.  add_one_using_dma (static memtile_dma block via
+# CDO) passes on the same HW, so it is specifically the runtime-
+# sequence-programmed path that breaks on Phoenix firmware 1.5.x.
+#
+# Filed upstream: https://github.com/Xilinx/mlir-aie/issues/3062
+# Remove from quarantine if upstream resolves it or we obtain a
+# firmware version that supports the path.
+memtile_dmas/blockwrite_using_locks
+memtile_dmas/dma_configure_task_lock
+memtile_dmas/dma_configure_task_token
+memtile_dmas/writebd
+memtile_dmas/writebd_tokens

@@ -411,6 +411,108 @@ sensor first; password is the fallback if no swipe.
   state, modprobe -r itself wedges in `synchronize_srcu` and
   reboot is the only path.  Update the recovery-escalation note.
 
+## Continuation: 2026-05-09 evening (post-reboot) -- bug #6 narrowed and filed upstream
+
+After the reboot, with `tdr_dump_ctx=1` made persistent in
+`/etc/modprobe.d/amdxdna.conf`, the failure mode is recoverable:
+hung tests dump every 2s but never poison the firmware mailbox, and
+modprobe-r/+r works cleanly afterward.  This unblocked iterative
+MLIR-level diagnostics that were impossible before.
+
+### Empirical narrowing of bug #6
+
+Constructed a series of minimal MLIR tests under
+`mlir-aie/test/npu-xrt/_diag_memtile_write/` (ephemeral; deleted at
+end of session) to isolate the trigger:
+
+| Variant | Result |
+|---------|--------|
+| Single `aiex.npu.write32` to memtile (col 0, row 1) LOCK0_VALUE | PASS |
+| Single `aiex.npu.writebd` to memtile (program BD, no exec) | PASS |
+| `writebd` + push to memtile S2MM TASK_QUEUE (channel start) | PASS |
+| Full `writebd` test, locks + chains as upstream-shipped | TDR |
+| Full `writebd` with `use_next_bd=0` (no self-loop) | TDR |
+| Full `writebd` with all `lock_acq_enable=0` (no locks) | TDR |
+| `add_one_using_dma` (static `aie.memtile_dma` block via CDO) | PASS |
+
+Conclusion: runtime-sequence writes to memtile registers,
+single-BD programming, and channel pushes all work fine on Phoenix.
+Static (CDO-time) memtile programming works.  But multi-channel
+runtime-programmed memtile DMA flow shim -> memtile -> shim never
+delivers data to the shim S2MM receiver.  Removing self-loops or
+locks doesn't fix it.  EMU passes the same xclbin and test logic.
+
+The hang is at `run.wait()` -> `drm_syncobj_array_wait_timeout` --
+sync waits forever for a TCT from shim S2MM that never arrives.
+The runtime sequence itself completes cleanly (verified by removing
+the trailing sync: kernel returns, test fails on data check rather
+than TDR).
+
+### Bridge runner ruled out as a confounder
+
+Suspected our bridge runner might be perturbing test execution
+relative to upstream lit.  Reproduced via native lit invocation:
+
+```
+ironenv/bin/lit -v --filter "memtile_dmas/writebd/run.lit" build/test/
+```
+
+Same hang.  Bridge runner is faithfully reproducing the upstream
+failure.  Process tree at the moment of failure:
+
+```
+lit -> bash run.lit.script -> python run_on_npu.py npu1 -> ./test.exe
+                                                           (drm_syncobj_array_wait_timeout)
+```
+
+### Upstream CI and version comparison
+
+Checked `Xilinx/mlir-aie` CI runs (`buildAndTestRyzenAI.yml`).  CI
+matrix runs on `amd7940hs` (Phoenix, identical chip family to ours)
+and `amdhx370` (Strix).  Most recent `main` CI run (2026-05-09
+`Align buffer allocate (#3037)`) succeeded; lit summary reports 892
+PASSED on `amd7940hs` but does not enumerate passing tests by name,
+so it's not visible whether `memtile_dmas/*` actually ran.  On
+`amdhx370`, `writebd` and adjacent tests show in the Unsupported
+list -- expected, since `REQUIRES: ryzen_ai_npu1` isn't met on
+Strix.  `dma_configure_task_lock` doesn't appear by name in either
+runner's enumerated lists.
+
+Environment delta vs upstream CI:
+
+| Component | Us | Upstream CI |
+|-----------|-----|-------------|
+| Chip | Ryzen 9 7940HS (Phoenix) | `amd7940hs` (same family) |
+| NPU FW | 1.5.5.391 | unknown -- log doesn't print |
+| XRT | 2.23.0 | `/opt/xilinx/xrt` (version unknown) |
+| amdxdna | 2.23.0\_20260509 (HEAD `c347d62`) | unknown |
+| mlir-aie | HEAD `b37dc33d41` | HEAD CI runs main |
+| Vitis | aietools 2025.2 (RyzenAI 1.5.x) | `/opt/ryzen_ai-1.3.0.1/vitis_aie_essentials` |
+
+Strongest hypothesis: AMD's CI is on RyzenAI 1.3.0.1 while we are
+on 1.5.x; the bundled NPU firmware may differ.
+
+### Filed upstream
+
+`Xilinx/mlir-aie#3062` -- "test/npu-xrt/memtile_dmas/* tests TDR on
+Phoenix (NPU1) -- do these actually pass in CI?"  Asks for status
+on the Phoenix runner and offers to file an XFAIL PR if upstream
+confirms broken.
+
+### Local mitigation landed
+
+`scripts/test-quarantine.txt` extended to cover the five
+memtile_dmas tests.  Bridge runner now skips them entirely (no
+compile, no run, no trace) with a "SKIP (test-quarantined)" line.
+Comment in the file references the upstream issue so it's clear
+when to remove.
+
+The quarantine file's docstring was generalized to allow two
+reasons for entries: (1) structural problems, (2) persistent
+failures on this hardware/firmware configuration that have been
+triaged.  Existing usage was solely (1); adding the second
+category covers our case without overloading the meaning.
+
 ## See also
 
 - `docs/superpowers/findings/2026-05-07-aie-rw-access-memtile-dm-half-impl.md`
