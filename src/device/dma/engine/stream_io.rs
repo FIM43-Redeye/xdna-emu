@@ -27,11 +27,12 @@ impl DmaEngine {
     /// Maximum stream_out depth before MM2S backpressures.
     ///
     /// Models the slave-port FIFO that the DMA's output bridges into on
-    /// real silicon; AM027 ch2 specifies four double-words = eight 32-bit
-    /// words per slave port. When stream_out reaches this depth, the
-    /// downstream consumer hasn't drained fast enough and the DMA stalls
-    /// (STALL_STRM_STARV in the channel status register), which is what
-    /// gates DMA_FINISHED_TASK timing across the chain.
+    /// real silicon; AM020 ch2 specifies "Local slave ports are 2-cycle
+    /// latency and a 4-deep FIFO" for AIE2 / Phoenix. When stream_out
+    /// reaches this depth, the downstream consumer hasn't drained fast
+    /// enough and the DMA stalls (STALL_STRM_STARV in the channel
+    /// status register), which is what gates DMA_FINISHED_TASK timing
+    /// across the chain.
     pub fn output_fifo_capacity(&self) -> usize {
         xdna_archspec::aie2::timing::STREAM_LOCAL_SLAVE_FIFO_DEPTH as usize
     }

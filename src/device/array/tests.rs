@@ -293,14 +293,15 @@ fn test_handle_read_registers_injects_response() {
         "pending buffer should have header + 4 data words"
     );
 
-    // Drain into FIFO. With AM027-spec FIFO depth (8 x 32-bit words on
-    // slave ports), the full 5-word response (header + 4 data) fits in
-    // one drain pass.
+    // Drain into FIFO. With AM020-spec FIFO depth (4 x 32-bit words on
+    // local slave ports), only 4 of the 5 response words fit in one
+    // drain pass; the 5th stays pending until the FIFO drains.
     let injected1 = array.drain_ctrl_responses();
-    assert_eq!(injected1, 5, "drain should inject header + 4 data words in one pass");
-    assert!(
-        array.tile(col, row).pending_ctrl_response.is_empty(),
-        "pending buffer should be empty after drain"
+    assert_eq!(injected1, 4, "first drain fills the 4-deep slave FIFO");
+    assert_eq!(
+        array.tile(col, row).pending_ctrl_response.len(),
+        1,
+        "one word left pending after first drain"
     );
 
     // Pop and verify the stream header
@@ -314,14 +315,28 @@ fn test_handle_read_registers_injects_response() {
     assert_eq!(decoded.src_col, col, "src_col should match tile column");
     assert_eq!(decoded.src_row, row, "src_row should match tile row");
 
-    // Pop the four data words. Only the last carries TLAST.
-    for (i, &expected) in values.iter().enumerate() {
+    // Pop the first three data words (no TLAST yet -- the 4th data word
+    // is still in pending_ctrl_response, waiting on FIFO space).
+    for (i, &expected) in values.iter().take(3).enumerate() {
         let slave = array.tile_mut(col, row).stream_switch.slave_mut(ctrl_slave_idx).unwrap();
         let (data, tlast) = slave.pop_with_tlast().unwrap();
         assert_eq!(data, expected, "data word {} should match register value", i);
-        let is_last = i == values.len() - 1;
-        assert_eq!(tlast, is_last, "TLAST on data word {} should be {}", i, is_last);
+        assert!(!tlast, "TLAST should not appear before the final data word");
     }
+
+    // FIFO is empty; pending still has the last word. Re-drain to inject it.
+    let injected2 = array.drain_ctrl_responses();
+    assert_eq!(injected2, 1, "second drain injects the final data word");
+    assert!(
+        array.tile(col, row).pending_ctrl_response.is_empty(),
+        "pending buffer should be empty after second drain"
+    );
+
+    // Pop the final data word -- carries TLAST.
+    let slave = array.tile_mut(col, row).stream_switch.slave_mut(ctrl_slave_idx).unwrap();
+    let (data, tlast) = slave.pop_with_tlast().unwrap();
+    assert_eq!(data, values[3], "final data word should match register value");
+    assert!(tlast, "TLAST must accompany the final data word");
 
     // FIFO should be empty now
     let slave = array.tile(col, row).stream_switch.slave(ctrl_slave_idx).unwrap();

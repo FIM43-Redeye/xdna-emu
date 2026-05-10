@@ -171,21 +171,24 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             host_memory_latency_cycles: 500,
         },
         stream_switch: StreamSwitchTiming {
-            // FIFO depths in 32-bit-word units. AM027 ch2 specifies depths
-            // in *double-words* (64 bits each = 2 x 32-bit words) since
-            // AIE2 streams are 64 bits wide. We store 32-bit-word counts to
-            // match the unit of `VecDeque<u32>` consumers, so each spec
-            // value is doubled here.
+            // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /
+            // Phoenix / NPU1 -- our target chip).
             //
-            //   "External and local slave ports have two cycles of latency
-            //    and four double-words of buffering."
-            //   -> 4 dws = 8 x 32-bit words
+            // AM020's stream switch is 32-bit wide (central FIFO is 16-deep
+            // and 34 bits = 32 data + 1 parity + 1 TLAST), so the documented
+            // FIFO depths are in 32-bit-word slots, not double-words:
             //
-            //   "Local master ports have one cycle of latency and two
-            //    double-words of buffering."
-            //   -> 2 dws = 4 x 32-bit words
-            local_slave_fifo_depth: 8,
-            local_master_fifo_depth: 4,
+            //   "Local slave ports are 2-cycle latency and a 4-deep FIFO."
+            //   "Local master ports have one register slice with 1-cycle
+            //    latency and a 2-deep FIFO."
+            //
+            // (Don't confuse with AM027, which describes the 64-bit AIE2P
+            // / Strix stream switch. AM027's "four double-words of
+            // buffering" = 8 x 32-bit words, but that's a different chip;
+            // applying it to AIE2 doubles the depths in the wrong
+            // direction.)
+            local_slave_fifo_depth: 4,
+            local_master_fifo_depth: 2,
             local_to_local_latency: 3,
             local_to_external_latency: 4,
             external_to_external_latency: 4,

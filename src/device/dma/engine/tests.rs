@@ -107,10 +107,13 @@ fn test_simple_transfer() {
     // Start transfer on MM2S channel
     engine.start_channel(2, 0).unwrap();
 
-    // Step until complete
+    // Step until complete. Drain stream_out per cycle to simulate an
+    // always-ready downstream consumer; without this, the MM2S backpressures
+    // once the slave-port FIFO (4 words) fills and the test never finishes.
     let mut cycles = 0;
     while engine.channel_active(2) {
         engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
         cycles += 1;
         if cycles > 100 {
             panic!("Transfer took too long");
@@ -174,13 +177,15 @@ fn test_transfer_with_lock() {
     // Start should trigger lock acquire on MM2S channel
     engine.start_channel(2, 0).unwrap();
 
-    // Step until complete (cycle-accurate timing needs more cycles)
-    // Arbiter-based lock arbitration: submit -> resolve -> step
+    // Step until complete (cycle-accurate timing needs more cycles).
+    // Arbiter-based lock arbitration: submit -> resolve -> step.
+    // Drain stream_out so MM2S doesn't stall on the 4-word slave-port FIFO.
     let mut cycles = 0;
     while engine.channel_active(2) {
         engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
         tile.resolve_lock_requests(0);
         engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
         cycles += 1;
         if cycles > 500 {
             panic!("Transfer took too long: {} cycles", cycles);
@@ -448,10 +453,12 @@ fn test_task_queue_multiple_tasks_complete() {
     engine.enqueue_task(2, 0, 0, false);
     engine.enqueue_task(2, 1, 0, true);
 
-    // Run until all work is complete (including queued tasks)
+    // Run until all work is complete (including queued tasks). Drain
+    // stream_out per cycle so MM2S doesn't stall on the 4-word slave FIFO.
     let mut cycles = 0;
     while engine.channel_has_pending_work(2) {
         engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
         cycles += 1;
         if cycles > 100 {
             panic!("Tasks took too long");
@@ -985,6 +992,8 @@ fn test_cross_tile_lock_release_west() {
         let mut neighbors = NeighborTiles { west: Some(&mut west_tile), east: None };
         let mut host_mem = make_host_memory();
         engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
+        // Drain MM2S output so the 4-word slave FIFO never backpressures.
+        while engine.pop_stream_out().is_some() {}
         cycles += 1;
         if cycles > 500 {
             panic!("Transfer took too long: {} cycles, state={:?}", cycles, engine.channel_state(6));
@@ -1028,6 +1037,8 @@ fn test_cross_tile_lock_release_east() {
         let mut neighbors = NeighborTiles { west: None, east: Some(&mut east_tile) };
         let mut host_mem = make_host_memory();
         engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
+        // Drain MM2S output so the 4-word slave FIFO never backpressures.
+        while engine.pop_stream_out().is_some() {}
         cycles += 1;
         if cycles > 500 {
             panic!("Transfer took too long: {} cycles, state={:?}", cycles, engine.channel_state(6));

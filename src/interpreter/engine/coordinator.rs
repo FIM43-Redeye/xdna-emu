@@ -1666,9 +1666,16 @@ mod tests {
         }
 
         // Step more - 64 bytes at 4 bytes/cycle = 16 cycles
-        // (Currently no setup overhead since timing isn't integrated yet)
+        // (Currently no setup overhead since timing isn't integrated yet).
+        // Drain MM2S output each step; without it the 4-deep slave-port
+        // FIFO fills after a few cycles and the DMA stalls indefinitely
+        // because no consumer is wired up in this isolated test.
         for i in 0..50 {
             engine.step();
+            {
+                let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
+                while dma.pop_stream_out().is_some() {}
+            }
 
             let dma = engine.device().array.dma_engine(1, 2).unwrap();
             let state = dma.channel_state(2);
