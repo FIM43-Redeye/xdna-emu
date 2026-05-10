@@ -1651,12 +1651,20 @@ compile_one() {
     if [[ -n "${XDNA_TRACE_MEMTILE_SEL_CHANNELS:-}" ]]; then
       _memtile_sel_args=("--memtile-sel-channels" "$XDNA_TRACE_MEMTILE_SEL_CHANNELS")
     fi
+    # Optional override: explicit memmod (compute-tile memory module) event
+    # slot list. Default 'all' uses the upstream defaults (DMA START_TASK +
+    # CONFLICT_DM_BANK + EDGE). Used by #355a to swap DMA_S2MM_0_FINISHED_BD
+    # in for stage-4 anchoring (memtile->compute chain → data in compute LM).
+    local _memmod_args=("--memmod-sweep-events" "all")
+    if [[ -n "${XDNA_TRACE_MEMMOD_EVENTS:-}" ]]; then
+      _memmod_args=("--memmod-sweep-events" "$XDNA_TRACE_MEMMOD_EVENTS")
+    fi
     if nice -n 19 python3 "$EMU_ROOT/tools/trace-prepare.py" "$src_dir" \
         -o "$traced_dir" \
         --shim-sweep-events all \
         "${_memtile_args[@]}" \
         "${_memtile_sel_args[@]}" \
-        --memmod-sweep-events all \
+        "${_memmod_args[@]}" \
         "${_trace_mode_args[@]}" \
         > "$trace_log" 2>&1; then
       if [[ -f "$traced_dir/prepare-status.txt" ]] \
