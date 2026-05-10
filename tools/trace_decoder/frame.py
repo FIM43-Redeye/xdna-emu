@@ -119,7 +119,24 @@ class Event:
 
     Mirrors the schema emitted by ``parse-trace.py --out-events`` so
     downstream consumers (trace-compare, Perfetto export) work
-    unchanged.  ``ts`` is in tile cycles relative to the segment Start.
+    unchanged.
+
+    ``ts`` matches the mlir-aie ``convert_commands_to_json`` convention:
+    each event in a tile's encoded stream advances the timer by
+    ``1 + cmd.cycles``, where the ``1`` is the implicit per-command
+    increment.  This means ``ts`` is *not* the SoC cycle of the event;
+    it inflates by +1 cyc per preceding event in the same tile stream.
+
+    ``soc`` removes the implicit per-event drift: ``soc = ts - cmd_index``
+    where ``cmd_index`` is the 1-based count of EventCmds (not slots --
+    a Multiple frame with N slots advances ``cmd_index`` by 1) preceding
+    this event in the tile.  For sparse-event tiles the two are nearly
+    equal; for dense-event tiles (shim with STREAM_STARVATION every
+    cycle) they diverge by hundreds of cycles.  Use ``soc`` for any
+    cross-tile timing comparison; ``ts`` is for compatibility with the
+    upstream mlir-aie tooling.
+
+    See `docs/superpowers/findings/2026-05-10-trace-decoder-event-density-drift.md`.
     """
 
     col: int
@@ -128,3 +145,4 @@ class Event:
     slot: int
     name: str
     ts: int
+    soc: int

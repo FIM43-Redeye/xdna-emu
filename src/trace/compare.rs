@@ -436,6 +436,15 @@ struct EventRecord {
     #[allow(dead_code)] // retained for debugging / future per-event name plumbing
     name: String,
     ts: u64,
+    /// SoC-cycle-corrected timestamp emitted by parse-trace.py. The
+    /// legacy `ts` field follows mlir-aie's convention and inflates by
+    /// +1 cyc per preceding event in the same tile's stream, which
+    /// poisons any cross-tile comparison on dense-event tiles (shim
+    /// with STREAM_STARVATION). `soc` strips that drift; we prefer it
+    /// when present and fall back to `ts` for older JSON snapshots.
+    /// See `docs/superpowers/findings/2026-05-10-trace-decoder-event-density-drift.md`.
+    #[serde(default)]
+    soc: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -491,10 +500,11 @@ pub fn load_events_json(path: &Path) -> Result<(TileEvents, EventsConfig, Option
     let mut tiles: TileEvents = HashMap::new();
     for rec in file.events {
         let key = TileKey { col: rec.col, row: rec.row, pkt_type: rec.pkt_type };
-        tiles
-            .entry(key)
-            .or_default()
-            .push(TileEvent { slot: rec.slot, abs_cycle: rec.ts });
+        // Prefer soc (SoC-cycle-corrected) over ts (mlir-aie convention
+        // that bakes in +1 cyc per preceding event in the tile stream).
+        // Old JSON snapshots without soc fall back to ts.
+        let abs_cycle = rec.soc.unwrap_or(rec.ts);
+        tiles.entry(key).or_default().push(TileEvent { slot: rec.slot, abs_cycle });
     }
     for events in tiles.values_mut() {
         events.sort_by_key(|e| e.abs_cycle);

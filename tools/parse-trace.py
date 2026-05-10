@@ -473,6 +473,7 @@ def decode_one_ours(np_mod, td_mod,
                 "slot": e.slot,
                 "name": e.name,
                 "ts": e.ts,
+                "soc": e.soc,
             }
             for e in events
         ]

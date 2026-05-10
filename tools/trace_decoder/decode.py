@@ -153,9 +153,10 @@ def _emit_event(
     slot: int,
     name: str,
     ts: int,
+    soc: int,
 ) -> None:
     out.append(
-        Event(col=col, row=row, pkt_type=pkt_type, slot=slot, name=name, ts=ts)
+        Event(col=col, row=row, pkt_type=pkt_type, slot=slot, name=name, ts=ts, soc=soc)
     )
 
 
@@ -176,6 +177,11 @@ def rebuild_timeline_mode0(
     events: list[Event] = []
     for (pkt_type, row, col), cmds in commands_per_tile.items():
         timer = 0
+        # cmd_index counts EventCmds (and Repeat iterations) since the
+        # most recent Start; soc = ts - cmd_index strips the +1-per-cmd
+        # implicit increment that the mlir-aie convention bakes into ts.
+        # Reset on every Start (mid-stream re-anchor in modes 1/2).
+        cmd_index = 0
         prev_event: EventCmd | None = None
         # Keys are stringified row,col (matching mlir-aie's convention)
         names_for_pt = slot_names.get(pkt_type, {})
@@ -184,6 +190,7 @@ def rebuild_timeline_mode0(
         for cmd in cmds:
             if isinstance(cmd, StartCmd):
                 timer = cmd.timer_value
+                cmd_index = 0
                 prev_event = None
                 continue
             if isinstance(cmd, SyncCmd):
@@ -197,6 +204,8 @@ def rebuild_timeline_mode0(
             if isinstance(cmd, EventCmd):
                 timer += 1  # implicit per-command increment
                 timer += cmd.cycles
+                cmd_index += 1
+                soc = timer - cmd_index
                 for slot in range(8):
                     if cmd.event_bits & (1 << slot):
                         name = slot_table[slot] if slot < len(slot_table) else ""
@@ -208,6 +217,7 @@ def rebuild_timeline_mode0(
                             slot=slot,
                             name=name,
                             ts=timer,
+                            soc=soc,
                         )
                 prev_event = cmd
                 continue
@@ -219,11 +229,17 @@ def rebuild_timeline_mode0(
                 cycles = prev_event.cycles
                 if cycles == 0:
                     # Zero-cycle repeats just extend the timer linearly.
+                    # No events emitted, but they do bump cmd_index --
+                    # each repeated iteration is one more "cmd" worth
+                    # of implicit drift baked into subsequent ts values.
                     timer += cmd.count
+                    cmd_index += cmd.count
                 else:
                     for _ in range(cmd.count):
                         timer += 1
                         timer += cycles
+                        cmd_index += 1
+                        soc = timer - cmd_index
                         for slot in range(8):
                             if prev_event.event_bits & (1 << slot):
                                 name = (
@@ -239,6 +255,7 @@ def rebuild_timeline_mode0(
                                     slot=slot,
                                     name=name,
                                     ts=timer,
+                                    soc=soc,
                                 )
                 continue
 
@@ -412,6 +429,7 @@ def rebuild_timeline_mode1(
                         slot=slot,
                         name=name,
                         ts=ev.cycles,  # mode 1: ts carries PC
+                        soc=ev.cycles,  # mode 1 has no cycle-domain soc; mirror ts
                     )
 
         for cmd in cmds:
