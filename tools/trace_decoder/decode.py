@@ -228,12 +228,13 @@ def rebuild_timeline_mode0(
                     continue
                 cycles = prev_event.cycles
                 if cycles == 0:
-                    # Zero-cycle repeats just extend the timer linearly.
-                    # No events emitted, but they do bump cmd_index --
-                    # each repeated iteration is one more "cmd" worth
-                    # of implicit drift baked into subsequent ts values.
+                    # Zero-cycle repeats just extend the timer linearly:
+                    # the decoder advances timer by `count` without firing
+                    # the implicit per-EventCmd +1, so cmd_index must not
+                    # advance either -- the timer increase in this region
+                    # represents real SoC cycles passing with no events,
+                    # which is exactly the case where ts == SoC.
                     timer += cmd.count
-                    cmd_index += cmd.count
                 else:
                     for _ in range(cmd.count):
                         timer += 1
