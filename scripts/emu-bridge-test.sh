@@ -1806,6 +1806,15 @@ compile_one() {
   fi
 
   if [[ -n "$clang_cmd" ]]; then
+    # Force build output to test.exe -- some newer tests use `-o test`
+    # (matrix_transpose, sync_task_complete_token, ...) but run_one_hardware
+    # only invokes ./test.exe. Rewriting here is simpler than handling both
+    # filenames downstream.
+    clang_cmd="${clang_cmd//-o test /-o test.exe }"
+    clang_cmd="${clang_cmd%-o test}"
+    if [[ "$clang_cmd" != *"-o test.exe"* ]]; then
+      clang_cmd+=" -o test.exe"
+    fi
     if ! ( cd "$build_dir" && bash -c "$clang_cmd" ) >> "$log_file" 2>&1; then
       echo "  COMPILE $name: FAIL (test.exe)"
       return 0

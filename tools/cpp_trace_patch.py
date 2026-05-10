@@ -50,10 +50,10 @@ _PARSER = Parser(_LANGUAGE)
 _TRACE_BO_TEMPLATE = """\
 
   // Trace buffer (injected by trace-prepare.py)
-  constexpr size_t trace_size = {trace_size};  // {trace_size_comment}
-  auto bo_trace = xrt::bo(device, trace_size, XRT_BO_FLAGS_HOST_ONLY,
+  constexpr size_t _xdna_trace_size = {trace_size};  // {trace_size_comment}
+  auto bo_trace = xrt::bo(device, _xdna_trace_size, XRT_BO_FLAGS_HOST_ONLY,
                            {kernel_name}.group_id({next_id}));
-  memset(bo_trace.map<void*>(), 0, trace_size);
+  memset(bo_trace.map<void*>(), 0, _xdna_trace_size);
   bo_trace.sync(XCL_BO_SYNC_BO_TO_DEVICE);"""
 
 _TRACE_WRITEOUT_TEMPLATE = """\
@@ -64,7 +64,7 @@ _TRACE_WRITEOUT_TEMPLATE = """\
       auto trace_ptr = bo_trace.map<char*>();
       std::string trace_path = std::string(trace_dir) + "/trace_raw.bin";
       std::ofstream trace_file(trace_path, std::ios::binary);
-      trace_file.write(trace_ptr, trace_size);
+      trace_file.write(trace_ptr, _xdna_trace_size);
   }"""
 
 
@@ -416,10 +416,9 @@ def patch_test_cpp(
         PatchError: If required insertion points cannot be found.
     """
     # Skip if already patched by us -- the injected BO declaration is the marker.
-    # We do NOT skip on the bare name 'trace_size', because some tests define
-    # their own trace_size variable for the legacy --trace_sz mechanism.  That
-    # legacy path is now voided at the bridge level (--trace_sz stripped from
-    # test.exe commands), so those tests need our injection like any other.
+    # The injected symbol is `_xdna_trace_size` (underscore-prefixed) so it
+    # never collides with a test's own `trace_size` from the legacy --trace_sz
+    # path (which is voided at the bridge level anyway).
     if "injected by trace-prepare.py" in source:
         return source
 

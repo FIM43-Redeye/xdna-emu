@@ -89,11 +89,11 @@ class TestTraceBufferAllocation:
 
     def test_trace_size_default(self):
         result = _patch(MINIMAL_CPP)
-        assert "constexpr size_t trace_size = 1048576;" in result
+        assert "constexpr size_t _xdna_trace_size = 1048576;" in result
 
     def test_trace_size_custom(self):
         result = _patch(MINIMAL_CPP, trace_size=2097152)
-        assert "constexpr size_t trace_size = 2097152;" in result
+        assert "constexpr size_t _xdna_trace_size = 2097152;" in result
 
     def test_trace_bo_has_sync(self):
         result = _patch(MINIMAL_CPP)
@@ -101,7 +101,7 @@ class TestTraceBufferAllocation:
 
     def test_trace_bo_has_memset(self):
         result = _patch(MINIMAL_CPP)
-        assert 'memset(bo_trace.map<void*>(), 0, trace_size);' in result
+        assert 'memset(bo_trace.map<void*>(), 0, _xdna_trace_size);' in result
 
 
 class TestKernelCallArgument:
@@ -169,13 +169,15 @@ class TestAlreadyTracedSkip:
     def test_legacy_trace_size_still_patched(self):
         """Files with a legacy trace_size variable ARE patched (not skipped).
 
-        The old guard skipped any file containing 'trace_size'. Now that the
-        bridge strips --trace_sz from test.exe commands, these tests need our
-        injection like any other.
+        The injected symbol is `_xdna_trace_size` so it cannot collide with
+        a user-defined `trace_size` (from the legacy --trace_sz path).
         """
-        src = "constexpr size_t trace_size = 1048576;\n" + MINIMAL_CPP
+        src = "int trace_size = 1024;\n" + MINIMAL_CPP
         result = _patch(src)
         assert "auto bo_trace = xrt::bo(" in result  # patched, not skipped
+        assert "_xdna_trace_size" in result          # uses our name
+        # User's `trace_size` survives untouched
+        assert "int trace_size = 1024;" in result
 
 
 class TestTraceArgIndex:
