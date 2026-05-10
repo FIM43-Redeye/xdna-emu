@@ -1625,11 +1625,20 @@ compile_one() {
     # Phase 5b's lockstep sweep then rotates events on every type that has
     # decls, giving full-array coverage. Pre-stage-1 behavior (core-only
     # trace) is preserved by omitting these flags.
+    # Optional override: set XDNA_TRACE_MODE={event_time,event_pc,inst_exec}
+    # to override mlir-trace-inject's default (event_pc / mode 1). Used by
+    # #355a cycle-delta calibration which needs event_time (mode 0)
+    # so tools/dma-fill-measure.py can extract per-event cycle counts.
+    local _trace_mode_args=()
+    if [[ -n "${XDNA_TRACE_MODE:-}" ]]; then
+      _trace_mode_args=(--trace-mode "$XDNA_TRACE_MODE")
+    fi
     if nice -n 19 python3 "$EMU_ROOT/tools/trace-prepare.py" "$src_dir" \
         -o "$traced_dir" \
         --shim-sweep-events all \
         --memtile-sweep-events all \
         --memmod-sweep-events all \
+        "${_trace_mode_args[@]}" \
         > "$trace_log" 2>&1; then
       if [[ -f "$traced_dir/prepare-status.txt" ]] \
           && grep -q '^OK' "$traced_dir/prepare-status.txt"; then

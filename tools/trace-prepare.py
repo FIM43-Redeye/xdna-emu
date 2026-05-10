@@ -120,6 +120,7 @@ def inject_trace_declarative(
     shim_sweep_events: str | None = None,
     memtile_sweep_events: str | None = None,
     memmod_sweep_events: str | None = None,
+    trace_mode: str | None = None,
 ) -> tuple[str, dict]:
     """Run mlir-trace-inject.py on the MLIR text.
 
@@ -172,6 +173,12 @@ def inject_trace_declarative(
         # alongside the core decl.
         if memmod_sweep_events is not None:
             cmd += ["--memmod-sweep-events", memmod_sweep_events]
+        # Opt-in trace mode override. Default (None) keeps mlir-trace-inject's
+        # own default (event_pc / mode 1). For cycle-delta calibration
+        # (#355a) callers pass "event_time" so the tile trace unit emits
+        # cycle deltas alongside each event instead of PCs.
+        if trace_mode is not None:
+            cmd += ["--trace-mode", trace_mode]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
             raise RuntimeError(
@@ -234,6 +241,7 @@ def prepare_trace(
     shim_sweep_events: str | None = None,
     memtile_sweep_events: str | None = None,
     memmod_sweep_events: str | None = None,
+    trace_mode: str | None = None,
 ) -> int:
     """Run the trace preparation pipeline.
 
@@ -320,6 +328,7 @@ def prepare_trace(
                 shim_sweep_events=shim_sweep_events,
                 memtile_sweep_events=memtile_sweep_events,
                 memmod_sweep_events=memmod_sweep_events,
+                trace_mode=trace_mode,
             )
         except Exception as e:
             msg = f"FAIL trace injection: {e}"
@@ -464,6 +473,15 @@ def main():
              "inject a second aie.trace decl per compute tile (memmod) "
              "alongside its core trace.",
     )
+    parser.add_argument(
+        "--trace-mode",
+        default=None,
+        choices=("event_time", "event_pc", "inst_exec"),
+        help="forward through to mlir-trace-inject's --trace-mode. Default "
+             "(None) inherits mlir-trace-inject's default (event_pc / "
+             "mode 1). Pass 'event_time' for cycle-delta-anchored traces "
+             "(needed by tools/dma-fill-measure.py for #355a calibration).",
+    )
     args = parser.parse_args()
 
     test_dir = args.test_dir.resolve()
@@ -493,6 +511,7 @@ def main():
         shim_sweep_events=args.shim_sweep_events,
         memtile_sweep_events=args.memtile_sweep_events,
         memmod_sweep_events=args.memmod_sweep_events,
+        trace_mode=args.trace_mode,
     )
     sys.exit(rc)
 
