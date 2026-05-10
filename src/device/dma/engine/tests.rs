@@ -314,7 +314,7 @@ fn test_first_bd_bonus_rearms_after_idle() {
 fn test_shim_ddr_cold_start_only_on_shim_with_host_memory() {
     let cfg = DmaTimingConfig::default();
     assert_eq!(cfg.channel_start_cycles, 2);
-    assert_eq!(cfg.shim_ddr_cold_start_cycles, 2500);
+    assert_eq!(cfg.shim_ddr_cold_start_cycles, 1500);
 
     // stop_channel re-arms the flag (covers external interrupts of in-flight tasks).
     let mut engine = DmaEngine::new_shim_tile(0, 0);

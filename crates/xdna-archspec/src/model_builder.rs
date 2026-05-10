@@ -171,11 +171,22 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             host_memory_latency_cycles: 500,
             // DDR controller cold-start: one-shot precharge + activate + CAS
             // for the first row open after a shim DMA channel goes from cold
-            // Idle to active. Sized to absorb the ~2500-cyc gap measured in
-            // Phase C between HW shim_dispatch and memtile S2MM FINISHED_BD
-            // on add_one_using_dma. Subsequent BDs in the chain stay warm
-            // and do not pay this. See #355a Phase C finding.
-            shim_ddr_cold_start_cycles: 2500,
+            // Idle to active. Subsequent BDs in the chain stay warm and do
+            // not pay this.
+            //
+            // 1500 cyc empirical (#355a): measured the data-path delta
+            // shim_dispatch -> compute_s2mm_done on two kernels with very
+            // different first-chunk sizes (add_one_using_dma at 64B and
+            // vector_scalar_using_dma at 4KB). Both showed EMU ~1000 cyc
+            // over HW with cold-start=2500, basically constant despite the
+            // 64x size difference -- the signature of a one-shot fixed cost
+            // sized too high. AM020 cites ~2500 cyc as DDR worst case, but
+            // on a system where the controller is partly warm from prior
+            // activity (typical during back-to-back test runs) the observed
+            // value is closer to 1500. See `2026-05-10-trace-decoder-event-
+            // density-drift.md` for the methodology that made this cleanly
+            // measurable.
+            shim_ddr_cold_start_cycles: 1500,
         },
         stream_switch: StreamSwitchTiming {
             // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /
