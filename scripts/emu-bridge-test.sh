@@ -1641,10 +1641,21 @@ compile_one() {
     if [[ -n "${XDNA_TRACE_MEMTILE_EVENTS:-}" ]]; then
       _memtile_args=("--memtile-sweep-events" "$XDNA_TRACE_MEMTILE_EVENTS")
     fi
+    # Optional override: memtile DMA Event Channel Selection register
+    # programming (offset 0xA06A0). Without this, memtile DMA SEL events
+    # only fire for physical channel 0 because every SEL slot points
+    # there at reset. Format: 'S2MM_SEL0:N,S2MM_SEL1:N,MM2S_SEL0:N,MM2S_SEL1:N'
+    # (any subset; unset slots default to channel 0). Used by #355a
+    # multi-channel memtile attribution.
+    local _memtile_sel_args=()
+    if [[ -n "${XDNA_TRACE_MEMTILE_SEL_CHANNELS:-}" ]]; then
+      _memtile_sel_args=("--memtile-sel-channels" "$XDNA_TRACE_MEMTILE_SEL_CHANNELS")
+    fi
     if nice -n 19 python3 "$EMU_ROOT/tools/trace-prepare.py" "$src_dir" \
         -o "$traced_dir" \
         --shim-sweep-events all \
         "${_memtile_args[@]}" \
+        "${_memtile_sel_args[@]}" \
         --memmod-sweep-events all \
         "${_trace_mode_args[@]}" \
         > "$trace_log" 2>&1; then

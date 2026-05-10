@@ -302,6 +302,95 @@ def test_memtile_injection_with_sweep_flag(tmp_path):
     )
 
 
+def test_memtile_sel_channels_default_off(tmp_path):
+    """Without --memtile-sel-channels, the runtime sequence must NOT emit
+    a write to the DMA_Event_Channel_Selection register (0xA06A0).
+
+    Leaving the register at its reset value is the safe default -- we don't
+    want to clobber it for tests that aren't asking for memtile DMA SEL
+    events. The reset value (all SEL slots at channel 0) matches what
+    chaining_channels and similar examples assume.
+    """
+    fixture = _write_memtile_fixture(tmp_path)
+    out = tmp_path / "out.mlir"
+    r = _run([
+        "--input", str(fixture),
+        "--out", str(out),
+        "--memtile-sweep-events", "all",
+    ])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    result = out.read_text()
+    # The register offset 0xA06A0 = 0x000A06A0 must not appear as an
+    # npu_write32 target in the output. Match on the address attribute
+    # rather than the bare hex so this test isn't fooled by an unrelated
+    # 0xA06A0 elsewhere (e.g. in a comment).
+    assert "address = 0xa06a0" not in result.lower(), (
+        f"unexpected DMA_Event_Channel_Selection write without --memtile-sel-channels:\n{result}"
+    )
+
+
+def test_memtile_sel_channels_emits_npu_write32(tmp_path):
+    """With --memtile-sel-channels, the runtime sequence must emit one
+    npu_write32 per memtile to program 0xA06A0 with the packed value.
+
+    Spec: 'S2MM_SEL1:1,MM2S_SEL1:1' -> S2MM_SEL0=0 (default), S2MM_SEL1=1,
+    MM2S_SEL0=0 (default), MM2S_SEL1=1.
+    Packed value: (0)<<0 | (1)<<8 | (0)<<16 | (1)<<24 = 0x01000100.
+    """
+    fixture = _write_memtile_fixture(tmp_path)
+    out = tmp_path / "out.mlir"
+    r = _run([
+        "--input", str(fixture),
+        "--out", str(out),
+        "--memtile-sweep-events", "all",
+        "--memtile-sel-channels", "S2MM_SEL1:1,MM2S_SEL1:1",
+    ])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    result = out.read_text()
+    # MLIR's standard pretty-printer emits ui32 attributes in decimal, so
+    # accept either the hex form (0xA06A0 / 0x01000100) or the decimal
+    # equivalents (657056 / 16777472) the printer actually writes.
+    lower = result.lower()
+    assert (
+        "0xa06a0" in lower
+        or "0x000a06a0" in lower
+        or "address = 657056" in lower
+    ), f"expected DMA_Event_Channel_Selection write at 0xA06A0:\n{result}"
+    assert (
+        "0x1000100" in lower
+        or "0x01000100" in lower
+        or "value = 16777472" in lower
+    ), f"expected packed SEL value 0x01000100:\n{result}"
+
+
+def test_memtile_sel_channels_invalid_slot_rejected(tmp_path):
+    """Bad slot names produce a friendly error, not a stack trace."""
+    fixture = _write_memtile_fixture(tmp_path)
+    out = tmp_path / "out.mlir"
+    r = _run([
+        "--input", str(fixture),
+        "--out", str(out),
+        "--memtile-sweep-events", "all",
+        "--memtile-sel-channels", "S2MM_SEL2:0",  # SEL2 doesn't exist
+    ], check=False)
+    assert r.returncode != 0, "expected non-zero exit on invalid slot"
+    assert "unknown slot" in r.stderr.lower() or "S2MM_SEL2" in r.stderr
+
+
+def test_memtile_sel_channels_out_of_range_channel_rejected(tmp_path):
+    """Channel numbers outside 0..5 are rejected (3-bit field)."""
+    fixture = _write_memtile_fixture(tmp_path)
+    out = tmp_path / "out.mlir"
+    r = _run([
+        "--input", str(fixture),
+        "--out", str(out),
+        "--memtile-sweep-events", "all",
+        "--memtile-sel-channels", "S2MM_SEL0:6",  # 6 is out of range
+    ], check=False)
+    assert r.returncode != 0, "expected non-zero exit on out-of-range channel"
+    assert "out of range" in r.stderr.lower()
+
+
 def test_memtile_injection_in_trace_config(tmp_path):
     """Memtile entries must appear in the trace_config.json with kind=memtile."""
     import json

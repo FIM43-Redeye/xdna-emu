@@ -119,6 +119,7 @@ def inject_trace_declarative(
     src_mlir: Path,
     shim_sweep_events: str | None = None,
     memtile_sweep_events: str | None = None,
+    memtile_sel_channels: str | None = None,
     memmod_sweep_events: str | None = None,
     trace_mode: str | None = None,
 ) -> tuple[str, dict]:
@@ -167,6 +168,12 @@ def inject_trace_declarative(
         # pattern as shim above: None leaves row-1 tiles untraced.
         if memtile_sweep_events is not None:
             cmd += ["--memtile-sweep-events", memtile_sweep_events]
+        # Opt-in memtile DMA Event Channel Selection register override.
+        # None leaves register 0xA06A0 at its reset value (every SEL slot
+        # at channel 0). Used by #355a multi-channel memtile attribution
+        # to redirect SEL slots at non-zero physical channels.
+        if memtile_sel_channels is not None:
+            cmd += ["--memtile-sel-channels", memtile_sel_channels]
         # Opt-in memmod trace injection (stage 3 / #374). Same pattern: None
         # leaves the compute tile's memory-module trace unit alone; any
         # non-None value emits a second aie.trace decl per compute tile
@@ -240,6 +247,7 @@ def prepare_trace(
     trace_quarantine_path: Path,
     shim_sweep_events: str | None = None,
     memtile_sweep_events: str | None = None,
+    memtile_sel_channels: str | None = None,
     memmod_sweep_events: str | None = None,
     trace_mode: str | None = None,
 ) -> int:
@@ -327,6 +335,7 @@ def prepare_trace(
                 src_mlir=test_dir / "aie.mlir",
                 shim_sweep_events=shim_sweep_events,
                 memtile_sweep_events=memtile_sweep_events,
+                memtile_sel_channels=memtile_sel_channels,
                 memmod_sweep_events=memmod_sweep_events,
                 trace_mode=trace_mode,
             )
@@ -465,6 +474,15 @@ def main():
              "comma-separated event list) to inject memtile DMA-port trace ops.",
     )
     parser.add_argument(
+        "--memtile-sel-channels",
+        default=None,
+        help="forward through to mlir-trace-inject's --memtile-sel-channels. "
+             "Default (None) leaves the DMA_Event_Channel_Selection register "
+             "(0xA06A0) at its reset value (every SEL slot at channel 0). "
+             "Pass 'SLOT:CHANNEL' pairs (e.g. 'S2MM_SEL1:1,MM2S_SEL1:1') to "
+             "redirect SEL slots at non-zero physical channels.",
+    )
+    parser.add_argument(
         "--memmod-sweep-events",
         default=None,
         help="forward through to mlir-trace-inject's --memmod-sweep-events. "
@@ -510,6 +528,7 @@ def main():
         trace_quarantine_path=trace_quarantine,
         shim_sweep_events=args.shim_sweep_events,
         memtile_sweep_events=args.memtile_sweep_events,
+        memtile_sel_channels=args.memtile_sel_channels,
         memmod_sweep_events=args.memmod_sweep_events,
         trace_mode=args.trace_mode,
     )

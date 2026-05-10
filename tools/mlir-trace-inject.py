@@ -192,6 +192,64 @@ _TRACE_DEFAULT_MEMMOD_EVENTS = (
 )
 
 
+# MemTile DMA_Event_Channel_Selection register offset (per AM020 /
+# aie-rt xaiemlgbl_params.h XAIEMLGBL_MEM_TILE_MODULE_DMA_EVENT_CHANNEL_SELECTION).
+_MEMTILE_DMA_EVENT_SEL_OFFSET = 0xA06A0
+_MEMTILE_SEL_FIELD_SHIFTS = {
+    "S2MM_SEL0": 0,
+    "S2MM_SEL1": 8,
+    "MM2S_SEL0": 16,
+    "MM2S_SEL1": 24,
+}
+
+
+def _parse_memtile_sel_channels(spec: str | None) -> int | None:
+    """Decode --memtile-sel-channels into the packed 32-bit register value.
+
+    Format: comma-separated `SLOT:CHANNEL` pairs where SLOT is one of
+    {S2MM_SEL0, S2MM_SEL1, MM2S_SEL0, MM2S_SEL1} and CHANNEL is 0-5
+    (3-bit field, memtile has 6 channels per direction). Unspecified
+    slots default to channel 0, matching the register's reset value.
+
+    Returns None when no override is requested (so the caller can skip
+    emitting an npu_write32 entirely and let the register stay at reset).
+    """
+    if not spec:
+        return None
+    packed = 0
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if ":" not in tok:
+            raise ValueError(
+                f"--memtile-sel-channels: missing ':' in '{tok}' "
+                f"(expected 'SLOT:CHANNEL')"
+            )
+        slot, channel_str = tok.split(":", 1)
+        slot = slot.strip().upper()
+        if slot not in _MEMTILE_SEL_FIELD_SHIFTS:
+            raise ValueError(
+                f"--memtile-sel-channels: unknown slot '{slot}' "
+                f"(expected one of {sorted(_MEMTILE_SEL_FIELD_SHIFTS)})"
+            )
+        try:
+            channel = int(channel_str.strip(), 0)
+        except ValueError:
+            raise ValueError(
+                f"--memtile-sel-channels: invalid channel '{channel_str}' "
+                f"for slot {slot}"
+            ) from None
+        if not (0 <= channel <= 5):
+            raise ValueError(
+                f"--memtile-sel-channels: channel {channel} out of range "
+                f"for slot {slot} (memtile has 6 channels per direction, "
+                f"valid 0-5)"
+            )
+        packed |= (channel & 0x7) << _MEMTILE_SEL_FIELD_SHIFTS[slot]
+    return packed
+
+
 def _memtile_default_port_config(event_name: str):
     """Return (channel, master) for a memtile PORT_RUNNING_<N> event, else None.
 
@@ -309,6 +367,22 @@ def parse_args():
                    help="comma-separated event names to sweep on memtile. "
                         "Default: don't inject memtile trace. 'all' is reserved "
                         "for future use; currently behaves the same as the default.")
+    p.add_argument("--memtile-sel-channels", default=None,
+                   help="memtile DMA Event Channel Selection register (0xA06A0) "
+                        "programming. Memtiles broadcast only 4 DMA event lines "
+                        "(S2MM_SEL0/SEL1, MM2S_SEL0/SEL1) regardless of how "
+                        "many physical channels are active; this register "
+                        "selects which physical channel feeds each SEL slot. "
+                        "Default register value is 0 (every SEL slot points "
+                        "at channel 0), so by default channel 0 fires both "
+                        "SEL0 and SEL1 events for its direction and channels "
+                        "1..5 fire nothing -- pass an explicit mapping to "
+                        "redirect SEL slots at higher channels. Format: "
+                        "'S2MM_SEL0:N,S2MM_SEL1:N,MM2S_SEL0:N,MM2S_SEL1:N' "
+                        "where any subset of the four SEL slots may be "
+                        "specified; unset slots default to 0. Example: "
+                        "'S2MM_SEL1:1,MM2S_SEL1:1' redirects the SEL1 slots "
+                        "at channel 1 while leaving SEL0 at channel 0.")
     p.add_argument("--shim-sweep-events", default=None,
                    help="comma-separated event names to sweep on shim. "
                         "Default (None): don't inject shim trace at all. "
@@ -783,6 +857,16 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
         _TRACE_DEFAULT_MEMTILE_EVENTS,
     ) if inject_memtile else []
 
+    # Parse the memtile DMA SEL channel mapping once. None means leave the
+    # register at its reset value (every SEL slot at channel 0). Anything
+    # non-None becomes a single 32-bit npu_write32 emitted into each
+    # traced memtile's runtime sequence below.
+    try:
+        memtile_sel_value = _parse_memtile_sel_channels(args.memtile_sel_channels)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
     # Memmod (compute mem-module) trace injection is opt-in. Stage 3 of #374.
     # The memmod trace unit lives on the SAME compute tile as the core trace
     # unit -- it's the second of two trace units that compute tiles expose
@@ -1050,6 +1134,27 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                 aied.trace_start_config(_trace_sym(col, row, "shim"))
             for sym in perf_syms:
                 aied.trace_start_config(sym)
+
+            # Program memtile DMA_Event_Channel_Selection (offset 0xA06A0) when
+            # the user has requested a non-default mapping. Without this write,
+            # all four SEL slots default to channel 0 -- so kernels that drive
+            # multiple memtile channels would only see channel-0 activity in
+            # the SEL events. Emitted via aiex.npu_write32 so aiecc lowers it
+            # alongside the rest of the runtime sequence config writes.
+            #
+            # Skipped when the spec is None: we don't need to clobber the
+            # register with its reset value, and emitting an unconditional
+            # write would change the runtime trace for tests that don't ask
+            # for memtile SEL events.
+            if memtile_sel_value is not None and memtile_tiles:
+                from aie.dialects.aiex import npu_write32
+                for col, row, _ in memtile_tiles:
+                    npu_write32(
+                        column=int(col),
+                        row=int(row),
+                        address=_MEMTILE_DMA_EVENT_SEL_OFFSET,
+                        value=memtile_sel_value,
+                    )
 
     # Write trace_config.json -- the single source of truth consumed by
     # cpp_trace_patch, parse-trace, trace_compare, and the bridge script.
