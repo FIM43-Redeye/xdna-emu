@@ -350,11 +350,13 @@ impl DeviceState {
 
             // Check broadcast channel mapping in the EventModule: if the
             // generated event matches any broadcast channel's configured
-            // event, queue the BROADCAST_N event for column propagation.
-            let broadcast_base = match tile.tile_kind {
-                TileKind::Compute | TileKind::ShimNoc | TileKind::ShimPl => 107u8, // Core/PL module
-                TileKind::Mem => 142u8,
-            };
+            // event, queue the channel number for column propagation.
+            //
+            // Note: `pending_broadcasts` stores the channel number (0..15),
+            // not a hw_id. Per-module hw_id translation happens at the
+            // receiving tile in `propagate_broadcasts`, since each module
+            // type sees BROADCAST_N at a different hw_id (compute core/mem
+            // = 107+N, shim PL_A = 110+N, memtile = 142+N).
             let events_ref = match tile.tile_kind {
                 TileKind::Compute | TileKind::ShimNoc | TileKind::ShimPl => tile.core_events.as_ref(),
                 TileKind::Mem => tile.mem_events.as_ref(),
@@ -363,16 +365,14 @@ impl DeviceState {
                 for ch in 0..16u8 {
                     let ch_event = em.broadcast.read_channel(ch as usize) as u8;
                     if ch_event == event_id && event_id != 0 {
-                        let broadcast_hw_id = broadcast_base + ch;
                         log::info!(
-                            "Tile({},{}) Event_Generate: event {} -> BROADCAST_{} (hw_id={})",
+                            "Tile({},{}) Event_Generate: event {} -> BROADCAST channel {}",
                             col,
                             row,
                             event_id,
                             ch,
-                            broadcast_hw_id
                         );
-                        tile.pending_broadcasts.push(broadcast_hw_id);
+                        tile.pending_broadcasts.push(ch);
                     }
                 }
             }
@@ -394,40 +394,71 @@ impl DeviceState {
         // are time-stamped with the current cycle rather than 0.
         let current_cycle = self.array.current_cycle;
 
-        // Drain pending broadcasts from the source tile.
-        let broadcasts = if let Some(tile) = self.array.get_mut(col, source_row) {
+        // Drain pending broadcasts (channel numbers 0..15) from the source tile.
+        let channels = if let Some(tile) = self.array.get_mut(col, source_row) {
             tile.drain_pending_broadcasts()
         } else {
             return;
         };
 
-        if broadcasts.is_empty() {
+        if channels.is_empty() {
             return;
         }
 
-        // Propagate each broadcast event to every tile in the column.
+        // Per-module hw_id base for the BROADCAST_N event (per AM020 /
+        // aie-rt xaie_events_aieml.h):
+        //   Core module        : BROADCAST_0 = 107
+        //   Compute mem module : BROADCAST_0 = 107
+        //   Shim PL module     : BROADCAST_A_0 = 110
+        //   MemTile event mod  : BROADCAST_0  = 142
+        // The broadcast network carries channel numbers; each receiving
+        // module fires its own per-module BROADCAST_N event when the
+        // channel arrives. Without this translation, only modules whose
+        // BROADCAST_0 base matches the source's would see the broadcast --
+        // historically that meant compute tile traces armed correctly but
+        // memtile and shim trace units never did.
+        const CORE_BROADCAST_BASE: u8 = 107;
+        const SHIM_PL_BROADCAST_BASE: u8 = 110;
+        const MEMTILE_BROADCAST_BASE: u8 = 142;
+
+        // Propagate each broadcast channel to every tile in the column.
         let rows = self.array.rows();
-        for hw_id in &broadcasts {
+        for &channel in &channels {
             log::info!(
-                "Propagating BROADCAST_{} (hw_id={}) from tile ({},{}) to column {} at cycle {}",
-                hw_id - 107,
-                hw_id,
+                "Propagating BROADCAST channel {} from tile ({},{}) to column {} at cycle {}",
+                channel,
                 col,
                 source_row,
                 col,
-                current_cycle
+                current_cycle,
             );
             for row in 0..rows {
                 if let Some(tile) = self.array.get_mut(col as u8, row as u8) {
-                    // Notify both trace units -- the trace unit checks if the
-                    // event matches its configured start/stop event. Pass the
-                    // recipient's core PC so mode-2's Start frame anchors at
-                    // the PC the core was at when the broadcast arrived
-                    // (matches HW: BROADCAST_15 typically fires while the
-                    // core is already mid-kernel and stalled in acquire).
+                    // Notify both trace units with each module's own hw_id
+                    // for this channel. Pass the recipient's core PC so
+                    // mode-2's Start frame anchors at the PC the core was at
+                    // when the broadcast arrived (matches HW: BROADCAST_15
+                    // typically fires while the core is already mid-kernel
+                    // and stalled in acquire).
                     let core_pc = Some(tile.core.pc);
-                    tile.notify_core_trace_event(*hw_id, current_cycle, core_pc);
-                    tile.notify_mem_trace_event(*hw_id, current_cycle, None);
+                    let (core_hw_id, mem_hw_id) = match tile.tile_kind {
+                        TileKind::Compute => (CORE_BROADCAST_BASE + channel, CORE_BROADCAST_BASE + channel),
+                        TileKind::ShimNoc | TileKind::ShimPl => {
+                            // Shim has only a PL/core trace unit; no mem
+                            // trace unit. Use a sentinel hw_id for the
+                            // mem-side notify -- the mem trace unit isn't
+                            // configured, so it's a no-op anyway.
+                            (SHIM_PL_BROADCAST_BASE + channel, 0)
+                        }
+                        TileKind::Mem => {
+                            // Memtile has only a mem trace unit. The
+                            // core-side notify is a no-op (no core_events
+                            // module on memtile, no core trace).
+                            (0, MEMTILE_BROADCAST_BASE + channel)
+                        }
+                    };
+                    tile.notify_core_trace_event(core_hw_id, current_cycle, core_pc);
+                    tile.notify_mem_trace_event(mem_hw_id, current_cycle, None);
                 }
             }
         }
