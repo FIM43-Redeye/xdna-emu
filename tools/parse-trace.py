@@ -477,6 +477,25 @@ def decode_one_ours(np_mod, td_mod,
             for e in events
         ]
         flat.sort(key=lambda r: (r["col"], r["row"], r["pkt_type"], r["ts"]))
+        # Backfill missing event names. The decoder's slot_names lookup is
+        # keyed by MLIR-origin "row,col" (e.g. '2,0'), but real captures
+        # arrive with HW-placement coords (e.g. col=1 when start_col=1),
+        # so the lookup misses silently and `name` ends up empty. Detect
+        # the runtime column offset from the events themselves (smallest
+        # observed col, since MLIR origin col is 0) and re-resolve any
+        # blank names against the offset-corrected key. This keeps the
+        # decoder API stable while making downstream tools that filter on
+        # event names (dma-fill-measure, trace-compare) actually find them.
+        if flat and slot_names:
+            col_offset = min(e["col"] for e in flat)
+            for e in flat:
+                if e["name"]:
+                    continue
+                lookup_col = e["col"] - col_offset
+                names_for_pt = slot_names.get(e["pkt_type"], {})
+                slot_table = names_for_pt.get(f"{e['row']},{lookup_col}", [])
+                if e["slot"] < len(slot_table):
+                    e["name"] = slot_table[e["slot"]]
         if flat:
             cycles = max(e["ts"] for e in flat) - min(e["ts"] for e in flat)
 
