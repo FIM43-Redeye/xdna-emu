@@ -82,24 +82,36 @@ the firmware command-and-response loop, not chain propagation.
 Calibrating it would require either modeling the mailbox or adding
 a fixed dispatcher-completion latency to dma_wait.
 
-### 2. EMU dma_wait returns too early (correctness issue)
+### 2. EMU dma_wait correctness -- on closer inspection, NOT a bug
 
-EMU shows 6 INSTR_LOCK_ACQUIRE_REQ events between T2 and T3, but
-the kernel does 16 acquires total (4 outer iters x 4 acquires/iter).
-The remaining 10 must be firing AFTER T3, meaning the runtime
-sequence's dma_wait returned before the kernel's work completed.
+Initial reading of this finding suggested EMU's dma_wait returned
+early because only 6 INSTR_LOCK_ACQUIRE_REQ events appeared between
+T2 and T3, vs 16 total kernel acquires.  Re-checking the full event
+list shows all 16 acquires fire on EMU; **10 of them happen between
+T0 and T2** (i.e., before T2), so only 6 land in the T2->T3 window.
+Order on EMU:
 
-The test still passes (output buffer correctness), so kernel work
-*does* complete -- just after the runtime sequence has already
-moved past dma_wait.  This is structurally fine for functional
-correctness but produces misleading cycle measurements: EMU's T3
-anchor doesn't represent "all work done," whereas HW's T3 does.
+  cycle 4562..5060  16 INSTR_LOCK_ACQUIRE_REQ (kernel runs to completion)
+  cycle 4761        shim S2MM 0 BD pushed (Idle -> BdSetup)
+  cycle 5277        shim S2MM 0 BD finished (Transferring -> Idle)
+  cycle 5307        T3 fires (NPU sync resolves ~30 cyc after BD finish,
+                     plus FlushingStreams 4-cyc post-sync settle)
 
-This is an EMU correctness issue independent of #355a calibration
-and worth chasing separately.  Likely lives in the runtime
-sequence executor's dma_wait handling -- it should block until the
-matching shim S2MM channel issues its token, not return on
-BD-queued or some early signal.
+The bridge log directly confirms: `NPU Sync #0 satisfied, resuming
+instruction 42` fires at cycle 5277 -- exactly when the channel
+transitions Idle.  EMU's is_sync_satisfied path is working; channel
+went running (started=true), then went idle, sync resolved.
+
+What looked like an EMU bug is actually a **timing-distribution
+artifact** from the HW vs EMU pipeline-fill difference: HW takes
+~3500 cyc of pipeline fill before the kernel starts, so the kernel
+runs entirely AFTER T2.  EMU takes ~430 cyc of pipeline fill, so
+the kernel starts BEFORE T2 (T2 fires after the second
+dma_memcpy_nd, by which time pipeline has already filled on EMU).
+Same kernel work, different distribution relative to runtime
+sequence anchors.
+
+**No EMU correctness fix needed for dma_wait.**
 
 ### 3. Real DMA pipeline propagation gap (~3000 cyc, structural)
 
@@ -111,29 +123,26 @@ backed out, the chain is 8x too fast on EMU.
 
 ## Recommended next direction
 
-Three independent threads emerged:
+After the dma_wait correction above, two threads remain:
 
-1. **Track down EMU's dma_wait early-return bug.**  Cleanest fix
-   first because it perturbs every trace measurement that goes
-   through the runtime sequence.  Probably lives in
-   `src/npu/executor.rs`'s handling of `aiex.npu.dma_wait`.
+1. **Attribute the 3000-cyc structural pipeline gap.**  Phase A's
+   11.4x pipeline-fill ratio (HW=3458 vs EMU=427 from compute
+   LOCK_STALL to first INSTR_LOCK_ACQUIRE_REQ) is the calibration
+   target.  Phase B confirms it lives in the chain between
+   "shim DMA dispatched" and "kernel cons_lock signaled."  Finer
+   attribution requires instrumenting either the memtile DMA or
+   the data path between memtile and compute -- via memtile-side
+   user events (memtile has 2: IDs 159-160) using the same
+   aiex.npu.write32 pattern as Phase B, but targeting the memtile
+   tile.  Memtile trace has slot 0 = DMA_S2MM_0_START_TASK by
+   default; we need to extend memtile slot allocation to capture
+   the user events too.
 
-2. **Phase C: instrument the kernel itself.**  Add a USER_EVENT
-   trigger as the kernel's first instruction (modify the .cc
-   source) to bracket "kernel boot" vs "kernel hits first acquire."
-   Also add anchors around the kernel's outer-loop iterations so
-   we can see per-iter timing on HW vs EMU directly.
-
-3. **Attribute the 3000-cyc structural pipeline gap.**  Even with
-   T0..T3 anchors, Phase B shows the gap lives between LOCK_STALL
-   and the first INSTR_LOCK_ACQUIRE_REQ.  Finer attribution
-   requires instrumenting either the memtile DMA or the data path
-   between memtile and compute -- either via memtile-side user
-   events (memtile has 2 user events: IDs 159-160) or by reading
-   memtile DMA channel state at known times via the existing core
-   user-event triggers.  Memtile reads via read_aie_reg are
-   firmware-broken on Phoenix (May 7 finding), so this is the
-   only feasible path.
+2. **Model HW firmware token-path latency.**  The ~8000-cyc dead
+   window between BD-finish and dma_wait-return on HW is firmware-
+   only overhead.  Could be added as a fixed delay in EMU's sync
+   resolution path, but is independent of DMA-chain calibration --
+   purely a trace-span fidelity question.
 
 ## Mechanical approach
 
