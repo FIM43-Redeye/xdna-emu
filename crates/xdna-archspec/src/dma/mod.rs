@@ -73,6 +73,13 @@ pub struct DmaTimingConfig {
     /// Applied once per BD, between MemoryLatency and Transferring, only for
     /// shim tiles with host memory endpoints.
     pub host_memory_latency_cycles: u16,
+
+    /// One-shot DDR controller cold-start latency, applied on the first BD of
+    /// a shim DMA task whose transfer touches host memory. Models the
+    /// precharge + activate + CAS sequence the DDR controller performs to
+    /// open a fresh row after the channel has been idle. Subsequent BDs in
+    /// the same chain do not pay this.
+    pub shim_ddr_cold_start_cycles: u16,
 }
 
 /// Per-arch DMA behavior, consulted at DmaEngine construction and at the

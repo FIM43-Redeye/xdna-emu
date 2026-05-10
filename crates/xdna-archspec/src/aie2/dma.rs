@@ -71,6 +71,7 @@ impl DmaModel for Aie2DmaModel {
             lock_release_cycles: timing::DMA_LOCK_RELEASE_CYCLES,
             bd_chain_cycles: timing::DMA_BD_CHAIN_CYCLES,
             host_memory_latency_cycles: timing::DMA_HOST_MEMORY_LATENCY_CYCLES,
+            shim_ddr_cold_start_cycles: timing::DMA_SHIM_DDR_COLD_START_CYCLES,
         }
     }
 }
@@ -142,6 +143,7 @@ mod tests {
         assert_eq!(cfg.lock_release_cycles, timing::DMA_LOCK_RELEASE_CYCLES);
         assert_eq!(cfg.bd_chain_cycles, timing::DMA_BD_CHAIN_CYCLES);
         assert_eq!(cfg.host_memory_latency_cycles, timing::DMA_HOST_MEMORY_LATENCY_CYCLES);
+        assert_eq!(cfg.shim_ddr_cold_start_cycles, timing::DMA_SHIM_DDR_COLD_START_CYCLES);
     }
 
     #[test]

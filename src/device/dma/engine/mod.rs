@@ -535,6 +535,7 @@ impl DmaEngine {
         ch.fsm = ChannelFsm::Idle;
         ch.queued_bd = None;
         ch.chain_start_bd = None;
+        ch.is_first_bd = true;
 
         Ok(())
     }

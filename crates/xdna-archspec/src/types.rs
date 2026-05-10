@@ -1167,6 +1167,17 @@ pub struct DmaTiming {
     /// Derived from trace comparison: ~110cy observed minus ~10cy already
     /// covered by bd_setup + memory_latency.
     pub host_memory_latency_cycles: u16,
+    /// One-shot DDR controller cold-start latency on the first DDR access
+    /// after a shim DMA channel transitions Idle -> active. Models the
+    /// ~2000-3000 cyc precharge + activate + CAS sequence the DDR controller
+    /// performs to open a fresh row. Subsequent BDs in the chain do not pay
+    /// this cost; only the first one out of cold idle.
+    ///
+    /// Source: trace observation on add_one_using_dma -- HW shim
+    /// dispatch -> first chunk in memtile took 2699 cyc vs EMU's 162;
+    /// stages 3-5 already calibrated within ~6-12 cyc of HW. See finding
+    /// 2026-05-10-phase-c-stage-attribution.
+    pub shim_ddr_cold_start_cycles: u16,
 }
 
 /// Stream switch timing and physical constants.

@@ -411,6 +411,12 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             t.dma.host_memory_latency_cycles
         )
         .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_SHIM_DDR_COLD_START_CYCLES: u16 = {};",
+            t.dma.shim_ddr_cold_start_cycles
+        )
+        .unwrap();
         writeln!(out).unwrap();
 
         writeln!(out, "    // Stream switch timing").unwrap();

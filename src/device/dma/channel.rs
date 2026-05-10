@@ -215,6 +215,14 @@ pub struct ChannelContext {
     /// BD unavailable error flag (out-of-order mode).
     pub error_bd_unavailable: bool,
 
+    /// First-BD-of-task gate: true while the channel is waiting to do its
+    /// first data movement out of cold idle. Consumed (cleared to false) on
+    /// the first transition into MemoryLatency, where it triggers one-shot
+    /// timing bonuses (channel_start_cycles, and shim_ddr_cold_start_cycles
+    /// for shim tiles touching host memory). Reset to true on Idle re-entry
+    /// or stop_channel.
+    pub is_first_bd: bool,
+
     /// Performance counters.
     pub stats: ChannelStats,
 }
@@ -231,6 +239,7 @@ impl ChannelContext {
             task_queue: TaskQueue::new_default(),
             task_config: ChannelTaskConfig::default(),
             error_bd_unavailable: false,
+            is_first_bd: true,
             stats: ChannelStats::default(),
         }
     }
@@ -333,6 +342,7 @@ impl ChannelContext {
         self.task_queue.reset();
         self.task_config = ChannelTaskConfig::default();
         self.error_bd_unavailable = false;
+        self.is_first_bd = true;
         self.stats = ChannelStats::default();
     }
 }

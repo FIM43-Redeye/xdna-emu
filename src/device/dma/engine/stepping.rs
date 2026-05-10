@@ -84,6 +84,30 @@ impl DmaEngine {
         }
     }
 
+    /// Consume the first-BD-of-task bonus into the next MemoryLatency budget.
+    ///
+    /// Returns extra cycles to add to memory_latency_cycles when entering
+    /// MemoryLatency for the first BD of a task. Combines:
+    /// - `channel_start_cycles`: generic "start trigger to first data" cost
+    ///   that applies to every channel/tile.
+    /// - `shim_ddr_cold_start_cycles`: one-shot DDR controller setup, only
+    ///   for shim DMA tasks that touch host memory.
+    ///
+    /// Both fire once per Idle->task transition; the flag clears here and is
+    /// re-armed when the channel re-enters Idle (in `after_transfer_done`)
+    /// or via `stop_channel`.
+    fn consume_first_bd_bonus(&mut self, ch_idx: usize, transfer: &Transfer) -> u16 {
+        if !self.channels[ch_idx].is_first_bd {
+            return 0;
+        }
+        self.channels[ch_idx].is_first_bd = false;
+        let mut bonus = self.timing_config.channel_start_cycles as u16;
+        if self.tile_kind.is_shim() && transfer.involves_host_memory() {
+            bonus += self.timing_config.shim_ddr_cold_start_cycles;
+        }
+        bonus
+    }
+
     /// Step a single channel through one cycle of its unified FSM.
     ///
     /// Each match arm does ONE cycle of work and optionally transitions to
@@ -120,8 +144,9 @@ impl DmaEngine {
                     } else {
                         // No lock needed -- insert header now, go to MemoryLatency.
                         self.maybe_insert_packet_header_from_transfer(&mut transfer);
+                        let bonus = self.consume_first_bd_bonus(ch_idx, &transfer);
                         ChannelFsm::MemoryLatency {
-                            cycles_remaining: self.timing_config.memory_latency_cycles as u16,
+                            cycles_remaining: (self.timing_config.memory_latency_cycles as u16) + bonus,
                             transfer,
                         }
                     }
@@ -137,8 +162,9 @@ impl DmaEngine {
                         // Lock acquired, latency done -- insert packet header
                         // now that we're about to start the actual transfer.
                         self.maybe_insert_packet_header_from_transfer(&mut transfer);
+                        let bonus = self.consume_first_bd_bonus(ch_idx, &transfer);
                         ChannelFsm::MemoryLatency {
-                            cycles_remaining: self.timing_config.memory_latency_cycles as u16,
+                            cycles_remaining: (self.timing_config.memory_latency_cycles as u16) + bonus,
                             transfer,
                         }
                     } else {
@@ -382,10 +408,14 @@ impl DmaEngine {
                 self.channels[ch_idx].task_queue.len()
             );
             self.start_next_queued_task(ch_idx as u8);
-            // start_next_queued_task sets the FSM, return what it set
+            // start_next_queued_task sets the FSM, return what it set.
+            // Note: is_first_bd is NOT reset here -- back-to-back queued
+            // tasks share the warm DDR controller and don't pay cold-start.
             return std::mem::take(&mut self.channels[ch_idx].fsm);
         }
 
+        // Channel goes cold; re-arm the first-BD bonus for any future task.
+        self.channels[ch_idx].is_first_bd = true;
         ChannelFsm::Idle
     }
 

@@ -169,6 +169,13 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // See #355a -- proper calibration requires a sweep across
             // multiple test DMA patterns.
             host_memory_latency_cycles: 500,
+            // DDR controller cold-start: one-shot precharge + activate + CAS
+            // for the first row open after a shim DMA channel goes from cold
+            // Idle to active. Sized to absorb the ~2500-cyc gap measured in
+            // Phase C between HW shim_dispatch and memtile S2MM FINISHED_BD
+            // on add_one_using_dma. Subsequent BDs in the chain stay warm
+            // and do not pay this. See #355a Phase C finding.
+            shim_ddr_cold_start_cycles: 2500,
         },
         stream_switch: StreamSwitchTiming {
             // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /

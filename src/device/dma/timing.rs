@@ -42,6 +42,11 @@ pub struct DmaTimingConfig {
     /// Applied once per BD, between MemoryLatency and Transferring, only for
     /// shim tiles with host memory endpoints.
     pub host_memory_latency_cycles: u16,
+
+    /// One-shot DDR controller cold-start latency, applied on the first BD of
+    /// a shim DMA task whose transfer touches host memory. Subsequent BDs in
+    /// the same chain do not pay this. Reset on Idle re-entry.
+    pub shim_ddr_cold_start_cycles: u16,
 }
 
 impl Default for DmaTimingConfig {
@@ -69,6 +74,7 @@ impl DmaTimingConfig {
             lock_release_cycles: m.lock_release_cycles,
             bd_chain_cycles: m.bd_chain_cycles,
             host_memory_latency_cycles: m.host_memory_latency_cycles,
+            shim_ddr_cold_start_cycles: m.shim_ddr_cold_start_cycles,
         }
     }
 

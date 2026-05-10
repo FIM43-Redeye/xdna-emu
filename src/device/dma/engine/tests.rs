@@ -249,6 +249,81 @@ fn test_default_cycle_accurate_timing() {
     assert_eq!(engine.timing_config().words_per_cycle, 4);
 }
 
+/// First-BD-of-task bonus: channel_start_cycles applies to every tile kind.
+///
+/// On a fresh compute MM2S channel the FSM transitions
+/// Idle -> BdSetup -> MemoryLatency -> Transferring. Without the bonus,
+/// MemoryLatency budget is `memory_latency_cycles` (5). With the bonus,
+/// it is `memory_latency_cycles + channel_start_cycles` (5 + 2 = 7) on
+/// the first BD only. Subsequent chained BDs don't pay it.
+#[test]
+fn test_first_bd_bonus_applies_channel_start_cycles() {
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+    let mut host_mem = make_host_memory();
+    engine.configure_bd(0, BdConfig::simple_1d(0x100, 16)).unwrap();
+
+    assert!(engine.channels[2].is_first_bd, "fresh channel should start with is_first_bd=true");
+    engine.start_channel(2, 0).unwrap();
+    assert!(engine.channels[2].is_first_bd, "is_first_bd shouldn't clear before MemoryLatency entry");
+
+    // Step through BdSetup (4 cycles: cycles_remaining counts down 4->1).
+    for _ in 0..4 {
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
+    }
+
+    // Now in MemoryLatency. Bonus should be consumed and budget should be
+    // memory_latency + channel_start = 5 + 2 = 7 (not just 5).
+    assert!(!engine.channels[2].is_first_bd, "is_first_bd cleared on MemoryLatency entry");
+    match &engine.channels[2].fsm {
+        crate::device::dma::channel::ChannelFsm::MemoryLatency { cycles_remaining, .. } => {
+            assert_eq!(*cycles_remaining, 7, "first-BD bonus folds channel_start into MemoryLatency");
+        }
+        other => panic!("expected MemoryLatency after BdSetup, got {:?}", other.phase_name()),
+    }
+}
+
+/// First-BD bonus re-arms after the channel returns to Idle.
+#[test]
+fn test_first_bd_bonus_rearms_after_idle() {
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+    let mut host_mem = make_host_memory();
+    engine.configure_bd(0, BdConfig::simple_1d(0x100, 16)).unwrap();
+
+    engine.start_channel(2, 0).unwrap();
+    let mut cycles = 0;
+    while engine.channel_active(2) {
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
+        cycles += 1;
+        assert!(cycles < 100, "transfer hung");
+    }
+
+    // Channel returned to Idle; flag should be re-armed for the next task.
+    assert!(engine.channels[2].is_first_bd, "is_first_bd re-armed when channel goes Idle");
+}
+
+/// Shim DDR cold-start fires only on shim+host-memory first BDs.
+///
+/// On compute the bonus is `channel_start_cycles` only (no DDR cold-start).
+/// On shim with a host-memory transfer the bonus adds
+/// `shim_ddr_cold_start_cycles` on top.
+#[test]
+fn test_shim_ddr_cold_start_only_on_shim_with_host_memory() {
+    let cfg = DmaTimingConfig::default();
+    assert_eq!(cfg.channel_start_cycles, 2);
+    assert_eq!(cfg.shim_ddr_cold_start_cycles, 2500);
+
+    // stop_channel re-arms the flag (covers external interrupts of in-flight tasks).
+    let mut engine = DmaEngine::new_shim_tile(0, 0);
+    engine.configure_bd(0, BdConfig::simple_1d(0x1000, 16)).unwrap();
+    engine.start_channel(0, 0).unwrap();
+    engine.stop_channel(0).unwrap();
+    assert!(engine.channels[0].is_first_bd, "stop_channel re-arms the bonus flag");
+}
+
 #[test]
 fn test_cycle_accurate_transfer() {
     // Cycle-accurate timing is the default
