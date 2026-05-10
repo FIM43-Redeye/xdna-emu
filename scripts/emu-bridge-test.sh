@@ -1633,10 +1633,18 @@ compile_one() {
     if [[ -n "${XDNA_TRACE_MODE:-}" ]]; then
       _trace_mode_args=(--trace-mode "$XDNA_TRACE_MODE")
     fi
+    # Optional override: explicit memtile event slot list, replacing the
+    # default PORT_RUNNING_* sweep with caller-chosen names. Used by #355a
+    # to get DMA_S2MM_SEL{0,1}_*_TASK boundary events on memtile so we
+    # can attribute per-stage propagation cycles.
+    local _memtile_args=("--memtile-sweep-events" "all")
+    if [[ -n "${XDNA_TRACE_MEMTILE_EVENTS:-}" ]]; then
+      _memtile_args=("--memtile-sweep-events" "$XDNA_TRACE_MEMTILE_EVENTS")
+    fi
     if nice -n 19 python3 "$EMU_ROOT/tools/trace-prepare.py" "$src_dir" \
         -o "$traced_dir" \
         --shim-sweep-events all \
-        --memtile-sweep-events all \
+        "${_memtile_args[@]}" \
         --memmod-sweep-events all \
         "${_trace_mode_args[@]}" \
         > "$trace_log" 2>&1; then
