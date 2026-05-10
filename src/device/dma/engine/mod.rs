@@ -455,6 +455,23 @@ impl DmaEngine {
         let transfer =
             Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_kind)?;
 
+        // Emit a transition log line in the same format as `step_channel_fsm`'s
+        // phase-change logger. This lets external waterfall tools see the
+        // Idle->BdSetup/AcquiringLock transition at start_channel time, which
+        // doesn't otherwise appear in the FSM step loop's transition stream.
+        let initial_phase = if transfer.acquire_lock.is_some() {
+            "AcquiringLock"
+        } else {
+            "BdSetup"
+        };
+        log::info!(
+            "DMA({},{}) ch{}: Idle -> {} cycle={}",
+            self.col,
+            self.row,
+            channel,
+            initial_phase,
+            self.current_cycle,
+        );
         log::info!("DMA tile({},{}) ch{} BD{} start: total_bytes={} base_addr=0x{:X} next_bd={:?} acq_lock={:?}(val={}) rel_lock={:?}(val={}) pkt={}(id={}) dir={:?}",
             self.col, self.row, channel, bd_index,
             transfer.total_bytes, bd_config.base_addr,
