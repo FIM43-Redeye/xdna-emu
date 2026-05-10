@@ -1509,9 +1509,14 @@ mod tests {
         // Sync still not satisfied (channel is running).
         assert!(!executor.syncs_satisfied(&device), "sync must not be satisfied while channel is running");
 
-        // Step DMA until the channel completes.
+        // Step DMA until the channel completes. Drain stream_out each cycle
+        // to simulate a downstream consumer; without it the MM2S backpressure
+        // cap stalls the channel because step_dma alone doesn't run array
+        // routing.
         for _ in 0..10_000 {
             device.array.step_dma(test_col, test_row, &mut host_mem);
+            let dma = device.array.dma_engine_mut(test_col, test_row).unwrap();
+            while dma.pop_stream_out().is_some() {}
             let status = device.array.dma_engine(test_col, test_row).unwrap().get_channel_status(abs_ch);
             if !reg_layout.memory_status.channel_running.extract_bool(status) {
                 break;

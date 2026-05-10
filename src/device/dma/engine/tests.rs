@@ -480,10 +480,13 @@ fn test_task_queue_with_repeat() {
     // Enqueue a task with repeat_count=2 (runs 3 times total)
     engine.enqueue_task(2, 0, 2, true);
 
-    // Run until all work is complete (including repeats)
+    // Run until all work is complete (including repeats). MM2S transfers
+    // need a downstream consumer or stream_out backpressure will stall;
+    // drain the queue each cycle to simulate one.
     let mut cycles = 0;
     while engine.channel_has_pending_work(2) {
         engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
         cycles += 1;
         if cycles > 200 {
             panic!("Repeated task took too long");
@@ -516,6 +519,7 @@ fn test_bd_chain_with_repeat_restarts_from_start() {
     let mut cycles = 0;
     while engine.channel_has_pending_work(2) {
         engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
         cycles += 1;
         if cycles > 500 {
             panic!("BD chain with repeat took too long (>500 cycles)");
@@ -550,8 +554,10 @@ fn test_self_chaining_bd_loops_indefinitely() {
     engine.enqueue_task(2, 0, 0, false);
 
     // Run for a fixed number of cycles -- channel should still be active.
+    // Drain stream_out each cycle so MM2S backpressure doesn't stall the loop.
     for _ in 0..200 {
         engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
     }
 
     assert!(

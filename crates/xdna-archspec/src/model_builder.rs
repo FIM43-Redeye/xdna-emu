@@ -171,8 +171,21 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             host_memory_latency_cycles: 500,
         },
         stream_switch: StreamSwitchTiming {
-            local_slave_fifo_depth: 4,
-            local_master_fifo_depth: 2,
+            // FIFO depths in 32-bit-word units. AM027 ch2 specifies depths
+            // in *double-words* (64 bits each = 2 x 32-bit words) since
+            // AIE2 streams are 64 bits wide. We store 32-bit-word counts to
+            // match the unit of `VecDeque<u32>` consumers, so each spec
+            // value is doubled here.
+            //
+            //   "External and local slave ports have two cycles of latency
+            //    and four double-words of buffering."
+            //   -> 4 dws = 8 x 32-bit words
+            //
+            //   "Local master ports have one cycle of latency and two
+            //    double-words of buffering."
+            //   -> 2 dws = 4 x 32-bit words
+            local_slave_fifo_depth: 8,
+            local_master_fifo_depth: 4,
             local_to_local_latency: 3,
             local_to_external_latency: 4,
             external_to_external_latency: 4,

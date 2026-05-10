@@ -662,7 +662,10 @@ impl DmaEngine {
     /// Execute a simple 1D transfer immediately (no cycling).
     ///
     /// This is a convenience method for testing that runs the transfer
-    /// to completion in one call.
+    /// to completion in one call. Drains any MM2S output each cycle to
+    /// simulate an always-ready downstream consumer; without it, the
+    /// stream-out backpressure cap stalls the transfer indefinitely
+    /// because no array-routing pass is running here.
     pub fn execute_1d_transfer(
         &mut self,
         channel: ChannelId,
@@ -676,6 +679,7 @@ impl DmaEngine {
         let mut cycles = 0u64;
         while self.channel_active(channel) {
             self.step(tile, neighbors, host_memory);
+            while self.pop_stream_out().is_some() {}
             cycles += 1;
 
             // Safety limit

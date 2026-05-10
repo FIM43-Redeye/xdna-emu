@@ -662,7 +662,15 @@ impl DmaEngine {
     ) -> TransferResult {
         match (source, dest) {
             (TransferEndpoint::TileMemory { .. }, TransferEndpoint::Stream { .. }) => {
-                // MM2S: Read from tile memory, queue to stream output
+                // MM2S: Read from tile memory, queue to stream output.
+                // Backpressure: stall when the DMA's own output queue has
+                // saturated the downstream slave port FIFO depth. Models
+                // STALL_STRM_STARV on real silicon, where MM2S blocks
+                // until the consumer (next switch hop / S2MM / etc.)
+                // pulls a word free.
+                if self.stream_out.len() >= self.output_fifo_capacity() {
+                    return TransferResult::stalled();
+                }
                 if self.transfer_mm2s(addr, bytes, channel, is_last, tlast_suppress, tile, neighbors) {
                     TransferResult::success()
                 } else {
@@ -714,7 +722,15 @@ impl DmaEngine {
                 }
             }
             (TransferEndpoint::HostMemory, TransferEndpoint::Stream { .. }) => {
-                // Shim MM2S: Read from host DDR, queue to stream output
+                // Shim MM2S: Read from host DDR, queue to stream output.
+                // Same backpressure as tile MM2S above -- shim's outgoing
+                // stream port stalls when the next slave FIFO is full,
+                // which is what propagates the consumer drain rate (memtile
+                // S2MM lock waits, compute kernel rate) back to the shim
+                // and gates DMA_FINISHED_TASK timing.
+                if self.stream_out.len() >= self.output_fifo_capacity() {
+                    return TransferResult::stalled();
+                }
                 if self.transfer_host_to_stream(addr, bytes, channel, is_last, tlast_suppress, host_memory) {
                     TransferResult::success()
                 } else {
