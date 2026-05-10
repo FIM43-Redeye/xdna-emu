@@ -143,6 +143,30 @@ impl DeviceState {
             }
         }
 
+        // 5b. MemTile DMA Event Channel Selection register (0xA06A0).
+        //
+        // Per AM020 / aie-rt xaiemlgbl_params.h, this register selects which
+        // physical DMA channel feeds each of the four memtile DMA event
+        // broadcast lines (S2MM_SEL0/SEL1, MM2S_SEL0/SEL1). At reset all
+        // SEL slots point at channel 0; software must program this register
+        // to redirect a SEL slot at any other channel.
+        //
+        // Read by `crate::trace::memtile_event_to_hw_ids` via the coordinator's
+        // memtile DMA event dispatch path.
+        if tile.is_mem() && offset == 0xA06A0 {
+            tile.memtile_dma_event_chan_sel = value;
+            log::info!(
+                "Tile({},{}) DMA_Event_Channel_Selection = 0x{:08X} (S2MM_SEL0={} S2MM_SEL1={} MM2S_SEL0={} MM2S_SEL1={})",
+                col,
+                row,
+                value,
+                value & 0x7,
+                (value >> 8) & 0x7,
+                (value >> 16) & 0x7,
+                (value >> 24) & 0x7,
+            );
+        }
+
         // 6. Edge detection event control registers (offsets from register database).
         if tile.is_compute() {
             if offset == ce.edge_detection {

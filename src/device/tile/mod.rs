@@ -269,6 +269,15 @@ pub struct Tile {
     /// Used by stall detection to distinguish 'slow but working' from
     /// 'stuck in an infinite loop'.
     lock_release_count: u64,
+
+    /// MemTile DMA Event Channel Selection register (offset 0xA06A0).
+    ///
+    /// Selects which physical DMA channel feeds each of the four memtile
+    /// DMA event broadcast lines (S2MM_SEL0/SEL1, MM2S_SEL0/SEL1). Only
+    /// meaningful on memtiles; unused on compute and shim. Reset value is 0
+    /// (every SEL slot points at channel 0). See `crate::trace::MemtileDmaEventSel`
+    /// for the field layout.
+    pub memtile_dma_event_chan_sel: u32,
 }
 
 // Performance counter types are now in src/device/perf_counters/mod.rs.
@@ -367,6 +376,7 @@ impl Tile {
             pending_broadcasts: Vec::new(),
             pending_ctrl_response: std::collections::VecDeque::new(),
             lock_release_count: 0,
+            memtile_dma_event_chan_sel: 0,
         }
     }
 

@@ -813,7 +813,13 @@ impl InterpreterEngine {
                         tile.notify_core_trace_event(id, cycle, None);
                     }
                 } else if tile.is_mem() {
-                    if let Some(id) = crate::trace::memtile_event_to_hw_id(&event) {
+                    // Memtile DMA events are gated by the DMA_Event_Channel_Selection
+                    // register (0xA06A0). Each SEL slot can map to a different
+                    // physical channel and a single channel may fire both SEL slots
+                    // when both are aimed at it (e.g., reset default = both at ch0).
+                    let sel =
+                        crate::trace::MemtileDmaEventSel::from_register(tile.memtile_dma_event_chan_sel);
+                    for id in crate::trace::memtile_event_to_hw_ids(&event, sel).into_iter().flatten() {
                         tile.notify_mem_trace_event(id, cycle, None);
                     }
                 } else {

@@ -224,72 +224,100 @@ pub fn mem_event_to_hw_id(event: &EventType) -> Option<u8> {
     }
 }
 
-/// Map an emulator `EventType` to its AIE2 MemTile hardware event ID.
+/// MemTile DMA Event Channel Selection register state (offset 0xA06A0).
+///
+/// Per AM020 / aie-rt `xaiemlgbl_params.h`, MemTiles have only 4 DMA event
+/// signals broadcast to the trace network: S2MM_SEL0, S2MM_SEL1, MM2S_SEL0,
+/// MM2S_SEL1. The DMA_Event_Channel_Selection register (0xA06A0) selects
+/// which physical DMA channel feeds each SEL slot:
+///
+/// | Bits   | Field             | Selects which physical channel fires SEL_N |
+/// |--------|-------------------|--------------------------------------------|
+/// | 2:0    | S2MM_Sel0_Channel | 0..5 (default 0)                           |
+/// | 10:8   | S2MM_Sel1_Channel | 0..5 (default 0)                           |
+/// | 18:16  | MM2S_Sel0_Channel | 0..5 (default 0)                           |
+/// | 26:24  | MM2S_Sel1_Channel | 0..5 (default 0)                           |
+///
+/// At reset, all SEL slots point at physical channel 0 -- so by default,
+/// channel 0 fires both SEL0 and SEL1 events for its direction, while
+/// channels 1-5 fire nothing. To capture activity on a non-zero channel,
+/// software must program 0xA06A0 to redirect a SEL slot at it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemtileDmaEventSel {
+    pub s2mm_sel0: u8,
+    pub s2mm_sel1: u8,
+    pub mm2s_sel0: u8,
+    pub mm2s_sel1: u8,
+}
+
+impl MemtileDmaEventSel {
+    /// Decode the 32-bit register value into per-SEL channel selectors.
+    ///
+    /// Field layout per AM020 / aie-rt `xaiemlgbl_params.h`:
+    ///   S2MM_SEL0 = bits 2:0, S2MM_SEL1 = bits 10:8,
+    ///   MM2S_SEL0 = bits 18:16, MM2S_SEL1 = bits 26:24.
+    /// All fields are 3 bits wide (memtile has 6 channels per direction; the
+    /// 7th value is reserved).
+    pub fn from_register(value: u32) -> Self {
+        Self {
+            s2mm_sel0: (value & 0x7) as u8,
+            s2mm_sel1: ((value >> 8) & 0x7) as u8,
+            mm2s_sel0: ((value >> 16) & 0x7) as u8,
+            mm2s_sel1: ((value >> 24) & 0x7) as u8,
+        }
+    }
+}
+
+/// Number of S2MM channels on a MemTile (per AM020 / mlir-aie device model).
+/// Used to decode the EMU's flat channel index (0..5 = S2MM, 6..11 = MM2S).
+const MEMTILE_S2MM_CHANNELS: u8 = 6;
+
+/// Map an emulator `EventType` to its AIE2 MemTile hardware event ID(s).
 ///
 /// MemTiles use a different event ID namespace than compute tile memory modules.
 /// DMA events are offset by +2 from compute tile IDs, and use SEL0/SEL1 naming
 /// for the two channel groups.
 ///
+/// `sel` is the current value of the DMA_Event_Channel_Selection register
+/// (0xA06A0). For DMA events on flat channel `N`, the SEL slot whose
+/// configured channel equals `N` fires the corresponding event ID. If no
+/// SEL slot is targeted at this channel, the event is dropped (returns
+/// `[None, None]`). Both SEL slots can be aimed at the same channel
+/// (e.g., both default to 0) -- in that case both event IDs fire.
+///
+/// Returns up to two HW event IDs in a fixed-size array. Non-DMA events
+/// (locks, etc.) always produce at most one entry. Unused slots are `None`.
+///
 /// Event IDs from mlir-aie `python/utils/trace/events/aie2.py` MemTileEvent.
-pub fn memtile_event_to_hw_id(event: &EventType) -> Option<u8> {
+pub fn memtile_event_to_hw_ids(event: &EventType, sel: MemtileDmaEventSel) -> [Option<u8>; 2] {
+    let dma_ids = |channel: u8, s2mm_base: u8, mm2s_base: u8| -> [Option<u8>; 2] {
+        if channel < MEMTILE_S2MM_CHANNELS {
+            // S2MM direction: flat channel = per-direction channel.
+            let phys = channel;
+            [(phys == sel.s2mm_sel0).then_some(s2mm_base), (phys == sel.s2mm_sel1).then_some(s2mm_base + 1)]
+        } else {
+            // MM2S direction: subtract S2MM count to get per-direction channel.
+            let phys = channel - MEMTILE_S2MM_CHANNELS;
+            [(phys == sel.mm2s_sel0).then_some(mm2s_base), (phys == sel.mm2s_sel1).then_some(mm2s_base + 1)]
+        }
+    };
     match event {
         // DMA start task: S2MM_SEL0=21, S2MM_SEL1=22, MM2S_SEL0=23, MM2S_SEL1=24
-        EventType::DmaStartTask { channel } => match channel {
-            0 => Some(21),
-            1 => Some(22),
-            2 => Some(23),
-            3 => Some(24),
-            _ => None,
-        },
+        EventType::DmaStartTask { channel } => dma_ids(*channel, 21, 23),
         // DMA finished BD: S2MM_SEL0=25, S2MM_SEL1=26, MM2S_SEL0=27, MM2S_SEL1=28
-        EventType::DmaFinishedBd { channel } => match channel {
-            0 => Some(25),
-            1 => Some(26),
-            2 => Some(27),
-            3 => Some(28),
-            _ => None,
-        },
+        EventType::DmaFinishedBd { channel } => dma_ids(*channel, 25, 27),
         // DMA finished task: S2MM_SEL0=29, S2MM_SEL1=30, MM2S_SEL0=31, MM2S_SEL1=32
-        EventType::DmaFinishedTask { channel } => match channel {
-            0 => Some(29),
-            1 => Some(30),
-            2 => Some(31),
-            3 => Some(32),
-            _ => None,
-        },
+        EventType::DmaFinishedTask { channel } => dma_ids(*channel, 29, 31),
         // DMA stalled lock: S2MM_SEL0=33, S2MM_SEL1=34, MM2S_SEL0=35, MM2S_SEL1=36
-        EventType::DmaStalledLock { channel } => match channel {
-            0 => Some(33),
-            1 => Some(34),
-            2 => Some(35),
-            3 => Some(36),
-            _ => None,
-        },
+        EventType::DmaStalledLock { channel } => dma_ids(*channel, 33, 35),
         // DMA stream starvation: S2MM_SEL0=37, S2MM_SEL1=38, MM2S_SEL0=39(bp), MM2S_SEL1=40
-        EventType::DmaStreamStarvation { channel } => match channel {
-            0 => Some(37),
-            1 => Some(38),
-            2 => Some(39),
-            3 => Some(40),
-            _ => None,
-        },
-        // Lock acquire: LOCK_SEL0_ACQ_GE=47, stride 4 per lock
-        EventType::LockAcquire { lock_id } => {
-            if *lock_id <= 7 {
-                Some(47 + (*lock_id as u8) * 4)
-            } else {
-                None
-            }
-        }
-        // Lock release: LOCK_SEL0_REL=48, stride 4 per lock
-        EventType::LockRelease { lock_id } => {
-            if *lock_id <= 7 {
-                Some(48 + (*lock_id as u8) * 4)
-            } else {
-                None
-            }
-        }
-        _ => None,
+        EventType::DmaStreamStarvation { channel } => dma_ids(*channel, 37, 39),
+        // Lock acquire: LOCK_SEL0_ACQ_GE=47, stride 4 per lock.
+        // Lock events are not gated by the DMA SEL register.
+        EventType::LockAcquire { lock_id } if *lock_id <= 7 => [Some(47 + (*lock_id as u8) * 4), None],
+        // Lock release: LOCK_SEL0_REL=48, stride 4 per lock.
+        EventType::LockRelease { lock_id } if *lock_id <= 7 => [Some(48 + (*lock_id as u8) * 4), None],
+        _ => [None, None],
     }
 }
 
@@ -578,38 +606,105 @@ mod tests {
 
     // -- MemTile event ID tests --
 
-    #[test]
-    fn test_memtile_dma_ids_offset_from_compute() {
-        // MemTile DMA events are offset +2 from compute tile memory module.
-        // Compute: S2MM_0_START_TASK=19, MemTile: S2MM_SEL0_START_TASK=21
-        assert_eq!(memtile_event_to_hw_id(&EventType::DmaStartTask { channel: 0 }), Some(21));
-        assert_eq!(memtile_event_to_hw_id(&EventType::DmaStartTask { channel: 1 }), Some(22));
-        assert_eq!(memtile_event_to_hw_id(&EventType::DmaStartTask { channel: 2 }), Some(23));
-        assert_eq!(memtile_event_to_hw_id(&EventType::DmaStartTask { channel: 3 }), Some(24));
+    /// Helper: SEL register state with each SEL slot pointing at a distinct
+    /// channel. Convenient for tests that want every channel 0..3 to fire
+    /// exactly one SEL event ID.
+    fn sel_distinct_4ch() -> MemtileDmaEventSel {
+        MemtileDmaEventSel { s2mm_sel0: 0, s2mm_sel1: 1, mm2s_sel0: 0, mm2s_sel1: 1 }
     }
 
     #[test]
-    fn test_memtile_dma_finished_ids() {
-        assert_eq!(memtile_event_to_hw_id(&EventType::DmaFinishedBd { channel: 0 }), Some(25));
-        assert_eq!(memtile_event_to_hw_id(&EventType::DmaFinishedBd { channel: 3 }), Some(28));
-        assert_eq!(memtile_event_to_hw_id(&EventType::DmaFinishedTask { channel: 0 }), Some(29));
-        assert_eq!(memtile_event_to_hw_id(&EventType::DmaFinishedTask { channel: 3 }), Some(32));
+    fn test_memtile_dma_ids_with_sel_register() {
+        // With SEL programmed for distinct channels (S2MM_SEL0=0, S2MM_SEL1=1,
+        // MM2S_SEL0=0, MM2S_SEL1=1), each S2MM channel 0/1 and MM2S channel
+        // 0/1 fires exactly one event ID.
+        let sel = sel_distinct_4ch();
+        // S2MM channels are flat 0..5; MM2S channels are flat 6..11.
+        // S2MM ch0 -> SEL0 (id=21), S2MM ch1 -> SEL1 (id=22).
+        assert_eq!(memtile_event_to_hw_ids(&EventType::DmaStartTask { channel: 0 }, sel), [Some(21), None]);
+        assert_eq!(memtile_event_to_hw_ids(&EventType::DmaStartTask { channel: 1 }, sel), [None, Some(22)]);
+        // MM2S ch0 -> SEL0 (id=23), MM2S ch1 -> SEL1 (id=24).
+        assert_eq!(memtile_event_to_hw_ids(&EventType::DmaStartTask { channel: 6 }, sel), [Some(23), None]);
+        assert_eq!(memtile_event_to_hw_ids(&EventType::DmaStartTask { channel: 7 }, sel), [None, Some(24)]);
+    }
+
+    #[test]
+    fn test_memtile_dma_default_sel_fires_both_slots_on_ch0() {
+        // Default SEL (all zero) means both SEL0 and SEL1 point at channel 0.
+        // A single channel-0 event fires both event IDs simultaneously --
+        // matching real hardware where the broadcast network sees both lines.
+        let sel = MemtileDmaEventSel::default();
+        assert_eq!(
+            memtile_event_to_hw_ids(&EventType::DmaStartTask { channel: 0 }, sel),
+            [Some(21), Some(22)]
+        );
+        // Channel 1 fires nothing because no SEL slot is aimed at it.
+        assert_eq!(memtile_event_to_hw_ids(&EventType::DmaStartTask { channel: 1 }, sel), [None, None]);
+        // MM2S channel 0 (flat=6) likewise fires both MM2S SEL slots.
+        assert_eq!(
+            memtile_event_to_hw_ids(&EventType::DmaStartTask { channel: 6 }, sel),
+            [Some(23), Some(24)]
+        );
+        // MM2S channel 1 (flat=7) fires nothing.
+        assert_eq!(memtile_event_to_hw_ids(&EventType::DmaStartTask { channel: 7 }, sel), [None, None]);
+    }
+
+    #[test]
+    fn test_memtile_dma_high_channels_supported() {
+        // Channels 4-5 (S2MM) and 10-11 (flat, = MM2S 4-5) must work when
+        // a SEL slot points at them. Pre-fix code silently dropped these.
+        let sel = MemtileDmaEventSel { s2mm_sel0: 5, s2mm_sel1: 4, mm2s_sel0: 5, mm2s_sel1: 4 };
+        assert_eq!(memtile_event_to_hw_ids(&EventType::DmaStartTask { channel: 5 }, sel), [Some(21), None]);
+        assert_eq!(memtile_event_to_hw_ids(&EventType::DmaStartTask { channel: 4 }, sel), [None, Some(22)]);
+        // Flat 11 = MM2S ch5; flat 10 = MM2S ch4.
+        assert_eq!(memtile_event_to_hw_ids(&EventType::DmaStartTask { channel: 11 }, sel), [Some(23), None]);
+        assert_eq!(memtile_event_to_hw_ids(&EventType::DmaStartTask { channel: 10 }, sel), [None, Some(24)]);
+    }
+
+    #[test]
+    fn test_memtile_dma_finished_ids_with_sel() {
+        let sel = sel_distinct_4ch();
+        assert_eq!(memtile_event_to_hw_ids(&EventType::DmaFinishedBd { channel: 0 }, sel), [Some(25), None]);
+        assert_eq!(memtile_event_to_hw_ids(&EventType::DmaFinishedBd { channel: 1 }, sel), [None, Some(26)]);
+        assert_eq!(
+            memtile_event_to_hw_ids(&EventType::DmaFinishedTask { channel: 0 }, sel),
+            [Some(29), None]
+        );
+        assert_eq!(
+            memtile_event_to_hw_ids(&EventType::DmaFinishedTask { channel: 7 }, sel),
+            [None, Some(32)]
+        );
     }
 
     #[test]
     fn test_memtile_lock_ids_offset_from_compute() {
+        // Lock events are not gated by the DMA SEL register.
+        let sel = MemtileDmaEventSel::default();
         // Compute: LOCK_SEL0_ACQ_GE=45, MemTile: LOCK_SEL0_ACQ_GE=47
-        assert_eq!(memtile_event_to_hw_id(&EventType::LockAcquire { lock_id: 0 }), Some(47));
-        assert_eq!(memtile_event_to_hw_id(&EventType::LockRelease { lock_id: 0 }), Some(48));
+        assert_eq!(memtile_event_to_hw_ids(&EventType::LockAcquire { lock_id: 0 }, sel), [Some(47), None]);
+        assert_eq!(memtile_event_to_hw_ids(&EventType::LockRelease { lock_id: 0 }, sel), [Some(48), None]);
         // Lock 7: 47 + 28 = 75
-        assert_eq!(memtile_event_to_hw_id(&EventType::LockAcquire { lock_id: 7 }), Some(75));
-        assert_eq!(memtile_event_to_hw_id(&EventType::LockRelease { lock_id: 7 }), Some(76));
+        assert_eq!(memtile_event_to_hw_ids(&EventType::LockAcquire { lock_id: 7 }, sel), [Some(75), None]);
+        assert_eq!(memtile_event_to_hw_ids(&EventType::LockRelease { lock_id: 7 }, sel), [Some(76), None]);
     }
 
     #[test]
     fn test_memtile_core_events_return_none() {
-        assert_eq!(memtile_event_to_hw_id(&EventType::InstrVector { pc: 0 }), None);
-        assert_eq!(memtile_event_to_hw_id(&EventType::CoreActive), None);
+        let sel = MemtileDmaEventSel::default();
+        assert_eq!(memtile_event_to_hw_ids(&EventType::InstrVector { pc: 0 }, sel), [None, None]);
+        assert_eq!(memtile_event_to_hw_ids(&EventType::CoreActive, sel), [None, None]);
+    }
+
+    #[test]
+    fn test_memtile_dma_event_sel_decode() {
+        // S2MM_SEL0=3 (bits 2:0), S2MM_SEL1=5 (bits 10:8),
+        // MM2S_SEL0=2 (bits 18:16), MM2S_SEL1=4 (bits 26:24)
+        let raw = 0u32 | 3 | (5 << 8) | (2 << 16) | (4 << 24);
+        let sel = MemtileDmaEventSel::from_register(raw);
+        assert_eq!(sel, MemtileDmaEventSel { s2mm_sel0: 3, s2mm_sel1: 5, mm2s_sel0: 2, mm2s_sel1: 4 });
+        // 3-bit fields ignore high bits.
+        let sel = MemtileDmaEventSel::from_register(0xFFFF_FFFF);
+        assert_eq!(sel, MemtileDmaEventSel { s2mm_sel0: 7, s2mm_sel1: 7, mm2s_sel0: 7, mm2s_sel1: 7 });
     }
 
     // -- Port event ID tests --
