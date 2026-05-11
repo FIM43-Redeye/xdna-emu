@@ -131,6 +131,60 @@ path. Matches the magnitude of "EMU overshoots HW by ~3200 cyc" open
 question in the mailbox finding (most of that 3200 was the mailbox
 constant; this chain overhead accounts for a chunk of the residual).
 
+## Implementation (2026-05-11)
+
+Landed in `src/device/dma/engine/stepping.rs` (`enter_chained_bd` helper
+plus an `is_first_bd` dispatch in the `AcquiringLock`-acquired arm).
+
+When `after_transfer_done` runs with `next_bd: Some(_)`, the FSM no
+longer transitions through `BdChaining -> BdSetup -> AcquiringLock(cycles=lock_acquire_cycles)
+-> MemoryLatency` for the chained BD. Instead it goes straight to the
+next BD's `Transferring` (or `HostPipelineLatency` for shim+host_mem
+BDs, which still pay DDR pipeline fill per BD). If the BD has an
+acquire lock, the FSM stages in `AcquiringLock { cycles_remaining: 0,
+acquired: false }` -- the post-grant countdown is folded away as part
+of the prefetch, but the arbiter grant check still costs the usual two
+cycles (one for the request to be picked up by the next pre-step
+`submit_lock_requests` pass, one for the grant transition).
+
+Cold start (first BD of a task, entered via `start_channel`) is
+unaffected: `is_first_bd=true` keeps the `AcquiringLock` arm routing to
+`MemoryLatency` with the existing `channel_start_cycles` /
+`shim_ddr_cold_start_cycles` bonuses. The dispatch on `is_first_bd`
+is consumed at the first MemoryLatency entry, so every subsequent BD
+in the chain takes the prefetched path.
+
+`ReleasingLock` is intentionally **not** skipped on chained BDs. An
+earlier draft fired the lock release inline at `begin_completion`,
+which broke data correctness in the bridge tests (Phase B's
+`_diag_phase_b_add_one_instrumented` output came back all-zeros).
+Keeping `ReleasingLock` as a real one-cycle stage preserves the
+existing arbiter ordering invariants; only the prefetched
+chain-setup window collapses.
+
+### Measured impact
+
+`_diag_phase_b_add_one_instrumented` chess, EMU back-to-back BD
+interval re-measured with the same Phase C trace harness:
+
+| channel        | BD size | HW | EMU pre-fix | EMU post-fix |
+| -------------- | ------: | -: | ----------: | -----------: |
+| memtile MM2S 0 |     16w | 15 |          20 |       **16** |
+| compute S2MM 0 |      8w |  8 |          16 |        **8** |
+
+Compute S2MM 8w lands exactly on HW. Memtile MM2S 16w is +1 cyc -- the
+residual is the `AcquiringLock` grant-cycle that we can't fully hide
+without bypassing the arbiter (which would re-introduce the
+correctness bug). Below trace-decoder noise.
+
+Total EMU runtime on the kernel: 14990 -> 14680 cyc (saved 310 cyc;
+~2% on this workload, more on workloads with many small chained BDs).
+
+All 2878 library unit tests pass; six varied bridge kernels pass
+(`add_one_using_dma`, `add_256_using_dma_op_no_double_buffering`,
+`vec_vec_add_memtile_init`, `vector_scalar_using_dma`, `cascade_flows`,
+`matrix_transpose`).
+
 ## What the fix would look like
 
 Hardware doesn't actually run BdChaining -> BdSetup -> Lock ->

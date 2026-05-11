@@ -162,10 +162,24 @@ impl DmaEngine {
                         // Lock acquired, latency done -- insert packet header
                         // now that we're about to start the actual transfer.
                         self.maybe_insert_packet_header_from_transfer(&mut transfer);
-                        let bonus = self.consume_first_bd_bonus(ch_idx, &transfer);
-                        ChannelFsm::MemoryLatency {
-                            cycles_remaining: (self.timing_config.memory_latency_cycles as u16) + bonus,
-                            transfer,
+                        // Dispatch on is_first_bd: cold-start (first BD of a
+                        // task) pays MemoryLatency for pipeline fill; chained
+                        // BDs skip it -- hardware prefetched and warmed the
+                        // memory pipeline during the prior BD's transferring
+                        // tail. See enter_chained_bd / the BD-chain finding.
+                        if self.channels[ch_idx].is_first_bd {
+                            let bonus = self.consume_first_bd_bonus(ch_idx, &transfer);
+                            ChannelFsm::MemoryLatency {
+                                cycles_remaining: (self.timing_config.memory_latency_cycles as u16) + bonus,
+                                transfer,
+                            }
+                        } else {
+                            let host_lat = self.timing_config.host_memory_latency_cycles;
+                            if host_lat > 0 && transfer.involves_host_memory() {
+                                ChannelFsm::HostPipelineLatency { cycles_remaining: host_lat, transfer }
+                            } else {
+                                ChannelFsm::Transferring { transfer }
+                            }
                         }
                     } else {
                         ChannelFsm::AcquiringLock {
@@ -222,7 +236,7 @@ impl DmaEngine {
                         transfer.tick();
                         // Check if data movement is complete
                         if transfer.remaining_bytes() == 0 {
-                            self.begin_completion(ch_idx, transfer)
+                            self.begin_completion(ch_idx, transfer, tile, neighbors)
                         } else {
                             ChannelFsm::Transferring { transfer }
                         }
@@ -234,7 +248,7 @@ impl DmaEngine {
                     }
                     TransferCycleResult::FotFinish => {
                         // Early finish on TLAST (FoT mode)
-                        self.begin_completion(ch_idx, transfer)
+                        self.begin_completion(ch_idx, transfer, tile, neighbors)
                     }
                     TransferCycleResult::Error => ChannelFsm::Error,
                 }
@@ -245,7 +259,7 @@ impl DmaEngine {
                     // Execute the lock release
                     self.execute_lock_release(lock_id, release_value, tile, neighbors);
                     // Update stats and handle chaining/repeat
-                    self.after_transfer_done(ch_idx, completion)
+                    self.after_transfer_done(ch_idx, completion, tile, neighbors)
                 } else {
                     ChannelFsm::ReleasingLock {
                         lock_id,
@@ -314,11 +328,88 @@ impl DmaEngine {
         Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_kind)
     }
 
+    /// Enter a chained next BD with hardware-prefetch semantics.
+    ///
+    /// Called from `after_transfer_done` when `Use_Next_BD` is set on the
+    /// completing BD. Skips the `BdChaining`/`BdSetup`/`MemoryLatency`
+    /// pipeline: real hardware fetches the next BD's parameters and warms
+    /// its memory pipeline while the prior BD is still streaming, so a
+    /// back-to-back chained BD enters `Transferring` the cycle after the
+    /// prior one completes -- no inter-BD overhead on the critical path.
+    ///
+    /// If the BD's acquire lock is granted at call time, transitions
+    /// directly to `Transferring` (or `HostPipelineLatency` for shim tiles
+    /// touching host DDR, which still pay the NoC/DDR pipeline-fill on
+    /// each BD). If the lock isn't yet granted, enters `AcquiringLock`
+    /// with `cycles_remaining=0` -- the post-grant latency was also
+    /// overlapped, so once the arbiter grants it the FSM transitions
+    /// straight to `Transferring`.
+    fn enter_chained_bd(
+        &mut self,
+        ch_idx: usize,
+        next_bd: u8,
+        _tile: &mut Tile,
+        _neighbors: &mut NeighborTiles<'_>,
+    ) -> ChannelFsm {
+        let bd_addr = self.bd_configs.get(next_bd as usize).map(|c| c.base_addr).unwrap_or(0);
+        log::info!(
+            "DMA tile({},{}) ch{} BD chain -> BD{} (base_addr=0x{:X}) [prefetched]",
+            self.col,
+            self.row,
+            ch_idx,
+            next_bd,
+            bd_addr,
+        );
+        let mut transfer = match self.create_transfer_from_bd(next_bd, ch_idx as u8) {
+            Ok(t) => Box::new(t),
+            Err(e) => {
+                log::warn!(
+                    "DMA tile({},{}) ch{} BD chain to {} failed: {:?}",
+                    self.col,
+                    self.row,
+                    ch_idx,
+                    next_bd,
+                    e
+                );
+                return ChannelFsm::Error;
+            }
+        };
+        self.channels[ch_idx].current_bd = Some(next_bd);
+
+        // If the BD acquires a lock, we can't grant it inline -- the
+        // arbiter only resolves requests submitted in the pre-step
+        // submit_lock_requests pass. Enter AcquiringLock with
+        // cycles_remaining=0 (no post-grant countdown -- already
+        // overlapped during prior BD's transferring); the FSM will
+        // submit the request next cycle, the arbiter will resolve,
+        // and the acquired-arm's is_first_bd dispatch (false here, BD
+        // is chained) routes straight to Transferring/HostPipelineLatency.
+        if let Some(lock_id) = transfer.acquire_lock {
+            return ChannelFsm::AcquiringLock { lock_id, cycles_remaining: 0, acquired: false, transfer };
+        }
+
+        // No lock to acquire. Insert packet header and start transfer.
+        self.maybe_insert_packet_header_from_transfer(&mut transfer);
+        let host_lat = self.timing_config.host_memory_latency_cycles;
+        if host_lat > 0 && transfer.involves_host_memory() {
+            ChannelFsm::HostPipelineLatency { cycles_remaining: host_lat, transfer }
+        } else {
+            ChannelFsm::Transferring { transfer }
+        }
+    }
+
     /// Begin the completion sequence after data movement is done.
     ///
     /// If the BD has a release lock, transitions to ReleasingLock.
-    /// Otherwise, goes directly to chaining/repeat/idle via after_transfer_done.
-    fn begin_completion(&mut self, ch_idx: usize, transfer: Box<Transfer>) -> ChannelFsm {
+    /// Otherwise, goes directly to chaining/repeat/idle via
+    /// `after_transfer_done`.
+    fn begin_completion(
+        &mut self,
+        ch_idx: usize,
+        transfer: Box<Transfer>,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) -> ChannelFsm {
         let completion = CompletionInfo {
             bd_index: transfer.bd_index,
             next_bd: transfer.next_bd,
@@ -335,14 +426,29 @@ impl DmaEngine {
                 completion,
             }
         } else {
-            self.after_transfer_done(ch_idx, completion)
+            self.after_transfer_done(ch_idx, completion, tile, neighbors)
         }
     }
 
     /// Handle post-transfer completion: stats, chaining, repeat, task queue.
     ///
-    /// Returns the next FSM state (BdChaining, Idle, or starts next task).
-    fn after_transfer_done(&mut self, ch_idx: usize, completion: CompletionInfo) -> ChannelFsm {
+    /// Returns the next FSM state. For chained BDs (Use_Next_BD set), this
+    /// skips the `BdChaining`/`BdSetup`/`AcquiringLock-countdown`/
+    /// `MemoryLatency` sequence and transitions straight to the next BD's
+    /// `Transferring` (or `AcquiringLock` if the lock isn't yet granted) --
+    /// hardware prefetches the next BD's parameters during the prior BD's
+    /// transferring tail, so the inter-BD overhead is off the critical
+    /// path on real silicon. The cold-start path (first BD of a task) is
+    /// unaffected; it still enters `BdSetup`/`AcquiringLock` from
+    /// `start_channel` and pays the full pipeline-fill cost. See
+    /// `docs/superpowers/findings/2026-05-11-emu-bd-chain-pipelining.md`.
+    fn after_transfer_done(
+        &mut self,
+        ch_idx: usize,
+        completion: CompletionInfo,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) -> ChannelFsm {
         self.channels[ch_idx].stats.transfers_completed += 1;
         self.channels[ch_idx].stats.cycles_spent += completion.cycles_elapsed;
 
@@ -362,17 +468,14 @@ impl DmaEngine {
         // is re-executed from chain_start_bd.
         if let Some(next_bd) = completion.next_bd {
             log::debug!(
-                "DMA tile({},{}) ch{} chaining to BD {} (from BD {})",
+                "DMA tile({},{}) ch{} chaining to BD {} (from BD {}) [prefetched]",
                 self.col,
                 self.row,
                 ch_idx,
                 next_bd,
                 completion.bd_index
             );
-            return ChannelFsm::BdChaining {
-                cycles_remaining: self.timing_config.bd_chain_cycles as u16,
-                next_bd,
-            };
+            return self.enter_chained_bd(ch_idx, next_bd, tile, neighbors);
         }
 
         // Chain ended (Use_Next_BD=0). Check repeat_count for re-execution.
