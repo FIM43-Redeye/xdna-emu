@@ -627,11 +627,27 @@ impl StreamSwitch {
 
     /// Step packet-switched routing for all slave ports.
     ///
-    /// For each slave with enabled packet slots:
-    /// - If idle: peek at first word, decode as header, resolve route, begin forwarding
-    /// - If mid-packet: pop word, push to all target masters, end on TLAST
+    /// Per slave with enabled packet slots:
+    /// 1. Header arrival (idle -> active): peek + decode header, resolve
+    ///    route, check arbiter lock / RR priority, pop header, build
+    ///    `ActivePacket` with one `TargetState` per destination master
+    ///    (header queued in each non-drop-header target's `pending`).
+    /// 2. Mid-packet fill: pop one slave word and push a copy into every
+    ///    target's `pending`, but only if every target's queue is below
+    ///    `MAX_PENDING_PER_TARGET`. This bound replaces the old
+    ///    all-or-nothing "every master can_accept" rule that deadlocked
+    ///    multicast through diverging+reconverging paths.
+    /// 3. Drain: each target independently pushes as many of its `pending`
+    ///    words into its master FIFO as the master can accept this cycle.
+    /// 4. Completion: when the slave has popped TLAST and every target's
+    ///    `pending` is empty, release the arbiter and the active slot.
     ///
-    /// Returns the number of words forwarded.
+    /// Header arrival also runs steps 3-4 in the same cycle so a header
+    /// reaches its master in the same step it was popped (preserving the
+    /// 1-cycle-per-word throughput of the previous implementation when
+    /// the multicast deadlock isn't engaged).
+    ///
+    /// Returns the number of words popped from slaves.
     pub fn step_packet_routes(&mut self) -> usize {
         let mut words_forwarded = 0;
         let num_slaves = self.slaves.len();
@@ -644,8 +660,6 @@ impl StreamSwitch {
             if !self.slaves[slave_idx].packet_enable {
                 continue;
             }
-
-            // Also skip if no slots are configured (defensive)
             let has_any_slot = self
                 .slave_slots
                 .get(slave_idx)
@@ -654,26 +668,20 @@ impl StreamSwitch {
                 continue;
             }
 
-            // Skip if slave has no data
-            if !self.slaves[slave_idx].has_data() {
-                continue;
-            }
-
-            if self.active_packets[slave_idx].is_none() {
-                // === Idle: look for a new packet header ===
-                let header_word = match self.slaves[slave_idx].peek() {
-                    Some(w) => w,
-                    None => continue,
-                };
-
-                // Decode the stream header to get pkt_id
+            // ----------------------------------------------------------------
+            // Phase A: Header arrival (only when idle).
+            // Pops the header word and creates an `ActivePacket` with per-
+            // target pending queues, queueing the header for non-drop-header
+            // targets. Skipped if a packet is already in progress.
+            // ----------------------------------------------------------------
+            if self.active_packets[slave_idx].is_none() && self.slaves[slave_idx].has_data() {
+                let header_word = self.slaves[slave_idx].peek().unwrap();
                 let (header, _parity_ok) = PacketHeader::decode(header_word);
                 let pkt_id = header.stream_id;
 
-                // Resolve route
                 match self.resolve_packet_route(slave_idx, pkt_id) {
                     Some((masters, all_drop_header, arbiter)) => {
-                        // Check arbiter lock: another slave may hold this arbiter.
+                        // Arbiter lock: another slave may hold this arbiter.
                         if let Some(locked_by) = self.arbiter_locks[arbiter as usize] {
                             if locked_by != slave_idx {
                                 self.slaves[slave_idx].cycle_stalled = true;
@@ -689,30 +697,20 @@ impl StreamSwitch {
                             }
                         }
 
-                        // Round-robin priority check: if another slave also
-                        // wants this arbiter and has higher priority (closer
-                        // to the priority pointer in round-robin order), defer.
-                        // This prevents a lower-indexed slave from starving
-                        // higher-indexed ones by always winning the arbiter.
+                        // Round-robin priority check. Prevents a lower-indexed
+                        // slave from starving higher-indexed ones by always
+                        // winning a contested arbiter.
                         if self.arbiter_locks[arbiter as usize].is_none() {
                             let priority = self.arbiter_priority[arbiter as usize];
-                            // Check if any OTHER packet-enabled slave with data
-                            // also wants this arbiter and has higher RR priority
                             let mut dominated = false;
                             for other in 0..num_slaves {
-                                if other == slave_idx {
+                                if other == slave_idx
+                                    || !self.slaves[other].packet_enable
+                                    || self.active_packets[other].is_some()
+                                    || !self.slaves[other].has_data()
+                                {
                                     continue;
                                 }
-                                if !self.slaves[other].packet_enable {
-                                    continue;
-                                }
-                                if self.active_packets[other].is_some() {
-                                    continue;
-                                }
-                                if !self.slaves[other].has_data() {
-                                    continue;
-                                }
-                                // Check if 'other' also routes to this arbiter
                                 let other_header = match self.slaves[other].peek() {
                                     Some(w) => w,
                                     None => continue,
@@ -722,7 +720,6 @@ impl StreamSwitch {
                                     self.resolve_packet_route(other, other_hdr.stream_id)
                                 {
                                     if other_arb == arbiter {
-                                        // Both want the same arbiter. Compare RR distance.
                                         let my_dist = (slave_idx + num_slaves - priority) % num_slaves;
                                         let other_dist = (other + num_slaves - priority) % num_slaves;
                                         if other_dist < my_dist {
@@ -745,63 +742,43 @@ impl StreamSwitch {
                             }
                         }
 
-                        // Backpressure: check that all target masters can accept
-                        // BEFORE consuming from slave. If any master is full,
-                        // hold data in the slave FIFO until next cycle.
-                        if !all_drop_header {
-                            let all_can_accept = masters.iter().all(|&m| {
-                                let m = m as usize;
-                                m >= self.masters.len()
-                                    || self.master_packet_config[m].drop_header
-                                    || self.masters[m].can_accept()
-                            });
-                            if !all_can_accept {
-                                self.slaves[slave_idx].cycle_stalled = true;
-                                log::trace!(
-                                    "TileSwitch({},{}): slave[{}] header backpressure (master full)",
-                                    self.col,
-                                    self.row,
-                                    slave_idx
-                                );
-                                continue;
-                            }
-                        }
-
-                        // Consume the header word from slave
+                        // Pop the header from the slave and build per-target
+                        // pendings. Header is queued only for masters that
+                        // don't drop_header.
                         let (data, tlast) = self.slaves[slave_idx].pop_with_tlast().unwrap();
-
-                        // Forward header to masters that don't drop it
-                        if !all_drop_header {
-                            for &m in &masters {
-                                let m = m as usize;
-                                if m < self.masters.len() && !self.master_packet_config[m].drop_header {
-                                    self.masters[m].push_with_tlast(data, tlast);
-                                }
+                        let mut targets = Vec::with_capacity(masters.len());
+                        for &m_idx in &masters {
+                            let mut t = TargetState::new(m_idx);
+                            let m = m_idx as usize;
+                            let drop = m < self.master_packet_config.len()
+                                && self.master_packet_config[m].drop_header;
+                            if !drop {
+                                t.pending.push_back((data, tlast));
                             }
+                            targets.push(t);
                         }
                         words_forwarded += 1;
 
-                        log::info!("TileSwitch({},{}): pkt header 0x{:08X} (id={}) slave[{}] -> masters {:?} arb={} all_drop={}{}",
+                        log::info!(
+                            "TileSwitch({},{}): pkt header 0x{:08X} (id={}) slave[{}] -> masters {:?} arb={} all_drop={}{}",
                             self.col, self.row, data, pkt_id, slave_idx, masters, arbiter,
                             all_drop_header,
-                            if tlast { " TLAST" } else { "" });
+                            if tlast { " TLAST" } else { "" }
+                        );
 
-                        if tlast {
-                            // Single-word packet (header only with TLAST)
-                            // No lock needed -- packet is complete
-                        } else {
-                            // Lock the arbiter for this multi-word packet
-                            self.arbiter_locks[arbiter as usize] = Some(slave_idx);
-                            self.active_packets[slave_idx] =
-                                Some(ActivePacket { target_masters: masters, words_forwarded: 0, arbiter });
-                        }
+                        // Lock the arbiter from header arrival through full
+                        // drain (released later by completion check). Even a
+                        // header-with-TLAST packet may need to drain its
+                        // pendings over several cycles if any master is full.
+                        self.arbiter_locks[arbiter as usize] = Some(slave_idx);
+                        self.active_packets[slave_idx] =
+                            Some(ActivePacket { targets, words_forwarded: 1, arbiter, tlast_seen: tlast });
                     }
                     None => {
-                        // No route configured. On real hardware, packets
-                        // always have a valid route (CDO sets them up).
-                        // This indicates a CDO parsing or configuration bug.
-                        //
-                        // Dump full slot config for this slave to aid diagnosis.
+                        // No route configured. On real hardware packets always
+                        // have a valid route (CDO sets them up). This indicates
+                        // a CDO parsing or configuration bug. Dump full slot
+                        // config for this slave to aid diagnosis.
                         let port_type = &self.slaves[slave_idx].port_type;
                         let slots: Vec<String> = self.slave_slots[slave_idx]
                             .iter()
@@ -827,76 +804,103 @@ impl StreamSwitch {
                         log::error!("{}", msg);
                         self.fatal_errors.push(msg);
                         self.slaves[slave_idx].pop();
+                        // Nothing further to do this iteration for this slave.
+                        continue;
                     }
                 }
-            } else {
-                // === Mid-packet: forward data word ===
-
-                // Backpressure: check that all target masters can accept
-                // BEFORE consuming from slave. If any master is full,
-                // hold data in the slave FIFO until next cycle.
-                let active = self.active_packets[slave_idx].as_ref().unwrap();
-                let all_can_accept = active.target_masters.iter().all(|&m| {
-                    let m = m as usize;
-                    m >= self.masters.len() || self.masters[m].can_accept()
-                });
-                if !all_can_accept {
+            }
+            // ----------------------------------------------------------------
+            // Phase B: Mid-packet fill (only when active, no fill in the
+            // same cycle as Phase A above -- Phase A already enqueued the
+            // header).
+            // ----------------------------------------------------------------
+            else if self.active_packets[slave_idx].is_some() {
+                let (should_fill, room_blocked) = {
+                    let active = self.active_packets[slave_idx].as_ref().unwrap();
+                    let all_have_room =
+                        active.targets.iter().all(|t| t.pending.len() < MAX_PENDING_PER_TARGET);
+                    let want = !active.tlast_seen && self.slaves[slave_idx].has_data();
+                    (want && all_have_room, want && !all_have_room)
+                };
+                if should_fill {
+                    let (data, tlast) = self.slaves[slave_idx].pop_with_tlast().unwrap();
+                    let active = self.active_packets[slave_idx].as_mut().unwrap();
+                    for target in &mut active.targets {
+                        target.pending.push_back((data, tlast));
+                    }
+                    active.words_forwarded += 1;
+                    if tlast {
+                        active.tlast_seen = true;
+                    }
+                    words_forwarded += 1;
+                    log::trace!(
+                        "TileSwitch({},{}): pkt data 0x{:08X} slave[{}] -> targets {:?}{}",
+                        self.col,
+                        self.row,
+                        data,
+                        slave_idx,
+                        active.targets.iter().map(|t| t.master_idx).collect::<Vec<_>>(),
+                        if tlast { " TLAST" } else { "" }
+                    );
+                } else if room_blocked {
                     self.slaves[slave_idx].cycle_stalled = true;
                     log::trace!(
-                        "TileSwitch({},{}): slave[{}] data backpressure (master full)",
+                        "TileSwitch({},{}): slave[{}] mid-packet stall (per-target buffer full)",
                         self.col,
                         self.row,
                         slave_idx
                     );
-                    continue;
+                }
+            }
+
+            // ----------------------------------------------------------------
+            // Phase C: Per-target drain. Each target independently pushes as
+            // many of its `pending` words into its master FIFO as the master
+            // can accept this cycle. A slow target does not block a fast one.
+            // ----------------------------------------------------------------
+            if self.active_packets[slave_idx].is_some() {
+                let target_count = self.active_packets[slave_idx].as_ref().unwrap().targets.len();
+                for t in 0..target_count {
+                    let m_idx =
+                        self.active_packets[slave_idx].as_ref().unwrap().targets[t].master_idx as usize;
+                    if m_idx >= self.masters.len() {
+                        continue;
+                    }
+                    loop {
+                        let front = self.active_packets[slave_idx].as_ref().unwrap().targets[t]
+                            .pending
+                            .front()
+                            .copied();
+                        let Some((data, tlast)) = front else { break };
+                        if !self.masters[m_idx].can_accept() {
+                            break;
+                        }
+                        self.masters[m_idx].push_with_tlast(data, tlast);
+                        self.active_packets[slave_idx].as_mut().unwrap().targets[t].pending.pop_front();
+                    }
                 }
 
-                let (data, tlast) = match self.slaves[slave_idx].pop_with_tlast() {
-                    Some(dt) => dt,
-                    None => continue,
+                // ------------------------------------------------------------
+                // Phase D: Completion. Release arbiter + active slot once
+                // the slave has popped TLAST AND every target has fully
+                // drained its pending into its master.
+                // ------------------------------------------------------------
+                let done = {
+                    let active = self.active_packets[slave_idx].as_ref().unwrap();
+                    active.tlast_seen && active.targets.iter().all(|t| t.pending.is_empty())
                 };
-
-                // Push to all target masters (guaranteed to succeed via check above)
-                let active = self.active_packets[slave_idx].as_ref().unwrap();
-                let targets: Vec<u8> = active.target_masters.clone();
-                for &m in &targets {
-                    let m = m as usize;
-                    if m < self.masters.len() {
-                        self.masters[m].push_with_tlast(data, tlast);
-                    }
-                }
-                words_forwarded += 1;
-
-                if let Some(ref mut active) = self.active_packets[slave_idx] {
-                    active.words_forwarded += 1;
-                }
-
-                if tlast {
-                    // Release arbiter lock and advance round-robin pointer
-                    // past this slave so the next contender gets priority.
-                    if let Some(ref active) = self.active_packets[slave_idx] {
-                        let arb = active.arbiter as usize;
-                        self.arbiter_locks[arb] = None;
-                        self.arbiter_priority[arb] = (slave_idx + 1) % num_slaves;
-                    }
+                if done {
+                    let arb = self.active_packets[slave_idx].as_ref().unwrap().arbiter as usize;
+                    self.arbiter_locks[arb] = None;
+                    self.arbiter_priority[arb] = (slave_idx + 1) % num_slaves;
                     log::debug!(
-                        "TileSwitch({},{}): pkt data 0x{:08X} slave[{}] -> {:?} TLAST (end of pkt)",
+                        "TileSwitch({},{}): slave[{}] packet complete, arbiter {} released",
                         self.col,
                         self.row,
-                        data,
                         slave_idx,
-                        targets
+                        arb
                     );
                     self.active_packets[slave_idx] = None;
-                } else {
-                    log::trace!(
-                        "TileSwitch({},{}): pkt data 0x{:08X} slave[{}] -> {:?}",
-                        self.col,
-                        self.row,
-                        data,
-                        slave_idx,
-                        targets
-                    );
                 }
             }
         }

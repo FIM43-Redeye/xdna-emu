@@ -501,6 +501,72 @@ column-only mode hides it. Once #28 is fixed, cross-column
 propagation can land safely (revert the column-only fallback in
 `propagate_broadcasts`).
 
+## Resolution (2026-05-11 late)
+
+Both #28 (per-master backpressure for multicast packet routes) and the
+cross-column broadcast propagation landed together:
+
+### Stream switch refactor
+
+`ActivePacket` now holds one `TargetState` per destination master, each
+with its own `pending: VecDeque<(u32, bool)>` queue. The mid-packet
+phase replaces the old "if ANY target master is full, don't pop" rule
+with:
+
+1. **Fill phase**: pop a word from the slave FIFO when every target's
+   `pending` is below `MAX_PENDING_PER_TARGET` (16). Pushes a copy into
+   every target's `pending`.
+2. **Drain phase**: each target independently pushes as many words from
+   its `pending` into its master FIFO as the master can accept this
+   cycle. A slow target does not block a fast one.
+3. **Completion**: release the arbiter only after the slave has popped
+   TLAST AND every target has drained TLAST into its master -- this
+   preserves the "no interleaving on the master FIFO" invariant for
+   other slaves contending the same arbiter.
+
+The arbiter is held from header arrival through full drain (not just
+until the slave's TLAST pop), so another slave cannot start pushing
+into the same masters mid-drain.
+
+Two unit tests guard the fix: `test_multicast_slow_path_does_not_block_fast_path`
+sets up a multicast where one target is never drained while the other is
+drained every cycle; the fast target must still receive the full 12-word
+packet. `test_multicast_reconverging_arbiter_no_deadlock` drains targets
+at unequal rates (every cycle vs every 4th cycle); both targets must
+eventually receive every word.
+
+### BFS broadcast propagation
+
+`propagate_broadcasts` in `src/device/state/effects.rs` now BFS-floods
+across the array honoring each tile's per-channel per-direction block
+masks (`BroadcastConfig::allowed_directions`). Trace-prepare emits no
+block-mask writes today so the masks stay at reset (= no blocking) and
+the broadcast effectively reaches every tile, but the BFS structure
+keeps the model HW-accurate for any CDO that programs them.
+
+### Bridge sweep result
+
+Full EMU-only Peano sweep with both fixes:
+
+```
+56 compiled, 52 bridge pass, 3 bridge fail (1 BUDGET, 1 XFAIL)
+```
+
+The two true failures are pre-existing and orthogonal:
+- `vec_mul_event_trace` -- `test.exe: No such file or directory`
+  (compile-side issue; per task #20 this is NPU2-only).
+- `vec_mul_trace_distribute_lateral` -- known FAIL kernel-side (the
+  distribute-channels lateral-routing plumbing is still incomplete).
+  Now produces 1 INSTR_EVENT_0 trace event instead of zero, so the
+  trace ingress side has moved partially.
+
+The trio of deadlock victims from the findings -- `packet_flow_fanout`,
+`add_one_ctrl_packet`, `dmabd_task_queue` -- all PASS.
+
+Task #23 still depends on full HW-vs-EMU trace-count comparison to
+confirm widened-column and distributed-channel trace traffic decodes
+end-to-end. The deadlock that blocked it is gone.
+
 ## Investigation breadcrumb (2026-05-11 evening)
 
 Partial investigation on `add_one_ctrl_packet` (chess, widened to

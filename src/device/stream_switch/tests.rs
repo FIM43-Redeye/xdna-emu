@@ -1025,3 +1025,119 @@ fn test_packet_routing_no_route_is_fatal() {
         ss.fatal_errors[0]
     );
 }
+
+/// Build an N-word multicast test packet: header + (N-2) data + TLAST data word.
+fn build_multicast_pkt(stream_id: u8, n: usize) -> Vec<(u32, bool)> {
+    let hdr = PacketHeader::new(stream_id, 0, 2).with_type(PacketType::Trace);
+    let mut words = Vec::with_capacity(n);
+    words.push((hdr.encode(), false));
+    for i in 0..(n - 2) {
+        words.push((0xAAAA_0000 | (i as u32), false));
+    }
+    words.push((0xAAAA_FFFF, true));
+    words
+}
+
+#[test]
+fn test_multicast_slow_path_does_not_block_fast_path() {
+    // One slave multicasts a packet to two masters on the same arbiter+msel.
+    // The downstream of one master (M_B = port 8) is never drained during
+    // phase 1; M_A (port 7) is drained every step. Under the old all-or-
+    // nothing rule, the slave would stall once M_B's FIFO filled and M_A
+    // would also stop receiving. Under per-target backpressure, the slave
+    // keeps pushing into M_A's pending queue independently.
+    //
+    // Unit-level analog of the packet_flow_fanout multicast deadlock in
+    // findings/2026-05-11-emu-trace-widened-distributed-routing.md.
+    let mut ss = StreamSwitch::new_compute_tile(0, 2);
+
+    ss.slaves[23].packet_enable = true;
+    ss.configure_slave_slot(23, 0, make_slot_reg(1, 0x1F, 0, 0));
+    ss.configure_master_packet(7, make_master_pkt_reg(0, 0b0001, false));
+    ss.configure_master_packet(8, make_master_pkt_reg(0, 0b0001, false));
+
+    // 12-word packet -- longer than the slave FIFO (depth 4), so we refill
+    // from a virtual upstream each cycle.
+    let mut feed = build_multicast_pkt(1, 12).into_iter().peekable();
+
+    let mut a_drained: Vec<u32> = Vec::new();
+    for _ in 0..60 {
+        while let Some(&(d, t)) = feed.peek() {
+            if !ss.slaves[23].push_with_tlast(d, t) {
+                break;
+            }
+            feed.next();
+        }
+        ss.step();
+        while let Some((w, _)) = ss.masters[7].pop_with_tlast() {
+            a_drained.push(w);
+        }
+    }
+
+    assert_eq!(
+        a_drained.len(),
+        12,
+        "fast multicast target should receive full packet despite blocked sibling: got {}: {:08X?}",
+        a_drained.len(),
+        a_drained,
+    );
+    assert!(ss.arbiter_locks[0].is_some(), "arbiter should still be held while M_B's pending is undrained");
+
+    // Phase 2: drain M_B and watch the packet complete.
+    let mut b_drained: Vec<u32> = Vec::new();
+    for _ in 0..60 {
+        ss.step();
+        while let Some((w, _)) = ss.masters[8].pop_with_tlast() {
+            b_drained.push(w);
+        }
+    }
+
+    assert_eq!(b_drained.len(), 12, "slow target should eventually receive full packet");
+    assert!(ss.arbiter_locks[0].is_none(), "arbiter should release once both targets have drained TLAST");
+}
+
+#[test]
+fn test_multicast_reconverging_arbiter_no_deadlock() {
+    // Same multicast topology, but drain M_A every cycle and M_B every
+    // fourth cycle -- simulating M_B losing arbitration on a downstream
+    // tile (the packet_flow_fanout pattern). Both masters must eventually
+    // receive every word.
+    let mut ss = StreamSwitch::new_compute_tile(0, 2);
+
+    ss.slaves[23].packet_enable = true;
+    ss.configure_slave_slot(23, 0, make_slot_reg(1, 0x1F, 0, 0));
+    ss.configure_master_packet(7, make_master_pkt_reg(0, 0b0001, false));
+    ss.configure_master_packet(8, make_master_pkt_reg(0, 0b0001, false));
+
+    let mut feed = build_multicast_pkt(1, 10).into_iter().peekable();
+    let mut a_out: Vec<u32> = Vec::new();
+    let mut b_out: Vec<u32> = Vec::new();
+
+    for cyc in 0..120 {
+        while let Some(&(d, t)) = feed.peek() {
+            if !ss.slaves[23].push_with_tlast(d, t) {
+                break;
+            }
+            feed.next();
+        }
+        ss.step();
+        while let Some((w, _)) = ss.masters[7].pop_with_tlast() {
+            a_out.push(w);
+        }
+        if cyc % 4 == 3 {
+            while let Some((w, _)) = ss.masters[8].pop_with_tlast() {
+                b_out.push(w);
+            }
+        }
+    }
+    for _ in 0..40 {
+        ss.step();
+        while let Some((w, _)) = ss.masters[8].pop_with_tlast() {
+            b_out.push(w);
+        }
+    }
+
+    assert_eq!(a_out.len(), 10, "M_A received {} words: {:08X?}", a_out.len(), a_out);
+    assert_eq!(b_out.len(), 10, "M_B received {} words: {:08X?}", b_out.len(), b_out);
+    assert!(ss.arbiter_locks[0].is_none(), "arbiter released after packet completes");
+}

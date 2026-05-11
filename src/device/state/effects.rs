@@ -379,28 +379,34 @@ impl DeviceState {
         }
     }
 
-    /// Propagate pending broadcast events from a tile to all tiles in its column.
+    /// Propagate pending broadcast events from a tile across the array.
     ///
-    /// Real hardware's broadcast network spans the whole array in 4 directions
-    /// (south/west/north/east). For the default-routing case (single column,
-    /// all tiles in that column have trace units listening to BROADCAST_15
-    /// for start) this column-only propagation suffices.
+    /// Real hardware's broadcast network spans the whole array in four
+    /// directions (south/west/north/east). Each tile module has per-direction
+    /// block-mask registers (`EVENT_BROADCAST_BLOCK_*`) that gate outbound
+    /// propagation per channel. The BFS below walks tile-to-tile and at
+    /// every hop consults the source-side tile's block mask for the channel
+    /// in the relevant outbound direction; a blocked direction prunes that
+    /// branch.
     ///
-    /// For the widened-trace case where the planner places the generator on
-    /// a spare column and expects the broadcast to reach trace units in
-    /// another column, this column-only propagation drops the start signal.
-    /// A naive cross-column flood (see git history for the BFS attempt)
-    /// correctly arms the application-column trace units but exposes a
-    /// downstream EMU bug: once those trace units fire, the kernel data
-    /// flow stalls (DMA backpressure from trace stream contention or a
-    /// timer-reset interaction). Tracked as task #27. See
+    /// Trace-prepare today emits no block-mask writes (so the masks stay at
+    /// reset = 0 = no blocking, and the broadcast effectively floods the
+    /// array), but honoring the masks here keeps the model HW-accurate for
+    /// any CDO that does program them.
+    ///
+    /// Why a flood is needed: the trace planner can place `Event_Generate`
+    /// on a spare column (e.g. (2,0) on npu1_2col) and expect every column's
+    /// trace units to receive the corresponding BROADCAST_15 hw_id. The
+    /// older column-only loop dropped the start signal for the application
+    /// column's trace units. Re-enabling cross-column propagation depends
+    /// on the multicast deadlock fix in stream_switch::step_packet_routes
+    /// (task #28); see
     /// `docs/superpowers/findings/2026-05-11-emu-trace-widened-distributed-routing.md`.
     pub(crate) fn propagate_broadcasts(&mut self, col: u8, source_row: u8) {
-        // Snapshot the simulation cycle so the trace unit start/stop events
-        // are time-stamped with the current cycle rather than 0.
+        use crate::device::events::broadcast::BroadcastDir;
+
         let current_cycle = self.array.current_cycle;
 
-        // Drain pending broadcasts (channel numbers 0..15) from the source tile.
         let channels = if let Some(tile) = self.array.get_mut(col, source_row) {
             tile.drain_pending_broadcasts()
         } else {
@@ -417,25 +423,43 @@ impl DeviceState {
         //   Compute mem module : BROADCAST_0 = 107
         //   Shim PL module     : BROADCAST_A_0 = 110
         //   MemTile event mod  : BROADCAST_0  = 142
-        // hw_id 0 is the EVENT_NONE sentinel and is filtered out at
-        // notify_*_trace_event for tile kinds that lack a module side.
+        // hw_id 0 is the EVENT_NONE sentinel; notify_*_trace_event filters
+        // it out for tile kinds that lack the corresponding module side.
         const CORE_BROADCAST_BASE: u8 = 107;
         const SHIM_PL_BROADCAST_BASE: u8 = 110;
         const MEMTILE_BROADCAST_BASE: u8 = 142;
 
-        // Propagate each broadcast channel to every tile in the column.
+        let cols = self.array.cols();
         let rows = self.array.rows();
+
         for &channel in &channels {
             log::info!(
-                "Propagating BROADCAST channel {} from tile ({},{}) to column {} at cycle {}",
+                "Propagating BROADCAST channel {} from tile ({},{}) at cycle {}",
                 channel,
                 col,
                 source_row,
-                col,
                 current_cycle,
             );
-            for row in 0..rows {
-                if let Some(tile) = self.array.get_mut(col, row) {
+
+            // BFS across (col,row) tiles. `visited` is a flat (cols * rows)
+            // bitmap stored row-major as Vec<bool>. Frontier holds (col,row)
+            // coordinates to process.
+            let mut visited = vec![false; cols as usize * rows as usize];
+            let idx_of = |c: u8, r: u8| (c as usize) * (rows as usize) + (r as usize);
+
+            let mut frontier: Vec<(u8, u8)> = vec![(col, source_row)];
+            visited[idx_of(col, source_row)] = true;
+
+            while let Some((c, r)) = frontier.pop() {
+                // Notify this tile of the broadcast hit. notify_*_trace_event
+                // filters hw_id=0 (no module on this side), so memtiles and
+                // shims only receive on their valid module.
+                let outbound_dirs: Vec<BroadcastDir>;
+                {
+                    let tile = match self.array.get_mut(c, r) {
+                        Some(t) => t,
+                        None => continue,
+                    };
                     let core_pc = Some(tile.core.pc);
                     let (core_hw_id, mem_hw_id) = match tile.tile_kind {
                         TileKind::Compute => (CORE_BROADCAST_BASE + channel, CORE_BROADCAST_BASE + channel),
@@ -444,6 +468,58 @@ impl DeviceState {
                     };
                     tile.notify_core_trace_event(core_hw_id, current_cycle, core_pc);
                     tile.notify_mem_trace_event(mem_hw_id, current_cycle, None);
+
+                    // Determine which directions propagation is allowed in
+                    // from THIS tile (the source side of each outbound hop).
+                    // Use whichever EventModule exists for this tile kind;
+                    // both default to no-blocking until CDO programs the
+                    // EVENT_BROADCAST_BLOCK_* registers.
+                    let bcfg = tile.core_events.as_ref().or(tile.mem_events.as_ref()).map(|m| &m.broadcast);
+                    outbound_dirs = match bcfg {
+                        Some(b) => b.allowed_directions(channel as usize),
+                        None => BroadcastDir::ALL.to_vec(),
+                    };
+                }
+
+                // Enqueue unvisited neighbors in allowed directions.
+                for dir in outbound_dirs {
+                    let neighbor = match dir {
+                        BroadcastDir::South => {
+                            if r > 0 {
+                                Some((c, r - 1))
+                            } else {
+                                None
+                            }
+                        }
+                        BroadcastDir::North => {
+                            if r + 1 < rows {
+                                Some((c, r + 1))
+                            } else {
+                                None
+                            }
+                        }
+                        BroadcastDir::East => {
+                            if c + 1 < cols {
+                                Some((c + 1, r))
+                            } else {
+                                None
+                            }
+                        }
+                        BroadcastDir::West => {
+                            if c > 0 {
+                                Some((c - 1, r))
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    if let Some((nc, nr)) = neighbor {
+                        let nidx = idx_of(nc, nr);
+                        if !visited[nidx] {
+                            visited[nidx] = true;
+                            frontier.push((nc, nr));
+                        }
+                    }
                 }
             }
         }

@@ -1,8 +1,30 @@
 //! Packet switching logic: slot configuration, arbiter-based routing, and
 //! the standalone PacketSwitch state machine.
 
+use std::collections::VecDeque;
+
 use xdna_archspec::aie2::timing as arch_timing;
 use super::packet_types::{PacketHeader, PacketRoute};
+
+/// Maximum number of words that can be buffered in a single multicast
+/// target's pending queue before backpressuring the source slave.
+///
+/// On real hardware, each multicast destination has independent output
+/// buffering: when one branch's downstream is briefly slower than another,
+/// the fast branch keeps advancing while the slow branch's words are held
+/// in the switch fabric. The emulator approximates this with a per-target
+/// `pending` VecDeque inside `ActivePacket`. The cap is chosen large enough
+/// that a slow path can absorb a full trace packet (8 words) plus generous
+/// slack, while still being bounded so a genuinely deadlocked downstream
+/// stops the source slave instead of growing memory without limit.
+///
+/// Why this matters: with a strict "ALL target masters must can_accept()
+/// before the slave pops" rule, multicast through diverging paths that
+/// re-converge at a contended downstream arbiter forms a circular wait
+/// (see findings/2026-05-11-emu-trace-widened-distributed-routing.md).
+/// Per-target buffering breaks the cycle by allowing the fast branch to
+/// advance independently of the slow branch.
+pub const MAX_PENDING_PER_TARGET: usize = 16;
 
 // ============================================================================
 // Packet Routing Configuration (AM025 stream switch slave slot registers)
@@ -96,15 +118,48 @@ impl MasterPacketConfig {
     }
 }
 
+/// Per-multicast-target state inside an active packet.
+///
+/// Each destination master has its own pending queue. The source slave can
+/// pop a word once and push a copy into every target's `pending`; each
+/// target then drains independently into its master FIFO at whatever rate
+/// the master allows. This decouples a slow downstream branch from a fast
+/// one and breaks multicast deadlocks that the old all-or-nothing rule
+/// would have caused.
+#[derive(Debug, Clone)]
+pub struct TargetState {
+    /// Destination master port index.
+    pub master_idx: u8,
+    /// Words queued for this master, waiting for `can_accept()` to free up.
+    /// Each entry is `(data, tlast)`. Drains FIFO-order into the master.
+    pub pending: VecDeque<(u32, bool)>,
+}
+
+impl TargetState {
+    pub fn new(master_idx: u8) -> Self {
+        Self { master_idx, pending: VecDeque::new() }
+    }
+}
+
 /// Active packet tracking for a slave port currently forwarding packet data.
+///
+/// Holds per-target output queues so multicast targets can be drained
+/// independently. The arbiter is locked from header arrival until every
+/// target has drained its TLAST word into its master FIFO -- not just
+/// when the slave pops TLAST -- to preserve the "no interleaving on the
+/// master" invariant.
 #[derive(Debug, Clone)]
 pub struct ActivePacket {
-    /// Master port indices this packet routes to
-    pub target_masters: Vec<u8>,
-    /// Number of data words forwarded so far
+    /// One entry per destination master, each with its own pending queue.
+    pub targets: Vec<TargetState>,
+    /// Number of words popped from the slave so far (diagnostics).
     pub words_forwarded: usize,
-    /// Which arbiter this packet is using (for lock release on TLAST).
+    /// Which arbiter this packet is using (for lock release on completion).
     pub arbiter: u8,
+    /// True once the slave has popped a word carrying `tlast=true`. No
+    /// more fills will happen after this; the packet completes (and the
+    /// arbiter is released) once every target's `pending` has drained.
+    pub tlast_seen: bool,
 }
 
 /// A local route within a stream switch (slave to master).
