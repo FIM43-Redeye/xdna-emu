@@ -261,6 +261,119 @@ The `propagate_broadcasts` BFS attempt was reverted to column-only;
 git history preserves the BFS code if/when the trace plumbing bug is
 fixed and we can land cross-column propagation.
 
+## Task #28 investigation (2026-05-11 night)
+
+Re-ran BFS with instrumented stall-time stream-switch state dump.
+At the stall (cycle 158051, after 100k cycles of no progress) the
+state of `packet_flow_fanout` is:
+
+```
+STALL-DUMP TileSwitch(1,0) arbiter_locks=[_, Some(14), Some(15), _, _, _, _, _]
+                          slave[14]:has_data slave[15]:has_data slave[22]:has_data
+STALL-DUMP TileSwitch(1,1) arbiter_locks=[Some(13), _, _, Some(17), _, _, _, _]
+                          slave[3]:has_data slave[13]:has_data slave[17]:has_data
+STALL-DUMP TileSwitch(1,2) arbiter_locks=[_, _, _, _, Some(23), _, _, _]
+                          slave[17]:has_data slave[23]:has_data
+STALL-DUMP TileSwitch(1,3) arbiter_locks=[_, _, Some(23), _, _, _, _, _]
+                          slave[23]:has_data
+STALL-DUMP TileSwitch(2,0) arbiter_locks=[Some(12), _, _, _, _, _, _, _]
+                          slave[10]:has_data slave[11]:has_data
+```
+
+Every tile along the trace flow path has at least one arbiter locked
+with the holding slave **mid-packet** (`active_packets[holder] = Some`,
+but slave FIFO either drained or stalled). The chain of holds traces
+the trace stream path:
+
+```
+(1,2)/(1,3) compute trace slave[23]
+        --> (1,1) slave[17] arb=3 (LOCKED, mid-packet)
+        --> (1,0) slave[15] arb=2 (LOCKED)
+        --> (2,0) slave[12] arb=0 (LOCKED)
+        --> shim_mux S2MM ch1 --> DMA(2,0) ch1 (Transferring, never advances)
+```
+
+### The contention: arb=3 on memtile (1,1)
+
+Slot config on memtile (1,1) (decoded with the AIE2 slot layout
+`id[28:24] mask[20:16] enable[8] msel[5:4] arb[2:0]`):
+
+| Slave | Slot raw  | pkt_id | mask | msel | arb |
+|-------|-----------|--------|------|------|-----|
+| `[3]` | `0x061F0103` | 6 | 0x1F | 0 | 3 |  ← data path (DMA ch9, pkt_id=6)
+| `[17]`| `0x011F0113` | 1 | 0x1F | 1 | 3 |  ← trace path (pkt_id=1)
+
+**Both slaves share `arb=3`.** Trace flow arrives first (~cycle 5088 +
+propagation latency) and locks `arb=3`. Data flow arrives later (cycle
+58049 when DMA(1,1) ch9 enters Transferring) but **never** acquires
+`arb=3` because slave[17] holds it indefinitely (mid-packet, downstream
+backpressured).
+
+### Why the trace packet never TLASTs
+
+The EMU's stream switch locks the arbiter for the **whole packet**
+(from header to TLAST), and only releases on TLAST (`packet_switch.rs`
+line ~879). Slave[17]'s packet pushes a few words into master[8] FIFO
+and then... waits, because master[8] feeds shim (1,0) which feeds shim
+(2,0) which feeds DMA(2,0) ch1. Somewhere in that chain a FIFO fills
+and back-pressures all the way back to slave[17]. Slave[17] stays
+"mid-packet, FIFO drained" forever and `arb=3` is locked.
+
+Data flow `pkt_id=6` from DMA(1,1) ch9 pushes its 4-word header window
+into slave[3], slave[3] fills (4-word FIFO), DMA can't push further and
+stalls in Transferring forever. The application's MemTile MM2S
+deadlocks behind it, then all the application DMAs deadlock waiting
+on locks held by the stuck channels, and the kernel cores end up
+waiting on locks that never release. End state: 50+ DMAs all in
+"AcquiringLock granted=false", cores stalled.
+
+### Cross-check: id=1 routings on (1,1) arb=3 today vs yesterday
+
+|                  | Today (BFS, FAIL) | Yesterday (column-only, PASS) |
+|------------------|------------------:|------------------------------:|
+| `id=1` total     | 381 (mostly trace)| 4 (just the broadcast hits)   |
+| `id=1` on (1,1) arb=3 | **92**       | 0                             |
+| `id=6` routings  | 0                 | 5                             |
+
+When trace doesn't fire (column-only), nothing contends `arb=3` and
+data routes freely. When trace fires (BFS), `slave[17]` locks `arb=3`
+and `slave[3]` never gets a chance.
+
+### Where to fix
+
+Three layered options, in increasing order of effort:
+
+1. **Make the arbiter lock packet-bounded with a backpressure timeout
+   or rotate fairness** -- e.g., if slave A holds an arbiter and can't
+   push for N cycles, temporarily release. Not HW-accurate but breaks
+   the EMU-specific deadlock. (Cheap, but a hack.)
+2. **Trace EMU's downstream backpressure to its actual source** --
+   probably the shim_mux/DMA(2,0) ch1 interface where the stream_in
+   FIFO meets the DMA consumer rate. The DMA's words-per-cycle is 4
+   and stream supply is 1/cycle, so on paper this should balance, but
+   something is preventing forward progress. Likely candidates:
+   `transfer_s2mm`'s "all words for this beat must be available"
+   atomic-beat check, or a master FIFO sizing bug. (Medium effort,
+   most informative.)
+3. **Restructure trace lowering / slot allocation so trace doesn't
+   share an arbiter with kernel data** -- changes the trace-prepare
+   pipeline, not the EMU. Would also help HW determinism (HW handles
+   this today only because its arbiter grant is fairer than ours).
+   (Largest scope, out of EMU's purview.)
+
+Option 2 is the right investment because the same backpressure
+mechanism applies anywhere trace and data share an arbiter, not just
+this one test. Task #28 captures it.
+
+### Defense for #23
+
+Cross-column broadcast propagation is correct on its own, but it must
+not land in `propagate_broadcasts` until #28 is resolved -- otherwise
+every widened-trace test deadlocks. The defensive `hw_id=0` /
+`input_event=0` fixes from earlier today landed safely without #28
+because column-only propagation never arms the application column's
+trace units to begin with.
+
 ## Investigation breadcrumb (2026-05-11 evening)
 
 Partial investigation on `add_one_ctrl_packet` (chess, widened to
