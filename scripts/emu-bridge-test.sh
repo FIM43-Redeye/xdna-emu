@@ -726,6 +726,11 @@ _strip_trace_flags() {
     cmd="$(echo "$cmd" | sed 's/--trace_file[[:space:]]\+[^[:space:]]\+//g')"
     cmd="$(echo "$cmd" | sed 's/[[:space:]]\+/ /g' | sed 's/[[:space:]]*$//')"
   fi
+  # Drop `| FileCheck ...` tails: the bridge captures test.exe output and
+  # grep's the log for "PASS" itself, so piping through FileCheck just
+  # swallows the stdout we need to inspect (bd_chain_repeat_on_memtile is
+  # currently the only test in the suite that uses this pattern).
+  cmd="$(echo "$cmd" | sed 's/[[:space:]]*|[[:space:]]*FileCheck[[:space:]][^|]*$//')"
   echo "$cmd"
 }
 
@@ -1538,7 +1543,14 @@ compile_one_compiler() {
     fi
 
     # Fix MLIR path references for aiecc commands.
-    if [[ "$cmd" == *aiecc.py* ]]; then
+    #
+    # The rewrite only applies when we actually produced an aie_arch.mlir
+    # (i.e., src_mlir was non-empty: either trace-prepare output, HW_CYCLES
+    # traced MLIR, or a source aie.mlir to copy). Tests that generate
+    # ./aie.mlir locally from a python script and don't have a source
+    # aie.mlir (e.g. bd_chain_repeat_on_memtile) need the aiecc command to
+    # reference that generated file as-is.
+    if [[ "$cmd" == *aiecc.py* ]] && [[ -n "$src_mlir" ]]; then
       cmd="${cmd//$src_dir\/aie.mlir/./aie_arch.mlir}"
       cmd="${cmd//\.\/aie.mlir/./aie_arch.mlir}"
       # Secondary aiecc steps (post-xclbin) use original MLIR when available.
