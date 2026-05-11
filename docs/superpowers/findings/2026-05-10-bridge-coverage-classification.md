@@ -119,9 +119,10 @@ back into scope when we acquire Strix hardware.
 add_one_two            reconfigure_loadpdi
 add_one_two_runlist    reconfigure_loadpdi_persistent_memtile
 add_one_two_txn        loadpdi (filtered earlier: no test.cpp, only test_elf.cpp)
+vec_mul_event_trace    (Python-driven; REQUIRES: ryzen_ai_npu2)
 ```
 
-(5 in the bridge results table + 1 filtered by `is_standard_test` = 6 NPU2-only.)
+(6 in the bridge results table + 1 filtered by `is_standard_test` = 7 NPU2-only.)
 
 ### Tier 4: Permanent quarantine
 
@@ -162,15 +163,22 @@ when running with HW cycle capture):
 
 ### Tier 5: Structurally not bridge-shaped
 
-| Test | Structure |
-|------|-----------|
-| `vec_mul_event_trace` | Python-driven (`test.py`, no `test.cpp`); tests trace decoder standalone |
-| `vec_mul_trace_distribute_lateral` | Same |
+Update 2026-05-11: Both Python-driven trace tests have been reclassified.
+The bridge now discovers and runs Python-host tests (`test.py` with no
+`test.cpp`) via the `is_python_host_test` predicate, and `vec_mul_*`
+landed in two different tiers based on hardware requirements:
 
-These could be brought in with a different harness — they're more
-"upstream-style integration tests" than "bridge correctness tests" and
-weren't designed for the host-side BO comparison path. Not a coverage
-loss for what the bridge is meant to do.
+- `vec_mul_event_trace` → Tier 3 (NPU2-only; `REQUIRES: ryzen_ai_npu2`).
+- `vec_mul_trace_distribute_lateral` → bridge-wrapped:
+  HW PASS, EMU FAIL. The EMU failure is a real correctness gap in our
+  distribute-channels + lateral-routing trace path — the kernel runs and
+  produces correct data, but the emulator does not populate the
+  distributed trace buffer regions the test reads back. Follow-up:
+  implement trace channel distribute / lateral routing in EMU. Tracked
+  as a forward gap, not a Tier 5 entry.
+
+Both tests are tracked in Tier 3 (NPU2) and as a forward gap (EMU
+distribute-channels) respectively. Tier 5 is currently empty.
 
 ### Tier 6: Trace pipeline ERROR (orthogonal issue)
 
@@ -190,20 +198,21 @@ trace stack rather than per-compiler kernel codegen.
 ## What this means for the project
 
 - **Coverage is saturated** against what the bridge framework is
-  designed to validate. There are no "tests we could be running but
-  aren't" except the two Python-driven trace-decoder tests, which are
-  a different validation shape.
+  designed to validate. With the Python-host harness landed
+  (`is_python_host_test`), every NPU1-runnable test is in the suite.
 - **EMU correctness is solid** across the breadth of mlir-aie patterns:
   ctrl-packets, packet flows, memtile DMAs (compute side), cascades,
   dynamic object FIFOs, ND-memcpy, control overlays, ELF mode. No
   failures that aren't otherwise documented.
 - **Three forward gaps for future work**:
   1. Trace-decoder ERROR on three otherwise-passing tests (Tier 6).
-  2. Bring vec_mul_event_trace / vec_mul_trace_distribute_lateral into
-     a Python-test bridge variant if we want trace-decoder validation
-     beyond the existing trace-compare path (Tier 5).
-  3. Strix (NPU4/AIE2P) hardware to unlock the 6 NPU2-only tests
-     (Tier 3) — not a bridge gap, a hardware acquisition gap.
+  2. EMU support for distribute-channels + lateral-routing trace —
+     surfaced by `vec_mul_trace_distribute_lateral`: HW PASS, kernel
+     output correct on EMU, but the distributed trace buffer regions
+     stay empty so the test's channel-content checks fail.
+  3. Strix (NPU4/AIE2P) hardware to unlock the 7 NPU2-only tests
+     (Tier 3, now including `vec_mul_event_trace`) — not a bridge gap,
+     a hardware acquisition gap.
 
 ## See also
 

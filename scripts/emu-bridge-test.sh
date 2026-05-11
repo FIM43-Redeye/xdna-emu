@@ -444,7 +444,8 @@ export -f npu_health_check
 # ---------------------------------------------------------------------------
 
 # Find the best .lit/.py file with RUN lines in a test directory.
-# Prefers run.lit, then *.lit, then aie2.py (Python-generated tests).
+# Prefers run.lit, then *.lit, then aie2.py (Python kernel generators),
+# then test.py (Python-driven host harnesses).
 # Returns empty string if no suitable file found.
 find_lit_file() {
   local dir="$1"
@@ -459,9 +460,16 @@ find_lit_file() {
     echo "$first"
     return
   fi
-  # Python-generated tests: aie2.py has RUN lines in comments.
+  # Python-generated kernel tests: aie2.py emits aie.mlir and carries RUN lines.
   if [[ -f "$dir/aie2.py" ]] && grep -q 'RUN:' "$dir/aie2.py" 2>/dev/null; then
     echo "$dir/aie2.py"
+    return
+  fi
+  # Python-driven host harnesses: test.py IS the test executable; its RUN
+  # lines drive aie-opt/aiecc plus the python3 test.py invocation itself.
+  # Example: vec_mul_trace_distribute_lateral.
+  if [[ -f "$dir/test.py" ]] && grep -q 'RUN:' "$dir/test.py" 2>/dev/null; then
+    echo "$dir/test.py"
     return
   fi
 }
@@ -469,13 +477,29 @@ find_lit_file() {
 # Check if a test directory has a runnable test.
 #
 # Standard tests have: test.cpp + (aie.mlir or run.lit)
-# Python-generated tests have: test.cpp + aie2.py (generates aie2.mlir)
+# Python-generated kernel tests have: test.cpp + aie2.py (generates aie2.mlir)
+# Python-driven host tests have: test.py + aie.mlir (test.py is the harness;
+#   has no test.cpp; the bridge runs it via `python3 test.py` instead of
+#   building a test.exe). Example: vec_mul_trace_distribute_lateral.
 # Nested tests: handled by subdirectory scan in discover_tests().
 is_standard_test() {
   local dir="$1"
   local lit
   lit="$(find_lit_file "$dir")"
-  [[ -f "$dir/test.cpp" ]] && [[ -f "$dir/aie.mlir" || -n "$lit" || -f "$dir/aie2.py" ]]
+  if [[ -f "$dir/test.cpp" ]]; then
+    [[ -f "$dir/aie.mlir" || -n "$lit" || -f "$dir/aie2.py" ]]
+    return $?
+  fi
+  # Python-driven host: test.py + aie.mlir (no test.cpp).
+  [[ -f "$dir/test.py" && -f "$dir/aie.mlir" ]]
+}
+
+# True if the test directory uses test.py as its host harness (no test.cpp).
+# Discovery / compile / run paths branch on this to skip test.exe machinery.
+is_python_host_test() {
+  local dir="$1"
+  [[ ! -f "$dir/test.cpp" ]] && [[ -f "$dir/test.py" ]] \
+    && grep -q 'RUN:' "$dir/test.py" 2>/dev/null
 }
 
 # Check if a test requires npu2 (AIE2P -- skip for now).
@@ -1139,7 +1163,9 @@ get_run_variants() {
   local variants=()
   while IFS= read -r line; do
     [[ "$line" == *"RUN:"* ]] || continue
-    if [[ "$line" == *"./test.exe"* ]] && [[ "$line" == *"npu1"* || "$line" != *"npu2"* ]]; then
+    # Host-side run line: test.exe (cpp tests) or test.py (python tests).
+    if [[ "$line" == *"./test.exe"* || "$line" == *"test.py"* ]] \
+       && [[ "$line" == *"npu1"* || "$line" != *"npu2"* ]]; then
       local cmd
       cmd="$(apply_lit_subs "$src_dir" "$line")"
       cmd="${cmd#"${cmd%%[![:space:]]*}"}"
@@ -1168,11 +1194,12 @@ get_variant_run_cmd() {
   lit_file="$(find_lit_file "$src_dir")"
   [[ -n "$lit_file" ]] || return 1
 
-  # Collect all npu1-matching run commands.
+  # Collect all npu1-matching run commands (test.exe or test.py).
   local cmds=()
   while IFS= read -r line; do
     [[ "$line" == *"RUN:"* ]] || continue
-    if [[ "$line" == *"./test.exe"* ]] && [[ "$line" == *"npu1"* || "$line" != *"npu2"* ]]; then
+    if [[ "$line" == *"./test.exe"* || "$line" == *"test.py"* ]] \
+       && [[ "$line" == *"npu1"* || "$line" != *"npu2"* ]]; then
       local cmd
       cmd="$(apply_lit_subs "$src_dir" "$line")"
       cmd="${cmd#"${cmd%%[![:space:]]*}"}"
@@ -1329,7 +1356,7 @@ transform_for_peano() {
 }
 
 # Export all helpers for xargs subshells.
-export -f find_lit_file is_standard_test requires_npu2 requires_only_compiler is_xfail
+export -f find_lit_file is_standard_test is_python_host_test requires_npu2 requires_only_compiler is_xfail
 export -f get_npu_device apply_lit_subs
 export -f extract_build_commands get_run_cmd get_run_variants get_variant_run_cmd
 export -f _strip_trace_flags _variant_from_cmd _run_trace_cycles_pipeline _run_trace_compare _classify_cycle_diff
@@ -1629,7 +1656,8 @@ compile_one() {
   local traced_dir="$build_dir/traced"
   local trace_ok=false
 
-  if [[ "$NO_TRACE" != "true" ]] && ! is_trace_quarantined "$name"; then
+  if [[ "$NO_TRACE" != "true" ]] && ! is_trace_quarantined "$name" \
+       && ! is_python_host_test "$src_dir"; then
     local trace_log="$RESULTS_DIR/${safe}.trace-prepare.log"
     # --shim-sweep-events all (#372 / stage 1), --memtile-sweep-events all
     # (#373 / stage 2), and --memmod-sweep-events all (#374 / stage 3) all
@@ -1874,17 +1902,24 @@ run_one_hardware() {
   local log_file="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw.log"
   local result_file="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw.result"
 
-  # Symlink shared test.exe into per-compiler build dir. Always relink so
-  # stale per-compiler test.exes (left over from older builds when test.exe
-  # was compiled per compiler) get replaced.
-  if [[ -f "$test_exe" ]]; then
-    rm -f "$build_dir/test.exe"
-    ln -sf "$test_exe" "$build_dir/test.exe"
-  fi
+  # Python-driven host tests have no test.exe; the run command invokes
+  # `python3 .../test.py ...` directly. Skip the test.exe symlink+check.
+  local _py_host=false
+  is_python_host_test "$src_dir" && _py_host=true
 
-  if [[ ! -f "$build_dir/test.exe" ]]; then
-    echo "SKIP" > "$result_file"
-    return
+  if ! $_py_host; then
+    # Symlink shared test.exe into per-compiler build dir. Always relink so
+    # stale per-compiler test.exes (left over from older builds when test.exe
+    # was compiled per compiler) get replaced.
+    if [[ -f "$test_exe" ]]; then
+      rm -f "$build_dir/test.exe"
+      ln -sf "$test_exe" "$build_dir/test.exe"
+    fi
+
+    if [[ ! -f "$build_dir/test.exe" ]]; then
+      echo "SKIP" > "$result_file"
+      return
+    fi
   fi
 
   if ! ls "$build_dir"/*.xclbin &>/dev/null; then
@@ -2007,18 +2042,25 @@ run_one_bridge() {
   local log_file="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.bridge.log"
   local result_file="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.bridge.result"
 
-  # Symlink shared test.exe into per-compiler build dir. Always relink so
-  # stale per-compiler test.exes (left over from older builds when test.exe
-  # was compiled per compiler) get replaced.
-  if [[ -f "$test_exe" ]]; then
-    rm -f "$build_dir/test.exe"
-    ln -sf "$test_exe" "$build_dir/test.exe"
-  fi
+  # Python-driven host tests have no test.exe; the run command invokes
+  # `python3 .../test.py ...` directly. Skip the test.exe symlink+check.
+  local _py_host=false
+  is_python_host_test "$src_dir" && _py_host=true
 
-  if [[ ! -f "$build_dir/test.exe" ]]; then
-    echo "SKIP" > "$result_file"
-    echo "  BRIDGE $display_name ($compiler): SKIP (no test.exe)"
-    return
+  if ! $_py_host; then
+    # Symlink shared test.exe into per-compiler build dir. Always relink so
+    # stale per-compiler test.exes (left over from older builds when test.exe
+    # was compiled per compiler) get replaced.
+    if [[ -f "$test_exe" ]]; then
+      rm -f "$build_dir/test.exe"
+      ln -sf "$test_exe" "$build_dir/test.exe"
+    fi
+
+    if [[ ! -f "$build_dir/test.exe" ]]; then
+      echo "SKIP" > "$result_file"
+      echo "  BRIDGE $display_name ($compiler): SKIP (no test.exe)"
+      return
+    fi
   fi
 
   if ! ls "$build_dir"/*.xclbin &>/dev/null; then
