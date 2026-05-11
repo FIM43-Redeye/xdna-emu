@@ -105,6 +105,75 @@ flagged as two separate gaps:
 They're the same root cause. Fixing the EMU's widened/distributed trace
 routing recovers all four tests.
 
+## Root cause confirmed (2026-05-11 night)
+
+The drop point is upstream of the stream switch -- the trace units on the
+application column never **arm**. Trace start uses BROADCAST_15: on a
+widened device the trace planner places `Event_Generate` on the spare
+column's shim (e.g., (2,0)), generating BROADCAST_15 there, and expects
+every tile's trace unit to see the corresponding per-module hw_id
+(compute = 122, shim = 125, memtile = 157). EMU's `propagate_broadcasts`
+in `src/device/state/effects.rs` only propagates within the source
+column. Bridge log:
+
+```
+Tile(2,0) Event_Generate: event 127 -> BROADCAST channel 15
+Propagating BROADCAST channel 15 from tile (2,0) to column 2 at cycle 5099
+```
+
+Column 2 only. Column 1 (where the application + trace units live)
+never receives the event, so `(1,2)` / `(1,3)` / `(1,1)` / `(1,0)`
+trace units stay in `Idle` and emit no packets. The stream-switch
+routing in the original breadcrumb was correct -- there's nothing to
+route because the trace units are silent.
+
+`TraceUnit (1,2) Control0: mode=EventTime start=122 stop=121 -> Idle`
+is what the debug log shows; the trace unit is configured but parked.
+
+## Why the naive "broadcast to all columns" fix breaks other tests
+
+Attempted 2026-05-11: extended `propagate_broadcasts` to iterate every
+column, on the theory that real HW's broadcast network spans the array
+and default block masks are clear. Results:
+
+| Test                        | TRACE before | TRACE after | Kernel before | Kernel after |
+| --------------------------- | -----------: | ----------: | ------------: | -----------: |
+| add_one_ctrl_packet         |        ERROR |   **CLEAN** |          PASS |     **PASS** |
+| dmabd_task_queue            |        ERROR |   **CLEAN** |          PASS |     **PASS** |
+| packet_flow_fanout          |        ERROR |       CLEAN |          PASS |     **FAIL** |
+| vec_mul_trace_distribute_*  |         NONE |        NONE |          FAIL |          FAIL |
+
+`packet_flow_fanout` regressed: kernel output came back as zeros where
+HW returns 8. The `chess.trace.log` shows `EDGE_DETECTION_EVENT_0` on
+tile `(0,0)` firing **963 times on EMU vs 7 on HW**, with a regular
+2-cyc interval -- a classic sign of a signal toggling continuously
+where it shouldn't. Some tile's edge detector input is matching the
+flooded broadcast hw_id and triggering every cycle, propagating into
+the kernel's data path.
+
+The fix needs to do one of:
+
+1. **Honor per-tile per-channel broadcast block masks** (registers
+   `EVENT_BROADCAST_BLOCK_{S,W,N,E}_{SET,CLR,VALUE}` at `0x34050+stride*16`).
+   On HW, the absence of trace-relevant block configuration means the
+   broadcast IS supposed to flood the array, but apparently HW handles
+   the flood in a way EMU doesn't model -- need to investigate whether
+   trace-prepare actually writes block masks (CDO inspection) or whether
+   EMU's edge detector / trace-unit notify paths have spurious activation.
+2. **Verify EMU's edge-detector signal modeling.** A 2-cyc-period toggle
+   pattern suggests `curr_active` is being set every step by some
+   mechanism not present in HW. Possibly the broadcast notify is
+   re-firing the same channel each cycle, or the edge detector polarity
+   is inverted from HW.
+3. **Possibly trace-prepare CDO inspection.** Check whether the trace
+   planner emits block-mask register writes that EMU doesn't recognize
+   (silently dropped), in which case the planner-intended scoping is
+   being lost.
+
+Tracked as task #27. The revert preserves the previous "all four tests
+TRACE=ERROR, all but vec_mul_trace_distribute_lateral PASS kernel-side"
+state.
+
 ## Investigation breadcrumb (2026-05-11 evening)
 
 Partial investigation on `add_one_ctrl_packet` (chess, widened to

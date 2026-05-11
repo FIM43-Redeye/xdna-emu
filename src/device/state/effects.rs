@@ -381,14 +381,16 @@ impl DeviceState {
 
     /// Propagate pending broadcast events from a tile to all tiles in its column.
     ///
-    /// On real hardware, broadcast events travel through a dedicated broadcast
-    /// network spanning the entire column. When a tile generates a broadcast
-    /// (via Event_Generate matching a broadcast channel config), the BROADCAST_N
-    /// event reaches every tile in the same column.
-    ///
-    /// This is the mechanism that synchronizes trace start/stop: the CDO writes
-    /// Event_Generate on the shim tile, which generates BROADCAST_15 (start) or
-    /// BROADCAST_14 (stop), and all tiles' trace units see their start/stop event.
+    /// On real hardware, broadcast events travel through a 4-direction network
+    /// (north/south/east/west) governed by per-tile per-channel block masks.
+    /// In the default-routing case (single column, all tiles in that column
+    /// have trace units that listen to BROADCAST_15 for start) this implementation
+    /// is sufficient. For the widened-trace case where the planner places the
+    /// generator on a spare column and expects the broadcast to reach trace
+    /// units in another column, this column-only propagation drops the start
+    /// signal and the trace units never arm. See
+    /// `docs/superpowers/findings/2026-05-11-emu-trace-widened-distributed-routing.md`.
+    /// Fix tracked in task #27 (honor block masks + cross-column propagation).
     pub(crate) fn propagate_broadcasts(&mut self, col: u8, source_row: u8) {
         // Snapshot the simulation cycle so the trace unit start/stop events
         // are time-stamped with the current cycle rather than 0.
@@ -434,28 +436,11 @@ impl DeviceState {
             );
             for row in 0..rows {
                 if let Some(tile) = self.array.get_mut(col as u8, row as u8) {
-                    // Notify both trace units with each module's own hw_id
-                    // for this channel. Pass the recipient's core PC so
-                    // mode-2's Start frame anchors at the PC the core was at
-                    // when the broadcast arrived (matches HW: BROADCAST_15
-                    // typically fires while the core is already mid-kernel
-                    // and stalled in acquire).
                     let core_pc = Some(tile.core.pc);
                     let (core_hw_id, mem_hw_id) = match tile.tile_kind {
                         TileKind::Compute => (CORE_BROADCAST_BASE + channel, CORE_BROADCAST_BASE + channel),
-                        TileKind::ShimNoc | TileKind::ShimPl => {
-                            // Shim has only a PL/core trace unit; no mem
-                            // trace unit. Use a sentinel hw_id for the
-                            // mem-side notify -- the mem trace unit isn't
-                            // configured, so it's a no-op anyway.
-                            (SHIM_PL_BROADCAST_BASE + channel, 0)
-                        }
-                        TileKind::Mem => {
-                            // Memtile has only a mem trace unit. The
-                            // core-side notify is a no-op (no core_events
-                            // module on memtile, no core trace).
-                            (0, MEMTILE_BROADCAST_BASE + channel)
-                        }
+                        TileKind::ShimNoc | TileKind::ShimPl => (SHIM_PL_BROADCAST_BASE + channel, 0),
+                        TileKind::Mem => (0, MEMTILE_BROADCAST_BASE + channel),
                     };
                     tile.notify_core_trace_event(core_hw_id, current_cycle, core_pc);
                     tile.notify_mem_trace_event(mem_hw_id, current_cycle, None);
