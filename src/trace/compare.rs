@@ -524,7 +524,7 @@ pub fn load_events_json(path: &Path) -> Result<(TileEvents, EventsConfig, Option
 /// might use column 1 while parallel runs use column 3 for the same
 /// test.  This function normalizes column numbers so traces from
 /// different runs can be compared by tile structure.
-fn remap_tile_columns(tiles: &TileEvents) -> TileEvents {
+pub fn remap_tile_columns(tiles: &TileEvents) -> TileEvents {
     let mut cols: Vec<u8> = tiles.keys().map(|k| k.col).collect::<BTreeSet<_>>().into_iter().collect();
     cols.sort();
     let col_map: HashMap<u8, u8> = cols.into_iter().enumerate().map(|(i, c)| (c, i as u8)).collect();
@@ -550,7 +550,7 @@ fn remap_tile_columns(tiles: &TileEvents) -> TileEvents {
 /// Tiles whose coordinates are below the origin (shouldn't happen for
 /// a well-formed events.json, but be defensive) are passed through
 /// unchanged.
-fn shift_tile_columns(tiles: &TileEvents, placement: PlacementRecord) -> TileEvents {
+pub fn shift_tile_columns(tiles: &TileEvents, placement: PlacementRecord) -> TileEvents {
     tiles
         .iter()
         .map(|(key, events)| {

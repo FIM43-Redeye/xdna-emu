@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::trace::compare::{
-    AnalysisOptions, BatchResult, EventsConfig, TileEvent, TileKey, compare_batch_with_opts, load_events_json,
+    AnalysisOptions, BatchResult, EventsConfig, TileEvent, TileKey, compare_batch_with_opts,
+    load_events_json, remap_tile_columns, shift_tile_columns,
 };
 
 use super::alignment::AlignmentMap;
@@ -112,9 +113,24 @@ impl LoadedComparison {
         )?;
 
         // Re-load events for rendering (comparison consumed them but didn't
-        // return the tile maps; fine for now since traces are small).
-        let (hw_events, hw_config, _hw_placement) = load_events_json(&hw_events_path)?;
-        let (emu_events, _, _emu_placement) = load_events_json(&emu_events_path)?;
+        // return the tile maps; fine for now since traces are small). The
+        // raw events.json keys carry physical (col, row), but the comparison
+        // (and therefore sorted_keys below) normalizes by the per-side
+        // placement origin -- mirror that here so HashMap lookups against
+        // sorted_keys hit the right entries.
+        let opts = AnalysisOptions::default();
+        let (hw_events_raw, hw_config, hw_placement) = load_events_json(&hw_events_path)?;
+        let (emu_events_raw, _, emu_placement) = load_events_json(&emu_events_path)?;
+        let hw_events = match (hw_placement, opts.remap_columns) {
+            (Some(p), _) => shift_tile_columns(&hw_events_raw, p),
+            (None, true) => remap_tile_columns(&hw_events_raw),
+            (None, false) => hw_events_raw,
+        };
+        let emu_events = match (emu_placement, opts.remap_columns) {
+            (Some(p), _) => shift_tile_columns(&emu_events_raw, p),
+            (None, true) => remap_tile_columns(&emu_events_raw),
+            (None, false) => emu_events_raw,
+        };
         let config = if !config_override.core_events.is_empty()
             || !config_override.mem_events.is_empty()
             || !config_override.memtile_events.is_empty()
@@ -273,5 +289,66 @@ mod tests {
         assert!(config.core_events.is_empty());
         assert!(config.mem_events.is_empty());
         assert!(config.memtile_events.is_empty());
+    }
+
+    /// Regression guard: when events.json carries a placement origin > 0
+    /// (e.g., HW with start_col=1), the compare path normalizes tile
+    /// coords by subtracting origin_col. LoadedComparison must apply the
+    /// same shift to its hw_events / emu_events HashMaps -- otherwise
+    /// sorted_keys (normalized) miss every entry (raw) and the viewer
+    /// reports "no events" for every tile.
+    #[test]
+    fn loaded_comparison_per_tile_events_nonempty_after_shift() {
+        let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+        let root = std::path::PathBuf::from(tmp).join(format!(
+            "xdna-emu-data-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let hw_dir = root.join("hw");
+        let emu_dir = root.join("emu");
+        std::fs::create_dir_all(&hw_dir).unwrap();
+        std::fs::create_dir_all(&emu_dir).unwrap();
+
+        // Single trace event at physical (col=1, row=2). With placement
+        // origin_col=1, this should normalize to (col=0, row=2) in
+        // both batch.tiles and the events HashMaps.
+        let events_json = r#"{
+            "schema_version": 1,
+            "events": [
+              {"col": 1, "row": 2, "pkt_type": 0, "slot": 0,
+               "name": "PERF_CNT_2", "ts": 100, "soc": 100},
+              {"col": 1, "row": 2, "pkt_type": 0, "slot": 1,
+               "name": "INSTR_EVENT_0", "ts": 200, "soc": 200}
+            ],
+            "slot_names": {"core": ["PERF_CNT_2", "INSTR_EVENT_0"],
+                           "mem": [], "memtile": []},
+            "placement": {"origin_col": 1, "origin_row": 0}
+        }"#;
+        std::fs::write(hw_dir.join("trace.events.json"), events_json).unwrap();
+        std::fs::write(emu_dir.join("trace.events.json"), events_json).unwrap();
+
+        let comp = LoadedComparison::from_trace_dirs(&hw_dir, &emu_dir)
+            .expect("LoadedComparison::from_trace_dirs should succeed");
+        let keys = comp.tile_keys();
+        assert!(!keys.is_empty(), "expected at least one tile key");
+        for k in keys {
+            assert!(
+                !comp.hw_events(k).is_empty(),
+                "hw_events({:?}) was empty -- sorted_keys do not match the events HashMap (forgot the placement shift?)",
+                k,
+            );
+            assert!(
+                !comp.emu_events(k).is_empty(),
+                "emu_events({:?}) was empty -- sorted_keys do not match the events HashMap",
+                k,
+            );
+            // Sanity: the normalized key has col=0 (after subtracting origin_col=1).
+            assert_eq!(k.col, 0, "key {:?} should be normalized to col=0", k);
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 }
