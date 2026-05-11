@@ -180,7 +180,7 @@ landed in two different tiers based on hardware requirements:
 Both tests are tracked in Tier 3 (NPU2) and as a forward gap (EMU
 distribute-channels) respectively. Tier 5 is currently empty.
 
-### Tier 6: Trace pipeline ERROR (orthogonal issue)
+### Tier 6: Trace pipeline ERROR (root cause identified 2026-05-11)
 
 Three tests pass at the bridge level (HW + EMU produce identical
 output) but their trace decode pipeline errors out:
@@ -191,9 +191,22 @@ dmabd_task_queue         (Chess/TRACE=ERROR  Peano/TRACE=ERROR)
 packet_flow_fanout       (Chess/TRACE=ERROR  Peano/TRACE=ERROR)
 ```
 
-This doesn't affect the correctness verdict; it's a follow-up for the
-trace decoder. Both compilers show the same ERROR, so the bug is in our
-trace stack rather than per-compiler kernel codegen.
+This doesn't affect the correctness verdict; both compilers show the
+same ERROR, so the bug is in our trace stack rather than per-compiler
+kernel codegen.
+
+**Root cause** (see `findings/2026-05-11-emu-trace-widened-distributed-routing.md`):
+all three tests have the trace planner *widen the device to npu1_2col*
+or *distribute trace across multiple shim DMA channels* because the
+application already occupies the default channels. EMU's trace dispatch
+only handles default single-channel origin-column routing, so events
+generated on widened/distributed paths are dropped silently. The
+emulator trace_raw.bin is all zeros; HW has hundreds of events.
+
+This is the **same root cause** as the `vec_mul_trace_distribute_lateral`
+EMU FAIL noted in the Tier 5 update -- distribute-channels + lateral
+routing in EMU isn't implemented. Fixing one path recovers all four
+tests.
 
 ## What this means for the project
 
@@ -204,13 +217,13 @@ trace stack rather than per-compiler kernel codegen.
   ctrl-packets, packet flows, memtile DMAs (compute side), cascades,
   dynamic object FIFOs, ND-memcpy, control overlays, ELF mode. No
   failures that aren't otherwise documented.
-- **Three forward gaps for future work**:
-  1. Trace-decoder ERROR on three otherwise-passing tests (Tier 6).
-  2. EMU support for distribute-channels + lateral-routing trace —
-     surfaced by `vec_mul_trace_distribute_lateral`: HW PASS, kernel
-     output correct on EMU, but the distributed trace buffer regions
-     stay empty so the test's channel-content checks fail.
-  3. Strix (NPU4/AIE2P) hardware to unlock the 7 NPU2-only tests
+- **Two forward gaps for future work**:
+  1. EMU support for trace routing through widened or distributed
+     shim DMA channels. This is **one** root cause covering both
+     the Tier 6 ERROR trio (`add_one_ctrl_packet`, `dmabd_task_queue`,
+     `packet_flow_fanout`) and the Tier 5 `vec_mul_trace_distribute_lateral`
+     test. See `findings/2026-05-11-emu-trace-widened-distributed-routing.md`.
+  2. Strix (NPU4/AIE2P) hardware to unlock the 7 NPU2-only tests
      (Tier 3, now including `vec_mul_event_trace`) — not a bridge gap,
      a hardware acquisition gap.
 
