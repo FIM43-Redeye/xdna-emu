@@ -93,24 +93,21 @@ pub(crate) enum ExecutorState {
     /// they both happen between "channel observed idle" and "next
     /// instruction can issue":
     ///
-    /// 1. **Stream switch flush** (`STREAM_FLUSH_CYCLES`, 4 cyc, always
-    ///    on). Control packet data may still be in-transit through the
-    ///    stream switch when the sync completes (sync only confirms the
-    ///    shim DMA finished sending). Firmware instruction latency
+    /// 1. **Stream switch flush** (`STREAM_FLUSH_CYCLES`, 4 cyc, every
+    ///    sync). Control packet data may still be in-transit through
+    ///    the stream switch when the sync completes (sync only confirms
+    ///    the shim DMA finished sending). Firmware instruction latency
     ///    gives the switch time to deliver data before follow-up writes
     ///    take effect.
-    /// 2. **Firmware mailbox roundtrip** (env-controlled via
-    ///    `XDNA_EMU_MAILBOX_LATENCY`, default 0). On HW, dma_wait is
-    ///    dispatched as a firmware command and the mailbox roundtrip
-    ///    is ~8000 cyc per Phase B's single-sync measurement. Kernels
-    ///    with many syncs (e.g., 160 in ctrl_packet_reconfig_1x4_cores)
-    ///    amortize that cost via firmware pipelining, so a per-sync
-    ///    constant overcounts. Until we have a multi-sync model, the
-    ///    default is 0; calibration sprints set
-    ///    `XDNA_EMU_MAILBOX_LATENCY=8000` to opt in.
-    ///
-    /// Modeling both as a single counter keeps the state machine simple;
-    /// the calibration target is the SUM.
+    /// 2. **Firmware mailbox roundtrip** (default 8000 cyc, configurable
+    ///    via `XDNA_EMU_MAILBOX_LATENCY`). Per-batch model: charged ONCE
+    ///    per runtime sequence on the first dma_wait, then subsequent
+    ///    syncs pipeline through the firmware mailbox queue at zero
+    ///    mailbox cost. Phase B measured ~8000 cyc for an isolated
+    ///    single-sync; kernels with 160+ syncs do not pay 1.28M cyc on
+    ///    HW, so the per-batch cap is the only model consistent with
+    ///    both regimes. See
+    ///    `docs/superpowers/findings/2026-05-11-emu-dma-wait-mailbox-latency.md`.
     FlushingStreams {
         /// Index of the NEXT instruction to execute after flush.
         next_index: usize,
@@ -194,6 +191,11 @@ pub struct NpuExecutor {
     /// callers can opt into `with_known_constants` (or future calibrated
     /// profiles) via `set_cycle_model`.
     cycle_model: super::CycleCostModel,
+    /// Whether the firmware mailbox setup cost has been charged for this
+    /// runtime sequence yet. Per-batch model: pay once on the first sync
+    /// (~8000 cyc when enabled), then pipeline subsequent syncs at just
+    /// the stream-flush cost (4 cyc). Reset by `load_instructions`.
+    mailbox_charged: bool,
 }
 
 impl NpuExecutor {
@@ -207,6 +209,7 @@ impl NpuExecutor {
             state: ExecutorState::Idle,
             instructions: Vec::new(),
             cycle_model: super::CycleCostModel::default(),
+            mailbox_charged: false,
         }
     }
 
@@ -368,6 +371,9 @@ impl NpuExecutor {
 
     /// Load instructions directly (for testing or internal use).
     pub fn load_instructions(&mut self, instructions: Vec<NpuInstruction>) {
+        // Reset the per-batch mailbox charge so each runtime sequence
+        // pays the firmware setup cost once.
+        self.mailbox_charged = false;
         // Log instruction summary for debugging complex multi-tile flows
         if instructions.len() > 10 {
             let mut syncs = 0;
@@ -530,26 +536,33 @@ impl NpuExecutor {
 
                 if satisfied {
                     log::info!("NPU Sync #{} satisfied, resuming instruction {}", sync_index, next_index,);
-                    // Post-sync settling. Two components, always charged
-                    // (even when sync is the final instruction):
+                    // Post-sync settling. Two components:
                     // - mailbox roundtrip: firmware mailbox latency for the
-                    //   dma_wait command/response. Phase B measured ~8000 cyc
-                    //   for a single dma_wait on NPU1, but kernels with many
-                    //   syncs (e.g., ctrl_packet_reconfig_1x4_cores has 160)
-                    //   amortize the cost through firmware pipelining. Until
-                    //   we have a multi-sync model, the default is 0 and
-                    //   calibration sprints opt in via XDNA_EMU_MAILBOX_LATENCY.
+                    //   first dma_wait of the runtime sequence (~8000 cyc on
+                    //   NPU1, Phase B measurement). Subsequent syncs are
+                    //   assumed to pipeline through the firmware mailbox
+                    //   queue and only pay the stream-flush cost. This is
+                    //   the "per-batch" model: total mailbox overhead is
+                    //   bounded, independent of sync count, which matches
+                    //   the empirical constraint that 160-sync kernels do
+                    //   not pay 1.28M cyc on HW.
                     // - STREAM_FLUSH_CYCLES: stream-switch in-transit data
-                    //   propagation delay. Always 4 cyc.
+                    //   propagation delay. Always 4 cyc per sync.
+                    // Default mailbox value is 8000 cyc per Phase B; can be
+                    // overridden via XDNA_EMU_MAILBOX_LATENCY for calibration.
                     const STREAM_FLUSH_CYCLES: u32 = 4;
+                    const DEFAULT_MAILBOX_CYCLES: u32 = 8000;
                     let mailbox_cycles: u32 = std::env::var("XDNA_EMU_MAILBOX_LATENCY")
                         .ok()
                         .and_then(|s| s.parse().ok())
-                        .unwrap_or(0);
-                    self.state = ExecutorState::FlushingStreams {
-                        next_index,
-                        remaining: mailbox_cycles + STREAM_FLUSH_CYCLES,
+                        .unwrap_or(DEFAULT_MAILBOX_CYCLES);
+                    let charge = if self.mailbox_charged {
+                        STREAM_FLUSH_CYCLES
+                    } else {
+                        self.mailbox_charged = true;
+                        mailbox_cycles + STREAM_FLUSH_CYCLES
                     };
+                    self.state = ExecutorState::FlushingStreams { next_index, remaining: charge };
                     AdvanceResult::Progressed
                 } else {
                     AdvanceResult::Blocked
@@ -1562,81 +1575,91 @@ mod tests {
         );
     }
 
-    /// After BlockedOnSync resolves, the executor spends stream-flush
-    /// (always) + optional firmware-mailbox latency in FlushingStreams
-    /// before reaching the next instruction.
+    /// Per-batch mailbox model: the first dma_wait of a runtime sequence
+    /// pays mailbox + stream-flush; subsequent dma_waits in the same
+    /// sequence pay only stream-flush.
     ///
-    /// The mailbox component is gated on XDNA_EMU_MAILBOX_LATENCY (default
-    /// 0) because a per-sync constant overcounts on multi-sync kernels --
-    /// e.g., ctrl_packet_reconfig_1x4_cores has 160 dma_waits and 8000
-    /// cyc/sync × 160 blew the 600s wall-clock budget. See
-    /// findings/2026-05-11-emu-dma-wait-mailbox-latency.md.
-    ///
-    /// Run twice: once with the env unset (default 0), once with it set
-    /// to verify the opt-in path.
+    /// The mailbox constant is XDNA_EMU_MAILBOX_LATENCY (default 8000
+    /// cyc, Phase B measurement). Setting it explicitly lets the test
+    /// be deterministic regardless of caller env.
     #[test]
-    fn test_sync_resolution_charges_mailbox_latency() {
-        for (env_value, expected_mailbox) in [(None, 0u32), (Some("123"), 123u32)] {
-            // SAFETY: set_var/remove_var are unsafe in the 2024 edition.
-            // This test is not parallel-safe with other tests that read
-            // XDNA_EMU_MAILBOX_LATENCY, but no other test touches it.
-            unsafe {
-                match env_value {
-                    Some(v) => std::env::set_var("XDNA_EMU_MAILBOX_LATENCY", v),
-                    None => std::env::remove_var("XDNA_EMU_MAILBOX_LATENCY"),
-                }
-            }
+    fn test_sync_resolution_per_batch_mailbox() {
+        const STREAM_FLUSH_CYCLES: u32 = 4;
+        const TEST_MAILBOX: u32 = 200; // distinctive non-default value
 
-            let mut executor = NpuExecutor::new();
+        // SAFETY: set_var/remove_var are unsafe in the 2024 edition;
+        // no other test touches XDNA_EMU_MAILBOX_LATENCY.
+        unsafe { std::env::set_var("XDNA_EMU_MAILBOX_LATENCY", TEST_MAILBOX.to_string()) };
+
+        let mut executor = NpuExecutor::new();
+        // Two pending syncs both ready to fire.
+        for _ in 0..2 {
             executor.pending_syncs.push(PendingSync {
                 column: 0,
                 row: 2,
                 channel: 0,
-                direction: 1,  // MM2S
-                started: true, // pretend the channel already ran
+                direction: 1,
+                started: true,
             });
-            executor.instructions = Vec::new();
-            executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0 };
-
-            let mut host_mem = HostMemory::new();
-            let mut device = DeviceState::new_npu1();
-
-            // First advance: BlockedOnSync poll -> satisfied -> FlushingStreams.
-            let _ = executor.try_advance(&mut device, &mut host_mem);
-            let initial_remaining = match executor.state {
-                ExecutorState::FlushingStreams { remaining, .. } => remaining,
-                ref other => panic!(
-                    "expected FlushingStreams after sync resolves (env={:?}), got {:?}",
-                    env_value, other,
-                ),
-            };
-
-            const STREAM_FLUSH_CYCLES: u32 = 4;
-            assert_eq!(
-                initial_remaining,
-                expected_mailbox + STREAM_FLUSH_CYCLES,
-                "post-sync settling for env={:?}: expected mailbox({}) + stream_flush(4) = {}",
-                env_value,
-                expected_mailbox,
-                expected_mailbox + STREAM_FLUSH_CYCLES,
-            );
-
-            // Drain the latency window; should take exactly `remaining` cycles.
-            let mut steps = 0;
-            while matches!(executor.state, ExecutorState::FlushingStreams { .. }) {
-                let _ = executor.try_advance(&mut device, &mut host_mem);
-                steps += 1;
-                if steps > (expected_mailbox as usize + 100) {
-                    panic!("FlushingStreams drained slower than expected (>{} cycles)", steps);
-                }
-            }
-            assert_eq!(
-                steps, initial_remaining as usize,
-                "FlushingStreams should take exactly `remaining` cycles to drain (env={:?})",
-                env_value,
-            );
         }
-        // Restore default state for any other tests reading the env.
+        executor.instructions = Vec::new();
+        let mut host_mem = HostMemory::new();
+        let mut device = DeviceState::new_npu1();
+
+        // ---- First sync: pays mailbox + stream-flush ----
+        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0 };
+        let _ = executor.try_advance(&mut device, &mut host_mem);
+        let first_remaining = match executor.state {
+            ExecutorState::FlushingStreams { remaining, .. } => remaining,
+            ref other => panic!("expected FlushingStreams after first sync, got {:?}", other),
+        };
+        assert_eq!(
+            first_remaining,
+            TEST_MAILBOX + STREAM_FLUSH_CYCLES,
+            "first sync should pay mailbox ({}) + stream_flush ({}) = {}",
+            TEST_MAILBOX,
+            STREAM_FLUSH_CYCLES,
+            TEST_MAILBOX + STREAM_FLUSH_CYCLES,
+        );
+        // Drain.
+        while matches!(executor.state, ExecutorState::FlushingStreams { .. }) {
+            let _ = executor.try_advance(&mut device, &mut host_mem);
+        }
+
+        // ---- Second sync: stream-flush only ----
+        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 1 };
+        let _ = executor.try_advance(&mut device, &mut host_mem);
+        let second_remaining = match executor.state {
+            ExecutorState::FlushingStreams { remaining, .. } => remaining,
+            ref other => panic!("expected FlushingStreams after second sync, got {:?}", other),
+        };
+        assert_eq!(
+            second_remaining, STREAM_FLUSH_CYCLES,
+            "second sync should pay only stream_flush ({}); mailbox already charged",
+            STREAM_FLUSH_CYCLES,
+        );
+
+        // ---- load_instructions resets the per-batch flag ----
+        executor.load_instructions(Vec::new());
+        executor.pending_syncs.push(PendingSync {
+            column: 0,
+            row: 2,
+            channel: 0,
+            direction: 1,
+            started: true,
+        });
+        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0 };
+        let _ = executor.try_advance(&mut device, &mut host_mem);
+        let reset_remaining = match executor.state {
+            ExecutorState::FlushingStreams { remaining, .. } => remaining,
+            ref other => panic!("expected FlushingStreams after reset+sync, got {:?}", other),
+        };
+        assert_eq!(
+            reset_remaining,
+            TEST_MAILBOX + STREAM_FLUSH_CYCLES,
+            "load_instructions should reset mailbox_charged so the next batch pays full mailbox",
+        );
+
         unsafe { std::env::remove_var("XDNA_EMU_MAILBOX_LATENCY") };
     }
 }

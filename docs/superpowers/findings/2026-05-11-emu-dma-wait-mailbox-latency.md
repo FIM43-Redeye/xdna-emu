@@ -72,6 +72,46 @@ as a test failure that gets reviewed deliberately.
 - Bridge `cargo test --lib` unaffected (2878 tests still pass --
   none of them encoded the pre-fix cycle count in an assertion).
 
+## Update 2026-05-12: per-batch model lands as the default
+
+After the env-opt-in fallback, an empirical fit on EMU+sync-count
+data across 5 kernels (1, 2, 4, 261, 272 syncs) and the physics of
+firmware command processing pointed to a **per-batch** model:
+charge the mailbox roundtrip once per runtime sequence (on the
+first dma_wait), then subsequent dma_waits pipeline through the
+firmware mailbox queue at zero mailbox cost.
+
+This matches both regimes:
+- **Single-sync (Phase B)**: full ~8000 cyc charged on the only
+  dma_wait. Closes the original 22.5x gap.
+- **Multi-sync (160-272 dma_waits)**: only ~8000 cyc total mailbox
+  overhead, well within budget. No timeouts.
+
+Direct verification on the same five kernels after the model
+landed (chess/peano EMU cycles):
+
+```
+test                              syncs  pre-fix   post-fix  delta
+_diag_phase_b_add_one_instrumented   1   5258      14990     +9732
+add_blockwrite                       2   5425      13831     +8406
+shim_dma_bd_reuse                    4   20926     -- (passes, not re-measured)
+sync_task_complete_token           272   690363    698363    +8000
+ctrl_packet_reconfig_1x4_cores     261   758281    766281    +8000
+```
+
+The 261-sync test pays the same +8000 cyc total as the 1-sync test
+-- exactly the per-batch model's prediction. The slight excess
+above +8000 on the 1-2 sync cases is EMU side-effects during the
+FlushingStreams window (DMA finalization that wouldn't have happened
+otherwise); accuracy gain, not noise.
+
+The default `MAILBOX_RESPONSE_CYCLES` is now 8000 (Phase B
+measurement). `XDNA_EMU_MAILBOX_LATENCY` still overrides for
+calibration experimentation.
+
+Full bridge sweep after the change: zero regressions vs the
+pre-mailbox-model baseline (0 timeouts, 0 newly-failing tests).
+
 ## Update 2026-05-11 evening: dialed back to env-opt-in (default 0)
 
 The first full bridge sweep after the 8000-cyc constant landed
