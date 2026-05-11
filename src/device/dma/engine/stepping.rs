@@ -194,7 +194,26 @@ impl DmaEngine {
                     if self.check_acquire_granted(lock_id, tile, neighbors, ch_idx) {
                         // Acquire granted -- lock stall deasserts.
                         self.channels[ch_idx].prev_lock_stalled = false;
-                        ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired: true, transfer }
+                        // For a chained BD with no post-grant cooldown
+                        // (cycles_remaining=0 from enter_chained_bd), collapse
+                        // the AcquiringLock{acquired=true,cr=0} -> Transferring
+                        // intermediate state into this same step. Saves one
+                        // dead cycle on the chained-lock critical path. The
+                        // cold-start path (is_first_bd=true with full
+                        // lock_acquire_cycles) is unchanged -- it still
+                        // counts down the post-grant latency in the
+                        // acquired=true arm below.
+                        if cycles_remaining == 0 && !self.channels[ch_idx].is_first_bd {
+                            self.maybe_insert_packet_header_from_transfer(&mut transfer);
+                            let host_lat = self.timing_config.host_memory_latency_cycles;
+                            if host_lat > 0 && transfer.involves_host_memory() {
+                                ChannelFsm::HostPipelineLatency { cycles_remaining: host_lat, transfer }
+                            } else {
+                                ChannelFsm::Transferring { transfer }
+                            }
+                        } else {
+                            ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired: true, transfer }
+                        }
                     } else {
                         self.channels[ch_idx].stats.lock_wait_cycles += 1;
                         // Edge-triggered: fire once on the rising edge of the
@@ -414,9 +433,15 @@ impl DmaEngine {
 
     /// Begin the completion sequence after data movement is done.
     ///
-    /// If the BD has a release lock, transitions to ReleasingLock.
-    /// Otherwise, goes directly to chaining/repeat/idle via
-    /// `after_transfer_done`.
+    /// Pipelines the release with the final data cycle: applies the BD's
+    /// release lock inline (bypassing the arbiter, since releases never
+    /// fail and never have a precondition), then goes straight to
+    /// `after_transfer_done`. HW also overlaps release with the transfer
+    /// tail, so the prior `ReleasingLock` state was an EMU-only dead cycle.
+    ///
+    /// The `ReleasingLock` FSM state is preserved but no longer reached
+    /// from this entry point. It remains valid in case a future scenario
+    /// (e.g., arbitrated release with non-trivial latency) needs it.
     fn begin_completion(
         &mut self,
         ch_idx: usize,
@@ -433,15 +458,9 @@ impl DmaEngine {
 
         if let Some(lock_id) = transfer.release_lock {
             let release_value = transfer.release_value;
-            ChannelFsm::ReleasingLock {
-                lock_id,
-                release_value,
-                cycles_remaining: self.timing_config.lock_release_cycles as u16,
-                completion,
-            }
-        } else {
-            self.after_transfer_done(ch_idx, completion, tile, neighbors)
+            self.apply_lock_release_direct(lock_id, release_value, tile, neighbors);
         }
+        self.after_transfer_done(ch_idx, completion, tile, neighbors)
     }
 
     /// Handle post-transfer completion: stats, chaining, repeat, task queue.

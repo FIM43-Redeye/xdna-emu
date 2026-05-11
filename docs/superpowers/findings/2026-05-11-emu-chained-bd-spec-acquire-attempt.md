@@ -1,6 +1,6 @@
 ---
-name: 'Task #26 attempt: speculative lock pre-arm for chained BD acquires breaks producer/consumer pacing'
-description: Tried to close the +1 cyc per-BD residual on chained-BD-with-lock paths by speculatively submitting the next BD's acquire request to the arbiter while the prior BD is still in Transferring. The unit test for back-to-back chained BDs on a private lock pair passed cleanly (interval matches HW data cycles). But on real kernels with counting-semaphore locks shared across tiles, the lock value gets decremented thousands of cycles too early -- the consumer "outruns" the producer's filling pace. Five bridge kernels regressed with data corruption (add_one_using_dma, _diag_phase_b_add_one_instrumented, dmabd_task_queue, vec_mul_trace_distribute_lateral, vec_vec_add_memtile_init). Reverted. The +1 cyc residual remains.
+name: 'Task #26: chained-BD lock pipelining -- two speculative attempts failed, third (conservative) attempt closed the residual'
+description: Closing the +1 cyc per-BD residual on chained-BD-with-lock paths. Two speculative attempts (pre-arming the next BD's acquire while the prior BD was still in Transferring) both broke 5 bridge kernels with cross-tile data corruption -- the lock value got decremented far before consumption, desyncing producer/consumer pacing. Third attempt: pure non-speculative pipelining. Apply the release inline on the last data cycle (releases are non-blocking, no precondition), and collapse the FSM's AcquiringLock{acquired=true,cr=0} intermediate state into the same step as the grant for chained BDs. No speculative grants on shared locks. Result: chained-BD FINISHED_BD interval drops from 4 to 2 (matches HW data-only timing); all 5 previously-broken kernels pass; broader bridge sweep shows zero regressions (53/56 PASS, 3 non-PASS are pre-existing).
 type: project
 ---
 
@@ -168,6 +168,99 @@ larger than #26 was scoped for.
 
 The only viable path forward is option 2: a true reservation-queue
 arbiter. Until then, accept the +1 cyc/BD residual on chained-lock BDs.
+
+## Third attempt (same day): non-speculative pipelining closed the residual
+
+Reframed the problem. Both speculative attempts shared a fatal trait:
+*they submitted the next BD's acquire to the arbiter before the BD was
+ready to consume*, which decremented the lock value visible to all
+observers during a window where the consumer hadn't actually consumed.
+Bounding that window doesn't help -- even a 1-cycle window was enough
+to desynchronize cross-tile pacing in the second attempt.
+
+The non-speculative fix: don't speculate on acquires at all. Instead,
+close the gap by pipelining the *safe* operations:
+
+1. **Inline release.** `begin_completion` now applies the BD's release
+   directly to the target lock (bypassing the arbiter) on the cycle the
+   last data word transfers. Releases are non-blocking and never have a
+   precondition, so the arbiter only added a cycle of latency without
+   changing the outcome. Other observers see the release one cycle
+   earlier than before -- *toward* HW timing, not away from it. The
+   `ReleasingLock` FSM state is preserved but no longer reached from
+   `begin_completion`; it's available if a future scenario needs it.
+
+2. **Inline grant for chained BDs.** When `AcquiringLock{acquired=false,
+   cycles_remaining=0}` (the state `enter_chained_bd` produces for
+   chained BDs) sees its grant arrive, transition directly to
+   `Transferring` instead of lingering in
+   `AcquiringLock{acquired=true,cr=0}` for a cycle. The lock decrement
+   happens at the same cycle as before (during the arbiter resolve in
+   this same step) -- only the FSM bookkeeping cycle is removed. The
+   cold-start path (`is_first_bd=true` with full
+   `lock_acquire_cycles`) is unchanged: it still counts down the
+   post-grant latency in the `acquired=true` arm.
+
+Net effect on the `chained_bd_lock_interval_baseline` test: interval
+drops from 4 to 2 (= data cycles only). Matches HW.
+
+### Why this didn't break what speculation broke
+
+The fundamental violation in both speculative attempts was: *the
+visible lock counter decremented before the consumer actually
+consumed the buffer*. Other tiles, polling cores, and other DMA
+channels all saw a counter that lied about consumption state.
+
+In the non-speculative fix:
+- The release happens at the cycle the last data word transferred. The
+  data has already moved; the buffer really is free; the release
+  legitimately reflects that. No lie.
+- The acquire happens at the exact same cycle as before (when the
+  chained BD is ready to start consuming). Other observers see no
+  change in lock-counter timing. The lock decrement still aligns with
+  actual consumption. No lie.
+
+Only the EMU's internal FSM bookkeeping cycles get collapsed, not the
+visible state.
+
+### Verification
+
+- **Lib tests:** 2883/2883 pass (was 2882; +1 from the updated
+  baseline test).
+- **5 previously-broken kernels:** all pass
+  (`add_one_using_dma`, `_diag_phase_b_add_one_instrumented`,
+  `dmabd_task_queue`, `vec_mul_trace_distribute_lateral`,
+  `vec_vec_add_memtile_init`).
+- **Broader bridge sweep (peano, no-hw):** 53/56 PASS, 0 new fails.
+  The 3 non-PASS results are pre-existing: `vec_mul_event_trace`
+  (NPU2-only, documented Tier 3), `ctrl_packet_reconfig_4x1_cores`
+  (BUDGET timeout), `objectfifo_repeat_distribute_repeat` (XFAIL).
+  Objectfifo and chained-DMA kernels (the most sensitive to this
+  change) all pass: `add_one_objFifo`, `add_one_objFifo_elf`,
+  `dynamic_object_fifo_*`, `vec_vec_add_*`, `bd_chain_repeat_on_memtile`,
+  `dmabd_task_queue`.
+
+### Code locations
+
+- `src/device/dma/engine/locks.rs::apply_lock_release_direct` -- new
+  helper, bypasses arbiter for release.
+- `src/device/dma/engine/stepping.rs::begin_completion` -- now applies
+  release inline instead of entering `ReleasingLock`.
+- `src/device/dma/engine/stepping.rs::step_channel_fsm` (AcquiringLock
+  acquired=false branch) -- inlines the transition to Transferring
+  when granted with `cycles_remaining=0` and not `is_first_bd`.
+- `src/device/dma/engine/tests.rs::chained_bd_lock_interval_baseline`
+  -- updated to assert interval=2 (was 4).
+
+### Residual
+
+This closes the +1 cyc per-BD chained-lock residual entirely on the
+synthetic baseline (interval=2 matches HW). On real kernels, the
+memtile MM2S 16w residual (EMU=16 vs HW=15) likely came from a
+*different* source than the chained-lock dead cycles -- e.g.,
+arbiter contention with same-cycle competing requestors, or
+end-of-task release timing on non-chained BDs. Re-measure those
+specific kernels after this change to see if the residual moved.
 
 ## What I'd do differently if revisiting
 

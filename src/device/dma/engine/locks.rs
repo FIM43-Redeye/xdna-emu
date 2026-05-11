@@ -84,6 +84,52 @@ impl DmaEngine {
         });
     }
 
+    /// Apply a release directly to the target lock, bypassing the arbiter.
+    ///
+    /// Used by `begin_completion` to pipeline the BD's release with its
+    /// final data cycle: releases are non-blocking and never have a
+    /// precondition, so the arbiter only added a cycle of latency without
+    /// changing the outcome. Applying inline matches HW behavior (release
+    /// completes in the cycle the BD's last data word transfers).
+    ///
+    /// Same-cycle acquires that were submitted earlier this cycle won't see
+    /// this release until next cycle's resolve -- a small ordering shift vs.
+    /// the arbiter path, but consistent with HW (release happens late in
+    /// the cycle, after arbiter resolution).
+    pub(super) fn apply_lock_release_direct(
+        &mut self,
+        lock_id: u8,
+        release_value: i8,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) {
+        let lock_target = match self.resolve_lock_id(lock_id) {
+            Some(target) => target,
+            None => return,
+        };
+        let (target_tile, local_id): (&mut Tile, u8) = match lock_target {
+            LockTarget::Own(id) => (tile, id),
+            LockTarget::West(id) => match neighbors.west.as_deref_mut() {
+                Some(west) => (west, id),
+                None => return,
+            },
+            LockTarget::East(id) => match neighbors.east.as_deref_mut() {
+                Some(east) => (east, id),
+                None => return,
+            },
+        };
+        if let Some(lock) = target_tile.locks.get_mut(local_id as usize) {
+            let _ = lock.release_with_value(release_value);
+        }
+        log::info!(
+            "DMA tile({},{}) lock release bd_lock={} delta={} (inline, pipelined with last data cycle)",
+            self.col,
+            self.row,
+            lock_id,
+            release_value
+        );
+    }
+
     /// Submit a release request to the appropriate tile's arbiter.
     fn submit_release_request(
         &self,

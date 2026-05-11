@@ -1698,26 +1698,20 @@ fn test_per_direction_channel() {
     assert_eq!(engine.per_direction_channel(11), 5);
 }
 
-/// Baseline measurement: chained BDs with acquire+release locks on a
-/// private lock pair. Asserts the current EMU behavior of paying 2 dead
-/// cycles between back-to-back FINISHED_BD events for 2-word BDs:
-///   - ReleasingLock: 1 cycle
-///   - AcquiringLock !acquired -> acquired transition: 1 cycle (collapsed
-///     from 2 by #13's enter_chained_bd cycles_remaining=0 shortcut)
+/// Chained BDs with acquire+release locks on a private lock pair finish
+/// back-to-back with `interval == data_cycles` (no dead cycles between
+/// FINISHED_BD events). This matches HW behavior: the release is pipelined
+/// with the last data cycle, and the next BD's `AcquiringLock{acquired=false}`
+/// state inlines its grant directly into Transferring instead of lingering
+/// in an intermediate `acquired=true,cr=0` state.
 ///
 /// For 2-word BDs (8 bytes, 1 Transferring cycle each) the FINISHED_BD
-/// interval is `data_cycles + dead_cycles` = 1 + 2 = 3 ... but empirically
-/// it lands at 4 because the post-acquire `acquired=true cycles=0`
-/// transition is also a separate FSM step. So total dead = 3, interval = 4.
-///
-/// HW achieves interval = data_cycles (zero dead cycles) by pipelining
-/// the release+acquire under the prior BD's transfer tail. #26 attempted
-/// to close this gap via speculative pre-arm and failed (see finding doc
-/// `2026-05-11-emu-chained-bd-spec-acquire-attempt.md`). Tightening this
-/// further requires the reservation-queue arbiter redesign.
-///
-/// When that redesign happens, this test should be updated to assert
-/// interval == 2 (data cycles only).
+/// interval is 2 (data only). Earlier EMU paid 4 cycles: 1 data + 1
+/// ReleasingLock + 1 grant + 1 acquired=true cooldown. Closed in the
+/// non-speculative pipelining pass (see finding doc
+/// `2026-05-11-emu-chained-bd-spec-acquire-attempt.md` for the failed
+/// speculative attempts; the eventual fix is conservative -- inline
+/// release + inline grant on chained BDs only).
 #[test]
 fn chained_bd_lock_interval_baseline() {
     use crate::interpreter::state::EventType;
@@ -1770,9 +1764,9 @@ fn chained_bd_lock_interval_baseline() {
     );
     let interval = finished_bd_cycles[1] - finished_bd_cycles[0];
     assert_eq!(
-        interval, 4,
-        "baseline FINISHED_BD interval; update this when chained-lock pipelining lands. \
-         HW=2 (data cycles only). cycles={:?}",
+        interval, 2,
+        "chained-BD FINISHED_BD interval == data cycles (no dead cycles); \
+         matches HW. cycles={:?}",
         finished_bd_cycles
     );
 }
