@@ -192,10 +192,17 @@ impl DmaEngine {
                 } else {
                     // Check if arbiter granted the acquire (submitted in pre-step pass)
                     if self.check_acquire_granted(lock_id, tile, neighbors, ch_idx) {
+                        // Acquire granted -- lock stall deasserts.
+                        self.channels[ch_idx].prev_lock_stalled = false;
                         ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired: true, transfer }
                     } else {
                         self.channels[ch_idx].stats.lock_wait_cycles += 1;
-                        self.trace(EventType::DmaStalledLock { channel: ch_idx as u8 });
+                        // Edge-triggered: fire once on the rising edge of the
+                        // lock-stall signal, not every cycle we're blocked.
+                        if !self.channels[ch_idx].prev_lock_stalled {
+                            self.trace(EventType::DmaStalledLock { channel: ch_idx as u8 });
+                            self.channels[ch_idx].prev_lock_stalled = true;
+                        }
                         ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired: false, transfer }
                     }
                 }
@@ -234,6 +241,8 @@ impl DmaEngine {
                     TransferCycleResult::Continue => {
                         // Tick the transfer's cycle counter
                         transfer.tick();
+                        // Forward progress -- starvation deasserts.
+                        self.channels[ch_idx].prev_starving = false;
                         // Check if data movement is complete
                         if transfer.remaining_bytes() == 0 {
                             self.begin_completion(ch_idx, transfer, tile, neighbors)
@@ -242,8 +251,13 @@ impl DmaEngine {
                         }
                     }
                     TransferCycleResult::Stalled => {
-                        // S2MM stall: stay in Transferring, don't advance
-                        self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8 });
+                        // S2MM stall: stay in Transferring, don't advance.
+                        // STREAM_STARVATION is edge-triggered on HW -- fire
+                        // only on rising edge (idle -> starving transition).
+                        if !self.channels[ch_idx].prev_starving {
+                            self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8 });
+                            self.channels[ch_idx].prev_starving = true;
+                        }
                         ChannelFsm::Transferring { transfer }
                     }
                     TransferCycleResult::FotFinish => {

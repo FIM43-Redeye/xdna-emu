@@ -225,6 +225,19 @@ pub struct ChannelContext {
 
     /// Performance counters.
     pub stats: ChannelStats,
+
+    /// Edge-trigger memory for DMA_S2MM_STREAM_STARVATION events.
+    /// HW fires the starvation event on the rising edge of the stall
+    /// signal -- emitting every stalled cycle would flood the trace BD
+    /// in milliseconds. We only emit when `prev_starving=false` and
+    /// the channel stalls this cycle. Reset to false on Idle re-entry.
+    pub prev_starving: bool,
+
+    /// Edge-trigger memory for DMA_STALLED_LOCK_ACQUIRE events.
+    /// Same rationale as `prev_starving` -- fires once per
+    /// idle->blocked transition, not every cycle a lock acquire is
+    /// pending.
+    pub prev_lock_stalled: bool,
 }
 
 impl ChannelContext {
@@ -241,6 +254,8 @@ impl ChannelContext {
             error_bd_unavailable: false,
             is_first_bd: true,
             stats: ChannelStats::default(),
+            prev_starving: false,
+            prev_lock_stalled: false,
         }
     }
 
