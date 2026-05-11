@@ -129,12 +129,25 @@ pub struct TimestampedEvent {
 }
 
 /// Event log for recording execution events.
+///
+/// The buffer is bounded to `max_events`; when full, the oldest event is
+/// dropped to make room for the new one. To let incremental consumers
+/// track their drain position across buffer wraps, the log also exposes
+/// a monotonic `total_recorded()` counter and a `since(absolute)`
+/// iterator. A cursor stored in absolute terms (rather than as a current
+/// array index) survives the buffer dropping older entries.
 #[derive(Clone)]
 pub struct EventLog {
     /// Recorded events.
     events: Vec<TimestampedEvent>,
     /// Maximum events to keep (circular buffer behavior).
     max_events: usize,
+    /// Monotonic count of events ever recorded (never decreases).
+    /// Equal to the absolute position of the next event that will be
+    /// pushed. Consumers track their drain position in this absolute
+    /// space rather than as an index into `events`, which shifts down
+    /// each time the buffer drops its oldest entry.
+    total_recorded: u64,
     /// Whether tracing is enabled.
     enabled: bool,
 }
@@ -147,7 +160,12 @@ impl EventLog {
 
     /// Create a new event log with specified capacity.
     pub fn with_capacity(max_events: usize) -> Self {
-        Self { events: Vec::with_capacity(max_events.min(1000)), max_events, enabled: false }
+        Self {
+            events: Vec::with_capacity(max_events.min(1000)),
+            max_events,
+            total_recorded: 0,
+            enabled: false,
+        }
     }
 
     /// Enable event recording.
@@ -172,20 +190,49 @@ impl EventLog {
             return;
         }
         if self.events.len() >= self.max_events {
-            // Drop oldest events (circular buffer)
+            // Drop oldest events (circular buffer).
             self.events.remove(0);
         }
         self.events.push(TimestampedEvent { cycle, event });
+        self.total_recorded += 1;
     }
 
-    /// Get all recorded events.
+    /// Get all currently buffered events. Position 0 in this slice is
+    /// NOT necessarily absolute position 0 -- entries shift down each
+    /// time the circular buffer drops its oldest entry. For incremental
+    /// draining across wraps, use `since()` with a `total_recorded()`
+    /// cursor instead.
     pub fn events(&self) -> &[TimestampedEvent] {
         &self.events
     }
 
-    /// Clear all events.
+    /// Monotonic count of events recorded since the log was created or
+    /// last cleared. Acts as the absolute position of the next event
+    /// that will be pushed. Used by incremental consumers as a stable
+    /// cursor that survives circular-buffer drops.
+    pub fn total_recorded(&self) -> u64 {
+        self.total_recorded
+    }
+
+    /// Iterate over events from absolute position `from` onward.
+    ///
+    /// If `from` is older than the oldest event still in the buffer
+    /// (because the circular buffer overwrote it), the iterator silently
+    /// starts at the oldest available event -- dropped events are lost,
+    /// not duplicated. If `from >= total_recorded()`, the iterator is
+    /// empty.
+    pub fn since(&self, from: u64) -> impl Iterator<Item = &TimestampedEvent> + '_ {
+        let len = self.events.len() as u64;
+        let earliest = self.total_recorded - len;
+        let start = from.max(earliest);
+        let offset = (start - earliest) as usize;
+        self.events.iter().skip(offset)
+    }
+
+    /// Clear all events. Resets `total_recorded()` to 0.
     pub fn clear(&mut self) {
         self.events.clear();
+        self.total_recorded = 0;
     }
 
     /// Get the number of recorded events.
@@ -267,6 +314,80 @@ mod tests {
         // First event (cycle 1) should be dropped
         assert_eq!(log.events()[0].cycle, 2);
         assert_eq!(log.events()[2].cycle, 4);
+    }
+
+    /// Consumers that drain incrementally need a stable position cursor
+    /// that survives circular-buffer wraps. The naive approach (index
+    /// into `events()`) breaks once the buffer fills: indices shift down
+    /// on every drop, so a cursor that previously pointed at the next
+    /// unconsumed event ends up pointing past the end forever. The fix
+    /// is a monotonic `total_recorded()` counter and a `since(absolute)`
+    /// iterator that yields events in absolute-position order, clamped
+    /// to whatever survives in the buffer.
+    #[test]
+    fn test_event_log_drain_survives_circular_wrap() {
+        let mut log = EventLog::with_capacity(4);
+        log.enable();
+
+        // Record 4 events, fully draining via cursor.
+        for i in 1..=4 {
+            log.record(i, EventType::InstrLoad { pc: i as u32 });
+        }
+        let mut cursor: u64 = 0;
+        let mut drained: Vec<u64> = Vec::new();
+        for evt in log.since(cursor) {
+            drained.push(evt.cycle);
+        }
+        cursor = log.total_recorded();
+        assert_eq!(drained, vec![1, 2, 3, 4]);
+        assert_eq!(cursor, 4);
+
+        // Record event 5 -- buffer wraps (drops 1). Cursor at 4 must
+        // still see the new event (5).
+        log.record(5, EventType::InstrLoad { pc: 5 });
+        let mut drained2: Vec<u64> = Vec::new();
+        for evt in log.since(cursor) {
+            drained2.push(evt.cycle);
+        }
+        cursor = log.total_recorded();
+        assert_eq!(drained2, vec![5], "cursor must see post-wrap event");
+        assert_eq!(cursor, 5);
+
+        // Record 3 more (buffer drops 2, 3). Cursor at 5 must see 6, 7, 8.
+        log.record(6, EventType::InstrLoad { pc: 6 });
+        log.record(7, EventType::InstrLoad { pc: 7 });
+        log.record(8, EventType::InstrLoad { pc: 8 });
+        let mut drained3: Vec<u64> = Vec::new();
+        for evt in log.since(cursor) {
+            drained3.push(evt.cycle);
+        }
+        assert_eq!(drained3, vec![6, 7, 8]);
+    }
+
+    /// If a consumer falls behind and the circular buffer overwrites
+    /// events it never read, `since(stale_cursor)` should clamp to the
+    /// oldest event still present (i.e. silently skip the dropped ones)
+    /// rather than panic or duplicate.
+    #[test]
+    fn test_event_log_since_clamps_to_oldest_when_cursor_stale() {
+        let mut log = EventLog::with_capacity(3);
+        log.enable();
+
+        for i in 1..=10 {
+            log.record(i, EventType::InstrLoad { pc: i as u32 });
+        }
+        // Buffer now holds cycles 8, 9, 10. total_recorded = 10.
+        // Stale cursor at 0 should yield only the events still present.
+        let cycles: Vec<u64> = log.since(0).map(|e| e.cycle).collect();
+        assert_eq!(cycles, vec![8, 9, 10]);
+        // Cursor at 7 (referring to dropped event 8 -- wait, since(7) means
+        // "events with absolute index >= 7"; absolute 7 is the 8th event,
+        // which is cycle 8) should yield the same set.
+        let cycles2: Vec<u64> = log.since(7).map(|e| e.cycle).collect();
+        assert_eq!(cycles2, vec![8, 9, 10]);
+        // Cursor at total -- nothing new.
+        let cycles3: Vec<u64> = log.since(log.total_recorded()).map(|e| e.cycle).collect();
+        assert_eq!(cycles3, Vec::<u64>::new());
     }
 
     #[test]

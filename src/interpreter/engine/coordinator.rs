@@ -52,10 +52,13 @@ struct CoreState {
     context: ExecutionContext,
     /// Is this core enabled?
     enabled: bool,
-    /// Number of trace events already consumed from the EventLog.
-    /// Used to incrementally drain new events each cycle for the
-    /// hardware trace unit without needing a drain() method.
-    trace_events_consumed: usize,
+    /// Absolute count of trace events already consumed from the
+    /// EventLog. Tracked in EventLog's monotonic `total_recorded`
+    /// space, NOT as an index into the current `events()` slice --
+    /// the latter shifts down each time the circular buffer drops its
+    /// oldest entry, silently stranding the cursor past end-of-slice
+    /// once the buffer wraps.
+    trace_events_consumed: u64,
     /// True if this core executed an instruction (StepResult::Continue)
     /// during the current cycle's execute phase. Used by the tick phase to
     /// route ACTIVE_CORE-configured perf counters to tick_active_cycles vs
@@ -698,17 +701,18 @@ impl InterpreterEngine {
                     // stalls and thus does not reflect the tile clock that real HW
                     // trace units observe. Events drained here happened in the
                     // current simulation step, so total_cycles is the right stamp.
-                    let events = core.context.timing_context().events.events();
+                    let event_log = &core.context.timing_context().events;
+                    let total = event_log.total_recorded();
                     let new_start = core.trace_events_consumed;
-                    if new_start < events.len() {
+                    if new_start < total {
                         let cycle = self.total_cycles;
-                        for evt in &events[new_start..] {
+                        for evt in event_log.since(new_start) {
                             if let Some(hw_id) = crate::trace::core_event_to_hw_id(&evt.event) {
                                 let pc = crate::trace::event_pc(&evt.event);
                                 tile.notify_core_trace_event(hw_id, cycle, pc);
                             }
                         }
-                        core.trace_events_consumed = events.len();
+                        core.trace_events_consumed = total;
                     }
                 }
 
