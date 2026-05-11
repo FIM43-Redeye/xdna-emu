@@ -1103,6 +1103,25 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                         aied.trace_stop(broadcast=_TRACE_BROADCAST_STOP)
 
         rs_block = rs_op.operation.regions[0].blocks[0]
+
+        # Append a trace BO arg to the runtime_sequence so aiecc emits a
+        # relocation for it.  Without this, ELF-mode kernels (xrt::ext::kernel
+        # + xrt::elf module) leave the trace BD's address unpatched: XRT's
+        # ELF reloc table only covers args present in the runtime_sequence
+        # signature, so a host-side bo_trace passed at a kernel slot beyond
+        # the runtime_sequence's argument count gets no relocation and the
+        # trace BD ends up writing to whatever default address the MLIR baked
+        # in -- which in ctrl_packet_reconfig_elf overlaps the input BO and
+        # corrupts it mid-run (see findings/2026-05-10-ctrl-packet-elf-trace-
+        # bd-collision.md).  Adding the arg here also costs nothing on the
+        # non-ELF path: XRT binds it to the same kernel slot via the regular
+        # arg-index mapping that trace_host_config + npu_address_patch
+        # already used.
+        from aie.ir import MemRefType, IntegerType, Location
+        i8_type = IntegerType.get_signless(8)
+        trace_memref_type = MemRefType.get([args.buffer_size], i8_type)
+        rs_block.add_argument(trace_memref_type, Location.unknown())
+
         with InsertionPoint.at_block_begin(rs_block):
             # trace_host_config(buffer_size=N, arg_idx=K) emits:
             #   aie.trace.host_config buffer_size = N, arg_idx = K
@@ -1110,8 +1129,9 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
             #                              routing=TraceShimRouting.Single, ...)
             # Mirror of mlir-aie python/utils/trace/setup.py line 534.
             # We override arg_idx (default 4) with chosen_arg_idx so the
-            # trace BD's address_patch lands on a free kernel arg slot rather
-            # than colliding with an existing memref arg.
+            # trace BD's address_patch lands on the trace memref arg we
+            # just appended (the runtime_sequence now has chosen_arg_idx+1
+            # args; the trace arg is the last one at index chosen_arg_idx).
             aied.trace_host_config(
                 buffer_size=args.buffer_size, arg_idx=chosen_arg_idx,
             )

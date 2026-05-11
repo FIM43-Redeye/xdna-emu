@@ -77,26 +77,46 @@ ctrl_packet_reconfig_elf:  Chess/HW PASS, Chess/EMU PASS
 Functional correctness on EMU is intact; the bug is strictly in the
 trace integration path.
 
-## Fix applied (mitigation)
+## Fix landed
 
-Added `ctrl_packet_reconfig_elf` to `scripts/trace-quarantine.txt` with
-a full reason comment. The bridge runner now skips trace injection for
-this test by default; it still runs HW + EMU functionally.
+`tools/mlir-trace-inject.py` now appends an explicit `memref<NxI8>`
+arg to the `aie.runtime_sequence` block before emitting
+`aie.trace.host_config`. The arg is unused inside the runtime sequence
+body, but its presence makes aiecc emit a relocation entry for the
+trace BO -- so:
 
-## Proper fix (deferred)
+- **ELF path** (xrt::ext::kernel with xrt::elf): the ELF's `.rela.dyn`
+  now has a slot for the trace arg, and XRT-host fills it from kernel
+  slot N+3 (where N = number of memref args) at relocation time. The
+  trace BD's source/dest address gets the actual `bo_trace` device
+  address, no collision.
+- **Non-ELF path**: XRT-firmware applies the same `aiex.npu.address_patch`
+  it always did, just now resolving arg_idx against a runtime_sequence
+  that explicitly carries the trace arg -- same effective behavior as
+  before. Verified with an 18-test sanity sweep covering add_one_*,
+  cascade_flows, ctrl_packet variants, matrix_transpose, packet_flow,
+  vector_scalar_using_dma, two_col, vec_vec_add_*_init, static_L1_init,
+  sync_task_complete_token, runtime_cumsum, nd_memcpy_linear_repeat
+  and column_specific -- 18/18 pass, 12 trace=CLEAN.
 
-A real fix requires `trace-prepare.py` to:
+The earlier `scripts/trace-quarantine.txt` entry has been removed; the
+test is back in the default trace flow.
 
-1. Detect ELF-mode kernels (xrt::ext::kernel with xrt::elf module).
-2. Either:
-   - Inject bo_trace as a `runtime_sequence` argument so XRT relocations
-     include it, OR
-   - Skip injection for ELF-mode tests (effectively automating today's
-     manual quarantine).
+## Lessons learned
 
-This is a cross-tool change (mlir-trace-inject.py, cpp_trace_patch.py,
-possibly emu-bridge-test.sh). Not justified yet; one test affected.
-Revisit if more ELF-mode tests show similar symptoms.
+The bug looked like a compute-side correctness issue (~2500 wrong
+outputs, dominantly 0x74 = 116). Instrumenting the EMU's memory-write
+log immediately reframed it: the input BO was being clobbered, the
+compute was doing the right thing on the wrong data. The "everything
+on column 0 of each row is right" pattern is the moment the kernel got
+to byte i before the trace BD's stripe landed at that offset -- a
+clean fingerprint for "data is being raced over in memory."
+
+For future debugging: when an EMU correctness bug shows a *byte-level*
+spatial pattern that doesn't correspond to any obvious compute-side
+structure, suspect an out-of-band write to the BO from somewhere else
+(another DMA, a trace path, a control packet) before you suspect the
+compute pipeline.
 
 ## See also
 
