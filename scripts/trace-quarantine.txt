@@ -39,3 +39,20 @@
 # emulator or tracing issue.
 ctrl_packet_reconfig
 ctrl_packet_reconfig_4x1_cores
+
+# 2026-05-10: ctrl_packet_reconfig_elf -- trace BD lands on the input BO,
+# corrupting bo_in mid-run. The test uses ELF-mode kernel dispatch
+# (xrt::ext::kernel with an xrt::elf module). XRT's relocation table only
+# patches arg_idx=0..2 inside the ELF, which map to bo_in, bo_out, and the
+# ctrl_pkt BOs respectively -- bo_trace (passed at kernel arg slot 5) has
+# no relocation slot, so the trace BD15's source/dest address stays at
+# whatever the MLIR baked in. That happens to be 0x800000008000, which
+# overlaps the input BO at 0x9000 because the trace buffer is 1MB. Result:
+# trace data overwrites the input partway through the run, the compute
+# kernel reads garbage, and the test produces ~2500 / 4096 wrong outputs.
+# HW passes because firmware-side BD address handling differs.
+# Functional pass is restored by skipping trace injection on this test.
+# Proper fix would require trace-prepare to inject bo_trace as a
+# runtime_sequence argument (not just a host-side kernel arg) so XRT can
+# relocate it. Deferred -- non-trivial cross-tool change.
+ctrl_packet_reconfig_elf
