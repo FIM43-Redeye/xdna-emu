@@ -566,13 +566,21 @@ impl Tile {
     /// event where a meaningful program counter is not available.
     #[inline]
     pub fn notify_core_trace_event(&mut self, hw_id: u8, cycle: u64, pc: Option<u32>) {
+        // hw_id 0 is the EVENT_NONE sentinel (used by callers as "no event for
+        // this module side", e.g. memtile broadcasts that have no core-side
+        // hw_id). It must never propagate -- otherwise disabled edge detectors
+        // (input_event=0 default) would falsely activate, and trace units with
+        // start/stop_event=0 would mis-trigger.
+        if hw_id == 0 {
+            return;
+        }
         self.core_trace.notify_event(hw_id, cycle, pc);
         // Auto-reset the core-module timer when the configured Reset_Event
         // is observed (XAie_SyncTimer protocol; latched-then-applied at
         // the next tick).
         self.core_timer.notify_event(hw_id);
         for det in &mut self.core_edge_detectors {
-            if det.input_event == hw_id {
+            if det.input_event != 0 && det.input_event == hw_id {
                 det.curr_active = true;
             }
         }
@@ -587,13 +595,17 @@ impl Tile {
     /// always pass `None`.
     #[inline]
     pub fn notify_mem_trace_event(&mut self, hw_id: u8, cycle: u64, pc: Option<u32>) {
+        // hw_id 0 is EVENT_NONE; see notify_core_trace_event for rationale.
+        if hw_id == 0 {
+            return;
+        }
         self.mem_trace.notify_event(hw_id, cycle, pc);
         // Auto-reset the memory-module timer when the configured Reset_Event
         // is observed (XAie_SyncTimer protocol; latched-then-applied at
         // the next tick).
         self.mem_timer.notify_event(hw_id);
         for det in &mut self.mem_edge_detectors {
-            if det.input_event == hw_id {
+            if det.input_event != 0 && det.input_event == hw_id {
                 det.curr_active = true;
             }
         }

@@ -174,6 +174,93 @@ Tracked as task #27. The revert preserves the previous "all four tests
 TRACE=ERROR, all but vec_mul_trace_distribute_lateral PASS kernel-side"
 state.
 
+## Task #27 investigation (2026-05-11 late)
+
+Three drop-candidate audits ran in parallel: EMU broadcast/mask state,
+trace-prepare CDO output, and edge-detector signal modeling. Findings:
+
+- **EMU already parses all block-mask registers and stores `block_mask`
+  per direction** in `BroadcastConfig` (`src/device/events/broadcast.rs`),
+  with `is_blocked()` and `allowed_directions()` helpers. The bug is
+  upstream: `propagate_broadcasts` never consults them.
+- **trace-prepare emits zero block-mask writes.** AIEInsertTraceFlows
+  programs only `Event_Broadcast_N_A` source-select, never
+  `EVENT_BROADCAST_BLOCK_*`. So on HW the masks stay at reset (0 = no
+  blocking) and the broadcast does flood the array. The flood is
+  benign on HW.
+- **EMU has two unrelated bugs that the flood exposes.** Both fixed
+  on this iteration as defensive hardening (see "Defensive fixes
+  landed" below):
+  1. `propagate_broadcasts` calls `notify_mem_trace_event(hw_id=0)` on
+     shim tiles and `notify_core_trace_event(hw_id=0)` on memtiles
+     (there's no matching module side; hw_id 0 is the EVENT_NONE
+     sentinel). The receiving `notify_*_trace_event` didn't guard
+     against hw_id=0 and iterated edge detectors, where disabled
+     detectors default to `input_event=0`, so the comparison
+     `det.input_event == hw_id` (0 == 0) accidentally activated them.
+  2. Even with hw_id != 0, the edge-detector match was vulnerable
+     because it didn't skip disabled detectors. Added the
+     `det.input_event != 0` guard for defense in depth.
+
+### What still blocks #23
+
+Tried the BFS again with the defensive fixes in place. `packet_flow_fanout`
+still regresses with a different failure mode: **kernel deadlocks at
+~58k cycles** rather than producing zeros. The deadlock signature:
+
+- One broadcast event (channel 15) fires at cycle 5088 from tile (2,0).
+- BFS reaches application column 1; trace units on (1,2) and (1,3)
+  ARM and start capturing trace events (LOCK_STALL = hw_id 26, etc.).
+  Bridge log shows `TraceUnit (1,2): EventPc mode received event hw_id=26`
+  warnings beginning shortly after the broadcast.
+- DMA(2,0) ch1 (trace destination, 1 MB total) enters Transferring at
+  cycle 6782 and never advances.
+- Application DMAs continue making progress for ~50k cycles, then
+  the last forward DMA activity is `DMA(1,1) ch9` entering
+  Transferring at cycle 58049. After 100k cycles of no progress the
+  stall detector halts the run.
+
+So the bug surface has *moved* from edge detectors to the trace
+plumbing itself: once the application-column trace units start
+emitting words, something between trace_unit -> tile stream switch
+-> col 2 shim DMA backpressures and eventually deadlocks the
+application DMA chain. Candidates:
+
+- Trace stream contention on the application column's stream switch
+  arbiter (slave[23]/[24] in packet mode) starving the data flow.
+- A timer-reset side effect: trace-prepare configures timer reset on
+  BROADCAST events, and when the broadcast arrives on the application
+  column the timer reset interacts with the kernel in a way that HW
+  doesn't model the same.
+- Stream switch packet header / pkt_id mismatch on the cross-column
+  routing -- words leave (1,2) but never arrive at (2,0).
+
+This is **task #27's true root cause for #23**: cross-column
+propagation is necessary but not sufficient. The downstream trace
+flow plumbing has to work end-to-end too.
+
+## Defensive fixes landed (2026-05-11)
+
+These two changes are safe on their own and address the spurious
+edge-detector activation surfaced during this investigation:
+
+- `notify_core_trace_event` / `notify_mem_trace_event` in
+  `src/device/tile/mod.rs` now early-return when `hw_id == 0`
+  (the EVENT_NONE sentinel). This prevents disabled trace units,
+  unmatched edge detectors, and timer reset_event=0 sentinels from
+  spuriously activating.
+- Edge-detector match loop now also skips `input_event == 0`
+  detectors explicitly, as defense in depth.
+
+Bridge sweep across the four affected tests plus seven CLEAN controls
+(add_one_using_dma, packet_flow_fanin, vec_vec_add_*, etc.) shows
+11/11 PASS kernel-side. The pre-existing TRACE=ERROR on the four
+victims is preserved -- not fixed -- by this iteration.
+
+The `propagate_broadcasts` BFS attempt was reverted to column-only;
+git history preserves the BFS code if/when the trace plumbing bug is
+fixed and we can land cross-column propagation.
+
 ## Investigation breadcrumb (2026-05-11 evening)
 
 Partial investigation on `add_one_ctrl_packet` (chess, widened to

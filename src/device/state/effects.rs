@@ -381,16 +381,20 @@ impl DeviceState {
 
     /// Propagate pending broadcast events from a tile to all tiles in its column.
     ///
-    /// On real hardware, broadcast events travel through a 4-direction network
-    /// (north/south/east/west) governed by per-tile per-channel block masks.
-    /// In the default-routing case (single column, all tiles in that column
-    /// have trace units that listen to BROADCAST_15 for start) this implementation
-    /// is sufficient. For the widened-trace case where the planner places the
-    /// generator on a spare column and expects the broadcast to reach trace
-    /// units in another column, this column-only propagation drops the start
-    /// signal and the trace units never arm. See
+    /// Real hardware's broadcast network spans the whole array in 4 directions
+    /// (south/west/north/east). For the default-routing case (single column,
+    /// all tiles in that column have trace units listening to BROADCAST_15
+    /// for start) this column-only propagation suffices.
+    ///
+    /// For the widened-trace case where the planner places the generator on
+    /// a spare column and expects the broadcast to reach trace units in
+    /// another column, this column-only propagation drops the start signal.
+    /// A naive cross-column flood (see git history for the BFS attempt)
+    /// correctly arms the application-column trace units but exposes a
+    /// downstream EMU bug: once those trace units fire, the kernel data
+    /// flow stalls (DMA backpressure from trace stream contention or a
+    /// timer-reset interaction). Tracked as task #27. See
     /// `docs/superpowers/findings/2026-05-11-emu-trace-widened-distributed-routing.md`.
-    /// Fix tracked in task #27 (honor block masks + cross-column propagation).
     pub(crate) fn propagate_broadcasts(&mut self, col: u8, source_row: u8) {
         // Snapshot the simulation cycle so the trace unit start/stop events
         // are time-stamped with the current cycle rather than 0.
@@ -413,12 +417,8 @@ impl DeviceState {
         //   Compute mem module : BROADCAST_0 = 107
         //   Shim PL module     : BROADCAST_A_0 = 110
         //   MemTile event mod  : BROADCAST_0  = 142
-        // The broadcast network carries channel numbers; each receiving
-        // module fires its own per-module BROADCAST_N event when the
-        // channel arrives. Without this translation, only modules whose
-        // BROADCAST_0 base matches the source's would see the broadcast --
-        // historically that meant compute tile traces armed correctly but
-        // memtile and shim trace units never did.
+        // hw_id 0 is the EVENT_NONE sentinel and is filtered out at
+        // notify_*_trace_event for tile kinds that lack a module side.
         const CORE_BROADCAST_BASE: u8 = 107;
         const SHIM_PL_BROADCAST_BASE: u8 = 110;
         const MEMTILE_BROADCAST_BASE: u8 = 142;
@@ -435,7 +435,7 @@ impl DeviceState {
                 current_cycle,
             );
             for row in 0..rows {
-                if let Some(tile) = self.array.get_mut(col as u8, row as u8) {
+                if let Some(tile) = self.array.get_mut(col, row) {
                     let core_pc = Some(tile.core.pc);
                     let (core_hw_id, mem_hw_id) = match tile.tile_kind {
                         TileKind::Compute => (CORE_BROADCAST_BASE + channel, CORE_BROADCAST_BASE + channel),
