@@ -1700,18 +1700,18 @@ fn test_per_direction_channel() {
 
 /// Chained BDs with acquire+release locks on a private lock pair finish
 /// back-to-back with `interval == data_cycles` (no dead cycles between
-/// FINISHED_BD events). This matches HW behavior: the release is pipelined
-/// with the last data cycle, and the next BD's `AcquiringLock{acquired=false}`
-/// state inlines its grant directly into Transferring instead of lingering
-/// in an intermediate `acquired=true,cr=0` state.
+/// FINISHED_BD events). Matches HW behavior via three non-speculative
+/// pipelining optimizations:
+/// 1. Inline release on the last data cycle (bypass ReleasingLock).
+/// 2. Inline grant transition (collapse AcquiringLock{acq=true,cr=0}).
+/// 3. Inline first data cycle on the grant (run do_transfer_cycle in
+///    the same step the arbiter grants).
 ///
 /// For 2-word BDs (8 bytes, 1 Transferring cycle each) the FINISHED_BD
-/// interval is 2 (data only). Earlier EMU paid 4 cycles: 1 data + 1
-/// ReleasingLock + 1 grant + 1 acquired=true cooldown. Closed in the
-/// non-speculative pipelining pass (see finding doc
+/// interval is 1 (data only). Earlier EMU paid 4 cycles: 1 data + 1
+/// ReleasingLock + 1 grant + 1 acquired=true cooldown. See finding doc
 /// `2026-05-11-emu-chained-bd-spec-acquire-attempt.md` for the failed
-/// speculative attempts; the eventual fix is conservative -- inline
-/// release + inline grant on chained BDs only).
+/// speculative attempts and the eventual non-speculative fix.
 #[test]
 fn chained_bd_lock_interval_baseline() {
     use crate::interpreter::state::EventType;
@@ -1764,9 +1764,145 @@ fn chained_bd_lock_interval_baseline() {
     );
     let interval = finished_bd_cycles[1] - finished_bd_cycles[0];
     assert_eq!(
-        interval, 2,
+        interval, 1,
         "chained-BD FINISHED_BD interval == data cycles (no dead cycles); \
          matches HW. cycles={:?}",
+        finished_bd_cycles
+    );
+}
+
+/// 4-BD chain of 16-word locked BDs. With all of #26's pipelining
+/// optimizations -- inline release on last data cycle, inline grant
+/// transition, AND inline first data cycle on grant -- the chained
+/// interval matches data cycles exactly (`16w / 4wpc = 4`).
+#[test]
+fn chained_bd_16w_lock_interval_diagnostic() {
+    use crate::interpreter::state::EventType;
+
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+    let mut host_mem = make_host_memory();
+
+    // 4 chained 16-word (64-byte) BDs ping-ponging on locks 0/1.
+    engine
+        .configure_bd(
+            0,
+            BdConfig::simple_1d(0x100, 64)
+                .with_acquire(0, 1)
+                .with_release(1, 1)
+                .with_next(1),
+        )
+        .unwrap();
+    engine
+        .configure_bd(
+            1,
+            BdConfig::simple_1d(0x200, 64)
+                .with_acquire(1, 1)
+                .with_release(0, 1)
+                .with_next(2),
+        )
+        .unwrap();
+    engine
+        .configure_bd(
+            2,
+            BdConfig::simple_1d(0x300, 64)
+                .with_acquire(0, 1)
+                .with_release(1, 1)
+                .with_next(3),
+        )
+        .unwrap();
+    engine
+        .configure_bd(3, BdConfig::simple_1d(0x400, 64).with_acquire(1, 1).with_release(0, 1))
+        .unwrap();
+
+    // with_acquire(N, 1) is acq_eq: lock must == 1, then decrement.
+    // Ping-pong: BD#0/#2 acquire lock 0 (which BD#1/#3 just released back).
+    tile.locks[0].set(1);
+    tile.locks[1].set(0);
+    engine.start_channel(2, 0).unwrap();
+
+    let mut cycle: u64 = 0;
+    let mut all_events: Vec<(u64, EventType)> = Vec::new();
+    while engine.channel_active(2) {
+        engine.set_current_cycle(cycle);
+        engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+        tile.resolve_lock_requests(cycle);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
+        all_events.extend(engine.drain_trace_events());
+        cycle += 1;
+        if cycle > 100 {
+            panic!("chain stalled beyond expected cycle budget");
+        }
+    }
+
+    let finished_bd_cycles: Vec<u64> = all_events
+        .iter()
+        .filter_map(|(c, e)| match e {
+            EventType::DmaFinishedBd { channel: 2 } => Some(*c),
+            _ => None,
+        })
+        .collect();
+    let intervals: Vec<u64> = finished_bd_cycles.windows(2).map(|w| w[1] - w[0]).collect();
+    assert_eq!(
+        intervals,
+        vec![4u64, 4, 4],
+        "16w chained-BD intervals match data cycles; FINISHED_BD cycles={:?}",
+        finished_bd_cycles
+    );
+}
+
+/// Diagnostic: chained BDs *without* locks. Pure chain overhead, no
+/// AcquiringLock state on the critical path. Reveals whether the +1
+/// cyc residual on locked chains is from the lock dance specifically
+/// or from a generic chain-transition cost.
+#[test]
+fn chained_bd_no_lock_interval_diagnostic() {
+    use crate::interpreter::state::EventType;
+
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+    let mut host_mem = make_host_memory();
+
+    // 4 chained 16-word BDs, no locks.
+    engine.configure_bd(0, BdConfig::simple_1d(0x100, 64).with_next(1)).unwrap();
+    engine.configure_bd(1, BdConfig::simple_1d(0x200, 64).with_next(2)).unwrap();
+    engine.configure_bd(2, BdConfig::simple_1d(0x300, 64).with_next(3)).unwrap();
+    engine.configure_bd(3, BdConfig::simple_1d(0x400, 64)).unwrap();
+
+    engine.start_channel(2, 0).unwrap();
+
+    let mut cycle: u64 = 0;
+    let mut all_events: Vec<(u64, EventType)> = Vec::new();
+    while engine.channel_active(2) {
+        engine.set_current_cycle(cycle);
+        engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+        tile.resolve_lock_requests(cycle);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
+        all_events.extend(engine.drain_trace_events());
+        cycle += 1;
+        if cycle > 100 {
+            panic!("chain stalled beyond expected cycle budget");
+        }
+    }
+
+    let finished_bd_cycles: Vec<u64> = all_events
+        .iter()
+        .filter_map(|(c, e)| match e {
+            EventType::DmaFinishedBd { channel: 2 } => Some(*c),
+            _ => None,
+        })
+        .collect();
+    let intervals: Vec<u64> = finished_bd_cycles.windows(2).map(|w| w[1] - w[0]).collect();
+    // 16w BD with wpc=4 = 4 data cycles. Without locks, enter_chained_bd
+    // returns Transferring directly (no AcquiringLock). The Transferring
+    // state's match arm runs do_transfer_cycle. With no transition
+    // overhead, interval = data cycles = 4.
+    assert_eq!(
+        intervals,
+        vec![4u64, 4, 4],
+        "no-lock chained-BD intervals; FINISHED_BD cycles={:?}",
         finished_bd_cycles
     );
 }

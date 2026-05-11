@@ -207,9 +207,19 @@ impl DmaEngine {
                             self.maybe_insert_packet_header_from_transfer(&mut transfer);
                             let host_lat = self.timing_config.host_memory_latency_cycles;
                             if host_lat > 0 && transfer.involves_host_memory() {
+                                // Shim host-DDR still pays its NoC/DDR
+                                // pipeline-fill latency before data flows.
                                 ChannelFsm::HostPipelineLatency { cycles_remaining: host_lat, transfer }
                             } else {
-                                ChannelFsm::Transferring { transfer }
+                                // Inline the first data cycle in the same
+                                // step as the grant. The grant has already
+                                // applied (arbiter resolved this cycle,
+                                // lock decremented), so moving data here
+                                // is pipelining, not speculation. Matches
+                                // HW's grant -> first-data-on-bus pipeline
+                                // and closes the last +1 cyc residual on
+                                // chained locked BDs.
+                                self.step_transferring_cycle(ch_idx, transfer, tile, neighbors, host_memory)
                             }
                         } else {
                             ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired: true, transfer }
@@ -252,39 +262,8 @@ impl DmaEngine {
                 }
             }
 
-            ChannelFsm::Transferring { mut transfer } => {
-                // Move one cycle of data
-                let result = self.do_transfer_cycle(ch_idx, &mut transfer, tile, neighbors, host_memory);
-
-                match result {
-                    TransferCycleResult::Continue => {
-                        // Tick the transfer's cycle counter
-                        transfer.tick();
-                        // Forward progress -- starvation deasserts.
-                        self.channels[ch_idx].prev_starving = false;
-                        // Check if data movement is complete
-                        if transfer.remaining_bytes() == 0 {
-                            self.begin_completion(ch_idx, transfer, tile, neighbors)
-                        } else {
-                            ChannelFsm::Transferring { transfer }
-                        }
-                    }
-                    TransferCycleResult::Stalled => {
-                        // S2MM stall: stay in Transferring, don't advance.
-                        // STREAM_STARVATION is edge-triggered on HW -- fire
-                        // only on rising edge (idle -> starving transition).
-                        if !self.channels[ch_idx].prev_starving {
-                            self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8 });
-                            self.channels[ch_idx].prev_starving = true;
-                        }
-                        ChannelFsm::Transferring { transfer }
-                    }
-                    TransferCycleResult::FotFinish => {
-                        // Early finish on TLAST (FoT mode)
-                        self.begin_completion(ch_idx, transfer, tile, neighbors)
-                    }
-                    TransferCycleResult::Error => ChannelFsm::Error,
-                }
+            ChannelFsm::Transferring { transfer } => {
+                self.step_transferring_cycle(ch_idx, transfer, tile, neighbors, host_memory)
             }
 
             ChannelFsm::ReleasingLock { lock_id, release_value, cycles_remaining, completion } => {
@@ -345,6 +324,47 @@ impl DmaEngine {
         };
 
         self.channels[ch_idx].fsm = new_fsm;
+    }
+
+    /// Run one cycle of data movement and return the next FSM state.
+    ///
+    /// Factored out of the `Transferring` match arm so chained-BD paths
+    /// can inline the first data cycle into the same step as the
+    /// arbiter grant. Handles all four `TransferCycleResult` outcomes:
+    /// Continue (advance, transition to completion if drained), Stalled
+    /// (stay in Transferring, fire edge-triggered starvation event),
+    /// FotFinish (early completion on TLAST), Error.
+    fn step_transferring_cycle(
+        &mut self,
+        ch_idx: usize,
+        mut transfer: Box<Transfer>,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+        host_memory: &mut HostMemory,
+    ) -> ChannelFsm {
+        let result = self.do_transfer_cycle(ch_idx, &mut transfer, tile, neighbors, host_memory);
+
+        match result {
+            TransferCycleResult::Continue => {
+                transfer.tick();
+                self.channels[ch_idx].prev_starving = false;
+                if transfer.remaining_bytes() == 0 {
+                    self.begin_completion(ch_idx, transfer, tile, neighbors)
+                } else {
+                    ChannelFsm::Transferring { transfer }
+                }
+            }
+            TransferCycleResult::Stalled => {
+                // STREAM_STARVATION is edge-triggered on HW.
+                if !self.channels[ch_idx].prev_starving {
+                    self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8 });
+                    self.channels[ch_idx].prev_starving = true;
+                }
+                ChannelFsm::Transferring { transfer }
+            }
+            TransferCycleResult::FotFinish => self.begin_completion(ch_idx, transfer, tile, neighbors),
+            TransferCycleResult::Error => ChannelFsm::Error,
+        }
     }
 
     /// Create a Transfer from a BD index without starting a channel.
