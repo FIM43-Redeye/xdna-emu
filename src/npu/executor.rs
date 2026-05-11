@@ -87,19 +87,33 @@ pub(crate) enum ExecutorState {
         /// Mask to apply before comparison.
         mask: u32,
     },
-    /// Flushing stream switch after sync satisfaction.
+    /// Post-sync settling period.
     ///
-    /// Control packet data may still be in-transit through the stream
-    /// switch when the sync completes (sync only confirms the shim DMA
-    /// finished sending). On real hardware, the firmware's instruction
-    /// pipeline latency gives the stream switch time to deliver data
-    /// before follow-up writes take effect. We model this by waiting
-    /// a few routing cycles before resuming instruction execution.
+    /// Two effects overlap here, both fired by the same state since they
+    /// both happen between "channel observed idle" and "next instruction
+    /// can issue":
+    ///
+    /// 1. **Firmware mailbox roundtrip** (`MAILBOX_RESPONSE_CYCLES`, ~8000
+    ///    cyc on NPU1). dma_wait is dispatched as a firmware command;
+    ///    firmware polls the BD status and returns a token via the
+    ///    mailbox. The roundtrip is the dominant component -- see
+    ///    `docs/superpowers/findings/2026-05-10-phase-b-runtime-seq-instrumentation.md`
+    ///    which measured a ~8000-cyc dead window between BD-finished
+    ///    and dma_wait-return.
+    /// 2. **Stream switch flush** (`STREAM_FLUSH_CYCLES`, ~4 cyc).
+    ///    Control packet data may still be in-transit through the stream
+    ///    switch when the sync completes (sync only confirms the shim
+    ///    DMA finished sending). Firmware instruction latency gives the
+    ///    switch time to deliver data before follow-up writes take effect.
+    ///
+    /// Modeling both as a single counter keeps the state machine simple;
+    /// the calibration target is the SUM.
     FlushingStreams {
         /// Index of the NEXT instruction to execute after flush.
         next_index: usize,
-        /// Remaining routing cycles before resuming.
-        remaining: u8,
+        /// Remaining cycles before resuming. Widened from u8 to u32
+        /// because the mailbox component alone is ~8000 cyc.
+        remaining: u32,
     },
     /// Charging cycles for a previously-issued instruction to retire.
     ///
@@ -513,22 +527,22 @@ impl NpuExecutor {
 
                 if satisfied {
                     log::info!("NPU Sync #{} satisfied, resuming instruction {}", sync_index, next_index,);
-                    if next_index >= self.instructions.len() {
-                        self.state = ExecutorState::Done;
-                        AdvanceResult::Done
-                    } else {
-                        // Flush stream switch before resuming. Control packet
-                        // data from the just-completed shim DMA may still be
-                        // in-transit through the stream switch pipeline. On real
-                        // hardware, firmware instruction latency (~4-8 cycles)
-                        // gives the switch time to deliver this data. We model
-                        // the same delay by waiting before executing the next
-                        // instruction.
-                        const STREAM_FLUSH_CYCLES: u8 = 4;
-                        self.state =
-                            ExecutorState::FlushingStreams { next_index, remaining: STREAM_FLUSH_CYCLES };
-                        AdvanceResult::Progressed
-                    }
+                    // Post-sync settling. Two components, always charged
+                    // (even when sync is the final instruction -- HW
+                    // firmware mailbox roundtrip happens regardless of
+                    // whether more host-side work follows):
+                    // - MAILBOX_RESPONSE_CYCLES: firmware mailbox roundtrip
+                    //   for the dma_wait command/response (~8000 cyc on
+                    //   NPU1, measured at Phase B; see executor state docs).
+                    // - STREAM_FLUSH_CYCLES: stream-switch in-transit data
+                    //   propagation delay.
+                    const MAILBOX_RESPONSE_CYCLES: u32 = 8000;
+                    const STREAM_FLUSH_CYCLES: u32 = 4;
+                    self.state = ExecutorState::FlushingStreams {
+                        next_index,
+                        remaining: MAILBOX_RESPONSE_CYCLES + STREAM_FLUSH_CYCLES,
+                    };
+                    AdvanceResult::Progressed
                 } else {
                     AdvanceResult::Blocked
                 }
@@ -554,9 +568,12 @@ impl NpuExecutor {
             }
 
             ExecutorState::FlushingStreams { next_index, remaining } => {
-                // Wait for stream switch to propagate in-transit data.
-                // Each cycle the caller runs the routing, delivering
-                // control packet data one hop closer to target tiles.
+                // Wait for firmware mailbox response + stream switch
+                // in-transit data propagation. Each cycle the caller
+                // runs the routing, delivering any in-transit control
+                // packet data one hop closer to target tiles; meanwhile
+                // we burn the mailbox-roundtrip cycles before the next
+                // host-side instruction can dispatch.
                 if remaining <= 1 {
                     self.state = ExecutorState::Executing { next_index };
                 } else {
@@ -1534,6 +1551,71 @@ mod tests {
         assert!(
             executor.syncs_satisfied(&device),
             "sync should be satisfied after channel ran and completed"
+        );
+    }
+
+    /// After BlockedOnSync resolves, the executor must spend the
+    /// firmware-mailbox + stream-flush latency in FlushingStreams
+    /// before reaching the next instruction. Models the ~8000-cyc
+    /// dead window measured at Phase B
+    /// (findings/2026-05-10-phase-b-runtime-seq-instrumentation.md).
+    #[test]
+    fn test_sync_resolution_charges_mailbox_latency() {
+        let mut executor = NpuExecutor::new();
+        let device = DeviceState::new_npu1();
+
+        // Synthesize a satisfied sync directly into the state machine:
+        // an empty pending_syncs entry with started=true plus a Sync
+        // instruction pointing at it would normally satisfy via
+        // is_sync_satisfied. We shortcut by parking the executor
+        // directly in BlockedOnSync and providing a pending_sync that
+        // is already in the "ran then idle" state, so the next
+        // try_advance pumps the resolution.
+        executor.pending_syncs.push(PendingSync {
+            column: 0,
+            row: 2,
+            channel: 0,
+            direction: 1,  // MM2S
+            started: true, // pretend the channel already ran
+        });
+        // Park the executor at "blocked on sync 0, would resume to next_index=99
+        // which we'll set up as 'past the end' so resolution lands in Done".
+        executor.instructions = Vec::new();
+        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0 };
+
+        let mut host_mem = HostMemory::new();
+        let mut device_mut = device;
+
+        // First advance: BlockedOnSync poll -> satisfied -> FlushingStreams.
+        let _ = executor.try_advance(&mut device_mut, &mut host_mem);
+        let initial_remaining = match executor.state {
+            ExecutorState::FlushingStreams { remaining, .. } => remaining,
+            ref other => panic!("expected FlushingStreams after sync resolves, got {:?}", other),
+        };
+
+        // The combined mailbox + stream-flush latency. Pinning the exact
+        // value here so any future tuning of MAILBOX_RESPONSE_CYCLES
+        // shows up as a test failure and gets reviewed deliberately.
+        assert_eq!(
+            initial_remaining, 8004,
+            "post-sync settling should be MAILBOX_RESPONSE_CYCLES (8000) + STREAM_FLUSH_CYCLES (4)",
+        );
+
+        // Drain the latency window; executor should stay in
+        // FlushingStreams until the counter reaches 1 (next cycle clears it).
+        let mut steps = 0;
+        while matches!(executor.state, ExecutorState::FlushingStreams { .. }) {
+            let _ = executor.try_advance(&mut device_mut, &mut host_mem);
+            steps += 1;
+            if steps > 9000 {
+                panic!("FlushingStreams drained slower than expected (>{} cycles)", steps);
+            }
+        }
+        // Exactly initial_remaining decrements from the counter; we leave
+        // FlushingStreams the cycle the counter reaches <=1.
+        assert_eq!(
+            steps, initial_remaining as usize,
+            "FlushingStreams should take exactly `remaining` cycles to drain",
         );
     }
 }
