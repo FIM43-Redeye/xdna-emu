@@ -72,14 +72,50 @@ as a test failure that gets reviewed deliberately.
 - Bridge `cargo test --lib` unaffected (2878 tests still pass --
   none of them encoded the pre-fix cycle count in an assertion).
 
+## Update 2026-05-11 evening: dialed back to env-opt-in (default 0)
+
+The first full bridge sweep after the 8000-cyc constant landed
+exposed the multi-sync regression I flagged in "open questions":
+**4 chess + 6 peano tests timed out** at the 600s wall clock.
+Two of them (`ctrl_packet_reconfig_1x4_cores`, `sync_task_complete_token`,
+`ctrl_packet_reconfig_4x1_cores`) have 130-163 `dma_wait` calls
+each. At 8000 cyc/sync × 160 syncs that's 1.28M cyc of pure
+mailbox time, which at EMU's per-cycle wall-clock cost blew the
+budget.
+
+Reverted the default to 0 and made the mailbox component
+env-controlled via `XDNA_EMU_MAILBOX_LATENCY`. The other piece of
+the change kept (FlushingStreams always fires, even when sync is
+the final instruction) -- adds only 4 cyc/sync (stream-flush).
+
+After revert, the focused rerun of the 4 timeout tests passes:
+```
+ctrl_packet_reconfig_1x4_cores  PASS chess, PASS peano
+ctrl_packet_reconfig_4x1_cores  PASS chess, PASS peano
+sync_task_complete_token        PASS chess, PASS peano
+dma_task_large_linear           PASS peano  (chess is SKIP_COMPILER)
+```
+
+Calibration sprints that want the mailbox accuracy on
+single-sync kernels still get it:
+```
+XDNA_EMU_MAILBOX_LATENCY=8000 ./test.exe ...
+```
+
+The multi-sync model is now open work, not a regression risk in
+the default path.
+
 ## Open questions
 
-1. **Per-sync vs amortized.** This implementation charges 8000 cyc
-   per `dma_wait`. Kernels with multiple `dma_wait` instructions
-   stack the cost linearly. Reality on HW: a single firmware command
-   queue with bounded concurrency may serialize mailbox responses,
-   so the cost might be more "per-batch" than "per-sync." Need
-   multi-sync test cases to discriminate.
+1. **Per-sync vs amortized -- still unresolved**. The dial-back
+   confirmed the per-sync model is wrong for multi-sync kernels.
+   Reality on HW: a single firmware command queue with bounded
+   concurrency probably serializes mailbox responses, so the cost
+   amortizes across nearby syncs. A model that matches HW would
+   either (a) cap the cumulative cost per "batch" of syncs in a
+   runtime sequence, or (b) charge a smaller per-sync constant
+   (~50-100 cyc?) representing the amortized response overhead.
+   Need multi-sync HW measurement to discriminate.
 
 2. **Is 8000 NPU1-specific?** Phase B measured 7981 cyc on Phoenix
    (NPU1). NPU2/NPU4 likely have similar mailbox latency but the
