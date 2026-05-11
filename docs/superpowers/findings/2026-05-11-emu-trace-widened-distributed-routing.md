@@ -105,6 +105,52 @@ flagged as two separate gaps:
 They're the same root cause. Fixing the EMU's widened/distributed trace
 routing recovers all four tests.
 
+## Investigation breadcrumb (2026-05-11 evening)
+
+Partial investigation on `add_one_ctrl_packet` (chess, widened to
+npu1_2col, physical start_col=1):
+
+- **EMU does configure the col-2 trace BD.** Bridge log:
+  `DMA(2,0) ch1 BD15 start: total_bytes=1048576 base_addr=0x800000005000
+  dir=S2MM`, channel reaches `Transferring` state at cycle 4545.
+- **EMU does configure tile (1,2)'s trace slave ports.** Bridge log:
+  `Tile (1,2) stream switch: slave[23] packet mode enabled`,
+  `slave[23] slot[0] = 0x011F0102` (and slave[24] similarly). The
+  compute trace slave port range is 23-24 (verified against
+  generated `gen_stream_ranges.rs`).
+- **Tiles (2,1) and (2,2) have no stream switch config.** Only tile
+  (2,0) is configured in column 2 (8 stream-switch log lines vs 46 in
+  column 1). This is plausibly expected if the pathfinder routes
+  trace traffic vertically down column 1 first (1,2)→(1,1)→(1,0)
+  and then crosses east into (2,0). Needs confirmation.
+- **The DMA starves.** Channel (2,0) ch1 transitions Idle → BdSetup →
+  MemoryLatency → HostPipelineLatency → Transferring, then nothing.
+  No stream bytes arrive at master[5] (the source that feeds the
+  shim mux's S2MM ch1).
+
+Next step is to rerun with debug-level logging on `trace_unit` and
+`stream_switch` modules to localize the drop:
+
+```
+RUST_LOG=xdna_emu::device::trace_unit=debug,\
+xdna_emu::device::stream_switch=debug,\
+xdna_emu::device::dma::engine=debug \
+./test.exe ...
+```
+
+Drop candidates, in order of likelihood:
+1. Stream switch packet header mismatch -- the events leaving (1,2)
+   slave[23] don't match any master port's slot configuration on
+   the route to (2,0).
+2. Cross-column propagation -- the per-tile stream switch's master
+   port pushes packets, but the East/West neighbor's slave doesn't
+   pick them up (column boundary logic missing).
+3. Trace unit not actually firing events on this kernel pattern --
+   `Tile (1,2) Event_Generate` count is zero in INFO-level log; could
+   be the tile's trace events never trigger because the kernel
+   structure doesn't hit the configured event triggers (this would
+   not be a routing bug, just an empty-trace artifact).
+
 ## See also
 
 - `tools/trace-prepare.py` -- the planner that decides to widen vs distribute.
