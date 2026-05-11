@@ -133,26 +133,62 @@ matches HW exactly thanks to the #13 fix.
 Total impact: a few tens of cycles per kernel iteration, dwarfed by
 larger residuals elsewhere (mailbox latency, cold-start, etc.).
 
-## What I'd do differently
+## Update: second attempt with proper 1-cycle gate (same day)
 
-If revisiting:
+Retried with the gate fixed to use `words_per_cycle * 4` (16 bytes) as the
+threshold instead of 4 -- now the speculation fires only on the cycle that
+will drain the BD (rem<=16 with words_per_cycle=4). The unit test passed
+at interval=2. But the bridge sweep still failed on the same 5 kernels.
 
-1. Limit the speculation window to the **last data cycle of the prior
-   BD** -- not the entire Transferring. This restricts the cross-tile
-   timing perturbation to 1 cycle. (Tried this once during debugging;
-   the "last cycle" gate eliminated the cycle savings entirely
-   because the consumer's spec-grant and the chain-consume now have
-   to fit in the same cycle as the prior BD's last data, which the
-   FSM doesn't currently allow.)
-2. Add a per-arbiter "reservation queue" distinct from the live lock
-   counter. The reservation logically holds a slot but the visible
-   counter only updates when the holder commits. This is the HW model
-   per my analysis, but it's a 200+ line change spanning the arbiter,
-   lock state, and all callers of `lock_value`.
-3. Skip the optimization entirely. +1 cyc per chained BD is below the
-   trace decoder's measurement noise floor for most kernels.
+Backpressure makes the gate window wider than intended: when the stream
+switch FIFO can't accept the full 4 words/cycle, `Transferring` stretches
+across multiple cycles with rem<=16 the whole time. The instrumented run
+on add_one_using_dma showed `SPEC_ACQ` re-submitting at cycles 5936-5939
+(rem 16->12->8->4) on a single BD that backpressured 4 cycles. The
+speculation window was effectively 3 cycles of lock-state divergence per
+BD, not 1.
 
-For now, option 3 is the right call. Documented and deferred.
+Isolation test: with the spec submit DISABLED but the rest of the
+infrastructure intact (pre_acquired slot, capture pass, enter_chained_bd
+consume fallthrough, stop_channel cleanup), all 7 bridge kernels passed.
+That confirms the structural changes are safe; the issue is precisely
+the speculative arbiter submission, regardless of how tightly its
+firing is gated.
+
+**Empirical conclusion: any speculative lock-acquire submission during
+the prior BD's `Transferring` (even bounded to a single cycle in the
+ideal case) breaks cross-tile pacing for objectfifo kernels.** The
+arbiter's grant decrements the live lock counter visible to all
+observers, and that decrement happening earlier than the FSM's
+`AcquiringLock` state would have fired is enough to desynchronize the
+producer/consumer dance. The exact failure mechanism is still murky
+(the lock value differs by only 1-5 cycles), but the bridge data
+corruption is reproducible and the fix surface area for finding it is
+larger than #26 was scoped for.
+
+The only viable path forward is option 2: a true reservation-queue
+arbiter. Until then, accept the +1 cyc/BD residual on chained-lock BDs.
+
+## What I'd do differently if revisiting
+
+1. **Reservation-queue arbiter (the real fix).** Split the lock arbiter
+   into two layers: a logical "reservation list" that grants a slot
+   speculatively and a "commit step" that actually mutates `lock.value`.
+   Reservations don't change observable lock state; commits happen at
+   the cycle the holder actually uses the resource (e.g. when the FSM
+   enters Transferring on the chained BD). This mirrors how HW
+   silicon almost certainly does it. ~200-line change spanning
+   `tile/locks.rs`, the DMA FSM, and every caller of
+   `effective_lock_value`/`was_granted`. Test with the same
+   `chained_bd_lock_interval_baseline` we left behind in
+   `engine/tests.rs`.
+2. **Don't bother.** +1 cyc per chained BD is below the trace
+   decoder's measurement noise on real kernels. Pin the residual in
+   docs and move on.
+
+For now, option 2 is the right call. A baseline test asserting the
+current interval=4 lives in `engine/tests.rs` so future contributors
+have a concrete target to flip when option 1 lands.
 
 ## Reproducing
 

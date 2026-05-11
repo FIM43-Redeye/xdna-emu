@@ -1698,6 +1698,85 @@ fn test_per_direction_channel() {
     assert_eq!(engine.per_direction_channel(11), 5);
 }
 
+/// Baseline measurement: chained BDs with acquire+release locks on a
+/// private lock pair. Asserts the current EMU behavior of paying 2 dead
+/// cycles between back-to-back FINISHED_BD events for 2-word BDs:
+///   - ReleasingLock: 1 cycle
+///   - AcquiringLock !acquired -> acquired transition: 1 cycle (collapsed
+///     from 2 by #13's enter_chained_bd cycles_remaining=0 shortcut)
+///
+/// For 2-word BDs (8 bytes, 1 Transferring cycle each) the FINISHED_BD
+/// interval is `data_cycles + dead_cycles` = 1 + 2 = 3 ... but empirically
+/// it lands at 4 because the post-acquire `acquired=true cycles=0`
+/// transition is also a separate FSM step. So total dead = 3, interval = 4.
+///
+/// HW achieves interval = data_cycles (zero dead cycles) by pipelining
+/// the release+acquire under the prior BD's transfer tail. #26 attempted
+/// to close this gap via speculative pre-arm and failed (see finding doc
+/// `2026-05-11-emu-chained-bd-spec-acquire-attempt.md`). Tightening this
+/// further requires the reservation-queue arbiter redesign.
+///
+/// When that redesign happens, this test should be updated to assert
+/// interval == 2 (data cycles only).
+#[test]
+fn chained_bd_lock_interval_baseline() {
+    use crate::interpreter::state::EventType;
+
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+    let mut host_mem = make_host_memory();
+
+    // 2-word BDs in a double-buffer ping-pong on locks 0/1.
+    engine
+        .configure_bd(0, BdConfig::simple_1d(0x100, 8).with_acquire(0, 1).with_release(1, 1).with_next(1))
+        .unwrap();
+    engine
+        .configure_bd(1, BdConfig::simple_1d(0x200, 8).with_acquire(1, 1).with_release(0, 1))
+        .unwrap();
+
+    // BD#0 acquires lock 0 (must start =1); releases lock 1 to signal BD#1.
+    // BD#1 acquires lock 1 (initially 0, set by BD#0's release).
+    tile.locks[0].set(1);
+    tile.locks[1].set(0);
+    engine.start_channel(2, 0).unwrap();
+
+    let mut cycle: u64 = 0;
+    let mut all_events: Vec<(u64, EventType)> = Vec::new();
+    while engine.channel_active(2) {
+        engine.set_current_cycle(cycle);
+        engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+        tile.resolve_lock_requests(cycle);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
+        all_events.extend(engine.drain_trace_events());
+        cycle += 1;
+        if cycle > 50 {
+            panic!("chain stalled beyond expected cycle budget");
+        }
+    }
+
+    let finished_bd_cycles: Vec<u64> = all_events
+        .iter()
+        .filter_map(|(c, e)| match e {
+            EventType::DmaFinishedBd { channel: 2 } => Some(*c),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        finished_bd_cycles.len(),
+        2,
+        "expected exactly 2 FINISHED_BD events, got cycles {:?}",
+        finished_bd_cycles
+    );
+    let interval = finished_bd_cycles[1] - finished_bd_cycles[0];
+    assert_eq!(
+        interval, 4,
+        "baseline FINISHED_BD interval; update this when chained-lock pipelining lands. \
+         HW=2 (data cycles only). cycles={:?}",
+        finished_bd_cycles
+    );
+}
+
 #[test]
 fn memtile_invalid_bd_channel_combination_returns_error() {
     // BD 24 is the first "odd channel" BD; per-direction channel 0 (S2MM ch 0)
