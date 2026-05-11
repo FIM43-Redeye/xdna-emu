@@ -374,6 +374,133 @@ every widened-trace test deadlocks. The defensive `hw_id=0` /
 because column-only propagation never arms the application column's
 trace units to begin with.
 
+## Task #28: the true root cause is multicast deadlock
+
+Instrumented the EMU with a deeper stall dump (master FIFO depths +
+per-slave `active_packets` state) and re-ran with BFS. State at
+deadlock:
+
+```
+TileSwitch(1,0) arb_locks=[None, Some(14), Some(15), None, None, None, None, None]
+                s[14]:has=true active=true depth=4
+                s[15]:has=true active=true depth=4
+                s[22]:has=true active=false depth=4
+                | m[18]:depth=2 m[19]:depth=2
+TileSwitch(1,1) arb_locks=[Some(13), None, None, Some(17), None, None, None, None]
+                s[3]:has=true active=false depth=4
+                s[13]:has=true active=true depth=4
+                s[17]:has=true active=true depth=4
+                | m[7]:depth=2 m[8]:depth=2
+TileSwitch(2,0) arb_locks=[Some(12), None, None, None, None, None, None, None]
+                s[10]:has=true active=false depth=4
+                s[11]:has=true active=false depth=4
+                s[12]:has=false active=true depth=0
+                |
+```
+
+Three observations make the picture crisp:
+
+1. (2,0) `s[12]` holds `arb=0` mid-packet but its FIFO is empty
+   (`has=false depth=0`). It's waiting for upstream to deliver more
+   words.
+2. `s[10]` and `s[11]` on (2,0) have full FIFOs (`depth=4`) but are
+   idle (`active=false`) -- they're starved contenders for the same
+   `arb=0`.
+3. (1,0) `m[18]` is FULL (`depth=2`) and (1,0) `m[20]` is empty
+   (not in the dump → `depth=0`).
+
+### The multicast
+
+Inspecting the routing log: `(1,0) slave[14]` routes pkt_id=1 to
+**TWO** masters in the same step:
+
+```
+TileSwitch(1,0): pkt header 0x00220001 (id=1) slave[14] -> masters [18, 20]
+```
+
+Decoding the AIE2 master packet-config layout
+(`enable[31] pkt[30] drop_hdr[7] msel_enable[6:3] arb[2:0]`):
+
+- `m[18] = 0xC0000019` -> arb=1, **msel_enable=0b0011** (accepts msel=0 OR 1)
+- `m[20] = 0xC0000009` -> arb=1, msel_enable=0b0001 (accepts msel=0)
+
+`slave[14]` slot is arb=1, msel=0. Both masters accept it, so
+`resolve_packet_route` returns `[18, 20]` -- an intentional multicast.
+This is the *only* multicast in the entire `packet_flow_fanout` test
+(verified by grepping all `masters [..]` lines).
+
+### The deadlock cycle
+
+The two multicast branches both go east to (2,0):
+
+- `m[18] (1,0) -> s[10] (2,0)` (east master 18 / west slave 10)
+- `m[20] (1,0) -> s[12] (2,0)` (east master 20 / west slave 12)
+
+Both `s[10]` and `s[12]` on (2,0) have the same slot
+(`pkt_id=1, arb=0, msel=0`) and both target the same master `m[5]`
+through `arb=0`. **Only one slave can hold `arb=0` at a time.**
+
+- `s[12]` wins, locks `arb=0`, starts forwarding.
+- `s[10]` waits, FIFO fills (4 words), can't accept any more.
+- `m[18] (1,0)` can't push to `s[10]` → fills (2 words).
+- `slave[14] (1,0)` mid-packet multicast stalls because *one* of its
+  target masters (`m[18]`) is full. EMU's mid-packet rule is
+  all-or-nothing: pop only when *every* master can accept.
+- `m[20] (1,0)` therefore gets nothing new.
+- `s[12] (2,0)` drains its FIFO and waits for more data via `m[20]`.
+- More data never arrives.
+- **Circular deadlock:** `s[12]` can't release `arb=0` until it sees
+  TLAST. TLAST is upstream of `slave[14]`. `slave[14]` won't forward
+  until `m[18]` drains. `m[18]` won't drain until `s[10]` releases.
+  `s[10]` won't get `arb=0` until `s[12]` releases.
+
+In yesterday's column-only run, trace units on the application column
+never arm so `slave[14]` never receives this trace data, the multicast
+never happens, the deadlock never forms. In the BFS run, trace fires,
+multicast fires, deadlock forms.
+
+### Why this is structural
+
+The EMU's `step_packet_routes` (see `src/device/stream_switch/mod.rs`)
+locks an arbiter for an *entire packet* and enforces "if ANY target
+master is full, don't pop." Multicast through diverging paths that
+re-converge at a shared downstream arbiter is the classic deadlock
+recipe under this rule.
+
+Larger master FIFOs only delay the deadlock; they don't break the
+cycle. The fix has to either:
+
+1. **Per-target backpressure with independent forwarding.** Track
+   per-master delivery progress within an active packet. Pop the word
+   from the slave FIFO when *the lagging* master accepts it, but
+   forward to faster masters immediately (with internal per-master
+   buffering). Most HW-accurate; biggest refactor.
+2. **Per-target buffered multicast.** Each multicast target gets its
+   own pending-output FIFO. Slave pops a word once and pushes a copy
+   into each target's pending FIFO. Each FIFO drains independently.
+   Less invasive than #1 but introduces per-(slave x target) state.
+3. **De-multicast at trace-prepare.** Recognize that trace doesn't
+   need multicast to two east masters and program only one. Loses any
+   intentional fanout (e.g., distribute-channels patterns), so this
+   only helps if trace-prepare's planner is over-conservative.
+
+The right move is #1 or #2 in the EMU because the real HW evidently
+handles this multicast pattern (HW passes `packet_flow_fanout`
+including trace). The structural property to preserve is: a slave
+mid-packet that has at least one ready downstream must be able to
+forward to that downstream regardless of the slowest one.
+
+### Defense for the rest of the bridge
+
+Multicast routings happen in real tests beyond just trace flow. A grep
+across the bridge log catches them via `masters [.., ..]`. Any test
+that hits a packet flow where two diverging branches reconverge at a
+contended arbiter on the receiving end will tickle the same bug. So
+far this only shows up under #23-widened-trace, which is why the
+column-only mode hides it. Once #28 is fixed, cross-column
+propagation can land safely (revert the column-only fallback in
+`propagate_broadcasts`).
+
 ## Investigation breadcrumb (2026-05-11 evening)
 
 Partial investigation on `add_one_ctrl_packet` (chess, widened to
