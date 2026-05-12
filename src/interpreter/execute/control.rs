@@ -341,10 +341,24 @@ impl ControlUnit {
                 // Trace event: INSTR_LOCK_RELEASE_REQ (hw_id 45). HW fires this
                 // once per release instruction issued; releases always complete
                 // in the same cycle, so a single record matches HW 1:1.
+                //
+                // Plus a 1-cycle LOCK_STALL: HW emits LOCK_STALL for the cycle
+                // each release operation is in flight (the lock arbiter commit
+                // window). Observed on add_one_using_dma chess trace: 16
+                // releases in the kernel produce exactly 16 LOCK_STALL events
+                // at the release helper's last-bundle PC, in addition to the
+                // thousands at the head-of-line-stalled acquire's PC. Without
+                // this emission, EMU shows one LOCK_STALL PC cluster where HW
+                // shows two -- the "missing stall window" symptom that started
+                // the 2026-05-11 trace-fidelity investigation.
                 let pc = ctx.pc();
                 let cycle = ctx.cycles;
                 ctx.timing_context_mut()
                     .record_event(cycle, crate::interpreter::state::EventType::InstrLockReleaseReq { pc });
+                ctx.timing_context_mut().record_event(
+                    cycle,
+                    crate::interpreter::state::EventType::LockStall { cycles: 1, pc: Some(pc) },
+                );
                 Some(ExecuteResult::Continue)
             }
 

@@ -222,9 +222,10 @@ impl CycleAccurateExecutor {
                 if conflict.has_conflict() {
                     let cycle = ctx.cycles;
                     let stall = conflict.stall_cycles;
+                    let pc = ctx.pc();
                     self.total_memory_stalls += stall as u64;
                     ctx.timing_context_mut()
-                        .record_event(cycle, EventType::MemoryStall { cycles: stall });
+                        .record_event(cycle, EventType::MemoryStall { cycles: stall, pc: Some(pc) });
                 }
             }
             _ => {}
@@ -413,8 +414,9 @@ impl CycleAccurateExecutor {
                         _ => 254,
                     };
                     let stall_cycle = ctx.cycles;
+                    let pc = ctx.pc();
                     ctx.timing_context_mut()
-                        .record_event(stall_cycle, EventType::StreamStall { cycles: 1 });
+                        .record_event(stall_cycle, EventType::StreamStall { cycles: 1, pc: Some(pc) });
                     ctx.record_instruction(1);
                     let timing = ctx.timing_context_mut();
                     timing.hazard_stalls = self.total_hazard_stalls;
@@ -425,8 +427,9 @@ impl CycleAccurateExecutor {
                     super::stream::StreamOps::would_stall(op, tile)
                 {
                     let stall_cycle = ctx.cycles;
+                    let pc = ctx.pc();
                     ctx.timing_context_mut()
-                        .record_event(stall_cycle, EventType::StreamStall { cycles: 1 });
+                        .record_event(stall_cycle, EventType::StreamStall { cycles: 1, pc: Some(pc) });
                     ctx.record_instruction(1);
                     let timing = ctx.timing_context_mut();
                     timing.hazard_stalls = self.total_hazard_stalls;
@@ -554,12 +557,14 @@ impl CycleAccurateExecutor {
                 }
             }
             ExecuteResult::WaitLock { .. } => {
+                let pc = ctx.pc();
                 ctx.timing_context_mut()
-                    .record_event(start_cycle, EventType::LockStall { cycles: 1 });
+                    .record_event(start_cycle, EventType::LockStall { cycles: 1, pc: Some(pc) });
             }
             ExecuteResult::WaitStream { .. } => {
+                let pc = ctx.pc();
                 ctx.timing_context_mut()
-                    .record_event(start_cycle, EventType::StreamStall { cycles: 1 });
+                    .record_event(start_cycle, EventType::StreamStall { cycles: 1, pc: Some(pc) });
             }
             _ => {}
         }

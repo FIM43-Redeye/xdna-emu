@@ -143,6 +143,13 @@ pub(crate) fn event_pc(event: &EventType) -> Option<u32> {
         | EventType::InstrStreamGet { pc }
         | EventType::InstrStreamPut { pc } => Some(*pc),
         EventType::InstrEvent { pc, .. } => Some(*pc),
+        // Stall variants carry an optional PC; emission sites that can
+        // snapshot the stalled instruction's PC pass Some, others pass None.
+        // Mode-1 trace encoding uses this so the encoded frame's PC matches
+        // the issuing instruction (and HW's per-instruction-PC view).
+        EventType::MemoryStall { pc, .. }
+        | EventType::LockStall { pc, .. }
+        | EventType::StreamStall { pc, .. } => *pc,
         // If you add a new InstrXxx variant carrying `pc: u32`, add a matching
         // arm above and extend `event_pc_extracts_from_instruction_variants` --
         // otherwise the new variant will silently fall through to None and
@@ -539,9 +546,9 @@ mod tests {
         assert_eq!(core_event_to_hw_id(&EventType::InstrStore { pc: 0 }), Some(39));
         assert_eq!(core_event_to_hw_id(&EventType::InstrCall { pc: 0 }), Some(35));
         assert_eq!(core_event_to_hw_id(&EventType::InstrReturn { pc: 0 }), Some(36));
-        assert_eq!(core_event_to_hw_id(&EventType::MemoryStall { cycles: 1 }), Some(23));
-        assert_eq!(core_event_to_hw_id(&EventType::LockStall { cycles: 1 }), Some(26));
-        assert_eq!(core_event_to_hw_id(&EventType::StreamStall { cycles: 1 }), Some(24));
+        assert_eq!(core_event_to_hw_id(&EventType::MemoryStall { cycles: 1, pc: None }), Some(23));
+        assert_eq!(core_event_to_hw_id(&EventType::LockStall { cycles: 1, pc: None }), Some(26));
+        assert_eq!(core_event_to_hw_id(&EventType::StreamStall { cycles: 1, pc: None }), Some(24));
         assert_eq!(core_event_to_hw_id(&EventType::CoreActive), Some(28));
         assert_eq!(core_event_to_hw_id(&EventType::CoreDisabled), Some(29));
         assert_eq!(core_event_to_hw_id(&EventType::InstrStreamGet { pc: 0 }), Some(40));
@@ -860,10 +867,13 @@ mod tests {
         assert_eq!(event_pc(&EventType::InstrStreamPut { pc: 0x120 }), Some(0x120));
         assert_eq!(event_pc(&EventType::InstrEvent { pc: 0x300, id: 1 }), Some(0x300));
 
-        // Non-instruction variants return None.
-        assert_eq!(event_pc(&EventType::MemoryStall { cycles: 5 }), None);
-        assert_eq!(event_pc(&EventType::LockStall { cycles: 3 }), None);
-        assert_eq!(event_pc(&EventType::StreamStall { cycles: 1 }), None);
+        // Stall variants thread the optional pc through.
+        assert_eq!(event_pc(&EventType::MemoryStall { cycles: 5, pc: None }), None);
+        assert_eq!(event_pc(&EventType::LockStall { cycles: 3, pc: None }), None);
+        assert_eq!(event_pc(&EventType::StreamStall { cycles: 1, pc: None }), None);
+        assert_eq!(event_pc(&EventType::MemoryStall { cycles: 5, pc: Some(0x340) }), Some(0x340));
+        assert_eq!(event_pc(&EventType::LockStall { cycles: 3, pc: Some(0x340) }), Some(0x340));
+        assert_eq!(event_pc(&EventType::StreamStall { cycles: 1, pc: Some(0x340) }), Some(0x340));
         assert_eq!(event_pc(&EventType::CoreActive), None);
         assert_eq!(event_pc(&EventType::CoreDisabled), None);
         assert_eq!(event_pc(&EventType::DmaStartTask { channel: 0 }), None);

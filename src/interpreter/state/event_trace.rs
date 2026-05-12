@@ -47,15 +47,23 @@ pub enum EventType {
     InstrEvent { pc: u32, id: u8 },
 
     // -- Stall events (Core module trace) --
+    //
+    // `pc` is the program counter of the stalled instruction (Some), or None
+    // when the emission site cannot snapshot it (e.g. bank-conflict path
+    // that borrows the core mutably). When present, mode-1 trace encoding
+    // stamps the frame with this PC, matching HW's per-instruction-PC view
+    // of stall windows. The trace-comparison's PC-anchored "interval" count
+    // relies on this -- two stall windows at different PCs show up as two
+    // intervals in mode-1.
     /// Memory access stall.
     /// Maps to hardware MEMORY_STALL.
-    MemoryStall { cycles: u8 },
+    MemoryStall { cycles: u8, pc: Option<u32> },
     /// Lock acquire stall.
     /// Maps to hardware LOCK_STALL.
-    LockStall { cycles: u8 },
+    LockStall { cycles: u8, pc: Option<u32> },
     /// Stream interface stall.
     /// Maps to hardware STREAM_STALL.
-    StreamStall { cycles: u8 },
+    StreamStall { cycles: u8, pc: Option<u32> },
 
     // -- DMA events (Memory module trace) --
     // Channel encodes direction: 0-1 = S2MM (input), 2-3 = MM2S (output)
@@ -408,9 +416,9 @@ mod tests {
             EventType::InstrEvent { pc: 0x124, id: 0 },
             EventType::InstrEvent { pc: 0x128, id: 1 },
             // Stall events
-            EventType::MemoryStall { cycles: 2 },
-            EventType::LockStall { cycles: 3 },
-            EventType::StreamStall { cycles: 1 },
+            EventType::MemoryStall { cycles: 2, pc: None },
+            EventType::LockStall { cycles: 3, pc: None },
+            EventType::StreamStall { cycles: 1, pc: None },
             // DMA events
             EventType::DmaStartTask { channel: 0 },
             EventType::DmaFinishedBd { channel: 1 },

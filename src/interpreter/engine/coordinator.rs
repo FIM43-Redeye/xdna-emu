@@ -1002,31 +1002,28 @@ impl InterpreterEngine {
             // Emit MEMORY_STALL (core event 23) for each core that lost a
             // bank to the DMA this cycle. Bump the core's stall counter too.
             for core_idx in stalled_cores {
+                // Snapshot the core's PC before any &mut borrow so the
+                // trace-unit notify and the timing-context record can both
+                // stamp the stalled instruction's PC (matches HW's
+                // per-instruction-PC view of MEMORY_STALL windows).
+                let pc = self.cores[core_idx].context.pc();
                 // Map core index -> tile coordinates for the trace unit.
                 let col = core_idx / self.rows;
                 let row = core_idx % self.rows;
                 if let Some(tile) = self.device.array.get_mut(col as u8, row as u8) {
                     let hw_id = crate::trace::core_event_to_hw_id(
-                        &crate::interpreter::state::EventType::MemoryStall { cycles: 1 },
+                        &crate::interpreter::state::EventType::MemoryStall { cycles: 1, pc: Some(pc) },
                     );
                     if let Some(id) = hw_id {
-                        // MEMORY_STALL fires from the core side, so HW would record
-                        // the core's current PC. We don't thread it because
-                        // EventType::MemoryStall carries `cycles: u8` but no `pc`
-                        // field, and snapshotting `self.cores[core_idx].context.pc()`
-                        // here conflicts with the &mut self.cores[core_idx] borrow
-                        // taken at line 958 below for ctx.
-                        // TODO: extend EventType::MemoryStall with `pc: Option<u32>`,
-                        // capture the core PC before the ctx borrow, then pass
-                        // Some(pc) here. Deferred: requires EventType change +
-                        // a small reorder of this block.
-                        tile.notify_core_trace_event(id, cycle, None);
+                        tile.notify_core_trace_event(id, cycle, Some(pc));
                     }
                 }
                 let ctx = &mut self.cores[core_idx].context;
                 ctx.timing_context_mut().memory_stalls += 1;
-                ctx.timing_context_mut()
-                    .record_event(cycle, crate::interpreter::state::EventType::MemoryStall { cycles: 1 });
+                ctx.timing_context_mut().record_event(
+                    cycle,
+                    crate::interpreter::state::EventType::MemoryStall { cycles: 1, pc: Some(pc) },
+                );
             }
         }
 

@@ -659,7 +659,9 @@ where
                     self.lock_stall_periodic += 1;
                     if self.lock_stall_periodic >= LOCK_STALL_TRACE_PERIOD {
                         let cycle = ctx.cycles;
-                        ctx.timing_context_mut().record_event(cycle, EventType::LockStall { cycles: 1 });
+                        let pc = ctx.pc();
+                        ctx.timing_context_mut()
+                            .record_event(cycle, EventType::LockStall { cycles: 1, pc: Some(pc) });
                         self.lock_stall_periodic = 0;
                     }
                     Some(StepResult::WaitLock { raw_lock_id })
