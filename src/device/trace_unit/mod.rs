@@ -262,6 +262,19 @@ impl TraceUnit {
         }
     }
 
+    /// Reset all state to constructor defaults, preserving only col/row.
+    ///
+    /// Called from `array.reset()` on submit_cmd / hw_context teardown so a
+    /// new run sees a trace unit indistinguishable from a freshly created
+    /// one. Without this, when the post-flush drain hits its iteration cap
+    /// with packets still in flight, orphaned payload words remain in
+    /// `pending_words` and leak into the next batch's fresh stream switch,
+    /// where they get misinterpreted as packet headers (with garbage
+    /// pkt_id) and trigger a fatal "no packet route" error.
+    pub fn reset(&mut self) {
+        *self = Self::new(self.col, self.row);
+    }
+
     // -- Test helpers (pub(crate) for trace_unit::tests and tile::tests) --
 
     /// True only when this trace unit is configured as a core-module

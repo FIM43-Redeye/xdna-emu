@@ -401,6 +401,13 @@ impl TileArray {
                     crate::device::stream_switch::StreamSwitch::new_compute_tile(tile.col, tile.row)
                 }
             };
+            // Reset trace units alongside the SS: array.reset() recreates each
+            // tile's stream_switch fresh, but trace_unit pending_words can carry
+            // orphaned payload words across the reset if post-flush hit its
+            // iteration cap mid-packet. Those leak into the new SS slave queues
+            // and get misinterpreted as headers. See trace_unit::reset() docs.
+            tile.core_trace.reset();
+            tile.mem_trace.reset();
             // Note: We don't zero memory here for performance
             // Call zero_memory() explicitly if needed
         }
