@@ -10,20 +10,12 @@
 # Format: one test directory name per line (relative to test/npu-xrt/).
 # Lines starting with # are comments.
 
-# memtile_dmas/* -- TDR on Phoenix (NPU1), pass on EMU.
-# All five tests in the family hang at run.wait() in
-# drm_syncobj_array_wait_timeout; runtime sequence executes cleanly,
-# shim S2MM TCT never fires.  Empirically ruled out self-loops and
-# lock semantics as triggers; bug is in the firmware-mediated memtile
-# DMA execution path.  add_one_using_dma (static memtile_dma block via
-# CDO) passes on the same HW, so it is specifically the runtime-
-# sequence-programmed path that breaks on Phoenix firmware 1.5.x.
+# (none currently quarantined)
 #
-# Filed upstream: https://github.com/Xilinx/mlir-aie/issues/3062
-# Remove from quarantine if upstream resolves it or we obtain a
-# firmware version that supports the path.
-memtile_dmas/blockwrite_using_locks
-memtile_dmas/dma_configure_task_lock
-memtile_dmas/dma_configure_task_token
-memtile_dmas/writebd
-memtile_dmas/writebd_tokens
+# memtile_dmas/* -- previously quarantined 2026-05-09 for TDR on Phoenix
+# (NPU1) under bug #6 / Xilinx/mlir-aie#3062.  Removed 2026-05-12 after
+# the bug stopped reproducing in our environment.  See
+# docs/superpowers/findings/2026-05-12-memtile-dmas-bug6-not-reproducible.md
+# for the diagnostic chain; bisect (task #29) closed without finding a
+# regressing commit because no deterministic reproducer remained.  Re-add
+# this block if the failure returns.
