@@ -871,10 +871,19 @@ _run_trace_cycles_pipeline() {
     # both the flat events JSON (for trace-compare) and the cycles scalar
     # (for the CYCLES column). One invocation, derived from shared state,
     # guarantees the two outputs never disagree.
+    #
+    # `--trace-mode auto` reads each per-tile payload's Start opcode and
+    # dispatches mode-0 (EventTime) and mode-1 (EventPC) tiles to their
+    # respective rebuilders. Without this, the script's default
+    # (event_time / mode 0) misinterprets mode-1 EventPC frames from
+    # compute cores as cycle-delta Multiple/Single opcodes, producing
+    # bogus cycle accumulators (the "247060 cycle gap" diagnosed in
+    # 2026-05-11-emu-dma-pipeline-too-fast-misses-stalls.md).
     if ! PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python \
         python3 "$EMU_ROOT/tools/parse-trace.py" \
         --trace-bin "$trace_bin" \
         --xclbin-mlir "$mlir_path" \
+        --trace-mode auto \
         --out-events "$events_json" \
         --out-cycles "$cycles_txt" \
         2>"$extract_log"; then
@@ -2212,6 +2221,7 @@ _bin_to_events_json() {
     python3 "$EMU_ROOT/tools/parse-trace.py" \
       --trace-bin "$bin" \
       --xclbin-mlir "$mlir" \
+      --trace-mode auto \
       --out-events "$out" 2>/dev/null
 }
 export -f _bin_to_events_json
