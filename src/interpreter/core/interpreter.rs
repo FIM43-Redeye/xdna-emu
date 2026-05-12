@@ -50,12 +50,18 @@ pub enum StepResult {
 }
 
 /// Period (in cycles) at which a LOCK_STALL trace event is re-emitted
-/// while the core remains in `WaitingLock`. Matches HW's default
-/// perf-counter-driven cadence: with PERF_CTRL0 counting ACTIVE_CORE
-/// (which keeps incrementing during stall) and the typical threshold of
-/// 1024, the trace controller emits a LOCK_STALL roughly every 1024
-/// cycles of held stall. See finding 2026-05-05-355-cycle-divergence-diagnosis.
-const LOCK_STALL_TRACE_PERIOD: u64 = 1024;
+/// while the core remains in `WaitingLock`. HW emits LOCK_STALL on every
+/// cycle the WaitLock instruction is unresolved (the trace controller's
+/// LOCK_STALL signal is level, not edge, so the core trace unit emits a
+/// frame each cycle the signal is asserted). Measured on
+/// `add_one_using_dma`: HW=4394 LOCK_STALL events over the stall window.
+///
+/// Previous value was 1024, based on the assumption that LOCK_STALL was
+/// perf-counter-driven (PERF_CTRL0 counting ACTIVE_CORE with threshold
+/// 1024). That model was wrong; the bridge auto-mode trace decode in
+/// 2026-05-11 surfaced that HW LOCK_STALL is per-cycle of held stall.
+/// See `2026-05-11-emu-dma-pipeline-too-fast-misses-stalls.md`.
+const LOCK_STALL_TRACE_PERIOD: u64 = 1;
 
 /// Per-core interpreter.
 ///
