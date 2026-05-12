@@ -1268,10 +1268,6 @@ impl DmaEngine {
             }
         };
 
-        // Record bank access for conflict detection (offset is local to the target tile)
-        self.cycle_dma_banks |=
-            crate::device::banking::banks_for_access(offset as u32, bytes, self.num_banks);
-
         if offset + bytes > mem_size {
             let msg = format!(
                 "DMA({},{}) S2MM addr=0x{:X} bytes={} wraps past memory end (size=0x{:X}) -- bus error",
@@ -1289,6 +1285,9 @@ impl DmaEngine {
             if !self.has_stream_in_for_channel(channel) {
                 return S2mmResult { success: true, stall: true, tlast_received: false, bytes_written: 0 };
             }
+            // Bank is touched only when we actually consume from the stream.
+            self.cycle_dma_banks |=
+                crate::device::banking::banks_for_access(offset as u32, bytes, self.num_banks);
             return self.transfer_s2mm_decompressed(offset, bytes, channel, target_tile);
         }
 
@@ -1299,6 +1298,14 @@ impl DmaEngine {
         if words_available < words_needed {
             return S2mmResult { success: true, stall: true, tlast_received: false, bytes_written: 0 };
         }
+
+        // Bank access is recorded only after the stream-availability check.
+        // A stalled S2MM (no upstream data) does NOT issue a memory access on
+        // real hardware, so it must not register a bank touch -- otherwise
+        // every stall cycle produces a phantom CONFLICT_DM_BANK_N + MEMORY_STALL
+        // when a core happens to load from the same bank.
+        self.cycle_dma_banks |=
+            crate::device::banking::banks_for_access(offset as u32, bytes, self.num_banks);
 
         // On real hardware, S2MM ignores TLAST unless Finish-on-TLAST (FoT)
         // mode is enabled. Without FoT, the DMA continues accepting words

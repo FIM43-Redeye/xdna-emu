@@ -42,6 +42,38 @@ These were derived from comparing EMU's inflated compute-tile trace
 timestamps against HW's normal timestamps. The comparison wasn't
 apples-to-apples, so the gap it showed wasn't real.
 
+## Update 2026-05-12: spurious MEMORY_STALL root cause + fix
+
+One of the three "real fidelity bugs" surfaced after the trace-decoder
+mode fix (HW=0 / EMU=1 MEMORY_STALL interval on `add_one_using_dma`)
+is now closed.
+
+**Root cause**: `transfer_s2mm()` in `src/device/dma/engine/stepping.rs`
+recorded the bank access into `cycle_dma_banks` *before* checking
+whether stream data was available. When the S2MM was stalled waiting
+for upstream data (which is the steady state during the kernel's
+warm-up window, ~6500 cyc on add_one_using_dma), every cycle it would
+phantom-claim a memory access at the BD's start offset. The conflict
+detector then ANDs `cycle_core_banks & cycle_dma_banks` and fires
+CONFLICT_DM_BANK_N + MEMORY_STALL whenever the core happens to load
+from the same bank -- e.g., a constructor-table load at offset 0x488
+(bank 0) coinciding with a stalled S2MM "writing" to offset 0x400
+(also bank 0).
+
+In HW the stalled DMA does not issue a memory transaction, so no bank
+arbitration occurs and no conflict event fires.
+
+**Fix**: Move `cycle_dma_banks |= banks_for_access(...)` to *after*
+the `stream_in_count_for_channel(channel) < words_needed` check (and
+inside the decompression branch, after the `has_stream_in_for_channel`
+check). MM2S already gates correctly via the
+`stream_out.len() >= output_fifo_capacity()` check happening *before*
+`transfer_mm2s` is called in `do_transfer`, so no change there.
+
+After the fix, `add_one_using_dma` chess: 0 MEMORY_STALL events, 0
+CONFLICT_DM_BANK_N events (down from 1 stall interval + 2 CONFLICT
+events), matching HW. 2885/2885 lib tests pass. Bridge test passes.
+
 ## What is actually true
 
 1. The bridge test passes on Chess for `add_one_using_dma`.
@@ -355,6 +387,10 @@ Three concrete bugs surfaced, in order of impact:
    pipeline stage than HW does (pre-decode vs post-issue, or
    pre/post-delay-slot resolution). Lower priority than (1) and (2)
    but trivial once those are unblocked.
+
+5. **Spurious MEMORY_STALL (CLOSED 2026-05-12)**: S2MM bank record
+   fired before the stall check, so every stalled cycle phantom-claimed
+   a bank touch. See "Update 2026-05-12" above.
 
 4. **Trace pipeline coalescing investigation** (prerequisite for
    item 2's level-triggered fix). The mystery of "adding
