@@ -521,64 +521,6 @@ discussed elsewhere in this finding, not a perf-counter bug.
 Trace stays CLEAN on `add_one_using_dma`/`add_one_objFifo`/
 `add_one_ctrl_packet` after the fix.
 
-## Update 2026-05-12: PORT_RUNNING/IDLE/STALLED/TLAST level-triggered (#36)
-
-EMU was emitting **zero** PORT_RUNNING/PORT_IDLE/PORT_STALLED/PORT_TLAST
-events; HW emits thousands of PORT_RUNNING per active port. On
-`add_one_using_dma` chess HW batch 00, PORT_RUNNING_2 and PORT_RUNNING_6
-each fire 10848 times across ~6991 kernel cycles.
-
-Root cause: coordinator.rs Phase 3b treated all four events as rising-edge
-triggered, with `prev_port_state` per slot for transition detection.
-This was based on the (incorrect) reasoning that level-triggered emit
-would "flood small trace BDs in milliseconds" -- it doesn't, because
-`TraceUnit::notify_event` filters by `event_slots` at trace_unit/mod.rs:587,
-so only events the kernel asked to capture reach the trace BD. Level
-emission only walks the in-memory event list once per cycle (bounded
-8 slots * configured tiles).
-
-Per AM025 and aie-rt's event enumeration, all four are slot-mapped
-signals derived from combinational port state -- they assert continuously
-while the condition holds, and the trace controller stamps a frame each
-cycle. Empirical HW data confirms (10848 events / kernel = many per
-active cycle, not transitions).
-
-Fix: read `port.cycle_active` / `cycle_stalled` / `cycle_tlast` directly
-each cycle in Phase 3b. `begin_routing_cycle` resets these at the start
-of every `step_data_movement`, so reading them gives the live level
-signal. PORT_TLAST is a 1-cycle pulse (cycle_tlast cleared each cycle),
-so level == edge for it. `prev_port_state` field on `Tile` and its
-reset in `state/effects.rs` are no longer needed; removed.
-
-Edge detector pipeline is unaffected: `notify_*_trace_event` still sets
-`curr_active=true` on each fire, and `evaluate_edge_detectors` compares
-against `prev_active` then resets `curr_active` each cycle. So
-level-triggered notify still produces correct rising/falling edges for
-downstream edge detectors.
-
-After fix on `add_one_using_dma` chess (full trace.log):
-
-```
-PORT_RUNNING_1   8/8 intervals  OK   (HW=1cy each, EMU=8cy each)
-PORT_RUNNING_5   4/4 intervals  OK   (HW=1cy each, EMU=8cy each)
-PORT_RUNNING_0   6/1 intervals  DIFFER (duration)
-PORT_RUNNING_4   7/3 intervals  DIFFER (duration)
-```
-
-Two slots' interval counts now match HW exactly; two slots are still
-short. The pattern across "OK" slots is a constant `dt_dur=-7` cycles
-(EMU's active period is 8 cycles, HW's is 1 cycle, repeated identically
-across 8 and 4 intervals respectively). This is a separate stream-switch
-fidelity issue -- EMU's `Port::cycle_active` stays true for the whole
-duration of a FIFO drain (~8-word burst) where HW asserts PORT_RUNNING
-for one cycle per beat. Tracked as #38; the level-triggered emission is
-faithfully transcribing whatever the underlying port state model says.
-
-cargo test --lib: 2889/2889 pass. Broad bridge sweep (chess-only):
-60 pass / 0 regressions / 36 trace clean / 0 diverged. Two pre-existing
-fails unchanged (`vec_mul_event_trace` NPU2-only, `vec_mul_trace_distribute_lateral`
-Chess compile segfault).
-
 ## Other items
 
 5. **Spurious MEMORY_STALL (CLOSED 2026-05-12)**: S2MM bank record
