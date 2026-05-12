@@ -222,7 +222,7 @@ fn counter_does_not_increment_when_idle() {
 }
 
 #[test]
-fn reset_event_zeroes_counter_and_goes_idle() {
+fn reset_event_zeroes_counter_and_keeps_running() {
     let mut bank = PerfCounterBank::new(4);
     // start=10, stop=0
     bank.write_control_start_stop(10, 0, 1, 7);
@@ -231,28 +231,40 @@ fn reset_event_zeroes_counter_and_goes_idle() {
 
     bank.handle_event(10); // start
     for _ in 0..50 {
-        bank.tick_active_cycles();
+        bank.tick();
     }
     assert_eq!(bank.read_counter(0), 50);
     assert!(bank.is_active(0));
 
-    bank.handle_event(20); // reset
+    // Per aie-rt's `XAie_PerfCounterReset`, the reset event zeros the
+    // counter register but does NOT halt the counter. The self-reset
+    // threshold-firing pattern (reset_event = PERF_CNT_N) needs this:
+    // after firing, the counter keeps ticking and the next threshold
+    // arrives one period later.
+    bank.handle_event(20);
     assert_eq!(bank.read_counter(0), 0);
-    assert!(!bank.is_active(0));
+    assert!(bank.is_active(0));
+
+    for _ in 0..5 {
+        bank.tick();
+    }
+    assert_eq!(bank.read_counter(0), 5);
 }
 
 #[test]
-fn reset_event_takes_priority_over_start() {
+fn reset_and_start_on_same_event_both_apply() {
     let mut bank = PerfCounterBank::new(4);
-    // Both start and reset are the same event
-    bank.write_control_start_stop(10, 0, 1, 7); // start=10
-    bank.write_control_reset(10, 7); // reset=10
+    // The same event is configured as both start and reset.
+    bank.write_control_start_stop(10, 0, 1, 7);
+    bank.write_control_reset(10, 7);
 
+    // Prime the counter so we can see the reset zero it.
     bank.write_counter(0, 100);
     bank.handle_event(10);
-    // Reset should take priority: counter zeroed, state is Idle
+
+    // Both effects apply: reset zeros the value, start arms the counter.
     assert_eq!(bank.read_counter(0), 0);
-    assert!(!bank.is_active(0));
+    assert!(bank.is_active(0));
 }
 
 #[test]
@@ -639,37 +651,38 @@ fn same_event_for_multiple_counters() {
 /// ACTIVE_CORE event ID on AIE2 (per aie-rt xaiemlgbl_reginit.c / xaie_events_aieml.h).
 const EVENT_ACTIVE_CORE: u8 = 0x1C;
 
+/// Once ACTIVE_CORE has armed the counter, every subsequent cycle
+/// increments it -- including cycles when the core is stalled, blocked
+/// on a DMA, or otherwise out of Execute state. ACTIVE_CORE is the
+/// `XAIE_EVENT_ACTIVE_CORE` *transition* (start trigger), not a level
+/// gate; HW perf counters are duration counters that run until
+/// `XAIE_EVENT_DISABLED_CORE` halts them. See the `EventMonitor pc0(...
+/// XAIE_EVENT_ACTIVE_CORE, XAIE_EVENT_DISABLED_CORE, ...)` pattern in
+/// mlir-aie's `05_Core_Startup` benchmark, which measures total core
+/// lifetime cycles by counting between those two transitions.
 #[test]
-fn active_core_ticks_only_while_core_active() {
+fn active_core_started_counter_ticks_every_cycle() {
     let mut bank = PerfCounterBank::new(4);
-    // Configure counter 0: start=ACTIVE_CORE, stop=0 (none), counter_hi=1, event_width=7
-    bank.write_control_start_stop(
-        EVENT_ACTIVE_CORE as u32, // start0=0x1C, stop0=0, start1=0, stop1=0
-        0,
-        1,
-        7,
-    );
-    // Fire start event -> counter 0 becomes Active.
+    bank.write_control_start_stop(EVENT_ACTIVE_CORE as u32, 0, 1, 7);
     bank.handle_event(EVENT_ACTIVE_CORE);
     assert!(bank.is_active(0));
 
-    // 10 active cycles.
     for _ in 0..10 {
-        bank.tick_active_cycles();
+        bank.tick();
     }
     assert_eq!(bank.read_counter(0), 10);
 
-    // 5 idle cycles (core stalled / blocked / disabled).
+    // Cycles where the core is stalled / blocked / disabled still tick
+    // the counter -- the duration counter is not gated by Execute state.
     for _ in 0..5 {
-        bank.tick_idle_cycles();
+        bank.tick();
     }
-    assert_eq!(bank.read_counter(0), 10, "counter must not tick while core is idle");
+    assert_eq!(bank.read_counter(0), 15);
 
-    // 10 more active cycles.
     for _ in 0..10 {
-        bank.tick_active_cycles();
+        bank.tick();
     }
-    assert_eq!(bank.read_counter(0), 20);
+    assert_eq!(bank.read_counter(0), 25);
 }
 
 #[test]

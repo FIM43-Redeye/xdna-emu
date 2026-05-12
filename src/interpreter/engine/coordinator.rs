@@ -1122,27 +1122,38 @@ impl InterpreterEngine {
                 // event doesn't match are unaffected. Stop and reset events
                 // still take priority inside handle_event() per its existing
                 // ordering.
+                //
+                // ACTIVE_CORE is an edge-style start event: it pulses on
+                // transition to Execute and arms the counter. Once Active,
+                // the counter ticks every cycle regardless of whether the
+                // core is still in Execute -- HW perf counters are duration
+                // counters started by ACTIVE_CORE and stopped by
+                // DISABLED_CORE, not gated per cycle on Execute state.
                 tile.core_perf_counters.handle_event(TRUE_EVENT);
                 if core_active {
                     tile.core_perf_counters.handle_event(ACTIVE_CORE_EVENT);
                 }
                 tile.mem_perf_counters.handle_event(TRUE_EVENT);
 
-                let core_fired = if core_active {
-                    tile.core_perf_counters.tick_active_cycles()
-                } else {
-                    tile.core_perf_counters.tick_idle_cycles()
-                };
-                for cnt_idx in core_fired {
-                    let hw_id = PERF_CNT_BASE + cnt_idx as u8;
-                    // Feed back so self-reset configs work, then trace-notify.
-                    // Perf counter threshold events carry no instruction PC.
-                    tile.core_perf_counters.handle_event(hw_id);
-                    tile.notify_core_trace_event(hw_id, cycle, None);
+                let core_fired = tile.core_perf_counters.tick();
+                if !core_fired.is_empty() {
+                    // Snapshot the core's pipeline-adjusted PC for trace
+                    // stamping. tile.core.pc is updated each cycle from the
+                    // core context (Phase 2) and includes the stall-PC
+                    // pipeline adjustment, so it matches what HW's trace
+                    // controller would sample when the perf-counter
+                    // threshold fires.
+                    let core_pc = tile.core.pc;
+                    for cnt_idx in core_fired {
+                        let hw_id = PERF_CNT_BASE + cnt_idx as u8;
+                        // Feed back so self-reset configs work, then trace-notify.
+                        tile.core_perf_counters.handle_event(hw_id);
+                        tile.notify_core_trace_event(hw_id, cycle, Some(core_pc));
+                    }
                 }
 
                 // Memory module perf counters tick unconditionally.
-                let mem_fired = tile.mem_perf_counters.tick_active_cycles();
+                let mem_fired = tile.mem_perf_counters.tick();
                 for cnt_idx in mem_fired {
                     let hw_id = PERF_CNT_BASE + cnt_idx as u8;
                     tile.mem_perf_counters.handle_event(hw_id);
@@ -2171,12 +2182,15 @@ mod tests {
     ///     -> commit_cycle -> encode_event_pc(mask, pc=0)
     ///     -> 4-byte EventPC frame in byte_buffer
     ///
-    /// The sentinel pc=0 is expected behavior per the trace_unit doc comment:
-    /// hardware records one PC per frame, and perfcnt threshold events carry
-    /// no instruction PC, so we encode PC=0.  This test pins down that the
-    /// pipeline doesn't crash, drop the event, or emit a malformed frame.
+    /// PERF_CNT_N events stamp the frame with the core's current PC (the
+    /// same value HW samples when the threshold fires), so a counter that
+    /// crosses threshold mid-execution shows up in mode-1 frames at the
+    /// in-flight PC rather than as a PC=0 sentinel. HW emits the same:
+    /// real captures of `add_one_using_dma` show PERF_CNT_2 frames stamped
+    /// with PCs in the compute body and in the lock-stall pipeline PC
+    /// (e.g., 204 and 832), never 0.
     #[test]
-    fn perfcnt_threshold_routes_to_mode1_event_pc_frame_with_sentinel_pc() {
+    fn perfcnt_threshold_routes_to_mode1_event_pc_frame_with_core_pc() {
         use xdna_archspec::aie2::trace_events::core_events::PERF_CNT_0;
 
         let mut engine = InterpreterEngine::new_npu1();
@@ -2220,13 +2234,9 @@ mod tests {
         );
 
         // After 8-byte start marker, expect at least one EventPC frame.
-        // Discriminator: (b & 0b1111_1100) == 0b1100_0100.
-        // The threshold-firing frame uses mask = 0b00000001 (slot 0) and
-        // pc = 0 (sentinel for perfcnt's None PC):
-        //   byte0 = 0xC4 | 0 = 0xC4
-        //   byte1 = (1 & 0x3F) << 2 = 0x04
-        //   byte2 = (0 >> 8) & 0x3F = 0x00
-        //   byte3 = 0 & 0xFF = 0x00
+        // Discriminator: (b & 0b1111_1100) == 0b1100_0100, mask=0b1 (slot 0).
+        // The 5th NOP issues at PC=0x14 (each NOP advances PC by 4 bytes,
+        // 5 cycles after PC=0 -> PC=0x14), so byte3 = 0x14.
         assert!(
             bytes.len() >= 12,
             "expected >= 12 bytes (8-byte Start + 4-byte EventPC); got {}: {:02X?}",
@@ -2236,9 +2246,9 @@ mod tests {
         let frame = &bytes[8..12];
         assert_eq!(
             frame,
-            &[0xC4, 0x04, 0x00, 0x00],
+            &[0xC4, 0x04, 0x00, 0x14],
             "perfcnt threshold did not produce expected mode-1 EventPC frame \
-             (mask=0b1, sentinel pc=0); got {:02X?}.  Full buffer: {:02X?}",
+             (mask=0b1, pc=0x14 at firing cycle); got {:02X?}.  Full buffer: {:02X?}",
             frame,
             bytes
         );

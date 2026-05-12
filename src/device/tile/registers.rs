@@ -15,8 +15,8 @@ impl Tile {
     ///
     /// Returns 0 for unwritten registers (default state).
     pub fn read_register(&mut self, offset: u32) -> u32 {
-        use xdna_archspec::aie2::registers::memory as mm;
         use xdna_archspec::aie2::registers::mem_tile as mt;
+        use xdna_archspec::aie2::registers::memory as mm;
         let reg_layout = super::super::regdb::device_reg_layout();
 
         // Lock_Request register - address encodes operation parameters
@@ -212,8 +212,8 @@ impl Tile {
     /// Reading from this address performs the operation and returns:
     /// - Bit 0: 1 if operation succeeded, 0 if it would stall/fail
     fn handle_lock_request(&mut self, offset: u32, is_memtile: bool) -> u32 {
-        use xdna_archspec::aie2::registers::memory as mm;
         use xdna_archspec::aie2::registers::mem_tile as mt;
+        use xdna_archspec::aie2::registers::memory as mm;
 
         let base = if is_memtile {
             mt::LOCK_REQUEST_BASE

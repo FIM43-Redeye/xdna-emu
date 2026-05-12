@@ -317,21 +317,22 @@ impl PerfCounterBank {
     /// State transitions:
     /// - Start event: Idle -> Active, Stopped -> Active
     /// - Stop event: Active -> Stopped
-    /// - Reset event: any state -> Idle, counter value zeroed
+    /// - Reset event: counter value zeroed; run state preserved
     ///
-    /// Note: if both start and reset fire on the same event ID, reset
-    /// takes priority (counter is zeroed and goes to Idle).
+    /// Reset is independent of the start/stop state machine: per aie-rt's
+    /// `XAie_PerfCounterReset`, a reset zeros the counter register but does
+    /// not stop it. The common "self-reset" pattern (`reset_event =
+    /// PERF_CNT_N`) relies on this -- after the threshold fires and the
+    /// counter zeroes, it keeps ticking and fires again every period.
     pub fn handle_event(&mut self, event_id: u8) {
         if event_id == 0 {
             return; // Event 0 = NONE, never matches
         }
 
         for i in 0..self.num_counters {
-            // Reset takes priority over start/stop
+            // Reset zeros the counter value but does not change run state.
             if self.reset_event[i] == event_id && self.reset_event[i] != 0 {
                 self.counter_value[i] = 0;
-                self.state[i] = CounterState::Idle;
-                continue;
             }
 
             // Stop takes priority over start (if same event is both start and stop,
@@ -353,48 +354,23 @@ impl PerfCounterBank {
         }
     }
 
-    /// ACTIVE_CORE event ID on AIE2.
+    /// Advance every Active counter by one cycle and return the indices of
+    /// any that crossed their threshold this cycle.
     ///
-    /// Per `aie-rt/driver/src/events/xaie_events_aieml.h:63`,
-    /// `XAIE_EVENT_ACTIVE_CORE_CORE = 28 = 0x1C`. A counter configured
-    /// with this start event is level-gated on the core Execute state: it
-    /// should tick only while the core is actually executing an instruction,
-    /// not while stalled on a lock, DMA, cascade, or disabled.
-    const EVENT_ACTIVE_CORE: u8 = 0x1C;
-
-    /// Advance counters for a cycle during which the core is in Execute state.
+    /// Hardware perf counters are duration counters: once a `start_event`
+    /// pulses the counter into the Active state, it ticks every cycle until
+    /// a `stop_event` halts it, regardless of whether the core itself is
+    /// executing or stalled. ACTIVE_CORE (0x1C) and DISABLED_CORE
+    /// (`XAIE_EVENT_DISABLED_CORE`) are edge events used as start/stop
+    /// triggers, NOT level-asserted per-cycle gates -- so the counter must
+    /// NOT pause when the core stalls.
     ///
-    /// All active counters increment, regardless of their start event.
-    /// Returns a vector of counter indices that reached their event value
-    /// threshold this cycle. Counter values wrap at u32::MAX (matching
-    /// 32-bit hardware counters).
-    pub fn tick_active_cycles(&mut self) -> Vec<usize> {
-        self.tick_internal(true)
-    }
-
-    /// Advance counters for a cycle during which the core is NOT in Execute
-    /// state (stalled on lock/DMA/cascade, halted, or disabled).
-    ///
-    /// Counters whose `start_event` is `EVENT_ACTIVE_CORE` (0x1C) do not
-    /// tick — they are level-gated on core Execute state. All other active
-    /// counters (pulse-started) still tick.
-    ///
-    /// Returns a vector of counter indices that reached their threshold
-    /// this cycle.
-    pub fn tick_idle_cycles(&mut self) -> Vec<usize> {
-        self.tick_internal(false)
-    }
-
-    fn tick_internal(&mut self, core_active: bool) -> Vec<usize> {
+    /// Counter values wrap at u32::MAX (matching 32-bit hardware counters).
+    pub fn tick(&mut self) -> Vec<usize> {
         let mut threshold_events = Vec::new();
 
         for i in 0..self.num_counters {
             if self.state[i] != CounterState::Active {
-                continue;
-            }
-
-            // Level-gated counters: skip when core is not in Execute state.
-            if self.start_event[i] == Self::EVENT_ACTIVE_CORE && !core_active {
                 continue;
             }
 
@@ -408,6 +384,20 @@ impl PerfCounterBank {
         }
 
         threshold_events
+    }
+
+    /// Deprecated: use [`tick`]. Retained for source compatibility with
+    /// callers that pre-date the duration-counter fix; both variants now
+    /// behave identically.
+    #[deprecated(note = "perf counters tick every cycle regardless of core state; use tick()")]
+    pub fn tick_active_cycles(&mut self) -> Vec<usize> {
+        self.tick()
+    }
+
+    /// Deprecated: use [`tick`]. See [`tick_active_cycles`].
+    #[deprecated(note = "perf counters tick every cycle regardless of core state; use tick()")]
+    pub fn tick_idle_cycles(&mut self) -> Vec<usize> {
+        self.tick()
     }
 
     // -- Register Interface --
