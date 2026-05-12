@@ -60,8 +60,8 @@ pub use registers::{
     validate_register_model,
 };
 pub use context::{
-    ExecutionContext, SpRegister, TimingContext, EventLog, EventType, TimestampedEvent, PendingBranch,
-    PendingWrite, SrsConfig,
+    DeferredPcKind, EventLog, EventType, ExecutionContext, PendingBranch, PendingDeferredEvent, PendingWrite,
+    SpRegister, SrsConfig, TimestampedEvent, TimingContext, TRACE_PC_PIPELINE_DEPTH,
 };
 
 #[cfg(test)]

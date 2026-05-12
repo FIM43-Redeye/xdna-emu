@@ -4,8 +4,54 @@
 //! `PendingBranch` (delay slot modeling), and `SrsConfig` (vector control
 //! register state for SRS/UPS operations).
 
+use std::collections::VecDeque;
+
 use super::event_trace::{EventLog, EventType};
 use crate::interpreter::timing::{HazardDetector, LatencyTable, MemoryModel};
+
+// ============================================================================
+// Trace Pipeline Modeling
+// ============================================================================
+
+/// AIE2 trace controller PC sampling depth (in cycles) for instruction events.
+///
+/// HW's trace controller observes instruction-completion signals from a deep
+/// pipeline stage and stamps each frame with the current issue-stage PC at
+/// commit time. By that point the core has advanced several bundles past the
+/// instruction that triggered the event, so the PC carried in the frame is
+/// systematically later than the issue PC.
+///
+/// Empirical fit for INSTR_LOCK_ACQUIRE_REQ on `add_one_using_dma`:
+///   acq at PC 0x330, HW frame carries PC 0x33C (+12 bytes) -- four 1-cycle
+///   post-acq bundles (ret, nop, nop, nop) past the issue. The same lag
+///   model is reused for the other Instr* events emitted from `control.rs`.
+pub const TRACE_PC_PIPELINE_DEPTH: u64 = 4;
+
+/// Which deferred-PC event kind to materialize when the pipeline drain fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferredPcKind {
+    InstrLockAcquireReq,
+}
+
+impl DeferredPcKind {
+    fn to_event(self, pc: u32) -> EventType {
+        match self {
+            Self::InstrLockAcquireReq => EventType::InstrLockAcquireReq { pc },
+        }
+    }
+}
+
+/// A scheduled event whose PC will be sampled `record_at_cycle` cycles later
+/// than its trigger, modeling the trace controller pipeline depth.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingDeferredEvent {
+    /// Cycle at which the event was triggered (e.g., acq success cycle).
+    pub trigger_cycle: u64,
+    /// Cycle at which to materialize the event with the then-current PC.
+    pub record_at_cycle: u64,
+    /// Which event variant to build.
+    pub kind: DeferredPcKind,
+}
 
 // ============================================================================
 // Timing Context
@@ -36,6 +82,11 @@ pub struct TimingContext {
 
     /// Event log for profiling/tracing.
     pub events: EventLog,
+
+    /// Events whose PC is sampled some cycles after their trigger, to model
+    /// the HW trace controller pipeline depth. Drained from the front by the
+    /// core step path with the current issue-stage PC.
+    pub pending_deferred_pc: VecDeque<PendingDeferredEvent>,
 }
 
 impl TimingContext {
@@ -48,6 +99,7 @@ impl TimingContext {
             hazard_stalls: 0,
             memory_stalls: 0,
             events: EventLog::new(),
+            pending_deferred_pc: VecDeque::new(),
         }
     }
 
@@ -64,6 +116,7 @@ impl TimingContext {
         self.hazard_stalls = 0;
         self.memory_stalls = 0;
         self.events.clear();
+        self.pending_deferred_pc.clear();
     }
 
     /// Enable event tracing.
@@ -80,6 +133,39 @@ impl TimingContext {
     #[inline]
     pub fn record_event(&mut self, cycle: u64, event: EventType) {
         self.events.record(cycle, event);
+    }
+
+    /// Schedule an instruction event whose PC must be sampled `delay` cycles
+    /// after its trigger, to model the HW trace controller's pipeline depth.
+    /// Called by execute handlers at the cycle of issue/retire; drained later
+    /// by the core step path via [`drain_deferred_pc`].
+    ///
+    /// No-op when tracing is disabled.
+    #[inline]
+    pub fn record_event_with_pc_delay(&mut self, trigger_cycle: u64, delay: u64, kind: DeferredPcKind) {
+        if !self.events.is_enabled() {
+            return;
+        }
+        self.pending_deferred_pc.push_back(PendingDeferredEvent {
+            trigger_cycle,
+            record_at_cycle: trigger_cycle + delay,
+            kind,
+        });
+    }
+
+    /// Materialize any deferred-PC events whose recording cycle has been
+    /// reached, stamping each with `current_pc` (the issue-stage PC visible
+    /// to the trace controller at drain time). Recorded with the drain cycle
+    /// so frame ordering tracks pipeline-commit order rather than trigger
+    /// order.
+    pub fn drain_deferred_pc(&mut self, current_cycle: u64, current_pc: u32) {
+        while let Some(front) = self.pending_deferred_pc.front() {
+            if front.record_at_cycle > current_cycle {
+                break;
+            }
+            let de = self.pending_deferred_pc.pop_front().unwrap();
+            self.events.record(current_cycle, de.kind.to_event(current_pc));
+        }
     }
 
     /// Get combined timing statistics.
@@ -255,5 +341,70 @@ mod tests {
         timing.disable_tracing();
         timing.record_event(30, EventType::CoreDisabled);
         assert_eq!(timing.events.len(), 1); // No new event recorded
+    }
+
+    #[test]
+    fn test_deferred_pc_fires_at_target_with_current_pc() {
+        let mut timing = TimingContext::new();
+        timing.enable_tracing();
+
+        // Acq succeeds at cycle 100, issue PC 0x330.
+        timing.record_event_with_pc_delay(100, TRACE_PC_PIPELINE_DEPTH, DeferredPcKind::InstrLockAcquireReq);
+
+        // Before the target cycle (100+4=104), drain is a no-op.
+        timing.drain_deferred_pc(103, 0x33A);
+        assert!(timing.events.is_empty(), "must not fire before target cycle");
+
+        // At target cycle, drain emits the event with the current PC (the
+        // 4th post-acq bundle in the kernel, 0x33C).
+        timing.drain_deferred_pc(104, 0x33C);
+        let evs = timing.events.events();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].cycle, 104, "frame cycle reflects pipeline-commit time");
+        assert!(matches!(evs[0].event, EventType::InstrLockAcquireReq { pc: 0x33C }));
+
+        // Queue is empty; further drain is a no-op.
+        timing.drain_deferred_pc(200, 0x999);
+        assert_eq!(timing.events.events().len(), 1);
+    }
+
+    #[test]
+    fn test_deferred_pc_disabled_tracing_drops_event() {
+        let mut timing = TimingContext::new();
+        // Tracing disabled -> scheduling is a no-op.
+        timing.record_event_with_pc_delay(0, 4, DeferredPcKind::InstrLockAcquireReq);
+        timing.drain_deferred_pc(100, 0x33C);
+        assert!(timing.events.is_empty());
+    }
+
+    #[test]
+    fn test_deferred_pc_multiple_events_fire_in_order() {
+        let mut timing = TimingContext::new();
+        timing.enable_tracing();
+
+        timing.record_event_with_pc_delay(100, 4, DeferredPcKind::InstrLockAcquireReq);
+        timing.record_event_with_pc_delay(105, 4, DeferredPcKind::InstrLockAcquireReq);
+
+        // Drain at cycle 104: only the first event is ready.
+        timing.drain_deferred_pc(104, 0x33C);
+        assert_eq!(timing.events.events().len(), 1);
+
+        // Drain at cycle 110: second event fires too, with PC at that cycle.
+        timing.drain_deferred_pc(110, 0x33C);
+        let evs = timing.events.events();
+        assert_eq!(evs.len(), 2);
+        assert!(matches!(evs[0].event, EventType::InstrLockAcquireReq { pc: 0x33C }));
+        assert!(matches!(evs[1].event, EventType::InstrLockAcquireReq { pc: 0x33C }));
+    }
+
+    #[test]
+    fn test_deferred_pc_reset_clears_queue() {
+        let mut timing = TimingContext::new();
+        timing.enable_tracing();
+        timing.record_event_with_pc_delay(100, 4, DeferredPcKind::InstrLockAcquireReq);
+        assert_eq!(timing.pending_deferred_pc.len(), 1);
+
+        timing.reset();
+        assert_eq!(timing.pending_deferred_pc.len(), 0);
     }
 }

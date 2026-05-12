@@ -272,11 +272,18 @@ impl ControlUnit {
                         // on Success so retries during WaitLock stalls don't inflate
                         // the count -- for tests that complete, every acquire
                         // eventually succeeds exactly once, matching HW 1:1.
-                        let pc = ctx.pc();
+                        //
+                        // PC is sampled with a pipeline-depth delay rather than
+                        // taken from the issuing acq instruction, because HW's
+                        // trace controller observes the acq-success signal at a
+                        // late pipeline stage and stamps the frame with the
+                        // then-current issue PC. Empirically that lands ~4 cyc
+                        // (one ret + three delay-slot nops) past the acq.
                         let cycle = ctx.cycles;
-                        ctx.timing_context_mut().record_event(
+                        ctx.timing_context_mut().record_event_with_pc_delay(
                             cycle,
-                            crate::interpreter::state::EventType::InstrLockAcquireReq { pc },
+                            crate::interpreter::state::TRACE_PC_PIPELINE_DEPTH,
+                            crate::interpreter::state::DeferredPcKind::InstrLockAcquireReq,
                         );
                         Some(ExecuteResult::Continue)
                     }

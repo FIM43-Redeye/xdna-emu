@@ -27,7 +27,9 @@ use crate::interpreter::traits::{Flags, StateAccess};
 // Re-export types that were previously defined in this file. Downstream code
 // that imports via `super::context::EventType` etc. continues to compile.
 pub use super::event_trace::{EventLog, EventType, TimestampedEvent};
-pub use super::timing_context::{PendingBranch, SrsConfig, TimingContext};
+pub use super::timing_context::{
+    DeferredPcKind, PendingBranch, PendingDeferredEvent, SrsConfig, TimingContext, TRACE_PC_PIPELINE_DEPTH,
+};
 
 /// Snapshot of a ZOL boundary event for trace + diagnostic use.
 ///

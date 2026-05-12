@@ -150,6 +150,13 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
             return result;
         }
 
+        // Drain any deferred-PC events whose target cycle has been reached,
+        // stamping each with the current issue PC. Models the HW trace
+        // controller's PC sampling pipeline depth; see TRACE_PC_PIPELINE_DEPTH.
+        let current_cycle = ctx.cycles;
+        let current_pc = ctx.pc();
+        ctx.timing_context_mut().drain_deferred_pc(current_cycle, current_pc);
+
         // Fetch instruction bytes from program memory
         let pc = ctx.pc();
         let program_mem = match tile.program_memory() {
@@ -425,6 +432,12 @@ where
         if let Some(result) = self.try_resume_stall(ctx, tile, None) {
             return result;
         }
+
+        // Drain any deferred-PC events whose target cycle has been reached.
+        // See step_internal for rationale.
+        let current_cycle = ctx.cycles;
+        let current_pc = ctx.pc();
+        ctx.timing_context_mut().drain_deferred_pc(current_cycle, current_pc);
 
         // Fetch instruction bytes from program memory
         let pc = ctx.pc();
