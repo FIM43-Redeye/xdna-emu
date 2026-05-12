@@ -1,31 +1,129 @@
 ---
-name: 'EMU DMA pipeline runs ~2.4x faster than HW, causing compute core to miss subsequent stall windows after the head-of-line wait'
-description: On add_one_using_dma the EMU compute core stalls once (cycles 473-605 of trace) waiting for the initial DMA fill, then sails through 4 iterations × 4 acquires (16 logical acquires) without ever stalling again. HW stalls at multiple iteration boundaries (cycles 32, 9410, 20693, 25724, 26459+, 27281+) because the DMA refill rate falls behind the compute drain rate. Root cause: EMU's DMA fill cycle per buffer (~35 cyc/BD on compute S2MM) is ~2.4x faster than HW's effective rate (~2625 cyc/buffer in HW vs ~1088 in EMU after head-of-line). Downstream symptom: EMU emits 22 LOCK_STALL and 4 INSTR_LOCK_ACQUIRE_REQ events vs HW's 24 and 2339 -- but only because EMU has one stall window where HW has six. The event-emission code is roughly correct; the trace-content gap is a DMA-modeling gap. Probable contributors: stream-switch traversal latency unmodeled (each hop is ~1 cyc in EMU), per-BD turnover at memtile possibly over-pipelined by recent #26 fix, DDR refill rate too aggressive on the shim path. Calibration task on the scale of #24 (mailbox latency), not a quick fix. Stream-switch traversal latency is the most likely single-knob contributor and the planned next step.
+name: 'EMU compute trace cycle counter jumps ~247k mid-stream (NOT a DMA pipeline rate gap; original framing was wrong)'
+description: On add_one_using_dma the EMU compute trace emits a tight cluster of events at cycle ~247060, even though the entire EMU coordinator run is 14673 cycles. The original framing of this finding -- "EMU DMA pipeline 2.4x faster than HW, causing missed stall windows" -- was based on misinterpreting these inflated trace timestamps as real timing. A clean HW+EMU bridge run on 2026-05-11 showed the event-content comparison is CLEAN (6/6 pre-jump pairs within +/-5 cyc), and the visible divergence is a cycle-stamp jump of ~247k cyc inside the EMU trace pipeline. The DMA pipeline isn't too fast, the per-buffer rate isn't 2.4x off, and the recent #26 fix didn't over-correct. The actual bug is in the EMU's compute-tile trace timestamp generation, likely a tile-local cycle counter that desynchronizes from the coordinator clock partway through the run.
 type: project
 ---
 
-# EMU DMA pipeline too fast -- compute misses subsequent stall windows
+# Originally: EMU DMA pipeline too fast. Actually: EMU compute trace cycle-stamp bug.
 
-## TL;DR
+## TL;DR (revised 2026-05-11)
 
-On `add_one_using_dma`, the EMU compute core stalls *once* at the
-head-of-line and then runs all 4 iterations × 4 acquires (16 logical
-acquires) without re-stalling. HW stalls at *multiple* iteration
-boundaries. The reason is not a trace-emission bug: it is that the
-EMU's DMA pipeline (shim → memtile → compute) is **~2.4x faster per
-buffer than HW**, so the producer is always ahead of the consumer
-and the consumer never waits.
+**The "2.4x DMA gap" framing in the original write-up was wrong.**
 
-This is upstream of three open trace-divergence symptoms
-(NEXT-STEPS.md naming):
+A clean HW + EMU bridge run on `add_one_using_dma` after the doc was
+written shows:
 
-- **#353** LOCK_STALL undercount -- 22 in EMU vs 24 in HW
-- **#354** PERF_CNT_0 / PERF_CNT_2 undercount -- 63 vs 56 (actually
-  *over*count post my recent fixes, but the count is roughly right)
-- **#355** EMU kernel-activity cycle range short vs HW -- 14655 vs
-  ~27340
+- Bridge test: PASS, both sides
+- Trace comparison: **CLEAN**
+- First 6 event pairs: within +/-5 cyc (HW vs EMU)
+- Divergence at pair 5: EMU's compute-tile trace cycle jumps from
+  cy 18 to cy 247060 between consecutive events, then all subsequent
+  events cluster in cy 247060-247170
+- EMU coordinator total: **14673 cyc** (XDNA_EMU_STATUS) -- the
+  "247060 cyc" event timestamp is ~17x larger than the entire run
 
-All three are downstream of the same root cause.
+That jump is a trace-pipeline artifact, not a real timing gap. The
+DMA pipeline rate, the per-BD turnover, and the stream-switch
+latencies are all roughly correct. The previous "HW = 27340 cyc"
+total in this doc was derived from the inflated EMU trace stamps,
+not real cycles -- the actual HW kernel-activity window is in the
+low single thousands of cycles, similar to EMU.
+
+## What was originally claimed (and is now retracted)
+
+- ❌ "EMU DMA pipeline is 2.4x faster per buffer than HW"
+- ❌ "Compute core misses 5/6 stall windows because producer is too
+  fast"
+- ❌ "Stream-switch traversal latency is the most likely single-knob
+  contributor"
+- ❌ Recommendations to recalibrate DMA / lock-arbiter / DDR rates
+
+These were derived from comparing EMU's inflated compute-tile trace
+timestamps against HW's normal timestamps. The comparison wasn't
+apples-to-apples, so the gap it showed wasn't real.
+
+## What is actually true
+
+1. The bridge test passes on Chess for `add_one_using_dma`.
+2. The trace-comparison's pre-divergence portion (the apples-to-apples
+   part) is clean.
+3. **The visible "divergence" is a trace-decoder mode mismatch in the
+   bridge pipeline.** Both HW and EMU encode the compute-tile trace
+   in mode 1 (EventPC -- the Trace_Control0 value 0x79860081 has
+   low bits = 0b01 = mode 1, confirmed by 0xf1 Start opcode in both
+   raw trace BOs). But `scripts/emu-bridge-test.sh` invokes
+   `parse-trace.py` without `--trace-mode auto`, so the script
+   defaults to `--trace-mode event_time` (mode 0). The mode-0
+   decoder happily parses mode-1 EventPC frames as Multiple/Single
+   opcodes with cycle deltas, accumulating bogus cycle counters
+   like 247060 on the EMU side and noisy-but-smaller values on the
+   HW side. Both sides are misdecoded, but in different ways,
+   producing the false visible "gap."
+4. **The real EMU trace fidelity issues, surfaced once mode-1 is
+   decoded correctly:**
+   - HW emits LOCK_STALL ~4400 times at PC 832 (every WaitLock
+     poll cycle). EMU emits LOCK_STALL twice at PC 0.
+     `event_pc(LockStall) -> None` in `src/trace/mod.rs:865`, so
+     mode-1 encoding stamps it with PC=0 instead of the WaitLock
+     instruction PC. Also EMU is edge-triggered (one event per
+     entry into WaitLock) rather than level (one per polling cyc).
+   - HW PC for `INSTR_LOCK_ACQUIRE_REQ` is 828; EMU PC is 816 (12
+     instructions / 24 bytes off). Same compiled binary, so this
+     is an EMU-side bookkeeping bug -- likely capturing PC at the
+     wrong pipeline stage (pre-decode vs post-issue).
+   - HW emits MEMORY_STALL at... unclear in the raw data. EMU
+     emits MEMORY_STALL at PC=0 (sentinel) three times.
+5. Two sensitivity probes (stream-switch latency +5x, per-BD turnover
+   +50 cyc) both moved EMU total cycles by less than 1%, confirming
+   those are not the gap drivers either.
+
+## Probes I ran while pursuing the wrong framing
+
+For the record, since the data is informative on what *doesn't*
+drive EMU/HW divergence:
+
+### Probe 1: Stream-switch traversal latency
+
+Bumped `STREAM_LOCAL_TO_LOCAL_LATENCY` 3->15,
+`STREAM_LOCAL_TO_EXTERNAL_LATENCY` 4->20, and
+`STREAM_EXTERNAL_TO_EXTERNAL_LATENCY` 4->20 (5x amplification across
+the board). Re-ran `add_one_using_dma` on Chess:
+
+- Baseline: 14673 cyc
+- 5x latency: 14762 cyc
+- Delta: +89 cyc (0.6%)
+
+The constants are correctly wired (intra-tile latency in
+`stream_switch::step`/`switch_pipeline`, inter-tile in
+`propagate_inter_tile`/`ROUTE_PER_HOP`), but the +89 cyc is all
+head-of-line / cold-start. Once the pipeline is primed, words flow
+at the slowest stage's rate independent of traversal latency. Not a
+per-buffer knob.
+
+### Probe 2: Per-BD turnover under backpressure
+
+Added +50 cyc post-grant cooldown in `enter_chained_bd` (stepping.rs
+line 441). This injects 50 cyc after each chained-BD lock grant
+before transfer begins. Re-ran:
+
+- Baseline: 14673 cyc
+- +50 cyc cooldown: 14742 cyc
+- Delta: +69 cyc (0.5%)
+
+The probe was absorbed because the DMA channels in
+`add_one_using_dma` are *consumer-bound*: each channel waits ~130
+cyc per buffer for compute to release the lock, and the +50 cyc
+post-grant just compresses that wait time on the next acquire. Not
+a per-buffer knob either.
+
+### Probe 3: Compute bundle latency
+
+Added `ctx.cycles += 2` after `record_instruction(1)` in
+`cycle_accurate.rs::execute_internal`. Zero effect on total cycles:
+the coordinator's `total_cycles` advances per coordinator step, not
+per core bundle, and `add_one_using_dma` is mailbox-bound (~8000
+cyc of `#24` modeling at the tail). Slowing the core internally
+doesn't slow the coordinator wall-clock.
 
 ## Investigation context
 
@@ -145,14 +243,28 @@ zero-pays.
 
 Concretely, the candidate sources of the missing 2.4x:
 
-### 1. Stream switch traversal latency (most likely single contributor)
+### 1. Stream switch traversal latency (RULED OUT as a single-knob fix)
 
-`STREAM_LOCAL_TO_LOCAL_LATENCY`, `STREAM_LOCAL_TO_EXTERNAL_LATENCY`,
-`STREAM_EXTERNAL_TO_EXTERNAL_LATENCY` constants exist in archspec
-but I have not verified they are enforced on the data path
-end-to-end. If a word traverses shim → memtile → compute through
-two stream-switch hops with, say, 2-4 cyc per hop, that adds 4-8
-cyc per buffer-byte-stream, summing to large per-buffer overhead.
+Investigated 2026-05-11 after the original write-up. Constants are
+wired: `STREAM_LOCAL_TO_LOCAL_LATENCY=3` and
+`STREAM_EXTERNAL_TO_EXTERNAL_LATENCY=4` (model_builder.rs:210-213) are
+applied per-route in the intra-tile pipeline
+(`stream_switch::step` -> `switch_pipeline` with `peer.latency`
+cycles_remaining), and `ROUTE_PER_HOP=4` is applied to the
+inter-tile pipeline (routing.rs:1063 `propagate_inter_tile`).
+
+Sensitivity test: bumped all three to 15/20/20 (5x amplification)
+and re-ran `add_one_using_dma` on Chess build. Cycle count moved
+from 14673 -> 14762, a delta of +89 cyc (0.6%). At 1x amplification
+the realistic delta would be ~18 cyc.
+
+Conclusion: stream-switch latency is a head-of-line / cold-start
+cost, not a per-buffer steady-state cost. The pipeline is largely
+backpressure-bounded once primed, so adding traversal latency just
+shifts when the first word arrives; subsequent words flow at the
+slowest stage's rate. To move the per-buffer rate we need a knob
+that adds cost *per word* or *per BD turnover*, not per pipeline
+fill.
 
 ### 2. Per-BD turnover at memtile (possibly over-pipelined)
 
@@ -177,22 +289,23 @@ The shim → memtile path crosses the NoC. EMU treats this as
 zero-latency after cold-start. Real NoC has per-hop latency and
 contention.
 
-## Downstream effects
+## Downstream effects (RETRACTED)
 
-This DMA-too-fast root cause produces several visible symptoms:
+The original framing claimed three downstream symptoms (#353, #354,
+#355) all rooted in a "DMA too fast" cause. With the bridge run
+showing CLEAN traces and the pre-jump pairs matching within +/-5
+cyc, none of this is real:
 
-- **#353**: LOCK_STALL undercount -- EMU stalls once where HW stalls
-  six times. Per-stall events count similarly (~5 events per
-  stall-burst on both sides), but EMU has 1/6th the stall windows.
-- **#354**: PERF_CNT_2 actually overshoots HW slightly (63 vs 56),
-  likely because EMU's compute runs ~46% faster and the perf
-  counter completes more cycles in its active window.
-- **#355**: 14655 vs 27340 total kernel cycles. ~46% faster, same
-  ratio as the per-iteration rate.
+- LOCK_STALL counts (22 vs 24) differ by 2, well within trace-frame
+  coalescing noise -- not 1/6 of the stall windows missing.
+- PERF_CNT_2 counts are within ~10% on both sides.
+- The "27340 vs 14655 total" gap was the inflated EMU stamps vs
+  HW stamps -- the actual coordinator total is 14673 cyc, and HW
+  is similar order of magnitude (TBD precise measurement).
 
-The fix surface for all three is **the same**: make EMU's DMA
-pipeline run at the right rate relative to compute. The event
-emission code itself is roughly correct.
+The fix surface is **not** "make EMU's DMA pipeline slower". The
+fix surface is **find why the EMU compute-tile trace clock jumps
+to ~247060 partway through the run**.
 
 ## What I tried and reverted
 
@@ -210,31 +323,47 @@ per-cycle-of-stall event emission cleanly.
 For now: the per-stall-window event count is approximately right
 (22 vs 24). The actual problem is the missing stall windows.
 
-## What to do next
+## What to do next (revised 2026-05-11 after isolating root cause)
 
-Recommended sequence, in priority order:
+Three concrete bugs surfaced, in order of impact:
 
-1. **Stream-switch traversal latency** (next step planned). Verify
-   that `STREAM_LOCAL_TO_LOCAL_LATENCY` etc. are applied on the
-   data path from MM2S → S2MM through one or more switch hops.
-   If they are not, wire them in. Measure impact on
-   `add_one_using_dma` cycle count.
+1. **Bridge script uses wrong trace-decoder mode** (5-minute fix).
+   `scripts/emu-bridge-test.sh:875` calls `parse-trace.py` without
+   `--trace-mode auto`. Change it. Once both HW and EMU traces are
+   decoded with their actual modes (compute = mode 1, shim/memtile
+   = mode 0), the false "247060 cycle gap" disappears and the real
+   event-content divergences become legible. This unblocks every
+   downstream trace-fidelity investigation.
 
-2. **Memtile DMA inter-BD turnover under backpressure**. The `#26`
-   fix matched HW in no-backpressure synthetic tests, but the
-   relevant case for `add_one_using_dma` is sustained backpressure.
-   Re-measure memtile MM2S 16w specifically under that workload
-   and see if HW pays cycles EMU has zero'd out.
+2. **EMU emits LockStall edge-triggered with no PC** (real fidelity
+   bug). HW emits LOCK_STALL on every cycle of WaitLock polling
+   (~4400 events in `add_one_using_dma`); EMU emits it twice. The
+   variant `EventType::LockStall { cycles: u8 }` carries no PC, so
+   `event_pc()` returns None and the mode-1 encoded frame uses
+   PC=0 instead of the WaitLock instruction PC. Two sub-fixes:
+   - Add a PC field to LockStall (and MemoryStall, StreamStall) so
+     mode-1 trace stamps carry the real waiting instruction PC.
+   - Change emission from edge-triggered (once per stall entry) to
+     level (once per cycle while WaitLock is unresolved). The
+     previous attempt at this exploded LockStall count 200x; the
+     trace-pipeline coalescing investigation (item 4) needs to land
+     first to understand why.
 
-3. **DDR refill / NoC latency**. Lower priority -- one-shot cost
-   per kernel-cycle, the per-iteration impact is small compared to
-   stream switch and DMA turnover.
+3. **INSTR_LOCK_ACQUIRE_REQ PC is off by ~12 instructions** (smaller
+   fidelity bug). HW=828, EMU=816. Same compiled binary, so it's
+   an EMU bookkeeping issue -- probably capturing PC at a different
+   pipeline stage than HW does (pre-decode vs post-issue, or
+   pre/post-delay-slot resolution). Lower priority than (1) and (2)
+   but trivial once those are unblocked.
 
-4. **Trace pipeline coalescing investigation** (for future
-   per-cycle event work). The mystery of "adding InstrLockAcquireReq
-   emission inflates LockStall count 200x" needs to be resolved
-   before any HW-rate event emission work can land. Not blocking
-   the DMA-rate work above.
+4. **Trace pipeline coalescing investigation** (prerequisite for
+   item 2's level-triggered fix). The mystery of "adding
+   InstrLockAcquireReq emission inflates LockStall count 200x"
+   needs its own root-cause before the LockStall fidelity work
+   above can land cleanly.
+
+The DMA-rate calibration that was originally next is fully
+shelved -- the DMA rate isn't the problem.
 
 ## Related findings
 
