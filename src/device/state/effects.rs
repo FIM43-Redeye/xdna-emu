@@ -204,9 +204,6 @@ impl DeviceState {
                     let port_idx = byte & 0x1F;
                     let is_master = (byte & 0x20) != 0;
                     tile.event_port_selection[base_slot + i] = Some((port_idx, is_master));
-                    // Reset edge-trigger memory for the reassigned slot so
-                    // the first observed transition fires as a rising edge.
-                    tile.prev_port_state[base_slot + i] = (false, false, false);
                 }
                 log::debug!(
                     "Tile({},{}) event port sel @0x{:X}: {:?}",

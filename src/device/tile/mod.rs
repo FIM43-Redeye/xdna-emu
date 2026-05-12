@@ -167,18 +167,6 @@ pub struct Tile {
     /// bits 4:0 = port index.
     pub event_port_selection: [Option<(u8, bool)>; 8],
 
-    /// Previous-cycle state per event-port slot, used to edge-trigger
-    /// PORT_RUNNING/PORT_IDLE/PORT_STALLED/PORT_TLAST trace events.
-    ///
-    /// On real silicon these events fire on the rising edge of the
-    /// corresponding port signal -- not every cycle the signal is asserted.
-    /// We track the previous cycle's value and only emit when the signal
-    /// transitions, matching HW behavior.
-    ///
-    /// Indexed by event-port slot (0..8), not by physical port index.
-    /// `(prev_active, prev_stalled, prev_tlast)` per slot.
-    pub prev_port_state: [(bool, bool, bool); 8],
-
     // === Cascade Stream (compute tiles only) ===
     /// Cascade input FIFO (SCD). 384-bit width, depth 1.
     /// Dedicated point-to-point link between adjacent compute tiles,
@@ -341,7 +329,6 @@ impl Tile {
             mem_trace: TraceUnit::new(col, row),
             mem_trace_pending: Vec::new(),
             event_port_selection: [None; 8],
-            prev_port_state: [(false, false, false); 8],
             core_perf_counters: match tile_kind {
                 TileKind::Compute => super::perf_counters::PerfCounterBank::new(4),
                 TileKind::ShimNoc | TileKind::ShimPl => super::perf_counters::PerfCounterBank::new(2),
