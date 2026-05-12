@@ -388,6 +388,141 @@ Three concrete bugs surfaced, in order of impact:
    pre/post-delay-slot resolution). Lower priority than (1) and (2)
    but trivial once those are unblocked.
 
+## Update 2026-05-12: INSTR_LOCK_ACQUIRE_REQ count investigation
+
+Dug into the "HW 15 / EMU 16" off-by-one count mismatch. Cross-kernel
+data:
+
+| Kernel | Dynamic acquires (EMU) | HW count | EMU count |
+|---|---|---|---|
+| add_one_using_dma | 16 | 15 | 16 |
+| add_one_objFifo | 16 | 15 | 16 |
+| add_one_ctrl_packet | 5 | 5 | 5 |
+
+First hypothesis: HW only fires INSTR_LOCK_ACQUIRE_REQ on immediate
+success (not on post-stall resumption). Implemented retry-suppression
+in EMU via a `lock_acquire_retry_pending` flag on ExecutionContext --
+matched add_one_using_dma to 15/15 but broke add_one_ctrl_packet
+(undercounted to 3/5: EMU has 3 stall-resolved acquires that HW DOES
+capture). Reverted.
+
+Real conclusion: HW's "drop 1" pattern is specific to kernels with a
+long head-of-line stall followed by tightly-packed acquires. Likely
+a trace-controller pipeline artifact -- either the first event is
+dropped during pipeline startup, or the last event is dropped because
+trace shutdown happens before it flushes. Same root-cause family as
+the #33 PC-pipeline-depth bug (HW=0x33C vs EMU=0x330): both are
+manifestations of HW's trace pipeline timing that EMU doesn't model.
+
+EMU's count of 16 is the *logically correct* count of acquires
+issued. HW's 15 is an underreport. **No EMU code change is the right
+answer here** -- modeling HW's trace-controller pipeline drop is
+much more work than the +1 discrepancy is worth.
+
+## Update 2026-05-12: #33 PC pipeline depth CLOSED
+
+The "INSTR_LOCK_ACQUIRE_REQ PC is off by ~12 instructions" item from
+the 2026-05-11 next-steps list is now fixed. Cross-kernel verification
+after the patch (HW vs EMU on the post-fix `.so`):
+
+| Kernel              |  HW PC | EMU PC | Match |
+|---------------------|-------:|-------:|------:|
+| add_one_using_dma   |  0x33C |  0x33C | ✓ |
+| add_one_objFifo     |  0x31C |  0x31C | ✓ |
+| add_one_ctrl_packet |  0x60C |  0x60C | ✓ |
+
+Pre-fix, `add_one_using_dma` was 0x330 (the acq's own PC). The other
+two were not measured pre-fix.
+
+The +12-byte offset on `add_one_using_dma` (3 bundles past `acq`: `ret`
++ 2× `nop` + the 4th delay-slot `nop`'s issue PC) looks like a constant
+in bytes but it's actually a constant in *cycles*: the trace controller
+observes the acq-success signal at a late pipeline stage and stamps the
+frame with the current issue-stage PC; by the time the signal lands,
+the core has moved 4 cycles past the `acq` (one `ret` bundle + three
+1-cycle delay-slot nops, all of which issue at 1 cycle each in this
+helper layout). +12 bytes is just what those four 1-cycle bundles
+happen to sum to in the standard `aie_runtime::acquire` helper. A
+kernel with different post-acq bundle widths would see a different
+byte offset but the same 4-cycle delay -- which is why the fix
+modeled cycles, not bytes.
+
+The fix lives in three files:
+
+- `src/interpreter/state/timing_context.rs`: a `pending_deferred_pc`
+  queue holding `(trigger_cycle, record_at_cycle, kind)`, plus
+  `record_event_with_pc_delay` (scheduler) and `drain_deferred_pc`
+  (drainer that stamps the event with the current issue PC). The
+  pipeline-depth constant lives here as `TRACE_PC_PIPELINE_DEPTH = 4`.
+
+- `src/interpreter/execute/control.rs`: the InstrLockAcquireReq
+  emission on lock-acquire success now calls `record_event_with_pc_delay`
+  instead of `record_event` -- the event is committed 4 cycles later
+  with whatever PC is at issue at that point.
+
+- `src/interpreter/core/interpreter.rs`: both step paths (`step_internal`
+  and `step`) call `drain_deferred_pc(current_cycle, current_pc)` after
+  resolving any stall, so the drain consistently fires at start-of-bundle
+  with the issue PC. The post-stall path matters because if the deferred
+  event lands during a subsequent stall (rare in practice but possible
+  when a kernel back-to-backs acquires) we don't want to stamp the
+  stalled PC.
+
+This same mechanism can be extended to InstrLockReleaseReq, InstrLoad,
+InstrStore, InstrCall, and InstrReturn if/when those events show similar
+HW/EMU PC offsets -- the deferred-PC plumbing is generic. For now only
+InstrLockAcquireReq goes through it, because that's the only Instr event
+with confirmed HW data to fit against.
+
+The HW=15/EMU=16 count discrepancy is unchanged by this fix and remains
+the HW-pipeline drop pattern documented in the section above, not an
+EMU bug.
+
+## Update 2026-05-12: PERF_CNT_2 0 -> 8 events (HW=11)
+
+EMU was emitting 0 PERF_CNT_2 events on `add_one_using_dma` (HW=11).
+After the fix, EMU emits 8 events. Two semantic bugs in the perf
+counter model:
+
+1. **Level-gating in `tick`**. `PerfCounterBank::tick_idle_cycles()`
+   skipped counters whose `start_event == ACTIVE_CORE`, on the
+   (incorrect) theory that ACTIVE_CORE is a level signal asserted
+   only during Execute state. ACTIVE_CORE is actually an edge-style
+   start trigger: `EventMonitor pc0(... XAIE_EVENT_ACTIVE_CORE,
+   XAIE_EVENT_DISABLED_CORE, ...)` in mlir-aie's `05_Core_Startup`
+   benchmark uses it to measure total core lifetime cycles --
+   meaning the counter must keep ticking through stalls. The fix
+   collapses `tick_active_cycles`/`tick_idle_cycles` into a single
+   `tick()` that increments every Active counter unconditionally;
+   the old names remain as `#[deprecated]` shims to ease migration
+   of test call sites.
+
+2. **Reset-event stopped the counter**. `handle_event(reset_event)`
+   set the counter to `Idle`, which made the canonical self-reset
+   pattern (`reset_event = PERF_CNT_N`, `threshold = period`) fire
+   exactly once per kernel and then go silent. Per aie-rt's
+   `XAie_PerfCounterReset`, reset zeros the counter register but
+   does not halt the counter -- the run state machine is start/stop
+   only. Fix: reset zeros the value, leaves state unchanged.
+
+PCs are now stamped from `tile.core.pc` (the pipeline-adjusted
+trace PC) rather than the `None` sentinel that decoded to PC=0,
+matching HW's behavior of capturing the in-flight PC when the
+counter fires. EMU PC=0xBC (188) on this kernel vs HW PCs 0xCC
+(204) and 0x340 (832) -- different specific PCs because of the
+underlying cycle-count divergence, same general pattern (compute
+body + lock-stall pipeline PC).
+
+Residual EMU=8/HW=11 gap is the kernel running ~30% fewer total
+cycles in EMU than HW, leaving ~3 fewer 1024-cycle windows for the
+threshold to fire in. That's the broader cycle-fidelity issue
+discussed elsewhere in this finding, not a perf-counter bug.
+
+Trace stays CLEAN on `add_one_using_dma`/`add_one_objFifo`/
+`add_one_ctrl_packet` after the fix.
+
+## Other items
+
 5. **Spurious MEMORY_STALL (CLOSED 2026-05-12)**: S2MM bank record
    fired before the stall check, so every stalled cycle phantom-claimed
    a bank touch. See "Update 2026-05-12" above.
