@@ -521,7 +521,12 @@ is_python_host_test() {
 # %run_on_npu1% commands is still npu2-only -- the conditional commands
 # exist for the lit infrastructure, not to signal NPU1 support.
 # (add_one_two_txn was incorrectly included on NPU1 because of this.)
-# Checks ALL .lit files in the directory.
+#
+# Checks ALL .lit files in the directory.  If none exist, falls back to
+# the Python harness (test.py / aie2.py) that find_lit_file would pick --
+# Python-driven tests like vec_mul_event_trace carry their REQUIRES line
+# in test.py rather than a .lit, and were previously mis-classified as
+# runnable on NPU1 because the for loop never executed.
 requires_npu2() {
   local dir="$1"
   local any_lit=false
@@ -535,6 +540,16 @@ requires_npu2() {
       grep -q 'REQUIRES:.*ryzen_ai_npu1' "$lit" && return 1
     fi
   done
+  if ! $any_lit; then
+    local fallback
+    fallback="$(find_lit_file "$dir")"
+    if [[ -n "$fallback" && -f "$fallback" ]] \
+        && grep -q 'REQUIRES:.*ryzen_ai_npu2' "$fallback"; then
+      grep -q 'REQUIRES:.*ryzen_ai_npu1' "$fallback" && return 1
+      return 0
+    fi
+    return 1
+  fi
   $any_lit && $any_npu2 && return 0
   return 1
 }
