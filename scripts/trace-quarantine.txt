@@ -37,6 +37,14 @@
 # no ctrlpkt.bin) passes; ctrl_packet_reconfig_1x4_cores (1 packet_flow
 # instead of 4) passes.  This is a compiler/hardware limitation, not an
 # emulator or tracing issue.
+#
+# 2026-05-13: Re-verified the deadlock still applies after upstream
+# churn.  Briefly de-quarantined both tests for a probe; with trace
+# injection re-enabled, all four (test x compiler) jobs TDR'd within
+# ~20s each (clean TDR recovery, no permanent wedge).  Without trace
+# (i.e. with these entries in place), ctrl_packet_reconfig_4x1_cores
+# peano PASSes -- so the deadlock is specifically the overlay+trace
+# routing combination, not the underlying test.  Restoring entries.
 ctrl_packet_reconfig
 ctrl_packet_reconfig_4x1_cores
 
