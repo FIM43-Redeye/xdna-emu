@@ -142,12 +142,12 @@ for reference.
 
 Build: `cargo build --release --bin trace-compare`
 
-**Deprecated tools** (do not add new callers):
+**Deprecated tools** (do not add new callers; v1 suffix avoids confusion with current top-level tools of the same base name):
 - `tools/deprecated/trace-inject.py` -- legacy MLIR trace injection
-- `tools/deprecated/trace-sweep.py` -- pre-IRON-API multi-batch orchestrator (note: `tools/trace-sweep.py` at the top level is the second-gen still in active use)
+- `tools/deprecated/trace-sweep-v1.py` -- pre-IRON-API multi-batch orchestrator
 - `tools/deprecated/trace-trim.py` -- buffer trimming
 - `tools/deprecated/trace-merge.py` -- Perfetto JSON merge
-- `tools/deprecated/trace-patch-events.py` -- pre-IRON-API event patching (note: `tools/trace-patch-events.py` at the top level is the second-gen still in active use)
+- `tools/deprecated/trace-patch-events-v1.py` -- pre-IRON-API event patching
 - `tools/deprecated/trace-bridge.sh` -- shell driver superseded by `scripts/emu-bridge-test.sh`
 - `tools/deprecated/trace-compare.py` -- Python comparator superseded by `src/bin/trace_compare.rs`
 
