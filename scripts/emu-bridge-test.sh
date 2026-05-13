@@ -1501,21 +1501,30 @@ compile_one_compiler() {
   fi
 
   if [[ -n "$src_mlir" ]]; then
-    local need_copy=false
-    if [[ "$FORCE_COMPILE" == "true" ]]; then
-      need_copy=true
-    elif [[ ! -f "$build_dir/aie_arch.mlir" ]]; then
-      need_copy=true
-    elif [[ "$src_mlir" -nt "$build_dir/aie_arch.mlir" ]]; then
-      need_copy=true
+    # Materialize the canonical input MLIR into a tempfile, then update
+    # build_dir/aie_arch.mlir iff its content differs from the canonical
+    # form. mtime-only invalidation isn't sufficient: a prior run can
+    # leave a trace-injected aie_arch.mlir in build_dir whose mtime is
+    # NEWER than the original source, so the mtime check would call it
+    # fresh on a later run that has trace disabled (e.g. test now in
+    # trace-quarantine.txt). aiecc would then compile the stale traced
+    # MLIR, emit a shim trace BD targeting an arg the host never binds,
+    # and the run page-faults on the unbound IOVA. Comparing content
+    # costs one cp+sed+cmp per compile cycle -- microseconds against
+    # aiecc's seconds-to-minutes.
+    local _aie_tmp
+    _aie_tmp="$(mktemp --tmpdir="$build_dir" .aie_arch.XXXXXX.mlir)"
+    cp "$src_mlir" "$_aie_tmp"
+    # Traced MLIR already has the device substituted by trace-inject.py.
+    if [[ "$src_mlir" == "$src_dir/aie.mlir" ]]; then
+      sed "s/NPUDEVICE/${npu_dev}/g" -i "$_aie_tmp"
     fi
-
-    if $need_copy; then
-      cp "$src_mlir" "$build_dir/aie_arch.mlir"
-      # Traced MLIR already has the device substituted by trace-inject.py.
-      if [[ "$src_mlir" == "$src_dir/aie.mlir" ]]; then
-        sed "s/NPUDEVICE/${npu_dev}/g" -i "$build_dir/aie_arch.mlir"
-      fi
+    if [[ "$FORCE_COMPILE" == "true" ]] \
+        || [[ ! -f "$build_dir/aie_arch.mlir" ]] \
+        || ! cmp -s "$_aie_tmp" "$build_dir/aie_arch.mlir"; then
+      mv "$_aie_tmp" "$build_dir/aie_arch.mlir"
+    else
+      rm -f "$_aie_tmp"
     fi
   fi
 
@@ -1535,17 +1544,18 @@ compile_one_compiler() {
   local orig_mlir_available=false
   if [[ "$TRACE_OK" == "true" ]] && [[ $aiecc_count -gt 1 ]] \
       && [[ -f "$src_dir/aie.mlir" ]]; then
-    local need_orig_copy=false
-    if [[ "$FORCE_COMPILE" == "true" ]]; then
-      need_orig_copy=true
-    elif [[ ! -f "$build_dir/aie_arch_orig.mlir" ]]; then
-      need_orig_copy=true
-    elif [[ "$src_dir/aie.mlir" -nt "$build_dir/aie_arch_orig.mlir" ]]; then
-      need_orig_copy=true
-    fi
-    if $need_orig_copy; then
-      cp "$src_dir/aie.mlir" "$build_dir/aie_arch_orig.mlir"
-      sed "s/NPUDEVICE/${npu_dev}/g" -i "$build_dir/aie_arch_orig.mlir"
+    # Same content-aware staleness check as aie_arch.mlir above --
+    # see that block for the failure mode mtime-only checks miss.
+    local _orig_tmp
+    _orig_tmp="$(mktemp --tmpdir="$build_dir" .aie_arch_orig.XXXXXX.mlir)"
+    cp "$src_dir/aie.mlir" "$_orig_tmp"
+    sed "s/NPUDEVICE/${npu_dev}/g" -i "$_orig_tmp"
+    if [[ "$FORCE_COMPILE" == "true" ]] \
+        || [[ ! -f "$build_dir/aie_arch_orig.mlir" ]] \
+        || ! cmp -s "$_orig_tmp" "$build_dir/aie_arch_orig.mlir"; then
+      mv "$_orig_tmp" "$build_dir/aie_arch_orig.mlir"
+    else
+      rm -f "$_orig_tmp"
     fi
     orig_mlir_available=true
   fi

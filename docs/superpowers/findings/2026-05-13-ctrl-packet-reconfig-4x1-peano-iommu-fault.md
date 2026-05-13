@@ -6,6 +6,20 @@ type: project
 
 # ctrl_packet_reconfig_4x1_cores peano IOMMU fault -- 2026-05-13
 
+> **SUPERSEDED 2026-05-13 (later same day) by
+> [2026-05-13-bridge-mlir-cache-mtime-stale-trace-injection.md](2026-05-13-bridge-mlir-cache-mtime-stale-trace-injection.md).**
+>
+> The "peano emits null-relative addresses" hypothesis below was
+> wrong.  Binary diff of chess vs peano revealed that peano's
+> `aie_arch.mlir` in build_dir was stale -- carrying a
+> `aie.trace.host_config` op injected by a prior run, with the test
+> now in trace-quarantine but the mtime cache failing to refresh the
+> artifact.  The IOMMU faults were successive trace DMA bursts to an
+> unbound buffer, not zeroed buffer descriptors.  Fix landed in the
+> same session as a content-aware cache invalidation.  NOT a peano
+> backend bug; not reportable upstream.  Read the superseding doc
+> for the current picture.
+
 ## TL;DR
 
 When the bridge test runs `ctrl_packet_reconfig_4x1_cores` compiled
