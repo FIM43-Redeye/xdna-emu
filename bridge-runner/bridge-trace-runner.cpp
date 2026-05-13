@@ -30,6 +30,13 @@
 //     # When --xclbin varies across lines, the runner caches prepared-kernel
 //     # state per xclbin so device/xclbin/hw_context/kernel are each built
 //     # exactly once per unique xclbin across the session.
+//     #
+//     # Control lines (do not increment run_idx):
+//     #   RESET   -- drop all cached PreparedKernels (hw_context, kernel,
+//     #              BO pool). The next batch line rebuilds from scratch,
+//     #              which re-allocates the NPU partition and zeros the
+//     #              shim DMA BD write counters. Acks with
+//     #              {"event":"reset","run_idx":N}.
 //
 // Output: raw trace buffer contents written to --trace-out, ready to be
 // parsed by tools/parse-trace.py.
@@ -1796,9 +1803,11 @@ RunOutcome execute_run(
         // here is genuinely zero before each run; new data is at fresh
         // offsets, never overlapping prior runs); only the buffer's
         // *effective capacity* shrinks linearly across the batch-stdin
-        // session. With trace_size_bytes=1MB this is fine for sweeps in
-        // the low thousands of batches. A future improvement could
-        // inject an explicit DMA channel reset between runs.
+        // session. Callers can clear the counter by sending the RESET
+        // control line (see run_batch_stdin) -- this drops the cached
+        // hw_context, and the next prepare allocates a fresh partition
+        // with zeroed channels. The parallel-event sweep does this
+        // between batches so pooled sessions stay deterministic.
         {
             xrt::bo& bo = prep.pool_bos[prep.pool_trace_bo_idx];
             std::memset(bo.map<void*>(), 0, args.trace_size_bytes);
@@ -2090,6 +2099,21 @@ int run_batch_stdin(Session& session, const OuterArgs& outer, const char* argv0)
         // Ignore blank lines and # comments so the parent can interleave
         // human-readable markers without breaking the protocol.
         if (line.empty() || line[0] == '#') continue;
+
+        // RESET command: drop all cached PreparedKernels so the next batch
+        // line rebuilds the hw_context from scratch. Re-allocating the NPU
+        // partition zeros the shim DMA BD write counters, giving each
+        // post-RESET batch a clean trace buffer starting at offset 0.
+        // Ack on stdout so the caller can synchronise; does not increment
+        // run_idx (this is an out-of-band control message, not a run).
+        if (line == "RESET") {
+            session.cache.clear();
+            std::printf(
+                "{\"event\":\"reset\",\"run_idx\":%llu}\n",
+                (unsigned long long)run_idx);
+            std::fflush(stdout);
+            continue;
+        }
 
         RunArgs args;
         // Inherit outer xclbin/kernel defaults.

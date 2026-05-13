@@ -48,11 +48,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -591,6 +593,37 @@ class RunnerSession:
             raise RuntimeError(
                 f"{self.side} runner non-JSON response: {resp!r}") from e
 
+    def reset(self) -> None:
+        """Tell the runner to drop its cached hw_context/kernel/BO pool.
+
+        The next run_one() will rebuild from scratch, re-allocating the
+        NPU partition and zeroing the shim DMA BD write counters. Used
+        between batches in the parallel EMU sweep so pooled sessions
+        produce identical results regardless of which session services a
+        given batch (otherwise the trace shim DMA's cumulative offset
+        leaks across the pool and per-batch event counts diverge).
+        """
+        if self.proc is None or self.proc.poll() is not None:
+            raise RuntimeError(f"{self.side} runner has exited")
+        try:
+            self.proc.stdin.write("RESET\n")
+            self.proc.stdin.flush()
+        except BrokenPipeError as e:
+            raise RuntimeError(f"{self.side} runner stdin closed") from e
+        resp = self.proc.stdout.readline()
+        if not resp:
+            raise RuntimeError(
+                f"{self.side} runner produced no reset response")
+        try:
+            ack = json.loads(resp)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"{self.side} runner non-JSON reset response: {resp!r}"
+            ) from e
+        if ack.get("event") != "reset":
+            raise RuntimeError(
+                f"{self.side} runner unexpected reset response: {ack!r}")
+
     def close(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
             try:
@@ -1120,6 +1153,7 @@ def sweep_multi(
     ctrlpkt: Optional[Path] = None,
     ground_event_name: Optional[str] = None,
     reuse_ctx: bool = False,
+    jobs: int = 1,
 ) -> List[dict]:
     """Sweep every trace event across a set of tiles in one kernel run.
 
@@ -1294,48 +1328,174 @@ def sweep_multi(
         )
 
     t_start = time.time()
-    for b_idx, batch in enumerate(batches):
-        event_ids = [e.id for e in batch]
+
+    # Two-phase sweep: HW first (serial -- one-job-in-flight rule on the
+    # NPU), then EMU (parallel if jobs > 1, since EMU sessions are
+    # independent subprocesses with no shared device). Per-tile
+    # aggregation runs last in b_idx order so results are deterministic
+    # regardless of EMU completion order.
+    #
+    # Per-batch patched.bin files (was a single shared file before): the
+    # HW phase patches each, EMU phase reuses the same files on disk.
+    # Negligible disk cost; required for parallel EMU correctness.
+    skipped_hw = RunResult(ok=False, cycles=None, events_count=None,
+                           error="hw skipped")
+    skipped_emu = RunResult(ok=False, cycles=None, events_count=None,
+                            error="emu skipped")
+    batch_patched = [work_dir / f"insts.patched.b{b:02d}.bin"
+                     for b in range(len(batches))]
+    batch_hw_events_out = [work_dir / f"b{b}.hw.events.json"
+                           for b in range(len(batches))]
+    batch_emu_events_out = [work_dir / f"b{b}.emu.events.json"
+                            for b in range(len(batches))]
+    batch_hw_res: List[Optional[RunResult]] = [None] * len(batches)
+    batch_emu_res: List[Optional[RunResult]] = [None] * len(batches)
+
+    def _patch_batch(b_idx: int) -> None:
+        event_ids = [e.id for e in batches[b_idx]]
         # Program the same event set on every tile in lockstep. Different
         # tile types would need different event IDs, but we enforced
         # same-tile-type above; same type => same IDs work across tiles.
         patches = [
             (t.col, t.row, t.tile_type, event_ids) for t in tiles
         ]
-        _run_patch_multi(insts, patched, patches)
+        _run_patch_multi(insts, batch_patched[b_idx], patches)
 
-        hw_events_out = work_dir / f"b{b_idx}.hw.events.json"
-        emu_events_out = work_dir / f"b{b_idx}.emu.events.json"
+    # ---- Phase A: HW sweep (serial; required by one-job-in-flight) ----
+    if run_hw:
+        for b_idx in range(len(batches)):
+            _patch_batch(b_idx)
+            # Reset before every batch so the shim DMA BD write counter
+            # is zeroed (each batch's events land at trace BO offset 0
+            # instead of the cumulative offset where the prior batch
+            # stopped). Cheap on the first batch (empty cache) and
+            # ~50ms thereafter (partition realloc).
+            hw_session.reset()
+            batch_hw_res[b_idx] = _run_one_side(
+                side="HW",
+                session=hw_session,
+                runner_env=hw_runner_env,
+                instr=batch_patched[b_idx],
+                trace_bin=work_dir / f"b{b_idx}.trace_hw.bin",
+                mlir=mlir,
+                events_out=batch_hw_events_out[b_idx],
+                cycles_out=work_dir / f"b{b_idx}.hw.cycles.txt",
+                parse_log=work_dir / f"b{b_idx}.hw.parse.log",
+                ctrlpkt=ctrlpkt,
+                parser_session=hw_parser,
+            )
+            print(f"[sweep-multi] HW batch {b_idx + 1}/{len(batches)}: "
+                  f"hw_cyc={batch_hw_res[b_idx].cycles}", flush=True)
+    else:
+        for b_idx in range(len(batches)):
+            batch_hw_res[b_idx] = skipped_hw
 
-        hw_res = RunResult(ok=False, cycles=None, events_count=None,
-                           error="hw skipped") if not run_hw else _run_one_side(
-            side="HW",
-            session=hw_session,
-            runner_env=hw_runner_env,
-            instr=patched,
-            trace_bin=work_dir / f"b{b_idx}.trace_hw.bin",
-            mlir=mlir,
-            events_out=hw_events_out,
-            cycles_out=work_dir / f"b{b_idx}.hw.cycles.txt",
-            parse_log=work_dir / f"b{b_idx}.hw.parse.log",
-            ctrlpkt=ctrlpkt,
-            parser_session=hw_parser,
-        )
+    # ---- Phase B: EMU sweep (parallel if jobs > 1) --------------------
+    if run_emu:
+        # If HW didn't run, patched.bin files don't exist yet; patch now.
+        if not run_hw:
+            for b_idx in range(len(batches)):
+                _patch_batch(b_idx)
 
-        emu_res = RunResult(ok=False, cycles=None, events_count=None,
-                            error="emu skipped") if not run_emu else _run_one_side(
-            side="EMU",
-            session=emu_session,
-            runner_env=emu_runner_env,
-            instr=patched,
-            trace_bin=work_dir / f"b{b_idx}.trace_emu.bin",
-            mlir=mlir,
-            events_out=emu_events_out,
-            cycles_out=work_dir / f"b{b_idx}.emu.cycles.txt",
-            parse_log=work_dir / f"b{b_idx}.emu.parse.log",
-            ctrlpkt=ctrlpkt,
-            parser_session=emu_parser,
-        )
+        effective_jobs = max(1, min(jobs, len(batches)))
+        if effective_jobs > 1:
+            # Pool of (RunnerSession, ParseSession) pairs. We already
+            # created one of each above (emu_session, emu_parser); spawn
+            # the remaining effective_jobs-1 here. Each worker borrows
+            # one pair from a queue, returns it when done.
+            extra_emu_sessions = [
+                RunnerSession(
+                    xclbin=xclbin, runner_env=emu_runner_env,
+                    side=f"EMU#{i + 2}",
+                    stderr_log=work_dir / f"emu.runner.{i + 2}.log",
+                    cdo_preambles=cdo_preambles,
+                    trace_buf_idx=trace_buf_idx,
+                    reuse_ctx=reuse_ctx,
+                )
+                for i in range(effective_jobs - 1)
+            ]
+            extra_emu_parsers = [
+                ParseSession(
+                    side=f"EMU#{i + 2}",
+                    stderr_log=work_dir / f"emu.parser.{i + 2}.log",
+                )
+                for i in range(effective_jobs - 1)
+            ]
+            all_emu_sessions = [emu_session] + extra_emu_sessions
+            all_emu_parsers = [emu_parser] + extra_emu_parsers
+            pair_q: "queue.Queue[Tuple[RunnerSession, ParseSession]]" = queue.Queue()
+            for pair in zip(all_emu_sessions, all_emu_parsers):
+                pair_q.put(pair)
+
+            def _run_emu_batch(b_idx: int) -> Tuple[int, RunResult]:
+                s, p = pair_q.get()
+                try:
+                    # Per-batch hw_context reset so the pool of sessions
+                    # produces identical results regardless of which
+                    # session services a given batch (otherwise the trace
+                    # shim DMA's cumulative offset leaks across the pool).
+                    s.reset()
+                    res = _run_one_side(
+                        side="EMU",
+                        session=s,
+                        runner_env=emu_runner_env,
+                        instr=batch_patched[b_idx],
+                        trace_bin=work_dir / f"b{b_idx}.trace_emu.bin",
+                        mlir=mlir,
+                        events_out=batch_emu_events_out[b_idx],
+                        cycles_out=work_dir / f"b{b_idx}.emu.cycles.txt",
+                        parse_log=work_dir / f"b{b_idx}.emu.parse.log",
+                        ctrlpkt=ctrlpkt,
+                        parser_session=p,
+                    )
+                finally:
+                    pair_q.put((s, p))
+                return b_idx, res
+
+            with ThreadPoolExecutor(max_workers=effective_jobs) as ex:
+                futures = [ex.submit(_run_emu_batch, b)
+                           for b in range(len(batches))]
+                for f in as_completed(futures):
+                    b_idx, res = f.result()
+                    batch_emu_res[b_idx] = res
+                    print(f"[sweep-multi] EMU batch {b_idx + 1}/{len(batches)} "
+                          f"done (parallel -j{effective_jobs}): "
+                          f"emu_cyc={res.cycles}", flush=True)
+
+            for s in extra_emu_sessions:
+                s.close()
+            for p in extra_emu_parsers:
+                p.close()
+        else:
+            for b_idx in range(len(batches)):
+                # Per-batch reset so j=1 matches the parallel path's
+                # per-batch isolation. See _run_emu_batch above.
+                emu_session.reset()
+                batch_emu_res[b_idx] = _run_one_side(
+                    side="EMU",
+                    session=emu_session,
+                    runner_env=emu_runner_env,
+                    instr=batch_patched[b_idx],
+                    trace_bin=work_dir / f"b{b_idx}.trace_emu.bin",
+                    mlir=mlir,
+                    events_out=batch_emu_events_out[b_idx],
+                    cycles_out=work_dir / f"b{b_idx}.emu.cycles.txt",
+                    parse_log=work_dir / f"b{b_idx}.emu.parse.log",
+                    ctrlpkt=ctrlpkt,
+                    parser_session=emu_parser,
+                )
+                print(f"[sweep-multi] EMU batch {b_idx + 1}/{len(batches)}: "
+                      f"emu_cyc={batch_emu_res[b_idx].cycles}", flush=True)
+    else:
+        for b_idx in range(len(batches)):
+            batch_emu_res[b_idx] = skipped_emu
+
+    # ---- Phase C: per-tile aggregation (serial, in b_idx order) -------
+    for b_idx, batch in enumerate(batches):
+        hw_res = batch_hw_res[b_idx]
+        emu_res = batch_emu_res[b_idx]
+        hw_events_out = batch_hw_events_out[b_idx]
+        emu_events_out = batch_emu_events_out[b_idx]
 
         # Split the one parsed events.json per-tile, relabel each tile's
         # filtered subset with this batch's event names. _relabel_events
@@ -1387,11 +1547,6 @@ def sweep_multi(
                         "error": emu_res.error,
                     },
                 })
-        print(f"[sweep-multi] batch {b_idx + 1}/{len(batches)} on "
-              f"{len(tiles)} tile(s): events "
-              f"{[e.name for e in batch]} "
-              f"hw_cyc={hw_res.cycles} emu_cyc={emu_res.cycles}",
-              flush=True)
 
     # Close sessions here rather than via try/finally so the cleanup
     # cost stays measurable (visible in elapsed_sec) without altering
@@ -1522,6 +1677,7 @@ def sweep_lockstep(
     perfcnt_period: int = DEFAULT_PERFCNT_PERIOD,
     with_mode2_baseline: bool = True,
     reuse_ctx: bool = False,
+    jobs: int = 1,
 ) -> None:
     """Mode-1 lockstep sweep across mixed-type tiles (A.2 path).
 
@@ -1666,16 +1822,30 @@ def sweep_lockstep(
     sweep_exc_obj: Optional[BaseException] = None
 
     try:
-        for b_idx, batch_assignment in enumerate(batches):
-            batch_dir = out_dir / f"batch_{b_idx:02d}"
-            hw_dir = batch_dir / "hw"
-            emu_dir = batch_dir / "emu"
-            hw_dir.mkdir(parents=True, exist_ok=True)
-            emu_dir.mkdir(parents=True, exist_ok=True)
+        # Two-phase sweep: HW first (serial -- one-job-in-flight rule
+        # on the NPU), then EMU (parallel if jobs > 1). See sweep_multi
+        # for the same shape.
+        #
+        # Per-batch patched.bin files (one shared file before): HW phase
+        # writes each, EMU phase reuses on disk.
+        batch_dirs = []
+        batch_patched_paths = []
+        batch_hw_dirs = []
+        batch_emu_dirs = []
+        for b_idx in range(len(batches)):
+            bd = out_dir / f"batch_{b_idx:02d}"
+            hd = bd / "hw"
+            ed = bd / "emu"
+            hd.mkdir(parents=True, exist_ok=True)
+            ed.mkdir(parents=True, exist_ok=True)
+            batch_dirs.append(bd)
+            batch_hw_dirs.append(hd)
+            batch_emu_dirs.append(ed)
+            batch_patched_paths.append(work_dir / f"insts.patched.b{b_idx:02d}.bin")
 
-            # Build multi-tile patch spec and apply it in one subprocess call.
+        def _patch_batch_lockstep(b_idx: int) -> None:
             patch_spec = _build_lockstep_patch_spec(
-                tiles, batch_assignment, grounding_by_type,
+                tiles, batches[b_idx], grounding_by_type,
                 all_events_by_type, mode,
             )
             spec_path = work_dir / f"b{b_idx:02d}.patch.json"
@@ -1683,53 +1853,150 @@ def sweep_lockstep(
             subprocess.run([
                 sys.executable, str(PATCH_TOOL), str(insts),
                 "--multi-tile", str(spec_path),
-                "--output", str(patched),
+                "--output", str(batch_patched_paths[b_idx]),
             ], check=True, capture_output=True)
 
-            hw_events_out = hw_dir / "trace.events.json"
-            emu_events_out = emu_dir / "trace.events.json"
+        batch_hw_res: List[Optional[RunResult]] = [None] * len(batches)
+        batch_emu_res: List[Optional[RunResult]] = [None] * len(batches)
+        skipped_hw = RunResult(ok=False, cycles=None, events_count=None,
+                               error="hw skipped")
+        skipped_emu = RunResult(ok=False, cycles=None, events_count=None,
+                                error="emu skipped")
 
-            hw_res = (
-                RunResult(ok=False, cycles=None, events_count=None, error="hw skipped")
-                if not run_hw else _run_one_side(
+        # ---- Phase A: HW sweep (serial) -------------------------------
+        if run_hw:
+            for b_idx in range(len(batches)):
+                _patch_batch_lockstep(b_idx)
+                # Reset before every batch -- see sweep_multi for rationale.
+                hw_session.reset()
+                batch_hw_res[b_idx] = _run_one_side(
                     side="HW",
                     session=hw_session,
                     runner_env=hw_runner_env,
-                    instr=patched,
-                    trace_bin=hw_dir / "trace.bin",
+                    instr=batch_patched_paths[b_idx],
+                    trace_bin=batch_hw_dirs[b_idx] / "trace.bin",
                     mlir=mlir,
-                    events_out=hw_events_out,
-                    cycles_out=hw_dir / "cycles.txt",
-                    parse_log=hw_dir / "parse.log",
+                    events_out=batch_hw_dirs[b_idx] / "trace.events.json",
+                    cycles_out=batch_hw_dirs[b_idx] / "cycles.txt",
+                    parse_log=batch_hw_dirs[b_idx] / "parse.log",
                     ctrlpkt=ctrlpkt,
                     parser_session=hw_parser,
                     trace_mode=mode,
                 )
-            )
-            emu_res = (
-                RunResult(ok=False, cycles=None, events_count=None, error="emu skipped")
-                if not run_emu else _run_one_side(
-                    side="EMU",
-                    session=emu_session,
-                    runner_env=emu_runner_env,
-                    instr=patched,
-                    trace_bin=emu_dir / "trace.bin",
-                    mlir=mlir,
-                    events_out=emu_events_out,
-                    cycles_out=emu_dir / "cycles.txt",
-                    parse_log=emu_dir / "parse.log",
-                    ctrlpkt=ctrlpkt,
-                    parser_session=emu_parser,
-                    trace_mode=mode,
+                print(
+                    f"[sweep-lockstep] HW batch {b_idx + 1}/{len(batches)}: "
+                    f"hw_ok={batch_hw_res[b_idx].ok} "
+                    f"hw_cyc={batch_hw_res[b_idx].cycles}",
+                    flush=True,
                 )
-            )
-            completed_batches = b_idx + 1
-            print(
-                f"[sweep-lockstep] batch {b_idx + 1}/{len(batches)}: "
-                f"hw_ok={hw_res.ok} emu_ok={emu_res.ok} "
-                f"hw_cyc={hw_res.cycles} emu_cyc={emu_res.cycles}",
-                flush=True,
-            )
+        else:
+            for b_idx in range(len(batches)):
+                batch_hw_res[b_idx] = skipped_hw
+
+        # ---- Phase B: EMU sweep (parallel if jobs > 1) ----------------
+        if run_emu:
+            # If HW didn't run, patched.bin files don't exist yet.
+            if not run_hw:
+                for b_idx in range(len(batches)):
+                    _patch_batch_lockstep(b_idx)
+
+            effective_jobs = max(1, min(jobs, len(batches)))
+            if effective_jobs > 1:
+                extra_emu_sessions = [
+                    RunnerSession(
+                        xclbin=xclbin, runner_env=emu_runner_env,
+                        side=f"EMU#{i + 2}",
+                        stderr_log=work_dir / f"emu.runner.{i + 2}.log",
+                        cdo_preambles=cdo_preambles,
+                        trace_buf_idx=trace_buf_idx,
+                        reuse_ctx=reuse_ctx,
+                    )
+                    for i in range(effective_jobs - 1)
+                ]
+                extra_emu_parsers = [
+                    ParseSession(
+                        side=f"EMU#{i + 2}",
+                        stderr_log=work_dir / f"emu.parser.{i + 2}.log",
+                    )
+                    for i in range(effective_jobs - 1)
+                ]
+                all_emu_sessions = [emu_session] + extra_emu_sessions
+                all_emu_parsers = [emu_parser] + extra_emu_parsers
+                pair_q: "queue.Queue[Tuple[RunnerSession, ParseSession]]" = queue.Queue()
+                for pair in zip(all_emu_sessions, all_emu_parsers):
+                    pair_q.put(pair)
+
+                def _run_emu_lockstep(b_idx: int) -> Tuple[int, RunResult]:
+                    s, p = pair_q.get()
+                    try:
+                        # Per-batch reset -- see sweep_multi for rationale.
+                        s.reset()
+                        res = _run_one_side(
+                            side="EMU",
+                            session=s,
+                            runner_env=emu_runner_env,
+                            instr=batch_patched_paths[b_idx],
+                            trace_bin=batch_emu_dirs[b_idx] / "trace.bin",
+                            mlir=mlir,
+                            events_out=batch_emu_dirs[b_idx] / "trace.events.json",
+                            cycles_out=batch_emu_dirs[b_idx] / "cycles.txt",
+                            parse_log=batch_emu_dirs[b_idx] / "parse.log",
+                            ctrlpkt=ctrlpkt,
+                            parser_session=p,
+                            trace_mode=mode,
+                        )
+                    finally:
+                        pair_q.put((s, p))
+                    return b_idx, res
+
+                with ThreadPoolExecutor(max_workers=effective_jobs) as ex:
+                    futures = [ex.submit(_run_emu_lockstep, b)
+                               for b in range(len(batches))]
+                    for f in as_completed(futures):
+                        b_idx, res = f.result()
+                        batch_emu_res[b_idx] = res
+                        print(
+                            f"[sweep-lockstep] EMU batch {b_idx + 1}/{len(batches)} "
+                            f"done (parallel -j{effective_jobs}): "
+                            f"emu_ok={res.ok} emu_cyc={res.cycles}",
+                            flush=True,
+                        )
+
+                for s in extra_emu_sessions:
+                    s.close()
+                for p in extra_emu_parsers:
+                    p.close()
+            else:
+                for b_idx in range(len(batches)):
+                    # Per-batch reset -- see sweep_multi for rationale.
+                    emu_session.reset()
+                    batch_emu_res[b_idx] = _run_one_side(
+                        side="EMU",
+                        session=emu_session,
+                        runner_env=emu_runner_env,
+                        instr=batch_patched_paths[b_idx],
+                        trace_bin=batch_emu_dirs[b_idx] / "trace.bin",
+                        mlir=mlir,
+                        events_out=batch_emu_dirs[b_idx] / "trace.events.json",
+                        cycles_out=batch_emu_dirs[b_idx] / "cycles.txt",
+                        parse_log=batch_emu_dirs[b_idx] / "parse.log",
+                        ctrlpkt=ctrlpkt,
+                        parser_session=emu_parser,
+                        trace_mode=mode,
+                    )
+                    print(
+                        f"[sweep-lockstep] EMU batch {b_idx + 1}/{len(batches)}: "
+                        f"emu_ok={batch_emu_res[b_idx].ok} "
+                        f"emu_cyc={batch_emu_res[b_idx].cycles}",
+                        flush=True,
+                    )
+        else:
+            for b_idx in range(len(batches)):
+                batch_emu_res[b_idx] = skipped_emu
+
+        # All batches finished both phases (whether ok or with recorded
+        # errors). Earlier in-flight exceptions are caught below.
+        completed_batches = len(batches)
 
         # ----------------------------------------------------------------
         # Mode-2 finishing batch (HW only, inst_exec).
@@ -1772,15 +2039,20 @@ def sweep_lockstep(
                 # sweep batches accumulate trace data in the BO via a
                 # shim DMA BD whose internal write counter persists
                 # across runs in --batch-stdin mode (see
-                # bridge-trace-runner.cpp:1657). Reusing the sweep
-                # session for mode-2 means the new mode-2 trace lands
-                # at the cumulative offset, leaving the leading bytes
-                # populated by the most recent mode-1 batch's data.
-                # The mode-2 parser then sees the leftover mode-1
-                # marker (0xF1) at offset 0 instead of mode-2's 0xF2,
-                # decodes it as garbage, and reports zero PCs. Spinning
-                # up dedicated sessions for the baseline isolates the
-                # state and gives a clean BO + BD counter at offset 0.
+                # bridge-trace-runner.cpp "Note on cumulative offsets
+                # across batches"). Reusing the sweep session for
+                # mode-2 means the new mode-2 trace lands at the
+                # cumulative offset, leaving the leading bytes populated
+                # by the most recent mode-1 batch's data. The mode-2
+                # parser then sees the leftover mode-1 marker (0xF1) at
+                # offset 0 instead of mode-2's 0xF2, decodes it as
+                # garbage, and reports zero PCs. Spinning up dedicated
+                # sessions for the baseline isolates the state and gives
+                # a clean BO + BD counter at offset 0. (The sweep loops
+                # also call RunnerSession.reset() between batches now,
+                # so a future cleanup could replace these fresh sessions
+                # with a reset on the existing one -- but separate
+                # processes are still the strongest isolation.)
                 if run_hw:
                     mode2_hw_dir = mode2_dir / "hw"
                     mode2_hw_dir.mkdir(parents=True, exist_ok=True)
@@ -2016,6 +2288,18 @@ def main() -> int:
     ap.add_argument("--ctrlpkt", type=Path, help="optional control-packet blob to pass as --input")
     ap.add_argument("--no-hw", action="store_true", help="skip HW runs")
     ap.add_argument("--no-emu", action="store_true", help="skip EMU runs")
+    ap.add_argument("-j", "--jobs", type=int, default=1,
+                    help="parallel EMU batch workers (default 1 = serial). "
+                         "When both HW and EMU run, Phase A (HW) is always "
+                         "serial -- one job in flight on the NPU -- and "
+                         "Phase B (EMU) then runs the same batches with -j "
+                         "workers. Each batch calls RunnerSession.reset() "
+                         "before dispatch, so per-batch results are "
+                         "independent of which session services the batch "
+                         "and identical across j values. Each worker holds "
+                         "its own RunnerSession + ParseSession subprocess "
+                         "pair (memory cost is N x (~50MB runner + ~200MB "
+                         "parser)).")
     ap.add_argument("--ground-event",
                     help="event name to reserve in slot 0 of every batch; "
                          "its timestamp anchors other events in a merged "
@@ -2121,6 +2405,7 @@ def main() -> int:
                 perfcnt_period=args.perfcnt_period,
                 with_mode2_baseline=args.with_mode2_baseline,
                 reuse_ctx=args.reuse_ctx,
+                jobs=args.jobs,
             )
             print(f"[sweep-lockstep] manifest: {args.out_dir}/sweep-manifest.json")
         else:
@@ -2159,6 +2444,7 @@ def main() -> int:
                 ctrlpkt=args.ctrlpkt,
                 ground_event_name=args.ground_event,
                 reuse_ctx=args.reuse_ctx,
+                jobs=args.jobs,
             )
             for s in summaries:
                 tile = s["tile"]

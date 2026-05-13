@@ -3351,7 +3351,7 @@ main() {
           if [[ "$arm" == "hw" ]]; then
             sweep_args+=(--no-emu)
           else
-            sweep_args+=(--no-hw)
+            sweep_args+=(--no-hw -j "$JOBS")
           fi
 
           local label="SWEEP[${arm}] $name ($compiler)"
@@ -3378,11 +3378,19 @@ main() {
           done
         fi
 
-        # EMU arm: parallel via xargs -P "$JOBS" (no device contention).
+        # EMU arm: serial across tests, with parallel events INSIDE each
+        # test via trace-sweep.py -j ${JOBS}. The total parallelism budget
+        # (${JOBS} workers) is plumbed one layer deeper: instead of N
+        # tests running concurrently with sequential events each, we run
+        # one test at a time with N events concurrently. Switched
+        # 2026-05-13; previous xargs -P approach gave one bridge-trace-
+        # runner per test, all running 30+ events sequentially, which
+        # was the wall-clock bottleneck.
         if $RUN_EMU; then
-          info "Phase 5b: EMU arm -- ${#sweep_pairs[@]} sweep(s), -j${JOBS}"
-          printf '%s\n' "${sweep_pairs[@]}" | \
-            xargs -d '\n' -I{} -P"$JOBS" bash -c '_phase5b_run_arm emu "$@"' _ {} || true
+          info "Phase 5b: EMU arm -- ${#sweep_pairs[@]} sweep(s), serial across tests, -j${JOBS} events/test"
+          for entry in "${sweep_pairs[@]}"; do
+            _phase5b_run_arm emu "$entry" || true
+          done
         fi
       fi
     else
@@ -3511,6 +3519,10 @@ main() {
             fi
             $RUN_HW || sweep_args+=(--no-hw)
             $RUN_EMU || sweep_args+=(--no-emu)
+            # Plumb -j ${JOBS} through to the two-phase sweep so per-test
+            # event sweeps parallelize on the EMU side (HW stays serial
+            # inside trace-sweep.py per its one-job-in-flight rule).
+            sweep_args+=(-j "$JOBS")
 
             echo "  PC-ANCHORED sweep $name ($compiler) ..."
             if python3 "$EMU_ROOT/tools/trace-sweep.py" "${sweep_args[@]}" \
