@@ -749,21 +749,29 @@ tees for a specific run) should use `/tmp/claude-1000/`.
 These describe the current machine's setup. Other contributors will
 substitute their own values.
 
-- **Kernel**: custom `7.0.3-custom`. Out-of-tree `amdxdna` is
+- **Kernel**: custom `7.0.6-custom+`. Out-of-tree `amdxdna` is
   managed by DKMS via `xrt-amdxdna/2.23.0`, source at
-  `/usr/src/xrt-amdxdna-2.23.0/` (auto-synced from
-  `xdna-driver/src/` when `./build.sh -release` runs). Module is
-  signed at install time with our MOK key
-  (`/var/lib/shim-signed/mok/MOK.{priv,der}`), so `modprobe amdxdna`
-  works after every kernel upgrade with no manual signing. After
-  editing driver source, refresh the installed module with:
+  `/usr/src/xrt-amdxdna-2.23.0/`.  The source under /usr/src is
+  NOT auto-refreshed by a bare `./build.sh -release` -- only by
+  installing the produced `.deb`, or by passing `-refresh_dkms`
+  (the iteration shortcut, see below).  Module is signed at install
+  time with our MOK key (`/var/lib/shim-signed/mok/MOK.{priv,der}`),
+  so `modprobe amdxdna` works after every kernel upgrade with no
+  manual signing.  After editing driver source, refresh the
+  installed module with:
   ```bash
-  cd ~/npu-work/xdna-driver/build && ./build.sh -release
-  pkexec bash -c '
-    dkms remove xrt-amdxdna/2.23.0 -k $(uname -r) && \
-    dkms install xrt-amdxdna/2.23.0 -k $(uname -r) && \
-    modprobe -r amdxdna && modprobe amdxdna'
+  cd ~/npu-work/xdna-driver/build
+  ./build.sh -release -refresh_dkms
+  pkexec sh -c 'modprobe -r amdxdna && modprobe amdxdna'
   ```
+  `-refresh_dkms` invokes the staged `dkms_driver.sh --remove/--install`
+  pair against `build/Release/opt/xilinx/xrt/share/amdxdna/`, which
+  is the same path the `.deb` postinst uses.  This keeps the
+  /usr/src tree (including `configure_kernel.sh` and the source
+  tarball) in lock-step with the dev tree -- a piecemeal rsync of
+  just the C sources will silently miss `configure_kernel.sh` and
+  produce a feature-probe mismatch (e.g. `num_rqs == 0` if upstream
+  added a probe we haven't synced yet).
 - **amdxdna module options pinned**: `/etc/modprobe.d/amdxdna.conf`
   contains `options amdxdna autosuspend_ms=-1 tdr_dump_ctx=1`.
   - `autosuspend_ms=-1`: prevent runtime autosuspend. The NPU has
