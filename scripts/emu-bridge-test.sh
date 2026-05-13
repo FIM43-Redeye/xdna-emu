@@ -443,6 +443,13 @@ elapsed_sec() {
 }
 export -f elapsed_sec
 
+# Per-test duration: format (now - $1) as "1.2s" using bash 5+ EPOCHREALTIME.
+# Caller captures start with `local s=$EPOCHREALTIME`, then `job_duration "$s"`.
+job_duration() {
+  awk -v s="$1" -v e="$EPOCHREALTIME" 'BEGIN{printf "%.1fs", e - s}'
+}
+export -f job_duration
+
 # Check NPU health: can it create contexts?  Returns 0 if healthy.
 npu_health_check() {
   xrt-smi examine -r aie-partitions &>/dev/null
@@ -2119,6 +2126,8 @@ run_one_bridge() {
     return
   fi
 
+  local _bridge_start=$EPOCHREALTIME
+
   local run_cmd
   run_cmd="$(get_variant_run_cmd "$src_dir" "$variant")"
 
@@ -2245,7 +2254,7 @@ run_one_bridge() {
     python3 "$EMU_ROOT/tools/trace-trim.py" "$trace_out_dir/trace_raw.bin" 2>/dev/null || true
   fi
 
-  echo "  BRIDGE $display_name ($compiler): $result"
+  echo "  BRIDGE $display_name ($compiler): $result  $(job_duration "$_bridge_start")"
 }
 export -f run_one_bridge
 
@@ -3067,7 +3076,8 @@ main() {
 
     # --- Parallel pool: safe tests at -j$NPU_HW_JOBS ---
     if [[ ${#hw_parallel_jobs[@]} -gt 0 ]]; then
-      declare -A hw_pids=()   # pid -> "name:compiler:variant"
+      declare -A hw_pids=()    # pid -> "name:compiler:variant"
+      declare -A hw_starts=()  # pid -> EPOCHREALTIME at launch
       local hw_idx=0
 
       while [[ $hw_idx -lt ${#hw_parallel_jobs[@]} ]] || [[ ${#hw_pids[@]} -gt 0 ]]; do
@@ -3080,10 +3090,12 @@ main() {
           hw_variant="$(_job_variant "$entry")"
           ((hw_idx++)) || true
 
+          local _hw_start=$EPOCHREALTIME
           (
             run_one_hardware "$hw_name" "$real_bdf" "$hw_compiler" "$hw_variant"
           ) &
           hw_pids[$!]="$entry"
+          hw_starts[$!]="$_hw_start"
         done
 
         # Wait for any one job to finish.
@@ -3093,7 +3105,9 @@ main() {
 
           if [[ $done_pid -ne 0 ]] && [[ -n "${hw_pids[$done_pid]+x}" ]]; then
             local finished="${hw_pids[$done_pid]}"
-            unset 'hw_pids[$done_pid]'
+            local _hw_dur="${hw_starts[$done_pid]:-}"
+            unset 'hw_pids[$done_pid]' 'hw_starts[$done_pid]'
+            [[ -n "$_hw_dur" ]] && _hw_dur="$(job_duration "$_hw_dur")" || _hw_dur="?"
             local fin_name fin_compiler fin_vsuffix fin_display
             fin_name="$(_job_name "$finished")"
             fin_compiler="$(_job_compiler "$finished")"
@@ -3114,7 +3128,7 @@ main() {
               done
               echo "TDR @$(uptime_sec)s -- concurrent: $suspects" >> "$tdr_suspect_file"
             fi
-            echo "  [${hw_done}/${hw_total}] HW $fin_display ($fin_compiler): $hr  @$(elapsed_sec)s${tdr_tag}"
+            echo "  [${hw_done}/${hw_total}] HW $fin_display ($fin_compiler): $hr  ${_hw_dur}  @$(elapsed_sec)s${tdr_tag}"
           fi
         fi
       done
@@ -3152,14 +3166,17 @@ main() {
         # Save original log, then rerun.
         local orig_log="$RESULTS_DIR/${r_safe}${r_vsuffix}.${r_compiler}.hw.log"
         [[ -f "$orig_log" ]] && cp "$orig_log" "${orig_log%.log}.tdr-orig.log"
+        local _r_start=$EPOCHREALTIME
         run_one_hardware "$r_name" "$real_bdf" "$r_compiler" "$r_variant"
+        local _r_dur
+        _r_dur="$(job_duration "$_r_start")"
         local rr="SKIP"
         [[ -f "$RESULTS_DIR/${r_safe}${r_vsuffix}.${r_compiler}.hw.result" ]] && \
           rr="$(< "$RESULTS_DIR/${r_safe}${r_vsuffix}.${r_compiler}.hw.result")"
         if [[ "$rr" == "PASS" ]]; then
-          echo "  RETRY $r_display ($r_compiler): PASS (was TDR collateral)"
+          echo "  RETRY $r_display ($r_compiler): PASS  ${_r_dur}  (was TDR collateral)"
         else
-          echo "  RETRY $r_display ($r_compiler): $rr (confirmed failure)"
+          echo "  RETRY $r_display ($r_compiler): $rr  ${_r_dur}  (confirmed failure)"
         fi
       done
     fi
@@ -3174,7 +3191,10 @@ main() {
         q_variant="$(_job_variant "$entry")"
         q_vsuffix="$(_job_vsuffix "$entry")"
         q_display="$(_job_display "$entry")"
+        local _q_start=$EPOCHREALTIME
         run_one_hardware "$q_name" "$real_bdf" "$q_compiler" "$q_variant"
+        local _q_dur
+        _q_dur="$(job_duration "$_q_start")"
         local q_safe
         q_safe="$(sanitize_name "$q_name")"
         local qr="SKIP"
@@ -3183,7 +3203,7 @@ main() {
         ((hw_done++)) || true
         local q_tag=""
         [[ "$qr" == "TDR" ]] && q_tag=" *** TDR ***"
-        echo "  [${hw_done}/${hw_total}] HW $q_display ($q_compiler): $qr  @$(elapsed_sec)s [QUARANTINE]${q_tag}"
+        echo "  [${hw_done}/${hw_total}] HW $q_display ($q_compiler): $qr  ${_q_dur}  @$(elapsed_sec)s [QUARANTINE]${q_tag}"
       done
     fi
 
