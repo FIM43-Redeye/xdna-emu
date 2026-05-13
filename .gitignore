@@ -85,6 +85,7 @@ aie_part.json
 .claude/session-state.md
 .claude/settings.local.json
 .claude/skills/
+.claude/scheduled_tasks.lock
 
 # Python
 __pycache__/
