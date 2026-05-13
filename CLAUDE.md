@@ -757,27 +757,37 @@ substitute their own values.
 
 - **Kernel**: custom `7.0.6-custom+`. Out-of-tree `amdxdna` is
   managed by DKMS via `xrt-amdxdna/2.23.0`, source at
-  `/usr/src/xrt-amdxdna-2.23.0/`.  The source under /usr/src is
-  NOT auto-refreshed by a bare `./build.sh -release` -- only by
-  installing the produced `.deb`, or by passing `-refresh_dkms`
-  (the iteration shortcut, see below).  Module is signed at install
-  time with our MOK key (`/var/lib/shim-signed/mok/MOK.{priv,der}`),
-  so `modprobe amdxdna` works after every kernel upgrade with no
-  manual signing.  After editing driver source, refresh the
-  installed module with:
+  `/usr/src/xrt-amdxdna-2.23.0/`.  Userspace plugin (the SHIM at
+  `/opt/xilinx/xrt/lib/libxrt_driver_xdna.so.*`) is delivered by the
+  `xrt_plugin-amdxdna` .deb.  A bare `./build.sh -release` BUILDS
+  both halves but INSTALLS neither; the `.deb` sits at
+  `build/Release/xrt_plugin.*-amdxdna.deb` until `dpkg -i`'d.  Module
+  is signed at install time with our MOK key
+  (`/var/lib/shim-signed/mok/MOK.{priv,der}`), so `modprobe amdxdna`
+  works after every kernel upgrade with no manual signing.  After
+  editing driver or SHIM source, refresh both halves with:
   ```bash
   cd ~/npu-work/xdna-driver/build
   ./build.sh -release -refresh_dkms
-  pkexec sh -c 'modprobe -r amdxdna && modprobe amdxdna'
   ```
-  `-refresh_dkms` invokes the staged `dkms_driver.sh --remove/--install`
-  pair against `build/Release/opt/xilinx/xrt/share/amdxdna/`, which
-  is the same path the `.deb` postinst uses.  This keeps the
-  /usr/src tree (including `configure_kernel.sh` and the source
-  tarball) in lock-step with the dev tree -- a piecemeal rsync of
-  just the C sources will silently miss `configure_kernel.sh` and
-  produce a feature-probe mismatch (e.g. `num_rqs == 0` if upstream
-  added a probe we haven't synced yet).
+  `-refresh_dkms` is our local addition (commit 3509b2a, simplified
+  2026-05-12).  It `pkexec dpkg -i`s the OS-matched
+  `build/Release/xrt_plugin.*_${VERSION_ID}-*.deb`; the .deb postinst
+  does the rest -- runs `dkms_driver.sh --install` to populate
+  `/usr/src/xrt-amdxdna-2.23.0/` from a single canonical source
+  (script + tarball + config, NOT a piecemeal rsync that would miss
+  `configure_kernel.sh` and produce feature-probe mismatches like
+  `num_rqs == 0`), then `rmmod amdxdna && modprobe amdxdna` to swap
+  the loaded module.  Single auth prompt, both halves of the install
+  on disk, kernel module reloaded.  Stale SHIM bytes silently mask
+  source changes -- always pass `-refresh_dkms` after touching
+  driver OR SHIM code.
+
+  Caveat: the .deb postinst uses `rmmod` which fails (and the install
+  aborts) if the device is busy or the module is wedged.  In that case,
+  free the device first (kill any process holding `/dev/accel/accel0`),
+  or fall back to a manual `pkexec sh -c 'modprobe -r amdxdna; dpkg -i
+  build/Release/xrt_plugin.*_${VERSION_ID}-*.deb'`.
 - **amdxdna module options pinned**: `/etc/modprobe.d/amdxdna.conf`
   contains `options amdxdna autosuspend_ms=-1 tdr_dump_ctx=1`.
   - `autosuspend_ms=-1`: prevent runtime autosuspend. The NPU has
