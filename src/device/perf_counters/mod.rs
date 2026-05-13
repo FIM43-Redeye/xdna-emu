@@ -177,6 +177,17 @@ impl PerfCounterBank {
         self.num_counters
     }
 
+    /// Reset to construction defaults, preserving `num_counters`.
+    ///
+    /// Mirrors a real-HW column reset on hw_context teardown: zeroes
+    /// counter values, event thresholds, control events, and runtime
+    /// state. CDO/PDI replay and the patched insts.bin re-configure
+    /// thresholds and start/stop events before the next run consumes
+    /// them, so clearing here is safe and matches HW behavior.
+    pub fn reset(&mut self) {
+        *self = Self::new(self.num_counters);
+    }
+
     // -- Counter Value Access --
 
     /// Read the current value of a counter.

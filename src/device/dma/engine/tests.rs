@@ -91,6 +91,26 @@ fn test_pause_resume() {
 }
 
 #[test]
+fn test_reset_clears_pending_trace_events() {
+    // The coordinator drains trace_events once per cycle, but events
+    // generated near end-of-run can linger past the final drain. If
+    // reset() doesn't clear them, the next run picks them up on its
+    // first drain and emits them in the new trace -- the j>1 parallel
+    // sweep saw this as a 3-event count divergence in batches that
+    // followed a high-activity batch on the same runner session.
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+
+    engine.set_current_cycle(42);
+    engine.trace(EventType::DmaStartTask { channel: 0 });
+    engine.trace(EventType::DmaFinishedBd { channel: 0 });
+
+    engine.reset();
+
+    let drained = engine.drain_trace_events();
+    assert!(drained.is_empty(), "reset() must clear pending trace events, but found {drained:?}");
+}
+
+#[test]
 fn test_simple_transfer() {
     let mut engine = DmaEngine::new_compute_tile(1, 2);
     let mut tile = make_tile();

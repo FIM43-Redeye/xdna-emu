@@ -1373,10 +1373,19 @@ impl InterpreterEngine {
 
     /// Reset all cores.
     pub fn reset(&mut self) {
-        for core in &mut self.cores {
+        let rows = self.rows;
+        for (idx, core) in self.cores.iter_mut().enumerate() {
+            let col = (idx / rows) as u8;
+            let row = (idx % rows) as u8;
             core.interpreter.reset();
-            core.context.reset();
+            // ExecutionContext::reset() resets via Self::new() which sets
+            // CORE_ID to (0,0). Re-tag each core's identity so reads of
+            // CORE_ID continue to return this core's actual (col, row)
+            // -- kernels routinely branch on it.
+            core.context = ExecutionContext::new_for_tile(col, row);
             core.enabled = false;
+            core.trace_events_consumed = 0;
+            core.active_this_cycle = false;
         }
 
         self.status = EngineStatus::Ready;
@@ -1622,6 +1631,98 @@ mod tests {
         assert_eq!(engine.status(), EngineStatus::Ready);
         assert_eq!(engine.total_cycles(), 0);
         assert_eq!(engine.enabled_cores(), 0);
+    }
+
+    #[test]
+    fn test_reset_for_new_context_preserves_core_id() {
+        // ExecutionContext::reset() does `*self = Self::new()`, which
+        // calls `new_for_tile(0, 0)` and zeros the CORE_ID register for
+        // every core regardless of position. Real HW's CORE_ID is wired
+        // to the tile's position and never changes -- and AIE kernels
+        // routinely branch on it. Forgetting to re-tag the identity
+        // after reset turned every post-reset run into a "this is the
+        // (0,0) tile" simulation, which suppressed real INSTR_VECTOR /
+        // LOCK_STALL events whose firing depended on the kernel's
+        // per-tile branch -- the j>=8 sweep caught this when fresh
+        // workers (correct CORE_ID) produced different traces than
+        // post-reset workers (zeroed CORE_ID).
+        use crate::interpreter::state::CORE_ID_REG_INDEX;
+        let mut engine = InterpreterEngine::new_npu1();
+
+        let pre = engine
+            .core_context(1, 2)
+            .expect("core (1,2) exists")
+            .scalar
+            .read(CORE_ID_REG_INDEX);
+        assert_eq!(pre, (1 << 16) | 2, "fresh CORE_ID for (1,2) should be 0x10002");
+
+        engine.reset_for_new_context();
+
+        let post = engine
+            .core_context(1, 2)
+            .expect("core (1,2) exists")
+            .scalar
+            .read(CORE_ID_REG_INDEX);
+        assert_eq!(post, (1 << 16) | 2, "CORE_ID for (1,2) must survive reset; got 0x{post:08x}");
+    }
+
+    #[test]
+    fn test_reset_for_new_context_clears_perf_counter_values() {
+        // Performance counters (PERF_CNT_N) emit trace events when their
+        // running count reaches `event_value`. On real hw_context reset
+        // they zero out -- if we leave them at their prior count, the
+        // next run hits the threshold N cycles earlier than a fresh run
+        // would, emitting phantom PERF_CNT events before the new run's
+        // workload has actually generated any counted events. The j1
+        // sweep saw this as 3 extra PERF_CNT_2 events in batches that
+        // followed a high-activity batch on the same runner session
+        // (e.g., j1 batch_01=11 vs j4 batch_01=8 in add_one_using_dma).
+        let mut engine = InterpreterEngine::new_npu1();
+
+        let tile = engine.device_mut().tile_mut(0, 2).expect("tile (0,2) exists on NPU1");
+        tile.core_perf_counters.write_counter(0, 12345);
+        tile.mem_perf_counters.write_counter(1, 67890);
+
+        engine.reset_for_new_context();
+
+        let tile = engine.device_mut().tile_mut(0, 2).expect("tile (0,2) exists on NPU1");
+        assert_eq!(
+            tile.core_perf_counters.read_counter(0),
+            0,
+            "core_perf_counters[0] must zero on reset_for_new_context"
+        );
+        assert_eq!(
+            tile.mem_perf_counters.read_counter(1),
+            0,
+            "mem_perf_counters[1] must zero on reset_for_new_context"
+        );
+    }
+
+    #[test]
+    fn test_reset_for_new_context_clears_pending_mem_trace() {
+        // mem_trace_pending buffers memory-module trace events (lock
+        // acquire/release, DMA) until the coordinator drains them at
+        // each cycle boundary. Events pushed near end-of-run can outlive
+        // the final drain; if reset_for_new_context leaves them in place
+        // they reappear at cycle 0 of the next hw_context, producing
+        // phantom events that bias trace-comparison event counts. This
+        // showed up as a 3-event divergence between j=1 and j>1 sweep
+        // runs whenever a small batch followed a high-activity batch
+        // on the same runner session.
+        use crate::interpreter::state::EventType;
+        let mut engine = InterpreterEngine::new_npu1();
+
+        let tile = engine.device_mut().tile_mut(0, 2).expect("tile (0,2) exists on NPU1");
+        tile.mem_trace_pending.push((1000, EventType::LockAcquire { lock_id: 0 }));
+        tile.mem_trace_pending.push((1001, EventType::LockRelease { lock_id: 0 }));
+
+        engine.reset_for_new_context();
+
+        let drained = engine.device_mut().array.drain_mem_trace_events();
+        assert!(
+            drained.is_empty(),
+            "reset_for_new_context must clear pending mem-trace events, but found {drained:?}"
+        );
     }
 
     #[test]

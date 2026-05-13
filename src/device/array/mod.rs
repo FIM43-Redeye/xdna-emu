@@ -379,46 +379,39 @@ impl TileArray {
     }
 
     /// Reset all tiles to initial state.
+    ///
+    /// Comprehensive per-tile state reset matching a real-HW column reset:
+    /// every Tile is reconstructed via `Tile::reset_for_new_context()` so
+    /// every field returns to its `Tile::new` default (preserving memory
+    /// contents). Avoiding a hand-curated field-by-field reset prevents
+    /// new state from being silently leaked across hw_context teardowns.
     pub fn reset(&mut self) {
         for tile in &mut self.tiles {
-            tile.core.reset();
-            for lock in &mut tile.locks {
-                lock.value = 0;
-            }
-            for bd in &mut tile.dma_bds {
-                *bd = Default::default();
-            }
-            for ch in &mut tile.dma_channels {
-                *ch = Default::default();
-            }
-            // Recreate stream switch based on tile type (they have different port configurations)
-            tile.stream_switch = match tile.tile_kind {
-                TileKind::ShimNoc | TileKind::ShimPl => {
-                    crate::device::stream_switch::StreamSwitch::new_shim_tile(tile.col)
-                }
-                TileKind::Mem => crate::device::stream_switch::StreamSwitch::new_mem_tile(tile.col, tile.row),
-                TileKind::Compute => {
-                    crate::device::stream_switch::StreamSwitch::new_compute_tile(tile.col, tile.row)
-                }
+            let params = TileParams {
+                data_memory_size: self.arch.data_memory_size(tile.tile_kind),
+                num_locks: self.arch.lock_count(tile.tile_kind),
+                num_bds: self.arch.dma_bd_count(tile.tile_kind),
+                num_channels: self.arch.dma_total_channels(tile.tile_kind),
+                dma_s2mm_channels: self.arch.dma_s2mm_channels(tile.tile_kind),
+                dma_mm2s_channels: self.arch.dma_mm2s_channels(tile.tile_kind),
             };
-            // Reset trace units alongside the SS: array.reset() recreates each
-            // tile's stream_switch fresh, but trace_unit pending_words can carry
-            // orphaned payload words across the reset if post-flush hit its
-            // iteration cap mid-packet. Those leak into the new SS slave queues
-            // and get misinterpreted as headers. See trace_unit::reset() docs.
-            tile.core_trace.reset();
-            tile.mem_trace.reset();
-            // Note: We don't zero memory here for performance
-            // Call zero_memory() explicitly if needed
+            tile.reset_for_new_context(&params);
         }
 
-        // Reset all DMA engines
+        // Reset all DMA engines (clears pending trace_events, channels,
+        // task tokens, stream queues, current_cycle).
         for engine in &mut self.dma_engines {
             engine.reset();
         }
 
-        // Clear inter-tile pipeline
+        // Array-level per-context state.
+        self.current_cycle = 0;
         self.inter_tile_pipeline.clear();
+        self.fatal_errors.clear();
+        self.pending_ctrl_actions.clear();
+        for r in &mut self.ctrl_reassemblers {
+            r.reset();
+        }
     }
 
     /// Zero all tile memory (slow, use only during initialization).

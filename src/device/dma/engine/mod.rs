@@ -718,6 +718,13 @@ impl DmaEngine {
         }
         self.task_tokens.reset();
         self.stream_out.clear();
+        // Drop any trace events that the coordinator's last drain missed
+        // -- otherwise they leak into the first cycle of the next run
+        // (with the prior cycle stamps) when the new coordinator drain
+        // picks them up before reset_for_new_context can re-zero
+        // current_cycle.
+        self.trace_events.clear();
+        self.current_cycle = 0;
         // stream_in is Vec<VecDeque<_>> with one entry per S2MM channel.
         // We want to drain each per-channel queue but keep the outer Vec
         // shaped so subsequent stream_in[ch] indexing still finds its

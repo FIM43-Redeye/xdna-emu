@@ -393,6 +393,31 @@ impl Tile {
         }
     }
 
+    /// Reset all per-context state to construction defaults, preserving
+    /// memory contents and tile identity.
+    ///
+    /// Mirrors a real-HW column reset on `hw_context` teardown: locks,
+    /// DMA channels/BDs, stream switch, trace units, event modules,
+    /// timers, perf counters, edge detectors, cascade FIFOs, pending
+    /// event/broadcast/ctrl queues, register store, and runtime flags
+    /// all return to power-on defaults. Memory cells survive (HW does
+    /// not lose memory contents across column reset), and the tile's
+    /// (col, row, tile_kind) identity is preserved.
+    ///
+    /// Without a comprehensive reset, fields that survive the prior run
+    /// bias the next batch's simulation -- the parallel sweep saw this
+    /// as bit-for-bit divergence between j=1 and j>=8 runs (a fresh
+    /// worker process produced different cycle counts than a worker
+    /// whose prior batch we'd "reset" by hand-zeroing a subset of state).
+    pub fn reset_for_new_context(&mut self, params: &TileParams) {
+        // Save memory contents -- HW preserves them across column reset.
+        let saved_data = std::mem::take(&mut self.data_memory);
+        let saved_program = self.program_memory.take();
+        *self = Tile::new(self.tile_kind, self.col, self.row, params);
+        self.data_memory = saved_data;
+        self.program_memory = saved_program;
+    }
+
     /// Create a compute tile with NPU1/AIE2 default parameters.
     ///
     /// Convenience constructor for tests. Production code should use
