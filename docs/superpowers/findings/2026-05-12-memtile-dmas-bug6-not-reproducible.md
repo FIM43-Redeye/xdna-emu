@@ -6,6 +6,18 @@ type: finding
 
 # memtile_dmas TDR (bug #6) no longer reproducible in our environment
 
+> **SUPERSEDED 2026-05-12 (same day, evening session) by
+> [2026-05-12-bug6-state-dependent-post-num_rqs-fix.md](2026-05-12-bug6-state-dependent-post-num_rqs-fix.md).**
+>
+> The "reproducible TDR" that motivated this doc's title turned
+> out to be a separate, louder bug -- the `num_rqs=0` packaging
+> oops in xdna-driver's DKMS flow.  Once that was fixed, the
+> quieter underlying bug #6 memtile-DMA-completion hang remained
+> and was reproducible again.  Bug #6 is **not** fixed; it is
+> state-dependent at fresh module load and clears after one or
+> more module reload cycles.  Read the superseding doc for the
+> current picture.
+
 ## TL;DR
 
 The five `test/npu-xrt/memtile_dmas/*` tests quarantined 2026-05-09 under
