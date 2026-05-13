@@ -39,16 +39,21 @@ JOBS=$(nproc)
 GENERATE_ONLY=false
 FILTER=""
 MULTI_TILE=false
+AMDXDNA_TRACE=true   # opt-out via --no-amdxdna-trace; ringbuffer-captures
+                     # amdxdna kernel tracepoints around the HW phase so a
+                     # mid-suite wedge leaves the host->FW->IRQ->fence chain
+                     # snapshotted to $RESULTS_DIR/amdxdna.{trace,dmesg}.
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --seed)          SEED="$2"; shift 2 ;;
-        --compile)       FORCE_COMPILE=true; shift ;;
-        -j)              JOBS="$2"; shift 2 ;;
-        --generate-only) GENERATE_ONLY=true; shift ;;
-        --filter)        FILTER="$2"; shift 2 ;;
-        --multi-tile)    MULTI_TILE=true; shift ;;
-        *)               echo "Unknown option: $1"; exit 1 ;;
+        --seed)             SEED="$2"; shift 2 ;;
+        --compile)          FORCE_COMPILE=true; shift ;;
+        -j)                 JOBS="$2"; shift 2 ;;
+        --generate-only)    GENERATE_ONLY=true; shift ;;
+        --filter)           FILTER="$2"; shift 2 ;;
+        --multi-tile)       MULTI_TILE=true; shift ;;
+        --no-amdxdna-trace) AMDXDNA_TRACE=false; shift ;;
+        *)                  echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
@@ -471,6 +476,29 @@ if [[ -d "$RESULTS_DIR" ]] && [[ -z "${ISA_TEST_RESULTS:-}" ]]; then
 fi
 mkdir -p "$RESULTS_DIR"
 
+# Capture amdxdna kernel tracepoints (xdna_job, mailbox, IRQ, fence) for
+# the duration of the HW phase.  Single-pkexec daemon design: the daemon
+# spawned here holds tracing on for the whole HW phase under one auth,
+# and snapshots+disables to $RESULTS_DIR/amdxdna.* when we remove the
+# sentinel at Phase 5 boundary.  No second pkexec, no auth-gap delay
+# mid-suite.  Daemon's EXIT trap also handles parent-died and signal-
+# killed cases.
+AMDXDNA_SENTINEL=""
+AMDXDNA_DAEMON_PID=""
+if $AMDXDNA_TRACE; then
+    AMDXDNA_SENTINEL=$(mktemp /tmp/claude-1000/amdxdna-trace.isa.XXXXXX 2>/dev/null \
+                       || mktemp /tmp/amdxdna-trace.isa.XXXXXX)
+    pkexec "$PROJECT_DIR/tools/amdxdna-trace.sh" daemon \
+        "$AMDXDNA_SENTINEL" $$ "$RESULTS_DIR" amdxdna &
+    AMDXDNA_DAEMON_PID=$!
+    sleep 1   # let daemon set up tracing before HW jobs start
+    if ! kill -0 $AMDXDNA_DAEMON_PID 2>/dev/null; then
+        echo "WARN: amdxdna-trace daemon failed to start; continuing without it"
+        AMDXDNA_TRACE=false
+        rm -f "$AMDXDNA_SENTINEL"
+    fi
+fi
+
 if $MULTI_TILE; then
     # Multi-tile HW execution: one xclbin per phase, serial.
     echo "--- Phase 4: Run HW (multi-tile, serial) ---"
@@ -563,6 +591,12 @@ else
             fi
         done <<< "$BATCH_INFO"
     echo ""
+fi
+
+if $AMDXDNA_TRACE; then
+    # Signal the daemon to wrap up: remove sentinel, wait for snapshot+disable.
+    rm -f "$AMDXDNA_SENTINEL"
+    wait "$AMDXDNA_DAEMON_PID" 2>/dev/null || true
 fi
 
 # ---- Phase 5: Run EMU ----

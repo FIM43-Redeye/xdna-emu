@@ -89,6 +89,10 @@ LIST_ONLY=false
 VERBOSE=false
 COMPILER_MODE="both"  # "both", "chess", "peano"
 NO_TRACE="${NO_TRACE:-false}"
+AMDXDNA_TRACE=true   # opt-out via --no-amdxdna-trace; ringbuffer-captures
+                     # amdxdna kernel tracepoints around the HW phase so a
+                     # mid-sweep wedge leaves the host->FW->IRQ->fence chain
+                     # snapshotted to $RESULTS_DIR/amdxdna.{trace,dmesg}.
 SWEEP=false
 PC_ANCHORED=false
 MODE2=false
@@ -125,6 +129,7 @@ while [[ $# -gt 0 ]]; do
     --peano-only|--peano)  COMPILER_MODE="peano"; shift ;;
     --no-trace)            NO_TRACE=true; shift ;;
     --trace)               NO_TRACE=false; shift ;;
+    --no-amdxdna-trace)    AMDXDNA_TRACE=false; shift ;;
     --sweep)               SWEEP=true; shift ;;
     --trace=pc-anchored)   PC_ANCHORED=true; NO_TRACE=false; shift ;;
     --mode2)               MODE2=true; PC_ANCHORED=true; NO_TRACE=false; shift ;;
@@ -145,6 +150,11 @@ Options:
   --trace         Enable trace injection and comparison (default: on)
   --no-trace      Disable trace preparation (e.g., when only validating
                   functional correctness)
+  --no-amdxdna-trace
+                  Skip amdxdna kernel tracepoint capture around the HW
+                  phase (default: enabled).  When on, ringbuffer-captures
+                  xdna_job + mailbox events to RESULTS_DIR/amdxdna.{trace,
+                  dmesg} so a mid-sweep wedge leaves diagnosable history.
   --sweep         Run full event sweep (trace-sweep.py) on passing tests after runs
   --trace=pc-anchored
                   Run mode-1 (event_pc) lockstep sweep on passing tests and
@@ -3002,6 +3012,31 @@ main() {
   if $RUN_HW; then
     local tdr_suspect_file="$RESULTS_DIR/tdr_suspects.log"
     : > "$tdr_suspect_file"
+
+    # Capture amdxdna kernel tracepoints (xdna_job, mailbox, IRQ, fence)
+    # for the duration of the HW phase.  Single-pkexec daemon design:
+    # the daemon spawned here holds tracing on for the whole HW phase
+    # under one auth, and snapshots+disables to $RESULTS_DIR/amdxdna.*
+    # when we remove the sentinel below.  No second pkexec, no auth-gap
+    # delay mid-sweep.  Daemon's EXIT trap also handles parent-died and
+    # signal-killed cases.
+    local amdxdna_sentinel="" amdxdna_daemon_pid=""
+    if $AMDXDNA_TRACE; then
+      amdxdna_sentinel=$(mktemp /tmp/claude-1000/amdxdna-trace.bridge.XXXXXX 2>/dev/null \
+                         || mktemp /tmp/amdxdna-trace.bridge.XXXXXX)
+      pkexec "$EMU_ROOT/tools/amdxdna-trace.sh" daemon \
+        "$amdxdna_sentinel" $$ "$RESULTS_DIR" amdxdna &
+      amdxdna_daemon_pid=$!
+      # Give the daemon time to set up tracing before HW jobs start.
+      # 1s is comfortable -- pkexec auth takes orders of magnitude longer
+      # than the actual setup.
+      sleep 1
+      if ! kill -0 $amdxdna_daemon_pid 2>/dev/null; then
+        info "WARN: amdxdna-trace daemon failed to start; continuing without it"
+        AMDXDNA_TRACE=false
+        rm -f "$amdxdna_sentinel"
+      fi
+    fi
     local hw_total=$(( ${#hw_parallel_jobs[@]} + ${#hw_quarantine_jobs[@]} ))
     local hw_done=0
 
@@ -3125,6 +3160,12 @@ main() {
         [[ "$qr" == "TDR" ]] && q_tag=" *** TDR ***"
         echo "  [${hw_done}/${hw_total}] HW $q_display ($q_compiler): $qr  @$(elapsed_sec)s [QUARANTINE]${q_tag}"
       done
+    fi
+
+    if $AMDXDNA_TRACE; then
+      # Signal the daemon to wrap up: remove sentinel, wait for snapshot+disable.
+      rm -f "$amdxdna_sentinel"
+      wait "$amdxdna_daemon_pid" 2>/dev/null || true
     fi
 
     info "HW runs done"
