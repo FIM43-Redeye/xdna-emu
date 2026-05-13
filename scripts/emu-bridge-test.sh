@@ -3162,13 +3162,11 @@ main() {
       done
     fi
 
-    if $AMDXDNA_TRACE; then
-      # Signal the daemon to wrap up: remove sentinel, wait for snapshot+disable.
-      rm -f "$amdxdna_sentinel"
-      wait "$amdxdna_daemon_pid" 2>/dev/null || true
-    fi
-
     info "HW runs done"
+    # NOTE: amdxdna-trace daemon stays alive past HW phase to also cover
+    # Phase 5b sweep mode + Phase 5b' PC-anchored sweep, both of which
+    # touch the NPU.  Snapshot+disable lands just before Phase 6 (report)
+    # below, so a sweep-mode wedge gets captured in the trace too.
   fi
 
   # Now launch EMU for all jobs (parallel, no NPU constraint).
@@ -3342,8 +3340,14 @@ main() {
             --tiles "$tile_spec"
             --out-dir "$sweep_dir"
             --core-sweep all
-            --reuse-ctx
           )
+          # NOTE: --reuse-ctx removed 2026-05-13 -- it sets
+          # BRIDGE_RUNNER_REUSE_CONTEXT=1 in the runner, which the runner's
+          # own comment flags as "unsafe-but-faster... will hit the timeout
+          # pattern."  Reproducibly wedged the box on add_one_ctrl_packet
+          # (chess) under our sweep load.  Strict serial (no ctx reuse)
+          # eliminates the multi-job-in-one-ctx wedge.  Cost: a few % of
+          # sweep wallclock.  Worth it.
           if [[ "$arm" == "hw" ]]; then
             sweep_args+=(--no-emu)
           else
@@ -3398,7 +3402,8 @@ main() {
   # compute tiles are found the test is skipped with a warning.
   #
   # Grounding: PERF_CNT_2,INSTR_EVENT_0,INSTR_EVENT_1 (default for mode-1).
-  # The sweep uses --reuse-ctx to cut per-batch latency on Phoenix.
+  # The sweep ran with --reuse-ctx historically; removed 2026-05-13 after
+  # it reproducibly wedged the box on add_one_ctrl_packet (chess).
   #
   # Mode-2 baseline (Phase 6 / Task 6.2):
   #   trace-sweep.py's --with-mode2-baseline is on by default, so each
@@ -3494,8 +3499,9 @@ main() {
               --out-dir "$sweep_dir"
               --mode event_pc
               --core-grounding "PERF_CNT_2,INSTR_EVENT_0,INSTR_EVENT_1"
-              --reuse-ctx
             )
+            # --reuse-ctx removed 2026-05-13 (see Phase 5b note above for
+            # the wedge it triggers under our sweep load).
             # Mode-2 baseline capture: trace-sweep.py defaults this on, but
             # we pass it explicitly when --mode2 is set so a future default
             # flip upstream cannot silently turn it off here. Without
@@ -3666,6 +3672,12 @@ main() {
         info "Phase 5c done: $aiesim_pass pass, $aiesim_fail fail"
       fi
     fi
+  fi
+
+  # ---- Snapshot+disable amdxdna trace daemon (covers HW + Phase 5b/5b' sweep) ----
+  if $AMDXDNA_TRACE && [[ -n "$amdxdna_sentinel" ]] && [[ -e "$amdxdna_sentinel" ]]; then
+    rm -f "$amdxdna_sentinel"
+    wait "$amdxdna_daemon_pid" 2>/dev/null || true
   fi
 
   # ---- Phase 6: Report ---------------------------------------------------

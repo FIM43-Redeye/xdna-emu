@@ -1101,14 +1101,19 @@ bool reuse_context_across_runs() {
 // sync to ~85 ms async, but parse-trace.py dominates at ~900 ms/batch
 // so most of the runner savings are hidden in the total.
 //
-// Disable with BRIDGE_RUNNER_ASYNC_CTX=0 to fall back to the
-// synchronous teardown path (useful for debugging or isolating
-// regressions).
+// DEFAULT FLIPPED 2026-05-13 to false: async pipeline keeps up to 3
+// hw_contexts live simultaneously (builder pre-building next, main
+// running current, destroyer tearing down previous), each with its
+// own mailbox traffic.  Strict "one job in flight on the NPU period"
+// rule (Phoenix supports ~5 ctxs total but contention causes wedges
+// under sweep load -- see add_one_ctrl_packet (chess) wedge
+// 2026-05-13) means we want exactly one ctx active at a time, full
+// stop.  Opt back in with BRIDGE_RUNNER_ASYNC_CTX=1 if benchmarking.
 bool async_ctx_enabled() {
     if (const char* v = std::getenv("BRIDGE_RUNNER_ASYNC_CTX")) {
         return std::atoi(v) != 0;
     }
-    return true;
+    return false;
 }
 
 // How many ready hw_contexts to keep pre-built. Default 1 is enough for
