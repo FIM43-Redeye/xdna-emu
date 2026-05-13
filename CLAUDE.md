@@ -694,11 +694,13 @@ When the NPU wedges, recovery escalates through:
    mailbox has been killed by an `AIE_RW_ACCESS` memtile-read timeout
    (or an equivalent firmware-level hang), `modprobe -r` itself wedges
    uninterruptibly in `drm_dev_unplug -> synchronize_srcu` and reboot
-   becomes the only recovery path.  Setting `tdr_dump_ctx=1` (now
-   persistent in `/etc/modprobe.d/amdxdna.conf`) avoids the recover
-   path that triggers this poisoning -- always verify
-   `cat /sys/module/amdxdna/parameters/tdr_dump_ctx` reports `Y`
-   before iterating on tests known to TDR.
+   becomes the only recovery path.  We previously set `tdr_dump_ctx=1`
+   to disable TDR recovery and avoid that poisoning, but that turned
+   every firmware silent-drop into a permanent `aie2_hmm_invalidate`
+   wedge requiring reboot anyway (see
+   `docs/superpowers/findings/2026-05-13-chain-exec-npu-silent-drop-on-phoenix.md`).
+   We removed `tdr_dump_ctx=1` on 2026-05-13: TDR now actually recovers,
+   so `modprobe -r` is again attempted-first when the NPU wedges.
 
 2. **Bridge PM-cycle** -- reset the upstream bridge function:
    ```bash
@@ -789,26 +791,32 @@ substitute their own values.
   or fall back to a manual `pkexec sh -c 'modprobe -r amdxdna; dpkg -i
   build/Release/xrt_plugin.*_${VERSION_ID}-*.deb'`.
 - **amdxdna module options pinned**: `/etc/modprobe.d/amdxdna.conf`
-  contains `options amdxdna autosuspend_ms=-1 tdr_dump_ctx=1`.
+  contains `options amdxdna autosuspend_ms=-1`.
   - `autosuspend_ms=-1`: prevent runtime autosuspend. The NPU has
     been observed to wedge on auto-resume after certain mailbox
     failures (e.g. struct-size mismatches that leave firmware in
     an unrecoverable state). Pinning autosuspend off keeps the
     device alive so we never hit the broken resume path.
-  - `tdr_dump_ctx=1`: TDR detects every 2s but only dumps ctx
-    info, never recovers (skips `aie2_rq_stop_all/restart_all`).
-    Required because the recover path on Phoenix can leave the
-    firmware mailbox in a state where reg-read messages hang and
-    `modprobe -r` wedges in `drm_dev_unplug -> synchronize_srcu`.
-    Trade-off: hung kernels stay hung until manual `modprobe
-    -r/+r`, instead of being killed by TDR after 2s.  See
-    `docs/superpowers/findings/2026-05-09-bridge-test-contention-and-trace-wedge.md`
-    for the full failure-mode chain.
 
-  Both are workarounds for development; revert if the underlying
-  wedges are diagnosed and fixed. Verify with
-  `cat /sys/module/amdxdna/parameters/{autosuspend_ms,tdr_dump_ctx}`
-  (should report `-1` and `Y`).
+  Workaround for development; revert once the underlying wedges
+  are diagnosed and fixed. Verify with
+  `cat /sys/module/amdxdna/parameters/autosuspend_ms`
+  (should report `-1`).
+
+  **Removed 2026-05-13: `tdr_dump_ctx=1`.** Originally set so TDR
+  was dump-only (no `aie2_rq_stop_all/restart_all`), avoiding the
+  `synchronize_srcu` wedge in `modprobe -r` after the recover path
+  poisoned the mailbox on Phoenix. But disabling TDR recovery made
+  every firmware silent-drop (e.g. CHAIN_EXEC_NPU on ctrl_packet
+  sweeps) into a permanent `aie2_hmm_invalidate` wedge -- the
+  driver-design comment at `aie2_ctx.c:1017` explicitly relies on
+  TDR to terminate the ctx if firmware doesn't respond, so without
+  recovery the `dma_resv_wait_timeout(MAX_SCHEDULE_TIMEOUT)` in
+  hmm_invalidate waits forever. We were rebooting from those
+  wedges anyway, so the original trade is gone -- letting TDR
+  recover trades a permanent wedge for a possible (not certain)
+  modprobe -r wedge. See
+  `docs/superpowers/findings/2026-05-13-chain-exec-npu-silent-drop-on-phoenix.md`.
 - **dmesg is unrestricted**: kernel built with `kernel.dmesg_restrict=0`
   (or equivalent), so `dmesg` works without `pkexec`. Don't wrap dmesg
   in pkexec on this machine.
