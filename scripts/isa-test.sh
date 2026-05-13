@@ -60,12 +60,12 @@ RESULTS_BASE="${PROJECT_DIR}/build/isa-test-results"
 RESULTS_DIR="${ISA_TEST_RESULTS:-${RESULTS_BASE}/latest}"
 
 # Determine which EMU profile to use and check for stale builds.
-EMU_PROFILE="${XDNA_EMU:-debug}"
+EMU_PROFILE="${XDNA_EMU_RUNTIME:-debug}"
 EMU_LIB="${PROJECT_DIR}/target/${EMU_PROFILE}/libxdna_emu.so"
 if [[ ! -f "$EMU_LIB" ]]; then
     echo "WARNING: EMU lib not found at $EMU_LIB"
     echo "  Run: cargo build $([ "$EMU_PROFILE" = "release" ] && echo "--release")"
-    echo "  Or set XDNA_EMU=release to use the release profile."
+    echo "  Or set XDNA_EMU_RUNTIME=release to use the release profile."
 fi
 # Auto-rebuild if the EMU lib is older than any Rust source file.
 # This ensures the plugin always matches the current code -- manual rebuilds
@@ -502,8 +502,8 @@ print(total_in, total_out)
             hw_out="${RESULTS_DIR}/phase_${pidx}_hw.bin"
             hw_log="${RESULTS_DIR}/phase_${pidx}_hw.log"
             rc=0
-            # Unset XDNA_EMU for HW runs so they go through the real NPU.
-            env -u XDNA_EMU timeout 30 "$HOST_BIN" \
+            # Unset XDNA_EMU* for HW runs so they go through the real NPU.
+            env -u XDNA_EMU -u XDNA_EMU_RUNTIME timeout 30 "$HOST_BIN" \
                 -x "${phase_dir}/aie.xclbin" \
                 -k MLIR_AIE \
                 -i "${phase_dir}/insts.bin" \
@@ -541,9 +541,9 @@ else
 
             hw_log="${RESULTS_DIR}/batch_${idx}_hw.log"
             rc=0
-            # Unset XDNA_EMU for HW runs so they go through the real NPU,
-            # not the emulator plugin.  Use env -u to fully remove it.
-            env -u XDNA_EMU timeout 30 "$HOST_BIN" \
+            # Unset XDNA_EMU* for HW runs so they go through the real NPU,
+            # not the emulator plugin.  Use env -u to fully remove them.
+            env -u XDNA_EMU -u XDNA_EMU_RUNTIME timeout 30 "$HOST_BIN" \
                 -x "${batch_dir}/aie.xclbin" \
                 -k MLIR_AIE \
                 -i "${batch_dir}/insts.bin" \
@@ -581,7 +581,7 @@ if $MULTI_TILE; then
                 return 0
             fi
 
-            if XDNA_EMU="$EMU_PROFILE" "$HOST_BIN" \
+            if XDNA_EMU=1 XDNA_EMU_RUNTIME="$EMU_PROFILE" "$HOST_BIN" \
                 -x "${phase_dir}/aie.xclbin" \
                 -k MLIR_AIE \
                 -i "${phase_dir}/insts.bin" \
@@ -595,7 +595,8 @@ if $MULTI_TILE; then
         }
         export -f run_emu_phase
         export HOST_BIN OUT_DIR RESULTS_DIR SEED EMU_PROFILE MANIFEST
-        export XDNA_EMU="$EMU_PROFILE"
+        export XDNA_EMU=1
+        export XDNA_EMU_RUNTIME="$EMU_PROFILE"
 
         # Build argument list: pidx batch_list in_size out_size (null-separated).
         printf '%b' "$PHASE_INFO" | while IFS=' ' read -r pidx batch_list; do
@@ -632,7 +633,7 @@ else
                 return 0
             fi
 
-            if XDNA_EMU="$EMU_PROFILE" "$HOST_BIN" \
+            if XDNA_EMU=1 XDNA_EMU_RUNTIME="$EMU_PROFILE" "$HOST_BIN" \
                 -x "${batch_dir}/aie.xclbin" \
                 -k MLIR_AIE \
                 -i "${batch_dir}/insts.bin" \
@@ -646,11 +647,12 @@ else
         }
         export -f run_emu_one
         export HOST_BIN OUT_DIR RESULTS_DIR SEED EMU_PROFILE
-        # Export XDNA_EMU so xargs subprocesses inherit it reliably.
-        # The inline XDNA_EMU="$EMU_PROFILE" in run_emu_one is belt-and-
-        # suspenders, but xargs spawns via bash -c which can miss inline
-        # env vars if the shell fast-paths the exec.
-        export XDNA_EMU="$EMU_PROFILE"
+        # Export XDNA_EMU* so xargs subprocesses inherit them reliably.
+        # The inline XDNA_EMU=1 XDNA_EMU_RUNTIME=... in run_emu_one is
+        # belt-and-suspenders, but xargs spawns via bash -c which can miss
+        # inline env vars if the shell fast-paths the exec.
+        export XDNA_EMU=1
+        export XDNA_EMU_RUNTIME="$EMU_PROFILE"
 
         echo "$BATCH_INFO" | while IFS=' ' read -r idx filename in_size out_size source_type; do
             # Skip pair batches in single-tile mode.

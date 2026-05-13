@@ -460,7 +460,7 @@ Chess is ground truth; Peano failures are informational. Five phases:
 discover, compile (parallel), run HW (-j5), run EMU (-j nproc), report.
 
 Flags: `--chess-only`, `--peano-only`, `--no-hw`, `--compile`,
-`--serial-hw`, `--trace=sweep`, `-v <filter>`.
+`--serial-hw`, `--sweep`, `--trace=pc-anchored`, `-v <filter>`.
 
 **Build dirs**: `mlir-aie/build/test/npu-xrt/$name/chess/` and `peano/`
 **Results**: `build/bridge-test-results/YYYYMMDD/` (symlink at `build/bridge-test-results/latest`)
@@ -513,9 +513,15 @@ See `tools/deprecated/README.md` for rationale.
 Driver plugin replacing the real XDNA kernel driver. XRT loads the .so,
 which delegates to the Rust emulator via FFI (`src/ffi/`).
 
-**Build**: `./scripts/rebuild-plugin.sh`
-**Install**: `pkexec cp xrt-plugin/build/libxrt_driver_emu.so.2 /opt/xilinx/xrt/lib/`
-**Activation**: Set `XDNA_EMU=1` before running test.exe.
+**Build**: `./scripts/rebuild-plugin.sh` (debug) / `--release` (release)
+**Install**: rebuild-plugin.sh symlinks the build output into `/opt/xilinx/xrt/lib/`.
+**Env contract**:
+- `XDNA_EMU` -- presence (any value) activates the emulator. Plugin replaces
+  `xrt::device(0)` so tests target the emulator with no BDF magic. Unset =
+  real HW.
+- `XDNA_EMU_RUNTIME=release|debug` -- which `.so` profile to dlopen
+  (default `debug`).
+- For HW invocations from a poisoned shell, use `env -u XDNA_EMU XDNA_EMU_RUNTIME`.
 
 ## How To Begin
 
@@ -555,7 +561,7 @@ to specified address ranges. Format: comma-separated `address:bytes` pairs
 
 ```bash
 # Watch three addresses (40 bytes each) during a bridge test
-XDNA_EMU=debug XDNA_EMU_WATCH=0xC000:40,0x428:40,0x400:40 RUST_LOG=info \
+XDNA_EMU=1 XDNA_EMU_WATCH=0xC000:40,0x428:40,0x400:40 RUST_LOG=info \
   ./test.exe 2>watch.log
 grep "\[WATCH\]" watch.log
 ```
@@ -804,7 +810,9 @@ substitute their own values.
 - **mlir-aie venv**: `/home/triple/npu-work/mlir-aie/ironenv/`
 - **PYTHONPATH**: `/home/triple/npu-work/mlir-aie/install/python`
 - **XRT plugin**: `./scripts/rebuild-plugin.sh` builds and installs the
-  debug `.so` by default (`--release` for release). `XDNA_EMU=debug`
-  or `release` selects the lib profile via `XDNA_EMU_DIR` at runtime.
+  debug `.so` by default (`--release` for release). Activation:
+  `XDNA_EMU=1` (any value) routes XRT to the emulator at `xrt::device(0)`.
+  Profile: `XDNA_EMU_RUNTIME=release|debug` (default `debug`); the plugin
+  picks the matching `.so` via `XDNA_EMU_DIR` or installed symlinks.
 - **Trace column offset**: emulator col=0 vs HW col=start_col (cosmetic;
   trace tools should normalize).

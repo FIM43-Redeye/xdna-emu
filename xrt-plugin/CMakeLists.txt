@@ -60,7 +60,12 @@ set(SHIM_SOURCES
   ${XDNA_SHIM_DIR}/hwq.cpp
   ${XDNA_SHIM_DIR}/buffer.cpp
   ${XDNA_SHIM_DIR}/fence.cpp
-  ${XDNA_SHIM_DIR}/smi_xdna.cpp
+  # smi_xdna.cpp was removed upstream in favor of core_common_smi_objects
+  # (smi.cpp + smi_ryzen.cpp under xrt/src/runtime_src/core/common/smi/).
+  # Compile those into the plugin since our installed libxrt_coreutil.so
+  # predates the refactor and does not export those symbols.
+  ${XRT_RUNTIME_SRC}/core/common/smi/smi.cpp
+  ${XRT_RUNTIME_SRC}/core/common/smi/smi_ryzen.cpp
 )
 
 add_library(xrt_driver_emu SHARED

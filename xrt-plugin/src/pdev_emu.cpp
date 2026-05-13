@@ -18,37 +18,39 @@ on_first_open() const
 
   // Determine library path.
   //
+  // Env contract:
+  //   XDNA_EMU             -- presence (any value) activates the emulator.
+  //                           Checked in drv_emu.cpp::scan_devices.
+  //   XDNA_EMU_RUNTIME     -- "release" or "debug" (default "debug"). Picks
+  //                           which Cargo build profile of libxdna_emu.so to
+  //                           dlopen.
+  //   XDNA_EMU_DIR         -- optional explicit path override; honored as-is
+  //                           with no further fallbacks.
+  //
   // Resolution order:
-  //   1. XDNA_EMU_DIR + XDNA_EMU profile -- e.g. $XDNA_EMU_DIR/target/debug/libxdna_emu.so
-  //      (explicit path override; honored as-is, no further fallbacks).
-  //      XDNA_EMU="debug" or "release" selects the Cargo profile.
-  //      XDNA_EMU="1" (or any other truthy value) defaults to "debug".
+  //   1. XDNA_EMU_DIR + XDNA_EMU_RUNTIME -- $XDNA_EMU_DIR/target/<profile>/libxdna_emu.so
   //   2. Profile-named lib in the standard search path --
   //      libxdna_emu_debug.so or libxdna_emu_release.so (installed as symlinks
   //      in /opt/xilinx/xrt/lib/ by rebuild-plugin.sh).
   //   3. Plain libxdna_emu.so via ldconfig/LD_LIBRARY_PATH (legacy fallback).
   const char* dir_env = std::getenv("XDNA_EMU_DIR");
-  const char* emu_env = std::getenv("XDNA_EMU");
+  const char* runtime_env = std::getenv("XDNA_EMU_RUNTIME");
   std::string profile = "debug";  // default
-  if (emu_env) {
-    std::string val(emu_env);
-    if (val == "release")
-      profile = "release";
-    // "debug", "1", or any other truthy value -> debug
-  }
+  if (runtime_env && std::string(runtime_env) == "release")
+    profile = "release";
 
   if (dir_env && dir_env[0] != '\0') {
     // Explicit override: use it verbatim, no fallbacks.
     std::string lib_path = std::string(dir_env) + "/target/" + profile +
                            "/libxdna_emu.so";
-    EMU_INFO("Loading emulator library: %s (profile=%s, XDNA_EMU_DIR override)",
+    EMU_INFO("Loading emulator library: %s (XDNA_EMU_RUNTIME=%s, XDNA_EMU_DIR override)",
              lib_path.c_str(), profile.c_str());
     m_transport = emu_transport::create_inprocess(lib_path);
   } else {
     // No override: try profile-suffixed name first, then plain name.
     std::string profiled = "libxdna_emu_" + profile + ".so";
     std::string plain    = "libxdna_emu.so";
-    EMU_INFO("Loading emulator library: %s (profile=%s)",
+    EMU_INFO("Loading emulator library: %s (XDNA_EMU_RUNTIME=%s)",
              profiled.c_str(), profile.c_str());
     try {
       m_transport = emu_transport::create_inprocess(profiled);

@@ -7,7 +7,7 @@
 # (Chess and Peano) through two execution paths, producing a per-compiler
 # comparison matrix:
 #
-#   1. XRT bridge + emulator  (XDNA_EMU=1 ./test.exe)
+#   1. XRT bridge + emulator  (XDNA_EMU=1 [XDNA_EMU_RUNTIME=release] ./test.exe)
 #   2. XRT bridge + real hardware  (./test.exe with real BDF)
 #
 # Chess is the ground truth compiler. Peano results are informational --
@@ -838,9 +838,12 @@ _run_trace_cycles_pipeline() {
     # on real silicon, so nothing extra is needed.
     local -a env_prefix=()
     if [[ "$side" == "EMU" ]]; then
-        env_prefix+=("XDNA_EMU=${XDNA_EMU:-debug}")
+        # XDNA_EMU presence (any value) activates the emulator; the plugin
+        # injects the emu device at xrt::device(0), no BDF magic needed.
+        # XDNA_EMU_RUNTIME picks debug vs release.
+        env_prefix+=("XDNA_EMU=1")
+        env_prefix+=("XDNA_EMU_RUNTIME=${XDNA_EMU_RUNTIME:-debug}")
         env_prefix+=("XDNA_EMU_LOG_LEVEL=${XDNA_EMU_LOG_LEVEL:-info}")
-        env_prefix+=("XRT_DEVICE_BDF=ffff:ff:1f.0")
         [[ -n "${XDNA_EMU_DIR:-}" ]] && env_prefix+=("XDNA_EMU_DIR=$XDNA_EMU_DIR")
     fi
 
@@ -1951,6 +1954,9 @@ run_one_hardware() {
   local rc=0
   (
     cd "$build_dir"
+    # Hygiene: ensure no leaked XDNA_EMU* in the outer env routes us
+    # through the emulator instead of real silicon.
+    unset XDNA_EMU XDNA_EMU_RUNTIME
     export XRT_DEVICE_BDF="$bdf"
     export XDNA_TRACE_DIR="$trace_out_dir"
     timeout 30 bash -c "$run_cmd"
@@ -2107,11 +2113,11 @@ run_one_bridge() {
   local rc=0
   (
     cd "$build_dir"
-    export XDNA_EMU="${XDNA_EMU:-debug}"
+    export XDNA_EMU=1
+    export XDNA_EMU_RUNTIME="${XDNA_EMU_RUNTIME:-debug}"
     export XDNA_EMU_LOG_LEVEL="${XDNA_EMU_LOG_LEVEL:-info}"
     # Pass through XDNA_EMU_LIB if set (explicit override).
     [[ -n "${XDNA_EMU_LIB:-}" ]] && export XDNA_EMU_LIB
-    export XRT_DEVICE_BDF="ffff:ff:1f.0"
     export XDNA_TRACE_DIR="$trace_out_dir"
     if [[ -n "$_cycle_budget" ]]; then
       export XDNA_EMU_MAX_CYCLES="$_cycle_budget"
@@ -2833,10 +2839,8 @@ main() {
 
   # ---- Phase 1b: Auto-rebuild plugin if Rust lib is newer ----------------
 
-  # Determine profile from XDNA_EMU env (matches runtime selection).
-  local emu_profile="${XDNA_EMU:-debug}"
-  # XDNA_EMU=1 is legacy shorthand for "debug".
-  [[ "$emu_profile" == "1" ]] && emu_profile="debug"
+  # Determine profile from XDNA_EMU_RUNTIME env (matches plugin selection).
+  local emu_profile="${XDNA_EMU_RUNTIME:-debug}"
   local rust_lib="$EMU_ROOT/target/$emu_profile/libxdna_emu.so"
   local installed_plugin="$XRT_LIB/libxrt_driver_emu.so.2.21.0"
 

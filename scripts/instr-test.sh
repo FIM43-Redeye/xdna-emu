@@ -245,7 +245,7 @@ if $RUN_EMU; then
             return 0
         fi
 
-        XDNA_EMU="${XDNA_EMU:-debug}" "$HOST_BIN" \
+        XDNA_EMU=1 XDNA_EMU_RUNTIME="${XDNA_EMU_RUNTIME:-debug}" "$HOST_BIN" \
             -x "${test_dir}/aie.xclbin" \
             -k MLIR_AIE \
             -i "${test_dir}/insts.bin" \

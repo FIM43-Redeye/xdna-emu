@@ -64,7 +64,9 @@ drv_emu::
 scan_devices(std::vector<std::shared_ptr<xrt_core::pci::dev>>& ready_list,
              std::vector<std::shared_ptr<xrt_core::pci::dev>>& /*nonready_list*/) const
 {
-  // Only inject the emulator device when XDNA_EMU is set.
+  // Only inject the emulator device when XDNA_EMU is set.  Presence is the
+  // trigger; the value is ignored ("0" still maps to off as a small
+  // affordance).  XDNA_EMU_RUNTIME picks debug vs release; see pdev_emu.cpp.
   const char* env = std::getenv("XDNA_EMU");
   if (!env || std::string(env) == "0")
     return;
@@ -72,12 +74,13 @@ scan_devices(std::vector<std::shared_ptr<xrt_core::pci::dev>>& ready_list,
   // Insert the emulator device at index 0 so that `xrt::device(0)` -- the
   // convention used by all mlir-aie test binaries -- selects the emulator
   // instead of real hardware.  This way `XDNA_EMU=1 ./test.exe` just works
-  // without needing XRT_DEVICE_BDF or patched test sources.
+  // without any BDF environment variable or patched test sources.
   //
   // XRT calls scan_devices() on each registered driver in load order,
   // appending to the shared ready_list.  By inserting at the front, the
   // emulator stays at index 0 regardless of whether other drivers have
-  // already added real devices.
+  // already added real devices.  (The synthetic BDF below is just an
+  // identifier; it is no longer part of the user-facing contract.)
   ready_list.insert(ready_list.begin(), create_pcidev("ffff:ff:1f.0"));
 }
 

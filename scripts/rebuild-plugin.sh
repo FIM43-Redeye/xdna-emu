@@ -54,7 +54,7 @@ XRT_PLUGIN="/opt/xilinx/xrt/lib/libxrt_driver_emu.so.2.21.0"
 #   libxdna_emu_debug.so   -> target/debug/libxdna_emu.so
 #   libxdna_emu_release.so -> target/release/libxdna_emu.so
 # The plugin dlopens libxdna_emu_<profile>.so first (from pdev_emu.cpp) so
-# debug/release selection works via XDNA_EMU env var without XDNA_EMU_DIR.
+# debug/release selection works via XDNA_EMU_RUNTIME env var without XDNA_EMU_DIR.
 XRT_LIB_DIR="/opt/xilinx/xrt/lib"
 PROFILE_LINK="$XRT_LIB_DIR/libxdna_emu_${PROFILE}.so"
 
@@ -70,7 +70,7 @@ if [[ ! -f "$CPP_PLUGIN" ]] || [[ ! -s "$CPP_PLUGIN" ]]; then
 fi
 
 # Install the C++ plugin to XRT. The Rust .so stays in target/ and is
-# loaded by the plugin at runtime via dlopen (path resolved from XDNA_EMU).
+# loaded by the plugin at runtime via dlopen (path resolved from XDNA_EMU_RUNTIME).
 #
 # If $XRT_PLUGIN is a symlink pointing at our build output, no install
 # is needed -- XRT picks up the build output directly.
@@ -152,7 +152,7 @@ NEEDS_LDCONFIG=0
 
 install_profile_symlink "$PROFILE"
 # Also refresh the OTHER profile's symlink if its build exists, so toggling
-# XDNA_EMU between debug/release just works without re-running this script.
+# XDNA_EMU_RUNTIME between debug/release just works without re-running this script.
 OTHER_PROFILE="debug"
 [[ "$PROFILE" == "debug" ]] && OTHER_PROFILE="release"
 install_profile_symlink "$OTHER_PROFILE"
@@ -170,4 +170,8 @@ fi
 
 echo ">>> Rust lib: $RUST_LIB"
 echo ">>> Profile symlink: $PROFILE_LINK -> $RUST_LIB"
-echo ">>> EMU test usage: XDNA_EMU=$PROFILE ./test.exe"
+if [[ "$PROFILE" == "debug" ]]; then
+  echo ">>> EMU test usage: XDNA_EMU=1 ./test.exe"
+else
+  echo ">>> EMU test usage: XDNA_EMU=1 XDNA_EMU_RUNTIME=$PROFILE ./test.exe"
+fi

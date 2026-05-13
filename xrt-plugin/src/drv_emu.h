@@ -5,8 +5,10 @@
 // Registers drv_emu with XRT's driver list via the same static-init
 // pattern used by the real xdna shim (pcidrv_amdxdna.cpp).
 //
-// When XDNA_EMU=1, scan_devices() injects a synthetic pdev_emu into
-// the ready list. Otherwise the driver is loaded but invisible.
+// When XDNA_EMU is set (any value), scan_devices() injects a synthetic
+// pdev_emu at index 0 of the ready list, so xrt::device(0) routes to the
+// emulator.  XDNA_EMU_RUNTIME=release|debug picks the .so profile.
+// Otherwise the driver is loaded but invisible.
 
 #pragma once
 

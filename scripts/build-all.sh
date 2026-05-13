@@ -170,4 +170,4 @@ echo ""
 
 echo "=== All done ==="
 echo "  Test: xrt-smi examine                     (real NPU only)"
-echo "  Test: XDNA_EMU=1 xrt-smi examine          (real + emulated)"
+echo "  Test: XDNA_EMU=1 xrt-smi examine          (emulator at xrt::device(0))"
