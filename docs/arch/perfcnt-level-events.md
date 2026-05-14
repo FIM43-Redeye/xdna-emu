@@ -1,76 +1,66 @@
-# Performance Counter Level-Event Semantics Audit
+# Performance Counter Level-Event Semantics
 
-## Problem
+## Model
 
-HW AIE2 perf counters configured with `XAIE_EVENT_ACTIVE_CORE` as start
-event tick only during cycles when the core is in Execute state. This is
-a *level* signal, not a pulse — the counter advances while the signal is
-asserted, not on signal transitions.
+AIE2 perf counters configured with `XAIE_EVENT_ACTIVE_CORE` (event 0x1C)
+or `XAIE_EVENT_TRUE` (event 0x01) as start_event are **duration counters**.
+ACTIVE_CORE arms the counter on transition to Execute state, and the
+counter ticks every cycle until a stop event (typically DISABLED_CORE)
+fires. The counter is **not** gated per-cycle on Execute state once armed.
 
-EMU's current `PerfCounterBank` (`src/device/perf_counters/mod.rs:326-383`)
-implements a pulse model: `handle_event(start)` transitions the counter
-to `Active`, and `tick()` (called unconditionally every cycle from
-`coordinator.rs:964`) increments every `Active` counter regardless of
-whether the core is still active.
+This matches `aie-rt`'s perfcnt programming model and was confirmed
+empirically against real Phoenix hardware.
 
-Consequence: once started, an ACTIVE_CORE-configured EMU counter ticks
-every cycle until stopped, even when the core is stalled on lock-wait,
-cascade-wait, or disabled. The counter overcounts.
+## EMU implementation
 
-## Which events are affected
+Per-cycle in the coordinator
+(`src/interpreter/engine/coordinator.rs:1075-1170`):
 
-Level-valued events reachable from EMU state, ordered by how close their
-semantics are to "tick only while X":
+1. Re-assert always-on level events at the top of each cycle:
+   - `handle_event(TRUE_EVENT)` for every tile (always asserted).
+   - `handle_event(ACTIVE_CORE_EVENT)` only when the core executed an
+     instruction this cycle.
+2. Call `tile.core_perf_counters.tick()` and `tile.mem_perf_counters.tick()`
+   once. `tick()` advances every Active counter and returns the indices
+   that crossed their threshold.
+3. Each fired counter is fed back through `handle_event(PERF_CNT_N)` (so
+   self-resetting configs can recycle) and notified to the owning module's
+   trace unit, stamped with the core's pipeline-adjusted PC.
 
-| Event | Level semantic | EMU state source |
-|-------|----------------|------------------|
-| `ACTIVE_CORE` | Core in Execute state | `Core::is_running()` / `!is_blocked()` |
-| `ACTIVE_MEMORY_STALL` | Core blocked on memory-bank contention | Not modeled in EMU (no bank contention) |
-| `ACTIVE_LOCK_STALL` | Core blocked on lock acquire | `Core::is_waiting_on_lock()` |
-| `ACTIVE_CASCADE_STALL` | Core blocked on cascade full/empty | `Core::is_waiting_on_cascade()` |
-| `DISABLED_CORE` | Core is disabled | `!Core::is_enabled()` |
+`handle_event()` is idempotent on level events: an already-Active counter
+stays Active when the start event re-asserts; counters whose start event
+doesn't match are unaffected. The pulse-vs-level distinction is handled
+entirely in the coordinator's per-cycle re-assertion phase, not by
+special-casing the `tick()` method.
 
-`ACTIVE_MEMORY_STALL` has no EMU backing — skip. The others map to
-existing blocked-state checks.
+## Ordering
 
-## Pulse vs level today
+Phase 3e (this perfcnt phase) runs *before* Phase 3f (commit_cycle) so
+that perfcnt `notify_event()` calls accumulate into the same cycle's
+`pending_slot_mask` as TRUE/edge-detector events. AM020 specifies one
+trace frame per cycle: when multiple events fire in cycle N they must
+be coalesced into a single Multiple frame, not split across two frames.
 
-`handle_event()` is called for pulse events — `LOCK_ACQUIRE`,
-`PORT_RUNNING`, `BRANCH_TAKEN`, etc. — and correctly transitions
-`Idle`/`Stopped` <-> `Active`. That path stays as-is for pulse events.
+## History
 
-The fix targets only the `tick()` path: rather than ticking every
-`Active` counter unconditionally, a counter with a level-valued
-start_event should tick only when that level is asserted *this cycle*.
+An earlier audit (2026-04-XX) framed this as an overcounting bug --
+"ACTIVE_CORE counters tick every cycle while stalled, even though
+ACTIVE_CORE is a level signal that should only assert during Execute" --
+and proposed splitting `tick()` into `tick_active_cycles()` /
+`tick_idle_cycles()` driven by a coordinator-side gate ("Option 2" in
+the original audit, since archived).
 
-## Fix: Option 2 (selected)
+Subsequent investigation (#354 trail) reframed the problem: real-HW
+ACTIVE_CORE counters are duration counters, not per-cycle-gated counters.
+The shipped fix re-asserts level events each cycle in the coordinator
+and lets `tick()` stay simple, which matches HW semantics without the
+proposed plumbing.
 
-Decision (from spec open questions): **Option 2 — move the tick gate
-into the caller.** Instead of changing `tick()`'s signature, the
-coordinator checks core state before calling `tick()`:
+## Out of scope
 
-- Core is in Execute state → `core_perf_counters.tick_active_cycles()`
-- Core is blocked/disabled → `core_perf_counters.tick_idle_cycles()`
-
-`tick_active_cycles()` is the current behavior: increment all Active
-counters, return threshold fires.
-
-`tick_idle_cycles()` is new: increment only counters whose `start_event`
-is NOT a level-valued event (i.e., preserves pulse-counter behavior for
-non-ACTIVE_CORE counters that happen to be running on the core module),
-but does not increment counters started by `ACTIVE_CORE`. Threshold
-checks still apply.
-
-This is the narrowest possible change: zero diff to `handle_event()`,
-zero diff to pulse-event counters, no new plumbing.
-
-## Out-of-scope for this work
-
-- Stall events (`ACTIVE_LOCK_STALL`, etc.) as start events. Spec says:
-  "If fixing these falls out of the same refactor (same plumbing, same
-  predicate), include them. If any needs significant separate plumbing,
-  defer to a follow-up." For Option 2, adding stall-event tick gating
-  is symmetric work: the coordinator would need to query `is_waiting_on_lock()`
-  etc. and conditionally tick a different subset. Leave as a follow-up.
-- DMA delay modeling — orthogonal.
-- NoC latency — orthogonal.
+- Stall events (`ACTIVE_LOCK_STALL`, etc.) as start events -- not yet
+  modeled. Would follow the same re-assertion pattern: query
+  `Core::is_waiting_on_lock()` etc. and conditionally `handle_event` the
+  corresponding event id each cycle.
+- Memory-bank contention -- not modeled in EMU at all.
+- DMA delay modeling -- orthogonal.
