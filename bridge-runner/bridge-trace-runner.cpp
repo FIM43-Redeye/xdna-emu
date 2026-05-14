@@ -170,6 +170,20 @@ struct RunArgs {
     bool read_perf_counter = false;
     uint16_t perf_col = 0;
     uint16_t perf_row = 2;
+
+    // When non-empty, on a non-COMPLETED run.wait() result, dump a JSON
+    // snapshot of (perf_col, perf_row)'s diagnostic registers -- core
+    // PC/status, timer, lock values, DMA channel ctrl/status -- to
+    // <snapshot_dir>/<basename>-snap-<unix_secs>.json before throwing.
+    // The snapshot is taken via xrt::hw_context::read_aie_reg
+    // (MSG_OP_AIE_RW_ACCESS), which uses the mgmt mailbox and continues
+    // to respond after the per-ctx mailbox has gone silent. Aimed at
+    // diagnosing CHAIN_EXEC_NPU firmware silent-drops on Phoenix
+    // (see docs/superpowers/findings/2026-05-13-chain-exec-npu-silent-drop-on-phoenix.md).
+    // Reads only the perf tile -- it's the one tile we know the hwctx
+    // claims, so AIE_RW_ACCESS authorization is satisfied. Memtile
+    // (row 1) is NEVER read -- known to hang firmware.
+    std::string snapshot_dir;
 };
 
 void print_usage(const char* argv0) {
@@ -179,7 +193,8 @@ void print_usage(const char* argv0) {
         "     [--kernel <name>] [--input <bin>]... [--output <path>]... \\\n"
         "     [--ctrlpkt <bin>]... [--cdo-preamble <cdo.bin>]... \\\n"
         "     [--reset-tile col:row]... [--reset-lock col:row:lock:val]... \\\n"
-        "     [--trace-buf-idx N] [--trace-size N] [-v]\n"
+        "     [--trace-buf-idx N] [--trace-size N] \\\n"
+        "     [--snapshot-on-timeout <dir>] [-v]\n"
         "\n"
         "  %s --batch-stdin [--xclbin <path>] [--kernel <name>] [-v]\n"
         "     # read one command line per stdin line in the same syntax\n"
@@ -346,6 +361,12 @@ int parse_tokens(const std::vector<std::string>& tokens,
             }
             run.perf_col = static_cast<uint16_t>(std::stoi(val.substr(0, colon)));
             run.perf_row = static_cast<uint16_t>(std::stoi(val.substr(colon + 1)));
+        }
+        else if (a == "--snapshot-on-timeout") {
+            // Directory to write a JSON register snapshot of the perf
+            // tile when run.wait() returns non-COMPLETED. See RunArgs::
+            // snapshot_dir for details.
+            run.snapshot_dir = need_val("--snapshot-on-timeout");
         }
         else if (a == "-v" || a == "--verbose") outer.verbose = true;
         else if (a == "-h" || a == "--help") { print_usage(argv0); std::exit(0); }
@@ -1551,6 +1572,95 @@ size_t middle_slot_size(const KernArgInfo& karg, const BindInfo& bind) {
     return declared;
 }
 
+// Dump diagnostic AIE registers for a single (col, row) tile to the
+// given ostream as JSON. Aimed at post-wedge forensics: when run.wait()
+// returns non-COMPLETED, the per-ctx mailbox is silent but the mgmt
+// mailbox (which AIE_RW_ACCESS uses) typically still responds. Captures
+// core PC/status/control, timer, performance counters, all 16 lock
+// values, and DMA channel ctrl/status registers.
+//
+// Each read is wrapped individually so a single EINVAL doesn't abort
+// the rest of the snapshot.
+//
+// SAFETY constraints (per docs/superpowers/findings/):
+//   - NEVER call against tile (col,1) (memtile) -- known to hang firmware
+//     on Phoenix (2026-05-07-aie-rw-access-memtile-dm-half-impl.md).
+//   - Tile must be claimed by the active hwctx's xclbin -- otherwise the
+//     reads return INVALID_PARAM and accumulating these can poison the
+//     mgmt mailbox channel (2026-05-06-aie-rw-access-tile-claim-authorization.md).
+//
+// Register offsets sourced from aie-rt's xaiemlgbl_params.h (AIE2/AIE-ML).
+void dump_tile_snapshot(xrt::hw_context& ctx, uint16_t col, uint16_t row,
+                        std::ostream& out, const std::string& label) {
+    if (row == 1) {
+        out << "{\"label\":\"" << label
+            << "\",\"col\":" << col << ",\"row\":" << row
+            << ",\"skipped\":\"row==1 (memtile) hangs firmware on Phoenix\"}";
+        return;
+    }
+
+    // Compute-tile registers (AIE2 / AIE-ML).
+    constexpr uint32_t CORE_PC            = 0x00031100;
+    constexpr uint32_t CORE_CONTROL       = 0x00032000;
+    constexpr uint32_t CORE_STATUS        = 0x00032004;
+    constexpr uint32_t TIMER_LOW          = 0x000340F8;
+    constexpr uint32_t PERF_CTRL0         = 0x00031500;
+    constexpr uint32_t PERF_COUNTER0      = 0x00031520;
+    constexpr uint32_t PERF_COUNTER1      = 0x00031524;
+    constexpr uint32_t LOCK0_VALUE        = 0x0001F000;  // step 0x10/lock
+    constexpr uint32_t DMA_S2MM_CTRL_0    = 0x0001DE00;
+    constexpr uint32_t DMA_S2MM_CTRL_1    = 0x0001DE08;
+    constexpr uint32_t DMA_MM2S_CTRL_0    = 0x0001DE10;
+    constexpr uint32_t DMA_MM2S_CTRL_1    = 0x0001DE18;
+    constexpr uint32_t DMA_S2MM_STATUS_0  = 0x0001DF00;
+    constexpr uint32_t DMA_S2MM_STATUS_1  = 0x0001DF04;
+    constexpr uint32_t DMA_MM2S_STATUS_0  = 0x0001DF10;
+    constexpr uint32_t DMA_MM2S_STATUS_1  = 0x0001DF14;
+
+    out << "{\"label\":\"" << label
+        << "\",\"col\":" << col << ",\"row\":" << row
+        << ",\"reads\":[";
+    bool first = true;
+    auto try_read = [&](const char* name, uint32_t off) {
+        if (!first) out << ",";
+        first = false;
+        out << "{\"reg\":\"" << name
+            << "\",\"off\":\"0x" << std::hex << off << "\"" << std::dec;
+        try {
+            uint32_t v = ctx.read_aie_reg(col, row, off);
+            out << ",\"value\":\"0x" << std::hex << v << "\"" << std::dec;
+        } catch (const std::exception& e) {
+            // e.what() is a short alphanumeric driver message ("EINVAL",
+            // "ENODEV") -- safe to embed in JSON without escaping.
+            out << ",\"error\":\"" << e.what() << "\"";
+        }
+        out << "}";
+    };
+
+    try_read("CORE_PC",            CORE_PC);
+    try_read("CORE_STATUS",        CORE_STATUS);
+    try_read("CORE_CONTROL",       CORE_CONTROL);
+    try_read("TIMER_LOW",          TIMER_LOW);
+    try_read("PERF_CTRL0",         PERF_CTRL0);
+    try_read("PERF_COUNTER0",      PERF_COUNTER0);
+    try_read("PERF_COUNTER1",      PERF_COUNTER1);
+    for (int i = 0; i < 16; ++i) {
+        char nm[32];
+        std::snprintf(nm, sizeof(nm), "LOCK%d_VALUE", i);
+        try_read(nm, LOCK0_VALUE + 0x10u * static_cast<uint32_t>(i));
+    }
+    try_read("DMA_S2MM_CTRL_0",    DMA_S2MM_CTRL_0);
+    try_read("DMA_S2MM_STATUS_0",  DMA_S2MM_STATUS_0);
+    try_read("DMA_S2MM_CTRL_1",    DMA_S2MM_CTRL_1);
+    try_read("DMA_S2MM_STATUS_1",  DMA_S2MM_STATUS_1);
+    try_read("DMA_MM2S_CTRL_0",    DMA_MM2S_CTRL_0);
+    try_read("DMA_MM2S_STATUS_0",  DMA_MM2S_STATUS_0);
+    try_read("DMA_MM2S_CTRL_1",    DMA_MM2S_CTRL_1);
+    try_read("DMA_MM2S_STATUS_1",  DMA_MM2S_STATUS_1);
+
+    out << "]}";
+}
+
 RunOutcome execute_run(
     xrt::device& device,
     PreparedKernel& prep,
@@ -1937,6 +2047,57 @@ RunOutcome execute_run(
             std::fprintf(stderr, "  run state after wait: %d\n", (int)state);
         }
         if (state != ERT_CMD_STATE_COMPLETED) {
+            // Wedge forensics: capture the suspect tile's diagnostic
+            // registers via AIE_RW_ACCESS BEFORE driver recovery (TDR or
+            // ctx destroy) wipes the on-tile state. The mgmt mailbox
+            // typically stays alive across the silent-drop window so
+            // these reads still succeed even though the per-ctx mailbox
+            // is dead. Snapshot failure is non-fatal -- the underlying
+            // timeout error must still propagate.
+            if (!args.snapshot_dir.empty()) {
+                try {
+                    auto now = std::chrono::system_clock::now();
+                    auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                        now.time_since_epoch()).count();
+                    // Derive a per-test snapshot filename from trace_out's
+                    // basename so snapshots stay associated with their
+                    // owning run.
+                    std::string base = args.trace_out;
+                    auto slash = base.find_last_of('/');
+                    if (slash != std::string::npos) base = base.substr(slash + 1);
+                    auto dot = base.find_last_of('.');
+                    if (dot != std::string::npos) base = base.substr(0, dot);
+                    std::string snap_path = args.snapshot_dir + "/" + base
+                                          + "-snap-" + std::to_string(secs) + ".json";
+                    std::ofstream snap(snap_path);
+                    if (snap) {
+                        snap << "{\"timeout_state\":" << static_cast<int>(state)
+                             << ",\"trace_out\":\"" << args.trace_out << "\""
+                             << ",\"perf_col\":" << args.perf_col
+                             << ",\"perf_row\":" << args.perf_row
+                             << ",\"timestamp\":" << secs
+                             << ",\"tile\":";
+                        dump_tile_snapshot(prep.context,
+                                           args.perf_col, args.perf_row,
+                                           snap, "post-timeout");
+                        snap << "}\n";
+                        if (verbose) {
+                            std::fprintf(stderr,
+                                "  wedge snapshot written to %s\n",
+                                snap_path.c_str());
+                        }
+                    } else if (verbose) {
+                        std::fprintf(stderr,
+                            "  could not open snapshot file %s\n",
+                            snap_path.c_str());
+                    }
+                } catch (const std::exception& e) {
+                    if (verbose) {
+                        std::fprintf(stderr,
+                            "  snapshot capture failed: %s\n", e.what());
+                    }
+                }
+            }
             throw std::runtime_error(
                 "kernel did not complete (state=" +
                 std::to_string(static_cast<int>(state)) + ")");

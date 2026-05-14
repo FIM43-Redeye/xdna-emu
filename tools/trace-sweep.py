@@ -497,6 +497,18 @@ class RunnerSession:
         self.side = side
         self.stderr_log = stderr_log
         self._stderr_fh = stderr_log.open("w")
+        # Wedge forensics: tell the runner to dump an AIE_RW_ACCESS
+        # register snapshot of the perf tile when run.wait() returns
+        # non-COMPLETED. Captures core PC/status/control, timer, lock
+        # values, and DMA channel state -- the on-tile evidence we lose
+        # to driver recovery once the snapshot window closes. See
+        # docs/superpowers/findings/2026-05-13-chain-exec-npu-silent-drop-on-phoenix.md
+        # for what we'd want to inspect after a CHAIN_EXEC_NPU drop.
+        # Auto-created per session under the runner-log directory; if a
+        # wedge fires, look for "wedge snapshot written to ..." lines in
+        # the stderr log to find the file.
+        self._snapshot_dir = stderr_log.parent / "wedge-snapshots"
+        self._snapshot_dir.mkdir(parents=True, exist_ok=True)
         # Per-call CLI fragments common to every run on this session.
         # Folded into run_one() rather than the outer cmd because the
         # runner's batch-stdin protocol re-parses every line through the
@@ -573,6 +585,10 @@ class RunnerSession:
             parts += ["--cdo-preamble", str(p)]
         if self._trace_buf_idx is not None:
             parts += ["--trace-buf-idx", str(self._trace_buf_idx)]
+        # Always opt into the wedge-snapshot path -- the runner only
+        # writes a file when run.wait() actually times out, so this is
+        # a no-op on healthy runs.
+        parts += ["--snapshot-on-timeout", str(self._snapshot_dir)]
         # Our argument values never contain spaces in this codebase,
         # but quote paths defensively so a future path with spaces
         # doesn't silently corrupt tokenisation on the C++ side.
