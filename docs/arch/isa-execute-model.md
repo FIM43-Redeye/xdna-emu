@@ -3,7 +3,7 @@
 **Subsystem:** 7 (Phase 1b)
 **Tag:** `phase1-subsys-isa-execute`
 **Spec:** [../archive/specs/2026-04-21-subsys7-isa-execute-design.md](../archive/specs/2026-04-21-subsys7-isa-execute-design.md)
-**Audit:** [subsys7-audit.md](subsys7-audit.md)
+**Audit:** [subsys7-audit.md](../archive/audits/subsys7-audit.md) (archived; refactor shipped)
 
 This document is the mandatory per-seam design note required by the
 parent device-family refactor. It explains why the `IsaExecutor`

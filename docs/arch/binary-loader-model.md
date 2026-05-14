@@ -3,7 +3,7 @@
 **Subsystem:** 8 (Phase 1b)
 **Tag:** `phase1-subsys-parser-arch`
 **Spec:** [../archive/specs/2026-04-23-subsys8-parser-design.md](../archive/specs/2026-04-23-subsys8-parser-design.md)
-**Audit:** [subsys8-audit.md](subsys8-audit.md)
+**Audit:** [subsys8-audit.md](../archive/audits/subsys8-audit.md) (archived; refactor shipped)
 
 This document is the mandatory per-seam design note required by the
 parent device-family refactor. It explains where arch-specific data
