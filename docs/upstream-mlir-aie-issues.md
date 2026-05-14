@@ -37,46 +37,61 @@ Note that `--k 5` in the RUN line already uses the long form.
 
 ## 2. add_one_ctrl_packet (3 variants): Peano codegen failure
 
-**Status:** Not known upstream. Chess passes, Peano fails on real NPU HW.
-**Severity:** Peano-compiled kernels produce wrong results
+**Status:** Reframed 2026-05-13 -- this is bidirectional flake, not a
+peano codegen bug. **Likely a Phoenix firmware silent-drop on
+`MSG_OP_CHAIN_EXEC_NPU` (op 0x18)**, see
+`docs/superpowers/findings/2026-05-13-chain-exec-npu-silent-drop-on-phoenix.md`.
+**Severity:** Probabilistic test failure, both compilers affected.
 
 Tests affected:
 - `test/npu-xrt/add_one_ctrl_packet/`
 - `test/npu-xrt/add_one_ctrl_packet_4_cores/`
 - `test/npu-xrt/add_one_ctrl_packet_col_overlay/`
 
-All three show the same pattern on real hardware: first 3 of 8 output values
-correct, then wrong. The Peano-compiled ELF is ~2KB vs Chess's ~11KB,
-suggesting incomplete code generation for the lock-based multi-stage add
-operations with control packet reconfiguration.
+### Original (2026-04-10) framing -- WRONG
 
-The kernel does:
-1. Acquire locks via control packets
-2. Perform 4 stages of add operations on input buffer
-3. Write results to output buffer
-4. Release locks
+We initially observed peano outputting "first 3 of 8 correct, then
+wrong" with a ~2KB ELF, while chess (~11KB ELF) appeared to pass. We
+read this as peano emitting a stub kernel.
 
-Chess handles this correctly. Peano appears to generate a stub/minimal ELF
-that doesn't fully implement the lock acquisition and buffer operation
-sequence.
+### Corrected (2026-05-13) framing
 
-**HW output pattern (Peano):**
-```
-Correct dma output 7 == 7
-Correct dma output 8 == 8
-Correct dma output 9 == 9
-Error in dma output 8 != 10    (expected 10, got 8 -- 3-element offset)
-Error in dma output 9 != 11
-...
-```
+HW outcomes across recent bridge runs show the chess-vs-peano
+correlation is unstable:
 
-This is likely a Peano backend issue with control packet code generation,
-not an mlir-aie IR problem (the MLIR is identical for both compilers).
+| Date | Chess HW | Peano HW |
+|---|---|---|
+| 2026-05-11 | TDR | TDR |
+| 2026-05-12 | PASS | PASS |
+| 2026-05-13 | TDR | PASS |
+| 2026-04-10 (the original observation here) | PASS | "first 3 of 8 wrong" |
+
+Both compilers fail on bad runs; both pass on good runs. The original
+"peano partial output" pattern is consistent with a probabilistic
+firmware silent-drop mid-sequence: kernel runs ~3 lock cycles, then the
+next `CHAIN_EXEC_NPU` response is dropped, output DMA partially
+completes, downstream BO contains stale data for the remainder.
+
+The chess ELF being ~5x larger than peano's is real but not load-bearing
+-- it's because chess fully unrolls the 5 inner loops in this MLIR's
+kernel body and pulls in C++ runtime machinery (atexit, cxa_finalize,
+ctor table walker). When the test runs successfully, both ELFs produce
+correct output.
+
+**Real root cause (current best guess):** Phoenix NPU1 firmware (FW
+1.5.5.391, protocol 5.8) probabilistically drops some
+`MSG_OP_CHAIN_EXEC_NPU` responses for ctrl_packet workloads. The driver
+treats the ensuing 30s timeout as completion (fake-fence-on-teardown
+path) and the test PASSes silently if the kernel happened to complete
+before the drop, FAILs/TDRs if not. See the finding doc above for the
+full evidence chain and probe matrix.
 
 **Files:**
 - `test/npu-xrt/add_one_ctrl_packet/aie.mlir`
 - `test/npu-xrt/add_one_ctrl_packet/test.cpp`
-- Peano backend (llvm-aie) -- likely the root cause
+- `xdna-driver/drivers/accel/amdxdna/aie2_message.c` -- driver-side
+  CHAIN_EXEC_NPU dispatch (likely innocent, just delivers the message)
+- Phoenix firmware (proprietary, opaque) -- root cause
 
 ## 3. objectfifo_repeat/distribute_repeat: known XFAIL
 

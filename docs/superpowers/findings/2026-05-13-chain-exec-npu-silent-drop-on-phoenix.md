@@ -461,3 +461,307 @@ SIGTERM mid-CHAIN_EXEC_NPU-submit cleanup). After reboot:
 2. Decide on the verification approach (probably the legacy-path
    force-and-test above, but Maya wanted to think about deeper probes
    first -- "why is the firmware not replying" is the real question).
+
+## Update 2026-05-13 (post-reboot, source-only investigation)
+
+The original 1.3 MB `amdxdna.trace` from the wedge sweep was overwritten
+by today's `--no-hw` Stage 2 verification sweep before this analysis ran.
+Pre-reboot artifacts at `build/experiments/2026-05-13-chain-exec-npu-pre-reboot/`
+saved dmesg + ps + stack but not the rich trace tracepoints. So this
+update is purely from reading driver / XRT shim source.
+
+### Probe #4 killed: `op: 0x0` is `ERT_START_CU`, not `OP_NOOP`
+
+`aie2_dump_ctx` (aie2_ctx.c:111) prints `op = amdxdna_cmd_get_op(j->cmd_bo)`,
+which reads the userspace cmd_bo header opcode field. `ERT_START_CU = 0`
+in `enum ert_cmd_opcode` (amdxdna_ctx.h:23). The `OP_NOOP = 4` in the
+neighboring `enum` is a different namespace (the `OP_*` enum for ctx
+io_ctl). So `op: 0x0` in the dump is just the userspace ert opcode --
+not a stale dump path, not OP_NOOP. Probe #4 is closed.
+
+### Userspace -> driver opcode chain (rigorously)
+
+For mlir-aie's npu-xrt C++ tests (which include `add_one_ctrl_packet`):
+
+1. Test calls `xrt::kernel(ctx, name)` (xrt_kernel.cpp:4649-4652) ->
+   `alloc_kernel_from_ctx` -> `kernel_impl(dev, hwctx, xrt::module{}, name)`
+   with empty module (xrt_kernel.cpp:4169-4174). This is the
+   "xclbin-only flow", where `m_module` is null.
+
+2. Submit hits `initialize_command_header` (xrt_kernel.cpp:1751-1758):
+   ```c++
+   case kernel_type::dpu:
+     if (m_module)
+       kcmd->opcode = elf_handle->get_ert_opcode();  // not taken
+     else
+       kcmd->opcode = ERT_START_CU;                  // <-- taken
+   ```
+   Even XRT itself flags this with the comment "Hack for ERT_START_CU
+   which is used in NPU TXN non-elf flow as well as for Alveo"
+   (xrt_kernel.cpp:3098 + 3762).
+
+3. Driver receives ERT_START_CU. With `AIE2_NPU_COMMAND` enabled on
+   NPU1, it dispatches via `npu_exec_message_ops`:
+   - Direct submit: `aie2_init_exec_cu_req` -> `MSG_OP_EXECUTE_BUFFER_CF`
+   - Chained submit (default, `force_cmdlist=true`):
+     `aie2_cmdlist_fill_npu_cf` -> `npu_slot->type = EXEC_NPU_TYPE_NON_ELF`
+     wrapped in `MSG_OP_CHAIN_EXEC_NPU` (op 0x18)
+
+The trace shows op 0x18 for the wedged jobs, so the chained path is what
+got picked, with `EXEC_NPU_TYPE_NON_ELF (= 0x1)` slots.
+
+### EXEC_NPU_TYPE matrix (from aie2_msg_priv.h:530-535)
+
+| User ert opcode | -> driver fill func | -> slot type | Gating |
+|---|---|---|---|
+| ERT_START_CU (0) | `fill_npu_cf` | `EXEC_NPU_TYPE_NON_ELF` (0x1) | always available |
+| ERT_START_NPU (20) | `fill_npu_dpu` | `EXEC_NPU_TYPE_PARTIAL_ELF` (0x2) | always available |
+| ERT_START_NPU_PREEMPT (21) | `fill_npu_preempt` | `EXEC_NPU_TYPE_PREEMPT` (0x3) | needs AIE2_PREEMPT (off on NPU1) |
+| ERT_START_NPU_PREEMPT_ELF (22) | `fill_npu_elf` | `EXEC_NPU_TYPE_ELF` (0x4) | needs AIE2_PREEMPT (off on NPU1) |
+
+The original probe matrix in this doc listed PARTIAL_ELF / PREEMPT / ELF
+but missed `EXEC_NPU_TYPE_NON_ELF`. That is the only slot type a
+no-m_module xclbin-only-flow kernel can produce.
+
+### What this means for the hypothesis
+
+If silent-drop correlates with slot type 0x1 (NON_ELF), it would explain
+ctrl_packet workloads being uniquely affected -- they're "compute-less,
+control-packets-only" kernels that wouldn't normally bother with an ELF
+module. But this hypothesis has a hole: most other npu-xrt tests in the
+sweep also use `xrt::kernel(ctx, name)` and would also produce NON_ELF
+slots, yet 561 fast jobs ran fine. So either:
+
+(a) `EXEC_NPU_TYPE_NON_ELF` works fine in general, and add_one_ctrl_packet
+    triggers something more specific (payload size, ctrl packet content,
+    column placement, target stream switch addresses), or
+(b) The 561 fast jobs are mostly tests that DO get an attached ELF via a
+    path I haven't read yet (e.g. xrt::ext::kernel ctor with a module,
+    or an IRON-Python harness path), and the NON_ELF slot is in fact
+    the trigger. ctrl_packet_reconfig (which passed in HW phase) was
+    only ONE submission -- maybe even NON_ELF works for short bursts
+    but firmware corrupts state after enough of them; the sweep mode
+    is what made add_one_ctrl_packet's wedge visible.
+
+Either way, the next probe needs to print the actual slot type per
+submission so we can correlate `type=0x1` vs `type=0x2` against the
+silent-drop verdict directly.
+
+### Proposed cheap probe: dprintk slot->type per submission
+
+3-line patch to `aie2_message.c`:
+
+```c
+// at the top of each aie2_cmdlist_fill_npu_* function, after npu_slot->type =
+XDNA_DBG(xdna, "cmdlist_fill_npu type=0x%x cu_idx=%d arg_cnt=%u inst_size=%u",
+         npu_slot->type, npu_slot->cu_idx, npu_slot->arg_cnt,
+         (npu_slot->type == EXEC_NPU_TYPE_NON_ELF) ? 0 : npu_slot->inst_size);
+```
+
+Or even simpler -- a tracepoint that captures (msg_id, slot_type, inst_size)
+to xdna_mailbox.135. Then re-run the sweep with the trace daemon on.
+Correlate slot_type per msg_id with whether the job got an IRQ in the
+trace. This tells us definitively whether NON_ELF is the trigger.
+
+Cost: tiny driver patch + DKMS rebuild via
+`./build.sh -release -refresh_dkms` (90s total) + bridge sweep (~20-30 min
+HW phase if no wedge, ~26 min as before if wedge reproduces).
+
+### Other things still wanting verification
+
+- `bridge-trace-runner` post-`run.wait()` state-check (probe #5 in original
+  matrix): does it check `ERT_CMD_STATE_TIMEOUT` after wait succeeds? If
+  not, every silent-drop is a false PASS.
+
+## Update 2026-05-13 (further narrowing — compiler isolation)
+
+After more grepping the trigger has narrowed sharply: it's not slot type,
+not test family, not ELF-attach. It's **the chess compiler's per-core
+ELF** for one specific test, with byte-identical inputs everywhere else.
+
+### NON_ELF hypothesis killed
+
+`xrt::kernel(ctx, name)` (xrt_kernel.cpp:4649-4652) ALWAYS routes through
+`alloc_kernel_from_ctx` -> `kernel_impl(dev, hwctx, xrt::module{}, name)`
+with empty module (xrt_kernel.cpp:4169-4174). That's what the
+xclbin-only flow gives you. Out of 80 npu-xrt C++ tests, only 5 use
+`xrt::ext::kernel(ctx, mod, name)` (the with-module path). The other 75
+tests -- including everything that PASSed -- ALL produce
+`EXEC_NPU_TYPE_NON_ELF` slots. So NON_ELF is NOT the silent-drop trigger.
+
+### Compiler-correlated, test-correlated
+
+Comparing the three `add_one_ctrl_packet*` variants × two compilers from
+the original wedge-sweep results dir:
+
+| Variant                         | chess HW | peano HW |
+|---|---|---|
+| add_one_ctrl_packet             | TIMEOUT (status 8, TDR) | PASS |
+| add_one_ctrl_packet_4_cores     | (skipped, device wedged) | PASS |
+| add_one_ctrl_packet_col_overlay | (skipped, device wedged) | PASS |
+
+Same test source, same xclbin config, same XRT path, same userspace ert
+opcode, same EXEC_NPU_TYPE_NON_ELF slot. Only the per-core ELF differs.
+
+### What's different in the chess ELF
+
+`insts.bin` (the NPU-level instruction stream that firmware parses) is
+**byte-identical** between chess and peano (both 1496 bytes, zero
+diff). `aie_cdo_init.bin` and `aie_cdo_enable.bin` are also identical.
+The only differing file is `aie_cdo_elfs.bin` (2272 chess vs 1072
+peano) -- that just wraps a different per-core ELF.
+
+ELF-level diff:
+- chess `.text`: 1984 bytes (13 sections including `.tctmemtab`,
+  `.eoltab`, `.chesstypeannotationtab`, `.rtstab`, `.stackinfo`,
+  Synopsys-/chess-specific debug tables)
+- peano `.text`: 848 bytes (6 sections, just .text/.symtab/etc.)
+- chess pulls in atexit.o, me_basic.o, `__cxa_finalize`, ctor/dtor table
+  walkers (`TGT_F_main_init_*`)
+- peano emits a much tighter `__start` -> `main` flow
+
+Lock encoding is identical (`acq #0x30, r1` for input_lock0 in both).
+Loop structure is correct in both -- chess `jnz r24, #0x190` at 0x5a4 is
+the outer-loop back-edge; peano `jnz r5, #0xa0` at 0x2da is the same
+back-edge for its (less-unrolled) loop. Both implement the
+`scf.for 0 to UINT32_MAX` infinite-ish loop body the MLIR demands.
+
+### Discontinuity in chess vs peano text-size ratio
+
+| Test | chess .text | peano .text | ratio | HW outcome |
+|---|---|---|---|---|
+| **add_one_ctrl_packet** | 1984 | 848 | **2.34x** | chess WEDGES |
+| **add_one_ctrl_packet_4_cores** | 1952 | 736 | **2.65x** | chess skipped |
+| **add_one_ctrl_packet_col_overlay** | 1952 | 736 | **2.65x** | chess skipped |
+| add_12_i8_using_2d_dma_op_with_padding | 1008 | 896 | 1.12x | chess passes |
+| ctrl_packet_reconfig | 1008 | 896 | 1.12x | chess passes |
+| add_one_objFifo | 1232 | 816 | 1.51x | chess passes |
+| add_blockwrite | 1328 | 848 | 1.57x | chess passes |
+
+A clean discontinuity at ratio 2x+ correlates exactly with wedging. The
+size delta comes from chess fully unrolling the **5 separate inner loops
+of 8 iterations each** in `add_one_ctrl_packet`'s body (4 add-by-1 phases
+plus the output writeback). Peano keeps tighter inner loops with branches.
+
+### What that means
+
+Whatever the trigger is, it's:
+- compiler-specific (chess only)
+- code-pattern-specific (something about heavy unrolling +
+  many lock cycles per outer iteration; not just "more code")
+- not in the array config (CDO init/enable are byte-identical)
+- not in the inst_buf NPU stream (also byte-identical)
+- not in the kernel structure (both implement the same MLIR loops correctly)
+
+Plausible remaining triggers, ordered by what to probe first:
+
+1. **Per-iteration time blow-up.** Chess's fully-unrolled body might run
+   each outer iteration in O(N) more cycles than peano's looped body,
+   pushing total wall-time past the firmware's internal completion deadline.
+   The runtime sequence drives a finite set of submissions; if each
+   inner kernel pass takes seconds instead of ms because of unrolled
+   no-load forwarding, the firmware times out internally.
+
+2. **Specific chess instruction encoding triggering microcode quirk.**
+   Both chess and peano produce decodable AIE2 ISA, but chess's
+   Synopsys-derived backend may emit specific instruction encodings
+   (or VLIW packing patterns) that hit a known-but-undocumented Phoenix
+   silicon edge case the firmware hangs on.
+
+3. **Chess `.data.DM_bankA.4` aliasing with kernel buffer placement.**
+   Chess allocates 32 bytes at DM 0x70460 for atexits[] + 4 bytes at
+   0x70480 for atexit_cnt. If chess's mlir-aie buffer allocator places
+   one of `input_buffer/output_buffer/other_buffer` so that addresses
+   overlap or alias, kernel writes during init could corrupt atexit
+   state and vice-versa. Worth dumping the `aie.buffer` allocations
+   for both builds.
+
+### Cheapest next probes
+
+(a) **Force chess `-O0` for `add_one_ctrl_packet`** (no unrolling), rebuild
+    just that xclbin, run on HW. If chess `-O0` passes, the trigger is
+    in the unrolling itself.
+(b) **Chess inst-instrumentation**: add a single `aie.use_lock` event
+    after each chess inner-loop phase to probe what the core actually
+    reaches. We have working trace injection (`tools/mlir-trace-inject.py`)
+    so this is in-bounds.
+(c) **Driver-side dprintk** on `aie2_cmdlist_fill_npu_*` to confirm the
+    per-job slot type during a fresh sweep -- still useful for the
+    ctrl_packet_reconfig_4x1_cores variant (the other wedging case from
+    the original 24).
+
+## Update 2026-05-13 (course correction -- it's flaky, not deterministic)
+
+**The chess vs peano correlation observed today does NOT replicate
+historically.** Pulled HW outcomes for `add_one_ctrl_packet` across the
+last few bridge runs:
+
+| Date | Chess HW | Peano HW |
+|---|---|---|
+| 2026-05-11 | TDR | TDR |
+| 2026-05-12 | PASS | PASS |
+| 2026-05-13 (AM, this session) | TDR | PASS |
+
+And `docs/upstream-mlir-aie-issues.md` (last touched 2026-05-08) recorded
+the OPPOSITE compiler-correlation: "Chess passes, Peano fails on real NPU
+HW. ... first 3 of 8 output values correct, then wrong" -- caught on a
+peano-bad-day around 2026-04-10. Today we caught it on a chess-bad-day.
+
+So this test is **flaky for both compilers**, not deterministically
+chess-broken. The structural deep-dive on chess unrolling / per-core ELF
+size discontinuity above is real but **not load-bearing for the
+silent-drop**: chess and peano are both affected, just on different
+runs.
+
+The 24/585 silent-drop rate (~4%) from the original wedge sweep is
+consistent with a probabilistic firmware behavior, not a deterministic
+binary trigger. The slow-job latency cluster at 32.18 ± 0.04s (mean ±
+stddev across 23 contexts) shows the *response* is deterministic (it's
+just bridge-runner's `run.wait(30s)` + 2s post-cleanup) but the
+*occurrence* is not.
+
+### What this kills and what survives
+
+Killed:
+- "Chess emits a buggy kernel for add_one_ctrl_packet" -- not consistent
+  with run-to-run history
+- "EXEC_NPU_TYPE_NON_ELF triggers silent-drop" -- same NON_ELF slot type
+  passes most of the time
+- "Chess unrolling causes timing race" -- peano (no unrolling) also TDRs
+  on 5/11
+
+Survives:
+- Phoenix firmware probabilistically silent-drops some
+  `MSG_OP_CHAIN_EXEC_NPU` (op 0x18) submissions
+- `MSG_OP_AIE_RW_ACCESS` capability gate added with verification was
+  the right pattern; the upstream `CHAIN_EXEC_NPU` gate added without
+  verification is the load-bearing root cause
+- Forcing the legacy path (`MSG_OP_CHAIN_EXEC_BUFFER_CF`, op 0x12) is
+  still the cleanest verification probe because it removes the op-0x18
+  path entirely
+
+### Better next probes (revised)
+
+1. **Re-run add_one_ctrl_packet HW many times back-to-back** (e.g. 50
+   serial submissions per compiler) to measure flake rate empirically
+   per compiler. If both compilers show similar flake rates, the trigger
+   is firmware-side, not compiler-side. If chess is meaningfully higher,
+   there's a real chess-codegen contributing factor.
+
+2. **Force legacy path** (probe #3 from the original matrix in this doc):
+   patch `npu1_regs.c` to remove `AIE2_NPU_COMMAND` + `MSG_OP_CHAIN_EXEC_NPU`
+   entries, rebuild driver, retry add_one_ctrl_packet × N. If legacy
+   path is also flaky, the bug is below the message-opcode layer (PCIe,
+   SMU, or firmware-internal). If legacy path is stable, it really is
+   `CHAIN_EXEC_NPU` specifically.
+
+3. **Driver-side dprintk** on `aie2_cmdlist_fill_npu_*` (probe (c) above)
+   is still valid and orthogonal -- gives us a per-submission slot-type
+   log we can correlate against any future wedge.
+
+4. **Update `docs/upstream-mlir-aie-issues.md` issue #2** to reflect that
+   this is bidirectional flake, not a peano codegen bug. The "first 3 of
+   8 wrong" symptom that doc noted is consistent with the kernel running
+   for ~3 lock cycles before the firmware drops the next response, the
+   output DMA partially writes, and downstream BOs are stale. That's
+   what we'd expect from a probabilistic op-0x18 drop mid-sequence.
