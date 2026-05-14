@@ -18,7 +18,7 @@ all injection now goes through the declarative path in mlir-trace-inject.py.
 
 Single source of truth: ``trace_config.json`` written by mlir-trace-inject;
 schema at ``tools/trace_config_schema.json``; spec at
-``docs/superpowers/findings/2026-05-05-trace-config-schema.md``. Every
+``docs/archive/findings/2026-05-05-trace-config-schema.md``. Every
 downstream tool (cpp_trace_patch, parse-trace, trace_compare, bridge script)
 reads this file. There is no ``events.json`` and no stdout-passed arg_idx.
 

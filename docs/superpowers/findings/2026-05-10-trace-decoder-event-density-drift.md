@@ -147,7 +147,7 @@ shim event-density drift artefact.
 ### Phase C per-stage table
 
 The same decoded-ts-as-SoC assumption affects every cross-tile entry
-in the Phase C anchor table (`docs/superpowers/findings/2026-05-10-phase-c-stage-attribution.md`).
+in the Phase C anchor table (`../../archive/findings/2026-05-10-phase-c-stage-attribution.md`).
 HW values are decoded with the same convention, so HW is similarly
 inflated by HW-side STARVATION density. The `Stage 1+2 gap = 2537 cyc`
 that motivated the cold-start work is itself partly drift, partly real.
@@ -191,7 +191,7 @@ config doesn't include them), so this is clean.
 2. **Re-base Phase C residual analysis on single-tile compute
    measurement.** The −172 cyc UNDER on `LOCK_STALL → ACQUIRE_REQ`
    is the canonical residual. Update
-   `2026-05-10-phase-c-stage-attribution.md` and the closure commit
+   `../../archive/findings/2026-05-10-phase-c-stage-attribution.md` and the closure commit
    message references.
 
 3. **Re-evaluate cold-start tuning.** If we want exact closure on this
@@ -222,7 +222,7 @@ config doesn't include them), so this is clean.
 
 ## See also
 
-- `2026-05-10-phase-c-stage-attribution.md` — the original Phase C
+- `../../archive/findings/2026-05-10-phase-c-stage-attribution.md` — the original Phase C
   finding; needs the residual numbers re-stated under the corrected
   convention.
 - Commit `3357b7c` — the closure work; the implementation is sound,

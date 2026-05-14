@@ -12,7 +12,7 @@ EMU's executor now charges every `dma_wait` an 8004-cyc post-sync
 settling cost (8000 cyc firmware mailbox roundtrip + 4 cyc stream
 switch flush). This closes the dominant component of the ~22.5x
 dma_wait gap measured in
-`2026-05-10-phase-b-runtime-seq-instrumentation.md`.
+`../../archive/findings/2026-05-10-phase-b-runtime-seq-instrumentation.md`.
 
 Direct measurement on `_diag_phase_b_add_one_instrumented` (chess):
 
@@ -172,7 +172,7 @@ the default path.
 
 ## See also
 
-- `docs/superpowers/findings/2026-05-10-phase-b-runtime-seq-instrumentation.md`
+- `../../archive/findings/2026-05-10-phase-b-runtime-seq-instrumentation.md`
   -- the measurement that identified this gap.
 - `src/npu/executor.rs` -- the change.
 - task #24 (this work); task #13 still tracks the residual ~9 cyc

@@ -33,7 +33,7 @@
 # threshold -- so the partial buffer drops on stop. Use a multi-pass
 # wrapper (heavy_zol = 64 passes, lc_overflow_probe = 4-pass) for any
 # fixture that opts into --mode2. See
-# docs/superpowers/findings/2026-05-08-mode2-flush-and-peano-non-bug.md
+# docs/archive/findings/2026-05-08-mode2-flush-and-peano-non-bug.md
 # for the empirical breakdown.
 #
 # Environment overrides (rare):

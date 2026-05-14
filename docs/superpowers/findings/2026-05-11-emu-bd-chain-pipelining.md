@@ -236,7 +236,7 @@ hardware actually behaves.
 
 ## See also
 
-- `2026-05-10-phase-c-stage-attribution.md` -- original Phase C
+- `../../archive/findings/2026-05-10-phase-c-stage-attribution.md` -- original Phase C
   attribution; Stage 4 numbers need re-reading under the corrected
   pairing.
 - `2026-05-10-trace-decoder-event-density-drift.md` -- the drift

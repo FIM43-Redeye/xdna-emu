@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://xdna-emu/schemas/trace_config-v1.json",
   "title": "TraceConfig",
-  "description": "Single source of truth for trace-injection configuration. Read by mlir-trace-inject, cpp_trace_patch, parse-trace, trace_compare, and the bridge script. Written by trace-prepare. Spec: docs/superpowers/findings/2026-05-05-trace-config-schema.md.",
+  "description": "Single source of truth for trace-injection configuration. Read by mlir-trace-inject, cpp_trace_patch, parse-trace, trace_compare, and the bridge script. Written by trace-prepare. Spec: docs/archive/findings/2026-05-05-trace-config-schema.md.",
   "type": "object",
   "required": [
     "schema_version",

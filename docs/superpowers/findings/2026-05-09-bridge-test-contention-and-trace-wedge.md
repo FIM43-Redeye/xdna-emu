@@ -515,11 +515,11 @@ category covers our case without overloading the meaning.
 
 ## See also
 
-- `docs/superpowers/findings/2026-05-07-aie-rw-access-memtile-dm-half-impl.md`
+- `../../archive/findings/2026-05-07-aie-rw-access-memtile-dm-half-impl.md`
   -- the prior session that documented the memtile-read hang and
   SMU-wedge cascade.  Should be cross-referenced before any
   read_aie_reg harness work on Phoenix.
-- `docs/superpowers/findings/2026-05-06-355a-host-latency-response.md`
+- `../../archive/findings/2026-05-06-355a-host-latency-response.md`
   -- prior #359/#355a calibration progress (the original target this
   session was supposed to advance, before the bridge test mess
   surfaced).

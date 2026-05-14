@@ -3,7 +3,7 @@
 
 Single shared entry point for every tool in the trace pipeline. Schema lives
 at tools/trace_config_schema.json; spec at
-docs/superpowers/findings/2026-05-05-trace-config-schema.md.
+docs/archive/findings/2026-05-05-trace-config-schema.md.
 
 Use as a library:
 

@@ -108,7 +108,7 @@ correction trail.
 - Task #311 (trace_unit reset across batches — closed; the actual fix
   for the contamination that drove the empty-batch pattern).
 - The mode-2 upstream issue draft
-  (`docs/superpowers/findings/2026-05-05-mlir-aie-mode2-issue-draft.md`)
+  (`docs/archive/findings/2026-05-05-mlir-aie-mode2-issue-draft.md`)
   references this disposition in its "Existing issues we cross-checked"
   section.
 

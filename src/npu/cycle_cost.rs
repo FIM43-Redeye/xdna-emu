@@ -201,7 +201,7 @@ impl CycleCostModel {
     /// missing entry in the driver's `npu1_regs.c` op-table, which
     /// `aie2_is_supported_msg` consults before letting the message through.
     /// One-line driver fix unblocks the path. See
-    /// `docs/superpowers/findings/2026-05-05-aie-rw-access-firmware-actually-supported.md`
+    /// `docs/archive/findings/2026-05-05-aie-rw-access-firmware-actually-supported.md`
     /// for the breakthrough writeup; #356 tracks the integration. A
     /// separate lifecycle bug in `bridge-trace-runner.cpp` still prevents
     /// trace-independent cycle counts from being recorded automatically;
@@ -241,7 +241,7 @@ impl CycleCostModel {
     /// are measurement-side and would not apply to a no-trace kernel.
     /// We can't confirm without on-NPU timing.
     ///
-    /// See `docs/superpowers/findings/2026-05-04-control-path-cycle-calibration.md`
+    /// See `docs/archive/findings/2026-05-04-control-path-cycle-calibration.md`
     /// for the full methodology, the negative results from diagnostic
     /// tests, and what it would take to ship a real model.
     pub fn provisional_npu1() -> Self {

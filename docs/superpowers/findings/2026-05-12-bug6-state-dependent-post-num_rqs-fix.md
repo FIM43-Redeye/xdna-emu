@@ -6,7 +6,7 @@ type: finding
 
 # Bug #6 memtile_dmas hang -- still state-dependent on rebased driver
 
-**Supersedes** [2026-05-12-memtile-dmas-bug6-not-reproducible.md](2026-05-12-memtile-dmas-bug6-not-reproducible.md).
+**Supersedes** [2026-05-12-memtile-dmas-bug6-not-reproducible.md](../../archive/findings/2026-05-12-memtile-dmas-bug6-not-reproducible.md).
 That earlier doc's title and TL;DR are now misleading: the
 "reproducible TDR" the morning sweep saw was actually the
 *num_rqs=0 packaging oops*, not bug #6 proper.  Bug #6 is the
@@ -178,7 +178,7 @@ the rebased branch.
 
 ## Cross-references
 
-- [2026-05-12-memtile-dmas-bug6-not-reproducible.md](2026-05-12-memtile-dmas-bug6-not-reproducible.md) -- the morning's premature "fixed" doc, now superseded.
+- [2026-05-12-memtile-dmas-bug6-not-reproducible.md](../../archive/findings/2026-05-12-memtile-dmas-bug6-not-reproducible.md) -- the morning's premature "fixed" doc, now superseded.
 - `build/experiments/2026-05-12-bug6-rebase-attempt/POST-REBOOT-FINDINGS.md` -- detailed kernel oops trace from this morning's num_rqs repro (kept under build/ since it's experiment scratch, not committed).
 - xdna-driver commit `3509b2a` -- `build: add -refresh_dkms flag for in-tree DKMS iteration` (the num_rqs packaging fix).
 - xdna-emu commit `33e4ad2` -- `claude.md: switch DKMS refresh shortcut to build.sh -refresh_dkms`.

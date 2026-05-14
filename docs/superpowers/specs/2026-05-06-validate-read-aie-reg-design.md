@@ -248,7 +248,7 @@ runs); 1 hr V2/V3/V4 (need real kernel run); 30 min cleanup and shake-out.
 ## See also
 
 - `NEXT-STEPS.md` lines 31-110 — original lifecycle-bug diagnosis
-- `docs/superpowers/findings/2026-05-05-aie-rw-access-firmware-actually-supported.md` — driver fix breakthrough
+- `docs/archive/findings/2026-05-05-aie-rw-access-firmware-actually-supported.md` — driver fix breakthrough
 - `bridge-runner/bridge-trace-runner.cpp:1700-1750` — existing
   pre/post-launch read-perf-counter scaffolding (the lifecycle bug
   lives here)

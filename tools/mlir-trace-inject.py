@@ -576,7 +576,7 @@ def _build_trace_config(
     """Construct the trace_config.json payload for the schema.
 
     Schema lives at tools/trace_config_schema.json; spec at
-    docs/superpowers/findings/2026-05-05-trace-config-schema.md.
+    docs/archive/findings/2026-05-05-trace-config-schema.md.
 
     Args:
         tiles: list of (col, row, events, module) for each tile traced.
@@ -1178,7 +1178,7 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
 
     # Write trace_config.json -- the single source of truth consumed by
     # cpp_trace_patch, parse-trace, trace_compare, and the bridge script.
-    # Spec: docs/superpowers/findings/2026-05-05-trace-config-schema.md.
+    # Spec: docs/archive/findings/2026-05-05-trace-config-schema.md.
     # Required when injecting; without it downstream tools have nothing
     # to read.
     if args.trace_config_out is None:

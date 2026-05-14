@@ -15,7 +15,7 @@
 # memtile_dmas/* -- previously quarantined 2026-05-09 for TDR on Phoenix
 # (NPU1) under bug #6 / Xilinx/mlir-aie#3062.  Removed 2026-05-12 after
 # the bug stopped reproducing in our environment.  See
-# docs/superpowers/findings/2026-05-12-memtile-dmas-bug6-not-reproducible.md
+# docs/archive/findings/2026-05-12-memtile-dmas-bug6-not-reproducible.md
 # for the diagnostic chain; bisect (task #29) closed without finding a
 # regressing commit because no deterministic reproducer remained.  Re-add
 # this block if the failure returns.

@@ -77,7 +77,7 @@ on `add_one_using_dma`.
 
 **Cross-references**:
 - Tasks: #322, #323, #336-#339, #342-#344
-- Findings: `docs/superpowers/findings/2026-05-04-control-path-cycle-calibration.md`
+- Findings: `docs/archive/findings/2026-05-04-control-path-cycle-calibration.md`
 - Code: `src/npu/cycle_cost.rs`, `tools/calibration/`
 
 ### 2. Multi-tile timer sync (broadcast-driven reset)
@@ -160,7 +160,7 @@ TIP about east-broadcast being internally connected)?
 transaction latency. Currently fudged.
 
 **Cross-references**:
-- Findings: `docs/superpowers/findings/2026-05-04-control-path-cycle-calibration.md`
+- Findings: `docs/archive/findings/2026-05-04-control-path-cycle-calibration.md`
 - Tasks: #335 (constants extracted), #337 (default latencies
   disassembled from libaie2_cluster_msm)
 

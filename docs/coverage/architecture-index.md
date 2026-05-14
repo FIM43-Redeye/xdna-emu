@@ -126,7 +126,7 @@ MemTile = mem tile (row 1 on NPU1), Shim = row 0.
 | Stream switch routing reconstruction | — | MODELED | `src/parser/stream_switch_topology.rs` | From CDO writes. |
 | Control packet handling | — | MODELED | `src/device/control_packets/` | Headers, reassembly, register read/write effects, response packets. Recently added — keystone subsystem we previously missed. |
 | NPU instruction stream | XRT host protocol | MODELED | `src/npu/` | WRITE32, BLOCKWRITE, BLOCKSET, MASKWRITE, MASKPOLL, CONFIG_SHIMDMA_*, DDR_PATCH. |
-| NoC fabric (latency / arbitration) | hardware spec | STUBBED | scattered | Stream switch has tile-internal latency; NoC inter-tile latency is fudged. Cycle-accuracy impact catalogued in `docs/superpowers/findings/2026-05-04-control-path-cycle-calibration.md`. |
+| NoC fabric (latency / arbitration) | hardware spec | STUBBED | scattered | Stream switch has tile-internal latency; NoC inter-tile latency is fudged. Cycle-accuracy impact catalogued in `docs/archive/findings/2026-05-04-control-path-cycle-calibration.md`. |
 | Multi-tile timer sync (broadcast) | aie-rt `timer/` | MISSING | — | Cross-tile timer alignment via broadcast event. Used by trace correlation. |
 | Cross-tile event broadcast network | aie-rt `events/`, AM025 | MODELED | `src/device/events/broadcast.rs` | 16 channels with directional masking. Verify L2 propagation. |
 
@@ -163,7 +163,7 @@ re-discover them as "missing hardware."
 
 ### Cycle-accuracy gaps (functional-OK, timing-off)
 
-7. **NoC latency / arbitration** — fudged. Documented in `docs/superpowers/findings/2026-05-04-control-path-cycle-calibration.md`.
+7. **NoC latency / arbitration** — fudged. Documented in `docs/archive/findings/2026-05-04-control-path-cycle-calibration.md`.
 8. **DMA FIFO size events** — not emitted; affects performance-counter output.
 9. **Stream switch FIFO size events** — same.
 10. **Module / column / tile clock control** — clock-gating writes are silent. Real HW gates state.

@@ -2,7 +2,7 @@
 
 Hardware probe for the mode-2 LC frame's bit-28 flag at trip counts that
 straddle the 2^28 boundary. Findings written up in
-[`docs/superpowers/findings/2026-05-08-lc-overflow-empirical.md`](../../../docs/superpowers/findings/2026-05-08-lc-overflow-empirical.md):
+[`docs/archive/findings/2026-05-08-lc-overflow-empirical.md`](../../../docs/archive/findings/2026-05-08-lc-overflow-empirical.md):
 bit-28 is an overflow saturation flag, count is `N mod 2^28`.
 
 ## Build

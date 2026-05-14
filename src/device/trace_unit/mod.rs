@@ -126,8 +126,8 @@ enum PendingMode2Frame {
 // flag=0; LC overflow probe (2026-05-08) flipped flag=1 at exactly
 // N >= 2^28 and confirmed the count wraps cleanly modulo 2^28 through
 // 2^29+5.
-//   docs/superpowers/findings/2026-04-30-mode2-lc-flag-semantics.md
-//   docs/superpowers/findings/2026-05-08-lc-overflow-empirical.md
+//   docs/archive/findings/2026-04-30-mode2-lc-flag-semantics.md
+//   docs/archive/findings/2026-05-08-lc-overflow-empirical.md
 
 /// Hardware trace unit for one tile module (Core or Memory).
 ///
@@ -1100,7 +1100,7 @@ impl TraceUnit {
     /// Aligns to word boundary via Filler0 padding before emitting.
     /// Flag = 1 iff trip count >= 2^28 (28-bit-overflow saturation);
     /// count = trip_count mod 2^28. See
-    /// docs/superpowers/findings/2026-05-08-lc-overflow-empirical.md.
+    /// docs/archive/findings/2026-05-08-lc-overflow-empirical.md.
     fn encode_lc(&mut self, flag: u8, count: u32) {
         debug_assert!(flag <= 1, "LC flag must be 0 or 1");
         debug_assert!(count < (1u32 << 28), "LC count exceeds 28 bits");

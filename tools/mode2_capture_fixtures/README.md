@@ -13,7 +13,7 @@ was baked into `src/device/trace_unit/mod.rs::compute_lc_flag`.
 from these fixtures (single-loop and software-outer/ZOL-inner nested
 configurations), bit-28 is always 0. The LC frame is also emitted **once
 per ZOL invocation** (not per iteration), with `count = trip count`.
-See [`docs/superpowers/findings/2026-04-30-mode2-lc-flag-semantics.md`](../../docs/superpowers/findings/2026-04-30-mode2-lc-flag-semantics.md)
+See [`docs/archive/findings/2026-04-30-mode2-lc-flag-semantics.md`](../../docs/archive/findings/2026-04-30-mode2-lc-flag-semantics.md)
 for the full empirical record and follow-on doc-search results.
 
 The methodology below is preserved as the template for future Phase-0-style
@@ -36,7 +36,7 @@ hypothesis tests on undocumented HW behavior.
 >   Compiling kernel.cc with Peano clang while linking with Chess
 >   xbridge crashes the linker (NULL deref). The current `build_fixture.sh`
 >   compiles kernel.cc with whichever toolchain `--chess` or peano-default
->   selects. See `docs/superpowers/findings/2026-05-08-mode2-flush-and-peano-non-bug.md`
+>   selects. See `docs/archive/findings/2026-05-08-mode2-flush-and-peano-non-bug.md`
 >   for the full corrected analysis.
 
 ## Why Peano kernels (not iron API)
