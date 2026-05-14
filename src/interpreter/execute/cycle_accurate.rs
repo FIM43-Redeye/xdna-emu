@@ -36,6 +36,7 @@ use crate::interpreter::traits::{ExecuteResult, Executor};
 use super::cascade::{CascadeOps, CascadeResult};
 use super::control::ControlUnit;
 use super::memory::{MemoryUnit, NeighborMemory};
+use crate::device::state::NeighborView;
 use super::semantic::execute_semantic;
 use super::stream::{StreamOps, StreamResult};
 use super::vector_dispatch::VectorAlu;
@@ -112,6 +113,7 @@ impl CycleAccurateExecutor {
         tile: &mut Tile,
         neighbor_locks: &mut super::control::NeighborLocks,
         neighbors: Option<&mut NeighborMemory>,
+        view: Option<&NeighborView>,
     ) -> Option<ExecuteResult> {
         // Check for call - save return address
         if matches!(op.semantic, Some(SemanticOp::Call)) {
@@ -130,7 +132,7 @@ impl CycleAccurateExecutor {
             return None;
         }
 
-        if MemoryUnit::execute(op, ctx, tile, neighbors) {
+        if MemoryUnit::execute(op, ctx, tile, neighbors, view) {
             return None;
         }
 
@@ -283,9 +285,10 @@ impl CycleAccurateExecutor {
         tile: &mut Tile,
         mem_tile_locks: Option<&mut [crate::device::tile::Lock]>,
         neighbors: Option<&mut NeighborMemory>,
+        view: Option<&NeighborView>,
     ) -> ExecuteResult {
         let mut nlocks = super::control::NeighborLocks::south_only(mem_tile_locks);
-        self.execute_internal(bundle, ctx, tile, &mut nlocks, neighbors)
+        self.execute_internal(bundle, ctx, tile, &mut nlocks, neighbors, view)
     }
 
     /// Execute with full neighbor lock routing (all four quadrants).
@@ -296,8 +299,9 @@ impl CycleAccurateExecutor {
         tile: &mut Tile,
         neighbor_locks: &mut super::control::NeighborLocks,
         neighbors: Option<&mut NeighborMemory>,
+        view: Option<&NeighborView>,
     ) -> ExecuteResult {
-        self.execute_internal(bundle, ctx, tile, neighbor_locks, neighbors)
+        self.execute_internal(bundle, ctx, tile, neighbor_locks, neighbors, view)
     }
 
     /// Internal execution with neighbor locks and cross-tile memory.
@@ -308,6 +312,7 @@ impl CycleAccurateExecutor {
         tile: &mut Tile,
         neighbor_locks: &mut super::control::NeighborLocks,
         mut neighbors: Option<&mut NeighborMemory>,
+        view: Option<&NeighborView>,
     ) -> ExecuteResult {
         self.pending_call_return_addr = None;
 
@@ -380,7 +385,7 @@ impl CycleAccurateExecutor {
         for ps in &ready_stores {
             let value = super::memory::MemoryUnit::read_store_register(&ps.source, ctx, ps.width);
             let neighbor_ref = neighbors.as_mut().map(|n| &mut **n);
-            super::memory::MemoryUnit::write_memory(tile, ps.address, value, ps.width, neighbor_ref);
+            super::memory::MemoryUnit::write_memory(tile, ps.address, value, ps.width, neighbor_ref, view);
         }
 
         // Pre-check stall conditions for cascade and stream slots.
@@ -454,7 +459,7 @@ impl CycleAccurateExecutor {
                 // Reborrow neighbors for each slot operation
                 let slot_neighbors = neighbors.as_mut().map(|n| &mut **n);
                 if let Some(result) =
-                    self.execute_slot_with_neighbor_locks(op, ctx, tile, neighbor_locks, slot_neighbors)
+                    self.execute_slot_with_neighbor_locks(op, ctx, tile, neighbor_locks, slot_neighbors, view)
                 {
                     match &result {
                         ExecuteResult::Branch { .. }
@@ -552,6 +557,7 @@ impl CycleAccurateExecutor {
                             value,
                             ps.width,
                             neighbor_ref,
+                            view,
                         );
                     }
                 }
@@ -612,7 +618,7 @@ impl CycleAccurateExecutor {
 impl Executor for CycleAccurateExecutor {
     fn execute(&mut self, bundle: &VliwBundle, ctx: &mut ExecutionContext, tile: &mut Tile) -> ExecuteResult {
         // Delegate to internal implementation with no neighbor locks or memory
-        self.execute_internal(bundle, ctx, tile, &mut super::control::NeighborLocks::none(), None)
+        self.execute_internal(bundle, ctx, tile, &mut super::control::NeighborLocks::none(), None, None)
     }
 
     fn is_cycle_accurate(&self) -> bool {

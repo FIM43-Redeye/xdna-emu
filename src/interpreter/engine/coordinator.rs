@@ -18,7 +18,6 @@ use crate::interpreter::core::{CoreInterpreter, CoreStatus, StepResult};
 use crate::interpreter::decode::InstructionDecoder;
 use crate::interpreter::execute::{CycleAccurateExecutor, NeighborMemory};
 use crate::interpreter::state::{EventType, ExecutionContext};
-use crate::interpreter::timing::MemoryQuadrant;
 use crate::parser::AieElf;
 use xdna_archspec::aie2::SHIM_ROW;
 use xdna_archspec::types::TileKind;
@@ -594,13 +593,12 @@ impl InterpreterEngine {
 
                 // Split the device so the executing tile and a read-through
                 // view of all other tiles come from one borrow. The view
-                // feeds `ensure_snapshot` for cross-tile neighbor refresh
-                // without conflicting with `&mut tile`. NeighborMemory is
-                // hoisted to CoreState; ensure_snapshot is gen-aware, so
-                // most of these calls hit the cache and only re-clone when
-                // a neighbor's data_memory_gen has changed. Both `tile`
-                // and `view` drop at the end of this `if let` body, freeing
-                // `&mut self.device` for `drain_writes` below.
+                // is threaded into `step_with_neighbor_locks` so the read
+                // sites can `ensure_snapshot` lazily -- only the quadrants
+                // the kernel actually accesses get snapshotted, and only
+                // on the first read. Both `tile` and `view` drop at the
+                // end of this body, freeing `&mut self.device` for
+                // `drain_writes` below.
                 let Some((tile, view)) = self.device.split_tile_mut(col, row) else {
                     continue;
                 };
@@ -608,9 +606,6 @@ impl InterpreterEngine {
                     continue;
                 }
                 let core = &mut self.cores[idx];
-                core.neighbors.ensure_snapshot(MemoryQuadrant::South, &view);
-                core.neighbors.ensure_snapshot(MemoryQuadrant::West, &view);
-                core.neighbors.ensure_snapshot(MemoryQuadrant::North, &view);
 
                 // Build neighbor locks struct
                 let mut nlocks = crate::interpreter::execute::NeighborLocks {
@@ -624,6 +619,7 @@ impl InterpreterEngine {
                     tile,
                     &mut nlocks,
                     Some(&mut core.neighbors),
+                    Some(&view),
                 );
 
                 // Update CoreDebugState with current PC and stall info.

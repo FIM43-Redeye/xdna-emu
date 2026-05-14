@@ -51,6 +51,12 @@ pub struct NeighborMemory {
     /// Buffered cross-tile writes: (direction, offset_within_tile, data).
     /// Applied after core step completes.
     pub pending_writes: Vec<(MemoryQuadrant, usize, Vec<u8>)>,
+
+    /// Test-only counter for `ensure_snapshot` invocations (cache hits AND
+    /// misses both increment). Used to assert lazy refresh actually skips
+    /// directions the kernel never touches.
+    #[cfg(test)]
+    pub ensure_snapshot_calls: u32,
 }
 
 /// Map a cardinal direction to its snapshot array index.
@@ -77,6 +83,8 @@ impl NeighborMemory {
             snapshots: [None, None, None, None],
             snapshot_gens: [None, None, None, None],
             pending_writes: Vec::new(),
+            #[cfg(test)]
+            ensure_snapshot_calls: 0,
         }
     }
 
@@ -122,6 +130,11 @@ impl NeighborMemory {
     /// refresh at a read site that already holds `&mut Tile` for the
     /// executing tile.
     pub fn ensure_snapshot<T: TileLookup>(&mut self, dir: MemoryQuadrant, source: &T) {
+        #[cfg(test)]
+        {
+            self.ensure_snapshot_calls += 1;
+        }
+
         let idx = match dir_index(dir) {
             Some(i) => i,
             None => return, // Local -- no snapshot needed

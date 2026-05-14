@@ -115,8 +115,9 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
         tile: &mut Tile,
         neighbor_locks: &mut crate::interpreter::execute::NeighborLocks,
         neighbors: Option<&mut crate::interpreter::execute::NeighborMemory>,
+        view: Option<&crate::device::state::NeighborView>,
     ) -> StepResult {
-        self.step_internal(ctx, tile, Some(neighbor_locks), neighbors)
+        self.step_internal(ctx, tile, Some(neighbor_locks), neighbors, view)
     }
 
     /// Execute a single instruction cycle with South-only lock routing
@@ -127,9 +128,10 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
         tile: &mut Tile,
         mem_tile_locks: Option<&mut [crate::device::tile::Lock]>,
         neighbors: Option<&mut crate::interpreter::execute::NeighborMemory>,
+        view: Option<&crate::device::state::NeighborView>,
     ) -> StepResult {
         let mut nlocks = crate::interpreter::execute::NeighborLocks::south_only(mem_tile_locks);
-        self.step_internal(ctx, tile, Some(&mut nlocks), neighbors)
+        self.step_internal(ctx, tile, Some(&mut nlocks), neighbors, view)
     }
 
     /// Internal step implementation.
@@ -139,6 +141,7 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
         tile: &mut Tile,
         neighbor_locks: Option<&mut crate::interpreter::execute::NeighborLocks>,
         neighbors: Option<&mut crate::interpreter::execute::NeighborMemory>,
+        view: Option<&crate::device::state::NeighborView>,
     ) -> StepResult {
         // Check if halted
         if self.is_halted() {
@@ -201,9 +204,10 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
         // Execute bundle with neighbor locks and neighbor memory for proper routing
         self.status = CoreStatus::Running;
         let result = if let Some(nlocks) = neighbor_locks {
-            self.executor.execute_with_neighbor_locks(&bundle, ctx, tile, nlocks, neighbors)
+            self.executor
+                .execute_with_neighbor_locks(&bundle, ctx, tile, nlocks, neighbors, view)
         } else {
-            self.executor.execute_with_mem_tile(&bundle, ctx, tile, None, neighbors)
+            self.executor.execute_with_mem_tile(&bundle, ctx, tile, None, neighbors, view)
         };
 
         // Save bundle for debugging
