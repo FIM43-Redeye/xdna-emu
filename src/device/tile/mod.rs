@@ -211,10 +211,6 @@ pub struct Tile {
     /// Configured by PERFORMANCE_CONTROL/COUNTER/EVENT_VALUE registers:
     /// - Compute core module: 0x31500-0x3158C (4 counters)
     /// - Shim PL module:      0x31000-0x31084 (2 counters)
-    ///
-    /// TODO: Implement actual counting logic triggered by start/stop/reset
-    /// events, and fire PERF_CNT_N events (hw_id 5-8) when counter reaches
-    /// the configured event_value threshold.
     pub core_perf_counters: super::perf_counters::PerfCounterBank,
 
     /// Memory module performance counters (compute: 2 counters, memtile: 4).

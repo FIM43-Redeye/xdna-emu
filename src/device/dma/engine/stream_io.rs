@@ -129,22 +129,6 @@ impl DmaEngine {
         self.stream_in.get_mut(channel as usize)?.pop_front()
     }
 
-    /// Check if any S2MM channel needs to receive stream data.
-    ///
-    /// Returns Some(channel) if a channel needs data, None otherwise.
-    pub fn s2mm_needs_data(&self) -> Option<ChannelId> {
-        for ch_idx in 0..self.channels.len() {
-            if self.channel_type(ch_idx as u8) == ChannelType::S2MM {
-                let is_pending = self.channels[ch_idx].is_active();
-                if is_pending && self.stream_in.len() < 256 {
-                    // TODO(phase2): This compares channel count to 256 -- likely a latent bug; see subsys3 audit
-                    return Some(ch_idx as u8);
-                }
-            }
-        }
-        None
-    }
-
     // === Stream Port Mapping Integration ===
     //
     // These methods integrate with the stream_io module's port mappings,

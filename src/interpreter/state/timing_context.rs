@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 
 use super::event_trace::{EventLog, EventType};
-use crate::interpreter::timing::{HazardDetector, LatencyTable, MemoryModel};
+use crate::interpreter::timing::{HazardDetector, MemoryModel};
 
 // ============================================================================
 // Trace Pipeline Modeling
@@ -69,11 +69,6 @@ pub struct TimingContext {
     /// Memory bank conflict detector.
     pub memory: MemoryModel,
 
-    /// Operation latency lookup table.
-    // TODO(subsys7-followup): Use arch_handle::latency_table() instead of owning a copy.
-    // See docs/arch/subsys7-audit.md "Completion" section.
-    pub latencies: LatencyTable,
-
     /// Total hazard stall cycles.
     pub hazard_stalls: u64,
 
@@ -95,7 +90,6 @@ impl TimingContext {
         Self {
             hazards: HazardDetector::new(),
             memory: MemoryModel::new(),
-            latencies: LatencyTable::aie2(),
             hazard_stalls: 0,
             memory_stalls: 0,
             events: EventLog::new(),
