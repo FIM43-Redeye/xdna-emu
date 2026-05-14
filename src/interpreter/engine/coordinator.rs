@@ -592,138 +592,144 @@ impl InterpreterEngine {
                     }
                 }
 
-                // Refresh cross-tile neighbor snapshots. NeighborMemory is
-                // hoisted to CoreState (persists across steps); ensure_snapshot
-                // is gen-aware, so most of these calls hit the cache and only
-                // re-clone when a neighbor's data_memory_gen has changed.
+                // Split the device so the executing tile and a read-through
+                // view of all other tiles come from one borrow. The view
+                // feeds `ensure_snapshot` for cross-tile neighbor refresh
+                // without conflicting with `&mut tile`. NeighborMemory is
+                // hoisted to CoreState; ensure_snapshot is gen-aware, so
+                // most of these calls hit the cache and only re-clone when
+                // a neighbor's data_memory_gen has changed. Both `tile`
+                // and `view` drop at the end of this `if let` body, freeing
+                // `&mut self.device` for `drain_writes` below.
+                let Some((tile, view)) = self.device.split_tile_mut(col, row) else {
+                    continue;
+                };
+                if !tile.is_compute() {
+                    continue;
+                }
                 let core = &mut self.cores[idx];
-                core.neighbors.ensure_snapshot(MemoryQuadrant::South, &self.device);
-                core.neighbors.ensure_snapshot(MemoryQuadrant::West, &self.device);
-                core.neighbors.ensure_snapshot(MemoryQuadrant::North, &self.device);
+                core.neighbors.ensure_snapshot(MemoryQuadrant::South, &view);
+                core.neighbors.ensure_snapshot(MemoryQuadrant::West, &view);
+                core.neighbors.ensure_snapshot(MemoryQuadrant::North, &view);
 
-                // Get tile for this core
-                if let Some(tile) = self.device.tile_mut(col, row) {
-                    if !tile.is_compute() {
-                        continue;
+                // Build neighbor locks struct
+                let mut nlocks = crate::interpreter::execute::NeighborLocks {
+                    south: south_locks.as_mut().map(|v| v.as_mut_slice()),
+                    west: west_locks.as_mut().map(|v| v.as_mut_slice()),
+                    north: north_locks.as_mut().map(|v| v.as_mut_slice()),
+                };
+
+                let result = core.interpreter.step_with_neighbor_locks(
+                    &mut core.context,
+                    tile,
+                    &mut nlocks,
+                    Some(&mut core.neighbors),
+                );
+
+                // Update CoreDebugState with current PC and stall info.
+                // This mirrors the interpreter state into the register
+                // space so host reads of Core_Status/Core_PC return
+                // correct values (matching real hardware behavior).
+                tile.core_debug.update_pc(core.context.pc());
+
+                // Mirror the live PC onto tile.core.pc as well, so any
+                // path that reads tile-side state (broadcast
+                // propagation, register effects) sees the running PC
+                // instead of the stale CDO-loaded entry value. Without
+                // this sync, mode-2's Start anchor_pc reads 0
+                // regardless of what the core was actually doing when
+                // start_event fired.
+                tile.core.pc = core.context.pc();
+                match result {
+                    StepResult::Continue => {
+                        tile.core_debug.update_stalls(false, false, false, false);
+                        all_halted = false;
+                        any_running = true;
+                        self.total_instructions += 1;
+                        core.active_this_cycle = true;
                     }
-
-                    // Build neighbor locks struct
-                    let mut nlocks = crate::interpreter::execute::NeighborLocks {
-                        south: south_locks.as_mut().map(|v| v.as_mut_slice()),
-                        west: west_locks.as_mut().map(|v| v.as_mut_slice()),
-                        north: north_locks.as_mut().map(|v| v.as_mut_slice()),
-                    };
-
-                    let result = core.interpreter.step_with_neighbor_locks(
-                        &mut core.context,
-                        tile,
-                        &mut nlocks,
-                        Some(&mut core.neighbors),
-                    );
-
-                    // Update CoreDebugState with current PC and stall info.
-                    // This mirrors the interpreter state into the register
-                    // space so host reads of Core_Status/Core_PC return
-                    // correct values (matching real hardware behavior).
-                    tile.core_debug.update_pc(core.context.pc());
-
-                    // Mirror the live PC onto tile.core.pc as well, so any
-                    // path that reads tile-side state (broadcast
-                    // propagation, register effects) sees the running PC
-                    // instead of the stale CDO-loaded entry value. Without
-                    // this sync, mode-2's Start anchor_pc reads 0
-                    // regardless of what the core was actually doing when
-                    // start_event fired.
-                    tile.core.pc = core.context.pc();
-                    match result {
-                        StepResult::Continue => {
-                            tile.core_debug.update_stalls(false, false, false, false);
-                            all_halted = false;
-                            any_running = true;
-                            self.total_instructions += 1;
-                            core.active_this_cycle = true;
-                        }
-                        StepResult::WaitLock { .. } => {
-                            tile.core_debug.update_stalls(false, true, false, false);
-                            all_halted = false;
-                            any_running = true;
-                            // Pipeline-PC adjustment: HW's fetch+decode is
-                            // several stages ahead of execute. When ACQ stalls
-                            // in execute, the fetch PC pins at the start of
-                            // the last delay slot of the next branch (RET in
-                            // the acquire stub). Override tile.core.pc so the
-                            // trace unit sees the same PC HW would, instead
-                            // of the execute PC where ACQ is parked.
-                            let stall_pc = core.context.pc();
-                            if let Some(prog_mem) = tile.program_memory() {
-                                let pipeline_pc = core.interpreter.lock_stall_pipeline_pc(prog_mem, stall_pc);
-                                tile.core.pc = pipeline_pc;
-                                tile.core_debug.update_pc(pipeline_pc);
-                            }
-                        }
-                        StepResult::WaitDma { .. } => {
-                            tile.core_debug.update_stalls(true, false, false, false);
-                            all_halted = false;
-                            any_running = true;
-                        }
-                        StepResult::WaitStream { .. } => {
-                            tile.core_debug.update_stalls(false, false, true, false);
-                            all_halted = false;
-                            any_running = true;
-                        }
-                        StepResult::Halt => {
-                            tile.core_debug.set_done(true);
-                            tile.core_debug.update_stalls(false, false, false, false);
-                        }
-                        StepResult::DecodeError(ref e) => {
-                            log::error!(
-                                "Core({},{}) DecodeError at cycle {}: {:?}",
-                                col,
-                                row,
-                                self.total_cycles,
-                                e
-                            );
-                            self.status = EngineStatus::Error;
-                            return;
-                        }
-                        StepResult::ExecError(ref e) => {
-                            log::error!(
-                                "Core({},{}) ExecError at cycle {}: {:?}",
-                                col,
-                                row,
-                                self.total_cycles,
-                                e
-                            );
-                            self.status = EngineStatus::Error;
-                            return;
+                    StepResult::WaitLock { .. } => {
+                        tile.core_debug.update_stalls(false, true, false, false);
+                        all_halted = false;
+                        any_running = true;
+                        // Pipeline-PC adjustment: HW's fetch+decode is
+                        // several stages ahead of execute. When ACQ stalls
+                        // in execute, the fetch PC pins at the start of
+                        // the last delay slot of the next branch (RET in
+                        // the acquire stub). Override tile.core.pc so the
+                        // trace unit sees the same PC HW would, instead
+                        // of the execute PC where ACQ is parked.
+                        let stall_pc = core.context.pc();
+                        if let Some(prog_mem) = tile.program_memory() {
+                            let pipeline_pc = core.interpreter.lock_stall_pipeline_pc(prog_mem, stall_pc);
+                            tile.core.pc = pipeline_pc;
+                            tile.core_debug.update_pc(pipeline_pc);
                         }
                     }
-
-                    // Notify core trace unit with any new events since last cycle.
-                    //
-                    // Use the coordinator's global cycle (self.total_cycles) rather
-                    // than the per-core `evt.cycle`. The event log stores the
-                    // core-local retire counter (ctx.cycles), which freezes during
-                    // stalls and thus does not reflect the tile clock that real HW
-                    // trace units observe. Events drained here happened in the
-                    // current simulation step, so total_cycles is the right stamp.
-                    let event_log = &core.context.timing_context().events;
-                    let total = event_log.total_recorded();
-                    let new_start = core.trace_events_consumed;
-                    if new_start < total {
-                        let cycle = self.total_cycles;
-                        for evt in event_log.since(new_start) {
-                            if let Some(hw_id) = crate::trace::core_event_to_hw_id(&evt.event) {
-                                let pc = crate::trace::event_pc(&evt.event);
-                                tile.notify_core_trace_event(hw_id, cycle, pc);
-                            }
-                        }
-                        core.trace_events_consumed = total;
+                    StepResult::WaitDma { .. } => {
+                        tile.core_debug.update_stalls(true, false, false, false);
+                        all_halted = false;
+                        any_running = true;
                     }
+                    StepResult::WaitStream { .. } => {
+                        tile.core_debug.update_stalls(false, false, true, false);
+                        all_halted = false;
+                        any_running = true;
+                    }
+                    StepResult::Halt => {
+                        tile.core_debug.set_done(true);
+                        tile.core_debug.update_stalls(false, false, false, false);
+                    }
+                    StepResult::DecodeError(ref e) => {
+                        log::error!(
+                            "Core({},{}) DecodeError at cycle {}: {:?}",
+                            col,
+                            row,
+                            self.total_cycles,
+                            e
+                        );
+                        self.status = EngineStatus::Error;
+                        return;
+                    }
+                    StepResult::ExecError(ref e) => {
+                        log::error!(
+                            "Core({},{}) ExecError at cycle {}: {:?}",
+                            col,
+                            row,
+                            self.total_cycles,
+                            e
+                        );
+                        self.status = EngineStatus::Error;
+                        return;
+                    }
+                }
+
+                // Notify core trace unit with any new events since last cycle.
+                //
+                // Use the coordinator's global cycle (self.total_cycles) rather
+                // than the per-core `evt.cycle`. The event log stores the
+                // core-local retire counter (ctx.cycles), which freezes during
+                // stalls and thus does not reflect the tile clock that real HW
+                // trace units observe. Events drained here happened in the
+                // current simulation step, so total_cycles is the right stamp.
+                let event_log = &core.context.timing_context().events;
+                let total = event_log.total_recorded();
+                let new_start = core.trace_events_consumed;
+                if new_start < total {
+                    let cycle = self.total_cycles;
+                    for evt in event_log.since(new_start) {
+                        if let Some(hw_id) = crate::trace::core_event_to_hw_id(&evt.event) {
+                            let pc = crate::trace::event_pc(&evt.event);
+                            tile.notify_core_trace_event(hw_id, cycle, pc);
+                        }
+                    }
+                    core.trace_events_consumed = total;
                 }
 
                 // Drain buffered cross-tile writes to neighbor tiles.
                 // Snapshots stay live; only the writes vec is drained.
+                // NLL: `tile` and `view` are no longer in use after this
+                // point, so `&mut self.device` is free to be re-borrowed.
                 if core.neighbors.has_pending_writes() {
                     core.neighbors.drain_writes(&mut self.device);
                 }

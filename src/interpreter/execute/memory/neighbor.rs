@@ -4,6 +4,7 @@
 //! built lazily on first access. Cross-tile writes are buffered and applied
 //! after the core step completes, matching hardware behavior.
 
+use crate::device::state::TileLookup;
 use crate::interpreter::timing::MemoryQuadrant;
 use xdna_archspec::aie2::SHIM_ROW;
 
@@ -115,13 +116,18 @@ impl NeighborMemory {
     ///
     /// Cheap to call repeatedly across steps -- this is what makes hoisting
     /// `NeighborMemory` across step boundaries safe.
-    pub fn ensure_snapshot(&mut self, dir: MemoryQuadrant, device: &crate::device::DeviceState) {
+    ///
+    /// `source` is anything that resolves coordinates to tiles -- typically
+    /// `&DeviceState` for pre-step refresh and `&NeighborView` for lazy
+    /// refresh at a read site that already holds `&mut Tile` for the
+    /// executing tile.
+    pub fn ensure_snapshot<T: TileLookup>(&mut self, dir: MemoryQuadrant, source: &T) {
         let idx = match dir_index(dir) {
             Some(i) => i,
             None => return, // Local -- no snapshot needed
         };
 
-        let neighbor = self.neighbor_coords(dir).and_then(|(c, r)| device.tile(c, r));
+        let neighbor = self.neighbor_coords(dir).and_then(|(c, r)| source.tile(c, r));
         let current_gen = neighbor.map(|t| t.data_memory_gen());
 
         // Cache hit: snapshot exists and the neighbor's gen hasn't changed

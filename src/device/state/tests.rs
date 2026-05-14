@@ -555,3 +555,31 @@ fn register_bus_write_to_compute_start_queue_does_not_trigger_unrelated_tile_eff
     assert_eq!(lock_over_pre, lock_over_post);
     assert_eq!(lock_under_pre, lock_under_post);
 }
+
+/// `NeighborView::tile(own_col, own_row)` must return `None` -- the executing
+/// tile is held by `&mut Tile` from the same `split_tile_mut` call, so it's
+/// deliberately a hole in the view to keep the borrow safe.
+#[test]
+fn neighbor_view_holes_out_own_tile() {
+    let mut device = DeviceState::new_npu1();
+    let (own_col, own_row) = (1, 3);
+    let (_own, view) = device.split_tile_mut(own_col, own_row).expect("split valid");
+
+    assert!(view.tile(own_col, own_row).is_none(), "own tile must be a hole in the view");
+    // Sanity: an existing neighbor IS visible through the view.
+    assert!(view.tile(own_col, own_row - 1).is_some(), "south neighbor should be visible");
+    assert!(view.tile(own_col - 1, own_row).is_some(), "west neighbor should be visible");
+}
+
+/// Out-of-bounds coordinates must return `None` rather than panic. This keeps
+/// callers from having to bounds-check before calling.
+#[test]
+fn split_tile_mut_returns_none_for_oob() {
+    let mut device = DeviceState::new_npu1();
+    let cols = device.cols();
+    let rows = device.rows();
+
+    assert!(device.split_tile_mut(cols, 0).is_none(), "col >= cols");
+    assert!(device.split_tile_mut(0, rows).is_none(), "row >= rows");
+    assert!(device.split_tile_mut(cols + 5, rows + 5).is_none(), "both OOB");
+}

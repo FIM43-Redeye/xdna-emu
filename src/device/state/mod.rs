@@ -220,4 +220,92 @@ impl DeviceState {
             None
         }
     }
+
+    /// Split the tile array so the executing tile can be borrowed mutably
+    /// while the neighbors stay reachable through a `NeighborView`.
+    ///
+    /// Uses `slice::split_at_mut` + `split_first_mut` -- no unsafe.
+    /// Returns `None` for out-of-bounds coordinates.
+    ///
+    /// # Why this exists
+    ///
+    /// The interpreter's per-step body needs `&mut Tile` for the executing
+    /// tile (to step the core, drain trace events, etc.) AND read access to
+    /// neighbor tiles' data memory (to refresh the cross-tile snapshot
+    /// cache). Holding `&mut Tile` and `&DeviceState` simultaneously is a
+    /// borrow conflict; this split disentangles them at one well-defined
+    /// boundary so the rest of the interpreter doesn't have to.
+    pub fn split_tile_mut(&mut self, col: usize, row: usize) -> Option<(&mut Tile, NeighborView<'_>)> {
+        let cols = self.cols();
+        let rows = self.rows();
+        if col >= cols || row >= rows {
+            return None;
+        }
+        let idx = col * rows + row;
+        let tiles: &mut [Tile] = &mut self.array.tiles;
+        let (left, rest) = tiles.split_at_mut(idx);
+        let (own, right) = rest.split_first_mut()?;
+        Some((own, NeighborView { left, right, own_idx: idx, cols, rows }))
+    }
+}
+
+/// Read-only access to a tile by coordinates.
+///
+/// Implemented for both `DeviceState` (full array) and `NeighborView`
+/// (everything except the executing tile). `NeighborMemory::ensure_snapshot`
+/// is generic over this trait so the same body works in both contexts:
+/// pre-step refresh against the whole device, and lazy refresh at a read
+/// site that already holds `&mut Tile` for the executing tile.
+pub trait TileLookup {
+    fn tile(&self, col: usize, row: usize) -> Option<&Tile>;
+}
+
+impl TileLookup for DeviceState {
+    #[inline]
+    fn tile(&self, col: usize, row: usize) -> Option<&Tile> {
+        DeviceState::tile(self, col, row)
+    }
+}
+
+/// Read-through view of every tile EXCEPT the one at `own_idx`.
+///
+/// Produced by `DeviceState::split_tile_mut`. The `own_idx` slot is a hole
+/// (`tile()` returns `None` there) because the caller has `&mut Tile` for
+/// that position from the same split. All other in-bounds coordinates
+/// resolve normally.
+pub struct NeighborView<'a> {
+    left: &'a [Tile],
+    right: &'a [Tile],
+    own_idx: usize,
+    cols: usize,
+    rows: usize,
+}
+
+impl<'a> NeighborView<'a> {
+    /// Look up a tile by coordinates.
+    ///
+    /// Returns `None` for out-of-bounds coordinates and for the hole at
+    /// `own_idx` (the executing tile is reachable via the `&mut Tile`
+    /// returned alongside this view, not through the view itself).
+    #[inline]
+    pub fn tile(&self, col: usize, row: usize) -> Option<&Tile> {
+        if col >= self.cols || row >= self.rows {
+            return None;
+        }
+        let idx = col * self.rows + row;
+        if idx < self.own_idx {
+            Some(&self.left[idx])
+        } else if idx == self.own_idx {
+            None
+        } else {
+            Some(&self.right[idx - self.own_idx - 1])
+        }
+    }
+}
+
+impl<'a> TileLookup for NeighborView<'a> {
+    #[inline]
+    fn tile(&self, col: usize, row: usize) -> Option<&Tile> {
+        NeighborView::tile(self, col, row)
+    }
 }
