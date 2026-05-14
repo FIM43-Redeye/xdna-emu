@@ -9,6 +9,19 @@ use crate::interpreter::execute::CycleAccurateExecutor;
 use crate::interpreter::state::{EventType, ExecutionContext};
 use crate::interpreter::traits::{DecodeError, Decoder, ExecuteResult, Executor};
 
+/// Mark the core in error_halt state and fire the INSTR_ERROR event into
+/// core trace + perf counters. Called at every site where the interpreter
+/// transitions to `CoreStatus::Error` (decode failure, missing program
+/// memory, or execute returning Error). Surfaces in Core_Status bit 19
+/// so software polling sees the halt; matches HW which routes these into
+/// the Error_Halt path.
+fn raise_instr_error(tile: &mut Tile, cycle: u64, pc: u32) {
+    use xdna_archspec::aie2::trace_events::core_events;
+    tile.core_debug.set_error_halt(true);
+    tile.core_trace.notify_event(core_events::INSTR_ERROR, cycle, Some(pc));
+    tile.core_perf_counters.handle_event(core_events::INSTR_ERROR);
+}
+
 /// Core execution status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CoreStatus {
@@ -166,6 +179,7 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
             Some(mem) => mem,
             None => {
                 self.status = CoreStatus::Error;
+                raise_instr_error(tile, ctx.cycles, pc);
                 return StepResult::ExecError("No program memory".to_string());
             }
         };
@@ -195,6 +209,7 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                     e
                 );
                 self.status = CoreStatus::Error;
+                raise_instr_error(tile, ctx.cycles, pc);
                 return StepResult::DecodeError(e);
             }
         };
@@ -307,6 +322,7 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
 
             crate::interpreter::traits::ExecuteResult::Error { message } => {
                 self.status = CoreStatus::Error;
+                raise_instr_error(tile, ctx.cycles, ctx.pc());
                 StepResult::ExecError(message)
             }
         }
@@ -449,6 +465,7 @@ where
             Some(mem) => mem,
             None => {
                 self.status = CoreStatus::Error;
+                raise_instr_error(tile, ctx.cycles, pc);
                 return StepResult::ExecError("No program memory".to_string());
             }
         };
@@ -469,6 +486,7 @@ where
             Ok(b) => b,
             Err(e) => {
                 self.status = CoreStatus::Error;
+                raise_instr_error(tile, ctx.cycles, pc);
                 return StepResult::DecodeError(e);
             }
         };
@@ -611,6 +629,7 @@ where
             ExecuteResult::Error { message } => {
                 self.status = CoreStatus::Error;
                 ctx.clear_pending_branch(); // Clear any pending branch on error
+                raise_instr_error(tile, ctx.cycles, ctx.pc());
                 StepResult::ExecError(message)
             }
         }

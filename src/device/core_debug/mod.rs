@@ -152,6 +152,11 @@ pub struct CoreDebugState {
     pub(super) halted: bool,
     /// ECC error has halted the core.
     pub(super) ecc_error: bool,
+    /// Generic execution error has halted the core (decode failure,
+    /// unhandled instruction, missing program memory). Distinct from
+    /// `ecc_error` -- both contribute to the Error_Halt status bit (19),
+    /// but only `ecc_error` raises ECC_ERROR_STALL (bit 17).
+    pub(super) error_halt: bool,
     /// Single-step mode active.
     pub(super) single_step: bool,
     /// Single-step count (Debug_Control0 bits [5:2]).
@@ -186,6 +191,7 @@ impl Default for CoreDebugState {
             cascade_stall: false,
             halted: false,
             ecc_error: false,
+            error_halt: false,
             single_step: false,
             single_step_count: 0,
             pc: 0,
@@ -274,6 +280,9 @@ impl CoreDebugState {
             val |= 1 << STATUS_ECC_ERROR_STALL_LSB;
             val |= 1 << STATUS_ERROR_HALT_LSB;
         }
+        if self.error_halt {
+            val |= 1 << STATUS_ERROR_HALT_LSB;
+        }
         if self.done {
             val |= 1 << STATUS_DONE_LSB;
         }
@@ -306,6 +315,7 @@ impl CoreDebugState {
             self.stream_stall = false;
             self.cascade_stall = false;
             self.ecc_error = false;
+            self.error_halt = false;
             self.single_step = false;
             self.single_step_count = 0;
             self.pc = 0;
@@ -441,6 +451,14 @@ impl CoreDebugState {
     /// Set the ECC error state.
     pub fn set_ecc_error(&mut self, error: bool) {
         self.ecc_error = error;
+    }
+
+    /// Set the generic error_halt state (decode failure, unhandled
+    /// instruction, missing program memory). Surfaces in Core_Status bit 19
+    /// alongside `ecc_error`. The interpreter calls this when it transitions
+    /// to `CoreStatus::Error`; reset_event clears it via `write_control`.
+    pub fn set_error_halt(&mut self, error: bool) {
+        self.error_halt = error;
     }
 
     // -----------------------------------------------------------------------

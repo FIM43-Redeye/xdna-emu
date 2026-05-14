@@ -59,7 +59,7 @@ MemTile = mem tile (row 1 on NPU1), Shim = row 0.
 | VLIW core | aie-rt `core/`, llvm-aie TableGen | MODELED | `src/interpreter/` | 100% ISA decode; SemanticOp coverage ~33%, rest in legacy handlers (gap). |
 | Core control (enable / done / reset) | AM025 `Core_Control`, `Core_Status` | MODELED | `src/device/core_debug/` | enable, halt, done, reset paths |
 | Core debug (halt / step / breakpoint) | AM025 `Debug_*` | PARTIAL | `src/device/core_debug/` | Halt + status bits modeled; programmable breakpoints / single-step PC trap not wired through interpreter. |
-| Core error halt | AM025 `Error_Halt_Control` / `Error_Halt_Event` | PARTIAL | `src/device/core_debug/mod.rs:75` | bit-field present in `Core_Status`, no triggering path; ECC errors / saturation / watchdog never raise it. |
+| Core error halt | AM025 `Error_Halt_Control` / `Error_Halt_Event` | MODELED | `src/device/core_debug/mod.rs:75`, `src/interpreter/core/interpreter.rs::raise_instr_error` | Generic `error_halt` path fires `INSTR_ERROR` (event 69) into core_trace + core_perf_counters at every CoreStatus::Error transition (decode failure, missing program memory, executor Error). Sets Core_Status bit 19. ECC errors still fire ECC_ERROR_STALL (bit 17) via `set_ecc_error`. Other error sources (saturation, watchdog) not yet detected. |
 | Watchpoint hardware (memory-address triggers) | AM025 Compute mem `WatchPoint0/1` (2) | MISSING | — | Register slots reserved in regdb but no emulator behavior. Distinct from `XDNA_EMU_WATCH` env-var debug aid. |
 | Data memory (64KB, banked) | aie-rt `memory/`, AM025 | MODELED | `src/device/banking.rs`, `src/interpreter/timing/memory.rs` | 8 banks × 128-bit, conflict detection done. |
 | Bank conflict events (intercore / intracore) | aietools events `MEM_CONFLICT_INTERCORE`, `_INTRACORE`, `DM_BANK_CONFLICT` | MODELED | `src/interpreter/execute/cycle_accurate.rs` | Per-bank `MEM_CONFLICT_DM_BANK_N` (events 77..84 compute / 112..120 memtile) fired into mem_trace + mem_perf_counters when scalar load/store conflict detected. INTERCORE/INTRACORE not modeled separately. |
@@ -156,7 +156,7 @@ re-discover them as "missing hardware."
 0. ~~**Multi-tile timer sync**~~ **FIXED 2026-05-04**. `Timer_Control.Reset_Event` is now consumed via a `pending_reset` latch on `TileTimer`. Both `notify_core_trace_event` and `notify_mem_trace_event` route through it. See [timer-sync-gap.md](timer-sync-gap.md) for full implementation notes; bridge re-run pending to confirm mode-2 divergence drops.
 0a. ~~**Trace controller pipelined start/stop**~~ **FIXED 2026-05-04**. After the timer-sync fix exposed it, the residual mode-2 PC divergence on `add_one_using_dma.chess` was exactly 2 frames (1 at start, 1 at end). Modeled HW's 1-cycle pipelined Idle→Running by deferring state transition until cycle advances past the arm cycle; same-cycle stop-window frames are now discarded. See [trace-start-stop-latency-gap.md](trace-start-stop-latency-gap.md). Bridge re-run pending.
 1. **Watchpoint hardware** (compute mem 2 / mem tile 4) — kernels using debug breakpoints would silently no-op on emulator.
-2. **Error halt path** — `Error_Halt_Event` never fires. Affects any test that intentionally triggers an error.
+2. ~~**Error halt path**~~ **FIXED 2026-05-14**. Generic `error_halt` flag set + `INSTR_ERROR` event fired at every CoreStatus::Error transition (decode failure, missing program memory, executor Error). ECC errors continue to fire `ECC_ERROR_STALL`. Saturation/watchdog/other error sources are still untracked. See `src/interpreter/core/interpreter.rs::raise_instr_error`.
 3. ~~**Bank conflict event-fire**~~ **FIXED 2026-05-14**. Per-bank `MEM_CONFLICT_DM_BANK_N` events (compute 77..84, memtile 112..120) now fire into mem_trace + mem_perf_counters when scalar load/store conflict detected. See `src/interpreter/execute/cycle_accurate.rs::fire_bank_conflict_events`.
 4. **Tile isolation gates** — directional N/S/E/W gating. If a kernel relies on isolation, packets we route would be blocked on real HW.
 6. **Packet handler status register** — we *do* the control-packet work but don't expose the status surface. Software polling that reg would loop forever.
@@ -203,9 +203,8 @@ Order suggested by likely impact on current mode-2 divergences and
 upcoming Option 1 cycle-validation:
 
 1. **Watchpoint hardware** — small register-state machine; needed for debugger work.
-2. **Error halt path** — wire `Error_Halt_Event` to the event bus from existing status sources.
-3. **Packet handler status** — expose existing control-packet processor state as a register.
-4. **Tile isolation gates** — gate the routing layer on isolation bits.
+2. **Packet handler status** — expose existing control-packet processor state as a register.
+3. **Tile isolation gates** — gate the routing layer on isolation bits.
 
 Items 7+ in the gaps list above are deliberately deferred until pass 1
 deep-dives surface unforeseen interactions.

@@ -110,6 +110,30 @@ fn status_packs_ecc_error() {
 }
 
 #[test]
+fn status_packs_error_halt_without_ecc() {
+    // set_error_halt flips the generic error bit (decode failure, missing
+    // program memory, executor Error). Error_Halt fires; ECC_Error_Stall
+    // stays clear because this is not an ECC-induced error.
+    let mut state = CoreDebugState::new();
+    state.reset = false;
+    state.set_error_halt(true);
+    let status = state.read_status();
+    assert_ne!(status & (1 << STATUS_ERROR_HALT_LSB), 0);
+    assert_eq!(status & (1 << STATUS_ECC_ERROR_STALL_LSB), 0);
+}
+
+#[test]
+fn write_control_reset_clears_error_halt() {
+    // Reset bit clears error_halt alongside the other transient state.
+    let mut state = CoreDebugState::new();
+    state.reset = false;
+    state.set_error_halt(true);
+    assert_ne!(state.read_status() & (1 << STATUS_ERROR_HALT_LSB), 0);
+    state.write_control(0x2); // bit 1 = reset
+    assert_eq!(state.read_status() & (1 << STATUS_ERROR_HALT_LSB), 0);
+}
+
+#[test]
 fn status_no_stalls_when_clear() {
     let mut state = CoreDebugState::new();
     state.reset = false;
