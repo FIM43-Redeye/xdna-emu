@@ -3041,6 +3041,10 @@ main() {
   # -j$(nproc); doing HW solo makes its already-fast tests finish quickly
   # while EMU then has the box to itself.
   local emu_pool_pid=""
+  # Hoisted out of the `if $RUN_HW` block: the post-Phase-5 cleanup at
+  # the bottom of main() references these unconditionally, and `set -u`
+  # would otherwise trip on `--no-hw` runs that never enter the HW arm.
+  local amdxdna_sentinel="" amdxdna_daemon_pid=""
 
   # Launch HW with NPU job pool (if enabled).
   if $RUN_HW; then
@@ -3054,7 +3058,6 @@ main() {
     # when we remove the sentinel below.  No second pkexec, no auth-gap
     # delay mid-sweep.  Daemon's EXIT trap also handles parent-died and
     # signal-killed cases.
-    local amdxdna_sentinel="" amdxdna_daemon_pid=""
     if $AMDXDNA_TRACE; then
       amdxdna_sentinel=$(mktemp /tmp/claude-1000/amdxdna-trace.bridge.XXXXXX 2>/dev/null \
                          || mktemp /tmp/amdxdna-trace.bridge.XXXXXX)
