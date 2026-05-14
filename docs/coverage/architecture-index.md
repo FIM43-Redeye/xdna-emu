@@ -71,7 +71,7 @@ MemTile = mem tile (row 1 on NPU1), Shim = row 0.
 | Cascade ports (tile↔tile) | aie-rt, aietools events | MODELED | `src/interpreter/execute/cascade.rs` | Read/write, deadlock not detected (`deadlock.rs` placeholder). |
 | Events (128 per module) | aie-rt `events/`, AM025 | MODELED | `src/device/events/` | broadcast (16 channels), combo, group, port events. Combo/edge generators may have boundary cases — needs targeted tests. |
 | Performance counters | aie-rt `perfcnt/`, AM025 | MODELED | `src/device/perf_counters/` | 4 counters; threshold events. |
-| Trace unit | aie-rt `trace/` | MODELED | `src/device/trace_unit/` | Mode-0 / mode-1 / mode-2 supported. Pipelined start/stop modeled (2026-05-04). Mode-2 gaps under investigation (#318, #321). |
+| Trace unit | aie-rt `trace/` | MODELED | `src/device/trace_unit/` | Mode-0 / mode-1 / mode-2 supported. Pipelined start/stop and multi-tile timer sync modeled (2026-05-04). Residual 2-PC mode-2 divergence on `add_one_using_dma` is broadcast-event delivery latency, not a state-machine issue; deferred per [trace-start-stop-latency-gap.md](trace-start-stop-latency-gap.md). |
 | Timer (per-module 64-bit) | aie-rt `timer/`, AM025 (5 reg) | MODELED | `src/device/timer.rs` | Free-running; trig_event_low/high used? — verify. |
 | Tile_Control register (clock + isolation bits) | AM025 (compute) | PARTIAL | `src/device/registers.rs:237` | layout parsed; field semantics (clock-gating, isolation gates) not interpreted. |
 | Module clock control | AM025 `Module_Clock_Control` | MISSING | — | Clock-gating writes accepted but no effect on cycle counts / power model. Probably OK to stay OUT_OF_SCOPE for emulation. |
