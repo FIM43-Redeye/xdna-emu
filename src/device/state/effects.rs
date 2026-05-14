@@ -24,6 +24,16 @@ impl DeviceState {
             None => return,
         };
 
+        // 0. Control_Packet_Handler_Status (write-1-to-clear sticky bits).
+        // Compute: 0x3FF30, MemTile: 0xB0F30. Bits [3:0] are
+        // Tlast_Error / SLVERR_On_Access / Second_Header_Parity / ID_Parity.
+        // Reads return tile.pkt_handler_status; writes clear bits whose
+        // mask bit is 1. tile.registers is bypassed for this offset.
+        if (tile.is_compute() && offset == 0x3FF30) || (tile.is_mem() && offset == 0xB0F30) {
+            tile.pkt_handler_status &= !(value & 0xF);
+            tile.registers.remove(&offset);
+        }
+
         // 1. Cascade config (compute tiles only).
         // Accumulator_Control register per AM025 (offset from register database).
         //   Bit 0: cascade input direction (0=North, 1=West)

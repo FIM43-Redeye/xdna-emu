@@ -356,6 +356,11 @@ impl TileArray {
                         ReassembleResult::Pending => {}
                         ReassembleResult::Error(msg) => {
                             log::error!("{}", msg);
+                            // Set Second_Header_Parity_Error sticky bit so
+                            // software polling Control_Packet_Handler_Status
+                            // sees a non-zero value. Bit 1 covers header
+                            // parse failures specifically.
+                            self.tiles[i].pkt_handler_status |= 0x2;
                             self.pending_ctrl_actions.push(CtrlPacketAction::Error(msg));
                         }
                     }

@@ -76,6 +76,13 @@ impl Tile {
             }
         }
 
+        // Control_Packet_Handler_Status sticky bits (compute 0x3FF30,
+        // memtile 0xB0F30). Source-of-truth lives on the dedicated field;
+        // tile.registers is not used for this offset.
+        if (self.is_compute() && offset == 0x3FF30) || (self.is_mem() && offset == 0xB0F30) {
+            return self.pkt_handler_status & 0xF;
+        }
+
         // Fall back to register map
         self.registers.get(&offset).copied().unwrap_or(0)
     }
@@ -158,6 +165,12 @@ impl Tile {
                 return self.locks[lock_id].value as u32
                     & crate::device::arch_handle::lock_value_layout().mask;
             }
+        }
+
+        // Control_Packet_Handler_Status sticky bits (compute 0x3FF30,
+        // memtile 0xB0F30). See read_register.
+        if (self.is_compute() && offset == 0x3FF30) || (self.is_mem() && offset == 0xB0F30) {
+            return self.pkt_handler_status & 0xF;
         }
 
         // Fall back to register map
@@ -325,5 +338,33 @@ impl Tile {
                 self.locks[i].underflow = false;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pkt_handler_status_tests {
+    use super::*;
+
+    #[test]
+    fn read_returns_pkt_handler_status_compute() {
+        let mut tile = Tile::compute(0, 2);
+        tile.pkt_handler_status = 0b0010; // Second_Header_Parity
+        assert_eq!(tile.read_register(0x3FF30), 0b0010);
+        assert_eq!(tile.read_register_pure(0x3FF30), 0b0010);
+    }
+
+    #[test]
+    fn read_returns_pkt_handler_status_memtile() {
+        let mut tile = Tile::mem_tile(0, 1);
+        tile.pkt_handler_status = 0b1000; // Tlast_Error
+        assert_eq!(tile.read_register(0xB0F30), 0b1000);
+        assert_eq!(tile.read_register_pure(0xB0F30), 0b1000);
+    }
+
+    #[test]
+    fn read_masks_to_low_4_bits() {
+        let mut tile = Tile::compute(0, 2);
+        tile.pkt_handler_status = 0xFFFF_FFFF;
+        assert_eq!(tile.read_register(0x3FF30), 0xF);
     }
 }

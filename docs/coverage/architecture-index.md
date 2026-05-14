@@ -90,7 +90,7 @@ MemTile = mem tile (row 1 on NPU1), Shim = row 0.
 | Trace unit | AM025 | MODELED | `src/device/trace_unit/` | |
 | Timer | AM025 (5 reg) | MODELED | `src/device/timer.rs` | |
 | Watchpoint hardware (4 slots) | AM025 `WatchPoint0..3` | MISSING | — | Same as compute-tile watchpoints. |
-| Packet handler status | AM025 `Packet_Handler_Status` | MISSING | — | Status surface for control-packet processor. We have control-packet *handling*; not sure we expose its status reg. |
+| Packet handler status | AM025 `Control_Packet_Handler_Status` | MODELED | `src/device/tile/mod.rs::pkt_handler_status` + `src/device/tile/registers.rs` reads + `src/device/state/effects.rs` write-1-to-clear | Sticky bits at 0x3FF30 (compute) / 0xB0F30 (memtile). Reassembler header-parse error sets `Second_Header_Parity_Error` (bit 1). `Tlast_Error` / `SLVERR_On_Access` / `ID_Parity_Error` not yet wired (no current path detects them). |
 | Memory_Control / Tile_Control / Module_Clock_Control | AM025 | PARTIAL | `src/device/registers.rs` | Layout parsed; behavior not interpreted. |
 
 ### Shim tile (NoC interface, row 0)
@@ -159,7 +159,7 @@ re-discover them as "missing hardware."
 2. ~~**Error halt path**~~ **FIXED 2026-05-14**. Generic `error_halt` flag set + `INSTR_ERROR` event fired at every CoreStatus::Error transition (decode failure, missing program memory, executor Error). ECC errors continue to fire `ECC_ERROR_STALL`. Saturation/watchdog/other error sources are still untracked. See `src/interpreter/core/interpreter.rs::raise_instr_error`.
 3. ~~**Bank conflict event-fire**~~ **FIXED 2026-05-14**. Per-bank `MEM_CONFLICT_DM_BANK_N` events (compute 77..84, memtile 112..120) now fire into mem_trace + mem_perf_counters when scalar load/store conflict detected. See `src/interpreter/execute/cycle_accurate.rs::fire_bank_conflict_events`.
 4. **Tile isolation gates** — directional N/S/E/W gating. If a kernel relies on isolation, packets we route would be blocked on real HW.
-6. **Packet handler status register** — we *do* the control-packet work but don't expose the status surface. Software polling that reg would loop forever.
+6. ~~**Packet handler status register**~~ **FIXED 2026-05-14**. `Control_Packet_Handler_Status` (compute 0x3FF30, memtile 0xB0F30) now backed by `tile.pkt_handler_status` with sticky bits + write-1-to-clear semantics. Reassembler header-parse failure sets bit 1 (`Second_Header_Parity_Error`). Other sticky bits (Tlast / SLVERR / ID_Parity) not yet wired -- no current code path detects those conditions.
 
 ### Cycle-accuracy gaps (functional-OK, timing-off)
 
@@ -203,8 +203,7 @@ Order suggested by likely impact on current mode-2 divergences and
 upcoming Option 1 cycle-validation:
 
 1. **Watchpoint hardware** — small register-state machine; needed for debugger work.
-2. **Packet handler status** — expose existing control-packet processor state as a register.
-3. **Tile isolation gates** — gate the routing layer on isolation bits.
+2. **Tile isolation gates** — gate the routing layer on isolation bits.
 
 Items 7+ in the gaps list above are deliberately deferred until pass 1
 deep-dives surface unforeseen interactions.

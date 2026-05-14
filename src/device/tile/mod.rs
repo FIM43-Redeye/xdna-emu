@@ -294,6 +294,21 @@ pub struct Tile {
     /// (every SEL slot points at channel 0). See `crate::trace::MemtileDmaEventSel`
     /// for the field layout.
     pub memtile_dma_event_chan_sel: u32,
+
+    /// Control_Packet_Handler_Status sticky bits (offset 0x3FF30 compute,
+    /// 0xB0F30 memtile).
+    ///
+    /// Bit layout per AM025:
+    ///   [0] ID_Parity_Error
+    ///   [1] Second_Header_Parity_Error
+    ///   [2] SLVERR_On_Access
+    ///   [3] Tlast_Error
+    ///
+    /// Sticky bits with write-1-to-clear semantics. We OR a bit in when the
+    /// reassembler observes the corresponding error condition; software
+    /// reads this register to diagnose, then writes 1 to the bit to clear.
+    /// Compute + memtile only; shim has no packet handler.
+    pub pkt_handler_status: u32,
 }
 
 // Performance counter types are now in src/device/perf_counters/mod.rs.
@@ -395,6 +410,7 @@ impl Tile {
             pending_ctrl_response: std::collections::VecDeque::new(),
             lock_release_count: 0,
             memtile_dma_event_chan_sel: 0,
+            pkt_handler_status: 0,
         }
     }
 
