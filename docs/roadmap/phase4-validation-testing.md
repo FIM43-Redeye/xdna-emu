@@ -26,16 +26,16 @@ to avoid overwhelming the system with TableGen-loading subprocesses.
 ### Coverage by Module
 
 Coverage is heavily concentrated in device and interpreter unit tests.
-These numbers reflect the approximate distribution, not exact counts
-(run `cargo test` for current numbers).
+These numbers reflect the approximate distribution as of 2026-05-14, not
+exact counts (run `cargo test --lib` for current numbers).
 
 | Area | Approximate Tests | What They Cover |
 |------|-------------------|-----------------|
-| Device (tile, array, DMA, stream, host memory) | ~130 | Component behavior in isolation |
-| Interpreter (decode, execute, timing, state) | ~250 | Instruction execution, hazards, stalls |
-| Parser / TableGen | ~85 | Binary parsing, encoding resolution |
-| Integration (test_runner, coordinator) | ~20 | Multi-component interaction |
-| Other (config, FFI) | ~10 | Utility functions |
+| Device (tile, array, DMA, stream, host memory, regdb, perf counters, control packets) | ~950 | Component behavior in isolation |
+| Interpreter (decode, execute, timing, state, neighbor cache, coordinator) | ~1100 | Instruction execution, hazards, stalls, cross-tile memory |
+| Parser / TableGen (xdna-archspec, ELF, XCLBIN, CDO) | ~410 | Binary parsing, encoding resolution |
+| Testing infrastructure (xclbin suite, test_cpp_parser, FFI) | ~190 | Test harness, discovery, integration |
+| Trace + VCD + visual + NPU instructions | ~440 | Trace pipeline, comparison, GUI components |
 
 ### What the Tests Actually Validate
 

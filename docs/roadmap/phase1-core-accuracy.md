@@ -193,8 +193,9 @@ cycle counts that match real hardware is entirely unknown.
 
 The bridge test suite runs ~75 distinct mlir-aie test kernels through the
 full XRT path against the emulator, with HW comparison enabled when an NPU
-is attached. Last broad run (2026-04-29 latest with HW): 116 PASS / 2 FAIL
-/ 1 XFAIL across both compilers.
+is attached. Last broad HW snapshot (2026-04-29): 116 PASS / 2 FAIL / 1 XFAIL
+across both compilers; see `build/bridge-test-results/latest/` for the most
+recent sweep on this machine.
 
 | Capability | Confidence | Evidence |
 |------------|------------|----------|
