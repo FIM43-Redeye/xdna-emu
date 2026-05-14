@@ -58,7 +58,7 @@ The visual debugger should provide:
 |------|--------|-------|
 | Record execution trace | TODO | Emulator produces Perfetto JSON via --trace |
 | Replay from trace file | TODO | |
-| Compare traces (emulator vs hardware) | VERIFIED | Rust trace-compare binary and trace-sweep.py |
+| Compare traces (emulator vs hardware) | VERIFIED | Rust `trace-compare` binary; gen-2 trace stack (`tools/mlir-trace-inject.py` + `cpp_trace_patch.py` + `parse-trace.py` + `trace-sweep.py` + `trace_decoder/`); legacy v1 in `tools/deprecated/` |
 | Export to VCD/FST for waveform viewers | TODO | |
 
 ---

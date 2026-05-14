@@ -501,7 +501,7 @@ For deeper context on the strategy, see [`docs/trace/strategy.md`](docs/trace/st
 2. **Run** -- per event-set, swaps event slots without recompiling.
    | Tool | Purpose |
    |------|---------|
-   | `bridge-runner/bridge-trace-runner` | C++ multi-batch orchestrator (HW + EMU). |
+   | `bridge-runner/bridge-trace-runner` | C++ multi-batch orchestrator (HW + EMU). Supports `--batch-stdin` (RESET command for worker reuse) and `--snapshot-on-timeout <dir>` (captures CORE/DMA/lock register state on `run.wait` timeout, before driver recovery wipes it). |
    | `tools/trace-sweep.py` | Gen-2 multi-tile sweep, 8-event batches per tile. |
    | `tools/trace-patch-events.py` | Gen-2 patcher: rewrites event-slot bytes in compiled `insts.bin`. |
 

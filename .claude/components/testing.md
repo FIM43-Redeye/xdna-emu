@@ -74,7 +74,8 @@ cargo test --lib
 ./scripts/emu-bridge-test.sh                    # full HW + EMU dual-compiler run
 ./scripts/emu-bridge-test.sh --no-hw            # emulator only, no NPU needed
 ./scripts/emu-bridge-test.sh --no-hw add_one    # single test, EMU only
-./scripts/emu-bridge-test.sh --trace=sweep ...  # add cycle trace comparison
+./scripts/emu-bridge-test.sh --sweep            # add event sweep across all tiles
+./scripts/emu-bridge-test.sh --trace=pc-anchored ...  # add PC-anchored cycle trace comparison
 
 # ISA test harness (real NPU only)
 ./scripts/isa-test.sh
@@ -118,11 +119,33 @@ validation.
 
 The primary validation target. Exercises the full XRT bridge path:
 `test.exe -> XRT -> plugin -> emulator`. Dual-compiler by default (Chess
-ground truth, Peano informational). Five phases: discover, compile, run HW
-(parallel -j5), run EMU (parallel -j nproc), report per-compiler matrix.
+ground truth, Peano informational). Six phases: discover, compile (parallel),
+run HW (parallel -j5), run EMU (parallel -j nproc), trace comparison
+(`--trace=pc-anchored`), event sweep (`--sweep`), report per-compiler matrix.
+
+Sweep mode (Phase 5b) is two-phase: HW arm runs serially across tests
+(NPU is single-tenant), EMU arm runs serial across tests with parallel
+events per test (-j N). The EMU arm uses `bridge-trace-runner --batch-stdin`
+with a RESET command so worker processes can re-run multiple tests
+without spawning a fresh emulator each time.
+
+`bridge-trace-runner` captures a tile state snapshot (CORE_PC/STATUS,
+TIMER_LOW, perf counters, all 16 LOCK*_VALUE, DMA channel CTRL/STATUS)
+on `run.wait` timeout when invoked with `--snapshot-on-timeout <dir>`.
+Sweep mode wires this automatically into
+`<sweep_out_dir>/<test>.<compiler>.lockstep.work/wedge-snapshots/`.
 
 Key flags: `--chess-only`, `--peano-only`, `--no-hw`, `--compile`,
-`--serial-hw`, `--trace=sweep`, `-v`.
+`--serial-hw`, `--sweep`, `--trace=pc-anchored`, `-v <filter>`.
+
+### Specialized capture: `tools/bug6-trace.sh`
+
+Single-pkexec wrapper that enables the existing `amdxdna_trace`
+kernel tracepoints (xdna_job, mbox_*, uc_*), runs one test under
+timeout, and snapshots the trace ringbuffer + dmesg. Built for the
+bug #6 (`memtile_dmas/writebd` hang) investigation; shelved 2026-05-14
+with canonical pass shape captured. Re-run if writebd hangs again --
+diff against `build/experiments/bug6/pass-baseline-v2.trace`.
 
 ## Trace Pipeline
 

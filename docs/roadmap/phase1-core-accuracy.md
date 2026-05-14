@@ -284,12 +284,19 @@ primary correctness gate, and a much stronger one than "kernels run to
 completion." A revised set of "done" criteria for Phase 1:
 
 1. **Bridge test suite passes 100% across both compilers on attached HW.**
-   (Currently: 116 PASS / 2 FAIL / 1 XFAIL last broad HW run.)
+   (Currently: 116 PASS / 2 FAIL / 1 XFAIL on the 2026-04-29 broad HW run;
+   see `build/bridge-test-results/latest/` for the most recent sweep.)
 2. **Cycle accounting on traced kernels matches HW within 1% on the clean
    anchor window**, with broadcast-stop and per-NPU-instruction cycle costs
    modeled (#321/#322/#323).
 3. **No known-broken features in the critical path.**
-   (Currently: 2 FAIL tests are tracked; no broad subsystem is broken.)
+   (Currently: 2 FAIL tests are tracked; no broad subsystem is broken.
+   Bug #6 -- `memtile_dmas/writebd` intermittent hang -- shelved 2026-05-14
+   as non-reproducible across 4 trace captures spanning 48h; see
+   `docs/superpowers/findings/2026-05-14-bug6-shelved-pass-shape-canonical.md`.
+   The `add_one_ctrl_packet*` family is bidirectionally flaky on Phoenix
+   firmware; see
+   `docs/superpowers/findings/2026-05-13-chain-exec-npu-silent-drop-on-phoenix.md`.)
 4. **SemanticOp test coverage tracked**, with each SemanticOp that appears
    in a compiled mlir-aie kernel covered by at least one dedicated test.
 
