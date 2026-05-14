@@ -89,9 +89,10 @@ full bridge run.
 
 The trace-sweep pipeline compares EMU vs HW cycle counts on clean
 kernels and shows ~0.6% deviation in the easy cases. The harder cases
--- broadcast-stop event timing (#321), per-NPU-instruction cycle cost
-(#322), and empirical calibration (#323) -- are tracked but not yet
-landed.
+-- broadcast-event propagation latency (PROPOSED), per-NPU-instruction
+cycle cost calibration (Phases 1-3 landed, Phase 4+ ongoing), and
+NoC/AXI/DMA pipeline timing (DEFERRED) -- are indexed in
+[cycle-accuracy-mission.md](../coverage/cycle-accuracy-mission.md).
 
 **What "adequate" looks like:**
 - Cycle counts compared against HW for the full bridge test set

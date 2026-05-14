@@ -16,7 +16,9 @@ behavior is NOT general to ctrl_packet workloads. Out of
 faults at addresses 0x0, 0x20, ..., 0xc0, indicating peano emitted
 zeroed buffer base addresses. **That's a separate, identifiable
 peano bug, documented in
-`2026-05-13-ctrl-packet-reconfig-4x1-peano-iommu-fault.md`.**
+`../../archive/findings/2026-05-13-ctrl-packet-reconfig-4x1-peano-iommu-fault.md`
+(later superseded; see
+`2026-05-13-bridge-mlir-cache-mtime-stale-trace-injection.md`).**
 The original `add_one_ctrl_packet (chess)` wedge had ZERO IOMMU
 faults and remains the unresolved mystery -- mode A below.
 

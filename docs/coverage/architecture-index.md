@@ -159,7 +159,6 @@ re-discover them as "missing hardware."
 2. **Error halt path** — `Error_Halt_Event` never fires. Affects any test that intentionally triggers an error.
 3. **Bank conflict event-fire** — we *detect* conflicts for stalls but don't emit `MEM_CONFLICT_*` events to the event subsystem. Mode-2 / VCD comparators may see the divergence.
 4. **Tile isolation gates** — directional N/S/E/W gating. If a kernel relies on isolation, packets we route would be blocked on real HW.
-5. **Multi-tile timer sync** — broadcast-driven timer alignment used for trace correlation. Likely contributor to mode-2 divergence (#318/#321 family).
 6. **Packet handler status register** — we *do* the control-packet work but don't expose the status surface. Software polling that reg would loop forever.
 
 ### Cycle-accuracy gaps (functional-OK, timing-off)

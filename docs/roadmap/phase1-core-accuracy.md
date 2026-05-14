@@ -171,7 +171,7 @@ cycle counts that match real hardware is entirely unknown.
 | Stall cycle modeling | VERIFIED | Unit tests in `cycle_accurate.rs` |
 | Event tracing (13 event types) | VERIFIED | Unit tests |
 | CycleAccurateExecutor integration | VERIFIED | Unit tests |
-| Cycle counts match hardware | OBSERVED | Trace-sweep matches HW within ~0.6% on clean kernels; broadcast/anchor handling tracked under #321/#322 |
+| Cycle counts match hardware | OBSERVED | Trace-sweep matches HW within ~0.6% on clean kernels; broadcast/anchor and per-instruction calibration tracked in [cycle-accuracy-mission.md](../coverage/cycle-accuracy-mission.md) |
 | Full pipeline model (F/D/E/WB) | Not implemented | Uses latency + hazard model |
 
 **Files**: `src/interpreter/timing/`, `src/interpreter/execute/cycle_accurate.rs`
@@ -288,8 +288,10 @@ completion." A revised set of "done" criteria for Phase 1:
    (Currently: 116 PASS / 2 FAIL / 1 XFAIL on the 2026-04-29 broad HW run;
    see `build/bridge-test-results/latest/` for the most recent sweep.)
 2. **Cycle accounting on traced kernels matches HW within 1% on the clean
-   anchor window**, with broadcast-stop and per-NPU-instruction cycle costs
-   modeled (#321/#322/#323).
+   anchor window**, with broadcast-event propagation, per-NPU-instruction
+   cycle cost calibration, and NoC/DMA pipeline timing modeled. See
+   [cycle-accuracy-mission.md](../coverage/cycle-accuracy-mission.md) for
+   per-item status.
 3. **No known-broken features in the critical path.**
    (Currently: 2 FAIL tests are tracked; no broad subsystem is broken.
    Bug #6 -- `memtile_dmas/writebd` intermittent hang -- shelved 2026-05-14

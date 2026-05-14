@@ -6,7 +6,7 @@ type: finding
 
 # Bridge cache mtime-only check leaks stale trace injection -- 2026-05-13
 
-**Supersedes** [2026-05-13-ctrl-packet-reconfig-4x1-peano-iommu-fault.md](2026-05-13-ctrl-packet-reconfig-4x1-peano-iommu-fault.md). That doc's title and hypothesis ("peano emitted null-relative addresses") were wrong. The IOMMU faults at 0x0, 0x20, ..., 0xc0 turned out not to be a peano codegen bug at all -- they were successive trace DMA bursts to an unbound buffer, caused by a stale build artifact.
+**Supersedes** [2026-05-13-ctrl-packet-reconfig-4x1-peano-iommu-fault.md](../../archive/findings/2026-05-13-ctrl-packet-reconfig-4x1-peano-iommu-fault.md). That doc's title and hypothesis ("peano emitted null-relative addresses") were wrong. The IOMMU faults at 0x0, 0x20, ..., 0xc0 turned out not to be a peano codegen bug at all -- they were successive trace DMA bursts to an unbound buffer, caused by a stale build artifact.
 
 ## TL;DR
 
@@ -57,5 +57,5 @@ After the fix, runtime sequence is `(%arg0, %arg1)`, external_buffers.json repor
 ## Cross-references
 
 - `scripts/emu-bridge-test.sh` -- the changed `compile_one_compiler` function.
-- `2026-05-13-ctrl-packet-reconfig-4x1-peano-iommu-fault.md` -- the superseded "peano emits null-relative" finding.
+- `../../archive/findings/2026-05-13-ctrl-packet-reconfig-4x1-peano-iommu-fault.md` -- the superseded "peano emits null-relative" finding.
 - `scripts/trace-quarantine.txt` -- list of tests where trace prep is skipped; `ctrl_packet_reconfig_4x1_cores` was on it the whole time, so the cache leak was the only thing that mattered.
