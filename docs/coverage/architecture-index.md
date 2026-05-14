@@ -159,7 +159,7 @@ re-discover them as "missing hardware."
 2. ~~**Error halt path**~~ **FIXED 2026-05-14**. Generic `error_halt` flag set + `INSTR_ERROR` event fired at every CoreStatus::Error transition (decode failure, missing program memory, executor Error). ECC errors continue to fire `ECC_ERROR_STALL`. Saturation/watchdog/other error sources are still untracked. See `src/interpreter/core/interpreter.rs::raise_instr_error`.
 3. ~~**Bank conflict event-fire**~~ **FIXED 2026-05-14**. Per-bank `MEM_CONFLICT_DM_BANK_N` events (compute 77..84, memtile 112..120) now fire into mem_trace + mem_perf_counters when scalar load/store conflict detected. See `src/interpreter/execute/cycle_accurate.rs::fire_bank_conflict_events`.
 4. **Tile isolation gates** — directional N/S/E/W gating. If a kernel relies on isolation, packets we route would be blocked on real HW.
-6. ~~**Packet handler status register**~~ **FIXED 2026-05-14**. `Control_Packet_Handler_Status` (compute 0x3FF30, memtile 0xB0F30) now backed by `tile.pkt_handler_status` with sticky bits + write-1-to-clear semantics. Reassembler header-parse failure sets bit 1 (`Second_Header_Parity_Error`). Other sticky bits (Tlast / SLVERR / ID_Parity) not yet wired -- no current code path detects those conditions.
+5. ~~**Packet handler status register**~~ **FIXED 2026-05-14**. `Control_Packet_Handler_Status` (compute 0x3FF30, memtile 0xB0F30) now backed by `tile.pkt_handler_status` with sticky bits + write-1-to-clear semantics. Reassembler header-parse failure sets bit 1 (`Second_Header_Parity_Error`). Other sticky bits (Tlast / SLVERR / ID_Parity) not yet wired -- no current code path detects those conditions.
 
 ### Cycle-accuracy gaps (functional-OK, timing-off)
 
@@ -202,8 +202,8 @@ Remaining verifications:
 Order suggested by likely impact on current mode-2 divergences and
 upcoming Option 1 cycle-validation:
 
-1. **Watchpoint hardware** — small register-state machine; needed for debugger work.
-2. **Tile isolation gates** — gate the routing layer on isolation bits.
+1. **Watchpoint hardware** — per-tile register storage already persists writes; the missing piece is the access-checking path: every load/store and DMA access checks active watchpoints (compute mem 2 / memtile 4), decodes access-type / direction filters, and fires `WATCHPOINT_N` (mem events 16/17 compute, 16-19 memtile) on match. Optional core-halt wiring on top.
+2. **Tile isolation gates** — Tile_Control bits S/W/N/E (compute 0x36030, memtile 0x96030) need three intervention points: stream switch routing for cross-tile packets, NeighborLocks for cross-tile lock access, NeighborMemory for cross-tile memory.
 
 Items 7+ in the gaps list above are deliberately deferred until pass 1
 deep-dives surface unforeseen interactions.
