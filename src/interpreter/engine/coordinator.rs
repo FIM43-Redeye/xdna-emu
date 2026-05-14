@@ -607,11 +607,38 @@ impl InterpreterEngine {
                 }
                 let core = &mut self.cores[idx];
 
-                // Build neighbor locks struct
+                // Tile_Control isolation: refresh the cached byte on
+                // NeighborMemory and gate cross-tile lock slices before
+                // they reach the executor. A set bit in tile.isolation
+                // blocks every cross-tile transit on that direction.
+                // Per-call sites in execute/memory then short-circuit
+                // via NeighborMemory's own `is_blocked`. See
+                // `crate::device::tile::isolation` for the bit layout.
+                use crate::device::tile::isolation as iso;
+                core.neighbors.set_isolation(tile.isolation);
+                let isolation = tile.isolation;
+
+                // Build neighbor locks struct, gating each direction by
+                // the matching isolation bit. None hides the slice from
+                // the executor so cross-tile lock ops fall back to the
+                // own-tile path (which then misses, since East-quadrant
+                // IDs map to internal locks only).
                 let mut nlocks = crate::interpreter::execute::NeighborLocks {
-                    south: south_locks.as_mut().map(|v| v.as_mut_slice()),
-                    west: west_locks.as_mut().map(|v| v.as_mut_slice()),
-                    north: north_locks.as_mut().map(|v| v.as_mut_slice()),
+                    south: if isolation & iso::SOUTH != 0 {
+                        None
+                    } else {
+                        south_locks.as_mut().map(|v| v.as_mut_slice())
+                    },
+                    west: if isolation & iso::WEST != 0 {
+                        None
+                    } else {
+                        west_locks.as_mut().map(|v| v.as_mut_slice())
+                    },
+                    north: if isolation & iso::NORTH != 0 {
+                        None
+                    } else {
+                        north_locks.as_mut().map(|v| v.as_mut_slice())
+                    },
                 };
 
                 let result = core.interpreter.step_with_neighbor_locks(

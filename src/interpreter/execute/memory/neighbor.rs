@@ -36,6 +36,16 @@ pub struct NeighborMemory {
     col: usize,
     row: usize,
 
+    /// Executing tile's `Tile_Control` isolation bits, snapshotted from
+    /// the tile before each core step (see
+    /// [`crate::device::tile::isolation`] for the bit layout). A set bit
+    /// blocks cross-tile reads and buffered writes in that direction --
+    /// `ensure_snapshot` returns early without touching the snapshot,
+    /// `get_memory` returns None, and `buffer_write` drops the write.
+    /// Mirrors aie-rt's gating where the AIE fabric refuses transit on
+    /// an isolated boundary.
+    isolation: u8,
+
     /// Neighbor data memory snapshots indexed by cardinal direction:
     /// 0=South, 1=West, 2=North, 3=East.
     /// None until first access (lazy clone). Inner None if neighbor doesn't exist.
@@ -80,12 +90,38 @@ impl NeighborMemory {
         Self {
             col,
             row,
+            isolation: 0,
             snapshots: [None, None, None, None],
             snapshot_gens: [None, None, None, None],
             pending_writes: Vec::new(),
             #[cfg(test)]
             ensure_snapshot_calls: 0,
         }
+    }
+
+    /// Refresh the cached `Tile_Control` isolation byte from the executing
+    /// tile. Called once per core step before the executor runs so the
+    /// gating below picks up software's most recent write to Tile_Control.
+    /// See [`crate::device::tile::isolation`] for the bit layout.
+    #[inline]
+    pub fn set_isolation(&mut self, isolation: u8) {
+        self.isolation = isolation;
+    }
+
+    /// True if cross-tile transit in `dir` is currently blocked by a
+    /// `Tile_Control` isolation bit on the executing tile. `Local` is
+    /// never isolated -- it's not a cross-tile direction.
+    #[inline]
+    fn is_blocked(&self, dir: MemoryQuadrant) -> bool {
+        use crate::device::tile::isolation::*;
+        let bit = match dir {
+            MemoryQuadrant::South => SOUTH,
+            MemoryQuadrant::West => WEST,
+            MemoryQuadrant::North => NORTH,
+            MemoryQuadrant::East => EAST,
+            MemoryQuadrant::Local => return false,
+        };
+        self.isolation & bit != 0
     }
 
     /// Resolve a cardinal direction to the neighbor tile coordinates.
@@ -135,6 +171,14 @@ impl NeighborMemory {
             self.ensure_snapshot_calls += 1;
         }
 
+        // Tile_Control isolation: short-circuit before touching the
+        // snapshot. `get_memory(dir)` returns None for blocked directions
+        // regardless, but skipping the clone here avoids burning the
+        // allocation when an isolated kernel still walks every quadrant.
+        if self.is_blocked(dir) {
+            return;
+        }
+
         let idx = match dir_index(dir) {
             Some(i) => i,
             None => return, // Local -- no snapshot needed
@@ -155,14 +199,26 @@ impl NeighborMemory {
 
     /// Get a reference to a neighbor's data memory snapshot.
     ///
-    /// Returns None if the neighbor doesn't exist or hasn't been snapshotted.
+    /// Returns None if the neighbor doesn't exist, hasn't been snapshotted,
+    /// or transit in `dir` is gated by a `Tile_Control` isolation bit on
+    /// the executing tile.
     pub fn get_memory(&self, dir: MemoryQuadrant) -> Option<&[u8]> {
+        if self.is_blocked(dir) {
+            return None;
+        }
         let idx = dir_index(dir)?;
         self.snapshots[idx].as_ref().and_then(|opt| opt.as_deref())
     }
 
     /// Buffer a cross-tile write for deferred application.
+    ///
+    /// Drops the write silently when transit in `dir` is gated by a
+    /// `Tile_Control` isolation bit. Real HW absorbs the store at the
+    /// boundary -- the data never reaches the neighbor.
     pub fn buffer_write(&mut self, dir: MemoryQuadrant, offset: usize, data: &[u8]) {
+        if self.is_blocked(dir) {
+            return;
+        }
         self.pending_writes.push((dir, offset, data.to_vec()));
     }
 
@@ -260,5 +316,79 @@ mod tests {
             0xAB,
             "snapshot must reflect post-write neighbor data"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Tile_Control isolation gating
+    // ------------------------------------------------------------------
+
+    /// With the SOUTH isolation bit set, ensure_snapshot must NOT touch the
+    /// south snapshot slot, and get_memory(South) must return None even if
+    /// a stale snapshot is somehow present. Other directions stay open.
+    #[test]
+    fn isolation_blocks_south_snapshot_and_read() {
+        use crate::device::tile::isolation as iso;
+        let device = crate::device::DeviceState::new_npu1();
+        let mut nbr = NeighborMemory::new(1, 3);
+        nbr.set_isolation(iso::SOUTH);
+
+        nbr.ensure_snapshot(MemoryQuadrant::South, &device);
+        // Snapshot slot must remain untouched -- no clone happened.
+        assert!(nbr.snapshots[0].is_none(), "isolated south must not allocate a snapshot");
+        assert!(nbr.get_memory(MemoryQuadrant::South).is_none(), "isolated south must not read");
+
+        // Other directions still work -- isolation is per-direction.
+        nbr.ensure_snapshot(MemoryQuadrant::West, &device);
+        assert!(nbr.get_memory(MemoryQuadrant::West).is_some(), "west must still work");
+    }
+
+    /// Buffered writes are silently dropped when the direction is isolated;
+    /// pending_writes never grows, so drain_writes is a no-op for that
+    /// direction. Mirrors HW where the AIE absorbs the store at the
+    /// isolation boundary instead of forwarding it.
+    #[test]
+    fn isolation_drops_buffered_writes() {
+        use crate::device::tile::isolation as iso;
+        let mut nbr = NeighborMemory::new(1, 3);
+        nbr.set_isolation(iso::WEST);
+        nbr.buffer_write(MemoryQuadrant::West, 0x100, &[0xAA, 0xBB]);
+        assert!(nbr.pending_writes.is_empty(), "isolated west write must be dropped, not buffered");
+        // South still permitted.
+        nbr.buffer_write(MemoryQuadrant::South, 0x100, &[0xAA]);
+        assert_eq!(nbr.pending_writes.len(), 1);
+    }
+
+    /// Stale snapshot cached BEFORE isolation was set must also stop being
+    /// readable once the bit goes hot. set_isolation is the only state
+    /// flip we need -- get_memory consults the live isolation byte.
+    #[test]
+    fn isolation_hides_previously_cached_snapshot() {
+        use crate::device::tile::isolation as iso;
+        let device = crate::device::DeviceState::new_npu1();
+        let mut nbr = NeighborMemory::new(1, 3);
+        // Cache a snapshot under "no isolation".
+        nbr.ensure_snapshot(MemoryQuadrant::South, &device);
+        assert!(nbr.get_memory(MemoryQuadrant::South).is_some());
+        // Now the executing tile sets ISOLATE_FROM_SOUTH.
+        nbr.set_isolation(iso::SOUTH);
+        assert!(
+            nbr.get_memory(MemoryQuadrant::South).is_none(),
+            "isolation must hide a previously cached snapshot"
+        );
+    }
+
+    /// All four bits set blocks every cross-tile direction simultaneously.
+    /// Local stays accessible (it's not a cross-tile path).
+    #[test]
+    fn isolation_all_directions_blocks_every_cross_tile_dir() {
+        use crate::device::tile::isolation as iso;
+        let device = crate::device::DeviceState::new_npu1();
+        let mut nbr = NeighborMemory::new(1, 3);
+        nbr.set_isolation(iso::ALL_DIRECTIONS);
+        for dir in [MemoryQuadrant::South, MemoryQuadrant::West, MemoryQuadrant::North, MemoryQuadrant::East]
+        {
+            nbr.ensure_snapshot(dir, &device);
+            assert!(nbr.get_memory(dir).is_none(), "{:?} must be blocked when ALL_DIRECTIONS is set", dir);
+        }
     }
 }

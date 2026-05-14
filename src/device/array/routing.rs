@@ -825,6 +825,7 @@ impl TileArray {
     ///
     /// Returns the number of words transferred between tiles.
     fn propagate_inter_tile(&mut self) -> usize {
+        use crate::device::tile::isolation as iso;
         // Phase 1: Advance the pipeline -- deliver words that have completed
         // their inter-tile traversal and decrement countdown timers.
         let words_transferred = self.advance_inter_tile_pipeline();
@@ -873,6 +874,14 @@ impl TileArray {
                         if master_idx < self.tiles[idx].stream_switch.masters.len() {
                             let port = &self.tiles[idx].stream_switch.masters[master_idx];
                             if let (Some(&data), Some(tlast)) = (port.fifo.front(), port.peek_tlast()) {
+                                // Tile_Control isolation: a north-bound
+                                // word is incoming-from-south at the
+                                // destination, so it's gated by dst's
+                                // SOUTH bit. HW absorbs the word at the
+                                // boundary; we drop the transfer here.
+                                if self.tiles[above_idx].isolation & iso::SOUTH != 0 {
+                                    continue;
+                                }
                                 // Check if destination slave can accept
                                 if slave_idx < self.tiles[above_idx].stream_switch.slaves.len()
                                     && self.tiles[above_idx].stream_switch.slaves[slave_idx].can_accept()
@@ -927,6 +936,11 @@ impl TileArray {
                         if master_idx < self.tiles[idx].stream_switch.masters.len() {
                             let port = &self.tiles[idx].stream_switch.masters[master_idx];
                             if let (Some(&data), Some(tlast)) = (port.fifo.front(), port.peek_tlast()) {
+                                // South-bound is incoming-from-north at
+                                // dst -- gated by dst's NORTH bit.
+                                if self.tiles[below_idx].isolation & iso::NORTH != 0 {
+                                    continue;
+                                }
                                 // Check if destination slave can accept
                                 if slave_idx < self.tiles[below_idx].stream_switch.slaves.len()
                                     && self.tiles[below_idx].stream_switch.slaves[slave_idx].can_accept()
@@ -981,6 +995,11 @@ impl TileArray {
                         if master_idx < self.tiles[idx].stream_switch.masters.len() {
                             let port = &self.tiles[idx].stream_switch.masters[master_idx];
                             if let (Some(&data), Some(tlast)) = (port.fifo.front(), port.peek_tlast()) {
+                                // East-bound is incoming-from-west at
+                                // dst -- gated by dst's WEST bit.
+                                if self.tiles[right_idx].isolation & iso::WEST != 0 {
+                                    continue;
+                                }
                                 if slave_idx < self.tiles[right_idx].stream_switch.slaves.len()
                                     && self.tiles[right_idx].stream_switch.slaves[slave_idx].can_accept()
                                 {
@@ -1027,6 +1046,11 @@ impl TileArray {
                         if master_idx < self.tiles[idx].stream_switch.masters.len() {
                             let port = &self.tiles[idx].stream_switch.masters[master_idx];
                             if let (Some(&data), Some(tlast)) = (port.fifo.front(), port.peek_tlast()) {
+                                // West-bound is incoming-from-east at
+                                // dst -- gated by dst's EAST bit.
+                                if self.tiles[left_idx].isolation & iso::EAST != 0 {
+                                    continue;
+                                }
                                 if slave_idx < self.tiles[left_idx].stream_switch.slaves.len()
                                     && self.tiles[left_idx].stream_switch.slaves[slave_idx].can_accept()
                                 {
@@ -1120,5 +1144,83 @@ impl TileArray {
         }
 
         delivered
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    use crate::device::tile::isolation as iso;
+    use xdna_archspec::aie2::stream_switch::compute as compute_ranges;
+
+    /// Helper: push one word with TLAST to the source tile's east-master
+    /// port at index `compute::EAST_MASTER_START` and return the master/
+    /// slave indices the test expects to use.
+    fn seed_east_to_west_word(array: &mut TileArray, src_col: u8, src_row: u8) -> (usize, usize) {
+        let master_idx = compute_ranges::EAST_MASTER_START as usize;
+        let slave_idx = compute_ranges::WEST_SLAVE_START as usize;
+        let src_idx = array.tile_index(src_col, src_row);
+        let pushed = array.tiles[src_idx].stream_switch.masters[master_idx].push_with_tlast(0xDEADBEEF, true);
+        assert!(pushed, "test setup: src east-master must accept the seed word");
+        (master_idx, slave_idx)
+    }
+
+    /// Without isolation, propagate_inter_tile drains the source's east
+    /// master into the inter-tile pipeline. The destination's west slave
+    /// remains empty (delivery is delayed by ROUTE_PER_HOP cycles), but
+    /// the source FIFO is now empty -- proving the transfer was accepted.
+    #[test]
+    fn east_to_west_transfer_passes_when_not_isolated() {
+        let mut array = TileArray::npu1();
+        let (src_col, src_row) = (1u8, 2u8); // compute tile
+        let (master_idx, _slave_idx) = seed_east_to_west_word(&mut array, src_col, src_row);
+
+        array.propagate_inter_tile();
+
+        let src_idx = array.tile_index(src_col, src_row);
+        assert!(
+            array.tiles[src_idx].stream_switch.masters[master_idx].fifo.is_empty(),
+            "source east master must drain into pipeline when no isolation"
+        );
+    }
+
+    /// With dst.isolation = WEST, the same transfer must be dropped at
+    /// the boundary -- the source's master FIFO retains the word.
+    #[test]
+    fn east_to_west_transfer_blocked_when_dst_isolates_west() {
+        let mut array = TileArray::npu1();
+        let (src_col, src_row) = (1u8, 2u8);
+        let dst_idx = array.tile_index(src_col + 1, src_row);
+        array.tiles[dst_idx].isolation = iso::WEST;
+
+        let (master_idx, _slave_idx) = seed_east_to_west_word(&mut array, src_col, src_row);
+        array.propagate_inter_tile();
+
+        let src_idx = array.tile_index(src_col, src_row);
+        assert_eq!(
+            array.tiles[src_idx].stream_switch.masters[master_idx].fifo.len(),
+            1,
+            "source east master must retain word when dst is isolated from west"
+        );
+    }
+
+    /// Isolation bits are independent. ISOLATE_FROM_NORTH on dst doesn't
+    /// affect an east-to-west transfer (which is gated by WEST). The
+    /// source FIFO drains as in the unisolated case.
+    #[test]
+    fn unrelated_isolation_bit_does_not_block_transfer() {
+        let mut array = TileArray::npu1();
+        let (src_col, src_row) = (1u8, 2u8);
+        let dst_idx = array.tile_index(src_col + 1, src_row);
+        array.tiles[dst_idx].isolation = iso::NORTH | iso::SOUTH | iso::EAST;
+
+        let (master_idx, _slave_idx) = seed_east_to_west_word(&mut array, src_col, src_row);
+        array.propagate_inter_tile();
+
+        let src_idx = array.tile_index(src_col, src_row);
+        assert!(
+            array.tiles[src_idx].stream_switch.masters[master_idx].fifo.is_empty(),
+            "WEST is the only bit that gates east-to-west; others must not block"
+        );
     }
 }

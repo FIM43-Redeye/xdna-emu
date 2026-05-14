@@ -583,3 +583,78 @@ fn split_tile_mut_returns_none_for_oob() {
     assert!(device.split_tile_mut(0, rows).is_none(), "row >= rows");
     assert!(device.split_tile_mut(cols + 5, rows + 5).is_none(), "both OOB");
 }
+
+// ----------------------------------------------------------------------
+// Tile_Control isolation register write effect
+//
+// Compute Tile_Control is at 0x36030, memtile at 0x96030. Low 4 bits
+// are S/W/N/E isolation per AM025; we mirror them onto tile.isolation
+// so the cross-tile gates can read a single byte. Higher bits
+// (clock-gating, etc.) flow through the generic register store
+// untouched. See `apply_tile_local_effects` in state/effects.rs.
+// ----------------------------------------------------------------------
+
+#[test]
+fn tile_control_write_updates_isolation_byte_compute() {
+    use crate::device::tile::isolation as iso;
+    let mut state = DeviceState::new_npu1();
+    let col: u8 = 1;
+    let row: u8 = 2;
+    let addr = TileAddress::encode(col, row, 0x36030);
+
+    // ISOLATE_FROM_SOUTH | ISOLATE_FROM_EAST = 0b1001 = 0x9.
+    state.write_register(addr, 0x9).unwrap();
+    let tile = state.array.tile(col, row);
+    assert_eq!(tile.isolation, iso::SOUTH | iso::EAST);
+    // Register store keeps the raw write so subsequent reads return it.
+    assert_eq!(*tile.registers_ref().get(&0x36030).unwrap(), 0x9);
+}
+
+#[test]
+fn tile_control_write_updates_isolation_byte_memtile() {
+    use crate::device::tile::isolation as iso;
+    let mut state = DeviceState::new_npu1();
+    let col: u8 = 1;
+    let row: u8 = 1;
+    let addr = TileAddress::encode(col, row, 0x96030);
+
+    state.write_register(addr, iso::ALL_DIRECTIONS as u32).unwrap();
+    let tile = state.array.tile(col, row);
+    assert_eq!(tile.isolation, iso::ALL_DIRECTIONS);
+}
+
+/// High bits of Tile_Control (clock-gating etc.) must NOT bleed into
+/// the isolation byte. Only the low 4 bits matter to the gate.
+#[test]
+fn tile_control_write_masks_isolation_to_low_4_bits() {
+    use crate::device::tile::isolation as iso;
+    let mut state = DeviceState::new_npu1();
+    let col: u8 = 1;
+    let row: u8 = 2;
+    let addr = TileAddress::encode(col, row, 0x36030);
+
+    // Bits above [3:0] should be ignored by the isolation snapshot.
+    state.write_register(addr, 0xFFFF_FFFA).unwrap();
+    let tile = state.array.tile(col, row);
+    assert_eq!(tile.isolation, 0xA & iso::ALL_DIRECTIONS);
+}
+
+/// Writing a different offset must NOT touch isolation, even if the
+/// value would map to a non-zero direction byte. Pins the dispatch
+/// guard: the effect only fires for the matching register.
+#[test]
+fn unrelated_register_write_does_not_change_isolation() {
+    let mut state = DeviceState::new_npu1();
+    let col: u8 = 1;
+    let row: u8 = 2;
+
+    // Pre-set isolation via Tile_Control to a known value.
+    let tc_addr = TileAddress::encode(col, row, 0x36030);
+    state.write_register(tc_addr, 0x5).unwrap();
+    assert_eq!(state.array.tile(col, row).isolation, 0x5);
+
+    // Write a totally unrelated offset; isolation byte must survive.
+    let other_addr = TileAddress::encode(col, row, 0x36034);
+    state.write_register(other_addr, 0xFFFF_FFFF).unwrap();
+    assert_eq!(state.array.tile(col, row).isolation, 0x5);
+}

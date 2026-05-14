@@ -34,6 +34,19 @@ impl DeviceState {
             tile.registers.remove(&offset);
         }
 
+        // 0a. Tile_Control isolation bits.
+        // Compute: 0x36030, MemTile: 0x96030. Low 4 bits = isolation per
+        // AM025 Tile_Control field layout (S/W/N/E in bits 0..3),
+        // matching aie-rt's `XAIE_ISOLATE_*_MASK` constants. Snapshot
+        // them onto `tile.isolation` so cross-tile gates (stream-switch
+        // routing, NeighborLocks, NeighborMemory) can consult a single
+        // byte instead of re-decoding the register on every check.
+        // Higher bits of Tile_Control (clock-gating etc.) still flow
+        // through the generic register store unchanged.
+        if (tile.is_compute() && offset == 0x36030) || (tile.is_mem() && offset == 0x96030) {
+            tile.isolation = (value & super::super::tile::isolation::ALL_DIRECTIONS as u32) as u8;
+        }
+
         // 1. Cascade config (compute tiles only).
         // Accumulator_Control register per AM025 (offset from register database).
         //   Bit 0: cascade input direction (0=North, 1=West)

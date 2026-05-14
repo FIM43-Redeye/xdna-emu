@@ -309,6 +309,38 @@ pub struct Tile {
     /// reads this register to diagnose, then writes 1 to the bit to clear.
     /// Compute + memtile only; shim has no packet handler.
     pub pkt_handler_status: u32,
+
+    /// Tile_Control isolation bits (bit 0=S, 1=W, 2=N, 3=E).
+    ///
+    /// Bit layout per AM025 / aie-rt `xaiemlgbl_params.h`
+    /// (`TILE_CONTROL_ISOLATE_FROM_*`):
+    ///   [0] Isolate_From_South
+    ///   [1] Isolate_From_West
+    ///   [2] Isolate_From_North
+    ///   [3] Isolate_From_East
+    /// A set bit blocks every cross-tile transit on that direction:
+    /// stream-switch packets entering the tile from that side, cross-tile
+    /// lock acquire/release/get/set into that direction's neighbor, and
+    /// cross-tile core memory load/store into that direction. See
+    /// `aie-rt/driver/src/pm/xaie_tilectrl.c` and the architecture index.
+    /// Compute uses Tile_Control at 0x36030, memtile at 0x96030; shim
+    /// also has a Tile_Control register but isolation is set up at
+    /// partition boundary by the privileged path -- writes pass through
+    /// without affecting routing here today.
+    pub isolation: u8,
+}
+
+/// Cardinal-direction bit positions for [`Tile::isolation`]. Match the
+/// AM025 `Tile_Control` field layout and aie-rt's `XAIE_ISOLATE_*_MASK`
+/// constants verbatim so we can store the low 4 bits of the register
+/// value directly.
+pub mod isolation {
+    pub const SOUTH: u8 = 1 << 0;
+    pub const WEST: u8 = 1 << 1;
+    pub const NORTH: u8 = 1 << 2;
+    pub const EAST: u8 = 1 << 3;
+    /// Mask of all four direction bits ((1<<4) - 1 = 0xF).
+    pub const ALL_DIRECTIONS: u8 = SOUTH | WEST | NORTH | EAST;
 }
 
 // Performance counter types are now in src/device/perf_counters/mod.rs.
@@ -411,6 +443,7 @@ impl Tile {
             lock_release_count: 0,
             memtile_dma_event_chan_sel: 0,
             pkt_handler_status: 0,
+            isolation: 0,
         }
     }
 

@@ -73,9 +73,9 @@ MemTile = mem tile (row 1 on NPU1), Shim = row 0.
 | Performance counters | aie-rt `perfcnt/`, AM025 | MODELED | `src/device/perf_counters/` | 4 counters; threshold events. |
 | Trace unit | aie-rt `trace/` | MODELED | `src/device/trace_unit/` | Mode-0 / mode-1 / mode-2 supported. Pipelined start/stop and multi-tile timer sync modeled (2026-05-04). Residual 2-PC mode-2 divergence on `add_one_using_dma` is broadcast-event delivery latency, not a state-machine issue; deferred per [trace-start-stop-latency-gap.md](trace-start-stop-latency-gap.md). |
 | Timer (per-module 64-bit) | aie-rt `timer/`, AM025 (5 reg) | MODELED | `src/device/timer.rs` | Free-running; trig_event_low/high used? — verify. |
-| Tile_Control register (clock + isolation bits) | AM025 (compute) | PARTIAL | `src/device/registers.rs:237` | layout parsed; field semantics (clock-gating, isolation gates) not interpreted. |
+| Tile_Control register (clock + isolation bits) | AM025 (compute) | PARTIAL | `src/device/registers.rs:237`, `src/device/state/effects.rs::apply_tile_local_effects` | Layout parsed; isolation bits S/W/N/E (low 4 bits) are now interpreted (see Tile isolation gates row). Clock-gating bits still pass through unmodeled. |
 | Module clock control | AM025 `Module_Clock_Control` | MISSING | — | Clock-gating writes accepted but no effect on cycle counts / power model. Probably OK to stay OUT_OF_SCOPE for emulation. |
-| Tile isolation gates (N/S/E/W) | aie-rt `pm/xaie_tilectrl.c`, AM025 | MISSING | — | Direction-gating of stream switch / DMA. If a kernel relies on isolation, our routing model may pass packets that real HW would block. |
+| Tile isolation gates (N/S/E/W) | aie-rt `pm/xaie_tilectrl.c`, AM025 | MODELED | `src/device/tile/mod.rs::isolation` (bit constants), `src/device/state/effects.rs` (Tile_Control snapshot), `src/device/array/routing.rs::propagate_inter_tile` (stream-switch gate), `src/interpreter/execute/memory/neighbor.rs` (NeighborMemory gate), `src/interpreter/engine/coordinator.rs` (NeighborLocks gate) | Tile_Control low 4 bits (S/W/N/E) snapshotted onto `tile.isolation` on register write. Inter-tile stream transfers, cross-tile NeighborMemory snapshots/reads/buffered writes, and cross-tile NeighborLocks slices all consult the destination/own isolation byte and short-circuit when blocked. Memtile uses 0x96030; compute uses 0x36030. Shim Tile_Control isolation is set up by privileged path in HW; writes pass through unmodeled here today. |
 
 ### Memory tile (MemTile, row 1)
 
@@ -158,7 +158,7 @@ re-discover them as "missing hardware."
 1. ~~**Watchpoint hardware** (compute mem 2 / mem tile 4)~~ **FIXED 2026-05-14**. Per-tile register storage already persisted writes; this commit adds the access-checking path. Every scalar load/store calls `matching_watchpoint_events` which gates on `WriteStrobes==0xF`, decodes the direction filter (Read/Write bits), masks the address comparator, and returns the matching slots' event IDs. `fire_watchpoint_events` notifies mem_trace + mem_perf_counters with `WATCHPOINT_N` (compute mem 16/17, memtile 16-19). DMA-engine path and AXI/quadrant filters are follow-up work; core-halt wiring on watchpoint hit is also deferred.
 2. ~~**Error halt path**~~ **FIXED 2026-05-14**. Generic `error_halt` flag set + `INSTR_ERROR` event fired at every CoreStatus::Error transition (decode failure, missing program memory, executor Error). ECC errors continue to fire `ECC_ERROR_STALL`. Saturation/watchdog/other error sources are still untracked. See `src/interpreter/core/interpreter.rs::raise_instr_error`.
 3. ~~**Bank conflict event-fire**~~ **FIXED 2026-05-14**. Per-bank `MEM_CONFLICT_DM_BANK_N` events (compute 77..84, memtile 112..120) now fire into mem_trace + mem_perf_counters when scalar load/store conflict detected. See `src/interpreter/execute/cycle_accurate.rs::fire_bank_conflict_events`.
-4. **Tile isolation gates** — directional N/S/E/W gating. If a kernel relies on isolation, packets we route would be blocked on real HW.
+4. ~~**Tile isolation gates**~~ **FIXED 2026-05-14**. Tile_Control writes (compute 0x36030, memtile 0x96030) now snapshot the low 4 bits onto `tile.isolation`. Three gate sites consult that byte: stream-switch inter-tile routing drops cross-boundary transfers, NeighborMemory short-circuits cross-tile snapshots/reads/buffered writes, NeighborLocks hides the slice for blocked directions. Shim Tile_Control isolation (privileged-path setup in HW) still passes through unmodeled.
 5. ~~**Packet handler status register**~~ **FIXED 2026-05-14**. `Control_Packet_Handler_Status` (compute 0x3FF30, memtile 0xB0F30) now backed by `tile.pkt_handler_status` with sticky bits + write-1-to-clear semantics. Reassembler header-parse failure sets bit 1 (`Second_Header_Parity_Error`). Other sticky bits (Tlast / SLVERR / ID_Parity) not yet wired -- no current code path detects those conditions.
 
 ### Cycle-accuracy gaps (functional-OK, timing-off)
@@ -199,15 +199,22 @@ Remaining verifications:
 
 ## Pass 2: deep-dive priorities
 
-Order suggested by likely impact on current mode-2 divergences and
-upcoming Option 1 cycle-validation:
+Pass 1 quick wins are all closed. Outstanding follow-ups inherited
+from those passes are queued below; promote any of them when impact
+warrants.
 
-1. **Tile isolation gates** — Tile_Control bits S/W/N/E (compute 0x36030, memtile 0x96030) need three intervention points: stream switch routing for cross-tile packets, NeighborLocks for cross-tile lock access, NeighborMemory for cross-tile memory.
-
-Follow-ups deferred from the watchpoint pass: DMA-engine watchpoint
-hookup (record_memory_access only covers scalar load/store today),
+Watchpoint follow-ups: DMA-engine watchpoint hookup
+(`record_memory_access` only covers scalar load/store today),
 AXI/quadrant filter bits (currently treated as wildcard for the
-internal scalar path), and optional core-halt wiring on watchpoint hit.
+internal scalar path), and optional core-halt wiring on watchpoint
+hit.
+
+Tile isolation follow-ups: shim Tile_Control isolation (privileged
+partition-boundary setup, not currently modeled), and a coordinator-
+level integration test that pins NeighborLocks gating end-to-end (the
+inline gate in `coordinator.rs` is mechanically simple and exercised
+indirectly by any cross-tile-locking bridge test, but a dedicated unit
+test would catch a future regression earlier).
 
 Items 7+ in the gaps list above are deliberately deferred until pass 1
 deep-dives surface unforeseen interactions.
