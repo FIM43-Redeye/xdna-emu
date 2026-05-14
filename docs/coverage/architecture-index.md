@@ -62,7 +62,7 @@ MemTile = mem tile (row 1 on NPU1), Shim = row 0.
 | Core error halt | AM025 `Error_Halt_Control` / `Error_Halt_Event` | PARTIAL | `src/device/core_debug/mod.rs:75` | bit-field present in `Core_Status`, no triggering path; ECC errors / saturation / watchdog never raise it. |
 | Watchpoint hardware (memory-address triggers) | AM025 Compute mem `WatchPoint0/1` (2) | MISSING | — | Register slots reserved in regdb but no emulator behavior. Distinct from `XDNA_EMU_WATCH` env-var debug aid. |
 | Data memory (64KB, banked) | aie-rt `memory/`, AM025 | MODELED | `src/device/banking.rs`, `src/interpreter/timing/memory.rs` | 8 banks × 128-bit, conflict detection done. |
-| Bank conflict events (intercore / intracore) | aietools events `MEM_CONFLICT_INTERCORE`, `_INTRACORE`, `DM_BANK_CONFLICT` | PARTIAL | `src/device/banking.rs` | Conflicts detected for stalls; explicit event-fire path not connected to event subsystem. |
+| Bank conflict events (intercore / intracore) | aietools events `MEM_CONFLICT_INTERCORE`, `_INTRACORE`, `DM_BANK_CONFLICT` | MODELED | `src/interpreter/execute/cycle_accurate.rs` | Per-bank `MEM_CONFLICT_DM_BANK_N` (events 77..84 compute / 112..120 memtile) fired into mem_trace + mem_perf_counters when scalar load/store conflict detected. INTERCORE/INTRACORE not modeled separately. |
 | ECC (data memory) | aie-rt `pm/xaie_ecc.c` | OUT_OF_SCOPE | — | Status bit readable; no scrubber, no fault injection. Document as OOS unless workloads require. |
 | Program memory (16KB) | AM025 | MODELED | `src/parser/elf.rs` + tile state | ELF load → run. |
 | DMA engine | aie-rt `dma/`, AM025 (112 reg) | MODELED | `src/device/dma/` | BDs 16, channels 4, n-d addressing, padding, lock coupling, packet header. Compression module present. Repeat / Out-of-order BD execution: verify. |
@@ -157,7 +157,7 @@ re-discover them as "missing hardware."
 0a. ~~**Trace controller pipelined start/stop**~~ **FIXED 2026-05-04**. After the timer-sync fix exposed it, the residual mode-2 PC divergence on `add_one_using_dma.chess` was exactly 2 frames (1 at start, 1 at end). Modeled HW's 1-cycle pipelined Idle→Running by deferring state transition until cycle advances past the arm cycle; same-cycle stop-window frames are now discarded. See [trace-start-stop-latency-gap.md](trace-start-stop-latency-gap.md). Bridge re-run pending.
 1. **Watchpoint hardware** (compute mem 2 / mem tile 4) — kernels using debug breakpoints would silently no-op on emulator.
 2. **Error halt path** — `Error_Halt_Event` never fires. Affects any test that intentionally triggers an error.
-3. **Bank conflict event-fire** — we *detect* conflicts for stalls but don't emit `MEM_CONFLICT_*` events to the event subsystem. Mode-2 / VCD comparators may see the divergence.
+3. ~~**Bank conflict event-fire**~~ **FIXED 2026-05-14**. Per-bank `MEM_CONFLICT_DM_BANK_N` events (compute 77..84, memtile 112..120) now fire into mem_trace + mem_perf_counters when scalar load/store conflict detected. See `src/interpreter/execute/cycle_accurate.rs::fire_bank_conflict_events`.
 4. **Tile isolation gates** — directional N/S/E/W gating. If a kernel relies on isolation, packets we route would be blocked on real HW.
 6. **Packet handler status register** — we *do* the control-packet work but don't expose the status surface. Software polling that reg would loop forever.
 
@@ -202,11 +202,10 @@ Remaining verifications:
 Order suggested by likely impact on current mode-2 divergences and
 upcoming Option 1 cycle-validation:
 
-1. **Bank conflict event-fire** — wires existing detection into event subsystem; cheap win.
-2. **Watchpoint hardware** — small register-state machine; needed for debugger work.
-3. **Error halt path** — wire `Error_Halt_Event` to the event bus from existing status sources.
-4. **Packet handler status** — expose existing control-packet processor state as a register.
-5. **Tile isolation gates** — gate the routing layer on isolation bits.
+1. **Watchpoint hardware** — small register-state machine; needed for debugger work.
+2. **Error halt path** — wire `Error_Halt_Event` to the event bus from existing status sources.
+3. **Packet handler status** — expose existing control-packet processor state as a register.
+4. **Tile isolation gates** — gate the routing layer on isolation bits.
 
 Items 7+ in the gaps list above are deliberately deferred until pass 1
 deep-dives surface unforeseen interactions.

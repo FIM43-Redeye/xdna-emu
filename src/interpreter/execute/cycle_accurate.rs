@@ -196,7 +196,13 @@ impl CycleAccurateExecutor {
     /// (AM020 event-time mode, core module event 23). We emit the event
     /// into the timing context so `core_event_to_hw_id` can route it to
     /// the trace unit, and bump `total_memory_stalls` for cycle accounting.
-    fn record_memory_access(&mut self, op: &SlotOp, ctx: &mut ExecutionContext) {
+    ///
+    /// Per-bank: HW additionally fires `MEM_CONFLICT_DM_BANK_N` (mem-module
+    /// events 77..84 on compute, 112..120 on memtile) for each conflicting
+    /// bank. We route those into `tile.mem_trace` and `tile.mem_perf_counters`
+    /// so trace dumps and perf counters see them. Compute path only --
+    /// memtile DMA-bank conflicts come through the DMA engine, not here.
+    fn record_memory_access(&mut self, op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) {
         match op.semantic {
             Some(SemanticOp::Load) | Some(SemanticOp::Store) if !op.is_vector => {
                 // Resolve address from the first pointer register in operands.
@@ -228,6 +234,7 @@ impl CycleAccurateExecutor {
                     self.total_memory_stalls += stall as u64;
                     ctx.timing_context_mut()
                         .record_event(cycle, EventType::MemoryStall { cycles: stall, pc: Some(pc) });
+                    fire_bank_conflict_events(tile, conflict.conflict_banks, cycle, pc);
                 }
             }
             _ => {}
@@ -269,6 +276,26 @@ impl CycleAccurateExecutor {
 impl Default for CycleAccurateExecutor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Fire one `MEM_CONFLICT_DM_BANK_N` event per bit set in `banks_mask` to the
+/// tile's mem-module trace and perf counters. Tile-kind dispatch picks the
+/// right event-ID base (compute mem 77, memtile 112) per `xaie_events_aieml.h`.
+fn fire_bank_conflict_events(tile: &mut Tile, banks_mask: u8, cycle: u64, pc: u32) {
+    use crate::device::tile::TileKind;
+    use xdna_archspec::aie2::trace_events::{mem_events, memtile_events};
+    let base = match tile.tile_kind {
+        TileKind::Compute => mem_events::CONFLICT_DM_BANK_0,
+        TileKind::Mem => memtile_events::CONFLICT_DM_BANK_0,
+        TileKind::ShimNoc | TileKind::ShimPl => return, // no mem module
+    };
+    for bank in 0..8u8 {
+        if banks_mask & (1 << bank) != 0 {
+            let event_id = base + bank;
+            tile.mem_trace.notify_event(event_id, cycle, Some(pc));
+            tile.mem_perf_counters.handle_event(event_id);
+        }
     }
 }
 
@@ -510,7 +537,7 @@ impl CycleAccurateExecutor {
         // Phase 3: Record writes and memory accesses for future hazard detection
         for op in bundle.active_slots() {
             self.record_writes(op);
-            self.record_memory_access(op, ctx);
+            self.record_memory_access(op, ctx, tile);
         }
 
         // Convert Branch to Call when this was a jl instruction.
