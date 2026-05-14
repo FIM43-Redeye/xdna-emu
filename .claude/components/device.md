@@ -44,9 +44,20 @@ matches reality.
 ## Key Types
 
 - `TileArray` -- the full NPU device; created via `TileArray::npu1()`
-- `Tile` -- individual tile state (compute, mem, or shim)
+- `Tile` -- individual tile state (compute, mem, or shim). Carries a
+  `data_memory_gen` counter that bumps on every data-memory write so
+  per-core neighbor caches can detect when their snapshots are stale
+  without comparing buffer contents.
 - `TileAddress` -- CDO address decoder (`TileAddress::decode(0x02232000)`)
-- `DeviceState` -- wraps `TileArray` and applies `DeviceOp`s
+- `DeviceState` -- wraps `TileArray` and applies `DeviceOp`s. Provides
+  `split_tile_mut(col, row)` returning `(&mut Tile, NeighborView<'_>)`
+  for borrow-safe split between the executing tile and the rest of
+  the array.
+- `NeighborView<'a>` -- read-only split-slice view of all tiles except
+  the executing one (its slot is a hole). Implements `TileLookup` so the
+  same neighbor-cache code path serves both eager and lazy access.
+- `TileLookup` -- trait abstracting tile-by-(col,row) lookup; implemented
+  for both `DeviceState` and `NeighborView<'a>`.
 - `DeviceOp` -- 8-variant op vocabulary the CDO parser and NPU instruction
   executor both feed (Write32, BlockWrite, MaskWrite, MaskPoll, ...)
 - `DmaEngine` -- per-tile DMA with 16 BDs and 4 channels

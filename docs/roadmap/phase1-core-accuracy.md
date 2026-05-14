@@ -88,6 +88,7 @@ combinations, float edge cases, and sparse matrix multiply.
 | Alignment checking | VERIFIED | Unit tests |
 | Bank mapping (bits[6:4]) | VERIFIED | Unit tests |
 | Word-addressed DMA loads/stores | VERIFIED | Unit tests |
+| Cross-tile neighbor reads (gen-aware caching) | VERIFIED | Unit tests in `execute/memory/neighbor.rs`; `NeighborView<'_>` + `TileLookup` for borrow-safe split, `Tile::data_memory_gen` for cache invalidation |
 
 **AM020 Memory Architecture** (Ch4):
 - Data memory per tile: 64 KB (8 banks x 8 KB)

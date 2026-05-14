@@ -158,6 +158,35 @@ execution unit.
    - Lock synchronization
 4. `InterpreterEngine` coordinates multiple cores per cycle
 
+## Cross-Tile Memory Access
+
+A core executing on tile T can read its neighbors' data memory (north, south,
+east, west) via load instructions. The interpreter mediates this through
+`NeighborMemory` (`src/interpreter/execute/memory/neighbor.rs`), a per-core
+read cache that holds a snapshot of each neighbor's data memory.
+
+The cache is **gen-aware**. Each `Tile` carries a `data_memory_gen` counter
+that bumps on every write to the tile's data memory. `NeighborMemory::ensure_snapshot`
+compares the cached gen against the neighbor's current gen and only re-clones
+the 64KB / 512KB memory when they differ. Steady-state cost is one
+`u64` comparison per access; full clones happen only when the neighbor
+actually wrote.
+
+Access goes through a `NeighborView<'a>` (`src/device/state/mod.rs`), a
+borrow-safe split-slice view into the tile array with the executing tile's
+slot held out as a hole. `DeviceState::split_tile_mut(col, row)` returns
+`(&mut Tile, NeighborView<'_>)` in one call -- the executing tile is
+mutable, and the rest of the array is read-only through the view.
+`NeighborMemory::ensure_snapshot` is generic over a `TileLookup` trait
+implemented by both `DeviceState` and `NeighborView<'a>`, so the same
+caching path serves both the coordinator's eager refresh and the
+read site's lazy access.
+
+`NeighborMemory` lives on `CoreState`, so the cache survives across
+interpreter steps (Stage 1 hoist). Stage 2 threads `&NeighborView` through
+the read paths so the read site declares its own data dependency rather
+than assuming the coordinator pre-decided.
+
 ## Key Bug Fixes to Preserve
 
 - **Branch delay slots**: AIE2 has 5 delay slots after a branch. Instructions in delay slots execute before the branch takes effect.
