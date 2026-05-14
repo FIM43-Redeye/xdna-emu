@@ -40,6 +40,13 @@ pub struct NeighborMemory {
     /// None until first access (lazy clone). Inner None if neighbor doesn't exist.
     snapshots: [Option<Option<Vec<u8>>>; 4],
 
+    /// `data_memory_gen` of the neighbor at the time `snapshots[idx]` was taken.
+    /// `ensure_snapshot` compares this against the neighbor's current gen and
+    /// only re-snapshots on mismatch. None means "not yet snapshotted" -- which
+    /// is also implied by `snapshots[idx].is_none()`, but tracking it
+    /// separately keeps the gen check next to the gen value.
+    snapshot_gens: [Option<u64>; 4],
+
     /// Buffered cross-tile writes: (direction, offset_within_tile, data).
     /// Applied after core step completes.
     pub pending_writes: Vec<(MemoryQuadrant, usize, Vec<u8>)>,
@@ -63,7 +70,13 @@ impl NeighborMemory {
     ///
     /// Does NOT clone any neighbor memory yet -- snapshots are lazy.
     pub fn new(col: usize, row: usize) -> Self {
-        Self { col, row, snapshots: [None, None, None, None], pending_writes: Vec::new() }
+        Self {
+            col,
+            row,
+            snapshots: [None, None, None, None],
+            snapshot_gens: [None, None, None, None],
+            pending_writes: Vec::new(),
+        }
     }
 
     /// Resolve a cardinal direction to the neighbor tile coordinates.
@@ -93,25 +106,32 @@ impl NeighborMemory {
         }
     }
 
-    /// Lazily snapshot a neighbor tile's data memory.
+    /// Snapshot a neighbor tile's data memory if the cached copy is stale.
     ///
-    /// Called before execution for each direction that might be accessed.
-    /// The `device` reference is only needed for this initial clone.
+    /// Cache hit when the neighbor's `data_memory_gen` matches the gen
+    /// recorded at the time of the previous snapshot. Cache miss (re-snapshot)
+    /// when no snapshot exists yet, or when the neighbor's data memory has
+    /// been mutated since (any `data_memory_mut()` call bumps the gen).
+    ///
+    /// Cheap to call repeatedly across steps -- this is what makes hoisting
+    /// `NeighborMemory` across step boundaries safe.
     pub fn ensure_snapshot(&mut self, dir: MemoryQuadrant, device: &crate::device::DeviceState) {
         let idx = match dir_index(dir) {
             Some(i) => i,
             None => return, // Local -- no snapshot needed
         };
-        if self.snapshots[idx].is_some() {
-            return; // Already loaded
+
+        let neighbor = self.neighbor_coords(dir).and_then(|(c, r)| device.tile(c, r));
+        let current_gen = neighbor.map(|t| t.data_memory_gen());
+
+        // Cache hit: snapshot exists and the neighbor's gen hasn't changed
+        // since (None == None handles "neighbor doesn't exist" idempotently).
+        if self.snapshots[idx].is_some() && self.snapshot_gens[idx] == current_gen {
+            return;
         }
 
-        let snapshot = self
-            .neighbor_coords(dir)
-            .and_then(|(c, r)| device.tile(c, r))
-            .map(|tile| tile.data_memory().to_vec());
-
-        self.snapshots[idx] = Some(snapshot);
+        self.snapshots[idx] = Some(neighbor.map(|tile| tile.data_memory().to_vec()));
+        self.snapshot_gens[idx] = current_gen;
     }
 
     /// Get a reference to a neighbor's data memory snapshot.
@@ -127,14 +147,16 @@ impl NeighborMemory {
         self.pending_writes.push((dir, offset, data.to_vec()));
     }
 
-    /// Apply all buffered cross-tile writes to the device.
+    /// Drain buffered cross-tile writes to the device.
     ///
     /// Resolves each direction to the target tile and writes the data.
-    /// Called after the core step completes.
-    pub fn apply_writes(self, device: &mut crate::device::DeviceState) {
+    /// Called after the core step completes. Drains the `pending_writes`
+    /// vec but leaves cached snapshots intact -- they remain valid across
+    /// steps as long as their gen-counters match (see `ensure_snapshot`).
+    pub fn drain_writes(&mut self, device: &mut crate::device::DeviceState) {
         let col = self.col;
         let row = self.row;
-        for (dir, offset, data) in self.pending_writes {
+        for (dir, offset, data) in self.pending_writes.drain(..) {
             let coords = match dir {
                 MemoryQuadrant::South => {
                     if row > SHIM_ROW as usize {
@@ -168,5 +190,56 @@ impl NeighborMemory {
     /// Check if there are any pending cross-tile writes.
     pub fn has_pending_writes(&self) -> bool {
         !self.pending_writes.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// When the neighbor's data memory hasn't changed since the last snapshot,
+    /// `ensure_snapshot` must be a no-op (no re-allocation). We detect this by
+    /// poking a sentinel into the cached snapshot; if the snapshot survives a
+    /// second `ensure_snapshot` call, no reclone happened.
+    #[test]
+    fn ensure_snapshot_is_noop_when_neighbor_unchanged() {
+        let device = crate::device::DeviceState::new_npu1();
+        let mut nbr = NeighborMemory::new(1, 3);
+        nbr.ensure_snapshot(MemoryQuadrant::South, &device);
+
+        // Sentinel into the cached snapshot (test-only, in-module access).
+        nbr.snapshots[0].as_mut().unwrap().as_mut().unwrap()[0x100] = 0xCD;
+
+        // No underlying mutation -> must hit cache and preserve the sentinel.
+        nbr.ensure_snapshot(MemoryQuadrant::South, &device);
+        assert_eq!(
+            nbr.get_memory(MemoryQuadrant::South).unwrap()[0x100],
+            0xCD,
+            "ensure_snapshot must not re-clone when neighbor's data_memory_gen is unchanged"
+        );
+    }
+
+    /// After taking a snapshot, if the neighbor's data memory is mutated,
+    /// the next ensure_snapshot must re-snapshot so reads see the new data.
+    /// Currently FAILS: the is_some() guard returns the stale snapshot.
+    #[test]
+    fn ensure_snapshot_picks_up_neighbor_write() {
+        let mut device = crate::device::DeviceState::new_npu1();
+
+        // Initial state: south neighbor (1, 2) has zero at offset 0x100.
+        let mut nbr = NeighborMemory::new(1, 3);
+        nbr.ensure_snapshot(MemoryQuadrant::South, &device);
+        assert_eq!(nbr.get_memory(MemoryQuadrant::South).unwrap()[0x100], 0x00);
+
+        // Mutate the neighbor's data memory directly.
+        device.tile_mut(1, 2).unwrap().data_memory_mut()[0x100] = 0xAB;
+
+        // Re-snapshot must pick up the new value.
+        nbr.ensure_snapshot(MemoryQuadrant::South, &device);
+        assert_eq!(
+            nbr.get_memory(MemoryQuadrant::South).unwrap()[0x100],
+            0xAB,
+            "snapshot must reflect post-write neighbor data"
+        );
     }
 }

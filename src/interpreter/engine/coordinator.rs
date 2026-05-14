@@ -50,6 +50,10 @@ struct CoreState {
     interpreter: Interpreter,
     /// Execution context (registers, PC, flags).
     context: ExecutionContext,
+    /// Cross-tile neighbor memory snapshots, hoisted across steps.
+    /// `ensure_snapshot` is gen-aware, so persisting this across steps
+    /// turns most per-step calls into cheap cache hits (see `NeighborMemory`).
+    neighbors: NeighborMemory,
     /// Is this core enabled?
     enabled: bool,
     /// Absolute count of trace events already consumed from the
@@ -78,6 +82,7 @@ impl CoreState {
                 CycleAccurateExecutor::new(),
             ),
             context: ExecutionContext::new_for_tile(col, row),
+            neighbors: NeighborMemory::new(col as usize, row as usize),
             enabled: false,
             trace_events_consumed: 0,
             active_this_cycle: false,
@@ -587,19 +592,20 @@ impl InterpreterEngine {
                     }
                 }
 
-                // Build cross-tile neighbor memory context.
-                let mut neighbors = NeighborMemory::new(col, row);
-                neighbors.ensure_snapshot(MemoryQuadrant::South, &self.device);
-                neighbors.ensure_snapshot(MemoryQuadrant::West, &self.device);
-                neighbors.ensure_snapshot(MemoryQuadrant::North, &self.device);
+                // Refresh cross-tile neighbor snapshots. NeighborMemory is
+                // hoisted to CoreState (persists across steps); ensure_snapshot
+                // is gen-aware, so most of these calls hit the cache and only
+                // re-clone when a neighbor's data_memory_gen has changed.
+                let core = &mut self.cores[idx];
+                core.neighbors.ensure_snapshot(MemoryQuadrant::South, &self.device);
+                core.neighbors.ensure_snapshot(MemoryQuadrant::West, &self.device);
+                core.neighbors.ensure_snapshot(MemoryQuadrant::North, &self.device);
 
                 // Get tile for this core
                 if let Some(tile) = self.device.tile_mut(col, row) {
                     if !tile.is_compute() {
                         continue;
                     }
-
-                    let core = &mut self.cores[idx];
 
                     // Build neighbor locks struct
                     let mut nlocks = crate::interpreter::execute::NeighborLocks {
@@ -612,7 +618,7 @@ impl InterpreterEngine {
                         &mut core.context,
                         tile,
                         &mut nlocks,
-                        Some(&mut neighbors),
+                        Some(&mut core.neighbors),
                     );
 
                     // Update CoreDebugState with current PC and stall info.
@@ -716,9 +722,10 @@ impl InterpreterEngine {
                     }
                 }
 
-                // Apply buffered cross-tile writes to neighbor tiles
-                if neighbors.has_pending_writes() {
-                    neighbors.apply_writes(&mut self.device);
+                // Drain buffered cross-tile writes to neighbor tiles.
+                // Snapshots stay live; only the writes vec is drained.
+                if core.neighbors.has_pending_writes() {
+                    core.neighbors.drain_writes(&mut self.device);
                 }
 
                 // Submit modified neighbor locks back to neighbor tiles.

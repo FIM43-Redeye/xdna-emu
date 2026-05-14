@@ -99,6 +99,14 @@ pub struct Tile {
     /// Boxed to avoid huge stack allocation
     data_memory: Box<[u8]>,
 
+    /// Generation counter, bumped every time `data_memory_mut()` is called.
+    /// Lets cross-tile snapshot caches detect when their snapshot is stale
+    /// without re-cloning. Conservative: bumps even if the caller takes the
+    /// mut slice and writes nothing -- false invalidation costs perf, not
+    /// correctness, and avoiding it would require routing every write
+    /// through a structured API.
+    data_memory_gen: u64,
+
     /// Program memory (64KB, compute tiles only)
     /// None for shim and mem tiles
     program_memory: Option<Box<[u8; PROGRAM_MEMORY_SIZE]>>,
@@ -329,6 +337,7 @@ impl Tile {
                 TileKind::Compute => FunctionalStreamSwitch::new_compute_tile(col, row),
             },
             data_memory: vec![0u8; params.data_memory_size].into_boxed_slice(),
+            data_memory_gen: 0,
             program_memory,
             registers: std::collections::HashMap::new(),
             shim_mux_mm2s_slaves: vec![None; params.dma_mm2s_channels],
@@ -446,9 +455,22 @@ impl Tile {
     }
 
     /// Get mutable data memory slice.
+    ///
+    /// Bumps `data_memory_gen` so neighbor-tile snapshot caches know they
+    /// must re-snapshot. See the field doc for the conservativeness trade-off.
     #[inline]
     pub fn data_memory_mut(&mut self) -> &mut [u8] {
+        self.data_memory_gen = self.data_memory_gen.wrapping_add(1);
         &mut self.data_memory
+    }
+
+    /// Generation counter for the tile's data memory.
+    ///
+    /// Incremented on every `data_memory_mut()` call. Used by
+    /// `NeighborMemory` to detect when a cached snapshot is stale.
+    #[inline]
+    pub fn data_memory_gen(&self) -> u64 {
+        self.data_memory_gen
     }
 
     /// Get program memory (compute tiles only).

@@ -2360,7 +2360,7 @@ mod tests {
         assert!(nbr.has_pending_writes());
 
         // Apply writes to the device
-        nbr.apply_writes(&mut device);
+        nbr.drain_writes(&mut device);
 
         // Verify the write landed in the west neighbor tile (0,3)
         let west = device.tile(0, 3).unwrap();
@@ -2435,7 +2435,7 @@ mod tests {
 
         // Apply writes
         assert!(nbr.has_pending_writes());
-        nbr.apply_writes(&mut device);
+        nbr.drain_writes(&mut device);
 
         // Now it should be visible
         let south = device.tile(1, 2).unwrap();
@@ -2457,7 +2457,7 @@ mod tests {
         MemoryUnit::write_vector_to_memory(&mut tile, 0x50800, test_data, Some(&mut nbr));
 
         // Apply and verify
-        nbr.apply_writes(&mut device);
+        nbr.drain_writes(&mut device);
 
         let west = device.tile(0, 3).unwrap();
         let mem = west.data_memory();
