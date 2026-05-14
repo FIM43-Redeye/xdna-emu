@@ -60,7 +60,7 @@ MemTile = mem tile (row 1 on NPU1), Shim = row 0.
 | Core control (enable / done / reset) | AM025 `Core_Control`, `Core_Status` | MODELED | `src/device/core_debug/` | enable, halt, done, reset paths |
 | Core debug (halt / step / breakpoint) | AM025 `Debug_*` | PARTIAL | `src/device/core_debug/` | Halt + status bits modeled; programmable breakpoints / single-step PC trap not wired through interpreter. |
 | Core error halt | AM025 `Error_Halt_Control` / `Error_Halt_Event` | MODELED | `src/device/core_debug/mod.rs:75`, `src/interpreter/core/interpreter.rs::raise_instr_error` | Generic `error_halt` path fires `INSTR_ERROR` (event 69) into core_trace + core_perf_counters at every CoreStatus::Error transition (decode failure, missing program memory, executor Error). Sets Core_Status bit 19. ECC errors still fire ECC_ERROR_STALL (bit 17) via `set_ecc_error`. Other error sources (saturation, watchdog) not yet detected. |
-| Watchpoint hardware (memory-address triggers) | AM025 Compute mem `WatchPoint0/1` (2) | MISSING | — | Register slots reserved in regdb but no emulator behavior. Distinct from `XDNA_EMU_WATCH` env-var debug aid. |
+| Watchpoint hardware (memory-address triggers) | AM025 Compute mem `WatchPoint0/1` (2) | MODELED | `src/interpreter/execute/cycle_accurate.rs::matching_watchpoint_events` | Compute slots at 0x14100/4 with `WriteStrobes==0xF` gate, direction filter (Read/Write bits 31/30), 16-byte-aligned 12-bit address comparator [15:4]. Fires `WATCHPOINT_0/1` (mem events 16/17) into mem_trace + mem_perf_counters on every matching scalar load/store. AXI/DMA/quadrant filters treated as wildcard for now (internal scalar path only); DMA-engine watchpoint hookup is follow-up work. Distinct from `XDNA_EMU_WATCH` env-var debug aid. |
 | Data memory (64KB, banked) | aie-rt `memory/`, AM025 | MODELED | `src/device/banking.rs`, `src/interpreter/timing/memory.rs` | 8 banks × 128-bit, conflict detection done. |
 | Bank conflict events (intercore / intracore) | aietools events `MEM_CONFLICT_INTERCORE`, `_INTRACORE`, `DM_BANK_CONFLICT` | MODELED | `src/interpreter/execute/cycle_accurate.rs` | Per-bank `MEM_CONFLICT_DM_BANK_N` (events 77..84 compute / 112..120 memtile) fired into mem_trace + mem_perf_counters when scalar load/store conflict detected. INTERCORE/INTRACORE not modeled separately. |
 | ECC (data memory) | aie-rt `pm/xaie_ecc.c` | OUT_OF_SCOPE | — | Status bit readable; no scrubber, no fault injection. Document as OOS unless workloads require. |
@@ -89,7 +89,7 @@ MemTile = mem tile (row 1 on NPU1), Shim = row 0.
 | Performance counters (11 reg) | AM025 | MODELED | `src/device/perf_counters/` | |
 | Trace unit | AM025 | MODELED | `src/device/trace_unit/` | |
 | Timer | AM025 (5 reg) | MODELED | `src/device/timer.rs` | |
-| Watchpoint hardware (4 slots) | AM025 `WatchPoint0..3` | MISSING | — | Same as compute-tile watchpoints. |
+| Watchpoint hardware (4 slots) | AM025 `WatchPoint0..3` | MODELED | `src/interpreter/execute/cycle_accurate.rs::matching_watchpoint_events` | 4 memtile slots at 0x94100..0x9410C with `WriteStrobes==0xF` gate, direction filter (Read/Write bits 29/28), 16-byte-aligned 15-bit address comparator [18:4] covering the full 512KB span. Fires `WATCHPOINT_0..3` (memtile events 16..19) into mem_trace + mem_perf_counters on every matching scalar load/store. |
 | Packet handler status | AM025 `Control_Packet_Handler_Status` | MODELED | `src/device/tile/mod.rs::pkt_handler_status` + `src/device/tile/registers.rs` reads + `src/device/state/effects.rs` write-1-to-clear | Sticky bits at 0x3FF30 (compute) / 0xB0F30 (memtile). Reassembler header-parse error sets `Second_Header_Parity_Error` (bit 1). `Tlast_Error` / `SLVERR_On_Access` / `ID_Parity_Error` not yet wired (no current path detects them). |
 | Memory_Control / Tile_Control / Module_Clock_Control | AM025 | PARTIAL | `src/device/registers.rs` | Layout parsed; behavior not interpreted. |
 
@@ -155,7 +155,7 @@ re-discover them as "missing hardware."
 
 0. ~~**Multi-tile timer sync**~~ **FIXED 2026-05-04**. `Timer_Control.Reset_Event` is now consumed via a `pending_reset` latch on `TileTimer`. Both `notify_core_trace_event` and `notify_mem_trace_event` route through it. See [timer-sync-gap.md](timer-sync-gap.md) for full implementation notes; bridge re-run pending to confirm mode-2 divergence drops.
 0a. ~~**Trace controller pipelined start/stop**~~ **FIXED 2026-05-04**. After the timer-sync fix exposed it, the residual mode-2 PC divergence on `add_one_using_dma.chess` was exactly 2 frames (1 at start, 1 at end). Modeled HW's 1-cycle pipelined Idle→Running by deferring state transition until cycle advances past the arm cycle; same-cycle stop-window frames are now discarded. See [trace-start-stop-latency-gap.md](trace-start-stop-latency-gap.md). Bridge re-run pending.
-1. **Watchpoint hardware** (compute mem 2 / mem tile 4) — kernels using debug breakpoints would silently no-op on emulator.
+1. ~~**Watchpoint hardware** (compute mem 2 / mem tile 4)~~ **FIXED 2026-05-14**. Per-tile register storage already persisted writes; this commit adds the access-checking path. Every scalar load/store calls `matching_watchpoint_events` which gates on `WriteStrobes==0xF`, decodes the direction filter (Read/Write bits), masks the address comparator, and returns the matching slots' event IDs. `fire_watchpoint_events` notifies mem_trace + mem_perf_counters with `WATCHPOINT_N` (compute mem 16/17, memtile 16-19). DMA-engine path and AXI/quadrant filters are follow-up work; core-halt wiring on watchpoint hit is also deferred.
 2. ~~**Error halt path**~~ **FIXED 2026-05-14**. Generic `error_halt` flag set + `INSTR_ERROR` event fired at every CoreStatus::Error transition (decode failure, missing program memory, executor Error). ECC errors continue to fire `ECC_ERROR_STALL`. Saturation/watchdog/other error sources are still untracked. See `src/interpreter/core/interpreter.rs::raise_instr_error`.
 3. ~~**Bank conflict event-fire**~~ **FIXED 2026-05-14**. Per-bank `MEM_CONFLICT_DM_BANK_N` events (compute 77..84, memtile 112..120) now fire into mem_trace + mem_perf_counters when scalar load/store conflict detected. See `src/interpreter/execute/cycle_accurate.rs::fire_bank_conflict_events`.
 4. **Tile isolation gates** — directional N/S/E/W gating. If a kernel relies on isolation, packets we route would be blocked on real HW.
@@ -202,8 +202,12 @@ Remaining verifications:
 Order suggested by likely impact on current mode-2 divergences and
 upcoming Option 1 cycle-validation:
 
-1. **Watchpoint hardware** — per-tile register storage already persists writes; the missing piece is the access-checking path: every load/store and DMA access checks active watchpoints (compute mem 2 / memtile 4), decodes access-type / direction filters, and fires `WATCHPOINT_N` (mem events 16/17 compute, 16-19 memtile) on match. Optional core-halt wiring on top.
-2. **Tile isolation gates** — Tile_Control bits S/W/N/E (compute 0x36030, memtile 0x96030) need three intervention points: stream switch routing for cross-tile packets, NeighborLocks for cross-tile lock access, NeighborMemory for cross-tile memory.
+1. **Tile isolation gates** — Tile_Control bits S/W/N/E (compute 0x36030, memtile 0x96030) need three intervention points: stream switch routing for cross-tile packets, NeighborLocks for cross-tile lock access, NeighborMemory for cross-tile memory.
+
+Follow-ups deferred from the watchpoint pass: DMA-engine watchpoint
+hookup (record_memory_access only covers scalar load/store today),
+AXI/quadrant filter bits (currently treated as wildcard for the
+internal scalar path), and optional core-halt wiring on watchpoint hit.
 
 Items 7+ in the gaps list above are deliberately deferred until pass 1
 deep-dives surface unforeseen interactions.

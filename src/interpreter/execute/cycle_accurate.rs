@@ -227,15 +227,21 @@ impl CycleAccurateExecutor {
                     port: if is_store { 2 } else { 0 },
                 };
                 let conflict = self.memory.record_access(&access);
+                let cycle = ctx.cycles;
+                let pc = ctx.pc();
                 if conflict.has_conflict() {
-                    let cycle = ctx.cycles;
                     let stall = conflict.stall_cycles;
-                    let pc = ctx.pc();
                     self.total_memory_stalls += stall as u64;
                     ctx.timing_context_mut()
                         .record_event(cycle, EventType::MemoryStall { cycles: stall, pc: Some(pc) });
                     fire_bank_conflict_events(tile, conflict.conflict_banks, cycle, pc);
                 }
+                // Watchpoints fire on every matching scalar access, regardless
+                // of bank-conflict status. Programmed slots compare the access
+                // address (low bits masked per HW) and direction filter against
+                // each WatchPointN register, then notify the mem-module trace
+                // unit and perf counters with WATCHPOINT_N events.
+                fire_watchpoint_events(tile, addr, is_store, cycle, pc);
             }
             _ => {}
         }
@@ -296,6 +302,91 @@ fn fire_bank_conflict_events(tile: &mut Tile, banks_mask: u8, cycle: u64, pc: u3
             tile.mem_trace.notify_event(event_id, cycle, Some(pc));
             tile.mem_perf_counters.handle_event(event_id);
         }
+    }
+}
+
+/// Per-tile-kind layout of the WatchPoint registers.
+///
+/// Compute mem-module exposes 2 slots at 0x14100/4 with direction bits at
+/// 31 (Read) / 30 (Write) and a 12-bit address comparator [15:4]
+/// (16-byte aligned, covers the full 64KB local memory). Memtile exposes 4
+/// slots at 0x94100..0x9410C with direction bits at 29 / 28 and a 15-bit
+/// comparator [18:4] (16-byte aligned, covers the full 512KB memtile mem).
+/// Both layouts gate the slot on WriteStrobes [23:20] == 0xF, the AM025
+/// "active slot" sentinel.
+struct WatchpointLayout {
+    slot_offsets: &'static [u32],
+    addr_mask: u32,
+    read_bit: u8,
+    write_bit: u8,
+    event_base: u8,
+}
+
+fn watchpoint_layout(kind: crate::device::tile::TileKind) -> Option<WatchpointLayout> {
+    use crate::device::tile::TileKind;
+    use xdna_archspec::aie2::trace_events::{mem_events, memtile_events};
+    match kind {
+        TileKind::Compute => Some(WatchpointLayout {
+            slot_offsets: &[0x14100, 0x14104],
+            addr_mask: 0xFFF0,
+            read_bit: 31,
+            write_bit: 30,
+            event_base: mem_events::WATCHPOINT_0,
+        }),
+        TileKind::Mem => Some(WatchpointLayout {
+            slot_offsets: &[0x94100, 0x94104, 0x94108, 0x9410C],
+            addr_mask: 0x7FFF0,
+            read_bit: 29,
+            write_bit: 28,
+            event_base: memtile_events::WATCHPOINT_0,
+        }),
+        TileKind::ShimNoc | TileKind::ShimPl => None,
+    }
+}
+
+/// Pure decision: which WATCHPOINT_N event IDs should fire for an access at
+/// `addr` with direction `is_write`, given the tile's current WatchPoint
+/// register programming. Returns slot indices in declaration order.
+fn matching_watchpoint_events(tile: &Tile, addr: u32, is_write: bool) -> Vec<u8> {
+    let Some(layout) = watchpoint_layout(tile.tile_kind) else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for (i, &reg_off) in layout.slot_offsets.iter().enumerate() {
+        let Some(&value) = tile.registers.get(&reg_off) else {
+            continue;
+        };
+        // WriteStrobes [23:20] == 0xF gates the slot. AM025: "always set this
+        // field to 0xF when using this watchpoint" -- we treat it as the
+        // active/inactive sentinel.
+        if (value >> 20) & 0xF != 0xF {
+            continue;
+        }
+        let dir_match = if is_write {
+            (value >> layout.write_bit) & 1 != 0
+        } else {
+            (value >> layout.read_bit) & 1 != 0
+        };
+        if !dir_match {
+            continue;
+        }
+        if (addr & layout.addr_mask) != (value & layout.addr_mask) {
+            continue;
+        }
+        hits.push(layout.event_base + i as u8);
+    }
+    hits
+}
+
+/// Fire WATCHPOINT_N events into the mem-module trace unit and perf counters
+/// for every WatchPoint slot that matches this access. Compute and memtile
+/// have different bit layouts (`watchpoint_layout`); shim tiles have no
+/// watchpoint registers and short-circuit.
+fn fire_watchpoint_events(tile: &mut Tile, addr: u32, is_write: bool, cycle: u64, pc: u32) {
+    let events = matching_watchpoint_events(tile, addr, is_write);
+    for event_id in events {
+        tile.mem_trace.notify_event(event_id, cycle, Some(pc));
+        tile.mem_perf_counters.handle_event(event_id);
     }
 }
 
@@ -1178,5 +1269,181 @@ mod tests {
             "Full-NOP bundle must not emit any unit-activity events; got: {:?}",
             unit_activity
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Watchpoint hardware: matching_watchpoint_events
+    //
+    // The watchpoint register layout is per AM025:
+    //   compute mem-module: WatchPoint0/1 at 0x14100/4
+    //     bit 31 = Read_Access, 30 = Write_Access
+    //     [23:20] = WriteStrobes (must be 0xF for active slot)
+    //     [15:4]  = Address (16-byte aligned, 12-bit comparator)
+    //   memtile: WatchPoint0..3 at 0x94100..0xC
+    //     bit 29 = Read_Access, 28 = Write_Access
+    //     [23:20] = WriteStrobes (must be 0xF for active slot)
+    //     [18:4]  = Address (16-byte aligned, 15-bit comparator)
+    // ------------------------------------------------------------------
+
+    /// Build a compute-tile watchpoint register value. `read`/`write` set the
+    /// direction filter bits, `addr` is the watch address (low 4 bits ignored
+    /// per the 16-byte alignment in HW). WriteStrobes is fixed at 0xF (the
+    /// AM025 "active slot" sentinel).
+    fn compute_wp(read: bool, write: bool, addr: u32) -> u32 {
+        let dir = ((read as u32) << 31) | ((write as u32) << 30);
+        let strobes = 0xFu32 << 20;
+        dir | strobes | (addr & 0xFFF0)
+    }
+
+    fn memtile_wp(read: bool, write: bool, addr: u32) -> u32 {
+        let dir = ((read as u32) << 29) | ((write as u32) << 28);
+        let strobes = 0xFu32 << 20;
+        dir | strobes | (addr & 0x7FFF0)
+    }
+
+    #[test]
+    fn test_watchpoint_unprogrammed_fires_nothing() {
+        let tile = Tile::compute(0, 2);
+        // No watchpoint register written. Every access must miss.
+        assert!(matching_watchpoint_events(&tile, 0x0000, false).is_empty());
+        assert!(matching_watchpoint_events(&tile, 0xFFF0, true).is_empty());
+    }
+
+    #[test]
+    fn test_watchpoint_inactive_slot_fires_nothing() {
+        let mut tile = Tile::compute(0, 2);
+        // WriteStrobes != 0xF: slot is inactive even if direction + addr would
+        // otherwise match. Hardware treats this as "not in use".
+        let inactive = (1u32 << 31) | (0x7u32 << 20) | 0x100;
+        tile.registers.insert(0x14100, inactive);
+        assert!(matching_watchpoint_events(&tile, 0x100, false).is_empty());
+    }
+
+    #[test]
+    fn test_watchpoint_compute_read_match() {
+        use xdna_archspec::aie2::trace_events::mem_events;
+        let mut tile = Tile::compute(0, 2);
+        tile.registers.insert(0x14100, compute_wp(true, false, 0x100));
+        let hits = matching_watchpoint_events(&tile, 0x100, false);
+        assert_eq!(hits, vec![mem_events::WATCHPOINT_0]);
+    }
+
+    #[test]
+    fn test_watchpoint_compute_read_addr_aligned_to_16_bytes() {
+        use xdna_archspec::aie2::trace_events::mem_events;
+        let mut tile = Tile::compute(0, 2);
+        // Watchpoint address 0x100 covers the whole 16-byte block 0x100..0x10F
+        // because the comparator masks the low 4 bits.
+        tile.registers.insert(0x14100, compute_wp(true, false, 0x100));
+        for off in 0..16 {
+            let hits = matching_watchpoint_events(&tile, 0x100 + off, false);
+            assert_eq!(hits, vec![mem_events::WATCHPOINT_0], "offset {off:#x}");
+        }
+        // 0x110 is the next 16-byte block: must miss.
+        assert!(matching_watchpoint_events(&tile, 0x110, false).is_empty());
+    }
+
+    #[test]
+    fn test_watchpoint_compute_wrong_direction_misses() {
+        let mut tile = Tile::compute(0, 2);
+        // Read-only watchpoint must NOT fire on a store to the same address.
+        tile.registers.insert(0x14100, compute_wp(true, false, 0x100));
+        assert!(matching_watchpoint_events(&tile, 0x100, true).is_empty());
+        // Write-only watchpoint must NOT fire on a load.
+        tile.registers.insert(0x14100, compute_wp(false, true, 0x100));
+        assert!(matching_watchpoint_events(&tile, 0x100, false).is_empty());
+    }
+
+    #[test]
+    fn test_watchpoint_compute_both_directions_match_load_and_store() {
+        use xdna_archspec::aie2::trace_events::mem_events;
+        let mut tile = Tile::compute(0, 2);
+        tile.registers.insert(0x14100, compute_wp(true, true, 0x200));
+        assert_eq!(matching_watchpoint_events(&tile, 0x200, false), vec![mem_events::WATCHPOINT_0]);
+        assert_eq!(matching_watchpoint_events(&tile, 0x200, true), vec![mem_events::WATCHPOINT_0]);
+    }
+
+    #[test]
+    fn test_watchpoint_compute_two_slots_independent() {
+        use xdna_archspec::aie2::trace_events::mem_events;
+        let mut tile = Tile::compute(0, 2);
+        tile.registers.insert(0x14100, compute_wp(true, false, 0x100));
+        tile.registers.insert(0x14104, compute_wp(false, true, 0x200));
+        // Load at 0x100 hits slot 0 only.
+        assert_eq!(matching_watchpoint_events(&tile, 0x100, false), vec![mem_events::WATCHPOINT_0]);
+        // Store at 0x200 hits slot 1 only.
+        assert_eq!(matching_watchpoint_events(&tile, 0x200, true), vec![mem_events::WATCHPOINT_1]);
+        // Load at 0x200 (store-only slot) misses.
+        assert!(matching_watchpoint_events(&tile, 0x200, false).is_empty());
+    }
+
+    #[test]
+    fn test_watchpoint_compute_two_slots_overlapping_address() {
+        use xdna_archspec::aie2::trace_events::mem_events;
+        let mut tile = Tile::compute(0, 2);
+        // Both slots cover the same address. A load there fires both events
+        // in declaration order (slot 0 then slot 1).
+        tile.registers.insert(0x14100, compute_wp(true, false, 0x40));
+        tile.registers.insert(0x14104, compute_wp(true, true, 0x40));
+        assert_eq!(
+            matching_watchpoint_events(&tile, 0x40, false),
+            vec![mem_events::WATCHPOINT_0, mem_events::WATCHPOINT_1]
+        );
+    }
+
+    #[test]
+    fn test_watchpoint_memtile_uses_memtile_event_ids() {
+        use xdna_archspec::aie2::trace_events::memtile_events;
+        let mut tile = Tile::mem_tile(0, 1);
+        // Slot 2 at 0x94108. Address 0x1000 is within memtile's 512KB span.
+        tile.registers.insert(0x94108, memtile_wp(true, false, 0x1000));
+        assert_eq!(matching_watchpoint_events(&tile, 0x1000, false), vec![memtile_events::WATCHPOINT_2]);
+    }
+
+    #[test]
+    fn test_watchpoint_memtile_address_field_is_15_bits() {
+        use xdna_archspec::aie2::trace_events::memtile_events;
+        let mut tile = Tile::mem_tile(0, 1);
+        // Memtile address field [18:4] covers 19-bit address space (512KB).
+        // 0x40000 is past the compute tile's 64KB span but well within memtile.
+        tile.registers.insert(0x94100, memtile_wp(true, false, 0x40000));
+        assert_eq!(matching_watchpoint_events(&tile, 0x40000, false), vec![memtile_events::WATCHPOINT_0]);
+        // 0x40010 is the next 16-byte block: must miss.
+        assert!(matching_watchpoint_events(&tile, 0x40010, false).is_empty());
+    }
+
+    #[test]
+    fn test_watchpoint_shim_has_no_watchpoints() {
+        let tile = Tile::shim(0, 0);
+        // Shim tiles have no watchpoint registers; the dispatch short-circuits.
+        assert!(matching_watchpoint_events(&tile, 0, false).is_empty());
+        assert!(matching_watchpoint_events(&tile, 0xFFFF, true).is_empty());
+    }
+
+    #[test]
+    fn test_watchpoint_fire_runs_through_record_memory_access() {
+        // End-to-end: a programmed compute watchpoint must fire when a real
+        // scalar load executes through the cycle-accurate executor. We can't
+        // easily probe the trace_unit (it requires configuration to record),
+        // but we can verify fire_watchpoint_events runs without panicking and
+        // that the matching function reports the expected hit at the access
+        // address used by the executor.
+        let mut tile = Tile::compute(0, 2);
+        tile.registers.insert(0x14100, compute_wp(true, false, 0x100));
+        tile.write_data_u32(0x100, 0xDEADBEEF);
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x100);
+
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Word)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0))]);
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        // Spot-check the pure decision agrees that this access matches.
+        use xdna_archspec::aie2::trace_events::mem_events;
+        assert_eq!(matching_watchpoint_events(&tile, 0x100, false), vec![mem_events::WATCHPOINT_0]);
     }
 }
