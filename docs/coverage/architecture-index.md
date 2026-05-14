@@ -202,12 +202,11 @@ Remaining verifications:
 Order suggested by likely impact on current mode-2 divergences and
 upcoming Option 1 cycle-validation:
 
-1. **Multi-tile timer sync** — almost certainly behind anchor_pc / New_PC drift in mode-2 (#318/#321 family).
-2. **Bank conflict event-fire** — wires existing detection into event subsystem; cheap win.
-3. **Watchpoint hardware** — small register-state machine; needed for debugger work.
-4. **Error halt path** — wire `Error_Halt_Event` to the event bus from existing status sources.
-5. **Packet handler status** — expose existing control-packet processor state as a register.
-6. **Tile isolation gates** — gate the routing layer on isolation bits.
+1. **Bank conflict event-fire** — wires existing detection into event subsystem; cheap win.
+2. **Watchpoint hardware** — small register-state machine; needed for debugger work.
+3. **Error halt path** — wire `Error_Halt_Event` to the event bus from existing status sources.
+4. **Packet handler status** — expose existing control-packet processor state as a register.
+5. **Tile isolation gates** — gate the routing layer on isolation bits.
 
 Items 7+ in the gaps list above are deliberately deferred until pass 1
 deep-dives surface unforeseen interactions.
