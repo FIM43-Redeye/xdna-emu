@@ -391,4 +391,67 @@ mod tests {
             assert!(nbr.get_memory(dir).is_none(), "{:?} must be blocked when ALL_DIRECTIONS is set", dir);
         }
     }
+
+    /// Every cardinal bit individually gates ONLY its own direction. Sweeps
+    /// the matrix to lock in that the bit -> quadrant mapping in `is_blocked`
+    /// is one-to-one and doesn't accidentally collapse two dirs onto the
+    /// same bit.
+    #[test]
+    fn isolation_each_bit_gates_only_its_own_direction() {
+        use crate::device::tile::isolation as iso;
+        let device = crate::device::DeviceState::new_npu1();
+        let cases = [
+            (iso::SOUTH, MemoryQuadrant::South),
+            (iso::WEST, MemoryQuadrant::West),
+            (iso::NORTH, MemoryQuadrant::North),
+            (iso::EAST, MemoryQuadrant::East),
+        ];
+        for (bit, blocked_dir) in cases {
+            let mut nbr = NeighborMemory::new(1, 3);
+            nbr.set_isolation(bit);
+            // Blocked direction: ensure_snapshot is a no-op, get_memory is None.
+            nbr.ensure_snapshot(blocked_dir, &device);
+            assert!(nbr.get_memory(blocked_dir).is_none(), "bit 0x{bit:X} must block {blocked_dir:?}");
+            // All OTHER directions must still snapshot + read.
+            for other in
+                [MemoryQuadrant::South, MemoryQuadrant::West, MemoryQuadrant::North, MemoryQuadrant::East]
+            {
+                if other == blocked_dir {
+                    continue;
+                }
+                nbr.ensure_snapshot(other, &device);
+                assert!(nbr.get_memory(other).is_some(), "bit 0x{bit:X} must NOT block {other:?}");
+            }
+        }
+    }
+
+    /// Local memory access path is not gated by any isolation bit. AM025's
+    /// Tile_Control isolation only governs cross-tile transit; the executing
+    /// tile can always read/write its own memory.
+    #[test]
+    fn isolation_local_memory_unaffected_by_all_directions() {
+        use crate::device::tile::isolation as iso;
+        let mut nbr = NeighborMemory::new(1, 3);
+        nbr.set_isolation(iso::ALL_DIRECTIONS);
+        assert!(!nbr.is_blocked(MemoryQuadrant::Local), "Local must never be blocked");
+    }
+
+    /// Buffered writes survive end-to-end when their direction is not
+    /// isolated. Locks in that the gate is one-shot at buffer_write time
+    /// and does not poison the queue for unrelated directions.
+    #[test]
+    fn isolation_permitted_direction_writes_survive_partial_isolation() {
+        use crate::device::tile::isolation as iso;
+        let mut nbr = NeighborMemory::new(1, 3);
+        nbr.set_isolation(iso::SOUTH | iso::EAST);
+        // Two blocked dirs.
+        nbr.buffer_write(MemoryQuadrant::South, 0x100, &[0x11]);
+        nbr.buffer_write(MemoryQuadrant::East, 0x200, &[0x22]);
+        assert!(nbr.pending_writes.is_empty(), "blocked-dir writes must not buffer");
+
+        // Two permitted dirs.
+        nbr.buffer_write(MemoryQuadrant::West, 0x300, &[0x33]);
+        nbr.buffer_write(MemoryQuadrant::North, 0x400, &[0x44]);
+        assert_eq!(nbr.pending_writes.len(), 2, "permitted-dir writes must buffer");
+    }
 }

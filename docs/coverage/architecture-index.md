@@ -60,7 +60,7 @@ MemTile = mem tile (row 1 on NPU1), Shim = row 0.
 | Core control (enable / done / reset) | AM025 `Core_Control`, `Core_Status` | MODELED | `src/device/core_debug/` | enable, halt, done, reset paths |
 | Core debug (halt / step / breakpoint) | AM025 `Debug_*` | PARTIAL | `src/device/core_debug/` | Halt + status bits modeled; programmable breakpoints / single-step PC trap not wired through interpreter. |
 | Core error halt | AM025 `Error_Halt_Control` / `Error_Halt_Event` | MODELED | `src/device/core_debug/mod.rs:75`, `src/interpreter/core/interpreter.rs::raise_instr_error` | Generic `error_halt` path fires `INSTR_ERROR` (event 69) into core_trace + core_perf_counters at every CoreStatus::Error transition (decode failure, missing program memory, executor Error). Sets Core_Status bit 19. ECC errors still fire ECC_ERROR_STALL (bit 17) via `set_ecc_error`. Other error sources (saturation, watchdog) not yet detected. |
-| Watchpoint hardware (memory-address triggers) | AM025 Compute mem `WatchPoint0/1` (2) | MODELED | `src/interpreter/execute/cycle_accurate.rs::matching_watchpoint_events` | Compute slots at 0x14100/4 with `WriteStrobes==0xF` gate, direction filter (Read/Write bits 31/30), 16-byte-aligned 12-bit address comparator [15:4]. Fires `WATCHPOINT_0/1` (mem events 16/17) into mem_trace + mem_perf_counters on every matching scalar load/store. AXI/DMA/quadrant filters treated as wildcard for now (internal scalar path only); DMA-engine watchpoint hookup is follow-up work. Distinct from `XDNA_EMU_WATCH` env-var debug aid. |
+| Watchpoint hardware (memory-address triggers) | AM025 Compute mem `WatchPoint0/1` (2) | MODELED | `src/interpreter/execute/cycle_accurate.rs::matching_watchpoint_events` | Compute slots at 0x14100/4 with `WriteStrobes==0xF` gate, direction filter (Read/Write bits 31/30), 16-byte-aligned 12-bit address comparator [15:4]. Fires `WATCHPOINT_0/1` (mem events 16/17) into mem_trace + mem_perf_counters on every matching scalar load/store. **Scalar-only**: vector loads/stores skip the check (record_memory_access guards on `!op.is_vector`). **Wildcard filters**: AXI_Access [29], DMA_Access [28], and quadrant bits [27:24] are not consulted, so any matching direction+address fires. **Approximate address**: takes first pointer source's base+immediate offset, ignoring modifiers/post-increments. DMA-engine path and core-halt-on-hit are deferred. Distinct from `XDNA_EMU_WATCH` env-var debug aid. |
 | Data memory (64KB, banked) | aie-rt `memory/`, AM025 | MODELED | `src/device/banking.rs`, `src/interpreter/timing/memory.rs` | 8 banks × 128-bit, conflict detection done. |
 | Bank conflict events (intercore / intracore) | aietools events `MEM_CONFLICT_INTERCORE`, `_INTRACORE`, `DM_BANK_CONFLICT` | MODELED | `src/interpreter/execute/cycle_accurate.rs` | Per-bank `MEM_CONFLICT_DM_BANK_N` (events 77..84 compute / 112..120 memtile) fired into mem_trace + mem_perf_counters when scalar load/store conflict detected. INTERCORE/INTRACORE not modeled separately. |
 | ECC (data memory) | aie-rt `pm/xaie_ecc.c` | OUT_OF_SCOPE | — | Status bit readable; no scrubber, no fault injection. Document as OOS unless workloads require. |
@@ -89,7 +89,7 @@ MemTile = mem tile (row 1 on NPU1), Shim = row 0.
 | Performance counters (11 reg) | AM025 | MODELED | `src/device/perf_counters/` | |
 | Trace unit | AM025 | MODELED | `src/device/trace_unit/` | |
 | Timer | AM025 (5 reg) | MODELED | `src/device/timer.rs` | |
-| Watchpoint hardware (4 slots) | AM025 `WatchPoint0..3` | MODELED | `src/interpreter/execute/cycle_accurate.rs::matching_watchpoint_events` | 4 memtile slots at 0x94100..0x9410C with `WriteStrobes==0xF` gate, direction filter (Read/Write bits 29/28), 16-byte-aligned 15-bit address comparator [18:4] covering the full 512KB span. Fires `WATCHPOINT_0..3` (memtile events 16..19) into mem_trace + mem_perf_counters on every matching scalar load/store. |
+| Watchpoint hardware (4 slots) | AM025 `WatchPoint0..3` | MODELED | `src/interpreter/execute/cycle_accurate.rs::matching_watchpoint_events` | 4 memtile slots at 0x94100..0x9410C with `WriteStrobes==0xF` gate, direction filter (Read/Write bits 29/28), 16-byte-aligned 15-bit address comparator [18:4] covering the full 512KB span. Fires `WATCHPOINT_0..3` (memtile events 16..19) into mem_trace + mem_perf_counters on every matching scalar load/store. Same scalar-only / wildcard-filter / approximate-address constraints as the compute watchpoint row; AXI [27], DMA [26], and East/West neighbour-DMA bits [25:24] not consulted. |
 | Packet handler status | AM025 `Control_Packet_Handler_Status` | MODELED | `src/device/tile/mod.rs::pkt_handler_status` + `src/device/tile/registers.rs` reads + `src/device/state/effects.rs` write-1-to-clear | Sticky bits at 0x3FF30 (compute) / 0xB0F30 (memtile). Reassembler header-parse error sets `Second_Header_Parity_Error` (bit 1). `Tlast_Error` / `SLVERR_On_Access` / `ID_Parity_Error` not yet wired (no current path detects them). |
 | Memory_Control / Tile_Control / Module_Clock_Control | AM025 | PARTIAL | `src/device/registers.rs` | Layout parsed; behavior not interpreted. |
 
@@ -203,18 +203,50 @@ Pass 1 quick wins are all closed. Outstanding follow-ups inherited
 from those passes are queued below; promote any of them when impact
 warrants.
 
-Watchpoint follow-ups: DMA-engine watchpoint hookup
-(`record_memory_access` only covers scalar load/store today),
-AXI/quadrant filter bits (currently treated as wildcard for the
-internal scalar path), and optional core-halt wiring on watchpoint
-hit.
+Watchpoint follow-ups (status confirmed via 2026-05-14 deep-validation
+pass; field positions and event IDs cross-checked against AM025 +
+aie-rt and locked in by 17 unit tests):
+- **Vector loads/stores skip watchpoint** -- `record_memory_access` arm
+  guards on `if !op.is_vector`, so VLD/VST never fire `WATCHPOINT_N`.
+  HW comparator does see them. Easy to fix once the vector-path address
+  decoding is trusted; gating is one line.
+- **DMA-engine path doesn't fire watchpoints** -- DMA writes go through
+  `buffer_write` and the BD execution path, not `record_memory_access`.
+  Memtile DMA bank conflicts already wire through the engine; the
+  watchpoint hook would mirror that.
+- **Approximate address calculation** -- `record_memory_access` takes
+  the first pointer source's `base + immediate offset` only, ignoring
+  modifiers/post-increments. Adequate for bank-conflict tracking;
+  watchpoints inherit the same approximation and may report a hit on
+  the nominal pointer rather than the modified address.
+- **AXI_Access / DMA_Access filter bits unmodeled** -- AM025 fields
+  [29:28] (compute) / [27:26] (memtile) gate the slot to specific
+  initiator types. Today we treat any matching direction+address as a
+  hit regardless of these bits; effectively wildcard for the internal
+  scalar path.
+- **East/North/West/South_Access quadrant bits unmodeled** -- AM025
+  fields [27:24] gate on which neighbour quadrant initiated the access.
+  Same wildcard treatment as above.
+- **Core-halt-on-hit not wired** -- HW watchpoints can be configured to
+  halt the core on hit. We fire the trace event and bump the perf
+  counter but never assert a halt.
 
-Tile isolation follow-ups: shim Tile_Control isolation (privileged
-partition-boundary setup, not currently modeled), and a coordinator-
-level integration test that pins NeighborLocks gating end-to-end (the
-inline gate in `coordinator.rs` is mechanically simple and exercised
-indirectly by any cross-tile-locking bridge test, but a dedicated unit
-test would catch a future regression earlier).
+Tile isolation follow-ups (status confirmed via 2026-05-14 deep-
+validation pass; gate sites cross-checked against aie-rt
+`pm/xaie_tilectrl.c` semantics and locked in by 14 unit tests covering
+all 4 cardinal stream directions, all 4 NeighborMemory quadrants
+individually, partial-isolation mixing, local-not-blocked, and stale-
+snapshot eviction):
+- **Shim Tile_Control isolation unmodeled** -- privileged partition-
+  boundary setup; shim row 0 doesn't currently store an isolation byte
+  even though writes pass through register storage. Needed for full
+  partition-isolation simulation but not for any existing kernel.
+- **No coordinator-level NeighborLocks integration test** -- the inline
+  gate in `coordinator.rs` is mechanically simple and exercised
+  indirectly by any cross-tile-locking bridge test. A dedicated unit
+  test would catch future regressions earlier; deferred because it
+  requires bringing up a multi-tile Engine + DeviceState which is
+  heavier than the focused unit tests we have.
 
 Items 7+ in the gaps list above are deliberately deferred until pass 1
 deep-dives surface unforeseen interactions.

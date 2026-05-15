@@ -1446,4 +1446,91 @@ mod tests {
         use xdna_archspec::aie2::trace_events::mem_events;
         assert_eq!(matching_watchpoint_events(&tile, 0x100, false), vec![mem_events::WATCHPOINT_0]);
     }
+
+    #[test]
+    fn test_watchpoint_writestrobes_zero_inactive() {
+        // Default register state has WriteStrobes==0. Even with direction +
+        // address bits perfectly aligned, the slot must NOT fire. This is the
+        // most common "register cleared / never programmed" case.
+        let mut tile = Tile::compute(0, 2);
+        let cleared = (1u32 << 31) | 0x100; // Read=1, addr=0x100, WriteStrobes=0x0
+        tile.registers.insert(0x14100, cleared);
+        assert!(matching_watchpoint_events(&tile, 0x100, false).is_empty());
+    }
+
+    #[test]
+    fn test_watchpoint_writestrobes_partial_inactive() {
+        // Only 0xF (all four strobes set) marks the slot active. AM025 says
+        // "always set this field to 0xF when using this watchpoint" -- we treat
+        // any other value as inactive. Sweep a few partial values to lock in
+        // that interpretation.
+        let mut tile = Tile::compute(0, 2);
+        for partial in [0x1u32, 0x3, 0x7, 0xE] {
+            let value = (1u32 << 31) | (partial << 20) | 0x100;
+            tile.registers.insert(0x14100, value);
+            assert!(
+                matching_watchpoint_events(&tile, 0x100, false).is_empty(),
+                "WriteStrobes 0x{partial:X} must leave slot inactive"
+            );
+        }
+        // Sanity: 0xF alone DOES enable.
+        tile.registers.insert(0x14100, (1u32 << 31) | (0xFu32 << 20) | 0x100);
+        assert_eq!(
+            matching_watchpoint_events(&tile, 0x100, false).len(),
+            1,
+            "WriteStrobes 0xF must enable slot"
+        );
+    }
+
+    #[test]
+    fn test_watchpoint_compute_slot1_alone() {
+        // Slot 1 (offset 0x14104) fires WATCHPOINT_1 even when slot 0 is
+        // unprogrammed. Locks in that the index->event_id mapping is by slot
+        // position, not by which slot is the first non-empty one.
+        use xdna_archspec::aie2::trace_events::mem_events;
+        let mut tile = Tile::compute(0, 2);
+        tile.registers.insert(0x14104, compute_wp(true, false, 0x80));
+        assert_eq!(matching_watchpoint_events(&tile, 0x80, false), vec![mem_events::WATCHPOINT_1]);
+    }
+
+    #[test]
+    fn test_watchpoint_memtile_all_four_slots_independent() {
+        // Memtile has 4 slots producing WATCHPOINT_0..3. Program each at a
+        // distinct address; each access fires only its own slot.
+        use xdna_archspec::aie2::trace_events::memtile_events;
+        let mut tile = Tile::mem_tile(0, 1);
+        let slots = [
+            (0x94100u32, 0x100u32, memtile_events::WATCHPOINT_0),
+            (0x94104, 0x200, memtile_events::WATCHPOINT_1),
+            (0x94108, 0x300, memtile_events::WATCHPOINT_2),
+            (0x9410C, 0x400, memtile_events::WATCHPOINT_3),
+        ];
+        for (off, addr, _) in slots {
+            tile.registers.insert(off, memtile_wp(true, false, addr));
+        }
+        for (_, addr, expected_event) in slots {
+            assert_eq!(
+                matching_watchpoint_events(&tile, addr, false),
+                vec![expected_event],
+                "addr 0x{addr:X} must fire only event {expected_event}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_watchpoint_memtile_address_comparator_masks_high_bits() {
+        // Memtile comparator is 15-bit [18:4]. An access at 0x80010 has bit 19
+        // set -- that bit is OUTSIDE the comparator field, so the masked
+        // address is 0x10. A slot programmed for 0x10 should match such an
+        // aliased access. This is HW-defined (the comparator is intentionally
+        // narrower than the access address) and is what HW would do too.
+        use xdna_archspec::aie2::trace_events::memtile_events;
+        let mut tile = Tile::mem_tile(0, 1);
+        tile.registers.insert(0x94100, memtile_wp(true, false, 0x10));
+        // Direct match at 0x10.
+        assert_eq!(matching_watchpoint_events(&tile, 0x10, false), vec![memtile_events::WATCHPOINT_0]);
+        // Aliased access at 0x80010 (bit 19 set, low 19 bits == 0x10): also
+        // matches because the comparator only sees [18:4].
+        assert_eq!(matching_watchpoint_events(&tile, 0x80010, false), vec![memtile_events::WATCHPOINT_0]);
+    }
 }

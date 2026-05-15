@@ -1223,4 +1223,102 @@ mod isolation_tests {
             "WEST is the only bit that gates east-to-west; others must not block"
         );
     }
+
+    /// Helper for cardinal directions other than east. Pushes one word with
+    /// TLAST onto the chosen master at the source tile and returns the master
+    /// index used. The destination's slave index isn't returned here -- the
+    /// caller only inspects the source FIFO drain state.
+    fn seed_master_word(array: &mut TileArray, col: u8, row: u8, master_idx: usize) -> usize {
+        let src_idx = array.tile_index(col, row);
+        let pushed = array.tiles[src_idx].stream_switch.masters[master_idx].push_with_tlast(0xCAFEBABE, true);
+        assert!(pushed, "test setup: master[{master_idx}] must accept the seed word");
+        master_idx
+    }
+
+    /// North-bound (data flows row -> row+1) is incoming-from-south at the
+    /// destination, so dst.isolation = SOUTH must drop it. Without isolation
+    /// the source drains; with SOUTH set the source retains the word.
+    #[test]
+    fn north_bound_transfer_blocked_when_dst_isolates_south() {
+        let mut array = TileArray::npu1();
+        // Compute->Compute boundary: source at (col, row=2), dst at row=3.
+        let (col, src_row) = (1u8, 2u8);
+        let dst_idx = array.tile_index(col, src_row + 1);
+        let master_idx = compute_ranges::NORTH_MASTER_START as usize;
+
+        // Without isolation: drains.
+        seed_master_word(&mut array, col, src_row, master_idx);
+        array.propagate_inter_tile();
+        let src_idx = array.tile_index(col, src_row);
+        assert!(
+            array.tiles[src_idx].stream_switch.masters[master_idx].fifo.is_empty(),
+            "baseline: north-bound must drain when dst is unisolated"
+        );
+
+        // With dst.SOUTH set: blocked.
+        array.tiles[dst_idx].isolation = iso::SOUTH;
+        seed_master_word(&mut array, col, src_row, master_idx);
+        array.propagate_inter_tile();
+        assert_eq!(
+            array.tiles[src_idx].stream_switch.masters[master_idx].fifo.len(),
+            1,
+            "north-bound must be blocked by dst.SOUTH"
+        );
+    }
+
+    /// South-bound (data flows row -> row-1) is incoming-from-north at the
+    /// destination, so dst.isolation = NORTH must drop it.
+    #[test]
+    fn south_bound_transfer_blocked_when_dst_isolates_north() {
+        let mut array = TileArray::npu1();
+        // Compute->Compute boundary: source at (col, row=3), dst at row=2.
+        let (col, src_row) = (1u8, 3u8);
+        let dst_idx = array.tile_index(col, src_row - 1);
+        let master_idx = compute_ranges::SOUTH_MASTER_START as usize;
+
+        seed_master_word(&mut array, col, src_row, master_idx);
+        array.propagate_inter_tile();
+        let src_idx = array.tile_index(col, src_row);
+        assert!(
+            array.tiles[src_idx].stream_switch.masters[master_idx].fifo.is_empty(),
+            "baseline: south-bound must drain when dst is unisolated"
+        );
+
+        array.tiles[dst_idx].isolation = iso::NORTH;
+        seed_master_word(&mut array, col, src_row, master_idx);
+        array.propagate_inter_tile();
+        assert_eq!(
+            array.tiles[src_idx].stream_switch.masters[master_idx].fifo.len(),
+            1,
+            "south-bound must be blocked by dst.NORTH"
+        );
+    }
+
+    /// West-bound (data flows col -> col-1) is incoming-from-east at the
+    /// destination, so dst.isolation = EAST must drop it.
+    #[test]
+    fn west_bound_transfer_blocked_when_dst_isolates_east() {
+        let mut array = TileArray::npu1();
+        // Compute->Compute boundary: source at (col=2, row), dst at col=1.
+        let (src_col, row) = (2u8, 2u8);
+        let dst_idx = array.tile_index(src_col - 1, row);
+        let master_idx = compute_ranges::WEST_MASTER_START as usize;
+
+        seed_master_word(&mut array, src_col, row, master_idx);
+        array.propagate_inter_tile();
+        let src_idx = array.tile_index(src_col, row);
+        assert!(
+            array.tiles[src_idx].stream_switch.masters[master_idx].fifo.is_empty(),
+            "baseline: west-bound must drain when dst is unisolated"
+        );
+
+        array.tiles[dst_idx].isolation = iso::EAST;
+        seed_master_word(&mut array, src_col, row, master_idx);
+        array.propagate_inter_tile();
+        assert_eq!(
+            array.tiles[src_idx].stream_switch.masters[master_idx].fifo.len(),
+            1,
+            "west-bound must be blocked by dst.EAST"
+        );
+    }
 }
