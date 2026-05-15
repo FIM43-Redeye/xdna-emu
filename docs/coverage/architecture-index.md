@@ -210,10 +210,18 @@ aie-rt and locked in by 17 unit tests):
   guards on `if !op.is_vector`, so VLD/VST never fire `WATCHPOINT_N`.
   HW comparator does see them. Easy to fix once the vector-path address
   decoding is trusted; gating is one line.
-- **DMA-engine path doesn't fire watchpoints** -- DMA writes go through
-  `buffer_write` and the BD execution path, not `record_memory_access`.
-  Memtile DMA bank conflicts already wire through the engine; the
-  watchpoint hook would mirror that.
+- ~~**DMA-engine path doesn't fire watchpoints**~~ **FIXED 2026-05-14**
+  (task #68). `transfer_mm2s` and `transfer_s2mm` (incl. compressed and
+  decompressed variants) now call `fire_watchpoint_events_with_origin`
+  with `AccessOrigin::Dma` per word actually moved, after the data loop
+  ends so the borrow on `target_tile.data_memory[_mut]` is released.
+  Resolvers were widened to return `(MemTileTarget, &mut Tile, usize)`
+  so the firing path can branch on own-vs-neighbor; only the Own target
+  fires, since cross-tile neighbour-direction quadrant assignment is
+  task #69. Locked in by 10 unit tests covering S2MM/MM2S firing,
+  AXI-only filter exclusion, DMA-only filter inclusion, multi-word,
+  wrong direction, address mismatch, compressed MM2S, memtile own
+  window, and memtile West-window neighbour exclusion.
 - **Approximate address calculation** -- `record_memory_access` takes
   the first pointer source's `base + immediate offset` only, ignoring
   modifiers/post-increments. Adequate for bank-conflict tracking;
@@ -226,11 +234,10 @@ aie-rt and locked in by 17 unit tests):
   access origin must match one of the enabled bits; when all bits are
   zero, the slot is wildcard (any origin including Core fires). Core
   has no AM025 enable bit, so it never matches a non-zero filter --
-  consistent with HW. The DMA hookup (task #68) and cross-tile DMA
-  quadrant detection (task #69) are still outstanding -- those are the
-  consumers that will pass non-Core origins; today the only caller
-  passes Core, so the new filter logic is exercised only by tests.
-  But the semantics are pinned and ready.
+  consistent with HW. Task #68 (DMA hookup) is now done -- the DMA
+  engine passes `AccessOrigin::Dma` for own-tile traffic, exercising
+  the filter logic from a real caller. Cross-tile DMA quadrant
+  detection (task #69) is still outstanding for the Neighbour path.
 - ~~**East/North/West/South_Access quadrant bits unmodeled**~~ **FIXED
   2026-05-14** along with the above. Compute supports all four
   quadrants; memtile only has E/W per AM025, so Neighbour(North) and

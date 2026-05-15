@@ -777,7 +777,7 @@ fn test_mm2s_compression_sparse_data() {
     // Enable compression on MM2S channel 2
     engine.set_channel_compression_config(2, true, false, false);
 
-    let result = engine.transfer_mm2s(0, 32, 2, true, false, &tile, &NeighborTiles::empty());
+    let result = engine.transfer_mm2s(0, 32, 2, true, false, &mut tile, &mut NeighborTiles::empty());
     assert!(result);
 
     // mask + 1 data word (3 bytes + padding) = 2 stream words
@@ -795,11 +795,11 @@ fn test_mm2s_compression_sparse_data() {
 #[test]
 fn test_mm2s_compression_all_zeros() {
     let mut engine = DmaEngine::new_compute_tile(1, 2);
-    let tile = make_tile();
+    let mut tile = make_tile();
 
     engine.set_channel_compression_config(2, true, false, false);
 
-    let result = engine.transfer_mm2s(0, 32, 2, true, false, &tile, &NeighborTiles::empty());
+    let result = engine.transfer_mm2s(0, 32, 2, true, false, &mut tile, &mut NeighborTiles::empty());
     assert!(result);
 
     // All zeros: just mask word, no data
@@ -820,7 +820,7 @@ fn test_s2mm_decompression_round_trip() {
 
     // MM2S compress from offset 0
     engine.set_channel_compression_config(2, true, false, false);
-    let result = engine.transfer_mm2s(0, 32, 2, true, false, &tile, &NeighborTiles::empty());
+    let result = engine.transfer_mm2s(0, 32, 2, true, false, &mut tile, &mut NeighborTiles::empty());
     assert!(result);
 
     // Route compressed data from stream_out to stream_in (channel 0)
@@ -857,7 +857,7 @@ fn test_mm2s_no_compression_when_disabled() {
 
     assert!(!engine.is_compression_enabled(2));
 
-    let result = engine.transfer_mm2s(0, 4, 2, true, false, &tile, &NeighborTiles::empty());
+    let result = engine.transfer_mm2s(0, 4, 2, true, false, &mut tile, &mut NeighborTiles::empty());
     assert!(result);
 
     assert_eq!(engine.stream_out_len(), 1);
@@ -893,7 +893,7 @@ fn test_compression_multiple_blocks() {
 
     engine.set_channel_compression_config(2, true, false, false);
 
-    let result = engine.transfer_mm2s(0, 64, 2, true, false, &tile, &NeighborTiles::empty());
+    let result = engine.transfer_mm2s(0, 64, 2, true, false, &mut tile, &mut NeighborTiles::empty());
     assert!(result);
 
     // Block 0: mask + data = 2 words; Block 1: mask + data = 2 words
@@ -1938,4 +1938,269 @@ fn memtile_invalid_bd_channel_combination_returns_error() {
 
     let result = engine.start_channel_with_repeat(0, 24, 0);
     assert!(matches!(result, Err(DmaError::InvalidBd(24))), "expected InvalidBd(24), got {:?}", result);
+}
+
+// ---------------------------------------------------------------------------
+// DMA watchpoint hookup (task #68)
+//
+// AM025 watchpoint slots include AXI_Access / DMA_Access / quadrant filter
+// bits; #65 modelled the filter semantics, #68 wires the DMA engine to fire
+// the slot with `AccessOrigin::Dma` so a configured slot actually catches
+// DMA traffic. We probe firing via mem_perf_counters: a counter armed to
+// start on WATCHPOINT_N transitions to active iff the event is delivered.
+// ---------------------------------------------------------------------------
+
+/// Compute-tile WatchPoint register layout (mirrors the helper in
+/// cycle_accurate.rs tests). `dma` sets the DMA_Access filter bit (28).
+fn wp_compute(read: bool, write: bool, addr: u32, dma: bool, axi: bool) -> u32 {
+    let dir = ((read as u32) << 31) | ((write as u32) << 30);
+    let strobes = 0xFu32 << 20;
+    let mut v = dir | strobes | (addr & 0xFFF0);
+    if dma {
+        v |= 1 << 28;
+    }
+    if axi {
+        v |= 1 << 29;
+    }
+    v
+}
+
+fn wp_memtile(read: bool, write: bool, addr: u32, dma: bool, axi: bool) -> u32 {
+    let dir = ((read as u32) << 29) | ((write as u32) << 28);
+    let strobes = 0xFu32 << 20;
+    let mut v = dir | strobes | (addr & 0x7FFF0);
+    if dma {
+        v |= 1 << 26;
+    }
+    if axi {
+        v |= 1 << 27;
+    }
+    v
+}
+
+#[test]
+fn test_dma_s2mm_fires_watchpoint_on_own_tile() {
+    use xdna_archspec::aie2::trace_events::mem_events;
+
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+
+    // Wildcard slot 0 watching writes at offset 0x100.
+    tile.registers.insert(0x14100, wp_compute(false, true, 0x100, false, false));
+    // Counter 0 starts on WATCHPOINT_0; we verify by checking is_active().
+    tile.mem_perf_counters
+        .write_control_start_stop(mem_events::WATCHPOINT_0 as u32, 0, 1, 7);
+    assert!(!tile.mem_perf_counters.is_active(0), "counter must start idle");
+
+    // Push one stream word and drive a S2MM that writes 4 bytes at 0x100.
+    engine.push_stream_in(StreamData { data: 0xCAFEBABE, tlast: true, channel: 0 });
+    let result = engine.transfer_s2mm(0x100, 4, 0, &mut tile, &mut NeighborTiles::empty());
+    assert!(result.success);
+
+    assert!(tile.mem_perf_counters.is_active(0), "S2MM write at the watched address must fire WATCHPOINT_0");
+}
+
+#[test]
+fn test_dma_mm2s_fires_watchpoint_on_own_tile() {
+    use xdna_archspec::aie2::trace_events::mem_events;
+
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+
+    tile.write_data_u32(0x200, 0xFEEDF00D);
+    // Wildcard slot 0 watching reads at 0x200.
+    tile.registers.insert(0x14100, wp_compute(true, false, 0x200, false, false));
+    tile.mem_perf_counters
+        .write_control_start_stop(mem_events::WATCHPOINT_0 as u32, 0, 1, 7);
+
+    let ok = engine.transfer_mm2s(0x200, 4, 2, true, false, &mut tile, &mut NeighborTiles::empty());
+    assert!(ok);
+
+    assert!(tile.mem_perf_counters.is_active(0), "MM2S read at the watched address must fire WATCHPOINT_0");
+}
+
+#[test]
+fn test_dma_filter_excludes_axi_only() {
+    // Slot configured with ONLY the AXI filter bit must NOT fire on a DMA
+    // access -- the origin filter is non-zero, so the access origin must
+    // match one of the enabled bits, and DMA isn't enabled.
+    use xdna_archspec::aie2::trace_events::mem_events;
+
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+
+    tile.registers
+        .insert(0x14100, wp_compute(false, true, 0x100, /*dma=*/ false, /*axi=*/ true));
+    tile.mem_perf_counters
+        .write_control_start_stop(mem_events::WATCHPOINT_0 as u32, 0, 1, 7);
+
+    engine.push_stream_in(StreamData { data: 0x1, tlast: true, channel: 0 });
+    let result = engine.transfer_s2mm(0x100, 4, 0, &mut tile, &mut NeighborTiles::empty());
+    assert!(result.success);
+
+    assert!(
+        !tile.mem_perf_counters.is_active(0),
+        "AXI-only filter must exclude DMA accesses; counter should stay idle"
+    );
+}
+
+#[test]
+fn test_dma_filter_includes_dma_only() {
+    // Slot configured with ONLY the DMA filter bit must fire on a DMA
+    // access (and NOT on a Core access -- but the DMA engine only emits
+    // Dma origins, so we just check that the firing happens).
+    use xdna_archspec::aie2::trace_events::mem_events;
+
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+
+    tile.registers
+        .insert(0x14100, wp_compute(false, true, 0x100, /*dma=*/ true, /*axi=*/ false));
+    tile.mem_perf_counters
+        .write_control_start_stop(mem_events::WATCHPOINT_0 as u32, 0, 1, 7);
+
+    engine.push_stream_in(StreamData { data: 0x1, tlast: true, channel: 0 });
+    let result = engine.transfer_s2mm(0x100, 4, 0, &mut tile, &mut NeighborTiles::empty());
+    assert!(result.success);
+
+    assert!(tile.mem_perf_counters.is_active(0), "DMA-only filter must include DMA writes");
+}
+
+#[test]
+fn test_dma_mm2s_multi_word_fires_per_word() {
+    // A 16-byte MM2S read crosses 4 words within a single 16-byte comparator
+    // block; the slot fires per word, so we'd expect at least one firing
+    // (counter activation suffices to verify the wiring).
+    use xdna_archspec::aie2::trace_events::mem_events;
+
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+
+    for i in 0..4usize {
+        tile.write_data_u32(0x300 + i * 4, 0x1000_0000 | i as u32);
+    }
+    tile.registers.insert(0x14100, wp_compute(true, false, 0x300, false, false));
+    tile.mem_perf_counters
+        .write_control_start_stop(mem_events::WATCHPOINT_0 as u32, 0, 1, 7);
+
+    let ok = engine.transfer_mm2s(0x300, 16, 2, true, false, &mut tile, &mut NeighborTiles::empty());
+    assert!(ok);
+
+    assert!(tile.mem_perf_counters.is_active(0), "multi-word MM2S must fire WATCHPOINT_0 at least once");
+}
+
+#[test]
+fn test_dma_wrong_direction_does_not_fire() {
+    // Slot configured for Read only; a DMA write must not match.
+    use xdna_archspec::aie2::trace_events::mem_events;
+
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+
+    tile.registers
+        .insert(0x14100, wp_compute(/*read=*/ true, /*write=*/ false, 0x100, false, false));
+    tile.mem_perf_counters
+        .write_control_start_stop(mem_events::WATCHPOINT_0 as u32, 0, 1, 7);
+
+    engine.push_stream_in(StreamData { data: 0x1, tlast: true, channel: 0 });
+    let result = engine.transfer_s2mm(0x100, 4, 0, &mut tile, &mut NeighborTiles::empty());
+    assert!(result.success);
+
+    assert!(!tile.mem_perf_counters.is_active(0), "read-only slot must ignore DMA writes");
+}
+
+#[test]
+fn test_dma_address_mismatch_does_not_fire() {
+    // Slot at 0x100; DMA writes 0x200 -- no match.
+    use xdna_archspec::aie2::trace_events::mem_events;
+
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+
+    tile.registers.insert(0x14100, wp_compute(false, true, 0x100, false, false));
+    tile.mem_perf_counters
+        .write_control_start_stop(mem_events::WATCHPOINT_0 as u32, 0, 1, 7);
+
+    engine.push_stream_in(StreamData { data: 0x1, tlast: true, channel: 0 });
+    let result = engine.transfer_s2mm(0x200, 4, 0, &mut tile, &mut NeighborTiles::empty());
+    assert!(result.success);
+
+    assert!(!tile.mem_perf_counters.is_active(0), "address mismatch must leave WATCHPOINT_0 unfired");
+}
+
+#[test]
+fn test_dma_compressed_mm2s_fires_watchpoint() {
+    // Compressed MM2S reads tile memory through the same bank interface;
+    // the comparator should still see the source address range.
+    use xdna_archspec::aie2::trace_events::mem_events;
+
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+
+    tile.data_memory_mut()[0x100] = 0x42;
+    tile.data_memory_mut()[0x108] = 0x84;
+    tile.registers.insert(0x14100, wp_compute(true, false, 0x100, false, false));
+    tile.mem_perf_counters
+        .write_control_start_stop(mem_events::WATCHPOINT_0 as u32, 0, 1, 7);
+
+    engine.set_channel_compression_config(2, true, false, false);
+    let ok = engine.transfer_mm2s(0x100, 32, 2, true, false, &mut tile, &mut NeighborTiles::empty());
+    assert!(ok);
+
+    assert!(
+        tile.mem_perf_counters.is_active(0),
+        "compressed MM2S must still fire WATCHPOINT_0 (comparator is independent of compression)"
+    );
+}
+
+#[test]
+fn test_memtile_dma_own_window_fires_watchpoint() {
+    // MemTile WatchPoint 2 watching writes at offset 0x100; DMA writes to
+    // address 0x80100 (Own window, offset 0x100).
+    use xdna_archspec::aie2::trace_events::memtile_events;
+
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut tile = Tile::mem_tile(1, 1);
+
+    tile.registers.insert(0x94108, wp_memtile(false, true, 0x100, false, false));
+    tile.mem_perf_counters
+        .write_control_start_stop(memtile_events::WATCHPOINT_2 as u32, 0, 1, 7);
+
+    engine.push_stream_in(StreamData { data: 0xABAB, tlast: true, channel: 0 });
+    let result = engine.transfer_s2mm(0x80100, 4, 0, &mut tile, &mut NeighborTiles::empty());
+    assert!(result.success);
+
+    assert!(tile.mem_perf_counters.is_active(0), "memtile Own-window S2MM must fire WATCHPOINT_2");
+}
+
+#[test]
+fn test_memtile_dma_neighbor_window_does_not_fire_own_watchpoint() {
+    // Cross-tile (West/East) DMA is task #69. For #68, the firing path is
+    // own-tile only: a write through the West window should NOT fire the
+    // OWN tile's watchpoint. (The neighbour tile is absent in this test, so
+    // resolve_s2mm_target falls back to Own -- to test "really cross-tile",
+    // we'd need a populated NeighborTiles. With a present neighbour, the
+    // resolver returns West and the own tile must remain idle.)
+    use xdna_archspec::aie2::trace_events::memtile_events;
+
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut tile = Tile::mem_tile(1, 1);
+    let mut west = Tile::mem_tile(0, 1);
+
+    // Watch writes at offset 0x100 on BOTH tiles. Only the WEST tile should
+    // see the access (it's the resolved target); own should remain idle.
+    tile.registers.insert(0x94108, wp_memtile(false, true, 0x100, false, false));
+    tile.mem_perf_counters
+        .write_control_start_stop(memtile_events::WATCHPOINT_2 as u32, 0, 1, 7);
+
+    engine.push_stream_in(StreamData { data: 0xABAB, tlast: true, channel: 0 });
+    let mut neighbors = NeighborTiles { west: Some(&mut west), east: None };
+    // Address 0x100 is in the West window (window 0 = West for MemTile).
+    let result = engine.transfer_s2mm(0x100, 4, 0, &mut tile, &mut neighbors);
+    assert!(result.success);
+
+    assert!(
+        !tile.mem_perf_counters.is_active(0),
+        "cross-tile DMA must not fire the SOURCE tile's watchpoint (#69 covers neighbour-side firing)"
+    );
 }

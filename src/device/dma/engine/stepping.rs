@@ -1,6 +1,7 @@
 //! FSM execution: the `step()` method and all helper methods it calls.
 
 use super::*;
+use crate::interpreter::execute::cycle_accurate::{fire_watchpoint_events_with_origin, AccessOrigin};
 
 impl DmaEngine {
     /// Step the DMA engine by one cycle.
@@ -979,19 +980,27 @@ impl DmaEngine {
         &mut self,
         addr: u64,
         mem_size: usize,
-        own: &'a Tile,
-        neighbors: &'a NeighborTiles<'_>,
-    ) -> Option<(&'a Tile, usize)> {
+        own: &'a mut Tile,
+        neighbors: &'a mut NeighborTiles<'_>,
+    ) -> Option<(MemTileTarget, &'a mut Tile, usize)> {
         if !self.tile_kind.is_mem() {
-            return Some((own, (addr as usize) % mem_size));
+            return Some((MemTileTarget::Own, own, (addr as usize) % mem_size));
         }
         match MemTileTarget::resolve(addr, mem_size) {
-            Ok((MemTileTarget::Own, off)) => Some((own, off)),
+            Ok((MemTileTarget::Own, off)) => Some((MemTileTarget::Own, own, off)),
             Ok((MemTileTarget::West, off)) => {
-                Some(neighbors.west.as_deref().map(|t| (t, off)).unwrap_or((own, off)))
+                Some(neighbors.west.as_deref_mut().map(|t| (MemTileTarget::West, t, off)).unwrap_or((
+                    MemTileTarget::Own,
+                    own,
+                    off,
+                )))
             }
             Ok((MemTileTarget::East, off)) => {
-                Some(neighbors.east.as_deref().map(|t| (t, off)).unwrap_or((own, off)))
+                Some(neighbors.east.as_deref_mut().map(|t| (MemTileTarget::East, t, off)).unwrap_or((
+                    MemTileTarget::Own,
+                    own,
+                    off,
+                )))
             }
             Err(e) => {
                 let msg = format!(
@@ -1017,19 +1026,19 @@ impl DmaEngine {
         mem_size: usize,
         own: &'a mut Tile,
         neighbors: &'a mut NeighborTiles<'_>,
-    ) -> Option<(&'a mut Tile, usize)> {
+    ) -> Option<(MemTileTarget, &'a mut Tile, usize)> {
         if !self.tile_kind.is_mem() {
-            return Some((own, (addr as usize) % mem_size));
+            return Some((MemTileTarget::Own, own, (addr as usize) % mem_size));
         }
         match MemTileTarget::resolve(addr, mem_size) {
-            Ok((MemTileTarget::Own, off)) => Some((own, off)),
+            Ok((MemTileTarget::Own, off)) => Some((MemTileTarget::Own, own, off)),
             Ok((MemTileTarget::West, off)) => Some(match neighbors.west.as_deref_mut() {
-                Some(t) => (t, off),
-                None => (own, off),
+                Some(t) => (MemTileTarget::West, t, off),
+                None => (MemTileTarget::Own, own, off),
             }),
             Ok((MemTileTarget::East, off)) => Some(match neighbors.east.as_deref_mut() {
-                Some(t) => (t, off),
-                None => (own, off),
+                Some(t) => (MemTileTarget::East, t, off),
+                None => (MemTileTarget::Own, own, off),
             }),
             Err(e) => {
                 let msg = format!(
@@ -1058,18 +1067,19 @@ impl DmaEngine {
         channel: u8,
         is_last: bool,
         tlast_suppress: bool,
-        tile: &Tile,
-        neighbors: &NeighborTiles<'_>,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
     ) -> bool {
         let mem_size = tile.data_memory().len();
 
         // Resolve target tile and offset.
         // MemTile uses the windowed (West/Own/East) address space; non-MemTile
         // tiles wrap at mem_size.
-        let (target_tile, offset) = match self.resolve_mm2s_target(addr, mem_size, tile, neighbors) {
-            Some(r) => r,
-            None => return false,
-        };
+        let (target_kind, target_tile, offset) =
+            match self.resolve_mm2s_target(addr, mem_size, tile, neighbors) {
+                Some(r) => r,
+                None => return false,
+            };
 
         // Record bank access for conflict detection (offset is local to the target tile)
         self.cycle_dma_banks |=
@@ -1085,13 +1095,21 @@ impl DmaEngine {
             return false;
         }
 
-        let data = target_tile.data_memory();
-
         // When compression is enabled, read 32-byte blocks and compress each one.
         // Compressed output (mask + packed non-zero bytes) is pushed as 32-bit stream words.
         if self.is_compression_enabled(channel) {
-            return self.transfer_mm2s_compressed(data, offset, bytes, channel, is_last, tlast_suppress);
+            return self.transfer_mm2s_compressed(
+                target_tile,
+                target_kind,
+                offset,
+                bytes,
+                channel,
+                is_last,
+                tlast_suppress,
+            );
         }
+
+        let data = target_tile.data_memory();
 
         // Uncompressed path: read data from tile memory in 32-bit words
         let word_count = (bytes + 3) / 4;
@@ -1158,6 +1176,27 @@ impl DmaEngine {
                 .push_back(StreamData { data: word, tlast: should_assert_tlast, channel });
         }
 
+        // Fire WATCHPOINT_N events on the target tile for each word the DMA
+        // read. The HW comparator sits at the bank interface and sees DMA
+        // traffic the same as core traffic; AM025 distinguishes them via the
+        // DMA_Access filter bit. Cross-tile (West/East neighbour) access uses
+        // a Neighbour origin -- task #69 -- so we only fire on own-tile reads
+        // here.
+        let cycle = self.current_cycle;
+        if matches!(target_kind, MemTileTarget::Own) {
+            for i in 0..word_count {
+                let word_addr = (offset + i * 4) as u32;
+                fire_watchpoint_events_with_origin(
+                    target_tile,
+                    word_addr,
+                    false,
+                    cycle,
+                    None,
+                    AccessOrigin::Dma,
+                );
+            }
+        }
+
         true
     }
 
@@ -1169,7 +1208,8 @@ impl DmaEngine {
     /// stream words.
     fn transfer_mm2s_compressed(
         &mut self,
-        data: &[u8],
+        target_tile: &mut Tile,
+        target_kind: MemTileTarget,
         offset: usize,
         bytes: usize,
         channel: u8,
@@ -1191,6 +1231,7 @@ impl DmaEngine {
 
         for block_idx in 0..num_blocks {
             let block_start = offset + block_idx * BLOCK_SIZE;
+            let data = target_tile.data_memory();
             let block_end = (block_start + BLOCK_SIZE).min(offset + bytes).min(data.len());
             let block_len = block_end - block_start;
 
@@ -1241,6 +1282,25 @@ impl DmaEngine {
             }
         }
 
+        // Fire WATCHPOINT_N events per word covered by the source range -- the
+        // bank comparator sees the same byte addresses regardless of compression.
+        // Cross-tile (#69) is out of scope; only own-tile reads fire here.
+        let cycle = self.current_cycle;
+        if matches!(target_kind, MemTileTarget::Own) {
+            let word_count = (bytes + 3) / 4;
+            for i in 0..word_count {
+                let word_addr = (offset + i * 4) as u32;
+                fire_watchpoint_events_with_origin(
+                    target_tile,
+                    word_addr,
+                    false,
+                    cycle,
+                    None,
+                    AccessOrigin::Dma,
+                );
+            }
+        }
+
         true
     }
 
@@ -1261,7 +1321,9 @@ impl DmaEngine {
         // Resolve target tile and offset.
         // MemTile uses the windowed (West/Own/East) address space; non-MemTile
         // tiles wrap at mem_size.
-        let (target_tile, offset) = match self.resolve_s2mm_target(addr, mem_size, tile, neighbors) {
+        let (target_kind, target_tile, offset) = match self
+            .resolve_s2mm_target(addr, mem_size, tile, neighbors)
+        {
             Some(r) => r,
             None => {
                 return S2mmResult { success: false, stall: false, tlast_received: false, bytes_written: 0 }
@@ -1288,7 +1350,7 @@ impl DmaEngine {
             // Bank is touched only when we actually consume from the stream.
             self.cycle_dma_banks |=
                 crate::device::banking::banks_for_access(offset as u32, bytes, self.num_banks);
-            return self.transfer_s2mm_decompressed(offset, bytes, channel, target_tile);
+            return self.transfer_s2mm_decompressed(offset, bytes, channel, target_kind, target_tile);
         }
 
         // Uncompressed path: the DMA bus transfers atomically -- all words
@@ -1379,6 +1441,26 @@ impl DmaEngine {
             };
         }
 
+        // Fire WATCHPOINT_N events for each word actually written. The bank
+        // comparator sees writes through the same path as core stores; AM025
+        // distinguishes them via the DMA_Access filter bit. Cross-tile (#69)
+        // writes are scoped out -- only own-tile here.
+        let cycle = self.current_cycle;
+        if matches!(target_kind, MemTileTarget::Own) {
+            let words_written = bytes_written / 4;
+            for i in 0..words_written {
+                let word_addr = (offset + i * 4) as u32;
+                fire_watchpoint_events_with_origin(
+                    target_tile,
+                    word_addr,
+                    true,
+                    cycle,
+                    None,
+                    AccessOrigin::Dma,
+                );
+            }
+        }
+
         S2mmResult { success: true, stall: false, tlast_received, bytes_written }
     }
 
@@ -1396,6 +1478,7 @@ impl DmaEngine {
         offset: usize,
         bytes: usize,
         channel: u8,
+        target_kind: MemTileTarget,
         target_tile: &mut Tile,
     ) -> S2mmResult {
         const BLOCK_SIZE: usize = 32;
@@ -1484,6 +1567,24 @@ impl DmaEngine {
             if got_tlast {
                 tlast_received = true;
                 break;
+            }
+        }
+
+        // Fire WATCHPOINT_N events per word actually written. Cross-tile (#69)
+        // is out of scope -- only own-tile decompressed S2MM fires here.
+        let cycle = self.current_cycle;
+        if matches!(target_kind, MemTileTarget::Own) {
+            let words_written = mem_bytes_written / 4;
+            for i in 0..words_written {
+                let word_addr = (offset + i * 4) as u32;
+                fire_watchpoint_events_with_origin(
+                    target_tile,
+                    word_addr,
+                    true,
+                    cycle,
+                    None,
+                    AccessOrigin::Dma,
+                );
             }
         }
 

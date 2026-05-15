@@ -321,8 +321,9 @@ fn fire_bank_conflict_events(tile: &mut Tile, banks_mask: u8, cycle: u64, pc: u3
 /// origin filter bits ([29:24] compute / [27:24] memtile) are all zero,
 /// the slot fires regardless of origin (wildcard); when any are set, the
 /// access origin must match one of the enabled bits.
-// Variants other than `Core` aren't consumed by any caller yet; they wait
-// on the DMA-engine watchpoint hookup (task #68). Suppress until then.
+// `Axi` and `Neighbour` aren't consumed by any caller yet; `Dma` is wired
+// from the DMA engine (task #68), `Neighbour` waits on cross-tile DMA
+// quadrant detection (task #69).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessOrigin {
@@ -437,6 +438,7 @@ fn origin_required_bit(origin: AccessOrigin, layout: &WatchpointLayout) -> Optio
 /// access at `addr` with direction `is_write`. Convenience wrapper for
 /// the common case; for non-Core origins, see
 /// [`matching_watchpoint_events_with_origin`].
+#[cfg(test)]
 fn matching_watchpoint_events(tile: &Tile, addr: u32, is_write: bool) -> Vec<u8> {
     matching_watchpoint_events_with_origin(tile, addr, is_write, AccessOrigin::Core)
 }
@@ -498,14 +500,29 @@ fn matching_watchpoint_events_with_origin(
 /// Fire WATCHPOINT_N events into the mem-module trace unit and perf counters
 /// for every WatchPoint slot that matches this access. Compute and memtile
 /// have different bit layouts (`watchpoint_layout`); shim tiles have no
-/// watchpoint registers and short-circuit.
+/// watchpoint registers and short-circuit. Convenience wrapper for the
+/// Core-origin path (scalar and vector loads/stores).
 fn fire_watchpoint_events(tile: &mut Tile, addr: u32, is_write: bool, cycle: u64, pc: u32) {
-    let events = matching_watchpoint_events(tile, addr, is_write);
+    fire_watchpoint_events_with_origin(tile, addr, is_write, cycle, Some(pc), AccessOrigin::Core);
+}
+
+/// Same as [`fire_watchpoint_events`] but with an explicit access origin and
+/// optional PC. Used by the DMA engine (task #68) to fire WATCHPOINT_N with
+/// `AccessOrigin::Dma` and no PC (DMA accesses are external to the core).
+pub(crate) fn fire_watchpoint_events_with_origin(
+    tile: &mut Tile,
+    addr: u32,
+    is_write: bool,
+    cycle: u64,
+    pc: Option<u32>,
+    origin: AccessOrigin,
+) {
+    let events = matching_watchpoint_events_with_origin(tile, addr, is_write, origin);
     for event_id in events {
         // Route through notify_mem_trace_event so trace + timer + edge
         // detector + debug-halt check all see the event. Perf counters
         // aren't on that path so we tick them explicitly.
-        tile.notify_mem_trace_event(event_id, cycle, Some(pc));
+        tile.notify_mem_trace_event(event_id, cycle, pc);
         tile.mem_perf_counters.handle_event(event_id);
     }
 }
