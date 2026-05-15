@@ -102,11 +102,53 @@ const DBG_CTRL0_SSTEP_COUNT_LSB: u32 = 2;
 const DBG_CTRL0_SSTEP_COUNT_MASK: u32 = 0xF << DBG_CTRL0_SSTEP_COUNT_LSB;
 
 // ---------------------------------------------------------------------------
+// Debug_Control1 bit positions (per AM025)
+// ---------------------------------------------------------------------------
+
+/// Bits [6:0]: resume event ID (clears halt when fired).
+const DBG_CTRL1_RESUME_EVENT_LSB: u32 = 0;
+const DBG_CTRL1_EVENT_MASK: u32 = 0x7F;
+/// Bits [14:8]: single-step event ID (advances one bundle on fire).
+/// Reserved for future single-step-on-event support; not currently consumed.
+#[allow(dead_code)]
+const DBG_CTRL1_SSTEP_EVENT_LSB: u32 = 8;
+/// Bits [22:16]: halt event 0 ID.
+const DBG_CTRL1_HALT_EVENT0_LSB: u32 = 16;
+/// Bits [30:24]: halt event 1 ID.
+const DBG_CTRL1_HALT_EVENT1_LSB: u32 = 24;
+
+// ---------------------------------------------------------------------------
+// Debug_Control2 bit positions (per AM025; stall-to-halt enables)
+// ---------------------------------------------------------------------------
+
+/// Bit 0: halt on PC event hit (requires PC_Event* registers; not modeled).
+#[allow(dead_code)]
+const DBG_CTRL2_PC_EVENT_HALT_LSB: u32 = 0;
+/// Bit 1: halt on memory stall.
+const DBG_CTRL2_MEM_STALL_HALT_LSB: u32 = 1;
+/// Bit 2: halt on lock stall.
+const DBG_CTRL2_LOCK_STALL_HALT_LSB: u32 = 2;
+/// Bit 3: halt on stream stall.
+const DBG_CTRL2_STREAM_STALL_HALT_LSB: u32 = 3;
+
+// ---------------------------------------------------------------------------
 // Debug_Status bit positions
 // ---------------------------------------------------------------------------
 
-/// Bit 0: halted by debug halt request.
+/// Bit 0: halted by debug halt request (any cause).
 const DBG_STS_HALTED_LSB: u32 = 0;
+/// Bit 1: halted due to PC event.
+const DBG_STS_PC_EVENT_HALTED_LSB: u32 = 1;
+/// Bit 2: halted due to memory stall.
+const DBG_STS_MEM_STALL_HALTED_LSB: u32 = 2;
+/// Bit 3: halted due to lock stall.
+const DBG_STS_LOCK_STALL_HALTED_LSB: u32 = 3;
+/// Bit 4: halted due to stream stall.
+const DBG_STS_STREAM_STALL_HALTED_LSB: u32 = 4;
+/// Bit 5: halted due to Debug_Halt_Core_Event0.
+const DBG_STS_EVENT0_HALTED_LSB: u32 = 5;
+/// Bit 6: halted due to Debug_Halt_Core_Event1.
+const DBG_STS_EVENT1_HALTED_LSB: u32 = 6;
 
 /// 20-bit address mask for PC, SP, and LR values.
 const ADDR_MASK_20BIT: u32 = 0x000F_FFFF;
@@ -174,6 +216,21 @@ pub struct CoreDebugState {
     pub(super) debug_ctrl1: u32,
     // -- Debug_Control2 raw value (stall-to-halt enables) --
     pub(super) debug_ctrl2: u32,
+
+    // -- Halt-cause latches (Debug_Status bits 1-6) --
+    /// Set when a configured PC event triggered the halt. Not currently
+    /// driven (PC_Event registers aren't modeled).
+    pub(super) halt_cause_pc_event: bool,
+    /// Set when memory stall + Debug_Control2.MEM_STALL_HALT triggered halt.
+    pub(super) halt_cause_mem_stall: bool,
+    /// Set when lock stall + Debug_Control2.LOCK_STALL_HALT triggered halt.
+    pub(super) halt_cause_lock_stall: bool,
+    /// Set when stream stall + Debug_Control2.STREAM_STALL_HALT triggered halt.
+    pub(super) halt_cause_stream_stall: bool,
+    /// Set when an event matching Debug_Halt_Core_Event0 fired.
+    pub(super) halt_cause_event0: bool,
+    /// Set when an event matching Debug_Halt_Core_Event1 fired.
+    pub(super) halt_cause_event1: bool,
 }
 
 impl Default for CoreDebugState {
@@ -199,6 +256,12 @@ impl Default for CoreDebugState {
             lr: 0,
             debug_ctrl1: 0,
             debug_ctrl2: 0,
+            halt_cause_pc_event: false,
+            halt_cause_mem_stall: false,
+            halt_cause_lock_stall: false,
+            halt_cause_stream_stall: false,
+            halt_cause_event0: false,
+            halt_cause_event1: false,
         }
     }
 }
@@ -384,6 +447,9 @@ impl CoreDebugState {
         self.lock_stall = lock;
         self.stream_stall = stream;
         self.cascade_stall = cascade;
+        // Re-evaluate stall-halt enables: a stall going hot with the
+        // matching Debug_Control2 bit set must immediately trigger halt.
+        self.check_stall_halt();
     }
 
     // -----------------------------------------------------------------------
@@ -462,6 +528,89 @@ impl CoreDebugState {
     }
 
     // -----------------------------------------------------------------------
+    // Event-driven halt (Debug_Control1 / Debug_Control2)
+    // -----------------------------------------------------------------------
+
+    /// Decoded Debug_Halt_Core_Event0 from Debug_Control1 [22:16].
+    fn debug_halt_event0(&self) -> u8 {
+        ((self.debug_ctrl1 >> DBG_CTRL1_HALT_EVENT0_LSB) & DBG_CTRL1_EVENT_MASK) as u8
+    }
+
+    /// Decoded Debug_Halt_Core_Event1 from Debug_Control1 [30:24].
+    fn debug_halt_event1(&self) -> u8 {
+        ((self.debug_ctrl1 >> DBG_CTRL1_HALT_EVENT1_LSB) & DBG_CTRL1_EVENT_MASK) as u8
+    }
+
+    /// Decoded Debug_Resume_Core_Event from Debug_Control1 [6:0].
+    fn debug_resume_event(&self) -> u8 {
+        ((self.debug_ctrl1 >> DBG_CTRL1_RESUME_EVENT_LSB) & DBG_CTRL1_EVENT_MASK) as u8
+    }
+
+    /// Notify the debug subsystem that an event has fired. If the event
+    /// matches a configured Debug_Halt_Core_EventN, halts the core and
+    /// latches the corresponding Debug_Status cause bit. If it matches
+    /// Debug_Resume_Core_Event, resumes the core and clears all latched
+    /// cause bits.
+    ///
+    /// AM025 Debug_Control1 encodes 7-bit event IDs; event 0 is the
+    /// EVENT_NONE sentinel and never matches (mirrors aie-rt's event-0 =
+    /// disabled convention). Tile-level dispatchers (notify_*_trace_event)
+    /// already short-circuit on event_id 0, but we double-check here so
+    /// direct callers can't accidentally trigger halts on unconfigured
+    /// slots.
+    pub fn check_event_halt(&mut self, event_id: u8) {
+        if event_id == 0 {
+            return;
+        }
+        let halt_e0 = self.debug_halt_event0();
+        let halt_e1 = self.debug_halt_event1();
+        let resume_e = self.debug_resume_event();
+        if halt_e0 != 0 && event_id == halt_e0 {
+            self.halt_cause_event0 = true;
+            self.request_halt();
+        }
+        if halt_e1 != 0 && event_id == halt_e1 {
+            self.halt_cause_event1 = true;
+            self.request_halt();
+        }
+        if resume_e != 0 && event_id == resume_e {
+            self.clear_halt_causes();
+            self.request_resume();
+        }
+    }
+
+    /// Consult Debug_Control2 stall-halt enables and trigger halt if any
+    /// enabled stall condition is currently active. Called from
+    /// `update_stalls` so every stall-state update gets re-evaluated.
+    /// PC_Event_Halt (bit 0) requires PC_Event* register modeling and is
+    /// not currently driven.
+    fn check_stall_halt(&mut self) {
+        let ctrl2 = self.debug_ctrl2;
+        if (ctrl2 >> DBG_CTRL2_MEM_STALL_HALT_LSB) & 1 != 0 && self.mem_stall {
+            self.halt_cause_mem_stall = true;
+            self.request_halt();
+        }
+        if (ctrl2 >> DBG_CTRL2_LOCK_STALL_HALT_LSB) & 1 != 0 && self.lock_stall {
+            self.halt_cause_lock_stall = true;
+            self.request_halt();
+        }
+        if (ctrl2 >> DBG_CTRL2_STREAM_STALL_HALT_LSB) & 1 != 0 && self.stream_stall {
+            self.halt_cause_stream_stall = true;
+            self.request_halt();
+        }
+    }
+
+    /// Clear all halt-cause latches (called on resume).
+    fn clear_halt_causes(&mut self) {
+        self.halt_cause_pc_event = false;
+        self.halt_cause_mem_stall = false;
+        self.halt_cause_lock_stall = false;
+        self.halt_cause_stream_stall = false;
+        self.halt_cause_event0 = false;
+        self.halt_cause_event1 = false;
+    }
+
+    // -----------------------------------------------------------------------
     // Debug_Control0 register interface
     // -----------------------------------------------------------------------
 
@@ -493,14 +642,33 @@ impl CoreDebugState {
     // Debug_Status register (read-only)
     // -----------------------------------------------------------------------
 
-    /// Read Debug_Status. Shows which halt cause is active.
+    /// Read Debug_Status. Bit 0 is the aggregate "any halt" indicator;
+    /// bits 1-6 are per-cause latches (PC event, mem/lock/stream stall,
+    /// Event0, Event1) that survive until the next resume clears them.
+    /// Per AM025 Debug_Status field layout.
     pub(super) fn read_debug_status(&self) -> u32 {
         let mut val = 0u32;
         if self.halted {
             val |= 1 << DBG_STS_HALTED_LSB;
         }
-        // Additional halt causes would be set here if we track them.
-        // For now, only the direct debug halt is modeled.
+        if self.halt_cause_pc_event {
+            val |= 1 << DBG_STS_PC_EVENT_HALTED_LSB;
+        }
+        if self.halt_cause_mem_stall {
+            val |= 1 << DBG_STS_MEM_STALL_HALTED_LSB;
+        }
+        if self.halt_cause_lock_stall {
+            val |= 1 << DBG_STS_LOCK_STALL_HALTED_LSB;
+        }
+        if self.halt_cause_stream_stall {
+            val |= 1 << DBG_STS_STREAM_STALL_HALTED_LSB;
+        }
+        if self.halt_cause_event0 {
+            val |= 1 << DBG_STS_EVENT0_HALTED_LSB;
+        }
+        if self.halt_cause_event1 {
+            val |= 1 << DBG_STS_EVENT1_HALTED_LSB;
+        }
         val
     }
 

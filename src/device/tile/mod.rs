@@ -689,6 +689,10 @@ impl Tile {
                 det.curr_active = true;
             }
         }
+        // Debug halt: if Debug_Control1 has this event configured as a halt
+        // trigger, request_halt and latch the cause bit. No-op when no
+        // debug halt is configured (event-0 fields).
+        self.core_debug.check_event_halt(hw_id);
     }
 
     /// Notify a memory module event for both tracing and edge detection.
@@ -713,6 +717,17 @@ impl Tile {
             if det.input_event != 0 && det.input_event == hw_id {
                 det.curr_active = true;
             }
+        }
+        // Debug halt: on compute tiles, the memory module shares its tile
+        // with a core, and AM025 lets a memory-module event broadcast to
+        // the core's debug halt selector. We approximate that path by
+        // calling check_event_halt directly here -- skipping the broadcast
+        // routing simplification is OK because the user-visible result
+        // (event N triggers halt when Debug_Halt_Core_EventX == N) is the
+        // same. Memtile and shim tiles have no core to halt, so this
+        // branch is compute-only.
+        if self.is_compute() {
+            self.core_debug.check_event_halt(hw_id);
         }
     }
 

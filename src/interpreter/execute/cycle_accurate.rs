@@ -304,7 +304,9 @@ fn fire_bank_conflict_events(tile: &mut Tile, banks_mask: u8, cycle: u64, pc: u3
     for bank in 0..8u8 {
         if banks_mask & (1 << bank) != 0 {
             let event_id = base + bank;
-            tile.mem_trace.notify_event(event_id, cycle, Some(pc));
+            // Same routing rationale as fire_watchpoint_events: dispatcher
+            // for trace + timer + edge + halt; perf counters separately.
+            tile.notify_mem_trace_event(event_id, cycle, Some(pc));
             tile.mem_perf_counters.handle_event(event_id);
         }
     }
@@ -390,7 +392,10 @@ fn matching_watchpoint_events(tile: &Tile, addr: u32, is_write: bool) -> Vec<u8>
 fn fire_watchpoint_events(tile: &mut Tile, addr: u32, is_write: bool, cycle: u64, pc: u32) {
     let events = matching_watchpoint_events(tile, addr, is_write);
     for event_id in events {
-        tile.mem_trace.notify_event(event_id, cycle, Some(pc));
+        // Route through notify_mem_trace_event so trace + timer + edge
+        // detector + debug-halt check all see the event. Perf counters
+        // aren't on that path so we tick them explicitly.
+        tile.notify_mem_trace_event(event_id, cycle, Some(pc));
         tile.mem_perf_counters.handle_event(event_id);
     }
 }
@@ -1520,6 +1525,41 @@ mod tests {
                 "addr 0x{addr:X} must fire only event {expected_event}"
             );
         }
+    }
+
+    #[test]
+    fn test_watchpoint_halt_via_debug_control1_event0() {
+        // End-to-end: a watchpoint configured to fire WATCHPOINT_0 (mem
+        // event 16), with Debug_Control1.Debug_Halt_Core_Event0 = 16,
+        // must halt the core when the load executes.
+        use xdna_archspec::aie2::trace_events::mem_events;
+        let mut tile = Tile::compute(0, 2);
+        // Program watchpoint at 0x100 for reads.
+        tile.registers.insert(0x14100, compute_wp(true, false, 0x100));
+        tile.write_data_u32(0x100, 0xCAFED00D);
+        // Configure Debug_Control1.Debug_Halt_Core_Event0 = WATCHPOINT_0 (16).
+        // Field at bits [22:16].
+        let halt_e0 = (mem_events::WATCHPOINT_0 as u32) << 16;
+        tile.core_debug.write_register(0x32014, halt_e0);
+        // Core must be enabled for request_halt to take effect.
+        tile.core_debug.write_register(0x32000, 1);
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x100);
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Word)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0))]);
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        assert!(
+            tile.core_debug.is_halted(),
+            "watchpoint event must trigger debug halt via Debug_Control1.Event0"
+        );
+        // Debug_Status[5] (Event0_Halted) must be latched.
+        let status = tile.core_debug.read_register(0x3201C).unwrap();
+        assert_ne!(status & (1 << 5), 0, "Debug_Status[5] Event0 cause latch");
     }
 
     #[test]

@@ -616,3 +616,158 @@ fn status_register_combined_bits() {
     assert_eq!(status & (1 << STATUS_STREAM_STALL_SS0_LSB), 0);
     assert_eq!(status & (1 << STATUS_CASCADE_STALL_SCD_LSB), 0);
 }
+
+// ----------------------------------------------------------------------
+// Event-driven debug halt (Debug_Control1 / Debug_Control2 / Debug_Status)
+// ----------------------------------------------------------------------
+
+/// Build a Debug_Control1 value with the given event IDs in their fields.
+fn make_dbg_ctrl1(resume: u8, sstep: u8, event0: u8, event1: u8) -> u32 {
+    ((resume as u32) & 0x7F)
+        | (((sstep as u32) & 0x7F) << 8)
+        | (((event0 as u32) & 0x7F) << 16)
+        | (((event1 as u32) & 0x7F) << 24)
+}
+
+#[test]
+fn check_event_halt_no_config_does_not_halt() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.halted = false;
+    // debug_ctrl1 left at 0 -- all event IDs are 0, the EVENT_NONE
+    // sentinel. No event should ever halt.
+    state.check_event_halt(16);
+    state.check_event_halt(42);
+    assert!(!state.is_halted(), "no halt event configured -> no halt");
+}
+
+#[test]
+fn check_event_halt_event0_match_halts_and_latches_cause() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 0, 16, 0); // Event0 = 16 (WATCHPOINT_0)
+    state.check_event_halt(16);
+    assert!(state.is_halted(), "event 16 must trigger halt via Event0");
+    let status = state.read_debug_status();
+    assert_ne!(status & (1 << DBG_STS_HALTED_LSB), 0, "Debug_Status[0] aggregate halt bit");
+    assert_ne!(status & (1 << DBG_STS_EVENT0_HALTED_LSB), 0, "Debug_Status[5] Event0 cause latch");
+    // Other cause bits must remain clear.
+    assert_eq!(status & (1 << DBG_STS_EVENT1_HALTED_LSB), 0);
+    assert_eq!(status & (1 << DBG_STS_MEM_STALL_HALTED_LSB), 0);
+}
+
+#[test]
+fn check_event_halt_event1_match_halts_and_latches_cause() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 0, 0, 28); // Event1 = 28 (ACTIVE_CORE)
+    state.check_event_halt(28);
+    assert!(state.is_halted());
+    let status = state.read_debug_status();
+    assert_ne!(status & (1 << DBG_STS_EVENT1_HALTED_LSB), 0, "Event1 cause latch");
+    assert_eq!(status & (1 << DBG_STS_EVENT0_HALTED_LSB), 0, "Event0 must stay clear");
+}
+
+#[test]
+fn check_event_halt_unrelated_event_does_not_halt() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 0, 16, 0);
+    state.check_event_halt(17); // Adjacent event ID; must not match.
+    assert!(!state.is_halted());
+}
+
+#[test]
+fn check_event_halt_resume_event_clears_halt_and_causes() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl1 = make_dbg_ctrl1(40, 0, 16, 0);
+    state.check_event_halt(16); // Halt via Event0.
+    assert!(state.is_halted());
+    state.check_event_halt(40); // Resume via Resume_Event.
+    assert!(!state.is_halted(), "resume event must clear halt");
+    let status = state.read_debug_status();
+    assert_eq!(status, 0, "all halt cause latches must be cleared on resume");
+}
+
+#[test]
+fn check_event_halt_event_0_id_never_matches() {
+    // Even if some caller passes event_id=0 (the EVENT_NONE sentinel),
+    // it must never match a configured halt event -- otherwise a slot
+    // with debug_ctrl1=0 would halt on every "no event" notification.
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl1 = 0; // halt event0 = 0, halt event1 = 0
+    state.check_event_halt(0);
+    assert!(!state.is_halted());
+}
+
+#[test]
+fn stall_halt_mem_disabled_by_default_does_not_halt() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    // debug_ctrl2 = 0 -> all stall-halt enables off.
+    state.update_stalls(true, false, false, false);
+    assert!(!state.is_halted(), "mem stall alone must not halt without enable");
+}
+
+#[test]
+fn stall_halt_mem_enabled_halts_on_mem_stall() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl2 = 1 << DBG_CTRL2_MEM_STALL_HALT_LSB;
+    state.update_stalls(true, false, false, false);
+    assert!(state.is_halted());
+    let status = state.read_debug_status();
+    assert_ne!(status & (1 << DBG_STS_MEM_STALL_HALTED_LSB), 0);
+}
+
+#[test]
+fn stall_halt_lock_enabled_halts_on_lock_stall() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl2 = 1 << DBG_CTRL2_LOCK_STALL_HALT_LSB;
+    state.update_stalls(false, true, false, false);
+    assert!(state.is_halted());
+    let status = state.read_debug_status();
+    assert_ne!(status & (1 << DBG_STS_LOCK_STALL_HALTED_LSB), 0);
+}
+
+#[test]
+fn stall_halt_stream_enabled_halts_on_stream_stall() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl2 = 1 << DBG_CTRL2_STREAM_STALL_HALT_LSB;
+    state.update_stalls(false, false, true, false);
+    assert!(state.is_halted());
+    let status = state.read_debug_status();
+    assert_ne!(status & (1 << DBG_STS_STREAM_STALL_HALTED_LSB), 0);
+}
+
+#[test]
+fn stall_halt_unenabled_categories_do_not_halt() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl2 = 1 << DBG_CTRL2_MEM_STALL_HALT_LSB; // mem only
+                                                           // Lock and stream stalls are active but their enables are off.
+    state.update_stalls(false, true, true, false);
+    assert!(!state.is_halted(), "only enabled categories may trigger halt");
+}
+
+#[test]
+fn debug_status_aggregates_multiple_causes() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl2 = 1 << DBG_CTRL2_MEM_STALL_HALT_LSB;
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 0, 16, 0);
+
+    // Trigger via mem stall first.
+    state.update_stalls(true, false, false, false);
+    // Then via Event0 -- request_halt is idempotent but the cause
+    // latch should also set independently.
+    state.check_event_halt(16);
+
+    let status = state.read_debug_status();
+    assert_ne!(status & (1 << DBG_STS_MEM_STALL_HALTED_LSB), 0);
+    assert_ne!(status & (1 << DBG_STS_EVENT0_HALTED_LSB), 0);
+}

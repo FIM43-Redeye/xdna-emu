@@ -227,9 +227,23 @@ aie-rt and locked in by 17 unit tests):
 - **East/North/West/South_Access quadrant bits unmodeled** -- AM025
   fields [27:24] gate on which neighbour quadrant initiated the access.
   Same wildcard treatment as above.
-- **Core-halt-on-hit not wired** -- HW watchpoints can be configured to
-  halt the core on hit. We fire the trace event and bump the perf
-  counter but never assert a halt.
+- ~~**Core-halt-on-hit not wired**~~ **FIXED 2026-05-14** -- AIE2 has
+  a *general* event-driven debug halt mechanism (Debug_Control1/2 +
+  Debug_Status, per AM025), not a watchpoint-specific halt bit. We
+  now decode Debug_Control1 (Event0/Event1/Resume event IDs) and
+  Debug_Control2 (mem/lock/stream stall-halt enables); when an event
+  matches a configured halt trigger, we request_halt and latch the
+  matching Debug_Status cause bit (bits 5/6 for Event0/1; bits 2/3/4
+  for the three stall categories; bit 0 for any-cause aggregate).
+  `tile.notify_core_trace_event` and `tile.notify_mem_trace_event`
+  (compute tiles only -- memtile/shim have no core to halt) call
+  `core_debug.check_event_halt(event_id)` so every event source flows
+  through the halt selector. Watchpoint events specifically were
+  rerouted from `mem_trace.notify_event` (bypass) to the dispatcher,
+  so a watchpoint hit configured as Debug_Halt_Core_Event0 now halts
+  the core end-to-end. PC_Event_Halt (Debug_Control2 bit 0) requires
+  PC_Event* register modeling and is the one piece still pending;
+  single-step-on-event also still pending.
 
 Tile isolation follow-ups (status confirmed via 2026-05-14 deep-
 validation pass; gate sites cross-checked against aie-rt
