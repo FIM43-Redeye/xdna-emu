@@ -203,48 +203,53 @@ impl CycleAccurateExecutor {
     /// so trace dumps and perf counters see them. Compute path only --
     /// memtile DMA-bank conflicts come through the DMA engine, not here.
     fn record_memory_access(&mut self, op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) {
-        match op.semantic {
-            Some(SemanticOp::Load) | Some(SemanticOp::Store) if !op.is_vector => {
-                // Resolve address from the first pointer register in operands.
-                // This is approximate (doesn't account for modifiers/offsets)
-                // but sufficient for bank conflict detection.
-                let addr = op
-                    .sources
-                    .iter()
-                    .find_map(|src| match src {
-                        Operand::Memory { base, offset } => {
-                            Some(ctx.pointer.read(*base).wrapping_add(*offset as i32 as u32))
-                        }
-                        Operand::PointerReg(r) => Some(ctx.pointer.read(*r)),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                let is_store = matches!(op.semantic, Some(SemanticOp::Store));
-                let access = MemoryAccess {
-                    address: addr,
-                    width: op.mem_width.bytes(),
-                    is_write: is_store,
-                    port: if is_store { 2 } else { 0 },
-                };
-                let conflict = self.memory.record_access(&access);
-                let cycle = ctx.cycles;
-                let pc = ctx.pc();
-                if conflict.has_conflict() {
-                    let stall = conflict.stall_cycles;
-                    self.total_memory_stalls += stall as u64;
-                    ctx.timing_context_mut()
-                        .record_event(cycle, EventType::MemoryStall { cycles: stall, pc: Some(pc) });
-                    fire_bank_conflict_events(tile, conflict.conflict_banks, cycle, pc);
-                }
-                // Watchpoints fire on every matching scalar access, regardless
-                // of bank-conflict status. Programmed slots compare the access
-                // address (low bits masked per HW) and direction filter against
-                // each WatchPointN register, then notify the mem-module trace
-                // unit and perf counters with WATCHPOINT_N events.
-                fire_watchpoint_events(tile, addr, is_store, cycle, pc);
-            }
-            _ => {}
+        if !matches!(op.semantic, Some(SemanticOp::Load) | Some(SemanticOp::Store)) {
+            return;
         }
+        // Resolve address from the first pointer register in operands. This is
+        // approximate (doesn't account for modifiers/post-increments) but
+        // sufficient for both bank-conflict tracking and watchpoint matching.
+        let addr = op
+            .sources
+            .iter()
+            .find_map(|src| match src {
+                Operand::Memory { base, offset } => {
+                    Some(ctx.pointer.read(*base).wrapping_add(*offset as i32 as u32))
+                }
+                Operand::PointerReg(r) => Some(ctx.pointer.read(*r)),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let is_store = matches!(op.semantic, Some(SemanticOp::Store));
+        let cycle = ctx.cycles;
+        let pc = ctx.pc();
+
+        // Bank-conflict tracking is scalar-only: the conflict model assumes
+        // single-port-per-direction access, which doesn't match the wider
+        // vector load/store ports. Vector accesses skip this block.
+        if !op.is_vector {
+            let access = MemoryAccess {
+                address: addr,
+                width: op.mem_width.bytes(),
+                is_write: is_store,
+                port: if is_store { 2 } else { 0 },
+            };
+            let conflict = self.memory.record_access(&access);
+            if conflict.has_conflict() {
+                let stall = conflict.stall_cycles;
+                self.total_memory_stalls += stall as u64;
+                ctx.timing_context_mut()
+                    .record_event(cycle, EventType::MemoryStall { cycles: stall, pc: Some(pc) });
+                fire_bank_conflict_events(tile, conflict.conflict_banks, cycle, pc);
+            }
+        }
+        // Watchpoints fire on every matching access regardless of issuing
+        // engine: HW comparator sits at the bank interface and sees both
+        // scalar and vector traffic. Programmed slots compare the access
+        // address (low bits masked per HW) and direction filter against each
+        // WatchPointN register, then notify the mem-module trace unit and
+        // perf counters with WATCHPOINT_N events.
+        fire_watchpoint_events(tile, addr, is_store, cycle, pc);
     }
 
     /// Reset executor state (for new program).
@@ -1515,6 +1520,44 @@ mod tests {
                 "addr 0x{addr:X} must fire only event {expected_event}"
             );
         }
+    }
+
+    #[test]
+    fn test_watchpoint_vector_load_fires_event() {
+        // Vector loads now fire watchpoints just like scalar loads do (HW
+        // comparator sits at the bank interface, doesn't care which engine
+        // issued the access). To probe the fire without configuring the
+        // trace pipeline, we wire a perf counter to start on WATCHPOINT_0
+        // (event 16) and check the counter activates after a vector load
+        // through the executor.
+        use crate::interpreter::bundle::ElementType;
+        use xdna_archspec::aie2::trace_events::mem_events;
+
+        let mut tile = Tile::compute(0, 2);
+        tile.registers.insert(0x14100, compute_wp(true, false, 0x100));
+        tile.write_data_u32(0x100, 0xFEEDFACE);
+        // Counter 0: start on WATCHPOINT_0 (=16), stop never (=0).
+        // write_control_start_stop packs counter_lo at bits [7:0] start /
+        // [15:8] stop; using event_width=7 (AIE2 event field width).
+        tile.mem_perf_counters
+            .write_control_start_stop(mem_events::WATCHPOINT_0 as u32, 0, 1, 7);
+        assert!(!tile.mem_perf_counters.is_active(0), "counter must start idle");
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x100);
+
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .as_vector(ElementType::Int32)
+            .with_mem_width(MemWidth::Word)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0))]);
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        assert!(
+            tile.mem_perf_counters.is_active(0),
+            "vector load must fire WATCHPOINT_0; counter would have stayed idle if the watchpoint check skipped vector ops"
+        );
     }
 
     #[test]
