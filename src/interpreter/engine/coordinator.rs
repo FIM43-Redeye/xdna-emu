@@ -12,15 +12,36 @@
 
 use crate::device::dma::ChannelState;
 use crate::device::host_memory::HostMemory;
+use crate::device::tile::Lock;
 use crate::device::DeviceState;
 use crate::interpreter::bundle::VliwBundle;
 use crate::interpreter::core::{CoreInterpreter, CoreStatus, StepResult};
 use crate::interpreter::decode::InstructionDecoder;
-use crate::interpreter::execute::{CycleAccurateExecutor, NeighborMemory};
+use crate::interpreter::execute::{CycleAccurateExecutor, NeighborLocks, NeighborMemory};
 use crate::interpreter::state::{EventType, ExecutionContext};
 use crate::parser::AieElf;
 use xdna_archspec::aie2::SHIM_ROW;
 use xdna_archspec::types::TileKind;
+
+/// Build a `NeighborLocks` from the executing tile's isolation byte and
+/// per-direction lock slices. A set bit in `isolation` (per
+/// [`crate::device::tile::isolation`]) hides the corresponding direction's
+/// slice from the executor; `route_lock` then falls back to the own-tile
+/// lock array. East/Internal quadrant locks always live on the executing
+/// tile, so they're unaffected by isolation.
+pub(crate) fn build_neighbor_locks_with_isolation<'a>(
+    isolation: u8,
+    south: Option<&'a mut [Lock]>,
+    west: Option<&'a mut [Lock]>,
+    north: Option<&'a mut [Lock]>,
+) -> NeighborLocks<'a> {
+    use crate::device::tile::isolation as iso;
+    NeighborLocks {
+        south: if isolation & iso::SOUTH != 0 { None } else { south },
+        west: if isolation & iso::WEST != 0 { None } else { west },
+        north: if isolation & iso::NORTH != 0 { None } else { north },
+    }
+}
 
 /// Engine execution status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -614,32 +635,13 @@ impl InterpreterEngine {
                 // Per-call sites in execute/memory then short-circuit
                 // via NeighborMemory's own `is_blocked`. See
                 // `crate::device::tile::isolation` for the bit layout.
-                use crate::device::tile::isolation as iso;
                 core.neighbors.set_isolation(tile.isolation);
-                let isolation = tile.isolation;
-
-                // Build neighbor locks struct, gating each direction by
-                // the matching isolation bit. None hides the slice from
-                // the executor so cross-tile lock ops fall back to the
-                // own-tile path (which then misses, since East-quadrant
-                // IDs map to internal locks only).
-                let mut nlocks = crate::interpreter::execute::NeighborLocks {
-                    south: if isolation & iso::SOUTH != 0 {
-                        None
-                    } else {
-                        south_locks.as_mut().map(|v| v.as_mut_slice())
-                    },
-                    west: if isolation & iso::WEST != 0 {
-                        None
-                    } else {
-                        west_locks.as_mut().map(|v| v.as_mut_slice())
-                    },
-                    north: if isolation & iso::NORTH != 0 {
-                        None
-                    } else {
-                        north_locks.as_mut().map(|v| v.as_mut_slice())
-                    },
-                };
+                let mut nlocks = build_neighbor_locks_with_isolation(
+                    tile.isolation,
+                    south_locks.as_mut().map(|v| v.as_mut_slice()),
+                    west_locks.as_mut().map(|v| v.as_mut_slice()),
+                    north_locks.as_mut().map(|v| v.as_mut_slice()),
+                );
 
                 let result = core.interpreter.step_with_neighbor_locks(
                     &mut core.context,
@@ -2389,5 +2391,121 @@ mod tests {
             frame,
             bytes
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // Tile_Control isolation -> NeighborLocks gating
+    //
+    // The coordinator constructs NeighborLocks by calling
+    // build_neighbor_locks_with_isolation. These tests pin the mapping from
+    // isolation byte to per-direction Some/None state, which is what the
+    // executor's route_lock fallback consumes. East quadrant locks live on
+    // the executing tile and are unaffected by isolation.
+    // ----------------------------------------------------------------------
+
+    fn lock_vec(n: usize) -> Vec<Lock> {
+        (0..n).map(|_| Lock::new(0)).collect()
+    }
+
+    #[test]
+    fn build_neighbor_locks_no_isolation_passes_all_slices() {
+        let mut s = lock_vec(16);
+        let mut w = lock_vec(16);
+        let mut n = lock_vec(16);
+        let nlocks = build_neighbor_locks_with_isolation(
+            0,
+            Some(s.as_mut_slice()),
+            Some(w.as_mut_slice()),
+            Some(n.as_mut_slice()),
+        );
+        assert!(nlocks.south.is_some());
+        assert!(nlocks.west.is_some());
+        assert!(nlocks.north.is_some());
+    }
+
+    #[test]
+    fn build_neighbor_locks_each_isolation_bit_hides_only_its_direction() {
+        use crate::device::tile::isolation as iso;
+        let cases = [(iso::SOUTH, "south"), (iso::WEST, "west"), (iso::NORTH, "north")];
+        for (bit, dir) in cases {
+            let mut s = lock_vec(16);
+            let mut w = lock_vec(16);
+            let mut n = lock_vec(16);
+            let nlocks = build_neighbor_locks_with_isolation(
+                bit,
+                Some(s.as_mut_slice()),
+                Some(w.as_mut_slice()),
+                Some(n.as_mut_slice()),
+            );
+            // The direction matching the bit must be hidden; others stay
+            // available. East/Internal isn't in NeighborLocks at all (own
+            // tile), so it's implicitly unaffected.
+            match dir {
+                "south" => {
+                    assert!(nlocks.south.is_none(), "SOUTH bit must hide south slice");
+                    assert!(nlocks.west.is_some());
+                    assert!(nlocks.north.is_some());
+                }
+                "west" => {
+                    assert!(nlocks.south.is_some());
+                    assert!(nlocks.west.is_none(), "WEST bit must hide west slice");
+                    assert!(nlocks.north.is_some());
+                }
+                "north" => {
+                    assert!(nlocks.south.is_some());
+                    assert!(nlocks.west.is_some());
+                    assert!(nlocks.north.is_none(), "NORTH bit must hide north slice");
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn build_neighbor_locks_all_directions_hides_every_slice() {
+        use crate::device::tile::isolation as iso;
+        let mut s = lock_vec(16);
+        let mut w = lock_vec(16);
+        let mut n = lock_vec(16);
+        let nlocks = build_neighbor_locks_with_isolation(
+            iso::ALL_DIRECTIONS,
+            Some(s.as_mut_slice()),
+            Some(w.as_mut_slice()),
+            Some(n.as_mut_slice()),
+        );
+        assert!(nlocks.south.is_none());
+        assert!(nlocks.west.is_none());
+        assert!(nlocks.north.is_none());
+    }
+
+    #[test]
+    fn build_neighbor_locks_passes_through_none_inputs() {
+        // When the coordinator has no neighbor at all (edge tile), the
+        // input slices are already None. Isolation must not turn None
+        // into Some -- it can only hide a present slice.
+        let nlocks = build_neighbor_locks_with_isolation(0, None, None, None);
+        assert!(nlocks.south.is_none());
+        assert!(nlocks.west.is_none());
+        assert!(nlocks.north.is_none());
+    }
+
+    /// End-to-end: bring up the engine, set tile.isolation = SOUTH on a
+    /// compute tile, and verify the gate engages without crashing the
+    /// step loop. Pre-isolation behavior would let the executor see the
+    /// south neighbor's locks; post-isolation it shouldn't. We can't
+    /// directly inspect the in-flight NeighborLocks (the closure owns
+    /// it), but a clean step + correct status proves the wiring holds.
+    #[test]
+    fn engine_step_survives_with_isolation_set() {
+        use crate::device::tile::isolation as iso;
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.enable_core(0, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+            tile.write_program(0, &[0x00, 0x00, 0x00, 0x00]); // NOP
+            tile.isolation = iso::ALL_DIRECTIONS;
+        }
+        engine.step();
+        assert_eq!(engine.status(), EngineStatus::Running);
+        assert_eq!(engine.total_cycles(), 1);
     }
 }

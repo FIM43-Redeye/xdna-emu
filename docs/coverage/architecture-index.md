@@ -245,12 +245,14 @@ snapshot eviction):
   isolation bits are snapshotted but no current routing path consults
   them. NeighborMemory and NeighborLocks don't apply (shim has no
   executing core that does cross-tile quadrant ops).
-- **No coordinator-level NeighborLocks integration test** -- the inline
-  gate in `coordinator.rs` is mechanically simple and exercised
-  indirectly by any cross-tile-locking bridge test. A dedicated unit
-  test would catch future regressions earlier; deferred because it
-  requires bringing up a multi-tile Engine + DeviceState which is
-  heavier than the focused unit tests we have.
+- ~~**No coordinator-level NeighborLocks integration test**~~
+  **FIXED 2026-05-14**. Extracted the gate construction into
+  `build_neighbor_locks_with_isolation(isolation, south, west, north)`
+  in `coordinator.rs` and pinned the mapping with 4 unit tests covering
+  no-isolation, each-bit-individual, all-directions, and pass-through-
+  None-inputs. A separate end-to-end test brings up the engine, sets
+  ALL_DIRECTIONS on a compute tile, and verifies the step loop still
+  advances cleanly.
 
 Items 7+ in the gaps list above are deliberately deferred until pass 1
 deep-dives surface unforeseen interactions.
