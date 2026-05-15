@@ -658,3 +658,22 @@ fn unrelated_register_write_does_not_change_isolation() {
     state.write_register(other_addr, 0xFFFF_FFFF).unwrap();
     assert_eq!(state.array.tile(col, row).isolation, 0x5);
 }
+
+/// Shim Tile_Control sits at the same offset (0x36030) as compute and
+/// uses the same SWNE bit layout. Privileged-path setup in real HW
+/// programs this; we mirror the snapshot so the stream-switch routing
+/// gate can consult it for memtile->shim south-bound transits (which
+/// gate on shim's NORTH bit per the inbound-direction rule).
+#[test]
+fn tile_control_write_updates_isolation_byte_shim() {
+    use crate::device::tile::isolation as iso;
+    let mut state = DeviceState::new_npu1();
+    let col: u8 = 1;
+    let row: u8 = 0; // shim row
+    let addr = TileAddress::encode(col, row, 0x36030);
+
+    state.write_register(addr, iso::NORTH as u32).unwrap();
+    let tile = state.array.tile(col, row);
+    assert!(tile.is_shim(), "row 0 must be a shim tile");
+    assert_eq!(tile.isolation, iso::NORTH);
+}

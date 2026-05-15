@@ -237,10 +237,14 @@ validation pass; gate sites cross-checked against aie-rt
 all 4 cardinal stream directions, all 4 NeighborMemory quadrants
 individually, partial-isolation mixing, local-not-blocked, and stale-
 snapshot eviction):
-- **Shim Tile_Control isolation unmodeled** -- privileged partition-
-  boundary setup; shim row 0 doesn't currently store an isolation byte
-  even though writes pass through register storage. Needed for full
-  partition-isolation simulation but not for any existing kernel.
+- ~~**Shim Tile_Control isolation unmodeled**~~ **FIXED 2026-05-14**.
+  Snapshot now extends to row-0 shim tiles at the same offset (0x36030)
+  with the same SWNE bit layout. Of the routing directions, the gate
+  that actually fires for shim is memtile->shim south-bound (gates on
+  shim's NORTH bit per the inbound-direction rule); other shim
+  isolation bits are snapshotted but no current routing path consults
+  them. NeighborMemory and NeighborLocks don't apply (shim has no
+  executing core that does cross-tile quadrant ops).
 - **No coordinator-level NeighborLocks integration test** -- the inline
   gate in `coordinator.rs` is mechanically simple and exercised
   indirectly by any cross-tile-locking bridge test. A dedicated unit

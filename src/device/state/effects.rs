@@ -35,15 +35,26 @@ impl DeviceState {
         }
 
         // 0a. Tile_Control isolation bits.
-        // Compute: 0x36030, MemTile: 0x96030. Low 4 bits = isolation per
-        // AM025 Tile_Control field layout (S/W/N/E in bits 0..3),
-        // matching aie-rt's `XAIE_ISOLATE_*_MASK` constants. Snapshot
-        // them onto `tile.isolation` so cross-tile gates (stream-switch
-        // routing, NeighborLocks, NeighborMemory) can consult a single
-        // byte instead of re-decoding the register on every check.
-        // Higher bits of Tile_Control (clock-gating etc.) still flow
-        // through the generic register store unchanged.
-        if (tile.is_compute() && offset == 0x36030) || (tile.is_mem() && offset == 0x96030) {
+        // Compute + Shim: 0x36030, MemTile: 0x96030. Low 4 bits = isolation
+        // per AM025 Tile_Control field layout (S/W/N/E in bits 0..3),
+        // matching aie-rt's `XAIE_ISOLATE_*_MASK` constants. Snapshot them
+        // onto `tile.isolation` so cross-tile gates (stream-switch routing,
+        // NeighborLocks, NeighborMemory) can consult a single byte instead
+        // of re-decoding the register on every check. Higher bits of
+        // Tile_Control (clock-gating etc.) still flow through the generic
+        // register store unchanged.
+        //
+        // Shim tiles only participate in stream-switch routing gating;
+        // NeighborMemory and NeighborLocks don't apply (shim has no
+        // executing core that does cross-tile quadrant ops). Of the routing
+        // directions, the gate that actually fires for shim is memtile->
+        // shim south-bound, which checks shim's NORTH bit per the inbound-
+        // direction rule. shim.SOUTH/WEST/EAST snapshot too, but no
+        // current routing path consults them.
+        let is_tile_control = (tile.is_compute() && offset == 0x36030)
+            || (tile.is_mem() && offset == 0x96030)
+            || (tile.is_shim() && offset == 0x36030);
+        if is_tile_control {
             tile.isolation = (value & super::super::tile::isolation::ALL_DIRECTIONS as u32) as u8;
         }
 

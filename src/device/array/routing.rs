@@ -1294,6 +1294,39 @@ mod isolation_tests {
         );
     }
 
+    /// Memtile -> shim south-bound transit: source at row=1 (memtile),
+    /// dst at row=0 (shim). Inbound direction is north at the dst, so
+    /// shim.NORTH gates it. This is the only routing path where the
+    /// shim's own isolation byte actually matters.
+    #[test]
+    fn memtile_to_shim_south_bound_blocked_when_shim_isolates_north() {
+        use xdna_archspec::aie2::stream_switch::mem_tile as mem_tile_ranges;
+        let mut array = TileArray::npu1();
+        let col = 1u8;
+        let src_row = 1u8; // memtile
+        let dst_idx = array.tile_index(col, src_row - 1); // shim
+        let master_idx = mem_tile_ranges::SOUTH_MASTER_START as usize;
+
+        // Baseline: drains when shim is unisolated.
+        seed_master_word(&mut array, col, src_row, master_idx);
+        array.propagate_inter_tile();
+        let src_idx = array.tile_index(col, src_row);
+        assert!(
+            array.tiles[src_idx].stream_switch.masters[master_idx].fifo.is_empty(),
+            "baseline: memtile->shim south-bound must drain when shim is unisolated"
+        );
+
+        // With shim.NORTH set: blocked.
+        array.tiles[dst_idx].isolation = iso::NORTH;
+        seed_master_word(&mut array, col, src_row, master_idx);
+        array.propagate_inter_tile();
+        assert_eq!(
+            array.tiles[src_idx].stream_switch.masters[master_idx].fifo.len(),
+            1,
+            "memtile->shim south-bound must be blocked by shim.NORTH"
+        );
+    }
+
     /// West-bound (data flows col -> col-1) is incoming-from-east at the
     /// destination, so dst.isolation = EAST must drop it.
     #[test]
