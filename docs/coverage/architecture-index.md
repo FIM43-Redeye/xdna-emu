@@ -250,9 +250,18 @@ aie-rt and locked in by 17 unit tests):
   through the halt selector. Watchpoint events specifically were
   rerouted from `mem_trace.notify_event` (bypass) to the dispatcher,
   so a watchpoint hit configured as Debug_Halt_Core_Event0 now halts
-  the core end-to-end. PC_Event_Halt (Debug_Control2 bit 0) requires
-  PC_Event* register modeling and is the one piece still pending;
-  single-step-on-event also still pending.
+  the core end-to-end. PC_Event_Halt (Debug_Control2 bit 0) **FIXED
+  2026-05-14**: PC_Event0..3 registers (offsets 0x32020/4/8/C, layout
+  bit 31 VALID + bits [13:0] PC_ADDRESS per aie-rt xaiemlgbl_params.h)
+  are now modeled. `update_pc` drives `check_pc_events`, which
+  broadcasts Core_PC_0..3 events (IDs 16-19 per xaie_events_aieml.h)
+  on single-slot matches and Core_PC_Range_0_1 / Core_PC_Range_2_3
+  (IDs 20/21) when PC is within a valid pair (both endpoints VALID;
+  endpoint order is normalized). Each fired event flows through
+  `check_event_halt` so HaltEvent0/1 wiring works; independently,
+  Debug_Control2.PC_Event_Halt (bit 0) gates a halt that latches
+  halt_cause_pc_event (Debug_Status bit 1). Reset clears all four
+  PC_Event registers. Single-step-on-event also still pending.
 
 Tile isolation follow-ups (status confirmed via 2026-05-14 deep-
 validation pass; gate sites cross-checked against aie-rt

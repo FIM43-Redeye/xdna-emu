@@ -38,12 +38,46 @@ const REG_DEBUG_CONTROL1: u32 = 0x0003_2014;
 const REG_DEBUG_CONTROL2: u32 = 0x0003_2018;
 /// Debug_Status register offset within a tile.
 const REG_DEBUG_STATUS: u32 = 0x0003_201C;
+/// PC_Event0..3 register offsets (each: bit 31 VALID, bits [13:0] PC_ADDRESS).
+const REG_PC_EVENT0: u32 = 0x0003_2020;
+const REG_PC_EVENT1: u32 = 0x0003_2024;
+const REG_PC_EVENT2: u32 = 0x0003_2028;
+const REG_PC_EVENT3: u32 = 0x0003_202C;
 /// Core_PC register offset within a tile.
 const REG_CORE_PC: u32 = 0x0003_1100;
 /// Core_SP register offset within a tile.
 const REG_CORE_SP: u32 = 0x0003_1120;
 /// Core_LR register offset within a tile.
 const REG_CORE_LR: u32 = 0x0003_1130;
+
+// ---------------------------------------------------------------------------
+// PC_Event* bit positions (per aie-rt xaiemlgbl_params.h)
+// ---------------------------------------------------------------------------
+
+/// PC_Event*: bit 31 VALID enable.
+const PC_EVENT_VALID_MASK: u32 = 0x8000_0000;
+/// PC_Event*: bits [13:0] 14-bit PC_ADDRESS.
+const PC_EVENT_ADDRESS_MASK: u32 = 0x0000_3FFF;
+/// Writable bits in PC_Event* (per AM025 register mask 0x80003FFF).
+const PC_EVENT_WRITE_MASK: u32 = PC_EVENT_VALID_MASK | PC_EVENT_ADDRESS_MASK;
+
+// ---------------------------------------------------------------------------
+// Core event IDs broadcast on PC matches (from xaie_events_aieml.h)
+// ---------------------------------------------------------------------------
+
+/// XAIEML_EVENTS_CORE_PC_0 = 16. Fires when PC matches PC_Event0.
+const EVENT_CORE_PC_0: u8 = 16;
+/// XAIEML_EVENTS_CORE_PC_1 = 17.
+const EVENT_CORE_PC_1: u8 = 17;
+/// XAIEML_EVENTS_CORE_PC_2 = 18.
+const EVENT_CORE_PC_2: u8 = 18;
+/// XAIEML_EVENTS_CORE_PC_3 = 19.
+const EVENT_CORE_PC_3: u8 = 19;
+/// XAIEML_EVENTS_CORE_PC_RANGE_0_1 = 20. Fires while PC is in [PC0, PC1]
+/// (both PC_Event0 and PC_Event1 must be VALID).
+const EVENT_CORE_PC_RANGE_0_1: u8 = 20;
+/// XAIEML_EVENTS_CORE_PC_RANGE_2_3 = 21.
+const EVENT_CORE_PC_RANGE_2_3: u8 = 21;
 
 // ---------------------------------------------------------------------------
 // Core_Status bit positions (from xaiemlgbl_params.h)
@@ -121,8 +155,7 @@ const DBG_CTRL1_HALT_EVENT1_LSB: u32 = 24;
 // Debug_Control2 bit positions (per AM025; stall-to-halt enables)
 // ---------------------------------------------------------------------------
 
-/// Bit 0: halt on PC event hit (requires PC_Event* registers; not modeled).
-#[allow(dead_code)]
+/// Bit 0: halt on any PC event firing (independent of Debug_Control1.HaltEvent*).
 const DBG_CTRL2_PC_EVENT_HALT_LSB: u32 = 0;
 /// Bit 1: halt on memory stall.
 const DBG_CTRL2_MEM_STALL_HALT_LSB: u32 = 1;
@@ -217,6 +250,12 @@ pub struct CoreDebugState {
     // -- Debug_Control2 raw value (stall-to-halt enables) --
     pub(super) debug_ctrl2: u32,
 
+    // -- PC_Event0..3 raw register values (VALID at bit 31, PC_ADDRESS at [13:0]) --
+    pub(super) pc_event0: u32,
+    pub(super) pc_event1: u32,
+    pub(super) pc_event2: u32,
+    pub(super) pc_event3: u32,
+
     // -- Halt-cause latches (Debug_Status bits 1-6) --
     /// Set when a configured PC event triggered the halt. Not currently
     /// driven (PC_Event registers aren't modeled).
@@ -256,6 +295,10 @@ impl Default for CoreDebugState {
             lr: 0,
             debug_ctrl1: 0,
             debug_ctrl2: 0,
+            pc_event0: 0,
+            pc_event1: 0,
+            pc_event2: 0,
+            pc_event3: 0,
             halt_cause_pc_event: false,
             halt_cause_mem_stall: false,
             halt_cause_lock_stall: false,
@@ -384,6 +427,11 @@ impl CoreDebugState {
             self.pc = 0;
             self.sp = 0;
             self.lr = 0;
+            self.pc_event0 = 0;
+            self.pc_event1 = 0;
+            self.pc_event2 = 0;
+            self.pc_event3 = 0;
+            self.clear_halt_causes();
         }
     }
 
@@ -419,9 +467,13 @@ impl CoreDebugState {
     }
 
     /// Update the program counter. Called by the interpreter after each
-    /// instruction. Value is masked to 20 bits per hardware.
+    /// instruction. Value is masked to 20 bits per hardware. Also drives
+    /// PC_Event0..3 matching, which broadcasts Core_PC_n events through
+    /// the standard event halt path and (when Debug_Control2.PC_Event_Halt
+    /// is set) latches halt_cause_pc_event.
     pub fn update_pc(&mut self, pc: u32) {
         self.pc = pc & ADDR_MASK_20BIT;
+        self.check_pc_events(pc);
     }
 
     /// Update the stack pointer. Value is masked to 20 bits per hardware.
@@ -579,11 +631,84 @@ impl CoreDebugState {
         }
     }
 
+    /// Decode a PC_Event* raw register value to its address (or None if
+    /// VALID=0). Per AM025 PC_Event* layout (bit 31 VALID, bits [13:0] address).
+    fn pc_event_address(raw: u32) -> Option<u32> {
+        if raw & PC_EVENT_VALID_MASK != 0 {
+            Some(raw & PC_EVENT_ADDRESS_MASK)
+        } else {
+            None
+        }
+    }
+
+    /// Returns true when Debug_Control2.PC_Event_Halt (bit 0) is set.
+    fn pc_event_halt_enabled(&self) -> bool {
+        (self.debug_ctrl2 >> DBG_CTRL2_PC_EVENT_HALT_LSB) & 1 != 0
+    }
+
+    /// Drive PC_Event0..3 matching against the new PC value.
+    ///
+    /// Per AM025 / xaie_events_aieml.h:
+    /// - PC_Event0..3 each broadcast Core_PC_0..3 (event IDs 16..19) when
+    ///   VALID=1 and the 14-bit PC_ADDRESS field equals the low 14 bits of
+    ///   the current PC.
+    /// - PC_Range_0_1 (event 20) fires while PC is within [PC_Event0,
+    ///   PC_Event1] (both must be VALID; the lower address is treated as
+    ///   the range start regardless of which slot holds it).
+    /// - PC_Range_2_3 (event 21) is the symmetric case for slots 2/3.
+    /// - When Debug_Control2.PC_Event_Halt is set and any of the above
+    ///   fires, the core is halted and halt_cause_pc_event is latched.
+    /// - Independent of the gate, each fired event is also routed through
+    ///   `check_event_halt`, so Debug_Control1.HaltEvent0/1 wired to one of
+    ///   these IDs will halt with the matching Event0/Event1 cause bit.
+    fn check_pc_events(&mut self, pc: u32) {
+        let pc14 = pc & PC_EVENT_ADDRESS_MASK;
+        let pc0 = Self::pc_event_address(self.pc_event0);
+        let pc1 = Self::pc_event_address(self.pc_event1);
+        let pc2 = Self::pc_event_address(self.pc_event2);
+        let pc3 = Self::pc_event_address(self.pc_event3);
+
+        let mut any_pc_event_fired = false;
+        if pc0 == Some(pc14) {
+            any_pc_event_fired = true;
+            self.check_event_halt(EVENT_CORE_PC_0);
+        }
+        if pc1 == Some(pc14) {
+            any_pc_event_fired = true;
+            self.check_event_halt(EVENT_CORE_PC_1);
+        }
+        if pc2 == Some(pc14) {
+            any_pc_event_fired = true;
+            self.check_event_halt(EVENT_CORE_PC_2);
+        }
+        if pc3 == Some(pc14) {
+            any_pc_event_fired = true;
+            self.check_event_halt(EVENT_CORE_PC_3);
+        }
+        if let (Some(a), Some(b)) = (pc0, pc1) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            if pc14 >= lo && pc14 <= hi {
+                any_pc_event_fired = true;
+                self.check_event_halt(EVENT_CORE_PC_RANGE_0_1);
+            }
+        }
+        if let (Some(a), Some(b)) = (pc2, pc3) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            if pc14 >= lo && pc14 <= hi {
+                any_pc_event_fired = true;
+                self.check_event_halt(EVENT_CORE_PC_RANGE_2_3);
+            }
+        }
+
+        if any_pc_event_fired && self.pc_event_halt_enabled() {
+            self.halt_cause_pc_event = true;
+            self.request_halt();
+        }
+    }
+
     /// Consult Debug_Control2 stall-halt enables and trigger halt if any
     /// enabled stall condition is currently active. Called from
     /// `update_stalls` so every stall-state update gets re-evaluated.
-    /// PC_Event_Halt (bit 0) requires PC_Event* register modeling and is
-    /// not currently driven.
     fn check_stall_halt(&mut self) {
         let ctrl2 = self.debug_ctrl2;
         if (ctrl2 >> DBG_CTRL2_MEM_STALL_HALT_LSB) & 1 != 0 && self.mem_stall {
@@ -689,6 +814,10 @@ impl CoreDebugState {
             REG_DEBUG_CONTROL1 => Some(self.debug_ctrl1),
             REG_DEBUG_CONTROL2 => Some(self.debug_ctrl2),
             REG_DEBUG_STATUS => Some(self.read_debug_status()),
+            REG_PC_EVENT0 => Some(self.pc_event0),
+            REG_PC_EVENT1 => Some(self.pc_event1),
+            REG_PC_EVENT2 => Some(self.pc_event2),
+            REG_PC_EVENT3 => Some(self.pc_event3),
             REG_CORE_PC => Some(self.read_pc()),
             REG_CORE_SP => Some(self.read_sp()),
             REG_CORE_LR => Some(self.read_lr()),
@@ -718,6 +847,22 @@ impl CoreDebugState {
             }
             REG_DEBUG_CONTROL2 => {
                 self.debug_ctrl2 = value;
+                true
+            }
+            REG_PC_EVENT0 => {
+                self.pc_event0 = value & PC_EVENT_WRITE_MASK;
+                true
+            }
+            REG_PC_EVENT1 => {
+                self.pc_event1 = value & PC_EVENT_WRITE_MASK;
+                true
+            }
+            REG_PC_EVENT2 => {
+                self.pc_event2 = value & PC_EVENT_WRITE_MASK;
+                true
+            }
+            REG_PC_EVENT3 => {
+                self.pc_event3 = value & PC_EVENT_WRITE_MASK;
                 true
             }
             // Read-only registers: accept the write (return true) but drop it.

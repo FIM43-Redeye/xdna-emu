@@ -771,3 +771,213 @@ fn debug_status_aggregates_multiple_causes() {
     assert_ne!(status & (1 << DBG_STS_MEM_STALL_HALTED_LSB), 0);
     assert_ne!(status & (1 << DBG_STS_EVENT0_HALTED_LSB), 0);
 }
+
+// ----------------------------------------------------------------------
+// PC_Event0..3 + Debug_Control2.PC_Event_Halt
+// ----------------------------------------------------------------------
+
+/// Build a PC_Event* register raw value with VALID and a 14-bit address.
+fn make_pc_event(valid: bool, address: u32) -> u32 {
+    let mut v = address & PC_EVENT_ADDRESS_MASK;
+    if valid {
+        v |= PC_EVENT_VALID_MASK;
+    }
+    v
+}
+
+#[test]
+fn pc_event_registers_default_zero() {
+    let state = CoreDebugState::new();
+    assert_eq!(state.read_register(REG_PC_EVENT0), Some(0));
+    assert_eq!(state.read_register(REG_PC_EVENT1), Some(0));
+    assert_eq!(state.read_register(REG_PC_EVENT2), Some(0));
+    assert_eq!(state.read_register(REG_PC_EVENT3), Some(0));
+}
+
+#[test]
+fn pc_event_register_round_trips_writeable_bits() {
+    let mut state = CoreDebugState::new();
+    // Set bits outside the writable mask -- they must be dropped.
+    assert!(state.write_register(REG_PC_EVENT0, 0xFFFF_FFFF));
+    let read = state.read_register(REG_PC_EVENT0).unwrap();
+    assert_eq!(read, PC_EVENT_WRITE_MASK, "non-writable bits must be masked off");
+    // VALID stays set.
+    assert_ne!(read & PC_EVENT_VALID_MASK, 0);
+    // 14-bit address.
+    assert_eq!(read & PC_EVENT_ADDRESS_MASK, PC_EVENT_ADDRESS_MASK);
+}
+
+#[test]
+fn pc_event_match_broadcasts_core_pc_event() {
+    // PC_Event0 valid + matching PC, with HaltEvent0 wired to Core_PC_0
+    // (event 16): the match must trigger halt via Event0 cause bit.
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.pc_event0 = make_pc_event(true, 0x100);
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 0, EVENT_CORE_PC_0, 0);
+
+    state.update_pc(0x100);
+
+    assert!(state.is_halted(), "PC match must broadcast Core_PC_0 -> HaltEvent0");
+    let status = state.read_debug_status();
+    assert_ne!(status & (1 << DBG_STS_EVENT0_HALTED_LSB), 0, "Event0 cause latched");
+    // PC_Event_Halt gate disabled -> halt_cause_pc_event must NOT be latched.
+    assert_eq!(
+        status & (1 << DBG_STS_PC_EVENT_HALTED_LSB),
+        0,
+        "PC_Event cause should only latch when Debug_Control2.PC_Event_Halt is set"
+    );
+}
+
+#[test]
+fn pc_event_invalid_does_not_fire() {
+    // VALID=0 with matching address -> no event.
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.pc_event0 = make_pc_event(false, 0x100);
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 0, EVENT_CORE_PC_0, 0);
+    state.update_pc(0x100);
+    assert!(!state.is_halted(), "VALID=0 must inhibit PC match");
+}
+
+#[test]
+fn pc_event_address_mismatch_does_not_fire() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.pc_event0 = make_pc_event(true, 0x100);
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 0, EVENT_CORE_PC_0, 0);
+    state.update_pc(0x104);
+    assert!(!state.is_halted(), "address mismatch must not fire");
+}
+
+#[test]
+fn pc_event_halt_gate_latches_pc_event_cause() {
+    // Debug_Control2.PC_Event_Halt + valid PC_Event match: halts and
+    // latches halt_cause_pc_event independently of Debug_Control1.HaltEvent*.
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.pc_event0 = make_pc_event(true, 0x200);
+    state.debug_ctrl2 = 1 << DBG_CTRL2_PC_EVENT_HALT_LSB;
+    // No HaltEvent wiring -- the gate alone must halt.
+    state.update_pc(0x200);
+    assert!(state.is_halted(), "PC_Event_Halt gate must halt on any PC event");
+    let status = state.read_debug_status();
+    assert_ne!(
+        status & (1 << DBG_STS_PC_EVENT_HALTED_LSB),
+        0,
+        "halt_cause_pc_event must latch under PC_Event_Halt gate"
+    );
+}
+
+#[test]
+fn pc_event_halt_gate_disabled_no_pc_cause_latch() {
+    // Without the gate, even a fired PC event does not latch the
+    // PC_Event halt cause (only the Event0/1 cause via HaltEvent path).
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.pc_event1 = make_pc_event(true, 0x300);
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 0, 0, EVENT_CORE_PC_1);
+    state.update_pc(0x300);
+    assert!(state.is_halted());
+    let status = state.read_debug_status();
+    assert_ne!(status & (1 << DBG_STS_EVENT1_HALTED_LSB), 0);
+    assert_eq!(status & (1 << DBG_STS_PC_EVENT_HALTED_LSB), 0);
+}
+
+#[test]
+fn pc_range_0_1_fires_when_in_range() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.pc_event0 = make_pc_event(true, 0x100);
+    state.pc_event1 = make_pc_event(true, 0x200);
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 0, EVENT_CORE_PC_RANGE_0_1, 0);
+    state.update_pc(0x150);
+    assert!(state.is_halted(), "Core_PC_Range_0_1 must fire when PC is in [PC0, PC1]");
+}
+
+#[test]
+fn pc_range_0_1_outside_does_not_fire() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.pc_event0 = make_pc_event(true, 0x100);
+    state.pc_event1 = make_pc_event(true, 0x200);
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 0, EVENT_CORE_PC_RANGE_0_1, 0);
+    state.update_pc(0x300);
+    assert!(!state.is_halted(), "PC outside range must not fire");
+}
+
+#[test]
+fn pc_range_requires_both_endpoints_valid() {
+    // PC_Event0 valid, PC_Event1 invalid -> no range event.
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.pc_event0 = make_pc_event(true, 0x100);
+    state.pc_event1 = make_pc_event(false, 0x200);
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 0, EVENT_CORE_PC_RANGE_0_1, 0);
+    state.update_pc(0x150);
+    assert!(!state.is_halted(), "range needs both endpoints VALID");
+}
+
+#[test]
+fn pc_range_swapped_endpoints_still_defines_range() {
+    // PC0 > PC1: still treated as a range (lo=PC1, hi=PC0).
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.pc_event0 = make_pc_event(true, 0x200);
+    state.pc_event1 = make_pc_event(true, 0x100);
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 0, EVENT_CORE_PC_RANGE_0_1, 0);
+    state.update_pc(0x150);
+    assert!(state.is_halted(), "range works regardless of endpoint order");
+}
+
+#[test]
+fn pc_range_2_3_fires_when_in_range() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.pc_event2 = make_pc_event(true, 0x400);
+    state.pc_event3 = make_pc_event(true, 0x500);
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 0, EVENT_CORE_PC_RANGE_2_3, 0);
+    state.update_pc(0x480);
+    assert!(state.is_halted(), "Core_PC_Range_2_3 must fire when PC is in [PC2, PC3]");
+}
+
+#[test]
+fn pc_event_resume_clears_pc_event_cause() {
+    // Halt via PC_Event_Halt gate, then send a Resume event.
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.pc_event0 = make_pc_event(true, 0x100);
+    state.debug_ctrl2 = 1 << DBG_CTRL2_PC_EVENT_HALT_LSB;
+    // Resume on a non-PC event so we can drive resume directly.
+    state.debug_ctrl1 = make_dbg_ctrl1(40, 0, 0, 0);
+    state.update_pc(0x100);
+    assert!(state.is_halted());
+    state.check_event_halt(40); // resume
+    assert!(!state.is_halted(), "resume event must clear halt");
+    let status = state.read_debug_status();
+    assert_eq!(status, 0, "all halt-cause latches must clear on resume");
+}
+
+#[test]
+fn reset_clears_pc_event_registers() {
+    let mut state = CoreDebugState::new();
+    state.write_register(REG_PC_EVENT0, make_pc_event(true, 0x100));
+    state.write_register(REG_PC_EVENT3, make_pc_event(true, 0x3FFF));
+    // Assert reset.
+    state.write_control(CTRL_RESET_MASK);
+    assert_eq!(state.read_register(REG_PC_EVENT0), Some(0));
+    assert_eq!(state.read_register(REG_PC_EVENT3), Some(0));
+}
+
+#[test]
+fn pc_event_match_after_reset_does_not_fire() {
+    // Configuration written, then reset, then PC update at the previously
+    // matched address: must not fire because PC_Event0 was cleared.
+    let mut state = CoreDebugState::new();
+    state.write_register(REG_PC_EVENT0, make_pc_event(true, 0x100));
+    state.write_register(REG_DEBUG_CONTROL1, make_dbg_ctrl1(0, 0, EVENT_CORE_PC_0, 0));
+    state.write_control(CTRL_RESET_MASK);
+    state.write_control(CTRL_ENABLE_MASK);
+    state.update_pc(0x100);
+    assert!(!state.is_halted(), "PC_Event registers must be cleared by reset");
+}
