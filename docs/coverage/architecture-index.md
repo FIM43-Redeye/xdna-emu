@@ -60,7 +60,7 @@ MemTile = mem tile (row 1 on NPU1), Shim = row 0.
 | Core control (enable / done / reset) | AM025 `Core_Control`, `Core_Status` | MODELED | `src/device/core_debug/` | enable, halt, done, reset paths |
 | Core debug (halt / step / breakpoint) | AM025 `Debug_*` | PARTIAL | `src/device/core_debug/` | Halt + status bits modeled; programmable breakpoints / single-step PC trap not wired through interpreter. |
 | Core error halt | AM025 `Error_Halt_Control` / `Error_Halt_Event` | MODELED | `src/device/core_debug/mod.rs:75`, `src/interpreter/core/interpreter.rs::raise_instr_error` | Generic `error_halt` path fires `INSTR_ERROR` (event 69) into core_trace + core_perf_counters at every CoreStatus::Error transition (decode failure, missing program memory, executor Error). Sets Core_Status bit 19. ECC errors still fire ECC_ERROR_STALL (bit 17) via `set_ecc_error`. Other error sources (saturation, watchdog) not yet detected. |
-| Watchpoint hardware (memory-address triggers) | AM025 Compute mem `WatchPoint0/1` (2) | MODELED | `src/interpreter/execute/cycle_accurate.rs::matching_watchpoint_events` | Compute slots at 0x14100/4 with `WriteStrobes==0xF` gate, direction filter (Read/Write bits 31/30), 16-byte-aligned 12-bit address comparator [15:4]. Fires `WATCHPOINT_0/1` (mem events 16/17) into mem_trace + mem_perf_counters on every matching scalar load/store. **Scalar-only**: vector loads/stores skip the check (record_memory_access guards on `!op.is_vector`). **Wildcard filters**: AXI_Access [29], DMA_Access [28], and quadrant bits [27:24] are not consulted, so any matching direction+address fires. **Approximate address**: takes first pointer source's base+immediate offset, ignoring modifiers/post-increments. DMA-engine path and core-halt-on-hit are deferred. Distinct from `XDNA_EMU_WATCH` env-var debug aid. |
+| Watchpoint hardware (memory-address triggers) | AM025 Compute mem `WatchPoint0/1` (2) | MODELED | `src/interpreter/execute/cycle_accurate.rs::matching_watchpoint_events` | Compute slots at 0x14100/4 with `WriteStrobes==0xF` gate, direction filter (Read/Write bits 31/30), 16-byte-aligned 12-bit address comparator [15:4]. Fires `WATCHPOINT_0/1` (mem events 16/17) into mem_trace + mem_perf_counters on every matching load/store (scalar AND vector -- the comparator sits at the bank interface and doesn't care which engine issued the access). **Wildcard filters**: AXI_Access [29], DMA_Access [28], and quadrant bits [27:24] are not consulted, so any matching direction+address fires. **Effective address**: `record_memory_access` dispatches through `MemoryUnit::get_address` / `get_store_address`, so indexed addressing through modifier registers (`[pN, mK]`) lands the watchpoint on the address the access actually hits, not the bare pointer. Post-modify (`op.post_modify`) is applied after the access and is correctly excluded from the recorded address. Distinct from `XDNA_EMU_WATCH` env-var debug aid. |
 | Data memory (64KB, banked) | aie-rt `memory/`, AM025 | MODELED | `src/device/banking.rs`, `src/interpreter/timing/memory.rs` | 8 banks × 128-bit, conflict detection done. |
 | Bank conflict events (intercore / intracore) | aietools events `MEM_CONFLICT_INTERCORE`, `_INTRACORE`, `DM_BANK_CONFLICT` | MODELED | `src/interpreter/execute/cycle_accurate.rs` | Per-bank `MEM_CONFLICT_DM_BANK_N` (events 77..84 compute / 112..120 memtile) fired into mem_trace + mem_perf_counters when scalar load/store conflict detected. INTERCORE/INTRACORE not modeled separately. |
 | ECC (data memory) | aie-rt `pm/xaie_ecc.c` | OUT_OF_SCOPE | — | Status bit readable; no scrubber, no fault injection. Document as OOS unless workloads require. |
@@ -206,10 +206,11 @@ warrants.
 Watchpoint follow-ups (status confirmed via 2026-05-14 deep-validation
 pass; field positions and event IDs cross-checked against AM025 +
 aie-rt and locked in by 17 unit tests):
-- **Vector loads/stores skip watchpoint** -- `record_memory_access` arm
-  guards on `if !op.is_vector`, so VLD/VST never fire `WATCHPOINT_N`.
-  HW comparator does see them. Easy to fix once the vector-path address
-  decoding is trusted; gating is one line.
+- ~~**Vector loads/stores skip watchpoint**~~ **FIXED** (task #62).
+  The `if !op.is_vector` guard now scopes only the bank-conflict block;
+  `fire_watchpoint_events` runs unconditionally so VLD/VST fire
+  `WATCHPOINT_N` exactly like scalar loads/stores. Locked in by
+  `test_watchpoint_vector_load_fires_event`.
 - ~~**DMA-engine path doesn't fire watchpoints**~~ **FIXED 2026-05-14**
   (task #68 + #69). `transfer_mm2s` and `transfer_s2mm` (incl. compressed
   and decompressed variants) now call `fire_watchpoint_events_with_origin`
@@ -227,11 +228,20 @@ aie-rt and locked in by 17 unit tests):
   for both S2MM and MM2S, neighbour DMA-only filter exclusion, neighbour
   East-quadrant filter inclusion, and missing-neighbour fallback to Own
   with `Dma` origin.
-- **Approximate address calculation** -- `record_memory_access` takes
-  the first pointer source's `base + immediate offset` only, ignoring
-  modifiers/post-increments. Adequate for bank-conflict tracking;
-  watchpoints inherit the same approximation and may report a hit on
-  the nominal pointer rather than the modified address.
+- ~~**Approximate address calculation**~~ **FIXED 2026-05-15** (task
+  #66). `record_memory_access` now routes through
+  `MemoryUnit::get_address` / `get_store_address` (made `pub(crate)` for
+  this), the same helpers the actual load/store path uses. Indexed
+  addressing through modifier registers (`[pN, mK]`) is now reflected in
+  both bank-conflict tracking and watchpoint matching, where it was
+  previously dropped (the resolver only looked at the first PointerReg
+  / Memory operand, ignoring the trailing modifier). Post-modify
+  (`op.post_modify`) is intentionally still excluded -- the modifier
+  updates the base register *after* the access, so the address the
+  access lands on this cycle is the pre-modify value. Locked in by
+  4 unit tests (modifier-register effective address fires watchpoint;
+  same address does NOT fire at the bare-base watchpoint; post-modify
+  fires at base and not at base+imm; store path mirrors load path).
 - ~~**AXI_Access / DMA_Access filter bits unmodeled**~~ **FIXED
   2026-05-14** -- `matching_watchpoint_events_with_origin` now consults
   AXI_Access [29 compute / 27 memtile], DMA_Access [28 / 26], and the

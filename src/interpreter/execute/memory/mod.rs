@@ -1272,7 +1272,12 @@ impl MemoryUnit {
     /// 1. `Memory { base, offset }` -- pre-scaled byte offset from AG decode
     /// 2. `[PointerReg, ModifierReg]` -- indexed register (byte offset in modifier)
     /// 3. `[PointerReg, Immediate/ScalarReg]` -- word-scaled offset
-    fn get_address(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
+    ///
+    /// Exposed `pub(crate)` so cycle-accurate accounting (bank-conflict
+    /// tracking and watchpoint matching in `record_memory_access`) can use
+    /// the same effective address the load actually accesses, instead of
+    /// re-deriving an approximation that drops the modifier-register offset.
+    pub(crate) fn get_address(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
         // Search all sources for Memory operand (encapsulates ptr+offset, already scaled).
         // For stores, the data source may precede the address operand.
         for src in &op.sources {
@@ -1316,7 +1321,12 @@ impl MemoryUnit {
     /// 3. Kernel layout: sources[0]=value, sources[1]=ptr, sources[2]=index
     ///    The index is a modifier register (dj/m) containing a byte offset
     ///    for indexed addressing (`st.s16 rN, [pM, djK]`).
-    fn get_store_address(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
+    ///
+    /// Exposed `pub(crate)` for the same reason as [`get_address`]: bank-conflict
+    /// tracking and watchpoint matching call this from
+    /// `CycleAccurateExecutor::record_memory_access` so the recorded address
+    /// matches the address the store actually writes to.
+    pub(crate) fn get_store_address(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
         // First check for Memory operand anywhere (encapsulates ptr+offset)
         for src in &op.sources {
             if let Operand::Memory { base, offset } = src {

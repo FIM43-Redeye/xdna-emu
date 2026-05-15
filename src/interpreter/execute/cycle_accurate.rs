@@ -27,7 +27,7 @@
 
 use crate::device::arch_handle;
 use crate::device::tile::Tile;
-use crate::interpreter::bundle::{Operand, SlotOp, VliwBundle};
+use crate::interpreter::bundle::{SlotOp, VliwBundle};
 use xdna_archspec::aie2::isa::SemanticOp;
 use crate::interpreter::state::{EventType, ExecutionContext};
 use crate::interpreter::timing::{HazardDetector, HazardStats, MemoryAccess, MemoryModel, MemoryQuadrant};
@@ -206,21 +206,20 @@ impl CycleAccurateExecutor {
         if !matches!(op.semantic, Some(SemanticOp::Load) | Some(SemanticOp::Store)) {
             return;
         }
-        // Resolve address from the first pointer register in operands. This is
-        // approximate (doesn't account for modifiers/post-increments) but
-        // sufficient for both bank-conflict tracking and watchpoint matching.
-        let addr = op
-            .sources
-            .iter()
-            .find_map(|src| match src {
-                Operand::Memory { base, offset } => {
-                    Some(ctx.pointer.read(*base).wrapping_add(*offset as i32 as u32))
-                }
-                Operand::PointerReg(r) => Some(ctx.pointer.read(*r)),
-                _ => None,
-            })
-            .unwrap_or(0);
+        // Resolve the effective address using the same helpers the actual
+        // load/store path uses. This picks up indexed addressing through
+        // modifier registers (`[pN, mK]`), which the previous ad-hoc resolver
+        // dropped -- a non-zero modifier shifted the recorded address out
+        // from under both bank-conflict tracking and watchpoint matching.
+        // Post-modify (`op.post_modify`) is intentionally NOT applied: it
+        // updates the base register *after* the access, so the address that
+        // hits memory this cycle is the pre-modify value.
         let is_store = matches!(op.semantic, Some(SemanticOp::Store));
+        let addr = if is_store {
+            MemoryUnit::get_store_address(op, ctx)
+        } else {
+            MemoryUnit::get_address(op, ctx)
+        };
         let cycle = ctx.cycles;
         let pc = ctx.pc();
 
@@ -1723,6 +1722,164 @@ mod tests {
         assert!(
             tile.mem_perf_counters.is_active(0),
             "vector load must fire WATCHPOINT_0; counter would have stayed idle if the watchpoint check skipped vector ops"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Effective-address tracking in record_memory_access (task #66)
+    //
+    // Previously record_memory_access resolved the recorded address from
+    // the first PointerReg or Memory operand it saw, which dropped the
+    // modifier-register contribution in indexed addressing (`[pN, mK]`).
+    // The fix routes record_memory_access through MemoryUnit::get_address /
+    // get_store_address -- the same helpers the actual load/store path
+    // uses -- so bank-conflict tracking and watchpoint matching see the
+    // address that hits memory, not the bare pointer.
+    //
+    // Post-modify (`op.post_modify`) is intentionally NOT included: the
+    // modifier updates the base register *after* the access, so the address
+    // the access lands on this cycle is the pre-modify base.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_record_memory_access_uses_modifier_register_indexed_address() {
+        // `lda r0, [p0, m0]` with p0=0x100 and m0=0x40 reads address 0x140.
+        // A watchpoint armed at the effective address 0x140 must fire.
+        // Under the prior approximation it would have stayed silent because
+        // record_memory_access only saw p0 and recorded 0x100.
+        use xdna_archspec::aie2::trace_events::mem_events;
+
+        let mut tile = Tile::compute(0, 2);
+        tile.write_data_u32(0x140, 0xFEEDFACE);
+        tile.registers.insert(0x14100, compute_wp(true, false, 0x140));
+        tile.mem_perf_counters
+            .write_control_start_stop(mem_events::WATCHPOINT_0 as u32, 0, 1, 7);
+        assert!(!tile.mem_perf_counters.is_active(0), "counter must start idle");
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x100);
+        ctx.modifier.write(0, 0x40);
+
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Word)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0))
+            .with_source(Operand::ModifierReg(0))]);
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        assert!(
+            tile.mem_perf_counters.is_active(0),
+            "indexed load must fire watchpoint at base+modifier (0x140), not base alone (0x100)"
+        );
+    }
+
+    #[test]
+    fn test_record_memory_access_modifier_register_does_not_fire_at_base_addr() {
+        // Same setup as the previous test, but the watchpoint sits at the
+        // BASE pointer (0x100) instead of the effective address (0x140).
+        // The pre-fix approximation would have wrongly fired here. After the
+        // fix, only the effective address sees a hit and the base stays cold.
+        use xdna_archspec::aie2::trace_events::mem_events;
+
+        let mut tile = Tile::compute(0, 2);
+        tile.write_data_u32(0x140, 0xFEEDFACE);
+        tile.registers.insert(0x14100, compute_wp(true, false, 0x100));
+        tile.mem_perf_counters
+            .write_control_start_stop(mem_events::WATCHPOINT_0 as u32, 0, 1, 7);
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x100);
+        ctx.modifier.write(0, 0x40);
+
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Word)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0))
+            .with_source(Operand::ModifierReg(0))]);
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        assert!(
+            !tile.mem_perf_counters.is_active(0),
+            "watchpoint at the base pointer must not fire when the access lands at base+modifier"
+        );
+    }
+
+    #[test]
+    fn test_record_memory_access_post_modify_does_not_shift_recorded_address() {
+        // `lda r0, [p0], #16` reads from p0 *first*, THEN updates p0 += 16.
+        // So the address that hits memory this cycle is the pre-modify base
+        // (0x100), and the watchpoint there must fire. A watchpoint at the
+        // post-modify destination (0x110) must NOT fire -- that address won't
+        // see traffic until the next access.
+        use crate::interpreter::bundle::PostModify;
+        use xdna_archspec::aie2::trace_events::mem_events;
+
+        let mut tile = Tile::compute(0, 2);
+        tile.write_data_u32(0x100, 0xCAFED00D);
+        // Slot 0 watches 0x100; slot 1 watches the would-be post-modify destination.
+        tile.registers.insert(0x14100, compute_wp(true, false, 0x100));
+        tile.registers.insert(0x14104, compute_wp(true, false, 0x110));
+        tile.mem_perf_counters
+            .write_control_start_stop(mem_events::WATCHPOINT_0 as u32, 0, 1, 7);
+        tile.mem_perf_counters
+            .write_control_start_stop(mem_events::WATCHPOINT_1 as u32, 0, 1, 7);
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(0, 0x100);
+
+        let mut load = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Word)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0));
+        load.post_modify = PostModify::Immediate(16);
+        let bundle = make_bundle(vec![load]);
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        assert!(
+            tile.mem_perf_counters.is_active(0),
+            "watchpoint at the pre-modify address must fire (the access lands there)"
+        );
+        assert!(
+            !tile.mem_perf_counters.is_active(1),
+            "watchpoint at the post-modify destination must NOT fire -- the modify happens after the access"
+        );
+        // And as a sanity check the pointer DID advance, so we know post-modify ran.
+        assert_eq!(ctx.pointer.read(0), 0x110, "post-modify must advance the pointer for next access");
+    }
+
+    #[test]
+    fn test_record_memory_access_store_uses_modifier_register_indexed_address() {
+        // Same fix path for stores: record_memory_access dispatches to
+        // get_store_address, which honors `[pN, djM]` indexed layout. A store
+        // with p1=0x200 and dj1=0x20 lands at 0x220; the watchpoint armed
+        // there must fire on writes.
+        use xdna_archspec::aie2::trace_events::mem_events;
+
+        let mut tile = Tile::compute(0, 2);
+        tile.registers.insert(0x14100, compute_wp(false, true, 0x220));
+        tile.mem_perf_counters
+            .write_control_start_stop(mem_events::WATCHPOINT_0 as u32, 0, 1, 7);
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(0, 0xABCDEF01);
+        ctx.pointer.write(1, 0x200);
+        ctx.modifier.write(1, 0x20);
+
+        // Store layout matches the test/legacy path in get_store_address:
+        // sources[0]=pointer, sources[1]=modifier (byte offset).
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .with_mem_width(MemWidth::Word)
+            .with_source(Operand::PointerReg(1))
+            .with_source(Operand::ModifierReg(1))]);
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        assert!(
+            tile.mem_perf_counters.is_active(0),
+            "indexed store must fire watchpoint at base+modifier (0x220), not base alone (0x200)"
         );
     }
 
