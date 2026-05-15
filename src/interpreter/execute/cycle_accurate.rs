@@ -30,7 +30,7 @@ use crate::device::tile::Tile;
 use crate::interpreter::bundle::{Operand, SlotOp, VliwBundle};
 use xdna_archspec::aie2::isa::SemanticOp;
 use crate::interpreter::state::{EventType, ExecutionContext};
-use crate::interpreter::timing::{HazardDetector, HazardStats, MemoryAccess, MemoryModel};
+use crate::interpreter::timing::{HazardDetector, HazardStats, MemoryAccess, MemoryModel, MemoryQuadrant};
 use crate::interpreter::traits::{ExecuteResult, Executor};
 
 use super::cascade::{CascadeOps, CascadeResult};
@@ -312,6 +312,31 @@ fn fire_bank_conflict_events(tile: &mut Tile, banks_mask: u8, cycle: u64, pc: u3
     }
 }
 
+/// Initiator of a memory access seen by the watchpoint comparator.
+///
+/// AM025 watchpoint registers separately enable filters for AXI accesses,
+/// local DMA accesses, and accesses originating from each neighbour
+/// quadrant. `Core` is the implicit fall-through: a core load/store on the
+/// executing tile, with no AM025 enable bit of its own. When the slot's
+/// origin filter bits ([29:24] compute / [27:24] memtile) are all zero,
+/// the slot fires regardless of origin (wildcard); when any are set, the
+/// access origin must match one of the enabled bits.
+// Variants other than `Core` aren't consumed by any caller yet; they wait
+// on the DMA-engine watchpoint hookup (task #68). Suppress until then.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessOrigin {
+    /// Local core load/store on the executing tile.
+    Core,
+    /// AXI-mapped access (host-side or NoC).
+    Axi,
+    /// Local DMA engine on the executing tile.
+    Dma,
+    /// Cross-tile access from the named neighbour quadrant. `Local` is
+    /// equivalent to `Core` for filter purposes (own-tile access).
+    Neighbour(MemoryQuadrant),
+}
+
 /// Per-tile-kind layout of the WatchPoint registers.
 ///
 /// Compute mem-module exposes 2 slots at 0x14100/4 with direction bits at
@@ -321,11 +346,22 @@ fn fire_bank_conflict_events(tile: &mut Tile, banks_mask: u8, cycle: u64, pc: u3
 /// comparator [18:4] (16-byte aligned, covers the full 512KB memtile mem).
 /// Both layouts gate the slot on WriteStrobes [23:20] == 0xF, the AM025
 /// "active slot" sentinel.
+///
+/// Origin filter bit positions per AM025:
+///   compute: AXI [29], DMA [28], East [27], North [26], West [25], South [24]
+///   memtile: AXI [27], DMA [26], East [25], West [24]   (no N/S)
 struct WatchpointLayout {
     slot_offsets: &'static [u32],
     addr_mask: u32,
     read_bit: u8,
     write_bit: u8,
+    axi_bit: u8,
+    dma_bit: u8,
+    east_bit: u8,
+    west_bit: u8,
+    /// Memtile lacks N/S quadrant filter bits.
+    north_bit: Option<u8>,
+    south_bit: Option<u8>,
     event_base: u8,
 }
 
@@ -338,6 +374,12 @@ fn watchpoint_layout(kind: crate::device::tile::TileKind) -> Option<WatchpointLa
             addr_mask: 0xFFF0,
             read_bit: 31,
             write_bit: 30,
+            axi_bit: 29,
+            dma_bit: 28,
+            east_bit: 27,
+            north_bit: Some(26),
+            west_bit: 25,
+            south_bit: Some(24),
             event_base: mem_events::WATCHPOINT_0,
         }),
         TileKind::Mem => Some(WatchpointLayout {
@@ -345,16 +387,74 @@ fn watchpoint_layout(kind: crate::device::tile::TileKind) -> Option<WatchpointLa
             addr_mask: 0x7FFF0,
             read_bit: 29,
             write_bit: 28,
+            axi_bit: 27,
+            dma_bit: 26,
+            east_bit: 25,
+            west_bit: 24,
+            north_bit: None,
+            south_bit: None,
             event_base: memtile_events::WATCHPOINT_0,
         }),
         TileKind::ShimNoc | TileKind::ShimPl => None,
     }
 }
 
-/// Pure decision: which WATCHPOINT_N event IDs should fire for an access at
-/// `addr` with direction `is_write`, given the tile's current WatchPoint
-/// register programming. Returns slot indices in declaration order.
+/// Build the origin-filter bitmask currently programmed in `value`. Each
+/// bit position corresponds to one origin (AXI/DMA/E/N/W/S). When the
+/// returned mask is 0 the slot is wildcard (all origins match).
+fn slot_origin_filter(value: u32, layout: &WatchpointLayout) -> u32 {
+    let mut mask = 0u32;
+    mask |= ((value >> layout.axi_bit) & 1) << layout.axi_bit;
+    mask |= ((value >> layout.dma_bit) & 1) << layout.dma_bit;
+    mask |= ((value >> layout.east_bit) & 1) << layout.east_bit;
+    mask |= ((value >> layout.west_bit) & 1) << layout.west_bit;
+    if let Some(nb) = layout.north_bit {
+        mask |= ((value >> nb) & 1) << nb;
+    }
+    if let Some(sb) = layout.south_bit {
+        mask |= ((value >> sb) & 1) << sb;
+    }
+    mask
+}
+
+/// Map an AccessOrigin to the bit position it requires in the slot's
+/// origin filter. Returns None for `Core` and `Neighbour(Local)` -- those
+/// origins have no AM025 enable bit, so a non-zero filter mask never
+/// matches them.
+fn origin_required_bit(origin: AccessOrigin, layout: &WatchpointLayout) -> Option<u8> {
+    match origin {
+        AccessOrigin::Core | AccessOrigin::Neighbour(MemoryQuadrant::Local) => None,
+        AccessOrigin::Axi => Some(layout.axi_bit),
+        AccessOrigin::Dma => Some(layout.dma_bit),
+        AccessOrigin::Neighbour(MemoryQuadrant::East) => Some(layout.east_bit),
+        AccessOrigin::Neighbour(MemoryQuadrant::West) => Some(layout.west_bit),
+        AccessOrigin::Neighbour(MemoryQuadrant::North) => layout.north_bit,
+        AccessOrigin::Neighbour(MemoryQuadrant::South) => layout.south_bit,
+    }
+}
+
+/// Pure decision: which WATCHPOINT_N event IDs should fire for a Core
+/// access at `addr` with direction `is_write`. Convenience wrapper for
+/// the common case; for non-Core origins, see
+/// [`matching_watchpoint_events_with_origin`].
 fn matching_watchpoint_events(tile: &Tile, addr: u32, is_write: bool) -> Vec<u8> {
+    matching_watchpoint_events_with_origin(tile, addr, is_write, AccessOrigin::Core)
+}
+
+/// Pure decision with explicit access origin. The slot fires when:
+///   - WriteStrobes [23:20] == 0xF (slot active)
+///   - The matching direction bit is set
+///   - The address comparator matches (after masking)
+///   - AND if any origin filter bits are set in the slot, the access
+///     origin must correspond to one of those bits. When all filter
+///     bits are zero, the slot is wildcard and any origin (including
+///     Core) matches.
+fn matching_watchpoint_events_with_origin(
+    tile: &Tile,
+    addr: u32,
+    is_write: bool,
+    origin: AccessOrigin,
+) -> Vec<u8> {
     let Some(layout) = watchpoint_layout(tile.tile_kind) else {
         return Vec::new();
     };
@@ -379,6 +479,16 @@ fn matching_watchpoint_events(tile: &Tile, addr: u32, is_write: bool) -> Vec<u8>
         }
         if (addr & layout.addr_mask) != (value & layout.addr_mask) {
             continue;
+        }
+        // Origin filter: when any of the AM025 origin bits ([29:24] compute,
+        // [27:24] memtile) are set, the access must match one of them.
+        // Wildcard (all bits 0) admits any origin, including Core.
+        let origin_filter = slot_origin_filter(value, &layout);
+        if origin_filter != 0 {
+            match origin_required_bit(origin, &layout) {
+                Some(bit) if origin_filter & (1u32 << bit) != 0 => {}
+                _ => continue,
+            }
         }
         hits.push(layout.event_base + i as u8);
     }
@@ -1598,6 +1708,210 @@ mod tests {
             tile.mem_perf_counters.is_active(0),
             "vector load must fire WATCHPOINT_0; counter would have stayed idle if the watchpoint check skipped vector ops"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Origin filter semantics (AXI / DMA / quadrant bits)
+    // ------------------------------------------------------------------
+
+    /// Build a compute-tile watchpoint register value with explicit
+    /// origin-filter bits. `axi`/`dma`/`east`/`north`/`west`/`south` set
+    /// bits 29/28/27/26/25/24 respectively.
+    fn compute_wp_with_filters(
+        read: bool,
+        write: bool,
+        addr: u32,
+        axi: bool,
+        dma: bool,
+        east: bool,
+        north: bool,
+        west: bool,
+        south: bool,
+    ) -> u32 {
+        let mut v = compute_wp(read, write, addr);
+        if axi {
+            v |= 1 << 29;
+        }
+        if dma {
+            v |= 1 << 28;
+        }
+        if east {
+            v |= 1 << 27;
+        }
+        if north {
+            v |= 1 << 26;
+        }
+        if west {
+            v |= 1 << 25;
+        }
+        if south {
+            v |= 1 << 24;
+        }
+        v
+    }
+
+    #[test]
+    fn test_watchpoint_origin_filter_zero_is_wildcard_for_core() {
+        // No origin bits set -> any origin (including Core) matches.
+        // Locks in backwards compatibility: every existing test relies on
+        // this implicit wildcard.
+        use xdna_archspec::aie2::trace_events::mem_events;
+        let mut tile = Tile::compute(0, 2);
+        tile.registers.insert(0x14100, compute_wp(true, false, 0x100));
+        let hits = matching_watchpoint_events_with_origin(&tile, 0x100, false, AccessOrigin::Core);
+        assert_eq!(hits, vec![mem_events::WATCHPOINT_0]);
+    }
+
+    #[test]
+    fn test_watchpoint_origin_filter_dma_only_blocks_core() {
+        // DMA_Access bit set, no other origin bits. Core access must NOT
+        // fire (filter is non-zero and Core has no enable bit). DMA
+        // access at the same address WOULD fire, but no caller passes
+        // AccessOrigin::Dma yet (task #68).
+        let mut tile = Tile::compute(0, 2);
+        tile.registers.insert(
+            0x14100,
+            compute_wp_with_filters(true, false, 0x100, false, true, false, false, false, false),
+        );
+        let hits_core = matching_watchpoint_events_with_origin(&tile, 0x100, false, AccessOrigin::Core);
+        assert!(hits_core.is_empty(), "Core access must not fire when only DMA_Access is enabled");
+        let hits_dma = matching_watchpoint_events_with_origin(&tile, 0x100, false, AccessOrigin::Dma);
+        assert_eq!(hits_dma.len(), 1, "DMA access must fire when DMA_Access is enabled");
+    }
+
+    #[test]
+    fn test_watchpoint_origin_filter_axi_matches_axi_only() {
+        let mut tile = Tile::compute(0, 2);
+        tile.registers.insert(
+            0x14100,
+            compute_wp_with_filters(true, false, 0x100, true, false, false, false, false, false),
+        );
+        assert!(matching_watchpoint_events_with_origin(&tile, 0x100, false, AccessOrigin::Core).is_empty());
+        assert!(matching_watchpoint_events_with_origin(&tile, 0x100, false, AccessOrigin::Dma).is_empty());
+        assert_eq!(matching_watchpoint_events_with_origin(&tile, 0x100, false, AccessOrigin::Axi).len(), 1);
+    }
+
+    #[test]
+    fn test_watchpoint_origin_filter_quadrant_bits_compute() {
+        // Each quadrant bit independently enables that quadrant. Sweep
+        // all four to confirm the bit-to-quadrant mapping.
+        let mut tile = Tile::compute(0, 2);
+        let cases = [
+            (true, false, false, false, MemoryQuadrant::East),
+            (false, true, false, false, MemoryQuadrant::North),
+            (false, false, true, false, MemoryQuadrant::West),
+            (false, false, false, true, MemoryQuadrant::South),
+        ];
+        for (e, n, w, s, expected_dir) in cases {
+            tile.registers
+                .insert(0x14100, compute_wp_with_filters(true, false, 0x100, false, false, e, n, w, s));
+            // The matching quadrant fires.
+            assert_eq!(
+                matching_watchpoint_events_with_origin(
+                    &tile,
+                    0x100,
+                    false,
+                    AccessOrigin::Neighbour(expected_dir)
+                )
+                .len(),
+                1,
+                "quadrant {expected_dir:?} must fire when its bit is set"
+            );
+            // Core does not fire when filter is non-zero.
+            assert!(
+                matching_watchpoint_events_with_origin(&tile, 0x100, false, AccessOrigin::Core).is_empty()
+            );
+            // Other quadrants don't match.
+            for other in
+                [MemoryQuadrant::East, MemoryQuadrant::North, MemoryQuadrant::West, MemoryQuadrant::South]
+            {
+                if other == expected_dir {
+                    continue;
+                }
+                assert!(
+                    matching_watchpoint_events_with_origin(
+                        &tile,
+                        0x100,
+                        false,
+                        AccessOrigin::Neighbour(other)
+                    )
+                    .is_empty(),
+                    "quadrant {other:?} must not fire when only {expected_dir:?} is enabled"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_watchpoint_origin_filter_multiple_bits_or_semantics() {
+        // AXI_Access | DMA_Access set -> both AXI and DMA accesses fire.
+        // (Direction match still required.) Confirms enable bits are OR'd
+        // within the origin filter category.
+        let mut tile = Tile::compute(0, 2);
+        tile.registers.insert(
+            0x14100,
+            compute_wp_with_filters(true, false, 0x100, true, true, false, false, false, false),
+        );
+        assert_eq!(matching_watchpoint_events_with_origin(&tile, 0x100, false, AccessOrigin::Axi).len(), 1);
+        assert_eq!(matching_watchpoint_events_with_origin(&tile, 0x100, false, AccessOrigin::Dma).len(), 1);
+        assert!(matching_watchpoint_events_with_origin(&tile, 0x100, false, AccessOrigin::Core).is_empty());
+    }
+
+    #[test]
+    fn test_watchpoint_origin_filter_memtile_has_no_north_south_quadrant() {
+        // Memtile WatchPoint registers only have East/West neighbour
+        // quadrant bits ([25:24]) -- no North/South. AccessOrigin::
+        // Neighbour(North) on memtile must never match, regardless of
+        // register programming.
+        let mut tile = Tile::mem_tile(0, 1);
+        // Set every memtile origin filter bit (axi+dma+east+west).
+        let mut value = memtile_wp(true, false, 0x100);
+        value |= 0xF << 24;
+        tile.registers.insert(0x94100, value);
+        // East/West/AXI/DMA fire because their bits are set.
+        for origin in [
+            AccessOrigin::Axi,
+            AccessOrigin::Dma,
+            AccessOrigin::Neighbour(MemoryQuadrant::East),
+            AccessOrigin::Neighbour(MemoryQuadrant::West),
+        ] {
+            assert_eq!(
+                matching_watchpoint_events_with_origin(&tile, 0x100, false, origin).len(),
+                1,
+                "{origin:?} must fire on memtile"
+            );
+        }
+        // North/South have no enable bit on memtile -> never match when
+        // the origin filter is non-zero.
+        for origin in
+            [AccessOrigin::Neighbour(MemoryQuadrant::North), AccessOrigin::Neighbour(MemoryQuadrant::South)]
+        {
+            assert!(
+                matching_watchpoint_events_with_origin(&tile, 0x100, false, origin).is_empty(),
+                "{origin:?} must not fire on memtile (no enable bit)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_watchpoint_origin_filter_neighbour_local_treated_as_core() {
+        // Neighbour(Local) is the "own-tile" quadrant from the executor's
+        // perspective; for filter purposes it behaves like Core (no
+        // AM025 enable bit). Set DMA_Access only and confirm neither
+        // Core nor Neighbour(Local) fires.
+        let mut tile = Tile::compute(0, 2);
+        tile.registers.insert(
+            0x14100,
+            compute_wp_with_filters(true, false, 0x100, false, true, false, false, false, false),
+        );
+        assert!(matching_watchpoint_events_with_origin(&tile, 0x100, false, AccessOrigin::Core).is_empty());
+        assert!(matching_watchpoint_events_with_origin(
+            &tile,
+            0x100,
+            false,
+            AccessOrigin::Neighbour(MemoryQuadrant::Local)
+        )
+        .is_empty());
     }
 
     #[test]

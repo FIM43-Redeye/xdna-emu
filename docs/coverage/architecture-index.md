@@ -219,14 +219,23 @@ aie-rt and locked in by 17 unit tests):
   modifiers/post-increments. Adequate for bank-conflict tracking;
   watchpoints inherit the same approximation and may report a hit on
   the nominal pointer rather than the modified address.
-- **AXI_Access / DMA_Access filter bits unmodeled** -- AM025 fields
-  [29:28] (compute) / [27:26] (memtile) gate the slot to specific
-  initiator types. Today we treat any matching direction+address as a
-  hit regardless of these bits; effectively wildcard for the internal
-  scalar path.
-- **East/North/West/South_Access quadrant bits unmodeled** -- AM025
-  fields [27:24] gate on which neighbour quadrant initiated the access.
-  Same wildcard treatment as above.
+- ~~**AXI_Access / DMA_Access filter bits unmodeled**~~ **FIXED
+  2026-05-14** -- `matching_watchpoint_events_with_origin` now consults
+  AXI_Access [29 compute / 27 memtile], DMA_Access [28 / 26], and the
+  quadrant bits. Semantics: when any origin filter bit is set, the
+  access origin must match one of the enabled bits; when all bits are
+  zero, the slot is wildcard (any origin including Core fires). Core
+  has no AM025 enable bit, so it never matches a non-zero filter --
+  consistent with HW. The DMA hookup (task #68) and cross-tile DMA
+  quadrant detection (task #69) are still outstanding -- those are the
+  consumers that will pass non-Core origins; today the only caller
+  passes Core, so the new filter logic is exercised only by tests.
+  But the semantics are pinned and ready.
+- ~~**East/North/West/South_Access quadrant bits unmodeled**~~ **FIXED
+  2026-05-14** along with the above. Compute supports all four
+  quadrants; memtile only has E/W per AM025, so Neighbour(North) and
+  Neighbour(South) on memtile silently never match (equivalent to no
+  enable bit existing), which is what HW would do.
 - ~~**Core-halt-on-hit not wired**~~ **FIXED 2026-05-14** -- AIE2 has
   a *general* event-driven debug halt mechanism (Debug_Control1/2 +
   Debug_Status, per AM025), not a watchpoint-specific halt bit. We
