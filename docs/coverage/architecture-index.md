@@ -296,6 +296,22 @@ aie-rt and locked in by 17 unit tests):
   consume cancels the pending step. There is no dedicated
   Debug_Status cause bit for single-step halts per AM025 -- the
   aggregate `halted` bit is the only signal.
+  Engine respects the halt **FIXED 2026-05-15**: the prior fix called
+  `request_halt` but the interpreter's `step` / `step_internal` only
+  gated on its own `CoreStatus::Halted`, so the engine kept advancing
+  the PC through any debug pause asserted via watchpoint event,
+  PC_Event halt, single-step latch, stall halt, or a host write to
+  Debug_Control0. Both step paths now check `tile.core_debug.is_halted()`
+  at the top and short-circuit with a new `StepResult::DebugHalt` (kept
+  distinct from `Halt` so the coordinator doesn't call `set_done` on a
+  transient pause). The coordinator handles `DebugHalt` by clearing
+  stall flags, leaving `all_halted = false` (engine keeps ticking, DMAs
+  continue, host can resume via Debug_Control0=0 or a matching resume
+  event), and not bumping the instruction or active-cycle counters.
+  Locked in by 3 interpreter tests covering: pre-halted core skips the
+  very first step, repeated halted steps stay pinned at the same PC and
+  resume cleanly, and `run()` surfaces `DebugHalt` to its caller with
+  zero cycles committed.
 
 Tile isolation follow-ups (status confirmed via 2026-05-14 deep-
 validation pass; gate sites cross-checked against aie-rt

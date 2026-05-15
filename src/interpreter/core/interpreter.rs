@@ -54,8 +54,17 @@ pub enum StepResult {
     WaitDma { channel: u8 },
     /// Stalled waiting on stream data.
     WaitStream { port: u8 },
-    /// Core halted.
+    /// Core halted (program-end / `HALT` instruction / fatal PC bound).
+    /// Distinct from [`DebugHalt`](Self::DebugHalt): this is terminal,
+    /// `core_debug.set_done(true)` is appropriate.
     Halt,
+    /// Core paused via a debug halt (Debug_Control0/1 host write,
+    /// watchpoint event halt, PC_Event halt, stall halt, or single-step
+    /// latch). Transient -- a host resume (Debug_Control0=0) or a matching
+    /// `Debug_Resume_Core_Event` clears it and the next step proceeds.
+    /// Coordinator must NOT call `set_done` on this -- the program isn't
+    /// finished, the core is just paused.
+    DebugHalt,
     /// Decode error.
     DecodeError(DecodeError),
     /// Execution error.
@@ -156,9 +165,21 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
         neighbors: Option<&mut crate::interpreter::execute::NeighborMemory>,
         view: Option<&crate::device::state::NeighborView>,
     ) -> StepResult {
-        // Check if halted
+        // Check if halted (program terminated).
         if self.is_halted() {
             return StepResult::Halt;
+        }
+
+        // Honor a debug halt asserted on the tile (host write to
+        // Debug_Control0, watchpoint event matching Debug_Halt_Core_EventN,
+        // PC_Event halt, stall halt, or a single-step latch consumed by the
+        // coordinator after the previous step). The interpreter's own status
+        // only tracks program-end termination, so without this gate the
+        // engine would keep stepping the core through a debug pause. The
+        // halt is transient -- next step retries and proceeds once the host
+        // or a Debug_Resume_Core_Event clears `core_debug.halted`.
+        if tile.core_debug.is_halted() {
+            return StepResult::DebugHalt;
         }
 
         // Try to resume from stall (pass neighbor locks for cross-tile routing)
@@ -443,9 +464,14 @@ where
     ///
     /// Returns the result of execution which indicates how to proceed.
     pub fn step(&mut self, ctx: &mut ExecutionContext, tile: &mut Tile) -> StepResult {
-        // Check if halted
+        // Check if halted (program terminated).
         if self.is_halted() {
             return StepResult::Halt;
+        }
+
+        // Honor a debug halt on the tile -- see step_internal for rationale.
+        if tile.core_debug.is_halted() {
+            return StepResult::DebugHalt;
         }
 
         // Try to resume from stall (no neighbor locks in simple step path)
@@ -767,6 +793,10 @@ where
             match self.step(ctx, tile) {
                 StepResult::Continue => continue,
                 result @ StepResult::Halt => return (result, ctx.cycles - start_cycles),
+                // Debug halt is transient -- a host could resume via Debug_Control0
+                // mid-run -- but the caller asked us to run; surfacing the pause
+                // lets them inspect state and decide whether to keep going.
+                result @ StepResult::DebugHalt => return (result, ctx.cycles - start_cycles),
                 result @ StepResult::DecodeError(_) => return (result, ctx.cycles - start_cycles),
                 result @ StepResult::ExecError(_) => return (result, ctx.cycles - start_cycles),
                 // On stall, count as one cycle and continue
@@ -874,6 +904,87 @@ mod tests {
         // Should remain halted
         let result = interpreter.step(&mut ctx, &mut tile);
         assert!(matches!(result, StepResult::Halt));
+    }
+
+    // -------------------------------------------------------------------
+    // Engine-honors-debug-halt (carry-over from #67)
+    //
+    // request_halt sets `tile.core_debug.halted` (host write to
+    // Debug_Control0, watchpoint event halt, PC_Event halt, single-step
+    // latch, stall halt). The interpreter must honor that flag and skip
+    // the step instead of advancing the PC. The halt is transient -- once
+    // the host clears it (or a Debug_Resume_Core_Event matches), the next
+    // step proceeds normally.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_step_skips_when_debug_halted() {
+        // request_halt before any step -- the very first call must skip.
+        let mut interpreter = make_interpreter();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = make_tile_with_program(&[0x00, 0x00, 0x00, 0x00]);
+
+        tile.core_debug.set_enabled(true);
+        assert!(tile.core_debug.request_halt(), "request_halt must take effect on enabled core");
+        assert!(tile.core_debug.is_halted());
+
+        let result = interpreter.step(&mut ctx, &mut tile);
+
+        assert!(matches!(result, StepResult::DebugHalt));
+        assert_eq!(ctx.pc(), 0, "debug-halted core must not advance PC");
+        assert_eq!(ctx.instructions, 0, "no instruction must commit during debug halt");
+        // Interpreter status must NOT flip to Halted -- that's terminal.
+        // DebugHalt is transient; the core can resume.
+        assert!(!interpreter.is_halted(), "debug halt must not set CoreStatus::Halted");
+    }
+
+    #[test]
+    fn test_debug_halt_persists_across_steps_until_resume() {
+        // Repeated steps while halted must each return DebugHalt without
+        // advancing PC. Then request_resume releases the halt and the next
+        // step proceeds as normal.
+        let mut interpreter = make_interpreter();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = make_tile_with_program(&[0x00; 16]);
+
+        tile.core_debug.set_enabled(true);
+        tile.core_debug.request_halt();
+
+        for _ in 0..3 {
+            let result = interpreter.step(&mut ctx, &mut tile);
+            assert!(matches!(result, StepResult::DebugHalt), "must keep returning DebugHalt");
+            assert_eq!(ctx.pc(), 0, "PC must stay pinned through repeated halted steps");
+        }
+
+        // Host clears the halt -- next step retries fetch+execute.
+        assert!(tile.core_debug.request_resume(), "resume must take effect when halted");
+        assert!(!tile.core_debug.is_halted());
+
+        let result = interpreter.step(&mut ctx, &mut tile);
+        assert!(matches!(result, StepResult::Continue), "post-resume step must proceed");
+        assert_eq!(ctx.pc(), 4, "post-resume step must advance PC");
+        assert_eq!(ctx.instructions, 1);
+    }
+
+    #[test]
+    fn test_run_returns_on_debug_halt() {
+        // run() loops over step() until halt/error. A debug halt mid-run
+        // must surface to the caller so they can inspect state and decide
+        // whether to resume.
+        let mut interpreter = make_interpreter();
+        let mut ctx = ExecutionContext::new();
+        // Lots of NOPs -- run would otherwise loop until max_cycles.
+        let mut tile = make_tile_with_program(&[0x00; 1024]);
+
+        tile.core_debug.set_enabled(true);
+        // Pre-halt the core so the very first step in run() sees it.
+        tile.core_debug.request_halt();
+
+        let (result, cycles) = interpreter.run(&mut ctx, &mut tile, 100);
+
+        assert!(matches!(result, StepResult::DebugHalt), "run must surface debug halt");
+        assert_eq!(cycles, 0, "no cycles must commit while halted");
+        assert_eq!(ctx.pc(), 0);
     }
 
     #[test]

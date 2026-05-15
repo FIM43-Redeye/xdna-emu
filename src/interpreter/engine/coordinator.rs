@@ -712,6 +712,16 @@ impl InterpreterEngine {
                         tile.core_debug.set_done(true);
                         tile.core_debug.update_stalls(false, false, false, false);
                     }
+                    StepResult::DebugHalt => {
+                        // Debug halt is a transient pause -- the program isn't
+                        // done. Don't call set_done; just clear stall flags
+                        // (the previous instruction has already retired) and
+                        // mark the engine as still active. Leaving all_halted
+                        // false keeps the engine ticking so DMAs continue and
+                        // the host can write Debug_Control0=0 to resume.
+                        tile.core_debug.update_stalls(false, false, false, false);
+                        all_halted = false;
+                    }
                     StepResult::DecodeError(ref e) => {
                         log::error!(
                             "Core({},{}) DecodeError at cycle {}: {:?}",
