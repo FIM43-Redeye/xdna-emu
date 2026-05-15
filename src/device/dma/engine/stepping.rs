@@ -2,6 +2,25 @@
 
 use super::*;
 use crate::interpreter::execute::cycle_accurate::{fire_watchpoint_events_with_origin, AccessOrigin};
+use crate::interpreter::timing::MemoryQuadrant;
+
+/// Map a resolved DMA target to the `AccessOrigin` the target tile's
+/// WatchPoint comparator should see.
+///
+/// `Own` is a local DMA access. For cross-tile (West/East) targets, the
+/// origin is described from the target's perspective: a write into the
+/// West window lands on the col-1 neighbour, so that neighbour sees the
+/// access arriving from the East -- and vice versa. The memtile WatchPoint
+/// layout only models East/West quadrant filter bits (AM025: bits [25:24]),
+/// which lines up naturally with the MemTile-to-MemTile shared-memory bus
+/// topology.
+fn dma_access_origin(target: MemTileTarget) -> AccessOrigin {
+    match target {
+        MemTileTarget::Own => AccessOrigin::Dma,
+        MemTileTarget::West => AccessOrigin::Neighbour(MemoryQuadrant::East),
+        MemTileTarget::East => AccessOrigin::Neighbour(MemoryQuadrant::West),
+    }
+}
 
 impl DmaEngine {
     /// Step the DMA engine by one cycle.
@@ -1179,22 +1198,15 @@ impl DmaEngine {
         // Fire WATCHPOINT_N events on the target tile for each word the DMA
         // read. The HW comparator sits at the bank interface and sees DMA
         // traffic the same as core traffic; AM025 distinguishes them via the
-        // DMA_Access filter bit. Cross-tile (West/East neighbour) access uses
-        // a Neighbour origin -- task #69 -- so we only fire on own-tile reads
-        // here.
+        // DMA_Access filter bit. Cross-tile (West/East) reads through the
+        // MemTile-to-MemTile shared bus fire on the *target* tile with
+        // `Neighbour(<direction-from-target>)` so the neighbour-side
+        // quadrant filter bits work as documented.
         let cycle = self.current_cycle;
-        if matches!(target_kind, MemTileTarget::Own) {
-            for i in 0..word_count {
-                let word_addr = (offset + i * 4) as u32;
-                fire_watchpoint_events_with_origin(
-                    target_tile,
-                    word_addr,
-                    false,
-                    cycle,
-                    None,
-                    AccessOrigin::Dma,
-                );
-            }
+        let origin = dma_access_origin(target_kind);
+        for i in 0..word_count {
+            let word_addr = (offset + i * 4) as u32;
+            fire_watchpoint_events_with_origin(target_tile, word_addr, false, cycle, None, origin);
         }
 
         true
@@ -1283,22 +1295,15 @@ impl DmaEngine {
         }
 
         // Fire WATCHPOINT_N events per word covered by the source range -- the
-        // bank comparator sees the same byte addresses regardless of compression.
-        // Cross-tile (#69) is out of scope; only own-tile reads fire here.
+        // bank comparator sees the same byte addresses regardless of
+        // compression. Cross-tile origins follow the same mapping as the
+        // uncompressed path.
         let cycle = self.current_cycle;
-        if matches!(target_kind, MemTileTarget::Own) {
-            let word_count = (bytes + 3) / 4;
-            for i in 0..word_count {
-                let word_addr = (offset + i * 4) as u32;
-                fire_watchpoint_events_with_origin(
-                    target_tile,
-                    word_addr,
-                    false,
-                    cycle,
-                    None,
-                    AccessOrigin::Dma,
-                );
-            }
+        let origin = dma_access_origin(target_kind);
+        let word_count = (bytes + 3) / 4;
+        for i in 0..word_count {
+            let word_addr = (offset + i * 4) as u32;
+            fire_watchpoint_events_with_origin(target_tile, word_addr, false, cycle, None, origin);
         }
 
         true
@@ -1443,22 +1448,15 @@ impl DmaEngine {
 
         // Fire WATCHPOINT_N events for each word actually written. The bank
         // comparator sees writes through the same path as core stores; AM025
-        // distinguishes them via the DMA_Access filter bit. Cross-tile (#69)
-        // writes are scoped out -- only own-tile here.
+        // distinguishes them via the DMA_Access filter bit. Cross-tile
+        // (West/East) writes via the MemTile-to-MemTile shared bus fire on
+        // the *target* tile with `Neighbour(<direction-from-target>)`.
         let cycle = self.current_cycle;
-        if matches!(target_kind, MemTileTarget::Own) {
-            let words_written = bytes_written / 4;
-            for i in 0..words_written {
-                let word_addr = (offset + i * 4) as u32;
-                fire_watchpoint_events_with_origin(
-                    target_tile,
-                    word_addr,
-                    true,
-                    cycle,
-                    None,
-                    AccessOrigin::Dma,
-                );
-            }
+        let origin = dma_access_origin(target_kind);
+        let words_written = bytes_written / 4;
+        for i in 0..words_written {
+            let word_addr = (offset + i * 4) as u32;
+            fire_watchpoint_events_with_origin(target_tile, word_addr, true, cycle, None, origin);
         }
 
         S2mmResult { success: true, stall: false, tlast_received, bytes_written }
@@ -1570,22 +1568,14 @@ impl DmaEngine {
             }
         }
 
-        // Fire WATCHPOINT_N events per word actually written. Cross-tile (#69)
-        // is out of scope -- only own-tile decompressed S2MM fires here.
+        // Fire WATCHPOINT_N events per word actually written. Cross-tile
+        // origins follow the same mapping as the uncompressed S2MM path.
         let cycle = self.current_cycle;
-        if matches!(target_kind, MemTileTarget::Own) {
-            let words_written = mem_bytes_written / 4;
-            for i in 0..words_written {
-                let word_addr = (offset + i * 4) as u32;
-                fire_watchpoint_events_with_origin(
-                    target_tile,
-                    word_addr,
-                    true,
-                    cycle,
-                    None,
-                    AccessOrigin::Dma,
-                );
-            }
+        let origin = dma_access_origin(target_kind);
+        let words_written = mem_bytes_written / 4;
+        for i in 0..words_written {
+            let word_addr = (offset + i * 4) as u32;
+            fire_watchpoint_events_with_origin(target_tile, word_addr, true, cycle, None, origin);
         }
 
         S2mmResult {

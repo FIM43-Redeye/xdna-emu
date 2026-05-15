@@ -321,9 +321,8 @@ fn fire_bank_conflict_events(tile: &mut Tile, banks_mask: u8, cycle: u64, pc: u3
 /// origin filter bits ([29:24] compute / [27:24] memtile) are all zero,
 /// the slot fires regardless of origin (wildcard); when any are set, the
 /// access origin must match one of the enabled bits.
-// `Axi` and `Neighbour` aren't consumed by any caller yet; `Dma` is wired
-// from the DMA engine (task #68), `Neighbour` waits on cross-tile DMA
-// quadrant detection (task #69).
+// `Axi` has no consumer yet; `Dma` is wired from the DMA engine (task #68),
+// `Neighbour` from the cross-tile MemTile-to-MemTile DMA path (task #69).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessOrigin {

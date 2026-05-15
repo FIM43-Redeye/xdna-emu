@@ -2175,20 +2175,18 @@ fn test_memtile_dma_own_window_fires_watchpoint() {
 
 #[test]
 fn test_memtile_dma_neighbor_window_does_not_fire_own_watchpoint() {
-    // Cross-tile (West/East) DMA is task #69. For #68, the firing path is
-    // own-tile only: a write through the West window should NOT fire the
-    // OWN tile's watchpoint. (The neighbour tile is absent in this test, so
-    // resolve_s2mm_target falls back to Own -- to test "really cross-tile",
-    // we'd need a populated NeighborTiles. With a present neighbour, the
-    // resolver returns West and the own tile must remain idle.)
+    // Cross-tile (West/East) DMA fires on the *target* tile, not the source.
+    // A write through the West window addresses the col-1 neighbour, so the
+    // SOURCE tile's WatchPoint must remain idle even when its slot would
+    // otherwise match. Companion tests cover the target-side firing.
     use xdna_archspec::aie2::trace_events::memtile_events;
 
     let mut engine = DmaEngine::new_mem_tile(1, 1);
     let mut tile = Tile::mem_tile(1, 1);
     let mut west = Tile::mem_tile(0, 1);
 
-    // Watch writes at offset 0x100 on BOTH tiles. Only the WEST tile should
-    // see the access (it's the resolved target); own should remain idle.
+    // Watch writes at offset 0x100 on the SOURCE tile. The West neighbour is
+    // the actual target, so the source must stay idle.
     tile.registers.insert(0x94108, wp_memtile(false, true, 0x100, false, false));
     tile.mem_perf_counters
         .write_control_start_stop(memtile_events::WATCHPOINT_2 as u32, 0, 1, 7);
@@ -2201,6 +2199,187 @@ fn test_memtile_dma_neighbor_window_does_not_fire_own_watchpoint() {
 
     assert!(
         !tile.mem_perf_counters.is_active(0),
-        "cross-tile DMA must not fire the SOURCE tile's watchpoint (#69 covers neighbour-side firing)"
+        "cross-tile DMA must not fire the SOURCE tile's watchpoint"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-tile DMA quadrant detection (task #69)
+//
+// MemTile DMAs that address the West/East windows reach the col-1/col+1
+// MemTile through the dedicated MemTile-to-MemTile shared bus. The HW
+// comparator on the *target* tile sees those accesses with the AM025
+// East/West quadrant filter bits ([25:24]) so software can distinguish
+// "DMA from my own tile" from "DMA from my neighbour". Following the
+// AccessOrigin scaffolding from #65 and the local-DMA hookup from #68,
+// the four DMA paths now fire on the resolved target with
+// `Neighbour(<direction-from-target>)` for cross-tile writes/reads.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_memtile_dma_west_window_fires_west_neighbor_watchpoint() {
+    // S2MM through the West window (col-1 target) must fire the WEST
+    // tile's WatchPoint with `Neighbour(East)` (we are east of the target).
+    use xdna_archspec::aie2::trace_events::memtile_events;
+
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut tile = Tile::mem_tile(1, 1);
+    let mut west = Tile::mem_tile(0, 1);
+
+    // Slot on the WEST tile watches writes at offset 0x100 with no origin
+    // filter (wildcard) -- it should match the cross-tile DMA write.
+    west.registers.insert(0x94108, wp_memtile(false, true, 0x100, false, false));
+    west.mem_perf_counters
+        .write_control_start_stop(memtile_events::WATCHPOINT_2 as u32, 0, 1, 7);
+
+    engine.push_stream_in(StreamData { data: 0xC0FFEE, tlast: true, channel: 0 });
+    let mut neighbors = NeighborTiles { west: Some(&mut west), east: None };
+    // Address 0x100 -> West window (window 0), offset 0x100 in west.data_memory.
+    let result = engine.transfer_s2mm(0x100, 4, 0, &mut tile, &mut neighbors);
+    assert!(result.success);
+
+    assert!(
+        west.mem_perf_counters.is_active(0),
+        "cross-tile S2MM through West window must fire the WEST neighbour's watchpoint"
+    );
+}
+
+#[test]
+fn test_memtile_dma_east_window_fires_east_neighbor_watchpoint() {
+    // S2MM through the East window (col+1 target) must fire the EAST
+    // tile's WatchPoint with `Neighbour(West)` (we are west of the target).
+    use xdna_archspec::aie2::trace_events::memtile_events;
+
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut tile = Tile::mem_tile(1, 1);
+    let mut east = Tile::mem_tile(2, 1);
+
+    east.registers.insert(0x94108, wp_memtile(false, true, 0x100, false, false));
+    east.mem_perf_counters
+        .write_control_start_stop(memtile_events::WATCHPOINT_2 as u32, 0, 1, 7);
+
+    engine.push_stream_in(StreamData { data: 0xDEC0DE, tlast: true, channel: 0 });
+    let mut neighbors = NeighborTiles { west: None, east: Some(&mut east) };
+    // Address 0x100100 -> East window (window 2 * 0x80000 = 0x100000), offset 0x100.
+    let result = engine.transfer_s2mm(0x100100, 4, 0, &mut tile, &mut neighbors);
+    assert!(result.success);
+
+    assert!(
+        east.mem_perf_counters.is_active(0),
+        "cross-tile S2MM through East window must fire the EAST neighbour's watchpoint"
+    );
+}
+
+#[test]
+fn test_memtile_dma_west_window_mm2s_fires_west_neighbor_watchpoint() {
+    // Symmetric MM2S check: read through the West window must fire the
+    // WEST tile's WatchPoint with the same `Neighbour(East)` origin.
+    use xdna_archspec::aie2::trace_events::memtile_events;
+
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut tile = Tile::mem_tile(1, 1);
+    let mut west = Tile::mem_tile(0, 1);
+
+    // Seed source bytes on the West tile (the read target).
+    west.write_data_u32(0x100, 0xBEEFCAFE);
+    west.registers.insert(0x94108, wp_memtile(true, false, 0x100, false, false));
+    west.mem_perf_counters
+        .write_control_start_stop(memtile_events::WATCHPOINT_2 as u32, 0, 1, 7);
+
+    let mut neighbors = NeighborTiles { west: Some(&mut west), east: None };
+    let ok = engine.transfer_mm2s(0x100, 4, 0, true, false, &mut tile, &mut neighbors);
+    assert!(ok);
+
+    assert!(
+        west.mem_perf_counters.is_active(0),
+        "cross-tile MM2S through West window must fire the WEST neighbour's watchpoint"
+    );
+}
+
+#[test]
+fn test_memtile_dma_neighbor_filter_dma_only_does_not_fire() {
+    // A target slot with ONLY the DMA filter bit must NOT fire on a
+    // cross-tile access -- the origin is `Neighbour(East)`, not `Dma`,
+    // so the AM025 filter mask excludes it.
+    use xdna_archspec::aie2::trace_events::memtile_events;
+
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut tile = Tile::mem_tile(1, 1);
+    let mut west = Tile::mem_tile(0, 1);
+
+    // West tile's slot 2 watches writes at 0x100 with DMA filter only.
+    west.registers
+        .insert(0x94108, wp_memtile(false, true, 0x100, /*dma=*/ true, /*axi=*/ false));
+    west.mem_perf_counters
+        .write_control_start_stop(memtile_events::WATCHPOINT_2 as u32, 0, 1, 7);
+
+    engine.push_stream_in(StreamData { data: 0x1, tlast: true, channel: 0 });
+    let mut neighbors = NeighborTiles { west: Some(&mut west), east: None };
+    let result = engine.transfer_s2mm(0x100, 4, 0, &mut tile, &mut neighbors);
+    assert!(result.success);
+
+    assert!(
+        !west.mem_perf_counters.is_active(0),
+        "DMA-only filter on the target must reject cross-tile origins"
+    );
+}
+
+#[test]
+fn test_memtile_dma_neighbor_filter_east_only_fires() {
+    // Target slot with ONLY the East quadrant filter bit (bit 25) must
+    // fire on a cross-tile access through the West window: we're east of
+    // that target, so the origin matches.
+    use xdna_archspec::aie2::trace_events::memtile_events;
+
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut tile = Tile::mem_tile(1, 1);
+    let mut west = Tile::mem_tile(0, 1);
+
+    // wp_memtile only exposes dma/axi convenience bits; build the East
+    // quadrant filter (bit 25) directly.
+    let east_only = wp_memtile(false, true, 0x100, false, false) | (1u32 << 25);
+    west.registers.insert(0x94108, east_only);
+    west.mem_perf_counters
+        .write_control_start_stop(memtile_events::WATCHPOINT_2 as u32, 0, 1, 7);
+
+    engine.push_stream_in(StreamData { data: 0x1, tlast: true, channel: 0 });
+    let mut neighbors = NeighborTiles { west: Some(&mut west), east: None };
+    let result = engine.transfer_s2mm(0x100, 4, 0, &mut tile, &mut neighbors);
+    assert!(result.success);
+
+    assert!(
+        west.mem_perf_counters.is_active(0),
+        "East-quadrant filter on the West target must accept the cross-tile origin"
+    );
+}
+
+#[test]
+fn test_memtile_dma_missing_neighbor_falls_back_to_own_dma_origin() {
+    // When the addressed neighbour does not exist, resolve_s2mm_target
+    // falls back to the local tile (silent aliasing per the resolver
+    // doc). The fallback target is `Own`, so the firing must use the
+    // local `Dma` origin -- not a Neighbour origin against a slot that
+    // would expect a different filter.
+    use xdna_archspec::aie2::trace_events::memtile_events;
+
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut tile = Tile::mem_tile(1, 1);
+
+    // OWN tile slot: DMA filter only. If the fallback used a Neighbour
+    // origin, this would NOT fire; with the correct Dma-on-Own origin,
+    // the slot matches and the counter activates.
+    tile.registers
+        .insert(0x94108, wp_memtile(false, true, 0x100, /*dma=*/ true, /*axi=*/ false));
+    tile.mem_perf_counters
+        .write_control_start_stop(memtile_events::WATCHPOINT_2 as u32, 0, 1, 7);
+
+    engine.push_stream_in(StreamData { data: 0x1, tlast: true, channel: 0 });
+    // Address 0x100 -> West window, but no west neighbour -- falls back to Own.
+    let result = engine.transfer_s2mm(0x100, 4, 0, &mut tile, &mut NeighborTiles::empty());
+    assert!(result.success);
+
+    assert!(
+        tile.mem_perf_counters.is_active(0),
+        "missing neighbour falls back to Own with Dma origin (slot armed for Dma must fire)"
     );
 }
