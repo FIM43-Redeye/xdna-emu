@@ -261,7 +261,17 @@ aie-rt and locked in by 17 unit tests):
   `check_event_halt` so HaltEvent0/1 wiring works; independently,
   Debug_Control2.PC_Event_Halt (bit 0) gates a halt that latches
   halt_cause_pc_event (Debug_Status bit 1). Reset clears all four
-  PC_Event registers. Single-step-on-event also still pending.
+  PC_Event registers. Single-step-on-event **FIXED 2026-05-14**:
+  Debug_Control1.SSTEP_EVENT (bits [14:8]) is now consumed.
+  `check_event_halt` arms a `pending_single_step` latch on a matching
+  event ID; the coordinator drains it after each core step via
+  `consume_pending_single_step`, which calls `request_halt` so the
+  triggering bundle is the last to commit before halt
+  (interpretation (a) per AM025; the spec is ambiguous between (a)
+  and "one more bundle after"). A resume event between arming and
+  consume cancels the pending step. There is no dedicated
+  Debug_Status cause bit for single-step halts per AM025 -- the
+  aggregate `halted` bit is the only signal.
 
 Tile isolation follow-ups (status confirmed via 2026-05-14 deep-
 validation pass; gate sites cross-checked against aie-rt

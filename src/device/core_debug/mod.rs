@@ -142,9 +142,10 @@ const DBG_CTRL0_SSTEP_COUNT_MASK: u32 = 0xF << DBG_CTRL0_SSTEP_COUNT_LSB;
 /// Bits [6:0]: resume event ID (clears halt when fired).
 const DBG_CTRL1_RESUME_EVENT_LSB: u32 = 0;
 const DBG_CTRL1_EVENT_MASK: u32 = 0x7F;
-/// Bits [14:8]: single-step event ID (advances one bundle on fire).
-/// Reserved for future single-step-on-event support; not currently consumed.
-#[allow(dead_code)]
+/// Bits [14:8]: single-step event ID. When the configured event fires,
+/// the core completes the current bundle and then halts (interpretation
+/// (a): triggering bundle is the last to commit). Drained by the
+/// coordinator via `consume_pending_single_step` after each step.
 const DBG_CTRL1_SSTEP_EVENT_LSB: u32 = 8;
 /// Bits [22:16]: halt event 0 ID.
 const DBG_CTRL1_HALT_EVENT0_LSB: u32 = 16;
@@ -270,6 +271,11 @@ pub struct CoreDebugState {
     pub(super) halt_cause_event0: bool,
     /// Set when an event matching Debug_Halt_Core_Event1 fired.
     pub(super) halt_cause_event1: bool,
+    /// Set when an event matching Debug_Control1.SSTEP_EVENT fired during
+    /// the current step. Drained by the coordinator after the step
+    /// completes via `consume_pending_single_step`, which clears the latch
+    /// and requests halt.
+    pub(super) pending_single_step: bool,
 }
 
 impl Default for CoreDebugState {
@@ -305,6 +311,7 @@ impl Default for CoreDebugState {
             halt_cause_stream_stall: false,
             halt_cause_event0: false,
             halt_cause_event1: false,
+            pending_single_step: false,
         }
     }
 }
@@ -431,6 +438,7 @@ impl CoreDebugState {
             self.pc_event1 = 0;
             self.pc_event2 = 0;
             self.pc_event3 = 0;
+            self.pending_single_step = false;
             self.clear_halt_causes();
         }
     }
@@ -598,6 +606,11 @@ impl CoreDebugState {
         ((self.debug_ctrl1 >> DBG_CTRL1_RESUME_EVENT_LSB) & DBG_CTRL1_EVENT_MASK) as u8
     }
 
+    /// Decoded Debug_Single_Step_Event from Debug_Control1 [14:8].
+    fn debug_sstep_event(&self) -> u8 {
+        ((self.debug_ctrl1 >> DBG_CTRL1_SSTEP_EVENT_LSB) & DBG_CTRL1_EVENT_MASK) as u8
+    }
+
     /// Notify the debug subsystem that an event has fired. If the event
     /// matches a configured Debug_Halt_Core_EventN, halts the core and
     /// latches the corresponding Debug_Status cause bit. If it matches
@@ -617,6 +630,7 @@ impl CoreDebugState {
         let halt_e0 = self.debug_halt_event0();
         let halt_e1 = self.debug_halt_event1();
         let resume_e = self.debug_resume_event();
+        let sstep_e = self.debug_sstep_event();
         if halt_e0 != 0 && event_id == halt_e0 {
             self.halt_cause_event0 = true;
             self.request_halt();
@@ -627,7 +641,29 @@ impl CoreDebugState {
         }
         if resume_e != 0 && event_id == resume_e {
             self.clear_halt_causes();
+            self.pending_single_step = false;
             self.request_resume();
+        }
+        if sstep_e != 0 && event_id == sstep_e {
+            self.pending_single_step = true;
+        }
+    }
+
+    /// Drain the SSTEP_EVENT latch. Returns true (and requests halt) if a
+    /// single-step event was queued during the just-completed step.
+    /// Called by the coordinator after each core step. The latch clears
+    /// on resume too, so a manual resume between event and consume cancels
+    /// the pending single-step.
+    ///
+    /// Per AM025 there is no dedicated Debug_Status cause bit for
+    /// single-step halts -- the aggregate `halted` bit is the only signal.
+    pub fn consume_pending_single_step(&mut self) -> bool {
+        if self.pending_single_step {
+            self.pending_single_step = false;
+            self.request_halt();
+            true
+        } else {
+            false
         }
     }
 

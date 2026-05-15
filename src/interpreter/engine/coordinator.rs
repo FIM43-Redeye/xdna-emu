@@ -655,7 +655,14 @@ impl InterpreterEngine {
                 // This mirrors the interpreter state into the register
                 // space so host reads of Core_Status/Core_PC return
                 // correct values (matching real hardware behavior).
+                // update_pc also drives PC_Event0..3 matching, which can
+                // set the pending single-step latch through check_event_halt.
                 tile.core_debug.update_pc(core.context.pc());
+                // Drain the SSTEP_EVENT latch: if any event during this
+                // step matched Debug_Control1.SSTEP_EVENT, request halt
+                // now (interpretation (a): the triggering bundle is the
+                // last to commit before halt).
+                tile.core_debug.consume_pending_single_step();
 
                 // Mirror the live PC onto tile.core.pc as well, so any
                 // path that reads tile-side state (broadcast

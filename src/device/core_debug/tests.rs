@@ -981,3 +981,126 @@ fn pc_event_match_after_reset_does_not_fire() {
     state.update_pc(0x100);
     assert!(!state.is_halted(), "PC_Event registers must be cleared by reset");
 }
+
+// ----------------------------------------------------------------------
+// Single-step-on-event (Debug_Control1.SSTEP_EVENT)
+// ----------------------------------------------------------------------
+
+#[test]
+fn sstep_event_match_sets_pending_latch() {
+    // SSTEP_EVENT field configured to event 16 (WATCHPOINT_0). Firing
+    // event 16 must set pending_single_step but NOT halt immediately --
+    // the halt happens on consume.
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 16, 0, 0);
+    state.check_event_halt(16);
+    assert!(state.pending_single_step, "matching event must arm the SSTEP latch");
+    assert!(!state.is_halted(), "halt is deferred to consume, so the triggering bundle commits first");
+}
+
+#[test]
+fn sstep_event_consume_halts_and_clears_latch() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 16, 0, 0);
+    state.check_event_halt(16);
+    let drained = state.consume_pending_single_step();
+    assert!(drained, "consume must report the event was queued");
+    assert!(state.is_halted(), "consume must halt the core");
+    assert!(!state.pending_single_step, "latch must clear after consume");
+}
+
+#[test]
+fn sstep_event_consume_when_idle_returns_false() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    let drained = state.consume_pending_single_step();
+    assert!(!drained, "no event queued -> consume reports false");
+    assert!(!state.is_halted());
+}
+
+#[test]
+fn sstep_event_unrelated_event_does_not_arm() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 16, 0, 0);
+    state.check_event_halt(17); // adjacent event ID, must not match
+    assert!(!state.pending_single_step);
+}
+
+#[test]
+fn sstep_event_zero_id_never_matches() {
+    // SSTEP_EVENT field = 0 (EVENT_NONE) must not arm on event_id=0.
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl1 = 0;
+    // check_event_halt short-circuits on event_id=0, but defense-in-depth:
+    // even if the field were 0 and a non-zero event fired, no match occurs.
+    state.check_event_halt(0);
+    assert!(!state.pending_single_step);
+    state.check_event_halt(42);
+    assert!(!state.pending_single_step);
+}
+
+#[test]
+fn sstep_event_via_pc_event_path() {
+    // End-to-end: SSTEP_EVENT wired to Core_PC_0 (event 16). PC_Event0
+    // valid + matching PC fires Core_PC_0, which arms the SSTEP latch.
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.pc_event0 = make_pc_event(true, 0x100);
+    state.debug_ctrl1 = make_dbg_ctrl1(0, EVENT_CORE_PC_0, 0, 0);
+
+    state.update_pc(0x100);
+    assert!(state.pending_single_step, "PC match -> Core_PC_0 -> SSTEP_EVENT match must arm the latch");
+    assert!(!state.is_halted(), "still deferred");
+    state.consume_pending_single_step();
+    assert!(state.is_halted());
+}
+
+#[test]
+fn sstep_event_resume_cancels_pending() {
+    // If a resume event arrives between the SSTEP arming and the
+    // coordinator's consume call, the pending latch must clear so the
+    // single-step doesn't fire after the host has unhalted.
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl1 = make_dbg_ctrl1(40, 16, 0, 0); // resume=40, sstep=16
+    state.check_event_halt(16);
+    assert!(state.pending_single_step);
+    state.check_event_halt(40); // resume
+    assert!(!state.pending_single_step, "resume must cancel a pending single-step");
+    let drained = state.consume_pending_single_step();
+    assert!(!drained, "consume after resume sees nothing");
+    assert!(!state.is_halted());
+}
+
+#[test]
+fn sstep_event_reset_clears_pending() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 16, 0, 0);
+    state.check_event_halt(16);
+    assert!(state.pending_single_step);
+    state.write_control(CTRL_RESET_MASK);
+    assert!(!state.pending_single_step, "reset must clear pending single-step");
+}
+
+#[test]
+fn sstep_event_coexists_with_halt_event() {
+    // SSTEP_EVENT and HaltEvent0 wired to the same event ID. Both fire on
+    // a match: the halt is immediate (HaltEvent path), and pending is
+    // also set (idempotent -- consume drains it but request_halt is
+    // already true).
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 16, 16, 0); // sstep=halt=16
+    state.check_event_halt(16);
+    assert!(state.is_halted(), "HaltEvent0 must halt immediately");
+    assert!(state.pending_single_step, "SSTEP latch also set -- separate paths");
+    let status = state.read_debug_status();
+    assert_ne!(status & (1 << DBG_STS_EVENT0_HALTED_LSB), 0);
+    state.consume_pending_single_step();
+    assert!(state.is_halted(), "still halted");
+}
