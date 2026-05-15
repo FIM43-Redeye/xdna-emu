@@ -967,6 +967,57 @@ mod tests {
     }
 
     #[test]
+    fn test_step_skips_after_watchpoint_event_halt() {
+        // End-to-end composition: an event arriving via the dispatcher
+        // (the same path the executor uses to fire WATCHPOINT_N) must
+        // request_halt through Debug_Control1.Debug_Halt_Core_Event0,
+        // and the next interpreter step must honor that halt. Bridges
+        // the watchpoint-fires test in cycle_accurate.rs (proves the
+        // halt flag gets set) with test_step_skips_when_debug_halted
+        // (proves the gate works) in one go, so a regression in either
+        // half of the chain shows up here.
+        use xdna_archspec::aie2::trace_events::mem_events;
+
+        let mut interpreter = make_interpreter();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = make_tile_with_program(&[0x00; 64]);
+
+        tile.core_debug.set_enabled(true);
+        // Debug_Control1 with Debug_Halt_Core_Event0 = WATCHPOINT_0 (16).
+        // Field at bits [22:16].
+        let halt_e0 = (mem_events::WATCHPOINT_0 as u32) << 16;
+        tile.core_debug.write_register(0x32014, halt_e0);
+
+        // Step once -- baseline NOP advances the PC and nothing has halted.
+        let r0 = interpreter.step(&mut ctx, &mut tile);
+        assert!(matches!(r0, StepResult::Continue));
+        assert_eq!(ctx.pc(), 4);
+        assert!(!tile.core_debug.is_halted(), "no event yet, no halt");
+
+        // Fire WATCHPOINT_0 through the same dispatcher the executor uses.
+        // This is what fire_watchpoint_events boils down to: route the event
+        // ID through notify_mem_trace_event, which calls check_event_halt
+        // and -- because Event0 is configured -- sets core_debug.halted.
+        tile.notify_mem_trace_event(mem_events::WATCHPOINT_0, ctx.cycles, Some(ctx.pc()));
+        assert!(tile.core_debug.is_halted(), "WATCHPOINT_0 must trip the configured halt");
+
+        // Now the engine must skip. PC stays put, no instruction commits,
+        // and CoreStatus stays out of the terminal Halted state.
+        let r1 = interpreter.step(&mut ctx, &mut tile);
+        assert!(matches!(r1, StepResult::DebugHalt), "step must return DebugHalt");
+        assert_eq!(ctx.pc(), 4, "halted core must not advance PC");
+        assert_eq!(ctx.instructions, 1, "only the pre-halt step counts");
+        assert!(!interpreter.is_halted(), "debug halt is transient, not CoreStatus::Halted");
+
+        // And once the host clears the halt (in HW: write 0 to Debug_Control0),
+        // the next step picks back up where it left off.
+        tile.core_debug.request_resume();
+        let r2 = interpreter.step(&mut ctx, &mut tile);
+        assert!(matches!(r2, StepResult::Continue), "post-resume step must proceed");
+        assert_eq!(ctx.pc(), 8);
+    }
+
+    #[test]
     fn test_run_returns_on_debug_halt() {
         // run() loops over step() until halt/error. A debug halt mid-run
         // must surface to the caller so they can inspect state and decide
