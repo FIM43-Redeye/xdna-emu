@@ -14,6 +14,12 @@ pub enum Provenance {
     DocSpecified,
     /// A trusted source describes the node and we assert NO model.
     Unspecified,
+    /// A behavior learned from silicon itself (trace sweep / differential
+    /// fuzzer), with no originating toolchain/doc node -- a unit born from a
+    /// hardware surprise (spec Section 6). Mint-only: no `Category` derives to
+    /// it. Neither perishable (it IS the silicon truth) nor a comprehension
+    /// gap (it is understood, just not toolchain-sourced).
+    HardwareObserved,
 }
 
 /// Silicon-verification status, orthogonal to provenance. Spec Section 1.
@@ -36,7 +42,7 @@ pub enum Verification {
 /// `Verification::Verified`. Verifying behavior against silicon requires a
 /// model to compare against, and having a model means the provenance is no
 /// longer `Unspecified`. A behavior learned purely from a hardware surprise
-/// gets a distinct provenance (future `HardwareObserved`, spec Section 6),
+/// gets a distinct provenance (`HardwareObserved`, spec Section 6),
 /// not `Unspecified + Verified`. The `is_perishable` / `is_comprehension_gap`
 /// predicates rely on this invariant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +64,17 @@ impl Verdict {
     pub fn is_comprehension_gap(&self) -> bool {
         matches!(self.provenance, Provenance::Unspecified)
             && !matches!(self.verification, Verification::Accepted { .. })
+    }
+
+    /// Mint a verdict from an empirical hardware observation (spec Section 6
+    /// empirical residual). `evidence` points at the trace / finding that
+    /// recorded the surprise. The verification is `Verified` against that
+    /// arch's silicon by construction -- the observation IS the evidence.
+    pub fn hardware_observed(evidence: impl Into<String>) -> Self {
+        Verdict {
+            provenance: Provenance::HardwareObserved,
+            verification: Verification::Verified { evidence: evidence.into() },
+        }
     }
 }
 
@@ -111,5 +128,26 @@ mod tests {
         };
         assert!(!v.is_perishable());
         assert!(!v.is_comprehension_gap());
+    }
+
+    #[test]
+    fn hardware_observed_is_neither_perishable_nor_a_gap() {
+        // Spec Section 6 "Phasing": a silicon-observed fact is ground truth
+        // from hardware -- not modeled-weakly, not a comprehension gap.
+        let v = Verdict::hardware_observed("trace-sweep:add_one:cycle=200");
+        assert_eq!(v.provenance, Provenance::HardwareObserved);
+        assert!(!v.is_perishable());
+        assert!(!v.is_comprehension_gap());
+    }
+
+    #[test]
+    fn hardware_observed_carries_its_evidence() {
+        let v = Verdict::hardware_observed("finding:2026-05-13-chain-exec");
+        match v.verification {
+            Verification::Verified { evidence } => {
+                assert_eq!(evidence, "finding:2026-05-13-chain-exec")
+            }
+            other => panic!("expected Verified evidence, got {other:?}"),
+        }
     }
 }
