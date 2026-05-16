@@ -175,6 +175,29 @@ mod tests {
     }
 
     #[test]
+    fn architecture_index_reps_match_category() {
+        // The renderer's hand-listed (Category, SemanticOp) reps must stay in
+        // sync with category(). The render fn also debug_assert!s this, but
+        // that is invisible to release builds -- this makes the invariant a
+        // first-class `cargo test --lib` gate that fails AT THE SOURCE with a
+        // clear message rather than as a downstream staleness string-diff.
+        let reps: &[(Category, SemanticOp)] = &[
+            (Category::Arithmetic, SemanticOp::Add),
+            (Category::Bitwise, SemanticOp::And),
+            (Category::Comparison, SemanticOp::SetLt),
+            (Category::Memory, SemanticOp::Load),
+            (Category::ControlFlow, SemanticOp::Br),
+            (Category::Vector, SemanticOp::Mac),
+            (Category::Sync, SemanticOp::LockAcquire),
+            (Category::SideEffect, SemanticOp::DmaStart),
+            (Category::NeedsTriage, SemanticOp::Intrinsic(0)),
+        ];
+        for (cat, rep) in reps {
+            assert_eq!(category(rep), *cat, "rep {rep:?} drifted from category {cat:?}");
+        }
+    }
+
+    #[test]
     fn old_hand_maintained_index_is_retired() {
         // Spec Section 5: no dual-maintenance window. The non-arch-qualified
         // hand-maintained file must not exist once the generated per-arch one
