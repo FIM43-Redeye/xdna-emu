@@ -48,13 +48,25 @@ pub fn override_registry(_arch: Architecture) -> Vec<BehavioralUnit> {
 }
 
 /// The single hand-curated capability spine (spec Section 6). Seeded once from
-/// the AM020 ToC + aie-rt module tree; maintained ONLY here. Coarse,
-/// arch-invariant domains; AIE2 is the only wired arch today (Plan 1).
+/// the AM020 ToC + aie-rt module tree; maintained ONLY here. Deliberately
+/// COARSER than `SubsystemKind` (spec Section 6: architectural domains, not a
+/// 1:1 register-taxonomy mirror). Documented folds so a Phase-2 author does
+/// not recreate a domain or think one is missing:
+///   - `core` covers `SubsystemKind::Processor` (the VLIW compute core)
+///   - `program_counter` covers `SubsystemKind::ProgramCounter` (PC sampling)
+///   - `events_trace` covers `SubsystemKind::Trace` AND `::Event`
+///   - `locks` covers `SubsystemKind::Lock` AND `::LockRequest`
+///   - `debug_halt` covers `SubsystemKind::Debug`
+/// `SubsystemKind::Unknown` is a classifier placeholder, NOT a hardware
+/// capability -- intentionally excluded. Coarse, arch-invariant; AIE2 is the
+/// only wired arch today (Plan 1). Phase 1 auto-claims every domain via the
+/// derived shim (Task 6); the SubsystemKind<->spine partition is Phase 2.
 pub fn capability_spine() -> Vec<CapabilityDomain> {
     let aie2 = vec![Architecture::Aie2];
     [
         "core",
         "program_memory",
+        "program_counter",
         "data_memory",
         "dma",
         "locks",
