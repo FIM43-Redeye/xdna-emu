@@ -212,14 +212,15 @@ mod tests {
     }
 
     #[test]
-    fn intrinsic_surface_is_classified_not_silently_wired() {
-        // Intrinsic(_) hits the execute_semantic `_ =>` delegated arm
-        // (semantic.rs:190-193) and depends on per-intrinsic dispatch. It is
-        // deliberately NOT asserted Wired here -- Step 3 classifies it from
-        // the real vector_dispatch handler topology. Whatever it is, it must
-        // be a definite class (the call must not panic).
-        let class = sc(SemanticOp::Intrinsic(0));
-        assert!(matches!(class, SurfaceClass::Wired | SurfaceClass::Fallthrough | SurfaceClass::Absent));
+    fn intrinsic_is_absent_not_silently_wired() {
+        // Step-3 investigation determined Intrinsic(_) is Absent: it hits the
+        // execute_semantic `_ =>` delegated arm (semantic.rs:190), VectorAlu
+        // ends `_ => false` (vector_dispatch.rs:120), no unit claims it, so it
+        // reaches the hard ExecuteResult::Error (cycle_accurate.rs:178). This
+        // pins that finding -- a future regression silently classifying it
+        // Wired (claiming the emulator surfaces arbitrary intrinsics when it
+        // does not) fails here. Coheres with Axis-2 Unspecified for Intrinsic.
+        assert_eq!(sc(SemanticOp::Intrinsic(0)), SurfaceClass::Absent);
     }
 
     #[test]
