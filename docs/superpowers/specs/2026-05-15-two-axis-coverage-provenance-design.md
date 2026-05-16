@@ -64,10 +64,16 @@ Per generated node -- every SemanticOp, register, hardware table -- a
 - `Fallthrough` -- reaches a `_ =>` default; no dedicated handling.
 - `Absent` -- decoded but nothing consumes it.
 
-Not hand-assigned. A single exhaustive `match` over `SemanticOp` (and
-equivalents for register groups) that the Rust compiler forces to be total.
-A new TableGen instruction or SemanticOp variant stops the build until it is
-classified, in the crate that actually knows whether a handler exists.
+Not hand-assigned. The `SurfaceClass` type and its contract are *defined* in
+archspec (archspec is the single point of definition for both axes). The
+per-node *evidence* -- "does a handler exist in this build of the
+interpreter" -- is an empirical fact about the emulator's implementation
+state, not about the AIE2 architecture, so it is supplied by the interpreter
+through a `SurfaceProbe` contract archspec declares (Section 2). The concrete
+probe is a single exhaustive `match` over `SemanticOp` (and register-group
+equivalents) that the Rust compiler forces to be total: a new TableGen
+instruction or SemanticOp variant stops the interpreter build until it is
+classified.
 
 ### Axis 2: Behavioral provenance (behavioral unit, hand-adjudicated, build-enforced)
 
@@ -121,38 +127,48 @@ accepted, or glowing red in one of the two files.
 
 ## Section 2 -- Module structure and the ownership seam
 
-Hard constraint: the "is there a handler" fact lives in the interpreter, not
-in archspec. Dependency flows interpreter -> archspec, never the reverse. The
-two axes are owned by different crates; the design respects that seam rather
-than smearing coverage logic across it.
+Principle: archspec is the single point of definition for *both* axes. The
+only thing that cannot live in archspec is the per-node Axis-1 *evidence* --
+"does a handler exist in this build of the interpreter" -- because that is a
+fact about the emulator's implementation state, not about the AIE2
+architecture, and archspec's independence from the emulator's implementation
+is load-bearing. That evidence enters through a trait archspec *declares* and
+the interpreter *implements*; the definition is never fractured.
 
-xdna-archspec owns the durable spec and its enforcement (it already holds the
-generated node universe and a `build.rs`):
+xdna-archspec owns the durable spec, both axis definitions, and Axis-2
+enforcement (it already holds the generated node universe and a `build.rs`):
 
 ```
 crates/xdna-archspec/src/coverage/
-  mod.rs        - CoverageModel: queryable model + the two filter sets
+  mod.rs        - CoverageModel<P: SurfaceProbe>: queryable model + two filter sets
+  surface.rs    - SurfaceClass type; the SurfaceProbe trait (Axis-1 contract)
   verdict.rs    - Provenance, Verification enums; BehavioralUnit { id, claims, verdict }
-  units.rs      - the explicit OVERRIDE registry (hand-authored units)
+  units.rs      - the explicit OVERRIDE registry + the CapabilityDomain list
   derive.rs     - taxonomy rules: fine node -> default behavioral unit
   enforce.rs    - build-time assertions, called from build.rs
 ```
 
+`SurfaceProbe` is the Axis-1 contract: `fn surface_class(&self, node:
+NodeId) -> SurfaceClass`. `CoverageModel` is generic over a probe. Both axes
+are *defined* here; the model simply does not know the answer to Axis-1 until
+a probe is injected.
+
 `enforce.rs` runs from the existing `build.rs`, with the full generated node
 set in hand. It enforces Axis 2 only: every generated node resolves to
-exactly one behavioral unit; every unit carries a non-default verdict. It
-does not know about handlers.
+exactly one behavioral unit; every unit carries a non-default verdict; every
+`CapabilityDomain` is claimed by at least one unit. It does not know about
+handlers -- Axis-2 enforcement needs no probe.
 
-The interpreter owns the surface probe
-(`src/interpreter/coverage/surface.rs`): a single compiler-enforced
-exhaustive `fn surface_class(op: SemanticOp) -> SurfaceClass` (and register
-equivalents). New variant breaks the build here, where handler knowledge
-lives. This is the Axis-1 forcing function.
+The interpreter supplies the only thing it must: a concrete `impl
+SurfaceProbe` (`src/interpreter/coverage/surface_probe.rs`) -- a single
+compiler-enforced exhaustive `match` over `SemanticOp` (and register
+equivalents). It defines nothing; it answers an archspec-defined contract. A
+new variant breaks the interpreter build here, where handler knowledge lives.
+This is the Axis-1 forcing function, sited at the only place that can observe
+the fact.
 
-One reconciliation test binds the seam and renders the views
-(`src/interpreter/coverage/`, integration test). It pulls archspec's
-`CoverageModel` (Axis 2) and the interpreter's `surface_class` (Axis 1),
-joins them per behavioral unit, and:
+One reconciliation test (`src/interpreter/coverage/`, integration test) wires
+the concrete probe into archspec's `CoverageModel` and:
 
 1. asserts consistency -- e.g., a unit marked `Verified` whose nodes are all
    `Absent` is a contradiction (test red);
@@ -162,9 +178,10 @@ joins them per behavioral unit, and:
 3. emits `docs/coverage/perishable-queue.md` and
    `docs/coverage/comprehension-gaps.md` as checked-in, diffable artifacts.
 
-Two forcing functions, each in the crate that owns the truth; one test
-catches contradictions between them and keeps the rendered index honest. No
-coverage logic crosses the dependency seam in the wrong direction.
+Definitions are single-sourced in archspec. The interpreter contributes one
+trait impl plus the wiring test. Two forcing functions -- archspec's build
+panic (Axis 2) and the interpreter's compiler-enforced probe (Axis 1) -- each
+fire in the crate that owns the corresponding decision.
 
 ## Section 3 -- Derived default + override clustering (Approach C)
 
@@ -227,9 +244,11 @@ Three places fail, each loud and located where the knowledge is:
 - Build panic (archspec `enforce.rs`): a unit with no verdict; two overrides
   claiming one node (partition violation); an override claiming a node the
   toolchain no longer emits (stale claim).
-- Compile error (interpreter `surface.rs` / `category`): a new `SemanticOp`
-  variant -- exhaustive matches refuse to compile until it is classified and
-  categorized. The toolchain cannot add an instruction we silently ignore.
+- Compile error: a new `SemanticOp` variant breaks two exhaustive matches
+  until resolved -- the interpreter's `impl SurfaceProbe`
+  (`surface_probe.rs`, must classify the handler) and archspec's `category()`
+  in `derive.rs` (must categorize). Each fires in its own crate. The
+  toolchain cannot add an instruction we silently ignore.
 - Test red (reconciliation test): a `Verified` unit whose nodes are all
   `Absent`; a stale committed `architecture-index.md`; an undeclared shadow.
 
@@ -257,7 +276,9 @@ not a uniform `ToolchainDerived`:
 - `scalar-arithmetic / bitwise / comparison / control-flow / memory` ->
   `ToolchainDerived / NotApplicable`
 - `vector` -> `AietoolsModeled / Unverified`
-- `timing` -> `DocSpecified / Unverified`
+- `timing` -> `DocSpecified / Unverified` (coarse on purpose; timing is
+  highly heterogeneous and is an explicitly-expected multi-override domain --
+  see below)
 - `NeedsTriage` -> `Unspecified` (lands in comprehension-gaps by
   construction)
 
@@ -265,6 +286,18 @@ That is roughly 15 default verdicts, not 100. Phase 1 ships green
 immediately, and both honesty-failure files are honest from day one -- just
 coarse ("all of vector compute: unverified" as one fat line rather than
 nothing at all).
+
+Timing in particular does not stay one bucket. It is expected to fan out
+into multiple override units in Phase 2, because the hardware itself is not
+one clock: the NoC runs in a different clock domain from the compute array
+(a non-obvious, perishable hardware fact -- recorded here so it is not lost).
+Expected named override units include at least `timing.array_clock`,
+`timing.noc_clock_domain` (distinct domain; NoC-to-array crossing latency is
+its own behavior), `timing.dma_pipeline_depth`, `timing.lock_latency`, and
+`timing.stream_switch_latency` -- each carrying its own honest verdict rather
+than inheriting the coarse `timing` default. The coarse default exists only
+so Phase 1 is green and honest; it is a placeholder these units retire, not a
+claim that timing is monolithic.
 
 Invariant that makes incremental rollout safe: a default is always the
 weakest member's provenance, and refinement can only *improve* a verdict,
@@ -302,12 +335,19 @@ register-level:
 - aie-rt's module tree (`dma/ locks/ stream_switch/ events/ perf/ ...`) -- a
   second, independently authored capability list.
 
-Mechanism: a small hand-curated `CapabilityDomain` list (~40 entries, seeded
-from those two structures) where each domain must be claimed by at least one
-behavioral unit, or the build panics. Not "every register has a verdict" but
-"every hardware capability the manual names is modeled by something." This
-catches "we completely forgot debug-halt is a thing." Cross-referencing two
-independently-authored enumerations is the `Confirmed<T>`
+Mechanism: a small hand-curated `CapabilityDomain` list (~40 entries) where
+each domain must be claimed by at least one behavioral unit, or the build
+panics. The list lives in exactly one location -- `coverage/units.rs`,
+co-located with the override registry -- seeded *once* by reading the AM020
+ToC and the aie-rt module tree, then maintained only there. It is
+deliberately *not* derived from `docs/xdna/` headings or any other source at
+build time: a single hand-curated location is the point, the same way the
+override registry is one location. Splitting the spine's source of truth
+across a doc-scraper would reintroduce exactly the decoupling this whole
+design exists to kill. Not "every register has a verdict" but "every hardware
+capability the manual names is modeled by something." This catches "we
+completely forgot debug-halt is a thing." Cross-referencing two
+independently-authored enumerations *at seeding time* is the `Confirmed<T>`
 multi-source-agreement trick applied to components instead of constants.
 Hand-curated, but ~40 architectural domains that change only when the
 architecture does -- a different swamp from 6,412 field verdicts.
@@ -333,8 +373,6 @@ empirical channels have had their run, regardless of the static gate.
 
 - Wire trace-sweep / differential-fuzzer findings into
   `Provenance::HardwareObserved` unit minting (the empirical intake path).
-- Consider semi-deriving the `CapabilityDomain` seed list from `docs/xdna/`
-  headings rather than fully hand-curating it.
 
 ## Open questions
 
