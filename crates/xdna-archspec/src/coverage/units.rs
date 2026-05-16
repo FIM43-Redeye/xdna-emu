@@ -21,9 +21,16 @@ pub struct BehavioralUnit {
     pub arch: Architecture,
     pub claims: Claims,
     pub verdict: Verdict,
-    /// Set true with a reason when an override pulls a node off the
-    /// toolchain-derived path (spec Section 3 no-silent-shadow rule).
+    /// Free-text human narrative for the Section-3 no-silent-shadow rule:
+    /// when an override pulls a node off the toolchain-derived path, this
+    /// records why for a human reader. NEVER substring-matched for
+    /// enforcement -- see `shared_from` for the typed soundness gate.
     pub shadows_derived: Option<String>,
+    /// Typed cross-arch provenance (spec Section 7). Some(other_arch) means
+    /// this verdict was shared from other_arch. enforce_coverage panics on
+    /// Verified + shared_from.is_some() -- verification never transfers
+    /// across silicon. Typed, so phrasing can neither bypass nor trip it.
+    pub shared_from: Option<Architecture>,
 }
 
 /// A top-level hardware capability the manual names (spec Section 6).

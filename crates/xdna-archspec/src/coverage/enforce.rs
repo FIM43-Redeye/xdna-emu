@@ -5,12 +5,12 @@ use crate::coverage::units::{capability_spine, BehavioralUnit, CapabilityDomain,
 use crate::coverage::verdict::Verification;
 use crate::coverage::CoverageNode;
 use crate::types::Architecture;
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 /// Build-time Axis-2 enforcement for one arch (spec Section 2/4). Panics on:
 /// a capability applicable to `arch` with no claiming unit; two units claiming
-/// one node; a `Verified` verdict carrying a cross-arch `shadows_derived`
-/// marker (verification never transfers across silicon, spec Section 7).
+/// one node; a `Verified` verdict whose unit carries a typed `shared_from`
+/// (verification never transfers across silicon, spec Section 7).
 ///
 /// The SemanticOp axis needs no check here -- `category()` is compiler-enforced
 /// (Task 3). Register-node partition is checked once the register override
@@ -18,32 +18,31 @@ use std::collections::HashSet;
 /// because every register rolls up to its subsystem's coarse default.
 pub fn enforce_coverage(arch: Architecture, spine: &[CapabilityDomain], units: &[BehavioralUnit]) {
     // 1. Cross-arch transfer rule: verification never transfers (spec S7).
+    // Keyed on the TYPED `shared_from` field -- never on prose.
     for u in units {
         if matches!(u.verdict.verification, Verification::Verified { .. }) {
-            if let Some(reason) = &u.shadows_derived {
-                if reason.contains("derived_shared_from") {
-                    panic!(
-                        "COVERAGE: unit '{}' ({arch}) is Verified but carries a cross-arch \
-                         shared marker ({reason}) -- verification never transfers across \
-                         silicon (spec Section 7)",
-                        u.id
-                    );
-                }
+            if let Some(src) = u.shared_from {
+                panic!(
+                    "COVERAGE: unit '{}' ({arch}) is Verified but shared_from={src:?} \
+                     -- verification never transfers across silicon (spec Section 7)",
+                    u.id
+                );
             }
         }
     }
 
     // 2. Partition: no node double-claimed by two units (spec Section 3).
-    // CoverageNode derives Hash, so a HashSet is the natural structure.
-    let mut seen: HashSet<&CoverageNode> = HashSet::new();
+    // CoverageNode derives Hash; map node -> first-claiming unit id so the
+    // panic names BOTH conflicting units.
+    let mut seen: HashMap<&CoverageNode, &str> = HashMap::new();
     for u in units {
         let Claims::Nodes(ns) = &u.claims;
         for n in ns {
-            if !seen.insert(n) {
+            if let Some(first) = seen.insert(n, u.id.as_str()) {
                 panic!(
-                    "COVERAGE: node {:?} double-claimed (unit '{}', {arch}) -- the registry \
-                     must partition, not merely cover (spec Section 3)",
-                    n, u.id
+                    "COVERAGE: node {:?} double-claimed by units '{}' and '{}' ({arch}) \
+                     -- the registry must partition, not merely cover (spec Section 3)",
+                    n, first, u.id
                 );
             }
         }
@@ -85,6 +84,7 @@ pub fn enforce_coverage_phase1(arch: Architecture) {
             // Coarse Phase-1 default; refined in Phase 2 (spec Section 5).
             verdict: crate::coverage::derive::default_verdict(crate::coverage::derive::Category::NeedsTriage),
             shadows_derived: None,
+            shared_from: None,
         })
         .collect();
     enforce_coverage(arch, &spine, &derived_units);
@@ -108,6 +108,7 @@ mod tests {
                 verification: Verification::NotApplicable,
             },
             shadows_derived: None,
+            shared_from: None,
         }
     }
 
@@ -128,13 +129,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "cross-arch")]
+    #[should_panic(expected = "never transfers across silicon")]
     fn panics_on_verified_with_cross_arch_shadow() {
         let arch = Architecture::Aie2;
         let spine = vec![CapabilityDomain { id: "dma".into(), arches: vec![arch] }];
         let mut u = ok_unit(arch, "dma");
         u.verdict.verification = Verification::Verified { evidence: "npu4".into() };
-        u.shadows_derived = Some("derived_shared_from:Aie2p".into());
+        u.shared_from = Some(Architecture::Aie2p); // typed marker, not prose
         enforce_coverage(arch, &spine, &[u]);
     }
 
