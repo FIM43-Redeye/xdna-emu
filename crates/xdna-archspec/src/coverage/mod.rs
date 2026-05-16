@@ -10,14 +10,17 @@ use serde::{Deserialize, Serialize};
 
 /// A fine node, architecture-qualified (spec Section 7: all identity is
 /// arch-qualified). Two kinds of node universe today: ISA semantics and
-/// registers. Capability-spine domains also get a NodeId so they can be
+/// registers. Capability-spine domains also get a CoverageNode so they can be
 /// claimed by units uniformly.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NodeId {
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CoverageNode {
     Semantic {
         arch: Architecture,
         op: SemanticOp,
     },
+    /// Intentionally finer-grained than the graph-level `types::NodeId::Register`:
+    /// it carries `subsystem` for coverage disambiguation, with a conversion
+    /// expected in a later task rather than zero-cost aliasing.
     Register {
         arch: Architecture,
         tile: TileKind,
@@ -31,12 +34,12 @@ pub enum NodeId {
     },
 }
 
-impl NodeId {
+impl CoverageNode {
     pub fn arch(&self) -> Architecture {
         match self {
-            NodeId::Semantic { arch, .. }
-            | NodeId::Register { arch, .. }
-            | NodeId::Capability { arch, .. } => *arch,
+            CoverageNode::Semantic { arch, .. }
+            | CoverageNode::Register { arch, .. }
+            | CoverageNode::Capability { arch, .. } => *arch,
         }
     }
 }
