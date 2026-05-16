@@ -1167,35 +1167,49 @@ Add a test for it (append inside the existing `#[cfg(test)] mod tests`):
     }
 ```
 
-Now wire it into `build.rs`. `build.rs` already calls `crate::model_builder::build_arch_model` (build.rs:110), so the crate's modules are in scope to `build.rs`. Inspect the top of `crates/xdna-archspec/build.rs` for how modules are brought in (the `mod`/`#[path]` declarations that make `crate::model_builder` reachable) and add `coverage` the same way. Then add the enforcement call immediately after the model is built and cross-validated. Modify `crates/xdna-archspec/build.rs` — after the `extract_aiert(workspace_root, &out_dir, &mut arch_model);` line (build.rs:115) and before `gen_arch(&arch_model, &out_dir);` (build.rs:118), insert:
+- [ ] **Step 6: Verify the library (no build.rs wiring in Plan 1)**
 
-```rust
-    // Coverage Axis-2 forcing function (spec Section 2/4): an incomplete
-    // coverage model panics the build, exactly like Confirmed<T>::confirm.
-    // Phase 1: coarse derived claims satisfy the capability spine.
-    crate::coverage::enforce::enforce_coverage_phase1(arch_model.arch);
-```
+Run BARE: `cargo test -p xdna-archspec --lib coverage::enforce` (5 tests pass:
+1 ok + 3 `should_panic` + `phase1_entry_point_is_green`), `cargo test -p
+xdna-archspec --lib coverage` (no regression), `cargo build -p xdna-archspec`
+(clean).
 
-If the top of build.rs uses `#[path = "src/<m>.rs"] mod <m>;` declarations, add `#[path = "src/coverage/mod.rs"] mod coverage;` alongside them (and ensure its submodules resolve — the `mod.rs` already declares them with `pub mod`, and `#[path]` on the parent makes the `src/coverage/` directory the module root, so submodule files resolve normally). The verification is Step 6 (the build must succeed).
-
-- [ ] **Step 6: Run the build to verify the hook compiles and is green**
-
-Run: `cargo build -p xdna-archspec 2>&1 | tail -20`
-Expected: build SUCCEEDS (the Phase-1 entry point is green by construction). Then `cargo test -p xdna-archspec --lib coverage::enforce 2>&1 | tail -10` — 5 tests PASS.
-
-To prove the forcing function actually fires, temporarily add a bogus unapplicable-but-applicable domain check: edit `capability_spine()` to append `CapabilityDomain { id: "BOGUS_UNCLAIMED".into(), arches: vec![Architecture::Aie2] }`, run `cargo build -p xdna-archspec 2>&1 | tail -5`, and confirm it PANICS with `unclaimed capability 'BOGUS_UNCLAIMED'`. Then revert that edit and rebuild green. (This manual check is not committed.)
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Commit (library only)**
 
 ```bash
-git add crates/xdna-archspec/src/coverage/enforce.rs crates/xdna-archspec/src/coverage/mod.rs crates/xdna-archspec/build.rs
-git commit -m "coverage: enforce_coverage + build.rs panic hook (Axis-2 forcing function)
+git add crates/xdna-archspec/src/coverage/enforce.rs crates/xdna-archspec/src/coverage/mod.rs
+git commit -F - <<'EOF'
+coverage: enforce_coverage + Phase-1 shim (Axis-2 logic, build hook deferred)
 
-Panics like Confirmed<T> on unclaimed capability / double-claim /
-cross-arch Verified. Phase-1 entry point green via coarse derived claims.
-
-Generated using Claude Code."
+Generated using Claude Code.
+EOF
 ```
+
+> **DEFERRED TO PLAN 2 -- build.rs panic delivery.** The original plan wired
+> `enforce_coverage_phase1(arch_model.arch)` into `build.rs` so an incomplete
+> coverage model stops the build (spec Section 2/4). This is a **circular
+> dependency**: `build.rs` generates `gen_tablegen.rs`; `aie2/isa/mod.rs`
+> `include!`s it; `coverage` transitively needs `aie2::isa::SemanticOp`. So
+> `build.rs` cannot reference `coverage` (it needs the file `build.rs` has not
+> yet generated). Decision (Maya, 2026-05-16): **defer the build.rs delivery
+> to Plan 2**, do not hack a workaround into Plan 1. Rationale: in Phase 1 the
+> panic is **vacuous by construction** -- the empty override registry + the
+> derived-claim shim auto-claim every spine domain, so no panic condition can
+> fire until Phase 2 introduces real overrides. The enforcement *logic* is
+> implemented and tested here (Steps 1-5: `enforce_coverage` + the three
+> `should_panic` tests proving each condition fires + `enforce_coverage_phase1`
+> + `phase1_entry_point_is_green`); only the `build.rs` *delivery* is deferred.
+> Recorded honestly in the spec (Section 4 "Phasing note") -- claiming a
+> build-stop guarantee Phase 1 cannot deliver would be the exact
+> false-confidence failure this design fights.
+>
+> **Plan 2 MUST include:** wire genuine `build.rs` (or equivalent
+> compile-time) enforcement, resolving the cycle via a dependency-light
+> enforcement entry (operating on plain domain-id data, no
+> `CoverageNode`/`SemanticOp` in its build-callable signature) or by
+> structuring the coverage build-check to not pull `aie2::isa`. The
+> `phase1_entry_point_is_green` test + the `should_panic` suite are the
+> interim Plan-1 gate.
 
 ---
 

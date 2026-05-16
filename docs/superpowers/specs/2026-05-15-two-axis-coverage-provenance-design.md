@@ -255,6 +255,23 @@ Three places fail, each loud and located where the knowledge is:
 - Test red (reconciliation test): a `Verified` unit whose nodes are all
   `Absent`; a stale committed `architecture-index.md`; an undeclared shadow.
 
+**Phasing note (honest delivery boundary).** The Axis-2 *enforcement logic*
+(the panic conditions above) is implemented and tested in Plan 1. Its
+delivery *as a `build.rs` panic* is realized in **Plan 2**, not Plan 1:
+`build.rs` generates the TableGen module that `coverage` transitively needs
+(`aie2::isa`), so calling the enforcement from `build.rs` in Plan 1 is a
+circular dependency. This loses no actual enforcement, because in Phase 1 the
+build panic is **vacuous by construction** -- the empty override registry
+plus the derived-claim shim means every spine domain is auto-claimed and no
+panic condition can fire until Phase 2 introduces real overrides. Plan 1
+therefore runs the enforcement via a test gate (`phase1_entry_point_is_green`
+plus the `should_panic` suite proving each condition fires); Plan 2 wires the
+genuine `build.rs` panic once the interpreter probe, real overrides, and a
+dependency-light enforcement entry resolve the cycle. This boundary is
+recorded rather than papered over -- claiming a build-stop guarantee that
+Phase 1 cannot actually deliver would be the exact false-confidence failure
+this design exists to prevent.
+
 The gate is a single command, parameterized by architecture:
 `cargo test coverage::clean_release` runs it per arch (Section 7). For a
 given arch it asserts that **both** that arch's perishable queue and its
