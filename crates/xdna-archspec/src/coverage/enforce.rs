@@ -1,7 +1,7 @@
 //! Build-time Axis-2 enforcement (spec Section 2/4). Panics like
 //! Confirmed<T>::confirm: an incomplete coverage model stops the build.
 
-use crate::coverage::units::{BehavioralUnit, CapabilityDomain, Claims};
+use crate::coverage::units::{capability_spine, BehavioralUnit, CapabilityDomain, Claims};
 use crate::coverage::verdict::Verification;
 use crate::coverage::CoverageNode;
 use crate::types::Architecture;
@@ -69,6 +69,27 @@ pub fn enforce_coverage(arch: Architecture, spine: &[CapabilityDomain], units: &
     }
 }
 
+/// Phase-1 entry point called from build.rs. Every spine domain is claimed by
+/// an implicit derived unit (spec Section 5: coarse defaults carry bootstrap).
+/// This keeps the build green and honest while the override registry is empty;
+/// Phase 2 replaces derived claims with real override units one at a time.
+pub fn enforce_coverage_phase1(arch: Architecture) {
+    let spine = capability_spine();
+    let derived_units: Vec<BehavioralUnit> = spine
+        .iter()
+        .filter(|d| d.applies_to(arch))
+        .map(|d| BehavioralUnit {
+            id: format!("derived.{}", d.id),
+            arch,
+            claims: Claims::Nodes(vec![CoverageNode::Capability { arch, domain: d.id.clone() }]),
+            // Coarse Phase-1 default; refined in Phase 2 (spec Section 5).
+            verdict: crate::coverage::derive::default_verdict(crate::coverage::derive::Category::NeedsTriage),
+            shadows_derived: None,
+        })
+        .collect();
+    enforce_coverage(arch, &spine, &derived_units);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +144,11 @@ mod tests {
         let arch = Architecture::Aie2;
         let spine = vec![CapabilityDomain { id: "dma".into(), arches: vec![arch] }];
         enforce_coverage(arch, &spine, &[ok_unit(arch, "dma"), ok_unit(arch, "dma")]);
+    }
+
+    #[test]
+    fn phase1_entry_point_is_green() {
+        // Coarse derived claims satisfy the spine without override entries.
+        enforce_coverage_phase1(Architecture::Aie2); // must not panic
     }
 }
