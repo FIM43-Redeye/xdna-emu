@@ -30,6 +30,15 @@ pub enum Verification {
 }
 
 /// One behavioral unit's verdict on both axes.
+///
+/// Invariant: `Provenance::Unspecified` is only ever paired with
+/// `Verification::Unverified` or `Verification::Accepted`, never
+/// `Verification::Verified`. Verifying behavior against silicon requires a
+/// model to compare against, and having a model means the provenance is no
+/// longer `Unspecified`. A behavior learned purely from a hardware surprise
+/// gets a distinct provenance (future `HardwareObserved`, spec Section 6),
+/// not `Unspecified + Verified`. The `is_perishable` / `is_comprehension_gap`
+/// predicates rely on this invariant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verdict {
     pub provenance: Provenance,
@@ -92,6 +101,10 @@ mod tests {
 
     #[test]
     fn verified_closes_perishable() {
+        // Uses AietoolsModeled (the realistic "modeled, then silicon-verified"
+        // path) rather than Unspecified: Unspecified + Verified is an incoherent
+        // state per the Verdict invariant -- you cannot verify behavior you have
+        // not modeled.
         let v = Verdict {
             provenance: Provenance::AietoolsModeled,
             verification: Verification::Verified { evidence: "bridge:add_one".into() },
