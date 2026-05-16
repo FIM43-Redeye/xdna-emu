@@ -812,11 +812,31 @@ mod tests {
     }
 
     #[test]
-    fn clean_release_is_per_arch() {
-        // Spec Section 7: the gate is per-silicon. A different arch is a
-        // different model; AIE2's state says nothing about it.
+    fn clean_release_arch_field_is_preserved() {
+        // Spec Section 7: the gate is per-silicon. True per-arch isolation
+        // (two arches' models are independent) is only testable once a
+        // second arch is wired -- TODO then. For now assert the model
+        // carries the arch it was built for (no cross-arch contamination of
+        // the field itself).
         let m = CoverageModel::build(Architecture::Aie2);
         assert_eq!(m.arch, Architecture::Aie2);
+    }
+
+    #[test]
+    fn all_semantic_ops_len_tripwire() {
+        // MAINTENANCE TRIPWIRE, not a completeness proof. category() forces a
+        // new SemanticOp variant to be categorized but NOT added to
+        // all_semantic_ops(); this assertion fails loudly if the list length
+        // changes, prompting a maintainer to confirm the variant was added
+        // here too. Authoritative completeness is Plan 2's reconciliation
+        // against the real decoded instruction set. Update the count below
+        // ONLY together with a deliberate all_semantic_ops() change.
+        assert_eq!(
+            all_semantic_ops().len(),
+            103,
+            "all_semantic_ops() length changed -- confirm every SemanticOp \
+             variant is still represented (see the doc comment on the fn)"
+        );
     }
 }
 ```
@@ -901,8 +921,15 @@ impl CoverageModel {
 
 /// The static SemanticOp universe. One representative of every enum variant;
 /// `Intrinsic` is represented by `Intrinsic(0)` (the table-lookup family).
-/// This list is itself guarded: `category()` is exhaustive (Task 3), so a new
-/// variant breaks that build before this list can go stale silently.
+///
+/// NOT compile-time guarded for completeness. `category()` (Task 3) forces a
+/// new SemanticOp variant to be *categorized* (exhaustive match, no wildcard)
+/// but does NOT force it into this hand-maintained list -- a categorized-but-
+/// unlisted variant would silently under-report in the rollups. The
+/// authoritative completeness cross-check is Plan 2's reconciliation against
+/// the real TableGen-decoded instruction set. The `len()` assertion in the
+/// test module is a maintenance tripwire (reminds a maintainer to update this
+/// list), NOT a proof of completeness. Do not claim a guard that is not here.
 fn all_semantic_ops() -> Vec<SemanticOp> {
     use SemanticOp::*;
     vec![
