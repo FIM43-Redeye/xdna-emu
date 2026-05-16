@@ -175,8 +175,8 @@ the concrete probe into archspec's `CoverageModel` and:
 2. regenerates `docs/coverage/architecture-index.md` as a rendered view and
    fails if the committed file is stale (the index becomes generated output,
    never hand-edited again);
-3. emits `docs/coverage/perishable-queue.md` and
-   `docs/coverage/comprehension-gaps.md` as checked-in, diffable artifacts.
+3. emits the perishable-queue and comprehension-gap artifacts as checked-in,
+   diffable files (per-architecture -- see Section 7 for the path scheme).
 
 Definitions are single-sourced in archspec. The interpreter contributes one
 trait impl plus the wiring test. Two forcing functions -- archspec's build
@@ -241,9 +241,12 @@ the long tail is auto-covered, un-missable, and defensibly defaulted.
 
 Three places fail, each loud and located where the knowledge is:
 
-- Build panic (archspec `enforce.rs`): a unit with no verdict; two overrides
-  claiming one node (partition violation); an override claiming a node the
-  toolchain no longer emits (stale claim).
+- Build panic (archspec `enforce.rs`), all per-arch: a unit with no verdict;
+  two overrides claiming one node (partition violation); an override claiming
+  a node the toolchain no longer emits (stale claim); a `CapabilityDomain`
+  applicable to the arch with no claiming unit; a `Verified` verdict carrying
+  a cross-arch `derived_shared_from` marker (Section 7 -- verification never
+  transfers across silicon).
 - Compile error: a new `SemanticOp` variant breaks two exhaustive matches
   until resolved -- the interpreter's `impl SurfaceProbe`
   (`surface_probe.rs`, must classify the handler) and archspec's `category()`
@@ -252,13 +255,15 @@ Three places fail, each loud and located where the knowledge is:
 - Test red (reconciliation test): a `Verified` unit whose nodes are all
   `Absent`; a stale committed `architecture-index.md`; an undeclared shadow.
 
-The gate is a single command: `cargo test coverage::clean_release`. It
-asserts that **both** the perishable queue and the comprehension-gap set are
-empty, modulo `Accepted { rationale }`. Green is the literal, checkable
-definition of "we can let NPU1 go": every behavioral unit is
+The gate is a single command, parameterized by architecture:
+`cargo test coverage::clean_release` runs it per arch (Section 7). For a
+given arch it asserts that **both** that arch's perishable queue and its
+comprehension-gap set are empty, modulo `Accepted { rationale }`. Green for
+AIE2 is the literal, checkable definition of "we can let NPU1 go" --
+independent of any other arch's state: every AIE2 behavioral unit is
 toolchain-ground-truth, or `Verified { evidence }`, or
-`Accepted { rationale }`; and nothing a trusted source describes is sitting
-in "we do not know what this is." Both `perishable-queue.md` and
+`Accepted { rationale }`; and nothing a trusted source describes for AIE2 is
+sitting in "we do not know what this is." Both `perishable-queue.md` and
 `comprehension-gaps.md` are committed and diffable, so every closure is one
 line removed in git history -- progress is visible and auditable. A
 comprehension gap is closed by understanding it (verdict improves) or by
@@ -368,6 +373,96 @@ hardware surprise rather than derived top-down -- so the model can *receive*
 empirical discoveries instead of structurally denying they can exist. It does
 not find them. That is itself an argument for keeping NPU1 until the
 empirical channels have had their run, regardless of the static gate.
+
+## Section 7 -- Architecture parameterization
+
+archspec is a multi-architecture model (AIE, AIE2, AIE2P; `model_builder` /
+`runtime` already construct an `ArchModel` per arch). The node sources are
+inherently per-arch: `aie_registers_aie2.json` is AIE2-only; AIE2P/AIE2PS
+registers come from `xaie2psgbl_params.h`; TableGen has per-arch instruction
+definitions; AIE2P has vector modes AIE2 lacks. A coverage layer that
+enforced "every generated node maps to a unit" against only the AIE2 node set
+would silently leave AIE2P uncovered -- the exact failure this design exists
+to prevent, committed one level up at the architecture axis. Therefore:
+
+### Coverage is a per-`ArchModel` facet, not a global singleton
+
+The `CoverageModel`, the override registry, the `CapabilityDomain` list, the
+derived defaults, and the two filter sets are all instanced per architecture
+and attach to the corresponding `ArchModel`. The parameterization seam
+already exists in archspec; the coverage layer uses it rather than
+introducing a parallel global.
+
+### All identity is architecture-qualified
+
+`NodeId`, `BehavioralUnit` ids, and every artifact are keyed by arch. Two
+behaviors that share a conceptual name across arches --
+`vmac.config_word_rounding` on AIE2 versus AIE2P -- are distinct units with
+independent verdicts. Partition enforcement is per-arch: every generated node
+for arch A maps to exactly one unit in arch A's registry; the build panic and
+the no-silent-shadow rule operate within an arch, never across.
+
+Artifacts are per-arch: `docs/coverage/<arch>/architecture-index.md`,
+`docs/coverage/<arch>/perishable-queue.md`,
+`docs/coverage/<arch>/comprehension-gaps.md`.
+
+### `clean_release` is per-silicon
+
+"Verified" means verified on *that arch's* hardware. The gate is
+`clean_release(arch)`. "Safe to retire NPU1" is exactly `clean_release(Aie2)`
+green, fully independent of AIE2P state -- which is otherwise mostly
+`Unverified` today since no NPU4 silicon is on hand. A single global gate
+would either block forever or grant false comfort; neither is acceptable.
+
+### Cross-arch verdict transfer rules (soundness core)
+
+- **Verification never transfers across arch.** `Verified { evidence }`
+  evidence must be silicon of *that* arch. A "same algorithm on the other
+  arch" assumption may at most yield `AietoolsModeled / Unverified` for the
+  other arch -- never `Verified`. `enforce.rs` panics if a verdict carries a
+  cross-arch `derived_shared_from` marker together with `Verified`.
+- **Derivation may transfer only when the source is genuinely common.**
+  `ToolchainDerived / NotApplicable` may be shared across arches only when
+  the originating toolchain source (same TableGen def, same aie-rt code path)
+  is common to both; the shared verdict must record
+  `derived_shared_from(other_arch)`. If the source diverges per arch, the
+  verdict does not transfer and each arch derives independently.
+- **Models are shareable; their verification is not.**
+  `AietoolsModeled` / `DocSpecified` knowledge may inform multiple arches,
+  but each arch carries its own `Verification` status independently.
+
+### `SurfaceClass` applicability -- resolved by per-arch instancing
+
+`SurfaceProbe` is instanced per arch (one `impl` per arch's `SemanticOp`
+set). A node simply does not exist in an arch's generated node set if the
+toolchain does not emit it for that arch, so `SurfaceClass` needs no
+`Inapplicable` value -- the per-arch node set is the applicability boundary.
+This is cleaner than a cross-arch enum value and consistent with the node set
+being per-arch generated.
+
+### `CapabilityDomain` applicability
+
+Each `CapabilityDomain` carries the set of arches it applies to.
+"Claimed by >= 1 unit" is enforced per-arch-where-applicable. The exact
+per-arch capability deltas (memtile presence, PL fabric on Versal-class
+parts, AIE2P-only vector capabilities) are themselves derive-work from each
+arch's sources -- deliberately not asserted in this spec, consistent with the
+project's derive-from-the-toolchain rule.
+
+### Future and out-of-scope architectures
+
+When llvm-aie / regdb gain a new arch (e.g., AIE4), its nodes appear,
+pessimistic defaults apply, and the build breaks until the new variants are
+categorized -- it is structurally impossible to ship "AIE4 support" that
+silently models nothing. Currently out-of-scope arches (AIE1 / Versal) are
+represented as an arch-level `Accepted { rationale: "out of scope" }`,
+producing zero false gaps while remaining cleanly addable later (the TableGen
+parser already handles multiple architectures).
+
+This section parameterizes; it does not redesign. The per-arch mechanics --
+forcing functions, monotone refinement, the two filter sets, the capability
+spine -- are identical to the single-arch description; Section 7 only makes
+the previously-implicit "AIE2" explicit and parametric.
 
 ## Future work
 
