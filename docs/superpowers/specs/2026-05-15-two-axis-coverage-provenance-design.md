@@ -230,9 +230,13 @@ Precedence and the no-silent-shadow guarantee:
   a vanished node -> build panic.
 - The dangerous case -- an override silently pulling a node off the
   toolchain-derived path into a weaker verdict -- requires the override to
-  declare `shadows_derived = true` with a one-line reason; the reconciliation
-  test panics on an undeclared shadow. Demotion from "toolchain-true" to
-  "approximated" is then a conscious, reviewed act.
+  declare `shadows_derived = Some(reason)` (a free-text human narrative); the
+  reconciliation test panics on an undeclared shadow. Demotion from
+  "toolchain-true" to "approximated" is then a conscious, reviewed act. This
+  narrative field is distinct from and must not be overloaded to encode the
+  Section-7 cross-arch transfer rule -- that is a separate *typed* field
+  (`shared_from`), because a machine-enforced soundness invariant must never
+  be enforced by substring-matching prose.
 
 Human judgment is spent only on the behaviorally subtle, perishable ~10%;
 the long tail is auto-covered, un-missable, and defensibly defaulted.
@@ -436,14 +440,17 @@ would either block forever or grant false comfort; neither is acceptable.
 - **Verification never transfers across arch.** `Verified { evidence }`
   evidence must be silicon of *that* arch. A "same algorithm on the other
   arch" assumption may at most yield `AietoolsModeled / Unverified` for the
-  other arch -- never `Verified`. `enforce.rs` panics if a verdict carries a
-  cross-arch `derived_shared_from` marker together with `Verified`.
+  other arch -- never `Verified`. `enforce.rs` panics if a `Verified`
+  verdict's unit also carries `shared_from: Some(other_arch)` -- a *typed*
+  field on the unit, NOT a substring of the free-text `shadows_derived`
+  narrative. A machine-enforced soundness rule must not be
+  bypassable-or-trippable by prose phrasing.
 - **Derivation may transfer only when the source is genuinely common.**
   `ToolchainDerived / NotApplicable` may be shared across arches only when
   the originating toolchain source (same TableGen def, same aie-rt code path)
-  is common to both; the shared verdict must record
-  `derived_shared_from(other_arch)`. If the source diverges per arch, the
-  verdict does not transfer and each arch derives independently.
+  is common to both; the unit must record `shared_from = Some(other_arch)`
+  (the typed field). If the source diverges per arch, the verdict does not
+  transfer and each arch derives independently.
 - **Models are shareable; their verification is not.**
   `AietoolsModeled` / `DocSpecified` knowledge may inform multiple arches,
   but each arch carries its own `Verification` status independently.

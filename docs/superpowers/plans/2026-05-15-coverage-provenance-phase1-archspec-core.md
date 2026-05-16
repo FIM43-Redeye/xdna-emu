@@ -692,9 +692,16 @@ pub struct BehavioralUnit {
     pub arch: Architecture,
     pub claims: Claims,
     pub verdict: Verdict,
-    /// Set true with a reason when an override pulls a node off the
-    /// toolchain-derived path (spec Section 3 no-silent-shadow rule).
+    /// Free-text human narrative when an override pulls a node off the
+    /// toolchain-derived path (spec Section 3 no-silent-shadow rule). NEVER
+    /// substring-matched for enforcement -- prose must not gate a soundness
+    /// rule. The cross-arch transfer rule is the typed `shared_from` below.
     pub shadows_derived: Option<String>,
+    /// Typed cross-arch provenance (spec Section 7). `Some(other_arch)` means
+    /// this verdict was shared from `other_arch`. `enforce_coverage` panics on
+    /// `Verified` + `shared_from.is_some()` -- verification never transfers
+    /// across silicon. Typed, so phrasing can neither bypass nor trip it.
+    pub shared_from: Option<Architecture>,
 }
 
 /// A top-level hardware capability the manual names (spec Section 6).
@@ -999,6 +1006,7 @@ mod tests {
             claims: Claims::Nodes(vec![CoverageNode::Capability { arch, domain: id.into() }]),
             verdict: Verdict { provenance: Provenance::ToolchainDerived, verification: Verification::NotApplicable },
             shadows_derived: None,
+            shared_from: None,
         }
     }
 
@@ -1025,7 +1033,7 @@ mod tests {
         let spine = vec![CapabilityDomain { id: "dma".into(), arches: vec![arch] }];
         let mut u = ok_unit(arch, "dma");
         u.verdict.verification = Verification::Verified { evidence: "npu4".into() };
-        u.shadows_derived = Some("derived_shared_from:Aie2p".into());
+        u.shared_from = Some(Architecture::Aie2p); // typed marker, not prose
         enforce_coverage(arch, &spine, &[u]);
     }
 
@@ -1053,12 +1061,12 @@ use crate::coverage::units::{BehavioralUnit, CapabilityDomain, Claims};
 use crate::coverage::verdict::Verification;
 use crate::coverage::CoverageNode;
 use crate::types::Architecture;
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 /// Build-time Axis-2 enforcement for one arch (spec Section 2/4). Panics on:
 /// a capability applicable to `arch` with no claiming unit; two units claiming
-/// one node; a `Verified` verdict carrying a cross-arch `shadows_derived`
-/// marker (verification never transfers across silicon, spec Section 7).
+/// one node; a `Verified` verdict whose unit carries a typed `shared_from`
+/// (verification never transfers across silicon, spec Section 7).
 ///
 /// The SemanticOp axis needs no check here -- `category()` is compiler-enforced
 /// (Task 3). Register-node partition is checked once the register override
@@ -1066,32 +1074,31 @@ use std::collections::HashSet;
 /// because every register rolls up to its subsystem's coarse default.
 pub fn enforce_coverage(arch: Architecture, spine: &[CapabilityDomain], units: &[BehavioralUnit]) {
     // 1. Cross-arch transfer rule: verification never transfers (spec S7).
+    // Keyed on the TYPED `shared_from` field -- never on prose.
     for u in units {
         if matches!(u.verdict.verification, Verification::Verified { .. }) {
-            if let Some(reason) = &u.shadows_derived {
-                if reason.contains("derived_shared_from") {
-                    panic!(
-                        "COVERAGE: unit '{}' ({arch}) is Verified but carries a cross-arch \
-                         shared marker ({reason}) -- verification never transfers across \
-                         silicon (spec Section 7)",
-                        u.id
-                    );
-                }
+            if let Some(src) = u.shared_from {
+                panic!(
+                    "COVERAGE: unit '{}' ({arch}) is Verified but shared_from={src:?} \
+                     -- verification never transfers across silicon (spec Section 7)",
+                    u.id
+                );
             }
         }
     }
 
     // 2. Partition: no node double-claimed by two units (spec Section 3).
-    // CoverageNode derives Hash, so a HashSet is the natural structure.
-    let mut seen: HashSet<&CoverageNode> = HashSet::new();
+    // CoverageNode derives Hash; map node -> first-claiming unit id so the
+    // panic names BOTH conflicting units.
+    let mut seen: HashMap<&CoverageNode, &str> = HashMap::new();
     for u in units {
         let Claims::Nodes(ns) = &u.claims;
         for n in ns {
-            if !seen.insert(n) {
+            if let Some(first) = seen.insert(n, u.id.as_str()) {
                 panic!(
-                    "COVERAGE: node {:?} double-claimed (unit '{}', {arch}) -- the registry \
-                     must partition, not merely cover (spec Section 3)",
-                    n, u.id
+                    "COVERAGE: node {:?} double-claimed by units '{}' and '{}' ({arch}) \
+                     -- the registry must partition, not merely cover (spec Section 3)",
+                    n, first, u.id
                 );
             }
         }
@@ -1151,6 +1158,7 @@ pub fn enforce_coverage_phase1(arch: Architecture) {
                 crate::coverage::derive::Category::NeedsTriage,
             ),
             shadows_derived: None,
+            shared_from: None,
         })
         .collect();
     enforce_coverage(arch, &spine, &derived_units);
@@ -1442,4 +1450,4 @@ If no fixes were needed, skip the commit; Plan 1 is complete at Task 7's commit.
 
 **2. Placeholder scan:** No "TBD"/"TODO"/"similar to". The one inspect-and-mirror step (build.rs module declaration, Task 6 Step 5) is a concrete action with a `cargo build` verification, not a placeholder — the literal `#[path]`/`mod` mechanism is the existing file's and must be read at execution time; the plan states exactly what to add and how to verify it. Every code step contains complete compiling code.
 
-**3. Type consistency:** `Verdict { provenance, verification }`, `Provenance::{ToolchainDerived,AietoolsModeled,DocSpecified,Unspecified}`, `Verification::{NotApplicable,Verified{evidence},Unverified,Accepted{rationale}}`, `CoverageNode::{Semantic,Register,Capability}`, `Category` (9 variants), `category(&SemanticOp)`, `default_verdict(Category)`, `BehavioralUnit { id,arch,claims,verdict,shadows_derived }`, `Claims::Nodes`, `CapabilityDomain { id,arches }`, `CoverageModel { arch, overrides }` with `build/semantic_verdict/perishable_queue/comprehension_gaps/clean_release/applicable_capabilities`, `enforce_coverage(arch,&[CapabilityDomain],&[BehavioralUnit])`, `enforce_coverage_phase1(arch)` — names and signatures are used identically across Tasks 1-8. `SemanticOp` gains `Serialize/Deserialize` in Task 2 before `CoverageNode` (which needs it) is serialized; ordering correct. No drift found.
+**3. Type consistency:** `Verdict { provenance, verification }`, `Provenance::{ToolchainDerived,AietoolsModeled,DocSpecified,Unspecified}`, `Verification::{NotApplicable,Verified{evidence},Unverified,Accepted{rationale}}`, `CoverageNode::{Semantic,Register,Capability}`, `Category` (9 variants), `category(&SemanticOp)`, `default_verdict(Category)`, `BehavioralUnit { id,arch,claims,verdict,shadows_derived,shared_from }`, `Claims::Nodes`, `CapabilityDomain { id,arches }`, `CoverageModel { arch, overrides }` with `build/semantic_verdict/perishable_queue/comprehension_gaps/clean_release/applicable_capabilities`, `enforce_coverage(arch,&[CapabilityDomain],&[BehavioralUnit])`, `enforce_coverage_phase1(arch)` — names and signatures are used identically across Tasks 1-8. `SemanticOp` gains `Serialize/Deserialize` in Task 2 before `CoverageNode` (which needs it) is serialized; ordering correct. No drift found.
