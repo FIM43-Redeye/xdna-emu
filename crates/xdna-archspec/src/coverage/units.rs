@@ -70,27 +70,10 @@ pub fn override_registry(_arch: Architecture) -> Vec<BehavioralUnit> {
 /// derived shim (Task 6); the SubsystemKind<->spine partition is Phase 2.
 pub fn capability_spine() -> Vec<CapabilityDomain> {
     let aie2 = vec![Architecture::Aie2];
-    [
-        "core",
-        "program_memory",
-        "program_counter",
-        "data_memory",
-        "dma",
-        "locks",
-        "stream_switch",
-        "events_trace",
-        "performance_counters",
-        "timer",
-        "watchpoint",
-        "debug_halt",
-        "cascade",
-        "interrupt",
-        "noc",
-        "shim_mux",
-    ]
-    .iter()
-    .map(|id| CapabilityDomain { id: (*id).to_string(), arches: aie2.clone() })
-    .collect()
+    crate::coverage::spine_ids::SPINE_DOMAIN_IDS
+        .iter()
+        .map(|id| CapabilityDomain { id: (*id).to_string(), arches: aie2.clone() })
+        .collect()
 }
 
 #[cfg(test)]
@@ -119,5 +102,16 @@ mod tests {
     fn capability_domain_arch_applicability_is_explicit() {
         let dma = capability_spine().into_iter().find(|d| d.id == "dma").unwrap();
         assert!(dma.applies_to(Architecture::Aie2));
+    }
+
+    #[test]
+    fn capability_spine_matches_the_leaf_id_list() {
+        // The leaf list (build.rs-visible) and the rich spine MUST agree --
+        // they are the same source of truth, just two views (spec Section 6
+        // one location; Plan 2 cycle note).
+        use crate::coverage::spine_ids::SPINE_DOMAIN_IDS;
+        let rich: Vec<String> = capability_spine().into_iter().map(|d| d.id).collect();
+        let leaf: Vec<String> = SPINE_DOMAIN_IDS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(rich, leaf);
     }
 }

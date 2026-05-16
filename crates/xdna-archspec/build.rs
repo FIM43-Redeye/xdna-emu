@@ -34,6 +34,10 @@ mod device_model;
 mod regdb_extractor;
 #[path = "src/model_builder.rs"]
 mod model_builder;
+#[path = "src/coverage/spine_ids.rs"]
+mod spine_ids;
+#[path = "src/coverage/build_gate.rs"]
+mod build_gate;
 
 use std::collections::HashMap;
 use std::env;
@@ -102,6 +106,13 @@ fn main() {
     });
     let mut arch_model = crate::model_builder::build_arch_model(&device_model_path, &regdb, "npu1")
         .unwrap_or_else(|e| panic!("Failed to build ArchModel: {}", e));
+
+    // COVERAGE build-time gate (spec Section 4 delivery). Dependency-light by
+    // necessity: build.rs cannot see crate::aie2::isa (it generates it), so
+    // the deep CoverageNode checks stay test-gated -- see the Plan-2
+    // "irreducible cycle" note. This panics the build if the capability spine
+    // is empty/ill-formed (absence the emulator cannot be composed without).
+    build_gate::enforce_spine_phase1(spine_ids::SPINE_DOMAIN_IDS);
 
     // Cross-validate subsystem ranges via aie-rt, and emit gen_aiert_*.rs
     // files consumed by xdna_archspec::aie2::aiert::* (and from there by
