@@ -25,9 +25,10 @@ pub fn render_perishable(arch: Architecture) -> String {
             Provenance::AietoolsModeled => "aietools-modeled (e.g. vector compute)".to_string(),
             Provenance::DocSpecified => "doc-specified (e.g. DMA/stream side effects)".to_string(),
             // Dead arm in Phase 1: perishable_queue() pre-filters to
-            // is_perishable() (only AietoolsModeled|DocSpecified). Neither
-            // Unspecified nor HardwareObserved can reach here. Kept so the
-            // match stays total if a future perishable provenance lands.
+            // is_perishable() (only AietoolsModeled|DocSpecified).
+            // ToolchainDerived, Unspecified, and HardwareObserved cannot
+            // reach here. Kept so the match stays total if a future
+            // perishable provenance lands.
             _ => "modeled".to_string(),
         })
         .collect();
