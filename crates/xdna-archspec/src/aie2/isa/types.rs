@@ -233,7 +233,7 @@ pub struct InstrAttributes {
 ///
 /// These come from `Pat<>` patterns in AIE2InstrPatterns.td.
 /// The SDNode name tells us what the instruction actually computes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SemanticOp {
     // Arithmetic
     Add,
