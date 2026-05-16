@@ -183,6 +183,10 @@ pub fn default_verdict(cat: Category) -> Verdict {
             Verdict { provenance: Provenance::AietoolsModeled, verification: Verification::Unverified }
         }
         Category::SideEffect => {
+            // Spec Section 5 names this tier "timing"; there are no
+            // timing-only SemanticOps (timing constants live at the
+            // register/spine level, e.g. the `timer` capability domain).
+            // DMA/stream/cascade side effects share that pessimistic tier.
             Verdict { provenance: Provenance::DocSpecified, verification: Verification::Unverified }
         }
         Category::NeedsTriage => {

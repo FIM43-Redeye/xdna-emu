@@ -279,6 +279,17 @@ mod tests {
     }
 
     #[test]
+    fn clean_release_aie2() {
+        // THE per-silicon release gate (spec Section 4/7). Discoverable via
+        // `cargo test -p xdna-archspec --lib clean_release`. Green for AIE2 ==
+        // "safe to retire NPU1". At bootstrap it is correctly NOT green
+        // (vector perishable, Intrinsic a comprehension gap) -- assert the
+        // honest negative; Phase 2 closes these and flips this assertion.
+        let m = CoverageModel::build(Architecture::Aie2);
+        assert!(!m.clean_release(), "bootstrap must not be green -- that is the honest state (spec S5)");
+    }
+
+    #[test]
     fn all_semantic_ops_len_tripwire() {
         // MAINTENANCE TRIPWIRE, not a completeness proof. category() forces a
         // new SemanticOp variant to be categorized but NOT added to
