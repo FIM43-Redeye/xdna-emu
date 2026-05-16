@@ -1,8 +1,13 @@
 # Subsystem audit checklist
 
-The questions to ask when auditing a subsystem listed in
-[aie2/architecture-index.md](aie2/architecture-index.md). Apply when adding a row,
-and re-apply when the subsystem's coverage state changes.
+The questions to ask when adjudicating a subsystem's behavioral coverage
+in the two-axis coverage model. Apply before flipping a behavioral unit's
+verdict toward `Verified { evidence }` or `Accepted { rationale }` (closing
+a line in [aie2/perishable-queue.md](aie2/perishable-queue.md) or
+[aie2/comprehension-gaps.md](aie2/comprehension-gaps.md)), or when adding an
+override unit. The generated
+[aie2/architecture-index.md](aie2/architecture-index.md) is the rolled-up
+view of those verdicts; it is regenerated, never hand-edited.
 
 The point of this document is to make the failure modes that have
 already burned us once become routine to check for. Each item exists
@@ -11,7 +16,8 @@ because we missed it at some point.
 ## 1. Source-of-truth verification
 
 - [ ] Does an authoritative source (aie-rt, AM025, mlir-aie device
-  model) define this subsystem? Cite the file path in the index row.
+  model) define this subsystem? Cite the file path in the unit's
+  `evidence` or `shadows_derived` narrative.
 - [ ] If multiple sources define it, do their constants agree? (See the
   lock-count / BD-count cross-check episode, 2026-05-04 — aie-rt's
   `xaiemlgbl_reginit.c` is the most reliable arbiter for AIE-ML.)
@@ -43,7 +49,8 @@ configuration enums, mode bits, threshold registers, ...):
   per cycle (or per event, per packet, etc.) and acts on its value.
 - [ ] If no consumer exists, the field is a write-only register from
   software's point of view — flag it. Either model the consumer or
-  document it explicitly in the index row's notes.
+  document it explicitly in the unit's verdict (`Accepted { rationale }`)
+  or its `shadows_derived` narrative.
 
 A clean subsystem has both producer and consumer for every meaningful
 field. A subsystem with producers but no consumers is the shape of
@@ -75,12 +82,15 @@ this 2026-05-04 bug class.
 
 ## How to use this checklist
 
-When you set a row in `aie2/architecture-index.md` to **MODELED** —
-either after writing a new subsystem or after closing a gap —
-walk through this list. Note any item you skipped (and why) in
-the row's notes column.
+When you flip a behavioral unit's verdict toward `Verified { evidence }`
+or `Accepted { rationale }` — either after modelling a new subsystem or
+after closing a perishable / comprehension entry — walk through this
+list. Record anything you skipped (and why) in the unit's
+`Accepted { rationale }` or its `shadows_derived` narrative; that text
+is what a future reader sees, not a hand-edited index cell.
 
-When grading existing **MODELED** rows, run them through item 3
-specifically: "what consumes this field per cycle?" If the answer
-is "nothing", drop the row to **PARTIAL** and add it to the gap
-list.
+When re-grading an existing `Verified` or toolchain-derived unit, run it
+through item 3 specifically: "what consumes this field per cycle?" If the
+answer is "nothing", the unit is not actually modelled — demote its
+verdict. It then reappears in perishable-queue.md / comprehension-gaps.md
+by construction, which is the gap list regenerating itself.

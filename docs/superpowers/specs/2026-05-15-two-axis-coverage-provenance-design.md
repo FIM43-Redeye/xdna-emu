@@ -398,16 +398,20 @@ empirical discoveries instead of structurally denying they can exist. It does
 not find them. That is itself an argument for keeping NPU1 until the
 empirical channels have had their run, regardless of the static gate.
 
-**Phasing (honest scope).** `Provenance::HardwareObserved` is introduced
-**together with the empirical intake path in Plan 2**, not in Plan 1. Plan 1
-ships exactly four `Provenance` variants (`ToolchainDerived`,
-`AietoolsModeled`, `DocSpecified`, `Unspecified`); a fifth variant with no
-producer and no consumer would be speculative scaffolding, which this
-design's own no-premature-complexity ethos discourages. The variant and its
-predicate semantics (`is_perishable` / `is_comprehension_gap` both false --
-a silicon-observed fact is neither modeled-weakly nor a comprehension gap)
-land in Plan 2 alongside the trace-sweep / fuzzer minting that gives it
-meaning.
+**Phasing (honest scope).** `Provenance::HardwareObserved`'s **receiving
+vocabulary** (the variant, its predicate semantics, and a mint constructor)
+lands in **Plan 2**, not Plan 1; the **empirical intake path** that produces
+such verdicts (trace-sweep / fuzzer wiring) is named future work, not built
+in either plan. Plan 1 ships exactly four `Provenance` variants
+(`ToolchainDerived`, `AietoolsModeled`, `DocSpecified`, `Unspecified`); a
+fifth variant with no producer and no consumer would be speculative
+scaffolding, which this design's own no-premature-complexity ethos
+discourages. The variant and its predicate semantics (`is_perishable` /
+`is_comprehension_gap` both false -- a silicon-observed fact is neither
+modeled-weakly nor a comprehension gap) land in Plan 2 as a mint-only
+receiving stub so the model can *accept* empirical discoveries; the
+trace-sweep / fuzzer minting that gives it meaning is future work (see
+"Future work").
 
 ## Section 7 -- Architecture parameterization
 
