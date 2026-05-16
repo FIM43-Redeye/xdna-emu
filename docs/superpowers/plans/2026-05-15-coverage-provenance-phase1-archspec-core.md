@@ -18,7 +18,7 @@
 
 | File | Responsibility |
 |------|----------------|
-| `crates/xdna-archspec/src/coverage/mod.rs` | Module root; `NodeId`; `CoverageModel`; the two filter sets; `clean_release` |
+| `crates/xdna-archspec/src/coverage/mod.rs` | Module root; `CoverageNode`; `CoverageModel`; the two filter sets; `clean_release` |
 | `crates/xdna-archspec/src/coverage/verdict.rs` | `Provenance`, `Verification`, `Verdict`, perishable/comprehension predicates |
 | `crates/xdna-archspec/src/coverage/surface.rs` | `SurfaceClass` enum + `SurfaceProbe` trait (definition only; impl is Plan 2) |
 | `crates/xdna-archspec/src/coverage/derive.rs` | `Category` + compiler-enforced `category(SemanticOp)` + per-category default verdict |
@@ -196,11 +196,11 @@ Generated using Claude Code."
 
 ---
 
-### Task 2: SurfaceClass + SurfaceProbe trait + NodeId
+### Task 2: SurfaceClass + SurfaceProbe trait + CoverageNode
 
 **Files:**
 - Create: `crates/xdna-archspec/src/coverage/surface.rs`
-- Modify: `crates/xdna-archspec/src/coverage/mod.rs` (add `NodeId`, `pub mod surface;`)
+- Modify: `crates/xdna-archspec/src/coverage/mod.rs` (add `CoverageNode`, `pub mod surface;`)
 - Test: inline in `surface.rs` and `mod.rs`
 
 - [ ] **Step 1: Write the failing test**
@@ -213,10 +213,10 @@ Create `crates/xdna-archspec/src/coverage/surface.rs`:
 //! per-arch `impl SurfaceProbe` lives in the interpreter crate (Plan 2),
 //! because "does a handler exist" is implementation state, not architecture.
 
-use crate::coverage::NodeId;
+use crate::coverage::CoverageNode;
 
 /// Whether a generated node is wired into execution. Spec Section 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SurfaceClass {
     /// A real execution handler / register consumer exists.
     Wired,
@@ -231,20 +231,20 @@ pub enum SurfaceClass {
 /// arch's node set if the toolchain does not emit it for that arch, so no
 /// `Inapplicable` value is needed (spec Section 7).
 pub trait SurfaceProbe {
-    fn surface_class(&self, node: &NodeId) -> SurfaceClass;
+    fn surface_class(&self, node: &CoverageNode) -> SurfaceClass;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coverage::NodeId;
+    use crate::coverage::CoverageNode;
     use crate::types::Architecture;
 
     /// A fake probe proves the trait is object-safe and usable before the
     /// real interpreter impl exists (Plan 2).
     struct FakeProbe;
     impl SurfaceProbe for FakeProbe {
-        fn surface_class(&self, _node: &NodeId) -> SurfaceClass {
+        fn surface_class(&self, _node: &CoverageNode) -> SurfaceClass {
             SurfaceClass::Wired
         }
     }
@@ -252,7 +252,7 @@ mod tests {
     #[test]
     fn trait_is_object_safe_and_usable() {
         let p: &dyn SurfaceProbe = &FakeProbe;
-        let node = NodeId::Capability { arch: Architecture::Aie2, domain: "dma".into() };
+        let node = CoverageNode::Capability { arch: Architecture::Aie2, domain: "dma".into() };
         assert_eq!(p.surface_class(&node), SurfaceClass::Wired);
     }
 }
@@ -261,7 +261,7 @@ mod tests {
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p xdna-archspec --lib coverage::surface 2>&1 | tail -20`
-Expected: FAIL — `cannot find type NodeId in crate::coverage` and `surface` not declared.
+Expected: FAIL — `cannot find type CoverageNode in crate::coverage` and `surface` not declared.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -280,10 +280,11 @@ use serde::{Deserialize, Serialize};
 
 /// A fine node, architecture-qualified (spec Section 7: all identity is
 /// arch-qualified). Two kinds of node universe today: ISA semantics and
-/// registers. Capability-spine domains also get a NodeId so they can be
-/// claimed by units uniformly.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NodeId {
+/// registers. Capability-spine domains also get a CoverageNode so they can be
+/// claimed by units uniformly. Derives `Hash` so it can key the partition
+/// `HashSet` (Task 6) and any future identity maps.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CoverageNode {
     Semantic { arch: Architecture, op: SemanticOp },
     Register {
         arch: Architecture,
@@ -295,18 +296,18 @@ pub enum NodeId {
     Capability { arch: Architecture, domain: String },
 }
 
-impl NodeId {
+impl CoverageNode {
     pub fn arch(&self) -> Architecture {
         match self {
-            NodeId::Semantic { arch, .. }
-            | NodeId::Register { arch, .. }
-            | NodeId::Capability { arch, .. } => *arch,
+            CoverageNode::Semantic { arch, .. }
+            | CoverageNode::Register { arch, .. }
+            | CoverageNode::Capability { arch, .. } => *arch,
         }
     }
 }
 ```
 
-`SemanticOp` derives `Hash` but not `Serialize`/`Deserialize` in `aie2/isa/types.rs:237`. `NodeId` derives `Serialize`/`Deserialize` above — to keep the build honest, the engineer must add `Serialize, Deserialize` to the `SemanticOp` derive list. Modify `crates/xdna-archspec/src/aie2/isa/types.rs:237`:
+`SemanticOp` derives `Hash` but not `Serialize`/`Deserialize` in `aie2/isa/types.rs:237`. `CoverageNode` derives `Serialize`/`Deserialize` above — to keep the build honest, the engineer must add `Serialize, Deserialize` to the `SemanticOp` derive list. Modify `crates/xdna-archspec/src/aie2/isa/types.rs:237`:
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -324,9 +325,9 @@ Expected: PASS — 1 test passes. Also run `cargo test -p xdna-archspec --lib co
 
 ```bash
 git add crates/xdna-archspec/src/coverage/ crates/xdna-archspec/src/aie2/isa/types.rs
-git commit -m "coverage: SurfaceClass + SurfaceProbe trait + arch-qualified NodeId
+git commit -m "coverage: SurfaceClass + SurfaceProbe trait + arch-qualified CoverageNode
 
-Derive Serialize/Deserialize on SemanticOp so NodeId can serialize.
+Derive Serialize/Deserialize on SemanticOp so CoverageNode can serialize.
 
 Generated using Claude Code."
 ```
@@ -666,7 +667,7 @@ Prepend to `crates/xdna-archspec/src/coverage/units.rs`:
 
 ```rust
 use crate::coverage::verdict::Verdict;
-use crate::coverage::NodeId;
+use crate::coverage::CoverageNode;
 use crate::types::Architecture;
 
 /// What fine nodes a behavioral unit claims (spec Section 3). A unit either
@@ -674,7 +675,7 @@ use crate::types::Architecture;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claims {
     /// Explicit override: this exact set of nodes (spec Section 3).
-    Nodes(Vec<NodeId>),
+    Nodes(Vec<CoverageNode>),
 }
 
 /// A behavioral unit: a cluster of fine nodes with one verdict (spec Section 3).
@@ -835,14 +836,14 @@ impl CoverageModel {
     /// Verdict for a SemanticOp node: override if one claims it, else the
     /// pessimistic category default (spec Section 3/5).
     pub fn semantic_verdict(&self, op: &SemanticOp) -> Verdict {
-        let node = NodeId::Semantic { arch: self.arch, op: op.clone() };
+        let node = CoverageNode::Semantic { arch: self.arch, op: op.clone() };
         if let Some(u) = self.claiming_unit(&node) {
             return u.verdict.clone();
         }
         default_verdict(category(op))
     }
 
-    fn claiming_unit(&self, node: &NodeId) -> Option<&BehavioralUnit> {
+    fn claiming_unit(&self, node: &CoverageNode) -> Option<&BehavioralUnit> {
         self.overrides.iter().find(|u| match &u.claims {
             crate::coverage::units::Claims::Nodes(ns) => ns.contains(node),
         })
@@ -943,14 +944,14 @@ mod tests {
     use super::*;
     use crate::coverage::units::{BehavioralUnit, Claims, CapabilityDomain};
     use crate::coverage::verdict::{Provenance, Verdict, Verification};
-    use crate::coverage::NodeId;
+    use crate::coverage::CoverageNode;
     use crate::types::Architecture;
 
     fn ok_unit(arch: Architecture, id: &str) -> BehavioralUnit {
         BehavioralUnit {
             id: id.into(),
             arch,
-            claims: Claims::Nodes(vec![NodeId::Capability { arch, domain: id.into() }]),
+            claims: Claims::Nodes(vec![CoverageNode::Capability { arch, domain: id.into() }]),
             verdict: Verdict { provenance: Provenance::ToolchainDerived, verification: Verification::NotApplicable },
             shadows_derived: None,
         }
@@ -1005,8 +1006,9 @@ Prepend to `crates/xdna-archspec/src/coverage/enforce.rs`:
 ```rust
 use crate::coverage::units::{BehavioralUnit, CapabilityDomain, Claims};
 use crate::coverage::verdict::Verification;
-use crate::coverage::NodeId;
+use crate::coverage::CoverageNode;
 use crate::types::Architecture;
+use std::collections::HashSet;
 
 /// Build-time Axis-2 enforcement for one arch (spec Section 2/4). Panics on:
 /// a capability applicable to `arch` with no claiming unit; two units claiming
@@ -1035,18 +1037,18 @@ pub fn enforce_coverage(arch: Architecture, spine: &[CapabilityDomain], units: &
     }
 
     // 2. Partition: no node double-claimed by two units (spec Section 3).
-    let mut seen: Vec<&NodeId> = Vec::new();
+    // CoverageNode derives Hash, so a HashSet is the natural structure.
+    let mut seen: HashSet<&CoverageNode> = HashSet::new();
     for u in units {
         let Claims::Nodes(ns) = &u.claims;
         for n in ns {
-            if seen.contains(&n) {
+            if !seen.insert(n) {
                 panic!(
                     "COVERAGE: node {:?} double-claimed (unit '{}', {arch}) -- the registry \
                      must partition, not merely cover (spec Section 3)",
                     n, u.id
                 );
             }
-            seen.push(n);
         }
     }
 
@@ -1057,7 +1059,7 @@ pub fn enforce_coverage(arch: Architecture, spine: &[CapabilityDomain], units: &
         }
         let claimed = units.iter().any(|u| {
             let Claims::Nodes(ns) = &u.claims;
-            ns.iter().any(|n| matches!(n, NodeId::Capability { domain, .. } if domain == &dom.id))
+            ns.iter().any(|n| matches!(n, CoverageNode::Capability { domain, .. } if domain == &dom.id))
         });
         if !claimed {
             panic!(
@@ -1098,7 +1100,7 @@ pub fn enforce_coverage_phase1(arch: Architecture) {
         .map(|d| BehavioralUnit {
             id: format!("derived.{}", d.id),
             arch,
-            claims: Claims::Nodes(vec![NodeId::Capability { arch, domain: d.id.clone() }]),
+            claims: Claims::Nodes(vec![CoverageNode::Capability { arch, domain: d.id.clone() }]),
             // Coarse Phase-1 default; refined in Phase 2 (spec Section 5).
             verdict: crate::coverage::derive::default_verdict(
                 crate::coverage::derive::Category::NeedsTriage,
@@ -1375,10 +1377,10 @@ If no fixes were needed, skip the commit; Plan 1 is complete at Task 7's commit.
 - Spec §4 failure modes + per-arch gate + committed artifacts -> Tasks 6 (panics), 5 (`clean_release`), 7 (artifacts + staleness). ✓
 - Spec §5 default-to-ignorant + pessimistic bootstrap + no flag-day -> Task 3 (`default_verdict`, NeedsTriage=Unspecified), Task 6 Step 5 (Phase-1 green via coarse derived claims). ✓
 - Spec §6 capability spine, one location -> Task 4 (`capability_spine` in `units.rs`), Task 6 (unclaimed-capability panic). ✓
-- Spec §7 architecture parameterization -> arch-qualified `NodeId` (Task 2), `CoverageModel { arch }` + per-arch gate (Task 5), per-arch `enforce_coverage(arch, ..)` + cross-arch Verified panic (Task 6). ✓
+- Spec §7 architecture parameterization -> arch-qualified `CoverageNode` (Task 2), `CoverageModel { arch }` + per-arch gate (Task 5), per-arch `enforce_coverage(arch, ..)` + cross-arch Verified panic (Task 6). ✓
 - Surface-axis Axis-1 evidence, reconciliation test, generated `architecture-index.md`, retiring hand-maintained index -> **explicitly deferred to Plan 2** (stated in header + file-structure note); not a gap. ✓
 - Phase 2 fine override adjudication -> explicitly out of scope (no bounded end state). ✓
 
 **2. Placeholder scan:** No "TBD"/"TODO"/"similar to". The one inspect-and-mirror step (build.rs module declaration, Task 6 Step 5) is a concrete action with a `cargo build` verification, not a placeholder — the literal `#[path]`/`mod` mechanism is the existing file's and must be read at execution time; the plan states exactly what to add and how to verify it. Every code step contains complete compiling code.
 
-**3. Type consistency:** `Verdict { provenance, verification }`, `Provenance::{ToolchainDerived,AietoolsModeled,DocSpecified,Unspecified}`, `Verification::{NotApplicable,Verified{evidence},Unverified,Accepted{rationale}}`, `NodeId::{Semantic,Register,Capability}`, `Category` (9 variants), `category(&SemanticOp)`, `default_verdict(Category)`, `BehavioralUnit { id,arch,claims,verdict,shadows_derived }`, `Claims::Nodes`, `CapabilityDomain { id,arches }`, `CoverageModel { arch, overrides }` with `build/semantic_verdict/perishable_queue/comprehension_gaps/clean_release/applicable_capabilities`, `enforce_coverage(arch,&[CapabilityDomain],&[BehavioralUnit])`, `enforce_coverage_phase1(arch)` — names and signatures are used identically across Tasks 1-8. `SemanticOp` gains `Serialize/Deserialize` in Task 2 before `NodeId` (which needs it) is serialized; ordering correct. No drift found.
+**3. Type consistency:** `Verdict { provenance, verification }`, `Provenance::{ToolchainDerived,AietoolsModeled,DocSpecified,Unspecified}`, `Verification::{NotApplicable,Verified{evidence},Unverified,Accepted{rationale}}`, `CoverageNode::{Semantic,Register,Capability}`, `Category` (9 variants), `category(&SemanticOp)`, `default_verdict(Category)`, `BehavioralUnit { id,arch,claims,verdict,shadows_derived }`, `Claims::Nodes`, `CapabilityDomain { id,arches }`, `CoverageModel { arch, overrides }` with `build/semantic_verdict/perishable_queue/comprehension_gaps/clean_release/applicable_capabilities`, `enforce_coverage(arch,&[CapabilityDomain],&[BehavioralUnit])`, `enforce_coverage_phase1(arch)` — names and signatures are used identically across Tasks 1-8. `SemanticOp` gains `Serialize/Deserialize` in Task 2 before `CoverageNode` (which needs it) is serialized; ordering correct. No drift found.
