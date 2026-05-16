@@ -431,14 +431,19 @@ pub enum Category {
 
 /// SemanticOp -> Category. EXHAUSTIVE WITH NO `_` ARM ON PURPOSE: this is the
 /// forcing function (spec Section 1/3). A new variant breaks this build until
-/// categorized. Grouping mirrors the enum's own comment sections in
-/// `aie2/isa/types.rs:237-376`.
+/// categorized. Only the Vector/Sync/SideEffect arms mirror the enum's own
+/// comment sections; the Arithmetic arm deliberately coalesces several
+/// sections into one pessimistic-default bucket (see its comment).
 pub fn category(op: &SemanticOp) -> Category {
     match op {
-        // Arithmetic (+ scalar compute that is fully toolchain-specified:
-        // div-step, select, bit-manip, extension, copy/nop, pointer, cntr,
-        // event — all ToolchainDerived, grouped here to keep the named
-        // category set the spec enumerates).
+        // Arithmetic + ALL fully-toolchain-specified scalar machinery
+        // (div-step, bit-manip, extension, copy/nop, pointer, cntr, event):
+        // deliberately coalesced into one pessimistic-default bucket. This
+        // arm spans several enum comment sections on purpose -- it does NOT
+        // mirror them (only Vector/Sync/SideEffect arms do). Event emits a
+        // trace packet and ReadCycleCounter reads a counter via
+        // toolchain-specified instructions, so ToolchainDerived is correct
+        // here; trace-buffering is a Phase-2 override candidate.
         SemanticOp::Add
         | SemanticOp::Sub
         | SemanticOp::Adc
@@ -451,7 +456,6 @@ pub fn category(op: &SemanticOp) -> Category {
         | SemanticOp::Abs
         | SemanticOp::Neg
         | SemanticOp::DivStep
-        | SemanticOp::Select
         | SemanticOp::Ctlz
         | SemanticOp::Cttz
         | SemanticOp::Ctpop
@@ -496,11 +500,14 @@ pub fn category(op: &SemanticOp) -> Category {
         // Memory
         SemanticOp::Load | SemanticOp::Store => Category::Memory,
 
-        // Control flow (Done/Halt are well-understood core termination)
+        // Control flow. Select is the conditional-select/ternary (the enum
+        // files it here); Done/Halt are well-understood toolchain-specified
+        // core termination. All ToolchainDerived.
         SemanticOp::Br
         | SemanticOp::BrCond
         | SemanticOp::Call
         | SemanticOp::Ret
+        | SemanticOp::Select
         | SemanticOp::Done
         | SemanticOp::Halt => Category::ControlFlow,
 
