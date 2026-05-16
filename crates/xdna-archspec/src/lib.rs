@@ -14,6 +14,7 @@
 //! can `#[path]`-include it without pulling in `runtime`'s `Arc`/`LazyLock`.
 
 pub mod aie2;
+pub mod coverage;
 pub mod device_model;
 pub mod dma;
 pub mod elf;
