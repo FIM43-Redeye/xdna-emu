@@ -1,0 +1,127 @@
+//! Build-time Axis-2 enforcement (spec Section 2/4). Panics like
+//! Confirmed<T>::confirm: an incomplete coverage model stops the build.
+
+use crate::coverage::units::{BehavioralUnit, CapabilityDomain, Claims};
+use crate::coverage::verdict::Verification;
+use crate::coverage::CoverageNode;
+use crate::types::Architecture;
+use std::collections::HashSet;
+
+/// Build-time Axis-2 enforcement for one arch (spec Section 2/4). Panics on:
+/// a capability applicable to `arch` with no claiming unit; two units claiming
+/// one node; a `Verified` verdict carrying a cross-arch `shadows_derived`
+/// marker (verification never transfers across silicon, spec Section 7).
+///
+/// The SemanticOp axis needs no check here -- `category()` is compiler-enforced
+/// (Task 3). Register-node partition is checked once the register override
+/// registry is non-empty (Phase 2); in Phase 1 it is trivially satisfied
+/// because every register rolls up to its subsystem's coarse default.
+pub fn enforce_coverage(arch: Architecture, spine: &[CapabilityDomain], units: &[BehavioralUnit]) {
+    // 1. Cross-arch transfer rule: verification never transfers (spec S7).
+    for u in units {
+        if matches!(u.verdict.verification, Verification::Verified { .. }) {
+            if let Some(reason) = &u.shadows_derived {
+                if reason.contains("derived_shared_from") {
+                    panic!(
+                        "COVERAGE: unit '{}' ({arch}) is Verified but carries a cross-arch \
+                         shared marker ({reason}) -- verification never transfers across \
+                         silicon (spec Section 7)",
+                        u.id
+                    );
+                }
+            }
+        }
+    }
+
+    // 2. Partition: no node double-claimed by two units (spec Section 3).
+    // CoverageNode derives Hash, so a HashSet is the natural structure.
+    let mut seen: HashSet<&CoverageNode> = HashSet::new();
+    for u in units {
+        let Claims::Nodes(ns) = &u.claims;
+        for n in ns {
+            if !seen.insert(n) {
+                panic!(
+                    "COVERAGE: node {:?} double-claimed (unit '{}', {arch}) -- the registry \
+                     must partition, not merely cover (spec Section 3)",
+                    n, u.id
+                );
+            }
+        }
+    }
+
+    // 3. Capability spine: every applicable domain claimed by >= 1 unit (S6).
+    for dom in spine {
+        if !dom.applies_to(arch) {
+            continue;
+        }
+        let claimed = units.iter().any(|u| {
+            let Claims::Nodes(ns) = &u.claims;
+            ns.iter()
+                .any(|n| matches!(n, CoverageNode::Capability { domain, .. } if domain == &dom.id))
+        });
+        if !claimed {
+            panic!(
+                "COVERAGE: unclaimed capability '{}' for {arch} -- every hardware capability \
+                 the manual names must be modeled by >= 1 behavioral unit (spec Section 6)",
+                dom.id
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coverage::units::{BehavioralUnit, CapabilityDomain, Claims};
+    use crate::coverage::verdict::{Provenance, Verdict, Verification};
+    use crate::coverage::CoverageNode;
+    use crate::types::Architecture;
+
+    fn ok_unit(arch: Architecture, id: &str) -> BehavioralUnit {
+        BehavioralUnit {
+            id: id.into(),
+            arch,
+            claims: Claims::Nodes(vec![CoverageNode::Capability { arch, domain: id.into() }]),
+            verdict: Verdict {
+                provenance: Provenance::ToolchainDerived,
+                verification: Verification::NotApplicable,
+            },
+            shadows_derived: None,
+        }
+    }
+
+    #[test]
+    fn passes_when_every_capability_is_claimed() {
+        let arch = Architecture::Aie2;
+        let spine = vec![CapabilityDomain { id: "dma".into(), arches: vec![arch] }];
+        let units = vec![ok_unit(arch, "dma")];
+        enforce_coverage(arch, &spine, &units); // must not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "unclaimed capability")]
+    fn panics_on_unclaimed_capability() {
+        let arch = Architecture::Aie2;
+        let spine = vec![CapabilityDomain { id: "locks".into(), arches: vec![arch] }];
+        enforce_coverage(arch, &spine, &[]); // nothing claims "locks"
+    }
+
+    #[test]
+    #[should_panic(expected = "cross-arch")]
+    fn panics_on_verified_with_cross_arch_shadow() {
+        let arch = Architecture::Aie2;
+        let spine = vec![CapabilityDomain { id: "dma".into(), arches: vec![arch] }];
+        let mut u = ok_unit(arch, "dma");
+        u.verdict.verification = Verification::Verified { evidence: "npu4".into() };
+        u.shadows_derived = Some("derived_shared_from:Aie2p".into());
+        enforce_coverage(arch, &spine, &[u]);
+    }
+
+    #[test]
+    #[should_panic(expected = "double-claimed")]
+    fn panics_on_two_units_claiming_one_node() {
+        let arch = Architecture::Aie2;
+        let spine = vec![CapabilityDomain { id: "dma".into(), arches: vec![arch] }];
+        enforce_coverage(arch, &spine, &[ok_unit(arch, "dma"), ok_unit(arch, "dma")]);
+    }
+}
