@@ -1,6 +1,7 @@
 //! Two-axis coverage provenance infrastructure. Spec:
 //! docs/superpowers/specs/2026-05-15-two-axis-coverage-provenance-design.md
 
+pub mod derive;
 pub mod surface;
 pub mod verdict;
 
