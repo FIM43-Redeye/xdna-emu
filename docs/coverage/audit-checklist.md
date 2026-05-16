@@ -1,7 +1,7 @@
 # Subsystem audit checklist
 
 The questions to ask when auditing a subsystem listed in
-[architecture-index.md](architecture-index.md). Apply when adding a row,
+[aie2/architecture-index.md](aie2/architecture-index.md). Apply when adding a row,
 and re-apply when the subsystem's coverage state changes.
 
 The point of this document is to make the failure modes that have
@@ -75,7 +75,7 @@ this 2026-05-04 bug class.
 
 ## How to use this checklist
 
-When you set a row in `architecture-index.md` to **MODELED** —
+When you set a row in `aie2/architecture-index.md` to **MODELED** —
 either after writing a new subsystem or after closing a gap —
 walk through this list. Note any item you skipped (and why) in
 the row's notes column.

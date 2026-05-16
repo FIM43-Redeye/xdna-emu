@@ -153,7 +153,8 @@ no regressions.
 1. Memtile-only and shim-only tile types reuse `mem_timer` and
    `core_timer` respectively. The fix works because the right field
    is touched on each tile type, but the naming is misleading.
-   Cosmetic; tracked as an architecture-index verification.
+   Cosmetic; tracked as an aie2/architecture-index coverage matrix
+   verification.
 2. Broadcast-propagation latency model. We currently reset all
    tiles' timers in the same emulator cycle if they all see the
    broadcast event simultaneously. Real HW has ~1 cycle per hop
