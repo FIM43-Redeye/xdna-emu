@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-05-15-two-axis-coverage-provenance-design.md`
 
-**Out of scope (Plan 2):** concrete `impl SurfaceProbe`, the reconciliation integration test, generated `architecture-index.md`, retiring the hand-maintained index. **Out of scope (Phase 2, no plan):** adjudicating the ~80-150 fine override units — that is standing process work the infra enables, with no bounded end state.
+**Out of scope (Plan 2):** concrete `impl SurfaceProbe`, the reconciliation integration test, generated `architecture-index.md`, retiring the hand-maintained index, the build.rs panic delivery (deferred -- see Task 6), and `Provenance::HardwareObserved` + its empirical-intake minting (spec Section 6 "Phasing"). **Out of scope (Phase 2, no plan):** adjudicating the ~80-150 fine override units — that is standing process work the infra enables, with no bounded end state.
 
 ---
 
@@ -585,6 +585,10 @@ pub fn default_verdict(cat: Category) -> Verdict {
             Verdict { provenance: Provenance::AietoolsModeled, verification: Verification::Unverified }
         }
         Category::SideEffect => {
+            // Spec Section 5 names this tier "timing"; there are no
+            // timing-only SemanticOps (timing constants live at the
+            // register/spine level, e.g. the `timer` capability domain).
+            // DMA/stream/cascade side effects share that pessimistic tier.
             Verdict { provenance: Provenance::DocSpecified, verification: Verification::Unverified }
         }
         Category::NeedsTriage => {
@@ -827,6 +831,20 @@ mod tests {
         // the field itself).
         let m = CoverageModel::build(Architecture::Aie2);
         assert_eq!(m.arch, Architecture::Aie2);
+    }
+
+    #[test]
+    fn clean_release_aie2() {
+        // THE per-silicon release gate (spec Section 4/7). Discoverable via
+        // `cargo test -p xdna-archspec --lib clean_release`. Green for AIE2 ==
+        // "safe to retire NPU1". At bootstrap it is correctly NOT green
+        // (vector perishable, Intrinsic a comprehension gap) -- assert the
+        // honest negative; Phase 2 closes these and flips this assertion.
+        let m = CoverageModel::build(Architecture::Aie2);
+        assert!(
+            !m.clean_release(),
+            "bootstrap must not be green -- that is the honest state (spec S5)"
+        );
     }
 
     #[test]
@@ -1216,8 +1234,14 @@ EOF
 > enforcement entry (operating on plain domain-id data, no
 > `CoverageNode`/`SemanticOp` in its build-callable signature) or by
 > structuring the coverage build-check to not pull `aie2::isa`. The
-> `phase1_entry_point_is_green` test + the `should_panic` suite are the
-> interim Plan-1 gate.
+> `phase1_entry_point_is_green` test + the `should_panic` suite + the
+> `clean_release_<arch>` gate test are the interim Plan-1 gate.
+>
+> **Plan 2 MUST also include:** add `Provenance::HardwareObserved` (with
+> `is_perishable`/`is_comprehension_gap` both false) together with the
+> trace-sweep / fuzzer empirical-intake minting that gives it meaning. Plan 1
+> deliberately shipped only the 4 producer/consumer-backed variants; the
+> fifth lands with its intake path (spec Section 6 "Phasing (honest scope)").
 
 ---
 

@@ -276,11 +276,14 @@ recorded rather than papered over -- claiming a build-stop guarantee that
 Phase 1 cannot actually deliver would be the exact false-confidence failure
 this design exists to prevent.
 
-The gate is a single command, parameterized by architecture:
-`cargo test coverage::clean_release` runs it per arch (Section 7). For a
-given arch it asserts that **both** that arch's perishable queue and its
-comprehension-gap set are empty, modulo `Accepted { rationale }`. Green for
-AIE2 is the literal, checkable definition of "we can let NPU1 go" --
+The gate is a single command. In Plan 1 (build.rs delivery deferred -- see
+the Phasing note) the interim gate is the test suite:
+`cargo test -p xdna-archspec --lib clean_release` runs the per-arch
+`clean_release_<arch>` gate test(s) plus the `should_panic` enforcement
+suite; Plan 2 adds the build-time panic and the reconciliation test. For a
+given arch the gate asserts that **both** that arch's perishable queue and
+its comprehension-gap set are empty, modulo `Accepted { rationale }`. Green
+for AIE2 is the literal, checkable definition of "we can let NPU1 go" --
 independent of any other arch's state: every AIE2 behavioral unit is
 toolchain-ground-truth, or `Verified { evidence }`, or
 `Accepted { rationale }`; and nothing a trusted source describes for AIE2 is
@@ -394,6 +397,17 @@ hardware surprise rather than derived top-down -- so the model can *receive*
 empirical discoveries instead of structurally denying they can exist. It does
 not find them. That is itself an argument for keeping NPU1 until the
 empirical channels have had their run, regardless of the static gate.
+
+**Phasing (honest scope).** `Provenance::HardwareObserved` is introduced
+**together with the empirical intake path in Plan 2**, not in Plan 1. Plan 1
+ships exactly four `Provenance` variants (`ToolchainDerived`,
+`AietoolsModeled`, `DocSpecified`, `Unspecified`); a fifth variant with no
+producer and no consumer would be speculative scaffolding, which this
+design's own no-premature-complexity ethos discourages. The variant and its
+predicate semantics (`is_perishable` / `is_comprehension_gap` both false --
+a silicon-observed fact is neither modeled-weakly nor a comprehension gap)
+land in Plan 2 alongside the trace-sweep / fuzzer minting that gives it
+meaning.
 
 ## Section 7 -- Architecture parameterization
 
