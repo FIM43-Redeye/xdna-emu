@@ -45,3 +45,227 @@ impl CoverageNode {
         }
     }
 }
+
+use crate::coverage::derive::{category, default_verdict};
+use crate::coverage::units::{capability_spine, override_registry, BehavioralUnit};
+use crate::coverage::verdict::Verdict;
+
+/// Per-arch coverage model (spec Section 7: a per-ArchModel facet, keyed by
+/// arch, built from the arch's node universe). Built-from / keyed-by satisfies
+/// the spec intent without forcing a non-serializable field into ArchModel.
+#[derive(Debug, Clone)]
+pub struct CoverageModel {
+    pub arch: Architecture,
+    overrides: Vec<BehavioralUnit>,
+}
+
+impl CoverageModel {
+    /// Build the coverage model for one architecture. Phase 1: overrides are
+    /// empty, so verdicts come from coarse category/subsystem defaults.
+    pub fn build(arch: Architecture) -> Self {
+        Self { arch, overrides: override_registry(arch) }
+    }
+
+    /// Verdict for a SemanticOp node: override if one claims it, else the
+    /// pessimistic category default (spec Section 3/5).
+    pub fn semantic_verdict(&self, op: &SemanticOp) -> Verdict {
+        let node = CoverageNode::Semantic { arch: self.arch, op: op.clone() };
+        if let Some(u) = self.claiming_unit(&node) {
+            return u.verdict.clone();
+        }
+        default_verdict(category(op))
+    }
+
+    fn claiming_unit(&self, node: &CoverageNode) -> Option<&BehavioralUnit> {
+        self.overrides.iter().find(|u| match &u.claims {
+            crate::coverage::units::Claims::Nodes(ns) => ns.contains(node),
+        })
+    }
+
+    /// All SemanticOp verdicts (the Plan 1 node universe for the gate). Plan 2
+    /// adds register/surface joining via the reconciliation test.
+    fn all_semantic_verdicts(&self) -> Vec<Verdict> {
+        all_semantic_ops().iter().map(|op| self.semantic_verdict(op)).collect()
+    }
+
+    /// Perishable queue (spec Section 1): modeled, unverified.
+    pub fn perishable_queue(&self) -> Vec<Verdict> {
+        self.all_semantic_verdicts().into_iter().filter(|v| v.is_perishable()).collect()
+    }
+
+    /// Comprehension gaps (spec Section 1): a source describes it, no model.
+    pub fn comprehension_gaps(&self) -> Vec<Verdict> {
+        self.all_semantic_verdicts()
+            .into_iter()
+            .filter(|v| v.is_comprehension_gap())
+            .collect()
+    }
+
+    /// Per-silicon release gate (spec Section 4/7): both sets empty modulo
+    /// Accepted. Green for AIE2 == "safe to retire NPU1".
+    pub fn clean_release(&self) -> bool {
+        self.perishable_queue().is_empty() && self.comprehension_gaps().is_empty()
+    }
+
+    /// The capability spine for this arch (spec Section 6).
+    pub fn applicable_capabilities(&self) -> Vec<String> {
+        capability_spine()
+            .into_iter()
+            .filter(|d| d.applies_to(self.arch))
+            .map(|d| d.id)
+            .collect()
+    }
+}
+
+/// The static SemanticOp universe. One representative of every enum variant;
+/// `Intrinsic` is represented by `Intrinsic(0)` (the table-lookup family).
+/// This list is itself guarded: `category()` is exhaustive (Task 3), so a new
+/// variant breaks that build before this list can go stale silently.
+fn all_semantic_ops() -> Vec<SemanticOp> {
+    use SemanticOp::*;
+    vec![
+        Add,
+        Sub,
+        Adc,
+        Sbc,
+        Mul,
+        SDiv,
+        UDiv,
+        SRem,
+        URem,
+        Abs,
+        Neg,
+        DivStep,
+        Select,
+        Ctlz,
+        Cttz,
+        Ctpop,
+        Bswap,
+        Clb,
+        SignExtend,
+        ZeroExtend,
+        Truncate,
+        Copy,
+        Nop,
+        Event,
+        ReadCycleCounter,
+        PointerAdd,
+        PointerMov,
+        And,
+        Or,
+        Xor,
+        Not,
+        Shl,
+        Sra,
+        Srl,
+        AshlBidir,
+        LshlBidir,
+        Rotl,
+        Rotr,
+        SetEq,
+        SetNe,
+        SetLt,
+        SetLe,
+        SetGt,
+        SetGe,
+        SetUlt,
+        SetUle,
+        SetUgt,
+        SetUge,
+        Cmp,
+        Load,
+        Store,
+        Br,
+        BrCond,
+        Call,
+        Ret,
+        Done,
+        Halt,
+        Mac,
+        MatMul,
+        MatMulSub,
+        NegMatMul,
+        AddMac,
+        SubMac,
+        NegMul,
+        Srs,
+        Ups,
+        Shuffle,
+        Pack,
+        Unpack,
+        Align,
+        VectorBroadcast,
+        VectorExtract,
+        VectorInsert,
+        VectorPush,
+        VectorPushHi,
+        VectorSelect,
+        VectorClear,
+        Convert,
+        Min,
+        Max,
+        SubLt,
+        SubGe,
+        MaxDiffLt,
+        MaxLt,
+        MinGe,
+        AbsGtz,
+        NegGtz,
+        NegLtz,
+        NegAdd,
+        Accumulate,
+        AccumSub,
+        AccumNegAdd,
+        AccumNegSub,
+        LockAcquire,
+        LockRelease,
+        CascadeRead,
+        CascadeWrite,
+        StreamRead,
+        StreamWrite,
+        StreamWritePacketHeader,
+        DmaStart,
+        DmaWait,
+        Intrinsic(0),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aie2::isa::SemanticOp;
+    use crate::coverage::verdict::{Provenance, Verification};
+
+    #[test]
+    fn semantic_rollup_uses_pessimistic_category_defaults() {
+        let m = CoverageModel::build(Architecture::Aie2);
+        // Vector ops roll up to AietoolsModeled/Unverified -> perishable.
+        let vmac = m.semantic_verdict(&SemanticOp::Mac);
+        assert_eq!(vmac.provenance, Provenance::AietoolsModeled);
+        assert!(vmac.is_perishable());
+        // Scalar add is toolchain ground truth -> in neither set.
+        let add = m.semantic_verdict(&SemanticOp::Add);
+        assert_eq!(add.verification, Verification::NotApplicable);
+        assert!(!add.is_perishable() && !add.is_comprehension_gap());
+        // Intrinsic -> comprehension gap (default-to-ignorant).
+        assert!(m.semantic_verdict(&SemanticOp::Intrinsic(0)).is_comprehension_gap());
+    }
+
+    #[test]
+    fn clean_release_is_false_at_bootstrap_and_honest() {
+        let m = CoverageModel::build(Architecture::Aie2);
+        // Honest from day one but coarse: vector + intrinsic populate the
+        // sets, so the gate is correctly NOT green at bootstrap (spec S5).
+        assert!(!m.perishable_queue().is_empty(), "vector ops must be perishable at bootstrap");
+        assert!(!m.comprehension_gaps().is_empty(), "Intrinsic must be a comprehension gap at bootstrap");
+        assert!(!m.clean_release(), "bootstrap must not be green -- that is the honest state (spec S5)");
+    }
+
+    #[test]
+    fn clean_release_is_per_arch() {
+        // Spec Section 7: the gate is per-silicon. A different arch is a
+        // different model; AIE2's state says nothing about it.
+        let m = CoverageModel::build(Architecture::Aie2);
+        assert_eq!(m.arch, Architecture::Aie2);
+    }
+}
