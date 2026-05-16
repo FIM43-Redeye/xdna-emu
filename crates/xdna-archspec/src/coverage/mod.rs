@@ -3,6 +3,7 @@
 
 pub mod derive;
 pub mod surface;
+pub mod units;
 pub mod verdict;
 
 use crate::aie2::isa::SemanticOp;
