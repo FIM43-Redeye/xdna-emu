@@ -131,6 +131,11 @@ mod reconciliation {
     fn universe_matches_archspec_tripwire_count() {
         // Same 103 the archspec-side tripwire pins; drift here means the two
         // hand-maintained peer lists fell out of sync -- fix both together.
+        // Note: this catches length drift, not content drift; content drift
+        // (same count, different representative) is caught by compile errors
+        // when archspec renames a SemanticOp variant (exhaustive matches
+        // break). Symmetric with archspec's own all_semantic_ops tripwire
+        // caveat -- neither claims to be a completeness proof.
         assert_eq!(semantic_universe().len(), 103);
     }
 
