@@ -50,6 +50,7 @@ pub mod core;
 pub mod engine;
 pub mod timing;
 pub mod test_runner;
+pub mod coverage;
 
 // Re-export key types for convenience
 pub use traits::{Decoder, Executor, StateAccess, ExecuteResult, DecodeError};
