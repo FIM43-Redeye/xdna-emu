@@ -10,6 +10,19 @@ Living technical reference material:
   Axis-2 coverage matrix: every SemanticOp category rolled up to its
   provenance/verification verdict. Do not hand-edit; regenerate with
   `cargo run -p xdna-archspec --example gen_coverage_artifacts`.
+- [coverage/aie2/subsystem-index.md](coverage/aie2/subsystem-index.md) -- Generated
+  per-subsystem coverage index: each capability-spine domain with its
+  authoritative source, our implementation location, own verdict,
+  rolled-up category verdict, and known-gaps narrative -- the
+  regenerated form of the retired hand-maintained architecture index.
+  Do not hand-edit; regenerate with
+  `cargo run -p xdna-archspec --example gen_coverage_artifacts`.
+- [coverage/aie2/implementation-gaps.md](coverage/aie2/implementation-gaps.md) -- Generated
+  queue of subsystems only partially built or stubbed
+  (`Modeled{Partial|Stub}`), the third honesty queue alongside
+  perishable-queue.md / comprehension-gaps.md. Do not hand-edit;
+  regenerate with
+  `cargo run -p xdna-archspec --example gen_coverage_artifacts`.
 - [aiesimulator.md](aiesimulator.md) -- AMD aiesimulator integration and usage
 - [dma-reference.md](dma-reference.md) -- DMA engine reference (BD fields,
   sequences, polling semantics)

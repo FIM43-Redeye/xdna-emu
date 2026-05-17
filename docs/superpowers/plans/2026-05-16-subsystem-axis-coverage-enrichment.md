@@ -410,7 +410,7 @@ Use its per-row Source / Coverage / "Our location" / Notes cells as the seed mat
 
 - [ ] **Step 2: Replace the skeleton map with explicit per-domain seeds (16 originals)**
 
-> **Plan correction (applied during execution, commit `a4efe52`):** the
+> **Plan correction (applied during execution, final Task-3 commit `4fac854`):** the
 > code block below originally listed only 15 `d(...)` entries — `debug_halt`
 > was omitted in error. The implementer correctly added it, folded from the
 > retired index's "Core debug (halt/step/breakpoint)" row per the spec
