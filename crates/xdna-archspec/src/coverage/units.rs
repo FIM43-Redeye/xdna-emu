@@ -2,7 +2,7 @@
 //! single hand-curated CapabilityDomain spine (spec Section 6). Seeded coarse;
 //! Phase 2 refines. Co-located on purpose (one location, spec Section 6).
 
-use crate::coverage::verdict::Verdict;
+use crate::coverage::verdict::{Completeness, Verdict, Verification};
 use crate::coverage::CoverageNode;
 use crate::types::Architecture;
 
@@ -33,13 +33,27 @@ pub struct BehavioralUnit {
     pub shared_from: Option<Architecture>,
 }
 
-/// A top-level hardware capability the manual names (spec Section 6).
-/// Each must be claimed by >= 1 behavioral unit per applicable arch, or the
-/// build panics (enforced in Task 6).
+/// A top-level hardware capability the manual names (spec Section 6), now
+/// carrying the retired index's per-subsystem detail as seeded data (spec
+/// Section 2). Each must be claimed by >= 1 behavioral unit per applicable
+/// arch, or the build panics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityDomain {
     pub id: String,
     pub arches: Vec<Architecture>,
+    /// Authoritative source (aie-rt path / AM025 / device model). Non-empty,
+    /// enforced.
+    pub source_ref: String,
+    /// Our emulator src/ path(s). Non-empty unless an OOS/MISSING narrative is
+    /// present (enforced).
+    pub src_locations: Vec<String>,
+    /// Human-readable notes and known gaps for this domain.
+    pub narrative: String,
+    /// The domain's own asserted coverage verdict (spec Section 1/2).
+    pub verdict: Verdict,
+    /// Documents a deliberate own-vs-rollup divergence (spec Section 3); a
+    /// silent material drift is a hard failure, an annotated one is allowed.
+    pub drift_rationale: Option<String>,
 }
 
 impl CapabilityDomain {
@@ -64,15 +78,41 @@ pub fn override_registry(_arch: Architecture) -> Vec<BehavioralUnit> {
 ///   - `events_trace` covers `SubsystemKind::Trace` AND `::Event`
 ///   - `locks` covers `SubsystemKind::Lock` AND `::LockRequest`
 ///   - `debug_halt` covers `SubsystemKind::Debug`
+///   - `control_packets` covers on-chip control-packet reassembly, packet
+///     handler status, and the NPU host instruction stream (spec Appendix)
+///   - `clock_control` covers module/column/tile clock + reset control
+///   - `tile_isolation` covers Tile_Control isolation bits / N-S-E-W gates
+///   - `binary_load` covers CDO/ELF/XCLBIN ingest, SS-routing reconstruction,
+///     and array-topology construction (spec Appendix N1 resolutions)
 /// `SubsystemKind::Unknown` is a classifier placeholder, NOT a hardware
 /// capability -- intentionally excluded. Coarse, arch-invariant; AIE2 is the
 /// only wired arch today (Plan 1). Phase 1 auto-claims every domain via the
 /// derived shim (Task 6); the SubsystemKind<->spine partition is Phase 2.
 pub fn capability_spine() -> Vec<CapabilityDomain> {
     let aie2 = vec![Architecture::Aie2];
+    // Task-2 skeleton seed: every domain is honestly Partial pending its
+    // curated seed (Tasks 3/4). source_ref/src_locations are non-empty so the
+    // enforce loop passes; the Partial{missing} verdict is true (the catalogue
+    // entry is genuinely incomplete) and self-corrects out of the
+    // implementation-gaps queue as Tasks 3/4 replace it. An accurate coarse
+    // bootstrap (the same honest-coarse pattern as Phase-1 category defaults).
+    let pending = |missing: &str| Verdict {
+        provenance: crate::coverage::verdict::Provenance::ToolchainDerived,
+        verification: Verification::Modeled {
+            completeness: Completeness::Partial { missing: missing.to_string() },
+        },
+    };
     crate::coverage::spine_ids::SPINE_DOMAIN_IDS
         .iter()
-        .map(|id| CapabilityDomain { id: (*id).to_string(), arches: aie2.clone() })
+        .map(|id| CapabilityDomain {
+            id: (*id).to_string(),
+            arches: aie2.clone(),
+            source_ref: "pending (plan Task 3/4)".to_string(),
+            src_locations: vec!["src/pending (plan Task 3/4)".to_string()],
+            narrative: format!("{id}: curated seed pending (plan Task 3/4)"),
+            verdict: pending("curated domain seed pending (plan Task 3/4)"),
+            drift_rationale: None,
+        })
         .collect()
 }
 
@@ -96,6 +136,14 @@ mod tests {
         assert!(spine.iter().any(|d| d.id == "stream_switch"));
         // Every seeded domain applies to AIE2 (the only wired arch today).
         assert!(spine.iter().all(|d| d.applies_to(Architecture::Aie2)));
+        // Spine extended to 20 (spec Section 2 hybrid decision).
+        assert_eq!(spine.len(), 20);
+        for id in ["control_packets", "clock_control", "tile_isolation", "binary_load"] {
+            assert!(spine.iter().any(|d| d.id == id), "missing new domain {id}");
+        }
+        // Every domain carries non-empty source_ref + src_locations.
+        assert!(spine.iter().all(|d| !d.source_ref.is_empty()));
+        assert!(spine.iter().all(|d| !d.src_locations.is_empty()));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! Confirmed<T>::confirm: an incomplete coverage model stops the build.
 
 use crate::coverage::units::{capability_spine, BehavioralUnit, CapabilityDomain, Claims};
-use crate::coverage::verdict::Verification;
+use crate::coverage::verdict::{Completeness, Provenance, Verification};
 use crate::coverage::CoverageNode;
 use crate::types::Architecture;
 use std::collections::HashMap;
@@ -66,6 +66,52 @@ pub fn enforce_coverage(arch: Architecture, spine: &[CapabilityDomain], units: &
             );
         }
     }
+
+    // 4. Per-domain seed validity (spec Section 2 N2). The spine argument now
+    //    carries fully-seeded domains (capability_spine()); validate them.
+    for dom in spine {
+        if !dom.applies_to(arch) {
+            continue;
+        }
+        // Per spec Section 1, MISSING is not its own Verification state -- a
+        // genuinely-unbuilt subsystem is encoded as Modeled{Stub} (or
+        // Modeled{Partial}) with a MISSING narrative and empty src_locations
+        // (e.g. the `noc` / `clock_control` seeds). So Stub/Partial DO exempt
+        // the src_locations requirement here; the narrative + the
+        // implementation-gaps queue are the real tracking, not this gate.
+        let oos_or_missing = match &dom.verdict.verification {
+            Verification::Accepted { .. } => true,
+            Verification::Modeled { completeness } => {
+                matches!(completeness, Completeness::Stub | Completeness::Partial { .. })
+            }
+            Verification::NotApplicable | Verification::Verified { .. } | Verification::Unverified => false,
+        };
+        if dom.source_ref.trim().is_empty() {
+            panic!(
+                "COVERAGE: domain '{}' ({arch}) has empty source_ref -- every \
+                 subsystem must name its authoritative source (spec Section 2)",
+                dom.id
+            );
+        }
+        if dom.src_locations.iter().all(|s| s.trim().is_empty()) && !oos_or_missing {
+            panic!(
+                "COVERAGE: domain '{}' ({arch}) has no src_locations and is not \
+                 an explicit OOS/MISSING state -- name where it is implemented \
+                 or mark it OOS/MISSING with a narrative (spec Section 2)",
+                dom.id
+            );
+        }
+        if matches!(dom.verdict.provenance, Provenance::Unspecified)
+            && matches!(dom.verdict.verification, Verification::Modeled { .. })
+        {
+            panic!(
+                "COVERAGE: domain '{}' ({arch}) is Unspecified + Modeled -- \
+                 asserting no-model and a-model are contradictory (spec \
+                 Section 1 invariant)",
+                dom.id
+            );
+        }
+    }
 }
 
 /// Phase-1 entry point called from build.rs. Every spine domain is claimed by
@@ -94,7 +140,7 @@ pub fn enforce_coverage_phase1(arch: Architecture) {
 mod tests {
     use super::*;
     use crate::coverage::units::{BehavioralUnit, CapabilityDomain, Claims};
-    use crate::coverage::verdict::{Provenance, Verdict, Verification};
+    use crate::coverage::verdict::{Completeness, Provenance, Verdict, Verification};
     use crate::coverage::CoverageNode;
     use crate::types::Architecture;
 
@@ -112,10 +158,32 @@ mod tests {
         }
     }
 
+    fn dom(id: &str, v: Verdict) -> CapabilityDomain {
+        CapabilityDomain {
+            id: id.into(),
+            arches: vec![Architecture::Aie2],
+            source_ref: "aie-rt".into(),
+            src_locations: vec!["src/x".into()],
+            narrative: "n".into(),
+            verdict: v,
+            drift_rationale: None,
+        }
+    }
+
+    fn default_dom(id: &str) -> CapabilityDomain {
+        dom(
+            id,
+            Verdict {
+                provenance: Provenance::ToolchainDerived,
+                verification: Verification::NotApplicable,
+            },
+        )
+    }
+
     #[test]
     fn passes_when_every_capability_is_claimed() {
         let arch = Architecture::Aie2;
-        let spine = vec![CapabilityDomain { id: "dma".into(), arches: vec![arch] }];
+        let spine = vec![default_dom("dma")];
         let units = vec![ok_unit(arch, "dma")];
         enforce_coverage(arch, &spine, &units); // must not panic
     }
@@ -124,7 +192,7 @@ mod tests {
     #[should_panic(expected = "unclaimed capability")]
     fn panics_on_unclaimed_capability() {
         let arch = Architecture::Aie2;
-        let spine = vec![CapabilityDomain { id: "locks".into(), arches: vec![arch] }];
+        let spine = vec![default_dom("locks")];
         enforce_coverage(arch, &spine, &[]); // nothing claims "locks"
     }
 
@@ -132,7 +200,7 @@ mod tests {
     #[should_panic(expected = "never transfers across silicon")]
     fn panics_on_verified_with_cross_arch_shadow() {
         let arch = Architecture::Aie2;
-        let spine = vec![CapabilityDomain { id: "dma".into(), arches: vec![arch] }];
+        let spine = vec![default_dom("dma")];
         let mut u = ok_unit(arch, "dma");
         u.verdict.verification = Verification::Verified { evidence: "npu4".into() };
         u.shared_from = Some(Architecture::Aie2p); // typed marker, not prose
@@ -143,7 +211,7 @@ mod tests {
     #[should_panic(expected = "double-claimed")]
     fn panics_on_two_units_claiming_one_node() {
         let arch = Architecture::Aie2;
-        let spine = vec![CapabilityDomain { id: "dma".into(), arches: vec![arch] }];
+        let spine = vec![default_dom("dma")];
         enforce_coverage(arch, &spine, &[ok_unit(arch, "dma"), ok_unit(arch, "dma")]);
     }
 
@@ -151,5 +219,45 @@ mod tests {
     fn phase1_entry_point_is_green() {
         // Coarse derived claims satisfy the spine without override entries.
         enforce_coverage_phase1(Architecture::Aie2); // must not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "empty source_ref")]
+    fn enforce_rejects_empty_source_ref() {
+        let mut d = dom(
+            "dma",
+            Verdict {
+                provenance: Provenance::ToolchainDerived,
+                verification: Verification::NotApplicable,
+            },
+        );
+        d.source_ref = "  ".into();
+        enforce_coverage(Architecture::Aie2, &[d], &[ok_unit(Architecture::Aie2, "dma")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unspecified + Modeled")]
+    fn enforce_rejects_unspecified_modeled_domain() {
+        let d = dom(
+            "dma",
+            Verdict {
+                provenance: Provenance::Unspecified,
+                verification: Verification::Modeled { completeness: Completeness::Stub },
+            },
+        );
+        enforce_coverage(Architecture::Aie2, &[d], &[ok_unit(Architecture::Aie2, "dma")]);
+    }
+
+    #[test]
+    fn enforce_allows_oos_missing_without_src_locations() {
+        let mut d = dom(
+            "ecc",
+            Verdict {
+                provenance: Provenance::DocSpecified,
+                verification: Verification::Accepted { rationale: "out of scope".into() },
+            },
+        );
+        d.src_locations = vec![];
+        enforce_coverage(Architecture::Aie2, &[d], &[ok_unit(Architecture::Aie2, "ecc")]);
     }
 }

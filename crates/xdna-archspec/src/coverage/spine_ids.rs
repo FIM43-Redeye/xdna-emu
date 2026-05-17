@@ -21,4 +21,8 @@ pub const SPINE_DOMAIN_IDS: &[&str] = &[
     "interrupt",
     "noc",
     "shim_mux",
+    "control_packets",
+    "clock_control",
+    "tile_isolation",
+    "binary_load",
 ];
