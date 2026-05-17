@@ -100,21 +100,6 @@ pub fn capability_spine() -> Vec<CapabilityDomain> {
         verdict: Verdict { provenance: ToolchainDerived, verification: v },
         drift_rationale: None,
     };
-    // Four new domains stay on the honest skeleton until Task 4.
-    let pending = |id: &str| CapabilityDomain {
-        id: id.into(),
-        arches: aie2(),
-        source_ref: "pending (plan Task 4)".into(),
-        src_locations: vec![],
-        narrative: format!("{id}: curated seed pending (plan Task 4)"),
-        verdict: Verdict {
-            provenance: ToolchainDerived,
-            verification: Modeled {
-                completeness: Partial { missing: "curated seed pending (plan Task 4)".into() },
-            },
-        },
-        drift_rationale: None,
-    };
     vec![
         // Order must match SPINE_DOMAIN_IDS exactly (spec Section 6: one location).
         d("core", "aie-rt core/, llvm-aie TableGen; AM025 Core_Control/Core_Status/Error_Halt_*",
@@ -142,7 +127,7 @@ pub fn capability_spine() -> Vec<CapabilityDomain> {
           Modeled { completeness: Full }),
         d("stream_switch", "aie-rt stream_switch/, AM025 (160/119/149 reg)",
           &["src/device/stream_switch/"],
-          "Circuit + packet, FIFOs, port events, packet-header matching. Parse-time routing reconstruction is a binary_load concern (spec Appendix N1); see binary_load for parse-time routing reconstruction.",
+          "Circuit + packet, FIFOs, port events, packet-header matching. Parse-time routing reconstruction is a binary_load concern (spec Appendix N1).",
           Modeled { completeness: Full }),
         d("events_trace", "aie-rt events/ + trace/, AM025 (128/161/51 events)",
           &["src/device/events/", "src/device/trace_unit/"],
@@ -180,11 +165,22 @@ pub fn capability_spine() -> Vec<CapabilityDomain> {
           &["src/device/stream_switch/"],
           "Shim master/slave NoC-facing mux/demux. PL Interface (Upsizer/Downsizer) is Versal-FPGA stream-width adaptation -- NPU1 exposes no programmable PL: accepted out of scope.",
           Modeled { completeness: Full }),
-        // 4 new domains: skeleton until Task 4.
-        pending("control_packets"),
-        pending("clock_control"),
-        pending("tile_isolation"),
-        pending("binary_load"),
+        d("control_packets", "AM025 Control_Packet_Handler_Status (0x3FF30/0xB0F30); XRT host protocol",
+          &["src/device/control_packets/", "src/device/tile/mod.rs", "src/npu/"],
+          "Control-packet headers, reassembly, register read/write effects, response packets MODELED. NPU host instruction stream (WRITE32/BLOCKWRITE/BLOCKSET/MASKWRITE/MASKPOLL/CONFIG_SHIMDMA_*/DDR_PATCH) MODELED. Packet handler status sticky bits + write-1-to-clear; Second_Header_Parity_Error wired, Tlast/SLVERR/ID_Parity not (no detecting path). Keystone subsystem; was absent from the retired architecture index.",
+          Modeled { completeness: Partial { missing: "Tlast/SLVERR/ID_Parity packet-handler sticky bits".into() } }),
+        d("clock_control", "AM025 Module_Clock_Control / Column_Clock_Control / Reset_Control_1 / AIE_Tile_Column_Reset",
+          &[],
+          "Module/column/tile clock-gating writes accepted but no effect on cycle counts / power model. Tile column reset (partition teardown) and multi-clock-domain semantics not simulated. Functionally inert today -- MISSING; relevant once partition lifecycle / power modeling is built.",
+          Modeled { completeness: Stub }),
+        d("tile_isolation", "aie-rt pm/xaie_tilectrl.c, AM025 (Tile_Control compute 0x36030 / memtile 0x96030)",
+          &["src/device/tile/mod.rs", "src/device/state/effects.rs", "src/device/array/routing.rs", "src/interpreter/execute/memory/neighbor.rs", "src/interpreter/engine/coordinator.rs"],
+          "Tile_Control low 4 bits (S/W/N/E) snapshotted on register write. Inter-tile stream transfers, cross-tile NeighborMemory snapshots/reads/buffered writes, and NeighborLocks slices all consult the destination/own isolation byte. Shim isolation snapshotted; only memtile->shim south-bound routing gate consults it today. Clock-gating bits of Tile_Control pass through unmodeled (see clock_control).",
+          Modeled { completeness: Full }),
+        d("binary_load", "XRT container / CDO / ELF formats; mlir-aie device model (tools/aie-device-models.json)",
+          &["src/parser/xclbin.rs", "src/parser/cdo/", "src/parser/elf.rs", "src/parser/stream_switch_topology.rs", "src/device/array/"],
+          "XCLBIN container, CDO framing/syntax/semantics -> DeviceOps, per-core ELF load, all MODELED. Stream-switch routing reconstruction from CDO writes (parse-side, distinct from the runtime stream_switch subsystem -- spec Appendix N1). Tile array topology (5x6 NPU1) constructed from the device model at load: folded here as the array-constructed-from-binary concern (spec Appendix N1 rationale), not a reachability-forced tag.",
+          Modeled { completeness: Full }),
     ]
 }
 
