@@ -22,6 +22,7 @@
 
 use super::parser::{ControlPacket, CtrlOpCode, HeaderFields, parse_header};
 use super::status::PktHandlerError;
+// odd_parity_ok is consumed by Task 5 (Second_Header_Parity); keep it.
 use crate::device::stream_switch::{odd_parity_ok, PacketHeader};
 
 /// Reassembly state machine for control packet words.
@@ -396,6 +397,10 @@ mod tests {
             ReassembleResult::HandlerError(PktHandlerError::FirstHeaderParity) => {}
             other => panic!("expected FirstHeaderParity, got {:?}", other),
         }
+
+        // The arm's core contract: stay waiting -- a valid header fed
+        // immediately after the bad one is still consumed as a header.
+        assert!(matches!(r.feed_word(0b1, false), ReassembleResult::Pending));
     }
 
     #[test]
