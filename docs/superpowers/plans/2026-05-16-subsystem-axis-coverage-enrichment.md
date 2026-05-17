@@ -410,6 +410,18 @@ Use its per-row Source / Coverage / "Our location" / Notes cells as the seed mat
 
 - [ ] **Step 2: Replace the skeleton map with explicit per-domain seeds (16 originals)**
 
+> **Plan correction (applied during execution, commit `a4efe52`):** the
+> code block below originally listed only 15 `d(...)` entries — `debug_halt`
+> was omitted in error. The implementer correctly added it, folded from the
+> retired index's "Core debug (halt/step/breakpoint)" row per the spec
+> Appendix: `d("debug_halt", "AM025 Debug_*; aie-rt core/",
+> &["src/device/core_debug/"], "Halt + status bits modeled. Programmable
+> breakpoints and single-step PC trap not wired through interpreter.",
+> Modeled { completeness: Partial { missing: "programmable breakpoints +
+> single-step PC trap".into() } })`. Additionally, entries are emitted in
+> `SPINE_DOMAIN_IDS` order (not the order written below) because
+> `capability_spine_matches_the_leaf_id_list` asserts ordered equality.
+
 Rewrite `capability_spine()` to construct each of the 16 original domains explicitly (keep the four new ids on the skeleton `pending` path for now — Task 4 curates them). Use a helper to cut boilerplate. Verdict mapping rule from the retired "Coverage" column: `MODELED`→`Modeled{Full}`; `PARTIAL`→`Modeled{Partial{missing:"…"}}`; `STUBBED`→`Modeled{Stub}`; `MISSING`→`Modeled{Stub}` with a MISSING narrative; `OUT_OF_SCOPE`→`Accepted{rationale:"out of scope: …"}`. Provenance is `ToolchainDerived` for aie-rt/AM025-sourced subsystems.
 
 ```rust
