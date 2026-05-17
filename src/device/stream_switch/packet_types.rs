@@ -96,6 +96,16 @@ pub struct PacketHeader {
     pub src_col: u8,
 }
 
+/// Odd-parity check over a full 32-bit header word.
+///
+/// The AIE packet/control-packet headers use odd parity: the total
+/// number of set bits (including the parity bit) is odd on a valid
+/// header. Single source of truth for the parity formula -- both
+/// `PacketHeader::decode` and the control-packet reassembler call this.
+pub fn odd_parity_ok(word: u32) -> bool {
+    word.count_ones() & 1 == 1
+}
+
 impl PacketHeader {
     /// Create a new packet header.
     pub fn new(stream_id: u8, src_col: u8, src_row: u8) -> Self {
@@ -162,7 +172,7 @@ impl PacketHeader {
             & xdna_archspec::aie2::packet::SRC_COL_MASK) as u8;
 
         // Check parity (odd parity means total 1-bits should be odd)
-        let parity_ok = word.count_ones() & 1 == 1;
+        let parity_ok = odd_parity_ok(word);
 
         let header = Self { stream_id, packet_type, src_row, src_col };
 
@@ -205,5 +215,20 @@ impl PacketRoute {
         if !self.dest_ports.contains(&port) {
             self.dest_ports.push(port);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn odd_parity_ok_basic() {
+        // count_ones() odd  -> true ; even -> false
+        assert!(odd_parity_ok(0b1)); // 1 one  -> odd
+        assert!(!odd_parity_ok(0b11)); // 2 ones -> even
+        assert!(odd_parity_ok(0b111)); // 3 ones -> odd
+        assert!(!odd_parity_ok(0)); // 0 ones -> even
+        assert!(odd_parity_ok(0xFFFF_FFFF) == (32 % 2 == 1)); // 32 ones -> even -> false
     }
 }
