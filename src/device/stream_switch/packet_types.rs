@@ -171,7 +171,6 @@ impl PacketHeader {
         let src_col = ((word >> xdna_archspec::aie2::packet::SRC_COL_SHIFT as usize)
             & xdna_archspec::aie2::packet::SRC_COL_MASK) as u8;
 
-        // Check parity (odd parity means total 1-bits should be odd)
         let parity_ok = odd_parity_ok(word);
 
         let header = Self { stream_id, packet_type, src_row, src_col };
@@ -229,6 +228,6 @@ mod tests {
         assert!(!odd_parity_ok(0b11)); // 2 ones -> even
         assert!(odd_parity_ok(0b111)); // 3 ones -> odd
         assert!(!odd_parity_ok(0)); // 0 ones -> even
-        assert!(odd_parity_ok(0xFFFF_FFFF) == (32 % 2 == 1)); // 32 ones -> even -> false
+        assert!(!odd_parity_ok(0xFFFF_FFFF)); // 32 ones -> even parity -> not ok
     }
 }
