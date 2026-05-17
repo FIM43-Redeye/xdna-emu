@@ -6,6 +6,7 @@ pub mod build_gate;
 pub mod derive;
 pub mod enforce;
 pub mod spine_ids;
+pub mod subsystem;
 pub mod surface;
 pub mod units;
 pub mod verdict;
