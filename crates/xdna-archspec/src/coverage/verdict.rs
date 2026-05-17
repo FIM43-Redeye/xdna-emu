@@ -22,6 +22,20 @@ pub enum Provenance {
     HardwareObserved,
 }
 
+/// Implementation completeness of a modeled subsystem (spec Section 1).
+/// Orthogonal in meaning to provenance/verification but folded into the one
+/// verdict vocabulary deliberately (see the spec's Risks section). `Partial` names the absent
+/// sub-behavior so the gap is self-documenting and not free prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Completeness {
+    /// Built and exercised by tests.
+    Full,
+    /// Layout / some behavior present; the named sub-behavior is absent.
+    Partial { missing: String },
+    /// Placeholder defaults, no real state machine.
+    Stub,
+}
+
 /// Silicon-verification status, orthogonal to provenance. Spec Section 1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verification {
@@ -33,6 +47,10 @@ pub enum Verification {
     Unverified,
     /// Explicitly signed off as "good enough, will not verify", with reasoning.
     Accepted { rationale: String },
+    /// The emulator implements this to `completeness`; verification status is
+    /// implied by provenance, not asserted here (spec Section 1). Minted on
+    /// `CapabilityDomain` seeds only; no `SemanticOp`/category default is ever `Modeled`.
+    Modeled { completeness: Completeness },
 }
 
 /// One behavioral unit's verdict on both axes.
@@ -45,6 +63,11 @@ pub enum Verification {
 /// gets a distinct provenance (`HardwareObserved`, spec Section 6),
 /// not `Unspecified + Verified`. The `is_perishable` / `is_comprehension_gap`
 /// predicates rely on this invariant.
+///
+/// `Provenance::Unspecified` is likewise never paired with
+/// `Verification::Modeled`: asserting *no model* and asserting *a model
+/// exists* are contradictory. `enforce_coverage` rejects this pairing on
+/// seeded domain verdicts (test-gated, spec Section 2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verdict {
     pub provenance: Provenance,
@@ -64,6 +87,18 @@ impl Verdict {
     pub fn is_comprehension_gap(&self) -> bool {
         matches!(self.provenance, Provenance::Unspecified)
             && !matches!(self.verification, Verification::Accepted { .. })
+    }
+
+    /// Implementation gap (spec Section 1, third gap class): the subsystem is
+    /// only partially built or a stub. Evaluated over `CapabilityDomain`
+    /// seeded verdicts ONLY -- never the SemanticOp universe, where no
+    /// category default is ever `Modeled` (that would be a permanently empty
+    /// queue, the silent failure this design exists to kill -- spec S1/M1).
+    pub fn is_implementation_gap(&self) -> bool {
+        matches!(
+            self.verification,
+            Verification::Modeled { completeness: Completeness::Partial { .. } | Completeness::Stub }
+        )
     }
 
     /// Mint a verdict from an empirical hardware observation (spec Section 6
@@ -149,5 +184,48 @@ mod tests {
             }
             other => panic!("expected Verified evidence, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn modeled_full_is_no_gap() {
+        let v = Verdict {
+            provenance: Provenance::ToolchainDerived,
+            verification: Verification::Modeled { completeness: Completeness::Full },
+        };
+        assert!(!v.is_perishable());
+        assert!(!v.is_comprehension_gap());
+        assert!(!v.is_implementation_gap());
+    }
+
+    #[test]
+    fn modeled_partial_and_stub_are_implementation_gaps_only() {
+        let part = Verdict {
+            provenance: Provenance::ToolchainDerived,
+            verification: Verification::Modeled {
+                completeness: Completeness::Partial { missing: "scrubber".into() },
+            },
+        };
+        let stub = Verdict {
+            provenance: Provenance::DocSpecified,
+            verification: Verification::Modeled { completeness: Completeness::Stub },
+        };
+        for v in [&part, &stub] {
+            assert!(v.is_implementation_gap());
+            assert!(!v.is_perishable(), "completeness is orthogonal to perishable");
+            assert!(!v.is_comprehension_gap());
+        }
+    }
+
+    #[test]
+    fn existing_predicates_ignore_modeled() {
+        // Safety mechanism (1), spec S1: is_perishable / is_comprehension_gap
+        // keep their exact arms; Modeled matches neither, by construction.
+        let v = Verdict {
+            provenance: Provenance::AietoolsModeled,
+            verification: Verification::Modeled { completeness: Completeness::Full },
+        };
+        assert!(!v.is_perishable());
+        assert!(!v.is_comprehension_gap());
+        assert!(!v.is_implementation_gap());
     }
 }
