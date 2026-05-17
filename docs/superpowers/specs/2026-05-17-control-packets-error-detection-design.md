@@ -26,45 +26,71 @@ That annotation is itself inaccurate. Per the AM025 extract
 There is **no `ID_Parity` bit anywhere in AM025**. The comment at
 `src/device/tile/mod.rs` (the `pkt_handler_status` doc block, currently
 "`[0] ID_Parity_Error`") is erroneous, and the coverage annotation
-inherited that error. This work wires the three genuinely unwired bits
-(0, 2, 3), tightens bit 1 to true-parity-only, and corrects the misnomer
-in both the comment and the coverage string so the gap closes against
-reality.
+inherited that error.
+
+This work wires the two genuinely unwired bits with faithful
+deterministic detecting paths -- First_Header_Parity (0) and Tlast_Error
+(3) -- tightens bit 1 (Second_Header_Parity) to true-parity-only, and
+corrects the misnomer in the comments and coverage string.
+
+**SLVERR_On_Access (bit 2) is deliberately deferred to a dedicated
+successor plan** (see Section 3.3 and Section 8). Tracing the live path
+showed the premise it was scoped on is false: `ControlPacketProcessor::
+process()` is dead code at runtime, and the real register-write sink
+`DeviceState::write_tile_register` returns `()` and cannot fail -- there
+is no faithful place a slave error arises today. Wiring bit 2 honestly
+requires repairing that path (a register-access-error model), which is
+its own piece of work. This plan therefore closes `control_packets` to
+an *accurate, narrowed* `Modeled{Partial}` (missing == exactly SLVERR),
+not `Full`. The successor plan closes it to `Full`.
 
 ## 1. Scope
 
 In scope:
 
-- Detecting paths + sticky-bit latching for First_Header_Parity (0),
-  SLVERR_On_Access (2), Tlast_Error (3).
+- Detecting paths + sticky-bit latching for First_Header_Parity (0) and
+  Tlast_Error (3).
 - Tightening Second_Header_Parity (1) to fire only on a genuine
   opcode-header odd-parity failure (today it fires on every header parse
   failure, including structural ones).
-- Correcting the `ID_Parity_Error` misnomer in `tile/mod.rs` and the
-  `units.rs` coverage seed.
-- Lockstep regeneration of the three generated coverage artifacts.
+- Correcting the `ID_Parity_Error` misnomer in `tile/mod.rs`,
+  `state/effects.rs`, and the `units.rs` coverage seed -- the comments
+  document the true 4-bit AM025 register regardless of which bits we
+  wire.
+- Lockstep regeneration of the three generated coverage artifacts, with
+  `control_packets` narrowed to an accurate SLVERR-only `Partial`.
 
-Out of scope: no change to write-1-to-clear (`effects.rs` already covers
-all 4 bits) or the register read path (`registers.rs` already returns
-`& 0xF`). Both were built generic; only detection was missing. No new
-regdb-driven extraction -- bit positions are centralized literals with an
-AM025 citation.
+Out of scope:
+
+- **SLVERR_On_Access (bit 2)** -- deferred to the successor plan
+  (Section 3.3 / Section 8). The `PktHandlerError` enum ships with three
+  variants now; the successor plan adds the `Slverr` variant when it
+  wires the path.
+- No change to write-1-to-clear (`effects.rs` already covers all 4
+  bits) or the register read path (`registers.rs` already returns
+  `& 0xF`). Both were built generic; only detection was missing.
+- No new regdb-driven extraction -- bit positions are centralized
+  literals with an AM025 citation.
 
 ## 2. New unit: `PktHandlerError`
 
 New file `src/device/control_packets/status.rs`:
 
 ```rust
-/// The four Tile_Control_Packet_Handler_Status sticky-error conditions.
-/// Bit positions per AM025 Tile_Control_Packet_Handler_Status
-/// (regdb fields First_Header_Parity_Error / Second_Header_Parity_Error /
-/// SLVERR_On_Access / Tlast_Error). This is the single source of truth
-/// for the bit map; no other site names these positions.
+/// Tile_Control_Packet_Handler_Status sticky-error conditions with a
+/// faithful detecting path. Bit positions per AM025
+/// Tile_Control_Packet_Handler_Status (regdb fields
+/// First_Header_Parity_Error / Second_Header_Parity_Error /
+/// Tlast_Error). This is the single source of truth for the bit map;
+/// no other site names these positions.
+///
+/// SLVERR_On_Access (bit 0x4) is intentionally absent: it has no
+/// faithful trigger until the successor plan repairs the runtime
+/// register-access path. That plan adds the `Slverr` variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PktHandlerError {
     FirstHeaderParity,  // bit 0
     SecondHeaderParity, // bit 1
-    Slverr,             // bit 2
     Tlast,              // bit 3
 }
 
@@ -73,7 +99,6 @@ impl PktHandlerError {
         match self {
             PktHandlerError::FirstHeaderParity => 0x1,
             PktHandlerError::SecondHeaderParity => 0x2,
-            PktHandlerError::Slverr => 0x4,
             PktHandlerError::Tlast => 0x8,
         }
     }
@@ -81,21 +106,32 @@ impl PktHandlerError {
 ```
 
 Exhaustive match, no `_` arm (project convention -- a new variant must
-force a compile error here).
+force a compile error here, which is exactly what forces the successor
+plan to handle `Slverr` when it adds it).
 
 ## 3. Detection semantics
 
-Parity is computed by **reusing the existing odd-parity helper used by
-`PacketHeader::decode` in `src/device/.../packet_types.rs`**. Do not
-re-derive a parity formula; locate the existing one and call it. (If it
-is private, lift it to a shared helper rather than duplicate.)
+Odd parity is computed identically everywhere in the codebase as
+`word.count_ones() & 1 == 1` (it appears inline in
+`src/device/stream_switch/packet_types.rs` `PacketHeader::decode:165`
+and `encode:140`). There is no standalone helper today. DRY this: add
+`pub fn odd_parity_ok(word: u32) -> bool { word.count_ones() & 1 == 1 }`
+in `packet_types.rs`, refactor `PacketHeader::decode` to call it (pure
+refactor, no behavior change -- locked by the existing `decode` tests),
+and call it for the Second_Header check. Do not re-derive the formula.
 
 ### 3.1 First_Header_Parity (bit 0)
 
 - **Where:** `src/device/control_packets/reassembler.rs`, the
-  `WaitingForStreamHeader` -> `Idle` transition.
-- **Condition:** odd-parity check on the 32-bit stream routing header
-  word fails.
+  `WaitingForStreamHeader` -> `Idle` transition (`feed_word`, currently
+  reassembler.rs:98-112, which consumes the routing header raw via
+  `word & 0x1F` etc.).
+- **Mechanism:** the stream routing header is exactly what
+  `PacketHeader::decode(word) -> (PacketHeader, parity_ok)` parses. The
+  reassembler currently ignores `decode` and hand-extracts fields.
+  Switch it to call `PacketHeader::decode`; on `parity_ok == false`
+  return `ReassembleResult::HandlerError(PktHandlerError::
+  FirstHeaderParity)`.
 - **Reachability:** only when `Drop_Header=false` (the stream switch
   forwarded the routing header). When dropped, the handler never sees
   the header and the bit correctly cannot fire. Document this in code.
@@ -112,17 +148,31 @@ is private, lift it to a shared helper rather than duplicate.)
   no `pkt_handler_status` write. This is the only change to existing
   wired behavior and gets an explicit regression-locking test (5.2).
 
-### 3.3 SLVERR_On_Access (bit 2)
+### 3.3 SLVERR_On_Access (bit 2) -- DEFERRED to successor plan
 
-- **Where:** `src/device/control_packets/processor.rs` register-access
-  path (`RegisterAccess::write_register` / `read_register`).
-- **Condition:** any such call returns `Err` during packet processing --
-  the emulator's analog of an AXI slave error (unmapped / decode-failed
-  / denied access).
-- **Origin differs:** this is the processor, not the reassembler.
-  The processor surfaces "an access error occurred" up to `routing.rs`,
-  which latches `PktHandlerError::Slverr` through the same latch helper
-  (Section 4). The processor stays free of tile-status state.
+Not implemented by this plan. The original scoping assumed
+`ControlPacketProcessor::process()` was the live register-access path
+and that bit 2 was a small mirror of the parity path. Tracing the
+runtime disproved both:
+
+- `ControlPacketProcessor::process()` is **dead code at runtime** --
+  invoked only by its own unit tests. The live path is
+  `routing.rs::step_ctrl_packets` -> `reassembler.feed_word` ->
+  `Complete(packet)` -> `packet_to_actions()` ->
+  `CtrlPacketAction::{WriteRegister,ReadRegisters,Error}` ->
+  `coordinator.rs` -> `DeviceState::write_tile_register`.
+- `write_tile_register` returns `()` and **cannot fail**: an unmapped
+  offset is silently stored in a `HashMap`. There is no
+  address-decode / privilege model, so no faithful slave error arises.
+
+Wiring bit 2 honestly means giving the runtime register-access path a
+real error notion and threading it out through `write_tile_register`
+plus the three `CtrlPacketAction` dispatch sites in `coordinator.rs`
+(~298, ~361, ~848). That is a distinct subsystem-shaped change, not a
+mirror of parity. Per the project rule against inventing simplified
+approximations, it gets its own spec/plan as the **immediate successor**
+to this one (Section 8). This plan deliberately leaves bit 2 unwired and
+narrows the coverage annotation to name exactly that.
 
 ### 3.4 Tlast_Error (bit 3)
 
@@ -149,11 +199,12 @@ doing `tile.pkt_handler_status |= e.bit()`. The match becomes:
   `CtrlPacketAction::Error`.
 - `Error(msg)` -> `log` + push `CtrlPacketAction::Error`, **no bit**
   (replaces the current `self.tiles[i].pkt_handler_status |= 0x2` at
-  `routing.rs:363`).
+  `routing.rs:363`, which today fires for every structural parse
+  failure -- this removal IS the bit-1 tightening of 3.2).
 
-SLVERR (Section 3.3) reaches the same `latch_pkt_error` from the
-processor-result path. One latch point, one bit map (`PktHandlerError::
-bit()`), two origins (reassembler, processor).
+One latch point, one bit map (`PktHandlerError::bit()`), one origin
+(the reassembler) for this plan. The successor SLVERR plan adds a second
+origin reaching the same `latch_pkt_error`.
 
 Unchanged and explicitly relied upon:
 
@@ -179,13 +230,14 @@ fail, implement, watch it pass.
   SecondHeaderParity)`; Tlast missing on final beat -> `HandlerError(
   Tlast)`; Tlast asserted early on non-final beat -> `HandlerError(
   Tlast)`; clean packet -> no error.
-- `processor.rs` / `routing.rs`: a `RegisterAccess` `Err` during
-  processing latches bit 2.
 - After latching through `routing.rs`, the corresponding
   `pkt_handler_status` bit reads back via the register path.
-- `effects.rs` / `registers.rs`: extend existing pkt_handler_status
-  tests to cover read-back + write-1-to-clear for bits 0, 2, 3
-  individually (bit 1 already covered).
+- `registers.rs`: extend existing pkt_handler_status tests to cover
+  read-back + write-1-to-clear for bits 0 and 3 individually (bit 1
+  already covered; bit 2 deferred).
+- `packet_types.rs`: the `decode` refactor is locked by existing
+  `decode` tests -- no behavior change. Add one direct `odd_parity_ok`
+  unit test (even-ones word -> false, odd-ones word -> true).
 
 ### 5.2 Regression-locking test (the tightening)
 
@@ -208,39 +260,52 @@ code that changes them, in the same task:
 1. `src/device/tile/mod.rs` -- rewrite the `pkt_handler_status` doc
    block to the true AM025 map (`[0] First_Header_Parity_Error`,
    `[1] Second_Header_Parity_Error`, `[2] SLVERR_On_Access`,
-   `[3] Tlast_Error`); fix the "we OR a bit in when the reassembler
-   observes" sentence (SLVERR originates in the processor).
-2. `crates/xdna-archspec/src/coverage/units.rs:177-180` -- the
-   `control_packets` seed: verdict
-   `Modeled{Partial{missing:"Tlast/SLVERR/ID_Parity..."}}` ->
-   `Modeled{completeness: Full}`; narrative loses the "Second_Header
-   _Parity_Error wired, Tlast/SLVERR/ID_Parity not (no detecting path)"
-   sentence, replaced with: all four `Tile_Control_Packet_Handler_Status`
-   sticky bits have detecting paths + write-1-to-clear.
-3. Regenerate: `cargo run -p xdna-archspec --example
+   `[3] Tlast_Error`). The comment documents the hardware register, so
+   it lists all four; annotate that bit 2 has no detecting path yet
+   (successor plan).
+2. `src/device/state/effects.rs:28-30` -- the comment currently reads
+   "Tlast_Error / SLVERR_On_Access / Second_Header_Parity / ID_Parity"
+   (wrong name + wrong order). Correct to the true AM025 map matching
+   item 1. Behavior (`&= !(value & 0xF)`) is unchanged.
+3. `crates/xdna-archspec/src/coverage/units.rs:177-180` -- the
+   `control_packets` seed: verdict **stays** `Modeled{Partial{...}}`
+   but `missing` narrows from
+   `"Tlast/SLVERR/ID_Parity packet-handler sticky bits"` to exactly
+   `"SLVERR_On_Access sticky bit -- needs a register-access-error
+   model (successor plan)"`. Narrative updated: First/Second-header
+   parity + Tlast sticky bits now have detecting paths +
+   write-1-to-clear; SLVERR deferred (no faithful trigger until the
+   runtime register-access path is repaired).
+4. Regenerate: `cargo run -p xdna-archspec --example
    gen_coverage_artifacts`. Expected diffs:
-   - `docs/coverage/aie2/subsystem-index.md` -- `control_packets`
-     row -> `Modeled { completeness: Full }`, drift recomputed.
+   - `docs/coverage/aie2/subsystem-index.md` -- `control_packets` row
+     narrative + `missing` text update; verdict stays
+     `Modeled{Partial}`.
    - `docs/coverage/aie2/implementation-gaps.md` -- the
-     `control_packets: PARTIAL ...` line drops off (queue 5 -> 4).
+     `control_packets: PARTIAL ...` line **stays** (queue remains 5)
+     but its text now names SLVERR specifically.
    - `docs/coverage/aie2/architecture-index.md` -- regenerate; changes
-     only if a rolled-up category verdict moves.
-4. Zero-drift check after commit (regenerate again, `git diff` empty),
+     only if a rolled-up category verdict moves (it should not, since
+     the verdict is unchanged).
+5. Zero-drift check after commit (regenerate again, `git diff` empty),
    exactly as Plan 3 did.
 
 ## 7. Files
 
 - Create: `src/device/control_packets/status.rs` (+ `mod.rs`
-  registration).
-- Modify: `src/device/control_packets/reassembler.rs` (parity + Tlast
-  detection, `HandlerError` variant), `processor.rs` (surface access
-  error), `src/device/array/routing.rs` (latch helper + match rewrite),
-  `src/device/tile/mod.rs` (comment), `crates/xdna-archspec/src/coverage
-  /units.rs` (seed).
-- Locate + reuse: existing odd-parity helper near `PacketHeader::decode`.
+  registration and `pub use`).
+- Modify: `src/device/stream_switch/packet_types.rs` (add
+  `odd_parity_ok`, refactor `decode` to use it),
+  `src/device/control_packets/reassembler.rs` (parity + Tlast
+  detection, `HandlerError` variant),
+  `src/device/array/routing.rs` (latch helper + match rewrite),
+  `src/device/tile/mod.rs` (comment), `src/device/state/effects.rs`
+  (comment), `crates/xdna-archspec/src/coverage/units.rs` (seed
+  narrative + narrowed `missing`).
 - Regenerate: the three `docs/coverage/aie2/*.md` artifacts.
-- Tests: alongside each modified module (reassembler/processor/registers/
-  effects), per existing patterns.
+- Tests: alongside each modified module (reassembler / registers /
+  packet_types), per existing patterns. `processor.rs` is untouched
+  (dead at runtime; SLVERR successor plan owns it).
 
 ## 8. Out of scope / non-goals
 
@@ -250,4 +315,29 @@ code that changes them, in the same task:
 - No change to the structural-parse-rejection logging behavior beyond
   decoupling it from bit 1.
 - No broader control-packet feature work (response routing, opcode
-  coverage) -- this closes exactly the status-bit gap.
+  coverage) -- this closes exactly the three faithfully-detectable
+  status bits.
+
+## 9. Successor plan (committed)
+
+SLVERR_On_Access (bit 2) is the **immediate next plan** after this one.
+It must repair the runtime register-access path so a slave error is a
+real, faithful event rather than a fabricated one:
+
+- Give `DeviceState::write_tile_register` (and the read path behind
+  `CtrlPacketAction::ReadRegisters` / `handle_read_registers`) a
+  fallible result expressing address-decode / access failure.
+- Thread that result through the three `CtrlPacketAction` dispatch
+  sites in `coordinator.rs` (~298, ~361, ~848) to the existing
+  `latch_pkt_error` helper.
+- Add the `Slverr` variant to `PktHandlerError` (the exhaustive
+  no-`_` match will force every site to handle it -- the intended
+  trip-wire).
+- Decide the faithful definition of an emulator slave error (likely:
+  offset not a decodable register for the tile type, grounded in the
+  regdb register map rather than an ad-hoc list).
+- Flip the `control_packets` coverage verdict to `Modeled{Full}` and
+  drop it from `implementation-gaps.md` (queue 5 -> 4) in lockstep.
+
+This is recorded so the deferral is a tracked commitment, not a
+silently dropped requirement.
