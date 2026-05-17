@@ -2,7 +2,7 @@
 //! single hand-curated CapabilityDomain spine (spec Section 6). Seeded coarse;
 //! Phase 2 refines. Co-located on purpose (one location, spec Section 6).
 
-use crate::coverage::verdict::{Completeness, Verdict, Verification};
+use crate::coverage::verdict::{Verdict, Verification};
 use crate::coverage::CoverageNode;
 use crate::types::Architecture;
 
@@ -89,31 +89,103 @@ pub fn override_registry(_arch: Architecture) -> Vec<BehavioralUnit> {
 /// only wired arch today (Plan 1). Phase 1 auto-claims every domain via the
 /// derived shim (Task 6); the SubsystemKind<->spine partition is Phase 2.
 pub fn capability_spine() -> Vec<CapabilityDomain> {
-    let aie2 = vec![Architecture::Aie2];
-    // Task-2 skeleton seed: every domain is honestly Partial pending its
-    // curated seed (Tasks 3/4). source_ref/src_locations are non-empty so the
-    // enforce loop passes; the Partial{missing} verdict is true (the catalogue
-    // entry is genuinely incomplete) and self-corrects out of the
-    // implementation-gaps queue as Tasks 3/4 replace it. An accurate coarse
-    // bootstrap (the same honest-coarse pattern as Phase-1 category defaults).
-    let pending = |missing: &str| Verdict {
-        provenance: crate::coverage::verdict::Provenance::ToolchainDerived,
-        verification: Verification::Modeled {
-            completeness: Completeness::Partial { missing: missing.to_string() },
-        },
+    use crate::coverage::verdict::{Completeness::*, Provenance::*, Verification::*};
+    let aie2 = || vec![Architecture::Aie2];
+    let d = |id: &str, source_ref: &str, locs: &[&str], narrative: &str, v: Verification| CapabilityDomain {
+        id: id.into(),
+        arches: aie2(),
+        source_ref: source_ref.into(),
+        src_locations: locs.iter().map(|s| s.to_string()).collect(),
+        narrative: narrative.into(),
+        verdict: Verdict { provenance: ToolchainDerived, verification: v },
+        drift_rationale: None,
     };
-    crate::coverage::spine_ids::SPINE_DOMAIN_IDS
-        .iter()
-        .map(|id| CapabilityDomain {
-            id: (*id).to_string(),
-            arches: aie2.clone(),
-            source_ref: "pending (plan Task 3/4)".to_string(),
-            src_locations: vec!["src/pending (plan Task 3/4)".to_string()],
-            narrative: format!("{id}: curated seed pending (plan Task 3/4)"),
-            verdict: pending("curated domain seed pending (plan Task 3/4)"),
-            drift_rationale: None,
-        })
-        .collect()
+    // Four new domains stay on the honest skeleton until Task 4.
+    let pending = |id: &str| CapabilityDomain {
+        id: id.into(),
+        arches: aie2(),
+        source_ref: "pending (plan Task 4)".into(),
+        src_locations: vec![],
+        narrative: format!("{id}: curated seed pending (plan Task 4)"),
+        verdict: Verdict {
+            provenance: ToolchainDerived,
+            verification: Modeled {
+                completeness: Partial { missing: "curated seed pending (plan Task 4)".into() },
+            },
+        },
+        drift_rationale: None,
+    };
+    vec![
+        // Order must match SPINE_DOMAIN_IDS exactly (spec Section 6: one location).
+        d("core", "aie-rt core/, llvm-aie TableGen; AM025 Core_Control/Core_Status/Error_Halt_*",
+          &["src/interpreter/", "src/device/core_debug/"],
+          "VLIW core, control (enable/done/reset), and error-halt path. 100% ISA decode; SemanticOp coverage ~33%, rest in legacy handlers. Generic error_halt fires INSTR_ERROR (event 69) on every CoreStatus::Error; ECC fires ECC_ERROR_STALL. Saturation/watchdog error sources not yet detected.",
+          Modeled { completeness: Full }),
+        d("program_memory", "AM025",
+          &["src/parser/elf.rs"],
+          "16KB program memory; ELF load -> run.", Modeled { completeness: Full }),
+        d("program_counter", "AM025 PC_Event0..3 (0x32020/4/8/C); aie-rt xaiemlgbl_params.h",
+          &["src/interpreter/", "src/device/core_debug/"],
+          "PC sampling + PC_Event0..3 / Core_PC_Range matching; drives event-halt selector.",
+          Modeled { completeness: Full }),
+        d("data_memory", "aie-rt memory/, AM025",
+          &["src/device/banking.rs", "src/device/state/memtile.rs", "src/interpreter/timing/memory.rs"],
+          "64KB compute (8 banks x 128-bit) / 512KB memtile; conflict detection done; per-bank MEM_CONFLICT_DM_BANK_N fired. ECC: status bit readable, no scrubber/fault-injection -- accepted out of scope unless workloads require.",
+          Modeled { completeness: Full }),
+        d("dma", "aie-rt dma/, AM025 (112/433/144 reg)",
+          &["src/device/dma/"],
+          "BDs per tile-type 16/48/16 (memtile 48 not 64 -- aie-rt xaiemlgbl_reginit.c), channels 2/6/2, address dims 3/4/3; n-d addressing, padding, lock coupling, packet header, compression. Repeat / out-of-order BD execution: verify.",
+          Modeled { completeness: Full }),
+        d("locks", "aie-rt locks/, AM025",
+          &["src/device/tile/locks.rs"],
+          "Counts per tile-type 16/64/16 (aie-rt xaiemlgbl_reginit.c; the 192 in AieMlMemTileDmaMod.NumLocks is the cross-tile reference range, not slot count). acquire/release/get/set, semaphore semantics, round-robin arbiter.",
+          Modeled { completeness: Full }),
+        d("stream_switch", "aie-rt stream_switch/, AM025 (160/119/149 reg)",
+          &["src/device/stream_switch/"],
+          "Circuit + packet, FIFOs, port events, packet-header matching. Parse-time routing reconstruction is a binary_load concern (spec Appendix N1); see binary_load for parse-time routing reconstruction.",
+          Modeled { completeness: Full }),
+        d("events_trace", "aie-rt events/ + trace/, AM025 (128/161/51 events)",
+          &["src/device/events/", "src/device/trace_unit/"],
+          "Events (broadcast 16ch, combo, group, port), cross-tile broadcast network, trace unit modes 0/1/2, pipelined start/stop + multi-tile timer sync. Combo/edge generator boundary cases need targeted tests; L2 broadcast propagation verify.",
+          Modeled { completeness: Full }),
+        d("performance_counters", "aie-rt perfcnt/, AM025 (compute/memtile/shim 4/11/6 reg)",
+          &["src/device/perf_counters/"],
+          "4 counters, threshold events. DMA/stream FIFO-size events not emitted (cycle-accuracy gap, tracked in cycle-accuracy-mission.md).",
+          Modeled { completeness: Full }),
+        d("timer", "aie-rt timer/, AM025 (5 reg)",
+          &["src/device/timer.rs"],
+          "Free-running 64-bit per-module; Reset_Event consumed via pending_reset latch; multi-tile timer-sync modeled. Trig_Event_Low/High_Value write effect: verification follow-up.",
+          Modeled { completeness: Full }),
+        d("watchpoint", "AM025 Compute WatchPoint0/1 (2), MemTile WatchPoint0..3 (4)",
+          &["src/interpreter/execute/cycle_accurate.rs"],
+          "Compute 2 / memtile 4 slots; WriteStrobes==0xF gate, direction + address comparator, AXI/DMA/quadrant origin filters, scalar+vector+DMA-engine paths, modifier-register effective address. Locked by 17+ unit tests.",
+          Modeled { completeness: Full }),
+        d("debug_halt", "AM025 Debug_*; aie-rt core/",
+          &["src/device/core_debug/"],
+          "Halt + status bits modeled. Programmable breakpoints and single-step PC trap not wired through interpreter.",
+          Modeled { completeness: Partial { missing: "programmable breakpoints + single-step PC trap".into() } }),
+        d("cascade", "aie-rt, aietools events",
+          &["src/interpreter/execute/cascade.rs"],
+          "Tile<->tile cascade read/write. Deadlock detection is a placeholder (deadlock.rs) -- promote to real detection or remove (verification follow-up).",
+          Modeled { completeness: Full }),
+        d("interrupt", "aie-rt interrupt/, AM025 (L2 shim_intc_l2 23 reg)",
+          &["src/device/interrupts/l1.rs", "src/device/interrupts/l2.rs"],
+          "L1 per-tile 20 IRQs mask/enable/status MODELED. L2 NoC aggregator present but 23-reg surface exhaustiveness unconfirmed and privilege gating not modeled.",
+          Modeled { completeness: Partial { missing: "L2 23-reg surface exhaustiveness + privilege gating".into() } }),
+        d("noc", "AM025 (NoC_Interface_AIE_to_NoC 4 reg, AIE_AXIMM_Config); aie-rt npi/; hardware spec",
+          &[],
+          "Direct NoC control / AIE_AXIMM_Config / NoC fabric latency-arbitration are not modeled (NoC fudged; impacts cycle-accuracy more than functional correctness; cycle-accuracy-mission.md tracks calibration). NPI privileged register access is driver-side privilege -- emulator gives unrestricted access: accepted out of scope. No emulator src for the unmodeled NoC surface.",
+          Modeled { completeness: Stub }),
+        d("shim_mux", "aie-rt, AM025 (shim Mux/Demux 2 reg); aie-rt pl/ (PL Interface)",
+          &["src/device/stream_switch/"],
+          "Shim master/slave NoC-facing mux/demux. PL Interface (Upsizer/Downsizer) is Versal-FPGA stream-width adaptation -- NPU1 exposes no programmable PL: accepted out of scope.",
+          Modeled { completeness: Full }),
+        // 4 new domains: skeleton until Task 4.
+        pending("control_packets"),
+        pending("clock_control"),
+        pending("tile_isolation"),
+        pending("binary_load"),
+    ]
 }
 
 #[cfg(test)]
@@ -141,9 +213,30 @@ mod tests {
         for id in ["control_packets", "clock_control", "tile_isolation", "binary_load"] {
             assert!(spine.iter().any(|d| d.id == id), "missing new domain {id}");
         }
-        // Every domain carries non-empty source_ref + src_locations.
+        // Every domain carries non-empty source_ref.
         assert!(spine.iter().all(|d| !d.source_ref.is_empty()));
-        assert!(spine.iter().all(|d| !d.src_locations.is_empty()));
+        // src_locations may be empty only for OOS/MISSING states (Stub/Partial/Accepted).
+        // Domains with Modeled{Full} + Verified must name where they live in src/.
+        // This mirrors what enforce_coverage block-4 gates on (spec Section 2 N2).
+        use crate::coverage::verdict::{Completeness, Verification};
+        for d in &spine {
+            let oos_or_missing = match &d.verdict.verification {
+                Verification::Accepted { .. } => true,
+                Verification::Modeled { completeness } => {
+                    matches!(completeness, Completeness::Stub | Completeness::Partial { .. })
+                }
+                Verification::NotApplicable | Verification::Verified { .. } | Verification::Unverified => {
+                    false
+                }
+            };
+            if !oos_or_missing {
+                assert!(
+                    !d.src_locations.is_empty(),
+                    "domain '{}' is not OOS/MISSING but has empty src_locations",
+                    d.id
+                );
+            }
+        }
     }
 
     #[test]
