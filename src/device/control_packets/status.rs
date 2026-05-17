@@ -1,4 +1,8 @@
 //! Tile_Control_Packet_Handler_Status sticky-error conditions.
+//!
+//! Provides [`PktHandlerError`], the single place the
+//! `Tile_Control_Packet_Handler_Status` bit positions are defined, so
+//! detecting paths and the routing latch never spell raw bit literals.
 
 /// A control-packet handler error with a faithful detecting path.
 ///
