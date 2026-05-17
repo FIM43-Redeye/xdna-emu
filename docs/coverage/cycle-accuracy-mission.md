@@ -9,7 +9,7 @@ cycle-accuracy effort. If you're touching anything that affects
 when an event/instruction/state-change happens at cycle granularity,
 your work belongs in this index.
 
-This is NOT an architecture doc — see [aie2/architecture-index.md](aie2/architecture-index.md)
+This is NOT an architecture doc — see [aie2/subsystem-index.md](aie2/subsystem-index.md)
 for "what subsystems exist." This doc tracks "where are we on making
 each subsystem cycle-accurate."
 

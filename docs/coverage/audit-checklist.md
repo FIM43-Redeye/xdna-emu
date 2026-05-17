@@ -94,3 +94,11 @@ through item 3 specifically: "what consumes this field per cycle?" If the
 answer is "nothing", the unit is not actually modelled — demote its
 verdict. It then reappears in perishable-queue.md / comprehension-gaps.md
 by construction, which is the gap list regenerating itself.
+
+A subsystem that is only partially built or stubbed lands in the
+generated [aie2/implementation-gaps.md](aie2/implementation-gaps.md) by
+its `CapabilityDomain` verdict (`Modeled{Partial|Stub}`), the same way a
+weak-provenance op lands in the perishable queue. Closing it means
+raising that domain's seeded verdict in `capability_spine()` to
+`Modeled{Full}` (or a closed state) with honest evidence -- the
+subsystem-index and implementation-gaps docs then regenerate to match.
