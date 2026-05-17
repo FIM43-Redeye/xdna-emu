@@ -94,8 +94,10 @@ impl StreamReassembler {
     /// Feed one word from the TileCtrl master port.
     ///
     /// Returns `Complete(packet)` when a full control packet has been
-    /// reassembled, `Pending` when more words are needed, or `Error`
-    /// on protocol violations.
+    /// reassembled, `Pending` when more words are needed,
+    /// `HandlerError(e)` on a protocol violation with a faithful
+    /// Control_Packet_Handler_Status bit, or `Error(msg)` on a structural
+    /// rejection (logged only, no status bit).
     pub fn feed_word(&mut self, word: u32, tlast: bool) -> ReassembleResult {
         match std::mem::take(&mut self.state) {
             ReassemblerState::WaitingForStreamHeader => {
