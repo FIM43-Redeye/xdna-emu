@@ -21,6 +21,8 @@
 //! ```
 
 use super::parser::{ControlPacket, CtrlOpCode, HeaderFields, parse_header};
+use super::status::PktHandlerError;
+use crate::device::stream_switch::{odd_parity_ok, PacketHeader};
 
 /// Reassembly state machine for control packet words.
 #[derive(Debug)]
@@ -101,16 +103,24 @@ impl StreamReassembler {
     pub fn feed_word(&mut self, word: u32, tlast: bool) -> ReassembleResult {
         match std::mem::take(&mut self.state) {
             ReassemblerState::WaitingForStreamHeader => {
-                // Consume the stream routing header, transition to Idle.
-                let pkt_id = word & 0x1F;
-                let pkt_type = (word >> 12) & 0x7;
+                // The stream routing header is exactly what
+                // PacketHeader::decode parses. Validate its odd parity
+                // (First_Header_Parity). Reachable only when
+                // drop_header=false; when the switch dropped the header
+                // the handler never sees it and this cannot fire.
+                let (hdr, parity_ok) = PacketHeader::decode(word);
+                if !parity_ok {
+                    // Stay waiting for a valid header.
+                    self.state = ReassemblerState::WaitingForStreamHeader;
+                    return ReassembleResult::HandlerError(PktHandlerError::FirstHeaderParity);
+                }
                 log::debug!(
-                    "Tile ({},{}) ctrl_pkt: consuming stream header 0x{:08X} (pkt_id={}, pkt_type={})",
+                    "Tile ({},{}) ctrl_pkt: consuming stream header 0x{:08X} (stream_id={}, type={:?})",
                     self.col,
                     self.row,
                     word,
-                    pkt_id,
-                    pkt_type
+                    hdr.stream_id,
+                    hdr.packet_type
                 );
                 self.state = ReassemblerState::Idle;
                 ReassembleResult::Pending
@@ -308,7 +318,7 @@ mod tests {
 
         // Next word should be treated as stream header again
         // (Feed a ctrl header without consuming stream header first -- should go Pending)
-        assert!(matches!(r.feed_word(0x0000_000F, false), ReassembleResult::Pending));
+        assert!(matches!(r.feed_word(0x0000_0007, false), ReassembleResult::Pending));
     }
 
     #[test]
@@ -372,6 +382,28 @@ mod tests {
             ReassembleResult::HandlerError(e) => assert_eq!(e.bit(), 0x2),
             other => panic!("expected HandlerError, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn bad_parity_stream_header_sets_first_header_parity() {
+        use crate::device::control_packets::status::PktHandlerError;
+        let mut r = StreamReassembler::new(0, 2);
+        r.set_drop_header(false); // stream header expected
+
+        // Stream header with EVEN ones -> odd-parity invalid.
+        // 0b11 has two set bits (even) -> odd_parity_ok == false.
+        match r.feed_word(0b11, false) {
+            ReassembleResult::HandlerError(PktHandlerError::FirstHeaderParity) => {}
+            other => panic!("expected FirstHeaderParity, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn good_parity_stream_header_is_consumed() {
+        let mut r = StreamReassembler::new(0, 2);
+        r.set_drop_header(false);
+        // 0b1 has one set bit (odd) -> odd_parity_ok == true -> consumed.
+        assert!(matches!(r.feed_word(0b1, false), ReassembleResult::Pending));
     }
 
     // Helper: build a control packet header word.
