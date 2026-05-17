@@ -8,16 +8,18 @@ the same CoverageModel that backs the release gate, so it cannot
 silently disagree with `clean_release` (spec Section 2, Section 5).
 Per-op overrides and the perishable/comprehension queues live in the
 sibling perishable-queue.md / comprehension-gaps.md.
+Each category lists the spine domains it tags; per-subsystem detail
+is in the generated subsystem-index.md.
 
-| Category | Provenance | Verification |
-|----------|------------|--------------|
-| Arithmetic | ToolchainDerived | NotApplicable |
-| Bitwise | ToolchainDerived | NotApplicable |
-| Comparison | ToolchainDerived | NotApplicable |
-| Memory | ToolchainDerived | NotApplicable |
-| ControlFlow | ToolchainDerived | NotApplicable |
-| Vector | AietoolsModeled | Unverified |
-| Sync | ToolchainDerived | NotApplicable |
-| SideEffect | DocSpecified | Unverified |
-| NeedsTriage | Unspecified | Unverified |
+| Category | Provenance | Verification | Domains |
+|----------|------------|--------------|---------|
+| Arithmetic | ToolchainDerived | NotApplicable | core |
+| Bitwise | ToolchainDerived | NotApplicable | core |
+| Comparison | ToolchainDerived | NotApplicable | core |
+| Memory | ToolchainDerived | NotApplicable | data_memory, program_memory |
+| ControlFlow | ToolchainDerived | NotApplicable | core |
+| Vector | AietoolsModeled | Unverified | core |
+| Sync | ToolchainDerived | NotApplicable | locks |
+| SideEffect | DocSpecified | Unverified | dma, stream_switch, cascade |
+| NeedsTriage | Unspecified | Unverified | core |
 
