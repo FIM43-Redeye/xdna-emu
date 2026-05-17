@@ -55,7 +55,10 @@ pub enum ReassembleResult {
     Pending,
     /// A complete control packet is ready.
     Complete(ControlPacket),
-    /// An error occurred during reassembly.
+    /// A protocol violation with a faithful Control_Packet_Handler_Status
+    /// detecting path (parity / TLAST). Latched as a sticky bit.
+    HandlerError(super::status::PktHandlerError),
+    /// A structural rejection (logged only, no status bit).
     Error(String),
 }
 
@@ -356,6 +359,16 @@ mod tests {
                 assert_eq!(pkt.data[0], 0x55);
             }
             other => panic!("Expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn handler_error_variant_carries_pkt_handler_error() {
+        use crate::device::control_packets::status::PktHandlerError;
+        let r = ReassembleResult::HandlerError(PktHandlerError::SecondHeaderParity);
+        match r {
+            ReassembleResult::HandlerError(e) => assert_eq!(e.bit(), 0x2),
+            other => panic!("expected HandlerError, got {:?}", other),
         }
     }
 

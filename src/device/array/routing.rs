@@ -354,13 +354,20 @@ impl TileArray {
                             }
                         }
                         ReassembleResult::Pending => {}
+                        ReassembleResult::HandlerError(e) => {
+                            log::error!(
+                                "Tile ({},{}) ctrl_pkt handler error: {:?} (sets Control_Packet_Handler_Status bit 0x{:X})",
+                                col, row, e, e.bit()
+                            );
+                            Self::latch_pkt_error(&mut self.tiles[i], e);
+                            self.pending_ctrl_actions.push(CtrlPacketAction::Error(format!("{:?}", e)));
+                        }
                         ReassembleResult::Error(msg) => {
+                            // Structural rejection: logged only. Per spec
+                            // 3.2 it does NOT set Second_Header_Parity --
+                            // that bit is now exclusively a true-parity
+                            // signal (Task 5). No pkt_handler_status write.
                             log::error!("{}", msg);
-                            // Set Second_Header_Parity_Error sticky bit so
-                            // software polling Control_Packet_Handler_Status
-                            // sees a non-zero value. Bit 1 covers header
-                            // parse failures specifically.
-                            self.tiles[i].pkt_handler_status |= 0x2;
                             self.pending_ctrl_actions.push(CtrlPacketAction::Error(msg));
                         }
                     }
@@ -379,6 +386,16 @@ impl TileArray {
         }
 
         words_routed
+    }
+
+    /// The single Control_Packet_Handler_Status latch point. All faithful
+    /// handler errors converge here so the bit map lives in exactly one
+    /// place (`PktHandlerError::bit()`).
+    fn latch_pkt_error(
+        tile: &mut crate::device::tile::Tile,
+        e: crate::device::control_packets::status::PktHandlerError,
+    ) {
+        tile.pkt_handler_status |= e.bit();
     }
 
     /// Convert a reassembled ControlPacket into legacy CtrlPacketAction(s).
