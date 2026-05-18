@@ -489,6 +489,15 @@ mod tests {
             ReassembleResult::HandlerError(PktHandlerError::Tlast) => {}
             other => panic!("expected Tlast, got {:?}", other),
         }
+
+        // Recovery: missing-TLAST -> transition_after_complete(false) -> Idle.
+        // A fresh valid packet must reassemble cleanly afterward.
+        let header2 = build_test_header(0x100, 0, 0, 0); // 0x100, 1 bit, odd parity OK
+        assert!(matches!(r.feed_word(header2, false), ReassembleResult::Pending));
+        match r.feed_word(0x55, true) {
+            ReassembleResult::Complete(pkt) => assert_eq!(pkt.data[0], 0x55),
+            other => panic!("expected Complete after recovery, got {:?}", other),
+        }
     }
 
     #[test]
