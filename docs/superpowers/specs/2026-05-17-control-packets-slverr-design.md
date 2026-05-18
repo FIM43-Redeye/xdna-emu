@@ -216,9 +216,11 @@ pub fn ctrl_pkt_offset_decodes(&self, row: u8, offset: u32) -> bool {
 
 /// A read of `count` consecutive registers from `offset` decodes iff
 /// every beat decodes. Any undecoded beat -> SLVERR, whole response
-/// suppressed.
+/// suppressed. `count == 0` is a header-only read (no register access,
+/// mirroring `handle_read_registers`) and is vacuously decodable --
+/// it cannot raise SLVERR.
 pub fn ctrl_pkt_read_range_decodes(&self, row: u8, offset: u32, count: u8) -> bool {
-    (0..count.max(1) as u32).all(|i| self.ctrl_pkt_offset_decodes(row, offset + i * 4))
+    (0..count as u32).all(|i| self.ctrl_pkt_offset_decodes(row, offset + i * 4))
 }
 ```
 
