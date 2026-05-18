@@ -196,8 +196,25 @@ impl StreamReassembler {
                     if tlast { " TLAST" } else { "" }
                 );
 
-                if beats_collected >= header.beats {
-                    // All beats received -- build the complete packet.
+                let is_final_beat = beats_collected >= header.beats;
+
+                // TLAST must land exactly on the final declared beat for
+                // write-class packets. Read packets never reach Collecting
+                // (they complete in the Idle arm), so this check covers all
+                // reachable opcodes.
+                if tlast && !is_final_beat {
+                    // Unexpected early TLAST -- hardware sets Tlast_Error (bit 3).
+                    self.transition_after_complete(true);
+                    return ReassembleResult::HandlerError(PktHandlerError::Tlast);
+                }
+                if is_final_beat && !tlast {
+                    // Missing TLAST on the final beat -- hardware sets Tlast_Error (bit 3).
+                    self.transition_after_complete(false);
+                    return ReassembleResult::HandlerError(PktHandlerError::Tlast);
+                }
+
+                if is_final_beat {
+                    // All beats received with correct TLAST -- build the complete packet.
                     let payload = &data[..beats_collected as usize];
                     let packet = match header.opcode {
                         CtrlOpCode::Write | CtrlOpCode::BlockWrite => {
@@ -339,18 +356,25 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_packets_without_tlast() {
+    fn consecutive_packets_back_to_back() {
+        // Two write packets in the same stream. Each must assert TLAST on its
+        // own final beat; the test checks that after the first packet completes
+        // the reassembler is ready for the second header immediately.
         let mut r = StreamReassembler::new(0, 2);
 
-        // First packet: write 1 word, no TLAST
+        // First packet: write 1 word, TLAST on final beat.
+        // (Old test used tlast=false on the final beat, which is a protocol
+        // violation. Corrected to true -- hardware requires TLAST on the final
+        // declared beat of every write-class packet.)
         let h1 = build_test_header(0x100, 0, 0, 0);
         r.feed_word(h1, false);
-        match r.feed_word(0xAA, false) {
+        match r.feed_word(0xAA, true) {
             ReassembleResult::Complete(pkt) => assert_eq!(pkt.data[0], 0xAA),
             other => panic!("Expected Complete, got {:?}", other),
         }
 
-        // Second packet in same stream: another write
+        // Second packet in same stream: another write.
+        // build_test_header(0x200,0,0,0) = 0x00000200 = 1 set bit (odd, valid).
         let h2 = build_test_header(0x200, 0, 0, 0);
         r.feed_word(h2, false);
         match r.feed_word(0xBB, true) {
@@ -451,6 +475,61 @@ mod tests {
         // build_test_header sets no parity bit; word = 0x00000100, count_ones=1 (odd) -> valid.
         let header = build_test_header(0x100, 0, 0, 0);
         assert!(matches!(r.feed_word(header, false), ReassembleResult::Pending));
+    }
+
+    #[test]
+    fn missing_final_tlast_on_write_sets_tlast_error() {
+        use crate::device::control_packets::status::PktHandlerError;
+        let mut r = StreamReassembler::new(0, 2);
+        // 1-beat write. build_test_header(0x100,0,0,0) = 0x00000100 = 1 set bit (odd, valid).
+        let header = build_test_header(0x100, 0, 0, 0);
+        assert!(matches!(r.feed_word(header, false), ReassembleResult::Pending));
+        // Final beat WITHOUT tlast -- hardware would set Tlast_Error (bit 3).
+        match r.feed_word(0xDEAD_BEEF, false) {
+            ReassembleResult::HandlerError(PktHandlerError::Tlast) => {}
+            other => panic!("expected Tlast, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn early_tlast_on_multibeat_write_sets_tlast_error() {
+        use crate::device::control_packets::status::PktHandlerError;
+        let mut r = StreamReassembler::new(0, 2);
+        // 3-beat write (length_field=2 -> beats=3).
+        // build_test_header(0x101,2,0,0) = 0x00200101 = 3 set bits (odd, valid).
+        let header = build_test_header(0x101, 2, 0, 0);
+        assert!(matches!(r.feed_word(header, false), ReassembleResult::Pending));
+        // TLAST on beat 1 of 3 -- unexpected early TLAST.
+        match r.feed_word(0x11, true) {
+            ReassembleResult::HandlerError(PktHandlerError::Tlast) => {}
+            other => panic!("expected Tlast, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn correct_final_tlast_completes_normally() {
+        let mut r = StreamReassembler::new(0, 2);
+        // build_test_header(0x100,0,0,0) = 0x00000100 = 1 set bit (odd, valid).
+        let header = build_test_header(0x100, 0, 0, 0);
+        r.feed_word(header, false);
+        // Final beat WITH tlast -- correct.
+        match r.feed_word(0x42, true) {
+            ReassembleResult::Complete(pkt) => assert_eq!(pkt.data[0], 0x42),
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn read_packet_needs_no_tlast() {
+        // OP_READ completes at the header (Idle arm); TLAST on the header beat
+        // is irrelevant to Collecting-arm TLAST validation -- no Tlast error.
+        let mut r = StreamReassembler::new(0, 2);
+        // build_test_header(0x300,0,1,0): 0x300=2 bits + op=1 bit = 3 bits (odd, valid).
+        let header = build_test_header(0x300, 0, 1, 0);
+        match r.feed_word(header, false) {
+            ReassembleResult::Complete(pkt) => assert_eq!(pkt.opcode, CtrlOpCode::Read),
+            other => panic!("expected Complete, got {:?}", other),
+        }
     }
 
     // Helper: build a control packet header word.
