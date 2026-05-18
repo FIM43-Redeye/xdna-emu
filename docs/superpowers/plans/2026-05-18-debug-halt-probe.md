@@ -446,9 +446,40 @@ Generated using Claude Code."
 
 ---
 
-## Task 5: Experiment 1 — hardware run, derive G1, open the findings doc [HARDWARE FORK]
+## Task 5: Experiment 1 — objectfifo-gate redesign + re-derive TRAP_PC (EMU)
 
-**Goal:** Run the redesigned armed probe on the real NPU; the core halts at the trap; control-packet OP_READ reads `output_buffer` + `Core_Status` while halted; the schedule-derived verdict yields the authoritative G1 (before/after-commit). This is the first exercise of read-while-halted (EMU could not validate it).
+> **REVISION (Task 5 HW attempt 1 failed: arming race).** The first HW run did not halt — the core is enabled by the CDO before `@seq` runs, so it completed before the `@seq` arming `write32`s landed (`Core_Status=0x100000` CORE_DONE). Toolchain grounding (spec §4.2) rejected host-lock-release, CDO debug-reg init, and memory-poll gates; the robust fix is a **blocking objectfifo gate**. This Task 5 implements that gate (EMU); Task 5b re-runs on hardware.
+
+**Goal:** Add a host→core blocking objectfifo gate so the core cannot execute its first real instruction until the host has (1) issued the arming `write32`s then (2) fed the gate. Re-derive `TRAP_PC` + the slot⇄schedule map from the gated build's fresh disasm (the schedule changes). EMU-validate the no-trap baseline (EMU still can't arm — write-side gap — so EMU expects `NO_TRAP_OR_RAN_TO_END` once the gate is fed; this validates the gate plumbing + readback, not halt).
+
+**Files:** Modify `mlir-aie/test/npu-xrt/debug_halt_probe/{aie.mlir,test.cpp,README.md}`. Reference patterns (read-only): `/home/triple/npu-work/mlir-aie/test/aiecc/cpp_basic.mlir` and `/home/triple/npu-work/mlir-aie/programming_examples/vision/vision_passthrough/aie2_lineBased_8b_tiny.mlir` (canonical host→core objectfifo-feed via runtime-sequence `dma_memcpy_nd`).
+
+- [ ] **Step 1: Add the gate objectfifo.** Define a 1-element shim→compute objectfifo `@gate` (host/shim producer → tile (0,2) consumer, `memref<1xi32>`), modeled on the cited examples. The core's FIRST op becomes `aie.objectfifo.acquire @gate(Consume,1)` (blocks on `llvm.aie2.acquire`, a HW pipeline stall) then `aie.objectfifo.release @gate(Consume,1)`, then the existing 4 marker stores + `aie.end`. Keep the Task-3 breakpoint-arming `write32`s in `@seq` and the Task-4 control-packet OP_READ readback plumbing. In `@seq`, order: arming `write32`s (0x32020/0x32018) → `dma_memcpy_nd` feeding `@gate` → the OP_READ readback push → `dma_wait{@ctrl0}`. (Runtime-sequence order is an in-order guarantee per `AIEToConfiguration`.) Preserve SPDX, aie-rt citations, TRAP_PC/OUTBUF_ADDR re-derivation warnings; no `@out0`/lock-gated-DMA reintroduction. Add a host gate-buffer BO arg.
+
+- [ ] **Step 2: Re-derive TRAP_PC + slot⇄schedule map.** The gate changes the compiled core. Disassemble the new core ELF (`tools/llvm-objdump-aie -d <chess prj>/main_core_0_2.elf`), identify the bundle that stores `0xBB(187)` to the slot-1 store (the trap), record the new `TRAP_PC`, `TRAP_PC14 = TRAP_PC & 0x3FFF`, new `PC_Event0 value = 0x80000000 | TRAP_PC14`, and the new strictly-later slot/PC. Update the `write32 0x32020` value and the test.cpp schedule-comment + verdict slot mapping accordingly. Update the in-artifact TRAP_PC warning text with the new derivation. If the disasm can't unambiguously identify the 0xBB-to-slot1 store, STOP and report.
+
+- [ ] **Step 3: EMU run — validate gate plumbing + no-trap baseline.** `cd /home/triple/npu-work/xdna-emu && ./scripts/emu-bridge-test.sh debug_halt_probe --chess-only --no-hw 2>&1 | tee /tmp/claude-1000/probe-exp1-gate-emu.log`. EMU: the gate must be fed by `@seq` so the core unblocks and runs (confirm it does — a stuck gate hangs EMU too); EMU still drops the arming writes so expect the markers all written, `CORE_STATUS=0x0` (read-side gap), `HALTED=0`, `TRAP_VERDICT:NO_TRAP_OR_RAN_TO_END`, bridge `PASS`. This validates the gate + readback plumbing end-to-end on EMU. Record exact lines. If EMU hangs, the gate isn't being fed correctly — debug before any HW.
+
+- [ ] **Step 4: Update README** (gate mechanism, new TRAP_PC, EMU baseline meaning, that Task 5b is the HW run). Commit (single, from `/home/triple/npu-work/mlir-aie`, `git add test/npu-xrt/debug_halt_probe/`):
+```
+debug_halt_probe: Exp1 -- blocking objectfifo gate (fix arming race) + re-derive TRAP_PC
+
+HW attempt 1 raced (core CDO-enabled before @seq arming landed). Add a
+host->core blocking objectfifo gate (llvm.aie2.acquire HW stall, immune
+to load-elimination); @seq arms then feeds the gate (in-order
+guarantee). Re-derived TRAP_PC/slot map from the gated build's disasm.
+EMU validates gate+readback plumbing (no-trap baseline); HW is Task 5b.
+
+Generated using Claude Code.
+```
+
+**Report:** the new TRAP_PC/TRAP_PC14/PC_Event0 value and how the 0xBB-slot1 store was identified; exact EMU `SLOTS:`/`CORE_STATUS`/`TRAP_VERDICT` lines; gate-feed confirmed (core unblocks, no EMU hang); preservation confirmations; commit SHA; concerns.
+
+---
+
+## Task 5b: Experiment 1 — hardware run, derive G1, open the findings doc [HARDWARE FORK]
+
+**Goal:** Run the gated+armed probe on the real NPU; the gate guarantees arming-before-core-run; the core halts at the trap; control-packet OP_READ reads `output_buffer` + `Core_Status` while halted; the schedule-derived verdict yields the authoritative G1 (before/after-commit). This is the first exercise of read-while-halted (EMU could not validate it).
 
 **Files:** Create `xdna-emu/docs/superpowers/findings/2026-05-18-debug-halt-timing-and-single-step-count.md`
 

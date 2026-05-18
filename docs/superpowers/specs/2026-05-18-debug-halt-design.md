@@ -174,7 +174,38 @@ disassembly* (not source order) and kept fresh via the TRAP_PC
 re-derivation discipline already committed in Task 3. For the current
 build the schedule is: `0x114` trap → `output_buffer[1]=0xBB`; strictly
 later `0x11c` → `output_buffer[0]=0xAA`; then `[3]=done`; then
-`[2]=0xCC`.
+`[2]=0xCC` (this schedule is for the pre-gate build; the objectfifo
+gate below changes it — re-derived per the TRAP_PC discipline).
+
+**Arming-race discovery (Phase A, Task 5 hardware run) + the gate.**
+The first hardware run did not halt: `Core_Status=0x100000` (CORE_DONE),
+all markers written. Root cause, confirmed by toolchain grounding: the
+compute core is enabled by the **CDO**, *before* the host
+`aie.runtime_sequence @seq` executes (`AIETargetCDODirect.cpp`,
+`AIERT.cpp addCoreEnable()`). With the entry lock immediately
+satisfied, the tiny core ran to completion in nanoseconds — long before
+the `@seq` control-packet arming `write32`s reached the tile. No
+`@seq`-only ordering can win this race. Two framed fixes were grounded
+and **rejected**: there is no host lock-release op (`aiex` dialect has
+none), and no mlir-aie construct emits arbitrary debug-register writes
+into the CDO. A naive memory-poll gate was also rejected: AIE2 has no
+honored volatile/fence, so a spin-wait load is hoisted/eliminated (the
+same wall that killed force-ordering).
+
+The supported, robust fix is a **blocking objectfifo gate**: the core's
+first op is `aie.objectfifo.acquire(@gate, Consume, 1)`, which lowers to
+the `llvm.aie2.acquire` hardware-blocking intrinsic (a real pipeline
+stall, immune to load-elimination — same primitive class as the core's
+existing `use_lock`). `@seq` issues the arming `write32`s **then** a
+`dma_memcpy_nd` that feeds `@gate`; runtime-sequence ordering is a
+documented in-order guarantee (control-packet then DMA, preserved by
+`AIEToConfiguration`). The core therefore cannot execute its first real
+instruction until the host has armed the breakpoint and then released
+the gate. Adding the gate changes the compiled schedule, so `TRAP_PC`
+and the slot⇄order map are re-derived from a fresh disasm (the Task-3
+re-derivation discipline is exactly this mechanism). Bound: if a HW run
+*still* does not halt despite the documented ordering guarantee, G1
+becomes a tracked §8 forward-commitment rather than a further redesign.
 
 Observation is **control-packet OP_READ while the core is halted**
 (core-independent; the lock-gated DMA is unusable per the discovery):
