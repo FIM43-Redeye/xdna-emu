@@ -120,10 +120,20 @@ NPU instruction stream carries, so the identical probe binary runs on
 EMU and HW. **No `AIE_RW_ACCESS`** anywhere (avoids the
 mailbox-poisoning path the calibration-feedback memory warns against).
 
-The decisive observation is plain output-BO readback: the kernel writes
-sentinel markers to a buffer; the host reads the buffer back through the
-normal XRT path. Control-packet `ReadRegisters` of Core_PC /
-Core_Status / Debug_Status is corroborating, not load-bearing.
+**Observation is control-packet readback while the core is halted, and
+this is load-bearing (revised — see 4.2 discovery).** The original
+design used lock-gated DMA / plain output-BO readback as the decisive
+path with control-packet `ReadRegisters` as mere corroboration. Phase A
+execution (Task 3) proved that wrong: a working breakpoint halts the
+core *before* it releases the lock that gates the marker DMA, so any
+output-BO/DMA readback hangs forever and wedges the device. The only
+core-independent way to read tile state while halted is the
+control-packet OP_READ path (it reads tile data memory and registers
+directly; emulator `registers.rs` `read_register_pure`, with prior art
+in `add_one_ctrl_packet`). Control-packet readback of the marker buffer
+*and* Core_Status is therefore the primary observation. (This promotes
+what 4.3 earlier deferred as YAGNI to load-bearing — justified by the
+discovered flaw.)
 
 Run order: EMU-first (harness shakeout, expected-behavior baseline),
 then a single HW session. NPU recovery staged per CLAUDE.md
@@ -133,22 +143,64 @@ secured before the exploratory pokes.
 
 ### 4.2 Experiment 1 — halt timing (G1)
 
-Kernel writes distinct markers at three known bundles:
-`mem[0]=0xAA` (pre-trap), `mem[1]=0xBB` (the trap bundle),
-`mem[2]=0xCC` (post-trap). The trap bundle's 14-bit PC is obtained from
-`llvm-objdump -d` of the compiled core ELF (map the `mem[1]` store to
-its bundle PC; PC_Event matches the low 14 bits).
+**Discovery (Phase A, Task 3).** Two fatal flaws in the original Exp1
+mechanism surfaced once the compiled core was disassembled, both masked
+on EMU (the emulator drops control-packet writes to debug registers
+into a `write_core_register` catch-all, so EMU never arms the
+breakpoint — itself a recorded Phase B input: the control-packet →
+`core_debug` register-write routing is unwired). The flaws:
 
-Control packets, before core start: `PC_Event0 = VALID | addr(bundle_1)`;
-`Debug_Control2[0]=1` (PC_Event_Halt). Start core. Readback:
+1. *Source order ≠ schedule order.* The compiler reorders the marker
+   stores; the trap-marker store was scheduled **first**, not in the
+   middle. A source-order before/after model is inverted and misreads a
+   real trap as "no trap."
+2. *Lock-gated readback hangs on a halted core.* The marker DMA is
+   gated by a lock the core only releases after finishing; a working
+   breakpoint halts the core before that release, so DMA/output-BO
+   readback blocks forever and wedges the NPU.
 
-- `mem[1]==0xBB` → trap bundle committed → **halt is after-commit**.
-- `mem[1]==0` and `mem[0]==0xAA` → **halt is before-commit**.
-- `mem[2]` must be `0` either way (core halted).
+Forcing the compiler to preserve source store order was investigated
+and rejected: no MLIR-level mechanism reliably pins it (`chess_separator`
+is a Peano no-op; mlir-aie does not lower `volatile` memref semantics;
+RAW chains fall to alias analysis), and our own disasm empirically
+confirms reordering. The redesign therefore does **not** fight the
+scheduler.
 
-Then resume (clear `Debug_Control2[0]` or drive a
-`Debug_Resume_Core_Event`) and confirm `mem[2]==0xCC` post-resume —
-validates the resume path end-to-end on silicon as a bonus.
+**Redesigned mechanism.** The kernel writes four distinct markers to
+distinct `output_buffer` slots. The trap bundle (where `PC_Event0` is
+armed, `Debug_Control2[0]=1`) is identified from `llvm-objdump-aie` of
+the compiled core, with the slot⇄schedule-order map *derived from that
+disassembly* (not source order) and kept fresh via the TRAP_PC
+re-derivation discipline already committed in Task 3. For the current
+build the schedule is: `0x114` trap → `output_buffer[1]=0xBB`; strictly
+later `0x11c` → `output_buffer[0]=0xAA`; then `[3]=done`; then
+`[2]=0xCC`.
+
+Observation is **control-packet OP_READ while the core is halted**
+(core-independent; the lock-gated DMA is unusable per the discovery):
+read the four `output_buffer` slots *and* `Core_Status` (0x32004). The
+verdict is computed from the disassembled schedule:
+
+- trap slot (`[1]`) committed, no strictly-later slot written, and
+  `Core_Status` shows enabled+debug-halted → **halt is after-commit**.
+- trap slot not committed, `Core_Status` shows enabled+debug-halted →
+  **halt is before-commit**.
+- `Core_Status` reading disambiguates "before-commit" from "core never
+  ran" (all-zero buffer is otherwise ambiguous).
+- all four slots written / not debug-halted → breakpoint did not fire
+  (`NO_TRAP_OR_RAN_TO_END`).
+
+**EMU limitation (accepted).** Because EMU drops the breakpoint-arming
+writes, EMU cannot produce a halted state. EMU therefore validates only
+the readback *mechanism* and the no-trap baseline; the read-*while-
+halted* semantics and the G1 answer itself are first exercised on
+hardware. This is understood, not a flaw — HW is the ground truth for
+G1 regardless.
+
+Resume is not exercised by this probe (a runtime sequence cannot
+deassert the breakpoint mid-run and re-observe); it stays in-emulator-
+tested + Phase-B-revalidated, with hardware resume-verification a
+tracked Section 8 forward-commitment.
 
 ### 4.3 Experiment 2 — Single_Step_Count characterization (G2)
 

@@ -363,64 +363,146 @@ Generated using Claude Code."
 
 ---
 
-## Task 4: Experiment 1 — hardware run, derive G1, open the findings doc
+> **REVISION (2026-05-18, post-Task-3 discovery).** Tasks 1–3 are done and remain valid (kernel, breakpoint arming at the disasm-derived TRAP_PC, the TRAP_PC re-derivation discipline). Task 3 exposed two fatal flaws in the original Exp1 observation/verdict (spec §4.2 "Discovery"): (1) the compiler reorders the marker stores so a source-order verdict is inverted; (2) the lock-gated marker DMA hangs forever on a halted core (NPU-wedge). Force-ordering was investigated and rejected (no MLIR-level pin; empirically confirmed). The redesign — confirmed with Maya — is: observe via **control-packet OP_READ while the core is halted** (core-independent; prior art `add_one_ctrl_packet`), and compute the verdict from the **disassembled schedule** + `Core_Status`, not source order. Tasks 4–8 below replace the old Tasks 4–7.
 
-**Goal:** Run the armed probe on the real NPU, read the markers back, determine before-vs-after-commit on silicon, and record it as the authoritative G1 finding.
+## Task 4: Rebuild Exp1 observation — control-packet readback + schedule-derived verdict (EMU)
+
+**Goal:** Replace the lock-gated-DMA observation with control-packet OP_READ of the marker buffer + `Core_Status` (works on a halted core), and a verdict computed from the disassembled schedule. EMU-validate the readback *mechanism* and the no-trap baseline (EMU cannot halt — it drops the breakpoint-arming writes — so read-while-halted is first exercised on hardware in Task 5).
 
 **Files:**
-- Create: `xdna-emu/docs/superpowers/findings/2026-05-18-debug-halt-timing-and-single-step-count.md`
+- Modify: `mlir-aie/test/npu-xrt/debug_halt_probe/aie.mlir` (add control-packet read plumbing; keep the Task 2 4-marker core and the Task 3 breakpoint-arming writes)
+- Modify: `mlir-aie/test/npu-xrt/debug_halt_probe/test.cpp` (assemble read control packets, parse responses, schedule-derived verdict)
+- Modify: `mlir-aie/test/npu-xrt/debug_halt_probe/README.md` (observation-path + verdict description)
+- Reference (read-only, the verified template): `/home/triple/npu-work/mlir-aie/test/npu-xrt/add_one_ctrl_packet/{aie.mlir,test.cpp}`
 
-- [ ] **Step 1: Pre-flight the hardware**
+- [ ] **Step 1: Study the control-packet read template**
 
-Confirm no other HW suite is running. Smoke-test the device: `xrt-smi validate` (expect pass). If it fails, recover: `pkexec sh -c 'modprobe -r amdxdna && modprobe amdxdna'`, re-validate. Do not proceed until the device is healthy.
+Read `add_one_ctrl_packet/aie.mlir` and `test.cpp` fully. The verified facts to reuse:
+- aie.mlir control-packet read plumbing: `aie.packet_flow(0x1)` shim DMA:0 → tile TileControl:0 (host→tile ctrl packets); `aie.packet_flow(0x2)` tile TileControl:0 → shim DMA:0 (tile→host responses); `aie.shim_dma_allocation @ctrl0 (%tile_0_0, S2MM, 0)`; runtime-sequence `dma_memcpy_nd(... metadata=@ctrl0)` + `dma_wait{symbol=@ctrl0}` and the blockwrite/address_patch/sync push sequence (lines 110–155).
+- Control-packet header word (xdna-emu `src/device/control_packets/parser.rs:9-14`): `[31] parity`, `[30:24] response/stream id`, `[23:22] operation` (OP_READ = `0x1`), `[21:20] length` (value = beats−1; beats = words to read), `[19:0] tile-local address`. OP_READ returns the addressed words back through the TileControl→shim response path; for addresses below the tile data-memory size (0x10000 for a compute tile) it reads **tile data memory** (`registers.rs:98-110`). `add_one_ctrl_packet/test.cpp` (read-packet assembly + parity, ~lines 93-136 and the ctrlOut validation ~164-186) is the concrete model — read it verbatim and reuse its packet-assembly idiom.
+
+- [ ] **Step 2: Determine `output_buffer`'s tile-local control-packet address**
+
+From the Task 3 disasm (`/tmp/claude-1000/probe-disasm.txt` or re-run `tools/llvm-objdump-aie -d` on the core ELF), `p0` = the `output_buffer` base in the core's 20-bit address space (recorded as `0x70400` in Task 3). The control-packet OP_READ address is the **tile-local data-memory offset** (the low bits within the 0x0000–0xFFFF compute data-memory window — i.e. `0x70400 & 0xFFFF = 0x0400`, the same form `add_one_ctrl_packet` uses when it reads `other_buffer` at `0x440`). Record `OUTBUF_ADDR` (expected `0x0400`; confirm against the aiecc allocation / by the EMU readback in Step 5 returning the known marker values — if the read returns garbage, the address is wrong, re-derive). Slots: `output_buffer[k]` at `OUTBUF_ADDR + 4*k`. `Core_Status` is register `0x32004`.
+
+- [ ] **Step 3: Add the control-packet read plumbing to aie.mlir**
+
+Add (modeled verbatim on `add_one_ctrl_packet/aie.mlir`): the `aie.packet_flow(0x1)` and `aie.packet_flow(0x2)` TileControl flows for tile (0,2), `aie.shim_dma_allocation @ctrl0 (%tile_0_0, S2MM, 0)`, and a second runtime-sequence argument for the ctrl-response BO. Keep the existing Task 2 4-marker core and the Task 3 `aiex.npu.write32` breakpoint-arming writes (PC_Event0=0x80000114, Debug_Control2=0x1) unchanged and still before the core is released. The `@seq` now also issues the read-control-packet DMA push (the blockwrite/address_patch/sync idiom from the template) and `dma_wait{symbol=@ctrl0}` so responses land in the ctrl-response BO. Do NOT remove the existing `@out0` marker-DMA path yet — leave it as a secondary (it will simply never fire when halted; harmless in the no-trap EMU baseline where it still works). Preserve SPDX headers and the aie-rt citation comments.
+
+- [ ] **Step 4: Rewrite test.cpp — assemble read packets, parse responses, schedule-derived verdict**
+
+Allocate the ctrl-in (read-request packets) and ctrl-out (response) BOs per the `add_one_ctrl_packet/test.cpp` group-id idiom (verify indices against the aiecc-generated signature). Assemble OP_READ control packets (parity per the template) requesting: the 4 `output_buffer` slots (`OUTBUF_ADDR + 4*k`, k=0..3) and `Core_Status` (0x32004). Parse the response words from the ctrl-out BO.
+
+Verdict — computed from the **committed disassembled schedule** (Task 3 / spec §4.2), NOT source order. For the current build: trap bundle `0x114` stores `output_buffer[1]=0xBB`; strictly-later `0x11c` stores `output_buffer[0]=0xAA`; later still `[3]=1`, `[2]=0xCC`. Let `s = output_buffer` slots, `cs = Core_Status`. `HALTED` ≡ `cs` bit16 (Debug_Halt) set AND bit0 (Enable) set:
+
+```cpp
+  // Schedule (from llvm-objdump-aie, see aie.mlir TRAP_PC comment):
+  //   trap bundle 0x114 -> s[1]=0xBB ; strictly-later 0x11c -> s[0]=0xAA
+  //   later -> s[3]=1 ; later -> s[2]=0xCC
+  bool halted = (cs & (1u<<16)) && (cs & (1u<<0));
+  std::cout << "SLOTS: s0=" << s[0] << " s1=" << s[1]
+            << " s2=" << s[2] << " s3=" << s[3]
+            << " CORE_STATUS=0x" << std::hex << cs << std::dec
+            << " HALTED=" << (halted?1:0) << "\n";
+  std::cout << "TRAP_VERDICT:";
+  if (!halted) {
+    if (s[0]==0xAA && s[1]==0xBB && s[2]==0xCC && s[3]==1)
+      std::cout << "NO_TRAP_OR_RAN_TO_END\n";        // breakpoint never fired
+    else
+      std::cout << "ANOMALY_NOT_HALTED\n";           // record verbatim
+  } else if (s[1]==0xBB && s[0]==0 && s[2]==0 && s[3]==0) {
+    std::cout << "AFTER_COMMIT\n";   // trap store committed, nothing later did
+  } else if (s[1]==0 && s[0]==0 && s[2]==0 && s[3]==0) {
+    std::cout << "BEFORE_COMMIT\n";  // halted, trap store did NOT commit
+  } else {
+    std::cout << "AMBIGUOUS\n";      // unexpected combo -- record verbatim
+  }
+  std::cout << "PASS\n";             // bridge-harness pass token (emu-bridge-test.sh grep)
+  return 0;
+```
+
+- [ ] **Step 5: EMU run — validate the readback mechanism + no-trap baseline**
+
+Run: `cd /home/triple/npu-work/xdna-emu && ./scripts/emu-bridge-test.sh debug_halt_probe --chess-only --no-hw 2>&1 | tee /tmp/claude-1000/probe-exp1-readback-emu.log`
+
+EMU drops the breakpoint-arming writes (`write_core_register` catch-all), so the core runs to completion: expected `SLOTS: s0=170 s1=187 s2=204 s3=1`, `CORE_STATUS` not debug-halted, `TRAP_VERDICT:NO_TRAP_OR_RAN_TO_END`, bridge `PASS`. This proves the control-packet readback mechanism returns correct tile-data-memory + Core_Status values end-to-end. If the slots read back as garbage, `OUTBUF_ADDR` is wrong (Step 2) — re-derive. Record the exact lines. (Read-while-halted is unverifiable on EMU by construction; that is Task 5's job on hardware.)
+
+- [ ] **Step 6: Commit**
+
+```bash
+cd /home/triple/npu-work/mlir-aie
+git add test/npu-xrt/debug_halt_probe/
+git commit -m "debug_halt_probe: Exp1 redesign -- control-packet readback + schedule-derived verdict
+
+Lock-gated DMA readback hangs on a halted core (Task 3 discovery);
+source-order verdict is inverted by compiler store-reordering. Replace
+with control-packet OP_READ of output_buffer + Core_Status (works on a
+halted core, prior art add_one_ctrl_packet) and a verdict computed from
+the disassembled schedule. EMU validates the readback mechanism + the
+no-trap baseline; read-while-halted is hardware-first (Task 5).
+
+Generated using Claude Code."
+```
+
+---
+
+## Task 5: Experiment 1 — hardware run, derive G1, open the findings doc [HARDWARE FORK]
+
+**Goal:** Run the redesigned armed probe on the real NPU; the core halts at the trap; control-packet OP_READ reads `output_buffer` + `Core_Status` while halted; the schedule-derived verdict yields the authoritative G1 (before/after-commit). This is the first exercise of read-while-halted (EMU could not validate it).
+
+**Files:** Create `xdna-emu/docs/superpowers/findings/2026-05-18-debug-halt-timing-and-single-step-count.md`
+
+- [ ] **Step 1: Pre-flight the hardware.** No other HW suite running. `xrt-smi validate` (expect pass). If it fails: `pkexec sh -c 'modprobe -r amdxdna && modprobe amdxdna'`, re-validate. Do not proceed until healthy.
 
 - [ ] **Step 2: Run the armed probe on hardware**
 
-Run: `cd /home/triple/npu-work/xdna-emu && ./scripts/emu-bridge-test.sh debug_halt_probe --chess-only 2>&1 | tee /tmp/claude-1000/probe-exp1-hw.log`
-(no `--no-hw` → HW run; the script also reruns EMU for comparison.)
+`cd /home/triple/npu-work/xdna-emu && ./scripts/emu-bridge-test.sh debug_halt_probe --chess-only 2>&1 | tee /tmp/claude-1000/probe-exp1-hw.log`
 
-Read the HW `test.exe` output (`build/bridge-test-results/latest/debug_halt_probe.chess/hw/` or the tee'd log). Record the exact `MARKERS:` and `TRAP_VERDICT:` lines from the **hardware** run.
+Record the exact `SLOTS:` / `CORE_STATUS` / `TRAP_VERDICT:` lines from the **hardware** run. Interpretation:
+- `AFTER_COMMIT` → silicon halts after the trap bundle commits → the emulator's post-`update_pc` model is **proven correct** for sync traps.
+- `BEFORE_COMMIT` → silicon halts before the trap bundle commits → emulator after-commit model is a **real Phase B fidelity fix**.
+- `NO_TRAP_OR_RAN_TO_END` → breakpoint did not fire on HW: debug arming (PC mask, Debug_Control2 bit, ordering of the arming writes vs core release). Do **not** record a non-halted result as G1.
+- `ANOMALY_NOT_HALTED` / `AMBIGUOUS` → record the raw `SLOTS:`/`CORE_STATUS` verbatim; do not force a conclusion.
 
-Interpretation:
-- `TRAP_VERDICT:AFTER_COMMIT` → silicon halts after the trap bundle commits. The emulator's current model is **proven correct**.
-- `TRAP_VERDICT:BEFORE_COMMIT` → silicon halts before the trap bundle commits. The emulator's after-commit model is a **real fidelity bug** for synchronous traps (Phase B fix).
-- `AMBIGUOUS` / core ran to end → the breakpoint did not take effect on HW; debug the arming (ordering, PC mask, Debug_Control2 bit) and rerun. Do not record an ambiguous result as the finding.
-
-If the NPU wedges during the run, recover per the hardware-run guard and rerun once; if it wedges again, stop and surface to Maya.
+Wedge protocol: if the core halts and `run.wait()` times out leaving the device wedged, the control-packet read should still have completed before the timeout (it does not depend on the core). If the NPU wedges, recover per the hardware-run guard, rerun once; second wedge → stop and surface to Maya with the raw logs.
 
 - [ ] **Step 3: Write the findings doc (G1 section)**
 
-Create `xdna-emu/docs/superpowers/findings/2026-05-18-debug-halt-timing-and-single-step-count.md`:
+Create the findings doc:
 
 ```markdown
 # Findings: debug_halt halt-timing (G1) and single-step-count (G2)
 
 Source: Phase A hardware probe (`mlir-aie/test/npu-xrt/debug_halt_probe`),
-derived per spec `docs/superpowers/specs/2026-05-18-debug-halt-design.md`.
-Ground truth = real NPU1 (Phoenix) hardware.
+spec `docs/superpowers/specs/2026-05-18-debug-halt-design.md`. Ground
+truth = real NPU1 (Phoenix) hardware. Observation: control-packet
+OP_READ of output_buffer + Core_Status while the core is halted.
+Verdict: computed from the disassembled schedule (not source order).
 
 ## G1 — Breakpoint / single-step halt timing
 
-Experiment: PC_Event0 armed at the trap bundle (the bundle that stores
-0xBB to output slot 1), Debug_Control2[0]=1. Markers: out0=pre-trap,
-out1=trap-bundle, out2=post-trap, out3=ran-to-end sentinel.
+PC_Event0 armed at trap bundle 0x114 (stores 0xBB to output_buffer[1]),
+Debug_Control2[0]=1. Schedule: trap 0x114->s[1]=0xBB; strictly-later
+0x11c->s[0]=0xAA; later s[3]=1; later s[2]=0xCC.
 
-- EMU observed (current model): `<paste exact MARKERS/TRAP_VERDICT line>`
-- HW observed (ground truth):  `<paste exact MARKERS/TRAP_VERDICT line>`
+- HW observed: `<paste exact SLOTS / CORE_STATUS / TRAP_VERDICT line>`
+- EMU baseline (mechanism check, cannot halt): `<paste exact line>`
 
-**Conclusion:** On silicon, a synchronous PC-event breakpoint halts
+**Conclusion:** On silicon a synchronous PC-event breakpoint halts
 **<BEFORE|AFTER>** the trap bundle commits. <One sentence: emulator
-model is proven correct / is a fidelity bug to fix in Phase B.>
+model proven correct / Phase B fidelity fix; plus the recorded EMU
+finding that control-packet writes to debug regs are dropped by the
+write_core_register catch-all -- a separate Phase B routing input.>
 
-Raw logs: /tmp/claude-1000/probe-exp1-{emu,hw}.log (transcribed here;
-logs are ephemeral).
+Raw logs: /tmp/claude-1000/probe-exp1-{readback-emu,hw}.log
+(transcribed here; logs are ephemeral).
 
 ## G2 — Single_Step_Count (Debug_Control0[5:2])
 
-(Filled in Task 6.)
+(Filled in Task 7.)
 ```
 
-Fill every `<...>` with the real observed data — no placeholders left in the committed doc except the explicitly-marked G2 stub.
+No placeholders in the committed doc except the explicitly-marked G2 stub; fill every `<...>` with real observed data.
 
 - [ ] **Step 4: Commit**
 
@@ -429,9 +511,11 @@ cd /home/triple/npu-work/xdna-emu
 git add docs/superpowers/findings/2026-05-18-debug-halt-timing-and-single-step-count.md
 git commit -m "debug_halt findings: G1 halt-timing derived from hardware
 
-PC_Event breakpoint probe on real NPU1: silicon halts <BEFORE|AFTER>
-the trap bundle commits. EMU vs HW verdicts recorded. Determines the
-synchronous-trap halt boundary for Phase B.
+Redesigned probe on real NPU1: control-packet read of output_buffer +
+Core_Status while halted; schedule-derived verdict shows silicon halts
+<BEFORE|AFTER> the trap bundle commits. Determines the synchronous-trap
+halt boundary for Phase B; also records the EMU control-packet-write
+routing gap as a Phase B input.
 
 Generated using Claude Code."
 ```
@@ -440,17 +524,13 @@ Generated using Claude Code."
 
 ---
 
-## Task 5: Experiment 2 kernel + config matrix — count-based single-step
+## Task 6: Experiment 2 kernel + config matrix — count-based single-step (EMU)
 
-**Goal:** Reshape the probe to characterize `Debug_Control0[5:2]` (`Single_Step_Count`) as far as silicon reveals: a known-length straight-line marker run, plus a small config matrix written via control packets.
+**Goal:** Reshape the probe for `Debug_Control0[5:2]` (`Single_Step_Count`) characterization, **reusing the Task 4 control-packet readback infra** (count-step may also halt the core mid-sequence, so the lock-gated DMA is equally unusable here).
 
-**Files:**
-- Modify: `mlir-aie/test/npu-xrt/debug_halt_probe/aie.mlir` (core: N sequential markers; runtime sequence: Debug_Control0 count write)
-- Modify: `mlir-aie/test/npu-xrt/debug_halt_probe/test.cpp` (count how many markers landed)
+**Files:** Modify `mlir-aie/test/npu-xrt/debug_halt_probe/{aie.mlir,test.cpp,README.md}`
 
-- [ ] **Step 1: N-marker straight-line core**
-
-Replace the core body with 8 sequential distinct stores so "how many committed before halt" is directly countable:
+- [ ] **Step 1: 8-marker straight-line core.** Replace the core body with 8 sequential distinct stores (`output_buffer[0..7] = 101..108`):
 
 ```mlir
     %core_0_2 = aie.core(%tile_0_2) {
@@ -484,81 +564,65 @@ Replace the core body with 8 sequential distinct stores so "how many committed b
     }
 ```
 
-- [ ] **Step 2: Count-step config in the runtime sequence**
+Markers are NOT assumed to be in source order on-chip — Step 3's verdict counts *how many distinct markers landed*, which is order-independent (each value is unique), so count-step characterization does not depend on schedule order.
 
-Replace the Task 3 breakpoint arming in `@seq` with a single Debug_Control0 count write. The matrix is swept by editing this one value and rebuilding (documented in Step 4); start with `count=4`, count alone (no halt bit): `Debug_Control0 = (4 << 2) = 0x10`:
+- [ ] **Step 2: Count-step config in @seq.** Replace the Task 3 PC_Event0/Debug_Control2 arming writes with a single Debug_Control0 count write (keep the control-packet read plumbing from Task 4 intact). Start `count=4`, no halt bit: `Debug_Control0 = (4<<2) = 0x10`:
 
 ```mlir
-      // Debug_Control0: Single_Step_Count = N at bits [5:2], halt bit [0]=0.
-      // Matrix is swept by editing this value (see README / findings).
+      // Debug_Control0: Single_Step_Count = N at bits [5:2] (aie-rt
+      // XAIEMLGBL_CORE_MODULE_DEBUG_CONTROL0, xaiemlgbl_params.h:2452;
+      // SINGLE_STEP_COUNT bits 2-5, DEBUG_HALT_BIT bit 0). Matrix swept
+      // by editing this value (see README / findings).
       aiex.npu.write32 {address = 0x32010 : ui32, column = 0 : i32, row = 2 : i32, value = 0x10 : ui32}
 ```
 
-- [ ] **Step 3: Marker-count verdict in `test.cpp`**
-
-Replace the verdict block:
+- [ ] **Step 3: LANDED verdict via control-packet readback in test.cpp.** Reuse the Task 4 read-packet machinery. Read `output_buffer[0..7]` (8 slots, `OUTBUF_ADDR + 4*k`) and `Core_Status` via OP_READ. Verdict:
 
 ```cpp
-  bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-  uint32_t *out = bo_out.map<uint32_t *>();
   int landed = 0;
-  for (int i = 0; i < 8; i++)
-    if (out[i] == (uint32_t)(101 + i)) landed++;
-  std::cout << "MARKERS:";
-  for (int i = 0; i < 8; i++) std::cout << " " << out[i];
-  std::cout << "\nLANDED:" << landed << "\n";
-  // landed==8 -> count-step had no effect (all bundles ran)
-  // landed==N -> core halted after exactly N committed stores
-  // 0<landed<8, !=N -> partial/other; record verbatim
+  for (int k = 0; k < 8; k++) if (s[k] == (uint32_t)(101+k)) landed++;
+  bool halted = (cs & (1u<<16)) && (cs & (1u<<0));
+  std::cout << "SLOTS:";
+  for (int k=0;k<8;k++) std::cout << " " << s[k];
+  std::cout << " CORE_STATUS=0x" << std::hex << cs << std::dec
+            << " HALTED=" << (halted?1:0) << "\nLANDED:" << landed << "\n";
+  // landed==8 && !halted -> count-step had no effect (ran to completion)
+  // halted && landed==N   -> core halted after exactly N committed stores
+  // other                 -> partial/other; record SLOTS+CORE_STATUS verbatim
+  std::cout << "PASS\n";
   return 0;
 ```
 
-- [ ] **Step 4: EMU run + document the sweep matrix in README**
-
-Run: `cd /home/triple/npu-work/xdna-emu && ./scripts/emu-bridge-test.sh debug_halt_probe --chess-only --no-hw 2>&1 | tee /tmp/claude-1000/probe-exp2-emu.log`
-
-Record `LANDED:` for the `count=4, no-halt-bit` config. Append a "Experiment 2 sweep matrix" section to `debug_halt_probe/README.md` listing the configs to run on HW in Task 6, each with the exact `Debug_Control0` value:
-- `count=4, halt bit 0`: `0x10`
-- `count=4, halt bit 1`: `0x11`
-- `count=2, halt bit 0`: `0x08`
-- `count=8 (max-ish), halt bit 0`: `0x20`
-- `count=0`: `0x00` (control — must run all 8)
+- [ ] **Step 4: EMU run + document sweep matrix.** `cd /home/triple/npu-work/xdna-emu && ./scripts/emu-bridge-test.sh debug_halt_probe --chess-only --no-hw 2>&1 | tee /tmp/claude-1000/probe-exp2-emu.log`. EMU drops the Debug_Control0 write (catch-all), so expect `LANDED:8`, not halted (baseline: count-step inert in EMU — itself the recorded G2 EMU finding). Record exact lines. Append an "Experiment 2 sweep matrix" section to README listing the HW configs with exact `Debug_Control0` values: `count=4 no-halt 0x10`, `count=4 halt 0x11`, `count=2 no-halt 0x08`, `count=8 no-halt 0x20`, `count=0 control 0x00`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/triple/npu-work/mlir-aie && git add test/npu-xrt/debug_halt_probe/ && \
-cd /home/triple/npu-work/xdna-emu && git add docs/ 2>/dev/null; \
-cd /home/triple/npu-work/mlir-aie && git commit -m "debug_halt_probe: Exp2 -- N-marker count-step kernel + config matrix
+cd /home/triple/npu-work/mlir-aie
+git add test/npu-xrt/debug_halt_probe/
+git commit -m "debug_halt_probe: Exp2 -- count-step kernel + matrix (reuses ctrl-pkt readback)
 
-8 sequential distinct marker stores; runtime sequence writes
-Debug_Control0 Single_Step_Count. test.cpp reports LANDED count.
-EMU baseline recorded; HW sweep matrix documented in README.
+8 distinct marker stores; @seq writes Debug_Control0 Single_Step_Count;
+LANDED counted via the Task 4 control-packet readback (count-step can
+also halt the core, so lock-gated DMA is equally unusable). EMU baseline
+(count-step inert in EMU) recorded; HW sweep matrix in README.
 
 Generated using Claude Code."
 ```
 
-(README lives with the probe in `mlir-aie`; the `xdna-emu` git add is a no-op safety if the README were mirrored — the canonical README is in the probe dir.)
-
 ---
 
-## Task 6: Experiment 2 — hardware sweep, derive G2
+## Task 7: Experiment 2 — hardware sweep, derive G2 [HARDWARE FORK]
 
-**Goal:** Run the count-step config matrix on the real NPU and record what `Debug_Control0[5:2]` actually does on silicon, as far as it is observable.
+**Goal:** Sweep the count-step matrix on the real NPU; record what `Debug_Control0[5:2]` does on silicon as far as observable.
 
-**Files:**
-- Modify: `mlir-aie/test/npu-xrt/debug_halt_probe/aie.mlir` (one value per sweep point)
-- Modify: `xdna-emu/docs/superpowers/findings/2026-05-18-debug-halt-timing-and-single-step-count.md` (G2 section)
+**Files:** Modify `mlir-aie/test/npu-xrt/debug_halt_probe/aie.mlir` (one value per point); `xdna-emu/docs/superpowers/findings/2026-05-18-debug-halt-timing-and-single-step-count.md` (G2 section)
 
-- [ ] **Step 1: Pre-flight hardware** (same as Task 4 Step 1: `xrt-smi validate`, recover if needed.)
+- [ ] **Step 1: Pre-flight hardware** (as Task 5 Step 1: `xrt-smi validate`, recover if needed).
 
-- [ ] **Step 2: Run each matrix point on hardware**
+- [ ] **Step 2: Run each matrix point on hardware.** For each README-matrix config: set the `Debug_Control0` value in aie.mlir, run `./scripts/emu-bridge-test.sh debug_halt_probe --chess-only 2>&1 | tee /tmp/claude-1000/probe-exp2-hw-<cfg>.log` from `xdna-emu/`. Record `LANDED:` + full `SLOTS:`/`CORE_STATUS` per config. Recover only on wedge (hardware-run guard); recurring wedge on a config → record "config <X> wedges device" as a finding, skip to next.
 
-For each config in the README matrix: set the `Debug_Control0` value in `aie.mlir`, then run `cd /home/triple/npu-work/xdna-emu && ./scripts/emu-bridge-test.sh debug_halt_probe --chess-only 2>&1 | tee /tmp/claude-1000/probe-exp2-hw-<cfg>.log`. Record `LANDED:` and the full `MARKERS:` line for each. Recover the NPU between points only if it wedges (per the hardware-run guard); a clean run needs no recovery. If a wedge recurs on the same config, record "config <X> wedges the device" as itself a finding and skip to the next.
-
-- [ ] **Step 3: Fill the G2 section of the findings doc**
-
-Replace the G2 stub with a results table (config → EMU LANDED → HW LANDED → interpretation) and a conclusion stating, in plain terms, what is established about arm/decrement/expire/halt-bit-interaction and what remains unobservable. Explicitly mark the unobservable parts as "to be a documented modeling decision in Phase B" and note the Section 8 forward-commitment (silicon-fidelity revisit) applies if behavior is under-characterized.
+- [ ] **Step 3: Fill the G2 findings section.** Results table (config → EMU LANDED → HW LANDED/HALTED → interpretation) + a conclusion on arm/decrement/expire/halt-bit interaction and what stays unobservable. Mark unobservable edges "documented modeling decision in Phase B"; note the §8 forward-commitment (silicon-fidelity revisit) applies if under-characterized.
 
 - [ ] **Step 4: Commit**
 
@@ -569,73 +633,66 @@ cd /home/triple/npu-work/mlir-aie
 git add test/npu-xrt/debug_halt_probe/aie.mlir
 git commit -m "debug_halt findings: G2 count-step characterized on hardware
 
-Debug_Control0[5:2] config matrix swept on real NPU1. Results table +
-conclusion recorded; unobservable edges flagged for Phase B documented
-modeling decisions / Section 8 forward-commitment.
+Debug_Control0[5:2] matrix swept on real NPU1 (control-packet readback).
+Results table + conclusion; unobservable edges flagged for Phase B
+documented modeling decisions / Section 8 forward-commitment.
 
 Generated using Claude Code."
 ```
 
 ---
 
-## Task 7: Finalize findings, restore the probe to a re-runnable state, regroup checkpoint
+## Task 8: Finalize findings, restore the probe to a re-runnable state, regroup checkpoint
 
-**Goal:** Leave the probe as a clean permanent regression artifact, the findings doc complete, and an explicit handoff to the Phase B planning regroup.
+**Goal:** Leave the probe a clean permanent regression artifact, findings complete, explicit handoff to the Phase B planning regroup.
 
-**Files:**
-- Modify: `mlir-aie/test/npu-xrt/debug_halt_probe/{aie.mlir,README.md}`
-- Modify: `xdna-emu/docs/superpowers/findings/2026-05-18-debug-halt-timing-and-single-step-count.md`
+**Files:** Modify `mlir-aie/test/npu-xrt/debug_halt_probe/{aie.mlir,README.md}`; `xdna-emu/docs/superpowers/findings/2026-05-18-debug-halt-timing-and-single-step-count.md`
 
-- [ ] **Step 1: Restore the probe to the Experiment 1 armed state**
+- [ ] **Step 1: Restore the probe to the Exp1 redesigned armed state** (Task 4 end-state: 4-marker core, Task 3 breakpoint-arming writes, control-packet readback + schedule-derived verdict). Rationale: Exp1 is the deterministic regression-valuable config; Exp2's matrix is a swept investigation. README documents how to switch to the Exp2 core for re-investigation.
 
-Set `aie.mlir` back to the Experiment 1 configuration (Task 3: PC_Event0 armed at `TRAP_PC14`, Debug_Control2[0]=1, the 4-marker pre/trap/post/done core). Rationale: Exp 1 is the deterministic, low-risk, regression-valuable configuration; Exp 2's matrix is a swept investigation, not a single regression state. README documents how to switch to the Exp 2 core for re-investigation.
+- [ ] **Step 2: EMU re-run** confirms the restored probe reproduces its recorded EMU baseline (`SLOTS: 170 187 204 1`, `NO_TRAP_OR_RAN_TO_END`, `PASS`): `./scripts/emu-bridge-test.sh debug_halt_probe --chess-only --no-hw 2>&1 | tee /tmp/claude-1000/probe-final-emu.log`.
 
-- [ ] **Step 2: EMU re-run confirms the restored probe still passes its known verdict**
-
-Run: `cd /home/triple/npu-work/xdna-emu && ./scripts/emu-bridge-test.sh debug_halt_probe --chess-only --no-hw 2>&1 | tee /tmp/claude-1000/probe-final-emu.log`
-
-Confirm the `TRAP_VERDICT:` line matches the EMU verdict recorded in the findings doc G1 section (the probe is now a stable regression: re-running it reproduces the recorded EMU behavior).
-
-- [ ] **Step 3: Finalize the findings doc**
-
-Add a closing "Phase B inputs" section that states, as direct instructions to the Phase B plan: (a) the synchronous-trap halt boundary to implement (from G1); (b) the count-step semantics to implement + the explicit list of documented modeling decisions for unobservable edges (from G2); (c) whether the Section 8 forward-commitment is triggered. No placeholders — every item resolved to a concrete instruction or an explicit "deferred per Section 8, tracked".
+- [ ] **Step 3: Finalize the findings doc.** Closing "Phase B inputs" section, direct no-placeholder instructions to Phase B: (a) the synchronous-trap halt boundary from G1; (b) count-step semantics from G2 + the explicit documented-modeling-decision list for unobservable edges; (c) the **control-packet → core_debug register-write routing gap** (EMU drops debug-reg writes via the `write_core_register` catch-all) as an explicit Phase B work item; (d) whether the §8 forward-commitment is triggered.
 
 - [ ] **Step 4: Commit and stop at the regroup**
 
 ```bash
 cd /home/triple/npu-work/mlir-aie && git add test/npu-xrt/debug_halt_probe/ && \
-git commit -m "debug_halt_probe: restore to Exp1 armed regression state + finalize findings
+git commit -m "debug_halt_probe: restore to Exp1 redesigned regression state
 
-Probe left in the deterministic Exp1 breakpoint configuration as a
-permanent re-runnable regression. Findings doc finalized with explicit
-Phase B inputs (G1 halt boundary, G2 count-step semantics + documented
-modeling decisions, Section 8 trigger status).
+Probe left in the deterministic Exp1 control-packet-readback config as a
+permanent re-runnable regression; README documents the Exp2 switch.
 
 Generated using Claude Code." && \
 cd /home/triple/npu-work/xdna-emu && \
 git add docs/superpowers/findings/2026-05-18-debug-halt-timing-and-single-step-count.md && \
 git commit -m "debug_halt findings: finalize -- Phase B inputs section
 
-Closes Phase A. Findings doc now carries direct, no-placeholder inputs
-for the Phase B implementation plan. Regroup before Phase B planning.
+Closes Phase A. No-placeholder Phase B inputs: G1 halt boundary, G2
+count-step + modeling decisions, the control-packet->core_debug routing
+gap work item, Section 8 trigger status. Regroup before Phase B.
 
 Generated using Claude Code."
 ```
 
-Then **stop**. Phase A is complete. Do not begin Phase B. Surface to Maya: Phase A findings (G1 verdict, G2 characterization, Section 8 status), and that the next step is to regroup and write the Phase B implementation plan against the recorded findings — her call when to start, per the plan→execute→regroup→next-plan rhythm.
+Then **stop**. Phase A is complete. Do not begin Phase B. Surface to Maya: Phase A findings (G1 verdict, G2 characterization, the routing-gap Phase B input, §8 status), and that the next step is the regroup before writing the Phase B plan — her call when, per the plan→execute→regroup→next-plan rhythm.
 
 ---
 
 ## Self-review
 
+**(Revised 2026-05-18 for the post-Task-3 redesign; spec §4 updated in lockstep.)**
+
 **Spec coverage (spec Section 4 = Phase A):**
-- 4.1 instrument (control-packet, marker-BO observation, EMU-first then HW, Exp1-before-Exp2, recovery staged) → Tasks 1 (mechanism), 2-4 (Exp1), 5-6 (Exp2); EMU-first and recovery in the per-task Conventions/guards; Exp1 banked (Task 4) before Exp2 HW (Task 6). Covered.
-- 4.2 Experiment 1 (3 markers + done sentinel, trap PC from objdump, PC_Event0+Debug_Control2, before/after verdict, resume bonus) → Tasks 2,3,4. Resume-bonus: the spec's post-resume `mem[2]==0xCC` check is **not** implemented (the runtime sequence cannot deassert the breakpoint mid-run and re-observe without a second core pass). Recorded here as a known scope reduction: Phase A derives the halt-timing fact; resume is already wired/tested in-emulator and is re-validated in Phase B's interpreter-level tests, not via this probe. (Surfaced to Maya at the regroup.)
-- 4.3 Experiment 2 (N markers, Debug_Control0 matrix, ReadRegisters corroboration) → Task 5,6. `ReadRegisters` corroboration via hand-assembled read control packets is **omitted** — marker-count is decisive per the spec and adding a ctrlOut read-packet path is extra surface for no decisive gain; noted as a deliberate YAGNI reduction, revisit only if marker-count proves ambiguous.
-- 4.4 output (findings doc + permanent re-runnable probe) → Tasks 4,6,7. Covered.
+- 4.1 instrument (control-packet readback while halted is load-bearing per revised §4.1; EMU-first then HW; Exp1 before Exp2; recovery staged) → Tasks 1 (authoring mechanism), 4 (readback mechanism + no-trap baseline), 5 (Exp1 HW), 6 (Exp2 EMU), 7 (Exp2 HW). Covered.
+- 4.2 Experiment 1, redesigned (4 markers; trap PC from `llvm-objdump-aie`; PC_Event0+Debug_Control2; **schedule-derived** verdict + Core_Status disambiguation; control-packet OP_READ while halted) → Tasks 2 (kernel), 3 (arming + disasm-derived TRAP_PC + re-derivation discipline), 4 (readback + verdict), 5 (HW derive G1). The "force store order" idea was investigated and rejected (no toolchain pin; empirically confirmed by our own disasm); schedule-derived verdict is the spec-blessed approach.
+- 4.3 Experiment 2 (8 markers, Debug_Control0 matrix) → Tasks 6,7. Control-packet readback is now **load-bearing, not omitted** — the redesign promotes it from the earlier YAGNI-deferred corroboration because the lock-gated DMA cannot observe a halted core (Task 3 discovery). Exp2 reuses the Task 4 readback infra.
+- 4.4 output (findings doc + permanent re-runnable probe) → Tasks 5,7,8. Covered.
 
-**Two scope reductions to surface at the regroup** (both already noted above): the post-resume bonus check and the ReadRegisters corroboration are dropped as non-decisive; the marker-BO observation carries the spec's decisive load. Flag both to Maya rather than silently dropping.
+**Superseded scope reductions (no longer open):** the earlier "ReadRegisters omitted as YAGNI" reduction is reversed — now the primary observation, justified by the discovered flaw. The post-resume hardware check stays out of Phase A but is a *tracked spec §8 forward-commitment* (resume hardware-verification), not an unflagged drop. Both are resolved in the spec, not merely "surfaced at regroup".
 
-**Placeholder scan:** No "TBD/TODO/handle appropriately". The intentional fill-ins (`0xNNNN` trap PC, BEFORE/AFTER verdict, LANDED counts) are *experimental observations the executor records*, not unspecified design — each has an exact derivation step and a "substitute the real value before committing" instruction. Acceptable: a probe plan's outputs are data, not code.
+**New Phase B input captured:** the EMU control-packet→`core_debug` register-write routing gap (debug-reg writes hit the `write_core_register` catch-all and are dropped) is recorded as an explicit Phase B work item in the findings-doc Phase B inputs (Task 8 Step 3) — discovered, not designed-around.
 
-**Type/identifier consistency:** Test dir `debug_halt_probe`, tile `(0,2)`, offsets `0x32010/0x32018/0x32020`, marker values consistent across kernel and `test.cpp` per task (Exp1: 170/187/204/1; Exp2: 101..108), verdict tokens (`AFTER_COMMIT`/`BEFORE_COMMIT`/`LANDED`) consistent between `test.cpp` and the findings doc. Bridge invocation and recovery commands match CLAUDE.md.
+**Placeholder scan:** No "TBD/TODO/handle appropriately". Intentional fill-ins (`<BEFORE|AFTER>` verdict, `OUTBUF_ADDR`, LANDED counts) are *experimental observations the executor records / derives*, each with an exact derivation step and a "substitute the real value before committing" instruction — a probe plan's outputs are data, not code.
+
+**Type/identifier consistency:** Test dir `debug_halt_probe`, tile `(0,2)`, offsets `0x32010/0x32018/0x32020`, `Core_Status` `0x32004`, `OUTBUF_ADDR` (derived, expected `0x0400`), trap bundle `0x114`→slot1=0xBB / strictly-later `0x11c`→slot0=0xAA consistent across spec §4.2, the aie.mlir TRAP_PC comment, and `test.cpp`; verdict tokens (`AFTER_COMMIT`/`BEFORE_COMMIT`/`NO_TRAP_OR_RAN_TO_END`/`AMBIGUOUS`/`ANOMALY_NOT_HALTED`/`LANDED`/`PASS`) consistent between `test.cpp` and the findings doc. Bridge invocation + recovery commands match CLAUDE.md.
