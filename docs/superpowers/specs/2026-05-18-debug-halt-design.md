@@ -323,6 +323,21 @@ to be unknowns until probed, hardware-verifying resume is a tracked
 later-consideration: worth a dedicated probe pass eventually, not a
 Phase A/B blocker. Recorded here so it is not lost.
 
+**Probe-artifact robustness: `OUTBUF_ADDR`.** The redesigned Exp1/Exp2
+observation reads `output_buffer` via control-packet OP_READ at a
+tile-local address (`OUTBUF_ADDR`, expected `0x0400`) derived from the
+disassembly / aiecc allocation — a fragile magic constant of the same
+class as `TRAP_PC`. Phase A makes it self-documenting (an in-artifact
+"derived, re-verify if the kernel/allocation changes" warning, parallel
+to the committed TRAP_PC discipline) and self-checking (the EMU no-trap
+readback must return the known marker values, else re-derive). That is
+sufficient for Phase A correctness, but it is not *robust*: a future
+maintainer editing the kernel could silently desync it. Tracked
+later-consideration: make `OUTBUF_ADDR` non-fragile (derive it
+programmatically — e.g. from the aiecc allocation map / a symbol — so
+it cannot rot), not a Phase A blocker. Recorded here so it is not
+ignored.
+
 ## 9. Open questions resolved by Phase A
 
 These are the spec's explicit parameterization points — Phase B is
