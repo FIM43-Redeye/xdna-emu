@@ -41,10 +41,14 @@ Probed aie-rt (authoritative HAL) and AM025 extracts. Findings, cited:
 - **SLVERR trigger = AXI unmapped-register address decode.** AM025
   `AIE_AXIMM_Config @ 0x1E020` bit 2 `SLVERR_Block`:
   *"1: Block returning of SLVERR when accessing unmapped registers"*
-  (`docs/xdna/am025-compact/noc_module/aie_aximm_config.txt:2-3`).
-  SLVERR is the DECERR-class response to an *unmapped/undecoded
-  register address* -- explicitly **not** a privilege/protection
-  violation and **not** a write to a read-only register.
+  (`docs/xdna/am025-compact/noc_module/aie_aximm_config.txt:9`; bit 3
+  `DECERR_Block` "accessing non-existent tiles" is the adjacent line 8).
+  SLVERR is the slave-error response to an *unmapped/undecoded register
+  offset within an existing tile* -- distinct from DECERR (no tile at
+  the address), which the emulator never produces because control
+  packets are always routed to real tiles. Explicitly **not** a
+  privilege/protection violation and **not** a write to a read-only
+  register.
 
 - **Handler is poll-only sticky-and-continue.** Neither aie-rt (no live
   control-packet handler code) nor AM025 (declarative `wtc` bit, no
@@ -144,8 +148,11 @@ A control-packet-handler-initiated register access (read **or** write)
 is a slave error iff the target offset classifies as
 `SubsystemKind::Unknown` for the tile kind, via the existing
 `subsystem_from_offset(offset, tile_kind_from_row(row))`
-(`src/device/registers.rs:410`). This is the AXI DECERR/SLVERR analogue
--- the address decodes to no slave. The classifier is derived from the
+(`src/device/registers.rs:410`). This is the AXI SLVERR case -- the
+tile exists (the packet is routed to a real `(col,row)`) but the offset
+maps to no register (AM025 `SLVERR_Block`, "unmapped registers"); it is
+not DECERR (no tile at the address), which never arises here. The
+classifier is derived from the
 AM025/aie-rt subsystem range constants and already returns `Unknown`
 only for genuinely undecoded space (verified: compute `0x10800`,
 `0x1F200`, `0x50000` -> `Unknown`; `0x10000`-class data memory, DMA-BD
@@ -197,10 +204,12 @@ Pure, non-mutating `DeviceState` methods (small new
 `src/device/state/ctrl_access.rs`, or co-located in `dispatch.rs`):
 
 ```rust
-/// A control-packet access to an offset that classifies as
-/// SubsystemKind::Unknown is the emulator's faithful AXI slave-error
-/// (DECERR) analogue -- the address decodes to no slave. Cite:
-/// xaiegbl_params.h:7761 (bit map), aie_aximm_config.txt:2-3 (trigger).
+/// A control-packet access whose offset classifies as
+/// SubsystemKind::Unknown is the faithful AXI SLVERR case: the tile
+/// exists but the offset maps to no register. Distinct from DECERR
+/// (no tile at the address), which never arises -- packets route to
+/// real tiles. Cite: xaiegbl_params.h:7761 (bit map),
+/// aie_aximm_config.txt:9 SLVERR_Block (trigger).
 pub fn ctrl_pkt_offset_decodes(&self, row: u8, offset: u32) -> bool {
     subsystem_from_offset(offset, tile_kind_from_row(row)) != SubsystemKind::Unknown
 }
