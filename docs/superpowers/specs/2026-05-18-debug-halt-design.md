@@ -222,12 +222,36 @@ silicon this byte-copies every ctrl-in header into the `@gate` S2MM
 buffer and every gate token into TileControl — corruption,
 `dma_wait @ctrl0` never satisfies, `run.wait()` timeout, NPU wedge. The
 emulator faithfully reproduced this (no EMU bug; the probe was at
-fault). Fix: pin `@gate` to shim MM2S **channel 1** via an explicit
-`aie.shim_dma_allocation`, leaving the proven ch0 ctrl-in idiom
-untouched, so the two flows take independent physical paths into the
-tile. This is a durable constraint on the gate mechanism, not a
-one-off: any future re-derivation that re-introduces a gate must keep
-its shim channel disjoint from the ctrl-packet shim channel.
+fault).
+
+The first-considered fix — pinning `@gate` to shim MM2S ch1 via an
+explicit `aie.shim_dma_allocation` — is **not honored by the
+toolchain** (grounded): the objectfifo lowering's `DMAChannelAnalysis`
+seeds channel occupancy only from `ShimDMAOp`/`MemOp`/`MemTileDMAOp`/
+`FlowOp` and *never* from `ShimDMAAllocationOp`
+(`AIEObjectFifoStatefulTransform.cpp:84-120`); there is no
+per-objectfifo channel attribute (`AIEOps.td:1825-1848`); the
+objectfifo unconditionally takes the lowest free channel
+(`getDMAChannelIndex`, `:125-152`), and a pre-placed
+`@gate_shim_alloc` collides with the symbol the lowering itself emits
+(`:1752`). The only objectfifo-side lever is a dummy `aie.shim_dma`
+occupier, which emits real BD/channel config into the CDO (undocumented,
+no in-tree precedent).
+
+**Adopted fix:** leave `@gate` on its natural default shim MM2S **ch0**
+and repoint the hand-rolled ctrl-in OP_READ push to shim MM2S **ch1**
+(the controllable side — plain register writes, fully characterized).
+The toolchain-derived delta is mechanical: shim DMA per-channel stride
+is `0x8` (aie-rt `xaiemlgbl_reginit.c` `.ChIdxOffset = 0x8`), so the
+ctrl-in CTRL `0x1d210→0x1d218` and TASK_QUEUE `0x1d214→0x1d21c`, the
+ctrl-in `aie.packet_flow` source `<%shim, DMA:0>→<%shim, DMA:1>`, and
+the `aiex.npu.sync` MM2S `channel 0→1`; no BD-layout or BD-address
+changes (BDs are channel-independent). `add_one_ctrl_packet` already
+proves hand-rolled-MM2S + objectfifo channels coexist disjointly on one
+shim tile. This is a durable constraint on the probe, not a one-off:
+the gate's and the ctrl-packet's shim MM2S channels must always be
+disjoint, and because the objectfifo channel is not pinnable, the
+ctrl-packet side is the one that must move.
 
 Observation is **control-packet OP_READ while the core is halted**
 (core-independent; the lock-gated DMA is unusable per the discovery):
