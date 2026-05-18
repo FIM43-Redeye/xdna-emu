@@ -23,6 +23,7 @@
 
 mod cdo;
 mod compute;
+mod ctrl_access;
 mod dispatch;
 mod effects;
 mod memtile;
