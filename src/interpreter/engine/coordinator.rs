@@ -2593,5 +2593,10 @@ mod tests {
             0,
             "decodable offset must NOT set SLVERR (false-positive guard)"
         );
+        assert_eq!(
+            tile.read_data_u32(0x400),
+            Some(0x0000_0001),
+            "decodable ctrl write must actually apply (end-to-end, not just no-SLVERR)"
+        );
     }
 }
