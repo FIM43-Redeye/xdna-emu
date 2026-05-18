@@ -207,6 +207,28 @@ re-derivation discipline is exactly this mechanism). Bound: if a HW run
 *still* does not halt despite the documented ordering guarantee, G1
 becomes a tracked §8 forward-commitment rather than a further redesign.
 
+**Shim-channel-disjointness constraint (Task 5 Step 3 discovery).** The
+gate's shim feed and the ctrl-in OP_READ push **must use disjoint shim
+MM2S channels**. The first gated EMU run timed out: `@gate` defaulted
+its shim feed to shim MM2S channel 0, and the hand-rolled ctrl-in push
+(register block `0x1d210/0x1d214`, inherited from the
+`add_one_ctrl_packet` idiom) also targets shim MM2S channel 0. With one
+shim source feeding two compute-tile destinations, the pathfinder
+correctly compiles a single **circuit broadcast** (`switchbox(0,2):
+South:1 → {TileControl:0, DMA:0}`, visible in `input_physical.mlir`);
+aie-rt confirms circuit masters forward their slave unconditionally
+(`xaie_ss.c:128-164,187-261`, `MstrPktEn=0`, no header parsing). On
+silicon this byte-copies every ctrl-in header into the `@gate` S2MM
+buffer and every gate token into TileControl — corruption,
+`dma_wait @ctrl0` never satisfies, `run.wait()` timeout, NPU wedge. The
+emulator faithfully reproduced this (no EMU bug; the probe was at
+fault). Fix: pin `@gate` to shim MM2S **channel 1** via an explicit
+`aie.shim_dma_allocation`, leaving the proven ch0 ctrl-in idiom
+untouched, so the two flows take independent physical paths into the
+tile. This is a durable constraint on the gate mechanism, not a
+one-off: any future re-derivation that re-introduces a gate must keep
+its shim channel disjoint from the ctrl-packet shim channel.
+
 Observation is **control-packet OP_READ while the core is halted**
 (core-independent; the lock-gated DMA is unusable per the discovery):
 read the four `output_buffer` slots *and* `Core_Status` (0x32004).
