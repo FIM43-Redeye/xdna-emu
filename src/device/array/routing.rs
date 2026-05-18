@@ -355,12 +355,17 @@ impl TileArray {
                         }
                         ReassembleResult::Pending => {}
                         ReassembleResult::HandlerError(e) => {
+                            // Poll-only sticky-continue (aie-rt/AM025): latch
+                            // the Control_Packet_Handler_Status bit and keep
+                            // processing. NOT engine-fatal -- pushing
+                            // CtrlPacketAction::Error here would route to
+                            // fatal_errors -> EngineStatus::Error (the bug the
+                            // SLVERR plan corrects). Firmware polls the bit.
                             log::error!(
                                 "Tile ({},{}) ctrl_pkt handler error: {:?} (sets Control_Packet_Handler_Status bit 0x{:X})",
                                 col, row, e, e.bit()
                             );
                             Self::latch_pkt_error(&mut self.tiles[i], e);
-                            self.pending_ctrl_actions.push(CtrlPacketAction::Error(format!("{:?}", e)));
                         }
                         ReassembleResult::Error(msg) => {
                             // Structural rejection: logged only. Per spec

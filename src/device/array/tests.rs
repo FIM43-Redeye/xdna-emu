@@ -384,3 +384,74 @@ fn test_handle_read_registers_bad_tile() {
     let ok = array.handle_read_registers(99, 99, 0x440, 4, 0);
     assert!(!ok, "should fail for out-of-bounds tile");
 }
+
+/// Parity handler errors (Second_Header_Parity) must latch the sticky
+/// `pkt_handler_status` bit and continue -- NOT push `CtrlPacketAction::Error`
+/// or populate `fatal_errors`. This exercises the full routing path through
+/// `route_tile_switches_to_ctrl` to prove the fix, not a hand-set-bit.
+///
+/// Hardware ref: aie-rt xaiegbl_params.h:7761, AM025
+/// `Tile_Control_Packet_Handler_Status` -- poll-only sticky, no interrupt/abort.
+#[test]
+fn parity_handler_error_is_sticky_continue_not_fatal() {
+    use crate::device::control_packets::status::PktHandlerError;
+    use crate::device::stream_switch::PortType;
+    use crate::device::tile::CtrlPacketAction;
+    use crate::device::host_memory::HostMemory;
+
+    let mut array = TileArray::npu1();
+    let col: u8 = 1;
+    let row: u8 = 2; // compute tile
+
+    // Build a header word with EVEN popcount so odd_parity_ok() returns false.
+    // 0x00000101 = bits[8] + bits[0] = 2 set bits (even) -> SecondHeaderParity.
+    // This matches build_test_header(0x101, 0, 0, 0) used in reassembler unit tests.
+    let bad_parity_word: u32 = 0x0000_0101;
+    assert_eq!(bad_parity_word.count_ones() % 2, 0, "word must have even popcount for parity failure");
+
+    // Find the TileCtrl master port index (same search the routing fn uses).
+    let tile_idx = array.tile_index(col, row);
+    let ctrl_master_idx = array.tiles[tile_idx]
+        .stream_switch
+        .masters
+        .iter()
+        .position(|p| matches!(p.port_type, PortType::TileCtrl))
+        .expect("compute tile must have a TileCtrl master port");
+
+    // Push the parity-bad word directly onto the TileCtrl master port
+    // with TLAST=false (a standalone header, no data beats expected).
+    let pushed =
+        array.tiles[tile_idx].stream_switch.masters[ctrl_master_idx].push_with_tlast(bad_parity_word, false);
+    assert!(pushed, "test setup: TileCtrl master port must accept the word");
+
+    // Run step_data_movement, which calls route_tile_switches_to_ctrl
+    // internally and feeds the word to the tile's ctrl reassembler.
+    let mut host_memory = HostMemory::new();
+    array.step_data_movement(&mut host_memory);
+
+    // Assert 1: SecondHeaderParity bit (0x2) latched in pkt_handler_status.
+    let handler_status = array.tiles[tile_idx].pkt_handler_status;
+    assert_ne!(
+        handler_status & PktHandlerError::SecondHeaderParity.bit(),
+        0,
+        "SecondHeaderParity bit (0x2) must be latched in pkt_handler_status after a bad-parity header"
+    );
+
+    // Assert 2: No CtrlPacketAction::Error produced for the handler error.
+    // (The structural-rejection Error arm is NOT triggered here -- this is a
+    // parity error, not an opcode/length error, and must be sticky-continue.)
+    let actions = array.drain_ctrl_packet_actions();
+    let error_actions: Vec<_> = actions.iter().filter(|a| matches!(a, CtrlPacketAction::Error(_))).collect();
+    assert!(
+        error_actions.is_empty(),
+        "HandlerError must NOT produce CtrlPacketAction::Error (sticky-continue); got: {:?}",
+        error_actions
+    );
+
+    // Assert 3: fatal_errors is empty -- the engine would NOT abort.
+    assert!(
+        array.fatal_errors.is_empty(),
+        "fatal_errors must be empty after a handler error (sticky-continue); got: {:?}",
+        array.fatal_errors
+    );
+}
