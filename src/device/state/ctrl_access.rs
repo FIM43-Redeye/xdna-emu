@@ -26,9 +26,11 @@ impl DeviceState {
 
     /// A read of `count` consecutive registers from `offset` decodes
     /// iff every beat decodes. Any undecoded beat is a SLVERR and the
-    /// whole response is suppressed.
+    /// whole response is suppressed. `count == 0` is a header-only read
+    /// (no register access, mirroring `handle_read_registers`) and is
+    /// therefore vacuously decodable -- it cannot raise SLVERR.
     pub fn ctrl_pkt_read_range_decodes(&self, row: u8, offset: u32, count: u8) -> bool {
-        (0..count.max(1) as u32).all(|i| self.ctrl_pkt_offset_decodes(row, offset + i * 4))
+        (0..count as u32).all(|i| self.ctrl_pkt_offset_decodes(row, offset + i * 4))
     }
 
     /// Latch `SLVERR_On_Access` on the tile at `(col,row)`. The
@@ -59,11 +61,19 @@ mod tests {
     }
 
     #[test]
-    fn read_range_fails_if_any_beat_unknown() {
+    fn read_range_all_beats_must_decode() {
         let d = DeviceState::new_npu1();
         // Start decodable, walk into the 0x1F200 Unknown hole.
         assert!(d.ctrl_pkt_read_range_decodes(2, 0x400, 4));
         assert!(!d.ctrl_pkt_read_range_decodes(2, 0x1F200, 1));
+    }
+
+    #[test]
+    fn read_range_zero_count_is_vacuously_decodable() {
+        let d = DeviceState::new_npu1();
+        // Header-only read (count=0) accesses no register, so even an
+        // Unknown base offset cannot raise SLVERR.
+        assert!(d.ctrl_pkt_read_range_decodes(2, 0x1F200, 0));
     }
 
     #[test]
