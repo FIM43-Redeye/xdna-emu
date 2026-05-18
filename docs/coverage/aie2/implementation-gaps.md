@@ -8,6 +8,5 @@ class). Empty == every named subsystem is Full/closed for this arch.
 - debug_halt: PARTIAL -- missing: programmable breakpoints + single-step PC trap
 - interrupt: PARTIAL -- missing: L2 23-reg surface exhaustiveness + privilege gating
 - noc: STUB
-- control_packets: PARTIAL -- missing: SLVERR_On_Access sticky bit -- needs a register-access-error model (successor plan)
 - clock_control: STUB
 

@@ -299,17 +299,20 @@ pub struct Tile {
     /// compute, 0xB0F30 memtile).
     ///
     /// Bit layout per AM025 Tile_Control_Packet_Handler_Status:
-    ///   [0] First_Header_Parity_Error  -- detected (stream header)
-    ///   [1] Second_Header_Parity_Error -- detected (opcode header)
-    ///   [2] SLVERR_On_Access           -- NO detecting path yet
-    ///       (successor plan: runtime register-access-error model)
+    ///   [0] First_Header_Parity_Error  -- detected (stream header parity)
+    ///   [1] Second_Header_Parity_Error -- detected (opcode header parity)
+    ///   [2] SLVERR_On_Access           -- detected (ctrl-pkt access to
+    ///       an unmapped offset within an existing tile -- AXI SLVERR,
+    ///       not DECERR)
     ///   [3] Tlast_Error                -- detected (write TLAST)
     ///
-    /// Sticky bits with write-1-to-clear semantics. The reassembler
-    /// returns ReassembleResult::HandlerError for bits 0/1/3; routing.rs
-    /// latches them here via PktHandlerError::bit(). Software reads this
-    /// register to diagnose, then writes 1 to a bit to clear it.
-    /// Compute + memtile only; shim has no packet handler.
+    /// All four are poll-only sticky bits with write-1-to-clear. The
+    /// reassembler returns ReassembleResult::HandlerError for bits
+    /// 0/1/3 (latched in routing.rs); bit 2 is latched at the
+    /// coordinator dispatch boundary (DeviceState::latch_ctrl_slverr).
+    /// The handler latches and continues -- no interrupt, no abort;
+    /// software polls then writes 1 to clear. Compute + memtile only;
+    /// shim has no packet handler.
     pub pkt_handler_status: u32,
 
     /// Tile_Control isolation bits (bit 0=S, 1=W, 2=N, 3=E).
