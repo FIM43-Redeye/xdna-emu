@@ -22,7 +22,8 @@
 
 use super::parser::{ControlPacket, CtrlOpCode, HeaderFields, parse_header};
 use super::status::PktHandlerError;
-// odd_parity_ok is consumed by Task 5 (Second_Header_Parity); keep it.
+// odd_parity_ok/PacketHeader live in stream_switch (parity formula and
+// the stream routing header are shared there; packet_types is private).
 use crate::device::stream_switch::{odd_parity_ok, PacketHeader};
 
 /// Reassembly state machine for control packet words.
@@ -436,8 +437,7 @@ mod tests {
         use crate::device::control_packets::status::PktHandlerError;
         let mut r = StreamReassembler::new(0, 2); // drop_header=true: starts Idle
 
-        // build_test_header leaves parity bit 0. addr=0x101 -> ones=2 (even) -> odd parity invalid.
-        // Confirmed: build_test_header(0x101, 0, 0, 0) = 0x00000101, count_ones=2, odd=false.
+        // build_test_header sets no parity bit; word = 0x00000101, count_ones=2 (even) -> invalid.
         let header = build_test_header(0x101, 0, 0, 0);
         match r.feed_word(header, false) {
             ReassembleResult::HandlerError(PktHandlerError::SecondHeaderParity) => {}
@@ -448,8 +448,7 @@ mod tests {
     #[test]
     fn good_parity_ctrl_header_proceeds() {
         let mut r = StreamReassembler::new(0, 2);
-        // addr=0x100 -> ones=1 (odd) -> valid -> goes Collecting (Pending).
-        // Confirmed: build_test_header(0x100, 0, 0, 0) = 0x00000100, count_ones=1, odd=true.
+        // build_test_header sets no parity bit; word = 0x00000100, count_ones=1 (odd) -> valid.
         let header = build_test_header(0x100, 0, 0, 0);
         assert!(matches!(r.feed_word(header, false), ReassembleResult::Pending));
     }
