@@ -261,6 +261,16 @@ left open as a recorded goal, not closed. The commitment is recorded
 here in Section 8 and surfaced in the `debug_halt` coverage narrative
 so it is discoverable, not lost.
 
+**Resume hardware-verification.** Phase A's probe derives halt timing
+but does not hardware-confirm *resume* (a runtime sequence cannot
+deassert the breakpoint mid-run and re-observe a second core pass).
+Resume is wired and tested in-emulator and is re-validated in Phase B's
+interpreter-level tests; the missing piece is a real-silicon
+confirmation. Given how many debug behaviors on this NPU have proven
+to be unknowns until probed, hardware-verifying resume is a tracked
+later-consideration: worth a dedicated probe pass eventually, not a
+Phase A/B blocker. Recorded here so it is not lost.
+
 ## 9. Open questions resolved by Phase A
 
 These are the spec's explicit parameterization points — Phase B is
