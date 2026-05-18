@@ -295,18 +295,20 @@ pub struct Tile {
     /// for the field layout.
     pub memtile_dma_event_chan_sel: u32,
 
-    /// Control_Packet_Handler_Status sticky bits (offset 0x3FF30 compute,
-    /// 0xB0F30 memtile).
+    /// Control_Packet_Handler_Status sticky bits (offset 0x3FF30
+    /// compute, 0xB0F30 memtile).
     ///
-    /// Bit layout per AM025:
-    ///   [0] ID_Parity_Error
-    ///   [1] Second_Header_Parity_Error
-    ///   [2] SLVERR_On_Access
-    ///   [3] Tlast_Error
+    /// Bit layout per AM025 Tile_Control_Packet_Handler_Status:
+    ///   [0] First_Header_Parity_Error  -- detected (stream header)
+    ///   [1] Second_Header_Parity_Error -- detected (opcode header)
+    ///   [2] SLVERR_On_Access           -- NO detecting path yet
+    ///       (successor plan: runtime register-access-error model)
+    ///   [3] Tlast_Error                -- detected (write TLAST)
     ///
-    /// Sticky bits with write-1-to-clear semantics. We OR a bit in when the
-    /// reassembler observes the corresponding error condition; software
-    /// reads this register to diagnose, then writes 1 to the bit to clear.
+    /// Sticky bits with write-1-to-clear semantics. The reassembler
+    /// returns ReassembleResult::HandlerError for bits 0/1/3; routing.rs
+    /// latches them here via PktHandlerError::bit(). Software reads this
+    /// register to diagnose, then writes 1 to a bit to clear it.
     /// Compute + memtile only; shim has no packet handler.
     pub pkt_handler_status: u32,
 
