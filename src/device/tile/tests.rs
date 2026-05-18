@@ -643,8 +643,10 @@ fn test_ctrl_packet_op_read_via_reassembler() {
 
     let mut reassembler = StreamReassembler::new(2, 3);
 
-    // Build OP_READ header: addr=0x440, beats=4 (raw=3), op=READ(1), resp_id=2
-    let header = 0x440u32
+    // Build OP_READ header: addr=0x441, beats=4 (raw=3), op=READ(1), resp_id=2.
+    // addr=0x441 (3 set bits) + raw_len=3 (2 bits) + op=1 (1 bit) + resp_id=2 (1 bit) = 7 bits (odd, valid).
+    // Old: addr=0x440 -> 2 bits -> total 6 bits (even, invalid); fixed addr to 0x441 -> 7 bits.
+    let header = 0x441u32
         | (3u32 << LENGTH_SHIFT)
         | ((OP_READ as u32) << OPERATION_SHIFT)
         | (2u32 << RESPONSE_ID_SHIFT);
@@ -653,7 +655,7 @@ fn test_ctrl_packet_op_read_via_reassembler() {
     match reassembler.feed_word(header, true) {
         ReassembleResult::Complete(pkt) => {
             assert_eq!(pkt.opcode, CtrlOpCode::Read);
-            assert_eq!(pkt.address, 0x440);
+            assert_eq!(pkt.address, 0x441);
             assert_eq!(pkt.beats, 4);
             assert_eq!(pkt.response_id, 2);
             assert!(pkt.data.is_empty());

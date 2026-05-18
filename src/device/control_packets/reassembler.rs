@@ -127,6 +127,16 @@ impl StreamReassembler {
                 ReassembleResult::Pending
             }
             ReassemblerState::Idle => {
+                // Second_Header_Parity: validate opcode-header odd parity
+                // BEFORE structural decode -- hardware checks header parity
+                // at ingress, before acting on opcode/length. Structural
+                // rejections (below) are logged only and do NOT set this
+                // bit (spec 3.2 tightening).
+                if !odd_parity_ok(word) {
+                    self.state = ReassemblerState::Idle;
+                    return ReassembleResult::HandlerError(PktHandlerError::SecondHeaderParity);
+                }
+
                 // Parse control packet header.
                 let header = match parse_header(word) {
                     Ok(h) => h,
@@ -256,8 +266,10 @@ mod tests {
     #[test]
     fn multi_word_write() {
         let mut r = StreamReassembler::new(0, 2);
-        // 3 beats: length field = 2 (beats = length+1 = 3)
-        let header = build_test_header(0x200, 2, 0, 0);
+        // 3 beats: length field = 2 (beats = length+1 = 3).
+        // addr=0x201 (2 set bits) + length=2 (1 bit) = 3 bits (odd, valid parity).
+        // Old: 0x200 -> 2 bits (even, invalid); fixed to 0x201 -> 3 bits (odd).
+        let header = build_test_header(0x201, 2, 0, 0);
         assert!(matches!(r.feed_word(header, false), ReassembleResult::Pending));
         assert!(matches!(r.feed_word(0x11, false), ReassembleResult::Pending));
         assert!(matches!(r.feed_word(0x22, false), ReassembleResult::Pending));
@@ -272,8 +284,9 @@ mod tests {
     #[test]
     fn read_completes_immediately() {
         let mut r = StreamReassembler::new(0, 2);
-        // OP_READ = 1
-        let header = build_test_header(0x300, 0, 1, 42);
+        // OP_READ = 1. resp_id=43 (0b101011, 4 set bits) + op=1 (1 bit) + addr=0x300 (2 bits) = 7 bits (odd, valid).
+        // Old: resp_id=42 (0b101010, 3 bits) -> total 6 bits (even, invalid); fixed resp_id to 43.
+        let header = build_test_header(0x300, 0, 1, 43);
         match r.feed_word(header, true) {
             ReassembleResult::Complete(pkt) => {
                 assert_eq!(pkt.address, 0x300);
@@ -313,8 +326,10 @@ mod tests {
         // Stream header
         r.feed_word(0x0000_0007, false);
 
-        // OP_READ with TLAST
-        let header = build_test_header(0x100, 0, 1, 0);
+        // OP_READ with TLAST.
+        // addr=0x101 (2 bits) + op=1 (1 bit) = 3 bits (odd, valid parity).
+        // Old: addr=0x100 -> 2 bits (even, invalid); fixed to 0x101 -> 3 bits.
+        let header = build_test_header(0x101, 0, 1, 0);
         r.feed_word(header, true);
 
         // Next word should be treated as stream header again
@@ -346,14 +361,18 @@ mod tests {
     #[test]
     fn reset_returns_to_initial_state() {
         let mut r = StreamReassembler::new(0, 2);
-        // Start collecting
-        let h = build_test_header(0x100, 1, 0, 0);
+        // Start collecting.
+        // addr=0x101 (2 bits) + length=1 (1 bit) = 3 bits (odd, valid parity).
+        // Old: addr=0x100 -> 2 bits (even, invalid); fixed to 0x101 -> 3 bits.
+        let h = build_test_header(0x101, 1, 0, 0);
         r.feed_word(h, false);
         r.feed_word(0x11, false);
         // Reset mid-collection
         r.reset();
-        // Should be back to Idle, ready for a new header
-        let h2 = build_test_header(0x200, 0, 1, 0);
+        // Should be back to Idle, ready for a new header.
+        // addr=0x201 (2 bits) + op=1 (1 bit) = 3 bits (odd, valid parity).
+        // Old: addr=0x200 -> 2 bits (even, invalid); fixed to 0x201 -> 3 bits.
+        let h2 = build_test_header(0x201, 0, 1, 0);
         match r.feed_word(h2, true) {
             ReassembleResult::Complete(pkt) => assert_eq!(pkt.opcode, CtrlOpCode::Read),
             other => panic!("Expected Complete, got {:?}", other),
@@ -363,8 +382,9 @@ mod tests {
     #[test]
     fn write_incr_opcode() {
         let mut r = StreamReassembler::new(0, 2);
-        // OP_WRITE_INCR = 2
-        let header = build_test_header(0x400, 0, 2, 0);
+        // OP_WRITE_INCR = 2. addr=0x401 (2 bits) + op=2 (1 bit) = 3 bits (odd, valid parity).
+        // Old: addr=0x400 -> 2 bits (even, invalid); fixed to 0x401 -> 3 bits.
+        let header = build_test_header(0x401, 0, 2, 0);
         r.feed_word(header, false);
         match r.feed_word(0x55, true) {
             ReassembleResult::Complete(pkt) => {
@@ -409,6 +429,29 @@ mod tests {
         r.set_drop_header(false);
         // 0b1 has one set bit (odd) -> odd_parity_ok == true -> consumed.
         assert!(matches!(r.feed_word(0b1, false), ReassembleResult::Pending));
+    }
+
+    #[test]
+    fn bad_parity_ctrl_header_sets_second_header_parity() {
+        use crate::device::control_packets::status::PktHandlerError;
+        let mut r = StreamReassembler::new(0, 2); // drop_header=true: starts Idle
+
+        // build_test_header leaves parity bit 0. addr=0x101 -> ones=2 (even) -> odd parity invalid.
+        // Confirmed: build_test_header(0x101, 0, 0, 0) = 0x00000101, count_ones=2, odd=false.
+        let header = build_test_header(0x101, 0, 0, 0);
+        match r.feed_word(header, false) {
+            ReassembleResult::HandlerError(PktHandlerError::SecondHeaderParity) => {}
+            other => panic!("expected SecondHeaderParity, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn good_parity_ctrl_header_proceeds() {
+        let mut r = StreamReassembler::new(0, 2);
+        // addr=0x100 -> ones=1 (odd) -> valid -> goes Collecting (Pending).
+        // Confirmed: build_test_header(0x100, 0, 0, 0) = 0x00000100, count_ones=1, odd=true.
+        let header = build_test_header(0x100, 0, 0, 0);
+        assert!(matches!(r.feed_word(header, false), ReassembleResult::Pending));
     }
 
     // Helper: build a control packet header word.
