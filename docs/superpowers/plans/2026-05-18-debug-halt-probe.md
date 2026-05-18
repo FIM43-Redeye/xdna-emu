@@ -387,7 +387,7 @@ From the Task 3 disasm (`/tmp/claude-1000/probe-disasm.txt` or re-run `tools/llv
 
 - [ ] **Step 3: Add the control-packet read plumbing to aie.mlir**
 
-Add (modeled verbatim on `add_one_ctrl_packet/aie.mlir`): the `aie.packet_flow(0x1)` and `aie.packet_flow(0x2)` TileControl flows for tile (0,2), `aie.shim_dma_allocation @ctrl0 (%tile_0_0, S2MM, 0)`, and a second runtime-sequence argument for the ctrl-response BO. Keep the existing Task 2 4-marker core and the Task 3 `aiex.npu.write32` breakpoint-arming writes (PC_Event0=0x80000114, Debug_Control2=0x1) unchanged and still before the core is released. The `@seq` now also issues the read-control-packet DMA push (the blockwrite/address_patch/sync idiom from the template) and `dma_wait{symbol=@ctrl0}` so responses land in the ctrl-response BO. Do NOT remove the existing `@out0` marker-DMA path yet — leave it as a secondary (it will simply never fire when halted; harmless in the no-trap EMU baseline where it still works). Preserve SPDX headers and the aie-rt citation comments.
+Add (modeled verbatim on `add_one_ctrl_packet/aie.mlir`): the `aie.packet_flow(0x1)` and `aie.packet_flow(0x2)` TileControl flows for tile (0,2), `aie.shim_dma_allocation @ctrl0 (%tile_0_0, S2MM, 0)`, and a second runtime-sequence argument for the ctrl-response BO. Keep the existing Task 2 4-marker core and the Task 3 `aiex.npu.write32` breakpoint-arming writes (PC_Event0=0x80000114, Debug_Control2=0x1) unchanged and still before the core is released. The `@seq` now also issues the read-control-packet DMA push (the blockwrite/address_patch/sync idiom from the template) and `dma_wait{symbol=@ctrl0}` so responses land in the ctrl-response BO. **Remove the `@out0` marker-DMA path entirely** (`dma_memcpy_nd`/`dma_wait @out0`, the lock-gated `aie.mem` MM2S block, `@out0` shim_dma_allocation, `packet_flow(0x3)`, and the `bo_out` arg in test.cpp/kernel): it is fully redundant (control-packet OP_READ is the sole observation) and a `dma_wait @out0` on a halted core blocks forever and wedges the NPU. The EMU no-trap baseline still passes because the OP_READ returns the markers regardless. Preserve SPDX headers and the aie-rt citation comments.
 
 - [ ] **Step 4: Rewrite test.cpp — assemble read packets, parse responses, schedule-derived verdict**
 
@@ -399,7 +399,7 @@ Verdict — computed from the **committed disassembled schedule** (Task 3 / spec
   // Schedule (from llvm-objdump-aie, see aie.mlir TRAP_PC comment):
   //   trap bundle 0x114 -> s[1]=0xBB ; strictly-later 0x11c -> s[0]=0xAA
   //   later -> s[3]=1 ; later -> s[2]=0xCC
-  bool halted = (cs & (1u<<16)) && (cs & (1u<<0));
+  bool halted = (cs & (1u<<16)) != 0;  // DEBUG_HALT bit alone -- ENABLE-stays-1 is an unverified HW assumption; DEBUG_HALT=1 already proves the core ran and is halted
   std::cout << "SLOTS: s0=" << s[0] << " s1=" << s[1]
             << " s2=" << s[2] << " s3=" << s[3]
             << " CORE_STATUS=0x" << std::hex << cs << std::dec
@@ -581,7 +581,7 @@ Markers are NOT assumed to be in source order on-chip — Step 3's verdict count
 ```cpp
   int landed = 0;
   for (int k = 0; k < 8; k++) if (s[k] == (uint32_t)(101+k)) landed++;
-  bool halted = (cs & (1u<<16)) && (cs & (1u<<0));
+  bool halted = (cs & (1u<<16)) != 0;  // DEBUG_HALT bit alone -- ENABLE-stays-1 is an unverified HW assumption; DEBUG_HALT=1 already proves the core ran and is halted
   std::cout << "SLOTS:";
   for (int k=0;k<8;k++) std::cout << " " << s[k];
   std::cout << " CORE_STATUS=0x" << std::hex << cs << std::dec

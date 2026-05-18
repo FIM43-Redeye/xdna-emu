@@ -178,24 +178,46 @@ later `0x11c` → `output_buffer[0]=0xAA`; then `[3]=done`; then
 
 Observation is **control-packet OP_READ while the core is halted**
 (core-independent; the lock-gated DMA is unusable per the discovery):
-read the four `output_buffer` slots *and* `Core_Status` (0x32004). The
-verdict is computed from the disassembled schedule:
+read the four `output_buffer` slots *and* `Core_Status` (0x32004).
+**The lock-gated marker-DMA path (`@out0`/`aie.mem` MM2S) is removed
+entirely from the probe** — it is fully redundant (the OP_READ is the
+sole observation) and a `dma_wait @out0` on a halted core blocks
+forever and wedges the NPU (a second pre-hardware wedge bug caught at
+Task-4 code review; the earlier "leave @out0, harmless" framing was
+wrong). Nothing in the probe depends on the halted core releasing a
+lock.
 
-- trap slot (`[1]`) committed, no strictly-later slot written, and
-  `Core_Status` shows enabled+debug-halted → **halt is after-commit**.
-- trap slot not committed, `Core_Status` shows enabled+debug-halted →
-  **halt is before-commit**.
-- `Core_Status` reading disambiguates "before-commit" from "core never
-  ran" (all-zero buffer is otherwise ambiguous).
-- all four slots written / not debug-halted → breakpoint did not fire
+The verdict is computed from the disassembled schedule, using the
+`Core_Status` **DEBUG_HALT bit (16) alone** — `halted ≡ Core_Status &
+(1<<16)`. Requiring the ENABLE bit was rejected: ENABLE-stays-1-while-
+halted is an unverified hardware assumption, and DEBUG_HALT=1 already
+proves the core ran and is debug-halted (you cannot be debug-halted
+without having executed):
+
+- `halted` and trap slot (`[1]`) committed, no strictly-later slot
+  written → **halt is after-commit**.
+- `halted` and trap slot not committed (all slots zero) → **halt is
+  before-commit**. (DEBUG_HALT=1 itself disambiguates this from "core
+  never ran": a core that never ran is not debug-halted, so it lands in
+  the not-halted branch as an anomaly, never as before-commit.)
+- not `halted`, all four slots written → breakpoint did not fire
   (`NO_TRAP_OR_RAN_TO_END`).
+- not `halted`, slots not the full set → `ANOMALY_NOT_HALTED` (record
+  raw).
 
 **EMU limitation (accepted).** Because EMU drops the breakpoint-arming
-writes, EMU cannot produce a halted state. EMU therefore validates only
-the readback *mechanism* and the no-trap baseline; the read-*while-
-halted* semantics and the G1 answer itself are first exercised on
-hardware. This is understood, not a flaw — HW is the ground truth for
-G1 regardless.
+writes (write-side `write_core_register` catch-all), EMU cannot produce
+a halted state. Additionally there is a *symmetric read-side gap*:
+control-packet OP_READ of core/debug registers (e.g. `Core_Status`
+0x32004) is not wired into `core_debug` (`read_register_pure` has no
+core_debug dispatch), so EMU returns `Core_Status = 0x0` even for a
+completed core. Both are recorded Phase B inputs (control-packet ⇄
+`core_debug` register routing, read and write sides; possibly multiple
+inconsistent register-access paths to reconcile). Consequently EMU
+validates only the readback *mechanism* and the no-trap baseline; the
+read-*while-halted* semantics and the G1 answer itself are first
+exercised on hardware (where Core_Status is populated correctly). This
+is understood, not a flaw — HW is the ground truth for G1 regardless.
 
 Resume is not exercised by this probe (a runtime sequence cannot
 deassert the breakpoint mid-run and re-observe); it stays in-emulator-
