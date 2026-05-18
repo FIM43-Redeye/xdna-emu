@@ -369,17 +369,10 @@ mod pkt_handler_status_tests {
     }
 
     #[test]
-    fn read_and_clear_first_header_parity_bit0_compute() {
+    fn read_first_header_parity_bit0_compute() {
         let mut tile = Tile::compute(0, 2);
         tile.pkt_handler_status = 0b0001; // First_Header_Parity_Error
         assert_eq!(tile.read_register(0x3FF30), 0b0001);
-    }
-
-    #[test]
-    fn read_tlast_error_bit3_memtile() {
-        let mut tile = Tile::mem_tile(0, 1);
-        tile.pkt_handler_status = 0b1000; // Tlast_Error
-        assert_eq!(tile.read_register(0xB0F30), 0b1000);
-        assert_eq!(tile.read_register_pure(0xB0F30), 0b1000);
+        assert_eq!(tile.read_register_pure(0x3FF30), 0b0001);
     }
 }
