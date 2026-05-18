@@ -368,10 +368,19 @@ impl TileArray {
                             Self::latch_pkt_error(&mut self.tiles[i], e);
                         }
                         ReassembleResult::Error(msg) => {
-                            // Structural rejection: logged only. Per spec
-                            // 3.2 it does NOT set Second_Header_Parity --
-                            // that bit is now exclusively a true-parity
-                            // signal (Task 5). No pkt_handler_status write.
+                            // Structural rejection: a packet so malformed it
+                            // cannot be reassembled into a coherent
+                            // ControlPacket at all (distinct from a
+                            // HandlerError on a well-formed packet above).
+                            // Logged AND pushed as a fatal
+                            // CtrlPacketAction::Error -- an unparseable
+                            // control packet is an emulator-modeling failure,
+                            // not a poll-able HW error class, so it stays
+                            // engine-fatal (deliberately out of scope of the
+                            // SLVERR poll-only correction). Per spec 3.2 it
+                            // does NOT set Second_Header_Parity -- that bit is
+                            // exclusively a true-parity signal (Task 5). No
+                            // pkt_handler_status write.
                             log::error!("{}", msg);
                             self.pending_ctrl_actions.push(CtrlPacketAction::Error(msg));
                         }
