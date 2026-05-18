@@ -291,20 +291,9 @@ impl InterpreterEngine {
 
             // Dispatch any ctrl packet actions produced during flush routing
             {
-                use crate::device::tile::CtrlPacketAction;
                 let ctrl_actions = self.device.array.drain_ctrl_packet_actions();
                 for action in ctrl_actions {
-                    match action {
-                        CtrlPacketAction::WriteRegister { col, row, offset, value } => {
-                            self.device.write_tile_register(col, row, offset, value);
-                        }
-                        CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id } => {
-                            self.device.array.handle_read_registers(col, row, offset, count, response_id);
-                        }
-                        CtrlPacketAction::Error(msg) => {
-                            self.device.array.fatal_errors.push(msg);
-                        }
-                    }
+                    self.dispatch_ctrl_action(action);
                 }
                 self.drain_core_enables();
             }
@@ -355,19 +344,8 @@ impl InterpreterEngine {
                 break;
             }
 
-            use crate::device::tile::CtrlPacketAction;
             for action in ctrl_actions {
-                match action {
-                    CtrlPacketAction::WriteRegister { col, row, offset, value } => {
-                        self.device.write_tile_register(col, row, offset, value);
-                    }
-                    CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id } => {
-                        self.device.array.handle_read_registers(col, row, offset, count, response_id);
-                    }
-                    CtrlPacketAction::Error(msg) => {
-                        self.device.array.fatal_errors.push(msg);
-                    }
-                }
+                self.dispatch_ctrl_action(action);
             }
             self.drain_core_enables();
         }
@@ -841,20 +819,9 @@ impl InterpreterEngine {
 
         // Dispatch control packet actions through DeviceState for full
         // module dispatch (MemTile DMA BDs, stream switch, etc.).
-        use crate::device::tile::CtrlPacketAction;
         let ctrl_actions = self.device.array.drain_ctrl_packet_actions();
         for action in ctrl_actions {
-            match action {
-                CtrlPacketAction::WriteRegister { col, row, offset, value } => {
-                    self.device.write_tile_register(col, row, offset, value);
-                }
-                CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id } => {
-                    self.device.array.handle_read_registers(col, row, offset, count, response_id);
-                }
-                CtrlPacketAction::Error(msg) => {
-                    self.device.array.fatal_errors.push(msg);
-                }
-            }
+            self.dispatch_ctrl_action(action);
         }
         self.drain_core_enables();
 
@@ -1560,6 +1527,49 @@ impl InterpreterEngine {
 
     fn get_core_mut(&mut self, col: usize, row: usize) -> Option<&mut CoreState> {
         self.core_index(col, row).map(|idx| &mut self.cores[idx])
+    }
+
+    /// Single dispatch point for a drained `CtrlPacketAction`. Owns the
+    /// SLVERR decode-gate: a control-packet access whose offset does not
+    /// decode is a faithful AXI slave error -- latch bit 2, suppress the
+    /// access, and continue (poll-only sticky; never engine-fatal). The
+    /// structural-rejection `Error` arm is unchanged (out of scope).
+    fn dispatch_ctrl_action(&mut self, action: crate::device::tile::CtrlPacketAction) {
+        use crate::device::tile::CtrlPacketAction;
+        match action {
+            CtrlPacketAction::WriteRegister { col, row, offset, value } => {
+                if self.device.ctrl_pkt_offset_decodes(row, offset) {
+                    self.device.write_tile_register(col, row, offset, value);
+                } else {
+                    log::error!(
+                        "Tile ({},{}) ctrl_pkt SLVERR: write to undecoded offset \
+                         0x{:05X} (sets Control_Packet_Handler_Status bit 0x4)",
+                        col,
+                        row,
+                        offset
+                    );
+                    self.device.latch_ctrl_slverr(col, row);
+                }
+            }
+            CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id } => {
+                if self.device.ctrl_pkt_read_range_decodes(row, offset, count) {
+                    self.device.array.handle_read_registers(col, row, offset, count, response_id);
+                } else {
+                    log::error!(
+                        "Tile ({},{}) ctrl_pkt SLVERR: read of {} regs from undecoded \
+                         offset 0x{:05X} (sets Control_Packet_Handler_Status bit 0x4)",
+                        col,
+                        row,
+                        count,
+                        offset
+                    );
+                    self.device.latch_ctrl_slverr(col, row);
+                }
+            }
+            CtrlPacketAction::Error(msg) => {
+                self.device.array.fatal_errors.push(msg);
+            }
+        }
     }
 }
 
@@ -2524,5 +2534,64 @@ mod tests {
         engine.step();
         assert_eq!(engine.status(), EngineStatus::Running);
         assert_eq!(engine.total_cycles(), 1);
+    }
+
+    #[test]
+    fn ctrl_write_to_unknown_offset_sets_slverr_and_suppresses_write() {
+        use crate::device::tile::CtrlPacketAction;
+        let mut engine = InterpreterEngine::new_npu1();
+        // 0x1F200 is verified SubsystemKind::Unknown on a compute tile.
+        engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
+            col: 0,
+            row: 2,
+            offset: 0x1F200,
+            value: 0xABCD_1234,
+        });
+        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        assert_eq!(tile.pkt_handler_status & 0x4, 0x4, "SLVERR bit must latch");
+        assert!(
+            tile.registers_ref().get(&0x1F200).is_none(),
+            "undecoded write must be suppressed (not stored)"
+        );
+        assert!(
+            !matches!(engine.status(), EngineStatus::Error),
+            "SLVERR is poll-only sticky -- engine must not abort"
+        );
+    }
+
+    #[test]
+    fn ctrl_read_of_unknown_offset_sets_slverr_no_response() {
+        use crate::device::tile::CtrlPacketAction;
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.dispatch_ctrl_action(CtrlPacketAction::ReadRegisters {
+            col: 0,
+            row: 2,
+            offset: 0x1F200,
+            count: 2,
+            response_id: 7,
+        });
+        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        assert_eq!(tile.pkt_handler_status & 0x4, 0x4, "SLVERR bit must latch");
+        assert!(tile.pending_ctrl_response.is_empty(), "undecoded read must not queue a response");
+        assert!(!matches!(engine.status(), EngineStatus::Error));
+    }
+
+    #[test]
+    fn ctrl_write_to_valid_offset_no_slverr_and_applies() {
+        use crate::device::tile::CtrlPacketAction;
+        let mut engine = InterpreterEngine::new_npu1();
+        // 0x400 is compute data memory -- decodes, must NOT SLVERR.
+        engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
+            col: 0,
+            row: 2,
+            offset: 0x400,
+            value: 0x0000_0001,
+        });
+        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        assert_eq!(
+            tile.pkt_handler_status & 0x4,
+            0,
+            "decodable offset must NOT set SLVERR (false-positive guard)"
+        );
     }
 }
