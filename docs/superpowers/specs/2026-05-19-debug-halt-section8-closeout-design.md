@@ -17,7 +17,7 @@ and two genuinely hardware-budget-gated:
 
 | §8 item | Disposition here |
 |---------|------------------|
-| G1 halt-timing (bounded escalation) | **RESOLVED (bookkeeping).** The contingency never fired — G1 was DERIVED and SHIPPED (findings `2026-05-18-...` conclusion (a), line 316). The §8 bullet describes a fallback that did not happen; flip it to RESOLVED. |
+| G1 halt-timing (bounded escalation) | **RESOLVED (bookkeeping).** The contingency never fired — G1 was DERIVED and SHIPPED (findings `2026-05-18-...` conclusion (a)). The §8 bullet describes a fallback that did not happen; flip it to RESOLVED. |
 | `OUTBUF_ADDR` probe-artifact robustness | **RESOLVED (Item 2).** Unified build-time derivation. |
 | `Core_Status` RESET-bit EMU/HW divergence | **RESOLVED (Item 3).** Emulator fidelity fix. |
 | Count-step silicon-fidelity | **STAYS OPEN.** Only `N=4` was observable (`LANDED:0`); finer cadence / larger-N / `0x11`-on-silicon need register-poke tooling or a dedicated hardware-observation budget. Untouched; stays surfaced in the `debug_halt` coverage narrative. |
@@ -251,7 +251,7 @@ The §8 "G1 halt-timing (bounded escalation)" bullet describes a
 contingency ("if the HW core does not halt … ship the after-commit model
 as an explicit assumption") that **never fired**: findings
 `docs/superpowers/findings/2026-05-18-debug-halt-timing-and-single-step-count.md`
-conclusion (a) (line 316) records *"G1 — synchronous-trap halt boundary:
+conclusion (a) records *"G1 — synchronous-trap halt boundary:
 DERIVED and SHIPPED."* This is not open debt; it is a tracker the data
 already retired.
 
