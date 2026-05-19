@@ -598,9 +598,25 @@ impl CoreDebugState {
         self.done = done;
     }
 
-    /// Set the enable bit. Called when the core is started.
+    /// Low-level enable-bit setter. The core-start path goes through
+    /// `enable()` (which also clears `reset`); this remains for the
+    /// disable path (`disable_core` passes `false`) and test setup.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+
+    /// Enable the core via the same register semantics as a CDO
+    /// `Core_Control = 0x1` write: sets `enabled`, clears `reset`.
+    ///
+    /// The runtime enable path (`Coordinator::enable_core`) routes
+    /// through this so it cannot diverge from the CDO write path. Before
+    /// this existed, the runtime path used `set_enabled(true)` (which
+    /// never touched `reset`), leaving `reset` at its `true` default and
+    /// making a debug-halted core report `Core_Status = 0x10003`
+    /// instead of the silicon-correct `0x10001` (§8 close-out,
+    /// 2026-05-19).
+    pub fn enable(&mut self) {
+        self.write_control(CTRL_ENABLE_MASK);
     }
 
     /// Set the ECC error state.

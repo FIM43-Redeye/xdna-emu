@@ -384,9 +384,12 @@ impl InterpreterEngine {
         if let Some(core) = self.get_core_mut(col, row) {
             core.enabled = true;
         }
-        // Mirror to CoreDebugState so Core_Status register shows enabled.
+        // Mirror to CoreDebugState via the same register semantics as a
+        // CDO Core_Control=0x1 write (sets enabled, clears reset) so the
+        // runtime enable path cannot diverge from the CDO write path
+        // (Core_Status RESET-bit fidelity, §8 close-out 2026-05-19).
         if let Some(tile) = self.device.tile_mut(col, row) {
-            tile.core_debug.set_enabled(true);
+            tile.core_debug.enable();
         }
     }
 
@@ -3439,5 +3442,16 @@ mod tests {
                 "commit tick 2: after 2 committed bundles (budget expiry), core must be halted by count-step"
             );
         }
+    }
+
+    #[test]
+    fn enable_core_clears_core_debug_reset() {
+        // §8 close-out: the runtime enable path must clear reset so a
+        // halted core reports Core_Status 0x10001, not 0x10003.
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.enable_core(0, 2);
+        let tile = engine.device_mut().tile_mut(0, 2).expect("tile (0,2)");
+        assert!(!tile.core_debug.is_reset(), "enable_core must clear reset");
+        assert!(tile.core_debug.is_enabled(), "enable_core sets enabled");
     }
 }

@@ -195,6 +195,32 @@ fn control_roundtrip_read() {
     assert_eq!(state.read_control(), 0);
 }
 
+#[test]
+fn enable_method_matches_cdo_enable_write() {
+    // The runtime enable path must be byte-identical to a CDO
+    // Core_Control=0x1 write: enabled set, reset cleared (Core_Status
+    // RESET-bit fidelity, §8 close-out).
+    let mut state = CoreDebugState::new();
+    assert!(state.is_reset(), "fresh state starts in reset");
+    state.enable();
+    assert!(state.is_enabled(), "enable() sets enabled");
+    assert!(!state.is_reset(), "enable() clears reset");
+    assert_eq!(state.read_control(), CTRL_ENABLE_MASK);
+}
+
+#[test]
+fn enable_then_halt_reports_no_reset_bit() {
+    // Debug-halted after the runtime enable path: Core_Status must be
+    // DEBUG_HALT|ENABLE (0x10001), NOT DEBUG_HALT|RESET|ENABLE (0x10003).
+    let mut state = CoreDebugState::new();
+    state.enable();
+    state.halted = true;
+    let status = state.read_status();
+    assert_eq!(status & (1 << STATUS_RESET_LSB), 0, "RESET bit must be clear");
+    assert_ne!(status & (1 << STATUS_ENABLE_LSB), 0, "ENABLE bit set");
+    assert_ne!(status & (1 << STATUS_DEBUG_HALT_LSB), 0, "DEBUG_HALT bit set");
+}
+
 // -- PC/SP/LR round-trip --
 
 #[test]
