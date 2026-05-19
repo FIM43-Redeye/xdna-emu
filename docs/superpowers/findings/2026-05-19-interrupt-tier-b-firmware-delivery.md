@@ -1,7 +1,10 @@
 # Interrupt Tier B — Firmware Async-Event Host Delivery (tracked follow-up)
 
-**Status:** Not started. **Immediate follow-up** after the Tier A interrupt
-close-out (ahead of the clock_control / noc gap-queue items).
+**Status:** Spec 1 (plumbing + INSTR_ERROR producer) drafted at
+[`../specs/2026-05-19-interrupt-tier-b-firmware-mailbox-design.md`](../specs/2026-05-19-interrupt-tier-b-firmware-mailbox-design.md).
+Per-class detection follow-ups (DMA, parity, ECC, lock, stream) remain
+tracked as separate not-started specs in that spec's §10. Tier C (TDR /
+context-restart) is a further follow-up.
 
 ## Why this is separate from Tier A
 
