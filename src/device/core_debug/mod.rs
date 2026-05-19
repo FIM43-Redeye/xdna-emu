@@ -287,6 +287,21 @@ pub struct CoreDebugState {
     /// Phase B Unit 1, spec §5.1: the before-commit seam must not re-fire
     /// the same PC_Event match on the step immediately following resume.
     pub(super) sync_trap_consumed_at: Option<u32>,
+
+    /// Live count-step budget (Debug_Control0[5:2] Single_Step_Count).
+    /// `Some(n)` = n committed bundles remain before a before-commit halt;
+    /// `None` = count-step disabled. Distinct from the raw
+    /// `single_step_count` config field: this is the decrementing live
+    /// counter. G2 (NPU1 silicon, 2026-05-19): count-step is live hardware;
+    /// `N=4` halts in the prologue before the first store. Modeling
+    /// decisions (silicon-unobservable edges, spec §5.2, Maya 2026-05-19):
+    /// N counts committed bundles, halt fires before the (N+1)th commits;
+    /// count+halt-bit (0x11) -> bit[0] immediate-halt precedence, budget
+    /// armed latent; expiry clears the budget, only a fresh Debug_Control0
+    /// write re-arms (request_resume never re-arms).
+    pub(super) count_step_remaining: Option<u32>,
+    /// Latched cause: the core was halted by count-step budget expiry.
+    pub(super) halt_cause_count_step: bool,
 }
 
 impl Default for CoreDebugState {
@@ -324,6 +339,8 @@ impl Default for CoreDebugState {
             halt_cause_event1: false,
             pending_single_step: false,
             sync_trap_consumed_at: None,
+            count_step_remaining: None,
+            halt_cause_count_step: false,
         }
     }
 }
@@ -679,6 +696,30 @@ impl CoreDebugState {
         }
     }
 
+    /// Decrement the count-step budget by one committed bundle. The
+    /// coordinator calls this after each committed bundle, adjacent to
+    /// `consume_pending_single_step`. On expiry it latches `halted` (via
+    /// `request_halt`) and the count-step cause; the existing
+    /// `interpreter.rs` `is_halted` gate then prevents the next bundle from
+    /// committing — the before-commit-of-bundle-(N+1) boundary G2 derived
+    /// (spec §5.2). Expiry clears the budget; only a fresh Debug_Control0
+    /// write re-arms. Returns true iff this tick expired the budget.
+    pub fn tick_count_step(&mut self) -> bool {
+        match self.count_step_remaining {
+            Some(n) if n > 1 => {
+                self.count_step_remaining = Some(n - 1);
+                false
+            }
+            Some(_) => {
+                self.count_step_remaining = None;
+                self.halt_cause_count_step = true;
+                self.request_halt();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Decode a PC_Event* raw register value to its address (or None if
     /// VALID=0). Per AM025 PC_Event* layout (bit 31 VALID, bits [13:0] address).
     fn pc_event_address(raw: u32) -> Option<u32> {
@@ -862,6 +903,17 @@ impl CoreDebugState {
         let sstep_count = ((value & DBG_CTRL0_SSTEP_COUNT_MASK) >> DBG_CTRL0_SSTEP_COUNT_LSB) as u8;
         self.single_step_count = sstep_count;
         self.single_step = sstep_count > 0;
+
+        // §5.2 count-step arm (G2 silicon-derived, 2026-05-19). A non-zero
+        // Single_Step_Count arms a live N-committed-bundle budget; N=0 disables.
+        // Independent of the halt bit: for 0x11 the bit[0] immediate halt above
+        // takes precedence; the budget is still armed (latent) and applies if
+        // the core later resumes (spec §5.2 modeling decision).
+        self.count_step_remaining = if sstep_count > 0 {
+            Some(sstep_count as u32)
+        } else {
+            None
+        };
     }
 
     /// Read Debug_Control0.

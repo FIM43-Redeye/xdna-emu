@@ -1104,3 +1104,64 @@ fn sstep_event_coexists_with_halt_event() {
     state.consume_pending_single_step();
     assert!(state.is_halted(), "still halted");
 }
+
+// -- §5.2 Count-step state machine --
+
+#[test]
+fn count_step_arm_from_debug_control0() {
+    // Debug_Control0[5:2]=N (halt bit clear) arms a live N-budget.
+    let mut s = CoreDebugState::new();
+    s.enabled = true;
+    s.write_debug_control0(0x10); // N=4 (4<<2), halt bit [0]=0
+    assert_eq!(s.count_step_remaining, Some(4));
+    assert!(!s.is_halted(), "arming alone does not halt");
+}
+
+#[test]
+fn count_step_zero_disables() {
+    let mut s = CoreDebugState::new();
+    s.enabled = true;
+    s.write_debug_control0(0x10);
+    s.write_debug_control0(0x00); // N=0 -> disabled
+    assert_eq!(s.count_step_remaining, None);
+    assert!(!s.tick_count_step(), "disabled budget never halts");
+    assert!(!s.is_halted());
+}
+
+#[test]
+fn count_step_decrements_then_halts_before_n_plus_1() {
+    // N=2: bundles 1 and 2 commit (tick after each), halt latched on the
+    // 2nd tick so the existing is_halted gate blocks bundle 3.
+    let mut s = CoreDebugState::new();
+    s.enabled = true;
+    s.write_debug_control0(0x08); // N=2 (2<<2)
+    assert!(!s.tick_count_step(), "after bundle 1: budget 2->1, no halt");
+    assert_eq!(s.count_step_remaining, Some(1));
+    assert!(s.tick_count_step(), "after bundle 2: budget expires, halt");
+    assert!(s.is_halted());
+    assert!(s.halt_cause_count_step);
+    assert_eq!(s.count_step_remaining, None, "expiry clears the budget");
+}
+
+#[test]
+fn count_step_expiry_clears_no_rearm_on_resume() {
+    let mut s = CoreDebugState::new();
+    s.enabled = true;
+    s.write_debug_control0(0x04); // N=1
+    assert!(s.tick_count_step(), "N=1 halts on the first tick");
+    assert_eq!(s.count_step_remaining, None);
+    s.request_resume(); // resume must NOT re-arm the budget
+    assert_eq!(s.count_step_remaining, None);
+    assert!(!s.tick_count_step(), "post-expiry ticks are no-ops until a fresh write");
+}
+
+#[test]
+fn count_step_halt_bit_precedence_with_latent_budget() {
+    // 0x11 = halt bit [0]=1 AND Single_Step_Count=4. Bit[0]'s immediate
+    // halt takes precedence; the N-budget is still armed (latent).
+    let mut s = CoreDebugState::new();
+    s.enabled = true;
+    s.write_debug_control0(0x11);
+    assert!(s.is_halted(), "halt bit [0] halts immediately (precedence)");
+    assert_eq!(s.count_step_remaining, Some(4), "budget armed latent");
+}

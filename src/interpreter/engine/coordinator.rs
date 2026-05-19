@@ -710,6 +710,10 @@ impl InterpreterEngine {
                 // now (interpretation (a): the triggering bundle is the
                 // last to commit before halt).
                 tile.core_debug.consume_pending_single_step();
+                // §5.2 count-step: decrement the live budget per committed
+                // bundle; expiry latches halted, the is_halted gate blocks the
+                // next bundle (before-commit of N+1, G2-derived).
+                tile.core_debug.tick_count_step();
 
                 // Mirror the live PC onto tile.core.pc as well, so any
                 // path that reads tile-side state (broadcast
