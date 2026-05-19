@@ -9,6 +9,13 @@
 # would format the entire module tree on every edit to lib.rs / mod.rs.
 # Stdin mode treats the input as a standalone source unit.
 #
+# Stdin mode discovers rustfmt.toml from the CWD, not the input path.
+# This hook's CWD is Claude Code's launch dir (the npu-work parent per
+# project CLAUDE.md), which has no rustfmt.toml -- so without an explicit
+# --config-path, every edit gets formatted with DEFAULT config instead of
+# the project's tuned rustfmt.toml. We resolve the config by walking up
+# from the edited file to its repo root, making the hook CWD-independent.
+#
 # Silent on success. Surfaces stderr only on failure.
 
 set -u
@@ -26,10 +33,22 @@ if [ ! -f "$f" ]; then
     exit 0
 fi
 
+# Walk up from the edited file to the dir holding rustfmt.toml so
+# stdin-mode rustfmt uses project config regardless of this hook's CWD.
+cfg_args=()
+d=$(cd "$(dirname "$f")" 2>/dev/null && pwd)
+while [ -n "$d" ] && [ "$d" != "/" ]; do
+    if [ -f "$d/rustfmt.toml" ] || [ -f "$d/.rustfmt.toml" ]; then
+        cfg_args=(--config-path "$d")
+        break
+    fi
+    d=$(dirname "$d")
+done
+
 tmp=$(mktemp) || exit 0
 err=$(mktemp) || { rm -f "$tmp"; exit 0; }
 
-if rustfmt --emit stdout < "$f" > "$tmp" 2> "$err"; then
+if rustfmt ${cfg_args[@]+"${cfg_args[@]}"} --emit stdout < "$f" > "$tmp" 2> "$err"; then
     # Replace only if rustfmt produced output and output differs.
     if [ -s "$tmp" ] && ! cmp -s "$tmp" "$f"; then
         mv "$tmp" "$f"
