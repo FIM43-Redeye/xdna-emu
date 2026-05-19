@@ -601,7 +601,12 @@ boundary; `tick_single_step()` per-bundle drive — out of this unit.
   never reaches `CORE_DONE`, so the DONE-MASKPOLL blocks forever and
   wedges the NPU *by design* — that wedge is the discriminator. Protocol:
   recover (staged, per CLAUDE.md), re-run that point once with the Exp1
-  `DEBUG_HALT` MASKPOLL. A point that wedges *both* the DONE-MASKPOLL and
+  `DEBUG_HALT` MASKPOLL **and a forced fresh compile** (witness-switch
+  hazard: the injector never rewrites an existing poll, so a warm compile
+  cache would silently keep the stale `done` witness; `inject-maskpoll.py`
+  now hard-fails on a witness mismatch — surfaced as a bridge COMPILE
+  FAIL — so the only correct path is recompile, not silent
+  mis-derivation). A point that wedges *both* the DONE-MASKPOLL and
   the DEBUG_HALT-MASKPOLL (neither terminal state reached) after one
   recovery+retry is recorded "config <X> indeterminate/wedges device"
   and the sweep skips to the next point — bounded, same posture as the

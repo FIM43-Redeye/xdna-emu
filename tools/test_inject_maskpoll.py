@@ -177,6 +177,31 @@ def test_idempotent_double_inject():
     assert twice == once, "double-inject must not change bytes"
 
 
+def test_idempotent_same_witness_done():
+    """Re-injecting the SAME witness on an already-injected binary is a
+    no-op (not just for the default halt witness)."""
+    data = _build_insts()
+    once, injected1 = inj.inject(data, witness="done")
+    assert injected1 is True
+    twice, injected2 = inj.inject(once, witness="done")
+    assert injected2 is False and twice == once
+
+
+def test_witness_mismatch_raises():
+    """Re-injecting a DIFFERENT witness on an already-injected binary must
+    fail loud (the Task 7 wedge-re-run footgun: switching
+    DEBUG_HALT_PROBE_WITNESS on a warm compile cache).  The injector never
+    silently keeps the stale witness."""
+    data = _build_insts()
+    halted, _ = inj.inject(data, witness="halt")
+    with pytest.raises(ValueError, match="DIFFERENT witness"):
+        inj.inject(halted, witness="done")
+    # And the symmetric direction.
+    done, _ = inj.inject(data, witness="done")
+    with pytest.raises(ValueError, match="DIFFERENT witness"):
+        inj.inject(done, witness="halt")
+
+
 def test_missing_anchor_raises():
     data = _build_insts(with_anchor=False)
     with pytest.raises(ValueError, match="no ctrl-in MaskWrite32"):
@@ -292,6 +317,5 @@ def test_witness_done_cli(tmp_path):
 def test_witness_invalid():
     """An invalid witness name raises ValueError."""
     data = _build_insts()
-    import pytest as _pytest
-    with _pytest.raises(ValueError, match="unknown witness"):
+    with pytest.raises(ValueError, match="unknown witness"):
         inj.inject(data, witness="bogus")

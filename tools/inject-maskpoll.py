@@ -211,13 +211,22 @@ def build_maskpoll_bytes(witness: str = "halt") -> bytes:
     return bytes(rec)
 
 
-def already_injected(buf: bytes) -> bool:
-    """True if a MASKPOLL on reg_off 0x00232004 is already present."""
+def _existing_maskpoll_value(buf: bytes):
+    """The `value` word ([16..20]) of the first Core_Status MASKPOLL already
+    in `buf`, or None if none is present.  The value word IS the witness bit
+    (build_maskpoll_bytes sets value == mask == the witness bit), so this
+    doubles as the existing-witness probe."""
     for off, opcode in _walk(buf):
         if opcode == _OPC_MASKPOLL:
             if _maskwrite_maskpoll_reg_off(buf, off) == _MASKPOLL_REG_OFF:
-                return True
-    return False
+                return struct.unpack_from("<I", buf, off + 16)[0]  # [16..20]
+    return None
+
+
+def already_injected(buf: bytes) -> bool:
+    """True if a MASKPOLL on reg_off 0x00232004 is already present (any
+    witness)."""
+    return _existing_maskpoll_value(buf) is not None
 
 
 def find_anchor_offset(buf: bytes) -> int:
@@ -252,8 +261,25 @@ def inject(buf: bytes, witness: str = "halt") -> Tuple[bytes, bool]:
             f"bad insts.bin magic {magic:#010x} (want {_INSTS_MAGIC:#010x})"
         )
 
-    if already_injected(buf):
-        return bytes(buf), False
+    want = _DEBUG_HALT_BIT if witness == "halt" else _CORE_DONE_BIT
+    existing = _existing_maskpoll_value(buf)
+    if existing is not None:
+        if existing == want:
+            return bytes(buf), False  # idempotent: same witness already there
+        # A MASKPOLL with a DIFFERENT witness is present.  The injector never
+        # rewrites an existing poll (a size-changing excise+re-splice would
+        # risk desynchronising the stream -- same rationale as the no-op
+        # contract).  This is the Task 7 wedge-re-run footgun: switching
+        # DEBUG_HALT_PROBE_WITNESS on a warm compile cache.  Fail loud
+        # (surfaces as a bridge COMPILE FAIL) rather than silently run the
+        # wrong witness and mis-derive G2.
+        raise ValueError(
+            f"insts.bin already has a Core_Status MASKPOLL with a DIFFERENT "
+            f"witness (existing value {existing:#010x}; requested "
+            f"{witness!r} = {want:#010x}).  The injector never rewrites an "
+            f"existing poll.  Recompile to a fresh insts.bin before switching "
+            f"the witness: emu-bridge-test.sh --compile (or edit aie.mlir)."
+        )
 
     anchor = find_anchor_offset(buf)
     poll = build_maskpoll_bytes(witness)
