@@ -1547,6 +1547,17 @@ impl InterpreterEngine {
     /// engine's internal core state, enabling execution.
     ///
     /// Call this after `device_mut().apply_cdo()` to start execution.
+    ///
+    /// Scope: this mirrors `tile.core.enabled`/`pc` into engine bookkeeping
+    /// only. It does NOT route through `core_debug.enable()`, so it neither
+    /// clears the `core_debug` RESET bit nor updates DEBUG_HALT/enable
+    /// state. That is correct in the CDO flow because the preceding
+    /// `apply_cdo()` `Core_Control` register write already established
+    /// `core_debug` state. Do not use this as a standalone enable path:
+    /// without a prior `Core_Control` write (or `Coordinator::enable_core`,
+    /// which goes through `core_debug.enable()`), `core_debug` is left
+    /// unsynced and `Core_Status` reports stale bits. See §8 close-out
+    /// (2026-05-19).
     pub fn sync_cores_from_device(&mut self) {
         for col in 0..self.cols {
             for row in self.compute_row_start..self.rows {
