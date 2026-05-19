@@ -372,14 +372,67 @@ tracked Section 8 forward-commitment.
 
 ### 4.3 Experiment 2 — Single_Step_Count characterization (G2)
 
-Kernel = N distinct sequential marker stores (`mem[i]=i` for a known
-N). Control packets write `Debug_Control0=(N<<2)` across a small matrix:
-count alone; count + halt-bit; count with core enabled first vs before
-enable. After each, `ReadRegisters` Debug_Status/Core_Status and count
-landed markers. This characterizes arm / decrement / expire / re-arm as
-far as silicon reveals. Whatever stays ambiguous becomes an explicit
-documented modeling decision in Phase B (it is debugger-substrate-only;
-no binary path depends on it).
+**Mechanism inherits the three Exp1 redesigns.** Exp2 is *not* the
+pre-redesign lock-gated kernel the original plan sketched: the
+arming-race, shim-collision, and no-happens-after facts that forced the
+Exp1 redesigns apply identically here. Exp2 reuses, unchanged: the
+host→core blocking objectfifo **`@gate`** (so the `Debug_Control0` count
+write provably lands before the core proceeds — without it, a
+`LANDED:8 not-halted` result is ambiguous between "count-step inert on
+silicon" and "armed too late", which would void G2); and the **ctrl-in
+on shim MM2S ch1** disjointness fix (forced whenever `@gate` is present).
+
+Kernel = 8 distinct sequential marker stores (`output_buffer[k]=101+k`).
+`@seq` arms a single `Debug_Control0=(N<<2)[|halt-bit]` write (replacing
+the Exp1 PC_Event0/Debug_Control2 writes), feeds `@gate`, then issues the
+Exp1 ctrl-in OP_READ readback of the 8 marker slots + `Core_Status`.
+
+**Happens-after = conditional MASKPOLL on `Core_Status`, keyed to the
+two possible terminal states** (the approved Option A; the completion
+witness is the `CORE_DONE` status bit, not a memory sentinel —
+reorder-immune, no new derived constant, and `tools/inject-maskpoll.py`
+already targets `Core_Status`):
+
+- **Default injection: MASKPOLL on `CORE_DONE`** (bit 20, mask/value
+  `0x00100000`, aie-rt `xaiemlgbl_params.h:2347-2349`). Count-step inert
+  (the expected outcome — §1/§7): the core completes all 8 stores,
+  latches `CORE_DONE` (confirmed readable via OP_READ by our own Exp1
+  arming-race HW observation, `Core_Status=0x100000`), MASKPOLL
+  satisfies, OP_READ reads a settled `LANDED:8` state. Rigorous
+  synchronization, not a latency argument (no P3 flaw).
+- **DONE-MASKPOLL wedges ⟹ count-step actually halted the core
+  mid-sequence** (never reached `CORE_DONE`). Recover (staged, per
+  CLAUDE.md), re-run *that* matrix point with the Exp1 `DEBUG_HALT`
+  MASKPOLL (mask/value `0x00010000`) for a synchronized partial-state
+  read: `LANDED:N` + `DEBUG_HALT`. That re-run *is* the count-step-fired
+  finding for that point.
+
+Matrix (one `Debug_Control0` value per point): `count=4 no-halt 0x10`,
+`count=4 halt 0x11`, `count=2 no-halt 0x08`, `count=8 no-halt 0x20`,
+`count=0 control 0x00`. This characterizes arm / decrement / expire /
+halt-bit interaction as far as silicon reveals. Whatever stays ambiguous
+becomes an explicit documented modeling decision in Phase B (it is
+debugger-substrate-only; no binary path depends on it) and, if
+under-characterized, triggers the §8 count-step forward-commitment.
+
+**EMU expectation (self-checking, post Unit 1/1b).** *Correction —
+there is no write-side routing gap:* `aiex.npu.write32` to
+`Debug_Control0` (`0x32010`) reaches `core_debug` via
+`apply_tile_local_effects` → `write_debug_control0` (mod.rs:787), which
+stores `Single_Step_Count` (same retraction as §4.2 "Mechanism
+correction"; the earlier "EMU drops the write via the
+`write_core_register` catch-all" framing is false). EMU count-step is
+inert because **nothing reads/acts on the stored count** — the count-step
+state machine is the deferred Phase B §5.2 work, not a routing defect.
+So on EMU every matrix point: core runs all 8 → `CORE_DONE` →
+DONE-MASKPOLL satisfies (via the Unit-1b-reconciled mutable
+`read_register` path) → `LANDED:8`, not halted. The recorded G2 EMU
+baseline is "count-step inert in EMU (state machine unimplemented —
+Phase B §5.2)". If EMU does not latch `CORE_DONE` in `core_debug`'s
+computed `Core_Status` (so the DONE-MASKPOLL cannot satisfy on EMU),
+that is a discovered EMU-fidelity gap of the same class as the Unit-1b
+read reconciliation — surface it explicitly (small Phase-B-adjacent fix
+or documented EMU limitation), do not hand-wave or force the verdict.
 
 ### 4.4 Output
 
@@ -536,11 +589,23 @@ boundary; `tick_single_step()` per-bundle drive — out of this unit.
   Experiment 1 banked before Experiment 2, recovery staged.
 - Experiment 1 may invalidate the current after-commit model. That is
   the point — a scoped, derived fidelity fix, not scope creep.
-- `Single_Step_Count` may be inert on silicon (effectively reserved).
-  Then it is honestly documented as host-debugger-only emulator
-  semantics; the verdict is still a defensible Full because the
-  binary-reachable surface is complete and the unreachable surface is
-  explicitly characterized, not silently faked.
+- `Single_Step_Count` may be inert on silicon (effectively reserved) —
+  the *expected* Exp2 outcome (§1, §4.3). Then it is honestly documented
+  as host-debugger-only emulator semantics; the verdict is still a
+  defensible Full because the binary-reachable surface is complete and
+  the unreachable surface is explicitly characterized, not silently
+  faked.
+- **Exp2 conditional-MASKPOLL wedge is the signal, not a failure.** The
+  default Exp2 injection is a no-timeout MASKPOLL on `CORE_DONE`
+  (§4.3). If a matrix point's count-step actually halts the core, it
+  never reaches `CORE_DONE`, so the DONE-MASKPOLL blocks forever and
+  wedges the NPU *by design* — that wedge is the discriminator. Protocol:
+  recover (staged, per CLAUDE.md), re-run that point once with the Exp1
+  `DEBUG_HALT` MASKPOLL. A point that wedges *both* the DONE-MASKPOLL and
+  the DEBUG_HALT-MASKPOLL (neither terminal state reached) after one
+  recovery+retry is recorded "config <X> indeterminate/wedges device"
+  and the sweep skips to the next point — bounded, same posture as the
+  G1 HW step; do not redesign the probe a further time.
 - The streamed MASKPOLL has **no timeout** (no watchdog found in open
   sources — a hardware-fork unknown; assume infinite poll). If the core
   does **not** halt on HW (arming still fails despite the gate), the
