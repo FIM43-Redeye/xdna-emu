@@ -797,6 +797,16 @@ impl CoreDebugState {
     /// stay after-commit via the unchanged check_event_halt ->
     /// pending_single_step -> consume_pending_single_step path (documented
     /// modeling decision).
+    ///
+    /// Unlike `has_sync_pc_trap_at`, there is no `pc_event_halt_enabled()`
+    /// guard: SSTEP_EVENT has no separate enable register — a zero
+    /// `debug_sstep_event()` (EVENT_NONE) falls to the `_ => return false`
+    /// arm, which *is* the disabled check for this path.
+    ///
+    /// The `sync_trap_consumed_at` marker is shared with the Unit-1
+    /// PC_Event_Halt seam: if `has_sync_pc_trap_at` fires first at the same
+    /// PC (the coordinator checks it first), this returns false there — one
+    /// before-commit halt at that PC is the correct observable result.
     pub fn has_sync_sstep_pc_trap_at(&self, pc: u32) -> bool {
         let pc14 = pc & PC_EVENT_ADDRESS_MASK;
         if self.sync_trap_consumed_at == Some(pc14) {

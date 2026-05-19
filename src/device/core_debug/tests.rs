@@ -1089,6 +1089,10 @@ fn sstep_pc_trap_only_for_point_pc_events() {
 
 #[test]
 fn sstep_pc_trap_requires_valid_matching_pc_event() {
+    // VALID=0 means the PC_Event slot is unconfigured/disabled (hardware
+    // semantics): an unset or non-matching slot must not produce a
+    // before-commit sstep trap; only a VALID slot whose address matches
+    // the queried PC does.
     let mut state = CoreDebugState::new();
     state.enabled = true;
     state.debug_ctrl1 = make_dbg_ctrl1(0, EVENT_CORE_PC_2, 0, 0);
