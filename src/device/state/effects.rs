@@ -523,6 +523,16 @@ impl DeviceState {
                         l2.signal_interrupt(channel);
                     }
 
+                    // Received broadcasts also feed this tile's L1 (shim):
+                    // the PL module sees BROADCAST channel N as event id
+                    // SHIM_PL_BROADCAST_BASE + N. On latch L1 queues its
+                    // IRQ_NO into this tile's pending_broadcasts; the
+                    // fixpoint driver re-propagates it (L1 output -> L2).
+                    if tile.l1_irq.is_some() {
+                        let ev = SHIM_PL_BROADCAST_BASE + channel;
+                        tile.tap_l1_interrupt(ev);
+                    }
+
                     // Determine which directions propagation is allowed in
                     // from THIS tile (the source side of each outbound hop).
                     // Use whichever EventModule exists for this tile kind;
@@ -575,6 +585,57 @@ impl DeviceState {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Drive `propagate_broadcasts` to a fixed point.
+    ///
+    /// A broadcast delivered to a shim tile can latch its L1 controller,
+    /// which queues a new IRQ_NO broadcast (the L1 output). That second
+    /// broadcast must also propagate (to reach L2) within the same
+    /// dispatch. `propagate_broadcasts` drains once, so loop until no tile
+    /// has pending broadcasts, bounded to avoid pathological cycles.
+    ///
+    /// The cap (8) comfortably exceeds the real L1->L2 chain depth (one
+    /// hop); hitting it indicates a misconfiguration loop and is logged
+    /// rather than silently spun.
+    ///
+    /// Deferred optimization (correctness-phase, not yet): `propagate_broadcasts`
+    /// could return whether it queued new work, letting the common no-L1-latch
+    /// case skip the all-tiles scan entirely. Not worth the signature churn until
+    /// dispatch profiling shows this as a hotspot.
+    pub(crate) fn propagate_broadcasts_fixpoint(&mut self, col: u8, source_row: u8) {
+        const MAX_ITERS: u32 = 8;
+        self.propagate_broadcasts(col, source_row);
+        let mut pending: Vec<(u8, u8)> = Vec::new();
+        for iter in 0..MAX_ITERS {
+            pending.clear();
+            for c in 0..self.array.cols() {
+                for r in 0..self.array.rows() {
+                    if let Some(t) = self.array.get(c, r) {
+                        if !t.pending_broadcasts.is_empty() {
+                            pending.push((c, r));
+                        }
+                    }
+                }
+            }
+            if pending.is_empty() {
+                return;
+            }
+            for &(c, r) in &pending {
+                self.propagate_broadcasts(c, r);
+            }
+            // Warn AFTER the final propagation (don't skip work on the last
+            // iteration); fires once, not per-iteration.
+            if iter == MAX_ITERS - 1 {
+                log::warn!(
+                    "propagate_broadcasts_fixpoint hit iteration cap ({}) \
+                     starting from ({},{}); possible broadcast/interrupt loop",
+                    MAX_ITERS,
+                    col,
+                    source_row
+                );
             }
         }
     }
@@ -702,6 +763,53 @@ mod interrupt_path_tests {
             0,
             "block mask must prevent L2 latch on un-visited neighbor shim"
         );
+    }
+
+    #[test]
+    fn received_broadcast_drives_shim_l1_then_l2_within_one_dispatch() {
+        use crate::device::interrupts::{
+            L1_REG_ENABLE_A, L1_REG_IRQ_NO_A, L2_REG_ENABLE, L2_REG_STATUS, SwitchId,
+        };
+        let mut dev = DeviceState::new_npu1();
+        let (scol, srow) = (0u8, 2u8); // compute source
+        let (shim_col, shim_row) = (0u8, 0u8);
+        {
+            let l1 = dev.array.get_mut(shim_col, shim_row).unwrap().l1_irq.as_mut().unwrap();
+            l1.set_irq_event_slot(SwitchId::A, 0, 110 + 2); // BROADCAST ch2 -> shim PL event 112
+            l1.write_register(L1_REG_ENABLE_A, 1 << 16);
+            l1.write_register(L1_REG_IRQ_NO_A, 6);
+        }
+        dev.array
+            .get_mut(shim_col, shim_row)
+            .unwrap()
+            .l2_irq
+            .as_mut()
+            .unwrap()
+            .write_register(L2_REG_ENABLE, 1 << 6);
+        dev.array.get_mut(scol, srow).unwrap().pending_broadcasts.push(2);
+        dev.propagate_broadcasts_fixpoint(scol, srow);
+        let l2 = dev.array.get(shim_col, shim_row).unwrap().l2_irq.as_ref().unwrap();
+        assert_ne!(
+            l2.read_register(L2_REG_STATUS).unwrap() & (1 << 6),
+            0,
+            "error/broadcast -> L1 -> L2 must complete within one dispatch"
+        );
+    }
+
+    #[test]
+    fn fixpoint_propagation_terminates_under_self_feeding_config() {
+        use crate::device::interrupts::{L1_REG_ENABLE_A, L1_REG_IRQ_NO_A, SwitchId};
+        let mut dev = DeviceState::new_npu1();
+        let (col, row) = (0u8, 0u8);
+        {
+            let l1 = dev.array.get_mut(col, row).unwrap().l1_irq.as_mut().unwrap();
+            l1.set_irq_event_slot(SwitchId::A, 0, 110 + 3); // input event 113
+            l1.write_register(L1_REG_ENABLE_A, 1 << 16);
+            l1.write_register(L1_REG_IRQ_NO_A, 3); // output ch3 -> feeds itself
+            let _ = SwitchId::B;
+        }
+        dev.array.get_mut(col, row).unwrap().pending_broadcasts.push(3);
+        dev.propagate_broadcasts_fixpoint(col, row); // must return, not hang
     }
 
     #[test]

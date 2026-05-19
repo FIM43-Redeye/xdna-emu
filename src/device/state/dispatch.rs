@@ -160,8 +160,10 @@ impl DeviceState {
         // underflow clear, event broadcast, and Event_Generate.
         self.apply_tile_local_effects(tile_addr.col, tile_addr.row, tile_addr.offset, value);
 
-        // Propagate broadcast events to all tiles in the column.
-        self.propagate_broadcasts(tile_addr.col, tile_addr.row);
+        // Propagate broadcast events to a fixed point: a delivered
+        // broadcast can latch a shim L1, whose IRQ_NO output must itself
+        // propagate to L2 within this dispatch (Tier A interrupt path).
+        self.propagate_broadcasts_fixpoint(tile_addr.col, tile_addr.row);
 
         Ok(())
     }
