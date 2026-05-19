@@ -513,6 +513,16 @@ impl DeviceState {
                     tile.notify_core_trace_event(core_hw_id, current_cycle, core_pc);
                     tile.notify_mem_trace_event(mem_hw_id, current_cycle, None);
 
+                    // Tier A interrupt sink: a broadcast delivered to a shim
+                    // tile is offered to its L2 interrupt controller. The
+                    // broadcast channel == L1 IRQ_NO == L2 input channel
+                    // (invariant; see channel-identity test). L2's enable-mask
+                    // gate decides whether it latches. Named seam -- interrupt
+                    // logic is not smeared into trace-notify above.
+                    if let Some(ref mut l2) = tile.l2_irq {
+                        l2.signal_interrupt(channel);
+                    }
+
                     // Determine which directions propagation is allowed in
                     // from THIS tile (the source side of each outbound hop).
                     // Use whichever EventModule exists for this tile kind;
@@ -611,6 +621,87 @@ mod interrupt_path_tests {
         let l1 = t.l1_irq.as_ref().unwrap();
         assert_ne!(l1.read_status(SwitchId::A) & (1 << 16), 0, "L1 status must latch");
         assert!(t.pending_broadcasts.contains(&5), "IRQ_NO 5 must be queued");
+    }
+
+    #[test]
+    fn broadcast_delivery_latches_shim_l2_on_matching_channel() {
+        use crate::device::interrupts::{L2_REG_ENABLE, L2_REG_STATUS};
+        let mut dev = DeviceState::new_npu1();
+        let (col, row) = (0u8, 0u8);
+        dev.array
+            .get_mut(col, row)
+            .unwrap()
+            .l2_irq
+            .as_mut()
+            .unwrap()
+            .write_register(L2_REG_ENABLE, 1 << 5);
+        dev.array.get_mut(col, row).unwrap().pending_broadcasts.push(5);
+        dev.propagate_broadcasts(col, row);
+        let l2 = dev.array.get(col, row).unwrap().l2_irq.as_ref().unwrap();
+        assert_ne!(
+            l2.read_register(L2_REG_STATUS).unwrap() & (1 << 5),
+            0,
+            "L2 channel 5 must latch on broadcast delivery"
+        );
+    }
+
+    #[test]
+    fn broadcast_delivery_does_not_latch_disabled_l2_channel() {
+        use crate::device::interrupts::L2_REG_STATUS;
+        let mut dev = DeviceState::new_npu1();
+        let (col, row) = (0u8, 0u8);
+        dev.array.get_mut(col, row).unwrap().pending_broadcasts.push(5);
+        dev.propagate_broadcasts(col, row);
+        let l2 = dev.array.get(col, row).unwrap().l2_irq.as_ref().unwrap();
+        assert_eq!(l2.read_register(L2_REG_STATUS).unwrap(), 0, "disabled L2 channel must not latch");
+    }
+
+    #[test]
+    fn broadcast_block_mask_prevents_l2_latch() {
+        use crate::device::events::broadcast::BroadcastDir;
+        use crate::device::interrupts::{L2_REG_ENABLE, L2_REG_STATUS};
+        // Topology: source = shim (0,0); target = adjacent shim (1,0).
+        //
+        // (1,0) has L2 channel 4 enabled. (0,0) has East blocked, so the
+        // BFS frontier never adds (1,0). Because the L2 sink fires only on
+        // BFS-visited tiles, (1,0) must not latch.
+        //
+        // Shim row is the bottom-most row (row 0), so South/West from (0,0)
+        // are off-grid. Only East and North are live from (0,0). Blocking
+        // East cuts the only direct path to (1,0); with (0,0)'s North
+        // propagating upward into column 0 compute tiles, the sideways
+        // re-entry into column 1 at row 0 would require traversing column 1
+        // downward, which still could reach (1,0). To keep the test clean
+        // and topology-independent, also block North on (0,0) so the BFS
+        // visits exactly one tile: (0,0) itself. This directly proves the
+        // sink cannot fire on an un-visited tile.
+        let mut dev = DeviceState::new_npu1();
+        let (src_col, src_row) = (0u8, 0u8);
+        let (tgt_col, tgt_row) = (1u8, 0u8);
+        // Enable channel 4 on the adjacent shim's L2.
+        dev.array
+            .get_mut(tgt_col, tgt_row)
+            .unwrap()
+            .l2_irq
+            .as_mut()
+            .unwrap()
+            .write_register(L2_REG_ENABLE, 1 << 4);
+        // Block East and North on the source shim so BFS stays at (0,0).
+        // `core_events` is the shim's event module (shim tiles have core
+        // module event state but no mem module; see Tile::new).
+        {
+            let em = dev.array.get_mut(src_col, src_row).unwrap().core_events.as_mut().unwrap();
+            em.broadcast.block_channel(4, BroadcastDir::East);
+            em.broadcast.block_channel(4, BroadcastDir::North);
+        }
+        dev.array.get_mut(src_col, src_row).unwrap().pending_broadcasts.push(4);
+        dev.propagate_broadcasts(src_col, src_row);
+        let l2 = dev.array.get(tgt_col, tgt_row).unwrap().l2_irq.as_ref().unwrap();
+        assert_eq!(
+            l2.read_register(L2_REG_STATUS).unwrap(),
+            0,
+            "block mask must prevent L2 latch on un-visited neighbor shim"
+        );
     }
 
     #[test]
