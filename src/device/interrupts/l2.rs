@@ -159,7 +159,15 @@ impl L2InterruptController {
             o if o == L2_REG_ENABLE => self.write_enable(value),
             o if o == L2_REG_DISABLE => self.write_disable(value),
             o if o == L2_REG_STATUS => self.clear_status(value), // Write-to-clear (ack)
-            o if o == L2_REG_INTERRUPT => { /* Interrupt output is read-only */ }
+            o if o == L2_REG_INTERRUPT => {
+                // NoC interrupt routing register. On hardware this is the
+                // single privileged L2 register (aie-rt _XAie_PrivilegeSetL2IrqId).
+                // Privilege is a driver-side concern; per the project policy
+                // applied to noc/shim_mux, the emulator gives unrestricted
+                // access and does not model privilege gating. Output state is
+                // derived, so the write is accepted and ignored. Scoped out by
+                // design (spec 2026-05-19-interrupt-l2-closeout, Tier A).
+            }
             _ => return false,
         }
         true

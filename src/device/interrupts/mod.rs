@@ -679,6 +679,29 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // L2: channel-identity invariant
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn channel_identity_l1_irq_no_equals_l2_input_channel() {
+        // Invariant probe: the broadcast id an L1 switch outputs (IRQ_NO) is
+        // the same numeric channel L2 latches on. If a future change inserts
+        // a remap, this fails loudly.
+        let mut l2 = L2InterruptController::new();
+        for ch in 0u8..16 {
+            l2.write_enable(1 << ch);
+        }
+        for irq_no in 0u8..16 {
+            l2.signal_interrupt(irq_no); // L1 IRQ_NO fed directly as L2 channel
+            assert_ne!(
+                l2.read_status() & (1 << irq_no),
+                0,
+                "L2 must latch the same channel index L1 output as IRQ_NO ({irq_no})"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
     // L2: register interface
     // ---------------------------------------------------------------
 
