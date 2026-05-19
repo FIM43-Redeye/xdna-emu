@@ -384,55 +384,69 @@ on shim MM2S ch1** disjointness fix (forced whenever `@gate` is present).
 
 Kernel = 8 distinct sequential marker stores (`output_buffer[k]=101+k`).
 `@seq` arms a single `Debug_Control0=(N<<2)[|halt-bit]` write (replacing
-the Exp1 PC_Event0/Debug_Control2 writes), feeds `@gate`, then issues the
-Exp1 ctrl-in OP_READ readback of the 8 marker slots + `Core_Status`.
+the Exp1 PC_Event0/Debug_Control2 writes), feeds `@gate`, then issues a
+**double** ctrl-in OP_READ readback of the 8 marker slots + `Core_Status`.
 
-**Happens-after = conditional MASKPOLL on `Core_Status`, keyed to the
-two possible terminal states** (the approved Option A; the completion
-witness is the `CORE_DONE` status bit, not a memory sentinel —
-reorder-immune, no new derived constant, and `tools/inject-maskpoll.py`
-already targets `Core_Status`):
+**Happens-after = no injected poll; latency-ordered double OP_READ,
+self-validated by snapshot agreement.** *This supersedes the earlier
+conditional-`CORE_DONE`-MASKPOLL design (Task 7 HW-grounded it out).*
 
-- **Default injection: MASKPOLL on `CORE_DONE`** (bit 20, mask/value
-  `0x00100000`, aie-rt `xaiemlgbl_params.h:2347-2349`). Count-step inert
-  (the expected outcome — §1/§7): the core completes all 8 stores,
-  latches `CORE_DONE` (confirmed readable via OP_READ by our own Exp1
-  arming-race HW observation, `Core_Status=0x100000`), MASKPOLL
-  satisfies, OP_READ reads a settled `LANDED:8` state. Rigorous
-  synchronization, not a latency argument (no P3 flaw).
-- **DONE-MASKPOLL wedges ⟹ count-step actually halted the core
-  mid-sequence** (never reached `CORE_DONE`). Recover (staged, per
-  CLAUDE.md), re-run *that* matrix point with the Exp1 `DEBUG_HALT`
-  MASKPOLL (mask/value `0x00010000`) for a synchronized partial-state
-  read: `LANDED:N` + `DEBUG_HALT`. That re-run *is* the count-step-fired
-  finding for that point.
+Rationale (HW-grounded, durable):
 
-Matrix (one `Debug_Control0` value per point): `count=4 no-halt 0x10`,
-`count=4 halt 0x11`, `count=2 no-halt 0x08`, `count=8 no-halt 0x20`,
-`count=0 control 0x00`. This characterizes arm / decrement / expire /
-halt-bit interaction as far as silicon reveals. Whatever stays ambiguous
-becomes an explicit documented modeling decision in Phase B (it is
-debugger-substrate-only; no binary path depends on it) and, if
-under-characterized, triggers the §8 count-step forward-commitment.
+- The injected `XAIE_IO_MASKPOLL` has **no timeout** (streamed encoding
+  drops `TimeOutUs`, §7). It blocks the firmware instruction stream
+  forever whenever its predicate never becomes true. Task 7 ran the
+  `CORE_DONE` poll on point `0x10` (count=4, no halt bit): it never
+  satisfied, wedged the mailbox, and (via the timed-out-message bug)
+  oopsed the kernel; recovery left the NPU **SMU-wedged (reboot-only)**.
+  An unbounded poll whose predicate we *cannot know in advance* is an
+  unacceptable Exp2 mechanism — and it was an unproven happens-after
+  (`CORE_DONE`-readable-via-OP_READ was assumed, never grounded).
+- The MASKPOLL was a **G1-specific rigor requirement**, not a
+  hang-avoidance one. The control-packet OP_READ path reads tile
+  memory/registers *directly, independent of core state* (Task 3
+  finding: it does **not** hang on a halted core — that was the deleted
+  lock-gated marker DMA). Exp1's Task-4 no-trap baseline read all
+  markers via plain OP_READ with no poll (that is how `OUTBUF_ADDR` was
+  self-checked). G1 needed synchronization-ordering only because its
+  question is an instruction-boundary (before/after the trap commits),
+  indistinguishable from "read too early" by latency alone.
+- G2's question is coarser and the end-state is **stable**: once
+  count-step halts the core (or it runs to `aie.end`) it writes nothing
+  more. A shim-DMA OP_READ round-trip (~ms, 9 packets) is orders of
+  magnitude slower than the core's 8 scalar stores (~µs), so the
+  readback inherently observes the settled terminal state.
 
-**EMU expectation (self-checking, post Unit 1/1b).** *Correction —
-there is no write-side routing gap:* `aiex.npu.write32` to
-`Debug_Control0` (`0x32010`) reaches `core_debug` via
-`apply_tile_local_effects` → `write_debug_control0` (mod.rs:787), which
-stores `Single_Step_Count` (same retraction as §4.2 "Mechanism
-correction"; the earlier "EMU drops the write via the
-`write_core_register` catch-all" framing is false). EMU count-step is
-inert because **nothing reads/acts on the stored count** — the count-step
-state machine is the deferred Phase B §5.2 work, not a routing defect.
-So on EMU every matrix point: core runs all 8 → `CORE_DONE` →
-DONE-MASKPOLL satisfies (via the Unit-1b-reconciled mutable
-`read_register` path) → `LANDED:8`, not halted. The recorded G2 EMU
-baseline is "count-step inert in EMU (state machine unimplemented —
-Phase B §5.2)". If EMU does not latch `CORE_DONE` in `core_debug`'s
-computed `Core_Status` (so the DONE-MASKPOLL cannot satisfy on EMU),
-that is a discovered EMU-fidelity gap of the same class as the Unit-1b
-read reconciliation — surface it explicitly (small Phase-B-adjacent fix
-or documented EMU limitation), do not hand-wave or force the verdict.
+To make "settled" *self-validating* rather than latency-assumed: `@seq`
+issues the 9-packet OP_READ readback **twice** (18 packets; pass B
+strictly after pass A in the in-order stream and after pass A's shim
+round-trips). `test.cpp` requires `A == B` (every `LANDED` slot and
+`Core_Status` identical) ⇒ provably settled. `A != B` ⇒ flagged
+`UNSETTLED` (core still mid-execution — a clean re-run, **never** a
+device wedge). `@gate` (arming-race) and ch1 (collision) are retained
+unchanged; the conditional-MASKPOLL re-run protocol is **removed**.
+
+Matrix: a **minimal set** — `count=0 control 0x00` and `count=4 no-halt
+0x10` — not the full 5-point sweep. `0x00` (count-step definitively off)
+vs `0x10` is the decisive contrast: it separates "count-step is active
+on silicon" from "count-step inert". Further points (`0x11`, `0x08`,
+`0x20`) only if the minimal set warrants and a hardware budget is
+available; otherwise remaining characterization is an explicit Phase B
+documented modeling decision + the §8 count-step forward-commitment.
+Each point is cheap and safe: worst case a TDR with clean driver
+recovery (the timed-out-message fix is verified), no SMU-wedge/reboot.
+
+**EMU expectation (self-checking, post Unit 1/1b).** *No write-side
+routing gap:* `aiex.npu.write32` to `Debug_Control0` (`0x32010`) reaches
+`core_debug` via `apply_tile_local_effects` → `write_debug_control0`
+(mod.rs:787), which stores `Single_Step_Count` (same retraction as §4.2
+"Mechanism correction"). EMU count-step is inert because **nothing
+reads/acts on the stored count** — the count-step state machine is the
+deferred Phase B §5.2 work, not a routing defect. So on EMU both points:
+core runs all 8 → terminal state stable → A == B → `LANDED:8`, not
+halted. Recorded G2 EMU baseline: "count-step inert in EMU (state
+machine unimplemented — Phase B §5.2)". No poll, so no MASKPOLL-satisfy
+dependency on EMU at all.
 
 ### 4.4 Output
 
@@ -595,31 +609,27 @@ boundary; `tick_single_step()` per-bundle drive — out of this unit.
   defensible Full because the binary-reachable surface is complete and
   the unreachable surface is explicitly characterized, not silently
   faked.
-- **Exp2 conditional-MASKPOLL wedge is the signal, not a failure.** The
-  default Exp2 injection is a no-timeout MASKPOLL on `CORE_DONE`
-  (§4.3). If a matrix point's count-step actually halts the core, it
-  never reaches `CORE_DONE`, so the DONE-MASKPOLL blocks forever and
-  wedges the NPU *by design* — that wedge is the discriminator. Protocol:
-  recover (staged, per CLAUDE.md), re-run that point once with the Exp1
-  `DEBUG_HALT` MASKPOLL **and a forced fresh compile** (witness-switch
-  hazard: the injector never rewrites an existing poll, so a warm compile
-  cache would silently keep the stale `done` witness; `inject-maskpoll.py`
-  now hard-fails on a witness mismatch — surfaced as a bridge COMPILE
-  FAIL — so the only correct path is recompile, not silent
-  mis-derivation). A point that wedges *both* the DONE-MASKPOLL and
-  the DEBUG_HALT-MASKPOLL (neither terminal state reached) after one
-  recovery+retry is recorded "config <X> indeterminate/wedges device"
-  and the sweep skips to the next point — bounded, same posture as the
-  G1 HW step; do not redesign the probe a further time.
+- **Exp2 uses no injected poll (Task-7 HW-grounded redesign).** The
+  earlier conditional-`CORE_DONE`-MASKPOLL design was run on HW and
+  failed badly: point `0x10` never satisfied the unbounded poll, wedged
+  the mailbox, exposed a kernel NULL-deref/UAF in `amdxdna`'s timed-out-
+  message teardown (now fixed and verified — `xdna_mailbox_cancel_msg` +
+  NULL-safe callbacks), and left the NPU SMU-wedged (reboot-only). It was
+  also an unproven happens-after (`CORE_DONE`-via-OP_READ assumed, never
+  grounded). Exp2 now uses the latency-ordered double OP_READ with
+  snapshot-agreement self-validation (§4.3) — **no instruction-stream
+  poll, so it structurally cannot block forever / cannot wedge**. Worst
+  case is a TDR with clean driver recovery (verified).
 - The streamed MASKPOLL has **no timeout** (no watchdog found in open
-  sources — a hardware-fork unknown; assume infinite poll). If the core
-  does **not** halt on HW (arming still fails despite the gate), the
-  MASKPOLL blocks the instruction stream forever and wedges the NPU.
-  Mitigation: hardware wedges are greenlit-survivable (recover per
-  CLAUDE.md `modprobe -r amdxdna && modprobe amdxdna`, staged); the G1
-  HW step is **bounded** — a second hang after one recovery+retry stops
-  the experiment and scopes G1 as the §8 forward-commitment rather than
-  a further redesign.
+  sources; infinite poll). This now affects **Exp1 only** (its
+  `DEBUG_HALT` poll is sound: a PC-event breakpoint deterministically
+  halts the core, so the predicate is guaranteed to become true).
+  Mitigation unchanged: hardware wedges are greenlit-survivable (recover
+  per CLAUDE.md, staged) and the timed-out-message driver fix makes a
+  `modprobe -r` on a wedged device a clean unload rather than a kernel
+  oops; the G1 HW step remains **bounded** — a second hang after one
+  recovery+retry scopes G1 to the §8 forward-commitment, no further
+  redesign.
 
 ## 8. Forward-commitment (tracked, deferred)
 

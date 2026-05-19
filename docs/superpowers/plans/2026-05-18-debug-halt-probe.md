@@ -558,7 +558,7 @@ Generated using Claude Code."
 
 ## Task 6: Experiment 2 kernel + config matrix — count-based single-step (EMU)
 
-**Goal:** Reshape the probe for `Debug_Control0[5:2]` (`Single_Step_Count`) characterization, **inheriting the three Exp1 redesigns** (`@gate` arming-race fix, ctrl-in on shim MM2S ch1, MASKPOLL happens-after) — spec §4.3. Without `@gate`, a `LANDED:8 not-halted` result is ambiguous between "count-step inert on silicon" and "armed too late", which would void G2.
+**Goal:** Reshape the probe for `Debug_Control0[5:2]` (`Single_Step_Count`) characterization, inheriting the Exp1 **`@gate`** (arming-race fix) and **ctrl-in on shim MM2S ch1** (collision fix), but **NOT the MASKPOLL** — the happens-after is a no-poll double-read OP_READ (spec §4.3; Task-7 HW-grounded the MASKPOLL out: the no-timeout `CORE_DONE` poll SMU-wedged the NPU and was an unproven happens-after). Without `@gate`, a `LANDED:8 not-halted` result is ambiguous between "count-step inert on silicon" and "armed too late", which would void G2.
 
 **Files:** Modify `mlir-aie/test/npu-xrt/debug_halt_probe/{aie.mlir,test.cpp,README.md}`; parameterize `xdna-emu/tools/inject-maskpoll.py`.
 
@@ -577,7 +577,7 @@ Generated using Claude Code."
       aie.end
 ```
 
-Markers are NOT assumed to be in source order on-chip — Step 3's verdict counts *how many distinct markers landed*, order-independent (each value unique). The happens-after is the `CORE_DONE` status bit (Step 4), NOT a memory sentinel — reorder-immune, no new derived constant.
+Markers are NOT assumed to be in source order on-chip — Step 3's verdict counts committed markers, order-independent (source binds value 101+k to slot k; the scheduler only reorders commit timing, not value-to-slot). The happens-after is the double OP_READ's snapshot agreement (Step 3), NOT an injected poll and NOT a memory sentinel — no new derived constant, no device-wedge hazard.
 
 - [ ] **Step 2: Count-step config in @seq.** Replace *only* the Exp1 PC_Event0 (`0x32020`) + Debug_Control2 (`0x32018`) arming writes with a single Debug_Control0 count write. Keep the `@gate` feed (`dma_memcpy_nd @gate`) and the entire Exp1 ctrl-in-on-ch1 OP_READ readback plumbing intact, extended to 8 marker slots (bump the read count 5→9: 8 markers + Core_Status; add 4 packet blocks mirroring the existing ones; `%c5_i64`→`%c9_i64`). Start `count=4`, no halt bit: `Debug_Control0 = (4<<2) = 0x10`:
 
@@ -589,65 +589,76 @@ Markers are NOT assumed to be in source order on-chip — Step 3's verdict count
       aiex.npu.write32 {address = 0x32010 : ui32, column = 0 : i32, row = 2 : i32, value = 0x10 : ui32}
 ```
 
-- [ ] **Step 3: LANDED verdict via control-packet readback in test.cpp.** Reuse the Exp1 read-packet machinery, extended to 8 slots. Read `output_buffer[0..7]` (`OUTBUF_ADDR + 4*k`) and `Core_Status` via OP_READ. `NUM_READ_PKTS` 5→9, `s[9]`. Verdict (report both terminal bits):
+- [ ] **Step 3: Double-read LANDED verdict in test.cpp (no MASKPOLL).** `@seq` issues the 9-packet OP_READ readback **twice** (18 packets: pass A = 8 markers + Core_Status, pass B = same; pass B is strictly after pass A in the in-order stream and after pass A's shim round-trips). `test.cpp` parses both snapshots and requires agreement (settled-state self-validation; spec §4.3). `NUM_READ_PKTS` 5→18; `sA[8]`,`csA`,`sB[8]`,`csB`:
 
 ```cpp
-  int landed = 0;
-  for (int k = 0; k < 8; k++) if (s[k] == (uint32_t)(101+k)) landed++;
-  bool halted = (cs & (1u<<16)) != 0;  // DEBUG_HALT (bit 16)
-  bool done   = (cs & (1u<<20)) != 0;  // CORE_DONE  (bit 20)
+  auto count = [](const uint32_t* s){ int n=0; for(int k=0;k<8;k++) if(s[k]==(uint32_t)(101+k)) n++; return n; };
+  int landedA = count(sA), landedB = count(sB);
+  bool settled = (landedA == landedB) && (csA == csB) &&
+                 !memcmp(sA, sB, sizeof(sA));
+  bool halted = (csB & (1u<<16)) != 0;  // DEBUG_HALT (bit 16)
+  bool done   = (csB & (1u<<20)) != 0;  // CORE_DONE  (bit 20)
   std::cout << "SLOTS:";
-  for (int k=0;k<8;k++) std::cout << " " << s[k];
-  std::cout << " CORE_STATUS=0x" << std::hex << cs << std::dec
+  for (int k=0;k<8;k++) std::cout << " " << sB[k];
+  std::cout << " CORE_STATUS=0x" << std::hex << csB << std::dec
             << " HALTED=" << (halted?1:0) << " DONE=" << (done?1:0)
-            << "\nLANDED:" << landed << "\n";
-  // done && landed==8 && !halted -> count-step inert (ran to completion)
-  // halted && landed==N          -> core halted after exactly N committed stores
-  // other                        -> partial/other; record SLOTS+CORE_STATUS verbatim
+            << " SETTLED=" << (settled?1:0)
+            << "\nLANDED:" << landedB << "\n";
+  if (!settled) { std::cout << "UNSETTLED\n"; return 1; }  // core mid-exec: clean re-run, NOT a wedge
+  // settled && landed==8 && !halted     -> count-step inert (ran to completion)
+  // settled && halted && landed==N      -> core stopped after N committed stores (count-step active)
+  // other settled                       -> record SLOTS+CORE_STATUS verbatim
   std::cout << "PASS\n";
   return 0;
 ```
 
-This is the transient Exp2 verdict; Task 8 git-restores the Exp1 `BEFORE_COMMIT` verdict. README documents the Exp1↔Exp2 switch.
+No injected poll, so nothing can block the instruction stream forever; the OP_READ reads tile memory/registers directly regardless of core state (Task-3 finding). This is the transient Exp2 verdict; Task 8 git-restores the Exp1 `BEFORE_COMMIT` verdict. README documents the Exp1↔Exp2 switch.
 
-- [ ] **Step 4: Parameterize the injector, EMU run, document matrix.** Parameterize `tools/inject-maskpoll.py` with the target `Core_Status` bit: a `--witness done|halt` flag (default `halt` = mask/value `0x00010000`, preserving Exp1 behavior byte-for-byte; `done` = `0x00100000`, `CORE_DONE`, aie-rt `xaiemlgbl_params.h:2347-2349`). Keep its existing unit tests green; add a `done`-witness test. Exp2 default injection is `--witness done`. Run: `cd /home/triple/npu-work/xdna-emu && ./scripts/emu-bridge-test.sh debug_halt_probe --chess-only --no-hw 2>&1 | tee /tmp/claude-1000/probe-exp2-emu.log`. **Expected EMU (corrected — no write-side gap):** the `Debug_Control0` write reaches `core_debug` via `apply_tile_local_effects` → `write_debug_control0` (mod.rs:787); EMU count-step is inert because the §5.2 state machine is unimplemented (nothing reads the stored count), NOT because the write is dropped. So the core runs all 8 → `CORE_DONE` → DONE-MASKPOLL satisfies (Unit-1b-reconciled mutable `read_register` path) → `LANDED:8`, `DONE=1`, `HALTED=0`. **If the DONE-MASKPOLL does not satisfy on EMU** (EMU `core_debug` does not latch `CORE_DONE` in computed `Core_Status`), STOP and surface it — a discovered EMU-fidelity gap of the Unit-1b class (small Phase-B-adjacent fix or documented EMU limitation), do not hand-wave or force the verdict. Append an "Experiment 2 sweep matrix" section to README with the exact `Debug_Control0` values: `count=4 no-halt 0x10`, `count=4 halt 0x11`, `count=2 no-halt 0x08`, `count=8 no-halt 0x20`, `count=0 control 0x00`, and the conditional-MASKPOLL protocol (default `--witness done`; on DONE-MASKPOLL wedge, recover + re-run that point `--witness halt`).
+- [ ] **Step 4: No-injection bridge wiring, EMU run, document.** The injector keeps its `--witness done|halt` param for Exp1, but Exp2 must inject **nothing**. Add a `none` sentinel to the bridge wiring: `_inject_maskpoll_if_probe` treats `DEBUG_HALT_PROBE_WITNESS=none` as "skip injection entirely" (echo `no MASKPOLL (Exp2 double-read)`); Exp1 default `halt` unchanged (still injects, byte-identical). Run: `cd /home/triple/npu-work/xdna-emu && DEBUG_HALT_PROBE_WITNESS=none ./scripts/emu-bridge-test.sh debug_halt_probe --chess-only --no-hw 2>&1 | tee /tmp/claude-1000/probe-exp2-emu.log`. **Expected EMU (no write-side gap):** `aiex.npu.write32` to `Debug_Control0` (`0x32010`) reaches `core_debug` via `apply_tile_local_effects` → `write_debug_control0` (mod.rs:787); EMU count-step is inert because the §5.2 state machine is unimplemented (nothing reads the stored count), NOT a dropped write. Core runs all 8 → terminal state stable → pass A == pass B → `SETTLED=1`, `LANDED:8`, `DONE=1`/`HALTED=0`, bridge `PASS`. No poll ⇒ no MASKPOLL-satisfy dependency on EMU. **If `SETTLED=0` on EMU** (snapshots disagree — EMU readback racing core completion), surface it: tune the inter-pass spacing (e.g. a benign extra OP_READ between passes), do not hand-wave. Append an "Experiment 2" section to README: minimal set (`count=0 control 0x00`, `count=4 no-halt 0x10`), the double-read no-poll mechanism, `DEBUG_HALT_PROBE_WITNESS=none`, and the Exp1↔Exp2 switch.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/triple/npu-work/xdna-emu && git add tools/inject-maskpoll.py tools/test_inject_maskpoll.py
+cd /home/triple/npu-work/xdna-emu && git add scripts/emu-bridge-test.sh
 cd /home/triple/npu-work/mlir-aie && git add test/npu-xrt/debug_halt_probe/
-git commit -m "debug_halt_probe: Exp2 -- count-step kernel + matrix (inherits Exp1 redesigns)
+git commit -m "debug_halt_probe: Exp2 -- count-step double-read (no MASKPOLL)
 
-8 distinct marker stores behind the Exp1 @gate (arming-race immunity);
-@seq writes Debug_Control0 Single_Step_Count; LANDED counted via the
-Exp1 ctrl-in-on-ch1 OP_READ readback. Happens-after = conditional
-MASKPOLL: default CORE_DONE (inert path), re-run halting points on
-DEBUG_HALT. Injector parameterized --witness done|halt. EMU baseline:
-count-step inert (state machine unimplemented -- Phase B 5.2; the write
-DOES reach core_debug -- no write-side gap). HW sweep matrix in README.
+8 distinct marker stores behind the Exp1 @gate (arming-race immunity)
+on ch1; @seq writes Debug_Control0 Single_Step_Count; LANDED via a
+DOUBLE ctrl-in OP_READ readback, settled-state self-validated by
+snapshot agreement (pass A == pass B). NO injected poll -- the Task-7
+HW-grounded redesign: the no-timeout CORE_DONE MASKPOLL SMU-wedged the
+NPU and was an unproven happens-after; OP_READ reads tile state
+core-independently (Task-3) and is ms >> the core's us, so a stable
+terminal state needs no synchronization. Cannot wedge the device.
+Bridge: DEBUG_HALT_PROBE_WITNESS=none skips injection (Exp1 halt
+default unchanged). EMU baseline: count-step inert (Phase B 5.2
+unimplemented; write DOES reach core_debug -- no write-side gap).
 
 Generated using Claude Code."
 ```
 
-(The xdna-emu injector commit and the mlir-aie probe commit are separate repos; commit each in its own tree. The message above is for the mlir-aie probe; the injector gets a parallel `tools: inject-maskpoll.py --witness done|halt for Exp2 ... Generated using Claude Code.` commit on `dev`.)
+(Separate repos: the bridge-wiring change commits on xdna-emu `dev`; the probe `test.cpp`/`aie.mlir`/README on mlir-aie `xdna-emu-cycle-budget`. The injector itself is unchanged this step — its `--witness` param already serves Exp1.)
 
 ---
 
 ## Task 7: Experiment 2 — hardware sweep, derive G2 [HARDWARE FORK]
 
-**Goal:** Sweep the count-step matrix on the real NPU; record what `Debug_Control0[5:2]` does on silicon as far as observable.
+**Goal:** Run the **minimal** count-step set on the real NPU with the no-poll double-read probe; record what `Debug_Control0[5:2]` does on silicon as far as observable.
 
 **Files:** Modify `mlir-aie/test/npu-xrt/debug_halt_probe/aie.mlir` (one value per point); `xdna-emu/docs/superpowers/findings/2026-05-18-debug-halt-timing-and-single-step-count.md` (G2 section)
 
-- [ ] **Step 1: Pre-flight hardware** (as Task 5 Step 1: `xrt-smi validate`, recover if needed).
+**Prerequisite: a reboot.** Task-7's first HW attempt SMU-wedged the NPU (the now-retired no-timeout `CORE_DONE` MASKPOLL); the device needs a reboot to clear it (kernel is healthy — the timed-out-message driver fix is verified). Maya triggers the reboot. The redesigned probe (no injected poll) **cannot** SMU-wedge the device — worst case is a TDR with clean driver recovery.
 
-- [ ] **Step 2: Run each matrix point on hardware, conditional-MASKPOLL protocol** (spec §4.3, §7). For each README-matrix config: set the `Debug_Control0` value in aie.mlir, inject the **default `--witness done`** MASKPOLL, run `./scripts/emu-bridge-test.sh debug_halt_probe --chess-only 2>&1 | tee /tmp/claude-1000/probe-exp2-hw-<cfg>-done.log` from `xdna-emu/`. Record `LANDED:` + full `SLOTS:`/`CORE_STATUS`/`DONE`/`HALTED`.
-  - **DONE-MASKPOLL satisfies** (`DONE=1`, `LANDED:8`, not halted): count-step inert for that point — recorded result, next config.
-  - **DONE-MASKPOLL wedges** (core never reached `CORE_DONE` ⟹ count-step halted it): recover (staged, per CLAUDE.md), re-run that point once with `DEBUG_HALT_PROBE_WITNESS=halt` **and a forced fresh compile** (`emu-bridge-test.sh --compile`, or touch `aie.mlir`) so the binary is re-injected with the `halt` witness: `DEBUG_HALT_PROBE_WITNESS=halt ./scripts/emu-bridge-test.sh debug_halt_probe --chess-only --compile 2>&1 | tee /tmp/claude-1000/probe-exp2-hw-<cfg>-halt.log`. Record `LANDED:N` + `HALTED=1` — that re-run *is* the count-step-fired finding for that point. **Why `--compile` is mandatory:** the injector refuses to rewrite an existing poll (size-changing excise risks desyncing the stream); on a warm compile cache it would otherwise no-op and silently keep the stale `done` witness. The injector now hard-fails (`ValueError: ... DIFFERENT witness ... recompile`) surfaced as a bridge COMPILE FAIL if the witness is switched without a fresh compile — a loud stop, not a silent mis-derivation. Forcing the recompile is the correct action; the raise is the safety net.
-  - **Both wedge** after one recovery+retry (neither terminal state reached): record "config <X> indeterminate/wedges device", skip to next. Bounded — do not redesign the probe (spec §7, §8 posture).
+- [ ] **Step 1: Pre-flight hardware** (`xrt-smi validate`; recover per CLAUDE.md if needed). Confirm the fixed `amdxdna` is loaded (`./build.sh -release -refresh_dkms` if a fresh build is needed).
 
-- [ ] **Step 3: Fill the G2 findings section.** Results table (config → EMU LANDED → HW LANDED/DONE/HALTED via which witness → interpretation) + a conclusion on arm/decrement/expire/halt-bit interaction and what stays unobservable. Mark unobservable edges "documented modeling decision in Phase B"; note the §8 count-step forward-commitment (silicon-fidelity revisit) applies if under-characterized (the likely outcome — count-step inert across the matrix is itself a valid, evidence-backed G2 finding).
+- [ ] **Step 2: Run the minimal set on hardware (no injection).** Two points only: `count=0 control 0x00` and `count=4 no-halt 0x10` (spec §4.3 — the decisive inert-vs-active contrast; the full 5-point sweep is explicitly *not* run). For each: set the `Debug_Control0` value in `aie.mlir`, run `DEBUG_HALT_PROBE_WITNESS=none ./scripts/emu-bridge-test.sh debug_halt_probe --chess-only --compile 2>&1 | tee /tmp/claude-1000/probe-exp2-hw-<cfg>.log` from `xdna-emu/`. Record `SLOTS:`/`CORE_STATUS`/`HALTED`/`DONE`/`SETTLED`/`LANDED:`.
+  - `SETTLED=1` is required for a usable datapoint; `UNSETTLED` ⇒ re-run once (clean, not a wedge — see Step 4 spacing note).
+  - **`0x00` settled, `LANDED:8`, not halted** (core ran to completion) AND **`0x10` settled, `LANDED:N<8` + halted/stopped** ⇒ count-step is **active** on silicon (the partial signal from Task-7 attempt 1, now cleanly grounded).
+  - **Both settled, `LANDED:8`, not halted** ⇒ count-step **inert** on silicon (the spec §1/§7 hypothesis).
+  - A TDR (firmware hang unrelated to a poll) ⇒ clean driver recovery (verified), `xrt-smi validate`, retry once; second TDR ⇒ record "indeterminate", §8 posture, do not redesign again.
+
+- [ ] **Step 3: Fill the G2 findings section.** Table (`0x00`/`0x10` → EMU LANDED → HW LANDED/HALTED/DONE/SETTLED → interpretation) + the active-vs-inert conclusion. Whatever the minimal set does not resolve (decrement/expire/re-arm/halt-bit interaction — the unrun points) is an explicit Phase B documented modeling decision + the **§8 count-step forward-commitment** (the expected disposition: substrate-only, no binary depends on it). Also record the Task-7 detour: the no-timeout `CORE_DONE` MASKPOLL HW-wedge, the kernel NULL-deref/UAF it exposed, the verified `amdxdna` fix, and the resulting probe redesign (this is significant durable content — cross-link the driver fix).
 
 - [ ] **Step 4: Commit**
 
@@ -656,11 +667,13 @@ cd /home/triple/npu-work/xdna-emu
 git add docs/superpowers/findings/2026-05-18-debug-halt-timing-and-single-step-count.md
 cd /home/triple/npu-work/mlir-aie
 git add test/npu-xrt/debug_halt_probe/aie.mlir
-git commit -m "debug_halt findings: G2 count-step characterized on hardware
+git commit -m "debug_halt findings: G2 count-step -- minimal HW set (no-poll double-read)
 
-Debug_Control0[5:2] matrix swept on real NPU1 (control-packet readback).
-Results table + conclusion; unobservable edges flagged for Phase B
-documented modeling decisions / Section 8 forward-commitment.
+0x00 vs 0x10 on real NPU1 via the redesigned no-injection double-read
+probe. Active-vs-inert conclusion; remaining edges -> Phase B modeling
+decisions + Section 8 forward-commitment. Records the Task-7 detour:
+no-timeout CORE_DONE MASKPOLL HW-wedge -> amdxdna NULL-deref/UAF (fixed,
+verified) -> probe redesign.
 
 Generated using Claude Code."
 ```
@@ -713,7 +726,7 @@ Then **stop**. Phase A is complete. Do not begin the Phase B remainder. Surface 
 **Spec coverage (spec Section 4 = Phase A):**
 - 4.1 instrument (control-packet readback while halted is load-bearing per revised §4.1; EMU-first then HW; Exp1 before Exp2; recovery staged) → Tasks 1 (authoring mechanism), 4 (readback mechanism + no-trap baseline), 5 (Exp1 HW), 6 (Exp2 EMU), 7 (Exp2 HW). Covered.
 - 4.2 Experiment 1, redesigned (4 markers; trap PC from `llvm-objdump-aie`; PC_Event0+Debug_Control2; **schedule-derived** verdict + Core_Status disambiguation; control-packet OP_READ while halted) → Tasks 2 (kernel), 3 (arming + disasm-derived TRAP_PC + re-derivation discipline), 4 (readback + verdict), 5 (HW derive G1). The "force store order" idea was investigated and rejected (no toolchain pin; empirically confirmed by our own disasm); schedule-derived verdict is the spec-blessed approach.
-- 4.3 Experiment 2 (8 markers, Debug_Control0 matrix) → Tasks 6,7. **Inherits all three Exp1 redesigns** (`@gate` arming-race fix, ctrl-in on shim MM2S ch1, MASKPOLL happens-after) — not the pre-redesign lock-gated sketch (spec §4.3). Happens-after = conditional MASKPOLL on `Core_Status`: default `CORE_DONE` (inert path, the expected outcome), re-run halting points on `DEBUG_HALT`. Control-packet readback is load-bearing (the lock-gated DMA cannot observe a halted core — Task 3 discovery). No write-side routing gap (Units 1/1b closed read reconciliation; spec §4.2).
+- 4.3 Experiment 2 (8 markers, Debug_Control0 minimal set) → Tasks 6,7. Inherits the Exp1 `@gate` (arming-race) + ctrl-in-on-ch1 (collision) fixes but **NOT the MASKPOLL** — Task-7 HW-grounded the no-timeout `CORE_DONE` poll out (it SMU-wedged the NPU, exposed the `amdxdna` NULL-deref/UAF, and was an unproven happens-after). Happens-after = no injected poll; latency-ordered **double OP_READ** self-validated by snapshot agreement (stable terminal state; OP_READ is core-state-independent — Task 3 — and ms ≫ the core's µs). Cannot wedge the device. HW = minimal `0x00`/`0x10` set, not the full sweep. No write-side routing gap (Units 1/1b; spec §4.2).
 - 4.4 output (findings doc + permanent re-runnable probe) → Tasks 5,7,8. Covered.
 
 **Superseded scope reductions (no longer open):** the earlier "ReadRegisters omitted as YAGNI" reduction is reversed — now the primary observation, justified by the discovered flaw. The post-resume hardware check stays out of Phase A but is a *tracked spec §8 forward-commitment* (resume hardware-verification), not an unflagged drop. Both are resolved in the spec, not merely "surfaced at regroup".
