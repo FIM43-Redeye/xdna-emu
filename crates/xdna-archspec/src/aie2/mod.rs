@@ -167,6 +167,16 @@ pub mod port_type {
 /// preprocessor. Submodules: `dma`, `locks`, `ports`.
 pub mod aiert;
 
+/// Async-error categorization tables and encoding helpers for Tier B.
+///
+/// Enums (`AieErrorOrigin`, `AieErrorCategory`, `AmdxdnaErrorNum`,
+/// `AmdxdnaErrorDriver`, `Severity`, `AmdxdnaErrorModule`, `Class`) with
+/// discriminant values matching the driver enums verbatim. Category lookup
+/// tables ported from `aie2_error.c` (CORE/MEM/MEMTILE/SHIM). Encoding
+/// helpers mirror `AMDXDNA_ERROR_CODE_BUILD` / `AMDXDNA_CRITICAL_ERROR_CODE_BUILD`
+/// (`amdxdna_error.h:106-115`) and `AMDXDNA_ERROR_EXTRA_CODE_BUILD`.
+pub mod async_errors;
+
 /// AIE2-family tile topology impl (`Aie2Topology`). Subsystem 2 seam.
 pub mod topology;
 
