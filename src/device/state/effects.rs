@@ -415,6 +415,11 @@ impl DeviceState {
                     }
                 }
             }
+            // Tier A interrupt path: a software-generated event is also
+            // offered to this tile's L1 interrupt controller (shim only).
+            // On latch, L1 queues its IRQ_NO into pending_broadcasts so the
+            // existing propagate_broadcasts transport carries it to L2.
+            tile.tap_l1_interrupt(event_id);
         }
     }
 
@@ -562,5 +567,65 @@ impl DeviceState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod interrupt_path_tests {
+    use super::*;
+
+    impl DeviceState {
+        /// Fire Event_Generate on a tile by calling apply_tile_local_effects
+        /// with the correct offset for that tile kind (test-only helper).
+        ///
+        /// For shim tiles, Event_Generate lives at `ce.event_generate`
+        /// (same offset that the production code matches for ShimNoc/ShimPl).
+        /// This keeps the test honest: it exercises the real production path.
+        fn fire_event_generate_for_test(&mut self, col: u8, row: u8, event_id: u8) {
+            let reg_layout = regdb::device_reg_layout();
+            let offset = match self.array.get(col, row).map(|t| t.tile_kind).expect("tile must exist") {
+                // mem-side (me.event_generate) intentionally omitted: Compute
+                // tiles have no l1_irq, so this helper is shim-scoped.
+                TileKind::Compute => reg_layout.core_events.event_generate,
+                TileKind::ShimNoc | TileKind::ShimPl => reg_layout.core_events.event_generate,
+                TileKind::Mem => reg_layout.memtile_events.event_generate,
+            };
+            self.apply_tile_local_effects(col, row, offset, event_id as u32);
+        }
+    }
+
+    #[test]
+    fn event_generate_on_shim_latches_l1_and_queues_irq_no() {
+        use crate::device::interrupts::{L1_REG_ENABLE_A, L1_REG_IRQ_NO_A, SwitchId};
+        let mut dev = DeviceState::new_npu1();
+        let (col, row) = (0u8, 0u8);
+        {
+            let t = dev.array.get_mut(col, row).unwrap();
+            let l1 = t.l1_irq.as_mut().unwrap();
+            l1.set_irq_event_slot(SwitchId::A, 0, 7);
+            l1.write_register(L1_REG_ENABLE_A, 1 << 16);
+            l1.write_register(L1_REG_IRQ_NO_A, 5);
+        }
+        dev.fire_event_generate_for_test(col, row, 7);
+        let t = dev.array.get(col, row).unwrap();
+        let l1 = t.l1_irq.as_ref().unwrap();
+        assert_ne!(l1.read_status(SwitchId::A) & (1 << 16), 0, "L1 status must latch");
+        assert!(t.pending_broadcasts.contains(&5), "IRQ_NO 5 must be queued");
+    }
+
+    #[test]
+    fn l1_switch_independence_only_configured_switch_latches() {
+        use crate::device::interrupts::{L1_REG_ENABLE_A, SwitchId};
+        let mut dev = DeviceState::new_npu1();
+        let (col, row) = (0u8, 0u8);
+        {
+            let l1 = dev.array.get_mut(col, row).unwrap().l1_irq.as_mut().unwrap();
+            l1.set_irq_event_slot(SwitchId::A, 0, 9);
+            l1.write_register(L1_REG_ENABLE_A, 1 << 16);
+        }
+        dev.fire_event_generate_for_test(col, row, 9);
+        let l1 = dev.array.get(col, row).unwrap().l1_irq.as_ref().unwrap();
+        assert_ne!(l1.read_status(SwitchId::A) & (1 << 16), 0);
+        assert_eq!(l1.read_status(SwitchId::B), 0, "switch B must not latch");
     }
 }

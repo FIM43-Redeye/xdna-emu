@@ -637,6 +637,35 @@ impl Tile {
         std::mem::take(&mut self.pending_broadcasts)
     }
 
+    /// Offer a fired event to both L1 interrupt switches (shim tiles).
+    ///
+    /// Faithful to the two-independent-switches hardware: each switch
+    /// slot-matches against its own IRQ_EVENT config and gates on its own
+    /// enable mask. On a latch, the switch drives its configured IRQ_NO
+    /// broadcast line -- modelled here by queueing that broadcast id into
+    /// `pending_broadcasts`, the same transport Event_Generate uses. L1 is
+    /// thus a second independent producer into the broadcast network.
+    /// No-op on non-shim tiles (no `l1_irq`).
+    ///
+    /// Safe to call unconditionally on any tile: callers need not gate on
+    /// `is_shim()` -- non-shim tiles (no `l1_irq`) are a silent no-op. Tasks
+    /// reusing this (broadcast sink, error path) rely on that contract.
+    pub fn tap_l1_interrupt(&mut self, event_id: u8) {
+        let Some(l1) = self.l1_irq.as_mut() else { return };
+        // Collect latched IRQ_NO values before releasing the l1 borrow so
+        // we can push to self.pending_broadcasts without a double-borrow.
+        let mut latched: [Option<u8>; 2] = [None; 2];
+        for sw in [super::interrupts::SwitchId::A, super::interrupts::SwitchId::B] {
+            if l1.signal_event(sw, event_id).is_some() {
+                latched[sw as usize] = Some(l1.read_irq_no(sw) as u8);
+            }
+        }
+        // l1 borrow ends here; safe to mutate pending_broadcasts.
+        for irq_no in latched.into_iter().flatten() {
+            self.pending_broadcasts.push(irq_no);
+        }
+    }
+
     // === Memory Bank Conflict Detection ===
 
     /// Number of physical memory banks for this tile type (for conflict detection).
