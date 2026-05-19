@@ -100,6 +100,13 @@ EMU run: 4.1 s, bridge PASS, no hang. `Core_Status = 0x10003` =
 `DEBUG_HALT`(bit 16) | `RESET`(bit 1) | `ENABLE`(bit 0). All four marker slots
 zero; `TRAP_VERDICT:BEFORE_COMMIT` -- matching HW.
 
+**RESOLVED (2026-05-19, §8 close-out):** the EMU `Core_Status = 0x10003`
+RESET-bit divergence noted above is fixed. `Coordinator::enable_core`
+now routes the core-debug enable through `write_control` (the same
+register semantics as a CDO `Core_Control=0x1` write), clearing `reset`.
+EMU now reports `Core_Status = 0x10001`, matching HW. See
+`docs/superpowers/specs/2026-05-19-debug-halt-section8-closeout-design.md`.
+
 **Phase B Unit 1b (xdna-emu `dev`, 2026-05-18) closes the earlier EMU
 limitation:** the mutable `tile.read_register` path (used by the injected
 MASKPOLL to poll `Core_Status` at `0x32004`) was previously falling back to the

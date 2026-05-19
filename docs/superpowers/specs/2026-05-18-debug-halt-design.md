@@ -665,7 +665,7 @@ silicon) was only partially observable (only `N=4` observed in the
 prologue, `LANDED:0`); the §8 forward-commitment stays OPEN after the
 remainder.
 
-**G1 halt-timing (bounded escalation).** The Phase A probe derives G1
+**G1 halt-timing (bounded escalation).** **RESOLVED (2026-05-19):** the contingency never fired -- G1 was DERIVED and SHIPPED (findings 2026-05-18 conclusion (a)). Retained below for history. The Phase A probe derives G1
 (synchronous-trap halt boundary, §5.1) on hardware via the MASKPOLL
 halt-synchronized OP_READ. If the HW core does not halt — MASKPOLL never
 satisfies — even after one recovery+retry (the §7-bounded HW step),
@@ -689,7 +689,7 @@ to be unknowns until probed, hardware-verifying resume is a tracked
 later-consideration: worth a dedicated probe pass eventually, not a
 Phase A/B blocker. Recorded here so it is not lost.
 
-**Probe-artifact robustness: `OUTBUF_ADDR`.** The redesigned Exp1/Exp2
+**Probe-artifact robustness: `OUTBUF_ADDR`.** **RESOLVED (2026-05-19):** unified golden-record-preserving build-time derivation -- see docs/superpowers/specs/2026-05-19-debug-halt-section8-closeout-design.md (OUTBUF_ADDR and the sibling TRAP_PC both now derived + guarded). Retained below for history. The redesigned Exp1/Exp2
 observation reads `output_buffer` via control-packet OP_READ at a
 tile-local address (`OUTBUF_ADDR`, expected `0x0400`) derived from the
 disassembly / aiecc allocation — a fragile magic constant of the same
@@ -704,7 +704,7 @@ programmatically — e.g. from the aiecc allocation map / a symbol — so
 it cannot rot), not a Phase A blocker. Recorded here so it is not
 ignored.
 
-**`Core_Status` RESET-bit EMU/HW divergence.** Surfaced by the Unit 1b
+**`Core_Status` RESET-bit EMU/HW divergence.** **RESOLVED (2026-05-19):** runtime enable path routed through write_control -- see 2026-05-19-debug-halt-section8-closeout-design.md. EMU now reports Core_Status 0x10001. Retained below for history. Surfaced by the Unit 1b
 code-quality review: when debug-halted at the trap, HW reports
 `Core_Status = 0x10001` (DEBUG_HALT|ENABLE) but EMU reports `0x10003`
 (DEBUG_HALT|RESET|ENABLE) — EMU leaves bit 1 (`RESET`) set.
