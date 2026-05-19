@@ -111,6 +111,23 @@ impl Tile {
             }
         }
 
+        // Interrupt controller read routing (shim tiles only). Mirrors the
+        // write routing in effects.rs::apply_tile_local_effects. L1 and L2
+        // occupy disjoint offset ranges (0x35xxx vs 0x15xxx) so order is
+        // immaterial; each returns None for offsets it does not own.
+        if self.is_shim() {
+            if let Some(ref l1) = self.l1_irq {
+                if let Some(val) = l1.read_register(offset) {
+                    return val;
+                }
+            }
+            if let Some(ref l2) = self.l2_irq {
+                if let Some(val) = l2.read_register(offset) {
+                    return val;
+                }
+            }
+        }
+
         // Fall back to register map
         self.registers.get(&offset).copied().unwrap_or(0)
     }
@@ -229,6 +246,10 @@ impl Tile {
                 return val;
             }
         }
+
+        // Interrupt controller registers are stateful (write-1-to-clear,
+        // enable->mask); they are intentionally NOT routed through this
+        // side-effect-free path -- guest interrupt reads use read_register.
 
         // Fall back to register map
         self.registers.get(&offset).copied().unwrap_or(0)
@@ -610,5 +631,51 @@ mod pkt_handler_status_tests {
         tile.pkt_handler_status = 0b0001; // First_Header_Parity_Error
         assert_eq!(tile.read_register(0x3FF30), 0b0001);
         assert_eq!(tile.read_register_pure(0x3FF30), 0b0001);
+    }
+}
+
+/// Task 1: L1/L2 read-path routing (interrupt close-out, 2026-05-19).
+///
+/// Verifies that `tile.read_register` routes L1 and L2 register reads through
+/// the dedicated interrupt controller objects on shim tiles, so that
+/// write-1-to-clear status and enable→mask reflection are visible to a guest
+/// read.  Before Task 1 both reads fell through to the generic HashMap
+/// (returning 0).
+#[cfg(test)]
+mod interrupt_read_routing_tests {
+    use super::*;
+
+    /// Writing to L2 Enable must make the mask reflect via `read_register`.
+    #[test]
+    fn shim_l2_enable_then_read_mask_reflects() {
+        let mut tile = Tile::shim(0, 0);
+        use crate::device::interrupts::{L2_REG_ENABLE, L2_REG_MASK};
+        assert!(tile.l2_irq.as_mut().unwrap().write_register(L2_REG_ENABLE, 0b1001));
+        assert_eq!(tile.read_register(L2_REG_MASK), 0b1001);
+        // A non-interrupt offset must still fall through (the routing block
+        // must not intercept offsets the controllers don't own).
+        assert_eq!(tile.read_register(0x0001_FFFF), 0, "non-L2 offset must fall through");
+    }
+
+    /// Writing to L1 Enable (Switch A) must make the mask reflect via
+    /// `read_register`.  Mirrors the L2 enable→mask test for L1.
+    #[test]
+    fn shim_l1_enable_then_read_mask_reflects() {
+        let mut tile = Tile::shim(0, 0);
+        use crate::device::interrupts::{L1_REG_ENABLE_A, L1_REG_MASK_A};
+        assert!(tile.l1_irq.as_mut().unwrap().write_register(L1_REG_ENABLE_A, 0b1010));
+        assert_eq!(tile.read_register(L1_REG_MASK_A), 0b1010);
+    }
+
+    /// L2 status write-1-to-clear must be visible through `read_register`.
+    #[test]
+    fn shim_l2_status_write_one_to_clear_visible_on_read() {
+        let mut tile = Tile::shim(0, 0);
+        use crate::device::interrupts::{L2_REG_ENABLE, L2_REG_STATUS};
+        tile.l2_irq.as_mut().unwrap().write_register(L2_REG_ENABLE, 0b1);
+        tile.l2_irq.as_mut().unwrap().signal_interrupt(0);
+        assert_eq!(tile.read_register(L2_REG_STATUS), 0b1);
+        tile.l2_irq.as_mut().unwrap().write_register(L2_REG_STATUS, 0b1);
+        assert_eq!(tile.read_register(L2_REG_STATUS), 0);
     }
 }
