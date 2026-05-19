@@ -728,3 +728,21 @@ Then **stop**. Phase A is complete. Do not begin Phase B. Surface to Maya: Phase
 **Placeholder scan:** No "TBD/TODO/handle appropriately". Intentional fill-ins (`<BEFORE|AFTER>` verdict, `OUTBUF_ADDR`, LANDED counts) are *experimental observations the executor records / derives*, each with an exact derivation step and a "substitute the real value before committing" instruction — a probe plan's outputs are data, not code.
 
 **Type/identifier consistency:** Test dir `debug_halt_probe`, tile `(0,2)`, offsets `0x32010/0x32018/0x32020`, `Core_Status` `0x32004`, `OUTBUF_ADDR` (derived, expected `0x0400`), trap bundle `0x114`→slot1=0xBB / strictly-later `0x11c`→slot0=0xAA consistent across spec §4.2, the aie.mlir TRAP_PC comment, and `test.cpp`; verdict tokens (`AFTER_COMMIT`/`BEFORE_COMMIT`/`NO_TRAP_OR_RAN_TO_END`/`AMBIGUOUS`/`ANOMALY_NOT_HALTED`/`LANDED`/`PASS`) consistent between `test.cpp` and the findings doc. Bridge invocation + recovery commands match CLAUDE.md.
+
+---
+
+## Phase B Unit 1: synchronous PC-event halt boundary (before-commit) + core_debug control-packet routing gaps
+
+> **Gate crossed deliberately.** Phase B was "Plan 2, later." This is one scoped, fully-derived, hardware-free unit pulled forward because G1 (Task 5b) unambiguously derived *before-commit* and this is the highest-leverage follow-through. Single-step / count-step / G2 remain deferred. Authority: spec §5.1, §5.3, §6 (committed coherence). Subagent-driven, TDD, two-stage review — same discipline as Tasks 4-5.
+
+**Goal:** Make a synchronous PC_Event/breakpoint halt take effect *before* the trap bundle's side effects commit (matching silicon, per the G1 finding), and wire the coupled `core_debug` control-packet register routing gaps so the behavior is testable end-to-end on EMU. PC_Event/breakpoint origin only; async paths provably untouched; single-step boundary explicitly out of scope.
+
+- [ ] **Step 1: Routing-gap fix (enables the end-to-end test).** Dispatch control-packet debug-register writes (`0x32010`–`0x3202C`) into `core_debug` instead of the silent `write_core_register` `_ => {}` (`compute.rs:554`), and the symmetric read path into `core_debug` (`read_register_pure`, `registers.rs:95`). TDD: control-packet write of PC_Event0/Debug_Control2 then read-back round-trips through `core_debug`; non-debug regs unaffected. Cite aie-rt offsets.
+
+- [ ] **Step 2: Pre-execute PC_Event seam.** In `coordinator.rs` (before `step_with_neighbor_locks`, ~:624): if the next PC matches an armed PC_Event with `PC_Event_Halt`, halt **without executing the bundle** (the trap store never lands). Add a non-committing `core_debug` query (e.g. `has_sync_pc_trap_at(pc)`); condition the existing post-execute `update_pc` (:638) so the same match does not re-fire after resume. Async halt paths and the `interpreter.rs:181` gate unchanged — verify by argument and by the existing async tests staying green.
+
+- [ ] **Step 3: Guarding test (approach decided up front).** Coordinator-level: arm PC_Event0 at a `TRAP_PC` whose bundle stores to a known tile data address, step, assert `DebugHalt` AND the store did **not** land (before-commit). Resolve the encoded-store-bundle dependency per spec §6 in order (a) reuse an existing compiled fixture; (b) hand-encode from llvm-aie ISA + document; (c) fall back to a state-machine-level assertion and explicitly record the literal store-not-landed claim as hardware-probe-covered. **Surface which of (a)/(b)/(c) before settling for (c).**
+
+- [ ] **Step 4: Validate + coverage + commit.** `cargo test --lib` green (xdna-emu + xdna-archspec); existing async/SSTEP tests (`core_debug/tests.rs:989,1046`, the watchpoint test) still pass (they assert untouched behavior). Regenerate coverage artifacts (`gen_coverage_artifacts`), zero drift; completeness stays `< Full` (G1 + routing closed; G2/single-step still open). Commit (xdna-emu `dev`), message ending `Generated using Claude Code.`. Then two-stage review (spec-compliance + code-quality, fresh sonnet) + controller adjudication, same as Task 5.
+
+**STOP at:** any need to move single-step/count-step (out of scope — defer to §5.2/G2); guarding-test fallback (c) without surfacing first; async-path behavior change (must be provably untouched).

@@ -381,21 +381,41 @@ checked in as a re-runnable regression for the subsystem.
 
 Introduce the distinction the hardware actually has:
 
-- **Synchronous trap halts** — PC_Event/breakpoint and single-step:
-  bound to a specific instruction boundary. Their halt boundary is set
-  to whatever Experiment 1 observes. If silicon halts before-commit and
-  we currently halt after-commit, this is a real, scoped fidelity fix:
-  evaluate the trap and the `DebugHalt` gate *before* the trap bundle
-  commits for sync-origin halts. If silicon halts after-commit, the
-  current model is *proven* and documented (no code change, only the
-  finding + a guarding test).
+- **Synchronous PC-event/breakpoint halts** — **G1 derived (Task 5b):
+  silicon halts BEFORE the trap bundle commits**; the emulator currently
+  evaluates the trap + `DebugHalt` gate *after* `update_pc` (after the
+  bundle's side effects commit). Scoped fidelity fix: a **pre-execute
+  seam** in the coordinator — for PC_Event/breakpoint origin, detect the
+  PC match and apply `DebugHalt` *before* the bundle's side effects
+  execute, so the trap bundle's store never lands. PC_Event/breakpoint
+  origin **only** (see single-step note).
+- **Single-step halts — deferred to §5.2/G2, not this unit.** Single-
+  step is synchronous in principle, but before-commit is only well-
+  defined for PC_Event-wired single-step; an `SSTEP_EVENT` armed by a
+  watchpoint/mid-execution event has *no* meaningful before-commit point
+  (its arming condition is only known after the bundle runs — a genuine
+  §5.1 design ambiguity, not just a hardware question). Single-step is
+  also naturally coupled to the count-step substrate (§5.2), which is
+  G2-dependent. The single-step halt boundary is therefore scoped out of
+  this unit and addressed with §5.2/G2. Two existing tests
+  (`core_debug/tests.rs:989,1046`) currently assert the after-commit
+  single-step model and stay valid until then.
 - **Asynchronous halts** — host `Debug_Control0[0]` write, stall-halt,
   external event-halt: take effect at the next instruction boundary.
-  Already correct; unchanged.
+  Already correct; the pre-execute seam is additive and provably does
+  not touch these (they keep setting `halted`, caught at the existing
+  `interpreter.rs:181` gate).
+- **Coupled prerequisite, folded into this unit:** the recorded Phase B
+  `core_debug` control-packet register-routing gaps — write side
+  (`write_core_register` `_ => {}` catch-all silently drops debug-reg
+  writes `0x32010`–`0x3202C`, `compute.rs:554`) and the symmetric read
+  side (`read_register_pure` has no `core_debug` dispatch,
+  `registers.rs:95`). Wiring both is required for an end-to-end emulator
+  guarding test (arm PC_Event via control packet, observe the halted
+  state) and is independently a recorded Phase B input.
 
-The split is the elegant core of the fix: a single, named seam between
-"this halt is tied to *this* instruction" and "this halt happens
-*soon*", rather than an ad hoc timing tweak.
+The async/sync split remains the elegant core; this unit lands the
+PC-event half (the part fully derived by G1 and unentangled with G2).
 
 ### 5.2 Count-step state machine (debugger substrate)
 
@@ -413,31 +433,61 @@ decisions, citing the finding.
 
 ### 5.3 Component boundaries
 
-- `src/device/core_debug/mod.rs` — count-step state machine; new
-  synchronous-trap-pending concept if 5.1 needs it. Self-contained.
-- `src/interpreter/engine/coordinator.rs` — single per-bundle drive
-  point: `tick_single_step()` + correct sync-trap halt boundary.
-- `src/interpreter/core/interpreter.rs` — refine the `DebugHalt`
-  boundary for sync traps **only if Experiment 1 demands it**.
-- probe kernel + findings doc — the derivation, durable.
+**This unit (PC-event before-commit + routing gaps):**
+- `src/interpreter/engine/coordinator.rs` — add the **pre-execute
+  PC_Event seam** before the bundle executes (before
+  `step_with_neighbor_locks`, ~:624): if the next PC matches an armed
+  PC_Event with `PC_Event_Halt`, halt *without* executing the bundle;
+  condition the existing post-execute `update_pc` (:638) so it does not
+  re-fire the same match after resume.
+- `src/device/core_debug/mod.rs` — a `sync_trap_pending`-style query
+  (`has_sync_pc_trap_at(pc)`) that does not itself commit the halt;
+  control-packet register dispatch reachable from the routing-gap fix.
+- `src/device/.../compute.rs:554` (`write_core_register`) + register
+  read path (`registers.rs:95`, `read_register_pure`) — dispatch
+  control-packet debug-reg writes/reads (`0x32010`–`0x3202C`) into
+  `core_debug` instead of the silent `_ => {}` / no-op.
+- `src/interpreter/core/interpreter.rs` — `is_halted()` gate at :181
+  unchanged (the coordinator sets `halted` pre-execute; the existing
+  gate still catches it). No change expected here.
+- findings doc — the derivation, durable (committed `96ecb6b`).
+
+**Deferred (with §5.2/G2):** count-step state machine; single-step halt
+boundary; `tick_single_step()` per-bundle drive — out of this unit.
 
 ## 6. Testing
 
-- Unit (`core_debug/tests.rs`): arm-N, tick-N, expire-at-N, resume
-  behavior, re-arm, count=0 no-op, halt-bit interaction. Pure state
-  machine, no hardware.
-- Interpreter-level: a sync-trap halt-boundary test asserting the
-  *observed* timing (breakpoint at a known PC; assert the trap-bundle
-  side effect did/did not land per Experiment 1); count-step end-to-end
-  through the coordinator.
-- Hardware probe = the derivation itself and a permanent re-runnable
-  regression.
+- Unit (`core_debug/tests.rs`): pre-execute sync-PC-trap query
+  (`has_sync_pc_trap_at`) arm/match/no-match; control-packet debug-reg
+  write/read dispatch round-trips through `core_debug` (routing-gap
+  fix). Pure, no hardware. (Count-step arm-N/tick-N/expire/resume unit
+  tests are deferred with §5.2/G2.)
+- **Guarding test (this unit): a coordinator-level before-commit
+  assertion** — arm PC_Event0 at a known `TRAP_PC` whose bundle stores
+  to a known tile data address, step, assert the core is `DebugHalt`
+  **and the store did NOT land** (before-commit, per G1). Now reachable
+  end-to-end because the routing-gap fix lets the test arm PC_Event via
+  the control-packet path. **Known risk / approach decision:** this
+  needs a real encoded AIE2 store-bundle in program memory (existing
+  interpreter tests use raw NOP bytes; no pre-baked store encoding is
+  known). Resolve up front, in order of preference: (a) reuse an
+  encoded store bundle from an existing compiled test binary/fixture;
+  (b) hand-encode one from the llvm-aie ISA and document the encoding;
+  (c) only if neither is feasible, fall back to a coordinator-level
+  state-machine assertion (halt fires pre-execute; PC not advanced)
+  and explicitly record that the literal store-did-not-land assertion
+  is covered by the hardware probe, not the unit suite. The implementer
+  must surface which of (a)/(b)/(c) before settling for a weaker test.
+- Hardware probe = the durable derivation + permanent regression
+  (committed; `MASKPOLL_UNSATISFIED_EMU` guards the EMU side).
 - `cargo test --lib` green (xdna-emu + xdna-archspec). Coverage
-  regenerated in lockstep: `units.rs` narrative → true state, verdict →
-  `Modeled { completeness: Full }` once G1+G2 closed, artifacts
-  regenerated via
-  `cargo run -p xdna-archspec --example gen_coverage_artifacts`,
-  zero drift, committed with the seed change.
+  regenerated in lockstep. **Completeness stays < Full after this
+  unit** — it closes the G1 (sync PC-event halt-boundary) surface and
+  the core_debug routing gaps; `Modeled { completeness: Full }` still
+  requires G2 + the deferred single-step/count-step substrate.
+  Regenerate artifacts via
+  `cargo run -p xdna-archspec --example gen_coverage_artifacts`, zero
+  drift, committed with the change.
 
 ## 7. Risks
 
