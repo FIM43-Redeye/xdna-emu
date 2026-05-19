@@ -1,0 +1,38 @@
+
+/home/triple/npu-work/mlir-aie/build/test/npu-xrt/debug_halt_probe/chess/aie_arch.mlir.prj/main_core_0_2.elf:	file format elf32-aie
+
+Disassembly of section .text:
+
+000000e0 <core_0_2>:
+      e0: 19 20 03 38  	paddb	[sp], #0x20
+      e4: 99 c2 ff 0f  	st	lr, [sp, #-4]
+      e8: 15 01 00 d8 00 00    	jl	#0x1b0
+      ee: 77 10 12 1a c0 01 80 7e ff 0f 06 00  	mova	r24, #0x0;		st	p7, [sp, #-8];		movxm	p0, #0x70424
+      fa: 3b c9 ff 27 28 06 00 00 56 00	st	r24, [p0, #0];		movx	r0, #0x31;		mov	r1, #-0x1
+     104: 01 00        	nop
+     106: 01 00        	nop
+     108: 23 78 00 00 04 00 00 00      	nopa	;		nopv
+     110: 15 01 00 e8 00 00    	jl	#0x1d0
+     116: 55 48 68 0e 07 00    	movxm	p7, #0x70424
+     11c: 43 c8 03 20 08 06 00 00      	movx	r0, #0x30;		mov	r1, #0x1
+     124: 01 00        	nop
+     126: 01 00        	nop
+     128: 23 78 00 00 04 00 00 00      	nopa	;		nopv
+     130: 59 b0 02 07  	lda	r24, [p7, #0]
+     134: 01 00        	nop
+     136: 01 00        	nop
+     138: d9 7e ff 07  	lda	p7, [sp, #-8]
+     13c: 01 00        	nop
+     13e: 15 01 00 d8 00 00    	jl	#0x1b0
+     144: 55 fc 9f fc ff 7f    	movxm	r25, #0x7ffffffe
+     14a: 99 8c 73 16  	ltu	r25, r25, r24
+     14e: 43 28 3b 1f 04 8c 33 00      	add	r24, r25, r24;		mov	p0, p7
+     156: 3b c9 ff 27 a8 06 00 00 56 00	st	r24, [p0, #0];		movx	r0, #0x35;		mov	r1, #-0x1
+     160: c0 03 00 88 03 00 00 00 00 00 00 00 00 00 00 00      	nopb	;		nopa	;		nops	;		nopx	;		nopm	;		nopv
+     170: d9 c2 ff 07  	lda	lr, [sp, #-4]
+     174: 95 00 00 e8 00 00    	j	#0x1d0
+     17a: bb 10 00 1a c0 01 00 28 64 17	mova	dj0, #0xbb;		movxm	p0, #0x70400
+     184: 03 40 57 11 00 20 d4 00      	st	dj0, [p0, #4];		mov	m0, #0xaa
+     18c: 3d 05 02 20 b0 00    	st	m0, [p0], #8;		movx	r1, #0x1
+     192: 2f 78 00 00 b4 19 61 00 00 82 06 00 00 00    	nopa	;		st	r1, [p0, #4];		mov	dj0, #0xcc;		nopv
+     1a0: c0 03 00 88 03 00 88 06 00 a1 02 00 00 00 fc ff      	paddb	[sp], #-0x20;		nopa	;		st	dj0, [p0, #0];		movx	r0, #0x34;		nopm	;		nopv
