@@ -264,6 +264,39 @@ Task-4 code review; the earlier "leave @out0, harmless" framing was
 wrong). Nothing in the probe depends on the halted core releasing a
 lock.
 
+**Halt-synchronization (Task 5 P2/P3 discovery + MASKPOLL fix).** The
+static-`@seq` OP_READ has *no happens-after* against the core halt:
+nothing orders "core halted at the trap PC" before "OP_READ reads
+`output_buffer`" — it was a pure relative-latency assumption (grounded
+P2/P3: the gated core's marker stores land *after* the EMU run loop
+terminates at `dma_wait @ctrl0`, `execution.rs:205-209`; and on silicon
+the on-die halt and the host/NoC OP_READ have no synchronization
+primitive between them — the same failure class that broke arming
+(attempt 1) and shim routing (attempt 2)). Grounding established there
+is **no on-device halt→lock/event actuation** on AIE2 (the event system
+is observational, not actuating: regdb has lock→event only, no
+event→lock-set; `DMA_*_Start_Queue` has no event field), and
+`aie.runtime_sequence` is strictly static (no poll/conditional op;
+`AIEX.td`). aie-rt's own debugger precedent is a host-side
+`XAie_MaskPoll` spin on the halt bit *then* read (`xaie_core.c:65-99`).
+The robust, synchronization-ordered fix is a firmware-level
+**`XAIE_IO_MASKPOLL`** instruction (opcode 4) post-compile-injected into
+the probe's `insts.bin`, positioned after the gate-feed `dma_memcpy_nd`
+and before the first OP_READ push: it blocks the instruction stream
+until `Core_Status & (1<<16)` (`DEBUG_HALT`) is set, so the OP_READ
+provably executes *after* the core has halted. No MLIR dialect emits
+this (`NpuMaskPollOp` does not exist; `AIETargetNPU.cpp`), so a
+post-compile binary patch is the only route — consistent with the
+probe's existing hand-rolled control-register writes and the trace
+stack's `insts.bin` patching. Byte-exact streamed form (28 bytes, no
+timeout field — `TimeOutUs` is dropped at serialization,
+`xaie_controlcode.c:620`): `reg_off = (col<<25)|(row<<20)|0x32004`
+(absolute NPU address; `col=0` logical, `row=2`), `value = mask =
+0x00010000`. The injector must bump the `insts.bin` header op-count
+(+1) and byte-size (+28); anchor the injection point to the first
+ctrl-in MaskWrite32 at tile-local `0x1d218` (channel-robust, not
+instruction-count-based).
+
 The verdict is computed from the disassembled schedule, using the
 `Core_Status` **DEBUG_HALT bit (16) alone** — `halted ≡ Core_Status &
 (1<<16)`. Requiring the ENABLE bit was rejected: ENABLE-stays-1-while-
@@ -282,19 +315,43 @@ without having executed):
 - not `halted`, slots not the full set → `ANOMALY_NOT_HALTED` (record
   raw).
 
-**EMU limitation (accepted).** Because EMU drops the breakpoint-arming
-writes (write-side `write_core_register` catch-all), EMU cannot produce
-a halted state. Additionally there is a *symmetric read-side gap*:
-control-packet OP_READ of core/debug registers (e.g. `Core_Status`
-0x32004) is not wired into `core_debug` (`read_register_pure` has no
-core_debug dispatch), so EMU returns `Core_Status = 0x0` even for a
-completed core. Both are recorded Phase B inputs (control-packet ⇄
-`core_debug` register routing, read and write sides; possibly multiple
-inconsistent register-access paths to reconcile). Consequently EMU
-validates only the readback *mechanism* and the no-trap baseline; the
-read-*while-halted* semantics and the G1 answer itself are first
-exercised on hardware (where Core_Status is populated correctly). This
-is understood, not a flaw — HW is the ground truth for G1 regardless.
+**EMU limitation + graceful poll-termination (accepted).** Because EMU
+drops the breakpoint-arming writes (write-side `write_core_register`
+catch-all), EMU cannot produce a halted state. Additionally there is a
+*symmetric read-side gap*: control-packet OP_READ of core/debug
+registers (e.g. `Core_Status` 0x32004) is not wired into `core_debug`
+(`read_register_pure` has no core_debug dispatch), so EMU returns
+`Core_Status = 0x0` even for a completed core. Both are recorded Phase B
+inputs (control-packet ⇄ `core_debug` register routing, read and write
+sides; possibly multiple inconsistent register-access paths to
+reconcile). Consequently EMU never satisfies the injected MASKPOLL
+(`Core_Status[16]` is never set). Because the streamed MASKPOLL has no
+timeout, a naive emulator would block on it forever and hang the host
+`run.wait()` (the OP_READ would never issue) — reintroducing the wedge
+class this redesign exists to remove.
+
+**Adopted contract — emulator graceful poll-termination.** EMU and HW
+run the *identical* injected binary (byte-parity). The emulator is
+changed so an unsatisfiable poll terminates the run **deterministically
+and honestly**: when a `BlockedOnPoll` cannot be satisfied and the
+engine is otherwise quiescent (core halted/idle, no monotonic
+progress), the run ends with a *distinct terminal reason*
+(`MaskPollUnsatisfied`), the FFI/`run.wait()` path returns a clean
+completion (not a hang), and the emulator **must not** fake the polled
+register, pretend the core halted, or skip to the OP_READ. The probe's
+`test.cpp` verdict treats "OP_READ responses absent because MASKPOLL
+unsatisfied" as the **expected EMU baseline** (a recognized
+`MASKPOLL_UNSATISFIED_EMU` outcome → bridge `PASS` for EMU), distinct
+from any HW verdict. This is an emulator behavior change with
+independent robustness merit (an unsatisfiable poll should never
+infinitely hang the emulator) and is TDD'd (poll satisfied immediately;
+satisfied after N cycles; never satisfied → deterministic terminal
+reason, no hang, no register fakery). Consequently EMU validates the
+readback *mechanism*, the disjoint route, the gate-feed, and the
+poll-termination contract; the read-*while-halted* semantics and the G1
+answer itself are first exercised on hardware (where `Core_Status` is
+populated and the MASKPOLL satisfies). This is understood, not a flaw —
+HW is the ground truth for G1 regardless.
 
 Resume is not exercised by this probe (a runtime sequence cannot
 deassert the breakpoint mid-run and re-observe); it stays in-emulator-
@@ -394,6 +451,15 @@ decisions, citing the finding.
   semantics; the verdict is still a defensible Full because the
   binary-reachable surface is complete and the unreachable surface is
   explicitly characterized, not silently faked.
+- The streamed MASKPOLL has **no timeout** (no watchdog found in open
+  sources — a hardware-fork unknown; assume infinite poll). If the core
+  does **not** halt on HW (arming still fails despite the gate), the
+  MASKPOLL blocks the instruction stream forever and wedges the NPU.
+  Mitigation: hardware wedges are greenlit-survivable (recover per
+  CLAUDE.md `modprobe -r amdxdna && modprobe amdxdna`, staged); the G1
+  HW step is **bounded** — a second hang after one recovery+retry stops
+  the experiment and scopes G1 as the §8 forward-commitment rather than
+  a further redesign.
 
 ## 8. Forward-commitment (tracked, deferred)
 
@@ -411,6 +477,20 @@ This mirrors the established `AIE_AXIMM_Config.SLVERR_Block` precedent
 left open as a recorded goal, not closed. The commitment is recorded
 here in Section 8 and surfaced in the `debug_halt` coverage narrative
 so it is discoverable, not lost.
+
+**G1 halt-timing (bounded escalation).** The Phase A probe derives G1
+(synchronous-trap halt boundary, §5.1) on hardware via the MASKPOLL
+halt-synchronized OP_READ. If the HW core does not halt — MASKPOLL never
+satisfies — even after one recovery+retry (the §7-bounded HW step),
+G1 is **not** force-concluded and the probe is **not** redesigned a
+further time. Instead Phase B ships the emulator's current
+after-commit synchronous-trap model as the **explicit documented
+assumption** (§5.1: model proven only if observed; otherwise stated as
+the unverified default), and a tracked forward-commitment records
+deriving G1 when better arming/observation tooling or a dedicated
+hardware-observation budget is available. Same posture as count-step
+above: open recorded goal, not closed; surfaced in the `debug_halt`
+coverage narrative.
 
 **Resume hardware-verification.** Phase A's probe derives halt timing
 but does not hardware-confirm *resume* (a runtime sequence cannot
