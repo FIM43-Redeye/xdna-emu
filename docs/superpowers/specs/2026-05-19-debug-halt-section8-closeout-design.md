@@ -186,27 +186,54 @@ tree). Given the probe project directory after a first aiecc compile:
   cannot be located unambiguously, the tool **exits non-zero with a
   diagnostic** — it never emits a default or guessed value.
 
-**Two-pass build inside `run.lit`** (keeps the probe standalone-
-reproducible under the lit harness; not buried in `emu-bridge-test.sh`):
+**Single-pass guarded build inside `run.lit`** (revised 2026-05-19
+during execution — see §2.5 for why this replaced the original two-pass
+design):
 
-1. Scratch-compile the probe (existing first aiecc invocation) to obtain
-   the core ELF.
-2. Run `debug-halt-probe-derive.py` → derived `OUTBUF_ADDR`,
-   `PC_EVENT0_VALUE`.
-3. Regenerate `aie.mlir` / `test.cpp` from the `.in` templates with the
-   derived values substituted.
-4. **Guard:** diff regenerated vs committed golden.
-   - **Equal:** proceed using the committed golden files unchanged
-     (Phase A bytes preserved; G1/G2 integrity intact).
-   - **Different:** **fail the build loudly**, printing
-     committed-vs-derived for each constant and the instruction: *if the
+1. Compile the probe once: the existing `aiecc` invocation on
+   `aie_arch.mlir` (the committed golden `aie.mlir` with `NPUDEVICE`
+   substituted), producing `aie_arch.mlir.prj/*core*.elf`.
+2. **Derive + guard** (a `run.lit` step after `aiecc`, before the host
+   `clang`/run): run `debug-halt-probe-derive.py` against the produced
+   core ELF → derived `OUTBUF_ADDR`, `PC_EVENT0_VALUE`; regenerate
+   `aie.mlir` / `test.cpp` from the `.in` templates; diff regenerated vs
+   committed golden.
+   - **Equal:** the bytes just compiled *are* the committed golden
+     (Phase A integrity intact); the step exits 0 and the host
+     `clang`/run lines proceed.
+   - **Different:** the tool exits non-zero, the `run.lit` step **fails
+     the test loudly** (the host compile/run lines do not execute),
+     printing committed-vs-derived and the instruction: *if the
      kernel/allocation change was intentional, commit the regenerated
      files as the new golden record and re-run.*
 
-Net effect: the constants are computed and verified on every build;
-silent rot is impossible; an intentional kernel change produces a clear
-build failure with the correct new value to commit, replacing the old
-"hand-disassemble and hope" maintenance loop.
+Why one compile suffices: the committed golden `aie.mlir` is the only
+kernel source, and the tool emits golden bytes verbatim on a match — so
+a separate scratch first pass is redundant. The guard runs *after* the
+single compile rather than before; on a match this is identical (golden
+was what compiled), and on drift the build still fails loudly and never
+ships drifted artifacts (worst case: one doomed compile is wasted before
+the guard aborts the test). The constants are still computed and
+verified on every build; silent rot is still impossible.
+
+### 2.5 Why single-pass (revised from two-pass during execution)
+
+The originally-approved design used a *two-pass* `run.lit`: a scratch
+`cp %S/aie.mlir scratch_arch.mlir` + first `aiecc`, derive, then a
+second `aiecc` of the verified golden. Implementation surfaced that this
+is incompatible with `emu-bridge-test.sh` — the probe's **primary**
+validation path (the XRT bridge is the real validation target;
+`debug_halt_probe` has committed bridge results). The bridge harness
+**skips all `cp` RUN lines** (`emu-bridge-test.sh:719`) and instead
+**synthesizes a single `aie_arch.mlir`** from canonical `aie.mlir`
+itself (≈ lines 1522-1535); it never creates `scratch_arch.mlir`, so the
+two-pass Pass-1 (`sed`/`aiecc scratch_arch.mlir`) fails under the bridge.
+The single-pass design needs no scratch `cp` and a single `aiecc` — the
+exact shape the bridge harness already supports — so it is compatible
+with **both** upstream `llvm-lit` and the bridge harness, while
+remaining functionally equivalent on the match path and equally loud on
+drift. (Maya, 2026-05-19: chose single-pass over extending the bridge
+harness.)
 
 ### 2.4 What this is *not*
 
@@ -290,8 +317,8 @@ Edits (all bookkeeping, no logic):
   uses `enable()`.
 - `src/device/core_debug/tests.rs` — Item 3 tests + stale-expectation
   corrections.
-- `../mlir-aie/test/npu-xrt/debug_halt_probe/run.lit` — two-pass build
-  with derive + guard.
+- `../mlir-aie/test/npu-xrt/debug_halt_probe/run.lit` — single-pass
+  build with a post-`aiecc` derive + guard step (§2.5).
 - `docs/superpowers/specs/2026-05-18-debug-halt-design.md` — §8 pointer
   updates (Item 1).
 - `docs/superpowers/findings/2026-05-18-debug-halt-timing-and-single-step-count.md`

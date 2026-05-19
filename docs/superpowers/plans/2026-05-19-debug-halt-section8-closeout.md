@@ -467,9 +467,24 @@ Generated using Claude Code."
 
 ---
 
-## Task 3: Item 2b — templatize probe + two-pass guarded build in run.lit
+## Task 3: Item 2b — templatize probe + single-pass guarded build in run.lit
 
-Wire the tool into the probe build: templatize the two golden files, add the scratch-compile → derive → guard → final-compile flow to `run.lit`. The committed `aie.mlir`/`test.cpp` stay byte-unchanged as the golden record.
+> **Revised 2026-05-19 during execution (Maya-approved).** The original
+> two-pass design (scratch `cp` + first `aiecc` + second `aiecc`) is
+> incompatible with `emu-bridge-test.sh`, the probe's primary validation
+> path: the bridge harness skips all `cp` RUN lines
+> (`emu-bridge-test.sh:719`) and synthesizes its own single
+> `aie_arch.mlir` (≈ lines 1522-1535), so `scratch_arch.mlir` is never
+> created and the two-pass Pass-1 fails under the bridge. The
+> single-pass design below compiles once and runs derive+guard against
+> the produced ELF: functionally equivalent on a match, equally loud on
+> drift, and compatible with both upstream `llvm-lit` and the bridge
+> harness. See spec §2.5. **Steps 1-3 (templates + round-trip) were
+> already completed correctly and the templates committed (mlir-aie
+> `424ce198be`); this revision only changes Step 4 (run.lit) and Steps
+> 5-6 — amend the existing mlir-aie commit.**
+
+Wire the tool into the probe build: templatize the two golden files, add a single-compile → derive → guard flow to `run.lit`. The committed `aie.mlir`/`test.cpp` stay byte-unchanged as the golden record.
 
 **Files:**
 - Create: `../mlir-aie/test/npu-xrt/debug_halt_probe/aie.mlir.in`
@@ -527,56 +542,69 @@ PY
 
 Expected: prints `... (golden match)` and `rc= 0`. If it reports drift, the template tokenization in Step 1/2 does not round-trip — fix the `.in` files (a stray byte difference) until it matches. (Output path uses `/tmp/claude-1000` — ephemeral, allowed.)
 
-- [ ] **Step 4: Rewrite `run.lit` as a two-pass guarded build**
+- [ ] **Step 4: Rewrite `run.lit` as a single-pass guarded build**
 
 Replace the RUN block in `../mlir-aie/test/npu-xrt/debug_halt_probe/run.lit` with (keep the header comment / `REQUIRES: ryzen_ai` lines above it intact):
 
 ```
-// Pass 1 (scratch): compile the committed golden to obtain the core ELF.
-// RUN: cp %S/aie.mlir scratch_arch.mlir
-// RUN: %run_on_npu1% sed 's/NPUDEVICE/npu1_1col/g' -i scratch_arch.mlir
-// RUN: %python aiecc.py --no-aiesim --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host --alloc-scheme=basic-sequential --xclbin-name=scratch.xclbin --npu-insts-name=scratch_insts.bin scratch_arch.mlir
-//
-// Derive + guard: re-derive OUTBUF_ADDR/TRAP_PC from the scratch ELF,
-// regenerate from the .in templates, diff against the committed golden.
-// Match -> emit golden bytes verbatim. Drift -> non-zero, fails here.
-// RUN: %python %S/../../../../xdna-emu/tools/debug-halt-probe-derive.py --elf scratch_arch.mlir.prj/*core*.elf --in-mlir %S/aie.mlir.in --in-cpp %S/test.cpp.in --golden-mlir %S/aie.mlir --golden-cpp %S/test.cpp --out-mlir aie_arch.mlir --out-cpp test_gen.cpp
-//
-// Pass 2 (final): compile the verified golden bytes.
+// Compile the committed golden once (aie_arch.mlir = golden aie.mlir
+// with NPUDEVICE substituted; under the bridge harness aie_arch.mlir is
+// synthesized from canonical aie.mlir, the cp line being skipped there).
+// RUN: cp %S/aie.mlir aie_arch.mlir
 // RUN: %run_on_npu1% sed 's/NPUDEVICE/npu1_1col/g' -i aie_arch.mlir
 // RUN: %python aiecc.py --no-aiesim --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host --alloc-scheme=basic-sequential --xclbin-name=aie.xclbin --npu-insts-name=insts.bin aie_arch.mlir
-// RUN: clang test_gen.cpp -o test.exe -std=c++17 -Wall %xrt_flags -lrt -lstdc++ %test_utils_flags
+//
+// Derive + guard (after aiecc, before host compile/run): re-derive
+// OUTBUF_ADDR/TRAP_PC from the compiled core ELF, regenerate from the
+// .in templates, diff against the committed golden aie.mlir/test.cpp.
+// Match -> exit 0 (the bytes just compiled ARE the golden; proceed).
+// Drift -> non-zero, the test fails HERE (host lines below do not run),
+// printing committed-vs-derived. One compile suffices: golden is the
+// only kernel source and the tool emits golden-on-match, so a separate
+// scratch pass is redundant; the --out-* files are a throwaway guard
+// side-effect (nothing consumes them in single-pass).
+// RUN: %python %S/../../../../xdna-emu/tools/debug-halt-probe-derive.py --elf aie_arch.mlir.prj/*core*.elf --in-mlir %S/aie.mlir.in --in-cpp %S/test.cpp.in --golden-mlir %S/aie.mlir --golden-cpp %S/test.cpp --out-mlir derived_check_aie.mlir --out-cpp derived_check_test.cpp
+//
+// RUN: clang %S/test.cpp -o test.exe -std=c++17 -Wall %xrt_flags -lrt -lstdc++ %test_utils_flags
 // RUN: %run_on_npu1% ./test.exe -x aie.xclbin -k MLIR_AIE -i insts.bin
 // RUN: %run_on_npu2% ./test.exe -x aie.xclbin -k MLIR_AIE -i insts.bin
 ```
 
-Notes for the engineer: the scratch ELF glob `scratch_arch.mlir.prj/*core*.elf` mirrors the observed project layout (`<arch>.mlir.prj/main_core_0_2.elf`); if `aiecc.py` emits a different prj dir name for the scratch arch, adjust the glob to match (verify by listing the scratch prj dir after Pass 1). Confirm the `%S/../../../../xdna-emu` depth resolves to the real `xdna-emu/tools/` path before committing.
+Notes for the engineer:
+- The ELF glob `aie_arch.mlir.prj/*core*.elf` mirrors the observed project layout (`aie_arch.mlir.prj/main_core_0_2.elf`). Verify it resolves to **exactly one** file after the `aiecc` step (both under lit and the bridge build dir); tighten the glob if more than one `*core*.elf` is emitted.
+- Confirm the `%S/../../../../xdna-emu` depth resolves to the real `xdna-emu/tools/` path (pre-verified to resolve; re-confirm).
+- The host compile uses `%S/test.cpp` (the golden, unchanged from the original probe). `derived_check_aie.mlir`/`derived_check_test.cpp` are written by the tool but consumed by nothing — they exist only so the tool's CLI contract is satisfied; the guard is purely its exit code.
+- Keep the `cp %S/aie.mlir aie_arch.mlir` first line (matches the original probe): under upstream lit it creates `aie_arch.mlir`; under the bridge harness it is skipped but the harness synthesizes `aie_arch.mlir` from canonical `aie.mlir` itself — either way `aie_arch.mlir` exists for `aiecc`.
 
-- [ ] **Step 5: Verify the probe still builds and the guard passes (HW path)**
+- [ ] **Step 5: Verify the probe builds and the guard passes — under BOTH paths**
 
-The probe runs through the bridge harness. Run the EMU-only quick path (no HW contention, safe in sandbox-adjacent flow per CLAUDE.md):
+This is the crux of the redesign: the single-pass `run.lit` must work under the bridge harness (the primary validation path), not only upstream lit.
 
-Run: `./scripts/emu-bridge-test.sh --no-hw -v debug_halt_probe 2>&1 | tee /tmp/claude-1000/dhp-build.log`
-Expected: the derive+guard step prints `... (golden match)`; the probe compiles through both passes; EMU run completes with the established `MASKPOLL_UNSATISFIED_EMU` / `TRAP_VERDICT:BEFORE_COMMIT` baseline (unchanged — the bytes are byte-identical to before). If the guard reports drift, STOP: either the tokenization regressed (fix `.in`) or a real toolchain change moved the constants (escalate — do not blindly re-baseline a permanent artifact).
+(a) Round-trip (already proven in Step 3; re-confirm if `.in` touched): the manual derive against the existing chess ELF prints `... (golden match)` and `rc=0`, and the regenerated outputs are byte-identical to the committed golden.
 
-If `emu-bridge-test.sh` is unavailable in the current environment, fall back to: run Pass 1 + the derive step manually (as in Step 3 but with `--out-mlir aie_arch.mlir --out-cpp test_gen.cpp` in a scratch dir) and confirm `rc=0` + `golden match`.
+(b) Bridge path: `./scripts/emu-bridge-test.sh --no-hw -v debug_halt_probe 2>&1 | tee /tmp/claude-1000/dhp-build.log`
+Expected: the harness synthesizes `aie_arch.mlir`, runs `aiecc`, then runs the `%python …/debug-halt-probe-derive.py …` RUN line (it is not a `cp` line, so it is NOT skipped), which prints `… (golden match)`; the EMU run reaches the established `MASKPOLL_UNSATISFIED_EMU` / `TRAP_VERDICT:BEFORE_COMMIT` baseline (unchanged — golden bytes are byte-identical to before). Confirm in the log that the derive RUN line actually executed under the bridge and the `aie_arch.mlir.prj/*core*.elf` glob resolved. If the bridge does NOT execute the derive line (e.g. it filters non-aiecc/non-run commands), STOP and report — that is a real integration gap to resolve, not to paper over.
+If running the bridge would contend for NPU hardware, use `--no-hw` (no HW contention) — that still exercises compile + derive+guard, which is what this task must prove. Only if `emu-bridge-test.sh` is entirely unavailable, fall back to (a) plus a manual replay of the exact RUN sequence (cp/sed/aiecc/derive) in a scratch dir, confirming the derive step exits 0 with `golden match` against the freshly-compiled ELF.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Amend the existing mlir-aie commit**
+
+Steps 1-2 already committed the templates at mlir-aie `424ce198be`. This revision changes only `run.lit`; amend it into that same commit (do NOT create a second commit; the mlir-aie commit is unpushed).
 
 ```bash
-git add ../mlir-aie/test/npu-xrt/debug_halt_probe/aie.mlir.in ../mlir-aie/test/npu-xrt/debug_halt_probe/test.cpp.in ../mlir-aie/test/npu-xrt/debug_halt_probe/run.lit
-git commit -m "debug-halt §8 close-out Item 2b: two-pass guarded probe build
+git -C ../mlir-aie add test/npu-xrt/debug_halt_probe/aie.mlir.in test/npu-xrt/debug_halt_probe/test.cpp.in test/npu-xrt/debug_halt_probe/run.lit
+git -C ../mlir-aie commit --amend -m "debug-halt §8 close-out Item 2b: single-pass guarded probe build
 
-run.lit now scratch-compiles, re-derives OUTBUF_ADDR/TRAP_PC from the
-core ELF, regenerates from .in templates, and guards against the
-committed golden aie.mlir/test.cpp (byte-unchanged Phase A record).
-Drift fails the build loudly with the new derived values; a match
-proceeds with the golden bytes. Silent constant rot is now impossible.
+run.lit compiles the committed golden once, then re-derives
+OUTBUF_ADDR/TRAP_PC from the core ELF, regenerates from .in templates,
+and guards against the committed golden aie.mlir/test.cpp (byte-unchanged
+Phase A record). Drift fails the test loudly before host compile/run; a
+match proceeds. Single-pass is bridge-harness-compatible (no scratch cp)
+and equivalent to two-pass on the golden path. Silent rot is impossible.
 
 Generated using Claude Code."
 ```
 
-Note: this commit touches files under `../mlir-aie`. Confirm the mlir-aie working tree is the intended target and commit there if it is a separate repo (the probe lives in the mlir-aie tree). If mlir-aie is a separate git repo, run the `git add`/`git commit` from `../mlir-aie` and adjust paths accordingly; the xdna-emu-side tool/tests were already committed in Task 2.
+CRITICAL: `../mlir-aie` is a SEPARATE git repo with unrelated pre-existing dirty files. Use `git -C ../mlir-aie` with the three explicit paths ONLY. NEVER `git add -A`/`.` there. NEVER push. Confirm `git -C ../mlir-aie status` shows `aie.mlir`/`test.cpp` (no `.in`) NOT modified (golden intact) before and after. The xdna-emu-side tool/tests were already committed in Task 2 — do not recommit those.
 
 ---
 
