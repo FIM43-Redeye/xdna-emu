@@ -607,6 +607,23 @@ programmatically — e.g. from the aiecc allocation map / a symbol — so
 it cannot rot), not a Phase A blocker. Recorded here so it is not
 ignored.
 
+**`Core_Status` RESET-bit EMU/HW divergence.** Surfaced by the Unit 1b
+code-quality review: when debug-halted at the trap, HW reports
+`Core_Status = 0x10001` (DEBUG_HALT|ENABLE) but EMU reports `0x10003`
+(DEBUG_HALT|RESET|ENABLE) — EMU leaves bit 1 (`RESET`) set.
+`CoreDebugState.reset` defaults to `true` and `Coordinator::enable_core()`
+calls `set_enabled(true)` directly, bypassing `write_control()` (which
+would clear `reset`); a CDO `Core_Control=0x1` write *does* route through
+`write_control` and clear it, so the residual `RESET` in the observed
+run indicates the enable path, not the CDO write, set `enabled`. This
+does **not** affect G1 or the probe verdict (which keys solely on
+DEBUG_HALT bit 16; before-commit also requires all marker slots zero),
+and the findings doc documents the divergence. Tracked
+later-consideration: reconcile `enable_core()` with `write_control()` so
+EMU `Core_Status` matches silicon bit-for-bit when halted — improves the
+self-checking regression's fidelity, not a Phase A/B blocker. Recorded
+here so it is not lost.
+
 ## 9. Open questions resolved by Phase A
 
 These are the spec's explicit parameterization points — Phase B is
