@@ -305,3 +305,84 @@ characterization is revisited when a dedicated hardware-observation
 budget / better register-poke tooling is available. The probe stays
 checked in (Exp2 form re-runnable via `DEBUG_HALT_PROBE_WITNESS=none`;
 Task 8 restores the Exp1 G1 regression as the default).
+
+---
+
+## Phase B inputs (closing -- no placeholders; Phase A complete)
+
+Phase A is closed. Phase B is written against these derived answers, not
+guesses:
+
+- **(a) G1 -- synchronous-trap halt boundary: DERIVED and SHIPPED.**
+  Silicon halts a PC-event/breakpoint *before* the trap bundle commits
+  (`TRAP_VERDICT:BEFORE_COMMIT`, HW + EMU). Phase B Unit 1 (pre-execute
+  PC_Event seam, coordinator) + Unit 1b (mutable `read_register`
+  reconciliation) implemented it; the probe is a self-checking EMU+HW
+  regression (restored Exp1 default reproduces
+  `SLOTS: s0=0..s3=0 CORE_STATUS=0x10003 HALTED=1 BEFORE_COMMIT`, bridge
+  PASS). Not an open Phase B item -- done; listed for the audit trail.
+
+- **(b) G2 -- count-step semantics: DERIVED.** `Debug_Control0[5:2]`
+  `Single_Step_Count` is **live** NPU1 silicon: `count=N` (halt bit
+  `[0]` clear) single-steps `N` instructions then halts the core via
+  `Core_Status` `DEBUG_HALT`; `count=0` disables (core runs free).
+  Independent of the halt bit. Phase B §5.2 implements the count-step
+  state machine to this: `write_debug_control0` arms an N-instruction
+  budget; a coordinator consumer (adjacent to
+  `consume_pending_single_step`) decrements per committed bundle and
+  requests halt at expiry, setting `DEBUG_HALT` (ENABLE stays 1,
+  CORE_DONE 0). The EMU is currently inert (field stored mod.rs:787,
+  no consumer) -- that *is* the §5.2 gap, now HW-anchored.
+  **Documented modeling decisions** (only `N=4` observed; the minimal
+  set was deliberate after the no-timeout-poll hazard -- implement to
+  the most natural reading, comment inline citing this finding):
+  the instruction boundary `N` counts to (we observed `N=4` halts in
+  the prologue, before the first store); decrement cadence;
+  expiry-vs-re-arm on resume; `count + halt-bit` (`0x11`) interaction;
+  larger-`N`. These are the **§8 count-step forward-commitment** --
+  ship the natural reading now, revisit silicon-faithful
+  characterization when a dedicated hardware-observation budget exists.
+
+- **(c) No write-side routing gap (corrected).** The earlier "EMU drops
+  control-packet debug-reg writes via a `write_core_register`
+  catch-all" framing is **false** (spec §4.2 "Mechanism correction").
+  Control-packet *and* `@seq npu.write32` debug-reg writes always
+  reached `core_debug` via `apply_tile_local_effects`. Units 1/1b
+  closed the only real defect -- the divergent *read* paths
+  (`read_register_pure` and the mutable `tile.read_register`). The
+  remaining Phase B work is therefore **not** a routing fix: it is
+  (i) §5.2 the count-step state machine (the consumer that (b)
+  anchors), and (ii) §5.1 the single-step halt boundary -- deferred as
+  G2-coupled, now G2-unblocked (single-step is the count=1 special
+  case of the same mechanism).
+
+- **(d) §8 forward-commitments (tracked, surfaced in the `debug_halt`
+  coverage narrative).** Count-step finer-characterization (above) --
+  triggered, recorded. Resume HW-verification -- still open (a runtime
+  sequence cannot deassert mid-run). `OUTBUF_ADDR` robustness -- still a
+  derived magic constant; make non-fragile later. `Core_Status`
+  `RESET`-bit EMU/HW divergence (`0x10003`/`0x100003` vs HW
+  `0x10001`/`0x100000`) -- benign (verdict keys on bits 16/20),
+  reconcile `enable_core()` vs `write_control()` later.
+
+- **(e) Incidental, high-leverage: a real `amdxdna` kernel bug, fixed.**
+  The retired no-timeout `CORE_DONE` MASKPOLL (Exp2 first attempt)
+  SMU-wedged the NPU and exposed a **NULL-deref / use-after-free in
+  `amdxdna` mailbox channel teardown**: timed-out messages were left in
+  `chan_xa` and flushed at `xdna_mailbox_release_channel` via
+  `notify_cb(handle, NULL, 0)` with the callback dereferencing the
+  NULL/dangling handle -- a `do_raw_spin_lock` oops on `modprobe -r` of
+  a firmware-wedged device (the recovery path we lean on constantly).
+  Root-caused from source, fixed, and **verified against the exact
+  reproduction** (clean unload, zero oops). xdna-driver branch
+  `fix/mailbox-teardown-stale-msg`: `1114562` (PR-candidate --
+  `xdna_mailbox_cancel_msg()` reclaim-on-`-ETIME` + NULL-safe
+  callbacks) and `7d85f25` (LOCAL-ONLY keep-channel-alive adopt, do not
+  upstream). This is the single highest-leverage outcome of Phase A:
+  it removes a recurring reboot-class landmine. Upstream PR is a
+  separate, Maya-gated step (reformat to AMD conventions; only
+  `1114562` is PR-eligible).
+
+**Regroup before Phase B remainder.** Per the plan->execute->regroup
+->next-plan rhythm, the next step is the regroup checkpoint (Maya's
+call when), not starting the Phase B §5.2/§5.1 remainder.
