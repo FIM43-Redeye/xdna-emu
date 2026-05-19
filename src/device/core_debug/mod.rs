@@ -745,11 +745,14 @@ impl CoreDebugState {
         self.request_halt();
     }
 
-    /// Clear the sync-trap-consumed record after the trap bundle has executed.
+    /// Clear the sync-trap-consumed record after the trap bundle has *retired*.
     ///
-    /// Called by the coordinator after `step_with_neighbor_locks` returns
-    /// (i.e. the bundle at the trap PC ran), so the next time the core
-    /// returns to that PC the trap fires again.
+    /// Called by the coordinator ONLY on `StepResult::Continue` (the trap
+    /// bundle ran and PC moved off TRAP_PC), so the next time the core
+    /// returns to that PC the trap fires again. It must NOT be cleared on
+    /// `DebugHalt`/`WaitLock`: those can leave PC pinned at TRAP_PC with the
+    /// bundle un-retired, and clearing the latch there re-arms the
+    /// pre-execute seam and swallows the host resume (review S1).
     pub fn clear_sync_trap_consumed(&mut self) {
         self.sync_trap_consumed_at = None;
     }

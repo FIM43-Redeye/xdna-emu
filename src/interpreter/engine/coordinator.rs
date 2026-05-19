@@ -630,16 +630,39 @@ impl InterpreterEngine {
                 // store never lands (before-commit).
                 //
                 // Async halt paths (host Debug_Control0[0], stall-halt,
-                // event-halt) set core_debug.halted = true through their own
-                // paths; the existing interpreter.rs:181 gate catches them
-                // before step_with_neighbor_locks is reached. This seam is
-                // additive and does not touch those paths.
+                // event-halt) are NOT intercepted by this seam, because
+                // has_sync_pc_trap_at() returns false for them:
+                // pc_event_halt_enabled() (Debug_Control2[0]) is clear for an
+                // async halt. They instead set core_debug.halted = true and
+                // are caught by the is_halted() gate *inside*
+                // step_with_neighbor_locks (interpreter.rs ~181) -- that gate
+                // is reached only after this seam is skipped, not "before
+                // step_with_neighbor_locks". The seam is purely additive: it
+                // does not change the async-halt code path.
                 //
-                // sync_trap_consumed_at suppresses re-fire for exactly one step
-                // after resume (when the PC is still at the trap PC): on the
-                // first step after resume, has_sync_pc_trap_at returns false,
-                // so step_with_neighbor_locks runs, the bundle executes, and PC
-                // advances. clear_sync_trap_consumed() is called after execution.
+                // Known dual-mechanism interaction (M1, deliberate, NOT
+                // unified in this unit): this pre-execute seam is the new
+                // before-commit PC_Event path, but the pre-existing
+                // post-execute update_pc() -> check_pc_events() PC_Event match
+                // (further down this block) still co-fires -- e.g. when the
+                // program loops back to TRAP_PC, the post-execute matcher also
+                // sees it. The observable result is still correct
+                // (before-commit is preserved because this seam runs first and
+                // skips the bundle), and the sync_trap_consumed_at latch keeps
+                // the two from double-counting across a resume. Unifying to a
+                // seam-only PC_Event path is a deliberate future follow-up
+                // (G2/spec §5.2), explicitly out of Phase B Unit 1 scope.
+                //
+                // sync_trap_consumed_at lifecycle: consume_sync_pc_trap() sets
+                // it to TRAP_PC when the seam fires; has_sync_pc_trap_at()
+                // then returns false while the core is halted at TRAP_PC (so
+                // intermediate halted ticks and the first post-resume tick do
+                // not re-fire the seam). It is cleared ONLY on
+                // StepResult::Continue (the trap bundle retired and PC moved
+                // off TRAP_PC) -- never on DebugHalt/WaitLock, which can leave
+                // PC pinned at TRAP_PC with the bundle un-retired. Clearing it
+                // on those would re-arm the seam and swallow the resume
+                // (review S1).
                 let next_pc = core.context.pc();
                 if tile.core_debug.has_sync_pc_trap_at(next_pc) {
                     tile.core_debug.consume_sync_pc_trap(next_pc);
@@ -658,10 +681,22 @@ impl InterpreterEngine {
                     Some(&view),
                 );
 
-                // Clear the sync-trap-consumed record now that the bundle at
-                // the trap PC has executed and PC will advance. The next match
-                // at this PC (e.g. on a loop back) fires fresh.
-                tile.core_debug.clear_sync_trap_consumed();
+                // NOTE: clear_sync_trap_consumed() is intentionally NOT called
+                // here. The latch must only be cleared once the trap bundle
+                // has actually retired and PC has moved off TRAP_PC -- that is
+                // exactly StepResult::Continue (see the Continue arm below).
+                //
+                // Clearing it unconditionally here was a resume-swallow bug
+                // (review S1): between the pre-execute halt and the host
+                // resume, the engine keeps ticking; the still-halted core
+                // falls through to step_with_neighbor_locks, the
+                // interpreter.rs is_halted() gate returns DebugHalt without
+                // executing the bundle, and an unconditional clear here would
+                // drop the latch while PC is still pinned at TRAP_PC. The next
+                // tick (now resumed) would then re-fire the seam on the same
+                // bundle, swallowing the resume. The same pin-at-TRAP_PC
+                // hazard applies to WaitLock if the trap bundle itself stalls
+                // on a lock acquire. Only Continue guarantees the bundle ran.
 
                 // Update CoreDebugState with current PC and stall info.
                 // This mirrors the interpreter state into the register
@@ -686,6 +721,15 @@ impl InterpreterEngine {
                 tile.core.pc = core.context.pc();
                 match result {
                     StepResult::Continue => {
+                        // The trap bundle (if any) has now retired and PC has
+                        // moved off TRAP_PC. Clear the sync-trap-consumed
+                        // latch so the next time the core returns to that PC
+                        // (e.g. a loop back to TRAP_PC) the seam fires fresh.
+                        // This is the ONLY place the latch is cleared (review
+                        // S1): DebugHalt/WaitLock can leave PC pinned at
+                        // TRAP_PC with the bundle un-retired, so clearing
+                        // there would re-arm the seam and swallow the resume.
+                        tile.core_debug.clear_sync_trap_consumed();
                         tile.core_debug.update_stalls(false, false, false, false);
                         all_halted = false;
                         any_running = true;
@@ -3136,6 +3180,102 @@ mod tests {
                  expected sentinel 0x{:08X}, got {:?}",
                 SENTINEL,
                 stored
+            );
+        }
+    }
+
+    /// S1 regression: the intermediate-halted-tick path must not swallow the
+    /// host resume.
+    ///
+    /// Reproduces the exact resume-swallow bug found in review S1: the engine
+    /// keeps ticking between the pre-execute halt and the host resume. The
+    /// still-halted core falls through to step_with_neighbor_locks, the
+    /// is_halted() gate returns DebugHalt without executing the trap bundle,
+    /// and (under the buggy code) clear_sync_trap_consumed() ran
+    /// unconditionally there -- dropping the latch while PC was still pinned
+    /// at TRAP_PC. The next tick (now resumed) then re-fired the seam on the
+    /// same bundle, swallowing the resume.
+    ///
+    /// Sequence: step (seam halts pre-commit) -> step again WITHOUT resuming
+    /// (the intermediate halted tick that cleared the latch under the old
+    /// code) -> request_resume() -> step. Expected: PC advances past TRAP_PC
+    /// and the core is not halted (resume honored, not swallowed).
+    ///
+    /// FAILS against pre-S1-fix code (unconditional clear after
+    /// step_with_neighbor_locks); PASSES after the fix (clear only on
+    /// StepResult::Continue).
+    #[test]
+    fn pre_execute_pc_event_resume_after_intermediate_halted_tick() {
+        const TRAP_PC: u32 = 0x00;
+        const PC_EVENT0: u32 = 0x32020;
+        const DEBUG_CONTROL2: u32 = 0x32018;
+
+        let mut engine = InterpreterEngine::new_npu1();
+
+        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+            tile.write_program(0, &[0x00u8; 16]);
+        }
+        engine.enable_core(0, 2);
+
+        use crate::device::tile::CtrlPacketAction;
+        let pc_event_value = 0x8000_0000 | (TRAP_PC & 0x3FFF);
+        engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
+            col: 0,
+            row: 2,
+            offset: PC_EVENT0,
+            value: pc_event_value,
+        });
+        engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
+            col: 0,
+            row: 2,
+            offset: DEBUG_CONTROL2,
+            value: 0x1,
+        });
+
+        // Step 1: pre-execute seam fires -> halt before-commit at TRAP_PC.
+        engine.step();
+        {
+            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            assert!(tile.core_debug.is_halted(), "step 1: must halt at trap PC");
+            let ctx = engine.core_context(0, 2).expect("core");
+            assert_eq!(ctx.pc(), TRAP_PC, "step 1: PC must not advance");
+        }
+
+        // Step 2: NO resume yet. The still-halted core falls through to
+        // step_with_neighbor_locks; the is_halted() gate returns DebugHalt
+        // without executing the bundle. PC is still pinned at TRAP_PC.
+        // This is the tick that cleared the latch under the buggy code.
+        engine.step();
+        {
+            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            assert!(tile.core_debug.is_halted(), "step 2: still halted (no resume issued)");
+            let ctx = engine.core_context(0, 2).expect("core");
+            assert_eq!(ctx.pc(), TRAP_PC, "step 2: PC must still be pinned at trap PC");
+        }
+
+        // Now the host resumes.
+        {
+            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile");
+            tile.core_debug.request_resume();
+        }
+
+        // Step 3: the trap bundle must execute exactly once and PC must
+        // advance. Under the buggy code the latch was already cleared by
+        // step 2, so the seam re-fires here and re-halts -- the resume is
+        // swallowed and this assertion fails.
+        engine.step();
+        {
+            let ctx = engine.core_context(0, 2).expect("core");
+            assert_eq!(
+                ctx.pc(),
+                4,
+                "step 3: PC must advance past trap PC after resume -- \
+                 resume must not be swallowed by the intermediate halted tick"
+            );
+            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            assert!(
+                !tile.core_debug.is_halted(),
+                "step 3: core must not re-halt on the same PC after resume"
             );
         }
     }
