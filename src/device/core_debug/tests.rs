@@ -1165,3 +1165,25 @@ fn count_step_halt_bit_precedence_with_latent_budget() {
     assert!(s.is_halted(), "halt bit [0] halts immediately (precedence)");
     assert_eq!(s.count_step_remaining, Some(4), "budget armed latent");
 }
+
+#[test]
+fn count_step_expiry_cause_cleared_on_resume() {
+    // Count-step expiry latches halt_cause_count_step; an event-resume
+    // must clear it in lockstep with the other halt_cause_* latches
+    // (clear_halt_causes symmetry). The budget rule is independent:
+    // resume does NOT re-arm -- count_step_remaining stays None.
+    let mut s = CoreDebugState::new();
+    s.enabled = true;
+    // Resume on event id 5 (arbitrary non-zero, not colliding with sstep/halt).
+    s.debug_ctrl1 = make_dbg_ctrl1(5, 0, 0, 0);
+    s.write_debug_control0(0x04); // N=1
+    assert!(s.tick_count_step(), "N=1 expires on first tick");
+    assert!(s.halt_cause_count_step, "expiry latches the cause");
+    assert!(s.is_halted());
+    assert_eq!(s.count_step_remaining, None, "expiry cleared the budget");
+
+    s.check_event_halt(5); // Debug_Resume_Core_Event fires
+    assert!(!s.halt_cause_count_step, "resume clears the count-step cause latch");
+    assert!(!s.is_halted(), "resume unhalts");
+    assert_eq!(s.count_step_remaining, None, "resume does NOT re-arm the budget");
+}

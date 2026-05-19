@@ -885,6 +885,7 @@ impl CoreDebugState {
         self.halt_cause_stream_stall = false;
         self.halt_cause_event0 = false;
         self.halt_cause_event1 = false;
+        self.halt_cause_count_step = false;
     }
 
     // -----------------------------------------------------------------------
