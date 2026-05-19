@@ -552,6 +552,7 @@ Replace the RUN block in `../mlir-aie/test/npu-xrt/debug_halt_probe/run.lit` wit
 // synthesized from canonical aie.mlir, the cp line being skipped there).
 // RUN: cp %S/aie.mlir aie_arch.mlir
 // RUN: %run_on_npu1% sed 's/NPUDEVICE/npu1_1col/g' -i aie_arch.mlir
+// RUN: %run_on_npu2% sed 's/NPUDEVICE/npu2_1col/g' -i aie_arch.mlir
 // RUN: %python aiecc.py --no-aiesim --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host --alloc-scheme=basic-sequential --xclbin-name=aie.xclbin --npu-insts-name=insts.bin aie_arch.mlir
 //
 // Derive + guard (after aiecc, before host compile/run): re-derive
@@ -575,6 +576,8 @@ Notes for the engineer:
 - Confirm the `%S/../../../../xdna-emu` depth resolves to the real `xdna-emu/tools/` path (pre-verified to resolve; re-confirm).
 - The host compile uses `%S/test.cpp` (the golden, unchanged from the original probe). `derived_check_aie.mlir`/`derived_check_test.cpp` are written by the tool but consumed by nothing — they exist only so the tool's CLI contract is satisfied; the guard is purely its exit code.
 - Keep the `cp %S/aie.mlir aie_arch.mlir` first line (matches the original probe): under upstream lit it creates `aie_arch.mlir`; under the bridge harness it is skipped but the harness synthesizes `aie_arch.mlir` from canonical `aie.mlir` itself — either way `aie_arch.mlir` exists for `aiecc`.
+- **Both** the `%run_on_npu1%` *and* `%run_on_npu2%` `sed ...NPUDEVICE...` lines must be present (the original probe had both; an earlier draft of this plan dropped the npu2 one — that is a regression for upstream-lit on npu2 hardware, caught in code review 2026-05-19). Keep both, immediately before `aiecc`.
+- Add a one-line comment in the run.lit comment block noting the guard fires on (re)compile; a cache-hit `--no-hw` bridge run skips it by design (the xclbin is derived from the golden, so a golden change invalidates the cache and the guard re-runs) — prevents a future reader mistaking a guard-less cached log for a broken guard.
 
 - [ ] **Step 5: Verify the probe builds and the guard passes — under BOTH paths**
 
