@@ -136,52 +136,81 @@ pub enum AieErrorCategory {
     Unknown,
 }
 
-/// Driver `enum amdxdna_error_num` (subset used here). Mirrors the values
-/// in `xdna-driver/src/driver/amdxdna/amdxdna_error.h` for the categories
-/// we map. We only port the variants needed for the AIE categories above;
-/// expand as new categories get producers.
+/// Driver `enum amdxdna_error_num`. Values mirror the driver enum
+/// (`amdxdna_error.h:37-53`) verbatim so encoded `err_code` bytes match
+/// what a real driver would emit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum AmdxdnaErrorNum {
-    Saturation = 0x0001,
-    Fp = 0x0002,
-    Stream = 0x0003,
-    Access = 0x0004,
-    Bus = 0x0005,
-    Instruction = 0x0006,
-    Ecc = 0x0007,
-    Lock = 0x0008,
-    Dma = 0x0009,
-    MemParity = 0x000A,
-    Unknown = 0xFFFF,
+    FirewallTrip = 1,
+    TempHigh = 2,
+    AieSaturation = 3,
+    AieFp = 4,
+    AieStream = 5,
+    AieAccess = 6,
+    AieBus = 7,
+    AieInstruction = 8,
+    AieEcc = 9,
+    AieLock = 10,
+    AieDma = 11,
+    AieMemParity = 12,
+    KdsCu = 13,
+    KdsExec = 14,
+    Unknown = 15,
 }
 
-/// Driver `enum amdxdna_error_module` (subset).
+/// Driver `enum amdxdna_error_driver` (`amdxdna_error.h:55-60`). Tier B always
+/// emits `Aie` (via the convenience `build_critical_aie_error_code` helper).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
-pub enum AmdxdnaErrorModule {
-    AieMemory = 0x01,
-    AieCore = 0x02,
-    AiePl = 0x03,
-    Unknown = 0xFF,
+pub enum AmdxdnaErrorDriver {
+    Xocl = 1,
+    Xclmgmt = 2,
+    Zocl = 3,
+    Aie = 4,
+    Unknown = 5,
 }
 
-/// Driver severity field. `NonFatal` is the only level Tier B currently emits.
+/// Driver `enum amdxdna_error_severity` (`amdxdna_error.h:63-72`). Tier B always
+/// emits `Critical` for AIE async errors -- matches the driver's hardcoded
+/// `AMDXDNA_CRITICAL_ERROR_CODE_BUILD` macro path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum Severity {
-    NonFatal = 0x01,
-    Critical = 0x02,
-    Fatal = 0x03,
+    Emergency = 1,
+    Alert = 2,
+    Critical = 3,
+    Error = 4,
+    Warning = 5,
+    Notice = 6,
+    Info = 7,
+    Debug = 8,
+    Unknown = 9,
 }
 
-/// Driver class field. AIE is the only class Tier B currently emits.
+/// Driver `enum amdxdna_error_module` (`amdxdna_error.h:75-83`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum AmdxdnaErrorModule {
+    Firewall = 1,
+    Cmc = 2,
+    AieCore = 3,
+    AieMemory = 4,
+    AieShim = 5,
+    AieNoc = 6,
+    AiePl = 7,
+    Unknown = 8,
+}
+
+/// Driver `enum amdxdna_error_class` (`amdxdna_error.h:86-92`). Tier B always
+/// emits `Aie` for AIE async errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum Class {
-    Driver = 0x01,
-    Hardware = 0x02,
-    Aie = 0x03,
+    System = 1,
+    Aie = 2,
+    Hardware = 3,
+    Unknown = 4,
 }
 
 #[cfg(test)]
@@ -339,16 +368,19 @@ Append to `crates/xdna-archspec/src/aie2/async_errors.rs` (inside the existing `
 
     #[test]
     fn shim_event_categories_match_driver_table() {
-        // Direct port of aie2_error.c:134-150 shim table.
+        // Direct port of aie2_error.c:134-146 shim table (11 entries).
         let cases: &[(u8, AieErrorCategory)] = &[
             (64, AieErrorCategory::Bus),
             (65, AieErrorCategory::Stream),
             (66, AieErrorCategory::Stream),
             (67, AieErrorCategory::Bus),
             (68, AieErrorCategory::Bus),
-            (69, AieErrorCategory::Lock),
-            (70, AieErrorCategory::Lock),
-            (71, AieErrorCategory::Lock),
+            (69, AieErrorCategory::Bus),
+            (70, AieErrorCategory::Bus),
+            (71, AieErrorCategory::Bus),
+            (72, AieErrorCategory::Dma),
+            (73, AieErrorCategory::Dma),
+            (74, AieErrorCategory::Lock),
         ];
         for &(event_id, expected) in cases {
             assert_eq!(
@@ -448,16 +480,19 @@ pub const MEMTILE_EVENT_CAT: &[EventCategory] = &[
     EventCategory { event_id: 139, category: AieErrorCategory::Lock },
 ];
 
-/// Shim-PL error events. Direct port of `aie2_error.c:134-150`.
+/// Shim-PL error events. Direct port of `aie2_error.c:134-146` (11 entries).
 pub const SHIM_EVENT_CAT: &[EventCategory] = &[
     EventCategory { event_id: 64, category: AieErrorCategory::Bus },
     EventCategory { event_id: 65, category: AieErrorCategory::Stream },
     EventCategory { event_id: 66, category: AieErrorCategory::Stream },
     EventCategory { event_id: 67, category: AieErrorCategory::Bus },
     EventCategory { event_id: 68, category: AieErrorCategory::Bus },
-    EventCategory { event_id: 69, category: AieErrorCategory::Lock },
-    EventCategory { event_id: 70, category: AieErrorCategory::Lock },
-    EventCategory { event_id: 71, category: AieErrorCategory::Lock },
+    EventCategory { event_id: 69, category: AieErrorCategory::Bus },
+    EventCategory { event_id: 70, category: AieErrorCategory::Bus },
+    EventCategory { event_id: 71, category: AieErrorCategory::Bus },
+    EventCategory { event_id: 72, category: AieErrorCategory::Dma },
+    EventCategory { event_id: 73, category: AieErrorCategory::Dma },
+    EventCategory { event_id: 74, category: AieErrorCategory::Lock },
 ];
 
 /// Look up the error category for a given `(event_id, origin)` pair.
@@ -526,21 +561,44 @@ Append to the `#[cfg(test)] mod tests` block:
     #[test]
     fn build_err_code_round_trips_via_bit_unpack() {
         let code = build_err_code(
-            Severity::NonFatal,
+            AmdxdnaErrorNum::AieInstruction,
+            AmdxdnaErrorDriver::Aie,
+            Severity::Critical,
             AmdxdnaErrorModule::AieCore,
             Class::Aie,
-            AmdxdnaErrorNum::Instruction,
         );
-        // Per amdxdna_error.h:60-99 layout: severity in [63:48], module in
-        // [47:32], class in [31:16], num in [15:0].
-        let severity = (code >> 48) & 0xFFFF;
-        let module = (code >> 32) & 0xFFFF;
-        let class = (code >> 16) & 0xFFFF;
+        // Per amdxdna_error.h:95-104 layout: num at [15:0] (16-bit mask),
+        // driver at [19:16], severity at [27:24], module at [35:32], class
+        // at [43:40] -- all 4-bit masks.
         let num = code & 0xFFFF;
-        assert_eq!(severity, Severity::NonFatal as u64);
+        let driver = (code >> 16) & 0xF;
+        let severity = (code >> 24) & 0xF;
+        let module = (code >> 32) & 0xF;
+        let class = (code >> 40) & 0xF;
+        assert_eq!(num, AmdxdnaErrorNum::AieInstruction as u64);
+        assert_eq!(driver, AmdxdnaErrorDriver::Aie as u64);
+        assert_eq!(severity, Severity::Critical as u64);
         assert_eq!(module, AmdxdnaErrorModule::AieCore as u64);
         assert_eq!(class, Class::Aie as u64);
-        assert_eq!(num, AmdxdnaErrorNum::Instruction as u64);
+    }
+
+    #[test]
+    fn build_critical_aie_error_code_matches_driver_macro() {
+        // AMDXDNA_CRITICAL_ERROR_CODE_BUILD hardcodes driver=Aie, severity=Critical,
+        // class=Aie (amdxdna_error.h:113-115). This convenience helper is what
+        // Tier B uses for AIE async errors.
+        let code = build_critical_aie_error_code(
+            AmdxdnaErrorNum::AieInstruction,
+            AmdxdnaErrorModule::AieCore,
+        );
+        let expected = build_err_code(
+            AmdxdnaErrorNum::AieInstruction,
+            AmdxdnaErrorDriver::Aie,
+            Severity::Critical,
+            AmdxdnaErrorModule::AieCore,
+            Class::Aie,
+        );
+        assert_eq!(code, expected);
     }
 
     #[test]
@@ -553,9 +611,9 @@ Append to the `#[cfg(test)] mod tests` block:
 
     #[test]
     fn category_to_error_num_maps_known_categories() {
-        assert_eq!(category_to_error_num(AieErrorCategory::Saturation), AmdxdnaErrorNum::Saturation);
-        assert_eq!(category_to_error_num(AieErrorCategory::Instruction), AmdxdnaErrorNum::Instruction);
-        assert_eq!(category_to_error_num(AieErrorCategory::Dma), AmdxdnaErrorNum::Dma);
+        assert_eq!(category_to_error_num(AieErrorCategory::Saturation), AmdxdnaErrorNum::AieSaturation);
+        assert_eq!(category_to_error_num(AieErrorCategory::Instruction), AmdxdnaErrorNum::AieInstruction);
+        assert_eq!(category_to_error_num(AieErrorCategory::Dma), AmdxdnaErrorNum::AieDma);
         assert_eq!(category_to_error_num(AieErrorCategory::Unknown), AmdxdnaErrorNum::Unknown);
     }
 
@@ -584,28 +642,53 @@ Expected: compile errors for `build_err_code`, `build_ex_err_code`, `category_to
 Append to `crates/xdna-archspec/src/aie2/async_errors.rs`, BEFORE the `#[cfg(test)]` block:
 
 ```rust
-// Bit layout of amdxdna_async_error.err_code (amdxdna_error.h:60-99).
-// 64 bits, packed as: [num:16][class:16][module:16][severity:16] from LSB.
-const SEVERITY_SHIFT: u32 = 48;
+// Bit layout of amdxdna_async_error.err_code (amdxdna_error.h:95-104).
+// 5 fields: num (16-bit) at [15:0]; driver, severity, module, class each
+// 4-bit at [19:16], [27:24], [35:32], [43:40].
+const NUM_SHIFT: u32 = 0;
+const DRIVER_SHIFT: u32 = 16;
+const SEVERITY_SHIFT: u32 = 24;
 const MODULE_SHIFT: u32 = 32;
-const CLASS_SHIFT: u32 = 16;
-const SEVERITY_MASK: u64 = 0xFFFF;
-const MODULE_MASK: u64 = 0xFFFF;
-const CLASS_MASK: u64 = 0xFFFF;
+const CLASS_SHIFT: u32 = 40;
 const NUM_MASK: u64 = 0xFFFF;
+const DRIVER_MASK: u64 = 0xF;
+const SEVERITY_MASK: u64 = 0xF;
+const MODULE_MASK: u64 = 0xF;
+const CLASS_MASK: u64 = 0xF;
 
 /// Build the `err_code` field of `amdxdna_async_error`.
-/// Mirrors `AMDXDNA_ERROR_CODE_BUILD` (amdxdna_error.h:100-111).
+/// Mirrors `AMDXDNA_ERROR_CODE_BUILD` (`amdxdna_error.h:106-111`). Caller
+/// supplies all 5 fields; for the common AIE async-error path use
+/// `build_critical_aie_error_code` instead.
 pub const fn build_err_code(
+    num: AmdxdnaErrorNum,
+    driver: AmdxdnaErrorDriver,
     severity: Severity,
     module: AmdxdnaErrorModule,
     class: Class,
-    num: AmdxdnaErrorNum,
 ) -> u64 {
-    ((severity as u64 & SEVERITY_MASK) << SEVERITY_SHIFT)
+    ((num as u64 & NUM_MASK) << NUM_SHIFT)
+        | ((driver as u64 & DRIVER_MASK) << DRIVER_SHIFT)
+        | ((severity as u64 & SEVERITY_MASK) << SEVERITY_SHIFT)
         | ((module as u64 & MODULE_MASK) << MODULE_SHIFT)
         | ((class as u64 & CLASS_MASK) << CLASS_SHIFT)
-        | (num as u64 & NUM_MASK)
+}
+
+/// Convenience that hardcodes `driver=Aie`, `severity=Critical`, `class=Aie`.
+/// Mirrors the driver's `AMDXDNA_CRITICAL_ERROR_CODE_BUILD`
+/// (`amdxdna_error.h:113-115`), which is what `aie2_error.c:239` uses to
+/// build the `err_code` for every AIE async error.
+pub const fn build_critical_aie_error_code(
+    num: AmdxdnaErrorNum,
+    module: AmdxdnaErrorModule,
+) -> u64 {
+    build_err_code(
+        num,
+        AmdxdnaErrorDriver::Aie,
+        Severity::Critical,
+        module,
+        Class::Aie,
+    )
 }
 
 // Bit layout of amdxdna_async_error.ex_err_code (amdxdna_error.h:127-141).
@@ -627,16 +710,16 @@ pub const fn build_ex_err_code(row: u8, col: u8) -> u64 {
 /// fallback (driver default at `aie2_error.c:182`).
 pub fn category_to_error_num(cat: AieErrorCategory) -> AmdxdnaErrorNum {
     match cat {
-        AieErrorCategory::Saturation => AmdxdnaErrorNum::Saturation,
-        AieErrorCategory::Fp => AmdxdnaErrorNum::Fp,
-        AieErrorCategory::Stream => AmdxdnaErrorNum::Stream,
-        AieErrorCategory::Access => AmdxdnaErrorNum::Access,
-        AieErrorCategory::Bus => AmdxdnaErrorNum::Bus,
-        AieErrorCategory::Instruction => AmdxdnaErrorNum::Instruction,
-        AieErrorCategory::Ecc => AmdxdnaErrorNum::Ecc,
-        AieErrorCategory::Lock => AmdxdnaErrorNum::Lock,
-        AieErrorCategory::Dma => AmdxdnaErrorNum::Dma,
-        AieErrorCategory::MemParity => AmdxdnaErrorNum::MemParity,
+        AieErrorCategory::Saturation => AmdxdnaErrorNum::AieSaturation,
+        AieErrorCategory::Fp => AmdxdnaErrorNum::AieFp,
+        AieErrorCategory::Stream => AmdxdnaErrorNum::AieStream,
+        AieErrorCategory::Access => AmdxdnaErrorNum::AieAccess,
+        AieErrorCategory::Bus => AmdxdnaErrorNum::AieBus,
+        AieErrorCategory::Instruction => AmdxdnaErrorNum::AieInstruction,
+        AieErrorCategory::Ecc => AmdxdnaErrorNum::AieEcc,
+        AieErrorCategory::Lock => AmdxdnaErrorNum::AieLock,
+        AieErrorCategory::Dma => AmdxdnaErrorNum::AieDma,
+        AieErrorCategory::MemParity => AmdxdnaErrorNum::AieMemParity,
         AieErrorCategory::Unknown => AmdxdnaErrorNum::Unknown,
     }
 }
@@ -1121,9 +1204,7 @@ Create `src/device/async_errors/sink.rs`:
 
 use std::collections::VecDeque;
 
-use xdna_archspec::aie2::async_errors::{
-    self, AieErrorOrigin, AmdxdnaErrorModule, AmdxdnaErrorNum, Class, Severity,
-};
+use xdna_archspec::aie2::async_errors::{self, AieErrorOrigin};
 
 use super::types::{AieError, AmdxdnaAsyncError, AsyncRing, RET_CODE_OVERFLOW};
 
@@ -1186,7 +1267,9 @@ impl AsyncErrorSink {
             .expect("record_error: event_to_category returned None; caller must gate via is_error_event");
         let num = async_errors::category_to_error_num(category);
         let module = async_errors::mod_type_to_amdxdna_module(origin);
-        let err_code = async_errors::build_err_code(Severity::NonFatal, module, Class::Aie, num);
+        // Convenience helper hardcodes driver=Aie, severity=Critical, class=Aie,
+        // matching driver's AMDXDNA_CRITICAL_ERROR_CODE_BUILD (aie2_error.c:239).
+        let err_code = async_errors::build_critical_aie_error_code(num, module);
         let ex_err_code = async_errors::build_ex_err_code(row, col);
         // Cycle-as-nanoseconds at ~1 GHz silicon -> microseconds = cycle / 1000.
         // Deterministic; spec section 2 ts_us decision.
@@ -1238,16 +1321,15 @@ mod tests {
 
     #[test]
     fn record_error_populates_cache_and_ring() {
+        use xdna_archspec::aie2::async_errors::{AmdxdnaErrorModule, AmdxdnaErrorNum};
         let mut sink = AsyncErrorSink::new(5);
         sink.record_error(1, 2, AieErrorOrigin::Core, 69, 50_000);
         let cache = sink.last_cache().expect("cache must be populated");
         assert_eq!(
             cache.err_code,
-            async_errors::build_err_code(
-                Severity::NonFatal,
+            async_errors::build_critical_aie_error_code(
+                AmdxdnaErrorNum::AieInstruction,
                 AmdxdnaErrorModule::AieCore,
-                Class::Aie,
-                AmdxdnaErrorNum::Instruction,
             )
         );
         assert_eq!(cache.ts_us, 50); // 50_000 cycles / 1000
@@ -1494,7 +1576,7 @@ In `src/device/state/effects.rs`, append to the existing `#[cfg(test)] mod inter
     #[test]
     fn event_generate_for_instr_error_populates_async_cache_and_ring() {
         use xdna_archspec::aie2::async_errors::{
-            self, AieErrorOrigin, AmdxdnaErrorModule, AmdxdnaErrorNum, Class, Severity,
+            self, AieErrorOrigin, AmdxdnaErrorModule, AmdxdnaErrorNum,
         };
         let mut dev = DeviceState::new_npu1();
         // Drive simulated time so ts_us is nonzero -- proves the cycle-as-ts
@@ -1507,11 +1589,9 @@ In `src/device/state/effects.rs`, append to the existing `#[cfg(test)] mod inter
 
         // Cache populated with the right decode.
         let cache = dev.async_errors.last_cache().expect("cache must populate");
-        let expected_err = async_errors::build_err_code(
-            Severity::NonFatal,
+        let expected_err = async_errors::build_critical_aie_error_code(
+            AmdxdnaErrorNum::AieInstruction,
             AmdxdnaErrorModule::AieCore,
-            Class::Aie,
-            AmdxdnaErrorNum::Instruction,
         );
         assert_eq!(cache.err_code, expected_err, "err_code must decode INSTR_ERROR");
         assert_eq!(cache.ex_err_code, ((row as u64) << 8) | col as u64, "ex_err_code packs row|col");
