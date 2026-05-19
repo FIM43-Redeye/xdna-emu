@@ -152,6 +152,13 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
     // the ~100k generic stall threshold (too slow for the bridge
     // wall-clock). The window is generous enough that any legitimately
     // satisfiable poll resolves first, but far below the bridge timeout.
+    //
+    // Known edge case: this bound is safe for firmware-issued MASKPOLLs,
+    // which resolve within a few cycles of the writing event (DMA-completion
+    // status, a control-packet register write, etc.). A hypothetical future
+    // MASKPOLL polling a register written only by a long (>20k-cycle)
+    // compute-core computation would be terminated prematurely. No such user
+    // exists today; revisit the bound if one is added.
     let mut poll_stall_cycles: u64 = 0;
     const POLL_STALL_LIMIT: u64 = 20_000;
 
@@ -182,15 +189,25 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         }
 
         // Bounded poll-stall detection (spec §4.2 graceful poll-termination).
-        // Track consecutive cycles the executor is BlockedOnPoll without
-        // making progress. Reset whenever it is not blocked on a poll or it
-        // advanced -- so a poll that does eventually satisfy never trips
-        // this. Crossing the bound means the poll is unsatisfiable: end
-        // deterministically with the distinct terminal reason. We do NOT
-        // fake the polled register, pretend the core halted, or skip the
-        // OP_READ -- the executor stays BlockedOnPoll, no further
-        // instruction is issued, and the run.wait() path returns cleanly.
-        if handle.npu_executor.is_blocked_on_poll() && !npu_progressed {
+        // The counter advances purely because the executor is BlockedOnPoll
+        // each cycle: while blocked on a poll, try_advance() returns Blocked
+        // (never Progressed), so npu_progressed is necessarily false in this
+        // branch -- there is no separate "no progress" condition to test
+        // (asserted below). It is reset the moment the executor is no longer
+        // blocked on a poll (a poll that does eventually satisfy never trips
+        // this). Crossing the bound means the poll is unsatisfiable: end
+        // deterministically with the distinct terminal reason. This is the
+        // DMA-churn-independent signal -- any_dma_active() was rejected
+        // because a starved ctrl-out DMA re-routing the same packet keeps it
+        // true forever, and the ~100k generic stall threshold is too slow
+        // for the bridge wall-clock. We do NOT fake the polled register,
+        // pretend the core debug-halted, or skip the OP_READ -- the executor
+        // stays BlockedOnPoll, no further instruction is issued, and the
+        // run.wait() path returns cleanly.
+        if handle.npu_executor.is_blocked_on_poll() {
+            // Invariant: BlockedOnPoll => try_advance() returned Blocked, so
+            // the executor cannot have progressed this cycle.
+            debug_assert!(!npu_progressed, "executor reported BlockedOnPoll yet npu_progressed=true");
             poll_stall_cycles += 1;
             if poll_stall_cycles >= POLL_STALL_LIMIT {
                 log::info!(
@@ -293,7 +310,23 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
     // them, then step_data_movement() routes them through the network.
     handle.engine.flush_trace_to_host();
 
-    let halted = handle.engine.status() == EngineStatus::Halted
+    // `halted` is the run-lifecycle / quiescence indicator -- "the run is
+    // done" (cores halted OR all DMA syncs satisfied), which drives the C++
+    // plugin's `last_run_complete_` and thus run.wait() returning
+    // ERT_CMD_STATE_COMPLETED. It is NOT the semantic core-debug-halt: that
+    // is Core_Status[16] (DEBUG_HALT), which is never touched/faked here (on
+    // EMU it stays unset -- that is the whole point of MaskPollUnsatisfied).
+    //
+    // For the MaskPollUnsatisfied path, the poll-stall counter terminates
+    // the run while engine.status() may still be non-Halted (the core is
+    // gated on the objectfifo, never debug-halted). Without this the
+    // poll-stall exit would report halted=false while the logically
+    // identical Halted+!any_dma_active fast path reports halted=true -- the
+    // two termination paths must agree. So set halted=true explicitly for
+    // this case: it means "run terminated deterministically", not
+    // "core debug-halted".
+    let halted = maskpoll_unsatisfied
+        || handle.engine.status() == EngineStatus::Halted
         || (handle.npu_executor.is_done() && handle.npu_executor.syncs_satisfied(handle.engine.device()));
 
     // Terminal-reason priority:
