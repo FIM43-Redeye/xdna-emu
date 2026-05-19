@@ -621,6 +621,35 @@ impl InterpreterEngine {
                     north_locks.as_mut().map(|v| v.as_mut_slice()),
                 );
 
+                // Pre-execute synchronous PC_Event seam (Phase B Unit 1, spec §5.1).
+                //
+                // G1 silicon observation (NPU1, 2026-05-18): a synchronous
+                // PC-event breakpoint halts BEFORE the trap bundle commits.
+                // If the next PC matches an armed PC_Event with PC_Event_Halt,
+                // halt the core here WITHOUT executing the bundle. The trap
+                // store never lands (before-commit).
+                //
+                // Async halt paths (host Debug_Control0[0], stall-halt,
+                // event-halt) set core_debug.halted = true through their own
+                // paths; the existing interpreter.rs:181 gate catches them
+                // before step_with_neighbor_locks is reached. This seam is
+                // additive and does not touch those paths.
+                //
+                // sync_trap_consumed_at suppresses re-fire for exactly one step
+                // after resume (when the PC is still at the trap PC): on the
+                // first step after resume, has_sync_pc_trap_at returns false,
+                // so step_with_neighbor_locks runs, the bundle executes, and PC
+                // advances. clear_sync_trap_consumed() is called after execution.
+                let next_pc = core.context.pc();
+                if tile.core_debug.has_sync_pc_trap_at(next_pc) {
+                    tile.core_debug.consume_sync_pc_trap(next_pc);
+                    // Core is now debug-halted; the bundle did not execute.
+                    // Skip the rest of this tile's step processing.
+                    all_halted = false;
+                    any_running = true;
+                    continue;
+                }
+
                 let result = core.interpreter.step_with_neighbor_locks(
                     &mut core.context,
                     tile,
@@ -628,6 +657,11 @@ impl InterpreterEngine {
                     Some(&mut core.neighbors),
                     Some(&view),
                 );
+
+                // Clear the sync-trap-consumed record now that the bundle at
+                // the trap PC has executed and PC will advance. The next match
+                // at this PC (e.g. on a loop back) fires fresh.
+                tile.core_debug.clear_sync_trap_consumed();
 
                 // Update CoreDebugState with current PC and stall info.
                 // This mirrors the interpreter state into the register
@@ -2598,5 +2632,511 @@ mod tests {
             Some(0x0000_0001),
             "decodable ctrl write must actually apply (end-to-end, not just no-SLVERR)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase B Unit 1 -- Step 1: routing-gap round-trip tests
+    //
+    // Spec §5.1 / §5.3: control-packet writes to PC_Event0 (0x32020) and
+    // Debug_Control2 (0x32018) must reach core_debug, and a read-back via
+    // read_register_pure must return the correct live value. The write side
+    // is already wired through apply_tile_local_effects; the read side
+    // (read_register_pure) must dispatch to core_debug for live-computed
+    // registers (Core_Status, Debug_Status). PC_Event*/Debug_Control* raw
+    // storage values are verified to round-trip through the tile.registers
+    // HashMap. These tests are the TDD gate: they must fail before the
+    // read-side fix and pass after.
+    //
+    // Register offsets (aie-rt xaiemlgbl_params.h, cross-checked against
+    // the AM025 register database aie_registers_aie2.json):
+    //   Core_Control    0x32000
+    //   Core_Status     0x32004  (read-only; live-computed)
+    //   Debug_Control0  0x32010
+    //   Debug_Control1  0x32014
+    //   Debug_Control2  0x32018
+    //   Debug_Status    0x3201C  (read-only; live-computed)
+    //   PC_Event0       0x32020  (write → core_debug.pc_event0; raw storage)
+    //   PC_Event1       0x32024
+    //   PC_Event2       0x32028
+    //   PC_Event3       0x3202C
+    // -----------------------------------------------------------------------
+
+    /// A ctrl-packet write of PC_Event0 (0x32020: VALID=1 | address=0x184)
+    /// must reach core_debug.pc_event0. Verified by reading back through
+    /// core_debug.read_register (which is what the pre-execute seam uses)
+    /// AND through read_register_pure (which is what OP_READ uses).
+    #[test]
+    fn ctrl_write_pc_event0_reaches_core_debug() {
+        use crate::device::tile::CtrlPacketAction;
+
+        const PC_EVENT0: u32 = 0x32020;
+        // VALID (bit 31) | PC_ADDRESS = 0x184 (low 14 bits).
+        const VALUE: u32 = 0x8000_0184;
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
+            col: 0,
+            row: 2,
+            offset: PC_EVENT0,
+            value: VALUE,
+        });
+
+        // No SLVERR: the offset decodes.
+        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        assert_eq!(tile.pkt_handler_status & 0x4, 0, "PC_Event0 write must not set SLVERR");
+
+        // Write side: core_debug must have the armed PC_Event0.
+        let read_via_core_debug = tile.core_debug.read_register(PC_EVENT0);
+        assert_eq!(
+            read_via_core_debug,
+            Some(VALUE),
+            "core_debug.read_register(0x32020) must return the written value"
+        );
+
+        // Read side: read_register_pure must return the same value (raw storage
+        // round-trip -- the write is also stored in tile.registers).
+        let read_via_pure = tile.read_register_pure(PC_EVENT0);
+        assert_eq!(
+            read_via_pure, VALUE,
+            "read_register_pure(0x32020) must return the written PC_Event0 value"
+        );
+    }
+
+    /// A ctrl-packet write of Debug_Control2 (0x32018) must reach
+    /// core_debug.debug_ctrl2, and read_register_pure must return the value.
+    #[test]
+    fn ctrl_write_debug_control2_reaches_core_debug() {
+        use crate::device::tile::CtrlPacketAction;
+
+        const DEBUG_CONTROL2: u32 = 0x32018;
+        // PC_Event_Halt enable (bit 0) -- the arming bit for PC_Event halts.
+        const VALUE: u32 = 0x0000_0001;
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
+            col: 0,
+            row: 2,
+            offset: DEBUG_CONTROL2,
+            value: VALUE,
+        });
+
+        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        assert_eq!(tile.pkt_handler_status & 0x4, 0, "Debug_Control2 write must not set SLVERR");
+
+        // core_debug must have the PC_Event_Halt enable set.
+        let read_via_core_debug = tile.core_debug.read_register(DEBUG_CONTROL2);
+        assert_eq!(
+            read_via_core_debug,
+            Some(VALUE),
+            "core_debug.read_register(0x32018) must return the written Debug_Control2 value"
+        );
+
+        // read_register_pure round-trip (raw storage).
+        let read_via_pure = tile.read_register_pure(DEBUG_CONTROL2);
+        assert_eq!(
+            read_via_pure, VALUE,
+            "read_register_pure(0x32018) must return the written Debug_Control2 value"
+        );
+    }
+
+    /// Core_Status (0x32004) read via read_register_pure must reflect the live
+    /// core_debug state, not stale tile.registers. This is the read-side gap:
+    /// Core_Status is a live-computed register (core_debug.read_status()); if
+    /// read_register_pure reads tile.registers instead, it returns 0 even when
+    /// the core is debug-halted.
+    ///
+    /// This test arms PC_Event0 + PC_Event_Halt, manually sets the halted flag
+    /// (simulating what the pre-execute seam will do), and asserts that
+    /// read_register_pure(0x32004) returns a value with DEBUG_HALT (bit 16).
+    #[test]
+    fn read_register_pure_core_status_reflects_live_debug_halt() {
+        const CORE_STATUS: u32 = 0x32004;
+        const DEBUG_HALT_BIT: u32 = 1 << 16;
+
+        let mut engine = InterpreterEngine::new_npu1();
+
+        // Enable the core and set the halted flag directly on core_debug.
+        // (The pre-execute seam in Step 2 will do this via has_sync_pc_trap_at +
+        // request_halt; here we isolate the read-side gap test.)
+        {
+            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile (0,2)");
+            tile.core_debug.set_enabled(true);
+            tile.core_debug.request_halt();
+        }
+
+        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        assert!(tile.core_debug.is_halted(), "precondition: core must be debug-halted");
+
+        // The live computed Core_Status via core_debug must have DEBUG_HALT set.
+        let via_core_debug = tile.core_debug.read_status();
+        assert_ne!(
+            via_core_debug & DEBUG_HALT_BIT,
+            0,
+            "core_debug.read_status() must have DEBUG_HALT bit set"
+        );
+
+        // read_register_pure must return the same live value, not tile.registers[0x32004]=0.
+        let via_pure = tile.read_register_pure(CORE_STATUS);
+        assert_ne!(
+            via_pure & DEBUG_HALT_BIT,
+            0,
+            "read_register_pure(Core_Status=0x32004) must reflect live DEBUG_HALT state; \
+             got 0x{via_pure:08X} (bit 16 absent -- read-side routing gap)"
+        );
+    }
+
+    /// Non-debug-reg writes and reads through the same paths are unaffected.
+    /// Data memory write at 0x400 still reads back via read_register_pure as
+    /// confirmed by the existing `ctrl_write_to_valid_offset_no_slverr_and_applies`
+    /// test. This companion test verifies that the core_debug dispatch in
+    /// read_register_pure does NOT intercept data-memory offsets.
+    #[test]
+    fn read_register_pure_non_debug_reg_unaffected() {
+        let mut engine = InterpreterEngine::new_npu1();
+
+        // Write a known value to data memory at offset 0x800.
+        {
+            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile (0,2)");
+            tile.write_data_u32(0x800, 0xDEAD_BEEF);
+        }
+
+        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        let val = tile.read_register_pure(0x800);
+        assert_eq!(
+            val, 0xDEAD_BEEF,
+            "read_register_pure of data memory must be unaffected by core_debug dispatch"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase B Unit 1 -- Step 2: pre-execute PC_Event seam tests
+    //
+    // Spec §5.1 / §5.3: when a synchronous PC_Event halt is armed (PC_Event0
+    // VALID + PC_Event_Halt in Debug_Control2) and the coordinator is about to
+    // execute the bundle at that PC, it must halt WITHOUT executing the bundle
+    // (before-commit, per G1 silicon observation). The post-execute update_pc
+    // must not re-fire the same match on the next step after resume.
+    //
+    // Async halt paths (host Debug_Control0[0], stall-halt, event-halt) must
+    // remain caught at the existing interpreter.rs:181 gate -- they are
+    // provably unaffected because the pre-execute seam only consults the
+    // core_debug.has_sync_pc_trap_at(pc) query, which returns false for async
+    // halt conditions (those set halted = true, caught at :181 before the
+    // pre-execute check would even fire).
+    // -----------------------------------------------------------------------
+
+    /// PC_Event0 armed at TRAP_PC, PC_Event_Halt enabled: stepping when the
+    /// core's next-PC matches TRAP_PC must return DebugHalt WITHOUT advancing
+    /// the PC (before-commit). The core must be halted and PC must not advance.
+    #[test]
+    fn pre_execute_pc_event_halts_before_commit() {
+        const TRAP_PC: u32 = 0x00; // arm at address 0 -- the first bundle
+        const PC_EVENT0: u32 = 0x32020;
+        const DEBUG_CONTROL2: u32 = 0x32018;
+
+        let mut engine = InterpreterEngine::new_npu1();
+
+        // Load 4 NOP bundles so the interpreter has something to execute.
+        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+            tile.write_program(0, &[0x00u8; 16]);
+        }
+        engine.enable_core(0, 2);
+
+        // Arm PC_Event0 at TRAP_PC via ctrl-packet (the routed path, now fixed in Step 1).
+        use crate::device::tile::CtrlPacketAction;
+        // VALID (bit 31) | address = TRAP_PC (14 bits).
+        let pc_event_value = 0x8000_0000 | (TRAP_PC & 0x3FFF);
+        engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
+            col: 0,
+            row: 2,
+            offset: PC_EVENT0,
+            value: pc_event_value,
+        });
+        // PC_Event_Halt: Debug_Control2 bit 0.
+        engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
+            col: 0,
+            row: 2,
+            offset: DEBUG_CONTROL2,
+            value: 0x1,
+        });
+
+        // Step once. The pre-execute seam must fire: the next PC (0) matches
+        // the armed PC_Event0, so the coordinator must halt before executing.
+        engine.step();
+
+        // PC must NOT have advanced (bundle did not execute).
+        let ctx = engine.core_context(0, 2).expect("core (0,2)");
+        assert_eq!(ctx.pc(), TRAP_PC, "PC must not advance on pre-execute halt (bundle did not commit)");
+
+        // Core must be debug-halted.
+        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        assert!(tile.core_debug.is_halted(), "core must be debug-halted after PC_Event match");
+
+        // Engine status must not be an error.
+        assert!(
+            !matches!(engine.status(), EngineStatus::Error),
+            "engine must not be in an error state after pre-execute halt"
+        );
+    }
+
+    /// When PC_Event0 is armed at a different PC than the current one, the
+    /// core must run normally (no spurious halt before-commit).
+    #[test]
+    fn pre_execute_pc_event_armed_but_not_matching_runs_normally() {
+        const TRAP_PC: u32 = 0x100; // arm at 0x100 -- far away from start
+        const PC_EVENT0: u32 = 0x32020;
+        const DEBUG_CONTROL2: u32 = 0x32018;
+
+        let mut engine = InterpreterEngine::new_npu1();
+
+        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+            tile.write_program(0, &[0x00u8; 16]);
+        }
+        engine.enable_core(0, 2);
+
+        use crate::device::tile::CtrlPacketAction;
+        let pc_event_value = 0x8000_0000 | (TRAP_PC & 0x3FFF);
+        engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
+            col: 0,
+            row: 2,
+            offset: PC_EVENT0,
+            value: pc_event_value,
+        });
+        engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
+            col: 0,
+            row: 2,
+            offset: DEBUG_CONTROL2,
+            value: 0x1,
+        });
+
+        // Step once from PC=0. PC_Event0 is at 0x100, so no match -> normal run.
+        engine.step();
+
+        let ctx = engine.core_context(0, 2).expect("core (0,2)");
+        assert_eq!(ctx.pc(), 4, "PC must advance normally when no PC_Event match");
+
+        let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+        assert!(!tile.core_debug.is_halted(), "core must NOT be halted when PC does not match");
+    }
+
+    /// After a pre-execute halt (Step 2 seam), resume (clear Debug_Control0[0])
+    /// and step again: the same PC_Event must NOT re-fire immediately on resume.
+    /// The core must advance past the trap PC without halting again, then halt
+    /// at the NEXT match if the trap PC wraps or is hit again.
+    ///
+    /// This tests the "condition the existing post-execute update_pc so the
+    /// same match does not re-fire after resume" requirement from the plan.
+    #[test]
+    fn pre_execute_pc_event_no_refire_after_resume() {
+        const TRAP_PC: u32 = 0x00;
+        const PC_EVENT0: u32 = 0x32020;
+        const DEBUG_CONTROL2: u32 = 0x32018;
+
+        let mut engine = InterpreterEngine::new_npu1();
+
+        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+            tile.write_program(0, &[0x00u8; 16]);
+        }
+        engine.enable_core(0, 2);
+
+        use crate::device::tile::CtrlPacketAction;
+        let pc_event_value = 0x8000_0000 | (TRAP_PC & 0x3FFF);
+        engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
+            col: 0,
+            row: 2,
+            offset: PC_EVENT0,
+            value: pc_event_value,
+        });
+        engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
+            col: 0,
+            row: 2,
+            offset: DEBUG_CONTROL2,
+            value: 0x1,
+        });
+
+        // First step: should halt before-commit at TRAP_PC=0.
+        engine.step();
+        {
+            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            assert!(tile.core_debug.is_halted(), "must halt at trap PC");
+        }
+        {
+            let ctx = engine.core_context(0, 2).expect("core");
+            assert_eq!(ctx.pc(), TRAP_PC, "PC must not advance");
+        }
+
+        // Resume: clear the halt.
+        {
+            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile");
+            tile.core_debug.request_resume();
+        }
+
+        // Second step: must NOT re-fire the pre-execute seam at the same PC;
+        // the bundle must execute and the PC must advance.
+        engine.step();
+        {
+            let ctx = engine.core_context(0, 2).expect("core");
+            assert_eq!(ctx.pc(), 4, "PC must advance past trap PC after resume -- no re-fire");
+            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            assert!(!tile.core_debug.is_halted(), "must not re-halt on the same PC after resume");
+        }
+    }
+
+    /// Async halt (host Debug_Control0[0] write) must still be caught at the
+    /// existing interpreter.rs:181 gate and must NOT be affected by the
+    /// pre-execute seam. The seam only checks for PC_Event conditions; an async
+    /// halt sets core_debug.halted = true through a different path, and the
+    /// interpreter's existing is_halted() gate (step_with_neighbor_locks ->
+    /// interpreter.rs:181) catches it before the bundle executes anyway.
+    ///
+    /// This test verifies the async path is unbroken: write Debug_Control0[0]
+    /// to halt, then step -- the interpreter gate returns DebugHalt, PC does
+    /// not advance, no interaction with the pre-execute seam.
+    #[test]
+    fn async_halt_unaffected_by_pre_execute_seam() {
+        const DEBUG_CONTROL0: u32 = 0x32010;
+
+        let mut engine = InterpreterEngine::new_npu1();
+
+        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+            tile.write_program(0, &[0x00u8; 16]);
+        }
+        engine.enable_core(0, 2);
+
+        // Arm async halt via Debug_Control0[0] (the host halt path).
+        use crate::device::tile::CtrlPacketAction;
+        engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
+            col: 0,
+            row: 2,
+            offset: DEBUG_CONTROL0,
+            value: 0x1, // halt bit
+        });
+
+        {
+            let tile = engine.device.array.get(0, 2).expect("compute tile");
+            assert!(tile.core_debug.is_halted(), "precondition: async halt must be set");
+        }
+
+        // Step: interpreter.rs:181 gate catches it before execution.
+        engine.step();
+
+        let ctx = engine.core_context(0, 2).expect("core");
+        assert_eq!(ctx.pc(), 0, "async halt must not advance PC");
+        let tile = engine.device.array.get(0, 2).expect("compute tile");
+        assert!(tile.core_debug.is_halted(), "core must remain halted after step with async halt");
+    }
+
+    /// Guarding test: the pre-execute halt must fire BEFORE the bundle commits.
+    ///
+    /// This test provides the literal store-not-landed assertion for the
+    /// before-commit guarantee derived from the G1 hardware finding:
+    ///   "silicon halts BEFORE the trap bundle commits -- all marker slots
+    ///    zero including the trap slot, DEBUG_HALT=1" (findings doc, 2026-05-18).
+    ///
+    /// Approach (a) per spec §6: reuse the encoded TRAP bundle bytes from
+    /// the debug_halt_probe ELF at PC=0x184:
+    ///   bytes: [0x03, 0x40, 0x57, 0x11, 0x00, 0x20, 0xd4, 0x00]
+    ///   disasm: st dj0, [p0, #4]; mov m0, #0xaa
+    ///   source: mlir-aie/build/test/npu-xrt/debug_halt_probe/chess/
+    ///           aie_arch.mlir.prj/main_core_0_2.elf (verified 2026-05-18)
+    ///
+    /// Setup:
+    ///   p0 = 0x70400 -- valid local data memory (CardDir 7, 0x70000-0x7FFFF)
+    ///   dj0 (modifier reg 16) = 0x7700 -- distinguishable 20-bit store value
+    ///   data_memory[0x404] = 0xDEAD_BEEF -- sentinel (offset = 0x70404 - 0x70000)
+    ///
+    /// Expected (pre-execute halt):
+    ///   data_memory[0x404] == 0xDEAD_BEEF  (store did NOT land)
+    ///
+    /// Falsified (post-execute halt, would indicate regression):
+    ///   data_memory[0x404] == 0x7700       (dj0 was stored, bundle committed)
+    #[test]
+    fn pre_execute_pc_event_store_not_landed_before_commit() {
+        use crate::interpreter::state::MOD_BASE_DJ;
+
+        // TRAP bundle from debug_halt_probe ELF (PC=0x184):
+        //   st dj0, [p0, #4]; mov m0, #0xaa
+        const TRAP_BUNDLE: [u8; 8] = [0x03, 0x40, 0x57, 0x11, 0x00, 0x20, 0xd4, 0x00];
+        const TRAP_PC: u32 = 0x00; // load the bundle at offset 0
+
+        // Store address: p0 + 4 = 0x70400 + 4 = 0x70404
+        // Data memory offset: 0x70404 - 0x70000 = 0x404
+        const P0_VAL: u32 = 0x70400;
+        const DATA_MEM_STORE_OFFSET: usize = 0x404;
+        // dj0: 20-bit value written to data_memory if bundle executes
+        const DJ0_VAL: u32 = 0x7700;
+        const SENTINEL: u32 = 0xDEAD_BEEF;
+
+        const PC_EVENT0: u32 = 0x32020;
+        const DEBUG_CONTROL2: u32 = 0x32018;
+
+        let mut engine = InterpreterEngine::new_npu1();
+
+        // Load the TRAP bundle at offset 0 in program memory.
+        // Pad to 16 bytes so the interpreter always has a valid bundle
+        // following the trap (avoid decode underrun on the second step).
+        {
+            let tile = engine.device_mut().tile_mut(0, 2).expect("compute tile (0,2)");
+            let mut prog = [0x00u8; 16];
+            prog[..8].copy_from_slice(&TRAP_BUNDLE);
+            tile.write_program(0, &prog);
+
+            // Pre-initialize the sentinel at the store target address.
+            tile.write_data_u32(DATA_MEM_STORE_OFFSET, SENTINEL);
+        }
+
+        // Pre-initialize p0 and dj0 in the core context BEFORE enabling the
+        // core.  engine.enable_core() does not reset the context, so these
+        // values survive into the first step.
+        //
+        // set_core_pointer / set_core_modifier require the core to exist in
+        // the engine (they look it up by (col, row)); the core is always
+        // constructed at engine creation time, so this is safe pre-enable.
+        engine.set_core_pointer(0, 2, 0, P0_VAL); // p0 = 0x70400
+        engine.set_core_modifier(0, 2, MOD_BASE_DJ + 0, DJ0_VAL); // dj0 = 0x7700
+        engine.enable_core(0, 2);
+
+        // Arm PC_Event0 at TRAP_PC and enable PC_Event_Halt.
+        use crate::device::tile::CtrlPacketAction;
+        let pc_event_value = 0x8000_0000 | (TRAP_PC & 0x3FFF);
+        engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
+            col: 0,
+            row: 2,
+            offset: PC_EVENT0,
+            value: pc_event_value,
+        });
+        engine.dispatch_ctrl_action(CtrlPacketAction::WriteRegister {
+            col: 0,
+            row: 2,
+            offset: DEBUG_CONTROL2,
+            value: 0x1,
+        });
+
+        // Step once: pre-execute seam fires at TRAP_PC, halts before commit.
+        engine.step();
+
+        // Core must be halted and PC must not have advanced.
+        {
+            let ctx = engine.core_context(0, 2).expect("core (0,2)");
+            assert_eq!(ctx.pc(), TRAP_PC, "PC must not advance -- pre-execute halt");
+        }
+        {
+            let tile = engine.device.array.get(0, 2).expect("compute tile (0,2)");
+            assert!(tile.core_debug.is_halted(), "core must be debug-halted");
+
+            // Literal store-not-landed assertion (G1-derived before-commit guarantee).
+            // If the seam incorrectly fired after-commit, data_memory[0x404] would
+            // be DJ0_VAL (0x7700); if it fired correctly before-commit, the
+            // SENTINEL (0xDEAD_BEEF) is undisturbed.
+            let stored = tile.read_data_u32(DATA_MEM_STORE_OFFSET);
+            assert_eq!(
+                stored,
+                Some(SENTINEL),
+                "store must NOT have landed (pre-execute halt is before-commit): \
+                 expected sentinel 0x{:08X}, got {:?}",
+                SENTINEL,
+                stored
+            );
+        }
     }
 }

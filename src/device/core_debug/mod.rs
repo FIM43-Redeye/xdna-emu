@@ -276,6 +276,17 @@ pub struct CoreDebugState {
     /// completes via `consume_pending_single_step`, which clears the latch
     /// and requests halt.
     pub(super) pending_single_step: bool,
+
+    /// PC of the most recently consumed synchronous PC_Event pre-execute
+    /// trap. When set, the pre-execute seam in the coordinator skips the
+    /// match check for exactly one step (the step immediately after resume
+    /// from a pre-execute halt), allowing the core to execute the trap
+    /// bundle and advance past it. Cleared by
+    /// `clear_sync_trap_consumed()` after the bundle executes.
+    ///
+    /// Phase B Unit 1, spec §5.1: the before-commit seam must not re-fire
+    /// the same PC_Event match on the step immediately following resume.
+    pub(super) sync_trap_consumed_at: Option<u32>,
 }
 
 impl Default for CoreDebugState {
@@ -312,6 +323,7 @@ impl Default for CoreDebugState {
             halt_cause_event0: false,
             halt_cause_event1: false,
             pending_single_step: false,
+            sync_trap_consumed_at: None,
         }
     }
 }
@@ -680,6 +692,66 @@ impl CoreDebugState {
     /// Returns true when Debug_Control2.PC_Event_Halt (bit 0) is set.
     fn pc_event_halt_enabled(&self) -> bool {
         (self.debug_ctrl2 >> DBG_CTRL2_PC_EVENT_HALT_LSB) & 1 != 0
+    }
+
+    // -----------------------------------------------------------------------
+    // Synchronous PC_Event trap query (Phase B Unit 1, spec §5.1)
+    // -----------------------------------------------------------------------
+
+    /// Return true if the core has an armed synchronous PC_Event trap at `pc`
+    /// that has not yet been consumed for this step.
+    ///
+    /// A trap is armed when:
+    /// - At least one of PC_Event0..3 is VALID and its 14-bit PC_ADDRESS
+    ///   matches the low 14 bits of `pc`, AND
+    /// - Debug_Control2.PC_Event_Halt (bit 0) is set, AND
+    /// - The trap has not already been consumed at this PC by a prior call to
+    ///   `consume_sync_pc_trap()` (suppresses re-fire for one step after resume).
+    ///
+    /// This is a non-committing query: it does not halt the core or modify any
+    /// state. The coordinator calls this before executing the bundle; if it
+    /// returns true, the coordinator calls `consume_sync_pc_trap()` and returns
+    /// `StepResult::DebugHalt` without executing the bundle.
+    ///
+    /// Per G1 silicon observation (NPU1, 2026-05-18): synchronous PC-event
+    /// breakpoints halt BEFORE the trap bundle commits. See findings doc.
+    pub fn has_sync_pc_trap_at(&self, pc: u32) -> bool {
+        if !self.pc_event_halt_enabled() {
+            return false;
+        }
+        // Suppress re-fire for exactly one step after resume from a
+        // pre-execute halt at this same PC.
+        if self.sync_trap_consumed_at == Some(pc & PC_EVENT_ADDRESS_MASK) {
+            return false;
+        }
+        let pc14 = pc & PC_EVENT_ADDRESS_MASK;
+        let matches_event =
+            |raw: u32| -> bool { Self::pc_event_address(raw).map_or(false, |addr| addr == pc14) };
+        matches_event(self.pc_event0)
+            || matches_event(self.pc_event1)
+            || matches_event(self.pc_event2)
+            || matches_event(self.pc_event3)
+    }
+
+    /// Consume the synchronous PC_Event trap at `pc`: halt the core and record
+    /// the consumed PC so the same trap does not re-fire immediately on resume.
+    ///
+    /// Called by the coordinator when `has_sync_pc_trap_at(pc)` returns true,
+    /// before the bundle executes. Sets `halt_cause_pc_event` (matching HW
+    /// Debug_Status behavior) and requests halt.
+    pub fn consume_sync_pc_trap(&mut self, pc: u32) {
+        self.sync_trap_consumed_at = Some(pc & PC_EVENT_ADDRESS_MASK);
+        self.halt_cause_pc_event = true;
+        self.request_halt();
+    }
+
+    /// Clear the sync-trap-consumed record after the trap bundle has executed.
+    ///
+    /// Called by the coordinator after `step_with_neighbor_locks` returns
+    /// (i.e. the bundle at the trap PC ran), so the next time the core
+    /// returns to that PC the trap fires again.
+    pub fn clear_sync_trap_consumed(&mut self) {
+        self.sync_trap_consumed_at = None;
     }
 
     /// Drive PC_Event0..3 matching against the new PC value.

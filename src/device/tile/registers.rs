@@ -173,6 +173,35 @@ impl Tile {
             return self.pkt_handler_status & 0xF;
         }
 
+        // Core debug register dispatch (compute tiles only).
+        //
+        // Core_Status (0x32004) and Debug_Status (0x3201C) are live-computed
+        // registers: their values are derived from the CoreDebugState struct
+        // fields (halt flag, stall flags, cause latches) and are never written
+        // to tile.registers, so a raw HashMap lookup returns 0 even when the
+        // core is halted. Delegating to core_debug.read_register() returns the
+        // correct live value.
+        //
+        // The other registers in this range (PC_Event*, Debug_Control*) store
+        // raw values in both tile.registers and core_debug fields; either path
+        // returns the same value. Routing them through core_debug.read_register()
+        // here is consistent and correct.
+        //
+        // Offsets derived from aie-rt xaiemlgbl_params.h, cross-checked against
+        // the AM025 register database (aie_registers_aie2.json):
+        //   Core_Control 0x32000  Core_Status 0x32004  (and 0x32008, 0x3200C)
+        //   Debug_Control0..2  0x32010, 0x32014, 0x32018
+        //   Debug_Status       0x3201C
+        //   PC_Event0..3       0x32020, 0x32024, 0x32028, 0x3202C
+        //   Core_PC/SP/LR      0x31100, 0x31120, 0x31130
+        //
+        // Phase B Unit 1 routing-gap fix (spec §5.1/§5.3, G1-derived 2026-05-18).
+        if self.is_compute() {
+            if let Some(val) = self.core_debug.read_register(offset) {
+                return val;
+            }
+        }
+
         // Fall back to register map
         self.registers.get(&offset).copied().unwrap_or(0)
     }
