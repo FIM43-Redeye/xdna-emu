@@ -256,12 +256,15 @@ impl NpuExecutor {
     /// `MaskPollUnsatisfied` terminal reason rather than hanging forever.
     ///
     /// This is the emulator-contract check for the MASKPOLL halt-synchronization
-    /// injected into `insts.bin` by the debug_halt_probe (spec §4.2). On the
-    /// real NPU the poll satisfies when `Core_Status[16]` (DEBUG_HALT) sets
-    /// after a breakpoint fires. On the emulator the breakpoint-arming writes
-    /// are dropped into the `write_core_register` catch-all so `DEBUG_HALT`
-    /// never sets -- the poll is unsatisfiable by design, and this method lets
-    /// the run loop detect it without spinning forever.
+    /// injected into `insts.bin` by the debug_halt_probe (spec §4.2). The poll
+    /// satisfies when `Core_Status[16]` (DEBUG_HALT) sets after a breakpoint
+    /// fires -- on the real NPU and, since Phase B Units 1/1b, on the emulator
+    /// too (the breakpoint arms, the pre-execute seam halts before-commit, and
+    /// both read paths observe DEBUG_HALT). This method instead guards a
+    /// *genuinely* unsatisfiable poll (e.g. polling a register nothing ever
+    /// drives), letting the run loop terminate deterministically rather than
+    /// spinning forever -- retained as independent hardening, no longer the
+    /// debug_halt_probe's path.
     pub fn is_blocked_on_poll(&self) -> bool {
         matches!(self.state, ExecutorState::BlockedOnPoll { .. })
     }
@@ -1785,8 +1788,10 @@ mod tests {
 
         // Poll for bit 16 of Core_Status (0x32004) on tile (0, 2):
         // This is exactly the DEBUG_HALT condition used by the probe injector.
-        // In the emulator, Core_Status[16] never sets (the write-side gap drops
-        // the arming writes), so the poll is never satisfied.
+        // Here the device is fresh: no breakpoint is armed and no halt-seam has
+        // fired, so the core is not debug-halted and Core_Status[16] stays 0 --
+        // a genuinely unsatisfiable poll (this is the retained-hardening path,
+        // NOT the debug_halt_probe's path, which now satisfies post-Unit-1b).
         let core_status_reg = 0x32004u32;
         let reg_off = (0u32 << 25) | (2u32 << 20) | core_status_reg;
 
@@ -1812,8 +1817,9 @@ mod tests {
             assert!(executor.is_blocked_on_poll(), "must remain in BlockedOnPoll (cycle {})", i);
         }
 
-        // Polled register must be untouched (no fakery -- emulator must not set
-        // the DEBUG_HALT bit to force poll satisfaction).
+        // DEBUG_HALT must not be faked to force poll satisfaction (no fakery).
+        // Note: Core_Status may carry other live-computed bits (e.g. RESET on a
+        // fresh core); the contract is specifically that bit 16 stays 0.
         let core_status_val = device.tile_mut(0, 2).map(|t| t.read_register(core_status_reg)).unwrap_or(0);
         assert_eq!(
             core_status_val & 0x0001_0000,
