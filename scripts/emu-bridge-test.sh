@@ -1715,6 +1715,15 @@ _inject_maskpoll_if_probe() {
   local name="$1" src_dir="$2" build_dir="$3" log_file="$4" result_file="$5"
   [[ "$name" == "debug_halt_probe" ]] || return 0
 
+  # Exp2 double-read uses no injected MASKPOLL -- the self-validating snapshot
+  # agreement between pass A and pass B eliminates the need for a poll.
+  # Exp1 halt/done witnesses are unchanged and still inject.
+  local _witness="${DEBUG_HALT_PROBE_WITNESS:-halt}"
+  if [[ "$_witness" == "none" ]]; then
+    echo "  INJECT $name: skipped (none -- Exp2 double-read, no poll)"
+    return 0
+  fi
+
   local _insts_name
   _insts_name="$(_discover_instr_binary "$src_dir")"
   local _insts="$build_dir/$_insts_name"
@@ -1723,7 +1732,6 @@ _inject_maskpoll_if_probe() {
     echo "  COMPILE $name: FAIL (insts.bin $_insts_name not found for MASKPOLL injection)"
     return 1
   fi
-  local _witness="${DEBUG_HALT_PROBE_WITNESS:-halt}"
   if ! python3 "$EMU_ROOT/tools/inject-maskpoll.py" \
        --witness "$_witness" "$_insts" \
        >> "$log_file" 2>&1; then
