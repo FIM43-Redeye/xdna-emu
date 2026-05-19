@@ -332,13 +332,19 @@ mod tests {
 
     #[test]
     fn implementation_gaps_source_is_the_spine_not_semantic() {
-        // Spec S1/M1 guard: no category default is ever Modeled, so a
-        // semantic-universe source would be a permanently empty queue. The
-        // Task-3/4 seeds make several domains real gaps (interrupt Partial,
-        // clock_control/noc Stub, control_packets Partial), so the rendered
-        // queue MUST be non-empty.
+        // Spec S1/M1 guard: the gaps queue must be sourced from the
+        // capability spine, not the semantic universe (which would yield a
+        // permanently empty queue since no category default is ever
+        // Modeled). Probe the invariant, not a specific domain name: `noc`
+        // and `clock_control` are permanent STUBs (unmodeled subsystems),
+        // so as long as any STUB/PARTIAL domain exists the rendered queue
+        // must be non-empty. (Avoids whack-a-mole when a single domain is
+        // promoted to Full -- e.g. debug_halt 2026-05-19.)
         let out = render_implementation_gaps(Architecture::Aie2);
-        assert!(out.contains("interrupt:"), "expected interrupt (a known Partial domain) in the implementation-gaps queue -- a silent per-domain drop or wrong source");
+        assert!(
+            out.lines().any(|l| l.contains(": PARTIAL") || l.contains(": STUB")),
+            "implementation-gaps queue has no PARTIAL/STUB entry -- generator likely sourced the semantic universe, not the spine (spec S1/M1)"
+        );
         assert!(
             !out.contains("_empty_"),
             "implementation-gaps queue is empty -- generator likely sourced the semantic universe, not the spine (spec S1/M1)"
