@@ -1,6 +1,6 @@
 # Debug Halt Timing and Single-Step Count
 
-**Source**: Phase A `debug_halt_probe`, Task 5/5b (G1) / Task 7 (G2 -- pending).
+**Source**: Phase A `debug_halt_probe`, Task 5/5b (G1) / Task 7 (G2 -- derived).
 **Ground truth**: Real NPU1 (Phoenix, XDNA/AIE2, `0000:c6:00.1`), 2026-05-18.
 **Observation method**: A firmware `XAIE_IO_MASKPOLL` (opcode 4) post-compile-
 injected into the probe `insts.bin` blocks the instruction stream until
@@ -170,4 +170,138 @@ pass). `test.cpp` commit `8546397987` updated for Unit 1b on
 
 ## G2 -- Single_Step_Count (Debug_Control0[5:2])
 
-(Filled in Task 7.)
+**Verdict: `Debug_Control0[5:2]` `Single_Step_Count` is LIVE silicon on
+NPU1 (Phoenix/AIE2), NOT dead/reserved state.** Writing a non-zero
+count (halt bit `[0]` clear) halts the core via `DEBUG_HALT` after
+single-stepping that many instructions. This disproves the pre-probe
+audit hypothesis (spec §1/§2.A/§7: "dead state ... may be inert on
+silicon (effectively reserved)").
+
+### Probe configuration (final, Exp2)
+
+8 distinct sequential marker stores (`output_buffer[k]=101+k`, k=0..7)
+behind the Exp1 blocking objectfifo `@gate` (arming-race immunity:
+`@seq` writes `Debug_Control0` *then* feeds `@gate`, so the count-step
+arm provably lands before the core proceeds); ctrl-in OP_READ on shim
+MM2S ch1 (collision fix, inherited). `@seq` arms a single
+`aiex.npu.write32 Debug_Control0 (0x32010) = value`, feeds `@gate`,
+then a **double** ctrl-in OP_READ readback (pass A then verbatim pass
+B, 8 marker slots + `Core_Status` each). Verdict (`test.cpp`):
+`SETTLED = (A == B)` (both snapshots identical -> provably stable
+terminal state); `LANDED` = committed marker count. **No injected
+poll** -- `DEBUG_HALT_PROBE_WITNESS=none` skips MASKPOLL injection.
+Minimal set: `0x00` (count-step off, control) vs `0x10`
+(`Single_Step_Count`=4, halt bit clear).
+
+Raw logs: `/tmp/claude-1000/probe-exp2-hw-0x00.log`,
+`probe-exp2-hw-0x10.log` (ephemeral); durable copy
+`build/bridge-test-results/.../debug_halt_probe.chess.{hw,bridge}.log`.
+Probe source: `mlir-aie/test/npu-xrt/debug_halt_probe/` branch
+`xdna-emu-cycle-budget`, Exp2 no-poll double-read at `ce86439a70`;
+bridge no-inject wiring xdna-emu `dev` `b701e61`.
+
+### The Task-7 detour (durable -- a no-timeout-poll hazard + a real driver bug)
+
+The *first* Task-7 HW attempt used the earlier conditional-`CORE_DONE`-
+MASKPOLL design (a no-timeout firmware `XAIE_IO_MASKPOLL`). On point
+`0x10` the poll's predicate never became true, the poll blocked the
+mailbox forever, and `modprobe -r` recovery hit a **kernel NULL-deref /
+use-after-free in `amdxdna`**: timed-out mailbox messages were left in
+`chan_xa` and flushed at channel teardown via
+`notify_cb(handle, NULL, 0)` with the callback dereferencing a
+NULL/dangling handle (`xdna_msg_cb`/`aie4_xdna_msg_cb` ->
+`complete(&cb_arg->comp)`, `do_raw_spin_lock` oops; SMU-wedged the NPU,
+reboot-only).
+
+Fixed and verified this session (xdna-driver branch
+`fix/mailbox-teardown-stale-msg`): `1114562` (PR-candidate) adds
+`xdna_mailbox_cancel_msg()` -- reclaim the timed-out message on
+`-ETIME` via the existing xa_erase ownership model -- plus NULL-safe
+teardown callbacks; `7d85f25` adopts the pre-existing local
+keep-channel-alive-on-`-ETIME` change (LOCAL-ONLY, do not upstream).
+Reproduced the exact pre-fix crash, then with the fix: `modprobe -r`
+on a firmware-wedged device unloads cleanly, zero oops. The probe was
+then redesigned to the **no-poll double-read** above (an unbounded
+firmware poll whose predicate cannot be known in advance is an
+unacceptable probe mechanism, and `CORE_DONE`-via-OP_READ was an
+unproven happens-after). The no-poll probe **cannot** wedge the
+device; both Task-7 HW points below ran clean (no TDR, no wedge).
+
+### Hardware observed (NPU1, 2026-05-19, fixed driver, no-poll probe)
+
+```
+Debug_Control0 = 0x00  (Single_Step_Count = 0; count-step disabled):
+  SLOTS: 101 102 103 104 105 106 107 108
+  CORE_STATUS=0x100000 HALTED=0 DONE=1 SETTLED=1   LANDED:8
+  bridge PASS, CLEAN, no wedge
+
+Debug_Control0 = 0x10  (Single_Step_Count = 4, halt bit [0] = 0):
+  SLOTS: 0 0 0 0 0 0 0 0
+  CORE_STATUS=0x10001 HALTED=1 DONE=0 SETTLED=1    LANDED:0
+  bridge PASS, CLEAN, no wedge
+```
+
+`0x00`: `Core_Status=0x100000` = `CORE_DONE`(bit 20); core ran all 8
+stores to completion. `0x10`: `Core_Status=0x10001` =
+`DEBUG_HALT`(bit 16) | `ENABLE`(bit 0); core halted with **zero**
+markers committed. `SETTLED=1` on both (pass A == pass B) -- stable
+terminal states, not read-too-early artifacts. The two runs are the
+*same binary* save the one `Debug_Control0` value; `@gate` guarantees
+the write landed before the core ran.
+
+### EMU observed (same byte-identical binaries)
+
+```
+0x00:  SLOTS: 101..108  CORE_STATUS=0x100000  HALTED=0 DONE=1 SETTLED=1  LANDED:8
+0x10:  SLOTS: 101..108  CORE_STATUS=0x100003  HALTED=0 DONE=1 SETTLED=1  LANDED:8
+```
+
+EMU is **count-step inert**: `0x10` behaves identically to `0x00`
+(`LANDED:8`, not halted). This is the expected, spec-predicted baseline
+-- *not* a probe defect and *not* a write-side routing gap: the
+`Debug_Control0` write reaches `core_debug` via
+`apply_tile_local_effects` -> `write_debug_control0` (mod.rs:787) and
+is stored, but **nothing reads/acts on the stored count** -- the
+count-step state machine is the unimplemented Phase B §5.2 work. (The
+`0x100003` vs HW `0x100000` is the tracked, benign §8 `RESET`-bit
+EMU/HW divergence; the verdict keys on bits 16/20, which agree.)
+
+### Conclusion
+
+**On NPU1 (Phoenix/AIE2) silicon, `Debug_Control0[5:2]`
+`Single_Step_Count` is a functional single-step instruction-count
+register.** With the halt bit `[0]` clear, `count=4` single-steps the
+core and halts it (via `DEBUG_HALT`, `Core_Status[16]`) within the
+first 4 instructions -- before the first marker store commits
+(`LANDED:0`); `count=0` leaves the core running free (`LANDED:8`,
+`CORE_DONE`). The halt is reached *without* setting the documented halt
+bit `[0]`, so bits `[5:2]` drive the halt on their own. Count-step is
+**not** the binary-unreachable dead state the audit assumed; it is live
+hardware the emulator must model.
+
+### Phase B implication (§5.2 -- now HW-anchored)
+
+Phase B §5.2 (count-step state machine) was specified as
+"behavior follows Experiment 2 findings." Anchored behavior: a non-zero
+`Debug_Control0[5:2]=N` arms an N-instruction single-step budget;
+on expiry the core halts with `Core_Status` `DEBUG_HALT` set (and
+`ENABLE` stays 1, `CORE_DONE` 0). `N=0` = disabled. The emulator
+currently stores the field (mod.rs:787) but no consumer decrements/
+expires it -- §5.2 implements that consumer (one call adjacent to
+`consume_pending_single_step`, per spec §5.2).
+
+### Scope / §8 forward-commitment (honest bounds)
+
+Derived: count-step is **active**, halts via `DEBUG_HALT`, independent
+of the halt bit, `N=4` halts in the prologue. **Not** derived (single
+`N=4` datapoint; minimal set by design after the no-timeout-poll
+hazard): the exact decrement cadence / which instruction boundary `N`
+counts to, expiry-vs-re-arm on resume, the `count + halt-bit` (`0x11`)
+interaction, and larger-`N` behavior. Per spec §8 these remain a
+**tracked count-step silicon-fidelity forward-commitment**: Phase B
+§5.2 ships the most natural reading of the above (documented inline as
+explicit modeling decisions citing this finding), and finer
+characterization is revisited when a dedicated hardware-observation
+budget / better register-poke tooling is available. The probe stays
+checked in (Exp2 form re-runnable via `DEBUG_HALT_PROBE_WITNESS=none`;
+Task 8 restores the Exp1 G1 regression as the default).
