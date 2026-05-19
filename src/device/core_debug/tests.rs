@@ -988,9 +988,13 @@ fn pc_event_match_after_reset_does_not_fire() {
 
 #[test]
 fn sstep_event_match_sets_pending_latch() {
-    // SSTEP_EVENT field configured to event 16 (WATCHPOINT_0). Firing
-    // event 16 must set pending_single_step but NOT halt immediately --
-    // the halt happens on consume.
+    // §5.1 principled split: this is the documented AFTER-commit case.
+    // check_event_halt is called directly with no PC_Event slot wired, so
+    // the before-commit seam (has_sync_sstep_pc_trap_at) does not engage;
+    // the SSTEP_EVENT latch arms and the halt is deferred to consume (the
+    // triggering bundle commits first). Watchpoint/mem/lock/range-wired
+    // single-step stays on this path by design (no coherent before-commit
+    // point -- arming known only post-bundle).
     let mut state = CoreDebugState::new();
     state.enabled = true;
     state.debug_ctrl1 = make_dbg_ctrl1(0, 16, 0, 0);
@@ -1045,18 +1049,57 @@ fn sstep_event_zero_id_never_matches() {
 
 #[test]
 fn sstep_event_via_pc_event_path() {
-    // End-to-end: SSTEP_EVENT wired to Core_PC_0 (event 16). PC_Event0
-    // valid + matching PC fires Core_PC_0, which arms the SSTEP latch.
+    // §5.1 principled split (Maya 2026-05-19): SSTEP_EVENT wired to a
+    // point PC event (Core_PC_0) is the before-commit-eligible case --
+    // the arming condition (PC match) is known before the bundle, so the
+    // pre-execute seam halts BEFORE the bundle commits, parallel to G1's
+    // PC_Event_Halt seam (no deferred pending_single_step round-trip).
     let mut state = CoreDebugState::new();
     state.enabled = true;
     state.pc_event0 = make_pc_event(true, 0x100);
     state.debug_ctrl1 = make_dbg_ctrl1(0, EVENT_CORE_PC_0, 0, 0);
 
-    state.update_pc(0x100);
-    assert!(state.pending_single_step, "PC match -> Core_PC_0 -> SSTEP_EVENT match must arm the latch");
-    assert!(!state.is_halted(), "still deferred");
-    state.consume_pending_single_step();
-    assert!(state.is_halted());
+    assert!(state.has_sync_sstep_pc_trap_at(0x100));
+    assert!(!state.is_halted(), "query alone does not halt");
+    state.consume_sync_sstep_pc_trap(0x100);
+    assert!(state.is_halted(), "PC-wired single-step halts before-commit");
+
+    // Idempotent: consumed at this PC, does not re-fire after resume
+    // (mirrors consume_sync_pc_trap; re-arming is the §8-tracked edge).
+    state.request_resume();
+    assert!(!state.has_sync_sstep_pc_trap_at(0x100));
+}
+
+#[test]
+fn sstep_pc_trap_only_for_point_pc_events() {
+    // Watchpoint / non-PC SSTEP_EVENT is NOT before-commit eligible: no
+    // PC_Event slot mapping -> query is false (it stays on the unchanged
+    // after-commit check_event_halt -> pending_single_step path).
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.pc_event0 = make_pc_event(true, 0x100);
+    // SSTEP_EVENT = 32 (a non-PC event id, e.g. a watchpoint).
+    state.debug_ctrl1 = make_dbg_ctrl1(0, 32, 0, 0);
+    assert!(!state.has_sync_sstep_pc_trap_at(0x100));
+
+    // PC-range single-step is deliberately bucketed after-commit too.
+    state.debug_ctrl1 = make_dbg_ctrl1(0, EVENT_CORE_PC_RANGE_0_1, 0, 0);
+    assert!(!state.has_sync_sstep_pc_trap_at(0x100));
+}
+
+#[test]
+fn sstep_pc_trap_requires_valid_matching_pc_event() {
+    let mut state = CoreDebugState::new();
+    state.enabled = true;
+    state.debug_ctrl1 = make_dbg_ctrl1(0, EVENT_CORE_PC_2, 0, 0);
+    // PC_Event2 not VALID -> no trap.
+    state.pc_event2 = make_pc_event(false, 0x200);
+    assert!(!state.has_sync_sstep_pc_trap_at(0x200));
+    // VALID but PC mismatch -> no trap.
+    state.pc_event2 = make_pc_event(true, 0x200);
+    assert!(!state.has_sync_sstep_pc_trap_at(0x208));
+    // VALID and matching -> trap.
+    assert!(state.has_sync_sstep_pc_trap_at(0x200));
 }
 
 #[test]

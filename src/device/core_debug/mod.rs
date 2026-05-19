@@ -786,6 +786,44 @@ impl CoreDebugState {
         self.request_halt();
     }
 
+    /// True iff an *event-driven* single-step (Debug_Control1[14:8]
+    /// SSTEP_EVENT) is wired to a *point* PC event (Core_PC_0..3) that is
+    /// VALID and matches `pc`, and this PC has not already been consumed.
+    /// This is the before-commit-eligible single-step case (§5.1 principled
+    /// split, Maya 2026-05-19): the arming condition (PC match) is known
+    /// *before* the bundle, so silicon halts before the bundle commits — the
+    /// same boundary as the G1 PC_Event_Halt seam. Watchpoint/mem/lock and
+    /// PC-*range*-wired SSTEP_EVENT have no coherent before-commit point and
+    /// stay after-commit via the unchanged check_event_halt ->
+    /// pending_single_step -> consume_pending_single_step path (documented
+    /// modeling decision).
+    pub fn has_sync_sstep_pc_trap_at(&self, pc: u32) -> bool {
+        let pc14 = pc & PC_EVENT_ADDRESS_MASK;
+        if self.sync_trap_consumed_at == Some(pc14) {
+            return false;
+        }
+        let raw = match self.debug_sstep_event() {
+            EVENT_CORE_PC_0 => self.pc_event0,
+            EVENT_CORE_PC_1 => self.pc_event1,
+            EVENT_CORE_PC_2 => self.pc_event2,
+            EVENT_CORE_PC_3 => self.pc_event3,
+            _ => return false,
+        };
+        Self::pc_event_address(raw).map_or(false, |addr| addr == pc14)
+    }
+
+    /// Consume a before-commit PC-wired single-step trap: latch the PC-event
+    /// halt cause (Debug_Status has no dedicated single-step cause bit —
+    /// aggregate only; a PC-wired single-step *is* a PC event firing), mark
+    /// this PC consumed so it does not re-fire after resume (mirrors
+    /// `consume_sync_pc_trap`; re-arming is the §8-tracked edge), and request
+    /// the halt.
+    pub fn consume_sync_sstep_pc_trap(&mut self, pc: u32) {
+        self.sync_trap_consumed_at = Some(pc & PC_EVENT_ADDRESS_MASK);
+        self.halt_cause_pc_event = true;
+        self.request_halt();
+    }
+
     /// Clear the sync-trap-consumed record after the trap bundle has *retired*.
     ///
     /// Called by the coordinator ONLY on `StepResult::Continue` (the trap

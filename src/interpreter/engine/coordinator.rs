@@ -673,6 +673,17 @@ impl InterpreterEngine {
                     continue;
                 }
 
+                // §5.1 principled split (Maya 2026-05-19): PC-wired event
+                // single-step also halts before-commit (arming = PC match,
+                // known pre-bundle). Same seam, same skip-the-bundle semantics
+                // as the G1 PC_Event_Halt path above.
+                if tile.core_debug.has_sync_sstep_pc_trap_at(next_pc) {
+                    tile.core_debug.consume_sync_sstep_pc_trap(next_pc);
+                    all_halted = false;
+                    any_running = true;
+                    continue;
+                }
+
                 let result = core.interpreter.step_with_neighbor_locks(
                     &mut core.context,
                     tile,
