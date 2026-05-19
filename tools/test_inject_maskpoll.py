@@ -8,6 +8,9 @@ Covers (plan Step 3 TDD requirements):
     and the MASKPOLL is spliced immediately before it
   - idempotent: re-injecting a stream that already has the MASKPOLL is a no-op
   - missing anchor -> ValueError (caller must STOP, not guess)
+  - --witness done -> value=mask=0x00100000 (CORE_DONE bit 20)
+  - --witness halt (default) -> value=mask=0x00010000 (DEBUG_HALT bit 16)
+  - default (no --witness) == halt (byte-for-byte identical)
 
 A representative insts.bin is built in memory: 16-byte header + a Write32 +
 a decoy MaskWrite32 (different tile-local offset) + the anchor MaskWrite32 at
@@ -210,3 +213,85 @@ def test_cli_in_place(tmp_path):
     assert r2.returncode == 0, r2.stderr
     assert "no-op" in r2.stderr
     assert p.read_bytes() == patched
+
+
+# ---------------------------------------------------------------------------
+# Witness parameterization tests (Task 6 -- --witness done|halt)
+# ---------------------------------------------------------------------------
+
+def _extract_maskpoll_value_mask(patched: bytes):
+    """Return (value, mask) of the single MASKPOLL in the patched stream."""
+    maskpolls = [off for off, opc in _walk(patched) if opc == inj._OPC_MASKPOLL]
+    assert len(maskpolls) == 1, "exactly one MASKPOLL expected"
+    off = maskpolls[0]
+    value = struct.unpack_from("<I", patched, off + 16)[0]
+    mask  = struct.unpack_from("<I", patched, off + 20)[0]
+    return value, mask
+
+
+def test_witness_halt_default():
+    """Default (no witness arg) produces DEBUG_HALT value=mask=0x00010000."""
+    data = _build_insts()
+    patched, injected = inj.inject(data)  # no witness arg -- defaults to "halt"
+    assert injected is True
+    value, mask = _extract_maskpoll_value_mask(patched)
+    assert value == 0x00010000, f"halt witness value wrong: {value:#010x}"
+    assert mask  == 0x00010000, f"halt witness mask  wrong: {mask:#010x}"
+
+
+def test_witness_halt_explicit():
+    """Explicit --witness halt produces the same bytes as the default."""
+    data = _build_insts()
+    default_patched, _ = inj.inject(data)
+    explicit_patched, _ = inj.inject(data, witness="halt")
+    assert default_patched == explicit_patched, (
+        "explicit witness=halt must be byte-for-byte identical to default"
+    )
+
+
+def test_witness_done():
+    """--witness done produces CORE_DONE value=mask=0x00100000."""
+    data = _build_insts()
+    patched, injected = inj.inject(data, witness="done")
+    assert injected is True
+    value, mask = _extract_maskpoll_value_mask(patched)
+    assert value == 0x00100000, f"done witness value wrong: {value:#010x}"
+    assert mask  == 0x00100000, f"done witness mask  wrong: {mask:#010x}"
+
+
+def test_witness_done_header_bump():
+    """--witness done still bumps the header correctly (op-count +1, size +28)."""
+    data = _build_insts()
+    orig_ops  = struct.unpack_from("<I", data, 8)[0]
+    orig_size = struct.unpack_from("<I", data, 12)[0]
+    patched, _ = inj.inject(data, witness="done")
+    assert struct.unpack_from("<I", patched, 8)[0]  == orig_ops  + 1
+    assert struct.unpack_from("<I", patched, 12)[0] == orig_size + 28
+
+
+def test_witness_done_cli(tmp_path):
+    """CLI --witness done writes CORE_DONE into the patched stream."""
+    data = _build_insts()
+    p = tmp_path / "insts.bin"
+    p.write_bytes(data)
+
+    r = subprocess.run(
+        [sys.executable, str(_TOOL_PATH), "--witness", "done", str(p)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    patched = p.read_bytes()
+    value, mask = _extract_maskpoll_value_mask(patched)
+    assert value == 0x00100000
+    assert mask  == 0x00100000
+    # Stderr must mention the witness and the CORE_DONE mask.
+    assert "done" in r.stderr
+    assert "0x00100000" in r.stderr
+
+
+def test_witness_invalid():
+    """An invalid witness name raises ValueError."""
+    data = _build_insts()
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="unknown witness"):
+        inj.inject(data, witness="bogus")

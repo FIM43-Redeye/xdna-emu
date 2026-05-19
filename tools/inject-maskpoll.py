@@ -1,17 +1,38 @@
 #!/usr/bin/env python3
 """inject-maskpoll.py -- splice a halt-synchronization MASKPOLL into insts.bin.
 
-The debug_halt_probe (mlir-aie test/npu-xrt/debug_halt_probe) arms a PC-event
-breakpoint on a compute core, then reads back output_buffer + Core_Status via
-control-packet OP_READ.  Without synchronization the OP_READ has no
-happens-after against the core halt -- it is pure relative latency (spec
+The debug_halt_probe (mlir-aie test/npu-xrt/debug_halt_probe) arms either a
+PC-event breakpoint (Exp1) or a Debug_Control0 count-step register write (Exp2)
+on a compute core, then reads back output_buffer + Core_Status via control-
+packet OP_READ.  Without synchronization the OP_READ has no happens-after
+against the core terminal state -- it is pure relative latency (spec
 docs/superpowers/specs/2026-05-18-debug-halt-design.md, sec 4.2
 "Halt-synchronization").  No MLIR dialect op emits a poll into the runtime
 sequence (NpuMaskPollOp does not exist), so the robust fix is a post-compile
 binary patch: insert a firmware XAIE_IO_MASKPOLL (opcode 0x04) that blocks the
-instruction stream until Core_Status[16] (DEBUG_HALT) is set, positioned
+instruction stream until the chosen Core_Status bit is set, positioned
 immediately before the first ctrl-in OP_READ push.  EMU and HW then run the
 *identical* patched binary (byte-parity).
+
+Two witnesses are supported via --witness {done,halt}:
+
+  --witness halt  (DEFAULT, Exp1)
+      Polls Core_Status[16] (DEBUG_HALT, mask/value 0x00010000).
+      Used for Exp1 (PC_Event0 breakpoint): the core halts at the trap
+      bundle; the poll satisfies when DEBUG_HALT becomes set.
+      Byte-for-byte identical to the original behavior; all existing tests
+      cover this path.
+
+  --witness done  (Exp2)
+      Polls Core_Status[20] (CORE_DONE, mask/value 0x00100000).
+      Used for Exp2 (Debug_Control0 count-step): the expected outcome is
+      that the count-step is inert and the core runs to completion, latching
+      CORE_DONE.  If the DONE-MASKPOLL wedges (core never reached DONE
+      because count-step halted it), recover and re-run with --witness halt.
+
+Only the value+mask words ([16..20] and [20..24] in the 28-byte record) differ
+between witnesses; reg_off (Core_Status, tile (0,2)) and everything else are
+identical.
 
 This tool is deliberately separate from trace-patch-events.py: that tool is
 rewrite-only (it never resizes the stream and never touches the header), and
@@ -31,8 +52,9 @@ MaskWrite (opcode 0x03), confirmed against:
   [8..12]  reg_off lo = 0x00232004  = (col0<<25)|(row2<<20)|0x32004
                                        (Core_Status, NPU absolute address)
   [12..16] reg_off hi = 0  (reg_off is a u64; high half always 0 here)
-  [16..20] value = 0x00010000  (DEBUG_HALT bit 16 set)
-  [20..24] mask  = 0x00010000  (poll only DEBUG_HALT)
+  [16..20] value = 0x00010000 (--witness halt, DEBUG_HALT bit 16)
+                or 0x00100000 (--witness done, CORE_DONE  bit 20)
+  [20..24] mask  = same as value (poll the single witness bit)
   [24..28] size  = 28
 
 insts.bin header (16 bytes; xdna-emu/src/npu/parser.rs:115-123):
@@ -69,7 +91,14 @@ _COL0 = 0
 _ROW2 = 2
 _CORE_STATUS_TILE_OFF = 0x32004
 _MASKPOLL_REG_OFF = (_COL0 << 25) | (_ROW2 << 20) | _CORE_STATUS_TILE_OFF  # 0x00232004
+
+# Witness bit masks (Core_Status register, aie-rt xaiemlgbl_params.h:2347-2365).
+# DEBUG_HALT = bit 16 (XAIEMLGBL_CORE_MODULE_CORE_STATUS_DEBUG_HALTED_LSB=16,
+#   width=1, line 2363-2365).  Used by Exp1 (PC_Event0 breakpoint).
+# CORE_DONE  = bit 20 (XAIEMLGBL_CORE_MODULE_CORE_STATUS_CORE_DONE_LSB=20,
+#   width=1, line 2347-2349).  Used by Exp2 (count-step inert path).
 _DEBUG_HALT_BIT = 0x0001_0000  # Core_Status[16]
+_CORE_DONE_BIT  = 0x0010_0000  # Core_Status[20]
 
 _OPC_WRITE32 = 0x00
 _OPC_BLOCKWRITE = 0x01
@@ -157,14 +186,27 @@ def _tile_offset(reg_off: int) -> int:
     return reg_off & 0xFFFFF
 
 
-def build_maskpoll_bytes() -> bytes:
-    """The 28-byte XAIE_IO_MASKPOLL instruction (spec sec 4.2, byte-exact)."""
+def build_maskpoll_bytes(witness: str = "halt") -> bytes:
+    """The 28-byte XAIE_IO_MASKPOLL instruction (spec sec 4.2, byte-exact).
+
+    witness="halt" (default): polls Core_Status[16] DEBUG_HALT (0x00010000).
+      Byte-for-byte identical to the original behavior -- passing no --witness
+      flag produces the same 28-byte record as before this parameterization.
+    witness="done": polls Core_Status[20] CORE_DONE (0x00100000).
+      Used for Exp2 (count-step inert path).
+    """
+    if witness == "halt":
+        bit = _DEBUG_HALT_BIT
+    elif witness == "done":
+        bit = _CORE_DONE_BIT
+    else:
+        raise ValueError(f"unknown witness {witness!r} -- expected 'halt' or 'done'")
     rec = bytearray(_MASKPOLL_LEN)
     rec[0] = _OPC_MASKPOLL  # [0] opcode; [1..4] pad stays 0
     # [4..8] zero word -- already 0
     struct.pack_into("<Q", rec, 8, _MASKPOLL_REG_OFF)  # [8..16] reg_off u64
-    struct.pack_into("<I", rec, 16, _DEBUG_HALT_BIT)   # [16..20] value
-    struct.pack_into("<I", rec, 20, _DEBUG_HALT_BIT)   # [20..24] mask
+    struct.pack_into("<I", rec, 16, bit)               # [16..20] value
+    struct.pack_into("<I", rec, 20, bit)               # [20..24] mask
     struct.pack_into("<I", rec, 24, _MASKPOLL_LEN)     # [24..28] size
     return bytes(rec)
 
@@ -196,10 +238,11 @@ def find_anchor_offset(buf: bytes) -> int:
     )
 
 
-def inject(buf: bytes) -> Tuple[bytes, bool]:
+def inject(buf: bytes, witness: str = "halt") -> Tuple[bytes, bool]:
     """Return (patched_bytes, injected).
 
     injected == False means a MASKPOLL was already present (idempotent no-op).
+    witness: "halt" (default, DEBUG_HALT bit 16) or "done" (CORE_DONE bit 20).
     """
     if len(buf) < _INSTS_HEADER_LEN:
         raise ValueError(f"insts.bin too short ({len(buf)} bytes)")
@@ -213,7 +256,7 @@ def inject(buf: bytes) -> Tuple[bytes, bool]:
         return bytes(buf), False
 
     anchor = find_anchor_offset(buf)
-    poll = build_maskpoll_bytes()
+    poll = build_maskpoll_bytes(witness)
 
     out = bytearray(buf)
     # Splice the MASKPOLL immediately before the anchor MaskWrite32.
@@ -234,18 +277,31 @@ def main(argv: List[str]) -> int:
     ap.add_argument("insts", help="path to insts.bin (patched in place)")
     ap.add_argument("-o", "--output",
                     help="write to this path instead of in-place")
+    ap.add_argument(
+        "--witness", choices=["halt", "done"], default="halt",
+        help=(
+            "which Core_Status bit to poll (default: halt). "
+            "'halt' = bit 16 DEBUG_HALT (0x00010000), used for Exp1 "
+            "(PC_Event0 breakpoint); byte-for-byte identical to original "
+            "behavior when omitted. "
+            "'done' = bit 20 CORE_DONE (0x00100000), used for Exp2 "
+            "(count-step inert path -- DONE-MASKPOLL satisfies when the "
+            "core runs to completion)."
+        ),
+    )
     args = ap.parse_args(argv)
 
     with open(args.insts, "rb") as f:
         data = f.read()
 
     try:
-        patched, injected = inject(data)
+        patched, injected = inject(data, witness=args.witness)
     except ValueError as e:
         print(f"inject-maskpoll: ERROR: {e}", file=sys.stderr)
         return 2
 
     dst = args.output or args.insts
+    bit = _DEBUG_HALT_BIT if args.witness == "halt" else _CORE_DONE_BIT
     if not injected:
         print(f"inject-maskpoll: MASKPOLL on {_MASKPOLL_REG_OFF:#010x} already "
               f"present in {args.insts} -- no-op (idempotent)", file=sys.stderr)
@@ -256,8 +312,8 @@ def main(argv: List[str]) -> int:
 
     with open(dst, "wb") as f:
         f.write(patched)
-    print(f"inject-maskpoll: spliced 28-byte MASKPOLL (reg_off="
-          f"{_MASKPOLL_REG_OFF:#010x}, value=mask={_DEBUG_HALT_BIT:#010x}) "
+    print(f"inject-maskpoll: spliced 28-byte MASKPOLL (witness={args.witness}, "
+          f"reg_off={_MASKPOLL_REG_OFF:#010x}, value=mask={bit:#010x}) "
           f"before anchor MaskWrite32@tile-local {_ANCHOR_TILE_OFF:#x}; "
           f"header op-count +1, byte-size +{_MASKPOLL_LEN} -> {dst}",
           file=sys.stderr)

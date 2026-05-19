@@ -1723,13 +1723,15 @@ _inject_maskpoll_if_probe() {
     echo "  COMPILE $name: FAIL (insts.bin $_insts_name not found for MASKPOLL injection)"
     return 1
   fi
-  if ! python3 "$EMU_ROOT/tools/inject-maskpoll.py" "$_insts" \
+  local _witness="${DEBUG_HALT_PROBE_WITNESS:-halt}"
+  if ! python3 "$EMU_ROOT/tools/inject-maskpoll.py" \
+       --witness "$_witness" "$_insts" \
        >> "$log_file" 2>&1; then
     echo "FAIL" > "$result_file"
-    echo "  COMPILE $name: FAIL (MASKPOLL injection)"
+    echo "  COMPILE $name: FAIL (MASKPOLL injection --witness $_witness)"
     return 1
   fi
-  echo "  INJECT $name: MASKPOLL halt-sync ensured in $_insts_name"
+  echo "  INJECT $name: MASKPOLL halt-sync (witness=$_witness) ensured in $_insts_name"
   return 0
 }
 export -f _inject_maskpoll_if_probe
