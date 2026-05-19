@@ -20,6 +20,21 @@ fn raise_instr_error(tile: &mut Tile, cycle: u64, pc: u32) {
     tile.core_debug.set_error_halt(true);
     tile.core_trace.notify_event(core_events::INSTR_ERROR, cycle, Some(pc));
     tile.core_perf_counters.handle_event(core_events::INSTR_ERROR);
+    // Tier A interrupt path: the error must also enter the event subsystem
+    // so it can broadcast to the shim L1/L2 interrupt controllers. Without
+    // this, the error path -- the primary real interrupt consumer -- never
+    // reaches L2. INSTR_ERROR = 69 is valid for the core EventModule's
+    // 128-event space (0-127); generate_event silently ignores out-of-range
+    // ids, but 69 is in range so this always records.
+    if let Some(em) = tile.core_events.as_mut() {
+        em.generate_event(core_events::INSTR_ERROR);
+    }
+    // Seed pending_broadcasts for any channel carrying INSTR_ERROR. Uses
+    // the same shared helper as the Event_Generate register path so the
+    // channel-scan logic cannot drift between the two producers; without
+    // this propagate_broadcasts_fixpoint finds nothing to start from on
+    // the compute tile.
+    tile.seed_broadcasts_for_event(core_events::INSTR_ERROR);
 }
 
 /// Core execution status.
@@ -1086,5 +1101,76 @@ mod tests {
 
         assert!(matches!(result, StepResult::ExecError(_)));
         assert!(matches!(interpreter.status(), CoreStatus::Error));
+    }
+
+    // -- Task 5: raise_instr_error wires into EventModule --
+
+    /// Proves that raise_instr_error (the production error path) calls
+    /// generate_event on the compute tile's core EventModule with INSTR_ERROR
+    /// (69). This is the focused unit test for Step 4's production wiring:
+    /// it calls raise_instr_error directly (accessible because this test
+    /// module is in the same file), verifying the EventModule records the
+    /// event. The companion end-to-end test in effects.rs proves the
+    /// propagation chain from generate_event onward.
+    #[test]
+    fn raise_instr_error_generates_event_in_core_event_module() {
+        use xdna_archspec::aie2::trace_events::core_events;
+        // Compute tile at (0,2) has core_events = Some(EventModule::Core).
+        let mut tile = Tile::compute(0, 2);
+
+        // Pre-condition: INSTR_ERROR not yet active.
+        let em = tile.core_events.as_ref().unwrap();
+        assert!(
+            !em.is_event_active(core_events::INSTR_ERROR),
+            "INSTR_ERROR must not be set before raise_instr_error"
+        );
+
+        raise_instr_error(&mut tile, 0, 0);
+
+        // Post-condition: INSTR_ERROR is active in the EventModule.
+        let em = tile.core_events.as_ref().unwrap();
+        assert!(
+            em.is_event_active(core_events::INSTR_ERROR),
+            "raise_instr_error must generate INSTR_ERROR (69) in core EventModule"
+        );
+        // INSTR_ERROR must also be in the pending queue so the broadcast
+        // engine can pick it up.
+        assert!(
+            em.pending_events().contains(&core_events::INSTR_ERROR),
+            "INSTR_ERROR must be in the pending queue after raise_instr_error"
+        );
+
+        // Existing behavior preserved: error_halt flag must be set (bit 19 of Core_Status).
+        assert_ne!(
+            tile.core_debug.read_status() & (1 << 19),
+            0,
+            "error_halt (Core_Status bit 19) must still be set by raise_instr_error"
+        );
+    }
+
+    /// Proves that raise_instr_error seeds pending_broadcasts when a broadcast
+    /// channel is configured to carry INSTR_ERROR. This covers the second half
+    /// of the production wiring: without it propagate_broadcasts_fixpoint has
+    /// nothing to start from on the compute tile.
+    #[test]
+    fn raise_instr_error_seeds_pending_broadcasts_for_configured_channel() {
+        use xdna_archspec::aie2::trace_events::core_events;
+        let mut tile = Tile::compute(0, 2);
+
+        // Configure broadcast channel 3 to carry INSTR_ERROR.
+        tile.core_events
+            .as_mut()
+            .unwrap()
+            .broadcast
+            .configure_channel(3, core_events::INSTR_ERROR);
+
+        assert!(tile.pending_broadcasts.is_empty(), "no pending broadcasts before error");
+
+        raise_instr_error(&mut tile, 0, 0);
+
+        assert!(
+            tile.pending_broadcasts.contains(&3),
+            "raise_instr_error must seed pending_broadcasts ch3 when ch3 is configured for INSTR_ERROR"
+        );
     }
 }

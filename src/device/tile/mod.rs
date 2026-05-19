@@ -666,6 +666,42 @@ impl Tile {
         }
     }
 
+    /// Seed `pending_broadcasts` with every broadcast channel whose
+    /// configured event matches `event_id`.
+    ///
+    /// Mirrors the hardware: an event that a broadcast channel is
+    /// configured for drives that channel onto the broadcast network.
+    /// `pending_broadcasts` stores the channel number (0..15), not a
+    /// hw_id -- per-module hw_id translation happens at the receiving
+    /// tile in `propagate_broadcasts`.
+    ///
+    /// Module selection matches the Event_Generate path exactly:
+    /// Compute / ShimNoc / ShimPl consult `core_events`; Mem consults
+    /// `mem_events`. The `event_id != 0` guard is load-bearing -- it
+    /// matches hardware EVENT_NONE semantics: an unconfigured channel
+    /// reads as event 0, and a real fired event id is never 0, so
+    /// without the guard every unconfigured channel would spuriously
+    /// match a 0 event id. No-op if the selected module is absent.
+    ///
+    /// Shared by the Event_Generate register path and the hardware
+    /// error path (`raise_instr_error`) so the two cannot drift.
+    pub fn seed_broadcasts_for_event(&mut self, event_id: u8) {
+        let events_ref = match self.tile_kind {
+            TileKind::Compute | TileKind::ShimNoc | TileKind::ShimPl => self.core_events.as_ref(),
+            TileKind::Mem => self.mem_events.as_ref(),
+        };
+        let Some(em) = events_ref else { return };
+        let mut hits = Vec::new();
+        for ch in 0..16u8 {
+            let ch_event = em.broadcast.read_channel(ch as usize) as u8;
+            if event_id != 0 && ch_event == event_id {
+                log::info!("Tile({},{}) event {} -> BROADCAST channel {}", self.col, self.row, event_id, ch,);
+                hits.push(ch);
+            }
+        }
+        self.pending_broadcasts.extend(hits);
+    }
+
     // === Memory Bank Conflict Detection ===
 
     /// Number of physical memory banks for this tile type (for conflict detection).

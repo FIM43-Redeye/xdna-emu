@@ -395,26 +395,9 @@ impl DeviceState {
             // not a hw_id. Per-module hw_id translation happens at the
             // receiving tile in `propagate_broadcasts`, since each module
             // type sees BROADCAST_N at a different hw_id (compute core/mem
-            // = 107+N, shim PL_A = 110+N, memtile = 142+N).
-            let events_ref = match tile.tile_kind {
-                TileKind::Compute | TileKind::ShimNoc | TileKind::ShimPl => tile.core_events.as_ref(),
-                TileKind::Mem => tile.mem_events.as_ref(),
-            };
-            if let Some(em) = events_ref {
-                for ch in 0..16u8 {
-                    let ch_event = em.broadcast.read_channel(ch as usize) as u8;
-                    if ch_event == event_id && event_id != 0 {
-                        log::info!(
-                            "Tile({},{}) Event_Generate: event {} -> BROADCAST channel {}",
-                            col,
-                            row,
-                            event_id,
-                            ch,
-                        );
-                        tile.pending_broadcasts.push(ch);
-                    }
-                }
-            }
+            // = 107+N, shim PL_A = 110+N, memtile = 142+N). Shared with the
+            // hardware error path so the scan logic cannot drift.
+            tile.seed_broadcasts_for_event(event_id);
             // Tier A interrupt path: a software-generated event is also
             // offered to this tile's L1 interrupt controller (shim only).
             // On latch, L1 queues its IRQ_NO into pending_broadcasts so the
@@ -826,5 +809,88 @@ mod interrupt_path_tests {
         let l1 = dev.array.get(col, row).unwrap().l1_irq.as_ref().unwrap();
         assert_ne!(l1.read_status(SwitchId::A) & (1 << 16), 0);
         assert_eq!(l1.read_status(SwitchId::B), 0, "switch B must not latch");
+    }
+
+    // -- Task 5: hardware error -> EventModule -> broadcast -> L1 -> L2 --
+
+    impl DeviceState {
+        /// Inject a hardware error event into the compute tile's core EventModule
+        /// (test-only). Mirrors the production `raise_instr_error` path exactly:
+        ///
+        ///   1. `em.generate_event(ev)` -- records the event in the EventModule
+        ///      status bits and pending queue (the same entry production uses).
+        ///   2. `tile.seed_broadcasts_for_event(ev)` -- the SAME shared helper
+        ///      `raise_instr_error` calls, which seeds `pending_broadcasts` for
+        ///      any channel configured to carry `ev`.
+        ///
+        /// Without step 2, `propagate_broadcasts_fixpoint` has nothing to start
+        /// from (it drains `pending_broadcasts`, not the EventModule pending queue).
+        #[cfg(test)]
+        fn raise_hardware_error_for_test(&mut self, col: u8, row: u8, ev: u8) {
+            // Mirrors raise_instr_error's event-subsystem steps. Update here if
+            // raise_instr_error gains additional event-subsystem steps.
+            let tile = self.array.get_mut(col, row).expect("tile must exist");
+            tile.core_events
+                .as_mut()
+                .expect("compute tile must have core EventModule")
+                .generate_event(ev);
+            tile.seed_broadcasts_for_event(ev);
+        }
+    }
+
+    /// End-to-end: a hardware error on a compute tile reaches shim L2 via the
+    /// event->broadcast->L1->L2 interrupt chain.
+    ///
+    /// Chain: generate_event(INSTR_ERROR=69) on compute (0,2)
+    ///   -> broadcast ch2 configured to event 69
+    ///   -> propagate_broadcasts_fixpoint carries broadcast ch2 south to shim (0,0)
+    ///   -> shim L1 slot 0 configured for PL event 112 (= SHIM_PL_BROADCAST_BASE 110 + ch2)
+    ///      -> L1 latches, queues IRQ_NO 7
+    ///   -> propagate_broadcasts_fixpoint delivers IRQ_NO 7 to L2
+    ///   -> L2 channel 7 enabled -> STATUS bit 7 latches.
+    #[test]
+    fn hardware_error_reaches_shim_l2_end_to_end() {
+        use crate::device::interrupts::{
+            L1_REG_ENABLE_A, L1_REG_IRQ_NO_A, L2_REG_ENABLE, L2_REG_STATUS, SwitchId,
+        };
+        use xdna_archspec::aie2::trace_events::core_events;
+        let mut dev = DeviceState::new_npu1();
+        let (ccol, crow) = (0u8, 2u8); // compute tile
+        let (shim_col, shim_row) = (0u8, 0u8);
+        // INSTR_ERROR = 69, which is < 128 (core EventModule num_events),
+        // so generate_event will always record it (out-of-range ids are
+        // silently ignored).
+        let err_ev = core_events::INSTR_ERROR; // = 69
+                                               // Configure compute tile's broadcast ch2 to fire on INSTR_ERROR (69).
+        {
+            let em = dev.array.get_mut(ccol, crow).unwrap().core_events.as_mut().unwrap();
+            em.broadcast.configure_channel(2, err_ev);
+        }
+        // Configure shim L1: slot 0 watches PL event 112 (BROADCAST_BASE 110 + ch 2).
+        {
+            let l1 = dev.array.get_mut(shim_col, shim_row).unwrap().l1_irq.as_mut().unwrap();
+            l1.set_irq_event_slot(SwitchId::A, 0, 110 + 2); // event 112
+            l1.write_register(L1_REG_ENABLE_A, 1 << 16);
+            l1.write_register(L1_REG_IRQ_NO_A, 7);
+        }
+        // Enable L2 channel 7.
+        dev.array
+            .get_mut(shim_col, shim_row)
+            .unwrap()
+            .l2_irq
+            .as_mut()
+            .unwrap()
+            .write_register(L2_REG_ENABLE, 1 << 7);
+        // Inject the hardware error event.
+        dev.raise_hardware_error_for_test(ccol, crow, err_ev);
+        // Propagate: event fires broadcast ch2 on (0,2) -> travels south -> shim
+        // L1 latches -> IRQ_NO 7 queued -> L2 channel 7 latches.
+        dev.propagate_broadcasts_fixpoint(ccol, crow);
+        let l2 = dev.array.get(shim_col, shim_row).unwrap().l2_irq.as_ref().unwrap();
+        assert_ne!(
+            l2.read_register(L2_REG_STATUS).unwrap() & (1 << 7),
+            0,
+            "hardware error must reach shim L2 via event->broadcast->L1->L2"
+        );
     }
 }
