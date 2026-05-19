@@ -83,6 +83,34 @@ impl Tile {
             return self.pkt_handler_status & 0xF;
         }
 
+        // Core debug register dispatch (compute tiles only).
+        //
+        // Mirrors the identical dispatch in read_register_pure (Phase B Unit 1,
+        // commit e0ec922). The two paths MUST return the same value for any
+        // given core_debug state -- divergence is a Phase B Unit 1b bug.
+        //
+        // Core_Status (0x32004) and Debug_Status (0x3201C) are live-computed
+        // from CoreDebugState fields; a raw HashMap lookup always returns 0
+        // even when the core is halted (DEBUG_HALT bit 16 comes from
+        // core_debug.read_status(), not from tile.registers). The same applies
+        // to Debug_Control0 (halted+single_step_count) and Debug_Control2
+        // (stall-to-halt enables stored in core_debug.debug_ctrl2).
+        //
+        // The injected MASKPOLL polls Core_Status (0x32004) via this mutable
+        // path. Without this dispatch the poll always read 0 and never
+        // satisfied, so the emulator could not observe the DEBUG_HALT set by
+        // the Unit-1 pre-execute seam (Phase B Unit 1b, spec §4.2/§5.3).
+        //
+        // Offsets from aie-rt xaiemlgbl_params.h, cross-checked against
+        // aie_registers_aie2.json (same offsets as read_register_pure):
+        //   Core_Status 0x32004, Debug_Control0..2 0x32010..0x32018,
+        //   Debug_Status 0x3201C, PC_Event0..3 0x32020..0x3202C.
+        if self.is_compute() {
+            if let Some(val) = self.core_debug.read_register(offset) {
+                return val;
+            }
+        }
+
         // Fall back to register map
         self.registers.get(&offset).copied().unwrap_or(0)
     }
@@ -367,6 +395,185 @@ impl Tile {
                 self.locks[i].underflow = false;
             }
         }
+    }
+}
+
+/// Unit 1b read-path reconciliation tests (spec §4.2/§5.3, Phase B Unit 1b).
+///
+/// Asserts that the mutable `tile.read_register` path agrees with
+/// `read_register_pure` for Core_Status (0x32004) and the debug-register
+/// offsets 0x32010–0x3202C. Both paths must return the live-computed
+/// `core_debug` value, not a raw HashMap lookup (which always returns 0 for
+/// these registers since they are never written to the HashMap).
+///
+/// Offsets from aie-rt xaiemlgbl_params.h, cross-checked against
+/// aie_registers_aie2.json:
+///   Core_Status    0x32004  (live-computed; includes DEBUG_HALT bit 16)
+///   Debug_Control0 0x32010  (stored in core_debug.halted + single_step_count)
+///   Debug_Control1 0x32014  (raw event config)
+///   Debug_Control2 0x32018  (stall-to-halt enables)
+///   Debug_Status   0x3201C  (live-computed halt-cause latches)
+///   PC_Event0      0x32020  (armed VALID|PC_ADDRESS)
+///   PC_Event1      0x32024
+///   PC_Event2      0x32028
+///   PC_Event3      0x3202C
+#[cfg(test)]
+mod unit1b_read_path_tests {
+    use super::*;
+
+    // -------------------------------------------------------------------
+    // Core_Status (0x32004) — reflects core_debug halt state, both paths
+    // -------------------------------------------------------------------
+
+    /// The mutable read path must reflect DEBUG_HALT (bit 16) when the
+    /// core is halted. Before Unit 1b this always returned 0 (raw HashMap).
+    #[test]
+    fn mutable_read_register_reflects_debug_halt_bit() {
+        let mut tile = Tile::compute(0, 2);
+        tile.core_debug.halted = true;
+        tile.core_debug.enabled = true;
+        let status = tile.read_register(0x32004);
+        assert_ne!(status & (1 << 16), 0, "read_register(Core_Status) must reflect DEBUG_HALT when halted");
+    }
+
+    /// The mutable path must NOT set DEBUG_HALT when the core is not halted.
+    #[test]
+    fn mutable_read_register_no_debug_halt_when_not_halted() {
+        let mut tile = Tile::compute(0, 2);
+        tile.core_debug.halted = false;
+        tile.core_debug.enabled = true;
+        let status = tile.read_register(0x32004);
+        assert_eq!(
+            status & (1 << 16),
+            0,
+            "read_register(Core_Status) must NOT set DEBUG_HALT when not halted"
+        );
+    }
+
+    /// `read_register` and `read_register_pure` must agree on Core_Status
+    /// for the same core_debug state (halted).
+    #[test]
+    fn mutable_and_pure_agree_on_core_status_halted() {
+        let mut tile = Tile::compute(0, 2);
+        tile.core_debug.halted = true;
+        tile.core_debug.enabled = true;
+        // read_register takes &mut self; read_register_pure takes &self.
+        // Save the pure value first (immutable borrow), then mutable.
+        let pure_val = tile.read_register_pure(0x32004);
+        let mut_val = tile.read_register(0x32004);
+        assert_eq!(
+            pure_val, mut_val,
+            "read_register and read_register_pure must agree on Core_Status (halted)"
+        );
+    }
+
+    /// Both paths must agree on Core_Status when the core is not halted.
+    #[test]
+    fn mutable_and_pure_agree_on_core_status_not_halted() {
+        let mut tile = Tile::compute(0, 2);
+        tile.core_debug.halted = false;
+        tile.core_debug.enabled = true;
+        let pure_val = tile.read_register_pure(0x32004);
+        let mut_val = tile.read_register(0x32004);
+        assert_eq!(
+            pure_val, mut_val,
+            "read_register and read_register_pure must agree on Core_Status (not halted)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Debug_Control0 (0x32010) — halted + single_step_count packed
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn mutable_and_pure_agree_on_debug_control0() {
+        let mut tile = Tile::compute(0, 2);
+        tile.core_debug.halted = true;
+        tile.core_debug.single_step_count = 3;
+        let pure_val = tile.read_register_pure(0x32010);
+        let mut_val = tile.read_register(0x32010);
+        assert_eq!(pure_val, mut_val, "read_register and read_register_pure must agree on Debug_Control0");
+        // Smoke: halt bit (bit 0) + count (bits [5:2]=3 → 0x0C)
+        assert_ne!(mut_val & 1, 0, "halt bit must be set");
+        assert_ne!(mut_val & 0x0C, 0, "single_step_count must be non-zero");
+    }
+
+    // -------------------------------------------------------------------
+    // Debug_Control2 (0x32018) — raw value stored in core_debug
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn mutable_and_pure_agree_on_debug_control2() {
+        let mut tile = Tile::compute(0, 2);
+        tile.core_debug.debug_ctrl2 = 0x01; // PC_Event_Halt enabled
+        let pure_val = tile.read_register_pure(0x32018);
+        let mut_val = tile.read_register(0x32018);
+        assert_eq!(pure_val, mut_val, "read_register and read_register_pure must agree on Debug_Control2");
+        assert_eq!(mut_val, 0x01, "Debug_Control2 value must match what was set");
+    }
+
+    // -------------------------------------------------------------------
+    // Debug_Status (0x3201C) — live-computed halt-cause latches
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn mutable_and_pure_agree_on_debug_status() {
+        let mut tile = Tile::compute(0, 2);
+        tile.core_debug.halted = true;
+        tile.core_debug.halt_cause_pc_event = true;
+        let pure_val = tile.read_register_pure(0x3201C);
+        let mut_val = tile.read_register(0x3201C);
+        assert_eq!(pure_val, mut_val, "read_register and read_register_pure must agree on Debug_Status");
+        assert_ne!(mut_val & 1, 0, "Debug_Status halted bit must be set");
+        assert_ne!(mut_val & 2, 0, "Debug_Status PC_Event_halted bit must be set");
+    }
+
+    // -------------------------------------------------------------------
+    // PC_Event0 (0x32020) — raw VALID|PC_ADDRESS stored in core_debug
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn mutable_and_pure_agree_on_pc_event0() {
+        let mut tile = Tile::compute(0, 2);
+        tile.core_debug.pc_event0 = 0x8000_0184; // VALID | TRAP_PC14=0x184
+        let pure_val = tile.read_register_pure(0x32020);
+        let mut_val = tile.read_register(0x32020);
+        assert_eq!(pure_val, mut_val, "read_register and read_register_pure must agree on PC_Event0");
+        assert_eq!(mut_val, 0x8000_0184, "PC_Event0 value must match what was set");
+    }
+
+    // -------------------------------------------------------------------
+    // Non-debug registers must be unaffected (still HashMap)
+    // -------------------------------------------------------------------
+
+    /// A non-debug register written to the HashMap must still be read
+    /// through the HashMap by the mutable path.
+    #[test]
+    fn non_debug_register_unaffected_reads_from_hashmap() {
+        let mut tile = Tile::compute(0, 2);
+        let arbitrary_offset = 0x1234_5678u32;
+        tile.registers.insert(arbitrary_offset, 0xDEAD_BEEF);
+        assert_eq!(
+            tile.read_register(arbitrary_offset),
+            0xDEAD_BEEF,
+            "non-debug registers must still be read from the HashMap"
+        );
+        // Ensure the debug-register dispatch does not intercept it.
+        assert_ne!(arbitrary_offset, 0x32004, "test setup: offset must not be a debug register");
+    }
+
+    /// Mem-tile read_register must not dispatch to core_debug (compute-only).
+    #[test]
+    fn memtile_core_status_offset_not_dispatched_to_core_debug() {
+        let mut tile = Tile::mem_tile(0, 1);
+        // Mem tiles have no core_debug; write the offset to the HashMap to
+        // give it a non-zero value and verify it round-trips without dispatch.
+        tile.registers.insert(0x32004, 0xABCD_EF01);
+        assert_eq!(
+            tile.read_register(0x32004),
+            0xABCD_EF01,
+            "mem-tile must not dispatch Core_Status offset to core_debug"
+        );
     }
 }
 

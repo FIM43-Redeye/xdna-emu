@@ -88,23 +88,55 @@ four marker slots -- including the trap slot `s[1]` (the `0xBB`/187 store at
 `TRAP_PC=0x184`) -- are zero. The MASKPOLL satisfied (DEBUG_HALT became set),
 so the OP_READ provably read a *stable, halted* state.
 
-### EMU baseline observed (same byte-identical injected binary, same session)
+### EMU observed (Phase B Unit 1b, same byte-identical injected binary)
 
 ```
-XDNA_EMU_STATUS: halt_reason=maskpoll_unsatisfied cycles=24304 max_cycles=0
-SLOTS: s0..s3 = 0xDEADC0DE  CORE_STATUS=0xdeadc0de  HALTED=0
-TRAP_VERDICT:MASKPOLL_UNSATISFIED_EMU
+SLOTS: s0=0 s1=0 s2=0 s3=0 CORE_STATUS=0x10003 HALTED=1
+TRAP_VERDICT:BEFORE_COMMIT
+PASS
 ```
 
-EMU drops the breakpoint-arming control-packet writes (write-side
-`write_core_register` catch-all), so `Core_Status[16]` is never set and the
-MASKPOLL is structurally unsatisfiable on EMU. The emulator's graceful poll-
-termination contract fired exactly as designed: deterministic termination at
-24304 cycles (3.3 s wall, *no hang*), the polled register never faked, the core
-never pretend-halted, the OP_READ never issued -- `output_buffer` stays at the
-`0xDEADC0DE` sentinel `test.cpp` pre-filled. This validates the injector + the
-poll-termination contract; G1 itself is HW-only by construction (EMU cannot
-halt -- a recorded Phase B input, not a flaw).
+EMU run: 4.1 s, bridge PASS, no hang. `Core_Status = 0x10003` =
+`DEBUG_HALT`(bit 16) | `RESET`(bit 1) | `ENABLE`(bit 0). All four marker slots
+zero; `TRAP_VERDICT:BEFORE_COMMIT` -- matching HW.
+
+**Phase B Unit 1b (xdna-emu `dev`, 2026-05-18) closes the earlier EMU
+limitation:** the mutable `tile.read_register` path (used by the injected
+MASKPOLL to poll `Core_Status` at `0x32004`) was previously falling back to the
+raw register HashMap, which never reflects the dynamically-computed
+`Core_Status[16]=DEBUG_HALT` from `core_debug.read_status()`. The fix dispatches
+`Core_Status` and debug-register offsets (`0x32010`--`0x3202C`) into
+`core_debug.read_register()`, mirroring exactly what Phase B Unit 1 (commit
+`e0ec922`) did for `read_register_pure`. With the mutable path reconciled:
+
+- The injected MASKPOLL now observes `DEBUG_HALT=1` and satisfies (no longer
+  unsatisfiable on EMU).
+- The OP_READ push runs, returning all marker slots zero (trap bundle did not
+  commit) + `DEBUG_HALT` set.
+- The schedule-derived verdict is `BEFORE_COMMIT` -- reproducing HW exactly.
+
+The earlier `MASKPOLL_UNSATISFIED_EMU` EMU baseline (observed with Phase A /
+the pre-Unit-1b emulator) is retired. It was caused solely by the divergent
+read paths, not by any write-side gap or structural EMU limitation. The
+write-side gap ("arming writes dropped into `write_core_register` catch-all")
+was separately established as false in spec §4.2 "Mechanism correction": both
+the control-packet path and `@seq npu.write32` arming writes always reached
+`core_debug` via `apply_tile_local_effects`. The breakpoint was armed on EMU all
+along.
+
+The emulator graceful-poll-termination contract is retained as independent
+hardening: an unsatisfiable MASKPOLL with a quiescent engine still terminates
+deterministically with `MaskPollUnsatisfied` reason, no register fakery, no
+pretend-halt. Its three unit tests remain green. This contract is not this
+probe's path anymore; it guards any genuinely-unsatisfiable poll in other
+contexts.
+
+**The probe is now a self-checking EMU+HW regression of the G1 before-commit
+fidelity fix.** An EMU run now validates: gate fed, MASKPOLL satisfies, OP_READ
+issues, all slots zero + DEBUG_HALT => `TRAP_VERDICT:BEFORE_COMMIT`. A
+regression in the Unit-1 seam or the Unit-1b read reconciliation fails the EMU
+bridge run, not only HW. HW remains ground truth; EMU is now a faithful
+reproduction of the silicon result.
 
 ### Conclusion
 
@@ -119,23 +151,20 @@ ENABLE-stays-1-while-halted -- though the verdict deliberately relies on
 `DEBUG_HALT` alone (spec §4.2; ENABLE-stays-1 was an unverified assumption,
 here merely observed, not depended on).
 
-**Phase B implication (real, scoped fidelity fix -- spec §5.1).** The emulator
-currently evaluates the trap and the `DebugHalt` gate *after* `update_pc`
-(after the bundle's side effects commit). Silicon halts *before* the trap
-bundle commits for synchronous-origin halts. Phase B must evaluate the trap +
-`DebugHalt` boundary **before the trap bundle commits** for synchronous traps
-(PC_Event / breakpoint / single-step); asynchronous halts (host
-`Debug_Control0[0]`, stall-halt, external event-halt) take effect at the next
-boundary and are unchanged. This is the named sync/async halt-boundary seam,
-not an ad hoc tweak. A guarding interpreter-level test must assert the observed
-before-commit timing (breakpoint at a known PC; assert the trap-bundle side
-effect did *not* land).
+**Phase B implication (real, scoped fidelity fix -- spec §5.1 -- SHIPPED).**
+Phase B Unit 1 (commit `e0ec922`) implemented the pre-execute seam in
+`coordinator.rs`: for PC_Event/breakpoint-origin halts, the coordinator checks
+`has_sync_pc_trap_at(pc)` *before* executing the bundle; on a match, the bundle
+does not execute (`BEFORE_COMMIT`), `consume_sync_pc_trap()` latches
+`halt_cause_pc_event` and requests halt. Phase B Unit 1b (this commit) closes
+the read-path reconciliation that makes the probe self-checking on EMU.
 
-The probe stays checked in as a permanent re-runnable regression: on HW it
-derives G1; on EMU the `MASKPOLL_UNSATISFIED_EMU` contract guards the injector
-+ graceful poll-termination path. The EMU control-packet write-side gap (arming
-writes dropped) and read-side gap (`core_debug` registers unreachable via
-OP_READ) remain separate recorded Phase B inputs, independent of the G1 result.
+The probe stays checked in as a permanent re-runnable regression: on both EMU
+and HW it produces `TRAP_VERDICT:BEFORE_COMMIT` and bridge `PASS`. A
+defensive `MASKPOLL_UNSATISFIED_EMU` branch in `test.cpp` remains to catch
+regressions (returns exit code 1 rather than 0 -- a bridge failure, not a
+pass). `test.cpp` commit `8546397987` updated for Unit 1b on
+`xdna-emu-cycle-budget`.
 
 ---
 
