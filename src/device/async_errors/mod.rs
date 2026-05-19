@@ -12,4 +12,11 @@
 //! Design source:
 //! `docs/superpowers/specs/2026-05-19-interrupt-tier-b-firmware-mailbox-design.md`
 
+pub mod sink;
 pub mod types;
+
+pub use sink::AsyncErrorSink;
+pub use types::{
+    AieError, AieErrInfoHeader, AmdxdnaAsyncError, AsyncRing, ASYNC_BUF_SIZE, MAX_ERRORS_PER_RING,
+    RET_CODE_OVERFLOW,
+};
