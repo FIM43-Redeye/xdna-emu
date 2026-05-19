@@ -338,7 +338,7 @@ mod tests {
         // clock_control/noc Stub, control_packets Partial), so the rendered
         // queue MUST be non-empty.
         let out = render_implementation_gaps(Architecture::Aie2);
-        assert!(out.contains("debug_halt:"), "expected debug_halt (a known Partial domain) in the implementation-gaps queue -- a silent per-domain drop or wrong source");
+        assert!(out.contains("interrupt:"), "expected interrupt (a known Partial domain) in the implementation-gaps queue -- a silent per-domain drop or wrong source");
         assert!(
             !out.contains("_empty_"),
             "implementation-gaps queue is empty -- generator likely sourced the semantic universe, not the spine (spec S1/M1)"

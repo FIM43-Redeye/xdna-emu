@@ -383,6 +383,17 @@ guesses:
   separate, Maya-gated step (reformat to AMD conventions; only
   `1114562` is PR-eligible).
 
-**Regroup before Phase B remainder.** Per the plan->execute->regroup
-->next-plan rhythm, the next step is the regroup checkpoint (Maya's
-call when), not starting the Phase B §5.2/§5.1 remainder.
+**Phase B remainder -- IMPLEMENTED (2026-05-19).** Unit 2 shipped the
+§5.2 count-step state machine (`Debug_Control0[5:2]` arms a live
+N-committed-bundle budget; `tick_count_step` decrements per committed
+bundle; expiry latches `halted` so the `is_halted` gate blocks bundle
+N+1 -- before-commit, G2-anchored; review fix added
+`halt_cause_count_step` to `clear_halt_causes`). Unit 3 shipped the
+§5.1 single-step halt boundary as the principled split (PC-wired
+SSTEP_EVENT -> before-commit via the Unit-1 seam
+`has_sync_sstep_pc_trap_at`/`consume_sync_sstep_pc_trap`;
+watchpoint/mem/lock/range -> documented after-commit). `debug_halt`
+coverage is now `Modeled { completeness: Full }`. The §8 count-step
+finer-characterization forward-commitment remains OPEN (decrement
+cadence / larger-N / `0x11`-on-silicon -- only `N=4` observed); the
+natural reading is shipped and documented inline citing this finding.
