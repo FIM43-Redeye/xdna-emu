@@ -468,17 +468,10 @@ Introduce the distinction the hardware actually has:
   PC match and apply `DebugHalt` *before* the bundle's side effects
   execute, so the trap bundle's store never lands. PC_Event/breakpoint
   origin **only** (see single-step note).
-- **Single-step halts — deferred to §5.2/G2, not this unit.** Single-
-  step is synchronous in principle, but before-commit is only well-
-  defined for PC_Event-wired single-step; an `SSTEP_EVENT` armed by a
-  watchpoint/mid-execution event has *no* meaningful before-commit point
-  (its arming condition is only known after the bundle runs — a genuine
-  §5.1 design ambiguity, not just a hardware question). Single-step is
-  also naturally coupled to the count-step substrate (§5.2), which is
-  G2-dependent. The single-step halt boundary is therefore scoped out of
-  this unit and addressed with §5.2/G2. Two existing tests
-  (`core_debug/tests.rs:989,1046`) currently assert the after-commit
-  single-step model and stay valid until then.
+- **Single-step halts — RESOLVED (Phase B remainder Unit 3, principled split, Maya 2026-05-19).** Event-driven single-step (Debug_Control1[14:8] SSTEP_EVENT) splits by arming-condition observability:
+  - **PC-wired single-step** — SSTEP_EVENT == a point PC event (Core_PC_0..3). The arming condition is a PC match, known *before* the bundle, so silicon halts *before* the bundle commits — the same boundary as the G1 PC_Event_Halt seam. Routed through the existing Unit-1 pre-execute seam via `has_sync_sstep_pc_trap_at`/`consume_sync_sstep_pc_trap`.
+  - **Watchpoint / mem / lock / PC-range-wired single-step** — arming is only known *after* the bundle runs; there is no coherent before-commit point. **Documented modeling decision:** stays after-commit via the unchanged `check_event_halt` → `pending_single_step` → `consume_pending_single_step` path. PC-range single-step (Core_PC_Range_0_1/2_3) is bucketed here deliberately: a range's before-commit boundary (range entry vs. each in-range step) is itself ambiguous, so it takes the defensible after-commit reading.
+  - Test disposition: `core_debug/tests.rs` `sstep_event_via_pc_event_path` is rewritten to assert the before-commit query path (PC-wired); `sstep_event_match_sets_pending_latch` stays valid (it exercises the bare `check_event_halt` latch with no PC_Event wired, i.e. the after-commit path) — comment clarified.
 - **Asynchronous halts** — host `Debug_Control0[0]` write, stall-halt,
   external event-halt: take effect at the next instruction boundary.
   Already correct; the pre-execute seam is additive and provably does
@@ -510,10 +503,10 @@ interpreter dependency — preserves the module's documented "projection
 arms a step budget from `[5:2]`; the coordinator decrements it per
 committed bundle (one new consumer call adjacent to the existing
 `consume_pending_single_step` at `coordinator.rs:643`) and requests
-halt at expiry. Behavior follows Experiment 2 findings; unobservable
-edges (re-arm on resume, count=0, halt-bit interaction) are implemented
-to the most natural reading and documented inline as explicit modeling
-decisions, citing the finding.
+halt at expiry. Behavior follows Experiment 2 findings. Silicon-unobservable edges are implemented to these explicit modeling decisions (Maya 2026-05-19; documented inline citing the G2 finding; finer characterization remains the §8 count-step forward-commitment):
+- **N counts committed bundles; the halt fires *before* the (N+1)th commits.** Implemented as a post-execute per-committed-bundle decrement; on expiry `request_halt()` latches `halted` and the existing `interpreter.rs:181` `is_halted` gate prevents the next bundle — before-commit of bundle N+1. Consistent with G1 and with the G2 observation (`N=4` halted in the prologue, `LANDED:0`).
+- **count + halt-bit (`0x11`):** the halt bit `[0]`'s immediate halt takes precedence (documented async halt); the N-budget is still armed and latent, applying only if the core is later resumed.
+- **Resume / re-arm:** budget expiry clears the budget (`None`); `request_resume()` never re-arms; only a fresh `Debug_Control0` write with `Single_Step_Count > 0` re-arms (mirrors `N=0` = disabled, write = arm).
 
 ### 5.3 Component boundaries
 
@@ -551,16 +544,32 @@ decisions, citing the finding.
 - The emulator graceful-poll-termination contract + its unit tests stay
   (independent hardening; no longer the probe's path).
 
-**Deferred (with §5.2/G2):** count-step state machine; single-step halt
-boundary; `tick_single_step()` per-bundle drive — out of this unit.
+**Phase B remainder (Units 2/3) — Phase B remainder plan:
+`docs/superpowers/plans/2026-05-19-debug-halt-phase-b-remainder.md`:**
+- `src/device/core_debug/mod.rs` — `count_step_remaining`/`halt_cause_count_step`
+  fields; `write_debug_control0` arm path (extract budget from `[5:2]`);
+  `tick_count_step()` (post-execute per-bundle decrement → `request_halt()` on
+  expiry); `has_sync_sstep_pc_trap_at(pc)`/`consume_sync_sstep_pc_trap()` (PC-wired
+  single-step query, mirrors the Unit-1 `has_sync_pc_trap_at` pattern).
+- `src/interpreter/engine/coordinator.rs` — count-step tick adjacent to
+  `consume_pending_single_step` (post-execute, per committed bundle); sstep-PC
+  seam check adjacent to the Unit-1 `has_sync_pc_trap_at` seam (pre-execute,
+  PC-wired only).
+- `src/device/core_debug/tests.rs` — count-step arm/tick/expire/resume unit
+  tests; `sstep_event_via_pc_event_path` rewritten to assert the before-commit
+  query path (PC-wired); `sstep_event_match_sets_pending_latch` comment clarified
+  (after-commit path, no PC_Event wired).
+- `crates/xdna-archspec/src/coverage/units.rs` — verdict → `Full`.
 
 ## 6. Testing
 
 - Unit (`core_debug/tests.rs`): pre-execute sync-PC-trap query
   (`has_sync_pc_trap_at`) arm/match/no-match; control-packet debug-reg
   write/read dispatch round-trips through `core_debug` (routing-gap
-  fix). Pure, no hardware. (Count-step arm-N/tick-N/expire/resume unit
-  tests are deferred with §5.2/G2.)
+  fix). Pure, no hardware. **Phase B remainder (Units 2/3):** count-step
+  arm-N/tick-N/expire/resume unit tests; `sstep_event_via_pc_event_path`
+  rewritten to assert before-commit query path (PC-wired);
+  `sstep_event_match_sets_pending_latch` comment clarified (after-commit).
 - **Guarding test (this unit): a coordinator-level before-commit
   assertion** — arm PC_Event0 at a known `TRAP_PC` whose bundle stores
   to a known tile data address, step, assert the core is `DebugHalt`
@@ -588,13 +597,15 @@ boundary; `tick_single_step()` per-bundle drive — out of this unit.
   emulator graceful-poll-termination unit tests remain green (the
   contract is retained, just not the probe's path).
 - `cargo test --lib` green (xdna-emu + xdna-archspec). Coverage
-  regenerated in lockstep. **Completeness stays < Full after this
-  unit** — it closes the G1 (sync PC-event halt-boundary) surface and
-  the core_debug routing gaps; `Modeled { completeness: Full }` still
-  requires G2 + the deferred single-step/count-step substrate.
-  Regenerate artifacts via
+  regenerated in lockstep. **Completeness stays < Full after Units 1/1b**
+  — those units close G1 (sync PC-event halt-boundary) and the
+  core_debug routing gaps. `Modeled { completeness: Full }` is reached
+  after the **Phase B remainder (Units 2/3)** closes G2 count-step +
+  the single-step boundary split (G1 + routing + G2 count-step + sstep
+  boundary all closed, no open gap surfaces). Coverage artifacts are
+  regenerated at that point via
   `cargo run -p xdna-archspec --example gen_coverage_artifacts`, zero
-  drift, committed with the change.
+  drift, committed with the remainder change.
 
 ## 7. Risks
 
@@ -646,7 +657,13 @@ This mirrors the established `AIE_AXIMM_Config.SLVERR_Block` precedent
 (NoC-gated, forward-linked from the `noc` coverage gap): the path is
 left open as a recorded goal, not closed. The commitment is recorded
 here in Section 8 and surfaced in the `debug_halt` coverage narrative
-so it is discoverable, not lost.
+so it is discoverable, not lost. **The Phase B remainder ships the
+natural reading (§5.2 locked modeling decisions, Maya 2026-05-19) and
+does NOT close this tracker** — finer characterization (decrement
+cadence, exact instruction boundary, larger-N behavior, `0x11` on
+silicon) was only partially observable (only `N=4` observed in the
+prologue, `LANDED:0`); the §8 forward-commitment stays OPEN after the
+remainder.
 
 **G1 halt-timing (bounded escalation).** The Phase A probe derives G1
 (synchronous-trap halt boundary, §5.1) on hardware via the MASKPOLL
