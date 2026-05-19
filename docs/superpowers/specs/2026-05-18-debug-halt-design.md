@@ -315,43 +315,55 @@ without having executed):
 - not `halted`, slots not the full set → `ANOMALY_NOT_HALTED` (record
   raw).
 
-**EMU limitation + graceful poll-termination (accepted).** Because EMU
-drops the breakpoint-arming writes (write-side `write_core_register`
-catch-all), EMU cannot produce a halted state. Additionally there is a
-*symmetric read-side gap*: control-packet OP_READ of core/debug
-registers (e.g. `Core_Status` 0x32004) is not wired into `core_debug`
-(`read_register_pure` has no core_debug dispatch), so EMU returns
-`Core_Status = 0x0` even for a completed core. Both are recorded Phase B
-inputs (control-packet ⇄ `core_debug` register routing, read and write
-sides; possibly multiple inconsistent register-access paths to
-reconcile). Consequently EMU never satisfies the injected MASKPOLL
-(`Core_Status[16]` is never set). Because the streamed MASKPOLL has no
-timeout, a naive emulator would block on it forever and hang the host
-`run.wait()` (the OP_READ would never issue) — reintroducing the wedge
-class this redesign exists to remove.
+**Mechanism correction (grounded post-Phase-B-Unit-1).** Earlier
+revisions of this section attributed the EMU's inability to observe a
+halt to a *write-side* gap ("EMU drops the breakpoint-arming writes,
+`write_core_register` catch-all, `compute.rs:554`"). **That is false.**
+Both the control-packet path *and* the probe's `@seq npu.write32`
+arming path share the same sink: `write_tile_register → dispatch →
+apply_tile_local_effects (effects.rs:296-298) → core_debug.write_register`.
+The debug/PC offsets `0x32010`–`0x3202C` are classified
+`SubsystemKind::Debug`/`ProgramCounter` by `subsystem_from_offset` and
+**bypass `write_core_register` entirely** — its `_ => {}` arm is
+unreachable for them. `pc_event0`/`debug_ctrl2` have been settable in
+`core_debug` since `8f52355`/`ed647b0` (pre-Task-5). **The breakpoint
+was armed on EMU all along.**
 
-**Adopted contract — emulator graceful poll-termination.** EMU and HW
-run the *identical* injected binary (byte-parity). The emulator is
-changed so an unsatisfiable poll terminates the run **deterministically
-and honestly**: when a `BlockedOnPoll` cannot be satisfied and the
-engine is otherwise quiescent (core halted/idle, no monotonic
-progress), the run ends with a *distinct terminal reason*
-(`MaskPollUnsatisfied`), the FFI/`run.wait()` path returns a clean
-completion (not a hang), and the emulator **must not** fake the polled
-register, pretend the core halted, or skip to the OP_READ. The probe's
-`test.cpp` verdict treats "OP_READ responses absent because MASKPOLL
-unsatisfied" as the **expected EMU baseline** (a recognized
-`MASKPOLL_UNSATISFIED_EMU` outcome → bridge `PASS` for EMU), distinct
-from any HW verdict. This is an emulator behavior change with
-independent robustness merit (an unsatisfiable poll should never
-infinitely hang the emulator) and is TDD'd (poll satisfied immediately;
-satisfied after N cycles; never satisfied → deterministic terminal
-reason, no hang, no register fakery). Consequently EMU validates the
-readback *mechanism*, the disjoint route, the gate-feed, and the
-poll-termination contract; the read-*while-halted* semantics and the G1
-answer itself are first exercised on hardware (where `Core_Status` is
-populated and the MASKPOLL satisfies). This is understood, not a flaw —
-HW is the ground truth for G1 regardless.
+The true reason the Task-5 EMU run produced `MASKPOLL_UNSATISFIED_EMU`
+is a **read-side gap on the mutable `tile.read_register` path** — the
+one the injected MASKPOLL polls `Core_Status` (0x32004) through. It
+falls back to the raw register HashMap, which never reflects the
+*dynamically computed* `Core_Status[16]=DEBUG_HALT` (derived from
+`core_debug.read_status()`), so the MASKPOLL always read 0 and never
+satisfied. This is **distinct from** the `read_register_pure` gap
+(control-packet OP_READ path) that Phase B Unit 1 (`e0ec922`) fixed —
+the two read paths diverging *is* the "possibly multiple inconsistent
+register-access paths to reconcile" recorded here as a Phase B input.
+
+**Phase B Unit 1b — reconcile the read paths; EMU reproduces G1.**
+Dispatch the mutable `tile.read_register` `Core_Status`/debug-register
+reads into `core_debug` (mirroring the `read_register_pure` fix Unit 1
+made on the other path), closing that recorded inconsistent-paths
+input. With arming already wired, the Unit-1 pre-execute seam halting
+*before* the trap bundle commits, and the MASKPOLL now able to observe
+`DEBUG_HALT`, the **EMU reproduces the hardware result**: MASKPOLL
+satisfies → OP_READ issues → all marker slots zero + `DEBUG_HALT` →
+`TRAP_VERDICT:BEFORE_COMMIT` on EMU, matching HW. The probe is thereby a
+**self-checking EMU+HW regression of the G1 before-commit fidelity
+fix**, not a HW-only derivation with an EMU placeholder. The earlier
+"G1 is HW-only by construction" framing is retired; HW remains ground
+truth, EMU is now a faithful regression of it.
+
+**Retained: emulator graceful poll-termination (independent hardening).**
+The contract added in Phase A — an unsatisfiable `BlockedOnPoll` with a
+quiescent engine terminates **deterministically and honestly** (distinct
+`MaskPollUnsatisfied` reason, clean `run.wait()`, **no** register
+fakery, no pretend-halt, no skipped OP_READ) — remains valid and is
+independently unit-tested (poll satisfied immediately / after N /
+never). It is no longer the *probe's* EMU baseline (Unit 1b makes this
+probe's MASKPOLL satisfy on EMU), but it stays as general emulator
+robustness for any genuinely-unsatisfiable poll. EMU and HW still run
+the *identical* injected binary (byte-parity).
 
 Resume is not exercised by this probe (a runtime sequence cannot
 deassert the breakpoint mid-run and re-observe); it stays in-emulator-
@@ -405,14 +417,19 @@ Introduce the distinction the hardware actually has:
   Already correct; the pre-execute seam is additive and provably does
   not touch these (they keep setting `halted`, caught at the existing
   `interpreter.rs:181` gate).
-- **Coupled prerequisite, folded into this unit:** the recorded Phase B
-  `core_debug` control-packet register-routing gaps — write side
-  (`write_core_register` `_ => {}` catch-all silently drops debug-reg
-  writes `0x32010`–`0x3202C`, `compute.rs:554`) and the symmetric read
-  side (`read_register_pure` has no `core_debug` dispatch,
-  `registers.rs:95`). Wiring both is required for an end-to-end emulator
-  guarding test (arm PC_Event via control packet, observe the halted
-  state) and is independently a recorded Phase B input.
+- **Coupled read-path reconciliation (Unit 1 + Unit 1b).** *Correction:*
+  there is **no write-side gap** — control-packet *and* `@seq npu.write32`
+  debug-reg writes both reach `core_debug` via `apply_tile_local_effects`
+  (see "Mechanism correction", §4.2). The real recorded input is the
+  divergent **read** paths: Unit 1 dispatched `read_register_pure`
+  (control-packet OP_READ path) into `core_debug`; **Unit 1b** dispatches
+  the mutable `tile.read_register` `Core_Status`/debug-reg reads (the
+  injected-MASKPOLL path) the same way, reconciling the two and closing
+  the "inconsistent register-access paths" Phase B input. With arming
+  (always wired) + the Unit-1 before-commit seam + Unit-1b read
+  reconciliation, the **EMU reproduces the HW `BEFORE_COMMIT` result** —
+  the probe becomes a self-checking EMU+HW regression of this fidelity
+  fix.
 
 The async/sync split remains the elegant core; this unit lands the
 PC-event half (the part fully derived by G1 and unentangled with G2).
@@ -443,14 +460,29 @@ decisions, citing the finding.
 - `src/device/core_debug/mod.rs` — a `sync_trap_pending`-style query
   (`has_sync_pc_trap_at(pc)`) that does not itself commit the halt;
   control-packet register dispatch reachable from the routing-gap fix.
-- `src/device/.../compute.rs:554` (`write_core_register`) + register
-  read path (`registers.rs:95`, `read_register_pure`) — dispatch
-  control-packet debug-reg writes/reads (`0x32010`–`0x3202C`) into
-  `core_debug` instead of the silent `_ => {}` / no-op.
+- `src/device/tile/registers.rs` — **Unit 1:** dispatch
+  `read_register_pure` (control-packet OP_READ path) `Core_Status`/
+  debug-reg reads into `core_debug` (live-computed status). Writes need
+  no change (already wired via `apply_tile_local_effects`).
 - `src/interpreter/core/interpreter.rs` — `is_halted()` gate at :181
   unchanged (the coordinator sets `halted` pre-execute; the existing
   gate still catches it). No change expected here.
-- findings doc — the derivation, durable (committed `96ecb6b`).
+- findings doc — the derivation, durable (committed `96ecb6b`;
+  EMU section updated by Unit 1b to record EMU reproduces `BEFORE_COMMIT`).
+
+**Unit 1b (read-path reconciliation; EMU reproduces G1):**
+- `src/device/tile/registers.rs` — dispatch the **mutable**
+  `tile.read_register` `Core_Status`/debug-reg reads into `core_debug`,
+  mirroring the Unit-1 `read_register_pure` fix (the injected MASKPOLL
+  polls via this path). Closes the §4.2 inconsistent-paths input.
+- `mlir-aie .../debug_halt_probe/test.cpp` — EMU verdict expectation
+  flips from `MASKPOLL_UNSATISFIED_EMU` to the schedule-derived
+  `BEFORE_COMMIT` (EMU now reproduces HW); HW path unchanged.
+- findings doc EMU section — updated to "EMU reproduces `BEFORE_COMMIT`;
+  probe is a self-checking EMU+HW regression" (retire the HW-only/
+  `MASKPOLL_UNSATISFIED_EMU`-baseline framing).
+- The emulator graceful-poll-termination contract + its unit tests stay
+  (independent hardening; no longer the probe's path).
 
 **Deferred (with §5.2/G2):** count-step state machine; single-step halt
 boundary; `tick_single_step()` per-bundle drive — out of this unit.
@@ -478,8 +510,16 @@ boundary; `tick_single_step()` per-bundle drive — out of this unit.
   and explicitly record that the literal store-did-not-land assertion
   is covered by the hardware probe, not the unit suite. The implementer
   must surface which of (a)/(b)/(c) before settling for a weaker test.
-- Hardware probe = the durable derivation + permanent regression
-  (committed; `MASKPOLL_UNSATISFIED_EMU` guards the EMU side).
+- Hardware probe = the durable derivation + permanent regression. Post
+  Unit 1b it is **self-checking on EMU too**: the EMU bridge run
+  reproduces the HW `TRAP_VERDICT:BEFORE_COMMIT` (arming wired + Unit-1
+  before-commit seam + Unit-1b read reconciliation), so a regression in
+  the before-commit fidelity fix fails the EMU bridge, not only HW.
+- Unit-1b read-path test (`registers.rs`/integration): mutable
+  `tile.read_register` of `Core_Status` reflects `core_debug` halt state
+  (DEBUG_HALT bit 16), consistent with `read_register_pure`; the
+  emulator graceful-poll-termination unit tests remain green (the
+  contract is retained, just not the probe's path).
 - `cargo test --lib` green (xdna-emu + xdna-archspec). Coverage
   regenerated in lockstep. **Completeness stays < Full after this
   unit** — it closes the G1 (sync PC-event halt-boundary) surface and
