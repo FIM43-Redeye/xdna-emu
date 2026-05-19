@@ -308,9 +308,10 @@ void emu_transport_inprocess::execute(const void* instructions, size_t size)
     // error paths -- otherwise an ExecutionError loses all cycle/reason info.
     const char* reason_str = "error";
     switch (status.halt_reason) {
-        case HALT_COMPLETED: reason_str = "completed"; break;
-        case HALT_BUDGET:    reason_str = "budget";    break;
-        case HALT_ERROR:     reason_str = "error";     break;
+        case HALT_COMPLETED:            reason_str = "completed";            break;
+        case HALT_BUDGET:               reason_str = "budget";               break;
+        case HALT_ERROR:                reason_str = "error";                break;
+        case HALT_MASKPOLL_UNSATISFIED: reason_str = "maskpoll_unsatisfied"; break;
     }
     std::cerr << "XDNA_EMU_STATUS: halt_reason=" << reason_str
               << " cycles=" << status.cycles_executed

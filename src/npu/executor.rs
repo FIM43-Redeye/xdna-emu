@@ -247,6 +247,25 @@ impl NpuExecutor {
         matches!(self.state, ExecutorState::Done | ExecutorState::Idle)
     }
 
+    /// Whether the executor is currently blocked on an unsatisfied MaskPoll.
+    ///
+    /// Used by the run loop to detect the graceful-poll-termination condition:
+    /// when the engine becomes quiescent (stalled or halted with no pending
+    /// work) while the executor is stuck in `BlockedOnPoll`, the poll can never
+    /// be satisfied and the run should end deterministically with a distinct
+    /// `MaskPollUnsatisfied` terminal reason rather than hanging forever.
+    ///
+    /// This is the emulator-contract check for the MASKPOLL halt-synchronization
+    /// injected into `insts.bin` by the debug_halt_probe (spec §4.2). On the
+    /// real NPU the poll satisfies when `Core_Status[16]` (DEBUG_HALT) sets
+    /// after a breakpoint fires. On the emulator the breakpoint-arming writes
+    /// are dropped into the `write_core_register` catch-all so `DEBUG_HALT`
+    /// never sets -- the poll is unsatisfiable by design, and this method lets
+    /// the run loop detect it without spinning forever.
+    pub fn is_blocked_on_poll(&self) -> bool {
+        matches!(self.state, ExecutorState::BlockedOnPoll { .. })
+    }
+
     /// Get pending sync conditions.
     pub fn pending_syncs(&self) -> &[PendingSync] {
         &self.pending_syncs
@@ -1661,5 +1680,150 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("XDNA_EMU_MAILBOX_LATENCY") };
+    }
+
+    // -----------------------------------------------------------------------
+    // MaskPoll graceful-termination tests (spec §4.2, debug_halt_probe)
+    //
+    // These cover the three cases for the MASKPOLL halt-synchronization
+    // instruction injected into insts.bin by inject-maskpoll.py:
+    //   (a) poll satisfied immediately -> proceeds to next instruction
+    //   (b) poll satisfied after N cycles -> proceeds
+    //   (c) poll never satisfied + engine quiescent -> is_blocked_on_poll()
+    //       detects the condition so the run loop can exit MaskPollUnsatisfied
+    // -----------------------------------------------------------------------
+
+    /// (a) MaskPoll satisfied immediately: the condition is already met when
+    /// the instruction first executes.  The executor advances past it without
+    /// ever entering BlockedOnPoll.
+    #[test]
+    fn test_maskpoll_satisfied_immediately() {
+        let mut executor = NpuExecutor::new();
+        let mut device = DeviceState::new_npu1();
+        let mut host_mem = HostMemory::new();
+
+        // Use the tile register map directly to preset a register value so
+        // the poll is satisfied on the first try.  Lock0_value (0x1F000) on
+        // compute tile (0, 2) is a safe non-side-effecting register to poke.
+        // write_tile_register routes through the unified register bus.
+        let lock0_reg = 0x1F000u32;
+        device.write_tile_register(0, 2, lock0_reg, 0x0000_0001);
+
+        // Encode the MaskPoll NPU address: col=0, row=2, offset=0x1F000.
+        let reg_off = (0u32 << 25) | (2u32 << 20) | lock0_reg;
+
+        // Poll: (reg & 0x01) == 0x01 -- satisfied immediately.
+        executor.load_instructions(vec![NpuInstruction::MaskPoll { reg_off, value: 0x01, mask: 0x01 }]);
+
+        let result = executor.try_advance(&mut device, &mut host_mem);
+        // With a one-instruction stream, after the poll succeeds we expect Done.
+        assert!(
+            matches!(result, AdvanceResult::Done | AdvanceResult::Progressed),
+            "immediately-satisfied MaskPoll should not block: got {:?}",
+            result
+        );
+        assert!(
+            !executor.is_blocked_on_poll(),
+            "executor must not be blocked on poll after immediate satisfaction"
+        );
+    }
+
+    /// (b) MaskPoll satisfied after N cycles: the condition is not met
+    /// initially, but becomes met after the polled register is updated.
+    /// The executor blocks (returns Blocked) until satisfied, then proceeds.
+    #[test]
+    fn test_maskpoll_satisfied_after_n_cycles() {
+        let mut executor = NpuExecutor::new();
+        let mut device = DeviceState::new_npu1();
+        let mut host_mem = HostMemory::new();
+
+        // Use Lock0_value on tile (0, 2) as the polled register.
+        let lock0_reg = 0x1F000u32;
+        let reg_off = (0u32 << 25) | (2u32 << 20) | lock0_reg;
+
+        // Initially the register is 0; poll waits for bit 0 to be set.
+        executor.load_instructions(vec![NpuInstruction::MaskPoll { reg_off, value: 0x01, mask: 0x01 }]);
+
+        // First advance: condition not met -> Blocked, enters BlockedOnPoll.
+        let r1 = executor.try_advance(&mut device, &mut host_mem);
+        assert_eq!(r1, AdvanceResult::Blocked, "unmet poll must return Blocked");
+        assert!(executor.is_blocked_on_poll(), "must be in BlockedOnPoll state");
+
+        // Simulate N cycles of Blocked returns while register is still 0.
+        for _ in 0..10 {
+            let r = executor.try_advance(&mut device, &mut host_mem);
+            assert_eq!(r, AdvanceResult::Blocked);
+            assert!(executor.is_blocked_on_poll());
+        }
+
+        // Now satisfy the condition by writing the register via the device bus.
+        device.write_tile_register(0, 2, lock0_reg, 0x01);
+
+        // Next advance: condition now met -> Done (single-instruction stream).
+        let r_done = executor.try_advance(&mut device, &mut host_mem);
+        assert!(
+            matches!(r_done, AdvanceResult::Done | AdvanceResult::Progressed),
+            "poll must resolve after register is set: got {:?}",
+            r_done
+        );
+        assert!(!executor.is_blocked_on_poll(), "must not be blocked on poll after condition is met");
+    }
+
+    /// (c) MaskPoll never satisfied + engine quiescent: the polled register
+    /// stays 0 forever (as when the emulator cannot set DEBUG_HALT because
+    /// control-packet writes to core/debug registers are dropped).
+    /// The executor remains in BlockedOnPoll indefinitely; is_blocked_on_poll()
+    /// stays true so the run loop can detect quiescence and exit cleanly.
+    /// Also verifies:
+    ///  - the polled register is never modified (no fakery)
+    ///  - no subsequent instruction is issued (no OP_READ skip)
+    #[test]
+    fn test_maskpoll_unsatisfied_blocks_indefinitely() {
+        let mut executor = NpuExecutor::new();
+        let mut device = DeviceState::new_npu1();
+        let mut host_mem = HostMemory::new();
+
+        // Poll for bit 16 of Core_Status (0x32004) on tile (0, 2):
+        // This is exactly the DEBUG_HALT condition used by the probe injector.
+        // In the emulator, Core_Status[16] never sets (the write-side gap drops
+        // the arming writes), so the poll is never satisfied.
+        let core_status_reg = 0x32004u32;
+        let reg_off = (0u32 << 25) | (2u32 << 20) | core_status_reg;
+
+        // A two-instruction stream: MaskPoll then a Write32 (the "OP_READ push"
+        // stand-in).  The Write32 must never be issued if the poll blocks.
+        let sentinel_reg = 0x1F000u32; // Lock0_value -- starts at 0, never written if poll blocks
+        let sentinel_addr = (0u32 << 25) | (2u32 << 20) | sentinel_reg;
+        executor.load_instructions(vec![
+            NpuInstruction::MaskPoll { reg_off, value: 0x0001_0000, mask: 0x0001_0000 },
+            // Sentinel instruction -- must NOT execute while poll is unsatisfied.
+            NpuInstruction::Write32 { reg_off: sentinel_addr, value: 0xDEAD_BEEF },
+        ]);
+
+        // Spin a large number of cycles -- poll must never satisfy.
+        for i in 0..1000 {
+            let r = executor.try_advance(&mut device, &mut host_mem);
+            assert_eq!(
+                r,
+                AdvanceResult::Blocked,
+                "unsatisfied poll must return Blocked forever (cycle {})",
+                i
+            );
+            assert!(executor.is_blocked_on_poll(), "must remain in BlockedOnPoll (cycle {})", i);
+        }
+
+        // Polled register must be untouched (no fakery -- emulator must not set
+        // the DEBUG_HALT bit to force poll satisfaction).
+        let core_status_val = device.tile_mut(0, 2).map(|t| t.read_register(core_status_reg)).unwrap_or(0);
+        assert_eq!(
+            core_status_val & 0x0001_0000,
+            0,
+            "Core_Status DEBUG_HALT bit must not be faked by the emulator"
+        );
+
+        // Sentinel register must be untouched (sentinel Write32 must not have
+        // executed while the poll is unsatisfied -- no OP_READ skip).
+        let sentinel_val = device.tile_mut(0, 2).map(|t| t.read_register(sentinel_reg)).unwrap_or(0);
+        assert_eq!(sentinel_val, 0, "sentinel Write32 must not execute while poll is unsatisfied");
     }
 }

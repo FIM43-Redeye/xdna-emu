@@ -1595,6 +1595,15 @@ compile_one_compiler() {
 
   if $have_xclbin && [[ "$FORCE_COMPILE" != "true" ]]; then
     echo "  COMPILE $name ($compiler): cached"
+    # Even on a cache hit the MASKPOLL halt-sync must be present in
+    # insts.bin (it is post-compile and not part of the cached aiecc
+    # output).  The injector is idempotent (no-ops if already spliced),
+    # so running it here is safe whether or not the cached binary was
+    # patched on a prior run.
+    if ! _inject_maskpoll_if_probe "$name" "$src_dir" "$build_dir" \
+         "$log_file" "$result_file"; then
+      return 0
+    fi
     echo "OK" > "$result_file"
     return 0
   fi
@@ -1680,9 +1689,50 @@ compile_one_compiler() {
     fi
   fi
 
+  # ---- debug_halt_probe MASKPOLL halt-sync injection ----
+  # Post-compile, pre-run: splice the firmware XAIE_IO_MASKPOLL into
+  # insts.bin so the ctrl-in OP_READ provably happens-after the core halts
+  # (spec §4.2).  Same helper as the cache-hit path so EMU and HW always
+  # consume the byte-identical patched binary.
+  if ! _inject_maskpoll_if_probe "$name" "$src_dir" "$build_dir" \
+       "$log_file" "$result_file"; then
+    return 0
+  fi
+
   echo "OK" > "$result_file"
   echo "  COMPILE $name ($compiler): OK"
 }
+
+# Splice the MASKPOLL halt-sync instruction into the probe's insts.bin.
+# No-op for any test other than debug_halt_probe.  Idempotent (the
+# injector refuses/no-ops if a MASKPOLL on 0x00232004 is already present),
+# so it is safe to call on both the fresh-compile and cache-hit paths --
+# guaranteeing EMU and HW run the byte-identical patched binary.
+# Returns 0 on success (or not-applicable), 1 if the caller should abort
+# the compile (writes FAIL to $result_file in that case).
+# Args: <name> <src_dir> <build_dir> <log_file> <result_file>
+_inject_maskpoll_if_probe() {
+  local name="$1" src_dir="$2" build_dir="$3" log_file="$4" result_file="$5"
+  [[ "$name" == "debug_halt_probe" ]] || return 0
+
+  local _insts_name
+  _insts_name="$(_discover_instr_binary "$src_dir")"
+  local _insts="$build_dir/$_insts_name"
+  if [[ ! -f "$_insts" ]]; then
+    echo "FAIL" > "$result_file"
+    echo "  COMPILE $name: FAIL (insts.bin $_insts_name not found for MASKPOLL injection)"
+    return 1
+  fi
+  if ! python3 "$EMU_ROOT/tools/inject-maskpoll.py" "$_insts" \
+       >> "$log_file" 2>&1; then
+    echo "FAIL" > "$result_file"
+    echo "  COMPILE $name: FAIL (MASKPOLL injection)"
+    return 1
+  fi
+  echo "  INJECT $name: MASKPOLL halt-sync ensured in $_insts_name"
+  return 0
+}
+export -f _inject_maskpoll_if_probe
 
 # Compile one test for all active compilers + build shared test.exe.
 # Called via xargs. Writes per-compiler compile results and shared test.exe.

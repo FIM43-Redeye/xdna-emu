@@ -111,6 +111,21 @@ pub enum XdnaEmuHaltReason {
     Budget = 1,
     /// Error during execution (FFI fault, executor error).
     Error = 2,
+    /// A MaskPoll instruction could not be satisfied because the engine became
+    /// quiescent (no cores running, no DMA progress) with the poll condition
+    /// still unmet.
+    ///
+    /// This is the expected outcome for the debug_halt_probe's MASKPOLL
+    /// halt-synchronization on the emulator: the probe polls `Core_Status[16]`
+    /// (DEBUG_HALT), which never sets because the emulator's control-packet
+    /// write path drops writes to core/debug registers into a catch-all.  The
+    /// emulator terminates deterministically with this reason rather than
+    /// spinning forever.  The polled register is NOT modified; no subsequent
+    /// instruction is issued.
+    ///
+    /// On real hardware the poll satisfies (the core halts at the breakpoint);
+    /// this reason is emulator-only.
+    MaskPollUnsatisfied = 3,
 }
 
 /// Execution status returned by run functions.

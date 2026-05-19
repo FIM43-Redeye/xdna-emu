@@ -132,6 +132,28 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
     // Track whether we exited via a natural halt (Completed) or fell through
     // to budget exhaustion.
     let mut natural_halt = false;
+    // Set when the run terminated because an injected MASKPOLL can never be
+    // satisfied (the engine went quiescent with the poll still blocked). This
+    // is the expected EMU outcome for the debug_halt_probe's halt-sync
+    // MASKPOLL: Core_Status[16] (DEBUG_HALT) never sets on the emulator, so
+    // the poll is unsatisfiable by design. We end deterministically here
+    // rather than spinning until the stall detector trips ~100k cycles later.
+    let mut maskpoll_unsatisfied = false;
+    // Bounded poll-stall counter: consecutive cycles the executor has been
+    // parked in BlockedOnPoll with no executor progress. A *satisfiable*
+    // poll resolves within a few cycles of whatever writes the polled
+    // register running; the debug_halt_probe MASKPOLL (Core_Status[16] /
+    // DEBUG_HALT) is unsatisfiable on EMU because the breakpoint-arming
+    // control-packet writes are dropped, so nothing the run loop steps can
+    // ever change the polled value. This counter is the deterministic,
+    // DMA-churn-independent "no monotonic progress" signal the spec §4.2
+    // contract requires -- it does NOT depend on any_dma_active() (a
+    // starved ctrl-out DMA re-routing the same packet is not progress) or
+    // the ~100k generic stall threshold (too slow for the bridge
+    // wall-clock). The window is generous enough that any legitimately
+    // satisfiable poll resolves first, but far below the bridge timeout.
+    let mut poll_stall_cycles: u64 = 0;
+    const POLL_STALL_LIMIT: u64 = 20_000;
 
     'run: while unbounded || cycles < max {
         // Publish the current simulation cycle to the tile array before the
@@ -159,6 +181,33 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
             npu_progressed = matches!(result, xdna_emu_core::npu::AdvanceResult::Progressed);
         }
 
+        // Bounded poll-stall detection (spec §4.2 graceful poll-termination).
+        // Track consecutive cycles the executor is BlockedOnPoll without
+        // making progress. Reset whenever it is not blocked on a poll or it
+        // advanced -- so a poll that does eventually satisfy never trips
+        // this. Crossing the bound means the poll is unsatisfiable: end
+        // deterministically with the distinct terminal reason. We do NOT
+        // fake the polled register, pretend the core halted, or skip the
+        // OP_READ -- the executor stays BlockedOnPoll, no further
+        // instruction is issued, and the run.wait() path returns cleanly.
+        if handle.npu_executor.is_blocked_on_poll() && !npu_progressed {
+            poll_stall_cycles += 1;
+            if poll_stall_cycles >= POLL_STALL_LIMIT {
+                log::info!(
+                    "MASKPOLL unsatisfiable: executor BlockedOnPoll with no progress \
+                     for {} cycles (total {} cycles) -- terminating deterministically \
+                     (MaskPollUnsatisfied)",
+                    poll_stall_cycles,
+                    cycles
+                );
+                maskpoll_unsatisfied = true;
+                natural_halt = true;
+                break 'run;
+            }
+        } else {
+            poll_stall_cycles = 0;
+        }
+
         // When the NPU executor progressed (executed an instruction that may
         // configure DMA or write START_QUEUE), flush in-flight control packet
         // data through the stream switch.  On real hardware the stream switch
@@ -172,6 +221,27 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         cycles += 1;
 
         if handle.engine.status() == EngineStatus::Halted {
+            // Graceful poll-termination contract (debug_halt_probe MASKPOLL,
+            // spec §4.2). If the executor is parked in BlockedOnPoll and the
+            // engine is otherwise quiescent (cores halted, no DMA in flight),
+            // the poll can never become satisfied -- nothing left running can
+            // change the polled register. End deterministically with a
+            // distinct terminal reason instead of force-running until the
+            // stall detector trips ~100k cycles later. We do NOT fake the
+            // polled register, pretend the core halted, or skip to the next
+            // instruction: the executor stays BlockedOnPoll and no further
+            // instruction (the OP_READ push) is issued.
+            if handle.npu_executor.is_blocked_on_poll() && !handle.engine.device().array.any_dma_active() {
+                log::info!(
+                    "MASKPOLL unsatisfiable: engine quiescent (cores halted, no DMA) \
+                     with poll still blocked after {} cycles -- terminating deterministically",
+                    cycles
+                );
+                maskpoll_unsatisfied = true;
+                natural_halt = true;
+                break 'run;
+            }
+
             // For DMA-only tests (no cores loaded), the engine halts
             // immediately because no cores are enabled.  But the NPU
             // executor may still be issuing instructions that configure
@@ -191,6 +261,15 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
 
         if handle.engine.status() == EngineStatus::Stalled {
             log::warn!("Stall detected after {} cycles: no monotonic progress", cycles);
+            // Defensive: if the stall is because the executor is parked in an
+            // unsatisfiable BlockedOnPoll (e.g. a path where the core never
+            // reaches the Halted status), still surface the distinct
+            // MASKPOLL-unsatisfied terminal reason rather than a generic
+            // Completed -- the cause is the same unsatisfiable poll.
+            if handle.npu_executor.is_blocked_on_poll() {
+                log::info!("Stall is an unsatisfiable MASKPOLL -- terminating as MaskPollUnsatisfied");
+                maskpoll_unsatisfied = true;
+            }
             // A stall is treated as a natural (if unhappy) halt — the run
             // completed as far as the emulator can tell, not a budget cut.
             natural_halt = true;
@@ -217,9 +296,16 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
     let halted = handle.engine.status() == EngineStatus::Halted
         || (handle.npu_executor.is_done() && handle.npu_executor.syncs_satisfied(handle.engine.device()));
 
-    // If we didn't exit naturally (halted/stalled/syncs), the while-loop
-    // condition `cycles >= max` ended the run — budget was exhausted.
-    let halt_reason = if natural_halt || halted {
+    // Terminal-reason priority:
+    //  1. MaskPollUnsatisfied: an injected MASKPOLL could never be satisfied
+    //     (debug_halt_probe halt-sync on EMU). Distinct from a generic
+    //     completion so the host harness can treat it as the expected EMU
+    //     baseline rather than misreading absent OP_READ responses.
+    //  2. Completed: natural halt / stalled / syncs satisfied.
+    //  3. Budget: the while-loop condition `cycles >= max` ended the run.
+    let halt_reason = if maskpoll_unsatisfied {
+        XdnaEmuHaltReason::MaskPollUnsatisfied
+    } else if natural_halt || halted {
         XdnaEmuHaltReason::Completed
     } else {
         XdnaEmuHaltReason::Budget

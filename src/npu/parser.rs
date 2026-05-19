@@ -664,4 +664,45 @@ mod tests {
         assert_eq!(NpuOpcode::from(99), NpuOpcode::Unknown);
         assert_eq!(NpuOpcode::from(254), NpuOpcode::Unknown);
     }
+
+    /// Authoritative cross-check for tools/inject-maskpoll.py: the 28-byte
+    /// MASKPOLL the injector emits must decode through the *real* parser as
+    /// MaskPoll{reg_off=0x00232004, value=0x10000, mask=0x10000}.  This
+    /// pins the byte-exact layout (spec §4.2 / debug_halt_probe) against the
+    /// parser cursor reads so the injector and parser cannot silently
+    /// diverge.
+    #[test]
+    fn test_injected_maskpoll_round_trips_through_parser() {
+        // Byte-exact MASKPOLL record per spec §4.2 (mirrors what
+        // inject-maskpoll.py build_maskpoll_bytes() produces).
+        let reg_off: u64 = 0x0023_2004; // (col0<<25)|(row2<<20)|0x32004
+        let debug_halt: u32 = 0x0001_0000; // Core_Status[16]
+
+        let mut rec = vec![0u8; 28];
+        rec[0] = 0x04; // opcode = MaskPoll; [1..4] pad stays 0
+                       // [4..8] zero word stays 0
+        rec[8..16].copy_from_slice(&reg_off.to_le_bytes());
+        rec[16..20].copy_from_slice(&debug_halt.to_le_bytes());
+        rec[20..24].copy_from_slice(&debug_halt.to_le_bytes());
+        rec[24..28].copy_from_slice(&28u32.to_le_bytes());
+
+        // Wrap in a minimal one-op insts.bin: 16-byte header + the record.
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x0603_0100u32.to_le_bytes()); // magic
+        data.extend_from_slice(&0u32.to_le_bytes()); // flags
+        data.extend_from_slice(&1u32.to_le_bytes()); // num_ops = 1
+        data.extend_from_slice(&((16 + rec.len()) as u32).to_le_bytes()); // total_size
+        data.extend_from_slice(&rec);
+
+        let stream = NpuInstructionStream::parse(&data).expect("parse must succeed");
+        assert_eq!(stream.len(), 1, "exactly one instruction expected");
+        match &stream.instructions()[0] {
+            NpuInstruction::MaskPoll { reg_off: ro, value, mask } => {
+                assert_eq!(*ro, 0x0023_2004, "reg_off must be Core_Status NPU address");
+                assert_eq!(*value, 0x0001_0000, "value must set DEBUG_HALT bit 16");
+                assert_eq!(*mask, 0x0001_0000, "mask must select only DEBUG_HALT");
+            }
+            other => panic!("expected MaskPoll, got {:?}", other),
+        }
+    }
 }

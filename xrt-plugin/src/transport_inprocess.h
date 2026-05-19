@@ -101,9 +101,10 @@ private:
     // the C ABI. Appending new fields is safe; reordering is not.
     using Result = int;          // XdnaEmuResult enum (0 = success)
     enum HaltReason : int {      // Mirrors Rust `XdnaEmuHaltReason`.
-        HALT_COMPLETED = 0,
-        HALT_BUDGET    = 1,
-        HALT_ERROR     = 2,
+        HALT_COMPLETED            = 0,
+        HALT_BUDGET               = 1,
+        HALT_ERROR                = 2,
+        HALT_MASKPOLL_UNSATISFIED = 3,
     };
     struct ExecStatus {
         Result     result;          // 4 bytes, offset 0
