@@ -1,7 +1,8 @@
 # Interrupt Tier B — Firmware Async-Event Host Delivery (tracked follow-up)
 
-**Status:** Spec 1 (plumbing + INSTR_ERROR producer) drafted at
-[`../specs/2026-05-19-interrupt-tier-b-firmware-mailbox-design.md`](../specs/2026-05-19-interrupt-tier-b-firmware-mailbox-design.md).
+**Status:** Spec 1 (plumbing + INSTR_ERROR producer) **shipped** on `dev`.
+Spec: [`../specs/2026-05-19-interrupt-tier-b-firmware-mailbox-design.md`](../specs/2026-05-19-interrupt-tier-b-firmware-mailbox-design.md);
+plan: [`../plans/2026-05-19-interrupt-tier-b-firmware-mailbox.md`](../plans/2026-05-19-interrupt-tier-b-firmware-mailbox.md).
 Per-class detection follow-ups (DMA, parity, ECC, lock, stream) remain
 tracked as separate not-started specs in that spec's §10. Tier C (TDR /
 context-restart) is a further follow-up.
