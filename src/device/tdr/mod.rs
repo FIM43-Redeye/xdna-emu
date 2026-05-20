@@ -154,8 +154,30 @@ impl TdrDetector {
             }
         }
 
-        // Default: still making progress (or the lower-precedence checks
-        // added in Tasks 5-7 will refine).
+        // Second precedence: MaskPollUnsatisfied.
+        // Mirrors the two paths the inline xdna_emu_run logic uses today:
+        //  (a) engine Halted + executor BlockedOnPoll + no DMA in flight
+        //      (the "fast-path" -- nothing left running can satisfy the poll)
+        //  (b) executor BlockedOnPoll for poll_stall_limit consecutive cycles
+        //      (the "budget" -- caps unsatisfiable polls in the running case)
+        if let Some(exec) = executor {
+            if exec.is_blocked_on_poll {
+                // Fast-path (a):
+                if signals.engine_status == EngineStatusSnapshot::Halted && !signals.any_dma_active {
+                    return TdrVerdict::MaskPollUnsatisfied;
+                }
+                // Budget (b):
+                self.poll_stall_cycles += 1;
+                if self.poll_stall_cycles >= self.poll_stall_limit {
+                    return TdrVerdict::MaskPollUnsatisfied;
+                }
+            } else {
+                self.poll_stall_cycles = 0;
+            }
+        } else {
+            self.poll_stall_cycles = 0;
+        }
+
         TdrVerdict::Progressing
     }
 }
@@ -234,5 +256,60 @@ mod tests {
         let exec = natural_completion_executor();
         let verdict = detector.classify(&signals, Some(&exec));
         assert!(matches!(verdict, TdrVerdict::NaturalCompletion), "got {verdict:?}");
+    }
+
+    fn blocked_on_poll_executor() -> ExecutorSignals {
+        ExecutorSignals {
+            is_done: false,
+            syncs_satisfied: false,
+            is_blocked_on_poll: true,
+            pending_syncs: vec![],
+        }
+    }
+
+    #[test]
+    fn classify_returns_mask_poll_unsatisfied_when_engine_halted_and_executor_blocked_on_poll() {
+        let mut detector = TdrDetector::new(0);
+        let mut signals = empty_engine_signals(EngineStatusSnapshot::Halted);
+        signals.any_dma_active = false; // matches existing run-loop fast-path condition
+        let exec = blocked_on_poll_executor();
+        let verdict = detector.classify(&signals, Some(&exec));
+        assert!(matches!(verdict, TdrVerdict::MaskPollUnsatisfied), "got {verdict:?}");
+    }
+
+    #[test]
+    fn classify_returns_mask_poll_unsatisfied_after_poll_stall_budget() {
+        let mut detector = TdrDetector::new(0);
+        let signals = empty_engine_signals(EngineStatusSnapshot::Running);
+        let exec = blocked_on_poll_executor();
+        // Burn through the poll-stall budget. Detector accumulates internally.
+        for _ in 0..DEFAULT_POLL_STALL_LIMIT {
+            let _ = detector.classify(&signals, Some(&exec));
+        }
+        // On the budget-th cycle (or one after), should report MaskPollUnsatisfied.
+        // Run one more cycle to be safe.
+        let last = detector.classify(&signals, Some(&exec));
+        assert!(matches!(last, TdrVerdict::MaskPollUnsatisfied), "got {last:?}");
+    }
+
+    #[test]
+    fn classify_resets_poll_stall_when_executor_unblocks() {
+        let mut detector = TdrDetector::new(0);
+        let signals = empty_engine_signals(EngineStatusSnapshot::Running);
+        let exec_blocked = blocked_on_poll_executor();
+        let mut exec_unblocked = blocked_on_poll_executor();
+        exec_unblocked.is_blocked_on_poll = false;
+
+        // Accumulate near the limit while blocked.
+        for _ in 0..(DEFAULT_POLL_STALL_LIMIT - 10) {
+            detector.classify(&signals, Some(&exec_blocked));
+        }
+        // Unblock for a cycle.
+        detector.classify(&signals, Some(&exec_unblocked));
+        // Now block again; should NOT fire immediately (counter reset).
+        for _ in 0..10 {
+            let v = detector.classify(&signals, Some(&exec_blocked));
+            assert!(!matches!(v, TdrVerdict::MaskPollUnsatisfied), "fired too early after reset");
+        }
     }
 }
