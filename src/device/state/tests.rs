@@ -708,3 +708,88 @@ fn device_state_reset_context_transitions_failed_to_connected() {
     state.reset_context(DEFAULT_CONTEXT).expect("reset failed");
     assert!(matches!(state.contexts[0].state, ContextState::Connected));
 }
+
+// ---------------------------------------------------------------------------
+// Tier C integration: synthesize a wedge via classifier, observe state
+// transition, recover, verify Tier B orthogonality.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tier_c_integration {
+    use crate::device::context::{ContextState, DEFAULT_CONTEXT};
+    use crate::device::tdr::{EngineSignals, EngineStatusSnapshot, TdrDiagnosis, TdrVerdict, WedgeReason};
+    use crate::device::state::DeviceState;
+
+    fn quiescent_signals() -> EngineSignals {
+        EngineSignals {
+            engine_status: EngineStatusSnapshot::Stalled,
+            any_dma_active: false,
+            any_data_in_flight: false,
+            total_dma_bytes_transferred: 0,
+            total_lock_releases: 0,
+            core_statuses: vec![],
+            dma_states: vec![],
+        }
+    }
+
+    #[test]
+    fn classify_into_wedged_then_mark_failed_then_reset_recovers() {
+        let mut state = DeviceState::new_npu1();
+        assert!(matches!(state.contexts[0].state, ContextState::Connected));
+
+        // Drive the detector through enough cycles to fire Wedged{Quiescent}.
+        // DEFAULT_QUIESCENCE_CYCLES = 5, so 10 iterations is more than enough.
+        let signals = quiescent_signals();
+        let detector = &mut state.tdr_detectors[0];
+        let mut fired = None;
+        for _ in 0..50 {
+            let v = detector.classify(&signals, None);
+            if let TdrVerdict::Wedged { reason, diagnosis } = v {
+                fired = Some((reason, diagnosis));
+                break;
+            }
+        }
+        let (reason, diagnosis) = fired.expect("Wedged verdict never fired");
+        assert_eq!(reason, WedgeReason::Quiescent);
+
+        // Apply the verdict to the context.
+        state.contexts[0].mark_failed(reason, diagnosis);
+        assert!(state.contexts[0].is_failed());
+        assert!(!state.contexts[0].is_connected());
+
+        // Reset and verify recovery.
+        state.reset_context(DEFAULT_CONTEXT).expect("reset");
+        assert!(state.contexts[0].is_connected());
+    }
+
+    #[test]
+    fn tier_b_and_tier_c_are_independent_paths() {
+        // A context can carry a Tier B async error AND be Failed; reset_context
+        // clears both surfaces independently.
+        use xdna_archspec::aie2::async_errors::AieErrorOrigin;
+
+        let mut state = DeviceState::new_npu1();
+
+        // Inject a Tier B async error directly via the sink.
+        state.async_errors.record_error(1, 2, AieErrorOrigin::Core, 69, 10_000);
+        assert!(
+            state.async_errors.last_cache().is_some(),
+            "Tier B cache should be populated after record_error"
+        );
+
+        // Synthesize a Tier C wedge directly via the Context API.
+        let diag = TdrDiagnosis {
+            core_states: vec![],
+            dma_states: vec![],
+            data_in_flight: false,
+            pending_syncs: vec![],
+        };
+        state.contexts[0].mark_failed(WedgeReason::Quiescent, diag);
+        assert!(state.contexts[0].is_failed(), "context must be Failed after mark_failed");
+
+        // Both surfaces are now populated. Reset clears both.
+        state.reset_context(DEFAULT_CONTEXT).expect("reset");
+        assert!(state.contexts[0].is_connected(), "context must return to Connected after reset");
+        assert!(state.async_errors.last_cache().is_none(), "Tier B cache should be cleared by reset_context");
+    }
+}
