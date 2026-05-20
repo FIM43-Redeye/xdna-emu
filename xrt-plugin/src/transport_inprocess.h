@@ -42,7 +42,7 @@ public:
 
     uint64_t alloc_buffer(size_t size) override;
     void     free_buffer(uint64_t addr) override;
-    void     reset_context() override;
+    void     reset_context(uint32_t context_id) override;
     void     write_memory(uint64_t addr, const void* data,
                           size_t size) override;
     void     read_memory(uint64_t addr, void* data,
@@ -139,7 +139,7 @@ private:
     // -- Future FFI (may be nullptr) ----------------------------------------
     using fn_alloc_buffer       = uint64_t (*)(XdnaEmuHandle*, uint64_t);
     using fn_free_buffer        = Result (*)(XdnaEmuHandle*, uint64_t);
-    using fn_reset_context      = Result (*)(XdnaEmuHandle*);
+    using fn_reset_context      = Result (*)(XdnaEmuHandle*, uint32_t);
     using fn_set_start_col      = Result (*)(XdnaEmuHandle*, uint8_t);
     using fn_read_register      = uint32_t (*)(XdnaEmuHandle*, uint16_t,
                                                uint16_t, uint32_t);

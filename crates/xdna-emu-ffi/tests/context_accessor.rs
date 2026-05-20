@@ -53,3 +53,30 @@ fn get_context_state_rejects_null_handle() {
     };
     assert_eq!(rc, -1, "expected null-handle");
 }
+
+#[test]
+fn reset_context_with_default_id_succeeds_on_fresh_handle() {
+    let handle = unsafe { xdna_emu_create() };
+    let rc = unsafe { xdna_emu_reset_context(handle, 0) };
+    assert_eq!(rc, XdnaEmuResult::Success);
+    unsafe { xdna_emu_destroy(handle) };
+}
+
+#[test]
+fn reset_context_returns_error_for_invalid_id() {
+    let handle = unsafe { xdna_emu_create() };
+    let rc = unsafe { xdna_emu_reset_context(handle, 999) };
+    assert_eq!(rc, XdnaEmuResult::ExecutionError);
+    unsafe { xdna_emu_destroy(handle) };
+}
+
+#[test]
+fn reset_context_with_same_id_twice_succeeds() {
+    // Idempotent: calling reset on an already-Connected context is fine.
+    let handle = unsafe { xdna_emu_create() };
+    let rc1 = unsafe { xdna_emu_reset_context(handle, 0) };
+    assert_eq!(rc1, XdnaEmuResult::Success);
+    let rc2 = unsafe { xdna_emu_reset_context(handle, 0) };
+    assert_eq!(rc2, XdnaEmuResult::Success);
+    unsafe { xdna_emu_destroy(handle) };
+}

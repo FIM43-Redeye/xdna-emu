@@ -456,7 +456,7 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
         ctx_start_col = static_cast<uint16_t>(it->second.start_col);
       }
     }
-    m_transport->reset_context();
+    m_transport->reset_context(0);
     // reset_context wipes per-context tile state but leaves start_col
     // intact on the emulator side; re-apply our hw_context's start_col
     // before any load_pdi so the CDO's logical->physical shift is correct.

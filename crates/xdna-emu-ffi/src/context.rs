@@ -50,3 +50,42 @@ pub unsafe extern "C" fn xdna_emu_get_context_state(
     *out_completed_counter = ctx.completed_counter;
     0
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{XdnaEmuResult, xdna_emu_create, xdna_emu_destroy, xdna_emu_reset_context};
+
+    #[test]
+    fn reset_context_transitions_failed_context_to_connected() {
+        // After a wedge marks context Failed, reset_context restores Connected.
+        let handle = unsafe { xdna_emu_create() };
+
+        // Mark context 0 as Failed via direct device access (pub(crate) paths
+        // are visible here since we are inside the xdna_emu_ffi crate).
+        {
+            let handle_mut = unsafe { &mut *handle };
+            let device = handle_mut.engine.device_mut();
+            use xdna_emu_core::device::tdr::{TdrDiagnosis, WedgeReason};
+            device.contexts[0].mark_failed(
+                WedgeReason::Quiescent,
+                TdrDiagnosis {
+                    core_states: vec![],
+                    dma_states: vec![],
+                    data_in_flight: false,
+                    pending_syncs: vec![],
+                },
+            );
+            assert!(device.contexts[0].is_failed());
+        }
+
+        let rc = unsafe { xdna_emu_reset_context(handle, 0) };
+        assert_eq!(rc, XdnaEmuResult::Success);
+
+        {
+            let handle_ref = unsafe { &*handle };
+            assert!(handle_ref.engine.device().contexts[0].is_connected());
+        }
+
+        unsafe { xdna_emu_destroy(handle) };
+    }
+}

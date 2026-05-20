@@ -31,8 +31,9 @@ public:
     /// Reset per-hw-context tile state (locks, DMAs, stream switches, cores)
     /// to mirror a real-HW column reset on hw_context teardown / re-creation.
     /// Host memory contents are preserved -- callers re-upload via the BO
-    /// sync path. No-op if the backing FFI symbol is not available.
-    virtual void reset_context() {}
+    /// sync path. Fails loudly at dlopen time if the backing FFI symbol is
+    /// not present (resolve_required convention -- stale .so fails early).
+    virtual void reset_context(uint32_t context_id) {}
 
     /// Set the partition's physical start column.  CDO streams and
     /// runtime_sequence ops use partition-relative (logical) columns; the

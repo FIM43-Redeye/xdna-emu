@@ -238,29 +238,41 @@ pub unsafe extern "C" fn xdna_emu_destroy(handle: *mut XdnaEmuHandle) {
     }
 }
 
-/// Reset per-hw-context tile state to match a column reset on real HW.
+/// Reset a context for a fresh submission.
 ///
-/// Clears locks, DMA channel queues + BD configs, stream switch routing,
-/// and resets cores. Host memory (BO contents) is intentionally preserved
-/// -- the user-side XRT layer drives BO contents via sync_to_device.
+/// Transitions the named context from Failed -> Connected (no-op on already-
+/// Connected), clears its Tier B async-error sink, and calls the engine's
+/// per-context reset to wipe stale tile state.
 ///
-/// Call this on `xrt::hw_context` creation so each fresh context starts
-/// on a clean column. Without it, stale lock state from a prior run can
-/// leave a DMA acquire blocked indefinitely on the next run.
+/// Call this between submissions, and especially after observing a
+/// `WedgeRecovered` halt -- the next `xdna_emu_run` entry rejects a non-
+/// Connected context.
 ///
-/// Returns `Success` on a clean reset, `InvalidHandle` for a null handle.
+/// Returns:
+/// - `Success` on a clean reset
+/// - `InvalidHandle` for a null handle
+/// - `ExecutionError` for an invalid context_id
 ///
 /// # Safety
 /// - `handle` must be valid
 #[no_mangle]
-pub unsafe extern "C" fn xdna_emu_reset_context(handle: *mut XdnaEmuHandle) -> XdnaEmuResult {
+pub unsafe extern "C" fn xdna_emu_reset_context(
+    handle: *mut XdnaEmuHandle,
+    context_id: u32,
+) -> XdnaEmuResult {
     if handle.is_null() {
         return XdnaEmuResult::InvalidHandle;
     }
 
     let handle = &mut *handle;
+    use xdna_emu_core::device::context::ContextId;
+    let cid = ContextId(context_id);
+    if handle.engine.device_mut().reset_context(cid).is_err() {
+        log::error!("xdna_emu_reset_context: invalid context_id {}", context_id);
+        return XdnaEmuResult::ExecutionError;
+    }
     handle.engine.reset_for_new_context();
-    log::debug!("xdna_emu_reset_context: cleared per-context tile state");
+    log::debug!("xdna_emu_reset_context: cleared per-context tile state for ctx {}", context_id);
     XdnaEmuResult::Success
 }
 

@@ -107,7 +107,7 @@ emu_transport_inprocess::emu_transport_inprocess(const std::string& lib_path)
     // Resolve optional/future symbols -- may not exist yet.
     sym_alloc_buffer_       = resolve_optional<fn_alloc_buffer>("xdna_emu_alloc_buffer");
     sym_free_buffer_        = resolve_optional<fn_free_buffer>("xdna_emu_free_buffer");
-    sym_reset_context_      = resolve_optional<fn_reset_context>("xdna_emu_reset_context");
+    sym_reset_context_      = resolve_required<fn_reset_context>("xdna_emu_reset_context");
     sym_set_start_col_      = resolve_optional<fn_set_start_col>("xdna_emu_set_start_col");
     sym_read_register_      = resolve_optional<fn_read_register>("xdna_emu_read_register");
     sym_write_register_     = resolve_optional<fn_write_register>("xdna_emu_write_register");
@@ -237,16 +237,10 @@ void emu_transport_inprocess::free_buffer(uint64_t addr)
     // instance is destroyed.
 }
 
-void emu_transport_inprocess::reset_context()
+void emu_transport_inprocess::reset_context(uint32_t context_id)
 {
     std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
-    // Optional symbol -- older emulator builds will not export it. The
-    // call site (create_ctx) has been wired up unconditionally; if the
-    // symbol is missing we silently fall through, matching the prior
-    // behavior where the EMU had no context-reset hook.
-    if (!sym_reset_context_)
-        return;
-    Result rc = sym_reset_context_(emu_);
+    Result rc = sym_reset_context_(emu_, context_id);
     check(rc, "reset_context");
 }
 
