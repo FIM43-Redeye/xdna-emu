@@ -34,18 +34,12 @@ _calling_user() {
 }
 
 _resolve_dbg() {
-    # If the documented BDF moved (GPU swap renumbers buses), find it.
-    if [[ ! -d "$DBG" ]]; then
-        local found
-        found=$(ls -d /sys/kernel/debug/accel/*/ 2>/dev/null | head -1 | sed 's:/$::')
-        if [[ -n "$found" ]]; then
-            echo "$found"
-            return 0
-        fi
-        echo "FATAL: amdxdna debugfs node not found under /sys/kernel/debug/accel/" >&2
-        return 1
-    fi
-    echo "$DBG"
+    # /sys/kernel/debug is mode 0700 root, so we can't stat or list it
+    # as the calling user.  Always emit $DBG and let the pkexec block
+    # validate it (it'll error visibly if the path is wrong).  Override
+    # with AMDXDNA_DEBUGFS_DIR=/sys/kernel/debug/accel/<bdf> if the BDF
+    # moves after a hardware swap.
+    echo "${AMDXDNA_DEBUGFS_DIR:-$DBG}"
 }
 
 _capture_common() {

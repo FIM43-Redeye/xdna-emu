@@ -1,7 +1,10 @@
 # amdxdna TDR recovery incomplete on Phoenix dev box
 
-**Status:** Open. Investigation gated on the next reboot of the dev box;
-the device is currently wedged from the run that triggered this finding.
+**Status:** Investigated 2026-05-20 (after the first reboot). Root cause
+located, all userspace recovery primitives proven non-functional on
+Phoenix, reboot confirmed as the only recovery. See "Investigation
+results" section below. Forensics preserved at
+`build/experiments/2026-05-20-amdxdna-tdr-forensics/`.
 
 **Related:**
 [`2026-05-13-chain-exec-npu-silent-drop-on-phoenix.md`](2026-05-13-chain-exec-npu-silent-drop-on-phoenix.md)
@@ -254,3 +257,151 @@ in `aie2_ctx_runqueue.c`), and either land a workaround in our test
 infrastructure or report a reproducible bug upstream to AMD. If
 `fw_reload` works, ideally bake it into a post-TDR recovery script so
 the dev box doesn't need a full reboot for every cascade.
+
+## Investigation results (2026-05-20, post-reboot)
+
+Triggered the wedge by running `debug_halt_probe/peano/test.exe`
+directly (bypassing the bridge harness to keep the pkexec count
+minimal). Captured full forensic state at
+`build/experiments/2026-05-20-amdxdna-tdr-forensics/`.
+
+### Q1 — dmesg TDR sequence (answered, but corrects the doc)
+
+The single-context recovery path is **NOT** `aie2_rq_stop_all` +
+`aie2_rq_restart_all`. Actual sequence (full trace in
+`wedged-post-debug-halt-probe/dmesg-pre-probe.txt`):
+
+```
+T+0.000  Job submitted on user mailbox 136, opcode 0x18, msg_id 0x1d000001
+T+1.545  Poll: ctx.88452.1 @[1, 1] submitted 1 completed 0
+T+3.594  Poll: same
+T+5.641  Poll: same
+T+5.641  aie2_tdr_work: Device isn't making progress... Count 1 timeout 2 dump_only 0
+T+5.641  aie2_dump_ctx: Dumping ctx (sub=1, comp=0)
+T+5.641  Get app health unsupported for the device or firmware version
+T+5.641  ctx.88452.1 @[1, 1] stop          ← per-ctx stop (not stop_all)
+T+5.641  xdna_mailbox.136: IRQ disabled and RX work cancelled
+T+5.641  Send destroy on MGMT mailbox 145 (opcode 0x3)
+T+10.83  xdna_send_msg_wait: Wait for completion timeout       ← MGMT mailbox dead
+T+10.83  aie2_destroy_context: destroy context failed, ret -62
+T+10.83  Driver continues teardown anyway; releases mailbox 136
+T+10.83  User-space process tears down BOs and exits
+```
+
+Notable: no `aie2_rq_stop_all` or `aie2_rq_restart_all` ever fires.
+The per-ctx destroy path runs first and hangs on MGMT mailbox; the
+escalation to rq_stop_all/restart_all (which the original doc and
+earlier reading of `aie2_tdr_force_recover()` predicted) does not
+happen. Either the driver path is different on this version or the
+escalation requires the per-ctx destroy to succeed first.
+
+### Q2 — mailbox alive after TDR? (NO, both channels dead)
+
+Direct evidence from `wedged-post-debug-halt-probe/`:
+
+- `nputest` probe: `aie2_check_protocol_version: Failed to get protocol version, ret -62` (`-ETIME`)
+- `get_app_health`: timed out (also: driver itself logs `Get app health unsupported for the device or firmware version` during TDR dump on this FW)
+- TDR's own destroy command on MGMT mailbox 145: timed out
+- All subsequent submissions fail at `DRM_IOCTL_AMDXDNA_EXEC_CMD IOCTL failed (err=-5): Input/output error`
+
+Both mailbox channels are dead. The doc's earlier framing ("MGMT
+mailbox might be alive even if user-context mailbox is dead") does
+not hold here — they go down together because the firmware is hung
+at a level below per-channel state.
+
+Caveat for future captures: `get_app_health` is not a reliable
+post-TDR liveness probe on Phoenix because the FW (1.5.5.391) doesn't
+support that mailbox opcode in normal operation either. The
+authoritative liveness probe is `echo 1 > nputest` → check dmesg for
+`NPU health check failed: ret=-62` (dead) vs success.
+
+### Q3 — did the firmware reload? (NO)
+
+`fw_version` unchanged at `1.5.5.391` throughout. No recovery action
+ever caused a FW reload.
+
+### Q4 — tdr_control state after the cascade
+
+`counter=1, status=wait, progress=0`. **The driver's TDR state
+machine thinks the recovery cycle completed successfully.** There is
+no machine-readable indication that the recovery action's
+mailbox-level operations actually failed. The kernel-side bookkeeping
+is decoupled from FW-side actual recovery — a structural blind spot.
+
+After "successful" TDR, `aie2_tdr_detect` returns false on subsequent
+polls (no contexts → none stuck → no need to recover again), so TDR
+doesn't fire repeatedly.
+
+### Q5 — do the userspace recovery primitives work? (NO, none of them)
+
+| Primitive | Result | Why |
+|-----------|--------|-----|
+| `echo recover > tdr_control` | NO-OP | Counter doesn't increment; no contexts to operate on (already destroyed by initial TDR). Subsequent submission still EIO. |
+| `echo 1 > fw_reload` | NO-OP | **`fw_reload` is in `aie4_pci.c` only — it does not exist in the aie2 path.** The module param accepts the write (it's a global), but the aie2 driver never reads it. Effectively a no-op on Phoenix. |
+| `modprobe -r amdxdna && modprobe amdxdna` | **PARTIAL** | modprobe -r completed without hanging in `synchronize_srcu` (good — the documented risk did not materialize here). modprobe loaded the kernel module successfully. **But the device probe failed at `aie2_smu_start: Access power failed, ret -22` (`smu cmd 4 failed, 0xff`) — the on-NPU SMU controller is wedged.** Per CLAUDE.md the SMU lives downstream of the PCIe reset domain, so SBR wouldn't fix it either. |
+
+### Additional findings
+
+**A. The `synchronize_srcu` modprobe -r wedge risk is failure-mode-specific.**
+The CLAUDE.md operational note about modprobe -r wedging in
+`drm_dev_unplug -> synchronize_srcu` did NOT materialize for the
+MGMT-mailbox-death-via-debug-halt-probe failure mode. It may be
+specific to AIE_RW_ACCESS memtile-read timeout poisoning (where the
+user-context mailbox dies mid-submission with outstanding work
+holding the rq lock). When TDR has run to "completion" first
+(bookkeeping-wise) and released the user mailbox cleanly, modprobe -r
+appears safe. This is a useful distinction worth carrying forward.
+
+**B. `fw_reload` is AIE4-only — remove from Phoenix recovery
+suggestions.** `aie4_pci.c:44` defines `fw_reload` as a static
+int module param used in `aie4_fw_reload()`. There is no equivalent
+in `aie2_pci.c`. The CLAUDE.md operational notes and this doc's
+earlier "diagnostic surface" section should be updated to reflect
+that on Phoenix, `fw_reload` cannot recover anything.
+
+**C. Both mailbox channels (user 136, MGMT 145) die together** when
+debug_halt_probe wedges the FW. They are not independent — once the
+FW is hung at the level the probe targets, all mailbox traffic stops
+regardless of channel type.
+
+**D. The full failure mode for debug_halt_probe on Phoenix:**
+user submission → FW silent on user mailbox → TDR detects after 2s →
+TDR's per-ctx destroy times out on MGMT mailbox → driver bookkeeping
+marks ctx destroyed; FW is actually stuck → SMU also wedged → no
+PCIe-layer recovery possible. Reboot is the only path.
+
+### Open questions still standing
+
+- **Q1 sub-question: when DOES `aie2_rq_stop_all` / `aie2_rq_restart_all`
+  fire?** The code exists; presumably escalates from per-ctx stop when
+  multiple contexts are stuck, or on a second TDR cycle. We only have
+  one-ctx single-cycle evidence so far.
+- **Q7 (mailbox_polling=1)**: Not exercised. Per "B" above this is
+  unlikely to help (polling can't get a response from dead FW), but
+  worth one cheap data point on a future investigation.
+- **Is there a way to provoke a real FW reload without rebooting?**
+  Suspend/resume drops the SoC to retention voltage and clears
+  on-NPU controller state (per CLAUDE.md) — but S3 suspend is broken
+  on this devbox (post-resume frequency issues). On other Phoenix
+  systems where S3 works, that may be the recovery primitive that
+  avoids reboot.
+
+### Status
+
+Findings documented. No code changes proposed yet — the upstream
+amdxdna driver has structural limitations that we don't have leverage
+to fix locally (SMU recovery requires either FW changes or a hardware
+reset domain that includes the SMU). The actionable items from this
+investigation are:
+
+1. CLAUDE.md operational notes update: clarify that `fw_reload` is
+   AIE4-only and shouldn't be in the Phoenix recovery escalation
+   chain.
+2. CLAUDE.md note that the `synchronize_srcu` modprobe -r risk
+   appears to be specific to AIE_RW_ACCESS-style poisoning, not
+   generic to any wedge.
+3. Future: test `mailbox_polling=1` (cheap experiment, possibly worth
+   one more debug_halt_probe cycle on a future session).
+4. Future: investigate whether AMD has a Phoenix FW that supports the
+   `app_health` opcode (would give us a better post-TDR liveness
+   probe than `nputest`).

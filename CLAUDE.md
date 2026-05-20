@@ -730,7 +730,7 @@ When the NPU wedges, recovery escalates through:
 
 1. **Driver reload** -- handles most TDR recoveries:
    ```bash
-   pkexec modprobe -r amdxdna && pkexec modprobe amdxdna
+   pkexec sh -c 'modprobe -r amdxdna && modprobe amdxdna'
    ```
    **Caveat: not safe in a poisoned-mailbox state.** If the user-context
    mailbox has been killed by an `AIE_RW_ACCESS` memtile-read timeout
@@ -743,6 +743,21 @@ When the NPU wedges, recovery escalates through:
    `docs/superpowers/findings/2026-05-13-chain-exec-npu-silent-drop-on-phoenix.md`).
    We removed `tdr_dump_ctx=1` on 2026-05-13: TDR now actually recovers,
    so `modprobe -r` is again attempted-first when the NPU wedges.
+
+   **2026-05-20 refinement** (see
+   `docs/superpowers/findings/2026-05-20-amdxdna-tdr-recovery-incomplete-on-phoenix.md`):
+   The `synchronize_srcu` wedge risk appears to be **failure-mode-specific**
+   to AIE_RW_ACCESS-style poisoning, where the user mailbox dies
+   mid-submission with outstanding work holding the rq lock.  For the
+   debug_halt_probe failure mode (TDR runs to "completion"
+   bookkeeping-wise and releases the user mailbox cleanly, but FW and
+   MGMT mailbox are dead), `modprobe -r` completed in ~10s without
+   hanging.  modprobe re-probe still fails (`aie2_smu_start: Access
+   power failed`, SMU wedged downstream of PCIe reset domain), so
+   reboot is still the only recovery, but at least the reload attempt
+   itself is safe to try.  Also: **`fw_reload` is AIE4-only**
+   (`aie4_pci.c:44`); on Phoenix the module param is accepted but does
+   nothing.  Don't include it in the Phoenix recovery escalation chain.
 
 2. **Bridge PM-cycle** -- reset the upstream bridge function:
    ```bash
