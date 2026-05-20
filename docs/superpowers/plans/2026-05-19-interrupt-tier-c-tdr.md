@@ -83,7 +83,7 @@ pub mod detector;
 
 - [ ] **Step 4: Build to verify module wiring**
 
-Run: `cargo build -p xdna-emu-core`
+Run: `cargo build -p xdna-emu`
 Expected: clean build (empty modules compile).
 
 - [ ] **Step 5: Commit**
@@ -182,14 +182,14 @@ git rm src/testing/quiescence.rs
 
 - [ ] **Step 5: Run the lifted unit tests at their new path**
 
-Run: `cargo test --lib -p xdna-emu-core device::tdr::detector`
+Run: `cargo test --lib -p xdna-emu device::tdr::detector`
 Expected: 5 tests pass (test_quiescence_threshold_counting, test_quiescence_reset_on_progress, test_diagnosis_display_all_halted, test_diagnosis_display_waiting_core, plus any other tests that were in the file).
 
 If the test count differs from what the old `src/testing/quiescence.rs` had, you've lost a test — re-check the move.
 
 - [ ] **Step 6: Run full library tests to catch any missed import**
 
-Run: `TMPDIR=/tmp/claude-1000 cargo test --lib -p xdna-emu-core`
+Run: `TMPDIR=/tmp/claude-1000 cargo test --lib -p xdna-emu`
 Expected: all pass. If a build error or test failure appears, it's because some consumer of `QuiescenceDiagnosis` (renamed) or `crate::testing::quiescence` (deleted) wasn't updated. Fix and re-run.
 
 - [ ] **Step 7: Commit**
@@ -266,7 +266,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify failure**
 
-Run: `cargo test --lib -p xdna-emu-core device::tdr::tests`
+Run: `cargo test --lib -p xdna-emu device::tdr::tests`
 Expected: compile errors — `WedgeReason`, `TdrVerdict` don't exist yet.
 
 - [ ] **Step 3: Define the enums + snapshot structs + skeleton in `src/device/tdr/mod.rs`**
@@ -412,7 +412,7 @@ Actually no — simpler: defer this `use` line and the `context_id` field until 
 
 - [ ] **Step 5: Run tests to verify they now pass**
 
-Run: `cargo test --lib -p xdna-emu-core device::tdr::tests`
+Run: `cargo test --lib -p xdna-emu device::tdr::tests`
 Expected: 3 tests pass (the two enum-derive tests + the Wedged construction test).
 
 - [ ] **Step 6: Commit**
@@ -492,7 +492,7 @@ Append to the `#[cfg(test)] mod tests` in `src/device/tdr/mod.rs`:
 
 - [ ] **Step 2: Run tests to verify failure**
 
-Run: `cargo test --lib -p xdna-emu-core device::tdr::tests::classify`
+Run: `cargo test --lib -p xdna-emu device::tdr::tests::classify`
 Expected: compile error — `classify` not defined.
 
 - [ ] **Step 3: Implement `classify` (minimum to pass these two)**
@@ -532,7 +532,7 @@ Add to `impl TdrDetector` in `src/device/tdr/mod.rs`:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib -p xdna-emu-core device::tdr::tests::classify`
+Run: `cargo test --lib -p xdna-emu device::tdr::tests::classify`
 Expected: both tests pass.
 
 - [ ] **Step 5: Commit**
@@ -622,7 +622,7 @@ Append to `mod tests`:
 
 - [ ] **Step 2: Run tests to verify failure**
 
-Run: `cargo test --lib -p xdna-emu-core device::tdr::tests::classify`
+Run: `cargo test --lib -p xdna-emu device::tdr::tests::classify`
 Expected: the 3 new tests fail (classify returns Progressing instead).
 
 - [ ] **Step 3: Extend `classify` with the MaskPollUnsatisfied path**
@@ -664,7 +664,7 @@ In `src/device/tdr/mod.rs`, update the `classify` method to insert the MaskPollU
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib -p xdna-emu-core device::tdr::tests::classify`
+Run: `cargo test --lib -p xdna-emu device::tdr::tests::classify`
 Expected: all classify tests (Task 4's 2 + these 3) pass.
 
 - [ ] **Step 5: Commit**
@@ -771,7 +771,7 @@ Append to `mod tests`:
 
 - [ ] **Step 2: Run tests to verify failure**
 
-Run: `cargo test --lib -p xdna-emu-core device::tdr::tests::classify`
+Run: `cargo test --lib -p xdna-emu device::tdr::tests::classify`
 Expected: the new Quiescent + Stalled tests fail (classify returns Progressing); the PollExhausted test may pass already (it expects MaskPollUnsatisfied, which is already implemented).
 
 - [ ] **Step 3: Extend `classify` with Wedged{Quiescent} and Wedged{Stalled} paths**
@@ -891,7 +891,7 @@ Now extend `classify` (in `mod.rs`) to call these and emit Wedged verdicts:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib -p xdna-emu-core device::tdr::tests::classify`
+Run: `cargo test --lib -p xdna-emu device::tdr::tests::classify`
 Expected: all classify tests pass (Task 4's 2 + Task 5's 3 + Task 6's 3 = 8 total).
 
 - [ ] **Step 5: Commit**
@@ -986,7 +986,7 @@ Append to `mod tests`:
 
 - [ ] **Step 2: Run tests to verify they pass**
 
-Run: `cargo test --lib -p xdna-emu-core device::tdr::tests::classify`
+Run: `cargo test --lib -p xdna-emu device::tdr::tests::classify`
 Expected: all 3 new tests pass on the existing classify implementation (precedence is built into the if-chain order from Tasks 4-6).
 
 If any fail, the precedence is wrong — fix the order in `classify` and re-run.
@@ -1183,10 +1183,10 @@ In `src/device/tdr/mod.rs`:
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test --lib -p xdna-emu-core device::context::tests`
+Run: `cargo test --lib -p xdna-emu device::context::tests`
 Expected: 6 tests pass.
 
-Run: `cargo test --lib -p xdna-emu-core device::tdr`
+Run: `cargo test --lib -p xdna-emu device::tdr`
 Expected: all tdr tests still pass after the ContextId tightening.
 
 - [ ] **Step 5: Commit**
@@ -1259,7 +1259,7 @@ fn device_state_reset_context_transitions_failed_to_connected() {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test --lib -p xdna-emu-core device::state::tests::device_state`
+Run: `cargo test --lib -p xdna-emu device::state::tests::device_state`
 Expected: compile errors — `state.contexts`, `state.tdr_detectors`, `state.reset_context` don't exist.
 
 - [ ] **Step 3: Add fields, constructor population, and reset method**
@@ -1337,10 +1337,10 @@ pub enum ResetContextError {
 
 - [ ] **Step 4: Run to verify passing**
 
-Run: `cargo test --lib -p xdna-emu-core device::state`
+Run: `cargo test --lib -p xdna-emu device::state`
 Expected: the 2 new tests pass; existing state tests unaffected.
 
-Run: `TMPDIR=/tmp/claude-1000 cargo test --lib -p xdna-emu-core`
+Run: `TMPDIR=/tmp/claude-1000 cargo test --lib -p xdna-emu`
 Expected: full library passes.
 
 - [ ] **Step 5: Commit**
@@ -2361,7 +2361,7 @@ fn tier_b_and_tier_c_are_independent_paths() {
 
 - [ ] **Step 2: Run**
 
-Run: `TMPDIR=/tmp/claude-1000 cargo test --lib -p xdna-emu-core device::state::tests::tier_c`
+Run: `TMPDIR=/tmp/claude-1000 cargo test --lib -p xdna-emu device::state::tests::tier_c`
 Expected: 2 tests pass.
 
 - [ ] **Step 3: Commit**
