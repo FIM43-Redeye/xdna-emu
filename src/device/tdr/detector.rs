@@ -95,6 +95,18 @@ impl QuiescenceDetector {
         Self { quiescent_cycles: 0, threshold }
     }
 
+    pub(crate) fn bump_quiescent_cycle(&mut self) {
+        self.quiescent_cycles += 1;
+    }
+
+    pub(crate) fn reset_quiescent_cycles(&mut self) {
+        self.quiescent_cycles = 0;
+    }
+
+    pub(crate) fn threshold_met(&self) -> bool {
+        self.quiescent_cycles >= self.threshold
+    }
+
     /// Check whether the system is quiescent this cycle.
     ///
     /// Must be called once per cycle in the run loop. Returns:
@@ -275,6 +287,23 @@ impl StallDetector {
     /// Create a new stall detector with the given cycle threshold.
     pub fn new(threshold: u64) -> Self {
         Self { last_dma_bytes: 0, last_lock_releases: 0, cycles_since_progress: 0, threshold }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.cycles_since_progress = 0;
+    }
+
+    /// Returns true when threshold met (stalled).
+    pub(crate) fn note_progress(&mut self, dma_bytes: u64, lock_releases: u64) -> bool {
+        if dma_bytes != self.last_dma_bytes || lock_releases != self.last_lock_releases {
+            self.last_dma_bytes = dma_bytes;
+            self.last_lock_releases = lock_releases;
+            self.cycles_since_progress = 0;
+            false
+        } else {
+            self.cycles_since_progress += 1;
+            self.cycles_since_progress >= self.threshold
+        }
     }
 
     /// Check whether the system has stalled this cycle.

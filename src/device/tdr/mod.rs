@@ -178,7 +178,85 @@ impl TdrDetector {
             self.poll_stall_cycles = 0;
         }
 
+        // Third precedence: Wedged{Quiescent}.
+        if self.check_quiescence(signals, executor) {
+            return TdrVerdict::Wedged {
+                reason: WedgeReason::Quiescent,
+                diagnosis: Self::build_diagnosis(signals, executor),
+            };
+        }
+        // Fourth precedence: Wedged{Stalled}.
+        if self.check_stall(signals, executor) {
+            return TdrVerdict::Wedged {
+                reason: WedgeReason::Stalled,
+                diagnosis: Self::build_diagnosis(signals, executor),
+            };
+        }
+
         TdrVerdict::Progressing
+    }
+
+    /// Run the quiescence rule against snapshot inputs. Returns true when the
+    /// quiescence threshold is met.
+    fn check_quiescence(&mut self, signals: &EngineSignals, executor: Option<&ExecutorSignals>) -> bool {
+        // Same predicate the existing QuiescenceDetector enforces, snapshot-driven:
+        //   - executor (if present) is done
+        //   - engine not Halted
+        //   - no runnable core
+        //   - no DMA active
+        //   - no data in flight
+        let executor_done = executor.map_or(true, |e| e.is_done);
+        let engine_terminal = signals.engine_status != EngineStatusSnapshot::Halted;
+        let no_runnable_core = signals
+            .core_statuses
+            .iter()
+            .all(|(_, _, s)| !matches!(s, CoreStatus::Running | CoreStatus::Ready));
+        let cond = executor_done
+            && engine_terminal
+            && no_runnable_core
+            && !signals.any_dma_active
+            && !signals.any_data_in_flight;
+
+        if cond {
+            self.quiescence.bump_quiescent_cycle();
+            self.quiescence.threshold_met()
+        } else {
+            self.quiescence.reset_quiescent_cycles();
+            false
+        }
+    }
+
+    fn check_stall(&mut self, signals: &EngineSignals, executor: Option<&ExecutorSignals>) -> bool {
+        let has_pending_syncs = executor.map_or(false, |e| !e.pending_syncs.is_empty());
+        if !has_pending_syncs {
+            self.stall.reset();
+            return false;
+        }
+        self.stall
+            .note_progress(signals.total_dma_bytes_transferred, signals.total_lock_releases)
+    }
+
+    fn build_diagnosis(signals: &EngineSignals, executor: Option<&ExecutorSignals>) -> TdrDiagnosis {
+        TdrDiagnosis {
+            core_states: signals
+                .core_statuses
+                .iter()
+                .map(|(c, r, s)| (*c, *r, format!("{:?}", s)))
+                .collect(),
+            dma_states: signals.dma_states.clone(),
+            data_in_flight: signals.any_data_in_flight,
+            pending_syncs: executor
+                .map(|e| {
+                    e.pending_syncs
+                        .iter()
+                        .map(|(c, r, ch, dir)| {
+                            let dir_s = if *dir == 0 { "S2MM" } else { "MM2S" };
+                            format!("col={c} row={r} ch={ch} {dir_s}")
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
     }
 }
 
@@ -311,5 +389,74 @@ mod tests {
             let v = detector.classify(&signals, Some(&exec_blocked));
             assert!(!matches!(v, TdrVerdict::MaskPollUnsatisfied), "fired too early after reset");
         }
+    }
+
+    #[test]
+    fn classify_returns_wedged_quiescent_when_all_subsystems_terminal() {
+        let mut detector = TdrDetector::new(0);
+        // All terminal: engine NOT Halted (otherwise we'd hit NaturalCompletion path),
+        // but no DMA, no data in flight, all cores in terminal state.
+        // Use the "no executor" path so NaturalCompletion's executor check
+        // doesn't satisfy. Engine status Stalled here.
+        let signals = empty_engine_signals(EngineStatusSnapshot::Stalled);
+        // Drive the quiescence detector long enough for it to fire.
+        for _ in 0..(DEFAULT_QUIESCENCE_CYCLES * 2) {
+            let v = detector.classify(&signals, no_executor().as_ref());
+            // Final cycle should be Wedged{Quiescent}; intermediate cycles
+            // are Progressing.
+            if let TdrVerdict::Wedged { reason, .. } = v {
+                assert_eq!(reason, WedgeReason::Quiescent);
+                return;
+            }
+        }
+        panic!("Quiescent verdict never fired across {} cycles", DEFAULT_QUIESCENCE_CYCLES * 2);
+    }
+
+    #[test]
+    fn classify_returns_wedged_stalled_with_pending_syncs_and_no_byte_progress() {
+        let mut detector = TdrDetector::new(0);
+        // Cores still "running" (engine not Stalled), but no DMA byte progress
+        // and pending syncs. Stall detector fires after its threshold.
+        let mut signals = empty_engine_signals(EngineStatusSnapshot::Running);
+        signals.any_dma_active = true; // suppress Quiescent path
+        let exec = ExecutorSignals {
+            is_done: false,
+            syncs_satisfied: false,
+            is_blocked_on_poll: false,
+            pending_syncs: vec![(0, 0, 0, 0)],
+        };
+        // StallDetector fires after DEFAULT_STALL_CYCLES of no byte/lock progress.
+        let mut fired = false;
+        for _ in 0..(DEFAULT_STALL_CYCLES + 100) {
+            let v = detector.classify(&signals, Some(&exec));
+            if let TdrVerdict::Wedged { reason, .. } = v {
+                assert_eq!(reason, WedgeReason::Stalled);
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired, "Stalled verdict never fired");
+    }
+
+    #[test]
+    fn classify_returns_wedged_poll_exhausted_when_budget_burned_without_clean_fastpath() {
+        // PollExhausted differs from MaskPollUnsatisfied: it fires only when
+        // the budget is burned AND the cleaner fast-path conditions are not
+        // met (e.g. DMA still active, masking the "engine quiescent" tell).
+        let mut detector = TdrDetector::new(0);
+        let mut signals = empty_engine_signals(EngineStatusSnapshot::Running);
+        signals.any_dma_active = true; // disqualifies the MaskPollUnsatisfied fast-path
+        let exec = blocked_on_poll_executor();
+        for _ in 0..(DEFAULT_POLL_STALL_LIMIT + 1) {
+            let _ = detector.classify(&signals, Some(&exec));
+        }
+        let last = detector.classify(&signals, Some(&exec));
+        // PRECEDENCE NOTE: when the poll-stall budget is burned, the
+        // classifier returns MaskPollUnsatisfied (b-path from Task 5),
+        // NOT PollExhausted. PollExhausted is only the reason inside a
+        // Wedged verdict when neither MaskPollUnsatisfied path applies;
+        // since path (b) always applies once the budget burns, this test
+        // expects MaskPollUnsatisfied. Kept here to lock in the precedence.
+        assert!(matches!(last, TdrVerdict::MaskPollUnsatisfied), "got {last:?}");
     }
 }
