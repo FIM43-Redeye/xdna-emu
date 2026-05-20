@@ -150,6 +150,24 @@ public:
     virtual std::string dump_tile_state(uint16_t col, uint16_t row)
     { return {}; }
 
+    // -- Tier B async-error delivery ----------------------------------------
+    // 24-byte mirror of `struct amdxdna_async_error` (drm/amdxdna_accel.h).
+    // Layout matches `XdnaEmuAsyncError` in
+    // crates/xdna-emu-ffi/src/async_errors.rs (field order + sizes are
+    // load-bearing across the FFI).
+    struct AsyncErrorRecord {
+        uint64_t err_code     = 0;
+        uint64_t ts_us        = 0;
+        uint64_t ex_err_code  = 0;
+    };
+
+    /// Pull the most recent async-error record, if any.  Returns true and
+    /// fills @out when a record is available; returns false when the
+    /// cache is empty or the backing transport does not implement the
+    /// query (older builds, future socket backend).
+    virtual bool get_last_async_error(AsyncErrorRecord& /*out*/)
+    { return false; }
+
     // -- Factory -------------------------------------------------------------
 
     /// Create an in-process transport by dlopen'ing the emulator shared lib.

@@ -1187,8 +1187,32 @@ get_info_array(amdxdna_drm_get_array& arg) const
   }
 
   case DRM_AMDXDNA_HW_LAST_ASYNC_ERR: {
-    // No async errors in emulation.
-    arg.num_element = 0;
+    // amdxdna_drm_get_array exposes a single "max" pair (element_size,
+    // num_element) and a raw u64 buffer pointer.  The async-error query
+    // always returns at most one fixed-size element.
+    if (arg.element_size < sizeof(amdxdna_async_error) || arg.num_element < 1)
+      shim_err(EINVAL, "get_info_array: buffer too small for async error");
+
+    if (!m_transport) {
+      arg.num_element = 0;
+      arg.element_size = sizeof(amdxdna_async_error);
+      break;
+    }
+
+    emu_transport::AsyncErrorRecord rec{};
+    if (m_transport->get_last_async_error(rec)) {
+      auto* out = reinterpret_cast<amdxdna_async_error*>(arg.buffer);
+      out->err_code    = rec.err_code;
+      out->ts_us       = rec.ts_us;
+      out->ex_err_code = rec.ex_err_code;
+      arg.num_element = 1;
+    } else {
+      // No record yet, or transport doesn't implement the query --
+      // same surface as the prior no-op so callers polling for errors
+      // see "none" rather than EINVAL.
+      arg.num_element = 0;
+    }
+    arg.element_size = sizeof(amdxdna_async_error);
     break;
   }
 

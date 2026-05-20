@@ -83,6 +83,9 @@ public:
     bool        set_log_level(const std::string& level) override;
     std::string dump_tile_state(uint16_t col, uint16_t row) override;
 
+    // -- Tier B async-error delivery ----------------------------------------
+    bool        get_last_async_error(AsyncErrorRecord& out) override;
+
 private:
     // -----------------------------------------------------------------------
     // FFI function-pointer types.
@@ -164,6 +167,21 @@ private:
     using fn_dump_tile_state    = int32_t (*)(XdnaEmuHandle*, uint16_t,
                                              uint16_t, char*, uint32_t);
 
+    // -- Tier B async-error FFI --------------------------------------------
+    // 24-byte mirror of `struct amdxdna_async_error` and Rust's
+    // `XdnaEmuAsyncError` (crates/xdna-emu-ffi/src/async_errors.rs).
+    // Field order and sizes are load-bearing across the C ABI; appending
+    // new fields is safe, reordering is not.
+    struct AsyncErrorWire {
+        uint64_t err_code;
+        uint64_t ts_us;
+        uint64_t ex_err_code;
+    };
+    // Returns 1 if a record is copied to *out, 0 if cache empty,
+    // -1 null-handle, -2 null-out.
+    using fn_get_last_async_error =
+        int32_t (*)(XdnaEmuHandle*, AsyncErrorWire*);
+
     // -----------------------------------------------------------------------
     // State
     // -----------------------------------------------------------------------
@@ -232,6 +250,9 @@ private:
     fn_get_dma_ch_stats   sym_get_dma_ch_stats_   = nullptr;
     fn_set_log_level      sym_set_log_level_      = nullptr;
     fn_dump_tile_state    sym_dump_tile_state_     = nullptr;
+
+    // -- Tier B async-error (required) -------------------------------------
+    fn_get_last_async_error sym_get_last_async_error_ = nullptr;
 
     // -----------------------------------------------------------------------
     // Helpers

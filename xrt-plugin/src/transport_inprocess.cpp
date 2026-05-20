@@ -124,6 +124,12 @@ emu_transport_inprocess::emu_transport_inprocess(const std::string& lib_path)
     sym_set_log_level_      = resolve_optional<fn_set_log_level>("xdna_emu_set_log_level");
     sym_dump_tile_state_    = resolve_optional<fn_dump_tile_state>("xdna_emu_dump_tile_state");
 
+    // Tier B async-error cache reader -- required.  A stale libxdna_emu.so
+    // lacking this symbol will fail dlopen-time resolution loudly, matching
+    // the rebuild-plugin / refresh-dkms discipline (see CLAUDE.md).
+    sym_get_last_async_error_ = resolve_required<fn_get_last_async_error>(
+        "xdna_emu_get_last_async_error");
+
     // Create the emulator instance.
     emu_ = sym_create_();
     if (!emu_) {
@@ -479,6 +485,32 @@ std::string emu_transport_inprocess::dump_tile_state(uint16_t col,
     if (len > 0 && static_cast<uint32_t>(len) < sizeof(buf))
         return std::string(buf, static_cast<size_t>(len));
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// Tier B async-error delivery
+// ---------------------------------------------------------------------------
+
+bool emu_transport_inprocess::get_last_async_error(AsyncErrorRecord& out)
+{
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
+    // sym_get_last_async_error_ is resolved with resolve_required at ctor
+    // time, so it cannot be nullptr here -- but guard anyway for safety.
+    if (!sym_get_last_async_error_)
+        return false;
+
+    // AsyncErrorWire and AsyncErrorRecord share the same field layout
+    // (three contiguous uint64_t).  Reinterpret-cast is safe; see the
+    // header comment on AsyncErrorWire.
+    AsyncErrorWire wire{};
+    int32_t rc = sym_get_last_async_error_(emu_, &wire);
+    if (rc != 1)
+        return false;  // 0 = empty, -1/-2 = FFI error -- both report "no record"
+
+    out.err_code    = wire.err_code;
+    out.ts_us       = wire.ts_us;
+    out.ex_err_code = wire.ex_err_code;
+    return true;
 }
 
 } // namespace xdna_emu

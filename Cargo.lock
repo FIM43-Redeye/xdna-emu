@@ -4778,6 +4778,7 @@ dependencies = [
  "env_logger",
  "log",
  "tempfile",
+ "xdna-archspec",
  "xdna-emu",
 ]
 
