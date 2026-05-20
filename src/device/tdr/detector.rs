@@ -24,6 +24,7 @@ pub enum QuiescenceStatus {
 }
 
 /// Diagnostic snapshot of system state at the moment deadlock is declared.
+#[derive(Debug)]
 pub struct TdrDiagnosis {
     /// Per-core status: (col, row, description).
     pub core_states: Vec<(u8, u8, String)>,
