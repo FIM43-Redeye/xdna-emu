@@ -85,8 +85,11 @@ during a real wedge yet.
 - `vbnv`, `device_type`, `fw_version` — confirm FW didn't crash/reload
   silently.
 
-**debugfs** (`/sys/kernel/debug/dri/<id>/`, mode 0700 owned root —
-**requires `pkexec` for any read**):
+**debugfs** (`/sys/kernel/debug/accel/<bdf>/`, e.g.
+`/sys/kernel/debug/accel/0000:c6:00.1/`, mode 0700 owned root —
+**requires `pkexec` for any read**. The newer DRM accel subsystem
+hangs the amdxdna debugfs node here, not under
+`/sys/kernel/debug/dri/<id>/` like older accel drivers.):
 - `tdr_control` — read shows TDR state (`started`, `counter`, `status`,
   `progress`, `timeout_sec`, `dump_only`). Write `dump` to force
   context dump; write `recover` to force recovery.
@@ -106,14 +109,24 @@ during a real wedge yet.
   health check (calls `aie2_check_protocol_version()`), reports pass /
   fail to dmesg. **This is the single most useful "is the mailbox
   alive?" probe.**
-- `powerstate`, `dpm_level` — SMU power state + DPM level.
+- `dump_fw_log`, `dump_fw_trace` — non-`_buffer` variants exposed
+  alongside the buffer dumps; treat as the same data via a different
+  entry point.
+
+Note: `msg_queue`, `powerstate`, `dpm_level` were listed in earlier
+revisions of this doc but are not actually present in the current
+amdxdna debugfs node on this kernel — verified by `find` post-reboot
+2026-05-20. The diagnostic surface is just what's enumerated above.
 
 **Tracepoints** (`/sys/kernel/tracing/events/amdxdna_trace/`, requires
-pkexec to enable). Our existing `tools/amdxdna-trace.sh` already
-captures `xdna_job`, `mbox_set_tail`, `mbox_set_head`,
-`mbox_irq_handle`, `mbox_rx_worker`, `uc_irq_handle`, `uc_wakeup`. The
-driver also exposes `amdxdna_debug_point` and `mbox_poll_handle` which
-we don't currently include.
+pkexec to enable). On this kernel only two tracepoints are exposed:
+`amdxdna_debug_point` and `__amdxdna_trace_point`. The richer set
+(`xdna_job`, `mbox_set_tail`, `mbox_set_head`, `mbox_irq_handle`,
+`mbox_rx_worker`, `uc_irq_handle`, `uc_wakeup`, `mbox_poll_handle`)
+listed in earlier revisions of this doc requires a build that defines
+those tracepoints — our DKMS build does not. If we want them, we'd
+have to enable them in the driver source and rebuild via
+`./build.sh -release -refresh_dkms`.
 
 **TDR code path** lives in
 `/home/triple/npu-work/xdna-driver/src/driver/amdxdna/aie2_tdr.c`:
@@ -128,14 +141,37 @@ we don't currently include.
 
 ## Post-reboot capture procedure
 
-Before re-running `debug_halt_probe`, get a clean baseline:
+The amdxdna debugfs node is `/sys/kernel/debug/accel/<bdf>/` — find
+the BDF with `ls /sys/kernel/debug/accel/`. On this dev box it is
+`0000:c6:00.1`; substitute as needed. To get fw_log and fw_trace
+content, the corresponding module params (`fw_log_level`,
+`fw_trace_size`, `fw_trace_categories`, `poll_fw_trace`) must be set
+*before* the run — they're not enabled by default and unset params
+produce empty buffers (`dd: IO error: Invalid input`).
 
 ```bash
-# Baseline (clean device, no submissions yet)
-cat /sys/class/accel/accel0/{vbnv,device_type,fw_version}
-pkexec cat /sys/kernel/debug/dri/*/tdr_control /sys/kernel/debug/dri/*/ctx_rq \
-           /sys/kernel/debug/dri/*/ringbuf /sys/kernel/debug/dri/*/msg_queue \
-           > /tmp/claude-1000/amdxdna-baseline.txt
+# Optional: enable FW logging before baseline (else fw_log/fw_trace
+# come back empty). Persist by adding to /etc/modprobe.d/amdxdna.conf
+# and reloading the module.
+pkexec sh -c 'echo 3 > /sys/module/amdxdna/parameters/fw_log_level &&
+              echo 65536 > /sys/module/amdxdna/parameters/fw_trace_size'
+
+# Baseline (clean device, no submissions yet) — scripted form:
+tools/amdxdna-debug-capture.sh baseline /tmp/claude-1000/amdxdna-baseline
+```
+
+The helper resolves the debugfs BDF automatically, runs the privileged
+half in a single pkexec, and chowns the output back to the calling
+user. Manual equivalent for reference:
+
+```bash
+DBG=/sys/kernel/debug/accel/0000:c6:00.1
+B=/tmp/claude-1000/amdxdna-baseline-$(date +%Y%m%d-%H%M%S) && mkdir -p $B
+cat /sys/class/accel/accel0/device/{vbnv,device_type,fw_version} > $B/userland.txt
+pkexec sh -c "cp $DBG/{tdr_control,ctx_rq,ringbuf} $B/
+              dd if=$DBG/dump_fw_log_buffer of=$B/fw_log.bin status=none
+              dd if=$DBG/dump_fw_trace_buffer of=$B/fw_trace.bin status=none
+              chown -R $USER:$USER $B"
 ```
 
 Then run **just** `debug_halt_probe` with the trace daemon already
@@ -150,28 +186,29 @@ the second submission will hang for ~7.7s). Then, **before any
 recovery action**, capture forensics:
 
 ```bash
-# Forensics (device is wedged, TDR has fired)
-sudo dmesg --since "5 min ago" | tee /tmp/claude-1000/amdxdna-dmesg.txt
-pkexec cat /sys/kernel/debug/dri/*/tdr_control \
-           > /tmp/claude-1000/amdxdna-tdr-state.txt
-pkexec cat /sys/kernel/debug/dri/*/ctx_rq \
-           > /tmp/claude-1000/amdxdna-ctx-rq.txt
-pkexec cat /sys/kernel/debug/dri/*/ringbuf \
-           /sys/kernel/debug/dri/*/msg_queue \
-           > /tmp/claude-1000/amdxdna-mbox.txt
-cat /sys/class/accel/accel0/fw_version    # did FW reload?
-# Mailbox liveness probe (may hang if mailbox is dead):
-pkexec sh -c 'echo 1 > /sys/kernel/debug/dri/*/nputest'   # check dmesg for "NPU health check"
-# FW log / trace (safe — these are RAM buffer reads):
-pkexec dd if=/sys/kernel/debug/dri/*/dump_fw_log_buffer of=/tmp/claude-1000/amdxdna-fw-log.bin
-pkexec dd if=/sys/kernel/debug/dri/*/dump_fw_trace_buffer of=/tmp/claude-1000/amdxdna-fw-trace.bin
-# app_health requires mailbox — try only if nputest passed:
-pkexec cat /sys/kernel/debug/dri/*/get_app_health \
-           > /tmp/claude-1000/amdxdna-app-health.txt
-# Try manual recover via debugfs (does what TDR did):
-pkexec sh -c 'echo recover > /sys/kernel/debug/dri/*/tdr_control'
-# Re-test:
-XDNA_EMU=  ./mlir-aie/build/test/npu-xrt/add_one_objFifo/peano/test.exe   # known-good
+tools/amdxdna-debug-capture.sh wedged /tmp/claude-1000/amdxdna-wedged
+```
+
+The helper runs the privileged half in a single pkexec: it copies
+tdr_control / ctx_rq / ringbuf, dumps FW log+trace buffers, runs the
+mailbox liveness probe (`echo 1 > nputest`), captures get_app_health
+with a 5s timeout (so a dead mailbox doesn't hang the script), and
+chowns everything back. dmesg captures (pre-probe + nputest verdict)
+land in the same output dir.
+
+Then try recovery experiments, in order. Test with a known-good kernel
+after each — `add_one_objFifo/peano` is the canonical "object-fifo
+shape" we use to confirm the device services real submissions:
+
+```bash
+# (a) Driver-level recover (does what TDR did internally)
+DBG=/sys/kernel/debug/accel/0000:c6:00.1
+pkexec sh -c "echo recover > $DBG/tdr_control"
+XDNA_EMU= ./mlir-aie/build/test/npu-xrt/add_one_objFifo/peano/test.exe
+
+# (b) FW reload — the last hammer before reboot
+pkexec sh -c 'echo 1 > /sys/module/amdxdna/parameters/fw_reload'
+XDNA_EMU= ./mlir-aie/build/test/npu-xrt/add_one_objFifo/peano/test.exe
 ```
 
 ## Open questions the capture is meant to answer
