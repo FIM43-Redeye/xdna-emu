@@ -145,14 +145,38 @@ impl TdrDetector {
     /// (`poll_stall_cycles`, quiescence/stall thresholds) per cycle.
     pub fn classify(&mut self, signals: &EngineSignals, executor: Option<&ExecutorSignals>) -> TdrVerdict {
         // Highest precedence: natural completion.
-        if signals.engine_status == EngineStatusSnapshot::Halted {
-            if let Some(exec) = executor {
-                if exec.is_done && exec.syncs_satisfied {
-                    return TdrVerdict::NaturalCompletion;
-                }
-            } else if !signals.any_dma_active && !signals.any_data_in_flight {
+        //
+        // Two completion shapes:
+        //   (a) engine Halted (cores done, no DMA active) -- the canonical
+        //       clean exit. With executor signals, also require is_done +
+        //       syncs_satisfied; without, fall back to any_dma_active /
+        //       any_data_in_flight.
+        //   (b) engine Stalled (cores done, but DMA channels still
+        //       AcquiringLock past the engine's stall_threshold without
+        //       byte/lock/instruction progress) AND executor confirms
+        //       is_done + syncs_satisfied. Object-fifo kernels routinely
+        //       leave producer/consumer DMAs spinning on lock acquires
+        //       for an iteration that never arrives -- the kernel's
+        //       defined work is done, the spinning is a bookkeeping
+        //       artifact (HW papers over it via host driver teardown).
+        //       Without this branch the engine's Stalled status falls
+        //       through to Wedged{Stalled}, a false positive that
+        //       previously surfaced on add_one_objFifo and friends.
+        if let Some(exec) = executor {
+            if exec.is_done
+                && exec.syncs_satisfied
+                && matches!(
+                    signals.engine_status,
+                    EngineStatusSnapshot::Halted | EngineStatusSnapshot::Stalled
+                )
+            {
                 return TdrVerdict::NaturalCompletion;
             }
+        } else if signals.engine_status == EngineStatusSnapshot::Halted
+            && !signals.any_dma_active
+            && !signals.any_data_in_flight
+        {
+            return TdrVerdict::NaturalCompletion;
         }
 
         // Second precedence: MaskPollUnsatisfied.
@@ -333,6 +357,23 @@ mod tests {
     fn classify_returns_natural_completion_when_engine_halted_and_syncs_satisfied() {
         let mut detector = TdrDetector::new(DEFAULT_CONTEXT);
         let signals = empty_engine_signals(EngineStatusSnapshot::Halted);
+        let exec = natural_completion_executor();
+        let verdict = detector.classify(&signals, Some(&exec));
+        assert!(matches!(verdict, TdrVerdict::NaturalCompletion), "got {verdict:?}");
+    }
+
+    #[test]
+    fn classify_returns_natural_completion_when_engine_stalled_but_executor_done_and_syncs_satisfied() {
+        // The object-fifo completion shape: cores halted, executor done,
+        // every Sync'd channel finished -- but a producer/consumer pair
+        // is still spinning on an Own(N) lock for an iteration that
+        // never arrives. The engine's coordinator flips to Stalled once
+        // stall_threshold elapses without byte/lock/instruction progress;
+        // without this branch the classifier would surface Wedged{Stalled},
+        // a false positive (the kernel's defined work is genuinely done).
+        let mut detector = TdrDetector::new(DEFAULT_CONTEXT);
+        let mut signals = empty_engine_signals(EngineStatusSnapshot::Stalled);
+        signals.any_dma_active = true; // leftover spinners
         let exec = natural_completion_executor();
         let verdict = detector.classify(&signals, Some(&exec));
         assert!(matches!(verdict, TdrVerdict::NaturalCompletion), "got {verdict:?}");
