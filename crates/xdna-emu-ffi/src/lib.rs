@@ -79,9 +79,12 @@ pub(crate) struct AsyncErrorCallback {
     pub func: async_errors::XdnaEmuAsyncErrorCallback,
     pub user_data: *mut std::ffi::c_void,
 }
-// SAFETY: handle access is serialized by the plugin's mutex; the user_data
-// pointer is opaque to us and only ever passed back to the registered C
-// callback on the same thread that registered it.
+// SAFETY: Both Send and Sync rest on the same invariant: handle access
+// is serialized by the plugin's mutex (see XdnaEmuHandle docs in this
+// file). So neither concurrent ownership (Send) nor concurrent reference
+// (Sync) is possible in practice. The user_data pointer is opaque to us
+// and only ever passed back to the registered C callback on the same
+// thread that registered it.
 unsafe impl Send for AsyncErrorCallback {}
 unsafe impl Sync for AsyncErrorCallback {}
 
