@@ -2899,6 +2899,38 @@ print_report() {
 # ---------------------------------------------------------------------------
 
 main() {
+  # ---- Phase 0: amdxdna kernel-trace daemon (hoisted from Phase 3) -------
+  #
+  # The daemon needs one pkexec auth. Asking for it here -- before Phase 1
+  # discovery, Phase 1b plugin rebuild, and Phase 2 compile -- means the
+  # prompt fires at t~=0 while the user is still attentive at the terminal,
+  # not several minutes in (when it's easy to mis-click and dismiss). The
+  # daemon idles through Phases 1/1b/2 capturing nothing useful, but the
+  # buffered tracepoint volume is negligible compared to the HW phase it
+  # exists to cover.
+  #
+  # Declared at function scope so the end-of-main cleanup can see them
+  # even on --no-hw / --no-amdxdna-trace paths (set -u safety).
+  local amdxdna_sentinel="" amdxdna_daemon_pid=""
+
+  if $RUN_HW && $AMDXDNA_TRACE; then
+    amdxdna_sentinel=$(mktemp /tmp/claude-1000/amdxdna-trace.bridge.XXXXXX 2>/dev/null \
+                       || mktemp /tmp/amdxdna-trace.bridge.XXXXXX)
+    pkexec "$EMU_ROOT/tools/amdxdna-trace.sh" daemon \
+      "$amdxdna_sentinel" $$ "$RESULTS_DIR" amdxdna &
+    amdxdna_daemon_pid=$!
+    # Give the daemon time to set up tracing. 1s is comfortable -- pkexec
+    # auth takes orders of magnitude longer than the actual setup.
+    sleep 1
+    if ! kill -0 $amdxdna_daemon_pid 2>/dev/null; then
+      info "WARN: amdxdna-trace daemon failed to start; continuing without it"
+      AMDXDNA_TRACE=false
+      rm -f "$amdxdna_sentinel"
+      amdxdna_sentinel=""
+      amdxdna_daemon_pid=""
+    fi
+  fi
+
   # ---- Phase 1: Discover -------------------------------------------------
 
   mapfile -t tests < <(discover_tests)
@@ -3101,39 +3133,14 @@ main() {
   # -j$(nproc); doing HW solo makes its already-fast tests finish quickly
   # while EMU then has the box to itself.
   local emu_pool_pid=""
-  # Hoisted out of the `if $RUN_HW` block: the post-Phase-5 cleanup at
-  # the bottom of main() references these unconditionally, and `set -u`
-  # would otherwise trip on `--no-hw` runs that never enter the HW arm.
-  local amdxdna_sentinel="" amdxdna_daemon_pid=""
+  # amdxdna_sentinel + amdxdna_daemon_pid declared and launched at the top
+  # of main() (Phase 0); referenced unconditionally by end-of-main cleanup.
 
   # Launch HW with NPU job pool (if enabled).
   if $RUN_HW; then
     local tdr_suspect_file="$RESULTS_DIR/tdr_suspects.log"
     : > "$tdr_suspect_file"
 
-    # Capture amdxdna kernel tracepoints (xdna_job, mailbox, IRQ, fence)
-    # for the duration of the HW phase.  Single-pkexec daemon design:
-    # the daemon spawned here holds tracing on for the whole HW phase
-    # under one auth, and snapshots+disables to $RESULTS_DIR/amdxdna.*
-    # when we remove the sentinel below.  No second pkexec, no auth-gap
-    # delay mid-sweep.  Daemon's EXIT trap also handles parent-died and
-    # signal-killed cases.
-    if $AMDXDNA_TRACE; then
-      amdxdna_sentinel=$(mktemp /tmp/claude-1000/amdxdna-trace.bridge.XXXXXX 2>/dev/null \
-                         || mktemp /tmp/amdxdna-trace.bridge.XXXXXX)
-      pkexec "$EMU_ROOT/tools/amdxdna-trace.sh" daemon \
-        "$amdxdna_sentinel" $$ "$RESULTS_DIR" amdxdna &
-      amdxdna_daemon_pid=$!
-      # Give the daemon time to set up tracing before HW jobs start.
-      # 1s is comfortable -- pkexec auth takes orders of magnitude longer
-      # than the actual setup.
-      sleep 1
-      if ! kill -0 $amdxdna_daemon_pid 2>/dev/null; then
-        info "WARN: amdxdna-trace daemon failed to start; continuing without it"
-        AMDXDNA_TRACE=false
-        rm -f "$amdxdna_sentinel"
-      fi
-    fi
     local hw_total=$(( ${#hw_parallel_jobs[@]} + ${#hw_quarantine_jobs[@]} ))
     local hw_done=0
 
