@@ -1536,6 +1536,7 @@ impl InterpreterEngine {
     /// run's insts.bin, but locks/BDs need this explicit reset because no
     /// existing register write paths reach them.
     pub fn reset_for_new_context(&mut self) {
+        self.device.async_errors.clear();
         self.reset();
         self.device.array.reset();
     }

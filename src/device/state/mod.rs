@@ -90,16 +90,23 @@ pub struct DeviceState {
     /// trace-packet headers and per-tile state line up with the real
     /// hardware's physical placement.
     pub start_col: u8,
+    /// Tier B async-error subsystem: cache + per-column rings + drain queue.
+    /// Populated from `state::effects::apply_tile_local_effects` when an
+    /// error-category event is generated.
+    pub async_errors: crate::device::async_errors::AsyncErrorSink,
 }
 
 impl DeviceState {
     /// Create a new device state for the given architecture configuration.
     pub fn new(arch: Arc<dyn ArchConfig>) -> Self {
+        let array = TileArray::new(arch);
+        let num_cols = array.cols() as usize;
         Self {
-            array: TileArray::new(arch),
+            array,
             stats: CdoStats::default(),
             pending_core_enables: Vec::new(),
             start_col: 0,
+            async_errors: crate::device::async_errors::AsyncErrorSink::new(num_cols),
         }
     }
 
@@ -308,5 +315,24 @@ impl<'a> TileLookup for NeighborView<'a> {
     #[inline]
     fn tile(&self, col: usize, row: usize) -> Option<&Tile> {
         NeighborView::tile(self, col, row)
+    }
+}
+
+#[cfg(test)]
+mod async_errors_integration_tests {
+    use super::*;
+    use xdna_archspec::aie2::async_errors::AieErrorOrigin;
+
+    #[test]
+    fn device_state_exposes_async_error_sink() {
+        let dev = DeviceState::new_npu1();
+        assert!(dev.async_errors.last_cache().is_none());
+    }
+
+    #[test]
+    fn record_error_through_sink_reaches_cache() {
+        let mut dev = DeviceState::new_npu1();
+        dev.async_errors.record_error(1, 2, AieErrorOrigin::Core, 69, 10_000);
+        assert!(dev.async_errors.last_cache().is_some());
     }
 }
