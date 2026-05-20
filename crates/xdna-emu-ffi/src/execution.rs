@@ -86,8 +86,6 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
 
     let handle = &mut *handle;
 
-    use xdna_emu_core::interpreter::engine::EngineStatus;
-
     let mut cycles = 0u64;
     let max = handle.max_cycles;
     // max == 0 means unbounded: the loop runs until a natural exit point.
@@ -101,6 +99,27 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
             format!("{} cycles", max)
         }
     );
+
+    // Entry guard: context(0) must be Connected. Otherwise the caller
+    // forgot to call xdna_emu_reset_context after a prior wedge.
+    {
+        use xdna_emu_core::device::context::DEFAULT_CONTEXT;
+        let device = handle.engine.device();
+        let ctx = &device.contexts[DEFAULT_CONTEXT.0 as usize];
+        if !ctx.is_connected() {
+            log::error!(
+                "xdna_emu_run: context {:?} not Connected; \
+                 caller must reset_context before re-submitting",
+                DEFAULT_CONTEXT
+            );
+            return XdnaEmuExecStatus {
+                result: XdnaEmuResult::ExecutionError,
+                cycles_executed: 0,
+                halted: false,
+                halt_reason: XdnaEmuHaltReason::Error,
+            };
+        }
+    }
 
     // Warm-up: let cores run to their first blocking point before
     // processing NPU instructions.  On real hardware, the core has been
@@ -129,38 +148,13 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         log::info!("Core warm-up: {} cycles (all cores at first blocking point)", cycles);
     }
 
-    // Track whether we exited via a natural halt (Completed) or fell through
-    // to budget exhaustion.
+    // Per-cycle: build snapshots, classify, dispatch on verdict.
+    use xdna_emu_core::device::tdr::{TdrVerdict, WedgeReason, TdrDiagnosis};
+    use xdna_emu_core::device::context::DEFAULT_CONTEXT;
+
     let mut natural_halt = false;
-    // Set when the run terminated because an injected MASKPOLL can never be
-    // satisfied (the engine went quiescent with the poll still blocked). This
-    // is the expected EMU outcome for the debug_halt_probe's halt-sync
-    // MASKPOLL: Core_Status[16] (DEBUG_HALT) never sets on the emulator, so
-    // the poll is unsatisfiable by design. We end deterministically here
-    // rather than spinning until the stall detector trips ~100k cycles later.
     let mut maskpoll_unsatisfied = false;
-    // Bounded poll-stall counter: consecutive cycles the executor has been
-    // parked in BlockedOnPoll with no executor progress. A *satisfiable*
-    // poll resolves within a few cycles of whatever writes the polled
-    // register running; the debug_halt_probe MASKPOLL (Core_Status[16] /
-    // DEBUG_HALT) is unsatisfiable on EMU because the breakpoint-arming
-    // control-packet writes are dropped, so nothing the run loop steps can
-    // ever change the polled value. This counter is the deterministic,
-    // DMA-churn-independent "no monotonic progress" signal the spec §4.2
-    // contract requires -- it does NOT depend on any_dma_active() (a
-    // starved ctrl-out DMA re-routing the same packet is not progress) or
-    // the ~100k generic stall threshold (too slow for the bridge
-    // wall-clock). The window is generous enough that any legitimately
-    // satisfiable poll resolves first, but far below the bridge timeout.
-    //
-    // Known edge case: this bound is safe for firmware-issued MASKPOLLs,
-    // which resolve within a few cycles of the writing event (DMA-completion
-    // status, a control-packet register write, etc.). A hypothetical future
-    // MASKPOLL polling a register written only by a long (>20k-cycle)
-    // compute-core computation would be terminated prematurely. No such user
-    // exists today; revisit the bound if one is added.
-    let mut poll_stall_cycles: u64 = 0;
-    const POLL_STALL_LIMIT: u64 = 20_000;
+    let mut wedged: Option<(WedgeReason, TdrDiagnosis)> = None;
 
     'run: while unbounded || cycles < max {
         // Publish the current simulation cycle to the tile array before the
@@ -188,42 +182,12 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
             npu_progressed = matches!(result, xdna_emu_core::npu::AdvanceResult::Progressed);
         }
 
-        // Bounded poll-stall detection (spec §4.2 graceful poll-termination).
-        // The counter advances purely because the executor is BlockedOnPoll
-        // each cycle: while blocked on a poll, try_advance() returns Blocked
-        // (never Progressed), so npu_progressed is necessarily false in this
-        // branch -- there is no separate "no progress" condition to test
-        // (asserted below). It is reset the moment the executor is no longer
-        // blocked on a poll (a poll that does eventually satisfy never trips
-        // this). Crossing the bound means the poll is unsatisfiable: end
-        // deterministically with the distinct terminal reason. This is the
-        // DMA-churn-independent signal -- any_dma_active() was rejected
-        // because a starved ctrl-out DMA re-routing the same packet keeps it
-        // true forever, and the ~100k generic stall threshold is too slow
-        // for the bridge wall-clock. We do NOT fake the polled register,
-        // pretend the core debug-halted, or skip the OP_READ -- the executor
-        // stays BlockedOnPoll, no further instruction is issued, and the
-        // run.wait() path returns cleanly.
-        if handle.npu_executor.is_blocked_on_poll() {
-            // Invariant: BlockedOnPoll => try_advance() returned Blocked, so
-            // the executor cannot have progressed this cycle.
-            debug_assert!(!npu_progressed, "executor reported BlockedOnPoll yet npu_progressed=true");
-            poll_stall_cycles += 1;
-            if poll_stall_cycles >= POLL_STALL_LIMIT {
-                log::info!(
-                    "MASKPOLL unsatisfiable: executor BlockedOnPoll with no progress \
-                     for {} cycles (total {} cycles) -- terminating deterministically \
-                     (MaskPollUnsatisfied)",
-                    poll_stall_cycles,
-                    cycles
-                );
-                maskpoll_unsatisfied = true;
-                natural_halt = true;
-                break 'run;
-            }
-        } else {
-            poll_stall_cycles = 0;
-        }
+        // Invariant from try_advance(): BlockedOnPoll => try_advance returned
+        // Blocked, so npu_progressed must be false. Preserved from pre-refactor.
+        debug_assert!(
+            !(handle.npu_executor.is_blocked_on_poll() && npu_progressed),
+            "executor reported BlockedOnPoll yet npu_progressed=true"
+        );
 
         // When the NPU executor progressed (executed an instruction that may
         // configure DMA or write START_QUEUE), flush in-flight control packet
@@ -234,6 +198,14 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
             handle.engine.flush_ctrl_packets();
         }
 
+        // DMA-only path: when no cores are enabled the engine halts
+        // immediately, but the NPU executor may still be configuring and
+        // triggering DMA. force_running() lets step() keep advancing DMA
+        // and stream switches. No-op when the engine is already Running.
+        if !handle.npu_executor.is_done() {
+            handle.engine.force_running();
+        }
+
         handle.engine.step();
         // Tier B: drain newly-recorded async errors and fire the registered
         // callback (if any). Mirrors the flush_trace_to_host pattern -- FFI
@@ -241,71 +213,32 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         crate::async_errors::fire_async_callbacks_for(handle);
         cycles += 1;
 
-        if handle.engine.status() == EngineStatus::Halted {
-            // Graceful poll-termination contract (debug_halt_probe MASKPOLL,
-            // spec §4.2). If the executor is parked in BlockedOnPoll and the
-            // engine is otherwise quiescent (cores halted, no DMA in flight),
-            // the poll can never become satisfied -- nothing left running can
-            // change the polled register. End deterministically with a
-            // distinct terminal reason instead of force-running until the
-            // stall detector trips ~100k cycles later. We do NOT fake the
-            // polled register, pretend the core halted, or skip to the next
-            // instruction: the executor stays BlockedOnPoll and no further
-            // instruction (the OP_READ push) is issued.
-            if handle.npu_executor.is_blocked_on_poll() && !handle.engine.device().array.any_dma_active() {
-                log::info!(
-                    "MASKPOLL unsatisfiable: engine quiescent (cores halted, no DMA) \
-                     with poll still blocked after {} cycles -- terminating deterministically",
-                    cycles
-                );
+        // Build per-cycle snapshots and classify.
+        let engine_signals = build_engine_signals(&handle.engine);
+        let executor_signals = build_executor_signals(&mut handle.npu_executor, &handle.engine);
+
+        let device = handle.engine.device_mut();
+        let detector = &mut device.tdr_detectors[DEFAULT_CONTEXT.0 as usize];
+        let verdict = detector.classify(&engine_signals, Some(&executor_signals));
+
+        match verdict {
+            TdrVerdict::Progressing => continue,
+            TdrVerdict::NaturalCompletion => {
+                log::info!("Natural completion after {} cycles", cycles);
+                natural_halt = true;
+                break 'run;
+            }
+            TdrVerdict::MaskPollUnsatisfied => {
+                log::info!("MASKPOLL unsatisfiable after {} cycles", cycles);
                 maskpoll_unsatisfied = true;
                 natural_halt = true;
                 break 'run;
             }
-
-            // For DMA-only tests (no cores loaded), the engine halts
-            // immediately because no cores are enabled.  But the NPU
-            // executor may still be issuing instructions that configure
-            // and trigger DMA, or DMA channels may already be running.
-            // Keep running while executor has pending work or syncs are
-            // unsatisfied.
-            let executor_pending = !handle.npu_executor.is_done()
-                || !handle.npu_executor.syncs_satisfied(handle.engine.device());
-            if executor_pending || handle.engine.device().array.any_dma_active() {
-                handle.engine.force_running();
-            } else {
-                log::info!("Cores halted after {} cycles", cycles);
-                natural_halt = true;
+            TdrVerdict::Wedged { reason, diagnosis } => {
+                log::warn!("Tier C wedge after {} cycles: {:?} -- {}", cycles, reason, diagnosis);
+                wedged = Some((reason, diagnosis));
                 break 'run;
             }
-        }
-
-        if handle.engine.status() == EngineStatus::Stalled {
-            log::warn!("Stall detected after {} cycles: no monotonic progress", cycles);
-            // Defensive: if the stall is because the executor is parked in an
-            // unsatisfiable BlockedOnPoll (e.g. a path where the core never
-            // reaches the Halted status), still surface the distinct
-            // MASKPOLL-unsatisfied terminal reason rather than a generic
-            // Completed -- the cause is the same unsatisfiable poll.
-            if handle.npu_executor.is_blocked_on_poll() {
-                log::info!("Stall is an unsatisfiable MASKPOLL -- terminating as MaskPollUnsatisfied");
-                maskpoll_unsatisfied = true;
-            }
-            // A stall is treated as a natural (if unhappy) halt — the run
-            // completed as far as the emulator can tell, not a budget cut.
-            natural_halt = true;
-            break 'run;
-        }
-
-        // Check if all NPU sync conditions are satisfied.  On real
-        // hardware, firmware considers execution complete when the sync
-        // fires -- DMA channels may still be running (trace channels,
-        // BD chains with use_next_bd, etc.) but the host transfer is
-        // done.  Do NOT require all DMA to be idle here.
-        if handle.npu_executor.is_done() && handle.npu_executor.syncs_satisfied(handle.engine.device()) {
-            log::info!("All DMA syncs satisfied after {} cycles", cycles);
-            natural_halt = true;
-            break 'run;
         }
     }
 
@@ -314,6 +247,28 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
     // them, then step_data_movement() routes them through the network.
     handle.engine.flush_trace_to_host();
 
+    // On wedge, transition context state.
+    if let Some((reason, diagnosis)) = wedged {
+        let device = handle.engine.device_mut();
+        device.contexts[DEFAULT_CONTEXT.0 as usize].mark_failed(reason, diagnosis);
+        return XdnaEmuExecStatus {
+            result: XdnaEmuResult::Success,
+            cycles_executed: cycles,
+            // halted=true: the run terminated (not still running) -- the
+            // plugin's last_run_complete_ flag should fire so run.wait() exits
+            // its wait loop. The distinction between "completed cleanly" and
+            // "aborted via TDR" is carried by halt_reason, not halted.
+            halted: true,
+            halt_reason: XdnaEmuHaltReason::WedgeRecovered,
+        };
+    }
+
+    // On natural completion, advance the context's completed_counter.
+    if natural_halt && !maskpoll_unsatisfied {
+        let device = handle.engine.device_mut();
+        device.contexts[DEFAULT_CONTEXT.0 as usize].note_submission_complete();
+    }
+
     // `halted` is the run-lifecycle / quiescence indicator -- "the run is
     // done" (cores halted OR all DMA syncs satisfied), which drives the C++
     // plugin's `last_run_complete_` and thus run.wait() returning
@@ -321,32 +276,90 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
     // is Core_Status[16] (DEBUG_HALT), which is never touched/faked here (on
     // EMU it stays unset -- that is the whole point of MaskPollUnsatisfied).
     //
-    // For the MaskPollUnsatisfied path, the poll-stall counter terminates
-    // the run while engine.status() may still be non-Halted (the core is
-    // gated on the objectfifo, never debug-halted). Without this the
-    // poll-stall exit would report halted=false while the logically
-    // identical Halted+!any_dma_active fast path reports halted=true -- the
-    // two termination paths must agree. So set halted=true explicitly for
-    // this case: it means "run terminated deterministically", not
-    // "core debug-halted".
-    let halted = maskpoll_unsatisfied
-        || handle.engine.status() == EngineStatus::Halted
-        || (handle.npu_executor.is_done() && handle.npu_executor.syncs_satisfied(handle.engine.device()));
-
-    // Terminal-reason priority:
-    //  1. MaskPollUnsatisfied: an injected MASKPOLL could never be satisfied
-    //     (debug_halt_probe halt-sync on EMU). Distinct from a generic
-    //     completion so the host harness can treat it as the expected EMU
-    //     baseline rather than misreading absent OP_READ responses.
-    //  2. Completed: natural halt / stalled / syncs satisfied.
-    //  3. Budget: the while-loop condition `cycles >= max` ended the run.
+    // For the MaskPollUnsatisfied path, maskpoll_unsatisfied terminates the
+    // run while the engine may still be non-Halted. Both MaskPollUnsatisfied
+    // termination paths (fast-path via classifier and budget-burn) agree on
+    // halted=true since natural_halt is set in both cases.
+    let halted = maskpoll_unsatisfied || natural_halt;
     let halt_reason = if maskpoll_unsatisfied {
         XdnaEmuHaltReason::MaskPollUnsatisfied
-    } else if natural_halt || halted {
+    } else if natural_halt {
         XdnaEmuHaltReason::Completed
     } else {
         XdnaEmuHaltReason::Budget
     };
 
     XdnaEmuExecStatus { result: XdnaEmuResult::Success, cycles_executed: cycles, halted, halt_reason }
+}
+
+fn build_engine_signals(
+    engine: &xdna_emu_core::interpreter::engine::InterpreterEngine,
+) -> xdna_emu_core::device::tdr::EngineSignals {
+    use xdna_emu_core::device::tdr::{EngineSignals, EngineStatusSnapshot};
+    use xdna_emu_core::interpreter::engine::EngineStatus;
+
+    let status = match engine.status() {
+        EngineStatus::Running => EngineStatusSnapshot::Running,
+        EngineStatus::Halted => EngineStatusSnapshot::Halted,
+        EngineStatus::Stalled => EngineStatusSnapshot::Stalled,
+        _ => EngineStatusSnapshot::Other,
+    };
+    let device = engine.device();
+
+    // Core statuses: compute tiles only (rows 2+). Rows 0 (shim) and 1
+    // (memtile) have no compute cores.
+    let mut core_statuses = Vec::new();
+    for col in 0..device.cols() {
+        for row in 2..device.rows() {
+            if engine.is_core_enabled(col, row) {
+                if let Some(s) = engine.core_status(col, row) {
+                    core_statuses.push((col as u8, row as u8, s));
+                }
+            }
+        }
+    }
+
+    // DMA: present on all tile types (shim, memtile, compute).
+    let mut dma_states = Vec::new();
+    use xdna_emu_core::device::dma::ChannelState;
+    for col in 0..device.cols() {
+        for row in 0..device.rows() {
+            if let Some(dma) = device.array.dma_engine(col as u8, row as u8) {
+                for ch in 0..dma.num_channels() {
+                    let state = dma.channel_state(ch as u8);
+                    if !matches!(state, ChannelState::Idle) {
+                        let desc = dma.channel_fsm_description(ch as u8);
+                        dma_states.push((col as u8, row as u8, ch as u8, desc));
+                    }
+                }
+            }
+        }
+    }
+
+    EngineSignals {
+        engine_status: status,
+        any_dma_active: device.array.any_dma_active(),
+        any_data_in_flight: device.array.any_data_in_flight(),
+        total_dma_bytes_transferred: device.array.total_dma_bytes_transferred(),
+        total_lock_releases: device.array.total_lock_releases(),
+        core_statuses,
+        dma_states,
+    }
+}
+
+fn build_executor_signals(
+    executor: &mut xdna_emu_core::npu::NpuExecutor,
+    engine: &xdna_emu_core::interpreter::engine::InterpreterEngine,
+) -> xdna_emu_core::device::tdr::ExecutorSignals {
+    use xdna_emu_core::device::tdr::ExecutorSignals;
+    ExecutorSignals {
+        is_done: executor.is_done(),
+        syncs_satisfied: executor.syncs_satisfied(engine.device()),
+        is_blocked_on_poll: executor.is_blocked_on_poll(),
+        pending_syncs: executor
+            .pending_syncs()
+            .iter()
+            .map(|s| (s.column, s.row, s.channel, s.direction))
+            .collect(),
+    }
 }
