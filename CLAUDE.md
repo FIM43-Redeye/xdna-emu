@@ -752,12 +752,22 @@ When the NPU wedges, recovery escalates through:
    debug_halt_probe failure mode (TDR runs to "completion"
    bookkeeping-wise and releases the user mailbox cleanly, but FW and
    MGMT mailbox are dead), `modprobe -r` completed in ~10s without
-   hanging.  modprobe re-probe still fails (`aie2_smu_start: Access
-   power failed`, SMU wedged downstream of PCIe reset domain), so
-   reboot is still the only recovery, but at least the reload attempt
-   itself is safe to try.  Also: **`fw_reload` is AIE4-only**
-   (`aie4_pci.c:44`); on Phoenix the module param is accepted but does
-   nothing.  Don't include it in the Phoenix recovery escalation chain.
+   hanging.  modprobe re-probe still fails -- the dmesg `smu cmd 4
+   failed, 0xff` is `SMU_RESP_CMD_FAIL` from the PPSMC convention,
+   meaning the SMU itself is alive and responding but cannot complete
+   POWER_OFF on an NPU whose FW-managed internal state machines are
+   hung.  So reboot is still the only recovery, but at least the
+   reload attempt itself is safe to try.  Also: **`fw_reload` is
+   AIE4-only** (`aie4_pci.c:44`); on Phoenix the module param is
+   accepted but does nothing.  Don't include it in the Phoenix
+   recovery escalation chain.
+
+   The SMU response codes follow PPSMC convention (see also
+   amdgpu's `drivers/gpu/drm/amd/pm/swsmu/smu_cmn.c`): `0x01`=OK,
+   `0xFC`=busy, `0xFD`=bad prereq, `0xFE`=unknown command,
+   `0xFF`=generic fail, `0x00`=no response (SMU dead).  Always read
+   the raw `0x%x` from the dmesg line; the kernel-return `-EINVAL`
+   from `aie_smu_exec` collapses all non-OK codes to one value.
 
 2. **Bridge PM-cycle** -- reset the upstream bridge function:
    ```bash

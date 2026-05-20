@@ -332,6 +332,45 @@ After "successful" TDR, `aie2_tdr_detect` returns false on subsequent
 polls (no contexts → none stuck → no need to recover again), so TDR
 doesn't fire repeatedly.
 
+### SMU response code interpretation
+
+The dmesg line `[drm] *ERROR* smu cmd 4 failed, 0xff` comes from
+`aie_smu_exec()` in `xdna-driver/src/driver/amdxdna/aie_smu.c:46-48`.
+The xdna driver collapses any non-OK SMU response to `-EINVAL`, so
+the returned errno is uninformative -- but the raw 0xff in the
+dmesg line carries the SMU's actual response code, which uses
+the canonical AMD PPSMC convention (also documented in the modern
+amdgpu driver at `drivers/gpu/drm/amd/pm/swsmu/smu_cmn.c:77-83`):
+
+| Code | Constant | Meaning |
+|------|----------|---------|
+| `0x00` | `SMU_RESP_NONE` | SMU never wrote a response (poll timed out -- SMU itself dead) |
+| `0x01` | `SMU_RESP_OK` | Success |
+| `0xFB` | `SMU_RESP_DEBUG_END` | Debug command terminus |
+| `0xFC` | `SMU_RESP_BUSY_OTHER` | SMU busy with another command (transient -- retry may help) |
+| `0xFD` | `SMU_RESP_CMD_BAD_PREREQ` | Prerequisites not met (state machine in wrong state) |
+| `0xFE` | `SMU_RESP_CMD_UNKNOWN` | SMU doesn't recognize the command (FW/SMU version mismatch) |
+| `0xFF` | `SMU_RESP_CMD_FAIL` | Generic "I tried and failed" |
+
+**`0xFF` is significant**: it means the SMU acknowledged the command
+(not `0xFE`) and tried to execute (not `0x00`), but execution failed.
+**The MP1/SMU controller is alive and responsive.** What's broken is
+the underlying action -- power-off of an NPU whose internal state
+(managed by the hung FW) won't allow a clean power cycle. This
+refines the earlier "SMU wedged" framing: the SMU itself isn't
+wedged, but it can't unstick the wider NPU subsystem because the FW
+that mediates the NPU's internal state machines is hung.
+
+This also explains why system-level power cycling (suspend or
+reboot) works while modprobe -r/modprobe cannot: suspend/reboot
+drops the whole SoC to retention voltage, taking the NPU's internal
+state machines down with it; modprobe-driven SMU POWER_OFF respects
+NPU-internal sequencing that requires FW cooperation.
+
+For future captures, **always read the raw `0x%x` from the dmesg
+`smu cmd N failed` line** -- it carries diagnostic information that
+the kernel-return errno does not.
+
 ### Q5 — do the userspace recovery primitives work? (NO, none of them)
 
 | Primitive | Result | Why |
