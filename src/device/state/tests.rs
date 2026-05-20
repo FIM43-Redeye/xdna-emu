@@ -677,3 +677,34 @@ fn tile_control_write_updates_isolation_byte_shim() {
     assert!(tile.is_shim(), "row 0 must be a shim tile");
     assert_eq!(tile.isolation, iso::NORTH);
 }
+
+#[test]
+fn device_state_new_populates_one_default_context() {
+    use crate::device::context::{ContextState, DEFAULT_CONTEXT};
+
+    let state = DeviceState::new_npu1();
+    assert_eq!(state.contexts.len(), 1, "should ship with one default context");
+    assert_eq!(state.contexts[0].id, DEFAULT_CONTEXT);
+    assert!(matches!(state.contexts[0].state, ContextState::Connected));
+    assert_eq!(state.tdr_detectors.len(), 1, "one detector per context");
+    assert_eq!(state.tdr_detectors[0].context_id(), DEFAULT_CONTEXT);
+}
+
+#[test]
+fn device_state_reset_context_transitions_failed_to_connected() {
+    use crate::device::context::{ContextState, DEFAULT_CONTEXT};
+    use crate::device::tdr::{TdrDiagnosis, WedgeReason};
+
+    let mut state = DeviceState::new_npu1();
+    let diag = TdrDiagnosis {
+        core_states: vec![],
+        dma_states: vec![],
+        data_in_flight: false,
+        pending_syncs: vec![],
+    };
+    state.contexts[0].mark_failed(WedgeReason::Quiescent, diag);
+    assert!(state.contexts[0].is_failed());
+
+    state.reset_context(DEFAULT_CONTEXT).expect("reset failed");
+    assert!(matches!(state.contexts[0].state, ContextState::Connected));
+}

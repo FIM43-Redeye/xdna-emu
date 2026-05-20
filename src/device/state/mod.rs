@@ -35,9 +35,11 @@ use std::sync::Arc;
 use xdna_archspec::runtime::{ArchConfig, ModelConfig};
 use super::array::TileArray;
 use super::async_errors::AsyncErrorSink;
+use super::context::{Context, ContextId, DEFAULT_CONTEXT};
 use super::registers::TileAddress;
 use super::registers::{subsystem_from_offset, tile_kind_from_row};
 use super::tile::Tile;
+use super::tdr::TdrDetector;
 use super::regdb;
 use xdna_archspec::types::{SubsystemKind, TileKind};
 use crate::parser::cdo::{Cdo, CdoRaw};
@@ -95,6 +97,16 @@ pub struct DeviceState {
     /// Populated from `state::effects::apply_tile_local_effects` when an
     /// error-category event is generated.
     pub async_errors: AsyncErrorSink,
+    /// Per-context state. Single context (DEFAULT_CONTEXT) today; multi-context
+    /// expansion is storage-only -- all APIs already key by ContextId.
+    pub contexts: Vec<Context>,
+    /// Per-context TDR classifier. Parallel index to `contexts`.
+    pub tdr_detectors: Vec<TdrDetector>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetContextError {
+    InvalidContextId,
 }
 
 impl DeviceState {
@@ -102,12 +114,16 @@ impl DeviceState {
     pub fn new(arch: Arc<dyn ArchConfig>) -> Self {
         let array = TileArray::new(arch);
         let num_cols = array.cols() as usize;
+        let contexts = vec![Context::new(DEFAULT_CONTEXT)];
+        let tdr_detectors = vec![TdrDetector::new(DEFAULT_CONTEXT)];
         Self {
             array,
             stats: CdoStats::default(),
             pending_core_enables: Vec::new(),
             start_col: 0,
             async_errors: AsyncErrorSink::new(num_cols),
+            contexts,
+            tdr_detectors,
         }
     }
 
@@ -119,6 +135,22 @@ impl DeviceState {
     /// `tile.col` by this amount.
     pub fn set_start_col(&mut self, start_col: u8) {
         self.start_col = start_col;
+    }
+
+    /// Reset the given context to Connected and clear its Tier B sink slot.
+    ///
+    /// Idempotent on an already-Connected context. Returns an error if the
+    /// context_id is out of range.
+    pub fn reset_context(&mut self, context_id: ContextId) -> Result<(), ResetContextError> {
+        let idx = context_id.0 as usize;
+        let ctx = self.contexts.get_mut(idx).ok_or(ResetContextError::InvalidContextId)?;
+        ctx.mark_connected();
+        // Tier B: clear async errors for this context. Today AsyncErrorSink
+        // is global; multi-context spec will give it per-context slots.
+        self.async_errors.clear();
+        // The engine.reset_for_new_context() call happens at the FFI layer
+        // (xdna_emu_reset_context); this method only touches device-side state.
+        Ok(())
     }
 
     /// Create an NPU1 device state.
