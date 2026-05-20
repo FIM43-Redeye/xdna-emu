@@ -760,15 +760,18 @@ impl DmaEngine {
 
         let requestor = self.channel_requestor(ch_idx as u8);
         let granted = target_tile.lock_was_granted(requestor, local_id as usize);
+        let lock_value = target_tile.locks.get(local_id as usize).map(|l| l.value).unwrap_or(i8::MIN);
 
         log::info!(
-            "DMA check_acquire_granted tile({},{}) ch{} bd_lock={} target={:?} local_lock={} granted={}",
+            "DMA check_acquire_granted tile({},{}) ch{} bd_lock={} target={:?} local_lock={} \
+             lock_value={} granted={}",
             self.col,
             self.row,
             ch_idx,
             lock_id,
             lock_target,
             local_id,
+            lock_value,
             granted
         );
 
