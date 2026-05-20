@@ -769,6 +769,33 @@ When the NPU wedges, recovery escalates through:
    the raw `0x%x` from the dmesg line; the kernel-return `-EINVAL`
    from `aie_smu_exec` collapses all non-OK codes to one value.
 
+   **Phoenix NPU SMU command map** (post-probe 2026-05-20, SMU FW
+   76.101.0; full discussion in
+   `docs/superpowers/findings/2026-05-20-amdxdna-tdr-recovery-incomplete-on-phoenix.md`):
+
+   | Cmd | Name | Notes |
+   |-----|------|-------|
+   | 0x1 | `TestMessage` | Returns `arg+1`.  Use as SMU heartbeat. |
+   | 0x2 | `GetSmuVersion` | Returns packed version `0x004C6500` = `76.101.0`. |
+   | 0x3 | `POWER_ON` | Works even on wedged device (no FW handshake needed). |
+   | 0x4 | `POWER_OFF` | Requires FW cooperation; fails CMD_FAIL when FW hung. |
+   | 0x5 | `SET_MPNPUCLK_FREQ` | Returns clamped value. |
+   | 0x6 | `SET_HCLK_FREQ` | Returns clamped value. |
+   | 0x7, 0x8 | `SET_SOFT/HARD_DPMLEVEL` | Defined in `aie_common.h` but **not implemented on Phoenix**; Strix-only. |
+
+   Nothing else exists in the 0x0-0x20 range (probed and confirmed
+   UNKNOWN_CMD).  The POWER_OFF asymmetry explains why driver reload
+   fails on a wedged device: `aie2_smu_start()` runs POWER_OFF first
+   as a defensive cleanup; it fails CMD_FAIL because the hung FW
+   can't acknowledge the shutdown handshake, and the function returns
+   early before reaching POWER_ON (which would succeed).  A candidate
+   driver patch that demotes the defensive POWER_OFF failure to a
+   warning and proceeds to POWER_ON is described in the finding doc
+   -- untested.
+
+   Tool: `tools/smu-probe.py read | exec CMD [ARG]` -- direct MMIO
+   to `/sys/bus/pci/devices/<bdf>/resource0`, requires pkexec.
+
 2. **Bridge PM-cycle** -- reset the upstream bridge function:
    ```bash
    pkexec modprobe -r amdxdna

@@ -444,3 +444,150 @@ investigation are:
 4. Future: investigate whether AMD has a Phoenix FW that supports the
    `app_health` opcode (would give us a better post-TDR liveness
    probe than `nputest`).
+5. Future: patch experiment described in next section ("Driver
+   workaround candidate").
+
+## Direct SMU probing (2026-05-20, deeper dig)
+
+After the recovery-experiment phase concluded, we directly probed the
+NPU SMU via MMIO writes to `/sys/bus/pci/devices/<bdf>/resource0`
+(`BAR0`) to see if there were commands beyond what xdna-driver wraps.
+Tool: `tools/smu-probe.py`.  Goal: find an SMU command that could
+unstick the NPU without rebooting.
+
+### Method
+
+The NPU1 (Phoenix) SMU registers are at fixed offsets within `BAR0`:
+
+| Register | BAR0 offset | Source (driver) |
+|----------|-------------|-----------------|
+| SMU_CMD  | `0x100AC`   | `MPNPU_PUB_SCRATCH5` (`npu1_regs.c:112`) |
+| SMU_RESP | `0x100B0`   | `MPNPU_PUB_SCRATCH6` |
+| SMU_ARG  | `0x100B4`   | `MPNPU_PUB_SCRATCH7` (also SMU_OUT) |
+| SMU_INTR | `0x10094`   | `MPNPU_PUB_PWRMGMT_INTR` |
+
+We mirror `aie_smu_exec()`: clear RESP, write ARG, write CMD, kick
+INTR (0 then 1), poll RESP.  `tools/smu-probe.py` does this and
+decodes the response code.
+
+The SMU lives in the NPU's private register aperture
+(`MPNPU_APERTURE0_BASE`), not in the MP1 shared with the GPU.  So
+undocumented commands here can only affect the NPU subsystem -- blast
+radius bounded to "NPU more wedged", which is where we already are.
+This made the probing safe to attempt on the wedged device.
+
+### Findings: full SMU command map (Phoenix NPU SMU FW 76.101.0)
+
+| Cmd | Behavior on wedged NPU                  | Identification |
+|-----|-----------------------------------------|----------------|
+| 0x1 | OK, `out = arg + 1` (verified, 5 args)  | `TestMessage` (canonical AMD PPSMC). The SMU is alive and bidirectional. |
+| 0x2 | OK, `out = 0x004C6500` (arg-insensitive) | `GetSmuVersion`.  Decodes as major=`0x4C`=76, minor=`0x65`=101, patch=`0x00`, i.e. **SMU firmware version 76.101.0**. |
+| 0x3 | OK, `out = 1` (arg-insensitive)         | `POWER_ON` (driver-known).  Works even on the wedged device. |
+| 0x4 | CMD_FAIL, `out = arg` (echo)            | `POWER_OFF` (driver-known).  Persistently fails with `0xFF` regardless of arg or recent POWER_ON.  See "Structural recovery limitation" below. |
+| 0x5 | OK, `out = 0x190` (clamped to 400 MHz)  | `SET_MPNPUCLK_FREQ` (driver-known).  Still works on wedged device.  Confirms SMU has live interaction with NPU clock infrastructure. |
+| 0x6 | OK, `out = 0x320` (clamped to 800 MHz)  | `SET_HCLK_FREQ` (driver-known).  Same. |
+| 0x7, 0x8 | **UNKNOWN_CMD** (`0xFE`)             | `SET_SOFT_DPMLEVEL` / `SET_HARD_DPMLEVEL` -- driver-defined in `aie_common.h` but **not implemented on Phoenix's NPU SMU**.  These are used only by `npu4_set_dpm()` (Strix path).  On NPU1 they're dead code. |
+| 0x0, 0x9, 0xA–0x20 (gaps) | UNKNOWN_CMD              | Nothing else exists in the probed range.  The NPU SMU's command set is exactly **6 commands (0x1–0x6)**, narrower than typical MP1 vocabularies. |
+
+Probing UNKNOWN_CMD codes is completely safe: they're rejected by the
+SMU in the same ~20ms as documented commands, with no side effects on
+register state beyond the SMU_CMD/SMU_RESP echo.
+
+### Structural recovery limitation
+
+The POWER_OFF asymmetry is the actionable finding.  POWER_ON
+succeeds on a wedged device; POWER_OFF persistently fails.  The
+likely explanation is a design asymmetry:
+
+- POWER_ON doesn't need FW cooperation -- FW isn't running yet at
+  POWER_ON time, so the SMU just programs hardware power gates
+  directly and returns OK.
+- POWER_OFF *does* need FW cooperation -- the SMU presumably waits
+  for a FW shutdown handshake (clean-state save, clocks ramp-down
+  acknowledgement) before reporting OK.  If FW is hung, this
+  handshake never arrives and the SMU's internal timer fires CMD_FAIL.
+
+This is the root cause of the modprobe-reload recovery failure.
+`aie2_smu_start()` in `xdna-driver/src/driver/amdxdna/aie2_smu.c:134-156`
+does **POWER_OFF first** as a defensive "ensure we're in a clean OFF
+state before powering on":
+
+```c
+int aie2_smu_start(struct amdxdna_dev_hdl *ndev)
+{
+    /*
+     * If the hardware was not powered off properly, try to set
+     * power off. Failing to power off indicates an unrecoverable
+     * issue, return failure.
+     */
+    ret = aie2_smu_set_power_off(ndev);   // <-- THIS FAILS (FW hung)
+    if (ret) {
+        XDNA_ERR(ndev->xdna, "Access power failed, ret %d", ret);
+        return ret;                       // <-- modprobe init aborts here
+    }
+    ret = aie2_smu_set_power_on(ndev);    // <-- never reached
+    ...
+}
+```
+
+So the driver can never reach POWER_ON during re-probe because its
+defensive POWER_OFF fails first.  But **POWER_ON works on its own**.
+
+### Driver workaround candidate (untested)
+
+If `aie2_smu_start()` skipped the defensive POWER_OFF (or treated its
+failure as non-fatal) on the wedged-device path, re-probe might
+complete successfully:
+
+```c
+int aie2_smu_start(struct amdxdna_dev_hdl *ndev)
+{
+    int ret;
+
+    ret = aie2_smu_set_power_off(ndev);
+    if (ret) {
+        XDNA_WARN(ndev->xdna, "defensive POWER_OFF failed (NPU may be wedged), "
+                              "proceeding to POWER_ON anyway");
+        /* fall through to POWER_ON */
+    }
+
+    ret = aie2_smu_set_power_on(ndev);
+    if (ret) {
+        XDNA_ERR(ndev->xdna, "Power on failed, ret %d", ret);
+        return ret;
+    }
+    return 0;
+}
+```
+
+This is **untested** (would require DKMS rebuild + reload to verify on
+a wedged device).  Risks of the patch:
+
+- If the NPU is in some intermediate power state between ON and OFF,
+  calling POWER_ON without the defensive POWER_OFF first might leave
+  hardware in an inconsistent state.  Whether the SMU's POWER_ON
+  internally handles this case is unknown.
+- May surface different bugs further into init (e.g.,
+  `aie2_pm_init()` or `aie2_mgmt_fw_init()` could fail differently if
+  hardware state wasn't fully reset).
+
+If the patch works, it could replace reboot as the recovery primitive
+for FW-mailbox-dead wedges on Phoenix.  That would close the loop on
+this finding: a software fix avoiding the reboot requirement.
+
+### Tool reference
+
+`tools/smu-probe.py` -- reads or executes commands on the Phoenix NPU
+SMU via direct MMIO.  Modes:
+
+- `read`: snapshot current SMU and PSP register state (read-only,
+  always safe).
+- `exec CMD [ARG] [--yes-destructive]`: send a command, wait up to
+  1s for the SMU's response, decode it.  Refuses to send command
+  numbers outside the safe set (0x1, 0x2, 0x3-0x8) without
+  `--yes-destructive` opt-in.
+
+Requires root via `pkexec`.  Default targets BDF `0000:c6:00.1`;
+override with `--bdf`.  Don't run `exec` mode on a healthy device --
+some command numbers are documented but most aren't, and writing an
+undocumented command number is undefined behavior.
