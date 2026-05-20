@@ -36,12 +36,14 @@
 //!   are borrowed from thread-local or handle state; they are invalidated
 //!   by the next FFI call on the same thread or by destroying the handle.
 
+mod async_errors;
 mod classify;
 mod config;
 mod execution;
 mod memory;
 mod query;
 
+pub use async_errors::*;
 pub use classify::*;
 pub use config::*;
 pub use execution::*;
@@ -66,6 +68,23 @@ pub(crate) fn set_last_error(msg: String) {
     });
 }
 
+/// Wrapper around an FFI callback + user_data pointer pair.
+///
+/// `*mut c_void` is not `Send`; this struct asserts the caller follows
+/// the documented "handles are not thread-safe" contract so we can store
+/// the pair on the handle without inheriting `!Send` constraints on
+/// `XdnaEmuHandle`.
+#[derive(Clone, Copy)]
+pub(crate) struct AsyncErrorCallback {
+    pub func: async_errors::XdnaEmuAsyncErrorCallback,
+    pub user_data: *mut std::ffi::c_void,
+}
+// SAFETY: handle access is serialized by the plugin's mutex; the user_data
+// pointer is opaque to us and only ever passed back to the registered C
+// callback on the same thread that registered it.
+unsafe impl Send for AsyncErrorCallback {}
+unsafe impl Sync for AsyncErrorCallback {}
+
 /// Opaque handle to emulator state.
 /// Wraps InterpreterEngine and related state.
 pub struct XdnaEmuHandle {
@@ -86,6 +105,8 @@ pub struct XdnaEmuHandle {
     /// to a stale address. See bridge-trace-runner.cpp:1500-1738 for the
     /// teardown rationale (alternating-TIMEOUT workaround on real HW).
     pub(crate) free_list: Vec<(u64, u64)>,
+    /// Optional FFI-registered push callback for async errors (Tier B).
+    pub(crate) async_callback: Option<AsyncErrorCallback>,
 }
 
 /// Result codes for FFI operations.
@@ -181,6 +202,7 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
         // with user-specified host regions (typically < 0x1_0000_0000).
         next_alloc_addr: 0x8000_0000_0000,
         free_list: Vec::new(),
+        async_callback: None,
     });
 
     Box::into_raw(handle)
