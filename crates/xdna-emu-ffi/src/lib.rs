@@ -39,6 +39,7 @@
 mod async_errors;
 mod classify;
 mod config;
+pub mod context;
 mod execution;
 mod memory;
 mod query;
@@ -46,6 +47,7 @@ mod query;
 pub use async_errors::*;
 pub use classify::*;
 pub use config::*;
+pub use context::{xdna_emu_get_context_state, XdnaEmuContextState};
 pub use execution::*;
 pub use memory::*;
 pub use query::*;
