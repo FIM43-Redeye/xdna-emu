@@ -134,7 +134,30 @@ impl TdrDetector {
         self.context_id
     }
 
-    // classify(...) added in Tasks 4-7 (TDD per verdict variant).
+    /// Classify the engine's run state this cycle.
+    ///
+    /// Precedence (when more than one would apply): `NaturalCompletion` >
+    /// `MaskPollUnsatisfied` > `Wedged` > `Progressing`. The classifier
+    /// returns the strongest applicable verdict.
+    ///
+    /// Read-only over signals; mutates internal counters
+    /// (`poll_stall_cycles`, quiescence/stall thresholds) per cycle.
+    pub fn classify(&mut self, signals: &EngineSignals, executor: Option<&ExecutorSignals>) -> TdrVerdict {
+        // Highest precedence: natural completion.
+        if signals.engine_status == EngineStatusSnapshot::Halted {
+            if let Some(exec) = executor {
+                if exec.is_done && exec.syncs_satisfied {
+                    return TdrVerdict::NaturalCompletion;
+                }
+            } else if !signals.any_dma_active && !signals.any_data_in_flight {
+                return TdrVerdict::NaturalCompletion;
+            }
+        }
+
+        // Default: still making progress (or the lower-precedence checks
+        // added in Tasks 5-7 will refine).
+        TdrVerdict::Progressing
+    }
 }
 
 #[cfg(test)]
@@ -169,5 +192,47 @@ mod tests {
             TdrVerdict::Wedged { reason, .. } => assert!(matches!(reason, WedgeReason::Quiescent)),
             _ => panic!("expected Wedged"),
         }
+    }
+
+    fn empty_engine_signals(status: EngineStatusSnapshot) -> EngineSignals {
+        EngineSignals {
+            engine_status: status,
+            any_dma_active: false,
+            any_data_in_flight: false,
+            total_dma_bytes_transferred: 0,
+            total_lock_releases: 0,
+            core_statuses: vec![],
+            dma_states: vec![],
+        }
+    }
+
+    fn natural_completion_executor() -> ExecutorSignals {
+        ExecutorSignals {
+            is_done: true,
+            syncs_satisfied: true,
+            is_blocked_on_poll: false,
+            pending_syncs: vec![],
+        }
+    }
+
+    fn no_executor() -> Option<ExecutorSignals> {
+        None
+    }
+
+    #[test]
+    fn classify_returns_progressing_when_engine_running_and_no_executor() {
+        let mut detector = TdrDetector::new(0);
+        let signals = empty_engine_signals(EngineStatusSnapshot::Running);
+        let verdict = detector.classify(&signals, no_executor().as_ref());
+        assert!(matches!(verdict, TdrVerdict::Progressing), "got {verdict:?}");
+    }
+
+    #[test]
+    fn classify_returns_natural_completion_when_engine_halted_and_syncs_satisfied() {
+        let mut detector = TdrDetector::new(0);
+        let signals = empty_engine_signals(EngineStatusSnapshot::Halted);
+        let exec = natural_completion_executor();
+        let verdict = detector.classify(&signals, Some(&exec));
+        assert!(matches!(verdict, TdrVerdict::NaturalCompletion), "got {verdict:?}");
     }
 }
