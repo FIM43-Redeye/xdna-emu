@@ -1621,7 +1621,7 @@ In `src/device/state/effects.rs`, append to the existing `#[cfg(test)] mod inter
     }
 
     #[test]
-    fn instr_error_fires_both_tier_a_l1_and_tier_b_async_paths() {
+    fn tier_a_fires_independently_of_tier_b_for_non_error_shim_event() {
         use crate::device::interrupts::{L1_REG_ENABLE_A, L1_REG_IRQ_NO_A, SwitchId};
         let mut dev = DeviceState::new_npu1();
         // Configure shim L1 to latch on event 7 (use 7 not 69 so this test
