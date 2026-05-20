@@ -65,6 +65,7 @@ pub mod control_packets;
 pub mod core_debug;
 pub mod events;
 pub mod async_errors;
+pub mod context;
 pub mod tdr;
 pub mod interrupts;
 pub mod perf_counters;

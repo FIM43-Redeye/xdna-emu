@@ -13,6 +13,7 @@ pub mod detector;
 
 pub use detector::{QuiescenceDetector, QuiescenceStatus, StallDetector, StallStatus, TdrDiagnosis};
 
+use crate::device::context::ContextId;
 use crate::interpreter::core::CoreStatus;
 
 /// Reason a context's submission is classified as wedged.
@@ -97,7 +98,7 @@ pub struct ExecutorSignals {
 /// Per-context classifier composing the lifted Quiescence/Stall detectors
 /// with a poll-stall budget.
 pub struct TdrDetector {
-    context_id: u32,
+    context_id: ContextId,
     quiescence: QuiescenceDetector,
     stall: StallDetector,
     poll_stall_cycles: u64,
@@ -119,7 +120,7 @@ pub const DEFAULT_STALL_CYCLES: u64 = 100_000;
 
 impl TdrDetector {
     /// Construct a detector for the given context using the default thresholds.
-    pub fn new(context_id: u32) -> Self {
+    pub fn new(context_id: ContextId) -> Self {
         Self {
             context_id,
             quiescence: QuiescenceDetector::new(DEFAULT_QUIESCENCE_CYCLES),
@@ -130,7 +131,7 @@ impl TdrDetector {
     }
 
     /// The context this detector classifies.
-    pub fn context_id(&self) -> u32 {
+    pub fn context_id(&self) -> ContextId {
         self.context_id
     }
 
@@ -263,6 +264,7 @@ impl TdrDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::context::DEFAULT_CONTEXT;
 
     #[test]
     fn wedge_reason_derives_copy_clone_debug() {
@@ -321,7 +323,7 @@ mod tests {
 
     #[test]
     fn classify_returns_progressing_when_engine_running_and_no_executor() {
-        let mut detector = TdrDetector::new(0);
+        let mut detector = TdrDetector::new(DEFAULT_CONTEXT);
         let signals = empty_engine_signals(EngineStatusSnapshot::Running);
         let verdict = detector.classify(&signals, no_executor().as_ref());
         assert!(matches!(verdict, TdrVerdict::Progressing), "got {verdict:?}");
@@ -329,7 +331,7 @@ mod tests {
 
     #[test]
     fn classify_returns_natural_completion_when_engine_halted_and_syncs_satisfied() {
-        let mut detector = TdrDetector::new(0);
+        let mut detector = TdrDetector::new(DEFAULT_CONTEXT);
         let signals = empty_engine_signals(EngineStatusSnapshot::Halted);
         let exec = natural_completion_executor();
         let verdict = detector.classify(&signals, Some(&exec));
@@ -347,7 +349,7 @@ mod tests {
 
     #[test]
     fn classify_returns_mask_poll_unsatisfied_when_engine_halted_and_executor_blocked_on_poll() {
-        let mut detector = TdrDetector::new(0);
+        let mut detector = TdrDetector::new(DEFAULT_CONTEXT);
         let mut signals = empty_engine_signals(EngineStatusSnapshot::Halted);
         signals.any_dma_active = false; // matches existing run-loop fast-path condition
         let exec = blocked_on_poll_executor();
@@ -357,7 +359,7 @@ mod tests {
 
     #[test]
     fn classify_returns_mask_poll_unsatisfied_after_poll_stall_budget() {
-        let mut detector = TdrDetector::new(0);
+        let mut detector = TdrDetector::new(DEFAULT_CONTEXT);
         let signals = empty_engine_signals(EngineStatusSnapshot::Running);
         let exec = blocked_on_poll_executor();
         // Burn through the poll-stall budget. Detector accumulates internally.
@@ -372,7 +374,7 @@ mod tests {
 
     #[test]
     fn classify_resets_poll_stall_when_executor_unblocks() {
-        let mut detector = TdrDetector::new(0);
+        let mut detector = TdrDetector::new(DEFAULT_CONTEXT);
         let signals = empty_engine_signals(EngineStatusSnapshot::Running);
         let exec_blocked = blocked_on_poll_executor();
         let mut exec_unblocked = blocked_on_poll_executor();
@@ -393,7 +395,7 @@ mod tests {
 
     #[test]
     fn classify_returns_wedged_quiescent_when_all_subsystems_terminal() {
-        let mut detector = TdrDetector::new(0);
+        let mut detector = TdrDetector::new(DEFAULT_CONTEXT);
         // All terminal: engine NOT Halted (otherwise we'd hit NaturalCompletion path),
         // but no DMA, no data in flight, all cores in terminal state.
         // Use the "no executor" path so NaturalCompletion's executor check
@@ -414,7 +416,7 @@ mod tests {
 
     #[test]
     fn classify_returns_wedged_stalled_with_pending_syncs_and_no_byte_progress() {
-        let mut detector = TdrDetector::new(0);
+        let mut detector = TdrDetector::new(DEFAULT_CONTEXT);
         // Cores still "running" (engine not Stalled), but no DMA byte progress
         // and pending syncs. Stall detector fires after its threshold.
         let mut signals = empty_engine_signals(EngineStatusSnapshot::Running);
@@ -443,7 +445,7 @@ mod tests {
         // PollExhausted differs from MaskPollUnsatisfied: it fires only when
         // the budget is burned AND the cleaner fast-path conditions are not
         // met (e.g. DMA still active, masking the "engine quiescent" tell).
-        let mut detector = TdrDetector::new(0);
+        let mut detector = TdrDetector::new(DEFAULT_CONTEXT);
         let mut signals = empty_engine_signals(EngineStatusSnapshot::Running);
         signals.any_dma_active = true; // disqualifies the MaskPollUnsatisfied fast-path
         let exec = blocked_on_poll_executor();
@@ -462,7 +464,7 @@ mod tests {
 
     #[test]
     fn classify_precedence_natural_completion_wins_over_wedge_signals() {
-        let mut detector = TdrDetector::new(0);
+        let mut detector = TdrDetector::new(DEFAULT_CONTEXT);
         // Build inputs that would qualify as both NaturalCompletion AND
         // (after enough cycles) Wedged{Quiescent}. NaturalCompletion is
         // the higher-precedence verdict.
@@ -478,7 +480,7 @@ mod tests {
 
     #[test]
     fn classify_precedence_mask_poll_wins_over_wedge_signals() {
-        let mut detector = TdrDetector::new(0);
+        let mut detector = TdrDetector::new(DEFAULT_CONTEXT);
         // Engine Halted + executor BlockedOnPoll + no DMA -- fast-path
         // MaskPollUnsatisfied. Also satisfies Wedged{Quiescent} structurally.
         let signals = empty_engine_signals(EngineStatusSnapshot::Halted);
@@ -492,7 +494,7 @@ mod tests {
         // When BOTH would apply (executor done with all cores terminal AND
         // pending syncs with no byte progress), Quiescent reports first
         // because it's the stronger description.
-        let mut detector = TdrDetector::new(0);
+        let mut detector = TdrDetector::new(DEFAULT_CONTEXT);
         let signals = empty_engine_signals(EngineStatusSnapshot::Stalled);
         let exec = ExecutorSignals {
             is_done: true, // quiescence requires this
