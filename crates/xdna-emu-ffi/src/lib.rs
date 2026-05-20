@@ -150,6 +150,15 @@ pub enum XdnaEmuHaltReason {
     /// On real hardware the poll satisfies (the core halts at the breakpoint);
     /// this reason is emulator-only.
     MaskPollUnsatisfied = 3,
+    /// Tier C: the in-flight submission wedged; the per-context state is
+    /// Failed. Caller should observe this, call `xdna_emu_reset_context`
+    /// before the next submission, and translate to an EIO-shaped XRT
+    /// command state in `run.wait()`.
+    ///
+    /// "Recovered" describes the contract: the device is ready to accept
+    /// the next submission once reset is called; this status code is the
+    /// signal that triggered recovery, not that recovery has already run.
+    WedgeRecovered = 4,
 }
 
 /// Execution status returned by run functions.
@@ -966,5 +975,11 @@ mod tests {
         assert_eq!(exports.len(), 2);
         assert_eq!(exports[0], "xdna_emu_create");
         assert_eq!(exports[1], "xdna_emu_version");
+    }
+
+    #[test]
+    fn halt_reason_wedge_recovered_has_discriminant_four() {
+        let r = XdnaEmuHaltReason::WedgeRecovered;
+        assert_eq!(r as u32, 4);
     }
 }
