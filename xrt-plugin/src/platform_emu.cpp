@@ -719,6 +719,10 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
 
   // -- Execute each sub-command ----------------------------------------------
 
+  // Tier C: set when xdna_emu_run reports HALT_WEDGE_RECOVERED. Drives the
+  // ert_cmd_state translation below (spec §4.5: WedgeRecovered -> ABORT).
+  bool any_wedged = false;
+
   for (size_t cmd_idx = 0; cmd_idx < sub_cmds.size(); cmd_idx++) {
     const auto& sc = sub_cmds[cmd_idx];
 
@@ -802,6 +806,15 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
 
     // Execute the NPU instruction buffer from emulator host memory.
     m_transport->execute_from_device(sc.instr_addr, sc.instr_size);
+
+    // Tier C: on wedge the context is now Failed. Subsequent sub-cmds
+    // would hit the FFI entry guard and throw ExecutionError, abandoning
+    // the rest of submit_cmd (including state-marking below). Break out
+    // here so we still mark every sub-cmd and the outer packet as ABORT.
+    if (m_transport->last_run_wedged()) {
+      any_wedged = true;
+      break;
+    }
   }
 
   // Post-execution diagnostics: dump DMA state for any non-idle channels.
@@ -853,17 +866,25 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
             m_bo_map.size());
   }
 
-  // Mark the outer packet as completed so that poll_command() sees it.
+  // Mark the outer packet so that poll_command() sees it. Tier C: on
+  // wedge, surface the EIO-shaped ABORT state so run.wait() consumers
+  // observe failure instead of treating the hang as a normal completion.
+  const auto final_state =
+      any_wedged ? ERT_CMD_STATE_ABORT : ERT_CMD_STATE_COMPLETED;
   auto* hdr = reinterpret_cast<ert_packet*>(buf.data());
-  hdr->state = ERT_CMD_STATE_COMPLETED;
+  hdr->state = final_state;
   pwrite(m_dev_fd, buf.data(), sizeof(ert_packet),
          static_cast<off_t>(info.map_offset));
 
-  // For chains, mark each sub-command packet as completed too.
+  // For chains, mark each sub-command packet with the same state. We mark
+  // every sub-cmd uniformly rather than tracking which specific one
+  // wedged: the chain-as-a-whole failed, and the emulator already
+  // batches state-marking at the end of submit_cmd rather than streaming
+  // per-sub-cmd completion the way real HW does.
   for (size_t i = 0; i < sub_cmd_completions.size(); i++) {
     auto& sc = sub_cmd_completions[i];
     auto* sub_hdr = reinterpret_cast<ert_packet*>(sub_cmd_bufs[i].data());
-    sub_hdr->state = ERT_CMD_STATE_COMPLETED;
+    sub_hdr->state = final_state;
     pwrite(m_dev_fd, sub_cmd_bufs[i].data(), sizeof(ert_packet),
            static_cast<off_t>(sc.map_offset));
   }
