@@ -1,6 +1,9 @@
 # Rust build output
 /target
 
+# Local git worktrees (parallel work streams; never tracked)
+/.worktrees
+
 # IDE
 .idea/
 *.swp
