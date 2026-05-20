@@ -162,11 +162,124 @@ pub unsafe extern "C" fn xdna_emu_async_event_pending(handle: *mut XdnaEmuHandle
     }
 }
 
+/// Register a C callback fired synchronously when an async error is recorded.
+/// Pass `None` to unregister. `user_data` is round-tripped to each invocation.
+///
+/// Thread-safety: the callback fires from whichever thread drives `xdna_emu_run`.
+/// Per the lib.rs handle-safety contract, that is expected to be a single
+/// thread per handle (the XRT plugin serializes via its own mutex).
+///
+/// # Safety
+/// `handle` must be valid; the `callback` (if Some) must be a valid C function
+/// pointer matching the `XdnaEmuAsyncErrorCallback` signature.
+///
+/// # Returns
+/// - `0`: success
+/// - `-1`: `handle` is null
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_set_async_event_callback(
+    handle: *mut XdnaEmuHandle,
+    callback: Option<XdnaEmuAsyncErrorCallback>,
+    user_data: *mut c_void,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+
+    let handle = &mut *handle;
+    handle.async_callback = callback.map(|func| crate::AsyncErrorCallback { func, user_data });
+    0
+}
+
+/// Drain newly-recorded async-error records and fire the registered callback
+/// (if any) for each. Called from the run loop between engine steps.
+///
+/// # Safety
+/// `handle` must be a valid mutable reference.
+pub(crate) unsafe fn fire_async_callbacks_for(handle: &mut XdnaEmuHandle) {
+    let Some(cb) = handle.async_callback else { return };
+    let drained = handle.engine.device_mut().async_errors.drain_newly_recorded();
+    for rec in drained {
+        let xrec = XdnaEmuAsyncError::from(&rec);
+        (cb.func)(&xrec as *const _, cb.user_data);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     use super::*;
     use crate::{xdna_emu_create, xdna_emu_destroy};
     use xdna_archspec::aie2::async_errors::AieErrorOrigin;
+
+    /// Test-only callback that increments a counter and records the last
+    /// observed err_code into a Mutex<Option<u64>>.
+    static OBSERVED: Mutex<Option<u64>> = Mutex::new(None);
+    static FIRE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    unsafe extern "C" fn test_callback(rec: *const XdnaEmuAsyncError, _ud: *mut std::ffi::c_void) {
+        FIRE_COUNT.fetch_add(1, Ordering::SeqCst);
+        if !rec.is_null() {
+            *OBSERVED.lock().unwrap() = Some((*rec).err_code);
+        }
+    }
+
+    #[test]
+    fn set_async_event_callback_registers_and_fires_on_drain() {
+        unsafe {
+            with_handle(|h| {
+                FIRE_COUNT.store(0, Ordering::SeqCst);
+                *OBSERVED.lock().unwrap() = None;
+
+                let rc = xdna_emu_set_async_event_callback(h, Some(test_callback), std::ptr::null_mut());
+                assert_eq!(rc, 0);
+
+                // Drive a record, then call the drain helper directly.
+                let dev = (*h).engine.device_mut();
+                dev.async_errors.record_error(1, 2, AieErrorOrigin::Core, 69, 50_000);
+
+                // The drain happens inside xdna_emu_run between engine steps.
+                // For this unit test, exercise the helper directly.
+                fire_async_callbacks_for(&mut *h);
+
+                assert_eq!(FIRE_COUNT.load(Ordering::SeqCst), 1);
+                assert!(OBSERVED.lock().unwrap().is_some());
+            });
+        }
+    }
+
+    #[test]
+    fn set_async_event_callback_with_none_unregisters() {
+        unsafe {
+            with_handle(|h| {
+                FIRE_COUNT.store(0, Ordering::SeqCst);
+                xdna_emu_set_async_event_callback(h, Some(test_callback), std::ptr::null_mut());
+                xdna_emu_set_async_event_callback(h, None, std::ptr::null_mut());
+
+                let dev = (*h).engine.device_mut();
+                dev.async_errors.record_error(1, 2, AieErrorOrigin::Core, 69, 50_000);
+
+                fire_async_callbacks_for(&mut *h);
+                assert_eq!(FIRE_COUNT.load(Ordering::SeqCst), 0, "unregistered callback must not fire");
+            });
+        }
+    }
+
+    #[test]
+    fn set_async_event_callback_null_handle_returns_minus_one() {
+        unsafe {
+            assert_eq!(
+                xdna_emu_set_async_event_callback(
+                    std::ptr::null_mut(),
+                    Some(test_callback),
+                    std::ptr::null_mut()
+                ),
+                -1
+            );
+        }
+    }
 
     /// Helper: create a handle, run a closure, then destroy it.
     unsafe fn with_handle(f: impl FnOnce(*mut XdnaEmuHandle)) {

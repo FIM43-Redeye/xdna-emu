@@ -235,6 +235,10 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         }
 
         handle.engine.step();
+        // Tier B: drain newly-recorded async errors and fire the registered
+        // callback (if any). Mirrors the flush_trace_to_host pattern -- FFI
+        // layer observes between engine steps.
+        crate::async_errors::fire_async_callbacks_for(handle);
         cycles += 1;
 
         if handle.engine.status() == EngineStatus::Halted {
