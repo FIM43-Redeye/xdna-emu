@@ -459,4 +459,56 @@ mod tests {
         // expects MaskPollUnsatisfied. Kept here to lock in the precedence.
         assert!(matches!(last, TdrVerdict::MaskPollUnsatisfied), "got {last:?}");
     }
+
+    #[test]
+    fn classify_precedence_natural_completion_wins_over_wedge_signals() {
+        let mut detector = TdrDetector::new(0);
+        // Build inputs that would qualify as both NaturalCompletion AND
+        // (after enough cycles) Wedged{Quiescent}. NaturalCompletion is
+        // the higher-precedence verdict.
+        let signals = empty_engine_signals(EngineStatusSnapshot::Halted);
+        let exec = natural_completion_executor();
+        // First cycle and every subsequent cycle should be NaturalCompletion --
+        // we never accumulate into Wedged territory.
+        for _ in 0..(DEFAULT_QUIESCENCE_CYCLES * 2) {
+            let v = detector.classify(&signals, Some(&exec));
+            assert!(matches!(v, TdrVerdict::NaturalCompletion), "got {v:?}");
+        }
+    }
+
+    #[test]
+    fn classify_precedence_mask_poll_wins_over_wedge_signals() {
+        let mut detector = TdrDetector::new(0);
+        // Engine Halted + executor BlockedOnPoll + no DMA -- fast-path
+        // MaskPollUnsatisfied. Also satisfies Wedged{Quiescent} structurally.
+        let signals = empty_engine_signals(EngineStatusSnapshot::Halted);
+        let exec = blocked_on_poll_executor();
+        let v = detector.classify(&signals, Some(&exec));
+        assert!(matches!(v, TdrVerdict::MaskPollUnsatisfied), "got {v:?}");
+    }
+
+    #[test]
+    fn classify_precedence_quiescent_wins_over_stalled() {
+        // When BOTH would apply (executor done with all cores terminal AND
+        // pending syncs with no byte progress), Quiescent reports first
+        // because it's the stronger description.
+        let mut detector = TdrDetector::new(0);
+        let signals = empty_engine_signals(EngineStatusSnapshot::Stalled);
+        let exec = ExecutorSignals {
+            is_done: true, // quiescence requires this
+            syncs_satisfied: false,
+            is_blocked_on_poll: false,
+            pending_syncs: vec![(0, 0, 0, 0)], // satisfies stall precondition too
+        };
+        // Burn enough cycles for quiescence threshold to fire.
+        let mut fired_as = None;
+        for _ in 0..(DEFAULT_QUIESCENCE_CYCLES * 2) {
+            let v = detector.classify(&signals, Some(&exec));
+            if let TdrVerdict::Wedged { reason, .. } = v {
+                fired_as = Some(reason);
+                break;
+            }
+        }
+        assert_eq!(fired_as, Some(WedgeReason::Quiescent));
+    }
 }
