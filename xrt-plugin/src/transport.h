@@ -151,6 +151,30 @@ public:
     virtual std::string dump_tile_state(uint16_t col, uint16_t row)
     { return {}; }
 
+    // -- Tier C context-state accessor ---------------------------------------
+    // Plugin-side mirror of the per-context state tracked by the emulator.
+    // Carries enough information for the plugin to decide whether the last
+    // submission wedged and to expose that to the bridge harness or higher
+    // layers.
+    struct ContextStateRecord {
+        uint32_t state;             // 0=Connected, 1=Stopped, 2=Failed
+        uint64_t completed_counter; // increments on each natural completion
+    };
+
+    /// Read the current state + completion counter for @context_id.
+    /// Returns false if the context_id is invalid, the transport does not
+    /// implement the query (older builds, future socket backend), or the
+    /// backing FFI call returns an error.
+    virtual bool get_context_state(uint32_t context_id,
+                                   ContextStateRecord& out)
+    { (void)context_id; (void)out; return false; }
+
+    /// Returns true if the most recent execute() call ended with a
+    /// HALT_WEDGE_RECOVERED status (i.e. the context is now Failed).
+    /// Resets to false at the start of the next execute() call.
+    /// Default: false (no-op for non-inprocess transports).
+    virtual bool last_run_wedged() const { return false; }
+
     // -- Tier B async-error delivery ----------------------------------------
     // 24-byte mirror of `struct amdxdna_async_error` (drm/amdxdna_accel.h).
     // Layout matches `XdnaEmuAsyncError` in

@@ -86,6 +86,11 @@ public:
     // -- Tier B async-error delivery ----------------------------------------
     bool        get_last_async_error(AsyncErrorRecord& out) override;
 
+    // -- Tier C context-state accessor --------------------------------------
+    bool        get_context_state(uint32_t context_id,
+                                  ContextStateRecord& out) override;
+    bool        last_run_wedged() const override;
+
 private:
     // -----------------------------------------------------------------------
     // FFI function-pointer types.
@@ -108,6 +113,7 @@ private:
         HALT_BUDGET               = 1,
         HALT_ERROR                = 2,
         HALT_MASKPOLL_UNSATISFIED = 3,
+        HALT_WEDGE_RECOVERED      = 4,   // Tier C: context now Failed
     };
     struct ExecStatus {
         Result     result;          // 4 bytes, offset 0
@@ -182,6 +188,13 @@ private:
     using fn_get_last_async_error =
         int32_t (*)(XdnaEmuHandle*, AsyncErrorWire*);
 
+    // -- Tier C context-state FFI ------------------------------------------
+    // Maps to `xdna_emu_get_context_state` in context.rs.
+    // out_state: 0=Connected, 1=Stopped, 2=Failed (XdnaEmuContextState repr(u32)).
+    // Returns 0 on success, -1 null args, -2 out-of-range context_id.
+    using fn_get_context_state =
+        int (*)(XdnaEmuHandle*, uint32_t, uint32_t*, uint64_t*);
+
     // -----------------------------------------------------------------------
     // State
     // -----------------------------------------------------------------------
@@ -253,6 +266,17 @@ private:
 
     // -- Tier B async-error (required) -------------------------------------
     fn_get_last_async_error sym_get_last_async_error_ = nullptr;
+
+    // -- Tier C context-state (required) -----------------------------------
+    fn_get_context_state    sym_get_context_state_    = nullptr;
+
+    // -- Tier C wedge flag --------------------------------------------------
+    // Set by execute() when halt_reason == HALT_WEDGE_RECOVERED.
+    // Cleared on the next execute() call so that only the most recent
+    // submission's outcome is visible.  Exposed via get_context_state()
+    // but also available to platform_emu.cpp callers that want to surface
+    // EIO-shaped command state to XRT without calling into the FFI.
+    bool last_run_wedged_ = false;
 
     // -----------------------------------------------------------------------
     // Helpers

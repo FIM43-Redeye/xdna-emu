@@ -130,6 +130,12 @@ emu_transport_inprocess::emu_transport_inprocess(const std::string& lib_path)
     sym_get_last_async_error_ = resolve_required<fn_get_last_async_error>(
         "xdna_emu_get_last_async_error");
 
+    // Tier C context-state accessor -- required.  Resolving required means a
+    // stale .so (predating the Tier C context module) fails early at dlopen
+    // time rather than producing a silent null-dereference at run time.
+    sym_get_context_state_ = resolve_required<fn_get_context_state>(
+        "xdna_emu_get_context_state");
+
     // Create the emulator instance.
     emu_ = sym_create_();
     if (!emu_) {
@@ -289,6 +295,9 @@ void emu_transport_inprocess::add_host_buffer(uint64_t addr, uint64_t size)
 void emu_transport_inprocess::execute(const void* instructions, size_t size)
 {
     std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
+    // Clear the wedge flag from the previous call before starting a new run.
+    last_run_wedged_ = false;
+
     // Submit NPU instructions (patches addresses, configures shim DMA).
     Result rc = sym_exec_npu_instr_(
         emu_, static_cast<const uint8_t*>(instructions),
@@ -302,6 +311,7 @@ void emu_transport_inprocess::execute(const void* instructions, size_t size)
     // Run the emulator to completion.
     ExecStatus status = sym_run_(emu_);
     last_run_complete_ = (status.halted != 0);
+    last_run_wedged_   = (status.halt_reason == HALT_WEDGE_RECOVERED);
 
     // Emit a structured status line so the bridge script can classify results.
     // Emit BEFORE the check(result) throw so bridges still see halt_reason on
@@ -312,6 +322,7 @@ void emu_transport_inprocess::execute(const void* instructions, size_t size)
         case HALT_BUDGET:               reason_str = "budget";               break;
         case HALT_ERROR:                reason_str = "error";                break;
         case HALT_MASKPOLL_UNSATISFIED: reason_str = "maskpoll_unsatisfied"; break;
+        case HALT_WEDGE_RECOVERED:      reason_str = "wedge_recovered";      break;
     }
     std::cerr << "XDNA_EMU_STATUS: halt_reason=" << reason_str
               << " cycles=" << status.cycles_executed
@@ -479,6 +490,35 @@ std::string emu_transport_inprocess::dump_tile_state(uint16_t col,
     if (len > 0 && static_cast<uint32_t>(len) < sizeof(buf))
         return std::string(buf, static_cast<size_t>(len));
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// Tier C context-state accessor
+// ---------------------------------------------------------------------------
+
+bool emu_transport_inprocess::get_context_state(uint32_t context_id,
+                                                 ContextStateRecord& out)
+{
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
+    // sym_get_context_state_ is resolve_required at ctor time; cannot be null.
+    if (!sym_get_context_state_)
+        return false;
+
+    uint32_t state   = 0;
+    uint64_t counter = 0;
+    int rc = sym_get_context_state_(emu_, context_id, &state, &counter);
+    if (rc != 0)
+        return false;  // -1 = null args (unreachable), -2 = invalid context_id
+
+    out.state             = state;
+    out.completed_counter = counter;
+    return true;
+}
+
+bool emu_transport_inprocess::last_run_wedged() const
+{
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
+    return last_run_wedged_;
 }
 
 // ---------------------------------------------------------------------------
