@@ -2249,7 +2249,7 @@ Append to `crates/xdna-emu-ffi/src/async_errors.rs`, BEFORE the `#[cfg(test)]` b
 #[no_mangle]
 pub unsafe extern "C" fn xdna_emu_read_async_event_ring(
     handle: *mut XdnaEmuHandle,
-    col: u32,
+    col: u16,
     buf: *mut u8,
     buf_size: u64,
 ) -> i64 {
@@ -2283,7 +2283,7 @@ pub unsafe extern "C" fn xdna_emu_read_async_event_ring(
 #[no_mangle]
 pub unsafe extern "C" fn xdna_emu_async_event_pending(
     handle: *mut XdnaEmuHandle,
-    col: u32,
+    col: u16,
 ) -> i32 {
     if handle.is_null() {
         return -1;

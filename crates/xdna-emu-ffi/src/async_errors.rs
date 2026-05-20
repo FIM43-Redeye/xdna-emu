@@ -44,15 +44,15 @@ pub type XdnaEmuAsyncErrorCallback =
 
 /// Read the last-recorded async-error record into `out`.
 ///
+/// # Safety
+/// `handle` must be a valid pointer from `xdna_emu_create`; `out` must point
+/// to at least `sizeof(XdnaEmuAsyncError)` writable bytes.
+///
 /// # Returns
 /// - `1`: a record is populated and copied to `*out`
 /// - `0`: no errors have been recorded since the last reset
 /// - `-1`: `handle` is null
 /// - `-2`: `out` is null
-///
-/// # Safety
-/// `handle` must be a valid pointer from `xdna_emu_create`; `out` must point
-/// to at least `sizeof(XdnaEmuAsyncError)` writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn xdna_emu_get_last_async_error(
     handle: *mut XdnaEmuHandle,
@@ -78,12 +78,12 @@ pub unsafe extern "C" fn xdna_emu_get_last_async_error(
 /// Clear the async-error cache, all per-column rings, and the drain queue.
 /// Does NOT touch Tier A L1/L2 latch state or any other tile state.
 ///
+/// # Safety
+/// `handle` must be a valid pointer from `xdna_emu_create`.
+///
 /// # Returns
 /// - `0`: success
 /// - `-1`: `handle` is null
-///
-/// # Safety
-/// `handle` must be a valid pointer from `xdna_emu_create`.
 #[no_mangle]
 pub unsafe extern "C" fn xdna_emu_clear_async_errors(handle: *mut XdnaEmuHandle) -> i32 {
     if handle.is_null() {
@@ -99,18 +99,18 @@ pub unsafe extern "C" fn xdna_emu_clear_async_errors(handle: *mut XdnaEmuHandle)
 /// Bytes are driver-wire format: `AieErrInfoHeader` (12B) followed by
 /// `err_cnt * AieError` (12B each).
 ///
+/// # Safety
+/// `handle` must be valid; `buf` must point to at least `buf_size` writable bytes.
+///
 /// # Returns
 /// - `N >= 0`: number of bytes copied (always at least 12 for the header)
 /// - `-1`: `handle` is null
 /// - `-2`: `col` is out of range for this device
 /// - `-3`: `buf` is null
-///
-/// # Safety
-/// `handle` must be valid; `buf` must point to at least `buf_size` writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn xdna_emu_read_async_event_ring(
     handle: *mut XdnaEmuHandle,
-    col: u32,
+    col: u16,
     buf: *mut u8,
     buf_size: u64,
 ) -> i64 {
@@ -136,16 +136,16 @@ pub unsafe extern "C" fn xdna_emu_read_async_event_ring(
 
 /// Probe whether column `col`'s ring has any pending records.
 ///
+/// # Safety
+/// `handle` must be valid.
+///
 /// # Returns
 /// - `1`: `err_cnt > 0`
 /// - `0`: ring is empty
 /// - `-1`: `handle` is null
 /// - `-2`: `col` is out of range
-///
-/// # Safety
-/// `handle` must be valid.
 #[no_mangle]
-pub unsafe extern "C" fn xdna_emu_async_event_pending(handle: *mut XdnaEmuHandle, col: u32) -> i32 {
+pub unsafe extern "C" fn xdna_emu_async_event_pending(handle: *mut XdnaEmuHandle, col: u16) -> i32 {
     if handle.is_null() {
         return -1;
     }
