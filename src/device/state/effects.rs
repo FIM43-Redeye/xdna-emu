@@ -359,17 +359,26 @@ impl DeviceState {
             }
         }
 
-        // 11. Event_Generate: fire on trace units and broadcast.
+        // 11. Event_Generate: fire on trace units, broadcast, and (Tier B)
+        // async-error pipeline.
         //
         // The EventModule above handles the event register write, but the
-        // trace units and broadcast propagation also need to be notified.
-        // Event_Generate offset is the first register in the event block.
-        let is_event_generate = match tile.tile_kind {
-            TileKind::Compute => offset == ce.event_generate || offset == me.event_generate,
-            TileKind::Mem => offset == mte.event_generate,
-            TileKind::ShimNoc | TileKind::ShimPl => offset == ce.event_generate,
+        // trace units, broadcast propagation, and the firmware async-error
+        // path also need to be notified. Event_Generate offset is the first
+        // register in the event block; the offset selects which module
+        // fired (core vs mem on compute tiles), which in turn determines
+        // the Tier B origin used for categorization.
+        use xdna_archspec::aie2::async_errors::{is_error_event, AieErrorOrigin};
+        let origin = match tile.tile_kind {
+            TileKind::Compute if offset == ce.event_generate => Some(AieErrorOrigin::Core),
+            TileKind::Compute if offset == me.event_generate => Some(AieErrorOrigin::Mem),
+            TileKind::Mem if offset == mte.event_generate => Some(AieErrorOrigin::MemTile),
+            TileKind::ShimNoc | TileKind::ShimPl if offset == ce.event_generate => Some(AieErrorOrigin::Pl),
+            _ => None,
         };
-        if is_event_generate {
+        // Capture event_id and origin before the tile borrow ends so that
+        // self.async_errors can be borrowed mutably after the tile scope closes.
+        let tier_b = if let Some(origin) = origin {
             let event_id = (value & 0x7F) as u8;
             log::info!(
                 "Tile({},{}) Event_Generate: event_id={} (offset=0x{:X}) cycle={}",
@@ -403,6 +412,22 @@ impl DeviceState {
             // On latch, L1 queues its IRQ_NO into pending_broadcasts so the
             // existing propagate_broadcasts transport carries it to L2.
             tile.tap_l1_interrupt(event_id);
+
+            Some((origin, event_id))
+        } else {
+            None
+        };
+        // tile borrow ends here. self.async_errors can now be borrowed.
+
+        // Tier B firmware async-error path: parallel to Tier A. On real
+        // silicon, firmware delivers errors via mailbox regardless of
+        // AIE L1/L2 enable state -- so this hook fires at event-generation,
+        // not after L1 latches. The two paths are independent: an error
+        // populates Tier B's cache + ring whether or not L1 was enabled.
+        if let Some((origin, event_id)) = tier_b {
+            if is_error_event(event_id, origin) {
+                self.async_errors.record_error(col, row, origin, event_id, current_cycle);
+            }
         }
     }
 
@@ -809,6 +834,82 @@ mod interrupt_path_tests {
         let l1 = dev.array.get(col, row).unwrap().l1_irq.as_ref().unwrap();
         assert_ne!(l1.read_status(SwitchId::A) & (1 << 16), 0);
         assert_eq!(l1.read_status(SwitchId::B), 0, "switch B must not latch");
+    }
+
+    // -- Task 8: Tier B async-error hook end-to-end tests --
+
+    #[test]
+    fn event_generate_for_instr_error_populates_async_cache_and_ring() {
+        use xdna_archspec::aie2::async_errors::{self, AieErrorOrigin, AmdxdnaErrorModule, AmdxdnaErrorNum};
+        let mut dev = DeviceState::new_npu1();
+        // Drive simulated time so ts_us is nonzero -- proves the cycle-as-ts
+        // conversion is wired (not a literal 0 from absent cycle plumbing).
+        dev.array.set_dma_cycle(50_000);
+
+        // Fire INSTR_ERROR on a compute tile via the real production path.
+        let (col, row) = (1u8, 2u8);
+        dev.fire_event_generate_for_test(col, row, 69);
+
+        // Cache populated with the right decode.
+        let cache = dev.async_errors.last_cache().expect("cache must populate");
+        let expected_err = async_errors::build_critical_aie_error_code(
+            AmdxdnaErrorNum::AieInstruction,
+            AmdxdnaErrorModule::AieCore,
+        );
+        assert_eq!(cache.err_code, expected_err, "err_code must decode INSTR_ERROR");
+        assert_eq!(cache.ex_err_code, ((row as u64) << 8) | col as u64, "ex_err_code packs row|col");
+        assert_eq!(cache.ts_us, 50, "ts_us = 50_000 cycles / 1000 = 50 us");
+
+        // Ring at col 1 has the wire-format record.
+        let ring = dev.async_errors.ring(col).expect("ring must exist");
+        assert_eq!(ring.header().err_cnt, 1);
+        let rec = &ring.records()[0];
+        assert_eq!(rec.event_id, 69);
+        assert_eq!(rec.row, row);
+        assert_eq!(rec.col, col);
+        assert_eq!(rec.mod_type, AieErrorOrigin::Core.wire_mod_type());
+    }
+
+    #[test]
+    fn event_generate_for_non_error_event_does_not_record_async() {
+        let mut dev = DeviceState::new_npu1();
+        let (col, row) = (1u8, 2u8);
+        // Event 7 is NOT in any error table (it's a generic user event).
+        dev.fire_event_generate_for_test(col, row, 7);
+        assert!(dev.async_errors.last_cache().is_none(), "non-error event must not populate the async cache");
+        assert_eq!(dev.async_errors.ring(col).unwrap().header().err_cnt, 0);
+    }
+
+    #[test]
+    fn tier_a_fires_independently_of_tier_b_for_non_error_shim_event() {
+        use crate::device::interrupts::{L1_REG_ENABLE_A, L1_REG_IRQ_NO_A, SwitchId};
+        let mut dev = DeviceState::new_npu1();
+        // Configure shim L1 to latch on event 7 (use 7 not 69 so this test
+        // doesn't depend on INSTR_ERROR being in any shim event-slot mapping).
+        // Then drive event 7 on a SHIM tile and verify L1 latched.
+        let (col, row) = (0u8, 0u8);
+        {
+            let t = dev.array.get_mut(col, row).unwrap();
+            let l1 = t.l1_irq.as_mut().unwrap();
+            l1.set_irq_event_slot(SwitchId::A, 0, 7);
+            l1.write_register(L1_REG_ENABLE_A, 1 << 16);
+            l1.write_register(L1_REG_IRQ_NO_A, 5);
+        }
+        dev.fire_event_generate_for_test(col, row, 7);
+
+        // Tier A: L1 latched + IRQ_NO queued.
+        let t = dev.array.get(col, row).unwrap();
+        let l1 = t.l1_irq.as_ref().unwrap();
+        assert_ne!(l1.read_status(SwitchId::A) & (1 << 16), 0, "Tier A L1 must latch");
+        assert!(t.pending_broadcasts.contains(&5), "Tier A IRQ_NO must queue");
+
+        // Tier B: shim event 7 is NOT in the SHIM_EVENT_CAT table, so no
+        // async record. This proves Tier A fires independently of Tier B
+        // (a Tier-A-only event leaves Tier B's cache empty).
+        assert!(
+            dev.async_errors.last_cache().is_none(),
+            "non-error shim event must not populate async cache; Tier B is independent"
+        );
     }
 
     // -- Task 5: hardware error -> EventModule -> broadcast -> L1 -> L2 --

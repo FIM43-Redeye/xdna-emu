@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use xdna_archspec::runtime::{ArchConfig, ModelConfig};
 use super::array::TileArray;
+use super::async_errors::AsyncErrorSink;
 use super::registers::TileAddress;
 use super::registers::{subsystem_from_offset, tile_kind_from_row};
 use super::tile::Tile;
@@ -93,7 +94,7 @@ pub struct DeviceState {
     /// Tier B async-error subsystem: cache + per-column rings + drain queue.
     /// Populated from `state::effects::apply_tile_local_effects` when an
     /// error-category event is generated.
-    pub async_errors: crate::device::async_errors::AsyncErrorSink,
+    pub async_errors: AsyncErrorSink,
 }
 
 impl DeviceState {
@@ -106,7 +107,7 @@ impl DeviceState {
             stats: CdoStats::default(),
             pending_core_enables: Vec::new(),
             start_col: 0,
-            async_errors: crate::device::async_errors::AsyncErrorSink::new(num_cols),
+            async_errors: AsyncErrorSink::new(num_cols),
         }
     }
 
