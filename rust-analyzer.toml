@@ -4,12 +4,22 @@
 # TableGen definitions and links against LLVM FFI. The defaults need
 # adjustment to keep diagnostics accurate.
 
-# Use cargo check (not clippy) for diagnostics -- faster, less noisy
+# Use cargo check (not clippy) for diagnostics -- faster, less noisy.
+#
+# Tightened scope: allTargets = false (skip tests/examples/benches) and
+# features = [] (default-only). Cuts check time, narrowing the
+# stale-diagnostic window where rust-analyzer publishes a check result
+# for an older file state because the implementer edited again before
+# the previous check finished.
+#
+# This is rust-analyzer's own check invocation only; manual `cargo
+# check` / `cargo build` / `cargo test` from the terminal are
+# completely unaffected (cargo does not read rust-analyzer.toml).
 [check]
 command = "check"
-
-# Run check on the full workspace (includes xdna-archspec crate)
 workspace = true
+allTargets = false
+features = []
 
 # Increase cargo timeout -- build.rs can be slow on first run (TableGen
 # parsing, LLVM FFI compilation)
