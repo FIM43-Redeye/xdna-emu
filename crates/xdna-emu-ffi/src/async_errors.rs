@@ -11,6 +11,7 @@
 //! - Buffers are copy-on-read; caller retains ownership.
 
 use std::ffi::c_void;
+use std::slice;
 
 use xdna_emu_core::device::async_errors::AmdxdnaAsyncError;
 
@@ -43,11 +44,11 @@ pub type XdnaEmuAsyncErrorCallback =
 
 /// Read the last-recorded async-error record into `out`.
 ///
-/// Returns:
-///   1 if a record is populated and copied to `*out`
-///   0 if no errors have been recorded since the last reset
-///  -1 if `handle` is null
-///  -2 if `out` is null
+/// # Returns
+/// - `1`: a record is populated and copied to `*out`
+/// - `0`: no errors have been recorded since the last reset
+/// - `-1`: `handle` is null
+/// - `-2`: `out` is null
 ///
 /// # Safety
 /// `handle` must be a valid pointer from `xdna_emu_create`; `out` must point
@@ -63,6 +64,7 @@ pub unsafe extern "C" fn xdna_emu_get_last_async_error(
     if out.is_null() {
         return -2;
     }
+
     let handle = &mut *handle;
     match handle.engine.device().async_errors.last_cache() {
         Some(rec) => {
@@ -76,9 +78,9 @@ pub unsafe extern "C" fn xdna_emu_get_last_async_error(
 /// Clear the async-error cache, all per-column rings, and the drain queue.
 /// Does NOT touch Tier A L1/L2 latch state or any other tile state.
 ///
-/// Returns:
-///   0 on success
-///  -1 if `handle` is null
+/// # Returns
+/// - `0`: success
+/// - `-1`: `handle` is null
 ///
 /// # Safety
 /// `handle` must be a valid pointer from `xdna_emu_create`.
@@ -87,9 +89,77 @@ pub unsafe extern "C" fn xdna_emu_clear_async_errors(handle: *mut XdnaEmuHandle)
     if handle.is_null() {
         return -1;
     }
+
     let handle = &mut *handle;
     handle.engine.device_mut().async_errors.clear();
     0
+}
+
+/// Copy up to `buf_size` bytes from column `col`'s ring buffer into `buf`.
+/// Bytes are driver-wire format: `AieErrInfoHeader` (12B) followed by
+/// `err_cnt * AieError` (12B each).
+///
+/// # Returns
+/// - `N >= 0`: number of bytes copied (always at least 12 for the header)
+/// - `-1`: `handle` is null
+/// - `-2`: `col` is out of range for this device
+/// - `-3`: `buf` is null
+///
+/// # Safety
+/// `handle` must be valid; `buf` must point to at least `buf_size` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_read_async_event_ring(
+    handle: *mut XdnaEmuHandle,
+    col: u32,
+    buf: *mut u8,
+    buf_size: u64,
+) -> i64 {
+    if handle.is_null() {
+        return -1;
+    }
+    if buf.is_null() {
+        return -3;
+    }
+
+    let handle = &mut *handle;
+    let col_u8 = match u8::try_from(col) {
+        Ok(c) => c,
+        Err(_) => return -2,
+    };
+    let ring = match handle.engine.device().async_errors.ring(col_u8) {
+        Some(r) => r,
+        None => return -2,
+    };
+    let dst = slice::from_raw_parts_mut(buf, buf_size as usize);
+    ring.read_into(dst) as i64
+}
+
+/// Probe whether column `col`'s ring has any pending records.
+///
+/// # Returns
+/// - `1`: `err_cnt > 0`
+/// - `0`: ring is empty
+/// - `-1`: `handle` is null
+/// - `-2`: `col` is out of range
+///
+/// # Safety
+/// `handle` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_async_event_pending(handle: *mut XdnaEmuHandle, col: u32) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+
+    let handle = &mut *handle;
+    let col_u8 = match u8::try_from(col) {
+        Ok(c) => c,
+        Err(_) => return -2,
+    };
+    match handle.engine.device().async_errors.ring(col_u8) {
+        Some(r) if r.header().err_cnt > 0 => 1,
+        Some(_) => 0,
+        None => -2,
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +246,99 @@ mod tests {
         unsafe {
             let rc = xdna_emu_clear_async_errors(std::ptr::null_mut());
             assert_eq!(rc, -1);
+        }
+    }
+
+    #[test]
+    fn read_async_event_ring_returns_header_only_when_empty() {
+        unsafe {
+            with_handle(|h| {
+                let mut buf = vec![0u8; 64];
+                let n = xdna_emu_read_async_event_ring(h, 0, buf.as_mut_ptr(), buf.len() as u64);
+                // Empty ring returns just the 12-byte header (err_cnt = 0).
+                assert_eq!(n, 12);
+                assert_eq!(&buf[0..4], &0u32.to_le_bytes());
+            });
+        }
+    }
+
+    #[test]
+    fn read_async_event_ring_returns_payload_after_record() {
+        unsafe {
+            with_handle(|h| {
+                let dev = (*h).engine.device_mut();
+                dev.async_errors.record_error(1, 2, AieErrorOrigin::Core, 69, 1_000);
+
+                let mut buf = vec![0u8; 64];
+                let n = xdna_emu_read_async_event_ring(h, 1, buf.as_mut_ptr(), buf.len() as u64);
+                // 12-byte header + 12-byte record = 24 bytes.
+                assert_eq!(n, 24);
+                assert_eq!(&buf[0..4], &1u32.to_le_bytes(), "err_cnt = 1");
+                assert_eq!(buf[12], 2, "record row");
+                assert_eq!(buf[13], 1, "record col");
+                assert_eq!(buf[20], 69, "record event_id (offset 12+8)");
+            });
+        }
+    }
+
+    #[test]
+    fn read_async_event_ring_invalid_col_returns_minus_two() {
+        unsafe {
+            with_handle(|h| {
+                let mut buf = vec![0u8; 64];
+                let n = xdna_emu_read_async_event_ring(h, 99, buf.as_mut_ptr(), buf.len() as u64);
+                assert_eq!(n, -2);
+            });
+        }
+    }
+
+    #[test]
+    fn read_async_event_ring_null_buf_returns_minus_three() {
+        unsafe {
+            with_handle(|h| {
+                let n = xdna_emu_read_async_event_ring(h, 0, std::ptr::null_mut(), 64);
+                assert_eq!(n, -3);
+            });
+        }
+    }
+
+    #[test]
+    fn read_async_event_ring_null_handle_returns_minus_one() {
+        unsafe {
+            let mut buf = vec![0u8; 64];
+            let n =
+                xdna_emu_read_async_event_ring(std::ptr::null_mut(), 0, buf.as_mut_ptr(), buf.len() as u64);
+            assert_eq!(n, -1);
+        }
+    }
+
+    #[test]
+    fn async_event_pending_zero_on_empty() {
+        unsafe {
+            with_handle(|h| {
+                assert_eq!(xdna_emu_async_event_pending(h, 0), 0);
+            });
+        }
+    }
+
+    #[test]
+    fn async_event_pending_one_after_record() {
+        unsafe {
+            with_handle(|h| {
+                let dev = (*h).engine.device_mut();
+                dev.async_errors.record_error(3, 2, AieErrorOrigin::Core, 69, 1_000);
+                assert_eq!(xdna_emu_async_event_pending(h, 3), 1);
+                assert_eq!(xdna_emu_async_event_pending(h, 0), 0, "col 0 still empty");
+            });
+        }
+    }
+
+    #[test]
+    fn async_event_pending_invalid_col_returns_minus_two() {
+        unsafe {
+            with_handle(|h| {
+                assert_eq!(xdna_emu_async_event_pending(h, 99), -2);
+            });
         }
     }
 }
