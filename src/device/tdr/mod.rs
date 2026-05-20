@@ -10,3 +10,5 @@
 //!   algorithm this lets a driver consumer drive)
 
 pub mod detector;
+
+pub use detector::{QuiescenceDetector, QuiescenceStatus, StallDetector, StallStatus, TdrDiagnosis};

@@ -1167,7 +1167,7 @@ impl XclbinSuite {
         mut npu_executor: Option<&mut NpuExecutor>,
         output_addr: u64,
     ) -> TestOutcome {
-        use super::quiescence::{QuiescenceDetector, QuiescenceStatus, StallDetector, StallStatus};
+        use crate::device::tdr::{QuiescenceDetector, QuiescenceStatus, StallDetector, StallStatus};
 
         const QUIESCENCE_CYCLES: u64 = 100;
 
