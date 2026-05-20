@@ -93,6 +93,17 @@ AMDXDNA_TRACE=true   # opt-out via --no-amdxdna-trace; ringbuffer-captures
                      # amdxdna kernel tracepoints around the HW phase so a
                      # mid-sweep wedge leaves the host->FW->IRQ->fence chain
                      # snapshotted to $RESULTS_DIR/amdxdna.{trace,dmesg}.
+WITH_DEBUG_HALT_PROBE=false  # opt-in via --with-debug-halt-probe.
+                             # debug_halt_probe is constructed to deliberately
+                             # wedge the NPU to exercise the kernel-driver TDR
+                             # recovery path. On this dev box (Phoenix +
+                             # current amdxdna), TDR recovery is unreliable in
+                             # practice -- the device usually stays poisoned
+                             # post-TDR until reboot, cascading every
+                             # subsequent HW test in the sweep to a 7.7s
+                             # test.exe timeout. Skipped by default; opt back
+                             # in explicitly when validating TDR-recovery
+                             # changes on a known-good kernel/driver state.
 SWEEP=false
 PC_ANCHORED=false
 MODE2=false
@@ -130,6 +141,8 @@ while [[ $# -gt 0 ]]; do
     --no-trace)            NO_TRACE=true; shift ;;
     --trace)               NO_TRACE=false; shift ;;
     --no-amdxdna-trace)    AMDXDNA_TRACE=false; shift ;;
+    --with-debug-halt-probe)
+                           WITH_DEBUG_HALT_PROBE=true; shift ;;
     --sweep)               SWEEP=true; shift ;;
     --trace=pc-anchored)   PC_ANCHORED=true; NO_TRACE=false; shift ;;
     --mode2)               MODE2=true; PC_ANCHORED=true; NO_TRACE=false; shift ;;
@@ -155,6 +168,13 @@ Options:
                   phase (default: enabled).  When on, ringbuffer-captures
                   xdna_job + mailbox events to RESULTS_DIR/amdxdna.{trace,
                   dmesg} so a mid-sweep wedge leaves diagnosable history.
+  --with-debug-halt-probe
+                  Include debug_halt_probe in the run.  This test
+                  deliberately wedges the NPU to exercise TDR recovery;
+                  on dev boxes where amdxdna TDR doesn't fully recover,
+                  it poisons the device for every test after it. Skipped
+                  by default; opt back in when validating TDR-recovery
+                  changes on a known-good kernel/driver.
   --sweep         Run full event sweep (trace-sweep.py) on passing tests after runs
   --trace=pc-anchored
                   Run mode-1 (event_pc) lockstep sweep on passing tests and
@@ -2562,6 +2582,7 @@ print_report() {
         [[ "$cr" == "SKIP_NPU2" ]] && skip_label="SKIP(npu2)"
         [[ "$cr" == "SKIP_COMPILER" ]] && skip_label="SKIP(compiler)"
         [[ "$cr" == "SKIP_QUARANTINED" ]] && skip_label="SKIP(quarantine)"
+        [[ "$cr" == "SKIP_DEBUG_HALT_PROBE" ]] && skip_label="SKIP(tdr-injector)"
         if [[ "$run_hw" == "true" ]]; then
           printf "  %-${col_width}s" "$skip_label"
         fi
@@ -2950,9 +2971,11 @@ main() {
   info "Results in: $RESULTS_DIR"
   echo ""
 
-  # Filter out npu2-only tests before running phases.
+  # Filter out npu2-only tests and (by default) the TDR-injector test
+  # debug_halt_probe before running phases.
   local runnable=()
   local skipped_npu2=0
+  local skipped_debug_halt_probe=0
   for name in "${tests[@]}"; do
     if requires_npu2 "$TEST_SRC/$name"; then
       local safe
@@ -2964,6 +2987,16 @@ main() {
         echo "SKIP_NPU2" > "$RESULTS_DIR/${safe}.${_c}.compile.result"
       done
       ((skipped_npu2++)) || true
+    elif [[ "$name" == "debug_halt_probe" ]] && ! $WITH_DEBUG_HALT_PROBE; then
+      local safe
+      safe="$(sanitize_name "$name")"
+      local compilers
+      read -ra compilers <<< "$COMPILERS_STR"
+      for _c in "${compilers[@]}"; do
+        echo "SKIP_DEBUG_HALT_PROBE" > "$RESULTS_DIR/${safe}.${_c}.bridge.result"
+        echo "SKIP_DEBUG_HALT_PROBE" > "$RESULTS_DIR/${safe}.${_c}.compile.result"
+      done
+      ((skipped_debug_halt_probe++)) || true
     else
       runnable+=("$name")
     fi
@@ -2971,6 +3004,9 @@ main() {
 
   if [[ $skipped_npu2 -gt 0 ]]; then
     info "Skipped $skipped_npu2 npu2-only test(s)"
+  fi
+  if [[ $skipped_debug_halt_probe -gt 0 ]]; then
+    info "Skipped debug_halt_probe (TDR-injector; opt in with --with-debug-halt-probe)"
   fi
 
   # ---- Phase 1b: Auto-rebuild plugin if Rust lib is newer ----------------
