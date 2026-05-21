@@ -557,6 +557,13 @@ which delegates to the Rust emulator via FFI (`src/ffi/`).
 
 **Build**: `./scripts/rebuild-plugin.sh` (debug) / `--release` (release)
 **Install**: rebuild-plugin.sh symlinks the build output into `/opt/xilinx/xrt/lib/`.
+**xdna-driver branch**: the plugin compiles SHIM sources from the sibling
+`xdna-driver` tree, which must be on the `emu-shim-base` branch -- it carries
+the SHIM hooks the plugin needs (protected `m_dev_fd`, `start_col` plumbing)
+and pins the `xrt` submodule to `emu-xrt-base` (virtual `scan_devices`).
+rebuild-plugin.sh warns if it is on another branch. Switch back to a
+PR/work branch when not building the plugin; the branches are clean (no
+working-tree patches).
 **Env contract**:
 - `XDNA_EMU` -- presence (any value) activates the emulator. Plugin replaces
   `xrt::device(0)` so tests target the emulator with no BDF magic. Unset =

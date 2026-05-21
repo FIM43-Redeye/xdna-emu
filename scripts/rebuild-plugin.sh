@@ -14,6 +14,19 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EMU_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$EMU_DIR/xrt-plugin/build"
 
+# The C++ plugin compiles SHIM sources from the sibling xdna-driver tree.
+# It must be on the emu-shim-base branch (protected m_dev_fd + start_col
+# plumbing, xrt submodule pinned to emu-xrt-base). Warn if it is not.
+XDNA_DRIVER_DIR="${XDNA_DRIVER_DIR:-$(dirname "$EMU_DIR")/xdna-driver}"
+if [[ -d "$XDNA_DRIVER_DIR/.git" ]]; then
+  drv_branch="$(git -C "$XDNA_DRIVER_DIR" branch --show-current 2>/dev/null || true)"
+  if [[ "$drv_branch" != "emu-shim-base" ]]; then
+    echo ">>> WARNING: xdna-driver is on '${drv_branch:-?}', expected 'emu-shim-base'." >&2
+    echo ">>>          The plugin build needs that branch's SHIM hooks. Run:" >&2
+    echo ">>>          git -C $XDNA_DRIVER_DIR checkout emu-shim-base && git -C $XDNA_DRIVER_DIR submodule update xrt" >&2
+  fi
+fi
+
 CARGO_FLAGS=""
 PROFILE="debug"
 for arg in "$@"; do

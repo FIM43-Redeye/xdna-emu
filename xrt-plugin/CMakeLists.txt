@@ -14,7 +14,10 @@ set(XRT_INSTALL_DIR "/opt/xilinx/xrt" CACHE PATH "XRT install prefix")
 
 # xdna-driver source tree.  Defaults to the sibling directory in npu-work.
 # Override with -DXDNA_DRIVER_DIR=/path/to/xdna-driver on the cmake line.
-# NOTE: Two patches are required -- see ../patches/ for details.
+# NOTE: the xdna-driver tree must be on the `emu-shim-base` branch, which
+# carries the SHIM hooks the plugin needs (protected m_dev_fd, start_col
+# plumbing) and pins the xrt submodule to `emu-xrt-base` (virtual
+# scan_devices).  rebuild-plugin.sh warns if it is on another branch.
 set(XDNA_DRIVER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../xdna-driver" CACHE PATH
     "Path to the xdna-driver source tree")
 
