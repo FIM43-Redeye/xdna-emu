@@ -533,7 +533,7 @@ int aie2_smu_start(struct amdxdna_dev_hdl *ndev)
 So the driver can never reach POWER_ON during re-probe because its
 defensive POWER_OFF fails first.  But **POWER_ON works on its own**.
 
-### Driver workaround candidate (untested)
+### Driver workaround candidate (VALIDATED -- see Resolution below)
 
 If `aie2_smu_start()` skipped the defensive POWER_OFF (or treated its
 failure as non-fatal) on the wedged-device path, re-probe might
@@ -591,3 +591,71 @@ Requires root via `pkexec`.  Default targets BDF `0000:c6:00.1`;
 override with `--bdf`.  Don't run `exec` mode on a healthy device --
 some command numbers are documented but most aren't, and writing an
 undocumented command number is undefined behavior.
+
+## Resolution (2026-05-20): in-place reload, built and validated
+
+The workaround candidate above was built, installed, and tested on a
+genuinely wedged device. **It works.** Two patches (Tier 1), in the
+`xdna-driver` repo:
+
+**Patch A -- `aie2_smu.c`.** `aie2_smu_start()` demotes the defensive
+`POWER_OFF` failure from a fatal `return` to an `XDNA_WARN`, then
+proceeds to `POWER_ON`. Exactly the candidate above.
+
+**Patch B -- `aie2_pci.c` / `aie2_pci.h` / `aie2_debugfs.c`.**
+`aie2_hw_reload()` runs `aie2_hw_suspend()` + `aie2_hw_resume()` --
+the device-level stop/start the PM callbacks already use (SMU
+power-cycle, PSP firmware reload, mailbox re-init) -- with **no module
+unload**. Exposed as a debugfs file: `echo reload > <debugfs>/reload`.
+This avoids `modprobe -r`, whose `drm_dev_unplug` ->
+`synchronize_srcu` can wedge unkillably on a poisoned mailbox.
+
+### Validation run
+
+Wedged the NPU with the full bridge suite (`emu-bridge-test.sh
+--with-debug-halt-probe`): MGMT mailbox went dead, 36 `Wait for
+completion timeout` / `create context failed, ret -62` lines, every
+HW test core-dumping. (A single `debug_halt_probe/test.exe` run did
+*not* wedge it -- the kernel failed cleanly and the FW stayed live;
+sustained multi-kernel load is the reliable trigger.)
+
+Then `echo reload`:
+
+```
+aie2_reload_write: In-place hardware reload requested via debugfs
+aie2_suspend_fw: Failed to suspend fw, ret -62          (FW dead, finite ~5s timeout)
+aie2_mgmt_fw_fini: suspend_fw failed -> npu firmware suspended
+[drm] *ERROR* smu cmd 4 failed, 0xff                    (the wedge signature)
+aie2_smu_start: Defensive power off failed (ret -22); continuing to power on
+...POWER_ON + aie2_psp_start firmware reload...
+xdna_mailbox.145: req opcode 0x108 -> FW version 1.5.5.391   (FW MAILBOX ALIVE)
+aie2_hw_reload: Hardware reload complete
+```
+
+`xrt-smi validate` afterward: latency PASSED (126 us), throughput
+PASSED (16932 op/s). Full recovery, no reboot, no `modprobe`.
+
+### What it proved
+
+- **Patch A is load-bearing.** `smu cmd 4 failed, 0xff` *did* occur
+  during the reload; without the demotion `aie2_smu_start` returns
+  `-22` there and the whole reload aborts -- the exact `modprobe`
+  failure. The demoted warning let it continue to `POWER_ON`.
+- **The PSP firmware reload resets a wedged LX7.** This was the open
+  question. The FW mailbox went from dead (36 timeouts) to fully
+  alive; `aie2_psp_start`'s VALIDATE + START + COPY_FW restarts the
+  LX7 core, not just recopies bytes.
+- The teardown (`aie2_rq_stop_all`, mailbox destroy) **completed** --
+  this is the "teardown-completes" wedge class.
+
+### Scope and limits
+
+Tier 1 recovers the **teardown-completes class** (debug_halt_probe /
+sustained-load wedges where the per-context destroy still drains).
+It does **not** rescue the `AIE_RW_ACCESS` poisoned-mailbox class,
+where `aie2_rq_stop_all` can itself block on
+`dma_resv_wait_timeout(..., MAX_SCHEDULE_TIMEOUT)` (`aie2_ctx.c:1025`,
+infinite by design, with TDR as the only -- also firmware-dependent --
+escape hatch). Recovering that class needs a reset-first reorder +
+fence cancellation (Tier 2), and is the strongest candidate for an
+upstream AMD bug report.
