@@ -175,8 +175,12 @@ Outputs land in `ghidra-projects/npu-fw/analysis-xtensa/`.
 
 ## What this enables for our specific goals
 
-With a coherent 590-function disassembly, the recovery-investigation
-targets are now reachable:
+The suspend / `waitmode` path has since been mapped on top of this
+characterization -- see
+[`2026-05-20-npu-fw-suspend-waitmode-path.md`](2026-05-20-npu-fw-suspend-waitmode-path.md).
+
+With a coherent disassembly, the recovery-investigation targets are now
+reachable:
 
 - **Mailbox dispatcher** -- map host message opcodes to handler
   functions; look for a "prepare for power-down / suspend" opcode.

@@ -13,8 +13,10 @@
 #   1. prepare -- extracts the plaintext body from the signed .sbin.
 #   2. analyze -- runs Ghidra's headless analyzer on the body with the
 #      Xtensa language, rebases it to the recovered load address so
-#      l32r literal pools resolve, runs full auto-analysis, and dumps
-#      text artifacts (functions.tsv, strings.tsv, disasm.txt).
+#      l32r literal pools resolve, runs full auto-analysis, seeds
+#      functions at every 'entry' prologue the call-graph walk missed
+#      (SeedFunctions.java -- recovers indirectly-reached code), and
+#      dumps text artifacts (functions.tsv, strings.tsv, disasm.txt).
 #
 # Ghidra's GUI is not scriptable for this workflow; everything is
 # CLI-driven and reproducible.  Outputs land in <WORK_DIR>/analysis-xtensa/.
@@ -84,6 +86,7 @@ cmd_analyze() {
         -processor "$LANGUAGE" \
         -scriptPath "$GHIDRA_SCRIPTS" \
         -preScript SetImageBase.java "$LOAD_BASE" \
+        -postScript SeedFunctions.java \
         -postScript DumpNpuFw.java "$ANALYSIS_DIR" \
         -overwrite
 
