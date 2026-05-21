@@ -98,6 +98,13 @@ set_target_properties(xrt_driver_emu PROPERTIES
 # can still resolve our exported FFI through the normal global namespace.
 target_link_options(xrt_driver_emu PRIVATE -Wl,-Bsymbolic)
 
+# Version script: make every symbol local. The plugin self-registers via a
+# static constructor, so it exports nothing -- and hiding its symbols stops
+# them interposing (or being interposed by) the real driver SHIM co-loaded
+# in the same process. See xrt_driver_emu.map.
+target_link_options(xrt_driver_emu PRIVATE
+  "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/xrt_driver_emu.map")
+
 target_compile_definitions(xrt_driver_emu PRIVATE
   XRT_ENABLE_AIE
   XRT_AIE_BUILD
