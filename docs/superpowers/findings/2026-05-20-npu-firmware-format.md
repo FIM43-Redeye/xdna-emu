@@ -1,13 +1,22 @@
 # NPU firmware format characterization (Phoenix, FW 1.5.5.391)
 
-**Status:** Initial format characterization complete (2026-05-20).  Body
-confirmed plaintext, code identified as ARM Thumb-2, function entry
-points enumerated.  Full reverse engineering not attempted; this doc
-captures the prerequisites that make it feasible.
+**Status:** Format and architecture characterized (2026-05-20). Body
+confirmed plaintext; processor identified as **Xtensa LX7 little-endian**;
+load base recovered; 590 functions disassembled with a connected call
+graph. Functional reverse engineering (mailbox dispatcher, power-down
+handshake) is the follow-on task.
+
+> **Correction (2026-05-20):** an earlier revision of this document
+> claimed the firmware was ARM Thumb-2. That was wrong. It rested on a
+> single 16-bit pattern match (`0xB5xx`, read as a Thumb `push {…,lr}`
+> prologue) at body offset 0x4918 -- which, once actually disassembled,
+> is data, not code (a region of ASCII hex digits from the SHA-256
+> block). The architecture below is verified: see "Evidence" and
+> "Verification".
 
 **Related:**
 [`2026-05-20-amdxdna-tdr-recovery-incomplete-on-phoenix.md`](2026-05-20-amdxdna-tdr-recovery-incomplete-on-phoenix.md)
-(the investigation that led to wanting to look at FW internals).
+(the investigation that motivated looking at FW internals).
 
 ## File layout
 
@@ -18,169 +27,171 @@ The firmware blob lives at `/lib/firmware/amdnpu/1502_00/`:
 | `npu.dev.sbin` | 248,592 B | Uncompressed copy ("dev" is misleading, see below) |
 | `npu.sbin.1.5.5.391.zst` | 75,293 B | zstd-compressed; decompresses to **byte-identical** `npu.dev.sbin` |
 | `npu.sbin.1.5.2.380.zst` | 73,534 B | Older version, similar shape |
-| `npu_7.sbin.zst` | symlink | → 1.5.5.391 (used by current driver per dmesg `Request fw amdnpu/1502_00/npu.dev.sbin`) |
+| `npu_7.sbin.zst` | symlink | -> 1.5.5.391 (used by current driver per dmesg `Request fw amdnpu/1502_00/npu.dev.sbin`) |
 
-**The "dev" suffix is misleading**: `npu.dev.sbin` is byte-identical to
-the production `npu.sbin.1.5.5.391.zst` after decompression.  Same 413
-strings, same entropy profile, same SHA-256 in the metadata header.
-There's no separate "dev" build; it's just an uncompressed convenience
-copy of the prod firmware.
+The `npu.dev.sbin` "dev" suffix is misleading: it is byte-identical to
+the production `npu.sbin.1.5.5.391.zst` after decompression. Same
+strings, same entropy profile. There is no separate "dev" build; it is
+just an uncompressed convenience copy.
 
-## Format: AMD PSP `$PS1`-signed binary
+The driver picks the firmware path in
+`xdna-driver/src/driver/amdxdna/npu1_regs.c:84`:
+`.fw_path = "amdnpu/1502_00/npu.dev.sbin"`.
 
-Header format from
-[`psptool`](https://github.com/PSPReverse/psptool)'s
-`HeaderFile` parser (`psptool/header_file.py:42-52`):
+## Container: AMD PSP `$PS1`-signed binary
 
-| Offset | Field | Our value | Meaning |
-|--------|-------|-----------|---------|
-| `0x00` | hash/signature prefix | `4e 81 cd c2 6c 02 f0 f6 a7 26 a8 26 7d 34 78 d9` | First 16 bytes of signature blob |
-| `0x10` | magic | `$PS1` (`24 50 53 31`) | AMD PSP signed binary v1 |
-| `0x14` | (body_size in some variants) | `0x000309C9` = 199,625 | Implementation-specific |
-| `0x18` | encrypted flag | `0` | **NOT encrypted** |
-| `0x34` | signature_type | `0` | Signature is 256 bytes (RSA-2048-class) |
-| `0x38` | signature_fingerprint | `12 e2 74 db 36 9e 47 39 ad 5c b0 17 5e 48 21 ff` | Identifies signing cert |
-| `0x48` | compressed flag | `0` | **NOT compressed** |
-| `0x50` | size_uncompressed | `0x000309C9` = 199,625 | Matches body_size since not packed |
-| `0x6C` | packed_size | `0x0003CB10` = 248,592 | Matches total file size |
+| File offset | Field | Value | Meaning |
+|-------------|-------|-------|---------|
+| `0x000` | signature prefix | 16 bytes | First bytes of the signature blob |
+| `0x010` | magic | `$PS1` | AMD PSP signed binary v1 |
+| `0x014` | body size | `0x0003C910` = 248,080 | Plaintext payload size |
+| `0x018` | encrypted flag | `0` | **NOT encrypted** |
+| `0x030` | (constant) | `1` | -- |
+| `0x038` | signing fingerprint | 16 bytes | Identifies the signing cert |
+| `0x048` | compressed flag | `0` | **NOT compressed** |
+| `0x050` | uncompressed size | `0x0003C910` = 248,080 | Equals body size -> not packed |
+| `0x06C` | packed size | `0x0003CB10` = 248,592 | Equals total file size |
+| `0x0D0` | digest | 32 bytes | Image hash |
 
-Header is 256 bytes (0x100).  Body starts at file offset 0x100.
-Signature is 256 bytes, located at file end.  Body covers
-`[0x100, file_end - 0x100)` = 248,080 bytes of plaintext code+data.
+Header is 256 bytes (`0x100`). Body is `[0x100, 0x3CA10)` = 248,080
+bytes of plaintext code+data. Signature is the trailing 256 bytes.
 
-## Section structure
+(The earlier psptool-derived field table was a generic `$PS1` guess and
+mislabelled several offsets; the table above is read directly from the
+file. psptool's `Blob` parser cannot read this file at all -- it expects
+a multi-MB ROM -- so the header was parsed by hand.)
 
-Entropy mapping at 4KB granularity reveals two dense payload regions
-separated by a 120KB zero gap:
+## Not encrypted, not compressed
+
+A sliding-window (2 KB) Shannon-entropy map of the body never exceeds
+~7.1 bits/byte. Whole-image encryption or compression would read ~7.9+.
+The dense code regions sit at ~7.0 -- high for fixed-width RISC, but
+normal for the variable-length Xtensa encoding (see below). The body is
+plaintext.
+
+## Processor architecture: Xtensa LX7 (little-endian)
+
+The firmware runs on a **Cadence/Tensilica Xtensa LX7** core -- the NPU's
+embedded management microcontroller.
+
+### Evidence (from the open-source driver -- authoritative)
+
+- `xdna-driver/src/driver/amdxdna/aie4_debugfs.c:392` --
+  `{"echo msg between host and lx7 firmware", test_msg_echo}`. The
+  firmware that exchanges mailbox messages with the host is explicitly
+  the **"lx7 firmware"**.
+- `xdna-driver/src/include/uapi/drm_local/amdxdna_accel.h:691-692` --
+  fatal-error reporting carries `fatal_error_exception_type`
+  ("LX7 exception type") and `fatal_error_exception_pc`
+  ("LX7 program counter"). The driver models the NPU controller's faults
+  in LX7 terms.
+- `xdna-driver/.../amdxdna_ctx.h:99-100` -- same LX7 exception fields.
+
+The `uc_index /* microblaze controller index */` comments in
+`amdxdna_ctx.h:89` / `ve2_hwctx.c` are a **red herring** for Phoenix:
+they describe the Versal/VE2 path, not the Ryzen AI NPU. (aie-rt's build
+system also has a MicroBlaze cross-compile target, `Makefile.rsc`, but
+that is a generic aie-rt build option, not what this firmware uses.)
+
+### Verification
+
+Imported into Ghidra 12.1 as `Xtensa:LE:32:default` (Ghidra ships an
+Xtensa processor module). The result is unambiguous:
+
+| | as ARM Thumb (wrong) | as Xtensa LE (correct) |
+|---|---|---|
+| Functions recovered | 40 | **590** |
+| With a real caller/callee | 1 | **~500** |
+| Disassembly | incoherent | coherent; branch targets resolve |
+
+Sample (function at `0x08ad5630`):
 
 ```
-off=    0 (  0 KB):  25% non-null  (header + metadata)
-off= 4096 (  4 KB):   0%           (padding)
-off=16384 ( 16 KB):  95% non-null  ###  <-- Section 1 starts
-off=20480 ( 20 KB):  94%           ###
-... (dense through 56KB) ...
-off=61440 ( 60 KB):  18%           (tail of Section 1)
-off=65536 ( 64 KB):   0%           (gap)
-... (zero through ~180KB) ...
-off=184320 (180 KB):  89% non-null  ###  <-- Section 2 starts
-off=200704 (196 KB):  91%           ###
-... (dense through 240KB) ...
-off=245760 (240 KB):  66%           (tail of Section 2)
+08ad5630  entry a1,0x50            ; Xtensa windowed-ABI prologue
+08ad5633  rsil  a2,0x2             ; read+set interrupt level (privileged)
+08ad5639  l32r  a2,0x08ad554c      ; PC-relative literal load
+08ad5641  memw                    ; memory barrier
+08ad5644  l32r  a5,0x08ad5550      ; -> 0xDEADBEEF
+08ad5656  beq   a7,a5,0x08ad566e   ; branch target inside the function
 ```
 
-- **Section 1**: file offset 0x4000–0xF000 (16K–60K), ~44KB
-- **Zero gap**: file offset 0xF000–0x2D000 (60K–180K), ~120KB
-- **Section 2**: file offset 0x2D000–0x3CA10 (180K–244K), ~68KB
+`entry`, `rsil`, `memw`, `l32r`, `add.n`/`l32i.n` (16-bit "narrow"
+code-density instructions), and `call8` windowed calls are all
+characteristic Xtensa. The mixed 16/24-bit instruction lengths are why
+the body's entropy reads ~7.0 and why every fixed-width disassembler
+(ARM, Thumb, MicroBlaze, AArch64, RISC-V, PPC, SH) produced garbage.
 
-The 120KB gap is significant: it suggests the two sections load at
-addresses separated by ~120KB in the NPU's address space, with the
-file padding the LMA difference.  This is typical of an ELF-derived
-binary stripped to raw payload (TEXT segment + RODATA segment at
-distinct virtual addresses).
+## Load base address: 0x08ad3000
 
-## Code architecture: ARM Thumb-2
+Xtensa code reaches absolute targets (string literals, function
+pointers) through PC-relative `l32r` literal pools, where each literal
+holds `load_base + offset`. Correlating the firmware's aligned 32-bit
+words against the 590 Ghidra function offsets *and* the string offsets
+(`tools/fw-find-base.py`) yields a single base that satisfies **both**
+anchor types: `0x08ad3000`.
 
-Section 1 disassembles cleanly as ARM Thumb-2:
+Cross-check: the literal at body `0x2d08c` holds `0x08b006c4`;
+`0x08b006c4 - 0x08ad3000 = 0x2d6c4`, exactly the body offset of the
+string `"XAie_Read32"`. With the image based at `0x08ad3000`, 125+
+string xrefs and the function-pointer tables resolve cleanly.
 
-- 14 valid `push {...lr}` function prologues (0xB5xx pattern) in
-  section 1 alone -- typical of a code section with ~14 functions
-  totalling ~44KB.
-- First prologue at file offset 0x4A18 is `b5 69` =
-  `push {r0, r3, r5, r6, lr}`, followed by coherent Thumb-2
-  instructions including the canonical `add r0, pc, #N` PC-relative
-  addressing idiom (used for loading string/constant addresses).
+Function address range (rebased): `0x08ad5630` - `0x08b0f624`.
 
-Example disasm of first function found:
+## Body structure
 
-```
-00000000 <.data>:
-   0: b569       push {r0, r3, r5, r6, lr}
-   2: 2258       movs r2, #88     @ 0x58
-   4: 2462       movs r4, #98     @ 0x62
-   6: d05f       beq.n 0xc8
-   8: a03e       add  r0, pc, #248  (adr r0, 0x104)    <-- string ref
-   a: 6562       str  r2, [r4, #84]
-   ...
-```
+| Body offset | Content |
+|-------------|---------|
+| `0x00000`-`0x00100` | Metadata: version fields (build 391 = `0x187`), SHA-256 hex, `"Release 1.5.5.391"` |
+| `0x00100`-`0x05000` | Low-density data + pointer tables (function-pointer arrays around `0x03000`-`0x03c00`) |
+| `0x05630`-`0x0f000` | Code region 1 (Xtensa) |
+| `0x0e800`-`0x10000` | Tail strings -- FW self-test names (`aie_ipu_mgmt_test`, etc.) |
+| `0x10000`-`0x2cf00` | Zero gap (~116 KB; LMA padding between the two loaded sections) |
+| `0x2cf00`-`0x32000` | String tables + `l32r` literal-pointer pools (aie-rt symbol/error strings) |
+| `0x32000`-`0x3c624` | Code region 2 (Xtensa) |
 
-This is ordinary ARM Thumb-2 / Cortex-A or Cortex-M code.  Specific
-core variant unknown without more analysis (vector table inspection
-would tell us Cortex-M vs Cortex-A).
+The bulk of the readable strings (181 `XAie_*` symbols) belong to the
+**vendored aie-rt library** linked into the firmware -- we already have
+its source at `../aie-rt/`, so that portion needs no RE. The
+firmware-specific logic (mailbox dispatch, management loop, power
+handling) is the code that *calls* aie-rt.
 
-## Plaintext rodata: 413 strings
+## Toolchain pipeline (CLI-driven, reproducible)
 
-The body contains 413 plaintext strings totalling several KB.
-Notable categories:
+Ghidra's GUI is not scriptable for this workflow, so analysis runs
+headless:
 
-- **aie-rt internal API symbols**: `XAie_Read32`, `XAie_BlockWrite32`,
-  `XAie_CmdWrite`, `XAie_DmaChannelReset`, `XAie_CoreReset`,
-  `XAie_CoreUnreset`, `XAie_CoreGetDebugHaltStatus`, `XAie_Txn_*`,
-  etc.  The FW links against the same aie-rt library we have at
-  `/home/triple/npu-work/aie-rt/`.
-- **Test framework strings**: `aie2_core_module_access_test`,
-  `aie2_mem_tile_access_test`, `msix_interrupt_test`, `tmr_test`,
-  `app_fatal_error_test`, `aie_error_async_msg_sanity` -- these
-  suggest a self-test harness compiled into production FW.
-- **Error message strings**: `Failed to flush cmd buffer`,
-  `Cmd Write operation is not supported when auto flush is disabled`,
-  `Invalid DMA channel reset value`, etc.
-- **Metadata**: SHA-256 hex digest at offset 0x130, followed by
-  the literal "Release 1.5.5.391" version string.
+- `tools/ghidra-npu-fw.sh` -- one-shot driver: extracts the body, runs
+  `analyzeHeadless` with the Xtensa language + correct load base, dumps
+  text artifacts.
+- `tools/ghidra-scripts/SetImageBase.java` -- preScript; rebases the
+  image to `0x08ad3000` before analysis so `l32r` literals resolve.
+- `tools/ghidra-scripts/DumpNpuFw.java` -- postScript; writes
+  `functions.tsv`, `strings.tsv`, `disasm.txt`.
+- `tools/fw-find-base.py` -- recovers the load base from literal pools.
+- `tools/fw-arch-probe.py` -- multi-architecture decode scorer (kept for
+  reference / future firmware blobs).
 
-The presence of unstripped symbol names is unusual for production
-firmware and is a significant aid to reverse engineering: cross-
-referencing strings to their callers immediately identifies function
-purpose.
-
-## What this enables
-
-Full decompilation is feasible.  The prerequisites are:
-
-1. **Header parsing**: psptool's `HeaderFile` parser handles `$PS1`
-   blobs.  It currently fails on this file (`Blob` parser expects a
-   full ROM, minimum ~8MB) -- needs a small wrapper to use the
-   `HeaderFile` class directly on the extracted blob, or just extract
-   the body manually (`dd if=npu.dev.sbin of=body.bin bs=1 skip=256
-   count=248080`).
-2. **Architecture**: ARM Thumb-2.  Specific variant (Cortex-A55 vs
-   Cortex-M vs custom) needs the vector table to confirm.
-3. **Section layout**: two sections (16K-60K, 180K-244K body offsets)
-   with a 120KB virtual-address gap.  Specific load addresses are
-   not yet recovered -- need to look for jump tables or PC-relative
-   accesses near section boundaries to infer.
-4. **Tools**: Ghidra or radare2 with an ARM Cortex profile.  Specify
-   the two sections at their respective load addresses; use the 413
-   plaintext strings as anchors for identifying function purposes.
+Outputs land in `ghidra-projects/npu-fw/analysis-xtensa/`.
 
 ## What this enables for our specific goals
 
-The most valuable functions to identify by reverse engineering, given
-the recovery investigation:
+With a coherent 590-function disassembly, the recovery-investigation
+targets are now reachable:
 
-- **SMU command dispatch** -- understand the POWER_OFF state-machine
-  blocker.  Confirm or refute the "needs FW handshake for clean
-  shutdown" hypothesis from the prior finding.
-- **Mailbox dispatcher** -- map opcodes 0x18, 0x10a, 0x11, 0x108,
-  0x101-0x106, 0x3, etc to handler functions.  Discover whether
-  there's an opcode for "FW soft-reset" that we could use.
-- **Init / shutdown sequences** -- understand what the FW does at
-  startup (after PSP_START) and shutdown.  Useful for understanding
-  why driver reload fails.
-
-## Operational notes for future work
-
-`psptool` is cloned at `/home/triple/npu-work/psptool/` (a sibling of
-xdna-emu / mlir-aie / aie-rt).  Install location:
-`/home/triple/npu-work/mlir-aie/ironenv/bin/psptool` (got pip-installed
-into the active mlir-aie venv).  The `Blob` parser can't read this
-firmware directly (size check); future scripts should instantiate
-`HeaderFile` directly with the file bytes.
+- **Mailbox dispatcher** -- map host message opcodes to handler
+  functions; look for a "prepare for power-down / suspend" opcode.
+- **Power-down handshake** -- understand what the LX7 firmware must do
+  before the SMU can complete `POWER_OFF`. The prior finding's
+  hypothesis (POWER_OFF needs FW cooperation that a hung FW cannot
+  provide) is now testable against the actual shutdown path.
+- **Init / fatal-error path** -- the FW has an LX7 exception handler
+  that feeds `fatal_error_exception_pc` back to the driver; mapping it
+  explains what the driver sees when the NPU wedges.
 
 ## Source policy reminder
 
 This is static analysis of AMD's NPU firmware to understand hardware
 behavior, used as a reading reference per the xdna-emu source policy
-(see top-level CLAUDE.md "Licensing and Relationship to AMD").  No
-code is copied from the firmware into the emulator.  Knowledge about
-the FW's interface, mailbox protocol, and state machines is used to
-inform original emulator implementations.
+(top-level CLAUDE.md, "Licensing and Relationship to AMD"). No firmware
+code is copied into the emulator. Knowledge of the FW's mailbox
+protocol and state machines informs original emulator implementations.
