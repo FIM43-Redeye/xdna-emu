@@ -185,6 +185,17 @@ proposed in 2026-05-13 -- force the legacy `CHAIN_EXEC_BUFFER_CF` op-0x12
 path -- remains the cleanest test, and would now need to be done against
 `drivers/accel`'s feature-table-only gating).
 
+**Update 2026-05-22 (traced re-run).** The silent-drop has since been
+captured directly, on both the driver verbose mailbox log and the kernel
+tracepoints -- see
+[`2026-05-22-chain-exec-npu-silent-drop-captured.md`](2026-05-22-chain-exec-npu-silent-drop-captured.md).
+The "mgmt mailbox responsive but refuses to allocate contexts" symptom
+recorded here is now decoded: a dropped op-0x18 exec leaves a compute
+column whose job is hung, `DESTROY_CONTEXT` fails `AIE2_STATUS_MGMT_ERT_BUSY`
+(0x2000006) because the management firmware cannot reclaim that column,
+the column leaks, and once the pool is exhausted every `CREATE_CONTEXT`
+fails `AIE2_STATUS_MGMT_ERT_NOAVAIL` (0x2000003).
+
 ## Environment cleanup done this session
 
 The `/etc/modprobe.d/` config was stale for `drivers/accel` -- it set five
