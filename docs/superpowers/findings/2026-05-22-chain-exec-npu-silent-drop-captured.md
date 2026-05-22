@@ -1,6 +1,6 @@
 ---
 name: 'CHAIN_EXEC_NPU silent-drop captured directly on Phoenix -- first two-sided trace of the dropped op-0x18 message, plus the column-leak wedge cascade decoded'
-description: A traced ctrl_packet sweep on the drivers/accel tree (kernel 7.0.9-custom, FW 1.5.5.391, TDR recovery active) reproduced the add_one_ctrl_packet wedge with working mailbox tracepoints for the first time. Prior findings (2026-05-13) inferred the silent-drop from 32s latency clustering; this run caught the dropped message itself. The firmware received MSG_OP_CHAIN_EXEC_NPU (op 0x18, id 0x1d000001) on the per-hwctx channel and never raised the i2x completion interrupt -- confirmed independently by the driver verbose mailbox log (TX present, zero resp data) and the kernel tracepoints (mbox_set_tail present, no mbox_irq_handle/rx_worker/set_head). TDR named the hung message explicitly. The wedge cascade was decoded with firmware status codes: the dropped exec leaves a compute column whose job is hung; DESTROY_CONTEXT then fails AIE2_STATUS_MGMT_ERT_BUSY (0x2000006) because the management firmware cannot reclaim that column; the column leaks; once the pool is exhausted every CREATE_CONTEXT fails AIE2_STATUS_MGMT_ERT_NOAVAIL (0x2000003). The management firmware itself stays alive throughout -- it is a compute-column job hang, not a mailbox-transport death. Cross-references the reverse-engineered LX7 firmware (event 0xf mailbox transport FUN_08ad8480, event-driven per-column teardown FUN_08ad70b8).
+description: A traced ctrl_packet sweep on the drivers/accel tree (kernel 7.0.9-custom, FW 1.5.5.391, TDR recovery active) reproduced the add_one_ctrl_packet wedge with working mailbox tracepoints for the first time. Prior findings (2026-05-13) inferred the silent-drop from 32s latency clustering; this run caught the dropped message itself. The firmware received MSG_OP_CHAIN_EXEC_NPU (op 0x18, id 0x1d000001) on the per-hwctx channel and never raised the i2x completion interrupt -- confirmed independently by the driver verbose mailbox log (TX present, zero resp data) and the kernel tracepoints (mbox_set_tail present, no mbox_irq_handle/rx_worker/set_head). TDR named the hung message explicitly. The wedge cascade was decoded with firmware status codes: the dropped exec leaves a compute column whose job is hung; DESTROY_CONTEXT then fails AIE2_STATUS_MGMT_ERT_BUSY (0x2000006) because the management firmware cannot reclaim that column; the column leaks; once the pool is exhausted every CREATE_CONTEXT fails AIE2_STATUS_MGMT_ERT_NOAVAIL (0x2000003). The management firmware itself stays alive throughout -- it is a compute-column job hang, not a mailbox-transport death. The op-0x18 firmware path was then reverse-engineered end to end from the decompiled LX7 image: exec ops are served by a per-hwctx APP-ERT RTOS task (FUN_08b04554 -> FUN_08b05194), the op-0x18 handler unconditionally sends a response unless its task blocks, and the task blocks on an RTOS array-completion event-wait (FUN_08b04428(0x10000,0)) that carries no firmware-side timeout -- a single missed completion event wedges the task permanently.
 type: project
 ---
 
@@ -141,32 +141,104 @@ probabilistic and count/state-dependent -- not tied to a specific input
 (2026-05-13 already killed the chess-codegen and slot-type hypotheses;
 the wedge is bidirectional flake across both compilers).
 
-## Cross-reference: the firmware is reverse-engineered
+## The op-0x18 firmware path -- reverse-engineered
 
-The Phoenix LX7 management firmware has been statically reverse-engineered
--- see [`2026-05-20-npu-firmware-format.md`](2026-05-20-npu-firmware-format.md)
-(format, Xtensa LX7, load base `0x08ad3000`, the Ghidra pipeline) and
-[`2026-05-20-npu-fw-suspend-waitmode-path.md`](2026-05-20-npu-fw-suspend-waitmode-path.md)
-(main event loop + dispatch table). That gives the silent-drop a concrete
-place to live:
+The Phoenix LX7 firmware is statically reverse-engineered -- see
+[`2026-05-20-npu-firmware-format.md`](2026-05-20-npu-firmware-format.md)
+(format, Xtensa LX7, load base `0x08ad3000`, the Ghidra pipeline). The
+pipeline now also emits decompiled pseudo-C for every function
+(`DecompileNpuFw.java` postScript -> `analysis-xtensa/decompiled.c`,
+623/623 functions decompiled). With that, the op-0x18 path was traced end
+to end.
 
-- The FW main loop `FUN_08ad85f8` dispatches on internal event codes.
-  Event **0xf -> `FUN_08ad8480`** is the "mailbox transport processor" --
-  every mailbox message, including the op-0x18 exec request, is processed
-  through there.
-- Per-column teardown is **`FUN_08ad70b8`** -- "called from a per-context
-  destroy path, not only from suspend." This is the routine `DESTROY_CONTEXT`
-  drives. Its inability to complete on a hung column is exactly the
-  `MGMT_ERT_BUSY` we observed.
+### Two mailbox servers, not one
 
-So the silent-drop sits in the op-0x18 exec path: `FUN_08ad8480` accepts
-the request and hands it to a compute column, and either the column job
-hangs or its completion is never posted back. Reading the decompiled
-op-0x18 / `CHAIN_EXEC_NPU` handler reachable from `FUN_08ad8480` -- and the
-exec-completion path that should re-arm the i2x interrupt -- is now a
-viable investigation route, not just a host-side black box. The
-`SeedFunctions` pass (623 functions recovered) means the indirectly-reached
-exec handlers are disassembled.
+A correction to
+[`2026-05-20-npu-fw-suspend-waitmode-path.md`](2026-05-20-npu-fw-suspend-waitmode-path.md):
+`FUN_08ad8480` (main-loop event 0xf) is **not** the host-message processor
+for exec ops -- it dispatches firmware-*internal* inter-column events (a
+16-bit type field, values `{0x10,0x14..0x17}`). The host mailbox is served
+two different ways:
+
+| Host channel | Firmware server | Opcodes |
+|---|---|---|
+| Management `.145` | `FUN_08ad9ff4` (main-loop event 4 drain) | CREATE/DESTROY ctx (2/3), config, SUSPEND (0x101), `GET_PROTOCOL_VERSION` (0x301) ... |
+| Per-hwctx exec `.135/.136` | **APP-ERT task** `FUN_08b04554` -> `FUN_08b05194` | exec ops 0xc, 0x10-0x14, 0x17, **0x18** |
+
+`CREATE_CONTEXT` (`FUN_08ad8dc0`) spawns a per-hwctx **APP-ERT task**: it
+calls a task-spawn primitive `FUN_08ae05c0(entry=FUN_08b04554, type, col,
+..., channel=col+0x10)`. That task is a separate RTOS thread; it owns the
+hwctx's exec mailbox channel. op-0x18 `CHAIN_EXEC_NPU` is serviced there,
+not by the management server. The opcode dispatch in `FUN_08b05194` matches
+the driver's `aie2_msg_priv.h` enum exactly (0xc, 0x10-0x14, 0x17, 0x18).
+
+This matches the driver's `MGMT_ERT` vs `APP_ERT` status namespaces: the
+management server is the MGMT ERT, each per-hwctx APP-ERT task is an APP ERT.
+
+### The op-0x18 handler always sends a response -- unless it blocks
+
+The op-0x18 handler is inline in `FUN_08b05194`. It validates the
+`cmd_chain_npu_req` (body size 0x18, `buf_size <= 0x1000` =
+`MAX_CHAIN_CMDBUF_SIZE`), copies the chain buffer from host DDR, then loops
+over `count` slots of `cmd_chain_slot_npu` (slot size `(arg_cnt + 13) * 4`
+-- the exact packed layout from the driver header, cross-checked field by
+field).
+
+**Every path through the handler -- success, every validation failure,
+every `break` out of the slot loop -- falls through to the response call
+`FUN_08b0586c(...)`.** There is no early return and no skipped-response
+branch. So a *silent* drop is not a dispatch bug: the only way no response
+is sent is for the APP-ERT task to **block inside the slot loop and never
+return**.
+
+Per-slot exec descends:
+
+```
+FUN_08b05194  (op 0x18, slot loop)
+  -> FUN_08b04280                  RTOS syscall  (in-loop)
+  -> FUN_08b04638                  per-slot exec
+       -> FUN_08b04428(0x10000,0)  RTOS syscall: WAIT for event 0x10000
+       -> FUN_08b0a544 -> FUN_08b0a260 -> FUN_08b0aa68 -> FUN_08b0a9e8
+            -> FUN_08b0e9a0        NPU command-stream interpreter
+```
+
+`FUN_08b0e9a0` is the command-stream interpreter -- a **bounded** loop over
+a buffer of register-write / block-write / descriptor-enqueue ops, decoding
+AIE-array MMIO addresses (`(word >> 0x10) * 0x2000000 + base + ...`). It
+does **not** spin: the op handlers (`FUN_08b0ecf0` writes a DMA BD at array
+offset `0x1d000`, `FUN_08b0ed6c` at `0xa0000`, ...) just write descriptors
+and advance the cursor. The interpreter programs the array and returns.
+
+The blocking points are RTOS **syscalls** (`syscall`-instruction wrappers:
+`FUN_08b04280`, `FUN_08b042c8` the host-DDR chain-buffer copy, `FUN_08b04334`,
+and `FUN_08b04428` the event primitive). The decisive one is
+**`FUN_08b04428(0x10000, 0)`** inside `FUN_08b04638`: an explicit wait on
+event `0x10000` ("prior array work complete"). **No timeout is passed** --
+the call site supplies only `(event_mask, flag)`, never a timeout. The same
+primitive, `(0xffffffff, 1)`, is the task's blocking message-dequeue in
+`FUN_08b04554`.
+
+### Conclusion
+
+The silent drop is the **APP-ERT task for the hwctx blocking forever on an
+RTOS completion-event wait** (event 0x10000) -- or on one of the other
+in-loop syscalls -- because a prior AIE-array operation (DMA, lock, kernel)
+never signalled completion. The task never returns to `FUN_08b0586c`, so
+no mailbox response and no i2x interrupt are produced. The host sees a
+clean `set_tail` and nothing else; TDR fires at 5 s.
+
+This is a firmware **robustness gap**, not a dispatch bug and not
+necessarily broken silicon: the firmware waits on an array-completion event
+with no firmware-side timeout, so a single missed completion wedges the
+APP-ERT task permanently. The ~6% is whatever upstream condition
+occasionally drops that completion event.
+
+It also explains the cascade precisely. The wedged APP-ERT task still owns
+its column. `DESTROY_CONTEXT` (mgmt op 3, `FUN_08ad9344`) asks the MGMT ERT
+to tear that context down; the MGMT ERT cannot reclaim a column whose
+APP-ERT task is blocked in an RTOS wait -> `MGMT_ERT_BUSY` -> column leak ->
+eventual `MGMT_ERT_NOAVAIL`. The MGMT ERT (`FUN_08ad9ff4`) stays alive and
+keeps answering correctly throughout -- exactly as observed.
 
 ## Side observation: `Get bo 4 failed` every iteration
 
@@ -179,18 +251,26 @@ wired up correctly on this tree) and deserves its own finding.
 
 ## What is known vs. still unknown
 
-**Known (observed):** the drop is real, op-0x18-specific, at the firmware
-completion-IRQ level; the mgmt transport stays alive; the wedge is a
-column-leak cascade with named MGMT ERT status codes; rate ~6%.
+**Known (observed + reverse-engineered):** the drop is real, op-0x18-specific,
+at the firmware completion-IRQ level; the mgmt transport stays alive; the
+wedge is a column-leak cascade with named MGMT ERT status codes; rate ~6%.
+The op-0x18 handler `FUN_08b05194` unconditionally sends a response unless
+its APP-ERT task blocks; the task blocks on RTOS syscalls -- notably the
+`FUN_08b04428(0x10000,0)` array-completion event-wait, which carries no
+firmware-side timeout. The `DESTROY -> BUSY` confirms the column's job
+genuinely did not finish: this is a real mid-exec hang, not a finished job
+with a lost response.
 
-**Unknown:** whether the firmware *hung mid-exec* (the AIE job itself
-deadlocked on the column) or *finished the job but failed to post the
-response / re-arm the i2x interrupt*. The `DESTROY -> BUSY` strongly favors
-an actual column-job hang -- a cleanly finished job's column would be
-reclaimable. No firmware-internal runtime visibility: Phoenix's
+**Unknown:** *which* in-loop syscall the task is parked in -- the event-wait
+`FUN_08b04428(0x10000,0)`, the host-DDR copy `FUN_08b042c8`, or
+`FUN_08b04280` -- and *what* upstream array condition drops the completion
+event (a DMA that never reports done, a lock never released, a kernel
+deadlock). Pinning the exact park point needs either firmware/array
+register state at wedge time (the `bridge-trace-runner --snapshot-on-timeout`
+path) or decoding the RTOS syscall dispatcher to prove the event-wait has
+no timeout branch. No firmware-trace visibility: Phoenix's
 `npu1_fw_feature_table` carries no `AIE2_FW_TRACE` bit, so the DPT
-firmware-trace path is not available here. The decompiled firmware is the
-remaining lever.
+firmware-trace path is unavailable here.
 
 ## Recovery
 
@@ -203,13 +283,23 @@ device cleanly -- the HW runner had exited, no D-state process pinning
 ## Next
 
 - **Legacy-path probe.** Patch `npu1_regs.c` so `AIE2_NPU_COMMAND` never
-  matches -> `aie2_msg_init` selects `legacy_exec_message_ops` ->
-  chained execs go out as `MSG_OP_CHAIN_EXEC_BUFFER_CF` (op 0x12). Re-sweep
-  traced. If the wedge disappears, the bug is isolated to the op-0x18
-  firmware handler (actionable upstream: gate `AIE2_NPU_COMMAND` off for
-  NPU1). If it persists, the hang is below the message-opcode layer.
-- **Read the decompiled op-0x18 handler** reachable from `FUN_08ad8480`,
-  and the exec-completion / i2x-interrupt re-arm path.
+  matches -> `aie2_msg_init` selects `legacy_exec_message_ops` -> chained
+  execs go out as `MSG_OP_CHAIN_EXEC_BUFFER_CF` (op 0x12). Re-sweep traced.
+  In the firmware, op 0x12 dispatches to a *different* slot handler
+  (`FUN_08b047d4`) within the same APP-ERT task `FUN_08b05194`. If the
+  wedge disappears, the gap is isolated to the op-0x18 inline handler
+  (actionable upstream: gate `AIE2_NPU_COMMAND` off for NPU1). If it
+  persists, the hang is in the shared exec/event-wait machinery below the
+  per-opcode handler -- the more likely outcome, since the suspect
+  `FUN_08b04428(0x10000,0)` wait lives in `FUN_08b04638`, shared by all
+  exec opcodes.
+- **Snapshot on timeout.** Re-run with `bridge-trace-runner
+  --snapshot-on-timeout <dir>` to capture CORE/DMA/lock register state on
+  the `run.wait` timeout, before TDR wipes it -- identifies which column
+  and which DMA/lock the array job is stuck on.
+- **Decode the RTOS syscall dispatcher** to confirm `FUN_08b04428`'s
+  event-wait has no timeout branch (the call-site signature already shows
+  no timeout argument; this would close it firmware-side).
 
 ## Artifacts
 
@@ -218,3 +308,9 @@ device cleanly -- the HW runner had exited, no D-state process pinning
 - `amdxdna.dmesg` -- driver verbose mailbox log across the run
 - `add_one_ctrl_packet.{chess,peano}.sweep.log` -- the failed sweep logs
 - `sweep-stdout.log` -- full bridge sweep stdout
+
+Firmware analysis (regenerate with `tools/ghidra-npu-fw.sh analyze`):
+`ghidra-projects/npu-fw/analysis-xtensa/`:
+- `decompiled.c` -- Ghidra pseudo-C, 623/623 functions (`DecompileNpuFw.java`)
+- `disasm.txt` -- raw Xtensa disassembly (exact; cross-check load-bearing claims)
+- `functions.tsv`, `strings.tsv` -- function + string tables
