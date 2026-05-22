@@ -15,8 +15,10 @@
 #      Xtensa language, rebases it to the recovered load address so
 #      l32r literal pools resolve, runs full auto-analysis, seeds
 #      functions at every 'entry' prologue the call-graph walk missed
-#      (SeedFunctions.java -- recovers indirectly-reached code), and
-#      dumps text artifacts (functions.tsv, strings.tsv, disasm.txt).
+#      (SeedFunctions.java -- recovers indirectly-reached code), dumps
+#      text artifacts (functions.tsv, strings.tsv, disasm.txt), and
+#      runs the decompiler over every function (DecompileNpuFw.java ->
+#      decompiled.c -- readable pseudo-C to skim before grinding disasm).
 #
 # Ghidra's GUI is not scriptable for this workflow; everything is
 # CLI-driven and reproducible.  Outputs land in <WORK_DIR>/analysis-xtensa/.
@@ -88,6 +90,7 @@ cmd_analyze() {
         -preScript SetImageBase.java "$LOAD_BASE" \
         -postScript SeedFunctions.java \
         -postScript DumpNpuFw.java "$ANALYSIS_DIR" \
+        -postScript DecompileNpuFw.java "$ANALYSIS_DIR" \
         -overwrite
 
     echo
