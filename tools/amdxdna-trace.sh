@@ -4,9 +4,10 @@
 # amdxdna-trace.sh -- enable/snapshot/disable amdxdna kernel tracepoints
 # around a long-running test suite (bridge sweep, ISA test).
 #
-# Wraps the same /sys/kernel/tracing/events/amdxdna_trace/* events that
-# tools/bug6-trace.sh uses, but designed for SUITE-wide capture under a
-# SINGLE pkexec auth.  The suite spawns a backgrounded `daemon` instance
+# Wraps the amdxdna kernel tracepoints under /sys/kernel/tracing/events/
+# (the trace subsystem name is resolved at runtime -- see _event_cmds),
+# designed for SUITE-wide capture under a SINGLE pkexec auth.  The suite
+# spawns a backgrounded `daemon` instance
 # which enables tracing, polls a sentinel file, and snapshots+disables
 # when the parent removes the sentinel.  Single auth covers the whole
 # suite -- no second prompt mid-run, no auth-gap delays.
@@ -39,27 +40,45 @@
 set -euo pipefail
 
 TRACEFS=/sys/kernel/tracing
+
+# Bare tracepoint event names -- the subsystem is resolved at runtime.
+# The drivers/accel (mainline) amdxdna tree registers these under
+# TRACE_SYSTEM "amdxdna"; the obsolete src/driver tree used
+# "amdxdna_trace".  Hardcoding the old name made every event silently
+# fail to enable (empty capture, no error) after the tree migration.
 EVENTS=(
-    amdxdna_trace/xdna_job
-    amdxdna_trace/mbox_set_tail
-    amdxdna_trace/mbox_set_head
-    amdxdna_trace/mbox_irq_handle
-    amdxdna_trace/mbox_rx_worker
-    amdxdna_trace/uc_irq_handle
-    amdxdna_trace/uc_wakeup
+    xdna_job
+    mbox_set_tail
+    mbox_set_head
+    mbox_irq_handle
+    mbox_rx_worker
+    mbox_poll_handle
+    uc_irq_handle
+    uc_wakeup
 )
 STATE_FILE=${AMDXDNA_TRACE_STATE:-/tmp/claude-1000/amdxdna-trace.state}
 
-# Build "enable / disable each event if its tracepoint dir exists" snippet
-# for inlining inside heredocs.  Each event is gated because amdxdna may
-# or may not export every event in older srcversions; missing events
-# shouldn't fail the whole setup.
+# Build an "enable / disable each event" snippet for inlining into the
+# pkexec shell (tracefs is root-only).  The snippet first resolves the
+# amdxdna trace subsystem (prefers the mainline "amdxdna", falls back to
+# the src/driver-era "amdxdna_trace"), then gates each event on its dir
+# existing so a partial event set never aborts the whole setup.  On
+# enable it counts matched events and aborts loudly if zero were enabled
+# -- turning a future subsystem rename from a silent empty capture into
+# a hard error.
 _event_cmds() {
     local action=$1   # 1 (enable) or 0 (disable)
+    local t=$TRACEFS
+    printf '__sub=""; for __s in amdxdna amdxdna_trace; do [[ -d %s/events/$__s ]] && { __sub=$__s; break; }; done\n' "$t"
+    printf '__n=0\n'
     for e in "${EVENTS[@]}"; do
-        printf '[[ -d %s/events/%s ]] && echo %s > %s/events/%s/enable || true\n' \
-            "$TRACEFS" "$e" "$action" "$TRACEFS" "$e"
+        printf '[[ -n "$__sub" && -d %s/events/$__sub/%s ]] && { echo %s > %s/events/$__sub/%s/enable; __n=$((__n+1)); }\n' \
+            "$t" "$e" "$action" "$t" "$e"
     done
+    printf 'echo "amdxdna-trace: subsystem=${__sub:-NONE} events=$__n action=%s"\n' "$action"
+    if [[ "$action" == "1" ]]; then
+        printf '%s\n' '[[ $__n -gt 0 ]] || { echo "amdxdna-trace ERROR: 0 events enabled -- amdxdna tracepoints not found (is amdxdna loaded?)" >&2; exit 1; }'
+    fi
 }
 
 # Resolve the username to chown captured files back to.  Under pkexec,

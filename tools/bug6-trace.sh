@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# bug6-trace.sh -- capture amdxdna_trace events around a single test run.
+# bug6-trace.sh -- capture amdxdna kernel tracepoints around a single test run.
 #
 # Bug #6 (memtile_dmas hang at run.wait, host never observes completion)
 # investigation aid. Enables the existing kernel tracepoints, runs the
@@ -52,14 +52,18 @@ OUT_DIR=${OUT_DIR:-/home/triple/npu-work/xdna-emu/build/experiments/bug6}
 mkdir -p "$OUT_DIR"
 
 TRACEFS=/sys/kernel/tracing
+# Bare tracepoint event names -- subsystem resolved at runtime.  The
+# mainline drivers/accel amdxdna tree registers these under TRACE_SYSTEM
+# "amdxdna"; the obsolete src/driver tree used "amdxdna_trace".
 EVENTS=(
-    amdxdna_trace/xdna_job
-    amdxdna_trace/mbox_set_tail
-    amdxdna_trace/mbox_set_head
-    amdxdna_trace/mbox_irq_handle
-    amdxdna_trace/mbox_rx_worker
-    amdxdna_trace/uc_irq_handle
-    amdxdna_trace/uc_wakeup
+    xdna_job
+    mbox_set_tail
+    mbox_set_head
+    mbox_irq_handle
+    mbox_rx_worker
+    mbox_poll_handle
+    uc_irq_handle
+    uc_wakeup
 )
 
 if [[ ! -x "$TEST_DIR/test.exe" ]]; then
@@ -93,12 +97,20 @@ echo "Out dir  : $OUT_DIR"
 : > "$RUN_LOG"
 rm -f "$RC_FILE" "$TRACE_FILE" "$DMESG_FILE"
 
-# Build the events-enable loop as plain commands (avoid bash array expansion
-# headaches inside the heredoc).
-EVENT_ENABLE_CMDS=$(for e in "${EVENTS[@]}"; do
-    printf '[[ -d %s/events/%s ]] && echo 1 > %s/events/%s/enable || echo "WARN: missing event %s" >&2\n' \
-        "$TRACEFS" "$e" "$TRACEFS" "$e" "$e"
-done)
+# Build the events-enable snippet inlined into the pkexec block.  Resolve
+# the trace subsystem at runtime, gate each event on its dir existing,
+# and abort loudly if zero events match -- a wrong subsystem must fail
+# hard, not silently capture an empty buffer.
+EVENT_ENABLE_CMDS=$(
+    printf '__sub=""; for __s in amdxdna amdxdna_trace; do [[ -d %s/events/$__s ]] && { __sub=$__s; break; }; done\n' "$TRACEFS"
+    printf '__n=0\n'
+    for e in "${EVENTS[@]}"; do
+        printf '[[ -n "$__sub" && -d %s/events/$__sub/%s ]] && { echo 1 > %s/events/$__sub/%s/enable; __n=$((__n+1)); } || echo "WARN: no event %s" >&2\n' \
+            "$TRACEFS" "$e" "$TRACEFS" "$e" "$e"
+    done
+    printf 'echo "bug6-trace: subsystem=${__sub:-NONE} events=$__n"\n'
+    printf '%s\n' '[[ $__n -gt 0 ]] || { echo "ERROR: 0 amdxdna tracepoints enabled (is amdxdna loaded?)" >&2; exit 1; }'
+)
 
 # Single pkexec: setup trace, drop to user for test, snapshot trace + dmesg.
 # All variables expanded by the *outer* shell -- inside the heredoc, escape

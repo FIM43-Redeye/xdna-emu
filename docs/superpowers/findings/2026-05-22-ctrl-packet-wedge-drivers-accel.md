@@ -212,6 +212,12 @@ and need a pass.
 - `sweep.log` -- full bridge sweep output
 - `dmesg-live.log` -- continuous ISO-timestamped dmesg across the run
   (~49 MB; `dyndbg=+p` is verbose -- consider gzip)
-- `amdxdna.dmesg`, `amdxdna.trace` -- amdxdna-trace daemon snapshot
+- `amdxdna.dmesg`, `amdxdna.trace` -- amdxdna-trace daemon snapshot.
+  NOTE: `amdxdna.trace` is empty (0 entries). The `amdxdna-trace.sh`
+  daemon hardcoded the obsolete `src/driver` trace subsystem name
+  (`amdxdna_trace`); the `drivers/accel` tree registers tracepoints
+  under `amdxdna`, so every event silently failed to enable. Fixed
+  2026-05-22 (runtime subsystem resolution) -- future runs capture
+  mailbox traffic.
 - `add_one_ctrl_packet.{chess,peano}.sweep.log` -- the failed sweep logs
 - `smoke-2.log` -- pre-sweep single-test path check (passed)
