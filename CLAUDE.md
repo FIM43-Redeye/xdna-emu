@@ -744,12 +744,23 @@ When the NPU wedges, recovery escalates through:
    (or an equivalent firmware-level hang), `modprobe -r` itself wedges
    uninterruptibly in `drm_dev_unplug -> synchronize_srcu` and reboot
    becomes the only recovery path.  We previously set `tdr_dump_ctx=1`
-   to disable TDR recovery and avoid that poisoning, but that turned
-   every firmware silent-drop into a permanent `aie2_hmm_invalidate`
-   wedge requiring reboot anyway (see
+   (the `src/driver`-tree TDR knob) to disable TDR recovery and avoid
+   that poisoning, but that turned every firmware silent-drop into a
+   permanent `aie2_hmm_invalidate` wedge requiring reboot anyway (see
    `docs/superpowers/findings/2026-05-13-chain-exec-npu-silent-drop-on-phoenix.md`).
-   We removed `tdr_dump_ctx=1` on 2026-05-13: TDR now actually recovers,
-   so `modprobe -r` is again attempted-first when the NPU wedges.
+   We removed it on 2026-05-13: TDR now actually recovers, so
+   `modprobe -r` is again attempted-first when the NPU wedges.
+
+   On the canonical `drivers/accel` tree (now the loaded module) the
+   TDR knob is `tdr_dump_only` (bool, default `N` = recovery active);
+   there is no `tdr_dump_ctx`.  A ctrl_packet sweep reproduced a wedge
+   on `drivers/accel` on 2026-05-22 -- TDR fired but recovery was
+   incomplete (mgmt mailbox left rejecting CREATE/DESTROY context).
+   `modprobe -r`/reload still recovered the device cleanly in ~3s (no
+   `synchronize_srcu` hang) because the HW runner had *exited* -- no
+   process pinning `/dev/accel/accel0` -- and the mgmt mailbox stayed
+   responsive.  See
+   `docs/superpowers/findings/2026-05-22-ctrl-packet-wedge-drivers-accel.md`.
 
    **2026-05-20 refinement** (see
    `docs/superpowers/findings/2026-05-20-amdxdna-tdr-recovery-incomplete-on-phoenix.md`):
@@ -858,9 +869,17 @@ tees for a specific run) should use `/tmp/claude-1000/`.
 These describe the current machine's setup. Other contributors will
 substitute their own values.
 
-- **Kernel**: custom `7.0.6-custom+`. Out-of-tree `amdxdna` is
+- **Kernel**: custom `7.0.9-custom`. Out-of-tree `amdxdna` is
   managed by DKMS via `xrt-amdxdna/2.23.0`, source at
-  `/usr/src/xrt-amdxdna-2.23.0/`.  Userspace plugin (the SHIM at
+  `/usr/src/xrt-amdxdna-2.23.0/`.  Caveat: if the kernel is *rebuilt*
+  in place (same `uname -r`, new build), `CONFIG_RANDSTRUCT`
+  re-randomizes `struct module` and the DKMS module fails to load
+  with `Exec format error` / a `.gnu.linkonce.this_module section
+  size` mismatch.  DKMS does not auto-detect this -- force a rebuild:
+  `pkexec sh -c 'dkms build xrt-amdxdna/2.23.0 -k $(uname -r) --force
+  && dkms install xrt-amdxdna/2.23.0 -k $(uname -r) --force'` (plain
+  `dkms install --force` re-copies the stale artifact -- it does not
+  recompile).  Userspace plugin (the SHIM at
   `/opt/xilinx/xrt/lib/libxrt_driver_xdna.so.*`) is delivered by the
   `xrt_plugin-amdxdna` .deb.  A bare `./build.sh -release` BUILDS
   both halves but INSTALLS neither; the `.deb` sits at
@@ -891,20 +910,27 @@ substitute their own values.
   free the device first (kill any process holding `/dev/accel/accel0`),
   or fall back to a manual `pkexec sh -c 'modprobe -r amdxdna; dpkg -i
   build/Release/xrt_plugin.*_${VERSION_ID}-*.deb'`.
-- **amdxdna module options pinned**: `/etc/modprobe.d/amdxdna.conf`
-  contains `options amdxdna autosuspend_ms=-1`.
-  - `autosuspend_ms=-1`: prevent runtime autosuspend. The NPU has
-    been observed to wedge on auto-resume after certain mailbox
-    failures (e.g. struct-size mismatches that leave firmware in
-    an unrecoverable state). Pinning autosuspend off keeps the
-    device alive so we never hit the broken resume path.
+- **amdxdna runtime autosuspend pinned off**: the NPU has been
+  observed to wedge on auto-resume after certain firmware failure
+  modes, so runtime autosuspend is disabled.  The canonical
+  `drivers/accel` tree has *no* `autosuspend_ms` module parameter
+  (that was a `src/driver`-tree knob) -- runtime PM is standard PCI
+  runtime PM.  Autosuspend is pinned off via
+  `/etc/udev/rules.d/71-amdxdna-no-autosuspend.rules`, which sets
+  `power/control=on` on the NPU PCI function (`[1022:1502]`).
+  Verify with `cat /sys/bus/pci/devices/<bdf>/power/control`
+  (should report `on`).  Workaround for development; revert (rule
+  to `auto`, or remove it) once the underlying wedges are fixed.
 
-  Workaround for development; revert once the underlying wedges
-  are diagnosed and fixed. Verify with
-  `cat /sys/module/amdxdna/parameters/autosuspend_ms`
-  (should report `-1`).
+  The old `/etc/modprobe.d/amdxdna.conf` (`options amdxdna
+  autosuspend_ms=-1`) was removed 2026-05-22 -- on `drivers/accel`
+  the param does not exist and modprobe logged it as "unknown
+  parameter ... ignored".  The loaded module's parameters are:
+  `aie2_max_col`, `tdr_dump_only`, `tdr_timeout_ms`, `force_cmdlist`,
+  `force_iova`.
 
-  **Removed 2026-05-13: `tdr_dump_ctx=1`.** Originally set so TDR
+  **History -- `tdr_dump_ctx` (removed 2026-05-13).** On the
+  `src/driver` tree the TDR knob was `tdr_dump_ctx=1`, set so TDR
   was dump-only (no `aie2_rq_stop_all/restart_all`), avoiding the
   `synchronize_srcu` wedge in `modprobe -r` after the recover path
   poisoned the mailbox on Phoenix. But disabling TDR recovery made
@@ -913,11 +939,26 @@ substitute their own values.
   driver-design comment at `aie2_ctx.c:1017` explicitly relies on
   TDR to terminate the ctx if firmware doesn't respond, so without
   recovery the `dma_resv_wait_timeout(MAX_SCHEDULE_TIMEOUT)` in
-  hmm_invalidate waits forever. We were rebooting from those
-  wedges anyway, so the original trade is gone -- letting TDR
-  recover trades a permanent wedge for a possible (not certain)
-  modprobe -r wedge. See
+  hmm_invalidate waits forever. We removed it 2026-05-13 -- letting
+  TDR recover trades a permanent wedge for a possible (not certain)
+  modprobe -r wedge. On `drivers/accel` the equivalent knob is
+  `tdr_dump_only` (bool, default `N`), left at default (recovery
+  active). See
   `docs/superpowers/findings/2026-05-13-chain-exec-npu-silent-drop-on-phoenix.md`.
+- **amdxdna driver + firmware logging**: driver-internal `pr_debug`
+  output is enabled via `/etc/modprobe.d/amdxdna-verbose-debug.conf`
+  (`options amdxdna dyndbg=+p`; persists across reloads). Firmware
+  logging/tracing is NOT a module parameter on `drivers/accel` --
+  the `src/driver`-era `fw_log_level` / `fw_trace_categories` /
+  `fw_log_size` / `fw_trace_size` / `poll_fw_trace` params are gone.
+  It is now the runtime "DPT" (firmware Debug/Profile/Trace)
+  framework in `amdxdna_dpt.c`: `FW_LOG` auto-starts at `WARN`,
+  `FW_TRACE` is opt-in, both driven by DRM ioctls
+  (`SET_FW_LOG_STATE` / `SET_FW_TRACE_STATE`, read back via
+  `GET_ARRAY` with `FW_LOG` / `FW_TRACE`) and surfaced through
+  `xrt-smi`. Kernel tracepoints live under
+  `/sys/kernel/debug/tracing/events/amdxdna/` -- the `amdxdna-trace`
+  daemon rides `xdna_job` + the `mbox_*` set.
 - **dmesg is unrestricted**: kernel built with `kernel.dmesg_restrict=0`
   (or equivalent), so `dmesg` works without `pkexec`. Don't wrap dmesg
   in pkexec on this machine.
