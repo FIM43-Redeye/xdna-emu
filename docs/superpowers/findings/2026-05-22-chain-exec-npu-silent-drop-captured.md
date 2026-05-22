@@ -209,14 +209,58 @@ does **not** spin: the op handlers (`FUN_08b0ecf0` writes a DMA BD at array
 offset `0x1d000`, `FUN_08b0ed6c` at `0xa0000`, ...) just write descriptors
 and advance the cursor. The interpreter programs the array and returns.
 
-The blocking points are RTOS **syscalls** (`syscall`-instruction wrappers:
-`FUN_08b04280`, `FUN_08b042c8` the host-DDR chain-buffer copy, `FUN_08b04334`,
-and `FUN_08b04428` the event primitive). The decisive one is
-**`FUN_08b04428(0x10000, 0)`** inside `FUN_08b04638`: an explicit wait on
-event `0x10000` ("prior array work complete"). **No timeout is passed** --
-the call site supplies only `(event_mask, flag)`, never a timeout. The same
-primitive, `(0xffffffff, 1)`, is the task's blocking message-dequeue in
-`FUN_08b04554`.
+The blocking points are RTOS **syscalls**. Each `syscall`-wrapper builds a
+request struct on the stack -- `{u32 number, u32 retval, args...}` -- and
+passes its pointer in a user register before the `syscall` instruction
+traps (confirmed in `disasm.txt`; the syscall number is a `movi` constant
+in each wrapper). The recovered number map: `FUN_08b04280/042c8/04354` =
+0x64 (7-arg; `042c8` is the host-DDR chain-buffer copy), `FUN_08b04334` =
+0x65, `FUN_08b0430c` = 0x66, `FUN_08b04398` = 0x68, `FUN_08b04404` = 0x6a,
+`FUN_08b04428` = **0x6b**.
+
+The decisive one is **`FUN_08b04428(0x10000, 0)`** inside `FUN_08b04638` --
+syscall 0x6b, the RTOS event-wait. Its wrapper marshals **exactly two
+arguments**: a 32-bit event mask (struct +0x08) and a one-byte mode flag
+(struct +0x0c). There is no third slot -- the wrapper structurally *cannot*
+carry a timeout. The mode byte is block-vs-poll, not a timeout: the only
+non-blocking caller is the task's message-dequeue in `FUN_08b04554`,
+`while (FUN_08b04428(0xffffffff,1) == 5)` -- mode 1, spin while status is 5.
+Every exec/config caller uses mode 0.
+
+And in the blocking form the syscall **return value is discarded** -- the
+exec path calls `FUN_08b04428(0x10000,0);` as a bare statement. The result
+is delivered through a *shared-memory slot* instead: `FUN_08b04638` puts
+`&iStack_28` (a pre-zeroed local) into the request struct it submits via
+`FUN_08b044b8`, waits, then reads `iStack_28`. If that wait ever returned
+*without* event 0x10000 having fired, the caller would read `iStack_28 == 0`
+and treat a non-completion as "success, result 0." There is no code path
+that observes or recovers from a wait that does not complete -- the firmware
+exec path has **no timeout handling at all**, independent of whatever the
+kernel-side syscall does.
+
+### The kernel-side dispatcher -- not decoded, and why it does not matter
+
+Confirming whether syscall 0x6b *itself* (kernel side) arms an internal
+timer would mean decoding the RTOS syscall-exception handler. That code is
+not among the 623 call-graph-reachable functions -- vector handlers have no
+`entry` prologue for `SeedFunctions.java` to key off. A raw disassembly of
+the pre-code region (`tools/ghidra-scripts/DisasmRange.java` ->
+`analysis-xtensa/vectors.txt`) found it is ~90% zero-fill, with the Xtensa
+vector table at `VECBASE ~= 0x08ad3800` (six window over/underflow vectors,
+unmistakable 0x40-spaced) and a real exception handler near `0x08ad3a78`
+(`rsr EXCCAUSE` / `wsr EXCSAVE3` / `rsr DEPC` + the `addi 3`
+skip-past-`syscall` idiom). Decoding the per-number dispatch precisely is a
+multi-hour exercise -- it needs correct per-vector instruction alignment,
+and Ghidra's Xtensa module never decoded a single `rfe`/`rur` anywhere, so
+its exception-return modelling is suspect.
+
+It is also **moot for this bug**. Even if syscall 0x6b kernel-side had an
+internal timeout, the caller discards the return and reads the shared slot
+-- an internal timeout would surface as a silent wrong result, not as
+recovery. With no internal timeout it blocks forever. Both outcomes produce
+exactly the observed wedge. The reportable claim -- *the firmware exec path
+has no timeout handling* -- is established from the caller side and does not
+depend on the dispatcher.
 
 ### Conclusion
 
@@ -267,12 +311,10 @@ with a lost response.
 `FUN_08b04428(0x10000,0)`, the host-DDR copy `FUN_08b042c8`, or
 `FUN_08b04280` -- and *what* upstream array condition drops the completion
 event (a DMA that never reports done, a lock never released, a kernel
-deadlock). Pinning the exact park point needs either firmware/array
-register state at wedge time (the `bridge-trace-runner --snapshot-on-timeout`
-path) or decoding the RTOS syscall dispatcher to prove the event-wait has
-no timeout branch. No firmware-trace visibility: Phoenix's
-`npu1_fw_feature_table` carries no `AIE2_FW_TRACE` bit, so the DPT
-firmware-trace path is unavailable here.
+deadlock). Pinning the exact park point needs firmware/array register state
+at wedge time (the `bridge-trace-runner --snapshot-on-timeout` path). No
+firmware-trace visibility: Phoenix's `npu1_fw_feature_table` carries no
+`AIE2_FW_TRACE` bit, so the DPT firmware-trace path is unavailable here.
 
 ## Recovery
 
@@ -326,10 +368,16 @@ auto-signs with the MOK -- `kmodsign` + `MOK.priv`/`MOK.der`), then
 - **Snapshot on timeout.** Re-run with `bridge-trace-runner
   --snapshot-on-timeout <dir>` to capture CORE/DMA/lock register state on
   the `run.wait` timeout, before TDR wipes it -- identifies which column
-  and which DMA/lock the array job is stuck on.
-- **Decode the RTOS syscall dispatcher** to confirm `FUN_08b04428`'s
-  event-wait has no timeout branch (the call-site signature already shows
-  no timeout argument; this would close it firmware-side).
+  and which DMA/lock the array job is stuck on. This is the remaining route
+  to *what* upstream condition drops the completion event.
+- **Report it.** The firmware exec path has no timeout handling (above);
+  the driver already relies on TDR as the sole backstop (`aie2_ctx.c`
+  comment: TDR terminates the ctx "if firmware doesn't respond"). Worth an
+  `xdna-driver` issue framed as the driver-interface gap -- op-0x18
+  `CHAIN_EXEC_NPU` can silently drop with no firmware-side timeout.
+
+(The "decode the RTOS syscall dispatcher" route is closed -- see *The
+kernel-side dispatcher* above: moot, the caller-side proof is decisive.)
 
 ## Artifacts
 
@@ -344,3 +392,6 @@ Firmware analysis (regenerate with `tools/ghidra-npu-fw.sh analyze`):
 - `decompiled.c` -- Ghidra pseudo-C, 623/623 functions (`DecompileNpuFw.java`)
 - `disasm.txt` -- raw Xtensa disassembly (exact; cross-check load-bearing claims)
 - `functions.tsv`, `strings.tsv` -- function + string tables
+- `vectors.txt` -- raw disassembly of the pre-code region `08ad3000-08ad5568`
+  (Xtensa vector table; `tools/ghidra-scripts/DisasmRange.java`, run
+  separately against the existing project with `-process -noanalysis`)
