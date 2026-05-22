@@ -251,9 +251,11 @@ wired up correctly on this tree) and deserves its own finding.
 
 ## What is known vs. still unknown
 
-**Known (observed + reverse-engineered):** the drop is real, op-0x18-specific,
-at the firmware completion-IRQ level; the mgmt transport stays alive; the
-wedge is a column-leak cascade with named MGMT ERT status codes; rate ~6%.
+**Known (observed + reverse-engineered):** the drop is real, on op-0x18
+execs (the only working exec opcode for this driver/FW 5.8 combination --
+see the legacy-path probe above), at the firmware completion-IRQ level;
+the mgmt transport stays alive; the wedge is a column-leak cascade with
+named MGMT ERT status codes; rate ~6%.
 The op-0x18 handler `FUN_08b05194` unconditionally sends a response unless
 its APP-ERT task blocks; the task blocks on RTOS syscalls -- notably the
 `FUN_08b04428(0x10000,0)` array-completion event-wait, which carries no
@@ -280,19 +282,47 @@ device cleanly -- the HW runner had exited, no D-state process pinning
 129 us latency, PASSED. This is the benign wedge class (see
 [`2026-05-22-ctrl-packet-wedge-drivers-accel.md`](2026-05-22-ctrl-packet-wedge-drivers-accel.md)).
 
+## Legacy-path probe -- attempted, closed off (2026-05-22)
+
+The plan was to force `aie2_msg_init` onto `legacy_exec_message_ops` by
+patching `npu1_fw_feature_table` (`npu1_regs.c:70`, `min_minor` 8 -> 99 so
+`AIE2_NPU_COMMAND` never matches FW 5.8), re-sweep, and see whether the
+wedge is op-0x18-specific. It does not work as a control -- **the legacy
+path is broken at the driver level on this tree.**
+
+With `AIE2_NPU_COMMAND` off, a single `xrt-smi validate` execbuf went out
+as **opcode 0x13** (`MSG_OP_CHAIN_EXEC_DPU`). The firmware *responded*
+correctly (`0x13` TX 24 B -> RX 12 B -- the firmware op-0x13 handler
+`FUN_08b04980` works), but the **driver's response callback returned
+`-EINVAL`** (`xdna_mailbox.136: Message callback ret -22` ->
+`Unexpected ret -22, disable irq` -> `Channel in bad state` ->
+`aie2_cmdlist_single_execbuf: Send message failed`). `xrt-smi validate`
+FAILED on the first exec; no test ran. Deterministic, immediate, 100% --
+the opposite of the probabilistic ~6% op-0x18 silent-drop.
+
+So `legacy_exec_message_ops` has bit-rotted on `drivers/accel` -- which is
+*why* `AIE2_NPU_COMMAND`/op-0x18 was added: the op-0x18 path is the only
+working exec path for FW 5.8. The legacy path is dead as both a workaround
+and a diagnostic. The probe left the device healthy (clean TDR recovery,
+no hardware wedge); the driver was reverted to the op-0x18 baseline and
+`xrt-smi validate` passed.
+
+The op-0x18-specificity question therefore stays open -- but note the
+suspect `FUN_08b04428(0x10000,0)` event-wait lives in `FUN_08b04638`,
+shared by *all* exec opcodes (0xc, 0x10-0x14, 0x18), so the hang is most
+likely below the per-opcode layer regardless.
+
+Probe mechanics (for repeat): the baseline driver is the DKMS tree
+`/usr/src/xrt-amdxdna-2.23.0/` (= branch `fix/mailbox-timeout-msg-uaf`
+@ `b1d58df`, the capture-run module). `build.sh -release` fails on an
+unrelated XRT/boost configure error and `-refresh_dkms` is not on
+`emu-shim-base`; the working path is to patch `npu1_regs.c` in the DKMS
+tree directly, `dkms build/install --force -k $(uname -r)` (DKMS
+auto-signs with the MOK -- `kmodsign` + `MOK.priv`/`MOK.der`), then
+`modprobe -r/modprobe`.
+
 ## Next
 
-- **Legacy-path probe.** Patch `npu1_regs.c` so `AIE2_NPU_COMMAND` never
-  matches -> `aie2_msg_init` selects `legacy_exec_message_ops` -> chained
-  execs go out as `MSG_OP_CHAIN_EXEC_BUFFER_CF` (op 0x12). Re-sweep traced.
-  In the firmware, op 0x12 dispatches to a *different* slot handler
-  (`FUN_08b047d4`) within the same APP-ERT task `FUN_08b05194`. If the
-  wedge disappears, the gap is isolated to the op-0x18 inline handler
-  (actionable upstream: gate `AIE2_NPU_COMMAND` off for NPU1). If it
-  persists, the hang is in the shared exec/event-wait machinery below the
-  per-opcode handler -- the more likely outcome, since the suspect
-  `FUN_08b04428(0x10000,0)` wait lives in `FUN_08b04638`, shared by all
-  exec opcodes.
 - **Snapshot on timeout.** Re-run with `bridge-trace-runner
   --snapshot-on-timeout <dir>` to capture CORE/DMA/lock register state on
   the `run.wait` timeout, before TDR wipes it -- identifies which column
