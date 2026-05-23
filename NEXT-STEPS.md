@@ -69,29 +69,34 @@ Pointers: `2026-05-22-chain-exec-npu-silent-drop-captured.md`
 **Not done.** The actual github issue text, addressed to AMD's
 `xdna-driver` repo.
 
-**Caveat (added 2026-05-22 evening).** Thread A's "emu reports
-emu_ok=True" claim turned out to be stale on re-check the same day.
-Before investing time drafting a public upstream report, **verify
-Bugs A and B still reproduce today** with the exact recipes in the
-finding doc.  If either doesn't reproduce, narrow the gap (different
-machine state? different driver/firmware version? something
-session-specific?) before posting -- a withdrawn or weakened
-upstream report is worse than no report.
+**Caveat (added 2026-05-22 evening): VERIFIED 2026-05-22 evening.**
+Thread A's "emu reports emu_ok=True" claim turned out to be stale on
+re-check the same day, so the reproducers were re-verified before
+investing in a draft.  Both Bug A and Bug B reproduce on today's
+code with signatures matching the finding doc exactly:
+
+| Bug | Recipe | Delta this run | Finding doc |
+|---|---|---|---|
+| A (silent-drop) | `trace-sweep.py --test add_one_ctrl_packet --core-sweep all --no-emu` | TDR +1, BUSY +1, NOAVAIL +0 | TDR≥1, BUSY≥1, NOAVAIL=0 ✓ |
+| B (cascade) | `./scripts/emu-bridge-test.sh --no-emu --sweep ctrl_packet` | NOAVAIL +104, ret-22 +417 | NOAVAIL 100+, ret-22 400+ ✓ |
+
+NPU recovered cleanly via `pkexec sh -c 'modprobe -r amdxdna &&
+modprobe amdxdna'` (no synchronize_srcu hang); `xrt-smi validate`
+PASSED both tests post-recovery with no new NOAVAIL.  Evidence at
+`build/experiments/2026-05-22-evening-thread-b-verify/{bug-a,bug-b}/`
+(stdout/stderr + counts.before/counts.after).
 
 **Next concrete steps:**
 
-1. **Verify the reproducers** before drafting.  Run each recipe
-   from the finding doc once and confirm the dmesg signatures
-   match (Bug A: TDR>0, BUSY≥1, NOAVAIL=0; Bug B: NOAVAIL flood).
-2. Draft the issue post.  Frame as a *driver-interface gap*: the
+1. Draft the issue post.  Frame as a *driver-interface gap*: the
    driver relies on TDR as the sole backstop for op-0x18 silent
    drops because the firmware has no timeout; the cascade-to-NOAVAIL
    means a single dropped exec can starve the column pool.  Reference
    the finding doc, the variant-immunity structural finding (low-
    level rt-seq triggers it), and link the standalone repro recipe.
-3. Show Maya the text before posting (CLAUDE.md global rule for
+2. Show Maya the text before posting (CLAUDE.md global rule for
    externally-visible writing).
-4. Post.
+3. Post.
 
 ---
 
@@ -170,7 +175,7 @@ plan after thread A above stabilises.
 
 ## Recent sessions (newest first)
 
-### 2026-05-22 evening — Thread A reality-check, closed
+### 2026-05-22 evening — Thread A closed, Thread B verified
 
 Picked up Thread A (the emu `dma_wait` / empty-ctrlpkt gap).  Wrote
 the failing regression test in `xclbin_suite` as NEXT-STEPS
@@ -184,10 +189,20 @@ silent success in either path.  NEXT-STEPS Thread A's "emu reports
 emu_ok=True" observation does not reproduce on today's code.  Cause
 of the mismatch unexplained ("something weird happened").  Relaxed
 the test assertion to `!is_pass()`, committed it as a regression
-gate, updated Thread A status to RESOLVED.  Added a verify-first
+gate (`06a24ab`), marked Thread A RESOLVED.  Added a verify-first
 caveat to Thread B since Thread A's premise turning out stale on the
-same day suggests Bug A/B reproducers also deserve a re-check before
-drafting an upstream report.
+same day suggested Bug A/B reproducers also deserved a re-check
+before drafting an upstream report.
+
+Then verified Thread B per that caveat.  Both reproducers fire with
+signatures matching the finding doc exactly: Bug A standalone
+(`trace-sweep.py`) produced TDR +1 / BUSY +1 / NOAVAIL +0 in ~5s;
+Bug B bridge-test (`emu-bridge-test.sh --no-emu --sweep ctrl_packet`)
+produced NOAVAIL +104 / ret-22 +417 over ~8m.  NPU recovered cleanly
+post-Bug-B via `pkexec sh -c 'modprobe -r amdxdna && modprobe
+amdxdna'`; `xrt-smi validate` PASSED both tests with no new NOAVAIL.
+Thread B unblocked for drafting; evidence at
+`build/experiments/2026-05-22-evening-thread-b-verify/`.
 
 ### 2026-05-22 daytime — silent-drop captured, Bugs A and B distinguished
 
