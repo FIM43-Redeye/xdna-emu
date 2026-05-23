@@ -1,6 +1,6 @@
 # NEXT-STEPS
 
-Session handoff. Read this first in a new conversation. Updated 2026-05-22 evening.
+Session handoff. Read this first in a new conversation. Updated 2026-05-23 (late evening 2026-05-22 work).
 
 The repo (commits, finding docs, component docs, ROADMAP, MEMORY) is
 canonical for *anything that's done*. This file is for *anything that's
@@ -86,17 +86,93 @@ PASSED both tests post-recovery with no new NOAVAIL.  Evidence at
 `build/experiments/2026-05-22-evening-thread-b-verify/{bug-a,bug-b}/`
 (stdout/stderr + counts.before/counts.after).
 
-**Next concrete steps:**
+**Validity check (added 2026-05-22 evening).** Before drafting we
+swept driver/XRT/upstream sources for correctness of our claims.
+Three significant corrections to the framing recorded above:
 
-1. Draft the issue post.  Frame as a *driver-interface gap*: the
-   driver relies on TDR as the sole backstop for op-0x18 silent
-   drops because the firmware has no timeout; the cascade-to-NOAVAIL
-   means a single dropped exec can starve the column pool.  Reference
-   the finding doc, the variant-immunity structural finding (low-
-   level rt-seq triggers it), and link the standalone repro recipe.
-2. Show Maya the text before posting (CLAUDE.md global rule for
-   externally-visible writing).
-3. Post.
+1. **"Driver relies on TDR as sole backstop" is WRONG.**  The
+   driver has a 5s `RX_TIMEOUT` (`wait_for_completion_timeout` in
+   `amdxdna_mailbox_helper.h:9-10`) on every mailbox message
+   including op-0x18.  TDR is a *separate* device-level watchdog
+   (`tdr_timeout_ms = 2000` default × 2 stalls ≈ 4s effective);
+   it fires first in practice.  Empirically (the reproducer below)
+   each silent-drop times out at ~4080ms, well before the 5s
+   RX_TIMEOUT — TDR is the actual mechanism that fires here.
+   Both exist; neither is "sole."
+2. **"FW has no timeout" is technically true but misleading.**  The
+   firmware's internal APP-ERT event-wait has no timeout, so the
+   wedged task never self-recovers.  But the driver doesn't depend
+   on FW recovery — its own RX_TIMEOUT and TDR catch the drop and
+   abort the command.  Userspace observes
+   `ERT_CMD_STATE_TIMEOUT` (state=8) at ~4s.  Conflating "FW has
+   no internal timeout" with "no recovery mechanism exists" was
+   the original framing error.
+3. **Three already-merged upstream commits would be reviewer
+   reach-fors and need to be pre-emptively ruled out**:
+   `3d32eb7a` (cu_idx memset fix, 2025-12-09),
+   `cd77d5a4` (mailbox tail-pointer polling, 2025-12-04),
+   `343f5683` (send-ring race, 2025-12-11).  All verified present
+   in our installed amdxdna 2.23.0.  Also relevant: issue #906
+   (NPU5 deterministic timeout — different platform, different
+   reproducibility profile, not us) and our own PR #1347
+   (mailbox UAF on cleanup of timed-out messages — downstream
+   consequence of this bug, not duplicate).
+
+**Verified deterministic reproducer** at
+`tools/repros/op0x18_silent_drop/op0x18_repro.cpp`.  Self-contained
+C++ using stock XRT API only (no xdna-emu deps).  Loads
+`add_one_ctrl_packet`'s chess artifacts, leaves `bo_ctrlIn`
+zero-filled, runs N=10 iterations with fresh `xrt::hw_context` per
+iter.  Verified output (`tools/repros/op0x18_silent_drop/run.log`):
+**10/10 non-COMPLETED, state=8 (TIMEOUT), ~4080ms per drop, dmesg
+TDR=+10/NOAVAIL=+0/ret-22=+10**.  Deterministic when `bo_ctrlIn`
+is empty — this is a stronger repro than the probabilistic ~6%
+historical observation.
+
+**Newer firmware exists in staging, not released.**
+`npu.sbin.1.5.6.399` in `kernel-firmware/drm-firmware:amdnpu/1502_00/`
+(committed 2025-05-19, ~1 year ago).  xdna-driver's `tools/info.json`
+still pins NPU1 to 1.5.5.391.  Worth asking maintainers whether
+1.5.6.399 fixes this before posting (or in the post itself).
+
+**Approved post design (revised 2026-05-22 evening).**
+
+- Title: *Phoenix FW 1.5.5.391: `MSG_OP_CHAIN_EXEC_NPU` silent-drops
+  at ~6%; driver correctly aborts — is this drop-rate known?*
+- Opening: inquiry-shaped ("Is this drop rate known? Staging FW
+  status? Mitigation guidance?"). Acknowledges driver handles each
+  drop correctly. *Removes* the false "no timeout / sole backstop"
+  claim.
+- Behavior summary: TX → no RX, no IRQ → driver RX_TIMEOUT and/or
+  TDR returns -ETIME → ERT_CMD_STATE_TIMEOUT to userspace.
+- *What we ruled out*: terse list of `3d32eb7a` / `cd77d5a4` /
+  `343f5683` (verified present), issue #906 (NPU5, different),
+  PR #1347 (our own downstream filing).
+- Evidence collapsibles: (1) driver verbose mailbox log,
+  (2) kernel tracepoint quartet, (3) frequency + reproducer
+  output, (4) variant immunity (one structural sentence,
+  no MLIR lowering claims).
+- *No "recovery is clean" claim* — that was about Bug B's cascade
+  and would conflate severity bounds.  One-line placeholder:
+  "cascade behavior under sustained load is a separate follow-up."
+- Inline reproducer: ~80 LoC C++ from `tools/repros/op0x18_silent_drop/`
+  with verbatim run.log output.
+- Environment: HW Phoenix NPU1, FW 1.5.5.391 (1.5.6.399 in staging
+  noted), amdxdna 2.23.0 (`drivers/accel`), `add_one_ctrl_packet`
+  from mlir-aie chess-compiled.
+- Open questions: drop rate known? FW 1.5.6.399 expected to fix?
+  Application-layer retry guidance for `-ETIME`/`ABORT` on op-0x18?
+
+**Next concrete steps (start a new session here for the prose
+draft):**
+
+1. Draft the issue post per the approved design above.  Prose
+   deserves a fresh context window; commit before posting.
+2. Show Maya the full text before posting (CLAUDE.md global rule).
+3. Post to `github.com/amd/xdna-driver` issues.  No firmware-vs-
+   driver tag exists; file as a regular issue with
+   `MSG_OP_CHAIN_EXEC_NPU` and `Phoenix NPU1 FW 1.5.5.391` in the
+   title for self-routing.
 
 ---
 
@@ -201,8 +277,36 @@ Bug B bridge-test (`emu-bridge-test.sh --no-emu --sweep ctrl_packet`)
 produced NOAVAIL +104 / ret-22 +417 over ~8m.  NPU recovered cleanly
 post-Bug-B via `pkexec sh -c 'modprobe -r amdxdna && modprobe
 amdxdna'`; `xrt-smi validate` PASSED both tests with no new NOAVAIL.
-Thread B unblocked for drafting; evidence at
-`build/experiments/2026-05-22-evening-thread-b-verify/`.
+Evidence at `build/experiments/2026-05-22-evening-thread-b-verify/`.
+
+Pivoted into Thread B drafting prep.  Maya flagged a credibility
+concern: the cascade reproducing cleanly via modprobe (vs. historical
+"requires reboot" framing) suggested our claims about Bug A's
+mechanism might also be stale — extremely dangerous in an externally
+visible upstream report.  Dispatched three parallel agents to
+cross-check validity: (1) driver source for existing op-0x18 timeout
+handling, (2) upstream github + linux history for related issues/PRs,
+(3) XRT/SHIM timeout layer.  Result: **three significant corrections
+to our framing**.  Driver does have per-message timeouts (5s RX_TIMEOUT
++ 2s × 2 TDR); "FW has no timeout, driver relies on TDR as sole
+backstop" was wrong on both halves.  Three already-merged upstream
+commits (`3d32eb7a` / `cd77d5a4` / `343f5683`) need pre-emptive
+ruling-out.  FW 1.5.6.399 exists in staging branch, not released.
+
+With corrections in hand, redesigned the post (inquiry-shape opening,
+"what we ruled out" section, dropped the recovery claim that was
+really about Bug B's cascade).  Built a deterministic reproducer at
+`tools/repros/op0x18_silent_drop/op0x18_repro.cpp` — 80 LoC C++ using
+only stock XRT API.  Verified: 10/10 non-COMPLETED, state=8 (TIMEOUT),
+~4080ms each (the ~4s TDR, fires before the 5s RX_TIMEOUT), dmesg
+TDR=+10/NOAVAIL=+0/ret-22=+10.  Empty `bo_ctrlIn` is a *deterministic*
+trigger for the same firmware path that probabilistically affects
+normal workloads at ~6%; stronger evidence than the historical
+statistical observation.
+
+Stopped before drafting the post prose — fresh context window
+deserves the externally-visible writing.  See Thread B in this file
+for the approved design + corrected framing + reproducer.
 
 ### 2026-05-22 daytime — silent-drop captured, Bugs A and B distinguished
 

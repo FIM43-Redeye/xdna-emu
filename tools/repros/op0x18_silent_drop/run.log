@@ -1,0 +1,13 @@
+iter 0: state=8 (DROP) elapsed_ms=4088
+iter 1: state=8 (DROP) elapsed_ms=4078
+iter 2: state=8 (DROP) elapsed_ms=4087
+iter 3: state=8 (DROP) elapsed_ms=4079
+iter 4: state=8 (DROP) elapsed_ms=4077
+iter 5: state=8 (DROP) elapsed_ms=4075
+iter 6: state=8 (DROP) elapsed_ms=4076
+iter 7: state=8 (DROP) elapsed_ms=4077
+iter 8: state=8 (DROP) elapsed_ms=4074
+iter 9: state=8 (DROP) elapsed_ms=4077
+
+==== summary ====
+10/10 non-COMPLETED (100%)
