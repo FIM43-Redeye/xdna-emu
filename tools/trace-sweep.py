@@ -74,7 +74,10 @@ EVENTS_HEADER = (
     MLIR_AIE_ROOT / "build" / "include" / "xaienginecdo_static"
     / "xaiengine" / "xaie_events_aieml.h"
 )
-RUNNER = REPO_ROOT / "bridge-runner" / "build" / "bridge-trace-runner"
+RUNNER = Path(os.environ.get(
+    "BRIDGE_TRACE_RUNNER",
+    REPO_ROOT / "bridge-runner" / "build" / "bridge-trace-runner",
+))
 PATCH_TOOL = REPO_ROOT / "tools" / "trace-patch-events.py"
 PARSE_TOOL = REPO_ROOT / "tools" / "parse-trace.py"
 

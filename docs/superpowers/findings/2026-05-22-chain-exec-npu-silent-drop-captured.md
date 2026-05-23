@@ -141,6 +141,71 @@ probabilistic and count/state-dependent -- not tied to a specific input
 (2026-05-13 already killed the chess-codegen and slot-type hypotheses;
 the wedge is bidirectional flake across both compilers).
 
+## Reproduction shortcuts (2026-05-22 evening)
+
+A follow-up bisection that evening cleaned up two muddled points: the
+silent-drop and the column-leak cascade are **distinct failure modes**
+that look the same at `hw_ok=False` but have different dmesg signatures
+and different blast radii. The recipes below repro them independently.
+
+### Bug A -- firmware silent-drop (recoverable). Standalone repro.
+
+```bash
+python3 tools/trace-sweep.py \
+  --test add_one_ctrl_packet --compiler chess \
+  --tiles 0:0:shim,0:2:core,0:2:memmod \
+  --out-dir <dir> --core-sweep all --no-emu
+```
+
+No `--ctrlpkt`. The runner submits op-0x18 execs that abort in firmware
+(no ctrl packets supplied -> kernel can't proceed past lock acquire).
+Fires on batch 1, every batch silent-drops, TDR cleans up each one,
+runner survives. dmesg signature: TDR=26, BUSY=1, **NOAVAIL=0**,
+ret -22 = 0. Device stays usable, `xrt-smi validate` passes immediately
+after.
+
+This is the firmware bug in isolation -- not the cascade. Loop it (50
+sweeps, 1250 aborting execs) and the device still recovers cleanly each
+time; cumulative BUSY count grows by 1 per sweep but never escalates to
+NOAVAIL within ~30 minutes of activity.
+
+### Bug B -- column-leak cascade (catastrophic). Bridge-test repro.
+
+```bash
+./scripts/emu-bridge-test.sh --no-emu --sweep ctrl_packet
+```
+
+Cascade fires within one full run. dmesg signature: NOAVAIL flood
+(100+), ret -22 flood (400+). All subsequent `CREATE_CONTEXT` returns
+`status 0x2000003` until activity stops or driver is reloaded.
+
+The `--no-amdxdna-trace` flag does NOT prevent it (verified
+2026-05-22) -- the daemon is innocent; the escalator is in the
+bridge-test script path itself (likely the Phase 3+4 warmup +
+back-to-back chess/peano sweeps that drain the column pool faster than
+the standalone loop's single-sweep cadence does).
+
+### Distinguishing the two in dmesg
+
+```bash
+dmesg | grep -c "status 0x2000003"  # NOAVAIL -- catastrophic (Bug B)
+dmesg | grep -c "status 0x2000006"  # BUSY -- column leak event
+dmesg | grep -c "TDR timeout"       # silent-drop fired (Bug A baseline)
+dmesg | grep -c "ret -22"           # downstream cascade propagation
+```
+
+NOAVAIL > 0 is the only sign of catastrophic territory. TDR alone just
+means the firmware bug fired and recovered.
+
+### Variant immunity
+
+`add_one_ctrl_packet_4_cores` and `add_one_ctrl_packet_col_overlay`
+both PASS the same Phase-5b sweep in the same bridge-test run.  All
+three variants populate `bo_ctrlIn` identically (runtime C++
+construction in their `test.cpp`), so the immunity is not about how
+the host marshals the ctrl-packet BO -- it is structural to the
+*kernel* (column count, routing, lock layout).  Not yet characterized.
+
 ## The op-0x18 firmware path -- reverse-engineered
 
 The Phoenix LX7 firmware is statically reverse-engineered -- see
@@ -315,6 +380,18 @@ deadlock). Pinning the exact park point needs firmware/array register state
 at wedge time (the `bridge-trace-runner --snapshot-on-timeout` path). No
 firmware-trace visibility: Phoenix's `npu1_fw_feature_table` carries no
 `AIE2_FW_TRACE` bit, so the DPT firmware-trace path is unavailable here.
+
+**Newly known / open (2026-05-22 evening):** the amdxdna-trace daemon is
+NOT required for cascade reproduction (`--no-amdxdna-trace` still
+cascades).  The standalone `trace-sweep.py` loop reliably reproduces Bug
+A but never Bug B within ~30 minutes of activity, even with the daemon
+attached -- so the A->B escalator is in the bridge-test script
+structure (probably warmup + sequential chess/peano sweeps), not in any
+single tool.  And the kernel-structure question -- *why
+`add_one_ctrl_packet_4_cores` and `_col_overlay` are immune* given
+identical host-side `bo_ctrlIn` populations -- is the most promising
+next angle for understanding *which* array condition drops the
+completion event.
 
 ## Recovery
 
