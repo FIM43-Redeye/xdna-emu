@@ -1,6 +1,6 @@
 # NEXT-STEPS
 
-Session handoff. Read this first in a new conversation. Updated 2026-05-22.
+Session handoff. Read this first in a new conversation. Updated 2026-05-22 evening.
 
 The repo (commits, finding docs, component docs, ROADMAP, MEMORY) is
 canonical for *anything that's done*. This file is for *anything that's
@@ -11,91 +11,50 @@ on each one. If something here gets done, delete or update it.
 
 ## Active threads
 
-### A. Emu `dma_wait` / empty-ctrlpkt gap  (NEW 2026-05-22)
+### A. Emu `dma_wait` / empty-ctrlpkt gap  (RESOLVED 2026-05-22 evening)
 
-**The gap.** Running plain `add_one_ctrl_packet` against the emu with
-`bo_ctrlIn` empty (no `--ctrlpkt`) reports `emu_ok=True`. On real
-hardware the same setup hard-aborts (state=8) and probabilistically
-triggers the firmware silent-drop. The emu should at minimum *not*
-report success — the core blocks on a lock acquire that never gets
-released, so the output S2MM channel never receives data, so
-`aiex.npu.dma_wait` should never satisfy.
+**Status.** Closed — the premise didn't reproduce on today's code.
+The original NEXT-STEPS entry (written earlier today) claimed the
+emu reported `emu_ok=True` for `add_one_ctrl_packet` with empty
+`bo_ctrlIn`.  Empirical re-check found both runtime paths refuse to
+declare success on this scenario:
 
-**Diagnosis surface (mapped today, not yet drilled in):**
+- **`xclbin_suite` path:** engine reaches `EngineStatus::Stalled`
+  at ~366k cycles, suite returns `Fail{Stall detected at cycle N}`.
+- **`bridge-trace-runner` path:** TDR classifier fires
+  `Wedged{Stalled}` at ~363k cycles; plugin translates
+  `WedgeRecovered -> ERT_CMD_STATE_ABORT`; runner exits 1 with
+  `error: kernel did not complete (state=6)`.
 
-```
-NPU rt-seq:   aiex.npu.dma_wait                  @ MLIR
-              |  aiecc compile
-NPU instr:    Tct (opcode 128)                   @ wire format
-              |  src/npu/parser.rs:280
-              NpuInstruction::Sync
-              |  src/npu/executor.rs:306
-              is_sync_satisfied()
-              |  checks
-              ChannelFsm::is_active()             @ src/device/dma/channel.rs:41
-```
+Diagnosis surfaces originally suspected (the fast-completion path
+in `executor.rs:332-339`, the channel FSM in `channel.rs:80`) are
+behaving as designed for this scenario — the executor stays
+`BlockedOnSync` on the unsatisfied `dma_wait @out0`, `is_done`
+remains false, so the TDR `NaturalCompletion` path is unreachable.
 
-The model is structurally right — `channel.rs:80` even says "S2MM
-stalls transparently (stays in [Transferring], no advancement)".  So
-the "where it goes wrong" is one of three candidate surfaces, listed in
-descending likelihood:
+**Regression gate landed.**  See
+`src/testing/xclbin_suite.rs::add_one_ctrl_packet_empty_ctrlpkt_must_not_report_success`.
+It runs the chess xclbin with the suite's default (zero-filled)
+input and asserts the outcome is NOT a pass-shaped variant; passes
+today.
 
-1. **Plain test's low-level rt-seq isn't routed to the channel.**
-   Plain uses `aiex.npu.blockwrite(0x1d000) + aiex.npu.write32(0x1d214)`
-   (manual MM2S task-queue push) instead of `aiex.npu.dma_memcpy_nd`.
-   The variants (`_4_cores`, `_col_overlay`) use *only* the high-level
-   `dma_memcpy_nd` form and they pass cleanly both on EMU and HW.
-   Bug-shape: the raw `write32(0x1d214)` likely hits a generic
-   write-handler instead of being recognised as a BD-task-queue push,
-   so no task ever lands on the shim S2MM/MM2S channel, channel stays
-   `Idle`.  Then the `is_sync_satisfied` *fast-completion path*
-   (`executor.rs:332-339`) trivially satisfies (`transfers_completed`
-   probably nonzero from a prior batch + queue empty).
-2. **`transfers_completed` not zeroed across batches.**  Sub-bug of
-   #1, but also could bite independently — verify the channel stats
-   reset on RESET / new hwctx.
-3. **`ChannelFsm::Transferring` advances without core-side data.**
-   The S2MM transfer would need an actual data-source gate, not just a
-   length-driven byte counter.  Less likely given the explicit
-   "transparent stall" comment, but worth confirming.
+**Empirical evidence preserved at**
+`build/experiments/2026-05-22-emu-empty-ctrlpkt/` (runner stderr +
+JSON status line).
 
-**Next concrete steps (start a new session here):**
-
-1. Write a failing test under `src/testing/` (xclbin-suite runner is
-   the right harness — see `.claude/components/testing.md`): load
-   `add_one_ctrl_packet` chess xclbin + insts.bin, run it with empty
-   `bo_ctrlIn`, assert the runtime sequence does **not** report
-   success.  Should fail today; that pins the gap.
-2. Trace one batch of plain through `npu/executor.rs` and
-   `device/dma/` with `RUST_LOG=debug` (or the `XDNA_EMU_WATCH`
-   memory-watch from `CLAUDE.md`) to identify which of the three
-   surfaces above is at fault.
-3. Fix.  Most likely: route `write32(0x1d214)` and related MM2S/S2MM
-   task-queue offsets through the BD-enqueue path the way the
-   high-level `dma_memcpy_nd` lowering does.  Possibly: gate
-   `transfers_completed` so the fast-completion path doesn't trip on
-   a never-started channel.
-
-**Why this matters beyond "make a test pass":**
-
-- The plain `add_one_ctrl_packet` rt-seq exercises a real lowering
-  path some user kernels also use (low-level register pokes for
-  control packets).  The emu silently passing kernels that would
-  hang on real HW is the worst kind of correctness gap.
-- This is the *exact* corner case that triggers the firmware
-  silent-drop on HW (Bug A in the finding doc).  Once the emu
-  reproduces the *symptom* (kernel never completes), we have a
-  debuggable environment for the firmware bug — much better than
-  the silicon, where firmware is opaque.
+**Why this entry is preserved instead of deleted:**  The mismatch
+between the earlier observation and today's behavior is unexplained
+("something weird happened" -- 2026-05-22 evening session).  If a
+similar symptom resurfaces, this entry plus the experiment dir
+gives the next session enough context to triage quickly without
+re-walking the same diagnosis surface.
 
 Pointers: `2026-05-22-chain-exec-npu-silent-drop-captured.md`
-(finding doc, has the low-level-vs-high-level structural diff and
-both repro recipes), MEMORY note
-`feedback_distinguish_silent_drop_from_cascade.md`.
+(finding doc — still authoritative for the HW/firmware side).
 
 ---
 
-### B. Upstream xdna-driver issue post  (RE done, drafting deferred)
+### B. Upstream xdna-driver issue post  (RE done, drafting deferred — verify-first)
 
 **Status.** The full firmware-side RE is complete and committed in
 `2026-05-22-chain-exec-npu-silent-drop-captured.md`.  We have:
@@ -110,17 +69,29 @@ both repro recipes), MEMORY note
 **Not done.** The actual github issue text, addressed to AMD's
 `xdna-driver` repo.
 
+**Caveat (added 2026-05-22 evening).** Thread A's "emu reports
+emu_ok=True" claim turned out to be stale on re-check the same day.
+Before investing time drafting a public upstream report, **verify
+Bugs A and B still reproduce today** with the exact recipes in the
+finding doc.  If either doesn't reproduce, narrow the gap (different
+machine state? different driver/firmware version? something
+session-specific?) before posting -- a withdrawn or weakened
+upstream report is worse than no report.
+
 **Next concrete steps:**
 
-1. Draft the issue post.  Frame as a *driver-interface gap*: the
+1. **Verify the reproducers** before drafting.  Run each recipe
+   from the finding doc once and confirm the dmesg signatures
+   match (Bug A: TDR>0, BUSY≥1, NOAVAIL=0; Bug B: NOAVAIL flood).
+2. Draft the issue post.  Frame as a *driver-interface gap*: the
    driver relies on TDR as the sole backstop for op-0x18 silent
    drops because the firmware has no timeout; the cascade-to-NOAVAIL
    means a single dropped exec can starve the column pool.  Reference
    the finding doc, the variant-immunity structural finding (low-
    level rt-seq triggers it), and link the standalone repro recipe.
-2. Show Maya the text before posting (CLAUDE.md global rule for
+3. Show Maya the text before posting (CLAUDE.md global rule for
    externally-visible writing).
-3. Post.
+4. Post.
 
 ---
 
@@ -197,8 +168,28 @@ plan after thread A above stabilises.
 
 ---
 
-## Today's session in one paragraph (so the next session knows the
-shape)
+## Recent sessions (newest first)
+
+### 2026-05-22 evening — Thread A reality-check, closed
+
+Picked up Thread A (the emu `dma_wait` / empty-ctrlpkt gap).  Wrote
+the failing regression test in `xclbin_suite` as NEXT-STEPS
+prescribed; expected it to fail today by reporting `Pass`.  It did
+fail — but with `Fail{Stall detected at cycle 366398}`, not `Pass`.
+That contradicted Thread A's premise.  Cross-checked the FFI /
+bridge-runner path empirically: ran `bridge-trace-runner` directly
+against `add_one_ctrl_packet` chess xclbin with no `--ctrlpkt`; got
+`halt_reason=wedge_recovered, state=6 (ABORT)` at ~363k cycles.  No
+silent success in either path.  NEXT-STEPS Thread A's "emu reports
+emu_ok=True" observation does not reproduce on today's code.  Cause
+of the mismatch unexplained ("something weird happened").  Relaxed
+the test assertion to `!is_pass()`, committed it as a regression
+gate, updated Thread A status to RESOLVED.  Added a verify-first
+caveat to Thread B since Thread A's premise turning out stale on the
+same day suggests Bug A/B reproducers also deserve a re-check before
+drafting an upstream report.
+
+### 2026-05-22 daytime — silent-drop captured, Bugs A and B distinguished
 
 Built a stubbed copy of `bridge-trace-runner` against stock XRT
 (`build/experiments/2026-05-22-stock-repro/runner-min/`), hunted the
@@ -212,6 +203,8 @@ diff between plain `add_one_ctrl_packet` and its variants — plain
 uses 14 low-level register-poke ops in its rt-seq, variants use 0 —
 which sharpens the upstream report.  Confirmed PR #1348-equivalent
 driver is loaded, so the wedge is not the UAF fix masking anything.
-Pivoted to emu: empty-ctrlpkt against EMU reports success, mapped
-the diagnosis surface for the gap (executor.rs sync logic, channel
-FSM), did not write the failing test or fix.  Last commit `e4b8290`.
+Pivoted to emu: claimed empty-ctrlpkt against EMU reported success,
+mapped the diagnosis surface for the gap (executor.rs sync logic,
+channel FSM), did not write the failing test or fix.  Last commit
+`e4b8290`.  *(Evening session subsequently could not reproduce the
+"reports success" observation.)*

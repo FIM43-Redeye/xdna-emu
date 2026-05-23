@@ -1620,4 +1620,76 @@ mod tests {
         // 7 passed out of 8 non-skipped = 87.5%
         assert!((result.pass_rate() - 87.5).abs() < 0.01);
     }
+
+    /// Regression gate: empty-ctrlpkt must not silently succeed.
+    ///
+    /// Plain `add_one_ctrl_packet`'s runtime sequence depends on a
+    /// real control packet stream (host-side `bo_ctrlIn` populated by
+    /// `test.cpp`) to release `input_lock0` on the compute core.
+    /// With `arg1` zero-filled -- the default input the suite supplies
+    /// when `test.cpp` parsing didn't recover a populated buffer spec
+    /// -- the core blocks on `input_lock0` forever, no data ever
+    /// reaches shim S2MM ch1, and `aiex.npu.dma_wait @out0` cannot
+    /// satisfy.  Real HW hard-aborts here (state=8) and probabilistically
+    /// triggers the FW silent-drop; see
+    /// `docs/superpowers/findings/2026-05-22-chain-exec-npu-silent-drop-captured.md`.
+    ///
+    /// The contract this test pins: **the emulator must NOT declare
+    /// success on this scenario.**  Any non-pass outcome is acceptable
+    /// (`Fail{Stall detected}`, `Timeout`, `Fail{...}`); what would be
+    /// a regression is `Pass`, `ExpectedFail` matching, or
+    /// `UnexpectedPass` -- all of which signal "the kernel completed."
+    ///
+    /// Today (2026-05-22) both runtime paths handle this correctly:
+    /// - `xclbin_suite` (this test, in-process): engine reaches
+    ///   `EngineStatus::Stalled` at ~366k cycles, suite returns
+    ///   `Fail{Stall detected at cycle N}`.
+    /// - `bridge-trace-runner` (XRT plugin + FFI): TDR classifier
+    ///   fires `Wedged{Stalled}` at ~363k cycles; plugin translates
+    ///   `WedgeRecovered -> ERT_CMD_STATE_ABORT`, runner exits 1.
+    ///   Empirical run recorded at
+    ///   `build/experiments/2026-05-22-emu-empty-ctrlpkt/`.
+    ///
+    /// History: NEXT-STEPS Thread A (2026-05-22) flagged this as an
+    /// open gap with symptom "emu reports emu_ok=True".  That premise
+    /// did not reproduce on today's code -- both paths already refuse
+    /// to declare success.  The diagnosis surfaces originally
+    /// implicated (the fast-completion path in `executor.rs:332-339`
+    /// and the channel FSM in `channel.rs:80`) are working as designed
+    /// for this scenario.  This test is the regression gate that
+    /// ensures the invariant stays held.
+    #[test]
+    fn add_one_ctrl_packet_empty_ctrlpkt_must_not_report_success() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let xclbin_path =
+            manifest.join("../mlir-aie/build/test/npu-xrt/add_one_ctrl_packet/chess/aie.xclbin");
+        if !xclbin_path.exists() {
+            eprintln!(
+                "SKIP add_one_ctrl_packet_empty_ctrlpkt: chess xclbin not built at {}",
+                xclbin_path.display(),
+            );
+            return;
+        }
+
+        // Build the test minimally -- no buffer_spec override, no
+        // expected_fail wrapper.  We want the raw outcome of running
+        // the kernel with whatever default input the suite supplies
+        // for arg1 (zero-filled today).
+        let test = XclbinTest::from_path(&xclbin_path);
+        assert!(test.expected_fail_reason.is_none(), "test setup poisoned by an override");
+        assert!(test.skip_reason.is_none(), "test setup poisoned by an override");
+
+        let suite = XclbinSuite::new();
+        let outcome = suite.run_single(&test);
+
+        // The contract: emulator must NOT silently declare success.
+        // Pass / UnexpectedPass / ExpectedFail are all "the kernel
+        // completed (cleanly or as expected to fail)" signals -- any
+        // of these on this scenario is a regression.
+        assert!(
+            !outcome.is_pass() && !outcome.is_unexpected_pass(),
+            "regression: empty-ctrlpkt must not report success; got {:?}",
+            outcome,
+        );
+    }
 }
