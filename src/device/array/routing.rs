@@ -86,8 +86,13 @@ impl TileArray {
         // Phase 2: Lock Arbiter Resolution
         // Resolve all tile arbiters using round-robin. Applies granted requests
         // directly to lock values. DMA channels check results in Phase 3.
+        // Skip gated columns -- no DMA submitted requests for them (Phase 1
+        // already skipped them), so resolving is also a no-op.
         let cycle = self.current_cycle;
         for tile in &mut self.tiles {
+            if !self.clock.is_column_active(tile.col) {
+                continue;
+            }
             tile.resolve_lock_requests(cycle);
         }
 
@@ -128,6 +133,11 @@ impl TileArray {
         let mut transfers: Vec<(usize, u8, u8)> = Vec::new();
 
         for col in 0..cols {
+            // Column gate check: skip gated columns for cascade propagation.
+            if !self.clock.is_column_active(col) {
+                continue;
+            }
+
             for row in 0..rows {
                 let idx = (col as usize) * (rows as usize) + (row as usize);
                 let tile = &self.tiles[idx];

@@ -123,11 +123,19 @@ impl TileArray {
         let cols = self.cols as usize;
         let tiles = &mut self.tiles;
         let engines = &self.dma_engines;
+        let clock = &self.clock;
 
         for i in 0..tiles.len() {
+            // Column gate check: skip tiles in gated columns.
+            // Silicon does not clock DMA engines in ungated columns, so the
+            // emulator skips lock request submission for them too.
+            let col = i / rows;
+            if !clock.is_column_active(col as u8) {
+                continue;
+            }
+
             let is_mem = engines[i].tile_kind.is_mem();
             if is_mem {
-                let col = i / rows;
                 let (west_ref, own_ref, east_ref) = get_three_mut(tiles, i, col, rows, cols);
                 let mut neighbors = dma::NeighborTiles { west: west_ref, east: east_ref };
                 engines[i].submit_lock_requests(own_ref, &mut neighbors);
@@ -145,8 +153,18 @@ impl TileArray {
         // Destructure for disjoint field borrows (tiles vs engines)
         let tiles = &mut self.tiles;
         let engines = &mut self.dma_engines;
+        let clock = &self.clock;
 
         for i in 0..tiles.len() {
+            // Column gate check: skip tiles in gated columns.
+            // Silicon does not clock DMA engines in gated columns, so the
+            // emulator skips all DMA stepping for them.  This is the top-tier
+            // perf win -- typical programs gate 3 of 5 columns.
+            let col = i / rows;
+            if !clock.is_column_active(col as u8) {
+                continue;
+            }
+
             // Reset bank tracking for this cycle
             tiles[i].reset_bank_tracking();
             engines[i].cycle_dma_banks = 0;
@@ -154,7 +172,6 @@ impl TileArray {
             let is_mem = engines[i].tile_kind.is_mem();
 
             let result = if is_mem {
-                let col = i / rows;
                 let (west_ref, own_ref, east_ref) = get_three_mut(tiles, i, col, rows, cols);
                 let mut neighbors = dma::NeighborTiles { west: west_ref, east: east_ref };
                 engines[i].step(own_ref, &mut neighbors, host_memory)

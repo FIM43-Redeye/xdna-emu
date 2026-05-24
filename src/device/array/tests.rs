@@ -470,3 +470,29 @@ fn tile_array_exposes_clock_controller_with_silicon_accurate_default() {
         );
     }
 }
+
+#[test]
+fn step_data_movement_skips_gated_columns_no_progress() {
+    use crate::device::host_memory::HostMemory;
+    let mut array = TileArray::npu1();
+    let mut host = HostMemory::new();
+    // All columns gated by default (silicon-accurate).
+    // step_data_movement should report no DMA active and no streams active.
+    let (dma_active, streams_active, words_routed) = array.step_data_movement(&mut host);
+    assert!(!dma_active, "no DMA activity when all columns gated");
+    assert!(!streams_active, "no stream activity when all columns gated");
+    assert_eq!(words_routed, 0, "no words routed when all columns gated");
+}
+
+#[test]
+fn step_data_movement_runs_ungated_columns() {
+    use crate::device::host_memory::HostMemory;
+    let mut array = TileArray::npu1();
+    let mut host = HostMemory::new();
+    // Ungate column 2. With no BDs programmed, still no DMA activity, but
+    // the function must traverse col 2 without panicking.
+    array.clock_mut().write_register(2, 0, 0x000F_FF20, 0x1);
+    assert!(array.clock().is_column_active(2), "col 2 should be active after write");
+    // Must not panic; exact return values don't matter with empty BDs.
+    let _ = array.step_data_movement(&mut host);
+}
