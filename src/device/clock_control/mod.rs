@@ -8,8 +8,27 @@
 //!
 //! Spec: docs/superpowers/specs/2026-05-24-clock-control-design.md
 
-#[allow(unused_imports)]
 use std::collections::HashMap;
+
+/// Which module within a tile is being queried.  Mirrors the bit-field
+/// breakdown of Module_Clock_Control in AM025.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleKind {
+    Core,
+    Memory,
+    Dma,
+    StreamSwitch,
+}
+
+/// Per-tile module-gate state.  Stores the raw register value(s); the
+/// per-module active queries decode bit fields on demand.
+#[derive(Debug, Clone)]
+struct TileGates {
+    /// `Module_Clock_Control` (compute, memtile) or `Module_Clock_Control_0` (shim).
+    raw_mcc_0: u32,
+    /// `Module_Clock_Control_1` (shim only); None for other tile types.
+    raw_mcc_1: Option<u32>,
+}
 
 /// Per-array clock-gating state.  Single source of truth for all
 /// column / module / adaptive gates.
@@ -20,6 +39,11 @@ pub struct ClockController {
     /// Number of rows in the array.  Stored so `ungate_all()` knows how
     /// far to iterate without needing to consult arch config.
     num_rows: u8,
+    /// Per-tile module-gate state, keyed by (col, row).
+    /// Tile entry is absent until first write to that tile's MCC register;
+    /// is_module_active falls back to the AM025 reset values in that case
+    /// (consistent with what a read of the register would return).
+    tiles: HashMap<(u8, u8), TileGates>,
 }
 
 /// AM025 offset for Column_Clock_Control (shim tiles only).
@@ -29,13 +53,40 @@ impl ClockController {
     /// Construct a controller for an array of `num_cols` columns and
     /// `num_rows` rows.  All columns boot gated (silicon-accurate).
     pub fn new(num_cols: u8, num_rows: u8) -> Self {
-        Self { columns: vec![false; num_cols as usize], num_rows }
+        Self { columns: vec![false; num_cols as usize], num_rows, tiles: HashMap::new() }
     }
 
     /// Returns true iff column `col` has its clock enabled.
     /// Returns false for out-of-range columns.
     pub fn is_column_active(&self, col: u8) -> bool {
         self.columns.get(col as usize).copied().unwrap_or(false)
+    }
+
+    /// Returns true iff the named module on tile (col, row) is currently
+    /// clocked.  Column gate dominates: a gated column means every module
+    /// reports inactive regardless of MCC.  An ungated column with no MCC
+    /// writes yet uses the AM025 reset value.
+    ///
+    /// Task 4 stub: always returns false until bit-field decode is added in
+    /// Task 5.
+    pub fn is_module_active(&self, col: u8, row: u8, kind: ModuleKind) -> bool {
+        // Column gate dominates.
+        if !self.is_column_active(col) {
+            return false;
+        }
+        // For now (filled in by Task 5), return false until bit-field
+        // decode is added.
+        let _ = (row, kind);
+        false
+    }
+
+    /// Returns true iff any module on this tile is active.
+    pub fn is_tile_active(&self, col: u8, row: u8) -> bool {
+        use ModuleKind::*;
+        self.is_module_active(col, row, Core)
+            || self.is_module_active(col, row, Memory)
+            || self.is_module_active(col, row, Dma)
+            || self.is_module_active(col, row, StreamSwitch)
     }
 
     /// Handle a register write at the given tile / offset.  Silently
@@ -118,5 +169,27 @@ mod tests {
         let mut clock = ClockController::new(5, 6);
         clock.write_register(3, 0, 0x000FFF20, 0x1);
         assert_eq!(clock.read_register(3, 0, 0x000FFF20), Some(0x1));
+    }
+
+    #[test]
+    fn module_kind_variants_exist() {
+        let _ = ModuleKind::Core;
+        let _ = ModuleKind::Memory;
+        let _ = ModuleKind::Dma;
+        let _ = ModuleKind::StreamSwitch;
+    }
+
+    #[test]
+    fn is_module_active_default_false_for_all_kinds() {
+        let clock = ClockController::new(5, 6);
+        for kind in [ModuleKind::Core, ModuleKind::Memory, ModuleKind::Dma, ModuleKind::StreamSwitch] {
+            assert!(!clock.is_module_active(2, 2, kind), "module {:?} should be gated at boot", kind);
+        }
+    }
+
+    #[test]
+    fn is_tile_active_default_false() {
+        let clock = ClockController::new(5, 6);
+        assert!(!clock.is_tile_active(2, 2));
     }
 }
