@@ -214,6 +214,7 @@ fn module_gate_skips_ss_when_ss_module_gated() {
 fn test_cascade_route_south() {
     // NPU1: 5 cols x 6 rows. Compute tiles at rows 2-5.
     let mut array = TileArray::npu1();
+    array.clock_mut().ungate_all();
 
     // Configure tile (1,3): output direction = South (0)
     // Configure tile (1,2): input direction = North (0)
@@ -242,6 +243,7 @@ fn test_cascade_route_south() {
 #[test]
 fn test_cascade_route_east() {
     let mut array = TileArray::npu1();
+    array.clock_mut().ungate_all();
 
     // Configure tile (1,3): output direction = East (1)
     array.tile_mut(1, 3).cascade_input_dir = 0; // North

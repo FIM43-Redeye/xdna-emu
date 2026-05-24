@@ -379,6 +379,20 @@ impl InterpreterEngine {
         (&mut self.device, &mut self.host_memory)
     }
 
+    /// Ungate every column and module so a directly-constructed engine
+    /// behaves as if a CDO had programmed the clock-control registers.
+    ///
+    /// On real silicon and in production runs, the CDO writes
+    /// `Column_Clock_Control` / `Module_Clock_Control` to bring tiles
+    /// out of reset before kernels execute.  Tests that construct an
+    /// `InterpreterEngine` directly (no xclbin/CDO) need this helper to
+    /// reach the same starting state without introducing a test-only
+    /// backdoor on the production path.
+    #[cfg(test)]
+    pub(crate) fn ungate_all_for_test(&mut self) {
+        self.device.array.clock_mut().ungate_all();
+    }
+
     /// Enable a core at (col, row).
     pub fn enable_core(&mut self, col: usize, row: usize) {
         if let Some(core) = self.get_core_mut(col, row) {
@@ -1747,6 +1761,7 @@ mod tests {
     #[test]
     fn test_step_with_enabled_core() {
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         // Enable a core and write NOP to program memory
         engine.enable_core(0, 2);
@@ -1768,6 +1783,7 @@ mod tests {
     #[test]
     fn test_run_limited_cycles() {
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         engine.enable_core(0, 2);
 
@@ -1785,6 +1801,7 @@ mod tests {
     #[test]
     fn test_pause_resume() {
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         engine.enable_core(0, 2);
         if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
@@ -1960,6 +1977,7 @@ mod tests {
         use crate::device::dma::BdConfig;
 
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         // Configure a BD on tile (1, 2) using MM2S channel (channel 2)
         // Use 64-byte transfer: at 4 bytes/cycle, takes 16 cycles to complete
@@ -2073,6 +2091,7 @@ mod tests {
     #[test]
     fn test_cycle_accurate_step() {
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         // Enable a core and write NOP to program memory
         engine.enable_core(0, 2);
@@ -2112,6 +2131,7 @@ mod tests {
     #[test]
     fn test_perfcnt_threshold_routes_to_trace_unit() {
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         // Enable core (0,2) with enough NOPs to run 20+ cycles without halting.
         // NOPs advance PC by 4 bytes; 512 bytes -> 128 cycles of runtime.
@@ -2192,6 +2212,7 @@ mod tests {
     #[test]
     fn test_perfcnt_active_core_start_fires_without_manual_arm() {
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         engine.enable_core(0, 2);
         if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
@@ -2259,6 +2280,7 @@ mod tests {
     #[test]
     fn test_perfcnt_and_true_same_cycle_coalesce_into_multiple_frame() {
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         engine.enable_core(0, 2);
         if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
@@ -2376,6 +2398,7 @@ mod tests {
         use crate::interpreter::state::EventType;
 
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         // Enable core (0,2) with NOPs so the step doesn't halt.
         engine.enable_core(0, 2);
@@ -2483,6 +2506,7 @@ mod tests {
         use xdna_archspec::aie2::trace_events::core_events::PERF_CNT_0;
 
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         engine.enable_core(0, 2);
         if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
@@ -2649,6 +2673,7 @@ mod tests {
     fn engine_step_survives_with_isolation_set() {
         use crate::device::tile::isolation as iso;
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
         engine.enable_core(0, 2);
         if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
             tile.write_program(0, &[0x00, 0x00, 0x00, 0x00]); // NOP
@@ -2924,6 +2949,7 @@ mod tests {
         const DEBUG_CONTROL2: u32 = 0x32018;
 
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         // Load 4 NOP bundles so the interpreter has something to execute.
         if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
@@ -2977,6 +3003,7 @@ mod tests {
         const DEBUG_CONTROL2: u32 = 0x32018;
 
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
             tile.write_program(0, &[0x00u8; 16]);
@@ -3022,6 +3049,7 @@ mod tests {
         const DEBUG_CONTROL2: u32 = 0x32018;
 
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
             tile.write_program(0, &[0x00u8; 16]);
@@ -3160,6 +3188,7 @@ mod tests {
         const DEBUG_CONTROL2: u32 = 0x32018;
 
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         // Load the TRAP bundle at offset 0 in program memory.
         // Pad to 16 bytes so the interpreter always has a valid bundle
@@ -3256,6 +3285,7 @@ mod tests {
         const DEBUG_CONTROL2: u32 = 0x32018;
 
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
             tile.write_program(0, &[0x00u8; 16]);
@@ -3368,6 +3398,7 @@ mod tests {
         const COUNT_STEP_N2: u32 = 2 << 2; // = 0x08
 
         let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
 
         // Load 8 NOP bundles (64 bytes of zeros) so the core has room to commit
         // several bundles after resuming.

@@ -110,13 +110,25 @@ pub struct TestRunner {
 
 impl TestRunner {
     /// Create a new test runner for NPU1.
+    ///
+    /// Tests load ELFs and drive kernels directly without a CDO, so the
+    /// runner ungates every column/module up front -- otherwise compute
+    /// cores would skip every step and DMAs would never advance.  On
+    /// real silicon the CDO programs Column_Clock_Control before kernel
+    /// launch; this helper mirrors that starting state.
     pub fn new() -> Self {
-        Self { engine: InterpreterEngine::new_npu1(), active_cores: Vec::new() }
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.device_mut().array.clock_mut().ungate_all();
+        Self { engine, active_cores: Vec::new() }
     }
 
     /// Create a new test runner for NPU2.
+    ///
+    /// See [`new`] for the rationale on ungating at construction.
     pub fn new_npu2() -> Self {
-        Self { engine: InterpreterEngine::new_npu2(), active_cores: Vec::new() }
+        let mut engine = InterpreterEngine::new_npu2();
+        engine.device_mut().array.clock_mut().ungate_all();
+        Self { engine, active_cores: Vec::new() }
     }
 
     /// Get a reference to the underlying engine.
@@ -2044,6 +2056,7 @@ mod tests {
 
         // Create array and host memory
         let mut array = TileArray::npu1();
+        array.clock_mut().ungate_all();
         let mut host_memory = HostMemory::new();
 
         // Use two compute tiles

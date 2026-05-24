@@ -1515,6 +1515,7 @@ mod tests {
         let reg_layout = crate::device::regdb::device_reg_layout();
 
         let mut device = DeviceState::new_npu1();
+        device.array.clock_mut().ungate_all();
         let mut host_mem = HostMemory::new();
         let mut executor = NpuExecutor::new();
 
