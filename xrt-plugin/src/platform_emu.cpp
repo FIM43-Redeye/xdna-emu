@@ -73,7 +73,7 @@ create_ctx(shim_xdna::create_ctx_arg& arg) const
   {
     const std::lock_guard<std::mutex> lock(m_ctx_lock);
     ctx_entry entry{};
-    entry.num_col = arg.num_tiles;
+    entry.num_tiles = arg.num_tiles;
     entry.pid = static_cast<int64_t>(getpid());
     m_ctx_map[handle] = entry;
   }
@@ -448,9 +448,7 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
   {
     std::vector<std::vector<uint8_t>> pdi_blobs_copy;
     uint16_t ctx_start_col = 0;
-    // NB: ctx_entry::num_col is set from arg.num_tiles in create_ctx
-    // (line ~76); the field name predates the firmware-emulation work
-    // and actually holds the XRT-native num_tiles = num_cols * core_rows
+    // ctx_entry::num_tiles holds the XRT-native num_tiles = num_cols * core_rows
     // value (SHIM hwctx.cpp:279).  The emulator FFI inverts the formula.
     uint32_t ctx_num_tiles = 0;
     {
@@ -459,7 +457,7 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
       if (it != m_ctx_map.end()) {
         pdi_blobs_copy = it->second.pdi_blobs;
         ctx_start_col = static_cast<uint16_t>(it->second.start_col);
-        ctx_num_tiles = it->second.num_col;
+        ctx_num_tiles = it->second.num_tiles;
       }
     }
     m_transport->reset_context(0);
@@ -1120,7 +1118,14 @@ get_info(amdxdna_drm_get_info& arg) const
       std::memset(&entry, 0, sizeof(entry));
       entry.context_id = handle;
       entry.start_col = ctx.start_col;
-      entry.num_col = ctx.num_col;
+      {
+        // ctx.num_tiles = num_cols * compute_rows (XRT-native unit).
+        // UAPI num_col expects the actual column count, matching what
+        // the real driver stores at aie2_ctx.c:591.
+        const uint32_t compute_rows =
+            (m_transport && m_transport->get_rows() > 2) ? (m_transport->get_rows() - 2) : 4;
+        entry.num_col = (compute_rows > 0) ? (ctx.num_tiles / compute_rows) : ctx.num_tiles;
+      }
       entry.pid = ctx.pid;
       entry.command_submissions = ctx.submissions;
       entry.command_completions = ctx.completions;
@@ -1211,7 +1216,14 @@ get_info_array(amdxdna_drm_get_array& arg) const
       entry.context_id = handle;
       entry.hwctx_id = handle;
       entry.start_col = ctx.start_col;
-      entry.num_col = ctx.num_col;
+      {
+        // ctx.num_tiles = num_cols * compute_rows (XRT-native unit).
+        // UAPI num_col expects the actual column count, matching what
+        // the real driver stores at aie2_ctx.c:591.
+        const uint32_t compute_rows =
+            (m_transport && m_transport->get_rows() > 2) ? (m_transport->get_rows() - 2) : 4;
+        entry.num_col = (compute_rows > 0) ? (ctx.num_tiles / compute_rows) : ctx.num_tiles;
+      }
       entry.pid = ctx.pid;
       entry.command_submissions = ctx.submissions;
       entry.command_completions = ctx.completions;
@@ -1450,8 +1462,8 @@ dump_ctx_table(const char* context) const
   const std::lock_guard<std::mutex> lock(m_ctx_lock);
   EMU_DBG("%s: %zu contexts", context, m_ctx_map.size());
   for (const auto& [handle, ctx] : m_ctx_map) {
-    EMU_DBG("  ctx %u: cols=%u cus=%u submissions=%" PRIu64,
-            handle, ctx.num_col, ctx.num_cus, ctx.submissions);
+    EMU_DBG("  ctx %u: num_tiles=%u cus=%u submissions=%" PRIu64,
+            handle, ctx.num_tiles, ctx.num_cus, ctx.submissions);
   }
 }
 

@@ -154,10 +154,13 @@ private:
   mutable std::mutex m_bo_lock;
   mutable std::unordered_map<uint32_t, bo_entry> m_bo_map;
 
-  // Active contexts: handle -> {start_col, num_cols, pid, submissions, completions}.
+  // Active contexts: handle -> {start_col, num_tiles, pid, submissions, completions}.
+  // num_tiles = num_cols * compute_rows (the XRT-native unit from arg.num_tiles).
+  // Callers must overwrite num_tiles immediately from arg.num_tiles; the default
+  // is a placeholder — do not rely on it.
   struct ctx_entry {
-    uint32_t start_col = 0;
-    uint32_t num_col   = 5;
+    uint32_t start_col  = 0;
+    uint32_t num_tiles  = 5;  // placeholder; overwritten in create_ctx from arg.num_tiles
     int64_t  pid       = 0;
     uint64_t submissions = 0;
     uint64_t completions = 0;
