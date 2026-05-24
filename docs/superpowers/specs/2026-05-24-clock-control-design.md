@@ -59,21 +59,52 @@ all of them.
 
 ## Decisions
 
-### Default boot state: pragmatic (all ungated)
+### Default boot state: silicon-accurate (all gated)
 
-Silicon's default is "all gated, ungate via CDO." Adopting that
-literally in the emulator would break every test that does not route
-through a full CDO configuration phase. The execution layer of the
-emulator therefore boots with all column and module gates effectively
-ON, and honors the registers when the CDO writes them. A future
-`XDNA_EMU_CLOCK_STRICT=1` env var could enforce the silicon-accurate
-default; out of v1 scope.
+Silicon's default is "all gated, ungate via CDO" and the emulator
+adopts that literally. A freshly-constructed `ClockController` reports
+every column and every module as gated. Execution of a tile does not
+begin until the CDO (or a test helper acting as one) programs its
+clocks active.
 
-This is the *execution-layer* default and is distinct from the
-*register-layer* reset value: a read from `Module_Clock_Control` before
-any write must still return the AM025 reset (0x37 / 0x33 / 0x3B). In
-other words, we lie to the execution loop ("all active") but tell the
-truth to register reads ("here is the hardware default").
+Boot-state behavior is consistent across two layers:
+
+- **Execution layer**: all column and module gates report inactive on
+  query. Step paths skip every tile.
+- **Register layer**: a read from `Module_Clock_Control` before any
+  write returns the AM025 reset value (compute 0x37 / memtile 0x33 /
+  shim `_0` 0x3B). These reset bits include enable bits for individual
+  modules; the controller decodes them on first read so the execution
+  layer agrees with what the register would say.
+
+The "boot active" pragmatic option was considered and rejected: the
+project's correctness principle (see `CLAUDE.md`) is "match real
+hardware, not invent workarounds." A test that does not configure
+clocks is, in fact, broken on real silicon; the emulator should not
+hide that.
+
+### Test-surface migration
+
+Existing tests that construct `Device` / `Array` / `Tile` directly
+(without loading a real xclbin/CDO) will see every tile gated and
+will need to ungate before the tile can do work. Two mechanisms:
+
+- **`ClockController::ungate_all()`** — test helper that internally
+  calls `write_register` for every `(col, row)` with the all-active
+  bit pattern. Exercises the real register-write path (no test-only
+  backdoor that could hide bugs).
+- **xclbin-loading tests** (`xclbin_suite`, bridge tests): no change
+  required — the loaded CDO already programs clocks. These tests now
+  exercise the silicon-accurate path naturally.
+
+Migration cost: one-line addition per direct-construction test site.
+The implementation plan will audit and quantify before changes land.
+
+**Bridge-test risk**: if any bridge-test xclbin does not program
+clock-control writes (relied historically on the emulator's no-gating
+behavior even though silicon needs explicit configuration), it will
+break. Treat as a bug exposed by the change, not a regression; address
+case by case.
 
 ### Access-to-gated-tile policy: serve and warn
 
@@ -91,12 +122,6 @@ intentionally exercises gated-access behavior.
 Silicon refuses clock-control writes from user-kernel contexts. The
 emulator has no privilege model today; adding one for this one feature
 is scope creep. v1 accepts writes from any context.
-
-### Strict-mode default: not in v1
-
-`XDNA_EMU_CLOCK_STRICT=1` (default-gated boot) is left as a future
-extension. Documented here so the design accommodates it; not
-implemented.
 
 ### NoC interaction: separate gap
 
@@ -165,6 +190,11 @@ impl ClockController {
     pub fn read_register(&self, col: u8, row: u8, offset: u32) -> Option<u32>;
     pub fn tick_adaptive(&mut self, col: u8, row: u8,
                           dma_active: bool, ss_active: bool);
+
+    /// Test helper: ungate every column and every module by writing
+    /// all-active patterns through `write_register`.  No test-only
+    /// backdoor -- this exercises the same register path the CDO uses.
+    pub fn ungate_all(&mut self);
 }
 ```
 
@@ -223,7 +253,7 @@ per-test, per-run).
 
 | Case | Behavior |
 |------|----------|
-| First read from a clock-control register before any write | Return AM025 reset value (compute 0x37 / memtile 0x33 / shim_0 0x3B). Reflects what real silicon does, regardless of the emulator-layer "boot active" default. |
+| First read from a clock-control register before any write | Return AM025 reset value (compute 0x37 / memtile 0x33 / shim_0 0x3B). The execution-layer "all gated at boot" default decodes this same reset value, so the two views are consistent. |
 | Write to a clock-control register on a tile that does not exist for this arch | No-op + warn. (Same as how other invalid-tile accesses behave today.) |
 | Adaptive gate engages during an in-flight DMA transfer | Cannot happen: an in-flight transfer is by definition active, so the idle counter is being reset. If the kernel programs an extremely short `abort_period` while DMA is paused, behavior is undefined per hardware. |
 | Re-ungate after gating | Idle counters reset to 0 on ungate. Adaptive state starts fresh. |
@@ -266,6 +296,5 @@ exists, the integration tests above stand alone.
 
 - NoC implementation (separate STUB; clock-control does not depend on it)
 - Privilege enforcement of writes
-- `XDNA_EMU_CLOCK_STRICT=1` mode (default-gated boot)
 - GUI/visualizer integration (future once basic implementation lands)
 - File-split into column/module/adaptive submodules (only if needed)
