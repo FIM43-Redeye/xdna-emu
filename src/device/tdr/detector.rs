@@ -258,17 +258,25 @@ pub enum StallStatus {
     Stalled(TdrDiagnosis),
 }
 
-/// Detects DMA stalls by monitoring lock-release progress.
+/// Detects DMA stalls by monitoring lock-release and instruction progress.
 ///
 /// Complements [`QuiescenceDetector`] which catches true deadlocks (all
 /// subsystems terminal). This detector catches **livelocks** where cores
-/// are still running but neither DMA bytes are moving nor any lock is being
-/// released, so the workload can never complete.
+/// are still running but neither DMA bytes are moving, any lock is being
+/// released, nor any instruction is retiring -- so the workload can never
+/// complete.
 ///
-/// The stall counter resets whenever either DMA bytes or lock release count
-/// changes. Lock releases are a robust forward-progress signal: any time a
-/// core releases a lock it is making productive progress toward completion,
-/// even if DMA bytes are not moving in that cycle.
+/// The stall counter resets whenever DMA bytes, lock release count, or
+/// instruction retirement count changes. Instruction retirement is the third
+/// signal: a core running a pure-compute inner loop (e.g. a 4096-element
+/// accumulation loop spanning ~100K cycles) retires instructions every cycle
+/// even when no DMA or lock events occur. Without this signal such loops
+/// would trip the stall threshold mid-flight and kill the core during
+/// legitimate work.
+///
+/// True deadlocks are still caught: a deadlocked core is blocked in
+/// WaitLock/WaitDma/WaitStream and does NOT retire instructions, so the
+/// counter still fires.
 ///
 /// The counter only fires when there are unsatisfied pending syncs --
 /// otherwise the test may legitimately be doing pure computation.
@@ -277,7 +285,9 @@ pub struct StallDetector {
     last_dma_bytes: u64,
     /// Last observed total lock releases across all tiles.
     last_lock_releases: u64,
-    /// Consecutive cycles with no progress (DMA or lock releases).
+    /// Last observed total instructions retired across all cores.
+    last_instructions: u64,
+    /// Consecutive cycles with no progress (DMA, lock releases, or instructions).
     cycles_since_progress: u64,
     /// Threshold before declaring a stall.
     threshold: u64,
@@ -286,18 +296,37 @@ pub struct StallDetector {
 impl StallDetector {
     /// Create a new stall detector with the given cycle threshold.
     pub fn new(threshold: u64) -> Self {
-        Self { last_dma_bytes: 0, last_lock_releases: 0, cycles_since_progress: 0, threshold }
+        Self {
+            last_dma_bytes: 0,
+            last_lock_releases: 0,
+            last_instructions: 0,
+            cycles_since_progress: 0,
+            threshold,
+        }
     }
 
     pub(crate) fn reset(&mut self) {
         self.cycles_since_progress = 0;
     }
 
+    /// Expose the no-progress counter for testing.
+    #[cfg(test)]
+    pub(crate) fn cycles_since_progress(&self) -> u64 {
+        self.cycles_since_progress
+    }
+
     /// Returns true when threshold met (stalled).
-    pub(crate) fn note_progress(&mut self, dma_bytes: u64, lock_releases: u64) -> bool {
-        if dma_bytes != self.last_dma_bytes || lock_releases != self.last_lock_releases {
+    ///
+    /// Any of the three signals advancing resets the no-progress counter:
+    /// DMA bytes transferred, lock releases, or instructions retired.
+    pub(crate) fn note_progress(&mut self, dma_bytes: u64, lock_releases: u64, instructions: u64) -> bool {
+        if dma_bytes != self.last_dma_bytes
+            || lock_releases != self.last_lock_releases
+            || instructions != self.last_instructions
+        {
             self.last_dma_bytes = dma_bytes;
             self.last_lock_releases = lock_releases;
+            self.last_instructions = instructions;
             self.cycles_since_progress = 0;
             false
         } else {
@@ -309,7 +338,7 @@ impl StallDetector {
     /// Check whether the system has stalled this cycle.
     ///
     /// Must be called once per cycle. Returns:
-    /// - `Progressing` if DMA bytes or lock releases are advancing
+    /// - `Progressing` if DMA bytes, lock releases, or instructions are advancing
     /// - `Stalled(diagnosis)` if no progress for `threshold` cycles
     ///   with unsatisfied syncs
     pub fn check(&mut self, engine: &InterpreterEngine, npu_executor: Option<&NpuExecutor>) -> StallStatus {
@@ -329,10 +358,15 @@ impl StallDetector {
 
         let current_bytes = engine.device().array.total_dma_bytes_transferred();
         let current_lock_releases = engine.device().array.total_lock_releases();
+        let current_instructions = engine.total_instructions();
 
-        if current_bytes != self.last_dma_bytes || current_lock_releases != self.last_lock_releases {
+        if current_bytes != self.last_dma_bytes
+            || current_lock_releases != self.last_lock_releases
+            || current_instructions != self.last_instructions
+        {
             self.last_dma_bytes = current_bytes;
             self.last_lock_releases = current_lock_releases;
+            self.last_instructions = current_instructions;
             self.cycles_since_progress = 0;
             StallStatus::Progressing
         } else {
@@ -416,5 +450,66 @@ mod tests {
         assert!(!s.contains("core(0,3)"), "got: {}", s);
         assert!(s.contains("DMA:"), "got: {}", s);
         assert!(s.contains("(0,2)ch0 WaitingForLock(5)"), "got: {}", s);
+    }
+
+    #[test]
+    fn test_stall_note_progress_resets_on_any_signal() {
+        // Verify that any of the three signals (bytes, lock_releases, instructions)
+        // resets the no-progress counter.
+        let mut detector = StallDetector::new(10);
+
+        // Accumulate a few stall cycles with all zeros.
+        for _ in 0..4 {
+            assert!(!detector.note_progress(0, 0, 0), "should not stall yet");
+        }
+        assert_eq!(detector.cycles_since_progress(), 4);
+
+        // Advancing bytes alone resets counter.
+        assert!(!detector.note_progress(1, 0, 0));
+        assert_eq!(detector.cycles_since_progress(), 0);
+
+        // Advance bytes again -- no change from last observation, counter bumps.
+        assert!(!detector.note_progress(1, 0, 0));
+        assert_eq!(detector.cycles_since_progress(), 1);
+
+        // Advancing lock_releases alone resets counter.
+        assert!(!detector.note_progress(1, 1, 0));
+        assert_eq!(detector.cycles_since_progress(), 0);
+
+        // Advancing instructions alone resets counter.
+        assert!(!detector.note_progress(1, 1, 1));
+        assert_eq!(detector.cycles_since_progress(), 0);
+    }
+
+    #[test]
+    fn test_instruction_progress_alone_resets_counter() {
+        // Core case: a pure-compute inner loop retires instructions every cycle
+        // while DMA bytes and lock releases are constant. The detector must NOT
+        // fire even after many cycles of zero DMA/lock progress, as long as
+        // instructions keep advancing.
+        let mut detector = StallDetector::new(5);
+
+        // Accumulate to threshold-1 with all zeros (no progress).
+        for i in 0..4 {
+            assert!(!detector.note_progress(0, 0, 0), "should not stall on cycle {}", i);
+        }
+        assert_eq!(detector.cycles_since_progress(), 4, "counter should be at threshold-1");
+
+        // Now instructions increment but bytes/locks stay zero.
+        // This should reset the counter and NOT report a stall.
+        assert!(!detector.note_progress(0, 0, 1), "instruction progress alone must reset the stall counter");
+        assert_eq!(
+            detector.cycles_since_progress(),
+            0,
+            "counter must reset to zero after instruction progress"
+        );
+
+        // Verify the detector recovers fully -- needs a fresh threshold-length
+        // run of no progress before it fires.
+        for i in 0..4 {
+            assert!(!detector.note_progress(0, 0, 1), "stale counter must not fire on cycle {}", i);
+        }
+        // Fifth cycle with no change: crosses threshold.
+        assert!(detector.note_progress(0, 0, 1), "stall must fire after threshold cycles with no progress");
     }
 }

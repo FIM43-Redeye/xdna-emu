@@ -727,6 +727,7 @@ mod tier_c_integration {
             any_data_in_flight: false,
             total_dma_bytes_transferred: 0,
             total_lock_releases: 0,
+            total_instructions: 0,
             core_statuses: vec![],
             dma_states: vec![],
         }

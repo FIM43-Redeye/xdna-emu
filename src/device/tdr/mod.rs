@@ -66,6 +66,8 @@ pub struct EngineSignals {
     pub any_data_in_flight: bool,
     pub total_dma_bytes_transferred: u64,
     pub total_lock_releases: u64,
+    /// Total instructions retired across all cores (monotonically increasing).
+    pub total_instructions: u64,
     /// (col, row, status) for every enabled compute core.
     pub core_statuses: Vec<(u8, u8, CoreStatus)>,
     /// (col, row, channel, fsm_description) for every non-idle DMA channel.
@@ -257,8 +259,11 @@ impl TdrDetector {
             self.stall.reset();
             return false;
         }
-        self.stall
-            .note_progress(signals.total_dma_bytes_transferred, signals.total_lock_releases)
+        self.stall.note_progress(
+            signals.total_dma_bytes_transferred,
+            signals.total_lock_releases,
+            signals.total_instructions,
+        )
     }
 
     fn build_diagnosis(signals: &EngineSignals, executor: Option<&ExecutorSignals>) -> TdrDiagnosis {
@@ -327,6 +332,7 @@ mod tests {
             any_data_in_flight: false,
             total_dma_bytes_transferred: 0,
             total_lock_releases: 0,
+            total_instructions: 0,
             core_statuses: vec![],
             dma_states: vec![],
         }
