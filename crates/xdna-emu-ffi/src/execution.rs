@@ -342,6 +342,7 @@ fn build_engine_signals(
         any_data_in_flight: device.array.any_data_in_flight(),
         total_dma_bytes_transferred: device.array.total_dma_bytes_transferred(),
         total_lock_releases: device.array.total_lock_releases(),
+        total_instructions: engine.total_instructions(),
         core_statuses,
         dma_states,
     }
