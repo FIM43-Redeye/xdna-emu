@@ -8,7 +8,7 @@
 //!
 //! Spec: docs/superpowers/specs/2026-05-24-clock-control-design.md
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Which module within a tile is being queried.  Mirrors the bit-field
 /// breakdown of Module_Clock_Control in AM025.
@@ -65,6 +65,11 @@ pub struct ClockController {
     /// Per-tile adaptive-gate idle counters and abort_period config.
     /// Entry created lazily on first tick or set_adaptive_abort_period.
     adaptive: HashMap<(u8, u8), AdaptiveState>,
+    /// Set of (col, row, offset) tuples that have already been warned
+    /// about as accesses to a gated tile.  Used to dedup the warning
+    /// emitted by `warn_gated_access` so a single bug pattern does not
+    /// flood the log on every cycle.
+    warned_sites: HashSet<(u8, u8, u32)>,
 }
 
 /// AM025 offset for Column_Clock_Control (shim tiles only).
@@ -170,6 +175,7 @@ impl ClockController {
             num_rows,
             tiles: HashMap::new(),
             adaptive: HashMap::new(),
+            warned_sites: HashSet::new(),
         }
     }
 
@@ -254,6 +260,32 @@ impl ClockController {
         };
         let threshold = 1u32.checked_shl(s.abort_period_2pow as u32).unwrap_or(u32::MAX);
         s.ss_idle_cycles >= threshold
+    }
+
+    /// Record a gated-tile access for warning purposes.
+    ///
+    /// Returns `true` if this is the first time the (col, row, offset)
+    /// site has been seen while the tile was gated -- the caller is
+    /// then expected to emit a log warning.  Returns `false` if the
+    /// tile is currently active (no warning needed) or if this exact
+    /// site has already been warned about (dedup).
+    ///
+    /// Per the spec, accesses to gated tiles proceed (silicon does not
+    /// block them); this method is purely for surfacing the bug
+    /// pattern in the emulator.  The dispatch path should still serve
+    /// the access regardless of this method's return value.
+    pub fn warn_gated_access(&mut self, col: u8, row: u8, offset: u32) -> bool {
+        if self.is_tile_active(col, row) {
+            return false;
+        }
+        self.warned_sites.insert((col, row, offset))
+    }
+
+    /// Test-only accessor for the number of distinct gated-access
+    /// sites this controller has recorded.
+    #[cfg(test)]
+    pub fn warned_sites_len(&self) -> usize {
+        self.warned_sites.len()
     }
 
     /// Handle a register write at the given tile / offset.  Silently

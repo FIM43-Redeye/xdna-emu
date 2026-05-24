@@ -18,6 +18,26 @@ impl DeviceState {
     /// All external callers MUST use this method. Never write to tile state
     /// directly.
     pub fn write_tile_register(&mut self, col: u8, row: u8, offset: u32, value: u32) {
+        // Warn-once-per-site on accesses to gated tiles.  Per spec, the
+        // access still proceeds (silicon does not block it) -- we just
+        // surface the bug pattern.  Clock-control register writes are
+        // suppressed since they are the mechanism by which a tile is
+        // ungated in the first place.
+        let tile_kind = tile_kind_from_row(row);
+        let subsystem = subsystem_from_offset(offset, tile_kind);
+        if subsystem != SubsystemKind::ClockControl
+            && self.array.clock_mut().warn_gated_access(col, row, offset)
+            && warnings_enabled()
+        {
+            log::warn!(
+                "access to gated tile ({}, {}) at offset 0x{:05X}; silicon would produce undefined results. \
+                Set XDNA_EMU_WARN_GATED_ACCESS=0 to silence.",
+                col,
+                row,
+                offset,
+            );
+        }
+
         let address = TileAddress::encode(col, row, offset);
         if let Err(e) = self.write_register(address, value) {
             log::error!("write_tile_register failed: tile({},{}) offset=0x{:05X}: {:?}", col, row, offset, e);
@@ -383,4 +403,12 @@ impl DeviceState {
 
         Ok(())
     }
+}
+
+/// Returns true unless `XDNA_EMU_WARN_GATED_ACCESS=0` is set.
+/// Controls whether the gated-tile-access warning emits a log line;
+/// the controller still records the site either way so tests can
+/// observe dedup behavior.
+fn warnings_enabled() -> bool {
+    std::env::var("XDNA_EMU_WARN_GATED_ACCESS").as_deref() != Ok("0")
 }

@@ -815,4 +815,67 @@ mod tier_c_integration {
             .clock()
             .is_module_active(2, 3, crate::device::clock_control::ModuleKind::Core));
     }
+
+    #[test]
+    fn first_write_to_gated_tile_records_warning() {
+        let mut state = DeviceState::new_npu1();
+        // Column 2 is gated by default (boots gated, no ungate yet).
+        assert_eq!(state.array.clock().warned_sites_len(), 0);
+        state.write_tile_register(2, 3, 0x00000, 0xDEADBEEF);
+        assert_eq!(
+            state.array.clock().warned_sites_len(),
+            1,
+            "first gated-tile access should record one warning site"
+        );
+        state.write_tile_register(2, 3, 0x00000, 0xCAFEF00D);
+        assert_eq!(state.array.clock().warned_sites_len(), 1, "subsequent writes to same site should dedup");
+    }
+
+    #[test]
+    fn different_offset_on_gated_tile_records_new_warning() {
+        let mut state = DeviceState::new_npu1();
+        state.write_tile_register(2, 3, 0x00000, 0x1);
+        state.write_tile_register(2, 3, 0x00004, 0x1);
+        assert_eq!(state.array.clock().warned_sites_len(), 2, "dedup is per-site, not per-tile");
+    }
+
+    #[test]
+    fn write_to_ungated_tile_does_not_record_warning() {
+        let mut state = DeviceState::new_npu1();
+        // Ungate column 2 so its tiles are clocked.
+        state.write_tile_register(2, 0, 0x000FFF20, 0x1);
+        let before = state.array.clock().warned_sites_len();
+        // Tile (2, 3) is now active (column ungated, MCC reset value 0x37
+        // has Core/Memory/SS bits set).
+        state.write_tile_register(2, 3, 0x00000, 0xDEADBEEF);
+        assert_eq!(state.array.clock().warned_sites_len(), before, "ungated tile must not record a warning");
+    }
+
+    #[test]
+    fn clock_control_register_writes_do_not_trigger_warning() {
+        let mut state = DeviceState::new_npu1();
+        // Column_Clock_Control on shim (col 2, row 0) -- the tile is
+        // gated, but this write IS the ungate mechanism.  Must not warn.
+        state.write_tile_register(2, 0, 0x000FFF20, 0x1);
+        assert_eq!(
+            state.array.clock().warned_sites_len(),
+            0,
+            "clock-control writes are the ungate mechanism; never warn"
+        );
+        // MCC on a still-gated column should similarly be suppressed.
+        // Column 3 is still gated; the MCC write is still a clock-control
+        // offset and so must not warn.
+        state.write_tile_register(3, 3, 0x00060000, 0x37);
+        assert_eq!(
+            state.array.clock().warned_sites_len(),
+            0,
+            "MCC writes are clock-control offsets; never warn even on gated col"
+        );
+    }
+
+    #[test]
+    fn fresh_clock_controller_has_empty_warned_sites() {
+        let state = DeviceState::new_npu1();
+        assert_eq!(state.array.clock().warned_sites_len(), 0);
+    }
 }
