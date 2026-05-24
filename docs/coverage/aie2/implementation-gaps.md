@@ -6,5 +6,5 @@ Subsystems only partially built or stubbed (spec Section 1, third gap
 class). Empty == every named subsystem is Full/closed for this arch.
 
 - noc: STUB
-- clock_control: STUB
+- clock_control: PARTIAL -- missing: adaptive idle-counter wiring (tick_adaptive not driven from step loop); Reset_Control_1 / AIE_Tile_Column_Reset partition teardown; power/cycle-count effects
 
