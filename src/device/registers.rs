@@ -411,6 +411,18 @@ pub fn subsystem_from_offset(offset: u32, tile_kind: TileKind) -> SubsystemKind 
     use xdna_archspec::aie2 as arch;
     use xdna_archspec::aie2::subsystems as subsystem;
 
+    // Clock-control offsets (exact match). Must come first so the
+    // generic ranges below do not consume them.
+    match (offset, tile_kind) {
+        (0x000FFF20, TileKind::ShimNoc | TileKind::ShimPl) => return SubsystemKind::ClockControl,
+        (0x00060000, TileKind::Compute) => return SubsystemKind::ClockControl,
+        (0x000FFF00, TileKind::Mem | TileKind::ShimNoc | TileKind::ShimPl) => {
+            return SubsystemKind::ClockControl
+        }
+        (0x000FFF04, TileKind::ShimNoc | TileKind::ShimPl) => return SubsystemKind::ClockControl,
+        _ => {}
+    }
+
     // Strategy: check most-specific (smallest) ranges first, then broader
     // encompassing ranges. Within overlapping clusters, the order is:
     //   Trace < WatchPoint < Timer < Event (smallest to largest)
@@ -950,6 +962,19 @@ mod tests {
         // compute or shim offset
         assert_eq!(subsystem_from_offset(0x50000, TileKind::Mem), SubsystemKind::DataMemory);
         assert_eq!(subsystem_from_offset(0x50000, TileKind::Compute), SubsystemKind::Unknown);
+    }
+
+    #[test]
+    fn subsystem_from_offset_routes_column_clock_control_to_clock_control() {
+        assert_eq!(subsystem_from_offset(0x000FFF20, TileKind::ShimNoc), SubsystemKind::ClockControl);
+    }
+
+    #[test]
+    fn subsystem_from_offset_routes_module_clock_control_to_clock_control() {
+        // Compute MCC at 0x00060000
+        assert_eq!(subsystem_from_offset(0x00060000, TileKind::Compute), SubsystemKind::ClockControl);
+        // Memtile MCC at 0x000FFF00
+        assert_eq!(subsystem_from_offset(0x000FFF00, TileKind::Mem), SubsystemKind::ClockControl);
     }
 
     #[test]

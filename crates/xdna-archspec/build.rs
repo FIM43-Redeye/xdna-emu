@@ -591,6 +591,7 @@ fn subsystem_mod_name(kind: crate::types::SubsystemKind) -> &'static str {
         SubsystemKind::Interrupt => "interrupt",
         SubsystemKind::NoC => "noc",
         SubsystemKind::ShimMux => "shim_mux",
+        SubsystemKind::ClockControl => "clock_control",
         SubsystemKind::Unknown => "unknown",
     }
 }

@@ -508,6 +508,10 @@ pub enum SubsystemKind {
     /// Network-on-chip interface (shim tiles).
     NoC,
     ShimMux,
+    /// Clock-control registers (column clock gate + per-tile module gates +
+    /// adaptive gate config). See aie_registers_aie2.json: Column_Clock_Control,
+    /// Module_Clock_Control, Module_Clock_Control_0, Module_Clock_Control_1.
+    ClockControl,
     /// Subsystem not yet classified.
     Unknown,
 }
@@ -532,6 +536,7 @@ impl fmt::Display for SubsystemKind {
             Self::Interrupt => write!(f, "interrupt"),
             Self::NoC => write!(f, "noc"),
             Self::ShimMux => write!(f, "shim_mux"),
+            Self::ClockControl => write!(f, "clock_control"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
