@@ -152,6 +152,12 @@ impl DeviceState {
                 }
             }
 
+            SubsystemKind::ClockControl => {
+                self.array
+                    .clock_mut()
+                    .write_register(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+            }
+
             _ => {}
         }
 

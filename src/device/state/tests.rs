@@ -792,4 +792,27 @@ mod tier_c_integration {
         assert!(state.contexts[0].is_connected(), "context must return to Connected after reset");
         assert!(state.async_errors.last_cache().is_none(), "Tier B cache should be cleared by reset_context");
     }
+
+    #[test]
+    fn write_tile_register_routes_column_clock_control_to_clock_controller() {
+        let mut state = DeviceState::new_npu1();
+        // Initially gated.
+        assert!(!state.array.clock().is_column_active(2));
+        // Write Column_Clock_Control bit 0 = 1 to ungate column 2.
+        state.write_tile_register(2, 0, 0x000FFF20, 0x1);
+        assert!(state.array.clock().is_column_active(2));
+    }
+
+    #[test]
+    fn write_tile_register_routes_mcc_compute_to_clock_controller() {
+        let mut state = DeviceState::new_npu1();
+        // Ungate column 2 first.
+        state.write_tile_register(2, 0, 0x000FFF20, 0x1);
+        // Write MCC with core bit set on tile (2, 3).
+        state.write_tile_register(2, 3, 0x00060000, 1 << 2);
+        assert!(state
+            .array
+            .clock()
+            .is_module_active(2, 3, crate::device::clock_control::ModuleKind::Core));
+    }
 }
