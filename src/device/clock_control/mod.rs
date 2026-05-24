@@ -30,6 +30,24 @@ struct TileGates {
     raw_mcc_1: Option<u32>,
 }
 
+/// Per-tile adaptive-gate state.  Tracks idle cycles separately for
+/// the DMA and stream switch subsystems.  Gate engages when idle
+/// cycles reach 2^abort_period (AM025 supported range 3-12).
+#[derive(Debug, Clone)]
+struct AdaptiveState {
+    dma_idle_cycles: u32,
+    ss_idle_cycles: u32,
+    /// Engagement threshold = 2^abort_period.  Range 3-12 per AM025.
+    /// Default 7 (= 2^7 = 128 cycles, the AM025 default).
+    abort_period_2pow: u8,
+}
+
+impl Default for AdaptiveState {
+    fn default() -> Self {
+        Self { dma_idle_cycles: 0, ss_idle_cycles: 0, abort_period_2pow: 7 }
+    }
+}
+
 /// Per-array clock-gating state.  Single source of truth for all
 /// column / module / adaptive gates.
 #[derive(Debug, Clone)]
@@ -44,6 +62,9 @@ pub struct ClockController {
     /// is_module_active falls back to the AM025 reset values in that case
     /// (consistent with what a read of the register would return).
     tiles: HashMap<(u8, u8), TileGates>,
+    /// Per-tile adaptive-gate idle counters and abort_period config.
+    /// Entry created lazily on first tick or set_adaptive_abort_period.
+    adaptive: HashMap<(u8, u8), AdaptiveState>,
 }
 
 /// AM025 offset for Column_Clock_Control (shim tiles only).
@@ -144,7 +165,12 @@ impl ClockController {
     /// Construct a controller for an array of `num_cols` columns and
     /// `num_rows` rows.  All columns boot gated (silicon-accurate).
     pub fn new(num_cols: u8, num_rows: u8) -> Self {
-        Self { columns: vec![false; num_cols as usize], num_rows, tiles: HashMap::new() }
+        Self {
+            columns: vec![false; num_cols as usize],
+            num_rows,
+            tiles: HashMap::new(),
+            adaptive: HashMap::new(),
+        }
     }
 
     /// Returns true iff column `col` has its clock enabled.
@@ -183,6 +209,51 @@ impl ClockController {
             || self.is_module_active(col, row, Memory)
             || self.is_module_active(col, row, Dma)
             || self.is_module_active(col, row, StreamSwitch)
+    }
+
+    /// Advance per-tile adaptive-gate idle counters.  Activity in DMA or
+    /// SS resets the corresponding counter; idleness advances it.  Once
+    /// a counter reaches 2^abort_period the adaptive gate engages.
+    pub fn tick_adaptive(&mut self, col: u8, row: u8, dma_active: bool, ss_active: bool) {
+        let entry = self.adaptive.entry((col, row)).or_default();
+        if dma_active {
+            entry.dma_idle_cycles = 0;
+        } else {
+            entry.dma_idle_cycles = entry.dma_idle_cycles.saturating_add(1);
+        }
+        if ss_active {
+            entry.ss_idle_cycles = 0;
+        } else {
+            entry.ss_idle_cycles = entry.ss_idle_cycles.saturating_add(1);
+        }
+    }
+
+    /// Configure the abort_period (= 2^N idle-cycle threshold) for the
+    /// adaptive gates on a tile.  AM025 supported range is 3-12; values
+    /// outside that produce undefined hardware behavior, but the
+    /// emulator does not enforce the range.
+    pub fn set_adaptive_abort_period(&mut self, col: u8, row: u8, period_2pow: u8) {
+        let entry = self.adaptive.entry((col, row)).or_default();
+        entry.abort_period_2pow = period_2pow;
+    }
+
+    /// Returns true iff the DMA adaptive gate is currently engaged
+    /// (idle cycle counter has crossed 2^abort_period).
+    pub fn is_adaptive_dma_engaged(&self, col: u8, row: u8) -> bool {
+        let Some(s) = self.adaptive.get(&(col, row)) else {
+            return false;
+        };
+        let threshold = 1u32.checked_shl(s.abort_period_2pow as u32).unwrap_or(u32::MAX);
+        s.dma_idle_cycles >= threshold
+    }
+
+    /// Returns true iff the SS adaptive gate is currently engaged.
+    pub fn is_adaptive_ss_engaged(&self, col: u8, row: u8) -> bool {
+        let Some(s) = self.adaptive.get(&(col, row)) else {
+            return false;
+        };
+        let threshold = 1u32.checked_shl(s.abort_period_2pow as u32).unwrap_or(u32::MAX);
+        s.ss_idle_cycles >= threshold
     }
 
     /// Handle a register write at the given tile / offset.  Silently
@@ -412,5 +483,52 @@ mod tests {
         assert_eq!(clock.read_register(2, 0, MCC_SHIM_0_OFFSET), Some(0x3B));
         // Shim Module_Clock_Control_1 reset is 0x01.
         assert_eq!(clock.read_register(2, 0, MCC_SHIM_1_OFFSET), Some(0x01));
+    }
+
+    // ---- Task 6: AdaptiveState + tick_adaptive ----
+
+    #[test]
+    fn adaptive_gate_default_disengaged_on_fresh_tile() {
+        let clock = ClockController::new(5, 6);
+        // No writes yet; adaptive state is "permissive" because the
+        // tile is also clock-gated (default).  Once ungated and ticked,
+        // the adaptive gate will engage on sustained idle.
+        assert!(!clock.is_adaptive_dma_engaged(2, 2));
+        assert!(!clock.is_adaptive_ss_engaged(2, 2));
+    }
+
+    #[test]
+    fn adaptive_dma_engages_after_idle_cycles() {
+        let mut clock = ClockController::new(5, 6);
+        // Set abort_period = 3 (engage after 2^3 = 8 idle cycles).
+        clock.set_adaptive_abort_period(2, 2, 3);
+        for _ in 0..8 {
+            clock.tick_adaptive(2, 2, /*dma_active=*/ false, /*ss_active=*/ false);
+        }
+        assert!(clock.is_adaptive_dma_engaged(2, 2));
+    }
+
+    #[test]
+    fn adaptive_dma_resets_on_activity() {
+        let mut clock = ClockController::new(5, 6);
+        clock.set_adaptive_abort_period(2, 2, 3);
+        for _ in 0..7 {
+            clock.tick_adaptive(2, 2, false, false);
+        }
+        // One active cycle resets the counter.
+        clock.tick_adaptive(2, 2, true, false);
+        assert!(!clock.is_adaptive_dma_engaged(2, 2));
+    }
+
+    #[test]
+    fn adaptive_ss_independent_from_dma() {
+        let mut clock = ClockController::new(5, 6);
+        clock.set_adaptive_abort_period(2, 2, 3);
+        // DMA active, SS idle.
+        for _ in 0..8 {
+            clock.tick_adaptive(2, 2, /*dma=*/ true, /*ss=*/ false);
+        }
+        assert!(!clock.is_adaptive_dma_engaged(2, 2), "DMA active -> DMA gate stays disengaged");
+        assert!(clock.is_adaptive_ss_engaged(2, 2), "SS idle long enough -> SS gate engages");
     }
 }
