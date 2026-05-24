@@ -52,8 +52,13 @@ public:
     /// submit because `reset_context` wipes clock state.  No-op if the
     /// backing FFI symbol is not available (older emulator builds --
     /// tests will wedge because nothing else ungates the columns).
+    ///
+    /// `num_tiles` is the XRT-native unit (cols * compute_rows).  SHIM
+    /// packs it as `m_col_cnt * core_rows` in
+    /// xdna-driver `src/shim/hwctx.cpp:279`; the emulator inverts the
+    /// formula in the FFI using its known topology.
     virtual void assign_partition(uint8_t /*start_col*/,
-                                  uint8_t /*num_col*/) {}
+                                  uint32_t /*num_tiles*/) {}
 
     // -- Buffer management ---------------------------------------------------
 

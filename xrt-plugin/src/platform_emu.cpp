@@ -448,14 +448,18 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
   {
     std::vector<std::vector<uint8_t>> pdi_blobs_copy;
     uint16_t ctx_start_col = 0;
-    uint16_t ctx_num_col = 0;
+    // NB: ctx_entry::num_col is set from arg.num_tiles in create_ctx
+    // (line ~76); the field name predates the firmware-emulation work
+    // and actually holds the XRT-native num_tiles = num_cols * core_rows
+    // value (SHIM hwctx.cpp:279).  The emulator FFI inverts the formula.
+    uint32_t ctx_num_tiles = 0;
     {
       const std::lock_guard<std::mutex> lock(m_ctx_lock);
       auto it = m_ctx_map.find(arg.ctx_handle);
       if (it != m_ctx_map.end()) {
         pdi_blobs_copy = it->second.pdi_blobs;
         ctx_start_col = static_cast<uint16_t>(it->second.start_col);
-        ctx_num_col = static_cast<uint16_t>(it->second.num_col);
+        ctx_num_tiles = it->second.num_col;
       }
     }
     m_transport->reset_context(0);
@@ -470,7 +474,7 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
     // each submit, so this MUST re-run per-submit (not just on first
     // context create).
     m_transport->assign_partition(static_cast<uint8_t>(ctx_start_col),
-                                  static_cast<uint8_t>(ctx_num_col));
+                                  ctx_num_tiles);
     for (const auto& blob : pdi_blobs_copy) {
       if (!blob.empty())
         m_transport->load_pdi(blob.data(), blob.size());

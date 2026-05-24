@@ -211,12 +211,12 @@ void emu_transport_inprocess::set_start_col(uint8_t start_col)
 }
 
 void emu_transport_inprocess::assign_partition(uint8_t start_col,
-                                               uint8_t num_col)
+                                               uint32_t num_tiles)
 {
     if (!sym_assign_partition_)
         return;  // Older emulator builds: no-op fallback (tests will wedge).
     std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
-    Result rc = sym_assign_partition_(emu_, start_col, num_col);
+    Result rc = sym_assign_partition_(emu_, start_col, num_tiles);
     check(rc, "assign_partition");
 }
 
