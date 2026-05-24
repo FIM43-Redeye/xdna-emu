@@ -172,3 +172,35 @@ fn mixed_column_gating_is_per_column_selective() {
     );
     assert_eq!(gated_stats.bytes_transferred, 0, "gated col {} must move zero bytes", gated_col);
 }
+
+#[test]
+fn adaptive_dma_counter_advances_via_step_data_movement() {
+    // Verify that tick_adaptive_dma is called from step_data_movement by
+    // confirming the adaptive DMA gate engages after enough idle cycles.
+    //
+    // Setup: ungate all columns/modules, set abort_period = 3 (engages
+    // after 2^3 = 8 idle cycles) on a compute tile, step 10 times with
+    // no DMA traffic.  The adaptive gate must be engaged at the end.
+    let mut state = DeviceState::new_npu1();
+    let mut host = HostMemory::new();
+    let col: u8 = 2;
+    let row: u8 = 3; // compute tile (row >= 2)
+
+    // Ungate all so adaptive counters can advance.
+    state.array.clock_mut().ungate_all();
+
+    // Set abort_period = 3 on our target tile.
+    state.array.clock_mut().set_adaptive_abort_period(col, row, 3);
+
+    // Step 10 times with no DMA traffic.  No BDs are configured, so every
+    // DMA step is idle.  The adaptive counter must reach 2^3 = 8 and engage.
+    for _ in 0..10 {
+        state.array.step_data_movement(&mut host);
+    }
+
+    assert!(
+        state.array.clock().is_adaptive_dma_engaged(col, row),
+        "adaptive DMA gate must engage after 10 idle step_data_movement cycles \
+         with abort_period=3 (threshold=8)"
+    );
+}

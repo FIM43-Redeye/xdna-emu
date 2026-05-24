@@ -220,6 +220,11 @@ impl ClockController {
     /// Advance per-tile adaptive-gate idle counters.  Activity in DMA or
     /// SS resets the corresponding counter; idleness advances it.  Once
     /// a counter reaches 2^abort_period the adaptive gate engages.
+    ///
+    /// This is the raw, two-counter form used by existing tests and by
+    /// higher-level callers that have computed both activity flags together.
+    /// The step loop uses `tick_adaptive_dma` and `tick_adaptive_ss` instead
+    /// so it can skip a gated module's counter without touching the other.
     pub fn tick_adaptive(&mut self, col: u8, row: u8, dma_active: bool, ss_active: bool) {
         let entry = self.adaptive.entry((col, row)).or_default();
         if dma_active {
@@ -231,6 +236,54 @@ impl ClockController {
             entry.ss_idle_cycles = 0;
         } else {
             entry.ss_idle_cycles = entry.ss_idle_cycles.saturating_add(1);
+        }
+    }
+
+    /// Advance only the DMA adaptive-gate idle counter.
+    ///
+    /// Called from `step_data_movement` when the DMA module is ungated.
+    /// Keeps the SS counter frozen (a gated SS module's counter should not
+    /// advance -- silicon does not clock a gated module's idle detector).
+    pub fn tick_adaptive_dma(&mut self, col: u8, row: u8, active: bool) {
+        let entry = self.adaptive.entry((col, row)).or_default();
+        if active {
+            entry.dma_idle_cycles = 0;
+        } else {
+            entry.dma_idle_cycles = entry.dma_idle_cycles.saturating_add(1);
+        }
+    }
+
+    /// Advance only the SS adaptive-gate idle counter.
+    ///
+    /// Called from `step_data_movement` when the StreamSwitch module is ungated.
+    /// Keeps the DMA counter frozen (a gated DMA module's counter should not
+    /// advance -- silicon does not clock a gated module's idle detector).
+    pub fn tick_adaptive_ss(&mut self, col: u8, row: u8, active: bool) {
+        let entry = self.adaptive.entry((col, row)).or_default();
+        if active {
+            entry.ss_idle_cycles = 0;
+        } else {
+            entry.ss_idle_cycles = entry.ss_idle_cycles.saturating_add(1);
+        }
+    }
+
+    /// Reset the DMA idle counter for every tile in `col` to zero.
+    ///
+    /// Internal helper called when a column transitions from gated to ungated.
+    fn reset_dma_counters_for_column(&mut self, col: u8) {
+        for row in 0..self.num_rows {
+            let entry = self.adaptive.entry((col, row)).or_default();
+            entry.dma_idle_cycles = 0;
+        }
+    }
+
+    /// Reset the SS idle counter for every tile in `col` to zero.
+    ///
+    /// Internal helper called when a column transitions from gated to ungated.
+    fn reset_ss_counters_for_column(&mut self, col: u8) {
+        for row in 0..self.num_rows {
+            let entry = self.adaptive.entry((col, row)).or_default();
+            entry.ss_idle_cycles = 0;
         }
     }
 
@@ -290,29 +343,96 @@ impl ClockController {
 
     /// Handle a register write at the given tile / offset.  Silently
     /// ignores offsets that are not clock-control registers.
+    ///
+    /// Re-ungate transition semantics (silicon-accurate):
+    /// - Column_Clock_Control: when bit 0 transitions from 0 -> 1, reset the
+    ///   DMA and SS idle counters for every tile in that column to 0.  The
+    ///   counter was frozen while gated; restarting from 0 matches silicon
+    ///   behavior where the idle detector sees a "fresh" clock domain.
+    /// - Module_Clock_Control: when a previously-gated module bit transitions
+    ///   to 1, reset the corresponding counter for that tile.  Handles
+    ///   simultaneous multi-bit transitions by comparing old vs new per module.
     pub fn write_register(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         match offset {
             COLUMN_CLOCK_CONTROL_OFFSET if row == 0 => {
                 // Bit 0 = column-clock-enable; per AM025.
+                let was_active = self.is_column_active(col);
+                let now_active = (value & 0x1) != 0;
                 if let Some(slot) = self.columns.get_mut(col as usize) {
-                    *slot = (value & 0x1) != 0;
+                    *slot = now_active;
+                }
+                // Reset adaptive counters on gated -> ungated transition.
+                if !was_active && now_active {
+                    self.reset_dma_counters_for_column(col);
+                    self.reset_ss_counters_for_column(col);
                 }
             }
             // MCC_MEMTILE_OFFSET == MCC_SHIM_0_OFFSET == 0x000FFF00; row
             // disambiguates.  Both write into raw_mcc_0.
             MCC_COMPUTE_OFFSET | MCC_MEMTILE_OFFSET => {
+                let tile_kind = clock_tile_kind_from_row(row);
+                // Capture old module-active state before applying the write.
+                let old_raw_mcc_0 = self
+                    .tiles
+                    .get(&(col, row))
+                    .map(|g| g.raw_mcc_0)
+                    .unwrap_or_else(|| reset_value_for_mcc(tile_kind));
+                let old_mcc_1 = self.tiles.get(&(col, row)).and_then(|g| g.raw_mcc_1);
+
                 let entry = self
                     .tiles
                     .entry((col, row))
                     .or_insert_with(|| TileGates { raw_mcc_0: 0, raw_mcc_1: None });
                 entry.raw_mcc_0 = value;
+
+                // Check for module ungate transitions and reset the
+                // corresponding idle counter.  Only meaningful when the
+                // column is ungated -- a gated column has no clocked counters.
+                if self.is_column_active(col) {
+                    let was_dma = mcc_module_active(old_raw_mcc_0, old_mcc_1, tile_kind, ModuleKind::Dma);
+                    let now_dma = mcc_module_active(value, old_mcc_1, tile_kind, ModuleKind::Dma);
+                    if !was_dma && now_dma {
+                        let entry = self.adaptive.entry((col, row)).or_default();
+                        entry.dma_idle_cycles = 0;
+                    }
+                    let was_ss =
+                        mcc_module_active(old_raw_mcc_0, old_mcc_1, tile_kind, ModuleKind::StreamSwitch);
+                    let now_ss = mcc_module_active(value, old_mcc_1, tile_kind, ModuleKind::StreamSwitch);
+                    if !was_ss && now_ss {
+                        let entry = self.adaptive.entry((col, row)).or_default();
+                        entry.ss_idle_cycles = 0;
+                    }
+                }
             }
             MCC_SHIM_1_OFFSET if row == 0 => {
+                let tile_kind = ClockTileKind::Shim;
+                let old_raw_mcc_0 = self
+                    .tiles
+                    .get(&(col, row))
+                    .map(|g| g.raw_mcc_0)
+                    .unwrap_or_else(|| reset_value_for_mcc(tile_kind));
+                let old_mcc_1 = self
+                    .tiles
+                    .get(&(col, row))
+                    .and_then(|g| g.raw_mcc_1)
+                    .or_else(|| Some(reset_value_for_mcc_1()));
+
                 let entry = self
                     .tiles
                     .entry((col, row))
                     .or_insert_with(|| TileGates { raw_mcc_0: 0, raw_mcc_1: Some(0) });
                 entry.raw_mcc_1 = Some(value);
+
+                // Shim DMA (NoC module) lives in MCC_1 bit 0.
+                if self.is_column_active(col) {
+                    let new_mcc_1 = Some(value);
+                    let was_dma = mcc_module_active(old_raw_mcc_0, old_mcc_1, tile_kind, ModuleKind::Dma);
+                    let now_dma = mcc_module_active(old_raw_mcc_0, new_mcc_1, tile_kind, ModuleKind::Dma);
+                    if !was_dma && now_dma {
+                        let entry = self.adaptive.entry((col, row)).or_default();
+                        entry.dma_idle_cycles = 0;
+                    }
+                }
             }
             _ => {} // not a clock-control offset
         }
@@ -633,5 +753,128 @@ mod tests {
         }
         assert!(!clock.is_adaptive_dma_engaged(2, 2), "DMA active -> DMA gate stays disengaged");
         assert!(clock.is_adaptive_ss_engaged(2, 2), "SS idle long enough -> SS gate engages");
+    }
+
+    // ---- tick_adaptive_dma / tick_adaptive_ss split methods ----
+
+    #[test]
+    fn tick_adaptive_dma_only_advances_dma_counter() {
+        let mut clock = ClockController::new(5, 6);
+        clock.set_adaptive_abort_period(2, 2, 3);
+        for _ in 0..8 {
+            clock.tick_adaptive_dma(2, 2, false);
+        }
+        assert!(clock.is_adaptive_dma_engaged(2, 2), "DMA counter must engage after threshold idle cycles");
+        // SS counter was never ticked; must remain disengaged.
+        assert!(!clock.is_adaptive_ss_engaged(2, 2), "SS counter untouched by tick_adaptive_dma");
+    }
+
+    #[test]
+    fn tick_adaptive_ss_only_advances_ss_counter() {
+        let mut clock = ClockController::new(5, 6);
+        clock.set_adaptive_abort_period(2, 2, 3);
+        for _ in 0..8 {
+            clock.tick_adaptive_ss(2, 2, false);
+        }
+        assert!(clock.is_adaptive_ss_engaged(2, 2), "SS counter must engage after threshold idle cycles");
+        // DMA counter was never ticked; must remain disengaged.
+        assert!(!clock.is_adaptive_dma_engaged(2, 2), "DMA counter untouched by tick_adaptive_ss");
+    }
+
+    #[test]
+    fn tick_adaptive_dma_active_resets_counter() {
+        let mut clock = ClockController::new(5, 6);
+        clock.set_adaptive_abort_period(2, 2, 3);
+        for _ in 0..7 {
+            clock.tick_adaptive_dma(2, 2, false);
+        }
+        clock.tick_adaptive_dma(2, 2, true); // active -- resets counter
+        assert!(!clock.is_adaptive_dma_engaged(2, 2), "active tick must reset DMA counter");
+    }
+
+    #[test]
+    fn tick_adaptive_ss_active_resets_counter() {
+        let mut clock = ClockController::new(5, 6);
+        clock.set_adaptive_abort_period(2, 2, 3);
+        for _ in 0..7 {
+            clock.tick_adaptive_ss(2, 2, false);
+        }
+        clock.tick_adaptive_ss(2, 2, true); // active -- resets counter
+        assert!(!clock.is_adaptive_ss_engaged(2, 2), "active tick must reset SS counter");
+    }
+
+    // ---- reset-on-re-ungate (column) ----
+
+    #[test]
+    fn column_ungate_resets_adaptive_counters() {
+        let mut clock = ClockController::new(5, 6);
+        // Force the DMA counter near engagement while still column-gated
+        // (tick_adaptive bypasses the column gate -- tests call raw form).
+        clock.set_adaptive_abort_period(2, 3, 3);
+        for _ in 0..7 {
+            clock.tick_adaptive_dma(2, 3, false);
+            clock.tick_adaptive_ss(2, 3, false);
+        }
+        // Pre-check: counters are advancing (not yet at threshold).
+        {
+            let s = clock.adaptive.get(&(2, 3)).expect("adaptive entry created");
+            assert_eq!(s.dma_idle_cycles, 7);
+            assert_eq!(s.ss_idle_cycles, 7);
+        }
+        // Ungate: write Column_Clock_Control bit 0 = 1 on the shim row.
+        clock.write_register(2, 0, COLUMN_CLOCK_CONTROL_OFFSET, 0x1);
+        // Both counters must be reset to 0.
+        let s = clock
+            .adaptive
+            .get(&(2, 3))
+            .expect("adaptive entry must still exist after ungate");
+        assert_eq!(s.dma_idle_cycles, 0, "column ungate must reset dma_idle_cycles");
+        assert_eq!(s.ss_idle_cycles, 0, "column ungate must reset ss_idle_cycles");
+    }
+
+    #[test]
+    fn column_ungate_does_not_reset_counters_on_already_active_column() {
+        let mut clock = ClockController::new(5, 6);
+        // Ungate column first.
+        clock.write_register(2, 0, COLUMN_CLOCK_CONTROL_OFFSET, 0x1);
+        // Advance counters.
+        clock.set_adaptive_abort_period(2, 3, 3);
+        for _ in 0..5 {
+            clock.tick_adaptive_dma(2, 3, false);
+            clock.tick_adaptive_ss(2, 3, false);
+        }
+        // Write column active again (no state transition -- was already active).
+        clock.write_register(2, 0, COLUMN_CLOCK_CONTROL_OFFSET, 0x1);
+        // Counters must NOT be reset -- no transition.
+        let s = clock.adaptive.get(&(2, 3)).expect("adaptive entry present");
+        assert_eq!(s.dma_idle_cycles, 5, "re-write to already-active column must not reset DMA counter");
+        assert_eq!(s.ss_idle_cycles, 5, "re-write to already-active column must not reset SS counter");
+    }
+
+    // ---- reset-on-re-ungate (module) ----
+
+    #[test]
+    fn module_ungate_resets_adaptive_counter() {
+        let mut clock = ClockController::new(5, 6);
+        // Ungate the column first so MCC writes are meaningful.
+        clock.write_register(2, 0, COLUMN_CLOCK_CONTROL_OFFSET, 0x1);
+        // Gate the DMA module (bit 1 = 0) by writing MCC with only SS active.
+        clock.write_register(2, 3, MCC_COMPUTE_OFFSET, 0b001); // bit 0 = SS, bit 1 = Mem/DMA off
+                                                               // Advance DMA idle counter directly (test API bypasses gate check).
+        clock.set_adaptive_abort_period(2, 3, 3);
+        for _ in 0..6 {
+            clock.tick_adaptive_dma(2, 3, false);
+        }
+        {
+            let s = clock.adaptive.get(&(2, 3)).expect("entry exists");
+            assert_eq!(s.dma_idle_cycles, 6);
+        }
+        // Ungate DMA module (write bit 1 = 1).
+        clock.write_register(2, 3, MCC_COMPUTE_OFFSET, 0b011); // bit 1 = Mem/DMA, bit 0 = SS
+                                                               // DMA counter must be reset; SS counter untouched.
+        let s = clock.adaptive.get(&(2, 3)).expect("entry still exists");
+        assert_eq!(s.dma_idle_cycles, 0, "DMA module ungate must reset dma_idle_cycles");
+        // SS counter was not reset (SS was already active before).
+        assert_eq!(s.ss_idle_cycles, 0, "SS counter should still be 0 (never ticked)");
     }
 }

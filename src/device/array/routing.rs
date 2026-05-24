@@ -122,7 +122,8 @@ impl TileArray {
         // Phase 3: DMA Step
         // All DMA engines advance channel FSMs, checking arbiter results.
         // MM2S channels produce stream words, S2MM channels consume them.
-        let dma_active = self.step_all_dma(host_memory);
+        // Use the tracked form so we can drive per-tile adaptive counters below.
+        let (dma_active, tile_dma_active) = self.step_all_dma_tracked(host_memory);
 
         // Phase 4: Stream Routing
         // Route all stream data through the stream switch network.
@@ -132,6 +133,52 @@ impl TileArray {
         // Dedicated point-to-point 384-bit links between compute tiles.
         // Entirely separate from the stream switch fabric.
         self.route_cascade();
+
+        // Phase 5: Adaptive counter tick (silicon-accurate, per tile/module).
+        //
+        // Each module's idle counter advances only when that module's clock is
+        // on (column ungated AND module MCC bit set AND adaptive gate not already
+        // engaged).  A gated module's counter stays frozen -- silicon does not
+        // run the idle detector without a clock.
+        //
+        // "DMA active" here means any channel on the tile is in a non-terminal
+        // state (Active / WaitingForLock / WaitingForStream / Paused), not the
+        // narrower "made progress this cycle" definition used by the global
+        // dma_active return.  Silicon's idle detector observes engine clock
+        // activity, which includes channels stalled on backpressure or locks --
+        // they are still consuming a clock and should not engage the gate.
+        // Without this, a sink S2MM waiting on its upstream producer would
+        // engage the adaptive gate before the producer ever sent a word,
+        // permanently blocking the transfer.
+        //
+        // SS activity is determined by whether any port on the tile had
+        // cycle_active set after routing (set by begin_routing_cycle +
+        // route_streams on ports that moved data this cycle).
+        {
+            use crate::device::clock_control::ModuleKind;
+            for &(_step_dma_active, col, row) in &tile_dma_active {
+                // Column gate: skip gated columns entirely (counters frozen).
+                if !self.clock.is_column_active(col) {
+                    continue;
+                }
+
+                // DMA module counter: advance only if the DMA module is ungated.
+                if self.clock.is_module_active(col, row, ModuleKind::Dma) {
+                    let idx = self.tile_index(col, row);
+                    let dma_active = self.dma_engines[idx].any_channel_active();
+                    self.clock.tick_adaptive_dma(col, row, dma_active);
+                }
+
+                // SS module counter: advance only if the SS module is ungated.
+                if self.clock.is_module_active(col, row, ModuleKind::StreamSwitch) {
+                    let idx = self.tile_index(col, row);
+                    let ss = &self.tiles[idx].stream_switch;
+                    let ss_active =
+                        ss.masters.iter().any(|p| p.cycle_active) || ss.slaves.iter().any(|p| p.cycle_active);
+                    self.clock.tick_adaptive_ss(col, row, ss_active);
+                }
+            }
+        }
 
         let switch_pipelines_active = self.tiles.iter().any(|t| t.stream_switch.has_pipeline_data());
         let streams_active =
