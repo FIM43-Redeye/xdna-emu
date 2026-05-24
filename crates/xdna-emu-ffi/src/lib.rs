@@ -41,6 +41,7 @@ mod classify;
 mod config;
 pub mod context;
 mod execution;
+mod firmware;
 mod memory;
 mod query;
 
@@ -49,6 +50,7 @@ pub use classify::*;
 pub use config::*;
 pub use context::{xdna_emu_get_context_state, XdnaEmuContextState};
 pub use execution::*;
+pub use firmware::*;
 pub use memory::*;
 pub use query::*;
 
