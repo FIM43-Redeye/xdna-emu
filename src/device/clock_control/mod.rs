@@ -49,6 +49,97 @@ pub struct ClockController {
 /// AM025 offset for Column_Clock_Control (shim tiles only).
 const COLUMN_CLOCK_CONTROL_OFFSET: u32 = 0x000FFF20;
 
+/// AM025 offset for Module_Clock_Control on compute tiles.
+const MCC_COMPUTE_OFFSET: u32 = 0x00060000;
+/// AM025 offset for Module_Clock_Control on memtile and shim (MCC_0).
+/// NOTE: MCC_MEMTILE_OFFSET == MCC_SHIM_0_OFFSET == 0x000FFF00.  They share
+/// the same offset; the row number disambiguates (row 0 = shim, row 1 =
+/// memtile).  They must NOT appear as separate match arms -- Rust errors on
+/// duplicate patterns.
+const MCC_MEMTILE_OFFSET: u32 = 0x000FFF00;
+/// AM025 offset for Module_Clock_Control_1 (shim only, NoC enable).
+const MCC_SHIM_1_OFFSET: u32 = 0x000FFF04;
+
+/// Internal tile-kind discriminator for bit-layout selection.
+/// Uses a clock-control-local enum rather than xdna_archspec::types::TileKind
+/// to avoid coupling the controller to the broader archspec model -- this
+/// only needs three buckets (Compute / Memtile / Shim) regardless of how
+/// many shim variants exist elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClockTileKind {
+    Compute,
+    Memtile,
+    Shim,
+}
+
+fn clock_tile_kind_from_row(row: u8) -> ClockTileKind {
+    if row == 0 {
+        ClockTileKind::Shim
+    } else if row == 1 {
+        ClockTileKind::Memtile
+    } else {
+        ClockTileKind::Compute
+    }
+}
+
+/// AM025 reset value for Module_Clock_Control (and MCC_0 for shim).
+/// Confirmed from aie_registers_aie2.json on 2026-05-24.
+fn reset_value_for_mcc(tile_kind: ClockTileKind) -> u32 {
+    match tile_kind {
+        ClockTileKind::Compute => 0x37,
+        ClockTileKind::Memtile => 0x33,
+        ClockTileKind::Shim => 0x3B,
+    }
+}
+
+/// AM025 reset value for shim Module_Clock_Control_1 (NoC enable bit set).
+fn reset_value_for_mcc_1() -> u32 {
+    0x01
+}
+
+/// Decode `kind` from a Module_Clock_Control register value.
+/// Bit positions confirmed from aie_registers_aie2.json on 2026-05-24.
+///
+/// | ModuleKind    | Compute      | Memtile      | Shim              |
+/// |---------------|--------------|--------------|-------------------|
+/// | Core          | MCC bit 2    | always false | always false      |
+/// | Memory        | MCC bit 1    | MCC bit 1    | always false      |
+/// | Dma           | MCC bit 1    | MCC bit 1    | MCC_1 bit 0 (NoC) |
+/// | StreamSwitch  | MCC bit 0    | MCC bit 0    | MCC_0 bit 0       |
+///
+/// On compute/memtile Dma and Memory share the same physical bit -- the
+/// silicon does not separately clock-gate DMA from data memory.
+fn mcc_module_active(
+    raw_mcc_0: u32,
+    raw_mcc_1: Option<u32>,
+    tile_kind: ClockTileKind,
+    kind: ModuleKind,
+) -> bool {
+    use ClockTileKind::*;
+    use ModuleKind::*;
+    let (reg, bit): (u32, u8) = match (tile_kind, kind) {
+        // Compute tile: MCC bit 2 = Core, bit 1 = Memory (= Dma), bit 0 = SS.
+        (Compute, Core) => (raw_mcc_0, 2),
+        (Compute, Memory) => (raw_mcc_0, 1),
+        (Compute, Dma) => (raw_mcc_0, 1), // same bit as Memory
+        (Compute, StreamSwitch) => (raw_mcc_0, 0),
+        // Memtile: no Core; bit 1 = Memory (= Dma), bit 0 = SS.
+        (Memtile, Core) => return false,
+        (Memtile, Memory) => (raw_mcc_0, 1),
+        (Memtile, Dma) => (raw_mcc_0, 1),
+        (Memtile, StreamSwitch) => (raw_mcc_0, 0),
+        // Shim: no Core / Memory.  Dma lives in MCC_1 bit 0 (NoC module).
+        (Shim, Core) => return false,
+        (Shim, Memory) => return false,
+        (Shim, Dma) => match raw_mcc_1 {
+            Some(r) => (r, 0),
+            None => return false,
+        },
+        (Shim, StreamSwitch) => (raw_mcc_0, 0),
+    };
+    (reg >> bit) & 0x1 != 0
+}
+
 impl ClockController {
     /// Construct a controller for an array of `num_cols` columns and
     /// `num_rows` rows.  All columns boot gated (silicon-accurate).
@@ -66,18 +157,23 @@ impl ClockController {
     /// clocked.  Column gate dominates: a gated column means every module
     /// reports inactive regardless of MCC.  An ungated column with no MCC
     /// writes yet uses the AM025 reset value.
-    ///
-    /// Task 4 stub: always returns false until bit-field decode is added in
-    /// Task 5.
     pub fn is_module_active(&self, col: u8, row: u8, kind: ModuleKind) -> bool {
-        // Column gate dominates.
         if !self.is_column_active(col) {
             return false;
         }
-        // For now (filled in by Task 5), return false until bit-field
-        // decode is added.
-        let _ = (row, kind);
-        false
+        let tile_kind = clock_tile_kind_from_row(row);
+        let (raw_mcc_0, raw_mcc_1) = match self.tiles.get(&(col, row)) {
+            Some(gates) => (gates.raw_mcc_0, gates.raw_mcc_1),
+            None => (
+                reset_value_for_mcc(tile_kind),
+                if matches!(tile_kind, ClockTileKind::Shim) {
+                    Some(reset_value_for_mcc_1())
+                } else {
+                    None
+                },
+            ),
+        };
+        mcc_module_active(raw_mcc_0, raw_mcc_1, tile_kind, kind)
     }
 
     /// Returns true iff any module on this tile is active.
@@ -99,6 +195,22 @@ impl ClockController {
                     *slot = (value & 0x1) != 0;
                 }
             }
+            // MCC_MEMTILE_OFFSET == MCC_SHIM_0_OFFSET == 0x000FFF00; row
+            // disambiguates.  Both write into raw_mcc_0.
+            MCC_COMPUTE_OFFSET | MCC_MEMTILE_OFFSET => {
+                let entry = self
+                    .tiles
+                    .entry((col, row))
+                    .or_insert_with(|| TileGates { raw_mcc_0: 0, raw_mcc_1: None });
+                entry.raw_mcc_0 = value;
+            }
+            MCC_SHIM_1_OFFSET if row == 0 => {
+                let entry = self
+                    .tiles
+                    .entry((col, row))
+                    .or_insert_with(|| TileGates { raw_mcc_0: 0, raw_mcc_1: Some(0) });
+                entry.raw_mcc_1 = Some(value);
+            }
             _ => {} // not a clock-control offset
         }
     }
@@ -107,13 +219,23 @@ impl ClockController {
     /// AM025 reset value if the register has not been written yet.
     /// Returns None if the offset is not a known clock-control register.
     pub fn read_register(&self, col: u8, row: u8, offset: u32) -> Option<u32> {
-        let _ = (col, row);
+        let tile_kind = clock_tile_kind_from_row(row);
         match offset {
             COLUMN_CLOCK_CONTROL_OFFSET if row == 0 => {
                 // Reflect current state: bit 0 = column enabled.
-                let enabled = self.is_column_active(col);
-                Some(if enabled { 0x1 } else { 0x0 })
+                Some(if self.is_column_active(col) { 0x1 } else { 0x0 })
             }
+            // MCC_MEMTILE_OFFSET == MCC_SHIM_0_OFFSET == 0x000FFF00.
+            MCC_COMPUTE_OFFSET | MCC_MEMTILE_OFFSET => self
+                .tiles
+                .get(&(col, row))
+                .map(|g| g.raw_mcc_0)
+                .or_else(|| Some(reset_value_for_mcc(tile_kind))),
+            MCC_SHIM_1_OFFSET if row == 0 => self
+                .tiles
+                .get(&(col, row))
+                .and_then(|g| g.raw_mcc_1)
+                .or_else(|| Some(reset_value_for_mcc_1())),
             _ => None,
         }
     }
@@ -191,5 +313,104 @@ mod tests {
     fn is_tile_active_default_false() {
         let clock = ClockController::new(5, 6);
         assert!(!clock.is_tile_active(2, 2));
+    }
+
+    // ---- Task 5: Module_Clock_Control bit-field decode ----
+
+    const MCC_COMPUTE_OFFSET: u32 = 0x00060000;
+    const MCC_MEMTILE_OFFSET: u32 = 0x000FFF00;
+    const MCC_SHIM_0_OFFSET: u32 = 0x000FFF00;
+    const MCC_SHIM_1_OFFSET: u32 = 0x000FFF04;
+
+    #[test]
+    fn mcc_compute_decodes_core_bit() {
+        // Bit positions per aie_registers_aie2.json (2026-05-24 lookup).
+        let mut clock = ClockController::new(5, 6);
+        clock.write_register(2, 0, 0x000FFF20, 0x1); // ungate column 2
+                                                     // Compute MCC bit 2 = Core_Module_Clock_Enable.
+        clock.write_register(2, 3, MCC_COMPUTE_OFFSET, 1 << 2);
+        assert!(clock.is_module_active(2, 3, ModuleKind::Core));
+        assert!(!clock.is_module_active(2, 3, ModuleKind::Memory));
+        assert!(!clock.is_module_active(2, 3, ModuleKind::Dma));
+        assert!(!clock.is_module_active(2, 3, ModuleKind::StreamSwitch));
+    }
+
+    #[test]
+    fn mcc_compute_decodes_memory_bit_as_both_memory_and_dma() {
+        let mut clock = ClockController::new(5, 6);
+        clock.write_register(2, 0, 0x000FFF20, 0x1);
+        // Compute MCC bit 1 = Memory_Module_Clock_Enable.  Same bit clocks DMA.
+        clock.write_register(2, 3, MCC_COMPUTE_OFFSET, 1 << 1);
+        assert!(clock.is_module_active(2, 3, ModuleKind::Memory));
+        assert!(clock.is_module_active(2, 3, ModuleKind::Dma));
+        assert!(!clock.is_module_active(2, 3, ModuleKind::Core));
+    }
+
+    #[test]
+    fn mcc_compute_decodes_ss_bit() {
+        let mut clock = ClockController::new(5, 6);
+        clock.write_register(2, 0, 0x000FFF20, 0x1);
+        clock.write_register(2, 3, MCC_COMPUTE_OFFSET, 1 << 0);
+        assert!(clock.is_module_active(2, 3, ModuleKind::StreamSwitch));
+    }
+
+    #[test]
+    fn mcc_memtile_no_core() {
+        let mut clock = ClockController::new(5, 6);
+        clock.write_register(2, 0, 0x000FFF20, 0x1);
+        // Set everything we can on memtile.
+        clock.write_register(2, 1, MCC_MEMTILE_OFFSET, 0xFFFF_FFFF);
+        // Memtile has no Core module -- always false regardless of writes.
+        assert!(!clock.is_module_active(2, 1, ModuleKind::Core));
+        // Memory and Dma both reflect bit 1.
+        assert!(clock.is_module_active(2, 1, ModuleKind::Memory));
+        assert!(clock.is_module_active(2, 1, ModuleKind::Dma));
+        assert!(clock.is_module_active(2, 1, ModuleKind::StreamSwitch));
+    }
+
+    #[test]
+    fn mcc_shim_dma_lives_in_mcc_1_not_mcc_0() {
+        let mut clock = ClockController::new(5, 6);
+        clock.write_register(2, 0, 0x000FFF20, 0x1);
+        // MCC_0 with everything set; MCC_1 explicitly 0.
+        clock.write_register(2, 0, MCC_SHIM_0_OFFSET, 0xFFFF_FFFF);
+        clock.write_register(2, 0, MCC_SHIM_1_OFFSET, 0x0);
+        // SS comes from MCC_0 bit 0 -> active.
+        assert!(clock.is_module_active(2, 0, ModuleKind::StreamSwitch));
+        // DMA on shim comes from MCC_1 bit 0 (NoC) -> inactive.
+        assert!(!clock.is_module_active(2, 0, ModuleKind::Dma));
+        // Shim has no Core or Memory.
+        assert!(!clock.is_module_active(2, 0, ModuleKind::Core));
+        assert!(!clock.is_module_active(2, 0, ModuleKind::Memory));
+    }
+
+    #[test]
+    fn mcc_shim_dma_lives_in_mcc_1_bit_0_when_set() {
+        let mut clock = ClockController::new(5, 6);
+        clock.write_register(2, 0, 0x000FFF20, 0x1);
+        clock.write_register(2, 0, MCC_SHIM_1_OFFSET, 1 << 0);
+        assert!(clock.is_module_active(2, 0, ModuleKind::Dma));
+    }
+
+    #[test]
+    fn module_inactive_when_column_gated_even_with_mcc_set() {
+        let mut clock = ClockController::new(5, 6);
+        // Column 2 NOT ungated.
+        clock.write_register(2, 3, MCC_COMPUTE_OFFSET, 1 << 2); // try to enable Core
+                                                                // Column gate dominates -- everything inactive.
+        assert!(!clock.is_module_active(2, 3, ModuleKind::Core));
+    }
+
+    #[test]
+    fn read_mcc_returns_am025_reset_value_before_any_write() {
+        let clock = ClockController::new(5, 6);
+        // Compute tile reset is 0x37.
+        assert_eq!(clock.read_register(2, 3, MCC_COMPUTE_OFFSET), Some(0x37));
+        // Memtile reset is 0x33.
+        assert_eq!(clock.read_register(2, 1, MCC_MEMTILE_OFFSET), Some(0x33));
+        // Shim Module_Clock_Control_0 reset is 0x3B.
+        assert_eq!(clock.read_register(2, 0, MCC_SHIM_0_OFFSET), Some(0x3B));
+        // Shim Module_Clock_Control_1 reset is 0x01.
+        assert_eq!(clock.read_register(2, 0, MCC_SHIM_1_OFFSET), Some(0x01));
     }
 }
