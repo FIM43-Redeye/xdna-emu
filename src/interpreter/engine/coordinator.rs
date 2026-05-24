@@ -567,6 +567,17 @@ impl InterpreterEngine {
                     continue;
                 }
 
+                use crate::device::clock_control::ModuleKind;
+                if !self.device.array.clock().is_column_active(col as u8)
+                    || !self
+                        .device
+                        .array
+                        .clock()
+                        .is_module_active(col as u8, row as u8, ModuleKind::Core)
+                {
+                    continue;
+                }
+
                 // AIE2 lock quadrant routing: copy neighbor locks before stepping,
                 // then write changes back after. Per mlir-aie getLockLocalBaseIndex:
                 //   South (IDs 0-15):  row-1 neighbor
