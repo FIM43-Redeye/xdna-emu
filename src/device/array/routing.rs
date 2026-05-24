@@ -122,8 +122,7 @@ impl TileArray {
         // Phase 3: DMA Step
         // All DMA engines advance channel FSMs, checking arbiter results.
         // MM2S channels produce stream words, S2MM channels consume them.
-        // Use the tracked form so we can drive per-tile adaptive counters below.
-        let (dma_active, tile_dma_active) = self.step_all_dma_tracked(host_memory);
+        let dma_active = self.step_all_dma(host_memory);
 
         // Phase 4: Stream Routing
         // Route all stream data through the stream switch network.
@@ -156,26 +155,27 @@ impl TileArray {
         // route_streams on ports that moved data this cycle).
         {
             use crate::device::clock_control::ModuleKind;
-            for &(_step_dma_active, col, row) in &tile_dma_active {
+            for col in 0..self.cols {
                 // Column gate: skip gated columns entirely (counters frozen).
                 if !self.clock.is_column_active(col) {
                     continue;
                 }
+                for row in 0..self.rows {
+                    // DMA module counter: advance only if the DMA module is ungated.
+                    if self.clock.is_module_active(col, row, ModuleKind::Dma) {
+                        let idx = self.tile_index(col, row);
+                        let tile_dma_active = self.dma_engines[idx].any_channel_active();
+                        self.clock.tick_adaptive_dma(col, row, tile_dma_active);
+                    }
 
-                // DMA module counter: advance only if the DMA module is ungated.
-                if self.clock.is_module_active(col, row, ModuleKind::Dma) {
-                    let idx = self.tile_index(col, row);
-                    let dma_active = self.dma_engines[idx].any_channel_active();
-                    self.clock.tick_adaptive_dma(col, row, dma_active);
-                }
-
-                // SS module counter: advance only if the SS module is ungated.
-                if self.clock.is_module_active(col, row, ModuleKind::StreamSwitch) {
-                    let idx = self.tile_index(col, row);
-                    let ss = &self.tiles[idx].stream_switch;
-                    let ss_active =
-                        ss.masters.iter().any(|p| p.cycle_active) || ss.slaves.iter().any(|p| p.cycle_active);
-                    self.clock.tick_adaptive_ss(col, row, ss_active);
+                    // SS module counter: advance only if the SS module is ungated.
+                    if self.clock.is_module_active(col, row, ModuleKind::StreamSwitch) {
+                        let idx = self.tile_index(col, row);
+                        let ss = &self.tiles[idx].stream_switch;
+                        let ss_active = ss.masters.iter().any(|p| p.cycle_active)
+                            || ss.slaves.iter().any(|p| p.cycle_active);
+                        self.clock.tick_adaptive_ss(col, row, ss_active);
+                    }
                 }
             }
         }

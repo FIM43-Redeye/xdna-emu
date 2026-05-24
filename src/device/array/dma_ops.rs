@@ -160,27 +160,18 @@ impl TileArray {
         }
     }
 
-    /// Step all DMA engines and return per-tile activity flags alongside the
-    /// global "any active" bool.
+    /// Step all DMA engines.
     ///
-    /// The per-tile flags are `(any_dma_active_for_tile, col, row)` tuples used
-    /// by `step_data_movement` to drive `tick_adaptive` once per tile at the end
-    /// of the full data-movement phase.
-    ///
-    /// Module gate check: tiles whose DMA module is clock-gated (column gate
-    /// OR module-level MCC OR adaptive DMA gate) are skipped.
-    pub(super) fn step_all_dma_tracked(
-        &mut self,
-        host_memory: &mut HostMemory,
-    ) -> (bool, Vec<(bool, u8, u8)>) {
+    /// Returns true if any DMA engine made progress this cycle (InProgress or
+    /// WaitingForLock). Module gate check: tiles whose DMA module is
+    /// clock-gated (column gate OR module-level MCC OR adaptive DMA gate) are
+    /// skipped.
+    pub fn step_all_dma(&mut self, host_memory: &mut HostMemory) -> bool {
         use crate::device::clock_control::ModuleKind;
 
         let mut any_active = false;
         let rows = self.rows as usize;
         let cols = self.cols as usize;
-        let num_tiles = (self.cols as usize) * (self.rows as usize);
-        // Per-tile activity: indexed by flat tile index.
-        let mut tile_dma_active: Vec<(bool, u8, u8)> = Vec::with_capacity(num_tiles);
 
         // Destructure for disjoint field borrows (tiles vs engines)
         let tiles = &mut self.tiles;
@@ -196,7 +187,6 @@ impl TileArray {
             // emulator skips all DMA stepping for them.  This is the top-tier
             // perf win -- typical programs gate 3 of 5 columns.
             if !clock.is_column_active(col) {
-                tile_dma_active.push((false, col, row));
                 continue;
             }
 
@@ -204,13 +194,11 @@ impl TileArray {
             // On compute/memtile, DMA shares a clock bit with data memory (MCC
             // bit 1).  On shim, DMA (NoC module) is MCC_1 bit 0.
             if !clock.is_module_active(col, row, ModuleKind::Dma) {
-                tile_dma_active.push((false, col, row));
                 continue;
             }
 
             // Adaptive gate check (bottom tier): skip if idle long enough.
             if clock.is_adaptive_dma_engaged(col, row) {
-                tile_dma_active.push((false, col, row));
                 continue;
             }
 
@@ -228,11 +216,9 @@ impl TileArray {
                 engines[i].step(&mut tiles[i], &mut dma::NeighborTiles::empty(), host_memory)
             };
 
-            let this_tile_active = matches!(result, DmaResult::InProgress | DmaResult::WaitingForLock(_));
-            if this_tile_active {
+            if matches!(result, DmaResult::InProgress | DmaResult::WaitingForLock(_)) {
                 any_active = true;
             }
-            tile_dma_active.push((this_tile_active, col, row));
 
             // Merge DMA engine bank accesses into the tile.
             // Static transfer methods record directly on tile.cycle_dma_banks;
@@ -248,11 +234,6 @@ impl TileArray {
             }
         }
 
-        (any_active, tile_dma_active)
-    }
-
-    pub fn step_all_dma(&mut self, host_memory: &mut HostMemory) -> bool {
-        let (any_active, _) = self.step_all_dma_tracked(host_memory);
         any_active
     }
 
