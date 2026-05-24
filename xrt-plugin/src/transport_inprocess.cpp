@@ -109,6 +109,7 @@ emu_transport_inprocess::emu_transport_inprocess(const std::string& lib_path)
     sym_free_buffer_        = resolve_optional<fn_free_buffer>("xdna_emu_free_buffer");
     sym_reset_context_      = resolve_required<fn_reset_context>("xdna_emu_reset_context");
     sym_set_start_col_      = resolve_optional<fn_set_start_col>("xdna_emu_set_start_col");
+    sym_assign_partition_   = resolve_optional<fn_assign_partition>("xdna_emu_assign_partition");
     sym_read_register_      = resolve_optional<fn_read_register>("xdna_emu_read_register");
     sym_write_register_     = resolve_optional<fn_write_register>("xdna_emu_write_register");
     sym_read_tile_mem_      = resolve_optional<fn_read_tile_mem>("xdna_emu_read_tile_memory");
@@ -207,6 +208,16 @@ void emu_transport_inprocess::set_start_col(uint8_t start_col)
     std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     Result rc = sym_set_start_col_(emu_, start_col);
     check(rc, "set_start_col");
+}
+
+void emu_transport_inprocess::assign_partition(uint8_t start_col,
+                                               uint8_t num_col)
+{
+    if (!sym_assign_partition_)
+        return;  // Older emulator builds: no-op fallback (tests will wedge).
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
+    Result rc = sym_assign_partition_(emu_, start_col, num_col);
+    check(rc, "assign_partition");
 }
 
 // ---------------------------------------------------------------------------

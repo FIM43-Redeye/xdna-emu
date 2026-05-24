@@ -448,12 +448,14 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
   {
     std::vector<std::vector<uint8_t>> pdi_blobs_copy;
     uint16_t ctx_start_col = 0;
+    uint16_t ctx_num_col = 0;
     {
       const std::lock_guard<std::mutex> lock(m_ctx_lock);
       auto it = m_ctx_map.find(arg.ctx_handle);
       if (it != m_ctx_map.end()) {
         pdi_blobs_copy = it->second.pdi_blobs;
         ctx_start_col = static_cast<uint16_t>(it->second.start_col);
+        ctx_num_col = static_cast<uint16_t>(it->second.num_col);
       }
     }
     m_transport->reset_context(0);
@@ -461,6 +463,14 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
     // intact on the emulator side; re-apply our hw_context's start_col
     // before any load_pdi so the CDO's logical->physical shift is correct.
     m_transport->set_start_col(static_cast<uint8_t>(ctx_start_col));
+    // Firmware emulation: real silicon's firmware would have ungated this
+    // context's partition columns in response to MSG_OP_CREATE_CONTEXT.
+    // Our plugin spans driver+firmware roles, so we issue the equivalent
+    // register-write sequence here.  reset_context wipes the clock state
+    // each submit, so this MUST re-run per-submit (not just on first
+    // context create).
+    m_transport->assign_partition(static_cast<uint8_t>(ctx_start_col),
+                                  static_cast<uint8_t>(ctx_num_col));
     for (const auto& blob : pdi_blobs_copy) {
       if (!blob.empty())
         m_transport->load_pdi(blob.data(), blob.size());

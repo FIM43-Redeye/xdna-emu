@@ -43,6 +43,18 @@ public:
     /// FFI symbol is not available (older emulator builds).
     virtual void set_start_col(uint8_t /*start_col*/) {}
 
+    /// Emulate firmware's response to MSG_OP_CREATE_CONTEXT: ungate the
+    /// columns assigned to this context's partition.  On real silicon
+    /// the mgmt-ERT firmware invokes `_XAieMl_RequestTiles` which writes
+    /// `Column_Clock_Control = 0x1` for each column in the partition;
+    /// our plugin spans the driver + firmware roles, so we issue the
+    /// equivalent register sequence ourselves.  Must be re-applied per
+    /// submit because `reset_context` wipes clock state.  No-op if the
+    /// backing FFI symbol is not available (older emulator builds --
+    /// tests will wedge because nothing else ungates the columns).
+    virtual void assign_partition(uint8_t /*start_col*/,
+                                  uint8_t /*num_col*/) {}
+
     // -- Buffer management ---------------------------------------------------
 
     /// Allocate a host-visible buffer.  Returns the device address.
