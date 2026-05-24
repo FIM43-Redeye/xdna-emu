@@ -29,6 +29,7 @@ mod routing;
 #[cfg(test)]
 mod tests;
 
+use super::clock_control::ClockController;
 use super::dma::{self, DmaEngine, DmaResult};
 use super::host_memory::HostMemory;
 use super::tile::{Tile, TileKind, TileParams};
@@ -160,6 +161,10 @@ pub struct TileArray {
     /// delivery ~12x faster than hardware (observed: EMU=645cy vs HW=8185cy
     /// starvation on tile_dmas_writebd).
     pub(super) inter_tile_pipeline: Vec<InFlightWord>,
+
+    /// Clock-control state for the array.  Owns all column / module /
+    /// adaptive gate state.  Boots with every tile gated.
+    pub(crate) clock: ClockController,
 }
 
 /// A word in flight between adjacent tiles.
@@ -237,6 +242,7 @@ impl TileArray {
             current_cycle: 0,
             ctrl_reassemblers,
             inter_tile_pipeline: Vec::new(),
+            clock: ClockController::new(cols, rows),
         }
     }
 
@@ -283,6 +289,16 @@ impl TileArray {
     #[inline]
     pub fn rows(&self) -> u8 {
         self.rows
+    }
+
+    /// Borrow the clock controller (read-only).
+    pub fn clock(&self) -> &ClockController {
+        &self.clock
+    }
+
+    /// Borrow the clock controller mutably.
+    pub fn clock_mut(&mut self) -> &mut ClockController {
+        &mut self.clock
     }
 
     /// Get tile index from coordinates.

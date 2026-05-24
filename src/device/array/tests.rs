@@ -455,3 +455,18 @@ fn parity_handler_error_is_sticky_continue_not_fatal() {
         array.fatal_errors
     );
 }
+
+#[test]
+fn tile_array_exposes_clock_controller_with_silicon_accurate_default() {
+    // TileArray::npu1() is the existing test helper.
+    let array = TileArray::npu1();
+    // Default state: silicon-accurate, all columns gated.
+    let cols = array.cols();
+    for col in 0..cols {
+        assert!(
+            !array.clock().is_column_active(col),
+            "col {} should be gated at TileArray construction",
+            col
+        );
+    }
+}
