@@ -70,6 +70,7 @@ pub mod tdr;
 pub mod interrupts;
 pub mod perf_counters;
 pub mod timer;
+pub mod clock_control;
 
 pub use registers::{RegisterInfo, TileAddress};
 pub use tile::{Tile, Lock, LockResult, DmaBufferDescriptor, DmaChannel, CoreState};
