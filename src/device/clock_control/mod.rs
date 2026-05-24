@@ -318,6 +318,33 @@ impl ClockController {
         }
     }
 
+    /// Test helper: enable every column and module by writing
+    /// all-active patterns via the same register-write path the CDO uses.
+    /// Spec: serve-and-warn policy; tests opt out of silicon-accurate
+    /// boot via this helper.
+    ///
+    /// The row-to-kind mapping (0=Shim, 1=Memtile, 2+=Compute) is
+    /// NPU1-specific; acceptable for v1 since the controller is
+    /// constructed per-array and AIE2P will need its own variant.
+    pub fn ungate_all(&mut self) {
+        let num_cols = self.columns.len() as u8;
+        let rows = self.num_rows;
+        for col in 0..num_cols {
+            self.write_register(col, 0, COLUMN_CLOCK_CONTROL_OFFSET, 0x1);
+            for row in 0..rows {
+                let offset = match clock_tile_kind_from_row(row) {
+                    ClockTileKind::Shim => MCC_MEMTILE_OFFSET, // MCC_SHIM_0 == MCC_MEMTILE offset
+                    ClockTileKind::Memtile => MCC_MEMTILE_OFFSET,
+                    ClockTileKind::Compute => MCC_COMPUTE_OFFSET,
+                };
+                self.write_register(col, row, offset, 0xFFFF_FFFF);
+                if matches!(clock_tile_kind_from_row(row), ClockTileKind::Shim) {
+                    self.write_register(col, row, MCC_SHIM_1_OFFSET, 0xFFFF_FFFF);
+                }
+            }
+        }
+    }
+
     /// Read a clock-control register.  Returns the current value, or the
     /// AM025 reset value if the register has not been written yet.
     /// Returns None if the offset is not a known clock-control register.
@@ -550,6 +577,47 @@ mod tests {
         // One active cycle resets the counter.
         clock.tick_adaptive(2, 2, true, false);
         assert!(!clock.is_adaptive_dma_engaged(2, 2));
+    }
+
+    #[test]
+    fn ungate_all_makes_every_column_and_module_active() {
+        let mut clock = ClockController::new(5, 6);
+        // Pre: everything gated.
+        assert!(!clock.is_column_active(0));
+        assert!(!clock.is_module_active(2, 3, ModuleKind::Core));
+        // Ungate all.
+        clock.ungate_all();
+        // Post: every column active.
+        for col in 0..5 {
+            assert!(clock.is_column_active(col));
+        }
+        // Every module that physically exists on a tile-kind reports
+        // active.  Per Task 5 semantics (matches AM025): shim has only
+        // StreamSwitch + Dma; memtile lacks Core; compute has all four.
+        // Iterate that matrix explicitly so this test does not mask
+        // future bugs by tolerating false-where-true-was-expected.
+        for col in 0..5 {
+            // row 0 = shim
+            assert!(clock.is_module_active(col, 0, ModuleKind::StreamSwitch));
+            assert!(clock.is_module_active(col, 0, ModuleKind::Dma));
+            // row 1 = memtile
+            assert!(clock.is_module_active(col, 1, ModuleKind::Memory));
+            assert!(clock.is_module_active(col, 1, ModuleKind::Dma));
+            assert!(clock.is_module_active(col, 1, ModuleKind::StreamSwitch));
+            // rows 2..6 = compute
+            for row in 2..6 {
+                for kind in [ModuleKind::Core, ModuleKind::Memory, ModuleKind::Dma, ModuleKind::StreamSwitch]
+                {
+                    assert!(
+                        clock.is_module_active(col, row, kind),
+                        "tile ({}, {}) module {:?} should be active after ungate_all",
+                        col,
+                        row,
+                        kind
+                    );
+                }
+            }
+        }
     }
 
     #[test]
