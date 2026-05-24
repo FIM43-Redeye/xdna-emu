@@ -142,6 +142,72 @@ fn test_dma_reset() {
     assert!(!engine.any_channel_active());
 }
 
+// === Clock Control Gate Tests ===
+
+/// When the DMA module is clock-gated (column active, but MCC bit 1 clear on a
+/// compute tile), `step_dma` must return `None` rather than running the engine.
+#[test]
+fn module_gate_skips_dma_when_dma_module_gated() {
+    use crate::device::clock_control::ModuleKind;
+    let mut array = TileArray::npu1();
+
+    // Ungate column 2 (write to Column_Clock_Control at shim row 0).
+    array.clock_mut().write_register(2, 0, 0x000FFF20, 0x1);
+
+    // Write MCC for compute tile (col=2, row=3): Core only (bit 2), no DMA (bit 1).
+    array.clock_mut().write_register(2, 3, 0x00060000, 1 << 2);
+
+    assert!(array.clock().is_module_active(2, 3, ModuleKind::Core), "Core must be active");
+    assert!(!array.clock().is_module_active(2, 3, ModuleKind::Dma), "Dma must be gated");
+
+    // With no BDs configured, an active-DMA tile returns Some(DmaResult) and a
+    // gated tile must return None.
+    let mut host = crate::device::host_memory::HostMemory::new();
+    let result = array.step_dma(2, 3, &mut host);
+    assert!(result.is_none(), "step_dma must return None when DMA module is clock-gated, got {:?}", result);
+}
+
+/// When the StreamSwitch module is clock-gated, `step_tile_switches` must not
+/// forward any words for that tile.  We seed a word on a slave port and verify
+/// it is NOT forwarded to the master when SS is gated.
+#[test]
+fn module_gate_skips_ss_when_ss_module_gated() {
+    use crate::device::clock_control::ModuleKind;
+
+    let mut array = TileArray::npu1();
+
+    // Ungate column 1.
+    array.clock_mut().write_register(1, 0, 0x000FFF20, 0x1);
+
+    // Gate the stream switch on compute tile (col=1, row=2): Core+DMA active, SS gated.
+    // MCC bit 2 = Core, bit 1 = Memory/DMA, bit 0 = SS.  Set bits 2+1, clear bit 0.
+    array.clock_mut().write_register(1, 2, 0x00060000, (1 << 2) | (1 << 1));
+
+    assert!(!array.clock().is_module_active(1, 2, ModuleKind::StreamSwitch), "SS must be gated");
+
+    // Seed a word on the core slave port (port 0) of that tile.
+    let idx = array.tile_index(1, 2);
+    array.tiles[idx]
+        .stream_switch
+        .slaves
+        .first_mut()
+        .expect("compute tile must have at least one slave port")
+        .push(0xDEAD_BEEF);
+
+    // Configure a local route from slave[0] -> master[0] so words would normally forward.
+    array.tiles[idx].stream_switch.configure_local_route(0, 0);
+
+    // Step tile switches: the SS-gated tile must not forward the seeded word.
+    let forwarded = array.step_tile_switches();
+    assert_eq!(forwarded, 0, "SS-gated tile must not forward any words");
+
+    // The word must still be in the slave FIFO.
+    assert!(
+        !array.tiles[idx].stream_switch.slaves[0].fifo.is_empty(),
+        "word must remain in slave FIFO when SS is gated"
+    );
+}
+
 // === Cascade Routing Tests ===
 
 #[test]

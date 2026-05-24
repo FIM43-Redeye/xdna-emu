@@ -30,20 +30,43 @@ impl fmt::Display for Mm2sRouteDesc {
 }
 
 impl TileArray {
-    /// Step all per-tile stream switches.
+    /// Step all per-tile stream switches, applying module-gate checks.
     ///
     /// This handles intra-tile routing: forwarding data from input (slave) ports
     /// to output (master) ports within each tile based on configured local routes.
     /// This is necessary for pass-through routing where data enters a tile from
     /// one direction and exits to another.
     ///
+    /// Tiles whose StreamSwitch module is clock-gated (column gate, MCC bit 0,
+    /// or adaptive SS gate engaged) are skipped.
+    ///
     /// Returns the total number of words forwarded across all tiles.
     pub fn step_tile_switches(&mut self) -> usize {
+        use crate::device::clock_control::ModuleKind;
         let mut total_forwarded = 0;
-        for tile in &mut self.tiles {
-            total_forwarded += tile.stream_switch.step();
+        // Collect (col, row, ss_active) for adaptive tick; done in
+        // step_data_movement where DMA activity is also known.
+        for i in 0..self.tiles.len() {
+            let col = self.tiles[i].col;
+            let row = self.tiles[i].row;
+
+            // Column gate (top tier).
+            if !self.clock.is_column_active(col) {
+                continue;
+            }
+            // Module gate (mid tier): stream switch MCC bit 0.
+            if !self.clock.is_module_active(col, row, ModuleKind::StreamSwitch) {
+                continue;
+            }
+            // Adaptive gate (bottom tier).
+            if self.clock.is_adaptive_ss_engaged(col, row) {
+                continue;
+            }
+
+            let forwarded = self.tiles[i].stream_switch.step();
+            total_forwarded += forwarded;
             // Drain any fatal errors from this tile's stream switch
-            self.fatal_errors.append(&mut tile.stream_switch.fatal_errors);
+            self.fatal_errors.append(&mut self.tiles[i].stream_switch.fatal_errors);
         }
         total_forwarded
     }

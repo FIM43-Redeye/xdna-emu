@@ -89,9 +89,24 @@ impl TileArray {
     ///
     /// This advances the DMA transfer state by one cycle.
     /// For MemTiles, constructs neighbor lock access from adjacent columns.
+    ///
+    /// Returns `None` when the tile is out of bounds OR when the DMA module is
+    /// clock-gated (column gate or module-level MCC gate) or when the adaptive
+    /// DMA gate is engaged.
     pub fn step_dma(&mut self, col: u8, row: u8, host_memory: &mut HostMemory) -> Option<DmaResult> {
         if col >= self.cols || row >= self.rows {
             return None;
+        }
+        // Module gate check: skip if column is gated, DMA module is gated, or
+        // the adaptive DMA gate has engaged due to sustained idleness.
+        {
+            use crate::device::clock_control::ModuleKind;
+            if !self.clock.is_column_active(col)
+                || !self.clock.is_module_active(col, row, ModuleKind::Dma)
+                || self.clock.is_adaptive_dma_engaged(col, row)
+            {
+                return None;
+            }
         }
         let idx = self.tile_index(col, row);
         let is_mem = self.tiles[idx].is_mem();
@@ -145,10 +160,27 @@ impl TileArray {
         }
     }
 
-    pub fn step_all_dma(&mut self, host_memory: &mut HostMemory) -> bool {
+    /// Step all DMA engines and return per-tile activity flags alongside the
+    /// global "any active" bool.
+    ///
+    /// The per-tile flags are `(any_dma_active_for_tile, col, row)` tuples used
+    /// by `step_data_movement` to drive `tick_adaptive` once per tile at the end
+    /// of the full data-movement phase.
+    ///
+    /// Module gate check: tiles whose DMA module is clock-gated (column gate
+    /// OR module-level MCC OR adaptive DMA gate) are skipped.
+    pub(super) fn step_all_dma_tracked(
+        &mut self,
+        host_memory: &mut HostMemory,
+    ) -> (bool, Vec<(bool, u8, u8)>) {
+        use crate::device::clock_control::ModuleKind;
+
         let mut any_active = false;
         let rows = self.rows as usize;
         let cols = self.cols as usize;
+        let num_tiles = (self.cols as usize) * (self.rows as usize);
+        // Per-tile activity: indexed by flat tile index.
+        let mut tile_dma_active: Vec<(bool, u8, u8)> = Vec::with_capacity(num_tiles);
 
         // Destructure for disjoint field borrows (tiles vs engines)
         let tiles = &mut self.tiles;
@@ -156,12 +188,29 @@ impl TileArray {
         let clock = &self.clock;
 
         for i in 0..tiles.len() {
-            // Column gate check: skip tiles in gated columns.
+            let col = (i / rows) as u8;
+            let row = (i % rows) as u8;
+
+            // Column gate check (top tier): skip tiles in gated columns.
             // Silicon does not clock DMA engines in gated columns, so the
             // emulator skips all DMA stepping for them.  This is the top-tier
             // perf win -- typical programs gate 3 of 5 columns.
-            let col = i / rows;
-            if !clock.is_column_active(col as u8) {
+            if !clock.is_column_active(col) {
+                tile_dma_active.push((false, col, row));
+                continue;
+            }
+
+            // Module gate check (mid tier): skip if the DMA module is gated.
+            // On compute/memtile, DMA shares a clock bit with data memory (MCC
+            // bit 1).  On shim, DMA (NoC module) is MCC_1 bit 0.
+            if !clock.is_module_active(col, row, ModuleKind::Dma) {
+                tile_dma_active.push((false, col, row));
+                continue;
+            }
+
+            // Adaptive gate check (bottom tier): skip if idle long enough.
+            if clock.is_adaptive_dma_engaged(col, row) {
+                tile_dma_active.push((false, col, row));
                 continue;
             }
 
@@ -172,16 +221,18 @@ impl TileArray {
             let is_mem = engines[i].tile_kind.is_mem();
 
             let result = if is_mem {
-                let (west_ref, own_ref, east_ref) = get_three_mut(tiles, i, col, rows, cols);
+                let (west_ref, own_ref, east_ref) = get_three_mut(tiles, i, col as usize, rows, cols);
                 let mut neighbors = dma::NeighborTiles { west: west_ref, east: east_ref };
                 engines[i].step(own_ref, &mut neighbors, host_memory)
             } else {
                 engines[i].step(&mut tiles[i], &mut dma::NeighborTiles::empty(), host_memory)
             };
 
-            if matches!(result, DmaResult::InProgress | DmaResult::WaitingForLock(_)) {
+            let this_tile_active = matches!(result, DmaResult::InProgress | DmaResult::WaitingForLock(_));
+            if this_tile_active {
                 any_active = true;
             }
+            tile_dma_active.push((this_tile_active, col, row));
 
             // Merge DMA engine bank accesses into the tile.
             // Static transfer methods record directly on tile.cycle_dma_banks;
@@ -197,6 +248,11 @@ impl TileArray {
             }
         }
 
+        (any_active, tile_dma_active)
+    }
+
+    pub fn step_all_dma(&mut self, host_memory: &mut HostMemory) -> bool {
+        let (any_active, _) = self.step_all_dma_tracked(host_memory);
         any_active
     }
 
