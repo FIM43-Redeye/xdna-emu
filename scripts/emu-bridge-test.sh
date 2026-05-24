@@ -89,10 +89,13 @@ LIST_ONLY=false
 VERBOSE=false
 COMPILER_MODE="both"  # "both", "chess", "peano"
 NO_TRACE="${NO_TRACE:-false}"
-AMDXDNA_TRACE=true   # opt-out via --no-amdxdna-trace; ringbuffer-captures
-                     # amdxdna kernel tracepoints around the HW phase so a
-                     # mid-sweep wedge leaves the host->FW->IRQ->fence chain
-                     # snapshotted to $RESULTS_DIR/amdxdna.{trace,dmesg}.
+AMDXDNA_TRACE=false  # opt-in via --with-amdxdna-trace.  When on, ringbuffer-
+                     # captures amdxdna kernel tracepoints around the HW phase
+                     # so a mid-sweep wedge leaves the host->FW->IRQ->fence
+                     # chain snapshotted to $RESULTS_DIR/amdxdna.{trace,dmesg}.
+                     # Default off because it requires a pkexec auth prompt
+                     # at the start of every run; opt in when debugging
+                     # mid-sweep wedges.
 WITH_DEBUG_HALT_PROBE=false  # opt-in via --with-debug-halt-probe.
                              # debug_halt_probe is constructed to deliberately
                              # wedge the NPU to exercise the kernel-driver TDR
@@ -140,7 +143,7 @@ while [[ $# -gt 0 ]]; do
     --peano-only|--peano)  COMPILER_MODE="peano"; shift ;;
     --no-trace)            NO_TRACE=true; shift ;;
     --trace)               NO_TRACE=false; shift ;;
-    --no-amdxdna-trace)    AMDXDNA_TRACE=false; shift ;;
+    --with-amdxdna-trace)  AMDXDNA_TRACE=true; shift ;;
     --with-debug-halt-probe)
                            WITH_DEBUG_HALT_PROBE=true; shift ;;
     --sweep)               SWEEP=true; shift ;;
@@ -163,11 +166,12 @@ Options:
   --trace         Enable trace injection and comparison (default: on)
   --no-trace      Disable trace preparation (e.g., when only validating
                   functional correctness)
-  --no-amdxdna-trace
-                  Skip amdxdna kernel tracepoint capture around the HW
-                  phase (default: enabled).  When on, ringbuffer-captures
-                  xdna_job + mailbox events to RESULTS_DIR/amdxdna.{trace,
-                  dmesg} so a mid-sweep wedge leaves diagnosable history.
+  --with-amdxdna-trace
+                  Ringbuffer-capture amdxdna kernel tracepoints around the
+                  HW phase (default: off).  When on, captures xdna_job +
+                  mailbox events to RESULTS_DIR/amdxdna.{trace,dmesg} so a
+                  mid-sweep wedge leaves diagnosable history.  Requires
+                  one pkexec auth prompt at run start.
   --with-debug-halt-probe
                   Include debug_halt_probe in the run.  This test
                   deliberately wedges the NPU to exercise TDR recovery;
@@ -2931,7 +2935,8 @@ main() {
   # exists to cover.
   #
   # Declared at function scope so the end-of-main cleanup can see them
-  # even on --no-hw / --no-amdxdna-trace paths (set -u safety).
+  # even on --no-hw paths or when --with-amdxdna-trace was not passed
+  # (set -u safety).
   local amdxdna_sentinel="" amdxdna_daemon_pid=""
 
   if $RUN_HW && $AMDXDNA_TRACE; then

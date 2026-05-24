@@ -39,10 +39,13 @@ JOBS=$(nproc)
 GENERATE_ONLY=false
 FILTER=""
 MULTI_TILE=false
-AMDXDNA_TRACE=true   # opt-out via --no-amdxdna-trace; ringbuffer-captures
-                     # amdxdna kernel tracepoints around the HW phase so a
-                     # mid-suite wedge leaves the host->FW->IRQ->fence chain
-                     # snapshotted to $RESULTS_DIR/amdxdna.{trace,dmesg}.
+AMDXDNA_TRACE=false  # opt-in via --with-amdxdna-trace.  When on, ringbuffer-
+                     # captures amdxdna kernel tracepoints around the HW phase
+                     # so a mid-suite wedge leaves the host->FW->IRQ->fence
+                     # chain snapshotted to $RESULTS_DIR/amdxdna.{trace,dmesg}.
+                     # Default off because it requires a pkexec auth prompt
+                     # at the start of every run; opt in when debugging
+                     # mid-suite wedges.
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -52,7 +55,7 @@ while [[ $# -gt 0 ]]; do
         --generate-only)    GENERATE_ONLY=true; shift ;;
         --filter)           FILTER="$2"; shift 2 ;;
         --multi-tile)       MULTI_TILE=true; shift ;;
-        --no-amdxdna-trace) AMDXDNA_TRACE=false; shift ;;
+        --with-amdxdna-trace) AMDXDNA_TRACE=true; shift ;;
         *)                  echo "Unknown option: $1"; exit 1 ;;
     esac
 done
