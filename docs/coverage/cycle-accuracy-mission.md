@@ -220,20 +220,16 @@ Mode-2 / VCD comparators see the divergence at the event level.
 
 ### 8. Adaptive clock-gate execution consumption (wake-on-event)
 
-**Status**: DEFERRED. Counter + tick + query shipped; execution
-consumption removed 2026-05-25 pending wake-on-event coverage.
+**Status**: SHIPPED 2026-05-25 (same-day deferral and re-enablement).
+Wake events 1-3 implemented; Wake 4 (cascade) deferred to land
+alongside Core-adaptive gating.
 
 **What**: AM025 adaptive clock-gating engages a per-tile-module
 gate after `2^abort_period` idle cycles (default 128). Silicon
 stops the clocked domain on engagement and resumes it on external
-wake events (register writes touching the gated module, stream
-beats arriving, lock-value changes, control packets). We model
-the counter and the engagement signal but not the wake paths, so
-consuming `is_adaptive_dma_engaged` / `is_adaptive_ss_engaged` to
-skip `step_all_dma` / `step_tile_switches` produces stable
-deadlocks on lock-mediated tests where a tile sits idle through
-a host-side stall and then needs to resume on a control-packet-
-driven task enqueue.
+wake events. Without wake-on-event coverage, consuming the gate
+to skip execution stalled lock-mediated tests on the
+"control-packet enqueue onto a gated tile" pattern.
 
 **Investigation**: surfaced 2026-05-25 via the
 `ctrl_packet_reconfig` family (4 variants), `core_dmas` /
@@ -241,34 +237,69 @@ driven task enqueue.
 `blockwrite_using_locks` clusters all wedging in
 `AcquiringLock` with `lock_value=0`, all unblocked when adaptive
 consumption is removed. Diagnosed with bridge-sweep correlation
-against the pre-clock-control baseline at `20260521`.
+against the pre-clock-control baseline at `20260521`. Consumption
+was deferred (5cfe9c4) the same day pending the wake-event work
+described below.
 
-**Resolution**: keep counter + tick + query (useful for trace /
-events / future re-enablement); stop using the engagement signal
-to skip execution. `any_channel_has_pending_work` lands alongside
-to make the Phase-5 tick honor queued-but-FSM-Idle channels --
-necessary for the counter to be correct even without consumption.
+**Wake events implemented** (see code references for each):
 
-**Re-enablement path**: enumerate every silicon wake event and
-reset the adaptive counter on that tile/module from the
-corresponding emulator code path. Sketched set:
+- **Wake 1 -- register write into a gated module's address range.**
+  Implemented as `DeviceState::wake_adaptive_for_subsystem` invoked
+  from `write_register`, `mask_write_register`, and `dma_write`
+  (dispatch.rs). Maps `SubsystemKind::Dma | Lock | DataMemory` to
+  `wake_adaptive_dma` (Memory clock bit shared with DMA on
+  compute/memtile; shim DMA has its own bit but same call) and
+  `SubsystemKind::StreamSwitch` to `wake_adaptive_ss`. ClockControl
+  writes are skipped at the dispatcher level since they have their
+  own counter-reset logic on column / module ungate transitions.
+  This is the wedge-unblocker for `ctrl_packet_reconfig`: the
+  control packet write that enqueues a task on an idle gated tile
+  wakes that tile's DMA counter before the next step.
 
-- Register write into a gated module's address range (most
-  immediate -- this is the control-packet wake path).
-- Stream beat push into a slave port of a gated SS module.
-- Lock-value change reaching a tile whose DMA is gated and has
-  channels in `AcquiringLock`.
-- Cascade transfer arriving at a gated compute tile.
+- **Wake 2 -- stream beat into a slave port of a gated SS module.**
+  Implemented via the existing Phase-5 SS branch: any successful
+  slave-push sets `cycle_active = true` on the port (ports.rs);
+  Phase 5 OR-folds `cycle_active` across all SS ports on the tile
+  and calls `tick_adaptive_ss(active=true)`, resetting the SS
+  counter. End-of-cycle wake rather than emit-site wake, which is
+  slightly closer to silicon's wake-up latency than instantaneous
+  reset would be.
 
-Each wake event is one-line add at the emit site. Verification:
-re-enable consumption (revert the dma_ops + routing edits in the
-2026-05-25 commit), confirm the originally-wedged bridge tests
-still pass.
+- **Wake 3 -- lock-value change reaching a gated DMA tile.**
+  Decomposes into two sub-cases, both already covered without an
+  additional explicit wake call: (a) cross-tile lock changes
+  arrive as stream-routed control packets that decode into
+  register writes to the local Lock_value register -- covered by
+  Wake 1; (b) same-tile lock changes happen because a channel is
+  in AcquiringLock, which `ChannelFsm::is_active()` includes, so
+  `any_channel_has_pending_work()` is true and the Phase-5 tick
+  produces `tick_adaptive_dma(active=true)`. The "DMA gated AND
+  channel in AcquiringLock" scenario from the original sketch is
+  impossible in our FSM model.
+
+- **Wake 4 -- cascade transfer arriving at a gated compute Core.**
+  DEFERRED. No Core adaptive counter exists today; this wake
+  becomes meaningful only when Core-side adaptive gating lands.
+  Tracked in the `clock_control` coverage entry.
+
+**Verification**: full bridge sweep 2026-05-25 (consumption
+re-enabled, EMU-only, 80 tests, -j16). All 13 formerly-wedged
+tests pass: `ctrl_packet_reconfig` × 4 variants, `core_dmas` /
+`memtile_dmas` / `tile_dmas` `dma_configure_task_lock`,
+`memtile_dmas` / `tile_dmas` `writebd*`,
+`tile_dmas/blockwrite_using_locks`. Two residual failures are
+both pre-existing and out of scope: `memtile_dmas/
+blockwrite_using_locks (chess)` TIMEOUT (separate `lock_value=0`
+wedge that reproduces with adaptive fully off -- next priority),
+and `vec_mul_trace_distribute_lateral (chess)` compile fail
+(unrelated). Lib tests: 3206 pass.
 
 **Cross-references**:
 - Spec: `docs/superpowers/specs/2026-05-24-clock-control-design.md`
-- Coverage: `clock_control` entry's `Partial { missing: ... }`
-  third clause
+- Code: `src/device/clock_control/mod.rs` (`wake_adaptive_dma/_ss`),
+  `src/device/state/dispatch.rs` (`wake_adaptive_for_subsystem`),
+  `src/device/array/routing.rs` (Phase 5 SS branch, Wake 2 chain),
+  `src/device/clock_control/integration_tests.rs` (Wake 1-3 tests)
 
 ## aietools SystemC angle
 

@@ -322,16 +322,24 @@ impl ClockController {
     /// Returns true iff the DMA adaptive gate is currently engaged
     /// (idle cycle counter has crossed 2^abort_period).
     ///
-    /// Observable signal only -- not consumed as an execution-gating
-    /// decision today. Silicon stops the clocked domain on engagement
-    /// and resumes it on external wake events (register writes touching
-    /// the gated module, stream beats, lock-value changes, control
-    /// packets). The emulator does not yet model those wake paths, so
-    /// using this to skip step_all_dma produces stable deadlocks
-    /// (ctrl_packet_reconfig and the lock-test clusters wedged on the
-    /// wake-after-host-stall pattern). Counter + tick + query kept for
-    /// trace / events / future re-enablement once wake-on-event is
-    /// built (cycle-accuracy-mission.md tracks).
+    /// Consumed by `step_dma` and `step_all_dma` to skip execution on
+    /// engaged tiles.  Silicon stops the clocked domain on engagement
+    /// and resumes it on external wake events; the emulator implements
+    /// the wake paths through `wake_adaptive_dma`:
+    ///
+    /// - Register-bus accesses (DMA, Lock, DataMemory) wake via the
+    ///   dispatcher in `DeviceState::wake_adaptive_for_subsystem`.
+    /// - Stream beats arriving at a slave port set `cycle_active`,
+    ///   which Phase 5 of `step_data_movement` converts to
+    ///   `tick_adaptive_ss(active=true)` (Wake 2 -- SS counter, but the
+    ///   same pattern covers DMA via the per-cycle ss_active /
+    ///   dma_active checks).
+    /// - Cross-tile lock changes arrive as control-packet writes, which
+    ///   take the register-bus path above (Wake 3 reduces to Wake 1).
+    ///
+    /// History: consumption deferred 2026-05-25 (5cfe9c4), re-enabled
+    /// after wake-on-event coverage shipped.  See
+    /// cycle-accuracy-mission.md item #8.
     pub fn is_adaptive_dma_engaged(&self, col: u8, row: u8) -> bool {
         let Some(s) = self.adaptive.get(&(col, row)) else {
             return false;
@@ -341,7 +349,9 @@ impl ClockController {
     }
 
     /// Returns true iff the SS adaptive gate is currently engaged.
-    /// Same observability-only stance as `is_adaptive_dma_engaged`.
+    /// Consumed by `step_tile_switches`; same wake-on-event guarantees as
+    /// `is_adaptive_dma_engaged` -- see that docstring for the full path
+    /// enumeration.
     pub fn is_adaptive_ss_engaged(&self, col: u8, row: u8) -> bool {
         let Some(s) = self.adaptive.get(&(col, row)) else {
             return false;
