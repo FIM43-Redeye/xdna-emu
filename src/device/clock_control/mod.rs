@@ -267,6 +267,29 @@ impl ClockController {
         }
     }
 
+    /// Reset the DMA adaptive idle counter for this tile.
+    ///
+    /// Called from emit sites where silicon would generate a wake event for the
+    /// DMA module: register writes targeting DMA/lock space, lock-value changes
+    /// reaching a tile with channels in `AcquiringLock`. Equivalent in effect to
+    /// `tick_adaptive_dma(active=true)` but reads more clearly at call sites
+    /// that want the wake semantics rather than the per-cycle accounting form.
+    pub fn wake_adaptive_dma(&mut self, col: u8, row: u8) {
+        let entry = self.adaptive.entry((col, row)).or_default();
+        entry.dma_idle_cycles = 0;
+    }
+
+    /// Reset the SS adaptive idle counter for this tile.
+    ///
+    /// Called from emit sites where silicon would generate a wake event for the
+    /// StreamSwitch module: stream beats arriving at a slave port of this tile,
+    /// SS configuration register writes. Same call-site-clarity rationale as
+    /// `wake_adaptive_dma`.
+    pub fn wake_adaptive_ss(&mut self, col: u8, row: u8) {
+        let entry = self.adaptive.entry((col, row)).or_default();
+        entry.ss_idle_cycles = 0;
+    }
+
     /// Reset the DMA idle counter for every tile in `col` to zero.
     ///
     /// Internal helper called when a column transitions from gated to ungated.
@@ -813,6 +836,71 @@ mod tests {
         }
         clock.tick_adaptive_ss(2, 2, true); // active -- resets counter
         assert!(!clock.is_adaptive_ss_engaged(2, 2), "active tick must reset SS counter");
+    }
+
+    // ---- wake_adaptive_dma / wake_adaptive_ss ----
+
+    #[test]
+    fn wake_adaptive_dma_resets_engaged_counter() {
+        let mut clock = ClockController::new(5, 6);
+        clock.set_adaptive_abort_period(2, 2, 3);
+        for _ in 0..8 {
+            clock.tick_adaptive_dma(2, 2, false);
+        }
+        assert!(clock.is_adaptive_dma_engaged(2, 2), "precondition: gate engaged");
+        clock.wake_adaptive_dma(2, 2);
+        assert!(!clock.is_adaptive_dma_engaged(2, 2), "wake must release DMA gate");
+    }
+
+    #[test]
+    fn wake_adaptive_ss_resets_engaged_counter() {
+        let mut clock = ClockController::new(5, 6);
+        clock.set_adaptive_abort_period(2, 2, 3);
+        for _ in 0..8 {
+            clock.tick_adaptive_ss(2, 2, false);
+        }
+        assert!(clock.is_adaptive_ss_engaged(2, 2), "precondition: gate engaged");
+        clock.wake_adaptive_ss(2, 2);
+        assert!(!clock.is_adaptive_ss_engaged(2, 2), "wake must release SS gate");
+    }
+
+    #[test]
+    fn wake_adaptive_dma_does_not_affect_ss_counter() {
+        let mut clock = ClockController::new(5, 6);
+        clock.set_adaptive_abort_period(2, 2, 3);
+        for _ in 0..8 {
+            clock.tick_adaptive_dma(2, 2, false);
+            clock.tick_adaptive_ss(2, 2, false);
+        }
+        assert!(clock.is_adaptive_dma_engaged(2, 2));
+        assert!(clock.is_adaptive_ss_engaged(2, 2));
+        clock.wake_adaptive_dma(2, 2);
+        assert!(!clock.is_adaptive_dma_engaged(2, 2));
+        assert!(clock.is_adaptive_ss_engaged(2, 2), "wake_adaptive_dma must leave SS counter alone");
+    }
+
+    #[test]
+    fn wake_adaptive_ss_does_not_affect_dma_counter() {
+        let mut clock = ClockController::new(5, 6);
+        clock.set_adaptive_abort_period(2, 2, 3);
+        for _ in 0..8 {
+            clock.tick_adaptive_dma(2, 2, false);
+            clock.tick_adaptive_ss(2, 2, false);
+        }
+        clock.wake_adaptive_ss(2, 2);
+        assert!(clock.is_adaptive_dma_engaged(2, 2), "wake_adaptive_ss must leave DMA counter alone");
+        assert!(!clock.is_adaptive_ss_engaged(2, 2));
+    }
+
+    #[test]
+    fn wake_adaptive_creates_entry_for_fresh_tile() {
+        // First wake on a tile that has never been ticked should not panic and
+        // should leave the gate disengaged (counter at 0, threshold at 2^7=128).
+        let mut clock = ClockController::new(5, 6);
+        clock.wake_adaptive_dma(3, 4);
+        clock.wake_adaptive_ss(3, 4);
+        assert!(!clock.is_adaptive_dma_engaged(3, 4));
+        assert!(!clock.is_adaptive_ss_engaged(3, 4));
     }
 
     // ---- reset-on-re-ungate (column) ----
