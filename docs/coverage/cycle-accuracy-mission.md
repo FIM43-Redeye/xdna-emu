@@ -301,64 +301,20 @@ and `vec_mul_trace_distribute_lateral (chess)` compile fail
   `src/device/array/routing.rs` (Phase 5 SS branch, Wake 2 chain),
   `src/device/clock_control/integration_tests.rs` (Wake 1-3 tests)
 
-### 9. Trace unit wire-format compression (skip-token runs)
+### 9. ~~Perf-counter-driven trace event emission~~ -> CARVED OUT 2026-05-25
 
-**Status**: PROPOSED. Retargeted 2026-05-25 after H1 (perf-counter-
-driven emission) was refuted by direct HW measurement.
+Original hypothesis (perf-counter-driven LOCK_STALL emission) was
+refuted by direct HW measurement on 2026-05-25. HW emits LOCK_STALL
+per stalled cycle, matching EMU. The actual EMU/HW divergence is in
+trace-unit wire-format compression (HW skip-tokens vs EMU per-cycle
+packets); that's an encoder change, not a cycle-accuracy modeling
+change, and now has its own home.
 
-**What**: HW and EMU emit the same per-cycle LOCK_STALL trace events.
-Decoded events.json from both sides shows ~2233-2766 LOCK_STALL events
-on `_diag_phase_b_add_one_instrumented` (HW captures across multiple
-days are within ~20% of each other and within ~20% of EMU). The
-behavioral model is correct.
+- Carved-out tracking doc: [`trace-compression-gap.md`](trace-compression-gap.md)
+- Refutation finding: [`docs/superpowers/findings/2026-05-25-lock-stall-cadence-h1-refuted.md`](../superpowers/findings/2026-05-25-lock-stall-cadence-h1-refuted.md)
 
-What differs is wire-format compression in the trace buffer:
-
-| Side | trace_raw.bin content words | Decoded LOCK_STALL events |
-|---|---:|---:|
-| HW (chess, 2026-05-24) | 160 | 2233 |
-| HW (chess, 2026-05-20) | 160 | 2766 |
-| EMU (chess, 2026-05-25) | 3032 | ~2700 |
-
-HW packs runs of repeated events into skip-tokens (`0xFExxxxxx`-style
-patterns visible in the raw bin); EMU emits one packet per cycle. The
-post-decode JSON is semantically the same on both sides -- the
-asymmetry only surfaces in the raw bin size and in the
-parse-trace.py `ts` field, which inflates by the per-tile in-stream
-event index.
-
-The original framing of this item (perf-counter-driven cadence) came
-from Phase C's "44 events at ~1024-cyc spacing" claim, which cannot be
-reproduced from any extant HW capture and was likely a measurement
-error of unknown provenance. See
-`docs/superpowers/findings/2026-05-25-lock-stall-cadence-h1-refuted.md`.
-
-**Why it matters**: closing the wire-format gap removes the ts/soc
-asymmetry. Once EMU compresses its trace buffer the way HW does,
-per-event `ts` values track HW's chunked timestamps and cross-side
-comparisons that read `ts` (instead of `soc`) stop tripping. soc-only
-analysis already works today.
-
-**How to fix**:
-
-a. **Trace unit encoder change** in `src/device/trace_unit/`.
-   Identify HW's skip-token format from the raw trace bytes (the
-   `0xFE`-byte patterns interleaved with event markers) and reproduce
-   it. Should be a writer-side change with no interpreter or model
-   impact.
-
-b. **Validation**: post-change EMU trace_raw.bin content words on the
-   diag test should drop from ~3000 to ~150-300, matching HW.
-   Post-decode events.json content and counts should stay the same.
-
-**Cross-references**:
-- Detail: [`docs/superpowers/findings/2026-05-25-lock-stall-cadence-h1-refuted.md`](../superpowers/findings/2026-05-25-lock-stall-cadence-h1-refuted.md)
-- Previously-attempted hypothesis (refuted): perf-counter-driven cadence
-- Related ts/soc gotcha: [`docs/superpowers/findings/2026-05-25-trace-ts-vs-soc-measurement-gotcha.md`](../superpowers/findings/2026-05-25-trace-ts-vs-soc-measurement-gotcha.md)
-- Code: `src/device/trace_unit/` (where the fix lands)
-- Code that stays as-is: `src/interpreter/core/interpreter.rs:97-101`
-  (`LOCK_STALL_TRACE_PERIOD = 1` is correct),
-  `src/interpreter/execute/cycle_accurate.rs:818-822`
+This slot remains in the mission doc as a tombstone so future readers
+who follow links to "item #9" land somewhere with the redirect.
 
 ### 10. Shim streaming throughput modeling
 
