@@ -301,62 +301,63 @@ and `vec_mul_trace_distribute_lateral (chess)` compile fail
   `src/device/array/routing.rs` (Phase 5 SS branch, Wake 2 chain),
   `src/device/clock_control/integration_tests.rs` (Wake 1-3 tests)
 
-### 9. Perf-counter-driven trace event emission (LOCK_STALL et al.)
+### 9. Trace unit wire-format compression (skip-token runs)
 
-**Status**: PROPOSED. Blocked on HW ground-truth measurement campaign.
+**Status**: PROPOSED. Retargeted 2026-05-25 after H1 (perf-counter-
+driven emission) was refuted by direct HW measurement.
 
-**What**: HW's trace controller emits state events like LOCK_STALL,
-MEMORY_STALL, STREAM_STALL not as raw level signals but via the
-correlation between a perf counter (typically PERF_CTRL0 counting
-ACTIVE_CORE with a configurable threshold like 1024 cyc) and the
-underlying stall state. On rollover the configured PERF_CNT_N slot
-fires AND, in the same cycle, whichever stall is active gets stamped
-into its slot. EMU currently treats LOCK_STALL as an edge event
-(initial emit on WaitLock entry, via `cycle_accurate.rs:821`) plus
-a per-retry emit (`interpreter.rs:728-743`, with
-`LOCK_STALL_TRACE_PERIOD = 1`). This over-emits on long-stall tests
-(2701 events vs HW's ~44 on `_diag_phase_b_add_one_instrumented`)
-and approximately matches on short-stall tests (22 vs 24 on
-`add_one_using_dma`).
+**What**: HW and EMU emit the same per-cycle LOCK_STALL trace events.
+Decoded events.json from both sides shows ~2233-2766 LOCK_STALL events
+on `_diag_phase_b_add_one_instrumented` (HW captures across multiple
+days are within ~20% of each other and within ~20% of EMU). The
+behavioral model is correct.
 
-**Why it matters**: cycle-accuracy comparisons that read the trace
-decoder's `ts` field are tripped by event-count differences (since
-`ts = soc + 1 + events_before`). Today's stage-decomposition for
-`#355a` was misdiagnosed as a stage-5 regression because the
-over-emission inflated `ts` by ~2686 cyc. Tighter measurement
-discipline (always use `soc`) handles this for tooling, but
-ultimately the emission semantics should match HW so the `ts` field
-is trustworthy too.
+What differs is wire-format compression in the trace buffer:
 
-**How to derive the value**:
+| Side | trace_raw.bin content words | Decoded LOCK_STALL events |
+|---|---:|---:|
+| HW (chess, 2026-05-24) | 160 | 2233 |
+| HW (chess, 2026-05-20) | 160 | 2766 |
+| EMU (chess, 2026-05-25) | 3032 | ~2700 |
 
-a. **HW measurement (preferred)**: re-measure LOCK_STALL counts on
-   a calibration set (`add_one_using_dma`, `_diag_phase_b_*`,
-   `dynamic_object_fifo/*`, a few of the `objectfifo_repeat/*`),
-   correlating against each test's perf-counter CDO writes. Use
-   `soc` field for the cycle window. The 2026-05-11 "~4400 events
-   at PC 832" claim cannot be trusted -- it was made before the
-   ts/soc gotcha was understood. Phase C's 44 events with ~1024-cyc
-   spacing is more credible.
+HW packs runs of repeated events into skip-tokens (`0xFExxxxxx`-style
+patterns visible in the raw bin); EMU emits one packet per cycle. The
+post-decode JSON is semantically the same on both sides -- the
+asymmetry only surfaces in the raw bin size and in the
+parse-trace.py `ts` field, which inflates by the per-tile in-stream
+event index.
 
-b. **CDO parser**: extract each tile's PERF_CTRL0 / PERF_CTRL1
-   configuration at xclbin-load time, store on the tile's trace
-   state, and tick during WaitingLock / WaitingDma / WaitingStream
-   (since the core stays ACTIVE during stalls per AM020).
+The original framing of this item (perf-counter-driven cadence) came
+from Phase C's "44 events at ~1024-cyc spacing" claim, which cannot be
+reproduced from any extant HW capture and was likely a measurement
+error of unknown provenance. See
+`docs/superpowers/findings/2026-05-25-lock-stall-cadence-h1-refuted.md`.
 
-**Open question**: do other state events (MEMORY_STALL, STREAM_STALL,
-PORT_STALL) follow the same perf-counter-driven sampling, or are
-they edge-only? The 2026-05-12 MEMORY_STALL fix in
-`docs/archive/findings/2026-05-11-emu-dma-pipeline-too-fast-misses-stalls.md`
-addressed a different bug (S2MM phantom bank claims during stall),
-not the emission cadence.
+**Why it matters**: closing the wire-format gap removes the ts/soc
+asymmetry. Once EMU compresses its trace buffer the way HW does,
+per-event `ts` values track HW's chunked timestamps and cross-side
+comparisons that read `ts` (instead of `soc`) stop tripping. soc-only
+analysis already works today.
+
+**How to fix**:
+
+a. **Trace unit encoder change** in `src/device/trace_unit/`.
+   Identify HW's skip-token format from the raw trace bytes (the
+   `0xFE`-byte patterns interleaved with event markers) and reproduce
+   it. Should be a writer-side change with no interpreter or model
+   impact.
+
+b. **Validation**: post-change EMU trace_raw.bin content words on the
+   diag test should drop from ~3000 to ~150-300, matching HW.
+   Post-decode events.json content and counts should stay the same.
 
 **Cross-references**:
-- Detail: [`docs/superpowers/findings/2026-05-25-trace-ts-vs-soc-measurement-gotcha.md`](../superpowers/findings/2026-05-25-trace-ts-vs-soc-measurement-gotcha.md)
-- Execution plan: [`hw-measurement-campaign.md`](hw-measurement-campaign.md)
-- Currently P3 (measurement-discipline-only); P2 is the real fix
-- Code: `src/interpreter/core/interpreter.rs:97-101`,
-  `src/interpreter/core/interpreter.rs:728-743`,
+- Detail: [`docs/superpowers/findings/2026-05-25-lock-stall-cadence-h1-refuted.md`](../superpowers/findings/2026-05-25-lock-stall-cadence-h1-refuted.md)
+- Previously-attempted hypothesis (refuted): perf-counter-driven cadence
+- Related ts/soc gotcha: [`docs/superpowers/findings/2026-05-25-trace-ts-vs-soc-measurement-gotcha.md`](../superpowers/findings/2026-05-25-trace-ts-vs-soc-measurement-gotcha.md)
+- Code: `src/device/trace_unit/` (where the fix lands)
+- Code that stays as-is: `src/interpreter/core/interpreter.rs:97-101`
+  (`LOCK_STALL_TRACE_PERIOD = 1` is correct),
   `src/interpreter/execute/cycle_accurate.rs:818-822`
 
 ### 10. Shim streaming throughput modeling

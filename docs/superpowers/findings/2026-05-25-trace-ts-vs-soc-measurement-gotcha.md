@@ -6,6 +6,23 @@ type: project
 
 # Trace `ts` vs `soc` -- a measurement gotcha that tricked us twice
 
+## Follow-up note (2026-05-25, same day)
+
+The "44 events" Phase C count this finding cites as "more credible" is
+itself wrong. Direct decoding of preserved HW captures
+(2026-05-20/21/24) shows ~2233-2766 LOCK_STALL events on
+`_diag_phase_b_add_one_instrumented`, matching EMU's count. Item #9
+in `docs/coverage/cycle-accuracy-mission.md` was retargeted from
+emission-cadence modeling to trace-unit wire-format compression as a
+result. See
+[`2026-05-25-lock-stall-cadence-h1-refuted.md`](2026-05-25-lock-stall-cadence-h1-refuted.md).
+
+The ts/soc discipline rule in this finding is still right -- it's
+exactly the asymmetric-compression effect this finding describes,
+just with the underlying cause now identified.
+
+---
+
 ## TL;DR
 
 The trace decoder produces two cycle-like fields per event:

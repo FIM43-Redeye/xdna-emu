@@ -29,36 +29,37 @@ data set once, then both items get modeled off of it.
   function of (BD payload size, access pattern). Solve for cold-start
   intercept and per-word streaming rate.
 
-- Item #9 -- perf-counter-driven trace event emission (LOCK_STALL et
-  al.). Need HW LOCK_STALL event counts and inter-event cycle deltas
-  on a set of tests that exercise short-stall and long-stall regimes,
-  correlated against each test's PERF_CTRL CDO writes.
+- ~~Item #9 -- perf-counter-driven trace event emission (LOCK_STALL et
+  al.)~~ **Closed via different fix 2026-05-25**. Hypothesis H1
+  (perf-counter-driven cadence) was refuted by direct measurement: HW
+  emits ~2233-2766 LOCK_STALL events per kernel run on the diag test,
+  matching EMU's current behavior. The real gap is trace-unit
+  wire-format compression (HW uses skip-tokens; EMU emits one packet
+  per cycle). Item #9 retargets to trace-unit work in
+  `src/device/trace_unit/`, no HW campaign needed. Detail:
+  [`../superpowers/findings/2026-05-25-lock-stall-cadence-h1-refuted.md`](../superpowers/findings/2026-05-25-lock-stall-cadence-h1-refuted.md).
 
 **Explicitly out of scope (deferred to model-build phase):**
 
-- Building the CDO PERF_CTRL parser (item #9b). Comes after the
-  campaign; the data tells us what the model needs to compute.
 - Implementing throughput-bound streaming in the DMA stepping
   state machine (item #10). Comes after the rate is known.
-- MEMORY_STALL / STREAM_STALL / PORT_STALL cadence -- LOCK_STALL is
-  the only state event we have a clean signal on. The other three
-  ride along if their cadence happens to fall out of the same
-  PERF_CTRL config, but we don't design experiments specifically for
-  them yet.
+- Trace-unit wire-format compression (item #9 retargeted scope) --
+  separate work, no HW campaign needed; lands in
+  `src/device/trace_unit/`.
 
-## Calibration corpus
+## Calibration corpus (for item #10)
 
-One corpus serves both items. Each test contributes anchors for at
-least one of the two items.
+Item #9 closed via different fix; the corpus below now serves item
+#10 (shim throughput) only.
 
-| Test | Anchors usable for #10 | Anchors usable for #9 | Notes |
-|------|:---:|:---:|------|
-| `_diag_phase_b_add_one_instrumented` | yes | yes | 64-word BD baseline; Phase C reference test; ~44 LOCK_STALL events historic |
-| `add_one_using_dma` | yes | yes | Short stalls (~22 LOCK_STALL); covers short-stall regime |
-| `add_one_objFifo` | yes | maybe | Different BD shape; check stall profile |
-| `add_one_objFifo_elf` | yes | maybe | ELF-driven variant; cross-check vs Python-driven |
-| `objectfifo_repeat` (variant TBD) | yes | maybe | Multi-iteration; tests sustained streaming |
-| `dynamic_object_fifo` | maybe | yes | Object FIFO with dynamic alloc; stall-heavy candidate |
+| Test | BD shape | Notes |
+|------|----------|------|
+| `_diag_phase_b_add_one_instrumented` | 64-word linear | Phase C reference test |
+| `add_one_using_dma` | small linear | Cross-check vs IRON-style |
+| `add_one_objFifo` | objectfifo | Different BD shape |
+| `add_one_objFifo_elf` | objectfifo | ELF-driven variant |
+| `objectfifo_repeat` (variant TBD) | multi-iteration | Sustained streaming |
+| `dynamic_object_fifo` | dynamic alloc | Different driver path |
 
 Test selection rule: each test must (a) successfully complete on HW
 under the current bridge harness with trace injection, (b) have a
@@ -157,83 +158,26 @@ The model derived from this campaign is validated when:
 3. No other test that previously passed the trace-comparison sweep
    regresses by more than 20 cyc total in stage 1+2.
 
-## Item #9 -- perf-counter LOCK_STALL emission design
+## Item #9 -- CLOSED (refuted 2026-05-25)
 
-### Anchors
+Previously slated for a perf-counter-driven LOCK_STALL emission
+model. Direct HW measurement against preserved captures
+(2026-05-20/21/24) refuted the hypothesis: HW emits ~2233-2766
+LOCK_STALL events per kernel run on `_diag_phase_b_add_one_instrumented`,
+matching EMU's per-cycle behavior. The original "44 events at
+~1024-cyc spacing" claim from Phase C cannot be reproduced and was
+likely a measurement error.
 
-Per test in the corpus, capture:
+The real gap is trace-unit wire-format compression. EMU emits one
+trace packet per cycle; HW packs runs of repeated events into
+skip-tokens. Item #9 retargets to trace-unit work in
+`src/device/trace_unit/` -- no HW measurement campaign needed.
 
-- All `LOCK_STALL` events with their `soc` timestamps and tile IDs.
-- Stall-entry and stall-exit edges (derive from kernel state, not
-  trace -- the trace controller doesn't emit "stall start/end"
-  directly; LOCK_STALL itself is the signal).
-- Per tile, the PERF_CTRL0 / PERF_CTRL1 register values written by
-  the test's CDO. Today this requires either: (a) parsing the
-  loaded xclbin's CDO section, or (b) reading the registers via
-  EMU's MMIO trace at xclbin-load time. Either path needs new
-  scaffolding (see Tooling gaps).
+Detail: [`../superpowers/findings/2026-05-25-lock-stall-cadence-h1-refuted.md`](../superpowers/findings/2026-05-25-lock-stall-cadence-h1-refuted.md).
 
-### Sweep dimensions
-
-| Dimension | Values |
-|-----------|--------|
-| Stall window length | short (~10s of cyc), medium (~100s), long (>1000) |
-| PERF_CTRL config | as-found per test (no parametric variation in v1) |
-| Tile location (memtile vs compute vs shim) | as-found |
-
-We are not varying PERF_CTRL programmatically; we are correlating
-across tests that happen to have different configs. This is the
-v1 budget. v2 (which would need a custom kernel that varies
-PERF_CTRL programmatically) is deferred.
-
-### Analysis
-
-For each test, compute:
-
-```
-lock_stall_count_per_tile     # observed in HW trace
-lock_stall_intervals_per_tile # consecutive soc deltas
-stall_window_duration         # total stall time per tile (from kernel state)
-```
-
-Two hypotheses to test:
-
-1. **Perf-counter-driven**: `lock_stall_count = floor(stall_window_duration / PERF_THRESHOLD)`
-   where PERF_THRESHOLD is read from PERF_CTRL0 of the tile, plus 1
-   for the initial entry edge. Intervals should be approximately
-   constant at PERF_THRESHOLD cyc.
-
-2. **Edge-only with periodic re-emit**: counts independent of
-   stall_window_duration. Intervals random or near-constant at a
-   different value.
-
-Phase C historic data (44 events on `_diag_phase_b_add_one_instrumented`,
-~1024-cyc spacing, configured threshold also 1024) is consistent with
-H1; this campaign verifies it across the corpus and gives us the
-right PERF_THRESHOLD lookup.
-
-### Output artifacts
-
-- `data/hw-lock-stall-2026-05.csv` -- per-tile rows with
-  (test_name, tile, lock_stall_count, mean_interval, stall_window).
-- `data/hw-perf-ctrl-config-2026-05.json` -- per-test perf-ctrl
-  configs (which event, which threshold) extracted from CDO.
-- Decision: H1 vs H2, plus the formula to feed into the EMU
-  model-builder.
-
-### Validation gate before declaring success
-
-The model derived from this campaign is validated when:
-
-1. EMU LOCK_STALL event counts match HW within +/- 5% across the
-   corpus, with current LOCK_STALL_TRACE_PERIOD removed (the
-   constant becomes per-tile, sourced from PERF_CTRL).
-2. The ts/soc gotcha stops biting: `ts` field across tests becomes
-   directly comparable for in-stream event ordering (which is what
-   it was designed for).
-3. MEMORY_STALL / STREAM_STALL / PORT_STALL emission, if the same
-   PERF_CTRL drives them, falls out for free. Document that in the
-   close-out finding even if it's beyond the v1 scope.
+The G2 tooling (PERF_CTRL extraction, MLIR + CDO paths) stays useful
+as a ground-truth readout for perf-counter trace events themselves,
+just not for LOCK_STALL cadence modeling.
 
 ## Tooling gaps
 
@@ -260,10 +204,12 @@ consume `events.json` directly without re-decoding.
 **Estimate**: ~15 min of shell-script work, two insertion sites
 (`run_one_hardware`, `run_one_bridge`).
 
-### G2. PERF_CTRL extraction utilities
+### G2. PERF_CTRL extraction utilities (retained, scope reduced)
 
-Item #9 analysis benefits from knowing each test's PERF_CTRL0 /
-PERF_CTRL1 / Counter*_Event_Value configuration per tile.
+Originally planned for item #9 cadence modeling; that item is closed
+via a different fix (see top of doc). The tools still ship since
+they're useful for any future work that needs ground-truth PERF_CTRL
+readout (e.g., perf counter trace events on tests that DO use them).
 
 **Finding (2026-05-25)**: IRON-style tests configure perf counters
 at runtime via the NPU instruction stream, NOT via CDO at xclbin
@@ -279,10 +225,9 @@ Two tools, complementary:
    post-injection MLIR (e.g.,
    `build/test/npu-xrt/<test>/traced/aie_traced.mlir`) for
    `aie.trace.reg register = "Performance_..." value = N` writes
-   inside `aie.trace.config` blocks. Works for any test that goes
-   through `mlir-trace-inject.py`. On the diag test yields:
+   inside `aie.trace.config` blocks. On the diag test yields:
    `(0,2)/core: {Performance_Counter2_Event_Value: 1024, ...}`,
-   matching Phase C's empirically-observed ~1024-cyc spacing.
+   matching the configured threshold.
 
 2. `src/bin/extract_perf_ctrl.rs` -- **fallback** for tests that
    DO configure perf via CDO at xclbin load. Reads via our
@@ -290,13 +235,6 @@ Two tools, complementary:
    ranges (core 0x031500-0x03158C, memory 0x011000-0x011084,
    memory_tile 0x091000-0x09108C, shim 0x031000-0x031084), emits
    per-tile JSON. Returns empty for IRON tests by design.
-
-For the campaign's item #9 analysis, the primary path is
-sufficient: the MLIR carries the configured PERF_THRESHOLD
-explicitly, so we don't need to back it out from interval analysis.
-Interval analysis still serves as cross-validation -- the median
-HW LOCK_STALL inter-event interval should match
-Performance_Counter*_Event_Value.
 
 **Actual time**: ~2 hr (1.5 hr Rust + 30 min Python pivot after
 finding the CDO doesn't carry the config for IRON tests).
@@ -359,38 +297,34 @@ Ordered phases. Each phase produces a checkpoint that should be
 committed before moving on.
 
 1. **G1 + G3 land.** Trace artifact preservation in bridge harness,
-   plus the persistent soc-aware comparator. Without these, the
-   campaign data is non-reproducible.
-2. **G2 lands.** PERF_CTRL extraction tool. Required for item #9
-   analysis; not blocking item #10.
-3. **Existing-corpus baseline run.** Six tests, HW side only, with
+   plus the persistent soc-aware comparator. Done 2026-05-25
+   (commits `eaff65e`, `85bab82`).
+2. **G2 lands.** PERF_CTRL extraction tool. Done 2026-05-25
+   (commit `b25f6e2`); scope reduced after item #9 closed.
+3. **Item #9 closed via different fix.** Done 2026-05-25
+   (see top of doc + finding link).
+4. **Existing-corpus baseline run.** Six tests, HW side only, with
    `--retain-traces`. Outputs per-test events.json + trace_buffer.bin.
-4. **Item #10 first-pass regression.** Mine the existing-corpus
+5. **Item #10 first-pass regression.** Mine the existing-corpus
    data for BD size variation. Linear fit per (access pattern,
    bank, channel). If R^2 > 0.95 across the corpus and residual on
    `_diag_phase_b` validation gate looks tractable, skip the
    parameterized kernel.
-5. **Item #9 first-pass analysis.** PERF_CTRL config from CDO,
-   LOCK_STALL counts and intervals from events.json, hypothesis
-   test (H1 perf-counter-driven vs H2 edge-only).
 6. **Decision point.** Do we need the parameterized calibration
-   kernel for item #10? Do we need a PERF_CTRL-varying kernel for
-   item #9? Either, both, or neither.
+   kernel for item #10?
 7. **(Conditional) Build calibration kernels.** Only if step 6
-   determined we need them.
+   says yes.
 8. **(Conditional) Second-pass HW run.** Sweep the new calibration
    kernels.
-9. **Close-out findings.** Write two findings:
-   `findings/<date>-shim-throughput-model.md` and
-   `findings/<date>-lock-stall-cadence-model.md`. Each lands the
-   model parameters with the data backing them.
+9. **Close-out finding.** Write `findings/<date>-shim-throughput-model.md`
+   landing model parameters with the data backing them.
 10. **EMU modeling work** (downstream, not part of this campaign).
-    Implement the throughput-bound streaming in DMA stepping;
-    implement the CDO PERF_CTRL parser and per-tile perf-counter
-    state. Re-run the validation gates from each item above.
+    Implement the throughput-bound streaming in DMA stepping.
+    Re-run the validation gate from item #10.
 
-Steps 1-9 are the campaign proper. Step 10 is the cycle-accuracy
-mission's continuation, gated on the campaign's outputs.
+Steps 1-3 are done. Steps 4-9 are the campaign proper. Step 10 is
+the cycle-accuracy mission's continuation, gated on the campaign's
+outputs.
 
 ## See also
 
