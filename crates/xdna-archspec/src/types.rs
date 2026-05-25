@@ -1187,14 +1187,22 @@ pub struct DmaTiming {
 
 /// Stream switch timing and physical constants.
 ///
-/// Source: AM020 Ch2 ("Local slave ports are 2-cycle latency and a 4-deep
-/// FIFO", "Local master ports have 1-cycle latency and a 2-deep FIFO").
+/// Source: AM020 Ch2 ("External ports are 2-cycle latency and a 4-deep FIFO",
+/// "Local slave ports are 2-cycle latency and a 4-deep FIFO", "Local master
+/// ports have 1-cycle latency and a 2-deep FIFO"). External master and slave
+/// ports share the same depth; local master is shallower.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamSwitchTiming {
-    /// Slave port FIFO depth (words).
+    /// Local slave port FIFO depth (words).
     pub local_slave_fifo_depth: u8,
-    /// Master port FIFO depth (words).
+    /// Local master port FIFO depth (words). Local masters feed the DMA /
+    /// core / trace / control consumer attached to the same tile.
     pub local_master_fifo_depth: u8,
+    /// External master port FIFO depth (words). External masters (N/S/E/W)
+    /// drive the inter-tile wires; AM020 specifies a 4-deep FIFO on them so
+    /// a route ending in an external master holds more in flight than one
+    /// ending in a local master.
+    pub external_master_fifo_depth: u8,
     /// Local slave to local master latency in cycles.
     pub local_to_local_latency: u8,
     /// Local slave to external master latency in cycles.

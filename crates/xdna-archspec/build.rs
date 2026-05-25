@@ -445,6 +445,12 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
         .unwrap();
         writeln!(
             out,
+            "    pub const STREAM_EXTERNAL_MASTER_FIFO_DEPTH: u8 = {};",
+            t.stream_switch.external_master_fifo_depth
+        )
+        .unwrap();
+        writeln!(
+            out,
             "    pub const STREAM_LOCAL_TO_LOCAL_LATENCY: u8 = {};",
             t.stream_switch.local_to_local_latency
         )

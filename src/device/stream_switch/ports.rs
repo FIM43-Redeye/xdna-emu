@@ -117,7 +117,14 @@ pub struct StreamPort {
 impl StreamPort {
     /// Create a new stream port.
     pub fn new(index: u8, direction: PortDirection, port_type: PortType) -> Self {
+        // FIFO depth per AM020 Ch2.  External masters drive the inter-tile
+        // wires and have a deeper FIFO (4) than local masters (2) which feed
+        // the DMA / core / trace / control consumers on the same tile.
+        // All slaves share the same 4-deep depth.
         let fifo_capacity = match direction {
+            PortDirection::Master if port_type.is_external() => {
+                arch_timing::STREAM_EXTERNAL_MASTER_FIFO_DEPTH as usize
+            }
             PortDirection::Master => arch_timing::STREAM_LOCAL_MASTER_FIFO_DEPTH as usize,
             PortDirection::Slave => arch_timing::STREAM_LOCAL_SLAVE_FIFO_DEPTH as usize,
         };

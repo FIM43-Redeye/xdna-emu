@@ -196,9 +196,14 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // and 34 bits = 32 data + 1 parity + 1 TLAST), so the documented
             // FIFO depths are in 32-bit-word slots, not double-words:
             //
+            //   "External ports are 2-cycle latency and a 4-deep FIFO."
             //   "Local slave ports are 2-cycle latency and a 4-deep FIFO."
             //   "Local master ports have one register slice with 1-cycle
             //    latency and a 2-deep FIFO."
+            //
+            // External and local master ports differ: local master is 2-deep
+            // (DMA / core consumer side), external master is 4-deep (drives
+            // the N/S/E/W wires to neighbouring tiles). We model both.
             //
             // (Don't confuse with AM027, which describes the 64-bit AIE2P
             // / Strix stream switch. AM027's "four double-words of
@@ -207,6 +212,7 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // direction.)
             local_slave_fifo_depth: 4,
             local_master_fifo_depth: 2,
+            external_master_fifo_depth: 4,
             local_to_local_latency: 3,
             local_to_external_latency: 4,
             external_to_external_latency: 4,
