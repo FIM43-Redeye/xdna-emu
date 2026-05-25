@@ -62,6 +62,14 @@ impl DeviceState {
         let tile_kind = tile_kind_from_row(tile_addr.row);
         let subsystem = subsystem_from_offset(tile_addr.offset, tile_kind);
 
+        // Wake-on-event: register writes into a gated module's address
+        // range wake the adaptive clock-gate counter for that module
+        // (AM025 adaptive gating).  ClockControl writes are themselves
+        // the ungate mechanism and handle their own counter reset.
+        if subsystem != SubsystemKind::ClockControl {
+            self.wake_adaptive_for_subsystem(tile_addr.col, tile_addr.row, subsystem);
+        }
+
         match subsystem {
             SubsystemKind::Lock => {
                 if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
@@ -210,6 +218,11 @@ impl DeviceState {
             subsystem
         );
 
+        // Wake-on-event: parallel to write_register.  See its comment.
+        if subsystem != SubsystemKind::ClockControl {
+            self.wake_adaptive_for_subsystem(tile_addr.col, tile_addr.row, subsystem);
+        }
+
         if self.array.get_mut(tile_addr.col, tile_addr.row).is_none() {
             log::trace!("mask_write_register: tile({},{}) not in array", tile_addr.col, tile_addr.row);
             return Ok(());
@@ -357,6 +370,13 @@ impl DeviceState {
         let tile_kind = tile_kind_from_row(tile_addr.row);
         let subsystem = subsystem_from_offset(tile_addr.offset, tile_kind);
 
+        // Wake-on-event: bulk DMA writes also count.  See write_register's
+        // comment.  PM/DM bulk writes here wake DMA via the Memory clock
+        // bit (compute/memtile) -- same as the per-word path.
+        if subsystem != SubsystemKind::ClockControl {
+            self.wake_adaptive_for_subsystem(tile_addr.col, tile_addr.row, subsystem);
+        }
+
         match subsystem {
             SubsystemKind::DataMemory => {
                 // Write to data memory
@@ -402,6 +422,30 @@ impl DeviceState {
         }
 
         Ok(())
+    }
+
+    /// Wake the adaptive clock-gate idle counter that corresponds to the
+    /// module being addressed.  Called from every register-bus entry
+    /// (write_register, mask_write_register, dma_write) so silicon's
+    /// wake-on-access semantics for AM025 adaptive gating apply to all
+    /// access forms.
+    ///
+    /// Compute and memtile share the Memory clock bit between DMA, Lock,
+    /// and DataMemory, so a write to any of them wakes the same
+    /// (single) DMA adaptive counter we track for that tile.  Shim
+    /// has separate DMA (NoC) and SS bits; the Dma arm covers that.
+    /// Processor/ProgramMemory wake the Core module, which has no
+    /// adaptive counter today and is therefore skipped.
+    fn wake_adaptive_for_subsystem(&mut self, col: u8, row: u8, subsystem: SubsystemKind) {
+        match subsystem {
+            SubsystemKind::Dma | SubsystemKind::Lock | SubsystemKind::DataMemory => {
+                self.array.clock_mut().wake_adaptive_dma(col, row);
+            }
+            SubsystemKind::StreamSwitch => {
+                self.array.clock_mut().wake_adaptive_ss(col, row);
+            }
+            _ => {}
+        }
     }
 }
 

@@ -254,3 +254,124 @@ fn adaptive_dma_gate_releases_when_task_queued_during_idle() {
          otherwise step_all_dma deadlocks the task queue"
     );
 }
+
+// ---- Wake-on-event integration tests (Wake 1: register write) ----
+
+/// Helper: ungate everything, set abort_period=3 on (col, row), idle until
+/// both DMA and SS adaptive gates engage.  Caller then exercises a wake
+/// path and asserts the corresponding gate has released.
+fn idle_until_both_gates_engaged(state: &mut DeviceState, host: &mut HostMemory, col: u8, row: u8) {
+    state.array.clock_mut().ungate_all();
+    state.array.clock_mut().set_adaptive_abort_period(col, row, 3);
+    for _ in 0..16 {
+        state.array.step_data_movement(host);
+    }
+    assert!(state.array.clock().is_adaptive_dma_engaged(col, row), "precondition: DMA gate engaged");
+    assert!(state.array.clock().is_adaptive_ss_engaged(col, row), "precondition: SS gate engaged");
+}
+
+#[test]
+fn write_to_dma_bd_register_wakes_dma_adaptive_gate() {
+    let mut state = DeviceState::new_npu1();
+    let mut host = HostMemory::new();
+    let (col, row) = (2u8, 3u8); // compute tile
+
+    idle_until_both_gates_engaged(&mut state, &mut host, col, row);
+
+    // 0x1D000 = compute DMA BD0 word 0.  Classified as SubsystemKind::Dma
+    // by subsystem_from_offset.
+    state.write_tile_register(col, row, 0x1D000, 0xDEAD_BEEF);
+
+    assert!(
+        !state.array.clock().is_adaptive_dma_engaged(col, row),
+        "DMA register write must wake the DMA adaptive gate"
+    );
+    // SS counter is unrelated and must stay engaged.
+    assert!(
+        state.array.clock().is_adaptive_ss_engaged(col, row),
+        "DMA register write must not affect SS adaptive gate"
+    );
+}
+
+#[test]
+fn write_to_lock_register_wakes_dma_adaptive_gate() {
+    let mut state = DeviceState::new_npu1();
+    let mut host = HostMemory::new();
+    let (col, row) = (2u8, 3u8);
+
+    idle_until_both_gates_engaged(&mut state, &mut host, col, row);
+
+    // 0x1F000 = compute Lock0_value.  Classified as SubsystemKind::Lock.
+    // Lock shares the Memory clock bit with DMA on compute, so a lock
+    // write must wake the DMA adaptive counter.
+    state.write_tile_register(col, row, 0x1F000, 0x0);
+
+    assert!(
+        !state.array.clock().is_adaptive_dma_engaged(col, row),
+        "Lock register write must wake the DMA adaptive gate (shared Memory clock bit)"
+    );
+    assert!(
+        state.array.clock().is_adaptive_ss_engaged(col, row),
+        "Lock register write must not affect SS adaptive gate"
+    );
+}
+
+#[test]
+fn write_to_stream_switch_register_wakes_ss_adaptive_gate() {
+    let mut state = DeviceState::new_npu1();
+    let mut host = HostMemory::new();
+    let (col, row) = (2u8, 3u8);
+
+    idle_until_both_gates_engaged(&mut state, &mut host, col, row);
+
+    // 0x3FF00 = compute stream switch master config base.
+    state.write_tile_register(col, row, 0x3FF00, 0x0);
+
+    assert!(
+        !state.array.clock().is_adaptive_ss_engaged(col, row),
+        "SS register write must wake the SS adaptive gate"
+    );
+    assert!(
+        state.array.clock().is_adaptive_dma_engaged(col, row),
+        "SS register write must not affect DMA adaptive gate"
+    );
+}
+
+#[test]
+fn write_to_clock_control_register_does_not_emit_wake() {
+    // Clock-control writes are themselves the ungate mechanism and have
+    // their own counter-reset logic in clock_control::write_register
+    // (column-ungate / module-ungate transitions).  The wake-on-event
+    // dispatcher path must NOT also wake them, because a clock-control
+    // write to a *non-transitioning* offset (e.g., re-writing the same
+    // value) should leave the counters alone.
+    let mut state = DeviceState::new_npu1();
+    let mut host = HostMemory::new();
+    let (col, row) = (2u8, 3u8);
+
+    // Ungate column 2 first so the rest of the test runs in the
+    // ungated-counter regime.
+    state.write_tile_register(col, 0, 0x000F_FF20, 0x1);
+    // Now engage the gates.
+    state.array.clock_mut().set_adaptive_abort_period(col, row, 3);
+    for _ in 0..16 {
+        state.array.step_data_movement(&mut host);
+    }
+    assert!(state.array.clock().is_adaptive_dma_engaged(col, row));
+    assert!(state.array.clock().is_adaptive_ss_engaged(col, row));
+
+    // Re-write Column_Clock_Control with the same value -- no transition.
+    // Both counters must stay engaged: the dispatcher does NOT route this
+    // through the wake path, and clock_control::write_register's reset
+    // logic only fires on a 0->1 transition.
+    state.write_tile_register(col, 0, 0x000F_FF20, 0x1);
+
+    assert!(
+        state.array.clock().is_adaptive_dma_engaged(col, row),
+        "non-transitioning clock-control write must not wake gates"
+    );
+    assert!(
+        state.array.clock().is_adaptive_ss_engaged(col, row),
+        "non-transitioning clock-control write must not wake gates"
+    );
+}
