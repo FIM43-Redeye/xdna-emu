@@ -89,6 +89,10 @@ name = "vcd-compare"
 path = "src/bin/vcd_compare.rs"
 required-features = ["analysis"]
 
+[[bin]]
+name = "extract-perf-ctrl"
+path = "src/bin/extract_perf_ctrl.rs"
+
 [profile.release]
 lto = "thin"
 codegen-units = 8

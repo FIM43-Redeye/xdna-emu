@@ -260,19 +260,46 @@ consume `events.json` directly without re-decoding.
 **Estimate**: ~15 min of shell-script work, two insertion sites
 (`run_one_hardware`, `run_one_bridge`).
 
-### G2. CDO PERF_CTRL extraction utility
+### G2. PERF_CTRL extraction utilities
 
-Item #9 analysis requires knowing each test's PERF_CTRL0 /
-PERF_CTRL1 configuration per tile. Today we have no direct readout.
+Item #9 analysis benefits from knowing each test's PERF_CTRL0 /
+PERF_CTRL1 / Counter*_Event_Value configuration per tile.
 
-**Proposal**: small Python tool at `tools/extract-perf-ctrl.py`
-that reads an xclbin, walks the CDO writes, and emits per-tile
-`{tile_id: {perf_ctrl0: ..., perf_ctrl1: ..., event_thresholds: [...]}}`.
-Doesn't need to be complete -- only needs to handle the writes
-that hit PERF_CTRL register offsets. Use the existing aie-rt
-register offset definitions and our regdb JSON to identify them.
+**Finding (2026-05-25)**: IRON-style tests configure perf counters
+at runtime via the NPU instruction stream, NOT via CDO at xclbin
+load. The diag corpus reference test
+`_diag_phase_b_add_one_instrumented` has zero PERF_CTRL writes in
+its xclbin CDO; the configuration lives in the post-injection
+MLIR's `aie.trace.config @perf_*` blocks (which `aiecc` then
+lowers to instruction-stream control packets).
 
-**Estimate**: ~1 hr of Python.
+Two tools, complementary:
+
+1. `tools/extract-perf-ctrl.py` -- **primary path**. Parses the
+   post-injection MLIR (e.g.,
+   `build/test/npu-xrt/<test>/traced/aie_traced.mlir`) for
+   `aie.trace.reg register = "Performance_..." value = N` writes
+   inside `aie.trace.config` blocks. Works for any test that goes
+   through `mlir-trace-inject.py`. On the diag test yields:
+   `(0,2)/core: {Performance_Counter2_Event_Value: 1024, ...}`,
+   matching Phase C's empirically-observed ~1024-cyc spacing.
+
+2. `src/bin/extract_perf_ctrl.rs` -- **fallback** for tests that
+   DO configure perf via CDO at xclbin load. Reads via our
+   existing parser, filters on the AM025 PERF_CTRL register offset
+   ranges (core 0x031500-0x03158C, memory 0x011000-0x011084,
+   memory_tile 0x091000-0x09108C, shim 0x031000-0x031084), emits
+   per-tile JSON. Returns empty for IRON tests by design.
+
+For the campaign's item #9 analysis, the primary path is
+sufficient: the MLIR carries the configured PERF_THRESHOLD
+explicitly, so we don't need to back it out from interval analysis.
+Interval analysis still serves as cross-validation -- the median
+HW LOCK_STALL inter-event interval should match
+Performance_Counter*_Event_Value.
+
+**Actual time**: ~2 hr (1.5 hr Rust + 30 min Python pivot after
+finding the CDO doesn't carry the config for IRON tests).
 
 ### G3. soc-aware trace comparator (the persistent version)
 
