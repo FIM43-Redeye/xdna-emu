@@ -10,6 +10,7 @@
 pub mod compare;
 pub mod compare_mode2;
 pub mod mode2_decode;
+pub mod stages;
 pub mod store;
 pub mod vcd;
 
