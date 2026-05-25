@@ -353,6 +353,7 @@ not the emission cadence.
 
 **Cross-references**:
 - Detail: [`docs/superpowers/findings/2026-05-25-trace-ts-vs-soc-measurement-gotcha.md`](../superpowers/findings/2026-05-25-trace-ts-vs-soc-measurement-gotcha.md)
+- Execution plan: [`hw-measurement-campaign.md`](hw-measurement-campaign.md)
 - Currently P3 (measurement-discipline-only); P2 is the real fix
 - Code: `src/interpreter/core/interpreter.rs:97-101`,
   `src/interpreter/core/interpreter.rs:728-743`,
@@ -425,6 +426,7 @@ c. **aietools SystemC reading**: the
 
 **Cross-references**:
 - Detail: [`docs/superpowers/findings/2026-05-25-shim-stage1a-1b-structural-limit.md`](../superpowers/findings/2026-05-25-shim-stage1a-1b-structural-limit.md)
+- Execution plan: [`hw-measurement-campaign.md`](hw-measurement-campaign.md)
 - Phase C: `docs/archive/findings/2026-05-10-phase-c-stage-attribution.md`
 - Parent item: #5 (NoC / AXI / DMA pipeline timings, DEFERRED)
 - Code: `crates/xdna-archspec/src/model_builder.rs:189`,
