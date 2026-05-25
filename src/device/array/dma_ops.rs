@@ -240,9 +240,18 @@ impl TileArray {
         any_active
     }
 
-    /// Check if any DMA engine has active transfers.
+    /// Check if any DMA engine has anything to do this cycle.
+    ///
+    /// Returns true if any channel on any engine is FSM-active, has a queued
+    /// BD, or has a non-empty task queue. The TDR uses this as the
+    /// "DMA still has reason to run" signal feeding Quiescent / completion
+    /// classification, and the FFI exports it as EngineSignals.any_dma_active.
+    /// Using FSM-only here was a blindspot: a channel with a queued task and
+    /// FSM=Idle (the moment after enqueue, before the next step promotes it
+    /// to BdSetup) reported inactive, letting TDR classify the array as
+    /// quiescent while work was actually pending.
     pub fn any_dma_active(&self) -> bool {
-        self.dma_engines.iter().any(|e| e.any_channel_active())
+        self.dma_engines.iter().any(|e| e.any_channel_has_pending_work())
     }
 
     /// Check if any DMA is actually making progress (not just waiting for locks).

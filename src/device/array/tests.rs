@@ -125,6 +125,24 @@ fn test_no_active_dma_initially() {
 }
 
 #[test]
+fn test_any_dma_active_includes_queued_tasks() {
+    // A channel with FSM=Idle but a queued task must report active --
+    // otherwise TDR's quiescent / natural-completion path can fire while
+    // work is still pending (sibling fix to bb3aad5's Phase-5 tick).
+    use crate::device::dma::BdConfig;
+
+    let mut array = TileArray::npu1();
+    assert!(!array.any_dma_active(), "fresh array reports no DMA");
+
+    let engine = array.dma_engine_mut(1, 2).unwrap();
+    engine.configure_bd(0, BdConfig::simple_1d(0x100, 32)).unwrap();
+    engine.enqueue_task(2, 0, 0, false);
+    // FSM has NOT been stepped yet -- channel is Idle with a queued task.
+
+    assert!(array.any_dma_active(), "queued task on Idle FSM must register as active");
+}
+
+#[test]
 fn test_dma_reset() {
     use crate::device::dma::BdConfig;
 
