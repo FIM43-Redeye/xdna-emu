@@ -305,11 +305,29 @@ committed before moving on.
    (see top of doc + finding link).
 4. **Existing-corpus baseline run.** Six tests, HW side only, with
    `--retain-traces`. Outputs per-test events.json + trace_buffer.bin.
+   **Done 2026-05-25** (chess on 5 tests, plus a top-up peano run on
+   `objectfifo_repeat/simple_repeat` which is peano-only by REQUIRES).
+   - Usable HW captures (events.json + trace_raw.bin): 4 tests --
+     `_diag_phase_b_add_one_instrumented`, `add_one_using_dma`,
+     `add_one_objFifo`, `add_one_objFifo_elf`.
+   - Empty trace_raw.bin (all zeros) on `dynamic_object_fifo/ping_pong`
+     and `objectfifo_repeat/simple_repeat`. Functional PASS, trace
+     prep reports OK, but BO never receives data on HW.  Both tests
+     compile against `aie2.mlir` (not `aie_arch.mlir`) and have
+     `placement.origin_col=0`; suspected trace-BO address patch
+     mismatch in the C++ launcher.  Tracked as a Phase B gap, separate
+     from this campaign.
+   - G1 helper fix landed in the same session: the predecode helper
+     hardcoded `aie_arch.mlir.prj/input_with_addresses.mlir`, so the
+     four corpus tests with that layout got events.json automatically
+     and the two with `aie2.mlir.prj` did not. Helper now discovers
+     `input_with_addresses.mlir` under `<test>/<compiler>/*.prj/`.
 5. **Item #10 first-pass regression.** Mine the existing-corpus
    data for BD size variation. Linear fit per (access pattern,
    bank, channel). If R^2 > 0.95 across the corpus and residual on
    `_diag_phase_b` validation gate looks tractable, skip the
-   parameterized kernel.
+   parameterized kernel.  **Open**: 4 usable tests may be too narrow
+   a BD-size span; revisit step 6 early if so.
 6. **Decision point.** Do we need the parameterized calibration
    kernel for item #10?
 7. **(Conditional) Build calibration kernels.** Only if step 6

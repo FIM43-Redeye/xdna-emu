@@ -2375,9 +2375,13 @@ export -f _bin_to_events_json
 _predecode_events_next_to_trace() {
   local trace_dir="$1" name="$2" compiler="$3"
   local bin="$trace_dir/trace_raw.bin"
-  local mlir="$BUILD_BASE/$name/${compiler}/aie_arch.mlir.prj/input_with_addresses.mlir"
   local out="$trace_dir/events.json"
-  [[ -f "$bin" && -f "$mlir" ]] || return 0
+  [[ -f "$bin" ]] || return 0
+  # Discover the aiecc-lowered MLIR; the .prj dir name varies by test
+  # (aie_arch.mlir.prj for the diag corpus, aie2.mlir.prj for objfifo).
+  local mlir
+  mlir="$(find "$BUILD_BASE/$name/${compiler}" -mindepth 2 -maxdepth 2 -name 'input_with_addresses.mlir' -print -quit 2>/dev/null || true)"
+  [[ -n "$mlir" && -f "$mlir" ]] || return 0
   _bin_to_events_json "$bin" "$mlir" "$out" || true
 }
 export -f _predecode_events_next_to_trace
