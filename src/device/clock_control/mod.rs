@@ -298,6 +298,17 @@ impl ClockController {
 
     /// Returns true iff the DMA adaptive gate is currently engaged
     /// (idle cycle counter has crossed 2^abort_period).
+    ///
+    /// Observable signal only -- not consumed as an execution-gating
+    /// decision today. Silicon stops the clocked domain on engagement
+    /// and resumes it on external wake events (register writes touching
+    /// the gated module, stream beats, lock-value changes, control
+    /// packets). The emulator does not yet model those wake paths, so
+    /// using this to skip step_all_dma produces stable deadlocks
+    /// (ctrl_packet_reconfig and the lock-test clusters wedged on the
+    /// wake-after-host-stall pattern). Counter + tick + query kept for
+    /// trace / events / future re-enablement once wake-on-event is
+    /// built (cycle-accuracy-mission.md tracks).
     pub fn is_adaptive_dma_engaged(&self, col: u8, row: u8) -> bool {
         let Some(s) = self.adaptive.get(&(col, row)) else {
             return false;
@@ -307,6 +318,7 @@ impl ClockController {
     }
 
     /// Returns true iff the SS adaptive gate is currently engaged.
+    /// Same observability-only stance as `is_adaptive_dma_engaged`.
     pub fn is_adaptive_ss_engaged(&self, col: u8, row: u8) -> bool {
         let Some(s) = self.adaptive.get(&(col, row)) else {
             return false;

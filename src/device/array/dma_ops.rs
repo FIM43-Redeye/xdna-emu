@@ -91,20 +91,22 @@ impl TileArray {
     /// For MemTiles, constructs neighbor lock access from adjacent columns.
     ///
     /// Returns `None` when the tile is out of bounds OR when the DMA module is
-    /// clock-gated (column gate or module-level MCC gate) or when the adaptive
-    /// DMA gate is engaged.
+    /// clock-gated (column gate or module-level MCC gate). Adaptive engagement
+    /// is tracked but does not skip execution today -- see
+    /// is_adaptive_dma_engaged docstring for the wake-on-event gap.
     pub fn step_dma(&mut self, col: u8, row: u8, host_memory: &mut HostMemory) -> Option<DmaResult> {
         if col >= self.cols || row >= self.rows {
             return None;
         }
-        // Module gate check: skip if column is gated, DMA module is gated, or
-        // the adaptive DMA gate has engaged due to sustained idleness.
+        // Module gate check: skip if column is gated or the DMA module
+        // is gated. Adaptive engagement is tracked but no longer used to
+        // skip execution -- silicon resumes the clocked domain on external
+        // wake events that this emulator does not model yet, so consuming
+        // the adaptive gate here deadlocks lock-mediated tests. See
+        // is_adaptive_dma_engaged docstring for the full rationale.
         {
             use crate::device::clock_control::ModuleKind;
-            if !self.clock.is_column_active(col)
-                || !self.clock.is_module_active(col, row, ModuleKind::Dma)
-                || self.clock.is_adaptive_dma_engaged(col, row)
-            {
+            if !self.clock.is_column_active(col) || !self.clock.is_module_active(col, row, ModuleKind::Dma) {
                 return None;
             }
         }
@@ -164,8 +166,8 @@ impl TileArray {
     ///
     /// Returns true if any DMA engine made progress this cycle (InProgress or
     /// WaitingForLock). Module gate check: tiles whose DMA module is
-    /// clock-gated (column gate OR module-level MCC OR adaptive DMA gate) are
-    /// skipped.
+    /// clock-gated (column gate OR module-level MCC) are skipped. Adaptive
+    /// engagement does not skip today -- see is_adaptive_dma_engaged.
     pub fn step_all_dma(&mut self, host_memory: &mut HostMemory) -> bool {
         use crate::device::clock_control::ModuleKind;
 
@@ -197,10 +199,11 @@ impl TileArray {
                 continue;
             }
 
-            // Adaptive gate check (bottom tier): skip if idle long enough.
-            if clock.is_adaptive_dma_engaged(col, row) {
-                continue;
-            }
+            // Adaptive engagement is tracked (see Phase 5 tick in
+            // step_data_movement and is_adaptive_dma_engaged) but no
+            // longer skips execution: silicon resumes on external wake
+            // events the emulator doesn't model yet, so skipping here
+            // produces stable deadlocks once the gate engages.
 
             // Reset bank tracking for this cycle
             tiles[i].reset_bank_tracking();

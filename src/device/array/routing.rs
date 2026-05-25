@@ -37,8 +37,9 @@ impl TileArray {
     /// This is necessary for pass-through routing where data enters a tile from
     /// one direction and exits to another.
     ///
-    /// Tiles whose StreamSwitch module is clock-gated (column gate, MCC bit 0,
-    /// or adaptive SS gate engaged) are skipped.
+    /// Tiles whose StreamSwitch module is clock-gated (column gate or
+    /// MCC bit 0) are skipped. Adaptive SS engagement is tracked but
+    /// does not skip execution today -- see is_adaptive_ss_engaged.
     ///
     /// Returns the total number of words forwarded across all tiles.
     pub fn step_tile_switches(&mut self) -> usize {
@@ -58,10 +59,11 @@ impl TileArray {
             if !self.clock.is_module_active(col, row, ModuleKind::StreamSwitch) {
                 continue;
             }
-            // Adaptive gate (bottom tier).
-            if self.clock.is_adaptive_ss_engaged(col, row) {
-                continue;
-            }
+            // Adaptive engagement is tracked (see is_adaptive_ss_engaged
+            // docstring) but does not skip execution -- the emulator
+            // lacks wake-on-event coverage for stream beats / port pushes
+            // that silicon uses to resume the SS clocked domain, so
+            // skipping here deadlocks routing once the gate engages.
 
             let forwarded = self.tiles[i].stream_switch.step();
             total_forwarded += forwarded;

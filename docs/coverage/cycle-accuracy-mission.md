@@ -218,6 +218,58 @@ Mode-2 / VCD comparators see the divergence at the event level.
 
 **Cross-references**: the cycle-accuracy gaps tracked in this document
 
+### 8. Adaptive clock-gate execution consumption (wake-on-event)
+
+**Status**: DEFERRED. Counter + tick + query shipped; execution
+consumption removed 2026-05-25 pending wake-on-event coverage.
+
+**What**: AM025 adaptive clock-gating engages a per-tile-module
+gate after `2^abort_period` idle cycles (default 128). Silicon
+stops the clocked domain on engagement and resumes it on external
+wake events (register writes touching the gated module, stream
+beats arriving, lock-value changes, control packets). We model
+the counter and the engagement signal but not the wake paths, so
+consuming `is_adaptive_dma_engaged` / `is_adaptive_ss_engaged` to
+skip `step_all_dma` / `step_tile_switches` produces stable
+deadlocks on lock-mediated tests where a tile sits idle through
+a host-side stall and then needs to resume on a control-packet-
+driven task enqueue.
+
+**Investigation**: surfaced 2026-05-25 via the
+`ctrl_packet_reconfig` family (4 variants), `core_dmas` /
+`memtile_dmas` / `tile_dmas` `dma_configure_task_lock` and
+`blockwrite_using_locks` clusters all wedging in
+`AcquiringLock` with `lock_value=0`, all unblocked when adaptive
+consumption is removed. Diagnosed with bridge-sweep correlation
+against the pre-clock-control baseline at `20260521`.
+
+**Resolution**: keep counter + tick + query (useful for trace /
+events / future re-enablement); stop using the engagement signal
+to skip execution. `any_channel_has_pending_work` lands alongside
+to make the Phase-5 tick honor queued-but-FSM-Idle channels --
+necessary for the counter to be correct even without consumption.
+
+**Re-enablement path**: enumerate every silicon wake event and
+reset the adaptive counter on that tile/module from the
+corresponding emulator code path. Sketched set:
+
+- Register write into a gated module's address range (most
+  immediate -- this is the control-packet wake path).
+- Stream beat push into a slave port of a gated SS module.
+- Lock-value change reaching a tile whose DMA is gated and has
+  channels in `AcquiringLock`.
+- Cascade transfer arriving at a gated compute tile.
+
+Each wake event is one-line add at the emit site. Verification:
+re-enable consumption (revert the dma_ops + routing edits in the
+2026-05-25 commit), confirm the originally-wedged bridge tests
+still pass.
+
+**Cross-references**:
+- Spec: `docs/superpowers/specs/2026-05-24-clock-control-design.md`
+- Coverage: `clock_control` entry's `Partial { missing: ... }`
+  third clause
+
 ## aietools SystemC angle
 
 The `*.osci.so` libraries in `amd-unified-software/aietools/lib/lnx64.o/`
