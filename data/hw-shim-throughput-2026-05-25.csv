@@ -1,0 +1,13 @@
+n_words,compiler,side,mm2s_duration_cyc,s2mm_duration_cyc
+8,chess,hw,1854,830
+16,chess,hw,2064,845
+32,chess,hw,963,872
+64,chess,hw,1741,696
+128,chess,hw,1207,862
+256,chess,hw,838,726
+512,chess,hw,1314,1001
+1024,chess,hw,1247,1187
+2048,chess,hw,3421,2217
+4096,chess,hw,5304,4261
+8192,chess,hw,9121,8357
+16384,chess,hw,17963,16525

@@ -323,26 +323,27 @@ committed before moving on.
      and the two with `aie2.mlir.prj` did not. Helper now discovers
      `input_with_addresses.mlir` under `<test>/<compiler>/*.prj/`.
 5. **Item #10 first-pass regression.** Mine the existing-corpus
-   data for BD size variation. Linear fit per (access pattern,
-   bank, channel). If R^2 > 0.95 across the corpus and residual on
-   `_diag_phase_b` validation gate looks tractable, skip the
-   parameterized kernel.  **Open**: 4 usable tests may be too narrow
-   a BD-size span; revisit step 6 early if so.
+   data for BD size variation. **Closed -- infeasible**: all four
+   working corpus tests have identical 64-word shim BDs.  10x
+   duration variance is downstream-readiness, not BD-size axis.
 6. **Decision point.** Do we need the parameterized calibration
-   kernel for item #10?
-7. **(Conditional) Build calibration kernels.** Only if step 6
-   says yes.
-8. **(Conditional) Second-pass HW run.** Sweep the new calibration
-   kernels.
-9. **Close-out finding.** Write `findings/<date>-shim-throughput-model.md`
-   landing model parameters with the data backing them.
+   kernel for item #10?  **Yes** -- forced by step 5 closure.
+7. **Build calibration kernels.**  Done 2026-05-25.  Kernel at
+   `mlir-aie/test/npu-xrt/_diag_shim_throughput_sweep/n64/`
+   (untracked in mlir-aie, same convention as `_diag_phase_b`);
+   sibling sizes via `xdna-emu/scripts/gen-shim-throughput-sweep.sh`.
+8. **Second-pass HW run.**  Done 2026-05-25.  12 BD sizes
+   {8, 16, ..., 16384} swept on chess/HW.  Linear fit at
+   N >= 1024: MM2S 1.05 cyc/word + 747 cyc cold-start,
+   S2MM 1.00 cyc/word + 171 cyc cold-start, R^2 0.996 / 1.000.
+9. **Close-out finding.**  Done 2026-05-25, at
+   [`../superpowers/findings/2026-05-25-shim-throughput-1-word-per-cycle.md`](../superpowers/findings/2026-05-25-shim-throughput-1-word-per-cycle.md).
 10. **EMU modeling work** (downstream, not part of this campaign).
     Implement the throughput-bound streaming in DMA stepping.
     Re-run the validation gate from item #10.
 
-Steps 1-3 are done. Steps 4-9 are the campaign proper. Step 10 is
-the cycle-accuracy mission's continuation, gated on the campaign's
-outputs.
+Campaign steps 1-9 are done.  Step 10 is the cycle-accuracy
+mission's continuation, gated on this campaign's outputs.
 
 ## See also
 

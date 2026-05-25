@@ -1,0 +1,85 @@
+{
+  "results_dir": "/home/triple/npu-work/xdna-emu/build/bridge-test-results/20260525",
+  "compiler": "chess",
+  "side": "hw",
+  "rows": [
+    {
+      "n": 8,
+      "mm2s_dur": 1854,
+      "s2mm_dur": 830
+    },
+    {
+      "n": 16,
+      "mm2s_dur": 2064,
+      "s2mm_dur": 845
+    },
+    {
+      "n": 32,
+      "mm2s_dur": 963,
+      "s2mm_dur": 872
+    },
+    {
+      "n": 64,
+      "mm2s_dur": 1741,
+      "s2mm_dur": 696
+    },
+    {
+      "n": 128,
+      "mm2s_dur": 1207,
+      "s2mm_dur": 862
+    },
+    {
+      "n": 256,
+      "mm2s_dur": 838,
+      "s2mm_dur": 726
+    },
+    {
+      "n": 512,
+      "mm2s_dur": 1314,
+      "s2mm_dur": 1001
+    },
+    {
+      "n": 1024,
+      "mm2s_dur": 1247,
+      "s2mm_dur": 1187
+    },
+    {
+      "n": 2048,
+      "mm2s_dur": 3421,
+      "s2mm_dur": 2217
+    },
+    {
+      "n": 4096,
+      "mm2s_dur": 5304,
+      "s2mm_dur": 4261
+    },
+    {
+      "n": 8192,
+      "mm2s_dur": 9121,
+      "s2mm_dur": 8357
+    },
+    {
+      "n": 16384,
+      "mm2s_dur": 17963,
+      "s2mm_dur": 16525
+    }
+  ],
+  "fits": [
+    {
+      "direction": "mm2s",
+      "n_points": 12,
+      "cold_start_cyc": 1155.4306515903359,
+      "cyc_per_word": 1.0125711898936498,
+      "words_per_cyc": 0.9875848829009543,
+      "r_squared": 0.988689093819041
+    },
+    {
+      "direction": "s2mm",
+      "n_points": 12,
+      "cold_start_cyc": 569.297079638819,
+      "cyc_per_word": 0.9629864177147184,
+      "words_per_cyc": 1.0384362454177902,
+      "r_squared": 0.9976067887698813
+    }
+  ]
+}

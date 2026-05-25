@@ -23,7 +23,7 @@ if [[ ! -d "$SRC" ]]; then
   exit 1
 fi
 
-SIZES=(8 16 32 128 256 512 1024)
+SIZES=(8 16 32 128 256 512 1024 2048 4096 8192 16384)
 
 for N in "${SIZES[@]}"; do
   DST="$SWEEP_DIR/n${N}"
