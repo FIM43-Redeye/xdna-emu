@@ -649,6 +649,18 @@ impl DmaEngine {
         self.channels.iter().any(|ch| ch.is_active())
     }
 
+    /// Check if any channel has anything to do this cycle -- FSM mid-flight
+    /// OR a BD queued OR a task waiting. The adaptive DMA gate's idle
+    /// detector must use this: a channel with FSM=Idle but task_queue
+    /// non-empty is about to step out of Idle on the next cycle, and
+    /// silicon-accurate idleness must reflect that pending work.
+    /// Otherwise the gate engages, step_all_dma skips the tile, the
+    /// Idle->BdSetup transition never fires, and the task queue
+    /// deadlocks.
+    pub fn any_channel_has_pending_work(&self) -> bool {
+        self.channels.iter().any(|ch| ch.has_pending_work())
+    }
+
     /// Get channel state.
     pub fn channel_state(&self, channel: ChannelId) -> ChannelState {
         let ch_idx = channel as usize;

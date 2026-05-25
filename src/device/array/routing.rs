@@ -162,9 +162,13 @@ impl TileArray {
                 }
                 for row in 0..self.rows {
                     // DMA module counter: advance only if the DMA module is ungated.
+                    // Use has_pending_work, not is_active: a channel sitting in
+                    // FSM=Idle with a queued task counts as "not yet idle" --
+                    // otherwise the gate engages before the channel can promote
+                    // Idle->BdSetup and step_all_dma deadlocks the task queue.
                     if self.clock.is_module_active(col, row, ModuleKind::Dma) {
                         let idx = self.tile_index(col, row);
-                        let tile_dma_active = self.dma_engines[idx].any_channel_active();
+                        let tile_dma_active = self.dma_engines[idx].any_channel_has_pending_work();
                         self.clock.tick_adaptive_dma(col, row, tile_dma_active);
                     }
 

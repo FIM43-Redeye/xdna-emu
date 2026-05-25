@@ -204,3 +204,53 @@ fn adaptive_dma_counter_advances_via_step_data_movement() {
          with abort_period=3 (threshold=8)"
     );
 }
+
+#[test]
+fn adaptive_dma_gate_releases_when_task_queued_during_idle() {
+    // Reproduces the ctrl_packet_reconfig deadlock: tile sits idle long enough
+    // for the adaptive DMA gate to engage; control packet then enqueues a task
+    // on an Idle-FSM channel. If the gate keeps engaging on subsequent ticks
+    // (because the idle detector only watches FSM, not queued tasks),
+    // step_all_dma skips the tile forever and the queued task never starts.
+    //
+    // Setup: same as adaptive_dma_counter_advances_via_step_data_movement
+    // (ungate, abort_period=3, step until engaged), then enqueue a task
+    // without taking another step.  One more step_data_movement must release
+    // the gate -- the Phase-5 tick now sees pending work via
+    // any_channel_has_pending_work() even with FSM=Idle.
+    let mut state = DeviceState::new_npu1();
+    let mut host = HostMemory::new();
+    let col: u8 = 2;
+    let row: u8 = 3;
+
+    state.array.clock_mut().ungate_all();
+    state.array.clock_mut().set_adaptive_abort_period(col, row, 3);
+
+    // Idle until the adaptive gate engages.
+    for _ in 0..10 {
+        state.array.step_data_movement(&mut host);
+    }
+    assert!(
+        state.array.clock().is_adaptive_dma_engaged(col, row),
+        "pre-condition: gate must be engaged before we enqueue"
+    );
+
+    // Enqueue a task on MM2S ch0 (absolute index 2). FSM stays Idle until
+    // the next step promotes Idle->BdSetup.
+    {
+        let dma = state.array.dma_engine_mut(col, row).expect("compute tile DMA");
+        dma.configure_bd(0, BdConfig::simple_1d(0x100, 64)).unwrap();
+        dma.enqueue_task(2, 0, 0, false);
+    }
+
+    // One step_data_movement: Phase 5 must observe pending work and reset
+    // the counter, releasing the gate even though step_all_dma still
+    // skipped this tile (gate was engaged at the time of step_all_dma).
+    state.array.step_data_movement(&mut host);
+
+    assert!(
+        !state.array.clock().is_adaptive_dma_engaged(col, row),
+        "gate must release after a queued task is observed by Phase 5; \
+         otherwise step_all_dma deadlocks the task queue"
+    );
+}
