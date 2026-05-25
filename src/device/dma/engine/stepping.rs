@@ -624,8 +624,7 @@ impl DmaEngine {
             match action {
                 PadAction::Zero => {
                     let should_assert_tlast = is_last_word && !tlast_suppress;
-                    self.stream_out
-                        .push_back(StreamData { data: 0, tlast: should_assert_tlast, channel });
+                    self.push_stream_out(StreamData { data: 0, tlast: should_assert_tlast, channel });
                     transfer.advance(4);
                     self.channels[ch_idx].stats.bytes_transferred += 4;
                     TransferCycleResult::Continue
@@ -829,11 +828,7 @@ impl DmaEngine {
         }
 
         if let Some(header_word) = transfer.generate_packet_header() {
-            self.stream_out.push_back(StreamData {
-                data: header_word,
-                tlast: false,
-                channel: transfer.channel,
-            });
+            self.push_stream_out(StreamData { data: header_word, tlast: false, channel: transfer.channel });
             transfer.mark_packet_header_sent();
             let (hdr, _) = crate::device::stream_switch::PacketHeader::decode(header_word);
             log::info!(
@@ -876,8 +871,10 @@ impl DmaEngine {
                 // saturated the downstream slave port FIFO depth. Models
                 // STALL_STRM_STARV on real silicon, where MM2S blocks
                 // until the consumer (next switch hop / S2MM / etc.)
-                // pulls a word free.
-                if self.stream_out.len() >= self.output_fifo_capacity() {
+                // pulls a word free.  Per-channel: each MM2S channel has
+                // its own slave-port FIFO, so one stalled channel does
+                // not gate another.
+                if !self.can_push_stream_out_for_channel(channel) {
                     return TransferResult::stalled();
                 }
                 if self.transfer_mm2s(addr, bytes, channel, is_last, tlast_suppress, tile, neighbors) {
@@ -936,8 +933,8 @@ impl DmaEngine {
                 // stream port stalls when the next slave FIFO is full,
                 // which is what propagates the consumer drain rate (memtile
                 // S2MM lock waits, compute kernel rate) back to the shim
-                // and gates DMA_FINISHED_TASK timing.
-                if self.stream_out.len() >= self.output_fifo_capacity() {
+                // and gates DMA_FINISHED_TASK timing.  Per-channel gate.
+                if !self.can_push_stream_out_for_channel(channel) {
                     return TransferResult::stalled();
                 }
                 if self.transfer_host_to_stream(addr, bytes, channel, is_last, tlast_suppress, host_memory) {
@@ -1194,8 +1191,7 @@ impl DmaEngine {
             // AM025: TLAST_Suppress (Word 5, bit 31) prevents TLAST assertion
             let is_last_word = is_last && (i == word_count - 1);
             let should_assert_tlast = is_last_word && !tlast_suppress;
-            self.stream_out
-                .push_back(StreamData { data: word, tlast: should_assert_tlast, channel });
+            self.push_stream_out(StreamData { data: word, tlast: should_assert_tlast, channel });
         }
 
         // Fire WATCHPOINT_N events on the target tile for each word the DMA
@@ -1292,8 +1288,7 @@ impl DmaEngine {
 
                 let is_last_word = is_last_block && w == compressed_words - 1;
                 let should_assert_tlast = is_last_word && !tlast_suppress;
-                self.stream_out
-                    .push_back(StreamData { data: word, tlast: should_assert_tlast, channel });
+                self.push_stream_out(StreamData { data: word, tlast: should_assert_tlast, channel });
             }
         }
 
@@ -1641,8 +1636,7 @@ impl DmaEngine {
             // AM025: TLAST_Suppress (Word 5, bit 31) prevents TLAST assertion
             let is_last_word = is_last && i == word_count - 1;
             let should_assert_tlast = is_last_word && !tlast_suppress;
-            self.stream_out
-                .push_back(StreamData { data: word, channel, tlast: should_assert_tlast });
+            self.push_stream_out(StreamData { data: word, channel, tlast: should_assert_tlast });
         }
 
         true
@@ -1702,8 +1696,7 @@ impl DmaEngine {
 
                 let is_last_word = is_last_block && w == compressed_words - 1;
                 let should_assert_tlast = is_last_word && !tlast_suppress;
-                self.stream_out
-                    .push_back(StreamData { data: word, channel, tlast: should_assert_tlast });
+                self.push_stream_out(StreamData { data: word, channel, tlast: should_assert_tlast });
             }
         }
 

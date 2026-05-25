@@ -804,9 +804,7 @@ fn test_engine_stream_word_interface() {
     assert_eq!(engine.stream_in_len(), 1);
 
     // Add stream output data directly
-    engine
-        .stream_out
-        .push_back(StreamData { data: 0x11111111, tlast: false, channel: 2 });
+    engine.push_stream_out(StreamData { data: 0x11111111, tlast: false, channel: 2 });
 
     // Pop as StreamWord
     let (out_word, channel) = engine.pop_stream_out_as_word().unwrap();
@@ -836,11 +834,11 @@ fn test_mm2s_compression_sparse_data() {
     // mask + 1 data word (3 bytes + padding) = 2 stream words
     assert_eq!(engine.stream_out_len(), 2);
 
-    let mask_word = engine.stream_out.pop_front().unwrap();
+    let mask_word = engine.pop_stream_out().unwrap();
     assert_eq!(mask_word.data, (1 << 0) | (1 << 3) | (1 << 8));
     assert!(!mask_word.tlast);
 
-    let data_word = engine.stream_out.pop_front().unwrap();
+    let data_word = engine.pop_stream_out().unwrap();
     assert_eq!(data_word.data, u32::from_le_bytes([5, 3, 7, 0]));
     assert!(data_word.tlast);
 }
@@ -857,7 +855,7 @@ fn test_mm2s_compression_all_zeros() {
 
     // All zeros: just mask word, no data
     assert_eq!(engine.stream_out_len(), 1);
-    let mask_word = engine.stream_out.pop_front().unwrap();
+    let mask_word = engine.pop_stream_out().unwrap();
     assert_eq!(mask_word.data, 0);
     assert!(mask_word.tlast);
 }
@@ -877,7 +875,7 @@ fn test_s2mm_decompression_round_trip() {
     assert!(result);
 
     // Route compressed data from stream_out to stream_in (channel 0)
-    while let Some(sd) = engine.stream_out.pop_front() {
+    while let Some(sd) = engine.pop_stream_out() {
         engine.push_stream_in(StreamData { data: sd.data, tlast: sd.tlast, channel: 0 });
     }
 
@@ -914,7 +912,7 @@ fn test_mm2s_no_compression_when_disabled() {
     assert!(result);
 
     assert_eq!(engine.stream_out_len(), 1);
-    let word = engine.stream_out.pop_front().unwrap();
+    let word = engine.pop_stream_out().unwrap();
     assert_eq!(word.data, u32::from_le_bytes([0xAA, 0xBB, 0xCC, 0xDD]));
     assert!(word.tlast);
 }
@@ -952,19 +950,19 @@ fn test_compression_multiple_blocks() {
     // Block 0: mask + data = 2 words; Block 1: mask + data = 2 words
     assert_eq!(engine.stream_out_len(), 4);
 
-    let w0 = engine.stream_out.pop_front().unwrap();
+    let w0 = engine.pop_stream_out().unwrap();
     assert_eq!(w0.data, 1u32);
     assert!(!w0.tlast);
 
-    let w1 = engine.stream_out.pop_front().unwrap();
+    let w1 = engine.pop_stream_out().unwrap();
     assert_eq!(w1.data, u32::from_le_bytes([0x11, 0, 0, 0]));
     assert!(!w1.tlast);
 
-    let w2 = engine.stream_out.pop_front().unwrap();
+    let w2 = engine.pop_stream_out().unwrap();
     assert_eq!(w2.data, 1u32);
     assert!(!w2.tlast);
 
-    let w3 = engine.stream_out.pop_front().unwrap();
+    let w3 = engine.pop_stream_out().unwrap();
     assert_eq!(w3.data, u32::from_le_bytes([0x22, 0, 0, 0]));
     assert!(w3.tlast);
 }
@@ -1328,7 +1326,7 @@ fn test_memtile_mm2s_reads_from_east_neighbor() {
     // The four stream words must contain east_tile's 0xEE pattern.
     let expected_word = u32::from_le_bytes([0xEE; 4]);
     assert_eq!(engine.stream_out_len(), 4, "expected 4 stream words from east tile");
-    while let Some(w) = engine.stream_out.pop_front() {
+    while let Some(w) = engine.pop_stream_out() {
         assert_eq!(
             w.data, expected_word,
             "stream word should carry east-neighbour byte pattern (0xEE), got 0x{:08X}",
@@ -1358,7 +1356,7 @@ fn test_memtile_mm2s_reads_from_west_neighbor() {
 
     let expected_word = u32::from_le_bytes([0x77; 4]);
     assert_eq!(engine.stream_out_len(), 4, "expected 4 stream words from west tile");
-    while let Some(w) = engine.stream_out.pop_front() {
+    while let Some(w) = engine.pop_stream_out() {
         assert_eq!(
             w.data, expected_word,
             "stream word should carry west-neighbour byte pattern (0x77), got 0x{:08X}",
@@ -1439,7 +1437,7 @@ fn test_memtile_mm2s_missing_neighbour_falls_back_to_own() {
     );
     let expected_word = u32::from_le_bytes([0x42; 4]);
     assert_eq!(engine.stream_out_len(), 4, "expected 4 stream words from own tile");
-    while let Some(w) = engine.stream_out.pop_front() {
+    while let Some(w) = engine.pop_stream_out() {
         assert_eq!(
             w.data, expected_word,
             "stream word should fall back to own-tile data (0x42), got 0x{:08X}",

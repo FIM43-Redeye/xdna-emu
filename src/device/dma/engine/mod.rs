@@ -88,9 +88,14 @@ pub struct DmaEngine {
     /// `Architecture`.
     pub(super) dma_model: &'static dyn xdna_archspec::dma::DmaModel,
 
-    /// Stream output buffer (MM2S channels produce data here).
-    /// Data is read from tile memory and queued for the stream router.
-    pub(super) stream_out: VecDeque<StreamData>,
+    /// Per-channel stream output buffers (MM2S channels produce data here).
+    /// Each MM2S channel has its own FIFO indexed by `channel - s2mm_count`,
+    /// matching real hardware where each MM2S channel pushes into its own
+    /// downstream slave port FIFO with independent credit-based flow control.
+    /// Sharing a single queue across channels causes head-of-line blocking
+    /// (one stalled channel freezes all the others) -- see
+    /// docs/superpowers/findings/2026-05-25-stream-switch-backpressure-bd-chain-repeat.md.
+    pub(super) stream_out: Vec<VecDeque<StreamData>>,
 
     /// Per-channel stream input buffers (S2MM channels consume data from here).
     /// Each S2MM channel has its own FIFO, matching real hardware where each
@@ -175,7 +180,7 @@ impl DmaEngine {
             channels,
             timing_config: DmaTimingConfig::from_model(dma_model),
             dma_model,
-            stream_out: VecDeque::with_capacity(16),
+            stream_out: (0..mm2s_channels).map(|_| VecDeque::with_capacity(16)).collect(),
             stream_in: (0..s2mm_channels).map(|_| VecDeque::with_capacity(16)).collect(),
             task_tokens: TokenState::new(),
             lock_timing: None,
@@ -729,7 +734,9 @@ impl DmaEngine {
             ch.reset();
         }
         self.task_tokens.reset();
-        self.stream_out.clear();
+        for q in &mut self.stream_out {
+            q.clear();
+        }
         // Drop any trace events that the coordinator's last drain missed
         // -- otherwise they leak into the first cycle of the next run
         // (with the prior cycle stamps) when the new coordinator drain

@@ -688,8 +688,13 @@ impl TileArray {
     /// Route DMA MM2S output to per-tile stream switch slave ports (as arbiter sources).
     ///
     /// In AIE stream switches, DMA MM2S output is presented as a "slave source" that
-    /// the arbiter can route to external master ports. Local routes like
+    /// the arbiter can route to external master ports.  Local routes like
     /// `slave[1] -> master[5]` configure master[5] to receive from DMA0 MM2S output.
+    ///
+    /// On real hardware, each MM2S channel has independent credit-based flow
+    /// control to its own slave port FIFO.  We mirror this by iterating
+    /// channels independently: one stalled channel cannot block another
+    /// because each channel's `stream_out` is its own queue.
     ///
     /// DMA slave port ranges come from gen_stream_ranges.rs (AM025-derived).
     fn route_dma_to_tile_switches(&mut self) -> usize {
@@ -705,105 +710,107 @@ impl TileArray {
         let fatal_errors = &mut self.fatal_errors;
 
         for i in 0..tiles.len() {
-            // Route DMA MM2S stream_out to tile switch slave ports.
-            //
-            // On real hardware, each MM2S channel has independent credit-based
-            // flow control to its stream switch slave port. One channel's
-            // backpressure never blocks another. Since stream_out is a shared
-            // queue, we must scan all pending words and deliver those whose
-            // target slave has space, retaining blocked words for next cycle.
             let tile = &mut tiles[i];
             let dma = &mut dma_engines[i];
             let tile_kind = tile.tile_kind;
             let col = tile.col;
             let row = tile.row;
             let s2mm_count = dma.s2mm_channel_count() as u8;
+            let mm2s_count = dma.mm2s_channel_count() as u8;
 
-            // Drain stream_out, attempting delivery for each word.
-            let mut retained: VecDeque<StreamData> = VecDeque::new();
+            // Iterate MM2S channels independently.  Each has its own
+            // stream_out queue; backpressure on one does not gate any other.
+            for mm2s_ch in 0..mm2s_count {
+                let combined_ch = s2mm_count + mm2s_ch;
 
-            while let Some(data) = dma.pop_stream_out() {
-                // Determine the target slave port for this DMA MM2S word.
-                let target_slave = if tile_kind.is_shim() {
-                    let mm2s_ch = data.channel.saturating_sub(s2mm_count) as usize;
-                    let from_mux = tile.shim_mux_mm2s_slaves.get(mm2s_ch).copied().flatten();
-
-                    if let Some(slave_idx) = from_mux {
-                        Some((slave_idx, Mm2sRouteDesc::ShimMux { channel: mm2s_ch as u8 }))
-                    } else {
-                        // Fallback: find South slave with circuit route to North
-                        let ss = &tile.stream_switch;
-                        let slaves = ss.slaves.as_slice();
-                        let masters = ss.masters.as_slice();
-                        let mut fallback_slave = None;
-                        for route in &ss.local_routes {
-                            let s = route.slave_idx as usize;
-                            let m = route.master_idx as usize;
-                            if s < slaves.len()
-                                && m < masters.len()
-                                && matches!(slaves[s].port_type, PortType::South)
-                                && matches!(masters[m].port_type, PortType::North)
-                            {
-                                fallback_slave = Some(s);
-                                break;
+                // Resolve the destination slave port once per channel -- it's
+                // a function of the channel index and tile topology, not the
+                // specific data word.
+                let target_slave =
+                    if tile_kind.is_shim() {
+                        let from_mux = tile.shim_mux_mm2s_slaves.get(mm2s_ch as usize).copied().flatten();
+                        if let Some(slave_idx) = from_mux {
+                            Some((slave_idx, Mm2sRouteDesc::ShimMux { channel: mm2s_ch }))
+                        } else {
+                            // Fallback: find South slave with circuit route to North
+                            let ss = &tile.stream_switch;
+                            let slaves = ss.slaves.as_slice();
+                            let masters = ss.masters.as_slice();
+                            let mut fallback_slave = None;
+                            for route in &ss.local_routes {
+                                let s = route.slave_idx as usize;
+                                let m = route.master_idx as usize;
+                                if s < slaves.len()
+                                    && m < masters.len()
+                                    && matches!(slaves[s].port_type, PortType::South)
+                                    && matches!(masters[m].port_type, PortType::North)
+                                {
+                                    fallback_slave = Some(s);
+                                    break;
+                                }
+                            }
+                            if let Some(slave_idx) = fallback_slave {
+                                Some((slave_idx, Mm2sRouteDesc::ShimFallbackSouthNorth))
+                            } else {
+                                // Only log + drop once per channel that has data
+                                // pending and no route.  Without data the channel
+                                // never reaches this branch.
+                                if dma.has_stream_out_for_channel(combined_ch) {
+                                    let msg = format!(
+                                        "DMA_MM2S->TileSwitch: Shim ({},{}) no route for MM2S ch{} -- \
+                                     no slave port or fallback available",
+                                        col, row, mm2s_ch,
+                                    );
+                                    log::error!("{}", msg);
+                                    fatal_errors.push(msg);
+                                    // Drain the unroutable queue
+                                    while dma.pop_stream_out_for_channel(combined_ch).is_some() {}
+                                }
+                                continue;
                             }
                         }
-                        if let Some(slave_idx) = fallback_slave {
-                            Some((slave_idx, Mm2sRouteDesc::ShimFallbackSouthNorth))
+                    } else {
+                        let slave_port = match tile_kind {
+                            TileKind::Mem => (mem_tile::DMA_SLAVE_START + mm2s_ch) as usize,
+                            TileKind::Compute => (compute::DMA_SLAVE_START + mm2s_ch) as usize,
+                            TileKind::ShimNoc | TileKind::ShimPl => unreachable!(),
+                        };
+
+                        let slaves = tile.stream_switch.slaves.as_slice();
+                        if slave_port < slaves.len() {
+                            let port_type = slaves[slave_port].port_type;
+                            if matches!(port_type, PortType::Dma(_)) {
+                                Some((slave_port, Mm2sRouteDesc::DmaPort { channel: combined_ch, port_type }))
+                            } else {
+                                // Drain misrouted queue -- caller misconfigured.
+                                if dma.has_stream_out_for_channel(combined_ch) {
+                                    log::debug!(
+                                    "DMA_MM2S->TileSwitch: tile ({},{}) slave[{}] rejected - wrong type {:?}",
+                                    col, row, slave_port, port_type
+                                );
+                                    while dma.pop_stream_out_for_channel(combined_ch).is_some() {}
+                                }
+                                continue;
+                            }
                         } else {
-                            let msg = format!(
-                                "DMA_MM2S->TileSwitch: Shim ({},{}) no route for MM2S ch{} -- \
-                                 no slave port or fallback available",
-                                col, row, mm2s_ch,
-                            );
-                            log::error!("{}", msg);
-                            fatal_errors.push(msg);
-                            // Drop permanently unroutable data
+                            while dma.pop_stream_out_for_channel(combined_ch).is_some() {}
                             continue;
                         }
-                    }
-                } else {
-                    let slave_port = match tile_kind {
-                        TileKind::Mem => {
-                            let ch_offset = data.channel.saturating_sub(s2mm_count);
-                            (mem_tile::DMA_SLAVE_START + ch_offset) as usize
-                        }
-                        TileKind::Compute => {
-                            let ch_offset = data.channel.saturating_sub(s2mm_count);
-                            (compute::DMA_SLAVE_START + ch_offset) as usize
-                        }
-                        TileKind::ShimNoc | TileKind::ShimPl => unreachable!(),
                     };
 
-                    let slaves = tile.stream_switch.slaves.as_slice();
-                    if slave_port < slaves.len() {
-                        let port_type = slaves[slave_port].port_type;
-                        if matches!(port_type, PortType::Dma(_)) {
-                            Some((slave_port, Mm2sRouteDesc::DmaPort { channel: data.channel, port_type }))
-                        } else {
-                            log::debug!(
-                                "DMA_MM2S->TileSwitch: tile ({},{}) slave[{}] rejected - wrong type {:?}",
-                                col,
-                                row,
-                                slave_port,
-                                port_type
-                            );
-                            // Drop misconfigured data
-                            continue;
-                        }
-                    } else {
-                        // Drop out-of-range data
-                        continue;
-                    }
+                let Some((slave_idx, desc)) = target_slave else {
+                    continue;
                 };
 
-                // Backpressure: deliver if target can accept, retain otherwise.
-                if let Some((slave_idx, desc)) = target_slave {
+                // Drain this channel's stream_out, attempting delivery for
+                // each word.  Retain blocked words for next cycle, preserving
+                // FIFO order on the channel's own queue.
+                let mut retained: VecDeque<StreamData> = VecDeque::new();
+                while let Some(data) = dma.pop_stream_out_for_channel(combined_ch) {
                     let slave = &mut tile.stream_switch.slaves[slave_idx];
                     if slave.can_accept() {
                         slave.push_with_tlast(data.data, data.tlast);
                         words_routed += 1;
-
                         let prefix = if tile_kind.is_shim() { "Shim" } else { "tile" };
                         log::info!(
                             "DMA_MM2S->TileSwitch: {} ({},{}) slave[{}] <- 0x{:08X}{} ({})",
@@ -816,19 +823,22 @@ impl TileArray {
                             desc
                         );
                     } else {
-                        // Target FIFO full -- retain for next cycle.
-                        // Per-channel independence: other channels' words
-                        // continue to be processed (no head-of-line blocking).
+                        // Slave FIFO full -- stop trying for this channel
+                        // (further words for the same slave would also
+                        // bounce, and we want to preserve order).
                         retained.push_back(data);
+                        // Drain the remaining words for this channel into
+                        // retained too so order is preserved end-to-end.
+                        while let Some(d) = dma.pop_stream_out_for_channel(combined_ch) {
+                            retained.push_back(d);
+                        }
+                        break;
                     }
                 }
-            }
 
-            // Put back any words that couldn't be delivered this cycle.
-            if !retained.is_empty() {
-                // Prepend retained words so they're tried first next cycle,
-                // preserving per-channel ordering.
-                dma.prepend_stream_out(retained);
+                if !retained.is_empty() {
+                    dma.prepend_stream_out_for_channel(combined_ch, retained);
+                }
             }
         }
 

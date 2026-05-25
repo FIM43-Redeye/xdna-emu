@@ -81,7 +81,10 @@ impl DmaEngine {
                     }
                 }
                 TransferDirection::MM2S => {
-                    if self.stream_out.len() >= self.output_fifo_capacity() {
+                    // Per-channel: only this MM2S channel's slave-port FIFO
+                    // counts; sibling channels with their own stalls do not
+                    // assert backpressure on this channel's status bit.
+                    if !self.can_push_stream_out_for_channel(channel) {
                         status = layout.stalled_stream_backpressure.set_bit(status);
                     }
                 }

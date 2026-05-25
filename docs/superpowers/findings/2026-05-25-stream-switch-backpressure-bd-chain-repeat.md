@@ -1,8 +1,12 @@
 # Stream Switch Backpressure Regression: bd_chain_repeat_on_memtile
 
 **Date**: 2026-05-25
-**Status**: Open — landed fix exposes a separate objectFifo deadlock
-**Related commit**: stream_switch local-route backpressure (this commit)
+**Status**: Resolved — root cause was DMA-side head-of-line blocking on a
+shared `stream_out` queue, not a lock-arbiter modeling gap.
+**Related commits**:
+- stream_switch local-route backpressure (commit 92fac90, surfaced the bug)
+- archspec external master FIFO = 4 per AM020 (this fix part 1)
+- dma: per-channel stream_out (this fix part 2)
 
 ---
 
@@ -171,3 +175,83 @@ by unbounded pipeline buffering.
    pattern and the fix is the resolution itself — `bd_chain_repeat_on_memtile`
    should be reclassified as a test that depends on faster-than-silicon
    propagation. (Would want HW correlation before concluding this.)
+
+---
+
+## Resolution (2026-05-25)
+
+The hypothesis above was wrong.  The deadlock was **not** in the lock arbiter
+or pipeline-vs-backpressure modelling, it was a **DMA-side head-of-line
+blocking bug** that the new backpressure fix exposed.
+
+### What actually happened
+
+A cycle-by-cycle state dump (added to `step_data_movement`, removed once
+diagnosis was complete) revealed at the wedge:
+
+```
+ch8=Transferring(76/512) stream_out=4 chans=[6, 6, 6, 6]
+slv0=4 slv1=0 slv2=0
+```
+
+- Memtile DMA's `stream_out` was full (4 / 4)
+- All 4 slots held data for ch 6 (`split_0`), whose slave[0] was full
+  because compute(1,2) was legitimately backpressured
+- Ch 8 (OUT) wanted to push to slave[2] -- which was empty -- but
+  couldn't, because the capacity check on the **shared** `stream_out`
+  queue saw `len == 4` and returned `Stalled` for *every* MM2S channel
+
+So one stalled MM2S channel (ch 6) was freezing all the others (ch 7, ch 8)
+on the same tile.  This is a classic head-of-line blocking issue at the
+producer side.  AM020 Ch2 specifies "Local slave ports are ... a 4-deep
+FIFO" *per port*, with independent credit-based flow control from each
+MM2S channel to its own slave port -- not a shared 4-deep queue across
+channels.
+
+### Fix
+
+Two parts:
+
+1. **External master FIFO depth = 4** (per AM020).  Local master is 2-deep,
+   external master is 4-deep -- we previously modelled both as 2.  Added a
+   separate `STREAM_EXTERNAL_MASTER_FIFO_DEPTH` constant and dispatched on
+   `PortType::is_external()` in `StreamPort::new`.  This moved the wedge
+   point by exactly +1 word (18 -> 19), confirming the budget formula was
+   correct but FIFO sizing was off.
+
+2. **Per-channel `stream_out`** -- the actual fix.  Changed
+   `DmaEngine::stream_out` from `VecDeque<StreamData>` to
+   `Vec<VecDeque<StreamData>>` indexed by `channel - s2mm_count`.  Each
+   MM2S channel gets its own 4-deep FIFO.  Capacity gates
+   (`output_fifo_capacity`) became per-channel via
+   `can_push_stream_out_for_channel`.  `route_dma_to_tile_switches` now
+   iterates channels independently, resolving the destination slave once
+   per channel (it's a function of channel index, not data).  Retained
+   words go back to the channel's own queue, preserving FIFO order
+   per-channel without coupling channels to each other.
+
+### What was wrong with the pre-diagnosis hypothesis
+
+The leading edge of the stall was MM2S ch 8 stuck at 18 words, with all
+other channels also mid-transfer.  This *looked* like a downstream lock
+deadlock cascading upstream, but the data flow was actually the opposite:
+ch 6 stalled (legitimately, downstream backpressure), ch 6's data filled
+the shared `stream_out`, and then ch 7 / ch 8 inherited the stall without
+any of their own downstream chains being affected.  All FIFOs along OUT's
+downstream chain (slave[2], pipeline, master[7], inter-tile, shim slave[14],
+shim pipeline, shim master[4], shim ch 0 stream_in) were EMPTY at wedge
+time -- the chain had drained completely.  We just couldn't push more
+into it because of the head-of-line block.
+
+The lock-arbiter hypothesis was wrong because all downstream queues were
+empty; there was no cascade.
+
+### Verification
+
+- `cargo test --lib`: 3207 passed (no regressions vs the per-port-type
+  FIFO change baseline).
+- `bd_chain_repeat_on_memtile.chess`: PASS (was failing 32569/32768).
+- `memtile_dmas/blockwrite_using_locks.chess`: PASS (still passes -- the
+  backpressure fix from the prior commit is preserved).
+
+Broader bridge sweep TBD.

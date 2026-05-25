@@ -12,39 +12,97 @@ use super::*;
 pub(super) const STREAM_BUFFER_CAPACITY_WORDS: usize = 256;
 
 impl DmaEngine {
-    /// Pop a word from the stream output buffer (MM2S produced data).
+    /// Map a combined channel index (S2MM_count + MM2S_offset) to the
+    /// per-channel `stream_out` slot.  Returns `usize::MAX` if the channel
+    /// isn't an MM2S channel on this tile -- callers that hit that case have
+    /// a programming error and the bounds-checked index access below will
+    /// panic, which is what we want (impossible-on-HW invariant).
+    #[inline]
+    fn stream_out_idx(&self, channel: u8) -> usize {
+        (channel as usize).saturating_sub(self.s2mm_count)
+    }
+
+    /// Push a word to the MM2S channel's stream output buffer.  The caller is
+    /// expected to gate on `can_push_stream_out_for_channel` (or the
+    /// `output_fifo_capacity` check); this assumes capacity has been verified.
+    pub(super) fn push_stream_out(&mut self, data: StreamData) {
+        let idx = self.stream_out_idx(data.channel);
+        self.stream_out[idx].push_back(data);
+    }
+
+    /// Pop a word from any non-empty MM2S channel's stream output buffer.
     ///
-    /// Returns None if no data is available.
+    /// Used by callers that want to drain the engine without caring about
+    /// which channel produced the data (tests, `execute_1d_transfer`).
+    /// `route_dma_to_tile_switches` uses `pop_stream_out_for_channel` instead
+    /// so each channel's words land in the correct slave port and per-channel
+    /// backpressure is preserved.
     pub fn pop_stream_out(&mut self) -> Option<StreamData> {
-        self.stream_out.pop_front()
+        for q in &mut self.stream_out {
+            if let Some(d) = q.pop_front() {
+                return Some(d);
+            }
+        }
+        None
     }
 
-    /// Peek at the next word in stream output buffer without removing it.
+    /// Pop the next word for a specific MM2S channel.
+    pub fn pop_stream_out_for_channel(&mut self, channel: u8) -> Option<StreamData> {
+        let idx = self.stream_out_idx(channel);
+        self.stream_out.get_mut(idx)?.pop_front()
+    }
+
+    /// Peek at the next word in any non-empty channel without removing it.
+    /// Returns the first channel's front (round-robin would skew throughput
+    /// metrics; this is for inspection only).
     pub fn peek_stream_out(&self) -> Option<&StreamData> {
-        self.stream_out.front()
+        self.stream_out.iter().find_map(|q| q.front())
     }
 
-    /// Maximum stream_out depth before MM2S backpressures.
+    /// Peek at the next word for a specific MM2S channel.
+    pub fn peek_stream_out_for_channel(&self, channel: u8) -> Option<&StreamData> {
+        let idx = self.stream_out_idx(channel);
+        self.stream_out.get(idx)?.front()
+    }
+
+    /// Maximum per-channel `stream_out` depth before that channel
+    /// backpressures.
     ///
     /// Models the slave-port FIFO that the DMA's output bridges into on
     /// real silicon; AM020 ch2 specifies "Local slave ports are 2-cycle
-    /// latency and a 4-deep FIFO" for AIE2 / Phoenix. When stream_out
-    /// reaches this depth, the downstream consumer hasn't drained fast
-    /// enough and the DMA stalls (STALL_STRM_STARV in the channel
-    /// status register), which is what gates DMA_FINISHED_TASK timing
-    /// across the chain.
+    /// latency and a 4-deep FIFO" for AIE2 / Phoenix.  Each MM2S channel
+    /// pushes into its own slave port FIFO with independent credit-based
+    /// flow control, so the capacity is enforced per-channel -- one
+    /// channel filling its FIFO must not stall any other channel.
     pub fn output_fifo_capacity(&self) -> usize {
         xdna_archspec::aie2::timing::STREAM_LOCAL_SLAVE_FIFO_DEPTH as usize
     }
 
-    /// Prepend retained words back to stream_out.
+    /// Whether the MM2S channel's `stream_out` has room for at least one
+    /// more word (i.e. `len < output_fifo_capacity`).
+    pub fn can_push_stream_out_for_channel(&self, channel: u8) -> bool {
+        let idx = self.stream_out_idx(channel);
+        let cap = self.output_fifo_capacity();
+        self.stream_out.get(idx).map_or(false, |q| q.len() < cap)
+    }
+
+    /// Prepend retained words back to the MM2S channel's stream_out buffer.
     ///
-    /// Used by route_dma_to_tile_switches to put back words that couldn't
-    /// be delivered this cycle (target slave full). Retained words go to the
-    /// front so they're retried first next cycle, preserving per-channel order.
-    pub fn prepend_stream_out(&mut self, mut retained: std::collections::VecDeque<StreamData>) {
-        retained.append(&mut self.stream_out);
-        self.stream_out = retained;
+    /// Used by `route_dma_to_tile_switches` to put back words that couldn't
+    /// be delivered this cycle (target slave full).  Retained words go to
+    /// the front of THAT channel's queue so they're retried first next
+    /// cycle, preserving per-channel ordering without affecting any other
+    /// channel.
+    pub fn prepend_stream_out_for_channel(
+        &mut self,
+        channel: u8,
+        mut retained: std::collections::VecDeque<StreamData>,
+    ) {
+        let idx = self.stream_out_idx(channel);
+        if let Some(q) = self.stream_out.get_mut(idx) {
+            retained.append(q);
+            *q = retained;
+        }
     }
 
     /// Push a word to the per-channel stream input buffer (for S2MM to consume).
@@ -81,9 +139,15 @@ impl DmaEngine {
         }
     }
 
-    /// Check if stream output buffer has data.
+    /// Check if any MM2S channel's stream output buffer has data.
     pub fn has_stream_out(&self) -> bool {
-        !self.stream_out.is_empty()
+        self.stream_out.iter().any(|q| !q.is_empty())
+    }
+
+    /// Check if a specific MM2S channel has stream output data.
+    pub fn has_stream_out_for_channel(&self, channel: u8) -> bool {
+        let idx = self.stream_out_idx(channel);
+        self.stream_out.get(idx).map_or(false, |q| !q.is_empty())
     }
 
     /// Check if any S2MM channel's stream input buffer has space.
@@ -102,9 +166,16 @@ impl DmaEngine {
             .map_or(false, |q| q.len() < STREAM_BUFFER_CAPACITY_WORDS)
     }
 
-    /// Get the number of words in stream output buffer.
+    /// Get the total number of words across all MM2S channel stream output
+    /// buffers.  For per-channel inspection use `stream_out_len_for_channel`.
     pub fn stream_out_len(&self) -> usize {
-        self.stream_out.len()
+        self.stream_out.iter().map(|q| q.len()).sum()
+    }
+
+    /// Get the number of words queued for a specific MM2S channel.
+    pub fn stream_out_len_for_channel(&self, channel: u8) -> usize {
+        let idx = self.stream_out_idx(channel);
+        self.stream_out.get(idx).map_or(0, |q| q.len())
     }
 
     /// Get the total number of words across all stream input channel buffers.
@@ -193,10 +264,10 @@ impl DmaEngine {
 
     /// Pop stream output as StreamWord (for stream switch integration).
     ///
-    /// Returns the word and the channel it came from.
+    /// Returns the word and the channel it came from.  Iterates per-channel
+    /// queues -- if multiple channels have data, picks the first non-empty.
     pub fn pop_stream_out_as_word(&mut self) -> Option<(super::super::stream_io::StreamWord, u8)> {
-        self.stream_out
-            .pop_front()
+        self.pop_stream_out()
             .map(|data| (Self::stream_data_to_word(&data), data.channel))
     }
 
