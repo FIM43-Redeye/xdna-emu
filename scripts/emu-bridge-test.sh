@@ -2145,6 +2145,9 @@ run_one_hardware() {
   if [[ -f "$trace_out_dir/trace_raw.bin" ]]; then
     python3 "$EMU_ROOT/tools/trace-trim.py" "$trace_out_dir/trace_raw.bin" 2>/dev/null || true
   fi
+
+  # Pre-decode events.json so the per-test directory is self-contained.
+  _predecode_events_next_to_trace "$trace_out_dir" "$name" "$compiler"
 }
 export -f run_one_hardware
 
@@ -2338,6 +2341,9 @@ run_one_bridge() {
     python3 "$EMU_ROOT/tools/trace-trim.py" "$trace_out_dir/trace_raw.bin" 2>/dev/null || true
   fi
 
+  # Pre-decode events.json so the per-test directory is self-contained.
+  _predecode_events_next_to_trace "$trace_out_dir" "$name" "$compiler"
+
   echo "  BRIDGE $display_name ($compiler): $result  $(job_duration "$_bridge_start")"
 }
 export -f run_one_bridge
@@ -2359,6 +2365,22 @@ _bin_to_events_json() {
       --out-events "$out" 2>/dev/null
 }
 export -f _bin_to_events_json
+
+# Pre-decode events.json next to trace_raw.bin, so downstream analysis
+# (campaign tooling, soc-aware comparator) can consume one self-contained
+# directory per test side without re-invoking parse-trace.py.
+#
+# Best-effort: missing inputs or parse failure are logged-and-ignored.
+# Usage: _predecode_events_next_to_trace <trace_dir> <test_name> <compiler>
+_predecode_events_next_to_trace() {
+  local trace_dir="$1" name="$2" compiler="$3"
+  local bin="$trace_dir/trace_raw.bin"
+  local mlir="$BUILD_BASE/$name/${compiler}/aie_arch.mlir.prj/input_with_addresses.mlir"
+  local out="$trace_dir/events.json"
+  [[ -f "$bin" && -f "$mlir" ]] || return 0
+  _bin_to_events_json "$bin" "$mlir" "$out" || true
+}
+export -f _predecode_events_next_to_trace
 
 # Run trace-compare on a bin pair. Requires the Rust binary and a matching
 # xclbin-mlir (for parse-trace.py). Caller supplies --hw <bin> --emu <bin>

@@ -240,20 +240,25 @@ The model derived from this campaign is validated when:
 The campaign requires three pieces of scaffolding that don't exist
 or aren't usable today. Address before kicking off the HW run.
 
-### G1. Trace artifact preservation in bridge runs
+### G1. Pre-decoded events.json next to trace_raw.bin
 
-Today's bridge sweep keeps PASS/FAIL/DRIFT verdicts in
-`build/bridge-test-results/<date>/`, but the raw `trace.bin` and the
-decoded events JSON are not preserved across runs. The campaign
-needs both.
+Today's bridge sweep already preserves `trace_raw.bin` and
+`trace_config.json` per test, in
+`build/bridge-test-results/<date>/<test>.<compiler>.{hw,emu}/`.
+What's missing is the **decoded** events JSON -- the existing
+`_bin_to_events_json` helper writes to `tmp/` and deletes after
+trace-compare runs.
 
-**Proposal**: add `--retain-traces` to `scripts/emu-bridge-test.sh`
-that, when set, copies each test's `trace_buffer.bin` (HW side) and
-`events.json` (post-parse-trace.py) to
-`build/bridge-test-results/<date>/<test_name>/{hw,emu}/`. Default
-off so the disk footprint of normal sweep runs doesn't grow.
+**Proposal**: after each side's `trace_raw.bin` is trimmed, decode
+once via `_bin_to_events_json` and write `events.json` next to the
+trace_raw.bin. Skipped when the side didn't run (e.g., `--no-hw`).
+Best-effort -- if parse-trace.py fails, log and continue.
 
-**Estimate**: ~30 min of shell-script work.
+Self-contained per-test directories let the campaign analysis tools
+consume `events.json` directly without re-decoding.
+
+**Estimate**: ~15 min of shell-script work, two insertion sites
+(`run_one_hardware`, `run_one_bridge`).
 
 ### G2. CDO PERF_CTRL extraction utility
 
