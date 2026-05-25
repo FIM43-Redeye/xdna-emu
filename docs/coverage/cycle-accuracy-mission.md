@@ -301,6 +301,136 @@ and `vec_mul_trace_distribute_lateral (chess)` compile fail
   `src/device/array/routing.rs` (Phase 5 SS branch, Wake 2 chain),
   `src/device/clock_control/integration_tests.rs` (Wake 1-3 tests)
 
+### 9. Perf-counter-driven trace event emission (LOCK_STALL et al.)
+
+**Status**: PROPOSED. Blocked on HW ground-truth measurement campaign.
+
+**What**: HW's trace controller emits state events like LOCK_STALL,
+MEMORY_STALL, STREAM_STALL not as raw level signals but via the
+correlation between a perf counter (typically PERF_CTRL0 counting
+ACTIVE_CORE with a configurable threshold like 1024 cyc) and the
+underlying stall state. On rollover the configured PERF_CNT_N slot
+fires AND, in the same cycle, whichever stall is active gets stamped
+into its slot. EMU currently treats LOCK_STALL as an edge event
+(initial emit on WaitLock entry, via `cycle_accurate.rs:821`) plus
+a per-retry emit (`interpreter.rs:728-743`, with
+`LOCK_STALL_TRACE_PERIOD = 1`). This over-emits on long-stall tests
+(2701 events vs HW's ~44 on `_diag_phase_b_add_one_instrumented`)
+and approximately matches on short-stall tests (22 vs 24 on
+`add_one_using_dma`).
+
+**Why it matters**: cycle-accuracy comparisons that read the trace
+decoder's `ts` field are tripped by event-count differences (since
+`ts = soc + 1 + events_before`). Today's stage-decomposition for
+`#355a` was misdiagnosed as a stage-5 regression because the
+over-emission inflated `ts` by ~2686 cyc. Tighter measurement
+discipline (always use `soc`) handles this for tooling, but
+ultimately the emission semantics should match HW so the `ts` field
+is trustworthy too.
+
+**How to derive the value**:
+
+a. **HW measurement (preferred)**: re-measure LOCK_STALL counts on
+   a calibration set (`add_one_using_dma`, `_diag_phase_b_*`,
+   `dynamic_object_fifo/*`, a few of the `objectfifo_repeat/*`),
+   correlating against each test's perf-counter CDO writes. Use
+   `soc` field for the cycle window. The 2026-05-11 "~4400 events
+   at PC 832" claim cannot be trusted -- it was made before the
+   ts/soc gotcha was understood. Phase C's 44 events with ~1024-cyc
+   spacing is more credible.
+
+b. **CDO parser**: extract each tile's PERF_CTRL0 / PERF_CTRL1
+   configuration at xclbin-load time, store on the tile's trace
+   state, and tick during WaitingLock / WaitingDma / WaitingStream
+   (since the core stays ACTIVE during stalls per AM020).
+
+**Open question**: do other state events (MEMORY_STALL, STREAM_STALL,
+PORT_STALL) follow the same perf-counter-driven sampling, or are
+they edge-only? The 2026-05-12 MEMORY_STALL fix in
+`docs/archive/findings/2026-05-11-emu-dma-pipeline-too-fast-misses-stalls.md`
+addressed a different bug (S2MM phantom bank claims during stall),
+not the emission cadence.
+
+**Cross-references**:
+- Detail: [`docs/superpowers/findings/2026-05-25-trace-ts-vs-soc-measurement-gotcha.md`](../superpowers/findings/2026-05-25-trace-ts-vs-soc-measurement-gotcha.md)
+- Currently P3 (measurement-discipline-only); P2 is the real fix
+- Code: `src/interpreter/core/interpreter.rs:97-101`,
+  `src/interpreter/core/interpreter.rs:728-743`,
+  `src/interpreter/execute/cycle_accurate.rs:818-822`
+
+### 10. Shim streaming throughput modeling
+
+**Status**: PROPOSED. Blocked on HW measurement of shim DDR egress
+rate as a function of BD size and access pattern.
+
+**What**: EMU models shim DMA cold-start (`shim_ddr_cold_start_cycles
+= 1500`, commit `3357b7c`) as a pure pre-data delay, after which
+words stream out instantly at the configured `words_per_cycle = 4`
+rate. HW behaves differently: cold-start is shorter (~tRCD + tRP +
+tRAS, sub-microsecond on modern DDR), but the **streaming itself is
+throughput-bound** -- the shim DMA's task duration is dominated by
+egress rate from DDR, not by cold-start. On
+`_diag_phase_b_add_one_instrumented.chess` this surfaces as a
+74%-closed-but-wrong-shape stage 1+2:
+
+| Sub-stage | HW | EMU (SoC) | Gap |
+|-----------|---:|---:|---:|
+| 1a: shim dispatch -> shim FINISHED_TASK | 1682 | 2054 | -372 |
+| 1b: shim FINISHED_TASK -> memtile S2MM done | 1017 | -27 | +1044 |
+
+EMU's memtile S2MM finishes 27 cyc *before* the shim itself reports
+done. Real silicon has memtile finishing 1017 cyc *after* shim done
+(the propagation/commit tail of continuous streaming). The cold-start
+knob cannot fix 1b -- adding cycles to MemoryLatency shifts both
+endpoints, leaving the sub-stage delta invariant.
+
+**Why it matters**: this is the dominant residual on the
+calibration test that drove Phase A/B/C of cycle-accuracy work
+(`_diag_phase_b_add_one_instrumented`). Closing it would bring EMU
+within stage-3-noise-floor of HW on that test, completing the
+#355a roadmap. Likely contributes proportionally on every test
+that hits shim DDR -- which is most of them.
+
+**How to derive the value**:
+
+a. **HW measurement (preferred)**: build a calibration kernel that
+   varies (i) BD payload size, (ii) access pattern (linear /
+   strided / cross-bank). Instrument with shim and memtile
+   FINISHED_BD trace anchors. Measure shim_dispatch -> shim_done
+   and shim_dispatch -> memtile_s2mm_done deltas; the slope vs
+   BD size gives the per-word egress rate, the intercept gives
+   true cold-start. Two-tier model (cold-start opens row, then
+   sustained throughput) is the expected shape.
+
+b. **AM020 DDR timing tables**: precharge (tRP), activate (tRCD),
+   CAS (tCL), refresh-time-rolled-into-stream contributions.
+   These give the structural floor for cold-start; not a substitute
+   for HW measurement of the streaming rate.
+
+c. **aietools SystemC reading**: the
+   `libaie2_cluster_msm_v1_0_0_dbg.osci.so` model contains a
+   shim DMA dispatcher; symbol names may indicate the streaming
+   rate model. Probably worth a read pass once we're doing the
+   HW measurement, as a cross-check on the rate.
+
+**Open questions**:
+- Does memtile S2MM also have a throughput-bound regime, or is
+  its rate so fast (SRAM-backed) that it effectively matches the
+  shim's egress rate? Phase C's stage 3 (memtile S2MM -> MM2S) at
+  HW=13 / EMU=15 cyc suggests memtile internals are already
+  well-calibrated.
+- How does multi-channel arbitration interact with the rate?
+  `add_one_using_dma` only exercises a single shim S2MM ch; a
+  multi-channel test would calibrate the arbitration cost.
+
+**Cross-references**:
+- Detail: [`docs/superpowers/findings/2026-05-25-shim-stage1a-1b-structural-limit.md`](../superpowers/findings/2026-05-25-shim-stage1a-1b-structural-limit.md)
+- Phase C: `docs/archive/findings/2026-05-10-phase-c-stage-attribution.md`
+- Parent item: #5 (NoC / AXI / DMA pipeline timings, DEFERRED)
+- Code: `crates/xdna-archspec/src/model_builder.rs:189`,
+  `src/device/dma/engine/stepping.rs` `consume_first_bd_bonus`,
+  `crates/xdna-archspec/src/types.rs` `DmaTiming.words_per_cycle`
+
 ## aietools SystemC angle
 
 The `*.osci.so` libraries in `amd-unified-software/aietools/lib/lnx64.o/`
