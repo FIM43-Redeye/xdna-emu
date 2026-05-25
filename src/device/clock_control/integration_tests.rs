@@ -337,6 +337,53 @@ fn write_to_stream_switch_register_wakes_ss_adaptive_gate() {
     );
 }
 
+// ---- Wake-on-event integration tests (Wake 3: lock-value change) ----
+
+#[test]
+fn wake_3_lock_change_is_covered_by_wake_1_plus_phase_5_pending_work() {
+    // Wake 3 from cycle-accuracy-mission.md item #8 -- "lock-value change
+    // reaching a tile whose DMA is gated and has channels in AcquiringLock"
+    // -- decomposes into two sub-cases, both of which are already covered
+    // without an additional explicit wake call:
+    //
+    // (a) Cross-tile lock change: arrives at the destination tile as a
+    //     stream-routed control packet that decodes into a write to the
+    //     local Lock_value register.  That register write traverses
+    //     write_tile_register -> SubsystemKind::Lock -> wake_adaptive_dma
+    //     (Wake 1, Lock subsystem shares the Memory clock bit with DMA
+    //     on compute/memtile).
+    //
+    // (b) Same-tile lock change: the requesting DMA channel sits in
+    //     AcquiringLock.  ChannelFsm::is_active() includes AcquiringLock,
+    //     and any_channel_has_pending_work() OR-folds is_active() across
+    //     all channels.  Phase 5 of step_data_movement ticks the DMA
+    //     counter with active=true on every cycle a channel has pending
+    //     work, so the DMA adaptive gate cannot engage at all while a
+    //     channel is in AcquiringLock.  The "DMA gated AND channel in
+    //     AcquiringLock" scenario from the mission-doc sketch is therefore
+    //     impossible in our FSM model.
+    //
+    // This test names the cross-tile sub-case explicitly so the path is
+    // visible to a future reader investigating Wake 3 specifically.
+    // Setup mirrors the Wake-1 lock-write test, but the assertion frames
+    // the scenario in Wake-3 terms.
+    let mut state = DeviceState::new_npu1();
+    let mut host = HostMemory::new();
+    let (col, row) = (2u8, 3u8);
+
+    idle_until_both_gates_engaged(&mut state, &mut host, col, row);
+
+    // Simulated control-packet write to Lock5_value -- the cross-tile
+    // lock-change path arrives at write_tile_register with this shape.
+    let lock_value_offset: u32 = 0x1F000 + 4 * 5;
+    state.write_tile_register(col, row, lock_value_offset, 0x1);
+
+    assert!(
+        !state.array.clock().is_adaptive_dma_engaged(col, row),
+        "cross-tile lock-release register write must wake the destination DMA gate (Wake 3 via Wake 1)"
+    );
+}
+
 // ---- Wake-on-event integration tests (Wake 2: stream beat) ----
 
 #[test]
