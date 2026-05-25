@@ -399,9 +399,41 @@ impl StreamSwitch {
         // We group routes by slave_idx so we pop once and push a pipeline
         // entry for every destination master.
         //
+        // Per-route backpressure: a route from slave to master models a
+        // `latency`-cycle pipe feeding the master's FIFO.  The total in-flight
+        // budget for a route is `latency + master.fifo_capacity` words --
+        // `latency` in the pipe (one per cycle of overlap) plus the master's
+        // own FIFO depth.  When in-flight reaches that budget, the slave can
+        // no longer be popped for that route; the slave's FIFO holds the
+        // word and back-pressures upstream (the DMA MM2S engine sees its
+        // stream-out slave full and stalls in Transferring with
+        // Stalled_Stream_Backpressure asserted).
+        //
+        // Without this gating, `step()` drained slaves unconditionally into an
+        // unbounded `switch_pipeline` Vec, so MM2S never saw downstream
+        // back-pressure and self-chained DMAs (the
+        // memtile_dmas/blockwrite_using_locks pattern) ran forever -- the
+        // engine never reached Halted/Stalled and natural completion never
+        // fired even though the sync target was satisfied.
+        //
+        // For multicast: every destination must have room.  If any one peer
+        // is at capacity, the slave is held until that peer drains.  This
+        // matches HW's all-or-nothing multicast semantics (a switch-fabric
+        // copy must land at every destination atomically).
+        //
         // Collect which slaves have been consumed this cycle to avoid
         // double-popping when multiple routes share the same slave.
         let mut slave_consumed: u64 = 0; // bitset, up to 64 slave ports
+
+        // Pre-compute pipeline occupancy per destination master so we don't
+        // re-scan `switch_pipeline` for every (route, peer) check.
+        let mut pipeline_to_master: Vec<usize> = vec![0; self.masters.len()];
+        for w in &self.switch_pipeline {
+            let m = w.master_idx as usize;
+            if m < pipeline_to_master.len() {
+                pipeline_to_master[m] += 1;
+            }
+        }
 
         for i in 0..self.local_routes.len() {
             let route = &self.local_routes[i];
@@ -434,48 +466,88 @@ impl StreamSwitch {
                 self.slaves[slave_idx].fifo.len()
             );
 
-            if slave_has_data {
-                // Pop once from slave
-                if let Some((data, tlast)) = self.slaves[slave_idx].pop_with_tlast() {
-                    if slave_idx < 64 {
-                        slave_consumed |= 1u64 << slave_idx;
-                    }
+            if !slave_has_data {
+                continue;
+            }
 
-                    // Find ALL enabled routes from this slave (multicast fanout)
-                    // Find ALL enabled routes from this slave (multicast fanout).
-                    // Search the full route list -- routes for the same slave may
-                    // appear at any position.
-                    let mut dest_count: u32 = 0;
-                    for j in 0..self.local_routes.len() {
-                        let peer = &self.local_routes[j];
-                        if peer.slave_idx as usize != slave_idx || !peer.enabled {
-                            continue;
-                        }
-                        let peer_master = peer.master_idx as usize;
-                        if peer_master >= self.masters.len() {
-                            continue;
-                        }
-                        self.switch_pipeline.push(InSwitchWord {
-                            master_idx: peer.master_idx,
-                            data,
-                            tlast,
-                            cycles_remaining: peer.latency,
-                        });
-                        dest_count += 1;
-                        log::debug!(
-                            "TileSwitch({},{}): slave[{}] -> pipeline({}) -> master[{}] data=0x{:08X}{}{}",
-                            self.col,
-                            self.row,
-                            slave_idx,
-                            peer.latency,
-                            peer_master,
-                            data,
-                            if tlast { " TLAST" } else { "" },
-                            if dest_count > 1 { " (multicast)" } else { "" }
-                        );
-                    }
-                    let _ = dest_count; // used in log messages above
+            // Per-peer backpressure check: every multicast destination must
+            // have room for one more in-flight word.  Budget per peer is
+            // `peer.latency + master.fifo_capacity`; in-flight is
+            // `pipeline_to_master[m] + masters[m].fifo.len()`.
+            let mut can_pop = true;
+            for j in 0..self.local_routes.len() {
+                let peer = &self.local_routes[j];
+                if peer.slave_idx as usize != slave_idx || !peer.enabled {
+                    continue;
                 }
+                let peer_master = peer.master_idx as usize;
+                if peer_master >= self.masters.len() {
+                    continue;
+                }
+                let in_flight = pipeline_to_master[peer_master] + self.masters[peer_master].fifo.len();
+                let budget = peer.latency as usize + self.masters[peer_master].fifo_capacity;
+                if in_flight >= budget {
+                    log::trace!(
+                        "TileSwitch({},{}): slave[{}]->master[{}] backpressured \
+                         (in_flight={} budget={}=lat{}+cap{})",
+                        self.col,
+                        self.row,
+                        slave_idx,
+                        peer_master,
+                        in_flight,
+                        budget,
+                        peer.latency,
+                        self.masters[peer_master].fifo_capacity,
+                    );
+                    can_pop = false;
+                    break;
+                }
+            }
+
+            if !can_pop {
+                continue;
+            }
+
+            // Pop once from slave
+            if let Some((data, tlast)) = self.slaves[slave_idx].pop_with_tlast() {
+                if slave_idx < 64 {
+                    slave_consumed |= 1u64 << slave_idx;
+                }
+
+                // Find ALL enabled routes from this slave (multicast fanout).
+                // Search the full route list -- routes for the same slave may
+                // appear at any position.
+                let mut dest_count: u32 = 0;
+                for j in 0..self.local_routes.len() {
+                    let peer = &self.local_routes[j];
+                    if peer.slave_idx as usize != slave_idx || !peer.enabled {
+                        continue;
+                    }
+                    let peer_master = peer.master_idx as usize;
+                    if peer_master >= self.masters.len() {
+                        continue;
+                    }
+                    self.switch_pipeline.push(InSwitchWord {
+                        master_idx: peer.master_idx,
+                        data,
+                        tlast,
+                        cycles_remaining: peer.latency,
+                    });
+                    pipeline_to_master[peer_master] += 1;
+                    dest_count += 1;
+                    log::debug!(
+                        "TileSwitch({},{}): slave[{}] -> pipeline({}) -> master[{}] data=0x{:08X}{}{}",
+                        self.col,
+                        self.row,
+                        slave_idx,
+                        peer.latency,
+                        peer_master,
+                        data,
+                        if tlast { " TLAST" } else { "" },
+                        if dest_count > 1 { " (multicast)" } else { "" }
+                    );
+                }
+                let _ = dest_count; // used in log messages above
             }
         }
 

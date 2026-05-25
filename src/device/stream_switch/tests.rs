@@ -378,6 +378,89 @@ fn test_circuit_multicast_multiple_words() {
 }
 
 // ========================================================================
+// Per-route backpressure (slave-pop gated on pipeline + master FIFO budget)
+// ========================================================================
+
+#[test]
+fn test_per_route_backpressure_caps_pipeline_at_latency_plus_master_fifo() {
+    // Regression test for the memtile_dmas/blockwrite_using_locks wedge.
+    //
+    // step() used to drain slave FIFOs unconditionally into an unbounded
+    // switch_pipeline Vec, so a producer (DMA MM2S) feeding a slave whose
+    // route led to a fully-backpressured master never saw its slave fill --
+    // every cycle, the slave was popped and the word buried in pipeline.  A
+    // self-chained MM2S BD would then run forever without ever asserting
+    // Stalled_Stream_Backpressure, and the run loop never reached natural
+    // completion.
+    //
+    // After the fix the slave-pop is gated by the per-route in-flight budget
+    // (`latency + master.fifo_capacity`).  Once that budget is reached the
+    // slave retains data and backpressures upstream.
+    let mut ss = StreamSwitch::new_compute_tile(0, 2);
+    ss.configure_local_route(0, 0);
+    let latency = ss.local_routes[0].latency as usize;
+    let master_cap = ss.masters[0].fifo_capacity;
+    let budget = latency + master_cap;
+
+    // Fill master so deliveries can't drain in-flight words; pipeline is
+    // the only place words can pool.
+    while ss.masters[0].can_accept() {
+        ss.masters[0].push(0x0);
+    }
+
+    // Fill the slave to capacity.  With master full and slave full, the
+    // pipeline can absorb at most `latency` more words before the budget
+    // is reached and the slave starts to back up.
+    let slave_cap = ss.slaves[0].fifo_capacity;
+    assert!(
+        slave_cap > latency,
+        "test setup needs slave capacity > latency ({} vs {}); the leak vs fixed comparison \
+         only makes sense if some slave words must be retained when the budget is reached",
+        slave_cap,
+        latency,
+    );
+    for i in 0..slave_cap {
+        assert!(ss.slaves[0].push(i as u32), "slave push must succeed up to capacity");
+    }
+    let pushed_to_slave = ss.slaves[0].fifo.len();
+
+    // Run more cycles than the budget so a leaky step() would have moved
+    // every slave word into the pipeline by now.
+    for _ in 0..(budget * 4) {
+        ss.step();
+    }
+
+    // Master stayed full (we never popped it), so no entries drained from
+    // the pipeline.  Pipeline + master FIFO must be exactly at budget; any
+    // further pops would exceed it.
+    let in_flight = ss.switch_pipeline.len() + ss.masters[0].fifo.len();
+    assert_eq!(in_flight, budget, "in-flight must equal budget at steady state");
+
+    // The slave retains words -- this is the backpressure signal that
+    // lets an upstream DMA MM2S stall in Transferring.  Master starts
+    // full (cap), so only `latency` slave words could enter the pipeline.
+    let expected_remaining = pushed_to_slave - latency;
+    assert_eq!(
+        ss.slaves[0].fifo.len(),
+        expected_remaining,
+        "slave must retain {} words once budget is reached; leaky pop would have emptied it",
+        expected_remaining,
+    );
+
+    // Drain one master slot.  The pipeline should advance one word to
+    // master, which opens budget for one more slave-pop.
+    ss.masters[0].pop();
+    ss.step();
+    let in_flight_after = ss.switch_pipeline.len() + ss.masters[0].fifo.len();
+    assert_eq!(in_flight_after, budget, "drain + step restores budget exactly");
+    assert_eq!(
+        ss.slaves[0].fifo.len(),
+        expected_remaining - 1,
+        "draining the master must let exactly one slave word into the pipeline",
+    );
+}
+
+// ========================================================================
 // Packet Header Tests
 // ========================================================================
 
