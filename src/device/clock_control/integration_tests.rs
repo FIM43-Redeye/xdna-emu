@@ -337,6 +337,43 @@ fn write_to_stream_switch_register_wakes_ss_adaptive_gate() {
     );
 }
 
+// ---- Wake-on-event integration tests (Wake 2: stream beat) ----
+
+#[test]
+fn stream_beat_into_slave_port_wakes_ss_adaptive_gate() {
+    // Wake 2 from cycle-accuracy-mission.md item #8.  A successful slave-port
+    // push sets the port's cycle_active flag; Phase 5 of step_data_movement
+    // observes cycle_active across all SS ports and calls tick_adaptive_ss
+    // with active=true, resetting the SS counter.  This is the wake-on-
+    // stream-beat path for silicon's adaptive clock gating.
+    let mut state = DeviceState::new_npu1();
+    let mut host = HostMemory::new();
+    let (col, row) = (2u8, 3u8); // compute tile
+
+    idle_until_both_gates_engaged(&mut state, &mut host, col, row);
+
+    // Push a stream beat directly into a slave port on this tile, mirroring
+    // what advance_inter_tile_pipeline does at delivery time.  Slave 0 is
+    // the Core slave port on compute and accepts any data.
+    let idx = state.array.tile_index(col, row);
+    let accepted = state.array.tiles[idx].stream_switch.slaves[0].push(0xDEAD_BEEF);
+    assert!(accepted, "slave[0] must accept the beat (FIFO has capacity)");
+
+    // One step_data_movement: Phase 5 reads cycle_active on the slave and
+    // resets the SS adaptive counter.
+    state.array.step_data_movement(&mut host);
+
+    assert!(
+        !state.array.clock().is_adaptive_ss_engaged(col, row),
+        "stream beat arrival must wake the SS adaptive gate (Phase 5 cycle_active chain)"
+    );
+    // DMA gate had no event -- stays engaged.
+    assert!(
+        state.array.clock().is_adaptive_dma_engaged(col, row),
+        "stream beat must not affect DMA adaptive gate"
+    );
+}
+
 #[test]
 fn write_to_clock_control_register_does_not_emit_wake() {
     // Clock-control writes are themselves the ungate mechanism and have

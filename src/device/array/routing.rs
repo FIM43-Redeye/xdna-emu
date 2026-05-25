@@ -175,6 +175,15 @@ impl TileArray {
                     }
 
                     // SS module counter: advance only if the SS module is ungated.
+                    //
+                    // This also implements Wake 2 (stream beat into slave SS
+                    // port) from cycle-accuracy-mission.md item #8.  A slave
+                    // push sets the port's cycle_active flag; any cycle_active
+                    // port here produces ss_active=true, which resets the
+                    // counter via tick_adaptive_ss(active=true).  The wake is
+                    // therefore an end-of-cycle reset rather than an emit-site
+                    // reset -- closer to silicon's small wake-up latency than
+                    // an instantaneous wake would be.
                     if self.clock.is_module_active(col, row, ModuleKind::StreamSwitch) {
                         let idx = self.tile_index(col, row);
                         let ss = &self.tiles[idx].stream_switch;
