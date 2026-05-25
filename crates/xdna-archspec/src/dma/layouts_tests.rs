@@ -288,7 +288,8 @@ mod tests {
         assert_eq!(cs.status.msb, 1);
         assert_eq!(cs.stalled_lock_acq.lsb, 2, "Stalled_Lock_Acq[2]");
         assert_eq!(cs.stalled_lock_rel.lsb, 3, "Stalled_Lock_Rel[3]");
-        assert_eq!(cs.stalled_stream.lsb, 4, "Stalled_Stream[4]");
+        assert_eq!(cs.stalled_stream_starvation.lsb, 4, "Stalled_Stream_Starvation[4] (S2MM)");
+        assert_eq!(cs.stalled_stream_backpressure.lsb, 4, "Stalled_Stream_Backpressure[4] (MM2S)");
         assert_eq!(cs.stalled_tct.lsb, 5, "Stalled_TCT[5]");
         assert_eq!(cs.error_bd_unavailable.lsb, 10, "Error_BD_Unavailable[10]");
         assert_eq!(cs.error_bd_invalid.lsb, 11, "Error_BD_Invalid[11]");

@@ -167,60 +167,79 @@ impl ChannelFieldLayout {
 
 /// Pre-resolved layout for DMA channel status registers.
 ///
-/// Covers `DMA_S2MM_Status_0` / `DMA_MM2S_Status_0` fields. The same
-/// field layout applies to all channels within a module (S2MM and MM2S
-/// share the same bit assignments for status).
+/// Covers `DMA_S2MM_Status_0` / `DMA_MM2S_Status_0` fields. Most fields
+/// share the same bit assignments between S2MM and MM2S registers, but
+/// AM025 names the bit-4 stall differently per direction: S2MM calls it
+/// `Stalled_Stream_Starvation` (waiting for upstream data), MM2S calls it
+/// `Stalled_Stream_Backpressure` (waiting for downstream space). Both
+/// live at bit 4 today; we carry the pair so emitters can pick the
+/// correct field per direction and so the loader fails loudly if a
+/// future register revision splits the bit positions.
 ///
 /// Key difference between modules: the `cur_bd` field is 4 bits [27:24]
 /// for compute tiles (16 BDs) but 6 bits [29:24] for memtiles (48 BDs).
 #[derive(Debug, Clone)]
 pub struct StatusFieldLayout {
-    pub status: BitField,               // [1:0] IDLE/STARTING/RUNNING
-    pub stalled_lock_acq: BitField,     // [2]
-    pub stalled_lock_rel: BitField,     // [3]
-    pub stalled_stream: BitField,       // [4]
-    pub stalled_tct: BitField,          // [5]
-    pub error_bd_unavailable: BitField, // [10]
-    pub error_bd_invalid: BitField,     // [11]
-    pub task_queue_overflow: BitField,  // [18]
-    pub channel_running: BitField,      // [19]
-    pub task_queue_size: BitField,      // [22:20]
-    pub cur_bd: BitField,               // [27:24] compute / [29:24] memtile
+    pub status: BitField,                      // [1:0] IDLE/STARTING/RUNNING
+    pub stalled_lock_acq: BitField,            // [2]
+    pub stalled_lock_rel: BitField,            // [3]
+    pub stalled_stream_starvation: BitField,   // [4] S2MM: waiting for upstream data
+    pub stalled_stream_backpressure: BitField, // [4] MM2S: waiting for downstream space
+    pub stalled_tct: BitField,                 // [5]
+    pub error_bd_unavailable: BitField,        // [10]
+    pub error_bd_invalid: BitField,            // [11]
+    pub task_queue_overflow: BitField,         // [18]
+    pub channel_running: BitField,             // [19]
+    pub task_queue_size: BitField,             // [22:20]
+    pub cur_bd: BitField,                      // [27:24] compute / [29:24] memtile
 }
 
 impl StatusFieldLayout {
     /// Build from the register database for a given module.
     ///
-    /// Uses `DMA_S2MM_Status_0` as the canonical source (all channels
-    /// share the same field layout within a module).
+    /// Reads `DMA_S2MM_Status_0` for shared and S2MM-specific fields, then
+    /// reads `DMA_MM2S_Status_0` for the MM2S-named stall (the only field
+    /// whose name differs between the two registers in current AM025).
     pub fn from_regdb(db: &RegisterDb, module: &str) -> Result<Self, String> {
         let m = db
             .module(module)
             .ok_or_else(|| format!("Module '{}' not found in register database", module))?;
 
-        let reg_name = "DMA_S2MM_Status_0";
-        let reg = m
-            .register(reg_name)
-            .ok_or_else(|| format!("{}.{} not found", module, reg_name))?;
+        let s2mm_reg_name = "DMA_S2MM_Status_0";
+        let s2mm_reg = m
+            .register(s2mm_reg_name)
+            .ok_or_else(|| format!("{}.{} not found", module, s2mm_reg_name))?;
 
-        let get_field = |field_name: &str| -> Result<BitField, String> {
-            reg.field(field_name)
+        let get_s2mm = |field_name: &str| -> Result<BitField, String> {
+            s2mm_reg
+                .field(field_name)
                 .cloned()
-                .ok_or_else(|| format!("{}.{}.{} not found", module, reg_name, field_name))
+                .ok_or_else(|| format!("{}.{}.{} not found", module, s2mm_reg_name, field_name))
         };
 
+        let mm2s_reg_name = "DMA_MM2S_Status_0";
+        let mm2s_reg = m
+            .register(mm2s_reg_name)
+            .ok_or_else(|| format!("{}.{} not found", module, mm2s_reg_name))?;
+
+        let stalled_stream_backpressure = mm2s_reg
+            .field("Stalled_Stream_Backpressure")
+            .cloned()
+            .ok_or_else(|| format!("{}.{}.Stalled_Stream_Backpressure not found", module, mm2s_reg_name))?;
+
         Ok(Self {
-            status: get_field("Status")?,
-            stalled_lock_acq: get_field("Stalled_Lock_Acq")?,
-            stalled_lock_rel: get_field("Stalled_Lock_Rel")?,
-            stalled_stream: get_field("Stalled_Stream_Starvation")?,
-            stalled_tct: get_field("Stalled_TCT_or_Count_FIFO_Full")?,
-            error_bd_unavailable: get_field("Error_BD_Unavailable")?,
-            error_bd_invalid: get_field("Error_BD_Invalid")?,
-            task_queue_overflow: get_field("Task_Queue_Overflow")?,
-            channel_running: get_field("Channel_Running")?,
-            task_queue_size: get_field("Task_Queue_Size")?,
-            cur_bd: get_field("Cur_BD")?,
+            status: get_s2mm("Status")?,
+            stalled_lock_acq: get_s2mm("Stalled_Lock_Acq")?,
+            stalled_lock_rel: get_s2mm("Stalled_Lock_Rel")?,
+            stalled_stream_starvation: get_s2mm("Stalled_Stream_Starvation")?,
+            stalled_stream_backpressure,
+            stalled_tct: get_s2mm("Stalled_TCT_or_Count_FIFO_Full")?,
+            error_bd_unavailable: get_s2mm("Error_BD_Unavailable")?,
+            error_bd_invalid: get_s2mm("Error_BD_Invalid")?,
+            task_queue_overflow: get_s2mm("Task_Queue_Overflow")?,
+            channel_running: get_s2mm("Channel_Running")?,
+            task_queue_size: get_s2mm("Task_Queue_Size")?,
+            cur_bd: get_s2mm("Cur_BD")?,
         })
     }
 }

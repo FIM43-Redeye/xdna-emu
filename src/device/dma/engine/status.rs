@@ -67,12 +67,24 @@ impl DmaEngine {
             }
         }
 
-        // Check for stream stall (S2MM waiting for data in Transferring state)
+        // Bit 4 of the status register reports a stream-side stall, but
+        // AM025 names it differently per direction: S2MM calls it
+        // Stalled_Stream_Starvation (upstream has no data), MM2S calls
+        // it Stalled_Stream_Backpressure (downstream has no space).
+        // Both live at bit 4; we still pick the correct field so a
+        // future split would surface here rather than silently misreport.
         if let Some(transfer) = ch.fsm.transfer() {
-            if matches!(transfer.direction, TransferDirection::S2MM)
-                && !self.has_stream_in_for_channel(channel)
-            {
-                status = layout.stalled_stream.set_bit(status);
+            match transfer.direction {
+                TransferDirection::S2MM => {
+                    if !self.has_stream_in_for_channel(channel) {
+                        status = layout.stalled_stream_starvation.set_bit(status);
+                    }
+                }
+                TransferDirection::MM2S => {
+                    if self.stream_out.len() >= self.output_fifo_capacity() {
+                        status = layout.stalled_stream_backpressure.set_bit(status);
+                    }
+                }
             }
         }
 

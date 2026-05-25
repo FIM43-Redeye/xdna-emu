@@ -536,6 +536,59 @@ fn test_task_queue_status_register() {
 }
 
 #[test]
+fn test_mm2s_stalled_stream_backpressure_bit() {
+    // AM025 names the bit-4 stall in DMA_MM2S_Status_0 as
+    // Stalled_Stream_Backpressure: channel stalled because the
+    // downstream slave FIFO has no space. We exercise that by
+    // configuring an MM2S transfer larger than the local-slave FIFO
+    // depth and never draining stream_out -- after the first
+    // output_fifo_capacity() words land, the channel must report
+    // the bit set.
+    let layout = &crate::device::regdb::device_reg_layout().memory_status;
+
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+    let mut host_mem = make_host_memory();
+
+    let cap = engine.output_fifo_capacity();
+    let bd_bytes = (cap as u32 + 4) * 4;
+    engine.configure_bd(0, BdConfig::simple_1d(0x100, bd_bytes)).unwrap();
+    engine.enqueue_task(2, 0, 0, false);
+
+    // Drive the engine until stream_out reaches capacity. No draining,
+    // so MM2S must stall once the slave FIFO model is full.
+    let mut steps = 0;
+    while engine.stream_out_len() < cap && steps < 100 {
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        steps += 1;
+    }
+    assert!(
+        engine.stream_out_len() >= cap,
+        "MM2S never reached stream_out capacity ({} words after {} cycles)",
+        engine.stream_out_len(),
+        steps,
+    );
+
+    // One more step in the stalled condition so the FSM stays in
+    // Transferring with backpressure active.
+    engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+
+    let status = engine.get_channel_status(2);
+    assert!(
+        layout.stalled_stream_backpressure.extract_bool(status),
+        "MM2S Stalled_Stream_Backpressure (bit 4) should be set when \
+         stream_out is at capacity, got status=0x{:08X}",
+        status,
+    );
+    assert!(
+        layout.channel_running.extract_bool(status),
+        "Channel_Running should remain set during a stream stall, got \
+         status=0x{:08X}",
+        status,
+    );
+}
+
+#[test]
 fn test_task_queue_multiple_tasks_complete() {
     let mut engine = DmaEngine::new_compute_tile(1, 2);
     let mut tile = make_tile();
