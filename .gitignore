@@ -26,6 +26,10 @@ bridge-runner/.cache/
 tools/validate-readback/build/
 tools/validate-readback/.cache/
 
+# txn-poll-probe build artifacts + clangd cache
+tools/txn-poll-probe/build/
+tools/txn-poll-probe/.cache/
+
 # aiecc.py per-MLIR project directories (created next to .mlir input/output)
 aie.mlir.prj/
 aie_traced.mlir.prj/
