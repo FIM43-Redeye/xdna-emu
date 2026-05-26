@@ -126,10 +126,30 @@ HW behaviour.
 - **First-gap modeling.**  If phase-transition gaps emerge as
   important for accuracy on real workloads, model the additional cost
   via direction-change detection in the executor.
-- **K=16 trailing event.**  EMU produces 17 task durations for K=16,
-  not 16 -- the extra appears to be a stray START_TASK from the
-  channel during dma_wait teardown.  Cosmetic; doesn't affect the
-  per-task or gap measurements.
+- **K=16 EMU diverges from HW behavior (not cosmetic).**  Initial
+  thought was that EMU's K=16 had a trailing phantom event; closer
+  inspection shows it's actually two divergences from HW:
+
+  - HW K=16: 16 MM2S START/FINISHED pairs (correct count), then **zero
+    S2MM events** -- HW wedges between the MM2S phase finishing and
+    the first S2MM dispatch.  Probably hits the 8-deep task queue
+    limit during the deferred dispatch attempts (or a dma_wait timeout
+    after queue management goes wrong).  Bridge test reports `FAIL`
+    with a 4.8s timeout.
+  - EMU K=16: 17 MM2S task pairs (1 phantom at the MM2S->S2MM
+    boundary) + 18 S2MM task pairs (2 phantoms), runs to completion.
+    EMU silently defers dispatches past the 8-deep queue via the
+    `BlockedOnQueue` path -- never hits HW's failure mode -- and
+    emits extra trace events at the phase boundary.
+
+  "Replicate HW including its flaws" means EMU should ALSO fail at
+  K=16 in roughly the same way HW does, not chug through.  The right
+  fix is probably to treat queue overflow as a hard error (no graceful
+  deferral past depth 8) rather than blocking until queue drains.
+  Phantom events would naturally disappear because EMU wouldn't reach
+  the S2MM phase.  Behavioral change with potential blast radius --
+  needs a corpus sweep to check what depends on the current deferral
+  semantics.  Tracked as future work.
 
 ## See also
 
