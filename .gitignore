@@ -30,6 +30,10 @@ tools/validate-readback/.cache/
 tools/txn-poll-probe/build/
 tools/txn-poll-probe/.cache/
 
+# telemetry-probe build artifacts + clangd cache
+tools/telemetry-probe/build/
+tools/telemetry-probe/.cache/
+
 # aiecc.py per-MLIR project directories (created next to .mlir input/output)
 aie.mlir.prj/
 aie_traced.mlir.prj/

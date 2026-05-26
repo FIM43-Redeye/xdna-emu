@@ -274,6 +274,70 @@ shim_test #64/#65/#66) turned out to be unwarranted for this opcode
 family on this firmware version (Phoenix 1.5.5.391, protocol 5.8).
 Future surveys on different firmware versions may behave differently.
 
+**2026-05-25 update**: the "no half-implementations" claim above is
+limited to the 6 NPU4-only opcodes surveyed here. A separate opcode,
+`MSG_OP_GET_TELEMETRY` (0x4) -- which is in both NPU1 and NPU4
+tables and not gated by any `AIE_FEATURE_ON` check -- *was* found to
+be half-implemented. See the new section below.
+
+## Follow-up (2026-05-25): MSG_OP_GET_TELEMETRY (0x4) -- STUBBED on Phoenix
+
+While chasing a trace-independent cycle ground-truth source for
+`dispatch_overhead` calibration, ran `tools/telemetry-probe/` on
+Phoenix to test whether `DRM_AMDXDNA_QUERY_TELEMETRY` with
+`TELEMETRY_TYPE_PROFILING` returned anything useful. The driver
+path is not feature-bit-gated, so unlike the APP_HEALTH case the
+op reaches firmware unconditionally.
+
+Firmware response (decoded from `dyndbg` hex-dump of the mailbox
+RX, `resp data` for `opcode 0x4 size 16 id 0x1d00000e`):
+
+```
+resp data: 00000001 00000000 00000698 00000000
+           ^major   ^minor   ^size    ^status
+           = 1      = 0      = 1688   = 0 (SUCCESS)
+```
+
+i.e. firmware:
+- accepts the op (no `0x4000002` rejection)
+- reports `status = 0` (success)
+- claims to have written 1688 bytes to the host DMA buffer
+
+...and then the buffer contents are **uniformly `0xff` across all
+1688 bytes**. Reproduced for every `telemetry_type` (DISABLED,
+HEALTH, ERROR_INFO, PROFILING, DEBUG) -- each returns the same
+1688-byte `0xff` blob with no variation by type. Driver allocates
+the DMA buffer via `dma_alloc_noncoherent` (no pre-fill), so the
+`0xff` pattern was written by firmware, not leftover memory.
+
+Verdict: **half-implementation**. The handler is wired into the
+firmware dispatch table and returns a well-formed success response,
+but the data is a fixed-fill placeholder. This is worse than the
+INVALID_COMMAND fingerprint of the surveyed NPU4-only ops because
+it presents as a clean success at every layer (mailbox status,
+driver, userspace ioctl) -- a userspace consumer would have to
+inspect the bytes to notice nothing real is there. The shim's
+`npu1_telemetry_handler` (in `src/shim/device.cpp:1172`) explicitly
+overrides `query_rtos_telemetry` to return empty for NPU1, but
+leaves the other four telemetry queries (aie/misc/opcode/stream_buffer)
+inherited from the base handler -- those silently consume the
+`0xff` placeholder as if it were real data.
+
+The empirical methodology generalizes the survey's previous
+conclusion: response status + decoded resp size, not just the
+4-byte INVALID_COMMAND fingerprint, is needed to discriminate
+"firmware doesn't implement" from "firmware stubs out". The
+telemetry-probe tool captures this discriminator and is reusable
+for spot-checking other ops where we suspect a stub.
+
+**Implication for cycle-ground-truth mission**: telemetry was a
+candidate path to trace-independent cycle counts (PROFILING type
+on NPU4 returns per-context scheduling counts, opcode traces,
+etc.). On Phoenix this path is dead. Fallback is direct register
+reads via `MSG_OP_AIE_RW_ACCESS` (0x203), which the original
+survey confirmed is the only NPU4-vs-NPU1 op that's genuinely
+present on Phoenix silicon.
+
 ## Recommended next moves
 
 1. **Possibly upstreamable: `a155466` xdna_msg_cb size-check
@@ -310,3 +374,5 @@ Future surveys on different firmware versions may behave differently.
 - `xdna-driver` `cd6bf13` -- the abandoned bypass module parameter
   (revert), retained in history for context.
 - `tools/validate-readback/` -- M0 probe + AIE_RW_ACCESS validation.
+- `tools/telemetry-probe/` -- direct-ioctl tool that surfaced the
+  GET_TELEMETRY stub (2026-05-25 follow-up).
