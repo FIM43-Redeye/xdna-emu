@@ -172,16 +172,28 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // Reinstate when multi-BD-per-task calibration justifies a
             // per-BD cost on top of the per-task cold-start.
             host_memory_latency_cycles: 0,
-            // Per-direction one-shot cold-start (HW calibration 2026-05-25,
-            // large-N sub-fit on _diag_shim_throughput_sweep at N >= 1024):
-            //   MM2S: cold_start = 747 cyc, slope = 1.05 cyc/word, R^2 = 0.996
-            //   S2MM: cold_start = 171 cyc, slope = 1.00 cyc/word, R^2 = 1.000
-            // MM2S is larger because the push direction has to issue a DDR
-            // read before words start streaming; S2MM is downstream of an
-            // already-warm memtile buffer.  See
-            // findings/2026-05-25-shim-throughput-1-word-per-cycle.md.
-            shim_ddr_cold_start_mm2s_cycles: 747,
-            shim_ddr_cold_start_s2mm_cycles: 171,
+            // Shim DMA timing decomposes into two terms (2026-05-25
+            // chain-sweep calibration on _diag_shim_chain_sweep K=8):
+            //   (1) Cold-start: one-shot per channel per session, fires
+            //       only on the FIRST task touching host memory.  Subsequent
+            //       tasks skip it -- HW keeps the channel "warm" indefinitely.
+            //   (2) Per-task overhead: paid on EVERY task, regardless of
+            //       first-vs-subsequent.  Covers BD programming and per-task
+            //       AXI burst arbitration.
+            // For single-task workloads, the two terms sum to what the prior
+            // N-sweep fit called "cold_start" (747/171 cyc).  The split is
+            // necessary to model chained dispatches correctly (object FIFO,
+            // etc.) where cold-start amortizes across K tasks.
+            //   MM2S: cold = 498, per-task = 249 (sum = 747)
+            //   S2MM: cold = 0,   per-task = 168 (sum = 168, near prior 171)
+            // S2MM "cold" is essentially zero -- the pull direction never
+            // pays a DDR read pipeline fill because the channel is fed by
+            // an already-warm memtile.  See finding
+            // 2026-05-25-shim-bd-chain-amortization.
+            shim_ddr_cold_start_mm2s_cycles: 498,
+            shim_ddr_cold_start_s2mm_cycles: 0,
+            shim_per_task_overhead_mm2s_cycles: 249,
+            shim_per_task_overhead_s2mm_cycles: 168,
         },
         stream_switch: StreamSwitchTiming {
             // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /

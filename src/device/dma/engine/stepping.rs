@@ -107,18 +107,23 @@ impl DmaEngine {
     /// Consume the first-BD-of-task bonus into the next MemoryLatency budget.
     ///
     /// Returns extra cycles to add to memory_latency_cycles when entering
-    /// MemoryLatency for the first BD of a task. Combines:
-    /// - `channel_start_cycles`: generic "start trigger to first data" cost
-    ///   that applies to every channel/tile.
-    /// - `shim_ddr_cold_start_{mm2s,s2mm}_cycles`: one-shot per-direction
-    ///   cold-start, only for shim DMA tasks that touch host memory.  MM2S
-    ///   (push) is larger because it has to fill the DDR read pipeline;
-    ///   S2MM (pull) is shorter because data is already streaming in from
-    ///   memtile.
+    /// MemoryLatency for the first BD of a task.  Combines three terms:
     ///
-    /// Both fire once per Idle->task transition; the flag clears here and is
-    /// re-armed when the channel re-enters Idle (in `after_transfer_done`)
-    /// or via `stop_channel`.
+    /// - `channel_start_cycles`: generic "start trigger to first data" cost.
+    ///   Fires on every task (every Idle->BdSetup), tile-agnostic.
+    /// - `shim_per_task_overhead_{mm2s,s2mm}_cycles`: per-task overhead on
+    ///   shim DMA touching host memory.  Fires on every task -- covers BD
+    ///   programming + per-task AXI burst arbitration.
+    /// - `shim_ddr_cold_start_{mm2s,s2mm}_cycles`: one-shot cold-start on
+    ///   the FIRST task ever on this channel session (gated on
+    ///   `has_paid_cold_start`).  Covers DDR read pipeline fill (MM2S) /
+    ///   initial AXI setup (S2MM).  Subsequent tasks skip it even with long
+    ///   idle gaps -- HW keeps the channel warm indefinitely.  Reset only
+    ///   on `stop_channel` (channel reset).
+    ///
+    /// `is_first_bd` is reset to true by `after_transfer_done` (Idle re-entry)
+    /// and by `stop_channel`; `has_paid_cold_start` is reset only by
+    /// `stop_channel`.
     fn consume_first_bd_bonus(&mut self, ch_idx: usize, transfer: &Transfer) -> u16 {
         if !self.channels[ch_idx].is_first_bd {
             return 0;
@@ -126,10 +131,19 @@ impl DmaEngine {
         self.channels[ch_idx].is_first_bd = false;
         let mut bonus = self.timing_config.channel_start_cycles as u16;
         if self.tile_kind.is_shim() && transfer.involves_host_memory() {
+            // Per-task overhead fires on every task.
             bonus += match transfer.direction {
-                TransferDirection::MM2S => self.timing_config.shim_ddr_cold_start_mm2s_cycles,
-                TransferDirection::S2MM => self.timing_config.shim_ddr_cold_start_s2mm_cycles,
+                TransferDirection::MM2S => self.timing_config.shim_per_task_overhead_mm2s_cycles,
+                TransferDirection::S2MM => self.timing_config.shim_per_task_overhead_s2mm_cycles,
             };
+            // Cold-start fires once per channel session.
+            if !self.channels[ch_idx].has_paid_cold_start {
+                self.channels[ch_idx].has_paid_cold_start = true;
+                bonus += match transfer.direction {
+                    TransferDirection::MM2S => self.timing_config.shim_ddr_cold_start_mm2s_cycles,
+                    TransferDirection::S2MM => self.timing_config.shim_ddr_cold_start_s2mm_cycles,
+                };
+            }
         }
         bonus
     }
@@ -590,9 +604,14 @@ impl DmaEngine {
                 self.channels[ch_idx].task_queue.len()
             );
             self.start_next_queued_task(ch_idx as u8);
-            // start_next_queued_task sets the FSM, return what it set.
-            // Note: is_first_bd is NOT reset here -- back-to-back queued
-            // tasks share the warm DDR controller and don't pay cold-start.
+            // Re-arm is_first_bd so the queued task pays per-task overhead
+            // (channel_start + shim_per_task_overhead_*).  Cold-start does
+            // NOT re-fire because it's gated separately on
+            // has_paid_cold_start -- back-to-back queued tasks share the
+            // warm DDR controller, but each still pays BD programming +
+            // AXI burst setup overhead.  See finding
+            // 2026-05-25-shim-bd-chain-amortization.
+            self.channels[ch_idx].is_first_bd = true;
             return std::mem::take(&mut self.channels[ch_idx].fsm);
         }
 

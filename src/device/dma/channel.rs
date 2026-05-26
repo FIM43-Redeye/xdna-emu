@@ -217,12 +217,21 @@ pub struct ChannelContext {
 
     /// First-BD-of-task gate: true while the channel is waiting to do its
     /// first data movement out of cold idle. Consumed (cleared to false) on
-    /// the first transition into MemoryLatency, where it triggers one-shot
-    /// timing bonuses (channel_start_cycles, and the direction-specific
-    /// shim_ddr_cold_start_{mm2s,s2mm}_cycles for shim tiles touching host
-    /// memory). Reset to true on Idle re-entry
-    /// or stop_channel.
+    /// the first transition into MemoryLatency, where it triggers per-task
+    /// timing bonuses (channel_start_cycles always, plus the per-direction
+    /// `shim_per_task_overhead_{mm2s,s2mm}_cycles` for shim+host transfers).
+    /// Reset to true on Idle re-entry or stop_channel -- so fires once per
+    /// task dispatch (Idle->BdSetup transition).
     pub is_first_bd: bool,
+
+    /// Channel cold-start gate: false until the channel pays its one-shot
+    /// `shim_ddr_cold_start_*_cycles` cost on the first task that touches
+    /// host memory.  Once true, subsequent tasks on this channel skip the
+    /// cold-start even if separated by long idle gaps -- HW keeps the
+    /// channel "warm" indefinitely within a session.  Reset on
+    /// stop_channel (channel reset / hard stop simulates a fresh
+    /// boot for that channel).
+    pub has_paid_cold_start: bool,
 
     /// Performance counters.
     pub stats: ChannelStats,
@@ -254,6 +263,7 @@ impl ChannelContext {
             task_config: ChannelTaskConfig::default(),
             error_bd_unavailable: false,
             is_first_bd: true,
+            has_paid_cold_start: false,
             stats: ChannelStats::default(),
             prev_starving: false,
             prev_lock_stalled: false,
@@ -359,6 +369,7 @@ impl ChannelContext {
         self.task_config = ChannelTaskConfig::default();
         self.error_bd_unavailable = false;
         self.is_first_bd = true;
+        self.has_paid_cold_start = false;
         self.stats = ChannelStats::default();
     }
 }

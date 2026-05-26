@@ -82,15 +82,24 @@ pub struct DmaTimingConfig {
     /// cold-start values as of 2026-05-25; left as 0 by default.
     pub host_memory_latency_cycles: u16,
 
-    /// One-shot cold-start latency for shim MM2S DMA tasks touching host
-    /// memory.  Applied on the first BD of a task; subsequent BDs in the
-    /// chain do not pay this.
+    /// True one-shot cold-start latency for shim MM2S DMA, once per channel
+    /// per session.  Covers DDR read pipeline fill + AXI-master burst setup
+    /// that only happen on the FIRST task; chain-amortized across all
+    /// subsequent tasks even with gaps.  See `DmaTiming` docstring.
     pub shim_ddr_cold_start_mm2s_cycles: u16,
 
-    /// One-shot cold-start latency for shim S2MM DMA tasks touching host
-    /// memory.  Applied on the first BD of a task; subsequent BDs in the
-    /// chain do not pay this.
+    /// True one-shot cold-start latency for shim S2MM DMA, once per
+    /// channel per session.  Near-zero on Phoenix (write side has no DDR
+    /// read pipeline to fill).  See `DmaTiming` docstring.
     pub shim_ddr_cold_start_s2mm_cycles: u16,
+
+    /// Per-task overhead on shim MM2S DMA, paid on every task.  Covers
+    /// BD programming + per-task AXI burst arbitration.  Distinct from
+    /// `shim_ddr_cold_start_mm2s_cycles` (one-shot per channel).
+    pub shim_per_task_overhead_mm2s_cycles: u16,
+
+    /// Per-task overhead on shim S2MM DMA, paid on every task.
+    pub shim_per_task_overhead_s2mm_cycles: u16,
 }
 
 /// Per-arch DMA behavior, consulted at DmaEngine construction and at the

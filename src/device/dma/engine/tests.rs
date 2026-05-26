@@ -325,27 +325,34 @@ fn test_first_bd_bonus_rearms_after_idle() {
     assert!(engine.channels[2].is_first_bd, "is_first_bd re-armed when channel goes Idle");
 }
 
-/// Shim DDR cold-start fires only on shim+host-memory first BDs.
+/// Shim DDR timing decomposes into three terms (chain-sweep calibration
+/// 2026-05-25): channel_start_cycles (every task, all tiles),
+/// shim_per_task_overhead_{mm2s,s2mm} (every task on shim+host), and
+/// shim_ddr_cold_start_{mm2s,s2mm} (once per channel session, on shim+host).
 ///
-/// On compute the bonus is `channel_start_cycles` only (no DDR cold-start).
-/// On shim with a host-memory transfer the bonus adds either
-/// `shim_ddr_cold_start_mm2s_cycles` or `_s2mm_cycles` on top, depending
-/// on the transfer direction.
+/// On compute / non-host transfers the bonus is `channel_start_cycles` only.
+/// On shim+host transfers the bonus includes the per-task overhead always,
+/// plus the cold-start on the FIRST task of the session.
 #[test]
-fn test_shim_ddr_cold_start_only_on_shim_with_host_memory() {
+fn test_shim_ddr_timing_decomposition() {
     let cfg = DmaTimingConfig::default();
     assert_eq!(cfg.channel_start_cycles, 2);
-    // Calibrated 2026-05-25 from _diag_shim_throughput_sweep.
-    assert_eq!(cfg.shim_ddr_cold_start_mm2s_cycles, 747);
-    assert_eq!(cfg.shim_ddr_cold_start_s2mm_cycles, 171);
+    // Calibrated 2026-05-25 from _diag_shim_chain_sweep K=8 within-run
+    // deltas (steady-state minus first-task isolates cold-start; steady-
+    // state minus N*slope isolates per-task overhead).
+    assert_eq!(cfg.shim_ddr_cold_start_mm2s_cycles, 498);
+    assert_eq!(cfg.shim_ddr_cold_start_s2mm_cycles, 0);
+    assert_eq!(cfg.shim_per_task_overhead_mm2s_cycles, 249);
+    assert_eq!(cfg.shim_per_task_overhead_s2mm_cycles, 168);
     assert_eq!(cfg.shim_words_per_cycle, 1);
 
-    // stop_channel re-arms the flag (covers external interrupts of in-flight tasks).
+    // stop_channel re-arms BOTH gates (channel reset == fresh boot).
     let mut engine = DmaEngine::new_shim_tile(0, 0);
     engine.configure_bd(0, BdConfig::simple_1d(0x1000, 16)).unwrap();
     engine.start_channel(0, 0).unwrap();
     engine.stop_channel(0).unwrap();
-    assert!(engine.channels[0].is_first_bd, "stop_channel re-arms the bonus flag");
+    assert!(engine.channels[0].is_first_bd, "stop_channel re-arms is_first_bd");
+    assert!(!engine.channels[0].has_paid_cold_start, "stop_channel re-arms has_paid_cold_start");
 }
 
 #[test]

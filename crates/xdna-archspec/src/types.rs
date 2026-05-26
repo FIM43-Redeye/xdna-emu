@@ -1184,22 +1184,45 @@ pub struct DmaTiming {
     /// Re-enable when multi-BD-per-task calibration data justifies a
     /// non-zero per-BD cost on top of the per-task cold-start.
     pub host_memory_latency_cycles: u16,
-    /// One-shot cold-start latency for shim MM2S DMA tasks touching host
-    /// memory.  Fires once per Idle -> task transition on the first BD;
-    /// subsequent BDs in the chain do not pay this.  Covers DDR read
-    /// pipeline fill + shim controller setup before words start streaming.
+    /// True one-shot cold-start latency for shim MM2S DMA, once per channel
+    /// per session.  Covers DDR read pipeline fill + initial AXI-master
+    /// burst setup -- behaviors that only happen the FIRST time the channel
+    /// touches host memory in a session.  Subsequent tasks on the same
+    /// channel skip this, even if separated by long idle gaps (HW seems to
+    /// keep the channel "warm" indefinitely within a session).
     ///
-    /// HW calibration (2026-05-25, large-N sub-fit on
-    /// _diag_shim_throughput_sweep): 747 cyc.  See finding
-    /// 2026-05-25-shim-throughput-1-word-per-cycle.
+    /// HW calibration (chain-sweep K=8 first-task delta, 2026-05-25):
+    /// 498 cyc (= 747 N-sweep cold - 249 per-task overhead).  The earlier
+    /// 747 figure folded per-task overhead into "cold"; this split makes
+    /// the chain behavior right.  See finding
+    /// 2026-05-25-shim-bd-chain-amortization.
     pub shim_ddr_cold_start_mm2s_cycles: u16,
-    /// One-shot cold-start latency for shim S2MM DMA tasks touching host
-    /// memory.  Pull direction has a much shorter cold-start than push
-    /// because data is already streaming into shim from memtile -- no
-    /// DDR read pipeline to fill, only the DDR write path setup.
+    /// True one-shot cold-start latency for shim S2MM DMA, once per
+    /// channel per session.  Near-zero on Phoenix: the write side of the
+    /// shim DMA doesn't have a DDR read pipeline to fill; the per-task
+    /// overhead is essentially all of the "cold-start" cost we previously
+    /// modeled.
     ///
-    /// HW calibration (2026-05-25, large-N sub-fit): 171 cyc.
+    /// HW calibration (2026-05-25 chain-sweep delta): ~3 cyc, within noise
+    /// of 0.  Field retained for symmetry and in case future silicon has
+    /// a measurable S2MM cold-start.
     pub shim_ddr_cold_start_s2mm_cycles: u16,
+    /// Per-task overhead on shim MM2S DMA touching host memory, paid on
+    /// every task (every Idle -> task transition), not just the first.
+    /// Covers BD programming + AXI burst arbitration + per-task DDR
+    /// setup.  Distinct from `shim_ddr_cold_start_mm2s_cycles`, which
+    /// fires only on the first task of a channel session.
+    ///
+    /// HW calibration (chain-sweep K=8 steady-state, 2026-05-25):
+    /// 249 cyc.  See finding 2026-05-25-shim-bd-chain-amortization.
+    pub shim_per_task_overhead_mm2s_cycles: u16,
+    /// Per-task overhead on shim S2MM DMA touching host memory, paid on
+    /// every task.  Smaller than MM2S -- pulling out of memtile is
+    /// cheaper to set up than pushing into DDR.
+    ///
+    /// HW calibration (chain-sweep K=8 steady-state, 2026-05-25):
+    /// 168 cyc.
+    pub shim_per_task_overhead_s2mm_cycles: u16,
 }
 
 /// Stream switch timing and physical constants.

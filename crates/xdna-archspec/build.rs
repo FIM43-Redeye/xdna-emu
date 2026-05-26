@@ -436,6 +436,18 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             t.dma.shim_ddr_cold_start_s2mm_cycles
         )
         .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_SHIM_PER_TASK_OVERHEAD_MM2S_CYCLES: u16 = {};",
+            t.dma.shim_per_task_overhead_mm2s_cycles
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_SHIM_PER_TASK_OVERHEAD_S2MM_CYCLES: u16 = {};",
+            t.dma.shim_per_task_overhead_s2mm_cycles
+        )
+        .unwrap();
         writeln!(out).unwrap();
 
         writeln!(out, "    // Stream switch timing").unwrap();

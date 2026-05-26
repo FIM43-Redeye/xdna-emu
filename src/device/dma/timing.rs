@@ -50,14 +50,24 @@ pub struct DmaTimingConfig {
     /// cold-start values as of 2026-05-25; default is 0.
     pub host_memory_latency_cycles: u16,
 
-    /// One-shot cold-start latency for shim MM2S DMA tasks touching host
-    /// memory.  Applied on the first BD of a task; subsequent BDs in
-    /// the same chain do not pay this.  Reset on Idle re-entry.
+    /// True one-shot cold-start latency for shim MM2S DMA, once per
+    /// channel per session.  Fires only on the FIRST task on this channel
+    /// after the engine starts; subsequent tasks skip it (HW keeps the
+    /// channel warm indefinitely).  See finding
+    /// 2026-05-25-shim-bd-chain-amortization.
     pub shim_ddr_cold_start_mm2s_cycles: u16,
 
-    /// One-shot cold-start latency for shim S2MM DMA tasks touching host
-    /// memory.  Pull direction has a shorter cold-start than push.
+    /// True one-shot cold-start latency for shim S2MM DMA.  Near-zero on
+    /// Phoenix -- pull direction never fills a DDR read pipeline.
     pub shim_ddr_cold_start_s2mm_cycles: u16,
+
+    /// Per-task overhead on shim MM2S DMA touching host memory, paid on
+    /// EVERY task.  Distinct from `shim_ddr_cold_start_mm2s_cycles` which
+    /// is one-shot per session.
+    pub shim_per_task_overhead_mm2s_cycles: u16,
+
+    /// Per-task overhead on shim S2MM DMA touching host memory.
+    pub shim_per_task_overhead_s2mm_cycles: u16,
 }
 
 impl Default for DmaTimingConfig {
@@ -88,6 +98,8 @@ impl DmaTimingConfig {
             host_memory_latency_cycles: m.host_memory_latency_cycles,
             shim_ddr_cold_start_mm2s_cycles: m.shim_ddr_cold_start_mm2s_cycles,
             shim_ddr_cold_start_s2mm_cycles: m.shim_ddr_cold_start_s2mm_cycles,
+            shim_per_task_overhead_mm2s_cycles: m.shim_per_task_overhead_mm2s_cycles,
+            shim_per_task_overhead_s2mm_cycles: m.shim_per_task_overhead_s2mm_cycles,
         }
     }
 
