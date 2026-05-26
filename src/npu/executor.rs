@@ -492,7 +492,20 @@ impl NpuExecutor {
                     self.state = ExecutorState::Done;
                     AdvanceResult::Done
                 } else {
-                    let retire_cycles = self.cycle_model.cost_of(&instr).saturating_sub(1);
+                    // Per-instruction CMP retirement cost from the cycle
+                    // model.  Plus a flat dispatch_overhead added if this
+                    // Write32 was a DMA Task_Queue trigger -- captures
+                    // controller-side DMA arbiter / AXI setup cost that
+                    // the per-packet model alone undershoots by ~10x on
+                    // chain workloads.  See finding
+                    // 2026-05-25-shim-bd-chain-amortization.
+                    let mut retire_cycles = self.cycle_model.cost_of(&instr).saturating_sub(1);
+                    if let NpuInstruction::Write32 { reg_off, .. } = &instr {
+                        let (col, row, offset) = decode_npu_address(*reg_off, device.start_col);
+                        if Self::is_task_dispatch_write(col, row, offset, device) {
+                            retire_cycles = retire_cycles.saturating_add(self.cycle_model.dispatch_overhead);
+                        }
+                    }
                     if retire_cycles > 0 {
                         self.state = ExecutorState::RetiringInstruction {
                             next_index: new_index,
@@ -1222,6 +1235,65 @@ impl NpuExecutor {
         }
 
         false
+    }
+
+    /// Pure detector for "is this Write32's offset a DMA Task_Queue write?".
+    ///
+    /// Mirrors the tile-type-aware queue-register classification done in
+    /// `would_block_on_queue`, but read-only -- no state mutation, no
+    /// blocking behaviour.  Used by `try_advance` to apply
+    /// `cycle_model.dispatch_overhead` on the retirement cost of any
+    /// Write32 that triggers a task dispatch.
+    ///
+    /// Returns true if the (col, row, offset) triple targets a Task_Queue
+    /// register of any DMA engine in this device.
+    fn is_task_dispatch_write(col: u8, row: u8, offset: u32, device: &DeviceState) -> bool {
+        let tile_kind = match device.tile(col as usize, row as usize).map(|t| t.tile_kind) {
+            Some(tt) => tt,
+            None => return false,
+        };
+        let dma = match device.array.dma_engine(col, row) {
+            Some(d) => d,
+            None => return false,
+        };
+        let s2mm_channels = dma.s2mm_channel_count() as u8;
+        let mm2s_channels = dma.mm2s_channel_count() as u8;
+        let reg_layout = crate::device::regdb::device_reg_layout();
+        match tile_kind {
+            TileKind::Compute => {
+                let base = reg_layout.memory_channel_base;
+                let stride = reg_layout.memory_channel_stride;
+                Self::channel_from_queue_write(
+                    offset,
+                    base,
+                    stride,
+                    s2mm_channels,
+                    s2mm_channels + mm2s_channels,
+                )
+                .is_some()
+            }
+            TileKind::Mem => {
+                let stride = reg_layout.memtile_channel_stride;
+                let s2mm_base = reg_layout.memtile_channel_s2mm_base;
+                let mm2s_base = reg_layout.memtile_channel_mm2s_base;
+                Self::channel_from_queue_write(offset, s2mm_base, stride, s2mm_channels, s2mm_channels)
+                    .is_some()
+                    || Self::channel_from_queue_write(offset, mm2s_base, stride, mm2s_channels, mm2s_channels)
+                        .is_some()
+            }
+            TileKind::ShimNoc | TileKind::ShimPl => {
+                let base = reg_layout.shim_channel_base;
+                let stride = reg_layout.shim_channel_stride;
+                Self::channel_from_queue_write(
+                    offset,
+                    base,
+                    stride,
+                    s2mm_channels,
+                    s2mm_channels + mm2s_channels,
+                )
+                .is_some()
+            }
+        }
     }
 
     /// Check if a register offset is a DMA Task_Queue write within a channel block.

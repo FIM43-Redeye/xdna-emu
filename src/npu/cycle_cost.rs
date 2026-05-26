@@ -130,6 +130,21 @@ pub struct CycleCostModel {
 
     /// Register write completion at the target. Derived from AM025.
     pub register_write: u64,
+
+    /// Flat overhead added to the retirement cost of any Write32 that
+    /// triggers a DMA task dispatch (writes to a channel's Start_Queue
+    /// register).  This is the per-dma_memcpy_nd controller overhead
+    /// HW pays that's NOT captured by the per-packet CMP decode cost
+    /// alone -- presumably DMA controller arbitration, AXI burst setup,
+    /// and inter-dispatch synchronization that happens on top of the
+    /// AXI write itself. (calibrated)
+    ///
+    /// HW calibration (2026-05-25 K-sweep on _diag_shim_chain_sweep,
+    /// steady-state inter-task gaps after the first): ~2500 cyc added
+    /// on top of the existing per-instruction CMP costs reproduces
+    /// HW gaps of ~2800 cyc/dispatch.  See finding
+    /// 2026-05-25-shim-bd-chain-amortization.
+    pub dispatch_overhead: u64,
 }
 
 impl CycleCostModel {
@@ -154,6 +169,7 @@ impl CycleCostModel {
             plio_aie_to_pl: 0,
             plio_pl_to_aie: 0,
             register_write: 0,
+            dispatch_overhead: 0,
         }
     }
 
@@ -183,6 +199,7 @@ impl CycleCostModel {
             plio_aie_to_pl: 4,      // aie_xtlm.cpp:202
             plio_pl_to_aie: 3,      // aie_xtlm.cpp:232
             register_write: 1,      // AM025
+            dispatch_overhead: 0,
         }
     }
 
@@ -265,6 +282,14 @@ impl CycleCostModel {
             plio_aie_to_pl: 4,      // aie_xtlm.cpp:202
             plio_pl_to_aie: 3,      // aie_xtlm.cpp:232
             register_write: 1,      // AM025
+            // K-sweep calibration: HW inter-task gaps ~2800 cyc, EMU per-
+            // instruction costs sum to ~313 cyc for one dma_memcpy_nd's
+            // worth of NPU instructions -- the 2500 cyc difference is
+            // controller-side dispatch overhead (DMA arbiter, AXI burst
+            // setup, inter-dispatch sync) that we model as a flat per-
+            // task-start additive.  See finding
+            // 2026-05-25-shim-bd-chain-amortization.
+            dispatch_overhead: 2500,
         }
     }
 
