@@ -106,3 +106,7 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+
+# rw-access-probe build artifacts + clangd cache
+tools/rw-access-probe/build/
+tools/rw-access-probe/.cache/

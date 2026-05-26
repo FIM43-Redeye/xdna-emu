@@ -46,35 +46,60 @@ const char* type_name(uint32_t t) {
     }
 }
 
-void hex_dump(const uint8_t* data, size_t len, size_t max_lines = 16) {
-    size_t lines_printed = 0;
-    bool found_nonzero = false;
-
-    // First pass: just look for nonzero ranges.
-    for (size_t i = 0; i < len; i += 16) {
-        bool any_nz = false;
-        for (size_t j = 0; j < 16 && i + j < len; ++j) {
-            if (data[i + j] != 0) { any_nz = true; break; }
-        }
-        if (any_nz) {
-            if (!found_nonzero) {
-                std::printf("  --- nonzero bytes ---\n");
-                found_nonzero = true;
-            }
-            std::printf("  %04zx:", i);
-            for (size_t j = 0; j < 16 && i + j < len; ++j) {
-                std::printf(" %02x", data[i + j]);
-                if (j == 7) std::printf(" ");
-            }
-            std::printf("\n");
-            if (++lines_printed >= max_lines) {
-                std::printf("  ... (truncated; %zu bytes total)\n", len);
-                return;
-            }
-        }
+void hex_line(const uint8_t* data, size_t i, size_t len) {
+    std::printf("  %04zx:", i);
+    for (size_t j = 0; j < 16 && i + j < len; ++j) {
+        std::printf(" %02x", data[i + j]);
+        if (j == 7) std::printf(" ");
     }
-    if (!found_nonzero) {
-        std::printf("  (all zeros across %zu bytes)\n", len);
+    std::printf("\n");
+}
+
+// Categorize each 16-byte row of `data` by content and print a concise summary:
+// runs of all-0xff or all-0x00 collapse to "[lo..hi] all 0xX", anything else
+// is dumped verbatim. Plus, always dump the explicit "interest range"
+// (0x180..0x1c0) which covers offsets 0x198-0x19f populated by the FW handler
+// per the RE'd npu-fw FUN_08adae28.
+void hex_dump(const uint8_t* data, size_t len) {
+    constexpr size_t INTEREST_LO = 0x180;
+    constexpr size_t INTEREST_HI = 0x1c0;
+
+    auto row_kind = [](const uint8_t* p, size_t n) -> int {
+        // 0 = all zero, 1 = all 0xff, 2 = mixed
+        bool z = true, f = true;
+        for (size_t k = 0; k < n; ++k) {
+            if (p[k] != 0x00) z = false;
+            if (p[k] != 0xff) f = false;
+        }
+        if (z) return 0;
+        if (f) return 1;
+        return 2;
+    };
+
+    size_t i = 0;
+    while (i < len) {
+        // Always dump the interest range verbatim.
+        if (i >= INTEREST_LO && i < INTEREST_HI) {
+            hex_line(data, i, len);
+            i += 16;
+            continue;
+        }
+        size_t row_n = std::min<size_t>(16, len - i);
+        int k = row_kind(data + i, row_n);
+        if (k == 2) {
+            hex_line(data, i, len);
+            i += 16;
+            continue;
+        }
+        // Collapse a run of identical-kind rows, stopping at INTEREST boundary
+        // or at end-of-buffer.
+        size_t start = i;
+        size_t stop_at = (i < INTEREST_LO) ? INTEREST_LO : len;
+        do {
+            i += 16;
+        } while (i < stop_at &&
+                 row_kind(data + i, std::min<size_t>(16, len - i)) == k);
+        std::printf("  [%04zx..%04zx] all 0x%02x\n", start, i - 1, k == 0 ? 0 : 0xff);
     }
 }
 
@@ -119,7 +144,7 @@ int probe_type(int fd, uint32_t type) {
         std::printf("  no data section in buffer\n");
         return 0;
     }
-    hex_dump(buf.data() + data_off, BUFFER_SIZE - data_off, /*max_lines*/ 24);
+    hex_dump(buf.data() + data_off, BUFFER_SIZE - data_off);
     return 0;
 }
 
