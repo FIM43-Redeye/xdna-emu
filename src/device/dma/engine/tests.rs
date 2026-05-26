@@ -328,13 +328,17 @@ fn test_first_bd_bonus_rearms_after_idle() {
 /// Shim DDR cold-start fires only on shim+host-memory first BDs.
 ///
 /// On compute the bonus is `channel_start_cycles` only (no DDR cold-start).
-/// On shim with a host-memory transfer the bonus adds
-/// `shim_ddr_cold_start_cycles` on top.
+/// On shim with a host-memory transfer the bonus adds either
+/// `shim_ddr_cold_start_mm2s_cycles` or `_s2mm_cycles` on top, depending
+/// on the transfer direction.
 #[test]
 fn test_shim_ddr_cold_start_only_on_shim_with_host_memory() {
     let cfg = DmaTimingConfig::default();
     assert_eq!(cfg.channel_start_cycles, 2);
-    assert_eq!(cfg.shim_ddr_cold_start_cycles, 1500);
+    // Calibrated 2026-05-25 from _diag_shim_throughput_sweep.
+    assert_eq!(cfg.shim_ddr_cold_start_mm2s_cycles, 747);
+    assert_eq!(cfg.shim_ddr_cold_start_s2mm_cycles, 171);
+    assert_eq!(cfg.shim_words_per_cycle, 1);
 
     // stop_channel re-arms the flag (covers external interrupts of in-flight tasks).
     let mut engine = DmaEngine::new_shim_tile(0, 0);

@@ -1158,8 +1158,17 @@ pub struct DmaTiming {
     pub bd_setup_cycles: u8,
     /// Cycles from start trigger to first data.
     pub channel_start_cycles: u8,
-    /// Throughput: words (32-bit) per cycle per channel.
+    /// Throughput: words (32-bit) per cycle per channel for non-host
+    /// (tile-local / memtile / compute) DMA transfers.  Derived from the
+    /// tile data-memory bus width (AM025 DATAMEMORY_WIDTH).
     pub words_per_cycle: u8,
+    /// Throughput: words (32-bit) per cycle per channel for shim DMA
+    /// transfers touching host memory.  Reflects the shim AXI-master /
+    /// AXI4-Stream rate to DDR, which is narrower than the tile data
+    /// memory bus on Phoenix.  HW measurement (2026-05-25): 1 word/cyc
+    /// on both MM2S and S2MM directions at large N; see finding
+    /// 2026-05-25-shim-throughput-1-word-per-cycle.
+    pub shim_words_per_cycle: u8,
     /// Memory access latency in cycles (same as data memory pipeline depth).
     pub memory_latency_cycles: u8,
     /// Cycles to check and acquire a lock.
@@ -1169,20 +1178,28 @@ pub struct DmaTiming {
     /// Cycles between finishing one BD and starting next in chain.
     pub bd_chain_cycles: u8,
     /// Extra cycles for shim tile DDR access (initial pipeline fill penalty).
-    /// Derived from trace comparison: ~110cy observed minus ~10cy already
-    /// covered by bd_setup + memory_latency.
+    /// Applied per BD between MemoryLatency and Transferring for shim tiles
+    /// with host memory endpoints.  As of 2026-05-25 this is folded into
+    /// the per-direction cold-start values below; left as 0 by default.
+    /// Re-enable when multi-BD-per-task calibration data justifies a
+    /// non-zero per-BD cost on top of the per-task cold-start.
     pub host_memory_latency_cycles: u16,
-    /// One-shot DDR controller cold-start latency on the first DDR access
-    /// after a shim DMA channel transitions Idle -> active. Models the
-    /// ~2000-3000 cyc precharge + activate + CAS sequence the DDR controller
-    /// performs to open a fresh row. Subsequent BDs in the chain do not pay
-    /// this cost; only the first one out of cold idle.
+    /// One-shot cold-start latency for shim MM2S DMA tasks touching host
+    /// memory.  Fires once per Idle -> task transition on the first BD;
+    /// subsequent BDs in the chain do not pay this.  Covers DDR read
+    /// pipeline fill + shim controller setup before words start streaming.
     ///
-    /// Source: trace observation on add_one_using_dma -- HW shim
-    /// dispatch -> first chunk in memtile took 2699 cyc vs EMU's 162;
-    /// stages 3-5 already calibrated within ~6-12 cyc of HW. See finding
-    /// 2026-05-10-phase-c-stage-attribution.
-    pub shim_ddr_cold_start_cycles: u16,
+    /// HW calibration (2026-05-25, large-N sub-fit on
+    /// _diag_shim_throughput_sweep): 747 cyc.  See finding
+    /// 2026-05-25-shim-throughput-1-word-per-cycle.
+    pub shim_ddr_cold_start_mm2s_cycles: u16,
+    /// One-shot cold-start latency for shim S2MM DMA tasks touching host
+    /// memory.  Pull direction has a much shorter cold-start than push
+    /// because data is already streaming into shim from memtile -- no
+    /// DDR read pipeline to fill, only the DDR write path setup.
+    ///
+    /// HW calibration (2026-05-25, large-N sub-fit): 171 cyc.
+    pub shim_ddr_cold_start_s2mm_cycles: u16,
 }
 
 /// Stream switch timing and physical constants.

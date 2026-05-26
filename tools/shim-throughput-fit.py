@@ -122,23 +122,8 @@ def fit_direction(rows: list[Row], direction: str) -> dict:
     }
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--results-dir", required=True, type=Path)
-    ap.add_argument("--csv-out", type=Path)
-    ap.add_argument("--json-out", type=Path)
-    ap.add_argument("--compiler", default="chess")
-    ap.add_argument("--side", default="hw")
-    args = ap.parse_args()
-
-    rows = collect_rows(args.results_dir)
-    rows = [r for r in rows if r.compiler == args.compiler and r.side == args.side]
-
-    if not rows:
-        print(f"no rows found in {args.results_dir} for compiler={args.compiler} side={args.side}", file=sys.stderr)
-        return 1
-
-    print(f"=== Per-BD-size shim DMA durations ({args.compiler}/{args.side}) ===")
+def print_table(rows: list[Row], label: str) -> None:
+    print(f"=== Per-BD-size shim DMA durations ({label}) ===")
     print(f"{'N':>6} {'MM2S (push)':>14} {'S2MM (pull)':>14}")
     for r in rows:
         mm = f"{r.mm2s_dur:>14}" if r.mm2s_dur is not None else f"{'—':>14}"
@@ -146,8 +131,10 @@ def main() -> int:
         print(f"{r.n:>6} {mm} {ss}")
     print()
 
+
+def print_fits(rows: list[Row], label: str) -> None:
     fits = [fit_direction(rows, d) for d in ("mm2s", "s2mm")]
-    print("=== Linear fits: duration = cold_start + N / rate ===")
+    print(f"=== Linear fits ({label}): duration = cold_start + N / rate ===")
     for f in fits:
         if f.get("n_points", 0) < 2:
             print(f"  {f['direction']:>5}: insufficient data ({f.get('n_points', 0)} points)")
@@ -158,6 +145,66 @@ def main() -> int:
             f"({f['words_per_cyc']:.3f} words/cyc), R^2={f['r_squared']:.4f}, "
             f"n_points={f['n_points']}"
         )
+    print()
+
+
+def print_compare(hw_rows: list[Row], emu_rows: list[Row]) -> None:
+    hw_by_n = {r.n: r for r in hw_rows}
+    emu_by_n = {r.n: r for r in emu_rows}
+    all_n = sorted(set(hw_by_n.keys()) | set(emu_by_n.keys()))
+    print("=== HW vs EMU side-by-side ===")
+    print(f"{'N':>6}  {'MM2S HW':>10}  {'MM2S EMU':>10}  {'MM2S Δ':>10}    {'S2MM HW':>10}  {'S2MM EMU':>10}  {'S2MM Δ':>10}")
+    for n in all_n:
+        hw = hw_by_n.get(n)
+        emu = emu_by_n.get(n)
+        hw_mm = hw.mm2s_dur if hw else None
+        emu_mm = emu.mm2s_dur if emu else None
+        hw_ss = hw.s2mm_dur if hw else None
+        emu_ss = emu.s2mm_dur if emu else None
+        def fmt(v):
+            return f"{v:>10}" if v is not None else f"{'—':>10}"
+        def delta(a, b):
+            if a is None or b is None:
+                return f"{'—':>10}"
+            d = b - a
+            return f"{d:>+10}"
+        print(f"{n:>6}  {fmt(hw_mm)}  {fmt(emu_mm)}  {delta(hw_mm, emu_mm)}    {fmt(hw_ss)}  {fmt(emu_ss)}  {delta(hw_ss, emu_ss)}")
+    print()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--results-dir", required=True, type=Path)
+    ap.add_argument("--csv-out", type=Path)
+    ap.add_argument("--json-out", type=Path)
+    ap.add_argument("--compiler", default="chess")
+    ap.add_argument("--side", default="hw", help="Single-side mode; ignored if --compare is set")
+    ap.add_argument("--compare", action="store_true", help="Show HW vs EMU side-by-side")
+    args = ap.parse_args()
+
+    all_rows = collect_rows(args.results_dir)
+    all_rows = [r for r in all_rows if r.compiler == args.compiler]
+    if not all_rows:
+        print(f"no rows found in {args.results_dir} for compiler={args.compiler}", file=sys.stderr)
+        return 1
+
+    if args.compare:
+        hw_rows = [r for r in all_rows if r.side == "hw"]
+        emu_rows = [r for r in all_rows if r.side == "emu"]
+        print_table(hw_rows, f"{args.compiler}/hw")
+        print_table(emu_rows, f"{args.compiler}/emu")
+        print_compare(hw_rows, emu_rows)
+        print_fits(hw_rows, f"{args.compiler}/hw")
+        print_fits(emu_rows, f"{args.compiler}/emu")
+        rows = hw_rows  # for CSV/JSON output
+    else:
+        rows = [r for r in all_rows if r.side == args.side]
+        if not rows:
+            print(f"no rows for side={args.side}", file=sys.stderr)
+            return 1
+        print_table(rows, f"{args.compiler}/{args.side}")
+        print_fits(rows, f"{args.compiler}/{args.side}")
+    fits = [fit_direction(rows, d) for d in ("mm2s", "s2mm")]
 
     if args.csv_out:
         with args.csv_out.open("w", newline="") as fh:

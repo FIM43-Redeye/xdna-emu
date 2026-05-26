@@ -158,35 +158,30 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // Source: xaiemlgbl_params.h DATAMEMORY_WIDTH = 128.
             // (AIE2P is 256 bits = 8 words/cycle per xaie2psgbl_params.h.)
             words_per_cycle: 4,
+            // Shim DMA host-memory streaming rate.  HW measurement
+            // (2026-05-25, _diag_shim_throughput_sweep large-N sub-fit):
+            // 1 word/cyc on both MM2S and S2MM directions, R^2 0.996/1.000.
+            // The narrower-than-tile-memory rate reflects the shim AXI
+            // master / DDR interface width, not the tile data bus.
+            shim_words_per_cycle: 1,
             memory_latency_cycles: 5,
             lock_acquire_cycles: 1,
             lock_release_cycles: 1,
             bd_chain_cycles: 2,
-            // PCIe + NoC + DDR round-trip latency for the FIRST word of a
-            // shim DMA transfer. After this, throughput is 1 word/cycle.
-            // 100 was an initial guess; bumped to 500 (~1.25us at 400 MHz)
-            // as a first calibration step against HW pipeline-fill data.
-            // See #355a -- proper calibration requires a sweep across
-            // multiple test DMA patterns.
-            host_memory_latency_cycles: 500,
-            // DDR controller cold-start: one-shot precharge + activate + CAS
-            // for the first row open after a shim DMA channel goes from cold
-            // Idle to active. Subsequent BDs in the chain stay warm and do
-            // not pay this.
-            //
-            // 1500 cyc empirical (#355a): measured the data-path delta
-            // shim_dispatch -> compute_s2mm_done on two kernels with very
-            // different first-chunk sizes (add_one_using_dma at 64B and
-            // vector_scalar_using_dma at 4KB). Both showed EMU ~1000 cyc
-            // over HW with cold-start=2500, basically constant despite the
-            // 64x size difference -- the signature of a one-shot fixed cost
-            // sized too high. AM020 cites ~2500 cyc as DDR worst case, but
-            // on a system where the controller is partly warm from prior
-            // activity (typical during back-to-back test runs) the observed
-            // value is closer to 1500. See `2026-05-10-trace-decoder-event-
-            // density-drift.md` for the methodology that made this cleanly
-            // measurable.
-            shim_ddr_cold_start_cycles: 1500,
+            // Folded into per-direction cold-start values as of 2026-05-25.
+            // Reinstate when multi-BD-per-task calibration justifies a
+            // per-BD cost on top of the per-task cold-start.
+            host_memory_latency_cycles: 0,
+            // Per-direction one-shot cold-start (HW calibration 2026-05-25,
+            // large-N sub-fit on _diag_shim_throughput_sweep at N >= 1024):
+            //   MM2S: cold_start = 747 cyc, slope = 1.05 cyc/word, R^2 = 0.996
+            //   S2MM: cold_start = 171 cyc, slope = 1.00 cyc/word, R^2 = 1.000
+            // MM2S is larger because the push direction has to issue a DDR
+            // read before words start streaming; S2MM is downstream of an
+            // already-warm memtile buffer.  See
+            // findings/2026-05-25-shim-throughput-1-word-per-cycle.md.
+            shim_ddr_cold_start_mm2s_cycles: 747,
+            shim_ddr_cold_start_s2mm_cycles: 171,
         },
         stream_switch: StreamSwitchTiming {
             // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /

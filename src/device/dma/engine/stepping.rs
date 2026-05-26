@@ -110,8 +110,11 @@ impl DmaEngine {
     /// MemoryLatency for the first BD of a task. Combines:
     /// - `channel_start_cycles`: generic "start trigger to first data" cost
     ///   that applies to every channel/tile.
-    /// - `shim_ddr_cold_start_cycles`: one-shot DDR controller setup, only
-    ///   for shim DMA tasks that touch host memory.
+    /// - `shim_ddr_cold_start_{mm2s,s2mm}_cycles`: one-shot per-direction
+    ///   cold-start, only for shim DMA tasks that touch host memory.  MM2S
+    ///   (push) is larger because it has to fill the DDR read pipeline;
+    ///   S2MM (pull) is shorter because data is already streaming in from
+    ///   memtile.
     ///
     /// Both fire once per Idle->task transition; the flag clears here and is
     /// re-armed when the channel re-enters Idle (in `after_transfer_done`)
@@ -123,7 +126,10 @@ impl DmaEngine {
         self.channels[ch_idx].is_first_bd = false;
         let mut bonus = self.timing_config.channel_start_cycles as u16;
         if self.tile_kind.is_shim() && transfer.involves_host_memory() {
-            bonus += self.timing_config.shim_ddr_cold_start_cycles;
+            bonus += match transfer.direction {
+                TransferDirection::MM2S => self.timing_config.shim_ddr_cold_start_mm2s_cycles,
+                TransferDirection::S2MM => self.timing_config.shim_ddr_cold_start_s2mm_cycles,
+            };
         }
         bonus
     }
@@ -607,7 +613,15 @@ impl DmaEngine {
         neighbors: &mut NeighborTiles<'_>,
         host_memory: &mut HostMemory,
     ) -> TransferCycleResult {
-        let words_per_cycle = self.timing_config.words_per_cycle as usize;
+        // Shim DMA transfers touching host memory stream at a narrower rate
+        // than tile-local DMAs.  HW measurement (2026-05-25): 1 word/cyc on
+        // Phoenix shim AXI master; tile-local stays at 4 words/cyc (data
+        // memory bus width).
+        let words_per_cycle = if self.tile_kind.is_shim() && transfer.involves_host_memory() {
+            self.timing_config.shim_words_per_cycle as usize
+        } else {
+            self.timing_config.words_per_cycle as usize
+        };
 
         if transfer.has_zero_padding() {
             // Padding-aware path: one word at a time

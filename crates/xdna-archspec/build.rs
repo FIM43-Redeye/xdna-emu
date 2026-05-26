@@ -411,6 +411,8 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
         writeln!(out, "    pub const DMA_CHANNEL_START_CYCLES: u8 = {};", t.dma.channel_start_cycles)
             .unwrap();
         writeln!(out, "    pub const DMA_WORDS_PER_CYCLE: u8 = {};", t.dma.words_per_cycle).unwrap();
+        writeln!(out, "    pub const DMA_SHIM_WORDS_PER_CYCLE: u8 = {};", t.dma.shim_words_per_cycle)
+            .unwrap();
         writeln!(out, "    pub const DMA_MEMORY_LATENCY_CYCLES: u8 = {};", t.dma.memory_latency_cycles)
             .unwrap();
         writeln!(out, "    pub const DMA_LOCK_ACQUIRE_CYCLES: u8 = {};", t.dma.lock_acquire_cycles).unwrap();
@@ -424,8 +426,14 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
         .unwrap();
         writeln!(
             out,
-            "    pub const DMA_SHIM_DDR_COLD_START_CYCLES: u16 = {};",
-            t.dma.shim_ddr_cold_start_cycles
+            "    pub const DMA_SHIM_DDR_COLD_START_MM2S_CYCLES: u16 = {};",
+            t.dma.shim_ddr_cold_start_mm2s_cycles
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_SHIM_DDR_COLD_START_S2MM_CYCLES: u16 = {};",
+            t.dma.shim_ddr_cold_start_s2mm_cycles
         )
         .unwrap();
         writeln!(out).unwrap();

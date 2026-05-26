@@ -218,8 +218,9 @@ pub struct ChannelContext {
     /// First-BD-of-task gate: true while the channel is waiting to do its
     /// first data movement out of cold idle. Consumed (cleared to false) on
     /// the first transition into MemoryLatency, where it triggers one-shot
-    /// timing bonuses (channel_start_cycles, and shim_ddr_cold_start_cycles
-    /// for shim tiles touching host memory). Reset to true on Idle re-entry
+    /// timing bonuses (channel_start_cycles, and the direction-specific
+    /// shim_ddr_cold_start_{mm2s,s2mm}_cycles for shim tiles touching host
+    /// memory). Reset to true on Idle re-entry
     /// or stop_channel.
     pub is_first_bd: bool,
 

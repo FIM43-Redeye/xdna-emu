@@ -38,15 +38,26 @@ pub struct DmaTimingConfig {
     /// Cycles between BD completion and next BD start
     pub bd_chain_cycles: u8,
 
+    /// Throughput: words (32-bit) per cycle for shim DMA transfers
+    /// touching host memory.  Separate from `words_per_cycle` because
+    /// the shim AXI master / DDR interface is narrower than the tile
+    /// data memory bus on Phoenix.  HW measurement: 1 word/cyc.
+    pub shim_words_per_cycle: u8,
+
     /// Extra pipeline latency for shim tile DDR access (NoC + DDR controller).
     /// Applied once per BD, between MemoryLatency and Transferring, only for
-    /// shim tiles with host memory endpoints.
+    /// shim tiles with host memory endpoints.  Folded into per-direction
+    /// cold-start values as of 2026-05-25; default is 0.
     pub host_memory_latency_cycles: u16,
 
-    /// One-shot DDR controller cold-start latency, applied on the first BD of
-    /// a shim DMA task whose transfer touches host memory. Subsequent BDs in
-    /// the same chain do not pay this. Reset on Idle re-entry.
-    pub shim_ddr_cold_start_cycles: u16,
+    /// One-shot cold-start latency for shim MM2S DMA tasks touching host
+    /// memory.  Applied on the first BD of a task; subsequent BDs in
+    /// the same chain do not pay this.  Reset on Idle re-entry.
+    pub shim_ddr_cold_start_mm2s_cycles: u16,
+
+    /// One-shot cold-start latency for shim S2MM DMA tasks touching host
+    /// memory.  Pull direction has a shorter cold-start than push.
+    pub shim_ddr_cold_start_s2mm_cycles: u16,
 }
 
 impl Default for DmaTimingConfig {
@@ -69,12 +80,14 @@ impl DmaTimingConfig {
             bd_setup_cycles: m.bd_setup_cycles,
             channel_start_cycles: m.channel_start_cycles,
             words_per_cycle: m.words_per_cycle,
+            shim_words_per_cycle: m.shim_words_per_cycle,
             memory_latency_cycles: m.memory_latency_cycles,
             lock_acquire_cycles: m.lock_acquire_cycles,
             lock_release_cycles: m.lock_release_cycles,
             bd_chain_cycles: m.bd_chain_cycles,
             host_memory_latency_cycles: m.host_memory_latency_cycles,
-            shim_ddr_cold_start_cycles: m.shim_ddr_cold_start_cycles,
+            shim_ddr_cold_start_mm2s_cycles: m.shim_ddr_cold_start_mm2s_cycles,
+            shim_ddr_cold_start_s2mm_cycles: m.shim_ddr_cold_start_s2mm_cycles,
         }
     }
 

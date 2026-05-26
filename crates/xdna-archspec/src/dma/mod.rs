@@ -54,8 +54,15 @@ pub struct DmaTimingConfig {
     /// Cycles from channel start to first data movement.
     pub channel_start_cycles: u8,
 
-    /// Words (32-bit) transferred per cycle per channel.
+    /// Words (32-bit) transferred per cycle per channel for non-host
+    /// (tile-local / memtile / compute) transfers.
     pub words_per_cycle: u8,
+
+    /// Words (32-bit) transferred per cycle per channel for shim DMA
+    /// transfers touching host memory.  Separate from `words_per_cycle`
+    /// because the shim AXI-master rate to DDR is narrower than the tile
+    /// data memory bus on Phoenix (HW measurement: 1 word/cyc).
+    pub shim_words_per_cycle: u8,
 
     /// Memory access latency in cycles.
     pub memory_latency_cycles: u8,
@@ -71,15 +78,19 @@ pub struct DmaTimingConfig {
 
     /// Extra pipeline latency for shim tile DDR access (NoC + DDR controller).
     /// Applied once per BD, between MemoryLatency and Transferring, only for
-    /// shim tiles with host memory endpoints.
+    /// shim tiles with host memory endpoints.  Folded into the per-direction
+    /// cold-start values as of 2026-05-25; left as 0 by default.
     pub host_memory_latency_cycles: u16,
 
-    /// One-shot DDR controller cold-start latency, applied on the first BD of
-    /// a shim DMA task whose transfer touches host memory. Models the
-    /// precharge + activate + CAS sequence the DDR controller performs to
-    /// open a fresh row after the channel has been idle. Subsequent BDs in
-    /// the same chain do not pay this.
-    pub shim_ddr_cold_start_cycles: u16,
+    /// One-shot cold-start latency for shim MM2S DMA tasks touching host
+    /// memory.  Applied on the first BD of a task; subsequent BDs in the
+    /// chain do not pay this.
+    pub shim_ddr_cold_start_mm2s_cycles: u16,
+
+    /// One-shot cold-start latency for shim S2MM DMA tasks touching host
+    /// memory.  Applied on the first BD of a task; subsequent BDs in the
+    /// chain do not pay this.
+    pub shim_ddr_cold_start_s2mm_cycles: u16,
 }
 
 /// Per-arch DMA behavior, consulted at DmaEngine construction and at the
