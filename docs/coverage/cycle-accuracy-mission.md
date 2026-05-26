@@ -318,8 +318,29 @@ who follow links to "item #9" land somewhere with the redirect.
 
 ### 10. Shim streaming throughput modeling
 
-**Status**: PROPOSED. Blocked on HW measurement of shim DDR egress
-rate as a function of BD size and access pattern.
+**Status**: DONE 2026-05-25.  HW calibration sweep on
+`_diag_shim_throughput_sweep` (12 BD sizes, N=8..16384) showed shim
+DMA runs at 1 word/cyc with direction-asymmetric cold-start (MM2S 747
+cyc, S2MM 171 cyc).  EMU model folded the result:
+
+- `shim_words_per_cycle = 1` (new, separate from tile-local
+  `words_per_cycle = 4`)
+- `shim_ddr_cold_start_mm2s_cycles = 747`, `shim_ddr_cold_start_s2mm_cycles = 171`
+  (replacing single `shim_ddr_cold_start_cycles = 1500`)
+- `host_memory_latency_cycles = 0` (folded into the direction-specific
+  values; field retained for future multi-BD-per-task calibration)
+
+Validation on `_diag_phase_b_add_one_instrumented` stage 1a:
+HW=788 cyc, EMU=773 cyc, gap=15 cyc (down from ~700 cyc undershoot).
+All 4 corpus tests trace-compare CLEAN.
+
+Detail: [`../superpowers/findings/2026-05-25-emu-shim-dma-timing-recalibrated.md`](../superpowers/findings/2026-05-25-emu-shim-dma-timing-recalibrated.md).
+Calibration data: [`../superpowers/findings/2026-05-25-shim-throughput-1-word-per-cycle.md`](../superpowers/findings/2026-05-25-shim-throughput-1-word-per-cycle.md).
+
+#### Original framing (now closed)
+
+Was blocked on HW measurement of shim DDR egress rate as a function
+of BD size and access pattern.
 
 **What**: EMU models shim DMA cold-start (`shim_ddr_cold_start_cycles
 = 1500`, commit `3357b7c`) as a pure pre-data delay, after which
