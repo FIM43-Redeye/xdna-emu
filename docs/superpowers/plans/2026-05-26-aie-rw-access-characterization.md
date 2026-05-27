@@ -519,11 +519,65 @@ Safety: wedge-survey safety patch blocks row=1 memtile. Shim is row=0, unaffecte
 
 ---
 
+## Phase 2a Decision Gate -- CLOSED (2026-05-27)
+
+**Result: structural-variance characterized; model upgrade deferred to a
+dedicated re-calibration sprint.** See
+[`docs/superpowers/findings/2026-05-27-dispatch-overhead-multirun-structural-variance.md`](../findings/2026-05-27-dispatch-overhead-multirun-structural-variance.md).
+
+What landed:
+- 2a.1 -- multi-run trace harness (`tools/multirun-trace-campaign.py`):
+  N=50 across K in {1,2,4,8} = 200 iterations in ~5 min wall-clock.
+  Direct `bridge-trace-runner` + `parse-trace.py` per iteration.
+- 2a.2 -- aggregator (`tools/aggregate-dispatch-overhead.py`):
+  per-(K, direction, gap_index) distribution summaries; reveals
+  bimodal MM2S and structural S2MM patterns.
+- 2a.3 -- visualization (`tools/plot-dispatch-overhead.py`):
+  histograms + boxplots per direction.
+- 2a.6 -- finding doc covering F1-F5 (variance is structural,
+  K-dependent S2MM elevations, MM2S Task_Queue pipelining,
+  HW depth=8 vs aie-rt depth=4, EMU model audit).
+
+What's deferred to a future sprint (Phase 2c):
+- 2a.4 -- re-derive `dispatch_overhead`. A Q-aware refactor that only
+  charges full overhead when the channel was idle at dispatch is the
+  mechanically-correct model upgrade. A one-line constant bump
+  (2500 -> 2785) on the existing universal-application model breaks
+  K=4 MM2S accuracy (the original calibration's empirical tuning
+  relied on offsetting errors).
+- 2a.5 -- update `src/npu/cycle_cost.rs` and `src/npu/executor.rs`.
+  Same blocker -- needs coupled re-calibration of `cmp_decode_cost`,
+  `fabric_cost`, `dispatch_overhead`, and a new
+  `dispatch_overhead_pipelined` field against the full bridge corpus.
+
+Why deferred: the current `dispatch_overhead = 2500` is mechanistically
+wrong (over-counts pipelined dispatches, under-counts serialized ones)
+but empirically tuned at the K-sweep span level. A Q-aware refactor
+needs simultaneous re-tuning of multiple cost components and full
+bridge-suite validation -- that's a dedicated sprint, not a 2a closer.
+
+The variance is now characterized; the model upgrade has a clear
+shape; we know what numbers to target. The remaining work is
+implementation + validation, which benefits from fresh context.
+
+---
+
+## Phase 2b status (unchanged)
+
+Still planned. K=16 wedge state inspection via AIE_RW_ACCESS reads of
+shim DMA channel state at the moment of wedge. Concrete tasks not yet
+written; depends on whether the Phase 2c re-calibration sprint takes
+priority over wedge characterization first.
+
+---
+
 ## Phase 2 (amended) Decision Gate
 
 After Phases 2a and 2b complete:
-- 2a result: dispatch_overhead is either confirmed at 2500 cyc with tighter uncertainty bars, refined to a different constant, or shown to need a conditional model. Either way, the noise structure of K-sweep measurements is understood.
-- 2b result: K=16 wedge mechanism is characterized; EMU's queue-deferral semantics get the appropriate fix.
+- 2a result: variance structure characterized, model upgrade scoped
+  but deferred. (Closed 2026-05-27.)
+- 2b result: K=16 wedge mechanism is characterized; EMU's
+  queue-deferral semantics get the appropriate fix.
 
 **Update this plan** with Phase 3 tasks or close the plan if no harness work is needed.
 
