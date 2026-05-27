@@ -455,6 +455,23 @@ impl NpuExecutor {
                 }
 
                 let instr = self.instructions[next_index].clone();
+
+                // Capture Q-aware dispatch classification BEFORE
+                // execute_instruction runs.  If this Write32 hits a
+                // Task_Queue register, execute_instruction will
+                // enqueue the BD into the DMA channel; we have to
+                // observe the channel state pre-enqueue to tell an
+                // idle-channel "first dispatch" apart from a busy-
+                // channel "pipelined dispatch" -- two regimes with
+                // very different controller costs on HW.  See finding
+                // 2026-05-27-dispatch-overhead-multirun-structural-variance.
+                let dispatch_was_idle = if let NpuInstruction::Write32 { reg_off, .. } = &instr {
+                    let (col, row, offset) = decode_npu_address(*reg_off, device.start_col);
+                    Self::classify_task_dispatch(col, row, offset, device)
+                } else {
+                    None
+                };
+
                 if let Err(e) = self.execute_instruction(&instr, device, host_memory) {
                     let msg = format!("NPU instruction {} execution error: {}", next_index, e);
                     log::error!("{}", msg);
@@ -493,18 +510,23 @@ impl NpuExecutor {
                     AdvanceResult::Done
                 } else {
                     // Per-instruction CMP retirement cost from the cycle
-                    // model.  Plus a flat dispatch_overhead added if this
-                    // Write32 was a DMA Task_Queue trigger -- captures
-                    // controller-side DMA arbiter / AXI setup cost that
-                    // the per-packet model alone undershoots by ~10x on
-                    // chain workloads.  See finding
-                    // 2026-05-25-shim-bd-chain-amortization.
+                    // model.  Plus Q-aware dispatch_overhead added if
+                    // this Write32 was a DMA Task_Queue trigger:
+                    //   - idle channel at write time -> full overhead
+                    //     (cold-start controller cost, ~2500 cyc)
+                    //   - busy channel (queue non-empty or active) ->
+                    //     pipelined overhead (controller burst rate,
+                    //     ~520 cyc)
+                    // See findings 2026-05-25-shim-bd-chain-amortization
+                    // and 2026-05-27-dispatch-overhead-multirun-structural-variance.
                     let mut retire_cycles = self.cycle_model.cost_of(&instr).saturating_sub(1);
-                    if let NpuInstruction::Write32 { reg_off, .. } = &instr {
-                        let (col, row, offset) = decode_npu_address(*reg_off, device.start_col);
-                        if Self::is_task_dispatch_write(col, row, offset, device) {
-                            retire_cycles = retire_cycles.saturating_add(self.cycle_model.dispatch_overhead);
-                        }
+                    if let Some(was_idle) = dispatch_was_idle {
+                        let extra = if was_idle {
+                            self.cycle_model.dispatch_overhead
+                        } else {
+                            self.cycle_model.dispatch_overhead_pipelined
+                        };
+                        retire_cycles = retire_cycles.saturating_add(extra);
                     }
                     if retire_cycles > 0 {
                         self.state = ExecutorState::RetiringInstruction {
@@ -1241,21 +1263,16 @@ impl NpuExecutor {
     ///
     /// Mirrors the tile-type-aware queue-register classification done in
     /// `would_block_on_queue`, but read-only -- no state mutation, no
-    /// blocking behaviour.  Used by `try_advance` to apply
-    /// `cycle_model.dispatch_overhead` on the retirement cost of any
-    /// Write32 that triggers a task dispatch.
+    /// blocking behaviour.  Used by `try_advance` to apply the
+    /// Q-aware dispatch_overhead on the retirement cost of any Write32
+    /// that triggers a task dispatch.
     ///
-    /// Returns true if the (col, row, offset) triple targets a Task_Queue
-    /// register of any DMA engine in this device.
-    fn is_task_dispatch_write(col: u8, row: u8, offset: u32, device: &DeviceState) -> bool {
-        let tile_kind = match device.tile(col as usize, row as usize).map(|t| t.tile_kind) {
-            Some(tt) => tt,
-            None => return false,
-        };
-        let dma = match device.array.dma_engine(col, row) {
-            Some(d) => d,
-            None => return false,
-        };
+    /// Returns `Some(channel)` (in the DMA engine's combined channel
+    /// index space, S2MM first then MM2S) if the (col, row, offset)
+    /// triple targets a Task_Queue register; `None` otherwise.
+    fn task_dispatch_channel(col: u8, row: u8, offset: u32, device: &DeviceState) -> Option<u8> {
+        let tile_kind = device.tile(col as usize, row as usize).map(|t| t.tile_kind)?;
+        let dma = device.array.dma_engine(col, row)?;
         let s2mm_channels = dma.s2mm_channel_count() as u8;
         let mm2s_channels = dma.mm2s_channel_count() as u8;
         let reg_layout = crate::device::regdb::device_reg_layout();
@@ -1270,16 +1287,25 @@ impl NpuExecutor {
                     s2mm_channels,
                     s2mm_channels + mm2s_channels,
                 )
-                .is_some()
+                .map(|(ch, _is_mm2s)| ch)
             }
             TileKind::Mem => {
                 let stride = reg_layout.memtile_channel_stride;
                 let s2mm_base = reg_layout.memtile_channel_s2mm_base;
                 let mm2s_base = reg_layout.memtile_channel_mm2s_base;
-                Self::channel_from_queue_write(offset, s2mm_base, stride, s2mm_channels, s2mm_channels)
-                    .is_some()
-                    || Self::channel_from_queue_write(offset, mm2s_base, stride, mm2s_channels, mm2s_channels)
-                        .is_some()
+                // S2MM block occupies channels [0, s2mm_channels);
+                // MM2S block occupies channels [s2mm_channels, s2mm+mm2s).
+                if let Some((ch, _)) =
+                    Self::channel_from_queue_write(offset, s2mm_base, stride, s2mm_channels, s2mm_channels)
+                {
+                    return Some(ch);
+                }
+                if let Some((rel_ch, _)) =
+                    Self::channel_from_queue_write(offset, mm2s_base, stride, mm2s_channels, mm2s_channels)
+                {
+                    return Some(s2mm_channels + rel_ch);
+                }
+                None
             }
             TileKind::ShimNoc | TileKind::ShimPl => {
                 let base = reg_layout.shim_channel_base;
@@ -1291,9 +1317,31 @@ impl NpuExecutor {
                     s2mm_channels,
                     s2mm_channels + mm2s_channels,
                 )
-                .is_some()
+                .map(|(ch, _is_mm2s)| ch)
             }
         }
+    }
+
+    /// Classify a Task_Queue Write32 as either an idle-channel dispatch
+    /// (full controller setup cost) or a pipelined dispatch (cheap
+    /// burst-rate cost), based on the channel state at the moment the
+    /// write arrives.
+    ///
+    /// Called **before** `execute_instruction` runs so we observe the
+    /// pre-dispatch state -- after execution, the BD has already been
+    /// enqueued and the queue size always reads >= 1.
+    ///
+    /// Returns:
+    /// - `Some(true)`  -- Task_Queue write, channel was idle (queue empty
+    ///                   and ChannelState::Idle)
+    /// - `Some(false)` -- Task_Queue write, channel was already busy
+    /// - `None`        -- not a Task_Queue write
+    fn classify_task_dispatch(col: u8, row: u8, offset: u32, device: &DeviceState) -> Option<bool> {
+        let channel = Self::task_dispatch_channel(col, row, offset, device)?;
+        let dma = device.array.dma_engine(col, row)?;
+        let was_idle = dma.task_queue_size(channel) == 0
+            && matches!(dma.channel_state(channel), crate::device::dma::ChannelState::Idle);
+        Some(was_idle)
     }
 
     /// Check if a register offset is a DMA Task_Queue write within a channel block.
@@ -1904,5 +1952,77 @@ mod tests {
         // executed while the poll is unsatisfied -- no OP_READ skip).
         let sentinel_val = device.tile_mut(0, 2).map(|t| t.read_register(sentinel_reg)).unwrap_or(0);
         assert_eq!(sentinel_val, 0, "sentinel Write32 must not execute while poll is unsatisfied");
+    }
+
+    // -----------------------------------------------------------------
+    // Q-aware dispatch_overhead classifier tests (Phase 2c.1)
+    // -----------------------------------------------------------------
+
+    /// Build a shim DMA Task_Queue register offset for `channel` (0-based
+    /// in the DMA engine's combined channel index).
+    ///
+    /// Shim channel registers are laid out as `Ctrl @ +0`, `Queue @ +4`
+    /// within each per-channel block of size `shim_channel_stride`.
+    fn shim_task_queue_offset(channel: u8) -> u32 {
+        let layout = crate::device::regdb::device_reg_layout();
+        layout.shim_channel_base + (channel as u32) * layout.shim_channel_stride + 4
+    }
+
+    #[test]
+    fn classify_task_dispatch_returns_some_true_for_idle_channel() {
+        let device = DeviceState::new_npu1();
+        // Shim DMA at (0, 0), channel 0 -- fresh device, channel is Idle
+        // and task_queue is empty.
+        let offset = shim_task_queue_offset(0);
+        let result = NpuExecutor::classify_task_dispatch(0, 0, offset, &device);
+        assert_eq!(result, Some(true), "fresh shim channel 0 must classify as idle dispatch");
+    }
+
+    #[test]
+    fn classify_task_dispatch_returns_some_false_for_busy_channel() {
+        let mut device = DeviceState::new_npu1();
+        // Enqueue a task on shim (0,0) channel 0 to mark it busy.  The
+        // enqueue itself flips queue size > 0 (and ChannelState off Idle
+        // once the FSM starts the task).  For a Q-aware classifier we
+        // only need the pre-write queue-size signal.
+        let enqueued = device
+            .array
+            .dma_engine_mut(0, 0)
+            .expect("shim (0,0) has a DMA engine")
+            .enqueue_task(0, 0, 0, false);
+        assert!(enqueued, "task should enqueue successfully on a fresh channel");
+
+        let offset = shim_task_queue_offset(0);
+        let result = NpuExecutor::classify_task_dispatch(0, 0, offset, &device);
+        assert_eq!(
+            result,
+            Some(false),
+            "shim channel 0 with queued task must classify as pipelined dispatch"
+        );
+    }
+
+    #[test]
+    fn classify_task_dispatch_returns_none_for_non_queue_write() {
+        let device = DeviceState::new_npu1();
+        // shim_channel_base is the Ctrl register of channel 0 (offset +0
+        // within the block, NOT +4).  Must not classify as a Task_Queue
+        // write.
+        let ctrl_offset = crate::device::regdb::device_reg_layout().shim_channel_base;
+        let result = NpuExecutor::classify_task_dispatch(0, 0, ctrl_offset, &device);
+        assert_eq!(result, None, "Ctrl register write (offset +0) must NOT classify as a Task_Queue write");
+    }
+
+    #[test]
+    fn cycle_cost_model_has_distinct_overhead_for_pipelined_vs_idle() {
+        // Sanity: provisional NPU1 profile must seed both fields and the
+        // pipelined cost must be strictly smaller (idle = cold-start
+        // controller cost; pipelined = controller burst rate).
+        let m = crate::npu::cycle_cost::CycleCostModel::provisional_npu1();
+        assert!(m.dispatch_overhead > 0, "provisional model must seed dispatch_overhead");
+        assert!(m.dispatch_overhead_pipelined > 0, "provisional model must seed dispatch_overhead_pipelined");
+        assert!(
+            m.dispatch_overhead > m.dispatch_overhead_pipelined,
+            "idle dispatch must cost more than pipelined dispatch (HW: ~2785 vs ~830 cyc)"
+        );
     }
 }

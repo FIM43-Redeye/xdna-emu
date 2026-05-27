@@ -131,20 +131,41 @@ pub struct CycleCostModel {
     /// Register write completion at the target. Derived from AM025.
     pub register_write: u64,
 
-    /// Flat overhead added to the retirement cost of any Write32 that
+    /// Flat overhead added to the retirement cost of a Write32 that
     /// triggers a DMA task dispatch (writes to a channel's Start_Queue
-    /// register).  This is the per-dma_memcpy_nd controller overhead
-    /// HW pays that's NOT captured by the per-packet CMP decode cost
-    /// alone -- presumably DMA controller arbitration, AXI burst setup,
-    /// and inter-dispatch synchronization that happens on top of the
-    /// AXI write itself. (calibrated)
+    /// register) **when the target channel was idle at the time of the
+    /// write** (queue empty and `ChannelState::Idle`).  This is the
+    /// per-dma_memcpy_nd controller overhead HW pays that's NOT
+    /// captured by the per-packet CMP decode cost alone -- presumably
+    /// DMA controller arbitration, AXI burst setup, and inter-dispatch
+    /// synchronization that happens on top of the AXI write itself.
+    /// (calibrated)
     ///
-    /// HW calibration (2026-05-25 K-sweep on _diag_shim_chain_sweep,
-    /// steady-state inter-task gaps after the first): ~2500 cyc added
-    /// on top of the existing per-instruction CMP costs reproduces
-    /// HW gaps of ~2800 cyc/dispatch.  See finding
-    /// 2026-05-25-shim-bd-chain-amortization.
+    /// HW calibration (2026-05-27 N=50 multi-run trace campaign on
+    /// _diag_shim_chain_sweep, S2MM steady-state which has no
+    /// pipelining due to STREAM_STARVATION): HW per-task gap ~2785 cyc;
+    /// EMU per-instruction CMP cost ~313 cyc for one dma_memcpy_nd's
+    /// instruction sequence, giving a controller-side overhead target
+    /// of ~2472 cyc.  See findings
+    /// 2026-05-25-shim-bd-chain-amortization and
+    /// 2026-05-27-dispatch-overhead-multirun-structural-variance.
     pub dispatch_overhead: u64,
+
+    /// Flat overhead added to the retirement cost of a Write32 that
+    /// triggers a DMA task dispatch **when the target channel was
+    /// already busy** (queue non-empty or `ChannelState::Active`).
+    /// This is the controller's pipelined-burst dispatch rate -- much
+    /// cheaper than the cold-start cost because the controller is
+    /// already mid-burst and the BD just appends to the existing
+    /// Task_Queue. (calibrated)
+    ///
+    /// HW calibration (2026-05-27 N=50 multi-run trace campaign,
+    /// MM2S K=8 burst observed via Task_Queue back-to-back enqueues):
+    /// HW controller burst rate ~830-900 cyc per Task_Queue write;
+    /// minus the ~313 cyc EMU per-instruction baseline gives a
+    /// pipelined dispatch overhead target of ~520 cyc.  See finding
+    /// 2026-05-27-dispatch-overhead-multirun-structural-variance F3.
+    pub dispatch_overhead_pipelined: u64,
 }
 
 impl CycleCostModel {
@@ -170,6 +191,7 @@ impl CycleCostModel {
             plio_pl_to_aie: 0,
             register_write: 0,
             dispatch_overhead: 0,
+            dispatch_overhead_pipelined: 0,
         }
     }
 
@@ -200,6 +222,7 @@ impl CycleCostModel {
             plio_pl_to_aie: 3,      // aie_xtlm.cpp:232
             register_write: 1,      // AM025
             dispatch_overhead: 0,
+            dispatch_overhead_pipelined: 0,
         }
     }
 
@@ -282,14 +305,20 @@ impl CycleCostModel {
             plio_aie_to_pl: 4,      // aie_xtlm.cpp:202
             plio_pl_to_aie: 3,      // aie_xtlm.cpp:232
             register_write: 1,      // AM025
-            // K-sweep calibration: HW inter-task gaps ~2800 cyc, EMU per-
-            // instruction costs sum to ~313 cyc for one dma_memcpy_nd's
-            // worth of NPU instructions -- the 2500 cyc difference is
-            // controller-side dispatch overhead (DMA arbiter, AXI burst
-            // setup, inter-dispatch sync) that we model as a flat per-
-            // task-start additive.  See finding
-            // 2026-05-25-shim-bd-chain-amortization.
+            // Q-aware dispatch overhead.  K-sweep calibration:
+            //  - idle dispatch (queue empty, channel Idle): HW per-task
+            //    gap ~2785 cyc on S2MM (no pipelining due to
+            //    STREAM_STARVATION); minus ~313 cyc per-instr baseline
+            //    -> ~2472 cyc.  Seeded at 2500 from the original Phase 1
+            //    calibration (close to target; Phase 2c.3 will refine
+            //    against the full bridge corpus).
+            //  - pipelined dispatch (queue non-empty or channel busy):
+            //    HW controller burst rate ~830 cyc per Task_Queue write
+            //    on MM2S; minus ~313 baseline -> ~520 cyc.
+            // See finding
+            // 2026-05-27-dispatch-overhead-multirun-structural-variance.
             dispatch_overhead: 2500,
+            dispatch_overhead_pipelined: 520,
         }
     }
 
