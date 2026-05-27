@@ -305,19 +305,32 @@ impl CycleCostModel {
             plio_aie_to_pl: 4,      // aie_xtlm.cpp:202
             plio_pl_to_aie: 3,      // aie_xtlm.cpp:232
             register_write: 1,      // AM025
-            // Q-aware dispatch overhead.  K-sweep calibration:
-            //  - idle dispatch (queue empty, channel Idle): HW per-task
-            //    gap ~2785 cyc on S2MM (no pipelining due to
-            //    STREAM_STARVATION); minus ~313 cyc per-instr baseline
-            //    -> ~2472 cyc.  Seeded at 2500 from the original Phase 1
-            //    calibration (close to target; Phase 2c.3 will refine
-            //    against the full bridge corpus).
-            //  - pipelined dispatch (queue non-empty or channel busy):
-            //    HW controller burst rate ~830 cyc per Task_Queue write
-            //    on MM2S; minus ~313 baseline -> ~520 cyc.
+            // Q-aware dispatch overhead.  Recalibrated against the
+            // 2026-05-27 HW multi-run campaign data, AFTER the Phase
+            // 2c.A non-stalling controller refactor which made
+            // dispatch_overhead the actual inter-Task_Queue interval
+            // (previously double-counted with per-instr CMP cost).
+            //
+            //  - dispatch_overhead (idle channel at TQ write time):
+            //    HW S2MM K=8 steady-state inter-START median = 3050
+            //    cyc (gap 2796 + dur 254).  This is the controller's
+            //    serialized dispatch rate when the previous task is
+            //    fully drained.
+            //
+            //  - dispatch_overhead_pipelined (channel busy at TQ
+            //    write time): HW MM2S K=8 first-pipelined-transition
+            //    rate ~830 cyc per Task_Queue write -- the controller's
+            //    burst rate when queue has room and the channel is
+            //    still processing a prior BD.  Currently does NOT fire
+            //    in EMU on K-sweep because EMU MM2S transfer duration
+            //    is shorter than dispatch_overhead, so the channel
+            //    always drains before next dispatch arrives.  Will
+            //    fire once Issue B's transfer-duration recalibration
+            //    extends MM2S cold-start to ~1330 cyc.
+            //
             // See finding
             // 2026-05-27-dispatch-overhead-multirun-structural-variance.
-            dispatch_overhead: 2500,
+            dispatch_overhead: 3050,
             dispatch_overhead_pipelined: 520,
         }
     }

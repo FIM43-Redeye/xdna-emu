@@ -172,28 +172,37 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // Reinstate when multi-BD-per-task calibration justifies a
             // per-BD cost on top of the per-task cold-start.
             host_memory_latency_cycles: 0,
-            // Shim DMA timing decomposes into two terms (2026-05-25
-            // chain-sweep calibration on _diag_shim_chain_sweep K=8):
+            // Shim DMA timing decomposes into two terms:
             //   (1) Cold-start: one-shot per channel per session, fires
             //       only on the FIRST task touching host memory.  Subsequent
             //       tasks skip it -- HW keeps the channel "warm" indefinitely.
             //   (2) Per-task overhead: paid on EVERY task, regardless of
             //       first-vs-subsequent.  Covers BD programming and per-task
             //       AXI burst arbitration.
-            // For single-task workloads, the two terms sum to what the prior
-            // N-sweep fit called "cold_start" (747/171 cyc).  The split is
-            // necessary to model chained dispatches correctly (object FIFO,
-            // etc.) where cold-start amortizes across K tasks.
-            //   MM2S: cold = 498, per-task = 249 (sum = 747)
-            //   S2MM: cold = 0,   per-task = 168 (sum = 168, near prior 171)
-            // S2MM "cold" is essentially zero -- the pull direction never
-            // pays a DDR read pipeline fill because the channel is fed by
-            // an already-warm memtile.  See finding
-            // 2026-05-25-shim-bd-chain-amortization.
-            shim_ddr_cold_start_mm2s_cycles: 498,
-            shim_ddr_cold_start_s2mm_cycles: 0,
-            shim_per_task_overhead_mm2s_cycles: 249,
-            shim_per_task_overhead_s2mm_cycles: 168,
+            //
+            // Calibration source: 2026-05-27 N=50 multi-run HW trace
+            // campaign on _diag_shim_chain_sweep K={1,2,4,8} (BD size 256B
+            // = 64 i32 words).  The prior 2026-05-25 K=8 fit
+            // (MM2S 498/249, S2MM 0/168) targeted steady-state chain
+            // accuracy and under-modelled K=1 single-task by ~50% for
+            // both directions.  The 2026-05-27 multi-run data lets us
+            // calibrate against BOTH K=1 (cold) and K=4+ (steady-state)
+            // simultaneously.
+            //
+            // Target totals (HW median, EMU base = bd_setup 4 + chan_start 2
+            // + memory_latency 5 + data 64 = 75 cyc):
+            //   MM2S K=1 (cold + per_task + base = 1654): cold = 1330
+            //   MM2S K=4+ steady (per_task + base ~400): per_task = 325
+            //   S2MM K=1 (cold + per_task + base = 584): cold = 341
+            //   S2MM K=4+ steady (per_task + base ~254): per_task = 179
+            //
+            // See finding
+            // 2026-05-27-dispatch-overhead-multirun-structural-variance
+            // and Phase 2c.3 recalibration.
+            shim_ddr_cold_start_mm2s_cycles: 1330,
+            shim_ddr_cold_start_s2mm_cycles: 341,
+            shim_per_task_overhead_mm2s_cycles: 325,
+            shim_per_task_overhead_s2mm_cycles: 179,
         },
         stream_switch: StreamSwitchTiming {
             // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /

@@ -337,13 +337,16 @@ fn test_first_bd_bonus_rearms_after_idle() {
 fn test_shim_ddr_timing_decomposition() {
     let cfg = DmaTimingConfig::default();
     assert_eq!(cfg.channel_start_cycles, 2);
-    // Calibrated 2026-05-25 from _diag_shim_chain_sweep K=8 within-run
-    // deltas (steady-state minus first-task isolates cold-start; steady-
-    // state minus N*slope isolates per-task overhead).
-    assert_eq!(cfg.shim_ddr_cold_start_mm2s_cycles, 498);
-    assert_eq!(cfg.shim_ddr_cold_start_s2mm_cycles, 0);
-    assert_eq!(cfg.shim_per_task_overhead_mm2s_cycles, 249);
-    assert_eq!(cfg.shim_per_task_overhead_s2mm_cycles, 168);
+    // Recalibrated 2026-05-27 from N=50 multi-run K-sweep HW campaign
+    // on _diag_shim_chain_sweep K={1,2,4,8}.  The previous 2026-05-25
+    // K=8-only fit (498/249/0/168) under-modelled K=1 single-task by
+    // ~50% in both directions; the multi-run data lets us calibrate
+    // cold-start against K=1 totals and per-task against K=4+ steady-
+    // state simultaneously.
+    assert_eq!(cfg.shim_ddr_cold_start_mm2s_cycles, 1330);
+    assert_eq!(cfg.shim_ddr_cold_start_s2mm_cycles, 341);
+    assert_eq!(cfg.shim_per_task_overhead_mm2s_cycles, 325);
+    assert_eq!(cfg.shim_per_task_overhead_s2mm_cycles, 179);
     assert_eq!(cfg.shim_words_per_cycle, 1);
 
     // stop_channel re-arms BOTH gates (channel reset == fresh boot).
