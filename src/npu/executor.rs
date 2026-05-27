@@ -196,6 +196,31 @@ pub struct NpuExecutor {
     /// (~8000 cyc when enabled), then pipeline subsequent syncs at just
     /// the stream-flush cost (4 cyc). Reset by `load_instructions`.
     mailbox_charged: bool,
+
+    /// Executor-local cycle counter, incremented once per `try_advance`
+    /// call.  Tracks the controller's view of time independently of the
+    /// engine's `total_cycles` (which is also driven by core stepping
+    /// and DMA ticks).  Used by the non-stalling controller model to
+    /// gate Task_Queue dispatches without blocking issue of other
+    /// instructions.  Reset by `load_instructions`.
+    npu_cycle: u64,
+
+    /// Earliest cycle (`npu_cycle` space) at which the controller can
+    /// issue the next Task_Queue Write32.  Set after every Task_Queue
+    /// dispatch to `npu_cycle + dispatch_overhead_*` based on Q state
+    /// at dispatch time.
+    ///
+    /// This implements a non-stalling controller model: the executor
+    /// can continue issuing BD-config writes and other non-dispatch
+    /// instructions even while the controller's previous Task_Queue
+    /// dispatch is still in flight; only the next Task_Queue write
+    /// stalls (in Executing state) until the controller is free.  This
+    /// is the prerequisite for modelling HW pipelining -- when channel
+    /// transfer duration exceeds the controller dispatch interval, the
+    /// channel's Task_Queue actually accumulates BDs.  See finding
+    /// 2026-05-27-dispatch-overhead-multirun-structural-variance F3
+    /// and the Phase 2c.A refactor.
+    controller_next_taskq_cycle: u64,
 }
 
 impl NpuExecutor {
@@ -210,6 +235,8 @@ impl NpuExecutor {
             instructions: Vec::new(),
             cycle_model: super::CycleCostModel::default(),
             mailbox_charged: false,
+            npu_cycle: 0,
+            controller_next_taskq_cycle: 0,
         }
     }
 
@@ -396,6 +423,10 @@ impl NpuExecutor {
         // Reset the per-batch mailbox charge so each runtime sequence
         // pays the firmware setup cost once.
         self.mailbox_charged = false;
+        // Reset the executor's cycle accounting and controller
+        // rate-limit state -- each runtime sequence starts fresh.
+        self.npu_cycle = 0;
+        self.controller_next_taskq_cycle = 0;
         // Log instruction summary for debugging complex multi-tile flows
         if instructions.len() > 10 {
             let mut syncs = 0;
@@ -444,6 +475,13 @@ impl NpuExecutor {
     /// naturally drains the queue by stepping the full system (DMA + cores +
     /// stream routing), so the queue will eventually have space.
     pub fn try_advance(&mut self, device: &mut DeviceState, host_memory: &mut HostMemory) -> AdvanceResult {
+        // Advance the controller's view of time once per advance call.
+        // Used by the non-stalling controller model to gate Task_Queue
+        // dispatches against `controller_next_taskq_cycle`.  Idle/Done
+        // ticks still advance the clock so a long Idle does not push
+        // the next runtime sequence's TQ writes past their gate.
+        self.npu_cycle = self.npu_cycle.saturating_add(1);
+
         match self.state.clone() {
             ExecutorState::Idle => AdvanceResult::Idle,
             ExecutorState::Done => AdvanceResult::Done,
@@ -472,12 +510,41 @@ impl NpuExecutor {
                     None
                 };
 
+                // Non-stalling controller rate gate (Phase 2c.A): if
+                // this is a Task_Queue write and the controller's last
+                // dispatch is still in flight, stall *just* this
+                // instruction.  We keep state=Executing(next_index)
+                // unchanged so we retry on the next tick; meanwhile
+                // the DMA channel(s) continue making progress and the
+                // engine continues stepping cores.
+                //
+                // This is the mechanism that lets the channel
+                // Task_Queue actually accumulate BDs when transfer
+                // duration is comparable to controller dispatch
+                // interval -- the prerequisite for HW-like pipelining.
+                if dispatch_was_idle.is_some() && self.npu_cycle < self.controller_next_taskq_cycle {
+                    return AdvanceResult::Blocked;
+                }
+
                 if let Err(e) = self.execute_instruction(&instr, device, host_memory) {
                     let msg = format!("NPU instruction {} execution error: {}", next_index, e);
                     log::error!("{}", msg);
                     return AdvanceResult::Error(msg);
                 }
                 self.executed_count += 1;
+
+                // Update the controller's next-available-for-Task_Queue
+                // cycle now that this dispatch has been issued.  The
+                // overhead reflects the Q-state at the moment of issue
+                // (pre-enqueue), classified above.
+                if let Some(was_idle) = dispatch_was_idle {
+                    let overhead = if was_idle {
+                        self.cycle_model.dispatch_overhead
+                    } else {
+                        self.cycle_model.dispatch_overhead_pipelined
+                    };
+                    self.controller_next_taskq_cycle = self.npu_cycle.saturating_add(overhead);
+                }
 
                 // would_block_on_queue may have transitioned us to BlockedOnQueue,
                 // or execute_instruction may have transitioned to BlockedOnSync.
@@ -510,24 +577,15 @@ impl NpuExecutor {
                     AdvanceResult::Done
                 } else {
                     // Per-instruction CMP retirement cost from the cycle
-                    // model.  Plus Q-aware dispatch_overhead added if
-                    // this Write32 was a DMA Task_Queue trigger:
-                    //   - idle channel at write time -> full overhead
-                    //     (cold-start controller cost, ~2500 cyc)
-                    //   - busy channel (queue non-empty or active) ->
-                    //     pipelined overhead (controller burst rate,
-                    //     ~520 cyc)
-                    // See findings 2026-05-25-shim-bd-chain-amortization
-                    // and 2026-05-27-dispatch-overhead-multirun-structural-variance.
-                    let mut retire_cycles = self.cycle_model.cost_of(&instr).saturating_sub(1);
-                    if let Some(was_idle) = dispatch_was_idle {
-                        let extra = if was_idle {
-                            self.cycle_model.dispatch_overhead
-                        } else {
-                            self.cycle_model.dispatch_overhead_pipelined
-                        };
-                        retire_cycles = retire_cycles.saturating_add(extra);
-                    }
+                    // model.  The Q-aware dispatch_overhead is no longer
+                    // applied as a retirement stall here -- the
+                    // non-stalling controller model (Phase 2c.A) tracks
+                    // it via `controller_next_taskq_cycle` instead, so
+                    // subsequent BD config writes can issue while the
+                    // controller's previous dispatch is still in
+                    // flight.  See finding
+                    // 2026-05-27-dispatch-overhead-multirun-structural-variance.
+                    let retire_cycles = self.cycle_model.cost_of(&instr).saturating_sub(1);
                     if retire_cycles > 0 {
                         self.state = ExecutorState::RetiringInstruction {
                             next_index: new_index,
@@ -2023,6 +2081,121 @@ mod tests {
         assert!(
             m.dispatch_overhead > m.dispatch_overhead_pipelined,
             "idle dispatch must cost more than pipelined dispatch (HW: ~2785 vs ~830 cyc)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Non-stalling controller rate-limit gate tests (Phase 2c.A)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn npu_cycle_advances_each_try_advance() {
+        let mut executor = NpuExecutor::new();
+        let mut device = DeviceState::new_npu1();
+        let mut host_mem = HostMemory::new();
+        assert_eq!(executor.npu_cycle, 0);
+        executor.try_advance(&mut device, &mut host_mem);
+        assert_eq!(executor.npu_cycle, 1);
+        executor.try_advance(&mut device, &mut host_mem);
+        assert_eq!(executor.npu_cycle, 2);
+    }
+
+    #[test]
+    fn load_instructions_resets_controller_state() {
+        let mut executor = NpuExecutor::new();
+        // Simulate prior activity: advance the executor clock and
+        // mark the controller as busy from a previous dispatch.
+        executor.npu_cycle = 1234;
+        executor.controller_next_taskq_cycle = 5678;
+        executor.load_instructions(Vec::new());
+        assert_eq!(executor.npu_cycle, 0, "load_instructions resets npu_cycle");
+        assert_eq!(
+            executor.controller_next_taskq_cycle, 0,
+            "load_instructions resets controller_next_taskq_cycle"
+        );
+    }
+
+    #[test]
+    fn task_dispatch_advances_controller_next_taskq_cycle() {
+        // After issuing a Task_Queue Write32 on an idle channel, the
+        // controller must be marked busy until npu_cycle + dispatch_overhead.
+        let mut executor = NpuExecutor::new();
+        let mut device = DeviceState::new_npu1();
+        let mut host_mem = HostMemory::new();
+
+        let tq_offset = shim_task_queue_offset(0);
+        // Build a Write32 address for shim (col=0, row=0) at the TQ
+        // offset.  Address encoding: col bits at 25..29, row bits at
+        // 20..24, offset in low 20 bits.
+        let addr = tq_offset; // col=0, row=0 -> no shift bits set
+        executor.load_instructions(vec![NpuInstruction::Write32 { reg_off: addr, value: 0 }]);
+
+        let r = executor.try_advance(&mut device, &mut host_mem);
+        // The executor consumed npu_cycle 1 to issue the dispatch.
+        assert_eq!(executor.npu_cycle, 1);
+        // Cold-start cost (idle channel) -- provisional_npu1 value.
+        let expected = 1 + executor.cycle_model.dispatch_overhead;
+        assert_eq!(
+            executor.controller_next_taskq_cycle, expected,
+            "TQ write on idle channel must set controller_next = npu_cycle + dispatch_overhead"
+        );
+        // The instruction was consumed (not stalled by rate-limit on first call).
+        assert!(matches!(r, AdvanceResult::Done | AdvanceResult::Progressed));
+    }
+
+    #[test]
+    fn second_task_dispatch_stalls_on_controller_rate_limit() {
+        // Two back-to-back Task_Queue writes: the second one must stall
+        // in Executing state (return Blocked) until npu_cycle catches
+        // up to controller_next_taskq_cycle from the first dispatch.
+        let mut executor = NpuExecutor::new();
+        let mut device = DeviceState::new_npu1();
+        let mut host_mem = HostMemory::new();
+
+        let tq0 = shim_task_queue_offset(0);
+        let tq1 = shim_task_queue_offset(1);
+        executor.load_instructions(vec![
+            NpuInstruction::Write32 { reg_off: tq0, value: 0 },
+            NpuInstruction::Write32 { reg_off: tq1, value: 0 },
+        ]);
+
+        // First call: issues TQ0 (idle channel -> cold-start),
+        // parks in RetiringInstruction for per-instr cost - 1 cycles
+        // (or transitions directly if cost == 1).
+        let _ = executor.try_advance(&mut device, &mut host_mem);
+        assert!(executor.controller_next_taskq_cycle > executor.npu_cycle);
+
+        // Drain any retirement stall so executor is back in Executing,
+        // pointing at TQ1.  The shim Write32 per-instr CMP cost is ~100
+        // cyc; bound conservatively to avoid spurious failures if the
+        // model grows.
+        for _ in 0..512 {
+            if matches!(executor.state(), ExecutorState::Executing { .. }) {
+                break;
+            }
+            executor.try_advance(&mut device, &mut host_mem);
+        }
+        assert!(
+            matches!(executor.state(), ExecutorState::Executing { .. }),
+            "expected Executing state before TQ1 attempt; got {:?}",
+            executor.state()
+        );
+        // controller is still busy from TQ0 -- TQ1 must stall.
+        assert!(executor.npu_cycle < executor.controller_next_taskq_cycle);
+        let next_index_before = match executor.state() {
+            ExecutorState::Executing { next_index } => *next_index,
+            _ => unreachable!(),
+        };
+        let r = executor.try_advance(&mut device, &mut host_mem);
+        assert_eq!(r, AdvanceResult::Blocked, "TQ1 must stall on rate-limit gate");
+        // next_index must NOT have advanced -- the stalled write was not consumed.
+        let next_index_after = match executor.state() {
+            ExecutorState::Executing { next_index } => *next_index,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            next_index_before, next_index_after,
+            "rate-limit stall must not advance the instruction pointer"
         );
     }
 }
