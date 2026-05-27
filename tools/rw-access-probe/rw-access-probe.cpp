@@ -56,7 +56,8 @@ struct Args {
     uint32_t reg = REG_TIMER_LOW;
     int sleep_ms = DEFAULT_SLEEP_MS;
     int num_reads = 2;
-    std::string label;  // optional, prepended to output
+    std::string label;     // optional, prepended to output
+    std::string csv_path;  // if set, write per-read rows here and suppress per-read stdout
 };
 
 Args parse_args(int argc, char** argv) {
@@ -70,6 +71,7 @@ Args parse_args(int argc, char** argv) {
         else if (s == "--sleep-ms" && i + 1 < argc) a.sleep_ms = std::stoi(argv[++i]);
         else if (s == "--num-reads" && i + 1 < argc) a.num_reads = std::stoi(argv[++i]);
         else if (s == "--label" && i + 1 < argc) a.label = argv[++i];
+        else if (s == "--csv" && i + 1 < argc) a.csv_path = argv[++i];
     }
     if (a.num_reads < 1) a.num_reads = 1;
     return a;
@@ -103,6 +105,16 @@ int main(int argc, char** argv) {
     try {
         std::vector<uint32_t> vals;
         vals.reserve(a.num_reads);
+        std::FILE* csv = nullptr;
+        if (!a.csv_path.empty()) {
+            csv = std::fopen(a.csv_path.c_str(), "w");
+            if (!csv) {
+                std::fprintf(stderr, "EXCEPTION: cannot open --csv path '%s'\n", a.csv_path.c_str());
+                return 1;
+            }
+            std::fprintf(csv, "index,timestamp_ns,roundtrip_us,value\n");
+        }
+        auto t_origin = std::chrono::steady_clock::now();
         for (int i = 0; i < a.num_reads; ++i) {
             if (i > 0) std::this_thread::sleep_for(std::chrono::milliseconds(a.sleep_ms));
             auto t0 = std::chrono::steady_clock::now();
@@ -111,8 +123,17 @@ int main(int argc, char** argv) {
                                               static_cast<uint16_t>(a.row), a.reg);
             auto t1 = std::chrono::steady_clock::now();
             double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-            std::printf("v[%d]  = 0x%08x  (%10u)   roundtrip=%.1fus\n", i, v, v, us);
+            int64_t t_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t0 - t_origin).count();
+            if (csv) {
+                std::fprintf(csv, "%d,%lld,%.3f,%u\n", i, static_cast<long long>(t_ns), us, v);
+            } else {
+                std::printf("v[%d]  = 0x%08x  (%10u)   roundtrip=%.1fus\n", i, v, v, us);
+            }
             vals.push_back(v);
+        }
+        if (csv) {
+            std::fclose(csv);
+            std::printf("wrote %d rows to %s\n", a.num_reads, a.csv_path.c_str());
         }
 
         if (vals.size() >= 2) {
