@@ -459,51 +459,71 @@ can and can't measure as a cycle-accurate probe."
 
 ---
 
-## Phase 1 Decision Gate
+## Phase 1 Decision Gate -- CLOSED (2026-05-26)
 
-**Stop here.** Before starting Phase 2, review the calibration finding doc with Maya and answer:
+**Result: AIE_RW_ACCESS is NOT a viable cycle-counter probe.** See
+[`docs/superpowers/findings/2026-05-26-aie-rw-access-not-a-cycle-probe.md`](../findings/2026-05-26-aie-rw-access-not-a-cycle-probe.md)
+for the full empirical writeup. Headline:
 
-1. **Is the probe useful at all?** If host-roundtrip noise floor is larger than the cycle-cost effects we want to measure, Phase 2 has to take a different shape (rely on trace unit only, deprecate this path, etc.).
-2. **What's the right measurement strategy?** Depending on Timer_Low's source clock and gating:
-   - Free-running at core clock → use it for absolute cycle deltas across a kernel run.
-   - Gated → use it only for "did the tile run?" boolean state, not timing.
-   - Slow ref clock → use it as a coarse calibration check against trace, not a primary measurement.
-3. **Is cross-tile alignment possible?** If timers drift, sequence-level event correlation must come from the trace unit, not paired AIE_RW_ACCESS reads.
+- T1: roundtrip distribution is OK (p50=73us, p99=192us).
+- T2: Timer_Low advance per call is a fixed ~11,870 ticks (std 0.1%) regardless of wall-clock duration between calls.
+- T3: bracket sampling across a verified-PASS kernel run shows the same ~12,000-tick delta as a single idle call. Timer_Low at the running tile does not advance via AIE_RW_ACCESS.
+- T3 follow-up: `write_aie_reg` succeeds at the API level but has no visible effect — Timer_Control reads as 0 regardless of what we write, and the trace pipeline's `aiex.npu.write32` to Timer_Control in `runtime_sequence` also produces no readable change.
 
-**Update this plan file** with concrete Phase 2 tasks based on the answers. Phase 2 currently has two open work items (see below) but the specific probe shapes depend on Phase 1.
+T4 (cross-tile coherence) is cancelled — measuring drift between two timers that don't tick in a useful way is moot.
+
+T5 (finding doc) lives at the file linked above. AIE_RW_ACCESS remains a useful **state inspection** probe (the wedge survey use case), but cannot serve as the dispatch_overhead cross-validation tool the earlier finding speculated about.
 
 ---
 
-## Phase 2: Apply to Active Cycle-Accuracy Questions (sketched)
+## Phase 2 (AMENDED 2026-05-26): Pivot to trace-unit cycle-accuracy work
 
-**Two concrete applications** motivate Phase 2; specific tasks are written after Phase 1.
+The original Phase 2a (cross-validate `dispatch_overhead = 2500 cyc` via AIE_RW_ACCESS cycle counter readback) is dead. The trace unit remains the cycle-accuracy tool. Phase 2 now focuses on:
 
-### Phase 2a: Cross-validate `dispatch_overhead = 2500 cyc`
+1. **Tightening trace-based measurements** — Maya's "eliminate as much noise as we can, even the long circuitous way" applied to trace data.
+2. **Phase 2b unchanged**: K=16 wedge state inspection via AIE_RW_ACCESS (this is the state-inspection use case, which we know works).
 
-The constant in `src/npu/cycle_cost.rs` was calibrated from trace-unit inter-task-start gaps on the K-sweep. AIE_RW_ACCESS gives an independent ground-truth path: read shim Timer_Low (or the shim's perf counter set to count cycles) before and after each dispatch. Compare cycle deltas to trace-derived gaps.
+### Phase 2a (amended): Trace-data noise reduction for dispatch_overhead
 
-Open questions for the Phase 1 review to resolve:
-- Does shim Timer_Low advance on its own time base, or only when shim DMA is active? (Affects whether pre/post sampling is valid.)
-- Is the noise floor smaller than the 2500 cyc effect we're cross-validating? (2500 cyc at 1 GHz = 2.5 us. AIE_RW_ACCESS roundtrip is ~150-200 us — too coarse for direct measurement, but useful for confirming aggregate counts across many dispatches.)
+Goal: tighten our understanding of the 2500-cyc dispatch_overhead constant from the trace data we already have, without depending on a new HW probe. The dispatch-overhead finding noted "Run-to-run HW variance is large. Per-task and per-gap measurements vary 30-50% between sweeps." That's the noise floor we want to chip away at.
 
-### Phase 2b: K=16 wedge state inspection
+Noise sources to attack (each its own sub-task):
 
-EMU silently defers past 8-deep task queue; HW wedges. We don't know what HW state looks like at the wedge because trace events stop firing. AIE_RW_ACCESS may let us read shim DMA registers (`Task_Queue` status, `BD_Ctrl`, channel status) *while HW is wedged* — assuming the wedge doesn't take the FW mailbox down (it shouldn't; this is a DMA-channel-level stall, not a Xtensa-AXI stall).
+- **Cross-run aggregation.** Currently each measurement comes from a single bridge run. Run the K-sweep N times (50-100), aggregate inter-task gaps per-K-per-direction, compute statistical summaries (median, MAD, IQR, not just mean). Outlier filtering at >3 sigma. Targets the run-to-run variance directly.
+- **First-gap separation.** The dispatch-overhead finding flagged first-gap variance as systematically different from steady-state. Separate first-gap from inter-task gaps in the aggregation, compute distributions independently, model first-gap as a phase-transition effect rather than averaging it in.
+- **Warmup runs.** Discard the first M runs (cache cold, FW state cold) before measurement. Find M empirically.
+- **Per-event slot decorrelation.** With 8 event slots per tile, our trace covers a different subset on each run. Cross-run aggregation lets us approach "full event coverage" statistically.
+- **Per-tile vs aggregate.** Inter-task gaps may differ by source tile (shim col=0 vs shim col=1). Stratify rather than aggregate.
 
-Approach (to be refined post-Phase-1):
+Tasks (concrete, written after Phase 1 closed):
+
+| Task | What |
+|------|------|
+| 2a.1 | Build a multi-run trace harness that fires the K-sweep N times against HW, saves raw trace data per run, and saves run-tagged metadata (BO indices, FW state, NPU temp if available) |
+| 2a.2 | Build a per-K/per-direction/per-run aggregator that produces distribution summaries (not just means) |
+| 2a.3 | Visualize: per-K gap distribution histograms, run-to-run scatter, first-gap vs steady-state |
+| 2a.4 | Re-derive the dispatch_overhead constant from the aggregated data; revisit whether a single constant is the right model or whether a (direction, K)-conditional model fits better |
+| 2a.5 | If the constant moves materially, update `src/npu/cycle_cost.rs` and re-run the bridge suite |
+| 2a.6 | Finding doc: what the noise structure actually is, what was averaged away in the original calibration, whether 2500 cyc is still the right number |
+
+### Phase 2b (unchanged): K=16 wedge state inspection
+
+EMU silently defers past 8-deep task queue; HW wedges. We don't know what HW state looks like at the wedge because trace events stop firing. AIE_RW_ACCESS is well-suited to this use case — we want to read tile state at a host-chosen moment (just-after-wedge), not measure cycles. Its negative-cycle-probe finding doesn't affect this use.
+
+Approach:
 1. Run K=16 to wedge.
-2. AIE_RW_ACCESS-read shim DMA state on (0, 0): channel status, BD pointer, task queue depth.
+2. AIE_RW_ACCESS-read shim DMA state on (0, 0): channel status, BD pointer, task queue depth, channel control regs.
 3. Document the wedge state. Use it to drive the emulator fix described in the dispatch-overhead finding's "Follow-ups" section ("treat queue overflow as a hard error rather than blocking until queue drains").
 
-Safety reminder: the wedge finding's safety patch blocks row=1 memtile access. Shim is row=0, unaffected.
+Safety: wedge-survey safety patch blocks row=1 memtile. Shim is row=0, unaffected.
 
 ---
 
-## Phase 2 Decision Gate
+## Phase 2 (amended) Decision Gate
 
-After Phase 2a and 2b complete:
-- Cross-validation result either tightens the dispatch_overhead constant or surfaces a structural divergence requiring a non-constant model.
-- K=16 wedge state inspection either confirms the queue-depth hypothesis or surfaces a different failure mode.
+After Phases 2a and 2b complete:
+- 2a result: dispatch_overhead is either confirmed at 2500 cyc with tighter uncertainty bars, refined to a different constant, or shown to need a conditional model. Either way, the noise structure of K-sweep measurements is understood.
+- 2b result: K=16 wedge mechanism is characterized; EMU's queue-deferral semantics get the appropriate fix.
 
 **Update this plan** with Phase 3 tasks or close the plan if no harness work is needed.
 
@@ -511,7 +531,9 @@ After Phase 2a and 2b complete:
 
 ## Phase 3: Reusable Characterization Harness (deferred)
 
-Goal (to be confirmed after Phase 2): take an xclbin as input, run it on HW with full instrumentation (trace + AIE_RW_ACCESS readouts), produce a structured timing report. Run the same xclbin in EMU and produce the same report shape. Diff them.
+Goal (to be confirmed after Phase 2): take an xclbin as input, run it N times on HW with trace instrumentation, produce a structured timing report with proper statistical treatment (distributions not means, per-event decorrelation, warmup handling). Run the same xclbin in EMU and produce the same report shape. Diff them.
+
+Building on the noise-reduction work from Phase 2a: the harness is essentially "Phase 2a generalized to arbitrary kernels, not just the K-sweep."
 
 The exact shape depends on what Phase 2 reveals about which measurements actually carry signal. Do not plan in detail until Phase 2 closes.
 

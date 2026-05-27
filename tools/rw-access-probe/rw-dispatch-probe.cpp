@@ -163,6 +163,20 @@ int main(int argc, char** argv) {
     // Post-sample.
     sample(a.inner_reads, post, post_rt);
 
+    // Also sample Timer_Control to see if the runtime_sequence's write
+    // is sticking. Address depends on tile module (core/shim = 0x34000,
+    // memory = 0x14000, memtile = 0x94000); pick by row heuristic.
+    uint32_t timer_ctrl_addr = (a.row == 1) ? 0x94000 : 0x34000;
+    uint32_t timer_ctrl_val = 0xDEADBEEF;
+    try {
+        timer_ctrl_val = aie_dev.read_aie_reg(pid, ctx_id,
+                                              static_cast<uint16_t>(a.col),
+                                              static_cast<uint16_t>(a.row),
+                                              timer_ctrl_addr);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[warning] Timer_Control read failed: %s\n", e.what());
+    }
+
     // Report.
     std::printf("\nkernel run   : %s  (wall-clock %.0f us)\n",
                 st == ERT_CMD_STATE_COMPLETED ? "COMPLETED" : "FAILED",
@@ -187,6 +201,16 @@ int main(int argc, char** argv) {
         uint32_t post_step = post[1] - post[0];
         std::printf("\npre-step  (pre[1]  - pre[0])  = %u ticks  (idle baseline)\n", pre_step);
         std::printf("post-step (post[1] - post[0]) = %u ticks  (idle baseline)\n", post_step);
+    }
+
+    std::printf("\nTimer_Control (addr 0x%05x col=%d row=%d) post-run = 0x%08x  (%u)\n",
+                timer_ctrl_addr, a.col, a.row, timer_ctrl_val, timer_ctrl_val);
+    if (timer_ctrl_val == 0) {
+        std::printf("  -- Timer_Control is ZERO: runtime_sequence's config did not stick\n");
+    } else if (timer_ctrl_val != 0xDEADBEEF) {
+        uint32_t reset_event = (timer_ctrl_val >> 8) & 0x7F;
+        uint32_t reset_bit = (timer_ctrl_val >> 31) & 0x1;
+        std::printf("  -- Reset_Event = %u, Reset bit = %u\n", reset_event, reset_bit);
     }
 
     // Verify output to confirm kernel really ran.

@@ -58,6 +58,8 @@ struct Args {
     int num_reads = 2;
     std::string label;     // optional, prepended to output
     std::string csv_path;  // if set, write per-read rows here and suppress per-read stdout
+    bool do_write = false;
+    uint32_t write_val = 0;
 };
 
 Args parse_args(int argc, char** argv) {
@@ -72,6 +74,10 @@ Args parse_args(int argc, char** argv) {
         else if (s == "--num-reads" && i + 1 < argc) a.num_reads = std::stoi(argv[++i]);
         else if (s == "--label" && i + 1 < argc) a.label = argv[++i];
         else if (s == "--csv" && i + 1 < argc) a.csv_path = argv[++i];
+        else if (s == "--write" && i + 1 < argc) {
+            a.do_write = true;
+            a.write_val = std::stoul(argv[++i], nullptr, 0);
+        }
     }
     if (a.num_reads < 1) a.num_reads = 1;
     return a;
@@ -103,6 +109,18 @@ int main(int argc, char** argv) {
     std::printf("pid=%d  ctx_id (assumed)=%u\n", pid, ctx_id);
 
     try {
+        if (a.do_write) {
+            std::printf("[write] writing 0x%08x to col=%d row=%d reg=0x%05x ...\n",
+                        a.write_val, a.col, a.row, a.reg);
+            auto t0 = std::chrono::steady_clock::now();
+            aie_dev.write_aie_reg(pid, ctx_id,
+                                  static_cast<uint16_t>(a.col),
+                                  static_cast<uint16_t>(a.row),
+                                  a.reg, a.write_val);
+            auto t1 = std::chrono::steady_clock::now();
+            double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+            std::printf("[write] OK (roundtrip %.1fus)\n", us);
+        }
         std::vector<uint32_t> vals;
         vals.reserve(a.num_reads);
         std::FILE* csv = nullptr;
