@@ -1,10 +1,19 @@
 // rw-access-probe: smallest possible end-to-end validation of
 // MSG_OP_AIE_RW_ACCESS via xrt::aie::device::read_aie_reg on Phoenix.
 //
-// Reads core Timer_Low (col=0, row=2, reg_addr=0x340F8) twice with a
-// configurable sleep between, prints both readings and the delta. With
-// the core actively running (NPU clock at ~400 MHz), the delta should
-// correlate with wall time: 100 ms ≈ 40M cycles.
+// Reads a tile register N times (default 2) with a sleep between, then
+// prints each reading and (if num-reads >= 2) the v[last]-v[0] delta.
+//
+// Default target is core Timer_Low (col=0, row=2, addr=0x340F8). Use
+// --col/--row/--reg to probe other tile types -- per the AM025 regdb,
+// the tile-local Timer_Low offset differs per module:
+//   core (compute row>=2)        : 0x340F8
+//   memory (compute mem-side)    : 0x140F8
+//   memory_tile (memtile row=1)  : 0x940F8
+//   shim (row=0)                 : 0x340F8
+// The Phoenix FW handler for opcode 0x203 does no row/col validation:
+// supplying a tile-local offset that doesn't decode at the target tile
+// hangs the AXI fabric, blocking the FW until TDR fires.
 //
 // Requires root or CAP_SYS_ADMIN -- the new XRT API path is gated on
 // admin per xrt_aie.h ("** This function works only in Admin mode **").
@@ -46,6 +55,8 @@ struct Args {
     int row = DEFAULT_ROW;
     uint32_t reg = REG_TIMER_LOW;
     int sleep_ms = DEFAULT_SLEEP_MS;
+    int num_reads = 2;
+    std::string label;  // optional, prepended to output
 };
 
 Args parse_args(int argc, char** argv) {
@@ -57,7 +68,10 @@ Args parse_args(int argc, char** argv) {
         else if (s == "--row" && i + 1 < argc) a.row = std::stoi(argv[++i]);
         else if (s == "--reg" && i + 1 < argc) a.reg = std::stoul(argv[++i], nullptr, 0);
         else if (s == "--sleep-ms" && i + 1 < argc) a.sleep_ms = std::stoi(argv[++i]);
+        else if (s == "--num-reads" && i + 1 < argc) a.num_reads = std::stoi(argv[++i]);
+        else if (s == "--label" && i + 1 < argc) a.label = argv[++i];
     }
+    if (a.num_reads < 1) a.num_reads = 1;
     return a;
 }
 
@@ -67,9 +81,10 @@ int main(int argc, char** argv) {
     Args a = parse_args(argc, argv);
 
     std::printf("== rw-access-probe ==\n");
+    if (!a.label.empty()) std::printf("label    : %s\n", a.label.c_str());
     std::printf("xclbin   : %s\n", a.xclbin.c_str());
-    std::printf("target   : col=%d row=%d reg=0x%05x sleep=%dms\n",
-                a.col, a.row, a.reg, a.sleep_ms);
+    std::printf("target   : col=%d row=%d reg=0x%05x num_reads=%d sleep=%dms\n",
+                a.col, a.row, a.reg, a.num_reads, a.sleep_ms);
 
     xrt::device dev{0};
     xrt::aie::device aie_dev{dev};
@@ -86,28 +101,33 @@ int main(int argc, char** argv) {
     std::printf("pid=%d  ctx_id (assumed)=%u\n", pid, ctx_id);
 
     try {
-        uint32_t v1 = aie_dev.read_aie_reg(pid, ctx_id, static_cast<uint16_t>(a.col),
-                                            static_cast<uint16_t>(a.row), a.reg);
-        std::this_thread::sleep_for(std::chrono::milliseconds(a.sleep_ms));
-        uint32_t v2 = aie_dev.read_aie_reg(pid, ctx_id, static_cast<uint16_t>(a.col),
-                                            static_cast<uint16_t>(a.row), a.reg);
-        uint32_t delta = v2 - v1;  // unsigned wrap is fine for 32-bit counter
+        std::vector<uint32_t> vals;
+        vals.reserve(a.num_reads);
+        for (int i = 0; i < a.num_reads; ++i) {
+            if (i > 0) std::this_thread::sleep_for(std::chrono::milliseconds(a.sleep_ms));
+            auto t0 = std::chrono::steady_clock::now();
+            uint32_t v = aie_dev.read_aie_reg(pid, ctx_id,
+                                              static_cast<uint16_t>(a.col),
+                                              static_cast<uint16_t>(a.row), a.reg);
+            auto t1 = std::chrono::steady_clock::now();
+            double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+            std::printf("v[%d]  = 0x%08x  (%10u)   roundtrip=%.1fus\n", i, v, v, us);
+            vals.push_back(v);
+        }
 
-        std::printf("\nv1    = 0x%08x  (%10u)\n", v1, v1);
-        std::printf("v2    = 0x%08x  (%10u)\n", v2, v2);
-        std::printf("delta = 0x%08x  (%10u cycles)\n", delta, delta);
-        std::printf("ratio = %.0f cycles/ms\n",
-                    static_cast<double>(delta) / a.sleep_ms);
+        if (vals.size() >= 2) {
+            uint32_t delta = vals.back() - vals.front();
+            std::printf("delta = 0x%08x  (%10u)   over %dms sleep\n",
+                        delta, delta, (a.num_reads - 1) * a.sleep_ms);
+        }
 
-        if (v1 == 0 && v2 == 0) {
-            std::printf("\nVERDICT: zero readings — read_aie_reg call may have silently failed\n");
+        bool any_nonzero = false;
+        for (auto v : vals) if (v != 0) { any_nonzero = true; break; }
+        if (!any_nonzero) {
+            std::printf("\nVERDICT: all readings zero — call may have silently failed\n");
             return 2;
         }
-        if (delta == 0) {
-            std::printf("\nVERDICT: counter did not advance — core may not be clocked\n");
-            return 3;
-        }
-        std::printf("\nVERDICT: cycle counter advanced (delta > 0). Feature path live.\n");
+        std::printf("\nVERDICT: read returned non-zero. Feature path live for this (col,row,reg).\n");
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "\nEXCEPTION: %s\n", e.what());
