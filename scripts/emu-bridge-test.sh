@@ -1811,6 +1811,14 @@ compile_one() {
     if [[ -n "${XDNA_TRACE_MODE:-}" ]]; then
       _trace_mode_args=(--trace-mode "$XDNA_TRACE_MODE")
     fi
+    # Optional override: explicit shim event slot list, replacing the
+    # default S2MM/MM2S START/FINISHED + S2MM STREAM_STARVATION sweep.
+    # Used by 2d stall-decomposition work to swap S2MM_1 noise slots for
+    # MM2S_0 backpressure / lock-stall / memory-starvation diagnostics.
+    local _shim_args=("--shim-sweep-events" "all")
+    if [[ -n "${XDNA_TRACE_SHIM_EVENTS:-}" ]]; then
+      _shim_args=("--shim-sweep-events" "$XDNA_TRACE_SHIM_EVENTS")
+    fi
     # Optional override: explicit memtile event slot list, replacing the
     # default PORT_RUNNING_* sweep with caller-chosen names. Used by #355a
     # to get DMA_S2MM_SEL{0,1}_*_TASK boundary events on memtile so we
@@ -1839,7 +1847,7 @@ compile_one() {
     fi
     if nice -n 19 python3 "$EMU_ROOT/tools/trace-prepare.py" "$src_dir" \
         -o "$traced_dir" \
-        --shim-sweep-events all \
+        "${_shim_args[@]}" \
         "${_memtile_args[@]}" \
         "${_memtile_sel_args[@]}" \
         "${_memmod_args[@]}" \
