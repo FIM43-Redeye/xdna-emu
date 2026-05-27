@@ -12,3 +12,7 @@ link_directories("${XRT_ROOT}/lib")
 add_executable(rw-access-probe rw-access-probe.cpp)
 target_link_libraries(rw-access-probe PRIVATE xrt_coreutil)
 target_compile_options(rw-access-probe PRIVATE -Wall -Wextra)
+
+add_executable(rw-dispatch-probe rw-dispatch-probe.cpp)
+target_link_libraries(rw-dispatch-probe PRIVATE xrt_coreutil)
+target_compile_options(rw-dispatch-probe PRIVATE -Wall -Wextra)
