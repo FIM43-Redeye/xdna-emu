@@ -139,8 +139,22 @@ def env_no_emu() -> dict:
     return env
 
 
+def env_with_emu(runtime: str = "debug") -> dict:
+    """Env with XDNA_EMU=1 set so XRT routes to the emulator plugin.
+
+    Also pins XDNA_EMU_DIR to this repo's root so the plugin loads the
+    freshly-built target/<runtime>/libxdna_emu.so instead of whatever
+    symlink happens to be installed under /opt/xilinx/xrt/lib.
+    """
+    env = dict(os.environ)
+    env["XDNA_EMU"] = "1"
+    env["XDNA_EMU_RUNTIME"] = runtime
+    env["XDNA_EMU_DIR"] = str(REPO)
+    return env
+
+
 def run_one(run_idx: int, k: int, paths: dict, out_root: Path,
-            verbose: bool) -> dict:
+            verbose: bool, emu: bool, emu_runtime: str) -> dict:
     """One iteration: bridge-trace-runner + parse-trace.py."""
     run_dir = out_root / f"run{run_idx:03d}" / f"k{k}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -153,6 +167,9 @@ def run_one(run_idx: int, k: int, paths: dict, out_root: Path,
     t_start = time.monotonic()
     t_start_wall = datetime.now(timezone.utc).isoformat()
 
+    runner_env = env_with_emu(emu_runtime) if emu else env_no_emu()
+    parser_env_base = runner_env  # parse-trace doesn't touch HW; same env is fine
+
     # 1) bridge-trace-runner
     runner_cmd = [
         str(RUNNER),
@@ -164,14 +181,14 @@ def run_one(run_idx: int, k: int, paths: dict, out_root: Path,
     t_run_start = time.monotonic()
     with open(runner_log, "w") as logf:
         rr = subprocess.run(runner_cmd, stdout=logf, stderr=subprocess.STDOUT,
-                            env=env_no_emu())
+                            env=runner_env)
     run_us = (time.monotonic() - t_run_start) * 1e6
 
     # 2) parse-trace.py (skip if runner failed)
     pr_rc = None
     parse_us = 0.0
     if rr.returncode == 0:
-        env_p = env_no_emu()
+        env_p = dict(parser_env_base)
         env_p["PYTHONPATH"] = MLIR_AIE_PY
         parser_cmd = [
             sys.executable, str(PARSE_TRACE),
@@ -214,22 +231,35 @@ def run_one(run_idx: int, k: int, paths: dict, out_root: Path,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    ap.add_argument("--n-runs", type=int, default=50,
-                    help="number of full (K) sweeps per K value (default 50)")
+    ap.add_argument("--n-runs", type=int, default=None,
+                    help="number of full (K) sweeps per K value "
+                         "(default 50 for HW, 1 for --emu since EMU is "
+                         "deterministic; >1 useful only to verify determinism)")
     ap.add_argument("--ks", default="1,2,4,8",
                     help="comma-separated K values (default 1,2,4,8; "
-                         "k16 wedges)")
+                         "k16 wedges on HW; should be safe on --emu)")
     ap.add_argument("--seed", type=int, default=42,
                     help="schedule shuffle seed (default 42)")
     ap.add_argument("--out-root", type=Path, default=DEFAULT_OUT_ROOT,
                     help=f"output root (default {DEFAULT_OUT_ROOT})")
     ap.add_argument("--session", default=None,
-                    help="session subdir name (default: timestamp)")
+                    help="session subdir name (default: timestamp; "
+                         "with --emu, an '-emu' suffix is appended)")
+    ap.add_argument("--emu", action="store_true",
+                    help="route bridge-trace-runner through the emulator "
+                         "plugin (XDNA_EMU=1) instead of real HW")
+    ap.add_argument("--emu-runtime", default="debug",
+                    choices=("debug", "release"),
+                    help="EMU plugin profile to load (default debug)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print schedule and manifest; don't execute")
     ap.add_argument("-q", "--quiet", action="store_true",
                     help="suppress per-iteration progress lines")
     args = ap.parse_args()
+
+    # Defaults differ by mode -- HW needs noise reduction, EMU does not.
+    if args.n_runs is None:
+        args.n_runs = 1 if args.emu else 50
 
     ks = [int(x) for x in args.ks.split(",")]
     if 16 in ks:
@@ -253,21 +283,30 @@ def main() -> int:
         paths_by_k[k] = kbuild_paths(k)
 
     session = args.session or utc_now_str()
+    if args.emu and not session.endswith("-emu"):
+        session = f"{session}-emu"
     out_root = args.out_root / session
     out_root.mkdir(parents=True, exist_ok=True)
 
     schedule = make_schedule(ks, args.n_runs, args.seed)
 
+    # On EMU mode, skip the xrt-smi probe entirely: no live HW state to
+    # report, and we want to avoid any risk of the probe touching the
+    # device while the EMU plugin is loaded.
+    fw_state = {} if args.emu else fw_state_from_xrt_smi()
+
     manifest = {
         "session": session,
         "session_start_utc": datetime.now(timezone.utc).isoformat(),
+        "mode": "emu" if args.emu else "hw",
+        "emu_runtime": args.emu_runtime if args.emu else None,
         "ks": ks,
         "n_runs": args.n_runs,
         "n_iterations": len(schedule),
         "seed": args.seed,
         "xdna_emu_git": git_head(REPO),
         "xdna_driver_git": git_head(DRIVER_REPO),
-        "fw_state": fw_state_from_xrt_smi(),
+        "fw_state": fw_state,
         "host": os.uname().nodename,
         "python": sys.version.split()[0],
         "runner_path": str(RUNNER),
@@ -285,6 +324,8 @@ def main() -> int:
 
     print(f"== multirun-trace-campaign ==")
     print(f"  session     : {session}")
+    print(f"  mode        : {manifest['mode']}"
+          + (f" ({args.emu_runtime})" if args.emu else ""))
     print(f"  ks          : {ks}")
     print(f"  n_runs      : {args.n_runs}")
     print(f"  iterations  : {len(schedule)}")
@@ -309,7 +350,8 @@ def main() -> int:
             print(f"[{i}/{len(schedule)}] {pct:5.1f}% run={run_idx} k={k}",
                   flush=True)
         meta = run_one(run_idx, k, paths_by_k[k], out_root,
-                       verbose=not args.quiet)
+                       verbose=not args.quiet,
+                       emu=args.emu, emu_runtime=args.emu_runtime)
         if meta["ok"]:
             n_ok += 1
         else:
