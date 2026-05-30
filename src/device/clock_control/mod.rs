@@ -310,6 +310,15 @@ impl ClockController {
         }
     }
 
+    /// Reset both adaptive idle counters (DMA + SS) for every tile in a
+    /// column. Called on `AIE_Tile_Column_Reset` -- the adaptive counters
+    /// are tile-resident state cleared by the column reset, unlike the
+    /// shim-resident clock-gate enable bits which the reset leaves intact.
+    pub(crate) fn reset_adaptive_counters_for_column(&mut self, col: u8) {
+        self.reset_dma_counters_for_column(col);
+        self.reset_ss_counters_for_column(col);
+    }
+
     /// Configure the abort_period (= 2^N idle-cycle threshold) for the
     /// adaptive gates on a tile.  AM025 supported range is 3-12; values
     /// outside that produce undefined hardware behavior, but the

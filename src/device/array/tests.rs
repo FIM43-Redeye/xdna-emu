@@ -38,6 +38,44 @@ fn test_out_of_bounds() {
     assert!(array.get(0, 10).is_none());
 }
 
+/// Column reset (AIE_Tile_Column_Reset assert edge) clears the state of
+/// every non-shim tile in the column -- core, locks, DMA -- but preserves
+/// tile memory and leaves the shim row and other columns untouched.
+#[test]
+fn reset_column_clears_nonshim_state_preserves_memory_and_isolates_columns() {
+    let mut array = TileArray::npu1();
+
+    // Stamp recognizable state into column 2: a compute tile (row 2), the
+    // mem tile (row 1), plus a memory marker that must survive the reset.
+    {
+        let t = array.get_mut(2, 2).unwrap();
+        t.core.pc = 0x200;
+        t.locks[0].value = 7;
+        assert!(t.write_data_u32(0x40, 0xDEAD_BEEF));
+    }
+    array.get_mut(2, 1).unwrap().locks[0].value = 4;
+
+    // A different column must be entirely unaffected.
+    {
+        let t = array.get_mut(1, 2).unwrap();
+        t.core.pc = 0x111;
+        t.locks[0].value = 5;
+    }
+
+    array.reset_column(2);
+
+    // Column 2 non-shim tiles: state cleared, memory preserved.
+    let t = array.get(2, 2).unwrap();
+    assert_eq!(t.core.pc, 0, "compute core PC reset to boot state");
+    assert_eq!(t.locks[0].value, 0, "compute lock reset to boot state");
+    assert_eq!(t.read_data_u32(0x40), Some(0xDEAD_BEEF), "data memory preserved across reset");
+    assert_eq!(array.get(2, 1).unwrap().locks[0].value, 0, "mem-tile lock reset");
+
+    // Other column untouched.
+    assert_eq!(array.get(1, 2).unwrap().core.pc, 0x111, "other column core untouched");
+    assert_eq!(array.get(1, 2).unwrap().locks[0].value, 5, "other column lock untouched");
+}
+
 #[test]
 fn test_tile_types() {
     let array = TileArray::npu1();

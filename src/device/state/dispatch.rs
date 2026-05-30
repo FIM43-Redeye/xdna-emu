@@ -62,6 +62,25 @@ impl DeviceState {
         let tile_kind = tile_kind_from_row(tile_addr.row);
         let subsystem = subsystem_from_offset(tile_addr.offset, tile_kind);
 
+        // AIE_Tile_Column_Reset (shim, AM025 offset 0xFFF28): asserting
+        // bit 0 tears down every non-shim tile in the column -- cores,
+        // DMAs, locks, stream switches, adaptive counters -- preserving
+        // tile memory (aie-rt pm/xaie_reset.c; the shim row is exempt).
+        // This is an array-wide effect, not a per-tile register, so it is
+        // handled here rather than via SubsystemKind; the raw store above
+        // keeps the shim's register value readable.  (Reset_Control_1 at
+        // 0xFFF14, the shim-NoC reset, is intentionally a no-op: the NoC
+        // is a stub with no state to tear down.)
+        const AIE_TILE_COLUMN_RESET_OFFSET: u32 = 0x000F_FF28;
+        if matches!(tile_kind, TileKind::ShimNoc | TileKind::ShimPl)
+            && tile_addr.offset == AIE_TILE_COLUMN_RESET_OFFSET
+        {
+            if value & 0x1 != 0 {
+                self.array.reset_column(tile_addr.col);
+            }
+            return Ok(());
+        }
+
         // Wake-on-event: register writes into a gated module's address
         // range wake the adaptive clock-gate counter for that module
         // (AM025 adaptive gating).  ClockControl writes are themselves

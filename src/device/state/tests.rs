@@ -805,6 +805,44 @@ mod tier_c_integration {
     }
 
     #[test]
+    fn write_tile_register_column_reset_tears_down_nonshim_tiles() {
+        let mut state = DeviceState::new_npu1();
+        // Ungate column 2 and stamp recognizable live state into a tile.
+        state.write_tile_register(2, 0, 0x000FFF20, 0x1);
+        {
+            let t = state.array.get_mut(2, 2).unwrap();
+            t.core.pc = 0x200;
+            t.locks[0].value = 7;
+            t.write_data_u32(0x40, 0xDEAD_BEEF);
+        }
+
+        // Assert AIE_Tile_Column_Reset (shim 0xFFF28, bit 0) on column 2.
+        state.write_tile_register(2, 0, 0x000FFF28, 0x1);
+
+        let t = state.array.get(2, 2).unwrap();
+        assert_eq!(t.core.pc, 0, "column reset cleared the core");
+        assert_eq!(t.locks[0].value, 0, "column reset cleared the lock");
+        assert_eq!(t.read_data_u32(0x40), Some(0xDEAD_BEEF), "tile memory preserved across reset");
+    }
+
+    #[test]
+    fn write_tile_register_column_reset_without_bit0_does_not_tear_down() {
+        let mut state = DeviceState::new_npu1();
+        state.write_tile_register(2, 0, 0x000FFF20, 0x1); // ungate column 2
+        state.array.get_mut(2, 2).unwrap().core.pc = 0x200;
+
+        // Writing AIE_Tile_Column_Reset with bit 0 clear is a deassert,
+        // not an assert edge -- no teardown.
+        state.write_tile_register(2, 0, 0x000FFF28, 0x0);
+
+        assert_eq!(
+            state.array.get(2, 2).unwrap().core.pc,
+            0x200,
+            "reset register write with bit 0 clear must not tear down the column"
+        );
+    }
+
+    #[test]
     fn write_tile_register_routes_mcc_compute_to_clock_controller() {
         let mut state = DeviceState::new_npu1();
         // Ungate column 2 first.

@@ -401,16 +401,23 @@ impl TileArray {
     /// every field returns to its `Tile::new` default (preserving memory
     /// contents). Avoiding a hand-curated field-by-field reset prevents
     /// new state from being silently leaked across hw_context teardowns.
+    /// Build the per-tile construction parameters for a tile kind from
+    /// the arch config. Associated (not `&self`) so callers can invoke it
+    /// while `self.tiles` is mutably borrowed (disjoint from `self.arch`).
+    fn tile_params(arch: &dyn ArchConfig, tile_kind: TileKind) -> TileParams {
+        TileParams {
+            data_memory_size: arch.data_memory_size(tile_kind),
+            num_locks: arch.lock_count(tile_kind),
+            num_bds: arch.dma_bd_count(tile_kind),
+            num_channels: arch.dma_total_channels(tile_kind),
+            dma_s2mm_channels: arch.dma_s2mm_channels(tile_kind),
+            dma_mm2s_channels: arch.dma_mm2s_channels(tile_kind),
+        }
+    }
+
     pub fn reset(&mut self) {
         for tile in &mut self.tiles {
-            let params = TileParams {
-                data_memory_size: self.arch.data_memory_size(tile.tile_kind),
-                num_locks: self.arch.lock_count(tile.tile_kind),
-                num_bds: self.arch.dma_bd_count(tile.tile_kind),
-                num_channels: self.arch.dma_total_channels(tile.tile_kind),
-                dma_s2mm_channels: self.arch.dma_s2mm_channels(tile.tile_kind),
-                dma_mm2s_channels: self.arch.dma_mm2s_channels(tile.tile_kind),
-            };
+            let params = Self::tile_params(&*self.arch, tile.tile_kind);
             tile.reset_for_new_context(&params);
         }
 
@@ -428,6 +435,34 @@ impl TileArray {
         for r in &mut self.ctrl_reassemblers {
             r.reset();
         }
+    }
+
+    /// Reset all non-shim tiles in a column to boot state, modelling
+    /// `AIE_Tile_Column_Reset` (SHIM offset 0xFFF28, bit 0) on the assert
+    /// edge.
+    ///
+    /// Per aie-rt `pm/xaie_reset.c`, asserting column reset clears every
+    /// tile *above* the shim -- cores, DMAs, locks, stream switches, and
+    /// adaptive clock-gating counters -- but does NOT zero tile memory
+    /// (that is a separate `XAie_ClearPartitionMems`) and exempts the
+    /// shim tile itself (row 0). Other columns are untouched.
+    pub fn reset_column(&mut self, col: u8) {
+        if col >= self.cols {
+            return;
+        }
+        // Non-shim tiles are rows 1..rows; row 0 (shim) is exempt. Reset
+        // each tile (memory-preserving) and its DMA engine.
+        for row in 1..self.rows {
+            let idx = self.tile_index(col, row);
+            let tile_kind = self.tiles[idx].tile_kind;
+            let params = Self::tile_params(&*self.arch, tile_kind);
+            self.tiles[idx].reset_for_new_context(&params);
+            self.dma_engines[idx].reset();
+        }
+        // Adaptive idle counters are tile-resident, so they reset too; the
+        // shim-resident column/module clock-gate enables are NOT touched
+        // (the shim is exempt from column reset).
+        self.clock.reset_adaptive_counters_for_column(col);
     }
 
     /// Zero all tile memory (slow, use only during initialization).

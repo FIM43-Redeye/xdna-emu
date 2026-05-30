@@ -6,5 +6,5 @@ Subsystems only partially built or stubbed (spec Section 1, third gap
 class). Empty == every named subsystem is Full/closed for this arch.
 
 - noc: STUB
-- clock_control: PARTIAL -- missing: Reset_Control_1 / AIE_Tile_Column_Reset partition teardown; power/cycle-count effects; cascade-arrival wake (Wake 4) deferred pending Core adaptive counter
+- clock_control: PARTIAL -- missing: power/cycle-count effects; cascade-arrival wake (Wake 4) deferred pending Core adaptive counter
 
