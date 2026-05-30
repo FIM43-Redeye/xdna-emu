@@ -541,7 +541,7 @@ impl DmaEngine {
         ch.queued_bd = None;
         ch.chain_start_bd = None;
         ch.is_first_bd = true;
-        ch.has_paid_cold_start = false;
+        ch.warm_task_index = 0;
         ch.prev_starving = false;
         ch.prev_lock_stalled = false;
 

@@ -203,6 +203,14 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             shim_ddr_cold_start_s2mm_cycles: 341,
             shim_per_task_overhead_mm2s_cycles: 325,
             shim_per_task_overhead_s2mm_cycles: 179,
+            // Warm-up transient: the MM2S cold-start cost decays
+            // geometrically across a task chain rather than firing once.
+            // Fit against 2026-05-27 N=50 K=8 HW (durations 1739/804/497/
+            // 422/... -> cold_start * 0.310^i over steady-state).  S2MM has
+            // no measurable tail (excess at i=1 within noise of 0), so its
+            // decay is 0 -- pure one-shot cold-start preserved.  Phase 2d.
+            shim_warmup_decay_mm2s_permille: 310,
+            shim_warmup_decay_s2mm_permille: 0,
         },
         stream_switch: StreamSwitchTiming {
             // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /

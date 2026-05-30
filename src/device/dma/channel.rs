@@ -224,14 +224,12 @@ pub struct ChannelContext {
     /// task dispatch (Idle->BdSetup transition).
     pub is_first_bd: bool,
 
-    /// Channel cold-start gate: false until the channel pays its one-shot
-    /// `shim_ddr_cold_start_*_cycles` cost on the first task that touches
-    /// host memory.  Once true, subsequent tasks on this channel skip the
-    /// cold-start even if separated by long idle gaps -- HW keeps the
-    /// channel "warm" indefinitely within a session.  Reset on
-    /// stop_channel (channel reset / hard stop simulates a fresh
-    /// boot for that channel).
-    pub has_paid_cold_start: bool,
+    /// Index of the next task within this channel session, used to charge
+    /// the geometrically-decaying shim warm-up transient
+    /// (`cold_start * (decay/1000)^warm_task_index`).  Increments once per
+    /// task (per first-BD bonus on a shim+host transfer); reset to 0 on
+    /// stop_channel (channel reset == fresh boot).  Phase 2d.
+    pub warm_task_index: u32,
 
     /// Performance counters.
     pub stats: ChannelStats,
@@ -263,7 +261,7 @@ impl ChannelContext {
             task_config: ChannelTaskConfig::default(),
             error_bd_unavailable: false,
             is_first_bd: true,
-            has_paid_cold_start: false,
+            warm_task_index: 0,
             stats: ChannelStats::default(),
             prev_starving: false,
             prev_lock_stalled: false,
@@ -369,7 +367,7 @@ impl ChannelContext {
         self.task_config = ChannelTaskConfig::default();
         self.error_bd_unavailable = false;
         self.is_first_bd = true;
-        self.has_paid_cold_start = false;
+        self.warm_task_index = 0;
         self.stats = ChannelStats::default();
     }
 }

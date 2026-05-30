@@ -76,6 +76,8 @@ impl DmaModel for Aie2DmaModel {
             shim_ddr_cold_start_s2mm_cycles: timing::DMA_SHIM_DDR_COLD_START_S2MM_CYCLES,
             shim_per_task_overhead_mm2s_cycles: timing::DMA_SHIM_PER_TASK_OVERHEAD_MM2S_CYCLES,
             shim_per_task_overhead_s2mm_cycles: timing::DMA_SHIM_PER_TASK_OVERHEAD_S2MM_CYCLES,
+            shim_warmup_decay_mm2s_permille: timing::DMA_SHIM_WARMUP_DECAY_MM2S_PERMILLE,
+            shim_warmup_decay_s2mm_permille: timing::DMA_SHIM_WARMUP_DECAY_S2MM_PERMILLE,
         }
     }
 }

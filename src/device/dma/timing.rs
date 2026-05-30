@@ -68,6 +68,19 @@ pub struct DmaTimingConfig {
 
     /// Per-task overhead on shim S2MM DMA touching host memory.
     pub shim_per_task_overhead_s2mm_cycles: u16,
+
+    /// Geometric decay ratio (per-mille) of the shim MM2S warm-up
+    /// transient.  The cold-start cost is charged as
+    /// `shim_ddr_cold_start_mm2s_cycles * (permille/1000)^i` at task
+    /// index `i` in a channel session, so it decays across the chain
+    /// rather than firing once on task 0.  Calibrated to ~310 (r=0.31)
+    /// against 2026-05-27 N=50 K=8 HW.  Phase 2d warm-up-transient model.
+    pub shim_warmup_decay_mm2s_permille: u16,
+
+    /// Geometric decay ratio (per-mille) of the shim S2MM warm-up
+    /// transient.  ~0 on Phoenix -- S2MM has no measurable tail past
+    /// task 0, so this preserves the pure one-shot cold-start.
+    pub shim_warmup_decay_s2mm_permille: u16,
 }
 
 impl Default for DmaTimingConfig {
@@ -100,6 +113,8 @@ impl DmaTimingConfig {
             shim_ddr_cold_start_s2mm_cycles: m.shim_ddr_cold_start_s2mm_cycles,
             shim_per_task_overhead_mm2s_cycles: m.shim_per_task_overhead_mm2s_cycles,
             shim_per_task_overhead_s2mm_cycles: m.shim_per_task_overhead_s2mm_cycles,
+            shim_warmup_decay_mm2s_permille: m.shim_warmup_decay_mm2s_permille,
+            shim_warmup_decay_s2mm_permille: m.shim_warmup_decay_s2mm_permille,
         }
     }
 

@@ -114,17 +114,18 @@ impl DmaEngine {
     /// - `shim_per_task_overhead_{mm2s,s2mm}_cycles`: per-task overhead on
     ///   shim DMA touching host memory.  Fires on every task -- covers BD
     ///   programming + per-task AXI burst arbitration.
-    /// - `shim_ddr_cold_start_{mm2s,s2mm}_cycles`: one-shot cold-start on
-    ///   the FIRST task ever on this channel session (gated on
-    ///   `has_paid_cold_start`).  Covers DDR read pipeline fill (MM2S) /
-    ///   initial AXI setup (S2MM).  Subsequent tasks skip it even with long
-    ///   idle gaps -- HW keeps the channel warm indefinitely.  Reset only
-    ///   on `stop_channel` (channel reset).
+    /// - `shim_ddr_cold_start_{mm2s,s2mm}_cycles` decayed by
+    ///   `shim_warmup_decay_{mm2s,s2mm}_permille`: the warm-up transient.
+    ///   The cold-start cost (DDR read pipeline fill on MM2S / AXI setup on
+    ///   S2MM) is charged as `cold_start * (decay/1000)^i` at task index
+    ///   `i = warm_task_index`, so it decays geometrically across the chain
+    ///   instead of firing once.  MM2S fades over ~4 tasks (r~0.31); S2MM's
+    ///   decay is 0, so only task 0 pays cold-start (pure one-shot).  Phase 2d.
     ///
     /// `is_first_bd` is reset to true by `after_transfer_done` (Idle re-entry)
-    /// and by `stop_channel`; `has_paid_cold_start` is reset only by
-    /// `stop_channel`.
-    fn consume_first_bd_bonus(&mut self, ch_idx: usize, transfer: &Transfer) -> u16 {
+    /// and by `stop_channel`; `warm_task_index` increments per task and is
+    /// reset to 0 only by `stop_channel`.
+    pub(crate) fn consume_first_bd_bonus(&mut self, ch_idx: usize, transfer: &Transfer) -> u16 {
         if !self.channels[ch_idx].is_first_bd {
             return 0;
         }
@@ -136,14 +137,28 @@ impl DmaEngine {
                 TransferDirection::MM2S => self.timing_config.shim_per_task_overhead_mm2s_cycles,
                 TransferDirection::S2MM => self.timing_config.shim_per_task_overhead_s2mm_cycles,
             };
-            // Cold-start fires once per channel session.
-            if !self.channels[ch_idx].has_paid_cold_start {
-                self.channels[ch_idx].has_paid_cold_start = true;
-                bonus += match transfer.direction {
-                    TransferDirection::MM2S => self.timing_config.shim_ddr_cold_start_mm2s_cycles,
-                    TransferDirection::S2MM => self.timing_config.shim_ddr_cold_start_s2mm_cycles,
-                };
+            // Warm-up transient: the cold-start cost decays geometrically
+            // across the task chain rather than firing once.  At task index
+            // `i` the channel pays cold_start * (decay/1000)^i -- i=0 is the
+            // full cold-start, and the tail fades over ~4 tasks.  MM2S has
+            // a real decay (r~0.31); S2MM's decay is 0, so it pays only the
+            // one-shot cold-start at i=0, preserving prior behavior.  Phase 2d.
+            let (cold_start, decay_permille) = match transfer.direction {
+                TransferDirection::MM2S => (
+                    self.timing_config.shim_ddr_cold_start_mm2s_cycles,
+                    self.timing_config.shim_warmup_decay_mm2s_permille,
+                ),
+                TransferDirection::S2MM => (
+                    self.timing_config.shim_ddr_cold_start_s2mm_cycles,
+                    self.timing_config.shim_warmup_decay_s2mm_permille,
+                ),
+            };
+            let mut term = cold_start as u32;
+            for _ in 0..self.channels[ch_idx].warm_task_index {
+                term = term * decay_permille as u32 / 1000;
             }
+            bonus += term as u16;
+            self.channels[ch_idx].warm_task_index += 1;
         }
         bonus
     }
@@ -604,13 +619,14 @@ impl DmaEngine {
                 self.channels[ch_idx].task_queue.len()
             );
             self.start_next_queued_task(ch_idx as u8);
-            // Re-arm is_first_bd so the queued task pays per-task overhead
-            // (channel_start + shim_per_task_overhead_*).  Cold-start does
-            // NOT re-fire because it's gated separately on
-            // has_paid_cold_start -- back-to-back queued tasks share the
-            // warm DDR controller, but each still pays BD programming +
-            // AXI burst setup overhead.  See finding
-            // 2026-05-25-shim-bd-chain-amortization.
+            // Re-arm is_first_bd so the queued task pays its first-BD bonus
+            // (channel_start + shim_per_task_overhead_* + the decayed warm-up
+            // term).  The cold-start no longer fires in full on each task --
+            // consume_first_bd_bonus charges cold_start * (decay/1000)^i at
+            // the channel's warm_task_index, so back-to-back queued tasks pay
+            // a geometrically shrinking warm-up cost as the DDR controller
+            // warms.  See finding 2026-05-25-shim-bd-chain-amortization and
+            // the Phase 2d warm-up-transient model.
             self.channels[ch_idx].is_first_bd = true;
             return std::mem::take(&mut self.channels[ch_idx].fsm);
         }

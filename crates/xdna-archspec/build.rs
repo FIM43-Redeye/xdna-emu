@@ -448,6 +448,18 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             t.dma.shim_per_task_overhead_s2mm_cycles
         )
         .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_SHIM_WARMUP_DECAY_MM2S_PERMILLE: u16 = {};",
+            t.dma.shim_warmup_decay_mm2s_permille
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_SHIM_WARMUP_DECAY_S2MM_PERMILLE: u16 = {};",
+            t.dma.shim_warmup_decay_s2mm_permille
+        )
+        .unwrap();
         writeln!(out).unwrap();
 
         writeln!(out, "    // Stream switch timing").unwrap();

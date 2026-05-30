@@ -1223,6 +1223,25 @@ pub struct DmaTiming {
     /// HW calibration (chain-sweep K=8 steady-state, 2026-05-25):
     /// 168 cyc.
     pub shim_per_task_overhead_s2mm_cycles: u16,
+
+    /// Geometric decay ratio (per-mille) of the shim MM2S warm-up
+    /// transient across a task chain.  The cold-start cost is not a
+    /// one-shot: HW per-task MM2S transfer durations decay geometrically
+    /// from the cold value toward steady state over ~4 tasks.  Modeled as
+    /// `cold_start_mm2s * (permille/1000)^i` charged at task index `i`
+    /// (i=0 reproduces the full cold-start).
+    ///
+    /// HW calibration (2026-05-27 N=50 K=8 multi-run): durations
+    /// 1739/804/497/422/... decay with ratio ~0.310 over the cold-start
+    /// excess.  See finding 2026-05-27-phase-2c-dispatch-overhead-recalibration
+    /// ("Remaining gap") and the Phase 2d warm-up-transient model.
+    pub shim_warmup_decay_mm2s_permille: u16,
+
+    /// Geometric decay ratio (per-mille) of the shim S2MM warm-up
+    /// transient.  ~0 on Phoenix: HW S2MM shows no measurable tail past
+    /// task 0 (excess at i=1 is within noise of zero), so S2MM keeps the
+    /// pure one-shot cold-start behavior.
+    pub shim_warmup_decay_s2mm_permille: u16,
 }
 
 /// Stream switch timing and physical constants.

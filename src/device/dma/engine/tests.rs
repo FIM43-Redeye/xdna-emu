@@ -348,6 +348,10 @@ fn test_shim_ddr_timing_decomposition() {
     assert_eq!(cfg.shim_per_task_overhead_mm2s_cycles, 325);
     assert_eq!(cfg.shim_per_task_overhead_s2mm_cycles, 179);
     assert_eq!(cfg.shim_words_per_cycle, 1);
+    // Phase 2d warm-up transient decay ratios (per-mille).  MM2S decays the
+    // cold-start across the chain (r~0.31); S2MM has no tail (one-shot).
+    assert_eq!(cfg.shim_warmup_decay_mm2s_permille, 310);
+    assert_eq!(cfg.shim_warmup_decay_s2mm_permille, 0);
 
     // stop_channel re-arms BOTH gates (channel reset == fresh boot).
     let mut engine = DmaEngine::new_shim_tile(0, 0);
@@ -355,7 +359,56 @@ fn test_shim_ddr_timing_decomposition() {
     engine.start_channel(0, 0).unwrap();
     engine.stop_channel(0).unwrap();
     assert!(engine.channels[0].is_first_bd, "stop_channel re-arms is_first_bd");
-    assert!(!engine.channels[0].has_paid_cold_start, "stop_channel re-arms has_paid_cold_start");
+    assert_eq!(engine.channels[0].warm_task_index, 0, "stop_channel re-arms warm_task_index");
+}
+
+/// Phase 2d warm-up transient: on shim MM2S the cold-start cost is not a
+/// one-shot -- HW per-task transfer durations decay geometrically across the
+/// chain (1739/804/497/422/... at K=8).  The first-BD bonus on successive
+/// tasks of a single channel session must follow
+/// `channel_start + per_task + cold_start * (decay/1000)^i`.
+///
+/// Calibrated against the 2026-05-27 N=50 K=8 HW multi-run campaign.
+#[test]
+fn test_shim_mm2s_warmup_transient_decays_geometrically() {
+    let mut engine = DmaEngine::new_shim_tile(0, 0);
+    let bd = BdConfig::simple_1d(0x1000, 16);
+    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 0, 0, engine.tile_kind).unwrap();
+    assert!(transfer.involves_host_memory(), "shim MM2S transfer touches host DDR");
+
+    // Drive successive tasks within one channel session.  is_first_bd is
+    // re-armed per task on Idle re-entry on real runs; emulate that here so
+    // each call represents the first BD of a new task.
+    let mut seq = Vec::new();
+    for _ in 0..6 {
+        engine.channels[0].is_first_bd = true;
+        seq.push(engine.consume_first_bd_bonus(0, &transfer));
+    }
+
+    // channel_start(2) + per_task_mm2s(325) + cold_start(1330) * 0.310^i,
+    // integer fixed-point (term = term * 310 / 1000 each task):
+    //   cold terms: 1330, 412, 127, 39, 12, 3
+    assert_eq!(seq, vec![1657, 739, 454, 366, 339, 330]);
+}
+
+/// S2MM warm-up decay is 0 on Phoenix: the cold-start fires once on task 0
+/// and subsequent tasks pay only the per-task overhead.  Guards that the
+/// Phase 2d geometric model leaves the S2MM direction's behavior unchanged.
+#[test]
+fn test_shim_s2mm_warmup_has_no_tail() {
+    let mut engine = DmaEngine::new_shim_tile(0, 0);
+    let bd = BdConfig::simple_1d(0x1000, 16);
+    let transfer = Transfer::new(&bd, 0, 0, TransferDirection::S2MM, 0, 0, engine.tile_kind).unwrap();
+    assert!(transfer.involves_host_memory(), "shim S2MM transfer touches host DDR");
+
+    let mut seq = Vec::new();
+    for _ in 0..3 {
+        engine.channels[0].is_first_bd = true;
+        seq.push(engine.consume_first_bd_bonus(0, &transfer));
+    }
+
+    // channel_start(2) + per_task_s2mm(179) + cold_start(341) only on task 0.
+    assert_eq!(seq, vec![522, 181, 181]);
 }
 
 #[test]

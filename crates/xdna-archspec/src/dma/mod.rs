@@ -100,6 +100,16 @@ pub struct DmaTimingConfig {
 
     /// Per-task overhead on shim S2MM DMA, paid on every task.
     pub shim_per_task_overhead_s2mm_cycles: u16,
+
+    /// Geometric decay ratio (per-mille) of the shim MM2S warm-up
+    /// transient: `cold_start_mm2s * (permille/1000)^i` is charged at
+    /// task index `i` within a channel session, so the cold-start cost
+    /// fades across the chain instead of firing once.  See `DmaTiming`.
+    pub shim_warmup_decay_mm2s_permille: u16,
+
+    /// Geometric decay ratio (per-mille) of the shim S2MM warm-up
+    /// transient.  ~0 on Phoenix (no measurable tail past task 0).
+    pub shim_warmup_decay_s2mm_permille: u16,
 }
 
 /// Per-arch DMA behavior, consulted at DmaEngine construction and at the
