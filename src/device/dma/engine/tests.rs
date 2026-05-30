@@ -655,6 +655,60 @@ fn test_mm2s_stalled_stream_backpressure_bit() {
     );
 }
 
+/// BD-prefetch overlap (Phase 2d.2): when a task sits in the queue while the
+/// channel transfers the current task, HW loads the next BD and fires its
+/// START_TASK event *during* the current transfer -- not after FINISHED.  This
+/// dual-state (Cur_BD executing + next BD loaded) is the mechanism behind a
+/// negative MM2S gap[0] on a long first task: START[i+1] can precede
+/// FINISHED[i].  The channel data path stays serial; only the event moves.
+#[test]
+fn test_queued_task_start_emitted_during_prior_transfer() {
+    let mut engine = DmaEngine::new_shim_tile(0, 0);
+    let mut tile = make_tile();
+    let mut host_mem = make_host_memory();
+
+    engine.configure_bd(0, BdConfig::simple_1d(0x1000, 256)).unwrap();
+    engine.configure_bd(1, BdConfig::simple_1d(0x2000, 256)).unwrap();
+
+    let ch = (0..engine.num_channels() as u8)
+        .find(|&c| matches!(engine.channel_type(c), ChannelType::MM2S))
+        .expect("shim has an MM2S channel");
+
+    // Both tasks queued up front, so task[1] is in the queue while task[0]
+    // transfers and the channel can prefetch it.
+    assert!(engine.enqueue_task(ch, 0, 0, false));
+    assert!(engine.enqueue_task(ch, 1, 0, false));
+
+    let mut events: Vec<(u64, EventType)> = Vec::new();
+    let mut steps = 0;
+    loop {
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {} // drain so MM2S doesn't backpressure
+        events.extend(engine.drain_trace_events());
+        steps += 1;
+        if !engine.channel_active(ch) || steps > 4000 {
+            break;
+        }
+    }
+    events.extend(engine.drain_trace_events());
+
+    // Event kinds in emission order.  current_cycle is driven externally in
+    // the real device (0 in this standalone test), so we assert on order, not
+    // timestamps.  Prefetch overlap => both STARTs fire before either FINISH:
+    // S[0], S[1] (prefetched during task[0]), F[0], F[1].  The pre-2d.2 serial
+    // model emits S[0], F[0], S[1], F[1].
+    let seq: Vec<char> = events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            EventType::DmaStartTask { .. } => Some('S'),
+            EventType::DmaFinishedTask { .. } => Some('F'),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(seq, vec!['S', 'S', 'F', 'F'], "prefetch: both STARTs must precede either FINISH");
+}
+
 #[test]
 fn test_task_queue_multiple_tasks_complete() {
     let mut engine = DmaEngine::new_compute_tile(1, 2);

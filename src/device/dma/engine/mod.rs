@@ -523,7 +523,14 @@ impl DmaEngine {
             );
         }
 
-        self.trace(EventType::DmaStartTask { channel });
+        // Suppress the START event if the BD-prefetch path already emitted it
+        // ahead of time while the prior task was transferring (Phase 2d.2);
+        // consume the gate either way.  The first task of a session has the
+        // gate clear, so it emits normally.
+        if !self.channels[ch_idx].prefetch_start_emitted {
+            self.trace(EventType::DmaStartTask { channel });
+        }
+        self.channels[ch_idx].prefetch_start_emitted = false;
 
         Ok(())
     }
@@ -542,6 +549,7 @@ impl DmaEngine {
         ch.chain_start_bd = None;
         ch.is_first_bd = true;
         ch.warm_task_index = 0;
+        ch.prefetch_start_emitted = false;
         ch.prev_starving = false;
         ch.prev_lock_stalled = false;
 

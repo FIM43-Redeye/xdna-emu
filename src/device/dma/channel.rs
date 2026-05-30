@@ -231,6 +231,14 @@ pub struct ChannelContext {
     /// stop_channel (channel reset == fresh boot).  Phase 2d.
     pub warm_task_index: u32,
 
+    /// BD-prefetch gate (Phase 2d.2): true once the channel has emitted the
+    /// START_TASK event for the *next* queued task ahead of time, while still
+    /// transferring the current one (HW loads the next BD into its second slot
+    /// during the current transfer).  start_channel suppresses the duplicate
+    /// START when that task actually begins, then clears this.  Reset on
+    /// channel stop/reset.  Lets START[i+1] precede FINISHED[i].
+    pub prefetch_start_emitted: bool,
+
     /// Performance counters.
     pub stats: ChannelStats,
 
@@ -262,6 +270,7 @@ impl ChannelContext {
             error_bd_unavailable: false,
             is_first_bd: true,
             warm_task_index: 0,
+            prefetch_start_emitted: false,
             stats: ChannelStats::default(),
             prev_starving: false,
             prev_lock_stalled: false,
@@ -368,6 +377,7 @@ impl ChannelContext {
         self.error_bd_unavailable = false;
         self.is_first_bd = true;
         self.warm_task_index = 0;
+        self.prefetch_start_emitted = false;
         self.stats = ChannelStats::default();
     }
 }

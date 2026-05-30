@@ -163,6 +163,31 @@ impl DmaEngine {
         bonus
     }
 
+    /// BD-prefetch overlap (Phase 2d.2): while a channel is transferring the
+    /// current task, if another task is already queued, HW loads that next BD
+    /// into its second slot and fires its START_TASK event during the current
+    /// transfer -- it does not wait for the current task to finish.  Emit that
+    /// START ahead of time, once per queued task, and mark the channel so
+    /// start_channel suppresses the duplicate when the task actually begins.
+    ///
+    /// The data path stays strictly serial (only one transfer moves data at a
+    /// time); this moves only the *event* timing, which is what lets the next
+    /// task's START precede the current task's FINISHED -- i.e. a negative
+    /// inter-task gap when the current transfer is long.  When the controller
+    /// dispatches slowly (queue empty during the transfer) this never fires,
+    /// so short steady-state tasks keep their positive gaps.
+    fn maybe_prefetch_next_task(&mut self, ch_idx: usize) {
+        if !self.dma_model.supports_task_queue() {
+            return;
+        }
+        let ch = &self.channels[ch_idx];
+        if ch.prefetch_start_emitted || ch.task_queue.is_empty() {
+            return;
+        }
+        self.channels[ch_idx].prefetch_start_emitted = true;
+        self.trace(EventType::DmaStartTask { channel: ch_idx as u8 });
+    }
+
     /// Step a single channel through one cycle of its unified FSM.
     ///
     /// Each match arm does ONE cycle of work and optionally transitions to
@@ -318,6 +343,7 @@ impl DmaEngine {
             }
 
             ChannelFsm::Transferring { transfer } => {
+                self.maybe_prefetch_next_task(ch_idx);
                 self.step_transferring_cycle(ch_idx, transfer, tile, neighbors, host_memory)
             }
 
