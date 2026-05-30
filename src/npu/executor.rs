@@ -494,16 +494,16 @@ impl NpuExecutor {
 
                 let instr = self.instructions[next_index].clone();
 
-                // Capture Q-aware dispatch classification BEFORE
+                // Capture Q-aware dispatch occupancy BEFORE
                 // execute_instruction runs.  If this Write32 hits a
                 // Task_Queue register, execute_instruction will
                 // enqueue the BD into the DMA channel; we have to
-                // observe the channel state pre-enqueue to tell an
-                // idle-channel "first dispatch" apart from a busy-
-                // channel "pipelined dispatch" -- two regimes with
-                // very different controller costs on HW.  See finding
-                // 2026-05-27-dispatch-overhead-multirun-structural-variance.
-                let dispatch_was_idle = if let NpuInstruction::Write32 { reg_off, .. } = &instr {
+                // observe the channel's outstanding-task occupancy
+                // pre-enqueue, because the controller paces the next
+                // dispatch by how full the channel already is (HW
+                // queue-occupancy backpressure).  See finding
+                // 2026-05-30-phase-2d-warmup-transient-and-gap0-mechanism.
+                let dispatch_occ = if let NpuInstruction::Write32 { reg_off, .. } = &instr {
                     let (col, row, offset) = decode_npu_address(*reg_off, device.start_col);
                     Self::classify_task_dispatch(col, row, offset, device)
                 } else {
@@ -522,7 +522,7 @@ impl NpuExecutor {
                 // Task_Queue actually accumulate BDs when transfer
                 // duration is comparable to controller dispatch
                 // interval -- the prerequisite for HW-like pipelining.
-                if dispatch_was_idle.is_some() && self.npu_cycle < self.controller_next_taskq_cycle {
+                if dispatch_occ.is_some() && self.npu_cycle < self.controller_next_taskq_cycle {
                     return AdvanceResult::Blocked;
                 }
 
@@ -535,14 +535,10 @@ impl NpuExecutor {
 
                 // Update the controller's next-available-for-Task_Queue
                 // cycle now that this dispatch has been issued.  The
-                // overhead reflects the Q-state at the moment of issue
-                // (pre-enqueue), classified above.
-                if let Some(was_idle) = dispatch_was_idle {
-                    let overhead = if was_idle {
-                        self.cycle_model.dispatch_overhead
-                    } else {
-                        self.cycle_model.dispatch_overhead_pipelined
-                    };
+                // overhead is the occupancy-dependent dispatch gate
+                // evaluated at the pre-enqueue occupancy captured above.
+                if let Some(occ) = dispatch_occ {
+                    let overhead = self.cycle_model.dispatch_overhead_for(occ);
                     self.controller_next_taskq_cycle = self.npu_cycle.saturating_add(overhead);
                 }
 
@@ -1380,26 +1376,29 @@ impl NpuExecutor {
         }
     }
 
-    /// Classify a Task_Queue Write32 as either an idle-channel dispatch
-    /// (full controller setup cost) or a pipelined dispatch (cheap
-    /// burst-rate cost), based on the channel state at the moment the
-    /// write arrives.
+    /// Read the channel's controller dispatch index at the moment a
+    /// Task_Queue Write32 arrives -- the input to the controller's
+    /// occupancy-dependent dispatch gate (`dispatch_overhead_for`).
     ///
-    /// Called **before** `execute_instruction` runs so we observe the
-    /// pre-dispatch state -- after execution, the BD has already been
-    /// enqueued and the queue size always reads >= 1.
+    /// The index is the monotonic count of dispatches already issued to
+    /// this channel since its last reset.  Read **before**
+    /// `execute_instruction` enqueues the new BD, so it counts only prior
+    /// dispatches: index `0` means this is the first task of the session
+    /// (fast base-rate dispatch); the gate ramps as the index climbs and
+    /// caps at the steady-state plateau.
     ///
-    /// Returns:
-    /// - `Some(true)`  -- Task_Queue write, channel was idle (queue empty
-    ///                   and ChannelState::Idle)
-    /// - `Some(false)` -- Task_Queue write, channel was already busy
-    /// - `None`        -- not a Task_Queue write
-    fn classify_task_dispatch(col: u8, row: u8, offset: u32, device: &DeviceState) -> Option<bool> {
+    /// We use the monotonic dispatch index rather than instantaneous queue
+    /// occupancy because the channel typically drains a short task back to
+    /// Idle before the controller's next dispatch, so occupancy would
+    /// collapse to 0 every cycle and the gate could never reach its
+    /// plateau.  See finding
+    /// 2026-05-30-phase-2d-warmup-transient-and-gap0-mechanism (Part 2).
+    ///
+    /// Returns `None` if the write is not a Task_Queue write.
+    fn classify_task_dispatch(col: u8, row: u8, offset: u32, device: &DeviceState) -> Option<u32> {
         let channel = Self::task_dispatch_channel(col, row, offset, device)?;
         let dma = device.array.dma_engine(col, row)?;
-        let was_idle = dma.task_queue_size(channel) == 0
-            && matches!(dma.channel_state(channel), crate::device::dma::ChannelState::Idle);
-        Some(was_idle)
+        Some(dma.controller_dispatch_index(channel))
     }
 
     /// Check if a register offset is a DMA Task_Queue write within a channel block.
@@ -2027,22 +2026,20 @@ mod tests {
     }
 
     #[test]
-    fn classify_task_dispatch_returns_some_true_for_idle_channel() {
+    fn classify_task_dispatch_returns_zero_index_for_fresh_channel() {
         let device = DeviceState::new_npu1();
-        // Shim DMA at (0, 0), channel 0 -- fresh device, channel is Idle
-        // and task_queue is empty.
+        // Shim DMA at (0, 0), channel 0 -- fresh device, no dispatches
+        // issued yet -> dispatch index 0 (first dispatch of the session).
         let offset = shim_task_queue_offset(0);
         let result = NpuExecutor::classify_task_dispatch(0, 0, offset, &device);
-        assert_eq!(result, Some(true), "fresh shim channel 0 must classify as idle dispatch");
+        assert_eq!(result, Some(0), "fresh shim channel 0 must report dispatch index 0");
     }
 
     #[test]
-    fn classify_task_dispatch_returns_some_false_for_busy_channel() {
+    fn classify_task_dispatch_counts_prior_dispatches() {
         let mut device = DeviceState::new_npu1();
-        // Enqueue a task on shim (0,0) channel 0 to mark it busy.  The
-        // enqueue itself flips queue size > 0 (and ChannelState off Idle
-        // once the FSM starts the task).  For a Q-aware classifier we
-        // only need the pre-write queue-size signal.
+        // One prior dispatch on shim (0,0) channel 0 -- the controller's
+        // dispatch index must reflect it so the gate ramps off the base.
         let enqueued = device
             .array
             .dma_engine_mut(0, 0)
@@ -2052,11 +2049,7 @@ mod tests {
 
         let offset = shim_task_queue_offset(0);
         let result = NpuExecutor::classify_task_dispatch(0, 0, offset, &device);
-        assert_eq!(
-            result,
-            Some(false),
-            "shim channel 0 with queued task must classify as pipelined dispatch"
-        );
+        assert_eq!(result, Some(1), "shim channel 0 with one prior dispatch must report index 1");
     }
 
     #[test]
@@ -2071,16 +2064,21 @@ mod tests {
     }
 
     #[test]
-    fn cycle_cost_model_has_distinct_overhead_for_pipelined_vs_idle() {
-        // Sanity: provisional NPU1 profile must seed both fields and the
-        // pipelined cost must be strictly smaller (idle = cold-start
-        // controller cost; pipelined = controller burst rate).
+    fn cycle_cost_model_dispatch_gate_ramps_with_occupancy() {
+        // Sanity: provisional NPU1 profile must seed the occupancy gate
+        // so the first (idle-channel) dispatch is cheaper than a deep-
+        // queue dispatch -- the controller's queue-occupancy backpressure.
         let m = crate::npu::cycle_cost::CycleCostModel::provisional_npu1();
-        assert!(m.dispatch_overhead > 0, "provisional model must seed dispatch_overhead");
-        assert!(m.dispatch_overhead_pipelined > 0, "provisional model must seed dispatch_overhead_pipelined");
+        assert!(m.dispatch_base > 0, "provisional model must seed dispatch_base");
+        assert!(m.dispatch_plateau > 0, "provisional model must seed dispatch_plateau");
         assert!(
-            m.dispatch_overhead > m.dispatch_overhead_pipelined,
-            "idle dispatch must cost more than pipelined dispatch (HW: ~2785 vs ~830 cyc)"
+            m.dispatch_overhead_for(0) < m.dispatch_overhead_for(2),
+            "first dispatch (occ=0) must cost less than a deep-queue dispatch (occ>=2)"
+        );
+        assert_eq!(
+            m.dispatch_overhead_for(0),
+            m.dispatch_base,
+            "occ=0 dispatch overhead must equal the base rate"
         );
     }
 
@@ -2133,11 +2131,11 @@ mod tests {
         let r = executor.try_advance(&mut device, &mut host_mem);
         // The executor consumed npu_cycle 1 to issue the dispatch.
         assert_eq!(executor.npu_cycle, 1);
-        // Cold-start cost (idle channel) -- provisional_npu1 value.
-        let expected = 1 + executor.cycle_model.dispatch_overhead;
+        // First dispatch into an idle channel -> occupancy 0 -> base gate.
+        let expected = 1 + executor.cycle_model.dispatch_overhead_for(0);
         assert_eq!(
             executor.controller_next_taskq_cycle, expected,
-            "TQ write on idle channel must set controller_next = npu_cycle + dispatch_overhead"
+            "TQ write on idle channel must set controller_next = npu_cycle + dispatch_overhead_for(0)"
         );
         // The instruction was consumed (not stalled by rate-limit on first call).
         assert!(matches!(r, AdvanceResult::Done | AdvanceResult::Progressed));

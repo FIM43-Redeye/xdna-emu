@@ -411,6 +411,55 @@ fn test_shim_s2mm_warmup_has_no_tail() {
     assert_eq!(seq, vec![522, 181, 181]);
 }
 
+/// Phase 2d.2 Part 2: the controller dispatch index is monotonic per
+/// channel session.  It counts task dispatches (Task_Queue writes) and
+/// must NOT collapse when the channel drains back to Idle between tasks
+/// -- that persistence is what lets the dispatch gate ramp to its
+/// plateau instead of snapping back to the base rate every time a short
+/// task finishes (instantaneous occupancy can't do this).  Reset only on
+/// stop_channel (channel reset == fresh boot), mirroring warm_task_index.
+#[test]
+fn controller_dispatch_index_is_monotonic_across_drains() {
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+    let mut host_mem = make_host_memory();
+    engine.configure_bd(0, BdConfig::simple_1d(0x100, 16)).unwrap();
+
+    // Fresh channel: no dispatches yet.
+    assert_eq!(engine.controller_dispatch_index(2), 0, "fresh channel -> index 0");
+
+    // First dispatch -- enqueue auto-starts the idle MM2S channel.
+    assert!(engine.enqueue_task(2, 0, 0, false), "first task enqueues");
+    assert_eq!(engine.controller_dispatch_index(2), 1, "first dispatch -> index 1");
+
+    // Drain the task fully; channel returns to Idle, queue empties.
+    let mut cycles = 0;
+    while engine.channel_active(2) {
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
+        cycles += 1;
+        assert!(cycles < 1000, "transfer hung");
+    }
+    assert_eq!(engine.channel_state(2), ChannelState::Idle);
+    assert_eq!(engine.task_queue_size(2), 0);
+
+    // Instantaneous occupancy is now 0 -- but the dispatch index must
+    // persist at 1, not collapse.  This is the whole point of the pivot.
+    assert_eq!(
+        engine.controller_dispatch_index(2),
+        1,
+        "dispatch index persists across a drain to Idle (occupancy would read 0 here)"
+    );
+
+    // Second dispatch climbs to 2 -- the ramp keeps rising.
+    assert!(engine.enqueue_task(2, 0, 0, false), "second task enqueues");
+    assert_eq!(engine.controller_dispatch_index(2), 2, "second dispatch -> index 2");
+
+    // stop_channel re-arms to 0 (fresh boot), like warm_task_index.
+    engine.stop_channel(2).unwrap();
+    assert_eq!(engine.controller_dispatch_index(2), 0, "stop_channel re-arms dispatch index");
+}
+
 #[test]
 fn test_cycle_accurate_transfer() {
     // Cycle-accurate timing is the default

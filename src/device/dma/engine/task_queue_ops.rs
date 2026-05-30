@@ -50,6 +50,12 @@ impl DmaEngine {
             return false;
         }
 
+        // Count this dispatch for the controller's occupancy-dependent
+        // dispatch gate (Phase 2d.2 Part 2).  Monotonic per session; reset
+        // only on channel reset.  Saturates so a pathologically long chain
+        // can't wrap (the gate caps at its plateau well before this matters).
+        ch.controller_dispatch_index = ch.controller_dispatch_index.saturating_add(1);
+
         log::debug!(
             "DMA tile({},{}) ch{} enqueued task: BD={} repeat={} token={} (queue_size={})",
             self.col,
@@ -124,6 +130,20 @@ impl DmaEngine {
         } else {
             self.channels[ch_idx].chain_start_bd = Some(start_bd);
         }
+    }
+
+    /// Get the controller dispatch index for a channel -- the monotonic
+    /// count of task dispatches issued since the last channel reset.  Feeds
+    /// the controller's occupancy-dependent dispatch gate (Phase 2d.2
+    /// Part 2).  Returns 0 on architectures without a task queue.
+    pub fn controller_dispatch_index(&self, channel: u8) -> u32 {
+        if !self.dma_model.supports_task_queue() {
+            return 0;
+        }
+        self.channels
+            .get(channel as usize)
+            .map(|ch| ch.controller_dispatch_index)
+            .unwrap_or(0)
     }
 
     /// Get the current task queue size for a channel.

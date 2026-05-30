@@ -131,41 +131,39 @@ pub struct CycleCostModel {
     /// Register write completion at the target. Derived from AM025.
     pub register_write: u64,
 
-    /// Flat overhead added to the retirement cost of a Write32 that
-    /// triggers a DMA task dispatch (writes to a channel's Start_Queue
-    /// register) **when the target channel was idle at the time of the
-    /// write** (queue empty and `ChannelState::Idle`).  This is the
-    /// per-dma_memcpy_nd controller overhead HW pays that's NOT
-    /// captured by the per-packet CMP decode cost alone -- presumably
-    /// DMA controller arbitration, AXI burst setup, and inter-dispatch
-    /// synchronization that happens on top of the AXI write itself.
-    /// (calibrated)
-    ///
-    /// HW calibration (2026-05-27 N=50 multi-run trace campaign on
-    /// _diag_shim_chain_sweep, S2MM steady-state which has no
-    /// pipelining due to STREAM_STARVATION): HW per-task gap ~2785 cyc;
-    /// EMU per-instruction CMP cost ~313 cyc for one dma_memcpy_nd's
-    /// instruction sequence, giving a controller-side overhead target
-    /// of ~2472 cyc.  See findings
-    /// 2026-05-25-shim-bd-chain-amortization and
-    /// 2026-05-27-dispatch-overhead-multirun-structural-variance.
-    pub dispatch_overhead: u64,
+    // === Controller dispatch gate (occupancy-dependent, calibrated) ==
+    //
+    // The IPU command processor paces successive Task_Queue writes by
+    // the channel's outstanding-task occupancy: the first dispatch into
+    // an empty+idle channel is fast, each additional outstanding task
+    // adds a slope, and the rate saturates at a plateau.  This models
+    // HW queue-occupancy backpressure -- see `dispatch_overhead_for`.
+    //
+    // HW calibration (2026-05-27 N=50 multi-run trace campaign on
+    // _diag_shim_chain_sweep): the K=8 MM2S inter-START sequence ramps
+    // 1086, 2118, ~3100 (plateau), revealing the gate is NOT a flat
+    // constant but rises with queue occupancy.  Findings
+    // 2026-05-25-shim-bd-chain-amortization,
+    // 2026-05-27-dispatch-overhead-multirun-structural-variance, and
+    // 2026-05-30-phase-2d-warmup-transient-and-gap0-mechanism (Part 2).
+    /// Gate at occupancy 0: the controller's cost to dispatch the first
+    /// task into an empty, idle channel.  Fast because there's no queue
+    /// to arbitrate against. (calibrated; HW ~1086 cyc)
+    pub dispatch_base: u64,
 
-    /// Flat overhead added to the retirement cost of a Write32 that
-    /// triggers a DMA task dispatch **when the target channel was
-    /// already busy** (queue non-empty or `ChannelState::Active`).
-    /// This is the controller's pipelined-burst dispatch rate -- much
-    /// cheaper than the cold-start cost because the controller is
-    /// already mid-burst and the BD just appends to the existing
-    /// Task_Queue. (calibrated)
-    ///
-    /// HW calibration (2026-05-27 N=50 multi-run trace campaign,
-    /// MM2S K=8 burst observed via Task_Queue back-to-back enqueues):
-    /// HW controller burst rate ~830-900 cyc per Task_Queue write;
-    /// minus the ~313 cyc EMU per-instruction baseline gives a
-    /// pipelined dispatch overhead target of ~520 cyc.  See finding
-    /// 2026-05-27-dispatch-overhead-multirun-structural-variance F3.
-    pub dispatch_overhead_pipelined: u64,
+    /// Per-outstanding-task increment on the dispatch gate.  Each task
+    /// already in flight or queued when the controller writes the next
+    /// Task_Queue entry adds this much to the dispatch interval, until
+    /// the rate saturates at `dispatch_plateau`. (calibrated; HW ~1032
+    /// cyc/task)
+    pub dispatch_slope: u64,
+
+    /// Steady-state dispatch interval -- the gate caps here once the
+    /// channel is deep enough (occupancy >= ~2).  This is the
+    /// serialized controller dispatch rate when the previous task is
+    /// fully drained, and must match the HW steady-state inter-START
+    /// gap. (calibrated; HW ~3050 cyc)
+    pub dispatch_plateau: u64,
 }
 
 impl CycleCostModel {
@@ -190,8 +188,9 @@ impl CycleCostModel {
             plio_aie_to_pl: 0,
             plio_pl_to_aie: 0,
             register_write: 0,
-            dispatch_overhead: 0,
-            dispatch_overhead_pipelined: 0,
+            dispatch_base: 0,
+            dispatch_slope: 0,
+            dispatch_plateau: 0,
         }
     }
 
@@ -221,8 +220,9 @@ impl CycleCostModel {
             plio_aie_to_pl: 4,      // aie_xtlm.cpp:202
             plio_pl_to_aie: 3,      // aie_xtlm.cpp:232
             register_write: 1,      // AM025
-            dispatch_overhead: 0,
-            dispatch_overhead_pipelined: 0,
+            dispatch_base: 0,
+            dispatch_slope: 0,
+            dispatch_plateau: 0,
         }
     }
 
@@ -305,33 +305,25 @@ impl CycleCostModel {
             plio_aie_to_pl: 4,      // aie_xtlm.cpp:202
             plio_pl_to_aie: 3,      // aie_xtlm.cpp:232
             register_write: 1,      // AM025
-            // Q-aware dispatch overhead.  Recalibrated against the
-            // 2026-05-27 HW multi-run campaign data, AFTER the Phase
-            // 2c.A non-stalling controller refactor which made
-            // dispatch_overhead the actual inter-Task_Queue interval
-            // (previously double-counted with per-instr CMP cost).
-            //
-            //  - dispatch_overhead (idle channel at TQ write time):
-            //    HW S2MM K=8 steady-state inter-START median = 3050
-            //    cyc (gap 2796 + dur 254).  This is the controller's
-            //    serialized dispatch rate when the previous task is
-            //    fully drained.
-            //
-            //  - dispatch_overhead_pipelined (channel busy at TQ
-            //    write time): HW MM2S K=8 first-pipelined-transition
-            //    rate ~830 cyc per Task_Queue write -- the controller's
-            //    burst rate when queue has room and the channel is
-            //    still processing a prior BD.  Currently does NOT fire
-            //    in EMU on K-sweep because EMU MM2S transfer duration
-            //    is shorter than dispatch_overhead, so the channel
-            //    always drains before next dispatch arrives.  Will
-            //    fire once Issue B's transfer-duration recalibration
-            //    extends MM2S cold-start to ~1330 cyc.
-            //
-            // See finding
-            // 2026-05-27-dispatch-overhead-multirun-structural-variance.
-            dispatch_overhead: 3050,
-            dispatch_overhead_pipelined: 520,
+            // Ramped controller dispatch gate (Phase 2d.2 Part 2).  The
+            // K=8 MM2S inter-START sequence ramps 1086, 2118, ~3100
+            // (plateau) -- the controller dispatches the first task fast
+            // and throttles to its serialized rate over ~2 dispatches.
+            // Indexed by the monotonic per-channel dispatch counter, NOT
+            // instantaneous occupancy: a short task drains the channel
+            // back to Idle before the next dispatch, so an occupancy
+            // signal would collapse to 0 and never reach the plateau.
+            //   base    = gate at dispatch index 0 (fast first dispatch)
+            //   slope   = per-prior-dispatch increment
+            //   plateau = steady-state serialized rate (matches the prior
+            //             flat dispatch_overhead; HW S2MM K=8 steady
+            //             inter-START median 3050 = gap 2796 + dur 254)
+            // Recalibrated against the 2026-05-27 N=50 HW multi-run
+            // campaign.  See finding
+            // 2026-05-30-phase-2d-warmup-transient-and-gap0-mechanism.
+            dispatch_base: 1086,
+            dispatch_slope: 1032,
+            dispatch_plateau: 3050,
         }
     }
 
@@ -367,6 +359,30 @@ impl CycleCostModel {
             NpuInstruction::DdrPatch { .. } => self.write_32,
             NpuInstruction::Unknown { .. } => 1,
         }
+    }
+
+    /// Controller dispatch gate: the minimum cycle interval the IPU
+    /// command processor enforces between successive Task_Queue writes,
+    /// as a function of the channel's outstanding-task occupancy `occ`
+    /// at the moment of the write (in-flight task + queued tasks, NOT
+    /// counting the one being dispatched now).
+    ///
+    /// HW exhibits queue-occupancy backpressure: the first dispatch into
+    /// an empty, idle channel is fast (`dispatch_base`), each additional
+    /// outstanding task adds `dispatch_slope`, and the rate saturates at
+    /// `dispatch_plateau` (the steady-state serialized dispatch interval):
+    ///
+    /// ```text
+    /// gate(occ) = min(base + occ * slope, plateau)
+    /// ```
+    ///
+    /// The non-dispatch profiles leave all three at 0, so the gate is 0
+    /// and dispatch pacing is disabled.
+    pub fn dispatch_overhead_for(&self, occ: u32) -> u64 {
+        let ramp = self
+            .dispatch_base
+            .saturating_add(self.dispatch_slope.saturating_mul(u64::from(occ)));
+        ramp.min(self.dispatch_plateau)
     }
 
     /// Classify the address into a CMP-decode category.
@@ -498,5 +514,26 @@ mod tests {
         // Sanity: provisional CMP cost should be ~100, far above the
         // 1-cyc placeholder in with_known_constants.
         assert!(p.write_32 >= 50, "provisional write_32 should reflect calibration");
+    }
+
+    #[test]
+    fn dispatch_overhead_ramps_with_occupancy_and_caps_at_plateau() {
+        let m = CycleCostModel::provisional_npu1();
+        // occ=0: first dispatch into an empty+idle channel -> base rate.
+        assert_eq!(m.dispatch_overhead_for(0), 1086, "occ=0 -> base");
+        // occ=1: one task already outstanding -> base + slope.
+        assert_eq!(m.dispatch_overhead_for(1), 2118, "occ=1 -> base + slope");
+        // occ=2: ramp (1086 + 2*1032 = 3150) would exceed plateau -> capped.
+        assert_eq!(m.dispatch_overhead_for(2), 3050, "occ=2 -> capped at plateau");
+        // Deeper occupancy stays at the plateau.
+        assert_eq!(m.dispatch_overhead_for(5), 3050, "occ>=2 -> plateau");
+    }
+
+    #[test]
+    fn dispatch_overhead_is_zero_in_non_dispatch_profiles() {
+        // legacy and with_known_constants leave the gate disabled -- no
+        // dispatch pacing regardless of occupancy.
+        assert_eq!(CycleCostModel::legacy_one_per_packet().dispatch_overhead_for(3), 0);
+        assert_eq!(CycleCostModel::with_known_constants().dispatch_overhead_for(3), 0);
     }
 }

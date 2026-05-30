@@ -239,6 +239,18 @@ pub struct ChannelContext {
     /// channel stop/reset.  Lets START[i+1] precede FINISHED[i].
     pub prefetch_start_emitted: bool,
 
+    /// Controller dispatch index (Phase 2d.2 Part 2): count of task
+    /// dispatches (Task_Queue writes) issued to this channel since the
+    /// last channel reset.  Feeds the controller's occupancy-dependent
+    /// dispatch gate (`CycleCostModel::dispatch_overhead_for`).  Unlike
+    /// instantaneous queue occupancy this is *monotonic per session*, so
+    /// the gate ramps up to its plateau and stays there instead of
+    /// collapsing back to the base rate when a short task drains the
+    /// channel between dispatches.  Increments once per `enqueue_task`;
+    /// reset to 0 on stop_channel (channel reset == fresh boot), like
+    /// `warm_task_index`.
+    pub controller_dispatch_index: u32,
+
     /// Performance counters.
     pub stats: ChannelStats,
 
@@ -271,6 +283,7 @@ impl ChannelContext {
             is_first_bd: true,
             warm_task_index: 0,
             prefetch_start_emitted: false,
+            controller_dispatch_index: 0,
             stats: ChannelStats::default(),
             prev_starving: false,
             prev_lock_stalled: false,
@@ -378,6 +391,7 @@ impl ChannelContext {
         self.is_first_bd = true;
         self.warm_task_index = 0;
         self.prefetch_start_emitted = false;
+        self.controller_dispatch_index = 0;
         self.stats = ChannelStats::default();
     }
 }

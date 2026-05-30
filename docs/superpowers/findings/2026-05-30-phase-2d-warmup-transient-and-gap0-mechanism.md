@@ -1,6 +1,6 @@
 ---
 name: 'Phase 2d: shim warm-up transient (durations) + gap[0] is a two-part BD-prefetch / controller-pacing mechanism'
-description: 'Phase 2d modeled the MM2S warm-up transient as a geometric decay of the cold-start across the task chain -- per-task transfer durations now match HW within ~3% (K=8 MM2S 1725/807/522/... vs HW 1739/804/497/...), steady-state inter-START gaps held at ~3%. But MM2S gap[0] stayed positive (+1326) vs HW negative (-433/-812). Diagnosis: gap[0] needs TWO coupled changes, neither sufficient alone -- (1) the DMA channel must emit START_TASK at BD-load/prefetch (during the prior transfer), and (2) the controller must pace TQ writes by queue occupancy so TQ[i+1] lands during task[i] rather than after it. Part 1 (prefetch START emission) is implemented + committed (b33517f); it is inert until Part 2. Part 2 (occupancy-dependent dispatch gate, calibration targets below) is designed but NOT yet implemented.'
+description: 'Phase 2d modeled the MM2S warm-up transient as a geometric decay of the cold-start across the task chain -- per-task transfer durations now match HW within ~3% (K=8 MM2S 1725/807/522/... vs HW 1739/804/497/...), steady-state inter-START gaps held at ~3%. But MM2S gap[0] stayed positive (+1326) vs HW negative (-433/-812). Diagnosis: gap[0] needs TWO coupled changes, neither sufficient alone -- (1) the DMA channel must emit START_TASK at BD-load/prefetch (during the prior transfer), and (2) the controller must pace TQ writes by queue occupancy so TQ[i+1] lands during task[i] rather than after it. Part 1 (prefetch START emission) is implemented + committed (b33517f); it is inert until Part 2. Part 2 (a ramped controller dispatch gate) is now implemented with unit tests: the spec''s instantaneous-occupancy signal was found structurally unable to reach the HW plateau (occupancy collapses to 0 between short tasks), so the gate is indexed by a monotonic per-channel dispatch counter instead (analog of Part A''s warm_task_index). End-to-end campaign calibration of base/slope/plateau (1086/1032/3050) is still pending.'
 type: project
 ---
 
@@ -108,7 +108,7 @@ Test: `test_queued_task_start_emitted_during_prior_transfer` -- a shim
 MM2S channel with two tasks queued up front emits S,S,F,F (both STARTs
 before either FINISH) instead of the serial S,F,S,F.
 
-## Part 2 (DESIGNED, NOT yet implemented): controller queue-occupancy pacing
+## Part 2 (IMPLEMENTED, mechanism + unit tests; campaign calibration pending): controller dispatch-rate ramp
 
 The controller must write TQ[i+1] early enough to be in the queue during
 task[i]'s transfer. The HW inter-START (≈ inter-TQ-write) sequence for
@@ -120,31 +120,76 @@ inter-START(i) = gap(i) + dur(i):
 ```
 
 So the controller dispatches the first task fast (~1086) and throttles
-toward a plateau (~3050) as the queue fills -- queue-occupancy
-backpressure. A flat fast gate is wrong: it would make gap[1] negative
-too (HW gap[1] is +1314, positive).
+toward a plateau (~3050) over the first ~2 dispatches. A flat fast gate
+is wrong: it would make gap[1] negative too (HW gap[1] is +1314,
+positive).
 
-**Proposed model**: replace the binary cold(3050)/pipelined(520)
-`dispatch_overhead` with an occupancy-dependent gate
-`gate(occ) = min(base + occ*slope, plateau)`, where `occ` = outstanding
-tasks (in-flight + queued) at the moment of the TQ write.
+**Model**: replace the binary cold(3050)/pipelined(520)
+`dispatch_overhead` with a ramped gate
+`gate(idx) = min(base + idx*slope, plateau)`, evaluated at each TQ write.
 
-**Initial calibration targets** (from the HW ramp):
-- `base ≈ 1086` (gate at occ=0 -> TQ[1] at 1086 -> gap[0] = 1086-1739 = -653)
-- `slope ≈ 1032` (gate at occ=1 ≈ 2118 -> matches inter-START[1->2])
-- `plateau ≈ 3050` (existing steady value; gate at occ>=2 caps here)
+- `base = 1086` (gate at idx=0 -> TQ[1] at 1086 -> gap[0] = 1086-1739 = -653)
+- `slope = 1032` (gate at idx=1 ≈ 2118 -> matches inter-START[1->2])
+- `plateau = 3050` (existing steady value; gate at idx>=2 caps here)
 
-`classify_task_dispatch` (executor.rs) currently returns
-`Option<bool>` (idle/busy); it would return enough to compute `occ`
-(e.g. `task_queue_size + channel_running`). The gate is then
-`base + occ*slope` capped at `plateau`, set into
-`controller_next_taskq_cycle`.
+### The signal pivot: dispatch index, NOT instantaneous occupancy
 
-This is an **empirical calibration loop**: implement the occupancy gate,
-rebuild the FFI .so, run `multirun-trace-campaign --emu`, compare against
-the HW baseline with `compare-dispatch-overhead.py`, and tune
+The original design fed the gate with **instantaneous occupancy**
+(`task_queue_size + channel_running` at TQ-write time). Tracing it
+against the HW numbers showed this is **structurally unable to reach the
+plateau**:
+
+- HW steady-state inter-START is ~3100 while steady task duration is
+  ~370. Inter-START >> duration means the channel is **idle between
+  tasks** -- the controller is the bottleneck and the channel drains and
+  sits empty waiting for the next dispatch.
+- So at every steady TQ write the channel is idle with an empty queue ->
+  `occ = 0` -> `gate(0) = base`. The gate never climbs to the plateau; it
+  produces a *spike-then-collapse* `1086, 2118, 1086, 1086, …` (only the
+  cold task[0], dur 1739 > 1086, is still in flight at TQ[1]).
+- This holds on HW too (same idle-between-tasks geometry), so it is not
+  an EMU artifact -- instantaneous occupancy is the wrong signal.
+
+**Fix**: index the ramp by a **monotonic per-channel dispatch counter**
+(`controller_dispatch_index`) -- the count of TQ writes issued since the
+channel's last reset -- not instantaneous occupancy. Monotonic 0->1->2->
+plateau, and it *stays* at plateau, reproducing both the fast first
+dispatch (gap[0] negative) and the steady ~3100 plateau. It is the
+controller-side analog of Part A's `warm_task_index`: the dispatch
+pipeline fills over the first ~2 tasks, then runs at the serialized rate.
+Reset only on `stop_channel`/channel reset (fresh boot), mirroring
+`warm_task_index`.
+
+### Where it lives
+
+- `CycleCostModel` (src/npu/cycle_cost.rs): retired
+  `dispatch_overhead`/`dispatch_overhead_pipelined`; added
+  `dispatch_base`/`dispatch_slope`/`dispatch_plateau` (1086/1032/3050 in
+  `provisional_npu1`, 0/0/0 in legacy + with_known_constants) and the
+  `dispatch_overhead_for(idx)` gate method.
+- `ChannelContext` (src/device/dma/channel.rs): added
+  `controller_dispatch_index: u32`, reset in new()/reset()/stop_channel.
+- `enqueue_task` (engine/task_queue_ops.rs): increments the index per
+  dispatch; new `controller_dispatch_index(channel)` accessor.
+- `classify_task_dispatch` (executor.rs): now returns the dispatch index
+  (`Option<u32>`) and the gate-application uses `dispatch_overhead_for`.
+
+Unit tests (RED->GREEN): `dispatch_overhead_ramps_with_occupancy_and_caps_at_plateau`,
+`dispatch_overhead_is_zero_in_non_dispatch_profiles` (cycle_cost),
+`controller_dispatch_index_is_monotonic_across_drains` (engine -- the
+persist-across-drain property that occupancy lacks), and the updated
+`classify_task_dispatch_*` + `cycle_cost_model_dispatch_gate_ramps_with_occupancy`.
+Full `cargo test --lib` green (3223), zero regressions.
+
+### Still pending: campaign calibration
+
+The constants are derived from the HW inter-START ramp but **not yet
+validated end-to-end**. The remaining **empirical loop**: rebuild the FFI
+.so, run `multirun-trace-campaign --emu`, `aggregate-dispatch-overhead.py`,
+then `compare-dispatch-overhead.py <hw> <emu>`, and tune
 base/slope/plateau until gap[0..] converge AND steady-state + durations
-do not regress. Constants live in `src/npu/cycle_cost.rs`.
+do not regress. Constants live in `src/npu/cycle_cost.rs`
+(`provisional_npu1`).
 
 ## Risks / watch items for Part 2
 
@@ -152,13 +197,22 @@ do not regress. Constants live in `src/npu/cycle_cost.rs`.
   steady-state inter-START match (~3%) is preserved. Guard with the
   comparator's `steady_gaps` rows.
 - **gap[1] sign**: HW gap[1] is positive (+1314); the ramp must throttle
-  fast enough that task[1]'s prefetch of task[2] does NOT fire (TQ[2]
-  must land after FINISHED[1]). This is the main constraint distinguishing
-  a correct ramp from a flat fast gate.
+  fast enough (idx=1 -> gate 2118, idx>=2 -> plateau 3050) that task[1]'s
+  prefetch of task[2] does NOT fire (TQ[2] must land after FINISHED[1]).
+  This is the main constraint distinguishing a correct ramp from a flat
+  fast gate, and is why `slope` must not be too small.
+- **Dispatch-index reset scope**: the index resets only on
+  `stop_channel`/channel reset, so a second independent chain after a
+  long idle (without a channel disable) would keep the index high and
+  pay the plateau rate on its first dispatch instead of the fast base.
+  Fine for the single-chain K-sweep; if a multi-chain kernel needs the
+  fast-restart behavior, add an idle-gap reset (index -> 0 when the
+  channel has been idle longer than `plateau` before a dispatch).
 - **Trace-test sensitivity**: Part 1 changed START emission order for
-  queued-during-transfer cases; full `cargo test --lib` passed (3220),
+  queued-during-transfer cases; full `cargo test --lib` passed (3223),
   but bridge/trace HW-comparison tests were not run (need HW) -- they
-  should *improve* (EMU now matches HW prefetch) but verify on next HW run.
+  should *improve* (EMU now matches HW prefetch + ramp) but verify on the
+  next HW run.
 
 ## Artifacts
 
