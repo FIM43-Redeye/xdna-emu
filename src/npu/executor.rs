@@ -494,16 +494,15 @@ impl NpuExecutor {
 
                 let instr = self.instructions[next_index].clone();
 
-                // Capture Q-aware dispatch occupancy BEFORE
+                // Capture the dispatch index + direction BEFORE
                 // execute_instruction runs.  If this Write32 hits a
-                // Task_Queue register, execute_instruction will
-                // enqueue the BD into the DMA channel; we have to
-                // observe the channel's outstanding-task occupancy
-                // pre-enqueue, because the controller paces the next
-                // dispatch by how full the channel already is (HW
-                // queue-occupancy backpressure).  See finding
-                // 2026-05-30-phase-2d-warmup-transient-and-gap0-mechanism.
-                let dispatch_occ = if let NpuInstruction::Write32 { reg_off, .. } = &instr {
+                // Task_Queue register, execute_instruction will enqueue
+                // the BD (incrementing the channel's dispatch index), so
+                // we read the pre-enqueue index here -- the controller
+                // paces the next dispatch by how many tasks it has already
+                // dispatched to this channel (a monotonic ramp).  See
+                // finding 2026-05-30-phase-2d-warmup-transient-and-gap0-mechanism.
+                let dispatch = if let NpuInstruction::Write32 { reg_off, .. } = &instr {
                     let (col, row, offset) = decode_npu_address(*reg_off, device.start_col);
                     Self::classify_task_dispatch(col, row, offset, device)
                 } else {
@@ -522,7 +521,7 @@ impl NpuExecutor {
                 // Task_Queue actually accumulate BDs when transfer
                 // duration is comparable to controller dispatch
                 // interval -- the prerequisite for HW-like pipelining.
-                if dispatch_occ.is_some() && self.npu_cycle < self.controller_next_taskq_cycle {
+                if dispatch.is_some() && self.npu_cycle < self.controller_next_taskq_cycle {
                     return AdvanceResult::Blocked;
                 }
 
@@ -535,10 +534,10 @@ impl NpuExecutor {
 
                 // Update the controller's next-available-for-Task_Queue
                 // cycle now that this dispatch has been issued.  The
-                // overhead is the occupancy-dependent dispatch gate
-                // evaluated at the pre-enqueue occupancy captured above.
-                if let Some(occ) = dispatch_occ {
-                    let overhead = self.cycle_model.dispatch_overhead_for(occ);
+                // overhead is the per-direction dispatch gate evaluated at
+                // the pre-enqueue dispatch index captured above.
+                if let Some((idx, is_mm2s)) = dispatch {
+                    let overhead = self.cycle_model.dispatch_overhead_for(idx, is_mm2s);
                     self.controller_next_taskq_cycle = self.npu_cycle.saturating_add(overhead);
                 }
 
@@ -1394,11 +1393,16 @@ impl NpuExecutor {
     /// plateau.  See finding
     /// 2026-05-30-phase-2d-warmup-transient-and-gap0-mechanism (Part 2).
     ///
-    /// Returns `None` if the write is not a Task_Queue write.
-    fn classify_task_dispatch(col: u8, row: u8, offset: u32, device: &DeviceState) -> Option<u32> {
+    /// Returns `(dispatch_index, is_mm2s)`, or `None` if the write is not
+    /// a Task_Queue write.  Direction selects the per-direction dispatch
+    /// gate (`dispatch_overhead_for`): the absolute channel index is
+    /// MM2S when it lands at or above the channel's S2MM count (S2MM
+    /// occupies the low channel indices, MM2S the high ones).
+    fn classify_task_dispatch(col: u8, row: u8, offset: u32, device: &DeviceState) -> Option<(u32, bool)> {
         let channel = Self::task_dispatch_channel(col, row, offset, device)?;
         let dma = device.array.dma_engine(col, row)?;
-        Some(dma.controller_dispatch_index(channel))
+        let is_mm2s = channel >= dma.s2mm_channel_count() as u8;
+        Some((dma.controller_dispatch_index(channel), is_mm2s))
     }
 
     /// Check if a register offset is a DMA Task_Queue write within a channel block.
@@ -2032,7 +2036,8 @@ mod tests {
         // issued yet -> dispatch index 0 (first dispatch of the session).
         let offset = shim_task_queue_offset(0);
         let result = NpuExecutor::classify_task_dispatch(0, 0, offset, &device);
-        assert_eq!(result, Some(0), "fresh shim channel 0 must report dispatch index 0");
+        // Shim channel 0 is in the S2MM block (is_mm2s = false).
+        assert_eq!(result, Some((0, false)), "fresh shim channel 0 must report dispatch index 0, S2MM");
     }
 
     #[test]
@@ -2049,7 +2054,11 @@ mod tests {
 
         let offset = shim_task_queue_offset(0);
         let result = NpuExecutor::classify_task_dispatch(0, 0, offset, &device);
-        assert_eq!(result, Some(1), "shim channel 0 with one prior dispatch must report index 1");
+        assert_eq!(
+            result,
+            Some((1, false)),
+            "shim channel 0 with one prior dispatch must report index 1, S2MM"
+        );
     }
 
     #[test]
@@ -2064,21 +2073,26 @@ mod tests {
     }
 
     #[test]
-    fn cycle_cost_model_dispatch_gate_ramps_with_occupancy() {
-        // Sanity: provisional NPU1 profile must seed the occupancy gate
-        // so the first (idle-channel) dispatch is cheaper than a deep-
-        // queue dispatch -- the controller's queue-occupancy backpressure.
+    fn cycle_cost_model_mm2s_gate_ramps_s2mm_flat() {
+        // Sanity: provisional NPU1 seeds both gates.  MM2S has a fast
+        // first dispatch (< plateau); S2MM is flat at the plateau.
         let m = crate::npu::cycle_cost::CycleCostModel::provisional_npu1();
-        assert!(m.dispatch_base > 0, "provisional model must seed dispatch_base");
-        assert!(m.dispatch_plateau > 0, "provisional model must seed dispatch_plateau");
+        assert!(m.dispatch_mm2s.base > 0, "provisional model must seed the MM2S base");
+        assert!(m.dispatch_mm2s.plateau > 0, "provisional model must seed the MM2S plateau");
         assert!(
-            m.dispatch_overhead_for(0) < m.dispatch_overhead_for(2),
-            "first dispatch (occ=0) must cost less than a deep-queue dispatch (occ>=2)"
+            m.dispatch_overhead_for(0, true) < m.dispatch_overhead_for(2, true),
+            "MM2S first dispatch must cost less than a later dispatch"
         );
         assert_eq!(
-            m.dispatch_overhead_for(0),
-            m.dispatch_base,
-            "occ=0 dispatch overhead must equal the base rate"
+            m.dispatch_overhead_for(0, true),
+            m.dispatch_mm2s.base,
+            "MM2S idx0 must equal the base rate"
+        );
+        // S2MM pays the plateau on every dispatch (no fast start).
+        assert_eq!(
+            m.dispatch_overhead_for(0, false),
+            m.dispatch_overhead_for(3, false),
+            "S2MM gate is flat across dispatch index"
         );
     }
 
@@ -2131,11 +2145,12 @@ mod tests {
         let r = executor.try_advance(&mut device, &mut host_mem);
         // The executor consumed npu_cycle 1 to issue the dispatch.
         assert_eq!(executor.npu_cycle, 1);
-        // First dispatch into an idle channel -> occupancy 0 -> base gate.
-        let expected = 1 + executor.cycle_model.dispatch_overhead_for(0);
+        // First dispatch on shim channel 0 (S2MM) -> dispatch index 0,
+        // S2MM gate (flat at the plateau).
+        let expected = 1 + executor.cycle_model.dispatch_overhead_for(0, false);
         assert_eq!(
             executor.controller_next_taskq_cycle, expected,
-            "TQ write on idle channel must set controller_next = npu_cycle + dispatch_overhead_for(0)"
+            "TQ write on idle channel must set controller_next = npu_cycle + dispatch_overhead_for(0, S2MM)"
         );
         // The instruction was consumed (not stalled by rate-limit on first call).
         assert!(matches!(r, AdvanceResult::Done | AdvanceResult::Progressed));

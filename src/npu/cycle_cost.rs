@@ -131,39 +131,67 @@ pub struct CycleCostModel {
     /// Register write completion at the target. Derived from AM025.
     pub register_write: u64,
 
-    // === Controller dispatch gate (occupancy-dependent, calibrated) ==
+    // === Controller dispatch gate (per-direction, calibrated) ========
     //
-    // The IPU command processor paces successive Task_Queue writes by
-    // the channel's outstanding-task occupancy: the first dispatch into
-    // an empty+idle channel is fast, each additional outstanding task
-    // adds a slope, and the rate saturates at a plateau.  This models
-    // HW queue-occupancy backpressure -- see `dispatch_overhead_for`.
+    // The IPU command processor paces successive Task_Queue writes by a
+    // ramp indexed by the channel's monotonic dispatch count -- see
+    // `dispatch_overhead_for` and `DispatchGate`.  The ramp is
+    // **per-direction** because the fast first dispatch is a MM2S
+    // phenomenon: MM2S sources from DDR (data available immediately, so
+    // the controller front-loads the first BD and the prefetch lets
+    // START[1] precede FINISHED[0] -> negative gap[0]), whereas S2MM
+    // waits on stream data, so its first dispatch pays full freight and
+    // its gate is flat at the plateau.
     //
     // HW calibration (2026-05-27 N=50 multi-run trace campaign on
-    // _diag_shim_chain_sweep): the K=8 MM2S inter-START sequence ramps
-    // 1086, 2118, ~3100 (plateau), revealing the gate is NOT a flat
-    // constant but rises with queue occupancy.  Findings
-    // 2026-05-25-shim-bd-chain-amortization,
+    // _diag_shim_chain_sweep, validated by the 2026-05-30 EMU campaign):
+    //   MM2S: fast idx0 (gap[0] -> negative), plateau from idx1 on.
+    //   S2MM: flat at the plateau (matches HW g0 2520, g1 2791, tight MAD).
+    // Findings 2026-05-25-shim-bd-chain-amortization,
     // 2026-05-27-dispatch-overhead-multirun-structural-variance, and
     // 2026-05-30-phase-2d-warmup-transient-and-gap0-mechanism (Part 2).
-    /// Gate at occupancy 0: the controller's cost to dispatch the first
-    /// task into an empty, idle channel.  Fast because there's no queue
-    /// to arbitrate against. (calibrated; HW ~1086 cyc)
-    pub dispatch_base: u64,
+    /// Dispatch gate for MM2S (stream-from-DDR) channels.
+    pub dispatch_mm2s: DispatchGate,
 
-    /// Per-outstanding-task increment on the dispatch gate.  Each task
-    /// already in flight or queued when the controller writes the next
-    /// Task_Queue entry adds this much to the dispatch interval, until
-    /// the rate saturates at `dispatch_plateau`. (calibrated; HW ~1032
-    /// cyc/task)
-    pub dispatch_slope: u64,
+    /// Dispatch gate for S2MM (stream-to-DDR) channels.
+    pub dispatch_s2mm: DispatchGate,
+}
 
-    /// Steady-state dispatch interval -- the gate caps here once the
-    /// channel is deep enough (occupancy >= ~2).  This is the
-    /// serialized controller dispatch rate when the previous task is
-    /// fully drained, and must match the HW steady-state inter-START
-    /// gap. (calibrated; HW ~3050 cyc)
-    pub dispatch_plateau: u64,
+/// Occupancy-dependent controller dispatch gate: the minimum cycle
+/// interval the IPU command processor enforces between successive
+/// Task_Queue writes, as a ramp `min(base + idx*slope, plateau)` indexed
+/// by the channel's monotonic dispatch count `idx`.
+///
+/// - `base`: gate at dispatch index 0 (first task of the session).
+/// - `slope`: per-prior-dispatch increment as the pipeline fills.
+/// - `plateau`: steady-state serialized dispatch rate (the cap).
+///
+/// `flat(v)` builds a constant-`v` gate (no ramp), used for S2MM and for
+/// any direction that pays full freight on every dispatch.
+#[derive(Debug, Clone)]
+pub struct DispatchGate {
+    pub base: u64,
+    pub slope: u64,
+    pub plateau: u64,
+}
+
+impl DispatchGate {
+    /// A gate disabled entirely (always 0) -- no dispatch pacing.
+    pub fn disabled() -> Self {
+        Self { base: 0, slope: 0, plateau: 0 }
+    }
+
+    /// A flat gate: every dispatch pays `v`, no ramp.
+    pub fn flat(v: u64) -> Self {
+        Self { base: v, slope: 0, plateau: v }
+    }
+
+    /// The dispatch interval for a channel at dispatch index `idx`.
+    pub fn overhead_for(&self, idx: u32) -> u64 {
+        self.base
+            .saturating_add(self.slope.saturating_mul(u64::from(idx)))
+            .min(self.plateau)
+    }
 }
 
 impl CycleCostModel {
@@ -188,9 +216,8 @@ impl CycleCostModel {
             plio_aie_to_pl: 0,
             plio_pl_to_aie: 0,
             register_write: 0,
-            dispatch_base: 0,
-            dispatch_slope: 0,
-            dispatch_plateau: 0,
+            dispatch_mm2s: DispatchGate::disabled(),
+            dispatch_s2mm: DispatchGate::disabled(),
         }
     }
 
@@ -220,9 +247,8 @@ impl CycleCostModel {
             plio_aie_to_pl: 4,      // aie_xtlm.cpp:202
             plio_pl_to_aie: 3,      // aie_xtlm.cpp:232
             register_write: 1,      // AM025
-            dispatch_base: 0,
-            dispatch_slope: 0,
-            dispatch_plateau: 0,
+            dispatch_mm2s: DispatchGate::disabled(),
+            dispatch_s2mm: DispatchGate::disabled(),
         }
     }
 
@@ -305,25 +331,26 @@ impl CycleCostModel {
             plio_aie_to_pl: 4,      // aie_xtlm.cpp:202
             plio_pl_to_aie: 3,      // aie_xtlm.cpp:232
             register_write: 1,      // AM025
-            // Ramped controller dispatch gate (Phase 2d.2 Part 2).  The
-            // K=8 MM2S inter-START sequence ramps 1086, 2118, ~3100
-            // (plateau) -- the controller dispatches the first task fast
-            // and throttles to its serialized rate over ~2 dispatches.
-            // Indexed by the monotonic per-channel dispatch counter, NOT
-            // instantaneous occupancy: a short task drains the channel
-            // back to Idle before the next dispatch, so an occupancy
-            // signal would collapse to 0 and never reach the plateau.
-            //   base    = gate at dispatch index 0 (fast first dispatch)
-            //   slope   = per-prior-dispatch increment
-            //   plateau = steady-state serialized rate (matches the prior
-            //             flat dispatch_overhead; HW S2MM K=8 steady
-            //             inter-START median 3050 = gap 2796 + dur 254)
-            // Recalibrated against the 2026-05-27 N=50 HW multi-run
-            // campaign.  See finding
+            // Per-direction controller dispatch gate (Phase 2d.2 Part 2),
+            // indexed by the monotonic per-channel dispatch counter (NOT
+            // instantaneous occupancy, which collapses to 0 between short
+            // tasks and never reaches the plateau).
+            //
+            // MM2S: a fast first dispatch (base=1086) that does not bind
+            // (it is below the per-task BD-config instruction floor), so
+            // task 0 is instruction-bound and the Part 1 prefetch drives
+            // gap[0] negative; from index 1 on the gate is at the plateau
+            // (slope=1964 -> gate(1)=3050) so the steady gaps match the
+            // prior flat behavior.  S2MM: flat at the plateau -- it waits
+            // on stream data, so its first dispatch pays full freight (HW
+            // g0 2520, g1 2791, tight MAD; the MM2S ramp would wrongly
+            // halve them).
+            //
+            // Calibrated against the 2026-05-27 N=50 HW campaign and the
+            // 2026-05-30 EMU campaign (2d2-emu).  See finding
             // 2026-05-30-phase-2d-warmup-transient-and-gap0-mechanism.
-            dispatch_base: 1086,
-            dispatch_slope: 1032,
-            dispatch_plateau: 3050,
+            dispatch_mm2s: DispatchGate { base: 1086, slope: 1964, plateau: 3050 },
+            dispatch_s2mm: DispatchGate::flat(3050),
         }
     }
 
@@ -363,26 +390,21 @@ impl CycleCostModel {
 
     /// Controller dispatch gate: the minimum cycle interval the IPU
     /// command processor enforces between successive Task_Queue writes,
-    /// as a function of the channel's outstanding-task occupancy `occ`
-    /// at the moment of the write (in-flight task + queued tasks, NOT
-    /// counting the one being dispatched now).
+    /// as a function of the channel's monotonic dispatch index `idx` (the
+    /// count of dispatches already issued to this channel this session,
+    /// NOT counting the one being dispatched now) and its direction.
     ///
-    /// HW exhibits queue-occupancy backpressure: the first dispatch into
-    /// an empty, idle channel is fast (`dispatch_base`), each additional
-    /// outstanding task adds `dispatch_slope`, and the rate saturates at
-    /// `dispatch_plateau` (the steady-state serialized dispatch interval):
-    ///
-    /// ```text
-    /// gate(occ) = min(base + occ * slope, plateau)
-    /// ```
-    ///
-    /// The non-dispatch profiles leave all three at 0, so the gate is 0
-    /// and dispatch pacing is disabled.
-    pub fn dispatch_overhead_for(&self, occ: u32) -> u64 {
-        let ramp = self
-            .dispatch_base
-            .saturating_add(self.dispatch_slope.saturating_mul(u64::from(occ)));
-        ramp.min(self.dispatch_plateau)
+    /// MM2S ramps from a fast first dispatch to the plateau; S2MM is flat
+    /// at the plateau.  See `DispatchGate` and the `dispatch_mm2s` /
+    /// `dispatch_s2mm` field docs for the per-direction rationale.  The
+    /// non-dispatch profiles leave both gates disabled (always 0).
+    pub fn dispatch_overhead_for(&self, idx: u32, is_mm2s: bool) -> u64 {
+        let gate = if is_mm2s {
+            &self.dispatch_mm2s
+        } else {
+            &self.dispatch_s2mm
+        };
+        gate.overhead_for(idx)
     }
 
     /// Classify the address into a CMP-decode category.
@@ -517,23 +539,27 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_overhead_ramps_with_occupancy_and_caps_at_plateau() {
+    fn dispatch_gate_is_per_direction() {
         let m = CycleCostModel::provisional_npu1();
-        // occ=0: first dispatch into an empty+idle channel -> base rate.
-        assert_eq!(m.dispatch_overhead_for(0), 1086, "occ=0 -> base");
-        // occ=1: one task already outstanding -> base + slope.
-        assert_eq!(m.dispatch_overhead_for(1), 2118, "occ=1 -> base + slope");
-        // occ=2: ramp (1086 + 2*1032 = 3150) would exceed plateau -> capped.
-        assert_eq!(m.dispatch_overhead_for(2), 3050, "occ=2 -> capped at plateau");
-        // Deeper occupancy stays at the plateau.
-        assert_eq!(m.dispatch_overhead_for(5), 3050, "occ>=2 -> plateau");
+        // MM2S ramps: a fast first dispatch (base), then the plateau from
+        // index 1 on (steep slope) -- the prefetch-driven fast start that
+        // makes gap[0] negative without lowering the steady-state gaps.
+        assert_eq!(m.dispatch_overhead_for(0, true), 1086, "MM2S idx0 -> base");
+        assert_eq!(m.dispatch_overhead_for(1, true), 3050, "MM2S idx1 -> plateau");
+        assert_eq!(m.dispatch_overhead_for(5, true), 3050, "MM2S idx>=1 -> plateau");
+        // S2MM is flat at the plateau -- it waits on stream data, so its
+        // first dispatch pays full freight (no fast start).
+        assert_eq!(m.dispatch_overhead_for(0, false), 3050, "S2MM idx0 -> plateau (flat)");
+        assert_eq!(m.dispatch_overhead_for(3, false), 3050, "S2MM flat");
     }
 
     #[test]
     fn dispatch_overhead_is_zero_in_non_dispatch_profiles() {
-        // legacy and with_known_constants leave the gate disabled -- no
-        // dispatch pacing regardless of occupancy.
-        assert_eq!(CycleCostModel::legacy_one_per_packet().dispatch_overhead_for(3), 0);
-        assert_eq!(CycleCostModel::with_known_constants().dispatch_overhead_for(3), 0);
+        // legacy and with_known_constants leave both gates disabled -- no
+        // dispatch pacing regardless of index or direction.
+        for is_mm2s in [true, false] {
+            assert_eq!(CycleCostModel::legacy_one_per_packet().dispatch_overhead_for(3, is_mm2s), 0);
+            assert_eq!(CycleCostModel::with_known_constants().dispatch_overhead_for(3, is_mm2s), 0);
+        }
     }
 }

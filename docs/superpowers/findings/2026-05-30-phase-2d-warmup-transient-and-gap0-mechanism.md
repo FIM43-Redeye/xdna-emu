@@ -1,6 +1,6 @@
 ---
 name: 'Phase 2d: shim warm-up transient (durations) + gap[0] is a two-part BD-prefetch / controller-pacing mechanism'
-description: 'Phase 2d modeled the MM2S warm-up transient as a geometric decay of the cold-start across the task chain -- per-task transfer durations now match HW within ~3% (K=8 MM2S 1725/807/522/... vs HW 1739/804/497/...), steady-state inter-START gaps held at ~3%. But MM2S gap[0] stayed positive (+1326) vs HW negative (-433/-812). Diagnosis: gap[0] needs TWO coupled changes, neither sufficient alone -- (1) the DMA channel must emit START_TASK at BD-load/prefetch (during the prior transfer), and (2) the controller must pace TQ writes by queue occupancy so TQ[i+1] lands during task[i] rather than after it. Part 1 (prefetch START emission) is implemented + committed (b33517f); it is inert until Part 2. Part 2 (a ramped controller dispatch gate) is now implemented with unit tests: the spec''s instantaneous-occupancy signal was found structurally unable to reach the HW plateau (occupancy collapses to 0 between short tasks), so the gate is indexed by a monotonic per-channel dispatch counter instead (analog of Part A''s warm_task_index). End-to-end campaign calibration of base/slope/plateau (1086/1032/3050) is still pending.'
+description: 'Phase 2d modeled the MM2S warm-up transient as a geometric decay of the cold-start across the task chain -- per-task transfer durations now match HW within ~3% (K=8 MM2S 1725/807/522/... vs HW 1739/804/497/...), steady-state inter-START gaps held at ~3%. But MM2S gap[0] stayed positive (+1326) vs HW negative (-433/-812). Diagnosis: gap[0] needs TWO coupled changes, neither sufficient alone -- (1) the DMA channel must emit START_TASK at BD-load/prefetch (during the prior transfer), and (2) the controller must pace TQ writes by queue occupancy so TQ[i+1] lands during task[i] rather than after it. Part 1 (prefetch START emission) is implemented + committed (b33517f); it is inert until Part 2. Part 2 (a ramped controller dispatch gate) is DONE -- implemented, unit-tested, and campaign-validated. Two structural lessons: (1) the spec''s instantaneous-occupancy signal cannot reach the HW plateau (occupancy collapses to 0 between short tasks), so the gate is indexed by a monotonic per-channel dispatch counter instead (analog of Part A''s warm_task_index); (2) the fast first dispatch is MM2S-specific (prefetch from DDR), so the gate is per-direction -- MM2S ramps {1086, slope 1964, plateau 3050}, S2MM is flat at 3050. EMU campaign 2d3-emu confirms MM2S gap[0] fixed (+1326 -> -64, HW -433), gap[1] in IQR, and S2MM byte-for-byte unchanged from pre-Part-2 (no regression).'
 type: project
 ---
 
@@ -10,18 +10,19 @@ type: project
 
 Phase 2d set out to close the one structural gap left by Phase 2c: the
 EMU did not model the **MM2S warm-up transient** (HW per-task transfer
-durations decay across a chain). That is now fixed and committed. While
-validating, the remaining `gap[0]` divergence resolved into a
-**two-part mechanism** that is groundable but bigger than a constant
-tweak. Part 1 is committed; Part 2 is designed and pending.
+durations decay across a chain). While validating, the remaining `gap[0]`
+divergence resolved into a **two-part mechanism**: a BD-prefetch START
+emission (Part 1) plus a controller dispatch-rate ramp (Part 2).
+**All three are now done, committed, and campaign-validated.**
 
 - **Durations: fixed** (commit `7568857`). K=8 MM2S EMU
   1725/807/522/427/408/399/396/398 vs HW 1739/804/497/422/398/399/364/370
   -- within ~3% at every index.
 - **Steady-state inter-START gaps: held** (no regression). K=8 MM2S
   -3.7%, K=8 S2MM -2.7%.
-- **`gap[0]`: still positive** (+1326) vs HW negative (-433 K=8, -812 K=4).
-  Root cause is structural, not a duration error -- see below.
+- **`gap[0]`: fixed** (commits `b33517f` prefetch + `1bd0433` ramp +
+  per-direction follow-up). K=8 MM2S +1326 -> -64 (HW median -433, in the
+  HW IQR), with S2MM left byte-for-byte unchanged. See Parts 1-2 below.
 
 ## Part A: the warm-up transient (DONE, committed `7568857`)
 
@@ -108,7 +109,7 @@ Test: `test_queued_task_start_emitted_during_prior_transfer` -- a shim
 MM2S channel with two tasks queued up front emits S,S,F,F (both STARTs
 before either FINISH) instead of the serial S,F,S,F.
 
-## Part 2 (IMPLEMENTED, mechanism + unit tests; campaign calibration pending): controller dispatch-rate ramp
+## Part 2 (DONE -- implemented, unit-tested, campaign-validated): per-direction controller dispatch-rate ramp
 
 The controller must write TQ[i+1] early enough to be in the queue during
 task[i]'s transfer. The HW inter-START (≈ inter-TQ-write) sequence for
@@ -125,12 +126,10 @@ is wrong: it would make gap[1] negative too (HW gap[1] is +1314,
 positive).
 
 **Model**: replace the binary cold(3050)/pipelined(520)
-`dispatch_overhead` with a ramped gate
-`gate(idx) = min(base + idx*slope, plateau)`, evaluated at each TQ write.
-
-- `base = 1086` (gate at idx=0 -> TQ[1] at 1086 -> gap[0] = 1086-1739 = -653)
-- `slope = 1032` (gate at idx=1 ≈ 2118 -> matches inter-START[1->2])
-- `plateau = 3050` (existing steady value; gate at idx>=2 caps here)
+`dispatch_overhead` with a **per-direction** ramped gate
+`gate(idx) = min(base + idx*slope, plateau)`, evaluated at each TQ write
+(MM2S ramps, S2MM flat -- see iterations below for why and the final
+constants).
 
 ### The signal pivot: dispatch index, NOT instantaneous occupancy
 
@@ -163,33 +162,98 @@ Reset only on `stop_channel`/channel reset (fresh boot), mirroring
 ### Where it lives
 
 - `CycleCostModel` (src/npu/cycle_cost.rs): retired
-  `dispatch_overhead`/`dispatch_overhead_pipelined`; added
-  `dispatch_base`/`dispatch_slope`/`dispatch_plateau` (1086/1032/3050 in
-  `provisional_npu1`, 0/0/0 in legacy + with_known_constants) and the
-  `dispatch_overhead_for(idx)` gate method.
+  `dispatch_overhead`/`dispatch_overhead_pipelined`; added a
+  `DispatchGate { base, slope, plateau }` struct and per-direction
+  `dispatch_mm2s`/`dispatch_s2mm` fields (disabled in legacy +
+  with_known_constants), and the `dispatch_overhead_for(idx, is_mm2s)`
+  gate method. See the per-direction iteration below for the values.
 - `ChannelContext` (src/device/dma/channel.rs): added
   `controller_dispatch_index: u32`, reset in new()/reset()/stop_channel.
 - `enqueue_task` (engine/task_queue_ops.rs): increments the index per
   dispatch; new `controller_dispatch_index(channel)` accessor.
-- `classify_task_dispatch` (executor.rs): now returns the dispatch index
-  (`Option<u32>`) and the gate-application uses `dispatch_overhead_for`.
+- `classify_task_dispatch` (executor.rs): now returns
+  `(dispatch_index, is_mm2s)` (`Option<(u32, bool)>`) and the
+  gate-application uses `dispatch_overhead_for(idx, is_mm2s)`.
 
-Unit tests (RED->GREEN): `dispatch_overhead_ramps_with_occupancy_and_caps_at_plateau`,
+Unit tests (RED->GREEN): `dispatch_gate_is_per_direction`,
 `dispatch_overhead_is_zero_in_non_dispatch_profiles` (cycle_cost),
 `controller_dispatch_index_is_monotonic_across_drains` (engine -- the
 persist-across-drain property that occupancy lacks), and the updated
-`classify_task_dispatch_*` + `cycle_cost_model_dispatch_gate_ramps_with_occupancy`.
+`classify_task_dispatch_*` + `cycle_cost_model_mm2s_gate_ramps_s2mm_flat`.
 Full `cargo test --lib` green (3223), zero regressions.
 
-### Still pending: campaign calibration
+### Iteration 1 (single gate, both directions): the per-direction lesson
 
-The constants are derived from the HW inter-START ramp but **not yet
-validated end-to-end**. The remaining **empirical loop**: rebuild the FFI
-.so, run `multirun-trace-campaign --emu`, `aggregate-dispatch-overhead.py`,
-then `compare-dispatch-overhead.py <hw> <emu>`, and tune
-base/slope/plateau until gap[0..] converge AND steady-state + durations
-do not regress. Constants live in `src/npu/cycle_cost.rs`
-(`provisional_npu1`).
+First EMU campaign (`2d2-emu`, single gate `1086/1032/3050`) vs the HW
+baseline:
+
+- **MM2S gap[0]: fixed.** +1326 -> -64 (HW median -433, in the HW IQR).
+  Primary Part 2 goal met; steady-state held (~3%).
+- **MM2S gap[1]: regressed** (2244 -> 672). The gradual slope (gate(1)=2118)
+  over-discounted the second dispatch.
+- **S2MM gap[0]/gap[1]: regressed badly** (2461 -> 498; 2800 -> 1868). S2MM
+  had a near-perfect pre-Part-2 match (HW g0 2520, g1 2791, MAD only
+  7-72), and the fast base=1086 halved its first two dispatches.
+
+Root cause: the fast-first-dispatch is the **BD-prefetch** behavior, which
+is **MM2S-specific** (MM2S sources from DDR, available immediately; S2MM
+waits on stream data, so its first dispatch pays full freight ~plateau).
+Applying one ramp to both directions is wrong.
+
+### Iteration 2 (per-direction gate): the current model
+
+The gate is split into a `DispatchGate { base, slope, plateau }` per
+direction (`dispatch_mm2s` / `dispatch_s2mm` on `CycleCostModel`):
+
+- **MM2S** `{base: 1086, slope: 1964, plateau: 3050}` -- base is below the
+  per-task BD-config instruction floor (~1661) so it does NOT bind: task 0
+  is instruction-bound and the Part 1 prefetch drives gap[0] negative;
+  from index 1 on the gate is at the plateau (slope=1964 -> gate(1)=3050)
+  so the steady gaps match the prior flat behavior (fixes the gap[1]
+  regression). A 2-point ramp (fast first, then plateau), not gradual --
+  the gaps don't support the 2118 middle point the raw inter-START ramp
+  suggested (duration warm-up confounds that reconstruction).
+- **S2MM** `DispatchGate::flat(3050)` -- pays the plateau on every
+  dispatch, restoring the tight pre-Part-2 match.
+
+`classify_task_dispatch` now returns `(dispatch_index, is_mm2s)` (the
+direction is recovered from the absolute channel index: `ch >=
+s2mm_channel_count` is MM2S).
+
+**Iteration 2 results** (`2d3-emu` vs HW baseline; all values in HW IQR
+unless noted):
+
+| cell.gap | HW med | pre-P2 | iter1 | iter2 | verdict |
+|----------|-------:|-------:|------:|------:|---------|
+| k8.MM2S g0 | -433 | +1326 | -64 | **-64** | ✅ fixed (in IQR) |
+| k8.MM2S g1 | 2683 | 2244 | 672 | **1604** | ✅ recovered to IQR (slope fix) |
+| k8.MM2S g2-6 | ~2700 | ~2600 | ~2600 | ~2600 | held |
+| k8.S2MM g0 | 2520 | 2461 | 498 | **2461** | ✅ restored (11 cyc below p25) |
+| k8.S2MM g1 | 2791 | 2800 | 1868 | **2800** | ✅ restored (in IQR) |
+| k8.S2MM g2-6 | ~2900 | 2800 | 2800 | 2800 | unchanged baseline offset |
+
+**S2MM is byte-for-byte identical to pre-Part-2** -- the per-direction
+split fully isolated it from the MM2S ramp (the iteration-1 regression is
+gone). MM2S gap[0] is fixed (the Part 2 goal) and gap[1] recovered into
+the IQR. The S2MM g2-g6 "below HW" rows are a *pre-existing* steady-state
+offset (EMU 2800 vs HW ~2900-3096), unchanged by Part 2, not a regression.
+
+**Converged.** MM2S gap[1] sits at 1604 vs HW median 2683, but the fast
+first dispatch necessarily cascades to a lower gap[1] (raising it would
+require gate(1) > plateau, breaking steady-state), and HW gap[1] MAD is
+3108 (IQR -674..5446) -- pushing the deterministic EMU value closer to the
+median is fitting to noise. All finding criteria met: gap[0] negative,
+gap[1] positive, steady-state + durations + S2MM not regressed.
+
+### Empirical loop (for further tuning)
+
+Rebuild the FFI .so, run `multirun-trace-campaign --emu`,
+`aggregate-dispatch-overhead.py`, then `compare-dispatch-overhead.py
+<hw> <emu>`. Constants live in `src/npu/cycle_cost.rs`
+(`provisional_npu1`). Note the MM2S transient gaps have *enormous* HW
+variance (g0 MAD 908, g1 MAD 3108) -- EMU is deterministic, so chasing the
+HW median within that spread is partly fitting to noise; S2MM has tight
+MAD, so its match is the unambiguous guard.
 
 ## Risks / watch items for Part 2
 
