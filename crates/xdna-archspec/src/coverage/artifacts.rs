@@ -334,23 +334,51 @@ mod tests {
     fn implementation_gaps_source_is_the_spine_not_semantic() {
         // Spec S1/M1 guard: the gaps queue must be sourced from the
         // capability spine, not the semantic universe (which would yield a
-        // permanently empty queue since no category default is ever
-        // Modeled). Probe the invariant, not a specific domain name: so
-        // long as any STUB/PARTIAL domain exists the rendered queue must
-        // be non-empty. (Avoids whack-a-mole when a single domain is
-        // promoted -- e.g. debug_halt 2026-05-19, clock_control 2026-05-24
-        // (Stub -> Partial), noc 2026-05-30 (Stub -> Accepted: a deliberate
-        // SoC-fabric abstraction, not unbuilt work). clock_control PARTIAL
-        // keeps the queue non-empty today.)
+        // permanently empty queue since no category default is ever Modeled).
+        //
+        // We verify this STRUCTURALLY -- the rendered queue must list exactly
+        // the spine domains whose verdict is_implementation_gap() -- rather
+        // than assuming a gap always exists. When every domain is Full/closed
+        // the queue is legitimately empty ("_empty_"), which is a real state,
+        // NOT the semantic-universe bug, so the test must not assume
+        // non-emptiness. The structural check still catches a renderer wired
+        // to the semantic universe: the moment any spine domain is a gap, that
+        // domain would be missing from a semantic-sourced (empty) queue.
+        //
+        // History: debug_halt 2026-05-19, clock_control 2026-05-24 (Stub ->
+        // Partial), noc 2026-05-30 (Stub -> Accepted: a deliberate SoC-fabric
+        // abstraction, not unbuilt work), clock_control 2026-05-30 (Partial ->
+        // Full: power/cycle-count counter-freeze modeled + cascade "Wake 4"
+        // reclassified as a non-feature -- the AIE2 core has no adaptive clock
+        // gate -- closing the last AIE2 implementation gap, so the queue is now
+        // legitimately empty).
+        let gap_ids: Vec<String> = capability_spine()
+            .into_iter()
+            .filter(|d| d.applies_to(Architecture::Aie2) && d.verdict.is_implementation_gap())
+            .map(|d| d.id)
+            .collect();
+
         let out = render_implementation_gaps(Architecture::Aie2);
-        assert!(
-            out.lines().any(|l| l.contains(": PARTIAL") || l.contains(": STUB")),
-            "implementation-gaps queue has no PARTIAL/STUB entry -- generator likely sourced the semantic universe, not the spine (spec S1/M1)"
-        );
-        assert!(
-            !out.contains("_empty_"),
-            "implementation-gaps queue is empty -- generator likely sourced the semantic universe, not the spine (spec S1/M1)"
-        );
+
+        if gap_ids.is_empty() {
+            assert!(
+                out.contains("_empty_"),
+                "no spine domain is an implementation gap, so the queue must render \"_empty_\""
+            );
+        } else {
+            assert!(
+                !out.contains("_empty_"),
+                "spine has gap domains {gap_ids:?} but the queue rendered empty -- \
+                 generator likely sourced the semantic universe, not the spine (spec S1/M1)"
+            );
+            for id in &gap_ids {
+                assert!(
+                    out.lines().any(|l| l.starts_with(&format!("- {id}:"))),
+                    "spine gap domain '{id}' missing from rendered queue -- \
+                     generator likely sourced the semantic universe, not the spine (spec S1/M1)"
+                );
+            }
+        }
     }
 
     #[test]
