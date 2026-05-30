@@ -335,13 +335,13 @@ mod tests {
         // Spec S1/M1 guard: the gaps queue must be sourced from the
         // capability spine, not the semantic universe (which would yield a
         // permanently empty queue since no category default is ever
-        // Modeled). Probe the invariant, not a specific domain name: `noc`
-        // and `clock_control` are permanent STUBs (unmodeled subsystems),
-        // so as long as any STUB/PARTIAL domain exists the rendered queue
-        // must be non-empty. (Avoids whack-a-mole when a single domain is
-        // promoted to Full -- e.g. debug_halt 2026-05-19, clock_control
-        // 2026-05-24 (Stub -> Partial).  noc remains STUB and is what
-        // keeps the queue non-empty until something better comes along.)
+        // Modeled). Probe the invariant, not a specific domain name: so
+        // long as any STUB/PARTIAL domain exists the rendered queue must
+        // be non-empty. (Avoids whack-a-mole when a single domain is
+        // promoted -- e.g. debug_halt 2026-05-19, clock_control 2026-05-24
+        // (Stub -> Partial), noc 2026-05-30 (Stub -> Accepted: a deliberate
+        // SoC-fabric abstraction, not unbuilt work). clock_control PARTIAL
+        // keeps the queue non-empty today.)
         let out = render_implementation_gaps(Architecture::Aie2);
         assert!(
             out.lines().any(|l| l.contains(": PARTIAL") || l.contains(": STUB")),
