@@ -1257,54 +1257,107 @@ impl InterpreterEngine {
             const TRUE_EVENT: u8 = 1;
             const ACTIVE_CORE_EVENT: u8 = 0x1C;
             let cycle = self.total_cycles;
+
+            // "No clock, no tick": a clock-gated module has no clock, so its
+            // timer and performance counters freeze. Precompute the per-tile
+            // gate booleans here -- computing them inside the loop below would
+            // borrow the clock controller while the tiles are already borrowed
+            // mutably.
+            //
+            // Bank-to-module mapping by tile kind:
+            //   core bank (core_timer + core_perf_counters):
+            //     Compute -> Core module gate; Shim -> column gate (shim PL
+            //     counters live in this bank and are clocked with the column --
+            //     our model has no separate shim-PL module gate); Mem -> column
+            //     gate (memtile has 0 core counters, so the choice is moot).
+            //   mem bank (mem_timer + mem_perf_counters):
+            //     Compute/Mem -> Memory module gate; Shim -> column gate (shim
+            //     has 0 mem counters, moot).
+            let clock_gates: Vec<(bool, bool)> = {
+                use crate::device::clock_control::ModuleKind;
+                let clock = self.device.array.clock();
+                let rows = self.rows;
+                self.device
+                    .array
+                    .tiles
+                    .iter()
+                    .enumerate()
+                    .map(|(i, tile)| {
+                        let col = (i / rows) as u8;
+                        let row = (i % rows) as u8;
+                        let core_clocked = match tile.tile_kind {
+                            TileKind::Compute => clock.is_module_active(col, row, ModuleKind::Core),
+                            _ => clock.is_column_active(col),
+                        };
+                        let mem_clocked = match tile.tile_kind {
+                            TileKind::Compute | TileKind::Mem => {
+                                clock.is_module_active(col, row, ModuleKind::Memory)
+                            }
+                            _ => clock.is_column_active(col),
+                        };
+                        (core_clocked, mem_clocked)
+                    })
+                    .collect()
+            };
+
             for (i, tile) in self.device.array.tiles.iter_mut().enumerate() {
-                tile.core_timer.tick();
-                tile.mem_timer.tick();
+                let (core_clocked, mem_clocked) = clock_gates[i];
 
-                let core_active = self.cores.get(i).map_or(false, |c| c.active_this_cycle);
+                // Core module (timer + perf counters). Skipped entirely when
+                // the module is clock-gated: a frozen clock advances neither
+                // the free-running timer nor any active counter.
+                if core_clocked {
+                    tile.core_timer.tick();
 
-                // Re-assert TRUE every cycle and ACTIVE_CORE only when the
-                // core is executing. handle_event() is idempotent: an
-                // already-Active counter stays Active; counters whose start
-                // event doesn't match are unaffected. Stop and reset events
-                // still take priority inside handle_event() per its existing
-                // ordering.
-                //
-                // ACTIVE_CORE is an edge-style start event: it pulses on
-                // transition to Execute and arms the counter. Once Active,
-                // the counter ticks every cycle regardless of whether the
-                // core is still in Execute -- HW perf counters are duration
-                // counters started by ACTIVE_CORE and stopped by
-                // DISABLED_CORE, not gated per cycle on Execute state.
-                tile.core_perf_counters.handle_event(TRUE_EVENT);
-                if core_active {
-                    tile.core_perf_counters.handle_event(ACTIVE_CORE_EVENT);
-                }
-                tile.mem_perf_counters.handle_event(TRUE_EVENT);
+                    let core_active = self.cores.get(i).map_or(false, |c| c.active_this_cycle);
 
-                let core_fired = tile.core_perf_counters.tick();
-                if !core_fired.is_empty() {
-                    // Snapshot the core's pipeline-adjusted PC for trace
-                    // stamping. tile.core.pc is updated each cycle from the
-                    // core context (Phase 2) and includes the stall-PC
-                    // pipeline adjustment, so it matches what HW's trace
-                    // controller would sample when the perf-counter
-                    // threshold fires.
-                    let core_pc = tile.core.pc;
-                    for cnt_idx in core_fired {
-                        let hw_id = PERF_CNT_BASE + cnt_idx as u8;
-                        // Feed back so self-reset configs work, then trace-notify.
-                        tile.core_perf_counters.handle_event(hw_id);
-                        tile.notify_core_trace_event(hw_id, cycle, Some(core_pc));
+                    // Re-assert TRUE every cycle and ACTIVE_CORE only when the
+                    // core is executing. handle_event() is idempotent: an
+                    // already-Active counter stays Active; counters whose start
+                    // event doesn't match are unaffected. Stop and reset events
+                    // still take priority inside handle_event() per its existing
+                    // ordering.
+                    //
+                    // ACTIVE_CORE is an edge-style start event: it pulses on
+                    // transition to Execute and arms the counter. Once Active,
+                    // the counter ticks every cycle regardless of whether the
+                    // core is still in Execute -- HW perf counters are duration
+                    // counters started by ACTIVE_CORE and stopped by
+                    // DISABLED_CORE, not gated per cycle on Execute state.
+                    tile.core_perf_counters.handle_event(TRUE_EVENT);
+                    if core_active {
+                        tile.core_perf_counters.handle_event(ACTIVE_CORE_EVENT);
+                    }
+
+                    let core_fired = tile.core_perf_counters.tick();
+                    if !core_fired.is_empty() {
+                        // Snapshot the core's pipeline-adjusted PC for trace
+                        // stamping. tile.core.pc is updated each cycle from the
+                        // core context (Phase 2) and includes the stall-PC
+                        // pipeline adjustment, so it matches what HW's trace
+                        // controller would sample when the perf-counter
+                        // threshold fires.
+                        let core_pc = tile.core.pc;
+                        for cnt_idx in core_fired {
+                            let hw_id = PERF_CNT_BASE + cnt_idx as u8;
+                            // Feed back so self-reset configs work, then trace-notify.
+                            tile.core_perf_counters.handle_event(hw_id);
+                            tile.notify_core_trace_event(hw_id, cycle, Some(core_pc));
+                        }
                     }
                 }
 
-                // Memory module perf counters tick unconditionally.
-                let mem_fired = tile.mem_perf_counters.tick();
-                for cnt_idx in mem_fired {
-                    let hw_id = PERF_CNT_BASE + cnt_idx as u8;
-                    tile.mem_perf_counters.handle_event(hw_id);
-                    tile.notify_mem_trace_event(hw_id, cycle, None);
+                // Memory module (timer + perf counters). Same freeze rule.
+                if mem_clocked {
+                    tile.mem_timer.tick();
+                    tile.mem_perf_counters.handle_event(TRUE_EVENT);
+
+                    let mem_fired = tile.mem_perf_counters.tick();
+                    for cnt_idx in mem_fired {
+                        let hw_id = PERF_CNT_BASE + cnt_idx as u8;
+                        tile.mem_perf_counters.handle_event(hw_id);
+                        tile.notify_mem_trace_event(hw_id, cycle, None);
+                    }
                 }
             }
         }
@@ -2255,6 +2308,130 @@ mod tests {
              frames); got {} bytes -- ACTIVE_CORE-started counter never fired \
              (#354 regression)",
             encoded
+        );
+    }
+
+    /// A clock-gated module has no clock, so its performance counters must
+    /// freeze: "no clock, no tick". This exercises the column gate (the
+    /// dominant tier) -- gating column 0 must stop tile (0,2)'s core perf
+    /// counter from advancing, even though the simulation keeps stepping
+    /// (a keep-alive core in the ungated column 1 drives cycles forward).
+    ///
+    /// Pre-fix, Phase 3e ticks every tile's perf counters unconditionally,
+    /// so the gated counter keeps counting -- a bug a binary could observe by
+    /// gating a column and reading Performance_Counter0.
+    #[test]
+    fn column_gate_freezes_core_perf_counter() {
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+
+        // Keep-alive core in column 1: run() steps max_cycles unless Halted,
+        // so a running core guarantees cycles advance while column 0 is gated.
+        engine.enable_core(1, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
+            tile.write_program(0, &[0x00u8; 512]);
+        }
+
+        // Core perf counter 0 on (0,2): start=TRUE, event_value=0 (free-running
+        // count -- never self-fires or resets). Armed Active up front.
+        {
+            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let ctrl0 = 1u32 | (0u32 << 8); // start=TRUE(1), stop=NONE(0)
+            tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
+            tile.core_perf_counters.write_event_value(0, 0);
+            tile.core_perf_counters.handle_event(1); // arm -> Active
+        }
+
+        // Sanity: while ungated the counter advances every cycle.
+        engine.run(5);
+        let after_ungated = engine.device().array.tile(0, 2).core_perf_counters.read_counter(0);
+        assert!(after_ungated > 0, "sanity: ungated core perf counter must advance, got {}", after_ungated);
+
+        // Gate column 0 (clear Column_Clock_Control bit 0 on the shim row).
+        engine.device_mut().array.clock_mut().write_register(0, 0, 0x000FFF20, 0x0);
+        assert!(!engine.device().array.clock().is_column_active(0), "precondition: column 0 gated");
+
+        engine.run(10);
+        let after_gated = engine.device().array.tile(0, 2).core_perf_counters.read_counter(0);
+        assert_eq!(
+            after_gated, after_ungated,
+            "clock-gated column must freeze the perf counter (no clock, no tick): \
+             advanced from {} to {} across 10 gated cycles",
+            after_ungated, after_gated
+        );
+    }
+
+    /// Module-granular freeze: gating only the Core module (column still
+    /// active) must freeze the core perf counter while the Memory module's
+    /// counter on the same tile keeps ticking. This proves the gate is
+    /// per-module, not just per-column, and that the two banks are independent.
+    #[test]
+    fn core_module_gate_freezes_core_counter_but_not_mem_counter() {
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+
+        // Keep-alive core in column 1 so cycles advance.
+        engine.enable_core(1, 2);
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
+            tile.write_program(0, &[0x00u8; 512]);
+        }
+
+        // Both the core and memory perf counter 0 on (0,2): start=TRUE,
+        // free-running, armed Active.
+        {
+            let tile = engine.device_mut().array.tile_mut(0, 2);
+            let ctrl0 = 1u32 | (0u32 << 8); // start=TRUE(1), stop=NONE(0)
+            tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
+            tile.core_perf_counters.write_event_value(0, 0);
+            tile.core_perf_counters.handle_event(1);
+            tile.mem_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
+            tile.mem_perf_counters.write_event_value(0, 0);
+            tile.mem_perf_counters.handle_event(1);
+        }
+
+        // Sanity: both advance while fully ungated.
+        engine.run(5);
+        let (core_pre, mem_pre) = {
+            let tile = engine.device().array.tile(0, 2);
+            (tile.core_perf_counters.read_counter(0), tile.mem_perf_counters.read_counter(0))
+        };
+        assert!(
+            core_pre > 0 && mem_pre > 0,
+            "sanity: both counters advance ungated ({}, {})",
+            core_pre,
+            mem_pre
+        );
+
+        // Gate ONLY the Core module on (0,2): MCC bits [SS=1, Mem=1, Core=0]
+        // -> 0b011. Column 0 stays active. Compute MCC offset = 0x60000.
+        engine.device_mut().array.clock_mut().write_register(0, 2, 0x0006_0000, 0b011);
+        assert!(!engine.device().array.clock().is_module_active(
+            0,
+            2,
+            crate::device::clock_control::ModuleKind::Core
+        ));
+        assert!(engine.device().array.clock().is_module_active(
+            0,
+            2,
+            crate::device::clock_control::ModuleKind::Memory
+        ));
+
+        engine.run(10);
+        let (core_post, mem_post) = {
+            let tile = engine.device().array.tile(0, 2);
+            (tile.core_perf_counters.read_counter(0), tile.mem_perf_counters.read_counter(0))
+        };
+        assert_eq!(
+            core_post, core_pre,
+            "Core-module gate must freeze core counter ({} -> {})",
+            core_pre, core_post
+        );
+        assert_eq!(
+            mem_post,
+            mem_pre + 10,
+            "Memory module still clocked: mem counter must keep ticking ({} -> {})",
+            mem_pre,
+            mem_post
         );
     }
 
