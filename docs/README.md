@@ -23,6 +23,14 @@ Living technical reference material:
   perishable-queue.md / comprehension-gaps.md. Do not hand-edit;
   regenerate with
   `cargo run -p xdna-archspec --example gen_coverage_artifacts`.
+- [operations.md](operations.md) -- Operational runbook: build discipline,
+  formatting enforcement, test-suite costs, hardware-testing rules, NPU
+  recovery escalation chain, and devbox environment state. The full-text home
+  for the quick-reference rules in CLAUDE.md.
+- [toolchain-sources.md](toolchain-sources.md) -- Detailed per-source breakdown
+  of the authoritative toolchain sources (aie-rt, AM025 regdb, llvm-aie
+  TableGen, mlir-aie device model): what each provides, key files, where the
+  emulator consumes it. The detail behind CLAUDE.md's Correctness Principle.
 - [aiesimulator.md](aiesimulator.md) -- AMD aiesimulator integration and usage
 - [dma-reference.md](dma-reference.md) -- DMA engine reference (BD fields,
   sequences, polling semantics)
@@ -36,6 +44,11 @@ Living technical reference material:
 
 ## Trace Tooling
 
+- [trace/tooling.md](trace/tooling.md) -- Per-tool inventory of the six-layer
+  trace pipeline (pre-build, run, decode, compare, matrix/regression, glue) plus
+  deprecated tools. The detail behind CLAUDE.md's Tracing Ecosystem section.
+- [trace/strategy.md](trace/strategy.md) -- Trace-driven validation strategy
+  (the logic-fuzzer end goal)
 - [trace/pc-anchored.md](trace/pc-anchored.md) -- PC-anchored mode-1
   trace sweep + comparison workflow
 
