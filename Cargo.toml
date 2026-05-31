@@ -8,6 +8,9 @@ edition = "2021"
 description = "Open-source emulator and visual debugger for AMD XDNA NPUs"
 license = "MIT"
 rust-version = "1.70"
+# The namesake emulator binary is the default for `cargo run`; the other
+# [[bin]] targets below are auxiliary tools selected explicitly via --bin.
+default-run = "xdna-emu"
 
 [lib]
 # Build both a Rust library and a C-compatible shared library
