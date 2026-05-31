@@ -136,7 +136,7 @@ pub fn run_fuzz(opts: &FuzzOptions) {
     println!("Fuzzing {} iterations, base seed {}", iterations, base_seed);
 
     if iterations == 0 {
-        println!("Fuzz complete: 0 pass, 0 fail, 0 error");
+        println!("Fuzz complete: 0 pass, 0 fail, 0 error, 0 CRASH");
         return;
     }
 
@@ -175,18 +175,28 @@ pub fn run_fuzz(opts: &FuzzOptions) {
     );
 
     if compiled.is_empty() {
-        println!("Fuzz complete: 0 pass, 0 fail, {} error", compile_errors);
+        println!("Fuzz complete: 0 pass, 0 fail, {} error, 0 CRASH", compile_errors);
         return;
     }
 
     // Phase 2: Execute on emulator (and optionally NPU), compare outputs.
     let exec_start = Instant::now();
-    let (pass, fail, exec_errors) = execute_all(&compiled, opts.max_cycles, hw, opts.verbose, jobs);
+    let (pass, fail, exec_errors, crash) = execute_all(&compiled, opts.max_cycles, hw, opts.verbose, jobs);
     let exec_elapsed = exec_start.elapsed().as_secs_f64();
 
     let total_errors = compile_errors + exec_errors;
-    println!("Execute: {} pass, {} fail, {} error ({:.1}s)", pass, fail, exec_errors, exec_elapsed,);
-    println!("Fuzz complete: {} pass, {} fail, {} error", pass, fail, total_errors,);
+    println!(
+        "Execute: {} pass, {} fail, {} error, {} CRASH ({:.1}s)",
+        pass, fail, exec_errors, crash, exec_elapsed,
+    );
+    println!("Fuzz complete: {} pass, {} fail, {} error, {} CRASH", pass, fail, total_errors, crash,);
+    if crash > 0 {
+        println!(
+            "  *** {} seed(s) CRASHED the emulator (panic) -- highest-priority bugs; \
+             see 'seed N CRASH' lines above ***",
+            crash,
+        );
+    }
 
     // Phase 3 (optional): Trace event group sweep.
     if trace_sweep {
@@ -325,19 +335,53 @@ fn compile_all(
 /// Phase 2: Execute compiled cases on emulator (and optionally NPU), compare.
 ///
 /// When `hw` is true, emulator and NPU run concurrently:
+/// One case's run outcome: `Ok((output, trace))` ran to a result;
+/// `Err(msg)` is a normal error (NPU failure, empty output, etc.).
+type CaseResult = Result<(Vec<u8>, Option<Vec<u8>>), String>;
+
+/// A `CaseResult` wrapped so a caught panic is distinguishable: outer
+/// `Err(msg)` means the run panicked (CRASH); `Ok(inner)` means it
+/// completed and `inner` carries the normal outcome.
+type CaughtResult = Result<CaseResult, String>;
+
+/// Run `f`, converting a panic into `Err(message)`.
+///
+/// The emulator workers run inside `std::thread::scope`, which re-raises a
+/// scoped thread's panic when the scope joins -- so a single panicking seed
+/// would otherwise abort the entire batch with no report.  A panic is the
+/// highest-signal find a differential fuzzer can produce (an unambiguous
+/// emulator bug), so callers catch it here and surface it as its own CRASH
+/// category rather than letting it take the run down.
+fn catch_panic<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(panic_to_string)
+}
+
+/// Extract a human-readable message from a caught panic payload.
+fn panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 /// - NPU thread processes cases sequentially (fast, <1s each).
 /// - Emulator workers fill result slots in parallel (~13s each), so
 ///   parallelism across `jobs` threads is critical for throughput.
 /// The NPU thread grabs emulator results as they become available.
 ///
-/// Returns (pass, fail, error) counts.
+/// Returns (pass, fail, error, crash) counts.  `crash` counts seeds where
+/// the emulator panicked -- caught per-seed so one bad seed cannot abort the
+/// batch.
 fn execute_all(
     cases: &[CompiledCase],
     max_cycles: u64,
     hw: bool,
     verbose: bool,
     jobs: usize,
-) -> (usize, usize, usize) {
+) -> (usize, usize, usize, usize) {
     let total = cases.len();
 
     if !hw {
@@ -346,16 +390,17 @@ fn execute_all(
 
     // HW comparison: run emulator (parallel) and NPU (sequential) independently,
     // then compare results. This decouples them so neither blocks the other.
-    type CaseResult = Result<(Vec<u8>, Option<Vec<u8>>), String>;
+    // Each run is wrapped in `catch_panic` so a single seed's panic cannot
+    // abort the scoped-thread batch.
 
     // Emulator results: parallel work-stealing.
-    let emu_results: Vec<std::sync::Mutex<Option<CaseResult>>> =
+    let emu_results: Vec<std::sync::Mutex<Option<CaughtResult>>> =
         (0..total).map(|_| std::sync::Mutex::new(None)).collect();
     let emu_next = std::sync::atomic::AtomicUsize::new(0);
     let emu_done = std::sync::atomic::AtomicUsize::new(0);
 
     // NPU results: sequential (single device).
-    let npu_results: Vec<std::sync::Mutex<Option<CaseResult>>> =
+    let npu_results: Vec<std::sync::Mutex<Option<CaughtResult>>> =
         (0..total).map(|_| std::sync::Mutex::new(None)).collect();
     let npu_done = std::sync::atomic::AtomicUsize::new(0);
 
@@ -375,7 +420,7 @@ fn execute_all(
                 }
                 let case = &cases[idx];
                 let xclbin_path = case.case_dir.join("aie.xclbin");
-                let result = run_emulator(&xclbin_path, &case.params, max_cycles);
+                let result = catch_panic(|| run_emulator(&xclbin_path, &case.params, max_cycles));
                 *emu_results[idx].lock().unwrap() = Some(result);
                 let n = emu_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if verbose {
@@ -389,7 +434,7 @@ fn execute_all(
             for (i, case) in cases.iter().enumerate() {
                 let xclbin_path = case.case_dir.join("aie.xclbin");
                 let insts_path = case.case_dir.join("insts.bin");
-                let result = run_on_npu_raw(case, &xclbin_path, &insts_path);
+                let result = catch_panic(|| run_on_npu_raw(case, &xclbin_path, &insts_path));
                 *npu_results[i].lock().unwrap() = Some(result);
                 let n = npu_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if !verbose {
@@ -413,66 +458,89 @@ fn execute_all(
     let mut pass = 0usize;
     let mut fail = 0usize;
     let mut error = 0usize;
+    let mut crash = 0usize;
     let mut vacuous = 0usize;
 
     for (i, case) in cases.iter().enumerate() {
         let emu_result = emu_results[i].lock().unwrap().take().unwrap();
         let npu_result = npu_results[i].lock().unwrap().take().unwrap();
 
-        match (emu_result, npu_result) {
-            (Ok((emu_output, emu_trace)), Ok((npu_output, npu_trace))) => {
-                if emu_output.as_slice() == npu_output.as_slice() {
-                    let all_zero = emu_output.iter().all(|&b| b == 0);
-                    if all_zero {
-                        vacuous += 1;
-                        if verbose {
-                            println!(
-                                "seed {} MATCH (vacuous -- both zero, {} elements)",
-                                case.seed,
-                                emu_output.len() / case.params.dtype.byte_size()
-                            );
-                        }
-                    } else {
-                        pass += 1;
-                        if verbose {
-                            println!(
-                                "seed {} MATCH ({} elements)",
-                                case.seed,
-                                emu_output.len() / case.params.dtype.byte_size()
-                            );
-                        }
-                    }
-                } else {
-                    fail += 1;
-                    let elem_type = match case.params.dtype {
-                        ScalarType::I32 => crate::testing::test_cpp_parser::ElementType::I32,
-                        ScalarType::I16 => crate::testing::test_cpp_parser::ElementType::I16,
-                        ScalarType::I8 => crate::testing::test_cpp_parser::ElementType::I8,
-                    };
-                    let detail = format_mismatch(&emu_output, &npu_output, elem_type);
-                    println!("seed {} MISMATCH: {}", case.seed, detail);
-                    // Save outputs and trace data for post-mortem debugging.
-                    let _ = std::fs::write(case.case_dir.join("emu_output.bin"), &emu_output);
-                    let _ = std::fs::write(case.case_dir.join("npu_output.bin"), &npu_output);
-                    if let Some(ref t) = emu_trace {
-                        let _ = std::fs::write(case.case_dir.join("emu_trace.bin"), t);
-                    }
-                    if let Some(ref t) = npu_trace {
-                        let _ = std::fs::write(case.case_dir.join("npu_trace.bin"), t);
-                    }
-                }
+        // Emulator panic = CRASH: the highest-signal find (an unambiguous
+        // emulator bug).  Surface it loudly and skip the diff for this seed.
+        let (emu_output, emu_trace) = match emu_result {
+            Err(panic_msg) => {
+                crash += 1;
+                println!("seed {} CRASH (emulator panic): {}", case.seed, panic_msg);
+                continue;
             }
-            (Err(e), _) => {
+            Ok(Err(e)) => {
                 error += 1;
                 if verbose {
                     println!("seed {} emulator error: {}", case.seed, e);
                 }
+                continue;
             }
-            (_, Err(e)) => {
+            Ok(Ok(pair)) => pair,
+        };
+
+        let (npu_output, npu_trace) = match npu_result {
+            Err(panic_msg) => {
+                // An NPU-side panic is a harness/driver failure, not an
+                // emulator bug -- categorize as error, not CRASH.
+                error += 1;
+                if verbose {
+                    println!("seed {} hw panic: {}", case.seed, panic_msg);
+                }
+                continue;
+            }
+            Ok(Err(e)) => {
                 error += 1;
                 if verbose {
                     println!("seed {} hw error: {}", case.seed, e);
                 }
+                continue;
+            }
+            Ok(Ok(pair)) => pair,
+        };
+
+        if emu_output.as_slice() == npu_output.as_slice() {
+            let all_zero = emu_output.iter().all(|&b| b == 0);
+            if all_zero {
+                vacuous += 1;
+                if verbose {
+                    println!(
+                        "seed {} MATCH (vacuous -- both zero, {} elements)",
+                        case.seed,
+                        emu_output.len() / case.params.dtype.byte_size()
+                    );
+                }
+            } else {
+                pass += 1;
+                if verbose {
+                    println!(
+                        "seed {} MATCH ({} elements)",
+                        case.seed,
+                        emu_output.len() / case.params.dtype.byte_size()
+                    );
+                }
+            }
+        } else {
+            fail += 1;
+            let elem_type = match case.params.dtype {
+                ScalarType::I32 => crate::testing::test_cpp_parser::ElementType::I32,
+                ScalarType::I16 => crate::testing::test_cpp_parser::ElementType::I16,
+                ScalarType::I8 => crate::testing::test_cpp_parser::ElementType::I8,
+            };
+            let detail = format_mismatch(&emu_output, &npu_output, elem_type);
+            println!("seed {} MISMATCH: {}", case.seed, detail);
+            // Save outputs and trace data for post-mortem debugging.
+            let _ = std::fs::write(case.case_dir.join("emu_output.bin"), &emu_output);
+            let _ = std::fs::write(case.case_dir.join("npu_output.bin"), &npu_output);
+            if let Some(ref t) = emu_trace {
+                let _ = std::fs::write(case.case_dir.join("emu_trace.bin"), t);
+            }
+            if let Some(ref t) = npu_trace {
+                let _ = std::fs::write(case.case_dir.join("npu_trace.bin"), t);
             }
         }
     }
@@ -481,19 +549,22 @@ fn execute_all(
         println!("  ({} vacuous matches -- both sides all zeros)", vacuous);
     }
 
-    (pass, fail, error)
+    (pass, fail, error, crash)
 }
 
 /// Emulator-only execution (no hardware comparison), parallel work-stealing.
+/// Returns (pass, fail, error, crash); `fail` is always 0 with no HW to diff
+/// against, and `crash` counts seeds where the emulator panicked.
 fn execute_emulator_only(
     cases: &[CompiledCase],
     max_cycles: u64,
     verbose: bool,
     jobs: usize,
-) -> (usize, usize, usize) {
+) -> (usize, usize, usize, usize) {
     let total = cases.len();
     let pass = std::sync::atomic::AtomicUsize::new(0);
     let error = std::sync::atomic::AtomicUsize::new(0);
+    let crash = std::sync::atomic::AtomicUsize::new(0);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let done = std::sync::atomic::AtomicUsize::new(0);
 
@@ -503,6 +574,7 @@ fn execute_emulator_only(
             let done = &done;
             let pass = &pass;
             let error = &error;
+            let crash = &crash;
             s.spawn(move || loop {
                 let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if idx >= total {
@@ -510,7 +582,22 @@ fn execute_emulator_only(
                 }
                 let case = &cases[idx];
                 let xclbin_path = case.case_dir.join("aie.xclbin");
-                match run_emulator(&xclbin_path, &case.params, max_cycles) {
+                // An emulator panic on one seed must not abort the batch
+                // (scoped threads re-raise at join); catch it as CRASH.
+                let caught = catch_panic(|| run_emulator(&xclbin_path, &case.params, max_cycles));
+                let run_result = match caught {
+                    Ok(r) => r,
+                    Err(panic_msg) => {
+                        crash.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        println!(
+                            "[{}/{}] seed {} CRASH (emulator panic): {}",
+                            n, total, case.seed, panic_msg
+                        );
+                        continue;
+                    }
+                };
+                match run_result {
                     Ok((output, trace)) if !output.is_empty() => {
                         pass.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if verbose {
@@ -559,8 +646,8 @@ fn execute_emulator_only(
     if !verbose {
         eprintln!();
     }
-    // No fail category in emulator-only mode (only pass/error).
-    (pass.into_inner(), 0, error.into_inner())
+    // No fail category in emulator-only mode (only pass/error/crash).
+    (pass.into_inner(), 0, error.into_inner(), crash.into_inner())
 }
 
 /// Phase 3: Trace event group sweep.
@@ -1119,5 +1206,26 @@ mod tests {
         let data = vec![1, 0, 0, 0];
         let msg = format_mismatch(&data, &data, ElementType::I32);
         assert!(msg.contains("no element mismatch"));
+    }
+
+    #[test]
+    fn catch_panic_returns_ok_for_non_panicking_closure() {
+        let r = catch_panic(|| 42);
+        assert_eq!(r, Ok(42));
+    }
+
+    #[test]
+    fn catch_panic_converts_str_panic_to_err() {
+        let r: Result<i32, String> = catch_panic(|| panic!("boom-from-emulator"));
+        let msg = r.expect_err("panic must be caught as Err");
+        assert!(msg.contains("boom-from-emulator"), "panic message preserved, got: {}", msg);
+    }
+
+    #[test]
+    fn catch_panic_converts_formatted_panic_to_err() {
+        // The negate-overflow panic arrives as a String payload, not &str.
+        let r: Result<i32, String> = catch_panic(|| panic!("value {}", 7));
+        let msg = r.expect_err("panic must be caught as Err");
+        assert!(msg.contains("value 7"), "formatted panic message preserved, got: {}", msg);
     }
 }
