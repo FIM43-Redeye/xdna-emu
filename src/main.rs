@@ -50,6 +50,22 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Check for fuzz command.
+    // Positional `args[1] == "fuzz"` (not `args.iter().any(...)` like test-suite
+    // above): the full argv slice is handed to parse_fuzz_args, so the subcommand
+    // token must sit at position 1.
+    if args.len() >= 2 && args[1] == "fuzz" {
+        #[cfg(feature = "tooling")]
+        {
+            return run_fuzz_command(&args);
+        }
+        #[cfg(not(feature = "tooling"))]
+        {
+            eprintln!("fuzz command requires --features tooling");
+            std::process::exit(1);
+        }
+    }
+
     // Check for GUI mode
     let gui_mode = args.iter().any(|a| a == "--gui" || a == "-g");
     let file_arg: Option<&str> = args
@@ -376,6 +392,13 @@ fn run_test_suite(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "tooling")]
+fn run_fuzz_command(args: &[String]) -> anyhow::Result<()> {
+    let opts = xdna_emu::fuzzer::cli::parse_fuzz_args(args).map_err(|e| anyhow::anyhow!("fuzz: {}", e))?;
+    xdna_emu::fuzzer::runner::run_fuzz(&opts);
+    Ok(())
+}
+
 /// Print help message.
 fn print_help() {
     println!("xdna-emu - Open-source emulator for AMD XDNA NPUs");
@@ -383,6 +406,7 @@ fn print_help() {
     println!("USAGE:");
     println!("    xdna-emu [OPTIONS] [FILE]");
     println!("    xdna-emu test-suite <PATH>");
+    println!("    xdna-emu fuzz [OPTIONS]");
     println!();
     println!("OPTIONS:");
     println!("    -h, --help          Print this help message");
@@ -395,6 +419,7 @@ fn print_help() {
     println!();
     println!("COMMANDS:");
     println!("    test-suite <PATH>   Run xclbin test suite from directory");
+    println!("    fuzz [OPTIONS]      Differential logic fuzzer (EMU vs NPU)");
     println!();
     println!("EXAMPLES:");
     println!("    xdna-emu                         # Launch GUI");
@@ -403,6 +428,8 @@ fn print_help() {
     println!("    xdna-emu --trace trace.json test-suite ./tests/");
     println!("    xdna-emu kernel.elf              # Parse ELF file");
     println!("    xdna-emu --trace-view-hw hw/ --trace-view-emu emu/  # Compare traces");
+    println!("    xdna-emu fuzz --iterations 100              # EMU-only fuzz batch");
+    println!("    xdna-emu fuzz --iterations 1000 --hw        # EMU+HW differential");
 }
 
 #[cfg(feature = "gui")]
