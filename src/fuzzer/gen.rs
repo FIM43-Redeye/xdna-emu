@@ -41,6 +41,36 @@ pub fn generate(seed: u64) -> FuzzParams {
         ops.push(gen_op(&mut rng));
     }
 
+    // Experimental harvest mode (XDNA_FUZZ_RECENCY1): mirror the structure of
+    // the observed recency-1 commits (seed_1086 `i ^ (i + C)`, seed_1340
+    // `i | (i - C)`) -- a pure-induction-var two-op chain whose outer op reads a
+    // freshly-computed inner intermediate, so the LE-bundle store's data
+    // producer reads a register written in the immediately-preceding bundle
+    // ("recency-1"), the structure that COMMITS across the AIE2 ZOL back-edge
+    // where most 96-byte loops flush. This overwrites the accumulator (the
+    // random prefix becomes dead code); op1/op2/C vary per seed so the harvested
+    // recency-1 kernels are independent. Off by default (normal-corpus
+    // determinism preserved).
+    if std::env::var_os("XDNA_FUZZ_RECENCY1").is_some() {
+        let c = (rng.next() % 63) as i32 + 1;
+        let op2 = gen_scalar_op(&mut rng);
+        let op1 = gen_scalar_op(&mut rng);
+        // Var0 = i op2 C   (fresh inner intermediate)
+        ops.push(KernelOp::ScalarArith {
+            op: op2,
+            dst: Var(0),
+            src1: Operand::Var(Var(1)),
+            src2: Operand::Literal(c),
+        });
+        // Var0 = i op1 Var0   (outer reads the just-written intermediate)
+        ops.push(KernelOp::ScalarArith {
+            op: op1,
+            dst: Var(0),
+            src1: Operand::Var(Var(1)),
+            src2: Operand::Var(Var(0)),
+        });
+    }
+
     // Always end with a store to output buffer so there's something to compare.
     ops.push(KernelOp::Store { buf: BufRef(1), idx: Operand::Var(Var(1)), val: Operand::Var(Var(0)) });
 

@@ -170,15 +170,39 @@ def classify(elf):
     # Walk backward for the producer of sreg.
     prod_op = None
     prod_dist = None
+    prod_pos = None
+    prod_raw = None
     for k in range(le_pos - 1, -1, -1):
         _, subs = bundles[k]
-        for (op, dest, _raw) in subs:
+        for (op, dest, raw) in subs:
             if dest == sreg:
                 prod_op = op
                 prod_dist = le_pos - k
+                prod_pos = k
+                prod_raw = raw
                 break
         if prod_op:
             break
+
+    # Data-input recency: how many bundles back the producer's *source* register
+    # was last written. recency==1 means the store's data was produced from a
+    # value written in the immediately-preceding bundle (the structure that
+    # tends to COMMIT across the ZOL back-edge); a large value / None means the
+    # data came from a long-stable value (induction var, loop invariant) and
+    # tends to FLUSH. Strong-but-not-deterministic correlate -- see the findings
+    # doc's recency experiment (~76% of body-96 recency-1 cases commit).
+    data_recency = None
+    if prod_raw is not None and prod_pos is not None:
+        src_regs = [t for t in prod_raw.replace(",", " ").split()[2:]
+                    if re.match(r"^r\d+$", t)]
+        best = None
+        for sr in src_regs:
+            for k in range(prod_pos - 1, -1, -1):
+                if any(d == sr for (_o, d, _r) in bundles[k][1]):
+                    dist = prod_pos - k
+                    best = dist if best is None else min(best, dist)
+                    break
+        data_recency = best
 
     # Loop body geometry: bundle count and byte span from LS to LE.
     ls_pos = next((k for k, (a, _) in enumerate(bundles) if a == ls_addr), None) \
@@ -197,6 +221,7 @@ def classify(elf):
         "lat": lat[1],
         "body_bundles": body_bundles,
         "body_bytes": body_bytes,
+        "data_recency": data_recency,
     }
 
 
@@ -222,11 +247,11 @@ def main():
     print(f"seeds with PARTIAL-WORD store in LE bundle: {len(part)}")
     print()
     print(f"{'seed':<13}{'hw?':<4}{'st':<7}{'sreg':<5}{'producer':<9}{'lat':<5}"
-          f"{'dist':<5}{'body_b':<7}{'bytes':<6}")
+          f"{'dist':<5}{'body_b':<7}{'bytes':<6}{'recency':<8}")
     for s, h, i in part:
         print(f"{s:<13}{'Y' if h else '-':<4}{i['le_store']:<7}{i['sreg']:<5}"
               f"{str(i['prod_op']):<9}{i['lat_class']:<5}{str(i['prod_dist']):<5}"
-              f"{str(i['body_bundles']):<7}{str(i['body_bytes']):<6}")
+              f"{str(i['body_bundles']):<7}{str(i['body_bytes']):<6}{str(i['data_recency']):<8}")
 
 
 if __name__ == "__main__":

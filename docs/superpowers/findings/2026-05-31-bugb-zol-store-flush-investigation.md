@@ -3,9 +3,11 @@
 **Date:** 2026-05-31
 **Follow-on to:** `2026-05-30-buga-fix-and-retriage.md` (which flagged BUG-B)
 **Status:** Root cause understood; modeled to the best simple approximation and
-shipped. The exact flush condition is cycle-exact and under-sampled; a small
-known residual remains (documented below). Resolving it fully would need the
-aiesimulator oracle plus more commit samples than hardware naturally produces.
+shipped. The exact flush condition is **proven irreducibly cycle-exact** (see
+the recency experiment) -- no single static feature determines it. The shipped
+body-size heuristic is the best simple model for natural Peano output. **Next
+phase: a cycle-level pipeline model (aiesimulator oracle)**, for which the
+controlled recency dataset below is ideal validation fodder.
 
 ---
 
@@ -85,6 +87,43 @@ seed_1048 (flush) and seed_1086 (commit) are structurally indistinguishable:
 same 96-byte body, same `store + induction-add` LE bundle, same 1-bundle
 dist-1 ALU producer. The split is genuinely cycle-exact.
 
+### The recency experiment (the decisive scale test)
+
+The two known 96-byte commits (seed_1086 `i ^ (i + C)`, seed_1340 `i | (i - C)`)
+shared one feature: the store's data producer reads a register written in the
+**immediately-preceding bundle** ("data-input recency 1"), whereas every flush
+read a long-stable value (recency >= 5 or induction-sourced). Across the labeled
+corpus this separated cleanly -- the two commits were the *only* recency-1 cases.
+
+To test it rather than overfit two points, a fuzzer harvest mode
+(`XDNA_FUZZ_RECENCY1`, in `gen.rs`) forces every iteration's store value into a
+pure-induction-var two-op chain (`i op1 (i op2 C)`), mass-producing recency-1
+store-at-LE kernels (~5x the natural rate). A 2000-seed HW run gave the verdict:
+
+| body | recency | HW commit | HW flush |
+|------|---------|-----------|----------|
+| 96   | 1       | **22**    | 7        |
+| 96   | 2-4     | 0         | 4        |
+| 96   | >=5     | 1         | 49       |
+| 112  | 2-4     | 3         | 0        |
+| 112  | >=5     | 1         | 16       |
+
+**Recency is a strong but non-deterministic correlate.** At body-96, recency-1
+commits **76%** (22/29) vs **2%** for recency>=5 -- so data-input freshness
+genuinely drives the behavior. But 7/29 recency-1 cases still flushed, and the
+body-size rule itself broke on this distribution (body-112 mostly *flushed*
+here, where natural body-112 kernels commit). **No single static feature
+determines the outcome** -- body, recency, and producer are all
+distribution-dependent correlates, never determinants. This is the proof that
+the phenomenon is irreducibly cycle-exact and needs cycle-level simulation.
+
+The harvest produced a **rich controlled dataset** (~95 body-96 + ~20 body-112
+store-at-LE kernels with recency + HW labels) under
+`build/experiments/2026-05-31-recency1b/` -- reproducible via
+`XDNA_FUZZ_RECENCY1=1 ... fuzz --seed 1 --iterations 2000 --hw`. This is the
+validation set for the next-phase cycle model. `tools/classify_le_store.py` now
+emits a `data_recency` column.
+
 ---
 
 ## The shipped model: loop-body fetch-packet threshold
@@ -156,7 +195,11 @@ benign.
 
 - `tools/classify_le_store.py` -- disassemble every seed's core ELF, find the LE
   bundle's partial-word store, extract producer op/latency/distance and loop
-  body span. The workhorse for the discriminator search.
+  body span, plus the `data_recency` feature. The workhorse for the
+  discriminator search.
+- `src/fuzzer/gen.rs` `XDNA_FUZZ_RECENCY1` mode -- harvest mode that forces
+  recency-1 store-at-LE kernels (~5x natural rate) for the scale test; kept as a
+  research capability for the cycle-model phase.
 - `tools/body_size_sweep_compile.py` -- attempt to compile controlled-body-size
   kernels. Recorded as a NEGATIVE result: Peano will not reliably park a store
   at LE in hand-written kernels (it parks a register-op instead), so controlled
@@ -170,13 +213,32 @@ Disassembly oracle: `llvm-aie/install/bin/llvm-objdump -d --triple=aie2 <elf>`.
 
 ---
 
+## Next phase: cycle-level model (aiesimulator oracle)
+
+Static modeling is exhausted (proven, not assumed). The path to a correct model
+is cycle-level pipeline simulation:
+
+- **Oracle**: aiesimulator (`amd-unified-software/aietools`, cycle-approximate
+  `aie2simmsm`). Caveats from the aborted earlier attempt (this same doc's
+  history): `--aiesim` is incompatible with the Peano flow, so the buggy Peano
+  ELF must be ELF/CDO-swapped into a Chess-built sim package; it is also
+  license- + network-gated (may need an out-of-sandbox run). Prior flow shells
+  at `build/experiments/2026-05-13-chess-aiesim/`.
+- **Validation set**: the recency dataset at
+  `build/experiments/2026-05-31-recency1b/` -- ~95 body-96 + ~20 body-112
+  store-at-LE kernels with recency + real-HW flush/commit labels. The canonical
+  cycle-by-cycle discriminating pairs are seed_1048 (flush) vs seed_1086
+  (commit), and within the recency harvest, a recency-1 flush (e.g. seed_323)
+  vs a recency-1 commit (e.g. seed_59) -- structurally near-identical, opposite
+  outcome.
+- **Goal**: derive the true store-vs-back-edge-squash timing from the sim trace,
+  then model that runtime quantity in the EMU (it already tracks per-register
+  write cycles and a pending-store pipeline), replacing the body-size heuristic.
+
 ## Open follow-ups (separate from BUG-B)
 
 - **seed_1806** (widened sweep): non-ZOL kernel, EMU zeros idx 1 where HW keeps
   it. A distinct divergence; needs its own triage.
-- **The 96-byte flush/commit split**: if the aiesimulator oracle is ever stood
-  up, seed_1048 (flush) vs seed_1086 (commit) -- both 96B, store+induction at LE
-  -- are the canonical discriminating pair to trace cycle-by-cycle.
 
 ---
 
