@@ -95,6 +95,13 @@ pub struct PendingStore {
     pub width: super::super::bundle::slot::MemWidth,
     /// Cycle at which the data register is read and the write occurs.
     pub ready_cycle: u64,
+    /// PC of the bundle that issued this store.
+    ///
+    /// Used to model the AIE2 zero-overhead-loop back-edge: the fetch redirect
+    /// at LE flushes a store issued *in the LE bundle* (the redirect shadow),
+    /// while stores issued earlier in the body have already entered the
+    /// decoupled store pipeline and still commit. See `check_hardware_loop`.
+    pub issue_pc: u32,
 }
 
 /// Latency for partial-word store data register read (II_STHB operand 0).
@@ -427,6 +434,17 @@ impl ExecutionContext {
         let new_lc = lc - 1;
         self.scalar.write(super::registers::LC_REG_INDEX, new_lc);
         if new_lc > 0 {
+            // Back-edge: the program-control-unit redirects fetch from LE to LS.
+            // A partial-word store (st.s8/st.s16) issued *in the LE bundle* is in
+            // that redirect shadow and is flushed before it commits to memory --
+            // the every-4th-element drop seen on silicon for a Peano-unrolled i8
+            // loop that parks a store at LE. Stores issued earlier in the body
+            // have already entered the decoupled store pipeline (and commit at
+            // E11 even across the back-edge -- software pipelining relies on
+            // this), and loads/register writes retire into the register file, so
+            // only stores with issue_pc == LE are dropped.
+            self.pending_stores.retain(|ps| ps.issue_pc != le);
+
             let ls = self.scalar.read(super::registers::LS_REG_INDEX);
             self.pc = ls;
             log::debug!(
@@ -854,12 +872,18 @@ impl ExecutionContext {
             source,
             width,
             ready_cycle: self.cycles + PARTIAL_WORD_STORE_DATA_LATENCY,
+            issue_pc: self.pc,
         });
     }
 
     /// Check if there are pending stores waiting to commit.
     pub fn pending_stores_empty(&self) -> bool {
         self.pending_stores.is_empty()
+    }
+
+    /// Check if there are pending (deferred) register writes awaiting commit.
+    pub fn pending_writes_is_empty(&self) -> bool {
+        self.pending_writes.is_empty()
     }
 
     /// Drain pending stores whose data-read cycle has been reached.
@@ -1394,6 +1418,110 @@ mod tests {
         ctx.check_hardware_loop(0x17C);
         assert_eq!(ctx.pc(), 0x180); // Unchanged
         assert_eq!(ctx.scalar.read(LC_REG_INDEX), 5); // Unchanged
+    }
+
+    // =====================================================================
+    // Zero-overhead loop: in-flight store flush on the back-edge
+    // =====================================================================
+    //
+    // AIE2 partial-word stores (st.s8/st.s16) are read-modify-write and commit
+    // to data memory late (stage E11, ~11 cycles after issue; AM020 + AIE2
+    // Schedule.td). When a ZOL back-edge is taken, a store that has not yet
+    // reached its memory-commit stage is flushed by the program-control-unit
+    // pipeline redirect -- so a store parked in the last bundle before LE is
+    // lost on every back-edge and commits only on the final fall-through. This
+    // is the every-4th-element drop observed on silicon for a Peano-unrolled
+    // i8 loop. Loads/register writes are NOT flushed (they retire into the
+    // register file), which is why a load in the LE bundle survives.
+    // A still-pending store in the emulator is by definition not-yet-committed,
+    // so flushing the pending-store queue on the back-edge models this exactly:
+    // any correctly-scheduled store (committed >=11 cycles before LE) has
+    // already drained and is unaffected.
+
+    #[test]
+    fn zol_backedge_flushes_pending_store() {
+        use crate::interpreter::bundle::slot::MemWidth;
+        use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(LS_REG_INDEX, 0x100);
+        ctx.scalar.write(LE_REG_INDEX, 0x200);
+        ctx.scalar.write(LC_REG_INDEX, 3);
+
+        // A store issued in the LE bundle is still pending at the back-edge.
+        ctx.set_pc(0x200);
+        ctx.queue_pending_store(0x400, Operand::ScalarReg(1), MemWidth::Byte);
+        assert!(!ctx.pending_stores_empty());
+
+        ctx.check_hardware_loop(0x200); // back-edge: LC 3 -> 2
+        assert_eq!(ctx.pc(), 0x100);
+        assert!(
+            ctx.pending_stores_empty(),
+            "a store issued in the LE bundle must be flushed by the ZOL back-edge"
+        );
+    }
+
+    #[test]
+    fn zol_backedge_preserves_earlier_body_store() {
+        // A store issued by a body bundle (PC < LE) has already entered the
+        // store pipeline and commits across the back-edge -- only the LE-bundle
+        // store is in the fetch-redirect shadow. This is the seed_13 case the
+        // "flush all pending stores" model wrongly broke.
+        use crate::interpreter::bundle::slot::MemWidth;
+        use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(LS_REG_INDEX, 0x100);
+        ctx.scalar.write(LE_REG_INDEX, 0x200);
+        ctx.scalar.write(LC_REG_INDEX, 3);
+
+        // Store issued at a body bundle (0x1F0), still pending when LE is hit.
+        ctx.set_pc(0x1F0);
+        ctx.queue_pending_store(0x400, Operand::ScalarReg(1), MemWidth::Byte);
+        ctx.set_pc(0x200);
+
+        ctx.check_hardware_loop(0x200); // back-edge
+        assert!(
+            !ctx.pending_stores_empty(),
+            "an earlier body store (issue_pc != LE) must survive the back-edge"
+        );
+    }
+
+    #[test]
+    fn zol_final_iteration_keeps_pending_store() {
+        use crate::interpreter::bundle::slot::MemWidth;
+        use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(LS_REG_INDEX, 0x100);
+        ctx.scalar.write(LE_REG_INDEX, 0x200);
+        ctx.scalar.write(LC_REG_INDEX, 1); // last iteration
+
+        ctx.set_pc(0x200);
+        ctx.queue_pending_store(0x400, Operand::ScalarReg(1), MemWidth::Byte);
+        ctx.set_pc(0x204); // models advance_pc past the LE bundle
+
+        ctx.check_hardware_loop(0x200); // fall-through: LC 1 -> 0
+        assert_eq!(ctx.pc(), 0x204);
+        assert!(
+            !ctx.pending_stores_empty(),
+            "a store on the final (fall-through) iteration commits -- no flush"
+        );
+    }
+
+    #[test]
+    fn zol_backedge_preserves_pending_register_write() {
+        use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(LS_REG_INDEX, 0x100);
+        ctx.scalar.write(LE_REG_INDEX, 0x200);
+        ctx.scalar.write(LC_REG_INDEX, 3);
+
+        // A load (deferred register write) in the LE bundle -- must survive,
+        // unlike a memory store. This is the seed_13 case the crude squash broke.
+        ctx.set_pc(0x200);
+        ctx.queue_scalar_load(Operand::ScalarReg(5), 0xDEAD, 7);
+        assert!(!ctx.pending_writes_is_empty());
+
+        ctx.check_hardware_loop(0x200); // back-edge
+        assert!(!ctx.pending_writes_is_empty(), "loads/register writes are NOT flushed by the back-edge");
     }
 
     // =====================================================================
