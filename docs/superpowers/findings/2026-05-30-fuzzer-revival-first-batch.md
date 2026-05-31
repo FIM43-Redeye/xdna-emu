@@ -1,5 +1,11 @@
 # Findings: First EMU+HW Differential Batch (M4)
 
+> **RESOLVED (2026-05-30).** BUG-A (the all-zeros blocker described below) is
+> fixed in commit `87b3d03`; a re-run took the pass rate from 0% to 76%. This
+> document is preserved as the original diagnosis. For the fix and the
+> post-fix re-triage (including the remaining sub-word divergence, BUG-B), see
+> `2026-05-30-buga-fix-and-retriage.md`.
+
 **Date:** 2026-05-30  
 **Task:** T6 -- M4 EMU+HW differential batch  
 **Run range:** seeds 1..2000 (Peano compiler, scalar single-tile kernel, trace-sweep OFF)

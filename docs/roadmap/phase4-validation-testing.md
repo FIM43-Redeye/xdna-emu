@@ -137,7 +137,7 @@ These items are from the original Phase 4 plan and remain relevant.
 | Hardware comparison tests | VERIFIED | `scripts/emu-bridge-test.sh` runs HW + EMU and diffs outputs; trace-sweep compares cycle counts |
 | Fuzzing for decoder robustness | Not started | |
 | Property-based testing for DMA addressing | Not started | |
-| Differential kernel fuzzer | Revived (scalar), blocked by BUG-A | `cargo run -- fuzz`; EMU+HW differential, Peano, single-tile scalar. In-process EMU path stalls shim DMA (BUG-A) -> not yet a correctness gate. Vector/Chess deferred. See docs/fuzzer-usage.md + findings/2026-05-30-fuzzer-revival-first-batch.md |
+| Differential kernel fuzzer | Working gate (scalar); BUG-A fixed, 76% pass | `cargo run -- fuzz`; EMU+HW differential, Peano, single-tile scalar. BUG-A fixed (firmware column power-on) -> 0%->76% pass over 2000 seeds. Remaining divergences are one sub-word pattern (BUG-B, likely a fuzzer NPU-readback artifact). Vector/Chess deferred. See docs/fuzzer-usage.md + findings/2026-05-30-buga-fix-and-retriage.md |
 
 ### Differential Kernel Fuzzer
 
@@ -146,12 +146,23 @@ The differential loop (generate -> Peano-compile -> EMU + NPU -> byte-diff)
 works and the in-sandbox HW path is proven. See
 [docs/fuzzer-usage.md](../fuzzer-usage.md) for full invocation details.
 
-**Current blocker (BUG-A):** the in-process EMU path (`XclbinSuite`) stalls
-shim DMA at `BdSetup`, so the emulator returns all-zeros for every fuzz kernel
-and every non-trivial seed appears to diverge for that one reason. The XRT
-bridge path is unaffected. Until BUG-A is fixed the fuzzer is not a useful
-correctness gate. See
-`docs/superpowers/findings/2026-05-30-fuzzer-revival-first-batch.md`.
+**BUG-A fixed (commit `87b3d03`).** The in-process EMU path (`XclbinSuite`)
+never emulated firmware's column power-on (`Column_Clock_Control = 0x1` per
+partition column -- a driver/firmware action, never in the user CDO), so every
+column booted gated and the shim DMA froze at `BdSetup`, returning all-zeros.
+The fix shares one firmware primitive (`DeviceState::assign_partition_columns`)
+between the in-process runner and the XRT-plugin FFI hook. Over a 2000-seed
+`--hw` batch the pass rate went **0% -> 76%** (95% counting legitimate
+all-zero outputs). Two secondary bugs surfaced once the EMU actually executed
+kernels: a shift negate-overflow on `i32::MIN` (commit `d974515`) and a fuzzer
+harness that couldn't survive an emulator panic (now a loud CRASH category,
+commit `e5457c5`).
+
+**Remaining (BUG-B):** the only material divergence class left is sub-word
+(i8/i16) -- the NPU output zeros every 4th element while the EMU computes the
+C-correct value; i32 is flawless. Leading hypothesis is a fuzzer NPU-readback
+artifact, not an emulator bug (to be confirmed). Full analysis in
+`docs/superpowers/findings/2026-05-30-buga-fix-and-retriage.md`.
 
 **Scope**: single-tile scalar ops (arith/bitwise/shift/branch/hw-loop),
 Peano-compiled, i8/i16/i32. Vector ops and Chess are planned next phases.
