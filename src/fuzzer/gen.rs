@@ -27,7 +27,14 @@ pub fn generate(seed: u64) -> FuzzParams {
         LoopStyle::HardwareLoop
     };
 
-    let num_ops = 2 + (rng.next() % 7) as usize; // 2-8 ops
+    // 1-16 ops. Widened from the original 2-8: a larger op count produces
+    // longer unrolled loop bodies, which broadens coverage of the scalar
+    // pipeline and -- critically for the AIE2 ZOL store-flush boundary --
+    // pushes loop bodies past the six-fetch-packet (96-byte) range up to eight
+    // packets and beyond, exercising both the flush and commit regimes of the
+    // back-edge store squash. A single op already yields a six-packet body, so
+    // the floor is unchanged; the gain is at the top end.
+    let num_ops = 1 + (rng.next() % 16) as usize; // 1-16 ops
     let mut ops = Vec::with_capacity(num_ops + 1);
 
     for _ in 0..num_ops {
