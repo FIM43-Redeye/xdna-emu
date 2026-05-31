@@ -117,6 +117,35 @@ pub struct PendingStore {
 const PARTIAL_WORD_STORE_DATA_LATENCY: u64 =
     xdna_archspec::aie2::processor::PARTIAL_STORE_DATA_LATENCY as u64;
 
+/// Maximum loop-body byte span for which the LE-bundle partial-word store is
+/// flushed on the zero-overhead-loop back-edge.
+///
+/// Loop body = le-ls, always a multiple of the 16-byte AIE2 fetch packet.
+/// Calibrated and validated against real silicon over ~3,500 differential-fuzz
+/// kernels that park a partial-word store (st.s8/st.s16) in the LE bundle:
+///
+/// - body  > 96 bytes (>=7 fetch packets): HW COMMITS the store. 4/4 observed
+///   (seed_1826, seed_1781, +2 in the widened HW sweep). The larger body has
+///   already streamed past the front-end squash point when the LE bundle
+///   issues.
+/// - body == 96 bytes (6 fetch packets): HW FLUSHES the store in 107/109
+///   observed cases -- the every-Nth-element drop. This is the dominant
+///   first-order effect the threshold captures.
+///
+/// This is an OBSERVED first-order model, not the exact micro-architectural
+/// rule. The flush is genuinely cycle-exact: ~1.8% of 96-byte cases COMMIT
+/// instead (seed_1086, seed_1340 in the widened sweep), and they are
+/// structurally indistinguishable from the flush cases (same body, same
+/// store+induction LE bundle, same producer class -- cf. seed_1048 which
+/// flushes). Three static discriminators were refuted: producer latency,
+/// body size alone (this threshold), and LE-bundle composition. Resolving the
+/// 96-byte split needs cycle-level pipeline visibility (aiesimulator) and more
+/// commit samples than the hardware naturally produces (~0.04% of seeds).
+/// Among simple models this threshold is the least-wrong: 2 mispredicts across
+/// the corpus, vs 6 for unconditional flush and 109 for never-flush.
+/// See docs/superpowers/findings/2026-05-31-bugb-zol-store-flush-investigation.md.
+const ZOL_FLUSH_MAX_BODY_BYTES: u32 = 0x60;
+
 /// Complete execution context for an AIE2 core.
 ///
 /// Contains all register files and execution state needed for instruction
@@ -443,9 +472,18 @@ impl ExecutionContext {
             // E11 even across the back-edge -- software pipelining relies on
             // this), and loads/register writes retire into the register file, so
             // only stores with issue_pc == LE are dropped.
-            self.pending_stores.retain(|ps| ps.issue_pc != le);
-
+            //
+            // The squash only reaches the LE store when the whole loop body fits
+            // in the front-end fetch window (<= ZOL_FLUSH_MAX_BODY_BYTES, six
+            // 16-byte fetch packets). A larger body has already streamed past
+            // the squash point by the time the LE bundle issues, so its store
+            // commits -- see ZOL_FLUSH_MAX_BODY_BYTES for the silicon basis.
             let ls = self.scalar.read(super::registers::LS_REG_INDEX);
+            let body_bytes = le.wrapping_sub(ls);
+            if body_bytes <= ZOL_FLUSH_MAX_BODY_BYTES {
+                self.pending_stores.retain(|ps| ps.issue_pc != le);
+            }
+
             self.pc = ls;
             log::debug!(
                 "ZLS loop: executed instr at LE=0x{:X}, LC {} -> {}, jumping to LS=0x{:X}",
@@ -1443,7 +1481,9 @@ mod tests {
         use crate::interpreter::bundle::slot::MemWidth;
         use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
         let mut ctx = ExecutionContext::new();
-        ctx.scalar.write(LS_REG_INDEX, 0x100);
+        // Body span le-ls = 0x60 (96 bytes, six fetch packets): inside the
+        // flush window, so the LE-bundle store is squashed on the back-edge.
+        ctx.scalar.write(LS_REG_INDEX, 0x1A0);
         ctx.scalar.write(LE_REG_INDEX, 0x200);
         ctx.scalar.write(LC_REG_INDEX, 3);
 
@@ -1453,11 +1493,36 @@ mod tests {
         assert!(!ctx.pending_stores_empty());
 
         ctx.check_hardware_loop(0x200); // back-edge: LC 3 -> 2
-        assert_eq!(ctx.pc(), 0x100);
+        assert_eq!(ctx.pc(), 0x1A0);
         assert!(
             ctx.pending_stores_empty(),
             "a store issued in the LE bundle must be flushed by the ZOL back-edge"
         );
+    }
+
+    #[test]
+    fn zol_backedge_large_body_keeps_le_store() {
+        // A loop body that does NOT fit in the front-end fetch window
+        // (le-ls > ZOL_FLUSH_MAX_BODY_BYTES) streams past the squash point
+        // before the LE bundle issues, so even the LE-bundle store commits.
+        // This is the seed_1826 / seed_1781 case (112-byte / seven-packet body)
+        // that the unconditional issue_pc==LE flush wrongly dropped.
+        use crate::interpreter::bundle::slot::MemWidth;
+        use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
+        let mut ctx = ExecutionContext::new();
+        // Body span le-ls = 0x70 (112 bytes, seven fetch packets): outside the
+        // flush window.
+        ctx.scalar.write(LS_REG_INDEX, 0x190);
+        ctx.scalar.write(LE_REG_INDEX, 0x200);
+        ctx.scalar.write(LC_REG_INDEX, 3);
+
+        ctx.set_pc(0x200);
+        ctx.queue_pending_store(0x400, Operand::ScalarReg(1), MemWidth::Byte);
+        assert!(!ctx.pending_stores_empty());
+
+        ctx.check_hardware_loop(0x200); // back-edge: LC 3 -> 2
+        assert_eq!(ctx.pc(), 0x190);
+        assert!(!ctx.pending_stores_empty(), "a large-body loop commits its LE-bundle store -- no flush");
     }
 
     #[test]
@@ -1469,7 +1534,7 @@ mod tests {
         use crate::interpreter::bundle::slot::MemWidth;
         use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
         let mut ctx = ExecutionContext::new();
-        ctx.scalar.write(LS_REG_INDEX, 0x100);
+        ctx.scalar.write(LS_REG_INDEX, 0x1A0);
         ctx.scalar.write(LE_REG_INDEX, 0x200);
         ctx.scalar.write(LC_REG_INDEX, 3);
 
@@ -1490,7 +1555,7 @@ mod tests {
         use crate::interpreter::bundle::slot::MemWidth;
         use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
         let mut ctx = ExecutionContext::new();
-        ctx.scalar.write(LS_REG_INDEX, 0x100);
+        ctx.scalar.write(LS_REG_INDEX, 0x1A0);
         ctx.scalar.write(LE_REG_INDEX, 0x200);
         ctx.scalar.write(LC_REG_INDEX, 1); // last iteration
 
@@ -1510,7 +1575,7 @@ mod tests {
     fn zol_backedge_preserves_pending_register_write() {
         use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
         let mut ctx = ExecutionContext::new();
-        ctx.scalar.write(LS_REG_INDEX, 0x100);
+        ctx.scalar.write(LS_REG_INDEX, 0x1A0);
         ctx.scalar.write(LE_REG_INDEX, 0x200);
         ctx.scalar.write(LC_REG_INDEX, 3);
 

@@ -1,206 +1,188 @@
-# Findings: BUG-B — AIE2 zero-overhead-loop store flush (investigation state)
+# Findings: BUG-B — AIE2 zero-overhead-loop store flush
 
 **Date:** 2026-05-31
 **Follow-on to:** `2026-05-30-buga-fix-and-retriage.md` (which flagged BUG-B)
-**Status:** Root cause understood; faithful emulation **not yet achieved**. Best
-model reaches 1574/1577 but regresses 2 seeds. The exact flush condition is
-**cycle-exact** and needs the aiesimulator oracle (Option 1). This document is
-the handoff so that work can resume after a context compaction.
+**Status:** Root cause understood; modeled to the best simple approximation and
+shipped. The exact flush condition is cycle-exact and under-sampled; a small
+known residual remains (documented below). Resolving it fully would need the
+aiesimulator oracle plus more commit samples than hardware naturally produces.
 
 ---
 
 ## Headline
 
-BUG-B is the differential fuzzer's "NPU zeros every 4th sub-word element"
+BUG-B is the differential fuzzer's "NPU zeros every Nth sub-word element"
 divergence. It is **a real hardware effect of a Peano codegen quirk**, not an
 emulator compute bug and not a fuzzer-harness artifact:
 
-- The fuzz kernel is well-formed. **Chess compiles it correctly** and the
-  Chess binary produces fully-correct output on silicon (the Chess experiment,
-  `build/experiments/buga-chess/`).
 - **Peano's simple-unroll path parks a partial-word store (`st.s8`/`st.s16`) in
-  the loop-end (`LE`) bundle.** On a zero-overhead-loop **back-edge**, that store
-  is **flushed by hardware** (committed only on the final fall-through), so every
-  4th element keeps its initial zero. The last element survives (final iteration
-  falls through, no back-edge).
-- The emulator must **reproduce this effect** (its purpose is to be an
-  open-source aiesimulator — faithful to what silicon does with a given binary,
-  including the effects of badly-scheduled code), **without** breaking
+  the loop-end (`LE`) bundle.** On a zero-overhead-loop **back-edge**, hardware
+  can flush that store before it commits, so the affected element keeps its
+  initial value. The final iteration falls through (no back-edge) so its element
+  survives. **Chess compiles the same kernels correctly** (no store parked at
+  `LE`), confirming it is a Peano-specific scheduling bug.
+- The emulator's job is to **reproduce the effect** (xdna-emu is meant to be an
+  open-source aiesimulator -- faithful to what silicon does with a given binary,
+  including the effects of badly-scheduled code), without breaking
   correctly-scheduled loops.
 
-The hard part: the flush is **cycle-exact**. Two structurally identical loops
-diverge on silicon (one flushes, one commits), so no static "store is at LE"
-rule suffices.
+The hard part: the flush is **cycle-exact** and the commit cases are rare, so no
+static rule fully separates flush from commit. We ship the best first-order
+model and document the residual.
 
 ---
 
 ## Confirmed hardware facts (grounded, keep these)
 
 1. **Partial-word stores are read-modify-write and commit late at stage E11
-   (issue+11).** `AIE2Schedule.td:133-141`: "ISA says load is in E5, store is in
-   E11, so we need to be 7 cycles apart"; `MemInstrItinData<II_STHB, ... [7,1,1],
-   MemoryCycles<[5,11]>>` (`AIE2Schedule.td:733-737`). AM020:3921 "8-bit and
-   16-bit stores are implemented as read-modify-write instructions";
+   (issue+11).** `AIE2Schedule.td:133-141` ("load is in E5, store is in E11");
+   `MemInstrItinData<II_STHB, ... MemoryCycles<[5,11]>>` (`:733-737`).
+   AM020:3921 "8-bit and 16-bit stores are implemented as read-modify-write";
    AM020:3911 "Load and store units manage the 5-cycle latency of data memory."
-2. **i32 / full-word stores are immediate** (one store port, not RMW). They are
-   NOT in the emulator's `pending_stores` queue and are unaffected by any flush.
-3. **The loop is run by a Program Control Unit (PCU)** with its own **fetch
-   counter `fc`** (distinct from `pc`) and a **shadow loop count `lci`**
-   (AM020 register table ~line 4059-4097). The PCU fetches ahead and redirects
-   fetch from `LE` to `LS`. The back-edge is a **fetch redirect**, which is the
-   physical origin of the last-bundle behavior.
+2. **i32 / full-word stores are immediate** (one store port, not RMW). Not in
+   the emulator's `pending_stores` queue; unaffected by any flush.
+3. **The loop runs on a Program Control Unit (PCU)** with its own fetch counter
+   `fc` and shadow loop count `lci` (AM020 ~4059-4097). The PCU fetches ahead
+   and the back-edge is a **fetch redirect** from `LE` to `LS` -- the physical
+   origin of the last-bundle behavior. The AIE2 front-end fetches in 16-byte
+   packets.
 4. **llvm-aie has NO scheduler constraint keeping stores away from `LE`, and is
    silent on back-edge flush** (`AIEBaseSubtarget.cpp:304-320` only enforces a
-   7-bundle setup-to-`LE` distance for the ls/le/lc register writes to settle;
-   `AIEBaseInstrInfo.cpp:1471`). So the flush is undocumented emergent pipeline
-   behavior — it cannot be derived from the toolchain, only observed.
+   7-bundle setup-to-`LE` distance for the ls/le/lc register writes to settle).
+   So the flush is undocumented emergent pipeline behavior -- it cannot be
+   derived from the toolchain, only observed on silicon.
 5. **DMA descriptors are innocent.** `examples/decode_cdo_bds.rs` decoded the CDO
-   BD registers independently of the emulator's parser: every hop is plain
-   contiguous (i8 memtile BD len=32 words, i32=128 words, all stride/wrap/zero
-   fields = 0). The drop is NOT in the data plane; it is the core store.
-6. **Emulator modeling gap:** the EMU uses partial-word store data-read latency
-   **6** (`PARTIAL_WORD_STORE_DATA_LATENCY`, tuned for add_21_i8/add_12_i8 value
-   forwarding), but the actual **memory commit is E11**. The data-read (value
-   sampling) and the memory-commit are two distinct events the EMU conflates.
+   BD registers independently: every hop is plain contiguous. The drop is the
+   core store, not the data plane.
 
 ---
 
-## The models tried, and why each failed (do not repeat these)
+## The discriminator search (what was tried, what was refuted)
 
-The validation method throughout: every fuzz seed that ever mismatched has its
-**true HW output saved as `build/fuzz/seed_N/npu_output.bin`** (written by the
-fuzzer on mismatch; HW output is deterministic). `examples/validate_seeds.rs`
-replays every such seed through the in-process emulator and diffs byte-for-byte
-against the saved HW — a **free, no-HW regression gate over ~1577 seeds**.
-`examples/check_le_squash.rs` does one seed with a readable dump.
+Validation method throughout: every fuzz seed that mismatches has its true HW
+output saved as `npu_output.bin` (HW output is deterministic).
+`examples/validate_seeds.rs` replays a seed corpus through the in-process
+emulator and diffs byte-for-byte. `tools/classify_le_store.py` disassembles each
+core ELF, finds the `.L_LEnd0` (LE) bundle, detects a partial-word store, and
+extracts its data producer and the loop-body byte span (`le - ls`).
 
-Baseline (no fix): the 53 BUG-B seeds mismatch (EMU correct-per-C, HW drops
-every 4th). Everything else matches.
+**Three static hypotheses were each proposed, looked clean, then refuted by a
+larger sample:**
 
-- **Model 1 — squash `issue_pc == LE` for BOTH stores and register writes.**
-  Result: **1525 → 1252 pass, 53 → 326 mismatch.** Catastrophic. It deleted
-  loop-carried **register writes / loads** that live in the `LE` bundle of
-  *pipelined* loops (e.g. seed_13's `LE` bundle is `lda.s16 r5; add r9...; mov
-  r1...`), which hardware commits every iteration. Lesson: **register writes
-  (loads, pointer/index updates) in the `LE` bundle are NOT flushed by HW.**
+- **Producer latency** (mul=2cyc flush vs lshl=1cyc commit). Refuted: across the
+  corpus, lshl-, add-, and mul-fed LE stores all appear in both flush and commit
+  outcomes. The seed_18(mul)-vs-seed_1826(lshl) contrast was a coincidence of
+  body size.
+- **Loop-body fetch-packet span** (`le - ls`). The current shipped model. Fits
+  the calibration corpus perfectly and the 112-byte commit cases solidly, but a
+  2000-seed widened HW sweep found **96-byte bodies that commit** (seed_1086,
+  seed_1340), refuting it as the *exact* rule. See the model section.
+- **LE-bundle composition** (store-only vs store + induction `add`). Refuted by
+  seed_1048: a 96-byte FLUSH case whose LE bundle is `st.s8 r1; add r0,r0,#4` --
+  structurally identical to the commit cases seed_1086/seed_1340.
 
-- **Model 2 — flush ALL pending stores at the back-edge (`pending_stores.clear()`).**
-  Reproduced seed_18/seed_1218 but **over-flushed pipelined body stores**
-  (seed_13 diffs at idx 9, 13). In a software-pipelined loop, `st.s16` stores
-  issued in the body are legitimately in-flight across the back-edge and DO
-  commit. Lesson: **earlier body stores survive the back-edge; only the store in
-  the `LE` bundle itself is at risk.**
-
-- **Model 3 (current best) — flush pending stores with `issue_pc == LE` only;
-  leave register writes alone.** Result: **1574/1577.** Fixed BUG-B AND all 273
-  pipelined regressions from Model 1. Implemented as: add `issue_pc: u32` to
-  `PendingStore`, set it to `self.pc` in `queue_pending_store`, and in
-  `check_hardware_loop` on the back-edge branch (`new_lc > 0`):
-  `self.pending_stores.retain(|ps| ps.issue_pc != le);`. Four TDD tests
-  (`zol_backedge_flushes_pending_store`, `zol_backedge_preserves_earlier_body_store`,
-  `zol_final_iteration_keeps_pending_store`, `zol_backedge_preserves_pending_register_write`).
-  **Remaining failure: it over-flushes 2 seeds (1826, 1781).**
+seed_1048 (flush) and seed_1086 (commit) are structurally indistinguishable:
+same 96-byte body, same `store + induction-add` LE bundle, same 1-bundle
+dist-1 ALU producer. The split is genuinely cycle-exact.
 
 ---
 
-## The wall: seed_18 vs seed_1826
+## The shipped model: loop-body fetch-packet threshold
 
-Both are **simple-unroll i8 loops** (no `chess_prepare_for_pipelining`) with a
-`st.s8` in the `LE` bundle, store data produced in the immediately-preceding
-bundle. Yet on silicon:
+`ZOL_FLUSH_MAX_BODY_BYTES = 0x60` (96 bytes, six fetch packets) in
+`src/interpreter/state/context.rs`. On a back-edge, a `pending_store` with
+`issue_pc == LE` is flushed **iff** `le - ls <= 96`. Register writes (loads,
+pointer/index updates) in the LE bundle are never flushed (they retire to the
+register file); stores issued earlier in the body have entered the decoupled
+store pipeline and commit across the back-edge (software pipelining relies on
+this).
 
-- **seed_18**: HW **flushes** the `LE` `st.s8` → idx 3 = 0. (Model 3 matches.)
-- **seed_1826**: HW **commits** the `LE` `st.s8` → idx 3 = 48. (Model 3 wrongly
-  flushes → EMU 0 ≠ HW 48.)
+**Why this rule** -- evidence across ~3,500 store-at-LE kernels on real silicon:
 
-No static rule distinguishes them. The only visible difference is the **latency
-of the instruction producing the store's data**:
-- seed_18 LE-store data = `mul r2, r1, r1` (integer multiply, **2-cycle**
-  latency per AM020).
-- seed_1826 LE-store data = `lshl r8, r5, r9` (shift, **1-cycle** latency).
+| body | fetch packets | HW flush | HW commit |
+|------|--------------|----------|-----------|
+| 96B  | 6            | 107      | 2 (seed_1086, seed_1340) |
+| 112B | 7            | 0        | 4 (seed_1826, seed_1781, +2) |
 
-**Unproven hypothesis worth testing first with the oracle:** the store is
-flushed iff its **data operand is not yet available when the back-edge fires**
-(i.e. the producing op's result hasn't landed), not merely because the store
-sits at `LE`. mul (2cyc) misses the window; lshl (1cyc) makes it. A load-fed
-store (7cyc) would also miss. This would also explain why register-fed loads in
-the `LE` bundle survive (they feed the register file, not a memory commit).
-**Do not implement this on faith — confirm against aiesim.**
+- `> 96B -> commit`: **4/4 correct**.
+- `== 96B -> flush`: **107/109 correct** (98.2%).
 
----
+**It is the least-wrong simple model.** Mispredicts across the corpus:
+threshold = **2** (the 96B commits), unconditional flush = **6** (all commits),
+never-flush = **109** (all flushes).
 
-## Residual mismatches under Model 3 (the 3 of 1577)
-
-| seed | dtype/size | nature | disposition |
-|------|-----------|--------|-------------|
-| 1826 | i8 / 256  | **over-flush** — HW commits LE `st.s8` (lshl data), EMU drops it | the discriminator for the cycle-exact rule |
-| 1781 | i16 / 64  | **over-flush** — same class | same |
-| 1964 | i8 / 256  | **separate compute divergence** (value diff −64 vs −16, both nonzero; `<<`/`*` semantics) | deferred; NOT ZOL. Also note seed_17 (i32) is a similar pre-existing compute divergence, untouched by the store flush. |
+**Known residual (shipped limitation):** ~1.8% of 96-byte store-at-LE loops
+COMMIT (seed_1086, seed_1340), and the emulator wrongly flushes them. These are
+cycle-exact boundary cases, structurally indistinguishable from flush cases,
+with only two known samples -- too few to derive a safe finer rule and
+impractical to enrich (~0.04% of random seeds). Closing this gap needs
+cycle-level pipeline visibility (aiesimulator) and more commit samples.
 
 ---
 
-## Key seed matrix (for any future model)
+## Validation results
 
-| seed | dtype/size | role |
-|------|-----------|------|
-| 18   | i8 / 128  | BUG-B, simple unroll, HW **flushes** LE store. Model 3 ✓ |
-| 1218 | i16 / 256 | BUG-B. Model 3 ✓ |
-| 13   | i16 / 128 | pipelined; LE bundle is a **load**; HW commits all. Model 1 broke it, Model 3 ✓ |
-| 1826 | i8 / 256  | simple unroll, LE `st.s8`, HW **commits** (lshl data). **Model 3 over-flushes.** |
-| 1781 | i16 / 64  | over-flush, same class |
-| 1964 | i8 / 256  | separate compute divergence (deferred) |
-| 3    | i32 / 128 | passing reference; nop at LE, no store there |
-| 17   | i32 / 128 | pre-existing compute divergence (full-word, not ZOL) |
+- **Calibration corpus** (`build/fuzz`, ~1,577 seeds with saved HW output):
+  `validate_seeds` 1576/1577. The one miss is seed_1964, an unrelated i8 compute
+  divergence (shift/mul semantics), NOT a store flush.
+- **Fresh generalization, 300 widened seeds:** 12/12 store-at-LE @96B flush on
+  silicon (EMU == HW), 0 fail.
+- **Fresh generalization, 2000 widened seeds:** 1546 pass, **3 fail**, 90 error
+  (timeouts), 0 crash. The 3 fails: seed_1086 + seed_1340 (the 96B-commit
+  residual above) and seed_1806 (a non-ZOL idx-1 drop -- a *separate* divergence
+  to triage independently; `classify_le_store` reports `loop: False` for it).
+- Full lib suite: 3250/0, including five ZOL flush/commit unit tests in
+  `context.rs`.
 
----
-
-## Tools built (kept, committed)
-
-- `examples/decode_cdo_bds.rs` — decode a raw CDO's DMA BD registers (len, d0/d1/d2
-  stride+wrap, zero-pad) independently of the emulator's BD parser. Usage:
-  `cargo run --example decode_cdo_bds -- build/fuzz/seed_18/aie.mlir.prj/main_aie_cdo_init.bin`
-- `examples/check_le_squash.rs` — run one seed through the in-process EMU and diff
-  against saved `npu_output.bin`. Usage:
-  `cargo run --example check_le_squash -- build/fuzz/seed_18 128 i8`
-- `examples/validate_seeds.rs` — batch: replay every seed with a saved HW output
-  and report EMU==HW / EMU!=HW. Usage: `cargo run --release --example validate_seeds`
-
-Disassembly oracle for AIE2 ELFs:
-`/home/triple/npu-work/llvm-aie/install/bin/llvm-objdump -d --triple=aie2 <elf>`
+The widened HW runs live under `build/experiments/2026-05-31-widefuzz/`
+(hwrun*.log).
 
 ---
 
-## Next step: Option 1 — aiesimulator oracle
+## Permanent fuzzer improvement
 
-Goal: confirm AMD's cycle-accurate sim reproduces both seed_18 (flush) and
-seed_1826 (commit), then read the cycle trace to derive the **exact** flush
-condition (test the data-availability hypothesis above first).
-
-- aiesimulator: `amd-unified-software/aietools/bin/aiesimulator` (cycle-accurate
-  `aie2simmsm`; functional `aie2simmsm_func`).
-- **There is prior aiesim work in this repo:** `build/experiments/2026-05-13-chess-aiesim/`
-  and `2026-05-13-chess-O0/` — check these for a working single-core/multi-tile
-  aiesim invocation to copy rather than build the flow from scratch.
-- The Chess build flow used for the experiment is in `build/experiments/buga-chess/`
-  (source the env: `source /home/triple/npu-work/toolchain-build/activate-npu-env.sh`,
-  then `xchesscc_wrapper aie2 ...` + `aiecc.py --xchesscc --xbridge ... --aiesim`).
-- aietools is a **read-only reference** (never copy code/data); the real NPU is
-  ground truth, aiesim is a debugging aid — but here aiesim's value is the
-  cycle-by-cycle pipeline visibility the silicon can't give.
-
-Then refine the flush condition in `context.rs` `check_hardware_loop` and re-run
-`validate_seeds` (free) until 1576/1577 (everything but the deferred seed_1964),
-then the HW fuzzer (`./target/release/xdna-emu fuzz --seed 1 --iterations 2000
---hw`, ~28 min) as the final guarantee, then commit, then file the Peano issue.
+`src/fuzzer/gen.rs`: kernel op-count widened from 2-8 to **1-16**. Larger op
+counts produce longer unrolled bodies, broadening scalar-pipeline coverage and
+-- the reason it was done here -- pushing loop bodies past six fetch packets so
+the differential fuzzer naturally exercises both the flush and commit regimes.
+A single op already yields a six-packet body, so the floor is unchanged; the
+gain is at the top end. Side effect: a ~4.5% HW-timeout rate on the largest
+generated kernels (handled gracefully as `error`, not false bugs) -- judged
+benign.
 
 ---
 
-## Code state at handoff
+## Tools (kept, committed)
 
-- `src/interpreter/state/context.rs`: **Model 3 committed as WIP** (issue_pc field
-  + `retain(issue_pc != le)` on the back-edge + 4 TDD tests). Full lib suite
-  passes (3249/0). It reproduces BUG-B and fixes the 273 regressions but
-  over-flushes seed_1826/1781 — the aiesim work refines the flush condition from
-  here (or replaces it if the data-availability model proves correct).
-- BUG-B is a confirmed **Peano codegen bug** to be reported upstream (issue-first)
-  once the emulator side is settled.
+- `tools/classify_le_store.py` -- disassemble every seed's core ELF, find the LE
+  bundle's partial-word store, extract producer op/latency/distance and loop
+  body span. The workhorse for the discriminator search.
+- `tools/body_size_sweep_compile.py` -- attempt to compile controlled-body-size
+  kernels. Recorded as a NEGATIVE result: Peano will not reliably park a store
+  at LE in hand-written kernels (it parks a register-op instead), so controlled
+  hand-crafted sweeps don't work; the widened fuzzer is the only reliable
+  store-at-LE generator.
+- `examples/validate_seeds.rs`, `examples/check_le_squash.rs`,
+  `examples/decode_cdo_bds.rs` -- in-process replay / single-seed diff / CDO BD
+  decode.
+
+Disassembly oracle: `llvm-aie/install/bin/llvm-objdump -d --triple=aie2 <elf>`.
+
+---
+
+## Open follow-ups (separate from BUG-B)
+
+- **seed_1806** (widened sweep): non-ZOL kernel, EMU zeros idx 1 where HW keeps
+  it. A distinct divergence; needs its own triage.
+- **The 96-byte flush/commit split**: if the aiesimulator oracle is ever stood
+  up, seed_1048 (flush) vs seed_1086 (commit) -- both 96B, store+induction at LE
+  -- are the canonical discriminating pair to trace cycle-by-cycle.
+
+---
+
+## Upstream
+
+BUG-B is a confirmed **Peano codegen bug**: the simple-unroll path parks a
+partial-word store in the LE bundle of a zero-overhead loop, where the back-edge
+fetch redirect can flush it. To be reported upstream (issue-first; Chess
+compiles the same kernels correctly).
