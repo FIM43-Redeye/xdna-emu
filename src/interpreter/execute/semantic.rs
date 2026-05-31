@@ -618,7 +618,8 @@ fn execute_ashl_bidir(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         let shift = (b as u32) & 0x1F;
         a << shift
     } else {
-        let shift = ((-b) as u32) & 0x1F;
+        // `wrapping_neg` avoids overflow on b == i32::MIN; see execute_lshl_bidir.
+        let shift = (b.wrapping_neg() as u32) & 0x1F;
         ((a as i32) >> shift) as u32
     };
     write_dest(op, ctx, result);
@@ -635,7 +636,10 @@ fn execute_lshl_bidir(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         let shift = (b as u32) & 0x1F;
         a << shift
     } else {
-        let shift = ((-b) as u32) & 0x1F;
+        // `wrapping_neg` avoids overflow on b == i32::MIN (negating it is UB in
+        // debug); the magnitude is masked to 5 bits anyway, and
+        // (i32::MIN mod 32) == 0, so this yields a logical right shift by 0.
+        let shift = (b.wrapping_neg() as u32) & 0x1F;
         a >> shift
     };
     write_dest(op, ctx, result);
@@ -948,6 +952,64 @@ mod tests {
 
         assert!(execute_semantic(&op, &mut ctx));
         assert_eq!(ctx.scalar_read(3), 30);
+    }
+
+    /// Helper: run LshlBidir with scalar a (reg 1), shift b (reg 2), dest reg 3.
+    fn run_lshl_bidir(a: u32, b: i32) -> u32 {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, a);
+        ctx.scalar.write(2, b as u32);
+        let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::LshlBidir);
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        ctx.scalar_read(3)
+    }
+
+    #[test]
+    fn lshl_bidir_min_shift_count_does_not_overflow() {
+        // Regression: shift operand i32::MIN made `-b` overflow and panic.
+        // The shift amount is masked to 5 bits, and (i32::MIN mod 32) == 0,
+        // so a negative shift of i32::MIN is a logical right shift by 0 = a.
+        let a = 0x1234_5678;
+        assert_eq!(run_lshl_bidir(a, i32::MIN), a, "i32::MIN shift -> shift-by-0 (no overflow)");
+    }
+
+    #[test]
+    fn lshl_bidir_shift_amount_masks_to_five_bits() {
+        // Positive = left, negative magnitude = logical right; both masked &0x1F.
+        assert_eq!(run_lshl_bidir(1, 1), 2, "b=+1 -> a<<1");
+        assert_eq!(run_lshl_bidir(0x40, -1), 0x20, "b=-1 -> a>>1");
+        // |b| mod 32 == 0 => shift by 0 (identity), for both wrap directions.
+        assert_eq!(run_lshl_bidir(0x55, -32), 0x55, "b=-32 -> a>>0");
+        assert_eq!(run_lshl_bidir(0x55, 32), 0x55, "b=+32 -> a<<0");
+    }
+
+    /// Helper: run AshlBidir (arithmetic) with a (reg 1), shift b (reg 2).
+    fn run_ashl_bidir(a: u32, b: i32) -> u32 {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, a);
+        ctx.scalar.write(2, b as u32);
+        let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::AshlBidir);
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        ctx.scalar_read(3)
+    }
+
+    #[test]
+    fn ashl_bidir_min_shift_count_does_not_overflow() {
+        // Same i32::MIN negate-overflow as LSHL, on the arithmetic-shift path.
+        // (i32::MIN mod 32) == 0 => arithmetic right shift by 0 = a.
+        let a = 0x89AB_CDEF; // high bit set, to exercise sign extension
+        assert_eq!(run_ashl_bidir(a, i32::MIN), a, "i32::MIN shift -> shift-by-0 (no overflow)");
+    }
+
+    #[test]
+    fn ashl_bidir_negative_shift_is_arithmetic_right() {
+        // Sign bit set: arithmetic right shift fills with 1s.
+        assert_eq!(run_ashl_bidir(0x8000_0000, -1), 0xC000_0000, "b=-1 -> sign-extending a>>1");
+        assert_eq!(run_ashl_bidir(0x40, -1), 0x20, "b=-1 -> a>>1 (positive)");
     }
 
     #[test]
