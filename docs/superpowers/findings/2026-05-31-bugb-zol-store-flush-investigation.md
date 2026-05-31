@@ -4,10 +4,14 @@
 **Follow-on to:** `2026-05-30-buga-fix-and-retriage.md` (which flagged BUG-B)
 **Status:** Root cause understood; modeled to the best simple approximation and
 shipped. The exact flush condition is **proven irreducibly cycle-exact** (see
-the recency experiment) -- no single static feature determines it. The shipped
-body-size heuristic is the best simple model for natural Peano output. **Next
-phase: a cycle-level pipeline model (aiesimulator oracle)**, for which the
-controlled recency dataset below is ideal validation fodder.
+the recency experiment) -- no single static feature determines it. A model-first
+cycle/feature study then **proved the shipped body-size heuristic is the
+static-feature optimum**: an exhaustive fit that separates the harvest set 0/104
+overfits and loses to body-size on an independent natural corpus (5 vs 2 wrong).
+The ~2% residual is a genuine fetch-pipeline phase effect below disassembly
+resolution. Closing it would require cycle-level simulation (aiesimulator);
+**that escalation is deferred as an optional deep-dive** -- the static ceiling is
+now proven, not assumed. See "Model-first cycle study" below.
 
 ---
 
@@ -197,6 +201,9 @@ benign.
   bundle's partial-word store, extract producer op/latency/distance and loop
   body span, plus the `data_recency` feature. The workhorse for the
   discriminator search.
+- `tools/cycle_model.py` -- cycle/fetch-domain contingency + threshold search
+  (`<fuzz_root> <hwrun_log> [--2d]`). Built for the model-first study; proved the
+  static ceiling (see "Model-first cycle study").
 - `src/fuzzer/gen.rs` `XDNA_FUZZ_RECENCY1` mode -- harvest mode that forces
   recency-1 store-at-LE kernels (~5x natural rate) for the scale test; kept as a
   research capability for the cycle-model phase.
@@ -213,27 +220,73 @@ Disassembly oracle: `llvm-aie/install/bin/llvm-objdump -d --triple=aie2 <elf>`.
 
 ---
 
-## Next phase: cycle-level model (aiesimulator oracle)
+## Model-first cycle study (the static ceiling, proven)
 
-Static modeling is exhausted (proven, not assumed). The path to a correct model
-is cycle-level pipeline simulation:
+Before reaching for the aiesimulator oracle, we ran the cheaper experiment: build
+the cycle/fetch-domain model from the toolchain and test whether *any*
+static-feature rule beats the shipped body-size heuristic. It does not -- and the
+failure is instructive.
 
-- **Oracle**: aiesimulator (`amd-unified-software/aietools`, cycle-approximate
-  `aie2simmsm`). Caveats from the aborted earlier attempt (this same doc's
-  history): `--aiesim` is incompatible with the Peano flow, so the buggy Peano
-  ELF must be ELF/CDO-swapped into a Chess-built sim package; it is also
-  license- + network-gated (may need an out-of-sandbox run). Prior flow shells
-  at `build/experiments/2026-05-13-chess-aiesim/`.
-- **Validation set**: the recency dataset at
-  `build/experiments/2026-05-31-recency1b/` -- ~95 body-96 + ~20 body-112
-  store-at-LE kernels with recency + real-HW flush/commit labels. The canonical
-  cycle-by-cycle discriminating pairs are seed_1048 (flush) vs seed_1086
-  (commit), and within the recency harvest, a recency-1 flush (e.g. seed_323)
-  vs a recency-1 commit (e.g. seed_59) -- structurally near-identical, opposite
-  outcome.
-- **Goal**: derive the true store-vs-back-edge-squash timing from the sim trace,
-  then model that runtime quantity in the EMU (it already tracks per-register
-  write cycles and a pending-store pipeline), replacing the body-size heuristic.
+**Pipeline facts (from llvm-aie `AIE2Schedule.td`, via Explore).** AIE2 issues
+one bundle per cycle in order (nops are real cycles); partial-word stores commit
+at **E11** (`MemoryCycles<[5,11]>`, `II_STHB`); the front end fetches **16 bytes
+per cycle**; the compiler already pads intra-iteration RAW stalls with nops, so a
+stall model just reproduces the static bundle count. The one unmodeled degree of
+freedom is the **fetch-vs-issue rate mismatch**: a 96-byte body issued in 24 vs
+27 bundles has different nop density, so the back-edge fetch-redirect lands at a
+different *phase* relative to the store's E11.
+
+**What the data showed** (recency-harvest set, 104 store-at-LE kernels with real
+HW flush/commit labels; `tools/cycle_model.py`):
+
+- **Cycles (bundle count) is non-monotonic.** At producer-distance 1, *only*
+  `cycles=25` commits; 24, 26, 27 all flush. A pure "longer iteration = more time
+  to commit" threshold is therefore wrong -- it is a phase effect, not a
+  duration effect.
+- **Freshness drives it, but in two operands.** The store
+  `st.s8 rData, [p1, dj0]` has a *data* operand and an *address* (`dj0`) operand.
+  Data-producer distance split the first ambiguous cell cleanly (dist 1-2 ->
+  commit, dist 6 -> flush); address-producer distance split the next
+  (`mov dj0` at LE-1 -> commit, 4-5 bundles back -> flush). Both say the same
+  thing: a store of fresh, still-in-flight operands commits; a store of settled
+  operands flushes. But neither, nor both together, separates globally.
+- **Exhaustive fit overfits.** A depth-3 decision tree over (body, cycles,
+  data-dist, addr-dist, surplus=16C-B, store-width) separates the harvest set
+  **0/104** -- but its splits are memorization (`surplus == 320` encodes the
+  exact (96,26)/(112,27) phase; `st.s16 -> commit` memorizes 5 outliers).
+
+**The decisive generalization test** (`generalization_test.py`, in the recency1b
+experiment dir): fit on the harvest set, evaluate on the **independent natural
+widened corpus** (`build/experiments/2026-05-31-widefuzz/`, no harvest):
+
+| rule | natural corpus (46) | harvest set (104) |
+|------|---------------------|-------------------|
+| body-size (shipped) | **2 wrong** | 39 |
+| robust core (cycles + addr-freshness) | 18 | 33 |
+| depth-3 fitted tree | **5 wrong** | 0 |
+
+The perfectly-fit tree loses to the shipped body-size rule on data it did not
+see. **This proves body-size is the static-feature optimum**, and its 2 residual
+errors (the 96-byte commits) are irreducible to anything in the disassembly --
+they are a fetch-pipeline phase that only cycle-level simulation could resolve.
+
+**Decision: bank the proof, defer aiesim.** The shipped rule is now provably
+near-optimal; the residual is ~2% and irreducible-static. The aiesimulator path
+(below) remains available but is an optional deep-dive for the last 2%, not a
+required next step -- and aiesim may not reproduce an *undocumented* flush at all.
+
+- **Tools kept:** `tools/cycle_model.py` (cycle/feature contingency + threshold
+  search, dataset-parameterized: `<fuzz_root> <hwrun_log> [--2d]`). The fitting
+  harnesses `fetch_sim.py` and `generalization_test.py` live in the recency1b
+  experiment dir (gitignored).
+- **If aiesim is ever attempted:** oracle is `aie2simmsm`
+  (`amd-unified-software/aietools`, cycle-approximate); `--aiesim` is
+  incompatible with the Peano flow, so the buggy Peano ELF must be
+  ELF/CDO-swapped into a Chess-built sim package; license- + network-gated. Prior
+  flow shells at `build/experiments/2026-05-13-chess-aiesim/`. Validation set is
+  the recency1b dataset; cycle-by-cycle discriminating pairs are the (96,25,D=1)
+  cell's commits (e.g. seed_94) vs flushes (e.g. seed_739, seed_1270), which are
+  structurally near-identical with opposite outcome.
 
 ## Open follow-ups (separate from BUG-B)
 
