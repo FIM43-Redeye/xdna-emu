@@ -145,7 +145,10 @@ the sandbox) so we hit any wall on seed #1, not seed #400.
   paths). TDD any Rust logic; iterate the template against real compile output.
 - **M3 -- EMU-only batch.** A few dozen seeds in-sandbox; confirm determinism
   (same seed -> same result) and report quality at scale before involving HW.
-- **M4 -- EMU+HW differential batch.** 100-500 seeds, full diff; triage every
+- **M4 -- EMU+HW differential batch.** As many seeds as practical -- HW
+  execution is very fast, so thousands per session is reasonable and preferred
+  (broad seed coverage is the whole point). Run with trace-sweep OFF: it is the
+  slow path and would throttle the batch. Full output diff; triage every
   divergence (real emulator bug vs. clean scalar surface). The deliverable that
   spends Phoenix time while we have it.
 - **M5 -- standing capability.** Finalize subcommand UX + help + a short usage
@@ -170,9 +173,10 @@ the sandbox) so we hit any wall on seed #1, not seed #400.
 
 1. `cargo run -- fuzz` is a permanent, documented subcommand that runs the
    pipeline EMU-only in-sandbox and EMU+HW with `--hw`.
-2. A real EMU+HW differential batch (100-500 seeds) has run against the Phoenix
-   NPU, with all divergences triaged (each classified as a real emulator bug to
-   fix, or the scalar surface confirmed clean).
+2. A large EMU+HW differential batch (thousands of seeds -- HW is fast, so
+   throughput is not the constraint) has run against the Phoenix NPU, with all
+   divergences triaged (each classified as a real emulator bug to fix, or the
+   scalar surface confirmed clean).
 3. The existing fuzzer unit tests stay green; new Rust is TDD-covered.
 
 ## Risks
