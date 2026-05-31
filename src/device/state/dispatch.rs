@@ -466,6 +466,32 @@ impl DeviceState {
             _ => {}
         }
     }
+
+    /// Emulate firmware's MSG_OP_CREATE_CONTEXT response: ungate the columns
+    /// assigned to a partition by writing `Column_Clock_Control = 0x1` for each
+    /// column in `[start_col, start_col + num_cols)`.
+    ///
+    /// On real silicon this is a driver/firmware action, not part of the user
+    /// CDO: the mgmt-ERT firmware runs `_XAieMl_RequestTiles`
+    /// (aie-rt `device_aieml.c:309`) at context create, which the compiled
+    /// kernel never carries.  Both runtime paths that stand in for the
+    /// driver+firmware roles funnel through here -- the XRT-plugin FFI hook
+    /// (`xdna_emu_assign_partition`) and the in-process `XclbinSuite` runner --
+    /// so the firmware role lives in exactly one place.  The writes go through
+    /// `write_tile_register`, identical to any other MMIO, so the emulator
+    /// cannot tell firmware writes from CDO or control-packet writes (just as
+    /// silicon cannot).
+    ///
+    /// Module_Clock_Control is intentionally left at its AM025 reset value: per
+    /// aie-rt `_XAieMl_PmSetColumnClockBuffer` firmware writes only the
+    /// column-level gate, and the per-tile module reset values already enable
+    /// the modules that boot active.
+    pub fn assign_partition_columns(&mut self, start_col: u8, num_cols: u8) {
+        use crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET;
+        for col in start_col..start_col.saturating_add(num_cols) {
+            self.write_tile_register(col, 0, COLUMN_CLOCK_CONTROL_OFFSET, 0x1);
+        }
+    }
 }
 
 /// Returns true unless `XDNA_EMU_WARN_GATED_ACCESS=0` is set.
@@ -474,4 +500,35 @@ impl DeviceState {
 /// observe dedup behavior.
 fn warnings_enabled() -> bool {
     std::env::var("XDNA_EMU_WARN_GATED_ACCESS").as_deref() != Ok("0")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::device::DeviceState;
+
+    #[test]
+    fn assign_partition_columns_ungates_only_target_columns() {
+        let mut d = DeviceState::new_npu1();
+        // Columns boot gated (silicon-accurate).
+        for col in 0..d.cols() as u8 {
+            assert!(!d.array.clock().is_column_active(col), "col {} should boot gated", col);
+        }
+
+        // Firmware ungates a 2-column partition starting at column 1.
+        d.assign_partition_columns(1, 2);
+
+        assert!(!d.array.clock().is_column_active(0), "col 0 outside partition stays gated");
+        assert!(d.array.clock().is_column_active(1), "col 1 in partition is ungated");
+        assert!(d.array.clock().is_column_active(2), "col 2 in partition is ungated");
+        assert!(!d.array.clock().is_column_active(3), "col 3 outside partition stays gated");
+    }
+
+    #[test]
+    fn assign_partition_columns_zero_width_is_a_noop() {
+        let mut d = DeviceState::new_npu1();
+        d.assign_partition_columns(0, 0);
+        for col in 0..d.cols() as u8 {
+            assert!(!d.array.clock().is_column_active(col), "col {} stays gated", col);
+        }
+    }
 }

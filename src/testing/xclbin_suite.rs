@@ -731,6 +731,18 @@ impl XclbinSuite {
         // Create engine and apply CDO
         let mut engine = InterpreterEngine::new_npu1();
         engine.set_stall_threshold(self.stall_threshold);
+
+        // Emulate firmware's MSG_OP_CREATE_CONTEXT response before applying the
+        // CDO: the driver/firmware ungates the partition's columns at context
+        // create (aie-rt `_XAieMl_RequestTiles` writes `Column_Clock_Control =
+        // 0x1`), which the user CDO never carries.  Without this the columns
+        // boot gated, `step_all_dma` skips them, and the shim DMA never moves
+        // data (BUG-A).  The XRT-plugin path does the equivalent via the
+        // `xdna_emu_assign_partition` FFI hook; the in-process runner applies
+        // the CDO unrelocated, so the partition occupies physical columns
+        // [0, column_width).
+        engine.device_mut().assign_partition_columns(0, partition.column_width() as u8);
+
         if let Err(e) = engine.device_mut().apply_cdo(&cdo) {
             return (
                 TestOutcome::LoadError { message: format!("Failed to apply CDO: {}", e) },
@@ -1691,5 +1703,56 @@ mod tests {
             "regression: empty-ctrlpkt must not report success; got {:?}",
             outcome,
         );
+    }
+
+    /// BUG-A regression gate: the in-process runner must move data through
+    /// the shim DMA end-to-end.  On real silicon the driver/firmware ungates
+    /// the partition's columns at context-create (aie-rt `_XAieMl_RequestTiles`
+    /// writes `Column_Clock_Control = 0x1`); the user CDO never carries it.
+    /// Before the firmware-emulation hook landed, the in-process path left
+    /// every column gated, `step_all_dma` skipped the shim, and the shim DMA
+    /// froze at `BdSetup` -- producing all-zero output for every kernel.
+    ///
+    /// This is the FIRST in-process test that asserts on actual computed
+    /// data: `add_one_using_dma` fills inA with [1..64] and the core computes
+    /// `out[i] = inA[i] + 1 = i + 2` (the same reference test.cpp checks).
+    #[test]
+    fn add_one_using_dma_in_process_moves_data_through_shim() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let test_dir = manifest.join("../mlir-aie/test/npu-xrt/add_one_using_dma");
+        let xclbin_path = manifest.join("../mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin");
+        if !xclbin_path.exists() {
+            eprintln!(
+                "SKIP add_one_using_dma_in_process: chess xclbin not built at {}",
+                xclbin_path.display(),
+            );
+            return;
+        }
+
+        let spec = crate::testing::test_cpp_parser::parse_test_cpp(&test_dir)
+            .expect("parse add_one_using_dma test.cpp buffer spec");
+        let test = XclbinTest::from_path(&xclbin_path).with_buffer_spec(spec);
+
+        let suite = XclbinSuite::new();
+        let (outcome, raw_output, _trace) = suite.run_single_with_trace(&test);
+
+        let out = raw_output.expect("captured output buffer");
+        assert!(out.len() >= 64 * 4, "expected >=64 i32 of output, got {} bytes", out.len());
+        let vals: Vec<i32> = out
+            .chunks_exact(4)
+            .take(64)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // BUG-A signature: a gated column leaves the output all-zeros.
+        assert!(
+            vals.iter().any(|&v| v != 0),
+            "output is all-zeros -- shim DMA never moved data (BUG-A); outcome={:?}",
+            outcome,
+        );
+        // Full correctness: out[i] = i + 2.
+        for (i, &v) in vals.iter().enumerate() {
+            assert_eq!(v, i as i32 + 2, "out[{}] should be i+2 (add_one of [1..64])", i);
+        }
     }
 }

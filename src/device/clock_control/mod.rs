@@ -73,7 +73,7 @@ pub struct ClockController {
 }
 
 /// AM025 offset for Column_Clock_Control (shim tiles only).
-const COLUMN_CLOCK_CONTROL_OFFSET: u32 = 0x000FFF20;
+pub(crate) const COLUMN_CLOCK_CONTROL_OFFSET: u32 = 0x000FFF20;
 
 /// AM025 offset for Module_Clock_Control on compute tiles.
 const MCC_COMPUTE_OFFSET: u32 = 0x00060000;

@@ -18,23 +18,15 @@
 
 use super::{set_last_error, XdnaEmuHandle};
 
-/// AM025 offset for Column_Clock_Control (shim row 0; bit 0 = enable).
-/// Mirrors the private constant in `src/device/clock_control/mod.rs`;
-/// kept hardcoded here so the FFI does not require re-exporting an
-/// internal constant through `xdna-emu-core`'s public surface.
-///
-/// Source: aie-rt `xaiemlgbl_params.h` -- the same offset
-/// `_XAieMl_RequestTiles` (device_aieml.c:309-385) writes when firmware
-/// processes MSG_OP_CREATE_CONTEXT on real silicon.
-const COLUMN_CLOCK_CONTROL_OFFSET: u32 = 0x000FFF20;
-
 /// Emulate firmware's response to MSG_OP_CREATE_CONTEXT: ungate the
 /// columns assigned to this context's partition.  On real silicon,
 /// firmware issues `_XAieMl_RequestTiles` (aie-rt device_aieml.c:309)
 /// which writes `Column_Clock_Control = 0x1` for each column in the
-/// partition.  We mirror that exactly -- through `write_tile_register`
-/// so the write goes through the normal dispatch path, identical to
-/// any other MMIO from the emulator's POV.
+/// partition.  The actual register writes live in the core
+/// (`DeviceState::assign_partition_columns`) so this XRT-plugin path and
+/// the in-process `XclbinSuite` runner share one firmware implementation;
+/// this hook only decodes the XRT-native `num_tiles` unit into a column
+/// count and delegates.
 ///
 /// Module_Clock_Control is intentionally NOT touched: per aie-rt
 /// `_XAieMl_PmSetColumnClockBuffer` (device_aieml.c:272-295) firmware
@@ -101,9 +93,7 @@ pub unsafe extern "C" fn xdna_emu_assign_partition(
         return -3;
     }
 
-    for col in start_col..start_col + num_col as u8 {
-        device.write_tile_register(col, 0, COLUMN_CLOCK_CONTROL_OFFSET, 0x1);
-    }
+    device.assign_partition_columns(start_col, num_col as u8);
     log::debug!(
         "xdna_emu_assign_partition: ungated {} cols [{}..{}] (num_tiles={}, compute_rows={})",
         num_col,
