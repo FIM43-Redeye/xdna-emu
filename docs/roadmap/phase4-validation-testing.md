@@ -137,24 +137,25 @@ These items are from the original Phase 4 plan and remain relevant.
 | Hardware comparison tests | VERIFIED | `scripts/emu-bridge-test.sh` runs HW + EMU and diffs outputs; trace-sweep compares cycle counts |
 | Fuzzing for decoder robustness | Not started | |
 | Property-based testing for DMA addressing | Not started | |
-| Differential kernel fuzzer | Not started | See below |
+| Differential kernel fuzzer | Revived (scalar), blocked by BUG-A | `cargo run -- fuzz`; EMU+HW differential, Peano, single-tile scalar. In-process EMU path stalls shim DMA (BUG-A) -> not yet a correctness gate. Vector/Chess deferred. See docs/fuzzer-usage.md + findings/2026-05-30-fuzzer-revival-first-batch.md |
 
-### Differential Kernel Fuzzer (Future)
+### Differential Kernel Fuzzer
 
-A tool that randomly generates valid NPU kernels (valid instruction sequences,
-valid DMA configurations, valid routing), runs them on both the emulator and
-real hardware, and diffs the output buffers. This is the most powerful way to
-find subtle emulator/hardware divergence -- it tests the emulator against the
-actual silicon rather than against our understanding of the architecture docs.
+The fuzzer is revived and runs end-to-end (`cargo run --release -- fuzz --hw`).
+The differential loop (generate -> Peano-compile -> EMU + NPU -> byte-diff)
+works and the in-sandbox HW path is proven. See
+[docs/fuzzer-usage.md](../fuzzer-usage.md) for full invocation details.
 
-Key design considerations:
-- Must generate *valid* programs (not random bytes) -- valid VLIW bundles,
-  legal register usage, coherent DMA descriptors
-- Should start simple (single-tile scalar ops) and grow to multi-tile vector
-  pipelines
-- Needs a harness that packages generated code into minimal xclbin containers
-- Shrinking/minimization when a divergence is found (like proptest/hypothesis)
-- Could leverage TableGen instruction definitions to know what's legal
+**Current blocker (BUG-A):** the in-process EMU path (`XclbinSuite`) stalls
+shim DMA at `BdSetup`, so the emulator returns all-zeros for every fuzz kernel
+and every non-trivial seed appears to diverge for that one reason. The XRT
+bridge path is unaffected. Until BUG-A is fixed the fuzzer is not a useful
+correctness gate. See
+`docs/superpowers/findings/2026-05-30-fuzzer-revival-first-batch.md`.
+
+**Scope**: single-tile scalar ops (arith/bitwise/shift/branch/hw-loop),
+Peano-compiled, i8/i16/i32. Vector ops and Chess are planned next phases.
+Shrinking is out of scope; the deterministic seed is the reproducer.
 
 ---
 
