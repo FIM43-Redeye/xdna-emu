@@ -184,5 +184,8 @@ Disassembly oracle: `llvm-aie/install/bin/llvm-objdump -d --triple=aie2 <elf>`.
 
 BUG-B is a confirmed **Peano codegen bug**: the simple-unroll path parks a
 partial-word store in the LE bundle of a zero-overhead loop, where the back-edge
-fetch redirect can flush it. To be reported upstream (issue-first; Chess
-compiles the same kernels correctly).
+fetch redirect can flush it. Filed upstream (issue-first; Chess compiles the
+same kernels correctly):
+**[Xilinx/llvm-aie#1012](https://github.com/Xilinx/llvm-aie/issues/1012)**.
+The minimal reproducer (`out[i] = i*i`, int8) and its verified `st.s8`-at-LE
+disassembly are under `build/experiments/2026-05-31-peano-repro/`.
