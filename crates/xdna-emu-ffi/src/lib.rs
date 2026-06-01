@@ -183,6 +183,23 @@ pub struct XdnaEmuExecStatus {
 // Global lock for thread safety during initialization
 static INIT_LOCK: Mutex<()> = Mutex::new(());
 
+/// Choose a backend from the `XDNA_BACKEND` value. Pure (no env read) so it is
+/// directly testable. Plan A wires only the interpreter; aiesim arrives in Plan
+/// B behind a cargo feature (which will replace the `"aiesim"` arm). An
+/// unsupported request fails loudly rather than silently using the interpreter.
+pub(crate) fn select_backend(
+    kind: &str,
+    engine: InterpreterEngine,
+) -> Result<Box<dyn crate::backend::NpuBackend>, String> {
+    match kind {
+        "interpreter" => Ok(Box::new(engine)),
+        "aiesim" => {
+            Err("XDNA_BACKEND=aiesim: this build has no aiesim backend (Plan B not yet built)".to_string())
+        }
+        other => Err(format!("XDNA_BACKEND={other}: unknown backend")),
+    }
+}
+
 /// Create a new emulator instance.
 ///
 /// # Safety
@@ -211,8 +228,19 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
     let config = xdna_emu_core::config::Config::get();
     let mut engine = InterpreterEngine::new_npu1();
     engine.set_stall_threshold(config.stall_threshold());
+
+    let backend_kind = std::env::var("XDNA_BACKEND").unwrap_or_else(|_| "interpreter".to_string());
+    let backend = match select_backend(&backend_kind, engine) {
+        Ok(b) => b,
+        Err(msg) => {
+            log::error!("{}", msg);
+            set_last_error(msg);
+            return std::ptr::null_mut();
+        }
+    };
+
     let handle = Box::new(XdnaEmuHandle {
-        backend: Box::new(engine),
+        backend,
         xclbin_path: None,
         npu_executor: NpuExecutor::new(),
         max_cycles: config.max_cycles(),
@@ -999,5 +1027,27 @@ mod tests {
     fn halt_reason_wedge_recovered_has_discriminant_four() {
         let r = XdnaEmuHaltReason::WedgeRecovered;
         assert_eq!(r as u32, 4);
+    }
+
+    #[test]
+    fn select_backend_interpreter_ok() {
+        let eng = xdna_emu_core::interpreter::engine::InterpreterEngine::new_npu1();
+        assert!(select_backend("interpreter", eng).is_ok());
+    }
+
+    #[test]
+    fn select_backend_aiesim_unsupported() {
+        // Plan A has no aiesim backend compiled; requesting it must fail cleanly
+        // rather than silently falling back to the interpreter.
+        let eng = xdna_emu_core::interpreter::engine::InterpreterEngine::new_npu1();
+        let r = select_backend("aiesim", eng);
+        assert!(r.is_err());
+        assert!(r.err().unwrap().contains("aiesim"));
+    }
+
+    #[test]
+    fn select_backend_unknown_rejected() {
+        let eng = xdna_emu_core::interpreter::engine::InterpreterEngine::new_npu1();
+        assert!(select_backend("bogus", eng).is_err());
     }
 }
