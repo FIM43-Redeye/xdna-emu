@@ -1414,6 +1414,8 @@ type ReadGmFn = unsafe extern "C" fn(*mut c_void, u64, *mut u8, usize) -> c_int;
 type RunFn = unsafe extern "C" fn(*mut c_void, u64, *mut u64) -> c_int;
 type ReadRegFn = unsafe extern "C" fn(*mut c_void, u64) -> u32;
 type ResetFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+type AddHostBufferFn = unsafe extern "C" fn(*mut c_void, u64, usize) -> c_int;
+type ClearHostBuffersFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type DestroyFn = unsafe extern "C" fn(*mut c_void);
 
 pub(crate) struct DlopenBridge {
@@ -1427,6 +1429,8 @@ pub(crate) struct DlopenBridge {
     run: RunFn,
     read_reg: ReadRegFn,
     reset: ResetFn,
+    add_host_buffer: AddHostBufferFn,
+    clear_host_buffers: ClearHostBuffersFn,
     destroy: DestroyFn,
 }
 
@@ -1457,8 +1461,10 @@ impl DlopenBridge {
             let run = *lib.get::<RunFn>(b"aiesim_run\0").map_err(sym_err)?;
             let read_reg = *lib.get::<ReadRegFn>(b"aiesim_read_reg\0").map_err(sym_err)?;
             let reset = *lib.get::<ResetFn>(b"aiesim_reset\0").map_err(sym_err)?;
+            let add_host_buffer = *lib.get::<AddHostBufferFn>(b"aiesim_add_host_buffer\0").map_err(sym_err)?;
+            let clear_host_buffers = *lib.get::<ClearHostBuffersFn>(b"aiesim_clear_host_buffers\0").map_err(sym_err)?;
             let destroy = *lib.get::<DestroyFn>(b"aiesim_destroy\0").map_err(sym_err)?;
-            Ok(Self { _lib: lib, handle, load_cdo, exec_npu, write_gm, read_gm, run, read_reg, reset, destroy })
+            Ok(Self { _lib: lib, handle, load_cdo, exec_npu, write_gm, read_gm, run, read_reg, reset, add_host_buffer, clear_host_buffers, destroy })
         }
     }
 }
@@ -1508,6 +1514,14 @@ impl BridgeAbi for DlopenBridge {
     }
     fn reset(&mut self) -> BridgeStatus {
         let rc = unsafe { (self.reset)(self.handle) };
+        if rc == 0 { BridgeStatus::Ok } else { BridgeStatus::Error }
+    }
+    fn add_host_buffer(&mut self, addr: u64, size: usize) -> BridgeStatus {
+        let rc = unsafe { (self.add_host_buffer)(self.handle, addr, size) };
+        if rc == 0 { BridgeStatus::Ok } else { BridgeStatus::Error }
+    }
+    fn clear_host_buffers(&mut self) -> BridgeStatus {
+        let rc = unsafe { (self.clear_host_buffers)(self.handle) };
         if rc == 0 { BridgeStatus::Ok } else { BridgeStatus::Error }
     }
 }
