@@ -36,6 +36,8 @@
 //!   are borrowed from thread-local or handle state; they are invalidated
 //!   by the next FFI call on the same thread or by destroying the handle.
 
+#[cfg(feature = "aiesim")]
+mod aiesim;
 mod async_errors;
 mod backend;
 mod classify;
