@@ -11,10 +11,45 @@
 //! `xdna_emu_run` reaches the interpreter via `as_interpreter_mut()`. The
 //! clean `run()` seam is designed in Plan B.
 
+use xdna_emu_core::device::async_errors::AmdxdnaAsyncError;
 use xdna_emu_core::device::context::ContextId;
 use xdna_emu_core::device::host_memory::HostMemory;
 use xdna_emu_core::interpreter::engine::InterpreterEngine;
 use xdna_emu_core::parser::Cdo; // same path config.rs imports (re-exported at parser root)
+
+/// How a `run()` ended. Mirrors `XdnaEmuHaltReason`; `execution.rs::map_halt`
+/// translates it to the FFI exec-status triple. Kept FFI-struct-free so
+/// backend.rs has no dependency on the C ABI types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HaltKind {
+    /// Kernel ran to natural completion (cores halted, syncs satisfied).
+    Completed,
+    /// Cycle budget reached before natural completion.
+    Budget,
+    /// A MaskPoll could not be satisfied (engine quiescent, condition unmet).
+    MaskPollUnsatisfied,
+    /// The in-flight submission wedged; the context was marked Failed.
+    WedgeRecovered,
+    /// Error during execution (FFI fault, executor error, bad precondition).
+    Error,
+}
+
+/// Result of a `run()`.
+#[derive(Debug, Clone, Copy)]
+pub struct RunOutcome {
+    pub cycles: u64,
+    pub halt: HaltKind,
+}
+
+/// Observer the FFI passes into `run()`. The backend reports newly-recorded
+/// async errors at whatever granularity it supports (interpreter: every cycle;
+/// aiesim: per run / at sync points). This replaces `fire_async_callbacks_for`,
+/// which took the whole handle -- the borrow tangle a prior phase dodged by
+/// deferring `run()`. The FFI's `CallbackObserver` (async_errors.rs) fires the
+/// registered C callback for each record.
+pub trait RunObserver {
+    fn on_async_errors(&mut self, records: &[AmdxdnaAsyncError]);
+}
 
 /// The operations the FFI performs that are common to every backend.
 pub trait NpuBackend {
@@ -143,6 +178,24 @@ pub(crate) mod mock {
 mod tests {
     use super::mock::MockBackend;
     use super::NpuBackend;
+
+    #[test]
+    fn run_outcome_and_observer_compose() {
+        use super::{HaltKind, RunObserver, RunOutcome};
+        use xdna_emu_core::device::async_errors::AmdxdnaAsyncError;
+
+        struct Counting(u32);
+        impl RunObserver for Counting {
+            fn on_async_errors(&mut self, records: &[AmdxdnaAsyncError]) {
+                self.0 += records.len() as u32;
+            }
+        }
+        let mut o = Counting(0);
+        o.on_async_errors(&[]);
+        assert_eq!(o.0, 0);
+        let out = RunOutcome { cycles: 7, halt: HaltKind::Completed };
+        assert_eq!(out.cycles, 7);
+    }
 
     #[test]
     fn mock_backend_is_not_an_interpreter() {
