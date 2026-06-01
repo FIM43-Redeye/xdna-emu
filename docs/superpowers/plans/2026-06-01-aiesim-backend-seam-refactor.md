@@ -282,6 +282,9 @@ impl NpuBackend for InterpreterEngine {
     fn reset_context(&mut self, cid: ContextId) -> Result<(), ()> {
         self.device_mut().reset_context(cid).map_err(|_| ())
     }
+    // Deliberately delegate to `self.device().X()`, NOT `self.X()` — the latter
+    // would re-enter this trait method and infinitely recurse. (The methods
+    // above use `InterpreterEngine::X(self)` UFCS for the same reason.)
     fn cols(&self) -> usize { self.device().cols() }
     fn rows(&self) -> usize { self.device().rows() }
     fn arch_name(&self) -> String { self.device().arch_name().to_string() }
@@ -348,6 +351,16 @@ to:
     let handle = Box::new(XdnaEmuHandle {
         backend: Box::new(engine),
 ```
+
+**Note (auto-trait change, verified harmless in Plan A):** boxing the field as
+`Box<dyn NpuBackend>` makes `XdnaEmuHandle` lose its auto-`Send`/`Sync` (the trait
+has no `Send` supertrait). This is safe here — the `unsafe impl Send/Sync` is on
+`AsyncErrorCallback`, not the handle; nothing stores the handle in a `static`,
+`Arc`, or spawns a thread with it; it only crosses FFI as `*mut XdnaEmuHandle`
+(raw pointers are unconditionally `Send`/`Sync`). No code requires
+`XdnaEmuHandle: Send`. Flagged because it is the one non-obvious consequence of
+the field change, and Plan B's threaded SystemC backend will have to confront it
+(it adds its own `Send` story for the aiesim service thread).
 
 In `xdna_emu_reset_context` (lines ~272-276), change:
 ```rust
@@ -710,6 +723,12 @@ Run: `grep -rn "\.engine\b" crates/xdna-emu-ffi/src/ | grep -v "as_interpreter\|
 Expected: no output (every `handle.engine` site is migrated). The only remaining
 references to the engine type are the `InterpreterEngine` import in `backend.rs`
 and the helper signatures in `execution.rs`.
+
+This grep is a heuristic, not a proof (it filters by line content). The real
+guarantee is that **Step 1's clean compile** is impossible while any `handle.engine`
+field access survives — the field no longer exists. Treat a clean
+`cargo test -p xdna-emu-ffi --lib` as the authoritative completeness check; the
+grep is just a fast sanity scan.
 
 - [ ] **Step 4: Commit (if Step 2/3 produced any fixups)**
 
