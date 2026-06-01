@@ -161,6 +161,29 @@ mod tests {
     }
 
     #[test]
+    fn dyn_dispatch_hits_the_concrete_backend() {
+        use super::mock::MockBackend;
+
+        // Own the concrete mock; dispatch through a `&mut dyn` (vtable) reference.
+        let mut mock = MockBackend::default();
+        {
+            let backend: &mut dyn NpuBackend = &mut mock;
+            backend.set_start_col(2);
+            backend.reset_for_new_context();
+            backend.reset_for_new_context();
+
+            // The downcast hatch correctly reports "not an interpreter".
+            assert!(backend.as_interpreter().is_none());
+            assert!(backend.as_interpreter_mut().is_none());
+        } // dyn borrow ends here
+
+        // The dynamic calls landed on the concrete MockBackend (proves dispatch
+        // reached it, not a default).
+        assert_eq!(mock.start_col, 2);
+        assert_eq!(mock.reset_for_new_context_calls, 2);
+    }
+
+    #[test]
     fn interpreter_implements_backend_and_downcasts() {
         use xdna_emu_core::interpreter::engine::InterpreterEngine;
         let mut eng = InterpreterEngine::new_npu1();
