@@ -47,7 +47,6 @@ mod memory;
 mod query;
 
 pub use async_errors::*;
-pub use backend::NpuBackend;
 pub use classify::*;
 pub use config::*;
 pub use context::{xdna_emu_get_context_state, XdnaEmuContextState};
