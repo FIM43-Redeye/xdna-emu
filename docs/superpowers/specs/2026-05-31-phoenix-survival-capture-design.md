@@ -1,11 +1,11 @@
 # Design: Phoenix-Survival Capture (output corpus + inventory)
 
 **Date:** 2026-05-31
-**Status:** **WIP CHECKPOINT** — design sections 1–2 approved and all scoping
-decisions locked; sections 3–5 stubbed (paused mid-brainstorm, resumable cold).
-Do **not** start implementation: the brainstorming flow has not reached the
-written-spec review gate. Pick up by completing sections 3–5, then the spec
-self-review + user-review gates, then `writing-plans`.
+**Status:** **APPROVED — implementation plan being written.** All five design
+sections approved by Maya (2026-06-01); self-review done. `writing-plans`
+produces the implementation plan next. Do **not** start implementation before the
+plan exists. Scope note: this completes the spec *as designed* — a larger aiesim
+role (Section 5) is intentionally deferred to a follow-up, not folded in here.
 
 ---
 
@@ -61,9 +61,11 @@ emulator's AIE2 fidelity stays regression-testable forever. This spec designs th
 2. **Storage:** **hybrid** — a curated, stratified subset committed to git as the
    backed-up regression gate (~few hundred–1000 cases, ~10–15 MB); the full
    capture archived to `~/npu-work/experiments/phoenix-aie2-golden-<date>/`.
-   (Per-case replay footprint ≈ 15 KB: `aie.xclbin` 9 KB + `aie.mlir` 5.5 KB +
-   `npu_output.bin` 64 B. The frozen xclbin pins the binary↔golden pairing, so
-   the corpus is immune to Peano toolchain drift.)
+   (Per-case *committed* footprint ≈ 9–10 KB: `aie.xclbin` 9 KB +
+   `npu_output.bin` 64 B + `meta.json`. The source `aie.mlir` lives in the
+   archive only, not the committed corpus — see Section 3, so the gate never
+   re-parses MLIR. The frozen xclbin pins the binary↔golden pairing, so the
+   corpus is immune to Peano toolchain drift.)
 3. **Composition:** **stratified grid generation** on the controllable axes +
    **classify-and-tag** for emergent regimes (approach C — see § Section 2).
 4. **Done = swap-safe:** an **automated regression gate** (`cargo test` over the
@@ -149,59 +151,186 @@ lever — not a hole. Grid dims, N, and M are spec parameters (defaults given).
 
 ---
 
-## Section 3 — Corpus schema, storage & durability  *(TODO — resume here)*
+## Section 3 — Corpus schema, storage & durability  *(APPROVED)*
 
-Sketch to flesh out:
-- Committed corpus dir (proposed `tests/corpus/phoenix-aie2/` — confirm location)
-  with `agree/` and `diverge/` subtrees; per-case dir
-  `{cell-id}_{seed}/{aie.xclbin, npu_output.bin, meta.json[, emu_output.bin]}`.
-- `meta.json` schema: seed, dtype, size, loop_style, op-count band, cell_id,
-  class (agree/diverge), tags[], op-signature, vacuous flag, capture_date,
-  **toolchain provenance** (Peano commit/version, driver/firmware version),
-  `npu_output_sha`, `xclbin_sha`.
-- `manifest.json` (whole-corpus) + `coverage.md` (cells × counts, tag counts).
-- Archive layout under `~/npu-work/experiments/phoenix-aie2-golden-<date>/`.
-- Decide: how much goes in git vs archive (the curated subset size / selection).
+**Committed corpus location.** `tests/corpus/phoenix-aie2/` — it is replayed by a
+`cargo test` (Section 4), so it lives under `tests/`. Two subtrees by class:
+`agree/` (EMU==HW at capture) and `diverge/` (EMU!=HW at capture). Each case is a
+directory `{cell_id}_{seed}/`:
 
-## Section 4 — Regression gate + diff report  *(TODO)*
+```
+tests/corpus/phoenix-aie2/agree/i8-128-Simple-5to9_000412/
+  aie.xclbin       # frozen binary (~9 KB) -- pins the binary<->golden pairing
+  npu_output.bin   # real NPU1 output (the golden)
+  meta.json        # everything the gate needs to replay + classify
+diverge/<...>/     # same three, PLUS:
+  emu_output.bin   # frozen EMU output (the known-divergence reference)
+```
 
-Sketch to flesh out:
-- `cargo test` (e.g. `tests/corpus_replay.rs`) + `scripts/replay-corpus.sh`,
-  replaying via in-process `XclbinSuite` (generalize `validate_seeds`).
-- Assertions: agree-set EMU==frozen-HW; diverge-set EMU==frozen-EMU (HW side is
-  immutable reference). When a divergence gets *fixed*, its case "fails" the
-  diverge tripwire → deliberate signal to **re-classify diverge→agree** (a corpus
-  update, not a bug). Document this lifecycle.
-- Diff-report artifact: per failing case, which elements diverged + signatures.
+**No `aie.mlir` in the committed corpus.** The gate must not depend on re-parsing
+MLIR; `meta.json` carries dtype/size/buffer-spec directly. (This is a deliberate
+change from `examples/validate_seeds.rs`, which parses `aie.mlir` for dtype/size
+— the corpus replayer reads `meta.json` instead.) The `aie.mlir` source is kept
+in the archive for provenance, not in the gate path.
 
-## Section 5 — Error/edge handling, testing & the inventory  *(TODO)*
+**Schema-first.** `meta.json` and `manifest.json` are defined as serde Rust types
+and serialization is derived — types first, JSON second:
 
-- Capture-time edge handling: compile failures, HW panics/timeouts (already an
-  `error` category in `runner.rs`), vacuous exclusion, determinism re-check.
-- Testing of the capture/curation tooling itself (not just the corpus).
-- **Inventory of the remaining Phoenix-gated tracks** (named follow-on specs):
-  - **Track B — Trace corpus:** golden NPU1 Perfetto traces for the
-    trace-fidelity regression. Different pipeline (trace tooling/strategy layer;
-    decode partly upstream-owned). See `docs/trace/`.
-  - **Track C — HW-gated verifications:** the Vector / SideEffect "Unverified"
-    semantics (coverage memory flags these; Perf_Counter cycle oracle broken for
-    NPU1). **First sub-task: confirm the recording isn't stale** — a grep for
-    Unverified markers in `docs/coverage/aie2/implementation-gaps.md` found
-    nothing, so the open-item list itself may need a pass.
-  - **Track D — Raw-breadth reservoir (the unknown-unknown hedge):** broad raw
-    Phoenix artifacts *not* tied to current understanding — raw traces across
-    diverse kernels, capability/register surveys, firmware+driver+toolchain
-    version pinning — stored raw for future re-interrogation. Explicit goal:
-    make unknown unknowns cheap to absorb.
+```rust
+struct CaseMeta {
+    schema_version: u32,
+    seed: u64,
+    cell_id: String,              // "i8/128/Simple/5-9"
+    dtype: ElementType,           // i8 | i16 | i32
+    size_elements: usize,
+    loop_style: LoopStyle,        // Simple | HardwareLoop
+    op_count: u32,
+    op_count_band: OpBand,        // 1-4 | 5-9 | 10-16
+    class: Class,                 // Agree | Diverge
+    tags: Vec<Tag>,               // store_at_le, has_load, has_branch_taken, has_hwloop, multi_store
+    op_signature: String,         // stable hash of the op sequence (dedup key)
+    vacuous: bool,
+    buffer_spec: BufferSpecMeta,  // group_ids, dirs, input patterns -> reconstruct the run
+    capture: Provenance,          // date, peano_commit, driver_version, fw_version, determinism_ok
+    hashes: Hashes,               // xclbin_sha256, npu_output_sha256, emu_output_sha256?
+}
+```
+
+`buffer_spec` is load-bearing: `validate_seeds.rs` hardcodes a single
+`fuzz_spec`, but a general corpus must record each case's actual buffer layout so
+the replayer reconstructs inputs deterministically.
+
+**Whole-corpus index.** `manifest.json` (a `Manifest` struct): schema_version,
+campaign id + date, counts (total / agree / diverge / vacuous-excluded / error),
+per-cell coverage map, per-tag counts, a toolchain-provenance summary, and a flat
+case index (path, class, tags) for fast loading. `coverage.md` is the
+human-readable companion: the 90-cell grid as a counts table, tag counts, and a
+note on any thin or oversampled cells.
+
+**Archive (full capture).** `~/npu-work/experiments/phoenix-aie2-golden-<date>/`
+holds the *entire* campaign: every non-vacuous case (agree + diverge), the
+`aie.mlir` sources, any captured `emu_trace.bin`/`npu_trace.bin`, the `errors/`
+bucket (Section 5), and the manifest. Self-contained and toolchain-drift-proof.
+
+**git vs archive — the curated subset.** The committed corpus is a stratified
+selection from the archive, ~few hundred–1000 cases (~10–15 MB), chosen by a
+deterministic (seed-ordered) algorithm:
+- **grid floor:** for each of the 90 cells, the first min(K, available) cases,
+  guaranteeing >=1 per non-empty cell;
+- **tag floor:** every emergent tag gets >=M representatives (oversample the
+  campaign if thin — Section 2's `store_at_le` risk + the RECENCY1 lever);
+- **all divergences:** *every* `diverge/` case is committed — they are rare and
+  unrecapturable once Phoenix is gone;
+- **dedup:** within a cell, drop cases sharing an `op_signature` so
+  near-identical kernels do not eat the budget.
+The selection is recorded in the manifest, so the committed subset is
+reproducible from the archive.
+
+**Durability.** The frozen xclbin pins the binary<->golden pairing, so the corpus
+is immune to Peano/toolchain drift (we replay the binary, never recompile).
+`capture.*` records what produced each golden; `hashes.*` detect corruption. The
+gate needs no hardware, license, or network — it is the tripwire that outlives
+Phoenix.
+
+## Section 4 — Regression gate + diff report  *(APPROVED)*
+
+**The gate.** `tests/corpus_replay.rs` (a `cargo test`) plus
+`scripts/replay-corpus.sh` for ad-hoc runs. It generalizes
+`examples/validate_seeds.rs`: per case it reads `meta.json`, reconstructs the
+`BufferSpec` from `buffer_spec`, runs the xclbin through the in-process
+`XclbinSuite` (zero HW), and compares bytes. The hardcoded `fuzz_spec` and
+`aie.mlir` parsing are replaced by `meta.json`-driven reconstruction.
+
+**Assertions.**
+- **agree case:** `EMU == npu_output.bin` (frozen real HW). A mismatch means the
+  emulator regressed against silicon — the core tripwire.
+- **diverge case:** `EMU == emu_output.bin` (frozen EMU at capture). The HW side
+  stays the immutable reference; this catches *any* change in EMU behavior on a
+  known-divergent case.
+- **vacuous:** excluded (both-sides-zero tests nothing).
+
+**Diverge->agree lifecycle.** When someone *fixes* a known divergence, that
+case's EMU output stops matching the frozen EMU and starts matching the frozen
+HW — so the diverge tripwire goes red **by design**. That red is the signal to
+**re-classify** the case `diverge -> agree` (move it, flip `class`; it now gates
+against HW forever). A helper (`scripts/reclassify-corpus-case.sh <case>`) does
+the move + meta update. This is a corpus update, not a bug — documented so a
+fixer knows the red is expected and what to do.
+
+**Diff report.** On any failing case the gate writes, to
+`build/corpus-replay-report/`, a per-case record: first-diff element index, total
+diverging elements, the `(expected, got)` values at the first few diffs, and a
+signature hash; a human summary table lists failures with signatures. A future
+regression is thus *diagnosable* (which lanes, what pattern) rather than a bare
+red/green — the difference between "something broke" and "element 5 is off by the
+store-flush amount."
+
+**Cost & CI.** In-process `XclbinSuite` replay is fast and HW-free; the curated
+subset (hundreds of cases) fits a normal `cargo test`/nextest budget. The gate
+runs in ordinary CI with no Phoenix, no license — which is the entire point: it
+is the regression guard that still works after the silicon is gone.
+
+## Section 5 — Error/edge handling, testing & the inventory  *(APPROVED)*
+
+**Capture-time edge handling.**
+- **Compile failures** (Peano can't build a generated kernel): logged, skipped,
+  never a corpus case (the fuzzer already does this).
+- **HW errors** (panic / timeout / TDR — the existing `error` category in
+  `runner.rs`): the HW output is untrustworthy, so these are **not** frozen as
+  agree/diverge. They go to an `errors/` archive bucket for triage, classified
+  catastrophic (dmesg NOAVAIL) vs recoverable (TDR) per the existing discipline.
+  Excluded from the corpus.
+- **Vacuous** (both-sides-zero): tagged and gate-excluded.
+- **Determinism gate:** before a case is frozen, its EMU run is repeated and must
+  be byte-identical; non-deterministic cases are flagged and excluded (we only
+  freeze deterministic goldens). HW-side flakiness is caught by the campaign's
+  repeat captures; determinism status is recorded in `meta.capture`.
+
+**Testing the tooling itself** (not just the corpus). Schema-first pays off here:
+`CaseMeta`/`Manifest` round-trip (de)serialization tests; a unit test for the
+curation selection algorithm (grid floor / tag floor / all-divergences / dedup)
+over a synthetic case set; and a tiny synthetic fixture corpus (a couple of
+hand-made agree + diverge cases) that exercises the gate's pass / regress /
+diverge-tripwire / diff-report paths without the real corpus. The
+capture/curate/replay code is covered like any subsystem (the finish-to-100%
+rule).
+
+**Complementary (non-Phoenix) oracle: aiesim.** *Newly proven this session*
+(`docs/aiesimulator.md`, "Running Peano-compiled cores"): a Peano core runs
+correctly through AMD's cycle-approximate `aiesimulator` (scalar + vector),
+giving a **functional oracle that needs no Phoenix** — it can answer *new* AIE2
+questions after the swap, where the frozen corpus only answers the ones we
+thought to capture. It is *complementary*, not a substitute: license-gated and
+not silicon-exact, so it does not replace the distributable, silicon-exact
+corpus; it does reduce how much purely-functional breadth the corpus must carry.
+**A larger role for aiesim is intended (to be defined after this spec
+consolidates) and is deliberately out of scope here** — noted so the spec
+records the asset without re-architecting around it.
+
+**Inventory of remaining Phoenix-gated tracks** (named follow-on specs):
+- **Track B — Trace corpus:** golden NPU1 Perfetto traces for the trace-fidelity
+  regression. Different pipeline (the trace tooling/strategy layer; decode partly
+  upstream-owned). See `docs/trace/`.
+- **Track C — HW-gated verifications:** the Vector / SideEffect "Unverified"
+  semantics (coverage memory flags these; the Perf_Counter cycle oracle is broken
+  for NPU1). First sub-task: confirm the recording isn't stale — a grep for
+  Unverified markers in `docs/coverage/aie2/implementation-gaps.md` found nothing,
+  so the open-item list itself may need a pass. (The aiesim oracle above may now
+  cover part of this functionally — weigh that when Track C is specced.)
+- **Track D — Raw-breadth reservoir (the unknown-unknown hedge):** broad raw
+  Phoenix artifacts *not* tied to current understanding — raw traces across
+  diverse kernels, capability/register surveys, firmware+driver+toolchain version
+  pinning — stored raw for future re-interrogation. Explicit goal: make unknown
+  unknowns cheap to absorb.
 
 ---
 
-## Resume checklist
+## Next steps
 
-1. Flesh out Sections 3–5 (above), getting per-section approval.
-2. Spec self-review (placeholders / consistency / scope / ambiguity).
-3. User review gate (Maya reviews this file).
-4. Invoke `writing-plans` for the implementation plan.
+1. ~~Flesh out Sections 3–5.~~ **Done** — all five sections written.
+2. ~~Spec self-review (placeholders / consistency / scope / ambiguity).~~ **Done.**
+3. ~~User review gate (Maya reviews this file).~~ **Done — approved 2026-06-01.**
+4. **Invoke `writing-plans` for the implementation plan.** <- we are here.
 
 Related: memory `project_strix_swap_replaces_phoenix`,
 `project_coverage_plan2_done_regroup_before_plan3`, `feedback_pace_methodical_over_fast`;
