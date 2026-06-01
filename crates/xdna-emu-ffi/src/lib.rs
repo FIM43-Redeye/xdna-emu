@@ -193,7 +193,27 @@ pub(crate) fn select_backend(
     match kind {
         "interpreter" => Ok(Box::new(crate::backend::InterpreterBackend::new(make_interp()))),
         "aiesim" => {
-            Err("XDNA_BACKEND=aiesim: this build has no aiesim backend (Plan B not yet built)".to_string())
+            #[cfg(feature = "aiesim")]
+            {
+                // Arch + device JSON come from parsed-xclbin context in the real
+                // flow; for the initial backend default to aie2 + discovered JSON.
+                // (Threading real arch/JSON through is Task II.6.)
+                let arch = "aie2";
+                let device_json = std::env::var("XDNA_AIESIM_DEVICE_JSON").map_err(|_| {
+                    "XDNA_BACKEND=aiesim: set XDNA_AIESIM_DEVICE_JSON to the cluster device model".to_string()
+                })?;
+                let bridge = crate::aiesim::bridge::DlopenBridge::open(arch, &device_json)?;
+                // Topology is queried from the cluster in the bridge; default to
+                // NPU1 geometry here until the query is wired (Task II.6).
+                let backend =
+                    crate::aiesim::backend::AiesimBackend::new(Box::new(bridge), arch.to_string(), 5, 6);
+                Ok(Box::new(backend))
+            }
+            #[cfg(not(feature = "aiesim"))]
+            {
+                Err("XDNA_BACKEND=aiesim: this build has no aiesim support (rebuild with --features aiesim)"
+                    .to_string())
+            }
         }
         other => Err(format!("XDNA_BACKEND={other}: unknown backend")),
     }
