@@ -82,48 +82,55 @@ pub trait NpuBackend {
     }
 }
 
-impl NpuBackend for InterpreterEngine {
+/// The interpreter backend: the pure-ISA `InterpreterEngine` plus (a later task)
+/// its runtime-sequence executor. The engine itself stays a clean core type; this
+/// FFI-side wrapper is where host/firmware-level driving lives.
+pub(crate) struct InterpreterBackend {
+    pub(crate) engine: InterpreterEngine,
+}
+
+impl InterpreterBackend {
+    pub(crate) fn new(engine: InterpreterEngine) -> Self {
+        Self { engine }
+    }
+}
+
+impl NpuBackend for InterpreterBackend {
     fn apply_cdo(&mut self, cdo: &Cdo<'_>) -> Result<(), String> {
-        // DeviceState::apply_cdo returns anyhow::Result<()>; normalize the
-        // error to String (Display is sufficient for the FFI boundary).
-        self.device_mut().apply_cdo(cdo).map_err(|e| e.to_string())
+        self.engine.device_mut().apply_cdo(cdo).map_err(|e| e.to_string())
     }
     fn set_start_col(&mut self, start_col: u8) {
-        self.device_mut().set_start_col(start_col);
+        self.engine.device_mut().set_start_col(start_col);
     }
     fn load_elf_bytes(&mut self, col: usize, row: usize, data: &[u8]) -> Result<u32, String> {
-        InterpreterEngine::load_elf_bytes(self, col, row, data)
+        self.engine.load_elf_bytes(col, row, data)
     }
     fn host_memory_mut(&mut self) -> &mut HostMemory {
-        InterpreterEngine::host_memory_mut(self)
+        self.engine.host_memory_mut()
     }
     fn sync_cores_from_device(&mut self) {
-        InterpreterEngine::sync_cores_from_device(self);
+        self.engine.sync_cores_from_device();
     }
     fn reset_for_new_context(&mut self) {
-        InterpreterEngine::reset_for_new_context(self);
+        self.engine.reset_for_new_context();
     }
     fn reset_context(&mut self, cid: ContextId) -> Result<(), ()> {
-        self.device_mut().reset_context(cid).map_err(|_| ())
+        self.engine.device_mut().reset_context(cid).map_err(|_| ())
     }
-    // Deliberately delegate to `self.device().X()`, NOT `self.X()` — the latter
-    // would re-enter this trait method and infinitely recurse. (The methods
-    // above use `InterpreterEngine::X(self)` UFCS for the same reason.)
     fn cols(&self) -> usize {
-        self.device().cols()
+        self.engine.device().cols()
     }
     fn rows(&self) -> usize {
-        self.device().rows()
+        self.engine.device().rows()
     }
     fn arch_name(&self) -> String {
-        self.device().arch_name().to_string()
+        self.engine.device().arch_name().to_string()
     }
-
     fn as_interpreter(&self) -> Option<&InterpreterEngine> {
-        Some(self)
+        Some(&self.engine)
     }
     fn as_interpreter_mut(&mut self) -> Option<&mut InterpreterEngine> {
-        Some(self)
+        Some(&mut self.engine)
     }
 }
 
@@ -239,10 +246,10 @@ mod tests {
     #[test]
     fn interpreter_implements_backend_and_downcasts() {
         use xdna_emu_core::interpreter::engine::InterpreterEngine;
-        let mut eng = InterpreterEngine::new_npu1();
+        let mut be = super::InterpreterBackend::new(InterpreterEngine::new_npu1());
 
         // Trait methods reflect the real device.
-        let b: &mut dyn NpuBackend = &mut eng;
+        let b: &mut dyn NpuBackend = &mut be;
         assert_eq!(b.cols(), 5);
         assert_eq!(b.rows(), 6);
         assert!(b.arch_name().to_lowercase().contains("npu") || b.arch_name().to_lowercase().contains("aie"));

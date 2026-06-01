@@ -191,7 +191,7 @@ pub(crate) fn select_backend(
     make_interp: impl FnOnce() -> InterpreterEngine,
 ) -> Result<Box<dyn crate::backend::NpuBackend>, String> {
     match kind {
-        "interpreter" => Ok(Box::new(make_interp())),
+        "interpreter" => Ok(Box::new(crate::backend::InterpreterBackend::new(make_interp()))),
         "aiesim" => {
             Err("XDNA_BACKEND=aiesim: this build has no aiesim backend (Plan B not yet built)".to_string())
         }
