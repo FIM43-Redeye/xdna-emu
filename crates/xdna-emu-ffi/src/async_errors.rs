@@ -66,7 +66,14 @@ pub unsafe extern "C" fn xdna_emu_get_last_async_error(
     }
 
     let handle = &mut *handle;
-    match handle.engine.device().async_errors.last_cache() {
+    match handle
+        .backend
+        .as_interpreter()
+        .expect("Plan A: interpreter backend")
+        .device()
+        .async_errors
+        .last_cache()
+    {
         Some(rec) => {
             *out = XdnaEmuAsyncError::from(rec);
             1
@@ -91,7 +98,13 @@ pub unsafe extern "C" fn xdna_emu_clear_async_errors(handle: *mut XdnaEmuHandle)
     }
 
     let handle = &mut *handle;
-    handle.engine.device_mut().async_errors.clear();
+    handle
+        .backend
+        .as_interpreter_mut()
+        .expect("Plan A: interpreter backend")
+        .device_mut()
+        .async_errors
+        .clear();
     0
 }
 
@@ -126,7 +139,14 @@ pub unsafe extern "C" fn xdna_emu_read_async_event_ring(
         Ok(c) => c,
         Err(_) => return -2,
     };
-    let ring = match handle.engine.device().async_errors.ring(col_u8) {
+    let ring = match handle
+        .backend
+        .as_interpreter()
+        .expect("Plan A: interpreter backend")
+        .device()
+        .async_errors
+        .ring(col_u8)
+    {
         Some(r) => r,
         None => return -2,
     };
@@ -155,7 +175,14 @@ pub unsafe extern "C" fn xdna_emu_async_event_pending(handle: *mut XdnaEmuHandle
         Ok(c) => c,
         Err(_) => return -2,
     };
-    match handle.engine.device().async_errors.ring(col_u8) {
+    match handle
+        .backend
+        .as_interpreter()
+        .expect("Plan A: interpreter backend")
+        .device()
+        .async_errors
+        .ring(col_u8)
+    {
         Some(r) if r.header().err_cnt > 0 => 1,
         Some(_) => 0,
         None => -2,
@@ -198,7 +225,13 @@ pub unsafe extern "C" fn xdna_emu_set_async_event_callback(
 /// `handle` must be a valid mutable reference.
 pub(crate) unsafe fn fire_async_callbacks_for(handle: &mut XdnaEmuHandle) {
     let Some(cb) = handle.async_callback else { return };
-    let drained = handle.engine.device_mut().async_errors.drain_newly_recorded();
+    let drained = handle
+        .backend
+        .as_interpreter_mut()
+        .expect("Plan A: interpreter backend")
+        .device_mut()
+        .async_errors
+        .drain_newly_recorded();
     for rec in drained {
         let xrec = XdnaEmuAsyncError::from(&rec);
         (cb.func)(&xrec as *const _, cb.user_data);
@@ -237,7 +270,11 @@ mod tests {
                 assert_eq!(rc, 0);
 
                 // Drive a record, then call the drain helper directly.
-                let dev = (*h).engine.device_mut();
+                let dev = (*h)
+                    .backend
+                    .as_interpreter_mut()
+                    .expect("Plan A: interpreter backend")
+                    .device_mut();
                 dev.async_errors.record_error(1, 2, AieErrorOrigin::Core, 69, 50_000);
 
                 // The drain happens inside xdna_emu_run between engine steps.
@@ -258,7 +295,11 @@ mod tests {
                 xdna_emu_set_async_event_callback(h, Some(test_callback), std::ptr::null_mut());
                 xdna_emu_set_async_event_callback(h, None, std::ptr::null_mut());
 
-                let dev = (*h).engine.device_mut();
+                let dev = (*h)
+                    .backend
+                    .as_interpreter_mut()
+                    .expect("Plan A: interpreter backend")
+                    .device_mut();
                 dev.async_errors.record_error(1, 2, AieErrorOrigin::Core, 69, 50_000);
 
                 fire_async_callbacks_for(&mut *h);
@@ -306,7 +347,11 @@ mod tests {
         unsafe {
             with_handle(|h| {
                 // Drive a record directly through the sink (no engine step needed).
-                let dev = (*h).engine.device_mut();
+                let dev = (*h)
+                    .backend
+                    .as_interpreter_mut()
+                    .expect("Plan A: interpreter backend")
+                    .device_mut();
                 dev.array.set_dma_cycle(50_000);
                 dev.async_errors.record_error(1, 2, AieErrorOrigin::Core, 69, 50_000);
 
@@ -342,7 +387,11 @@ mod tests {
     fn clear_async_errors_resets_cache() {
         unsafe {
             with_handle(|h| {
-                let dev = (*h).engine.device_mut();
+                let dev = (*h)
+                    .backend
+                    .as_interpreter_mut()
+                    .expect("Plan A: interpreter backend")
+                    .device_mut();
                 dev.async_errors.record_error(1, 2, AieErrorOrigin::Core, 69, 50_000);
                 let rc = xdna_emu_clear_async_errors(h);
                 assert_eq!(rc, 0);
@@ -379,7 +428,11 @@ mod tests {
     fn read_async_event_ring_returns_payload_after_record() {
         unsafe {
             with_handle(|h| {
-                let dev = (*h).engine.device_mut();
+                let dev = (*h)
+                    .backend
+                    .as_interpreter_mut()
+                    .expect("Plan A: interpreter backend")
+                    .device_mut();
                 dev.async_errors.record_error(1, 2, AieErrorOrigin::Core, 69, 1_000);
 
                 let mut buf = vec![0u8; 64];
@@ -438,7 +491,11 @@ mod tests {
     fn async_event_pending_one_after_record() {
         unsafe {
             with_handle(|h| {
-                let dev = (*h).engine.device_mut();
+                let dev = (*h)
+                    .backend
+                    .as_interpreter_mut()
+                    .expect("Plan A: interpreter backend")
+                    .device_mut();
                 dev.async_errors.record_error(3, 2, AieErrorOrigin::Core, 69, 1_000);
                 assert_eq!(xdna_emu_async_event_pending(h, 3), 1);
                 assert_eq!(xdna_emu_async_event_pending(h, 0), 0, "col 0 still empty");

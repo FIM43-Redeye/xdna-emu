@@ -34,7 +34,7 @@ pub unsafe extern "C" fn xdna_emu_alloc_host_region(
         }
     };
 
-    let host_mem = handle.engine.host_memory_mut();
+    let host_mem = handle.backend.host_memory_mut();
     let _ = host_mem.allocate_region(&region_name, address, size as usize);
 
     // Also register with NPU executor for address patching
@@ -71,7 +71,7 @@ pub unsafe extern "C" fn xdna_emu_write_host_memory(
     let data_slice = slice::from_raw_parts(data, size as usize);
 
     // Write as u32 words
-    let host_mem = handle.engine.host_memory_mut();
+    let host_mem = handle.backend.host_memory_mut();
     for (i, chunk) in data_slice.chunks(4).enumerate() {
         let mut word = [0u8; 4];
         word[..chunk.len()].copy_from_slice(chunk);
@@ -109,7 +109,7 @@ pub unsafe extern "C" fn xdna_emu_read_host_memory(
     let data_slice = slice::from_raw_parts_mut(data, size as usize);
 
     // Read as u32 words
-    let host_mem = handle.engine.host_memory_mut();
+    let host_mem = handle.backend.host_memory_mut();
     for (i, chunk) in data_slice.chunks_mut(4).enumerate() {
         let value = host_mem.read_u32(address + (i * 4) as u64);
         let bytes = value.to_le_bytes();
@@ -198,7 +198,7 @@ pub unsafe extern "C" fn xdna_emu_alloc_buffer(handle: *mut XdnaEmuHandle, size:
 
     let addr = recycled.unwrap_or(handle.next_alloc_addr);
 
-    let host_mem = handle.engine.host_memory_mut();
+    let host_mem = handle.backend.host_memory_mut();
     let name = format!("alloc_{:x}", addr);
     if host_mem.allocate_region(&name, addr, aligned_size as usize).is_err() {
         log::error!("Failed to allocate buffer at 0x{:x} size {}", addr, aligned_size);
@@ -251,7 +251,7 @@ pub unsafe extern "C" fn xdna_emu_free_buffer(handle: *mut XdnaEmuHandle, addr: 
     }
 
     let handle = &mut *handle;
-    let host_mem = handle.engine.host_memory_mut();
+    let host_mem = handle.backend.host_memory_mut();
     // Look up the size BEFORE freeing so we can return the range to the
     // free list with the same aligned size we registered it with.
     let region_size = host_mem.region_at(addr).map(|r| r.size as u64);

@@ -34,7 +34,7 @@ pub unsafe extern "C" fn xdna_emu_get_context_state(
         return -1;
     }
     let handle = &*handle;
-    let device = handle.engine.device();
+    let device = handle.backend.as_interpreter().expect("Plan A: interpreter backend").device();
     let ctx = match device.contexts.get(context_id as usize) {
         Some(c) => c,
         None => return -2,
@@ -64,7 +64,11 @@ mod tests {
         // are visible here since we are inside the xdna_emu_ffi crate).
         {
             let handle_mut = unsafe { &mut *handle };
-            let device = handle_mut.engine.device_mut();
+            let device = handle_mut
+                .backend
+                .as_interpreter_mut()
+                .expect("test interpreter backend")
+                .device_mut();
             use xdna_emu_core::device::tdr::{TdrDiagnosis, WedgeReason};
             device.contexts[0].mark_failed(
                 WedgeReason::Quiescent,
@@ -83,7 +87,13 @@ mod tests {
 
         {
             let handle_ref = unsafe { &*handle };
-            assert!(handle_ref.engine.device().contexts[0].is_connected());
+            assert!(handle_ref
+                .backend
+                .as_interpreter()
+                .expect("test interpreter backend")
+                .device()
+                .contexts[0]
+                .is_connected());
         }
 
         unsafe { xdna_emu_destroy(handle) };

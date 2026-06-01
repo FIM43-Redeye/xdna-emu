@@ -95,9 +95,9 @@ unsafe impl Send for AsyncErrorCallback {}
 unsafe impl Sync for AsyncErrorCallback {}
 
 /// Opaque handle to emulator state.
-/// Wraps InterpreterEngine and related state.
+/// Wraps an NpuBackend and related state.
 pub struct XdnaEmuHandle {
-    pub(crate) engine: InterpreterEngine,
+    pub(crate) backend: Box<dyn crate::backend::NpuBackend>,
     pub(crate) xclbin_path: Option<String>,
     pub(crate) npu_executor: NpuExecutor,
     pub(crate) max_cycles: u64,
@@ -212,7 +212,7 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
     let mut engine = InterpreterEngine::new_npu1();
     engine.set_stall_threshold(config.stall_threshold());
     let handle = Box::new(XdnaEmuHandle {
-        engine,
+        backend: Box::new(engine),
         xclbin_path: None,
         npu_executor: NpuExecutor::new(),
         max_cycles: config.max_cycles(),
@@ -271,11 +271,11 @@ pub unsafe extern "C" fn xdna_emu_reset_context(
     let handle = &mut *handle;
     use xdna_emu_core::device::context::ContextId;
     let cid = ContextId(context_id);
-    if handle.engine.device_mut().reset_context(cid).is_err() {
+    if handle.backend.reset_context(cid).is_err() {
         log::error!("xdna_emu_reset_context: invalid context_id {}", context_id);
         return XdnaEmuResult::ExecutionError;
     }
-    handle.engine.reset_for_new_context();
+    handle.backend.reset_for_new_context();
     log::debug!("xdna_emu_reset_context: cleared per-context tile state for ctx {}", context_id);
     XdnaEmuResult::Success
 }

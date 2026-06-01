@@ -64,7 +64,11 @@ pub unsafe extern "C" fn xdna_emu_assign_partition(
     }
 
     let handle = &mut *handle;
-    let device = handle.engine.device_mut();
+    let device = handle
+        .backend
+        .as_interpreter_mut()
+        .expect("Plan A: interpreter backend")
+        .device_mut();
     let total_cols = device.cols();
     let total_rows = device.array.rows() as u32;
     // AIE2 layout: row 0 = shim, row 1 = memtile, rows 2.. = compute.
@@ -120,7 +124,13 @@ mod tests {
             let h = unsafe { &*handle };
             for col in 0..5 {
                 assert!(
-                    !h.engine.device().array.clock().is_column_active(col),
+                    !h.backend
+                        .as_interpreter()
+                        .expect("test interpreter backend")
+                        .device()
+                        .array
+                        .clock()
+                        .is_column_active(col),
                     "col {} should be gated at boot",
                     col
                 );
@@ -131,10 +141,25 @@ mod tests {
         assert_eq!(rc, 0);
         {
             let h = unsafe { &*handle };
-            assert!(!h.engine.device().array.clock().is_column_active(0), "col 0 not in partition");
+            assert!(
+                !h.backend
+                    .as_interpreter()
+                    .expect("test interpreter backend")
+                    .device()
+                    .array
+                    .clock()
+                    .is_column_active(0),
+                "col 0 not in partition"
+            );
             for col in 1..=4 {
                 assert!(
-                    h.engine.device().array.clock().is_column_active(col),
+                    h.backend
+                        .as_interpreter()
+                        .expect("test interpreter backend")
+                        .device()
+                        .array
+                        .clock()
+                        .is_column_active(col),
                     "col {} should be ungated by the partition",
                     col
                 );
@@ -151,11 +176,50 @@ mod tests {
         assert_eq!(rc, 0);
         {
             let h = unsafe { &*handle };
-            assert!(!h.engine.device().array.clock().is_column_active(0));
-            assert!(h.engine.device().array.clock().is_column_active(1));
-            assert!(h.engine.device().array.clock().is_column_active(2));
-            assert!(!h.engine.device().array.clock().is_column_active(3), "col 3 outside partition");
-            assert!(!h.engine.device().array.clock().is_column_active(4), "col 4 outside partition");
+            assert!(!h
+                .backend
+                .as_interpreter()
+                .expect("test interpreter backend")
+                .device()
+                .array
+                .clock()
+                .is_column_active(0));
+            assert!(h
+                .backend
+                .as_interpreter()
+                .expect("test interpreter backend")
+                .device()
+                .array
+                .clock()
+                .is_column_active(1));
+            assert!(h
+                .backend
+                .as_interpreter()
+                .expect("test interpreter backend")
+                .device()
+                .array
+                .clock()
+                .is_column_active(2));
+            assert!(
+                !h.backend
+                    .as_interpreter()
+                    .expect("test interpreter backend")
+                    .device()
+                    .array
+                    .clock()
+                    .is_column_active(3),
+                "col 3 outside partition"
+            );
+            assert!(
+                !h.backend
+                    .as_interpreter()
+                    .expect("test interpreter backend")
+                    .device()
+                    .array
+                    .clock()
+                    .is_column_active(4),
+                "col 4 outside partition"
+            );
         }
         unsafe { xdna_emu_destroy(handle) };
     }

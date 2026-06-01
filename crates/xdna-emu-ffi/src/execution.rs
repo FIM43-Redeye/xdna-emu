@@ -86,6 +86,15 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
 
     let handle = &mut *handle;
 
+    if handle.backend.as_interpreter().is_none() {
+        return XdnaEmuExecStatus {
+            result: XdnaEmuResult::ExecutionError,
+            cycles_executed: 0,
+            halted: false,
+            halt_reason: XdnaEmuHaltReason::Error,
+        };
+    }
+
     let mut cycles = 0u64;
     let max = handle.max_cycles;
     // max == 0 means unbounded: the loop runs until a natural exit point.
@@ -104,7 +113,7 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
     // forgot to call xdna_emu_reset_context after a prior wedge.
     {
         use xdna_emu_core::device::context::DEFAULT_CONTEXT;
-        let device = handle.engine.device();
+        let device = handle.backend.as_interpreter().expect("Plan A: interpreter backend").device();
         let ctx = &device.contexts[DEFAULT_CONTEXT.0 as usize];
         if !ctx.is_connected() {
             log::error!(
@@ -136,12 +145,24 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
     // test needs a budget much larger than 100k), but documented here so
     // a smoke-test-sized budget isn't mistaken for a "kernel did nothing"
     // signal.
-    if handle.engine.enabled_cores() > 0 && !handle.npu_executor.is_done() {
+    if handle
+        .backend
+        .as_interpreter()
+        .expect("Plan A: interpreter backend")
+        .enabled_cores()
+        > 0
+        && !handle.npu_executor.is_done()
+    {
         const MAX_WARMUP: u64 = 100_000;
         while cycles < MAX_WARMUP {
-            handle.engine.step();
+            handle.backend.as_interpreter_mut().expect("Plan A: interpreter backend").step();
             cycles += 1;
-            if handle.engine.all_cores_blocked() {
+            if handle
+                .backend
+                .as_interpreter()
+                .expect("Plan A: interpreter backend")
+                .all_cores_blocked()
+            {
                 break;
             }
         }
@@ -161,17 +182,31 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         // NPU executor runs. Register-write side effects (trace unit
         // start/stop, broadcast propagation) driven by NPU instructions
         // read array.current_cycle to time-stamp events.
-        handle.engine.device_mut().array.set_dma_cycle(cycles);
+        handle
+            .backend
+            .as_interpreter_mut()
+            .expect("Plan A: interpreter backend")
+            .device_mut()
+            .array
+            .set_dma_cycle(cycles);
 
         // Advance NPU instruction execution (interleaved with engine step).
         let npu_progressed;
         {
-            let (device, host_mem) = handle.engine.device_and_host_memory();
+            let (device, host_mem) = handle
+                .backend
+                .as_interpreter_mut()
+                .expect("Plan A: interpreter backend")
+                .device_and_host_memory();
             let result = handle.npu_executor.try_advance(device, host_mem);
             if let xdna_emu_core::npu::AdvanceResult::Error(msg) = result {
                 log::error!("NPU executor fatal: {}", msg);
                 // Flush trace before returning so partial data reaches DDR.
-                handle.engine.flush_trace_to_host();
+                handle
+                    .backend
+                    .as_interpreter_mut()
+                    .expect("Plan A: interpreter backend")
+                    .flush_trace_to_host();
                 return XdnaEmuExecStatus {
                     result: XdnaEmuResult::ExecutionError,
                     cycles_executed: cycles,
@@ -195,7 +230,11 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         // latency is invisible to firmware; in the emulator, routing is batched
         // per cycle so control packet register writes can lag behind.
         if npu_progressed {
-            handle.engine.flush_ctrl_packets();
+            handle
+                .backend
+                .as_interpreter_mut()
+                .expect("Plan A: interpreter backend")
+                .flush_ctrl_packets();
         }
 
         // DMA-only path: when no cores are enabled the engine halts
@@ -203,10 +242,14 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         // triggering DMA. force_running() lets step() keep advancing DMA
         // and stream switches. No-op when the engine is already Running.
         if !handle.npu_executor.is_done() {
-            handle.engine.force_running();
+            handle
+                .backend
+                .as_interpreter_mut()
+                .expect("Plan A: interpreter backend")
+                .force_running();
         }
 
-        handle.engine.step();
+        handle.backend.as_interpreter_mut().expect("Plan A: interpreter backend").step();
         // Tier B: drain newly-recorded async errors and fire the registered
         // callback (if any). Mirrors the flush_trace_to_host pattern -- FFI
         // layer observes between engine steps.
@@ -214,10 +257,15 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         cycles += 1;
 
         // Build per-cycle snapshots and classify.
-        let engine_signals = build_engine_signals(&handle.engine);
-        let executor_signals = build_executor_signals(&mut handle.npu_executor, &handle.engine);
+        let interp = handle.backend.as_interpreter().expect("Plan A: interpreter backend");
+        let engine_signals = build_engine_signals(interp);
+        let executor_signals = build_executor_signals(&mut handle.npu_executor, interp);
 
-        let device = handle.engine.device_mut();
+        let device = handle
+            .backend
+            .as_interpreter_mut()
+            .expect("Plan A: interpreter backend")
+            .device_mut();
         let detector = &mut device.tdr_detectors[DEFAULT_CONTEXT.0 as usize];
         let verdict = detector.classify(&engine_signals, Some(&executor_signals));
 
@@ -245,11 +293,19 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
     // Flush any pending trace packets through the stream switch to host DDR.
     // Trace units may have partial packets buffered; flush() pads and emits
     // them, then step_data_movement() routes them through the network.
-    handle.engine.flush_trace_to_host();
+    handle
+        .backend
+        .as_interpreter_mut()
+        .expect("Plan A: interpreter backend")
+        .flush_trace_to_host();
 
     // On wedge, transition context state.
     if let Some((reason, diagnosis)) = wedged {
-        let device = handle.engine.device_mut();
+        let device = handle
+            .backend
+            .as_interpreter_mut()
+            .expect("Plan A: interpreter backend")
+            .device_mut();
         device.contexts[DEFAULT_CONTEXT.0 as usize].mark_failed(reason, diagnosis);
         return XdnaEmuExecStatus {
             result: XdnaEmuResult::Success,
@@ -265,7 +321,11 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
 
     // On natural completion, advance the context's completed_counter.
     if natural_halt && !maskpoll_unsatisfied {
-        let device = handle.engine.device_mut();
+        let device = handle
+            .backend
+            .as_interpreter_mut()
+            .expect("Plan A: interpreter backend")
+            .device_mut();
         device.contexts[DEFAULT_CONTEXT.0 as usize].note_submission_complete();
     }
 

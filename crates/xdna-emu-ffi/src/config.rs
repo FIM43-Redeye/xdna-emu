@@ -92,7 +92,7 @@ pub unsafe extern "C" fn xdna_emu_load_xclbin(
     // Sync.column), so the load_xclbin path lands partition-aware
     // addressing end to end.  Empty list (older xclbins): leave at 0.
     let start_col = partition.start_columns().first().copied().unwrap_or(0);
-    handle.engine.device_mut().set_start_col(start_col as u8);
+    handle.backend.set_start_col(start_col as u8);
     log::info!("load_xclbin: physical start_col = {}", start_col);
 
     // Apply PDI through the shared golden path.
@@ -149,7 +149,7 @@ pub(super) fn apply_pdi_data(handle: &mut XdnaEmuHandle, data: &[u8]) -> XdnaEmu
     };
 
     // Apply CDO to device.
-    if let Err(e) = handle.engine.device_mut().apply_cdo(&cdo) {
+    if let Err(e) = handle.backend.apply_cdo(&cdo) {
         let msg = format!("Failed to apply CDO: {}", e);
         log::error!("{}", msg);
         set_last_error(msg);
@@ -233,7 +233,7 @@ pub unsafe extern "C" fn xdna_emu_load_elf(
         }
     };
 
-    if let Err(e) = handle.engine.load_elf_bytes(col as usize, row as usize, &elf_data) {
+    if let Err(e) = handle.backend.load_elf_bytes(col as usize, row as usize, &elf_data) {
         log::error!("Failed to load ELF: {}", e);
         return XdnaEmuResult::ParseError;
     }
@@ -250,7 +250,7 @@ pub unsafe extern "C" fn xdna_emu_sync_cores(handle: *mut XdnaEmuHandle) -> Xdna
     }
 
     let handle = &mut *handle;
-    handle.engine.sync_cores_from_device();
+    handle.backend.sync_cores_from_device();
 
     XdnaEmuResult::Success
 }
@@ -278,7 +278,7 @@ pub unsafe extern "C" fn xdna_emu_set_start_col(handle: *mut XdnaEmuHandle, star
     }
 
     let handle = &mut *handle;
-    handle.engine.device_mut().set_start_col(start_col);
+    handle.backend.set_start_col(start_col);
     log::info!("xdna_emu_set_start_col: start_col = {}", start_col);
     XdnaEmuResult::Success
 }

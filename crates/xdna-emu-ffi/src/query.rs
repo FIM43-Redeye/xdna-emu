@@ -29,7 +29,11 @@ pub unsafe extern "C" fn xdna_emu_read_register(
     }
 
     let handle = &mut *handle;
-    let device = handle.engine.device_mut();
+    let device = handle
+        .backend
+        .as_interpreter_mut()
+        .expect("Plan A: interpreter backend")
+        .device_mut();
 
     if let Some(tile) = device.tile_mut(col as usize, row as usize) {
         tile.read_register(reg_addr)
@@ -62,7 +66,11 @@ pub unsafe extern "C" fn xdna_emu_write_register(
     }
 
     let handle = &mut *handle;
-    let device = handle.engine.device_mut();
+    let device = handle
+        .backend
+        .as_interpreter_mut()
+        .expect("Plan A: interpreter backend")
+        .device_mut();
 
     if device.tile(col as usize, row as usize).is_some() {
         device.write_tile_register(col as u8, row as u8, reg_addr, value);
@@ -106,7 +114,11 @@ pub unsafe extern "C" fn xdna_emu_read_tile_memory(
     }
 
     let handle = &mut *handle;
-    let device = handle.engine.device_mut();
+    let device = handle
+        .backend
+        .as_interpreter_mut()
+        .expect("Plan A: interpreter backend")
+        .device_mut();
 
     let tile = match device.tile_mut(col as usize, row as usize) {
         Some(t) => t,
@@ -159,7 +171,11 @@ pub unsafe extern "C" fn xdna_emu_write_tile_memory(
     }
 
     let handle = &mut *handle;
-    let device = handle.engine.device_mut();
+    let device = handle
+        .backend
+        .as_interpreter_mut()
+        .expect("Plan A: interpreter backend")
+        .device_mut();
 
     let tile = match device.tile_mut(col as usize, row as usize) {
         Some(t) => t,
@@ -188,7 +204,7 @@ pub unsafe extern "C" fn xdna_emu_get_columns(handle: *mut XdnaEmuHandle) -> u8 
         return 0;
     }
     let handle = &*handle;
-    handle.engine.device().cols() as u8
+    handle.backend.cols() as u8
 }
 
 /// Get the number of tile rows in the emulated device.
@@ -201,7 +217,7 @@ pub unsafe extern "C" fn xdna_emu_get_rows(handle: *mut XdnaEmuHandle) -> u8 {
         return 0;
     }
     let handle = &*handle;
-    handle.engine.device().rows() as u8
+    handle.backend.rows() as u8
 }
 
 /// Get the device name string (e.g. "NPU Phoenix (Emulated)").
@@ -223,7 +239,7 @@ pub unsafe extern "C" fn xdna_emu_get_device_name(
     }
 
     let handle = &*handle;
-    let arch_name = handle.engine.device().arch_name();
+    let arch_name = handle.backend.arch_name();
     let name = format!("NPU Phoenix (Emulated) [{}]", arch_name);
 
     let bytes = name.as_bytes();
@@ -283,7 +299,7 @@ pub unsafe extern "C" fn xdna_emu_get_lock_value(
     }
 
     let handle = &*handle;
-    let device = handle.engine.device();
+    let device = handle.backend.as_interpreter().expect("Plan A: interpreter backend").device();
 
     let tile = match device.tile(col as usize, row as usize) {
         Some(t) => t,
@@ -335,7 +351,7 @@ pub unsafe extern "C" fn xdna_emu_get_dma_channel_state(
     }
 
     let handle = &*handle;
-    let device = handle.engine.device();
+    let device = handle.backend.as_interpreter().expect("Plan A: interpreter backend").device();
 
     let engine = match device.array.dma_engine(col as u8, row as u8) {
         Some(e) => e,
@@ -391,7 +407,7 @@ pub unsafe extern "C" fn xdna_emu_get_dma_channel_stats(
     }
 
     let handle = &*handle;
-    let device = handle.engine.device();
+    let device = handle.backend.as_interpreter().expect("Plan A: interpreter backend").device();
 
     let engine = match device.array.dma_engine(col as u8, row as u8) {
         Some(e) => e,
@@ -439,7 +455,7 @@ pub unsafe extern "C" fn xdna_emu_dump_tile_state(
     }
 
     let handle = &*handle;
-    let device = handle.engine.device();
+    let device = handle.backend.as_interpreter().expect("Plan A: interpreter backend").device();
 
     let tile = match device.tile(col as usize, row as usize) {
         Some(t) => t,
