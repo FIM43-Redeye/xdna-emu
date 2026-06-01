@@ -1228,104 +1228,159 @@ placeholders refined in the next task. Mock-driven unit tests.
 Generated using Claude Code."
 ```
 
-### Task I.8: CDO + NPU op-stream encoding + host-memory flush
+### Task I.8: CDO + NPU op-stream encoding + host-buffer forwarding + flush
 
 **Files:**
-- Modify: `crates/xdna-emu-ffi/src/aiesim/backend.rs` (replace the three placeholders)
+- Modify: `crates/xdna-emu-ffi/src/aiesim/backend.rs` (replace the three placeholders;
+  forward host buffers)
+- Modify: `crates/xdna-emu-ffi/src/aiesim/abi.rs` (`BridgeAbi` gains `add_host_buffer`
+  / `clear_host_buffers`; `MockBridge` implements them)
 
-Define how a parsed `Cdo` and an `NpuInstructionStream` become the byte streams the
-bridge replays, and how populated host-memory regions flush into the bridge GM.
-**Keep the encoding a faithful pass-through of the parser's op-stream** — the same
-ops the interpreter consumes — so a cross-check isolates execution divergence (spec
-§5, Path 2).
+**Design (Option 1 — faithful serialize in Rust, translate in the C++ bridge).**
+The CDO and NPU op models genuinely diverge, and the NPU stream carries two ops
+that are NOT plain register writes: `DdrPatch` (patch a BD register with a host
+buffer's DDR address) and `Sync` (wait for a DMA channel). Per the agreed design,
+the **Rust encoders serialize every op verbatim** (a lossless, round-trippable wire
+format); the **C++ bridge decoder (Part II)** does the semantic work — resolving
+`DdrPatch` against the host buffers it was given and mapping `Sync` to a DMA wait.
+So Part I is pure plumbing (sandbox-testable); semantic correctness is validated
+against the real cluster in Part II.
 
-- [ ] **Step 1: Inspect the parser's op-stream shape**
+**Two separate tag spaces** (the models diverge). The real op variants (from the
+parser — verify against the source before coding):
+- `Cdo::commands() -> CdoRawIterator` yielding `CdoRaw`: `Write{addr u32,value u32}`,
+  `Write64{addr u64,value u32}`, `MaskWrite{addr u32,mask u32,value u32}`,
+  `MaskWrite64{addr u64,mask u32,value u32}`, `DmaWrite{addr u32,data Vec<u8>}`,
+  `MaskPoll{addr u32,mask u32,expected u32}`, `MaskPoll64{addr u64,mask u32,expected u32}`,
+  `Delay{cycles u32}`, `Nop{words u16}`, `EndMark`, `Marker{value u32}`,
+  `Unknown{opcode u16,payload Vec<u32>}`. (Paths: `src/parser/cdo/syntax.rs`.)
+- `NpuInstructionStream::instructions() -> &[NpuInstruction]`: `Write32{reg_off u32,value u32}`,
+  `BlockWrite{reg_off u32,values Vec<u32>}`, `MaskWrite{reg_off u32,value u32,mask u32}`,
+  `MaskPoll{reg_off u32,value u32,mask u32}`, `DdrPatch{reg_addr u32,arg_idx u8,arg_plus u32}`,
+  `Sync{channel u8,column u8,direction u8,column_num u8,row u8,row_num u8}`,
+  `Unknown{opcode u8,data Vec<u8>}`. (Path: `src/npu/parser.rs`.)
 
-Run: `grep -n "pub enum\|pub struct\|Write32\|BlockWrite\|MaskPoll" $(find .. -path '*parser*' -name '*.rs' | xargs grep -l "Cdo" | head)`
-and read the `Cdo` op iterator API (how the interpreter walks it today — find the
-interpreter's `apply_cdo` consumer). Capture the op variants (Write32, BlockWrite,
-MaskPoll, NoOp, etc.) and their fields.
+- [ ] **Step 1: Verify the op models against the source**
 
-- [ ] **Step 2: Write the failing encoding test**
+Read `src/parser/cdo/syntax.rs` (the `CdoRaw` enum + `Cdo::commands()` iterator) and
+`src/npu/parser.rs` (the `NpuInstruction` enum + `instructions()`), and confirm the
+variant fields above are current. If any differ, adapt the encoders to the real
+shapes (the source wins).
 
-In `backend.rs` tests, add (adjust op constructors to the real parser API found in
-Step 1):
+- [ ] **Step 2: Define the CDO wire format + `encode_cdo` (faithful, all variants)**
+
+All little-endian, one tagged record per op. Use a distinct CDO tag namespace:
 ```rust
-#[test]
-fn encode_cdo_emits_one_record_per_op() {
-    // Build a tiny CDO with a couple of Write32s (use the real parser builder
-    // or a fixture); assert encode_cdo produces a non-empty, length-consistent
-    // byte stream that decodes back to the same (addr,value) pairs.
-    // (Fill in with the concrete parser API from Step 1.)
+// CDO op tags -- decoder twin in aiesim-bridge/src/cdo_replay.cpp (Task II.5).
+mod cdo_tag {
+    pub const WRITE: u8 = 1;       // [addr u32][val u32]
+    pub const WRITE64: u8 = 2;     // [addr u64][val u32]
+    pub const MASK_WRITE: u8 = 3;  // [addr u32][mask u32][val u32]
+    pub const MASK_WRITE64: u8 = 4;// [addr u64][mask u32][val u32]
+    pub const DMA_WRITE: u8 = 5;   // [addr u32][len u32][bytes...]
+    pub const MASK_POLL: u8 = 6;   // [addr u32][mask u32][expected u32]
+    pub const MASK_POLL64: u8 = 7; // [addr u64][mask u32][expected u32]
+    pub const DELAY: u8 = 8;       // [cycles u32]
+    pub const MARKER: u8 = 9;      // [value u32]
 }
 ```
+`encode_cdo` iterates `cdo.commands()` and emits one record per op via
+`out.push(tag)` + `out.extend_from_slice(&field.to_le_bytes())`. SKIP `Nop` and
+`EndMark` (structural, no replay effect); for `Unknown`, skip but `log::warn!` (note
+it as encoder/parser drift). Keep a doc comment listing the format; the C++ decoder
+(II.5) mirrors it exactly.
 
-- [ ] **Step 3: Define a stable wire format and implement `encode_cdo`**
+- [ ] **Step 3: Define the NPU wire format + `encode_npu` (faithful, incl DdrPatch/Sync)**
 
-Replace the placeholder `encode_cdo` with a real encoder. Wire format (little-
-endian, one tagged record per op) — keep it minimal and mirror it in the C++
-`cdo_replay` decoder (Task II.5):
+Separate NPU tag namespace (the bridge routes `exec_npu` bytes to a distinct decoder):
 ```rust
-// Op tags (must match aiesim-bridge/src/cdo_replay.cpp).
-const OP_WRITE32: u8 = 1;
-const OP_BLOCKWRITE: u8 = 2;
-const OP_MASKPOLL: u8 = 3;
+// NPU op tags -- decoder twin in aiesim-bridge (Task II.5). DdrPatch/Sync are
+// serialized VERBATIM; the bridge resolves them (DdrPatch against host buffers,
+// Sync -> DMA wait). The Rust side does NO semantic translation.
+mod npu_tag {
+    pub const WRITE32: u8 = 1;     // [reg_off u32][val u32]
+    pub const BLOCK_WRITE: u8 = 2; // [reg_off u32][count u32][vals u32...]
+    pub const MASK_WRITE: u8 = 3;  // [reg_off u32][val u32][mask u32]
+    pub const MASK_POLL: u8 = 4;   // [reg_off u32][val u32][mask u32]
+    pub const DDR_PATCH: u8 = 5;   // [reg_addr u32][arg_idx u8][arg_plus u32]
+    pub const SYNC: u8 = 6;        // [channel u8][column u8][direction u8][column_num u8][row u8][row_num u8]
+}
+```
+`encode_npu` walks `stream.instructions()` and emits one record per instruction.
+SKIP `Unknown` with a `log::warn!`. Do NOT resolve DdrPatch or interpret Sync here —
+emit their raw fields.
 
-pub(crate) fn encode_cdo(cdo: &Cdo<'_>) -> Vec<u8> {
-    let mut out = Vec::new();
-    for op in cdo.ops() {       // <-- use the real iterator from Step 1
-        match op {
-            // Write32 { addr: u64, value: u32 }
-            //   [OP_WRITE32][addr u64][value u32]
-            // BlockWrite { addr: u64, words: &[u32] }
-            //   [OP_BLOCKWRITE][addr u64][count u32][words...]
-            // MaskPoll { addr: u64, mask: u32, value: u32 }
-            //   [OP_MASKPOLL][addr u64][mask u32][value u32]
-            // (Match on the actual parser enum; push bytes accordingly.)
-            _ => {}
-        }
+- [ ] **Step 4: Round-trip tests for both encoders**
+
+In `backend.rs` tests, write a tiny in-test decoder (parse the bytes back into
+`(tag, fields)` tuples) and assert the encoded stream round-trips for a handcrafted
+set of ops covering at least: a CDO `Write`, `Write64`, `DmaWrite`, `MaskPoll64`;
+and an NPU `Write32`, `BlockWrite`, `DdrPatch`, `Sync`. Build the `CdoRaw`/`Cdo` and
+`NpuInstruction`/`NpuInstructionStream` inputs via the real parser API (read
+`src/npu/parser.rs` / `src/parser/cdo/syntax.rs` for constructors or a `parse`
+fixture). Assert byte-length consistency and exact field recovery. This is the
+contract the Part II decoder must match.
+
+- [ ] **Step 5: Forward host buffers to the bridge (`BridgeAbi` + AiesimBackend)**
+
+The bridge resolves `DdrPatch` against host buffers, so it needs them. Add to the
+`BridgeAbi` trait (abi.rs), after `exec_npu`:
+```rust
+    /// Register a host buffer (DDR addr + size) so the bridge can resolve
+    /// DdrPatch records during exec_npu replay.
+    fn add_host_buffer(&mut self, addr: u64, size: usize) -> BridgeStatus;
+    /// Clear the registered host buffers (before a new submission).
+    fn clear_host_buffers(&mut self) -> BridgeStatus;
+```
+Implement both on `MockBridge` (record into a `Vec<(u64,usize)>` field
+`host_buffers` / clear it; return `Ok`). Then in `AiesimBackend`, change the two
+methods to ALSO forward to the bridge (keep the Rust-side `host_buffers` Vec for
+introspection, and forward):
+```rust
+    fn add_host_buffer(&mut self, address: u64, size: usize) {
+        self.host_buffers.push((address, size));
+        let _ = self.bridge.add_host_buffer(address, size);
     }
-    out
-}
+    fn clear_host_buffers(&mut self) {
+        self.host_buffers.clear();
+        let _ = self.bridge.clear_host_buffers();
+    }
 ```
-Implement each arm with `out.extend_from_slice(&field.to_le_bytes())`. Document
-that the **C++ decoder in Task II.5 is the consumer** and the two must stay in
-lockstep (a shared header comment in both files referencing each other).
 
-- [ ] **Step 4: Implement `encode_npu`**
+- [ ] **Step 6: Implement `flush_host_to_bridge`**
 
-Replace the `encode_npu` placeholder. The runtime sequence (`NpuInstructionStream`)
-reduces to the same register-write primitives (DMA BD config, lock ops, MaskPoll),
-so reuse the **same tag set and wire format** as `encode_cdo`. Walk the stream's
-ops (grep the `NpuInstructionStream` / `NpuExecutor` op model — the interpreter's
-`try_advance` consumer shows the variants) and emit the matching tagged records.
-Add a round-trip test mirroring Step 2 for a small instruction stream. If the NPU
-op model has primitives beyond Write32/BlockWrite/MaskPoll, extend the shared tag
-enum (and note it for the Task II.5 decoder).
+Replace the placeholder. Iterate the populated regions of `HostMemory` (read
+`src/device/host_memory.rs` for the region-iteration API) and call
+`bridge.write_gm(addr, bytes)` per region.
 
-- [ ] **Step 5: Implement `flush_host_to_bridge`**
+- [ ] **Step 7: Run the encoding tests + suites**
 
-Replace the placeholder. Iterate the populated regions of `HostMemory` (use its
-real region API found via grep) and call `bridge.write_gm(addr, bytes)` per region.
+`TMPDIR=/tmp/claude-1000 cargo test -p xdna-emu-ffi --features aiesim --lib` (green, new round-trip tests pass)
+`TMPDIR=/tmp/claude-1000 cargo test --lib` (still 3250 — default build unaffected)
 
-- [ ] **Step 6: Run the encoding tests + full FFI suite**
-
-Run: `TMPDIR=/tmp/claude-1000 cargo test -p xdna-emu-ffi --features aiesim --lib`
-Expected: PASS.
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add crates/xdna-emu-ffi/src/aiesim/backend.rs
-git commit -m "ffi(aiesim): real CDO + NPU op-stream encoding + host-memory flush
+git add crates/xdna-emu-ffi/src/aiesim
+git commit -m "ffi(aiesim): faithful CDO+NPU op-stream encoders + host-buffer forwarding
 
-encode_cdo/encode_npu serialize the same parser op-streams the interpreter
-consumes into a shared tagged little-endian wire format (decoder twin in
-cdo_replay.cpp). flush_host_to_bridge pushes populated GM regions before
-run. Round-trip unit-tested.
+encode_cdo/encode_npu losslessly serialize every parser op variant into
+two tagged little-endian wire formats (separate namespaces; the models
+diverge). DdrPatch/Sync are emitted verbatim -- the C++ bridge resolves
+them in Part II. BridgeAbi gains add_host_buffer/clear_host_buffers so the
+bridge can resolve DdrPatch; AiesimBackend forwards them. Round-trip tested.
 
 Generated using Claude Code."
 ```
+
+**Part II implications (fold in at the Part II checkpoint, do not lose):**
+- C-ABI header (II.1) gains `aiesim_add_host_buffer(void*, uint64_t, size_t)` and
+  `aiesim_clear_host_buffers(void*)`; `DlopenBridge` (I.9) binds them.
+- The bridge replay (II.5) splits into a CDO decoder (all register writes) and an
+  NPU decoder that **resolves `DdrPatch`** (patched value = host_buffer_addr +
+  arg_plus → `ess_Write32(reg_addr, patched)`) and **handles `Sync`** (wait on the
+  DMA channel status / advance the sim). The bridge stores host buffers from
+  `aiesim_add_host_buffer`.
 
 ### Task I.9: Wire the `aiesim` arm in `select_backend` (feature-gated)
 
