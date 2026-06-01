@@ -121,6 +121,44 @@ Output: aie.mlir.prj/sim/ (complete simulation package)
 Step [5] is where `libxaienginecdo.so` is needed: `ps.so` links against it.
 The clang++ invocation uses `-L{xaiengine}/lib -lxaienginecdo`.
 
+## Running Peano-compiled cores (the Peano x aiesim cell)
+
+aiesim is reputed to be "Chess-only", but that wall is an **aiecc build-flow
+gate, not a simulator limitation**: `aiecc` refuses `--no-xchesscc --aiesim`
+(aiesim "requires xbridge"; xbridge links only Chess objects). The closed AIE2
+ISS (`aie2simmsm`) loads per-core ELFs and decodes the AIE2 ISA from the
+instruction stream -- it does **not** require Chess metadata sections
+(`.tctmemtab`, `.eoltab`, `.stackinfo`, `.rtstab`, `.chesstypeannotationtab`),
+and the host `ps.so` is compiler-independent (`ps_main` comes from `test.cpp`).
+
+So a Peano-compiled core runs through aiesim by **swapping it into a Chess-built
+package**:
+
+1. Chess `--aiesim` build the test -> a sound `aie.mlir.prj/sim` package; run it
+   and confirm `PASS!` (baseline -- proves the package is good).
+2. Peano-build the same kernel's core (`aiecc --no-xchesscc --no-xbridge`).
+3. Overwrite `aie.mlir.prj/main_core_<col>_<row>.elf` with the Peano build
+   (keep the Chess `ps.so`, `scsim_config.json`, flows) and re-run `aiesim.sh`.
+
+Only the core ELF changes; the single variable is the kernel compiler. Buffer
+and lock addresses come from mlir-aie's `AIEAssignBufferAddresses` pass, which
+runs before either backend, so both compilers place them identically.
+
+**Proven (2026-05-31):** scalar (`03_simple`) and vector (`vec_add`, genuine
+`vadd.32` / `vldb` / `vst`) Peano cores both reach `PASS!` through aiesim. This
+makes aiesim a **non-Phoenix-gated functional oracle** -- it validates Peano
+*and* Chess output on any licensed box, with no silicon, and fills the
+long-missing Peano column of the `{Peano,Chess} x {HW,EMU,aiesim}` grid.
+
+**Scope / caveats:** aiesim is a *functional* oracle (value-correct); its timing
+is cycle-*approximate*, not silicon-exact. The standalone swap is demonstrated
+on single-tile inline kernels; multi-core / DMA / `kernel.cc` designs need
+either lit-driven baselines or the planned **xclbin-boundary integration**
+(drive aiesim from real bridge-test binaries via the emulator's own CDO parser,
+which would also make aiesim a third bridge-test runtime). Working proof +
+`swap_validate.sh` under `build/experiments/2026-05-31-aiesim-peano/`
+(gitignored).
+
 ## Prerequisites
 
 ### License
