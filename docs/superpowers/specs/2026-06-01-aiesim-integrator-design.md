@@ -1,7 +1,8 @@
 # aiesim Integrator — Design Spec
 
 **Date:** 2026-06-01
-**Status:** DESIGN — awaiting user review before writing-plans.
+**Status:** DESIGN — approved (2026-06-01); HAL independent-replay sequenced as
+phase 2. Proceeding to writing-plans.
 **Feasibility:** PROVEN (see
 `docs/superpowers/findings/2026-06-01-aiesim-inprocess-backend-feasibility.md`).
 
@@ -53,7 +54,7 @@ XRT plugin
                                                             ├─ aiesim_top       sc_module; builds cluster IN elaboration (fixes E513)
                                                             │     └─ MathEngine  closed cluster .so, dlopen(create_math_engine)
                                                             ├─ ps_bridge        our PSIP_ps_i3 twin: ess_*() ⇄ TLM sockets
-                                                            └─ hal_driver       aie-rt HAL, -D__AIESIM__ (optional; see §5)
+                                                            └─ hal_driver       aie-rt HAL, -D__AIESIM__ (phase 2 — see §5)
 ```
 
 ## 3. The seam: `NpuBackend` trait and the three-tier boundary
@@ -129,7 +130,7 @@ bridge:
 | `sc_bootstrap` | Compile aietools' `sc_main.cpp`/`sc_main_main.cpp`; define the 2 host globals (`sc_stop_at_end_of_main`, `plio_complete`); own the **elaborate-once** entry (`main`→`sc_elab_and_sim`→our `sc_main`). |
 | `aiesim_top` | An `sc_module` whose ctor calls `create_math_engine` *inside* live elaboration (the E513 fix), then binds sockets. Owns the `MathEngine*`. |
 | `ps_bridge` | Our own `PSIP_ps_i3` twin. Provides `ess_Write32/Read32/WriteGM/ReadGM/WriteCmd`. Two bindings: host-initiator → cluster `get_ss_aximm_rd/wr` (config/MMIO in), and a host-DDR target ← cluster `shim_dma_rd/wr_socket` (DMA out). |
-| `hal_driver` | The OPEN aie-rt HAL built `-D__AIESIM__`, SIM backend. **Optional** — see §5; the primary data path does not require it. |
+| `hal_driver` | The OPEN aie-rt HAL built `-D__AIESIM__`, SIM backend. **Phase 2** — see §5; not on the initial data path, but the committed next step (independent CDO replay). |
 | `c_abi` | The `extern "C"` surface Rust calls: `aiesim_create` / `load_cdo` / `write_gm` / `read_gm` / `run` / `read_reg` / `read_mem` / `dump_*` / `destroy`. |
 
 **Rust side** (`src/aiesim/backend.rs`): `AiesimBackend` implements `NpuBackend`,
@@ -189,16 +190,18 @@ interpreter today). So `hal_driver` is **not required on the data path**.
   shim calls `ess_*()` directly. Reuses heavily-validated code, and feeding the
   *same parsed ops* to both backends means a cross-check isolates **execution**
   divergence cleanly. This is the data path.
-- **Path 1 — HAL-driven independent replay (logged follow-on).** Drive aie-rt's
-  HAL, which calls `ess_*()` itself, giving a *second, independent* CDO
-  interpretation that would also catch bugs in our parser. More rigorous as an
-  oracle, but more work and contingent on a clean raw-CDO→`XAie_*` ingest in
-  aie-rt (to be verified, not assumed; aie-rt mostly *emits* CDO). Demoted to a
-  tier-3 fidelity cross-check, not a day-one goal.
+- **Path 1 — HAL-driven independent replay (the committed next step, phase 2).**
+  Drive aie-rt's HAL, which calls `ess_*()` itself, giving a *second, independent*
+  CDO interpretation that also catches bugs in our parser — strictly more rigorous
+  as an oracle. Sequenced *after* the initial parser-driven backend works, not
+  folded into it. One gating unknown to resolve when we take the step: whether
+  aie-rt exposes a clean raw-CDO→`XAie_*` ingest (it mostly *emits* CDO; the
+  consumer is normally firmware) — to be verified, and supplied if absent. This is
+  a planned phase, not a maybe.
 
-So `hal_driver` is an **optional** bridge piece: the data path is parser-driven;
-the HAL becomes a deliberate "independent-replay" capability later — itself a
-"never fall behind" upgrade.
+So `hal_driver` is a **phase-2** bridge piece: the initial data path is
+parser-driven; the HAL independent-replay lands as the committed next step — a
+deliberate "never fall behind" upgrade, sequenced after the backend is proven.
 
 ## 6. Lifecycle and process model
 
@@ -359,16 +362,22 @@ aiesim never displaces HW as truth — it is a cross-check and a pace-setter.
 `aie_xtlm`'s pre-construction setup. Everything else builds on a known-good
 instantiation.
 
-**Future work (logged, out of scope for the first plan):**
+**Next step — phase 2 (committed, after the initial backend works):**
 
 - **HAL-driven independent replay** (§5, Path 1) — a second, independent CDO
-  interpretation as a stricter oracle; contingent on verifying an aie-rt raw-CDO
-  ingest path.
+  interpretation as a stricter oracle. Sequenced after the parser-driven backend
+  is proven, not folded into the first plan. Gating unknown to resolve when we
+  take it: whether aie-rt exposes a clean raw-CDO→`XAie_*` ingest path (verify;
+  supply if absent).
+
+**Later (wanted, deferred on effort):**
+
 - **Custom device-model generation** — emit our own device JSON (from
   `tools/aie-device-models.json`, the authoritative geometry) so the cluster
   models the real NPU1 geometry exactly (one memtile row, 5×6) instead of
-  windowing a full Versal array. Blocker: decode the binary `XbV18.3` device-JSON
-  format first.
+  windowing a full Versal array. We *do* want this — it is how the NPU geometry
+  gets properly right — but it is gated on first decoding the binary `XbV18.3`
+  device-JSON format, which will take a while.
 - **Interpreter feature backlog** — close the tier-3 gaps aiesim exposes
   (guidance JSON, memory-violation diagnostics, FIFO guidance, native watchpoints,
   event-trace, VCD) so the interpreter never falls behind aiesim.
