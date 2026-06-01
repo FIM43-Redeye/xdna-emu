@@ -106,11 +106,51 @@ fn map_halt(halt: crate::backend::HaltKind) -> (XdnaEmuResult, bool, XdnaEmuHalt
     use crate::backend::HaltKind;
     match halt {
         HaltKind::Completed => (XdnaEmuResult::Success, true, XdnaEmuHaltReason::Completed),
-        HaltKind::Budget => (XdnaEmuResult::Success, true, XdnaEmuHaltReason::Budget),
+        // Budget = cycle cap hit before quiescence: the run is NOT done, so
+        // halted=false (matches the pre-unification `maskpoll_unsatisfied ||
+        // natural_halt` truth table -- both are false on budget exhaustion).
+        HaltKind::Budget => (XdnaEmuResult::Success, false, XdnaEmuHaltReason::Budget),
         HaltKind::MaskPollUnsatisfied => {
             (XdnaEmuResult::Success, true, XdnaEmuHaltReason::MaskPollUnsatisfied)
         }
         HaltKind::WedgeRecovered => (XdnaEmuResult::Success, true, XdnaEmuHaltReason::WedgeRecovered),
         HaltKind::Error => (XdnaEmuResult::ExecutionError, false, XdnaEmuHaltReason::Error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_halt;
+    use crate::backend::HaltKind;
+    use crate::{XdnaEmuHaltReason, XdnaEmuResult};
+
+    /// Pin the full `HaltKind` -> (result, halted, reason) truth table. This
+    /// mirrors the pre-unification `xdna_emu_run` final-return logic exactly;
+    /// `halted` is the run-done / `run.wait()` signal, NOT a semantic core halt.
+    /// In particular Budget (cycle cap hit) is `halted=false` -- the run did not
+    /// finish, it was capped -- matching the old `maskpoll || natural_halt`.
+    #[test]
+    fn map_halt_truth_table_matches_pre_unification() {
+        assert_eq!(
+            map_halt(HaltKind::Completed),
+            (XdnaEmuResult::Success, true, XdnaEmuHaltReason::Completed)
+        );
+        assert_eq!(
+            map_halt(HaltKind::Budget),
+            (XdnaEmuResult::Success, false, XdnaEmuHaltReason::Budget),
+            "budget exhaustion is not a completed run: halted must be false"
+        );
+        assert_eq!(
+            map_halt(HaltKind::MaskPollUnsatisfied),
+            (XdnaEmuResult::Success, true, XdnaEmuHaltReason::MaskPollUnsatisfied)
+        );
+        assert_eq!(
+            map_halt(HaltKind::WedgeRecovered),
+            (XdnaEmuResult::Success, true, XdnaEmuHaltReason::WedgeRecovered)
+        );
+        assert_eq!(
+            map_halt(HaltKind::Error),
+            (XdnaEmuResult::ExecutionError, false, XdnaEmuHaltReason::Error)
+        );
     }
 }

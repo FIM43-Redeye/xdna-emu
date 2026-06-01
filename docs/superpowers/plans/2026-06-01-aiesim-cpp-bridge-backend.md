@@ -656,7 +656,9 @@ fn map_halt(halt: crate::backend::HaltKind) -> (XdnaEmuResult, bool, XdnaEmuHalt
     use crate::backend::HaltKind;
     match halt {
         HaltKind::Completed => (XdnaEmuResult::Success, true, XdnaEmuHaltReason::Completed),
-        HaltKind::Budget => (XdnaEmuResult::Success, true, XdnaEmuHaltReason::Budget),
+        // Budget = cycle cap hit before quiescence: run NOT done -> halted=false
+        // (matches the original `maskpoll_unsatisfied || natural_halt` truth table).
+        HaltKind::Budget => (XdnaEmuResult::Success, false, XdnaEmuHaltReason::Budget),
         HaltKind::MaskPollUnsatisfied => (XdnaEmuResult::Success, true, XdnaEmuHaltReason::MaskPollUnsatisfied),
         HaltKind::WedgeRecovered => (XdnaEmuResult::Success, true, XdnaEmuHaltReason::WedgeRecovered),
         HaltKind::Error => (XdnaEmuResult::ExecutionError, false, XdnaEmuHaltReason::Error),
