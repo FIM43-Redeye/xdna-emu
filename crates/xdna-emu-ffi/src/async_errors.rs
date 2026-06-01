@@ -218,23 +218,23 @@ pub unsafe extern "C" fn xdna_emu_set_async_event_callback(
     0
 }
 
-/// Drain newly-recorded async-error records and fire the registered callback
-/// (if any) for each. Called from the run loop between engine steps.
-///
-/// # Safety
-/// `handle` must be a valid mutable reference.
-pub(crate) unsafe fn fire_async_callbacks_for(handle: &mut XdnaEmuHandle) {
-    let Some(cb) = handle.async_callback else { return };
-    let drained = handle
-        .backend
-        .as_interpreter_mut()
-        .expect("Plan A: interpreter backend")
-        .device_mut()
-        .async_errors
-        .drain_newly_recorded();
-    for rec in drained {
-        let xrec = XdnaEmuAsyncError::from(&rec);
-        (cb.func)(&xrec as *const _, cb.user_data);
+/// Observer that fires the registered C callback for each newly-recorded async
+/// error. Built fresh per `xdna_emu_run` from the handle's callback (copied out,
+/// so it holds no handle borrow). Replaces `fire_async_callbacks_for`.
+pub(crate) struct CallbackObserver {
+    pub(crate) cb: Option<crate::AsyncErrorCallback>,
+}
+
+impl crate::backend::RunObserver for CallbackObserver {
+    fn on_async_errors(&mut self, records: &[AmdxdnaAsyncError]) {
+        let Some(cb) = self.cb else { return };
+        for rec in records {
+            let xrec = XdnaEmuAsyncError::from(rec);
+            // SAFETY: cb.func is a valid C fn ptr registered via
+            // xdna_emu_set_async_event_callback; fired on the run thread per
+            // the handle-serialization contract.
+            unsafe { (cb.func)(&xrec as *const _, cb.user_data) };
+        }
     }
 }
 
@@ -279,7 +279,16 @@ mod tests {
 
                 // The drain happens inside xdna_emu_run between engine steps.
                 // For this unit test, exercise the helper directly.
-                fire_async_callbacks_for(&mut *h);
+                let recs = (*h)
+                    .backend
+                    .as_interpreter_mut()
+                    .expect("interpreter backend")
+                    .device_mut()
+                    .async_errors
+                    .drain_newly_recorded();
+                let mut obs = CallbackObserver { cb: (*h).async_callback };
+                use crate::backend::RunObserver;
+                obs.on_async_errors(&recs);
 
                 assert_eq!(FIRE_COUNT.load(Ordering::SeqCst), 1);
                 assert!(OBSERVED.lock().unwrap().is_some());
@@ -302,7 +311,16 @@ mod tests {
                     .device_mut();
                 dev.async_errors.record_error(1, 2, AieErrorOrigin::Core, 69, 50_000);
 
-                fire_async_callbacks_for(&mut *h);
+                let recs = (*h)
+                    .backend
+                    .as_interpreter_mut()
+                    .expect("interpreter backend")
+                    .device_mut()
+                    .async_errors
+                    .drain_newly_recorded();
+                let mut obs = CallbackObserver { cb: (*h).async_callback };
+                use crate::backend::RunObserver;
+                obs.on_async_errors(&recs);
                 assert_eq!(FIRE_COUNT.load(Ordering::SeqCst), 0, "unregistered callback must not fire");
             });
         }

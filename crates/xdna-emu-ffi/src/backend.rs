@@ -15,6 +15,7 @@ use xdna_emu_core::device::async_errors::AmdxdnaAsyncError;
 use xdna_emu_core::device::context::ContextId;
 use xdna_emu_core::device::host_memory::HostMemory;
 use xdna_emu_core::interpreter::engine::InterpreterEngine;
+use xdna_emu_core::npu::NpuExecutor;
 use xdna_emu_core::parser::Cdo; // same path config.rs imports (re-exported at parser root)
 
 /// How a `run()` ended. Mirrors `XdnaEmuHaltReason`; `execution.rs::map_halt`
@@ -131,6 +132,272 @@ impl NpuBackend for InterpreterBackend {
     }
     fn as_interpreter_mut(&mut self) -> Option<&mut InterpreterEngine> {
         Some(&mut self.engine)
+    }
+}
+
+/// Run the interpreter engine to completion or budget. Lifted verbatim from
+/// `xdna_emu_run` -- the loop logic is unchanged; only the handle-coupled
+/// borrows are now explicit parameters (`engine`, `executor`, `observer`).
+pub(crate) fn run_interpreter(
+    engine: &mut InterpreterEngine,
+    executor: &mut NpuExecutor,
+    max_cycles: u64,
+    observer: &mut dyn RunObserver,
+) -> RunOutcome {
+    let mut cycles = 0u64;
+    // max_cycles == 0 means unbounded: the loop runs until a natural exit point.
+    let unbounded = max_cycles == 0;
+
+    log::info!(
+        "Running emulator (max {})",
+        if unbounded {
+            "unbounded".to_string()
+        } else {
+            format!("{} cycles", max_cycles)
+        }
+    );
+
+    // Entry guard: context(0) must be Connected. Otherwise the caller
+    // forgot to call xdna_emu_reset_context after a prior wedge.
+    {
+        use xdna_emu_core::device::context::DEFAULT_CONTEXT;
+        let device = engine.device();
+        let ctx = &device.contexts[DEFAULT_CONTEXT.0 as usize];
+        if !ctx.is_connected() {
+            log::error!(
+                "xdna_emu_run: context {:?} not Connected; \
+                 caller must reset_context before re-submitting",
+                DEFAULT_CONTEXT
+            );
+            return RunOutcome { cycles: 0, halt: HaltKind::Error };
+        }
+    }
+
+    // Warm-up: let cores run to their first blocking point before
+    // processing NPU instructions.  On real hardware, the core has been
+    // running for thousands of cycles (CDO enables the core well before
+    // NPU instructions arrive through firmware + NoC).  Without this,
+    // maskwrite/blockwrite instructions modify tile memory before the
+    // core's init loop has written its initial values.
+    //
+    // NOTE: warm-up cycles count against `max_cycles`. For small budgets
+    // (e.g. `max_cycles=1` for smoke tests), the warm-up alone can exhaust
+    // the budget and the run loop below won't execute a single cycle of
+    // real work -- you'll see `halt_reason=Budget` with `cycles == warm-up
+    // count`. This is acceptable for the cycle-budget use case (any real
+    // test needs a budget much larger than 100k), but documented here so
+    // a smoke-test-sized budget isn't mistaken for a "kernel did nothing"
+    // signal.
+    if engine.enabled_cores() > 0 && !executor.is_done() {
+        const MAX_WARMUP: u64 = 100_000;
+        while cycles < MAX_WARMUP {
+            engine.step();
+            cycles += 1;
+            if engine.all_cores_blocked() {
+                break;
+            }
+        }
+        log::info!("Core warm-up: {} cycles (all cores at first blocking point)", cycles);
+    }
+
+    // Per-cycle: build snapshots, classify, dispatch on verdict.
+    use xdna_emu_core::device::tdr::{TdrVerdict, WedgeReason, TdrDiagnosis};
+    use xdna_emu_core::device::context::DEFAULT_CONTEXT;
+
+    let mut natural_halt = false;
+    let mut maskpoll_unsatisfied = false;
+    let mut wedged: Option<(WedgeReason, TdrDiagnosis)> = None;
+
+    'run: while unbounded || cycles < max_cycles {
+        // Publish the current simulation cycle to the tile array before the
+        // NPU executor runs. Register-write side effects (trace unit
+        // start/stop, broadcast propagation) driven by NPU instructions
+        // read array.current_cycle to time-stamp events.
+        engine.device_mut().array.set_dma_cycle(cycles);
+
+        // Advance NPU instruction execution (interleaved with engine step).
+        let npu_progressed;
+        {
+            let (device, host_mem) = engine.device_and_host_memory();
+            let result = executor.try_advance(device, host_mem);
+            if let xdna_emu_core::npu::AdvanceResult::Error(msg) = result {
+                log::error!("NPU executor fatal: {}", msg);
+                // Flush trace before returning so partial data reaches DDR.
+                engine.flush_trace_to_host();
+                return RunOutcome { cycles, halt: HaltKind::Error };
+            }
+            npu_progressed = matches!(result, xdna_emu_core::npu::AdvanceResult::Progressed);
+        }
+
+        // Invariant from try_advance(): BlockedOnPoll => try_advance returned
+        // Blocked, so npu_progressed must be false. Preserved from pre-refactor.
+        debug_assert!(
+            !(executor.is_blocked_on_poll() && npu_progressed),
+            "executor reported BlockedOnPoll yet npu_progressed=true"
+        );
+
+        // When the NPU executor progressed (executed an instruction that may
+        // configure DMA or write START_QUEUE), flush in-flight control packet
+        // data through the stream switch.  On real hardware the stream switch
+        // latency is invisible to firmware; in the emulator, routing is batched
+        // per cycle so control packet register writes can lag behind.
+        if npu_progressed {
+            engine.flush_ctrl_packets();
+        }
+
+        // DMA-only path: when no cores are enabled the engine halts
+        // immediately, but the NPU executor may still be configuring and
+        // triggering DMA. force_running() lets step() keep advancing DMA
+        // and stream switches. No-op when the engine is already Running.
+        if !executor.is_done() {
+            engine.force_running();
+        }
+
+        engine.step();
+        // Tier B: drain newly-recorded async errors and fire the registered
+        // callback (if any). Mirrors the flush_trace_to_host pattern -- FFI
+        // layer observes between engine steps.
+        let recs = engine.device_mut().async_errors.drain_newly_recorded();
+        observer.on_async_errors(&recs);
+        cycles += 1;
+
+        // Build per-cycle snapshots and classify.
+        let engine_signals = build_engine_signals(engine);
+        let executor_signals = build_executor_signals(executor, engine);
+
+        let device = engine.device_mut();
+        let detector = &mut device.tdr_detectors[DEFAULT_CONTEXT.0 as usize];
+        let verdict = detector.classify(&engine_signals, Some(&executor_signals));
+
+        match verdict {
+            TdrVerdict::Progressing => continue,
+            TdrVerdict::NaturalCompletion => {
+                log::info!("Natural completion after {} cycles", cycles);
+                natural_halt = true;
+                break 'run;
+            }
+            TdrVerdict::MaskPollUnsatisfied => {
+                log::info!("MASKPOLL unsatisfiable after {} cycles", cycles);
+                maskpoll_unsatisfied = true;
+                natural_halt = true;
+                break 'run;
+            }
+            TdrVerdict::Wedged { reason, diagnosis } => {
+                log::warn!("Tier C wedge after {} cycles: {:?} -- {}", cycles, reason, diagnosis);
+                wedged = Some((reason, diagnosis));
+                break 'run;
+            }
+        }
+    }
+
+    // Flush any pending trace packets through the stream switch to host DDR.
+    // Trace units may have partial packets buffered; flush() pads and emits
+    // them, then step_data_movement() routes them through the network.
+    engine.flush_trace_to_host();
+
+    // On wedge, transition context state.
+    if let Some((reason, diagnosis)) = wedged {
+        let device = engine.device_mut();
+        device.contexts[DEFAULT_CONTEXT.0 as usize].mark_failed(reason, diagnosis);
+        return RunOutcome { cycles, halt: HaltKind::WedgeRecovered };
+    }
+
+    // On natural completion, advance the context's completed_counter.
+    if natural_halt && !maskpoll_unsatisfied {
+        let device = engine.device_mut();
+        device.contexts[DEFAULT_CONTEXT.0 as usize].note_submission_complete();
+    }
+
+    // `halted` is the run-lifecycle / quiescence indicator -- "the run is
+    // done" (cores halted OR all DMA syncs satisfied), which drives the C++
+    // plugin's `last_run_complete_` and thus run.wait() returning
+    // ERT_CMD_STATE_COMPLETED. It is NOT the semantic core-debug-halt: that
+    // is Core_Status[16] (DEBUG_HALT), which is never touched/faked here (on
+    // EMU it stays unset -- that is the whole point of MaskPollUnsatisfied).
+    //
+    // For the MaskPollUnsatisfied path, maskpoll_unsatisfied terminates the
+    // run while the engine may still be non-Halted. Both MaskPollUnsatisfied
+    // termination paths (fast-path via classifier and budget-burn) agree on
+    // halted=true since natural_halt is set in both cases.
+    let halt = if maskpoll_unsatisfied {
+        HaltKind::MaskPollUnsatisfied
+    } else if natural_halt {
+        HaltKind::Completed
+    } else {
+        HaltKind::Budget
+    };
+
+    RunOutcome { cycles, halt }
+}
+
+fn build_engine_signals(engine: &InterpreterEngine) -> xdna_emu_core::device::tdr::EngineSignals {
+    use xdna_emu_core::device::tdr::{EngineSignals, EngineStatusSnapshot};
+    use xdna_emu_core::interpreter::engine::EngineStatus;
+
+    let status = match engine.status() {
+        EngineStatus::Running => EngineStatusSnapshot::Running,
+        EngineStatus::Halted => EngineStatusSnapshot::Halted,
+        EngineStatus::Stalled => EngineStatusSnapshot::Stalled,
+        _ => EngineStatusSnapshot::Other,
+    };
+    let device = engine.device();
+
+    // Core statuses: compute tiles only (rows 2+). Rows 0 (shim) and 1
+    // (memtile) have no compute cores.
+    let mut core_statuses = Vec::new();
+    for col in 0..device.cols() {
+        for row in 2..device.rows() {
+            if engine.is_core_enabled(col, row) {
+                if let Some(s) = engine.core_status(col, row) {
+                    core_statuses.push((col as u8, row as u8, s));
+                }
+            }
+        }
+    }
+
+    // DMA: present on all tile types (shim, memtile, compute).
+    let mut dma_states = Vec::new();
+    use xdna_emu_core::device::dma::ChannelState;
+    for col in 0..device.cols() {
+        for row in 0..device.rows() {
+            if let Some(dma) = device.array.dma_engine(col as u8, row as u8) {
+                for ch in 0..dma.num_channels() {
+                    let state = dma.channel_state(ch as u8);
+                    if !matches!(state, ChannelState::Idle) {
+                        let desc = dma.channel_fsm_description(ch as u8);
+                        dma_states.push((col as u8, row as u8, ch as u8, desc));
+                    }
+                }
+            }
+        }
+    }
+
+    EngineSignals {
+        engine_status: status,
+        any_dma_active: device.array.any_dma_active(),
+        any_data_in_flight: device.array.any_data_in_flight(),
+        total_dma_bytes_transferred: device.array.total_dma_bytes_transferred(),
+        total_lock_releases: device.array.total_lock_releases(),
+        total_instructions: engine.total_instructions(),
+        core_statuses,
+        dma_states,
+    }
+}
+
+fn build_executor_signals(
+    executor: &mut NpuExecutor,
+    engine: &InterpreterEngine,
+) -> xdna_emu_core::device::tdr::ExecutorSignals {
+    use xdna_emu_core::device::tdr::ExecutorSignals;
+    ExecutorSignals {
+        is_done: executor.is_done(),
+        syncs_satisfied: executor.syncs_satisfied(engine.device()),
+        is_blocked_on_poll: executor.is_blocked_on_poll(),
+        pending_syncs: executor
+            .pending_syncs()
+            .iter()
+            .map(|s| (s.column, s.row, s.channel, s.direction))
+            .collect(),
     }
 }
 
