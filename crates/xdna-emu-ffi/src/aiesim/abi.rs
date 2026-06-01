@@ -22,8 +22,13 @@ pub(crate) enum BridgeHalt {
 /// The operations `AiesimBackend` needs from the bridge. One method per C-ABI
 /// entry. Slices/lengths are marshalled to raw pointers only in the real impl.
 pub(crate) trait BridgeAbi {
+    // `create`, `read_gm`, and `read_reg` are part of the bridge contract but
+    // not yet called from compiled (non-test) code: `create` runs inside
+    // `DlopenBridge::open`, and `read_gm`/`read_reg` are the tier-2 read-back
+    // paths wired in Part II. Allow them now so the feature build is clean.
     /// Construct the cluster for `arch` ("aie2"/"aie2ps"/"aie") using the device
     /// JSON at `device_json`. Called once; the bridge owns the service thread.
+    #[allow(dead_code)]
     fn create(&mut self, arch: &str, device_json: &str) -> BridgeStatus;
     /// Replay a config op-stream (already serialized by cdo_replay-side encoding;
     /// here it is the raw bytes our parser produced). Returns Ok/Error.
@@ -40,10 +45,12 @@ pub(crate) trait BridgeAbi {
     /// Write host (DDR/GM) memory.
     fn write_gm(&mut self, addr: u64, data: &[u8]) -> BridgeStatus;
     /// Read host (DDR/GM) memory into `out`.
+    #[allow(dead_code)]
     fn read_gm(&mut self, addr: u64, out: &mut [u8]) -> BridgeStatus;
     /// Run to quiescence or `budget` cycles. On Ok, `*cycles_out` is set.
     fn run(&mut self, budget: u64, cycles_out: &mut u64) -> BridgeHalt;
     /// Tier-2: zero-time backdoor register read.
+    #[allow(dead_code)]
     fn read_reg(&mut self, addr: u64) -> u32;
     /// Reset logical state between submissions (re-apply CDO follows).
     fn reset(&mut self) -> BridgeStatus;

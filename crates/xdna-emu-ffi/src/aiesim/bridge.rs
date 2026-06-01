@@ -24,8 +24,11 @@ pub(crate) struct DlopenBridge {
     load_cdo: LoadCdoFn,
     exec_npu: ExecNpuFn,
     write_gm: WriteGmFn,
+    // read_gm / read_reg: tier-2 read-back, called from Part II (kept bound now).
+    #[allow(dead_code)]
     read_gm: ReadGmFn,
     run: RunFn,
+    #[allow(dead_code)]
     read_reg: ReadRegFn,
     reset: ResetFn,
     add_host_buffer: AddHostBufferFn,
