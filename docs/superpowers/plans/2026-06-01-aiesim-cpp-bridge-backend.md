@@ -1046,6 +1046,10 @@ pub(crate) struct AiesimBackend {
     /// Pending host-memory writes to push to the bridge before the next run.
     /// (Populated in apply path; see Step 3 note.)
     dirty: bool,
+    /// Registered host-buffer regions (addr, size). The interpreter's executor
+    /// uses these for runtime-sequence address patching; the cluster uses real
+    /// DDR addresses directly, so aiesim just tracks them for GM/DDR setup.
+    host_buffers: Vec<(u64, usize)>,
 }
 
 impl AiesimBackend {
@@ -1060,6 +1064,7 @@ impl AiesimBackend {
             rows,
             arch,
             dirty: false,
+            host_buffers: Vec::new(),
         }
     }
 }
@@ -1130,6 +1135,14 @@ impl NpuBackend for AiesimBackend {
         // aiesim errors come back via error registers, not a Rust drain. For now
         // the bridge reports none; the observer is intentionally unused here.
         RunOutcome { cycles, halt }
+    }
+    fn add_host_buffer(&mut self, address: u64, size: usize) {
+        // The cluster's shim-DMA uses real DDR addresses (no patching needed);
+        // track the region so the GM/DDR model is set up before run.
+        self.host_buffers.push((address, size));
+    }
+    fn clear_host_buffers(&mut self) {
+        self.host_buffers.clear();
     }
     fn cols(&self) -> usize {
         self.cols
