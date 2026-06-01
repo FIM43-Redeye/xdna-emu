@@ -60,7 +60,6 @@ use std::ffi::c_char;
 use std::sync::Mutex;
 
 use xdna_emu_core::interpreter::engine::InterpreterEngine;
-use xdna_emu_core::npu::NpuExecutor;
 
 // Thread-local error storage for xdna_emu_get_error().
 thread_local! {
@@ -98,7 +97,6 @@ unsafe impl Sync for AsyncErrorCallback {}
 pub struct XdnaEmuHandle {
     pub(crate) backend: Box<dyn crate::backend::NpuBackend>,
     pub(crate) xclbin_path: Option<String>,
-    pub(crate) npu_executor: NpuExecutor,
     pub(crate) max_cycles: u64,
     /// Next address to allocate for xdna_emu_alloc_buffer.
     /// Starts at a high address to avoid conflicts with user-specified regions.
@@ -244,7 +242,6 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
     let handle = Box::new(XdnaEmuHandle {
         backend,
         xclbin_path: None,
-        npu_executor: NpuExecutor::new(),
         max_cycles: config.max_cycles(),
         // Start auto-allocation at 0x8000_0000_0000 to avoid conflicts
         // with user-specified host regions (typically < 0x1_0000_0000).

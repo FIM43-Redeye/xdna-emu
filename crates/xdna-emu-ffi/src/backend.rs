@@ -6,10 +6,11 @@
 //! operations the FFI needs, while deep interpreter-only introspection
 //! routes through the `as_interpreter()` downcast hatch.
 //!
-//! `run()` is NOT on this trait in Plan A — it is entangled with the FFI's
-//! `npu_executor`, the TDR detectors, and per-cycle async-callback firing.
-//! `xdna_emu_run` reaches the interpreter via `as_interpreter_mut()`. The
-//! clean `run()` seam is designed in Plan B.
+//! `run()` and `execute_npu_instructions()` are first-class trait methods: the
+//! interpreter's runtime-sequence executor (`npu_executor`), TDR detection, and
+//! per-cycle async-callback firing all live inside `InterpreterBackend`, so
+//! `xdna_emu_run` is a thin dispatcher with no downcast in the run path. The
+//! trait is the complete execution contract.
 
 use xdna_emu_core::device::async_errors::AmdxdnaAsyncError;
 use xdna_emu_core::device::context::ContextId;
@@ -69,6 +70,24 @@ pub trait NpuBackend {
     fn reset_for_new_context(&mut self);
     fn reset_context(&mut self, cid: ContextId) -> Result<(), ()>;
 
+    // --- execution (the unified seam) ---
+    /// Load the runtime-sequence (NPU instruction) stream for this submission.
+    /// Interpreter: feed its executor. aiesim (later): encode + buffer for
+    /// register-write replay.
+    fn execute_npu_instructions(
+        &mut self,
+        stream: &xdna_emu_core::npu::NpuInstructionStream,
+    ) -> Result<(), String>;
+    /// Run the configured submission to quiescence or `max_cycles` (0 =
+    /// unbounded). Reports async errors via `observer`.
+    fn run(&mut self, max_cycles: u64, observer: &mut dyn RunObserver) -> RunOutcome;
+
+    // --- host-buffer registration (address patching for NPU instructions) ---
+    /// Register a host buffer for runtime-sequence address patching.
+    fn add_host_buffer(&mut self, address: u64, size: usize);
+    /// Clear the registered host-buffer list (before a new submission).
+    fn clear_host_buffers(&mut self);
+
     // --- topology / identity (tier-2, cross-backend) ---
     fn cols(&self) -> usize;
     fn rows(&self) -> usize;
@@ -88,11 +107,12 @@ pub trait NpuBackend {
 /// FFI-side wrapper is where host/firmware-level driving lives.
 pub(crate) struct InterpreterBackend {
     pub(crate) engine: InterpreterEngine,
+    pub(crate) npu_executor: NpuExecutor,
 }
 
 impl InterpreterBackend {
     pub(crate) fn new(engine: InterpreterEngine) -> Self {
-        Self { engine }
+        Self { engine, npu_executor: NpuExecutor::new() }
     }
 }
 
@@ -117,6 +137,22 @@ impl NpuBackend for InterpreterBackend {
     }
     fn reset_context(&mut self, cid: ContextId) -> Result<(), ()> {
         self.engine.device_mut().reset_context(cid).map_err(|_| ())
+    }
+    fn execute_npu_instructions(
+        &mut self,
+        stream: &xdna_emu_core::npu::NpuInstructionStream,
+    ) -> Result<(), String> {
+        self.npu_executor.load(stream);
+        Ok(())
+    }
+    fn run(&mut self, max_cycles: u64, observer: &mut dyn RunObserver) -> RunOutcome {
+        run_interpreter(&mut self.engine, &mut self.npu_executor, max_cycles, observer)
+    }
+    fn add_host_buffer(&mut self, address: u64, size: usize) {
+        self.npu_executor.add_host_buffer(address, size);
+    }
+    fn clear_host_buffers(&mut self) {
+        self.npu_executor.set_host_buffers(Vec::new());
     }
     fn cols(&self) -> usize {
         self.engine.device().cols()
@@ -435,6 +471,17 @@ pub(crate) mod mock {
         fn reset_context(&mut self, _cid: ContextId) -> Result<(), ()> {
             Ok(())
         }
+        fn execute_npu_instructions(
+            &mut self,
+            _stream: &xdna_emu_core::npu::NpuInstructionStream,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn run(&mut self, _max_cycles: u64, _observer: &mut dyn RunObserver) -> RunOutcome {
+            RunOutcome { cycles: 0, halt: HaltKind::Completed }
+        }
+        fn add_host_buffer(&mut self, _address: u64, _size: usize) {}
+        fn clear_host_buffers(&mut self) {}
         fn cols(&self) -> usize {
             5
         }

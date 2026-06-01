@@ -44,7 +44,11 @@ pub unsafe extern "C" fn xdna_emu_execute_npu_instructions(
     log::info!("Executing {} NPU instructions", stream.instructions().len());
 
     // Load instructions for interleaved execution in xdna_emu_run().
-    handle.npu_executor.load(&stream);
+    if let Err(e) = handle.backend.execute_npu_instructions(&stream) {
+        log::error!("execute_npu_instructions: {}", e);
+        crate::set_last_error(e);
+        return XdnaEmuResult::ExecutionError;
+    }
 
     XdnaEmuResult::Success
 }
@@ -87,17 +91,7 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
     let handle = &mut *handle;
     let max = handle.max_cycles;
     let mut observer = crate::async_errors::CallbackObserver { cb: handle.async_callback };
-
-    // Disjoint field borrows: backend (engine) and npu_executor.
-    let Some(engine) = handle.backend.as_interpreter_mut() else {
-        return XdnaEmuExecStatus {
-            result: XdnaEmuResult::ExecutionError,
-            cycles_executed: 0,
-            halted: false,
-            halt_reason: XdnaEmuHaltReason::Error,
-        };
-    };
-    let outcome = crate::backend::run_interpreter(engine, &mut handle.npu_executor, max, &mut observer);
+    let outcome = handle.backend.run(max, &mut observer);
     let (result, halted, halt_reason) = map_halt(outcome.halt);
     XdnaEmuExecStatus { result, cycles_executed: outcome.cycles, halted, halt_reason }
 }

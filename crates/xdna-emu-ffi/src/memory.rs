@@ -38,7 +38,7 @@ pub unsafe extern "C" fn xdna_emu_alloc_host_region(
     let _ = host_mem.allocate_region(&region_name, address, size as usize);
 
     // Also register with NPU executor for address patching
-    handle.npu_executor.add_host_buffer(address, size as usize);
+    handle.backend.add_host_buffer(address, size as usize);
 
     log::debug!("Allocated host region '{}' at 0x{:x} size {}", region_name, address, size);
     XdnaEmuResult::Success
@@ -129,7 +129,7 @@ pub unsafe extern "C" fn xdna_emu_clear_host_buffers(handle: *mut XdnaEmuHandle)
     }
 
     let handle = &mut *handle;
-    handle.npu_executor.set_host_buffers(Vec::new());
+    handle.backend.clear_host_buffers();
 
     XdnaEmuResult::Success
 }
@@ -150,7 +150,7 @@ pub unsafe extern "C" fn xdna_emu_add_host_buffer(
     }
 
     let handle = &mut *handle;
-    handle.npu_executor.add_host_buffer(address, size as usize);
+    handle.backend.add_host_buffer(address, size as usize);
 
     log::debug!("Added host buffer: addr=0x{:x} size={}", address, size);
     XdnaEmuResult::Success
@@ -211,7 +211,7 @@ pub unsafe extern "C" fn xdna_emu_alloc_buffer(handle: *mut XdnaEmuHandle, size:
     }
 
     // Also register with NPU executor for address patching.
-    handle.npu_executor.add_host_buffer(addr, aligned_size as usize);
+    handle.backend.add_host_buffer(addr, aligned_size as usize);
 
     if recycled.is_none() {
         handle.next_alloc_addr = addr + aligned_size;
