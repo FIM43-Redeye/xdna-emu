@@ -20,6 +20,14 @@ xdna_emu_core = { package = "xdna-emu", path = "../..", default-features = false
 log = "0.4"
 env_logger = "0.11"
 tempfile = "3"
+libloading = { version = "0.8", optional = true }
+
+[features]
+# Off by default. Gates the AiesimBackend Rust code. With the feature off,
+# XDNA_BACKEND=aiesim returns a clean "built without aiesim support" error.
+# Even with the feature ON there is no build-time aietools dependency: the
+# bridge .so is loaded at runtime via dlopen (see src/aiesim/bridge.rs).
+aiesim = ["dep:libloading"]
 
 [dev-dependencies]
 xdna-archspec = { path = "../xdna-archspec" }
