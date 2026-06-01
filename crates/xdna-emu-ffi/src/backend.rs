@@ -47,6 +47,51 @@ pub trait NpuBackend {
     }
 }
 
+impl NpuBackend for InterpreterEngine {
+    fn apply_cdo(&mut self, cdo: &Cdo<'_>) -> Result<(), String> {
+        // DeviceState::apply_cdo returns anyhow::Result<()>; normalize the
+        // error to String (Display is sufficient for the FFI boundary).
+        self.device_mut().apply_cdo(cdo).map_err(|e| e.to_string())
+    }
+    fn set_start_col(&mut self, start_col: u8) {
+        self.device_mut().set_start_col(start_col);
+    }
+    fn load_elf_bytes(&mut self, col: usize, row: usize, data: &[u8]) -> Result<u32, String> {
+        InterpreterEngine::load_elf_bytes(self, col, row, data)
+    }
+    fn host_memory_mut(&mut self) -> &mut HostMemory {
+        InterpreterEngine::host_memory_mut(self)
+    }
+    fn sync_cores_from_device(&mut self) {
+        InterpreterEngine::sync_cores_from_device(self);
+    }
+    fn reset_for_new_context(&mut self) {
+        InterpreterEngine::reset_for_new_context(self);
+    }
+    fn reset_context(&mut self, cid: ContextId) -> Result<(), ()> {
+        self.device_mut().reset_context(cid).map_err(|_| ())
+    }
+    // Deliberately delegate to `self.device().X()`, NOT `self.X()` — the latter
+    // would re-enter this trait method and infinitely recurse. (The methods
+    // above use `InterpreterEngine::X(self)` UFCS for the same reason.)
+    fn cols(&self) -> usize {
+        self.device().cols()
+    }
+    fn rows(&self) -> usize {
+        self.device().rows()
+    }
+    fn arch_name(&self) -> String {
+        self.device().arch_name().to_string()
+    }
+
+    fn as_interpreter(&self) -> Option<&InterpreterEngine> {
+        Some(self)
+    }
+    fn as_interpreter_mut(&mut self) -> Option<&mut InterpreterEngine> {
+        Some(self)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod mock {
     use super::*;
@@ -113,5 +158,21 @@ mod tests {
         assert_eq!(m.cols(), 5);
         assert_eq!(m.rows(), 6);
         assert_eq!(m.arch_name(), "mock");
+    }
+
+    #[test]
+    fn interpreter_implements_backend_and_downcasts() {
+        use xdna_emu_core::interpreter::engine::InterpreterEngine;
+        let mut eng = InterpreterEngine::new_npu1();
+
+        // Trait methods reflect the real device.
+        let b: &mut dyn NpuBackend = &mut eng;
+        assert_eq!(b.cols(), 5);
+        assert_eq!(b.rows(), 6);
+        assert!(b.arch_name().to_lowercase().contains("npu") || b.arch_name().to_lowercase().contains("aie"));
+
+        // The downcast hatch returns the engine.
+        assert!(b.as_interpreter().is_some());
+        assert!(b.as_interpreter_mut().is_some());
     }
 }
