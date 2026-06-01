@@ -32,6 +32,11 @@ pub(crate) trait BridgeAbi {
     /// Same tagged wire format as `load_cdo`; separate entry so the bridge can
     /// stage it distinctly (it arrives via `execute_npu_instructions`, before run).
     fn exec_npu(&mut self, ops: &[u8]) -> BridgeStatus;
+    /// Register a host buffer (DDR addr + size) so the bridge can resolve
+    /// DdrPatch records during exec_npu replay.
+    fn add_host_buffer(&mut self, addr: u64, size: usize) -> BridgeStatus;
+    /// Clear the registered host buffers (before a new submission).
+    fn clear_host_buffers(&mut self) -> BridgeStatus;
     /// Write host (DDR/GM) memory.
     fn write_gm(&mut self, addr: u64, data: &[u8]) -> BridgeStatus;
     /// Read host (DDR/GM) memory into `out`.
@@ -58,6 +63,7 @@ pub(crate) mod mock {
         pub npu_loads: u32,
         pub runs: u32,
         pub gm: HashMap<u64, u8>,
+        pub host_buffers: Vec<(u64, usize)>,
         pub next_run_halt: Option<BridgeHalt>,
         pub next_run_cycles: u64,
     }
@@ -73,6 +79,14 @@ pub(crate) mod mock {
         }
         fn exec_npu(&mut self, _ops: &[u8]) -> BridgeStatus {
             self.npu_loads += 1;
+            BridgeStatus::Ok
+        }
+        fn add_host_buffer(&mut self, addr: u64, size: usize) -> BridgeStatus {
+            self.host_buffers.push((addr, size));
+            BridgeStatus::Ok
+        }
+        fn clear_host_buffers(&mut self) -> BridgeStatus {
+            self.host_buffers.clear();
             BridgeStatus::Ok
         }
         fn write_gm(&mut self, addr: u64, data: &[u8]) -> BridgeStatus {
