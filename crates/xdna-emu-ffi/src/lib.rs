@@ -37,6 +37,7 @@
 //!   by the next FFI call on the same thread or by destroying the handle.
 
 mod async_errors;
+mod backend;
 mod classify;
 mod config;
 pub mod context;
@@ -46,6 +47,7 @@ mod memory;
 mod query;
 
 pub use async_errors::*;
+pub use backend::NpuBackend;
 pub use classify::*;
 pub use config::*;
 pub use context::{xdna_emu_get_context_state, XdnaEmuContextState};
