@@ -115,6 +115,13 @@ scripts/emu-bridge-test.sh II-B.5  optional aiesim third runtime
 
 ## Task II-B.1: `ps_bridge` — the `ess_*()` seam + socket bindings
 
+> **STATUS: config path DONE (commit c822f11).** ps_bridge (the 6 ess_*, TLM
+> bodies, backdoor R/W) is bound to the cluster's config ss_aximm[0]; an
+> env-gated backdoor write+read sweep round-trips 6/6 AIE2 array addresses. The
+> **cluster->host DDR path (shim_dma_*_socket, GM routing fact 7) is deferred to
+> II-B.3** (it needs the functional-run lifecycle: sc_start + full socket
+> stubbing). Step 5's GM round-trip moves there.
+
 **Files:** Create `aiesim-bridge/src/ps_bridge.{h,cpp}`; modify `aiesim_top.cpp`,
 `CMakeLists.txt`.
 
