@@ -33,7 +33,11 @@ aiesim_top::aiesim_top(sc_core::sc_module_name name, const char* arch, const cha
     : sc_core::sc_module(name),
       clock_("aie_clk", sc_core::sc_time(1.0, sc_core::SC_NS)) {
     const std::string arch_s = arch ? arch : "";
-    const char* lib = arch_to_cluster_lib(arch_s);
+    // XDNA_AIESIM_CLUSTER_LIB overrides the default per-arch cluster .so (e.g. to
+    // select the functional _func variant vs the timed msm model). Resolved via
+    // LD_LIBRARY_PATH like the defaults.
+    const char* lib = std::getenv("XDNA_AIESIM_CLUSTER_LIB");
+    if (!lib || !*lib) lib = arch_to_cluster_lib(arch_s);
     if (!lib) {
         throw std::runtime_error("aiesim_top: unknown arch '" + arch_s + "'");
     }
