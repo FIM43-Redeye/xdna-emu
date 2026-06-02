@@ -283,3 +283,43 @@ aiesim host flow calls XAie_PartitionInitialize and where its ess_NpiWrite32 rou
 (a dedicated cluster NPI socket, or nowhere -- i.e. does the cluster gate on reset
 at all), THEN add the matching PartitionInitialize sequence + NPI routing to the
 harness.
+
+### RESOLVED (2026-06-02): wrong config socket -- it was ss_aximm[0] (NPI), not [1]
+
+Deriving from the standard flow settled it, and the answer was none of the above
+(no PartitionInitialize, no NPI bring-up). Two derivations:
+
+1. `mlir_aie_init_device` (mlir-aie runtime_lib/test_lib/test_library.cpp) gates out
+   everything except `XAie_CfgInitialize` + `XAie_TurnEccOff` for the SIM backend --
+   the PmRequestTiles/PartitionInitialize dance is non-SIM only. The standard SIM
+   flow does NOT call XAie_PartitionInitialize. The cluster comes up ready; there is
+   no missing bring-up layer.
+
+2. The standard sim's top netlist (aietools aie_xtlm.cpp:359-383, `noc2aie_mm_config`)
+   shows the cluster's `get_ss_aximm_rd/wr()` vector is laid out as: **[0] = the NPI
+   socket** (`aie_npi_rd/wr_socket`, when `is_npi`), **[1..N] = the noc2aie
+   memory-mapped interfaces** (`noc_me_aximm_socket[i] = ss_aximm[i+1]`) that carry
+   the HAL's register + tile-memory writes. For VC2802 there are 19 ss_aximm sockets:
+   [0]=NPI, [1..18]=18 memory-mapped noc2aie interfaces (= 18 noc_tiles).
+
+The bridge bound ps_bridge to ss_aximm[0] -- the NPI socket -- so every ess_Write32
+/ess_Read32 (registers, locks, tile DM) hit the NPI port and vanished. **Binding to
+ss_aximm[1] instead makes it all work.** The HAL harness now passes end-to-end
+(commit on aiesim-cpp-bridge): DM round-trip LIVE OK, locks rc=0, buf_a[3]=7, core
+runs, buf_b[5]=35, PASS. First real end-to-end execution of the in-process backend.
+
+This single wrong binding produced the ENTIRE prior tangle: "backdoor is a shadow
+store", "timed reads hit live registers but writes don't stick", "array never out of
+reset", "need PartitionInitialize / NPI bring-up", "missing ess_WriteCmd layer" --
+all were artifacts of reading/writing the NPI socket instead of the config interface.
+Lesson: when a whole subsystem looks inert, verify the socket/endpoint identity
+before theorising a missing mechanism. The `set_burst_type(1)` INCR fix (matching
+genwrapper PSIP_ps_i3) and the SETSTACK correction above stand, but neither was the
+blocker.
+
+OPEN (workload-agnostic coverage): bound one interface, ss_aximm[1], which reaches
+tile (1,3). Whether [1] is global (any tile) or the NoC partitions columns across
+the 18 noc2aie interfaces is the next thing to confirm -- a multi-column kernel will
+tell. The config index is env-overridable (XDNA_AIESIM_CONFIG_IDX, default 1) for
+the probe. If partitioned, the bridge needs the noc2aie address decode (an
+interconnect modeling the NoC's address->interface map from the device JSON).
