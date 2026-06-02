@@ -7,9 +7,21 @@
 // silently pretending to work.
 #include "xdna_aiesim_bridge.h"
 
+// Temporary II.2 scaffold (sc_bootstrap.cpp): start the SystemC kernel once to
+// prove the in-process embed. II.6 replaces this with the service thread.
+extern "C" int aiesim_bridge_start_systemc_smoke();
+
+// Non-null sentinel so the II.2 smoke's aiesim_create returns "success" without
+// a real handle yet. II.3+ return an actual cluster handle.
+static char g_smoke_handle;
+
 extern "C" {
 
-void *aiesim_create(const char *, const char *) { return nullptr; }
+void *aiesim_create(const char *, const char *) {
+    // II.2: run the SystemC banner + sc_main from inside the .so.
+    if (aiesim_bridge_start_systemc_smoke() != 0) return nullptr;
+    return &g_smoke_handle;
+}
 int aiesim_load_cdo(void *, const uint8_t *, size_t) { return 1; }
 int aiesim_exec_npu(void *, const uint8_t *, size_t) { return 1; }
 int aiesim_add_host_buffer(void *, uint64_t, size_t) { return 1; }

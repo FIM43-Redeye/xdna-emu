@@ -48,6 +48,26 @@ if [[ ! -f "$SO" ]]; then
   exit 1
 fi
 
+# Drop a marker-cleared copy of libsystemc next to the bridge .so. aietools'
+# libsystemc ships with a spurious executable-stack marker that makes dlopen
+# fail on hardened kernels; the bridge carries DT_RPATH=$ORIGIN so this
+# co-located copy resolves ahead of the aietools one. Regenerated each build
+# from the local aietools (nothing aietools is modified in place or committed).
+# See docs/superpowers/findings/2026-06-01-aiesim-inprocess-backend-feasibility.md
+AIETOOLS="${XILINX_VITIS_AIETOOLS:-}"
+if [[ -z "$AIETOOLS" ]]; then
+  # Fall back to the path CMake resolved (cached) so this works even if the env
+  # var is unset but FindAIETools found it.
+  AIETOOLS="$(grep -m1 '^AIETOOLS_DIR' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null | cut -d= -f2-)"
+fi
+SRC_SYSTEMC="$AIETOOLS/lib/lnx64.o/libsystemc.so"
+if [[ ! -f "$SRC_SYSTEMC" ]]; then
+  echo "FATAL: libsystemc not found at $SRC_SYSTEMC" >&2
+  exit 1
+fi
+cp -f "$SRC_SYSTEMC" "$BUILD_DIR/libsystemc.so"
+python3 "$SCRIPT_DIR/clear-execstack.py" "$BUILD_DIR/libsystemc.so"
+
 echo ">>> Built: $SO"
 echo ">>> Exported aiesim_* symbols:"
 nm -D --defined-only "$SO" | grep -E ' T aiesim_' || {

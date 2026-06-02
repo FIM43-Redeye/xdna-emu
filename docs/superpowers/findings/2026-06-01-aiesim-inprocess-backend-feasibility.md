@@ -36,13 +36,38 @@ To load + run the closed cluster inside a normal (modern-toolchain) host binary:
 
 | Requirement | Why |
 |---|---|
-| `-z execstack` | aietools `libsystemc` requires an executable stack |
+| **do NOT** mark the bridge `-z execstack` + use a **marker-cleared `libsystemc` copy** | see "Executable-stack constraint" below -- the spike's `-z execstack` was an executable-only artifact; it BREAKS the dlopen path |
 | `-rdynamic` | export host globals so the dlopened cluster resolves them |
 | define 2 host globals: `extern "C" { bool sc_stop_at_end_of_main=false; int plio_complete=0; }` | host-executable contract (else dlopen fails) |
-| compile aietools SystemC main bootstrap | `main`→`sc_elab_and_sim`→our `sc_main` |
+| compile aietools SystemC main bootstrap (`sc_main_main.cpp` only, NOT `sc_main.cpp`) | provides `sc_elab_and_sim`→our `sc_main`; `sc_main.cpp` only adds `main()`, which a `.so` never runs |
 | `sc_main` declared `extern "C"` | the bootstrap calls it C-linkage |
 | use **system** libstdc++, NOT aietools' | aietools' `tps/lnx64/gcc/lib64` libstdc++ is too old (missing `GLIBCXX_3.4.3x`); system one is newer + backward-compatible |
-| `LD_LIBRARY_PATH=<aietools>/lib/lnx64.o` (only) | cluster deps (systemc/boost-1.72/msm_cpp/etc.) all live here |
+| `LD_LIBRARY_PATH=<aietools>/lib/lnx64.o` (for cluster deps) + sanitized-libsystemc dir | cluster deps (boost-1.72/msm_cpp/etc.) live in lnx64.o; the sanitized `libsystemc` must win over the aietools one (bridge carries `DT_RPATH=$ORIGIN`, old dtags, so its co-located copy resolves first) |
+
+### Executable-stack constraint (characterized 2026-06-01, probe4 + probe_cor)
+
+aietools `libsystemc.so` ships marked **executable-stack (RWE)** -- but this is a
+**spurious** marker (QuickThreads `.s` files lacking `.note.GNU-stack`), NOT a
+real runtime need. Proven: a non-exec-stack (`GNU_STACK: RW`) executable linked
+against a **marker-cleared** `libsystemc` runs `sc_thread` coroutines fine
+(QuickThreads context-switch is SP/register asm, not stack code execution).
+
+Why it matters for the in-process backend (a `.so` dlopened into a running host,
+not an executable): on this hardened kernel the loader **cannot** flip a running
+process's stack to executable at `dlopen` time (`EINVAL`), and dlopening from a
+worker thread does not help (glibc always targets the *main* stack). Executables
+escape this because the kernel sets exec-stack at `exec()` -- which is exactly why
+the spike (probe executables) never saw it.
+
+**Resolution (chosen with Maya): sanitize the marker.** The bridge build produces
+a marker-cleared copy of `libsystemc.so` next to the bridge `.so` (regenerated
+from local aietools at build time -- nothing modified in place, nothing aietools
+committed to the repo), and the bridge carries `DT_RPATH=$ORIGIN` (old dtags) so
+its co-located sanitized copy resolves ahead of the aietools one even when
+`<aietools>/lib/lnx64.o` is on `LD_LIBRARY_PATH`. Result: the bridge loads + runs
+in **any** host, no `-z execstack`, no consumer relink. (Alternative, rejected:
+link every consumer `-Wl,-z,execstack` -- works but invasive + doesn't generalize.)
+Marker patcher: `scripts/clear-execstack.py` (clears `PF_X` on `PT_GNU_STACK`).
 
 **Key paths:**
 - cluster: `<aietools>/lib/lnx64.o/libaie2_cluster_msm_v1_0_0.osci.so` (and `_func`, `_dbg` variants)

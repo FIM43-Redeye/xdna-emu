@@ -31,13 +31,18 @@ set(SC_MAIN    "${AIETOOLS_DIR}/data/osci_systemc/sc_main")
 # Bridge shared library
 # ---------------------------------------------------------------------------
 # Sources are added as the spine is built:
-#   II.2  src/sc_bootstrap.cpp + ${SC_MAIN}/sc_main.cpp + ${SC_MAIN}/sc_main_main.cpp
 #   II.3  src/aiesim_top.cpp
 #   II.4  src/ps_bridge.cpp
 #   II.5  src/cdo_replay.cpp
 #   II.6  src/service_thread.cpp
+#
+# Note: we compile sc_main_main.cpp (provides sc_elab_and_sim, the entry the
+# bridge calls to start the kernel) but NOT sc_main.cpp -- that only provides
+# main(), which a .so never runs.
 add_library(xdna_aiesim_bridge SHARED
   src/c_abi.cpp
+  src/sc_bootstrap.cpp
+  "${SC_MAIN}/sc_main_main.cpp"
 )
 
 target_include_directories(xdna_aiesim_bridge PRIVATE
@@ -46,8 +51,30 @@ target_include_directories(xdna_aiesim_bridge PRIVATE
 )
 
 # In-process embedding recipe (findings doc 2026-06-01):
-#   -z execstack : aietools' libsystemc requires an executable stack
-#   -rdynamic    : export our host globals so the dlopened cluster resolves them
-# Harmless for the II.1 stub library; required once SystemC embeds in II.2.
-target_link_options(xdna_aiesim_bridge PRIVATE -Wl,-z,execstack -rdynamic)
-target_link_libraries(xdna_aiesim_bridge PRIVATE ${CMAKE_DL_LIBS})
+#   -rdynamic : export our host globals so the dlopened cluster resolves them.
+# NOTE: we deliberately do NOT pass -z execstack. aietools' libsystemc ships
+# marked executable-stack, but that marker is spurious (QuickThreads .s files
+# lacking .note.GNU-stack) -- and marking our .so execstack is exactly what makes
+# dlopen fail on this kernel (it can't flip a running process's stack). Instead
+# the build script sanitizes a co-located libsystemc copy; see below + findings.
+target_link_options(xdna_aiesim_bridge PRIVATE -rdynamic)
+
+# DT_RPATH=$ORIGIN (old dtags, so it is searched BEFORE LD_LIBRARY_PATH): makes
+# the loader resolve libsystemc to the marker-cleared copy the build script
+# drops next to this .so, ahead of the RWE one in <aietools>/lib/lnx64.o.
+set_target_properties(xdna_aiesim_bridge PROPERTIES
+  BUILD_WITH_INSTALL_RPATH ON
+  INSTALL_RPATH "$ORIGIN"
+)
+target_link_options(xdna_aiesim_bridge PRIVATE -Wl,--disable-new-dtags)
+
+# SystemC: link aietools' libsystemc (resolved at run time to the sanitized
+# copy via the $ORIGIN rpath above). Cluster libs + other deps live in
+# lib/lnx64.o, found via LD_LIBRARY_PATH. Use system libstdc++ (default).
+find_library(SYSTEMC_LIB systemc PATHS "${AIETOOLS_DIR}/lib/lnx64.o" NO_DEFAULT_PATH)
+if(NOT SYSTEMC_LIB)
+  message(FATAL_ERROR "libsystemc not found in ${AIETOOLS_DIR}/lib/lnx64.o")
+endif()
+message(STATUS "systemc: ${SYSTEMC_LIB}")
+
+target_link_libraries(xdna_aiesim_bridge PRIVATE ${SYSTEMC_LIB} ${CMAKE_DL_LIBS})
