@@ -75,6 +75,9 @@ CURRENT-REFACTOR.md
 # XRT plugin build artifacts
 /xrt-plugin/build/
 
+# aiesim bridge build artifacts
+/aiesim-bridge/build/
+
 # Build script output
 /build/
 
