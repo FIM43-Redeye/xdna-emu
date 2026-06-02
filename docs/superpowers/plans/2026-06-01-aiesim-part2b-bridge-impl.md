@@ -159,6 +159,17 @@ the singleton.
 
 ## Task II-B.2: `cdo_replay` — decode the op-stream, drive `ess_*()`
 
+> **SPLIT (Maya "size tasks smaller"): II-B.2a DONE (commit 5da2981), II-B.2b
+> next.** II-B.2a = the CDO config decoder (`cdo_replay.{h,cpp}`, all 9 cdo_tag
+> ops via the zero-time backdoor; Steps 1-2 + the CDO half of 4-5). Gated:
+> hand-built op-stream WRITE/MASK_WRITE/MASK_POLL/DELAY/MARKER → read_reg
+> 0xDEADABEF, unsatisfiable poll → rc=1 bounded. II-B.2b = the NPU decoder +
+> DdrPatch (host_buffers[arg_idx].address+arg_plus → 48-bit BD addr write per
+> executor.rs `write_bd_address`) + Sync (DMA-wait; needs the AIE2 shim DMA-done
+> status reg + sc_start interleaving) = Step 3 + the NPU half. The Step-5
+> end-to-end gate (first real workload) decides the open backdoor-vs-timed
+> question (sc_main backdoor vs an SC_THREAD service process for timed writes).
+
 **Files:** Create `aiesim-bridge/src/cdo_replay.{h,cpp}`; modify `c_abi.cpp`
 (`aiesim_load_cdo` + `aiesim_exec_npu` call it), `CMakeLists.txt`.
 
