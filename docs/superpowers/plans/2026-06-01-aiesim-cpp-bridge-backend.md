@@ -2177,6 +2177,18 @@ Generated using Claude Code."
   queries the cluster and is where it gets resolved.
 - **`ess_WriteCmd` is unverified** — Task II.4 Step 1 is the authority on the real
   symbol set; do not provide symbols the HAL doesn't reference.
-- **`run()` seam decision** (dispatch, not unification) is the one design call to
-  confirm with Maya before Part I lands — it is deliberately not a single unified
-  loop, to keep interpreter behavior byte-for-byte unchanged.
+- **`run()` seam = full unification (DONE in Part I).** The earlier
+  dispatch-not-unification framing was dropped; `run` + `execute_npu_instructions`
+  are first-class `NpuBackend` trait methods and `execution.rs` is a thin
+  dispatcher. Settled with Maya; recorded here so the old note doesn't mislead.
+
+## Part II execution note (spike-first, decided with Maya 2026-06-01)
+
+Part II is taken as a **de-risking spike, II.1 → II.3**, driven inline on the dev
+box. Tasks II.1/II.2 reproduce the proven embedding spike (low risk); **II.3
+(E513-free cluster instantiation) is the one real unknown** and the gate. Tasks
+**II.4 → II.8 are NOT executed from this plan as-written** — their detail
+(exact `ess_*` set, socket signatures, topology API) is the findings doc's best
+guess and will shift on contact with II.3. After II.3 lands we **regroup and write
+a short Part II-B** grounded in what the cluster actually exposes. Review surface
+for Maya: the II.1-II.3 spine code + the E513 findings, not the speculative tail.

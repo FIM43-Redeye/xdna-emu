@@ -111,18 +111,31 @@ parity + arch-agnostic) vs a parallel harness. (2) **The host-driver strategy:**
   `runtime_sequence` designs.
 Target = **B**, with **A** as the proven fallback for MLIR-derived workloads.
 
-## OPEN — clean E513-free instantiation (first implementation task)
+## RESOLVED — clean E513-free instantiation (2026-06-01, probe4)
 
-- bare `create_math_engine` from `sc_main` → **E533** ("module name stack empty").
-- wrapped in a top `sc_module` (replicating `aie_xtlm`'s context) → **E513**
-  ("sc_module_name parameter required"). Context matters but isn't fully satisfied.
-- `XILINX_VITIS_AIETOOLS` + `RDI_DATADIR` set did **not** fix E513.
-- **Hypothesis:** needs the exact real-flow elaboration/global/env state that
-  `aie2simmsm`/`aie_xtlm` sets up before the call (possibly `AIE_FUNC_MODE`,
-  device-model load order, or a specific SystemC hierarchy). Next: trace the
-  *complete* real `sc_main → aie_xtlm ctor → create_cluster → create_math_engine`
-  path. Likely resolved naturally by a properly-structured backend, not throwaway
-  probes.
+**The crack: push one `sc_module_name` onto SystemC's name stack immediately
+before `create_math_engine`, from inside a parent `sc_module`'s construction.**
+
+Mechanism, now fully understood:
+- bare `create_math_engine` from `sc_main` (no module context) → **E533**
+  (`SC_ID_MODULE_NAME_STACK_EMPTY_`): the factory internally constructs a child
+  `sc_module` via the **default (no-name) ctor**, which pops a name off the stack;
+  with no module context at all, the stack is empty → E533.
+- wrapped in a parent `sc_module` ctor (probe3) → **E513** (`sc_module.cpp:227`,
+  "an sc_module_name parameter for your constructor is required"): now there *is*
+  a construction context, but probe3 still pushed no name for the factory's
+  internal default-ctor module → E513.
+- **Fix (probe4): declare `sc_core::sc_module_name nm("math_engine");` in the
+  parent ctor right before the call.** That single push is consumed by the
+  factory's internal module. Result: `create_math_engine` returns a valid
+  `MathEngine*` (`0x...`), the cluster fully constructs ("Array constructed /
+  Shim row constructed / Mem row constructed"), `STEP1 PASS`, exit 0. AIE2 ISS
+  r1p8, MTMODEL sim, all tiles enumerated. **No license check tripped; no
+  launcher; no pkg-dir.** `XILINX_VITIS_AIETOOLS`/`RDI_DATADIR` were never needed.
+
+Repro: `build/experiments/2026-06-01-aiesim-inprocess/probe4.cpp` +
+`build-probe.sh` (gitignored). This recipe is what Task II.3's `aiesim_top` ctor
+codifies: a parent `sc_module`, one pushed `sc_module_name`, then the factory.
 
 ## Reference files (the Rosetta stones)
 
