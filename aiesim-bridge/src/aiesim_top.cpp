@@ -80,8 +80,17 @@ aiesim_top::aiesim_top(sc_core::sc_module_name name, const char* arch, const cha
     if (ss_rd.empty() || ss_wr.empty()) {
         throw std::runtime_error("aiesim_top: cluster exposes no ss_aximm config sockets");
     }
-    ps_->ps_axi_rd.bind(*ss_rd[0]);
-    ps_->ps_axi_wr.bind(*ss_wr[0]);
+    // The HAL's memory-mapped register/DM writes route to a noc2aie interface
+    // ss_aximm[1..N] (aie_xtlm.cpp:359-383); [0] is the NPI socket. Bind the PS
+    // bridge to the memory-mapped config interface, NOT [0].
+    if (const char* idx = std::getenv("XDNA_AIESIM_CONFIG_IDX")) {
+        config_idx_ = static_cast<size_t>(std::strtoul(idx, nullptr, 10));
+    }
+    if (config_idx_ >= ss_rd.size()) {
+        throw std::runtime_error("aiesim_top: XDNA_AIESIM_CONFIG_IDX out of range");
+    }
+    ps_->ps_axi_rd.bind(*ss_rd[config_idx_]);
+    ps_->ps_axi_wr.bind(*ss_wr[config_idx_]);
 
     // Drive the cluster clock (aie_xtlm: me_inst->get_clk()(clk)). Required for
     // sc_start to advance the cluster.
@@ -119,10 +128,13 @@ void aiesim_top::stub_unused_ports() {
     auto* me = static_cast<MathEngineBase*>(me_);
     auto name = [](const char* p, size_t i) { return std::string(p) + std::to_string(i); };
 
-    // 1. ss_aximm slave targets [1..]: initiator stubs ([0] is the ps_bridge).
+    // 1. ss_aximm slave targets: initiator stubs for every index EXCEPT the one
+    //    the ps_bridge owns (config_idx_). This stubs the NPI socket [0] and the
+    //    other noc2aie interfaces.
     std::vector<xtlm::xtlm_aximm_target_socket*>& ss_rd = me->get_ss_aximm_rd();
     std::vector<xtlm::xtlm_aximm_target_socket*>& ss_wr = me->get_ss_aximm_wr();
-    for (size_t i = 1; i < ss_rd.size(); ++i) {
+    for (size_t i = 0; i < ss_rd.size(); ++i) {
+        if (i == config_idx_) continue;
         auto* rs = new xtlm::xtlm_aximm_initiator_stub(name("ss_rd_stub_", i).c_str(), 32);
         auto* ws = new xtlm::xtlm_aximm_initiator_stub(name("ss_wr_stub_", i).c_str(), 32);
         ss_rd[i]->bind(rs->initiator_socket);

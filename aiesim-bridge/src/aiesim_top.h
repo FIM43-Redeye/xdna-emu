@@ -36,6 +36,11 @@ private:
 
     void* me_ = nullptr;           // MathEngine*
     void* cluster_lib_ = nullptr;  // dlopen handle for the per-arch cluster .so
+    size_t config_idx_ = 1;        // ss_aximm index for memory-mapped config.
+                                   // [0]=NPI (aie_xtlm.cpp:371); [1..]=noc2aie
+                                   // memory-mapped interfaces. Overridable via
+                                   // XDNA_AIESIM_CONFIG_IDX while we pin which
+                                   // NoC interface reaches a given tile.
     ps_bridge* ps_ = nullptr;      // PS-side ess_*() bridge (child sc_module)
     ddr_target* ddr_ = nullptr;    // host DDR bound to the shim-DMA masters
     sc_core::sc_clock clock_;      // drives the cluster's clk (II-B.3)

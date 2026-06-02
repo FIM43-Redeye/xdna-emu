@@ -40,6 +40,8 @@ void ps_bridge::set_payload_attr(xtlm::aximm_payload* trans, size_t bytes) {
     trans->set_axi_id(0);
     trans->set_burst_length(1);
     trans->set_burst_size(bytes);
+    trans->set_burst_type(1);  // INCR -- genwrapper PSIP_ps_i3 sets this on every
+                               // beat; without it the config target sees FIXED.
 }
 
 void ps_bridge::write32(uint64_t addr, uint32_t data) {

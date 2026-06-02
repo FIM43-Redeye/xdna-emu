@@ -107,6 +107,7 @@ void hal_test_proc() {
 
     // Isolation: does a data-memory write reach LIVE state via ess_*? Round-trip
     // a sentinel before the lock dance to separate "path works" from lock issues.
+    // (b_transport is blocking, so the write commits before the read returns.)
     {
         TRY(XAie_DataMemWrWord(&DevInst, core, 64, 0x12345678));
         u32 chk = 0xdeadbeef;
