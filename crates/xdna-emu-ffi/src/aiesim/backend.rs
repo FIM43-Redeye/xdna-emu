@@ -89,9 +89,16 @@ impl NpuBackend for AiesimBackend {
         }
     }
     fn execute_npu_instructions(&mut self, stream: &NpuInstructionStream) -> Result<(), String> {
+        // The bridge replays the runtime sequence to COMPLETION here (its Sync
+        // ops block on the live DMA), so host inputs must already be in the
+        // bridge GM before replay -- flush now, not at run() time, or the shim
+        // DMA reads an empty input buffer and the output comes back zero.
+        if self.dirty {
+            flush_host_to_bridge(&self.host, self.bridge.as_mut());
+            self.dirty = false;
+        }
         // Encode the runtime-sequence ops into the same tagged wire format and
-        // hand them to the bridge for register-write replay. encode_npu is a
-        // placeholder until Task I.8; the bridge stages them for the next run.
+        // hand them to the bridge for register-write replay.
         let ops = encode_npu(stream);
         match self.bridge.exec_npu(&ops) {
             BridgeStatus::Ok => Ok(()),
@@ -116,6 +123,10 @@ impl NpuBackend for AiesimBackend {
             BridgeHalt::Budget => HaltKind::Budget,
             BridgeHalt::Error => HaltKind::Error,
         };
+        // The cluster wrote outputs into the bridge's DDR model (ddr_target) via
+        // shim DMA; pull every registered region back into the Rust HostMemory
+        // mirror so read_host_memory (which reads the mirror) sees them.
+        flush_bridge_to_host(&mut self.host, self.bridge.as_mut());
         // Async-error surfacing through `observer` is a tier-3 item (Part II):
         // aiesim errors come back via error registers, not a Rust drain. For now
         // the bridge reports none; the observer is intentionally unused here.
@@ -317,6 +328,20 @@ fn flush_host_to_bridge(host: &HostMemory, bridge: &mut dyn BridgeAbi) {
         let mut bytes = vec![0u8; region.size];
         host.read_bytes(region.base_address, &mut bytes);
         let _ = bridge.write_gm(region.base_address, &bytes);
+    }
+}
+
+/// Pull every registered host-memory region back from the bridge GM model into
+/// the Rust `HostMemory` mirror -- the post-run reverse of `flush_host_to_bridge`.
+/// Output buffers are written by the cluster's shim DMA into the bridge's DDR; we
+/// copy them back so the FFI read path (which reads the mirror) observes them.
+fn flush_bridge_to_host(host: &mut HostMemory, bridge: &mut dyn BridgeAbi) {
+    let regions: Vec<(u64, usize)> = host.regions().iter().map(|r| (r.base_address, r.size)).collect();
+    for (base, size) in regions {
+        let mut bytes = vec![0u8; size];
+        if bridge.read_gm(base, &mut bytes) == BridgeStatus::Ok {
+            host.write_bytes(base, &bytes);
+        }
     }
 }
 

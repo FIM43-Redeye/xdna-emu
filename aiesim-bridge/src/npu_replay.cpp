@@ -3,6 +3,7 @@
 #include <systemc.h>
 
 #include <cstdio>
+#include <cstdlib>
 
 #include "addr_remap.h"
 #include "ps_bridge.h"
@@ -24,18 +25,28 @@ enum NpuTag : uint8_t {
 
 // Sync (dma_await_task) "channel done" mask for the AIE-ML DMA channel status
 // register, derived from aie-rt _XAieMl_DmaWaitForDone (xaie_dma_aieml.c) + the
-// xaiemlgbl register layout: TaskQSize[22:20] | ChannelRunning[19] |
-// StalledTCT[5] | StalledStreamStarve[4] | StalledLockRel[3] | StalledLockAcq[2].
+// xaiemlgbl register layout:
+//   TaskQSize[22:20]      0x700000
+//   ChannelRunning[19]    0x080000
+//   StalledTCT[5]         0x000020
+//   StalledStreamStarve[4]0x000010
+//   StalledLockRel[3]     0x000008
+//   StalledLockAcq[2]     0x000004
 // Done == all of these clear (queue empty, not running, not stalled). The
 // TaskQSize bits also defeat the false-idle race a queued-but-not-started task
 // would otherwise cause (no need for the interpreter's "started" flag).
-constexpr uint32_t kDmaDoneMask = 0x007000FCu;
+// (NB: bit 19 ChannelRunning MUST be in the mask -- omitting it makes a running
+// channel read as "done" and the Sync returns before the DMA finishes.)
+constexpr uint32_t kDmaDoneMask = 0x0078003Cu;
 
 // Poll bound for Sync, like cdo_replay's MASK_POLL: advance the kernel in quanta
 // so a never-completing DMA fails instead of hanging. The cluster's DMA runs in
 // real sim-time, so this only ever trips on a genuine stall.
+// The cluster sim advances ~1 sim-ns per ~1 ms wall, so the cap doubles as a
+// wall-clock bound: 100k ns ~ 2 min before a stuck (starving) channel gives up.
+// A real small DMA completes in a few thousand sim-ns. Tunable.
 constexpr uint64_t kPollQuantumNs = 256;
-constexpr uint64_t kPollMaxNs = 5'000'000;
+constexpr uint64_t kPollMaxNs = 100'000;
 
 // AIE-ML DMA channel STATUS register offset within a tile, by tile-type (from
 // the NPU1 row), direction (0=S2MM, 1=MM2S) and channel. Offsets per the
@@ -57,6 +68,21 @@ uint32_t dma_status_offset(uint8_t npu1_row, uint8_t direction, uint8_t channel)
     }
     const uint32_t base = (direction == 0) ? s2mm_base : mm2s_base;
     return base + static_cast<uint32_t>(channel) * 4u;
+}
+
+// Resolve a DdrPatch arg_idx to its DDR base address. For arg_idx within the
+// registered host buffers, that buffer's address; beyond it, fabricate a 1 MiB
+// trace-style buffer per extra index, placed after the last buffer -- mirroring
+// the interpreter (executor.rs execute_ddr_patch), so an over-indexed BD (trace
+// / instrumentation) gets a valid, non-overlapping DDR address instead of an
+// error. The bridge's ddr_target is sparse-paged, so any such address is live.
+uint64_t resolve_arg_base(const std::vector<std::pair<uint64_t, std::size_t>>& bufs,
+                          uint8_t arg_idx) {
+    if (arg_idx < bufs.size()) return bufs[arg_idx].first;
+    constexpr uint64_t kTrace = 0x100000;  // 1 MiB, matching the interpreter
+    uint64_t addr = bufs.empty() ? kTrace : (bufs.back().first + bufs.back().second);
+    for (std::size_t idx = bufs.size(); idx < arg_idx; ++idx) addr += kTrace;
+    return addr;
 }
 
 // Little-endian cursor with bounds checking (twin of cdo_replay's Reader).
@@ -152,19 +178,18 @@ int npu_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len, uint8_t start
                 uint8_t arg_idx = r.u8();
                 uint32_t arg_plus = r.u32();
                 if (r.err) break;
-                if (arg_idx >= host_buffers.size()) {
-                    std::fprintf(stderr,
-                                 "[npu_replay] DdrPatch arg_idx %u >= %zu host buffers\n",
-                                 arg_idx, host_buffers.size());
-                    return 1;
-                }
                 // Host-buffer mode (host buffers are registered by the plugin):
                 // the patched DDR address is the buffer base + the BD's byte
                 // offset. Write it into the shim BD address word pair (low 32 to
                 // the addr-low word, high 16 to the addr-high word). The DDR
                 // address is in the bridge's ddr_target space -- NOT translated.
-                const uint64_t patched = host_buffers[arg_idx].first + arg_plus;
+                const uint64_t patched = resolve_arg_base(host_buffers, arg_idx) + arg_plus;
                 const uint64_t lo_reg = cluster_addr(reg_addr, start_col);
+                if (std::getenv("XDNA_AIESIM_TRACE")) {
+                    std::fprintf(stderr,
+                                 "[npu_replay] DdrPatch arg_idx=%u patched=0x%llx -> reg=0x%llx\n",
+                                 arg_idx, (unsigned long long)patched, (unsigned long long)lo_reg);
+                }
                 ps->write32(lo_reg, uint32_t(patched & 0xFFFFFFFFu));
 
                 const uint8_t row = uint8_t((reg_addr >> kRowShift) & 0x1F);
@@ -195,6 +220,14 @@ int npu_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len, uint8_t start
                 const uint32_t npu_addr = (uint32_t(column) << kColShift) |
                                           (uint32_t(row) << kRowShift) | off;
                 const uint64_t status_addr = cluster_addr(npu_addr, start_col);
+                if (std::getenv("XDNA_AIESIM_TRACE")) {
+                    uint32_t first = ps->read32(status_addr);
+                    std::fprintf(stderr,
+                                 "[npu_replay] Sync col=%u row=%u dir=%u ch=%u status=0x%llx "
+                                 "first_read=0x%08x (done_mask&=0x%x)\n",
+                                 column, row, direction, channel,
+                                 (unsigned long long)status_addr, first, first & kDmaDoneMask);
+                }
                 if (!dma_wait(ps, status_addr)) {
                     std::fprintf(stderr,
                                  "[npu_replay] Sync timeout: col=%u row=%u dir=%u ch=%u "

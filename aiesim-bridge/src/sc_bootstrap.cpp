@@ -122,7 +122,15 @@ void execute(aiesim_top* top, aiesim::Command* c) {
             c->reply_int = aiesim::npu_replay(ps, c->in_ptr, c->len, g_start_col, g_host_buffers);
             break;
         case aiesim::Command::SET_START_COL:
-            g_start_col = static_cast<uint8_t>(c->addr);
+            // XDNA_AIESIM_START_COL overrides the xclbin's start_col -- a debug
+            // knob for placing the partition on a specific Versal column (e.g. a
+            // NoC shim column, since PL-shim columns route the output stream to
+            // an unconnected PL port).
+            if (const char* e = std::getenv("XDNA_AIESIM_START_COL")) {
+                g_start_col = static_cast<uint8_t>(std::strtoul(e, nullptr, 10));
+            } else {
+                g_start_col = static_cast<uint8_t>(c->addr);
+            }
             c->reply_int = 0;
             break;
         case aiesim::Command::RESET:

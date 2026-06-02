@@ -44,11 +44,18 @@ impl DlopenBridge {
     pub(crate) fn open(arch: &str, device_json: &str) -> Result<Self, String> {
         let path =
             std::env::var("XDNA_AIESIM_BRIDGE").unwrap_or_else(|_| "libxdna_aiesim_bridge.so".to_string());
-        // SAFETY: loading a trusted, locally-built bridge; RTLD_GLOBAL so the
-        // cluster can resolve the bridge's host globals.
-        let lib = unsafe { Library::new(&path) }.map_err(|e| {
+        // RTLD_GLOBAL is REQUIRED, not cosmetic: the bridge defines host globals
+        // (sc_stop_at_end_of_main, plio_complete) that the cluster .so -- dlopened
+        // later by the bridge -- resolves from the global symbol scope. The
+        // default Library::new loads RTLD_LOCAL, hiding them, so the cluster
+        // fails with "undefined symbol: sc_stop_at_end_of_main". Open with
+        // RTLD_NOW | RTLD_GLOBAL via the unix-specific API.
+        // SAFETY: loading a trusted, locally-built bridge.
+        use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
+        let unix_lib = unsafe { UnixLibrary::open(Some(&path), RTLD_NOW | RTLD_GLOBAL) }.map_err(|e| {
             format!("aiesim: cannot load {path}: {e} (build it with scripts/build-aiesim-bridge.sh)")
         })?;
+        let lib: Library = unix_lib.into();
         unsafe {
             let create: Symbol<CreateFn> = lib
                 .get(b"aiesim_create\0")
