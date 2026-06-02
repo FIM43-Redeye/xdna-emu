@@ -4,6 +4,7 @@
 
 #include <cstdio>
 
+#include "addr_remap.h"
 #include "ps_bridge.h"
 
 namespace aiesim {
@@ -80,7 +81,7 @@ bool mask_poll(ps_bridge* ps, uint64_t addr, uint32_t mask, uint32_t expected) {
 
 }  // namespace
 
-int cdo_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len) {
+int cdo_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len, uint8_t start_col) {
     Reader r{ops, len};
     while (r.i < r.n && !r.err) {
         const uint8_t tag = r.u8();
@@ -88,40 +89,43 @@ int cdo_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len) {
             case WRITE: {
                 uint32_t a = r.u32(), v = r.u32();
                 if (r.err) break;
-                ps->write32(a, v);
+                ps->write32(cluster_addr(a, start_col), v);
                 break;
             }
             case WRITE64: {
                 uint64_t a = r.u64();
                 uint32_t v = r.u32();
                 if (r.err) break;
-                ps->write32(a, v);
+                ps->write32(cluster_addr(a, start_col), v);
                 break;
             }
             case MASK_WRITE: {
                 uint32_t a = r.u32(), m = r.u32(), v = r.u32();
                 if (r.err) break;
-                mask_write(ps, a, m, v);
+                mask_write(ps, cluster_addr(a, start_col), m, v);
                 break;
             }
             case MASK_WRITE64: {
                 uint64_t a = r.u64();
                 uint32_t m = r.u32(), v = r.u32();
                 if (r.err) break;
-                mask_write(ps, a, m, v);
+                mask_write(ps, cluster_addr(a, start_col), m, v);
                 break;
             }
             case DMA_WRITE: {
                 uint32_t a = r.u32(), l = r.u32();
                 if (r.err || !r.need(l)) { r.err = true; break; }
                 // A contiguous block write to the config/MMIO space: replay it
-                // word by word (register data is 32-bit-aligned).
+                // word by word (register data is 32-bit-aligned). Translate the
+                // base once; per-word offsets stay within the tile so they add
+                // linearly onto the translated address.
+                const uint64_t base = cluster_addr(a, start_col);
                 const uint8_t* blk = r.p + r.i;
                 for (uint32_t off = 0; off + 4 <= l; off += 4) {
                     uint32_t w = uint32_t(blk[off]) | (uint32_t(blk[off + 1]) << 8) |
                                  (uint32_t(blk[off + 2]) << 16) |
                                  (uint32_t(blk[off + 3]) << 24);
-                    ps->write32(a + off, w);
+                    ps->write32(base + off, w);
                 }
                 r.i += l;
                 break;
@@ -129,7 +133,7 @@ int cdo_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len) {
             case MASK_POLL: {
                 uint32_t a = r.u32(), m = r.u32(), e = r.u32();
                 if (r.err) break;
-                if (!mask_poll(ps, a, m, e)) {
+                if (!mask_poll(ps, cluster_addr(a, start_col), m, e)) {
                     std::fprintf(stderr,
                                  "[cdo_replay] MASK_POLL timeout: addr=0x%x mask=0x%x exp=0x%x\n",
                                  a, m, e);
@@ -141,7 +145,7 @@ int cdo_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len) {
                 uint64_t a = r.u64();
                 uint32_t m = r.u32(), e = r.u32();
                 if (r.err) break;
-                if (!mask_poll(ps, a, m, e)) {
+                if (!mask_poll(ps, cluster_addr(a, start_col), m, e)) {
                     std::fprintf(stderr,
                                  "[cdo_replay] MASK_POLL64 timeout: addr=0x%llx mask=0x%x exp=0x%x\n",
                                  (unsigned long long)a, m, e);

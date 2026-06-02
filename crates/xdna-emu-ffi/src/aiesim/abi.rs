@@ -54,6 +54,9 @@ pub(crate) trait BridgeAbi {
     fn read_reg(&mut self, addr: u64) -> u32;
     /// Reset logical state between submissions (re-apply CDO follows).
     fn reset(&mut self) -> BridgeStatus;
+    /// Set the partition's physical start column for the NPU1->Versal address
+    /// translation (logical col 0 -> physical start_col).
+    fn set_start_col(&mut self, start_col: u8) -> BridgeStatus;
 }
 
 #[cfg(test)]
@@ -71,6 +74,7 @@ pub(crate) mod mock {
         pub runs: u32,
         pub gm: HashMap<u64, u8>,
         pub host_buffers: Vec<(u64, usize)>,
+        pub start_col: u8,
         pub next_run_halt: Option<BridgeHalt>,
         pub next_run_cycles: u64,
     }
@@ -117,6 +121,10 @@ pub(crate) mod mock {
             0
         }
         fn reset(&mut self) -> BridgeStatus {
+            BridgeStatus::Ok
+        }
+        fn set_start_col(&mut self, start_col: u8) -> BridgeStatus {
+            self.start_col = start_col;
             BridgeStatus::Ok
         }
     }

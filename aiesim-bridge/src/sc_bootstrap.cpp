@@ -28,6 +28,7 @@
 #include "aiesim_top.h"
 #include "cdo_replay.h"
 #include "ddr_target.h"
+#include "npu_replay.h"
 #include "ps_bridge.h"
 #include "service_thread.h"
 
@@ -50,8 +51,14 @@ void* g_aiesim_top = nullptr;  // aiesim_top*
 namespace {
 
 // Registered host buffers (DDR addr, size). ADD/CLEAR_HOST_BUF maintain this;
-// II-B.2b's exec_npu (DdrPatch resolution) consumes it. Driver-thread only.
+// exec_npu (DdrPatch resolution) consumes it. Driver-thread only.
 std::vector<std::pair<uint64_t, std::size_t>> g_host_buffers;
+
+// Partition physical start column (SET_START_COL). Drives the NPU1->Versal
+// address translation in cdo_replay/npu_replay (logical col 0 -> physical
+// start_col). Default 0: a single-partition kernel runs correctly at column 0
+// (consistent logical->physical mapping); the plugin sets the real value.
+uint8_t g_start_col = 0;
 
 // Doorbell: the OS thread rings async_request_update() (thread-safe); the kernel
 // runs update() in its next update phase, notifying the driver's command event.
@@ -109,13 +116,25 @@ void execute(aiesim_top* top, aiesim::Command* c) {
             c->reply_int = 0;
             break;
         case aiesim::Command::LOAD_CDO:
-            c->reply_int = aiesim::cdo_replay(ps, c->in_ptr, c->len);
+            c->reply_int = aiesim::cdo_replay(ps, c->in_ptr, c->len, g_start_col);
             break;
-        // EXEC_NPU (DdrPatch/Sync) lands in II-B.2b; RESET re-applies CDO.
         case aiesim::Command::EXEC_NPU:
+            c->reply_int = aiesim::npu_replay(ps, c->in_ptr, c->len, g_start_col, g_host_buffers);
+            break;
+        case aiesim::Command::SET_START_COL:
+            g_start_col = static_cast<uint8_t>(c->addr);
+            c->reply_int = 0;
+            break;
         case aiesim::Command::RESET:
+            // No-op success for now: the cluster cannot be reset in-process
+            // (SystemC is single-shot) and single-submission runs do not need
+            // it. Multi-submission state reset is a follow-up (destroy+recreate
+            // or a CDO re-apply); returning Ok keeps reset_for_new_context from
+            // failing the run.
+            c->reply_int = 0;
+            break;
         default:
-            c->reply_int = 1;  // not yet implemented
+            c->reply_int = 1;  // unknown command
             break;
     }
 }

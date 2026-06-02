@@ -28,6 +28,10 @@ int aiesim_load_cdo(void *h, const uint8_t *ops, size_t len);
  * staged before run (arrives via execute_npu_instructions). 0 = ok. */
 int aiesim_exec_npu(void *h, const uint8_t *ops, size_t len);
 
+/* Set the partition's physical start column for the NPU1->Versal address
+ * translation (logical col 0 -> physical start_col). Default 0. 0 = ok. */
+int aiesim_set_start_col(void *h, uint32_t start_col);
+
 /* Register a host buffer (DDR addr + size) so the bridge can resolve DdrPatch
  * records during exec_npu replay. 0 = ok. */
 int aiesim_add_host_buffer(void *h, uint64_t addr, size_t size);

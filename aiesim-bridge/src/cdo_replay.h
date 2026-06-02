@@ -11,6 +11,10 @@
 // legal -- the backdoor reaches only a shadow store, not live registers (see the
 // feasibility findings doc, 2026-06-02). MASK_POLL advances the kernel (wait())
 // between live reads; DELAY steps time.
+//
+// Addresses are NPU1 (partition-logical, base-less) and are translated to the
+// absolute Versal cluster address via addr_remap.h (start_col shift + row remap
+// + base) before every register access.
 #pragma once
 
 #include <cstddef>
@@ -20,8 +24,9 @@ class ps_bridge;
 
 namespace aiesim {
 
-// Decode + replay a CDO op-stream. Returns 0 on success; 1 on decode error
-// (truncated stream / unknown tag) or MASK_POLL timeout.
-int cdo_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len);
+// Decode + replay a CDO op-stream. `start_col` is the partition's physical start
+// column (for the NPU1->Versal address translation). Returns 0 on success; 1 on
+// decode error (truncated stream / unknown tag) or MASK_POLL timeout.
+int cdo_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len, uint8_t start_col);
 
 }  // namespace aiesim

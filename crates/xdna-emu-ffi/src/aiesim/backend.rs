@@ -60,6 +60,9 @@ impl NpuBackend for AiesimBackend {
     }
     fn set_start_col(&mut self, start_col: u8) {
         self.start_col = start_col;
+        // Forward to the bridge so cdo_replay/npu_replay translate NPU1 logical
+        // columns to the right physical column on the Versal cluster.
+        let _ = self.bridge.set_start_col(start_col);
     }
     fn load_elf_bytes(&mut self, _col: usize, _row: usize, _data: &[u8]) -> Result<u32, String> {
         // ELF core images are delivered to the cluster as part of CDO/config in

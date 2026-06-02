@@ -32,7 +32,7 @@ namespace aiesim {
 struct Command {
     enum Tag {
         LOAD_CDO, EXEC_NPU, WRITE_GM, READ_GM, READ_REG,
-        ADD_HOST_BUF, CLEAR_HOST_BUF, RUN, RESET, SHUTDOWN,
+        ADD_HOST_BUF, CLEAR_HOST_BUF, RUN, RESET, SET_START_COL, SHUTDOWN,
     };
     explicit Command(Tag t) : tag(t) {}
     Tag tag;

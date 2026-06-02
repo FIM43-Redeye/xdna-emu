@@ -44,6 +44,12 @@ int aiesim_exec_npu(void* /*handle*/, const uint8_t* ops, size_t len) {
     return submit_status(c);
 }
 
+int aiesim_set_start_col(void* /*handle*/, uint32_t start_col) {
+    aiesim::Command c(aiesim::Command::SET_START_COL);
+    c.addr = start_col;  // reuse addr to carry the value
+    return submit_status(c);
+}
+
 int aiesim_add_host_buffer(void* /*handle*/, uint64_t addr, size_t size) {
     aiesim::Command c(aiesim::Command::ADD_HOST_BUF);
     c.addr = addr;
