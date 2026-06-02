@@ -25,6 +25,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 
 namespace aiesim {
 
@@ -33,9 +34,21 @@ constexpr uint64_t kAieMlBase = 0x20000000000ULL;
 constexpr uint32_t kColShift = 25;
 constexpr uint32_t kRowShift = 20;
 
-// Map an NPU1 row to the Versal AIE-ML row. shim(0)/memtile(1) identity; compute
-// (>=2) shifts +1 to skip Versal's second memtile row.
+// NATIVE-GEOMETRY MODE: when the cluster is built from a native NPU1 device file
+// (5 cols, 1 memtile row) instead of the Versal-overlay default, the row remap
+// must NOT apply -- the addresses are already NPU1-native (shim row 0, memtile
+// row 1, compute rows 2-5, with no second memtile row to skip). Gated on
+// XDNA_AIESIM_NATIVE_GEOMETRY (presence = native).
+inline bool native_geometry() {
+    static const bool v = (std::getenv("XDNA_AIESIM_NATIVE_GEOMETRY") != nullptr);
+    return v;
+}
+
+// Map an NPU1 row to the cluster row. Native NPU1 geometry: identity. Versal
+// overlay (Fork A): shim(0)/memtile(1) identity; compute (>=2) shifts +1 to skip
+// Versal's second memtile row.
 inline uint32_t remap_row(uint32_t npu1_row) {
+    if (native_geometry()) return npu1_row;
     return (npu1_row < 2) ? npu1_row : npu1_row + 1;
 }
 
