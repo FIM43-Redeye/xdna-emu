@@ -317,9 +317,11 @@ before theorising a missing mechanism. The `set_burst_type(1)` INCR fix (matchin
 genwrapper PSIP_ps_i3) and the SETSTACK correction above stand, but neither was the
 blocker.
 
-OPEN (workload-agnostic coverage): bound one interface, ss_aximm[1], which reaches
-tile (1,3). Whether [1] is global (any tile) or the NoC partitions columns across
-the 18 noc2aie interfaces is the next thing to confirm -- a multi-column kernel will
-tell. The config index is env-overridable (XDNA_AIESIM_CONFIG_IDX, default 1) for
-the probe. If partitioned, the bridge needs the noc2aie address decode (an
-interconnect modeling the NoC's address->interface map from the device JSON).
+Coverage (RESOLVED 2026-06-02): **ss_aximm[1] is GLOBAL.** A coverage probe in the
+harness (XDNA_AIESIM_COVERAGE) round-tripped a per-tile sentinel into core-tile DM
+across the full array -- 30/30 core tiles (cols {0,1,2,5,9,18,19,20,30,37} x rows
+{3,6,10}) stuck via the single bound interface ss_aximm[1]. The cluster's NoC model
+routes globally; the bridge needs only ONE config binding, no noc2aie address decode.
+(XDNA_AIESIM_CONFIG_IDX stays as a probe knob; mem-tile DM uses a different access
+path and can be confirmed when a mem-tile workload arrives, but core-tile coverage
+is array-wide.) The single-tile kernel run still PASSes with the probe in place.

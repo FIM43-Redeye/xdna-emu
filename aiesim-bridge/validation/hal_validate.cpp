@@ -103,6 +103,36 @@ void hal_test_proc() {
            XAIE_IO_BACKEND_SIM);
     XAie_TurnEccOff(&DevInst);  // SIM special-case (test_library.cpp:291)
 
+    // Coverage probe (XDNA_AIESIM_COVERAGE): does the single bound config
+    // interface reach every column, or does the NoC partition columns across the
+    // noc2aie interfaces? Round-trip a per-tile sentinel into core-tile DM across
+    // a spread of columns (core rows are 3..10). Reports stick/no-stick, then
+    // stops -- skips the kernel run.
+    if (std::getenv("XDNA_AIESIM_COVERAGE")) {
+        const int cols[] = {0, 1, 2, 5, 9, 18, 19, 20, 30, 37};
+        const int rows[] = {3, 6, 10};  // core rows (3..10)
+        int ok = 0, total = 0;
+        for (int c : cols) {
+            for (int r : rows) {
+                XAie_LocType t = XAie_TileLoc((u8)c, (u8)r);
+                u32 sentinel = 0xC0DE0000u | ((u32)c << 4) | (u32)r;
+                AieRC wr = XAie_DataMemWrWord(&DevInst, t, 64, sentinel);
+                u32 chk = 0xdeadbeef;
+                AieRC rd = XAie_DataMemRdWord(&DevInst, t, 64, &chk);
+                bool good = (wr == XAIE_OK && rd == XAIE_OK && chk == sentinel);
+                if (!good)
+                    printf("[cov] tile(%2d,%2d) wrote 0x%08x read 0x%08x MISS\n", c,
+                           r, sentinel, chk);
+                ok += good;
+                ++total;
+            }
+        }
+        printf("[cov] %d/%d core tiles reachable via this config interface "
+               "(cols 0..37 x rows 3,6,10)\n", ok, total);
+        sc_core::sc_stop();
+        return;
+    }
+
     const XAie_LocType core = XAie_TileLoc(1, 3);
 
     // Isolation: does a data-memory write reach LIVE state via ess_*? Round-trip
