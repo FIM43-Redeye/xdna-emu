@@ -113,4 +113,4 @@ Thumbs.db
 # rw-access-probe build artifacts + clangd cache
 tools/rw-access-probe/build/
 tools/rw-access-probe/.cache/
-/default.aierun_summary
+default.aierun_summary

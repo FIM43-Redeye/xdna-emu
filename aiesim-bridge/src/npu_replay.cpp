@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "addr_remap.h"
 #include "ps_bridge.h"
@@ -118,11 +119,71 @@ bool dma_wait(ps_bridge* ps, uint64_t status_addr) {
     }
 }
 
+// Diagnostic: when XDNA_AIESIM_PROBE_TILE="col,row" (NPU1 logical) is set, dump
+// the compute tile's core/clock/program/data state via timed live reads. Lets us
+// tell "core never enabled" (clock-gated / no program loaded) from "core enabled
+// but stalled" (input stream/lock starvation) -- the two failure modes that both
+// leave the output S2MM channel never completing. Register offsets are the
+// AIE-ML compute-tile module (xaiemlgbl_params.h):
+//   Core_Control 0x32000 (Enable[0], Reset[1])
+//   Core_Status  0x32004 (Enable[0], Done[20], stream-stall SS0[10], lock-stall..)
+//   Core_PC      0x31100   Program_Memory 0x20000   Module_Clock_Control 0x60000
+// `tag` labels the call site (entry / sync / timeout).
+void probe_tile(ps_bridge* ps, uint8_t start_col, const char* tag) {
+    const char* e = std::getenv("XDNA_AIESIM_PROBE_TILE");
+    if (!e) return;
+    int col = 0, row = 0;
+    if (std::sscanf(e, "%d,%d", &col, &row) != 2) return;
+    // Read NPU1 logical (col,r,off) through the cluster remap.
+    auto rd = [&](int r, uint32_t off) -> uint32_t {
+        const uint32_t npu = (uint32_t(col) << kColShift) | (uint32_t(r) << kRowShift) | off;
+        return ps->read32(cluster_addr(npu, start_col));
+    };
+    // Compute-tile core + clock + program state.
+    const uint32_t ctrl = rd(row, 0x32000), status = rd(row, 0x32004), pc = rd(row, 0x31100);
+    const uint32_t clk = rd(row, 0x60000), pm0 = rd(row, 0x20000);
+    std::fprintf(stderr,
+                 "[probe %s] core(%d,%d) ctrl=0x%08x status=0x%08x pc=0x%05x clk=0x%08x pm0=0x%08x\n",
+                 tag, col, row, ctrl, status, pc, clk, pm0);
+    // Compute-tile memory-module locks 0..7 (0x1F000, stride 0x10). Signed value.
+    std::fprintf(stderr, "[probe %s] locks ", tag);
+    for (int l = 0; l < 8; ++l) std::fprintf(stderr, "L%d=%d ", l, (int)rd(row, 0x1F000 + l * 0x10));
+    std::fprintf(stderr, "\n");
+    // Compute-tile DMA channel status: S2MM (receives input from stream) 0x1DF00,
+    // MM2S (sends output to stream) 0x1DF10.
+    std::fprintf(stderr, "[probe %s] compute-dma s2mm0=0x%08x mm2s0=0x%08x\n",
+                 tag, rd(row, 0x1DF00), rd(row, 0x1DF10));
+    // Shim (row 0) DMA channel status: MM2S (input DDR->stream) 0x1D228,
+    // S2MM (output stream->DDR) 0x1D220. Plus the input BD0 (len 0x1D000,
+    // addr-lo 0x1D004, addr-hi 0x1D008) and MM2S ch0 ctrl 0x1D210 / task-queue
+    // 0x1D214 -- to confirm the input descriptor is configured + queued.
+    std::fprintf(stderr,
+                 "[probe %s] shim-dma mm2s0=0x%08x s2mm0=0x%08x | bd0[len,lo,hi]=0x%08x,0x%08x,0x%08x "
+                 "mm2s0_ctrl=0x%08x mm2s0_q=0x%08x\n",
+                 tag, rd(0, 0x1D228), rd(0, 0x1D220), rd(0, 0x1D000), rd(0, 0x1D004), rd(0, 0x1D008),
+                 rd(0, 0x1D210), rd(0, 0x1D214));
+    // Compute-tile data-memory scan -- look for the input pattern (0,1,2,3,...).
+    // 64 KiB data memory; sample a few plausible buffer offsets.
+    static const uint32_t kOff[] = {0x0000, 0x0400, 0x0800, 0x1000, 0x1400, 0x1800, 0x2000, 0x4000};
+    std::fprintf(stderr, "[probe %s] dm", tag);
+    for (uint32_t o : kOff) std::fprintf(stderr, " [0x%04x]=%u,%u", o, rd(row, o), rd(row, o + 4));
+    std::fprintf(stderr, "\n");
+    // Memtile (NPU1 row 1) -- the middle of the shim->memtile->compute pipeline.
+    // If its S2MM (from shim) is done but MM2S (to compute) is running+stalled,
+    // the downstream route to the compute tile is broken (the Fork A row-gap).
+    // Memtile DMA status: S2MM 0xA0660, MM2S 0xA0680 (stride 4). Locks 0xC0000.
+    std::fprintf(stderr, "[probe %s] memtile(0,1) s2mm0=0x%08x s2mm1=0x%08x mm2s0=0x%08x mm2s1=0x%08x locks ",
+                 tag, rd(1, 0xA0660), rd(1, 0xA0664), rd(1, 0xA0680), rd(1, 0xA0684));
+    for (int l = 0; l < 4; ++l) std::fprintf(stderr, "L%d=%d ", l, (int)rd(1, 0xC0000 + l * 0x10));
+    std::fprintf(stderr, "\n");
+}
+
 }  // namespace
 
 int npu_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len, uint8_t start_col,
                const std::vector<std::pair<uint64_t, std::size_t>>& host_buffers) {
     Reader r{ops, len};
+    probe_tile(ps, start_col, "entry");
     while (r.i < r.n && !r.err) {
         const uint8_t tag = r.u8();
         switch (tag) {
@@ -228,12 +289,14 @@ int npu_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len, uint8_t start
                                  column, row, direction, channel,
                                  (unsigned long long)status_addr, first, first & kDmaDoneMask);
                 }
+                probe_tile(ps, start_col, "sync");
                 if (!dma_wait(ps, status_addr)) {
                     std::fprintf(stderr,
                                  "[npu_replay] Sync timeout: col=%u row=%u dir=%u ch=%u "
                                  "status=0x%llx\n",
                                  column, row, direction, channel,
                                  (unsigned long long)status_addr);
+                    probe_tile(ps, start_col, "timeout");
                     return 1;
                 }
                 break;
