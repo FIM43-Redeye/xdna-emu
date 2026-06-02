@@ -47,7 +47,15 @@ constexpr uint32_t kDmaDoneMask = 0x0078003Cu;
 // wall-clock bound: 100k ns ~ 2 min before a stuck (starving) channel gives up.
 // A real small DMA completes in a few thousand sim-ns. Tunable.
 constexpr uint64_t kPollQuantumNs = 256;
-constexpr uint64_t kPollMaxNs = 100'000;
+// Default cap; XDNA_AIESIM_POLL_MAX_NS overrides (e.g. a small value for a
+// fast-fail timeout probe when debugging a known stall).
+inline uint64_t poll_max_ns() {
+    if (const char* e = std::getenv("XDNA_AIESIM_POLL_MAX_NS")) {
+        const uint64_t v = std::strtoull(e, nullptr, 0);
+        if (v) return v;
+    }
+    return 100'000;
+}
 
 // AIE-ML DMA channel STATUS register offset within a tile, by tile-type (from
 // the NPU1 row), direction (0=S2MM, 1=MM2S) and channel. Offsets per the
@@ -113,7 +121,7 @@ bool dma_wait(ps_bridge* ps, uint64_t status_addr) {
     uint64_t elapsed = 0;
     for (;;) {
         if ((ps->read32(status_addr) & kDmaDoneMask) == 0) return true;
-        if (elapsed >= kPollMaxNs) return false;
+        if (elapsed >= poll_max_ns()) return false;
         sc_core::wait(sc_core::sc_time(double(kPollQuantumNs), sc_core::SC_NS));
         elapsed += kPollQuantumNs;
     }
@@ -222,7 +230,7 @@ int npu_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len, uint8_t start
                 bool ok = false;
                 for (;;) {
                     if ((ps->read32(ca) & m) == v) { ok = true; break; }
-                    if (elapsed >= kPollMaxNs) break;
+                    if (elapsed >= poll_max_ns()) break;
                     sc_core::wait(sc_core::sc_time(double(kPollQuantumNs), sc_core::SC_NS));
                     elapsed += kPollQuantumNs;
                 }
