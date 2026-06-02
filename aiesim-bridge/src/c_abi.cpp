@@ -7,20 +7,25 @@
 // silently pretending to work.
 #include "xdna_aiesim_bridge.h"
 
-// Temporary II.2 scaffold (sc_bootstrap.cpp): start the SystemC kernel once to
-// prove the in-process embed. II.6 replaces this with the service thread.
-extern "C" int aiesim_bridge_start_systemc_smoke();
-
-// Non-null sentinel so the II.2 smoke's aiesim_create returns "success" without
-// a real handle yet. II.3+ return an actual cluster handle.
-static char g_smoke_handle;
+// SystemC-side hand-off (sc_bootstrap.cpp): set arch/device_json, start the
+// kernel (which constructs the cluster in sc_main), read back the handle.
+// II.6 replaces this synchronous start with the persistent service thread.
+extern "C" {
+extern const char* g_aiesim_arch;
+extern const char* g_aiesim_device_json;
+extern void* g_aiesim_top;
+int aiesim_bridge_start_systemc();
+}
 
 extern "C" {
 
-void *aiesim_create(const char *, const char *) {
-    // II.2: run the SystemC banner + sc_main from inside the .so.
-    if (aiesim_bridge_start_systemc_smoke() != 0) return nullptr;
-    return &g_smoke_handle;
+void *aiesim_create(const char *arch, const char *device_json) {
+    // II.3: hand arch/device_json to sc_main and run elaboration, which
+    // constructs the E513-free cluster. Returns the aiesim_top handle.
+    g_aiesim_arch = arch;
+    g_aiesim_device_json = device_json;
+    if (aiesim_bridge_start_systemc() != 0) return nullptr;
+    return g_aiesim_top;
 }
 int aiesim_load_cdo(void *, const uint8_t *, size_t) { return 1; }
 int aiesim_exec_npu(void *, const uint8_t *, size_t) { return 1; }

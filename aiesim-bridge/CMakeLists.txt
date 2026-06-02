@@ -31,7 +31,6 @@ set(SC_MAIN    "${AIETOOLS_DIR}/data/osci_systemc/sc_main")
 # Bridge shared library
 # ---------------------------------------------------------------------------
 # Sources are added as the spine is built:
-#   II.3  src/aiesim_top.cpp
 #   II.4  src/ps_bridge.cpp
 #   II.5  src/cdo_replay.cpp
 #   II.6  src/service_thread.cpp
@@ -42,6 +41,7 @@ set(SC_MAIN    "${AIETOOLS_DIR}/data/osci_systemc/sc_main")
 add_library(xdna_aiesim_bridge SHARED
   src/c_abi.cpp
   src/sc_bootstrap.cpp
+  src/aiesim_top.cpp
   "${SC_MAIN}/sc_main_main.cpp"
 )
 

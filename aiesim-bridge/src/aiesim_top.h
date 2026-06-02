@@ -1,0 +1,25 @@
+// Cluster instantiation as an sc_module.
+//
+// Its constructor performs the E513-free create_math_engine call. See
+// docs/superpowers/findings/2026-06-01-aiesim-inprocess-backend-feasibility.md
+// (RESOLVED section): the factory internally constructs a child sc_module via
+// the default (no-name) ctor, which pops an sc_module_name off SystemC's name
+// stack. We are inside a parent sc_module's construction and push one name right
+// before the call so the internal module consumes it. (Bare from sc_main: E533;
+// inside a parent but no push: E513; with the push: clean.)
+#pragma once
+
+#include <systemc.h>
+
+class aiesim_top : public sc_core::sc_module {
+public:
+    aiesim_top(sc_core::sc_module_name name, const char* arch, const char* device_json);
+    ~aiesim_top();
+
+    // Opaque MathEngine* (closed type). Non-null once construction succeeds.
+    void* math_engine() const { return me_; }
+
+private:
+    void* me_ = nullptr;           // MathEngine*
+    void* cluster_lib_ = nullptr;  // dlopen handle for the per-arch cluster .so
+};
