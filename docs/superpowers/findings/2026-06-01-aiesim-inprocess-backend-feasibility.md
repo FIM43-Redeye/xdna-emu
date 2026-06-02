@@ -190,3 +190,48 @@ design-space characterized. Per Maya, next = **architecture phase**:
 **implementation plan** (`docs/superpowers/plans/2026-06-01-phoenix-survival-corpus.md`)
 is written + approved, **awaiting execution** (deferred when we pivoted to aiesim).
 Its capture campaign (Task 13) is HW-gated (Phoenix).
+
+## CRITICAL (2026-06-02): backdoor register access is a SHADOW; live registers need timed b_transport from an SC_THREAD
+
+A de-risk probe before building DdrPatch/Sync revealed the cdo_replay II-B.2a
+approach was driving nothing. Decisive evidence, three steps:
+
+1. **probe_core** — backdoor-write `Core_Control`=Enable (offset 0x32000) on a
+   compute tile, `sc_start`, read `Core_Status`/`Core_PC`/perf-counter: all FLAT.
+   PC read back as `0x68635f6b` (ASCII garbage, not a 20-bit PC).
+2. **probe_diag** — backdoor write+read a sentinel at 10 offsets (DM, PM, PC,
+   Core_Control/Status, perf, shim BD): ALL round-trip. So the config-aximm
+   `transport_dbg` (backdoor) backs a FLAT SHADOW STORE at every address — it is
+   NOT the live register file (several offsets held pre-existing content distinct
+   from writes, e.g. PC 0x68635f6b, BD reg 0x38).
+3. **timed_probe** — the SAME write via TIMED `ps->write32` (b_transport) from
+   `sc_main`: `Error: (E519) wait() is only allowed in SC_THREADs and SC_CTHREADs`
+   on the first call. The initiator util's `b_transport` wait()s on the AXI
+   handshake.
+
+Scout (aie-rt `xaie_sim.c`, genwrapper, aie_xtlm) confirms: the HAL ALWAYS uses
+timed `b_transport` for register access; `transport_dbg` is debug-memory-only.
+Address convention is VERBATIM `(col<<25)|(row<<20)|offset` (no translation) —
+addresses were right, the access METHOD was wrong.
+
+**Conclusion:** backdoor cannot drive or observe the live cluster. Register R/W
+MUST be timed `b_transport`, which requires an SC_THREAD (not `sc_main`).
+
+**Architecture (Maya-approved 2026-06-02): unified SC_THREAD driver + sc_pause.**
+SystemC 2.3.1 (aietools) has both `async_request_update()` (sc_prim_channel.h:67,
+thread-safe OS→kernel handoff) and `sc_pause()` (sc_simcontext.h:131/172). The
+design:
+- One SC_THREAD owns ALL register access (timed b_transport) + time advance
+  (`wait(N)` for RUN, `wait(1 cyc)` for STEP). `sc_main` is just
+  `for(;;){ sc_start(); if(shutdown)break; wait_for_pending(); }`.
+- Kernel is PAUSED between commands (driver `sc_pause()`s after draining; sc_main
+  only `sc_start`s when a command is pending) → no time drift → **cycle-precise
+  discrete stepping is first-class** (the debugger capability), and free-run is
+  just `RUN(large N)`. Faithful: config takes effect immediately as timed writes.
+- OS thread (C-ABI) rings a `Doorbell` (sc_prim_channel) via
+  `async_request_update()`; its `update()` notifies the driver's cmd_event.
+- Reused: command queue + reply handshake, ddr_target, cdo_replay DECODER logic,
+  wire format, C-ABI. Changed: service loop moves into the SC_THREAD;
+  cdo_replay/READ_REG swap backdoor→timed and `sc_start`→`wait` (now in a process
+  context). II-B.2a's "gate" only round-tripped the shadow; the restructure is
+  what makes it drive live hardware.

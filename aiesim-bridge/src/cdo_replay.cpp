@@ -60,20 +60,20 @@ struct Reader {
 };
 
 // Read-modify-write a register, preserving bits outside mask (CDO MaskWrite
-// semantics: new = (cur & ~mask) | (val & mask)).
+// semantics: new = (cur & ~mask) | (val & mask)). Timed live access.
 void mask_write(ps_bridge* ps, uint64_t addr, uint32_t mask, uint32_t val) {
-    uint32_t cur = ps->read32_backdoor(addr);
-    ps->write32_backdoor(addr, (cur & ~mask) | (val & mask));
+    uint32_t cur = ps->read32(addr);
+    ps->write32(addr, (cur & ~mask) | (val & mask));
 }
 
 // Poll (reg & mask) == expected, advancing the kernel between checks. Returns
-// false on timeout.
+// false on timeout. Runs on the driver SC_THREAD, so time advances via wait().
 bool mask_poll(ps_bridge* ps, uint64_t addr, uint32_t mask, uint32_t expected) {
     uint64_t elapsed = 0;
     for (;;) {
-        if ((ps->read32_backdoor(addr) & mask) == expected) return true;
+        if ((ps->read32(addr) & mask) == expected) return true;
         if (elapsed >= kPollMaxNs) return false;
-        sc_core::sc_start(sc_core::sc_time(double(kPollQuantumNs), sc_core::SC_NS));
+        sc_core::wait(sc_core::sc_time(double(kPollQuantumNs), sc_core::SC_NS));
         elapsed += kPollQuantumNs;
     }
 }
@@ -88,14 +88,14 @@ int cdo_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len) {
             case WRITE: {
                 uint32_t a = r.u32(), v = r.u32();
                 if (r.err) break;
-                ps->write32_backdoor(a, v);
+                ps->write32(a, v);
                 break;
             }
             case WRITE64: {
                 uint64_t a = r.u64();
                 uint32_t v = r.u32();
                 if (r.err) break;
-                ps->write32_backdoor(a, v);
+                ps->write32(a, v);
                 break;
             }
             case MASK_WRITE: {
@@ -121,7 +121,7 @@ int cdo_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len) {
                     uint32_t w = uint32_t(blk[off]) | (uint32_t(blk[off + 1]) << 8) |
                                  (uint32_t(blk[off + 2]) << 16) |
                                  (uint32_t(blk[off + 3]) << 24);
-                    ps->write32_backdoor(a + off, w);
+                    ps->write32(a + off, w);
                 }
                 r.i += l;
                 break;
@@ -152,7 +152,7 @@ int cdo_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len) {
             case DELAY: {
                 uint32_t cyc = r.u32();
                 if (r.err) break;
-                sc_core::sc_start(sc_core::sc_time(double(cyc), sc_core::SC_NS));
+                sc_core::wait(sc_core::sc_time(double(cyc), sc_core::SC_NS));
                 break;
             }
             case MARKER: {

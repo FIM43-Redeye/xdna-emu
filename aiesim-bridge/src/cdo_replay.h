@@ -5,13 +5,12 @@
 // fails loudly.
 //
 // Replays a parsed CDO (device configuration: BD descriptors, routing, locks,
-// core-enables) onto the cluster's register space. Writes use the PS bridge's
-// zero-time backdoor (transport_dbg): the service loop runs in sc_main, not an
-// SC_THREAD, so a timed b_transport that wait()s would be illegal there -- and
-// the II-B.1 selftest proved backdoor writes land in the cluster's registers.
-// MASK_POLL advances the kernel (sc_start) between backdoor reads; DELAY steps
-// time. (Whether backdoor config drives a live workload vs. needing timed writes
-// from an SC_THREAD is the open question resolved by II-B.2b's end-to-end gate.)
+// core-enables) onto the cluster's register space via TIMED b_transport
+// (ps->write32/read32). Runs on the driver SC_THREAD, the only context where
+// b_transport (which wait()s on the AXI handshake) and time advance (wait()) are
+// legal -- the backdoor reaches only a shadow store, not live registers (see the
+// feasibility findings doc, 2026-06-02). MASK_POLL advances the kernel (wait())
+// between live reads; DELAY steps time.
 #pragma once
 
 #include <cstddef>

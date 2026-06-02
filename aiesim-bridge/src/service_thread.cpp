@@ -1,8 +1,5 @@
 #include "service_thread.h"
 
-// The bootstrap globals + kernel entry the service thread drives. Declared here
-// (not via a header) to keep this translation unit free of SystemC includes;
-// they are defined in sc_bootstrap.cpp.
 extern "C" {
 extern const char* g_aiesim_arch;
 extern const char* g_aiesim_device_json;
@@ -16,23 +13,20 @@ Service& Service::instance() {
     return s;
 }
 
+void Service::set_wake(std::function<void()> wake) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    wake_ = std::move(wake);
+}
+
 void* Service::start(const char* arch, const char* device_json) {
     std::unique_lock<std::mutex> lock(mtx_);
     if (started_) {
-        // One SystemC sim per process: a second create returns the same cluster.
-        return elab_ok_ ? top_ : nullptr;
+        return elab_ok_ ? top_ : nullptr;  // one sim per process
     }
     started_ = true;
-
-    // sc_main reads these to construct the cluster. They are caller-owned and
-    // must outlive elaboration; aiesim_create holds the originals for the run.
     g_aiesim_arch = arch;
     g_aiesim_device_json = device_json;
-
-    // Spawn the kernel thread. It runs until a SHUTDOWN command lets sc_main
-    // return. publish() (called from sc_main) releases the wait below.
     thread_ = std::thread([] { aiesim_bridge_start_systemc(); });
-
     elab_cv_.wait(lock, [this] { return elaborated_; });
     return elab_ok_ ? top_ : nullptr;
 }
@@ -48,25 +42,26 @@ void Service::publish(void* top, bool ok) {
 }
 
 void Service::submit(Command& c) {
+    std::function<void()> wake;
     {
         std::lock_guard<std::mutex> lock(mtx_);
         if (!elab_ok_ || joined_) {
-            // Service never came up, or was already torn down: fail loudly
-            // rather than block forever on a reply that will never arrive.
-            c.reply_int = 1;
+            c.reply_int = 1;  // service not up / torn down -> fail fast
             return;
         }
         queue_.push_back(&c);
+        wake = wake_;
     }
-    q_cv_.notify_one();
+    q_cv_.notify_one();      // wake sc_main's wait_for_pending so it sc_starts
+    if (wake) wake();        // ring the Doorbell so the driver runs within sc_start
 
     std::unique_lock<std::mutex> clock(c.m);
     c.cv.wait(clock, [&c] { return c.done; });
 }
 
-Command* Service::next() {
-    std::unique_lock<std::mutex> lock(mtx_);
-    q_cv_.wait(lock, [this] { return !queue_.empty(); });
+Command* Service::try_pop() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (queue_.empty()) return nullptr;
     Command* c = queue_.front();
     queue_.pop_front();
     return c;
@@ -80,32 +75,45 @@ void Service::complete(Command* c) {
     c->cv.notify_one();
 }
 
+void Service::mark_shutdown() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    shutdown_ = true;
+}
+
+void Service::wait_for_pending() {
+    std::unique_lock<std::mutex> lock(mtx_);
+    q_cv_.wait(lock, [this] { return !queue_.empty(); });
+}
+
+bool Service::is_shutdown() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return shutdown_;
+}
+
 void Service::shutdown_and_join() {
+    std::function<void()> wake;
     {
         std::lock_guard<std::mutex> lock(mtx_);
         if (!started_ || !elab_ok_ || joined_) return;
-        joined_ = true;  // claim the shutdown; blocks double / concurrent calls
+        joined_ = true;  // claim the shutdown
+        wake = wake_;
     }
 
-    // Enqueue SHUTDOWN directly -- we bypass submit() because we just set
-    // joined_, which submit() now rejects. SHUTDOWN flows as a normal command so
-    // the service thread unwinds sc_main cleanly (end_of_simulation runs).
+    // Enqueue SHUTDOWN directly (bypass submit()'s joined_ guard, which we just
+    // set) so the driver unwinds sc_main cleanly (sc_stop -> end_of_simulation).
     Command stop(Command::SHUTDOWN);
     {
         std::lock_guard<std::mutex> lock(mtx_);
         queue_.push_back(&stop);
     }
     q_cv_.notify_one();
+    if (wake) wake();
     {
         std::unique_lock<std::mutex> clock(stop.m);
         stop.cv.wait(clock, [&stop] { return stop.done; });
     }
 
-    if (thread_.joinable()) {
-        thread_.join();
-    }
-    // aiesim is process-singleton and not restartable in-process: after this no
-    // further submits will be serviced (they fail-fast on the joined_ guard).
+    if (thread_.joinable()) thread_.join();
 }
 
 }  // namespace aiesim

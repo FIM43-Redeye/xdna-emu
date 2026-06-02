@@ -1,115 +1,102 @@
-// SystemC service thread: marshals C-ABI requests onto the one kernel thread.
+// SystemC service: marshals C-ABI requests onto the kernel and drives the
+// cluster through ONE in-kernel SC_THREAD.
 //
-// SystemC's kernel is a process-global singleton and is NOT thread-safe: every
-// sc_* / TLM call must happen on the thread that called sc_elab_and_sim. But the
-// C ABI (aiesim_*) is invoked from the host's thread (XRT plugin / Rust), which
-// is a different thread. This layer bridges that gap:
+// Register access on this cluster requires TIMED b_transport (the backdoor
+// transport_dbg only reaches a shadow store -- see the feasibility findings doc,
+// 2026-06-02). b_transport wait()s on the AXI handshake, so it is illegal in
+// sc_main and must run inside a SystemC process. The model:
 //
-//   * The first aiesim_create spawns ONE OS thread that runs sc_elab_and_sim ->
-//     sc_main. sc_main constructs aiesim_top once, publishes the handle, then
-//     loops pulling commands and executing them (the only place sc_* runs).
-//   * Every C-ABI entry builds a Command, enqueues it, and blocks on a per-
-//     command condvar until the service thread fills in the reply.
-//
-// This file is deliberately free of SystemC and cluster headers: it is pure
-// threading + queue mechanics. The command DISPATCH (which touches aiesim_top /
-// ps_bridge / sc_start) lives in sc_bootstrap.cpp, on the service thread.
+//   * OS thread (C-ABI): enqueue a Command, ring the kernel (a Doorbell's
+//     async_request_update -- the one thread-safe OS->kernel hook), block for
+//     the reply. This file owns that side; it stays free of SystemC headers (the
+//     wake is an injected std::function so sc_bootstrap supplies the Doorbell).
+//   * Driver SC_THREAD (sc_bootstrap): drains the queue, executing each command
+//     with timed b_transport / wait()-based time advance, then sc_pause()s. The
+//     kernel is paused between commands -> no time drift -> cycle-precise stepping.
+//   * sc_main: for(;;){ sc_start(); if(shutdown) break; wait_for_pending(); } --
+//     only advances the kernel while a command is pending.
 #pragma once
 
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <thread>
 
 namespace aiesim {
 
-// One unit of work handed from a host thread to the service thread. The caller
-// owns it on its stack and blocks (in submit) until done, so no heap/lifetime
-// dance is needed -- the pointer enqueued stays valid for the whole exchange.
+// One unit of work. The caller owns it on its stack and blocks in submit() until
+// done, so the enqueued pointer stays valid for the whole exchange.
 struct Command {
     enum Tag {
-        LOAD_CDO,    // in_ptr/len = config op-stream bytes
-        EXEC_NPU,    // in_ptr/len = runtime-sequence op-stream bytes
-        WRITE_GM,    // addr + in_ptr/len = host->DDR bytes
-        READ_GM,     // addr + out_ptr/len = DDR->host bytes
-        READ_REG,    // addr -> reply_u32 (zero sim-time backdoor)
-        ADD_HOST_BUF,// addr + len (size) = register a host buffer
-        CLEAR_HOST_BUF,
-        RUN,         // budget cycles -> reply_int (halt) + reply_cycles
-        RESET,
-        SHUTDOWN,    // stop the service loop; sc_main returns
+        LOAD_CDO, EXEC_NPU, WRITE_GM, READ_GM, READ_REG,
+        ADD_HOST_BUF, CLEAR_HOST_BUF, RUN, RESET, SHUTDOWN,
     };
-
     explicit Command(Tag t) : tag(t) {}
-
     Tag tag;
 
-    // Inputs (only the fields relevant to `tag` are read).
     const uint8_t* in_ptr = nullptr;
     uint8_t* out_ptr = nullptr;
     size_t len = 0;
     uint64_t addr = 0;
-    uint64_t budget = 0;
+    uint64_t budget = 0;  // RUN: cycles (0 handled by the caller)
 
-    // Outputs (filled by the service thread before signalling done).
-    int reply_int = 0;       // status / halt code (mirrors the C-ABI return)
+    int reply_int = 0;       // status / halt (mirrors the C-ABI return)
     uint32_t reply_u32 = 0;  // READ_REG value
     uint64_t reply_cycles = 0;
 
-    // Handshake. The service thread sets done under m and notifies cv.
     std::mutex m;
     std::condition_variable cv;
     bool done = false;
 };
 
-// Process-singleton owner of the SystemC thread + command queue. Started lazily
-// by the first start() call (from aiesim_create).
+// Process-singleton owner of the kernel thread + command queue.
 class Service {
 public:
     static Service& instance();
 
-    // Host thread: spawn the SystemC thread (idempotent), block until aiesim_top
-    // is elaborated and published, and return its handle (null on failure).
-    // arch / device_json are handed to sc_main via the bootstrap globals.
+    // OS thread: install the kernel-wake hook (rings the Doorbell). Call before
+    // start(). The hook is invoked from submit() on the OS thread.
+    void set_wake(std::function<void()> wake);
+
+    // OS thread: spawn the kernel thread (idempotent), block until the driver
+    // publishes the elaborated handle, return it (null on failure).
     void* start(const char* arch, const char* device_json);
 
-    // Host thread: enqueue `c` and block until the service thread completes it.
-    // If the service thread never came up, marks the command failed and returns.
+    // OS thread: enqueue, ring the kernel, block until the driver completes it.
     void submit(Command& c);
 
-    // Host thread: enqueue SHUTDOWN, then join the service thread. Safe to call
-    // once; further submits after this are no-ops. (SystemC cannot be restarted
-    // in-process, so there is no symmetric re-start.)
+    // OS thread: enqueue SHUTDOWN, then join the kernel thread. One-way (SystemC
+    // does not restart in-process).
     void shutdown_and_join();
 
-    // --- called ONLY on the service thread (from sc_bootstrap's sc_main) ---
+    // --- driver SC_THREAD side ---
+    void publish(void* top, bool ok);  // release start()'s waiter
+    Command* try_pop();                // non-blocking; null when the queue is empty
+    void complete(Command* c);         // signal the OS-thread waiter
+    void mark_shutdown();              // driver saw SHUTDOWN (before sc_stop)
 
-    // Publish the elaboration result: release start()'s waiter. `top` is the
-    // aiesim_top* (null + ok=false on construction failure).
-    void publish(void* top, bool ok);
-
-    // Block-pop the next command. Returns nullptr only if asked to stop before a
-    // command arrives (not currently used; SHUTDOWN flows as a normal Command).
-    Command* next();
-
-    // Mark a popped command complete and wake its waiter.
-    void complete(Command* c);
+    // --- sc_main side ---
+    void wait_for_pending();           // block until the queue is non-empty
+    bool is_shutdown();
 
 private:
     Service() = default;
 
-    std::mutex mtx_;                  // guards queue_ + lifecycle flags
-    std::condition_variable q_cv_;    // queue non-empty
-    std::condition_variable elab_cv_; // elaboration settled
+    std::mutex mtx_;
+    std::condition_variable q_cv_;     // queue non-empty (sc_main gate)
+    std::condition_variable elab_cv_;  // elaboration settled
     std::deque<Command*> queue_;
     std::thread thread_;
+    std::function<void()> wake_;
     void* top_ = nullptr;
     bool started_ = false;
-    bool elaborated_ = false;  // publish() has run (success or failure)
+    bool elaborated_ = false;
     bool elab_ok_ = false;
     bool joined_ = false;
+    bool shutdown_ = false;
 };
 
 }  // namespace aiesim
