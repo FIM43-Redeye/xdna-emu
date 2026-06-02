@@ -74,6 +74,13 @@ extern "C" int sc_main(int /*argc*/, char* /*argv*/[]) {
         if (top->math_engine() && std::getenv("AIESIM_BRIDGE_SELFTEST")) {
             bridge_selftest(top->ps());
         }
+        // II-B.3 scoping scaffold: try to advance the kernel. Surfaces the
+        // unbound-port set we still need to stub. Env-gated.
+        if (top->math_engine() && std::getenv("AIESIM_BRIDGE_RUN")) {
+            std::cout << "[run] sc_start(100 ns)...\n";
+            sc_core::sc_start(100, sc_core::SC_NS);
+            std::cout << "[run] sc_start returned, t=" << sc_core::sc_time_stamp() << "\n";
+        }
         return top->math_engine() ? 0 : 1;
     } catch (const std::exception& e) {
         std::cerr << "[aiesim-bridge] cluster instantiation failed: " << e.what()
