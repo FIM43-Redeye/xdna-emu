@@ -235,3 +235,28 @@ design:
   cdo_replay/READ_REG swap backdoor→timed and `sc_start`→`wait` (now in a process
   context). II-B.2a's "gate" only round-tripped the shadow; the restructure is
   what makes it drive live hardware.
+
+## (2026-06-02) HAL-driven validation: the missing NPI/array-init layer
+
+Validation pivot: the Versal aiesim flow (mlir-aie xcve2802, the only AIE2 device
+mlir-aie compiles for that has a SHIPPED aiesim JSON -- VC2802.json, per
+AIETargetSimulationFiles.cpp:69-77) configures the array PROCEDURALLY via the
+xaiengine HAL (mlir_aie_configure_* -> XAie_* -> ess_*), not a standalone CDO. So
+the parser-driven path doesn't fit; we drive the REAL HAL against the bridge.
+
+Harness (commit e6c9de6, aiesim-bridge/validation/hal_validate.cpp): links
+libxaienginecdo (HAL, SIM backend) + our aiesim_top/ps_bridge/ddr_target; runs the
+03_simple config+run+check on the driver SC_THREAD. SIM backend = XAIE_IO_BACKEND_
+SIM (=0). It WORKS up to a point: CfgInitialize, LoadElf, lock ops, and an NPI
+command (ess_WriteCmd cmd=0 col=1 row=3 w0=0x70000 w1=0x703ff) all issue.
+
+BLOCKER: tile-memory writes don't stick (DM round-trip reads 0; locks rc=19) on
+BOTH the timed (msm) and functional (_func) clusters. The array is never brought
+out of reset. The NPI / array-init layer (column reset-deassert + clock-ungate --
+ess_WriteCmd and NPI writes via ess_Write32 @ NpiBaseAddr) is provided by the
+aie2simmsm HOST PROCESS in the standard launcher flow, which our in-process
+embedding lacks (we no-op'd ess_WriteCmd). BaseAddr is NOT the issue (the SIM
+backend uses Config.BaseAddr=0x20000000000 verbatim, same as the working standard
+flow). Next: find a cluster init/reset API (scout math_engine_base.h + the cluster
+symbols + aie-rt for what ess_WriteCmd/NPI must drive), else replicate the NPI
+bring-up routed to the cluster.
