@@ -72,7 +72,7 @@ Marker patcher: `scripts/clear-execstack.py` (clears `PF_X` on `PT_GNU_STACK`).
 **Key paths:**
 - cluster: `<aietools>/lib/lnx64.o/libaie2_cluster_msm_v1_0_0.osci.so` (and `_func`, `_dbg` variants)
 - arch-param bonus (on disk): `libaie2ps_cluster_msm...` (Strix/AIE2P), `libaie_cluster_msm...` (AIE1) → AIE2P bring-up unlock is a lib swap
-- device model: `<aietools>/data/aie_ml/devices/VC2802.json` — **NOT text JSON**; a binary/compressed device-model blob (magic `XbV18.3`). `create_math_engine` decompresses + parses it.
+- device model: `<aietools>/data/aie_ml/devices/*.json` — **NOT text JSON**; a binary/compressed device-model blob (magic `XbV18.3`). `create_math_engine` decompresses + parses it. **All shipped AIE-ML models are Versal parts (with PL), NOT the NPU** — there is no NPU device model on disk (that is the out-of-scope `XbV18.3` custom-gen work). **Stopgap device = `VE2102.json`** (the smallest: 12 cols, 4 noc tiles, ~170 stream ports vs VC2802's 38 cols / ~720). It still has cols 0-4 + the rows NPU xclbins target, so config/replay/runs work; the geometry/PL mismatch is a **fidelity caveat for the differential-vs-NPU oracle** (II-B.5), not a functional blocker. Set via `XDNA_AIESIM_DEVICE_JSON` (Rust selector has no default). Real NPU geometry awaits custom-device-model gen.
 - SystemC include: `<aietools>/data/osci_systemc/include`
 - SystemC main bootstrap: `<aietools>/data/osci_systemc/sc_main/{sc_main.cpp,sc_main_main.cpp}`
 
