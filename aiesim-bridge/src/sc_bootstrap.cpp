@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "aiesim_top.h"
+#include "cdo_replay.h"
 #include "ddr_target.h"
 #include "ps_bridge.h"
 #include "service_thread.h"
@@ -139,10 +140,12 @@ void service_loop(aiesim_top* top) {
                 c->reply_int = 0;
                 svc.complete(c);
                 return;
-            // Remaining data-path commands land in II-B.2: LOAD_CDO/EXEC_NPU need
-            // the cdo_replay decoder; RESET re-applies CDO. Until then they fail
-            // loudly rather than pretend to work.
             case aiesim::Command::LOAD_CDO:
+                // Decode the CDO config op-stream onto the cluster registers.
+                c->reply_int = aiesim::cdo_replay(ps, c->in_ptr, c->len);
+                break;
+            // EXEC_NPU (DdrPatch/Sync resolution) lands in II-B.2b; RESET
+            // re-applies CDO. Until then they fail loudly.
             case aiesim::Command::EXEC_NPU:
             case aiesim::Command::RESET:
             default:
