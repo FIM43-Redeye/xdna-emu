@@ -1,41 +1,101 @@
 // C ABI entry points for the aiesim bridge.
 //
-// Task II.1: stubs that link and export the eleven aiesim_* symbols the Rust
-// DlopenBridge binds. Real bodies arrive in later tasks (the service thread in
-// II.6 routes each of these onto the SystemC command queue). Until then every
-// entry returns an error/NULL so a premature call fails loudly rather than
-// silently pretending to work.
+// These are the eleven aiesim_* symbols the Rust DlopenBridge binds. Each call
+// arrives on the host (XRT/Rust) thread; SystemC must be driven from its own
+// thread, so every entry (except create/destroy lifecycle) marshals a Command
+// onto the service thread's queue and blocks for the reply. The `void* handle`
+// argument is the aiesim_top* from create; aiesim is a process singleton, so the
+// Service drives the one cluster and the handle is not re-dereferenced here.
+//
+// Return contract (mirrors crates/xdna-emu-ffi/src/aiesim/abi.rs):
+//   status entries: 0 = Ok, 1 = Error
+//   aiesim_run:     0 = Completed, 1 = Budget, 2 = Error
 #include "xdna_aiesim_bridge.h"
 
-// SystemC-side hand-off (sc_bootstrap.cpp): set arch/device_json, start the
-// kernel (which constructs the cluster in sc_main), read back the handle.
-// II.6 replaces this synchronous start with the persistent service thread.
-extern "C" {
-extern const char* g_aiesim_arch;
-extern const char* g_aiesim_device_json;
-extern void* g_aiesim_top;
-int aiesim_bridge_start_systemc();
+#include "service_thread.h"
+
+namespace {
+// Submit a command and return its status reply (the C-ABI int).
+int submit_status(aiesim::Command& c) {
+    aiesim::Service::instance().submit(c);
+    return c.reply_int;
 }
+}  // namespace
 
 extern "C" {
 
-void *aiesim_create(const char *arch, const char *device_json) {
-    // II.3: hand arch/device_json to sc_main and run elaboration, which
-    // constructs the E513-free cluster. Returns the aiesim_top handle.
-    g_aiesim_arch = arch;
-    g_aiesim_device_json = device_json;
-    if (aiesim_bridge_start_systemc() != 0) return nullptr;
-    return g_aiesim_top;
+void* aiesim_create(const char* arch, const char* device_json) {
+    // First call spawns the service thread, constructs the E513-free cluster
+    // during elaboration, and returns the aiesim_top handle. Idempotent.
+    return aiesim::Service::instance().start(arch, device_json);
 }
-int aiesim_load_cdo(void *, const uint8_t *, size_t) { return 1; }
-int aiesim_exec_npu(void *, const uint8_t *, size_t) { return 1; }
-int aiesim_add_host_buffer(void *, uint64_t, size_t) { return 1; }
-int aiesim_clear_host_buffers(void *) { return 1; }
-int aiesim_write_gm(void *, uint64_t, const uint8_t *, size_t) { return 1; }
-int aiesim_read_gm(void *, uint64_t, uint8_t *, size_t) { return 1; }
-int aiesim_run(void *, uint64_t, uint64_t *) { return 2; }
-uint32_t aiesim_read_reg(void *, uint64_t) { return 0; }
-int aiesim_reset(void *) { return 1; }
-void aiesim_destroy(void *) {}
+
+int aiesim_load_cdo(void* /*handle*/, const uint8_t* ops, size_t len) {
+    aiesim::Command c(aiesim::Command::LOAD_CDO);
+    c.in_ptr = ops;
+    c.len = len;
+    return submit_status(c);
+}
+
+int aiesim_exec_npu(void* /*handle*/, const uint8_t* ops, size_t len) {
+    aiesim::Command c(aiesim::Command::EXEC_NPU);
+    c.in_ptr = ops;
+    c.len = len;
+    return submit_status(c);
+}
+
+int aiesim_add_host_buffer(void* /*handle*/, uint64_t addr, size_t size) {
+    aiesim::Command c(aiesim::Command::ADD_HOST_BUF);
+    c.addr = addr;
+    c.len = size;
+    return submit_status(c);
+}
+
+int aiesim_clear_host_buffers(void* /*handle*/) {
+    aiesim::Command c(aiesim::Command::CLEAR_HOST_BUF);
+    return submit_status(c);
+}
+
+int aiesim_write_gm(void* /*handle*/, uint64_t addr, const uint8_t* data, size_t len) {
+    aiesim::Command c(aiesim::Command::WRITE_GM);
+    c.addr = addr;
+    c.in_ptr = data;
+    c.len = len;
+    return submit_status(c);
+}
+
+int aiesim_read_gm(void* /*handle*/, uint64_t addr, uint8_t* out, size_t len) {
+    aiesim::Command c(aiesim::Command::READ_GM);
+    c.addr = addr;
+    c.out_ptr = out;
+    c.len = len;
+    return submit_status(c);
+}
+
+int aiesim_run(void* /*handle*/, uint64_t budget, uint64_t* cycles_out) {
+    aiesim::Command c(aiesim::Command::RUN);
+    c.budget = budget;
+    aiesim::Service::instance().submit(c);
+    if (cycles_out) *cycles_out = c.reply_cycles;
+    return c.reply_int;  // 0=Completed, 1=Budget, 2=Error
+}
+
+uint32_t aiesim_read_reg(void* /*handle*/, uint64_t addr) {
+    aiesim::Command c(aiesim::Command::READ_REG);
+    c.addr = addr;
+    aiesim::Service::instance().submit(c);
+    return c.reply_u32;
+}
+
+int aiesim_reset(void* /*handle*/) {
+    aiesim::Command c(aiesim::Command::RESET);
+    return submit_status(c);
+}
+
+void aiesim_destroy(void* /*handle*/) {
+    // Stop the service loop and join the kernel thread. SystemC is not
+    // restartable in-process, so this is a one-way teardown.
+    aiesim::Service::instance().shutdown_and_join();
+}
 
 }  // extern "C"

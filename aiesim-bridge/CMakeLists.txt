@@ -60,6 +60,7 @@ add_library(xdna_aiesim_bridge SHARED
   src/sc_bootstrap.cpp
   src/aiesim_top.cpp
   src/ps_bridge.cpp
+  src/service_thread.cpp
   "${SC_MAIN}/sc_main_main.cpp"
 )
 
@@ -102,4 +103,8 @@ endif()
 message(STATUS "systemc: ${SYSTEMC_LIB}")
 message(STATUS "xtlm:    ${XTLM_LIB}")
 
-target_link_libraries(xdna_aiesim_bridge PRIVATE ${SYSTEMC_LIB} ${XTLM_LIB} ${CMAKE_DL_LIBS})
+# The service thread (service_thread.cpp) uses std::thread -> needs pthread.
+find_package(Threads REQUIRED)
+
+target_link_libraries(xdna_aiesim_bridge PRIVATE
+  ${SYSTEMC_LIB} ${XTLM_LIB} ${CMAKE_DL_LIBS} Threads::Threads)
