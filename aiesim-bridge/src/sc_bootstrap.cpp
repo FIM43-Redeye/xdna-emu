@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "aiesim_top.h"
+#include "ddr_target.h"
 #include "ps_bridge.h"
 #include "service_thread.h"
 
@@ -124,19 +125,25 @@ void service_loop(aiesim_top* top) {
                 g_host_buffers.clear();
                 c->reply_int = 0;
                 break;
+            case aiesim::Command::WRITE_GM:
+                // Host -> DDR. Zero sim-time poke of the same store the cluster's
+                // shim-DMA masters see (ddr_target). Serviced on this thread.
+                top->ddr()->host_write(c->addr, c->in_ptr, c->len);
+                c->reply_int = 0;
+                break;
+            case aiesim::Command::READ_GM:
+                top->ddr()->host_read(c->addr, c->out_ptr, c->len);
+                c->reply_int = 0;
+                break;
             case aiesim::Command::SHUTDOWN:
                 c->reply_int = 0;
                 svc.complete(c);
                 return;
-            // Data-path commands route through the queue now but their backends
-            // land in the next increments: WRITE_GM/READ_GM need the cluster->
-            // host DDR target (replacing the ms_aximm stubs); LOAD_CDO/EXEC_NPU
-            // need the cdo_replay decoder (II-B.2); RESET re-applies CDO. Until
-            // then they fail loudly rather than pretend to work.
+            // Remaining data-path commands land in II-B.2: LOAD_CDO/EXEC_NPU need
+            // the cdo_replay decoder; RESET re-applies CDO. Until then they fail
+            // loudly rather than pretend to work.
             case aiesim::Command::LOAD_CDO:
             case aiesim::Command::EXEC_NPU:
-            case aiesim::Command::WRITE_GM:
-            case aiesim::Command::READ_GM:
             case aiesim::Command::RESET:
             default:
                 c->reply_int = 1;  // not yet implemented

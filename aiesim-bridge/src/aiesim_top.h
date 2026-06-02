@@ -14,6 +14,7 @@
 #include <vector>
 
 class ps_bridge;
+class ddr_target;
 
 class aiesim_top : public sc_core::sc_module {
 public:
@@ -24,6 +25,9 @@ public:
     void* math_engine() const { return me_; }
     // The PS bridge bound to the cluster's config aximm (II-B.1).
     ps_bridge* ps() const { return ps_; }
+    // The host DDR model bound to the cluster's shim-DMA masters (II-B.3); the
+    // GM (host-buffer) path reads/writes it directly.
+    ddr_target* ddr() const { return ddr_; }
 
 private:
     // Bind/stub the cluster ports we do not drive so end_of_elaboration passes
@@ -33,6 +37,7 @@ private:
     void* me_ = nullptr;           // MathEngine*
     void* cluster_lib_ = nullptr;  // dlopen handle for the per-arch cluster .so
     ps_bridge* ps_ = nullptr;      // PS-side ess_*() bridge (child sc_module)
+    ddr_target* ddr_ = nullptr;    // host DDR bound to the shim-DMA masters
     sc_core::sc_clock clock_;      // drives the cluster's clk (II-B.3)
 
     // Stub storage (kept alive for the cluster's lifetime). xtlm stub modules

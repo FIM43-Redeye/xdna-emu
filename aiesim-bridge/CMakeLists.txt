@@ -60,6 +60,7 @@ add_library(xdna_aiesim_bridge SHARED
   src/sc_bootstrap.cpp
   src/aiesim_top.cpp
   src/ps_bridge.cpp
+  src/ddr_target.cpp
   src/service_thread.cpp
   "${SC_MAIN}/sc_main_main.cpp"
 )

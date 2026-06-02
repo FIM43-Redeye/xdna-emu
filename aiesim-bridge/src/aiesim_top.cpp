@@ -8,9 +8,9 @@
 #include <string>
 
 #include <utils/xtlm_aximm_initiator_stub.h>
-#include <utils/xtlm_aximm_target_stub.h>
 
 #include "math_engine_base.h"  // the closed cluster ABI (aietools, build-time ref)
+#include "ddr_target.h"
 #include "ps_bridge.h"
 
 namespace {
@@ -127,14 +127,17 @@ void aiesim_top::stub_unused_ports() {
         stubs_.push_back(ws);
     }
 
-    // 2. ms_aximm master initiators (incl. shim DMA): target stubs.
-    for (size_t i = 0; i < me->ms_aximm_rd.size(); ++i) {
-        auto* rs = new xtlm::xtlm_aximm_target_stub(name("ms_rd_stub_", i).c_str(), 32);
-        auto* ws = new xtlm::xtlm_aximm_target_stub(name("ms_wr_stub_", i).c_str(), 32);
-        (*me->ms_aximm_rd[i])(rs->target_socket);
-        (*me->ms_aximm_wr[i])(ws->target_socket);
-        stubs_.push_back(rs);
-        stubs_.push_back(ws);
+    // 2. ms_aximm shim-DMA masters -> host DDR target. On AIE2 these ARE the
+    //    shim DMAs (math_engine_base.h ~114, "AXI-MM Masters from the Shim
+    //    DMAs"), and shim_dma_rd/wr_socket(col) returns these same sockets, so
+    //    binding every ms_aximm master covers the shim-DMA set without needing
+    //    the col->index map. One shared DDR store backs them all; the GM path
+    //    (ess_WriteGM/ReadGM) pokes that same store via ddr_->host_write/read.
+    const size_t n_mm = me->ms_aximm_rd.size();
+    ddr_ = new ddr_target("ddr", n_mm);
+    for (size_t i = 0; i < n_mm; ++i) {
+        ddr_->bind_rd(i, *me->ms_aximm_rd[i]);
+        ddr_->bind_wr(i, *me->ms_aximm_wr[i]);
     }
 
     // 3. stream + event clocks driven by our clock.
