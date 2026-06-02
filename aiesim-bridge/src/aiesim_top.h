@@ -11,6 +11,8 @@
 
 #include <systemc.h>
 
+class ps_bridge;
+
 class aiesim_top : public sc_core::sc_module {
 public:
     aiesim_top(sc_core::sc_module_name name, const char* arch, const char* device_json);
@@ -18,8 +20,11 @@ public:
 
     // Opaque MathEngine* (closed type). Non-null once construction succeeds.
     void* math_engine() const { return me_; }
+    // The PS bridge bound to the cluster's config aximm (II-B.1).
+    ps_bridge* ps() const { return ps_; }
 
 private:
     void* me_ = nullptr;           // MathEngine*
     void* cluster_lib_ = nullptr;  // dlopen handle for the per-arch cluster .so
+    ps_bridge* ps_ = nullptr;      // PS-side ess_*() bridge (child sc_module)
 };

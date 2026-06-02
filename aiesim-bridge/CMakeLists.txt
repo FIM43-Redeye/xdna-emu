@@ -26,6 +26,23 @@ message(STATUS "aietools: ${AIETOOLS_DIR}")
 
 set(SC_INCLUDE "${AIETOOLS_DIR}/data/osci_systemc/include")
 set(SC_MAIN    "${AIETOOLS_DIR}/data/osci_systemc/sc_main")
+# xtlm pulls in common_cpp headers (report_handler.h, properties.h) on the bare
+# include path, so both dirs are needed.
+set(XTLM_INCLUDE
+  "${AIETOOLS_DIR}/include/xtlm/include"
+  "${AIETOOLS_DIR}/include/common_cpp/common_cpp_v1_0/include")
+
+# MathEngineBase interface header (math_engine_base.h) -- the closed cluster's
+# ABI, needed to call its socket accessors when binding ps_bridge. It ships only
+# under data/simmodels/<sim>/.../protected/; the OSCI variant matches our
+# SystemC 2.3.1 + the .osci cluster lib. Glob so the version path is not pinned.
+file(GLOB ME_INCLUDE_CANDIDATES
+  "${AIETOOLS_DIR}/../data/simmodels/osci/*/lnx64/*/systemc/protected/aie_cluster_v1_0_0/include")
+if(NOT ME_INCLUDE_CANDIDATES)
+  message(FATAL_ERROR "MathEngineBase include (osci aie_cluster) not found under data/simmodels")
+endif()
+list(GET ME_INCLUDE_CANDIDATES 0 ME_INCLUDE)
+message(STATUS "MathEngine interface: ${ME_INCLUDE}")
 
 # ---------------------------------------------------------------------------
 # Bridge shared library
@@ -42,12 +59,15 @@ add_library(xdna_aiesim_bridge SHARED
   src/c_abi.cpp
   src/sc_bootstrap.cpp
   src/aiesim_top.cpp
+  src/ps_bridge.cpp
   "${SC_MAIN}/sc_main_main.cpp"
 )
 
 target_include_directories(xdna_aiesim_bridge PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
   "${SC_INCLUDE}"
+  "${XTLM_INCLUDE}"
+  "${ME_INCLUDE}"
 )
 
 # In-process embedding recipe (findings doc 2026-06-01):
@@ -75,6 +95,11 @@ find_library(SYSTEMC_LIB systemc PATHS "${AIETOOLS_DIR}/lib/lnx64.o" NO_DEFAULT_
 if(NOT SYSTEMC_LIB)
   message(FATAL_ERROR "libsystemc not found in ${AIETOOLS_DIR}/lib/lnx64.o")
 endif()
+find_library(XTLM_LIB xtlm PATHS "${AIETOOLS_DIR}/lib/lnx64.o" NO_DEFAULT_PATH)
+if(NOT XTLM_LIB)
+  message(FATAL_ERROR "libxtlm not found in ${AIETOOLS_DIR}/lib/lnx64.o")
+endif()
 message(STATUS "systemc: ${SYSTEMC_LIB}")
+message(STATUS "xtlm:    ${XTLM_LIB}")
 
-target_link_libraries(xdna_aiesim_bridge PRIVATE ${SYSTEMC_LIB} ${CMAKE_DL_LIBS})
+target_link_libraries(xdna_aiesim_bridge PRIVATE ${SYSTEMC_LIB} ${XTLM_LIB} ${CMAKE_DL_LIBS})

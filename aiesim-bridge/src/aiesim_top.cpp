@@ -5,6 +5,9 @@
 #include <stdexcept>
 #include <string>
 
+#include "math_engine_base.h"  // the closed cluster ABI (aietools, build-time ref)
+#include "ps_bridge.h"
+
 namespace {
 
 typedef void* (*create_math_engine_fn)(const char*, const char*, bool, bool);
@@ -56,7 +59,19 @@ aiesim_top::aiesim_top(sc_core::sc_module_name name, const char* arch, const cha
         throw std::runtime_error("aiesim_top: create_math_engine returned null");
     }
 
-    // Socket binding (ps_bridge -> me's aximm rd/wr + shim DMA) is Task II.4.
+    // II-B.1: bind the PS bridge's config initiators to the cluster's NPI/config
+    // ss_aximm target sockets ([0], per aie_xtlm). ps_bridge is a child module
+    // (explicit name -> no name-stack push needed). The cluster->host DDR path
+    // (shim_dma_*_socket) is bound in the functional-run lifecycle (II-B.3).
+    auto* me = static_cast<MathEngineBase*>(me_);
+    ps_ = new ps_bridge("ps_bridge");
+    std::vector<xtlm::xtlm_aximm_target_socket*>& ss_rd = me->get_ss_aximm_rd();
+    std::vector<xtlm::xtlm_aximm_target_socket*>& ss_wr = me->get_ss_aximm_wr();
+    if (ss_rd.empty() || ss_wr.empty()) {
+        throw std::runtime_error("aiesim_top: cluster exposes no ss_aximm config sockets");
+    }
+    ps_->ps_axi_rd.bind(*ss_rd[0]);
+    ps_->ps_axi_wr.bind(*ss_wr[0]);
 }
 
 aiesim_top::~aiesim_top() {
