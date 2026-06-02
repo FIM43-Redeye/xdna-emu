@@ -192,6 +192,20 @@ constants identical; cross-reference in comments.
 
 ## Task II-B.3: `service_thread` — elaborate-once lifecycle + command queue
 
+> **STATUS: DONE (commits bc6b94f service thread, 59ccd54 DDR target).** The
+> elaborate-once lifecycle stands: one SystemC kernel/process on a dedicated
+> service thread fed by a thread-safe command queue (`service_thread.{h,cpp}`,
+> dispatch on the kernel thread in `sc_bootstrap.cpp`, `c_abi.cpp` marshals +
+> blocks). READ_REG (backdoor) + RUN (incremental `sc_start` quanta, short-circuit
+> on `plio_complete`) + WRITE_GM/READ_GM (via the new `ddr_target`) functional;
+> ADD/CLEAR_HOST_BUF stage a registry for II-B.2. Fact-7 routing resolved
+> option-B: `ddr_target.{h,cpp}` is a real shim-DMA→host DDR model (per-master
+> xtlm target utils @TRANSACTION + spawned pumps, one sparse paged store; host
+> face for ess_WriteGM/ReadGM). Gate `smoke_service.c` (VE2102) green:
+> create→read_reg→GM round-trips (incl. cross-page)→run×2→destroy, clean
+> teardown. REMAINING here: Step 4 topology hand-back (deferred — currently
+> bridge-internal). LOAD_CDO/EXEC_NPU/RESET route-but-not-yet → II-B.2.
+
 **Files:** Create `aiesim-bridge/src/service_thread.{h,cpp}`; modify `c_abi.cpp`
 (all entries marshal onto the queue), `sc_bootstrap.cpp` (sc_main runs the
 service loop, not a one-shot), `CMakeLists.txt`.
