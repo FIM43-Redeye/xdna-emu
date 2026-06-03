@@ -51,26 +51,34 @@ fn main() {
     }
     eprintln!("total ops={total} unknown(dropped)={unknown}");
 
-    // Walk the flattened map; report any address whose tile-local offset is in the
+    // Walk the flattened map; report any address whose tile-local offset is in a
     // SS slave-slot region. Slot value: Enable[8], id[28:24], mask[20:16],
-    // msel[5:4], arbiter[2:0].
+    // msel[5:4], arbiter[2:0]. Two distinct slot-config bases:
+    //   compute/shim tiles: 0x3F200 (per AM025 core/shim modules)
+    //   memtile (row 1):    0xB0200 (per AM025 memory_tile module; ports are
+    //                       DMA_0..5, then South_0..5, then North_0..5, stride
+    //                       0x10/port with 4 slots/port stride 4)
     println!("Configured SS slots (Enable=1):");
     for (&addr, &v) in mem.iter() {
         let ta = TileAddress::decode(addr);
-        if ta.offset < 0x3F200 || ta.offset >= 0x3F600 {
+        let base = if (0x3F200..0x3F600).contains(&ta.offset) {
+            0x3F200u32
+        } else if (0xB0200..0xB0400).contains(&ta.offset) {
+            0xB0200u32
+        } else {
             continue;
-        }
+        };
         if v & 0x100 == 0 {
             continue; // not enabled
         }
-        let slot = (ta.offset - 0x3F200) / 4;
+        let slot = (ta.offset - base) / 4;
         let id = (v >> 24) & 0x1F;
         let mask = (v >> 16) & 0x1F;
         let msel = (v >> 4) & 0x3;
         let arb = v & 0x7;
         println!(
-            "  tile({},{}) slot{slot:2} = 0x{v:08x}  id={id} mask=0x{mask:02x} msel={msel} arb={arb}",
-            ta.col, ta.row
+            "  tile({},{}) off=0x{:05x} slot{slot:2} = 0x{v:08x}  id={id} mask=0x{mask:02x} msel={msel} arb={arb}",
+            ta.col, ta.row, ta.offset
         );
     }
 
