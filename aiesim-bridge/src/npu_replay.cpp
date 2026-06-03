@@ -184,6 +184,58 @@ void probe_tile(ps_bridge* ps, uint8_t start_col, const char* tag) {
                  tag, rd(1, 0xA0660), rd(1, 0xA0664), rd(1, 0xA0680), rd(1, 0xA0684));
     for (int l = 0; l < 4; ++l) std::fprintf(stderr, "L%d=%d ", l, (int)rd(1, 0xC0000 + l * 0x10));
     std::fprintf(stderr, "\n");
+
+    // Stream-switch master-config readback (XDNA_AIESIM_PROBE_SS): confirm whether
+    // the packet-mode config the CDO programmed actually stuck in the cluster's SS
+    // registers. Master config: bit31 = port enable, bit30 = packet-stream enable.
+    // If a packet kernel's masters read back 0xC0000000-flavored, the config landed
+    // (so a non-routing hang is a cluster-model gap, not a lost write); if they read
+    // 0x8.../0x0, the write path dropped the packet bit. Offsets per AM025:
+    //   compute/shim SS master base 0x3F000; memtile SS master base 0xB0000 (stride 4).
+    if (std::getenv("XDNA_AIESIM_PROBE_SS")) {
+        auto dump_ss = [&](int r, uint32_t base, int count, const char* label) {
+            std::fprintf(stderr, "[probe %s] ss-master %s:", tag, label);
+            int en = 0, pkt = 0;
+            for (int i = 0; i < count; ++i) {
+                uint32_t v = rd(r, base + uint32_t(i) * 4);
+                if (v & 0x80000000u) ++en;
+                if (v & 0x40000000u) ++pkt;
+                if (v & 0xC0000000u)  // only print configured ports
+                    std::fprintf(stderr, " m%d=0x%08x%s", i, v, (v & 0x40000000u) ? "(PKT)" : "");
+            }
+            std::fprintf(stderr, "  [%d enabled, %d packet]\n", en, pkt);
+        };
+        dump_ss(row, 0x3F000, 23, "compute");
+        dump_ss(1, 0xB0000, 17, "memtile");
+        dump_ss(0, 0x3F000, 22, "shim");
+
+        // Slave SLOT config (compute, base 0x3F200): the packet-ID matcher. A
+        // configured slot has Enable[8] with id[28:24]/mask[20:16]/msel[5:4]/
+        // arbit[2:0]. If packet masters are enabled but NO slots are configured,
+        // incoming packet IDs match nothing -> dropped (the routing gap).
+        std::fprintf(stderr, "[probe %s] compute slots:", tag);
+        int slots = 0;
+        for (int i = 0; i < 64; ++i) {
+            uint32_t v = rd(row, 0x3F200 + uint32_t(i) * 4);
+            if (v & 0x100u) {  // Enable
+                ++slots;
+                std::fprintf(stderr, " s%d=0x%08x(id=%u msel=%u arb=%u)", i, v,
+                             (v >> 24) & 0x1F, (v >> 4) & 0x3, v & 0x7);
+            }
+        }
+        std::fprintf(stderr, "  [%d configured]\n", slots);
+
+        // Deterministic-merge / arbiter (compute, base 0x3F800): the Versal-style
+        // arbiter init that NPU1 CDOs may omit. If these are all zero while packet
+        // masters are enabled, a missing arbiter init is the likely routing gap.
+        std::fprintf(stderr, "[probe %s] compute det-merge:", tag);
+        int dm = 0;
+        for (int i = 0; i < 24; ++i) {
+            uint32_t v = rd(row, 0x3F800 + uint32_t(i) * 4);
+            if (v) { ++dm; std::fprintf(stderr, " [0x%03x]=0x%08x", 0x800 + i * 4, v); }
+        }
+        std::fprintf(stderr, "  [%d nonzero]\n", dm);
+    }
 }
 
 }  // namespace
