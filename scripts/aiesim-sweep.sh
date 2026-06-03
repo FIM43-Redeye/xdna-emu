@@ -19,7 +19,10 @@ set -u
 EMU=/home/triple/npu-work/xdna-emu
 KROOT=/home/triple/npu-work/mlir-aie/build/test/npu-xrt
 COMPILER="${AIESIM_SWEEP_COMPILER:-chess}"
-TIMEOUT="${AIESIM_SWEEP_TIMEOUT:-120}"
+# Default 300s: packet-switched-routing kernels (packet_flow*) are correct but
+# slow to simulate (packet arbitration + per-cycle FIFO modeling), ~140-260s.
+# A 120s timeout misclassified them as hangs; 300s covers them with margin.
+TIMEOUT="${AIESIM_SWEEP_TIMEOUT:-300}"
 FILTER="${AIESIM_SWEEP_FILTER:-}"
 DEVJSON="${XDNA_AIESIM_DEVICE_JSON:-$EMU/build/experiments/aiesim-device-decrypt/NPU1.json}"
 STAMP="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo run)"
