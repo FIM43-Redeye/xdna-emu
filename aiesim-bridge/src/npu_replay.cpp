@@ -170,6 +170,14 @@ void probe_tile(ps_bridge* ps, uint8_t start_col, const char* tag) {
                  "mm2s0_ctrl=0x%08x mm2s0_q=0x%08x\n",
                  tag, rd(0, 0x1D228), rd(0, 0x1D220), rd(0, 0x1D000), rd(0, 0x1D004), rd(0, 0x1D008),
                  rd(0, 0x1D210), rd(0, 0x1D214));
+    // Did ANY beats land at shim S2MM ch0 (@ctrl0, the control-response sink)?
+    // write_count 0x1DF18 / finish_tlast_fifo 0x1DF20 per the device DMA def. Also
+    // the NoC-interface mux (0x1F000) / demux (0x1F004) config that steers SS south
+    // streams to DMA channels by stream-id. write_count>0 => response arrived but
+    // not drained (BD/consume issue); ==0 => never generated or never routed.
+    std::fprintf(stderr,
+                 "[probe %s] shim s2mm-ch0 write_count=0x%08x finish_tlast=0x%08x | mux=0x%08x demux=0x%08x\n",
+                 tag, rd(0, 0x1DF18), rd(0, 0x1DF20), rd(0, 0x1F000), rd(0, 0x1F004));
     // Compute-tile data-memory scan -- look for the input pattern (0,1,2,3,...).
     // 64 KiB data memory; sample a few plausible buffer offsets.
     static const uint32_t kOff[] = {0x0000, 0x0400, 0x0800, 0x1000, 0x1400, 0x1800, 0x2000, 0x4000};
@@ -215,7 +223,7 @@ void probe_tile(ps_bridge* ps, uint8_t start_col, const char* tag) {
         // incoming packet IDs match nothing -> dropped (the routing gap).
         std::fprintf(stderr, "[probe %s] compute slots:", tag);
         int slots = 0;
-        for (int i = 0; i < 64; ++i) {
+        for (int i = 0; i < 128; ++i) {
             uint32_t v = rd(row, 0x3F200 + uint32_t(i) * 4);
             if (v & 0x100u) {  // Enable
                 ++slots;
@@ -235,6 +243,22 @@ void probe_tile(ps_bridge* ps, uint8_t start_col, const char* tag) {
             if (v) { ++dm; std::fprintf(stderr, " [0x%03x]=0x%08x", 0x800 + i * 4, v); }
         }
         std::fprintf(stderr, "  [%d nonzero]\n", dm);
+
+        // Shim (row 0) slave SLOT config: the demux matcher that decides whether a
+        // control-response packet (id=2) routes to the shim DMA0 S2MM master. Flow
+        // 0x3 (id=3 -> DMA1) is known-good, so a missing id=2 slot here would be the
+        // control-read-response gap. Same register layout as compute (base 0x3F200).
+        std::fprintf(stderr, "[probe %s] shim slots:", tag);
+        int sslots = 0;
+        for (int i = 0; i < 128; ++i) {
+            uint32_t v = rd(0, 0x3F200 + uint32_t(i) * 4);
+            if (v & 0x100u) {
+                ++sslots;
+                std::fprintf(stderr, " s%d=0x%08x(id=%u msel=%u arb=%u)", i, v,
+                             (v >> 24) & 0x1F, (v >> 4) & 0x3, v & 0x7);
+            }
+        }
+        std::fprintf(stderr, "  [%d configured]\n", sslots);
     }
 }
 
