@@ -64,11 +64,13 @@ pub unsafe extern "C" fn xdna_emu_assign_partition(
     }
 
     let handle = &mut *handle;
-    let device = handle
-        .backend
-        .as_interpreter_mut()
-        .expect("Plan A: interpreter backend")
-        .device_mut();
+    // Non-interpreter backends (aiesim) ungate partition columns themselves via
+    // the cluster's CDO replay (Column_Clock_Control writes), so the
+    // firmware-emulation hook is a no-op there -- only the in-process
+    // interpreter needs the explicit ungate.
+    let Some(device) = handle.backend.as_interpreter_mut().map(|i| i.device_mut()) else {
+        return 0;
+    };
     let total_cols = device.cols();
     let total_rows = device.array.rows() as u32;
     // AIE2 layout: row 0 = shim, row 1 = memtile, rows 2.. = compute.
