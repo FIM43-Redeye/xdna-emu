@@ -36,6 +36,10 @@ export XDNA_AIESIM_DEVICE_JSON="$DEVJSON"
 export XDNA_AIESIM_BRIDGE="$EMU/aiesim-bridge/build/libxdna_aiesim_bridge.so"
 export XDNA_AIESIM_NATIVE_GEOMETRY=1
 export XDNA_AIESIM_POLL_MAX_NS="${XDNA_AIESIM_POLL_MAX_NS:-200000}"
+# Per-kernel input/expectation spec: feeds real control-packet ctrlIn (and
+# expected outputs) for kernels the generic i-pattern seeding can't drive.
+# Kernels absent from the spec keep generic seeding + the add_<N> grep check.
+export AIESIM_SWEEP_SPEC="${AIESIM_SWEEP_SPEC:-$EMU/tests/aiesim/kernel-inputs.json}"
 export TMPDIR=/tmp/claude-1000
 [[ -f "$DEVJSON" ]] || { echo "device json not found: $DEVJSON" >&2; exit 2; }
 
@@ -58,7 +62,8 @@ for kdir in "$KROOT"/*/"$COMPILER"; do
   [[ -z "$FILTER" || "$name" == *"$FILTER"* ]] || continue
 
   log="$OUTDIR/$name.log"
-  AIESIM_KERNEL_DIR="$kdir" timeout "$TIMEOUT" "$BIN" --ignored --exact --nocapture sweep_one_kernel_aiesim \
+  AIESIM_KERNEL_DIR="$kdir" AIESIM_KERNEL_NAME="$name" \
+    timeout "$TIMEOUT" "$BIN" --ignored --exact --nocapture sweep_one_kernel_aiesim \
     > "$log" 2>&1
   rc=$?
 
@@ -83,9 +88,14 @@ for kdir in "$KROOT"/*/"$COMPILER"; do
     class="RAN"
   fi
 
-  # Opportunistic correctness for add_<N> int32: out[i] == i+N in some buffer.
+  # Correctness: prefer the runner's spec verdict (SWEEP correct=...) when a
+  # per-kernel expectation exists; else fall back to the opportunistic add_<N>
+  # int32 grep (out[i] == i+N in some buffer).
   correct="-"
-  if [[ "$name" =~ ^add_([0-9]+)_ && "$name" != *i8* ]]; then
+  spec_corr="$(sed -n 's/.*SWEEP correct=\([A-Za-z]*\).*/\1/p' "$log" | head -1)"
+  if [[ -n "$spec_corr" ]]; then
+    correct="$spec_corr"
+  elif [[ "$name" =~ ^add_([0-9]+)_ && "$name" != *i8* ]]; then
     n="${BASH_REMATCH[1]}"
     want="[$n, $((n+1)), $((n+2)), $((n+3)), $((n+4)), $((n+5)), $((n+6)), $((n+7))]"
     if grep -qF "$want" "$log"; then correct="PASS"; else correct="MISMATCH"; fi
