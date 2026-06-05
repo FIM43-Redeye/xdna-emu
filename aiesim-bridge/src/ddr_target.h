@@ -45,6 +45,12 @@ public:
 
     std::size_t num_masters() const { return n_masters_; }
 
+    // Monotonic count of CLUSTER-side shim-DMA transactions committed (read +
+    // write), bumped only by the per-master pumps -- NOT by host_write/read.
+    // RUN watches this for quiescence: when it stops advancing, the shim DMAs
+    // have drained (the faithful "DMAs drained" natural-completion signal).
+    uint64_t dma_txn_count() const { return dma_txns_; }
+
 private:
     // Spawned (per-socket) SC_METHOD pumps; mirror axi_bram_memory_imp.
     void pump_rd(std::size_t i);
@@ -63,4 +69,7 @@ private:
     static constexpr uint64_t kPageBits = 16;          // 64 KB pages
     static constexpr uint64_t kPageSize = uint64_t(1) << kPageBits;
     std::unordered_map<uint64_t, std::vector<unsigned char>> pages_;
+
+    // Cluster-side shim-DMA transaction counter (see dma_txn_count()).
+    uint64_t dma_txns_ = 0;
 };

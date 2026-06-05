@@ -69,20 +69,44 @@ struct Doorbell : sc_core::sc_prim_channel {
 Doorbell* g_doorbell = nullptr;
 
 // RUN: advance up to `budget` cycles (1 ns clock => 1 cycle/ns) via wait() (we
-// are in a process), stepping in quanta so plio_complete can short-circuit.
+// are in a process), stepping in quanta. Completes EARLY on natural quiescence
+// rather than grinding the whole budget: exec_npu already replayed the runtime
+// sequence to completion (its Sync ops block on the live DMA), so by RUN time
+// the shim DMAs have drained -- we detect that by watching the cluster-side
+// shim-DMA transaction counter go idle for a short settle window. This mirrors
+// the interpreter's natural-completion ("DMAs drained") and avoids the hang the
+// XRT-plugin path hit when it passes its large interpreter-oriented max_cycles.
+// plio_complete still short-circuits for streaming kernels that fire it.
 // Fills reply_int (0=Completed, 1=Budget) + reply_cycles.
-void do_run(aiesim::Command* c) {
+void do_run(aiesim_top* top, aiesim::Command* c) {
     constexpr uint64_t kQuantum = 1024;
+    // Quanta of no shim-DMA activity before we call it quiescent. 4 quanta
+    // (~4096 cycles) clears the tiny settle the timed tests used (2000) with
+    // margin while staying negligible against any real budget.
+    constexpr uint64_t kSettleQuanta = 4;
     const sc_core::sc_time one_ns(1.0, sc_core::SC_NS);
     const sc_core::sc_time t0 = sc_core::sc_time_stamp();
+    ddr_target* ddr = top ? top->ddr() : nullptr;
 
     uint64_t ran = 0;
-    int halt = 1;  // Budget unless plio_complete fires
+    int halt = 1;  // Budget unless we detect quiescence / plio_complete
+    uint64_t last_txns = ddr ? ddr->dma_txn_count() : 0;
+    uint64_t idle_quanta = 0;
     while (ran < c->budget) {
         const uint64_t step = std::min<uint64_t>(kQuantum, c->budget - ran);
         sc_core::wait(sc_core::sc_time(static_cast<double>(step), sc_core::SC_NS));
         ran += step;
         if (plio_complete) { halt = 0; break; }
+        if (ddr) {
+            const uint64_t txns = ddr->dma_txn_count();
+            if (txns != last_txns) {
+                last_txns = txns;
+                idle_quanta = 0;
+            } else if (++idle_quanta >= kSettleQuanta) {
+                halt = 0;  // shim DMAs have drained -> natural completion
+                break;
+            }
+        }
     }
     c->reply_cycles = static_cast<uint64_t>((sc_core::sc_time_stamp() - t0) / one_ns);
     c->reply_int = halt;
@@ -97,7 +121,7 @@ void execute(aiesim_top* top, aiesim::Command* c) {
             c->reply_int = 0;
             break;
         case aiesim::Command::RUN:
-            do_run(c);
+            do_run(top, c);
             break;
         case aiesim::Command::WRITE_GM:
             top->ddr()->host_write(c->addr, c->in_ptr, c->len);

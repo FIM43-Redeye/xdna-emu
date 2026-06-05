@@ -63,6 +63,7 @@ void ddr_target::pump_rd(std::size_t i) {
         trans->set_response_status(xtlm::XTLM_OK_RESPONSE);
         mem_read(trans->get_address(), trans->get_data_ptr(),
                  trans->get_data_length());
+        ++dma_txns_;  // shim-DMA activity (read) -- RUN watches this for quiescence
         pending.push_back(trans);
     }
     if (!pending.empty() && util->is_master_ready()) {
@@ -91,6 +92,7 @@ void ddr_target::pump_wr(std::size_t i) {
         } else {
             mem_write(addr, data, size);
         }
+        ++dma_txns_;  // shim-DMA activity (write) -- RUN watches this for quiescence
         pending.push_back(trans);
     }
     if (!pending.empty() && util->is_master_ready()) {
