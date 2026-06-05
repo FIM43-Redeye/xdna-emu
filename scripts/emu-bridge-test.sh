@@ -111,6 +111,8 @@ SWEEP=false
 PC_ANCHORED=false
 MODE2=false
 RUN_AIESIM=false
+RUN_AIESIM_EMU=false  # opt-in via --aiesim-emu (the aiesim BACKEND as a third
+                      # comparison side; distinct from --aiesim's standalone CLI)
 NO_TIMEOUT=false
 WITH_HW_CYCLES=${WITH_HW_CYCLES:-false}
 WITH_CYCLE_DIFF=${WITH_CYCLE_DIFF:-false}
@@ -150,6 +152,7 @@ while [[ $# -gt 0 ]]; do
     --trace=pc-anchored)   PC_ANCHORED=true; NO_TRACE=false; shift ;;
     --mode2)               MODE2=true; PC_ANCHORED=true; NO_TRACE=false; shift ;;
     --aiesim)              RUN_AIESIM=true; shift ;;
+    --aiesim-emu)          RUN_AIESIM_EMU=true; shift ;;
     --serial-hw)           NPU_HW_JOBS=1; shift ;;
     --parallel-hw)         NPU_HW_JOBS="${NPU_HW_JOBS_PARALLEL:-5}"; shift ;;
     --no-timeout)          NO_TIMEOUT=true; shift ;;
@@ -193,6 +196,14 @@ Options:
                   Phase 0 kernel work and the EMU-side raw-stream output
                   path needed to fully wire HW vs EMU mode-2 comparison.
   --aiesim        Run aiesimulator on Chess builds + VCD coverage audit
+  --aiesim-emu    Run xdna-emu's aiesim BACKEND through the XRT plugin as a
+                  third comparison side (XDNA_BACKEND=aiesim).  Distinct from
+                  --aiesim (AMD's standalone aiesimulator CLI): this drives the
+                  SAME test.exe->XRT->plugin flow as the interpreter EMU and
+                  real HW, so aiesim becomes "just another runtime" -- the
+                  Phoenix oracle that survives the Strix swap.  Requires the FFI
+                  .so built with --features aiesim (rebuild-plugin.sh --aiesim)
+                  and the aiesim bridge .so (build-aiesim-bridge.sh).  Slow.
   --list          List available tests and exit
   -jN             Override parallelism (default: nproc)
   -v, --verbose   Show log snippets on failure
@@ -239,13 +250,23 @@ for _c in "${COMPILERS[@]}"; do
 done
 
 # Export variables that parallel jobs need.
-export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP PC_ANCHORED MODE2 RUN_AIESIM NO_TIMEOUT WITH_HW_CYCLES WITH_CYCLE_DIFF
+export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP PC_ANCHORED MODE2 RUN_AIESIM RUN_AIESIM_EMU NO_TIMEOUT WITH_HW_CYCLES WITH_CYCLE_DIFF
 export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT SCRIPT_DIR TRACE_QUARANTINE_FILE
 export XRT_DIR XRT_INCLUDE XRT_LIB
 export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
 export AIETOOLS_DIR
 export COMPILER_MODE PEANO_CLANG PEANO_INCLUDE CHESS_INCLUDE PEANO_KERNEL_FLAGS
 export COMPILERS_STR="${COMPILERS[*]}"
+
+# aiesim-backend (third comparison side) paths. Local-only scaffolding -- the
+# aiesim path links proprietary aietools and never ships. All overridable.
+#   AIESIM_BRIDGE_SO   -- the SystemC bridge .so (build-aiesim-bridge.sh output)
+#   AIESIM_DEVICE_JSON -- native NPU1 5x6 cluster device model (make_npu1.py)
+#   AIESIM_TIMEOUT     -- wall-clock cap per aiesim test.exe (aiesim is slow)
+AIESIM_BRIDGE_SO="${AIESIM_BRIDGE_SO:-$EMU_ROOT/aiesim-bridge/build/libxdna_aiesim_bridge.so}"
+AIESIM_DEVICE_JSON="${AIESIM_DEVICE_JSON:-$EMU_ROOT/build/experiments/aiesim-device-decrypt/NPU1.json}"
+AIESIM_TIMEOUT="${AIESIM_TIMEOUT:-300}"
+export AIESIM_BRIDGE_SO AIESIM_DEVICE_JSON AIESIM_TIMEOUT
 
 # ---------------------------------------------------------------------------
 # Hardware quarantine (tests that cause TDRs, run last + isolated)
@@ -2357,6 +2378,121 @@ run_one_bridge() {
 export -f run_one_bridge
 
 # ---------------------------------------------------------------------------
+# aiesim backend runner (third comparison side -- the Phoenix oracle)
+# ---------------------------------------------------------------------------
+#
+# Mirrors run_one_bridge but routes the SAME test.exe -> XRT -> plugin flow to
+# the aiesim backend (XDNA_BACKEND=aiesim) instead of the interpreter. The
+# plugin dlopens the same libxdna_emu_<profile>.so; the feature-gated aiesim
+# code is selected purely at runtime by XDNA_BACKEND. Correctness-only for now
+# (no trace/cycle pipeline) -- this is the calibration-first slice: prove aiesim
+# agrees with real Phoenix on a kernel before building out the full report
+# matrix. Writes .aiesim.{result,log} alongside the .bridge / .hw files.
+run_one_aiesim() {
+  local name="$1"
+  local compiler="${2:-}"
+  local variant="${3:-}"
+  local safe
+  safe="$(sanitize_name "$name")"
+
+  # If no compiler specified, deserialize from COMPILERS_STR and run all.
+  if [[ -z "$compiler" ]]; then
+    local compilers
+    read -ra compilers <<< "$COMPILERS_STR"
+    for c in "${compilers[@]}"; do
+      run_one_aiesim "$name" "$c" "$variant"
+    done
+    return
+  fi
+
+  local build_dir="$BUILD_BASE/$name/$compiler"
+  local test_exe="$BUILD_BASE/$name/test.exe"
+  local src_dir="$TEST_SRC/$name"
+
+  local vsuffix=""
+  [[ -n "$variant" ]] && vsuffix=".${variant}"
+  local display_name="$name"
+  [[ -n "$variant" ]] && display_name="${name}/${variant}"
+
+  local log_file="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.aiesim.log"
+  local result_file="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.aiesim.result"
+
+  local _py_host=false
+  is_python_host_test "$src_dir" && _py_host=true
+
+  if ! $_py_host; then
+    if [[ -f "$test_exe" ]]; then
+      rm -f "$build_dir/test.exe"
+      ln -sf "$test_exe" "$build_dir/test.exe"
+    fi
+    if [[ ! -f "$build_dir/test.exe" ]]; then
+      echo "SKIP" > "$result_file"
+      echo "  AIESIM $display_name ($compiler): SKIP (no test.exe)"
+      return
+    fi
+  fi
+
+  if ! ls "$build_dir"/*.xclbin &>/dev/null; then
+    echo "SKIP" > "$result_file"
+    echo "  AIESIM $display_name ($compiler): SKIP (no xclbin)"
+    return
+  fi
+
+  # Bridge-backend prerequisites must exist or every test would SKIP silently.
+  if [[ ! -f "$AIESIM_BRIDGE_SO" ]]; then
+    echo "SKIP" > "$result_file"
+    echo "  AIESIM $display_name ($compiler): SKIP (bridge .so missing: $AIESIM_BRIDGE_SO -- build-aiesim-bridge.sh)"
+    return
+  fi
+  if [[ ! -f "$AIESIM_DEVICE_JSON" ]]; then
+    echo "SKIP" > "$result_file"
+    echo "  AIESIM $display_name ($compiler): SKIP (device JSON missing: $AIESIM_DEVICE_JSON)"
+    return
+  fi
+
+  local _aiesim_start=$EPOCHREALTIME
+  local run_cmd
+  run_cmd="$(get_variant_run_cmd "$src_dir" "$variant")"
+
+  local rc=0
+  (
+    cd "$build_dir"
+    # aietools (SystemC + sim) libs APPENDED per CLAUDE.md, plus the bridge dir.
+    local _aietools="${XILINX_VITIS_AIETOOLS:-$AIETOOLS_DIR}"
+    export LD_LIBRARY_PATH="${_aietools}/lib/lnx64.o:$EMU_ROOT/aiesim-bridge/build:${LD_LIBRARY_PATH:-}"
+    export XDNA_EMU=1
+    export XDNA_EMU_RUNTIME="${XDNA_EMU_RUNTIME:-debug}"
+    export XDNA_EMU_LOG_LEVEL="${XDNA_EMU_LOG_LEVEL:-info}"
+    export XDNA_EMU_DIR="$EMU_ROOT"
+    export XDNA_BACKEND=aiesim
+    export XDNA_AIESIM_DEVICE_JSON="$AIESIM_DEVICE_JSON"
+    export XDNA_AIESIM_BRIDGE="$AIESIM_BRIDGE_SO"
+    export XDNA_AIESIM_NATIVE_GEOMETRY=1
+    timeout "$AIESIM_TIMEOUT" bash -c "$run_cmd"
+  ) > "$log_file" 2>&1 || rc=$?
+
+  local result
+  if [[ $rc -eq 0 ]] && grep -q "PASS" "$log_file"; then
+    result="PASS"
+  elif [[ $rc -eq 124 ]]; then
+    result="TIMEOUT"
+  else
+    result="FAIL"
+  fi
+
+  # Verify the aiesim backend actually ran (catch silent fallthrough).
+  if [[ "$result" == "PASS" ]]; then
+    if ! grep -qE '(Loaded PDI|xdna_emu|XDNA emulator|aiesim)' "$log_file"; then
+      result="EMU_MISS"
+    fi
+  fi
+
+  echo "$result" > "$result_file"
+  echo "  AIESIM $display_name ($compiler): $result  $(job_duration "$_aiesim_start")"
+}
+export -f run_one_aiesim
+
+# ---------------------------------------------------------------------------
 # Trace comparison helpers (Phase 5: run_one_bridge trace_raw.bin flow)
 # ---------------------------------------------------------------------------
 
@@ -3057,6 +3193,11 @@ main() {
 
   local rebuild_flags=""
   [[ "$emu_profile" == "release" ]] && rebuild_flags="--release"
+  # When the aiesim side is enabled, the FFI .so must carry the aiesim feature
+  # (XDNA_BACKEND=aiesim returns a "built without aiesim support" error
+  # otherwise). Pre-build with rebuild-plugin.sh --aiesim is still recommended
+  # since Phase 1b only auto-rebuilds when the Rust lib is newer than the plugin.
+  $RUN_AIESIM_EMU && rebuild_flags="${rebuild_flags:+$rebuild_flags }--aiesim"
 
   if [[ -f "$rust_lib" ]]; then
     if [[ ! -f "$installed_plugin" ]] || [[ "$rust_lib" -nt "$installed_plugin" ]]; then
@@ -3375,6 +3516,25 @@ main() {
   fi
   info "EMU runs done"
   echo ""
+
+  # ---- aiesim backend pass (third comparison side, opt-in) ---------------
+  # Runs AFTER the interpreter EMU pass. aiesim is pure simulation (no real
+  # NPU), so it does not contend with hardware, but it is slow and
+  # memory-heavy -- run serially. Correctness-only for now (calibration-first);
+  # the full report-matrix column lands once aiesim fidelity vs Phoenix is
+  # confirmed on a calibration kernel.
+  if $RUN_AIESIM_EMU; then
+    info "aiesim: running ${#all_jobs[@]} job(s) (serial)"
+    for entry in "${all_jobs[@]}"; do
+      local a_name a_compiler a_variant
+      a_name="$(_job_name "$entry")"
+      a_compiler="$(_job_compiler "$entry")"
+      a_variant="$(_job_variant "$entry")"
+      run_one_aiesim "$a_name" "$a_compiler" "$a_variant"
+    done
+    info "aiesim runs done"
+    echo ""
+  fi
 
   # ---- Phase 5: Automatic trace comparison --------------------------------
   # Comparison requires both HW and EMU captures; skip when either is off.

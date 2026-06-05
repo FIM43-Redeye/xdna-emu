@@ -8,6 +8,15 @@
 #   ./scripts/rebuild-plugin.sh             # Debug build (default)
 #   ./scripts/rebuild-plugin.sh --release   # Release build
 #   ./scripts/rebuild-plugin.sh --reconfigure  # Force cmake reconfigure
+#   ./scripts/rebuild-plugin.sh --aiesim    # Also compile in the aiesim backend
+#
+# --aiesim builds the Rust FFI .so with `--features aiesim`, which gates in the
+# AiesimBackend code (selected at runtime via XDNA_BACKEND=aiesim). The feature
+# is purely additive -- there is NO build-time aietools dependency (the bridge
+# .so is dlopened at runtime), so the resulting .so still runs the interpreter
+# normally when XDNA_BACKEND is unset. Off by default so the standard plugin .so
+# stays interpreter-only. The aiesim bridge .so itself is built separately (see
+# aiesim-bridge/); this flag only affects the Rust feature gate.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -28,12 +37,16 @@ if [[ -d "$XDNA_DRIVER_DIR/.git" ]]; then
 fi
 
 CARGO_FLAGS=""
+CARGO_FEATURES=""
 PROFILE="debug"
 for arg in "$@"; do
   case "$arg" in
     --release)
       CARGO_FLAGS="--release"
       PROFILE="release"
+      ;;
+    --aiesim)
+      CARGO_FEATURES="--features aiesim"
       ;;
     --reconfigure)
       echo ">>> Reconfiguring cmake..."
@@ -51,8 +64,8 @@ if [[ ! -f "$BUILD_DIR/CMakeCache.txt" ]]; then
   ( cd "$BUILD_DIR" && cmake .. )
 fi
 
-echo ">>> Building Rust FFI lib..."
-nice -n 19 cargo build -p xdna-emu-ffi $CARGO_FLAGS
+echo ">>> Building Rust FFI lib...${CARGO_FEATURES:+ ($CARGO_FEATURES)}"
+nice -n 19 cargo build -p xdna-emu-ffi $CARGO_FLAGS $CARGO_FEATURES
 
 echo ">>> Building C++ plugin..."
 ( cd "$BUILD_DIR" && make -j$(nproc) )
