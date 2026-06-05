@@ -238,12 +238,15 @@ void aiesim_top::spawn_egress_drains() {
     // shim->PL egress (MEStream64). On a real all-NoC NPU these ports must stay
     // EMPTY -- nothing should route to PL. Any packet arriving here is a routing-
     // fidelity bug (today: the shim DMA's TCT/control stream is misrouted to PL
-    // instead of NoC). XDNA_AIESIM_PL_PANIC turns the drain into a fail-fast
-    // guard: abort loudly on the first PL packet, so a faulty run dies at the
-    // exact misrouting point instead of grinding a long sim, and we are forced to
-    // fix the routing until PL is provably empty. Default (unset) drains and
-    // discards so kernels still run despite the known misroute (see fd2821b).
-    const bool pl_panic = std::getenv("XDNA_AIESIM_PL_PANIC") != nullptr;
+    // instead of NoC). By DEFAULT we fail-fast: abort loudly on the first PL
+    // packet, so a faulty run dies at the exact misrouting point instead of
+    // grinding a long sim, and the all-NoC "PL is empty" invariant cannot be
+    // silently papered over. XDNA_AIESIM_PL_DRAIN opts out to drain+discard, for
+    // when we knowingly want a kernel to run despite the still-unfixed misroute
+    // (the behavior committed in fd2821b). NOTE: with the misroute unfixed the
+    // default aborts ANY issue_token kernel (its TCT hits PL) -- intended, until
+    // the routing fix lands.
+    const bool pl_panic = std::getenv("XDNA_AIESIM_PL_DRAIN") == nullptr;
     const size_t n_pl = me->ms_pl_stream.size();
     for (size_t i = 0; i < n_pl; ++i) {
         sc_core::sc_spawn(
@@ -259,7 +262,7 @@ void aiesim_top::spawn_egress_drains() {
                             "[PL-PANIC]   this is a routing-fidelity bug (TCT/control stream\n"
                             "[PL-PANIC]   misrouted to PL instead of NoC).\n"
                             "[PL-PANIC]   pkt#%llu d0=0x%08x d1=0x%08x tlast=%d\n"
-                            "[PL-PANIC] aborting (unset XDNA_AIESIM_PL_PANIC to drain+discard).\n\n",
+                            "[PL-PANIC] aborting (set XDNA_AIESIM_PL_DRAIN=1 to drain+discard).\n\n",
                             i, sc_core::sc_time_stamp().to_string().c_str(),
                             (unsigned long long)pkts, d.data[0], d.data[1], d.tlast ? 1 : 0);
                         std::fflush(stderr);
