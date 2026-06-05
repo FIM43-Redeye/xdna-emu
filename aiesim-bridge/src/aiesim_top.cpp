@@ -182,6 +182,88 @@ void aiesim_top::stub_unused_ports() {
     stubs_.push_back(noc_fifo);
 }
 
+// Drain the shim output-stream egress. The cluster pushes a packet on the shim
+// master output stream for every BD that completes with issue_token set (the
+// Task Completion Token), plus other controller traffic. These are get_exports
+// the cluster fills internally; the only way to drain one is to call ->get() (a
+// put-side sink cannot be bound, unlike the ss_noc_axis ingress get_port). The
+// reference wrapper (aietools aie_xtlm.cpp) pulls each port the same way. Left
+// unconsumed the egress FIFO fills after a bounded number of tokens and back-
+// pressures the shim DMA (status Stalled_TCT[5]=1, Channel_Running stuck),
+// deadlocking any kernel that issues more issue_token BDs than the FIFO depth
+// (e.g. sync_task_complete_token's 256 single-word input transfers wedge at ~155).
+//
+// We drain BOTH ms_pl_stream and ms_noc_axis. Real NPU1 is all-NoC (no PL
+// fabric), but the cluster model is the generic Versal AIE-ML array, which
+// exposes PL stream ports; with our partition placed at Versal start_col 0 the
+// shim routes its TCT/control output stream to a PL egress port (ms_pl_stream),
+// not the NoC one -- a placement artifact of emulating a NoC-only NPU on the
+// generic model, not real-silicon behavior (on hardware that port does not
+// exist). Draining both makes the bridge column-type-agnostic and also removes
+// a pervasive per-transfer stall (the un-drained FIFO back-pressures every BD,
+// not just the one that finally fills it).
+//
+// We discard the packets: completion is detected from the DMA channel status
+// (dma_wait watches Channel_Running), and result DATA travels the shim-DMA aximm
+// path into host DDR -- the stream egress carries only the redundant completion-
+// token / controller notifications, for which we model no destination. (A future
+// TCT-accurate completion model could parse these instead of discarding.) One
+// blocking SC_THREAD per port: idle (suspended in get()) until the cluster emits
+// a packet, so it costs nothing when quiet and drains concurrently otherwise.
+void aiesim_top::spawn_egress_drains() {
+    auto* me = static_cast<MathEngineBase*>(me_);
+    const bool trace = std::getenv("XDNA_AIESIM_TRACE") != nullptr;
+
+    // shim->NoC egress (NoCStream128). Carries TCT / controller packets on
+    // NoC-shim columns.
+    const size_t n_noc = me->ms_noc_axis.size();
+    for (size_t i = 0; i < n_noc; ++i) {
+        sc_core::sc_spawn(
+            [me, i, trace] {
+                uint64_t pkts = 0;
+                for (;;) {
+                    NoCStreamData128 d = me->ms_noc_axis[i]->get();
+                    ++pkts;
+                    if (trace && (pkts % 64 == 0 || pkts <= 2 || d.tlast)) {
+                        std::fprintf(stderr,
+                                     "[noc-drain %zu] %llu pkts (d0=0x%08x tdest=0x%x tlast=%d)\n",
+                                     i, (unsigned long long)pkts, d.data[0], d.tdest,
+                                     d.tlast ? 1 : 0);
+                    }
+                }
+            },
+            (std::string("noc_drain_") + std::to_string(i)).c_str());
+    }
+
+    // shim->PL egress (MEStream64). On PL-shim columns the shim output stream
+    // (incl. the TCT) routes here; left unconsumed it back-pressures the shim
+    // DMA exactly like the NoC egress.
+    const size_t n_pl = me->ms_pl_stream.size();
+    for (size_t i = 0; i < n_pl; ++i) {
+        sc_core::sc_spawn(
+            [me, i, trace] {
+                uint64_t pkts = 0;
+                for (;;) {
+                    MEStreamData64 d = me->ms_pl_stream[i]->get();
+                    ++pkts;
+                    if (trace && (pkts % 64 == 0 || pkts <= 2 || d.tlast)) {
+                        std::fprintf(stderr,
+                                     "[pl-drain %zu] %llu pkts (d0=0x%08x d1=0x%08x tlast=%d)\n",
+                                     i, (unsigned long long)pkts, d.data[0], d.data[1],
+                                     d.tlast ? 1 : 0);
+                    }
+                }
+            },
+            (std::string("pl_drain_") + std::to_string(i)).c_str());
+    }
+
+    if (trace) {
+        std::fprintf(stderr,
+                     "[egress-drain] spawned %zu ms_noc_axis + %zu ms_pl_stream drains\n",
+                     n_noc, n_pl);
+    }
+}
+
 aiesim_top::~aiesim_top() {
     if (cluster_lib_) {
         dlclose(cluster_lib_);

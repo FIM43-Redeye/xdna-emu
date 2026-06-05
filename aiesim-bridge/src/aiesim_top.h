@@ -29,6 +29,15 @@ public:
     // GM (host-buffer) path reads/writes it directly.
     ddr_target* ddr() const { return ddr_; }
 
+    // Spawn the shim egress drains (one SC_THREAD per ms_pl_stream and
+    // ms_noc_axis port). The cluster emits a Task-Completion-Token packet on the
+    // shim output stream for every BD that completes with issue_token set (PL-shim
+    // columns -> ms_pl_stream, NoC-shim columns -> ms_noc_axis). Left unconsumed
+    // that egress FIFO fills and back-pressures the shim DMA (status
+    // Stalled_TCT[5]=1) -> deadlock. Must be called from sc_main (a simulation
+    // context where sc_spawn is legal), after the cluster is constructed.
+    void spawn_egress_drains();
+
 private:
     // Bind/stub the cluster ports we do not drive so end_of_elaboration passes
     // (aximm stubs, stream/event clocks, dangling sc_in). me_ must be set.

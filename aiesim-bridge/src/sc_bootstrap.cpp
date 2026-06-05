@@ -222,6 +222,11 @@ extern "C" int sc_main(int /*argc*/, char* /*argv*/[]) {
     });
     sc_core::sc_spawn(sc_bind(&driver_proc, top), "aiesim_driver");
 
+    // Drain the shim output-stream egress (TCT packets) so it cannot fill and
+    // back-pressure the shim DMA. One blocking SC_THREAD per ms_pl_stream /
+    // ms_noc_axis port; see aiesim_top::spawn_egress_drains.
+    top->spawn_egress_drains();
+
     // Host loop: advance the kernel only while a command is pending; the driver
     // sc_pause()s after each drain, returning control here.
     for (;;) {
