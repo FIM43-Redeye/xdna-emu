@@ -1274,6 +1274,8 @@ get_run_variants() {
   # _variant_from_cmd names both "" (no distinguishing arg), which would enqueue
   # -- and run -- the kernel twice (both resolving to the first npu1 command).
   # Collapsing identical variant names keeps one job per distinct variant.
+  # (Consequence: the Python/IRON host is never run -- a known, wanted-someday
+  # coverage gap; see .claude/components/testing.md "Known coverage gap".)
   # NB: bash assoc arrays reject an empty-string key ("bad array subscript"),
   # and the empty variant is precisely the duplicated one -- track it separately.
   local -a _uniq_variants=()

@@ -138,6 +138,24 @@ Sweep mode wires this automatically into
 Key flags: `--chess-only`, `--peano-only`, `--no-hw`, `--compile`,
 `--serial-hw`, `--sweep`, `--trace=pc-anchored`, `-v <filter>`.
 
+### Known coverage gap: Python/IRON host path
+
+The suite only ever exercises the **C++ host** (`test.exe`, raw XRT API). Some
+upstream kernels (e.g. `add_one_objFifo`, `add_one_objFifo_elf`) also ship a
+**Python/IRON host** (`test.py`, `aie.iron` + `DefaultNPURuntime.run_test` via
+pyxrt) for the *same* xclbin. Both lit RUN lines derive the same variant name
+(`""`, from `aie.xclbin`), so `get_run_variants` collapses them and
+`get_variant_run_cmd("")` always resolves to the first command -- the C++ one.
+The Python host is never run. (Before the variant-dedup fix this surfaced as a
+double-enqueued job that ran `test.exe` twice.)
+
+This is fine for *fidelity* -- the kernel compute is identical regardless of
+host -- but it leaves the **IRON/pyxrt -> plugin integration** unvalidated.
+Making the emulator a true drop-in for the IRON Python flow is a wanted future
+feature: it needs a real *host axis* (cpp vs py) distinct from the
+xclbin-derived variant, plus confirming `DefaultNPURuntime` actually routes
+through `XDNA_EMU` to our plugin. Deliberate feature, not a quick flag.
+
 ### Specialized capture: `tools/bug6-trace.sh`
 
 Single-pkexec wrapper that enables the existing `amdxdna_trace`
