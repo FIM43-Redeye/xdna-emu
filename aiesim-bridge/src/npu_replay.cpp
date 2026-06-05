@@ -2,6 +2,7 @@
 
 #include <systemc.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -115,6 +116,26 @@ struct Reader {
     }
 };
 
+// Live sim-vs-wall ratio probe. Set XDNA_AIESIM_RATE_LOG=1 to print, every
+// ~kRateEvery quanta, the absolute SystemC sim time (us) and the wall time (s)
+// since the first poll -- so the cycle-accurate slowdown is directly visible.
+void rate_tick(const char* where, uint64_t poll_elapsed_ns) {
+    static const bool on = std::getenv("XDNA_AIESIM_RATE_LOG") != nullptr;
+    if (!on) return;
+    static const auto wall0 = std::chrono::steady_clock::now();
+    static uint64_t n = 0;
+    constexpr uint64_t kRateEvery = 16;  // 16 * 256ns = ~4us sim between prints
+    if (n++ % kRateEvery != 0) return;
+    const double sim_us = sc_core::sc_time_stamp().to_seconds() * 1e6;
+    const double wall_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
+    std::fprintf(stderr,
+                 "[rate] %s sim=%.3f us wall=%.1f s  (this-wait poll=%.3f us)  "
+                 "ratio=%.1f ms_wall/sim_us\n",
+                 where, sim_us, wall_s, poll_elapsed_ns / 1000.0,
+                 wall_s > 0 && sim_us > 0 ? (wall_s * 1000.0) / sim_us : 0.0);
+}
+
 // Poll (reg & kDmaDoneMask) == 0 -- the DMA channel is idle, queue-empty, not
 // stalled. Advances sim time between checks so the cluster's DMA/cores progress.
 bool dma_wait(ps_bridge* ps, uint64_t status_addr) {
@@ -124,6 +145,7 @@ bool dma_wait(ps_bridge* ps, uint64_t status_addr) {
         if (elapsed >= poll_max_ns()) return false;
         sc_core::wait(sc_core::sc_time(double(kPollQuantumNs), sc_core::SC_NS));
         elapsed += kPollQuantumNs;
+        rate_tick("dma_wait", elapsed);
     }
 }
 
@@ -153,6 +175,15 @@ void probe_tile(ps_bridge* ps, uint8_t start_col, const char* tag) {
     std::fprintf(stderr,
                  "[probe %s] core(%d,%d) ctrl=0x%08x status=0x%08x pc=0x%05x clk=0x%08x pm0=0x%08x\n",
                  tag, col, row, ctrl, status, pc, clk, pm0);
+    // TILE_CONTROL_PACKET_HANDLER_STATUS (0x3FF30, CORE_MODULE; xaiemlgbl_params.h):
+    // bit0 first-header parity err, bit1 second-header parity err, bit2 slverr-on-
+    // access, bit3 TLAST err. Nonzero => the compute tile's control-packet handler
+    // saw a malformed REQUEST (our framing bug) -- the our-error check for why the
+    // read response is unframed. Reads via the model's faithful register path.
+    const uint32_t cph = rd(row, 0x3FF30);
+    std::fprintf(stderr,
+                 "[probe %s] ctrl_pkt_handler_status(%d,%d)=0x%08x  [hdr1_parity=%u hdr2_parity=%u slverr=%u tlast=%u]\n",
+                 tag, col, row, cph, cph & 1u, (cph >> 1) & 1u, (cph >> 2) & 1u, (cph >> 3) & 1u);
     // Compute-tile memory-module locks 0..7 (0x1F000, stride 0x10). Signed value.
     std::fprintf(stderr, "[probe %s] locks ", tag);
     for (int l = 0; l < 8; ++l) std::fprintf(stderr, "L%d=%d ", l, (int)rd(row, 0x1F000 + l * 0x10));
@@ -309,6 +340,7 @@ int npu_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len, uint8_t start
                     if (elapsed >= poll_max_ns()) break;
                     sc_core::wait(sc_core::sc_time(double(kPollQuantumNs), sc_core::SC_NS));
                     elapsed += kPollQuantumNs;
+                    rate_tick("mask_poll", elapsed);
                 }
                 if (!ok) {
                     std::fprintf(stderr,
