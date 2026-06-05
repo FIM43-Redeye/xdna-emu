@@ -34,10 +34,9 @@ hwctx_umq(const device& dev, uint32_t partition_size)
 
 hwctx_umq::~hwctx_umq() = default;
 
-// tcp_server and dbg_hwq_umq destructor stubs -- hwctx_umq holds a
-// unique_ptr<tcp_server> whose destructor chain needs the complete types.
-// The real implementations live in umq/ which we do not compile.
-dbg_hwq_umq::~dbg_hwq_umq() = default;
-tcp_server::~tcp_server() = default;
+// (Upstream removed the AIE-debugger TCP server: commit "remove cert aie
+// debugger support" deleted dbg_hwq_umq + tcp_server and the
+// unique_ptr<tcp_server> member of hwctx_umq, so the destructor-chain stubs
+// they used to require are gone with them.)
 
 } // namespace shim_xdna
