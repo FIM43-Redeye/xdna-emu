@@ -193,23 +193,32 @@ void aiesim_top::stub_unused_ports() {
 // deadlocking any kernel that issues more issue_token BDs than the FIFO depth
 // (e.g. sync_task_complete_token's 256 single-word input transfers wedge at ~155).
 //
-// We drain BOTH ms_pl_stream and ms_noc_axis. Real NPU1 is all-NoC (no PL
-// fabric), but the cluster model is the generic Versal AIE-ML array, which
-// exposes PL stream ports; with our partition placed at Versal start_col 0 the
-// shim routes its TCT/control output stream to a PL egress port (ms_pl_stream),
-// not the NoC one -- a placement artifact of emulating a NoC-only NPU on the
-// generic model, not real-silicon behavior (on hardware that port does not
-// exist). Draining both makes the bridge column-type-agnostic and also removes
-// a pervasive per-transfer stall (the un-drained FIFO back-pressures every BD,
-// not just the one that finally fills it).
+// We drain BOTH ms_pl_stream and ms_noc_axis. One blocking SC_THREAD per port:
+// idle (suspended in get()) until the cluster emits a packet, so it costs nothing
+// when quiet and drains concurrently otherwise. An un-drained egress FIFO
+// back-pressures the shim DMA (Stalled_TCT) -- not just on the BD that finally
+// fills it, but on every issue_token BD -- so draining is mandatory, not cleanup.
 //
-// We discard the packets: completion is detected from the DMA channel status
-// (dma_wait watches Channel_Running), and result DATA travels the shim-DMA aximm
-// path into host DDR -- the stream egress carries only the redundant completion-
-// token / controller notifications, for which we model no destination. (A future
-// TCT-accurate completion model could parse these instead of discarding.) One
-// blocking SC_THREAD per port: idle (suspended in get()) until the cluster emits
-// a packet, so it costs nothing when quiet and drains concurrently otherwise.
+// What's actually on these ports (task #80 investigation):
+//   - Task-completion tokens (TCTs) are REAL silicon: issue_token (BD field) +
+//     Controller_ID (DMA channel reg) are real config, and npu.sync is built on
+//     them (the host sequence blocks until N tokens arrive). On real NPU1 a TCT
+//     does NOT travel an ME data-stream egress; it goes via an internal,
+//     Controller_ID-addressed path to the host controller. aie-rt confirms this
+//     negatively: there is NO stream-switch route programmed for a token (the
+//     shim mux/demux at 0x1F000/0x1F004 route only DATA ports; our CDO programs
+//     them to DMA type only -- verified by register dump). So the TCT appearing
+//     on a PL egress here is purely a generic-Versal-cluster artifact: lacking
+//     the XDNA token transport, the model dumps each token on a PL BLI port.
+//   - The cluster surfaces a TCT as a SINGLE 32-bit control word: d0 = token
+//     (controller-id/count, bit31 = valid), d1 = NO_STREAM_DATA filler, tlast=1.
+//
+// Completion is detected from DMA channel status (dma_wait watches
+// Channel_Running) and result DATA travels the shim-DMA aximm path into host DDR,
+// so the tokens are redundant for correctness -- but they are USEFUL TO SEE when
+// debugging (which BD completed, with controller id). So on PL we CLASSIFY: a
+// recognized TCT is drained (and traceable); anything else on a PL port is
+// genuine misrouted traffic on an all-NoC NPU -> a real routing bug -> we PANIC.
 void aiesim_top::spawn_egress_drains() {
     auto* me = static_cast<MathEngineBase*>(me_);
     const bool trace = std::getenv("XDNA_AIESIM_TRACE") != nullptr;
@@ -235,44 +244,56 @@ void aiesim_top::spawn_egress_drains() {
             (std::string("noc_drain_") + std::to_string(i)).c_str());
     }
 
-    // shim->PL egress (MEStream64). On a real all-NoC NPU these ports must stay
-    // EMPTY -- nothing should route to PL. Any packet arriving here is a routing-
-    // fidelity bug (today: the shim DMA's TCT/control stream is misrouted to PL
-    // instead of NoC). By DEFAULT we fail-fast: abort loudly on the first PL
-    // packet, so a faulty run dies at the exact misrouting point instead of
-    // grinding a long sim, and the all-NoC "PL is empty" invariant cannot be
-    // silently papered over. XDNA_AIESIM_PL_DRAIN opts out to drain+discard, for
-    // when we knowingly want a kernel to run despite the still-unfixed misroute
-    // (the behavior committed in fd2821b). NOTE: with the misroute unfixed the
-    // default aborts ANY issue_token kernel (its TCT hits PL) -- intended, until
-    // the routing fix lands.
+    // shim->PL egress (MEStream64). On an all-NoC NPU no DATA may route to PL.
+    // The only legitimate traffic here is the model's TCT artifact (see above):
+    // a single 32-bit control word with d1 == NO_STREAM_DATA and tlast=1. We
+    // recognize those and drain them (traceable as TCTs -- useful for debugging),
+    // and PANIC on anything else: a multi-beat or data-bearing packet on a PL
+    // port is genuine misrouted traffic, a real routing-fidelity bug, and we want
+    // the run to die at the exact point it happens rather than grind a long sim.
+    // XDNA_AIESIM_PL_DRAIN disables the panic entirely (drain+discard everything),
+    // for when we knowingly want a run to bulldoze past unexpected PL data.
+    //
+    // NO_STREAM_DATA (0x77777777) is the cluster's "this 32-bit lane carries no
+    // data" sentinel (aietools me_axi_stream.h); a 64-bit data beat populates d1.
+    constexpr uint32_t kNoStreamData = 0x77777777u;
     const bool pl_panic = std::getenv("XDNA_AIESIM_PL_DRAIN") == nullptr;
     const size_t n_pl = me->ms_pl_stream.size();
     for (size_t i = 0; i < n_pl; ++i) {
         sc_core::sc_spawn(
-            [me, i, trace, pl_panic] {
-                uint64_t pkts = 0;
+            [me, i, trace, pl_panic, kNoStreamData] {
+                uint64_t tcts = 0;
                 for (;;) {
                     MEStreamData64 d = me->ms_pl_stream[i]->get();
-                    ++pkts;
+                    // A recognized TCT artifact: single 32-bit control word
+                    // (upper lane is filler), end-of-packet on the one beat.
+                    const bool is_tct = (d.data[1] == kNoStreamData) && d.tlast;
+                    if (is_tct) {
+                        ++tcts;
+                        if (trace && (tcts <= 2 || tcts % 64 == 0)) {
+                            std::fprintf(stderr,
+                                         "[pl-tct %zu] tct#%llu d0=0x%08x (token, drained)\n",
+                                         i, (unsigned long long)tcts, d.data[0]);
+                        }
+                        continue;
+                    }
                     if (pl_panic) {
                         std::fprintf(stderr,
-                            "\n[PL-PANIC] data entered shim->PL egress port %zu at %s\n"
-                            "[PL-PANIC]   on an all-NoC NPU every PL port must stay empty --\n"
-                            "[PL-PANIC]   this is a routing-fidelity bug (TCT/control stream\n"
-                            "[PL-PANIC]   misrouted to PL instead of NoC).\n"
-                            "[PL-PANIC]   pkt#%llu d0=0x%08x d1=0x%08x tlast=%d\n"
+                            "\n[PL-PANIC] DATA entered shim->PL egress port %zu at %s\n"
+                            "[PL-PANIC]   on an all-NoC NPU no data may route to PL -- this is\n"
+                            "[PL-PANIC]   a genuine routing-fidelity bug (not a TCT artifact).\n"
+                            "[PL-PANIC]   d0=0x%08x d1=0x%08x tlast=%d (after %llu TCTs)\n"
                             "[PL-PANIC] aborting (set XDNA_AIESIM_PL_DRAIN=1 to drain+discard).\n\n",
                             i, sc_core::sc_time_stamp().to_string().c_str(),
-                            (unsigned long long)pkts, d.data[0], d.data[1], d.tlast ? 1 : 0);
+                            d.data[0], d.data[1], d.tlast ? 1 : 0,
+                            (unsigned long long)tcts);
                         std::fflush(stderr);
                         std::abort();
                     }
-                    if (trace && (pkts % 64 == 0 || pkts <= 2 || d.tlast)) {
+                    if (trace) {
                         std::fprintf(stderr,
-                                     "[pl-drain %zu] %llu pkts (d0=0x%08x d1=0x%08x tlast=%d)\n",
-                                     i, (unsigned long long)pkts, d.data[0], d.data[1],
-                                     d.tlast ? 1 : 0);
+                                     "[pl-drain %zu] non-TCT data drained (d0=0x%08x d1=0x%08x tlast=%d)\n",
+                                     i, d.data[0], d.data[1], d.tlast ? 1 : 0);
                     }
                 }
             },
