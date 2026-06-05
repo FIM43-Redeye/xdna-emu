@@ -266,7 +266,12 @@ export COMPILERS_STR="${COMPILERS[*]}"
 AIESIM_BRIDGE_SO="${AIESIM_BRIDGE_SO:-$EMU_ROOT/aiesim-bridge/build/libxdna_aiesim_bridge.so}"
 AIESIM_DEVICE_JSON="${AIESIM_DEVICE_JSON:-$EMU_ROOT/build/experiments/aiesim-device-decrypt/NPU1.json}"
 AIESIM_TIMEOUT="${AIESIM_TIMEOUT:-300}"
-export AIESIM_BRIDGE_SO AIESIM_DEVICE_JSON AIESIM_TIMEOUT
+# Each aiesim instance is single-threaded (SystemC pins one core) and ~1.2 GB
+# RAM, so the cap is cores, not memory: fan out across kernels but leave a few
+# cores for the OS + harness. Pure simulation (no NPU), so unlike the HW pass
+# there is no hardware-contention reason to serialize.
+AIESIM_JOBS="${AIESIM_JOBS:-$(( $(nproc) > 4 ? $(nproc) - 4 : 1 ))}"
+export AIESIM_BRIDGE_SO AIESIM_DEVICE_JSON AIESIM_TIMEOUT AIESIM_JOBS
 
 # ---------------------------------------------------------------------------
 # Hardware quarantine (tests that cause TDRs, run last + isolated)
@@ -3378,12 +3383,18 @@ main() {
     fi
   fi
 
-  local hw_label="" emu_label=""
-  $RUN_HW && hw_label="HW -j${NPU_HW_JOBS}"
-  $RUN_EMU && emu_label="EMU -j${JOBS}"
+  # Active runtimes run the same jobs in order (HW -> EMU -> aiesim); list only
+  # the enabled ones, joined with "->", so --no-hw doesn't leave a dangling
+  # comma and the aiesim side is actually announced.
+  local -a _runtimes=()
+  $RUN_HW && _runtimes+=("HW -j${NPU_HW_JOBS}")
+  $RUN_EMU && _runtimes+=("EMU -j${JOBS}")
+  $RUN_AIESIM_EMU && _runtimes+=("aiesim -P${AIESIM_JOBS}")
+  local _runtime_seq="" _r
+  for _r in "${_runtimes[@]}"; do _runtime_seq="${_runtime_seq:+$_runtime_seq -> }$_r"; done
   local q_label=""
   [[ ${#hw_quarantine_jobs[@]} -gt 0 ]] && q_label=", ${#hw_quarantine_jobs[@]} quarantined"
-  info "Phase 3+4: Running ${#all_jobs[@]} job(s) (${hw_label:+$hw_label first}${emu_label:+, then $emu_label}${q_label})"
+  info "Phase 3+4: Running ${#all_jobs[@]} job(s) (${_runtime_seq}${q_label})"
 
   # Stale-artifact guard: nuke per-test .hw/ or .emu/ dirs (and their
   # paired .log/.result and trace.summary files) for any side we are NOT
@@ -3591,19 +3602,21 @@ main() {
 
   # ---- aiesim backend pass (third comparison side, opt-in) ---------------
   # Runs AFTER the interpreter EMU pass. aiesim is pure simulation (no real
-  # NPU), so it does not contend with hardware, but it is slow and
-  # memory-heavy -- run serially. Correctness-only (no trace/cycle pipeline);
-  # results feed the AIESIM report-matrix column + the aiesim-vs-HW calibration
-  # mismatch check in print_report.
+  # NPU), so it does not contend with hardware -- fan out across kernels like
+  # the EMU pass (xargs -P), bounded by AIESIM_JOBS since each instance pins a
+  # core. Correctness-only (no trace/cycle pipeline); results feed the AIESIM
+  # report-matrix column + the aiesim-vs-HW calibration check in print_report.
   if $RUN_AIESIM_EMU; then
-    info "aiesim: running ${#all_jobs[@]} job(s) (serial)"
-    for entry in "${all_jobs[@]}"; do
-      local a_name a_compiler a_variant
-      a_name="$(_job_name "$entry")"
-      a_compiler="$(_job_compiler "$entry")"
-      a_variant="$(_job_variant "$entry")"
-      run_one_aiesim "$a_name" "$a_compiler" "$a_variant"
-    done
+    info "aiesim: running ${#all_jobs[@]} job(s) (-P${AIESIM_JOBS})"
+    printf '%s\n' "${all_jobs[@]}" \
+      | xargs -P"$AIESIM_JOBS" -I{} bash -c '
+          entry="$1"
+          j_name="${entry%%:*}"
+          tmp="${entry#*:}"
+          j_compiler="${tmp%%:*}"
+          j_variant="${tmp#*:}"
+          run_one_aiesim "$j_name" "$j_compiler" "$j_variant"
+        ' _ {}
     info "aiesim runs done"
     echo ""
   fi
