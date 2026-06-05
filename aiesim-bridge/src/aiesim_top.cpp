@@ -235,17 +235,36 @@ void aiesim_top::spawn_egress_drains() {
             (std::string("noc_drain_") + std::to_string(i)).c_str());
     }
 
-    // shim->PL egress (MEStream64). On PL-shim columns the shim output stream
-    // (incl. the TCT) routes here; left unconsumed it back-pressures the shim
-    // DMA exactly like the NoC egress.
+    // shim->PL egress (MEStream64). On a real all-NoC NPU these ports must stay
+    // EMPTY -- nothing should route to PL. Any packet arriving here is a routing-
+    // fidelity bug (today: the shim DMA's TCT/control stream is misrouted to PL
+    // instead of NoC). XDNA_AIESIM_PL_PANIC turns the drain into a fail-fast
+    // guard: abort loudly on the first PL packet, so a faulty run dies at the
+    // exact misrouting point instead of grinding a long sim, and we are forced to
+    // fix the routing until PL is provably empty. Default (unset) drains and
+    // discards so kernels still run despite the known misroute (see fd2821b).
+    const bool pl_panic = std::getenv("XDNA_AIESIM_PL_PANIC") != nullptr;
     const size_t n_pl = me->ms_pl_stream.size();
     for (size_t i = 0; i < n_pl; ++i) {
         sc_core::sc_spawn(
-            [me, i, trace] {
+            [me, i, trace, pl_panic] {
                 uint64_t pkts = 0;
                 for (;;) {
                     MEStreamData64 d = me->ms_pl_stream[i]->get();
                     ++pkts;
+                    if (pl_panic) {
+                        std::fprintf(stderr,
+                            "\n[PL-PANIC] data entered shim->PL egress port %zu at %s\n"
+                            "[PL-PANIC]   on an all-NoC NPU every PL port must stay empty --\n"
+                            "[PL-PANIC]   this is a routing-fidelity bug (TCT/control stream\n"
+                            "[PL-PANIC]   misrouted to PL instead of NoC).\n"
+                            "[PL-PANIC]   pkt#%llu d0=0x%08x d1=0x%08x tlast=%d\n"
+                            "[PL-PANIC] aborting (unset XDNA_AIESIM_PL_PANIC to drain+discard).\n\n",
+                            i, sc_core::sc_time_stamp().to_string().c_str(),
+                            (unsigned long long)pkts, d.data[0], d.data[1], d.tlast ? 1 : 0);
+                        std::fflush(stderr);
+                        std::abort();
+                    }
                     if (trace && (pkts % 64 == 0 || pkts <= 2 || d.tlast)) {
                         std::fprintf(stderr,
                                      "[pl-drain %zu] %llu pkts (d0=0x%08x d1=0x%08x tlast=%d)\n",
