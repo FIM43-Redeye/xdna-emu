@@ -10,6 +10,7 @@
 #include <utils/xtlm_aximm_initiator_stub.h>
 
 #include "math_engine_base.h"  // the closed cluster ABI (aietools, build-time ref)
+#include "cluster_clone_patch.h"
 #include "ddr_target.h"
 #include "ps_bridge.h"
 
@@ -49,6 +50,12 @@ aiesim_top::aiesim_top(sc_core::sc_module_name name, const char* arch, const cha
     if (!cluster_lib_) {
         throw std::runtime_error(std::string("aiesim_top: dlopen ") + lib + ": " + dlerror());
     }
+
+    // Work around the cluster model's send_response object-reuse bug so control-
+    // packet READ-RESPONSES route (see cluster_clone_patch.h). Must run before the
+    // first sc_start (send_response only fires during simulation). Fail-safe + arch-
+    // gated + default-on; announces on stderr. LOCAL-ONLY runtime patch.
+    aiesim::install_clone_patch(cluster_lib_, arch_s.c_str());
 
     dlerror();  // clear
     auto factory = reinterpret_cast<create_math_engine_fn>(
