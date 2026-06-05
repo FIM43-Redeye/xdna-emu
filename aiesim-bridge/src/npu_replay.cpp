@@ -25,21 +25,23 @@ enum NpuTag : uint8_t {
     SYNC = 6,         // [channel u8][column u8][direction u8][col_num u8][row u8][row_num u8]
 };
 
-// Sync (dma_await_task) "channel done" mask for the AIE-ML DMA channel status
-// register, derived from aie-rt _XAieMl_DmaWaitForDone (xaie_dma_aieml.c) + the
-// xaiemlgbl register layout:
-//   TaskQSize[22:20]      0x700000
-//   ChannelRunning[19]    0x080000
-//   StalledTCT[5]         0x000020
-//   StalledStreamStarve[4]0x000010
-//   StalledLockRel[3]     0x000008
-//   StalledLockAcq[2]     0x000004
-// Done == all of these clear (queue empty, not running, not stalled). The
-// TaskQSize bits also defeat the false-idle race a queued-but-not-started task
-// would otherwise cause (no need for the interpreter's "started" flag).
-// (NB: bit 19 ChannelRunning MUST be in the mask -- omitting it makes a running
-// channel read as "done" and the Sync returns before the DMA finishes.)
-constexpr uint32_t kDmaDoneMask = 0x0078003Cu;
+// Sync (dma_await_task) completion detection for the AIE-ML DMA channel status
+// register. The runtime-sequence Sync is a Task-Completion-Token wait, which the
+// interpreter models in is_sync_satisfied (src/npu/executor.rs) by watching the
+// Channel_Running bit edge -- not an aie-rt-style "wait for done" poll. The
+// decisive signal is Channel_Running (AM025 DMA_*_Status_0[19]) going 1 then 0
+// (started-then-idle); a channel already idle with an empty Task_Queue at the
+// first poll is fast completion. Task_Queue_Size[22:20] guards the
+// never-started false-idle race.
+//
+// The stall flags (StalledTCT[5], StalledLockRel[3], StalledStreamStarve[4],
+// StalledLockAcq[2]) are deliberately EXCLUDED from the done decision: a channel
+// that finished its transfer but parks in a TCT/lock stall (the completion-token
+// FIFO the bridge never drains) is data-done. Including them -- the old
+// kDmaDoneMask=0x0078003C, modeled on aie-rt's poll-style DmaWaitForDone -- hung
+// TCT-heavy (sync_task_complete_token) and BD-reuse (shim_dma_bd_reuse) kernels.
+constexpr uint32_t kChannelRunningBit = 0x00080000u;  // Channel_Running[19]
+constexpr uint32_t kTaskQueueSizeMask = 0x00700000u;  // Task_Queue_Size[22:20]
 
 // Poll bound for Sync, like cdo_replay's MASK_POLL: advance the kernel in quanta
 // so a never-completing DMA fails instead of hanging. The cluster's DMA runs in
@@ -136,12 +138,23 @@ void rate_tick(const char* where, uint64_t poll_elapsed_ns) {
                  wall_s > 0 && sim_us > 0 ? (wall_s * 1000.0) / sim_us : 0.0);
 }
 
-// Poll (reg & kDmaDoneMask) == 0 -- the DMA channel is idle, queue-empty, not
-// stalled. Advances sim time between checks so the cluster's DMA/cores progress.
+// Mirror the interpreter's is_sync_satisfied: a sync is satisfied once
+// Channel_Running has been observed high then low (started-then-idle), or the
+// channel is already idle with an empty task queue at first poll (fast
+// completion). Stall flags are excluded -- see kChannelRunningBit above.
+// Advances sim time in quanta so a never-completing channel fails (returns
+// false) instead of hanging; the cluster's DMA runs in real sim-time, so this
+// only trips on a genuine stall.
 bool dma_wait(ps_bridge* ps, uint64_t status_addr) {
     uint64_t elapsed = 0;
+    bool started = false;
     for (;;) {
-        if ((ps->read32(status_addr) & kDmaDoneMask) == 0) return true;
+        const uint32_t st = ps->read32(status_addr);
+        if (st & kChannelRunningBit) {
+            started = true;  // running -- keep waiting for it to drain
+        } else if (started || (st & kTaskQueueSizeMask) == 0) {
+            return true;     // started-then-idle, or already-drained
+        }
         if (elapsed >= poll_max_ns()) return false;
         sc_core::wait(sc_core::sc_time(double(kPollQuantumNs), sc_core::SC_NS));
         elapsed += kPollQuantumNs;
@@ -401,9 +414,10 @@ int npu_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len, uint8_t start
                     uint32_t first = ps->read32(status_addr);
                     std::fprintf(stderr,
                                  "[npu_replay] Sync col=%u row=%u dir=%u ch=%u status=0x%llx "
-                                 "first_read=0x%08x (done_mask&=0x%x)\n",
+                                 "first_read=0x%08x (running&=0x%x qsize&=0x%x)\n",
                                  column, row, direction, channel,
-                                 (unsigned long long)status_addr, first, first & kDmaDoneMask);
+                                 (unsigned long long)status_addr, first,
+                                 first & kChannelRunningBit, first & kTaskQueueSizeMask);
                 }
                 probe_tile(ps, start_col, "sync");
                 if (!dma_wait(ps, status_addr)) {
