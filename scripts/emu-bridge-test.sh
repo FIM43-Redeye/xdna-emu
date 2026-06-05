@@ -1269,6 +1269,29 @@ get_run_variants() {
     fi
   done < "$lit_file"
 
+  # Dedup variant names, preserving order. A test can list both an npu1
+  # ./test.exe run and an npu1 %python test.py run for the same logical case;
+  # _variant_from_cmd names both "" (no distinguishing arg), which would enqueue
+  # -- and run -- the kernel twice (both resolving to the first npu1 command).
+  # Collapsing identical variant names keeps one job per distinct variant.
+  # NB: bash assoc arrays reject an empty-string key ("bad array subscript"),
+  # and the empty variant is precisely the duplicated one -- track it separately.
+  local -a _uniq_variants=()
+  local -A _seen_variant=()
+  local _seen_empty=false
+  local _vv
+  for _vv in "${variants[@]}"; do
+    if [[ -z "$_vv" ]]; then
+      $_seen_empty && continue
+      _seen_empty=true
+    else
+      [[ -n "${_seen_variant[$_vv]+x}" ]] && continue
+      _seen_variant["$_vv"]=1
+    fi
+    _uniq_variants+=("$_vv")
+  done
+  variants=("${_uniq_variants[@]}")
+
   if [[ ${#variants[@]} -le 1 ]]; then
     # Zero or one run command: single-variant test (empty variant name).
     echo ""
