@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "addr_remap.h"
+#include "ddr_target.h"
 #include "ps_bridge.h"
 
 namespace aiesim {
@@ -43,21 +44,41 @@ enum NpuTag : uint8_t {
 constexpr uint32_t kChannelRunningBit = 0x00080000u;  // Channel_Running[19]
 constexpr uint32_t kTaskQueueSizeMask = 0x00700000u;  // Task_Queue_Size[22:20]
 
-// Poll bound for Sync, like cdo_replay's MASK_POLL: advance the kernel in quanta
-// so a never-completing DMA fails instead of hanging. The cluster's DMA runs in
-// real sim-time, so this only ever trips on a genuine stall.
-// The cluster sim advances ~1 sim-ns per ~1 ms wall, so the cap doubles as a
-// wall-clock bound: 100k ns ~ 2 min before a stuck (starving) channel gives up.
-// A real small DMA completes in a few thousand sim-ns. Tunable.
+// Sync advances the kernel in quanta so the cluster's DMA/cores make concurrent
+// progress while we poll. Completion is decided by quiescence, not a fixed
+// sim-time cap (see dma_wait): a single long BD (e.g. shim_dma_bd_reuse's 5120-
+// word 2D-wrap recv) keeps Channel_Running=1 for its WHOLE duration, so a fixed
+// cap can't tell "slow but progressing" from "wedged" -- it just cuts slow
+// transfers off mid-flight. Instead we watch the shim-DMA transaction counter
+// (ddr_target::dma_txn_count, the same "DMAs drained" signal the run() early-exit
+// uses): as long as it advances, the transfer is live; only when it stalls for a
+// settle window with the channel still not done is the DMA genuinely wedged.
 constexpr uint64_t kPollQuantumNs = 256;
-// Default cap; XDNA_AIESIM_POLL_MAX_NS overrides (e.g. a small value for a
-// fast-fail timeout probe when debugging a known stall).
-inline uint64_t poll_max_ns() {
-    if (const char* e = std::getenv("XDNA_AIESIM_POLL_MAX_NS")) {
+
+// Settle window: quanta of no shim-DMA transaction progress before a still-
+// running channel is declared wedged. Must exceed the longest legitimate gap
+// between transactions during a slow transfer (the core passthrough's lock
+// ping-pong between consecutive output bursts). XDNA_AIESIM_SETTLE_QUANTA
+// overrides. Default 512 (~131k sim-ns) is generous: a true wedge costs that
+// much extra sim-time before giving up, but a live transfer never false-trips.
+inline uint64_t settle_quanta() {
+    if (const char* e = std::getenv("XDNA_AIESIM_SETTLE_QUANTA")) {
         const uint64_t v = std::strtoull(e, nullptr, 0);
         if (v) return v;
     }
-    return 100'000;
+    return 512;
+}
+
+// Hard safety backstop on total Sync sim-time, so a pathological channel that
+// dribbles one transaction just inside every settle window can't loop forever.
+// Far above any real transfer; XDNA_AIESIM_POLL_MAX_NS overrides (e.g. a small
+// value for a fast-fail timeout probe when debugging a known stall). 0 from the
+// env means "no fixed cap -- rely on quiescence alone".
+inline uint64_t poll_max_ns() {
+    if (const char* e = std::getenv("XDNA_AIESIM_POLL_MAX_NS")) {
+        return std::strtoull(e, nullptr, 0);  // honor 0 as "no cap"
+    }
+    return 50'000'000;  // ~50 ms sim-time backstop
 }
 
 // AIE-ML DMA channel STATUS register offset within a tile, by tile-type (from
@@ -138,26 +159,68 @@ void rate_tick(const char* where, uint64_t poll_elapsed_ns) {
                  wall_s > 0 && sim_us > 0 ? (wall_s * 1000.0) / sim_us : 0.0);
 }
 
-// Mirror the interpreter's is_sync_satisfied: a sync is satisfied once
-// Channel_Running has been observed high then low (started-then-idle), or the
-// channel is already idle with an empty task queue at first poll (fast
-// completion). Stall flags are excluded -- see kChannelRunningBit above.
-// Advances sim time in quanta so a never-completing channel fails (returns
-// false) instead of hanging; the cluster's DMA runs in real sim-time, so this
-// only trips on a genuine stall.
-bool dma_wait(ps_bridge* ps, uint64_t status_addr) {
+// Mirror the interpreter's is_sync_satisfied for SUCCESS, but use DMA quiescence
+// (not a fixed sim-time cap) to detect a genuine wedge.
+//
+// SUCCESS: Channel_Running observed high then low (started-then-idle), or the
+// channel already idle with an empty task queue at first poll (fast completion).
+// Stall flags are excluded -- see kChannelRunningBit above.
+//
+// WEDGE: the shim-DMA transaction counter (ddr_target::dma_txn_count) has not
+// advanced for a settle window while the channel is still not done. A single
+// long BD holds Channel_Running=1 for its entire duration, so the status alone
+// cannot distinguish "slow but progressing" from "stuck" -- only the transaction
+// counter can. As long as the DMA keeps committing reads/writes to host DDR the
+// transfer is live and we keep waiting, with no artificial deadline. (`ddr` may
+// be null in degenerate setups; then we fall back to the sim-time backstop only.)
+bool dma_wait(ps_bridge* ps, ddr_target* ddr, uint64_t status_addr) {
     uint64_t elapsed = 0;
     bool started = false;
+    const bool trace = std::getenv("XDNA_AIESIM_TRACE") != nullptr;
+    uint64_t since_log = 0;
+    uint32_t prev_st = 0xFFFFFFFFu;
+    uint64_t last_txns = ddr ? ddr->dma_txn_count() : 0;
+    uint64_t idle_quanta = 0;
     for (;;) {
         const uint32_t st = ps->read32(status_addr);
+        if (trace && (st != prev_st || since_log >= 16384)) {
+            std::fprintf(stderr,
+                         "[dma_wait@%lluns] status=0x%08x (running=%u curbd=%u qsize=%u state=%u) "
+                         "txns=%llu idle=%llu\n",
+                         (unsigned long long)elapsed, st,
+                         (st & kChannelRunningBit) ? 1u : 0u, (st >> 24) & 0xFu,
+                         (st >> 20) & 0x7u, st & 0x3u,
+                         (unsigned long long)(ddr ? ddr->dma_txn_count() : 0),
+                         (unsigned long long)idle_quanta);
+            prev_st = st;
+            since_log = 0;
+        }
         if (st & kChannelRunningBit) {
             started = true;  // running -- keep waiting for it to drain
         } else if (started || (st & kTaskQueueSizeMask) == 0) {
             return true;     // started-then-idle, or already-drained
         }
-        if (elapsed >= poll_max_ns()) return false;
+        // Quiescence-based wedge detection: progress resets the idle counter;
+        // a full settle window with no shim-DMA activity = genuinely stuck.
+        if (ddr) {
+            const uint64_t txns = ddr->dma_txn_count();
+            if (txns != last_txns) {
+                last_txns = txns;
+                idle_quanta = 0;
+            } else if (++idle_quanta >= settle_quanta()) {
+                if (trace)
+                    std::fprintf(stderr,
+                                 "[dma_wait] quiescent wedge at %lluns: status=0x%08x txns=%llu\n",
+                                 (unsigned long long)elapsed, st, (unsigned long long)txns);
+                return false;
+            }
+        }
+        // Hard sim-time backstop (0 = disabled, rely on quiescence alone).
+        const uint64_t cap = poll_max_ns();
+        if (cap && elapsed >= cap) return false;
         sc_core::wait(sc_core::sc_time(double(kPollQuantumNs), sc_core::SC_NS));
         elapsed += kPollQuantumNs;
+        since_log += kPollQuantumNs;
         rate_tick("dma_wait", elapsed);
     }
 }
@@ -308,7 +371,8 @@ void probe_tile(ps_bridge* ps, uint8_t start_col, const char* tag) {
 
 }  // namespace
 
-int npu_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len, uint8_t start_col,
+int npu_replay(ps_bridge* ps, ddr_target* ddr, const uint8_t* ops, std::size_t len,
+               uint8_t start_col,
                const std::vector<std::pair<uint64_t, std::size_t>>& host_buffers) {
     Reader r{ops, len};
     probe_tile(ps, start_col, "entry");
@@ -420,7 +484,7 @@ int npu_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len, uint8_t start
                                  first & kChannelRunningBit, first & kTaskQueueSizeMask);
                 }
                 probe_tile(ps, start_col, "sync");
-                if (!dma_wait(ps, status_addr)) {
+                if (!dma_wait(ps, ddr, status_addr)) {
                     std::fprintf(stderr,
                                  "[npu_replay] Sync timeout: col=%u row=%u dir=%u ch=%u "
                                  "status=0x%llx\n",

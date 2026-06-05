@@ -22,14 +22,18 @@
 #include <vector>
 
 class ps_bridge;
+class ddr_target;
 
 namespace aiesim {
 
 // Decode + replay an NPU runtime-sequence op-stream. `start_col` is the
 // partition's physical start column; `host_buffers` are the registered (DDR
-// addr, size) regions DdrPatch resolves against (arg_idx -> buffer). Returns 0
+// addr, size) regions DdrPatch resolves against (arg_idx -> buffer). `ddr` is
+// the host DDR model bound to the shim-DMA masters -- Sync watches its
+// transaction counter for quiescence-based completion (see dma_wait). Returns 0
 // on success; 1 on decode error, DdrPatch out-of-range, or Sync timeout.
-int npu_replay(ps_bridge* ps, const uint8_t* ops, std::size_t len, uint8_t start_col,
+int npu_replay(ps_bridge* ps, ddr_target* ddr, const uint8_t* ops, std::size_t len,
+               uint8_t start_col,
                const std::vector<std::pair<uint64_t, std::size_t>>& host_buffers);
 
 }  // namespace aiesim

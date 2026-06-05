@@ -143,7 +143,8 @@ void execute(aiesim_top* top, aiesim::Command* c) {
             c->reply_int = aiesim::cdo_replay(ps, c->in_ptr, c->len, g_start_col);
             break;
         case aiesim::Command::EXEC_NPU:
-            c->reply_int = aiesim::npu_replay(ps, c->in_ptr, c->len, g_start_col, g_host_buffers);
+            c->reply_int = aiesim::npu_replay(ps, top->ddr(), c->in_ptr, c->len, g_start_col,
+                                              g_host_buffers);
             break;
         case aiesim::Command::SET_START_COL:
             // XDNA_AIESIM_START_COL overrides the xclbin's start_col -- a debug
