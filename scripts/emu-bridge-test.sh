@@ -2384,10 +2384,11 @@ export -f run_one_bridge
 # Mirrors run_one_bridge but routes the SAME test.exe -> XRT -> plugin flow to
 # the aiesim backend (XDNA_BACKEND=aiesim) instead of the interpreter. The
 # plugin dlopens the same libxdna_emu_<profile>.so; the feature-gated aiesim
-# code is selected purely at runtime by XDNA_BACKEND. Correctness-only for now
-# (no trace/cycle pipeline) -- this is the calibration-first slice: prove aiesim
-# agrees with real Phoenix on a kernel before building out the full report
-# matrix. Writes .aiesim.{result,log} alongside the .bridge / .hw files.
+# code is selected purely at runtime by XDNA_BACKEND. Correctness-only (no
+# trace/cycle pipeline): the verdict feeds the AIESIM report column and the
+# aiesim-vs-HW calibration check, which together turn the three-way agreement
+# into the Phoenix oracle's calibration signal. Writes .aiesim.{result,log}
+# alongside the .bridge / .hw files.
 run_one_aiesim() {
   local name="$1"
   local compiler="${2:-}"
@@ -2587,6 +2588,8 @@ print_report() {
   [[ "$WITH_CYCLE_DIFF" == "true" ]] && has_cycle=true
   local has_mode2=false
   [[ "$MODE2" == "true" ]] && has_mode2=true
+  local has_aiesim=false
+  [[ "$RUN_AIESIM_EMU" == "true" ]] && has_aiesim=true
 
   local compilers
   read -ra compilers <<< "$COMPILERS_STR"
@@ -2602,6 +2605,7 @@ print_report() {
   # Build dynamic header based on active compilers and modes.
   local name_width=50
   local col_width=10
+  local aiesim_col_width=12  # wider: "${label}/AIESIM" runs to 12 chars
 
   # Print header.
   printf "%-${name_width}s" "TEST"
@@ -2612,6 +2616,9 @@ print_report() {
       printf "  %-${col_width}s" "${label}/HW"
     fi
     printf "  %-${col_width}s" "${label}/EMU"
+    if $has_aiesim; then
+      printf "  %-${aiesim_col_width}s" "${label}/AIESIM"
+    fi
   done
   if $has_trace; then
     for compiler in "${compilers[@]}"; do
@@ -2643,6 +2650,9 @@ print_report() {
       printf "  %-${col_width}s" "$(printf '%0.s-' $(seq 1 $col_width))"
     fi
     printf "  %-${col_width}s" "$(printf '%0.s-' $(seq 1 $col_width))"
+    if $has_aiesim; then
+      printf "  %-${aiesim_col_width}s" "$(printf '%0.s-' $(seq 1 $aiesim_col_width))"
+    fi
   done
   if $has_trace; then
     for _ in "${compilers[@]}"; do
@@ -2686,6 +2696,15 @@ print_report() {
     hw_xfail[$compiler]=0
     hw_xpass[$compiler]=0
   done
+  # aiesim (third comparison side) counters.
+  declare -A aiesim_pass aiesim_fail aiesim_skip aiesim_timeout aiesim_emumiss
+  for compiler in "${compilers[@]}"; do
+    aiesim_pass[$compiler]=0
+    aiesim_fail[$compiler]=0
+    aiesim_skip[$compiler]=0
+    aiesim_timeout[$compiler]=0
+    aiesim_emumiss[$compiler]=0
+  done
   declare -A trace_clean trace_diverge trace_error trace_skip
   for compiler in "${compilers[@]}"; do
     trace_clean[$compiler]=0
@@ -2709,6 +2728,11 @@ print_report() {
   declare -a cycle_offenders=()   # lines for the summary block
   declare -a cycle_empty_list=()
   declare -a cycle_no_core_list=()
+
+  # aiesim-vs-HW calibration mismatches: where the oracle disagrees with real
+  # silicon on PASS-ness (both sides actually ran). This is THE signal that
+  # aiesim is drifting from Phoenix -- the whole reason for the third column.
+  declare -a aiesim_mismatch=()
 
   # Mode-2 counters (Task 305).
   declare -A mode2_pass mode2_fail mode2_skip mode2_error
@@ -2761,6 +2785,7 @@ print_report() {
           printf "  %-${col_width}s" "$skip_label"
         fi
         printf "  %-${col_width}s" "$skip_label"
+        $has_aiesim && printf "  %-${aiesim_col_width}s" "$skip_label"
         continue
       fi
 
@@ -2778,6 +2803,7 @@ print_report() {
           printf "  %-${col_width}s" "$_fail_label"
         fi
         printf "  %-${col_width}s" "$_fail_label"
+        $has_aiesim && printf "  %-${aiesim_col_width}s" "$_fail_label"
         continue
       fi
 
@@ -2827,6 +2853,35 @@ print_report() {
         SKIP*)    bridge_skip[$compiler]=$(( ${bridge_skip[$compiler]} + 1 )) ;;
         *)        bridge_fail[$compiler]=$(( ${bridge_fail[$compiler]} + 1 )) ;;
       esac
+
+      # Read aiesim result (third comparison side, variant-aware).
+      if $has_aiesim; then
+        local ar="SKIP"
+        [[ -f "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.aiesim.result" ]] && \
+          ar="$(< "$RESULTS_DIR/${safe}${vsuffix}.${compiler}.aiesim.result")"
+        printf "  %-${aiesim_col_width}s" "$ar"
+        case "$ar" in
+          PASS)     aiesim_pass[$compiler]=$(( ${aiesim_pass[$compiler]} + 1 )) ;;
+          TIMEOUT)  aiesim_timeout[$compiler]=$(( ${aiesim_timeout[$compiler]} + 1 ))
+                    aiesim_fail[$compiler]=$(( ${aiesim_fail[$compiler]} + 1 )) ;;
+          EMU_MISS) aiesim_emumiss[$compiler]=$(( ${aiesim_emumiss[$compiler]} + 1 ))
+                    aiesim_fail[$compiler]=$(( ${aiesim_fail[$compiler]} + 1 )) ;;
+          SKIP*)    aiesim_skip[$compiler]=$(( ${aiesim_skip[$compiler]} + 1 )) ;;
+          *)        aiesim_fail[$compiler]=$(( ${aiesim_fail[$compiler]} + 1 )) ;;
+        esac
+
+        # Calibration cross-check: only meaningful when HW also ran and both
+        # sides produced a real (non-SKIP) verdict. Disagreement on PASS-ness
+        # is an oracle-drift flag.
+        if [[ "$run_hw" == "true" && "$hr" != SKIP* && "$ar" != SKIP* ]]; then
+          local _hw_pass=false _ai_pass=false
+          [[ "$hr" == "PASS" ]] && _hw_pass=true
+          [[ "$ar" == "PASS" ]] && _ai_pass=true
+          if [[ "$_hw_pass" != "$_ai_pass" ]]; then
+            aiesim_mismatch+=("  $display_name ($compiler): HW=$hr AIESIM=$ar")
+          fi
+        fi
+      fi
     done
 
     # Trace columns (per-compiler, variant-aware).
@@ -3018,6 +3073,23 @@ print_report() {
       label="$(echo "$compiler" | sed 's/./\U&/')"
       echo "${label} trace: ${trace_clean[$compiler]} clean, ${trace_diverge[$compiler]} diverge, ${trace_error[$compiler]} error, ${trace_skip[$compiler]} skip"
     done
+  fi
+  if $has_aiesim; then
+    for compiler in "${compilers[@]}"; do
+      local label
+      label="$(echo "$compiler" | sed 's/./\U&/')"
+      local aiesim_extra=""
+      [[ ${aiesim_timeout[$compiler]} -gt 0 ]] && aiesim_extra+=" (${aiesim_timeout[$compiler]} timeout)"
+      [[ ${aiesim_emumiss[$compiler]} -gt 0 ]] && aiesim_extra+=" (${aiesim_emumiss[$compiler]} EMU_MISS)"
+      echo "${label} aiesim: ${aiesim_pass[$compiler]} pass, ${aiesim_fail[$compiler]} fail, ${aiesim_skip[$compiler]} skip${aiesim_extra}"
+    done
+    if [[ ${#aiesim_mismatch[@]} -gt 0 ]]; then
+      echo ""
+      echo "  !! aiesim-vs-HW calibration mismatch (${#aiesim_mismatch[@]}):"
+      printf '%s\n' "${aiesim_mismatch[@]}"
+    else
+      [[ "$run_hw" == "true" ]] && echo "  aiesim-vs-HW: in calibration (no PASS-ness mismatches)"
+    fi
   fi
 
   if $has_cycle; then
@@ -3520,9 +3592,9 @@ main() {
   # ---- aiesim backend pass (third comparison side, opt-in) ---------------
   # Runs AFTER the interpreter EMU pass. aiesim is pure simulation (no real
   # NPU), so it does not contend with hardware, but it is slow and
-  # memory-heavy -- run serially. Correctness-only for now (calibration-first);
-  # the full report-matrix column lands once aiesim fidelity vs Phoenix is
-  # confirmed on a calibration kernel.
+  # memory-heavy -- run serially. Correctness-only (no trace/cycle pipeline);
+  # results feed the AIESIM report-matrix column + the aiesim-vs-HW calibration
+  # mismatch check in print_report.
   if $RUN_AIESIM_EMU; then
     info "aiesim: running ${#all_jobs[@]} job(s) (serial)"
     for entry in "${all_jobs[@]}"; do
