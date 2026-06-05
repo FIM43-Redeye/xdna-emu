@@ -43,6 +43,11 @@ enum NpuTag : uint8_t {
 // TCT-heavy (sync_task_complete_token) and BD-reuse (shim_dma_bd_reuse) kernels.
 constexpr uint32_t kChannelRunningBit = 0x00080000u;  // Channel_Running[19]
 constexpr uint32_t kTaskQueueSizeMask = 0x00700000u;  // Task_Queue_Size[22:20]
+// Task_Queue_Size MSB (bit 22 on aie-ml). aie-rt's _XAieMl_DmaWaitForBdTaskQueue
+// polls this bit before pushing a BD to the start queue: set => the depth-4
+// (StartQSizeMax) queue is full. We replicate that pacing before task-queue
+// pushes (see WRITE32) so we don't overrun the cluster model's queue.
+constexpr uint32_t kTaskQueueFullBit = 0x00400000u;
 
 // Sync advances the kernel in quanta so the cluster's DMA/cores make concurrent
 // progress while we poll. Completion is decided by quiescence, not a fixed
@@ -101,6 +106,23 @@ uint32_t dma_status_offset(uint8_t npu1_row, uint8_t direction, uint8_t channel)
     }
     const uint32_t base = (direction == 0) ? s2mm_base : mm2s_base;
     return base + static_cast<uint32_t>(channel) * 4u;
+}
+
+// If a SHIM (row 0) tile-local register offset is a DMA task-queue PUSH register,
+// return the matching channel-status register offset (for the Task_Queue_Size
+// poll); otherwise 0. Shim task queues (per aie-rt / AM025): S2MM ch0/1 =
+// 0x1D204/0x1D20C, MM2S ch0/1 = 0x1D214/0x1D21C; each maps to its channel status
+// via dma_status_offset(0, dir, ch). Runtime-sequence dma_start_task pushes only
+// ever target the shim, so this shim-only mapping covers the replayed op stream
+// (memtile/compute DMAs are CDO-configured and self-looping, never host-pushed).
+uint32_t shim_taskqueue_status_off(uint32_t off) {
+    switch (off) {
+        case 0x1D204: return dma_status_offset(0, 0, 0);  // S2MM ch0 -> 0x1D220
+        case 0x1D20C: return dma_status_offset(0, 0, 1);  // S2MM ch1 -> 0x1D224
+        case 0x1D214: return dma_status_offset(0, 1, 0);  // MM2S ch0 -> 0x1D228
+        case 0x1D21C: return dma_status_offset(0, 1, 1);  // MM2S ch1 -> 0x1D22C
+        default:      return 0;
+    }
 }
 
 // Resolve a DdrPatch arg_idx to its DDR base address. For arg_idx within the
@@ -277,6 +299,22 @@ void probe_tile(ps_bridge* ps, uint8_t start_col, const char* tag) {
                  "mm2s0_ctrl=0x%08x mm2s0_q=0x%08x\n",
                  tag, rd(0, 0x1D228), rd(0, 0x1D220), rd(0, 0x1D000), rd(0, 0x1D004), rd(0, 0x1D008),
                  rd(0, 0x1D210), rd(0, 0x1D214));
+    // Shim BD8 full descriptor (the 2D-wrap S2MM recv in shim_dma_bd_reuse). Base
+    // 0x1D100, 8 words @ stride 4 (AM025 DMA_BD8_0..7). Decode: W0=Buffer_Length,
+    // W3[29:20]=D0_Wrap W3[19:0]=D0_Step(-1), W4[29:20]=D1_Wrap W4[19:0]=D1_Step(-1),
+    // W6[25:20]=Iter_Wrap(-1), W7 bit25=Valid bit26=UseNextBD [30:27]=NextBD. Lets
+    // us see whether the cluster received a correct 2D descriptor or a mangled one.
+    {
+        uint32_t b[8];
+        for (int i = 0; i < 8; ++i) b[i] = rd(0, 0x1D100 + uint32_t(i) * 4);
+        std::fprintf(stderr,
+                     "[probe %s] shim bd8 W0-7=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x "
+                     "| len=%u d0wrap=%u d0step=%u d1wrap=%u d1step=%u iterwrap=%u valid=%u usenext=%u next=%u\n",
+                     tag, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                     b[0], (b[3] >> 20) & 0x3FF, (b[3] & 0xFFFFF) + 1,
+                     (b[4] >> 20) & 0x3FF, (b[4] & 0xFFFFF) + 1, ((b[6] >> 20) & 0x3F) + 1,
+                     (b[7] >> 25) & 1u, (b[7] >> 26) & 1u, (b[7] >> 27) & 0xFu);
+    }
     // Did ANY beats land at shim S2MM ch0 (@ctrl0, the control-response sink)?
     // write_count 0x1DF18 / finish_tlast_fifo 0x1DF20 per the device DMA def. Also
     // the NoC-interface mux (0x1F000) / demux (0x1F004) config that steers SS south
@@ -382,6 +420,34 @@ int npu_replay(ps_bridge* ps, ddr_target* ddr, const uint8_t* ops, std::size_t l
             case WRITE32: {
                 uint32_t a = r.u32(), v = r.u32();
                 if (r.err) break;
+                // Task-queue PUSH pacing (faithful to aie-rt
+                // _XAieMl_DmaWaitForBdTaskQueue): the shim DMA start queue is
+                // depth 4 (StartQSizeMax). On real hardware the MMIO write to a
+                // full queue stalls, so the driver fires dma_start_task back to
+                // back and the hardware paces it. The cluster model instead
+                // accepts-and-DROPS overflow pushes, so a batch of >5 fire-and-
+                // forget tasks silently loses every task past the 5th (4 queued +
+                // 1 in-flight) -- exactly the bd_id 5,6,7 drops seen on
+                // shim_dma_bd_reuse. We restore the hardware pacing: before a
+                // task-queue push, poll the channel's Task_Queue_Size MSB and
+                // advance sim-time until the queue has room.
+                if (const uint32_t row = (a >> kRowShift) & 0x1Fu; row == 0) {
+                    if (const uint32_t qstat = shim_taskqueue_status_off(a & 0xFFFFFu)) {
+                        const uint64_t stat_addr =
+                            cluster_addr((a & ~uint64_t(0xFFFFF)) | qstat, start_col);
+                        uint64_t waited = 0;
+                        while (ps->read32(stat_addr) & kTaskQueueFullBit) {
+                            if (waited >= poll_max_ns()) {
+                                std::fprintf(stderr,
+                                             "[npu_replay] task-queue pace timeout: off=0x%05x\n",
+                                             a & 0xFFFFFu);
+                                break;
+                            }
+                            sc_core::wait(sc_core::sc_time(double(kPollQuantumNs), sc_core::SC_NS));
+                            waited += kPollQuantumNs;
+                        }
+                    }
+                }
                 // Register and data-memory writes both go through the config
                 // MMIO socket; the cluster decodes the tile address internally
                 // (no DM-vs-register split needed on our side).
@@ -392,10 +458,16 @@ int npu_replay(ps_bridge* ps, ddr_target* ddr, const uint8_t* ops, std::size_t l
                 uint32_t a = r.u32(), count = r.u32();
                 if (r.err || !r.need(std::size_t(count) * 4)) { r.err = true; break; }
                 const uint64_t base = cluster_addr(a, start_col);
+                const bool trace_bd = std::getenv("XDNA_AIESIM_TRACE") &&
+                                      (a & 0xFFFFFu) >= 0x1D100u && (a & 0xFFFFFu) < 0x1D120u;
+                if (trace_bd)
+                    std::fprintf(stderr, "[npu_replay] BLOCK_WRITE BD8 a=0x%05x count=%u:", a & 0xFFFFFu, count);
                 for (uint32_t k = 0; k < count; ++k) {
                     uint32_t w = r.u32();
                     ps->write32(base + k * 4u, w);
+                    if (trace_bd) std::fprintf(stderr, " W%u=0x%08x", k, w);
                 }
+                if (trace_bd) std::fprintf(stderr, "\n");
                 break;
             }
             case MASK_WRITE: {
@@ -491,6 +563,33 @@ int npu_replay(ps_bridge* ps, ddr_target* ddr, const uint8_t* ops, std::size_t l
                                  column, row, direction, channel,
                                  (unsigned long long)status_addr);
                     probe_tile(ps, start_col, "timeout");
+                    if (ddr && std::getenv("XDNA_AIESIM_TRACE")) {
+                        // Partial-transfer discriminator: how many 256-word
+                        // slices of each host buffer physically reached DDR at the
+                        // wedge? (Unwritten sparse pages read as 0.) Distinguishes
+                        // a clean completion stall (all slices present, only the
+                        // token missing) from dropped data upstream -- e.g. the
+                        // start-queue overrun that left shim_dma_bd_reuse 6 slices
+                        // short before the task-queue pacing above was added.
+                        for (std::size_t bi = 0; bi < host_buffers.size(); ++bi) {
+                            const uint64_t ba = host_buffers[bi].first;
+                            const std::size_t nw = host_buffers[bi].second / 4;
+                            std::size_t filled = 0;
+                            std::fprintf(stderr, "[timeout] hostbuf[%zu]@0x%llx %zuw slices:",
+                                         bi, (unsigned long long)ba, nw);
+                            for (std::size_t s = 0; s * 256 < nw; ++s) {
+                                const std::size_t rem = nw - s * 256;
+                                const std::size_t cnt = rem < 256 ? rem : 256;
+                                uint32_t w[256];
+                                ddr->host_read(ba + uint64_t(s) * 256 * 4, w, cnt * 4);
+                                bool nz = false;
+                                for (std::size_t k = 0; k < cnt; ++k)
+                                    if (w[k]) { nz = true; break; }
+                                if (nz) { ++filled; std::fprintf(stderr, " s%zu=0x%08x", s, w[0]); }
+                            }
+                            std::fprintf(stderr, "  [%zu non-zero]\n", filled);
+                        }
+                    }
                     return 1;
                 }
                 break;
