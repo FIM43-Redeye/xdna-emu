@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
+#include <vector>
 
 #include "addr_remap.h"
 #include "ddr_target.h"
@@ -407,6 +409,108 @@ void probe_tile(ps_bridge* ps, uint8_t start_col, const char* tag) {
     }
 }
 
+// Post-config array settle: model the config->host-submit gap real hardware
+// has for free. After LOAD_CDO enables the cores, on silicon they run until
+// they reach their first synchronization point (a lock/stream stall) BEFORE
+// the host runtime sequence is ever submitted. The bridge otherwise fires
+// every EXEC_NPU register write at the same sim-instant, before the cores have
+// advanced a cycle -- so a runtime write that races a core's pre-lock work
+// lands in the wrong order. The canonical victim is add_maskwrite: its core
+// stores 0x37373737 into input_buffer, then blocks on a lock; the runtime then
+// maskwrites two of those words and releases the lock. On HW (and the
+// interpreter) the maskwrites land on top of the stored values and survive
+// into the core's read; with no settle the bridge applied them first, the
+// core's store then clobbered them, and the masked result was lost.
+//
+// We restore the ordering by advancing sim-time until the cores quiesce.
+// Quiescence signal: per-core program-counter (Core_PC 0x31100) stability. A
+// core stalled on a lock/stream holds a frozen PC; a running core's PC
+// advances. PC-stability is bit-layout-agnostic (no Core_Status stall-bit
+// decoding to get wrong) and is the ground-truth "is this core making
+// progress" signal. We warm up a few quanta so the cores get going, then wait
+// for every enabled core's PC to hold steady for a short window, with a
+// sim-time cap as the backstop. The settle is purely an ordering aid -- if a
+// core never blocks before the host sequence, hitting the cap and proceeding
+// is harmless (the cores keep running concurrently during the sequence, as
+// before). XDNA_AIESIM_POSTCFG_SETTLE=0 disables it (A/B knob).
+void settle_array(ps_bridge* ps, uint8_t start_col) {
+    if (const char* e = std::getenv("XDNA_AIESIM_POSTCFG_SETTLE"))
+        if (std::strcmp(e, "0") == 0) return;
+
+    constexpr uint32_t kCoreCtrl = 0x32000;  // Core_Control (Enable[0])
+    constexpr uint32_t kCorePc = 0x31100;    // Core_PC
+    // NPU1 geometry: 5 columns, compute cores on rows 2..5. Over-scanning is
+    // harmless -- a non-enabled tile reads Core_Control[0]=0 and is skipped, so
+    // the enable check bounds us to the real cores. (Could be device-JSON-
+    // derived later; the emulated device is fixed NPU1 today.)
+    constexpr int kNumCols = 5, kFirstComputeRow = 2, kLastComputeRow = 5;
+
+    auto rd = [&](int col, int row, uint32_t off) -> uint32_t {
+        const uint32_t npu = (uint32_t(col) << kColShift) |
+                             (uint32_t(row) << kRowShift) | off;
+        return ps->read32(cluster_addr(npu, start_col));
+    };
+
+    // Enumerate enabled compute cores once.
+    std::vector<std::pair<int, int>> cores;
+    for (int c = 0; c < kNumCols; ++c)
+        for (int r = kFirstComputeRow; r <= kLastComputeRow; ++r)
+            if (rd(c, r, kCoreCtrl) & 0x1u) cores.emplace_back(c, r);
+    if (cores.empty()) return;  // DMA-only kernel: nothing to settle
+
+    const bool trace = std::getenv("XDNA_AIESIM_TRACE") != nullptr;
+    constexpr uint64_t kWarmupQuanta = 4;  // let cores start before checking
+    constexpr uint64_t kStableQuanta = 2;  // consecutive stable quanta = settled
+    // Backstop for the case where a core never reaches a stable PC -- e.g.
+    // static_L1_init's degenerate empty core (`aie.core { aie.end }`), which the
+    // cluster model runs off the end of its program memory (a stream of
+    // [ERROR:101] PM-bank faults) so its PC never settles. The legit settle
+    // fires via quiescence in a handful of quanta (real cores block on their
+    // input lock within a few hundred cycles); this only bounds the non-
+    // quiescing case. Kept generous enough for any real staggered-blocking core
+    // yet small enough that a degenerate core costs ~tens of sim-us, not the
+    // ~2M cycles (minutes of wall-clock at aiesim's rate) that timed the kernel
+    // out. Hitting it just proceeds -- the cores keep running during the
+    // sequence, as they did before the settle existed.
+    constexpr uint64_t kSettleCapNs = 16'384;  // 64 quanta (~16k cycles)
+
+    auto sample = [&]() {
+        std::vector<uint32_t> pcs;
+        pcs.reserve(cores.size());
+        for (const auto& cr : cores) pcs.push_back(rd(cr.first, cr.second, kCorePc));
+        return pcs;
+    };
+
+    std::vector<uint32_t> prev = sample();
+    uint64_t elapsed = 0, advanced = 0, stable = 0;
+    while (elapsed < kSettleCapNs) {
+        sc_core::wait(sc_core::sc_time(double(kPollQuantumNs), sc_core::SC_NS));
+        elapsed += kPollQuantumNs;
+        ++advanced;
+        std::vector<uint32_t> cur = sample();
+        if (advanced <= kWarmupQuanta) {  // skip the "not started yet" window
+            prev = std::move(cur);
+            continue;
+        }
+        if (cur == prev) {
+            if (++stable >= kStableQuanta) {
+                if (trace)
+                    std::fprintf(stderr,
+                                 "[settle] array quiescent after %lluns (%zu core(s))\n",
+                                 (unsigned long long)elapsed, cores.size());
+                return;
+            }
+        } else {
+            stable = 0;
+        }
+        prev = std::move(cur);
+    }
+    if (trace)
+        std::fprintf(stderr,
+                     "[settle] cap reached at %lluns (%zu core(s), not fully quiesced)\n",
+                     (unsigned long long)elapsed, cores.size());
+}
+
 }  // namespace
 
 int npu_replay(ps_bridge* ps, ddr_target* ddr, const uint8_t* ops, std::size_t len,
@@ -414,6 +518,10 @@ int npu_replay(ps_bridge* ps, ddr_target* ddr, const uint8_t* ops, std::size_t l
                const std::vector<std::pair<uint64_t, std::size_t>>& host_buffers) {
     Reader r{ops, len};
     probe_tile(ps, start_col, "entry");
+    // Let the just-configured cores reach their first lock/stream block before
+    // replaying the host runtime sequence -- models the HW config->submit gap
+    // so runtime writes can't race a core's pre-lock work (see settle_array).
+    settle_array(ps, start_col);
     while (r.i < r.n && !r.err) {
         const uint8_t tag = r.u8();
         switch (tag) {
