@@ -1,6 +1,44 @@
 # Three-way timing calibration (Stage 2, task #72)
 
-**Status**: DESIGN APPROVED (2026-06-06). Building.
+**Status**: DESIGN APPROVED (2026-06-06). Building. **PIVOTED 2026-06-06** (see below).
+
+## PIVOT: in-process NPU1 VCD, not standalone vc2802 (2026-06-06, Maya)
+
+The original plan pulled the aiesim **timing** VCD from the **standalone**
+aiesimulator (`--aiesim`, Phase 5c), which only models AIE2 as `xcve2802`
+(Versal 38x11). That forced a region-dependent geometry remap (vc2802 -> NPU1)
+on every anchor -- a remap `aiesim-validate.py:574` admits was never even
+implemented in `vcd_compare`.
+
+Maya's question -- "why normalize at all, didn't we build an NPU1 JSON?" --
+exposed the real cause: normalization was an artifact of using the *wrong*
+aiesim. The NPU1 JSON drives the **in-process cluster** (the correctness
+oracle), which simply wasn't dumping a VCD. The design defaulted to the
+standalone because it already had `--dump-vcd` wired.
+
+**The in-process cluster can dump its own NPU1-native VCD.** It is a real
+SystemC sim (`sc_bootstrap.cpp` owns `sc_main`/`sc_start`, links aietools
+`libsystemc`, hosts the `aie_cluster` model). The cluster model exposes the
+standard SystemC trace hook -- `math_engine_base.h:124`:
+`virtual void add_sc_traces(sc_trace_file *tf) = 0;` -- and our `sc_main`
+already holds the top object (`aiesim_top::math_engine()`, constructed at
+`sc_bootstrap.cpp:209`). So `sc_create_vcd_trace_file()` + `top->add_sc_traces(tf)`
+yields a VCD in **NPU1 5x6 geometry, identical to the trace-BO/HW side**.
+
+Consequences:
+- **Zero geometry normalization** -- pure NPU1<->NPU1 anchor alignment.
+- **One run, one config** -- the same in-process execution produces correctness
+  *and* timing, so the "report timing only where standalone-VCD and
+  NPU1-correctness configs agree" caveat (old decision 3) evaporates.
+- **Truer Phoenix oracle** -- NPU1-native, not Versal vc2802 (wrong array size /
+  different NoC). This is what we want post-Strix.
+
+The standalone `--aiesim` path is now **very deprecated** (Maya) -- kept only as
+an optional independent cross-check, to be cut once the bridge timing path is
+solid. New build order is tasks #87 (wire `add_sc_traces`) -> #88 (in-process
+NPU1 mapping tree + coverage) -> #84 (anchor extractor, no normalization). The
+"geometry wrinkle" section below is retained for historical context but no
+longer governs the primary path.
 
 **Decisions (2026-06-06, Maya):**
 1. Architecture: **C -> B** -- total-cycle direct three-way first, then layer
@@ -225,11 +263,19 @@ Notes for the B build:
    for each source (hw/interp from parse-trace output; aiesim from vcd-compare).
 3. **C comparator + report**: three total-cycle records per kernel -> drift
    table, HW ground truth.
-4. **B-aiesim anchor extractor**: `DmaFsmState`/`Lock` transitions -> anchors,
-   NPU1-normalized coords.
-5. **B trace-anchor reducer**: `parse-trace --out-events` -> anchors.
-6. **B comparator**: extend (3) with per-anchor alignment + deltas.
-7. **Harness integration**: a `--aiesim-timing` mode in emu-bridge-test.sh that
-   runs the standalone `--aiesim` VCD path on the envelope and joins all three.
-8. **Campaign**: all 72 kernels, three-way, correctness + timing; close-out
-   finding.
+4. **(#87) In-process VCD dump**: env-gated `add_sc_traces` in `sc_bootstrap.cpp`
+   sc_main -> NPU1-native VCD. Verify non-degenerate timeline under the chunked
+   `sc_pause`/`sc_start` driver model.
+5. **(#88) In-process NPU1 mapping tree**: `--coverage` the new VCD to discover
+   the `aiesim_top.*` hierarchy; add `build_npu1_inproc_mapping_tree`. Confirm
+   `DmaFsmState`/`Lock` resolve.
+6. **(#84) B-aiesim anchor extractor**: `DmaFsmState`/`Lock` transitions ->
+   anchors, **no normalization** (NPU1 tree). `vcd-compare --anchors`.
+7. **(#84) B trace-anchor reducer**: `parse-trace --out-events` / `events.json`
+   -> anchors (DMA_*_START_TASK/FINISHED_TASK -> canonical kind, `soc` cycle).
+8. **(#84) B comparator**: extend (3) with per-anchor alignment on `(col,row,kind)`,
+   per-source earliest-anchor normalization, deltas vs HW.
+9. **(#85) Harness integration**: `--aiesim-timing` mode in emu-bridge-test.sh
+   joining all three from the **in-process** run (correctness + timing in one).
+10. **(#85) Campaign**: all 72 kernels, three-way, correctness + timing; close-out
+    finding. (Standalone `--aiesim` path deprecated -- optional cross-check only.)

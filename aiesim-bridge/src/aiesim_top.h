@@ -11,6 +11,7 @@
 
 #include <systemc.h>
 
+#include <string>
 #include <vector>
 
 class ps_bridge;
@@ -38,6 +39,30 @@ public:
     // context where sc_spawn is legal), after the cluster is constructed.
     void spawn_egress_drains();
 
+    // Request an NPU1-native VCD timing dump from the MSM cluster model. Yields a
+    // waveform in NPU1 5x6 geometry -- same as the trace BO / HW side, so no
+    // vc2802 row remap -- driving the three-way timing calibration's aiesim leg
+    // (docs/coverage/three-way-timing-calibration.md). Records `path`; the actual
+    // trace registration runs in end_of_elaboration() (below), because the cluster
+    // binds its internal ports (e.g. shim_reset_n) during elaboration -- calling
+    // add_sc_traces from sc_main before the first sc_start hits those ports while
+    // still unbound (E112). Call from sc_main before sc_start. `path` gets a ".vcd"
+    // suffix if absent.
+    void request_vcd_trace(const char* path);
+    // Flush the VCD writer's tail buffer to disk. Call after the sim loop ends:
+    // the writer streams each cycle during the run but nobody destroys it, so the
+    // final filebuf would otherwise be lost. No-op if tracing was not requested.
+    void flush_vcd_trace();
+
+protected:
+    // SystemC elaboration hook. After the cluster has bound its internal ports we
+    // register the VCD traces here (if requested): create the cluster's OWN trace
+    // writer via msm_create_vcd_trace_file -- NOT SystemC's
+    // sc_create_vcd_trace_file: MathEngineBase::add_sc_traces reinterprets its
+    // sc_trace_file* arg as a msm_trace::vcd_trace_file_writer* (verified by
+    // backtrace -- a SystemC trace file segfaults in write_comment).
+    void end_of_elaboration() override;
+
 private:
     // Bind/stub the cluster ports we do not drive so end_of_elaboration passes
     // (aximm stubs, stream/event clocks, dangling sc_in). me_ must be set.
@@ -52,6 +77,10 @@ private:
                                    // NoC interface reaches a given tile.
     ps_bridge* ps_ = nullptr;      // PS-side ess_*() bridge (child sc_module)
     ddr_target* ddr_ = nullptr;    // host DDR bound to the shim-DMA masters
+    std::string vcd_path_;         // requested VCD path ("" = disabled); consumed
+                                   // in end_of_elaboration()
+    void* vcd_writer_ = nullptr;   // msm_trace::vcd_trace_file_writer* (opaque);
+                                   // created in end_of_elaboration, flushed at sim end
     sc_core::sc_clock clock_;      // drives the cluster's clk (II-B.3)
 
     // Stub storage (kept alive for the cluster's lifetime). xtlm stub modules

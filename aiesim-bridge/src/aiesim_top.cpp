@@ -307,6 +307,55 @@ void aiesim_top::spawn_egress_drains() {
     }
 }
 
+// The MSM cluster model carries its OWN VCD writer (libmsm_cpp.so), distinct from
+// SystemC's sc_trace_file. MathEngineBase::add_sc_traces(sc_trace_file*) actually
+// reinterprets that pointer as a msm_trace::vcd_trace_file_writer* and calls
+// write_comment/dump_partial_vcd_config on it -- passing a real SystemC trace file
+// segfaults (confirmed by backtrace). So we create the writer with the MSM factory
+// and hand THAT to add_sc_traces.
+//
+// We resolve the MSM trace API via dlsym(RTLD_DEFAULT) rather than linking it: the
+// bridge does not link libmsm_cpp -- it arrives (RTLD_GLOBAL) as a dependency of
+// the per-arch cluster .so we dlopen in the ctor. Resolving at call time (well
+// after construction) both avoids a bridge load-time dependency AND guarantees we
+// share the SAME libmsm instance -- hence the SAME global writer -- that the
+// cluster's elaborate()/get_vcd_trace_file() finalizes. Mangled names are
+// ABI-pinned to the local aietools; local-only branch, never shipped.
+void aiesim_top::request_vcd_trace(const char* path) {
+    vcd_path_ = path ? path : "";
+}
+
+void aiesim_top::end_of_elaboration() {
+    if (vcd_path_.empty()) return;
+    // By now the cluster has bound its internal ports (shim_reset_n etc.), so
+    // add_sc_traces' get_interface() walk succeeds. msm_trace::msm_create_vcd_trace_file
+    // (std::string, bool): type=true -> write a real file (false would mkfifo a
+    // pipe). It also registers the writer as libmsm's global, which the model's
+    // elaborate() finalizes via finish_trace_registration.
+    using create_fn = void* (*)(std::string, bool);
+    auto create = reinterpret_cast<create_fn>(dlsym(
+        RTLD_DEFAULT,
+        "_ZN9msm_trace25msm_create_vcd_trace_fileENSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb"));
+    if (!create) {
+        fprintf(stderr, "[aiesim-bridge] WARNING: msm_create_vcd_trace_file unresolved; VCD disabled\n");
+        return;
+    }
+    void* writer = create(vcd_path_, true);
+    vcd_writer_ = writer;
+    static_cast<MathEngineBase*>(me_)->add_sc_traces(
+        reinterpret_cast<sc_core::sc_trace_file*>(writer));
+}
+
+void aiesim_top::flush_vcd_trace() {
+    if (!vcd_writer_) return;
+    // msm_trace::vcd_trace_file_writer::flush() -- a non-virtual no-arg member, so
+    // ABI-callable as a free function taking `this` first.
+    using flush_fn = void (*)(void*);
+    auto flush = reinterpret_cast<flush_fn>(
+        dlsym(RTLD_DEFAULT, "_ZN9msm_trace21vcd_trace_file_writer5flushEv"));
+    if (flush) flush(vcd_writer_);
+}
+
 aiesim_top::~aiesim_top() {
     if (cluster_lib_) {
         dlclose(cluster_lib_);

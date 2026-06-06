@@ -227,12 +227,34 @@ extern "C" int sc_main(int /*argc*/, char* /*argv*/[]) {
     // ms_noc_axis port; see aiesim_top::spawn_egress_drains.
     top->spawn_egress_drains();
 
+    // Optional NPU1-native VCD dump for three-way timing calibration. When
+    // XDNA_AIESIM_VCD is set, register the cluster's signals BEFORE the first
+    // sc_start (trace registration must precede time advance; the model's
+    // elaborate() finalizes the header on that first sc_start). The waveform is
+    // in NPU1 5x6 geometry -- identical to the trace-BO/HW side -- so no vc2802
+    // row remap is needed (docs/coverage/three-way-timing-calibration.md). The
+    // pause/resume host loop is invisible to the VCD: it records sim time (which
+    // is monotonic across sc_pause), not wall time, so the timeline is continuous.
+    // Local-only branch (links proprietary aietools); never shipped.
+    bool vcd_enabled = false;
+    if (const char* vcd_path = std::getenv("XDNA_AIESIM_VCD")) {
+        if (*vcd_path) {
+            top->request_vcd_trace(vcd_path);  // registered in end_of_elaboration()
+            vcd_enabled = true;
+            std::cerr << "[aiesim-bridge] VCD trace -> " << vcd_path << std::endl;
+        }
+    }
+
     // Host loop: advance the kernel only while a command is pending; the driver
     // sc_pause()s after each drain, returning control here.
     for (;;) {
         sc_core::sc_start();           // runs until the driver sc_pause()s / sc_stop
         if (svc.is_shutdown()) break;
         svc.wait_for_pending();        // block (kernel paused) until a command arrives
+    }
+
+    if (vcd_enabled) {
+        top->flush_vcd_trace();        // push the writer's tail buffer to disk
     }
     return 0;
 }
