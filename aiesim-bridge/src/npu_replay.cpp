@@ -504,17 +504,47 @@ int npu_replay(ps_bridge* ps, ddr_target* ddr, const uint8_t* ops, std::size_t l
                 uint8_t arg_idx = r.u8();
                 uint32_t arg_plus = r.u32();
                 if (r.err) break;
-                // Host-buffer mode (host buffers are registered by the plugin):
-                // the patched DDR address is the buffer base + the BD's byte
-                // offset. Write it into the shim BD address word pair (low 32 to
-                // the addr-low word, high 16 to the addr-high word). The DDR
-                // address is in the bridge's ddr_target space -- NOT translated.
-                const uint64_t patched = resolve_arg_base(host_buffers, arg_idx) + arg_plus;
                 const uint64_t lo_reg = cluster_addr(reg_addr, start_col);
+
+                // Two address-resolution modes, mirroring the interpreter
+                // (executor.rs execute_ddr_patch / _prepatched). Both write the
+                // resolved DDR address into the shim BD address word pair (low 32
+                // to the addr-low word, high 16 to the addr-high word).
+                //
+                //  - Host-buffer mode (classic insts.bin path): the plugin
+                //    registered the kernel-arg BOs, so the address is the buffer
+                //    base + the BD's byte offset, already in the bridge's flat
+                //    ddr_target space -- no translation.
+                //
+                //  - Pre-patched mode (XRT ELF/module path, opcode 20): the
+                //    regmap carries no BOs, so host_buffers is empty. XRT's ELF
+                //    relocation already wrote BO_addr + arg_plus + the DDR-AIE
+                //    aperture offset into the BD via the preceding block-write.
+                //    Read it back, strip the offset, write the flat-space address.
+                //    The subtract stands in for the AIE's host-DDR aperture, which
+                //    the bridge does not model as a translation (real silicon's
+                //    memory controller absorbs this 2 GB offset; we keep one flat
+                //    ddr_target instead -- see executor.rs execute_ddr_patch_
+                //    prepatched). TODO: model the aperture properly so both flows
+                //    share one translation rather than this special case.
+                uint64_t patched;
+                if (host_buffers.empty()) {
+                    constexpr uint64_t kDdrAieAddrOffset = 0x8000'0000u;
+                    const uint32_t word_lo = ps->read32(lo_reg);
+                    const uint32_t word_hi = ps->read32(lo_reg + 4);
+                    const uint64_t xrt_addr =
+                        ((uint64_t(word_hi) & 0xFFFFu) << 32) | word_lo;
+                    patched = xrt_addr - kDdrAieAddrOffset;
+                } else {
+                    patched = resolve_arg_base(host_buffers, arg_idx) + arg_plus;
+                }
+
                 if (std::getenv("XDNA_AIESIM_TRACE")) {
                     std::fprintf(stderr,
-                                 "[npu_replay] DdrPatch arg_idx=%u patched=0x%llx -> reg=0x%llx\n",
-                                 arg_idx, (unsigned long long)patched, (unsigned long long)lo_reg);
+                                 "[npu_replay] DdrPatch arg_idx=%u patched=0x%llx -> reg=0x%llx%s\n",
+                                 arg_idx, (unsigned long long)patched,
+                                 (unsigned long long)lo_reg,
+                                 host_buffers.empty() ? " (pre-patched)" : "");
                 }
                 ps->write32(lo_reg, uint32_t(patched & 0xFFFFFFFFu));
 
