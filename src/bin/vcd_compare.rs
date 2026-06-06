@@ -26,8 +26,10 @@ use std::process;
 
 use xdna_emu::vcd::compare::{compare_signals, load_and_align};
 use xdna_emu::vcd::coverage::coverage_audit;
+use xdna_emu::vcd::cycles::cycle_span;
 use xdna_emu::vcd::mapping::{build_aie2_mapping_tree, build_vc2802_mapping_tree, MappingTree};
 use xdna_emu::vcd::report::{json_report, text_report};
+use xdna_emu::vcd::state_path::Subsystem;
 use xdna_emu::vcd::tolerance::ToleranceConfig;
 
 // ---------------------------------------------------------------------------
@@ -38,6 +40,7 @@ fn usage() -> ! {
     eprintln!("Usage:");
     eprintln!("  vcd-compare --emu <file> --sim <file> [options]");
     eprintln!("  vcd-compare --coverage <file> [options]");
+    eprintln!("  vcd-compare --cycles <file> [--json] [options]");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --device npu1|vc2802                 Device geometry (default: vc2802 for coverage, npu1 for compare)");
@@ -54,6 +57,7 @@ fn main() {
     let mut emu_path: Option<String> = None;
     let mut sim_path: Option<String> = None;
     let mut coverage_path: Option<String> = None;
+    let mut cycles_path: Option<String> = None;
     let mut tolerance_name = "default".to_string();
     let mut device_name: Option<String> = None;
     let mut json_output = false;
@@ -73,6 +77,10 @@ fn main() {
             "--coverage" => {
                 i += 1;
                 coverage_path = Some(args.get(i).cloned().unwrap_or_else(|| usage()));
+            }
+            "--cycles" => {
+                i += 1;
+                cycles_path = Some(args.get(i).cloned().unwrap_or_else(|| usage()));
             }
             "--tolerance" => {
                 i += 1;
@@ -104,7 +112,12 @@ fn main() {
         process::exit(1);
     }
 
-    if let Some(cov_path) = coverage_path {
+    if let Some(cyc_path) = cycles_path {
+        // aiesim VCDs use VC2802 geometry; same default as coverage.
+        let dev = device_name.as_deref().unwrap_or("vc2802");
+        let tree = parse_device(dev);
+        run_cycles(&cyc_path, &tree, json_output, output_path.as_deref());
+    } else if let Some(cov_path) = coverage_path {
         // Default to vc2802 for coverage (most common: aiesim VCDs use VC2802 geometry)
         let dev = device_name.as_deref().unwrap_or("vc2802");
         let tree = parse_device(dev);
@@ -198,6 +211,63 @@ fn run_coverage(vcd_path: &str, tree: &MappingTree, _json: bool, output: Option<
     let text = format!("{}", report);
 
     write_output(&text, output);
+}
+
+// ---------------------------------------------------------------------------
+// Cycles mode
+// ---------------------------------------------------------------------------
+
+/// Compute the total active-cycle span of a single aiesimulator VCD and write
+/// it out. This is the aiesim side of three-way timing calibration: the
+/// `span_cycles` scalar is comparable to `parse-trace.py --out-cycles` for the
+/// HW and interpreter sides.
+fn run_cycles(vcd_path: &str, tree: &MappingTree, json: bool, output: Option<&str>) {
+    // Default activity vocabulary: all temporal-activity subsystems. The event
+    // trace signals alone are often one-shot in aiesim VCDs; the kernel's active
+    // window is carried by DMA/lock/stream/core transitions. This measures the
+    // gross active span (first..last activity) -- the coarse total-cycle proxy
+    // for Option-C drift. Precise trace-event anchoring is Option B.
+    let activity = [Subsystem::Dma, Subsystem::Lock, Subsystem::Stream, Subsystem::Core, Subsystem::Event];
+    let span = match cycle_span(vcd_path, tree, &activity) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error computing cycle span for {}: {}", vcd_path, e);
+            process::exit(1);
+        }
+    };
+
+    if span.n_changes == 0 {
+        eprintln!(
+            "Warning: {} has no event-signal activity (degenerate/dump-vars-only VCD); span_cycles=0",
+            vcd_path
+        );
+    }
+
+    let report = if json {
+        format!(
+            "{{\"span_cycles\":{},\"span_ps\":{},\"period_ps\":{},\"first_ps\":{},\"last_ps\":{},\"n_signals\":{},\"n_changes\":{}}}\n",
+            span.span_cycles,
+            span.span_ps,
+            span.period_ps,
+            span.first_ps,
+            span.last_ps,
+            span.n_signals,
+            span.n_changes
+        )
+    } else {
+        format!(
+            "span_cycles={}\nspan_ps={}\nperiod_ps={}\nfirst_ps={}\nlast_ps={}\nn_signals={}\nn_changes={}\n",
+            span.span_cycles,
+            span.span_ps,
+            span.period_ps,
+            span.first_ps,
+            span.last_ps,
+            span.n_signals,
+            span.n_changes
+        )
+    };
+
+    write_output(&report, output);
 }
 
 // ---------------------------------------------------------------------------

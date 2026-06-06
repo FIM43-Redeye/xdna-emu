@@ -14,6 +14,7 @@ pub mod mapping;
 pub mod coverage;
 pub mod tolerance;
 pub mod compare;
+pub mod cycles;
 pub mod report;
 
 #[cfg(feature = "vcd-recording")]
