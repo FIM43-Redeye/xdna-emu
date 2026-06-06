@@ -151,6 +151,71 @@ Step 0 regardless of choice: verify the standalone `--aiesim` VCD path runs on
 ~2 corpus kernels and that `src/vcd` maps its DMA/lock signals (feasibility gate
 for B and C).
 
+## The interpreter VCD leg (Maya, 2026-06-06)
+
+Once VCD timing extraction is trustworthy, the interpreter's *own* VCD output
+(`src/vcd/emit.rs` `VcdRecorder`, behind the `vcd-recording` feature) becomes a
+usable timing artifact too. That gives the interpreter **two** timing
+representations and closes every edge of the triangle with a *direct*
+measurement:
+
+- interp **trace BO** -> cycles, comparable to **HW** (existing).
+- interp **own VCD** -> cycles/anchors, comparable to **aiesim** (this leg).
+
+The anchor/`cycle_span` extractor is device-parameterized (takes a `MappingTree`),
+so it would run on an interp VCD (NPU1 tree) with no new code, and the existing
+`vcd-compare --emu <interp.vcd> --sim <aiesim.vcd>` already aligns two VCDs
+signal-for-signal with per-signal `TimingOffset` (median cycle delta). The
+consumer side is free.
+
+**BUT the producer side is not built.** `VcdRecorder` (`emit.rs`) has zero
+callers in the execution path -- the interpreter does **not** emit a VCD today.
+Wiring it requires instrumenting the device state machine to record every
+DMA/lock/stream/core state change (the archived Phase C Task 9, explicitly
+deferred). So this leg is a real follow-on, tracked as task #86.
+
+Why it doesn't block the campaign: the interpreter is **already** in the
+three-way via its **trace BO** (same `bridge-trace-runner -> parse-trace` path
+as HW), so it gets a trace-cycles/anchors column directly comparable to HW.
+Only the *direct FSM-level* interp<->aiesim VCD edge is missing, and it is **not
+Phoenix-gated** (both sides available anytime) -- do it after the HW<->aiesim
+campaign.
+
+Anchor matching approach (Maya, 2026-06-06): **fixed canonical anchor set** --
+a small universal vocabulary (DMA ch0/ch1 first-start & last-done, lock
+acquire/release, compute start/end), extracted from the VCD via FSM/lock
+transitions and from the trace BO by recognizing matching event names; report
+only anchors both sides carry.
+
+## Canonical anchor vocabulary (grounded on real data, 2026-06-06)
+
+Inspected a real EMU `events.json` (`add_one_using_dma.chess.emu`). The trace BO
+carries DMA start/done as named events with a precise `soc` (start-of-cycle
+absolute) field, tagged by `(col, row)`:
+
+| Anchor kind | Trace BO event name | aiesim/interp VCD source |
+|-------------|---------------------|--------------------------|
+| `dma_s2mm{ch}_start` | `DMA_S2MM_{ch}_START_TASK` | `DmaFsmState{dir=S2mm,ch}` first leave-idle |
+| `dma_s2mm{ch}_done`  | `DMA_S2MM_{ch}_FINISHED_TASK` | `DmaFsmState{dir=S2mm,ch}` done / last change |
+| `dma_mm2s{ch}_start` | `DMA_MM2S_{ch}_START_TASK` | `DmaFsmState{dir=Mm2s,ch}` first leave-idle |
+| `dma_mm2s{ch}_done`  | `DMA_MM2S_{ch}_FINISHED_TASK` | `DmaFsmState{dir=Mm2s,ch}` done / last change |
+
+DMA START/FINISHED tasks are the strongest universal anchors -- present, named,
+and semantically unambiguous on both sides. Lock (`LOCK_STALL`,
+`INSTR_LOCK_ACQUIRE_REQ`) and `PORT_RUNNING_N` events exist too and can extend
+the set later, but the DMA task anchors are the v1 vocabulary.
+
+Notes for the B build:
+- Cycle anchor: use the trace event's `soc` field (precise start-of-cycle), not
+  `ts`. VCD side: change-time / derived period.
+- Coordinates: trace BO is NPU1 geometry already; aiesim VCD is xcve2802 -- apply
+  the row offset (NPU1 row N == vc2802 row N+1) at VCD extraction so both align
+  on `(col,row,kind)`. Shim DMA (row 0) needs explicit care -- verify the aiesim
+  VCD exposes shim-tile DmaFsmState before relying on shim anchors.
+- Alignment: absolute cycle zeros differ between sources (sim start vs trace
+  start), so the comparator normalizes each source's anchors to its earliest
+  anchor (relative timing) before computing per-anchor deltas vs HW.
+
 ## Build plan
 
 1. **C-aiesim extractor**: `vcd-compare --cycles <vcd>` -> total active-cycle
