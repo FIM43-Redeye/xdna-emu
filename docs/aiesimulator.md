@@ -278,6 +278,30 @@ Its timing can diverge from real silicon, especially for:
 Use it for **functional correctness** validation, not timing analysis. For
 timing, use real NPU hardware traces.
 
+### Compute-to-compute shared memory is NOT modeled on AIE2 (hard limitation)
+
+aiesimulator **cannot simulate compute-to-compute neighbour shared-memory / lock
+handoff on AIE2/AIE-ML**. A producer core's lock release is never made visible to
+the adjacent consumer core's neighbour-lock view, so any kernel that hands data
+core-to-core through shared memory + locks (e.g. depth-1 objectfifos between
+adjacent compute tiles) deadlocks. Same-tile locks and memtile locks work fine;
+only the cross-core neighbour bridge is missing (the AIE2 ISS models core tiles in
+isolation).
+
+This is **AMD's limitation, not ours**: AMD's own `mlir-aie`
+`chess_compiler_tests_aie2/04_shared_memory` is marked `XFAIL: *` (the AIE1
+version passes), and AMD's native `aiesimulator` reproduces the failure standalone
+(no bridge involved). Real silicon runs these kernels fine.
+
+**Consequence:** exclude compute-to-compute neighbour-objectfifo kernels from the
+aiesim oracle. In the corpus this is `matrix_multiplication_using_cascade` `buffer`
+(the `cascade`/`plain` variants use cascade ports instead and pass). Our own Rust
+emulator models direct neighbour-memory + locks, so it is *more* faithful than
+aiesim for this class.
+
+Full analysis, three-legged proof, and native repro:
+[`docs/superpowers/findings/2026-06-06-aiesim-aie2-cross-core-shared-memory-limitation.md`](superpowers/findings/2026-06-06-aiesim-aie2-cross-core-shared-memory-limitation.md).
+
 ## Source Files
 
 | File | Purpose |

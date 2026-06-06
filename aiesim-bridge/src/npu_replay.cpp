@@ -262,6 +262,56 @@ bool dma_wait(ps_bridge* ps, ddr_target* ddr, uint64_t status_addr) {
 void probe_tile(ps_bridge* ps, uint8_t start_col, const char* tag) {
     const char* e = std::getenv("XDNA_AIESIM_PROBE_TILE");
     if (!e) return;
+    // "all": compact per-tile core+lock dump across the 4 compute tiles (cols
+    // 0-3, row 2). Lets us see a producer/consumer lock-handoff chain in one
+    // run. Core_Status lock-stall bits (AIE-ML): [6]=S [7]=W [8]=N [9]=E; the
+    // neighbor-memory objectfifo handoff stalls one of these when the cross-tile
+    // release isn't seen. Locks 0..7 at 0x1F000 (stride 0x10), signed value.
+    if (std::strcmp(e, "all") == 0) {
+        for (int col = 0; col <= 3; ++col) {
+            const int row = 2;
+            auto rd = [&](uint32_t off) -> uint32_t {
+                const uint32_t npu =
+                    (uint32_t(col) << kColShift) | (uint32_t(row) << kRowShift) | off;
+                return ps->read32(cluster_addr(npu, start_col));
+            };
+            const uint32_t st = rd(0x32004);
+            std::fprintf(stderr,
+                         "[probe %s] core(%d,2) ctrl=0x%08x status=0x%08x pc=0x%05x "
+                         "stall[S=%u W=%u N=%u E=%u ss=%u] done=%u | locks ",
+                         tag, col, rd(0x32000), st, rd(0x31100),
+                         (st >> 6) & 1u, (st >> 7) & 1u, (st >> 8) & 1u, (st >> 9) & 1u,
+                         (st >> 10) & 3u, (st >> 20) & 1u);
+            for (int l = 0; l < 8; ++l)
+                std::fprintf(stderr, "L%d=%d ", l, (int)rd(0x1F000 + uint32_t(l) * 0x10));
+            std::fprintf(stderr, "\n");
+        }
+        // Input pipeline: shim col0 (A/B push from DDR) + both memtiles
+        // (S2MM-from-shim, MM2S-to-cores). Locates where input flow dies before
+        // the cores ever see data. Shim MM2S0/1 status 0x1D228/0x1D22C, S2MM0
+        // 0x1D220, task queues 0x1D214/0x1D21C/0x1D204. Memtile S2MM 0xA0660,
+        // MM2S 0xA0680 (stride 4); memtile locks 0xC0000 (stride 0x10).
+        auto rdc = [&](int col, int row, uint32_t off) -> uint32_t {
+            const uint32_t npu =
+                (uint32_t(col) << kColShift) | (uint32_t(row) << kRowShift) | off;
+            return ps->read32(cluster_addr(npu, start_col));
+        };
+        std::fprintf(stderr,
+                     "[probe %s] shim(0,0) mm2s0=0x%08x mm2s1=0x%08x s2mm0=0x%08x | q[mm2s0,mm2s1,s2mm0]=%u,%u,%u\n",
+                     tag, rdc(0, 0, 0x1D228), rdc(0, 0, 0x1D22C), rdc(0, 0, 0x1D220),
+                     rdc(0, 0, 0x1D214), rdc(0, 0, 0x1D21C), rdc(0, 0, 0x1D204));
+        for (int col = 0; col <= 1; ++col) {
+            std::fprintf(stderr,
+                         "[probe %s] memtile(%d,1) s2mm[0,1]=0x%08x,0x%08x mm2s[0..4]=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x | locks ",
+                         tag, col, rdc(col, 1, 0xA0660), rdc(col, 1, 0xA0664),
+                         rdc(col, 1, 0xA0680), rdc(col, 1, 0xA0684), rdc(col, 1, 0xA0688),
+                         rdc(col, 1, 0xA068C), rdc(col, 1, 0xA0690));
+            for (int l = 0; l < 6; ++l)
+                std::fprintf(stderr, "L%d=%d ", l, (int)rdc(col, 1, 0xC0000 + uint32_t(l) * 0x10));
+            std::fprintf(stderr, "\n");
+        }
+        return;
+    }
     int col = 0, row = 0;
     if (std::sscanf(e, "%d,%d", &col, &row) != 2) return;
     // Read NPU1 logical (col,r,off) through the cluster remap.

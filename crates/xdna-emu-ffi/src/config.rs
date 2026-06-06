@@ -91,7 +91,17 @@ pub unsafe extern "C" fn xdna_emu_load_xclbin(
     // (apply_device_op) and to NPU executor ops (decode_npu_address /
     // Sync.column), so the load_xclbin path lands partition-aware
     // addressing end to end.  Empty list (older xclbins): leave at 0.
-    let start_col = partition.start_columns().first().copied().unwrap_or(0);
+    let mut start_col = partition.start_columns().first().copied().unwrap_or(0);
+    // Diagnostic override (XDNA_AIESIM_FORCE_START_COL): relocate the partition to
+    // a chosen physical column. Used to land NPU1 logical col 0 on a NoC shim
+    // column when running NPU1 xclbins over the genuine Versal (VC2802) geometry,
+    // isolating geometry-specific cluster behavior. Off by default.
+    if let Ok(v) = std::env::var("XDNA_AIESIM_FORCE_START_COL") {
+        if let Ok(forced) = v.parse::<u16>() {
+            log::warn!("XDNA_AIESIM_FORCE_START_COL: overriding start_col {start_col} -> {forced}");
+            start_col = forced;
+        }
+    }
     handle.backend.set_start_col(start_col as u8);
     log::info!("load_xclbin: physical start_col = {}", start_col);
 
