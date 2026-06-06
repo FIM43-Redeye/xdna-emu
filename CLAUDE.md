@@ -367,6 +367,11 @@ Always run `cargo test --lib` after making changes. Do not consider work
 complete until tests pass. If tests were passing before your changes and are
 now failing, that is a regression to fix before moving on.
 
+**Known fidelity gaps.** Confirmed model-vs-hardware disagreements are tracked
+in [`docs/known-fidelity-gaps.md`](docs/known-fidelity-gaps.md) -- check it
+before investigating a suspected emulator bug (a stale wrong note once cost a
+whole session), and add a row when you confirm a new one.
+
 **Planned: differential fuzzing.** The long-term validation strategy is a logic
 fuzzer that generates valid kernels, runs them on both emulator and real NPU,
 and compares results. Future work -- do not start building it until hand-written
