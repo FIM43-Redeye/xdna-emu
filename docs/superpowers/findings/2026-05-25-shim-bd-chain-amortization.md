@@ -140,9 +140,17 @@ state.  This finding does not address it; tracked as the next axis to
 calibrate (see follow-ups).
 
 **Shim task queue depth.**  K=16 chain-sweep HW FAILs (4.8s timeout vs
-0.6s for K=8).  Shim DMA task queue is 8-deep on AIE2 per AM025; the
-ninth queued task wedges.  EMU correctly models the 8-deep queue but
-doesn't currently surface the limit as an explicit kernel error.
+0.6s for K=8).  **[CORRECTED 2026-06-06]** The mechanism stated here
+originally ("shim task queue is 8-deep; the ninth queued task wedges")
+is WRONG: the shim DMA task queue is **4-deep** (aie-rt
+`XAIE_DMA_MAX_QUEUE_SIZE 4U` / `StartQSizeMax = 4U`), and the "8" was our
+own incorrect `MAX_TASK_QUEUE_DEPTH`, not silicon -- k8 already exceeds a
+4-deep queue yet passes.  The real cause is **16-BD shim pool
+over-allocation** (a K-direction kernel needs 2K distinct shim BDs; K>8
+exceeds the 16-BD pool), and the HW wedge is **non-monotonic** in K
+(k8 pass, k9 wedge, k12 pass, k16 wedge).  Full analysis in
+[2026-06-06-shim-bd-pool-overallocation-nonmonotonic-wedge.md](2026-06-06-shim-bd-pool-overallocation-nonmonotonic-wedge.md).
+The generator is now capped at K=8.
 
 ## Follow-ups (non-gating)
 

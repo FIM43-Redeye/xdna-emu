@@ -6,8 +6,8 @@ amortization calibration. Holds N (words per BD) fixed and sweeps K (number
 of back-to-back dma_memcpy_nd dispatches per direction).
 
 The k1 directory is the hand-written template (lock init = 1, single
-dispatch per direction). This script generates k2, k4, k8, k16 by mutating
-the template:
+dispatch per direction). This script generates k2, k4, k8 by mutating
+the template (K is capped at 8 -- see the MAX_K note below):
 
   - prod_lock init = 1 -> init = K
   - %arg0 / %arg2 memref<N x i32> -> memref<K*N x i32>
@@ -27,7 +27,24 @@ MLIR_AIE_TEST_DIR = (
     REPO_ROOT.parent / "mlir-aie" / "test" / "npu-xrt" / "_diag_shim_chain_sweep"
 )
 
-DEFAULT_K_LIST = [2, 4, 8, 16]
+# K is capped at 8 by the shim BD pool, NOT by anything in this script.  The
+# runtime sequence needs K input BDs + K output BDs = 2K *distinct* shim BDs,
+# and an AIE2 shim/NoC tile has exactly 16 BDs (aie-rt NumBds = 16U; BD-ID is
+# 4-bit).  At K=8 the allocator fills the pool exactly with disjoint halves
+# (input BD8-15, output BD0-7) and the kernel runs.  For K>8 the compiler wraps
+# the input BDs onto the output BDs (e.g. k16 uses BD0-15 for BOTH directions),
+# and -- because the single-slot memtile buffer overlaps the input/output
+# phases -- the colliding BDs wedge on real hardware.  Critically the wedge is
+# NON-MONOTONIC (HW + aiesim: k8 pass, k9 WEDGE, k12 pass, k16 WEDGE), an
+# allocation-specific BD-lifecycle interaction with no clean closed form.  Our
+# interpreter does NOT model it (it re-parses BDs on reuse and completes) -- a
+# known fidelity gap, documented in
+# docs/superpowers/findings/2026-06-06-shim-bd-pool-overallocation-nonmonotonic-wedge.md.
+# Generating K>8 here produces kernels that are invalid on hardware, so we
+# refuse them rather than emit misleading calibration data.
+MAX_K = 8  # 2*MAX_K == 16 shim BDs
+
+DEFAULT_K_LIST = [2, 4, 8]
 N = 64  # words per BD; fixed for this sweep
 
 
@@ -288,6 +305,15 @@ def main() -> int:
         help=f"Base directory (default: {MLIR_AIE_TEST_DIR})",
     )
     args = ap.parse_args()
+
+    over = [k for k in args.k if 2 * k > 16]
+    if over:
+        ap.error(
+            f"K values {over} need 2K > 16 shim BDs, which exceeds the AIE2 shim "
+            f"BD pool (16). Such kernels wedge non-monotonically on hardware and "
+            f"are not modeled by the emulator (see MAX_K note + findings doc). "
+            f"Max supported K is {MAX_K}."
+        )
 
     for k in args.k:
         d = emit_variant(k, args.n, args.base_dir)
