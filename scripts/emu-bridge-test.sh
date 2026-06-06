@@ -262,15 +262,22 @@ export COMPILERS_STR="${COMPILERS[*]}"
 # aiesim path links proprietary aietools and never ships. All overridable.
 #   AIESIM_BRIDGE_SO   -- the SystemC bridge .so (build-aiesim-bridge.sh output)
 #   AIESIM_DEVICE_JSON -- native NPU1 5x6 cluster device model (make_npu1.py)
-#   AIESIM_TIMEOUT     -- wall-clock cap per aiesim test.exe (aiesim is slow)
+#   AIESIM_TIMEOUT     -- wall-clock backstop per aiesim test.exe (NOT the
+#                         normal exit: each run finishes on the bridge's
+#                         quiescence signal, so this only kills a genuinely
+#                         hung run). Generous so a slow-but-correct kernel
+#                         under heavy fan-out is never false-killed.
 AIESIM_BRIDGE_SO="${AIESIM_BRIDGE_SO:-$EMU_ROOT/aiesim-bridge/build/libxdna_aiesim_bridge.so}"
 AIESIM_DEVICE_JSON="${AIESIM_DEVICE_JSON:-$EMU_ROOT/build/experiments/aiesim-device-decrypt/NPU1.json}"
-AIESIM_TIMEOUT="${AIESIM_TIMEOUT:-300}"
+AIESIM_TIMEOUT="${AIESIM_TIMEOUT:-1200}"
 # Each aiesim instance is single-threaded (SystemC pins one core) and ~1.2 GB
-# RAM, so the cap is cores, not memory: fan out across kernels but leave a few
-# cores for the OS + harness. Pure simulation (no NPU), so unlike the HW pass
-# there is no hardware-contention reason to serialize.
-AIESIM_JOBS="${AIESIM_JOBS:-$(( $(nproc) > 4 ? $(nproc) - 4 : 1 ))}"
+# RAM, so the throughput ceiling is cores, not memory. Completion is quiescence-
+# based (not wall-clock), so fanning out to ~nproc is clean: a slow instance
+# just finishes later, it is not false-timed-out (see AIESIM_TIMEOUT). Leave 2
+# cores for the OS + harness; going past nproc only oversubscribes (instances
+# time-slice, no throughput gain). Pure simulation (no NPU), so unlike the HW
+# pass there is no hardware-contention reason to serialize.
+AIESIM_JOBS="${AIESIM_JOBS:-$(( $(nproc) > 2 ? $(nproc) - 2 : 1 ))}"
 export AIESIM_BRIDGE_SO AIESIM_DEVICE_JSON AIESIM_TIMEOUT AIESIM_JOBS
 
 # ---------------------------------------------------------------------------
