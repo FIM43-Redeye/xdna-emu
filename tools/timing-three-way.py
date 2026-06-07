@@ -178,28 +178,45 @@ def json_report(rows: list[DriftRow]) -> str:
 # ---------------------------------------------------------------------------
 #
 # Each source counts cycles from a different origin (sim power-on vs trace
-# enable), so absolute anchor cycles are not comparable. We normalize each
-# source to ITS earliest anchor (the calibration-doc decision) -- setting that
-# source's first activity to cycle 0 -- then compare anchors on (col, row, kind).
-# This assumes the earliest anchor is the same physical event across sources,
-# which holds when the first DMA to arm is the same on both; the per-anchor
-# deltas are therefore relative to each source's first activity.
+# enable), so absolute anchor cycles are not comparable. We align all sources on
+# a SHARED REFERENCE anchor -- the (col,row,kind) present in every available
+# source, earliest by HW cycle -- and express every anchor relative to that
+# reference *within its own source*. The reference therefore reads 0 in every
+# source by construction, and per-anchor deltas measure true relative drift,
+# independent of absolute origins AND of which channel each source happens to
+# arm first.
+#
+# (An earlier design normalized each source to its own earliest anchor, which
+# silently assumed that earliest anchor was the same physical event across
+# sources. When it isn't -- HW arms channel A first, aiesim arms channel B first
+# -- that injects a spurious constant offset into every shared-anchor delta. The
+# shared reference removes that failure mode entirely.)
 
 AnchorKey = tuple  # (col:int, row:int, kind:str)
 
 
-def normalize_anchors(record: TimingRecord) -> dict:
-    """Return {(col,row,kind): relative_cycle}, normalized to the record's
-    earliest anchor. Empty if the record carries no anchors."""
-    if not record.anchors:
-        return {}
-    cycles = [int(a["cycle"]) for a in record.anchors]
-    base = min(cycles)
+def anchor_map(record: TimingRecord) -> dict:
+    """Return {(col,row,kind): absolute_cycle} for a record's anchors."""
     out = {}
     for a in record.anchors:
-        key = (int(a["col"]), int(a["row"]), str(a["kind"]))
-        out[key] = int(a["cycle"]) - base
+        out[(int(a["col"]), int(a["row"]), str(a["kind"]))] = int(a["cycle"])
     return out
+
+
+def choose_reference(by_source: dict) -> Optional[AnchorKey]:
+    """Pick the shared reference anchor: the key present in every available
+    source, earliest by HW cycle (or by the first available source if HW is
+    absent). Returns None if the sources share no common anchor."""
+    present = [s for s in SOURCES if by_source.get(s)]
+    if not present:
+        return None
+    common = set(by_source[present[0]])
+    for s in present[1:]:
+        common &= set(by_source[s])
+    if not common:
+        return None
+    rank = "hw" if by_source.get("hw") else present[0]
+    return min(common, key=lambda k: by_source[rank][k])
 
 
 @dataclass
@@ -212,6 +229,7 @@ class AnchorRow:
     hw: Optional[int]
     interp: Optional[int]
     aiesim: Optional[int]
+    is_reference: bool = False
 
     def delta(self, rel: Optional[int]) -> Optional[int]:
         if self.hw is None or rel is None:
@@ -221,17 +239,36 @@ class AnchorRow:
 
 def build_anchor_rows(records: list[TimingRecord]) -> list[AnchorRow]:
     """Group records by (kernel, compiler) and align their anchors on
-    (col, row, kind), each source normalized to its own earliest anchor."""
+    (col, row, kind), all sources normalized to a shared reference anchor.
+
+    When the sources share no common anchor (no reference), each source falls
+    back to its own earliest anchor for display; deltas are None in that case
+    regardless, since there are no shared keys to compare."""
     grouped: dict[tuple[str, str], dict[str, dict]] = {}
     for r in records:
-        grouped.setdefault((r.kernel, r.compiler), {})[r.source] = normalize_anchors(r)
+        grouped.setdefault((r.kernel, r.compiler), {})[r.source] = anchor_map(r)
 
     rows: list[AnchorRow] = []
     for (kernel, compiler), by_source in sorted(grouped.items()):
-        hw = by_source.get("hw", {})
-        interp = by_source.get("interp", {})
-        aiesim = by_source.get("aiesim", {})
-        keys = set(hw) | set(interp) | set(aiesim)
+        ref = choose_reference(by_source)
+        # Per-source base = the reference cycle in that source; if there is no
+        # shared reference, fall back to the source's own earliest (cosmetic --
+        # cross-source deltas require a shared key, which by definition is absent).
+        bases: dict[str, int] = {}
+        for src, amap in by_source.items():
+            if not amap:
+                continue
+            bases[src] = amap[ref] if (ref is not None and ref in amap) else min(amap.values())
+
+        def rel(src: str, key: AnchorKey) -> Optional[int]:
+            amap = by_source.get(src)
+            if not amap or key not in amap:
+                return None
+            return amap[key] - bases[src]
+
+        keys: set = set()
+        for amap in by_source.values():
+            keys |= set(amap)
         for key in sorted(keys):
             col, row, kind = key
             rows.append(
@@ -241,9 +278,10 @@ def build_anchor_rows(records: list[TimingRecord]) -> list[AnchorRow]:
                     col=col,
                     row=row,
                     kind=kind,
-                    hw=hw.get(key),
-                    interp=interp.get(key),
-                    aiesim=aiesim.get(key),
+                    hw=rel("hw", key),
+                    interp=rel("interp", key),
+                    aiesim=rel("aiesim", key),
+                    is_reference=(key == ref),
                 )
             )
     return rows
@@ -259,19 +297,21 @@ def _fmt_delta_int(v: Optional[int]) -> str:
 
 def text_anchor_report(rows: list[AnchorRow]) -> str:
     lines = []
-    lines.append("Three-way per-anchor timing (each source normalized to its earliest anchor; HW = ground truth)")
-    lines.append("Cycles are relative to each source's first activity; iΔ/aΔ are vs HW.")
+    lines.append("Three-way per-anchor timing (shared-reference aligned; HW = ground truth)")
+    lines.append("All sources are normalized to a shared reference anchor (marked *); iΔ/aΔ are vs HW.")
     lines.append("")
 
     # Group rows by (kernel, compiler) for readable sectioning.
     from itertools import groupby
 
-    header = f"  {'tile':<7} {'kind':<20} {'HW':>9} {'interp':>9} {'aiesim':>9} {'iΔ':>8} {'aΔ':>8}"
+    header = f"    {'tile':<7} {'kind':<20} {'HW':>9} {'interp':>9} {'aiesim':>9} {'iΔ':>8} {'aΔ':>8}"
     all_i_abs: list[int] = []
     all_a_abs: list[int] = []
     for (kernel, compiler), group in groupby(rows, key=lambda r: (r.kernel, r.compiler)):
         group = list(group)
-        lines.append(f"{kernel}  [{compiler}]")
+        ref_row = next((r for r in group if r.is_reference), None)
+        ref_label = f"({ref_row.col},{ref_row.row}) {ref_row.kind}" if ref_row else "none (no shared anchor)"
+        lines.append(f"{kernel}  [{compiler}]   ref: {ref_label}")
         lines.append(header)
         lines.append("  " + "-" * (len(header) - 2))
         i_abs: list[int] = []
@@ -283,9 +323,10 @@ def text_anchor_report(rows: list[AnchorRow]) -> str:
                 i_abs.append(abs(di))
             if da is not None:
                 a_abs.append(abs(da))
+            mark = "*" if r.is_reference else " "
             tile = f"({r.col},{r.row})"
             lines.append(
-                f"  {tile:<7} {r.kind:<20} "
+                f"  {mark} {tile:<7} {r.kind:<20} "
                 f"{_fmt_int(r.hw):>9} {_fmt_int(r.interp):>9} {_fmt_int(r.aiesim):>9} "
                 f"{_fmt_delta_int(di):>8} {_fmt_delta_int(da):>8}"
             )
@@ -318,6 +359,7 @@ def json_anchor_report(rows: list[AnchorRow]) -> str:
                 "col": r.col,
                 "row": r.row,
                 "kind": r.kind,
+                "is_reference": r.is_reference,
                 "hw": r.hw,
                 "interp": r.interp,
                 "aiesim": r.aiesim,
@@ -373,16 +415,54 @@ def selftest() -> int:
     assert len(arows) == 2, arows
     start = next(r for r in arows if r.kind == "dma_s2mm0_start")
     done = next(r for r in arows if r.kind == "dma_s2mm0_done")
-    # Normalized: HW start=0 done=200; aiesim start=0 done=210.
+    # Shared reference = earliest-HW common anchor = the start. Normalized:
+    # HW start=0 done=200; aiesim start=0 done=210.
+    assert start.is_reference and not done.is_reference, (start, done)
     assert start.hw == 0 and start.aiesim == 0 and start.delta(start.aiesim) == 0, start
     assert done.hw == 200 and done.aiesim == 210 and done.delta(done.aiesim) == 10, done
     assert done.interp is None and done.delta(done.interp) is None, done
     # Reports render without error.
-    assert "per-anchor" in text_anchor_report(arows)
+    assert "shared-reference" in text_anchor_report(arows)
     assert json.loads(json_anchor_report(arows))[0]["kind"] in ("dma_s2mm0_done", "dma_s2mm0_start")
-    # Empty anchors -> empty normalization.
-    assert normalize_anchors(TimingRecord.from_dict(
+    # Empty anchors -> empty map.
+    assert anchor_map(TimingRecord.from_dict(
         {"kernel": "x", "compiler": "c", "source": "hw", "total_cycles": 1})) == {}
+
+    # -- Shared reference beats per-source-earliest --
+    # HW arms channel A first; aiesim arms channel C first (which HW lacks).
+    # The only common anchor is B. Shared-reference aligns B to delta 0; the old
+    # per-source-earliest method would have reported a spurious offset on B
+    # (hw B-relA = 400 vs aiesim B-relC = 1000 -> bogus 600-cycle drift).
+    A = {"col": 1, "row": 2, "kind": "dma_s2mm0_start", "cycle": 100}
+    B_hw = {"col": 1, "row": 0, "kind": "dma_s2mm0_start", "cycle": 500}
+    B_ai = {"col": 1, "row": 0, "kind": "dma_s2mm0_start", "cycle": 5000}
+    C = {"col": 1, "row": 3, "kind": "dma_mm2s0_start", "cycle": 4000}
+    srecs = [
+        TimingRecord.from_dict({"kernel": "sk", "compiler": "chess", "source": "hw",
+                                "total_cycles": 1, "anchors": [A, B_hw]}),
+        TimingRecord.from_dict({"kernel": "sk", "compiler": "chess", "source": "aiesim",
+                                "total_cycles": 1, "anchors": [B_ai, C]}),
+    ]
+    srows = build_anchor_rows(srecs)
+    b = next(r for r in srows if (r.col, r.row) == (1, 0))
+    assert b.is_reference, b
+    assert b.hw == 0 and b.aiesim == 0 and b.delta(b.aiesim) == 0, b  # NOT 600
+    # A is HW-only, C is aiesim-only -> no cross-source delta.
+    a = next(r for r in srows if (r.col, r.row) == (1, 2))
+    c = next(r for r in srows if (r.col, r.row) == (1, 3))
+    assert a.hw == -400 and a.aiesim is None, a
+    assert c.aiesim == -1000 and c.hw is None, c
+
+    # -- No shared anchor -> no reference, deltas all None --
+    nrecs = [
+        TimingRecord.from_dict({"kernel": "nk", "compiler": "chess", "source": "hw",
+                                "total_cycles": 1, "anchors": [A]}),
+        TimingRecord.from_dict({"kernel": "nk", "compiler": "chess", "source": "aiesim",
+                                "total_cycles": 1, "anchors": [C]}),
+    ]
+    nrows = build_anchor_rows(nrecs)
+    assert all(not r.is_reference for r in nrows), nrows
+    assert all(r.delta(r.aiesim) is None for r in nrows), nrows
 
     print("selftest OK")
     return 0

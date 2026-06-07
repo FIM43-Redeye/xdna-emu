@@ -251,8 +251,13 @@ Notes for the B build:
   on `(col,row,kind)`. Shim DMA (row 0) needs explicit care -- verify the aiesim
   VCD exposes shim-tile DmaFsmState before relying on shim anchors.
 - Alignment: absolute cycle zeros differ between sources (sim start vs trace
-  start), so the comparator normalizes each source's anchors to its earliest
-  anchor (relative timing) before computing per-anchor deltas vs HW.
+  start), so the comparator aligns all sources on a **shared reference anchor**
+  -- the `(col,row,kind)` present in every available source, earliest by HW
+  cycle -- and expresses every anchor relative to that reference within its own
+  source before computing per-anchor deltas vs HW. (An earlier draft normalized
+  each source to its *own* earliest anchor; that silently assumes the first
+  event is the same across sources, injecting a spurious constant offset when it
+  isn't. The shared reference removes that failure mode.)
 
 ## Build plan
 
@@ -288,12 +293,15 @@ Notes for the B build:
    last-`soc` for `_done`, matching the VCD first-leave-idle/last-change rule).
    Event names are grounded on mlir-aie's `python/utils/trace/setup.py` enum.
 8. **(#84) B comparator** -- DONE. `timing-three-way.py --per-anchor` aligns
-   anchors on `(col,row,kind)`, normalizes each source to its earliest anchor,
-   and reports per-anchor deltas vs HW (+ per-kernel and overall mean |Δ|). The
-   earliest-anchor normalization assumes the first-armed channel is the same
-   event across sources; per-anchor deltas are relative to each source's first
-   activity. End-to-end verified: a +50000-cycle origin shift normalizes away
-   cleanly and an injected +30-cycle drift surfaces as the sole nonzero delta.
+   anchors on `(col,row,kind)` against a **shared reference anchor** (the key
+   present in every source, earliest by HW cycle; marked `*` in the report) and
+   reports per-anchor deltas vs HW (+ per-kernel and overall mean |Δ|). The
+   shared reference makes deltas independent of both absolute origins and of
+   which channel each source arms first -- a selftest locks in that it reports 0
+   drift on a shared anchor where per-source-earliest would have reported a
+   bogus 600-cycle offset. End-to-end verified on real fixture data: a
+   +50000-cycle origin shift aligns away cleanly and an injected +30-cycle drift
+   surfaces as the sole nonzero delta.
 9. **(#85) Harness integration**: `--aiesim-timing` mode in emu-bridge-test.sh
    joining all three from the **in-process** run (correctness + timing in one).
 10. **(#85) Campaign**: all 72 kernels, three-way, correctness + timing; close-out
