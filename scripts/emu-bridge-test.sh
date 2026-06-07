@@ -120,17 +120,6 @@ NO_TIMEOUT=false
 WITH_HW_CYCLES=${WITH_HW_CYCLES:-false}
 WITH_CYCLE_DIFF=${WITH_CYCLE_DIFF:-false}
 
-# Phase E dual-bound EMU timing constants.
-# EMU_SECONDS_PER_CYCLE: wall-clock seconds per simulated cycle. Emulator's
-# reported simulation rate is ~800 MHz (pessimistic) to ~1 GHz; 2e-9 s/cycle
-# = 500 M sim-cycles/sec is a conservative starting value that gives headroom
-# on both figures. In practice the 600 s wall-clock floor (below) dominates
-# for any test under ~300 G cycles, so this mostly matters as a sanity cap
-# for pathologically long runs.
-EMU_SECONDS_PER_CYCLE=${EMU_SECONDS_PER_CYCLE:-2e-9}
-EMU_CYCLE_BUDGET_MULTIPLIER=${EMU_CYCLE_BUDGET_MULTIPLIER:-2.0}
-export EMU_SECONDS_PER_CYCLE EMU_CYCLE_BUDGET_MULTIPLIER
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --compile)     FORCE_COMPILE=true; shift ;;
@@ -2154,25 +2143,15 @@ run_one_bridge() {
   local trace_out_dir="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.emu"
   mkdir -p "$trace_out_dir"
 
-  # Phase E dual-bound timing: if a HW cycles file exists for this
-  # test+compiler+variant, derive a tighter cycle budget and a scaled
-  # wall-clock timeout. Otherwise fall back to today's 600 s.
-  # cycles.HW.txt is written by run_one_hardware's predecode (variant = compiler+vsuffix).
-  local _hw_cycles_file="$RESULTS_DIR/${safe}.${compiler}${vsuffix}.cycles.HW.txt"
-  local _hw_cycles=0
-  if [[ -f "$_hw_cycles_file" ]]; then
-      _hw_cycles="$(tr -d '[:space:]' < "$_hw_cycles_file")"
-      [[ -z "$_hw_cycles" ]] && _hw_cycles=0
-  fi
-
-  local _cycle_budget=""
+  # EMU runaway guard is the 600 s wall-clock timeout below. We deliberately do
+  # NOT cap the emulator's internal cycle counter from cycles.HW.txt: that
+  # scalar is the HW trace event SPAN (~10-70k), while the emulator's absolute
+  # cycle counter runs far past it (the active timeline reaches hundreds of
+  # thousands of cycles), so a span-derived XDNA_EMU_MAX_CYCLES kills every
+  # legitimate run. cycles.HW.txt is still produced (run_one_hardware predecode)
+  # and feeds the timing report + _classify_cycle_diff; it just no longer gates
+  # execution.
   local _timeout_s=600
-  if [[ "$_hw_cycles" -gt 0 ]]; then
-      _cycle_budget="$(awk -v c="$_hw_cycles" -v m="$EMU_CYCLE_BUDGET_MULTIPLIER" \
-          'BEGIN{ printf "%d", c*m + 0.5 }')"
-      _timeout_s="$(awk -v c="$_hw_cycles" -v m="$EMU_CYCLE_BUDGET_MULTIPLIER" -v s="$EMU_SECONDS_PER_CYCLE" \
-          'BEGIN{ t=c*m*s; if (t<600) t=600; printf "%d", t + 0.5 }')"
-  fi
 
   local rc=0
   (
@@ -2183,9 +2162,6 @@ run_one_bridge() {
     # Pass through XDNA_EMU_LIB if set (explicit override).
     [[ -n "${XDNA_EMU_LIB:-}" ]] && export XDNA_EMU_LIB
     export XDNA_TRACE_DIR="$trace_out_dir"
-    if [[ -n "$_cycle_budget" ]]; then
-      export XDNA_EMU_MAX_CYCLES="$_cycle_budget"
-    fi
     if [[ "${NO_TIMEOUT:-false}" == "true" ]]; then
       bash -c "$run_cmd"
     else
