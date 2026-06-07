@@ -44,6 +44,18 @@ import sys
 _DMA_EVENT_RE = re.compile(r"^DMA_(S2MM|MM2S)_(\d+)_(START|FINISHED)_TASK$")
 
 
+def load_events(fh) -> list[dict]:
+    """Load a parse-trace events file, accepting both schemas it emits:
+    a bare flat list, or the wrapped `{"schema_version":N, "events":[...]}`.
+    Returns the flat event list (empty if neither shape is present)."""
+    data = json.load(fh)
+    if isinstance(data, dict):
+        return list(data.get("events", []))
+    if isinstance(data, list):
+        return data
+    return []
+
+
 def canonical_kind(event_name: str) -> str | None:
     """Map a trace-BO event name to a canonical anchor kind, or None."""
     m = _DMA_EVENT_RE.match(event_name or "")
@@ -151,6 +163,12 @@ def selftest() -> int:
     assert rec["anchors"] == anchors
     bare = build_output(anchors, None, None, None, None)
     assert bare == {"anchors": anchors}
+    # load_events accepts both the flat-list and {events:[...]} schemas.
+    import io
+    flat = [{"col": 0, "row": 0, "name": "X", "soc": 1}]
+    assert load_events(io.StringIO(json.dumps(flat))) == flat
+    assert load_events(io.StringIO(json.dumps({"schema_version": 1, "events": flat}))) == flat
+    assert load_events(io.StringIO(json.dumps({"schema_version": 1}))) == []
     print("selftest OK")
     return 0
 
@@ -172,10 +190,7 @@ def main() -> int:
         ap.error("events.json path is required (or use --selftest)")
 
     with open(args.events) as fh:
-        events = json.load(fh)
-    if not isinstance(events, list):
-        print(f"Expected a JSON list of events in {args.events}", file=sys.stderr)
-        return 1
+        events = load_events(fh)
 
     anchors = reduce_anchors(events)
     out = build_output(anchors, args.kernel, args.compiler, args.source, args.total_cycles)

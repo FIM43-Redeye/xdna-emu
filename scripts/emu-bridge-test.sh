@@ -113,6 +113,9 @@ MODE2=false
 RUN_AIESIM=false
 RUN_AIESIM_EMU=false  # opt-in via --aiesim-emu (the aiesim BACKEND as a third
                       # comparison side; distinct from --aiesim's standalone CLI)
+AIESIM_TIMING=false   # opt-in via --aiesim-timing: three-way timing campaign --
+                      # dumps the in-process aiesim NPU1 VCD per kernel, captures
+                      # HW+interp trace cycles, joins all three via the comparator
 NO_TIMEOUT=false
 WITH_HW_CYCLES=${WITH_HW_CYCLES:-false}
 WITH_CYCLE_DIFF=${WITH_CYCLE_DIFF:-false}
@@ -153,6 +156,9 @@ while [[ $# -gt 0 ]]; do
     --mode2)               MODE2=true; PC_ANCHORED=true; NO_TRACE=false; shift ;;
     --aiesim)              RUN_AIESIM=true; shift ;;
     --aiesim-emu)          RUN_AIESIM_EMU=true; shift ;;
+    --aiesim-timing)       AIESIM_TIMING=true; RUN_AIESIM_EMU=true
+                           WITH_CYCLE_DIFF=true; WITH_HW_CYCLES=true
+                           NO_TRACE=false; shift ;;
     --serial-hw)           NPU_HW_JOBS=1; shift ;;
     --parallel-hw)         NPU_HW_JOBS="${NPU_HW_JOBS_PARALLEL:-5}"; shift ;;
     --no-timeout)          NO_TIMEOUT=true; shift ;;
@@ -204,6 +210,12 @@ Options:
                   Phoenix oracle that survives the Strix swap.  Requires the FFI
                   .so built with --features aiesim (rebuild-plugin.sh --aiesim)
                   and the aiesim bridge .so (build-aiesim-bridge.sh).  Slow.
+  --aiesim-timing Three-way timing campaign.  Implies --aiesim-emu and
+                  --with-cycle-diff: dumps the in-process aiesim NPU1-native VCD
+                  per kernel (XDNA_AIESIM_VCD), captures HW+interp trace cycles,
+                  and joins all three sources via tools/timing-three-way.py
+                  (Phase 5d).  Emits per-source timing records under
+                  RESULTS_DIR/timing-records/ and total/per-anchor drift reports.
   --list          List available tests and exit
   -jN             Override parallelism (default: nproc)
   -v, --verbose   Show log snippets on failure
@@ -250,7 +262,7 @@ for _c in "${COMPILERS[@]}"; do
 done
 
 # Export variables that parallel jobs need.
-export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP PC_ANCHORED MODE2 RUN_AIESIM RUN_AIESIM_EMU NO_TIMEOUT WITH_HW_CYCLES WITH_CYCLE_DIFF
+export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP PC_ANCHORED MODE2 RUN_AIESIM RUN_AIESIM_EMU AIESIM_TIMING NO_TIMEOUT WITH_HW_CYCLES WITH_CYCLE_DIFF
 export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT SCRIPT_DIR TRACE_QUARANTINE_FILE
 export XRT_DIR XRT_INCLUDE XRT_LIB
 export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
@@ -2492,6 +2504,14 @@ run_one_aiesim() {
   local run_cmd
   run_cmd="$(get_variant_run_cmd "$src_dir" "$variant")"
 
+  # Three-way timing campaign: dump the in-process NPU1-native VCD (#87) so the
+  # join phase (5d) can extract DMA anchors + total cycles for the aiesim side.
+  # Absolute path: the run cd's into build_dir. Gated on --aiesim-timing because
+  # the full-signal VCD is ~8 MB/kernel and adds tracing overhead.
+  local _vcd_out=""
+  [[ "${AIESIM_TIMING:-false}" == "true" ]] && \
+    _vcd_out="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.aiesim.vcd"
+
   local rc=0
   (
     cd "$build_dir"
@@ -2506,6 +2526,7 @@ run_one_aiesim() {
     export XDNA_AIESIM_DEVICE_JSON="$AIESIM_DEVICE_JSON"
     export XDNA_AIESIM_BRIDGE="$AIESIM_BRIDGE_SO"
     export XDNA_AIESIM_NATIVE_GEOMETRY=1
+    [[ -n "$_vcd_out" ]] && export XDNA_AIESIM_VCD="$_vcd_out"
     timeout "$AIESIM_TIMEOUT" bash -c "$run_cmd"
   ) > "$log_file" 2>&1 || rc=$?
 
@@ -2529,6 +2550,88 @@ run_one_aiesim() {
   echo "  AIESIM $display_name ($compiler): $result  $(job_duration "$_aiesim_start")"
 }
 export -f run_one_aiesim
+
+# ---------------------------------------------------------------------------
+# Three-way timing record emission (Phase 5d, task #85)
+# ---------------------------------------------------------------------------
+#
+# Joins the three timing sources for one (test, compiler, variant) into the
+# data-contract *.timing.json records consumed by tools/timing-three-way.py:
+#   hw     -- trace-BO events.json (--with-hw-cycles) -> tools/trace-anchors.py
+#   interp -- EMU trace-BO events.json (--with-cycle-diff) -> tools/trace-anchors.py
+#   aiesim -- in-process NPU1 VCD (XDNA_AIESIM_VCD) -> vcd-compare --anchors/--cycles
+# Each source is best-effort: a missing artifact simply omits that record, and
+# the comparator reports whatever is present.
+
+# Locate the vcd-compare binary (prefer release, fall back to debug). Echoes the
+# path on stdout; returns 1 if neither exists.
+_find_vcd_compare_bin() {
+  if [[ -x "$EMU_ROOT/target/release/vcd-compare" ]]; then
+    echo "$EMU_ROOT/target/release/vcd-compare"
+  elif [[ -x "$EMU_ROOT/target/debug/vcd-compare" ]]; then
+    echo "$EMU_ROOT/target/debug/vcd-compare"
+  else
+    return 1
+  fi
+}
+
+_emit_timing_records() {
+  local name="$1" compiler="$2" variant="${3:-}"
+  local safe; safe="$(sanitize_name "$name")"
+  local vsuffix=""; [[ -n "$variant" ]] && vsuffix=".${variant}"
+  local var="${compiler}${vsuffix}"
+  local outdir="$RESULTS_DIR/timing-records"
+  mkdir -p "$outdir"
+  local work="$RESULTS_DIR/${safe}.hw-cycles"
+
+  # -- HW side --
+  local hw_events="$work/trace_hw.${var}.events.json"
+  if [[ -f "$hw_events" ]]; then
+    local hw_tc=() hw_cyc="$RESULTS_DIR/${safe}.${var}.cycles.HW.txt"
+    [[ -f "$hw_cyc" ]] && hw_tc=(--total-cycles "$(tr -d '[:space:]' < "$hw_cyc")")
+    python3 "$EMU_ROOT/tools/trace-anchors.py" "$hw_events" \
+      --source hw --kernel "$name" --compiler "$compiler" "${hw_tc[@]}" \
+      -o "$outdir/${safe}.${var}.hw.timing.json" 2>/dev/null || true
+  fi
+
+  # -- Interpreter (EMU) side --
+  local emu_events="$work/trace_emu.${var}.events.json"
+  if [[ -f "$emu_events" ]]; then
+    local emu_tc=() emu_cyc="$RESULTS_DIR/${safe}.${var}.cycles.EMU.txt"
+    [[ -f "$emu_cyc" ]] && emu_tc=(--total-cycles "$(tr -d '[:space:]' < "$emu_cyc")")
+    python3 "$EMU_ROOT/tools/trace-anchors.py" "$emu_events" \
+      --source interp --kernel "$name" --compiler "$compiler" "${emu_tc[@]}" \
+      -o "$outdir/${safe}.${var}.interp.timing.json" 2>/dev/null || true
+  fi
+
+  # -- aiesim side (in-process NPU1 VCD) --
+  local vcd="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.aiesim.vcd"
+  local vcd_bin; vcd_bin="$(_find_vcd_compare_bin || true)"
+  if [[ -f "$vcd" && -n "$vcd_bin" ]]; then
+    # The in-process VCD is native NPU1 geometry -- both modes need the
+    # npu1-inproc tree (--anchors defaults to it, but --cycles defaults to
+    # vc2802, which resolves nothing here and yields a degenerate 0-cycle span).
+    local tmpd; tmpd="$(mktemp -d "${TMPDIR:-/tmp}/aiesim-timing.XXXXXX")"
+    "$vcd_bin" --anchors "$vcd" --device npu1-inproc > "$tmpd/anchors.json" 2>/dev/null || true
+    "$vcd_bin" --cycles "$vcd" --device npu1-inproc --json > "$tmpd/span.json" 2>/dev/null || true
+    if [[ -s "$tmpd/anchors.json" ]]; then
+      python3 - "$name" "$compiler" "$tmpd/anchors.json" "$tmpd/span.json" \
+        "$outdir/${safe}.${var}.aiesim.timing.json" <<'PYEOF' || true
+import json, sys
+name, comp, ancp, spanp, out = sys.argv[1:6]
+anc = json.load(open(ancp))
+try:
+    tc = json.load(open(spanp)).get("span_cycles")
+except Exception:
+    tc = None
+rec = {"kernel": name, "compiler": comp, "source": "aiesim",
+       "total_cycles": tc, "anchors": anc.get("anchors", [])}
+json.dump(rec, open(out, "w"), indent=2)
+PYEOF
+    fi
+    rm -rf "$tmpd"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Trace comparison helpers (Phase 5: run_one_bridge trace_raw.bin flow)
@@ -4208,6 +4311,35 @@ main() {
         _classify_cycle_diff "$_rn" "${_rc}${_rsuffix}" || true
       done
     done
+  fi
+
+  # ---- Phase 5d: aiesim three-way timing join ----------------------------
+  if [[ "${AIESIM_TIMING:-false}" == "true" ]]; then
+    info "Phase 5d: aiesim three-way timing join"
+    local _tj_compilers
+    read -ra _tj_compilers <<< "$COMPILERS_STR"
+    for _row in "${report_rows[@]}"; do
+      local _rn="${_row%%:*}" _rv="${_row#*:}"
+      for _rc in "${_tj_compilers[@]}"; do
+        _emit_timing_records "$_rn" "$_rc" "$_rv"
+      done
+    done
+    local _tj_dir="$RESULTS_DIR/timing-records"
+    if ls "$_tj_dir"/*.timing.json &>/dev/null; then
+      local _n_rec
+      _n_rec="$(ls "$_tj_dir"/*.timing.json 2>/dev/null | wc -l)"
+      python3 "$EMU_ROOT/tools/timing-three-way.py" --records "$_tj_dir" \
+        -o "$RESULTS_DIR/timing-three-way.total.txt" 2>/dev/null || true
+      python3 "$EMU_ROOT/tools/timing-three-way.py" --records "$_tj_dir" --per-anchor \
+        -o "$RESULTS_DIR/timing-three-way.per-anchor.txt" 2>/dev/null || true
+      python3 "$EMU_ROOT/tools/timing-three-way.py" --records "$_tj_dir" --json \
+        -o "$RESULTS_DIR/timing-three-way.total.json" 2>/dev/null || true
+      python3 "$EMU_ROOT/tools/timing-three-way.py" --records "$_tj_dir" --per-anchor --json \
+        -o "$RESULTS_DIR/timing-three-way.per-anchor.json" 2>/dev/null || true
+      info "Phase 5d done: $_n_rec timing record(s) in $_tj_dir; reports: timing-three-way.{total,per-anchor}.{txt,json}"
+    else
+      info "Phase 5d: no timing records produced (no aiesim VCD / trace events captured?)"
+    fi
   fi
 
   info "Phase 6: Report"
