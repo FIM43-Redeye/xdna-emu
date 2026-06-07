@@ -38,17 +38,55 @@ focused **re-verify** of the 17 non-PASS (test×compiler) pairs on the current
   with default env (one drain WARNING, then `PASS!`). TCT-on-PL path unchanged.
   Standing diagnostic added: `XDNA_AIESIM_MUXLOG=1` logs shim mux/demux
   (0x1F000/0x1F004) writes.
-- **`vec_mul_trace_distribute_lateral` (peano) — characterized (genuine aiesim
-  trace gap).** Compute PASSes; only the trace-buffer check fails. The lateral
-  egress shim (col2) S2MM channels start but drain empty in 2 cycles. VCD root
-  cause: the **trace-unit FSM never activates** (`event_trace.state` flat-0 at the
-  core, memtile, and egress shim) because the trace-start **broadcast (broadcast
-  15) never fires** (broadcast network flat). The event-input wires DO fire, so
-  events occur but are never packed/emitted. This is an aiesim cluster-model gap —
-  aiesim does not deliver hardware trace data here, so it **cannot be a
-  trace-fidelity oracle** for the trace-event-sweep campaign. Open question (Maya):
-  is the broadcast-start config something we can enable via the device file? The
-  trace unit *exists*; worth a look. Not bridge code either way.
+- **`vec_mul_trace_distribute_lateral` (peano) — ROOT-CAUSED (#93, 2026-06-07).**
+  Compute PASSes; only the trace-buffer check fails (empty buffer → `parse_trace`
+  JSONDecodeError → FAIL). Precise mechanism, from a fresh full-array VCD
+  (`/tmp/.../distlat.vcd`, analyzed per-tile/per-direction):
+  - The trace-start **does** fire. The kernel issues `Event_Generate=127` on a
+    shim; the model honors it — `shim.tile_2_0.event_trace.event127_user_event_1`
+    goes high @2237ns, and one tick later that shim drives its broadcast bus to
+    **bit-15** (`event_broadcast_a.*_m @2238ns`). So "Event_Generate not modeled"
+    is **refuted**.
+  - Broadcast-15 **floods the entire shim row east-west** — reaches every shim
+    column (col2@2238 → col1@2240 → col0@2242, eastward to col3/col4), on both the
+    `_a` and `_b` networks. The horizontal broadcast network works.
+  - But it **never climbs north out of row 0.** Every memtile (`mem_row.tile_X_1`)
+    and every array tile (`tile_X_{2..7}`) broadcast bus is flat; even where a shim
+    asserts its `north_m` with bit-15 (col2), the memtile directly above never
+    receives it. **The shim→memtile vertical broadcast link is unwired in the
+    cluster model.** Hence no memtile/core sees broadcast-15, every
+    `event_trace.state` stays flat-0 array-wide, no trace packets are produced.
+  - This **corrects** the earlier coarse note ("broadcast network flat"): the
+    broadcast is alive in the shim row; it just cannot cross the shim/array
+    boundary. Same *class* as the PL-egress finding — generic-Versal cluster
+    internal connectivity ≠ XDNA.
+  - **Answer to Maya's device-file question: NO.** The decrypted device JSON
+    (`NPU1.json`) describes the event *register map* (offsets like
+    `ctrl_event_generate=0x008`, `ctrl_event_broadcast_block_{n,s,e,w}`), event-ID
+    enums, stream-switch connectivity (`DeviceConnections`), and the ME↔PL **event
+    boundary** ports (`ME_PL_M_EVENTS`→plsink, `ME_PL_S_EVENTS`←0). It has **no
+    internal tile-to-tile broadcast adjacency** — that wiring is structural in the
+    closed `libaie2_cluster_msm`. Nothing in the device-file schema controls the
+    missing shim→array hop. (Also: trace-start uses **no** `Event_Broadcast_Block`
+    writes — broadcast is meant to flood freely — so it's not a blocked-route or
+    config issue either.)
+  - **Scope of the limitation:** EVERY standard mlir-aie trace setup starts the
+    trace unit on broadcast-15 generated at a shim (row 0) and consumed in the
+    array (row ≥ 2). Since that vertical hop is severed, **aiesim cannot oracle
+    hardware trace for any such kernel** — distribute_lateral isn't special, it's
+    just the one kernel that *validates* trace contents and thus FAILs visibly;
+    other trace kernels "pass" only because they never check the buffer.
+  - **Secondary observation (separate, non-gating):** `Event_Generate` was
+    addressed to col1 (`shim_noc_tile_1_0`) but `user_event_1` fired on col2's
+    shim — an apparent 1-column offset in the shim address remap. It does **not**
+    gate trace (broadcast floods all columns anyway), but it's worth a separate
+    look. Flagged, not chased here.
+  - **Disposition:** characterize and accept — aiesim is **not** a trace oracle;
+    HW + interpreter remain the trace-fidelity path. A local broadcast-bridge
+    patch (analogous to the control-read clone) is *theoretically* possible but a
+    much deeper lift into the proprietary event network and arguably fabricates
+    trace-start fidelity — **not pursued** absent a Maya decision. Not bridge code
+    either way.
 - **`objectfifo_repeat/init_values_repeat` (peano) — NEW open FAIL.** Surfaced by
   the re-verify (campaign had it as TIMEOUT). Fails fast (log ends after 5 NPU
   instructions; no PL-PANIC, no Sync-timeout, no quiescent-wedge) — a distinct
