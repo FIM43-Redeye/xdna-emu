@@ -119,6 +119,59 @@ Mechanism: `dma_wait`'s hard sim-time backstop is `poll_max_ns()` default = 50ms
 *sim* time, which at cycle-accurate speed is ~1200s *wall* — so the timeouts
 cluster at 1200s because that is the natural sim-budget limit, not a wedge.
 
+## Classification RESULT (`20260607-ratelog`, sim backstop off, 2400s cap)
+
+Re-running the 6 genuine-timeout kernels with `XDNA_AIESIM_POLL_MAX_NS=0` and a
+2400s wall cap **resolved 5 of 7 as merely slow** (Maya's instinct was right):
+
+| Kernel | Campaign | Reclassified |
+|--------|----------|--------------|
+| `ctrl_packet_reconfig_1x4_cores` (chess/peano) | TIMEOUT | **PASS** @ 1098 / 1119s |
+| `dma_task_large_linear` (peano) | TIMEOUT | **PASS** @ 1527s |
+| `nd_memcpy_linear_repeat` (peano) | TIMEOUT | **PASS** @ 935s |
+| `packet_flow_fanin` (chess/peano) | TIMEOUT | **PASS** @ 697 / 915s |
+| `objectfifo_repeat/compute_repeat` (peano) | TIMEOUT | quiescent wedge (txns stall @64) |
+| `objectfifo_repeat/init_values_repeat` (peano) | TIMEOUT | quiescent wedge (txns=0) |
+
+Heartbeat ratio ~5000 ms_wall/µs_sim — at 1200s wall the sim has advanced only
+~240µs, so these are slow-but-progressing, not stuck.
+
+**CORRECTION:** family B above ("`dma_task_large_linear` — never signals
+completion") is **wrong** — it completes at 1527s. The transfer is fine; it was
+just slower than the 1200s cutoff. Not a model gap.
+
+The two `objectfifo_repeat` wedges trip at ~131µs sim — suspiciously close to the
+default 512-quanta settle window (~131µs). Disambiguation
+(`20260607-settlecheck`, `XDNA_AIESIM_SETTLE_QUANTA=16384`): **both PASS**
+(`compute_repeat` @ 609.7s, `init_values_repeat` @ 1828.8s). So they were
+**settle-window FALSE-TRIPS, not real wedges.**
+
+## FINAL verdict: ZERO genuine aiesim model wedges in the timeout set
+
+All 7 campaign "timeouts" were **our own instrumentation defaults**, not aiesim
+model gaps:
+
+- **5 = `AIESIM_TIMEOUT` (1200s) too short.** They pass with budget
+  (`dma_task_large_linear` @1527s, `init_values_repeat` @1829s low-contention).
+- **2 = `settle_quanta` (512) too short** for repeat-mode inter-iteration DMA
+  gaps. Measured max legitimate idle gap = **512 quanta** (`init_values_repeat`)
+  / 495 (`compute_repeat`) — i.e. the default settle window sits exactly *at* the
+  legitimate gap, so it borderline-false-trips a still-live transfer as wedged.
+
+The aiesim oracle is therefore **more faithful than the campaign suggested** —
+the control-read clone patch and all prior DMA/TCT fixes hold; the remaining
+"failures" were measurement artifacts. The only genuinely-failing kernels are the
+two fast FAILs (next section).
+
+### Two instrumentation fixes (derived, not magic numbers)
+1. **`settle_quanta` default 512 → higher.** Must exceed the measured ~512-quanta
+   legitimate gap with margin. Tension: at ~5000 ms_wall/µs_sim a larger settle
+   window means a *real* wedge burns `settle × ratio` wall before it's flagged
+   (512→~675s, 2048→~2600s). Proposed 2048 (4× margin) balances false-trip
+   safety against real-wedge detection latency.
+2. **`AIESIM_TIMEOUT` default 1200 → 2400+.** `init_values_repeat` needed 1829s
+   at low contention; under the campaign's `-P14` load the ceiling is higher.
+
 ## Next-step plan (CLASSIFY-then-FIX)
 
 Per Maya: fix the genuinely-broken ones — but first separate genuine wedges from
