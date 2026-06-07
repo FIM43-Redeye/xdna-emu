@@ -1878,8 +1878,18 @@ compile_one() {
     # #355a cycle-delta calibration which needs event_time (mode 0)
     # so tools/dma-fill-measure.py can extract per-event cycle counts.
     local _trace_mode_args=()
-    if [[ -n "${XDNA_TRACE_MODE:-}" ]]; then
-      _trace_mode_args=(--trace-mode "$XDNA_TRACE_MODE")
+    local _trace_mode="${XDNA_TRACE_MODE:-}"
+    # When capturing cycles, default the trace to event_time (mode 0): the
+    # cycle pipeline (parse-trace --out-cycles, dma-fill-measure) is tuned for
+    # it, and the merged trace-prepare binary (which replaces the separate
+    # core-only hw-cycles injection -- see below) must carry cycles too. A
+    # PC-anchored sweep needs event_pc, so it wins; an explicit override always
+    # wins.
+    if [[ -z "$_trace_mode" && "$WITH_HW_CYCLES" == "true" && "$PC_ANCHORED" != "true" ]]; then
+      _trace_mode="event_time"
+    fi
+    if [[ -n "$_trace_mode" ]]; then
+      _trace_mode_args=(--trace-mode "$_trace_mode")
     fi
     # Optional override: explicit shim event slot list, replacing the
     # default S2MM/MM2S START/FINISHED + S2MM STREAM_STARVATION sweep.
@@ -1948,11 +1958,23 @@ compile_one() {
   # mlir-aie test sources use the literal "NPUDEVICE" placeholder which the
   # test's lit file normally resolves via sed. We do the substitution into a
   # temporary pre-substituted MLIR before handing it to the injector.
+  #
+  # MERGE (2026-06-06): when trace-prepare already ran (TRACE_OK), it produced
+  # the full multi-tile trace (core for cycles + shim/memmod DMA task events for
+  # per-anchor timing) via the SAME underlying injector this path uses. Running
+  # the separate core-only hw-cycles injection then would just re-do the work
+  # AND override the richer trace at compile (line ~1596 priority), discarding
+  # the DMA events. So skip it when TRACE_OK; the trace-prepare binary is the
+  # single executed binary feeding both the cycle pipeline and the anchor
+  # extractor. The hw-cycles injection survives only as the --no-trace fallback.
   local hw_cycles_traced_mlir=""
-  if [[ "$WITH_HW_CYCLES" == "true" ]] && is_trace_incompat "$name"; then
+  if [[ "$WITH_HW_CYCLES" == "true" ]] && [[ "$TRACE_OK" == "true" ]]; then
+      echo "  HW-CYCLES INJECT $name: SKIP (trace-prepare provides full trace)"
+  fi
+  if [[ "$WITH_HW_CYCLES" == "true" ]] && [[ "$TRACE_OK" != "true" ]] && is_trace_incompat "$name"; then
       echo "  HW-CYCLES INJECT $name: SKIP (in trace-incompat-tests.txt)"
   fi
-  if [[ "$WITH_HW_CYCLES" == "true" ]] && ! is_trace_incompat "$name"; then
+  if [[ "$WITH_HW_CYCLES" == "true" ]] && [[ "$TRACE_OK" != "true" ]] && ! is_trace_incompat "$name"; then
       local hw_cycles_inject_log="$RESULTS_DIR/${safe}.hw-cycles-inject.log"
       local hw_cycles_target="$build_dir/aie-hw-cycles-traced.mlir"
       local hw_cycles_src="$build_dir/aie-hw-cycles-src.mlir"
@@ -2582,10 +2604,16 @@ _emit_timing_records() {
   local var="${compiler}${vsuffix}"
   local outdir="$RESULTS_DIR/timing-records"
   mkdir -p "$outdir"
-  local work="$RESULTS_DIR/${safe}.hw-cycles"
+
+  # Anchors come from the MAIN run's events.json (the actually-executed binary's
+  # full trace -- core + shim/memmod DMA task events), written by
+  # _predecode_events_next_to_trace into the per-side trace dir. The total cycle
+  # scalar still comes from the cycle pipeline's cycles.{HW,EMU}.txt. (NOT the
+  # cycle-pipeline trace_{hw,emu}.events.json, which is a separate, often
+  # core-only capture and carries no DMA anchors.)
 
   # -- HW side --
-  local hw_events="$work/trace_hw.${var}.events.json"
+  local hw_events="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw/events.json"
   if [[ -f "$hw_events" ]]; then
     local hw_tc=() hw_cyc="$RESULTS_DIR/${safe}.${var}.cycles.HW.txt"
     [[ -f "$hw_cyc" ]] && hw_tc=(--total-cycles "$(tr -d '[:space:]' < "$hw_cyc")")
@@ -2595,7 +2623,7 @@ _emit_timing_records() {
   fi
 
   # -- Interpreter (EMU) side --
-  local emu_events="$work/trace_emu.${var}.events.json"
+  local emu_events="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.emu/events.json"
   if [[ -f "$emu_events" ]]; then
     local emu_tc=() emu_cyc="$RESULTS_DIR/${safe}.${var}.cycles.EMU.txt"
     [[ -f "$emu_cyc" ]] && emu_tc=(--total-cycles "$(tr -d '[:space:]' < "$emu_cyc")")
