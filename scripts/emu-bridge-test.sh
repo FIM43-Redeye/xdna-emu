@@ -859,188 +859,13 @@ _strip_trace_flags() {
   echo "$cmd"
 }
 
-# _run_trace_cycles_pipeline <side> <build_dir> <xclbin> <kernel> <instr> <variant>
-#   side ∈ {HW, EMU}.
-# Runs bridge-trace-runner against a traced xclbin on the requested side,
-# then runs parse-trace.py (in-tree tools/trace_decoder backend by default;
-# mlir-aie still used for slot-name lookup from MLIR) to emit both the flat
-# events JSON (for trace-compare) and the cycles scalar (for the CYCLES
-# column) in a single pass. Writes:
-#   RESULTS_DIR/<safe>.hw-cycles/trace_{hw,emu}.<variant>.bin
-#   RESULTS_DIR/<safe>.hw-cycles/trace_{hw,emu}.<variant>.events.json
-#   RESULTS_DIR/<safe>.<variant>.cycles.{HW,EMU}.txt
-# Best-effort: any failure logs and returns non-zero, but callers pass || true
-# so the core bridge/hw verdicts are never gated on the cycle-capture side.
-_run_trace_cycles_pipeline() {
-    local side="$1"
-    local build_dir="$2"
-    local xclbin="$3"
-    local kernel="$4"      # currently unused; runner auto-detects single kernel
-    local instr="$5"
-    local variant="$6"     # already includes compiler + any variant suffix
-
-    local test_name
-    test_name="$(basename "$(dirname "$build_dir")")"
-
-    local runner="$EMU_ROOT/bridge-runner/build/bridge-trace-runner"
-    if [[ ! -x "$runner" ]]; then
-        echo "[trace-cycles:$side] $test_name ($variant): runner not built at $runner; skipping" >&2
-        return 0
-    fi
-
-    # parse_trace needs the POST-LOWERING MLIR (input_with_addresses.mlir)
-    # produced by aiecc.py inside its .prj scratch dir. The .prj dir is
-    # named after whatever MLIR aiecc was invoked on -- aie_arch.mlir.prj
-    # for most tests, aie_overlay.mlir.prj for control-packet tests, etc.
-    # Discover it by searching for the unique input_with_addresses.mlir
-    # rather than hardcoding the source-filename assumption.
-    #
-    # The trace-presence check uses a source MLIR with high-level aie.trace
-    # ops. We pick any MLIR in build_dir with aie.trace (typically
-    # aie_arch.mlir, written by our injector); if none, no tracing happened.
-    local src_mlir=""
-    for _cand in "$build_dir"/*.mlir; do
-        [[ -f "$_cand" ]] || continue
-        if grep -q "aie.trace " "$_cand" 2>/dev/null; then
-            src_mlir="$_cand"
-            break
-        fi
-    done
-    if [[ -z "$src_mlir" ]]; then
-        echo "[trace-cycles:$side] $test_name ($variant): no MLIR with aie.trace ops in $build_dir; skipping" >&2
-        return 0
-    fi
-    local mlir_path
-    mlir_path="$(find "$build_dir" -mindepth 2 -maxdepth 2 -name 'input_with_addresses.mlir' -print -quit 2>/dev/null || true)"
-    if [[ -z "$mlir_path" || ! -f "$mlir_path" ]]; then
-        echo "[trace-cycles:$side] $test_name ($variant): no aiecc-lowered MLIR (input_with_addresses.mlir) under $build_dir/*.prj/; cannot extract cycles" >&2
-        return 0
-    fi
-
-    local safe
-    safe="$(sanitize_name "$test_name")"
-    local work_dir="$RESULTS_DIR/${safe}.hw-cycles"
-    mkdir -p "$work_dir"
-
-    local bin_label cycles_label
-    case "$side" in
-        HW)  bin_label="trace_hw";  cycles_label="HW" ;;
-        EMU) bin_label="trace_emu"; cycles_label="EMU" ;;
-        *)   echo "[trace-cycles] unknown side: $side" >&2; return 1 ;;
-    esac
-
-    local trace_bin="$work_dir/${bin_label}.${variant}.bin"
-    local events_json="$work_dir/${bin_label}.${variant}.events.json"
-    local cycles_txt="$RESULTS_DIR/${safe}.${variant}.cycles.${cycles_label}.txt"
-    local runner_log="$work_dir/runner.${bin_label}.${variant}.log"
-    local extract_log="$work_dir/extract.${bin_label}.${variant}.log"
-
-    # Side-specific env: EMU routes through the XRT plugin + xdna-emu. HW runs
-    # on real silicon, so nothing extra is needed.
-    local -a env_prefix=()
-    if [[ "$side" == "EMU" ]]; then
-        # XDNA_EMU presence (any value) activates the emulator; the plugin
-        # injects the emu device at xrt::device(0), no BDF magic needed.
-        # XDNA_EMU_RUNTIME picks debug vs release.
-        env_prefix+=("XDNA_EMU=1")
-        env_prefix+=("XDNA_EMU_RUNTIME=${XDNA_EMU_RUNTIME:-debug}")
-        env_prefix+=("XDNA_EMU_LOG_LEVEL=${XDNA_EMU_LOG_LEVEL:-info}")
-        [[ -n "${XDNA_EMU_DIR:-}" ]] && env_prefix+=("XDNA_EMU_DIR=$XDNA_EMU_DIR")
-    fi
-
-    # Optional control-packet blob gets fed as --ctrlpkt when the test's
-    # lit specifies --ctrlpkt-name. The runner uses libxdna_emu.so's
-    # kernarg classifier to identify the Ctrlpkt-role arg_idx and bind
-    # the blob there; if the classifier is unavailable the flag falls
-    # back to --input semantics (legacy positional).
-    local -a extra_args=()
-    local _ctrlpkt_name
-    _ctrlpkt_name="$(_discover_ctrlpkt_binary "$TEST_SRC/$test_name")"
-    if [[ -n "$_ctrlpkt_name" ]] && [[ -f "$build_dir/$_ctrlpkt_name" ]]; then
-        extra_args+=(--ctrlpkt "$build_dir/$_ctrlpkt_name")
-    fi
-
-    if ! env "${env_prefix[@]}" "$runner" \
-        --xclbin "$xclbin" \
-        --instr "$instr" \
-        --trace-out "$trace_bin" \
-        --trace-size 1048576 \
-        "${extra_args[@]}" \
-        2>"$runner_log"; then
-        echo "[trace-cycles:$side] $test_name ($variant): runner failed; see $runner_log" >&2
-        return 1
-    fi
-
-    # Single-pass decode: parse-trace.py wraps mlir-aie's parser and emits
-    # both the flat events JSON (for trace-compare) and the cycles scalar
-    # (for the CYCLES column). One invocation, derived from shared state,
-    # guarantees the two outputs never disagree.
-    #
-    # `--trace-mode auto` reads each per-tile payload's Start opcode and
-    # dispatches mode-0 (EventTime) and mode-1 (EventPC) tiles to their
-    # respective rebuilders. Without this, the script's default
-    # (event_time / mode 0) misinterprets mode-1 EventPC frames from
-    # compute cores as cycle-delta Multiple/Single opcodes, producing
-    # bogus cycle accumulators (the "247060 cycle gap" diagnosed in
-    # 2026-05-11-emu-dma-pipeline-too-fast-misses-stalls.md).
-    if ! PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python \
-        python3 "$EMU_ROOT/tools/parse-trace.py" \
-        --trace-bin "$trace_bin" \
-        --xclbin-mlir "$mlir_path" \
-        --trace-mode auto \
-        --out-events "$events_json" \
-        --out-cycles "$cycles_txt" \
-        2>"$extract_log"; then
-        echo "[trace-cycles:$side] $test_name ($variant): parse-trace failed; see $extract_log" >&2
-        return 1
-    fi
-
-    echo "[trace-cycles:$side] $test_name ($variant): cycles=$(cat "$cycles_txt")" >&2
-    return 0
-}
-
-# _run_trace_compare <test_name> <variant>
-# Runs trace-compare on the HW and EMU events JSONs produced by
-# _run_trace_cycles_pipeline (via parse-trace.py). Writes the report to
-# RESULTS_DIR/<safe>.<variant>.cycles.compare.txt.
-# Returns 0 on success, 1 if either events JSON is missing, 2 on compare error.
-_run_trace_compare() {
-    local test_name="$1"
-    local variant="$2"
-
-    local safe
-    safe="$(sanitize_name "$test_name")"
-    local work_dir="$RESULTS_DIR/${safe}.hw-cycles"
-    local hw_events="$work_dir/trace_hw.${variant}.events.json"
-    local emu_events="$work_dir/trace_emu.${variant}.events.json"
-    local report="$RESULTS_DIR/${safe}.${variant}.cycles.compare.txt"
-
-    if [[ ! -f "$hw_events" || ! -f "$emu_events" ]]; then
-        return 1
-    fi
-
-    local rust_bin="$EMU_ROOT/target/release/trace-compare"
-    if [[ ! -x "$rust_bin" ]]; then
-        echo "[trace-compare] trace-compare binary not built at $rust_bin" >&2
-        return 2
-    fi
-
-    # --remap-columns normalizes each side's physical column numbers to
-    # 0-indexed logical columns before pairing. HW schedulers pick
-    # start_col=1 (or similar) whereas the emulator always places kernels
-    # at col=0; without remapping, identical events on row=2 appear on
-    # tile (1,2) in HW vs (0,2) in EMU and fall out as count mismatches.
-    if ! "$rust_bin" \
-        --hw "$hw_events" \
-        --emu "$emu_events" \
-        --remap-columns \
-        --stalls \
-        --extended \
-        -o "$report" 2>/dev/null; then
-        return 2
-    fi
-    return 0
-}
+# NOTE (B-full, 2026-06-06): _run_trace_cycles_pipeline and _run_trace_compare
+# were retired here. They re-executed each passing kernel via
+# bridge-trace-runner to capture a second trace BO purely for the cycle scalar
+# + HW/EMU compare -- redundant once the #89 merge made trace-prepare's traced
+# binary the single executed binary. Cycle scalars now come from the main run's
+# trace BO (_predecode_events_next_to_trace --out-cycles), and _classify_cycle_diff
+# runs trace-compare directly on the main run's per-side events.json.
 
 # _classify_cycle_diff <test_name> <variant>
 # Reads the HW/EMU cycles files and the compare report, writes one of
@@ -1054,18 +879,25 @@ _classify_cycle_diff() {
 
     local safe
     safe="$(sanitize_name "$test_name")"
-    local work_dir="$RESULTS_DIR/${safe}.hw-cycles"
-    local hw_bin="$work_dir/trace_hw.${variant}.bin"
-    local emu_bin="$work_dir/trace_emu.${variant}.bin"
+    # variant = "${compiler}${vsuffix}"; split it back to locate the per-side
+    # event dirs, named "${safe}${vsuffix}.${compiler}.{hw,emu}".
+    local compiler="${variant%%.*}"
+    local vsuffix="${variant#"$compiler"}"
+
+    # B-full (2026-06-06): the cycle-diff leg now reads the MAIN run's
+    # events.json + cycle scalars -- the same trace BO the actually-executed
+    # binary produced -- instead of a separate bridge-trace-runner re-execution.
+    local hw_events="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw/events.json"
+    local emu_events="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.emu/events.json"
     local hw_cycles_txt="$RESULTS_DIR/${safe}.${variant}.cycles.HW.txt"
     local emu_cycles_txt="$RESULTS_DIR/${safe}.${variant}.cycles.EMU.txt"
     local report="$RESULTS_DIR/${safe}.${variant}.cycles.compare.txt"
     local out_file="$RESULTS_DIR/${safe}.${variant}.cycle.result"
 
-    local hw_have_bin=false; [[ -f "$hw_bin"  ]] && hw_have_bin=true
-    local emu_have_bin=false; [[ -f "$emu_bin" ]] && emu_have_bin=true
+    local hw_have=false; [[ -f "$hw_events"  ]] && hw_have=true
+    local emu_have=false; [[ -f "$emu_events" ]] && emu_have=true
 
-    if ! $hw_have_bin && ! $emu_have_bin; then
+    if ! $hw_have && ! $emu_have; then
         echo "NO_DATA" > "$out_file"
         return 0
     fi
@@ -1076,12 +908,12 @@ _classify_cycle_diff() {
     [[ -z "$hw_cycles"  ]] && hw_cycles=0
     [[ -z "$emu_cycles" ]] && emu_cycles=0
 
-    # Asymmetry cases: one side traced, the other didn't.
-    if $hw_have_bin && ! $emu_have_bin; then
+    # Asymmetry cases: one side produced a trace (events.json), the other didn't.
+    if $hw_have && ! $emu_have; then
         echo "EMU_TRACE_BUG" > "$out_file"
         return 0
     fi
-    if $emu_have_bin && ! $hw_have_bin; then
+    if $emu_have && ! $hw_have; then
         echo "HW_TRACE_BUG" > "$out_file"
         return 0
     fi
@@ -1094,15 +926,14 @@ _classify_cycle_diff() {
         return 0
     fi
 
-    # Both sides captured zero events. Two legitimate shapes:
+    # Both sides captured zero cycle-bearing events. Two legitimate shapes:
     #   NO_CORE  -- traced MLIR has no aie.core (DMA-only passthrough like
     #               column_specific). Core-side trace events cannot fire
     #               without a core, so HW and EMU both produce zeros.
-    #   EMPTY    -- has core, but default event set did not fire (Phase B
-    #               Limitation 1 -- scalar kernels). Broadening the event
-    #               set would turn these into usable data points.
+    #   EMPTY    -- has core, but default event set did not fire (scalar
+    #               kernels). Broadening the event set would make these usable.
     if [[ "$hw_cycles" -eq 0 && "$emu_cycles" -eq 0 ]]; then
-        local traced_mlir="$BUILD_BASE/$test_name/aie-hw-cycles-traced.mlir"
+        local traced_mlir="$BUILD_BASE/$test_name/traced/aie_traced.mlir"
         if [[ -f "$traced_mlir" ]] && ! grep -q 'aie\.core' "$traced_mlir"; then
             echo "NO_CORE" > "$out_file"
         else
@@ -1111,8 +942,23 @@ _classify_cycle_diff() {
         return 0
     fi
 
-    # Both non-zero: parse the compare report for divergence counts.
-    if [[ ! -f "$report" ]]; then
+    # Both non-zero: run trace-compare directly on the main-run events.json
+    # pair for divergence counts (replaces the old re-executed compare). The
+    # --remap-columns flag is essential -- HW schedulers place kernels at
+    # start_col=1 while the emulator places at col=0, so identical events would
+    # otherwise fall out as count mismatches.
+    local tc_bin="$EMU_ROOT/target/release/trace-compare"
+    if [[ ! -x "$tc_bin" ]]; then
+        echo "COMPARE-ERR" > "$out_file"
+        return 0
+    fi
+    if ! "$tc_bin" \
+        --hw "$hw_events" \
+        --emu "$emu_events" \
+        --remap-columns \
+        --stalls \
+        --extended \
+        -o "$report" 2>/dev/null; then
         echo "COMPARE-ERR" > "$out_file"
         return 0
     fi
@@ -1497,7 +1343,7 @@ transform_for_peano() {
 export -f find_lit_file is_standard_test is_python_host_test requires_npu2 requires_only_compiler is_xfail
 export -f get_npu_device apply_lit_subs
 export -f extract_build_commands get_run_cmd get_run_variants get_variant_run_cmd
-export -f _strip_trace_flags _variant_from_cmd _run_trace_cycles_pipeline _run_trace_compare _classify_cycle_diff
+export -f _strip_trace_flags _variant_from_cmd _classify_cycle_diff
 export -f sanitize_name wait_npu_idle
 export -f transform_for_chess transform_for_peano
 
@@ -1967,10 +1813,12 @@ compile_one() {
   # the DMA events. So skip it when TRACE_OK; the trace-prepare binary is the
   # single executed binary feeding both the cycle pipeline and the anchor
   # extractor. The hw-cycles injection survives only as the --no-trace fallback.
+  # When TRACE_OK, trace-prepare already produced the full trace via the same
+  # injector this path would use, so the separate core-only injection is a
+  # silent no-op (no echo -- the "TRACE PREP $name: OK" line above already
+  # records that trace-prepare ran). The injection below survives only as the
+  # --no-trace / trace-prepare-failure fallback.
   local hw_cycles_traced_mlir=""
-  if [[ "$WITH_HW_CYCLES" == "true" ]] && [[ "$TRACE_OK" == "true" ]]; then
-      echo "  HW-CYCLES INJECT $name: SKIP (trace-prepare provides full trace)"
-  fi
   if [[ "$WITH_HW_CYCLES" == "true" ]] && [[ "$TRACE_OK" != "true" ]] && is_trace_incompat "$name"; then
       echo "  HW-CYCLES INJECT $name: SKIP (in trace-incompat-tests.txt)"
   fi
@@ -2214,26 +2062,6 @@ run_one_hardware() {
 
   echo "$result" > "$result_file"
 
-  # Phase B: capture HW cycle count via trace pipeline (best-effort).
-  if [[ "$WITH_HW_CYCLES" == "true" && "$result" == "PASS" ]]; then
-      local _hw_xclbin
-      _hw_xclbin="$(find "$build_dir" -maxdepth 1 -name '*.xclbin' -print -quit 2>/dev/null || true)"
-      # Discover the test's instruction binary name from its run.lit file
-      # (--npu-insts-name=<foo>). Falls back to the aiecc default insts.bin
-      # when the test relies on the default. This avoids hardcoding the
-      # set of known filenames.
-      local _src_dir="$TEST_SRC/$name"
-      local _hw_instr_name
-      _hw_instr_name="$(_discover_instr_binary "$_src_dir")"
-      local _hw_instr=""
-      [[ -f "$build_dir/$_hw_instr_name" ]] && _hw_instr="$build_dir/$_hw_instr_name"
-      if [[ -n "$_hw_xclbin" && -n "$_hw_instr" ]]; then
-          _run_trace_cycles_pipeline HW "$build_dir" "$_hw_xclbin" "" "$_hw_instr" "${compiler}${vsuffix}" || true
-      else
-          echo "[trace-cycles:HW] $name (${compiler}${vsuffix}): missing xclbin or instruction binary ($_hw_instr_name) in $build_dir; skipping" >&2
-      fi
-  fi
-
   # Mirror trace_config.json into the trace output dir so downstream
   # tools see one self-contained directory per (test, compiler, side).
   local build_traced="$BUILD_BASE/$name/traced"
@@ -2246,8 +2074,13 @@ run_one_hardware() {
     python3 "$EMU_ROOT/tools/trace-trim.py" "$trace_out_dir/trace_raw.bin" 2>/dev/null || true
   fi
 
-  # Pre-decode events.json so the per-test directory is self-contained.
-  _predecode_events_next_to_trace "$trace_out_dir" "$name" "$compiler"
+  # Pre-decode events.json so the per-test directory is self-contained. Under
+  # --with-hw-cycles, the SAME parse also derives the HW total-cycle scalar
+  # (cycles.HW.txt) from the main run's trace BO -- no separate re-execution.
+  local _hw_cycles_out=""
+  [[ "$WITH_HW_CYCLES" == "true" && "$result" == "PASS" ]] \
+      && _hw_cycles_out="$RESULTS_DIR/${safe}.${compiler}${vsuffix}.cycles.HW.txt"
+  _predecode_events_next_to_trace "$trace_out_dir" "$name" "$compiler" "$_hw_cycles_out"
 }
 export -f run_one_hardware
 
@@ -2324,7 +2157,7 @@ run_one_bridge() {
   # Phase E dual-bound timing: if a HW cycles file exists for this
   # test+compiler+variant, derive a tighter cycle budget and a scaled
   # wall-clock timeout. Otherwise fall back to today's 600 s.
-  # File naming matches _run_trace_cycles_pipeline (variant = compiler+vsuffix).
+  # cycles.HW.txt is written by run_one_hardware's predecode (variant = compiler+vsuffix).
   local _hw_cycles_file="$RESULTS_DIR/${safe}.${compiler}${vsuffix}.cycles.HW.txt"
   local _hw_cycles=0
   if [[ -f "$_hw_cycles_file" ]]; then
@@ -2401,34 +2234,6 @@ run_one_bridge() {
 
   echo "$result" > "$result_file"
 
-  # Phase E: capture EMU cycle count via trace pipeline (best-effort).
-  # Mirrors run_one_hardware's WITH_HW_CYCLES hook; only fires under the
-  # cycle-diff superset flag, and only for tests that passed (a FAILed
-  # bridge run's cycle count is meaningless for drift comparison).
-  if [[ "$WITH_CYCLE_DIFF" == "true" && "$result" == "PASS" ]]; then
-      local _emu_xclbin
-      _emu_xclbin="$(find "$build_dir" -maxdepth 1 -name '*.xclbin' -print -quit 2>/dev/null || true)"
-      # Discover the test's instruction binary name from run.lit (see HW path).
-      local _src_dir="$TEST_SRC/$name"
-      local _emu_instr_name
-      _emu_instr_name="$(_discover_instr_binary "$_src_dir")"
-      local _emu_instr=""
-      [[ -f "$build_dir/$_emu_instr_name" ]] && _emu_instr="$build_dir/$_emu_instr_name"
-      if [[ -n "$_emu_xclbin" && -n "$_emu_instr" ]]; then
-          _run_trace_cycles_pipeline EMU "$build_dir" "$_emu_xclbin" "" "$_emu_instr" "${compiler}${vsuffix}" || true
-      else
-          echo "[trace-cycles:EMU] $name (${compiler}${vsuffix}): missing xclbin or instruction binary ($_emu_instr_name) in $build_dir; skipping" >&2
-      fi
-  fi
-
-  # Phase E: compare HW vs EMU traces when both bins exist, then classify
-  # the result into a persistent .cycle.result (MATCH / DRIFT / EMPTY /
-  # *_TRACE_BUG / COMPARE-ERR / NO_DATA).
-  if [[ "$WITH_CYCLE_DIFF" == "true" && "$result" == "PASS" ]]; then
-      _run_trace_compare "$name" "${compiler}${vsuffix}" || true
-      _classify_cycle_diff "$name" "${compiler}${vsuffix}" || true
-  fi
-
   # Mirror trace_config.json into the trace output dir so downstream
   # tools see one self-contained directory per (test, compiler, side).
   local build_traced="$BUILD_BASE/$name/traced"
@@ -2441,8 +2246,24 @@ run_one_bridge() {
     python3 "$EMU_ROOT/tools/trace-trim.py" "$trace_out_dir/trace_raw.bin" 2>/dev/null || true
   fi
 
-  # Pre-decode events.json so the per-test directory is self-contained.
-  _predecode_events_next_to_trace "$trace_out_dir" "$name" "$compiler"
+  # Pre-decode events.json so the per-test directory is self-contained. Under
+  # --with-cycle-diff, the SAME parse derives the EMU total-cycle scalar
+  # (cycles.EMU.txt) from the main run's trace BO -- no separate re-execution.
+  # (HW cycles.HW.txt come from run_one_hardware's matching predecode.)
+  local _emu_cycles_out=""
+  [[ "$WITH_CYCLE_DIFF" == "true" && "$result" == "PASS" ]] \
+      && _emu_cycles_out="$RESULTS_DIR/${safe}.${compiler}${vsuffix}.cycles.EMU.txt"
+  _predecode_events_next_to_trace "$trace_out_dir" "$name" "$compiler" "$_emu_cycles_out"
+
+  # Classify HW-vs-EMU cycle drift from the on-disk events.json + cycle
+  # scalars (best-effort; the final report re-classifies authoritatively once
+  # every side's files exist). The standalone trace comparison (the old
+  # cycles.compare.txt) is gone: _classify_cycle_diff now runs trace-compare
+  # directly on the main run's events.json, and Phase 5 owns the authoritative
+  # HW-vs-EMU diff.
+  if [[ "$WITH_CYCLE_DIFF" == "true" && "$result" == "PASS" ]]; then
+      _classify_cycle_diff "$name" "${compiler}${vsuffix}" || true
+  fi
 
   echo "  BRIDGE $display_name ($compiler): $result  $(job_duration "$_bridge_start")"
 }
@@ -2669,13 +2490,20 @@ PYEOF
 # Usage: _bin_to_events_json <trace.bin> <xclbin-mlir> <out.events.json>
 # Returns 0 on success, non-zero if mlir-aie parsing fails (unwritten output).
 _bin_to_events_json() {
-  local bin="$1" mlir="$2" out="$3"
+  local bin="$1" mlir="$2" out="$3" cycles_out="${4:-}"
+  # Optional --out-cycles: derive the total-cycle scalar from the SAME parse
+  # that produces events.json, so the main run's already-captured trace BO is
+  # the single source for both per-anchor events and the cycle scalar -- no
+  # separate bridge-trace-runner re-execution (the old cycle pipeline).
+  local _cyc_args=()
+  [[ -n "$cycles_out" ]] && _cyc_args=(--out-cycles "$cycles_out")
   PYTHONPATH=/home/triple/npu-work/mlir-aie/install/python \
     python3 "$EMU_ROOT/tools/parse-trace.py" \
       --trace-bin "$bin" \
       --xclbin-mlir "$mlir" \
       --trace-mode auto \
-      --out-events "$out" 2>/dev/null
+      --out-events "$out" \
+      "${_cyc_args[@]}" 2>/dev/null
 }
 export -f _bin_to_events_json
 
@@ -2686,7 +2514,7 @@ export -f _bin_to_events_json
 # Best-effort: missing inputs or parse failure are logged-and-ignored.
 # Usage: _predecode_events_next_to_trace <trace_dir> <test_name> <compiler>
 _predecode_events_next_to_trace() {
-  local trace_dir="$1" name="$2" compiler="$3"
+  local trace_dir="$1" name="$2" compiler="$3" cycles_out="${4:-}"
   local bin="$trace_dir/trace_raw.bin"
   local out="$trace_dir/events.json"
   [[ -f "$bin" ]] || return 0
@@ -2695,7 +2523,8 @@ _predecode_events_next_to_trace() {
   local mlir
   mlir="$(find "$BUILD_BASE/$name/${compiler}" -mindepth 2 -maxdepth 2 -name 'input_with_addresses.mlir' -print -quit 2>/dev/null || true)"
   [[ -n "$mlir" && -f "$mlir" ]] || return 0
-  _bin_to_events_json "$bin" "$mlir" "$out" || true
+  # When cycles_out is set, the same parse also writes the total-cycle scalar.
+  _bin_to_events_json "$bin" "$mlir" "$out" "$cycles_out" || true
 }
 export -f _predecode_events_next_to_trace
 
