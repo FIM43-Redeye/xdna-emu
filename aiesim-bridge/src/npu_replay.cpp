@@ -66,14 +66,19 @@ constexpr uint64_t kPollQuantumNs = 256;
 // running channel is declared wedged. Must exceed the longest legitimate gap
 // between transactions during a slow transfer (the core passthrough's lock
 // ping-pong between consecutive output bursts). XDNA_AIESIM_SETTLE_QUANTA
-// overrides. Default 512 (~131k sim-ns) is generous: a true wedge costs that
-// much extra sim-time before giving up, but a live transfer never false-trips.
+// overrides. Default 4096 (~1.05M sim-ns): repeat-mode object-fifo kernels
+// (objectfifo_repeat/{compute,init_values}_repeat) have legitimate inter-
+// iteration gaps measured at ~512 quanta, so the former 512 default sat exactly
+// at the live-transfer gap and borderline-false-tripped them as wedged. 4096 is
+// 8x that measured gap -- safe against false-trips while still bounding a true
+// wedge (the cost is settle*ratio of wall-time before a genuine wedge is flagged
+// at the cycle-accurate ~5000 ms_wall/us_sim rate).
 inline uint64_t settle_quanta() {
     if (const char* e = std::getenv("XDNA_AIESIM_SETTLE_QUANTA")) {
         const uint64_t v = std::strtoull(e, nullptr, 0);
         if (v) return v;
     }
-    return 512;
+    return 4096;
 }
 
 // Hard safety backstop on total Sync sim-time, so a pathological channel that

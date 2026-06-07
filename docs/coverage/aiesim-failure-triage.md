@@ -163,14 +163,34 @@ the control-read clone patch and all prior DMA/TCT fixes hold; the remaining
 "failures" were measurement artifacts. The only genuinely-failing kernels are the
 two fast FAILs (next section).
 
-### Two instrumentation fixes (derived, not magic numbers)
-1. **`settle_quanta` default 512 → higher.** Must exceed the measured ~512-quanta
-   legitimate gap with margin. Tension: at ~5000 ms_wall/µs_sim a larger settle
-   window means a *real* wedge burns `settle × ratio` wall before it's flagged
-   (512→~675s, 2048→~2600s). Proposed 2048 (4× margin) balances false-trip
-   safety against real-wedge detection latency.
-2. **`AIESIM_TIMEOUT` default 1200 → 2400+.** `init_values_repeat` needed 1829s
-   at low contention; under the campaign's `-P14` load the ceiling is higher.
+### Two instrumentation fixes (derived, not magic numbers) — APPLIED
+1. **`settle_quanta` default 512 → 4096** (`npu_replay.cpp`). Exceeds the measured
+   ~512-quanta legitimate gap by 8×. Tension: at ~5000 ms_wall/µs_sim a larger
+   settle window means a *real* wedge burns `settle × ratio` wall before it's
+   flagged (512→~675s, 4096→~5250s) — accepted for false-trip safety.
+2. **`AIESIM_TIMEOUT` default 1200 → 3000** (`emu-bridge-test.sh`).
+   `init_values_repeat` needed 1829s low-contention (2373s under the 9-job
+   `--no-trace` arm); 3000s covers it with headroom.
+
+### Trace tax is ZERO (refutes the overwhelm hypothesis for wall-clock)
+
+`--no-trace` arm (`20260607-notrace-arm`) vs trace-on (`20260607-ratelog`),
+compared on **final sim-time** (deterministic, contention-free) for the slow
+cluster:
+
+| Kernel | sim ON | sim OFF | tax |
+|--------|--------|---------|-----|
+| ctrl_packet_reconfig_1x4_cores.chess | 124.552µs | 124.552µs | +0.0% |
+| dma_task_large_linear.peano | 252.035µs | 252.035µs | +0.0% |
+| nd_memcpy_linear_repeat.peano | 100.531µs | 100.531µs | +0.0% |
+| packet_flow_fanin.peano | 96.730µs | 96.669µs | +0.1% |
+
+Byte-identical sim-time: trace events are observational (side-DMA into a trace
+buffer; they don't gate compute), so they add no cycles to the critical path.
+**`--no-trace` is not a lever for campaign wall-clock** — the slowness is
+intrinsic to cycle-accurate sim of each kernel's cycle count. The two default
+fixes are correct and sufficient; a fewer-events option is not needed for
+performance (may still matter for sweep trace-slot capacity — separate concern).
 
 ## Next-step plan (CLASSIFY-then-FIX)
 

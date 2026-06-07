@@ -267,10 +267,16 @@ export COMPILERS_STR="${COMPILERS[*]}"
 #                         normal exit: each run finishes on the bridge's
 #                         quiescence signal, so this only kills a genuinely
 #                         hung run). Generous so a slow-but-correct kernel
-#                         under heavy fan-out is never false-killed.
+#                         under heavy fan-out is never false-killed. 3000s:
+#                         the cycle-accurate sim is brutally slow (~5000
+#                         ms_wall/us_sim) and legitimate completions reach
+#                         ~1829s low-contention (init_values_repeat); the prior
+#                         1200s default manufactured false timeouts by slicing
+#                         through the healthy PASS tail (see docs/coverage/
+#                         aiesim-failure-triage.md).
 AIESIM_BRIDGE_SO="${AIESIM_BRIDGE_SO:-$EMU_ROOT/aiesim-bridge/build/libxdna_aiesim_bridge.so}"
 AIESIM_DEVICE_JSON="${AIESIM_DEVICE_JSON:-$EMU_ROOT/build/experiments/aiesim-device-decrypt/NPU1.json}"
-AIESIM_TIMEOUT="${AIESIM_TIMEOUT:-1200}"
+AIESIM_TIMEOUT="${AIESIM_TIMEOUT:-3000}"
 # Each aiesim instance is single-threaded (SystemC pins one core) and ~1.2 GB
 # RAM, so the throughput ceiling is cores, not memory. Completion is quiescence-
 # based (not wall-clock), so fanning out to ~nproc is clean: a slow instance
