@@ -2,6 +2,8 @@
 // (genwrapper_for_ps.cpp); see ps_bridge.h for the structural differences.
 #include "ps_bridge.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -45,6 +47,22 @@ void ps_bridge::set_payload_attr(xtlm::aximm_payload* trans, size_t bytes) {
 }
 
 void ps_bridge::write32(uint64_t addr, uint32_t data) {
+    // DIAG (XDNA_AIESIM_MUXLOG): log shim stream MUX(0x1F000)/DEMUX(0x1F004)
+    // writes -- the selectors that route an egress stream to PL(00)/DMA(01)/
+    // NoC(10). Trace egress should set the trace stream's South selector to DMA;
+    // if it stays at the PL reset default the trace lands on a PL port.
+    if (const uint32_t off = static_cast<uint32_t>(addr & 0xFFFFFu);
+        off == 0x1F000u || off == 0x1F004u) {
+        if (std::getenv("XDNA_AIESIM_MUXLOG")) {
+            const uint64_t rel = addr - 0x20000000000ULL;
+            std::fprintf(stderr,
+                "[muxlog] %s col=%llu row=%llu val=0x%08x @%s\n",
+                off == 0x1F004u ? "DEMUX" : "MUX",
+                (unsigned long long)((rel >> 25) & 0x7F),
+                (unsigned long long)((rel >> 20) & 0x1F),
+                data, sc_core::sc_time_stamp().to_string().c_str());
+        }
+    }
     const size_t n = sizeof(uint32_t);
     xtlm::aximm_payload* trans = mem_manager_->get_payload();
     trans->acquire();
