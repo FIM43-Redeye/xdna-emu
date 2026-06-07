@@ -1,13 +1,73 @@
 # aiesim Failure Triage — three-way timing campaign
 
-**Status:** ACTIVE investigation (campaign running 2026-06-06/07)
+**Status:** RESOLVED for the non-PASS set (2026-06-07). Re-verify on the current
+`.so` cleared ~13 stale verdicts; the two genuine fast FAILs are root-caused (one
+fixed, one characterized + tied to a device-model gap). One new FAIL surfaced
+(`init_values_repeat`, open). See the **2026-06-07 resolution** section directly
+below; the campaign-era catalog further down is retained as history.
 **Companion:** [trace-event-sweep-campaign.md](trace-event-sweep-campaign.md)
+
+## 2026-06-07 resolution (re-verify on current `.so` + the two fast FAILs)
+
+The campaign verdicts (`20260606/`) were captured on an older `.so`/kernels. A
+focused **re-verify** of the 17 non-PASS (test×compiler) pairs on the current
+`.so` (shipping defaults: settle 4096, AIESIM_TIMEOUT 3000) — aiesim-only,
+`build/bridge-test-results/20260607-reverify/` — separated stale from genuine:
+
+- **~13 stale → now PASS/XFAIL.** Every campaign TIMEOUT in the set now PASSes:
+  `ctrl_packet_reconfig{,_1x4_cores,_4x1_cores}`, `dma_task_large_linear`,
+  `nd_memcpy_linear_repeat`, `objectfifo_repeat/compute_repeat`,
+  `packet_flow_fanin` (all slow-not-wedged — confirms the #90 classification end
+  to end). `objectfifo_repeat/distribute_repeat` → **XFAIL** (the `179a1b0` fix
+  now applies on re-run, as predicted).
+- **`ctrl_packet_reconfig_elf` (chess+peano) — RESOLVED (was the family-A FAIL).**
+  Root cause: the panic data (`d0=0x00202001` = a stream packet header,
+  pkt_type=2; `AIETargetNPU.cpp:324`) is **harness-injected TRACE egress**, not
+  real data. VCD (`sShimTrace → mSouth3 → shim_to_pl3`) confirms it's the shim
+  trace port. It lands on PL because the shim **demux** South-selector (0x1F004)
+  is still at its PL **reset-default (00)** when the first trace beats arrive: the
+  runtime's South3→DMA demux write (`XAie_EnableAieToShimDmaStrmPort`, value
+  `0x40/0x50`) lands at **18827ns**, but the trace beats reach the shim at
+  **18790ns** — a 37ns startup-ordering race in the cluster's timing. **The demux
+  write IS present and the bridge routes it faithfully** — not a bridge gap, not a
+  device-JSON flaw (`demux_dma_streamids=[2,3]` is correct topology), not missing
+  driver replication. The result data still travels the shim-DMA aximm path, so
+  the PL beats are redundant. **Fix:** PL-egress panic demoted to **drain+warn**
+  by default; strict abort is now opt-in via `XDNA_AIESIM_PL_PANIC=1` (was: panic
+  default, `XDNA_AIESIM_PL_DRAIN` to opt out). reconfig_elf now PASSes on aiesim
+  with default env (one drain WARNING, then `PASS!`). TCT-on-PL path unchanged.
+  Standing diagnostic added: `XDNA_AIESIM_MUXLOG=1` logs shim mux/demux
+  (0x1F000/0x1F004) writes.
+- **`vec_mul_trace_distribute_lateral` (peano) — characterized (genuine aiesim
+  trace gap).** Compute PASSes; only the trace-buffer check fails. The lateral
+  egress shim (col2) S2MM channels start but drain empty in 2 cycles. VCD root
+  cause: the **trace-unit FSM never activates** (`event_trace.state` flat-0 at the
+  core, memtile, and egress shim) because the trace-start **broadcast (broadcast
+  15) never fires** (broadcast network flat). The event-input wires DO fire, so
+  events occur but are never packed/emitted. This is an aiesim cluster-model gap —
+  aiesim does not deliver hardware trace data here, so it **cannot be a
+  trace-fidelity oracle** for the trace-event-sweep campaign. Open question (Maya):
+  is the broadcast-start config something we can enable via the device file? The
+  trace unit *exists*; worth a look. Not bridge code either way.
+- **`objectfifo_repeat/init_values_repeat` (peano) — NEW open FAIL.** Surfaced by
+  the re-verify (campaign had it as TIMEOUT). Fails fast (log ends after 5 NPU
+  instructions; no PL-PANIC, no Sync-timeout, no quiescent-wedge) — a distinct
+  early-stop, NOT a settle wedge and NOT the trace-on-PL panic. #90 noted it needs
+  settle≥16384, but the observed mode doesn't match a settle wedge. **Needs
+  dedicated investigation** (deferred — separate from the two fast FAILs).
+- **PL routing on HW** is a deeper standing item (Maya: "been acting weird for a
+  while") — to revisit; the drain+warn default lets aiesim runs proceed meanwhile.
+
+---
+
+## Campaign-era catalog (HISTORY — 2026-06-06/07, older `.so`)
 
 The all-72 three-way (HW / interp / aiesim) timing campaign (#85) surfaced a set
 of aiesim failures. This doc catalogs them, their failure modes, and the
 fix-first plan. **None come from this session's harness fixes** (B-full and the
 budget-cap removal both touch only the HW/EMU path; the aiesim verdict path was
-untouched except the xfail-labeling fix).
+untouched except the xfail-labeling fix). *Superseded by the 2026-06-07
+resolution above — retained for the per-kernel failure-mode notes.*
 
 ## Session harness fixes (committed)
 
