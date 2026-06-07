@@ -24,6 +24,7 @@
 
 use std::process;
 
+use xdna_emu::vcd::anchors::{anchors_to_json, extract_dma_anchors_with_period};
 use xdna_emu::vcd::compare::{compare_signals, load_and_align};
 use xdna_emu::vcd::coverage::coverage_audit;
 use xdna_emu::vcd::cycles::cycle_span;
@@ -42,6 +43,7 @@ fn usage() -> ! {
     eprintln!("  vcd-compare --emu <file> --sim <file> [options]");
     eprintln!("  vcd-compare --coverage <file> [options]");
     eprintln!("  vcd-compare --cycles <file> [--json] [options]");
+    eprintln!("  vcd-compare --anchors <file> [options]");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --device npu1|vc2802|npu1-inproc     Device geometry (default: vc2802 for coverage, npu1 for compare)");
@@ -59,6 +61,7 @@ fn main() {
     let mut sim_path: Option<String> = None;
     let mut coverage_path: Option<String> = None;
     let mut cycles_path: Option<String> = None;
+    let mut anchors_path: Option<String> = None;
     let mut tolerance_name = "default".to_string();
     let mut device_name: Option<String> = None;
     let mut json_output = false;
@@ -82,6 +85,10 @@ fn main() {
             "--cycles" => {
                 i += 1;
                 cycles_path = Some(args.get(i).cloned().unwrap_or_else(|| usage()));
+            }
+            "--anchors" => {
+                i += 1;
+                anchors_path = Some(args.get(i).cloned().unwrap_or_else(|| usage()));
             }
             "--tolerance" => {
                 i += 1;
@@ -113,7 +120,13 @@ fn main() {
         process::exit(1);
     }
 
-    if let Some(cyc_path) = cycles_path {
+    if let Some(anc_path) = anchors_path {
+        // Anchors come from the in-process NPU1 cluster VCD (#87/#88), native
+        // NPU1 geometry -- so the default device is the in-process tree.
+        let dev = device_name.as_deref().unwrap_or("npu1-inproc");
+        let tree = parse_device(dev);
+        run_anchors(&anc_path, &tree, output_path.as_deref());
+    } else if let Some(cyc_path) = cycles_path {
         // aiesim VCDs use VC2802 geometry; same default as coverage.
         let dev = device_name.as_deref().unwrap_or("vc2802");
         let tree = parse_device(dev);
@@ -218,6 +231,28 @@ fn run_coverage(vcd_path: &str, tree: &MappingTree, _json: bool, output: Option<
 // ---------------------------------------------------------------------------
 // Cycles mode
 // ---------------------------------------------------------------------------
+
+/// Extract DMA start/done timing anchors from an in-process NPU1 cluster VCD
+/// and write them as bare-measurement JSON. This is the aiesim side of Option B
+/// (per-anchor) three-way timing: the anchors align on `(col, row, kind)` with
+/// the HW/interp trace-BO `DMA_*_{START,FINISHED}_TASK` events
+/// (`tools/trace-anchors.py`), with zero geometry normalization.
+fn run_anchors(vcd_path: &str, tree: &MappingTree, output: Option<&str>) {
+    let (anchors, period_ps) = match extract_dma_anchors_with_period(vcd_path, tree) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("Error extracting anchors from {}: {}", vcd_path, e);
+            process::exit(1);
+        }
+    };
+
+    if anchors.is_empty() {
+        eprintln!("Warning: {} produced no DMA anchors (no channel showed status activity)", vcd_path);
+    }
+
+    let report = anchors_to_json(&anchors, period_ps);
+    write_output(&report, output);
+}
 
 /// Compute the total active-cycle span of a single aiesimulator VCD and write
 /// it out. This is the aiesim side of three-way timing calibration: the

@@ -29,3 +29,6 @@ pub mod event_mapping;
 
 // In-process NPU1 cluster VCD mapping tree (typed + raw tiers).
 pub mod inproc_mapping;
+
+// Macro-anchor extraction (Option B per-anchor timing).
+pub mod anchors;

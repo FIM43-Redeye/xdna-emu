@@ -269,12 +269,31 @@ Notes for the B build:
 5. **(#88) In-process NPU1 mapping tree**: `--coverage` the new VCD to discover
    the `aiesim_top.*` hierarchy; add `build_npu1_inproc_mapping_tree`. Confirm
    `DmaFsmState`/`Lock` resolve.
-6. **(#84) B-aiesim anchor extractor**: `DmaFsmState`/`Lock` transitions ->
-   anchors, **no normalization** (NPU1 tree). `vcd-compare --anchors`.
-7. **(#84) B trace-anchor reducer**: `parse-trace --out-events` / `events.json`
-   -> anchors (DMA_*_START_TASK/FINISHED_TASK -> canonical kind, `soc` cycle).
-8. **(#84) B comparator**: extend (3) with per-anchor alignment on `(col,row,kind)`,
-   per-source earliest-anchor normalization, deltas vs HW.
+6. **(#84) B-aiesim anchor extractor** -- DONE. `vcd-compare --anchors <vcd>`
+   (`src/vcd/anchors.rs`) reduces each DMA channel's typed `status`
+   ([`StatePath::DmaStatus`]) timeline to anchors: `dma_{dir}{ch}_start` =
+   first leave-idle change, `dma_{dir}{ch}_done` = last change. **No
+   normalization** (native NPU1 tree). Verified on the in-process fixture: 16
+   anchors across shim/mem/compute, cycles matching raw VCD inspection.
+   - Encoding note: the `status` FSM is `0`=idle, `1`=acquire, `2`=run. Shim
+     channels return to idle (`0->1->2->0`); compute/mem oscillate `1<->2` per
+     BD and the capture ends mid-run, so "done" is universally the last change,
+     not a return to idle. The rule needs only "0 is idle".
+   - The richer per-channel `start_task`/`finished_task` pulse signals exist but
+     are inconsistently emitted (shim does not pulse them), so `status` is the
+     robust universal anchor source.
+7. **(#84) B trace-anchor reducer** -- DONE. `tools/trace-anchors.py` reduces
+   `parse-trace --out-events` JSON to the same anchors: `DMA_{DIR}_{ch}_{START,
+   FINISHED}_TASK` -> canonical kind, `soc` cycle (first-`soc` for `_start`,
+   last-`soc` for `_done`, matching the VCD first-leave-idle/last-change rule).
+   Event names are grounded on mlir-aie's `python/utils/trace/setup.py` enum.
+8. **(#84) B comparator** -- DONE. `timing-three-way.py --per-anchor` aligns
+   anchors on `(col,row,kind)`, normalizes each source to its earliest anchor,
+   and reports per-anchor deltas vs HW (+ per-kernel and overall mean |Δ|). The
+   earliest-anchor normalization assumes the first-armed channel is the same
+   event across sources; per-anchor deltas are relative to each source's first
+   activity. End-to-end verified: a +50000-cycle origin shift normalizes away
+   cleanly and an injected +30-cycle drift surfaces as the sole nonzero delta.
 9. **(#85) Harness integration**: `--aiesim-timing` mode in emu-bridge-test.sh
    joining all three from the **in-process** run (correctness + timing in one).
 10. **(#85) Campaign**: all 72 kernels, three-way, correctness + timing; close-out
