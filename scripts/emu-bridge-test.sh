@@ -2365,6 +2365,16 @@ run_one_aiesim() {
     fi
   fi
 
+  # Honor XFAIL annotations: a failing xfail is XFAIL, a passing xfail is XPASS.
+  # Mirrors run_one_hardware / run_one_bridge. EMU_MISS is an infrastructure bug
+  # -- never mask it with XFAIL.
+  if [[ "$result" != "EMU_MISS" ]] && is_xfail "$src_dir" "$compiler"; then
+    case "$result" in
+      PASS)          result="XPASS" ;;
+      FAIL|TIMEOUT)  result="XFAIL" ;;
+    esac
+  fi
+
   echo "$result" > "$result_file"
   echo "  AIESIM $display_name ($compiler): $result  $(job_duration "$_aiesim_start")"
 }
@@ -2670,13 +2680,15 @@ print_report() {
     hw_xpass[$compiler]=0
   done
   # aiesim (third comparison side) counters.
-  declare -A aiesim_pass aiesim_fail aiesim_skip aiesim_timeout aiesim_emumiss
+  declare -A aiesim_pass aiesim_fail aiesim_skip aiesim_timeout aiesim_emumiss aiesim_xfail aiesim_xpass
   for compiler in "${compilers[@]}"; do
     aiesim_pass[$compiler]=0
     aiesim_fail[$compiler]=0
     aiesim_skip[$compiler]=0
     aiesim_timeout[$compiler]=0
     aiesim_emumiss[$compiler]=0
+    aiesim_xfail[$compiler]=0
+    aiesim_xpass[$compiler]=0
   done
   declare -A trace_clean trace_diverge trace_error trace_skip
   for compiler in "${compilers[@]}"; do
@@ -2835,6 +2847,8 @@ print_report() {
         printf "  %-${aiesim_col_width}s" "$ar"
         case "$ar" in
           PASS)     aiesim_pass[$compiler]=$(( ${aiesim_pass[$compiler]} + 1 )) ;;
+          XFAIL)    aiesim_xfail[$compiler]=$(( ${aiesim_xfail[$compiler]} + 1 )) ;;
+          XPASS)    aiesim_xpass[$compiler]=$(( ${aiesim_xpass[$compiler]} + 1 )) ;;
           TIMEOUT)  aiesim_timeout[$compiler]=$(( ${aiesim_timeout[$compiler]} + 1 ))
                     aiesim_fail[$compiler]=$(( ${aiesim_fail[$compiler]} + 1 )) ;;
           EMU_MISS) aiesim_emumiss[$compiler]=$(( ${aiesim_emumiss[$compiler]} + 1 ))
@@ -3054,6 +3068,8 @@ print_report() {
       local aiesim_extra=""
       [[ ${aiesim_timeout[$compiler]} -gt 0 ]] && aiesim_extra+=" (${aiesim_timeout[$compiler]} timeout)"
       [[ ${aiesim_emumiss[$compiler]} -gt 0 ]] && aiesim_extra+=" (${aiesim_emumiss[$compiler]} EMU_MISS)"
+      [[ ${aiesim_xfail[$compiler]} -gt 0 ]] && aiesim_extra+=" (${aiesim_xfail[$compiler]} XFAIL)"
+      [[ ${aiesim_xpass[$compiler]} -gt 0 ]] && aiesim_extra+=" (${aiesim_xpass[$compiler]} XPASS)"
       echo "${label} aiesim: ${aiesim_pass[$compiler]} pass, ${aiesim_fail[$compiler]} fail, ${aiesim_skip[$compiler]} skip${aiesim_extra}"
     done
     if [[ ${#aiesim_mismatch[@]} -gt 0 ]]; then
