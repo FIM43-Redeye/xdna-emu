@@ -626,18 +626,32 @@ pub fn compare_pair(pair: &AlignedPair, tolerance: &ToleranceConfig) -> SignalRe
 pub fn compare_signals(input: &ComparisonInput, tolerance: &ToleranceConfig) -> ComparisonResult {
     let mut results = Vec::with_capacity(input.pairs.len() + input.emu_only.len() + input.sim_only.len());
 
+    // Raw signals (model-internal / source-specific) carry no typed field
+    // semantics and have no cross-source partner -- the in-process aiesim VCD
+    // emits thousands of them and the interpreter emits none, so leaving them in
+    // would flood the report with spurious `Missing`. They are fully accounted
+    // for in the coverage audit instead. See inproc-mapping-tree-design.md.
     for pair in &input.pairs {
+        if pair.path.is_raw() {
+            continue;
+        }
         let result = compare_pair(pair, tolerance);
         results.push((pair.path.clone(), result));
     }
 
     // Signals present only in the emulator VCD.
     for path in &input.emu_only {
+        if path.is_raw() {
+            continue;
+        }
         results.push((path.clone(), SignalResult::Missing { present_in: Source::Emu }));
     }
 
     // Signals present only in the simulator VCD.
     for path in &input.sim_only {
+        if path.is_raw() {
+            continue;
+        }
         results.push((path.clone(), SignalResult::Missing { present_in: Source::Sim }));
     }
 

@@ -37,6 +37,13 @@ pub enum Subsystem {
     Memory,
     Event,
     PerfCount,
+    /// Catch-all for model-internal / source-specific signals that have no
+    /// cross-source comparison partner (ISS internals, bus adaptors, interrupt
+    /// controllers, broadcast nets, tile-control, PL interface). Carried by
+    /// [`StatePath::Raw`] so they resolve for coverage accounting without
+    /// inflating the typed comparison vocabulary. See
+    /// `docs/coverage/inproc-mapping-tree-design.md`.
+    Other,
 }
 
 impl Subsystem {
@@ -49,6 +56,7 @@ impl Subsystem {
         Subsystem::Memory,
         Subsystem::Event,
         Subsystem::PerfCount,
+        Subsystem::Other,
     ];
 
     /// Short lowercase string identifier for display and serialisation.
@@ -61,6 +69,7 @@ impl Subsystem {
             Subsystem::Memory => "memory",
             Subsystem::Event => "event",
             Subsystem::PerfCount => "perf_count",
+            Subsystem::Other => "other",
         }
     }
 }
@@ -336,6 +345,24 @@ pub enum StatePath {
     // ------------------------------------------------------------------
     /// Performance counter value.
     PerfCounter { col: u8, row: u8, idx: u8 },
+
+    // ------------------------------------------------------------------
+    // Raw / model-internal (no cross-source comparison partner)
+    // ------------------------------------------------------------------
+    /// A signal that resolves to a tile and subsystem but carries no typed
+    /// field semantics -- a model-internal or source-specific signal (ISS
+    /// internals, bus adaptors, interrupts, broadcast, tile-control, PL
+    /// interface, DMA channel-internal flags). Resolving these to `Raw` lets the
+    /// coverage audit account for every signal (~100% resolved) while the
+    /// comparison engine skips them: there is no interpreter-side partner to
+    /// diff against. `signal` is the full leaf name within the subsystem scope,
+    /// preserved verbatim so the audit can report exactly what was seen.
+    Raw {
+        col: u8,
+        row: u8,
+        subsystem: Subsystem,
+        signal: String,
+    },
 }
 
 impl StatePath {
@@ -389,7 +416,17 @@ impl StatePath {
             StatePath::EventTrace { .. } => Subsystem::Event,
 
             StatePath::PerfCounter { .. } => Subsystem::PerfCount,
+
+            StatePath::Raw { subsystem, .. } => *subsystem,
         }
+    }
+
+    /// Whether this is a [`StatePath::Raw`] signal -- a model-internal /
+    /// source-specific signal with no cross-source comparison partner. The
+    /// comparison engine skips these (they resolve for coverage accounting
+    /// only); see `docs/coverage/inproc-mapping-tree-design.md`.
+    pub fn is_raw(&self) -> bool {
+        matches!(self, StatePath::Raw { .. })
     }
 
     /// Extract the (col, row) tile coordinates from any variant.
@@ -436,7 +473,8 @@ impl StatePath {
             | StatePath::MemConflictAddr { col, row, .. }
             | StatePath::MemPortAccess { col, row, .. }
             | StatePath::EventTrace { col, row, .. }
-            | StatePath::PerfCounter { col, row, .. } => (*col, *row),
+            | StatePath::PerfCounter { col, row, .. }
+            | StatePath::Raw { col, row, .. } => (*col, *row),
         }
     }
 
@@ -489,6 +527,7 @@ impl StatePath {
             StatePath::MemPortAccess { .. } => "port_access",
             StatePath::EventTrace { .. } => "event",
             StatePath::PerfCounter { .. } => "counter",
+            StatePath::Raw { .. } => "raw",
         }
     }
 }
@@ -637,6 +676,11 @@ impl fmt::Display for StatePath {
             StatePath::PerfCounter { idx, .. } => {
                 write!(f, "tile({},{}).{}.counter[{}]", col, row, sub, idx)
             }
+
+            // Raw / model-internal: subsystem + verbatim leaf name.
+            StatePath::Raw { signal, .. } => {
+                write!(f, "tile({},{}).{}.{}", col, row, sub, signal)
+            }
         }
     }
 }
@@ -717,7 +761,7 @@ mod tests {
     fn subsystem_all_covers_all_variants() {
         // Every subsystem variant must appear in ALL exactly once.
         let all = Subsystem::ALL;
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
         for &s in all {
             assert_eq!(all.iter().filter(|&&x| x == s).count(), 1);
         }

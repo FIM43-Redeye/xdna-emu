@@ -27,6 +27,7 @@ use std::process;
 use xdna_emu::vcd::compare::{compare_signals, load_and_align};
 use xdna_emu::vcd::coverage::coverage_audit;
 use xdna_emu::vcd::cycles::cycle_span;
+use xdna_emu::vcd::inproc_mapping::build_npu1_inproc_mapping_tree;
 use xdna_emu::vcd::mapping::{build_aie2_mapping_tree, build_vc2802_mapping_tree, MappingTree};
 use xdna_emu::vcd::report::{json_report, text_report};
 use xdna_emu::vcd::state_path::Subsystem;
@@ -43,7 +44,7 @@ fn usage() -> ! {
     eprintln!("  vcd-compare --cycles <file> [--json] [options]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --device npu1|vc2802                 Device geometry (default: vc2802 for coverage, npu1 for compare)");
+    eprintln!("  --device npu1|vc2802|npu1-inproc     Device geometry (default: vc2802 for coverage, npu1 for compare)");
     eprintln!("  --tolerance strict|relaxed|default   Timing tolerance (default: default)");
     eprintln!("  --json                               Output JSON instead of text");
     eprintln!("  -o <file>                            Write output to file");
@@ -139,8 +140,9 @@ fn parse_device(name: &str) -> MappingTree {
     match name {
         "npu1" => build_aie2_mapping_tree(),
         "vc2802" => build_vc2802_mapping_tree(),
+        "npu1-inproc" => build_npu1_inproc_mapping_tree(),
         other => {
-            eprintln!("Error: unknown device '{}'. Use npu1 or vc2802.", other);
+            eprintln!("Error: unknown device '{}'. Use npu1, vc2802, or npu1-inproc.", other);
             process::exit(1);
         }
     }

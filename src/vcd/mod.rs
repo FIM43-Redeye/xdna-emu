@@ -26,3 +26,6 @@ pub mod dma_mapping;
 pub mod stream_mapping;
 pub mod core_mapping;
 pub mod event_mapping;
+
+// In-process NPU1 cluster VCD mapping tree (typed + raw tiers).
+pub mod inproc_mapping;

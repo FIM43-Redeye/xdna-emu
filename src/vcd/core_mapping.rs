@@ -101,18 +101,42 @@ pub fn core_mapping() -> SubsystemMapping {
 /// This function returns a [`CompositeMapping`] with scope `"cm"` that
 /// handles both nesting levels.
 pub fn core_mapping_vc2802() -> CompositeMapping {
-    // PC stages are directly under cm.proc (1-indexed, E1..E7)
-    let pc_mapping = SubsystemMapping::new("proc", Subsystem::Core)
+    // Combine: cm contains proc (with PCs) and proc.iss (with ISS signals).
+    // The CompositeMapping tries each child in order.
+    CompositeMapping::new(
+        "cm",
+        vec![
+            Box::new(proc_pc_mapping()),
+            Box::new(NestedScopeMapping::new("proc", Box::new(proc_iss_mapping()))),
+        ],
+    )
+}
+
+/// The pipeline-stage PC mapping under the `proc` scope (`cm.proc.pc_E1`..`pc_E7`).
+///
+/// Exposed so other device trees (e.g. the in-process NPU1 cluster, which uses
+/// the same `cm.proc` / `cm.proc.iss` nesting) can reuse it without duplicating
+/// the signal table. PC stages are 1-indexed, matching the AIE2 7-stage VLIW
+/// pipeline.
+pub fn proc_pc_mapping() -> SubsystemMapping {
+    SubsystemMapping::new("proc", Subsystem::Core)
         .fixed_signal("pc_E1", 32, |col, row, _| StatePath::CorePc { col, row, stage: 1 })
         .fixed_signal("pc_E2", 32, |col, row, _| StatePath::CorePc { col, row, stage: 2 })
         .fixed_signal("pc_E3", 32, |col, row, _| StatePath::CorePc { col, row, stage: 3 })
         .fixed_signal("pc_E4", 32, |col, row, _| StatePath::CorePc { col, row, stage: 4 })
         .fixed_signal("pc_E5", 32, |col, row, _| StatePath::CorePc { col, row, stage: 5 })
         .fixed_signal("pc_E6", 32, |col, row, _| StatePath::CorePc { col, row, stage: 6 })
-        .fixed_signal("pc_E7", 32, |col, row, _| StatePath::CorePc { col, row, stage: 7 });
+        .fixed_signal("pc_E7", 32, |col, row, _| StatePath::CorePc { col, row, stage: 7 })
+}
 
-    // ISS signals are under cm.proc.iss
-    let iss_mapping = SubsystemMapping::new("iss", Subsystem::Core)
+/// The ISS bus mapping under the `iss` scope (`cm.proc.iss.pm_rd_in`, etc.).
+///
+/// Exposed for reuse by other device trees sharing the `cm.proc.iss` nesting.
+/// Covers the program-memory and tile-memory buses, reset, and breakpoint halt
+/// -- the architecturally-observable core state. The ISS model's internal bus
+/// lanes (dme/dmo/lock adaptors) are not core state and fall to the raw tier.
+pub fn proc_iss_mapping() -> SubsystemMapping {
+    SubsystemMapping::new("iss", Subsystem::Core)
         .fixed_signal("pm_rd_in", 128, |col, row, _| StatePath::CorePmData { col, row })
         .fixed_signal("pm_ad_out", 20, |col, row, _| StatePath::CorePmAddress { col, row })
         .fixed_signal("tm_rd_in", 32, |col, row, _| StatePath::CoreTmReadData { col, row })
@@ -121,14 +145,7 @@ pub fn core_mapping_vc2802() -> CompositeMapping {
         .fixed_signal("tm_ld_out", 1, |col, row, _| StatePath::CoreTmLoad { col, row })
         .fixed_signal("tm_st_out", 1, |col, row, _| StatePath::CoreTmStore { col, row })
         .fixed_signal("reset", 1, |col, row, _| StatePath::CoreReset { col, row })
-        .fixed_signal("pc_breakpoint_halted", 1, |col, row, _| StatePath::CoreBreakpointHalted { col, row });
-
-    // Combine: cm contains proc (with PCs) and proc.iss (with ISS signals).
-    // The CompositeMapping tries each child in order.
-    CompositeMapping::new(
-        "cm",
-        vec![Box::new(pc_mapping), Box::new(NestedScopeMapping::new("proc", Box::new(iss_mapping)))],
-    )
+        .fixed_signal("pc_breakpoint_halted", 1, |col, row, _| StatePath::CoreBreakpointHalted { col, row })
 }
 
 /// A composite mapping that tries multiple child mappings in order.
