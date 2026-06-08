@@ -62,10 +62,76 @@ impl CapabilityDomain {
     }
 }
 
-/// The explicit override registry, per arch. Empty in Phase 1 (spec Section 5):
-/// coarse category defaults carry the bootstrap; Phase 2 adds entries here.
-pub fn override_registry(_arch: Architecture) -> Vec<BehavioralUnit> {
-    Vec::new()
+/// The explicit override registry, per arch. Phase 2 adds entries here; the
+/// sole current entry Accepts the `SemanticOp::Intrinsic(_)` catch-all (#104).
+pub fn override_registry(arch: Architecture) -> Vec<BehavioralUnit> {
+    match arch {
+        Architecture::Aie2 => vec![intrinsic_catchall_accepted()],
+        _ => Vec::new(),
+    }
+}
+
+/// Accept the `SemanticOp::Intrinsic(_)` catch-all node (#104).
+///
+/// The node `SemanticOp::Intrinsic(0)` represents "an intrinsic we could not
+/// classify to a concrete SemanticOp." It derives to the NeedsTriage category
+/// default (`Unspecified` / `Unverified`) and so registers as a comprehension
+/// gap. It is closed here by explicit Accept rather than left open, on these
+/// confirmed facts:
+///
+///   * It is **never constructed** by the live pipeline. Every intrinsic-backed
+///     instruction is resolved to a concrete SemanticOp at build time
+///     (`build_helpers/extract.rs:semantic_from_intrinsic`), and the ISA build
+///     asserts 100% semantic coverage (`aie2/isa/mod.rs`), so no decoded
+///     instruction can carry `Intrinsic`. The runtime classifier
+///     `SemanticOp::from_intrinsic` that would mint `Intrinsic(idx)` is dead
+///     code (never called outside its own unit tests).
+///   * It is **fail-loud, not silent-wrong**: the surface probe classes
+///     `Intrinsic(_)` as `Absent`, so any value reaching execution hits a hard
+///     `ExecuteResult::Error`, never a wrong result.
+///   * The concrete vector SemanticOps that intrinsics actually resolve to
+///     (`Srs`/`Ups`/`Pack`/`Convert`/`Mac`/`MatMul`) are differentially
+///     verified bit-exact against the genuine aietools models (#103 Half A;
+///     `docs/superpowers/findings/2026-06-08-vector-compute-audit-half-a-rollup.md`).
+///
+/// Provenance stays `Unspecified` -- the catch-all genuinely has no model; it is
+/// Accepted because it is unconstructible and fail-loud, not because it is
+/// understood. Silicon verification of the *resolved* ops is Half B (HW-gated)
+/// and is tracked separately in the perishable queue, so this Accept does not
+/// green the release gate.
+fn intrinsic_catchall_accepted() -> BehavioralUnit {
+    use crate::aie2::isa::SemanticOp;
+    use crate::coverage::verdict::{Provenance, Verdict};
+    BehavioralUnit {
+        id: "aie2.intrinsic_catchall.accepted".into(),
+        arch: Architecture::Aie2,
+        claims: Claims::Nodes(vec![CoverageNode::Semantic {
+            arch: Architecture::Aie2,
+            op: SemanticOp::Intrinsic(0),
+        }]),
+        verdict: Verdict {
+            provenance: Provenance::Unspecified,
+            verification: Verification::Accepted {
+                rationale: "SemanticOp::Intrinsic(_) catch-all: never constructed by the live \
+                    pipeline (every intrinsic-backed instruction resolves to a concrete SemanticOp \
+                    at build time via semantic_from_intrinsic; the ISA build asserts 100% semantic \
+                    coverage; the runtime from_intrinsic classifier is dead code). Fail-loud: the \
+                    surface probe classes Intrinsic(_) as Absent -> hard ExecuteResult::Error, never \
+                    a wrong value. The concrete ops it resolves to (Srs/Ups/Pack/Convert/Mac/MatMul) \
+                    are differentially verified bit-exact vs the genuine aietools models (#103 Half \
+                    A). Accepted as unconstructible + fail-loud, not understood; silicon \
+                    verification of the resolved ops is Half B (perishable queue)."
+                    .into(),
+            },
+        },
+        shadows_derived: Some(
+            "Intrinsic(0) otherwise derives to the NeedsTriage default (Unspecified/Unverified -> \
+             comprehension gap). This Accept shadows no real unmodeled behavior: the catch-all is \
+             never constructed (build-time 100% concrete-SemanticOp coverage) and is fail-loud."
+                .into(),
+        ),
+        shared_from: None,
+    }
 }
 
 /// The single hand-curated capability spine (spec Section 6). Seeded once from
@@ -202,10 +268,19 @@ mod tests {
     use crate::types::Architecture;
 
     #[test]
-    fn override_registry_is_empty_at_phase1() {
-        // Phase 1 ships green on coarse category defaults; overrides are
-        // Phase 2 refinement work (spec Section 5).
-        assert!(override_registry(Architecture::Aie2).is_empty());
+    fn override_registry_has_intrinsic_accept() {
+        // #104: the sole Phase-2 override is the Accept of the
+        // SemanticOp::Intrinsic(_) catch-all (never constructed, fail-loud; the
+        // concrete ops it resolves to are differentially verified -- #103). The
+        // rest of the spine still rides coarse derived defaults.
+        use crate::coverage::verdict::Verification;
+        let regs = override_registry(Architecture::Aie2);
+        assert_eq!(regs.len(), 1, "exactly the intrinsic-catchall Accept");
+        assert!(matches!(regs[0].verdict.verification, Verification::Accepted { .. }));
+        assert!(
+            regs[0].shadows_derived.is_some(),
+            "Accept pulls Intrinsic off its derived NeedsTriage default"
+        );
     }
 
     #[test]

@@ -258,18 +258,23 @@ mod tests {
         let add = m.semantic_verdict(&SemanticOp::Add);
         assert_eq!(add.verification, Verification::NotApplicable);
         assert!(!add.is_perishable() && !add.is_comprehension_gap());
-        // Intrinsic -> comprehension gap (default-to-ignorant).
-        assert!(m.semantic_verdict(&SemanticOp::Intrinsic(0)).is_comprehension_gap());
+        // Intrinsic catch-all is Accepted (#104): never constructed, fail-loud,
+        // and the concrete ops it resolves to are differentially verified (#103).
+        let intr = m.semantic_verdict(&SemanticOp::Intrinsic(0));
+        assert!(!intr.is_comprehension_gap(), "Intrinsic must be Accepted, not a gap");
+        assert!(matches!(intr.verification, Verification::Accepted { .. }));
     }
 
     #[test]
-    fn clean_release_is_false_at_bootstrap_and_honest() {
+    fn clean_release_is_false_via_perishable_not_comprehension() {
         let m = CoverageModel::build(Architecture::Aie2);
-        // Honest from day one but coarse: vector + intrinsic populate the
-        // sets, so the gate is correctly NOT green at bootstrap (spec S5).
-        assert!(!m.perishable_queue().is_empty(), "vector ops must be perishable at bootstrap");
-        assert!(!m.comprehension_gaps().is_empty(), "Intrinsic must be a comprehension gap at bootstrap");
-        assert!(!m.clean_release(), "bootstrap must not be green -- that is the honest state (spec S5)");
+        // The intrinsic comprehension gap is closed by Accept (#104), so the
+        // comprehension set is empty. But the perishable queue (vector ops,
+        // AietoolsModeled/Unverified) keeps the gate honestly red until the
+        // silicon Verified flip (Half B) -- Accept does NOT falsely green it.
+        assert!(!m.perishable_queue().is_empty(), "vector ops perishable until silicon verification");
+        assert!(m.comprehension_gaps().is_empty(), "intrinsic gap Accepted (#104) -- none remain");
+        assert!(!m.clean_release(), "gate stays red via the perishable queue (spec S5)");
     }
 
     #[test]
