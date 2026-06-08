@@ -16,6 +16,7 @@ use serde::Deserialize;
 use super::vector_srs;
 use xdna_archspec::aie2::rounding::RoundingMode;
 use super::vector_ups;
+use super::vector_pack;
 use super::VectorAlu;
 use crate::interpreter::bundle::{ElementType, Operand, SlotIndex, SlotOp};
 use xdna_archspec::aie2::isa::SemanticOp;
@@ -29,6 +30,11 @@ use crate::interpreter::state::ExecutionContext;
 struct GoldenData {
     srs: Vec<SrsCase>,
     ups: Vec<UpsCase>,
+
+    // Pack (narrowing) lane cases. Defaults to empty when the golden file
+    // predates pack coverage, so SRS/UPS/elementwise tests still load.
+    #[serde(default)]
+    pack: Vec<PackCase>,
 
     // Element-wise ops: dynamic keys like "vadd_Int32", "vsub_UInt8", etc.
     #[serde(flatten)]
@@ -63,6 +69,17 @@ struct ElementwiseCase {
     a: [u32; 8],
     b: [u32; 8],
     expected: [u32; 8],
+}
+
+#[derive(Deserialize)]
+struct PackCase {
+    value: i64,
+    bits_i: u32,
+    bits_o: u32,
+    signed: bool,
+    sat: bool,
+    symsat: bool,
+    expected: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +247,67 @@ fn validate_ups_golden() {
     }
     eprintln!("UPS: {pass}/{total} pass, {fail} fail");
     assert_eq!(fail, 0, "UPS validation: {fail}/{total} cases failed");
+}
+
+// ---------------------------------------------------------------------------
+// Pack (narrowing) validation
+// ---------------------------------------------------------------------------
+
+/// Map the genuine model's (sat, symsat) flags to the emulator's PackMode.
+fn pack_mode(sat: bool, symsat: bool) -> vector_pack::PackMode {
+    match (sat, symsat) {
+        (false, _) => vector_pack::PackMode::Truncate,
+        (true, false) => vector_pack::PackMode::Saturate,
+        (true, true) => vector_pack::PackMode::SymmetricSaturate,
+    }
+}
+
+#[test]
+fn validate_pack_golden() {
+    let golden = load_golden();
+    let total = golden.pack.len();
+    assert!(
+        total > 0,
+        "pack golden data missing -- regenerate tools/golden/vector_ops.json \
+         (VECTOR_ORACLE_MODEL=... python3 tools/gen_vector_golden.py)"
+    );
+
+    let mut pass = 0;
+    let mut fail = 0;
+    let mut first_failures = Vec::new();
+
+    for case in &golden.pack {
+        let mode = pack_mode(case.sat, case.symsat);
+        let actual = vector_pack::pack_lane(case.value, case.bits_i, case.bits_o, case.signed, mode);
+
+        if actual == case.expected {
+            pass += 1;
+        } else {
+            fail += 1;
+            if first_failures.len() < 10 {
+                first_failures.push(format!(
+                    "PACK MISMATCH: value={}, bits_i={}, bits_o={}, signed={}, \
+                     sat={}, symsat={}: expected={}, actual={}",
+                    case.value,
+                    case.bits_i,
+                    case.bits_o,
+                    case.signed,
+                    case.sat,
+                    case.symsat,
+                    case.expected,
+                    actual,
+                ));
+            }
+        }
+    }
+
+    if !first_failures.is_empty() {
+        for msg in &first_failures {
+            eprintln!("{}", msg);
+        }
+    }
+    eprintln!("Pack: {pass}/{total} pass, {fail} fail");
+    assert_eq!(fail, 0, "Pack validation: {fail}/{total} cases failed");
 }
 
 // ---------------------------------------------------------------------------

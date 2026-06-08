@@ -73,11 +73,12 @@ def load_oracle():
     sys.path.insert(0, ORACLE_MODEL)
     import srs
     import ups
+    import pack
     from helpers import trnc
-    return srs, ups, trnc
+    return srs, ups, pack, trnc
 
 
-SRS, UPS, trnc = load_oracle()
+SRS, UPS, PACK, trnc = load_oracle()
 
 BIAS = 4  # SRS rounding-precision bias; caller passes user_shift + BIAS.
 
@@ -313,6 +314,101 @@ def gen_ups_golden():
 
 
 # ---------------------------------------------------------------------------
+# Pack (narrowing) golden data (Tier 2b)
+# ---------------------------------------------------------------------------
+
+# The Rust pack_lane() signature:
+#   pack_lane(value: i64, bits_i: u32, bits_o: u32, signed: bool,
+#             mode: PackMode) -> i64
+#   where PackMode in {Truncate, Saturate, SymmetricSaturate}.
+#
+# The genuine model pack_lane() signature:
+#   pack_lane(a_in, bits_i, bits_o, sgn, sat, symsat) -> int
+#   (sat=False => Truncate; sat=True,symsat=False => Saturate;
+#    sat=True,symsat=True => SymmetricSaturate.)
+#
+# bits_i is unused by the lane computation (arbitrary-precision input); it is
+# recorded so the Rust seam receives the same signature.
+
+# AIE2 pack width pairs (bits_in -> bits_out). 4-bit outputs (D4) are real on
+# AIE2 (VPACK_D4_*), so they are exercised too.
+PACK_WIDTHS = [
+    (32, 16),
+    (32, 8),
+    (16, 8),
+    (16, 4),
+    (8, 4),
+]
+
+# (sat, symsat) -> Truncate / Saturate / SymmetricSaturate.
+PACK_SAT_CONFIGS = [
+    (False, False),  # truncate
+    (True, False),   # saturate
+    (True, True),    # symmetric saturate
+]
+
+
+def pack_boundary_values(bits_o, signed):
+    """Inputs that stress the saturate/truncate boundaries for a given output."""
+    if signed:
+        vmax = (1 << (bits_o - 1)) - 1
+        vmin = -(1 << (bits_o - 1))
+    else:
+        vmax = (1 << bits_o) - 1
+        vmin = 0
+
+    vals = [0, 1, -1, vmax, vmin, vmax + 1, vmin - 1, vmax - 1, vmin + 1]
+    # Symmetric-saturation min boundary (signed): -(2^(n-1)-1).
+    if signed:
+        vals.extend([-vmax, -vmax - 1, -vmax + 1])
+    # Far out of range, both directions -- exercises truncate-wrap vs clamp.
+    vals.extend([vmax * 4, vmin * 4 - 1, (1 << 30), -(1 << 30), (1 << 40), -(1 << 40)])
+    # Powers of two spanning the input width.
+    for p in range(0, 34, 2):
+        vals.extend([1 << p, -(1 << p)])
+
+    return list(set(vals))
+
+
+def gen_pack_golden():
+    """Generate pack (narrowing) golden cases against the genuine model."""
+    cases = []
+
+    for bits_i, bits_o in PACK_WIDTHS:
+        for signed in [True, False]:
+            for sat, symsat in PACK_SAT_CONFIGS:
+                boundary_vals = pack_boundary_values(bits_o, signed)
+                for val in boundary_vals:
+                    r = int(PACK.pack_lane(val, bits_i, bits_o, signed, sat, symsat))
+                    cases.append({
+                        "value": int(val),
+                        "bits_i": bits_i,
+                        "bits_o": bits_o,
+                        "signed": signed,
+                        "sat": sat,
+                        "symsat": symsat,
+                        "expected": r,
+                    })
+
+                # Random values spanning a wide accumulator range.
+                for _ in range(20):
+                    val = rng.randint(-(1 << 40), (1 << 40) - 1)
+                    r = int(PACK.pack_lane(val, bits_i, bits_o, signed, sat, symsat))
+                    cases.append({
+                        "value": int(val),
+                        "bits_i": bits_i,
+                        "bits_o": bits_o,
+                        "signed": signed,
+                        "sat": sat,
+                        "symsat": symsat,
+                        "expected": r,
+                    })
+
+    print(f"  Pack: {len(cases)} cases across {len(PACK_WIDTHS)} width pairs")
+    return cases
+
+
+# ---------------------------------------------------------------------------
 # Element-wise vector ops golden data (Tier 3)
 # ---------------------------------------------------------------------------
 
@@ -458,6 +554,7 @@ def main():
     golden = {}
     golden["srs"] = gen_srs_golden()
     golden["ups"] = gen_ups_golden()
+    golden["pack"] = gen_pack_golden()
     golden.update(gen_elementwise_golden())
 
     out_path = os.path.join(os.path.dirname(__file__), "golden", "vector_ops.json")
@@ -473,9 +570,11 @@ def main():
     print(f"\nSummary:")
     print(f"  SRS:  {len(golden['srs']):>6} cases")
     print(f"  UPS:  {len(golden['ups']):>6} cases")
+    print(f"  Pack: {len(golden['pack']):>6} cases")
     elem_total = sum(len(v) for k, v in golden.items() if k.startswith("v"))
     print(f"  Elem: {elem_total:>6} cases")
-    print(f"  Total:{len(golden['srs']) + len(golden['ups']) + elem_total:>6} cases")
+    grand = len(golden['srs']) + len(golden['ups']) + len(golden['pack']) + elem_total
+    print(f"  Total:{grand:>6} cases")
 
 
 if __name__ == "__main__":
