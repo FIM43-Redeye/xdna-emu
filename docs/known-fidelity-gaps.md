@@ -26,14 +26,14 @@ root posture: our DMA model is *optimistic where silicon is strict* -- it
 assumes generous/infinite resources (deep queues, unbounded token buffers,
 freely reusable BDs) where the hardware is finite and will stall or wedge. All
 are **low real-workload impact**: real compilers don't hit these; they bite
-synthetic / pathological kernels (e.g. our own calibration sweeps). If ever
-worth closing, they're plausibly **one "finite shim DMA" pass**, not three
-separate hunts.
+synthetic / pathological kernels (e.g. our own calibration sweeps). The one
+toolchain-derivable member (task queue depth) is now **fixed**; the two
+residual gaps both need **HW-empirical data** the open-source toolchain does not
+expose, so they stay documented-and-deferred rather than guessed.
 
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
-| Shim task queue depth | we model **8**, HW is **4** (aie-rt `XAIE_DMA_MAX_QUEUE_SIZE 4U` / `StartQSizeMax = 4U`) | `src/device/dma/token.rs` (`MAX_TASK_QUEUE_DEPTH`) | **OPEN.** A 1-line correction, but it changes queue behavior / cycle counts broadly -- blast radius with no current payoff (it does not by itself reproduce any known HW wedge; our peak occupancy is 1-2). Batch into a finite-DMA pass, don't do ad-hoc. |
-| TCT token buffer | we model **unbounded**; HW has finite token backpressure that stalls the channel (`Stalled_TCT`) | `src/device/dma/token.rs` (`TokenState`; the deliberate simplification is called out in the doc comment) | **OPEN.** Documented in code. No numeric depth in the toolchain (single stall bit only), so faithful modeling needs empirical depth. |
+| TCT token buffer | we model **unbounded**; HW has finite token backpressure that stalls the channel (`Stalled_TCT`) | `src/device/dma/token.rs` (`TokenState`; the deliberate simplification is called out in the doc comment) | **OPEN.** Documented in code. aie-rt exposes only a 1-bit `STALLED_TCT` flag, **no numeric depth** -- faithful finite modeling needs an empirically-measured HW depth (HW-gated; a guessed depth would violate derive-from-toolchain). |
 | BD reuse-while-live / BD-pool over-allocation | we re-parse a BD on reuse and complete; HW wedges when a kernel needs > 16 distinct shim BDs (in-flight BD reuse) | [finding: 2026-06-06 shim BD-pool over-allocation](superpowers/findings/2026-06-06-shim-bd-pool-overallocation-nonmonotonic-wedge.md) | **OPEN (won't-fix).** The HW wedge is *non-monotonic* in K (k8 pass, k9 wedge, k12 pass, k16 wedge) -- no clean model. Generator (`gen-shim-chain-sweep.py`) capped at K=8 instead. |
 
 A second, unrelated cluster: **trace held-level encoding**. After the held-level

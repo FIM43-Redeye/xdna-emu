@@ -614,12 +614,12 @@ fn test_task_queue_overflow() {
     // First task starts immediately
     assert!(engine.enqueue_task(2, 0, 0, false));
 
-    // Queue 8 more tasks (fills the queue)
+    // Fill the queue to its hardware depth
     for i in 0..MAX_TASK_QUEUE_DEPTH {
         assert!(engine.enqueue_task(2, 0, 0, false), "Task {} should enqueue", i);
     }
 
-    // 9th task should fail (queue full)
+    // One past depth should fail (queue full)
     assert!(!engine.enqueue_task(2, 0, 0, false));
 
     // Overflow flag should be set

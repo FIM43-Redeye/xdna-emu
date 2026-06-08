@@ -1,8 +1,8 @@
 //! DMA task queue and token-based synchronization.
 //!
 //! This module implements the AIE2 DMA task queue and completion token
-//! mechanism. Each DMA channel has a hardware task queue (8 entries deep
-//! per AM025) that allows multiple transfers to be enqueued without
+//! mechanism. Each DMA channel has a hardware task queue (4 entries deep
+//! per aie-rt `StartQSizeMax`) that allows multiple transfers to be enqueued without
 //! software intervention between tasks. When a task completes and token
 //! issue is enabled, the channel produces a completion token that software
 //! can poll or use to trigger events.
@@ -92,17 +92,21 @@ pub const START_BD_ID_WIDTH_MEMTILE: u32 = 6;
 
 /// Maximum task queue depth per channel.
 ///
-/// Per AM025 the hardware FIFO is 8 entries deep.  The
-/// `Task_Queue_Size` status field is 3 bits wide, reporting values
-/// 0-7; bit 7 (MSB) is implicit in "queue full".  aie-rt's
-/// `_XAieMl_DmaWaitForBdTaskQueue` polls the field's MSB (bit 22 of
-/// the status word = bit 2 of the 3-bit Task_Queue_Size) to detect
-/// "queue at least half-full" (size >= 4) as a backpressure
-/// signal -- it does not indicate queue saturation.
+/// The hardware start-queue holds 4 tasks.  aie-rt declares this as
+/// `XAIE_DMA_MAX_QUEUE_SIZE 4U` (`xaie_dma.c:45`, returned by
+/// `XAie_DmaGetMaxQueueSize`) and as the per-tile-type channel property
+/// `StartQSizeMax = 4U` -- uniform across compute, memtile, and shim/NoC
+/// modules and across every generation (AIE1, AIE-ML/AIE2, AIE2PS).
+/// `_XAieMlDmaSetStartQueue` (`xaie_dma_aieml.c:1125`) rejects a task whose
+/// `TaskQSize > StartQSizeMax`.
+///
+/// The `Task_Queue_Size` status field is 3 bits wide -- that is the register
+/// *encoding* width (it can express 0-7), not the queue's actual capacity.
+/// The capacity aie-rt enforces is 4, so a 5th outstanding task overflows.
 ///
 /// AIE2+ only: AIE1 has no task queue mechanism.  Consult
 /// `DmaModel::supports_task_queue()` before using.
-pub const MAX_TASK_QUEUE_DEPTH: usize = 8;
+pub const MAX_TASK_QUEUE_DEPTH: usize = 4;
 
 /// Maximum repeat count (8-bit field encodes actual-1, so max actual is 256).
 pub const MAX_REPEAT_COUNT: u32 = 256;
@@ -200,7 +204,7 @@ impl std::error::Error for QueueFull {}
 /// DMA channel task queue.
 ///
 /// A fixed-capacity FIFO that buffers pending tasks for a DMA channel.
-/// The hardware queue is 8 entries deep (per AM025 Task_Queue_Size field).
+/// The hardware queue is 4 entries deep (aie-rt `StartQSizeMax`).
 ///
 /// Tasks are pushed by writing to the Start_Queue register and consumed
 /// by the DMA engine as the channel becomes idle.
@@ -216,13 +220,13 @@ pub struct TaskQueue {
 impl TaskQueue {
     /// Create a new task queue with the given capacity.
     ///
-    /// The hardware capacity is `MAX_TASK_QUEUE_DEPTH` (8), but this
+    /// The hardware capacity is `MAX_TASK_QUEUE_DEPTH` (4), but this
     /// constructor accepts an arbitrary capacity for testing flexibility.
     pub fn new(capacity: usize) -> Self {
         Self { entries: VecDeque::with_capacity(capacity), capacity, overflow: false }
     }
 
-    /// Create a task queue with the standard hardware capacity (8 entries).
+    /// Create a task queue with the standard hardware capacity (4 entries).
     pub fn new_default() -> Self {
         Self::new(MAX_TASK_QUEUE_DEPTH)
     }
@@ -498,7 +502,8 @@ mod tests {
     fn queue_default_capacity() {
         let q = TaskQueue::new_default();
         assert_eq!(q.capacity(), MAX_TASK_QUEUE_DEPTH);
-        assert_eq!(q.capacity(), 8);
+        // aie-rt XAIE_DMA_MAX_QUEUE_SIZE / StartQSizeMax = 4U (all tile types).
+        assert_eq!(q.capacity(), 4);
     }
 
     #[test]
@@ -797,18 +802,19 @@ mod tests {
     }
 
     #[test]
-    fn queue_full_8_entries() {
-        // Verify the hardware-standard 8-entry depth
+    fn queue_full_at_hardware_depth() {
+        // Verify the hardware start-queue depth (aie-rt StartQSizeMax = 4).
         let mut q = TaskQueue::new_default();
         let entry = TaskQueueEntry::new(0, 0, false);
 
-        for i in 0..8 {
+        for i in 0..MAX_TASK_QUEUE_DEPTH {
             assert!(q.push(entry).is_ok(), "Entry {} should fit", i);
         }
         assert!(q.is_full());
-        assert_eq!(q.len(), 8);
+        assert_eq!(q.len(), MAX_TASK_QUEUE_DEPTH);
+        assert_eq!(MAX_TASK_QUEUE_DEPTH, 4);
 
-        // 9th push fails
+        // One past depth fails
         assert_eq!(q.push(entry), Err(QueueFull));
         assert!(q.has_overflow());
     }
