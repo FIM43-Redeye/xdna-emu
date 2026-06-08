@@ -139,6 +139,19 @@ pub(crate) fn core_level_edge(event: &EventType) -> Option<(u8, bool)> {
     }
 }
 
+/// For a memory-module DMA trace event, return its held-level polarity:
+/// `Some(true)` on the asserting edge, `Some(false)` on the deasserting edge.
+/// Returns `None` for one-cycle pulse events (start/finished task, finished BD),
+/// which route through the pulse path. The hw_id is resolved separately by the
+/// module-specific `*_event_to_hw_id` mapping; this only carries the edge.
+pub(crate) fn dma_level_active(event: &EventType) -> Option<bool> {
+    match event {
+        EventType::DmaStalledLock { active, .. } => Some(*active),
+        EventType::DmaStreamStarvation { active, .. } => Some(*active),
+        _ => None,
+    }
+}
+
 /// Extract the PC field from an EventType variant, if it carries one.
 ///
 /// Returns `Some(pc)` for instruction-class events (InstrVector, InstrLoad,
@@ -212,7 +225,7 @@ pub fn mem_event_to_hw_id(event: &EventType) -> Option<u8> {
             _ => None,
         },
         // DMA stalled lock: S2MM_0=31, S2MM_1=32, MM2S_0=33, MM2S_1=34
-        EventType::DmaStalledLock { channel } => match channel {
+        EventType::DmaStalledLock { channel, .. } => match channel {
             0 => Some(31),
             1 => Some(32),
             2 => Some(33),
@@ -220,7 +233,7 @@ pub fn mem_event_to_hw_id(event: &EventType) -> Option<u8> {
             _ => None,
         },
         // DMA stream starvation: S2MM_0=35, S2MM_1=36, MM2S_0=37(backpressure), MM2S_1=38
-        EventType::DmaStreamStarvation { channel } => match channel {
+        EventType::DmaStreamStarvation { channel, .. } => match channel {
             0 => Some(35),
             1 => Some(36),
             2 => Some(37),
@@ -335,9 +348,9 @@ pub fn memtile_event_to_hw_ids(event: &EventType, sel: MemtileDmaEventSel) -> [O
         // DMA finished task: S2MM_SEL0=29, S2MM_SEL1=30, MM2S_SEL0=31, MM2S_SEL1=32
         EventType::DmaFinishedTask { channel } => dma_ids(*channel, 29, 31),
         // DMA stalled lock: S2MM_SEL0=33, S2MM_SEL1=34, MM2S_SEL0=35, MM2S_SEL1=36
-        EventType::DmaStalledLock { channel } => dma_ids(*channel, 33, 35),
+        EventType::DmaStalledLock { channel, .. } => dma_ids(*channel, 33, 35),
         // DMA stream starvation: S2MM_SEL0=37, S2MM_SEL1=38, MM2S_SEL0=39(bp), MM2S_SEL1=40
-        EventType::DmaStreamStarvation { channel } => dma_ids(*channel, 37, 39),
+        EventType::DmaStreamStarvation { channel, .. } => dma_ids(*channel, 37, 39),
         // Lock acquire: LOCK_SEL0_ACQ_GE=47, stride 4 per lock.
         // Lock events are not gated by the DMA SEL register.
         EventType::LockAcquire { lock_id } if *lock_id <= 7 => [Some(47 + (*lock_id as u8) * 4), None],
@@ -380,7 +393,7 @@ pub fn shim_event_to_hw_id(event: &EventType) -> Option<u8> {
             _ => None,
         },
         // DMA stalled lock: S2MM_0=26, S2MM_1=27, MM2S_0=28, MM2S_1=29
-        EventType::DmaStalledLock { channel } => match channel {
+        EventType::DmaStalledLock { channel, .. } => match channel {
             0 => Some(26),
             1 => Some(27),
             2 => Some(28),
@@ -389,7 +402,7 @@ pub fn shim_event_to_hw_id(event: &EventType) -> Option<u8> {
         },
         // DMA stream starvation: S2MM_0=30, S2MM_1=31
         // DMA stream backpressure: MM2S_0=32, MM2S_1=33
-        EventType::DmaStreamStarvation { channel } => match channel {
+        EventType::DmaStreamStarvation { channel, .. } => match channel {
             0 => Some(30),
             1 => Some(31),
             2 => Some(32),
@@ -857,12 +870,18 @@ mod tests {
         assert_eq!(shim_event_to_hw_id(&EventType::DmaFinishedTask { channel: 3 }), Some(25));
 
         // DMA stalled lock: S2MM_0=26, S2MM_1=27, MM2S_0=28, MM2S_1=29
-        assert_eq!(shim_event_to_hw_id(&EventType::DmaStalledLock { channel: 0 }), Some(26));
-        assert_eq!(shim_event_to_hw_id(&EventType::DmaStalledLock { channel: 3 }), Some(29));
+        assert_eq!(shim_event_to_hw_id(&EventType::DmaStalledLock { channel: 0, active: true }), Some(26));
+        assert_eq!(shim_event_to_hw_id(&EventType::DmaStalledLock { channel: 3, active: true }), Some(29));
 
         // DMA stream starvation/backpressure: S2MM_0=30, S2MM_1=31, MM2S_0=32, MM2S_1=33
-        assert_eq!(shim_event_to_hw_id(&EventType::DmaStreamStarvation { channel: 0 }), Some(30));
-        assert_eq!(shim_event_to_hw_id(&EventType::DmaStreamStarvation { channel: 3 }), Some(33));
+        assert_eq!(
+            shim_event_to_hw_id(&EventType::DmaStreamStarvation { channel: 0, active: true }),
+            Some(30)
+        );
+        assert_eq!(
+            shim_event_to_hw_id(&EventType::DmaStreamStarvation { channel: 3, active: true }),
+            Some(33)
+        );
 
         // Lock events: 6 locks, stride 4, ACQ_GE base=40, REL base=41
         assert_eq!(shim_event_to_hw_id(&EventType::LockAcquire { lock_id: 0 }), Some(40));
@@ -870,6 +889,25 @@ mod tests {
         assert_eq!(shim_event_to_hw_id(&EventType::LockAcquire { lock_id: 6 }), None); // Only 6 locks
         assert_eq!(shim_event_to_hw_id(&EventType::LockRelease { lock_id: 0 }), Some(41));
         assert_eq!(shim_event_to_hw_id(&EventType::LockRelease { lock_id: 5 }), Some(61));
+    }
+
+    #[test]
+    fn dma_level_active_classifies_stall_starvation_edges() {
+        // Held-level DMA events carry the assert/deassert polarity...
+        assert_eq!(dma_level_active(&EventType::DmaStalledLock { channel: 0, active: true }), Some(true));
+        assert_eq!(dma_level_active(&EventType::DmaStalledLock { channel: 1, active: false }), Some(false));
+        assert_eq!(
+            dma_level_active(&EventType::DmaStreamStarvation { channel: 0, active: true }),
+            Some(true)
+        );
+        assert_eq!(
+            dma_level_active(&EventType::DmaStreamStarvation { channel: 1, active: false }),
+            Some(false)
+        );
+        // ...while one-cycle DMA pulses return None (routed through notify_event).
+        assert_eq!(dma_level_active(&EventType::DmaStartTask { channel: 0 }), None);
+        assert_eq!(dma_level_active(&EventType::DmaFinishedBd { channel: 0 }), None);
+        assert_eq!(dma_level_active(&EventType::DmaFinishedTask { channel: 0 }), None);
     }
 
     #[test]

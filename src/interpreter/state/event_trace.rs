@@ -83,12 +83,14 @@ pub enum EventType {
     /// DMA channel finished an entire task (all BDs and repeats).
     /// Maps to hardware DMA_x_FINISHED_TASK.
     DmaFinishedTask { channel: u8 },
-    /// DMA channel stalled waiting for a lock.
+    /// DMA channel stalled waiting for a lock. Held LEVEL: `active=true` on the
+    /// rising edge (channel blocks), `active=false` when the lock is granted.
     /// Maps to hardware DMA_x_STALLED_LOCK.
-    DmaStalledLock { channel: u8 },
-    /// DMA channel stalled waiting for stream data.
+    DmaStalledLock { channel: u8, active: bool },
+    /// DMA channel stalled waiting for stream data. Held LEVEL: `active=true`
+    /// when the input stream runs dry, `active=false` when data resumes.
     /// Maps to hardware DMA_x_STREAM_STARVATION.
-    DmaStreamStarvation { channel: u8 },
+    DmaStreamStarvation { channel: u8, active: bool },
 
     // -- Lock events (Memory module trace) --
     /// Lock acquired.
@@ -429,8 +431,8 @@ mod tests {
             EventType::DmaStartTask { channel: 0 },
             EventType::DmaFinishedBd { channel: 1 },
             EventType::DmaFinishedTask { channel: 2 },
-            EventType::DmaStalledLock { channel: 0 },
-            EventType::DmaStreamStarvation { channel: 1 },
+            EventType::DmaStalledLock { channel: 0, active: true },
+            EventType::DmaStreamStarvation { channel: 1, active: true },
             // Lock events
             EventType::LockAcquire { lock_id: 5 },
             EventType::LockRelease { lock_id: 5 },

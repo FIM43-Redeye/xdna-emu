@@ -543,6 +543,16 @@ impl DmaEngine {
             return Err(DmaError::InvalidChannel(channel));
         }
 
+        // Close any asserted held-level (stall/starvation) so its span does not
+        // leak past the channel stop. No-op in the trace unit if the level was
+        // never recorded (set_event_level ignores a no-edge deassert).
+        if self.channels[ch_idx].prev_lock_stalled {
+            self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
+        }
+        if self.channels[ch_idx].prev_starving {
+            self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8, active: false });
+        }
+
         let ch = &mut self.channels[ch_idx];
         ch.fsm = ChannelFsm::Idle;
         ch.queued_bd = None;

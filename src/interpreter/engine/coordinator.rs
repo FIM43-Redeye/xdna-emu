@@ -963,10 +963,17 @@ impl InterpreterEngine {
         // - Shim tiles: shim_event_to_hw_id -> core_trace (PL module)
         for (col, row, cycle, event) in self.device.array.drain_mem_trace_events() {
             if let Some(tile) = self.device.array.get_mut(col, row) {
+                // DMA stall/starvation are held levels (assert/deassert edges);
+                // start/finished events are one-cycle pulses. `dma_level_active`
+                // returns the edge polarity for the former, None for the latter.
+                let level = crate::trace::dma_level_active(&event);
                 if tile.is_shim() {
                     if let Some(id) = crate::trace::shim_event_to_hw_id(&event) {
                         // Shim DMA/lock events have no program counter.
-                        tile.notify_core_trace_event(id, cycle, None);
+                        match level {
+                            Some(active) => tile.notify_core_trace_level(id, cycle, active),
+                            None => tile.notify_core_trace_event(id, cycle, None),
+                        }
                     }
                 } else if tile.is_mem() {
                     // Memtile DMA events are gated by the DMA_Event_Channel_Selection
@@ -976,11 +983,15 @@ impl InterpreterEngine {
                     let sel =
                         crate::trace::MemtileDmaEventSel::from_register(tile.memtile_dma_event_chan_sel);
                     for id in crate::trace::memtile_event_to_hw_ids(&event, sel).into_iter().flatten() {
-                        tile.notify_mem_trace_event(id, cycle, None);
+                        match level {
+                            Some(active) => tile.notify_mem_trace_level(id, cycle, active),
+                            None => tile.notify_mem_trace_event(id, cycle, None),
+                        }
                     }
-                } else {
-                    if let Some(id) = crate::trace::mem_event_to_hw_id(&event) {
-                        tile.notify_mem_trace_event(id, cycle, None);
+                } else if let Some(id) = crate::trace::mem_event_to_hw_id(&event) {
+                    match level {
+                        Some(active) => tile.notify_mem_trace_level(id, cycle, active),
+                        None => tile.notify_mem_trace_event(id, cycle, None),
                     }
                 }
             }

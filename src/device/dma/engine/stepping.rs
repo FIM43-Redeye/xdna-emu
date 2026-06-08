@@ -272,8 +272,11 @@ impl DmaEngine {
                 } else {
                     // Check if arbiter granted the acquire (submitted in pre-step pass)
                     if self.check_acquire_granted(lock_id, tile, neighbors, ch_idx) {
-                        // Acquire granted -- lock stall deasserts.
-                        self.channels[ch_idx].prev_lock_stalled = false;
+                        // Acquire granted -- lock stall level deasserts.
+                        if self.channels[ch_idx].prev_lock_stalled {
+                            self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
+                            self.channels[ch_idx].prev_lock_stalled = false;
+                        }
                         // For a chained BD with no post-grant cooldown
                         // (cycles_remaining=0 from enter_chained_bd), collapse
                         // the AcquiringLock{acquired=true,cr=0} -> Transferring
@@ -306,10 +309,11 @@ impl DmaEngine {
                         }
                     } else {
                         self.channels[ch_idx].stats.lock_wait_cycles += 1;
-                        // Edge-triggered: fire once on the rising edge of the
-                        // lock-stall signal, not every cycle we're blocked.
+                        // Held level: assert on the rising edge of the
+                        // lock-stall signal; the matching deassert fires when the
+                        // acquire is granted (see check_acquire_granted arm).
                         if !self.channels[ch_idx].prev_lock_stalled {
-                            self.trace(EventType::DmaStalledLock { channel: ch_idx as u8 });
+                            self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: true });
                             self.channels[ch_idx].prev_lock_stalled = true;
                         }
                         ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired: false, transfer }
@@ -428,7 +432,11 @@ impl DmaEngine {
         match result {
             TransferCycleResult::Continue => {
                 transfer.tick();
-                self.channels[ch_idx].prev_starving = false;
+                // Stream data resumed -- starvation level deasserts.
+                if self.channels[ch_idx].prev_starving {
+                    self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8, active: false });
+                    self.channels[ch_idx].prev_starving = false;
+                }
                 if transfer.remaining_bytes() == 0 {
                     self.begin_completion(ch_idx, transfer, tile, neighbors)
                 } else {
@@ -436,9 +444,10 @@ impl DmaEngine {
                 }
             }
             TransferCycleResult::Stalled => {
-                // STREAM_STARVATION is edge-triggered on HW.
+                // STREAM_STARVATION held level: assert on the rising edge; the
+                // deassert fires on the next Continue (data resumed).
                 if !self.channels[ch_idx].prev_starving {
-                    self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8 });
+                    self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8, active: true });
                     self.channels[ch_idx].prev_starving = true;
                 }
                 ChannelFsm::Transferring { transfer }
@@ -550,6 +559,19 @@ impl DmaEngine {
         tile: &mut Tile,
         neighbors: &mut NeighborTiles<'_>,
     ) -> ChannelFsm {
+        // A transfer can complete directly from a stalled state (e.g. FotFinish
+        // on TLAST) without passing through a Continue, so close any asserted
+        // held-level here too -- otherwise the starvation/stall span would never
+        // deassert and would run to end-of-segment.
+        if self.channels[ch_idx].prev_starving {
+            self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8, active: false });
+            self.channels[ch_idx].prev_starving = false;
+        }
+        if self.channels[ch_idx].prev_lock_stalled {
+            self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
+            self.channels[ch_idx].prev_lock_stalled = false;
+        }
+
         let completion = CompletionInfo {
             bd_index: transfer.bd_index,
             next_bd: transfer.next_bd,
