@@ -827,6 +827,33 @@ impl Tile {
         }
     }
 
+    /// Notify a memory-module LEVEL event edge: assert (`active=true`) or
+    /// deassert (`active=false`).
+    ///
+    /// Mem-module counterpart to `notify_core_trace_level`. Forwards to
+    /// `mem_trace.set_event_level()` (the held-level trace path) and mirrors
+    /// `notify_mem_trace_event`'s timer-reset / edge-detector / debug-halt
+    /// side effects on the rising edge only.
+    #[inline]
+    pub fn notify_mem_trace_level(&mut self, hw_id: u8, cycle: u64, active: bool) {
+        // hw_id 0 is EVENT_NONE; see notify_core_trace_event for rationale.
+        if hw_id == 0 {
+            return;
+        }
+        self.mem_trace.set_event_level(hw_id, cycle, active);
+        if active {
+            self.mem_timer.notify_event(hw_id);
+            for det in &mut self.mem_edge_detectors {
+                if det.input_event != 0 && det.input_event == hw_id {
+                    det.curr_active = true;
+                }
+            }
+            if self.is_compute() {
+                self.core_debug.check_event_halt(hw_id);
+            }
+        }
+    }
+
     /// Evaluate edge detectors and fire generated events to trace units.
     ///
     /// Call once per cycle after all raw events have been notified.

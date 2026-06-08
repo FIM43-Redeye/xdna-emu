@@ -928,6 +928,10 @@ impl TraceUnit {
         // this cycle's pulses. Pulses are consumed (cleared) after; held bits
         // persist in `held_mask` until deasserted.
         let active = self.held_mask | self.pending_slot_mask;
+        // Pulse-only bits (one-cycle events not held as levels). Inside a hold
+        // these need an explicit close frame, since upstream does not
+        // deactivate events on a cycles==0 frame.
+        let pulses = self.pending_slot_mask & !self.held_mask;
         self.pending_slot_mask = 0;
 
         match self.mode {
@@ -957,13 +961,19 @@ impl TraceUnit {
                         self.emit_skip_run(gap - 1);
                     }
                     self.emit_event_frame(active, 0);
-                } else if self.held_mask != 0 && gap > 0 {
-                    // Opening a hold after an idle gap: position+activate with the
-                    // gap in the cycles field, then an immediate cycles=0 frame to
-                    // arm the skip mechanism for the upcoming hold (mirrors HW's
-                    // pulse-then-cycles=0 hold open).
-                    self.emit_event_frame(active, gap);
+                    self.close_pulses_during_hold(pulses);
+                } else if self.held_mask != 0 {
+                    // Opening a hold (no level was held across the gap). With an
+                    // idle gap, position+activate with the gap in the cycles field
+                    // first; then an immediate cycles=0 frame arms the skip
+                    // mechanism for the upcoming hold (mirrors HW's pulse-then-
+                    // cycles=0 hold open). At gap 0 the single cycles=0 frame
+                    // suffices.
+                    if gap > 0 {
+                        self.emit_event_frame(active, gap);
+                    }
                     self.emit_event_frame(active, 0);
+                    self.close_pulses_during_hold(pulses);
                 } else {
                     // Pure pulse / nothing held across the gap: the gap rides in the
                     // frame's cycles field, as before.
@@ -1038,6 +1048,21 @@ impl TraceUnit {
             self.encode_single(active.trailing_zeros() as u8, cycles);
         } else {
             self.encode_multiple(active, cycles);
+        }
+    }
+
+    /// After a `cycles==0` frame that carried one-cycle `pulses` alongside held
+    /// levels, emit a follow-up `held_mask, cycles=0` frame to deactivate those
+    /// pulses. Upstream `parse_trace` only deactivates an active event when a
+    /// later frame's mask omits it; inside a hold every frame is `cycles==0`, so
+    /// without this close frame the pulse would stay asserted and merge with the
+    /// next same-slot pulse (dropping its count). Mirrors HW's
+    /// `Multiple(held|pulse) ; Multiple(held)` pattern (e.g. commands [42]->[43]
+    /// of the distribute_lateral core stream). No-op when no pulse fired or no
+    /// level remains held -- a lone pulse closes at the next frame as before.
+    fn close_pulses_during_hold(&mut self, pulses: u8) {
+        if pulses != 0 && self.held_mask != 0 {
+            self.emit_event_frame(self.held_mask, 0);
         }
     }
 

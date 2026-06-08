@@ -185,6 +185,42 @@ fn held_level_emits_skip_token_run_not_per_cycle() {
     );
 }
 
+/// A one-cycle pulse fired DURING a held level must be closed by a follow-up
+/// held-only frame. Upstream `parse_trace` only deactivates an active event
+/// when a later frame's mask omits it; inside a hold every frame is `cycles==0`,
+/// so without the close frame the pulse stays asserted and merges with the next
+/// same-slot pulse (dropping its count). Mirrors HW's
+/// `Multiple(held|pulse) ; Multiple(held)` pattern.
+#[test]
+fn pulse_during_hold_emits_close_frame() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    // slot0=37 (pulse), slot3=26 (LOCK_STALL, a level)
+    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24));
+    tu.notify_event(28, 0, None);
+
+    tu.set_event_level(26, 10, true); // assert level (slot3 -> bit 0x08)
+    for c in 11..40 {
+        tu.commit_cycle(c);
+    }
+    let before = tu.byte_buffer.len();
+
+    // Pulse slot0 (bit 0x01) at cycle 40, while LOCK_STALL is held.
+    tu.notify_event(37, 40, None);
+    tu.commit_cycle(40);
+
+    // The level stays held across the pulse...
+    assert_eq!(tu.held_mask, 0x08, "level stays held across the pulse");
+    // ...and the pulse is closed by a trailing held-only frame:
+    // Single0(slot3, cycles=0) = (3<<4)|0 = 0x30.
+    assert_eq!(
+        *tu.byte_buffer.last().unwrap(),
+        0x30,
+        "pulse during hold must be closed by a held-only frame; got {:02x?}",
+        &tu.byte_buffer[before..]
+    );
+}
+
 /// With no levels asserted (`held_mask == 0`) the held-level mechanism is
 /// inert: pulse-event encoding is byte-identical to the pre-held-mask encoder.
 #[test]

@@ -18,7 +18,7 @@ use crate::interpreter::bundle::VliwBundle;
 use crate::interpreter::core::{CoreInterpreter, CoreStatus, StepResult};
 use crate::interpreter::decode::InstructionDecoder;
 use crate::interpreter::execute::{CycleAccurateExecutor, NeighborLocks, NeighborMemory};
-use crate::interpreter::state::{EventType, ExecutionContext};
+use crate::interpreter::state::ExecutionContext;
 use crate::parser::AieElf;
 use xdna_archspec::aie2::SHIM_ROW;
 use xdna_archspec::types::TileKind;
@@ -1002,9 +1002,13 @@ impl InterpreterEngine {
         // (the old behavior) floods small trace BDs in milliseconds.
         {
             let cycle = self.total_cycles;
-            // Collect (tile_idx, hw_event_id, event_type, trace_target) tuples.
-            // trace_target: which trace unit to notify (core_trace vs mem_trace).
-            let mut port_events: Vec<(usize, u8, EventType, TileKind)> = Vec::new();
+            // Collect (tile_idx, hw_event_id, route, trace_target) tuples.
+            // `route`: None = one-cycle pulse; Some(active) = held-level edge
+            // (assert/deassert). PORT_RUNNING/IDLE/STALLED are level signals
+            // (held while the port is in that state), so they emit both edges
+            // through the skip-token held-level path; PORT_TLAST is a true
+            // pulse. trace_target selects core_trace vs mem_trace.
+            let mut port_events: Vec<(usize, u8, Option<bool>, TileKind)> = Vec::new();
             // Per-tile updates to prev_port_state, applied after collection.
             let mut prev_updates: Vec<(usize, u8, bool, bool, bool)> = Vec::new();
             for idx in 0..self.device.array.tiles.len() {
@@ -1013,6 +1017,27 @@ impl InterpreterEngine {
                     continue;
                 }
                 let tt = tile.tile_kind;
+
+                let running_hw = |p| match tt {
+                    TileKind::Compute => crate::trace::core_port_running_hw_id(p),
+                    TileKind::Mem => crate::trace::memtile_port_running_hw_id(p),
+                    TileKind::ShimNoc | TileKind::ShimPl => crate::trace::shim_port_running_hw_id(p),
+                };
+                let idle_hw = |p| match tt {
+                    TileKind::Compute => crate::trace::core_port_idle_hw_id(p),
+                    TileKind::Mem => crate::trace::memtile_port_idle_hw_id(p),
+                    TileKind::ShimNoc | TileKind::ShimPl => crate::trace::shim_port_idle_hw_id(p),
+                };
+                let stalled_hw = |p| match tt {
+                    TileKind::Compute => crate::trace::core_port_stalled_hw_id(p),
+                    TileKind::Mem => crate::trace::memtile_port_stalled_hw_id(p),
+                    TileKind::ShimNoc | TileKind::ShimPl => crate::trace::shim_port_stalled_hw_id(p),
+                };
+                let tlast_hw = |p| match tt {
+                    TileKind::Compute => crate::trace::core_port_tlast_hw_id(p),
+                    TileKind::Mem => crate::trace::memtile_port_tlast_hw_id(p),
+                    TileKind::ShimNoc | TileKind::ShimPl => crate::trace::shim_port_tlast_hw_id(p),
+                };
 
                 for event_port in 0..8u8 {
                     if let Some((port_idx, is_master)) = tile.event_port_selection[event_port as usize] {
@@ -1029,65 +1054,43 @@ impl InterpreterEngine {
                         let cur_stalled = port.cycle_stalled;
                         let cur_tlast = port.cycle_tlast;
 
-                        // PORT_RUNNING fires on idle -> active transition;
-                        // PORT_IDLE fires on active -> idle transition.
-                        if cur_active && !prev_active {
-                            let hw_id = match tt {
-                                TileKind::Compute => crate::trace::core_port_running_hw_id(event_port),
-                                TileKind::Mem => crate::trace::memtile_port_running_hw_id(event_port),
-                                TileKind::ShimNoc | TileKind::ShimPl => {
-                                    crate::trace::shim_port_running_hw_id(event_port)
-                                }
-                            };
-                            port_events.push((idx, hw_id, EventType::PortRunning { port: event_port }, tt));
-                        } else if !cur_active && prev_active {
-                            let hw_id = match tt {
-                                TileKind::Compute => crate::trace::core_port_idle_hw_id(event_port),
-                                TileKind::Mem => crate::trace::memtile_port_idle_hw_id(event_port),
-                                TileKind::ShimNoc | TileKind::ShimPl => {
-                                    crate::trace::shim_port_idle_hw_id(event_port)
-                                }
-                            };
-                            port_events.push((idx, hw_id, EventType::PortIdle { port: event_port }, tt));
+                        // PORT_RUNNING and PORT_IDLE are complementary held
+                        // levels: a port is either running or idle. On each
+                        // active-edge, assert one and deassert the other. The
+                        // trace unit records only the levels mapped to a slot,
+                        // so emitting both is harmless when only one is traced.
+                        if cur_active != prev_active {
+                            port_events.push((idx, running_hw(event_port), Some(cur_active), tt));
+                            port_events.push((idx, idle_hw(event_port), Some(!cur_active), tt));
                         }
 
-                        // PORT_STALLED and PORT_TLAST fire only on rising edge.
-                        if cur_stalled && !prev_stalled {
-                            let hw_id = match tt {
-                                TileKind::Compute => crate::trace::core_port_stalled_hw_id(event_port),
-                                TileKind::Mem => crate::trace::memtile_port_stalled_hw_id(event_port),
-                                TileKind::ShimNoc | TileKind::ShimPl => {
-                                    crate::trace::shim_port_stalled_hw_id(event_port)
-                                }
-                            };
-                            port_events.push((idx, hw_id, EventType::PortStalled { port: event_port }, tt));
+                        // PORT_STALLED is a held level (asserted while the port
+                        // is stalled); emit both edges.
+                        if cur_stalled != prev_stalled {
+                            port_events.push((idx, stalled_hw(event_port), Some(cur_stalled), tt));
                         }
 
+                        // PORT_TLAST is a genuine one-cycle pulse (end of
+                        // packet), emitted on its rising edge only.
                         if cur_tlast && !prev_tlast {
-                            let hw_id = match tt {
-                                TileKind::Compute => crate::trace::core_port_tlast_hw_id(event_port),
-                                TileKind::Mem => crate::trace::memtile_port_tlast_hw_id(event_port),
-                                TileKind::ShimNoc | TileKind::ShimPl => {
-                                    crate::trace::shim_port_tlast_hw_id(event_port)
-                                }
-                            };
-                            port_events.push((idx, hw_id, EventType::PortTlast { port: event_port }, tt));
+                            port_events.push((idx, tlast_hw(event_port), None, tt));
                         }
 
                         prev_updates.push((idx, event_port, cur_active, cur_stalled, cur_tlast));
                     }
                 }
             }
-            for (idx, hw_id, _evt, tt) in port_events {
+            for (idx, hw_id, route, tt) in port_events {
                 let tile = &mut self.device.array.tiles[idx];
                 // Compute tiles: core_trace (CoreEvent namespace)
                 // Shim tiles: core_trace (PL module, single trace unit)
                 // MemTiles: mem_trace (MemTileEvent namespace)
                 // Port events have no PC -- they are I/O fabric events.
-                if tt.is_mem() {
-                    tile.notify_mem_trace_event(hw_id, cycle, None);
-                } else {
-                    tile.notify_core_trace_event(hw_id, cycle, None);
+                match (tt.is_mem(), route) {
+                    (true, Some(active)) => tile.notify_mem_trace_level(hw_id, cycle, active),
+                    (true, None) => tile.notify_mem_trace_event(hw_id, cycle, None),
+                    (false, Some(active)) => tile.notify_core_trace_level(hw_id, cycle, active),
+                    (false, None) => tile.notify_core_trace_event(hw_id, cycle, None),
                 }
             }
             for (idx, event_port, active, stalled, tlast) in prev_updates {
