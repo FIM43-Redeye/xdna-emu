@@ -33,7 +33,7 @@ for the corresponding vector class (plan Task 3 -> Task 5 Verified flip).
 
 | Dir | Class | Status |
 |-----|-------|--------|
-| `vec_eltwise_add` | element-wise (vadd_Int32) | authored; EMU-smoke pending |
+| `vec_eltwise_add` | element-wise (vadd_Int32) | **EMU-smoke PASS** (chess, 18.5s) |
 | `vec_srs_i32` | SRS | todo |
 | `vec_ups_i32` | UPS | todo |
 | `vec_pack_i16` | Pack | todo |
