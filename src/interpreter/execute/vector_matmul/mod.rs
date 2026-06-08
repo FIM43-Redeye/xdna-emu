@@ -960,6 +960,171 @@ fn matmul_i32xi16(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // MatMul value differential vs independent oracles
+    //
+    // Golden from tools/gen_vector_golden.py: integer lanes computed by
+    // independent integer multiply-accumulate (wrapped to acc width); bf16
+    // lanes computed by the genuine aietools bfloat16.py:bf16_mac_hw. The live
+    // seam (matmul_config_driven) is driven via MatMulConfig::from_types, and
+    // the geometry from_types yields is cross-checked against the golden's
+    // geometry fields. No aietools dependency at test time.
+    // -----------------------------------------------------------------------
+
+    #[derive(serde::Deserialize)]
+    struct MatmulCase {
+        a_type: String,
+        b_type: String,
+        rows: u32,
+        inner: u32,
+        cols: u32,
+        bits_x: u32,
+        bits_y: u32,
+        acc_width: String,
+        bfloat: bool,
+        x_signed: bool,
+        y_signed: bool,
+        subtract: bool,
+        a: Vec<u32>,
+        b: Vec<u32>,
+        /// Per-lane expected: int lanes as i64; bf16 lanes as fp32 bit pattern.
+        expected: Vec<i64>,
+    }
+
+    fn parse_elem_type(s: &str) -> ElementType {
+        match s {
+            "Int8" => ElementType::Int8,
+            "Int16" => ElementType::Int16,
+            "Int32" => ElementType::Int32,
+            "BFloat16" => ElementType::BFloat16,
+            other => panic!("unhandled matmul element type {other}"),
+        }
+    }
+
+    /// True if an fp32 bit pattern is NaN (exp all-ones, mantissa nonzero).
+    fn fp32_is_nan_bits(bits: u32) -> bool {
+        (bits >> 23) & 0xFF == 0xFF && (bits & 0x7F_FFFF) != 0
+    }
+
+    fn load_matmul_golden() -> Vec<MatmulCase> {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tools");
+        path.push("golden");
+        path.push("vector_ops.json");
+        let data = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read golden {}: {}", path.display(), e));
+        let v: serde_json::Value = serde_json::from_str(&data).expect("parse golden json");
+        let arr = v.get("matmul").cloned().unwrap_or(serde_json::Value::Null);
+        if arr.is_null() {
+            return Vec::new();
+        }
+        serde_json::from_value(arr).expect("deserialize matmul cases")
+    }
+
+    #[test]
+    fn validate_matmul_golden() {
+        let cases = load_matmul_golden();
+        assert!(
+            !cases.is_empty(),
+            "matmul golden data missing -- regenerate tools/golden/vector_ops.json \
+             (VECTOR_ORACLE_MODEL=... python3 tools/gen_vector_golden.py)"
+        );
+
+        let mut pass = 0usize;
+        let mut fail = 0usize;
+        let mut first_failures = Vec::new();
+
+        for (ci, case) in cases.iter().enumerate() {
+            let a_type = parse_elem_type(&case.a_type);
+            let b_type = parse_elem_type(&case.b_type);
+            let config = MatMulConfig::from_types(
+                a_type,
+                b_type,
+                /*accumulate=*/ false,
+                case.x_signed,
+                case.y_signed,
+                case.subtract,
+            )
+            .unwrap_or_else(|| panic!("from_types returned None for {}x{}", case.a_type, case.b_type));
+
+            // Cross-check: the geometry from_types selects must match the
+            // independently-encoded golden geometry.
+            let want_aw = if case.acc_width == "Acc64" {
+                AccWidth::Acc64
+            } else {
+                AccWidth::Acc32
+            };
+            assert_eq!(
+                (
+                    config.rows,
+                    config.inner,
+                    config.cols,
+                    config.bits_x,
+                    config.bits_y,
+                    config.acc_width,
+                    config.bfloat
+                ),
+                (case.rows, case.inner, case.cols, case.bits_x, case.bits_y, want_aw, case.bfloat),
+                "geometry mismatch for {}x{} (case {ci})",
+                case.a_type,
+                case.b_type,
+            );
+
+            let mut a = [0u32; 16];
+            let mut b = [0u32; 16];
+            a.copy_from_slice(&case.a);
+            b.copy_from_slice(&case.b);
+            let mut acc: Acc1024 = [0u64; 16];
+            matmul_config_driven(&mut acc, &a, &b, &config, None, false);
+
+            let lanes = (case.rows * case.cols) as usize;
+            for out_idx in 0..lanes {
+                let expected = case.expected[out_idx];
+                let matched = if case.bfloat {
+                    // bf16 lanes are fp32 bit patterns. The emulator matches the
+                    // genuine model bit-exact on all finite + inf results, but
+                    // diverges on NaN canonicalization: the aietools model uses
+                    // NaN mantissa 0x7F, while real NPU1 silicon (and thus the
+                    // emulator) uses mantissa = 1. That is a documented
+                    // model-vs-silicon gap where the emulator is HW-correct, so
+                    // NaN-vs-NaN counts as a match (payload divergence ignored).
+                    let act = read_acc_wide_f32(&acc, out_idx).to_bits();
+                    let exp = expected as u32;
+                    if fp32_is_nan_bits(exp) {
+                        fp32_is_nan_bits(act)
+                    } else {
+                        act == exp
+                    }
+                } else {
+                    read_acc_wide(&acc, out_idx, config.acc_width) == expected
+                };
+                if matched {
+                    pass += 1;
+                } else {
+                    fail += 1;
+                    if first_failures.len() < 10 {
+                        let actual: i64 = if case.bfloat {
+                            read_acc_wide_f32(&acc, out_idx).to_bits() as i64
+                        } else {
+                            read_acc_wide(&acc, out_idx, config.acc_width)
+                        };
+                        first_failures.push(format!(
+                            "MATMUL MISMATCH {}x{} (case {ci}) lane {out_idx}: expected {expected}, actual {actual}",
+                            case.a_type, case.b_type,
+                        ));
+                    }
+                }
+            }
+        }
+
+        for msg in &first_failures {
+            eprintln!("{msg}");
+        }
+        eprintln!("MatMul: {pass} pass, {fail} fail across {} cases", cases.len());
+        assert_eq!(fail, 0, "MatMul validation: {fail} lane(s) failed");
+    }
+
     /// Pack int8 values into [u32; 8] in little-endian order.
     fn pack_i8(values: &[i8]) -> [u32; 8] {
         let mut packed = [0u32; 8];

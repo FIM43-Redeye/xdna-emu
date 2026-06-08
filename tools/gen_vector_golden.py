@@ -74,11 +74,12 @@ def load_oracle():
     import srs
     import ups
     import pack
+    import bfloat16
     from helpers import trnc
-    return srs, ups, pack, trnc
+    return srs, ups, pack, bfloat16, trnc
 
 
-SRS, UPS, PACK, trnc = load_oracle()
+SRS, UPS, PACK, BF16, trnc = load_oracle()
 
 BIAS = 4  # SRS rounding-precision bias; caller passes user_shift + BIAS.
 
@@ -482,6 +483,159 @@ def gen_bf16_srs_golden():
 
 
 # ---------------------------------------------------------------------------
+# MatMul golden data (Tier 4): value differential vs INDEPENDENT oracles
+# ---------------------------------------------------------------------------
+#
+# The live seam is matmul_config_driven (generic row-major tiling). mulmac.py
+# (the gate-level model) cannot be driven -- it imports kernels.helpers
+# (absent from aietools) and needs the full constants.py geometry tables. So
+# the value-level oracles here are:
+#   - integer paths: INDEPENDENT integer multiply-accumulate (plain Python),
+#     wrapped to the accumulator width. No aietools dependency.
+#   - bf16 path: the GENUINE bfloat16.py:bf16_mac_hw hardware MAC reference.
+# Both oracles are geometry-free (flat element lists), so they don't touch the
+# suspect constants.py port. The geometry is encoded here from the documented
+# AIE2 tile shapes; the Rust side derives geometry from MatMulConfig::from_types
+# and cross-checks it against these fields (a mismatch fails the test loudly).
+
+# (a_type, b_type, rows, inner, cols, bits_x, bits_y, acc_width, bfloat)
+# Tile shapes are the DEFAULT (first-matching) entries of the AIE2
+# DENSE_GEOMETRY_TABLE that MatMulConfig::from_types selects per (bits_x,
+# bits_y, bfloat). The Rust side derives geometry from from_types and asserts
+# it equals these fields -- a mismatch fails the test loudly, cross-checking
+# the geometry itself.
+MATMUL_GEOMS = [
+    ("Int8",     "Int8",     4, 8, 8, 8,  8,  "Acc32", False),  # mmode 1
+    ("Int16",    "Int16",    4, 2, 8, 16, 16, "Acc32", False),  # mmode 3
+    ("Int32",    "Int16",    4, 2, 4, 32, 16, "Acc64", False),  # mmode 7
+    ("BFloat16", "BFloat16", 4, 8, 4, 16, 16, "Acc32", True),   # mmode 6
+]
+
+
+def _to_i32(v):
+    return ((v + (1 << 31)) % (1 << 32)) - (1 << 31)
+
+
+def _pack_elem(buf, byte_off, val, nbytes):
+    v = val & ((1 << (8 * nbytes)) - 1)
+    for i in range(nbytes):
+        buf[byte_off + i] = (v >> (8 * i)) & 0xFF
+
+
+def _buf_to_vec512(buf):
+    return [buf[i * 4] | (buf[i * 4 + 1] << 8) | (buf[i * 4 + 2] << 16) | (buf[i * 4 + 3] << 24)
+            for i in range(16)]
+
+
+def _int_range(bits, signed):
+    if signed:
+        return -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    return 0, (1 << bits) - 1
+
+
+def _sample_int_matrix(n, bits, signed, kind, vmin, vmax):
+    if kind == "zeros":
+        return [0] * n
+    if kind == "max":
+        return [vmax] * n
+    if kind == "min":
+        return [vmin] * n
+    if kind == "alt":
+        return [vmax if i % 2 == 0 else vmin for i in range(n)]
+    return [rng.randint(vmin, vmax) for _ in range(n)]
+
+
+def _nice_bf16_values():
+    # Small representable bf16 patterns (exact integers/halves) + a few randoms.
+    vals = [0x0000, 0x3F80, 0xBF80, 0x4000, 0xC000, 0x3F00, 0xBF00,  # 0,1,-1,2,-2,.5,-.5
+            0x4040, 0x4080, 0x40A0, 0x3E80, 0x4120]                  # 3,4,5,.25,10
+    return vals
+
+
+def gen_matmul_golden():
+    """MatMul value differential: int vs independent arithmetic, bf16 vs the
+    genuine bf16_mac_hw."""
+    cases = []
+    for (at, bt, rows, inner, cols, bx, by, accw, bfloat) in MATMUL_GEOMS:
+        na = rows * inner
+        nb = inner * cols
+        bytes_x = bx // 8
+        bytes_y = by // 8
+
+        if bfloat:
+            # bf16: sweep nice value pairs + random bf16-bit matrices.
+            nice = _nice_bf16_values()
+            mats = []
+            mats.append(([0x3F80] * na, [0x3F80] * nb))            # all ones
+            mats.append(([nice[i % len(nice)] for i in range(na)],
+                         [nice[(i * 3) % len(nice)] for i in range(nb)]))
+            for _ in range(24):
+                mats.append(([rng.choice(nice) for _ in range(na)],
+                             [rng.choice(nice) for _ in range(nb)]))
+            for _ in range(12):
+                mats.append(([rng.randint(0, 0xFFFF) for _ in range(na)],
+                             [rng.randint(0, 0xFFFF) for _ in range(nb)]))
+            for (av, bv) in mats:
+                abuf = bytearray(64)
+                bbuf = bytearray(64)
+                for idx, v in enumerate(av):
+                    _pack_elem(abuf, idx * 2, v, 2)
+                for idx, v in enumerate(bv):
+                    _pack_elem(bbuf, idx * 2, v, 2)
+                # Independent per-lane oracle: genuine bf16_mac_hw(q=0, A row, B col).
+                exp = []
+                for r in range(rows):
+                    for c in range(cols):
+                        a_elems = [av[r * inner + k] for k in range(inner)]
+                        b_elems = [bv[k * cols + c] for k in range(inner)]
+                        exp.append(int(BF16.bf16_mac_hw(0, a_elems, b_elems)) & 0xFFFFFFFF)
+                cases.append({
+                    "a_type": at, "b_type": bt, "rows": rows, "inner": inner, "cols": cols,
+                    "bits_x": bx, "bits_y": by, "acc_width": accw, "bfloat": True,
+                    "x_signed": True, "y_signed": True, "subtract": False,
+                    "a": _buf_to_vec512(abuf), "b": _buf_to_vec512(bbuf), "expected": exp,
+                })
+            continue
+
+        # Integer paths: sweep sign combos, subtract, and stress matrices.
+        for x_signed in (True, False):
+            for y_signed in (True, False):
+                for subtract in (False, True):
+                    vminx, vmaxx = _int_range(bx, x_signed)
+                    vminy, vmaxy = _int_range(by, y_signed)
+                    kinds = ["zeros", "max", "min", "alt", "rand", "rand", "rand",
+                             "rand", "rand", "rand"]
+                    for ak in kinds:
+                        for bk in kinds[:5]:
+                            av = _sample_int_matrix(na, bx, x_signed, ak, vminx, vmaxx)
+                            bv = _sample_int_matrix(nb, by, y_signed, bk, vminy, vmaxy)
+                            abuf = bytearray(64)
+                            bbuf = bytearray(64)
+                            for idx, v in enumerate(av):
+                                _pack_elem(abuf, idx * bytes_x, v, bytes_x)
+                            for idx, v in enumerate(bv):
+                                _pack_elem(bbuf, idx * bytes_y, v, bytes_y)
+                            exp = []
+                            for r in range(rows):
+                                for c in range(cols):
+                                    s = sum(av[r * inner + k] * bv[k * cols + c]
+                                            for k in range(inner))
+                                    if subtract:
+                                        s = -s
+                                    exp.append(_to_i32(s) if accw == "Acc32" else s)
+                            cases.append({
+                                "a_type": at, "b_type": bt, "rows": rows, "inner": inner,
+                                "cols": cols, "bits_x": bx, "bits_y": by, "acc_width": accw,
+                                "bfloat": False, "x_signed": x_signed, "y_signed": y_signed,
+                                "subtract": subtract,
+                                "a": _buf_to_vec512(abuf), "b": _buf_to_vec512(bbuf),
+                                "expected": exp,
+                            })
+    print(f"  MatMul: {len(cases)} cases across {len(MATMUL_GEOMS)} geometries")
+    return cases
+
+
+# ---------------------------------------------------------------------------
 # Element-wise vector ops golden data (Tier 3)
 # ---------------------------------------------------------------------------
 
@@ -629,6 +783,7 @@ def main():
     golden["ups"] = gen_ups_golden()
     golden["pack"] = gen_pack_golden()
     golden["bf16_srs"] = gen_bf16_srs_golden()
+    golden["matmul"] = gen_matmul_golden()
     golden.update(gen_elementwise_golden())
 
     out_path = os.path.join(os.path.dirname(__file__), "golden", "vector_ops.json")
@@ -646,10 +801,11 @@ def main():
     print(f"  UPS:  {len(golden['ups']):>6} cases")
     print(f"  Pack: {len(golden['pack']):>6} cases")
     print(f"  BF16: {len(golden['bf16_srs']):>6} cases")
+    print(f"  MatMul:{len(golden['matmul']):>5} cases")
     elem_total = sum(len(v) for k, v in golden.items() if k.startswith("v"))
     print(f"  Elem: {elem_total:>6} cases")
     grand = (len(golden['srs']) + len(golden['ups']) + len(golden['pack'])
-             + len(golden['bf16_srs']) + elem_total)
+             + len(golden['bf16_srs']) + len(golden['matmul']) + elem_total)
     print(f"  Total:{grand:>6} cases")
 
 

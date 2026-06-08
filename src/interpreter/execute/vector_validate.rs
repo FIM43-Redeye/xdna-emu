@@ -41,6 +41,13 @@ struct GoldenData {
     #[serde(default)]
     bf16_srs: Vec<Bf16SrsCase>,
 
+    // MatMul cases are validated in the vector_matmul module (where the
+    // accumulator helpers are in scope). Named here only so the flattened
+    // elementwise map below does not try to deserialize them.
+    #[serde(default)]
+    #[allow(dead_code)]
+    matmul: Vec<serde::de::IgnoredAny>,
+
     // Element-wise ops: dynamic keys like "vadd_Int32", "vsub_UInt8", etc.
     #[serde(flatten)]
     elementwise: HashMap<String, Vec<ElementwiseCase>>,
