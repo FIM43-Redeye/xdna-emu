@@ -345,68 +345,54 @@ pub struct BatchResult {
 // Level event classification
 // ============================================================================
 
-/// Level events fire every cycle a condition holds. Comparing them by
-/// occurrence index is meaningless -- compare by interval structure instead.
+use crate::trace::event_codes::{core_event_name, mem_event_name, memtile_event_name, TraceModule};
+
+/// Resolve an event name string to its (hw_id, TraceModule) pair.
+///
+/// Module is inferred from the name prefix:
+///   - `DMA_*SEL*` (MemTile SEL-naming)   -> TraceModule::MemTile
+///   - `DMA_*` or `CONFLICT_DM_BANK_*`    -> TraceModule::Mem
+///   - everything else (stalls, port states, TRUE, INSTR_*, ...) -> TraceModule::Core
+///
+/// The hw_id is found by scanning the appropriate generated name table
+/// (0..=127). Returns `None` if the name is not found in the table
+/// (unknown or reserved names).
+fn name_to_hw_id_and_module(name: &str) -> Option<(u8, TraceModule)> {
+    let module = if name.starts_with("DMA_") && name.contains("SEL") {
+        TraceModule::MemTile
+    } else if name.starts_with("DMA_") || name.starts_with("CONFLICT_DM_BANK_") {
+        TraceModule::Mem
+    } else {
+        TraceModule::Core
+    };
+
+    let hw_id = (0u8..=127).find(|&id| match module {
+        TraceModule::Core => core_event_name(id) == name,
+        TraceModule::Mem => mem_event_name(id) == name,
+        TraceModule::MemTile => memtile_event_name(id) == name,
+    })?;
+
+    Some((hw_id, module))
+}
+
+/// Returns `true` if the named hardware event fires every cycle a condition
+/// holds (a *level* signal), `false` if it fires once per occurrence (a
+/// *pulse/edge* signal).
+///
+/// Delegates to the archspec hw_id-keyed classifier
+/// `xdna_archspec::aie2::trace_events::is_level_event` via
+/// `name_to_hw_id_and_module`. Archspec is the single source of truth for
+/// this classification; this function is a name-string adapter over it.
+///
+/// Returns `false` for any name that does not resolve in the archspec tables
+/// (unknown or reserved names are treated as pulse events, which is the
+/// safe default -- over-counting edge comparisons is better than missing
+/// level-structure mismatches).
 fn is_level_event(name: &str) -> bool {
-    matches!(
-        name,
-        "TRUE"
-            | "ACTIVE"
-            | "DISABLED"
-            | "LOCK_STALL"
-            | "MEMORY_STALL"
-            | "STREAM_STALL"
-            | "CASCADE_STALL"
-            | "PORT_RUNNING_0"
-            | "PORT_RUNNING_1"
-            | "PORT_RUNNING_2"
-            | "PORT_RUNNING_3"
-            | "PORT_RUNNING_4"
-            | "PORT_RUNNING_5"
-            | "PORT_RUNNING_6"
-            | "PORT_RUNNING_7"
-            | "PORT_IDLE_0"
-            | "PORT_IDLE_1"
-            | "PORT_IDLE_2"
-            | "PORT_IDLE_3"
-            | "PORT_IDLE_4"
-            | "PORT_IDLE_5"
-            | "PORT_IDLE_6"
-            | "PORT_IDLE_7"
-            | "PORT_STALLED_0"
-            | "PORT_STALLED_1"
-            | "PORT_STALLED_2"
-            | "PORT_STALLED_3"
-            | "PORT_STALLED_4"
-            | "PORT_STALLED_5"
-            | "PORT_STALLED_6"
-            | "PORT_STALLED_7"
-            | "DMA_S2MM_0_STALLED_LOCK"
-            | "DMA_S2MM_1_STALLED_LOCK"
-            | "DMA_MM2S_0_STALLED_LOCK"
-            | "DMA_MM2S_1_STALLED_LOCK"
-            | "DMA_S2MM_0_STREAM_STARVATION"
-            | "DMA_S2MM_1_STREAM_STARVATION"
-            | "DMA_MM2S_0_STREAM_BACKPRESSURE"
-            | "DMA_MM2S_1_STREAM_BACKPRESSURE"
-            | "DMA_S2MM_0_MEMORY_BACKPRESSURE"
-            | "DMA_S2MM_1_MEMORY_BACKPRESSURE"
-            | "DMA_MM2S_0_MEMORY_STARVATION"
-            | "DMA_MM2S_1_MEMORY_STARVATION"
-            | "CONFLICT_DM_BANK_0"
-            | "CONFLICT_DM_BANK_1"
-            | "CONFLICT_DM_BANK_2"
-            | "CONFLICT_DM_BANK_3"
-            // MemTile stall events (SEL0/SEL1 naming from MemTileEvent enum)
-            | "DMA_S2MM_SEL0_STALLED_LOCK"
-            | "DMA_S2MM_SEL1_STALLED_LOCK"
-            | "DMA_MM2S_SEL0_STALLED_LOCK"
-            | "DMA_MM2S_SEL1_STALLED_LOCK"
-            | "DMA_S2MM_SEL0_STREAM_STARVATION"
-            | "DMA_S2MM_SEL1_STREAM_STARVATION"
-            | "DMA_MM2S_SEL0_STREAM_BACKPRESSURE"
-            | "DMA_MM2S_SEL1_STREAM_BACKPRESSURE"
-    )
+    match name_to_hw_id_and_module(name) {
+        Some((hw_id, module)) => crate::trace::event_codes::is_level_event(hw_id, module),
+        None => false,
+    }
 }
 
 /// Map a slot index to its configured event name.
@@ -2939,6 +2925,64 @@ mod tests {
         assert!(is_level_event("DMA_MM2S_SEL1_STREAM_BACKPRESSURE"));
         assert!(!is_level_event("INSTR_VECTOR"));
         assert!(!is_level_event("slot3"));
+    }
+
+    /// Behavior-preservation test: locks the exact level/pulse classification
+    /// for the representative set that was hardcoded before the archspec reroute.
+    ///
+    /// Each assertion name mirrors the task spec and was verified correct against
+    /// the original name-list in compare.rs. Any regression in the archspec
+    /// classifier or the name-resolution path will fail here.
+    #[test]
+    fn is_level_event_behavior_preserved_across_refactor() {
+        // --- Level events (must return true) ---
+        // Core stall signals
+        assert!(is_level_event("LOCK_STALL"), "LOCK_STALL must be level");
+        assert!(is_level_event("MEMORY_STALL"), "MEMORY_STALL must be level");
+        assert!(is_level_event("STREAM_STALL"), "STREAM_STALL must be level");
+        assert!(is_level_event("CASCADE_STALL"), "CASCADE_STALL must be level");
+        // Core stream-switch port state -- all 8 ports
+        assert!(is_level_event("PORT_RUNNING_0"), "PORT_RUNNING_0 must be level");
+        assert!(is_level_event("PORT_RUNNING_7"), "PORT_RUNNING_7 must be level");
+        // Mem DMA stall conditions
+        assert!(is_level_event("DMA_S2MM_0_STREAM_STARVATION"), "DMA_S2MM_0_STREAM_STARVATION must be level");
+        assert!(is_level_event("DMA_MM2S_0_STALLED_LOCK"), "DMA_MM2S_0_STALLED_LOCK must be level");
+        assert!(
+            is_level_event("DMA_MM2S_0_STREAM_BACKPRESSURE"),
+            "DMA_MM2S_0_STREAM_BACKPRESSURE must be level"
+        );
+        assert!(
+            is_level_event("DMA_S2MM_0_MEMORY_BACKPRESSURE"),
+            "DMA_S2MM_0_MEMORY_BACKPRESSURE must be level"
+        );
+        assert!(is_level_event("DMA_MM2S_0_MEMORY_STARVATION"), "DMA_MM2S_0_MEMORY_STARVATION must be level");
+        // Mem memory bank conflicts (banks 0-3 are in scope)
+        assert!(is_level_event("CONFLICT_DM_BANK_0"), "CONFLICT_DM_BANK_0 must be level");
+        assert!(is_level_event("CONFLICT_DM_BANK_3"), "CONFLICT_DM_BANK_3 must be level");
+        // TRUE: always-on
+        assert!(is_level_event("TRUE"), "TRUE must be level");
+        // MemTile SEL stall events
+        assert!(is_level_event("DMA_S2MM_SEL0_STALLED_LOCK"), "DMA_S2MM_SEL0_STALLED_LOCK must be level");
+        assert!(is_level_event("DMA_MM2S_SEL0_STALLED_LOCK"), "DMA_MM2S_SEL0_STALLED_LOCK must be level");
+        assert!(
+            is_level_event("DMA_S2MM_SEL0_STREAM_STARVATION"),
+            "DMA_S2MM_SEL0_STREAM_STARVATION must be level"
+        );
+        assert!(
+            is_level_event("DMA_MM2S_SEL0_STREAM_BACKPRESSURE"),
+            "DMA_MM2S_SEL0_STREAM_BACKPRESSURE must be level"
+        );
+
+        // --- Pulse events (must return false) ---
+        assert!(!is_level_event("INSTR_LOCK_ACQUIRE_REQ"), "INSTR_LOCK_ACQUIRE_REQ must be pulse");
+        assert!(!is_level_event("INSTR_EVENT_0"), "INSTR_EVENT_0 must be pulse");
+        assert!(!is_level_event("DMA_S2MM_0_START_TASK"), "DMA_S2MM_0_START_TASK must be pulse");
+        assert!(!is_level_event("PORT_TLAST_0"), "PORT_TLAST_0 must be pulse");
+        assert!(!is_level_event("PERF_CNT_0"), "PERF_CNT_0 must be pulse");
+
+        // --- Unknown names fall through as pulse (safe default) ---
+        assert!(!is_level_event("slot3"), "unmapped slot name must be pulse (safe default)");
+        assert!(!is_level_event("UNKNOWN_FUTURE_EVENT"), "unknown names must be pulse (safe default)");
     }
 
     #[test]
