@@ -670,15 +670,25 @@ impl fmt::Debug for AccumulatorRegisterFile {
 /// sparse vector are non-zero (2:4 structured sparsity).
 pub const NUM_MASK_REGS: usize = 4;
 
-/// Mask register file: 4 x 128-bit registers for sparse vector masks.
+/// The AIE2 **q register file**: 4 x 128-bit registers (q0-q3).
 ///
-/// Each register is stored as [u32; 4] (128 bits). The sparse matmul
-/// only uses the low 64 bits of each mask register, but the full 128-bit
-/// width is preserved for correctness with other mask operations.
+/// Named `MaskRegisterFile` for its primary architectural role -- in llvm-aie
+/// TableGen these are literally the `AIE2Vector128RegisterClass` "128-bit mask
+/// registers" -- but the same physical registers serve **dual duty**:
 ///
-/// Composite qx registers (qx0-qx3) pair a mask register with a vector
-/// register: qx_n = {x_n, q_n}. The mask portion comes from q_n, and
-/// the vector data from x_n (in the vector register file).
+/// 1. **Masks**: comparison results and 2:4 sparsity masks (the sparse matmul
+///    uses the low 64 bits of each register).
+/// 2. **128-bit vector data**: the q registers are also the vehicle for 128-bit
+///    moves and stores. Chess lands int32->int16 SRS results via `vmov qN, wX`
+///    (low 128 bits of a w-register) followed by `st qN` (see `vec_srs_i32`).
+///
+/// So `q` (the assembly mnemonic) == this "mask" file; treat reads/writes here
+/// as plain 128 bits of register state whose interpretation (mask vs. packed
+/// data) is the consuming op's concern, not the file's. Each register is stored
+/// as `[u32; 4]` (128 bits); the full width is preserved for both roles.
+///
+/// Composite qx registers (qx0-qx3) pair a q register with a vector register:
+/// qx_n = {x_n, q_n} -- the mask portion from q_n here, vector data from x_n.
 #[derive(Clone)]
 pub struct MaskRegisterFile {
     regs: [[u32; 4]; NUM_MASK_REGS],

@@ -1,10 +1,40 @@
 # Mission: Model AIE2 q-registers as 128-bit vector data
 
-- Date: 2026-06-08. Status: **staging / orientation** (pre-implementation).
+- Date: 2026-06-08. Status: **COMPLETE** -- `vec_srs_i32` passes EMU smoke
+  (`./scripts/emu-bridge-test.sh --no-hw vec_srs_i32` -> BRIDGE PASS) through the
+  real decode->execute interpreter, the first compiled vector-compute kernel to
+  do so. `cargo test --lib` green.
 - Parent: #103 Half B (`2026-06-08-vector-compute-halfB-silicon.md`). Decision:
   Maya chose to **lean all the way in** -- make the emulator genuinely execute
   compiled vector kernels through its interpreter, not route around the gap.
-- This doc is the centering artifact. Read it first when resuming.
+
+## Outcome: a FOUR-bug cascade (all fixed, TDD, committed)
+
+"Model q-registers" was only the first of four interlocking gaps -- each one had
+simply never been exercised, because no compiled vector-compute kernel had ever
+run through the interpreter before. In order of discovery:
+
+1. **`VMOV q,w` dropped its write** (`5570f5d`). q-mask destinations
+   (ControlReg 16..19) weren't handled by the narrow-vector-move sink. The
+   128-bit q storage already existed (`ctx.mask`); only this copy edge was
+   missing. Toolchain-derived register-hierarchy findings below.
+2. **Fused post-increment dispatch** (`960975a`). `vlda.ups`/`vst.srs`/... with
+   `[p0], #imm` addressing decode as PointerReg+post_modify (no `Memory{}`
+   operand); both dispatch gates (VectorAlu skip + MemoryUnit) recognized only
+   `Memory{}`, so post-increment fused loads fell to the register path -- no
+   memory load, no pointer advance. Fixed via shared `SlotOp::addresses_memory()`.
+3. **`get_address` base resolution** (`960975a`). The register-indirect fallback
+   took `sources.first()`, but fused ops carry the shift ScalarReg *before* the
+   pointer. Search for the PointerReg instead.
+4. **VLIW snapshot gap** (`13534bc`). The bundle read-old/write-new snapshot
+   covered only scalar/pointer/modifier. Chess schedules `vsrs whN,cmK ; vmov
+   qK,whN` in one bundle; the VSRS-to-register lands in the **Store** slot (runs
+   before Scalar1 where the vmov reads), so the vmov read the same-bundle
+   overwrite. Extended the snapshot to vector/accum/mask via an in-file shadow.
+
+Naming note (resolved): `ctx.mask` / `MaskRegisterFile` keeps its name (these ARE
+the TableGen "128-bit mask registers" and the sparse-matmul code uses them as
+masks); doc comments now state `q` == `mask` and the dual mask/vector-data role.
 
 ## Why this mission exists
 

@@ -180,7 +180,10 @@ pub struct ExecutionContext {
     /// Accumulator registers (acc0-acc7).
     pub accumulator: AccumulatorRegisterFile,
 
-    /// Mask registers (q0-q3) for sparse vector operations.
+    /// The q register file (q0-q3): AIE2's 128-bit "mask registers". Named
+    /// `mask` for their primary role (compare/sparsity masks), but the same
+    /// registers also carry 128-bit vector data (`vmov q,w; st q`). See
+    /// [`MaskRegisterFile`] -- `q` (the asm mnemonic) and `mask` are the same file.
     pub mask: MaskRegisterFile,
 
     // === Statistics ===

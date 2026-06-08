@@ -34,7 +34,7 @@ for the corresponding vector class (plan Task 3 -> Task 5 Verified flip).
 | Dir | Class | Status |
 |-----|-------|--------|
 | `vec_eltwise_add` | element-wise (vadd_Int32) | **EMU-smoke PASS** (chess, 18.5s) |
-| `vec_srs_i32` | SRS | authored; **EMU-blocked on q-register modeling** (see `docs/superpowers/plans/2026-06-08-q-register-vector-modeling.md`). Surfaced + fixed the wide-cm SRS panic (commit 4472bfb). |
+| `vec_srs_i32` | SRS | **EMU-smoke PASS** (chess) -- first compiled vector kernel through the decode->execute interpreter. Surfaced + fixed a four-bug cascade (wide-cm SRS panic 4472bfb; VMOV-q 5570f5d; fused post-inc dispatch + get_address 960975a; VLIW vector/accum/mask snapshot 13534bc). See `docs/superpowers/plans/2026-06-08-q-register-vector-modeling.md`. |
 | `vec_ups_i32` | UPS | todo |
 | `vec_pack_i16` | Pack | todo |
 | `vec_mac_i8` | MatMul int (i8) | todo |
