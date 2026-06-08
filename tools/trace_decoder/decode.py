@@ -21,6 +21,14 @@ The timeline rebuild is the mode-0 algorithm documented in mlir-aie's
 ``convert_commands_to_json`` (Apache 2.0); we re-implement it here on
 our typed command stream.  Mode-1 and mode-2 timelines will hook in
 through alternative rebuild functions on the same EventCmd schema.
+
+NOT THE REGRESSION ORACLE.  The emulator-vs-HW trace comparison decodes with
+**upstream** ``aie.utils.trace.parse_trace`` (the skip-token model: a held
+level is ``Single(cycles=0)`` + ``Repeat`` tokens, closed by the next
+``cycles>0`` frame).  This local decoder is a development/inspection aid only;
+the held-level *emitter* (``src/device/trace_unit``) is tuned to the upstream
+decoder, not to this one.  If the two ever disagree on a held span, upstream is
+authoritative -- do not "fix" the emitter to satisfy this module.
 """
 
 from __future__ import annotations
