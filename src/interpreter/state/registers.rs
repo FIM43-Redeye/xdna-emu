@@ -340,6 +340,12 @@ impl fmt::Debug for ModifierRegisterFile {
 pub struct VectorRegisterFile {
     /// Each register is 256 bits = 8 × u32
     regs: [[u32; 8]; NUM_VECTOR_REGS],
+    /// VLIW bundle snapshot. When `Some`, reads return the pre-bundle values so
+    /// every read within a bundle sees the same pre-execution state (writes
+    /// still go live). Set by `begin_bundle`, cleared by `end_bundle`. This is
+    /// the vector-register half of the pure-VLIW read-old/write-new semantics
+    /// the scalar/pointer/modifier files already get via the context snapshot.
+    snapshot: Option<[[u32; 8]; NUM_VECTOR_REGS]>,
 }
 
 impl Default for VectorRegisterFile {
@@ -351,13 +357,34 @@ impl Default for VectorRegisterFile {
 impl VectorRegisterFile {
     /// Create a new zeroed register file.
     pub const fn new() -> Self {
-        Self { regs: [[0; 8]; NUM_VECTOR_REGS] }
+        Self { regs: [[0; 8]; NUM_VECTOR_REGS], snapshot: None }
+    }
+
+    /// The array reads see: the bundle snapshot if active, else live registers.
+    #[inline]
+    fn active(&self) -> &[[u32; 8]; NUM_VECTOR_REGS] {
+        match &self.snapshot {
+            Some(snap) => snap,
+            None => &self.regs,
+        }
+    }
+
+    /// Snapshot live registers for VLIW bundle read semantics.
+    #[inline]
+    pub fn begin_bundle(&mut self) {
+        self.snapshot = Some(self.regs);
+    }
+
+    /// Discard the bundle snapshot; reads return live state again.
+    #[inline]
+    pub fn end_bundle(&mut self) {
+        self.snapshot = None;
     }
 
     /// Read a vector register as 8 × u32.
     #[inline]
     pub fn read(&self, reg: u8) -> [u32; 8] {
-        self.regs[(reg & 0x1F) as usize]
+        self.active()[(reg & 0x1F) as usize]
     }
 
     /// Write a vector register from 8 × u32.
@@ -369,7 +396,7 @@ impl VectorRegisterFile {
     /// Read a single lane (0-7) as u32.
     #[inline]
     pub fn read_lane(&self, reg: u8, lane: u8) -> u32 {
-        self.regs[(reg & 0x1F) as usize][(lane & 0x07) as usize]
+        self.active()[(reg & 0x1F) as usize][(lane & 0x07) as usize]
     }
 
     /// Write a single lane (0-7).
@@ -492,6 +519,10 @@ impl fmt::Debug for VectorRegisterFile {
 pub struct AccumulatorRegisterFile {
     /// Each register is 512 bits = 8 × u64
     regs: [[u64; 8]; NUM_ACCUMULATOR_REGS],
+    /// VLIW bundle snapshot (see `VectorRegisterFile::snapshot`). Reads return
+    /// pre-bundle values; writes go live. `accumulate` is a live read-modify-
+    /// write (MAC accumulation crosses bundles, one accumulate per cm/bundle).
+    snapshot: Option<[[u64; 8]; NUM_ACCUMULATOR_REGS]>,
 }
 
 impl Default for AccumulatorRegisterFile {
@@ -503,13 +534,34 @@ impl Default for AccumulatorRegisterFile {
 impl AccumulatorRegisterFile {
     /// Create a new zeroed register file.
     pub const fn new() -> Self {
-        Self { regs: [[0; 8]; NUM_ACCUMULATOR_REGS] }
+        Self { regs: [[0; 8]; NUM_ACCUMULATOR_REGS], snapshot: None }
+    }
+
+    /// The array reads see: the bundle snapshot if active, else live registers.
+    #[inline]
+    fn active(&self) -> &[[u64; 8]; NUM_ACCUMULATOR_REGS] {
+        match &self.snapshot {
+            Some(snap) => snap,
+            None => &self.regs,
+        }
+    }
+
+    /// Snapshot live registers for VLIW bundle read semantics.
+    #[inline]
+    pub fn begin_bundle(&mut self) {
+        self.snapshot = Some(self.regs);
+    }
+
+    /// Discard the bundle snapshot; reads return live state again.
+    #[inline]
+    pub fn end_bundle(&mut self) {
+        self.snapshot = None;
     }
 
     /// Read an accumulator register as 8 × u64.
     #[inline]
     pub fn read(&self, reg: u8) -> [u64; 8] {
-        self.regs[(reg as usize) % NUM_ACCUMULATOR_REGS]
+        self.active()[(reg as usize) % NUM_ACCUMULATOR_REGS]
     }
 
     /// Write an accumulator register from 8 × u64.
@@ -521,7 +573,7 @@ impl AccumulatorRegisterFile {
     /// Read a single lane (0-7) as u64.
     #[inline]
     pub fn read_lane(&self, reg: u8, lane: u8) -> u64 {
-        self.regs[(reg as usize) % NUM_ACCUMULATOR_REGS][(lane & 0x07) as usize]
+        self.active()[(reg as usize) % NUM_ACCUMULATOR_REGS][(lane & 0x07) as usize]
     }
 
     /// Write a single lane (0-7).
@@ -630,33 +682,60 @@ pub const NUM_MASK_REGS: usize = 4;
 #[derive(Clone)]
 pub struct MaskRegisterFile {
     regs: [[u32; 4]; NUM_MASK_REGS],
+    /// VLIW bundle snapshot (see `VectorRegisterFile::snapshot`). q-registers
+    /// double as 128-bit vector data (e.g. `vmov q,w; st q`), so they need the
+    /// same read-old/write-new semantics within a bundle.
+    snapshot: Option<[[u32; 4]; NUM_MASK_REGS]>,
 }
 
 impl MaskRegisterFile {
     /// Create a new mask register file with all registers zeroed.
     pub fn new() -> Self {
-        Self { regs: [[0u32; 4]; NUM_MASK_REGS] }
+        Self { regs: [[0u32; 4]; NUM_MASK_REGS], snapshot: None }
+    }
+
+    /// The array reads see: the bundle snapshot if active, else live registers.
+    #[inline]
+    fn active(&self) -> &[[u32; 4]; NUM_MASK_REGS] {
+        match &self.snapshot {
+            Some(snap) => snap,
+            None => &self.regs,
+        }
+    }
+
+    /// Snapshot live registers for VLIW bundle read semantics.
+    #[inline]
+    pub fn begin_bundle(&mut self) {
+        self.snapshot = Some(self.regs);
+    }
+
+    /// Discard the bundle snapshot; reads return live state again.
+    #[inline]
+    pub fn end_bundle(&mut self) {
+        self.snapshot = None;
     }
 
     /// Read the low 64 bits of a mask register (used by sparse matmul).
     pub fn read_u64_low(&self, reg: u8) -> u64 {
         let idx = (reg as usize) % NUM_MASK_REGS;
-        (self.regs[idx][0] as u64) | ((self.regs[idx][1] as u64) << 32)
+        let regs = self.active();
+        (regs[idx][0] as u64) | ((regs[idx][1] as u64) << 32)
     }
 
     /// Read the full 128-bit mask register as u128 (used by sparse pair-routing).
     pub fn read_u128(&self, reg: u8) -> u128 {
         let idx = (reg as usize) % NUM_MASK_REGS;
-        (self.regs[idx][0] as u128)
-            | ((self.regs[idx][1] as u128) << 32)
-            | ((self.regs[idx][2] as u128) << 64)
-            | ((self.regs[idx][3] as u128) << 96)
+        let regs = self.active();
+        (regs[idx][0] as u128)
+            | ((regs[idx][1] as u128) << 32)
+            | ((regs[idx][2] as u128) << 64)
+            | ((regs[idx][3] as u128) << 96)
     }
 
     /// Read the full 128-bit mask register as [u32; 4].
     pub fn read(&self, reg: u8) -> [u32; 4] {
         let idx = (reg as usize) % NUM_MASK_REGS;
-        self.regs[idx]
+        self.active()[idx]
     }
 
     /// Write the full 128-bit mask register.

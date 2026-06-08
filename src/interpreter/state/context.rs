@@ -583,6 +583,13 @@ impl ExecutionContext {
         self.scalar_snapshot = Some(self.scalar.clone());
         self.pointer_snapshot = Some(self.pointer.clone());
         self.modifier_snapshot = Some(self.modifier.clone());
+        // Vector/accumulator/mask use an in-file shadow snapshot (the read
+        // surface is too broad to route through context accessors). Same
+        // pure-VLIW read-old/write-new semantics: in-bundle reads see
+        // pre-execution values.
+        self.vector.begin_bundle();
+        self.accumulator.begin_bundle();
+        self.mask.begin_bundle();
     }
 
     /// End a VLIW bundle execution.
@@ -594,6 +601,9 @@ impl ExecutionContext {
         self.scalar_snapshot = None;
         self.pointer_snapshot = None;
         self.modifier_snapshot = None;
+        self.vector.end_bundle();
+        self.accumulator.end_bundle();
+        self.mask.end_bundle();
     }
 
     // === Deferred Write Methods ===
@@ -2343,6 +2353,55 @@ mod tests {
         ctx.cycles = 80;
         ctx.delay_pending_writes(1);
         assert_eq!(ctx.pointer.read(7), 0xDEAD, "p7 still correct");
+    }
+
+    /// VLIW: a vector-register write during a bundle must NOT be visible to
+    /// reads in the same bundle. Regression for vec_srs_i32: a Store-slot VSRS
+    /// writes a w-register that a Scalar1 vmov reads in the same bundle (Store
+    /// executes before Scalar1 in slot order), so the vmov must see the
+    /// pre-bundle value -- pure read-old/write-new.
+    #[test]
+    fn test_bundle_snapshot_hides_in_bundle_vector_write() {
+        let mut ctx = ExecutionContext::new();
+        ctx.vector.write(1, [10, 20, 30, 40, 50, 60, 70, 80]);
+        ctx.begin_bundle();
+        ctx.vector.write(1, [1, 2, 3, 4, 5, 6, 7, 8]); // in-bundle writer (the VSRS)
+        assert_eq!(
+            ctx.vector.read(1),
+            [10, 20, 30, 40, 50, 60, 70, 80],
+            "in-bundle vector read must see the pre-bundle value"
+        );
+        ctx.end_bundle();
+        assert_eq!(ctx.vector.read(1), [1, 2, 3, 4, 5, 6, 7, 8], "after the bundle, the write is live");
+    }
+
+    /// VLIW read-old/write-new for accumulator (cm) registers, including the
+    /// wide (1024-bit cm) read path that the SRS uses.
+    #[test]
+    fn test_bundle_snapshot_hides_in_bundle_accum_write() {
+        let mut ctx = ExecutionContext::new();
+        ctx.accumulator.write(0, [10, 20, 30, 40, 50, 60, 70, 80]);
+        ctx.accumulator.write(1, [11, 21, 31, 41, 51, 61, 71, 81]);
+        ctx.begin_bundle();
+        ctx.accumulator.write(0, [1; 8]);
+        assert_eq!(ctx.accumulator.read(0), [10, 20, 30, 40, 50, 60, 70, 80], "narrow read sees pre-bundle");
+        let wide = ctx.accumulator.read_wide(0);
+        assert_eq!(&wide[..8], &[10, 20, 30, 40, 50, 60, 70, 80], "wide read low half sees pre-bundle");
+        assert_eq!(&wide[8..], &[11, 21, 31, 41, 51, 61, 71, 81], "wide read high half sees pre-bundle");
+        ctx.end_bundle();
+        assert_eq!(ctx.accumulator.read(0), [1; 8], "after the bundle, the write is live");
+    }
+
+    /// VLIW read-old/write-new for q (mask) registers.
+    #[test]
+    fn test_bundle_snapshot_hides_in_bundle_mask_write() {
+        let mut ctx = ExecutionContext::new();
+        ctx.mask.write(0, [10, 20, 30, 40]);
+        ctx.begin_bundle();
+        ctx.mask.write(0, [1, 2, 3, 4]);
+        assert_eq!(ctx.mask.read(0), [10, 20, 30, 40], "in-bundle mask read must see pre-bundle value");
+        ctx.end_bundle();
+        assert_eq!(ctx.mask.read(0), [1, 2, 3, 4], "after the bundle, the write is live");
     }
 
     #[test]
