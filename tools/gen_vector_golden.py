@@ -2,17 +2,42 @@
 """Generate golden test data for vector compute validation.
 
 Generates deterministic test vectors for SRS, UPS, and element-wise vector
-operations. SRS and UPS use the aietools Python model as the oracle; element-
-wise ops use straightforward Python arithmetic.
+operations. SRS and UPS use the **genuine aietools Python model** as the oracle
+(driven out-of-repo, never copied in); element-wise integer ops use
+straightforward wrap-around arithmetic (which *is* the spec for them -- no
+rounding or saturation subtlety).
 
 Usage:
-    cd tools && python3 gen_vector_golden.py
+    VECTOR_ORACLE_MODEL=/path/to/ported/model \
+        python3 tools/gen_vector_golden.py
 
 Output:
     tools/golden/vector_ops.json
 
 The generated file is checked in and loaded by Rust tests at cargo test time,
-so there is no aietools dependency at test time.
+so there is NO aietools dependency at test time -- only at regeneration time.
+
+Oracle provenance (de-circularization)
+--------------------------------------
+Earlier this generator *re-implemented* srs_lane/ups_lane/trnc in Python "from
+srs.py / ups.py". That was circular: a misread of the reference would corrupt
+the emulator and the golden identically, hiding the bug. We now drive the real
+aietools model functions directly, so the golden is provenanced to the genuine
+silicon reference, not to a hand-port.
+
+The model is Python 2 and needs a py2->py3 port (print statements, integer
+division, long literals). Per the licensing policy, aietools code stays
+OUT-OF-REPO: the ported model lives in an out-of-repo working copy (default
+$VECTOR_ORACLE_MODEL below; see experiments/vector-oracle/). Only the derived
+golden JSON is committed -- matching the aiesim oracle posture and the existing
+golden precedent. Regeneration therefore requires the licensed tool, which is
+correct: a genuine-aietools-derived golden should not be reproducible without
+aietools.
+
+Source functions (read-only reference, driven not copied):
+  aietools/data/aie_ml/lib/python_model/model/srs.py:srs_lane
+  aietools/data/aie_ml/lib/python_model/model/ups.py:ups_lane
+  aietools/data/aie_ml/lib/python_model/model/helpers.py:trnc
 """
 
 import json
@@ -21,139 +46,40 @@ import random
 import sys
 
 # ---------------------------------------------------------------------------
-# SRS / UPS oracle functions
+# Genuine aietools oracle (out-of-repo, py2->py3 ported working copy)
 # ---------------------------------------------------------------------------
 
-# The aietools model files are Python 2 and require extensive fixups for
-# Python 3 (print statements, integer division throughout). Rather than
-# importing them, we reimplement the small subset we need: srs_lane(),
-# ups_lane(), and trnc(). These are direct translations of the aietools
-# Python model, verified against the same algorithm our Rust code implements.
-#
-# Source functions (read-only reference, not copied):
-#   aietools/data/aie_ml/lib/python_model/model/srs.py:srs_lane
-#   aietools/data/aie_ml/lib/python_model/model/ups.py:ups_lane
-#   aietools/data/aie_ml/lib/python_model/model/helpers.py:trnc
+ORACLE_MODEL = os.environ.get(
+    "VECTOR_ORACLE_MODEL",
+    "/home/triple/npu-work/experiments/vector-oracle/model",
+)
 
 
-def trnc(a, sgn, bits):
-    """Truncate to `bits` width with optional sign extension (from helpers.py)."""
-    if bits == 0:
-        return 0
-    msk = (1 << bits) - 1
-    a = int(a) & msk
-    s = (a >> (bits - 1)) & 1
-    if s == 1 and sgn:
-        a = a | ~msk
-    return a
+def load_oracle():
+    """Import the genuine aietools model fns from the out-of-repo working copy.
 
-
-# Rounding mode constants (from constants.py).
-RND_FLOOR = 0
-RND_CEIL = 1
-RND_SYM_FLOOR = 2
-RND_SYM_CEIL = 3
-RND_NEG_INF = 8
-RND_POS_INF = 9
-RND_SYM_ZERO = 10
-RND_SYM_INF = 11
-RND_CONV_EVEN = 12
-RND_CONV_ODD = 13
-
-
-def srs_round(rnd, sgn, lsb, grd, stk):
-    """SRS rounding decision (from srs.py:srs_round, sgn_mag=False)."""
-    rnd_halfway = rnd in (RND_NEG_INF, RND_POS_INF, RND_SYM_INF,
-                          RND_SYM_ZERO, RND_CONV_EVEN, RND_CONV_ODD)
-    symmetric = rnd in (RND_SYM_FLOOR, RND_SYM_CEIL, RND_SYM_INF, RND_SYM_ZERO)
-    otherdir = rnd in (RND_CEIL, RND_SYM_CEIL, RND_POS_INF, RND_SYM_INF, RND_CONV_ODD)
-    convergent = rnd in (RND_CONV_EVEN, RND_CONV_ODD)
-
-    if convergent:
-        det = lsb
-    elif symmetric:
-        det = sgn
-    else:
-        det = False
-    if otherdir:
-        det = not det
-
-    if rnd_halfway:
-        return grd and (det or stk)
-    else:
-        return det and (grd or stk)
-
-
-def py_srs_lane(a_in, shft, bits_i, bits_o, sgn_o, sat, symsat, rnd):
-    """SRS per-lane computation (from srs.py:srs_lane).
-
-    Arguments match the aietools Python model:
-      a_in:    input accumulator value
-      shft:    total shift amount (user_shift + BIAS)
-      bits_i:  input width (unused, we work on arbitrary-precision int)
-      bits_o:  output bit width
-      sgn_o:   True if output is signed
-      sat:     True to clamp to output range
-      symsat:  True for symmetric saturation (signed min = -(2^(n-1)-1))
-      rnd:     rounding mode constant (0-3, 8-13)
-
-    Returns (result, overflow_flag).
+    Returns (srs_module, ups_module, trnc_fn). Fails loud if the oracle is not
+    present -- regeneration requires the licensed tool by design.
     """
-    BIAS = 4
-    a = int(a_in) << BIAS
-    a_sft = a >> shft
-
-    # Rounding signals.
-    if shft > 0:
-        stk = trnc((a << 1), False, shft) != 0
-        grd = bool(((a << 1) >> shft) & 0x1)
-    else:
-        stk = False
-        grd = False
-    lsb = bool(((a << 1) >> (shft + 1)) & 0x1)
-    sgn = a < 0
-
-    p1 = srs_round(rnd, sgn, lsb, grd, stk)
-    a_rnd = a_sft + 1 if p1 else a_sft
-
-    # Saturation bounds.
-    if sgn_o:
-        vmax = 2 ** (bits_o - 1) - 1
-        vmin_t = -(2 ** (bits_o - 1))
-        vmin = vmin_t + (1 if symsat else 0)
-    else:
-        vmax = 2 ** bits_o - 1
-        vmin = 0
-        vmin_t = vmin
-
-    a_sft_flt = (int(a_in) << BIAS) / 2.0 ** shft
-
-    of = False
-    a_sat = a_rnd
-    if a_rnd > vmax:
-        of = True
-        if sat:
-            a_sat = vmax
-    elif a_rnd < vmin:
-        if sat:
-            a_sat = vmin
-
-    of = of or a_sft_flt < vmin
-    r = trnc(a_sat, sgn_o, bits_o)
-    return (r, of)
+    if not os.path.isdir(ORACLE_MODEL):
+        sys.exit(
+            f"genuine aietools oracle model not found at:\n  {ORACLE_MODEL}\n"
+            "Set VECTOR_ORACLE_MODEL to the py2->py3 ported aietools model dir.\n"
+            "(The committed golden JSON is the test-time artifact; the oracle is\n"
+            "only needed to REGENERATE it. See tools/gen_vector_golden.py header.)"
+        )
+    import builtins
+    builtins.long = int  # py2 long() shim; model files are not edited for this
+    sys.path.insert(0, ORACLE_MODEL)
+    import srs
+    import ups
+    from helpers import trnc
+    return srs, ups, trnc
 
 
-def py_ups_lane(a, shft, bits_o, sat):
-    """UPS per-lane computation (from ups.py:ups_lane)."""
-    u = int(a) << shft
+SRS, UPS, trnc = load_oracle()
 
-    if sat:
-        vmax = 2 ** (bits_o - 1) - 1
-        vmin = -(2 ** (bits_o - 1))
-        u = max(min(u, vmax), vmin)
-
-    r = trnc(u, True, bits_o)
-    return r
+BIAS = 4  # SRS rounding-precision bias; caller passes user_shift + BIAS.
 
 # ---------------------------------------------------------------------------
 # Reproducible randomness
@@ -171,14 +97,25 @@ rng = random.Random(SEED)
 #            output_bits: u32, saturate: bool, symmetric_saturate: bool,
 #            mode: RoundingMode) -> i64
 #
-# The Python srs_lane() signature:
+# The genuine model srs_lane() signature:
 #   srs_lane(a_in, shft, bits_i, bits_o, sgn_o, sat, symsat, rnd)
-#   where shft = user_shift + BIAS (BIAS=4).
+#   where shft = user_shift + BIAS (BIAS=4); bits_i is unused (arbitrary prec).
 #
 # Our Rust function adds BIAS internally, so we record user_shift in JSON
 # and pass user_shift + BIAS to the oracle.
 
-BIAS = 4
+# Rounding mode constants (from constants.py).
+RND_FLOOR = 0
+RND_CEIL = 1
+RND_SYM_FLOOR = 2
+RND_SYM_CEIL = 3
+RND_NEG_INF = 8
+RND_POS_INF = 9
+RND_SYM_ZERO = 10
+RND_SYM_INF = 11
+RND_CONV_EVEN = 12
+RND_CONV_ODD = 13
+
 RND_MODES = (RND_FLOOR, RND_CEIL, RND_SYM_FLOOR, RND_SYM_CEIL,
              RND_NEG_INF, RND_POS_INF, RND_SYM_ZERO, RND_SYM_INF,
              RND_CONV_EVEN, RND_CONV_ODD)
@@ -231,7 +168,7 @@ def srs_boundary_values(bits_o, signed):
 
 
 def gen_srs_golden():
-    """Generate SRS golden test cases."""
+    """Generate SRS golden test cases against the genuine aietools model."""
     cases = []
     count_by_config = {}
 
@@ -243,7 +180,7 @@ def gen_srs_golden():
                 for shift in [0, 4, 8, 12]:
                     for val in boundary_vals:
                         total_shift = shift + BIAS
-                        py_result, _ = py_srs_lane(
+                        py_result, _ = SRS.srs_lane(
                             val, total_shift, 64, bits_o, signed,
                             sat, sym_sat, rnd_mode,
                         )
@@ -263,7 +200,7 @@ def gen_srs_golden():
                     val = rng.randint(-(1 << 48), (1 << 48) - 1)
                     shift = rng.randint(0, 16)
                     total_shift = shift + BIAS
-                    py_result, _ = py_srs_lane(
+                    py_result, _ = SRS.srs_lane(
                         val, total_shift, 64, bits_o, signed,
                         sat, sym_sat, rnd_mode,
                     )
@@ -292,9 +229,9 @@ def gen_srs_golden():
 # The Rust ups_lane() signature:
 #   ups_lane(value: i64, shift: u32, bits_in: u32, bits_out: u32, saturate: bool) -> i64
 #
-# The Python ups_lane() signature:
+# The genuine model ups_lane() signature:
 #   ups_lane(a, shft, bits_o, sat) -> int
-#   It takes the already-sign-extended input value.
+#   It takes the already-sign-extended input value (genuine trnc applied here).
 
 UPS_MODES = [
     # (bits_in, bits_out, lanes)
@@ -323,7 +260,7 @@ def ups_boundary_values(bits_in, signed):
 
 
 def gen_ups_golden():
-    """Generate UPS golden test cases."""
+    """Generate UPS golden test cases against the genuine aietools model."""
     cases = []
 
     for bits_in, bits_out, _lanes in UPS_MODES:
@@ -334,9 +271,9 @@ def gen_ups_golden():
                 for shift in [0, 1, 4, 8, 12]:
                     for val in boundary_vals:
                         # Sign-extend the input value to bits_in width,
-                        # matching what the Rust code does.
+                        # matching what the Rust code does (genuine trnc).
                         truncated = int(trnc(val, signed, bits_in))
-                        py_result = int(py_ups_lane(
+                        py_result = int(UPS.ups_lane(
                             truncated, shift, bits_out, sat,
                         ))
                         cases.append({
@@ -358,7 +295,7 @@ def gen_ups_golden():
                         else:
                             val = rng.randint(0, (1 << bits_in) - 1)
                         truncated = int(trnc(val, signed, bits_in))
-                        py_result = int(py_ups_lane(
+                        py_result = int(UPS.ups_lane(
                             truncated, shift, bits_out, sat,
                         ))
                         cases.append({
@@ -516,6 +453,7 @@ def gen_elementwise_golden():
 
 def main():
     print("Generating vector compute golden data...")
+    print(f"  oracle: {ORACLE_MODEL}")
 
     golden = {}
     golden["srs"] = gen_srs_golden()
