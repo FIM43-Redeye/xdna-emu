@@ -34,7 +34,7 @@ for the corresponding vector class (plan Task 3 -> Task 5 Verified flip).
 | Dir | Class | Status |
 |-----|-------|--------|
 | `vec_eltwise_add` | element-wise (vadd_Int32) | **EMU-smoke PASS** (chess, 18.5s) |
-| `vec_srs_i32` | SRS | todo |
+| `vec_srs_i32` | SRS | authored; **EMU-blocked on q-register modeling** (see `docs/superpowers/plans/2026-06-08-q-register-vector-modeling.md`). Surfaced + fixed the wide-cm SRS panic (commit 4472bfb). |
 | `vec_ups_i32` | UPS | todo |
 | `vec_pack_i16` | Pack | todo |
 | `vec_mac_i8` | MatMul int (i8) | todo |
