@@ -81,12 +81,23 @@ focused **re-verify** of the 17 non-PASS (test×compiler) pairs on the current
     shim — an apparent 1-column offset in the shim address remap. It does **not**
     gate trace (broadcast floods all columns anyway), but it's worth a separate
     look. Flagged, not chased here.
-  - **Disposition:** characterize and accept — aiesim is **not** a trace oracle;
-    HW + interpreter remain the trace-fidelity path. A local broadcast-bridge
-    patch (analogous to the control-read clone) is *theoretically* possible but a
-    much deeper lift into the proprietary event network and arguably fabricates
-    trace-start fidelity — **not pursued** absent a Maya decision. Not bridge code
-    either way.
+  - **Disposition (UPDATED 2026-06-07, supersedes the "not pursued" note below):**
+    a local broadcast-bridge **was built and committed** (`7d93a83`, #97). It does
+    **not** fabricate fidelity — it completes each dropped inter-sub-model seam with
+    the model's **own real broadcast values** (shim combined value -> memtile per
+    column; memtile -> compute vertical flood, each EB read from its wired south
+    wire, rippling 1 row/posedge to match HW timing). Result: all 20 compute tiles
+    flood, core+mem trace units fire bcast-15, `trace.txt` 0->18719 B, test PASS.
+    **HW-validated** (`881d238`): same peano xclbin on real NPU1 — compute region
+    cycle-EXACT (12297 ns/invocation), 32-event deterministic order byte-identical;
+    only stall micro-timing diverges (an aiesim-ISS limit, decomposed in
+    `docs/known-fidelity-gaps.md`). Gated `XDNA_AIESIM_BCAST_BRIDGE`, LOCAL-ONLY,
+    fail-safe; cluster lib never modified on disk. So aiesim **is** now a trace
+    *structure/flow* oracle for this kernel class; HW remains the stall-timing
+    oracle. (Original characterize-and-accept reasoning preserved below for the
+    record.) ~ A local broadcast-bridge patch was originally judged a "much deeper
+    lift... not pursued absent a Maya decision" — that decision was taken and the
+    lift completed.
 - **`objectfifo_repeat/init_values_repeat` (peano) — NEW open FAIL.** Surfaced by
   the re-verify (campaign had it as TIMEOUT). Fails fast (log ends after 5 NPU
   instructions; no PL-PANIC, no Sync-timeout, no quiescent-wedge) — a distinct
