@@ -135,6 +135,10 @@ pub fn core_event_to_hw_id(event: &EventType) -> Option<u8> {
 pub(crate) fn core_level_edge(event: &EventType) -> Option<(u8, bool)> {
     match event {
         EventType::LockStallLevel { active } => Some((26, *active)),
+        EventType::StreamStallLevel { active } => Some((24, *active)),
+        // CASCADE_STALL (25) is distinct from STREAM_STALL (24): cascade
+        // backpressure has its own event enum (xaie_events_aieml.h:60).
+        EventType::CascadeStallLevel { active } => Some((25, *active)),
         _ => None,
     }
 }
@@ -908,6 +912,26 @@ mod tests {
         assert_eq!(dma_level_active(&EventType::DmaStartTask { channel: 0 }), None);
         assert_eq!(dma_level_active(&EventType::DmaFinishedBd { channel: 0 }), None);
         assert_eq!(dma_level_active(&EventType::DmaFinishedTask { channel: 0 }), None);
+    }
+
+    #[test]
+    fn core_level_edge_classifies_stall_family() {
+        // The core-module stall family is held LEVEL: each carries assert/deassert
+        // polarity and routes through set_event_level, NOT the pulse notify_event
+        // path. hw_ids derive from xaie_events_aieml.h (AIE2 core module):
+        // MEMORY_STALL=23, STREAM_STALL=24, CASCADE_STALL=25, LOCK_STALL=26.
+        assert_eq!(core_level_edge(&EventType::LockStallLevel { active: true }), Some((26, true)));
+        assert_eq!(core_level_edge(&EventType::LockStallLevel { active: false }), Some((26, false)));
+        assert_eq!(core_level_edge(&EventType::StreamStallLevel { active: true }), Some((24, true)));
+        assert_eq!(core_level_edge(&EventType::StreamStallLevel { active: false }), Some((24, false)));
+        // CASCADE_STALL (25) is a DISTINCT event from STREAM_STALL (24): cascade
+        // backpressure (SCD-read / MCD-write stalls) is its own enum, not folded
+        // into the stream stall. See xaie_events_aieml.h:60.
+        assert_eq!(core_level_edge(&EventType::CascadeStallLevel { active: true }), Some((25, true)));
+        assert_eq!(core_level_edge(&EventType::CascadeStallLevel { active: false }), Some((25, false)));
+        // Pulse / non-level events return None (routed via core_event_to_hw_id).
+        assert_eq!(core_level_edge(&EventType::InstrLoad { pc: 0 }), None);
+        assert_eq!(core_level_edge(&EventType::MemoryStall { cycles: 1, pc: None }), None);
     }
 
     #[test]

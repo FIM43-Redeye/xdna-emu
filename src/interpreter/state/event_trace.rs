@@ -67,9 +67,22 @@ pub enum EventType {
     /// so a held stall produces one B..E span of the real duration instead of
     /// one pulse per cycle (the over-emission bug).
     LockStallLevel { active: bool },
-    /// Stream interface stall.
-    /// Maps to hardware STREAM_STALL.
+    /// Stream interface stall (PULSE: legacy one-cycle variant, kept for the
+    /// `core_event_to_hw_id` mapping). Maps to hardware STREAM_STALL.
     StreamStall { cycles: u8, pc: Option<u32> },
+    /// Stream interface stall (LEVEL edge): rising when the core blocks on a
+    /// stream port (data unavailable), falling when data resumes. Routed via
+    /// the trace unit's held-level path (`set_event_level`) so a held stall
+    /// renders as one B..E span of the real duration instead of a one-cycle
+    /// pulse. Maps to hardware STREAM_STALL (core event 24).
+    StreamStallLevel { active: bool },
+    /// Cascade interface stall (LEVEL edge): rising when the core blocks on a
+    /// cascade port -- SCD-read empty or MCD-write full -- falling when the
+    /// cascade unblocks. Maps to hardware CASCADE_STALL (core event 25), a
+    /// DISTINCT event from STREAM_STALL: cascade backpressure has its own
+    /// enum (xaie_events_aieml.h:60), so these stalls must not be folded into
+    /// STREAM_STALL the way the former pulse path did.
+    CascadeStallLevel { active: bool },
 
     // -- DMA events (Memory module trace) --
     // Channel encodes direction: 0-1 = S2MM (input), 2-3 = MM2S (output)

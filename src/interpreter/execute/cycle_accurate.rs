@@ -672,9 +672,11 @@ impl CycleAccurateExecutor {
                         _ => 254,
                     };
                     let stall_cycle = ctx.cycles;
-                    let pc = ctx.pc();
+                    // Rising edge of the cascade stall (held level). CASCADE_STALL
+                    // (25) is a distinct event from STREAM_STALL (24); the falling
+                    // edge is recorded in try_resume_stall when the cascade unblocks.
                     ctx.timing_context_mut()
-                        .record_event(stall_cycle, EventType::StreamStall { cycles: 1, pc: Some(pc) });
+                        .record_event(stall_cycle, EventType::CascadeStallLevel { active: true });
                     ctx.record_instruction(1);
                     let timing = ctx.timing_context_mut();
                     timing.hazard_stalls = self.total_hazard_stalls;
@@ -685,9 +687,10 @@ impl CycleAccurateExecutor {
                     super::stream::StreamOps::would_stall(op, tile)
                 {
                     let stall_cycle = ctx.cycles;
-                    let pc = ctx.pc();
+                    // Rising edge of the stream stall (held level); falling edge in
+                    // try_resume_stall when stream data resumes.
                     ctx.timing_context_mut()
-                        .record_event(stall_cycle, EventType::StreamStall { cycles: 1, pc: Some(pc) });
+                        .record_event(stall_cycle, EventType::StreamStallLevel { active: true });
                     ctx.record_instruction(1);
                     let timing = ctx.timing_context_mut();
                     timing.hazard_stalls = self.total_hazard_stalls;
@@ -823,10 +826,17 @@ impl CycleAccurateExecutor {
                 ctx.timing_context_mut()
                     .record_event(start_cycle, EventType::LockStallLevel { active: true });
             }
-            ExecuteResult::WaitStream { .. } => {
-                let pc = ctx.pc();
-                ctx.timing_context_mut()
-                    .record_event(start_cycle, EventType::StreamStall { cycles: 1, pc: Some(pc) });
+            ExecuteResult::WaitStream { port } => {
+                // Rising edge of the stall (held level); falling edge in
+                // try_resume_stall. Sentinel ports 254/255 are cascade
+                // read/write stalls -> CASCADE_STALL (25), a distinct event
+                // from the regular-port STREAM_STALL (24).
+                let event = if *port == 254 || *port == 255 {
+                    EventType::CascadeStallLevel { active: true }
+                } else {
+                    EventType::StreamStallLevel { active: true }
+                };
+                ctx.timing_context_mut().record_event(start_cycle, event);
             }
             _ => {}
         }
@@ -1043,6 +1053,63 @@ mod tests {
             !memory_stall_events.is_empty(),
             "expected a MemoryStall event to be recorded; got {:?}",
             timing.events.events()
+        );
+    }
+
+    #[test]
+    fn stream_stall_entry_records_rising_level_not_pulse() {
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.timing_context_mut().enable_tracing();
+        let mut tile = Tile::compute(0, 2);
+
+        // Blocking stream read with an empty FIFO stalls on entry.
+        let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamRead)
+            .with_blocking(true)
+            .with_dest(Operand::ScalarReg(5))]);
+        let result = executor.execute(&bundle, &mut ctx, &mut tile);
+        assert!(matches!(result, ExecuteResult::WaitStream { .. }));
+
+        let events: Vec<_> = ctx.timing_context().events.events().iter().map(|e| e.event).collect();
+        assert!(
+            events.iter().any(|e| matches!(e, EventType::StreamStallLevel { active: true })),
+            "stream-stall entry must record a rising STREAM_STALL held level; got {events:?}"
+        );
+        // The held-level path replaces the legacy one-cycle pulse variant.
+        assert!(
+            !events.iter().any(|e| matches!(e, EventType::StreamStall { .. })),
+            "stream stall must no longer emit the legacy StreamStall pulse"
+        );
+    }
+
+    #[test]
+    fn cascade_stall_entry_records_rising_cascade_level_not_stream() {
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.timing_context_mut().enable_tracing();
+        let mut tile = Tile::compute(0, 2);
+
+        // Cascade read with an empty SCD stalls on entry (sentinel port 254).
+        let bundle =
+            make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead)
+                .with_dest(Operand::VectorReg(0))]);
+        let result = executor.execute(&bundle, &mut ctx, &mut tile);
+        assert!(matches!(result, ExecuteResult::WaitStream { port: 254 }));
+
+        let events: Vec<_> = ctx.timing_context().events.events().iter().map(|e| e.event).collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, EventType::CascadeStallLevel { active: true })),
+            "cascade-read stall entry must record a rising CASCADE_STALL held level; got {events:?}"
+        );
+        // CASCADE_STALL (25) is distinct: a cascade stall must never be
+        // recorded as STREAM_STALL (24), pulse or level.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, EventType::StreamStall { .. } | EventType::StreamStallLevel { .. })),
+            "cascade stall must not be mislabeled as STREAM_STALL; got {events:?}"
         );
     }
 

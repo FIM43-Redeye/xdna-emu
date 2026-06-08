@@ -88,6 +88,31 @@ struct CoreState {
     /// route ACTIVE_CORE-configured perf counters to tick_active_cycles vs
     /// tick_idle_cycles. Reset to false at the start of each cycle.
     active_this_cycle: bool,
+    /// Held-level state for MEMORY_STALL (core event 23): true while this core
+    /// is in a sustained DMA bank conflict. Drives the rising/falling edges so
+    /// a multi-cycle conflict renders as one B..E span rather than one pulse
+    /// per conflicting cycle. See `mem_stall_edge`.
+    mem_stall_active: bool,
+}
+
+/// Held-level edge decision for MEMORY_STALL (core event 23).
+///
+/// Given whether a core's load/store conflicts with the DMA on a memory bank
+/// THIS cycle (`conflicting`) and the core's previous mem-stall level
+/// (`was_active`), returns the trace edge to emit:
+///   `Some(true)`  -- rising edge (conflict begins)
+///   `Some(false)` -- falling edge (conflict clears)
+///   `None`        -- no transition (sustained conflict, or sustained idle)
+///
+/// Returning `None` on a sustained conflict is what collapses N consecutive
+/// bank-conflict cycles into a single held span instead of N one-cycle pulses,
+/// matching how HW samples the MEMORY_STALL level signal.
+fn mem_stall_edge(conflicting: bool, was_active: bool) -> Option<bool> {
+    match (conflicting, was_active) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    }
 }
 
 impl CoreState {
@@ -106,6 +131,7 @@ impl CoreState {
             enabled: false,
             trace_events_consumed: 0,
             active_this_cycle: false,
+            mem_stall_active: false,
         }
     }
 }
@@ -1165,31 +1191,48 @@ impl InterpreterEngine {
                 // Memory-module event; no program counter.
                 tile.notify_mem_trace_event(hw_id, cycle, None);
             }
-            // Emit MEMORY_STALL (core event 23) for each core that lost a
-            // bank to the DMA this cycle. Bump the core's stall counter too.
-            for core_idx in stalled_cores {
-                // Snapshot the core's PC before any &mut borrow so the
-                // trace-unit notify and the timing-context record can both
-                // stamp the stalled instruction's PC (matches HW's
-                // per-instruction-PC view of MEMORY_STALL windows).
-                let pc = self.cores[core_idx].context.pc();
-                // Map core index -> tile coordinates for the trace unit.
-                let col = core_idx / self.rows;
-                let row = core_idx % self.rows;
-                if let Some(tile) = self.device.array.get_mut(col as u8, row as u8) {
-                    let hw_id = crate::trace::core_event_to_hw_id(
-                        &crate::interpreter::state::EventType::MemoryStall { cycles: 1, pc: Some(pc) },
-                    );
-                    if let Some(id) = hw_id {
-                        tile.notify_core_trace_event(id, cycle, Some(pc));
+            // Emit MEMORY_STALL (core event 23) as a held LEVEL. The bank
+            // conflict is detected per cycle above; `mem_stall_edge` turns the
+            // per-cycle boolean into trace edges so a sustained conflict
+            // renders as one B..E span instead of one pulse per cycle (HW
+            // samples MEMORY_STALL as a level signal).
+            //
+            // Iterate every compute core -- not just this cycle's conflicting
+            // set -- so a core whose conflict just cleared fires its falling
+            // edge. The edge routes through `notify_core_trace_level` directly
+            // here (Phase 4), keeping the cycle-accurate boundary; the resuming
+            // load/store frame carries the span close on the next cycle.
+            //
+            // The former path ALSO recorded a MemoryStall pulse into the core
+            // EventLog, which the Phase 2 drain re-emitted to the trace unit
+            // one cycle later -- a double emission (nothing else consumed that
+            // EventLog entry). The held-level direct notify is now the single
+            // emission path.
+            for col in 0..self.cols {
+                for row in self.compute_row_start..self.rows {
+                    let core_idx = col * self.rows + row;
+                    let conflicting = stalled_cores.contains(&core_idx);
+                    // Cycle-stat counter ticks every conflicting cycle,
+                    // independent of the trace-edge collapsing.
+                    if conflicting {
+                        self.cores[core_idx].context.timing_context_mut().memory_stalls += 1;
+                    }
+                    let Some(active) = mem_stall_edge(conflicting, self.cores[core_idx].mem_stall_active)
+                    else {
+                        continue;
+                    };
+                    self.cores[core_idx].mem_stall_active = active;
+                    if let Some(tile) = self.device.array.get_mut(col as u8, row as u8) {
+                        // hw_id 23 derived from the toolchain event mapping
+                        // rather than hardcoded.
+                        let hw_id = crate::trace::core_event_to_hw_id(
+                            &crate::interpreter::state::EventType::MemoryStall { cycles: 1, pc: None },
+                        );
+                        if let Some(id) = hw_id {
+                            tile.notify_core_trace_level(id, cycle, active);
+                        }
                     }
                 }
-                let ctx = &mut self.cores[core_idx].context;
-                ctx.timing_context_mut().memory_stalls += 1;
-                ctx.timing_context_mut().record_event(
-                    cycle,
-                    crate::interpreter::state::EventType::MemoryStall { cycles: 1, pc: Some(pc) },
-                );
             }
         }
 
@@ -1785,6 +1828,20 @@ impl InterpreterEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mem_stall_edge_collapses_sustained_conflict_to_one_span() {
+        // MEMORY_STALL is a held level: only the rising (conflict begins) and
+        // falling (conflict clears) transitions produce a trace edge. A
+        // sustained conflict produces NO edge -- this is what collapses N
+        // consecutive bank-conflict cycles into one B..E span instead of N
+        // pulses, and also prevents the old direct-notify + EventLog-drain
+        // double emission.
+        assert_eq!(mem_stall_edge(true, false), Some(true), "rising on first conflict cycle");
+        assert_eq!(mem_stall_edge(true, true), None, "no edge while conflict sustained");
+        assert_eq!(mem_stall_edge(false, true), Some(false), "falling when conflict clears");
+        assert_eq!(mem_stall_edge(false, false), None, "no edge while idle");
+    }
 
     #[test]
     fn test_engine_npu1() {

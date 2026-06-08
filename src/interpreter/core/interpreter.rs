@@ -733,6 +733,12 @@ where
                     if tile.has_cascade_input() {
                         log::debug!("Cascade SCD data available, resuming execution");
                         self.status = CoreStatus::Ready;
+                        // Falling edge of the cascade stall (held level). Pairs
+                        // with the rising edge recorded at stall entry. CASCADE_STALL
+                        // (25) is distinct from STREAM_STALL (24).
+                        let cycle = ctx.cycles;
+                        ctx.timing_context_mut()
+                            .record_event(cycle, EventType::CascadeStallLevel { active: false });
                         None
                     } else {
                         ctx.record_stall(1);
@@ -744,6 +750,10 @@ where
                     if tile.cascade_output.is_empty() {
                         log::debug!("Cascade MCD drained, resuming execution");
                         self.status = CoreStatus::Ready;
+                        // Falling edge of the cascade stall (held level).
+                        let cycle = ctx.cycles;
+                        ctx.timing_context_mut()
+                            .record_event(cycle, EventType::CascadeStallLevel { active: false });
                         None
                     } else {
                         ctx.record_stall(1);
@@ -754,6 +764,13 @@ where
                     if tile.has_stream_input(port) {
                         log::info!("Stream port {} data available, resuming execution", port);
                         self.status = CoreStatus::Ready;
+                        // Falling edge of the stream stall (held level). Pairs with
+                        // the rising edge recorded at stall entry; the held-level
+                        // model renders one B..E span of the real stall duration
+                        // instead of a one-cycle pulse.
+                        let cycle = ctx.cycles;
+                        ctx.timing_context_mut()
+                            .record_event(cycle, EventType::StreamStallLevel { active: false });
                         // Re-execute the instruction now that data is available
                         None
                     } else {
@@ -1139,6 +1156,111 @@ mod tests {
         assert!(
             tile.pending_broadcasts.contains(&3),
             "raise_instr_error must seed pending_broadcasts ch3 when ch3 is configured for INSTR_ERROR"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Core stall family as held levels (M2)
+    //
+    // STREAM_STALL (24) and CASCADE_STALL (25) become held levels: the
+    // falling edge fires from try_resume_stall when the blocking condition
+    // clears, pairing with the rising edge recorded at stall entry. Cascade
+    // (sentinel ports 254/255) is a DISTINCT event from stream (xaie_events_
+    // aieml.h:60), so its resume must record CascadeStallLevel, never
+    // StreamStallLevel.
+    // -------------------------------------------------------------------
+
+    fn recorded_events(ctx: &ExecutionContext) -> Vec<EventType> {
+        ctx.timing_context().events.events().iter().map(|e| e.event).collect()
+    }
+
+    #[test]
+    fn stream_stall_resume_emits_falling_level_edge() {
+        let mut interp = make_interpreter();
+        let mut ctx = ExecutionContext::new();
+        ctx.timing_context_mut().enable_tracing();
+        let mut tile = Tile::compute(0, 2);
+        interp.status = CoreStatus::WaitingStream { port: 3 };
+
+        // Port still empty: stays stalled, level remains asserted (no falling edge).
+        let r = interp.try_resume_stall(&mut ctx, &mut tile, None);
+        assert!(matches!(r, Some(StepResult::WaitStream { port: 3 })));
+        assert!(
+            !recorded_events(&ctx)
+                .iter()
+                .any(|e| matches!(e, EventType::StreamStallLevel { active: false })),
+            "no STREAM_STALL falling edge while still stalled"
+        );
+
+        // Data arrives: resume + exactly one falling edge.
+        tile.push_stream_input(3, 0xCAFE);
+        let r = interp.try_resume_stall(&mut ctx, &mut tile, None);
+        assert!(r.is_none(), "resumes when stream data is available");
+        let falling = recorded_events(&ctx)
+            .into_iter()
+            .filter(|e| matches!(e, EventType::StreamStallLevel { active: false }))
+            .count();
+        assert_eq!(falling, 1, "exactly one STREAM_STALL falling edge on resume");
+    }
+
+    #[test]
+    fn cascade_read_stall_resume_emits_falling_cascade_level() {
+        let mut interp = make_interpreter();
+        let mut ctx = ExecutionContext::new();
+        ctx.timing_context_mut().enable_tracing();
+        let mut tile = Tile::compute(0, 2);
+        interp.status = CoreStatus::WaitingStream { port: 254 }; // cascade READ (SCD)
+
+        // SCD empty: stalled.
+        let r = interp.try_resume_stall(&mut ctx, &mut tile, None);
+        assert!(matches!(r, Some(StepResult::WaitStream { port: 254 })));
+
+        // Cascade input arrives: resume + CASCADE_STALL falling (NOT stream).
+        tile.push_cascade_input([0; 6]);
+        let r = interp.try_resume_stall(&mut ctx, &mut tile, None);
+        assert!(r.is_none(), "resumes when SCD has data");
+        let ev = recorded_events(&ctx);
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, EventType::CascadeStallLevel { active: false }))
+                .count(),
+            1,
+            "exactly one CASCADE_STALL falling edge on cascade-read resume"
+        );
+        assert!(
+            !ev.iter().any(|e| matches!(e, EventType::StreamStallLevel { .. })),
+            "cascade stall must NOT be mislabeled as STREAM_STALL"
+        );
+    }
+
+    #[test]
+    fn cascade_write_stall_resume_emits_falling_cascade_level() {
+        let mut interp = make_interpreter();
+        let mut ctx = ExecutionContext::new();
+        ctx.timing_context_mut().enable_tracing();
+        let mut tile = Tile::compute(0, 2);
+        tile.push_cascade_output([0; 6]); // MCD full
+        interp.status = CoreStatus::WaitingStream { port: 255 }; // cascade WRITE (MCD)
+
+        // MCD full: stalled.
+        let r = interp.try_resume_stall(&mut ctx, &mut tile, None);
+        assert!(matches!(r, Some(StepResult::WaitStream { port: 255 })), "stalled while MCD full");
+
+        // MCD drained: resume + CASCADE_STALL falling (NOT stream).
+        tile.pop_cascade_output();
+        let r = interp.try_resume_stall(&mut ctx, &mut tile, None);
+        assert!(r.is_none(), "resumes when MCD drained");
+        let ev = recorded_events(&ctx);
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, EventType::CascadeStallLevel { active: false }))
+                .count(),
+            1,
+            "exactly one CASCADE_STALL falling edge on cascade-write resume"
+        );
+        assert!(
+            !ev.iter().any(|e| matches!(e, EventType::StreamStallLevel { .. })),
+            "cascade stall must NOT be mislabeled as STREAM_STALL"
         );
     }
 }
