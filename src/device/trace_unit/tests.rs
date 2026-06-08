@@ -130,14 +130,16 @@ fn test_single0_encoding() {
     assert_eq!(tu.byte_buffer[start_len], 0x05);
 }
 
-/// A held LEVEL event must produce ONE rising-edge frame, no per-cycle frames
-/// during the hold, and a falling-edge frame carried by the closing event --
-/// not the old one-frame-per-cycle (the LOCK_STALL over-emission bug).
+/// A held LEVEL must encode in the upstream skip-token model: a rising-edge
+/// frame, NO per-cycle frames during the hold, and the hold duration carried as
+/// a `Repeat` skip-token run flushed lazily at the closing frame -- NOT a mask
+/// re-asserted per frame (the snapshot encoding upstream renders as `dur=1`
+/// spans). See docs/superpowers/specs/2026-06-08-skip-token-held-level-encoding.md.
 #[test]
-fn held_level_emits_one_span_not_per_cycle() {
+fn held_level_emits_skip_token_run_not_per_cycle() {
     let mut tu = TraceUnit::new(0, 2);
     tu.write_register(0x00, 0 | (28 << 16) | (29 << 24)); // mode0, start 28, stop 29
-                                                          // slot0=37 (pulse), slot1=38, slot2=39, slot3=26 (LOCK_STALL, a level event)
+                                                          // slot0=37 (pulse), slot3=26 (LOCK_STALL, a level event)
     tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24));
     tu.notify_event(28, 0, None); // arm start + emit Start marker
     let start_len = tu.byte_buffer.len();
@@ -147,8 +149,9 @@ fn held_level_emits_one_span_not_per_cycle() {
     let after_assert = tu.byte_buffer.len();
     assert!(after_assert > start_len, "level assert must emit a rising-edge frame");
 
-    // Hold ~1000 cycles. The coordinator calls commit_cycle every cycle; a
-    // held level must emit NO per-cycle frames.
+    // Hold ~1000 cycles. The coordinator calls commit_cycle every cycle; a held
+    // level must emit NO per-cycle frames -- the duration is a skip-token run
+    // emitted lazily at the closing frame.
     for c in 11..=1009 {
         tu.commit_cycle(c);
     }
@@ -158,22 +161,27 @@ fn held_level_emits_one_span_not_per_cycle() {
         "held level must emit no per-cycle frames during the hold"
     );
 
-    // Falling edge: deassert at 1010 with a coincident closing pulse (slot0),
-    // mirroring stall -> acquire. The pulse carries the reduced snapshot so the
-    // decoder closes the LOCK_STALL span at 1010.
+    // Falling edge at 1010 with a coincident closing pulse (slot0), mirroring
+    // stall -> acquire. The reduced snapshot deactivates LOCK_STALL; the
+    // ~1000-cycle hold is encoded as a Repeat skip-token run.
     tu.notify_event(37, 1010, None);
     tu.set_event_level(26, 1010, false);
     tu.commit_cycle(1010);
-    let after_close = tu.byte_buffer.len();
-    assert!(after_close > after_assert, "level deassert + close must emit a falling-edge frame");
+    assert!(tu.byte_buffer.len() > after_assert, "deassert + close must emit frames");
     assert_eq!(tu.held_mask, 0, "level must be deasserted");
 
-    // The whole held span cost a handful of bytes (rising + falling frames),
-    // NOT ~1000 (one per held cycle, the old bug).
+    // The hold duration must be a Repeat1 skip-token frame (`0b110110xx` =>
+    // 0xD8..=0xDB), NOT ~1000 per-cycle frames.
+    let closing = &tu.byte_buffer[after_assert..];
     assert!(
-        after_close - start_len < 12,
-        "held span must be ~2 frames, got {} bytes",
-        after_close - start_len
+        closing.iter().any(|&b| (b & 0b1111_1100) == 0b1101_1000),
+        "hold must encode as a Repeat1 skip run, got {:02x?}",
+        closing
+    );
+    assert!(
+        tu.byte_buffer.len() - start_len < 16,
+        "held span must be a handful of bytes, got {}",
+        tu.byte_buffer.len() - start_len
     );
 }
 
@@ -193,6 +201,49 @@ fn pulse_events_byte_identical_with_no_held_levels() {
     assert_eq!(tu.byte_buffer[start_len], 0x05);
     assert_eq!(tu.byte_buffer[start_len + 1], 0x14);
     assert_eq!(tu.held_mask, 0, "no levels asserted");
+}
+
+/// The mode-0 skip-run chunker must reproduce HW's exact held-level duration
+/// encoding: HW's first long LOCK_STALL hold (6353 cycles) decodes to six
+/// `Repeat1(1023)` frames + one `Repeat1(215)`. Bytes verified against the
+/// upstream `utils.py::convert_to_commands` opcode table.
+#[test]
+fn mode0_skip_run_chunks_like_hw() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.emit_skip_run(6353);
+    // Repeat1(1023) = [0xDB, 0xFF]; Repeat1(215) = [0xD8, 0xD7].
+    let mut expected = Vec::new();
+    for _ in 0..6 {
+        expected.push(0xDB);
+        expected.push(0xFF);
+    }
+    expected.push(0xD8);
+    expected.push(0xD7);
+    assert_eq!(tu.byte_buffer, expected, "6353 must chunk as 6x1023 + 215");
+}
+
+/// Small remainders (<=15) use the 1-byte Repeat0 frame, not Repeat1.
+#[test]
+fn mode0_skip_run_small_uses_repeat0() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.emit_skip_run(6);
+    assert_eq!(tu.byte_buffer, vec![0xE6], "Repeat0(6) = 0b1110_0110");
+}
+
+/// Exact-boundary chunking: 1024 = Repeat1(1023) + Repeat0(1).
+#[test]
+fn mode0_skip_run_boundary_1024() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.emit_skip_run(1024);
+    assert_eq!(tu.byte_buffer, vec![0xDB, 0xFF, 0xE1]);
+}
+
+/// A zero-length run emits nothing.
+#[test]
+fn mode0_skip_run_zero_is_empty() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.emit_skip_run(0);
+    assert!(tu.byte_buffer.is_empty());
 }
 
 #[test]

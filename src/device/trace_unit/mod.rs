@@ -177,6 +177,16 @@ pub struct TraceUnit {
     /// early-returns when no pulse fired, and `set_event_level` only commits
     /// on an actual assert/deassert edge.
     pub(super) held_mask: u8,
+    /// Held-level mask as of the *last emitted frame*. Distinct from
+    /// `held_mask` (the live state): this records what was asserted when the
+    /// previous frame went out, so `commit_pending_frame` knows whether a level
+    /// was held *across the gap* since that frame. If so, the gap must be
+    /// carried by skip tokens (`Repeat`) rather than the frame's `cycles`
+    /// field -- upstream `parse_trace` deactivates all active events on any
+    /// `cycles>0` frame, so a held level only survives a gap encoded as
+    /// `cycles==0` + Repeat. See
+    /// `docs/superpowers/specs/2026-06-08-skip-token-held-level-encoding.md`.
+    frame_held: u8,
     /// PC value associated with the most recent event in `pending_cycle`
     /// (mode 1 only). Mode 0 ignores this field entirely.
     pending_pc: u32,
@@ -256,6 +266,7 @@ impl TraceUnit {
             pending_cycle: 0,
             pending_slot_mask: 0,
             held_mask: 0,
+            frame_held: 0,
             pending_pc: 0,
             pc_truncate_warnings: 0,
             no_pc_warnings: 0,
@@ -921,26 +932,45 @@ impl TraceUnit {
 
         match self.mode {
             TraceMode::EventTime => {
-                // Snapshot-diff model (tools/trace_decoder/decode.py
-                // rebuild_perfetto_mode0): each frame carries the full
-                // asserted set; the decoder pairs B/E by diffing consecutive
-                // frames. A held level appears in `active` every time a frame
-                // is emitted, and closes when a later frame drops its bit.
-                // No frame is emitted when nothing is asserted. Per-cycle
-                // re-emission during a hold is avoided upstream: commit_cycle
-                // early-returns when no pulse fired, so a pure held stall
-                // produces only its rising-edge frame here.
+                // Skip-token model, matching upstream `aie.utils.trace.parse_trace`
+                // (the decoder the regression comparison actually runs). Upstream
+                // deactivates ALL active events on any `cycles>0` frame, so a held
+                // level only survives a multi-cycle gap if that gap is encoded as a
+                // `cycles==0` frame plus `Repeat` tokens. Design + HW reference:
+                // docs/superpowers/specs/2026-06-08-skip-token-held-level-encoding.md.
                 if active == 0 {
+                    // No mode-0 encoding exists for an empty snapshot, and HW emits
+                    // none either. Leave the decoder's currently-active level(s)
+                    // asserted; the next emitted frame deactivates them (HW's
+                    // close-at-next-event behavior). Do NOT advance the anchor --
+                    // the gap carries forward to that closing frame.
                     return;
                 }
-                let delta = self.pending_cycle.saturating_sub(self.last_event_cycle);
-                self.last_event_cycle = self.pending_cycle;
-                if active.count_ones() == 1 {
-                    let slot = active.trailing_zeros() as u8;
-                    self.encode_single(slot, delta);
+                let gap = self.pending_cycle.saturating_sub(self.last_event_cycle);
+                if self.frame_held != 0 {
+                    // A level was held across the gap: cover it with skip tokens so
+                    // upstream keeps survivors active, then emit this frame at
+                    // cycles=0. The closing frame's implicit +1 supplies the final
+                    // hold cycle, so the run is `gap - 1` (matches HW: a 6354-cycle
+                    // hold -> 6353 cycles of Repeat).
+                    if gap > 1 {
+                        self.emit_skip_run(gap - 1);
+                    }
+                    self.emit_event_frame(active, 0);
+                } else if self.held_mask != 0 && gap > 0 {
+                    // Opening a hold after an idle gap: position+activate with the
+                    // gap in the cycles field, then an immediate cycles=0 frame to
+                    // arm the skip mechanism for the upcoming hold (mirrors HW's
+                    // pulse-then-cycles=0 hold open).
+                    self.emit_event_frame(active, gap);
+                    self.emit_event_frame(active, 0);
                 } else {
-                    self.encode_multiple(active, delta);
+                    // Pure pulse / nothing held across the gap: the gap rides in the
+                    // frame's cycles field, as before.
+                    self.emit_event_frame(active, gap);
                 }
+                self.last_event_cycle = self.pending_cycle;
+                self.frame_held = self.held_mask;
             }
             TraceMode::EventPc => {
                 // EventPc carries a PC per frame; include held levels in the
@@ -997,6 +1027,18 @@ impl TraceUnit {
         self.byte_buffer.push(byte1);
         self.byte_buffer.push(byte2);
         self.byte_buffer.push(byte3);
+    }
+
+    /// Emit one mode-0 event frame for the asserted snapshot `active` with the
+    /// given `cycles` delta: a Single0/1/2 when exactly one slot is set, a
+    /// Multiple0/1/2 otherwise. Shared by the skip-token commit paths.
+    fn emit_event_frame(&mut self, active: u8, cycles: u64) {
+        debug_assert!(active != 0, "emit_event_frame called with empty mask");
+        if active.count_ones() == 1 {
+            self.encode_single(active.trailing_zeros() as u8, cycles);
+        } else {
+            self.encode_multiple(active, cycles);
+        }
     }
 
     /// Encode a single event with a cycle delta.
@@ -1096,6 +1138,50 @@ impl TraceUnit {
             self.byte_buffer.push(byte1);
             self.byte_buffer.push(byte2);
             self.byte_buffer.push(byte3);
+        }
+    }
+
+    /// Mode-0 Repeat0 frame: `0b1110_RRRR` (1 byte), 4-bit repeat count (0..15).
+    ///
+    /// Emitted byte-aligned into the mode-0 byte buffer -- distinct from the
+    /// mode-2 `encode_repeat0`, which packs the same bit pattern through the
+    /// nibble accumulator. A Repeat after a `cycles==0` frame extends the
+    /// decoder timer linearly without deactivating held events (upstream
+    /// `parse.py` `convert_commands_to_json`), which is how a held level's
+    /// duration is encoded.
+    fn encode_mode0_repeat0(&mut self, n: u8) {
+        debug_assert!(n < 16, "Repeat0 count {} exceeds 4 bits", n);
+        self.byte_buffer.push(0xE0 | (n & 0x0F));
+    }
+
+    /// Mode-0 Repeat1 frame: `0b110110_RR RRRRRRRR` (2 bytes), 10-bit count
+    /// (0..1023). Byte-aligned mode-0 counterpart to mode-2 `encode_repeat1`.
+    fn encode_mode0_repeat1(&mut self, n: u16) {
+        debug_assert!(n < 1024, "Repeat1 count {} exceeds 10 bits", n);
+        self.byte_buffer.push(0xD8 | ((n >> 8) as u8 & 0x03));
+        self.byte_buffer.push((n & 0xFF) as u8);
+    }
+
+    /// Emit a skip-token run covering `cycles` cycles of held-level hold time,
+    /// using `Repeat1(1023)` chunks plus a final `Repeat0`/`Repeat1` remainder.
+    ///
+    /// Matches HW's held-level duration encoding exactly: HW's first long
+    /// LOCK_STALL hold (6353 cycles) decodes to six `Repeat1(1023)` + one
+    /// `Repeat1(215)`, which this reproduces. The caller must have emitted the
+    /// opening `cycles==0` frame first so the decoder treats these as linear
+    /// timer extension rather than a deactivate/activate replay.
+    fn emit_skip_run(&mut self, mut cycles: u64) {
+        while cycles >= 1024 {
+            self.encode_mode0_repeat1(1023);
+            cycles -= 1023;
+        }
+        if cycles == 0 {
+            return;
+        }
+        if cycles <= 15 {
+            self.encode_mode0_repeat0(cycles as u8);
+        } else {
+            self.encode_mode0_repeat1(cycles as u16);
         }
     }
 
