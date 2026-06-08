@@ -36,7 +36,8 @@ include!(concat!(env!("OUT_DIR"), "/trace_event_codes.rs"));
 pub enum TraceModule {
     /// Compute tile core module (CoreEvent ids from mlir-aie).
     Core,
-    /// Compute or shim tile memory module (MemEvent ids from mlir-aie).
+    /// Compute tile memory module (MemEvent ids from mlir-aie). Shim tiles are
+    /// not classified here.
     Mem,
     /// Mem tile module (MemTileEvent ids from mlir-aie, distinct from MemEvent).
     MemTile,
@@ -55,6 +56,25 @@ pub enum TraceModule {
 /// All id constants are referenced from the generated `core_events`,
 /// `mem_events`, and `memtile_events` modules so this function derives from
 /// the toolchain, not from magic numbers.
+///
+/// # Scope: deliberately mirrors `compare.rs`, not hardware-complete
+///
+/// The LEVEL set here deliberately mirrors `src/trace/compare.rs::is_level_event`
+/// *exactly*, so that rerouting `compare.rs` to consume this function is
+/// behavior-preserving. Classifying *more* events as level than `compare.rs`
+/// does today would silently change trace-comparison results and risk breaking
+/// comparison tests.
+///
+/// Hardware-complete coverage is intentionally deferred. The known omissions
+/// (all absent from `compare.rs` today) are:
+///   - MemTile stream-switch port states `PORT_RUNNING`/`PORT_IDLE`/`PORT_STALLED`
+///     (MemTileEvent ids 79-109) -- level on hardware but unclassified here.
+///   - Compute memory bank conflicts `CONFLICT_DM_BANK_4..7` (MemEvent ids 81-84).
+///   - The MemTile memory bank conflicts (MemTileEvent `CONFLICT_DM_BANK_*`).
+///
+/// Expanding the set is future work that must touch *both* this file and
+/// `compare.rs` together (with comparison-test updates). Do not add those
+/// events here in isolation.
 pub fn is_level_event(hw_id: u8, module: TraceModule) -> bool {
     match module {
         TraceModule::Core => is_level_core(hw_id),
@@ -144,9 +164,11 @@ fn is_level_mem(hw_id: u8) -> bool {
 
 /// Level classifier for MemTileEvent ids (mem tile module).
 ///
-/// Mirrors `is_level_mem` for the MemTile event namespace (SEL0/SEL1 naming).
-/// MemTile uses distinct hw_ids from MemEvent -- the same bit patterns mean
-/// different events in the two modules.
+/// Level events for the MemTile DMA stalled-lock, stream-starvation, and
+/// stream-backpressure conditions (SEL0/SEL1 naming). MemTile uses distinct
+/// hw_ids from MemEvent -- the same bit patterns mean different events in the
+/// two modules. Narrower than `is_level_mem`: MemTile memory bank conflicts and
+/// port states are deliberately omitted (see `is_level_event` scope note).
 fn is_level_memtile(hw_id: u8) -> bool {
     matches!(
         hw_id,
@@ -182,6 +204,9 @@ mod level_classifier_tests {
         assert!(is_level_event(core_events::CASCADE_STALL, TraceModule::Core)); // 25
                                                                                 // Core stream-switch port state
         assert!(is_level_event(core_events::PORT_RUNNING_0, TraceModule::Core)); // 75
+                                                                                 // High port index: port hw_ids are non-contiguous (stride 4), so cover
+                                                                                 // the top of the range as well as port 0.
+        assert!(is_level_event(core_events::PORT_RUNNING_7, TraceModule::Core)); // 103
                                                                                  // Mem DMA starvation
         assert!(is_level_event(mem_events::DMA_S2MM_0_STREAM_STARVATION, TraceModule::Mem)); // 35
                                                                                              // Core power state
