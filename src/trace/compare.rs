@@ -9,6 +9,7 @@
 //! - **Single batch**: compare one HW vs EMU `trace_raw.bin` pair
 //! - **Sweep directory**: compare all batches from `trace-sweep.py`
 
+use crate::trace::event_codes::{core_event_name, mem_event_name, memtile_event_name, TraceModule};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
@@ -345,8 +346,6 @@ pub struct BatchResult {
 // Level event classification
 // ============================================================================
 
-use crate::trace::event_codes::{core_event_name, mem_event_name, memtile_event_name, TraceModule};
-
 /// Resolve an event name string to its (hw_id, TraceModule) pair.
 ///
 /// Module is inferred from the name prefix:
@@ -357,6 +356,14 @@ use crate::trace::event_codes::{core_event_name, mem_event_name, memtile_event_n
 /// The hw_id is found by scanning the appropriate generated name table
 /// (0..=127). Returns `None` if the name is not found in the table
 /// (unknown or reserved names).
+///
+/// COUPLING CAVEAT: some names are shared across modules -- MemTile also has
+/// `CONFLICT_DM_BANK_*` (ids 112-127) and `PORT_{RUNNING,IDLE,STALLED}_*`, which
+/// collide with the Mem/Core names this heuristic routes them to. That is
+/// harmless today only because the archspec MemTile classifier deliberately
+/// excludes those (see its scope note). If MemTile bank-conflict or port-state
+/// events are ever added to the level set, this heuristic AND the name tables
+/// must be updated together, or those names will be silently misrouted.
 fn name_to_hw_id_and_module(name: &str) -> Option<(u8, TraceModule)> {
     let module = if name.starts_with("DMA_") && name.contains("SEL") {
         TraceModule::MemTile
@@ -2941,6 +2948,9 @@ mod tests {
         assert!(is_level_event("MEMORY_STALL"), "MEMORY_STALL must be level");
         assert!(is_level_event("STREAM_STALL"), "STREAM_STALL must be level");
         assert!(is_level_event("CASCADE_STALL"), "CASCADE_STALL must be level");
+        // Core power-state level signals
+        assert!(is_level_event("ACTIVE"), "ACTIVE must be level");
+        assert!(is_level_event("DISABLED"), "DISABLED must be level");
         // Core stream-switch port state -- all 8 ports
         assert!(is_level_event("PORT_RUNNING_0"), "PORT_RUNNING_0 must be level");
         assert!(is_level_event("PORT_RUNNING_7"), "PORT_RUNNING_7 must be level");
