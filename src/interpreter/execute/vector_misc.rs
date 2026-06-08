@@ -973,4 +973,34 @@ mod tests {
         VectorAlu::execute(&op, &mut ctx);
         assert_eq!(ctx.vector.read(1), [10, 20, 30, 40, 50, 60, 70, 80]);
     }
+
+    /// `vmov q0, wh0`: copy the LOW 128 bits of a 256-bit w-register into the
+    /// 128-bit q register file. This is how Chess stores int32->int16 SRS
+    /// results: `vsrs wX,cmN` -> `vmov qN,wX` -> `st qN`. q is an independent
+    /// 128-bit class per AIE2 TableGen (`AIE2Vector128RegisterClass`, the
+    /// "128-bit mask registers"), modeled here as `ctx.mask` and decoded to
+    /// `ControlReg(16..19)`. Previously execute_copy dropped the q destination
+    /// (the narrow-vector-move sink only knew Vector/Accum/Scalar dests), so the
+    /// move evaporated and the subsequent `st q` read stale poison.
+    #[test]
+    fn test_vmov_q_from_w_takes_low_128() {
+        let mut ctx = make_ctx();
+        // wh0 = VectorReg(1), 256 bits = 8 u32 lanes. Low 128 bits = lanes [0..4]
+        // (the valid SRS outputs; the high 8 int16 lanes come from the unloaded
+        // cm high half and are never stored).
+        ctx.vector.write(1, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Copy)
+            .as_vector(ElementType::Int16)
+            .with_dest(Operand::ControlReg(16))
+            .with_source(Operand::VectorReg(1));
+
+        VectorAlu::execute(&op, &mut ctx);
+
+        assert_eq!(
+            ctx.mask.read(0),
+            [0x11, 0x22, 0x33, 0x44],
+            "vmov q0, wh0 must copy the low 128 bits of the w-register into q0"
+        );
+    }
 }

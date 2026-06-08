@@ -87,6 +87,17 @@ impl VectorAlu {
                 let mask = Self::condense_comparison_mask(&value, op.element_type);
                 ctx.scalar.write(*r, mask);
             }
+            Some(Operand::ControlReg(id)) if *id >= 16 && *id <= 19 => {
+                // q0-q3: the AIE2 128-bit register file (TableGen
+                // `AIE2Vector128RegisterClass`, the "128-bit mask registers"),
+                // modeled as `ctx.mask`. `vmov qN, wX` copies the LOW 128 bits
+                // of the 256-bit w source into the q register -- this is how
+                // Chess lands int32->int16 SRS results before `st qN`. The high
+                // 128 of the w-reg holds the unloaded cm-high garbage and is
+                // dropped. See test_vmov_q_from_w_takes_low_128.
+                let q_idx = (*id - 16) as u8;
+                ctx.mask.write(q_idx, [value[0], value[1], value[2], value[3]]);
+            }
             Some(other) => {
                 log::error!(
                     "[VECTOR] write_vector_dest: unexpected dest {:?} -- \

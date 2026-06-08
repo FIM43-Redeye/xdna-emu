@@ -38,72 +38,99 @@ the host reference, so the HW leg is HW-vs-golden; combined with Half-A
 debugger, future kernels, and EMU==HW direct cross-checks), which Maya chose to
 invest in now.
 
-## The blocker to resolve first (Task 1): authoritative register hierarchy
+## Task 1 FINDINGS (2026-06-08): register hierarchy + the real root cause
 
-We do NOT yet have the definitive AIE2 vector sub-register structure. Derive it
-from llvm-aie TableGen (`/home/triple/npu-work/llvm-aie/llvm/lib/Target/AIE/`,
-the same `AIE2*RegisterInfo.td` / `SubRegIndex` pattern that gave the
-accumulator widths). Open questions to nail with quoted TableGen:
+### Authoritative AIE2 vector register hierarchy (TableGen-cited)
 
-- Width of `q` (hypothesis: 128-bit) and its relationship to `wl`/`wh`/`w`/`x`.
-  Known so far (from the accumulator-derivation Explore, partial): `x` = 512-bit
-  = `{wl, wh}` each **256-bit** (`sub_256_lo`/`sub_256_hi`), `y` = 1024-bit =
-  two `x`. Where does 128-bit `q` sit -- is it a half of `wl`/`wh`
-  (so q = quarter of x), an independent 128-bit class, or both? Find the
-  `q` register class + its SubRegIndices.
-- The register classes used by the failing ops: `vmov qN, wX` and `st qN` --
-  what operand classes, and what does `st q` with `#0x10` (16-byte) imply.
-- Confirm `vst.128 wl0` semantics: does `.128` store the low 128 bits of a
-  256-bit `wl`, or is `wl` itself addressable at 128?
+From `llvm-aie/llvm/lib/Target/AIE/AIE2GenRegisterInfo.td` and
+`AIE2RegisterInfo.td`:
 
-Deliverable: a definitive table {q/w/wl/wh/x/y -> bit width -> sub-register
-relationships} with TableGen citations. This grounds every design choice below.
+| Reg | Width | Class | Composition / SubRegIndex |
+|-----|-------|-------|---------------------------|
+| `q0-q3` | **128** | `AIE2Vector128RegisterClass` (`[v16i8,v8i16,v8bf16,v4i32,v4f32,i128]`) | `ql`+`qh` (64+64) via `sub_lo_mask`/`sub_hi_mask`. TableGen comment: **"128-bit mask registers"** |
+| `wl/wh` | 256 | `AIE2Vector256RegisterClass` | leaf |
+| `x` | 512 | `AIE2Vector512RegisterClass` | `wl`(lo)+`wh`(hi) via `sub_256_lo`/`sub_256_hi` |
+| `y` | 1024 | `AIE2Vector1024RegisterClass` | two `x` via `sub_512_lo`/`sub_512_hi` |
+| `qwl/qwh` | **320** | composite | `q`(64-via-`sub_q`)+`w`(256-via-`sub_w`) |
+| `qx` | 640 | composite | `x`(512)+`q`(128) via `sub_sparse_x`/`sub_sparse_q` -- our `SparseQxReg` |
 
-## Current emulator model (what we're changing)
+**Decisive structural fact: `q` is INDEPENDENT 128-bit storage, NOT a sub-register
+half of `wl`/`wh`.** Proof: `qwl = q + wl` is a **320-bit** composite (128 would
+be absorbed if q overlapped wl; 320 = 64-aligned `sub_q` + 256 `sub_w` means q
+and w are concatenated, i.e. disjoint). So design **Option C (q as a w-half) is
+dead.** The hardware-faithful model is an independent 128-bit q file (Option A's
+storage). (Side note: AMD's aiesim punts on this -- `//QX_t ext_qx` is commented
+out in `aietools .../me.h`; it models 128-bit values as overlay views of w. That
+is an aiesim impl shortcut, not the architecture. TableGen wins.)
 
-- `Operand::VectorReg(u8)` = 256-bit (`[u32; 8]`), in `bundle/slot.rs`.
-- `register_map.rs`: `wl_n -> VectorReg(2n)`, `wh_n -> VectorReg(2n+1)` (each
-  256-bit); `x` = "wide" = a VectorReg pair (512-bit) via
-  `registers.rs::read_wide`/`write_wide` (even base required).
-- `q -> ControlReg(16+idx)` (line 209) -- WRONG for vector-data use. Also
-  `qx -> SparseQxReg` (sparse composite, line 214) -- a separate thing, leave it.
-- `vector.rs` register file is `[u32; 8]`-per-register; there is no 128-bit
-  addressable vector unit today.
+### Ground-truth instruction sequence (the compiled SRS, `srs.o.lst`)
 
-## Design space (decide after Task 1)
+`VLDA.UPS.s64.s32 bmlN` x6 (only the low-8-lane `bml` halves loaded; `bmh` never
+written -> **partial-cm confirmed**) -> `VSRS.s16.s64 wlN/whN, cmN, s0` x6 (full-cm
+SRS into 256-bit w-regs; only low-8 int16 lanes valid) -> `VMOV qN, whN/wlN` (copy
+**low 128 bits** of the w-reg = the 8 valid lanes into a q) -> `ST qN,[p1],#16`
+(128-bit store) x6, plus one `VST.128 wl0,[p1,#0]` (direct low-128-of-w store).
 
-How to represent a 128-bit vector-data `q` operand:
+### THE REFRAME: 128-bit q storage already exists; only one edge is missing
 
-- **Option A -- new `Operand::QuarterReg(u8)` (Vec128)**: explicit 128-bit
-  operand; `vmov q, w` reads low/high 128 of a VectorReg; `st q` stores 128
-  bits. Cleanest typing; touches decode map, vmov execute, store execute.
-- **Option B -- map q into VectorReg space with a width tag**: reuse VectorReg
-  but carry a 128-bit width on the SlotOp. Fewer new variants, but width
-  plumbing leaks into many ops.
-- **Option C -- model q as a half-of-w addressing**: `q_n -> (VectorReg(n/2),
-  half)`. Mirrors hardware sub-register reality if Task 1 confirms q = half of
-  wl/wh.
+The staging hypothesis ("build a 128-bit q model from scratch -- new Operand
+variant, new register file, decode rework") is **wrong/oversized**. The emulator
+already has:
 
-Lean toward A unless Task 1 shows q is cleanly a w-half (then C). Schema-first:
-define the operand/width representation before wiring execute.
+- **A 128-bit q register file**: `ctx.mask` (`[u32;4]` x 4), today labelled
+  "mask." This IS the q file.
+- **q decode**: `register_map.rs:209` maps `q -> ControlReg(16+idx)` (and
+  `ql/qh/qwl/qwh` to 28..35 / 20..27). This encoding is FINE -- it routes to
+  `ctx.mask`.
+- **The store-read path**: `read_store_data_wide` (`memory/mod.rs:1231`) already
+  reads `ControlReg(16..19)` from `ctx.mask` and returns 128 bits. `ST q` works.
+- **A pipelined 128-bit vector-write path**: `context.rs:800` already writes
+  `ControlReg(16..19)` + `vec_value` into `ctx.mask`. 
+- **`VST.128 wl0`**: already works (VectorReg source -> `read_store_data_wide` ->
+  QuadWord low-128 store at `memory/mod.rs:334`).
 
-## Implementation plan (TDD, post Task 1)
+**The single missing edge: `VMOV q, w` execute.** `execute_copy`
+(`vector_misc.rs:630`) for `VMOV q0, wh0` (dest `ControlReg(16)`, src
+`VectorReg(1)`, not accum, not wide) falls into the "narrow vector move" branch
+-> `write_vector_dest`, which only handles VectorReg/AccumReg/ScalarReg dests.
+**The q (`ControlReg 16..19`) destination is silently dropped** -> `ctx.mask`
+never receives w's low 128 -> `ST q` later reads stale storage -> output stays
+`0xDEADBEEF` poison. That single dropped move is the whole bug.
 
-1. **Derive hierarchy** (Task 1 above). Write it into this doc.
-2. **Decode**: `register_map.rs` map `q` to the chosen vector-data operand. RED:
-   a decode test on `vmov q0, wh0` / `st q0` bytes asserting q -> vector-data
-   operand (not ControlReg). The `vec_srs_i32` ELF at
-   `mlir-aie/build/test/npu-xrt/vec_srs_i32/chess/aie_arch.mlir.prj/main_core_0_2.elf`
-   is the byte source (disasm via `llvm-aie/build/bin/llvm-objdump -d
-   --triple=aie2`).
-3. **Execute `vmov q, w`**: copy the correct 128-bit half of the 256-bit source
-   into the q destination. RED execute test first.
-4. **Execute `st q`**: store 128 bits to memory. RED test (likely in the store
-   path, `execute/memory.rs`). Mind `#0x10` post-increment.
-5. **Integration acceptance**: `./scripts/emu-bridge-test.sh --no-hw vec_srs_i32`
-   goes green (after `cargo build -p xdna-emu-ffi`). This is the real RED->GREEN
-   for the whole mission. Watch for the NEXT gap behind q (see below).
-6. **Full `cargo test --lib`** clean; commit per logical unit.
+### Revised design decision
+
+No new `Operand` variant, no new register file, no decode rework. **Extend the
+copy path to route a q-mask destination (`ControlReg 16..19`, plus `ql/qh` and
+the `qwl/qwh` wide-mask forms if a kernel needs them) into `ctx.mask`, copying
+the LOW 128 bits of the 256-bit w source.** Faithful to TableGen (q is the
+already-existing independent 128-bit file) and minimal.
+
+Naming nit to consider (non-blocking): `ctx.mask` / "mask register" is now doing
+double duty as the q vector-data file. A rename to `ctx.q` (or a doc note that
+mask == q) would reduce future confusion, but is cosmetic -- defer unless cheap.
+
+## Implementation plan (TDD, post Task 1 -- REVISED per findings)
+
+Task 1 is done (above). Decode, store-read, pipelined-write, and `VST.128` already
+work; `ST q` already works. The only missing edge is `VMOV q, w` execute.
+
+1. **Execute `vmov q, w`** (the fix): in `execute_copy` (`vector_misc.rs:630`),
+   detect a q-mask destination (`ControlReg(16..19)`, and `ql/qh` 28..35,
+   `qwl/qwh` 20..27 if needed) and copy the **low 128 bits** (`src[0..4]`) of the
+   256-bit w source into `ctx.mask` via the existing pipelined-write mechanism
+   (so the read-before-write VLIW bundle ordering is honoured -- critical: the
+   SRS schedule does `VSRS wh0,cmK ; VMOV q,wh0` and `ST q ; VMOV q,whN` in the
+   same bundles, relying on read-old/write-new). RED: an execute unit test on a
+   `VMOV q0, wh0` SlotOp asserting `ctx.mask[0] == low 128 of VectorReg(1)`;
+   watch it fail (q-dest dropped), then GREEN.
+2. **Integration acceptance**: `./scripts/emu-bridge-test.sh --no-hw vec_srs_i32`
+   goes green (after `cargo build -p xdna-emu-ffi`). The real end-to-end
+   RED->GREEN. Watch for the NEXT gap behind q (partial-cm read tolerance below).
+3. **Full `cargo test --lib`** clean; commit per logical unit.
+
+Byte source if more decode evidence is needed: `srs.o.lst` (Chess listing, has
+the cleanest disasm) and the ELF at `.../chess/aie_arch.mlir.prj/main_core_0_2.elf`
+(disasm via `llvm-aie/build/bin/llvm-objdump -d --triple=aie2`).
 
 ## Known related gaps to watch (may surface behind q)
 
