@@ -192,7 +192,14 @@ fn commit_active_set_change(&mut self, cycle: u64) {
 }
 ```
 
-NOTE (resolve during implementation against the decoder): the AIE mode-0 format encodes which slots are *active this frame*. Confirm with the decoder (`tools/trace_decoder/decode.py` `_emit_be`) whether a falling edge is represented by a frame with the cleared active set, or by re-emitting the slot. Make the held_level test the oracle: iterate the encoding until `decode_lock_stall_spans` returns exactly `[(10,1010)]`. Keep `commit_pending_frame` for pulse-only paths but route held changes through `commit_active_set_change`.
+RESOLVED BY SPIKE (2026-06-07) -- do not re-derive:
+- The in-tree decoder (`tools/trace_decoder/decode.py` `rebuild_perfetto_mode0` / `_emit_be`, lines 287, 327-354) is a **snapshot-mask-diff** engine: every EventCmd carries the FULL currently-asserted slot mask; the decoder diffs consecutive masks (bit 0->1 = B, 1->0 = E). A held level closes only when a later frame DROPS the bit, or at end-of-segment (`_emit_be(0, timer)`, line 396).
+- Therefore: emit a frame carrying the full `held | pulse` mask **whenever it changes** from `last_emitted_mask`. Do NOT emit per-cycle. While a level is held with nothing else changing, emit NOTHING (the level stays asserted between frames).
+- **Falling edge is carried by the next event's frame**, exactly as HW does it. HW emits NO synthetic empty frame: the startup LOCK_STALL (HW span 1->6355) closes precisely at the coincident acquire event whose frame's mask excludes LOCK_STALL. For LOCK_STALL this always lines up -- the wait ends when the lock is acquired, and the acquire is a traced event at that cycle. So on deassert: clear the held bit; the frame committed at the deassert cycle (carrying the now-reduced mask) closes the span via the diff.
+- Do NOT synthesize a `mask == 0` frame on deassert-to-empty. HW doesn't, and `encode_multiple` asserts >= 2 bits (mask=0 isn't naturally encodable). A transition to a truly-empty active set is left to the next real frame / end-of-segment -- this does not occur for LOCK_STALL (the resuming acquire always coincides).
+- **Empirical anchor:** the in-tree "ours" decoder already renders add_one HW as 46 held LOCK_STALL spans (`build/bridge-test-results/20260606/_diag_phase_b_add_one_instrumented.peano.hw/events.json`), confirming the decoder is level-diff and HW uses frame-on-transition.
+- **Test consequence:** the held_level test must include a COINCIDENT closing event at the deassert cycle (mirroring stall->acquire), then assert one span `[assert_cycle, deassert_cycle]`. Do NOT test a lone held level with no closing event -- that correctly stays open to end-of-segment. Use the in-tree decoder as the oracle, or assert byte-level: one frame at the assert cycle, NO per-cycle frames during the hold, and a mask-reducing frame at the deassert cycle.
+Keep `commit_pending_frame` for pulse-only paths; route held-mask changes through `commit_active_set_change`.
 
 - [ ] **Step 6: Run to verify it passes.** Run: `TMPDIR=/tmp/claude-1000 cargo test --lib trace_unit::tests::held_level_emits_single_span`. Expected: PASS.
 
