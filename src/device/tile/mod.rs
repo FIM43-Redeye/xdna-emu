@@ -765,6 +765,32 @@ impl Tile {
         self.core_debug.check_event_halt(hw_id);
     }
 
+    /// Notify a core-module LEVEL event edge: assert (`active=true`) or
+    /// deassert (`active=false`).
+    ///
+    /// Forwards to `core_trace.set_event_level()` (the held-level trace path).
+    /// On a rising edge the event is "firing", so we mirror the
+    /// timer-reset / edge-detector / debug-halt side effects of
+    /// `notify_core_trace_event`; on a falling edge the event is not firing,
+    /// so only the trace state changes.
+    #[inline]
+    pub fn notify_core_trace_level(&mut self, hw_id: u8, cycle: u64, active: bool) {
+        // hw_id 0 is EVENT_NONE; see notify_core_trace_event for rationale.
+        if hw_id == 0 {
+            return;
+        }
+        self.core_trace.set_event_level(hw_id, cycle, active);
+        if active {
+            self.core_timer.notify_event(hw_id);
+            for det in &mut self.core_edge_detectors {
+                if det.input_event != 0 && det.input_event == hw_id {
+                    det.curr_active = true;
+                }
+            }
+            self.core_debug.check_event_halt(hw_id);
+        }
+    }
+
     /// Notify a memory module event for both tracing and edge detection.
     ///
     /// Forwards the event to `mem_trace.notify_event()` and marks it as

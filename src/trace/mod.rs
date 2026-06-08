@@ -116,7 +116,25 @@ pub fn core_event_to_hw_id(event: &EventType) -> Option<u8> {
         EventType::InstrLockReleaseReq { .. } => Some(45),
         // Branch is an emulator-internal event, no hardware equivalent
         EventType::BranchTaken { .. } => None,
+        // LockStallLevel is a level-EDGE event routed via core_level_edge /
+        // set_event_level, not the pulse notify_event path -- return None here
+        // so the coordinator's drain falls through to the level route.
+        EventType::LockStallLevel { .. } => None,
         // Memory module events don't have core event IDs
+        _ => None,
+    }
+}
+
+/// Map a core-module LEVEL-edge event to its `(hw_id, active)` for the trace
+/// unit's held-level path (`set_event_level`). Returns `None` for events that
+/// are not level edges -- the caller routes those through
+/// `core_event_to_hw_id` + `notify_event` (the pulse path) instead.
+///
+/// hw_id 26 mirrors `core_event_to_hw_id(LockStall)` -- both are the LOCK_STALL
+/// event; the difference is pulse (notify_event) vs level (set_event_level).
+pub(crate) fn core_level_edge(event: &EventType) -> Option<(u8, bool)> {
+    match event {
+        EventType::LockStallLevel { active } => Some((26, *active)),
         _ => None,
     }
 }

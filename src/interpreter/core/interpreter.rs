@@ -86,20 +86,6 @@ pub enum StepResult {
     ExecError(String),
 }
 
-/// Period (in cycles) at which a LOCK_STALL trace event is re-emitted
-/// while the core remains in `WaitingLock`. HW emits LOCK_STALL on every
-/// cycle the WaitLock instruction is unresolved (the trace controller's
-/// LOCK_STALL signal is level, not edge, so the core trace unit emits a
-/// frame each cycle the signal is asserted). Measured on
-/// `add_one_using_dma`: HW=4394 LOCK_STALL events over the stall window.
-///
-/// Previous value was 1024, based on the assumption that LOCK_STALL was
-/// perf-counter-driven (PERF_CTRL0 counting ACTIVE_CORE with threshold
-/// 1024). That model was wrong; the bridge auto-mode trace decode in
-/// 2026-05-11 surfaced that HW LOCK_STALL is per-cycle of held stall.
-/// See `2026-05-11-emu-dma-pipeline-too-fast-misses-stalls.md`.
-const LOCK_STALL_TRACE_PERIOD: u64 = 1;
-
 /// Per-core interpreter.
 ///
 /// Manages the execution of a single AIE2 compute core by coordinating
@@ -126,10 +112,6 @@ where
     status: CoreStatus,
     /// Last decoded bundle (for debugging).
     last_bundle: Option<VliwBundle>,
-    /// Cycles accumulated since the last periodic LOCK_STALL trace
-    /// emission while the core is in `WaitingLock`. Reset on acquire
-    /// and on `reset()`.
-    lock_stall_periodic: u64,
 }
 
 impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
@@ -372,13 +354,7 @@ where
 {
     /// Create a new interpreter with the given decoder and executor.
     pub fn new(decoder: D, executor: E) -> Self {
-        Self {
-            decoder,
-            executor,
-            status: CoreStatus::Ready,
-            last_bundle: None,
-            lock_stall_periodic: 0,
-        }
+        Self { decoder, executor, status: CoreStatus::Ready, last_bundle: None }
     }
 
     /// Get the current core status.
@@ -721,26 +697,19 @@ where
                 if lock_value > 0 {
                     log::info!("Lock {} available (value={}), resuming execution", raw_lock_id, lock_value);
                     self.status = CoreStatus::Ready;
-                    self.lock_stall_periodic = 0;
+                    // Falling edge of the lock stall (held level): the lock is
+                    // available, so the stall deasserts now. Pairs with the
+                    // rising edge recorded at WaitLock entry. This replaces the
+                    // old per-cycle LOCK_STALL re-emission (period=1), which
+                    // over-emitted ~375x vs HW; the held-level model produces
+                    // one B..E span of the real stall duration.
+                    let cycle = ctx.cycles;
+                    ctx.timing_context_mut()
+                        .record_event(cycle, EventType::LockStallLevel { active: false });
                     // Re-execute the instruction - it will acquire the lock
                     None
                 } else {
                     ctx.record_stall(1);
-                    // Periodic LOCK_STALL re-emission. HW emits one LOCK_STALL
-                    // event each time the trace controller's cycle-driven
-                    // sampler fires while the core is held in stall (typically
-                    // every 1024 cycles, driven by a perf counter counting
-                    // ACTIVE_CORE -- which keeps incrementing during stall).
-                    // The initial event is emitted by the executor on entry to
-                    // WaitLock; this path covers the held-stall window.
-                    self.lock_stall_periodic += 1;
-                    if self.lock_stall_periodic >= LOCK_STALL_TRACE_PERIOD {
-                        let cycle = ctx.cycles;
-                        let pc = ctx.pc();
-                        ctx.timing_context_mut()
-                            .record_event(cycle, EventType::LockStall { cycles: 1, pc: Some(pc) });
-                        self.lock_stall_periodic = 0;
-                    }
                     Some(StepResult::WaitLock { raw_lock_id })
                 }
             }
@@ -828,7 +797,6 @@ where
     pub fn reset(&mut self) {
         self.status = CoreStatus::Ready;
         self.last_bundle = None;
-        self.lock_stall_periodic = 0;
     }
 }
 

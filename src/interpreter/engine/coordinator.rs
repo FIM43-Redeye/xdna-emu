@@ -863,7 +863,12 @@ impl InterpreterEngine {
                 if new_start < total {
                     let cycle = self.total_cycles;
                     for evt in event_log.since(new_start) {
-                        if let Some(hw_id) = crate::trace::core_event_to_hw_id(&evt.event) {
+                        // Level-edge events (e.g. LockStallLevel) route to the
+                        // trace unit's held-level path; everything else is a
+                        // one-cycle pulse via notify_event.
+                        if let Some((hw_id, active)) = crate::trace::core_level_edge(&evt.event) {
+                            tile.notify_core_trace_level(hw_id, cycle, active);
+                        } else if let Some(hw_id) = crate::trace::core_event_to_hw_id(&evt.event) {
                             let pc = crate::trace::event_pc(&evt.event);
                             tile.notify_core_trace_event(hw_id, cycle, pc);
                         }

@@ -816,9 +816,12 @@ impl CycleAccurateExecutor {
                 }
             }
             ExecuteResult::WaitLock { .. } => {
-                let pc = ctx.pc();
+                // Rising edge of the lock stall (held level). The matching
+                // falling edge is recorded in try_resume_stall when the lock
+                // becomes available. Replaces the former per-cycle pulse, which
+                // over-emitted LOCK_STALL ~375x vs HW.
                 ctx.timing_context_mut()
-                    .record_event(start_cycle, EventType::LockStall { cycles: 1, pc: Some(pc) });
+                    .record_event(start_cycle, EventType::LockStallLevel { active: true });
             }
             ExecuteResult::WaitStream { .. } => {
                 let pc = ctx.pc();

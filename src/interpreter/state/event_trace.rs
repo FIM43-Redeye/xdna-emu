@@ -58,9 +58,15 @@ pub enum EventType {
     /// Memory access stall.
     /// Maps to hardware MEMORY_STALL.
     MemoryStall { cycles: u8, pc: Option<u32> },
-    /// Lock acquire stall.
-    /// Maps to hardware LOCK_STALL.
+    /// Lock acquire stall (PULSE: one-cycle arbitration window).
+    /// Maps to hardware LOCK_STALL. Routed via `notify_event`.
     LockStall { cycles: u8, pc: Option<u32> },
+    /// Lock acquire stall (LEVEL edge): rising on stall entry, falling on
+    /// lock acquired. Maps to hardware LOCK_STALL but is routed via the trace
+    /// unit's held-level path (`set_event_level`) rather than `notify_event`,
+    /// so a held stall produces one B..E span of the real duration instead of
+    /// one pulse per cycle (the over-emission bug).
+    LockStallLevel { active: bool },
     /// Stream interface stall.
     /// Maps to hardware STREAM_STALL.
     StreamStall { cycles: u8, pc: Option<u32> },
