@@ -17,6 +17,7 @@ use super::vector_srs;
 use xdna_archspec::aie2::rounding::RoundingMode;
 use super::vector_ups;
 use super::vector_pack;
+use super::vector_float;
 use super::VectorAlu;
 use crate::interpreter::bundle::{ElementType, Operand, SlotIndex, SlotOp};
 use xdna_archspec::aie2::isa::SemanticOp;
@@ -35,6 +36,10 @@ struct GoldenData {
     // predates pack coverage, so SRS/UPS/elementwise tests still load.
     #[serde(default)]
     pack: Vec<PackCase>,
+
+    // BF16 conversion (f32 -> bf16 with rounding) lane cases.
+    #[serde(default)]
+    bf16_srs: Vec<Bf16SrsCase>,
 
     // Element-wise ops: dynamic keys like "vadd_Int32", "vsub_UInt8", etc.
     #[serde(flatten)]
@@ -80,6 +85,15 @@ struct PackCase {
     sat: bool,
     symsat: bool,
     expected: i64,
+}
+
+#[derive(Deserialize)]
+struct Bf16SrsCase {
+    /// fp32 input as raw bit pattern.
+    value: u32,
+    rnd: u8,
+    /// bf16 output as raw bit pattern.
+    expected: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +322,58 @@ fn validate_pack_golden() {
     }
     eprintln!("Pack: {pass}/{total} pass, {fail} fail");
     assert_eq!(fail, 0, "Pack validation: {fail}/{total} cases failed");
+}
+
+// ---------------------------------------------------------------------------
+// BF16 conversion (f32 -> bf16 with rounding) validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn validate_bf16_srs_golden() {
+    let golden = load_golden();
+    let total = golden.bf16_srs.len();
+    assert!(
+        total > 0,
+        "bf16_srs golden data missing -- regenerate tools/golden/vector_ops.json \
+         (VECTOR_ORACLE_MODEL=... python3 tools/gen_vector_golden.py)"
+    );
+
+    let mut pass = 0;
+    let mut fail = 0;
+    let mut first_failures = Vec::new();
+
+    for case in &golden.bf16_srs {
+        let mode = match RoundingMode::from_raw(case.rnd) {
+            Some(m) => m,
+            None => {
+                // Reserved rounding mode -- the oracle would not have emitted it.
+                pass += 1;
+                continue;
+            }
+        };
+
+        let actual = vector_float::f32_to_bf16(f32::from_bits(case.value), mode);
+
+        if actual == case.expected {
+            pass += 1;
+        } else {
+            fail += 1;
+            if first_failures.len() < 10 {
+                first_failures.push(format!(
+                    "BF16_SRS MISMATCH: value=0x{:08X}, rnd={}: expected=0x{:04X}, actual=0x{:04X}",
+                    case.value, case.rnd, case.expected, actual,
+                ));
+            }
+        }
+    }
+
+    if !first_failures.is_empty() {
+        for msg in &first_failures {
+            eprintln!("{}", msg);
+        }
+    }
+    eprintln!("BF16_SRS: {pass}/{total} pass, {fail} fail");
+    assert_eq!(fail, 0, "BF16 SRS validation: {fail}/{total} cases failed");
 }
 
 // ---------------------------------------------------------------------------

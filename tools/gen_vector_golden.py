@@ -409,6 +409,79 @@ def gen_pack_golden():
 
 
 # ---------------------------------------------------------------------------
+# BF16 conversion golden data (Tier 2c): f32 -> bf16 with rounding
+# ---------------------------------------------------------------------------
+
+# The Rust seam: vector_float::f32_to_bf16(f32::from_bits(value), mode) -> u16.
+# The genuine model: srs.srs_bf_lane(a_fp32_bits, rnd, flags) -> bf16 bits.
+# (srs_bf_lane uses sgn_mag=True rounding; flags out-param is ignored here --
+# we only compare the converted bf16 bit pattern.)
+
+
+def fp32_bits(sgn, exp, man):
+    return ((int(bool(sgn)) << 31) | ((exp & 0xFF) << 23) | (man & 0x7FFFFF)) & 0xFFFFFFFF
+
+
+def bf16_srs_input_patterns():
+    """fp32 bit patterns that stress the f32->bf16 rounding boundary.
+
+    Rounding reads mantissa bits: guard=bit15, sticky=bits14:0, lsb=bit16.
+    So the low 17 mantissa bits are what matter; sweep them against a spread
+    of exponents and both signs, plus inf/NaN/denorm edges.
+    """
+    pats = set()
+
+    # Mantissa patterns exercising guard/sticky/lsb and overflow-on-roundup.
+    mans = [
+        0x000000,            # exact (no discarded bits)
+        0x008000,            # halfway (guard only)
+        0x008001,            # past halfway (guard + sticky)
+        0x007FFF,            # just below halfway
+        0x010000,            # lsb=1, no guard
+        0x018000,            # lsb=1 + halfway (ties-to-even pivot)
+        0x004000, 0x004001,  # below halfway, with/without sticky
+        0x7F0000, 0x7F8000, 0x7F8001,
+        0x7FFFFF,            # all ones -- roundup overflows mantissa -> exp++
+        0x7F7FFF, 0x400000, 0x3F8000,
+    ]
+    exps = [0, 1, 64, 126, 127, 128, 200, 253, 254, 255]
+    for sgn in (0, 1):
+        for exp in exps:
+            for man in mans:
+                pats.add(fp32_bits(sgn, exp, man))
+
+    # Explicit NaN cases where truncation would drop NaN-ness (low-16-only man).
+    for sgn in (0, 1):
+        pats.add(fp32_bits(sgn, 255, 0x000001))   # NaN, man only in low bits
+        pats.add(fp32_bits(sgn, 255, 0x008000))   # NaN, guard bit
+        pats.add(fp32_bits(sgn, 255, 0x400000))   # NaN, top mantissa bit
+        pats.add(fp32_bits(sgn, 255, 0x000000))   # inf (exp=255, man=0)
+
+    # Random fp32 bit patterns (seeded).
+    for _ in range(200):
+        pats.add(rng.randint(0, (1 << 32) - 1))
+
+    return sorted(pats)
+
+
+def gen_bf16_srs_golden():
+    """Generate f32->bf16 conversion golden cases against the genuine model."""
+    cases = []
+    inputs = bf16_srs_input_patterns()
+    for a in inputs:
+        for rnd_mode in RND_MODES:
+            flags = [False] * 5
+            r = int(SRS.srs_bf_lane(a, rnd_mode, flags)) & 0xFFFF
+            cases.append({
+                "value": int(a),
+                "rnd": rnd_mode,
+                "expected": r,
+            })
+    print(f"  BF16-SRS: {len(cases)} cases ({len(inputs)} inputs x {len(RND_MODES)} modes)")
+    return cases
+
+
+# ---------------------------------------------------------------------------
 # Element-wise vector ops golden data (Tier 3)
 # ---------------------------------------------------------------------------
 
@@ -555,6 +628,7 @@ def main():
     golden["srs"] = gen_srs_golden()
     golden["ups"] = gen_ups_golden()
     golden["pack"] = gen_pack_golden()
+    golden["bf16_srs"] = gen_bf16_srs_golden()
     golden.update(gen_elementwise_golden())
 
     out_path = os.path.join(os.path.dirname(__file__), "golden", "vector_ops.json")
@@ -571,9 +645,11 @@ def main():
     print(f"  SRS:  {len(golden['srs']):>6} cases")
     print(f"  UPS:  {len(golden['ups']):>6} cases")
     print(f"  Pack: {len(golden['pack']):>6} cases")
+    print(f"  BF16: {len(golden['bf16_srs']):>6} cases")
     elem_total = sum(len(v) for k, v in golden.items() if k.startswith("v"))
     print(f"  Elem: {elem_total:>6} cases")
-    grand = len(golden['srs']) + len(golden['ups']) + len(golden['pack']) + elem_total
+    grand = (len(golden['srs']) + len(golden['ups']) + len(golden['pack'])
+             + len(golden['bf16_srs']) + elem_total)
     print(f"  Total:{grand:>6} cases")
 
 
