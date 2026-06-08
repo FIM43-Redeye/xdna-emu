@@ -2137,4 +2137,70 @@ mod tests {
             "MOVX_mvx_scl should get Copy semantic from mnemonic fallback"
         );
     }
+
+    /// Decode a real compiled `vsrs.s16.s64 wh0, cm5, s0` and confirm the
+    /// accumulator source (`cm5`) decodes to an AccumReg, not a ScalarReg.
+    ///
+    /// Regression for the Half-B SRS capture kernel: the first compiled SRS
+    /// instruction run through decode mis-bucketed the `cm` accumulator source
+    /// as `ScalarReg(41)`, so the SRS executor read zeros and then panicked
+    /// writing a wide result to an odd half-register base.
+    #[test]
+    fn test_vsrs_s16_s64_decodes_accum_source() {
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
+            return;
+        }
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
+
+        // vsrs.s16.s64 wh0, cm5, s0 -- from compiled vec_srs_i32 at PC 0x28e.
+        // Disasm: `28e: 99 d4 5c 08  vsrs.s16.s64 wh0, cm5, s0`.
+        let bytes: [u8; 4] = [0x99, 0xd4, 0x5c, 0x08];
+        let bundle = decoder.decode(&bytes, 0x28e).expect("Should decode vsrs");
+
+        eprintln!("=== vsrs.s16.s64 decoded slots ===");
+        for slot in bundle.active_slots() {
+            eprintln!(
+                "  semantic={:?} dest={:?} sources={:?} accum_width={:?} is_wide={} from_type={:?} elem={:?}",
+                slot.semantic,
+                slot.dest,
+                &slot.sources[..],
+                slot.accum_width,
+                slot.is_wide_vector,
+                slot.from_type,
+                slot.element_type,
+            );
+        }
+
+        // Dump the raw encoding operand fields to see the source operand's
+        // declared width/type.
+        let ext = decoder.extract_bundle_slots(&bytes);
+        for s in &ext.slots {
+            if s.bits == 0 {
+                continue;
+            }
+            if let Some(decoded) = decoder.decode_slot_bits(s.bits, s.slot_type) {
+                eprintln!("=== ENC {} ({}) ===", decoded.encoding.mnemonic, decoded.encoding.name);
+                for f in &decoded.encoding.operand_fields {
+                    let raw = decoded.operand(&f.name).unwrap_or(0);
+                    eprintln!(
+                        "   field {}: raw={} (0x{:X}) width={} type={:?}",
+                        f.name, raw, raw, f.width, f.operand_type
+                    );
+                }
+            }
+        }
+
+        let srs_slot = bundle
+            .active_slots()
+            .find(|s| matches!(s.semantic, Some(SemanticOp::Srs)))
+            .expect("vsrs must produce an Srs semantic slot");
+        assert!(
+            srs_slot.sources.iter().any(|o| matches!(o, Operand::AccumReg(_))),
+            "vsrs source (cm5) must decode to AccumReg, got sources={:?}",
+            &srs_slot.sources[..]
+        );
+    }
 }

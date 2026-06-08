@@ -293,8 +293,7 @@ impl VectorAlu {
             matches!(op.accum_width, Some(crate::interpreter::decode::register_map::AccumWidth::Half));
 
         if !is_half {
-            // Wide SRS: read Acc1024 (cm-register), SRS each half,
-            // write Vec512.
+            // Read Acc1024 (cm-register = 16 lanes), SRS each 8-lane half.
             let acc_wide = ctx.accumulator.read_wide(acc_reg);
             let acc_lo: [u64; 8] = acc_wide[..8].try_into().unwrap();
             let acc_hi: [u64; 8] = acc_wide[8..].try_into().unwrap();
@@ -314,7 +313,19 @@ impl VectorAlu {
             let n = words_per_half.min(8);
             result[..n].copy_from_slice(&result_lo[..n]);
             result[n..n + n].copy_from_slice(&result_hi[..n]);
-            Self::write_wide_vec_dest(op, ctx, result);
+
+            // A wide accumulator SOURCE (1024-bit cm) does NOT imply a wide
+            // vector DEST. SRS reduces each acc lane to one output element, so
+            // a full 16-lane cm yields 16 outputs: with int16 that is 256 bits
+            // = a single 256-bit `mWa` w-register (`vsrs.s16.s64`); only int32
+            // output (512 bits) needs the x-register pair. `is_wide_vector`
+            // carries the decoder's dest-class width -- write wide only then.
+            if op.is_wide_vector {
+                Self::write_wide_vec_dest(op, ctx, result);
+            } else {
+                let narrow: [u32; 8] = result[..8].try_into().unwrap();
+                Self::write_vector_dest(op, ctx, narrow);
+            }
         } else {
             // Half SRS (bml/bmh): read single 512-bit accum register,
             // SRS 8 lanes, write to 256-bit w-register.
@@ -1236,6 +1247,53 @@ mod integration_tests {
         assert_eq!(v4, [10, 20, 30, 40, 50, 60, 70, 80]);
         let v5 = ctx.vector.read(5);
         assert_eq!(v5, [90, 100, 110, 120, 130, 140, 150, 160]);
+    }
+
+    /// `vsrs.s16.s64 wh0, cm5, s0`: a full 1024-bit `cm` source (16 acc64
+    /// lanes) reduced to int16 yields 16 outputs = 256 bits = a SINGLE 256-bit
+    /// `mWa` destination, not a 512-bit x-register pair. The accumulator source
+    /// being wide must not force a wide vector write. Regression for the Half-B
+    /// SRS capture kernel, which panicked here (`write_wide` to odd base 1).
+    #[test]
+    fn test_srs_full_cm_to_d16_narrow_dest() {
+        use crate::interpreter::decode::register_map::AccumWidth;
+
+        let mut ctx = make_ctx();
+        // cm = {bml (AccumReg 0), bmh (AccumReg 1)} = 16 lanes.
+        ctx.accumulator.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
+        ctx.accumulator.write(1, [9, 10, 11, 12, 13, 14, 15, 16]);
+
+        // Mirror the decoder output: Srs, Int16, dest wh0 = VectorReg(1) (odd
+        // half-register), source cm = AccumReg(0) Full, shift s0, from Int64,
+        // is_wide_vector = false (the dest is a single 256-bit w-register).
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
+            .as_vector(ElementType::Int16)
+            .with_dest(Operand::VectorReg(1))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::ScalarReg(40));
+        op.from_type = Some(ElementType::Int64);
+        op.accum_width = Some(AccumWidth::Full);
+        op.is_wide_vector = false;
+
+        ctx.srs_config.rounding_mode = 0;
+        ctx.srs_config.saturation_mode = 0;
+        ctx.srs_config.srs_sign = true;
+
+        VectorAlu::execute(&op, &mut ctx);
+
+        // 16 int16 [1..=16] packed 2-per-u32 into the single dest register.
+        let v1 = ctx.vector.read(1);
+        let expected: [u32; 8] = [
+            1 | (2 << 16),
+            3 | (4 << 16),
+            5 | (6 << 16),
+            7 | (8 << 16),
+            9 | (10 << 16),
+            11 | (12 << 16),
+            13 | (14 << 16),
+            15 | (16 << 16),
+        ];
+        assert_eq!(v1, expected, "full-cm s16.s64 must write 256 bits to VectorReg(1)");
     }
 
     #[test]
