@@ -526,6 +526,22 @@ impl SlotOp {
         matches!(self.semantic, Some(SemanticOp::Load | SemanticOp::Store))
     }
 
+    /// Whether this op addresses memory through one of its source operands.
+    ///
+    /// True for a pre-scaled `Memory{}` operand (offset addressing, `[p0, #imm]`)
+    /// OR a `PointerReg` base (register-indirect: post-increment `[p0], #imm`
+    /// and indexed `[p0, m1]`). This is the discriminator between fused
+    /// compute-load/store variants (vlda.ups/vst.srs/...), which carry a memory
+    /// address and must route to the MemoryUnit, and the standalone register
+    /// forms (vups/vsrs reg->reg), which carry none and stay in the VectorAlu.
+    /// Matching only `Memory{}` silently misrouted the post-increment forms.
+    #[inline]
+    pub fn addresses_memory(&self) -> bool {
+        self.sources
+            .iter()
+            .any(|s| matches!(s, Operand::Memory { .. } | Operand::PointerReg(_)))
+    }
+
     /// Check if this slot operation is a synchronization operation.
     #[inline]
     pub fn is_sync(&self) -> bool {

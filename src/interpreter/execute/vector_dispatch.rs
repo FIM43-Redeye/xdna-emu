@@ -3,7 +3,7 @@
 //! Single entry point that routes SemanticOp variants to operation
 //! implementations. Each match arm is a single function call.
 
-use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
+use crate::interpreter::bundle::{ElementType, SlotOp};
 use crate::interpreter::state::ExecutionContext;
 use xdna_archspec::aie2::isa::SemanticOp;
 
@@ -25,9 +25,13 @@ impl VectorAlu {
             return false;
         }
 
-        // Skip fused ops that have memory operands -- MemoryUnit handles these.
-        // Standalone SRS/Pack/UPS on memory slots with NO memory operand are
-        // register-only and must be handled here.
+        // Skip fused ops that address memory -- MemoryUnit handles these.
+        // Standalone SRS/Pack/UPS on memory slots with NO memory address are
+        // register-only and must be handled here. `addresses_memory()` covers
+        // both offset (Memory{}) and register-indirect (PointerReg, i.e.
+        // post-increment / indexed) addressing -- matching only Memory{} let
+        // post-increment fused loads fall through to the register path here,
+        // before MemoryUnit ever saw them (the vec_srs_i32 bug).
         if op.slot.is_memory()
             && matches!(
                 semantic,
@@ -37,7 +41,7 @@ impl VectorAlu {
                     | SemanticOp::Unpack
                     | SemanticOp::Convert
             )
-            && op.sources.iter().any(|s| matches!(s, Operand::Memory { .. }))
+            && op.addresses_memory()
         {
             return false;
         }

@@ -756,7 +756,9 @@ impl MemoryUnit {
     /// Check if the op has a memory address operand (Memory { base, offset }).
     /// Fused instructions have this; standalone SRS/Pack/UPS on memory slots don't.
     fn has_memory_operand(op: &SlotOp) -> bool {
-        op.sources.iter().any(|s| matches!(s, Operand::Memory { .. }))
+        // Shared with the VectorAlu skip gate: covers both offset (Memory{}) and
+        // register-indirect (PointerReg: post-increment / indexed) addressing.
+        op.addresses_memory()
     }
 
     /// Check if the op is on a load slot (LoadA or LoadB).
@@ -1288,9 +1290,30 @@ impl MemoryUnit {
             }
         }
 
-        // Handle indexed addressing: find first PointerReg as base
+        // Register-indirect addressing. The base is a PointerReg; locate it by
+        // SEARCH rather than position, because fused compute-loads/stores
+        // (vlda.ups/vst.srs/...) carry the shift ScalarReg *before* the pointer
+        // (sources = [shift, p0, ...]). Any operand following the pointer is the
+        // offset/index (ModifierReg for indexed, ScalarReg/Immediate otherwise);
+        // a post-increment carries no offset operand (the step lives in
+        // post_modify and is applied separately).
+        if let Some(ptr_idx) = op.sources.iter().position(|s| matches!(s, Operand::PointerReg(_))) {
+            let base_addr = match &op.sources[ptr_idx] {
+                Operand::PointerReg(r) => ctx.pointer_read(*r),
+                _ => unreachable!(),
+            };
+            let offset = op.sources.get(ptr_idx + 1).map_or(0, |src| match src {
+                Operand::Immediate(v) => (*v as i32 * 4) as u32, // Scale by word size
+                Operand::ScalarReg(r) => ctx.scalar_read(*r).wrapping_mul(4),
+                // Modifier registers contain byte offsets (set via mov dj0/m0, rN)
+                Operand::ModifierReg(r) => ctx.modifier_read(*r),
+                _ => 0, // post-increment / no offset operand
+            });
+            return base_addr.wrapping_add(offset);
+        }
+
+        // No pointer: legacy positional fallback (immediate/scalar base).
         let base_addr = op.sources.first().map_or(0, |src| match src {
-            Operand::PointerReg(r) => ctx.pointer_read(*r),
             Operand::ScalarReg(r) => ctx.scalar_read(*r),
             Operand::Immediate(v) => *v as u32,
             other => {
@@ -1302,7 +1325,6 @@ impl MemoryUnit {
         let offset = op.sources.get(1).map_or(0, |src| match src {
             Operand::Immediate(v) => (*v as i32 * 4) as u32, // Scale by word size
             Operand::ScalarReg(r) => ctx.scalar_read(*r).wrapping_mul(4),
-            // Modifier registers contain byte offsets (set via mov dj0/m0, rN)
             Operand::ModifierReg(r) => ctx.modifier_read(*r),
             other => {
                 log::warn!("[MEMORY] get_address: unexpected offset operand {:?}, defaulting to 0", other);
@@ -3173,6 +3195,64 @@ mod tests {
         // s0=0 round-trip should produce identity
         let output: Vec<u8> = (0..32).map(|i| tile.data_memory()[0x200 + i]).collect();
         assert_eq!(&output[..], &input_data[..], "UPS->SRS with s0=0 (hw init) should round-trip correctly");
+    }
+
+    /// Fused `vlda.ups` with POST-INCREMENT addressing (`[p0], #32`) must route
+    /// to the fused-load path: load from memory into the accumulator AND advance
+    /// the pointer. Regression for the Half-B SRS kernel -- post-increment fused
+    /// loads decode as PointerReg + post_modify with NO `Memory{}` operand, and
+    /// `has_memory_operand` previously matched only `Memory{}`, so they fell
+    /// through to the standalone register-UPS path: no memory load, no pointer
+    /// advance, garbage accumulator (the real `vec_srs_i32` failure).
+    #[test]
+    fn test_fused_ups_post_increment_loads_and_advances_pointer() {
+        use crate::interpreter::decode::register_map::AccumWidth;
+
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // 8 int32 at local 0x100.
+        let vals: [i32; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
+        for (i, &v) in vals.iter().enumerate() {
+            let b = (v as u32).to_le_bytes();
+            for k in 0..4 {
+                tile.data_memory_mut()[0x100 + i * 4 + k] = b[k];
+            }
+        }
+        ctx.pointer.write(0, 0x70100); // p0 -> input
+        ctx.scalar.write(41, 0); // s1 (UPS shift) = 0
+
+        // vlda.ups.s64.s32 bml0, s1, [p0], #32  (post-increment, no Memory{} operand)
+        let mut ups = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Ups)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::ScalarReg(41))
+            .with_source(Operand::PointerReg(0));
+        ups.from_type = Some(ElementType::Int32);
+        ups.element_type = Some(ElementType::Int64);
+        ups.accum_width = Some(AccumWidth::Half);
+        ups.mem_width = MemWidth::Vector256;
+        ups.is_vector = true;
+        ups.post_modify = PostModify::Immediate(32);
+
+        // The upstream dispatch runs VectorAlu BEFORE MemoryUnit. VectorAlu must
+        // DEFER (return false) on a memory-addressing fused UPS so MemoryUnit
+        // handles it; otherwise it consumes the op as a register-UPS (reading a
+        // register as data, never touching memory) -- the real dispatch bug.
+        assert!(
+            !super::super::VectorAlu::execute(&ups, &mut ctx),
+            "VectorAlu must skip a fused (memory-addressing) post-increment UPS"
+        );
+
+        let handled = MemoryUnit::execute(&ups, &mut ctx, &mut tile, None, None);
+        assert!(handled, "post-increment vlda.ups must be handled by the fused-load path");
+
+        // Accumulator holds the loaded int32 values (widened to acc64), not zeros.
+        let acc = ctx.accumulator.read(0);
+        assert_eq!(acc[0], 10, "bml0 lane0 must be the loaded value, not garbage");
+        assert_eq!(acc[7], 80, "bml0 lane7 must be the loaded value");
+
+        // p0 post-incremented by 32 bytes.
+        assert_eq!(ctx.pointer.read(0), 0x70120, "p0 must post-increment by 32 bytes");
     }
 
     // --- Cross-tile load pipeline hazard regression test ---

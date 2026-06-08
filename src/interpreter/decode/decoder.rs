@@ -1178,6 +1178,55 @@ mod tests {
         assert_eq!(scalar1.dest, Some(Operand::ScalarReg(20)), "mov destination should be r20");
     }
 
+    /// Decode regression for the Half-B SRS capture kernel's two key
+    /// instructions (`vec_srs_i32`, real bytes from llvm-objdump):
+    ///   - `st q0, [p1], #0x10`  -> 128-bit QuadWord store, q-mask source.
+    ///   - `vlda.ups.s64.s32 bml5, s1, [p0], #0x20` -> fused UPS load with
+    ///     POST-INCREMENT addressing (PointerReg base + post_modify, no
+    ///     Memory{} operand). The post-increment form is what the dispatch
+    ///     must recognize as a memory op; offset addressing was the only form
+    ///     previously exercised.
+    #[test]
+    fn test_srs_kernel_q_store_and_postinc_ups_decode() {
+        use crate::interpreter::bundle::{MemWidth, PostModify};
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping: llvm-aie not found");
+            return;
+        }
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
+
+        // PC 0x2c0: `99 8a 03 09  st q0, [p1], #0x10`.
+        let st_bundle = decoder.decode(&[0x99, 0x8a, 0x03, 0x09], 0x2c0).expect("decode st q");
+        let st = st_bundle.slot(SlotIndex::Store).expect("Store slot");
+        assert_eq!(st.semantic, Some(SemanticOp::Store));
+        assert_eq!(st.mem_width, MemWidth::QuadWord, "st q is a 128-bit store");
+        assert_eq!(st.sources[0], Operand::ControlReg(16), "data source is q0 (mask range)");
+        assert_eq!(st.post_modify, PostModify::Immediate(16), "post-increment 16 bytes");
+
+        // PC 0x250: `vlda.ups.s64.s32 bml5, s1, [p0], #0x20` (LoadA slot).
+        let ups_bundle = decoder
+            .decode(&[0xbb, 0xc8, 0x03, 0x48, 0x0a, 0x80, 0x01, 0xa0, 0xba, 0x02], 0x250)
+            .expect("decode vlda.ups");
+        let ups = ups_bundle.slot(SlotIndex::LoadA).expect("LoadA slot");
+        assert_eq!(ups.semantic, Some(SemanticOp::Ups));
+        assert_eq!(ups.dest, Some(Operand::AccumReg(10)), "bml5 -> AccumReg(10)");
+        assert_eq!(ups.from_type, Some(ElementType::Int32));
+        assert_eq!(ups.element_type, Some(ElementType::Int64));
+        assert_eq!(ups.post_modify, PostModify::Immediate(32), "post-increment 32 bytes");
+        // The address comes via a PointerReg (post-increment), NOT a Memory{}
+        // operand -- the case the fused-load dispatch must still recognize.
+        assert!(
+            ups.sources.iter().any(|s| matches!(s, Operand::PointerReg(_))),
+            "post-increment addressing carries a PointerReg, not Memory{{}}"
+        );
+        assert!(
+            !ups.sources.iter().any(|s| matches!(s, Operand::Memory { .. })),
+            "post-increment form has no Memory{{}} operand"
+        );
+    }
+
     /// Helper: create a minimal vector encoding with the given mnemonic.
     fn make_vec_encoding(mnemonic: &str) -> InstrEncoding {
         use xdna_archspec::aie2::isa::{AddressingMode, InstrMemWidth};
