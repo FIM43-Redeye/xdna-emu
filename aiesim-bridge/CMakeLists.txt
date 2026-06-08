@@ -59,6 +59,7 @@ add_library(xdna_aiesim_bridge SHARED
   src/c_abi.cpp
   src/sc_bootstrap.cpp
   src/aiesim_top.cpp
+  src/bcast_bridge.cpp
   src/cluster_clone_patch.cpp
   src/ps_bridge.cpp
   src/ddr_target.cpp

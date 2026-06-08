@@ -227,6 +227,10 @@ extern "C" int sc_main(int /*argc*/, char* /*argv*/[]) {
     // ms_noc_axis port; see aiesim_top::spawn_egress_drains.
     top->spawn_egress_drains();
 
+    // Bridge shim->memtile broadcast (trace-start) if enabled. Spawns one
+    // clock-posedge mirror method; no-op unless XDNA_AIESIM_BCAST_BRIDGE is set.
+    top->spawn_bcast_bridge();
+
     // Optional NPU1-native VCD dump for three-way timing calibration. When
     // XDNA_AIESIM_VCD is set, register the cluster's signals BEFORE the first
     // sc_start (trace registration must precede time advance; the model's

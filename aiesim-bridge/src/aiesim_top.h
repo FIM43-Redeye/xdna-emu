@@ -39,6 +39,12 @@ public:
     // context where sc_spawn is legal), after the cluster is constructed.
     void spawn_egress_drains();
 
+    // Spawn the shim->memtile event-broadcast mirror (one clock-posedge method;
+    // no-op unless XDNA_AIESIM_BCAST_BRIDGE is set and lanes resolved). Lets
+    // trace-start broadcast-15 cross from the shim's SystemC world into the array's
+    // MSM world. Call from sc_main alongside spawn_egress_drains (sim context).
+    void spawn_bcast_bridge();
+
     // Request an NPU1-native VCD timing dump from the MSM cluster model. Yields a
     // waveform in NPU1 5x6 geometry -- same as the trace BO / HW side, so no
     // vc2802 row remap -- driving the three-way timing calibration's aiesim leg

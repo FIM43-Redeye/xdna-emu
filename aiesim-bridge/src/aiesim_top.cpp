@@ -10,6 +10,7 @@
 #include <utils/xtlm_aximm_initiator_stub.h>
 
 #include "math_engine_base.h"  // the closed cluster ABI (aietools, build-time ref)
+#include "bcast_bridge.h"
 #include "cluster_clone_patch.h"
 #include "ddr_target.h"
 #include "ps_bridge.h"
@@ -56,6 +57,13 @@ aiesim_top::aiesim_top(sc_core::sc_module_name name, const char* arch, const cha
     // first sc_start (send_response only fires during simulation). Fail-safe + arch-
     // gated + default-on; announces on stderr. LOCAL-ONLY runtime patch.
     aiesim::install_clone_patch(cluster_lib_, arch_s.c_str());
+
+    // Bridge the shim->memtile event-broadcast network so trace-start (broadcast-15
+    // from the shim) reaches the array. Must run before create_math_engine so the
+    // GOT-interpose catches the memtile EventBroadcast ctors during elaboration.
+    // Gated (XDNA_AIESIM_BCAST_BRIDGE), arch-gated, fail-safe. LOCAL-ONLY. See
+    // bcast_bridge.h.
+    aiesim::install_bcast_bridge(cluster_lib_, arch_s.c_str());
 
     dlerror();  // clear
     auto factory = reinterpret_cast<create_math_engine_fn>(
@@ -318,6 +326,8 @@ void aiesim_top::spawn_egress_drains() {
     }
 }
 
+void aiesim_top::spawn_bcast_bridge() { aiesim::bcast_bridge_spawn(clock_); }
+
 // The MSM cluster model carries its OWN VCD writer (libmsm_cpp.so), distinct from
 // SystemC's sc_trace_file. MathEngineBase::add_sc_traces(sc_trace_file*) actually
 // reinterprets that pointer as a msm_trace::vcd_trace_file_writer* and calls
@@ -337,6 +347,11 @@ void aiesim_top::request_vcd_trace(const char* path) {
 }
 
 void aiesim_top::end_of_elaboration() {
+    // Resolve the broadcast-bridge lanes now that descriptors are wired and the
+    // shim's SystemC ports are bound (no-op unless the bridge is enabled). The
+    // driver itself is spawned later from sc_main (sim context).
+    aiesim::bcast_bridge_resolve();
+
     if (vcd_path_.empty()) return;
     // By now the cluster has bound its internal ports (shim_reset_n etc.), so
     // add_sc_traces' get_interface() walk succeeds. msm_trace::msm_create_vcd_trace_file
