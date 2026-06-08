@@ -165,7 +165,18 @@ pub struct TraceUnit {
     pending_cycle: u64,
     /// Bitmask of slots whose events have fired during `pending_cycle`.
     /// Flushed by `commit_cycle()` or lazily on next-cycle event arrival.
+    /// These are PULSE (one-cycle) events; the bit lives only for the frame
+    /// of `pending_cycle`.
     pub(super) pending_slot_mask: u8,
+    /// Bitmask of LEVEL-event slots currently asserted. Unlike
+    /// `pending_slot_mask`, these persist across cycles until explicitly
+    /// deasserted via `set_event_level`. The emitted frame mask is
+    /// `held_mask | pending_slot_mask` (the full asserted snapshot), so a
+    /// held level appears in every frame between its assert and deassert.
+    /// No per-cycle re-emission occurs during a hold: `commit_cycle`
+    /// early-returns when no pulse fired, and `set_event_level` only commits
+    /// on an actual assert/deassert edge.
+    pub(super) held_mask: u8,
     /// PC value associated with the most recent event in `pending_cycle`
     /// (mode 1 only). Mode 0 ignores this field entirely.
     pending_pc: u32,
@@ -244,6 +255,7 @@ impl TraceUnit {
             last_event_cycle: 0,
             pending_cycle: 0,
             pending_slot_mask: 0,
+            held_mask: 0,
             pending_pc: 0,
             pc_truncate_warnings: 0,
             no_pc_warnings: 0,
@@ -635,6 +647,64 @@ impl TraceUnit {
         }
     }
 
+    /// Assert (`active=true`) or deassert (`active=false`) a LEVEL trace event.
+    ///
+    /// Unlike `notify_event` (a one-cycle pulse), a level's slot bit persists
+    /// in `held_mask` across cycles until deasserted, so the asserted snapshot
+    /// (`held_mask | pending_slot_mask`) includes it in every frame between
+    /// assert and deassert -- the mode-0 decoder then renders one B..E span of
+    /// the real duration instead of one span per cycle.
+    ///
+    /// A frame is committed at the rising edge (assert). The falling edge is
+    /// carried by the next frame whose mask drops the bit -- typically the
+    /// event that ends the condition (e.g. the lock acquire that ends a stall),
+    /// which fires in the same cycle as the deassert. This matches how real HW
+    /// closes a level span (it emits no synthetic empty frame). If a level
+    /// deasserts with nothing else asserted and no coincident event, the span
+    /// closes at the next frame / end-of-segment -- acceptable, and the same
+    /// behavior HW exhibits.
+    ///
+    /// Callers classify level vs pulse via the archspec `is_level_event`
+    /// authority and route accordingly (levels here, pulses to `notify_event`).
+    pub fn set_event_level(&mut self, hw_event_id: u8, cycle: u64, active: bool) {
+        if !self.configured {
+            return;
+        }
+        // Mirror notify_event's deferred-start promotion so a level asserted
+        // as the first post-start event isn't dropped.
+        if let Some(arm_cycle) = self.armed_start_cycle {
+            if self.state == TraceState::Idle && cycle > arm_cycle {
+                self.activate_armed_start(cycle);
+            }
+        }
+        if self.state != TraceState::Running {
+            return;
+        }
+        let slot = match self.event_slots.iter().position(|&s| s == hw_event_id) {
+            Some(idx) => idx as u8,
+            None => return, // Event not in any slot
+        };
+        let bit = 1u8 << slot;
+        let new_held = if active {
+            self.held_mask | bit
+        } else {
+            self.held_mask & !bit
+        };
+        if new_held == self.held_mask {
+            return; // No edge -- already in the requested state.
+        }
+        // Flush any pending pulse accumulated for an *earlier* cycle first, so
+        // its frame keeps the pre-transition snapshot. A pulse in the *same*
+        // cycle (e.g. the acquire that ends a stall) is intentionally folded
+        // into this transition's frame.
+        if cycle != self.pending_cycle && self.pending_slot_mask != 0 {
+            self.commit_pending_frame();
+        }
+        self.held_mask = new_held;
+        self.pending_cycle = cycle;
+        self.commit_pending_frame();
+    }
+
     /// Mode-2 only: record the disposition of one conditional branch.
     /// `taken=true` queues an E_atom; `taken=false` queues an N_atom.
     ///
@@ -843,26 +913,41 @@ impl TraceUnit {
     ///
     /// This matches AM020/AM025 behavior and the mode1.py decoder.
     fn commit_pending_frame(&mut self) {
-        let mask = self.pending_slot_mask;
-        // Mode-2 doesn't gate on the slot mask; the drain handles its
-        // own queues. Other modes early-return when no slot fired.
-        if mask == 0 && !matches!(self.mode, TraceMode::Execution) {
-            return;
-        }
+        // The frame carries the full asserted snapshot: held levels OR'd with
+        // this cycle's pulses. Pulses are consumed (cleared) after; held bits
+        // persist in `held_mask` until deasserted.
+        let active = self.held_mask | self.pending_slot_mask;
         self.pending_slot_mask = 0;
 
         match self.mode {
             TraceMode::EventTime => {
+                // Snapshot-diff model (tools/trace_decoder/decode.py
+                // rebuild_perfetto_mode0): each frame carries the full
+                // asserted set; the decoder pairs B/E by diffing consecutive
+                // frames. A held level appears in `active` every time a frame
+                // is emitted, and closes when a later frame drops its bit.
+                // No frame is emitted when nothing is asserted. Per-cycle
+                // re-emission during a hold is avoided upstream: commit_cycle
+                // early-returns when no pulse fired, so a pure held stall
+                // produces only its rising-edge frame here.
+                if active == 0 {
+                    return;
+                }
                 let delta = self.pending_cycle.saturating_sub(self.last_event_cycle);
                 self.last_event_cycle = self.pending_cycle;
-                if mask.count_ones() == 1 {
-                    let slot = mask.trailing_zeros() as u8;
+                if active.count_ones() == 1 {
+                    let slot = active.trailing_zeros() as u8;
                     self.encode_single(slot, delta);
                 } else {
-                    self.encode_multiple(mask, delta);
+                    self.encode_multiple(active, delta);
                 }
             }
             TraceMode::EventPc => {
+                // EventPc carries a PC per frame; include held levels in the
+                // mask so they are not dropped mid-span.
+                if active == 0 {
+                    return;
+                }
                 let pc_full = self.pending_pc;
                 let pc14 = (pc_full & 0x3FFF) as u16;
                 if pc_full > 0x3FFF && self.pc_truncate_warnings < 4 {
@@ -875,7 +960,7 @@ impl TraceUnit {
                     );
                     self.pc_truncate_warnings += 1;
                 }
-                self.encode_event_pc(mask, pc14);
+                self.encode_event_pc(active, pc14);
             }
             TraceMode::Execution => {
                 // Mode-2 doesn't use the slot-based mask. Atoms are

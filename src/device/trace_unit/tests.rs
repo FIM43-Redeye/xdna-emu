@@ -130,6 +130,71 @@ fn test_single0_encoding() {
     assert_eq!(tu.byte_buffer[start_len], 0x05);
 }
 
+/// A held LEVEL event must produce ONE rising-edge frame, no per-cycle frames
+/// during the hold, and a falling-edge frame carried by the closing event --
+/// not the old one-frame-per-cycle (the LOCK_STALL over-emission bug).
+#[test]
+fn held_level_emits_one_span_not_per_cycle() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24)); // mode0, start 28, stop 29
+                                                          // slot0=37 (pulse), slot1=38, slot2=39, slot3=26 (LOCK_STALL, a level event)
+    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24));
+    tu.notify_event(28, 0, None); // arm start + emit Start marker
+    let start_len = tu.byte_buffer.len();
+
+    // Rising edge: assert LOCK_STALL (level) at cycle 10.
+    tu.set_event_level(26, 10, true);
+    let after_assert = tu.byte_buffer.len();
+    assert!(after_assert > start_len, "level assert must emit a rising-edge frame");
+
+    // Hold ~1000 cycles. The coordinator calls commit_cycle every cycle; a
+    // held level must emit NO per-cycle frames.
+    for c in 11..=1009 {
+        tu.commit_cycle(c);
+    }
+    assert_eq!(
+        tu.byte_buffer.len(),
+        after_assert,
+        "held level must emit no per-cycle frames during the hold"
+    );
+
+    // Falling edge: deassert at 1010 with a coincident closing pulse (slot0),
+    // mirroring stall -> acquire. The pulse carries the reduced snapshot so the
+    // decoder closes the LOCK_STALL span at 1010.
+    tu.notify_event(37, 1010, None);
+    tu.set_event_level(26, 1010, false);
+    tu.commit_cycle(1010);
+    let after_close = tu.byte_buffer.len();
+    assert!(after_close > after_assert, "level deassert + close must emit a falling-edge frame");
+    assert_eq!(tu.held_mask, 0, "level must be deasserted");
+
+    // The whole held span cost a handful of bytes (rising + falling frames),
+    // NOT ~1000 (one per held cycle, the old bug).
+    assert!(
+        after_close - start_len < 12,
+        "held span must be ~2 frames, got {} bytes",
+        after_close - start_len
+    );
+}
+
+/// With no levels asserted (`held_mask == 0`) the held-level mechanism is
+/// inert: pulse-event encoding is byte-identical to the pre-held-mask encoder.
+#[test]
+fn pulse_events_byte_identical_with_no_held_levels() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37 | (38 << 8)); // slot0=37, slot1=38
+    tu.notify_event(28, 0, None);
+    let start_len = tu.byte_buffer.len();
+
+    notify_commit(&mut tu, 37, 5); // slot0, delta 5 -> Single0 0x05
+    notify_commit(&mut tu, 38, 9); // slot1, delta 4 -> Single0 (1<<4)|4 = 0x14
+    assert_eq!(tu.byte_buffer.len(), start_len + 2);
+    assert_eq!(tu.byte_buffer[start_len], 0x05);
+    assert_eq!(tu.byte_buffer[start_len + 1], 0x14);
+    assert_eq!(tu.held_mask, 0, "no levels asserted");
+}
+
 #[test]
 fn test_single1_encoding() {
     let mut tu = TraceUnit::new(0, 2);
