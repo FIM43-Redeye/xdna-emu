@@ -17,7 +17,7 @@
 use crate::interpreter::bundle::SlotOp;
 use xdna_archspec::aie2::isa::SemanticOp;
 use xdna_archspec::aie2::isa::decoder_ffi;
-use xdna_archspec::aie2::{instruction_latency, timing};
+use xdna_archspec::aie2::{Bypass, instruction_latency, timing};
 
 /// Timing information for a single operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +157,13 @@ pub const LATENCY_VECTOR_MUL: u8 = instruction_latency::VECTOR_MUL;
 /// Sourced from `xdna_archspec::aie2::instruction_latency::VECTOR_MAC`.
 pub const LATENCY_VECTOR_MAC: u8 = instruction_latency::VECTOR_MAC;
 
+/// Float (bf16/fp32) vector MAC/MUL: 6 cycles.
+/// (TableGen II_VMACf / II_VMULf operand_cycles[0] = 6 -- one cycle longer
+/// than the integer MAC for the float normalization stage.)
+///
+/// Sourced from `xdna_archspec::aie2::instruction_latency::VECTOR_MAC_F`.
+pub const LATENCY_VECTOR_MAC_F: u8 = instruction_latency::VECTOR_MAC_F;
+
 /// Vector shuffle/permute: 2 cycles.
 ///
 /// Sourced from `xdna_archspec::aie2::instruction_latency::VECTOR_SHUFFLE`.
@@ -206,14 +213,35 @@ pub struct LatencyTable {
     /// Per-opcode latency from LLVM's itinerary model.
     /// Indexed by LLVM opcode ID; None if the opcode has no itinerary data.
     llvm_latencies: Vec<Option<u8>>,
+    /// Per-opcode result-operand forwarding id (itinerary `Forwardings[0]`).
+    /// Indexed by LLVM opcode ID; 0 = NoBypass. Used by the vector-register
+    /// bypass-visibility model to decide whether a result forwards to ALU
+    /// consumers at issue+1 (see [`Self::def_bypass`]).
+    llvm_def_bypass: Vec<u16>,
 }
 
 impl LatencyTable {
     /// Create the AIE2 latency table, populated with LLVM itinerary data.
     pub fn aie2() -> Self {
         let infos = decoder_ffi::query_all_instr_info();
-        let llvm_latencies = infos.into_iter().map(|info| info.latency).collect();
-        Self { llvm_latencies }
+        let llvm_latencies = infos.iter().map(|info| info.latency).collect();
+        let llvm_def_bypass = infos.iter().map(|info| info.def_bypass).collect();
+        Self { llvm_latencies, llvm_def_bypass }
+    }
+
+    /// Result bypass class of an opcode, for the vector-register visibility
+    /// model. Maps the raw itinerary forwarding id: 0 -> `No`; nonzero -> `Mov`.
+    ///
+    /// The nonzero->`Mov` mapping is exact for vector-*register* results (the
+    /// only caller): such results carry `MOV_Bypass` or `NoBypass`, never
+    /// `VEC_Bypass` (which is accumulator-domain). When the accumulator file
+    /// joins this model, the `Vec` case must be distinguished here -- see the
+    /// FIXME at `ExecutionContext::queue_matmul_accum_write`.
+    pub fn def_bypass(&self, llvm_opcode: u32) -> Bypass {
+        match self.llvm_def_bypass.get(llvm_opcode as usize) {
+            Some(0) | None => Bypass::No,
+            Some(_) => Bypass::Mov,
+        }
     }
 
     /// Map a SemanticOp + vector flag directly to its timing.
@@ -490,7 +518,7 @@ impl Default for LatencyTable {
     fn default() -> Self {
         // Default creates an empty table (no LLVM data) -- uses SemanticOp fallback only.
         // Production code should use aie2() or validated_aie2() for full LLVM latencies.
-        Self { llvm_latencies: Vec::new() }
+        Self { llvm_latencies: Vec::new(), llvm_def_bypass: Vec::new() }
     }
 }
 

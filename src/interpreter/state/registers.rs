@@ -16,6 +16,8 @@
 
 use std::fmt;
 
+pub use xdna_archspec::aie2::Bypass;
+
 /// 512-bit vector data: two consecutive 256-bit w-registers.
 pub type Vec512 = [u32; 16];
 
@@ -336,16 +338,38 @@ impl fmt::Debug for ModifierRegisterFile {
 ///
 /// 32 × 256-bit SIMD registers (v0-v31).
 /// Each register holds 8 × 32-bit, 16 × 16-bit, or 32 × 8-bit elements.
+/// An in-flight vector-register write awaiting bypass-network visibility.
+///
+/// Vector results become visible to a consumer at `issue_bundle + l_def`
+/// (the architectural / `NoBypass` latency), reduced by 1 when the producer's
+/// def bypass class matches the consumer's use bypass class (forwarding). See
+/// [`VectorRegisterFile::resolve`].
+#[derive(Clone, Copy, Debug)]
+struct PendingVecWrite {
+    reg: u8,
+    value: [u32; 8],
+    issue_bundle: u64,
+    l_def: u8,
+    def_bypass: Bypass,
+}
+
 #[derive(Clone)]
 pub struct VectorRegisterFile {
-    /// Each register is 256 bits = 8 × u32
+    /// Each register is 256 bits = 8 × u32. Holds *committed* (fully-landed)
+    /// values; in-flight writes live in `pending` until they land.
     regs: [[u32; 8]; NUM_VECTOR_REGS],
-    /// VLIW bundle snapshot. When `Some`, reads return the pre-bundle values so
-    /// every read within a bundle sees the same pre-execution state (writes
-    /// still go live). Set by `begin_bundle`, cleared by `end_bundle`. This is
-    /// the vector-register half of the pure-VLIW read-old/write-new semantics
-    /// the scalar/pointer/modifier files already get via the context snapshot.
+    /// VLIW bundle snapshot of the committed file. When `Some`, the committed
+    /// base seen by reads is the pre-bundle state, so direct (`write`) writes
+    /// within a bundle stay invisible to sibling slots. Bypass-overlay writes
+    /// (`queue_write`) are not in `regs` until landed, so they get read-old
+    /// semantics from the resolution rule itself.
     snapshot: Option<[[u32; 8]; NUM_VECTOR_REGS]>,
+    /// In-flight vector writes, in issue order. Resolved per-read against the
+    /// AIE2 forwarding network; moved into `regs` once fully landed.
+    pending: Vec<PendingVecWrite>,
+    /// Current issued-bundle counter (the issue-slot-relative clock the
+    /// compiler's latencies are expressed in). Set at bundle start.
+    cur_bundle: u64,
 }
 
 impl Default for VectorRegisterFile {
@@ -357,10 +381,15 @@ impl Default for VectorRegisterFile {
 impl VectorRegisterFile {
     /// Create a new zeroed register file.
     pub const fn new() -> Self {
-        Self { regs: [[0; 8]; NUM_VECTOR_REGS], snapshot: None }
+        Self {
+            regs: [[0; 8]; NUM_VECTOR_REGS],
+            snapshot: None,
+            pending: Vec::new(),
+            cur_bundle: 0,
+        }
     }
 
-    /// The array reads see: the bundle snapshot if active, else live registers.
+    /// The committed array reads see: the bundle snapshot if active, else live.
     #[inline]
     fn active(&self) -> &[[u32; 8]; NUM_VECTOR_REGS] {
         match &self.snapshot {
@@ -369,34 +398,129 @@ impl VectorRegisterFile {
         }
     }
 
-    /// Snapshot live registers for VLIW bundle read semantics.
+    /// Advance the issued-bundle clock and land any in-flight writes that have
+    /// reached their architectural visibility (`issue_bundle + l_def <=
+    /// bundle`). Call at the start of each bundle, BEFORE `begin_bundle`, so
+    /// landed values are captured by the snapshot.
+    ///
+    /// Landed writes are applied in issue order, so when several target the
+    /// same register the latest-issued wins.
+    pub fn advance_bundle(&mut self, bundle: u64) {
+        self.cur_bundle = bundle;
+        if self.pending.is_empty() {
+            return;
+        }
+        // Apply landed writes in issue order (Vec is push/issue-ordered).
+        for w in &self.pending {
+            if w.issue_bundle + w.l_def as u64 <= bundle {
+                self.regs[(w.reg & 0x1F) as usize] = w.value;
+            }
+        }
+        self.pending.retain(|w| w.issue_bundle + w.l_def as u64 > bundle);
+    }
+
+    /// Effective visibility bundle of an in-flight write to a consumer with
+    /// `use_bypass`. Forwarding subtracts 1 when the def/use bypass classes
+    /// match and are not `NoBypass` (AIE2 `getNumBypassedCycles`, flat -1).
+    /// Clamped so effective latency is >= 1: a write never resolves within its
+    /// own issue bundle (pure-VLIW read-old).
+    #[inline]
+    fn visible_at(w: &PendingVecWrite, use_bypass: Bypass) -> u64 {
+        // EXPERIMENT (consumer-keyed store-lag): forward to compute (Mov)
+        // consumers, not to stores (No). Validates the reduction before commit.
+        let _ = w.def_bypass;
+        let forward = use_bypass == Bypass::Mov;
+        let eff = (w.l_def as u64).saturating_sub(forward as u64).max(1);
+        w.issue_bundle + eff
+    }
+
+    /// Resolve register `reg` for a consumer with `use_bypass`: the committed
+    /// base value, overridden by the latest-issued in-flight write visible to
+    /// this consumer at the current bundle.
+    #[inline]
+    fn resolve(&self, reg: u8, use_bypass: Bypass) -> [u32; 8] {
+        let idx = (reg & 0x1F) as usize;
+        let mut val = self.active()[idx];
+        for w in &self.pending {
+            if (w.reg & 0x1F) as usize == idx && Self::visible_at(w, use_bypass) <= self.cur_bundle {
+                val = w.value;
+            }
+        }
+        val
+    }
+
+    /// Snapshot the committed file for VLIW bundle read semantics.
     #[inline]
     pub fn begin_bundle(&mut self) {
         self.snapshot = Some(self.regs);
     }
 
-    /// Discard the bundle snapshot; reads return live state again.
+    /// Discard the bundle snapshot; committed reads return live state again.
     #[inline]
     pub fn end_bundle(&mut self) {
         self.snapshot = None;
     }
 
-    /// Read a vector register as 8 × u32.
-    #[inline]
-    pub fn read(&self, reg: u8) -> [u32; 8] {
-        self.active()[(reg & 0x1F) as usize]
+    /// Queue a vector-register write through the bypass network. `l_def` is the
+    /// producer's result latency (itinerary `operand_cycles[0]`); `def_bypass`
+    /// its result bypass class. `l_def == 0` writes immediately (test/legacy
+    /// helpers that bypass the executor's latency plumbing).
+    pub fn queue_write(&mut self, reg: u8, value: [u32; 8], l_def: u8, def_bypass: Bypass) {
+        if l_def == 0 {
+            self.regs[(reg & 0x1F) as usize] = value;
+            return;
+        }
+        self.pending.push(PendingVecWrite {
+            reg: reg & 0x1F,
+            value,
+            issue_bundle: self.cur_bundle,
+            l_def,
+            def_bypass,
+        });
     }
 
-    /// Write a vector register from 8 × u32.
+    /// Queue a 512-bit wide write (two consecutive w-registers) through the
+    /// bypass network. Each half carries the same latency and bypass class.
+    pub fn queue_write_wide(&mut self, base_reg: u8, data: Vec512, l_def: u8, def_bypass: Bypass) {
+        debug_assert!(base_reg % 2 == 0, "wide vector queue to odd base register {}", base_reg);
+        let mut lo = [0u32; 8];
+        let mut hi = [0u32; 8];
+        lo.copy_from_slice(&data[..8]);
+        hi.copy_from_slice(&data[8..]);
+        self.queue_write(base_reg, lo, l_def, def_bypass);
+        self.queue_write(base_reg + 1, hi, l_def, def_bypass);
+    }
+
+    /// Read a vector register as a compute consumer (`MOV_Bypass` use), the
+    /// common case: vector ALU ops forward from `MOV_Bypass` producers at
+    /// issue+1. Store-data reads must use [`read_store`](Self::read_store).
+    #[inline]
+    pub fn read(&self, reg: u8) -> [u32; 8] {
+        self.resolve(reg, Bypass::Mov)
+    }
+
+    /// Read a vector register as a store-data consumer (`NoBypass` use): never
+    /// receives ALU forwarding, so a producer's result is visible only at its
+    /// full architectural latency (e.g. issue+2 for a vector ALU op). This is
+    /// the path the bf16 split-tile store depends on (reads the *old* value the
+    /// bundle after a `VMOV x,bml`).
+    #[inline]
+    pub fn read_store(&self, reg: u8) -> [u32; 8] {
+        self.resolve(reg, Bypass::No)
+    }
+
+    /// Write a vector register directly (committed immediately, no bypass
+    /// modelling). Used by load commits, cascade reads, and tests; ordinary
+    /// compute writes go through [`queue_write`](Self::queue_write).
     #[inline]
     pub fn write(&mut self, reg: u8, value: [u32; 8]) {
         self.regs[(reg & 0x1F) as usize] = value;
     }
 
-    /// Read a single lane (0-7) as u32.
+    /// Read a single lane (0-7) as u32 (compute / `MOV_Bypass` consumer).
     #[inline]
     pub fn read_lane(&self, reg: u8, lane: u8) -> u32 {
-        self.active()[(reg & 0x1F) as usize][(lane & 0x07) as usize]
+        self.resolve(reg, Bypass::Mov)[(lane & 0x07) as usize]
     }
 
     /// Write a single lane (0-7).
@@ -1166,5 +1290,104 @@ mod tests {
 
         // Should not panic
         validate_register_model(&output.register_model);
+    }
+
+    // ========== Vector bypass-network visibility ==========
+    //
+    // Models the AIE2 forwarding network: a vector write at issue bundle B with
+    // result latency L_def and def bypass class is visible to a consumer with
+    // use bypass class at `B + L_def - (1 if bypass-matches-and-not-No else 0)`.
+    // Reg 2 used throughout (arbitrary even index).
+
+    const V: [u32; 8] = [0xAAAA_AAAA; 8];
+
+    #[test]
+    fn test_bypass_mov_def_compute_read_visible_issue_plus_1() {
+        // MOV def -> compute (MOV) read: forwards, visible at issue+1.
+        let mut r = VectorRegisterFile::new();
+        r.advance_bundle(0);
+        r.queue_write(2, V, 2, Bypass::Mov);
+        // Same bundle: read-old (not yet visible).
+        assert_eq!(r.read(2), [0; 8], "within-bundle read must see old value");
+        r.advance_bundle(1);
+        assert_eq!(r.read(2), V, "MOV->compute visible at issue+1");
+    }
+
+    #[test]
+    fn test_bypass_mov_def_store_read_visible_issue_plus_2() {
+        // MOV def -> store (No) read: no forwarding, visible at issue+2.
+        // This is the bf16 split-tile edge: the store one bundle later reads OLD.
+        let mut r = VectorRegisterFile::new();
+        r.advance_bundle(0);
+        r.queue_write(2, V, 2, Bypass::Mov);
+        r.advance_bundle(1);
+        assert_eq!(r.read_store(2), [0; 8], "MOV->store still old at issue+1");
+        r.advance_bundle(2);
+        assert_eq!(r.read_store(2), V, "MOV->store visible at issue+2");
+    }
+
+    #[test]
+    fn test_bypass_nobypass_def_compute_read_visible_issue_plus_2() {
+        // NoBypass def (e.g. VMOV BM->X) -> compute read: no forwarding even to
+        // a MOV consumer, visible at issue+2 not issue+1.
+        let mut r = VectorRegisterFile::new();
+        r.advance_bundle(0);
+        r.queue_write(2, V, 2, Bypass::No);
+        r.advance_bundle(1);
+        assert_eq!(r.read(2), [0; 8], "NoBypass->compute still old at issue+1");
+        r.advance_bundle(2);
+        assert_eq!(r.read(2), V, "NoBypass->compute visible at issue+2");
+    }
+
+    #[test]
+    fn test_bypass_nobypass_def_store_read_visible_issue_plus_2() {
+        let mut r = VectorRegisterFile::new();
+        r.advance_bundle(0);
+        r.queue_write(2, V, 2, Bypass::No);
+        r.advance_bundle(1);
+        assert_eq!(r.read_store(2), [0; 8]);
+        r.advance_bundle(2);
+        assert_eq!(r.read_store(2), V);
+    }
+
+    #[test]
+    fn test_bypass_latest_issued_write_wins() {
+        // Two in-flight MOV writes to one reg; the later-issued visible one wins.
+        let a = [0x1111_1111; 8];
+        let b = [0x2222_2222; 8];
+        let mut r = VectorRegisterFile::new();
+        r.advance_bundle(0);
+        r.queue_write(2, a, 2, Bypass::Mov);
+        r.advance_bundle(1);
+        r.queue_write(2, b, 2, Bypass::Mov); // issued at bundle 1
+                                             // cur=1: a visible (0+1), b not yet (1+1=2).
+        assert_eq!(r.read(2), a, "only the earlier write is visible at bundle 1");
+        r.advance_bundle(2);
+        // cur=2: a landed into regs; b now forwards (1+2-1=2). b wins.
+        assert_eq!(r.read(2), b, "later-issued write wins once visible");
+    }
+
+    #[test]
+    fn test_bypass_wide_write_splits_and_resolves() {
+        let mut data = [0u32; 16];
+        for (i, d) in data.iter_mut().enumerate() {
+            *d = 0xC0DE_0000 | i as u32;
+        }
+        let mut r = VectorRegisterFile::new();
+        r.advance_bundle(0);
+        r.queue_write_wide(4, data, 2, Bypass::Mov); // x-reg base 4 -> regs 4,5
+        r.advance_bundle(1);
+        assert_eq!(r.read_wide(4), data, "wide MOV->compute visible at issue+1");
+        // Low half in reg 4, high half in reg 5.
+        assert_eq!(r.read(4)[..], data[..8]);
+        assert_eq!(r.read(5)[..], data[8..]);
+    }
+
+    #[test]
+    fn test_bypass_zero_latency_writes_immediately() {
+        let mut r = VectorRegisterFile::new();
+        r.advance_bundle(5);
+        r.queue_write(2, V, 0, Bypass::Mov);
+        assert_eq!(r.read(2), V, "l_def=0 writes immediately (test/legacy path)");
     }
 }

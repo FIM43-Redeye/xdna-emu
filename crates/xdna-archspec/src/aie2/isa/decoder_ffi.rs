@@ -73,6 +73,7 @@ pub struct RawInstrInfo {
     pub latency: i16,       // operand_cycles[0], or -1 if unavailable
     pub stage_latency: i16, // Pipeline stage sum, or -1 if unavailable
     pub sched_class: u16,   // Itinerary class index (opaque)
+    pub def_bypass: u16,    // Forwarding id of result operand 0 (0 = NoBypass)
 }
 
 extern "C" {
@@ -284,6 +285,13 @@ pub struct InstrInfo {
     pub stage_latency: Option<u8>,
     /// Itinerary class index (opaque, for cross-ref with build-time data).
     pub sched_class: u16,
+    /// Forwarding-network id of the result operand (itinerary `Forwardings[0]`).
+    /// 0 = `NoBypass`. A nonzero id forwards (-1 cycle) to a consumer whose
+    /// matching use operand shares the id. Raw because mapping the id to a
+    /// named [`Bypass`](super::super::Bypass) class is only unambiguous in
+    /// context (e.g. a vector-register result's nonzero id is always
+    /// `MOV_Bypass`); callers interpret per the destination register file.
+    pub def_bypass: u16,
 }
 
 impl InstrInfo {
@@ -340,6 +348,7 @@ pub fn query_all_instr_info() -> Vec<InstrInfo> {
             latency: -1,
             stage_latency: -1,
             sched_class: 0,
+            def_bypass: 0,
         };
 
         let ok = unsafe { aie2_get_instr_info(opcode, &mut raw) };
@@ -350,6 +359,7 @@ pub fn query_all_instr_info() -> Vec<InstrInfo> {
                 latency: None,
                 stage_latency: None,
                 sched_class: 0,
+                def_bypass: 0,
             });
             continue;
         }
@@ -372,6 +382,7 @@ pub fn query_all_instr_info() -> Vec<InstrInfo> {
             latency,
             stage_latency,
             sched_class: raw.sched_class,
+            def_bypass: raw.def_bypass,
         });
     }
 

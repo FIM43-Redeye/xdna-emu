@@ -337,6 +337,17 @@ int aie2_get_instr_info(uint32_t opcode, Aie2InstrInfo *out) {
         unsigned stage_lat = g_iid.getStageLatency(sched_class);
         if (stage_lat > 0)
             out->stage_latency = (int16_t)stage_lat;
+
+        // Forwarding (bypass) class of the result operand (operand 0). The
+        // Forwardings table is indexed by FirstOperandCycle + operand index
+        // (same indexing getOperandCycle uses for OperandCycles). 0 = NoBypass;
+        // a nonzero id forwards to a consumer whose matching use operand shares
+        // the id (AIE2: MOV_Bypass on W/X-file ALU, VEC_Bypass on CM/accumulator).
+        if (g_iid.Itineraries && g_iid.Forwardings) {
+            const InstrItinerary &itin = g_iid.Itineraries[sched_class];
+            if (itin.FirstOperandCycle < itin.LastOperandCycle)
+                out->def_bypass = (uint16_t)g_iid.Forwardings[itin.FirstOperandCycle];
+        }
     }
 
     return 1;

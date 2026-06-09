@@ -49,13 +49,13 @@ for the corresponding vector class (plan Task 3 -> Task 5 Verified flip).
 | `vec_conv_bf16` | Convert (f32->bf16) | **EMU-smoke PASS** (chess) -- generated; round-narrow via accfloat accumulator, `VST.CONV.bf16.fp32`, ConvEven. Surfaced + fixed an interpreter gap: the convert path hardcoded bit-truncation, ignoring the configured rounding mode (47% of the 438-record golden slice are round-ups it would have failed). Fix threads `ctx.srs_config.rounding_mode` into `vector_convert` / the vst.conv fast path. Needed a generator extension (`Buf.ktype` host-vs-kernel type split for bit-pattern staging; `select_records` predicate for normal-finite-f32 filtering). Denormal/NaN/Inf inputs deferred (HW-gated FTZ + canonicalization edges). |
 | `vec_mac_i8` | MatMul int (i8) | **EMU-smoke PASS** (chess) -- first matmul-variant kernel. Drove the MAC-tier cascade below (bugs 1-3). |
 | `vec_mac_i16` | MatMul int (i16) | **EMU-smoke PASS** (chess) -- int16, 4x2x8. |
-| `vec_mac_bf16` | MatMul bf16 | **EMU-blocked** (chess) -- bf16, 4x8x4, fp32-bit compare, all-finite slice. Integer bugs 1-3 fixed; a bf16-specific gap remains (bug 4, below). |
+| `vec_mac_bf16` | MatMul bf16 | **EMU-smoke PASS** (chess) -- bf16, 4x8x4, fp32-bit compare, all-finite slice. Drove bugs 4-5 (float MAC latency + the general vector-write-latency model). |
 
-### Shared MAC-tier gap (a two-bug cascade)
+### Shared MAC-tier gap (a five-bug cascade)
 
 All three MAC kernels share the same compiled-mmul datapath. Pinned by
-memory-watch runs on `vec_mac_i16`, a cascade of four bugs gated it: three
-fixed (i8/i16 now pass), one bf16-specific remaining.
+memory-watch runs on `vec_mac_i16` (bugs 1-3) and instrumented bf16 bridge
+runs (bugs 4-5), a cascade of five bugs gated the tier; all now fixed.
 
 **Bug 1 -- matrix-VMUL routed to elementwise Mul (FIXED).** Chess lowers
 `aie::mmul` to **`VMUL cm0, x0, x1, r24`**: a matrix-multiply VMUL with a `cm`
@@ -106,16 +106,35 @@ since only 50 signed records exist). A generator test
 matmul spec's baked C equals the textbook product of its baked row-major A/B.
 **After bugs 1-3: vec_mac_i8 and vec_mac_i16 EMU-smoke PASS.**
 
-**Bug 4 -- bf16 matmul element type not inferred (OPEN).** `vec_mac_bf16` runs
-the same compiled path but produces non-uniform garbage for a uniform-input tile
-(all-1.0 -> expected 8.0, got [0, 6.0, -1.5, 15.0, ...]). The compiled bf16
-multiply is `VMUL_F_vmac_bm_core_dense` (mnemonic `vmul.f`), routed to MatMul by
-bug-1's refinement (matches `bm_core`), but `execute_matmul` picks the integer
-vs bf16 datapath from `op.element_type`, and the element-type inference keys on
-`bf16`/`.bf`/`f32`/`float`/ends-with-`.f` -- none of which the def name
-`VMUL_F_vmac_bm_core_dense` matches -> `element_type=None` -> the integer matmul
-runs on bf16 bit patterns. Fix direction: infer BFloat16/Float32 for the `_F`
-matrix-multiply forms. Tracked separately.
+**Bug 4 -- float MAC result latency is 6, not 5 (FIXED).** `vec_mac_bf16` runs
+the same compiled path; the matmul value is correct (the uniform-1.0 tile
+computes 8.0), so the original "element type not inferred" hypothesis was wrong
+-- `VMUL_F_vmac_bm_core_dense` already resolves to `sem=MatMul, et=Float32`
+(verified against the real TableGen), and `execute_matmul` takes the bf16
+datapath. The real timing finding: float vector MAC/MUL has result latency **6**
+(llvm-aie `II_VMULf`/`II_VMACf` operand_cycles[0]=6, the extra `EmptyCycles<4>`
+vs the integer classes' `<3>` is the float-normalization stage) vs integer 5.
+Fixed by deriving `VECTOR_MAC_F=6` in archspec and selecting it in
+`execute_matmul` when `config.bfloat`. (Correct, but not sufficient on its own --
+see bug 5.)
+
+**Bug 5 -- vector-register writes weren't deferred by their result latency
+(FIXED, general model).** The bf16 accumulator-drain idiom is two bundles:
+`VST wh2; VMOV x2,bml0; VMUL.f bml0` then `VST wl2`. `VMOV_mv_x` (BM->X) has
+result latency 2 (`II_VMOV_X_BM_XM`), but the emulator applied the `VMOV x2`
+write immediately. So the same-bundle `wh2` store read x2 via the per-bundle
+snapshot (old tile, correct), but the next-bundle `wl2` store read x2 *after*
+the VMOV overwrote it (next tile) -- each output tile-slot came out split: high
+half from tile K, low half from tile K+1. The per-bundle snapshot models only
+the issue+0 (intra-bundle) hazard; this is an issue+1 cross-bundle hazard.
+Fixed generally: every vector-register write now defers by the op's result
+latency (`ExecutionContext::queue_vector_reg_write` /
+`queue_wide_vector_reg_write`, keyed on `ctx.result_latency` set per slot by the
+bundle executor), completing the pipeline model the snapshot started. The
+integer MAC kernels never hit this -- they store straight from the (already
+deferred) accumulator with no intermediate `VMOV -> x -> store`. See
+`docs/superpowers/plans/2026-06-09-vector-write-result-latency.md`.
+**After bugs 4-5: vec_mac_bf16 EMU-smoke PASS.**
 
 `vec_eltwise_add` is the proof-of-pattern: once its author -> stage -> compile ->
 EMU-smoke loop is green, the rest follow the same template (`runtime_cumsum`-

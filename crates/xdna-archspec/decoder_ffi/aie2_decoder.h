@@ -81,6 +81,7 @@ struct Aie2InstrInfo {
     int16_t latency;         // Result latency from itinerary operand_cycles[0], or -1
     int16_t stage_latency;   // Total pipeline latency from InstrStage sum, or -1
     uint16_t sched_class;    // Itinerary class index (opaque; for cross-ref with build data)
+    uint16_t def_bypass;     // Forwarding-network id of result operand 0 (0 = NoBypass)
 };
 
 // MCID flag bit positions (from llvm/MC/MCInstrDesc.h MCID::Flag enum).

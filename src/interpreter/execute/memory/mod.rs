@@ -1222,7 +1222,11 @@ impl MemoryUnit {
 
         for operand in op.sources.iter().chain(op.dest.iter()) {
             match operand {
-                Operand::VectorReg(r) => return Some(ctx.vector.read(*r)),
+                // Store data is a NoBypass consumer: it never receives ALU
+                // forwarding, so a vector producer's result is visible only at
+                // its full architectural latency (the bf16 split-tile store
+                // reads the OLD value the bundle after a `VMOV x,bml`).
+                Operand::VectorReg(r) => return Some(ctx.vector.read_store(*r)),
                 Operand::AccumReg(r) => {
                     // Read the right quarter/half based on accum_width.
                     let accum = ctx.accumulator.read(*r);
@@ -1476,7 +1480,8 @@ impl MemoryUnit {
             Operand::PointerReg(r) => ctx.pointer_read(*r) as u64,
             Operand::ModifierReg(r) => ctx.modifier_read(*r) as u64,
             Operand::VectorReg(r) => {
-                let vec = ctx.vector.read(*r);
+                // Store data: NoBypass consumer (see read_store_data_wide).
+                let vec = ctx.vector.read_store(*r);
                 if width == MemWidth::Vector256 {
                     ((vec[1] as u64) << 32) | (vec[0] as u64)
                 } else {

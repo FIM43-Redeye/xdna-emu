@@ -335,7 +335,15 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // Writing immediately makes the result visible too early and shifts every
     // tile one ahead. `is_half` selects the 512-bit bm-half vs 1024-bit cm-pair
     // write inside the deferred apply.
-    let latency = crate::interpreter::timing::latency::LATENCY_VECTOR_MAC as u64;
+    // Float (bf16/fp32) MAC has a longer result latency than integer (6 vs 5)
+    // for the normalization stage; using the integer latency on a bf16
+    // software-pipelined loop shifts every stored tile by one (II_VMACf /
+    // II_VMULf operand_cycles[0]=6 vs II_VMAC/II_VMUL=5).
+    let latency = if config.bfloat {
+        crate::interpreter::timing::latency::LATENCY_VECTOR_MAC_F
+    } else {
+        crate::interpreter::timing::latency::LATENCY_VECTOR_MAC
+    } as u64;
     ctx.queue_matmul_accum_write(Operand::AccumReg(acc_dest), acc, is_half, latency);
 
     true
@@ -1729,6 +1737,45 @@ mod tests {
             let val = f32::from_bits(bits);
             assert!((val - 8.0).abs() < 0.01, "output[{}]: expected 8.0, got {}", i, val);
         }
+    }
+
+    #[test]
+    fn test_matmul_bf16_uses_float_latency_six() {
+        // Float (bf16) vector MAC has result latency 6 (llvm-aie II_VMULf /
+        // II_VMACf operand_cycles[0]=6), one cycle longer than integer (5)
+        // because of the extra float-normalization pipeline stage
+        // (EmptyCycles<4> vs <3> in AIE2Schedule.td). The deferred accumulator
+        // write must use the FLOAT latency: Chess software-pipelines bf16 batch
+        // loops one stage deeper than integer (a 3-deep VMUL.f prologue vs
+        // 2-deep), so a write committed at issue+5 makes the next tile's result
+        // visible too early and shifts every stored tile by one.
+        let mut ctx = ExecutionContext::new();
+        ctx.accumulator.write_wide(0, [0u64; 16]);
+
+        let ones = vec512_all_ones_bf16();
+        ctx.vector.write_wide(0, ones);
+        ctx.vector.write_wide(2, ones);
+        ctx.scalar.write(5, config_bf16_accumulate());
+
+        let mut op = make_mac_op(SemanticOp::MatMul, 0, 2, 5, 0, Some("VMUL_F_vmac_bm_core_dense"));
+        op.element_type = Some(ElementType::Float32);
+
+        ctx.cycles = 100;
+        assert!(execute_matmul(&op, &mut ctx));
+
+        // At issue+5 the float result must NOT yet be visible (integer latency
+        // would have committed here; float latency 6 must not).
+        ctx.cycles = 105;
+        ctx.commit_pending_writes();
+        let bits5 = (ctx.accumulator.read_wide(0)[0] & 0xFFFF_FFFF) as u32;
+        assert_eq!(bits5, 0, "bf16 matmul result must NOT be visible at issue+5 (float latency is 6)");
+
+        // At issue+6 it commits.
+        ctx.cycles = 106;
+        ctx.commit_pending_writes();
+        let bits6 = (ctx.accumulator.read_wide(0)[0] & 0xFFFF_FFFF) as u32;
+        let v = f32::from_bits(bits6);
+        assert!((v - 8.0).abs() < 0.01, "bf16 result must be visible at issue+6, got {}", v);
     }
 
     #[test]

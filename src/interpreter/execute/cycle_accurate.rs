@@ -29,6 +29,7 @@ use crate::device::arch_handle;
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{Operand, SlotOp, VliwBundle};
 use xdna_archspec::aie2::isa::SemanticOp;
+use xdna_archspec::aie2::Bypass;
 use crate::interpreter::state::{EventType, ExecutionContext};
 use crate::interpreter::timing::{HazardDetector, HazardStats, MemoryAccess, MemoryModel, MemoryQuadrant};
 use crate::interpreter::traits::{ExecuteResult, Executor};
@@ -708,6 +709,13 @@ impl CycleAccurateExecutor {
         // The begin_bundle snapshot ensures that when `lda r13, [p5]` and
         // `or r3, r13, r0` are in the same bundle, the OR reads r13's value
         // from BEFORE the load writes it.
+        //
+        // First advance the vector file's issued-bundle clock and land any
+        // bypass-network writes that have reached architectural visibility, so
+        // landed values are captured by the snapshot. This runs only on an
+        // actually-issued bundle (stall pre-checks above return earlier), so
+        // the clock tracks issued bundles, not stall cycles.
+        ctx.advance_vector_bundle();
         ctx.begin_bundle();
 
         // Same-bundle scalar->shift forwarding. AIE2 writes an S register at
@@ -730,6 +738,15 @@ impl CycleAccurateExecutor {
 
         for slot_idx in &execution_order {
             if let Some(ref op) = bundle.slots()[*slot_idx as usize] {
+                // Expose this op's result latency and result bypass class so a
+                // vector-register write routes through the AIE2 forwarding
+                // network (visible to ALU consumers at issue+1 when MOV_Bypass,
+                // to stores at full latency). See VectorRegisterFile::resolve.
+                // Set per slot before dispatch so each write sees its own op.
+                ctx.result_latency = self.operation_cycles(op);
+                ctx.result_bypass =
+                    op.llvm_opcode.map(|o| self.latencies.def_bypass(o)).unwrap_or(Bypass::No);
+
                 // Reborrow neighbors for each slot operation
                 let slot_neighbors = neighbors.as_mut().map(|n| &mut **n);
                 if let Some(result) =
@@ -778,6 +795,11 @@ impl CycleAccurateExecutor {
                 }
             }
         }
+
+        // Clear the per-slot result latency/bypass so any write outside bundle
+        // dispatch (e.g. pipeline drain) defaults to an immediate write.
+        ctx.result_latency = 0;
+        ctx.result_bypass = Bypass::No;
 
         ctx.end_bundle();
 
@@ -889,6 +911,13 @@ impl CycleAccurateExecutor {
         // Advance cycle counter by 1 (pipelined issue rate).
         // Latency-based deferred writes and hazard stalls handle the rest.
         ctx.record_instruction(1);
+
+        // Count this issued bundle. bundle_seq is the issue-slot-relative clock
+        // that drives the vector register file's bypass-network visibility (see
+        // VectorRegisterFile::resolve / advance_bundle). Cascade/stream stall
+        // pre-checks return before this point, so a stall advances `cycles` but
+        // NOT `bundle_seq` -- vector-write latency stays robust to stalls.
+        ctx.bundle_seq += 1;
 
         // Sync timing context
         let timing = ctx.timing_context_mut();

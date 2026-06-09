@@ -70,6 +70,32 @@ pub mod trace_events;
 /// memory-map arithmetic has a single home inside `xdna-archspec`.
 pub mod memory_map;
 
+/// Result-operand bypass (forwarding) class for an AIE2 instruction.
+///
+/// Each itinerary operand carries a bypass class (`AIE2Schedule.td`
+/// `InstrItinData` 4th argument). The forwarding network gives a 1-cycle
+/// latency reduction when a producer's def-operand bypass class matches a
+/// consumer's use-operand bypass class and the class is not `NoBypass`
+/// (LLVM `getOperandLatency` + AIE2 `getNumBypassedCycles`, flat -1).
+///
+/// AIE2 defines three classes: `MOV_Bypass` (scalar/vector ALU, the W/X
+/// register file), `VEC_Bypass` (accumulator/CM domain: MAC/MUL), and
+/// `NoBypass` (loads, stores, cross-domain moves, flags -- no forwarding).
+///
+/// Vector-*register* writes only ever carry `Mov` or `No` def bypass
+/// (`Vec` is accumulator-domain), so the vector-file visibility model needs
+/// only those two; `Vec` is represented for the future accumulator extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Bypass {
+    /// No forwarding (id 0). Consumers always wait the full result latency.
+    #[default]
+    No,
+    /// `MOV_Bypass`: scalar/vector ALU forwarding (W/X register file).
+    Mov,
+    /// `VEC_Bypass`: accumulator-domain forwarding (CM register file).
+    Vec,
+}
+
 /// Instruction result-latency constants for the AIE2 core pipeline.
 ///
 /// These latencies are the cycles from instruction issue to when the result
@@ -113,6 +139,14 @@ pub mod instruction_latency {
     /// Source: `AIE2Schedule.td` `II_VMAC`, `II_VMSC`, `II_VNEGMAC`,
     /// `II_VACC` itineraries, `operand_cycles[0] = 5`.
     pub const VECTOR_MAC: u8 = 5;
+
+    /// Float (bf16/fp32) vector MAC/MUL result latency: 6 cycles.
+    ///
+    /// One cycle longer than the integer MAC because of the extra
+    /// floating-point normalization pipeline stage. Source: `AIE2Schedule.td`
+    /// `II_VMACf`, `II_VMULf` itineraries, `operand_cycles[0] = 6`
+    /// (`EmptyCycles<4>` vs the integer classes' `EmptyCycles<3>`).
+    pub const VECTOR_MAC_F: u8 = 6;
 
     /// Vector shuffle/permute result latency: 2 cycles.
     ///

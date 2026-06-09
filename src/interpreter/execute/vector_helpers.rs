@@ -71,7 +71,12 @@ impl VectorAlu {
     pub(super) fn write_vector_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: [u32; 8]) {
         match &op.dest {
             Some(Operand::VectorReg(r)) => {
-                ctx.vector.write(*r, value);
+                // Route through the bypass network: the result becomes visible to
+                // a consumer at issue + result_latency, reduced by 1 when the
+                // result forwards (MOV_Bypass) to a matching ALU consumer. See
+                // `VectorRegisterFile::resolve`.
+                let (lat, byp) = (ctx.result_latency, ctx.result_bypass);
+                ctx.vector.queue_write(*r, value, lat, byp);
             }
             Some(Operand::AccumReg(r)) => {
                 // Vector -> accumulator: zero-extend each u32 to u64.
@@ -452,7 +457,11 @@ impl VectorAlu {
     /// Write a 512-bit result to the vector destination.
     pub(super) fn write_wide_vec_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: Vec512) {
         if let Some(Operand::VectorReg(r)) = &op.dest {
-            ctx.vector.write_wide(*r, value);
+            // Bypass-network visibility (see write_vector_dest); the wide write
+            // splits across regs r (lo) and r|1 (hi), both with the same latency
+            // and result bypass class.
+            let (lat, byp) = (ctx.result_latency, ctx.result_bypass);
+            ctx.vector.queue_write_wide(*r, value, lat, byp);
         } else {
             log::error!("[VECTOR_WIDE] write_wide_vec_dest: expected VectorReg dest, got {:?}", op.dest);
         }

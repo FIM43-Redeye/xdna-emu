@@ -18,8 +18,8 @@
 //! ```
 
 use super::registers::{
-    AccumulatorRegisterFile, MaskRegisterFile, ModifierRegisterFile, PointerRegisterFile, ScalarRegisterFile,
-    VectorRegisterFile,
+    AccumulatorRegisterFile, Bypass, MaskRegisterFile, ModifierRegisterFile, PointerRegisterFile,
+    ScalarRegisterFile, VectorRegisterFile,
 };
 use crate::interpreter::bundle::Operand;
 use crate::interpreter::traits::{Flags, StateAccess};
@@ -262,6 +262,26 @@ pub struct ExecutionContext {
     /// the destination register is deferred until `ready_cycle` is reached.
     pending_writes: Vec<PendingWrite>,
 
+    /// Result latency (itinerary `operand_cycles[0]`) of the slot op currently
+    /// being executed, set by the bundle executor before each slot dispatch.
+    /// Vector-register writes pass this to the register file's bypass-network
+    /// visibility model (`VectorRegisterFile::queue_write`). A value of 0 means
+    /// "write immediately" -- direct test-path helpers that bypass the executor.
+    pub result_latency: u8,
+
+    /// Result bypass class of the slot op currently being executed (set
+    /// alongside `result_latency`). Determines whether the result forwards to
+    /// ALU consumers at issue+1 (`Mov`) or is visible only at full latency
+    /// (`No`). See `VectorRegisterFile::resolve`.
+    pub result_bypass: Bypass,
+
+    /// Monotonic counter of issued bundles, incremented once per executed
+    /// bundle by the cycle-accurate executor. This is the issue-slot-relative
+    /// clock the compiler's result latencies are expressed in; it drives the
+    /// vector register file's bypass visibility (`advance_bundle`) and, unlike
+    /// `cycles`, does not advance on stalls (a stalled bundle re-issues).
+    pub bundle_seq: u64,
+
     // === Partial-Word Store Pipeline ===
     /// Deferred partial-word stores awaiting data register read.
     /// Partial-word stores (st.s8, st.u8, etc.) use a RMW pipeline where
@@ -408,6 +428,9 @@ impl ExecutionContext {
             bundle_shift_forward: Vec::new(),
             pending_branch: None,
             pending_writes: Vec::new(),
+            result_latency: 0,
+            result_bypass: Bypass::No,
+            bundle_seq: 0,
             pending_stores: Vec::new(),
             cycle_core_banks: 0,
             srs_config: SrsConfig::default(),
@@ -725,6 +748,18 @@ impl ExecutionContext {
     /// the previous tile's accumulator while the next tile's VMUL is still in
     /// flight. `is_half` selects a 512-bit `bm` half write vs a 1024-bit `cm`
     /// wide-pair write.
+    ///
+    /// FIXME(bypass-model): the accumulator file is NOT yet part of the AIE2
+    /// bypass/forwarding network that the vector register file now models
+    /// (`VectorRegisterFile::resolve`). This path applies a single flat
+    /// result-latency deferral and does not distinguish `VEC_Bypass` (MAC->MAC
+    /// accumulator forwarding, effective latency L-1) from `NoBypass`
+    /// consumers (e.g. accumulator stores). If a kernel surfaces a tight
+    /// MAC->MAC vs MAC->store accumulator-visibility split, fold the
+    /// accumulator file into the same `(l_def, def_bypass)` resolution rule:
+    /// extract the `VEC_Bypass` id (see `LatencyTable::def_bypass`, which today
+    /// maps any nonzero id to `Mov` because only vector-register results query
+    /// it) and give `AccumulatorRegisterFile` the same in-flight overlay.
     pub fn queue_matmul_accum_write(&mut self, dest: Operand, value: [u64; 16], is_half: bool, latency: u64) {
         self.pending_writes.push(PendingWrite {
             dest,
@@ -735,6 +770,16 @@ impl ExecutionContext {
             issued_cycle: self.cycles,
             wide_accum: Some(Box::new(DeferredAccum { value, is_half })),
         });
+    }
+
+    /// Land vector-register writes that have reached visibility and advance the
+    /// register file's issued-bundle clock. Call once per issued bundle, at the
+    /// start, before snapshotting. Vector writes themselves go through
+    /// `self.vector.queue_write` (driven by the executor's `result_latency` /
+    /// `result_bypass`), and the AIE2 forwarding network is modeled inside
+    /// `VectorRegisterFile` (see its `resolve`).
+    pub fn advance_vector_bundle(&mut self) {
+        self.vector.advance_bundle(self.bundle_seq);
     }
 
     /// Queue a pointer register write with pipeline latency.
@@ -1750,6 +1795,10 @@ mod tests {
             "at ready_cycle the matmul result becomes visible",
         );
     }
+
+    // Vector-register result visibility (the AIE2 bypass/forwarding network) is
+    // modeled inside `VectorRegisterFile` and unit-tested there
+    // (`registers::tests::test_bypass_*`).
 
     #[test]
     fn test_pointer_load_forwarding_basic() {
