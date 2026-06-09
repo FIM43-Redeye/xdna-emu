@@ -76,6 +76,25 @@ pub struct PendingWrite {
     /// vs writes from the current bundle (not forwardable -- VLIW semantics
     /// require same-bundle reads to see pre-execution values).
     pub issued_cycle: u64,
+    /// Full-width (up to 1024-bit) accumulator result for a deferred matmul
+    /// write. When set, the AccumReg write uses this wide value instead of
+    /// `vec_value`/`accum_width` (which only cover <=512-bit chunks). Boxed so
+    /// the common scalar/vector/pointer pending writes stay small.
+    pub wide_accum: Option<Box<DeferredAccum>>,
+}
+
+/// A deferred full-width matmul accumulator result.
+///
+/// The AIE2 matrix-multiply (VMUL/VMAC) writes a 1024-bit `cm` register (or a
+/// 512-bit `bm` half) with the MAC result latency. This carries the computed
+/// accumulator so `commit_pending_writes` can apply it at `ready_cycle`.
+#[derive(Debug, Clone)]
+pub struct DeferredAccum {
+    /// The computed accumulator lanes ([u64; 16] = 1024 bits).
+    pub value: [u64; 16],
+    /// True for a 512-bit `bm` half write (low 8 lanes); false for the full
+    /// 1024-bit `cm` wide-pair write.
+    pub is_half: bool,
 }
 
 /// A deferred partial-word store awaiting its data register read.
@@ -661,6 +680,7 @@ impl ExecutionContext {
             accum_width: None,
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
+            wide_accum: None,
         });
     }
 
@@ -673,6 +693,7 @@ impl ExecutionContext {
             accum_width: None,
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
+            wide_accum: None,
         });
     }
 
@@ -691,6 +712,28 @@ impl ExecutionContext {
             accum_width: Some(width),
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
+            wide_accum: None,
+        });
+    }
+
+    /// Queue a deferred full-width matmul accumulator write.
+    ///
+    /// The AIE2 matrix-multiply (VMUL/VMAC) result is not visible in the `cm`
+    /// accumulator until the MAC result latency (5 cycles, II_VMAC
+    /// operand_cycles[0]=5) elapses. Deferring the write models that pipeline:
+    /// in a software-pipelined batch loop, the stores that drain a tile read
+    /// the previous tile's accumulator while the next tile's VMUL is still in
+    /// flight. `is_half` selects a 512-bit `bm` half write vs a 1024-bit `cm`
+    /// wide-pair write.
+    pub fn queue_matmul_accum_write(&mut self, dest: Operand, value: [u64; 16], is_half: bool, latency: u64) {
+        self.pending_writes.push(PendingWrite {
+            dest,
+            scalar_value: 0,
+            vec_value: None,
+            accum_width: None,
+            ready_cycle: self.cycles + latency,
+            issued_cycle: self.cycles,
+            wide_accum: Some(Box::new(DeferredAccum { value, is_half })),
         });
     }
 
@@ -719,6 +762,7 @@ impl ExecutionContext {
             accum_width: None,
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
+            wide_accum: None,
         });
     }
 
@@ -835,7 +879,17 @@ impl ExecutionContext {
                 }
             }
             Operand::AccumReg(r) => {
-                if let Some(vec) = &pw.vec_value {
+                if let Some(wide) = &pw.wide_accum {
+                    // Deferred matmul result: full 1024-bit cm pair, or 512-bit
+                    // bm half.
+                    if wide.is_half {
+                        let mut half = [0u64; 8];
+                        half.copy_from_slice(&wide.value[..8]);
+                        self.accumulator.write(*r, half);
+                    } else {
+                        self.accumulator.write_wide(*r, wide.value);
+                    }
+                } else if let Some(vec) = &pw.vec_value {
                     self.apply_accum_write(*r, vec, pw.accum_width);
                 }
             }
@@ -1662,6 +1716,39 @@ mod tests {
         assert_eq!(ctx.scalar.read(5), 222, "After commit, live register should have new value");
         // No more pending writes, read should return live value
         assert_eq!(ctx.scalar_read(5), 222);
+    }
+
+    #[test]
+    fn test_queue_matmul_accum_write_defers() {
+        // A matmul (VMUL/VMAC) accumulator write has MAC result latency (5
+        // cycles): the result is not visible in the accumulator until
+        // ready_cycle, so in-flight stores in a software-pipelined loop read
+        // the previous tile's value. Models AIE2 II_VMAC operand_cycles[0]=5.
+        let mut ctx = ExecutionContext::new();
+        ctx.accumulator.write_wide(0, [0xAAAA_AAAA_AAAA_AAAAu64; 16]);
+
+        ctx.cycles = 10;
+        let result = [0x1111_1111_1111_1111u64; 16];
+        ctx.queue_matmul_accum_write(Operand::AccumReg(0), result, false, 5); // ready=15
+
+        // Immediately and before ready_cycle: accumulator holds the OLD value.
+        assert_eq!(ctx.accumulator.read_wide(0)[0], 0xAAAA_AAAA_AAAA_AAAA);
+        ctx.cycles = 14;
+        ctx.commit_pending_writes();
+        assert_eq!(
+            ctx.accumulator.read_wide(0)[0],
+            0xAAAA_AAAA_AAAA_AAAA,
+            "before ready_cycle the matmul result must not be visible",
+        );
+
+        // At ready_cycle (15): committed, new value visible.
+        ctx.cycles = 15;
+        ctx.commit_pending_writes();
+        assert_eq!(
+            ctx.accumulator.read_wide(0)[0],
+            0x1111_1111_1111_1111,
+            "at ready_cycle the matmul result becomes visible",
+        );
     }
 
     #[test]

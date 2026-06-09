@@ -327,16 +327,16 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         _ => {}
     }
 
-    // Write result back to the DESTINATION accumulator register.
-    if is_half {
-        // bm (512-bit): write back single register only.
-        let mut half = [0u64; 8];
-        half.copy_from_slice(&acc[..8]);
-        ctx.accumulator.write(acc_dest, half);
-    } else {
-        // cm (1024-bit): write wide pair.
-        ctx.accumulator.write_wide(acc_dest, acc);
-    }
+    // Write the result back to the DESTINATION accumulator with the MAC result
+    // latency (LATENCY_VECTOR_MAC = 5, from llvm-aie II_VMAC/II_VMUL
+    // operand_cycles[0]=5). Deferring the write models the AIE2 MAC pipeline: in
+    // a software-pipelined batch loop, the stores draining a tile read the
+    // previous tile's accumulator while the next tile's VMUL is still in flight.
+    // Writing immediately makes the result visible too early and shifts every
+    // tile one ahead. `is_half` selects the 512-bit bm-half vs 1024-bit cm-pair
+    // write inside the deferred apply.
+    let latency = crate::interpreter::timing::latency::LATENCY_VECTOR_MAC as u64;
+    ctx.queue_matmul_accum_write(Operand::AccumReg(acc_dest), acc, is_half, latency);
 
     true
 }
@@ -1626,6 +1626,7 @@ mod tests {
         let op = make_mac_op(SemanticOp::Mac, 0, 2, 5, 0, None);
 
         let handled = execute_matmul(&op, &mut ctx);
+        ctx.force_commit_all_pending(); // commit the deferred MAC-latency write
         assert!(handled, "execute_matmul should handle Mac semantic");
 
         let acc = ctx.accumulator.read_wide(0);
@@ -1658,6 +1659,7 @@ mod tests {
 
         let op = make_mac_op(SemanticOp::MatMul, 0, 2, 5, 0, Some("VMUL_vmac_cm_core_dense"));
         let handled = execute_matmul(&op, &mut ctx);
+        ctx.force_commit_all_pending(); // commit the deferred MAC-latency write
         assert!(handled, "execute_matmul should handle MatMul semantic");
 
         let acc = ctx.accumulator.read_wide(0);
@@ -1690,6 +1692,7 @@ mod tests {
 
         let op = make_mac_op(SemanticOp::Mac, 0, 2, 5, 0, Some("VMAC_vmac_cm_core_dense"));
         execute_matmul(&op, &mut ctx);
+        ctx.force_commit_all_pending(); // commit the deferred MAC-latency write
 
         let acc = ctx.accumulator.read_wide(0);
         for i in 0..32 {
@@ -1715,6 +1718,7 @@ mod tests {
         op.element_type = Some(ElementType::BFloat16);
 
         let handled = execute_matmul(&op, &mut ctx);
+        ctx.force_commit_all_pending(); // commit the deferred MAC-latency write
         assert!(handled);
 
         let acc = ctx.accumulator.read_wide(0);
@@ -1741,6 +1745,7 @@ mod tests {
         let op = make_mac_op(SemanticOp::NegMul, 0, 2, 5, 0, None);
 
         let handled = execute_matmul(&op, &mut ctx);
+        ctx.force_commit_all_pending(); // commit the deferred MAC-latency write
         assert!(handled);
 
         let acc = ctx.accumulator.read_wide(0);
@@ -1770,6 +1775,7 @@ mod tests {
         let op = make_mac_op(SemanticOp::Mac, 0, 2, 5, 0, None);
 
         let handled = execute_matmul(&op, &mut ctx);
+        ctx.force_commit_all_pending(); // commit the deferred MAC-latency write
         assert!(handled);
 
         let acc = ctx.accumulator.read_wide(0);
@@ -1861,6 +1867,7 @@ mod tests {
         op.encoding_name = Some("VMAC_vmac_cm_core_sparse_wide".to_string());
 
         let handled = execute_matmul(&op, &mut ctx);
+        ctx.force_commit_all_pending(); // commit the deferred MAC-latency write
         assert!(handled);
 
         let acc = ctx.accumulator.read_wide(0);
@@ -1900,6 +1907,7 @@ mod tests {
         op.encoding_name = Some("VMAC_vmac_cm_core_sparse_wide".to_string());
 
         let handled = execute_matmul(&op, &mut ctx);
+        ctx.force_commit_all_pending(); // commit the deferred MAC-latency write
         assert!(handled);
 
         let acc = ctx.accumulator.read_wide(0);
