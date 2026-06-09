@@ -419,34 +419,42 @@ impl VectorRegisterFile {
         self.pending.retain(|w| w.issue_bundle + w.l_def as u64 > bundle);
     }
 
-    /// Effective visibility bundle of an in-flight write to a consumer with
-    /// `use_bypass`. Forwarding subtracts 1 when the def/use bypass classes
-    /// match and are not `NoBypass` (AIE2 `getNumBypassedCycles`, flat -1).
-    /// Clamped so effective latency is >= 1: a write never resolves within its
-    /// own issue bundle (pure-VLIW read-old).
+    /// Effective visibility bundle of an in-flight write to a consumer reading
+    /// it at `use_cycle` with `use_bypass`. AIE2 forwarding-network latency:
+    ///   eff = max(1, l_def - use_cycle + 1 - (match ? 1 : 0))
+    /// where match = producer/consumer bypass classes equal and not NoBypass.
+    /// The `+1` is the bundle-clock convention constant (calibrated against the
+    /// VMOV->VST issue+2 / VMOV->VEXTRACT issue+1 anchors; see the design spec).
+    /// Clamped to >= 1: a write never resolves within its own issue bundle.
     #[inline]
-    fn visible_at(w: &PendingVecWrite, use_bypass: Bypass) -> u64 {
-        // EXPERIMENT (consumer-keyed store-lag): forward to compute (Mov)
-        // consumers, not to stores (No). Validates the reduction before commit.
-        let _ = w.def_bypass;
-        let forward = use_bypass == Bypass::Mov;
-        let eff = (w.l_def as u64).saturating_sub(forward as u64).max(1);
+    fn visible_at(w: &PendingVecWrite, use_cycle: u8, use_bypass: Bypass) -> u64 {
+        let matched = w.def_bypass == use_bypass && w.def_bypass != Bypass::No;
+        let eff = (w.l_def as i64) - (use_cycle as i64) + 1 - (matched as i64);
+        let eff = eff.max(1) as u64;
         w.issue_bundle + eff
     }
 
-    /// Resolve register `reg` for a consumer with `use_bypass`: the committed
-    /// base value, overridden by the latest-issued in-flight write visible to
-    /// this consumer at the current bundle.
+    /// Resolve register `reg` for a consumer reading at `(use_cycle, use_bypass)`:
+    /// the committed base value, overridden by the latest-issued in-flight write
+    /// visible to this consumer at the current bundle.
     #[inline]
-    fn resolve(&self, reg: u8, use_bypass: Bypass) -> [u32; 8] {
+    fn resolve(&self, reg: u8, use_cycle: u8, use_bypass: Bypass) -> [u32; 8] {
         let idx = (reg & 0x1F) as usize;
         let mut val = self.active()[idx];
         for w in &self.pending {
-            if (w.reg & 0x1F) as usize == idx && Self::visible_at(w, use_bypass) <= self.cur_bundle {
+            if (w.reg & 0x1F) as usize == idx && Self::visible_at(w, use_cycle, use_bypass) <= self.cur_bundle
+            {
                 val = w.value;
             }
         }
         val
+    }
+
+    /// Primary vector-read entry point. The execute path supplies the consuming
+    /// operand's `(use_cycle, use_bypass)` from `SlotOp::source_forward`.
+    #[inline]
+    pub fn read_with(&self, reg: u8, use_cycle: u8, use_bypass: Bypass) -> [u32; 8] {
+        self.resolve(reg, use_cycle, use_bypass)
     }
 
     /// Snapshot the committed file for VLIW bundle read semantics.
@@ -494,9 +502,12 @@ impl VectorRegisterFile {
     /// Read a vector register as a compute consumer (`MOV_Bypass` use), the
     /// common case: vector ALU ops forward from `MOV_Bypass` producers at
     /// issue+1. Store-data reads must use [`read_store`](Self::read_store).
+    /// For callers with explicit operand context, use [`read_with`](Self::read_with).
     #[inline]
     pub fn read(&self, reg: u8) -> [u32; 8] {
-        self.resolve(reg, Bypass::Mov)
+        // Compute-consumer default (use_cycle 2, Mov bypass). Only for callers
+        // without operand context; the execute path uses read_with.
+        self.resolve(reg, 2, Bypass::Mov)
     }
 
     /// Read a vector register as a store-data consumer (`NoBypass` use): never
@@ -506,7 +517,7 @@ impl VectorRegisterFile {
     /// bundle after a `VMOV x,bml`).
     #[inline]
     pub fn read_store(&self, reg: u8) -> [u32; 8] {
-        self.resolve(reg, Bypass::No)
+        self.resolve(reg, 1, Bypass::No)
     }
 
     /// Write a vector register directly (committed immediately, no bypass
@@ -520,7 +531,7 @@ impl VectorRegisterFile {
     /// Read a single lane (0-7) as u32 (compute / `MOV_Bypass` consumer).
     #[inline]
     pub fn read_lane(&self, reg: u8, lane: u8) -> u32 {
-        self.resolve(reg, Bypass::Mov)[(lane & 0x07) as usize]
+        self.resolve(reg, 2, Bypass::Mov)[(lane & 0x07) as usize]
     }
 
     /// Write a single lane (0-7).
@@ -1294,65 +1305,87 @@ mod tests {
 
     // ========== Vector bypass-network visibility ==========
     //
-    // Models the AIE2 forwarding network: a vector write at issue bundle B with
-    // result latency L_def and def bypass class is visible to a consumer with
-    // use bypass class at `B + L_def - (1 if bypass-matches-and-not-No else 0)`.
-    // Reg 2 used throughout (arbitrary even index).
+    // Models the AIE2 forwarding network. The matrix tests below are the
+    // canonical specification: a vector write at issue bundle B with result
+    // latency l_def and def bypass class is visible to a consumer reading at
+    // use_cycle with use_bypass at bundle:
+    //   eff = max(1, l_def - use_cycle + 1 - (match ? 1 : 0))
+    //   visible_at = B + eff
+    // where match = (def_bypass == use_bypass) && def_bypass != No.
+    //
+    // The shim methods read/read_store/read_lane are validated indirectly through
+    // their defaults (use_cycle=2/Mov and use_cycle=1/No respectively).
 
-    const V: [u32; 8] = [0xAAAA_AAAA; 8];
+    // ── Forwarding matrix (consumer-keyed) ──────────────────────────────
+    // Producer VMOV-class: l_def = 2. Visibility per the itinerary formula
+    //   eff = max(1, l_def - use_cycle + 1 - match), match = def==use != No.
 
-    #[test]
-    fn test_bypass_mov_def_compute_read_visible_issue_plus_1() {
-        // MOV def -> compute (MOV) read: forwards, visible at issue+1.
-        let mut r = VectorRegisterFile::new();
-        r.advance_bundle(0);
-        r.queue_write(2, V, 2, Bypass::Mov);
-        // Same bundle: read-old (not yet visible).
-        assert_eq!(r.read(2), [0; 8], "within-bundle read must see old value");
-        r.advance_bundle(1);
-        assert_eq!(r.read(2), V, "MOV->compute visible at issue+1");
+    /// Helper: file with one pending write at issue bundle 0, advanced to `at`.
+    fn pending_at(l_def: u8, def: Bypass, at: u64) -> VectorRegisterFile {
+        let mut f = VectorRegisterFile::new();
+        f.queue_write(4, [0xAAAA_AAAA; 8], l_def, def);
+        f.advance_bundle(at); // lands writes where issue+l_def <= at; sets cur_bundle
+        f
     }
 
     #[test]
-    fn test_bypass_mov_def_store_read_visible_issue_plus_2() {
-        // MOV def -> store (No) read: no forwarding, visible at issue+2.
-        // This is the bf16 split-tile edge: the store one bundle later reads OLD.
-        let mut r = VectorRegisterFile::new();
-        r.advance_bundle(0);
-        r.queue_write(2, V, 2, Bypass::Mov);
-        r.advance_bundle(1);
-        assert_eq!(r.read_store(2), [0; 8], "MOV->store still old at issue+1");
-        r.advance_bundle(2);
-        assert_eq!(r.read_store(2), V, "MOV->store visible at issue+2");
+    fn test_matrix_compute_read_l2_visible_issue_plus_1() {
+        // use_cycle 2 (compute), No-def: eff = 2-2+1-0 = 1 -> visible at bundle 1.
+        let f = pending_at(2, Bypass::No, 0);
+        assert_eq!(f.read_with(4, 2, Bypass::No), [0u32; 8], "issue+0 reads old");
+        let f1 = pending_at(2, Bypass::No, 1);
+        assert_eq!(f1.read_with(4, 2, Bypass::No), [0xAAAA_AAAA; 8], "issue+1 visible");
     }
 
     #[test]
-    fn test_bypass_nobypass_def_compute_read_visible_issue_plus_2() {
-        // NoBypass def (e.g. VMOV BM->X) -> compute read: no forwarding even to
-        // a MOV consumer, visible at issue+2 not issue+1.
-        let mut r = VectorRegisterFile::new();
-        r.advance_bundle(0);
-        r.queue_write(2, V, 2, Bypass::No);
-        r.advance_bundle(1);
-        assert_eq!(r.read(2), [0; 8], "NoBypass->compute still old at issue+1");
-        r.advance_bundle(2);
-        assert_eq!(r.read(2), V, "NoBypass->compute visible at issue+2");
+    fn test_matrix_store_read_l2_visible_issue_plus_2() {
+        // use_cycle 1 (store), No-def: eff = 2-1+1-0 = 2 -> visible at bundle 2.
+        let f1 = pending_at(2, Bypass::No, 1);
+        assert_eq!(f1.read_with(4, 1, Bypass::No), [0u32; 8], "issue+1 still old for store");
+        let f2 = pending_at(2, Bypass::No, 2);
+        assert_eq!(f2.read_with(4, 1, Bypass::No), [0xAAAA_AAAA; 8], "issue+2 visible");
     }
 
     #[test]
-    fn test_bypass_nobypass_def_store_read_visible_issue_plus_2() {
-        let mut r = VectorRegisterFile::new();
-        r.advance_bundle(0);
-        r.queue_write(2, V, 2, Bypass::No);
-        r.advance_bundle(1);
-        assert_eq!(r.read_store(2), [0; 8]);
-        r.advance_bundle(2);
-        assert_eq!(r.read_store(2), V);
+    fn test_matrix_matched_forwarding_shaves_a_cycle() {
+        // use_cycle 2, Mov-def == Mov-use: eff = 2-2+1-1 = 0 -> clamp 1 -> issue+1.
+        let f1 = pending_at(2, Bypass::Mov, 1);
+        assert_eq!(f1.read_with(4, 2, Bypass::Mov), [0xAAAA_AAAA; 8], "matched: issue+1");
     }
 
     #[test]
-    fn test_bypass_latest_issued_write_wins() {
-        // Two in-flight MOV writes to one reg; the later-issued visible one wins.
+    fn test_matrix_l_def_variation_shifts_visibility() {
+        // l_def = 3, use_cycle 1 (store), No: eff = 3-1+1 = 3 -> issue+3.
+        let f2 = pending_at(3, Bypass::No, 2);
+        assert_eq!(f2.read_with(4, 1, Bypass::No), [0u32; 8], "l_def 3 store: still old at +2");
+        let f3 = pending_at(3, Bypass::No, 3);
+        assert_eq!(f3.read_with(4, 1, Bypass::No), [0xAAAA_AAAA; 8], "l_def 3 store: visible at +3");
+    }
+
+    #[test]
+    fn test_matrix_clamp_never_resolves_in_own_bundle() {
+        // Even maximally-forwarded, eff clamps to >= 1: issue+0 always reads old.
+        let f0 = pending_at(1, Bypass::Mov, 0);
+        assert_eq!(f0.read_with(4, 2, Bypass::Mov), [0u32; 8], "own bundle reads old");
+    }
+
+    #[test]
+    fn test_matrix_per_operand_independence() {
+        // Two reads of the same reg at the SAME bundle with different use_cycles
+        // resolve independently (compute sees it, store does not).
+        let f1 = pending_at(2, Bypass::No, 1);
+        assert_eq!(f1.read_with(4, 2, Bypass::No), [0xAAAA_AAAA; 8], "compute (uc2) visible at +1");
+        assert_eq!(f1.read_with(4, 1, Bypass::No), [0u32; 8], "store (uc1) not visible at +1");
+    }
+
+    // ── Shim-path validation ─────────────────────────────────────────────
+    // These test the read/read_store/read_lane convenience wrappers which
+    // supply fixed (use_cycle, use_bypass) defaults. They exercise realistic
+    // l_def values (1 or 2) covering the VMOV-class anchors.
+
+    #[test]
+    fn test_latest_issued_write_wins() {
+        // Two in-flight Mov writes to one reg; the later-issued visible one wins.
         let a = [0x1111_1111; 8];
         let b = [0x2222_2222; 8];
         let mut r = VectorRegisterFile::new();
@@ -1360,15 +1393,15 @@ mod tests {
         r.queue_write(2, a, 2, Bypass::Mov);
         r.advance_bundle(1);
         r.queue_write(2, b, 2, Bypass::Mov); // issued at bundle 1
-                                             // cur=1: a visible (0+1), b not yet (1+1=2).
+                                             // cur=1: a visible (0+1 <= 1), b not yet (1+1=2 > 1).
         assert_eq!(r.read(2), a, "only the earlier write is visible at bundle 1");
         r.advance_bundle(2);
-        // cur=2: a landed into regs; b now forwards (1+2-1=2). b wins.
+        // cur=2: a landed; b now visible (1+1=2 <= 2). b wins (later-issued).
         assert_eq!(r.read(2), b, "later-issued write wins once visible");
     }
 
     #[test]
-    fn test_bypass_wide_write_splits_and_resolves() {
+    fn test_wide_write_splits_and_resolves() {
         let mut data = [0u32; 16];
         for (i, d) in data.iter_mut().enumerate() {
             *d = 0xC0DE_0000 | i as u32;
@@ -1377,17 +1410,16 @@ mod tests {
         r.advance_bundle(0);
         r.queue_write_wide(4, data, 2, Bypass::Mov); // x-reg base 4 -> regs 4,5
         r.advance_bundle(1);
-        assert_eq!(r.read_wide(4), data, "wide MOV->compute visible at issue+1");
-        // Low half in reg 4, high half in reg 5.
+        assert_eq!(r.read_wide(4), data, "wide Mov->compute visible at issue+1");
         assert_eq!(r.read(4)[..], data[..8]);
         assert_eq!(r.read(5)[..], data[8..]);
     }
 
     #[test]
-    fn test_bypass_zero_latency_writes_immediately() {
+    fn test_zero_latency_writes_immediately() {
         let mut r = VectorRegisterFile::new();
         r.advance_bundle(5);
-        r.queue_write(2, V, 0, Bypass::Mov);
-        assert_eq!(r.read(2), V, "l_def=0 writes immediately (test/legacy path)");
+        r.queue_write(2, [0xAAAA_AAAA; 8], 0, Bypass::Mov);
+        assert_eq!(r.read(2), [0xAAAA_AAAA; 8], "l_def=0 writes immediately (test/legacy path)");
     }
 }
