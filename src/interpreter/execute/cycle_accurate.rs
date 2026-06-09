@@ -27,7 +27,7 @@
 
 use crate::device::arch_handle;
 use crate::device::tile::Tile;
-use crate::interpreter::bundle::{SlotOp, VliwBundle};
+use crate::interpreter::bundle::{Operand, SlotOp, VliwBundle};
 use xdna_archspec::aie2::isa::SemanticOp;
 use crate::interpreter::state::{EventType, ExecutionContext};
 use crate::interpreter::timing::{HazardDetector, HazardStats, MemoryAccess, MemoryModel, MemoryQuadrant};
@@ -710,6 +710,24 @@ impl CycleAccurateExecutor {
         // from BEFORE the load writes it.
         ctx.begin_bundle();
 
+        // Same-bundle scalar->shift forwarding. AIE2 writes an S register at
+        // pipeline stage E1 but UPS/SRS sample their shift operand at E7
+        // (llvm-aie AIE2Schedule.td: RAW latency -5), so a shift-setup
+        // `MOV sN,#imm` bundled with its consumer must forward the new value.
+        // Record those immediate writes before any slot executes; only
+        // shift-operand reads consult them (ctx.shift_forward) -- general reads
+        // keep pure read-old semantics. (Compiled UPS does exactly this: the
+        // first vlda.ups is bundled with its `mov s0,#shift`.)
+        for slot_idx in &execution_order {
+            if let Some(ref op) = bundle.slots()[*slot_idx as usize] {
+                if op.semantic == Some(SemanticOp::Copy) && op.sources.len() == 1 {
+                    if let (Some(Operand::ScalarReg(r)), Operand::Immediate(v)) = (&op.dest, &op.sources[0]) {
+                        ctx.record_bundle_scalar_imm(*r, *v as u32);
+                    }
+                }
+            }
+        }
+
         for slot_idx in &execution_order {
             if let Some(ref op) = bundle.slots()[*slot_idx as usize] {
                 // Reborrow neighbors for each slot operation
@@ -925,6 +943,62 @@ mod tests {
     fn test_cycle_accurate_creation() {
         let executor = CycleAccurateExecutor::new();
         assert!(executor.is_cycle_accurate());
+    }
+
+    /// Same-bundle scalar->shift forwarding: `MOV s0, #4` and
+    /// `VLDA.UPS.s32.s16 bml0, s0, [p0]` in one VLIW bundle. The S register is
+    /// written at pipeline stage E1; the UPS samples its shift operand at E7
+    /// (llvm-aie AIE2Schedule.td gives RAW latency -5), so the UPS must see the
+    /// NEW s0=4. A pure read-old snapshot leaves the load unshifted. Surfaced by
+    /// the compiled vec_ups_i32 kernel, whose first UPS load is bundled with its
+    /// shift-setup MOV (scalar regs are 0 at entry, so without forwarding the
+    /// first 16 lanes come out unshifted).
+    #[test]
+    fn test_same_bundle_scalar_forwards_to_ups_shift() {
+        use crate::interpreter::bundle::ElementType;
+        use crate::interpreter::decode::register_map::AccumWidth;
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+
+        // 16 int16 values at local 0x200.
+        let vals: [i16; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        for i in 0..16 {
+            let b = (vals[i] as u16).to_le_bytes();
+            tile.data_memory_mut()[0x200 + i * 2] = b[0];
+            tile.data_memory_mut()[0x200 + i * 2 + 1] = b[1];
+        }
+        ctx.pointer.write(0, 0x70200);
+        ctx.scalar.write(0, 0); // pre-bundle s0 = 0; the same-bundle MOV sets the shift
+
+        // Scalar0: MOV s0, #4   (E1 write of the shift)
+        let mov = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::Immediate(4));
+
+        // LoadA: vlda.ups.s32.s16 bml0, s0, [p0]   (E7 read of the shift)
+        let mut ups = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Ups)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0));
+        ups.from_type = Some(ElementType::Int16);
+        ups.element_type = Some(ElementType::Int32);
+        ups.accum_width = Some(AccumWidth::Half);
+        ups.mem_width = MemWidth::Vector256;
+        ups.is_vector = true;
+
+        executor.execute(&make_bundle(vec![mov, ups]), &mut ctx, &mut tile);
+
+        // acc32 packs two int32 per u64: lane[2j]=acc[j] low, lane[2j+1]=high.
+        // With the same-bundle shift forwarded, every lane = value << 4.
+        let acc = ctx.accumulator.read(0);
+        for j in 0..8usize {
+            let lo = (acc[j] & 0xFFFF_FFFF) as i32;
+            let hi = (acc[j] >> 32) as i32;
+            assert_eq!(lo, (vals[2 * j] as i32) << 4, "lane {}", 2 * j);
+            assert_eq!(hi, (vals[2 * j + 1] as i32) << 4, "lane {}", 2 * j + 1);
+        }
     }
 
     #[test]

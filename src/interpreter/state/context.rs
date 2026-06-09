@@ -222,6 +222,15 @@ pub struct ExecutionContext {
     pointer_snapshot: Option<PointerRegisterFile>,
     modifier_snapshot: Option<ModifierRegisterFile>,
 
+    /// Same-bundle scalar immediate-MOV writes, for shift/control-operand
+    /// forwarding only. AIE2 writes an S register at pipeline stage E1 but
+    /// UPS/SRS read their shift operand at E7 (llvm-aie AIE2Schedule.td gives
+    /// RAW latency -5), so a shift-setup `MOV sN,#imm` bundled with its consumer
+    /// must forward the new value. This is deliberately NOT consulted by general
+    /// scalar reads -- those keep pure read-old VLIW semantics (e.g. a same-bundle
+    /// `st rX` must capture rX's pre-write value). (reg, value), last writer wins.
+    bundle_shift_forward: Vec<(u8, u32)>,
+
     // === Branch Delay Slot Support ===
     /// Pending branch waiting for delay slots to complete.
     /// AIE2 has 5-cycle branch delay slots - after a branch is decided,
@@ -377,6 +386,7 @@ impl ExecutionContext {
             scalar_snapshot: None,
             pointer_snapshot: None,
             modifier_snapshot: None,
+            bundle_shift_forward: Vec::new(),
             pending_branch: None,
             pending_writes: Vec::new(),
             pending_stores: Vec::new(),
@@ -586,6 +596,7 @@ impl ExecutionContext {
         self.scalar_snapshot = Some(self.scalar.clone());
         self.pointer_snapshot = Some(self.pointer.clone());
         self.modifier_snapshot = Some(self.modifier.clone());
+        self.bundle_shift_forward.clear();
         // Vector/accumulator/mask use an in-file shadow snapshot (the read
         // surface is too broad to route through context accessors). Same
         // pure-VLIW read-old/write-new semantics: in-bundle reads see
@@ -607,6 +618,24 @@ impl ExecutionContext {
         self.vector.end_bundle();
         self.accumulator.end_bundle();
         self.mask.end_bundle();
+    }
+
+    /// Record a same-bundle scalar immediate-MOV write (`MOV sN, #imm`) for
+    /// shift/control-operand forwarding. Called by the bundle pre-pass before
+    /// any slot executes, so a shift read sees the new value even though the
+    /// MOV's own slot executes later in the bundle.
+    #[inline]
+    pub fn record_bundle_scalar_imm(&mut self, reg: u8, value: u32) {
+        self.bundle_shift_forward.push((reg, value));
+    }
+
+    /// Forwarded value of a scalar register written by a same-bundle immediate
+    /// MOV, for shift/control operand reads (E7) ONLY. `None` if no such write
+    /// occurred this bundle. General scalar reads must NOT use this -- they keep
+    /// pure read-old VLIW semantics. Last writer in the bundle wins.
+    #[inline]
+    pub fn shift_forward(&self, reg: u8) -> Option<u32> {
+        self.bundle_shift_forward.iter().rev().find(|(r, _)| *r == reg).map(|(_, v)| *v)
     }
 
     // === Deferred Write Methods ===

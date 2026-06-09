@@ -781,7 +781,12 @@ impl MemoryUnit {
         for src in &op.sources {
             match src {
                 Operand::Immediate(imm) => return *imm as u32,
-                Operand::ScalarReg(r) => return ctx.scalar_read(*r),
+                // The shift operand reads at pipeline stage E7, so a same-bundle
+                // `MOV sN,#imm` (written at E1) forwards -- consult shift_forward
+                // before the read-old snapshot. See ExecutionContext::shift_forward.
+                Operand::ScalarReg(r) => {
+                    return ctx.shift_forward(*r).unwrap_or_else(|| ctx.scalar_read(*r));
+                }
                 _ => {}
             }
         }

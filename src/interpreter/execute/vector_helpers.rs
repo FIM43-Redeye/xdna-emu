@@ -265,7 +265,9 @@ impl VectorAlu {
                 return *imm as u32;
             }
             if let Operand::ScalarReg(r) = src {
-                return ctx.scalar_read(*r);
+                // The shift operand reads at pipeline stage E7, so a same-bundle
+                // `MOV sN,#imm` (written at E1) forwards. See shift_forward.
+                return ctx.shift_forward(*r).unwrap_or_else(|| ctx.scalar_read(*r));
             }
         }
         0 // Default: no shift
