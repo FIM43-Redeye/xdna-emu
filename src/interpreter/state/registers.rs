@@ -334,16 +334,13 @@ impl fmt::Debug for ModifierRegisterFile {
     }
 }
 
-/// Vector register file.
-///
-/// 32 × 256-bit SIMD registers (v0-v31).
-/// Each register holds 8 × 32-bit, 16 × 16-bit, or 32 × 8-bit elements.
 /// An in-flight vector-register write awaiting bypass-network visibility.
 ///
-/// Vector results become visible to a consumer at `issue_bundle + l_def`
-/// (the architectural / `NoBypass` latency), reduced by 1 when the producer's
-/// def bypass class matches the consumer's use bypass class (forwarding). See
-/// [`VectorRegisterFile::resolve`].
+/// Carries the producer-side facts (result latency `l_def`, def bypass class
+/// `def_bypass`, and the `issue_bundle` it was queued in). Visibility is
+/// *consumer-keyed*: when each read happens determines what it sees, computed
+/// from these producer facts plus the consumer's `(use_cycle, use_bypass)` by
+/// [`VectorRegisterFile::visible_at`].
 #[derive(Clone, Copy, Debug)]
 struct PendingVecWrite {
     reg: u8,
@@ -353,6 +350,10 @@ struct PendingVecWrite {
     def_bypass: Bypass,
 }
 
+/// Vector register file.
+///
+/// 32 × 256-bit SIMD registers (v0-v31).
+/// Each register holds 8 × 32-bit, 16 × 16-bit, or 32 × 8-bit elements.
 #[derive(Clone)]
 pub struct VectorRegisterFile {
     /// Each register is 256 bits = 8 × u32. Holds *committed* (fully-landed)
@@ -1349,6 +1350,8 @@ mod tests {
     #[test]
     fn test_matrix_matched_forwarding_shaves_a_cycle() {
         // use_cycle 2, Mov-def == Mov-use: eff = 2-2+1-1 = 0 -> clamp 1 -> issue+1.
+        let f0 = pending_at(2, Bypass::Mov, 0);
+        assert_eq!(f0.read_with(4, 2, Bypass::Mov), [0u32; 8], "matched: own bundle reads old");
         let f1 = pending_at(2, Bypass::Mov, 1);
         assert_eq!(f1.read_with(4, 2, Bypass::Mov), [0xAAAA_AAAA; 8], "matched: issue+1");
     }
