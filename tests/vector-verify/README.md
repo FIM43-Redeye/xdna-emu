@@ -46,10 +46,10 @@ for the corresponding vector class (plan Task 3 -> Task 5 Verified flip).
 | `vec_srs_i32` | SRS | **EMU-smoke PASS** (chess) -- first compiled vector kernel through the decode->execute interpreter. Surfaced + fixed a four-bug cascade (wide-cm SRS panic 4472bfb; VMOV-q 5570f5d; fused post-inc dispatch + get_address 960975a; VLIW vector/accum/mask snapshot 13534bc). See `docs/superpowers/plans/2026-06-08-q-register-vector-modeling.md`. |
 | `vec_ups_i32` | UPS | **EMU-smoke PASS** (chess) -- first GENERATED kernel (`tools/gen_vector_kernel.py`). Surfaced + fixed two interpreter gaps: wide acc32->x VMOV as a raw 512-bit reinterpret (80e7ba7), and same-bundle scalar->UPS-shift forwarding (724548e, E1->E7 per llvm-aie AIE2Schedule.td). |
 | `vec_pack_i16` | Pack | **EMU-smoke PASS** (chess) -- generated; native VPACK int16->int8 (truncating, not saturating). No new interpreter gap. |
+| `vec_conv_bf16` | Convert (f32->bf16) | **EMU-smoke PASS** (chess) -- generated; round-narrow via accfloat accumulator, `VST.CONV.bf16.fp32`, ConvEven. Surfaced + fixed an interpreter gap: the convert path hardcoded bit-truncation, ignoring the configured rounding mode (47% of the 438-record golden slice are round-ups it would have failed). Fix threads `ctx.srs_config.rounding_mode` into `vector_convert` / the vst.conv fast path. Needed a generator extension (`Buf.ktype` host-vs-kernel type split for bit-pattern staging; `select_records` predicate for normal-finite-f32 filtering). Denormal/NaN/Inf inputs deferred (HW-gated FTZ + canonicalization edges). |
 | `vec_mac_i8` | MatMul int (i8) | todo |
 | `vec_mac_i16` | MatMul int (i16) | todo |
 | `vec_mac_bf16` | MatMul bf16 | todo |
-| `vec_conv_bf16` | Convert (bf16<->f32) | todo |
 
 `vec_eltwise_add` is the proof-of-pattern: once its author -> stage -> compile ->
 EMU-smoke loop is green, the rest follow the same template (`runtime_cumsum`-

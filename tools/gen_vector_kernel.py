@@ -27,11 +27,25 @@ from typing import List, Optional, Tuple
 
 @dataclass(frozen=True)
 class Buf:
-    """One DMA-connected buffer: host C type + MLIR element type."""
+    """One DMA-connected buffer.
+
+    `ctype` is the host-staging C type used for the baked golden array and the
+    XRT buffer (so exact bit patterns move byte-for-byte over DMA). `mlir` is
+    the MLIR element type. `ktype` is the kernel-signature C type when it
+    differs from `ctype` -- e.g. the f32->bf16 conv kernel stages uint32/uint16
+    bit patterns on the host but the kernel reads `float`/`bfloat16`. When
+    `ktype` is unset, the kernel uses the host type.
+    """
 
     name: str
     ctype: str
     mlir: str
+    ktype: Optional[str] = None
+
+    @property
+    def kernel_ctype(self):
+        """C type seen in the kernel signature (falls back to the host type)."""
+        return self.ktype if self.ktype else self.ctype
 
 
 @dataclass
@@ -73,13 +87,17 @@ def _format_c_array(name, ctype, values, per_line=8, indent="    "):
             f"{body}\n}};")
 
 
-def select_records(records, filt, value_range=None, value_field="value"):
+def select_records(records, filt, value_range=None, value_field="value",
+                   predicate=None):
     """Filter a golden class's records to a single config slice, in corpus order.
 
     `filt` is a dict of field==value constraints (e.g. {"shift": 4, "sat": True}).
     `value_range`, if given, is an inclusive (lo, hi) bound on `value_field` --
     used to keep only host-representable inputs (e.g. int32-representable
-    accumulator values). Order is preserved so a baked array is reproducible.
+    accumulator values). `predicate`, if given, is a callable(record) -> bool
+    for constraints a single range can't express (e.g. "the f32 bit pattern is
+    a normal finite value", which is two sign-split ranges). Order is preserved
+    so a baked array is reproducible.
     """
     out = []
     for r in records:
@@ -89,6 +107,8 @@ def select_records(records, filt, value_range=None, value_field="value"):
             lo, hi = value_range
             if not (lo <= r[value_field] <= hi):
                 continue
+        if predicate is not None and not predicate(r):
+            continue
         out.append(r)
     return out
 
@@ -207,7 +227,8 @@ def _bake_io(spec, golden):
     """Select the spec's golden slice and bake (input, expected) arrays to N."""
     g = spec.golden
     recs = select_records(
-        golden[g["class"]], g["filt"], g.get("value_range")
+        golden[g["class"]], g["filt"], g.get("value_range"),
+        predicate=g.get("predicate"),
     )
     in_vals = bake_array(recs, g.get("value_field", "value"), spec.n)
     exp_vals = bake_array(recs, g.get("expected_field", "expected"), spec.n)
@@ -315,9 +336,13 @@ $body}
 
 
 def _signature(spec):
-    """`<ctype> *restrict <name>` for each input then the output, comma-joined."""
+    """`<ktype> *restrict <name>` for each input then output, comma-joined.
+
+    Uses each buffer's kernel-signature type (which may differ from the host
+    staging type), so a bit-pattern-staged buffer is seen as its real type.
+    """
     bufs = list(spec.inputs) + [spec.output]
-    return ", ".join(f"{b.ctype} *restrict {b.name}" for b in bufs)
+    return ", ".join(f"{b.kernel_ctype} *restrict {b.name}" for b in bufs)
 
 
 def render_kernel(spec):

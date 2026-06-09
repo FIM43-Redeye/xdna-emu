@@ -173,9 +173,56 @@ class TestRegistry:
         from vector_kernel_specs import SPECS
         for name, spec in SPECS.items():
             g = spec.golden
-            recs = select_records(GOLDEN[g["class"]], g["filt"], g.get("value_range"))
+            recs = select_records(GOLDEN[g["class"]], g["filt"],
+                                  g.get("value_range"), predicate=g.get("predicate"))
             assert recs, f"{name}: golden slice is empty"
             assert len(recs) <= spec.n, f"{name}: {len(recs)} records > N={spec.n}"
+
+
+class TestKernelTypeSplit:
+    """A Buf's host-staging C type (for baking golden bit patterns) can differ
+    from the kernel-signature type. The f32->bf16 conv kernel stages uint32/
+    uint16 bit patterns on the host but the kernel reads float/bfloat16."""
+
+    def test_buf_kernel_ctype_defaults_to_host_ctype(self):
+        assert Buf("x", "int32_t", "i32").kernel_ctype == "int32_t"
+
+    def test_buf_kernel_ctype_overrides_when_set(self):
+        assert Buf("x", "uint32_t", "f32", ktype="float").kernel_ctype == "float"
+
+    def test_signature_uses_kernel_ctype_not_host_ctype(self):
+        from gen_vector_kernel import _signature
+        spec = KernelSpec(
+            name="vec_conv_bf16", func="conv_bf16", doc="conv.",
+            inputs=[Buf("in", "uint32_t", "f32", ktype="float")],
+            output=Buf("out", "uint16_t", "bf16", ktype="bfloat16"),
+            n=16, golden={"class": "bf16_srs", "filt": {"rnd": 12}},
+            body="  // body\n",
+        )
+        assert _signature(spec) == "float *restrict in, bfloat16 *restrict out"
+
+    def test_test_cpp_buffers_use_host_staging_ctype(self):
+        # Host buffers + baked arrays use the staging type (uint32/uint16),
+        # so exact golden bit patterns are moved byte-for-byte over DMA.
+        spec = KernelSpec(
+            name="vec_conv_bf16", func="conv_bf16", doc="conv.",
+            inputs=[Buf("in", "uint32_t", "f32", ktype="float")],
+            output=Buf("out", "uint16_t", "bf16", ktype="bfloat16"),
+            n=600, golden={"class": "bf16_srs", "filt": {"rnd": 12}},
+            body="  // body\n",
+        )
+        cpp = render_test_cpp(spec, GOLDEN)
+        assert "uint32_t *bufIn" in cpp
+        assert "uint16_t *bufOut" in cpp
+
+
+class TestSelectRecordsPredicate:
+    def test_predicate_filters_records_in_order(self):
+        recs = [{"value": 1, "rnd": 12}, {"value": 2, "rnd": 12},
+                {"value": 3, "rnd": 12}, {"value": 4, "rnd": 8}]
+        out = select_records(recs, {"rnd": 12},
+                             predicate=lambda r: r["value"] % 2 == 1)
+        assert [r["value"] for r in out] == [1, 3]
 
 
 class TestKernelHeaderFormatting:

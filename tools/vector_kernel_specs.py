@@ -21,6 +21,21 @@ def _reg(spec):
     return spec
 
 
+def _is_normal_f32(rec):
+    """The record's f32 bit pattern (in `value`) is a normal finite number.
+
+    True iff the biased exponent is in 1..254 -- i.e. not a denormal (exp=0)
+    and not Inf/NaN (exp=255). Those edges are deliberately excluded from the
+    conv capture kernel: the bf16_srs model does NOT flush denormal inputs to
+    zero (e.g. 0x10000 -> 1) whereas the execute path's input FTZ would, and
+    NaN canonicalization differs between the model and NPU1 silicon (the Half-A
+    bf16 NaN finding). Restricting to normals isolates the rounding datapath --
+    the actual subject of the kernel -- from those separate HW-gated questions.
+    """
+    exp = (rec["value"] >> 23) & 0xFF
+    return 1 <= exp <= 254
+
+
 # --- SRS: accumulator (acc64) -> narrower vector (int16), shift-round-saturate.
 # This is the committed vec_srs_i32 kernel expressed as a spec; the generator
 # regenerates it bit-for-bit on the golden arrays (validation anchor).
@@ -118,6 +133,45 @@ _reg(KernelSpec(
   for (int i = 0; i < PACK_N; i += 32) {
     aie::vector<int16_t, 32> v = aie::load_v<32>(in + i);
     aie::vector<int8_t, 32> o = v.pack<int8_t>();
+    aie::store_v(out + i, o);
+  }
+  event1();
+""",
+))
+
+
+# --- Convert: round-narrow f32 -> bf16 via an accfloat accumulator. The host
+# stages exact f32/bf16 bit patterns (uint32/uint16); the kernel reads them as
+# float/bfloat16. `accum<accfloat>(v).to_vector<bfloat16>()` is the SRS-style
+# round-narrow (Chess `to_v16bfloat16`), governed by the configured rounding
+# mode (crRnd). We pick conv_even (round-to-nearest, ties to even): unlike
+# Floor it rounds positive values up, so a positive batch already distinguishes
+# rounding from bit-truncation. Slice = all normal-finite inputs of the Half-A
+# `bf16_srs` golden at rnd=12 (both signs), padded to a 16-multiple.
+_reg(KernelSpec(
+    name="vec_conv_bf16",
+    func="conv_bf16",
+    doc="Convert (round-narrow), f32 -> bf16 through an accfloat accumulator. "
+        "Config: rounding=conv_even (round-to-nearest, ties to even), normal "
+        "finite inputs -- the matching slice of the Half-A `bf16_srs` golden "
+        "(rnd=12). HW: crRnd governs to_v16bfloat16, so set_rounding selects "
+        "the mode; the emulator's convert path honors it.",
+    inputs=[Buf("in", "uint32_t", "f32", ktype="float")],
+    output=Buf("out", "uint16_t", "bf16", ktype="bfloat16"),
+    n=448,
+    golden={
+        "class": "bf16_srs",
+        "filt": {"rnd": 12},
+        "predicate": _is_normal_f32,
+    },
+    defines=[("CONV_N", 448)],
+    body="""  event0();
+  ::aie::set_rounding(aie::rounding_mode::conv_even);
+
+  for (int i = 0; i < CONV_N; i += 16) {
+    aie::vector<float, 16> v = aie::load_v<16>(in + i);
+    aie::accum<accfloat, 16> acc(v);
+    aie::vector<bfloat16, 16> o = acc.to_vector<bfloat16>();
     aie::store_v(out + i, o);
   }
   event1();
