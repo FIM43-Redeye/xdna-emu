@@ -282,6 +282,52 @@ class TestMatmulSupport:
         assert "int32_t *bufOut" in cpp
         assert "INA" in cpp and "INB" in cpp and "EXP" in cpp
 
+    def test_bake_matmul_honors_predicate(self):
+        """bake_matmul forwards a record predicate to select_records, so a
+        matmul spec can exclude records whose expected output has NaN/Inf lanes
+        (the bf16 overflow edge that breaks an exact bit-compare)."""
+        from gen_vector_kernel import Matmul, bake_matmul, select_records
+        filt = {"a_type": "BFloat16", "b_type": "BFloat16", "rows": 4,
+                "inner": 8, "cols": 4, "subtract": False}
+        finite = lambda r: all(((b >> 23) & 0xFF) != 0xFF for b in r["expected"])
+        full = select_records(GOLDEN["matmul"], filt)
+        clean = select_records(GOLDEN["matmul"], filt, predicate=finite)
+        # The predicate must actually drop records (bf16 slice has overflow).
+        assert 0 < len(clean) < len(full)
+        mm = Matmul(M=4, K=8, N=4, a_bytes=2, b_bytes=2,
+                    batch=len(clean), bfloat=True)
+        A, B, C = bake_matmul(GOLDEN["matmul"], filt, mm, predicate=finite)
+        # No baked C lane is NaN/Inf (exp field 0xFF) -> exact bit-compare safe.
+        assert all(((c >> 23) & 0xFF) != 0xFF for c in C)
+        assert len(C) == len(clean) * mm.size_c
+
+    def test_render_test_cpp_passes_spec_predicate_to_bake(self):
+        """A matmul spec's golden predicate reaches bake_matmul through
+        render_test_cpp (not just direct bake_matmul calls)."""
+        from gen_vector_kernel import Buf, KernelSpec, Matmul, render_test_cpp
+        finite = lambda r: all(((b >> 23) & 0xFF) != 0xFF for b in r["expected"])
+        spec = KernelSpec(
+            name="vec_mac_bf16", func="mac_bf16", doc="bf16 matmul.",
+            inputs=[Buf("inA", "uint16_t", "bf16", ktype="bfloat16"),
+                    Buf("inB", "uint16_t", "bf16", ktype="bfloat16")],
+            output=Buf("out", "uint32_t", "f32", ktype="float"),
+            n=0,
+            golden={"class": "matmul",
+                    "filt": {"a_type": "BFloat16", "b_type": "BFloat16",
+                             "rows": 4, "inner": 8, "cols": 4,
+                             "subtract": False},
+                    "predicate": finite},
+            matmul=Matmul(M=4, K=8, N=4, a_bytes=2, b_bytes=2,
+                          batch=24, bfloat=True),
+            body="  // bf16 mmul body\n",
+        )
+        cpp = render_test_cpp(spec, GOLDEN)
+        import re
+        m = re.search(r"EXP\[\w+\]\s*=\s*\{([^}]*)\}", cpp, re.S)
+        exp = [int(x) for x in re.findall(r"-?\d+", m.group(1))]
+        # Predicate applied: no NaN/Inf lanes in the baked expected.
+        assert exp and all(((c & 0xFFFFFFFF) >> 23) & 0xFF != 0xFF for c in exp)
+
 
 def _mac_i8_spec():
     from gen_vector_kernel import Buf, KernelSpec, Matmul

@@ -176,17 +176,20 @@ def unpack_vec512(words, count, bytes_per, signed=True):
     ]
 
 
-def bake_matmul(records, filt, mm):
+def bake_matmul(records, filt, mm, predicate=None):
     """Bake (A, B, C) host arrays for a batch of row-major matmul tiles.
 
-    Selects the matmul config slice (`filt`), unpacks each record's
-    row-major-packed a/b vec512 into M*K / K*N elements, and concatenates
-    `mm.batch` independent tiles into flat A and B buffers. C is the golden's
-    row-major M*N `expected` output taken verbatim (int32 lanes for integer
-    configs, fp32 bit patterns for bf16). The unpacked row-major A.B reproduces
-    the golden expected (verified against the corpus), so no value is recomputed.
+    Selects the matmul config slice (`filt`, with an optional record
+    `predicate`), unpacks each record's row-major-packed a/b vec512 into
+    M*K / K*N elements, and concatenates `mm.batch` independent tiles into flat
+    A and B buffers. C is the golden's row-major M*N `expected` output taken
+    verbatim (int32 lanes for integer configs, fp32 bit patterns for bf16). The
+    unpacked row-major A.B reproduces the golden expected (verified against the
+    corpus), so no value is recomputed. `predicate` excludes records a flat
+    filter can't (e.g. bf16 tiles whose expected has NaN/Inf overflow lanes,
+    which would break the exact bit-compare).
     """
-    recs = select_records(records, filt)
+    recs = select_records(records, filt, predicate=predicate)
     assert len(recs) >= mm.batch, f"{len(recs)} matmul records < batch {mm.batch}"
     signed = not mm.bfloat
     a_out, b_out, c_out = [], [], []
@@ -420,8 +423,9 @@ def render_test_cpp(spec, golden):
     """
     if spec.matmul is not None:
         mm = spec.matmul
-        a_vals, b_vals, c_vals = bake_matmul(golden[spec.golden["class"]],
-                                             spec.golden["filt"], mm)
+        a_vals, b_vals, c_vals = bake_matmul(
+            golden[spec.golden["class"]], spec.golden["filt"], mm,
+            predicate=spec.golden.get("predicate"))
         return _TEST_CPP_MATMUL_TMPL.substitute(
             name=spec.name,
             gclass=spec.golden["class"],

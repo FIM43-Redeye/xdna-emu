@@ -36,6 +36,19 @@ def _is_normal_f32(rec):
     return 1 <= exp <= 254
 
 
+def _all_expected_finite_f32(rec):
+    """Every lane of the record's `expected` (fp32 bit patterns) is finite.
+
+    True iff no expected lane is NaN or Inf (biased exponent != 255). Used by
+    the bf16 matmul capture to exclude overflow tiles: an Inf result is bit-
+    comparable but a NaN's bit pattern differs between the aietools model and
+    NPU1 silicon (the Half-A bf16 NaN finding), which would break the exact
+    bit-compare. Restricting to all-finite tiles isolates the mmul accumulate/
+    round datapath -- the subject of the kernel -- from the overflow edge.
+    """
+    return all(((bits >> 23) & 0xFF) != 0xFF for bits in rec["expected"])
+
+
 # --- SRS: accumulator (acc64) -> narrower vector (int16), shift-round-saturate.
 # This is the committed vec_srs_i32 kernel expressed as a spec; the generator
 # regenerates it bit-for-bit on the golden arrays (validation anchor).
@@ -208,6 +221,77 @@ _reg(KernelSpec(
     MMUL m;
     m.mul(a, b);
     aie::store_v(out + n * MMUL::size_C, m.to_vector<int32>());
+  }
+  event1();
+""",
+))
+
+
+# --- MatMul: native AIE2 mmul tile, int16 x int16 -> int32 accumulator, 4x2x8.
+# Same compiled-mmul datapath as vec_mac_i8 with a different element width and
+# tile shape (K=2, N=8). The acc32 accumulator wraps at int32 (no saturation),
+# so the golden `expected` -- taken verbatim -- already carries the wrapped
+# lanes the kernel produces; the comparison stays exact.
+_reg(KernelSpec(
+    name="vec_mac_i16",
+    func="mac_i16",
+    doc="MatMul (native mmul tile), int16 x int16 -> int32, 4x2x8. A batch of "
+        "independent row-major tiles from the Half-A `matmul` golden (Int16/"
+        "Int16, subtract=false); each C = A.B with int32 accumulator wrap.",
+    inputs=[Buf("inA", "int16_t", "i16"), Buf("inB", "int16_t", "i16")],
+    output=Buf("out", "int32_t", "i32"),
+    n=0,
+    golden={"class": "matmul",
+            "filt": {"a_type": "Int16", "b_type": "Int16", "rows": 4,
+                     "inner": 2, "cols": 8, "subtract": False}},
+    matmul=Matmul(M=4, K=2, N=8, a_bytes=2, b_bytes=2, batch=64),
+    defines=[("MAC_BATCH", 64)],
+    body="""  event0();
+  using MMUL = aie::mmul<4, 2, 8, int16, int16, accauto>;
+  for (int n = 0; n < MAC_BATCH; n++) {
+    aie::vector<int16, MMUL::size_A> a = aie::load_v<MMUL::size_A>(inA + n * MMUL::size_A);
+    aie::vector<int16, MMUL::size_B> b = aie::load_v<MMUL::size_B>(inB + n * MMUL::size_B);
+    MMUL m;
+    m.mul(a, b);
+    aie::store_v(out + n * MMUL::size_C, m.to_vector<int32>());
+  }
+  event1();
+""",
+))
+
+
+# --- MatMul: native AIE2 mmul tile, bf16 x bf16 -> fp32 accumulator, 4x8x4.
+# The float MAC tier: bf16 inputs, fp32 (accfloat) accumulator, exact fp32-bit
+# output compare. The host stages bf16/fp32 bit patterns (uint16/uint32); the
+# kernel reads bfloat16/float. Restricted to all-finite-expected tiles
+# (_all_expected_finite_f32): a NaN result's bits differ between the model and
+# NPU1 silicon (Half-A bf16 NaN finding), so overflow tiles are excluded to keep
+# the bit-compare exact and isolate the mmul accumulate/round datapath.
+_reg(KernelSpec(
+    name="vec_mac_bf16",
+    func="mac_bf16",
+    doc="MatMul (native mmul tile), bf16 x bf16 -> fp32, 4x8x4. A batch of "
+        "independent row-major tiles from the Half-A `matmul` golden (BFloat16/"
+        "BFloat16, subtract=false), all-finite expected; each C = A.B in fp32. "
+        "Host stages bf16/fp32 bit patterns; the kernel reads bfloat16/float.",
+    inputs=[Buf("inA", "uint16_t", "bf16", ktype="bfloat16"),
+            Buf("inB", "uint16_t", "bf16", ktype="bfloat16")],
+    output=Buf("out", "uint32_t", "f32", ktype="float"),
+    n=0,
+    golden={"class": "matmul",
+            "filt": {"a_type": "BFloat16", "b_type": "BFloat16", "rows": 4,
+                     "inner": 8, "cols": 4, "subtract": False},
+            "predicate": _all_expected_finite_f32},
+    matmul=Matmul(M=4, K=8, N=4, a_bytes=2, b_bytes=2, batch=24, bfloat=True),
+    defines=[("MAC_BATCH", 24)],
+    body="""  event0();
+  using MMUL = aie::mmul<4, 8, 4, bfloat16, bfloat16, accauto>;
+  for (int n = 0; n < MAC_BATCH; n++) {
+    aie::vector<bfloat16, MMUL::size_A> a = aie::load_v<MMUL::size_A>(inA + n * MMUL::size_A);
+    aie::vector<bfloat16, MMUL::size_B> b = aie::load_v<MMUL::size_B>(inB + n * MMUL::size_B);
+    MMUL m;
+    m.mul(a, b);
+    aie::store_v(out + n * MMUL::size_C, m.to_vector<float>());
   }
   event1();
 """,
