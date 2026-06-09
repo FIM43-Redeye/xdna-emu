@@ -1,9 +1,9 @@
 //===- test.cpp -------------------------------------------------*- C++ -*-===//
 //
-// Host harness for the Half-B vec_ups_i32 capture kernel (GENERATED -- edit the spec
+// Host harness for the Half-B vec_pack_i16 capture kernel (GENERATED -- edit the spec
 // in vector_kernel_specs.py, not this file). Feeds a baked input batch and
-// checks the output against the Half-A golden (ups slice). PASS means the
-// vec_ups_i32 datapath ran correctly. Expected values are the genuine
+// checks the output against the Half-A golden (pack slice). PASS means the
+// vec_pack_i16 datapath ran correctly. Expected values are the genuine
 // aietools-model outputs baked from tools/golden/vector_ops.json.
 //
 //===----------------------------------------------------------------------===//
@@ -20,23 +20,19 @@
 
 #include "test_utils.h"
 
-static constexpr int N = 48;
+static constexpr int N = 32;
 
-static const int16_t IN[48] = {
-    0, 1, -32768, -32767, 2, 4, 128, -128,
-    8, 256, 4096, -4096, 8192, 16, 512, 16384,
-    32, 1024, 64, -64, 2048, -2048, -32, -1024,
-    -16, -512, -2, -1, -8, -256, -8192, -16384,
-    -4, 32766, 32767, -6624, 18483, 24344, 15741, -26765,
-    11687, 18556, 6909, 15451, 10180, 0, 0, 0,
+static const int16_t IN[32] = {
+    0, 1, -128, 128, -127, -126, 4, 256,
+    4096, -4096, 16, 16384, 1024, 64, -64, -1024,
+    508, 127, -16, -1, -129, -16384, -256, -4,
+    126, -513, 0, 0, 0, 0, 0, 0,
 };
-static const int32_t EXP[48] = {
-    0, 16, -524288, -524272, 32, 64, 2048, -2048,
-    128, 4096, 65536, -65536, 131072, 256, 8192, 262144,
-    512, 16384, 1024, -1024, 32768, -32768, -512, -16384,
-    -256, -8192, -32, -16, -128, -4096, -131072, -262144,
-    -64, 524256, 524272, -105984, 295728, 389504, 251856, -428240,
-    186992, 296896, 110544, 247216, 162880, 0, 0, 0,
+static const int8_t EXP[32] = {
+    0, 1, -128, -128, -127, -126, 4, 0,
+    0, 0, 16, 0, 0, 64, -64, 0,
+    -4, 127, -16, -1, 127, 0, 0, -4,
+    126, -1, 0, 0, 0, 0, 0, 0,
 };
 
 int main(int argc, const char *argv[]) {
@@ -63,13 +59,13 @@ int main(int argc, const char *argv[]) {
   auto bo_instr = xrt::bo(device, instr_v.size() * sizeof(int),
                           XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
   auto bo_in = xrt::bo(device, N * sizeof(int16_t), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3));
-  auto bo_out = xrt::bo(device, N * sizeof(int32_t), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4));
+  auto bo_out = xrt::bo(device, N * sizeof(int8_t), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4));
 
   int16_t *bufIn = bo_in.map<int16_t *>();
-  int32_t *bufOut = bo_out.map<int32_t *>();
+  int8_t *bufOut = bo_out.map<int8_t *>();
 
   std::memcpy(bufIn, IN, N * sizeof(int16_t));
-  std::memset(bufOut, 0, N * sizeof(int32_t));
+  std::memset(bufOut, 0, N * sizeof(int8_t));
 
   void *bufInstr = bo_instr.map<void *>();
   std::memcpy(bufInstr, instr_v.data(), instr_v.size() * sizeof(int));

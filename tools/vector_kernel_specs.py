@@ -89,3 +89,37 @@ _reg(KernelSpec(
   event1();
 """,
 ))
+
+
+# --- Pack: native VPACK, int16 -> int8 (halving narrow). int32->int16 pack()
+# falls back to the SRS accumulator path (would re-test srs), so this targets
+# the int16->int8 native pack -- a distinct datapath. Config: signed, sat -- the
+# matching slice of the Half-A `pack` golden (bits_i=16, bits_o=8).
+_reg(KernelSpec(
+    name="vec_pack_i16",
+    func="pack_i16",
+    doc="Pack (native VPACK), int16 -> int8 truncating narrow. Native pack "
+        "takes the low 8 bits (it does NOT saturate, regardless of the "
+        "saturation mode), so this matches the Half-A `pack` golden slice "
+        "(bits_i=16, bits_o=8, signed, sat=false).",
+    inputs=[Buf("in", "int16_t", "i16")],
+    output=Buf("out", "int8_t", "i8"),
+    n=32,
+    golden={
+        "class": "pack",
+        "filt": {"bits_i": 16, "bits_o": 8, "signed": True,
+                 "sat": False, "symsat": False},
+        "value_range": (-(2 ** 15), 2 ** 15 - 1),
+    },
+    defines=[("PACK_N", 32)],
+    body="""  event0();
+  ::aie::set_saturation(aie::saturation_mode::none);
+
+  for (int i = 0; i < PACK_N; i += 32) {
+    aie::vector<int16_t, 32> v = aie::load_v<32>(in + i);
+    aie::vector<int8_t, 32> o = v.pack<int8_t>();
+    aie::store_v(out + i, o);
+  }
+  event1();
+""",
+))

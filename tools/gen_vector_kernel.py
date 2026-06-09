@@ -186,8 +186,8 @@ int main(int argc, const char *argv[]) {
   for (int i = 0; i < N; i++) {
     if (bufOut[i] != EXP[i]) {
       if (errors < 10)
-        std::cout << "Error [" << i << "]: in=" << IN[i]
-                  << " got=" << bufOut[i] << " != exp=" << EXP[i] << "\\n";
+        std::cout << "Error [" << i << "]: in=" << (int)IN[i]
+                  << " got=" << (int)bufOut[i] << " != exp=" << (int)EXP[i] << "\\n";
       errors++;
     }
   }

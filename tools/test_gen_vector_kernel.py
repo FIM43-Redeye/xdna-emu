@@ -77,6 +77,8 @@ class TestRenderTestCpp:
         assert "0, 0, -16, 16, -16, -32768, -32768," in cpp
         # Exactly one input buffer => single dma input arg in the kernel call.
         assert "bo_in" in cpp and "bo_out" in cpp
+        # int8 outputs must print as integers, not raw chars (readable errors).
+        assert "(int)bufOut[i]" in cpp and "(int)IN[i]" in cpp and "(int)EXP[i]" in cpp
 
 
 class TestRenderMlir:
