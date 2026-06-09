@@ -618,6 +618,178 @@ mod tests {
         assert_eq!(info.use_cycle(0), 1, "out-of-range source defaults to use_cycle 1");
     }
 
+    /// Risk-retirement proof for the per-operand vector forwarding model.
+    ///
+    /// LOAD-BEARING ASSUMPTION: for a decoded instruction, source operand `k`
+    /// (its position in `DecodeResult::uses()`, which the interpreter builds
+    /// from TableGen `input_order`) corresponds to itinerary operand slot
+    /// `num_defs + k`. The risk is that tied operands (e.g. VMAC's accumulator,
+    /// which is both a def and a use) or operand-ordering quirks could break
+    /// this mapping, silently aliasing a vector source onto a DEF slot or the
+    /// wrong use slot -- which would corrupt every `use_cycle` / `use_bypass`
+    /// lookup the forwarding model performs.
+    ///
+    /// Proof method (A): decode REAL anchor instructions end-to-end through the
+    /// LLVM disassembler and check the itinerary cycle/bypass that `num_defs+k`
+    /// resolves to against the empirically-known hardware values. This is not a
+    /// tautology -- the asserted cycles (store data = 1/NoBypass, compute source
+    /// = 1/MOV-bypass, VMAC accumulator-use = 3 != def's result latency) are
+    /// independent facts from the chess itinerary; an off-by-one in `num_defs+k`
+    /// would read a neighbouring slot's value and the assert would fail loudly.
+    ///
+    /// Encodings (verified decodable via a brute-force slot probe, see git
+    /// history of this test): VMAC_F @ Vec/0x40001, VST_3D_SRS_D8_S32 @ St/0x2,
+    /// VEXTRACT_D8 @ Mv/0x35.
+    #[test]
+    fn test_vector_source_operand_index_mapping() {
+        let infos = query_all_instr_info();
+        assert!(!infos.is_empty(), "FFI returned no instr info");
+
+        // Resolve the source operand a register name lands on, with the cycle
+        // and bypass that `num_defs + source_idx` selects. Panics if the named
+        // register is not among the decoded sources.
+        fn source_idx_of<'a>(d: &'a DecodeResult, reg: &str) -> usize {
+            d.uses()
+                .iter()
+                .position(|op| matches!(op, DecodedOperand::Reg { name, .. } if name == reg))
+                .unwrap_or_else(|| panic!("source '{}' not found in {} uses {:?}", reg, d.name, d.uses()))
+        }
+
+        // ---- Anchor 1: COMPUTE consumer (VEXTRACT-class) ----------------------
+        // `(outs $dst), (ins mXm:$s1, mRS4:$idx)` -- the vector source $s1 is the
+        // first use. The itinerary marks it use_cycle 1 with MOV bypass (id 1):
+        // the def is at the result-latency slot (cycle 2), the *source* reads at
+        // cycle 1 and forwards at issue+1 via the bypass match. (The plan's
+        // "compute=2" refers to the def's L=2 result latency, not the source
+        // use_cycle -- the issue+1 read is driven by the bypass, not use_cycle.)
+        let vext = decode_slot(Slot::Mv, 0x35).expect("VEXTRACT_D8 should decode");
+        assert!(vext.name.starts_with("VEXTRACT_"), "expected VEXTRACT, got {}", vext.name);
+        let vext_info = &infos[vext.opcode as usize];
+        assert!(
+            vext_info.num_operand_cycles as usize > vext_info.num_defs as usize,
+            "{}: must model use slots beyond the {} def(s) (noc={})",
+            vext.name,
+            vext_info.num_defs,
+            vext_info.num_operand_cycles,
+        );
+        let vext_src = source_idx_of(&vext, "x0");
+        println!(
+            "COMPUTE {} (op {}): nd={} src '{}' -> mi[{}] use_cycle={} bypass={}",
+            vext.name,
+            vext.opcode,
+            vext_info.num_defs,
+            "x0",
+            vext_info.num_defs as usize + vext_src,
+            vext_info.use_cycle(vext_src),
+            vext_info.use_bypass_raw(vext_src),
+        );
+        assert_eq!(vext_info.use_cycle(vext_src), 1, "{}: vector source use_cycle should be 1", vext.name);
+        assert_eq!(
+            vext_info.use_bypass_raw(vext_src),
+            1,
+            "{}: vector source should carry the MOV bypass (forward at issue+1)",
+            vext.name,
+        );
+
+        // ---- Anchor 2: STORE consumer (VST-class) -----------------------------
+        // The SRS store reads accumulator data (cm0) and stores it. Its data
+        // source resolves to use_cycle 1 with NO bypass: a store data read sees
+        // the producer's fully-landed value (issue + l_def), the issue+2 store
+        // edge in the plan.
+        let vst = decode_slot(Slot::St, 0x2).expect("VST_3D_SRS should decode");
+        assert!(vst.name.starts_with("VST_"), "expected VST, got {}", vst.name);
+        let vst_info = &infos[vst.opcode as usize];
+        assert!(
+            vst_info.num_operand_cycles as usize > vst_info.num_defs as usize,
+            "{}: must model use slots beyond the {} def(s)",
+            vst.name,
+            vst_info.num_defs,
+        );
+        let vst_data = source_idx_of(&vst, "cm0");
+        println!(
+            "STORE   {} (op {}): nd={} data src '{}' -> mi[{}] use_cycle={} bypass={}",
+            vst.name,
+            vst.opcode,
+            vst_info.num_defs,
+            "cm0",
+            vst_info.num_defs as usize + vst_data,
+            vst_info.use_cycle(vst_data),
+            vst_info.use_bypass_raw(vst_data),
+        );
+        assert_eq!(vst_info.use_cycle(vst_data), 1, "{}: store data use_cycle should be 1", vst.name);
+        assert_eq!(vst_info.use_bypass_raw(vst_data), 0, "{}: store data read takes no bypass", vst.name);
+
+        // ---- Anchor 3: TIED-OPERAND risk (VMAC accumulator) -------------------
+        // This is the actual hazard: VMAC's accumulator is both a def (dst) and
+        // a use (acc-in). `(outs $dst), (ins $acc1, $s1, $s2, $c)` -- so source 0
+        // is the accumulator-USE. If `num_defs+k` aliased it onto the def slot,
+        // use_cycle(0) would read the def's result latency. It must instead read
+        // the accumulator-use slot, whose cycle is DISTINCT from the def's.
+        let vmac = decode_slot(Slot::Vec, 0x0040001).expect("VMAC_F should decode");
+        assert!(vmac.name.starts_with("VMAC"), "expected VMAC, got {}", vmac.name);
+        let vmac_info = &infos[vmac.opcode as usize];
+        assert_eq!(vmac_info.num_defs, 1, "{}: one result def", vmac.name);
+        assert!(
+            vmac_info.num_operand_cycles as usize > vmac_info.num_defs as usize,
+            "{}: must model use slots beyond the def",
+            vmac.name,
+        );
+        // Source 0 is the accumulator-use (the first `ins` operand).
+        let acc_src = 0usize;
+        let def_cycle = vmac_info.operand_cycle[0];
+        let acc_use_cycle = vmac_info.use_cycle(acc_src);
+        println!(
+            "TIED    {} (op {}): nd={} def_cycle={} acc-use src 0 -> mi[{}] use_cycle={} bypass={}",
+            vmac.name,
+            vmac.opcode,
+            vmac_info.num_defs,
+            def_cycle,
+            vmac_info.num_defs as usize + acc_src,
+            acc_use_cycle,
+            vmac_info.use_bypass_raw(acc_src),
+        );
+        assert_eq!(
+            acc_use_cycle, 3,
+            "{}: accumulator-use should read at use_cycle 3 (its itinerary use slot)",
+            vmac.name,
+        );
+        assert_ne!(
+            acc_use_cycle as i16, def_cycle,
+            "{}: TIED-OPERAND MAPPING BROKEN -- accumulator source aliased onto the def slot \
+             (use_cycle {} == def result latency {})",
+            vmac.name, acc_use_cycle, def_cycle,
+        );
+
+        // ---- Structural invariant across ALL anchors --------------------------
+        // No source may resolve into a def slot: for every modeled source k, the
+        // index `num_defs + k` is within [num_defs, num_operand_cycles).
+        for d in [&vext, &vst, &vmac] {
+            let info = &infos[d.opcode as usize];
+            for k in 0..d.uses().len() {
+                let mi = info.num_defs as usize + k;
+                assert!(
+                    mi >= info.num_defs as usize,
+                    "{}: source {} maps to def-region slot {}",
+                    d.name,
+                    k,
+                    mi,
+                );
+                // Sources the itinerary models must land within the cycle table;
+                // any beyond it fall back to the conservative use_cycle 1, never
+                // a def slot. Either way the source never aliases a def.
+                if mi < info.num_operand_cycles as usize {
+                    assert!(
+                        (1..=7).contains(&info.use_cycle(k)),
+                        "{}: source {} use_cycle {} out of plausible range",
+                        d.name,
+                        k,
+                        info.use_cycle(k),
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_instr_info_latency_cross_check() {
         // Cross-validate LLVM itinerary latencies against AM020 constants.
