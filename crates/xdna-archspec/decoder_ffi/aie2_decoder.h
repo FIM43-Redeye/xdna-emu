@@ -82,6 +82,12 @@ struct Aie2InstrInfo {
     int16_t stage_latency;   // Total pipeline latency from InstrStage sum, or -1
     uint16_t sched_class;    // Itinerary class index (opaque; for cross-ref with build data)
     uint16_t def_bypass;     // Forwarding-network id of result operand 0 (0 = NoBypass)
+    // Per-operand itinerary data, indexed by MI operand position (defs then
+    // uses). operand_cycle[i] is the cycle operand i is read/produced;
+    // operand_bypass[i] its forwarding id. Valid for i < num_operand_cycles.
+    int16_t operand_cycle[AIE2_MAX_OPERANDS];
+    uint16_t operand_bypass[AIE2_MAX_OPERANDS];
+    uint8_t num_operand_cycles;
 };
 
 // MCID flag bit positions (from llvm/MC/MCInstrDesc.h MCID::Flag enum).

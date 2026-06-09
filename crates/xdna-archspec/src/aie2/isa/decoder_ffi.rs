@@ -19,6 +19,9 @@
 use std::ffi::CStr;
 use std::sync::Once;
 
+/// Maximum operands any AIE2 instruction can have (matches AIE2_MAX_OPERANDS in C header).
+pub const AIE2_MAX_OPERANDS: usize = 16;
+
 /// Operand kinds matching LLVM MCOperand (mirrors Aie2OpKind in C header).
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +77,9 @@ pub struct RawInstrInfo {
     pub stage_latency: i16, // Pipeline stage sum, or -1 if unavailable
     pub sched_class: u16,   // Itinerary class index (opaque)
     pub def_bypass: u16,    // Forwarding id of result operand 0 (0 = NoBypass)
+    pub operand_cycle: [i16; AIE2_MAX_OPERANDS],
+    pub operand_bypass: [u16; AIE2_MAX_OPERANDS],
+    pub num_operand_cycles: u8,
 }
 
 extern "C" {
@@ -292,6 +298,15 @@ pub struct InstrInfo {
     /// context (e.g. a vector-register result's nonzero id is always
     /// `MOV_Bypass`); callers interpret per the destination register file.
     pub def_bypass: u16,
+    /// Per-operand itinerary cycle numbers in MI operand order (defs then uses).
+    /// Valid only for indices `i < num_operand_cycles`; entries at or after it
+    /// are unspecified (reserved -- do not rely on their value).
+    pub operand_cycle: [i16; AIE2_MAX_OPERANDS],
+    /// Per-operand forwarding ids in MI operand order (defs then uses).
+    /// Valid for indices 0..num_operand_cycles. 0 = NoBypass.
+    pub operand_bypass: [u16; AIE2_MAX_OPERANDS],
+    /// Number of valid entries in operand_cycle and operand_bypass.
+    pub num_operand_cycles: u8,
 }
 
 impl InstrInfo {
@@ -325,6 +340,35 @@ impl InstrInfo {
     pub fn is_move_imm(&self) -> bool {
         self.flags & mcid::MOVE_IMM != 0
     }
+
+    /// use_cycle for source operand `source_idx` (0-based among sources). Maps
+    /// to itinerary operand index `num_defs + source_idx`. Returns the
+    /// conservative default 1 (read-at-issue) when out of range. Default 1 is
+    /// the conservative choice -- it maximizes `eff` in
+    /// `eff = l_def - use_cycle + 1 - match`, yielding no early forwarding: the
+    /// latest, safest visibility, the same as a store-data read at use_cycle 1.
+    pub fn use_cycle(&self, source_idx: usize) -> u8 {
+        let mi = self.num_defs as usize + source_idx;
+        if mi < self.num_operand_cycles as usize {
+            let c = self.operand_cycle[mi];
+            if c >= 0 {
+                return c as u8;
+            }
+        }
+        1
+    }
+
+    /// Raw forwarding id for source operand `source_idx` (0 = NoBypass). Caller
+    /// maps to a named Bypass per the destination register file (the
+    /// nonzero->MOV_Bypass mapping is only unambiguous for vector-register reads
+    /// -- see the VEC_Bypass FIXME at queue_matmul_accum_write).
+    pub fn use_bypass_raw(&self, source_idx: usize) -> u16 {
+        let mi = self.num_defs as usize + source_idx;
+        if mi < self.num_operand_cycles as usize {
+            return self.operand_bypass[mi];
+        }
+        0
+    }
 }
 
 /// Query instruction metadata for all opcodes at init time.
@@ -349,6 +393,9 @@ pub fn query_all_instr_info() -> Vec<InstrInfo> {
             stage_latency: -1,
             sched_class: 0,
             def_bypass: 0,
+            operand_cycle: [0; AIE2_MAX_OPERANDS],
+            operand_bypass: [0; AIE2_MAX_OPERANDS],
+            num_operand_cycles: 0,
         };
 
         let ok = unsafe { aie2_get_instr_info(opcode, &mut raw) };
@@ -360,6 +407,9 @@ pub fn query_all_instr_info() -> Vec<InstrInfo> {
                 stage_latency: None,
                 sched_class: 0,
                 def_bypass: 0,
+                operand_cycle: [-1; AIE2_MAX_OPERANDS],
+                operand_bypass: [0; AIE2_MAX_OPERANDS],
+                num_operand_cycles: 0,
             });
             continue;
         }
@@ -383,6 +433,9 @@ pub fn query_all_instr_info() -> Vec<InstrInfo> {
             stage_latency,
             sched_class: raw.sched_class,
             def_bypass: raw.def_bypass,
+            operand_cycle: raw.operand_cycle,
+            operand_bypass: raw.operand_bypass,
+            num_operand_cycles: raw.num_operand_cycles,
         });
     }
 
@@ -519,6 +572,50 @@ mod tests {
         assert!(loads > 50, "Should have 50+ load instructions, got {}", loads);
         assert!(stores > 50, "Should have 50+ store instructions, got {}", stores);
         assert!(branches > 5, "Should have 5+ branch instructions, got {}", branches);
+    }
+
+    #[test]
+    fn test_per_operand_arrays_consistent_with_op0() {
+        // The new per-operand arrays must agree with the existing operand-0
+        // fields for every opcode that has itinerary data.
+        let infos = query_all_instr_info();
+        assert!(!infos.is_empty(), "FFI returned no instr info");
+        let mut checked = 0;
+        for info in &infos {
+            if info.num_operand_cycles == 0 {
+                continue;
+            }
+            if let Some(lat) = info.latency {
+                assert_eq!(
+                    info.operand_cycle[0], lat as i16,
+                    "operand_cycle[0] disagrees with latency for sched_class {}",
+                    info.sched_class
+                );
+            }
+            assert_eq!(
+                info.operand_bypass[0], info.def_bypass,
+                "operand_bypass[0] disagrees with def_bypass for sched_class {}",
+                info.sched_class
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no opcodes had operand-cycle data");
+    }
+
+    #[test]
+    fn test_use_cycle_defaults_when_out_of_range() {
+        let info = InstrInfo {
+            flags: 0,
+            num_defs: 1,
+            latency: Some(2),
+            stage_latency: None,
+            sched_class: 0,
+            def_bypass: 0,
+            operand_cycle: [-1; AIE2_MAX_OPERANDS],
+            operand_bypass: [0; AIE2_MAX_OPERANDS],
+            num_operand_cycles: 0,
+        };
+        assert_eq!(info.use_cycle(0), 1, "out-of-range source defaults to use_cycle 1");
     }
 
     #[test]

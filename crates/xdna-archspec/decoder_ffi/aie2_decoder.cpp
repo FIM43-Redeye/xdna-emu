@@ -338,16 +338,33 @@ int aie2_get_instr_info(uint32_t opcode, Aie2InstrInfo *out) {
         if (stage_lat > 0)
             out->stage_latency = (int16_t)stage_lat;
 
-        // Forwarding (bypass) class of the result operand (operand 0). The
-        // Forwardings table is indexed by FirstOperandCycle + operand index
-        // (same indexing getOperandCycle uses for OperandCycles). 0 = NoBypass;
-        // a nonzero id forwards to a consumer whose matching use operand shares
-        // the id (AIE2: MOV_Bypass on W/X-file ALU, VEC_Bypass on CM/accumulator).
-        if (g_iid.Itineraries && g_iid.Forwardings) {
-            const InstrItinerary &itin = g_iid.Itineraries[sched_class];
-            if (itin.FirstOperandCycle < itin.LastOperandCycle)
-                out->def_bypass = (uint16_t)g_iid.Forwardings[itin.FirstOperandCycle];
+        // Per-operand itinerary cycles + forwarding ids. OperandCycles and
+        // Forwardings are parallel arrays indexed by FirstOperandCycle + i,
+        // matching MI operand order (defs then uses). def_bypass/latency stay
+        // as the operand-0 shorthands the producer side already uses.
+        //
+        // The enclosing !isEmpty() check already proves Itineraries != nullptr,
+        // so we don't re-guard it. OperandCycles/Forwardings can still each be
+        // null independently, so capture those once outside the loop.
+        const InstrItinerary &itin = g_iid.Itineraries[sched_class];
+        unsigned n = (itin.LastOperandCycle > itin.FirstOperandCycle)
+                         ? (itin.LastOperandCycle - itin.FirstOperandCycle)
+                         : 0;
+        if (n > AIE2_MAX_OPERANDS)
+            n = AIE2_MAX_OPERANDS;
+        out->num_operand_cycles = (uint8_t)n;
+        const bool have_cycles = g_iid.OperandCycles != nullptr;
+        const bool have_fwd = g_iid.Forwardings != nullptr;
+        for (unsigned i = 0; i < n; i++) {
+            if (have_cycles)
+                out->operand_cycle[i] =
+                    (int16_t)g_iid.OperandCycles[itin.FirstOperandCycle + i];
+            if (have_fwd)
+                out->operand_bypass[i] =
+                    (uint16_t)g_iid.Forwardings[itin.FirstOperandCycle + i];
         }
+        if (n > 0 && have_fwd)
+            out->def_bypass = out->operand_bypass[0];
     }
 
     return 1;
