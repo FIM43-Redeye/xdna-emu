@@ -176,7 +176,13 @@ class TestRegistry:
             recs = select_records(GOLDEN[g["class"]], g["filt"],
                                   g.get("value_range"), predicate=g.get("predicate"))
             assert recs, f"{name}: golden slice is empty"
-            assert len(recs) <= spec.n, f"{name}: {len(recs)} records > N={spec.n}"
+            if spec.matmul is not None:
+                # Matmul specs consume `batch` records (each a full tile), not
+                # one element per record; the slice must hold at least a batch.
+                assert len(recs) >= spec.matmul.batch, \
+                    f"{name}: {len(recs)} records < batch {spec.matmul.batch}"
+            else:
+                assert len(recs) <= spec.n, f"{name}: {len(recs)} records > N={spec.n}"
 
 
 class TestKernelTypeSplit:
@@ -223,6 +229,75 @@ class TestSelectRecordsPredicate:
         out = select_records(recs, {"rnd": 12},
                              predicate=lambda r: r["value"] % 2 == 1)
         assert [r["value"] for r in out] == [1, 3]
+
+
+class TestMatmulSupport:
+    """The matmul-shape generator variant: two row-major input buffers (A, B)
+    and one output (C), baked by unpacking the matmul golden's row-major-packed
+    vec512 words and concatenating a batch of independent tile multiplies."""
+
+    def test_unpack_vec512_int8_little_endian(self):
+        from gen_vector_kernel import unpack_vec512
+        assert unpack_vec512([0x04030201, 0x08070605], 8, 1) == [1, 2, 3, 4, 5, 6, 7, 8]
+
+    def test_unpack_vec512_int16_signed(self):
+        from gen_vector_kernel import unpack_vec512
+        # word low half 0xFFFF = -1 (signed int16), high half 0x0002 = 2
+        assert unpack_vec512([0x0002FFFF], 2, 2) == [-1, 2]
+
+    def test_unpack_vec512_bf16_unsigned_bits(self):
+        from gen_vector_kernel import unpack_vec512
+        # raw bf16 bit patterns, not sign-interpreted
+        assert unpack_vec512([0xBF803F80], 2, 2, signed=False) == [0x3F80, 0xBF80]
+
+    def test_bake_matmul_concatenates_batch_row_major(self):
+        from gen_vector_kernel import Matmul, bake_matmul
+        mm = Matmul(M=4, K=8, N=8, a_bytes=1, b_bytes=1, batch=2)
+        filt = {"a_type": "Int8", "b_type": "Int8", "rows": 4, "inner": 8,
+                "cols": 8, "subtract": False}
+        A, B, C = bake_matmul(GOLDEN["matmul"], filt, mm)
+        assert len(A) == 2 * 32 and len(B) == 2 * 64 and len(C) == 2 * 32
+        # The first tile's row-major A.B must equal its baked C (oracle anchor).
+        for r in range(4):
+            for c in range(8):
+                s = sum(A[r * 8 + k] * B[k * 8 + c] for k in range(8))
+                got = C[r * 8 + c]
+                # both wrapped to i32
+                assert (s & 0xFFFFFFFF) == (got & 0xFFFFFFFF), f"C[{r},{c}]"
+
+    def test_render_mlir_two_inputs_emits_both_objectfifos(self):
+        from gen_vector_kernel import Matmul, render_mlir
+        spec = _mac_i8_spec()
+        mlir = render_mlir(spec)
+        # func decl carries three memrefs (A=8*32, B=8*64, C=8*32).
+        assert "memref<256xi8>, memref<512xi8>, memref<256xi32>" in mlir
+        # two input objectfifos + one output, correctly shaped.
+        assert "@inA(%shim, {%core}" in mlir and "@inB(%shim, {%core}" in mlir
+        assert "@outC(%core, {%shim}" in mlir
+
+    def test_render_test_cpp_two_inputs_two_buffers(self):
+        from gen_vector_kernel import render_test_cpp
+        cpp = render_test_cpp(_mac_i8_spec(), GOLDEN)
+        assert "int8_t *bufInA" in cpp and "int8_t *bufInB" in cpp
+        assert "int32_t *bufOut" in cpp
+        assert "INA" in cpp and "INB" in cpp and "EXP" in cpp
+
+
+def _mac_i8_spec():
+    from gen_vector_kernel import Buf, KernelSpec, Matmul
+    # batch of 8 native 4x8x8 i8 tiles: A=8*32, B=8*64, C=8*32.
+    return KernelSpec(
+        name="vec_mac_i8", func="mac_i8", doc="i8 matmul.",
+        inputs=[Buf("inA", "int8_t", "i8"), Buf("inB", "int8_t", "i8")],
+        output=Buf("out", "int32_t", "i32"),
+        n=0,
+        golden={"class": "matmul",
+                "filt": {"a_type": "Int8", "b_type": "Int8", "rows": 4,
+                         "inner": 8, "cols": 8, "subtract": False}},
+        matmul=__import__("gen_vector_kernel").Matmul(
+            M=4, K=8, N=8, a_bytes=1, b_bytes=1, batch=8),
+        body="  // mmul body\n",
+    )
 
 
 class TestKernelHeaderFormatting:

@@ -11,7 +11,7 @@ tools/golden/vector_ops.json (the Half-A corpus); the generator bakes the
 input/expected arrays from it so no expected value is ever transcribed by hand.
 """
 
-from gen_vector_kernel import Buf, KernelSpec
+from gen_vector_kernel import Buf, KernelSpec, Matmul
 
 SPECS = {}
 
@@ -173,6 +173,41 @@ _reg(KernelSpec(
     aie::accum<accfloat, 16> acc(v);
     aie::vector<bfloat16, 16> o = acc.to_vector<bfloat16>();
     aie::store_v(out + i, o);
+  }
+  event1();
+""",
+))
+
+
+# --- MatMul: native AIE2 mmul tile, int8 x int8 -> int32 accumulator, 4x8x8.
+# First of the MAC tier and the first COMPILED matmul to run through the
+# decode->execute interpreter (Half-A verified mmul arithmetic via hand-built
+# SlotOps only). A batch of independent row-major tiles is unpacked from the
+# Half-A `matmul` golden; each C = A.B exactly (integer sum of products, i32
+# wrap), so the comparison is exact. The aie::mmul class handles the register-
+# level A/B packing internally -- the kernel just DMAs plain row-major matrices.
+_reg(KernelSpec(
+    name="vec_mac_i8",
+    func="mac_i8",
+    doc="MatMul (native mmul tile), int8 x int8 -> int32, 4x8x8. A batch of "
+        "independent row-major tiles from the Half-A `matmul` golden (Int8/Int8, "
+        "subtract=false); each C = A.B exactly (integer sum of products).",
+    inputs=[Buf("inA", "int8_t", "i8"), Buf("inB", "int8_t", "i8")],
+    output=Buf("out", "int32_t", "i32"),
+    n=0,
+    golden={"class": "matmul",
+            "filt": {"a_type": "Int8", "b_type": "Int8", "rows": 4,
+                     "inner": 8, "cols": 8, "subtract": False}},
+    matmul=Matmul(M=4, K=8, N=8, a_bytes=1, b_bytes=1, batch=64),
+    defines=[("MAC_BATCH", 64)],
+    body="""  event0();
+  using MMUL = aie::mmul<4, 8, 8, int8, int8, accauto>;
+  for (int n = 0; n < MAC_BATCH; n++) {
+    aie::vector<int8, MMUL::size_A> a = aie::load_v<MMUL::size_A>(inA + n * MMUL::size_A);
+    aie::vector<int8, MMUL::size_B> b = aie::load_v<MMUL::size_B>(inB + n * MMUL::size_B);
+    MMUL m;
+    m.mul(a, b);
+    aie::store_v(out + n * MMUL::size_C, m.to_vector<int32>());
   }
   event1();
 """,
