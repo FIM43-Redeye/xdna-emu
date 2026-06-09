@@ -654,11 +654,46 @@ impl VectorAlu {
                 ctx.accumulator.write(dst, data);
             }
         } else if has_acc_source || has_acc_dest {
-            // Cross-register-file move (vector <-> accumulator).
-            // get_vector_source handles AccumReg sources (truncates u64->u32).
-            // write_vector_dest handles AccumReg destinations (zero-extends u32->u64).
-            let src = Self::get_vector_source(op, ctx, 0);
-            Self::write_vector_dest(op, ctx, src);
+            if op.is_wide_vector {
+                // Wide cross-file move (vmov x, bml / vmov bml, x): a raw 512-bit
+                // reinterpret between the accumulator ([u64; 8]) and the x vector
+                // register ([u32; 16]). u64 word j holds two int32 lanes -- 2j in
+                // the low half, 2j+1 in the high half -- so an acc32 (16 x int32)
+                // maps directly onto the 16 vector lanes. The narrow path below
+                // (low 32 bits of 8 u64 lanes) would read every other lane and
+                // leave the high 256 bits (wh) uninitialized.
+                if has_acc_source {
+                    let src_reg = op
+                        .sources
+                        .iter()
+                        .find_map(|s| match s {
+                            Operand::AccumReg(r) => Some(*r),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    let acc = ctx.accumulator.read(src_reg);
+                    let mut wide = [0u32; 16];
+                    for j in 0..8 {
+                        wide[2 * j] = acc[j] as u32;
+                        wide[2 * j + 1] = (acc[j] >> 32) as u32;
+                    }
+                    Self::write_wide_vec_dest(op, ctx, wide);
+                } else {
+                    let wide = Self::get_wide_vec_source(op, ctx, 0);
+                    let mut acc = [0u64; 8];
+                    for j in 0..8 {
+                        acc[j] = wide[2 * j] as u64 | ((wide[2 * j + 1] as u64) << 32);
+                    }
+                    let dst = Self::get_acc_dest(op);
+                    ctx.accumulator.write(dst, acc);
+                }
+            } else {
+                // Narrow cross-register-file move (vector <-> accumulator).
+                // get_vector_source handles AccumReg sources (truncates u64->u32).
+                // write_vector_dest handles AccumReg dests (zero-extends u32->u64).
+                let src = Self::get_vector_source(op, ctx, 0);
+                Self::write_vector_dest(op, ctx, src);
+            }
         } else if op.is_wide_vector {
             // Wide vector move: vmov x_dst_wide, x_src_wide (512-bit)
             let a = Self::get_wide_vec_source(op, ctx, 0);
@@ -1002,5 +1037,38 @@ mod tests {
             [0x11, 0x22, 0x33, 0x44],
             "vmov q0, wh0 must copy the low 128 bits of the w-register into q0"
         );
+    }
+
+    /// `vmov x2, bml1`: copy a full 512-bit acc32 accumulator (16 x int32,
+    /// packed two per u64 word) into a 512-bit x vector register. This is how
+    /// Chess moves UPS results out of the accumulator before storing:
+    /// `vlda.ups.s32.s16 bmlN` -> `vmov xN, bmlN` -> `vst wl/wh`. The move is a
+    /// raw 512-bit reinterpret. Previously the cross-file path only handled the
+    /// narrow 256-bit case (low 32 bits of 8 u64 lanes), so it read every other
+    /// int32 lane (stride 2) and left the high 256 bits (wh) uninitialized.
+    #[test]
+    fn test_vmov_wide_acc32_to_x_reinterprets_all_16_lanes() {
+        let mut ctx = make_ctx();
+        // acc32 bml1 = AccumReg(2): 16 int32 lanes [100..=115], packed 2 per u64.
+        let mut acc = [0u64; 8];
+        for j in 0..8u64 {
+            acc[j as usize] = (100 + 2 * j) | ((101 + 2 * j) << 32);
+        }
+        ctx.accumulator.write(2, acc);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Copy)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(4)) // x2 -> wl2=VectorReg(4), wh2=VectorReg(5)
+            .with_source(Operand::AccumReg(2)); // bml1
+        op.is_wide_vector = true;
+
+        VectorAlu::execute(&op, &mut ctx);
+
+        let lo = ctx.vector.read(4); // wl2 = int32 lanes 0..8
+        let hi = ctx.vector.read(5); // wh2 = int32 lanes 8..16
+        for i in 0..8u32 {
+            assert_eq!(lo[i as usize], 100 + i, "wl2 lane {i}");
+            assert_eq!(hi[i as usize], 108 + i, "wh2 lane {i}");
+        }
     }
 }
