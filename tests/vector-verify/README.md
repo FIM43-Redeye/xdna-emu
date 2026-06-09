@@ -5,6 +5,15 @@ loops) so a bridge run can confirm the emulator matches real NPU1 silicon on the
 vector-compute classes Half A verified against the aietools model. See
 `docs/superpowers/plans/2026-06-08-vector-compute-halfB-silicon.md`.
 
+Most kernels are **generated** from a spec by `tools/gen_vector_kernel.py`
+(registry: `tools/vector_kernel_specs.py`). A spec is the config slice + the
+intrinsic body (the IP); the generator derives run.lit/aie.mlir/test.cpp/kernel.cc
+and bakes the golden input/expected arrays from the Half-A corpus
+(`tools/golden/vector_ops.json`) so no expected value is hand-transcribed. To
+(re)generate one durably here: `python3 tools/gen_vector_kernel.py <name>`
+(or `all`). The early kernels (`vec_eltwise_add`, `vec_srs_i32`) were authored by
+hand before the generator and remain the template it was modeled on.
+
 These are the durable, committed source of truth. The bridge harness
 (`scripts/emu-bridge-test.sh`) discovers tests only under
 `$MLIR_AIE/test/npu-xrt/`, so to build/run a kernel, stage it there first:
@@ -35,7 +44,7 @@ for the corresponding vector class (plan Task 3 -> Task 5 Verified flip).
 |-----|-------|--------|
 | `vec_eltwise_add` | element-wise (vadd_Int32) | **EMU-smoke PASS** (chess, 18.5s) |
 | `vec_srs_i32` | SRS | **EMU-smoke PASS** (chess) -- first compiled vector kernel through the decode->execute interpreter. Surfaced + fixed a four-bug cascade (wide-cm SRS panic 4472bfb; VMOV-q 5570f5d; fused post-inc dispatch + get_address 960975a; VLIW vector/accum/mask snapshot 13534bc). See `docs/superpowers/plans/2026-06-08-q-register-vector-modeling.md`. |
-| `vec_ups_i32` | UPS | todo |
+| `vec_ups_i32` | UPS | **EMU-smoke PASS** (chess) -- first GENERATED kernel (`tools/gen_vector_kernel.py`). Surfaced + fixed two interpreter gaps: wide acc32->x VMOV as a raw 512-bit reinterpret (80e7ba7), and same-bundle scalar->UPS-shift forwarding (724548e, E1->E7 per llvm-aie AIE2Schedule.td). |
 | `vec_pack_i16` | Pack | todo |
 | `vec_mac_i8` | MatMul int (i8) | todo |
 | `vec_mac_i16` | MatMul int (i16) | todo |
