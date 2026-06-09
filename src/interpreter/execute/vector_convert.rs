@@ -7,10 +7,21 @@
 
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::state::ExecutionContext;
+use xdna_archspec::aie2::rounding::RoundingMode;
 
 use super::vector_dispatch::VectorAlu;
 
 impl VectorAlu {
+    /// The vector unit's configured rounding mode, used by f32->bf16 conversion.
+    ///
+    /// `set_rounding` writes the SRS/conversion rounding-mode control field,
+    /// which AIE2 shares between the integer SRS pipeline and float->bf16
+    /// narrowing (`to_v16bfloat16` is governed by `crRnd`). Falls back to Floor
+    /// (the reset default) for an out-of-range field.
+    pub(crate) fn ctx_rounding(ctx: &ExecutionContext) -> RoundingMode {
+        RoundingMode::from_raw(ctx.srs_config.rounding_mode).unwrap_or(RoundingMode::Floor)
+    }
+
     /// Dispatch entry point for Convert (VCONV/VFLOOR) operations.
     ///
     /// Handles both narrow and wide paths, including accumulator sources
@@ -42,10 +53,11 @@ impl VectorAlu {
     fn execute_convert_narrow(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         let src = Self::get_vector_source(op, ctx, 0);
         let from = op.from_type.unwrap_or(ElementType::Int32);
+        let mode = Self::ctx_rounding(ctx);
         let is_expansion = from.bits() < et.bits();
         if is_expansion && matches!(op.dest, Some(Operand::AccumReg(_))) {
             // BF16->FP32 expansion: 8 bf16 -> 8 fp32 packed into accum.
-            let result = Self::vector_convert(&src, from, et);
+            let result = Self::vector_convert(&src, from, et, mode);
             let dst_reg = Self::get_acc_dest(op);
             let mut acc = [0u64; 8];
             for i in 0..8 {
@@ -53,7 +65,7 @@ impl VectorAlu {
             }
             ctx.accumulator.write(dst_reg, acc);
         } else {
-            let result = Self::vector_convert(&src, from, et);
+            let result = Self::vector_convert(&src, from, et, mode);
             Self::write_vector_dest(op, ctx, result);
         }
         true
@@ -71,6 +83,7 @@ impl VectorAlu {
     ///   result[i] = saturate_s32(floor(bf16_value * 2^shift))
     fn execute_convert_wide(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         let from = op.from_type.unwrap_or(ElementType::Int32);
+        let mode = Self::ctx_rounding(ctx);
 
         // Extract shift from scalar source (VFLOOR only).
         let shift_val: Option<i32> = op.sources.iter().find_map(|s| {
@@ -157,7 +170,7 @@ impl VectorAlu {
                 let s = shift_val.unwrap();
                 (Self::vector_floor_bf16_to_s32(&src_lo, s), Self::vector_floor_bf16_to_s32(&src_hi, s))
             } else {
-                (Self::vector_convert(&src_lo, from, et), Self::vector_convert(&src_hi, from, et))
+                (Self::vector_convert(&src_lo, from, et, mode), Self::vector_convert(&src_hi, from, et, mode))
             };
             // VCONV may produce narrow output (e.g., f32->bf16 packs 8 f32
             // into 4 words of bf16). Write to the appropriate dest width.
@@ -196,7 +209,10 @@ impl VectorAlu {
                     let s = shift_val.unwrap();
                     (Self::vector_floor_bf16_to_s32(&lo_in, s), Self::vector_floor_bf16_to_s32(&hi_in, s))
                 } else {
-                    (Self::vector_convert(&lo_in, from, et), Self::vector_convert(&hi_in, from, et))
+                    (
+                        Self::vector_convert(&lo_in, from, et, mode),
+                        Self::vector_convert(&hi_in, from, et, mode),
+                    )
                 };
                 if matches!(op.dest, Some(Operand::AccumReg(_))) {
                     // Accumulator dest: pack 16 x u32 into 8 x u64.
@@ -222,8 +238,8 @@ impl VectorAlu {
                 let src = Self::get_wide_vec_source(op, ctx, 0);
                 let src_lo: [u32; 8] = src[..8].try_into().unwrap();
                 let src_hi: [u32; 8] = src[8..].try_into().unwrap();
-                let res_lo = Self::vector_convert(&src_lo, from, et);
-                let res_hi = Self::vector_convert(&src_hi, from, et);
+                let res_lo = Self::vector_convert(&src_lo, from, et, mode);
+                let res_hi = Self::vector_convert(&src_hi, from, et, mode);
                 let mut result = [0u32; 16];
                 result[..8].copy_from_slice(&res_lo);
                 result[8..].copy_from_slice(&res_hi);
@@ -235,8 +251,15 @@ impl VectorAlu {
 
     /// Vector type conversion.
     ///
-    /// Used by standalone `VCONV` and fused `vlda.conv` / `vst.conv`.
-    pub(crate) fn vector_convert(src: &[u32; 8], from_type: ElementType, to_type: ElementType) -> [u32; 8] {
+    /// Used by standalone `VCONV` and fused `vlda.conv` / `vst.conv`. `mode` is
+    /// the configured rounding mode (from `set_rounding`); it governs f32->bf16
+    /// narrowing and is ignored by conversions that don't round.
+    pub(crate) fn vector_convert(
+        src: &[u32; 8],
+        from_type: ElementType,
+        to_type: ElementType,
+        mode: RoundingMode,
+    ) -> [u32; 8] {
         let mut result = [0u32; 8];
 
         match (from_type, to_type) {
@@ -252,13 +275,16 @@ impl VectorAlu {
             }
             // Float32 -> BFloat16 (pack: 8 f32 -> 16 bf16, store in lower 4 words)
             (ElementType::Float32, ElementType::BFloat16) => {
-                use super::vector_float::fp32_flush_to_zero;
+                use super::vector_float::{f32_to_bf16, fp32_flush_to_zero};
                 for i in 0..4 {
                     // AIE2 FTZ on inputs before conversion.
                     let f0 = f32::from_bits(fp32_flush_to_zero(src[i * 2]));
                     let f1 = f32::from_bits(fp32_flush_to_zero(src[i * 2 + 1]));
-                    let bf0 = Self::f32_to_bf16(f0);
-                    let bf1 = Self::f32_to_bf16(f1);
+                    // Round-narrow per the configured mode (HW: crRnd governs
+                    // to_v16bfloat16). The Half-A-validated f32_to_bf16 matches
+                    // the aietools model across all 10 modes.
+                    let bf0 = f32_to_bf16(f0, mode);
+                    let bf1 = f32_to_bf16(f1, mode);
                     result[i] = (bf0 as u32) | ((bf1 as u32) << 16);
                 }
             }
@@ -461,6 +487,33 @@ mod tests {
                 lo_bf16
             );
         }
+    }
+
+    #[test]
+    fn test_vconv_fp32_bf16_honors_rounding_mode() {
+        // f32 0x3F80C000 has guard=1, sticky=1 in the discarded low-16 mantissa
+        // bits, so ConvEven (mode 12) rounds the bf16 mantissa up: 0x3F80 ->
+        // 0x3F81. Bit-truncation (the old behavior) would give 0x3F80. The
+        // convert datapath must honor the configured rounding mode, matching
+        // the Half-A-validated f32_to_bf16(value, mode) path (and HW's
+        // crRnd-governed to_v16bfloat16). See the bf16_srs golden (rnd-keyed).
+        let mut ctx = make_ctx();
+        let mut acc = [0u64; 8];
+        acc[0] = 0x3F80_C000u64; // lane 0 low f32 = our value; high f32 = 0
+        ctx.accumulator.write(0, acc);
+        ctx.srs_config.rounding_mode = 12; // ConvEven
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Convert)
+            .as_vector(ElementType::BFloat16)
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::AccumReg(0));
+        op.from_type = Some(ElementType::Float32);
+        op.accum_width = Some(AccumWidth::Half);
+
+        assert!(VectorAlu::execute(&op, &mut ctx));
+        let result = ctx.vector.read(0);
+        let bf0 = (result[0] & 0xFFFF) as u16;
+        assert_eq!(bf0, 0x3F81, "ConvEven must round 0x3F80C000 up to 0x3F81, not truncate to 0x3F80");
     }
 
     #[test]

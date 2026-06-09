@@ -900,7 +900,8 @@ impl MemoryUnit {
                     ctx.accumulator.write(*r, acc);
                 } else {
                     // Generic path: use vector_convert (256-bit result)
-                    let result = super::VectorAlu::vector_convert(&vec_data, from, to);
+                    let mode = super::VectorAlu::ctx_rounding(ctx);
+                    let result = super::VectorAlu::vector_convert(&vec_data, from, to, mode);
                     // Pack into accumulator as raw u64 words
                     let mut acc = [0u64; 8];
                     for i in 0..4 {
@@ -911,7 +912,8 @@ impl MemoryUnit {
             }
             Some(dest) => {
                 // Non-accumulator dest (vector register)
-                let result = super::VectorAlu::vector_convert(&vec_data, from, to);
+                let mode = super::VectorAlu::ctx_rounding(ctx);
+                let result = super::VectorAlu::vector_convert(&vec_data, from, to, mode);
                 let latency = load_latency_for_address(Self::get_address(op, ctx));
                 ctx.queue_vector_load(dest.clone(), result, latency);
             }
@@ -1109,13 +1111,15 @@ impl MemoryUnit {
             // For bf16 output (16 values in 256 bits = 32 bytes), we need
             // all 16 f32 values. Pack them as 8 pairs into the convert path.
             if from == ElementType::Float32 && to == ElementType::BFloat16 {
-                // Direct bf16 truncation from accumulator float data.
+                // Round-narrow bf16 from accumulator float data, per the
+                // configured rounding mode (HW: crRnd governs to_v16bfloat16).
+                let mode = super::VectorAlu::ctx_rounding(ctx);
                 let mut result = [0u32; 8];
                 for i in 0..8 {
                     let f_lo = f32::from_bits(acc[i] as u32);
                     let f_hi = f32::from_bits((acc[i] >> 32) as u32);
-                    let bf_lo = super::VectorAlu::f32_to_bf16(f_lo);
-                    let bf_hi = super::VectorAlu::f32_to_bf16(f_hi);
+                    let bf_lo = super::vector_float::f32_to_bf16(f_lo, mode);
+                    let bf_hi = super::vector_float::f32_to_bf16(f_hi, mode);
                     result[i] = (bf_lo as u32) | ((bf_hi as u32) << 16);
                 }
                 let addr = Self::get_store_address(op, ctx);
@@ -1138,7 +1142,8 @@ impl MemoryUnit {
             Self::get_vector_source(op, ctx)
         };
 
-        let converted = super::VectorAlu::vector_convert(&src, from, to);
+        let mode = super::VectorAlu::ctx_rounding(ctx);
+        let converted = super::VectorAlu::vector_convert(&src, from, to, mode);
 
         let addr = Self::get_store_address(op, ctx);
         log::debug!("[FUSED] vst.conv: addr=0x{:X} ({:?} -> {:?})", addr, from, to,);
