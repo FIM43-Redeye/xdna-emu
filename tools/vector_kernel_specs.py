@@ -210,9 +210,10 @@ _reg(KernelSpec(
     n=0,
     golden={"class": "matmul",
             "filt": {"a_type": "Int8", "b_type": "Int8", "rows": 4,
-                     "inner": 8, "cols": 8, "subtract": False}},
-    matmul=Matmul(M=4, K=8, N=8, a_bytes=1, b_bytes=1, batch=64),
-    defines=[("MAC_BATCH", 64)],
+                     "inner": 8, "cols": 8, "subtract": False,
+                     "x_signed": True, "y_signed": True}},
+    matmul=Matmul(M=4, K=8, N=8, a_bytes=1, b_bytes=1, batch=48),
+    defines=[("MAC_BATCH", 48)],
     body="""  event0();
   using MMUL = aie::mmul<4, 8, 8, int8, int8, accauto>;
   for (int n = 0; n < MAC_BATCH; n++) {
@@ -243,9 +244,10 @@ _reg(KernelSpec(
     n=0,
     golden={"class": "matmul",
             "filt": {"a_type": "Int16", "b_type": "Int16", "rows": 4,
-                     "inner": 2, "cols": 8, "subtract": False}},
-    matmul=Matmul(M=4, K=2, N=8, a_bytes=2, b_bytes=2, batch=64),
-    defines=[("MAC_BATCH", 64)],
+                     "inner": 2, "cols": 8, "subtract": False,
+                     "x_signed": True, "y_signed": True}},
+    matmul=Matmul(M=4, K=2, N=8, a_bytes=2, b_bytes=2, batch=48),
+    defines=[("MAC_BATCH", 48)],
     body="""  event0();
   using MMUL = aie::mmul<4, 2, 8, int16, int16, accauto>;
   for (int n = 0; n < MAC_BATCH; n++) {

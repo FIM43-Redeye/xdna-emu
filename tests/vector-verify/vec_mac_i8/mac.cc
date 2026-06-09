@@ -9,7 +9,7 @@
 
 #include <aie_api/aie.hpp>
 
-#define MAC_BATCH 64
+#define MAC_BATCH 48
 
 extern "C" {
 

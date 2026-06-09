@@ -282,6 +282,32 @@ class TestMatmulSupport:
         assert "int32_t *bufOut" in cpp
         assert "INA" in cpp and "INB" in cpp and "EXP" in cpp
 
+    def test_integer_matmul_specs_golden_matches_textbook(self):
+        """Each shipped integer matmul spec's baked C must equal the textbook
+        product of its baked row-major A/B. The kernel feeds SIGNED inputs, so
+        the golden slice must select the signed-input records (x_signed/y_signed
+        True) -- otherwise unsigned-sampled records (whose high-bit bytes the
+        signed kernel reads as negative) diverge from their stored expected."""
+        from gen_vector_kernel import bake_matmul
+        from vector_kernel_specs import SPECS
+        for name in ("vec_mac_i8", "vec_mac_i16"):
+            spec = SPECS[name]
+            mm = spec.matmul
+            a_vals, b_vals, c_vals = bake_matmul(
+                GOLDEN["matmul"], spec.golden["filt"], mm,
+                predicate=spec.golden.get("predicate"))
+            sa, sb, sc = mm.size_a, mm.size_b, mm.size_c
+            for t in range(mm.batch):
+                a = a_vals[t * sa:(t + 1) * sa]
+                b = b_vals[t * sb:(t + 1) * sb]
+                c = c_vals[t * sc:(t + 1) * sc]
+                for i in range(mm.M):
+                    for j in range(mm.N):
+                        s = sum(a[i * mm.K + k] * b[k * mm.N + j] for k in range(mm.K))
+                        s = ((s + 2 ** 31) % 2 ** 32) - 2 ** 31  # int32 wrap
+                        assert s == c[i * mm.N + j], \
+                            f"{name} tile {t} [{i},{j}]: textbook {s} != golden {c[i * mm.N + j]}"
+
     def test_bake_matmul_honors_predicate(self):
         """bake_matmul forwards a record predicate to select_records, so a
         matmul spec can exclude records whose expected output has NaN/Inf lanes
