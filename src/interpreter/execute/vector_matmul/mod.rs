@@ -90,6 +90,20 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         }
     };
 
+    // Fresh-multiply forms zero the accumulator regardless of the config word.
+    //
+    // VMUL (-> MatMul) and VNEGMUL (-> NegMul) encode acc1 = 0b1111, i.e. NO
+    // accumulator input -- the products land in a freshly-zeroed accumulator.
+    // This is structural to the instruction, distinct from the config word's
+    // dynZeroAccum bit (which only dynamically zeroes the VMAC-family). Chess
+    // emits the fresh VMUL with a config word that has zero_acc=0 (accumulate),
+    // so honoring only the config word would leak the destination accumulator's
+    // stale/poison contents into the result. Mac/MatMulSub/NegMatMul/AddMac/
+    // SubMac (the VMAC family) keep the config-driven accumulate behavior.
+    if matches!(semantic, SemanticOp::MatMul | SemanticOp::NegMul) {
+        config.accumulate = false;
+    }
+
     // Handle subtract semantics for MAC variants.
     //
     // The hardware compressor stage controls the sign of the product via a
@@ -1621,6 +1635,68 @@ mod tests {
             let half = i % 2;
             let val = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as i32;
             assert_eq!(val, 8, "output[{}]: expected 8, got {}", i, val);
+        }
+    }
+
+    #[test]
+    fn test_matmul_fresh_zeroes_dirty_accumulator() {
+        // VMUL (mnemonic "vmul", MatMul semantic) is a FRESH matrix multiply:
+        // acc1 is hardcoded 0b1111 (no accumulator input), so the destination
+        // accumulator must be zeroed before the multiply regardless of the
+        // config word's zero_acc bit. The compiled VMUL config word has
+        // zero_acc=0 (accumulate), so the fresh-zero must come from the
+        // semantic, not the config. Reproduces the MAC-tier poison bug: a dirty
+        // accumulator must NOT leak into the result.
+        let mut ctx = ExecutionContext::new();
+        ctx.accumulator.write_wide(0, [0xDEAD_BEEF_DEAD_BEEFu64; 16]);
+
+        let ones = vec512_all_ones_i8();
+        ctx.vector.write_wide(0, ones);
+        ctx.vector.write_wide(2, ones);
+        // Config word says ACCUMULATE (bit 0 = 0), exactly like Chess emits.
+        ctx.scalar.write(5, config_i8xi8_accumulate());
+
+        let op = make_mac_op(SemanticOp::MatMul, 0, 2, 5, 0, Some("VMUL_vmac_cm_core_dense"));
+        let handled = execute_matmul(&op, &mut ctx);
+        assert!(handled, "execute_matmul should handle MatMul semantic");
+
+        let acc = ctx.accumulator.read_wide(0);
+        for i in 0..32 {
+            let lane = i / 2;
+            let half = i % 2;
+            let val = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as i32;
+            assert_eq!(val, 8, "output[{}]: fresh A.B must be 8, not poison+A.B (got {})", i, val);
+        }
+    }
+
+    #[test]
+    fn test_matmul_mac_still_accumulates_after_fresh_fix() {
+        // Regression guard: the fresh-zero must apply ONLY to MatMul/NegMul, not
+        // to Mac. With a pre-loaded accumulator (10 per lane) and accumulate
+        // config, VMAC must add: 10 + 8 = 18.
+        let mut ctx = ExecutionContext::new();
+        let mut pre = [0u64; 16];
+        for i in 0..32 {
+            let lane = i / 2;
+            let half = i % 2;
+            pre[lane] |= (10u64 & 0xFFFF_FFFF) << (half * 32);
+        }
+        ctx.accumulator.write_wide(0, pre);
+
+        let ones = vec512_all_ones_i8();
+        ctx.vector.write_wide(0, ones);
+        ctx.vector.write_wide(2, ones);
+        ctx.scalar.write(5, config_i8xi8_accumulate());
+
+        let op = make_mac_op(SemanticOp::Mac, 0, 2, 5, 0, Some("VMAC_vmac_cm_core_dense"));
+        execute_matmul(&op, &mut ctx);
+
+        let acc = ctx.accumulator.read_wide(0);
+        for i in 0..32 {
+            let lane = i / 2;
+            let half = i % 2;
+            let val = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as i32;
+            assert_eq!(val, 18, "Mac must accumulate 10 + 8 = 18, got {}", val);
         }
     }
 

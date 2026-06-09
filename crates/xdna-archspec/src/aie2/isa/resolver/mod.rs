@@ -35,7 +35,7 @@ pub use operand_classification::{
 };
 pub use semantic_inference::{
     infer_branch_condition, infer_dual_element_types, infer_element_type, infer_select_variant,
-    infer_semantic_from_structure, refine_branch_semantic, refine_fused_semantic,
+    infer_semantic_from_structure, refine_branch_semantic, refine_fused_semantic, refine_matmul_semantic,
 };
 
 use std::collections::HashMap;
@@ -436,6 +436,11 @@ impl<'a> Resolver<'a> {
         // Refine Load/Store -> fused semantics (UPS/SRS/Pack/Unpack/Convert)
         // using the TableGen instruction name, not the runtime mnemonic.
         let semantic = refine_fused_semantic(&instr.name, semantic);
+
+        // Refine the matrix-multiply VMUL (Mul -> MatMul): in AIE2 a `vmul`
+        // writing a cm/bm accumulator IS a fresh matrix multiply, not the
+        // elementwise Mul that Pat<> inference assigns.
+        let semantic = refine_matmul_semantic(&instr.name, semantic);
 
         // Extract operand ordering from InstrDef
         let input_order: Vec<String> = instr.inputs.iter().map(|o| o.name.clone()).collect();

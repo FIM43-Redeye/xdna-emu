@@ -51,31 +51,44 @@ for the corresponding vector class (plan Task 3 -> Task 5 Verified flip).
 | `vec_mac_i16` | MatMul int (i16) | **EMU-blocked** (chess) -- generated (int16, 4x2x8). Same shared gap. |
 | `vec_mac_bf16` | MatMul bf16 | **EMU-blocked** (chess) -- generated (bf16, 4x8x4, fp32-bit compare, all-finite slice). Same shared gap. |
 
-### Shared MAC-tier gap: compiled matrix-VMUL not routed to matmul execute
+### Shared MAC-tier gap (a two-bug cascade)
 
-All three MAC kernels are blocked on **one** interpreter gap (one fix unblocks
-the tier). Root cause, pinned by a memory-watch run on `vec_mac_i16`:
+All three MAC kernels share the same compiled-mmul datapath. Pinned by
+memory-watch runs on `vec_mac_i16`, two distinct interpreter bugs gate it.
 
-- Chess lowers `aie::mmul` to **`VMUL cm0, x0, x1, r24`** -- a matrix-multiply
-  VMUL with a `cm` (matrix accumulator) destination and the matmul shape/mode in
-  the `r24` config word. The result is read back via `VST amhl0`.
-- The decoder maps **all** `vmul` to `SemanticOp::Mul` (elementwise) -- see
-  `decoder.rs` `assert_sem("vmul.s8", SemanticOp::Mul)`. The matrix-VMUL form is
-  never routed to `SemanticOp::MatMul` (which exists and dispatches to
-  `vector_matmul::execute_matmul`, the path Half-A exercised via hand-built
-  SlotOps). The elementwise `Mul` handler does not write the `cm` accumulator.
-- So `amhl0` stays at its poison init; the core stores **`0xDEADBEEF`** to the
-  output buffer (confirmed: `CORE-ST pc=0x320 addr=0x70420 value=0xDEADBEEF`).
-  The lock/DMA machinery is correct -- the output produce-lock release grants the
-  drain DMA immediately; the drain just copies poison. The "no-progress stall"
-  the coordinator reports is a *secondary* artifact (the chained second output BD
-  waits for a production that never comes), not the cause.
+**Bug 1 -- matrix-VMUL routed to elementwise Mul (FIXED).** Chess lowers
+`aie::mmul` to **`VMUL cm0, x0, x1, r24`**: a matrix-multiply VMUL with a `cm`
+(matrix accumulator) destination and the matmul shape/mode in the `r24` config
+word (read back via `VST amhl0`). In AIE2 there is no elementwise VMUL, but the
+Pat<>-based inference assigned `SemanticOp::Mul`, so it never reached
+`vector_matmul::execute_matmul` and the `cm` accumulator was never written --
+the core stored the poison init (`0xDEADBEEF`). Fix (two parts):
+  - `resolver/semantic_inference.rs::refine_matmul_semantic` upgrades the
+    matrix-VMUL name (`VMUL_..._cm_core_...` / `..._bm_core_...`) from `Mul` to
+    `MatMul`, so it routes to `execute_matmul` (which already decodes the `r24`
+    config word via `MatMulConfig::from_config_word`).
+  - `execute_matmul` force-zeros the accumulator for the fresh-multiply forms
+    (`MatMul`/`NegMul`): VMUL encodes `acc1 = 0b1111` (no accumulator input), so
+    it zeroes structurally -- the compiled config word has `zero_acc=0`
+    (accumulate), so honoring only the config word would leak the destination
+    accumulator's stale contents. VMAC-family forms keep config-driven
+    accumulate.
 
-Fix direction: detect the matrix-multiply VMUL encoding (cm-destination + config
-operand) at decode and route it to `SemanticOp::MatMul`, decoding the `r24`
-config word into the matmul parameters the existing `execute_matmul` expects.
-This is a decode/dispatch routing fix (cf. the srs four-bug cascade), not a
-from-scratch reimplementation of matmul arithmetic.
+  After Bug 1, the arithmetic is correct (every tile's `A.B` matches the golden)
+  but the result is shifted by exactly one tile (see Bug 2).
+
+**Bug 2 -- MAC pipeline latency not modeled (OPEN).** Chess software-pipelines
+the batch loop: a 2-deep `VMUL cm0` prologue, then a zero-overhead loop whose
+body bundles the tile store with the *next* tile's `VMUL cm0` (`VST amhl0,
+[p2], #64; VMUL cm0, x0, x1, r24`). Hardware relies on the multi-cycle MAC
+latency -- the VMUL result is not visible in `cm0` for several cycles, so the
+in-flight stores read the *older* tile's result. The emulator applies the VMUL
+write immediately, so every tile is stored one ahead: emu tile N == golden tile
+N+1 (verified: emu tiles 5/6/7 == golden tiles 6/7/8). Fix direction: defer the
+matmul accumulator write by the MAC latency using the interpreter's existing
+`PendingWrite` / `commit_pending_writes` machinery (the latency table already
+lists "Vector MAC | 4+ cycles"), so pipelined-loop stores read the correct
+prior tile. This is a timing-model change, tracked separately.
 
 `vec_eltwise_add` is the proof-of-pattern: once its author -> stage -> compile ->
 EMU-smoke loop is green, the rest follow the same template (`runtime_cumsum`-

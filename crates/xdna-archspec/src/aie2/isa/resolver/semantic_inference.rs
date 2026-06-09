@@ -185,6 +185,31 @@ pub fn refine_fused_semantic(name: &str, semantic: Option<SemanticOp>) -> Option
     }
 }
 
+/// Refine a `Mul` semantic to `MatMul` for the matrix-multiply VMUL.
+///
+/// In AIE2 there is no elementwise VMUL: the `vmul` mnemonic writing to a
+/// cm/bm accumulator destination, with a config-word operand, IS a fresh
+/// matrix multiply driven by the systolic MAC array (the encoding hardcodes
+/// acc1 = 0b1111, i.e. no accumulator input). LLVM's Pat<>-based inference
+/// assigns it the generic `Mul`, which the emulator would execute as an
+/// elementwise multiply that never writes the accumulator. This upgrades it
+/// to `MatMul` so it routes to the matrix-multiply execute path.
+///
+/// The matrix form is identified by the TableGen def name
+/// (`VMUL_..._cm_core_...` for integer, `VMUL_F_..._bm_core_...` for bf16).
+/// VMAC/VMSC/VNEGMAC already resolve to MAC-family semantics, and VNEGMUL
+/// (negated fresh multiply, `NegMul`) keeps its own semantic -- only the plain
+/// fresh-multiply `Mul` is refined here.
+pub fn refine_matmul_semantic(name: &str, semantic: Option<SemanticOp>) -> Option<SemanticOp> {
+    if semantic == Some(SemanticOp::Mul)
+        && name.starts_with("VMUL_")
+        && (name.contains("cm_core") || name.contains("bm_core"))
+    {
+        return Some(SemanticOp::MatMul);
+    }
+    semantic
+}
+
 /// Infer branch condition from mnemonic and semantic operation.
 ///
 /// Only meaningful for BrCond instructions. Returns None for other semantics.
@@ -461,6 +486,46 @@ mod tests {
             refine_fused_semantic("VST_CONV_BF16_FP32_ag_pstm_nrm", Some(SemanticOp::Store)),
             Some(SemanticOp::Convert),
         );
+    }
+
+    #[test]
+    fn test_refine_matmul_semantic_vmul_to_matmul() {
+        // The matrix-multiply VMUL (cm/bm accumulator destination, config-word
+        // operand) is a fresh matrix multiply -- it must be MatMul, not the
+        // elementwise Mul the Pat<>-based inference assigns. Integer + bf16.
+        assert_eq!(
+            refine_matmul_semantic("VMUL_vmac_cm_core_dense", Some(SemanticOp::Mul)),
+            Some(SemanticOp::MatMul),
+        );
+        assert_eq!(
+            refine_matmul_semantic("VMUL_F_vmac_bm_core_dense", Some(SemanticOp::Mul)),
+            Some(SemanticOp::MatMul),
+        );
+        assert_eq!(
+            refine_matmul_semantic("VMUL_vmac_cm_core_sparse_wide", Some(SemanticOp::Mul)),
+            Some(SemanticOp::MatMul),
+        );
+    }
+
+    #[test]
+    fn test_refine_matmul_semantic_leaves_others_alone() {
+        // VMAC already resolves to Mac (accumulate) -- must not be touched.
+        assert_eq!(
+            refine_matmul_semantic("VMAC_vmac_cm_core_dense", Some(SemanticOp::Mac)),
+            Some(SemanticOp::Mac),
+        );
+        // VNEGMUL (negated fresh multiply) is not a plain VMUL: leave it.
+        assert_eq!(
+            refine_matmul_semantic("VNEGMUL_vmac_cm_core_dense", Some(SemanticOp::NegMul)),
+            Some(SemanticOp::NegMul),
+        );
+        // A non-matrix Mul (no cm/bm-core accumulator destination) stays Mul.
+        assert_eq!(
+            refine_matmul_semantic("VMUL_elem_something", Some(SemanticOp::Mul)),
+            Some(SemanticOp::Mul),
+        );
+        // Non-Mul semantics pass through unchanged.
+        assert_eq!(refine_matmul_semantic("VADD_32", Some(SemanticOp::Add)), Some(SemanticOp::Add),);
     }
 
     #[test]
