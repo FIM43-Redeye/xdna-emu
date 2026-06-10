@@ -104,6 +104,140 @@ class KernelSpec:
     matmul: Optional[Matmul] = None
 
 
+# --- Mode sweep --------------------------------------------------------------
+#
+# AIE2 vector-compute classes that round (SRS, bf16 convert) read crRnd; classes
+# that narrow with overflow (SRS, Pack, UPS) read crSat. A single capture kernel
+# bakes ONE mode (one set_rounding/set_saturation in the body, one matching
+# golden slice). Phase A makes the silicon check *mode-exhaustive*: emit one
+# kernel per reachable mode-point so every crRnd/crSat value is exercised on HW,
+# not just one representative -- the same axis the pack-saturation gap hid behind.
+#
+# The crRnd index -> aie::rounding_mode enum name and crSat index -> enum name
+# maps below are verified against the toolchain: the rnd_* macros in
+# aietools .../aie_ml/lib/me_defines.h and the saturation_mode enum in
+# aie_api/aie_types.hpp (none=0, saturate=1, symmetric=3). They match the
+# emulator's RoundingMode (crates/xdna-archspec/.../rounding.rs), so the kernel
+# the generator emits drives exactly the crRnd/crSat the baked golden slice was
+# produced under -- the body and the expected values stay in lockstep.
+
+ROUNDING_ENUM = {
+    0: "floor", 1: "ceil", 2: "symmetric_floor", 3: "symmetric_ceil",
+    8: "negative_inf", 9: "positive_inf", 10: "symmetric_zero",
+    11: "symmetric_inf", 12: "conv_even", 13: "conv_odd",
+}
+
+SAT_ENUM = {0: "none", 1: "saturate", 3: "symmetric"}
+
+
+def mode_lines(rnd, crsat):
+    """Render the set_rounding / set_saturation lines for a mode-point.
+
+    Emits set_rounding only when `rnd` is given (the class rounds) and
+    set_saturation only when `crsat` is given (the class can overflow), so each
+    class's `$mode` placeholder gets exactly the control-register writes it uses.
+    """
+    out = []
+    if rnd is not None:
+        out.append(f"  ::aie::set_rounding(aie::rounding_mode::{ROUNDING_ENUM[rnd]});")
+    if crsat is not None:
+        out.append(f"  ::aie::set_saturation(aie::saturation_mode::{SAT_ENUM[crsat]});")
+    return "\n".join(out)
+
+
+def _sat_filt(crsat, sat_field, symsat_field):
+    """Golden-filter fields selecting the records produced under crSat=`crsat`.
+
+    The corpus only ever pairs (sat=False, sym=False), (sat=True, sym=False),
+    (sat=True, sym=True) -- never (False, True) -- so {sat: crsat!=0, sym:
+    crsat==3} selects each of none(0)/saturate(1)/symmetric(3) unambiguously.
+    `symsat_field` is None for classes (e.g. UPS) whose corpus carries no
+    symmetric-saturation column; there only crSat 0/1 are swept.
+    """
+    filt = {sat_field: crsat != 0}
+    if symsat_field is not None:
+        filt[symsat_field] = crsat == 3
+    return filt
+
+
+@dataclass
+class SweepSpec:
+    """A family of capture kernels covering a class's full crRnd/crSat space.
+
+    `expand()` yields one `KernelSpec` per point in the cartesian product of
+    `rnds` x `sats`. Each point derives its kernel name suffix (`_r<rnd>_s<sat>`),
+    its body (the mode-setting lines substituted into `body_template`'s `$mode`
+    placeholder), and its golden filter (`base_filt` plus the mode fields) so the
+    swept body and the baked golden stay in lockstep by construction.
+
+    `body_template` is the hand-written intrinsic IP with a `$mode` marker where
+    the control-register writes belong (and `event0()`/`event1()` around it).
+    `rnds`/`sats` are the crRnd/crSat index lists to sweep (None => that axis is
+    fixed/absent for the class). `sat_field`/`symsat_field` name the corpus's
+    saturation columns (they differ across classes: srs uses sym_sat, pack uses
+    symsat, ups has none).
+    """
+
+    prefix: str
+    func: str
+    doc: str
+    inputs: List[Buf]
+    output: Buf
+    n: int
+    gclass: str
+    base_filt: dict
+    body_template: str
+    rnds: Optional[List[int]] = None
+    sats: Optional[List[int]] = None
+    sat_field: str = "sat"
+    symsat_field: Optional[str] = None
+    value_range: Optional[Tuple[int, int]] = None
+    predicate: Optional[object] = None
+    defines: List[Tuple[str, object]] = field(default_factory=list)
+    stem: Optional[str] = None
+
+    def expand(self):
+        """Materialize the sweep into one KernelSpec per (rnd, crsat) point."""
+        rnds = self.rnds if self.rnds is not None else [None]
+        sats = self.sats if self.sats is not None else [None]
+        specs = []
+        for rnd in rnds:
+            for crsat in sats:
+                suffix = ""
+                desc = []
+                if rnd is not None:
+                    suffix += f"_r{rnd}"
+                    desc.append(f"rnd={rnd}({ROUNDING_ENUM[rnd]})")
+                if crsat is not None:
+                    suffix += f"_s{crsat}"
+                    desc.append(f"sat={crsat}({SAT_ENUM[crsat]})")
+                filt = dict(self.base_filt)
+                if rnd is not None:
+                    filt["rnd"] = rnd
+                if crsat is not None:
+                    filt.update(_sat_filt(crsat, self.sat_field, self.symsat_field))
+                golden = {"class": self.gclass, "filt": filt}
+                if self.value_range is not None:
+                    golden["value_range"] = self.value_range
+                if self.predicate is not None:
+                    golden["predicate"] = self.predicate
+                body = string.Template(self.body_template).substitute(
+                    mode=mode_lines(rnd, crsat))
+                specs.append(KernelSpec(
+                    name=self.prefix + suffix,
+                    func=self.func,
+                    doc=self.doc + " Mode-sweep point: " + ", ".join(desc) + ".",
+                    inputs=self.inputs,
+                    output=self.output,
+                    n=self.n,
+                    golden=golden,
+                    body=body,
+                    defines=self.defines,
+                    stem=self.stem,
+                ))
+        return specs
+
+
 def _stem(spec):
     """Basename for the kernel's .cc/.o (e.g. "srs" from func "srs_i32")."""
     return spec.stem if spec.stem else spec.func.split("_")[0]
@@ -687,22 +821,36 @@ def main(argv=None):
 
     ap = argparse.ArgumentParser(
         description="Generate Half-B vector-compute capture kernels from specs.")
-    ap.add_argument("name", help="spec name (e.g. vec_ups_i32), or 'all'")
+    ap.add_argument("name", help="spec name (e.g. vec_ups_i32), a sweep name "
+                                 "(e.g. vec_srs_i32_sweep), 'all', or 'all-sweeps'")
     ap.add_argument("--out", default=_default_out_dir(),
                     help="output root (default: tests/vector-verify)")
     ap.add_argument("--golden", default=_default_golden_path(),
                     help="vector_ops.json corpus (default: tools/golden/...)")
     args = ap.parse_args(argv)
 
-    from vector_kernel_specs import SPECS
+    from vector_kernel_specs import SPECS, SWEEPS
     golden = json.loads(open(args.golden).read())
 
-    names = sorted(SPECS) if args.name == "all" else [args.name]
-    for name in names:
-        if name not in SPECS:
-            ap.error(f"unknown spec '{name}'; known: {', '.join(sorted(SPECS))}")
-        dest = generate(SPECS[name], golden, args.out)
-        print(f"generated {name} -> {dest}")
+    # Resolve the request to a flat list of KernelSpecs. A sweep name expands to
+    # one KernelSpec per mode-point; 'all-sweeps' expands every sweep.
+    to_gen = []
+    if args.name == "all":
+        to_gen = [SPECS[n] for n in sorted(SPECS)]
+    elif args.name == "all-sweeps":
+        for sname in sorted(SWEEPS):
+            to_gen.extend(SWEEPS[sname].expand())
+    elif args.name in SWEEPS:
+        to_gen = SWEEPS[args.name].expand()
+    elif args.name in SPECS:
+        to_gen = [SPECS[args.name]]
+    else:
+        ap.error(f"unknown spec/sweep '{args.name}'; specs: {', '.join(sorted(SPECS))}; "
+                 f"sweeps: {', '.join(sorted(SWEEPS))}")
+
+    for spec in to_gen:
+        dest = generate(spec, golden, args.out)
+        print(f"generated {spec.name} -> {dest}")
 
 
 if __name__ == "__main__":

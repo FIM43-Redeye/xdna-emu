@@ -372,6 +372,113 @@ def _mac_i8_spec():
     )
 
 
+class TestModeSweep:
+    """SweepSpec.expand()s a class's full crRnd/crSat space into one KernelSpec
+    per mode-point, keeping the swept body (set_rounding/set_saturation) and the
+    baked golden slice in lockstep -- the move that makes the silicon check
+    mode-exhaustive rather than one-representative-per-class."""
+
+    def test_rounding_and_sat_enum_maps_match_toolchain(self):
+        # crRnd index -> aie::rounding_mode name, per aietools me_defines.h.
+        from gen_vector_kernel import ROUNDING_ENUM, SAT_ENUM
+        assert ROUNDING_ENUM == {
+            0: "floor", 1: "ceil", 2: "symmetric_floor", 3: "symmetric_ceil",
+            8: "negative_inf", 9: "positive_inf", 10: "symmetric_zero",
+            11: "symmetric_inf", 12: "conv_even", 13: "conv_odd",
+        }
+        # crSat index -> saturation_mode name (none=0, saturate=1, symmetric=3).
+        assert SAT_ENUM == {0: "none", 1: "saturate", 3: "symmetric"}
+
+    def test_mode_lines_emit_only_present_axes(self):
+        from gen_vector_kernel import mode_lines
+        # both axes
+        ml = mode_lines(12, 1)
+        assert "aie::rounding_mode::conv_even" in ml
+        assert "aie::saturation_mode::saturate" in ml
+        # rounding-only class (no crsat): no set_saturation line
+        assert "set_saturation" not in mode_lines(0, None)
+        assert "aie::rounding_mode::floor" in mode_lines(0, None)
+        # sat-only class (no crrnd): no set_rounding line
+        assert "set_rounding" not in mode_lines(None, 3)
+        assert "aie::saturation_mode::symmetric" in mode_lines(None, 3)
+
+    def test_srs_sweep_expands_to_full_cross_product(self):
+        from vector_kernel_specs import SWEEPS
+        specs = SWEEPS["vec_srs_i32_sweep"].expand()
+        # 10 rounding modes x 3 saturation modes.
+        assert len(specs) == 30
+        names = {s.name for s in specs}
+        assert "vec_srs_i32_r0_s0" in names
+        assert "vec_srs_i32_r12_s3" in names
+        assert "vec_srs_i32_r13_s1" in names
+
+    def test_sweep_point_golden_filter_matches_its_body_mode(self):
+        """The baked golden slice's mode fields must equal the crRnd/crSat the
+        kernel body sets -- otherwise the kernel drives one mode while the
+        expected values came from another (the lockstep guarantee)."""
+        from vector_kernel_specs import SWEEPS
+        by_name = {s.name: s for s in SWEEPS["vec_srs_i32_sweep"].expand()}
+        # rnd=12 (conv_even), crsat=3 (symmetric) -> filt {rnd:12, sat:True, sym_sat:True}
+        s = by_name["vec_srs_i32_r12_s3"]
+        assert s.golden["filt"]["rnd"] == 12
+        assert s.golden["filt"]["sat"] is True
+        assert s.golden["filt"]["sym_sat"] is True
+        assert "aie::rounding_mode::conv_even" in s.body
+        assert "aie::saturation_mode::symmetric" in s.body
+        # crsat=0 (none) -> filt {sat:False, sym_sat:False}
+        s0 = by_name["vec_srs_i32_r0_s0"]
+        assert s0.golden["filt"]["sat"] is False
+        assert s0.golden["filt"]["sym_sat"] is False
+        assert "aie::saturation_mode::none" in s0.body
+
+    def test_pack_sweep_is_saturation_only(self):
+        from vector_kernel_specs import SWEEPS
+        specs = SWEEPS["vec_pack_i16_sweep"].expand()
+        assert {s.name for s in specs} == {
+            "vec_pack_i16_s0", "vec_pack_i16_s1", "vec_pack_i16_s3"}
+        for s in specs:
+            assert "set_rounding" not in s.body  # pack does not round
+            assert "rnd" not in s.golden["filt"]
+
+    def test_convert_sweep_is_rounding_only_normals(self):
+        from vector_kernel_specs import SWEEPS
+        specs = SWEEPS["vec_conv_bf16_sweep"].expand()
+        assert len(specs) == 10  # 10 rounding modes, no saturation axis
+        for s in specs:
+            assert "set_saturation" not in s.body
+            assert s.golden.get("predicate") is not None  # normals-only
+
+    def test_ups_sweep_two_sat_modes_no_symmetric(self):
+        from vector_kernel_specs import SWEEPS
+        specs = SWEEPS["vec_ups_i32_sweep"].expand()
+        assert {s.name for s in specs} == {"vec_ups_i32_s0", "vec_ups_i32_s1"}
+        for s in specs:
+            assert "sym_sat" not in s.golden["filt"]  # ups corpus has no such column
+
+    def test_every_sweep_point_has_a_resolvable_golden_slice_that_fits(self):
+        """No mode-point names an empty golden slice, and every slice fits its
+        buffer N (so bake_array never silently truncates a mode's records)."""
+        from gen_vector_kernel import select_records
+        from vector_kernel_specs import SWEEPS
+        for sname, sweep in SWEEPS.items():
+            for spec in sweep.expand():
+                g = spec.golden
+                recs = select_records(GOLDEN[g["class"]], g["filt"],
+                                      g.get("value_range"),
+                                      predicate=g.get("predicate"))
+                assert recs, f"{spec.name}: golden slice is empty"
+                assert len(recs) <= spec.n, \
+                    f"{spec.name}: {len(recs)} records > N={spec.n}"
+
+    def test_sweep_kernel_generates_four_files(self, tmp_path):
+        from gen_vector_kernel import generate
+        from vector_kernel_specs import SWEEPS
+        spec = SWEEPS["vec_srs_i32_sweep"].expand()[0]
+        outdir = generate(spec, GOLDEN, tmp_path)
+        for fn in ["run.lit", "aie.mlir", "test.cpp", "srs.cc"]:
+            assert (Path(outdir) / fn).is_file(), f"missing {fn}"
+
+
 class TestKernelHeaderFormatting:
     def test_ruler_line_is_eighty_columns(self):
         """The kernel.cc header ruler matches the 80-col LLVM convention

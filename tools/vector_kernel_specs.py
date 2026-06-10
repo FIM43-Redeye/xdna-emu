@@ -11,14 +11,32 @@ tools/golden/vector_ops.json (the Half-A corpus); the generator bakes the
 input/expected arrays from it so no expected value is ever transcribed by hand.
 """
 
-from gen_vector_kernel import Buf, KernelSpec, Matmul
+from gen_vector_kernel import Buf, KernelSpec, Matmul, SweepSpec
 
 SPECS = {}
+
+# Mode-sweep families (Half-B phase A). Each SweepSpec.expand()s into one
+# capture kernel per reachable crRnd/crSat point so the silicon check is
+# mode-exhaustive, not one-representative-per-class. Keyed by sweep name; the
+# generator resolves a sweep name (or 'all-sweeps') to its expanded KernelSpecs.
+SWEEPS = {}
 
 
 def _reg(spec):
     SPECS[spec.name] = spec
     return spec
+
+
+def _reg_sweep(sweep):
+    SWEEPS[sweep.prefix + "_sweep"] = sweep
+    return sweep
+
+
+# Reachable mode indices (verified against the toolchain; see gen_vector_kernel
+# ROUNDING_ENUM / SAT_ENUM). crRnd valid indices are 0-3 and 8-13; crSat is
+# none(0)/saturate(1)/symmetric(3).
+_ALL_RND = [0, 1, 2, 3, 8, 9, 10, 11, 12, 13]
+_ALL_SAT = [0, 1, 3]
 
 
 def _is_normal_f32(rec):
@@ -294,6 +312,141 @@ _reg(KernelSpec(
     MMUL m;
     m.mul(a, b);
     aie::store_v(out + n * MMUL::size_C, m.to_vector<float>());
+  }
+  event1();
+""",
+))
+
+
+# === Mode-sweep families (Half-B phase A: mode-exhaustive on silicon) =========
+#
+# Each sweep mirrors a single-mode anchor above but parametrizes the swept axes.
+# The anchor stays as an independent generator-reproduction check; the sweep is
+# the HW campaign covering every reachable mode-point of its class. Buffer sizes
+# are set to the largest mode slice (padded points are 0 -> 0 under every mode):
+# srs 50, pack 66, convert 438-normals, ups 45.
+
+# --- SRS sweep: crRnd x crSat over the acc64 -> int16 shift-round-saturate
+# datapath. 10 rounding modes x 3 saturation modes = 30 points -- the full
+# discrete mode space the integer SRS pipeline can be configured into.
+_reg_sweep(SweepSpec(
+    prefix="vec_srs_i32",
+    func="srs_i32",
+    doc="SRS (shift-round-saturate), int32 accumulator -> int16, shift=4.",
+    inputs=[Buf("in", "int32_t", "i32")],
+    output=Buf("out", "int16_t", "i16"),
+    n=64,
+    gclass="srs",
+    base_filt={"bits_o": 16, "signed": True, "shift": 4},
+    rnds=_ALL_RND,
+    sats=_ALL_SAT,
+    sat_field="sat",
+    symsat_field="sym_sat",
+    value_range=(-(2 ** 31), 2 ** 31 - 1),
+    defines=[("SRS_N", 64), ("SRS_SHIFT", 4)],
+    body_template="""  event0();
+$mode
+
+  for (int i = 0; i < SRS_N; i += 16) {
+    aie::vector<int32_t, 16> v = aie::load_v<16>(in + i);
+    aie::accum<acc64, 16> acc;
+    acc.from_vector(v, 0);
+    aie::vector<int16_t, 16> o = acc.to_vector<int16_t>(SRS_SHIFT);
+    aie::store_v(out + i, o);
+  }
+  event1();
+""",
+))
+
+
+# --- Pack sweep: crSat over native VPACK int16 -> int8. 3 saturation modes.
+# Pack does not round (no crRnd dependence), so only the saturation axis varies;
+# this is the exact axis the pack-saturation gap hid behind (model truncated,
+# silicon saturates -- crSat=1/3).
+_reg_sweep(SweepSpec(
+    prefix="vec_pack_i16",
+    func="pack_i16",
+    doc="Pack (native VPACK), int16 -> int8 narrowing.",
+    inputs=[Buf("in", "int16_t", "i16")],
+    output=Buf("out", "int8_t", "i8"),
+    n=96,
+    gclass="pack",
+    base_filt={"bits_i": 16, "bits_o": 8, "signed": True},
+    sats=_ALL_SAT,
+    sat_field="sat",
+    symsat_field="symsat",
+    value_range=(-(2 ** 15), 2 ** 15 - 1),
+    defines=[("PACK_N", 96)],
+    body_template="""  event0();
+$mode
+
+  for (int i = 0; i < PACK_N; i += 32) {
+    aie::vector<int16_t, 32> v = aie::load_v<32>(in + i);
+    aie::vector<int8_t, 32> o = v.pack<int8_t>();
+    aie::store_v(out + i, o);
+  }
+  event1();
+""",
+))
+
+
+# --- Convert sweep: crRnd over f32 -> bf16 round-narrow (accfloat). 10 rounding
+# modes. No saturation axis. Normal-finite inputs only (denormal FTZ + NaN
+# canonicalization are HW-gated edges deferred to phase B).
+_reg_sweep(SweepSpec(
+    prefix="vec_conv_bf16",
+    func="conv_bf16",
+    doc="Convert (round-narrow), f32 -> bf16 through an accfloat accumulator, "
+        "normal-finite inputs.",
+    inputs=[Buf("in", "uint32_t", "f32", ktype="float")],
+    output=Buf("out", "uint16_t", "bf16", ktype="bfloat16"),
+    n=448,
+    gclass="bf16_srs",
+    base_filt={},
+    rnds=_ALL_RND,
+    predicate=_is_normal_f32,
+    defines=[("CONV_N", 448)],
+    body_template="""  event0();
+$mode
+
+  for (int i = 0; i < CONV_N; i += 16) {
+    aie::vector<float, 16> v = aie::load_v<16>(in + i);
+    aie::accum<accfloat, 16> acc(v);
+    aie::vector<bfloat16, 16> o = acc.to_vector<bfloat16>();
+    aie::store_v(out + i, o);
+  }
+  event1();
+""",
+))
+
+
+# --- UPS sweep: crSat over int16 -> int32 widen (acc32). 2 saturation modes
+# (the ups corpus has no symmetric column). UPS widens, so a shift<=4 never
+# overflows int32 -- none and saturate produce identical output; the sweep
+# confirms silicon plumbs the saturation control without diverging.
+_reg_sweep(SweepSpec(
+    prefix="vec_ups_i32",
+    func="ups_i32",
+    doc="UPS (unpack-shift widen), int16 -> int32 accumulator, shift=4.",
+    inputs=[Buf("in", "int16_t", "i16")],
+    output=Buf("out", "int32_t", "i32"),
+    n=48,
+    gclass="ups",
+    base_filt={"bits_in": 16, "bits_out": 32, "signed": True, "shift": 4},
+    sats=[0, 1],
+    sat_field="sat",
+    symsat_field=None,
+    value_range=(-(2 ** 15), 2 ** 15 - 1),
+    defines=[("UPS_N", 48), ("UPS_SHIFT", 4)],
+    body_template="""  event0();
+$mode
+
+  for (int i = 0; i < UPS_N; i += 16) {
+    aie::vector<int16_t, 16> v = aie::load_v<16>(in + i);
+    aie::accum<acc32, 16> acc;
+    acc.from_vector(v, UPS_SHIFT);
+    aie::vector<int32_t, 16> o = acc.to_vector<int32_t>(0);
+    aie::store_v(out + i, o);
   }
   event1();
 """,
