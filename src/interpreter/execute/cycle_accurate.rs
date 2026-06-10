@@ -1457,6 +1457,80 @@ mod tests {
         assert_eq!(ctx.pointer.read(1), 0x1234);
     }
 
+    // --- Deferred accumulator (VMOV bml,x) write tests ---
+
+    /// `VMOV bml0, x` (a wide vector->accumulator cross-file move) must defer
+    /// its accumulator write by the AIE2 def latency (2 cycles), not apply it
+    /// immediately. The accumulator def operand cycle for II_VMOV_X_BM_XM is 2
+    /// (NoBypass) in llvm-aie AIE2Schedule.td, so a fused VST.CONV/VST.SRS that
+    /// drains the accumulator in a software-pipelined loop reads the value as it
+    /// was two cycles earlier -- one VMOV behind the live register.
+    ///
+    /// Regression: surfaced by the vec_conv_bf16_edge silicon kernels, where the
+    /// f32->bf16 store-converts are packed into a RET's delay slots. With an
+    /// immediate (0-cycle) accumulator write, each delay-slot store read the
+    /// freshly-overwritten accumulator and produced Inf/NaN-range garbage shifted
+    /// one group forward; silicon (and a 2-cycle deferral) read the correct value.
+    #[test]
+    fn test_vmov_to_accum_deferred_by_def_latency() {
+        use crate::interpreter::bundle::ElementType;
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+
+        // x0 (wide 512-bit pair x0/x1) holds a recognizable pattern: 16 int32
+        // lanes 0x100..0x10F. Accumulator lane j packs lanes 2j (low) | 2j+1 (high).
+        let mut wide = [0u32; 16];
+        for (i, w) in wide.iter_mut().enumerate() {
+            *w = 0x100 + i as u32;
+        }
+        ctx.vector.write_wide(0, wide);
+
+        // Pre-seed bml0 with a sentinel so we can prove the new value is NOT
+        // visible until the latency elapses.
+        ctx.accumulator.write(0, [0xDEAD_BEEF_DEAD_BEEF; 8]);
+
+        // vmov bml0, x0  (wide cross-file move into the accumulator)
+        let mut vmov = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Copy)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::VectorReg(0));
+        vmov.is_wide_vector = true;
+        vmov.is_vector = true;
+        vmov.element_type = Some(ElementType::Int32);
+
+        executor.execute(&make_bundle(vec![vmov]), &mut ctx, &mut tile);
+
+        // Immediately after the issuing bundle, bml0 must still read the sentinel:
+        // the def latency (2) has not elapsed, so the write is in flight.
+        let acc_now = ctx.accumulator.read(0);
+        assert_eq!(
+            acc_now[0], 0xDEAD_BEEF_DEAD_BEEF,
+            "VMOV bml,x write must be deferred, not visible in the issuing bundle"
+        );
+
+        // Run filler bundles until the deferred write commits. With latency 2 the
+        // value lands within a couple of cycles; allow a small margin.
+        let mut committed = false;
+        for _ in 0..4 {
+            executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
+            if ctx.accumulator.read(0)[0] != 0xDEAD_BEEF_DEAD_BEEF {
+                committed = true;
+                break;
+            }
+        }
+        assert!(committed, "deferred VMOV->accum write never committed");
+
+        // Once committed, the accumulator holds the moved x0 data.
+        let acc = ctx.accumulator.read(0);
+        for j in 0..8usize {
+            let lo = (acc[j] & 0xFFFF_FFFF) as u32;
+            let hi = (acc[j] >> 32) as u32;
+            assert_eq!(lo, 0x100 + (2 * j) as u32, "acc lane {} low", 2 * j);
+            assert_eq!(hi, 0x100 + (2 * j + 1) as u32, "acc lane {} high", 2 * j + 1);
+        }
+    }
+
     // --- NOP / slot-based event classification tests ---
     //
     // AIE2 hardware fires INSTR_LOAD / INSTR_STORE / INSTR_VECTOR only when

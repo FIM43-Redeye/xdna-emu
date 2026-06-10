@@ -685,7 +685,22 @@ impl VectorAlu {
                         acc[j] = wide[2 * j] as u64 | ((wide[2 * j + 1] as u64) << 32);
                     }
                     let dst = Self::get_acc_dest(op);
-                    ctx.accumulator.write(dst, acc);
+                    // Defer the accumulator write by this VMOV's def latency rather
+                    // than applying it immediately. II_VMOV_X_BM_XM (vmov bm,x) has
+                    // accumulator def operand cycle 2 (NoBypass) in llvm-aie
+                    // AIE2Schedule.td, so a fused VST.CONV/VST.SRS draining the
+                    // accumulator in a software-pipelined loop must read the value
+                    // as of two cycles earlier -- one VMOV behind the live register.
+                    // An immediate write let each store read the freshly-overwritten
+                    // accumulator (observed as one-group-shifted Inf/NaN garbage in
+                    // the vec_conv_bf16_edge silicon kernels, whose store-converts
+                    // are packed into a RET's delay slots). The pending-write queue
+                    // models the latency; reuse the half-accumulator path
+                    // (queue_matmul_accum_write with is_half) since bm is 512-bit.
+                    let latency = ctx.result_latency.max(1) as u64;
+                    let mut wide16 = [0u64; 16];
+                    wide16[..8].copy_from_slice(&acc);
+                    ctx.queue_matmul_accum_write(Operand::AccumReg(dst), wide16, true, latency);
                 }
             } else {
                 // Narrow cross-register-file move (vector <-> accumulator).
