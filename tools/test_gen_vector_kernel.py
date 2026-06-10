@@ -694,7 +694,7 @@ class TestConvertFtzAuditSpecs(unittest.TestCase):
         spec = vks.SPECS["vec_vfloor_bf16_denorm"]
         d = spec.golden["direct"]
         idx = d.inputs.index(0x8001)            # tiny negative denormal
-        self.assertEqual(d.reference[idx], 0xFFFFFFFF)  # floor(-tiny) = -1 (no FTZ)
+        self.assertEqual(d.reference[idx], -1)  # floor(-tiny) = -1, signed (no FTZ)
         idx0 = d.inputs.index(0x0001)           # tiny positive denormal
         self.assertEqual(d.reference[idx0], 0)  # floor(+tiny) = 0
 

@@ -59,13 +59,21 @@ def _bf16_to_f32_bits(b):
 
 
 def _bf16_floor_reference():
-    """No-FTZ floor(bf16) per lane as int32 two's-complement bit patterns."""
+    """No-FTZ floor(bf16) per lane as SIGNED int32 values.
+
+    The vfloor kernel's output buffer is int32_t (signed), so the reference and
+    the captured silicon are stored as signed ints: floor of a tiny negative
+    denormal is -1 (not the unsigned 0xFFFFFFFF, which is a C++11 narrowing
+    error in the generated int32_t EXP array). This matches what silicon dumps
+    to out.txt -- `(int64_t)(int32_t)-1` is -1 -- so bootstrap, capture, and
+    comparison all share one signed representation.
+    """
     import math
     import struct
     out = []
     for b in _bf16_denorm_inputs():
         f = struct.unpack("<f", struct.pack("<I", _bf16_to_f32_bits(b)))[0]
-        out.append(int(math.floor(f)) & 0xFFFFFFFF)
+        out.append(int(math.floor(f)))
     return tuple(out)
 
 
