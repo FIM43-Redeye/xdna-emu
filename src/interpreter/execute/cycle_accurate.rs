@@ -744,13 +744,12 @@ impl CycleAccurateExecutor {
                 // to stores at full latency). See VectorRegisterFile::resolve.
                 // Set per slot before dispatch so each write sees its own op.
                 //
-                // result_bypass is now the register-aware resolved bypass from
-                // the decoded SlotOp, populated in try_decode_via_ffi via
+                // result_bypass is the register-aware resolved bypass from the
+                // decoded SlotOp, populated in try_decode_via_ffi via
                 // Bypass::from_forwarding_id(ffi_result.resolved_def_bypass()).
                 // This correctly handles register-pair-variant opcodes like
-                // VMOV_mv_x (X<-BM must carry MOV bypass; the static per-opcode
-                // lookup from LatencyTable::def_bypass returned No for the base
-                // class and is no longer used here).
+                // VMOV_mv_x (X<-BM carries MOV_Bypass; a static per-opcode
+                // lookup on the base class would return No).
                 ctx.result_latency = self.operation_cycles(op);
                 ctx.result_bypass = op.result_bypass;
 
