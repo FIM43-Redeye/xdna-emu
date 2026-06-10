@@ -1379,6 +1379,29 @@ impl MemoryUnit {
             return base_addr.wrapping_add(offset);
         }
 
+        // Fused stores (vst.srs/vst.pack/...) carry the pointer AFTER the data
+        // and shift operands (sources = [acc, shift, pointer]); a
+        // post-increment carries no offset operand (the step lives in
+        // post_modify). Locate the pointer by SEARCH -- mirroring get_address --
+        // so the positional fallback below never mistakes the shift register for
+        // the base address. Without this, a post-increment `vst.srs [pN], #imm`
+        // read the shift (e.g. 4) as the store address and scattered output to
+        // ~0x4; indexed forms decode to `Memory{}` and were unaffected, so it
+        // surfaced only on compiles that picked post-increment addressing.
+        if let Some(ptr_idx) = op.sources.iter().position(|s| matches!(s, Operand::PointerReg(_))) {
+            let base_addr = match &op.sources[ptr_idx] {
+                Operand::PointerReg(r) => ctx.pointer_read(*r),
+                _ => unreachable!(),
+            };
+            let offset = op.sources.get(ptr_idx + 1).map_or(0, |src| match src {
+                Operand::ModifierReg(r) => ctx.modifier_read(*r),
+                Operand::Immediate(v) => (*v as i32 * 4) as u32,
+                Operand::ScalarReg(r) => ctx.scalar_read(*r).wrapping_mul(4),
+                _ => 0,
+            });
+            return base_addr.wrapping_add(offset);
+        }
+
         // Kernel layout: sources[0]=value, sources[1]=pointer, sources[2]=index
         let base_addr = op.sources.get(1).map_or(0, |src| match src {
             Operand::PointerReg(r) => ctx.pointer_read(*r),
@@ -3264,6 +3287,51 @@ mod tests {
 
         // p0 post-incremented by 32 bytes.
         assert_eq!(ctx.pointer.read(0), 0x70120, "p0 must post-increment by 32 bytes");
+    }
+
+    /// Fused `vst.srs` with POST-INCREMENT addressing (`[p1], #32`) decodes as
+    /// sources = [acc, shift, PointerReg] + post_modify, with NO `Memory{}`
+    /// operand. The store address must be the POINTER's value, not a positional
+    /// `sources[1]` (which is the SHIFT register). Regression for the Half-B
+    /// mode-sweep SRS kernels: a compile emitted the first `VST.SRS` as
+    /// `[p1], #32`, and `get_store_address`'s positional fallback read the shift
+    /// (=4) as the base -- scattering the first 16 outputs to address 0x4 while
+    /// the indexed (`[p1, #off]` -> `Memory{}`) stores landed correctly. The
+    /// fused-load path already searched for the pointer; the store path did not.
+    #[test]
+    fn test_fused_srs_post_increment_store_address_is_pointer() {
+        ctx_and_op_assert_store_address(PostModify::Immediate(32), 0x70200);
+    }
+
+    /// The same store with a bare pointer and no post-modify (`[p1]`) must also
+    /// address the pointer, not the shift register.
+    #[test]
+    fn test_fused_srs_bare_pointer_store_address_is_pointer() {
+        ctx_and_op_assert_store_address(PostModify::None, 0x70200);
+    }
+
+    fn ctx_and_op_assert_store_address(post_modify: PostModify, expected: u32) {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        let mut ctx = make_ctx();
+        ctx.pointer.write(1, 0x70200);
+        // shift = 4: the value that used to leak through as the store address.
+        ctx.scalar.write(0, 4);
+        let mut srs = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Srs)
+            .with_source(Operand::AccumReg(0)) // acc data
+            .with_source(Operand::ScalarReg(0)) // shift register (NOT the address)
+            .with_source(Operand::PointerReg(1)); // address pointer
+        srs.from_type = Some(ElementType::Int64);
+        srs.element_type = Some(ElementType::Int16);
+        srs.accum_width = Some(AccumWidth::Full);
+        srs.mem_width = MemWidth::Vector256;
+        srs.is_vector = true;
+        srs.post_modify = post_modify;
+
+        assert_eq!(
+            MemoryUnit::get_store_address(&srs, &ctx),
+            expected,
+            "fused store must address the pointer, not the shift register"
+        );
     }
 
     // --- Cross-tile load pipeline hazard regression test ---
