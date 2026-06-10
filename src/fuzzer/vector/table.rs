@@ -4,7 +4,9 @@
 //! input/output vector types, the number of mode variants (shift amounts,
 //! shuffle modes), and an emit function producing the C++ expression. All
 //! spellings come from the Peano reach spike
-//! (`docs/superpowers/specs/2026-06-10-vector-fuzzer-spike-findings.md`).
+//! (`docs/superpowers/specs/2026-06-10-vector-fuzzer-spike-findings.md`),
+//! except bf16 sel_lt/sel_ge/bcast, which extrapolate the int-probe spellings
+//! to bf16 and get verified by the compile-clean test in Task 8.
 
 use std::sync::OnceLock;
 
@@ -100,7 +102,8 @@ fn coupler(
 fn build_table() -> Vec<OpEntry> {
     let mut t = Vec::new();
 
-    // Spike-verified spellings throughout: aie::bit_and/bit_or/bit_xor/bit_not
+    // Spike-verified spellings (except bf16 sel/bcast, noted below):
+    // aie::bit_and/bit_or/bit_xor/bit_not
     // (not band/bor/...), aie::max_reduce (not max_red), raw ::shuffle with the
     // mode as a register operand. down/upshift and the pack couplers route via
     // the UPS/SRS accumulator pipeline -- intended, they exercise SRS semantics.
@@ -151,10 +154,10 @@ fn build_table() -> Vec<OpEntry> {
         format!("aie::unpack({}.extract<32>(0))", a[0])
     }));
     t.push(coupler("unpack32", VecType::I16x16, VecType::I32x16, |a, _, _| format!("aie::unpack({})", a[0])));
-    t.push(coupler("widen16", VecType::I16x32, VecType::I16x16, |a, _, _| {
+    t.push(coupler("narrow16", VecType::I16x32, VecType::I16x16, |a, _, _| {
         format!("{}.extract<16>(0)", a[0])
     }));
-    t.push(coupler("widen32", VecType::I32x16, VecType::I32x8, |a, _, _| format!("{}.extract<8>(0)", a[0])));
+    t.push(coupler("narrow32", VecType::I32x16, VecType::I32x8, |a, _, _| format!("{}.extract<8>(0)", a[0])));
     t.push(coupler("grow16", VecType::I16x16, VecType::I16x32, |a, _, _| {
         format!("aie::concat({0}, {0})", a[0])
     }));
@@ -162,7 +165,9 @@ fn build_table() -> Vec<OpEntry> {
         format!("aie::concat({0}, {0})", a[0])
     }));
 
-    // bf16 family -- never couples to int types.
+    // bf16 family -- never couples to int types. add/sub/min/max/neg are
+    // spike-probed; sel_lt/sel_ge/bcast extrapolate the int-probe spellings
+    // (Task 8 compile-clean test verifies them).
     let bf = VecType::Bf16x32;
     t.push(bin("add", bf, |a, _, _| format!("aie::add({}, {})", a[0], a[1])));
     t.push(bin("sub", bf, |a, _, _| format!("aie::sub({}, {})", a[0], a[1])));
@@ -237,18 +242,14 @@ mod tests {
 
     #[test]
     fn half_width_types_are_32_bytes() {
-        for vt in [
-            VecType::I8x64,
-            VecType::I16x32,
-            VecType::I32x16,
-            VecType::Bf16x32,
-            VecType::I16x16,
-            VecType::I32x8,
+        for (vt, expected) in [
+            (VecType::I8x64, 64),
+            (VecType::I16x32, 64),
+            (VecType::I32x16, 64),
+            (VecType::Bf16x32, 64),
+            (VecType::I16x16, 32),
+            (VecType::I32x8, 32),
         ] {
-            let expected = match vt {
-                VecType::I16x16 | VecType::I32x8 => 32,
-                _ => 64,
-            };
             assert_eq!(vt.bytes(), expected, "{vt:?}");
         }
     }
