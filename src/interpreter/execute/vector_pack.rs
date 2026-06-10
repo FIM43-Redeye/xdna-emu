@@ -30,6 +30,25 @@ pub enum PackMode {
     SymmetricSaturate,
 }
 
+impl PackMode {
+    /// Select the narrow mode from the live crSat saturation flags
+    /// (Core_CR [1:0]): bit 0 = saturate, bit 1 = symmetric saturate.
+    /// The hardware narrowing pack reads crSat (`VPACK_* Uses = [crSat]`, llvm-aie
+    /// TableGen) and SRS does the same, so the emulator derives the mode from the
+    /// live saturation register rather than assuming truncation. Confirmed on real
+    /// NPU1 silicon: a saturating crSat clamps int16->int8 (200 -> 127), it does
+    /// not take the low byte.
+    ///
+    /// 0 -> Truncate, 1 -> Saturate, 3 -> SymmetricSaturate.
+    pub fn from_sat_flags(saturate: bool, symmetric: bool) -> PackMode {
+        match (saturate, symmetric) {
+            (false, _) => PackMode::Truncate,
+            (true, false) => PackMode::Saturate,
+            (true, true) => PackMode::SymmetricSaturate,
+        }
+    }
+}
+
 /// Truncate a value to `bits` width, interpreting as signed or unsigned.
 ///
 /// If `signed`: sign-extend from bit position (bits-1).
@@ -319,8 +338,12 @@ impl VectorAlu {
             let src_lo: [u32; 8] = src[..8].try_into().unwrap();
             let src_hi: [u32; 8] = src[8..].try_into().unwrap();
 
-            let packed_lo = pack_half(&src_lo, bits_i, bits_o, signed, PackMode::Truncate);
-            let packed_hi = pack_half(&src_hi, bits_i, bits_o, signed, PackMode::Truncate);
+            // VPACK reads crSat (Uses = [crSat]); derive the narrow mode from
+            // the live saturation register instead of assuming truncation.
+            let mode =
+                PackMode::from_sat_flags(ctx.srs_config.saturate(), ctx.srs_config.symmetric_saturate());
+            let packed_lo = pack_half(&src_lo, bits_i, bits_o, signed, mode);
+            let packed_hi = pack_half(&src_hi, bits_i, bits_o, signed, mode);
 
             // Each half produces (256/bits_i * bits_o) bits of packed data.
             // Concatenate the two halves into a single 256-bit w-register.
@@ -383,6 +406,47 @@ impl VectorAlu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interpreter::bundle::{Operand, SlotIndex};
+    use xdna_archspec::aie2::isa::SemanticOp;
+
+    fn make_ctx() -> ExecutionContext {
+        ExecutionContext::new()
+    }
+
+    /// VPACK_S8_S16 `Uses = [crSat]`: a saturating crSat must make the wide
+    /// int16->int8 pack saturate (clamp), not truncate. Verified against real
+    /// NPU1 silicon (vec_pack_i16_sat: HW saturates 200->127, matches the
+    /// saturating golden; the emulator previously hardcoded truncation).
+    #[test]
+    fn execute_pack_honors_crsat_saturation() {
+        let mut ctx = make_ctx();
+        // lane 0 = 200 (out of int8 range): truncate -> -56, saturate -> 127.
+        let mut src = [0u32; 16];
+        src[0] = 200;
+        ctx.vector.write_wide(0, src);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Pack)
+            .as_vector(ElementType::Int8)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0));
+        op.is_wide_vector = true;
+        op.encoding_name = Some("vpack.s8.s16".to_string());
+
+        // crSat = saturate (bit 0 set): clamp 200 -> 127.
+        ctx.srs_config.saturation_mode = 1;
+        VectorAlu::execute(&op, &mut ctx);
+        assert_eq!((ctx.vector.read(2)[0] & 0xff) as u8 as i8, 127, "crSat=saturate must clamp 200 -> 127");
+
+        // crSat = none (0): truncate low 8 bits -> -56.
+        ctx.vector.write_wide(0, src);
+        ctx.srs_config.saturation_mode = 0;
+        VectorAlu::execute(&op, &mut ctx);
+        assert_eq!(
+            (ctx.vector.read(2)[0] & 0xff) as u8 as i8,
+            200u32 as u8 as i8,
+            "crSat=none must truncate 200 -> -56"
+        );
+    }
 
     // -- truncate --
 

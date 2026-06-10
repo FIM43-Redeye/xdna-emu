@@ -1048,20 +1048,16 @@ impl MemoryUnit {
             hi
         };
 
-        let packed_lo = super::vector_pack::pack_half(
-            &src_lo,
-            bits_i,
-            bits_o,
-            signed,
-            super::vector_pack::PackMode::Truncate,
+        // vst.pack reads crSat (Uses = [crSat]); derive the narrow mode from the
+        // live saturation register instead of assuming truncation. Matches the
+        // standalone execute_pack path and real NPU1 silicon (saturating crSat
+        // clamps int16->int8 rather than taking the low byte).
+        let mode = super::vector_pack::PackMode::from_sat_flags(
+            ctx.srs_config.saturate(),
+            ctx.srs_config.symmetric_saturate(),
         );
-        let packed_hi = super::vector_pack::pack_half(
-            &src_hi,
-            bits_i,
-            bits_o,
-            signed,
-            super::vector_pack::PackMode::Truncate,
-        );
+        let packed_lo = super::vector_pack::pack_half(&src_lo, bits_i, bits_o, signed, mode);
+        let packed_hi = super::vector_pack::pack_half(&src_hi, bits_i, bits_o, signed, mode);
 
         // Each half produces (256/bits_i * bits_o) bits of packed data.
         let words_per_half = ((256 / bits_i as usize) * bits_o as usize / 32).max(1);

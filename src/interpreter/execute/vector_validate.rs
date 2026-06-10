@@ -276,11 +276,7 @@ fn validate_ups_golden() {
 
 /// Map the genuine model's (sat, symsat) flags to the emulator's PackMode.
 fn pack_mode(sat: bool, symsat: bool) -> vector_pack::PackMode {
-    match (sat, symsat) {
-        (false, _) => vector_pack::PackMode::Truncate,
-        (true, false) => vector_pack::PackMode::Saturate,
-        (true, true) => vector_pack::PackMode::SymmetricSaturate,
-    }
+    vector_pack::PackMode::from_sat_flags(sat, symsat)
 }
 
 #[test]
