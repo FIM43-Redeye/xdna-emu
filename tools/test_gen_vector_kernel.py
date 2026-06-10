@@ -148,8 +148,8 @@ class TestGenerate:
         gen = (Path(outdir) / "test.cpp").read_text()
         committed = (REPO / "tests/vector-verify/vec_srs_i32/test.cpp").read_text()
 
-        assert nums(gen, "IN") == nums(committed, "SRS_IN")
-        assert nums(gen, "EXP") == nums(committed, "SRS_EXP")
+        assert nums(gen, "IN") == nums(committed, "IN")
+        assert nums(gen, "EXP") == nums(committed, "EXP")
 
 
 class TestRegistry:
@@ -167,8 +167,8 @@ class TestRegistry:
         outdir = generate(SPECS["vec_srs_i32"], GOLDEN, tmp_path)
         gen = (Path(outdir) / "test.cpp").read_text()
         committed = (REPO / "tests/vector-verify/vec_srs_i32/test.cpp").read_text()
-        assert nums(gen, "IN") == nums(committed, "SRS_IN")
-        assert nums(gen, "EXP") == nums(committed, "SRS_EXP")
+        assert nums(gen, "IN") == nums(committed, "IN")
+        assert nums(gen, "EXP") == nums(committed, "EXP")
 
     def test_every_spec_has_a_resolvable_golden_slice(self):
         """No spec names a golden config that yields zero records (silent empty)."""
