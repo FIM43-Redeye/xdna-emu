@@ -118,22 +118,38 @@ Fixed by deriving `VECTOR_MAC_F=6` in archspec and selecting it in
 `execute_matmul` when `config.bfloat`. (Correct, but not sufficient on its own --
 see bug 5.)
 
-**Bug 5 -- vector-register writes weren't deferred by their result latency
-(FIXED, general model).** The bf16 accumulator-drain idiom is two bundles:
+**Bug 5 -- vector-register result visibility not modeled (FIXED, AIE2
+bypass/forwarding network).** The bf16 accumulator-drain idiom is two bundles:
 `VST wh2; VMOV x2,bml0; VMUL.f bml0` then `VST wl2`. `VMOV_mv_x` (BM->X) has
-result latency 2 (`II_VMOV_X_BM_XM`), but the emulator applied the `VMOV x2`
-write immediately. So the same-bundle `wh2` store read x2 via the per-bundle
-snapshot (old tile, correct), but the next-bundle `wl2` store read x2 *after*
-the VMOV overwrote it (next tile) -- each output tile-slot came out split: high
-half from tile K, low half from tile K+1. The per-bundle snapshot models only
-the issue+0 (intra-bundle) hazard; this is an issue+1 cross-bundle hazard.
-Fixed generally: every vector-register write now defers by the op's result
-latency (`ExecutionContext::queue_vector_reg_write` /
-`queue_wide_vector_reg_write`, keyed on `ctx.result_latency` set per slot by the
-bundle executor), completing the pipeline model the snapshot started. The
-integer MAC kernels never hit this -- they store straight from the (already
-deferred) accumulator with no intermediate `VMOV -> x -> store`. See
+result latency 2 (`II_VMOV_X_BM_XM`) with `NoBypass`, but the emulator applied
+the `VMOV x2` write immediately. So the same-bundle `wh2` store read x2 via the
+per-bundle snapshot (old tile, correct), but the next-bundle `wl2` store read
+x2 *after* the VMOV overwrote it (next tile) -- each output tile-slot came out
+split: high half from tile K, low half from tile K+1.
+
+The fix is the **AIE2 per-operand bypass/forwarding network** derived from
+llvm-aie TableGen itineraries. Every vector-register write records
+`(reg, value, issue_bundle, l_def, def_bypass)` as an in-flight `PendingVecWrite`.
+Each read resolves its own visibility via:
+```
+match      = (def_bypass == use_bypass) && def_bypass != NoBypass
+eff        = max(1, l_def - use_cycle + 1 - (match ? 1 : 0))
+visible_at = issue_bundle + eff
+```
+Producer `def_bypass`/`l_def` and consumer `(use_cycle, use_bypass)` come from
+the LLVM itinerary, resolved per-instruction (not per-opcode-class) by the FFI
+decode path so that register-pair-variant opcodes like `VMOV_mv_x` are handled
+correctly (e.g., X<-BM carries `MOV_Bypass`; the static base class does not).
+Store-data reads use `NoBypass`; vector ALU reads use `MOV_Bypass`. This subsumes
+the per-bundle snapshot hazard and models cross-bundle forwarding. Validated
+against the chess bridge sweep (89/89 PASS, 0 regressions). See
 `docs/superpowers/plans/2026-06-09-vector-write-result-latency.md`.
+
+The accumulator/CM-domain (`VEC_Bypass`) file is NOT in this matrix -- those
+MAC/MUL results use the separate MAC-pipeline-latency path
+(`queue_matmul_accum_write`). The integer MAC kernels never hit bug 5 -- they
+store straight from the (already deferred) accumulator with no intermediate
+`VMOV -> x -> store`.
 **After bugs 4-5: vec_mac_bf16 EMU-smoke PASS.**
 
 `vec_eltwise_add` is the proof-of-pattern: once its author -> stage -> compile ->

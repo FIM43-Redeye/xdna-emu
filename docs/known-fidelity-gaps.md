@@ -59,6 +59,16 @@ PC, matching the LOCK_STALL precedent), and the executor-level *intra-bundle*
 structural bank conflict stays a bounded MEMORY_STALL pulse (it resolves within one
 executor step, so a same-step rising+falling would encode as a zero-width span).
 
+A third cluster: **vector-register result visibility (forwarding network)**. The
+AIE2 per-operand bypass/forwarding matrix is implemented and validated against
+the chess bridge sweep (89/89 PASS, 0 regressions), but real-NPU (HW) validation
+is pending.
+
+| Gap | Model vs hardware | Where | Status / rationale |
+|-----|-------------------|-------|--------------------|
+| Accumulator/CM-domain (`VEC_Bypass`) result visibility | not in the per-operand bypass matrix; modeled via the separate MAC-pipeline-latency path (`ExecutionContext::queue_matmul_accum_write`). The matrix resolves W/X-file results; `VEC_Bypass` (MAC/MUL results into the accumulator file) is deferred. | `src/interpreter/state/registers.rs` (`VectorRegisterFile::visible_at`); `src/interpreter/state/context.rs` (`queue_matmul_accum_write`, carries a `FIXME(bypass-model)`) | **OPEN / deferred.** Validated by chess bridge (89/89) but no real-NPU trace comparison yet. Accumulator folding into the bypass matrix is a noted future extension (see `docs/superpowers/plans/2026-06-09-vector-write-result-latency.md` Scope). |
+| `source_forward` positional alignment for merged memory operands | `SlotOp::source_forward` aligns exactly for compute ops; may drift for fused memory operands that merge address/data into a single TableGen operand list position | `src/interpreter/bundle/slot.rs` (`FIXME(source-forward-memory-alignment)`); `src/interpreter/decode/operand_extraction.rs` | **DOCUMENTED / benign.** The bypass model only reads vector-register compute sources; memory operands use `NoBypass` or are not vector-reg reads, so this positional drift does not affect result visibility decisions. |
+
 ---
 
 ## aiesim oracle (AMD's proprietary simulator)

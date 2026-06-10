@@ -1,5 +1,11 @@
 # Vector result visibility via the AIE2 bypass/forwarding network
 
+**STATUS: IMPLEMENTED AND VALIDATED (2026-06-09).** The model described below
+is fully implemented and committed. Chess bridge sweep: 89/89 PASS, 0
+regressions against the pre-implementation baseline. Real-NPU (HW) validation
+pending. See `docs/known-fidelity-gaps.md` (vector forwarding section) and the
+spec/plan at `docs/superpowers/specs/2026-06-09-consumer-side-bypass-matrix-design.md`.
+
 **Task #108 follow-on.** Supersedes the earlier "bundle-seq write-deferral"
 content in this file (that approach is abandoned -- see "Why the previous
 approach was wrong").
