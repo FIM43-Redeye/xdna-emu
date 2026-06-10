@@ -916,6 +916,8 @@ mod tests {
         //   1>=1=T, 2>=3=F, 3>=2=T, 4>=4=T, 5>=6=F, 6>=5=T, 7>=7=T, 8>=9=F
         //   mask_hi = 0b_0110_1101 = 0x6D
         // full_mask = mask_lo | (mask_hi << 8) = 0x6D75
+        // The scalar mask has pipeline latency 2 (II_VCMP); flush to observe it.
+        ctx.flush_pending_writes();
         let scalar_result = ctx.scalar.read(16);
         assert_eq!(scalar_result, 0x6D75, "wide VGE scalar bitmask mismatch: got {:#06x}", scalar_result);
     }
@@ -943,7 +945,42 @@ mod tests {
         // lo: F,T,F,T,F,F,F,T -> 0b_1000_1010 = 0x8A
         // hi: F,T,F,F,T,F,F,T -> 0b_1001_0010 = 0x92
         // full_mask = 0x928A
+        // The scalar mask has pipeline latency 2 (II_VCMP); flush to observe it.
+        ctx.flush_pending_writes();
         let scalar_result = ctx.scalar.read(16);
         assert_eq!(scalar_result, 0x928A, "wide VLT scalar bitmask mismatch: got {:#06x}", scalar_result);
+    }
+
+    /// Regression: the scalar mask of a vector compare is pipelined (latency
+    /// 2, NoBypass per AIE2Schedule.td II_VMAX_LT/II_VCMP), so the next bundle
+    /// must still read the PRE-compare value. Peano schedules callee-save
+    /// copies of the mask register in that shadow (e.g. `vmax_lt x4,r16,..`
+    /// then `or r1,r16,r16`); an immediate write corrupts the saved value,
+    /// which fuzzer kernels then use as the lock-release delta (lock wedged
+    /// at -64, output DMA stalls).
+    #[test]
+    fn test_cmp_scalar_mask_not_visible_to_next_bundle() {
+        let mut ctx = make_ctx();
+        ctx.scalar.write(16, 1); // caller value (lock-release amount)
+        ctx.vector.write(0, [10, 5, 20, 3, 8, 8, 100, 0]);
+        ctx.vector.write(1, [1, 2, 3, 4, 5, 6, 7, 8]);
+        ctx.vector.write(2, [5, 10, 20, 4, 7, 8, 50, 1]);
+        ctx.vector.write(3, [1, 3, 2, 4, 6, 5, 7, 9]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::SetGe)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::ScalarReg(16))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(2));
+        op.is_wide_vector = true;
+
+        assert!(VectorAlu::execute(&op, &mut ctx));
+
+        // Latency shadow: a read in the next bundle sees the old value.
+        assert_eq!(ctx.scalar.read(16), 1, "compare mask forwarded too early");
+
+        // After the pipeline drains the mask becomes architectural.
+        ctx.flush_pending_writes();
+        assert_eq!(ctx.scalar.read(16), 0x6D75);
     }
 }
