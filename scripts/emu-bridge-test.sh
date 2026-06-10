@@ -74,14 +74,15 @@ mkdir -p "$RESULTS_DIR"
 # Maintain a 'latest' symlink for easy access.
 ln -sfn "$RESULTS_DIR" "${RESULTS_DIR%/*}/latest"
 
-# Default parallelism. HARDCODED CAP (2026-06-10): Chess (xchesscc) compiles eat
-# ~5.5GB each, so the old `nproc` default (-j16 here) tried to use ~88GB and
-# OOM'd this 96GB box mid-sweep -- doubly dangerous on the current faulty
-# mainboard. Capped to 4 (~22GB peak) until the hardware is replaced. `-jN`
-# still works but is clamped to the cap (see option parsing). Lift JOBS_CAP
-# once on stable hardware.
-JOBS_CAP=4
-JOBS="$JOBS_CAP"
+# Parallelism wall (2026-06-10): keep total RAM under ~48GB. Chess (xchesscc)
+# compiles eat ~5.5GB each, so the old `nproc` default (-j16 here) tried to use
+# ~88GB and OOM'd this 96GB box mid-sweep -- doubly dangerous on the current
+# faulty mainboard. Rule: Chess default 4 (~22GB, safe when other work runs),
+# absolute ceiling 8 (~44GB, only when the box is otherwise idle). `-jN` works
+# up to the ceiling and is clamped above it (see option parsing). Lift once on
+# stable hardware. (Peano-based tools are ~0.5GB/job and not bound by this.)
+JOBS_CAP=8        # absolute Chess ceiling: 8 x ~5.5GB = ~44GB < 48GB wall
+JOBS=4            # safe default; pass -j8 explicitly when the box is idle
 
 # ---------------------------------------------------------------------------
 # Option parsing
