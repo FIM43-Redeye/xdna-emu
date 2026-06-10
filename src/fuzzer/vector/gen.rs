@@ -12,7 +12,7 @@
 //! classes that found the phase B/C convert bugs.
 
 use super::chain::{Chain, Stage};
-use super::table::{table, VecType};
+use super::table::table;
 
 /// xorshift64 PRNG (same as the scalar fuzzer's): zero state forbidden.
 pub(crate) struct Xorshift64(pub u64);
@@ -160,6 +160,7 @@ pub(crate) fn pool_bytes(rng: &mut Xorshift64, slots: usize, for_float: bool) ->
 mod tests {
     use super::*;
     use crate::fuzzer::vector::ledger::Ledger;
+    use crate::fuzzer::vector::table::VecType;
 
     /// Pick a deterministic pseudo-random target key for a seed.
     fn key_for_seed(universe: &[String], seed: u64) -> &str {
