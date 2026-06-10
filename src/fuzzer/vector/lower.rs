@@ -27,6 +27,27 @@ pub fn lower_chain(chain: &Chain) -> String {
     ));
     s.push_str("#include <stdint.h>\n");
     s.push_str("#include <aie_api/aie.hpp>\n");
+
+    // Peano's GlobalISel crashes ("Register class not set") on chains of >=3
+    // dependent bf16 element-wise ops at -O2 (e.g. three chained aie::add).
+    // Independent ops and noinline-call-separated chains compile fine, so bf16
+    // stages route through one noinline helper per stage. The helpers still
+    // emit native vector code (vadd.f via fp32 conv, vmin_ge.bf16); verified
+    // by the compile-clean test and objdump. Bf16 chains never mix types, so
+    // a single helper signature over Bf16x32 covers every entry.
+    let bf16_chain = chain.stages.iter().any(|st| t[st.entry_idx].out_type.is_float());
+    if bf16_chain {
+        s.push_str("using V = aie::vector<bfloat16, 32>;\n");
+        for (k, st) in chain.stages.iter().enumerate() {
+            let e = &t[st.entry_idx];
+            let arity = e.in_types.len();
+            let names: Vec<String> = ["a", "b"][..arity].iter().map(|n| n.to_string()).collect();
+            let body = (e.emit)(&names, st.mode, e.out_type);
+            let params = if arity == 2 { "V a, V b" } else { "V a" };
+            s.push_str(&format!("__attribute__((noinline)) static V h{k}({params}) {{ return {body}; }}\n"));
+        }
+    }
+
     s.push_str("extern \"C\" void fuzz_kernel(int32_t* __restrict in, int32_t* __restrict out) {\n");
 
     for (k, st) in chain.stages.iter().enumerate() {
@@ -54,7 +75,12 @@ pub fn lower_chain(chain: &Chain) -> String {
             ));
             args.push(format!("p{slot}"));
         }
-        s.push_str(&format!("  auto v{k} = {};\n", (e.emit)(&args, st.mode, e.out_type)));
+        let expr = if bf16_chain {
+            format!("h{k}({})", args.join(", "))
+        } else {
+            (e.emit)(&args, st.mode, e.out_type)
+        };
+        s.push_str(&format!("  auto v{k} = {expr};\n"));
         s.push_str(&format!("  aie::store_v(({}*)(out + {}), v{k});\n", e.out_type.ctype(), 16 * k));
     }
     s.push_str("}\n");

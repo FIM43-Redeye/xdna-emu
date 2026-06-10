@@ -142,7 +142,9 @@ fn build_table() -> Vec<OpEntry> {
         in_types: vec![VecType::I32x16, VecType::I32x16],
         out_type: VecType::I32x16,
         modes: 48,
-        emit: |a, m, _| format!("::shuffle({}, {}, {})", a[0], a[1], m),
+        // Raw ::shuffle returns a native v16int32; wrap it back into an
+        // aie::vector so downstream stages (store_v, aie::* calls) type-check.
+        emit: |a, m, _| format!("aie::vector<int32_t, 16>(::shuffle({}, {}, {}))", a[0], a[1], m),
     });
 
     // Couplers between widths/types (pack/unpack go through accum SRS/UPS).

@@ -38,9 +38,12 @@ pub struct FuzzOptions {
 }
 
 /// Paths to external tools needed for compilation.
-struct ToolPaths {
+///
+/// `pub(crate)` so the vector fuzz runner (`super::vector::runner`) reuses the
+/// same compile pipeline.
+pub(crate) struct ToolPaths {
     /// Peano clang compiler.
-    peano_clang: PathBuf,
+    pub(crate) peano_clang: PathBuf,
     /// Python interpreter from ironenv.
     python: PathBuf,
     /// Path to aiecc.py.
@@ -59,7 +62,7 @@ struct ToolPaths {
 
 impl ToolPaths {
     /// Discover tool paths from the environment.
-    fn discover() -> Result<Self, String> {
+    pub(crate) fn discover() -> Result<Self, String> {
         let config = crate::config::Config::get();
         let env = crate::integration::chess_build::BuildEnv::discover(config)?;
 
@@ -81,8 +84,14 @@ impl ToolPaths {
         })
     }
 
+    /// Include dir for aie_api headers (`<mlir-aie install>/include`).
+    /// Scalar fuzz kernels are plain C, but vector kernels need aie_api.
+    pub(crate) fn aie_api_include(&self) -> Option<PathBuf> {
+        self.mlir_aie_bin.parent().map(|root| root.join("include"))
+    }
+
     /// Apply build environment variables to a Command.
-    fn apply_env(&self, cmd: &mut Command) {
+    pub(crate) fn apply_env(&self, cmd: &mut Command) {
         cmd.env("PEANO_INSTALL_DIR", &self.peano_dir);
 
         // Build PATH with mlir-aie bin + peano bin
@@ -104,7 +113,7 @@ impl ToolPaths {
 
 /// Trace buffer size in elements (i32). 1MB = 262144 x i32, matching the
 /// standard trace buffer size used by npu-test and the NPU executor.
-const TRACE_BUFFER_ELEMENTS: usize = 262_144;
+pub(crate) const TRACE_BUFFER_ELEMENTS: usize = 262_144;
 
 fn dtype_str(dtype: ScalarType) -> &'static str {
     match dtype {
@@ -352,7 +361,7 @@ type CaughtResult = Result<CaseResult, String>;
 /// highest-signal find a differential fuzzer can produce (an unambiguous
 /// emulator bug), so callers catch it here and surface it as its own CRASH
 /// category rather than letting it take the run down.
-fn catch_panic<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+pub(crate) fn catch_panic<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(panic_to_string)
 }
 
@@ -1007,6 +1016,18 @@ fn read_elem(bytes: &[u8], size: usize) -> i64 {
 
 /// Compile a fuzz case: kernel.cc -> kernel.o, template -> aie.mlir -> xclbin.
 fn compile_fuzz_case(tools: &ToolPaths, params: &FuzzParams, case_dir: &Path) -> Result<(), String> {
+    compile_kernel_case(tools, case_dir, params.buffer_size, dtype_str(params.dtype))
+}
+
+/// Compile a `fuzz_kernel.cc` case directory to xclbin, parameterized by raw
+/// buffer size (elements) and dtype string. Shared between the scalar fuzzer
+/// (via [`compile_fuzz_case`]) and the vector fuzzer.
+pub(crate) fn compile_kernel_case(
+    tools: &ToolPaths,
+    case_dir: &Path,
+    buffer_size: usize,
+    dtype: &str,
+) -> Result<(), String> {
     // Skip if already compiled (xclbin exists and is newer than source).
     let xclbin = case_dir.join("aie.xclbin");
     let kernel_cc = case_dir.join("fuzz_kernel.cc");
@@ -1027,10 +1048,14 @@ fn compile_fuzz_case(tools: &ToolPaths, params: &FuzzParams, case_dir: &Path) ->
     compile_cmd
         .arg("--target=aie2-none-unknown-elf")
         .arg("-O2")
+        .arg("-std=c++20") // aie_api headers are C++20 (concepts)
         .arg("-c")
         .arg(&kernel_cc)
         .arg("-o")
         .arg(&kernel_obj);
+    if let Some(inc) = tools.aie_api_include() {
+        compile_cmd.arg("-I").arg(inc);
+    }
     tools.apply_env(&mut compile_cmd);
 
     let compile_out = compile_cmd
@@ -1051,9 +1076,9 @@ fn compile_fuzz_case(tools: &ToolPaths, params: &FuzzParams, case_dir: &Path) ->
         .arg("--kernel")
         .arg("fuzz_kernel.cc")
         .arg("--size")
-        .arg(params.buffer_size.to_string())
+        .arg(buffer_size.to_string())
         .arg("--dtype")
-        .arg(dtype_str(params.dtype))
+        .arg(dtype)
         .arg("--outdir")
         .arg(case_dir)
         .arg("--device")
