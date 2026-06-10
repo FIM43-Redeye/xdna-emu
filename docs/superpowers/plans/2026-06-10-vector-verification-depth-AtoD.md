@@ -82,19 +82,55 @@ divergence found = a real fidelity fix, derived from the toolchain (like pack:
 `tests/vector-verify/`. **Acceptance:** every reachable mode per class HW==EMU;
 divergences fixed.
 
-## B. Edge inputs on silicon
+## B. Edge inputs on silicon  [DONE 2026-06-10 -- 11/11 EMU==silicon green]
 
-- bf16 denormals (FTZ), NaN/Inf canonicalization (the conv kernel explicitly
-  **deferred** these; MAC-bf16 used an all-finite slice), overflow edges, full range.
-- Extend input selection (`select_records` predicate) to edge slices; HW-capture.
-- Known: bf16 NaN payload -- emulator HW-correct, model outlier (Half-A). Confirm on
-  silicon and record.
+**Result:** bf16 edge frontier silicon-verified. Built a HW-observed golden tier
+(`tools/golden/silicon_edge/`, capture tool `tools/capture_silicon_edge.py`):
+each edge kernel runs once on real NPU1 Phoenix, its output becomes `EXP`, and the
+model-vs-silicon divergences are recorded. Corpus regrown with rich bf16 edge inputs
+(dense denormals straddling the FTZ boundary, more NaN payloads, 54 overflow tiles)
+without perturbing phase-A baked slices (safety-gated byte-identical). 11 kernels:
+`vec_conv_bf16_edge_r{0,1,2,3,8,9,10,11,12,13}` (denormal/NaN/Inf x 10 rounding
+modes) + `vec_mac_bf16_ovf` (overflow tiles). **All 11 EMU==silicon**; full vector
+regression 134/134 green, `cargo test --lib` 3335.
+
+**What silicon said (the findings):**
+- **Convert denormals: silicon ROUNDS them, does NOT flush-to-zero.** 0 divergences
+  vs the aietools model across all 10 modes; 46 denormal lanes produce nonzero bf16
+  (e.g. `0x00008000`->`0x0001`). The FTZ hypothesis was wrong for this datapath --
+  the `VST.CONV` fused store-convert path rounds (no input FTZ), matching silicon.
+- **MAC overflow: 638/640 divergent lanes are silicon canonical NaN mantissa=1**
+  (model uses `0x7F`); the emulator already matched silicon there. Inf results agree.
+
+**Bug the silicon flushed out (commit `430d841`):** the real divergence was NOT
+denormal handling -- it was **accumulator-write visibility**. `VMOV bml,x` (wide
+vector->accumulator move) wrote the accumulator immediately, but AIE2 gives it a
+2-cycle def latency. Chess packed the convert-stores into a `RET`'s delay slots, so
+each delay-slot `VST.CONV` read the freshly-overwritten accumulator -> Inf/NaN
+garbage shifted one group forward (store before the branch correct; the 5 in delay
+slots corrupted). Fix: defer the vmov-to-accum write through `queue_matmul_accum_write`
+(is_half). This advances the deferred `FIXME(bypass-model)` accumulator-visibility
+gap (functionally, for the vmov-to-accum case).
+
+**Open, migrated to C (op breadth):** the *other* convert FTZ paths in
+`vector_convert.rs` -- the **`VCONV` f32->bf16**, **bf16->f32 expand** (line 272),
+and **`vfloor` bf16->s32** (line 342) -- still apply `fp32_flush_to_zero` and are
+**untested on silicon** (the phase-B kernel uses `VST.CONV`, a different instruction,
+which does not FTZ). Since silicon proved no-FTZ for the narrow-convert datapath,
+these blanket-FTZ paths (added in `ef77756` as an unvalidated accuracy-era
+generalization) are suspect. Author VCONV/vfloor/expand denormal kernels in C and
+confirm on silicon while Phoenix is available.
 
 ## C. Op breadth on silicon
 
 - Ops not yet HW-captured: shuffle **routing** (Half-A enum-verified, routing
   HW-gated), vsel, vcmp, vshift, vmin/vmax, reductions.
 - Author kernels per op; HW-capture; fix divergences. Breadth, not depth.
+- **Convert FTZ-path audit (migrated from B):** silicon proved the `VST.CONV`
+  narrow-convert does NOT flush-to-zero, but `vector_convert.rs` still FTZs the
+  separate `VCONV` f32->bf16, bf16->f32 expand (line 272), and `vfloor` bf16->s32
+  (line 342) paths -- untested, blanket-applied in `ef77756`. Author denormal-input
+  kernels driving those specific instructions; confirm whether silicon FTZs there.
 
 ## D. Vector differential fuzzer  [gold standard, biggest build]
 
