@@ -9,13 +9,23 @@
 //! dispatch logic and operation implementations.
 
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
-use crate::interpreter::state::{ExecutionContext, Vec512, Acc1024};
+use crate::interpreter::state::{Bypass, ExecutionContext, Vec512, Acc1024};
 
 use super::vector_dispatch::VectorAlu;
 use super::vector_pack;
 
 impl VectorAlu {
     // ========== Operand Access ==========
+
+    /// Resolve the forwarding pair (use_cycle, use_bypass) for the source at
+    /// `op.sources` position `pos`, from the itinerary-resolved `source_forward`.
+    /// Returns `None` when the op carries no itinerary data (synthetic/legacy
+    /// ops have empty source_forward), in which case callers fall back to the
+    /// compute default via `ctx.vector.read(reg)`.
+    #[inline]
+    fn source_fwd(op: &SlotOp, pos: usize) -> Option<(u8, Bypass)> {
+        op.source_forward.get(pos).copied()
+    }
 
     /// Get two vector source operands.
     pub(super) fn get_two_vector_sources(op: &SlotOp, ctx: &ExecutionContext) -> ([u32; 8], [u32; 8]) {
@@ -24,20 +34,30 @@ impl VectorAlu {
         (a, b)
     }
 
-    /// Get a single vector source operand.
+    /// Get a single vector source operand, applying per-operand forwarding.
+    ///
+    /// `idx` is the position in `op.sources` (same index space as `source_forward`).
     pub(super) fn get_vector_source(op: &SlotOp, ctx: &ExecutionContext, idx: usize) -> [u32; 8] {
-        op.sources.get(idx).map_or([0; 8], |src| Self::read_vector_operand(src, ctx))
+        op.sources
+            .get(idx)
+            .map_or([0; 8], |src| Self::read_vector_operand_fwd(src, ctx, Self::source_fwd(op, idx)))
     }
 
-    /// Read a vector operand value.
+    /// Read a vector operand value with optional forwarding context.
     ///
-    /// Handles both VectorReg (native 256-bit) and AccumReg (truncated from
-    /// 512-bit to 256-bit by taking the low 32 bits of each u64 lane).
-    /// This truncation matches hardware behavior for VMOV x, bml/bmh where
-    /// the 256-bit accumulator half maps directly to 8 x u32 lanes.
-    pub(super) fn read_vector_operand(operand: &Operand, ctx: &ExecutionContext) -> [u32; 8] {
+    /// When `fwd` is `Some((use_cycle, use_bypass))`, the `VectorReg` arm uses
+    /// `read_with` with those itinerary-resolved values instead of the compute
+    /// default. All other operand types are unaffected.
+    pub(super) fn read_vector_operand_fwd(
+        operand: &Operand,
+        ctx: &ExecutionContext,
+        fwd: Option<(u8, Bypass)>,
+    ) -> [u32; 8] {
         match operand {
-            Operand::VectorReg(r) => ctx.vector.read(*r),
+            Operand::VectorReg(r) => match fwd {
+                Some((uc, ub)) => ctx.vector.read_with(*r, uc, ub),
+                None => ctx.vector.read(*r),
+            },
             Operand::AccumReg(r) => {
                 // Accumulator -> vector: take low 32 bits of each lane.
                 let acc = ctx.accumulator.read(*r);
@@ -53,13 +73,26 @@ impl VectorAlu {
             }
             other => {
                 log::error!(
-                    "[VECTOR] read_vector_operand: unexpected operand {:?} -- \
+                    "[VECTOR] read_vector_operand_fwd: unexpected operand {:?} -- \
                      returning zeros, check decoder",
                     other
                 );
                 [0; 8]
             }
         }
+    }
+
+    /// Read a vector operand value.
+    ///
+    /// Handles both VectorReg (native 256-bit) and AccumReg (truncated from
+    /// 512-bit to 256-bit by taking the low 32 bits of each u64 lane).
+    /// This truncation matches hardware behavior for VMOV x, bml/bmh where
+    /// the 256-bit accumulator half maps directly to 8 x u32 lanes.
+    ///
+    /// Uses the compute default forwarding (use_cycle 2, MOV_Bypass). For callers
+    /// with explicit per-operand forwarding context, use `read_vector_operand_fwd`.
+    pub(super) fn read_vector_operand(operand: &Operand, ctx: &ExecutionContext) -> [u32; 8] {
+        Self::read_vector_operand_fwd(operand, ctx, None)
     }
 
     // ========== Result Writing ==========
@@ -434,12 +467,20 @@ impl VectorAlu {
     /// this reads a pair of consecutive registers (x-register = two w-registers).
     /// Skips non-VectorReg sources when counting, so idx=0 is the first
     /// VectorReg in sources, idx=1 is the second, etc.
+    ///
+    /// When the op carries `source_forward` data, the forwarding pair is resolved
+    /// by the POSITION of the VectorReg in `op.sources` (not the vec-count), so
+    /// it aligns with the 1:1 mapping between `sources[pos]` and `source_forward[pos]`.
     pub(super) fn get_wide_vec_source(op: &SlotOp, ctx: &ExecutionContext, idx: usize) -> Vec512 {
         let mut vec_count = 0;
-        for src in &op.sources {
+        for (pos, src) in op.sources.iter().enumerate() {
             if let Operand::VectorReg(r) = src {
                 if vec_count == idx {
-                    return ctx.vector.read_wide(*r);
+                    let fwd = Self::source_fwd(op, pos);
+                    return match fwd {
+                        Some((uc, ub)) => ctx.vector.read_wide_with(*r, uc, ub),
+                        None => ctx.vector.read_wide(*r),
+                    };
                 }
                 vec_count += 1;
             }
@@ -842,7 +883,46 @@ impl VectorAlu {
 mod tests {
     use super::*;
     use crate::interpreter::bundle::{SlotIndex, SlotOp};
+    use crate::interpreter::state::Bypass;
     use smallvec::smallvec;
+
+    // ========== source_forward threading ==========
+
+    #[test]
+    fn test_get_vector_source_uses_source_forward() {
+        let mut ctx = ExecutionContext::new();
+        // Establish a known committed (old) value in reg 3 before any in-flight writes.
+        ctx.vector.write(3, [0xAAAA_BBBB; 8]);
+        // Queue an in-flight write: l_def 2, No-def, issued at bundle 0.
+        ctx.vector.advance_bundle(0); // set cur_bundle = 0 (issue point)
+        ctx.vector.queue_write(3, [0x1234_5678; 8], 2, Bypass::No);
+        ctx.vector.advance_bundle(1); // advance to bundle 1 (consumer cycle)
+
+        let mut op = SlotOp::nop(SlotIndex::Vector);
+        op.sources = smallvec![Operand::VectorReg(3)];
+
+        // Store-like consumer (use_cycle 1, No): eff = 2-1+1 = 2 -> visible at issue+2.
+        // At bundle 1 (issue+1) the new value is NOT yet visible; old value returned.
+        op.source_forward = smallvec![(1u8, Bypass::No)];
+        assert_eq!(VectorAlu::get_vector_source(&op, &ctx, 0), [0xAAAA_BBBB; 8], "uc1: old value at issue+1");
+
+        // Compute consumer (use_cycle 2, No): eff = 2-2+1 = 1 -> visible at issue+1.
+        // At bundle 1 the new value IS visible.
+        op.source_forward = smallvec![(2u8, Bypass::No)];
+        assert_eq!(
+            VectorAlu::get_vector_source(&op, &ctx, 0),
+            [0x1234_5678; 8],
+            "uc2: new value visible at issue+1"
+        );
+
+        // Fallback (empty source_forward): compute default (uc=2, Mov) -> visible at +1.
+        op.source_forward = smallvec![];
+        assert_eq!(
+            VectorAlu::get_vector_source(&op, &ctx, 0),
+            [0x1234_5678; 8],
+            "no source_forward: falls back to compute default, visible at +1"
+        );
+    }
 
     // ========== BFloat16 Conversion ==========
 

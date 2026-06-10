@@ -56,6 +56,8 @@ pub use registers::{
     MOD_BASE_DN,
     MOD_BASE_DJ,
     MOD_BASE_DC,
+    // Bypass classes (re-exported so execute helpers can use crate::interpreter::state::Bypass).
+    Bypass,
     // TableGen validation.
     validate_register_model,
 };

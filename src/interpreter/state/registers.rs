@@ -575,6 +575,22 @@ impl VectorRegisterFile {
         result
     }
 
+    /// Read a 512-bit x-register with explicit forwarding context.
+    ///
+    /// Like `read_wide` but resolves each half-register via
+    /// `read_with(reg, use_cycle, use_bypass)` rather than the compute default.
+    /// Used by `get_wide_vec_source` when the op carries per-operand
+    /// `source_forward` data from the resolved itinerary.
+    pub fn read_wide_with(&self, base_reg: u8, use_cycle: u8, use_bypass: Bypass) -> Vec512 {
+        debug_assert!(base_reg % 2 == 0, "wide vector read_with from odd base register {}", base_reg);
+        let lo = self.resolve(base_reg, use_cycle, use_bypass);
+        let hi = self.resolve(base_reg + 1, use_cycle, use_bypass);
+        let mut result = [0u32; 16];
+        result[..8].copy_from_slice(&lo);
+        result[8..].copy_from_slice(&hi);
+        result
+    }
+
     /// Write a 512-bit x-register (split across two consecutive w-registers).
     pub fn write_wide(&mut self, base_reg: u8, data: Vec512) {
         debug_assert!(base_reg % 2 == 0, "wide vector write to odd base register {}", base_reg);
