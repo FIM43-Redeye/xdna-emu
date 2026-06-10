@@ -46,6 +46,17 @@ impl VectorAlu {
             return false;
         }
 
+        // Fuzzer anti-folding sentinel: when armed, record that this vector
+        // op actually executed (no-op otherwise). Mode captures the SRS
+        // config for ops whose semantics depend on it.
+        let mode = match semantic {
+            SemanticOp::Srs | SemanticOp::Pack | SemanticOp::Convert | SemanticOp::Ups => {
+                (ctx.srs_config.saturation_mode << 4) | ctx.srs_config.rounding_mode
+            }
+            _ => 0,
+        };
+        super::fuzz_recorder::record(semantic, op.element_type, mode);
+
         let et = op.element_type.unwrap_or(ElementType::Int32);
 
         log::trace!(
@@ -123,5 +134,32 @@ impl VectorAlu {
 
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interpreter::bundle::{Operand, SlotIndex};
+    use crate::interpreter::execute::fuzz_recorder;
+
+    /// Executing a vector op through the dispatcher records it when armed.
+    #[test]
+    fn test_dispatch_records_executed_op_when_armed() {
+        let mut ctx = ExecutionContext::new();
+        ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
+        ctx.vector.write(1, [10, 20, 30, 40, 50, 60, 70, 80]);
+
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
+
+        fuzz_recorder::arm();
+        assert!(VectorAlu::execute(&op, &mut ctx));
+
+        let keys = fuzz_recorder::take().expect("recorder was armed");
+        assert!(keys.iter().any(|k| k.starts_with("Add/")), "expected an Add/ key, got {keys:?}");
     }
 }
