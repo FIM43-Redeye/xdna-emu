@@ -7,6 +7,7 @@ regenerating a known-good kernel (vec_srs_i32) reproduces its committed
 golden arrays exactly.
 """
 
+import dataclasses
 import json
 import os
 import tempfile
@@ -632,6 +633,17 @@ class TestDirectInput(unittest.TestCase):
             in_vals, exp_vals = gen._bake_io(gen.replace_silicon(spec, path), {})
         self.assertEqual(in_vals, [1, 2, 0x8001, 0])
         self.assertEqual(exp_vals, [0, 0, 0x80000000, 0])
+
+    def test_direct_wrong_length_raises(self):
+        # A direct spec whose tuples don't match n must fail loudly, the same
+        # anti-silent-truncation guard bake_array gives the corpus path.
+        spec = dataclasses.replace(
+            self._direct_spec(),
+            golden={"class": "direct",
+                    "direct": DirectIO(inputs=(1, 2, 3),
+                                       reference=(1, 2, 3))})
+        with self.assertRaises(AssertionError):
+            gen._bake_io(spec, {})
 
 
 class TestKernelHeaderFormatting:

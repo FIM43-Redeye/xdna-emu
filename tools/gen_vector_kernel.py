@@ -91,8 +91,8 @@ class DirectIO:
     an oracle. The binding comparison is emulator-output vs captured silicon.
     """
 
-    inputs: tuple
-    reference: tuple
+    inputs: Tuple[int, ...]
+    reference: Tuple[int, ...]
 
 
 @dataclass
@@ -509,6 +509,9 @@ def _bake_io(spec, golden):
     if direct is not None:
         in_vals = list(direct.inputs)
         exp_vals = list(direct.reference)
+        assert len(in_vals) == spec.n and len(exp_vals) == spec.n, \
+            f"{spec.name}: direct inputs/reference must be exactly n={spec.n} " \
+            f"(got {len(in_vals)}/{len(exp_vals)})"
     else:
         recs = select_records(golden[g["class"]], g["filt"], g.get("value_range"),
                               predicate=g.get("predicate"))
