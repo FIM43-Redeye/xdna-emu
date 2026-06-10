@@ -1198,7 +1198,6 @@ impl VectorAlu {
     /// The shift parameter comes from a scalar register operand.
     /// Hardware uses the low 6 bits as a signed value (range -32 to +31).
     pub(super) fn vector_floor_bf16_to_s32(src: &[u32; 8], shift: i32) -> [u32; 8] {
-        use super::vector_float::fp32_flush_to_zero;
         let mut result = [0u32; 8];
         // Hardware interprets shift as signed 6-bit (-32 to +31).
         let masked = (shift & 0x3F) as i8;
@@ -1206,7 +1205,11 @@ impl VectorAlu {
         let scale = (2.0f64).powi(effective_shift);
         for i in 0..8 {
             let bf16 = (src[i / 2] >> ((i % 2) * 16)) as u16;
-            let f = f32::from_bits(fp32_flush_to_zero(Self::bf16_to_f32(bf16).to_bits()));
+            // Silicon (NPU1 Phoenix, vec_vfloor_bf16_denorm, 2026-06-10) does NOT
+            // flush bf16 denormals before floor: a tiny negative denormal floors to
+            // -1, not 0. This is the datapath the compiled VFLOOR kernel uses (wide
+            // path, quarter-acc source) -- distinct from vector_convert's branch.
+            let f = Self::bf16_to_f32(bf16);
             // Hardware saturates NaN to INT_MAX (positive saturation).
             if f.is_nan() {
                 result[i] = i32::MAX as u32;

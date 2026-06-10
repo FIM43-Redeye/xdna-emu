@@ -265,21 +265,23 @@ impl VectorAlu {
         match (from_type, to_type) {
             // BFloat16 -> Float32 (expand: 16 bf16 -> 8 f32, use lower half)
             (ElementType::BFloat16, ElementType::Float32) => {
-                use super::vector_float::fp32_flush_to_zero;
                 for i in 0..8 {
                     // Take lower bf16 from each pair
                     let bf16 = (src[i / 2] >> ((i % 2) * 16)) as u16;
-                    // AIE2 FTZ: bf16 denormals (exp=0) flush to signed zero.
-                    result[i] = fp32_flush_to_zero(Self::bf16_to_f32(bf16).to_bits());
+                    // Silicon (NPU1 Phoenix, vec_convexp_bf16_denorm, 2026-06-10)
+                    // widens bf16 denormals to f32 denormals -- it does NOT flush
+                    // to zero. Matches the fused-load expand path (memory/mod.rs).
+                    result[i] = Self::bf16_to_f32(bf16).to_bits();
                 }
             }
             // Float32 -> BFloat16 (pack: 8 f32 -> 16 bf16, store in lower 4 words)
             (ElementType::Float32, ElementType::BFloat16) => {
-                use super::vector_float::{f32_to_bf16, fp32_flush_to_zero};
+                use super::vector_float::f32_to_bf16;
                 for i in 0..4 {
-                    // AIE2 FTZ on inputs before conversion.
-                    let f0 = f32::from_bits(fp32_flush_to_zero(src[i * 2]));
-                    let f1 = f32::from_bits(fp32_flush_to_zero(src[i * 2 + 1]));
+                    // Silicon ROUNDS f32 denormal inputs (phase B; does NOT flush),
+                    // matching the fused-store path (memory/mod.rs:1110). No input FTZ.
+                    let f0 = f32::from_bits(src[i * 2]);
+                    let f1 = f32::from_bits(src[i * 2 + 1]);
                     // Round-narrow per the configured mode (HW: crRnd governs
                     // to_v16bfloat16). The Half-A-validated f32_to_bf16 matches
                     // the aietools model across all 10 modes.
@@ -336,11 +338,12 @@ impl VectorAlu {
             // BFloat16 -> Int32: 16 bf16 -> 8 i32 (use lower half)
             // VFLOOR uses floor rounding (toward negative infinity).
             (ElementType::BFloat16, ElementType::Int32) => {
-                use super::vector_float::fp32_flush_to_zero;
                 for i in 0..8 {
                     let bf16 = (src[i / 2] >> ((i % 2) * 16)) as u16;
-                    // AIE2 FTZ: bf16 denormals flush to signed zero before floor.
-                    let f = f32::from_bits(fp32_flush_to_zero(Self::bf16_to_f32(bf16).to_bits()));
+                    // Silicon (NPU1 Phoenix, vec_vfloor_bf16_denorm, 2026-06-10) does
+                    // NOT flush bf16 denormals before floor: a tiny negative denormal
+                    // floors to -1, not 0.
+                    let f = Self::bf16_to_f32(bf16);
                     result[i] = f.floor() as i32 as u32;
                 }
             }
@@ -366,6 +369,7 @@ mod tests {
     use crate::interpreter::execute::vector_dispatch::VectorAlu;
     use crate::interpreter::state::ExecutionContext;
     use xdna_archspec::aie2::isa::SemanticOp;
+    use xdna_archspec::aie2::rounding::RoundingMode;
     use crate::interpreter::decode::register_map::AccumWidth;
 
     fn make_ctx() -> ExecutionContext {
@@ -450,6 +454,19 @@ mod tests {
         let result = VectorAlu::vector_floor_bf16_to_s32(&src, 0);
         assert_eq!(result[0], i32::MAX as u32, "NaN -> INT_MAX");
         assert_eq!(result[1], i32::MAX as u32, "NaN -> INT_MAX");
+    }
+
+    #[test]
+    fn vfloor_bf16_to_s32_does_not_flush_negative_denormal() {
+        // Silicon (NPU1 Phoenix, vec_vfloor_bf16_denorm, 2026-06-10) does NOT flush
+        // bf16 denormals before floor. This is the actual datapath the compiled
+        // VFLOOR kernel uses (wide path / quarter-acc source), distinct from the
+        // vector_convert bf16->int32 branch.
+        // lane0 = 0x0001 (tiny +denormal), lane1 = 0x8001 (tiny -denormal).
+        let src = [0x0001u32 | (0x8001u32 << 16), 0, 0, 0, 0, 0, 0, 0];
+        let out = VectorAlu::vector_floor_bf16_to_s32(&src, 0);
+        assert_eq!(out[0] as i32, 0, "floor(tiny +denormal) = 0");
+        assert_eq!(out[1] as i32, -1, "floor(tiny -denormal) = -1 (no FTZ)");
     }
 
     #[test]
@@ -560,6 +577,44 @@ mod tests {
                 f_hi
             );
         }
+    }
+
+    #[test]
+    fn bf16_to_f32_expand_does_not_flush_denormals() {
+        // Silicon (NPU1 Phoenix, vec_convexp_bf16_denorm, 2026-06-10): bf16 denormals
+        // widen to f32 denormals, sign preserved -- not flushed.
+        let mut src = [0u32; 8];
+        src[0] = 0x8001_0001; // lane0 = 0x0001 (+denormal), lane1 = 0x8001 (-denormal)
+        let out =
+            VectorAlu::vector_convert(&src, ElementType::BFloat16, ElementType::Float32, RoundingMode::Floor);
+        assert_eq!(out[0], 0x0001_0000, "positive bf16 denormal must widen, not flush");
+        assert_eq!(out[1], 0x8001_0000, "negative bf16 denormal must widen with sign");
+    }
+
+    #[test]
+    fn vfloor_bf16_to_i32_floors_negative_denormal_to_minus_one() {
+        // Silicon does not flush: floor(tiny negative bf16) = -1, not 0.
+        let mut src = [0u32; 8];
+        src[0] = 0x8001_0001; // lane0 +denormal, lane1 -denormal
+        let out =
+            VectorAlu::vector_convert(&src, ElementType::BFloat16, ElementType::Int32, RoundingMode::Floor);
+        assert_eq!(out[0] as i32, 0, "floor(tiny +denormal) = 0");
+        assert_eq!(out[1] as i32, -1, "floor(tiny -denormal) = -1 (no FTZ)");
+    }
+
+    #[test]
+    fn f32_to_bf16_narrow_does_not_flush_denormal_input() {
+        // Phase B: silicon rounds f32 denormal inputs to bf16 (no input FTZ). An f32
+        // denormal whose top 16 bits are nonzero rounds to a nonzero bf16, not 0.
+        let mut src = [0u32; 8];
+        // 0x0001_0000 is an f32 denormal; its high 16 bits (0x0001) are a bf16 denormal.
+        // round-to-nearest-even (Floor mode here rounds toward -inf) of this exact value
+        // keeps the bf16 pattern 0x0001 (no lower mantissa bits to round). Result lane 0
+        // packs bf0|bf1<<16; with src[1]=0 -> bf1=0.
+        src[0] = 0x0001_0000;
+        let out =
+            VectorAlu::vector_convert(&src, ElementType::Float32, ElementType::BFloat16, RoundingMode::Floor);
+        assert_eq!(out[0] & 0xFFFF, 0x0001, "f32 denormal input must NOT flush to 0 bf16");
     }
 
     #[test]
