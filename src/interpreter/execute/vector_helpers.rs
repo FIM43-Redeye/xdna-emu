@@ -82,19 +82,6 @@ impl VectorAlu {
         }
     }
 
-    /// Read a vector operand value.
-    ///
-    /// Handles both VectorReg (native 256-bit) and AccumReg (truncated from
-    /// 512-bit to 256-bit by taking the low 32 bits of each u64 lane).
-    /// This truncation matches hardware behavior for VMOV x, bml/bmh where
-    /// the 256-bit accumulator half maps directly to 8 x u32 lanes.
-    ///
-    /// Uses the compute default forwarding (use_cycle 2, MOV_Bypass). For callers
-    /// with explicit per-operand forwarding context, use `read_vector_operand_fwd`.
-    pub(super) fn read_vector_operand(operand: &Operand, ctx: &ExecutionContext) -> [u32; 8] {
-        Self::read_vector_operand_fwd(operand, ctx, None)
-    }
-
     // ========== Result Writing ==========
 
     /// Write result to vector destination.
@@ -1301,7 +1288,7 @@ mod tests {
         let mut ctx = ExecutionContext::new();
         let data = [1u32, 2, 3, 4, 5, 6, 7, 8];
         ctx.vector.write(3, data);
-        let result = VectorAlu::read_vector_operand(&Operand::VectorReg(3), &ctx);
+        let result = VectorAlu::read_vector_operand_fwd(&Operand::VectorReg(3), &ctx, None);
         assert_eq!(result, data);
     }
 
@@ -1311,7 +1298,7 @@ mod tests {
         // Write accumulator with values that have high bits
         let acc = [0x1_DEAD_BEEFu64, 0x2_CAFE_BABEu64, 0, 0, 0, 0, 0, 0];
         ctx.accumulator.write(0, acc);
-        let result = VectorAlu::read_vector_operand(&Operand::AccumReg(0), &ctx);
+        let result = VectorAlu::read_vector_operand_fwd(&Operand::AccumReg(0), &ctx, None);
         // Should truncate to low 32 bits
         assert_eq!(result[0], 0xDEAD_BEEF);
         assert_eq!(result[1], 0xCAFE_BABE);
@@ -1319,13 +1306,15 @@ mod tests {
 
     #[test]
     fn test_read_vector_operand_immediate_broadcast() {
-        let result = VectorAlu::read_vector_operand(&Operand::Immediate(42), &ExecutionContext::new());
+        let result =
+            VectorAlu::read_vector_operand_fwd(&Operand::Immediate(42), &ExecutionContext::new(), None);
         assert_eq!(result, [42u32; 8]);
     }
 
     #[test]
     fn test_read_vector_operand_unexpected_returns_zeros() {
-        let result = VectorAlu::read_vector_operand(&Operand::PointerReg(0), &ExecutionContext::new());
+        let result =
+            VectorAlu::read_vector_operand_fwd(&Operand::PointerReg(0), &ExecutionContext::new(), None);
         assert_eq!(result, [0u32; 8]);
     }
 

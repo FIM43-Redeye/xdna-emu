@@ -16,7 +16,7 @@
 //! the next handler.
 
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
-use crate::interpreter::state::ExecutionContext;
+use crate::interpreter::state::{Bypass, ExecutionContext};
 use xdna_archspec::aie2::isa::SemanticOp;
 
 // ---------------------------------------------------------------------------
@@ -149,15 +149,30 @@ pub(crate) fn get_two_vector_sources(op: &SlotOp, ctx: &ExecutionContext) -> ([u
     (a, b)
 }
 
-/// Read a single vector source operand by index.
+/// Read a single vector source operand by index, applying per-operand forwarding.
+///
+/// `idx` is the position in `op.sources` (same index space as `source_forward`),
+/// so the resolved `(use_cycle, use_bypass)` pair aligns directly. Falls back to
+/// the compute default (`ctx.vector.read`) when the op carries no itinerary data.
 pub(crate) fn get_vector_source(op: &SlotOp, ctx: &ExecutionContext, idx: usize) -> [u32; 8] {
-    op.sources.get(idx).map_or([0; 8], |src| read_vector_operand(src, ctx))
+    let fwd = op.source_forward.get(idx).copied();
+    op.sources.get(idx).map_or([0; 8], |src| read_vector_operand(src, ctx, fwd))
 }
 
-/// Interpret an operand as a vector register read.
-pub(crate) fn read_vector_operand(operand: &Operand, ctx: &ExecutionContext) -> [u32; 8] {
+/// Interpret an operand as a vector register read with optional forwarding context.
+///
+/// When `fwd` is `Some((use_cycle, use_bypass))`, the read honors the resolved
+/// bypass-network window via `read_with`; otherwise it uses the compute default.
+pub(crate) fn read_vector_operand(
+    operand: &Operand,
+    ctx: &ExecutionContext,
+    fwd: Option<(u8, Bypass)>,
+) -> [u32; 8] {
     match operand {
-        Operand::VectorReg(r) => ctx.vector.read(*r),
+        Operand::VectorReg(r) => match fwd {
+            Some((uc, ub)) => ctx.vector.read_with(*r, uc, ub),
+            None => ctx.vector.read(*r),
+        },
         _ => [0; 8],
     }
 }
@@ -832,10 +847,68 @@ pub(crate) fn vector_sra(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
 mod tests {
     use super::*;
     use crate::interpreter::bundle::SlotIndex;
+    use smallvec::smallvec;
     use xdna_archspec::aie2::isa::SemanticOp;
 
     fn make_ctx() -> ExecutionContext {
         ExecutionContext::new()
+    }
+
+    // ======================================================================
+    // source_forward threading (mirrors vector_helpers Task 5 test)
+    // ======================================================================
+
+    #[test]
+    fn test_semantic_get_vector_source_honors_source_forward() {
+        let mut ctx = make_ctx();
+        // Known committed (old) value in reg 3 before any in-flight writes.
+        ctx.vector.write(3, [0xAAAA_BBBB; 8]);
+        // Queue an in-flight write to reg 3: l_def 2, No-def, issued at bundle 0.
+        ctx.vector.advance_bundle(0);
+        ctx.vector.queue_write(3, [0x1234_5678; 8], 2, Bypass::No);
+        ctx.vector.advance_bundle(1); // consumer reads at issue+1
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add).as_vector(ElementType::Int32);
+        op.sources = smallvec![Operand::VectorReg(3)];
+
+        // Store-like consumer (uc 1, No): eff = 2-1+1 = 2 -> NOT visible at issue+1.
+        op.source_forward = smallvec![(1u8, Bypass::No)];
+        assert_eq!(get_vector_source(&op, &ctx, 0), [0xAAAA_BBBB; 8], "uc1: old value at issue+1");
+
+        // Compute consumer (uc 2, No): eff = 2-2+1 = 1 -> visible at issue+1.
+        op.source_forward = smallvec![(2u8, Bypass::No)];
+        assert_eq!(get_vector_source(&op, &ctx, 0), [0x1234_5678; 8], "uc2: new value visible at issue+1");
+
+        // No source_forward: falls back to compute default (uc 2, Mov) -> visible at +1.
+        op.source_forward = smallvec![];
+        assert_eq!(get_vector_source(&op, &ctx, 0), [0x1234_5678; 8], "fallback: compute default visible");
+    }
+
+    #[test]
+    fn test_semantic_add_end_to_end_honors_source_forward() {
+        // Exercise the full execute_vector_semantic path: an Add whose two
+        // source reads carry store-like forwarding (uc 1, No) must read the OLD
+        // values of an in-flight write, not the forwarded-new compute default.
+        let mut ctx = make_ctx();
+        ctx.vector.write(0, [10u32; 8]); // committed old
+        ctx.vector.write(1, [20u32; 8]); // committed old
+        ctx.vector.advance_bundle(0);
+        // In-flight writes that would change v0/v1 if visible.
+        ctx.vector.queue_write(0, [1000u32; 8], 2, Bypass::No);
+        ctx.vector.queue_write(1, [2000u32; 8], 2, Bypass::No);
+        ctx.vector.advance_bundle(1); // reads happen at issue+1
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
+        // Store-like (uc 1, No): in-flight writes NOT visible at issue+1.
+        op.source_forward = smallvec![(1u8, Bypass::No), (1u8, Bypass::No)];
+
+        assert!(execute_vector_semantic(&op, &mut ctx));
+        // 10 + 20 = 30 (old values), NOT 1000 + 2000.
+        assert_eq!(ctx.vector.read(2), [30u32; 8], "uc1: Add reads old in-flight values");
     }
 
     // -- Helper to build a vector binop --
