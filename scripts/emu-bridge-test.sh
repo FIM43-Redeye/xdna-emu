@@ -74,8 +74,14 @@ mkdir -p "$RESULTS_DIR"
 # Maintain a 'latest' symlink for easy access.
 ln -sfn "$RESULTS_DIR" "${RESULTS_DIR%/*}/latest"
 
-# Default parallelism
-JOBS="$(nproc)"
+# Default parallelism. HARDCODED CAP (2026-06-10): Chess (xchesscc) compiles eat
+# ~5.5GB each, so the old `nproc` default (-j16 here) tried to use ~88GB and
+# OOM'd this 96GB box mid-sweep -- doubly dangerous on the current faulty
+# mainboard. Capped to 4 (~22GB peak) until the hardware is replaced. `-jN`
+# still works but is clamped to the cap (see option parsing). Lift JOBS_CAP
+# once on stable hardware.
+JOBS_CAP=4
+JOBS="$JOBS_CAP"
 
 # ---------------------------------------------------------------------------
 # Option parsing
@@ -131,6 +137,10 @@ while [[ $# -gt 0 ]]; do
       JOBS="${1#-j}"
       if [[ -z "$JOBS" ]] || ! [[ "$JOBS" =~ ^[0-9]+$ ]]; then
         echo "Invalid -j value: $1" >&2; exit 1
+      fi
+      if (( JOBS > JOBS_CAP )); then
+        echo ">>> -j$JOBS clamped to -j$JOBS_CAP (memory-safety cap: Chess ~5.5GB/job, faulty board)" >&2
+        JOBS="$JOBS_CAP"
       fi
       shift ;;
     --chess-only|--chess)  COMPILER_MODE="chess"; shift ;;
