@@ -61,12 +61,17 @@ executor step, so a same-step rising+falling would encode as a zero-width span).
 
 A third cluster: **vector-register result visibility (forwarding network)**. The
 AIE2 per-operand bypass/forwarding matrix is implemented and validated against
-the chess bridge sweep (89/89 PASS, 0 regressions), but real-NPU (HW) validation
-is pending.
+the chess bridge sweep (89/89 PASS, 0 regressions) **and against real Phoenix
+(NPU1) silicon**: `vec_mac_bf16`, `two_col`, and all three
+`matrix_multiplication_using_cascade` variants (plain/buffer/cascade) PASS
+HW==EMU on the bridge (2026-06-09), with `vec_mac_bf16` and `two_col` also
+diffing CLEAN on the trace comparison. The W/X-file forwarding model is therefore
+HW-verified for the bf16 matmul class; the remaining gaps below are scoped
+deferrals, not unvalidated model.
 
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
-| Accumulator/CM-domain (`VEC_Bypass`) result visibility | not in the per-operand bypass matrix; modeled via the separate MAC-pipeline-latency path (`ExecutionContext::queue_matmul_accum_write`). The matrix resolves W/X-file results; `VEC_Bypass` (MAC/MUL results into the accumulator file) is deferred. | `src/interpreter/state/registers.rs` (`VectorRegisterFile::visible_at`); `src/interpreter/state/context.rs` (`queue_matmul_accum_write`, carries a `FIXME(bypass-model)`) | **OPEN / deferred.** Validated by chess bridge (89/89) but no real-NPU trace comparison yet. Accumulator folding into the bypass matrix is a noted future extension (see `docs/superpowers/plans/2026-06-09-vector-write-result-latency.md` Scope). |
+| Accumulator/CM-domain (`VEC_Bypass`) result visibility | not in the per-operand bypass matrix; modeled via the separate MAC-pipeline-latency path (`ExecutionContext::queue_matmul_accum_write`). The matrix resolves W/X-file results; `VEC_Bypass` (MAC/MUL results into the accumulator file) is deferred. | `src/interpreter/state/registers.rs` (`VectorRegisterFile::visible_at`); `src/interpreter/state/context.rs` (`queue_matmul_accum_write`, carries a `FIXME(bypass-model)`) | **OPEN / deferred.** The MAC-latency path is HW-validated *functionally* — all three `matrix_multiplication_using_cascade` variants PASS HW==EMU on the bridge (2026-06-09), which exercises the accumulator-write path — but not yet at trace granularity (those kernels' TRACE PREP fails for an orthogonal trace-injection reason). Accumulator folding into the per-operand bypass matrix is a noted future extension (see `docs/superpowers/plans/2026-06-09-vector-write-result-latency.md` Scope). |
 | `source_forward` positional alignment for merged memory operands | `SlotOp::source_forward` aligns exactly for compute ops; may drift for fused memory operands that merge address/data into a single TableGen operand list position | `src/interpreter/bundle/slot.rs` (`FIXME(source-forward-memory-alignment)`); `src/interpreter/decode/operand_extraction.rs` | **DOCUMENTED / benign.** The bypass model only reads vector-register compute sources; memory operands use `NoBypass` or are not vector-reg reads, so this positional drift does not affect result visibility decisions. |
 
 ---

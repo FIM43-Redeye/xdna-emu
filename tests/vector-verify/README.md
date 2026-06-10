@@ -142,8 +142,11 @@ decode path so that register-pair-variant opcodes like `VMOV_mv_x` are handled
 correctly (e.g., X<-BM carries `MOV_Bypass`; the static base class does not).
 Store-data reads use `NoBypass`; vector ALU reads use `MOV_Bypass`. This subsumes
 the per-bundle snapshot hazard and models cross-bundle forwarding. Validated
-against the chess bridge sweep (89/89 PASS, 0 regressions). See
-`docs/superpowers/plans/2026-06-09-vector-write-result-latency.md`.
+against the chess bridge sweep (89/89 PASS, 0 regressions) and against real
+Phoenix (NPU1) silicon: `vec_mac_bf16`, `two_col`, and all three
+`matrix_multiplication_using_cascade` variants PASS HW==EMU on the bridge
+(2026-06-09); `vec_mac_bf16` and `two_col` also diff CLEAN at trace granularity.
+See `docs/superpowers/plans/2026-06-09-vector-write-result-latency.md`.
 
 The accumulator/CM-domain (`VEC_Bypass`) file is NOT in this matrix -- those
 MAC/MUL results use the separate MAC-pipeline-latency path
