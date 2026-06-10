@@ -60,7 +60,8 @@ def _bf16_to_f32_bits(b):
 
 def _bf16_floor_reference():
     """No-FTZ floor(bf16) per lane as int32 two's-complement bit patterns."""
-    import math, struct
+    import math
+    import struct
     out = []
     for b in _bf16_denorm_inputs():
         f = struct.unpack("<f", struct.pack("<I", _bf16_to_f32_bits(b)))[0]
@@ -611,7 +612,7 @@ _reg(KernelSpec(
     n=_DENORM_N,
     golden={"class": "direct",
             "direct": DirectIO(inputs=_bf16_denorm_inputs(),
-                               reference=tuple(v << 16 for v in _bf16_denorm_inputs()))},
+                               reference=tuple(_bf16_to_f32_bits(v) for v in _bf16_denorm_inputs()))},
     defines=[("CONV_N", _DENORM_N)],
     body="""  event0();
   for (int i = 0; i < CONV_N; i += 16) {
