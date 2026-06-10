@@ -31,3 +31,16 @@ class TestBf16EdgeEnrichment(unittest.TestCase):
         neg = [p for p in nans if (p >> 31)]
         self.assertGreaterEqual(len(pos), 8)
         self.assertGreaterEqual(len(neg), 8)
+
+
+@unittest.skipUnless(os.environ.get("VECTOR_ORACLE_MODEL"),
+                     "needs VECTOR_ORACLE_MODEL (aietools model)")
+class TestMatmulOverflowEnrichment(unittest.TestCase):
+    def test_many_bf16_overflow_tiles(self):
+        cases = gvg.gen_matmul_golden()
+        bf = [c for c in cases if c["a_type"] == "BFloat16"]
+        def has_ovf(c):
+            return any(((b >> 23) & 0xFF) == 0xFF for b in c["expected"])
+        ovf = [c for c in bf if has_ovf(c)]
+        self.assertGreaterEqual(len(ovf), 30,
+            f"want >=30 bf16 overflow tiles for the edge kernel, got {len(ovf)}")

@@ -595,6 +595,22 @@ def gen_matmul_golden():
             for _ in range(12):
                 mats.append(([rng.randint(0, 0xFFFF) for _ in range(na)],
                              [rng.randint(0, 0xFFFF) for _ in range(nb)]))
+            # Deliberate overflow/NaN tiles for the bf16 edge kernel. A separate
+            # RNG keeps the global `rng` stream (and thus the phase-A finite tiles)
+            # byte-identical. Large-exponent bf16 values (~1e38) overflow fp32 on
+            # accumulate -> Inf/NaN result lanes; explicit NaN inputs propagate.
+            ovf_rng = random.Random(0xB16ED6E)   # distinct, fixed seed
+            big = [0x7F00, 0x7F40, 0x7F7F, 0xFF00, 0xFF40,  # +/- ~1e38
+                   0x7E80, 0xFE80, 0x7EC0, 0xFEC0]
+            nan_in = [0x7FC0, 0xFFC0, 0x7F81, 0x7FFF]        # bf16 NaN bit patterns
+            ovf_mats = []
+            ovf_mats.append(([0x7F7F] * na, [0x7F7F] * nb))  # max-magnitude product
+            ovf_mats.append(([0x7FC0] + [0x3F80] * (na - 1),
+                             [0x3F80] * nb))                  # NaN input propagates
+            for _ in range(40):
+                ovf_mats.append(([ovf_rng.choice(big) for _ in range(na)],
+                                 [ovf_rng.choice(big + nan_in) for _ in range(nb)]))
+            mats.extend(ovf_mats)
             for (av, bv) in mats:
                 abuf = bytearray(64)
                 bbuf = bytearray(64)
