@@ -19,6 +19,63 @@ FIXME.
 
 **Spec:** `docs/superpowers/specs/2026-06-09-consumer-side-bypass-matrix-design.md`
 
+---
+
+## REVISION 2026-06-09 (post-Task-3 risk gate + feasibility spike)
+
+Task 3 (the operand-index risk gate, committed `fe2c279`) proved the `num_defs + k`
+mapping sound but discovered the model's compute-vs-store split is driven by the
+**bypass match**, not `use_cycle` (both anchors read at `use_cycle 1`). That put
+the load on the **producer `def_bypass`**, which exposed a real FFI gap:
+
+- `def_bypass` for **register-pair-variant opcodes** (e.g. `VMOV_mv_x`) depends on
+  the actual **register operands**, via a TableGen `ItineraryRegPairs` override.
+  Our FFI read the **static base** sched class (`desc.getSchedClass()`), so
+  `VMOV x,bml` reported `def_bypass = NoBypass` instead of `MOV` — making the
+  cascade compute edge resolve issue+2 instead of the hardware's issue+1.
+- LLVM's own scheduler uses the **register-aware** resolver
+  `AIE2InstrInfo::getSchedClass(MCInstrDesc&, ArrayRef<OperandRegInfo>)`
+  (`AIEBaseInstrInfo.cpp:1032`). `OperandRegInfo` (`AIEBaseInstrInfo.h:48`) needs
+  only a `Register` id — no MachineInstr/MRI. `-lLLVMAIECodeGen` is already on our
+  link line. **Feasibility spike PROVED Option A** (call LLVM's resolver): for
+  opcode 985 (`VMOV_mv_x`), X←BM resolves to class 229 (`II_VMOV_X_XM_BM`,
+  `fwd=[1,0]` = def bypass MOV). Spike artifacts: `/tmp/claude-1000/sched-spike/`.
+- The override changes the **forwarding vector only** (operand cycles are
+  identical across all variants), and can flip **both def and use** slots. So the
+  resolution is inherently **per-instruction** and must feed both the producer
+  `def_bypass` and the consumer `source_forward`.
+
+**Revised architecture.** Resolve the variant sched class **per-instruction at
+decode** and carry the resolved forwarding data on the decoded instruction.
+Derive BOTH producer `def_bypass` and consumer `source_forward` from it. This
+supersedes the per-opcode `def_bypass` lookup (`cycle_accurate`'s
+`latencies.def_bypass(opcode)`), which is wrong for the 22 variant opcodes.
+Operand *cycles* stay per-opcode (variant-invariant). Task 2's per-opcode
+`InstrInfo` arrays remain as a static reference; any now-unused accessor
+(`use_bypass_raw`) is pruned in Task 7.
+
+### Task 3.5 (NEW): FFI register-aware sched-class resolution
+
+Construct a static `AIE2InstrInfo` in the FFI; resolve each decoded
+instruction's sched class from its operand register ids; return the RESOLVED
+per-operand forwarding (+cycle) arrays on the decode result. See the dedicated
+implementer dispatch — built TDD with an anchor test asserting `VMOV x,bml` →
+def bypass MOV, `VMOV bm,bm` → NoBypass, `VEXTRACT` source → MOV.
+
+### Task 4 (REVISED)
+
+`SlotOp` gains `source_forward` (consumer pairs) AND `result_bypass` (resolved
+producer def bypass), both populated at decode from the resolved decode-result
+arrays. `cycle_accurate` reads `slot_op.result_bypass` instead of
+`latencies.def_bypass(opcode)`.
+
+### Task 5 (unchanged in intent)
+
+Thread `source_forward` into the vector + store read paths via `read_with`.
+
+Tasks 6 (gates), 7 (cleanup — incl. pruning superseded per-opcode bypass
+accessors), 8 (HW) unchanged.
+
 **The forwarding formula (the heart):**
 ```
 match      = (def_bypass(P) == use_bypass(C,k)) && def_bypass(P) != NoBypass
