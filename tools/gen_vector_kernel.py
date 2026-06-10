@@ -102,6 +102,7 @@ class KernelSpec:
     defines: List[Tuple[str, object]] = field(default_factory=list)
     stem: Optional[str] = None
     matmul: Optional[Matmul] = None
+    silicon_golden: Optional[str] = None
 
 
 # --- Mode sweep --------------------------------------------------------------
@@ -195,6 +196,7 @@ class SweepSpec:
     predicate: Optional[object] = None
     defines: List[Tuple[str, object]] = field(default_factory=list)
     stem: Optional[str] = None
+    silicon: bool = False
 
     def expand(self):
         """Materialize the sweep into one KernelSpec per (rnd, crsat) point."""
@@ -234,6 +236,7 @@ class SweepSpec:
                     body=body,
                     defines=self.defines,
                     stem=self.stem,
+                    silicon_golden=_silicon_path(self.prefix + suffix) if self.silicon else None,
                 ))
         return specs
 
@@ -310,7 +313,7 @@ def unpack_vec512(words, count, bytes_per, signed=True):
     ]
 
 
-def bake_matmul(records, filt, mm, predicate=None):
+def bake_matmul(records, filt, mm, predicate=None, silicon=None, name=None):
     """Bake (A, B, C) host arrays for a batch of row-major matmul tiles.
 
     Selects the matmul config slice (`filt`, with an optional record
@@ -322,6 +325,10 @@ def bake_matmul(records, filt, mm, predicate=None):
     corpus), so no value is recomputed. `predicate` excludes records a flat
     filter can't (e.g. bf16 tiles whose expected has NaN/Inf overflow lanes,
     which would break the exact bit-compare).
+
+    When `silicon` is a loaded silicon-golden dict, C is replaced by its
+    `silicon` field and the inputs are cross-checked for alignment (stale
+    captures that no longer match the corpus would bake mismatched EXP).
     """
     recs = select_records(records, filt, predicate=predicate)
     assert len(recs) >= mm.batch, f"{len(recs)} matmul records < batch {mm.batch}"
@@ -331,6 +338,10 @@ def bake_matmul(records, filt, mm, predicate=None):
         a_out += unpack_vec512(r["a"], mm.size_a, mm.a_bytes, signed=signed)
         b_out += unpack_vec512(r["b"], mm.size_b, mm.b_bytes, signed=signed)
         c_out += r["expected"][:mm.size_c]
+    if silicon is not None:
+        assert silicon["input_a"] == a_out and silicon["input_b"] == b_out, \
+            f"{name + ': ' if name else ''}silicon golden inputs != corpus slice (regenerate capture)"
+        c_out = silicon["silicon"]
     return a_out, b_out, c_out
 
 
@@ -441,15 +452,48 @@ int main(int argc, const char *argv[]) {
 )
 
 
+def _silicon_path(name):
+    """Path to the HW-captured silicon golden for a kernel (tools/golden/silicon_edge/)."""
+    import os
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "golden", "silicon_edge", name + ".json")
+
+
+def replace_silicon(spec, path):
+    """Return a copy of `spec` with `silicon_golden` set (test helper)."""
+    import dataclasses
+    return dataclasses.replace(spec, silicon_golden=path)
+
+
+def _load_silicon(spec):
+    """Load the spec's silicon golden JSON if set and present, else None."""
+    import os
+    import json
+    if not spec.silicon_golden or not os.path.exists(spec.silicon_golden):
+        return None
+    with open(spec.silicon_golden) as f:
+        return json.load(f)
+
+
 def _bake_io(spec, golden):
-    """Select the spec's golden slice and bake (input, expected) arrays to N."""
+    """Select the spec's golden slice and bake (input, expected) arrays to N.
+
+    If `spec.silicon_golden` points to an existing silicon capture JSON, the
+    expected array is taken from its `silicon` field (not the model corpus) and
+    the inputs are cross-checked against the corpus slice (so a stale capture
+    that no longer matches can't silently bake mismatched EXP). When the file is
+    absent (bootstrap mode), the model corpus drives both arrays as usual.
+    """
     g = spec.golden
-    recs = select_records(
-        golden[g["class"]], g["filt"], g.get("value_range"),
-        predicate=g.get("predicate"),
-    )
+    recs = select_records(golden[g["class"]], g["filt"], g.get("value_range"),
+                          predicate=g.get("predicate"))
     in_vals = bake_array(recs, g.get("value_field", "value"), spec.n)
     exp_vals = bake_array(recs, g.get("expected_field", "expected"), spec.n)
+    sj = _load_silicon(spec)
+    if sj is not None:
+        assert sj["input"] == in_vals, \
+            f"{spec.name}: silicon golden inputs != corpus slice (regenerate capture)"
+        exp_vals = sj["silicon"]
     return in_vals, exp_vals
 
 
@@ -577,7 +621,8 @@ def render_test_cpp(spec, golden):
         mm = spec.matmul
         a_vals, b_vals, c_vals = bake_matmul(
             golden[spec.golden["class"]], spec.golden["filt"], mm,
-            predicate=spec.golden.get("predicate"))
+            predicate=spec.golden.get("predicate"), silicon=_load_silicon(spec),
+            name=spec.name)
         return _TEST_CPP_MATMUL_TMPL.substitute(
             name=spec.name,
             gclass=spec.golden["class"],

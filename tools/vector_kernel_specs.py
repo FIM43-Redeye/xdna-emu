@@ -11,7 +11,7 @@ tools/golden/vector_ops.json (the Half-A corpus); the generator bakes the
 input/expected arrays from it so no expected value is ever transcribed by hand.
 """
 
-from gen_vector_kernel import Buf, KernelSpec, Matmul, SweepSpec
+from gen_vector_kernel import Buf, KernelSpec, Matmul, SweepSpec, _silicon_path
 
 SPECS = {}
 
@@ -467,6 +467,82 @@ $mode
     acc.from_vector(v, UPS_SHIFT);
     aie::vector<int32_t, 16> o = acc.to_vector<int32_t>(0);
     aie::store_v(out + i, o);
+  }
+  event1();
+""",
+))
+
+
+# === Phase-B edge specs (silicon golden required) =============================
+#
+# These specs exercise the inputs that the phase-A kernels deliberately excluded
+# (denormal/NaN/Inf f32, bf16 overflow) because the aietools model diverges from
+# real silicon on those edges. EXP = HW-captured silicon (via silicon_golden).
+# Until the silicon JSON is captured (bootstrap mode), the model golden is baked
+# as a placeholder; the alignment assert in _bake_io prevents a stale capture
+# from silently baking mismatched EXP once the JSON is present.
+
+EDGE_N = 96            # ceil(94 non-normal bf16_srs inputs/mode / 16) * 16
+MAC_OVF_BATCH = 54     # all bf16 matmul overflow tiles in the regrown corpus
+
+# --- Convert edge sweep: denormal + NaN + Inf f32 -> bf16 across all 10 rounding
+# modes. The model ROUNDS denormals (mode-dependent) while the execute path FTZs;
+# rnd=0 and rnd=12 alone miss it, so the full mode space is swept. EXP = silicon.
+_reg_sweep(SweepSpec(
+    prefix="vec_conv_bf16_edge",
+    func="conv_bf16",
+    doc="Convert edge (round-narrow), f32 -> bf16, denormal/NaN/Inf inputs.",
+    inputs=[Buf("in", "uint32_t", "f32", ktype="float")],
+    output=Buf("out", "uint16_t", "bf16", ktype="bfloat16"),
+    n=EDGE_N,
+    gclass="bf16_srs",
+    base_filt={},
+    rnds=_ALL_RND,
+    predicate=_is_edge_f32,
+    silicon=True,
+    defines=[("CONV_N", EDGE_N)],
+    body_template="""  event0();
+$mode
+
+  for (int i = 0; i < CONV_N; i += 16) {
+    aie::vector<float, 16> v = aie::load_v<16>(in + i);
+    aie::accum<accfloat, 16> acc(v);
+    aie::vector<bfloat16, 16> o = acc.to_vector<bfloat16>();
+    aie::store_v(out + i, o);
+  }
+  event1();
+""",
+))
+
+
+# --- MAC bf16 overflow: the bf16 matmul tiles whose result overflows to Inf/NaN.
+# The overflow lane's canonical NaN is mantissa=1 on silicon+emu vs 0x7F in the
+# model, so EXP = silicon. Same 4x8x4 mmul datapath as vec_mac_bf16.
+_reg(KernelSpec(
+    name="vec_mac_bf16_ovf",
+    func="mac_bf16",
+    doc="MatMul bf16 overflow tiles (4x8x4): result overflows to Inf/NaN. EXP is "
+        "HW-captured silicon (model canonical NaN mantissa 0x7F vs silicon 1). "
+        "Host stages bf16/fp32 bit patterns.",
+    inputs=[Buf("inA", "uint16_t", "bf16", ktype="bfloat16"),
+            Buf("inB", "uint16_t", "bf16", ktype="bfloat16")],
+    output=Buf("out", "uint32_t", "f32", ktype="float"),
+    n=0,
+    golden={"class": "matmul",
+            "filt": {"a_type": "BFloat16", "b_type": "BFloat16", "rows": 4,
+                     "inner": 8, "cols": 4, "subtract": False},
+            "predicate": _has_overflow_expected},
+    matmul=Matmul(M=4, K=8, N=4, a_bytes=2, b_bytes=2, batch=MAC_OVF_BATCH, bfloat=True),
+    silicon_golden=_silicon_path("vec_mac_bf16_ovf"),
+    defines=[("MAC_BATCH", MAC_OVF_BATCH)],
+    body="""  event0();
+  using MMUL = aie::mmul<4, 8, 4, bfloat16, bfloat16, accauto>;
+  for (int n = 0; n < MAC_BATCH; n++) {
+    aie::vector<bfloat16, MMUL::size_A> a = aie::load_v<MMUL::size_A>(inA + n * MMUL::size_A);
+    aie::vector<bfloat16, MMUL::size_B> b = aie::load_v<MMUL::size_B>(inB + n * MMUL::size_B);
+    MMUL m;
+    m.mul(a, b);
+    aie::store_v(out + n * MMUL::size_C, m.to_vector<float>());
   }
   event1();
 """,

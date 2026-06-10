@@ -524,6 +524,72 @@ class TestOutputDump(unittest.TestCase):
         self.assertIn('"out.txt"', cpp)
 
 
+class TestSiliconGoldenSource:
+    def test_silicon_field_defaults_none(self):
+        spec = gen.KernelSpec(name="x", func="x", doc="",
+                              inputs=[gen.Buf("in","int16_t","i16")],
+                              output=gen.Buf("out","int16_t","i16"), n=4,
+                              golden={"class":"srs","filt":{}}, body="")
+        assert spec.silicon_golden is None
+
+    def test_bootstrap_bakes_model_when_no_silicon_file(self):
+        from vector_kernel_specs import SWEEPS
+        pt = SWEEPS["vec_conv_bf16_edge_sweep"].expand()[0]
+        miss = gen.replace_silicon(pt, "/nonexistent.json")
+        in_vals, exp_vals = gen._bake_io(miss, GOLDEN)
+        assert len(exp_vals) == pt.n
+
+    def test_silicon_file_overrides_exp_keeps_inputs(self, tmp_path):
+        from vector_kernel_specs import SWEEPS
+        pt = SWEEPS["vec_conv_bf16_edge_sweep"].expand()[0]
+        in_model, _ = gen._bake_io(gen.replace_silicon(pt, None), GOLDEN)
+        sj = {"kernel": pt.name, "n": pt.n, "input": in_model,
+              "silicon": [0xDEAD]*pt.n, "model": [0]*pt.n, "divergences": []}
+        path = tmp_path / "sj.json"
+        path.write_text(json.dumps(sj))
+        in_vals, exp_vals = gen._bake_io(gen.replace_silicon(pt, str(path)), GOLDEN)
+        assert exp_vals == [0xDEAD]*pt.n
+        assert in_vals == in_model
+
+    def test_sweep_assigns_silicon_path_per_point(self):
+        from vector_kernel_specs import SWEEPS
+        for pt in SWEEPS["vec_conv_bf16_edge_sweep"].expand():
+            assert pt.silicon_golden is not None
+            assert pt.name in pt.silicon_golden
+
+
+class TestEdgeSpecs:
+    def test_convert_edge_sweep_is_ten_points(self):
+        from vector_kernel_specs import SWEEPS
+        pts = SWEEPS["vec_conv_bf16_edge_sweep"].expand()
+        assert len(pts) == 10
+        assert {p.name for p in pts} == {f"vec_conv_bf16_edge_r{r}" for r in (0,1,2,3,8,9,10,11,12,13)}
+
+    def test_convert_edge_inputs_all_nonnormal(self):
+        from vector_kernel_specs import SWEEPS, _is_normal_f32
+        pt = SWEEPS["vec_conv_bf16_edge_sweep"].expand()[0]
+        in_vals, _ = gen._bake_io(gen.replace_silicon(pt, None), GOLDEN)
+        for v in in_vals:
+            assert not _is_normal_f32({"value": v}), f"{v:#x} normal"
+
+    def test_convert_edge_slice_fits_buffer(self):
+        from vector_kernel_specs import SWEEPS
+        pt = SWEEPS["vec_conv_bf16_edge_sweep"].expand()[0]
+        recs = gen.select_records(GOLDEN["bf16_srs"], pt.golden["filt"],
+                                  predicate=pt.golden["predicate"])
+        assert len(recs) <= pt.n
+        assert len(recs) > 0
+
+    def test_mac_ovf_selects_overflow_tiles(self):
+        from vector_kernel_specs import SPECS, _has_overflow_expected
+        spec = SPECS["vec_mac_bf16_ovf"]
+        recs = gen.select_records(GOLDEN["matmul"], spec.golden["filt"],
+                                  predicate=spec.golden["predicate"])
+        assert len(recs) >= spec.matmul.batch
+        for r in recs[:spec.matmul.batch]:
+            assert _has_overflow_expected(r)
+
+
 class TestKernelHeaderFormatting:
     def test_ruler_line_is_eighty_columns(self):
         """The kernel.cc header ruler matches the 80-col LLVM convention
