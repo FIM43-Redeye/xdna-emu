@@ -306,6 +306,10 @@ impl VectorAlu {
             (ElementType::Float32, ElementType::Int32) => {
                 use super::vector_float::fp32_flush_to_zero;
                 for i in 0..8 {
+                    // FTZ here is a provable no-op: an f32 denormal lies in (-1, 1)
+                    // and truncates to 0 with or without the flush. Unobservable, so
+                    // not silicon-disproven like the bf16/f32->bf16 paths above. Kept
+                    // for symmetry; see f32_to_int_denormal_truncates_to_zero test.
                     let f = f32::from_bits(fp32_flush_to_zero(src[i]));
                     result[i] = f as i32 as u32;
                 }
@@ -314,6 +318,8 @@ impl VectorAlu {
             (ElementType::Float32, ElementType::UInt32) => {
                 use super::vector_float::fp32_flush_to_zero;
                 for i in 0..8 {
+                    // FTZ no-op (see Float32 -> Int32 above): a denormal truncates to
+                    // 0 either way.
                     let f = f32::from_bits(fp32_flush_to_zero(src[i]));
                     result[i] = f.max(0.0) as u32;
                 }
@@ -467,6 +473,23 @@ mod tests {
         let out = VectorAlu::vector_floor_bf16_to_s32(&src, 0);
         assert_eq!(out[0] as i32, 0, "floor(tiny +denormal) = 0");
         assert_eq!(out[1] as i32, -1, "floor(tiny -denormal) = -1 (no FTZ)");
+    }
+
+    #[test]
+    fn f32_to_int_denormal_truncates_to_zero_ftz_irrelevant() {
+        // An f32 denormal lies in (-1, 1) -> truncates to 0 whether or not it is
+        // first flushed. The FTZ on the f32->int branches is a provable no-op (not
+        // silicon-observable, so not removed like the bf16 paths). Guards against a
+        // future change that assumes it is meaningful either way.
+        let mut src = [0u32; 8];
+        src[0] = 0x0000_0001; // smallest +f32 denormal
+        src[1] = 0x8000_0001; // smallest -f32 denormal
+        src[2] = 0x007F_FFFF; // largest +f32 denormal
+        let out =
+            VectorAlu::vector_convert(&src, ElementType::Float32, ElementType::Int32, RoundingMode::Floor);
+        assert_eq!(out[0] as i32, 0);
+        assert_eq!(out[1] as i32, 0);
+        assert_eq!(out[2] as i32, 0);
     }
 
     #[test]
