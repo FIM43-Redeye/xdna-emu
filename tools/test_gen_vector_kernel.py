@@ -179,6 +179,15 @@ class TestRegistry:
         from vector_kernel_specs import SPECS
         for name, spec in SPECS.items():
             g = spec.golden
+            if g["class"] == "direct":
+                # Direct specs carry their own input/reference arrays instead of
+                # slicing a corpus class; the anti-silent-empty / fits-N guarantee
+                # still holds, just against the DirectIO tuples.
+                d = g["direct"]
+                assert d.inputs, f"{name}: direct inputs empty"
+                assert len(d.inputs) == len(d.reference) == spec.n, \
+                    f"{name}: direct arrays len {len(d.inputs)}/{len(d.reference)} != N={spec.n}"
+                continue
             recs = select_records(GOLDEN[g["class"]], g["filt"],
                                   g.get("value_range"), predicate=g.get("predicate"))
             assert recs, f"{name}: golden slice is empty"
@@ -655,3 +664,43 @@ class TestKernelHeaderFormatting:
         assert len(first) == 80, f"ruler is {len(first)} cols: {first!r}"
         assert first.startswith("//===- srs.cc ")
         assert first.endswith("*- C++ -*-===//")
+
+
+class TestConvertFtzAuditSpecs(unittest.TestCase):
+    """The two bf16 convert FTZ-audit capture kernels (Half-B phase C). Both
+    sweep the exhaustive bf16-denormal input space (all 254 denormals + +/-0)
+    via DirectIO, so their oracle is silicon and their bootstrap reference is
+    the no-FTZ widen/floor. vec_vfloor_bf16_denorm is the real audit test: a
+    standalone VFLOOR routes through vector_convert's bf16->int32 FTZ, so a
+    negative denormal floors to -1 without FTZ (vs 0 with it)."""
+
+    def test_audit_specs_generate_with_direct_denorm_inputs(self):
+        import vector_kernel_specs as vks
+        for name in ("vec_convexp_bf16_denorm", "vec_vfloor_bf16_denorm"):
+            spec = vks.SPECS[name]
+            d = spec.golden["direct"]
+            # 254 denormals + 2 zeros, exhaustive, length 256.
+            self.assertEqual(len(d.inputs), 256)
+            self.assertEqual(len(d.reference), 256)
+            # negative bf16 denormal present (the FTZ discriminator).
+            self.assertIn(0x8001, d.inputs)
+            # bootstrap bake (no silicon json) returns the direct arrays.
+            in_vals, exp_vals = gen._bake_io(gen.replace_silicon(spec, None), {})
+            self.assertEqual(in_vals, list(d.inputs))
+            self.assertEqual(exp_vals, list(d.reference))
+
+    def test_vfloor_reference_floors_negative_denormal_to_minus_one(self):
+        import vector_kernel_specs as vks
+        spec = vks.SPECS["vec_vfloor_bf16_denorm"]
+        d = spec.golden["direct"]
+        idx = d.inputs.index(0x8001)            # tiny negative denormal
+        self.assertEqual(d.reference[idx], 0xFFFFFFFF)  # floor(-tiny) = -1 (no FTZ)
+        idx0 = d.inputs.index(0x0001)           # tiny positive denormal
+        self.assertEqual(d.reference[idx0], 0)  # floor(+tiny) = 0
+
+    def test_convexp_reference_widens_denormal_without_flush(self):
+        import vector_kernel_specs as vks
+        spec = vks.SPECS["vec_convexp_bf16_denorm"]
+        d = spec.golden["direct"]
+        idx = d.inputs.index(0x0001)
+        self.assertEqual(d.reference[idx], 0x00010000)  # widened f32 denormal, not flushed

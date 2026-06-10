@@ -11,7 +11,9 @@ tools/golden/vector_ops.json (the Half-A corpus); the generator bakes the
 input/expected arrays from it so no expected value is ever transcribed by hand.
 """
 
-from gen_vector_kernel import Buf, KernelSpec, Matmul, SweepSpec, _silicon_path
+from gen_vector_kernel import (
+    Buf, DirectIO, KernelSpec, Matmul, SweepSpec, _silicon_path
+)
 
 SPECS = {}
 
@@ -37,6 +39,33 @@ def _reg_sweep(sweep):
 # none(0)/saturate(1)/symmetric(3).
 _ALL_RND = [0, 1, 2, 3, 8, 9, 10, 11, 12, 13]
 _ALL_SAT = [0, 1, 3]
+
+
+_DENORM_N = 256  # all 254 bf16 denormals + 0x0000 + 0x8000
+
+
+def _bf16_denorm_inputs():
+    """All 254 bf16 denormals (exp=0, mantissa 1..127, both signs) + +/-0."""
+    pos = [m for m in range(1, 128)]              # 0x0001..0x007F
+    neg = [0x8000 | m for m in range(1, 128)]     # 0x8001..0x807F
+    vals = pos + neg + [0x0000, 0x8000]
+    assert len(vals) == _DENORM_N
+    return tuple(vals)
+
+
+def _bf16_to_f32_bits(b):
+    """Exact bf16->f32 widen: bf16 is the high 16 bits of the f32 word."""
+    return (b & 0xFFFF) << 16
+
+
+def _bf16_floor_reference():
+    """No-FTZ floor(bf16) per lane as int32 two's-complement bit patterns."""
+    import math, struct
+    out = []
+    for b in _bf16_denorm_inputs():
+        f = struct.unpack("<f", struct.pack("<I", _bf16_to_f32_bits(b)))[0]
+        out.append(int(math.floor(f)) & 0xFFFFFFFF)
+    return tuple(out)
 
 
 def _is_normal_f32(rec):
@@ -543,6 +572,78 @@ _reg(KernelSpec(
     MMUL m;
     m.mul(a, b);
     aie::store_v(out + n * MMUL::size_C, m.to_vector<float>());
+  }
+  event1();
+""",
+))
+
+
+# === Convert FTZ-audit specs (Half-B phase C, silicon golden required) ========
+#
+# These two kernels audit whether the bf16 convert datapath flushes denormals to
+# zero (FTZ). Both feed the exhaustive bf16-denormal space (all 254 denormals +
+# +/-0) via DirectIO -- an input range no corpus class produces. EXP = HW-captured
+# silicon (via silicon_golden); the bootstrap reference is the no-FTZ widen/floor
+# computed here, which doubles as the divergence baseline. As with the phase-B
+# edge specs, the alignment assert in _bake_io guards against a stale capture
+# baking mismatched EXP once the silicon JSON is present.
+#
+# vec_vfloor_bf16_denorm is THE audit test. It emits a standalone VFLOOR.s32.bf16
+# (decodes to SemanticOp::Convert), which routes through vector_convert's
+# bf16->int32 branch (vector_convert.rs:343) where fp32_flush_to_zero is applied.
+# A negative bf16 denormal floors to -1 without FTZ vs 0 with it -- a clean -1-vs-0
+# discriminator.
+#
+# vec_convexp_bf16_denorm probes the bf16->f32 expand direction (new coverage;
+# phase B only narrowed f32->bf16). The expand CANNOT be isolated as a standalone
+# VCONV: Chess fuses it into VLDA.CONV.fp32.bf16, a load-convert. The emulator
+# special-cases that opcode in execute_fused_load_convert (memory/mod.rs:891-900)
+# with a pure bf16<<16 widen that already does NOT flush (it never calls
+# vector_convert). So this kernel does not exercise vector_convert's FTZ; it
+# silicon-validates the fused-load expand path and the new expand direction.
+_reg(KernelSpec(
+    name="vec_convexp_bf16_denorm", func="convexp_bf16", stem="convexp",
+    doc="bf16->f32 expand (fused VLDA.CONV.fp32.bf16, no FTZ), exhaustive bf16 "
+        "denormal inputs. EXP = HW-captured silicon.",
+    silicon_golden=_silicon_path("vec_convexp_bf16_denorm"),
+    inputs=[Buf("in", "uint16_t", "bf16", ktype="bfloat16")],
+    output=Buf("out", "uint32_t", "f32", ktype="float"),
+    n=_DENORM_N,
+    golden={"class": "direct",
+            "direct": DirectIO(inputs=_bf16_denorm_inputs(),
+                               reference=tuple(v << 16 for v in _bf16_denorm_inputs()))},
+    defines=[("CONV_N", _DENORM_N)],
+    body="""  event0();
+  for (int i = 0; i < CONV_N; i += 16) {
+    aie::vector<bfloat16, 16> v = aie::load_v<16>(in + i);
+    v16accfloat raw = ::ups_to_v16accfloat((v16bfloat16)v);
+    aie::accum<accfloat, 16> acc(raw);
+    aie::vector<float, 16> o = acc.to_vector<float>();
+    aie::store_v(out + i, o);
+  }
+  event1();
+""",
+))
+
+_reg(KernelSpec(
+    name="vec_vfloor_bf16_denorm", func="vfloor_bf16", stem="vfloor",
+    doc="bf16->int32 floor (standalone VFLOOR.s32.bf16), exhaustive bf16 denormal "
+        "inputs. Routes through vector_convert's FTZ (vector_convert.rs:343): neg "
+        "denormal floors to -1 without FTZ vs 0 with. EXP = HW-captured silicon.",
+    silicon_golden=_silicon_path("vec_vfloor_bf16_denorm"),
+    inputs=[Buf("in", "uint16_t", "bf16", ktype="bfloat16")],
+    output=Buf("out", "int32_t", "i32"),
+    n=_DENORM_N,
+    golden={"class": "direct",
+            "direct": DirectIO(inputs=_bf16_denorm_inputs(),
+                               reference=_bf16_floor_reference())},
+    defines=[("VFL_N", _DENORM_N)],
+    body="""  event0();
+  ::aie::set_rounding(aie::rounding_mode::floor);
+  for (int i = 0; i < VFL_N; i += 16) {
+    aie::vector<bfloat16, 16> v = aie::load_v<16>(in + i);
+    v16int32 o = ::bfloat16_to_int((v16bfloat16)v, 0);
+    aie::store_v(out + i, (aie::vector<int32, 16>)o);
   }
   event1();
 """,
