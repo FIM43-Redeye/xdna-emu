@@ -30,10 +30,31 @@ Deepening closes exactly that assumption.
 
 ---
 
-## A. Mode-exhaustive on silicon  [NEXT after compact]
+## A. Mode-exhaustive on silicon  [DONE 2026-06-10 -- 45/45 HW==EMU green]
 
-Run each class's **full mode space** on HW, not one representative -- the same move
-that caught pack.
+**Result:** generator extended with `SweepSpec` (commit `1008cde`); 45 mode-point
+kernels generated (SRS 10rnd x 3sat = 30, Convert 10rnd, Pack 3sat incl. the
+never-before-HW-tested symmetric point, UPS 2sat). Single full-bridge artifact
+`build/bridge-test-results/20260610/` (run log
+`build/experiments/vector-sweep-A/bridge-run-confirm.log`): **45/45 PASS on both
+Chess/HW and Chess/EMU**, 0 fail.
+
+**Bug the sweep flushed out (commit `26874db`):** the mode sweep recompiled the
+SRS kernel and Chess happened to emit a fused **post-increment** narrowing store
+`VST.SRS.s16.s64 cm0, s0, [p1], #32`. `get_store_address` assumed the pointer sat
+at `sources[1]`, but fused stores carry sources `[acc, shift, pointer]`, so it
+read the **shift register (=4) as the base address** and scattered the first 16
+outputs to ~0x4 -> output buffer zero -> all 30 SRS mode-points failed EMU while
+passing on silicon. Fixed by searching `sources` for the `PointerReg` (mirroring
+the already-correct fused-*load* path `get_address`); `post_modify` carries the
+increment. Two regression tests; `cargo test --lib` 3334 pass. This is a
+codegen-lottery latent bug -- the anchor `vec_srs_i32` passed earlier only
+because that compile emitted separate srs+store / indexed (`Memory{}`) stores. It
+validates the whole mode-exhaustive premise: a fresh compile surfaced a path no
+passing kernel had exercised.
+
+**Original plan text (retained for reference):** Run each class's **full mode
+space** on HW, not one representative -- the same move that caught pack.
 
 **Mode spaces to sweep:**
 - SRS: rounding {Floor, Ceil, Even/ConvEven, PosInf, NegInf, ...} x saturation
