@@ -5,13 +5,18 @@
 
 use std::collections::HashMap;
 
+use smallvec::SmallVec;
+
 use crate::interpreter::bundle::{Operand, PostModify};
 use crate::interpreter::state::SP_PTR_INDEX;
 #[cfg(test)]
 use crate::interpreter::state::{MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M};
-use xdna_archspec::aie2::isa::{
-    AddressingMode, InstrEncoding,
-    decoder_ffi::{self, DecodedOperand, DecodeResult},
+use xdna_archspec::aie2::{
+    Bypass,
+    isa::{
+        AddressingMode, InstrEncoding,
+        decoder_ffi::{self, DecodedOperand, DecodeResult},
+    },
 };
 use crate::interpreter::decode::register_map::{AccumWidth, operand_from_reg_name};
 #[cfg(test)]
@@ -71,7 +76,15 @@ impl InstructionDecoder {
     /// Try to decode a slot using LLVM FFI and build operands directly from
     /// LLVM's register names and output classification.
     ///
-    /// Returns (DecodedInstr, dest, sources, post_modify, opcode, extra_defs, accum_width) on success.
+    /// Returns
+    /// `(DecodedInstr, dest, sources, post_modify, opcode, extra_defs, accum_width,
+    ///   source_forward, result_bypass)` on success.
+    ///
+    /// `source_forward` is aligned 1:1 with `sources`: `source_forward[k]` is
+    /// `(use_cycle, use_bypass)` for `sources[k]`, from the register-aware
+    /// resolved itinerary.  `result_bypass` is the resolved def bypass for the
+    /// instruction's first (and typically only) def operand.
+    ///
     /// The DecodedInstr is still needed for build_slot_op() which reads
     /// metadata (semantic, element_type, etc.) from InstrEncoding.
     ///
@@ -91,6 +104,8 @@ impl InstructionDecoder {
         Option<u32>,
         Vec<Operand>,
         Option<AccumWidth>,
+        SmallVec<[(u8, Bypass); 4]>,
+        Bypass,
     )> {
         let ffi_slot = Self::slot_type_to_ffi(slot_type)?;
         let ffi_result = decoder_ffi::decode_slot(ffi_slot, bits)?;
@@ -117,12 +132,38 @@ impl InstructionDecoder {
         let (dest, sources, post_modify, extra_defs, accum_width) =
             Self::extract_operands_from_ffi(&ffi_result, encoding);
 
+        // Resolved register-aware forwarding (producer side): def bypass for this
+        // instruction's result.
+        let result_bypass = Bypass::from_forwarding_id(ffi_result.resolved_def_bypass());
+
+        // Resolved register-aware forwarding (consumer side): one (use_cycle,
+        // use_bypass) per source, from the itinerary at num_defs+k.
+        // source_forward is aligned 1:1 with the `sources` vec above, so k
+        // here indexes into `sources` (i.e. the extracted use operands, not the
+        // full MI operand list which includes defs first).
+        let mut source_forward: SmallVec<[(u8, Bypass); 4]> = SmallVec::new();
+        for k in 0..sources.len() {
+            let uc = ffi_result.resolved_use_cycle(k);
+            let ub = Bypass::from_forwarding_id(ffi_result.resolved_use_bypass_raw(k));
+            source_forward.push((uc, ub));
+        }
+
         // Build a minimal DecodedInstr with empty raw operands (we don't need
         // them since we're using LLVM's operands, but build_slot_op reads
         // encoding metadata from it).
         let decoded_instr = DecodedInstr { encoding: encoding.clone(), operands: HashMap::new() };
 
-        Some((decoded_instr, dest, sources, post_modify, Some(ffi_result.opcode), extra_defs, accum_width))
+        Some((
+            decoded_instr,
+            dest,
+            sources,
+            post_modify,
+            Some(ffi_result.opcode),
+            extra_defs,
+            accum_width,
+            source_forward,
+            result_bypass,
+        ))
     }
 
     /// Extract dest, sources, and post-modify from LLVM FFI decode result.

@@ -18,7 +18,10 @@
 use smallvec::SmallVec;
 
 // TableGen-derived semantic information and shared types
-use xdna_archspec::aie2::isa::{ImplicitReg, SemanticOp};
+use xdna_archspec::aie2::{
+    Bypass,
+    isa::{ImplicitReg, SemanticOp},
+};
 
 // Re-export types defined in tablegen::types so existing code using
 // crate::interpreter::bundle::{ElementType, BranchCondition, SelectVariant}
@@ -298,6 +301,17 @@ pub struct SlotOp {
     /// choose between 512-bit (bml/bmh) and 1024-bit (cm) read/write paths
     /// instead of the unreliable parity heuristic.
     pub accum_width: Option<crate::interpreter::decode::register_map::AccumWidth>,
+
+    /// Per-source forwarding metadata, aligned 1:1 with `sources`.
+    /// source_forward[k] = (use_cycle, use_bypass) for the consumer read of
+    /// sources[k], from the register-aware resolved itinerary at decode time.
+    /// Empty when the opcode has no itinerary data (legacy/synthetic ops) --
+    /// reads then fall back to read()/read_store() defaults.
+    pub source_forward: SmallVec<[(u8, Bypass); 4]>,
+    /// Resolved producer result (def) bypass class, from the register-aware
+    /// itinerary. Drives this op's vector-write forwarding visibility. No for
+    /// ops without a forwarding def.
+    pub result_bypass: Bypass,
 }
 
 // Core methods on SlotOp.
@@ -502,6 +516,8 @@ impl SlotOp {
             raw_opcode: None,
             llvm_opcode: None,
             accum_width: None,
+            source_forward: SmallVec::new(),
+            result_bypass: Bypass::No,
         }
     }
 
@@ -581,6 +597,8 @@ impl SlotOp {
             raw_opcode: None,
             llvm_opcode: None,
             accum_width: None,
+            source_forward: SmallVec::new(),
+            result_bypass: Bypass::No,
         }
     }
 }

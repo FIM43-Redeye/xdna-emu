@@ -743,9 +743,16 @@ impl CycleAccurateExecutor {
                 // network (visible to ALU consumers at issue+1 when MOV_Bypass,
                 // to stores at full latency). See VectorRegisterFile::resolve.
                 // Set per slot before dispatch so each write sees its own op.
+                //
+                // result_bypass is now the register-aware resolved bypass from
+                // the decoded SlotOp, populated in try_decode_via_ffi via
+                // Bypass::from_forwarding_id(ffi_result.resolved_def_bypass()).
+                // This correctly handles register-pair-variant opcodes like
+                // VMOV_mv_x (X<-BM must carry MOV bypass; the static per-opcode
+                // lookup from LatencyTable::def_bypass returned No for the base
+                // class and is no longer used here).
                 ctx.result_latency = self.operation_cycles(op);
-                ctx.result_bypass =
-                    op.llvm_opcode.map(|o| self.latencies.def_bypass(o)).unwrap_or(Bypass::No);
+                ctx.result_bypass = op.result_bypass;
 
                 // Reborrow neighbors for each slot operation
                 let slot_neighbors = neighbors.as_mut().map(|n| &mut **n);

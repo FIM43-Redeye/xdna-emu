@@ -96,6 +96,21 @@ pub enum Bypass {
     Vec,
 }
 
+impl Bypass {
+    /// Map an itinerary forwarding id to a bypass class for a VECTOR-REGISTER
+    /// result/operand: 0 -> No (NoBypass); nonzero -> Mov (MOV_Bypass). This
+    /// mapping is exact only for vector-register reads/writes (W/X file);
+    /// accumulator/CM-domain (VEC_Bypass) results go through the separate MAC
+    /// path -- see the FIXME(bypass-model) at queue_matmul_accum_write. When
+    /// that file joins this model, distinguish the Vec case here.
+    pub fn from_forwarding_id(id: u16) -> Bypass {
+        match id {
+            0 => Bypass::No,
+            _ => Bypass::Mov,
+        }
+    }
+}
+
 /// Instruction result-latency constants for the AIE2 core pipeline.
 ///
 /// These latencies are the cycles from instruction issue to when the result

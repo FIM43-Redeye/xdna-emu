@@ -3,8 +3,13 @@
 //! Builds `SlotOp` values with TableGen-derived metadata (semantic operation,
 //! element type, memory width, implicit registers, etc.).
 
+use smallvec::SmallVec;
+
 use crate::interpreter::bundle::{MemWidth, Operand, PostModify, SlotIndex, SlotOp};
-use xdna_archspec::aie2::isa::{CompositeEncoder, InstrMemWidth, OperandType, RegisterKind, SemanticOp};
+use xdna_archspec::aie2::{
+    Bypass,
+    isa::{CompositeEncoder, InstrMemWidth, OperandType, RegisterKind, SemanticOp},
+};
 
 use super::decoder::{DecodedInstr, InstructionDecoder};
 
@@ -15,6 +20,12 @@ impl InstructionDecoder {
     /// This method:
     /// 1. Sets the semantic operation from TableGen
     /// 2. Attaches implicit register uses/defs
+    /// 3. Populates resolved forwarding metadata (source_forward, result_bypass)
+    ///
+    /// `source_forward` must be aligned 1:1 with `sources`: it carries the
+    /// register-aware resolved `(use_cycle, use_bypass)` per source operand.
+    /// Pass an empty SmallVec for synthetic/legacy ops that have no itinerary.
+    /// `result_bypass` carries the resolved def bypass for this op's result.
     pub(super) fn build_slot_op(
         &self,
         slot_index: SlotIndex,
@@ -22,6 +33,8 @@ impl InstructionDecoder {
         dest: Option<Operand>,
         sources: Vec<Operand>,
         extracted_pm: Option<PostModify>,
+        source_forward: SmallVec<[(u8, Bypass); 4]>,
+        result_bypass: Bypass,
     ) -> SlotOp {
         let enc = &decoded.encoding;
 
@@ -122,6 +135,15 @@ impl InstructionDecoder {
         for src in sources {
             slot_op = slot_op.with_source(src);
         }
+
+        // Resolved register-aware forwarding metadata.
+        // source_forward is already aligned 1:1 with sources (populated in
+        // try_decode_via_ffi before the sources list is finalized). Empty for
+        // synthetic/legacy ops -- consumers fall back to read() defaults.
+        slot_op.source_forward = source_forward;
+        // Resolved producer def bypass: drives vector-write forwarding visibility
+        // for this op. Replaces the static per-opcode lookup from LatencyTable.
+        slot_op.result_bypass = result_bypass;
 
         slot_op
     }

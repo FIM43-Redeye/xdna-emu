@@ -383,11 +383,21 @@ impl Decoder for InstructionDecoder {
                     ffi_opcode,
                     extra_defs,
                     accum_width,
+                    source_forward,
+                    result_bypass,
                 )) = self.try_decode_via_ffi(slot.bits, slot.slot_type)
                 {
                     // LLVM FFI is the sole production decoder for both instruction
                     // identification and operand extraction.
-                    let mut slot_op = self.build_slot_op(slot_index, &decoded, dest, sources, extracted_pm);
+                    let mut slot_op = self.build_slot_op(
+                        slot_index,
+                        &decoded,
+                        dest,
+                        sources,
+                        extracted_pm,
+                        source_forward,
+                        result_bypass,
+                    );
                     slot_op.llvm_opcode = ffi_opcode;
                     slot_op.accum_width = accum_width;
                     // Attach secondary destinations (e.g., cmp register for
@@ -499,7 +509,8 @@ impl Decoder for InstructionDecoder {
 mod tests {
     use super::*;
     use crate::interpreter::bundle::ElementType;
-    use xdna_archspec::aie2::isa::OperandField;
+    use smallvec::SmallVec;
+    use xdna_archspec::aie2::{Bypass, isa::OperandField};
     use std::path::Path;
 
     #[test]
@@ -1023,19 +1034,43 @@ mod tests {
 
         // Vector load A (slot=lda, is_vector=true) -> Load + is_vector
         let decoded_vlda = DecodedInstr { encoding: make_load_enc("lda", true), operands: HashMap::new() };
-        let op = decoder.build_slot_op(SlotIndex::LoadA, &decoded_vlda, None, vec![], None);
+        let op = decoder.build_slot_op(
+            SlotIndex::LoadA,
+            &decoded_vlda,
+            None,
+            vec![],
+            None,
+            SmallVec::new(),
+            Bypass::No,
+        );
         assert_eq!(op.semantic, Some(SemanticOp::Load));
         assert!(op.is_vector, "slot=lda + is_vector should produce vector Load");
 
         // Vector load B (slot=ldb, is_vector=true) -> Load + is_vector
         let decoded_vldb = DecodedInstr { encoding: make_load_enc("ldb", true), operands: HashMap::new() };
-        let op = decoder.build_slot_op(SlotIndex::LoadB, &decoded_vldb, None, vec![], None);
+        let op = decoder.build_slot_op(
+            SlotIndex::LoadB,
+            &decoded_vldb,
+            None,
+            vec![],
+            None,
+            SmallVec::new(),
+            Bypass::No,
+        );
         assert_eq!(op.semantic, Some(SemanticOp::Load));
         assert!(op.is_vector, "slot=ldb + is_vector should produce vector Load");
 
         // Scalar load in lda slot (is_vector=false) -> Load + !is_vector
         let decoded_scl = DecodedInstr { encoding: make_load_enc("lda", false), operands: HashMap::new() };
-        let op = decoder.build_slot_op(SlotIndex::LoadA, &decoded_scl, None, vec![], None);
+        let op = decoder.build_slot_op(
+            SlotIndex::LoadA,
+            &decoded_scl,
+            None,
+            vec![],
+            None,
+            SmallVec::new(),
+            Bypass::No,
+        );
         assert_eq!(op.semantic, Some(SemanticOp::Load));
         assert!(!op.is_vector, "slot=lda + !is_vector should produce scalar Load");
 
@@ -1045,7 +1080,15 @@ mod tests {
         store_enc.may_load = false;
         store_enc.may_store = true;
         let decoded_vst = DecodedInstr { encoding: store_enc, operands: HashMap::new() };
-        let op = decoder.build_slot_op(SlotIndex::Store, &decoded_vst, None, vec![], None);
+        let op = decoder.build_slot_op(
+            SlotIndex::Store,
+            &decoded_vst,
+            None,
+            vec![],
+            None,
+            SmallVec::new(),
+            Bypass::No,
+        );
         assert_eq!(op.semantic, Some(SemanticOp::Store));
         assert!(op.is_vector, "slot=st + is_vector should produce vector Store");
     }
@@ -1268,7 +1311,7 @@ mod tests {
         enc.semantic = Some(semantic);
         let decoded = DecodedInstr { encoding: enc, operands: HashMap::new() };
         let decoder = InstructionDecoder::load_default();
-        decoder.build_slot_op(SlotIndex::Vector, &decoded, None, vec![], None)
+        decoder.build_slot_op(SlotIndex::Vector, &decoded, None, vec![], None, SmallVec::new(), Bypass::No)
     }
 
     /// Helper: assert a dispatch result matches expected SemanticOp.
@@ -1548,7 +1591,7 @@ mod tests {
 
                         match (ffi_result, legacy_result) {
                             (
-                                Some((_, ffi_dest, ffi_src, ffi_pm, _, _, _)),
+                                Some((_, ffi_dest, ffi_src, ffi_pm, _, _, _, _, _)),
                                 Some((_, leg_dest, leg_src, leg_pm)),
                             ) => {
                                 ffi_hits += 1;
@@ -1638,7 +1681,7 @@ mod tests {
                             let (dest, sources, pm, _) = decoder.extract_operands(&d);
                             (d, dest, sources, pm)
                         });
-                        if let (Some((_, fd, fs, fp, _, _, _)), Some((_, ld, ls, lp))) = (ffi, leg) {
+                        if let (Some((_, fd, fs, fp, _, _, _, _, _)), Some((_, ld, ls, lp))) = (ffi, leg) {
                             if fd == ld && fs == ls && fp == lp {
                                 continue;
                             }
@@ -1876,13 +1919,13 @@ mod tests {
 
                     let ffi_name = ffi
                         .as_ref()
-                        .map(|(d, _, _, _, _, _, _)| d.encoding.name.as_str())
+                        .map(|(d, _, _, _, _, _, _, _, _)| d.encoding.name.as_str())
                         .unwrap_or("FAIL");
                     let leg_name = leg.as_ref().map(|(n, _, _, _)| n.as_str()).unwrap_or("FAIL");
 
                     let ffi_ops = ffi
                         .as_ref()
-                        .map(|(_, d, s, p, _, _, _)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
+                        .map(|(_, d, s, p, _, _, _, _, _)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
                     let leg_ops =
                         leg.as_ref().map(|(_, d, s, p)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
 
@@ -1999,7 +2042,7 @@ mod tests {
 
         // Try FFI decoder
         let ffi_result = decoder.try_decode_via_ffi(mv_bits, SlotType::Mv);
-        if let Some((decoded, dest, sources, _, _, _, _)) = &ffi_result {
+        if let Some((decoded, dest, sources, _, _, _, _, _, _)) = &ffi_result {
             eprintln!(
                 "FFI decode: name={:?} mnemonic={:?} dest={:?} sources={:?}",
                 decoded.encoding.name, decoded.encoding.mnemonic, dest, sources
@@ -2251,5 +2294,110 @@ mod tests {
             "vsrs source (cm5) must decode to AccumReg, got sources={:?}",
             &srs_slot.sources[..]
         );
+    }
+
+    /// TDD anchor: VMOV x, bml (X<-BM, Mv slot encoding 0x36) must produce
+    /// `result_bypass == Bypass::Mov` on the decoded SlotOp.
+    ///
+    /// The static per-opcode lookup (based on the base schedule class II_VMOV_X)
+    /// returns `Bypass::No` for this variant.  The register-aware resolved
+    /// itinerary correctly returns `MOV_Bypass` (id 1).  This test verifies
+    /// the resolved value wins.
+    ///
+    /// Companion to `test_resolved_sched_class_bypass` in decoder_ffi.rs, which
+    /// proves the FFI itself returns id=1; this test proves the decode pipeline
+    /// threads it through to `SlotOp.result_bypass`.
+    #[test]
+    fn test_vmov_x_bml_result_bypass_is_mov() {
+        use xdna_archspec::aie2::Bypass;
+
+        let decoder = InstructionDecoder::load_default();
+
+        // VMOV_mv_x X<-BM: Mv slot bits 0x36.  Verified decodable in
+        // test_resolved_sched_class_bypass (decoder_ffi.rs).
+        let bytes: [u8; 4] = {
+            // I32_MV bundle: {0b00011[31:27], mv[21:0][26:5], 0b1[4], 0b1001[3:0]}
+            // bits[31:27]=0b00011 discriminates the MV slot in extract_32bit.
+            // bit[4]=1 and bits[3:0]=0x9 together form the low 5 bits (0x19).
+            // mv_bits=0x36 are placed at bits[26:5].
+            let word: u32 = (0b00011u32 << 27) | (0x36u32 << 5) | 0x19;
+            word.to_le_bytes()
+        };
+
+        let bundle = decoder.decode(&bytes, 0).expect("Should decode VMOV x, bml");
+
+        // The decoded instruction should occupy the Scalar1 (MV) slot.
+        let slot = bundle
+            .slots()
+            .iter()
+            .flatten()
+            .find(|s| !s.is_nop() && s.encoding_name.as_deref() == Some("vmov"))
+            .expect("VMOV x,bml should decode to a vmov SlotOp");
+
+        eprintln!(
+            "VMOV x,bml: encoding={:?} result_bypass={:?} llvm_opcode={:?}",
+            slot.encoding_name, slot.result_bypass, slot.llvm_opcode
+        );
+
+        assert_eq!(
+            slot.result_bypass,
+            Bypass::Mov,
+            "VMOV x,bml (X<-BM, 0x36) must carry Bypass::Mov from resolved itinerary; \
+             static per-opcode path would produce Bypass::No"
+        );
+    }
+
+    /// TDD anchor: source_forward aligned 1:1 with sources for VEXTRACT.
+    ///
+    /// VEXTRACT_D8 (Mv slot 0x35) has a vector source (x0) at source_idx 0.
+    /// The resolved itinerary marks it use_cycle=1, use_bypass=MOV (id 1).
+    /// After decode, `slot_op.source_forward.len()` must equal
+    /// `slot_op.sources.len()`, and the entry for the vector source must
+    /// match the FFI-resolved values.
+    #[test]
+    fn test_vextract_source_forward_aligned() {
+        use xdna_archspec::aie2::Bypass;
+
+        let decoder = InstructionDecoder::load_default();
+
+        // VEXTRACT_D8: Mv slot bits 0x35. Build a 32-bit I32_MV bundle.
+        // See test_vmov_x_bml_result_bypass_is_mov for the I32_MV encoding rationale.
+        let bytes: [u8; 4] = {
+            let word: u32 = (0b00011u32 << 27) | (0x35u32 << 5) | 0x19;
+            word.to_le_bytes()
+        };
+
+        let bundle = decoder.decode(&bytes, 0).expect("Should decode VEXTRACT_D8");
+
+        let slot = bundle
+            .slots()
+            .iter()
+            .flatten()
+            .find(|s| !s.is_nop() && s.encoding_name.as_deref().map_or(false, |n| n.starts_with("vextract")))
+            .expect("VEXTRACT_D8 should decode to a vextract SlotOp");
+
+        eprintln!(
+            "VEXTRACT: sources.len()={} source_forward.len()={} source_forward={:?}",
+            slot.sources.len(),
+            slot.source_forward.len(),
+            &slot.source_forward[..]
+        );
+
+        // Structural: source_forward must align 1:1 with sources.
+        assert_eq!(
+            slot.source_forward.len(),
+            slot.sources.len(),
+            "source_forward.len() must equal sources.len() for VEXTRACT_D8"
+        );
+
+        // The vector source x0 should appear as source 0 (first in uses()).
+        // Its resolved itinerary: use_cycle=1, use_bypass=MOV (id 1 -> Bypass::Mov).
+        if slot.sources.iter().any(|s| matches!(s, Operand::VectorReg(0))) {
+            let vec_src_idx = slot.sources.iter().position(|s| matches!(s, Operand::VectorReg(0))).unwrap();
+            let (uc, ub) = slot.source_forward[vec_src_idx];
+            eprintln!("  x0 source_forward[{}] = ({}, {:?})", vec_src_idx, uc, ub);
+            assert_eq!(uc, 1, "VEXTRACT x0 source use_cycle should be 1");
+            assert_eq!(ub, Bypass::Mov, "VEXTRACT x0 source use_bypass should be Bypass::Mov");
+        }
     }
 }
