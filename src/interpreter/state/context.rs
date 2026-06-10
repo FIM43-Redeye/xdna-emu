@@ -757,9 +757,10 @@ impl ExecutionContext {
     /// consumers (e.g. accumulator stores). If a kernel surfaces a tight
     /// MAC->MAC vs MAC->store accumulator-visibility split, fold the
     /// accumulator file into the same `(l_def, def_bypass)` resolution rule:
-    /// extract the `VEC_Bypass` id (see `LatencyTable::def_bypass`, which today
-    /// maps any nonzero id to `Mov` because only vector-register results query
-    /// it) and give `AccumulatorRegisterFile` the same in-flight overlay.
+    /// extract the `VEC_Bypass` id (see `Bypass::from_forwarding_id`, the live
+    /// mapping, which today collapses any nonzero id to `Mov` because only
+    /// vector-register results consume it) and give `AccumulatorRegisterFile`
+    /// the same in-flight overlay.
     pub fn queue_matmul_accum_write(&mut self, dest: Operand, value: [u64; 16], is_half: bool, latency: u64) {
         self.pending_writes.push(PendingWrite {
             dest,

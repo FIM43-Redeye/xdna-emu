@@ -237,6 +237,12 @@ impl LatencyTable {
     /// `VEC_Bypass` (which is accumulator-domain). When the accumulator file
     /// joins this model, the `Vec` case must be distinguished here -- see the
     /// FIXME at `ExecutionContext::queue_matmul_accum_write`.
+    ///
+    // TODO(task-7-cleanup): dead since the cycle_accurate switch to
+    // `op.result_bypass` (resolved per-instruction via `Bypass::from_forwarding_id`).
+    // This per-opcode-class lookup has no callers in src/ left; remove it together
+    // with the `llvm_def_bypass` field in Task 7. Do NOT re-wire it -- the resolved
+    // path supersedes it (it handles register-variant opcodes like VMOV_mv_x).
     pub fn def_bypass(&self, llvm_opcode: u32) -> Bypass {
         match self.llvm_def_bypass.get(llvm_opcode as usize) {
             Some(0) | None => Bypass::No,

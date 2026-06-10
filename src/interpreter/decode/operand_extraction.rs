@@ -141,6 +141,17 @@ impl InstructionDecoder {
         // source_forward is aligned 1:1 with the `sources` vec above, so k
         // here indexes into `sources` (i.e. the extracted use operands, not the
         // full MI operand list which includes defs first).
+        //
+        // FIXME(source-forward-memory-alignment): positional indexing into the
+        // resolved itinerary (resolved_use_cycle(k) / resolved_use_bypass_raw(k))
+        // is exact only for vector COMPUTE ops, where `sources` order matches the
+        // raw MI use-operand order. For MEMORY instructions, extract_operands_from_ffi
+        // merges/filters pointer and modifier operands, so sources[k] no longer maps
+        // to MI use k -- the forwarding pair recorded here may belong to a different
+        // operand. Benign today: the bypass model only reads source_forward for
+        // vector-register COMPUTE sources (stores fall back to the read_store()
+        // default). A future consumer over memory operands must fix the alignment
+        // (track the MI operand index per source rather than relying on position).
         let mut source_forward: SmallVec<[(u8, Bypass); 4]> = SmallVec::new();
         for k in 0..sources.len() {
             let uc = ffi_result.resolved_use_cycle(k);

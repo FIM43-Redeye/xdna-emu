@@ -2390,14 +2390,18 @@ mod tests {
             "source_forward.len() must equal sources.len() for VEXTRACT_D8"
         );
 
-        // The vector source x0 should appear as source 0 (first in uses()).
+        // The vector source x0 must appear as a source (first in uses()).
         // Its resolved itinerary: use_cycle=1, use_bypass=MOV (id 1 -> Bypass::Mov).
-        if slot.sources.iter().any(|s| matches!(s, Operand::VectorReg(0))) {
-            let vec_src_idx = slot.sources.iter().position(|s| matches!(s, Operand::VectorReg(0))).unwrap();
-            let (uc, ub) = slot.source_forward[vec_src_idx];
-            eprintln!("  x0 source_forward[{}] = ({}, {:?})", vec_src_idx, uc, ub);
-            assert_eq!(uc, 1, "VEXTRACT x0 source use_cycle should be 1");
-            assert_eq!(ub, Bypass::Mov, "VEXTRACT x0 source use_bypass should be Bypass::Mov");
-        }
+        // Assert unconditionally: a decode mismatch that drops x0 must fail loudly
+        // rather than silently skipping the forwarding checks.
+        let vec_src_idx = slot
+            .sources
+            .iter()
+            .position(|s| matches!(s, Operand::VectorReg(0)))
+            .expect("x0 must appear as a source of VEXTRACT_D8");
+        let (uc, ub) = slot.source_forward[vec_src_idx];
+        eprintln!("  x0 source_forward[{}] = ({}, {:?})", vec_src_idx, uc, ub);
+        assert_eq!(uc, 1, "VEXTRACT x0 source use_cycle should be 1");
+        assert_eq!(ub, Bypass::Mov, "VEXTRACT x0 source use_bypass should be Bypass::Mov");
     }
 }
