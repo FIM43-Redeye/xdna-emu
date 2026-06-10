@@ -140,6 +140,10 @@ pub enum InputPattern {
     /// Too complex to parse with regex (e.g. control packet headers).
     /// The hardware reference capture will provide the correct input.
     Opaque,
+    /// Literal little-endian bytes copied into the buffer verbatim;
+    /// truncated to the buffer length, zero-padded when shorter.
+    /// Programmatic input (e.g. fuzzer-generated); never parsed from test.cpp.
+    Bytes(Vec<u8>),
 }
 
 /// Parse a test.cpp file and extract buffer metadata.
@@ -746,6 +750,10 @@ pub fn generate_input_data(buf: &BufferDef) -> Vec<u8> {
             write_pattern(&mut data, buf.element_type, buf.size_elements, |i| start + (i as i64) * step);
         }
         InputPattern::Opaque => {} // Leave as zeros; hardware reference will catch mismatches
+        InputPattern::Bytes(bytes) => {
+            let n = bytes.len().min(byte_count);
+            data[..n].copy_from_slice(&bytes[..n]);
+        }
     }
 
     data
@@ -1154,6 +1162,57 @@ auto bo1_out = xrt::bo(device, OUT_SIZE * sizeof(int32_t),
         let data = generate_input_data(&buf);
         assert_eq!(data.len(), 16);
         assert!(data.iter().all(|&b| b == 0));
+    }
+
+    fn bytes_buf(size_elements: usize, element_type: ElementType, bytes: Vec<u8>) -> BufferDef {
+        BufferDef {
+            name: "test".to_string(),
+            group_id: 3,
+            size_elements,
+            element_type,
+            direction: BufferDir::Input,
+            input_pattern: InputPattern::Bytes(bytes),
+        }
+    }
+
+    #[test]
+    fn test_generate_bytes_shorter_pads_zeros() {
+        // 4 x i32 = 16-byte buffer; 5 literal bytes; rest zero-padded.
+        let buf = bytes_buf(4, ElementType::I32, vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+        let data = generate_input_data(&buf);
+        assert_eq!(data.len(), 16);
+        assert_eq!(&data[..5], &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+        assert!(data[5..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_generate_bytes_equal_length_round_trips() {
+        let bytes: Vec<u8> = (0..8).map(|i| 0x10 + i).collect();
+        let buf = bytes_buf(2, ElementType::I32, bytes.clone());
+        let data = generate_input_data(&buf);
+        assert_eq!(data, bytes);
+    }
+
+    #[test]
+    fn test_generate_bytes_longer_truncates() {
+        let bytes: Vec<u8> = (1..=12).collect();
+        let buf = bytes_buf(4, ElementType::I16, bytes); // 8-byte buffer
+        let data = generate_input_data(&buf);
+        assert_eq!(data.len(), 8);
+        assert_eq!(data, (1..=8).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn test_generate_bytes_element_type_irrelevant() {
+        // Literal bytes are copied verbatim regardless of element type;
+        // only total byte count (size_elements * elem_size) matters.
+        let bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let as_u8 = generate_input_data(&bytes_buf(4, ElementType::U8, bytes.clone()));
+        let as_i32 = generate_input_data(&bytes_buf(1, ElementType::I32, bytes.clone()));
+        let as_i16 = generate_input_data(&bytes_buf(2, ElementType::I16, bytes.clone()));
+        assert_eq!(as_u8, bytes);
+        assert_eq!(as_i32, bytes);
+        assert_eq!(as_i16, bytes);
     }
 
     #[test]
