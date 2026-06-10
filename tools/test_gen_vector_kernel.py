@@ -225,6 +225,28 @@ class TestKernelTypeSplit:
         assert "uint16_t *bufOut" in cpp
 
 
+class TestEdgePredicates:
+    def test_is_edge_f32_selects_nonnormal(self):
+        from vector_kernel_specs import _is_edge_f32
+        for v in (0x00010000, 0x7F800001, 0x7F800000, 0x00000000):
+            assert _is_edge_f32({"value": v})
+        assert not _is_edge_f32({"value": 0x3F800000})
+
+    def test_is_edge_is_complement_of_normal(self):
+        from vector_kernel_specs import _is_edge_f32, _is_normal_f32
+        for v in [0x0, 0x1, 0x00010000, 0x3F800000, 0x7F800000, 0x7F800001, 0xFF800000]:
+            assert _is_edge_f32({"value": v}) != _is_normal_f32({"value": v})
+
+    def test_has_overflow_expected(self):
+        from vector_kernel_specs import _has_overflow_expected, _all_expected_finite_f32
+        ovf = {"expected": [0x3F800000, 0x7F800000]}
+        fin = {"expected": [0x3F800000, 0x40000000]}
+        assert _has_overflow_expected(ovf)
+        assert not _has_overflow_expected(fin)
+        assert not _all_expected_finite_f32(ovf)
+        assert _all_expected_finite_f32(fin)
+
+
 class TestSelectRecordsPredicate:
     def test_predicate_filters_records_in_order(self):
         recs = [{"value": 1, "rnd": 12}, {"value": 2, "rnd": 12},

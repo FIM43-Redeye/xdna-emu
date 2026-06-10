@@ -67,6 +67,26 @@ def _all_expected_finite_f32(rec):
     return all(((bits >> 23) & 0xFF) != 0xFF for bits in rec["expected"])
 
 
+def _is_edge_f32(rec):
+    """The record's f32 bit pattern is NOT a normal finite number.
+
+    Exact complement of `_is_normal_f32`: zero/denormal (exp=0) and Inf/NaN
+    (exp=255) -- the inputs the phase-A conv kernel excluded. Where the execute
+    path's input FTZ and NaN handling can diverge from the aietools model.
+    """
+    return not _is_normal_f32(rec)
+
+
+def _has_overflow_expected(rec):
+    """At least one lane of `expected` (fp32 bit patterns) is Inf/NaN.
+
+    Complement of `_all_expected_finite_f32`: the bf16 matmul tiles whose result
+    overflows. The overflow lane's canonical NaN is mantissa=1 on silicon+emu but
+    mantissa=0x7F in the model, so these tiles need a silicon oracle.
+    """
+    return not _all_expected_finite_f32(rec)
+
+
 # --- SRS: accumulator (acc64) -> narrower vector (int16), shift-round-saturate.
 # This is the committed vec_srs_i32 kernel expressed as a spec; the generator
 # regenerates it bit-for-bit on the golden arrays (validation anchor).
