@@ -80,6 +80,21 @@ class Matmul:
         return self.M * self.N
 
 
+@dataclass(frozen=True)
+class DirectIO:
+    """Inputs supplied directly by the spec, bypassing the model corpus.
+
+    For kernels whose oracle is silicon (not the aietools model) and whose input
+    space (e.g. bf16 denormals) no corpus class produces. `inputs` are the host-
+    staged bit patterns; `reference` is a simple mathematical expectation (no-FTZ
+    widen/floor) used ONLY as a bootstrap EXP and a divergence baseline -- never
+    an oracle. The binding comparison is emulator-output vs captured silicon.
+    """
+
+    inputs: tuple
+    reference: tuple
+
+
 @dataclass
 class KernelSpec:
     """Everything needed to emit one vector-compute capture kernel.
@@ -478,17 +493,27 @@ def _load_silicon(spec):
 def _bake_io(spec, golden):
     """Select the spec's golden slice and bake (input, expected) arrays to N.
 
-    If `spec.silicon_golden` points to an existing silicon capture JSON, the
-    expected array is taken from its `silicon` field (not the model corpus) and
-    the inputs are cross-checked against the corpus slice (so a stale capture
-    that no longer matches can't silently bake mismatched EXP). When the file is
-    absent (bootstrap mode), the model corpus drives both arrays as usual.
+    A spec whose `golden` carries a `direct` DirectIO sources inputs and the
+    bootstrap reference straight from it (no corpus class) -- for kernels whose
+    oracle is silicon and whose input space (bf16 denormals) no corpus class
+    produces. Otherwise the model corpus drives both arrays.
+
+    In both cases, if `spec.silicon_golden` points to an existing silicon
+    capture JSON, the expected array is taken from its `silicon` field (not the
+    model/reference) and the inputs are cross-checked (so a stale capture that no
+    longer matches can't silently bake mismatched EXP). When the file is absent
+    (bootstrap mode), the model corpus / direct reference drives both arrays.
     """
     g = spec.golden
-    recs = select_records(golden[g["class"]], g["filt"], g.get("value_range"),
-                          predicate=g.get("predicate"))
-    in_vals = bake_array(recs, g.get("value_field", "value"), spec.n)
-    exp_vals = bake_array(recs, g.get("expected_field", "expected"), spec.n)
+    direct = g.get("direct")
+    if direct is not None:
+        in_vals = list(direct.inputs)
+        exp_vals = list(direct.reference)
+    else:
+        recs = select_records(golden[g["class"]], g["filt"], g.get("value_range"),
+                              predicate=g.get("predicate"))
+        in_vals = bake_array(recs, g.get("value_field", "value"), spec.n)
+        exp_vals = bake_array(recs, g.get("expected_field", "expected"), spec.n)
     sj = _load_silicon(spec)
     if sj is not None:
         assert sj["input"] == in_vals, \

@@ -9,12 +9,14 @@ golden arrays exactly.
 
 import json
 import os
+import tempfile
 import unittest
 from pathlib import Path
 
 import gen_vector_kernel as gen
 from gen_vector_kernel import (
     Buf,
+    DirectIO,
     KernelSpec,
     bake_array,
     render_test_cpp,
@@ -588,6 +590,48 @@ class TestEdgeSpecs:
         assert len(recs) >= spec.matmul.batch
         for r in recs[:spec.matmul.batch]:
             assert _has_overflow_expected(r)
+
+
+class TestDirectInput(unittest.TestCase):
+    """A spec whose `golden` carries a DirectIO sources its inputs and bootstrap
+    reference straight from the spec, bypassing the model corpus -- for kernels
+    (bf16 denormal convert) whose oracle is silicon and whose input space no
+    corpus class produces. The silicon-override block runs on top of the direct
+    path unchanged: a present capture overrides the expected array, gated by an
+    input-alignment cross-check."""
+
+    @staticmethod
+    def _direct_spec():
+        return KernelSpec(
+            name="vec_conv_bf16_direct",
+            func="conv_bf16",
+            doc="direct-input convert.",
+            inputs=[Buf("in", "uint16_t", "bf16", ktype="bfloat16")],
+            output=Buf("out", "uint32_t", "f32", ktype="float"),
+            n=4,
+            golden={"class": "direct",
+                    "direct": DirectIO(
+                        inputs=(1, 2, 0x8001, 0),
+                        reference=(0x10000, 0x20000, 0x80010000, 0))},
+            body="  // body\n",
+        )
+
+    def test_direct_bypasses_corpus(self):
+        # Empty corpus proves the class is never consulted on the direct path.
+        in_vals, exp_vals = gen._bake_io(self._direct_spec(), {})
+        self.assertEqual(in_vals, [1, 2, 0x8001, 0])
+        self.assertEqual(exp_vals, [0x10000, 0x20000, 0x80010000, 0])
+
+    def test_direct_silicon_overrides_reference(self):
+        spec = self._direct_spec()
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "sj.json")
+            with open(path, "w") as f:
+                json.dump({"input": [1, 2, 0x8001, 0],
+                           "silicon": [0, 0, 0x80000000, 0]}, f)
+            in_vals, exp_vals = gen._bake_io(gen.replace_silicon(spec, path), {})
+        self.assertEqual(in_vals, [1, 2, 0x8001, 0])
+        self.assertEqual(exp_vals, [0, 0, 0x80000000, 0])
 
 
 class TestKernelHeaderFormatting:
