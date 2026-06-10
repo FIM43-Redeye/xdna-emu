@@ -102,6 +102,35 @@ static void init_disassembler() {
     g_tii = new AIE2InstrInfo();
 }
 
+// Fill per-operand itinerary cycles + forwarding ids from g_iid for a given
+// itinerary entry, returning the count n (capped at AIE2_MAX_OPERANDS).
+//
+// OperandCycles and Forwardings are parallel arrays indexed by
+// FirstOperandCycle + i, matching MI operand order (defs then uses). Each may
+// be null independently, so guard both. Shared by the static path
+// (aie2_get_instr_info) and the register-aware resolved path
+// (fill_resolved_itinerary) so the fill logic lives in one place.
+//
+// Caller must ensure the itinerary is non-empty (!g_iid.isEmpty()), which
+// proves g_iid.Itineraries != nullptr; this helper does not re-check.
+static uint8_t fill_operand_arrays(const InstrItinerary &itin, int16_t *cycles,
+                                   uint16_t *bypass) {
+    unsigned n = (itin.LastOperandCycle > itin.FirstOperandCycle)
+                     ? (itin.LastOperandCycle - itin.FirstOperandCycle)
+                     : 0;
+    if (n > AIE2_MAX_OPERANDS)
+        n = AIE2_MAX_OPERANDS;
+    const bool have_cycles = g_iid.OperandCycles != nullptr;
+    const bool have_fwd = g_iid.Forwardings != nullptr;
+    for (unsigned i = 0; i < n; i++) {
+        if (have_cycles)
+            cycles[i] = (int16_t)g_iid.OperandCycles[itin.FirstOperandCycle + i];
+        if (have_fwd)
+            bypass[i] = (uint16_t)g_iid.Forwardings[itin.FirstOperandCycle + i];
+    }
+    return (uint8_t)n;
+}
+
 // Resolve the register-aware schedule class for a decoded MCInst and fill the
 // resolved per-operand itinerary (cycles + forwarding ids) into the result.
 //
@@ -116,6 +145,9 @@ static void fill_resolved_itinerary(const MCInst &mi, Aie2DecodeResult &result) 
         return;
 
     const MCInstrDesc &desc = g_mii->get(mi.getOpcode());
+    // res_num_defs is set from the descriptor regardless of itinerary
+    // availability: a consumer that sees res_num_operand_cycles == 0 (e.g. no
+    // itinerary) still gets a valid def count.
     result.res_num_defs = (uint8_t)desc.getNumDefs();
 
     // Build OperandRegInfo per operand from physical register ids. Non-register
@@ -134,30 +166,15 @@ static void fill_resolved_itinerary(const MCInst &mi, Aie2DecodeResult &result) 
     unsigned resolved_class =
         g_tii->getSchedClass(desc, ArrayRef<OperandRegInfo>(ops));
 
-    // Extract resolved per-operand cycles + forwardings exactly as
-    // aie2_get_instr_info does for the static class, but indexed at the
+    // Extract resolved per-operand cycles + forwardings, indexed at the
     // resolved class's FirstOperandCycle. The resolved class comes from LLVM's
     // own variant tables, so it is a valid itinerary index whenever the
     // itinerary is non-empty (Itineraries != nullptr).
     if (g_iid.isEmpty())
         return;
     const InstrItinerary &itin = g_iid.Itineraries[resolved_class];
-    unsigned n = (itin.LastOperandCycle > itin.FirstOperandCycle)
-                     ? (itin.LastOperandCycle - itin.FirstOperandCycle)
-                     : 0;
-    if (n > AIE2_MAX_OPERANDS)
-        n = AIE2_MAX_OPERANDS;
-    result.res_num_operand_cycles = (uint8_t)n;
-    const bool have_cycles = g_iid.OperandCycles != nullptr;
-    const bool have_fwd = g_iid.Forwardings != nullptr;
-    for (unsigned i = 0; i < n; i++) {
-        if (have_cycles)
-            result.res_operand_cycle[i] =
-                (int16_t)g_iid.OperandCycles[itin.FirstOperandCycle + i];
-        if (have_fwd)
-            result.res_operand_bypass[i] =
-                (uint16_t)g_iid.Forwardings[itin.FirstOperandCycle + i];
-    }
+    result.res_num_operand_cycles =
+        fill_operand_arrays(itin, result.res_operand_cycle, result.res_operand_bypass);
 }
 
 // Extract the slot-level MCInst from a bundle-level decode result.
@@ -210,6 +227,8 @@ static Aie2DecodeResult mcinst_to_result(const MCInst &mi) {
 
     // Register-aware resolved itinerary (cycles + forwardings). Must run with
     // the slot MCInst's operands available -- resolution is per-instruction.
+    // Runs once per decode (one getSchedClass + operand scan); acceptable for
+    // correctness-phase work, revisit if profiling shows it hot.
     fill_resolved_itinerary(mi, result);
 
     return result;
@@ -418,32 +437,15 @@ int aie2_get_instr_info(uint32_t opcode, Aie2InstrInfo *out) {
         if (stage_lat > 0)
             out->stage_latency = (int16_t)stage_lat;
 
-        // Per-operand itinerary cycles + forwarding ids. OperandCycles and
-        // Forwardings are parallel arrays indexed by FirstOperandCycle + i,
-        // matching MI operand order (defs then uses). def_bypass/latency stay
-        // as the operand-0 shorthands the producer side already uses.
-        //
-        // The enclosing !isEmpty() check already proves Itineraries != nullptr,
-        // so we don't re-guard it. OperandCycles/Forwardings can still each be
-        // null independently, so capture those once outside the loop.
+        // Per-operand itinerary cycles + forwarding ids (defs then uses).
+        // def_bypass/latency stay as the operand-0 shorthands the producer side
+        // already uses. The enclosing !isEmpty() check proves Itineraries !=
+        // nullptr; fill_operand_arrays handles the OperandCycles/Forwardings
+        // null guards.
         const InstrItinerary &itin = g_iid.Itineraries[sched_class];
-        unsigned n = (itin.LastOperandCycle > itin.FirstOperandCycle)
-                         ? (itin.LastOperandCycle - itin.FirstOperandCycle)
-                         : 0;
-        if (n > AIE2_MAX_OPERANDS)
-            n = AIE2_MAX_OPERANDS;
+        unsigned n = fill_operand_arrays(itin, out->operand_cycle, out->operand_bypass);
         out->num_operand_cycles = (uint8_t)n;
-        const bool have_cycles = g_iid.OperandCycles != nullptr;
-        const bool have_fwd = g_iid.Forwardings != nullptr;
-        for (unsigned i = 0; i < n; i++) {
-            if (have_cycles)
-                out->operand_cycle[i] =
-                    (int16_t)g_iid.OperandCycles[itin.FirstOperandCycle + i];
-            if (have_fwd)
-                out->operand_bypass[i] =
-                    (uint16_t)g_iid.Forwardings[itin.FirstOperandCycle + i];
-        }
-        if (n > 0 && have_fwd)
+        if (n > 0 && g_iid.Forwardings != nullptr)
             out->def_bypass = out->operand_bypass[0];
     }
 

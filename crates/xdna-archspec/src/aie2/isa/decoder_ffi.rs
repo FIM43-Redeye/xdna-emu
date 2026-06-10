@@ -165,6 +165,9 @@ impl DecodeResult {
     /// `VMOV x, bml` (X<-BM) the resolved class carries the MOV bypass (id 1),
     /// whereas the static base class would report 0. Mirrors
     /// [`InstrInfo::def_bypass`] but resolved per-instruction.
+    ///
+    /// Assumes operand 0 is the def, which holds for the forwarding-critical
+    /// instructions (AIE2 vector producers always have a def at index 0).
     pub fn resolved_def_bypass(&self) -> u16 {
         if self.res_num_operand_cycles >= 1 {
             self.res_operand_bypass[0]
