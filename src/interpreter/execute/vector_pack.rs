@@ -317,7 +317,7 @@ fn insert_lanes(reg: &mut [u32; 8], lanes: &[i64], bits: u32) {
 
 // ========== VectorAlu dispatch for Pack/Unpack ==========
 
-use crate::interpreter::bundle::{ElementType, SlotOp};
+use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::state::ExecutionContext;
 
 use super::vector_dispatch::VectorAlu;
@@ -372,28 +372,32 @@ impl VectorAlu {
             // The source lanes are split: lower lanes fill the low half
             // of the output, upper lanes fill the high half.
             //
-            // The compiler emits vldb+vunpack without NOPs because
-            // hardware scoreboarding stalls the unpack until the load
-            // completes. Force-commit all pending vector writes so the
-            // source data from a preceding vldb is visible.
-            ctx.force_commit_all_pending();
-
+            // II_VUNPACK reads its SOURCE at pipeline stage 7 (operand
+            // cycles [7,7,7] in AIE2Schedule.td), not at issue. The
+            // compiler exploits this: a preceding vldb's data is naturally
+            // visible (load latency 7), and producers of the source can be
+            // scheduled AFTER the vunpack (silicon-verified, fuzzer seed 7
+            // where a vsel 4 bundles later supplies the unpack source). So
+            // the read+compute is deferred to issue+6 via the pending-unpack
+            // queue; only the operand registers are captured here.
             let name = op.encoding_name.as_deref().unwrap_or("");
             let (bits_i, bits_o, signed) = unpack_widths_from_name(name);
 
-            // Read the 256-bit source (NOT wide -- it's a w-register).
-            let src = Self::get_vector_source(op, ctx, 0);
-
-            // Each output half holds 256/bits_o lanes. The second half
-            // reads from lane_start = 256/bits_o in the source.
-            let lanes_per_half = (256 / bits_o) as usize;
-            let result_lo = unpack_half(&src, 0, bits_i, bits_o, signed);
-            let result_hi = unpack_half(&src, lanes_per_half, bits_i, bits_o, signed);
-
-            let mut result = [0u32; 16];
-            result[..8].copy_from_slice(&result_lo);
-            result[8..].copy_from_slice(&result_hi);
-            Self::write_wide_vec_dest(op, ctx, result);
+            let src_reg = match op.sources.first() {
+                Some(Operand::VectorReg(r)) => *r,
+                other => {
+                    log::error!("[VECTOR] execute_unpack: expected VectorReg source, got {:?}", other);
+                    return true;
+                }
+            };
+            let dest_reg = match &op.dest {
+                Some(Operand::VectorReg(r)) => *r,
+                other => {
+                    log::error!("[VECTOR] execute_unpack: expected VectorReg dest, got {:?}", other);
+                    return true;
+                }
+            };
+            ctx.queue_pending_unpack(src_reg, dest_reg, bits_i, bits_o, signed);
         } else {
             let src = Self::get_vector_source(op, ctx, 0);
             let result = Self::vector_unpack_low(&src);
@@ -446,6 +450,53 @@ mod tests {
             200u32 as u8 as i8,
             "crSat=none must truncate 200 -> -56"
         );
+    }
+
+    /// II_VUNPACK reads its w-reg source at pipeline stage 7 (operand cycles
+    /// [7,7,7], AIE2Schedule.td), so a producer scheduled AFTER the vunpack
+    /// supplies the data. Silicon-verified: vector fuzzer seed 7 has Peano
+    /// emit `vunpack.s16.s8 x4, wl2` four bundles BEFORE the `vsel.8 x2, ...`
+    /// whose result the unpack consumes; NPU1 unpacks the vsel result.
+    /// Sampling at issue read the stale pre-vsel register.
+    #[test]
+    fn execute_unpack_samples_source_at_stage7_not_issue() {
+        let mut ctx = make_ctx();
+        // Committed (old) value: bytes 0x11. New value (written by a producer
+        // 4 bundles after the unpack issues): bytes 0xAA -> -86 sign-extended.
+        ctx.vector.write(2, [0x1111_1111; 8]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Unpack)
+            .as_vector(ElementType::Int8)
+            .with_dest(Operand::VectorReg(4))
+            .with_source(Operand::VectorReg(2));
+        op.is_wide_vector = true;
+        op.encoding_name = Some("vunpack.s16.s8".to_string());
+
+        // Issue the unpack at bundle 0.
+        ctx.vector.advance_bundle(0);
+        ctx.bundle_seq = 0;
+        VectorAlu::execute(&op, &mut ctx);
+
+        let step = |ctx: &mut ExecutionContext, b: u64| {
+            ctx.bundle_seq = b;
+            ctx.vector.advance_bundle(b);
+            ctx.process_pending_unpacks();
+        };
+
+        for b in 1..=3 {
+            step(&mut ctx, b);
+        }
+        // Producer (vsel, latency 2) writes the source register at bundle 4:
+        // architecturally visible at bundle 6 -- exactly the unpack read bundle.
+        ctx.vector
+            .queue_write(2, [0xAAAA_AAAA; 8], 2, crate::interpreter::state::Bypass::No);
+        for b in 4..=7 {
+            step(&mut ctx, b);
+        }
+
+        // Dest lands at issue+7: every i16 lane is sign-extend(0xAA) = 0xFFAA.
+        let dest = ctx.vector.read_wide(4);
+        assert_eq!(dest, [0xFFAA_FFAA; 16], "unpack must widen the post-producer source value");
     }
 
     // -- truncate --

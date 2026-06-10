@@ -716,6 +716,12 @@ impl CycleAccurateExecutor {
         // actually-issued bundle (stall pre-checks above return earlier), so
         // the clock tracks issued bundles, not stall cycles.
         ctx.advance_vector_bundle();
+
+        // Sample sources for VUNPACKs whose stage-7 read bundle arrived
+        // (after the vector clock advance so producer writes landing this
+        // bundle are visible, before slot execution).
+        ctx.process_pending_unpacks();
+
         ctx.begin_bundle();
 
         // Same-bundle scalar->shift forwarding. AIE2 writes an S register at

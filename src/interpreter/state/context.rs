@@ -136,6 +136,37 @@ pub struct PendingStore {
 const PARTIAL_WORD_STORE_DATA_LATENCY: u64 =
     xdna_archspec::aie2::processor::PARTIAL_STORE_DATA_LATENCY as u64;
 
+/// A deferred VUNPACK awaiting its late source-register read.
+///
+/// II_VUNPACK (AIE2Schedule.td) has OperandCycles=[7,7,7]: both the x-reg
+/// destination write AND the w-reg source read happen at pipeline stage 7.
+/// The compiler exploits the late read by scheduling the producer of the
+/// source register AFTER the vunpack (Peano emits `vunpack x4, wl2` four
+/// bundles before the `vsel.8 x2, ...` whose result it consumes; verified
+/// against NPU1 silicon, vector fuzzer seed 7). The unpack must therefore
+/// sample its source at issue+6 (one bundle before the cycle-7 write-back
+/// boundary, same rationale as PARTIAL_WORD_STORE_DATA_LATENCY) and land
+/// its destination at issue+7.
+#[derive(Debug, Clone)]
+pub struct PendingUnpack {
+    /// Source w-register index (256-bit), sampled at `ready_bundle`.
+    pub src_reg: u8,
+    /// Destination x-register index (512-bit pair base).
+    pub dest_reg: u8,
+    /// Input lane width in bits.
+    pub bits_i: u32,
+    /// Output lane width in bits.
+    pub bits_o: u32,
+    /// Sign-extend (true) vs zero-extend.
+    pub signed: bool,
+    /// Issued-bundle count (`bundle_seq`) at which the source is read.
+    pub ready_bundle: u64,
+}
+
+/// VUNPACK source-register read latency in issued bundles (II_VUNPACK
+/// operand cycle 7, sampled one bundle before write-back; see PendingUnpack).
+const VUNPACK_SRC_READ_LATENCY: u64 = 6;
+
 /// Maximum loop-body byte span for which the LE-bundle partial-word store is
 /// flushed on the zero-overhead-loop back-edge.
 ///
@@ -289,6 +320,10 @@ pub struct ExecutionContext {
     /// post-modify are computed at issue time; only the data read is deferred.
     pending_stores: Vec<PendingStore>,
 
+    // === Late-Read VUNPACK Pipeline ===
+    /// Deferred VUNPACKs awaiting their stage-7 source read (see PendingUnpack).
+    pending_unpacks: Vec<PendingUnpack>,
+
     // === Memory Bank Conflict Detection ===
     /// Bitmask of memory banks accessed by the core during this cycle.
     /// Bit N set = bank N was accessed via load/store. Compared against
@@ -432,6 +467,7 @@ impl ExecutionContext {
             result_bypass: Bypass::No,
             bundle_seq: 0,
             pending_stores: Vec::new(),
+            pending_unpacks: Vec::new(),
             cycle_core_banks: 0,
             srs_config: SrsConfig::default(),
         }
@@ -1059,6 +1095,62 @@ impl ExecutionContext {
     /// Check if there are pending stores waiting to commit.
     pub fn pending_stores_empty(&self) -> bool {
         self.pending_stores.is_empty()
+    }
+
+    /// Queue a VUNPACK for its stage-7 source read (see [`PendingUnpack`]).
+    ///
+    /// The source w-register is sampled `VUNPACK_SRC_READ_LATENCY` issued
+    /// bundles after issue; the x-register result lands one bundle later
+    /// (total dest latency 7, II_VUNPACK operand_cycles[0]).
+    pub fn queue_pending_unpack(
+        &mut self,
+        src_reg: u8,
+        dest_reg: u8,
+        bits_i: u32,
+        bits_o: u32,
+        signed: bool,
+    ) {
+        self.pending_unpacks.push(PendingUnpack {
+            src_reg,
+            dest_reg,
+            bits_i,
+            bits_o,
+            signed,
+            ready_bundle: self.bundle_seq + VUNPACK_SRC_READ_LATENCY,
+        });
+    }
+
+    /// Sample sources for pending VUNPACKs that reached their read bundle and
+    /// queue their destination writes. Call once per issued bundle, after
+    /// `advance_vector_bundle()` (so producer writes that land this bundle are
+    /// architecturally visible) and before slot execution.
+    pub fn process_pending_unpacks(&mut self) {
+        if self.pending_unpacks.is_empty() {
+            return;
+        }
+        let current = self.bundle_seq;
+        let mut ready: Vec<PendingUnpack> = Vec::new();
+        self.pending_unpacks.retain(|pu| {
+            if pu.ready_bundle <= current {
+                ready.push(pu.clone());
+                false
+            } else {
+                true
+            }
+        });
+        ready.sort_by_key(|pu| pu.ready_bundle);
+        for pu in ready {
+            use crate::interpreter::execute::vector_pack::unpack_half;
+            let src = self.vector.read(pu.src_reg);
+            let lanes_per_half = (256 / pu.bits_o) as usize;
+            let lo = unpack_half(&src, 0, pu.bits_i, pu.bits_o, pu.signed);
+            let hi = unpack_half(&src, lanes_per_half, pu.bits_i, pu.bits_o, pu.signed);
+            let mut result = [0u32; 16];
+            result[..8].copy_from_slice(&lo);
+            result[8..].copy_from_slice(&hi);
+            // Source read at issue+6, write-back at issue+7: one more bundle.
+            self.vector.queue_write_wide(pu.dest_reg, result, 1, Bypass::No);
+        }
     }
 
     /// Check if there are pending (deferred) register writes awaiting commit.
