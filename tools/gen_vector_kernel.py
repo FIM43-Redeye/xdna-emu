@@ -348,6 +348,7 @@ _TEST_CPP_TMPL = string.Template(
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <vector>
 
@@ -411,6 +412,14 @@ int main(int argc, const char *argv[]) {
 
   bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
+  // Always dump the raw output buffer (one value per line) so a HW run can be
+  // captured as a silicon golden. Harmless for model-golden kernels.
+  {
+    std::ofstream dump("out.txt");
+    for (int i = 0; i < N; i++)
+      dump << (int64_t)bufOut[i] << "\\n";
+  }
+
   int errors = 0;
   for (int i = 0; i < N; i++) {
     if (bufOut[i] != EXP[i]) {
@@ -458,6 +467,7 @@ _TEST_CPP_MATMUL_TMPL = string.Template(
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <vector>
 
@@ -527,6 +537,14 @@ int main(int argc, const char *argv[]) {
   }
 
   bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+  // Always dump the raw output buffer (one value per line) so a HW run can be
+  // captured as a silicon golden. Harmless for model-golden kernels.
+  {
+    std::ofstream dump("out.txt");
+    for (int i = 0; i < NC; i++)
+      dump << (int64_t)bufOut[i] << "\\n";
+  }
 
   int errors = 0;
   for (int i = 0; i < NC; i++) {

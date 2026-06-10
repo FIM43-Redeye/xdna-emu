@@ -8,8 +8,11 @@ golden arrays exactly.
 """
 
 import json
+import os
+import unittest
 from pathlib import Path
 
+import gen_vector_kernel as gen
 from gen_vector_kernel import (
     Buf,
     KernelSpec,
@@ -477,6 +480,26 @@ class TestModeSweep:
         outdir = generate(spec, GOLDEN, tmp_path)
         for fn in ["run.lit", "aie.mlir", "test.cpp", "srs.cc"]:
             assert (Path(outdir) / fn).is_file(), f"missing {fn}"
+
+
+class TestOutputDump(unittest.TestCase):
+    def setUp(self):
+        import os
+        gp = os.path.join(os.path.dirname(gen.__file__), "golden", "vector_ops.json")
+        self.golden = json.loads(open(gp).read())
+
+    def test_elementwise_harness_dumps_out_txt(self):
+        from vector_kernel_specs import SPECS
+        cpp = gen.render_test_cpp(SPECS["vec_srs_i32"], self.golden)
+        self.assertIn('std::ofstream', cpp)
+        self.assertIn('"out.txt"', cpp)
+        self.assertIn('for (int i = 0; i < N; i++)', cpp)
+
+    def test_matmul_harness_dumps_out_txt(self):
+        from vector_kernel_specs import SPECS
+        cpp = gen.render_test_cpp(SPECS["vec_mac_i8"], self.golden)
+        self.assertIn('std::ofstream', cpp)
+        self.assertIn('"out.txt"', cpp)
 
 
 class TestKernelHeaderFormatting:
