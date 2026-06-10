@@ -23,12 +23,6 @@ invocation of a given target, not one build overall. `cargo build` and
 `cargo build --release` can run concurrently -- cargo handles the
 locking between them. Don't run the same command twice concurrently.
 
-**Stale cargo warnings.** If `cargo build` prints
-`Plugin install failed: Read-only file system (os error 30)` but the
-filesystem is writable, it's a cached warning from a prior
-sandbox-blocked build. `cargo clean -p xdna-emu` (with the matching
-profile) flushes it.
-
 ## Code formatting
 
 The repo has a tuned `rustfmt.toml` at the root. Stable rustfmt only;
@@ -80,7 +74,7 @@ use filter arguments or single-test invocations.
 so output is both live-monitorable and logged:
 
 ```bash
-./scripts/isa-test.sh 2>&1 | tee /tmp/claude-1000/isa-test.log
+./scripts/isa-test.sh 2>&1 | tee /tmp/isa-test.log
 ```
 
 A bare redirect hides progress from both sides. (`/tmp` is fine here --
@@ -224,8 +218,8 @@ finds the current BDF.
 This PC cannot suspend and reboots often, which wipes `/tmp`. Tools
 live under `xdna-emu/tools/` or `xdna-emu/scripts/`. Experiment results
 go under `xdna-emu/build/experiments/` or `~/npu-work/experiments/`.
-Only truly ephemeral data (sandbox temp dirs for `cargo test`, log
-tees for a specific run) should use `/tmp/claude-1000/`.
+Only truly ephemeral data (log tees for a specific run, throwaway
+scratch) should use `/tmp`.
 
 ## Developer environment state
 

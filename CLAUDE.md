@@ -235,7 +235,6 @@ cargo run -- path/to/binary.xclbin
 ./scripts/run-tests.sh          # all tests (doc tests nice'd)
 ./scripts/run-tests.sh --lib    # fast: library tests only
 cargo test --lib                # direct
-TMPDIR=/tmp/claude-1000 cargo test --lib   # sandbox-safe (temp dirs)
 
 # Bridge tests (dual-compiler, requires XRT + NPU)
 ./scripts/emu-bridge-test.sh                    # full run
@@ -271,8 +270,7 @@ discover, compile (parallel), run HW (-j5), run EMU (-j nproc), report. Flags:
 
 **Backup: in-process xclbin runner** (`src/testing/xclbin_suite.rs`) runs
 xclbins against the emulator without XRT, for isolated subsystem testing.
-Driven from unit tests. **NEVER run a real-NPU capture inside the Claude Code
-sandbox** -- license checks and filesystem isolation will fail.
+Driven from unit tests.
 
 ## Tracing Ecosystem
 
@@ -395,13 +393,10 @@ command map, dev-environment state, formatting enforcement) are in
   --lib` unit tests are safe alongside (no hardware).
 - **Always `cargo test --lib` after changes.** A pass that regresses is a
   regression to fix before moving on.
-- **Sandbox**: use `TMPDIR=/tmp/claude-1000` for `cargo test` (default temp_dir
-  resolves to `/tmp` and trips sandbox isolation). Reach for
-  `dangerouslyDisableSandbox` only when genuinely blocked.
 - **Never put persistent work in `/tmp`** -- this PC reboots often and wipes it.
   Tools/scripts under `xdna-emu/{tools,scripts}/`; experiment output under
   `build/experiments/` or `~/npu-work/experiments/`. Only ephemeral logs/temp
-  dirs use `/tmp/claude-1000/`.
+  dirs use `/tmp`.
 - **Never pipe long-running commands** (`cargo build/test`, `dmesg -w`, test
   scripts) through `tail`/`head`/`grep` -- the filter buffers until EOF and
   appears to hang. Redirect to a file and Read it, or use `run_in_background`.
