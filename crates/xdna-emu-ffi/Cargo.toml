@@ -31,6 +31,3 @@ aiesim = ["dep:libloading"]
 
 [dev-dependencies]
 xdna-archspec = { path = "../xdna-archspec" }
-# aiesim breadth sweep reads a per-kernel input/expectation spec (JSON).
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"

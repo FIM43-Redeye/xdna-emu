@@ -4778,8 +4778,6 @@ dependencies = [
  "env_logger",
  "libloading",
  "log",
- "serde",
- "serde_json",
  "tempfile",
  "xdna-archspec",
  "xdna-emu",
