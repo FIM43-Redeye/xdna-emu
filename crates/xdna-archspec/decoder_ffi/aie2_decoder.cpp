@@ -30,6 +30,15 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/TargetParser/Triple.h"
 
+// CodeGen headers for register-aware schedule-class resolution. These pull in
+// AIE2InstrInfo (a TargetInstrInfo subclass) whose getSchedClass(desc,
+// operands) applies the TableGen ItineraryRegPairs override -- the same
+// resolution LLVM's scheduler uses. Provided by libLLVMAIECodeGen (already on
+// the link line via `llvm-config --libs aie`). clangd may flag these as
+// missing in-editor; they exist at build time.
+#include "AIE2InstrInfo.h"
+#include "AIEBaseInstrInfo.h"
+
 #include <cstring>
 #include <mutex>
 
@@ -48,6 +57,9 @@ static MCContext *g_ctx = nullptr;
 static MCDisassembler *g_disasm = nullptr;
 static MCInstrInfo *g_mii = nullptr;
 static InstrItineraryData g_iid;  // Legacy itinerary data for scheduling queries.
+// CodeGen InstrInfo, used only for register-aware schedule-class resolution
+// (getSchedClass(desc, operands)). Constructed once; never owns target state.
+static AIE2InstrInfo *g_tii = nullptr;
 
 static void init_disassembler() {
     // Register the AIE2 target (the llvm-aie build provides this).
@@ -83,6 +95,69 @@ static void init_disassembler() {
     // We need to explicitly request the "aie2" CPU's itineraries, which
     // contain per-instruction latencies via operand_cycles[].
     g_iid = g_sti->getInstrItineraryForCPU("aie2");
+
+    // CodeGen InstrInfo for register-aware schedule-class resolution. The
+    // no-arg ctor needs no target state; getSchedClass(desc, operands) reads
+    // only the generated variant tables and operand register classes.
+    g_tii = new AIE2InstrInfo();
+}
+
+// Resolve the register-aware schedule class for a decoded MCInst and fill the
+// resolved per-operand itinerary (cycles + forwarding ids) into the result.
+//
+// For register-pair-variant opcodes (e.g. VMOV_mv_x) the static base class
+// reports the wrong bypass; getSchedClass(desc, operands) applies the TableGen
+// ItineraryRegPairs override based on the operands' register classes, yielding
+// the same resolved class the LLVM scheduler uses. Operands are passed as
+// physical register ids (OperandRegInfo{Register(physReg)}), matching the MI
+// operand order so OperandRCRequirement.OpIdx lines up.
+static void fill_resolved_itinerary(const MCInst &mi, Aie2DecodeResult &result) {
+    if (!g_mii || !g_tii || mi.getOpcode() >= g_mii->getNumOpcodes())
+        return;
+
+    const MCInstrDesc &desc = g_mii->get(mi.getOpcode());
+    result.res_num_defs = (uint8_t)desc.getNumDefs();
+
+    // Build OperandRegInfo per operand from physical register ids. Non-register
+    // operands become a default OperandRegInfo (no Reg, no RC), which cannot
+    // satisfy any RC requirement -- so the variant falls back to the static
+    // class exactly as LLVM does.
+    SmallVector<OperandRegInfo, 8> ops;
+    for (unsigned i = 0; i < mi.getNumOperands(); i++) {
+        const MCOperand &op = mi.getOperand(i);
+        if (op.isReg() && op.getReg() != 0)
+            ops.emplace_back(Register(op.getReg()));
+        else
+            ops.emplace_back();
+    }
+
+    unsigned resolved_class =
+        g_tii->getSchedClass(desc, ArrayRef<OperandRegInfo>(ops));
+
+    // Extract resolved per-operand cycles + forwardings exactly as
+    // aie2_get_instr_info does for the static class, but indexed at the
+    // resolved class's FirstOperandCycle. The resolved class comes from LLVM's
+    // own variant tables, so it is a valid itinerary index whenever the
+    // itinerary is non-empty (Itineraries != nullptr).
+    if (g_iid.isEmpty())
+        return;
+    const InstrItinerary &itin = g_iid.Itineraries[resolved_class];
+    unsigned n = (itin.LastOperandCycle > itin.FirstOperandCycle)
+                     ? (itin.LastOperandCycle - itin.FirstOperandCycle)
+                     : 0;
+    if (n > AIE2_MAX_OPERANDS)
+        n = AIE2_MAX_OPERANDS;
+    result.res_num_operand_cycles = (uint8_t)n;
+    const bool have_cycles = g_iid.OperandCycles != nullptr;
+    const bool have_fwd = g_iid.Forwardings != nullptr;
+    for (unsigned i = 0; i < n; i++) {
+        if (have_cycles)
+            result.res_operand_cycle[i] =
+                (int16_t)g_iid.OperandCycles[itin.FirstOperandCycle + i];
+        if (have_fwd)
+            result.res_operand_bypass[i] =
+                (uint16_t)g_iid.Forwardings[itin.FirstOperandCycle + i];
+    }
 }
 
 // Extract the slot-level MCInst from a bundle-level decode result.
@@ -132,6 +207,11 @@ static Aie2DecodeResult mcinst_to_result(const MCInst &mi) {
             result.operands[i].kind = AIE2_OP_INVALID;
         }
     }
+
+    // Register-aware resolved itinerary (cycles + forwardings). Must run with
+    // the slot MCInst's operands available -- resolution is per-instruction.
+    fill_resolved_itinerary(mi, result);
+
     return result;
 }
 

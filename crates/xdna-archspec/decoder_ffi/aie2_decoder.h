@@ -36,6 +36,18 @@ struct Aie2DecodeResult {
     uint32_t num_operands;
     uint32_t num_defs;       // First num_defs operands are outputs (from MCInstrDesc)
     struct Aie2Operand operands[AIE2_MAX_OPERANDS];
+
+    // ── Register-aware resolved itinerary ──────────────────────────────
+    // For register-pair-variant opcodes (e.g. VMOV_mv_x) the correct
+    // forwarding/bypass depends on the actual operand register classes, not
+    // the static base schedule class. These fields carry the per-operand
+    // itinerary RESOLVED via AIE2InstrInfo::getSchedClass(desc, operands),
+    // matching what LLVM's scheduler uses. Indexed by MI operand position
+    // (defs then uses), valid for i < res_num_operand_cycles.
+    uint8_t res_num_defs;                          // = desc.getNumDefs()
+    uint8_t res_num_operand_cycles;                // valid entries below
+    int16_t res_operand_cycle[AIE2_MAX_OPERANDS];  // resolved operand cycles
+    uint16_t res_operand_bypass[AIE2_MAX_OPERANDS]; // resolved forwarding ids
 };
 
 // Slot identifiers (matching our slot table order).

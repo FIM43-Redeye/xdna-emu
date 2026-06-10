@@ -41,6 +41,8 @@ pub struct RawOperand {
 }
 
 /// Raw FFI decode result (mirrors Aie2DecodeResult).
+///
+/// Field order MUST match the C `struct Aie2DecodeResult` exactly.
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct RawDecodeResult {
@@ -49,6 +51,12 @@ pub struct RawDecodeResult {
     pub num_operands: u32,
     pub num_defs: u32,
     pub operands: [RawOperand; 16],
+    // Register-aware resolved itinerary (see C header). Indexed by MI operand
+    // position (defs then uses), valid for i < res_num_operand_cycles.
+    pub res_num_defs: u8,
+    pub res_num_operand_cycles: u8,
+    pub res_operand_cycle: [i16; AIE2_MAX_OPERANDS],
+    pub res_operand_bypass: [u16; AIE2_MAX_OPERANDS],
 }
 
 /// Slot identifiers (mirrors Aie2Slot in C header).
@@ -119,6 +127,23 @@ pub struct DecodeResult {
     pub num_defs: u32,
     /// All operands (first `num_defs` are outputs, rest are inputs).
     pub operands: Vec<DecodedOperand>,
+
+    // ── Register-aware resolved itinerary ──────────────────────────────
+    // For register-pair-variant opcodes (e.g. VMOV_mv_x) the correct
+    // forwarding/bypass depends on the *actual operand register classes*, not
+    // the static base schedule class. These carry the per-operand itinerary
+    // resolved via LLVM's `AIE2InstrInfo::getSchedClass(desc, operands)`,
+    // indexed by MI operand position (defs then uses).
+    /// Number of def (output) operands per the resolved descriptor.
+    pub res_num_defs: u8,
+    /// Number of valid entries in `res_operand_cycle` / `res_operand_bypass`.
+    pub res_num_operand_cycles: u8,
+    /// Resolved per-operand itinerary cycle numbers (MI operand order).
+    /// Valid only for indices `i < res_num_operand_cycles`.
+    pub res_operand_cycle: [i16; AIE2_MAX_OPERANDS],
+    /// Resolved per-operand forwarding ids (MI operand order). 0 = NoBypass.
+    /// Valid only for indices `i < res_num_operand_cycles`.
+    pub res_operand_bypass: [u16; AIE2_MAX_OPERANDS],
 }
 
 impl DecodeResult {
@@ -132,6 +157,47 @@ impl DecodeResult {
     pub fn uses(&self) -> &[DecodedOperand] {
         let n = (self.num_defs as usize).min(self.operands.len());
         &self.operands[n..]
+    }
+
+    /// Resolved forwarding id of result def operand 0 (0 = NoBypass).
+    ///
+    /// This is the field the register-pair-variant fix targets: for
+    /// `VMOV x, bml` (X<-BM) the resolved class carries the MOV bypass (id 1),
+    /// whereas the static base class would report 0. Mirrors
+    /// [`InstrInfo::def_bypass`] but resolved per-instruction.
+    pub fn resolved_def_bypass(&self) -> u16 {
+        if self.res_num_operand_cycles >= 1 {
+            self.res_operand_bypass[0]
+        } else {
+            0
+        }
+    }
+
+    /// Resolved use_cycle for source operand `source_idx` (0-based among
+    /// sources). Maps to itinerary operand index `res_num_defs + source_idx`.
+    /// Returns the conservative default 1 (read-at-issue) when out of range.
+    /// Mirrors [`InstrInfo::use_cycle`] but on the resolved arrays.
+    pub fn resolved_use_cycle(&self, source_idx: usize) -> u8 {
+        let mi = self.res_num_defs as usize + source_idx;
+        if mi < self.res_num_operand_cycles as usize {
+            let c = self.res_operand_cycle[mi];
+            if c >= 0 {
+                return c as u8;
+            }
+        }
+        1
+    }
+
+    /// Resolved raw forwarding id for source operand `source_idx`
+    /// (0 = NoBypass). Maps to itinerary operand index
+    /// `res_num_defs + source_idx`. Mirrors [`InstrInfo::use_bypass_raw`] but
+    /// on the resolved arrays.
+    pub fn resolved_use_bypass_raw(&self, source_idx: usize) -> u16 {
+        let mi = self.res_num_defs as usize + source_idx;
+        if mi < self.res_num_operand_cycles as usize {
+            return self.res_operand_bypass[mi];
+        }
+        0
     }
 }
 
@@ -185,7 +251,16 @@ pub fn decode_slot(slot: Slot, insn_bits: u64) -> Option<DecodeResult> {
         }
     }
 
-    Some(DecodeResult { name, opcode: raw.opcode, num_defs: raw.num_defs, operands })
+    Some(DecodeResult {
+        name,
+        opcode: raw.opcode,
+        num_defs: raw.num_defs,
+        operands,
+        res_num_defs: raw.res_num_defs,
+        res_num_operand_cycles: raw.res_num_operand_cycles,
+        res_operand_cycle: raw.res_operand_cycle,
+        res_operand_bypass: raw.res_operand_bypass,
+    })
 }
 
 /// Decode a slot and return just the instruction name (legacy interface).
@@ -820,5 +895,105 @@ mod tests {
         assert!(found_load, "Should have found a load instruction with latency");
         assert!(found_store, "Should have found a store instruction with latency");
         assert!(found_vmac, "Should have found a VMAC instruction with latency");
+    }
+
+    /// Register-aware sched-class resolution in the decode path.
+    ///
+    /// LOAD-BEARING FACT: for register-pair-variant opcodes the correct
+    /// forwarding/bypass depends on the *actual operand register classes*, not
+    /// the static base schedule class. `VMOV_mv_x` base class II_VMOV_X has
+    /// def bypass NoBypass [0,0]; the X<-BM operand case overrides to
+    /// II_VMOV_X_XM_BM = [MOV_Bypass, NoBypass] = [1,0]. The decode path must
+    /// run LLVM's `AIE2InstrInfo::getSchedClass(desc, operands)` per instruction
+    /// so the resolved arrays reflect the operand-class-specific variant.
+    ///
+    /// This test FAILS against the static base class (which yields def bypass 0
+    /// for X<-BM) and PASSES only when the FFI resolves the variant. The
+    /// X<-BM / BM<-BM discrimination proves the resolution is genuinely
+    /// register-class-aware, not an unconditional MOV stamp.
+    ///
+    /// Encodings discovered via brute-force slot probe (see git history):
+    /// VMOV_mv_x X<-BM @ Mv/0x36, BM<-BM @ Mv/0x10036.
+    #[test]
+    fn test_resolved_sched_class_bypass() {
+        assert!(init());
+
+        // ---- VMOV x, bml (X<-BM): THE fix. -------------------------------
+        // Resolves to II_VMOV_X_XM_BM -> def bypass MOV (id 1). The static base
+        // class II_VMOV_X would report 0 here.
+        let xbm = decode_slot(Slot::Mv, 0x36).expect("VMOV x,bml should decode");
+        assert_eq!(xbm.name, "VMOV_mv_x", "expected VMOV_mv_x, got {}", xbm.name);
+        println!(
+            "X<-BM   {} (op {}): nd={} noc={} res_bypass={:?} res_cycle={:?}",
+            xbm.name,
+            xbm.opcode,
+            xbm.res_num_defs,
+            xbm.res_num_operand_cycles,
+            &xbm.res_operand_bypass[..xbm.res_num_operand_cycles as usize],
+            &xbm.res_operand_cycle[..xbm.res_num_operand_cycles as usize],
+        );
+        assert!(
+            xbm.res_num_operand_cycles as usize >= 1,
+            "{}: resolved itinerary must model the def slot",
+            xbm.name,
+        );
+        assert_eq!(
+            xbm.resolved_def_bypass(),
+            1,
+            "{}: X<-BM def must carry MOV bypass (id 1) -- register-aware resolution",
+            xbm.name,
+        );
+
+        // ---- VMOV bm, bm (BM<-BM): discriminator. ------------------------
+        // Resolves to II_VMOV_X_BM_BM -> NoBypass (id 0). Proves the resolution
+        // discriminates by operand register class, not always-MOV.
+        let bmbm = decode_slot(Slot::Mv, 0x10036).expect("VMOV bm,bm should decode");
+        assert_eq!(bmbm.name, "VMOV_mv_x", "expected VMOV_mv_x, got {}", bmbm.name);
+        println!(
+            "BM<-BM  {} (op {}): nd={} noc={} res_bypass={:?}",
+            bmbm.name,
+            bmbm.opcode,
+            bmbm.res_num_defs,
+            bmbm.res_num_operand_cycles,
+            &bmbm.res_operand_bypass[..bmbm.res_num_operand_cycles as usize],
+        );
+        assert_eq!(
+            bmbm.resolved_def_bypass(),
+            0,
+            "{}: BM<-BM def must NOT carry a bypass (id 0) -- discriminates by regclass",
+            bmbm.name,
+        );
+
+        // ---- VEXTRACT compute consumer: resolved vector-source use bypass. --
+        // The vector source $s1 forwards at issue+1 via the MOV bypass; the
+        // resolved use_bypass at (res_num_defs + source_idx) must read id 1.
+        let vext = decode_slot(Slot::Mv, 0x35).expect("VEXTRACT_D8 should decode");
+        assert!(vext.name.starts_with("VEXTRACT_"), "expected VEXTRACT, got {}", vext.name);
+        let vext_src = vext
+            .uses()
+            .iter()
+            .position(|op| matches!(op, DecodedOperand::Reg { name, .. } if name == "x0"))
+            .expect("x0 source in VEXTRACT uses");
+        println!(
+            "VEXTRACT {} (op {}): nd={} noc={} src x0 -> use_bypass={} use_cycle={}",
+            vext.name,
+            vext.opcode,
+            vext.res_num_defs,
+            vext.res_num_operand_cycles,
+            vext.resolved_use_bypass_raw(vext_src),
+            vext.resolved_use_cycle(vext_src),
+        );
+        assert_eq!(
+            vext.resolved_use_bypass_raw(vext_src),
+            1,
+            "{}: vector source should carry the MOV bypass (forward at issue+1)",
+            vext.name,
+        );
+        assert_eq!(
+            vext.resolved_use_cycle(vext_src),
+            1,
+            "{}: vector source use_cycle should be 1",
+            vext.name,
+        );
     }
 }
