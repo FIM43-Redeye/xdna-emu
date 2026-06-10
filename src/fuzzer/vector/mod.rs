@@ -6,5 +6,7 @@
 //! the Peano-reach spike (`docs/superpowers/specs/2026-06-10-vector-fuzzer-spike-findings.md`);
 //! every listed family compiles to native AIE2 vector code (no scalar loops).
 
+pub mod chain;
+pub mod gen;
 pub mod ledger;
 pub mod table;
