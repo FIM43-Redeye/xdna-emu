@@ -121,16 +121,43 @@ these blanket-FTZ paths (added in `ef77756` as an unvalidated accuracy-era
 generalization) are suspect. Author VCONV/vfloor/expand denormal kernels in C and
 confirm on silicon while Phoenix is available.
 
-## C. Op breadth on silicon
+## C. Op breadth on silicon  [DONE 2026-06-10 -- convert FTZ audit; bug fixed]
 
-- Ops not yet HW-captured: shuffle **routing** (Half-A enum-verified, routing
-  HW-gated), vsel, vcmp, vshift, vmin/vmax, reductions.
-- Author kernels per op; HW-capture; fix divergences. Breadth, not depth.
-- **Convert FTZ-path audit (migrated from B):** silicon proved the `VST.CONV`
-  narrow-convert does NOT flush-to-zero, but `vector_convert.rs` still FTZs the
-  separate `VCONV` f32->bf16, bf16->f32 expand (line 272), and `vfloor` bf16->s32
-  (line 342) paths -- untested, blanket-applied in `ef77756`. Author denormal-input
-  kernels driving those specific instructions; confirm whether silicon FTZs there.
+**Scope (Maya's call):** Phase C reduced to the **convert FTZ-path audit only**;
+op breadth (shuffle routing, vsel/vcmp/vshift/min-max/reductions) folds into the
+phase-D fuzzer (#112) rather than hand-authored kernels.
+
+**Result -- the audit caught a real bug.** Two silicon kernels on NPU1 Phoenix
+(exhaustive bf16 denormal sweep: all 254 denormals + +/-0), via the phase-B
+silicon-golden tier + a new generator direct-input mode (`DirectIO`):
+- **`vec_vfloor_bf16_denorm`** (standalone `VFLOOR.s32.bf16`): silicon floors a
+  tiny negative bf16 denormal to **-1**; the emulator FTZ'd it to **0** -> EMU
+  FAIL. **Silicon does NOT flush-to-zero.**
+- **`vec_convexp_bf16_denorm`** (bf16->f32 expand): Chess fuses this into
+  `VLDA.CONV.fp32.bf16` (no standalone `VCONV` for a load->store kernel). Silicon
+  widens denormals (`0x8001`->`0x80010000`, sign preserved); the emulator's
+  fused-load path (`memory/mod.rs:891-900`) already did no-FTZ -> EMU PASS,
+  silicon-validated. (The bf16->f32 *expand* direction is new coverage; phase B
+  only did f32->bf16 narrowing.)
+
+**The bug + fix (`506e7cb`).** Root cause was NOT the `vector_convert` branch this
+plan originally named. The compiled VFLOOR routes through a **separate wide-path
+implementation, `vector_floor_bf16_to_s32` (`vector_arith.rs:1209`)**, which had
+its own `fp32_flush_to_zero`. The first attempt patched `vector_convert` (unit
+test passed) but the bridge EMU re-verify still FAILed -- end-to-end verification
+caught the wrong-function fix before it shipped. Removed the FTZ from the real
+path **and** the parallel `vector_convert` bf16->f32 / f32->bf16 / bf16->int32
+branches (silicon-grounded; f32->bf16 also grounded in phase B's fused-store
+finding). Both kernels now **EMU == silicon**; `cargo test --lib` 3340 pass. The
+f32->int FTZ is kept as a **documented provable no-op** (`97bf60b`): an f32
+denormal truncates to 0 either way.
+
+**Deferred (hardware instability 2026-06-10 -- mainboard/GPU faulty, board swap
+imminent):** the broader bf16-family EMU regression sweep and the two-stage code
+review of the fix. The fix is already verified (unit 3340 + both kernels
+EMU==silicon); these are extra-confidence steps for when the box is stable.
+Commit chain: `dfc0490`..`97bf60b` (direct-input mode, audit specs, silicon
+goldens `3526869`, fix `506e7cb`, f32->int doc `97bf60b`).
 
 ## D. Vector differential fuzzer  [gold standard, biggest build]
 
