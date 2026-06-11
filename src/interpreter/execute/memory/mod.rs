@@ -823,6 +823,19 @@ impl MemoryUnit {
         None
     }
 
+    /// Find the S-register shift operand, mirroring `get_shift_amount`'s
+    /// operand precedence (an Immediate shift means no register sample).
+    fn get_shift_scalar_reg(op: &SlotOp) -> Option<u8> {
+        for src in &op.sources {
+            match src {
+                Operand::Immediate(_) => return None,
+                Operand::ScalarReg(r) => return Some(*r),
+                _ => {}
+            }
+        }
+        None
+    }
+
     // ========== Fused load+compute handlers ==========
 
     /// Execute `vlda.ups`: load from memory, upshift to accumulator.
@@ -837,7 +850,6 @@ impl MemoryUnit {
         post_modify: &PostModify,
     ) {
         let vec_data = Self::fused_load_vector(op, ctx, tile);
-        let shift = Self::get_shift_amount(op, ctx);
         let from = op.from_type.unwrap_or(ElementType::Int16);
         let to = op.element_type.unwrap_or(ElementType::Int32);
 
@@ -848,12 +860,25 @@ impl MemoryUnit {
 
         match &op.dest {
             Some(Operand::AccumReg(r)) => {
-                if is_half {
-                    let acc = super::vector_ups::ups_vector_to_acc(&vec_data, shift, from, to);
-                    ctx.accumulator.write(*r, acc);
+                // II_VLDA_UPS reads its shift S-register at operand cycle 7
+                // (issue+6), not at issue: the UPS conversion happens after
+                // the load data returns, and the compiler schedules the
+                // shift-setup `mov sN` AFTER the vlda.ups it controls
+                // (verified against NPU1 silicon, vector fuzzer seeds
+                // 1142-1448). Defer the conversion so the shift is sampled
+                // at the stage-7 bundle. Immediate shifts have no register
+                // to sample and convert at issue.
+                if let Some(s) = Self::get_shift_scalar_reg(op) {
+                    ctx.queue_pending_ups_load(vec_data, s, *r, from, to, is_half);
                 } else {
-                    let acc_wide = super::vector_ups::ups_vector_to_acc_wide(&vec_data, shift, from, to);
-                    ctx.accumulator.write_wide(*r, acc_wide);
+                    let shift = Self::get_shift_amount(op, ctx);
+                    if is_half {
+                        let acc = super::vector_ups::ups_vector_to_acc(&vec_data, shift, from, to);
+                        ctx.accumulator.write(*r, acc);
+                    } else {
+                        let acc_wide = super::vector_ups::ups_vector_to_acc_wide(&vec_data, shift, from, to);
+                        ctx.accumulator.write_wide(*r, acc_wide);
+                    }
                 }
             }
             other => {
@@ -3148,6 +3173,11 @@ mod tests {
 
         MemoryUnit::execute(&ups_op, &mut ctx, &mut tile, None, None);
 
+        // The UPS shift register is sampled at issue+6 (II_VLDA_UPS operand
+        // cycle 7); advance the bundle clock and process the deferred load.
+        ctx.bundle_seq += 6;
+        ctx.process_pending_ups_loads();
+
         // Verify accumulator has non-zero data
         let acc = ctx.accumulator.read_wide(0);
         assert!(acc.iter().any(|&v| v != 0), "UPS should produce non-zero accumulator data");
@@ -3212,6 +3242,10 @@ mod tests {
         ups_op.is_vector = true;
 
         MemoryUnit::execute(&ups_op, &mut ctx, &mut tile, None, None);
+
+        // Stage-7 shift sample: advance and process the deferred UPS load.
+        ctx.bundle_seq += 6;
+        ctx.process_pending_ups_loads();
 
         // SRS with s0 = 0 (unchanged)
         let mut srs_op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Srs)
@@ -3279,6 +3313,10 @@ mod tests {
 
         let handled = MemoryUnit::execute(&ups, &mut ctx, &mut tile, None, None);
         assert!(handled, "post-increment vlda.ups must be handled by the fused-load path");
+
+        // Stage-7 shift sample: advance and process the deferred UPS load.
+        ctx.bundle_seq += 6;
+        ctx.process_pending_ups_loads();
 
         // Accumulator holds the loaded int32 values (widened to acc64), not zeros.
         let acc = ctx.accumulator.read(0);

@@ -197,6 +197,41 @@ pub struct PendingAccAdd {
 /// cycle 3, sampled one bundle before the boundary; see PendingAccAdd).
 const VACC_SRC_READ_LATENCY: u64 = 2;
 
+/// A deferred fused `vlda.ups` awaiting its stage-7 shift-register read.
+///
+/// II_VLDA_UPS (AIE2Schedule.td) reads its shift S-register at operand
+/// cycle 7, not at issue (OperandCycles `[9,7,1,1,...]`: acc dest at 9,
+/// S-reg at 7). The conversion happens after the load data returns, so the
+/// compiler schedules the `mov sN, rM` that sets the shift several bundles
+/// AFTER the vlda.ups it controls. Sampling at issue read the stale shift
+/// (verified against NPU1 silicon, vector fuzzer seeds 1142-1448: upshift
+/// modes 1-7 produced the unshifted input). The load data, destination, and
+/// element types are resolved at issue; only the shift amount is sampled at
+/// issue+6, one bundle before the cycle-7 boundary (same rationale as
+/// PendingUnpack). Plain register II_VUPS reads its shift at issue and is
+/// not deferred.
+#[derive(Debug, Clone)]
+pub struct PendingUpsLoad {
+    /// Vector data loaded from memory at issue.
+    pub vec_data: [u32; 8],
+    /// S-register holding the shift amount, sampled at `ready_bundle`.
+    pub shift_reg: u8,
+    /// Destination accumulator register.
+    pub dest_reg: u8,
+    /// Input element type.
+    pub from: xdna_archspec::aie2::isa::ElementType,
+    /// Output (accumulator lane) element type.
+    pub to: xdna_archspec::aie2::isa::ElementType,
+    /// Half (bml/bmh, 512-bit) vs full cm (1024-bit) destination.
+    pub is_half: bool,
+    /// Issued-bundle count at which the shift register is read.
+    pub ready_bundle: u64,
+}
+
+/// VLDA.UPS shift-register read latency in issued bundles (operand cycle 7,
+/// sampled one bundle before the boundary; see PendingUpsLoad).
+const VLDA_UPS_SHIFT_READ_LATENCY: u64 = 6;
+
 /// Maximum loop-body byte span for which the LE-bundle partial-word store is
 /// flushed on the zero-overhead-loop back-edge.
 ///
@@ -358,6 +393,10 @@ pub struct ExecutionContext {
     /// (see PendingAccAdd).
     pending_acc_adds: Vec<PendingAccAdd>,
 
+    /// Deferred fused vlda.ups awaiting their stage-7 shift read
+    /// (see PendingUpsLoad).
+    pending_ups_loads: Vec<PendingUpsLoad>,
+
     // === Memory Bank Conflict Detection ===
     /// Bitmask of memory banks accessed by the core during this cycle.
     /// Bit N set = bank N was accessed via load/store. Compared against
@@ -503,6 +542,7 @@ impl ExecutionContext {
             pending_stores: Vec::new(),
             pending_unpacks: Vec::new(),
             pending_acc_adds: Vec::new(),
+            pending_ups_loads: Vec::new(),
             cycle_core_banks: 0,
             srs_config: SrsConfig::default(),
         }
@@ -1253,6 +1293,61 @@ impl ExecutionContext {
                     result[i] = Self::acc_add_sub_lane_pair(a1[i], a2[i], &pa);
                 }
                 self.accumulator.write(pa.dst_reg, result);
+            }
+        }
+    }
+
+    /// Queue a fused `vlda.ups` for its stage-7 shift-register read (see
+    /// [`PendingUpsLoad`]). Load data and destination are resolved at issue;
+    /// only the shift amount is sampled at issue+6.
+    pub fn queue_pending_ups_load(
+        &mut self,
+        vec_data: [u32; 8],
+        shift_reg: u8,
+        dest_reg: u8,
+        from: xdna_archspec::aie2::isa::ElementType,
+        to: xdna_archspec::aie2::isa::ElementType,
+        is_half: bool,
+    ) {
+        self.pending_ups_loads.push(PendingUpsLoad {
+            vec_data,
+            shift_reg,
+            dest_reg,
+            from,
+            to,
+            is_half,
+            ready_bundle: self.bundle_seq + VLDA_UPS_SHIFT_READ_LATENCY,
+        });
+    }
+
+    /// Sample the shift register for pending vlda.ups conversions that
+    /// reached their read bundle and write the converted accumulator. Call
+    /// once per issued bundle, after `advance_vector_bundle()` and before
+    /// slot execution.
+    pub fn process_pending_ups_loads(&mut self) {
+        if self.pending_ups_loads.is_empty() {
+            return;
+        }
+        let current = self.bundle_seq;
+        let mut ready: Vec<PendingUpsLoad> = Vec::new();
+        self.pending_ups_loads.retain(|pu| {
+            if pu.ready_bundle <= current {
+                ready.push(pu.clone());
+                false
+            } else {
+                true
+            }
+        });
+        ready.sort_by_key(|pu| pu.ready_bundle);
+        for pu in ready {
+            use crate::interpreter::execute::vector_ups::{ups_vector_to_acc, ups_vector_to_acc_wide};
+            let shift = self.scalar_read(pu.shift_reg);
+            if pu.is_half {
+                let acc = ups_vector_to_acc(&pu.vec_data, shift, pu.from, pu.to);
+                self.accumulator.write(pu.dest_reg, acc);
+            } else {
+                let acc = ups_vector_to_acc_wide(&pu.vec_data, shift, pu.from, pu.to);
+                self.accumulator.write_wide(pu.dest_reg, acc);
             }
         }
     }

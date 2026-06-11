@@ -727,6 +727,10 @@ impl CycleAccurateExecutor {
         // this cycle are visible).
         ctx.process_pending_acc_adds();
 
+        // Sample the shift register for fused vlda.ups whose stage-7 read
+        // bundle arrived and write their converted accumulators.
+        ctx.process_pending_ups_loads();
+
         ctx.begin_bundle();
 
         // Same-bundle scalar->shift forwarding. AIE2 writes an S register at
@@ -1036,6 +1040,12 @@ mod tests {
 
         executor.execute(&make_bundle(vec![mov, ups]), &mut ctx, &mut tile);
 
+        // The UPS samples the shift at issue+6 (II_VLDA_UPS operand cycle 7);
+        // issue empty bundles to reach the read bundle.
+        for _ in 0..6 {
+            executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
+        }
+
         // acc32 packs two int32 per u64: lane[2j]=acc[j] low, lane[2j+1]=high.
         // With the same-bundle shift forwarded, every lane = value << 4.
         let acc = ctx.accumulator.read(0);
@@ -1044,6 +1054,61 @@ mod tests {
             let hi = (acc[j] >> 32) as i32;
             assert_eq!(lo, (vals[2 * j] as i32) << 4, "lane {}", 2 * j);
             assert_eq!(hi, (vals[2 * j + 1] as i32) << 4, "lane {}", 2 * j + 1);
+        }
+    }
+
+    /// Cross-bundle late shift write: the `MOV s0,#1` issued several bundles
+    /// AFTER the vlda.ups must still control the conversion. II_VLDA_UPS reads
+    /// its shift S-register at operand cycle 7, and Peano schedules the
+    /// shift-setup mov in the load's shadow (vector fuzzer seeds 1142-1448,
+    /// silicon-verified: issue-time sampling produced the unshifted input for
+    /// upshift modes 1-7).
+    #[test]
+    fn test_late_shift_mov_controls_earlier_ups_load() {
+        use crate::interpreter::bundle::ElementType;
+        use crate::interpreter::decode::register_map::AccumWidth;
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+
+        let vals: [i16; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        for i in 0..16 {
+            let b = (vals[i] as u16).to_le_bytes();
+            tile.data_memory_mut()[0x200 + i * 2] = b[0];
+            tile.data_memory_mut()[0x200 + i * 2 + 1] = b[1];
+        }
+        ctx.pointer.write(0, 0x70200);
+        ctx.scalar.write(0, 0); // s0 = 0 at issue; the late MOV sets the shift
+
+        let mut ups = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Ups)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0));
+        ups.from_type = Some(ElementType::Int16);
+        ups.element_type = Some(ElementType::Int32);
+        ups.accum_width = Some(AccumWidth::Half);
+        ups.mem_width = MemWidth::Vector256;
+        ups.is_vector = true;
+
+        // Bundle 0: the UPS load. Bundles 1-4: nops. Bundle 5: MOV s0,#1
+        // (commits before the issue+6 sample). Bundle 6: sample lands.
+        executor.execute(&make_bundle(vec![ups]), &mut ctx, &mut tile);
+        for _ in 0..4 {
+            executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
+        }
+        let mov = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::Immediate(1));
+        executor.execute(&make_bundle(vec![mov]), &mut ctx, &mut tile);
+        executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
+
+        let acc = ctx.accumulator.read(0);
+        for j in 0..8usize {
+            let lo = (acc[j] & 0xFFFF_FFFF) as i32;
+            let hi = (acc[j] >> 32) as i32;
+            assert_eq!(lo, (vals[2 * j] as i32) << 1, "lane {}", 2 * j);
+            assert_eq!(hi, (vals[2 * j + 1] as i32) << 1, "lane {}", 2 * j + 1);
         }
     }
 
