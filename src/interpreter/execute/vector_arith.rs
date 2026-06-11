@@ -275,28 +275,18 @@ impl VectorAlu {
                 }
             }
             ElementType::BFloat16 => {
-                // AIE2 NaN semantics: when either operand is NaN, the compare
-                // unit returns false, and the VMIN mux selects s1 (left operand).
-                // This is NaN propagation from s1, NOT IEEE 754 minNum.
+                // VMIN_GE mux: select s2 when (s1 >= s2) under the silicon
+                // sign-magnitude ordering, else s1. NaN makes the compare
+                // false, propagating s1 (NOT IEEE 754 minNum); -0 sorts
+                // strictly below +0, so min(-0, +0) = -0 (silicon-verified,
+                // vector fuzzer seed 1433 max counterpart).
                 for i in 0..8 {
-                    let a_lo_raw = (a[i] & 0xFFFF) as u16;
-                    let a_hi_raw = ((a[i] >> 16) & 0xFFFF) as u16;
-                    let b_lo_raw = (b[i] & 0xFFFF) as u16;
-                    let b_hi_raw = ((b[i] >> 16) & 0xFFFF) as u16;
-                    let a_lo = Self::bf16_to_f32(a_lo_raw);
-                    let a_hi = Self::bf16_to_f32(a_hi_raw);
-                    let b_lo = Self::bf16_to_f32(b_lo_raw);
-                    let b_hi = Self::bf16_to_f32(b_hi_raw);
-                    let r_lo = if a_lo.is_nan() || b_lo.is_nan() {
-                        a_lo_raw
-                    } else {
-                        Self::f32_to_bf16(a_lo.min(b_lo))
-                    };
-                    let r_hi = if a_hi.is_nan() || b_hi.is_nan() {
-                        a_hi_raw
-                    } else {
-                        Self::f32_to_bf16(a_hi.min(b_hi))
-                    };
+                    let a_lo = (a[i] & 0xFFFF) as u16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
+                    let b_lo = (b[i] & 0xFFFF) as u16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
+                    let r_lo = if Self::bf16_cmp_ge(a_lo, b_lo) { b_lo } else { a_lo };
+                    let r_hi = if Self::bf16_cmp_ge(a_hi, b_hi) { b_hi } else { a_hi };
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -379,28 +369,18 @@ impl VectorAlu {
                 }
             }
             ElementType::BFloat16 => {
-                // AIE2 NaN semantics: when either operand is NaN, the compare
-                // unit returns false, and the VMAX mux selects s1 (left operand).
-                // This is NaN propagation from s1, NOT IEEE 754 maxNum.
+                // VMAX_LT mux: select s2 when (s1 < s2) under the silicon
+                // sign-magnitude ordering, else s1. NaN makes the compare
+                // false, propagating s1 (NOT IEEE 754 maxNum); -0 sorts
+                // strictly below +0, so max(-0, +0) = +0 (silicon-verified,
+                // vector fuzzer seed 1433: numeric f32 max kept -0).
                 for i in 0..8 {
-                    let a_lo_raw = (a[i] & 0xFFFF) as u16;
-                    let a_hi_raw = ((a[i] >> 16) & 0xFFFF) as u16;
-                    let b_lo_raw = (b[i] & 0xFFFF) as u16;
-                    let b_hi_raw = ((b[i] >> 16) & 0xFFFF) as u16;
-                    let a_lo = Self::bf16_to_f32(a_lo_raw);
-                    let a_hi = Self::bf16_to_f32(a_hi_raw);
-                    let b_lo = Self::bf16_to_f32(b_lo_raw);
-                    let b_hi = Self::bf16_to_f32(b_hi_raw);
-                    let r_lo = if a_lo.is_nan() || b_lo.is_nan() {
-                        a_lo_raw
-                    } else {
-                        Self::f32_to_bf16(a_lo.max(b_lo))
-                    };
-                    let r_hi = if a_hi.is_nan() || b_hi.is_nan() {
-                        a_hi_raw
-                    } else {
-                        Self::f32_to_bf16(a_hi.max(b_hi))
-                    };
+                    let a_lo = (a[i] & 0xFFFF) as u16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
+                    let b_lo = (b[i] & 0xFFFF) as u16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
+                    let r_lo = if Self::bf16_cmp_lt(a_lo, b_lo) { b_lo } else { a_lo };
+                    let r_hi = if Self::bf16_cmp_lt(a_hi, b_hi) { b_hi } else { a_hi };
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -2075,6 +2055,32 @@ mod tests {
         let r = VectorAlu::vector_min(&a, &b, ElementType::Int8);
         // min(-128,-127)=-128, min(127,0)=0, min(-1,-2)=-2, min(1,2)=1
         assert_eq!(r[0], 0x01_FE_00_80);
+    }
+
+    /// bf16 min/max mux semantics on signed zero and NaN (silicon-verified,
+    /// vector fuzzer seed 1433): -0 sorts strictly below +0, so
+    /// max(-0,+0)=+0 and min(-0,+0)=-0 regardless of operand order; a NaN
+    /// operand makes the compare false, propagating s1. Numeric f32 min/max
+    /// collapses the zeros and got the seed-1433 lane wrong.
+    #[test]
+    fn vector_max_min_bf16_signed_zero_and_nan() {
+        let nz = 0x8000u32; // -0.0 bf16
+        let pz = 0x0000u32; // +0.0 bf16
+        let nan = 0x7FC0u32;
+        let one = 0x3F80u32;
+        // lane lo of word 0; hi half unused (zeros compare equal -> s1).
+        let a = [nz, pz, nan, one, 0, 0, 0, 0];
+        let b = [pz, nz, one, nan, 0, 0, 0, 0];
+        let max = VectorAlu::vector_max(&a, &b, ElementType::BFloat16);
+        assert_eq!(max[0] & 0xFFFF, pz, "max(-0,+0)=+0");
+        assert_eq!(max[1] & 0xFFFF, pz, "max(+0,-0)=+0");
+        assert_eq!(max[2] & 0xFFFF, nan, "max(NaN,1) propagates s1");
+        assert_eq!(max[3] & 0xFFFF, one, "max(1,NaN) propagates s1");
+        let min = VectorAlu::vector_min(&a, &b, ElementType::BFloat16);
+        assert_eq!(min[0] & 0xFFFF, nz, "min(-0,+0)=-0");
+        assert_eq!(min[1] & 0xFFFF, nz, "min(+0,-0)=-0");
+        assert_eq!(min[2] & 0xFFFF, nan, "min(NaN,1) propagates s1");
+        assert_eq!(min[3] & 0xFFFF, one, "min(1,NaN) propagates s1");
     }
 
     // -- vector_shift_left --

@@ -15,6 +15,7 @@
 //! it returns `true`; otherwise `false` so the caller can fall through to
 //! the next handler.
 
+use super::vector_dispatch::VectorAlu;
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::state::{Bypass, ExecutionContext};
 use xdna_archspec::aie2::isa::SemanticOp;
@@ -489,13 +490,23 @@ pub(crate) fn vector_min(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
             }
         }
         ElementType::BFloat16 => {
+            // VMIN_GE mux semantics: s2 when (s1 >= s2) sign-magnitude,
+            // else s1 (NaN -> s1; -0 < +0). Mirrors VectorAlu::vector_min.
             for i in 0..8 {
-                let a_lo = bf16_to_f32((a[i] & 0xFFFF) as u16);
-                let a_hi = bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
-                let b_lo = bf16_to_f32((b[i] & 0xFFFF) as u16);
-                let b_hi = bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
-                let r_lo = f32_to_bf16(a_lo.min(b_lo));
-                let r_hi = f32_to_bf16(a_hi.min(b_hi));
+                let a_lo = (a[i] & 0xFFFF) as u16;
+                let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
+                let b_lo = (b[i] & 0xFFFF) as u16;
+                let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
+                let r_lo = if VectorAlu::bf16_cmp_ge(a_lo, b_lo) {
+                    b_lo
+                } else {
+                    a_lo
+                };
+                let r_hi = if VectorAlu::bf16_cmp_ge(a_hi, b_hi) {
+                    b_hi
+                } else {
+                    a_hi
+                };
                 result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
             }
         }
@@ -573,13 +584,23 @@ pub(crate) fn vector_max(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
             }
         }
         ElementType::BFloat16 => {
+            // VMAX_LT mux semantics: s2 when (s1 < s2) sign-magnitude,
+            // else s1 (NaN -> s1; -0 < +0). Mirrors VectorAlu::vector_max.
             for i in 0..8 {
-                let a_lo = bf16_to_f32((a[i] & 0xFFFF) as u16);
-                let a_hi = bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
-                let b_lo = bf16_to_f32((b[i] & 0xFFFF) as u16);
-                let b_hi = bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
-                let r_lo = f32_to_bf16(a_lo.max(b_lo));
-                let r_hi = f32_to_bf16(a_hi.max(b_hi));
+                let a_lo = (a[i] & 0xFFFF) as u16;
+                let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
+                let b_lo = (b[i] & 0xFFFF) as u16;
+                let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
+                let r_lo = if VectorAlu::bf16_cmp_lt(a_lo, b_lo) {
+                    b_lo
+                } else {
+                    a_lo
+                };
+                let r_hi = if VectorAlu::bf16_cmp_lt(a_hi, b_hi) {
+                    b_hi
+                } else {
+                    a_hi
+                };
                 result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
             }
         }

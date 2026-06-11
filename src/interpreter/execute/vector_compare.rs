@@ -28,7 +28,7 @@ impl VectorAlu {
 
     /// bf16 a >= b under the silicon ordering (false when either is NaN).
     #[inline]
-    fn bf16_cmp_ge(a: u16, b: u16) -> bool {
+    pub(super) fn bf16_cmp_ge(a: u16, b: u16) -> bool {
         matches!(
             (Self::bf16_order_key(a), Self::bf16_order_key(b)),
             (Some(ka), Some(kb)) if ka >= kb
@@ -37,7 +37,7 @@ impl VectorAlu {
 
     /// bf16 a < b under the silicon ordering (false when either is NaN).
     #[inline]
-    fn bf16_cmp_lt(a: u16, b: u16) -> bool {
+    pub(super) fn bf16_cmp_lt(a: u16, b: u16) -> bool {
         matches!(
             (Self::bf16_order_key(a), Self::bf16_order_key(b)),
             (Some(ka), Some(kb)) if ka < kb
