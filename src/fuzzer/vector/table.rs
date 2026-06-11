@@ -147,7 +147,118 @@ fn build_table() -> Vec<OpEntry> {
         t.push(un("max_reduce_bcast", vt, 1, |a, _, vt| {
             format!("aie::broadcast<{}, {}>(aie::max_reduce({}))", vt.ctype(), vt.lanes(), a[0])
         }));
+
+        // Tier 1: cmp-flag family. maxdiff = max(a-b, 0); max_cmp/min_cmp also
+        // return the lane mask, folded into every lane via broadcast-add so the
+        // flag result is silicon-observable (spike: vmax_lt/vmin_ge write GPR
+        // masks the emulator must model, not just lanes).
+        t.push(bin("maxdiff", vt, |a, _, _| format!("aie::maxdiff({}, {})", a[0], a[1])));
+        t.push(bin("max_cmp", vt, |a, _, vt| {
+            format!(
+                "[&]{{ auto [v, m] = aie::max_cmp({}, {}); return aie::add(v, {}); }}()",
+                a[0],
+                a[1],
+                mask_bcast_expr("m", vt)
+            )
+        }));
+        t.push(bin("min_cmp", vt, |a, _, vt| {
+            format!(
+                "[&]{{ auto [v, m] = aie::min_cmp({}, {}); return aie::add(v, {}); }}()",
+                a[0],
+                a[1],
+                mask_bcast_expr("m", vt)
+            )
+        }));
+        // Mask producers: broadcast the (XOR-folded) compare mask to all lanes.
+        t.push(bin("mask_lt", vt, |a, _, vt| {
+            format!("[&]{{ auto m = aie::lt({}, {}); return {}; }}()", a[0], a[1], mask_bcast_expr("m", vt))
+        }));
+        t.push(bin("mask_ge", vt, |a, _, vt| {
+            format!("[&]{{ auto m = aie::ge({}, {}); return {}; }}()", a[0], a[1], mask_bcast_expr("m", vt))
+        }));
+        t.push(bin("mask_eq", vt, |a, _, vt| {
+            format!("[&]{{ auto m = aie::eq({}, {}); return {}; }}()", a[0], a[1], mask_bcast_expr("m", vt))
+        }));
+
+        // Tier 1: general shifts, mode = shift class {1, width/2, width-1}.
+        // i32 stays on the dedicated downshift/upshift entries below.
+        if vt != VecType::I32x16 {
+            t.push(un("shl", vt, 3, |a, m, vt| format!("aie::upshift({}, {})", a[0], shift_amount(vt, m))));
+            t.push(un("sra", vt, 3, |a, m, vt| format!("aie::downshift({}, {})", a[0], shift_amount(vt, m))));
+            t.push(un("srl", vt, 3, |a, m, vt| {
+                format!("aie::logical_downshift({}, {})", a[0], shift_amount(vt, m))
+            }));
+        }
+
+        // Tier 1: vector movement. vexin swaps halves via extract+insert
+        // (mode = which half is rewritten); elem_ins copies the top lane into
+        // lane mode*lanes/4 via VEXTRACT.elem/VINSERT. All lanes defined.
+        t.push(un("vexin", vt, 2, |a, m, vt| {
+            let half = vt.lanes() / 2;
+            format!(
+                "[&]{{ auto t = {0}; t.insert({m}, {0}.extract<{half}>({1})); return t; }}()",
+                a[0],
+                1 - m
+            )
+        }));
+        t.push(un("elem_ins", vt, 4, |a, m, vt| {
+            let lane = m as usize * (vt.lanes() / 4);
+            format!("[&]{{ auto t = {0}; t.set({0}.get({1}), {lane}u); return t; }}()", a[0], vt.lanes() - 1)
+        }));
     }
+
+    // Tier 1: matrix engine (aie::mmul tiles). A/B come from the full-width
+    // inputs via extract; the accumulator couples back through SRS via
+    // to_vector (fixed shift 0). mac variants accumulate a second product on
+    // top of mul, exercising the acc-accumulate path with defined state.
+    t.push(OpEntry {
+        name: "mmul_i8",
+        in_types: vec![VecType::I8x64, VecType::I8x64],
+        out_type: VecType::I32x16,
+        modes: 1,
+        emit: |a, _, _| {
+            format!(
+                "[&]{{ aie::mmul<4, 8, 4, int8, int8, accauto> m; m.mul({0}.extract<32>(0), {1}.extract<32>(0)); return m.to_vector<int32>(0); }}()",
+                a[0], a[1]
+            )
+        },
+    });
+    t.push(OpEntry {
+        name: "mmac_i8",
+        in_types: vec![VecType::I8x64, VecType::I8x64],
+        out_type: VecType::I32x16,
+        modes: 1,
+        emit: |a, _, _| {
+            format!(
+                "[&]{{ aie::mmul<4, 8, 4, int8, int8, accauto> m; m.mul({0}.extract<32>(0), {1}.extract<32>(0)); m.mac({0}.extract<32>(1), {1}.extract<32>(1)); return m.to_vector<int32>(0); }}()",
+                a[0], a[1]
+            )
+        },
+    });
+    t.push(OpEntry {
+        name: "mmul_i16",
+        in_types: vec![VecType::I16x32, VecType::I16x32],
+        out_type: VecType::I32x16,
+        modes: 1,
+        emit: |a, _, _| {
+            format!(
+                "[&]{{ aie::mmul<4, 4, 4, int16, int16, accauto> m; m.mul({0}.extract<16>(0), {1}.extract<16>(0)); return m.to_vector<int32>(0); }}()",
+                a[0], a[1]
+            )
+        },
+    });
+    t.push(OpEntry {
+        name: "mmac_i16",
+        in_types: vec![VecType::I16x32, VecType::I16x32],
+        out_type: VecType::I32x16,
+        modes: 1,
+        emit: |a, _, _| {
+            format!(
+                "[&]{{ aie::mmul<4, 4, 4, int16, int16, accauto> m; m.mul({0}.extract<16>(0), {1}.extract<16>(0)); m.mac({0}.extract<16>(1), {1}.extract<16>(1)); return m.to_vector<int32>(0); }}()",
+                a[0], a[1]
+            )
+        },
+    });
 
     // int32-only: shift amount = mode (UPS/SRS pipeline), raw vshuffle mode sweep.
     t.push(un("downshift", VecType::I32x16, 8, |a, m, _| format!("aie::downshift({}, {})", a[0], m)));
@@ -197,7 +308,82 @@ fn build_table() -> Vec<OpEntry> {
         format!("aie::broadcast<{}, {}>({}.get(0))", vt.ctype(), vt.lanes(), a[0])
     }));
 
+    // Tier 1 bf16 family. mmul tile is 4x8x4 bf16 -> fp32, coupled back to
+    // bf16 via the accumulator conversion. The converted vector must be
+    // SINGLE-USE: duplicating it (concat(c, c)) trips Peano GlobalISel
+    // (selectG_AIE_STORE_CONV "Expected SSA" assertion -- tier-1 probe), so
+    // the upper output half takes the b operand's low half. Defined, modeled.
+    t.push(OpEntry {
+        name: "mmul_bf16",
+        in_types: vec![bf, bf],
+        out_type: bf,
+        modes: 1,
+        emit: |a, _, _| {
+            format!(
+                "[&]{{ aie::mmul<4, 8, 4, bfloat16, bfloat16, accauto> m; m.mul({0}, {1}); return aie::concat(m.to_vector<bfloat16>(), {1}.extract<16>(0)); }}()",
+                a[0], a[1]
+            )
+        },
+    });
+    t.push(OpEntry {
+        name: "mmac_bf16",
+        in_types: vec![bf, bf],
+        out_type: bf,
+        modes: 1,
+        emit: |a, _, _| {
+            format!(
+                "[&]{{ aie::mmul<4, 8, 4, bfloat16, bfloat16, accauto> m; m.mul({0}, {1}); m.mac({0}, {1}); return aie::concat(m.to_vector<bfloat16>(), {1}.extract<16>(0)); }}()",
+                a[0], a[1]
+            )
+        },
+    });
+    t.push(bin("maxdiff", bf, |a, _, _| format!("aie::maxdiff({}, {})", a[0], a[1])));
+    t.push(bin("mask_lt", bf, |a, _, vt| {
+        format!("[&]{{ auto m = aie::lt({}, {}); return {}; }}()", a[0], a[1], mask_bcast_expr("m", vt))
+    }));
+    t.push(bin("mask_ge", bf, |a, _, vt| {
+        format!("[&]{{ auto m = aie::ge({}, {}); return {}; }}()", a[0], a[1], mask_bcast_expr("m", vt))
+    }));
+    t.push(un("vexin", bf, 2, |a, m, vt| {
+        let half = vt.lanes() / 2;
+        format!("[&]{{ auto t = {0}; t.insert({m}, {0}.extract<{half}>({1})); return t; }}()", a[0], 1 - m)
+    }));
+    t.push(un("elem_ins", bf, 4, |a, m, vt| {
+        let lane = m as usize * (vt.lanes() / 4);
+        format!("[&]{{ auto t = {0}; t.set({0}.get({1}), {lane}u); return t; }}()", a[0], vt.lanes() - 1)
+    }));
+
     t
+}
+
+/// Broadcast a compare mask (named by `mask`) to all lanes of `vt`. Lane
+/// counts wider than the element type XOR-fold so every mask bit affects the
+/// result; bf16 routes through float conversion (deterministic on silicon).
+fn mask_bcast_expr(mask: &str, vt: VecType) -> String {
+    match vt {
+        VecType::I32x16 | VecType::I32x8 => {
+            format!("aie::broadcast<int32_t, {}>((int32_t){mask}.to_uint32())", vt.lanes())
+        }
+        VecType::I16x32 | VecType::I16x16 => format!(
+            "aie::broadcast<int16_t, {}>((int16_t)({mask}.to_uint32() ^ ({mask}.to_uint32() >> 16)))",
+            vt.lanes()
+        ),
+        VecType::I8x64 => format!(
+            "aie::broadcast<int8_t, 64>((int8_t)(({mask}.to_uint64() ^ ({mask}.to_uint64() >> 32) ^ ({mask}.to_uint64() >> 16) ^ ({mask}.to_uint64() >> 8)) & 0xff))"
+        ),
+        VecType::Bf16x32 => format!("aie::broadcast<bfloat16, 32>(bfloat16((float){mask}.to_uint32()))"),
+    }
+}
+
+/// Shift amount for the general-shift entries: mode 0 -> 1 bit, mode 1 ->
+/// half the element width, mode 2 -> width-1 (sign-replication edge).
+fn shift_amount(vt: VecType, mode: u8) -> usize {
+    let width = vt.bytes() / vt.lanes() * 8;
+    match mode {
+        0 => 1,
+        1 => width / 2,
+        _ => width - 1,
+    }
 }
 
 #[cfg(test)]
@@ -211,7 +397,54 @@ mod tests {
 
     #[test]
     fn table_non_empty() {
-        assert!(table().len() > 60, "expected >60 entries, got {}", table().len());
+        assert!(table().len() > 90, "expected >90 entries, got {}", table().len());
+    }
+
+    #[test]
+    fn tier1_families_present_per_type() {
+        let has = |name: &str, vt: VecType| table().iter().any(|e| e.name == name && e.out_type == vt);
+        for vt in [VecType::I8x64, VecType::I16x32, VecType::I32x16, VecType::Bf16x32] {
+            assert!(has("maxdiff", vt), "maxdiff missing for {vt:?}");
+            assert!(has("mask_lt", vt), "mask_lt missing for {vt:?}");
+            assert!(has("vexin", vt), "vexin missing for {vt:?}");
+            assert!(has("elem_ins", vt), "elem_ins missing for {vt:?}");
+        }
+        // General shifts only on i8/i16 (i32 keeps the dedicated entries).
+        for vt in [VecType::I8x64, VecType::I16x32] {
+            for name in ["shl", "sra", "srl"] {
+                let e = table().iter().find(|e| e.name == name && e.out_type == vt).expect(name);
+                assert_eq!(e.modes, 3, "{name}/{vt:?} mode count");
+            }
+        }
+        assert!(!has("shl", VecType::I32x16), "i32 shl should not exist");
+        // Matrix engine: int tiles couple to I32x16, bf16 stays bf16.
+        for name in ["mmul_i8", "mmac_i8", "mmul_i16", "mmac_i16"] {
+            let e = table().iter().find(|e| e.name == name).expect(name);
+            assert_eq!(e.out_type, VecType::I32x16, "{name} out type");
+            assert_eq!(e.in_types.len(), 2, "{name} arity");
+        }
+        for name in ["mmul_bf16", "mmac_bf16"] {
+            let e = table().iter().find(|e| e.name == name).expect(name);
+            assert_eq!(e.out_type, VecType::Bf16x32, "{name} out type");
+        }
+    }
+
+    #[test]
+    fn shift_amounts_are_1_mid_widthm1() {
+        assert_eq!(shift_amount(VecType::I8x64, 0), 1);
+        assert_eq!(shift_amount(VecType::I8x64, 1), 4);
+        assert_eq!(shift_amount(VecType::I8x64, 2), 7);
+        assert_eq!(shift_amount(VecType::I16x32, 0), 1);
+        assert_eq!(shift_amount(VecType::I16x32, 1), 8);
+        assert_eq!(shift_amount(VecType::I16x32, 2), 15);
+    }
+
+    #[test]
+    fn mask_bcast_expr_matches_lane_type() {
+        assert!(mask_bcast_expr("m", VecType::I32x16).contains("int32_t, 16"));
+        assert!(mask_bcast_expr("m", VecType::I16x32).contains("int16_t, 32"));
+        assert!(mask_bcast_expr("m", VecType::I8x64).contains("to_uint64"));
+        assert!(mask_bcast_expr("m", VecType::Bf16x32).contains("bfloat16"));
     }
 
     #[test]

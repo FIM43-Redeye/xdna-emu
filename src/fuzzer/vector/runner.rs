@@ -706,7 +706,10 @@ mod tests {
         let dir = std::env::current_dir().unwrap().join("build/fuzz-vector/compile-clean");
         std::fs::create_dir_all(&dir).unwrap();
 
-        let cases: Vec<(u64, String, PathBuf)> = (0..200u64)
+        // At least 200 seeds, and at least one seed per universe key so every
+        // table entry/mode gets compiled.
+        let n_seeds = 200u64.max(universe.len() as u64);
+        let cases: Vec<(u64, String, PathBuf)> = (0..n_seeds)
             .map(|seed| {
                 let key = universe[(seed as usize) % universe.len()].clone();
                 let case_dir = dir.join(format!("seed_{seed}"));
