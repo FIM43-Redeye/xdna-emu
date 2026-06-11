@@ -8,6 +8,7 @@
 
 pub mod ast;
 pub mod cli;
+pub mod core;
 pub mod gen;
 pub mod lower_cpp;
 pub mod params;

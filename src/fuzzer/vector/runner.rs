@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::fuzzer::runner::{catch_panic, compile_kernel_case, ToolPaths, TRACE_BUFFER_ELEMENTS};
+use crate::fuzzer::core::toolchain::{catch_panic, compile_kernel_case, ToolPaths, TRACE_BUFFER_ELEMENTS};
 use crate::fuzzer::vector::chain::{Chain, Stage};
 use crate::fuzzer::vector::gen::generate;
 use crate::fuzzer::vector::ledger::Ledger;
