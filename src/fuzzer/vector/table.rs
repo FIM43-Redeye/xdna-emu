@@ -57,6 +57,20 @@ impl VecType {
     pub fn is_float(self) -> bool {
         matches!(self, VecType::Bf16x32)
     }
+
+    /// Parse from the `{:?}` spelling embedded in coverage keys (`name/Type/m0`).
+    /// Lets replay recover a slice's type from banked keys without the live table.
+    pub fn from_debug(s: &str) -> Option<VecType> {
+        match s {
+            "I8x64" => Some(VecType::I8x64),
+            "I16x32" => Some(VecType::I16x32),
+            "I32x16" => Some(VecType::I32x16),
+            "Bf16x32" => Some(VecType::Bf16x32),
+            "I16x16" => Some(VecType::I16x16),
+            "I32x8" => Some(VecType::I32x8),
+            _ => None,
+        }
+    }
 }
 
 /// One vector op the chain generator can instantiate as a stage.

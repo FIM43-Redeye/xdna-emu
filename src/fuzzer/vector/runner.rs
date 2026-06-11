@@ -21,7 +21,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::fuzzer::runner::{catch_panic, compile_kernel_case, ToolPaths, TRACE_BUFFER_ELEMENTS};
-use crate::fuzzer::vector::chain::Chain;
+use crate::fuzzer::vector::chain::{Chain, Stage};
 use crate::fuzzer::vector::gen::generate;
 use crate::fuzzer::vector::ledger::Ledger;
 use crate::fuzzer::vector::lower::lower_chain;
@@ -50,15 +50,24 @@ pub struct VecFuzzOptions {
     pub reverify: bool,
 }
 
-/// Serialized form of a banked chain: enough to regenerate and audit.
-/// Stages are stored explicitly so a bank survives table evolution detectably:
-/// replay regenerates from (seed, target_key) and verifies keys match.
+/// Serialized form of a banked chain: enough to replay without the live table.
+/// The banked `pool` (input bytes) and `keys` make replay self-contained -- it
+/// reconstructs and runs the banked xclbin even after the op table evolves and
+/// shifts `entry_idx`. `table_version` stamps which table the bank was cut under
+/// so replay can tell a same-table regeneration apart from a reconstruction.
 #[derive(Serialize, Deserialize)]
 struct ChainRecord {
     seed: u64,
     target_key: String,
     keys: Vec<String>,
     stages: Vec<StageRecord>,
+    /// Input pool bytes the kernel loaded operands from. Defaulted empty for
+    /// legacy banks cut before this field (those fall back to regeneration).
+    #[serde(default)]
+    pool: Vec<u8>,
+    /// Hash of the coverage-key universe the bank was cut under (0 = legacy).
+    #[serde(default)]
+    table_version: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -83,8 +92,49 @@ impl ChainRecord {
                     second_pool_slot: s.second_pool_slot,
                 })
                 .collect(),
+            pool: chain.pool.clone(),
+            table_version: current_table_version(),
         }
     }
+
+    /// Reconstruct the runnable [`Chain`] from banked artifacts alone -- no live
+    /// table lookup, so it is correct even when the table has shifted `entry_idx`.
+    /// Execution (`run_emulator_vec`/`run_npu_vec`) uses only `pool` and the stage
+    /// count, both preserved here; localization uses the banked `keys`.
+    fn to_chain(&self) -> Chain {
+        Chain {
+            seed: self.seed,
+            target_key: self.target_key.clone(),
+            stages: self
+                .stages
+                .iter()
+                .map(|s| Stage { entry_idx: s.entry_idx, mode: s.mode, second_pool_slot: s.second_pool_slot })
+                .collect(),
+            pool: self.pool.clone(),
+        }
+    }
+}
+
+/// Stable FNV-1a hash of the coverage-key universe -- the bank's table-version
+/// stamp. Deterministic across runs and independent of std hasher internals, so
+/// a bank cut today still compares equal after a rebuild of the same table.
+fn current_table_version() -> u64 {
+    let joined = Ledger::universe().join("\n");
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in joined.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Per-slice result types parsed from banked coverage keys (`name/Type/mMode`).
+/// Table-independent, so replay applies the right per-slice comparator tolerance
+/// even when `entry_idx` no longer resolves against the current table.
+fn out_types_from_keys(keys: &[String]) -> Vec<VecType> {
+    keys.iter()
+        .filter_map(|k| k.split('/').nth(1).and_then(VecType::from_debug))
+        .collect()
 }
 
 /// Buffer size in i32 words: pool and output both live in `--size`-word
@@ -154,11 +204,11 @@ fn first_divergent_slice(a: &[u8], b: &[u8], out_types: &[VecType]) -> Option<us
     None
 }
 
-/// Map a divergent slice index to the chain's coverage key. Slices past the
-/// last stage (zero padding) clamp to the final stage -- a diff there still
-/// means the kernel wrote where it should not have, attributed to the chain.
-fn slice_to_key(chain: &Chain, slice: usize) -> String {
-    let keys = chain.keys();
+/// Map a divergent slice index to a coverage key. Slices past the last stage
+/// (zero padding) clamp to the final stage -- a diff there still means the kernel
+/// wrote where it should not have, attributed to the chain. Takes keys directly
+/// so replay can localize against banked keys without the live table.
+fn slice_to_key(keys: &[String], slice: usize) -> String {
     let idx = slice.min(keys.len().saturating_sub(1));
     keys[idx].clone()
 }
@@ -534,7 +584,7 @@ pub fn run_vector_fuzz(opts: &VecFuzzOptions) {
             }
             Some(slice) => {
                 fail += 1;
-                let key = slice_to_key(&case.chain, slice);
+                let key = slice_to_key(&case.chain.keys(), slice);
                 println!("seed {seed} MISMATCH at slice {slice} -> key {key}");
                 ledger.mark_divergent(&key);
                 match bank_case(&case.case_dir, &case.chain, Some(&npu_out), npu_trace.as_deref(), &executed)
@@ -635,12 +685,25 @@ fn run_replay(dir: &Path, opts: &VecFuzzOptions) {
             }
         };
 
-        let chain = generate(record.seed, &record.target_key);
-        if chain.keys() != record.keys {
-            errors += 1;
-            println!("{name}: regenerated keys differ from banked keys (table changed?) -- skipping");
-            continue;
-        }
+        // Reconstruct the runnable chain. A durable bank (with pool) is replayed
+        // directly and is table-independent. A legacy bank (no pool) can only be
+        // regenerated, which requires the live table to still match.
+        let chain = if !record.pool.is_empty() {
+            record.to_chain()
+        } else {
+            let c = generate(record.seed, &record.target_key);
+            if c.keys() != record.keys {
+                errors += 1;
+                println!(
+                    "{name}: legacy bank under a changed table (no pool) -- skipping; re-bank to replay"
+                );
+                continue;
+            }
+            c
+        };
+        // Localization and comparator tolerance come from banked keys, so they
+        // are correct even when the live table has shifted entry indices.
+        let out_types = out_types_from_keys(&record.keys);
 
         let xclbin = case_dir.join("aie.xclbin");
         if !xclbin.exists() {
@@ -681,7 +744,7 @@ fn run_replay(dir: &Path, opts: &VecFuzzOptions) {
                 println!("{name}: emulator error: {e}");
             }
             Ok(Ok((emu_out, _trace, _executed))) => {
-                match first_divergent_slice(&emu_out, &npu_out, &chain_out_types(&chain)) {
+                match first_divergent_slice(&emu_out, &npu_out, &out_types) {
                     None => {
                         matched += 1;
                         println!("{name}: MATCH (divergence resolved)");
@@ -690,7 +753,7 @@ fn run_replay(dir: &Path, opts: &VecFuzzOptions) {
                         mismatched += 1;
                         println!(
                             "{name}: still divergent at slice {slice} -> key {}",
-                            slice_to_key(&chain, slice)
+                            slice_to_key(&record.keys, slice)
                         );
                         // Dump the EMU side next to the banked HW output for byte diffs.
                         if let Err(e) = std::fs::write(case_dir.join("emu_output.bin"), &emu_out) {
@@ -722,7 +785,7 @@ mod tests {
         npu[64 + 7] ^= 0x40; // corrupt one byte inside slice 1
         let slice = first_divergent_slice(&emu, &npu, &chain_out_types(&chain)).expect("must diverge");
         assert_eq!(slice, 1);
-        assert_eq!(slice_to_key(&chain, slice), chain.keys()[1]);
+        assert_eq!(slice_to_key(&chain.keys(), slice), chain.keys()[1]);
     }
 
     #[test]
@@ -798,7 +861,7 @@ mod tests {
     fn slice_past_last_stage_clamps_to_final_key() {
         let chain = generate(2, "add/I32x16/m0");
         let last = chain.keys().len() - 1;
-        assert_eq!(slice_to_key(&chain, last + 5), chain.keys()[last]);
+        assert_eq!(slice_to_key(&chain.keys(), last + 5), chain.keys()[last]);
     }
 
     #[test]
@@ -830,6 +893,37 @@ mod tests {
         let regen = generate(loaded.seed, &loaded.target_key);
         assert_eq!(regen.keys(), loaded.keys);
         assert_eq!(regen.stages.len(), loaded.stages.len());
+    }
+
+    #[test]
+    fn durable_bank_reconstructs_chain_without_the_table() {
+        // A banked record reconstructs an identical runnable chain via to_chain
+        // -- pool and stage structure preserved, no generate()/table involved.
+        let chain = generate(6, "add/Bf16x32/m0");
+        let record = ChainRecord::from_chain(&chain);
+        assert!(!record.pool.is_empty(), "pool is banked");
+        assert_eq!(record.table_version, current_table_version());
+
+        let rebuilt = record.to_chain();
+        assert_eq!(rebuilt.seed, chain.seed);
+        assert_eq!(rebuilt.pool, chain.pool);
+        assert_eq!(rebuilt.stages, chain.stages);
+        // Execution inputs are reconstructed identically.
+        assert_eq!(buffer_words(&rebuilt), buffer_words(&chain));
+    }
+
+    #[test]
+    fn out_types_parsed_from_keys_match_the_table() {
+        let chain = generate(7, "add/Bf16x32/m0");
+        let from_keys = out_types_from_keys(&chain.keys());
+        assert_eq!(from_keys, chain_out_types(&chain));
+        assert!(from_keys.contains(&VecType::Bf16x32));
+    }
+
+    #[test]
+    fn table_version_is_stable_across_calls() {
+        assert_eq!(current_table_version(), current_table_version());
+        assert_ne!(current_table_version(), 0);
     }
 
     #[test]
