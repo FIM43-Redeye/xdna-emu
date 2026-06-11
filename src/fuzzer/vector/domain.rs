@@ -313,6 +313,9 @@ impl Domain for VectorDomain {
                 fuzz_recorder::arm();
                 let (outcome, raw_output, trace) = suite.run_single_with_trace(&test);
                 let executed = fuzz_recorder::take().unwrap_or_default();
+                // A non-pass outcome means the output buffer is stale zeros, not
+                // computed data; comparing it would mis-attribute the failure to
+                // vector compute.
                 if !outcome.is_pass() {
                     return Err(format!("emulator outcome not pass: {outcome:?}"));
                 }
