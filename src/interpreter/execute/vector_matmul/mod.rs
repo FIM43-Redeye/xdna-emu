@@ -443,29 +443,39 @@ fn get_config_reg(op: &SlotOp, ctx: &ExecutionContext) -> Option<u32> {
 /// MAC instructions have two VectorReg sources that each name an x-register
 /// (already decoded as even indices: x0->0, x2->2, etc.). We read the full
 /// 512-bit value via `read_wide`.
+/// The reads respect the op's per-operand forwarding context: II_VMAC reads
+/// its vector sources at operand cycle 1 with NoBypass (AIE2Schedule.td
+/// [5,3,1,1,1] / [VEC,VEC,No,No]), so a producer like `vmov wl0, wh0`
+/// (latency 2) issued one bundle before the VMUL must still show the OLD
+/// half -- Peano chains `vmov wl; vmul; vmac` expecting the mul to see the
+/// first halves and the mac the second (seed 5038 silicon).
 fn get_two_vec512(op: &SlotOp, ctx: &ExecutionContext) -> (Vec512, Vec512) {
-    let mut vregs = op.sources.iter().filter_map(|s| {
+    let mut vregs = op.sources.iter().enumerate().filter_map(|(pos, s)| {
         if let Operand::VectorReg(r) = s {
-            Some(*r)
+            Some((pos, *r))
         } else {
             None
         }
     });
 
-    let a_reg = vregs.next().unwrap_or_else(|| {
+    let (a_pos, a_reg) = vregs.next().unwrap_or_else(|| {
         log::error!("[MATMUL] missing first VectorReg source");
-        0
+        (0, 0)
     });
-    let b_reg = vregs.next().unwrap_or_else(|| {
+    let (b_pos, b_reg) = vregs.next().unwrap_or_else(|| {
         log::error!("[MATMUL] missing second VectorReg source");
-        0
+        (0, 0)
     });
 
-    // Ensure even alignment for wide read.
-    let a_base = a_reg & !1;
-    let b_base = b_reg & !1;
-
-    (ctx.vector.read_wide(a_base), ctx.vector.read_wide(b_base))
+    let read = |pos: usize, reg: u8| {
+        // Ensure even alignment for wide read.
+        let base = reg & !1;
+        match op.source_forward.get(pos) {
+            Some(&(uc, ub)) => ctx.vector.read_wide_with(base, uc, ub),
+            None => ctx.vector.read_wide(base),
+        }
+    };
+    (read(a_pos, a_reg), read(b_pos, b_reg))
 }
 
 /// Extract the AccumReg from the destination operand.
@@ -1860,6 +1870,46 @@ mod tests {
             let half = i % 2;
             let val = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as i32;
             assert_eq!(val, 16, "output[{i}]: chained vmul+vmac must be 8+8=16, got {val}");
+        }
+    }
+
+    #[test]
+    fn test_vmul_vec_sources_read_at_cycle1_nobypass() {
+        // II_VMAC reads its vector sources at operand cycle 1 with NoBypass.
+        // Peano puts `vmov wl0, wh0` (latency 2) one bundle before the VMUL:
+        // hardware's VMUL still sees the OLD low half; only the VMAC two
+        // bundles later sees the new one (seed 5038 silicon). The default
+        // compute-read (use_cycle 2, Mov) makes the in-flight vmov visible a
+        // bundle early and feeds the wrong matrix into the mul.
+        use crate::interpreter::state::Bypass;
+        let mut ctx = ExecutionContext::new();
+        ctx.accumulator.write_wide(0, [0u64; 16]);
+        ctx.vector.write_wide(0, vec512_all_ones_i8());
+        ctx.vector.write_wide(2, vec512_all_ones_i8());
+        ctx.scalar.write(5, config_i8xi8_accumulate());
+
+        // Bundle 1: vmov-like in-flight write of 2s to wl0 (l_def 2, NoBypass).
+        ctx.bundle_seq = 1;
+        ctx.vector.advance_bundle(1);
+        ctx.vector.queue_write(0, [0x02020202u32; 8], 2, Bypass::No);
+
+        // Bundle 2: vmul issues, reading its vec sources at (1, NoBypass).
+        ctx.cycles = 2;
+        ctx.bundle_seq = 2;
+        ctx.vector.advance_bundle(2);
+        let mut op = make_mac_op(SemanticOp::MatMul, 0, 2, 5, 0, Some("VMUL_vmac_cm_core_dense"));
+        op.source_forward.push((1, Bypass::No));
+        op.source_forward.push((1, Bypass::No));
+        op.source_forward.push((1, Bypass::No));
+        assert!(execute_matmul(&op, &mut ctx));
+        ctx.force_commit_all_pending();
+
+        let acc = ctx.accumulator.read_wide(0);
+        for i in 0..32 {
+            let lane = i / 2;
+            let half = i % 2;
+            let val = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as i32;
+            assert_eq!(val, 8, "output[{i}]: vmul must read OLD wl0 (all ones -> 8), got {val}");
         }
     }
 
