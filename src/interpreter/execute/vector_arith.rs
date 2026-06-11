@@ -75,6 +75,35 @@ impl VectorAlu {
         result
     }
 
+    /// Single-lane bf16 elementwise add/sub (`vadd.f` / `vsub.f`).
+    ///
+    /// The hardware datapath is `vconv bf16->f32`, the fp32 accumulator adder
+    /// (`aie2_acc_fp32_add`), then `vconv f32->bf16`. The widen is the exact
+    /// `bits << 16`; the fp32 add carries the silicon exp-255 special-value
+    /// rules; the narrow is a NaN-preserving truncate: drop the low 16 bits, but
+    /// if the fp32 result is a NaN (exp 0xFF, mantissa != 0) whose truncated bf16
+    /// mantissa would be zero, force mantissa bit 0 so the NaN never collapses to
+    /// Inf. `sub` negates b (sign-bit flip) before the add.
+    ///
+    /// Verified bit-exact against captured Phoenix silicon (512/512 bf16 lanes,
+    /// build/experiments/nan-inf-add-sub-sweep).
+    fn bf16_elem_addsub(a: u16, b: u16, sub: bool) -> u16 {
+        let fa = (a as u32) << 16;
+        let mut fb = (b as u32) << 16;
+        if sub {
+            fb ^= 0x8000_0000;
+        }
+        let r = super::vector_float::aie2_acc_fp32_add(fa, fb);
+        let mut hi = (r >> 16) as u16;
+        let exp = (r >> 23) & 0xFF;
+        let man = r & 0x7F_FFFF;
+        // f32 result is a NaN whose high 16 bits read as Inf -> keep it a NaN.
+        if exp == 0xFF && man != 0 && (hi & 0x7F) == 0 {
+            hi |= 1;
+        }
+        hi
+    }
+
     pub(super) fn vector_add(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
 
@@ -86,11 +115,16 @@ impl VectorAlu {
                 }
             }
             ElementType::Float32 => {
-                // 8 x 32-bit IEEE 754 float lanes
+                // 8 x 32-bit fp32 lanes. The elementwise vadd.f datapath is the
+                // SAME normalized fp adder as the fp32 accumulator ALU
+                // (aie2_acc_fp32_add, silicon-verified). It does NOT use the
+                // host FPU's IEEE NaN/Inf rules: special operands (exp 0xFF) are
+                // fed as exp-255 magnitudes, the sum forces exp 0xFF, the sign is
+                // the computed sum's sign, and the mantissa is the sticky-rounded
+                // low bits (NaN -> mantissa low bit 1). Verified bit-exact against
+                // 256/256 captured Phoenix lanes (nan-inf-add-sub-sweep, fp32 add).
                 for i in 0..8 {
-                    let fa = f32::from_bits(a[i]);
-                    let fb = f32::from_bits(b[i]);
-                    result[i] = (fa + fb).to_bits();
+                    result[i] = super::vector_float::aie2_acc_fp32_add(a[i], b[i]);
                 }
             }
             ElementType::Int16 | ElementType::UInt16 => {
@@ -106,14 +140,19 @@ impl VectorAlu {
                 }
             }
             ElementType::BFloat16 => {
-                // 16 x BFloat16 lanes (2 per u32)
+                // 16 x BFloat16 lanes (2 per u32). The bf16 vadd.f datapath is
+                // vconv bf16->f32, the fp32 acc adder, then vconv f32->bf16. Same
+                // exp-255 special-value rules as fp32 (see above); the final
+                // narrow is a NaN-preserving truncate so a NaN sum never collapses
+                // to Inf. Verified bit-exact against 256/256 captured Phoenix
+                // lanes (nan-inf-add-sub-sweep, bf16 add).
                 for i in 0..8 {
-                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
-                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
-                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
-                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
-                    let r_lo = Self::f32_to_bf16(a_lo + b_lo);
-                    let r_hi = Self::f32_to_bf16(a_hi + b_hi);
+                    let r_lo = Self::bf16_elem_addsub((a[i] & 0xFFFF) as u16, (b[i] & 0xFFFF) as u16, false);
+                    let r_hi = Self::bf16_elem_addsub(
+                        ((a[i] >> 16) & 0xFFFF) as u16,
+                        ((b[i] >> 16) & 0xFFFF) as u16,
+                        false,
+                    );
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -146,10 +185,12 @@ impl VectorAlu {
                 }
             }
             ElementType::Float32 => {
+                // 8 x fp32 lanes. vsub.f is the fp32 acc adder with b negated
+                // (sign bit flipped) -- same exp-255 special-value datapath as
+                // vadd.f. Verified bit-exact against 256/256 captured Phoenix
+                // lanes (nan-inf-add-sub-sweep, fp32 sub).
                 for i in 0..8 {
-                    let fa = f32::from_bits(a[i]);
-                    let fb = f32::from_bits(b[i]);
-                    result[i] = (fa - fb).to_bits();
+                    result[i] = super::vector_float::aie2_acc_fp32_add(a[i], b[i] ^ 0x8000_0000);
                 }
             }
             ElementType::Int16 | ElementType::UInt16 => {
@@ -164,13 +205,16 @@ impl VectorAlu {
                 }
             }
             ElementType::BFloat16 => {
+                // 16 x BFloat16 lanes. vsub.f = vconv to f32, fp32 acc add with
+                // b negated, NaN-preserving narrow back to bf16. Verified bit-exact
+                // against 256/256 captured Phoenix lanes (sweep, bf16 sub).
                 for i in 0..8 {
-                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
-                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
-                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
-                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
-                    let r_lo = Self::f32_to_bf16(a_lo - b_lo);
-                    let r_hi = Self::f32_to_bf16(a_hi - b_hi);
+                    let r_lo = Self::bf16_elem_addsub((a[i] & 0xFFFF) as u16, (b[i] & 0xFFFF) as u16, true);
+                    let r_hi = Self::bf16_elem_addsub(
+                        ((a[i] >> 16) & 0xFFFF) as u16,
+                        ((b[i] >> 16) & 0xFFFF) as u16,
+                        true,
+                    );
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -1035,10 +1079,11 @@ impl VectorAlu {
                 }
             }
             ElementType::Float32 => {
+                // Same fp32 vsub.f datapath as vector_sub (b negated through the
+                // acc adder); shares the silicon-verified exp-255 special-value
+                // rules (nan-inf-add-sub-sweep, fp32 sub).
                 for i in 0..8 {
-                    let fa = f32::from_bits(a[i]);
-                    let fb = f32::from_bits(b[i]);
-                    result[i] = (fa - fb).to_bits();
+                    result[i] = super::vector_float::aie2_acc_fp32_add(a[i], b[i] ^ 0x8000_0000);
                 }
             }
             ElementType::Int16 | ElementType::UInt16 => {
@@ -1053,13 +1098,14 @@ impl VectorAlu {
                 }
             }
             ElementType::BFloat16 => {
+                // Same bf16 vsub.f datapath as vector_sub (NaN-preserving narrow).
                 for i in 0..8 {
-                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
-                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
-                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
-                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
-                    let r_lo = Self::f32_to_bf16(a_lo - b_lo);
-                    let r_hi = Self::f32_to_bf16(a_hi - b_hi);
+                    let r_lo = Self::bf16_elem_addsub((a[i] & 0xFFFF) as u16, (b[i] & 0xFFFF) as u16, true);
+                    let r_hi = Self::bf16_elem_addsub(
+                        ((a[i] >> 16) & 0xFFFF) as u16,
+                        ((b[i] >> 16) & 0xFFFF) as u16,
+                        true,
+                    );
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -2430,6 +2476,150 @@ mod tests {
         // All values were denormalized f32 -> FTZ to 0 -> add(0,0) = 0.
         for (i, &v) in result_acc.iter().enumerate() {
             assert_eq!(v, 0, "acc lane {} should be 0 after FTZ, got {:#018x}", i, v);
+        }
+    }
+
+    // -- Elementwise fp32/bf16 add/sub special-value datapath (NaN/Inf/zero) --
+    //
+    // Ground truth captured from Phoenix (NPU1) silicon, full 16x16 operand-class
+    // matrix per (type, op): build/experiments/nan-inf-add-sub-sweep/vec_nan_*.hw.txt.
+    // The new model (aie2_acc_fp32_add for fp32; vconv + acc-add + NaN-preserving
+    // narrow for bf16) reproduces all 1024 captured lanes bit-exactly. The cases
+    // baked below cover every discriminator: signed-zero RNE, input denormal FTZ,
+    // finite overflow -> clean Inf, exact cancellation, Inf passing clean (NOT
+    // exp-255-normal), opposing Inf -> +NaN, NaN absorbing finite (mantissa forced
+    // to 1), sNaN treated as NaN, and the computed-mantissa NaN payload cases.
+    //
+    // (a_bits, b_bits, expected_out_bits) triples, decimal hex from the silicon dump.
+
+    fn fp32_add_lane0(a: u32, b: u32) -> u32 {
+        VectorAlu::vector_add(&[a, 0, 0, 0, 0, 0, 0, 0], &[b, 0, 0, 0, 0, 0, 0, 0], ElementType::Float32)[0]
+    }
+    fn fp32_sub_lane0(a: u32, b: u32) -> u32 {
+        VectorAlu::vector_sub(&[a, 0, 0, 0, 0, 0, 0, 0], &[b, 0, 0, 0, 0, 0, 0, 0], ElementType::Float32)[0]
+    }
+    fn bf16_add_lane0(a: u16, b: u16) -> u16 {
+        (VectorAlu::vector_add(
+            &[a as u32, 0, 0, 0, 0, 0, 0, 0],
+            &[b as u32, 0, 0, 0, 0, 0, 0, 0],
+            ElementType::BFloat16,
+        )[0] & 0xFFFF) as u16
+    }
+    fn bf16_sub_lane0(a: u16, b: u16) -> u16 {
+        (VectorAlu::vector_sub(
+            &[a as u32, 0, 0, 0, 0, 0, 0, 0],
+            &[b as u32, 0, 0, 0, 0, 0, 0, 0],
+            ElementType::BFloat16,
+        )[0] & 0xFFFF) as u16
+    }
+
+    #[test]
+    fn elementwise_fp32_add_special_values_match_silicon() {
+        // L1, L8, L10, L12, L19, L34, L68, L69, L102, L103, L109, L128, L137,
+        // L152, L160, L170, L174, L234 of vec_nan_fp32_add.hw.txt.
+        let cases: &[(u32, u32, u32)] = &[
+            (0x0000_0000, 0x8000_0000, 0x0000_0000), // +0 + -0 -> +0 (signed-zero RNE)
+            (0x0000_0000, 0x7F80_0000, 0x7F80_0000), // +0 + +inf -> clean Inf (NOT exp255-normal)
+            (0x0000_0000, 0x7FC0_0000, 0x7F80_0001), // +0 + +qnan -> NaN, mantissa forced 1
+            (0x0000_0000, 0x7FA0_0000, 0x7F80_0001), // +0 + +snan -> NaN, mantissa forced 1
+            (0x8000_0000, 0x8000_0001, 0x8000_0000), // -0 + -denorm -> denorm FTZ, sign kept
+            (0x0000_0001, 0x0000_0001, 0x0000_0000), // +denorm + +denorm -> input FTZ -> +0
+            (0x0080_0000, 0x0080_0000, 0x0100_0000), // +nsmall + +nsmall -> finite normal add
+            (0x0080_0000, 0x8080_0000, 0x0000_0000), // +nsmall + -nsmall -> exact cancel +0
+            (0x7F00_0000, 0x7F00_0000, 0x7F80_0000), // +nlarge + +nlarge -> overflow to clean Inf
+            (0x7F00_0000, 0xFF00_0000, 0x0000_0000), // +nlarge + -nlarge -> cancel +0
+            (0x7F00_0000, 0xFFA0_0000, 0xFFC0_0001), // +nlarge + -snan -> computed-mantissa NaN
+            (0x7F80_0000, 0x0000_0000, 0x7F80_0000), // +inf + +0 -> clean Inf
+            (0x7F80_0000, 0xFF80_0000, 0x7F80_0001), // +inf + -inf -> +NaN mantissa 1
+            (0xFF80_0000, 0x7F80_0000, 0x7F80_0001), // -inf + +inf -> +NaN (sign +)
+            (0x7FC0_0000, 0x0000_0000, 0x7F80_0001), // +qnan + +0 -> NaN absorbs (a side)
+            (0x7FC0_0000, 0x7FC0_0000, 0x7F80_0001), // +qnan + +qnan -> NaN mantissa 1
+            (0x7FC0_0000, 0x7FB5_5555, 0x7F80_0001), // +qnan + +qnan2 -> computed mantissa
+            (0x7FB5_5555, 0x7FC0_0000, 0x7F80_0001), // +qnan2 + +qnan -> order-swapped
+        ];
+        for &(a, b, want) in cases {
+            assert_eq!(fp32_add_lane0(a, b), want, "fp32 add {a:#010X} + {b:#010X}");
+        }
+    }
+
+    #[test]
+    fn elementwise_fp32_sub_special_values_match_silicon() {
+        let cases: &[(u32, u32, u32)] = &[
+            (0x0000_0000, 0x8000_0000, 0x0000_0000), // +0 - -0 -> +0
+            (0x0000_0000, 0x7F80_0000, 0xFF80_0000), // +0 - +inf -> -Inf clean
+            (0x0000_0000, 0x7FC0_0000, 0xFF80_0001), // +0 - +qnan -> NaN
+            (0x0000_0000, 0x7FA0_0000, 0xFF80_0001), // +0 - +snan -> NaN
+            (0x8000_0000, 0x8000_0001, 0x0000_0000), // -0 - -denorm -> denorm FTZ -> +0
+            (0x0000_0001, 0x0000_0001, 0x0000_0000), // +denorm - +denorm -> +0
+            (0x0080_0000, 0x0080_0000, 0x0000_0000), // +nsmall - +nsmall -> +0
+            (0x0080_0000, 0x8080_0000, 0x0100_0000), // +nsmall - -nsmall -> 2x normal
+            (0x7F00_0000, 0x7F00_0000, 0x0000_0000), // +nlarge - +nlarge -> +0
+            (0x7F00_0000, 0xFF00_0000, 0x7F80_0000), // +nlarge - -nlarge -> overflow Inf
+            (0x7F00_0000, 0xFFA0_0000, 0x7F80_0001), // +nlarge - -snan -> NaN
+            (0x7F80_0000, 0x0000_0000, 0x7F80_0000), // +inf - +0 -> clean Inf
+            (0x7F80_0000, 0xFF80_0000, 0x7F80_0000), // +inf - -inf -> +Inf (same-sign after negate)
+            (0xFF80_0000, 0x7F80_0000, 0xFF80_0000), // -inf - +inf -> -Inf
+            (0x7FC0_0000, 0x0000_0000, 0x7F80_0001), // +qnan - +0 -> NaN
+            (0x7FC0_0000, 0x7FC0_0000, 0x7F80_0001), // +qnan - +qnan -> NaN
+            (0x7FC0_0000, 0x7FB5_5555, 0x7FAA_AAB1), // +qnan - +qnan2 -> computed mantissa
+            (0x7FB5_5555, 0x7FC0_0000, 0xFFAA_AAB1), // +qnan2 - +qnan -> order-swapped
+        ];
+        for &(a, b, want) in cases {
+            assert_eq!(fp32_sub_lane0(a, b), want, "fp32 sub {a:#010X} - {b:#010X}");
+        }
+    }
+
+    #[test]
+    fn elementwise_bf16_add_special_values_match_silicon() {
+        let cases: &[(u16, u16, u16)] = &[
+            (0x0000, 0x8000, 0x0000), // +0 + -0 -> +0
+            (0x0000, 0x7F80, 0x7F80), // +0 + +inf -> clean Inf
+            (0x0000, 0x7FC0, 0x7F81), // +0 + +qnan -> NaN, mantissa forced 1
+            (0x0000, 0x7FA0, 0x7F81), // +0 + +snan -> NaN
+            (0x8000, 0x8001, 0x8000), // -0 + -denorm -> FTZ, sign kept
+            (0x0001, 0x0001, 0x0000), // +denorm + +denorm -> +0
+            (0x3880, 0x3880, 0x3900), // +nsmall + +nsmall -> finite normal add
+            (0x3880, 0xB880, 0x0000), // +nsmall + -nsmall -> +0
+            (0x7F00, 0x7F00, 0x7F80), // +nlarge + +nlarge -> overflow to clean Inf
+            (0x7F00, 0xFF00, 0x0000), // +nlarge + -nlarge -> +0
+            (0x7F00, 0xFFA0, 0xFFC0), // +nlarge + -snan -> computed-mantissa NaN
+            (0x7F80, 0x0000, 0x7F80), // +inf + +0 -> clean Inf
+            (0x7F80, 0xFF80, 0x7F81), // +inf + -inf -> +NaN
+            (0xFF80, 0x7F80, 0x7F81), // -inf + +inf -> +NaN
+            (0x7FC0, 0x0000, 0x7F81), // +qnan + +0 -> NaN
+            (0x7FC0, 0x7FC0, 0x7F81), // +qnan + +qnan -> NaN
+            (0x7FC0, 0x7FD5, 0x7F81), // +qnan + +qnan2 -> NaN (narrow collapses to mant 1)
+            (0x7FD5, 0x7FC0, 0x7F81), // +qnan2 + +qnan -> order-swapped
+        ];
+        for &(a, b, want) in cases {
+            assert_eq!(bf16_add_lane0(a, b), want, "bf16 add {a:#06X} + {b:#06X}");
+        }
+    }
+
+    #[test]
+    fn elementwise_bf16_sub_special_values_match_silicon() {
+        let cases: &[(u16, u16, u16)] = &[
+            (0x0000, 0x8000, 0x0000), // +0 - -0 -> +0
+            (0x0000, 0x7F80, 0xFF80), // +0 - +inf -> -Inf
+            (0x0000, 0x7FC0, 0xFF81), // +0 - +qnan -> NaN
+            (0x0000, 0x7FA0, 0xFF81), // +0 - +snan -> NaN
+            (0x8000, 0x8001, 0x0000), // -0 - -denorm -> +0
+            (0x0001, 0x0001, 0x0000), // +denorm - +denorm -> +0
+            (0x3880, 0x3880, 0x0000), // +nsmall - +nsmall -> +0
+            (0x3880, 0xB880, 0x3900), // +nsmall - -nsmall -> 2x normal
+            (0x7F00, 0x7F00, 0x0000), // +nlarge - +nlarge -> +0
+            (0x7F00, 0xFF00, 0x7F80), // +nlarge - -nlarge -> overflow Inf
+            (0x7F00, 0xFFA0, 0x7F81), // +nlarge - -snan -> NaN
+            (0x7F80, 0x0000, 0x7F80), // +inf - +0 -> clean Inf
+            (0x7F80, 0xFF80, 0x7F80), // +inf - -inf -> +Inf
+            (0xFF80, 0x7F80, 0xFF80), // -inf - +inf -> -Inf
+            (0x7FC0, 0x0000, 0x7F81), // +qnan - +0 -> NaN
+            (0x7FC0, 0x7FC0, 0x7F81), // +qnan - +qnan -> NaN
+            (0x7FC0, 0x7FD5, 0xFFA8), // +qnan - +qnan2 -> computed-mantissa NaN
+            (0x7FD5, 0x7FC0, 0x7FA8), // +qnan2 - +qnan -> order-swapped
+        ];
+        for &(a, b, want) in cases {
+            assert_eq!(bf16_sub_lane0(a, b), want, "bf16 sub {a:#06X} - {b:#06X}");
         }
     }
 }
