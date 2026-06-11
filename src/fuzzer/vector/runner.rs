@@ -167,8 +167,13 @@ fn run_emulator_vec(
     let test = XclbinTest::from_path(xclbin_path).with_buffer_spec(spec);
     let suite = XclbinSuite::new().with_max_cycles(max_cycles);
     fuzz_recorder::arm();
-    let (_outcome, raw_output, trace) = suite.run_single_with_trace(&test);
+    let (outcome, raw_output, trace) = suite.run_single_with_trace(&test);
     let executed = fuzz_recorder::take().unwrap_or_default();
+    // A non-pass outcome means the output buffer is stale zeros, not computed
+    // data; comparing it would mis-attribute the failure to vector compute.
+    if !outcome.is_pass() {
+        return Err(format!("emulator outcome not pass: {outcome:?}"));
+    }
     let output = raw_output.ok_or_else(|| "Emulator produced no output".to_string())?;
     Ok((output, trace, executed))
 }
@@ -595,6 +600,10 @@ fn run_replay(dir: &Path, opts: &VecFuzzOptions) {
                         "{name}: still divergent at slice {slice} -> key {}",
                         slice_to_key(&chain, slice)
                     );
+                    // Dump the EMU side next to the banked HW output for byte diffs.
+                    if let Err(e) = std::fs::write(case_dir.join("emu_output.bin"), &emu_out) {
+                        eprintln!("{name}: emu_output.bin write error: {e}");
+                    }
                 }
             },
         }
