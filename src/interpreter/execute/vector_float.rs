@@ -547,7 +547,18 @@ pub fn aie2_acc_fp32_add(a_bits: u32, b_bits: u32) -> u32 {
     let exp_zeros = !(underflow || real_zero);
 
     let sgn_out = if !nan && (pinf || minf) { minf } else { sgn_sum };
-    let rr = (if out_zeros { r as u32 } else { 0 }) | u32::from(nan);
+    // NaN-payload datapath regime. When a NaN INPUT is present and the mantissa
+    // datapath does not overflow, silicon exposes the datapath sum `r` itself as
+    // the result NaN payload (e.g. +Inf + -NaN(0x46) -> bf16 0xFF8C, the
+    // normalized magnitude of 0x800000-0xC60000); it does NOT canonicalize. On
+    // overflow (same-sign Inf+NaN, mantissa carry-out) silicon canonicalizes the
+    // payload to 1. Validated 8160/8160 against NPU1 dense special-value sweeps
+    // (build/experiments/special-value-dense, captured in this datapath regime).
+    // A second, residual-HW-state regime canonicalizes all such payloads to 1;
+    // it is non-architectural (selected by float-unit residual state, survives a
+    // driver reload) -- we model the datapath regime, which is the dominant one.
+    let use_r = (a_nan || b_nan) && !overflow;
+    let rr = (if out_zeros || use_r { r as u32 } else { 0 }) | u32::from(nan);
     let e8 = if exp_ones {
         0xFF
     } else if exp_zeros {
