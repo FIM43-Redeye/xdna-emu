@@ -393,6 +393,10 @@ pub struct ExecutionContext {
     /// (see PendingAccAdd).
     pending_acc_adds: Vec<PendingAccAdd>,
 
+    /// Deferred MAC-family multiplies awaiting their stage-3 accumulator
+    /// source read (see execute::vector_matmul::PendingMatmul).
+    pending_matmuls: Vec<crate::interpreter::execute::vector_matmul::PendingMatmul>,
+
     /// Deferred fused vlda.ups awaiting their stage-7 shift read
     /// (see PendingUpsLoad).
     pending_ups_loads: Vec<PendingUpsLoad>,
@@ -542,6 +546,7 @@ impl ExecutionContext {
             pending_stores: Vec::new(),
             pending_unpacks: Vec::new(),
             pending_acc_adds: Vec::new(),
+            pending_matmuls: Vec::new(),
             pending_ups_loads: Vec::new(),
             cycle_core_banks: 0,
             srs_config: SrsConfig::default(),
@@ -953,6 +958,9 @@ impl ExecutionContext {
     /// load completes. We approximate this by committing all pending
     /// writes before the dependent instruction reads.
     pub fn force_commit_all_pending(&mut self) {
+        // Deferred matmuls first: completing them queues their destination
+        // writes, which the flush below then applies.
+        crate::interpreter::execute::vector_matmul::drain_pending_matmuls(self);
         let writes: Vec<_> = self.pending_writes.drain(..).collect();
         for pw in &writes {
             self.apply_pending_write(pw);
@@ -1295,6 +1303,42 @@ impl ExecutionContext {
                 self.accumulator.write(pa.dst_reg, result);
             }
         }
+    }
+
+    /// Queue a MAC-family multiply for its stage-3 accumulator source read
+    /// (see execute::vector_matmul::PendingMatmul). Vector sources and control
+    /// flags are sampled by the caller at issue.
+    pub fn queue_pending_matmul(&mut self, p: crate::interpreter::execute::vector_matmul::PendingMatmul) {
+        self.pending_matmuls.push(p);
+    }
+
+    /// Take the deferred matmuls whose accumulator-read bundle arrived,
+    /// in ready order. Completion lives in execute::vector_matmul.
+    pub fn take_ready_pending_matmuls(
+        &mut self,
+    ) -> Vec<crate::interpreter::execute::vector_matmul::PendingMatmul> {
+        if self.pending_matmuls.is_empty() {
+            return Vec::new();
+        }
+        let current = self.bundle_seq;
+        let mut ready = Vec::new();
+        self.pending_matmuls.retain(|p| {
+            if p.ready_bundle <= current {
+                ready.push(p.clone());
+                false
+            } else {
+                true
+            }
+        });
+        ready.sort_by_key(|p| p.ready_bundle);
+        ready
+    }
+
+    /// Take ALL deferred matmuls regardless of bundle (force-commit path).
+    pub fn take_all_pending_matmuls(
+        &mut self,
+    ) -> Vec<crate::interpreter::execute::vector_matmul::PendingMatmul> {
+        std::mem::take(&mut self.pending_matmuls)
     }
 
     /// Queue a fused `vlda.ups` for its stage-7 shift-register read (see

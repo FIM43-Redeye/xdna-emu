@@ -722,6 +722,12 @@ impl CycleAccurateExecutor {
         // bundle are visible, before slot execution).
         ctx.process_pending_unpacks();
 
+        // Complete deferred MAC-family multiplies whose stage-3 accumulator
+        // read bundle arrived (after commit_pending_writes so a chained
+        // VMUL's write landing this cycle is visible -- hardware forwarding;
+        // before acc add/sub sampling so their relative order is preserved).
+        super::vector_matmul::process_pending_matmuls(ctx);
+
         // Sample sources for accumulator add/subs whose stage-3 read bundle
         // arrived (after commit_pending_writes so MAC/conv results that land
         // this cycle are visible).

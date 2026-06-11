@@ -34,6 +34,55 @@ use crate::interpreter::execute::vector_config::{AccWidth, MatMulConfig};
 use crate::interpreter::state::{ExecutionContext, Vec512, Acc1024};
 use xdna_archspec::aie2::isa::SemanticOp;
 
+/// VMAC accumulator-source read latency in issued bundles.
+///
+/// II_VMAC / II_VMACf (AIE2Schedule.td) read their accumulator source at
+/// operand cycle 3 ([5,3,1,1,1] / [6,3,1,1,1]): vector sources at issue,
+/// acc source three cycles later. Peano chains VMUL -> VMAC at distance 2
+/// (seed 5039 silicon: `vmul cm0` then `vmac cm0, cm0` two bundles later),
+/// so the VMAC's acc read at +3 lands exactly on the VMUL's stage-5 write --
+/// hardware forwards the fresh value. Sampling at issue read the poison
+/// accumulator. Process AFTER commit_pending_writes (the producer's write
+/// commits first), mirroring the forwarding behavior.
+const VMAC_ACC_SRC_READ_LATENCY: u64 = 3;
+
+/// Sparse operand bytes captured at issue for a deferred sparse VMAC.
+#[derive(Debug, Clone)]
+pub struct PendingSparse {
+    a_bytes: [u8; 128],
+    b_comp: [u8; 64],
+    mask: u128,
+    sub0: bool,
+    sub1: bool,
+    sub2: bool,
+    conf_val: u32,
+}
+
+/// A MAC-family instruction awaiting its stage-3 accumulator source read.
+///
+/// Vector sources, config word, and all control flags are sampled at issue
+/// (operand cycle 1); only the accumulator sources are read at +3. The result
+/// then carries the remaining write latency so the destination still commits
+/// at the full MAC latency from issue.
+#[derive(Debug, Clone)]
+pub struct PendingMatmul {
+    /// Dense A/B vector sources sampled at issue (None for sparse).
+    dense: Option<(Vec512, Vec512)>,
+    /// Sparse operands sampled at issue (None for dense).
+    sparse: Option<Box<PendingSparse>>,
+    config: MatMulConfig,
+    /// Second accumulator merge: None, Some(false)=AddMac, Some(true)=SubMac.
+    acc2_sub: Option<bool>,
+    acc_src: u8,
+    acc2_reg: u8,
+    acc_dest: u8,
+    is_half: bool,
+    /// Remaining destination write latency (cycles) after the source read.
+    write_latency: u64,
+    /// Issued-bundle count at which the accumulator sources are read.
+    pub ready_bundle: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Entry point: execute_matmul
 // ---------------------------------------------------------------------------
@@ -187,43 +236,17 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         })
         .unwrap_or(acc_dest);
 
-    let mut acc = if is_half {
-        // bm (512-bit): read single register, pad to 1024-bit working buffer.
-        let half = ctx.accumulator.read(acc_src);
-        let mut buf = [0u64; 16];
-        buf[..8].copy_from_slice(&half);
-        buf
-    } else {
-        // cm (1024-bit): read wide pair.
-        ctx.accumulator.read_wide(acc_src & !1)
+    // Second accumulator merge mode (AddMac/SubMac). The acc2 REGISTER is
+    // resolved at issue; its value is read with the deferred acc sources.
+    let acc2_sub = match semantic {
+        SemanticOp::AddMac => Some(false),
+        SemanticOp::SubMac => Some(true),
+        _ => None,
     };
 
-    // For AddMac/SubMac: read the second accumulator source.
-    //
-    // In bfloat mode, acc2 participates in the 68-bit PSA adder BEFORE
-    // normalization (hardware: psal_hw merges products + acc1 + acc2, then
-    // bfnorm_hw normalizes). We pass acc2 into matmul_config_driven so
-    // bf16_mac_hw_lane can include it in the pre-normalization sum.
-    //
-    // In integer mode, acc2 is a simple post-multiply add/sub.
-    let (acc2_for_bfloat, is_sub_acc2) = match semantic {
-        SemanticOp::AddMac | SemanticOp::SubMac if config.bfloat => {
-            let src_reg = get_acc_source(op);
-            let src_acc = if is_half {
-                let half = ctx.accumulator.read(src_reg);
-                let mut buf = [0u64; 16];
-                buf[..8].copy_from_slice(&half);
-                buf
-            } else {
-                ctx.accumulator.read_wide(src_reg & !1)
-            };
-            (Some(src_acc), semantic == SemanticOp::SubMac)
-        }
-        _ => (None, false),
-    };
-
-    // Read input vectors and perform multiply.
-    if is_sparse {
+    // Sample the vector sources and control flags at issue (operand cycle 1);
+    // defer the accumulator source read and the multiply to +3.
+    let (dense, sparse) = if is_sparse {
         let (a_bytes, b_register, mask) = get_sparse_operands(op, ctx);
 
         // Determine sub0/sub1/sub2 flags from instruction encoding bits.
@@ -254,99 +277,151 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         let sub0 = is_msc ^ is_neg;
         let sub1 = is_neg;
         let sub2 = matches!(semantic, SemanticOp::SubMac);
-
-        // For AddMac/SubMac with bfloat, acc2 participates in the PSA
-        // adder. Pass it as scd to sparse_vmac.
-        let scd = match (semantic, config.bfloat) {
-            (SemanticOp::AddMac | SemanticOp::SubMac, true) => {
-                let src_reg = get_acc_source(op);
-                if is_half {
-                    let half = ctx.accumulator.read(src_reg);
-                    let mut buf = [0u64; 16];
-                    buf[..8].copy_from_slice(&half);
-                    buf
-                } else {
-                    ctx.accumulator.read_wide(src_reg & !1)
-                }
-            }
-            _ => [0u64; 16],
-        };
-
-        // Use the hardware-faithful vmac pipeline.
-        acc =
-            super::vmac_hw::sparse_vmac(&a_bytes, &b_register, mask, &acc, &scd, conf_val, sub0, sub1, sub2);
+        (
+            None,
+            Some(Box::new(PendingSparse { a_bytes, b_comp: b_register, mask, sub0, sub1, sub2, conf_val })),
+        )
     } else {
-        let (a, b) = get_two_vec512(op, ctx);
-        matmul_config_driven(&mut acc, &a, &b, &config, acc2_for_bfloat.as_ref(), is_sub_acc2);
-    }
+        (Some(get_two_vec512(op, ctx)), None)
+    };
 
-    // For integer AddMac/SubMac: merge acc2 AFTER the multiply.
-    // (Bfloat AddMac/SubMac is handled inside bf16_mac_hw_lane above.)
-    match semantic {
-        SemanticOp::AddMac | SemanticOp::SubMac if !config.bfloat => {
-            let src_reg = get_acc_source(op);
-            let src_acc = if is_half {
-                let half = ctx.accumulator.read(src_reg);
-                let mut buf = [0u64; 16];
-                buf[..8].copy_from_slice(&half);
-                buf
-            } else {
-                ctx.accumulator.read_wide(src_reg & !1)
-            };
-            let n = if is_half { 8 } else { 16 };
-            let is_sub = semantic == SemanticOp::SubMac;
-
-            match config.acc_width {
-                AccWidth::Acc32 => {
-                    // Acc32: two i32 values per u64, added independently.
-                    for i in 0..n {
-                        let a_lo = (acc[i] & 0xFFFF_FFFF) as u32;
-                        let a_hi = (acc[i] >> 32) as u32;
-                        let s_lo = (src_acc[i] & 0xFFFF_FFFF) as u32;
-                        let s_hi = (src_acc[i] >> 32) as u32;
-                        let (r_lo, r_hi) = if is_sub {
-                            (a_lo.wrapping_sub(s_lo), a_hi.wrapping_sub(s_hi))
-                        } else {
-                            (a_lo.wrapping_add(s_lo), a_hi.wrapping_add(s_hi))
-                        };
-                        acc[i] = (r_lo as u64) | ((r_hi as u64) << 32);
-                    }
-                }
-                AccWidth::Acc64 => {
-                    // Acc64: full 64-bit add/sub on each u64 lane.
-                    for i in 0..n {
-                        if is_sub {
-                            acc[i] = acc[i].wrapping_sub(src_acc[i]);
-                        } else {
-                            acc[i] = acc[i].wrapping_add(src_acc[i]);
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    // Write the result back to the DESTINATION accumulator with the MAC result
-    // latency (LATENCY_VECTOR_MAC = 5, from llvm-aie II_VMAC/II_VMUL
-    // operand_cycles[0]=5). Deferring the write models the AIE2 MAC pipeline: in
-    // a software-pipelined batch loop, the stores draining a tile read the
-    // previous tile's accumulator while the next tile's VMUL is still in flight.
-    // Writing immediately makes the result visible too early and shifts every
-    // tile one ahead. `is_half` selects the 512-bit bm-half vs 1024-bit cm-pair
-    // write inside the deferred apply.
-    // Float (bf16/fp32) MAC has a longer result latency than integer (6 vs 5)
-    // for the normalization stage; using the integer latency on a bf16
-    // software-pipelined loop shifts every stored tile by one (II_VMACf /
-    // II_VMULf operand_cycles[0]=6 vs II_VMAC/II_VMUL=5).
+    // Total result latency from issue: LATENCY_VECTOR_MAC = 5 (llvm-aie
+    // II_VMAC/II_VMUL operand_cycles[0]=5). Deferring the write models the
+    // AIE2 MAC pipeline: in a software-pipelined batch loop, the stores
+    // draining a tile read the previous tile's accumulator while the next
+    // tile's VMUL is still in flight. Float (bf16/fp32) MAC has one extra
+    // normalization stage (II_VMACf/II_VMULf operand_cycles[0]=6).
+    // The acc sources are read at +3 (VMAC_ACC_SRC_READ_LATENCY); the write
+    // carries the remaining latency so it still lands at issue+5 (int) /
+    // issue+6 (float).
     let latency = if config.bfloat {
         crate::interpreter::timing::latency::LATENCY_VECTOR_MAC_F
     } else {
         crate::interpreter::timing::latency::LATENCY_VECTOR_MAC
     } as u64;
-    ctx.queue_matmul_accum_write(Operand::AccumReg(acc_dest), acc, is_half, latency);
+
+    ctx.queue_pending_matmul(PendingMatmul {
+        dense,
+        sparse,
+        config,
+        acc2_sub,
+        acc_src,
+        // acc2 register only exists for AddMac/SubMac; resolving it on other
+        // forms would log a spurious missing-AccumReg error (VMUL has none).
+        acc2_reg: if acc2_sub.is_some() { get_acc_source(op) } else { 0 },
+        acc_dest,
+        is_half,
+        write_latency: latency.saturating_sub(VMAC_ACC_SRC_READ_LATENCY),
+        ready_bundle: ctx.bundle_seq + VMAC_ACC_SRC_READ_LATENCY,
+    });
 
     true
+}
+
+/// Read a full 1024-bit working accumulator from `reg` (bm half padded high).
+fn read_acc_full(ctx: &ExecutionContext, reg: u8, is_half: bool) -> Acc1024 {
+    if is_half {
+        let half = ctx.accumulator.read(reg);
+        let mut buf = [0u64; 16];
+        buf[..8].copy_from_slice(&half);
+        buf
+    } else {
+        ctx.accumulator.read_wide(reg & !1)
+    }
+}
+
+/// Complete a deferred MAC-family instruction: read its accumulator sources
+/// (operand cycle 3), perform the multiply, and queue the destination write
+/// with the remaining latency.
+fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
+    let mut acc = read_acc_full(ctx, p.acc_src, p.is_half);
+
+    // For AddMac/SubMac: read the second accumulator source.
+    //
+    // In bfloat mode, acc2 participates in the 68-bit PSA adder BEFORE
+    // normalization (hardware: psal_hw merges products + acc1 + acc2, then
+    // bfnorm_hw normalizes). In integer mode, acc2 is a post-multiply add/sub.
+    let acc2 = p.acc2_sub.map(|_| read_acc_full(ctx, p.acc2_reg, p.is_half));
+
+    if let Some(sp) = &p.sparse {
+        // For AddMac/SubMac with bfloat, acc2 participates in the PSA adder
+        // (scd input). Use the hardware-faithful vmac pipeline.
+        let scd = if p.config.bfloat {
+            acc2.unwrap_or([0u64; 16])
+        } else {
+            [0u64; 16]
+        };
+        acc = super::vmac_hw::sparse_vmac(
+            &sp.a_bytes,
+            &sp.b_comp,
+            sp.mask,
+            &acc,
+            &scd,
+            sp.conf_val,
+            sp.sub0,
+            sp.sub1,
+            sp.sub2,
+        );
+    } else if let Some((a, b)) = &p.dense {
+        let acc2_for_bfloat = if p.config.bfloat { acc2.as_ref() } else { None };
+        matmul_config_driven(&mut acc, a, b, &p.config, acc2_for_bfloat, p.acc2_sub.unwrap_or(false));
+    }
+
+    // For integer AddMac/SubMac: merge acc2 AFTER the multiply.
+    // (Bfloat AddMac/SubMac is handled inside bf16_mac_hw_lane above.)
+    if let (Some(is_sub), Some(src_acc), false) = (p.acc2_sub, acc2, p.config.bfloat) {
+        let n = if p.is_half { 8 } else { 16 };
+        match p.config.acc_width {
+            AccWidth::Acc32 => {
+                // Acc32: two i32 values per u64, added independently.
+                for i in 0..n {
+                    let a_lo = (acc[i] & 0xFFFF_FFFF) as u32;
+                    let a_hi = (acc[i] >> 32) as u32;
+                    let s_lo = (src_acc[i] & 0xFFFF_FFFF) as u32;
+                    let s_hi = (src_acc[i] >> 32) as u32;
+                    let (r_lo, r_hi) = if is_sub {
+                        (a_lo.wrapping_sub(s_lo), a_hi.wrapping_sub(s_hi))
+                    } else {
+                        (a_lo.wrapping_add(s_lo), a_hi.wrapping_add(s_hi))
+                    };
+                    acc[i] = (r_lo as u64) | ((r_hi as u64) << 32);
+                }
+            }
+            AccWidth::Acc64 => {
+                // Acc64: full 64-bit add/sub on each u64 lane.
+                for i in 0..n {
+                    acc[i] = if is_sub {
+                        acc[i].wrapping_sub(src_acc[i])
+                    } else {
+                        acc[i].wrapping_add(src_acc[i])
+                    };
+                }
+            }
+        }
+    }
+
+    ctx.queue_matmul_accum_write(Operand::AccumReg(p.acc_dest), acc, p.is_half, p.write_latency);
+}
+
+/// Complete deferred MAC-family instructions whose stage-3 accumulator read
+/// bundle arrived. Call once per issued bundle, after `commit_pending_writes`
+/// (so a chained VMUL's write landing this cycle is visible -- hardware
+/// forwarding) and before slot execution.
+pub fn process_pending_matmuls(ctx: &mut ExecutionContext) {
+    let ready = ctx.take_ready_pending_matmuls();
+    for p in ready {
+        complete_matmul(ctx, &p);
+    }
+}
+
+/// Force-complete ALL deferred MAC-family instructions regardless of bundle
+/// (used by force_commit_all_pending; the destination writes are queued and
+/// drained by the caller's pending-write flush).
+pub fn drain_pending_matmuls(ctx: &mut ExecutionContext) {
+    let all = ctx.take_all_pending_matmuls();
+    for p in all {
+        complete_matmul(ctx, &p);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1739,6 +1814,55 @@ mod tests {
         }
     }
 
+    /// Step the context the way the cycle-accurate loop does: advance both
+    /// clocks, commit pending writes, then complete ready deferred matmuls.
+    fn step_bundle(ctx: &mut ExecutionContext) {
+        ctx.cycles += 1;
+        ctx.bundle_seq += 1;
+        ctx.commit_pending_writes();
+        process_pending_matmuls(ctx);
+    }
+
+    #[test]
+    fn test_vmac_acc_source_read_at_stage3_sees_chained_vmul() {
+        // Peano chains `vmul cm0, x0, x2` then `vmac cm0, cm0, x0, x2` at
+        // distance 2 (seed 5039 silicon, fuzz banked 2026-06-10). II_VMAC
+        // reads its accumulator source at operand cycle 3, exactly when the
+        // VMUL's stage-5 write lands -- hardware forwards the fresh value.
+        // Reading at issue saw the poison accumulator (all banked mmac seeds
+        // showed 0xDEADBEEF + mac contribution on EMU vs mul+mac on silicon).
+        let mut ctx = ExecutionContext::new();
+        ctx.accumulator.write_wide(0, [0xDEAD_BEEF_DEAD_BEEFu64; 16]);
+
+        let ones = vec512_all_ones_i8();
+        ctx.vector.write_wide(0, ones);
+        ctx.vector.write_wide(2, ones);
+        ctx.scalar.write(5, config_i8xi8_accumulate());
+
+        // Bundle 0: vmul (fresh multiply, zeroes acc).
+        let mul = make_mac_op(SemanticOp::MatMul, 0, 2, 5, 0, Some("VMUL_vmac_cm_core_dense"));
+        assert!(execute_matmul(&mul, &mut ctx));
+
+        step_bundle(&mut ctx);
+        step_bundle(&mut ctx);
+
+        // Bundle 2: vmac chained on the same accumulator.
+        let mac = make_mac_op(SemanticOp::Mac, 0, 2, 5, 0, Some("VMAC_vmac_cm_core_dense"));
+        assert!(execute_matmul(&mac, &mut ctx));
+
+        for _ in 0..8 {
+            step_bundle(&mut ctx);
+        }
+
+        let acc = ctx.accumulator.read_wide(0);
+        for i in 0..32 {
+            let lane = i / 2;
+            let half = i % 2;
+            let val = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as i32;
+            assert_eq!(val, 16, "output[{i}]: chained vmul+vmac must be 8+8=16, got {val}");
+        }
+    }
+
     #[test]
     fn test_matmul_bf16_uses_float_latency_six() {
         // Float (bf16) vector MAC has result latency 6 (llvm-aie II_VMULf /
@@ -1764,15 +1888,17 @@ mod tests {
         assert!(execute_matmul(&op, &mut ctx));
 
         // At issue+5 the float result must NOT yet be visible (integer latency
-        // would have committed here; float latency 6 must not).
-        ctx.cycles = 105;
-        ctx.commit_pending_writes();
+        // would have committed here; float latency 6 must not). step_bundle
+        // advances both clocks and completes the deferred acc-source read at
+        // issue+3 along the way.
+        for _ in 0..5 {
+            step_bundle(&mut ctx);
+        }
         let bits5 = (ctx.accumulator.read_wide(0)[0] & 0xFFFF_FFFF) as u32;
         assert_eq!(bits5, 0, "bf16 matmul result must NOT be visible at issue+5 (float latency is 6)");
 
         // At issue+6 it commits.
-        ctx.cycles = 106;
-        ctx.commit_pending_writes();
+        step_bundle(&mut ctx);
         let bits6 = (ctx.accumulator.read_wide(0)[0] & 0xFFFF_FFFF) as u32;
         let v = f32::from_bits(bits6);
         assert!((v - 8.0).abs() < 0.01, "bf16 result must be visible at issue+6, got {}", v);
