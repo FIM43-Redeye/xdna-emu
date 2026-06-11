@@ -192,7 +192,9 @@ fn build_table() -> Vec<OpEntry> {
 
         // Tier 1: vector movement. vexin swaps halves via extract+insert
         // (mode = which half is rewritten); elem_ins copies the top lane into
-        // lane mode*lanes/4 via VEXTRACT.elem/VINSERT. All lanes defined.
+        // lane mode*lanes/4. elem_ins lowers via select+single-lane mask, NOT
+        // vector::set -- set on 8-bit lanes references an undefined
+        // ::shuffle(v8DB64) symbol that only fails at link (Peano lib gap).
         t.push(un("vexin", vt, 2, |a, m, vt| {
             let half = vt.lanes() / 2;
             format!(
@@ -201,16 +203,17 @@ fn build_table() -> Vec<OpEntry> {
                 1 - m
             )
         }));
-        t.push(un("elem_ins", vt, 4, |a, m, vt| {
-            let lane = m as usize * (vt.lanes() / 4);
-            format!("[&]{{ auto t = {0}; t.set({0}.get({1}), {lane}u); return t; }}()", a[0], vt.lanes() - 1)
-        }));
+        t.push(un("elem_ins", vt, 4, elem_ins_emit));
     }
 
     // Tier 1: matrix engine (aie::mmul tiles). A/B come from the full-width
     // inputs via extract; the accumulator couples back through SRS via
     // to_vector (fixed shift 0). mac variants accumulate a second product on
     // top of mul, exercising the acc-accumulate path with defined state.
+    // i8 uses the native 4x8x8 tile (Half-A shape): 4x8x4 i8 compiles but
+    // references an undefined runtime-mode ::shuffle(v8DB64) symbol that
+    // only fails at LINK time (Peano lib gap; same root as elem_ins set).
+    // C is 32 i32; the low 16 couple onward.
     t.push(OpEntry {
         name: "mmul_i8",
         in_types: vec![VecType::I8x64, VecType::I8x64],
@@ -218,7 +221,7 @@ fn build_table() -> Vec<OpEntry> {
         modes: 1,
         emit: |a, _, _| {
             format!(
-                "[&]{{ aie::mmul<4, 8, 4, int8, int8, accauto> m; m.mul({0}.extract<32>(0), {1}.extract<32>(0)); return m.to_vector<int32>(0); }}()",
+                "[&]{{ aie::mmul<4, 8, 8, int8, int8, accauto> m; m.mul({0}.extract<32>(0), {1}); return m.to_vector<int32>(0).extract<16>(0); }}()",
                 a[0], a[1]
             )
         },
@@ -230,7 +233,7 @@ fn build_table() -> Vec<OpEntry> {
         modes: 1,
         emit: |a, _, _| {
             format!(
-                "[&]{{ aie::mmul<4, 8, 4, int8, int8, accauto> m; m.mul({0}.extract<32>(0), {1}.extract<32>(0)); m.mac({0}.extract<32>(1), {1}.extract<32>(1)); return m.to_vector<int32>(0); }}()",
+                "[&]{{ aie::mmul<4, 8, 8, int8, int8, accauto> m; m.mul({0}.extract<32>(0), {1}); m.mac({0}.extract<32>(1), {1}); return m.to_vector<int32>(0).extract<16>(0); }}()",
                 a[0], a[1]
             )
         },
@@ -348,12 +351,28 @@ fn build_table() -> Vec<OpEntry> {
         let half = vt.lanes() / 2;
         format!("[&]{{ auto t = {0}; t.insert({m}, {0}.extract<{half}>({1})); return t; }}()", a[0], 1 - m)
     }));
-    t.push(un("elem_ins", bf, 4, |a, m, vt| {
-        let lane = m as usize * (vt.lanes() / 4);
-        format!("[&]{{ auto t = {0}; t.set({0}.get({1}), {lane}u); return t; }}()", a[0], vt.lanes() - 1)
-    }));
+    t.push(un("elem_ins", bf, 4, elem_ins_emit));
 
     t
+}
+
+/// elem_ins emit: copy the top lane into lane `mode * lanes/4` via
+/// select + single-lane mask (vsel + vbcst), avoiding `vector::set`, which
+/// references an undefined `::shuffle(v8DB64)` symbol at link for 8-bit lanes.
+fn elem_ins_emit(a: &[String], m: u8, vt: VecType) -> String {
+    let lanes = vt.lanes();
+    let lane = m as usize * (lanes / 4);
+    let mask = if lanes == 64 {
+        format!("aie::mask<64>::from_uint64(1ull << {lane})")
+    } else {
+        format!("aie::mask<{lanes}>::from_uint32(1u << {lane})")
+    };
+    format!(
+        "aie::select({0}, aie::broadcast<{ct}, {lanes}>({0}.get({top})), {mask})",
+        a[0],
+        ct = vt.ctype(),
+        top = lanes - 1
+    )
 }
 
 /// Broadcast a compare mask (named by `mask`) to all lanes of `vt`. Lane

@@ -751,7 +751,21 @@ mod tests {
                     }
                     tools.apply_env(&mut cmd);
                     match cmd.output() {
-                        Ok(out) if out.status.success() => {}
+                        Ok(out) if out.status.success() => {
+                            // A successful compile can still fail to LINK: some
+                            // aie_api paths (i8 mmul 4x8x4, vector::set on 8-bit
+                            // lanes) reference an undefined runtime-mode
+                            // ::shuffle(v8DB64) symbol Peano's lib never defines.
+                            // Scan undefined symbols so link gaps fail here, not
+                            // in the aiecc pipeline. memset/memcpy resolve from
+                            // compiler-rt and are expected.
+                            if let Some(und) = undefined_symbols(tools, &case_dir.join("fuzz_kernel.cc.o")) {
+                                failures
+                                    .lock()
+                                    .unwrap()
+                                    .push(format!("seed {seed} key {key}: undefined symbols:\n{und}"));
+                            }
+                        }
                         Ok(out) => failures.lock().unwrap().push(format!(
                             "seed {seed} key {key}:\n{}",
                             tail_lines(&String::from_utf8_lossy(&out.stderr), 8)
@@ -764,5 +778,28 @@ mod tests {
 
         let failures = failures.into_inner().unwrap();
         assert!(failures.is_empty(), "{} compile failures:\n{}", failures.len(), failures.join("\n---\n"));
+    }
+
+    /// Undefined symbols in an object file (excluding compiler-rt intrinsics:
+    /// mem* and `__`-prefixed soft-float builtins like __floatunsisf, which
+    /// aiecc resolves from libclang_rt), via Peano llvm-objdump. Real library
+    /// gaps are C++-mangled (e.g. _Z7shuffleDv8_DB64_S0_j). None = clean.
+    fn undefined_symbols(tools: &ToolPaths, obj: &Path) -> Option<String> {
+        let objdump = tools.peano_clang.parent()?.join("llvm-objdump");
+        let out = std::process::Command::new(objdump).arg("-t").arg(obj).output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let und: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("*UND*"))
+            .filter(|l| {
+                let sym = l.rsplit(' ').next().unwrap_or("");
+                !sym.starts_with("mem") && !sym.starts_with("__")
+            })
+            .collect();
+        if und.is_empty() {
+            None
+        } else {
+            Some(und.join("\n"))
+        }
     }
 }
