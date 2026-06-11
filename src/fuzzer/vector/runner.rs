@@ -25,6 +25,7 @@ use crate::fuzzer::vector::chain::Chain;
 use crate::fuzzer::vector::gen::generate;
 use crate::fuzzer::vector::ledger::Ledger;
 use crate::fuzzer::vector::lower::lower_chain;
+use crate::fuzzer::vector::table::{table, VecType};
 use crate::interpreter::execute::fuzz_recorder;
 use crate::testing::test_cpp_parser::{BufferDef, BufferDir, BufferSpec, ElementType, InputPattern};
 use crate::testing::xclbin_suite::{XclbinSuite, XclbinTest};
@@ -89,13 +90,58 @@ fn buffer_words(chain: &Chain) -> usize {
     (chain.pool_slots() * 16).max(chain.out_bytes() / 4)
 }
 
+/// Per-stage result types for a chain, in output-slice order. Selects the
+/// per-slice tolerance the comparator applies (bf16 NaN payload is don't-care).
+fn chain_out_types(chain: &Chain) -> Vec<VecType> {
+    let t = table();
+    chain.stages.iter().map(|s| t[s.entry_idx].out_type).collect()
+}
+
+/// True when a bf16 bit pattern is a NaN: exponent all-ones, mantissa nonzero.
+fn bf16_is_nan(x: u16) -> bool {
+    (x & 0x7F80) == 0x7F80 && (x & 0x007F) != 0
+}
+
+/// Equality for one 64-byte output slice, with type-aware tolerance.
+///
+/// For bf16 results the NaN *payload* mantissa bits are functionally dead and
+/// silicon produces two residual-state-dependent values for them (the #115
+/// datapath vs. canonical regimes -- same binary, same lane, different session).
+/// Gating differential credit on those bits tests residual hardware state, not
+/// emulator correctness, so two NaNs with matching sign compare equal regardless
+/// of payload. Everything else compares exactly: Inf-vs-Inf (sign+exp),
+/// Inf-vs-NaN, NaN-vs-finite, sign flips, and all integer types still register
+/// as real divergences.
+fn slice_equal(a: &[u8], b: &[u8], vt: Option<VecType>) -> bool {
+    if a == b {
+        return true;
+    }
+    if vt != Some(VecType::Bf16x32) || a.len() < 64 || b.len() < 64 {
+        return false;
+    }
+    for lane in 0..32 {
+        let av = u16::from_le_bytes([a[lane * 2], a[lane * 2 + 1]]);
+        let bv = u16::from_le_bytes([b[lane * 2], b[lane * 2 + 1]]);
+        if av == bv {
+            continue;
+        }
+        // Tolerate only a dead NaN payload: both NaN, same sign.
+        if !(bf16_is_nan(av) && bf16_is_nan(bv) && (av >> 15) == (bv >> 15)) {
+            return false;
+        }
+    }
+    true
+}
+
 /// First differing 64-byte slice index between two buffers, or None if equal.
-/// A length mismatch beyond the common prefix counts as a divergence at the
-/// first slice past the common length.
-fn first_divergent_slice(a: &[u8], b: &[u8]) -> Option<usize> {
+/// `out_types[i]` is stage i's result type and selects per-slice tolerance (see
+/// [`slice_equal`]). Slices past `out_types` (zero padding) compare exactly. A
+/// length mismatch beyond the common prefix counts as a divergence at the first
+/// slice past the common length.
+fn first_divergent_slice(a: &[u8], b: &[u8], out_types: &[VecType]) -> Option<usize> {
     let common = a.len().min(b.len());
     for (i, (sa, sb)) in a[..common].chunks(64).zip(b[..common].chunks(64)).enumerate() {
-        if sa != sb {
+        if !slice_equal(sa, sb, out_types.get(i).copied()) {
             return Some(i);
         }
     }
@@ -454,7 +500,7 @@ pub fn run_vector_fuzz(opts: &VecFuzzOptions) {
             Ok(Ok(pair)) => pair,
         };
 
-        match first_divergent_slice(&emu_out, &npu_out) {
+        match first_divergent_slice(&emu_out, &npu_out, &chain_out_types(&case.chain)) {
             None => {
                 pass += 1;
                 ledger.credit_keys(&case.chain.keys());
@@ -589,23 +635,25 @@ fn run_replay(dir: &Path, opts: &VecFuzzOptions) {
                 errors += 1;
                 println!("{name}: emulator error: {e}");
             }
-            Ok(Ok((emu_out, _trace, _executed))) => match first_divergent_slice(&emu_out, &npu_out) {
-                None => {
-                    matched += 1;
-                    println!("{name}: MATCH (divergence resolved)");
-                }
-                Some(slice) => {
-                    mismatched += 1;
-                    println!(
-                        "{name}: still divergent at slice {slice} -> key {}",
-                        slice_to_key(&chain, slice)
-                    );
-                    // Dump the EMU side next to the banked HW output for byte diffs.
-                    if let Err(e) = std::fs::write(case_dir.join("emu_output.bin"), &emu_out) {
-                        eprintln!("{name}: emu_output.bin write error: {e}");
+            Ok(Ok((emu_out, _trace, _executed))) => {
+                match first_divergent_slice(&emu_out, &npu_out, &chain_out_types(&chain)) {
+                    None => {
+                        matched += 1;
+                        println!("{name}: MATCH (divergence resolved)");
+                    }
+                    Some(slice) => {
+                        mismatched += 1;
+                        println!(
+                            "{name}: still divergent at slice {slice} -> key {}",
+                            slice_to_key(&chain, slice)
+                        );
+                        // Dump the EMU side next to the banked HW output for byte diffs.
+                        if let Err(e) = std::fs::write(case_dir.join("emu_output.bin"), &emu_out) {
+                            eprintln!("{name}: emu_output.bin write error: {e}");
+                        }
                     }
                 }
-            },
+            }
         }
     }
 
@@ -627,7 +675,7 @@ mod tests {
         let emu = vec![0xAAu8; n];
         let mut npu = emu.clone();
         npu[64 + 7] ^= 0x40; // corrupt one byte inside slice 1
-        let slice = first_divergent_slice(&emu, &npu).expect("must diverge");
+        let slice = first_divergent_slice(&emu, &npu, &chain_out_types(&chain)).expect("must diverge");
         assert_eq!(slice, 1);
         assert_eq!(slice_to_key(&chain, slice), chain.keys()[1]);
     }
@@ -638,14 +686,67 @@ mod tests {
         let mut emu = vec![0u8; 4 * 64];
         emu[..128].fill(0x5A); // two written stages
         let npu = emu.clone();
-        assert_eq!(first_divergent_slice(&emu, &npu), None);
+        assert_eq!(first_divergent_slice(&emu, &npu, &[]), None);
     }
 
     #[test]
     fn length_mismatch_diverges_at_first_extra_slice() {
         let emu = vec![0u8; 3 * 64];
         let npu = vec![0u8; 2 * 64];
-        assert_eq!(first_divergent_slice(&emu, &npu), Some(2));
+        assert_eq!(first_divergent_slice(&emu, &npu, &[]), Some(2));
+    }
+
+    /// One 64-byte bf16 slice (32 lanes), one lane set on each side.
+    fn bf16_slice(lane: usize, value: u16) -> Vec<u8> {
+        let mut s = vec![0u8; 64];
+        let b = value.to_le_bytes();
+        s[lane * 2] = b[0];
+        s[lane * 2 + 1] = b[1];
+        s
+    }
+
+    #[test]
+    fn bf16_nan_payload_is_tolerated_when_sign_matches() {
+        // Datapath regime 0xFF8C vs canonical regime 0xFF81: same sign, both NaN.
+        let emu = bf16_slice(29, 0xFF8C);
+        let npu = bf16_slice(29, 0xFF81);
+        let types = [VecType::Bf16x32];
+        assert_eq!(first_divergent_slice(&emu, &npu, &types), None);
+    }
+
+    #[test]
+    fn bf16_opposite_sign_nan_still_diverges() {
+        // Same payload, opposite sign -- a real sign divergence, not dead bits.
+        let emu = bf16_slice(29, 0xFF8C);
+        let npu = bf16_slice(29, 0x7F8C);
+        let types = [VecType::Bf16x32];
+        assert_eq!(first_divergent_slice(&emu, &npu, &types), Some(0));
+    }
+
+    #[test]
+    fn bf16_inf_vs_nan_still_diverges() {
+        // +Inf (0x7F80, mantissa 0) vs a NaN -- not both NaN, must flag.
+        let emu = bf16_slice(5, 0x7F80);
+        let npu = bf16_slice(5, 0x7F8C);
+        let types = [VecType::Bf16x32];
+        assert_eq!(first_divergent_slice(&emu, &npu, &types), Some(0));
+    }
+
+    #[test]
+    fn bf16_nan_vs_finite_still_diverges() {
+        let emu = bf16_slice(5, 0x7F8C); // NaN
+        let npu = bf16_slice(5, 0x4048); // finite ~3.125
+        let types = [VecType::Bf16x32];
+        assert_eq!(first_divergent_slice(&emu, &npu, &types), Some(0));
+    }
+
+    #[test]
+    fn bf16_tolerance_does_not_leak_to_int_slices() {
+        // The same byte pattern, typed as int, must compare exactly.
+        let emu = bf16_slice(29, 0xFF8C);
+        let npu = bf16_slice(29, 0xFF81);
+        let types = [VecType::I16x32];
+        assert_eq!(first_divergent_slice(&emu, &npu, &types), Some(0));
     }
 
     #[test]
