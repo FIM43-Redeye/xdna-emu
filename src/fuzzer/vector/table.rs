@@ -126,8 +126,23 @@ fn build_table() -> Vec<OpEntry> {
         t.push(un("bcast", vt, 1, |a, _, vt| {
             format!("aie::broadcast<{}, {}>({}.get(0))", vt.ctype(), vt.lanes(), a[0])
         }));
-        t.push(un("shup", vt, 4, |a, m, _| format!("aie::shuffle_up({}, {})", a[0], m + 1)));
-        t.push(un("shdn", vt, 4, |a, m, _| format!("aie::shuffle_down({}, {})", a[0], m + 1)));
+        // Fill variants: plain shuffle_up/down shift in UNDEFINED lanes (silicon
+        // returns prior-kernel register residue -- batch-1 seeds 1027/1472), so
+        // they cannot be modeled. The fill operand makes every lane defined.
+        t.push(OpEntry {
+            name: "shup",
+            in_types: vec![vt, vt],
+            out_type: vt,
+            modes: 4,
+            emit: |a, m, _| format!("aie::shuffle_up_fill({}, {}, {})", a[0], a[1], m + 1),
+        });
+        t.push(OpEntry {
+            name: "shdn",
+            in_types: vec![vt, vt],
+            out_type: vt,
+            modes: 4,
+            emit: |a, m, _| format!("aie::shuffle_down_fill({}, {}, {})", a[0], a[1], m + 1),
+        });
         // Keeps reductions in-chain by re-broadcasting the scalar.
         t.push(un("max_reduce_bcast", vt, 1, |a, _, vt| {
             format!("aie::broadcast<{}, {}>(aie::max_reduce({}))", vt.ctype(), vt.lanes(), a[0])
