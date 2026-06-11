@@ -9,6 +9,41 @@ use crate::interpreter::state::ExecutionContext;
 use super::vector_dispatch::VectorAlu;
 
 impl VectorAlu {
+    /// Sign-magnitude ordering key for bf16 comparisons (None = NaN).
+    ///
+    /// The bf16 vector comparators (VGE/VLT) are unordered on NaN -- any
+    /// NaN operand makes the comparison FALSE in both directions -- and
+    /// order all other lanes by their bit pattern, sign-magnitude, so -0
+    /// sorts strictly BELOW +0. Verified against NPU1 silicon (vector
+    /// fuzzer seeds 4/41/47: vge.bf16(-0, +0) is FALSE; lt/ge with a NaN
+    /// operand always FALSE; a numeric f32 compare flips the vsel lane).
+    #[inline]
+    pub(super) fn bf16_order_key(bits: u16) -> Option<i32> {
+        if bits & 0x7FFF > 0x7F80 {
+            return None; // NaN: unordered
+        }
+        let mag = (bits & 0x7FFF) as i32;
+        Some(if bits & 0x8000 != 0 { -mag - 1 } else { mag })
+    }
+
+    /// bf16 a >= b under the silicon ordering (false when either is NaN).
+    #[inline]
+    fn bf16_cmp_ge(a: u16, b: u16) -> bool {
+        matches!(
+            (Self::bf16_order_key(a), Self::bf16_order_key(b)),
+            (Some(ka), Some(kb)) if ka >= kb
+        )
+    }
+
+    /// bf16 a < b under the silicon ordering (false when either is NaN).
+    #[inline]
+    fn bf16_cmp_lt(a: u16, b: u16) -> bool {
+        matches!(
+            (Self::bf16_order_key(a), Self::bf16_order_key(b)),
+            (Some(ka), Some(kb)) if ka < kb
+        )
+    }
+
     /// Vector equality comparison (returns mask).
     pub(super) fn vector_cmp_eq(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
@@ -96,13 +131,18 @@ impl VectorAlu {
                 }
             }
             ElementType::BFloat16 => {
+                // Sign-magnitude ordering, NaN unordered (see bf16_order_key).
                 for i in 0..8 {
-                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
-                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
-                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
-                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
-                    let r_lo: u16 = if a_lo >= b_lo { !0 } else { 0 };
-                    let r_hi: u16 = if a_hi >= b_hi { !0 } else { 0 };
+                    let r_lo: u16 = if Self::bf16_cmp_ge((a[i] & 0xFFFF) as u16, (b[i] & 0xFFFF) as u16) {
+                        !0
+                    } else {
+                        0
+                    };
+                    let r_hi: u16 = if Self::bf16_cmp_ge((a[i] >> 16) as u16, (b[i] >> 16) as u16) {
+                        !0
+                    } else {
+                        0
+                    };
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -180,13 +220,18 @@ impl VectorAlu {
                 }
             }
             ElementType::BFloat16 => {
+                // Sign-magnitude ordering, NaN unordered (see bf16_order_key).
                 for i in 0..8 {
-                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
-                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
-                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
-                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
-                    let r_lo: u16 = if a_lo < b_lo { !0 } else { 0 };
-                    let r_hi: u16 = if a_hi < b_hi { !0 } else { 0 };
+                    let r_lo: u16 = if Self::bf16_cmp_lt((a[i] & 0xFFFF) as u16, (b[i] & 0xFFFF) as u16) {
+                        !0
+                    } else {
+                        0
+                    };
+                    let r_hi: u16 = if Self::bf16_cmp_lt((a[i] >> 16) as u16, (b[i] >> 16) as u16) {
+                        !0
+                    } else {
+                        0
+                    };
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -753,6 +798,23 @@ mod tests {
         // byte 2: 0 >= 0 -> true (0xFF)
         // byte 3: 0 >= 0 -> true (0xFF)
         assert_eq!(r[0], 0xFFFF_00FF);
+    }
+
+    /// bf16 VGE/VLT silicon semantics (fuzzer seeds 4/41/47): sign-magnitude
+    /// ordering (-0 strictly below +0), NaN unordered (both directions FALSE).
+    #[test]
+    fn test_bf16_compare_neg_zero_and_nan() {
+        // lo = -0 vs +0, hi = +0 vs -0
+        let a = [0x0000_8000u32, 0x7FC0_8006, 0, 0, 0, 0, 0, 0];
+        let b = [0x8000_0000u32, 0x0000_7FC0, 0, 0, 0, 0, 0, 0];
+        let ge = VectorAlu::vector_compare_ge(&a, &b, ElementType::BFloat16);
+        let lt = VectorAlu::vector_compare_lt(&a, &b, ElementType::BFloat16);
+        // word 0 lo: ge(-0, +0) FALSE, lt TRUE; hi: ge(+0, -0) TRUE, lt FALSE.
+        assert_eq!(ge[0], 0xFFFF_0000);
+        assert_eq!(lt[0], 0x0000_FFFF);
+        // word 1 lo: -denorm vs +NaN -> both FALSE; hi: NaN vs 0 -> both FALSE.
+        assert_eq!(ge[1], 0);
+        assert_eq!(lt[1], 0);
     }
 
     // ========== vector_compare_lt ==========
