@@ -181,7 +181,14 @@ def generate_mlir(
     w(f"        aie.objectfifo.release @fuzz_out1(Produce, 1)")
     w(f"      }}")
     w(f"      aie.end")
-    w(f"    }} {{ link_with=\"{kernel_obj}\" }}")
+    # stack_size: the aie.core default is 0x400 (1 KiB). Long fuzz chains
+    # spill every stage result to the stack (bf16 chains spill 64 B per
+    # stage plus saved regs), and a 15-stage chain overflows 1 KiB --
+    # the frame walks over the .bss output buffer and the saved LR (seed
+    # 5023: kernel frame 0x480 > 0x400; corrupted return address, core hang
+    # on EMU; HW would fault the same). 8 KiB leaves room for the deepest
+    # chains while still fitting tile memory with the largest pools.
+    w(f"    }} {{ link_with=\"{kernel_obj}\", stack_size = 8192 : i32 }}")
     w(f"")
 
     # Runtime sequence: DMA transfers between host and device.
