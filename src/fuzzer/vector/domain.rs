@@ -11,7 +11,9 @@ use crate::fuzzer::core::toolchain::TRACE_BUFFER_ELEMENTS;
 use crate::fuzzer::vector::chain::{Chain, Stage};
 use crate::fuzzer::vector::gen::generate;
 use crate::fuzzer::vector::lower::lower_chain;
-use crate::fuzzer::vector::table::{table, universe_keys, VecType};
+use crate::fuzzer::vector::table::{universe_keys, VecType};
+#[cfg(test)]
+use crate::fuzzer::vector::table::table;
 use crate::interpreter::execute::fuzz_recorder;
 use crate::testing::test_cpp_parser::{BufferDef, BufferDir, BufferSpec, ElementType, InputPattern};
 use crate::testing::xclbin_suite::{XclbinSuite, XclbinTest};
@@ -106,9 +108,8 @@ fn current_table_version() -> u64 {
 
 /// Per-slice result types parsed from banked coverage keys (`name/Type/mMode`).
 /// Table-independent, so replay applies the right per-slice comparator tolerance
-/// even when `entry_idx` no longer resolves against the current table. Retained
-/// as a tested helper; the live-table `chain_out_types` drives `compare` today.
-#[cfg_attr(not(test), allow(dead_code))]
+/// even when `entry_idx` no longer resolves against the current table. Used by
+/// `compare` so both campaign and replay remain table-independent.
 fn out_types_from_keys(keys: &[String]) -> Vec<VecType> {
     keys.iter()
         .filter_map(|k| k.split('/').nth(1).and_then(VecType::from_debug))
@@ -123,6 +124,7 @@ fn buffer_words(chain: &Chain) -> usize {
 
 /// Per-stage result types for a chain, in output-slice order. Selects the
 /// per-slice tolerance the comparator applies (bf16 NaN payload is don't-care).
+#[cfg(test)]
 fn chain_out_types(chain: &Chain) -> Vec<VecType> {
     let t = table();
     chain.stages.iter().map(|s| t[s.entry_idx].out_type).collect()
@@ -345,9 +347,9 @@ impl Domain for VectorDomain {
         }
     }
 
-    fn compare(&self, emu: &VecObs, reference: &VecObs, c: &Chain) -> Option<String> {
-        first_divergent_slice(&emu.output, &reference.output, &chain_out_types(c))
-            .map(|slice| slice_to_key(&c.keys(), slice))
+    fn compare(&self, emu: &VecObs, reference: &VecObs, keys: &[String]) -> Option<String> {
+        first_divergent_slice(&emu.output, &reference.output, &out_types_from_keys(keys))
+            .map(|slice| slice_to_key(keys, slice))
     }
 
     fn bank(
@@ -355,11 +357,11 @@ impl Domain for VectorDomain {
         case_dir: &Path,
         c: &Chain,
         reference: Option<&VecObs>,
-        _emu: Option<&VecObs>,
+        emu_obs: Option<&VecObs>,
     ) -> Result<PathBuf, String> {
         let npu_output = reference.map(|o| o.output.as_slice());
         let npu_trace = reference.and_then(|o| o.trace.as_deref());
-        let executed = reference.map(|o| o.executed.as_slice()).unwrap_or(&[]);
+        let executed = emu_obs.map(|o| o.executed.as_slice()).unwrap_or(&[]);
         bank_case(case_dir, c, npu_output, npu_trace, executed)
     }
 
@@ -391,7 +393,6 @@ impl Domain for VectorDomain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fuzzer::vector::table::table;
 
     /// Build synthetic 3-stage outputs differing only in slice 1 and verify
     /// the divergence localizes to stage 1's coverage key.

@@ -296,7 +296,7 @@ pub fn run_vector_fuzz(opts: &VecFuzzOptions) {
             Ok(Ok(obs)) => obs,
         };
 
-        match dom.compare(&emu, &npu, &case.chain) {
+        match dom.compare(&emu, &npu, &case.chain.keys()) {
             None => {
                 pass += 1;
                 ledger.credit_keys(&case.chain.keys());
@@ -398,8 +398,8 @@ fn run_replay(dir: &Path, opts: &VecFuzzOptions) {
         // Reconstruct the runnable chain + banked reference observation. A durable
         // bank (with pool) is replayed directly and is table-independent; a legacy
         // bank under a changed table is reported and skipped.
-        let (chain, reference) = match dom.load_banked(case_dir) {
-            Ok(Banked::Replayable { case, reference, keys: _ }) => (case, reference),
+        let (chain, reference, banked_keys) = match dom.load_banked(case_dir) {
+            Ok(Banked::Replayable { case, reference, keys }) => (case, reference, keys),
             Ok(Banked::Skip(why)) => {
                 errors += 1;
                 println!("{name}: {why}");
@@ -443,7 +443,7 @@ fn run_replay(dir: &Path, opts: &VecFuzzOptions) {
                 println!("{name}: emulator error: {e}");
             }
             Ok(Ok(emu)) => {
-                match dom.compare(&emu, &reference, &chain) {
+                match dom.compare(&emu, &reference, &banked_keys) {
                     None => {
                         matched += 1;
                         println!("{name}: MATCH (divergence resolved)");

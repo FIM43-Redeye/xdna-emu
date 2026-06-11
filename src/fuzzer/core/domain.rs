@@ -101,7 +101,11 @@ pub trait Domain {
     /// Differential compare: `None` = match (credit the case); `Some(key)` =
     /// the first divergent coverage key (flag it, bank the case). Localization
     /// lives here because only the domain knows the observation's structure.
-    fn compare(&self, emu: &Self::Obs, reference: &Self::Obs, case: &Self::Case) -> Option<String>;
+    /// Takes the coverage `keys` (not the case) so replay can compare against
+    /// banked keys -- keeping per-slice type tolerance and localization
+    /// table-independent. Campaign passes the live `coverage_keys(case)`; replay
+    /// passes the banked keys.
+    fn compare(&self, emu: &Self::Obs, reference: &Self::Obs, keys: &[String]) -> Option<String>;
 
     /// Bank a divergent/crashed case under `phoenix-survival/{name}/seed_N/` for
     /// post-mortem and replay. `reference` is None on an emulator crash (no HW
@@ -154,7 +158,7 @@ mod tests {
         fn observe(&self, _b: Backend, _x: &Path, _i: &Path, _c: &u64, _m: u64) -> Result<Vec<u8>, String> {
             Ok(vec![])
         }
-        fn compare(&self, a: &Vec<u8>, b: &Vec<u8>, _c: &u64) -> Option<String> {
+        fn compare(&self, a: &Vec<u8>, b: &Vec<u8>, _keys: &[String]) -> Option<String> {
             if a == b {
                 None
             } else {
@@ -183,7 +187,7 @@ mod tests {
     fn mock_domain_satisfies_the_trait_behind_a_generic_bound() {
         let m = MockDomain;
         assert_eq!(drive(&m), vec!["a/I32x16/m0".to_string()]);
-        assert_eq!(m.compare(&vec![1], &vec![2], &0), Some("a/I32x16/m0".into()));
-        assert_eq!(m.compare(&vec![1], &vec![1], &0), None);
+        assert_eq!(m.compare(&vec![1], &vec![2], &[]), Some("a/I32x16/m0".into()));
+        assert_eq!(m.compare(&vec![1], &vec![1], &[]), None);
     }
 }
