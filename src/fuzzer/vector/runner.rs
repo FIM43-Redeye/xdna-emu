@@ -45,6 +45,9 @@ pub struct VecFuzzOptions {
     pub report_only: bool,
     /// Replay banked divergences from this directory (EMU vs banked npu_output.bin).
     pub replay: Option<PathBuf>,
+    /// Clear divergent flags and re-earn them against silicon this run. Requires
+    /// `--hw` (credit is only honest with a live silicon comparison).
+    pub reverify: bool,
 }
 
 /// Serialized form of a banked chain: enough to regenerate and audit.
@@ -317,6 +320,27 @@ pub fn run_vector_fuzz(opts: &VecFuzzOptions) {
         return;
     }
 
+    // Re-verify: clear divergent flags and re-earn them against silicon this run.
+    // Credit is only honest with a live silicon comparison, so require --hw.
+    let reverify_keys: Vec<String> = if opts.reverify {
+        if !opts.hw {
+            eprintln!("Error: --reverify requires --hw (clearing flags needs a silicon re-check)");
+            std::process::exit(1);
+        }
+        let cleared = ledger.take_divergent();
+        if cleared.is_empty() {
+            println!("Re-verify: no divergent keys to clear.");
+        } else {
+            println!("Re-verify: cleared {} divergent flags to re-earn:", cleared.len());
+            for k in &cleared {
+                println!("  {k}");
+            }
+        }
+        cleared
+    } else {
+        Vec::new()
+    };
+
     let uncovered = ledger.uncovered(opts.target_hits);
     if uncovered.is_empty() {
         println!("Vector fuzz: coverage complete (target {} hits/key)", opts.target_hits);
@@ -528,6 +552,27 @@ pub fn run_vector_fuzz(opts: &VecFuzzOptions) {
                 eprintln!("ledger save error: {e}");
             }
         }
+    }
+
+    // Record re-verify outcomes. A cleared key is *resolved* only if it actually
+    // earned a silicon-clean hit this run; re-flagged keys stay divergent; keys
+    // that were never exercised are left uncovered (not falsely resolved).
+    if !reverify_keys.is_empty() {
+        let (mut healed, mut still, mut untested) = (0usize, 0usize, 0usize);
+        for key in &reverify_keys {
+            if ledger.is_divergent(key) {
+                still += 1;
+            } else if ledger.hit_count(key) >= 1 {
+                ledger.mark_resolved(key, &format!("re-verified clean, base seed {base_seed}"));
+                healed += 1;
+            } else {
+                untested += 1;
+            }
+        }
+        println!(
+            "Re-verify: {healed} resolved, {still} still divergent, {untested} not exercised (of {})",
+            reverify_keys.len()
+        );
     }
 
     if let Err(e) = ledger.save(&ledger_path) {

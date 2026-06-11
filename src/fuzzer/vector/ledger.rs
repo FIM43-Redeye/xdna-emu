@@ -28,6 +28,10 @@ pub struct Ledger {
     timing_fail: HashSet<String>,
     /// Keys whose kernels never compile, with the reason.
     unreachable: HashMap<String, String>,
+    /// Keys cleared from `divergent` by a clean re-verify, with evidence. Kept
+    /// for audit; never withholds credit. Defaulted so pre-field ledgers load.
+    #[serde(default)]
+    resolved: HashMap<String, String>,
 }
 
 impl Ledger {
@@ -53,8 +57,35 @@ impl Ledger {
     }
 
     /// Mark a key as functionally divergent (excluded from credit/completion).
+    /// A divergent key is never also `resolved`.
     pub fn mark_divergent(&mut self, key: &str) {
+        self.resolved.remove(key);
         self.divergent.insert(key.to_string());
+    }
+
+    /// Drain the divergent set for re-verification, returning the cleared keys
+    /// (sorted). They rejoin the uncovered pool until a run re-credits them (and
+    /// `mark_resolved`) or re-flags them (`mark_divergent`).
+    pub fn take_divergent(&mut self) -> Vec<String> {
+        let mut keys: Vec<String> = self.divergent.drain().collect();
+        keys.sort();
+        keys
+    }
+
+    /// True if the key is currently flagged divergent.
+    pub fn is_divergent(&self, key: &str) -> bool {
+        self.divergent.contains(key)
+    }
+
+    /// Silicon-verified hit count for a key (0 if never credited).
+    pub fn hit_count(&self, key: &str) -> u32 {
+        self.hits.get(key).copied().unwrap_or(0)
+    }
+
+    /// Record that a previously-divergent key was re-verified clean against
+    /// silicon, with an evidence note. Audit-only; does not affect credit.
+    pub fn mark_resolved(&mut self, key: &str, evidence: &str) {
+        self.resolved.insert(key.to_string(), evidence.to_string());
     }
 
     /// Flag timing-only divergence on a key; functional credit continues.
@@ -120,6 +151,9 @@ impl Ledger {
         let _ = writeln!(out, "  divergent:   {}", self.divergent.len());
         let _ = writeln!(out, "  timing-only: {}", self.timing_fail.len());
         let _ = writeln!(out, "  unreachable: {}", self.unreachable.len());
+        if !self.resolved.is_empty() {
+            let _ = writeln!(out, "  resolved:    {} (re-verified clean)", self.resolved.len());
+        }
 
         if !uncovered.is_empty() {
             let _ = writeln!(out, "uncovered (first 40):");
@@ -242,6 +276,56 @@ mod tests {
         let path = std::env::temp_dir().join("xdna-emu-ledger-test-does-not-exist.json");
         let ledger = Ledger::load(&path).unwrap();
         assert_eq!(ledger.uncovered(10).len(), Ledger::universe().len());
+    }
+
+    #[test]
+    fn take_divergent_clears_flags_and_returns_keys_to_uncovered() {
+        let mut ledger = Ledger::default();
+        let universe = Ledger::universe();
+        let key = universe[0].clone();
+        ledger.mark_divergent(&key);
+        assert!(!ledger.uncovered(10).contains(&key), "flagged: not uncovered");
+
+        let taken = ledger.take_divergent();
+        assert_eq!(taken, vec![key.clone()]);
+        assert!(!ledger.is_divergent(&key), "flag cleared");
+        assert!(ledger.uncovered(10).contains(&key), "back in uncovered pool");
+
+        // Re-earning it now credits normally.
+        let keys = vec![key.clone()];
+        for _ in 0..10 {
+            ledger.credit_keys(&keys);
+        }
+        assert!(!ledger.uncovered(10).contains(&key), "re-earned to target");
+    }
+
+    #[test]
+    fn mark_resolved_and_mark_divergent_are_mutually_exclusive() {
+        let mut ledger = Ledger::default();
+        let key = Ledger::universe()[0].clone();
+        ledger.mark_resolved(&key, "re-verified clean, seed 5000");
+        ledger.mark_divergent(&key); // re-flagging drops the resolved record
+        assert!(ledger.is_divergent(&key));
+        let report = ledger.report(10);
+        assert!(!report.contains("resolved:"), "no resolved entries: {report}");
+    }
+
+    #[test]
+    fn resolved_field_round_trips_and_pre_field_ledger_loads() {
+        let dir = tempdir();
+        let path = dir.join("ledger.json");
+        // A ledger.json written before the `resolved` field existed.
+        std::fs::write(&path, r#"{"hits":{},"divergent":["k"],"timing_fail":[],"unreachable":{}}"#).unwrap();
+        let mut ledger = Ledger::load(&path).expect("pre-field ledger loads via serde default");
+        assert!(ledger.is_divergent("k"));
+
+        ledger.take_divergent();
+        ledger.mark_resolved("k", "re-verified clean");
+        ledger.save(&path).unwrap();
+        let loaded = Ledger::load(&path).unwrap();
+        assert_eq!(loaded.resolved, ledger.resolved);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

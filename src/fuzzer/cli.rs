@@ -75,6 +75,7 @@ pub fn parse_vector_fuzz_args(args: &[String]) -> Result<VecFuzzOptions, String>
         verbose: false,
         report_only: false,
         replay: None,
+        reverify: false,
     };
 
     let mut iter = args.iter().skip(1);
@@ -89,6 +90,7 @@ pub fn parse_vector_fuzz_args(args: &[String]) -> Result<VecFuzzOptions, String>
             "--max-cycles" => opts.max_cycles = parse_next(&mut iter, "--max-cycles")?,
             "--target-hits" => opts.target_hits = parse_next(&mut iter, "--target-hits")?,
             "--report" => opts.report_only = true,
+            "--reverify" => opts.reverify = true,
             "--replay" => {
                 let dir = iter.next().ok_or("--replay requires a directory")?;
                 opts.replay = Some(PathBuf::from(dir));
@@ -126,6 +128,12 @@ mod tests {
         assert!(!o.report_only);
         assert!(o.replay.is_none());
         assert!(!o.verbose);
+        assert!(!o.reverify);
+    }
+
+    #[test]
+    fn vector_reverify_flag_parses() {
+        assert!(parse_vector_fuzz_args(&vargv(&["--reverify"])).unwrap().reverify);
     }
 
     #[test]
