@@ -74,17 +74,36 @@ deferrals, not unvalidated model.
 | Accumulator/CM-domain (`VEC_Bypass`) result visibility | not in the per-operand bypass matrix; modeled via the separate MAC-pipeline-latency path (`ExecutionContext::queue_matmul_accum_write`). The matrix resolves W/X-file results; `VEC_Bypass` (MAC/MUL results into the accumulator file) is deferred. | `src/interpreter/state/registers.rs` (`VectorRegisterFile::visible_at`); `src/interpreter/state/context.rs` (`queue_matmul_accum_write`, carries a `FIXME(bypass-model)`) | **OPEN / deferred.** The MAC-latency path is HW-validated *functionally* — all three `matrix_multiplication_using_cascade` variants PASS HW==EMU on the bridge (2026-06-09), which exercises the accumulator-write path — but not yet at trace granularity (those kernels' TRACE PREP fails for an orthogonal trace-injection reason). Accumulator folding into the per-operand bypass matrix is a noted future extension (see `docs/superpowers/plans/2026-06-09-vector-write-result-latency.md` Scope). **Partially advanced 2026-06-10 (`430d841`):** the `VMOV bml,x` (wide vector->accumulator move) write is now deferred by its def latency via the same `queue_matmul_accum_write` path, after the phase-B `vec_conv_bf16_edge` silicon kernels proved an immediate write corrupts delay-slot `VST.CONV` stores (read freshly-overwritten accumulator -> Inf/NaN garbage). All 10 convert modes EMU==silicon. The full bypass-matrix fold (distinguishing `VEC_Bypass` MAC->MAC from `NoBypass` store consumers) is still the open extension. |
 | `source_forward` positional alignment for merged memory operands | `SlotOp::source_forward` aligns exactly for compute ops; may drift for fused memory operands that merge address/data into a single TableGen operand list position | `src/interpreter/bundle/slot.rs` (`FIXME(source-forward-memory-alignment)`); `src/interpreter/decode/operand_extraction.rs` | **DOCUMENTED / benign.** The bypass model only reads vector-register compute sources; memory operands use `NoBypass` or are not vector-reg reads, so this positional drift does not affect result visibility decisions. |
 
-A fourth cluster: **bf16 `vadd.f`/`vsub.f` NaN-payload preservation when an Inf
-operand is present**. The elementwise/accumulator fp add datapath
-(`aie2_acc_fp32_add`) is now silicon-verified bit-exact for **fp32** add/sub
-(256/256 lanes each direction) and for the **bf16** operand classes captured by
-the 16-class NaN/Inf sweep (512/512 lanes; widen `bf16<<16` -> acc add ->
-NaN-preserving narrow). The residual is a *payload-dependent* bf16 NaN case the
-sweep could not disambiguate.
+A fourth cluster: **bf16 `vadd.f`/`vsub.f` two-special-operand mantissa**. The
+elementwise/accumulator fp add datapath (`aie2_acc_fp32_add`) is now
+silicon-verified bit-exact for **fp32** add/sub (256/256 lanes each direction)
+and for **bf16** wherever at most one operand is a NaN paired with a finite,
+zero, denormal, or `Inf` operand (those collapse to mantissa 1 -- the current
+`bf16<<16` widen -> acc add -> NaN-preserving narrow reproduces them). The
+residual is the **two-exp-255-operand** case.
+
+**Corrected analysis (2026-06-11): this is NOT payload preservation and needs
+NO new HW capture.** The existing 16-class sweep already holds the
+discriminating lanes. bf16 treats NaN/Inf operands as **exp-255 significands
+and does real significand arithmetic**, then forces exp `0xFF`:
+- opposite-sign distinct NaN payloads -> significand *subtract* + normalize,
+  mantissa kept: `+NaN40 + -NaN55 -> -NaN28`, `+NaN20 + -NaN55 -> -NaN54`
+  (`1.0x40 - 1.0x55 = -0x15/128`, normalize `<<4` -> `0x28`). Verified against
+  `vec_nan_bf16_add.hw.txt`.
+- same-sign (significand add overflows) or either operand `Inf` (significand
+  `1.0000000`) -> collapse to mantissa 1.
+
+Seeds 6159/6258 (`-NaN0c` at slice 4 lane 29) are computed significand results
+of this rule, not payload copies -- our model collapses them to `NaN01`. fp32
+does **not** show this (fp32 NaN+NaN/Inf+NaN collapse to mantissa 1,
+silicon-verified) -- the significand-arithmetic path is bf16-specific (it lives
+in the narrow, not the shared acc adder). The earlier "single point `0x46 ->
+0x0C`, needs a new sweep" framing was wrong: `0x46` is the *other* operand of a
+NaN+NaN pair, not an Inf+NaN payload.
 
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
-| bf16 `Inf` + `NaN` mantissa payload | for bf16 `vadd.f`/`vsub.f` where one operand is `Inf` and the other a `NaN`, we narrow to a canonical NaN with mantissa bit 0 set (`0x*F81`), discarding the payload. HW preserves a **payload-dependent** mantissa: e.g. `+Inf + NaN(0xFFC6) -> 0xFF8C` (man `0x0C`), `NaN + Inf -> 0xFFF8` (man `0x78`). | `src/interpreter/execute/vector_float.rs` (`aie2_acc_fp32_add` forces NaN mantissa to 1 when the NaN/overflow flag fires); the bf16 narrow then has no payload to preserve. Reproduces fuzzer seeds 6159/6258 (banked `~/npu-work/experiments/phoenix-survival/vector/`). | **OPEN / documented.** The 16-class sweep (`build/experiments/nan-inf-add-sub-sweep/`) shows bf16 `Inf+NaN` collapsing to mantissa 1 for its three NaN payloads (`0x40`, `0x20`, `0x55`), while the fuzzer payload `0x46 -> 0x0C` is preserved -- the captured payloads happen to all collapse, so the sweep **cannot derive the preservation rule** and a single observed point (`0x46 -> 0x0C`, `<<1 & 0x7F`) is insufficient to fit a model that also satisfies the collapsing cases. A targeted bf16-NaN-payload capture (sweep the NaN mantissa across all 7 bits against Inf, both ops) is needed to pin the datapath; until then we keep the silicon-verified collapse-to-1 model rather than guess. fp32 is fully correct (fp32 `Inf+NaN` *does* collapse to mantissa 1, silicon-verified L138-143). |
+| bf16 two-special-operand significand arithmetic | for bf16 `vadd.f`/`vsub.f` with two exp-255 operands (NaN+NaN, opposite sign + distinct payload), HW subtracts significands, normalizes, forces exp `0xFF`, keeps the computed mantissa (`+NaN40 + -NaN55 -> -NaN28`). We collapse to `NaN01`. | `src/interpreter/execute/vector_float.rs` / the bf16 narrow in the elementwise add path; `aie2_acc_fp32_add` forces mantissa 1 on the NaN flag so the narrow has nothing to compute. Reproduces fuzzer seeds 6159/6258 (banked `~/npu-work/experiments/phoenix-survival/vector/`). | **OPEN / derivable offline -- no HW window needed.** The rule reads directly off the already-captured `build/experiments/nan-inf-add-sub-sweep/vec_nan_bf16_{add,sub}.hw.txt` NaN+NaN lanes. Next session: fit the significand-subtract+normalize model in the bf16 narrow, gated on both-operands-exp-255 with the Inf/same-sign collapse cases, extend the existing `elementwise_bf16_*_special_values_match_silicon` tests, then re-credit seeds 6159/6258 to close Tier 1 ledger. |
 
 ---
 
