@@ -362,7 +362,7 @@ impl VectorAlu {
         let acc_result = ups_vector_to_acc(&src, shift, from, et);
         match &op.dest {
             Some(Operand::AccumReg(r)) => {
-                ctx.accumulator.write(*r, acc_result);
+                Self::queue_ups_acc_write(ctx, *r, &acc_result);
             }
             other => {
                 panic!(
@@ -372,6 +372,18 @@ impl VectorAlu {
             }
         }
         true
+    }
+
+    /// Queue a half (512-bit) UPS accumulator write at the II_VUPS def
+    /// latency (operand cycle 3, AIE2Schedule.td [3,1,1,...]). Writing
+    /// immediately let the `vst am` draining the PREVIOUS accumulator value
+    /// (Peano schedules the next tile's VUPS one bundle before the stores)
+    /// read the freshly-converted value (seed 5048 silicon).
+    fn queue_ups_acc_write(ctx: &mut ExecutionContext, reg: u8, acc: &[u64; 8]) {
+        let latency = ctx.result_latency.max(1) as u64;
+        let mut wide16 = [0u64; 16];
+        wide16[..8].copy_from_slice(acc);
+        ctx.queue_matmul_accum_write(Operand::AccumReg(reg), wide16, true, latency);
     }
 
     /// Wide UPS path: widen to 1024-bit accumulator (w2c or x2c).
@@ -402,7 +414,9 @@ impl VectorAlu {
 
             match &op.dest {
                 Some(Operand::AccumReg(r)) => {
-                    ctx.accumulator.write_wide(*r, acc_wide);
+                    // Defer by the II_VUPS def latency (see queue_ups_acc_write).
+                    let latency = ctx.result_latency.max(1) as u64;
+                    ctx.queue_matmul_accum_write(Operand::AccumReg(*r), acc_wide, false, latency);
                 }
                 other => {
                     panic!(
@@ -418,7 +432,7 @@ impl VectorAlu {
             let acc_result = ups_vector_to_acc(&src, shift, from, et);
             match &op.dest {
                 Some(Operand::AccumReg(r)) => {
-                    ctx.accumulator.write(*r, acc_result);
+                    Self::queue_ups_acc_write(ctx, *r, &acc_result);
                 }
                 other => {
                     panic!(
@@ -898,6 +912,46 @@ mod integration_tests {
         assert_eq!(packed_s, src, "wide s8.s32 UPS->SRS round-trip with shift=4 failed");
     }
 
+    /// VUPS accumulator writes commit at the II_VUPS def latency (operand
+    /// cycle 3, AIE2Schedule.td [3,1,1,...]), not at issue. Peano schedules
+    /// the next tile's `vups cm0, x0` one bundle BEFORE the `vst am` pair
+    /// draining the previous accumulator (seed 5048 silicon); an immediate
+    /// write let those stores read the freshly-converted value.
+    #[test]
+    fn test_ups_acc_write_deferred_by_def_latency() {
+        let mut ctx = make_ctx();
+        ctx.accumulator.write_wide(0, [0xAAAA_AAAA_AAAA_AAAAu64; 16]);
+        ctx.vector.write(4, [1, 2, 3, 4, 5, 6, 7, 8]);
+        ctx.vector.write(5, [9, 10, 11, 12, 13, 14, 15, 16]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Ups)
+            .as_vector(ElementType::Int64)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::VectorReg(4))
+            .with_source(Operand::Immediate(0));
+        op.from_type = Some(ElementType::Int32);
+        op.is_wide_vector = true;
+
+        ctx.cycles = 100;
+        ctx.result_latency = 3;
+        VectorAlu::execute(&op, &mut ctx);
+
+        // Still the old value through issue+2 (a vst am one bundle later
+        // drains the previous accumulator).
+        ctx.cycles = 102;
+        ctx.commit_pending_writes();
+        assert_eq!(
+            ctx.accumulator.read(0)[0],
+            0xAAAA_AAAA_AAAA_AAAA,
+            "UPS result must NOT be visible before issue+3"
+        );
+
+        // Commits at issue+3.
+        ctx.cycles = 103;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.accumulator.read(0)[0], 1, "UPS result must be visible at issue+3");
+    }
+
     #[test]
     fn test_wide_ups_x2c() {
         let mut ctx = make_ctx();
@@ -914,6 +968,7 @@ mod integration_tests {
         op.is_wide_vector = true;
 
         VectorAlu::execute(&op, &mut ctx);
+        ctx.flush_pending_writes(); // UPS acc writes carry the II_VUPS def latency
 
         let acc_lo = ctx.accumulator.read(0);
         for i in 0..8 {
