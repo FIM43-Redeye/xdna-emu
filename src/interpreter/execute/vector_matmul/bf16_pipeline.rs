@@ -337,6 +337,13 @@ pub(crate) fn bf16_mac_hw_lane(
     }
 
     if cexpmax == 0 {
+        // All contributions have zero exponent, so the PSA sum is zero --
+        // but a pending NaN (e.g. Inf * 0, whose product keeps cexp = 0)
+        // must still come out as NaN.  bfnorm: zero mantissa, bit 0 |= nan,
+        // exp = 0xFF.  Silicon-verified (fuzzer seed 6160, mmul_bf16).
+        if nan_flag {
+            return fp32_make(false, 255, 1);
+        }
         return 0; // All inputs zero
     }
 
@@ -510,5 +517,26 @@ mod tests {
         let b6: [u16; 8] = [0x0802, 0x7b38, 0x6983, 0x2273, 0x33a8, 0x1130, 0xe493, 0x18ec];
         let r6 = bf16_mac_hw_lane(0, &a6, &b6, false, None, false);
         assert_eq!(r6, 0x797187FF, "random: expected 0x797187FF, got 0x{:08X}", r6);
+    }
+
+    /// Inf * 0 = NaN even when every product has zero exponent and the
+    /// accumulator is zero (cexpmax == 0 must not swallow the NaN flag).
+    ///
+    /// Silicon-verified: vector fuzzer seed 6160 (mmul_bf16 lane 15) takes
+    /// a = -0 in all rows, b containing +Inf -- NPU1 returns NaN where a
+    /// zero short-circuit returns 0.
+    #[test]
+    fn test_inf_times_zero_with_zero_cexpmax_is_nan() {
+        // Exact lane inputs from banked seed 6160, slice 6, acc lane 15.
+        let a: [u16; 8] = [0x8000, 0x8036, 0x8000, 0x8000, 0x8000, 0x8000, 0x8000, 0x8000];
+        let b: [u16; 8] = [0x7F7F, 0x0000, 0x8037, 0x8004, 0x0029, 0x806A, 0xF349, 0x7F80];
+        let r = bf16_mac_hw_lane(0, &a, &b, false, None, false);
+        assert_eq!(r, 0x7F800001, "Inf*0 with all-zero cexpmax: expected NaN, got 0x{:08X}", r);
+
+        // Minimal form: 0 * Inf alone.
+        let a2 = [0x0000u16];
+        let b2 = [0x7F80u16];
+        let r2 = bf16_mac_hw_lane(0, &a2, &b2, false, None, false);
+        assert_eq!(r2, 0x7F800001, "0*Inf: expected NaN, got 0x{:08X}", r2);
     }
 }
