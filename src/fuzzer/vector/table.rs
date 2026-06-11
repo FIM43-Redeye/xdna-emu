@@ -93,6 +93,17 @@ pub fn table() -> &'static [OpEntry] {
     TABLE.get_or_init(build_table)
 }
 
+/// Every coverage key derivable from the op table, sorted. Was `Ledger::universe`
+/// before the ledger was made domain-agnostic.
+pub fn universe_keys() -> Vec<String> {
+    let mut keys: Vec<String> = table()
+        .iter()
+        .flat_map(|e| (0..e.modes).map(move |m| format!("{}/{:?}/m{}", e.name, e.out_type, m)))
+        .collect();
+    keys.sort();
+    keys
+}
+
 /// Two-input op, same type in and out, no mode dimension.
 fn bin(name: &'static str, vt: VecType, emit: fn(&[String], u8, VecType) -> String) -> OpEntry {
     OpEntry { name, in_types: vec![vt, vt], out_type: vt, modes: 1, emit }

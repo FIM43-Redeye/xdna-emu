@@ -1,21 +1,20 @@
-//! Persistent coverage ledger for the vector differential fuzzer.
+//! Persistent coverage ledger for differential fuzzers.
 //!
-//! Coverage universe = every `{name}/{out_type:?}/m{mode}` key from
-//! [`super::table::table`]. A passing chain credits all the stage keys it
-//! executed; keys with confirmed emulator-vs-silicon divergence are excluded
-//! from credit (and from completion) but never block the campaign; keys whose
-//! kernels never compile are marked unreachable with a reason. Timing-only
-//! divergence is tracked separately and does not withhold functional credit.
-//! The campaign is complete when every key that is neither divergent nor
-//! unreachable has at least `target` hits.
+//! Domain-agnostic: holds only coverage key strings. The domain supplies its
+//! key universe (e.g. `table::universe_keys()` for the vector fuzzer) to
+//! `uncovered`, `complete`, and `report`. A passing chain credits all the stage
+//! keys it executed; keys with confirmed emulator-vs-silicon divergence are
+//! excluded from credit (and from completion) but never block the campaign;
+//! keys whose kernels never compile are marked unreachable with a reason.
+//! Timing-only divergence is tracked separately and does not withhold
+//! functional credit. The campaign is complete when every key that is neither
+//! divergent nor unreachable has at least `target` hits.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-
-use super::table::table;
 
 /// Persistent coverage state, serialized as pretty JSON between fuzz runs.
 #[derive(Default, Serialize, Deserialize)]
@@ -35,16 +34,6 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// All coverage keys derivable from the op table, sorted.
-    pub fn universe() -> Vec<String> {
-        let mut keys: Vec<String> = table()
-            .iter()
-            .flat_map(|e| (0..e.modes).map(move |m| format!("{}/{:?}/m{}", e.name, e.out_type, m)))
-            .collect();
-        keys.sort();
-        keys
-    }
-
     /// Credit one verified chain: +1 to each executed key, skipping keys
     /// already marked divergent or unreachable.
     pub fn credit_keys(&mut self, keys: &[String]) {
@@ -99,18 +88,19 @@ impl Ledger {
     }
 
     /// Universe keys still needing credit: not divergent, not unreachable,
-    /// fewer than `target` hits. Sorted.
-    pub fn uncovered(&self, target: u32) -> Vec<String> {
-        Self::universe()
-            .into_iter()
-            .filter(|k| !self.divergent.contains(k) && !self.unreachable.contains_key(k))
-            .filter(|k| self.hits.get(k).copied().unwrap_or(0) < target)
+    /// fewer than `target` hits. Sorted. `universe` is supplied by the domain.
+    pub fn uncovered(&self, universe: &[String], target: u32) -> Vec<String> {
+        universe
+            .iter()
+            .filter(|k| !self.divergent.contains(*k) && !self.unreachable.contains_key(*k))
+            .filter(|k| self.hits.get(*k).copied().unwrap_or(0) < target)
+            .cloned()
             .collect()
     }
 
     /// True when every key not divergent/unreachable has >= `target` hits.
-    pub fn complete(&self, target: u32) -> bool {
-        self.uncovered(target).is_empty()
+    pub fn complete(&self, universe: &[String], target: u32) -> bool {
+        self.uncovered(universe, target).is_empty()
     }
 
     /// Persist as pretty JSON, atomically (temp file + rename).
@@ -132,11 +122,9 @@ impl Ledger {
         serde_json::from_str(&data).map_err(|e| format!("parse {}: {e}", path.display()))
     }
 
-    /// Human-readable campaign status: counts, first uncovered keys, and the
-    /// full divergent list.
-    pub fn report(&self, target: u32) -> String {
-        let universe = Self::universe();
-        let uncovered = self.uncovered(target);
+    /// Human-readable campaign status over `universe`.
+    pub fn report(&self, universe: &[String], target: u32) -> String {
+        let uncovered = self.uncovered(universe, target);
         let covered = universe
             .iter()
             .filter(|k| !self.divergent.contains(*k) && !self.unreachable.contains_key(*k))
@@ -181,6 +169,12 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// A synthetic coverage universe for ledger unit tests -- the ledger is
+    /// table-agnostic, so tests supply their own key space.
+    fn test_universe() -> Vec<String> {
+        (0..20).map(|i| format!("op{i}/I32x16/m0")).collect()
+    }
+
     fn tempdir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "xdna-emu-ledger-test-{}-{:?}",
@@ -194,46 +188,46 @@ mod tests {
     #[test]
     fn fresh_ledger_uncovered_is_full_universe() {
         let ledger = Ledger::default();
-        let universe = Ledger::universe();
-        let expected: usize = crate::fuzzer::vector::table::table().iter().map(|e| e.modes as usize).sum();
-        assert_eq!(universe.len(), expected, "one key per (entry, mode)");
-        assert_eq!(ledger.uncovered(10).len(), universe.len());
-        assert_eq!(ledger.uncovered(10), universe);
+        let u = test_universe();
+        assert_eq!(ledger.uncovered(&u, 10), u);
     }
 
     #[test]
     fn credit_increments_and_target_hits_remove_from_uncovered() {
         let mut ledger = Ledger::default();
-        let key = Ledger::universe()[0].clone();
+        let u = test_universe();
+        let key = u[0].clone();
         let keys = vec![key.clone()];
         ledger.credit_keys(&keys);
-        assert!(ledger.uncovered(10).contains(&key), "1 hit < target");
-        assert!(!ledger.uncovered(1).contains(&key), "1 hit meets target 1");
+        assert!(ledger.uncovered(&u, 10).contains(&key), "1 hit < target");
+        assert!(!ledger.uncovered(&u, 1).contains(&key), "1 hit meets target 1");
         for _ in 0..9 {
             ledger.credit_keys(&keys);
         }
-        assert!(!ledger.uncovered(10).contains(&key), "10 hits meet target 10");
-        assert_eq!(ledger.uncovered(10).len(), Ledger::universe().len() - 1);
+        assert!(!ledger.uncovered(&u, 10).contains(&key), "10 hits meet target 10");
+        assert_eq!(ledger.uncovered(&u, 10).len(), u.len() - 1);
     }
 
     #[test]
     fn credit_on_divergent_key_does_nothing() {
         let mut ledger = Ledger::default();
-        let key = Ledger::universe()[0].clone();
+        let u = test_universe();
+        let key = u[0].clone();
         ledger.mark_divergent(&key);
         for _ in 0..10 {
             ledger.credit_keys(std::slice::from_ref(&key));
         }
         assert_eq!(ledger.hits.get(&key), None);
-        assert!(!ledger.uncovered(10).contains(&key), "divergent never uncovered");
+        assert!(!ledger.uncovered(&u, 10).contains(&key), "divergent never uncovered");
     }
 
     #[test]
     fn unreachable_excluded_from_uncovered_and_credit() {
         let mut ledger = Ledger::default();
-        let key = Ledger::universe()[0].clone();
+        let u = test_universe();
+        let key = u[0].clone();
         ledger.mark_unreachable(&key, "kernel never compiles");
-        assert!(!ledger.uncovered(10).contains(&key));
+        assert!(!ledger.uncovered(&u, 10).contains(&key));
         ledger.credit_keys(std::slice::from_ref(&key));
         assert_eq!(ledger.hits.get(&key), None);
     }
@@ -241,12 +235,13 @@ mod tests {
     #[test]
     fn timing_flag_does_not_withhold_credit() {
         let mut ledger = Ledger::default();
-        let key = Ledger::universe()[0].clone();
+        let u = test_universe();
+        let key = u[0].clone();
         ledger.mark_timing(&key);
         for _ in 0..10 {
             ledger.credit_keys(std::slice::from_ref(&key));
         }
-        assert!(!ledger.uncovered(10).contains(&key));
+        assert!(!ledger.uncovered(&u, 10).contains(&key));
     }
 
     #[test]
@@ -254,11 +249,11 @@ mod tests {
         let dir = tempdir();
         let path = dir.join("ledger.json");
         let mut ledger = Ledger::default();
-        let universe = Ledger::universe();
-        ledger.credit_keys(&universe[..5]);
-        ledger.mark_divergent(&universe[6]);
-        ledger.mark_timing(&universe[7]);
-        ledger.mark_unreachable(&universe[8], "no compile");
+        let u = test_universe();
+        ledger.credit_keys(&u[..5]);
+        ledger.mark_divergent(&u[6]);
+        ledger.mark_timing(&u[7]);
+        ledger.mark_unreachable(&u[8], "no compile");
 
         ledger.save(&path).unwrap();
         let loaded = Ledger::load(&path).unwrap();
@@ -266,7 +261,7 @@ mod tests {
         assert_eq!(loaded.divergent, ledger.divergent);
         assert_eq!(loaded.timing_fail, ledger.timing_fail);
         assert_eq!(loaded.unreachable, ledger.unreachable);
-        assert_eq!(loaded.uncovered(10), ledger.uncovered(10));
+        assert_eq!(loaded.uncovered(&u, 10), ledger.uncovered(&u, 10));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -275,38 +270,40 @@ mod tests {
     fn load_missing_path_yields_default() {
         let path = std::env::temp_dir().join("xdna-emu-ledger-test-does-not-exist.json");
         let ledger = Ledger::load(&path).unwrap();
-        assert_eq!(ledger.uncovered(10).len(), Ledger::universe().len());
+        let u = test_universe();
+        assert_eq!(ledger.uncovered(&u, 10).len(), u.len());
     }
 
     #[test]
     fn take_divergent_clears_flags_and_returns_keys_to_uncovered() {
         let mut ledger = Ledger::default();
-        let universe = Ledger::universe();
-        let key = universe[0].clone();
+        let u = test_universe();
+        let key = u[0].clone();
         ledger.mark_divergent(&key);
-        assert!(!ledger.uncovered(10).contains(&key), "flagged: not uncovered");
+        assert!(!ledger.uncovered(&u, 10).contains(&key), "flagged: not uncovered");
 
         let taken = ledger.take_divergent();
         assert_eq!(taken, vec![key.clone()]);
         assert!(!ledger.is_divergent(&key), "flag cleared");
-        assert!(ledger.uncovered(10).contains(&key), "back in uncovered pool");
+        assert!(ledger.uncovered(&u, 10).contains(&key), "back in uncovered pool");
 
         // Re-earning it now credits normally.
         let keys = vec![key.clone()];
         for _ in 0..10 {
             ledger.credit_keys(&keys);
         }
-        assert!(!ledger.uncovered(10).contains(&key), "re-earned to target");
+        assert!(!ledger.uncovered(&u, 10).contains(&key), "re-earned to target");
     }
 
     #[test]
     fn mark_resolved_and_mark_divergent_are_mutually_exclusive() {
         let mut ledger = Ledger::default();
-        let key = Ledger::universe()[0].clone();
+        let u = test_universe();
+        let key = u[0].clone();
         ledger.mark_resolved(&key, "re-verified clean, seed 5000");
         ledger.mark_divergent(&key); // re-flagging drops the resolved record
         assert!(ledger.is_divergent(&key));
-        let report = ledger.report(10);
+        let report = ledger.report(&u, 10);
         assert!(!report.contains("resolved:"), "no resolved entries: {report}");
     }
 
@@ -331,37 +328,37 @@ mod tests {
     #[test]
     fn complete_flips_when_all_credited() {
         let mut ledger = Ledger::default();
-        let universe = Ledger::universe();
-        assert!(!ledger.complete(1));
-        ledger.credit_keys(&universe[..universe.len() - 1]);
-        assert!(!ledger.complete(1), "one key still missing");
-        ledger.credit_keys(&universe);
-        assert!(ledger.complete(1));
-        assert!(!ledger.complete(2), "needs two hits each for target 2");
+        let u = test_universe();
+        assert!(!ledger.complete(&u, 1));
+        ledger.credit_keys(&u[..u.len() - 1]);
+        assert!(!ledger.complete(&u, 1), "one key still missing");
+        ledger.credit_keys(&u);
+        assert!(ledger.complete(&u, 1));
+        assert!(!ledger.complete(&u, 2), "needs two hits each for target 2");
     }
 
     #[test]
     fn divergent_unreachable_do_not_block_completion() {
         let mut ledger = Ledger::default();
-        let universe = Ledger::universe();
-        ledger.mark_divergent(&universe[0]);
-        ledger.mark_unreachable(&universe[1], "no compile");
-        ledger.credit_keys(&universe[2..]);
-        assert!(ledger.complete(1));
+        let u = test_universe();
+        ledger.mark_divergent(&u[0]);
+        ledger.mark_unreachable(&u[1], "no compile");
+        ledger.credit_keys(&u[2..]);
+        assert!(ledger.complete(&u, 1));
     }
 
     #[test]
     fn report_contains_counts_and_divergent_list() {
         let mut ledger = Ledger::default();
-        let universe = Ledger::universe();
-        ledger.mark_divergent(&universe[0]);
-        ledger.credit_keys(&universe[1..]);
-        let report = ledger.report(1);
+        let u = test_universe();
+        ledger.mark_divergent(&u[0]);
+        ledger.credit_keys(&u[1..]);
+        let report = ledger.report(&u, 1);
         assert!(report.contains("divergent"), "report: {report}");
         assert!(report.contains("divergent:   1"), "report: {report}");
-        let covered = format!("covered:     {}", universe.len() - 1);
+        let covered = format!("covered:     {}", u.len() - 1);
         assert!(report.contains(&covered), "report: {report}");
         assert!(report.contains("uncovered:   0"), "report: {report}");
-        assert!(report.contains(&universe[0]), "divergent key listed: {report}");
+        assert!(report.contains(&u[0]), "divergent key listed: {report}");
     }
 }

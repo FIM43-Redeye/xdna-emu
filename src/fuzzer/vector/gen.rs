@@ -31,7 +31,7 @@ impl Xorshift64 {
 /// Generate one chain deterministically from `(seed, target_key)`.
 ///
 /// Panics on a malformed/unknown key or out-of-range mode -- callers feed keys
-/// from [`super::ledger::Ledger::universe`].
+/// from [`super::table::universe_keys`].
 pub fn generate(seed: u64, target_key: &str) -> Chain {
     let t = table();
     let (target_idx, target_mode) = parse_key(target_key);
@@ -159,8 +159,7 @@ pub(crate) fn pool_bytes(rng: &mut Xorshift64, slots: usize, for_float: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fuzzer::vector::ledger::Ledger;
-    use crate::fuzzer::vector::table::VecType;
+    use crate::fuzzer::vector::table::{universe_keys, VecType};
 
     /// Pick a deterministic pseudo-random target key for a seed.
     fn key_for_seed(universe: &[String], seed: u64) -> &str {
@@ -171,7 +170,7 @@ mod tests {
     #[test]
     fn thousand_seeds_type_legal_8_to_16_stages() {
         let t = table();
-        let universe = Ledger::universe();
+        let universe = universe_keys();
         for seed in 0..1000u64 {
             let key = key_for_seed(&universe, seed);
             let chain = generate(seed, key);
@@ -197,7 +196,7 @@ mod tests {
 
     #[test]
     fn same_seed_and_key_identical_chain_and_pool() {
-        let universe = Ledger::universe();
+        let universe = universe_keys();
         for seed in [0u64, 1, 42, 999] {
             let key = key_for_seed(&universe, seed);
             assert_eq!(generate(seed, key), generate(seed, key), "seed {seed} key {key}");
@@ -208,7 +207,7 @@ mod tests {
     fn bf16_target_keeps_all_stages_bf16() {
         let t = table();
         for (seed, key) in
-            (0..200u64).zip(Ledger::universe().into_iter().filter(|k| k.contains("Bf16x32")).cycle())
+            (0..200u64).zip(universe_keys().into_iter().filter(|k| k.contains("Bf16x32")).cycle())
         {
             let chain = generate(seed, &key);
             for (k, s) in chain.stages.iter().enumerate() {
@@ -224,7 +223,7 @@ mod tests {
     #[test]
     fn stage0_is_target_entry_with_target_mode() {
         let t = table();
-        for key in Ledger::universe().iter().step_by(7) {
+        for key in universe_keys().iter().step_by(7) {
             let chain = generate(7, key);
             let s0 = &chain.stages[0];
             let e = &t[s0.entry_idx];
@@ -236,7 +235,7 @@ mod tests {
     #[test]
     fn i32x16_target_key_is_covered_in_keys() {
         for (seed, key) in
-            (0..200u64).zip(Ledger::universe().into_iter().filter(|k| k.contains("I32x16")).cycle())
+            (0..200u64).zip(universe_keys().into_iter().filter(|k| k.contains("I32x16")).cycle())
         {
             let chain = generate(seed, &key);
             assert!(chain.keys().contains(&key), "seed {seed}: {key} not in {:?}", chain.keys());

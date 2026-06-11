@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::fuzzer::core::toolchain::{catch_panic, compile_kernel_case, ToolPaths, TRACE_BUFFER_ELEMENTS};
 use crate::fuzzer::vector::chain::{Chain, Stage};
 use crate::fuzzer::vector::gen::generate;
-use crate::fuzzer::vector::ledger::Ledger;
+use crate::fuzzer::core::ledger::Ledger;
 use crate::fuzzer::vector::lower::lower_chain;
 use crate::fuzzer::vector::table::{table, VecType};
 use crate::interpreter::execute::fuzz_recorder;
@@ -119,7 +119,7 @@ impl ChainRecord {
 /// stamp. Deterministic across runs and independent of std hasher internals, so
 /// a bank cut today still compares equal after a rebuild of the same table.
 fn current_table_version() -> u64 {
-    let joined = Ledger::universe().join("\n");
+    let joined = crate::fuzzer::vector::table::universe_keys().join("\n");
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in joined.as_bytes() {
         h ^= b as u64;
@@ -364,9 +364,10 @@ pub fn run_vector_fuzz(opts: &VecFuzzOptions) {
             std::process::exit(1);
         }
     };
+    let universe = crate::fuzzer::vector::table::universe_keys();
 
     if opts.report_only {
-        print!("{}", ledger.report(opts.target_hits));
+        print!("{}", ledger.report(&universe, opts.target_hits));
         return;
     }
 
@@ -391,10 +392,10 @@ pub fn run_vector_fuzz(opts: &VecFuzzOptions) {
         Vec::new()
     };
 
-    let uncovered = ledger.uncovered(opts.target_hits);
+    let uncovered = ledger.uncovered(&universe, opts.target_hits);
     if uncovered.is_empty() {
         println!("Vector fuzz: coverage complete (target {} hits/key)", opts.target_hits);
-        print!("{}", ledger.report(opts.target_hits));
+        print!("{}", ledger.report(&universe, opts.target_hits));
         return;
     }
     if opts.iterations == 0 {
@@ -640,7 +641,7 @@ pub fn run_vector_fuzz(opts: &VecFuzzOptions) {
         "Vector fuzz complete: {pass} pass, {fail} fail, {} error, {crash} CRASH",
         error + compile_errors
     );
-    println!("  uncovered keys remaining: {}", ledger.uncovered(opts.target_hits).len());
+    println!("  uncovered keys remaining: {}", ledger.uncovered(&universe, opts.target_hits).len());
     if fail > 0 || crash > 0 {
         std::process::exit(1);
     }
@@ -942,7 +943,7 @@ mod tests {
     #[ignore = "needs Peano toolchain; run explicitly after table changes"]
     fn vector_compile_clean_200_seeds() {
         let tools = ToolPaths::discover().expect("tool discovery");
-        let universe = Ledger::universe();
+        let universe = crate::fuzzer::vector::table::universe_keys();
         let dir = std::env::current_dir().unwrap().join("build/fuzz-vector/compile-clean");
         std::fs::create_dir_all(&dir).unwrap();
 

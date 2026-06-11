@@ -91,7 +91,7 @@ pub fn lower_chain(chain: &Chain) -> String {
 mod tests {
     use super::*;
     use crate::fuzzer::vector::gen::{generate, Xorshift64};
-    use crate::fuzzer::vector::ledger::Ledger;
+    use crate::fuzzer::vector::table::universe_keys;
 
     /// Same deterministic key pick as gen's tests.
     fn key_for_seed(universe: &[String], seed: u64) -> &str {
@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn two_hundred_seeds_structural_invariants() {
         let t = table();
-        let universe = Ledger::universe();
+        let universe = universe_keys();
         for seed in 0..200u64 {
             let key = key_for_seed(&universe, seed);
             let chain = generate(seed, key);

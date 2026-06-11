@@ -5,4 +5,7 @@
 //! Lifted out of the vector fuzzer in the framework Step 1 refactor
 //! (`docs/superpowers/plans/2026-06-11-framework-step1-lift-vector.md`).
 
+pub mod ledger;
 pub mod toolchain;
+
+pub use ledger::Ledger;
