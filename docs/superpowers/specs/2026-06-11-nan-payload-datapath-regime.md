@@ -82,6 +82,38 @@ Hand-derivation, confirmed numerically:
 mantissa `0x0C0000` -> bf16 `0xFF8C`. `+Inf + (+NaN 0x04)` (same sign) ->
 `0x800000 + 0x840000` overflows -> canonical `0x7F81`.
 
+### Architecture corroboration (AM020 -- mechanism read, not just inferred)
+
+The datapath our model uses is documented verbatim in AM020 ch.4
+("Floating-Point Vector Unit", line 290-291):
+
+> "The accumulator unit supports addition/subtract/negate of accumulator
+> registers in a single-precision FP32 format. All floating-point additions are
+> done in one go, by aligning all mantissas to the one with the largest exponent
+> and with 23 bits of fractional bits. The FP normalization unit handles the
+> cases where the mantissa coming from the post-adder is negative and if the
+> mantissa is outside the acceptable range."
+
+That maps onto `aie2_acc_fp32_add` term for term: one FP32 post-adder all adds
+share (hence bf16 and fp32 take the *same* path), align-to-largest-exponent,
+23-bit fractional, normalize (handles negative mantissa = our sign logic,
+out-of-range = our `overflow` branch). Line 297: "Denormalized numbers are not
+supported by the AIE-ML floating-point data path" = our FTZ. Critically, the
+datapath is described as **uniform** ("all floating-point additions are done in
+one go") with NaN/`invalid` handling in a *separate* exception-event path (line
+295) -- the architecture documents **no canonicalization step in the adder**. So
+the post-adder mantissa simply *is* the result: that is why the datapath regime
+exposes `r`, and the canonical regime (payload forced to 1) is the residual-state
+*deviation* from the documented default, not the default. AM027 ch.4 carries the
+identical datapath to AIE-ML v2 (AIE2P / Strix).
+
+The mechanism is thus triangulated three ways -- AM020 (datapath structure, read),
+AMD's cluster model (computes the same `r`), and silicon (8160/8160 in the
+datapath regime). The "inferred vs read" gap is closed; only AMD's exact RTL for
+payload *exposure* remains unread (in the protected model + silicon), and it is
+empirically pinned. Disassembling the cluster `.so` would add a fourth
+confirmation of an already-triangulated fact -- not pursued.
+
 ## The rule and its validation
 
 ```
