@@ -7,6 +7,7 @@
 //! every listed family compiles to native AIE2 vector code (no scalar loops).
 
 pub mod chain;
+pub mod domain;
 pub mod gen;
 pub mod lower;
 pub mod runner;
