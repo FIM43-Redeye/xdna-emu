@@ -134,6 +134,24 @@ git-archaeology (checkout parent of `692ef54d`, regen pool, re-bank).
 already correct -- this is all verification-infra + comparator honesty). Commit
 per part.
 
+## Outcome (2026-06-11 -- all parts landed)
+
+- **C** `19d2c161`, **B** `c1b1f48c`, **A** `fb15b549`. Lib 3420 throughout.
+- **D** -- HW re-verify campaign (`--reverify --hw --seed 7000 -n 120`, native
+  silicon, `XDNA_EMU` unset). NPU pre-flight `xrt-smi validate` green. Result:
+  **120 pass, 0 fail, 0 error, 0 CRASH**; all 6 cleared flags re-earned
+  (`6 resolved, 0 still divergent`). Final ledger: **218 covered, 0 divergent,
+  0 uncovered, resolved 6** -- genuinely ledger-complete, with per-key
+  re-verify evidence (base seed 7000). The comparator (C) held: bf16 NaN keys
+  passed regardless of the session's NaN regime. Log:
+  `build/experiments/vector-reverify/campaign.log` (build/ is gitignored;
+  ledger.json is a local artifact, evidence lives here + in the banked corpus).
+- **E** -- archived the 45 pre-extension, no-pool, un-replayable seed dirs to
+  `phoenix-survival/vector/archive/` (+ README) -- they retain historical
+  silicon captures but cannot replay. Post-archive replay is **24 match, 0
+  divergent, 0 error** (was 24/0/45-error): the regression gate is now green
+  and noise-free. New divergences bank durably (A) and survive table evolution.
+
 ## Out of scope / open
 
 - The gate flip (#113) reads the coverage-unit registry, not this ledger; it stays
