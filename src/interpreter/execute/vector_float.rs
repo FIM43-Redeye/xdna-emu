@@ -452,36 +452,110 @@ pub fn aie2_fp32_add(a_bits: u32, b_bits: u32) -> u32 {
     fp32_flush_to_zero(result.to_bits())
 }
 
-/// AIE2 fp32 accumulator ALU addition (no output FTZ).
+/// AIE2 fp32 accumulator ALU addition (VADD.f / VSUB.f datapath).
 ///
-/// Same as `aie2_fp32_add` but does NOT flush the result to zero.
-/// The accumulator preserves denormalized results; FTZ only applies
-/// at the SRS/bf16 conversion stage, not when writing back to the
-/// accumulator register file.
+/// Bit-exact model of the hardware mantissa datapath (bfshiftcompute /
+/// bfaccshift / bfnorm lane pipeline), validated against NPU1 silicon via
+/// the vector differential fuzzer (seeds 4/8/34/41/47, bf16 chains with
+/// denormal/NaN/Inf-heavy inputs). Key behaviors that differ from IEEE:
+///
+/// - Denormal INPUTS are not flushed: they enter the mantissa datapath
+///   without an implicit leading 1 (0x80520000 + 0x807E0000 -> exact
+///   normal sum 0x80D00000 on silicon).
+/// - Denormal RESULTS underflow to signed zero (sign of the true sum).
+/// - NaN inputs are flags, not short-circuits: the exponent-255 operand
+///   runs through the same datapath. The result has exp=255 forced,
+///   mantissa = datapath sum (zeroed on overflow/inf) with bit 0 set as
+///   the NaN sticky, and the sum's sign (so -0 - NaN = 0xFF800001-class).
+/// - +Inf + -Inf is NaN (mantissa datapath cancels to zero, bit 0 sticks).
 ///
 /// Used by VADD_F, VSUB_F, VNEGSUB_F, and VNEGADD_F (the accumulator
-/// add/subtract instructions).
-#[inline]
+/// add/subtract instructions); callers apply operand negation by sign flip
+/// (zeros excluded).
 pub fn aie2_acc_fp32_add(a_bits: u32, b_bits: u32) -> u32 {
-    let a_ftz = fp32_flush_to_zero(a_bits);
-    let b_ftz = fp32_flush_to_zero(b_bits);
+    let dec = |bits: u32| -> (bool, u32, u32) { ((bits >> 31) != 0, (bits >> 23) & 0xFF, bits & 0x7F_FFFF) };
+    let (asgn, aexp, aman) = dec(a_bits);
+    let (bsgn, bexp, bman) = dec(b_bits);
 
-    let a_nan = fp32_is_nan(a_ftz);
-    let b_nan = fp32_is_nan(b_ftz);
+    let a_zero = aexp == 0 && aman == 0;
+    let b_zero = bexp == 0 && bman == 0;
+    let a_inf = aexp == 255 && aman == 0;
+    let b_inf = bexp == 255 && bman == 0;
+    let a_nan = aexp == 255 && aman != 0;
+    let b_nan = bexp == 255 && bman != 0;
 
-    if a_nan && b_nan {
-        // Both NaN: hardware treats exp=255 as valid, computes normally,
-        // then sets mantissa bit 0 as NaN-origin sticky flag.
-        return fp32_add_treat_nan_as_normal(a_ftz, b_ftz) | 0x01;
-    }
-    if a_nan || b_nan {
-        return fp32_make_nan(false);
-    }
+    // Flag pre-compute (bfshiftcompute_lane): inf becomes a signed flag,
+    // opposing infinities raise NaN.
+    let pinf = (a_inf && !asgn) || (b_inf && !bsgn);
+    let minf = (a_inf && asgn) || (b_inf && bsgn);
+    let nan = a_nan || b_nan || (pinf && minf);
 
-    let a = f32::from_bits(a_ftz);
-    let b = f32::from_bits(b_ftz);
-    let result = a + b;
-    result.to_bits()
+    // Biased 9-bit exponent: +0x80 for nonzero, low bit forced for denorms.
+    let exp9 = |zero: bool, exp: u32, man: u32| -> u32 {
+        if zero {
+            0
+        } else {
+            (exp + 0x80) | u32::from(exp == 0 && man != 0)
+        }
+    };
+    let aexp9 = exp9(a_zero, aexp, aman);
+    let bexp9 = exp9(b_zero, bexp, bman);
+    let omax = aexp9.max(bexp9);
+
+    // 24-bit mantissa (implicit 1 only when exp != 0), aligned to omax with
+    // round-to-nearest-even on the shifted-out bits (bfaccshift_lane).
+    let align = |exp: u32, man: u32, exp9v: u32| -> i64 {
+        let man24 = if exp != 0 { (1 << 23) | man } else { man } as u64;
+        let s = omax - exp9v;
+        let v = man24 << 1; // 25-bit
+        let e = if s >= 64 { 0 } else { v >> s };
+        let r = e >> 1;
+        let grd = e & 1 != 0;
+        let lsb = (e >> 1) & 1 != 0;
+        let rmask = if s >= 64 { u64::MAX } else { !(u64::MAX << s) };
+        let stk = man24 & (rmask >> 1) != 0;
+        (r + u64::from(grd && (stk || lsb))) as i64
+    };
+    let sum = {
+        let av = align(aexp, aman, aexp9);
+        let bv = align(bexp, bman, bexp9);
+        (if asgn { -av } else { av }) + (if bsgn { -bv } else { bv })
+    };
+
+    // Normalize (bfnorm_lane): 29-bit magnitude, RNE to 23-bit mantissa.
+    let sgn_sum = sum < 0;
+    let m = sum.unsigned_abs();
+    let real_zero = m == 0;
+    let fl: i32 = if real_zero {
+        32
+    } else {
+        28 - (63 - m.leading_zeros() as i32)
+    };
+    let d = if real_zero { 0u64 } else { m << (fl & 0x1F) };
+    let grd = (d >> 4) & 1 != 0;
+    let lsb = (d >> 5) & 1 != 0;
+    let stk = d & 0xF != 0;
+    let rup = grd && (stk || lsb);
+    let r = (((d >> 5) & 0x7F_FFFF) + u64::from(rup)) & 0x7F_FFFF;
+    let exp_up = (d >> 4) & 0xFF_FFFF == 0xFF_FFFF;
+    let exp = omax as i32 - 0x7B - fl + i32::from(exp_up);
+
+    let overflow = exp >= 255 && !real_zero;
+    let underflow = exp <= 0 && !real_zero;
+    let out_zeros = !(pinf || minf || overflow || underflow);
+    let exp_ones = nan || pinf || minf || overflow;
+    let exp_zeros = !(underflow || real_zero);
+
+    let sgn_out = if !nan && (pinf || minf) { minf } else { sgn_sum };
+    let rr = (if out_zeros { r as u32 } else { 0 }) | u32::from(nan);
+    let e8 = if exp_ones {
+        0xFF
+    } else if exp_zeros {
+        exp as u32 & 0xFF
+    } else {
+        0
+    };
+    (u32::from(sgn_out) << 31) | (e8 << 23) | rr
 }
 
 // ---------------------------------------------------------------------------
@@ -1260,5 +1334,46 @@ mod tests {
         let val = f32::from_bits(0x3FFF_8000);
         let r = f32_to_bf16(val, RoundingMode::ConvEven);
         assert_eq!(r, 0x4000, "rounding should overflow to next exponent");
+    }
+
+    // -- aie2_acc_fp32_add: VADD.f datapath, silicon-verified (fuzzer seed 4) --
+
+    #[test]
+    fn acc_add_preserves_denormal_inputs() {
+        // Two fp32 denorms (from bf16 denorms via vconv) sum to an exact
+        // normal: silicon does NOT flush the inputs.
+        assert_eq!(aie2_acc_fp32_add(0x8052_0000, 0x807E_0000), 0x80D0_0000);
+    }
+
+    #[test]
+    fn acc_add_flushes_denormal_result_with_sum_sign() {
+        // -0x45 + 0x71 denorms: denormal sum -> +0 with the true sum's sign.
+        assert_eq!(aie2_acc_fp32_add(0x8045_0000, 0x0071_0000), 0x0000_0000);
+        // -0x6b + 0x2f: negative denormal sum -> -0.
+        assert_eq!(aie2_acc_fp32_add(0x806B_0000, 0x002F_0000), 0x8000_0000);
+    }
+
+    #[test]
+    fn acc_add_nan_keeps_datapath_sign_with_sticky() {
+        // -0 + -NaN: exp-255 operand overflows the datapath -> sign|FF|1.
+        assert_eq!(aie2_acc_fp32_add(0x8000_0000, 0xFFC0_0000), 0xFF80_0001);
+        // NaN + max-normal: mantissa datapath survives -> exp FF forced,
+        // mantissa from the (rounded) sum.
+        let r = aie2_acc_fp32_add(0xFF80_007F, 0x7F7F_0000);
+        assert_eq!(r >> 23, 0x1FF, "negative, exp=255");
+        assert_ne!(r & 0x7F_FFFF, 0, "NaN sticky/mantissa nonzero");
+    }
+
+    #[test]
+    fn acc_add_opposing_infinities_are_nan() {
+        // +Inf + -Inf cancels in the mantissa datapath -> +NaN sticky only.
+        assert_eq!(aie2_acc_fp32_add(0x7F80_0000, 0xFF80_0000), 0x7F80_0001);
+    }
+
+    #[test]
+    fn acc_add_normal_matches_ieee() {
+        for (a, b) in [(1.0f32, 2.0f32), (1.5, -0.25), (3.0e38, 3.0e37), (-1.0e-30, 1.0e-32)] {
+            assert_eq!(f32::from_bits(aie2_acc_fp32_add(a.to_bits(), b.to_bits())), a + b, "{a} + {b}");
+        }
     }
 }

@@ -222,11 +222,17 @@ impl VectorAlu {
                     let mut all = [0u32; 16];
                     all[..8].copy_from_slice(&res_lo);
                     all[8..].copy_from_slice(&res_hi);
-                    let mut acc = [0u64; 8];
+                    let mut acc = [0u64; 16];
                     for i in 0..8 {
                         acc[i] = (all[i * 2] as u64) | ((all[i * 2 + 1] as u64) << 32);
                     }
-                    ctx.accumulator.write(dst_reg, acc);
+                    // II_VCONVfp32bf16 result latency is 2 (AIE2Schedule.td).
+                    // The write must be deferred so the stage-3 accumulator
+                    // source read of a deferred vadd.f samples the producer
+                    // schedule the compiler intended: a conv issued AFTER the
+                    // vadd must not retroactively replace the vadd's source
+                    // (silicon-verified, fuzzer seed 4 high half).
+                    ctx.queue_matmul_accum_write(Operand::AccumReg(dst_reg), acc, true, 2);
                 } else {
                     let mut result = [0u32; 16];
                     result[..8].copy_from_slice(&res_lo);
@@ -576,6 +582,9 @@ mod tests {
         op.is_wide_vector = true;
 
         assert!(VectorAlu::execute(&op, &mut ctx));
+        // The accumulator write carries the II_VCONVfp32bf16 result latency
+        // (2 cycles); commit it before reading back.
+        ctx.flush_pending_writes();
         let acc = ctx.accumulator.read(0);
 
         for i in 0..8 {

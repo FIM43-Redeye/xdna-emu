@@ -167,6 +167,36 @@ pub struct PendingUnpack {
 /// operand cycle 7, sampled one bundle before write-back; see PendingUnpack).
 const VUNPACK_SRC_READ_LATENCY: u64 = 6;
 
+/// A deferred accumulator add/sub awaiting its stage-3 source read.
+///
+/// II_VADDMAC / II_VADDMACf (AIE2Schedule.td) read their accumulator
+/// sources at operand cycle 3, not at issue. The compiler relies on this:
+/// Peano bundles `vconv.fp32.bf16 bmh2, wl2` (result latency 2) WITH the
+/// `vadd.f bmh0, bmh0, bmh2` that consumes it, and the slot order executes
+/// the vadd first. Sampling at issue read the stale accumulator (verified
+/// against NPU1 silicon, vector fuzzer seed 4: low output half = a.lo +
+/// b.HI because the prior bundle's conv was the freshest visible write).
+/// All control bits are resolved at issue; only the accumulator source
+/// read is deferred.
+#[derive(Debug, Clone)]
+pub struct PendingAccAdd {
+    pub acc1_reg: u8,
+    pub acc2_reg: u8,
+    pub dst_reg: u8,
+    pub negate_acc1: bool,
+    pub negate_acc2: bool,
+    pub zero_acc1: bool,
+    pub shift16: bool,
+    pub is_float: bool,
+    pub is_wide: bool,
+    /// Issued-bundle count at which the accumulator sources are read.
+    pub ready_bundle: u64,
+}
+
+/// Accumulator add/sub source read latency in issued bundles (operand
+/// cycle 3, sampled one bundle before the boundary; see PendingAccAdd).
+const VACC_SRC_READ_LATENCY: u64 = 2;
+
 /// Maximum loop-body byte span for which the LE-bundle partial-word store is
 /// flushed on the zero-overhead-loop back-edge.
 ///
@@ -324,6 +354,10 @@ pub struct ExecutionContext {
     /// Deferred VUNPACKs awaiting their stage-7 source read (see PendingUnpack).
     pending_unpacks: Vec<PendingUnpack>,
 
+    /// Deferred accumulator add/subs awaiting their stage-3 source read
+    /// (see PendingAccAdd).
+    pending_acc_adds: Vec<PendingAccAdd>,
+
     // === Memory Bank Conflict Detection ===
     /// Bitmask of memory banks accessed by the core during this cycle.
     /// Bit N set = bank N was accessed via load/store. Compared against
@@ -468,6 +502,7 @@ impl ExecutionContext {
             bundle_seq: 0,
             pending_stores: Vec::new(),
             pending_unpacks: Vec::new(),
+            pending_acc_adds: Vec::new(),
             cycle_core_banks: 0,
             srs_config: SrsConfig::default(),
         }
@@ -1150,6 +1185,145 @@ impl ExecutionContext {
             result[8..].copy_from_slice(&hi);
             // Source read at issue+6, write-back at issue+7: one more bundle.
             self.vector.queue_write_wide(pu.dest_reg, result, 1, Bypass::No);
+        }
+    }
+
+    /// Queue an accumulator add/sub for its stage-3 source read (see
+    /// [`PendingAccAdd`]). Control bits are resolved by the caller at issue.
+    #[allow(clippy::too_many_arguments)]
+    pub fn queue_pending_acc_add(
+        &mut self,
+        acc1_reg: u8,
+        acc2_reg: u8,
+        dst_reg: u8,
+        negate_acc1: bool,
+        negate_acc2: bool,
+        zero_acc1: bool,
+        shift16: bool,
+        is_float: bool,
+        is_wide: bool,
+    ) {
+        self.pending_acc_adds.push(PendingAccAdd {
+            acc1_reg,
+            acc2_reg,
+            dst_reg,
+            negate_acc1,
+            negate_acc2,
+            zero_acc1,
+            shift16,
+            is_float,
+            is_wide,
+            ready_bundle: self.bundle_seq + VACC_SRC_READ_LATENCY,
+        });
+    }
+
+    /// Sample sources for pending accumulator add/subs that reached their
+    /// read bundle and write their results. Call once per issued bundle,
+    /// after `commit_pending_writes()` (so MAC results that land this cycle
+    /// are visible) and before slot execution.
+    pub fn process_pending_acc_adds(&mut self) {
+        if self.pending_acc_adds.is_empty() {
+            return;
+        }
+        let current = self.bundle_seq;
+        let mut ready: Vec<PendingAccAdd> = Vec::new();
+        self.pending_acc_adds.retain(|pa| {
+            if pa.ready_bundle <= current {
+                ready.push(pa.clone());
+                false
+            } else {
+                true
+            }
+        });
+        ready.sort_by_key(|pa| pa.ready_bundle);
+        for pa in ready {
+            if pa.is_wide {
+                let a1 = self.accumulator.read_wide(pa.acc1_reg);
+                let a2 = self.accumulator.read_wide(pa.acc2_reg);
+                let mut result = [0u64; 16];
+                for i in 0..16 {
+                    result[i] = Self::acc_add_sub_lane_pair(a1[i], a2[i], &pa);
+                }
+                self.accumulator.write_wide(pa.dst_reg, result);
+            } else {
+                let a1 = self.accumulator.read(pa.acc1_reg);
+                let a2 = self.accumulator.read(pa.acc2_reg);
+                let mut result = [0u64; 8];
+                for i in 0..8 {
+                    result[i] = Self::acc_add_sub_lane_pair(a1[i], a2[i], &pa);
+                }
+                self.accumulator.write(pa.dst_reg, result);
+            }
+        }
+    }
+
+    /// One 64-bit accumulator word of VADD/VSUB/VNEGADD/VNEGSUB: two
+    /// independent 32-bit lanes (fp32 or int32 per `is_float`).
+    fn acc_add_sub_lane_pair(a1: u64, a2: u64, pa: &PendingAccAdd) -> u64 {
+        if pa.is_float {
+            use crate::interpreter::execute::vector_float::aie2_acc_fp32_add;
+            // Denormal inputs are NOT flushed: the acc add ALU computes them
+            // at full precision and flushes only a denormal RESULT to signed
+            // zero (silicon-verified, fuzzer seed 4; see aie2_acc_fp32_add).
+            let mut a1_lo = if pa.zero_acc1 { 0 } else { a1 as u32 };
+            let mut a1_hi = if pa.zero_acc1 { 0 } else { (a1 >> 32) as u32 };
+            let mut a2_lo = a2 as u32;
+            let mut a2_hi = (a2 >> 32) as u32;
+            // Negate by flipping the sign bit -- but NOT for true zeros: the
+            // hardware negation leaves zero positive, so vsub.f(-0, +0) = +0
+            // (silicon-verified, fuzzer seed 4 sub stage; IEEE -0 + -0 would
+            // give -0). Normals, denormals, inf, and NaN all flip.
+            let neg = |bits: u32| {
+                if bits & 0x7FFF_FFFF == 0 {
+                    bits
+                } else {
+                    bits ^ 0x8000_0000
+                }
+            };
+            if pa.negate_acc1 {
+                a1_lo = neg(a1_lo);
+                a1_hi = neg(a1_hi);
+            }
+            if pa.negate_acc2 {
+                a2_lo = neg(a2_lo);
+                a2_hi = neg(a2_hi);
+            }
+            let r_lo = aie2_acc_fp32_add(a1_lo, a2_lo);
+            let r_hi = aie2_acc_fp32_add(a1_hi, a2_hi);
+            (r_lo as u64) | ((r_hi as u64) << 32)
+        } else {
+            // Acc32 mode: no carry chain between halves, per-lane 32-bit math.
+            let v1_lo = if pa.zero_acc1 { 0i32 } else { a1 as i32 };
+            let v1_hi = if pa.zero_acc1 { 0i32 } else { (a1 >> 32) as i32 };
+            let v2_lo = a2 as i32;
+            let v2_hi = (a2 >> 32) as i32;
+            let v1_lo = if pa.negate_acc1 {
+                v1_lo.wrapping_neg()
+            } else {
+                v1_lo
+            };
+            let v1_hi = if pa.negate_acc1 {
+                v1_hi.wrapping_neg()
+            } else {
+                v1_hi
+            };
+            let v2_lo = if pa.negate_acc2 {
+                v2_lo.wrapping_neg()
+            } else {
+                v2_lo
+            };
+            let v2_hi = if pa.negate_acc2 {
+                v2_hi.wrapping_neg()
+            } else {
+                v2_hi
+            };
+            let mut r_lo = v1_lo.wrapping_add(v2_lo);
+            let mut r_hi = v1_hi.wrapping_add(v2_hi);
+            if pa.shift16 {
+                r_lo >>= 16;
+                r_hi >>= 16;
+            }
+            (r_lo as u32 as u64) | ((r_hi as u32 as u64) << 32)
         }
     }
 

@@ -722,6 +722,11 @@ impl CycleAccurateExecutor {
         // bundle are visible, before slot execution).
         ctx.process_pending_unpacks();
 
+        // Sample sources for accumulator add/subs whose stage-3 read bundle
+        // arrived (after commit_pending_writes so MAC/conv results that land
+        // this cycle are visible).
+        ctx.process_pending_acc_adds();
+
         ctx.begin_bundle();
 
         // Same-bundle scalar->shift forwarding. AIE2 writes an S register at

@@ -1606,126 +1606,23 @@ impl VectorAlu {
         let negate_acc1 = md1 ^ sub_acc1;
         let negate_acc2 = md2 ^ sub_acc2;
 
-        if is_wide {
-            // Wide path: 1024-bit cm registers (16 x 64-bit lanes).
-            let a1 = ctx.accumulator.read_wide(acc1_reg);
-            let a2 = ctx.accumulator.read_wide(acc2_reg);
-            let mut result = [0u64; 16];
-
-            if is_float {
-                use super::vector_float::{fp32_flush_to_zero, aie2_acc_fp32_add};
-                for i in 0..16 {
-                    let mut a1_lo = if zero_acc1 {
-                        0u32
-                    } else {
-                        fp32_flush_to_zero(a1[i] as u32)
-                    };
-                    let mut a1_hi = if zero_acc1 {
-                        0u32
-                    } else {
-                        fp32_flush_to_zero((a1[i] >> 32) as u32)
-                    };
-                    let mut a2_lo = fp32_flush_to_zero(a2[i] as u32);
-                    let mut a2_hi = fp32_flush_to_zero((a2[i] >> 32) as u32);
-
-                    // Negate by flipping sign bit (works for zero, normal, inf, NaN).
-                    if negate_acc1 {
-                        a1_lo ^= 0x8000_0000;
-                        a1_hi ^= 0x8000_0000;
-                    }
-                    if negate_acc2 {
-                        a2_lo ^= 0x8000_0000;
-                        a2_hi ^= 0x8000_0000;
-                    }
-
-                    // Use acc ALU add (no output FTZ): the accumulator
-                    // register file preserves denormalized fp32 values.
-                    let r_lo = aie2_acc_fp32_add(a1_lo, a2_lo);
-                    let r_hi = aie2_acc_fp32_add(a1_hi, a2_hi);
-                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
-                }
-            } else {
-                // Acc32 mode: each u64 holds two independent 32-bit accumulator
-                // lanes.  The hardware ALU has no carry chain between the lo and
-                // hi halves -- all arithmetic is per-lane 32-bit.
-                for i in 0..16 {
-                    let v1_lo = if zero_acc1 { 0i32 } else { a1[i] as i32 };
-                    let v1_hi = if zero_acc1 { 0i32 } else { (a1[i] >> 32) as i32 };
-                    let v2_lo = a2[i] as i32;
-                    let v2_hi = (a2[i] >> 32) as i32;
-                    let v1_lo = if negate_acc1 { v1_lo.wrapping_neg() } else { v1_lo };
-                    let v1_hi = if negate_acc1 { v1_hi.wrapping_neg() } else { v1_hi };
-                    let v2_lo = if negate_acc2 { v2_lo.wrapping_neg() } else { v2_lo };
-                    let v2_hi = if negate_acc2 { v2_hi.wrapping_neg() } else { v2_hi };
-                    let mut r_lo = v1_lo.wrapping_add(v2_lo);
-                    let mut r_hi = v1_hi.wrapping_add(v2_hi);
-                    if shift16 {
-                        r_lo >>= 16;
-                        r_hi >>= 16;
-                    }
-                    result[i] = (r_lo as u32 as u64) | ((r_hi as u32 as u64) << 32);
-                }
-            }
-
-            ctx.accumulator.write_wide(dst_reg, result);
-        } else {
-            // Narrow path: 512-bit bm registers (8 x 64-bit lanes).
-            let a1 = ctx.accumulator.read(acc1_reg);
-            let a2 = ctx.accumulator.read(acc2_reg);
-            let mut result = [0u64; 8];
-
-            if is_float {
-                use super::vector_float::{fp32_flush_to_zero, aie2_acc_fp32_add};
-                for i in 0..8 {
-                    let mut a1_lo = if zero_acc1 {
-                        0u32
-                    } else {
-                        fp32_flush_to_zero(a1[i] as u32)
-                    };
-                    let mut a1_hi = if zero_acc1 {
-                        0u32
-                    } else {
-                        fp32_flush_to_zero((a1[i] >> 32) as u32)
-                    };
-                    let mut a2_lo = fp32_flush_to_zero(a2[i] as u32);
-                    let mut a2_hi = fp32_flush_to_zero((a2[i] >> 32) as u32);
-
-                    if negate_acc1 {
-                        a1_lo ^= 0x8000_0000;
-                        a1_hi ^= 0x8000_0000;
-                    }
-                    if negate_acc2 {
-                        a2_lo ^= 0x8000_0000;
-                        a2_hi ^= 0x8000_0000;
-                    }
-
-                    let r_lo = aie2_acc_fp32_add(a1_lo, a2_lo);
-                    let r_hi = aie2_acc_fp32_add(a1_hi, a2_hi);
-                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
-                }
-            } else {
-                // Acc32 mode: independent 32-bit lane operations (see wide path).
-                for i in 0..8 {
-                    let v1_lo = if zero_acc1 { 0i32 } else { a1[i] as i32 };
-                    let v1_hi = if zero_acc1 { 0i32 } else { (a1[i] >> 32) as i32 };
-                    let v2_lo = a2[i] as i32;
-                    let v2_hi = (a2[i] >> 32) as i32;
-                    let v1_lo = if negate_acc1 { v1_lo.wrapping_neg() } else { v1_lo };
-                    let v1_hi = if negate_acc1 { v1_hi.wrapping_neg() } else { v1_hi };
-                    let v2_lo = if negate_acc2 { v2_lo.wrapping_neg() } else { v2_lo };
-                    let v2_hi = if negate_acc2 { v2_hi.wrapping_neg() } else { v2_hi };
-                    let mut r_lo = v1_lo.wrapping_add(v2_lo);
-                    let mut r_hi = v1_hi.wrapping_add(v2_hi);
-                    if shift16 {
-                        r_lo >>= 16;
-                        r_hi >>= 16;
-                    }
-                    result[i] = (r_lo as u32 as u64) | ((r_hi as u32 as u64) << 32);
-                }
-            }
-
-            ctx.accumulator.write(dst_reg, result);
-        }
+        // II_VADDMAC / II_VADDMACf read their accumulator sources at operand
+        // cycle 3, not at issue (AIE2Schedule.td); Peano bundles the vconv
+        // producing a source WITH the vadd that consumes it. Defer the source
+        // read+compute to the pending-acc-add queue; all control bits are
+        // resolved here at issue. The 32-bit lane math lives in
+        // `ExecutionContext::acc_add_sub_lane_pair`.
+        ctx.queue_pending_acc_add(
+            acc1_reg,
+            acc2_reg,
+            dst_reg,
+            negate_acc1,
+            negate_acc2,
+            zero_acc1,
+            shift16,
+            is_float,
+            is_wide,
+        );
     }
 
     /// Accumulator negate: dst = -src.
@@ -2462,10 +2359,16 @@ mod tests {
         ctx.scalar.write(0, 0);
 
         VectorAlu::execute(&op, &mut ctx);
+        // VADD.f samples its accumulator sources at operand cycle 3; drive
+        // the deferred read (issued at bundle 0, ready at bundle 2).
+        ctx.bundle_seq = 2;
+        ctx.process_pending_acc_adds();
 
         let result = ctx.accumulator.read(0);
-        // Each u64 lane should hold two copies of canonical NaN = 0x7F800001.
-        let expected = 0x7F800001_7F800001u64;
+        // 0xFFFFFFFF is a NEGATIVE NaN; the mantissa datapath sums the
+        // exp-255 operands (overflow), forces exp=255 with the NaN sticky in
+        // bit 0, and keeps the sum's (negative) sign: 0xFF800001 per lane.
+        let expected = 0xFF800001_FF800001u64;
         for (i, &v) in result.iter().enumerate() {
             assert_eq!(v, expected, "acc lane {} should be canonical NaN pair, got {:#018x}", i, v);
         }
@@ -2512,6 +2415,9 @@ mod tests {
         ctx.scalar.write(0, 0);
 
         VectorAlu::execute(&op, &mut ctx);
+        // Drive the deferred stage-3 accumulator source read.
+        ctx.bundle_seq = 2;
+        ctx.process_pending_acc_adds();
 
         // Read back via SRS s16.s32 with shift=0.
         let result_acc = ctx.accumulator.read(0);
