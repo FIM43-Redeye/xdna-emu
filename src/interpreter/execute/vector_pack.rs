@@ -30,6 +30,25 @@ pub enum PackMode {
     SymmetricSaturate,
 }
 
+impl PackMode {
+    /// Select the narrow mode from the live crSat saturation flags
+    /// (Core_CR [1:0]): bit 0 = saturate, bit 1 = symmetric saturate.
+    /// The hardware narrowing pack reads crSat (`VPACK_* Uses = [crSat]`, llvm-aie
+    /// TableGen) and SRS does the same, so the emulator derives the mode from the
+    /// live saturation register rather than assuming truncation. Confirmed on real
+    /// NPU1 silicon: a saturating crSat clamps int16->int8 (200 -> 127), it does
+    /// not take the low byte.
+    ///
+    /// 0 -> Truncate, 1 -> Saturate, 3 -> SymmetricSaturate.
+    pub fn from_sat_flags(saturate: bool, symmetric: bool) -> PackMode {
+        match (saturate, symmetric) {
+            (false, _) => PackMode::Truncate,
+            (true, false) => PackMode::Saturate,
+            (true, true) => PackMode::SymmetricSaturate,
+        }
+    }
+}
+
 /// Truncate a value to `bits` width, interpreting as signed or unsigned.
 ///
 /// If `signed`: sign-extend from bit position (bits-1).
@@ -298,7 +317,7 @@ fn insert_lanes(reg: &mut [u32; 8], lanes: &[i64], bits: u32) {
 
 // ========== VectorAlu dispatch for Pack/Unpack ==========
 
-use crate::interpreter::bundle::{ElementType, SlotOp};
+use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::state::ExecutionContext;
 
 use super::vector_dispatch::VectorAlu;
@@ -319,8 +338,12 @@ impl VectorAlu {
             let src_lo: [u32; 8] = src[..8].try_into().unwrap();
             let src_hi: [u32; 8] = src[8..].try_into().unwrap();
 
-            let packed_lo = pack_half(&src_lo, bits_i, bits_o, signed, PackMode::Truncate);
-            let packed_hi = pack_half(&src_hi, bits_i, bits_o, signed, PackMode::Truncate);
+            // VPACK reads crSat (Uses = [crSat]); derive the narrow mode from
+            // the live saturation register instead of assuming truncation.
+            let mode =
+                PackMode::from_sat_flags(ctx.srs_config.saturate(), ctx.srs_config.symmetric_saturate());
+            let packed_lo = pack_half(&src_lo, bits_i, bits_o, signed, mode);
+            let packed_hi = pack_half(&src_hi, bits_i, bits_o, signed, mode);
 
             // Each half produces (256/bits_i * bits_o) bits of packed data.
             // Concatenate the two halves into a single 256-bit w-register.
@@ -349,28 +372,32 @@ impl VectorAlu {
             // The source lanes are split: lower lanes fill the low half
             // of the output, upper lanes fill the high half.
             //
-            // The compiler emits vldb+vunpack without NOPs because
-            // hardware scoreboarding stalls the unpack until the load
-            // completes. Force-commit all pending vector writes so the
-            // source data from a preceding vldb is visible.
-            ctx.force_commit_all_pending();
-
+            // II_VUNPACK reads its SOURCE at pipeline stage 7 (operand
+            // cycles [7,7,7] in AIE2Schedule.td), not at issue. The
+            // compiler exploits this: a preceding vldb's data is naturally
+            // visible (load latency 7), and producers of the source can be
+            // scheduled AFTER the vunpack (silicon-verified, fuzzer seed 7
+            // where a vsel 4 bundles later supplies the unpack source). So
+            // the read+compute is deferred to issue+6 via the pending-unpack
+            // queue; only the operand registers are captured here.
             let name = op.encoding_name.as_deref().unwrap_or("");
             let (bits_i, bits_o, signed) = unpack_widths_from_name(name);
 
-            // Read the 256-bit source (NOT wide -- it's a w-register).
-            let src = Self::get_vector_source(op, ctx, 0);
-
-            // Each output half holds 256/bits_o lanes. The second half
-            // reads from lane_start = 256/bits_o in the source.
-            let lanes_per_half = (256 / bits_o) as usize;
-            let result_lo = unpack_half(&src, 0, bits_i, bits_o, signed);
-            let result_hi = unpack_half(&src, lanes_per_half, bits_i, bits_o, signed);
-
-            let mut result = [0u32; 16];
-            result[..8].copy_from_slice(&result_lo);
-            result[8..].copy_from_slice(&result_hi);
-            Self::write_wide_vec_dest(op, ctx, result);
+            let src_reg = match op.sources.first() {
+                Some(Operand::VectorReg(r)) => *r,
+                other => {
+                    log::error!("[VECTOR] execute_unpack: expected VectorReg source, got {:?}", other);
+                    return true;
+                }
+            };
+            let dest_reg = match &op.dest {
+                Some(Operand::VectorReg(r)) => *r,
+                other => {
+                    log::error!("[VECTOR] execute_unpack: expected VectorReg dest, got {:?}", other);
+                    return true;
+                }
+            };
+            ctx.queue_pending_unpack(src_reg, dest_reg, bits_i, bits_o, signed);
         } else {
             let src = Self::get_vector_source(op, ctx, 0);
             let result = Self::vector_unpack_low(&src);
@@ -383,6 +410,94 @@ impl VectorAlu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interpreter::bundle::{Operand, SlotIndex};
+    use xdna_archspec::aie2::isa::SemanticOp;
+
+    fn make_ctx() -> ExecutionContext {
+        ExecutionContext::new()
+    }
+
+    /// VPACK_S8_S16 `Uses = [crSat]`: a saturating crSat must make the wide
+    /// int16->int8 pack saturate (clamp), not truncate. Verified against real
+    /// NPU1 silicon (vec_pack_i16_sat: HW saturates 200->127, matches the
+    /// saturating golden; the emulator previously hardcoded truncation).
+    #[test]
+    fn execute_pack_honors_crsat_saturation() {
+        let mut ctx = make_ctx();
+        // lane 0 = 200 (out of int8 range): truncate -> -56, saturate -> 127.
+        let mut src = [0u32; 16];
+        src[0] = 200;
+        ctx.vector.write_wide(0, src);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Pack)
+            .as_vector(ElementType::Int8)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0));
+        op.is_wide_vector = true;
+        op.encoding_name = Some("vpack.s8.s16".to_string());
+
+        // crSat = saturate (bit 0 set): clamp 200 -> 127.
+        ctx.srs_config.saturation_mode = 1;
+        VectorAlu::execute(&op, &mut ctx);
+        assert_eq!((ctx.vector.read(2)[0] & 0xff) as u8 as i8, 127, "crSat=saturate must clamp 200 -> 127");
+
+        // crSat = none (0): truncate low 8 bits -> -56.
+        ctx.vector.write_wide(0, src);
+        ctx.srs_config.saturation_mode = 0;
+        VectorAlu::execute(&op, &mut ctx);
+        assert_eq!(
+            (ctx.vector.read(2)[0] & 0xff) as u8 as i8,
+            200u32 as u8 as i8,
+            "crSat=none must truncate 200 -> -56"
+        );
+    }
+
+    /// II_VUNPACK reads its w-reg source at pipeline stage 7 (operand cycles
+    /// [7,7,7], AIE2Schedule.td), so a producer scheduled AFTER the vunpack
+    /// supplies the data. Silicon-verified: vector fuzzer seed 7 has Peano
+    /// emit `vunpack.s16.s8 x4, wl2` four bundles BEFORE the `vsel.8 x2, ...`
+    /// whose result the unpack consumes; NPU1 unpacks the vsel result.
+    /// Sampling at issue read the stale pre-vsel register.
+    #[test]
+    fn execute_unpack_samples_source_at_stage7_not_issue() {
+        let mut ctx = make_ctx();
+        // Committed (old) value: bytes 0x11. New value (written by a producer
+        // 4 bundles after the unpack issues): bytes 0xAA -> -86 sign-extended.
+        ctx.vector.write(2, [0x1111_1111; 8]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Unpack)
+            .as_vector(ElementType::Int8)
+            .with_dest(Operand::VectorReg(4))
+            .with_source(Operand::VectorReg(2));
+        op.is_wide_vector = true;
+        op.encoding_name = Some("vunpack.s16.s8".to_string());
+
+        // Issue the unpack at bundle 0.
+        ctx.vector.advance_bundle(0);
+        ctx.bundle_seq = 0;
+        VectorAlu::execute(&op, &mut ctx);
+
+        let step = |ctx: &mut ExecutionContext, b: u64| {
+            ctx.bundle_seq = b;
+            ctx.vector.advance_bundle(b);
+            ctx.process_pending_unpacks();
+        };
+
+        for b in 1..=3 {
+            step(&mut ctx, b);
+        }
+        // Producer (vsel, latency 2) writes the source register at bundle 4:
+        // architecturally visible at bundle 6 -- exactly the unpack read bundle.
+        ctx.vector
+            .queue_write(2, [0xAAAA_AAAA; 8], 2, crate::interpreter::state::Bypass::No);
+        for b in 4..=7 {
+            step(&mut ctx, b);
+        }
+
+        // Dest lands at issue+7: every i16 lane is sign-extend(0xAA) = 0xFFAA.
+        let dest = ctx.vector.read_wide(4);
+        assert_eq!(dest, [0xFFAA_FFAA; 16], "unpack must widen the post-producer source value");
+    }
 
     // -- truncate --
 

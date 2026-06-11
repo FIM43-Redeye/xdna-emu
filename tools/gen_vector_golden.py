@@ -458,6 +458,26 @@ def bf16_srs_input_patterns():
         pats.add(fp32_bits(sgn, 255, 0x400000))   # NaN, top mantissa bit
         pats.add(fp32_bits(sgn, 255, 0x000000))   # inf (exp=255, man=0)
 
+    # Dense denormal sweep (exp=0) straddling the guard (bit15) and lsb (bit16)
+    # boundaries -- the FTZ diagnostic region. The model ROUNDS these (mode-
+    # dependent: round-up modes give a nonzero bf16, round-down give 0), while the
+    # execute path FTZs every denormal to signed zero. Silicon adjudicates per mode.
+    denorm_mans = [0x000001, 0x002000, 0x004000, 0x006000, 0x007FFF,
+                   0x008000, 0x008001, 0x00A000, 0x00C000, 0x00FFFF,
+                   0x010000, 0x014000, 0x018000, 0x01C000, 0x020000,
+                   0x030000, 0x040000, 0x07FFFF]
+    for sgn in (0, 1):
+        for man in denorm_mans:
+            pats.add(fp32_bits(sgn, 0, man))   # exp=0 -> denormal
+
+    # Richer NaN payloads (exp=255, man!=0), both signs: probe whether silicon
+    # preserves the payload (like f32_to_bf16) or canonicalizes it.
+    nan_mans = [0x000001, 0x000040, 0x004000, 0x008000, 0x080000,
+                0x200000, 0x400000, 0x7FFFFF]
+    for sgn in (0, 1):
+        for man in nan_mans:
+            pats.add(fp32_bits(sgn, 255, man))
+
     # Random fp32 bit patterns (seeded).
     for _ in range(200):
         pats.add(rng.randint(0, (1 << 32) - 1))
@@ -575,6 +595,22 @@ def gen_matmul_golden():
             for _ in range(12):
                 mats.append(([rng.randint(0, 0xFFFF) for _ in range(na)],
                              [rng.randint(0, 0xFFFF) for _ in range(nb)]))
+            # Deliberate overflow/NaN tiles for the bf16 edge kernel. A separate
+            # RNG keeps the global `rng` stream (and thus the phase-A finite tiles)
+            # byte-identical. Large-exponent bf16 values (~1e38) overflow fp32 on
+            # accumulate -> Inf/NaN result lanes; explicit NaN inputs propagate.
+            ovf_rng = random.Random(0xB16ED6E)   # distinct, fixed seed
+            big = [0x7F00, 0x7F40, 0x7F7F, 0xFF00, 0xFF40,  # +/- ~1e38
+                   0x7E80, 0xFE80, 0x7EC0, 0xFEC0]
+            nan_in = [0x7FC0, 0xFFC0, 0x7F81, 0x7FFF]        # bf16 NaN bit patterns
+            ovf_mats = []
+            ovf_mats.append(([0x7F7F] * na, [0x7F7F] * nb))  # max-magnitude product
+            ovf_mats.append(([0x7FC0] + [0x3F80] * (na - 1),
+                             [0x3F80] * nb))                  # NaN input propagates
+            for _ in range(40):
+                ovf_mats.append(([ovf_rng.choice(big) for _ in range(na)],
+                                 [ovf_rng.choice(big + nan_in) for _ in range(nb)]))
+            mats.extend(ovf_mats)
             for (av, bv) in mats:
                 abuf = bytearray(64)
                 bbuf = bytearray(64)

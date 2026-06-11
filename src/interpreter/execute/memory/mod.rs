@@ -823,6 +823,19 @@ impl MemoryUnit {
         None
     }
 
+    /// Find the S-register shift operand, mirroring `get_shift_amount`'s
+    /// operand precedence (an Immediate shift means no register sample).
+    fn get_shift_scalar_reg(op: &SlotOp) -> Option<u8> {
+        for src in &op.sources {
+            match src {
+                Operand::Immediate(_) => return None,
+                Operand::ScalarReg(r) => return Some(*r),
+                _ => {}
+            }
+        }
+        None
+    }
+
     // ========== Fused load+compute handlers ==========
 
     /// Execute `vlda.ups`: load from memory, upshift to accumulator.
@@ -837,7 +850,6 @@ impl MemoryUnit {
         post_modify: &PostModify,
     ) {
         let vec_data = Self::fused_load_vector(op, ctx, tile);
-        let shift = Self::get_shift_amount(op, ctx);
         let from = op.from_type.unwrap_or(ElementType::Int16);
         let to = op.element_type.unwrap_or(ElementType::Int32);
 
@@ -848,12 +860,25 @@ impl MemoryUnit {
 
         match &op.dest {
             Some(Operand::AccumReg(r)) => {
-                if is_half {
-                    let acc = super::vector_ups::ups_vector_to_acc(&vec_data, shift, from, to);
-                    ctx.accumulator.write(*r, acc);
+                // II_VLDA_UPS reads its shift S-register at operand cycle 7
+                // (issue+6), not at issue: the UPS conversion happens after
+                // the load data returns, and the compiler schedules the
+                // shift-setup `mov sN` AFTER the vlda.ups it controls
+                // (verified against NPU1 silicon, vector fuzzer seeds
+                // 1142-1448). Defer the conversion so the shift is sampled
+                // at the stage-7 bundle. Immediate shifts have no register
+                // to sample and convert at issue.
+                if let Some(s) = Self::get_shift_scalar_reg(op) {
+                    ctx.queue_pending_ups_load(vec_data, s, *r, from, to, is_half);
                 } else {
-                    let acc_wide = super::vector_ups::ups_vector_to_acc_wide(&vec_data, shift, from, to);
-                    ctx.accumulator.write_wide(*r, acc_wide);
+                    let shift = Self::get_shift_amount(op, ctx);
+                    if is_half {
+                        let acc = super::vector_ups::ups_vector_to_acc(&vec_data, shift, from, to);
+                        ctx.accumulator.write(*r, acc);
+                    } else {
+                        let acc_wide = super::vector_ups::ups_vector_to_acc_wide(&vec_data, shift, from, to);
+                        ctx.accumulator.write_wide(*r, acc_wide);
+                    }
                 }
             }
             other => {
@@ -1048,20 +1073,16 @@ impl MemoryUnit {
             hi
         };
 
-        let packed_lo = super::vector_pack::pack_half(
-            &src_lo,
-            bits_i,
-            bits_o,
-            signed,
-            super::vector_pack::PackMode::Truncate,
+        // vst.pack reads crSat (Uses = [crSat]); derive the narrow mode from the
+        // live saturation register instead of assuming truncation. Matches the
+        // standalone execute_pack path and real NPU1 silicon (saturating crSat
+        // clamps int16->int8 rather than taking the low byte).
+        let mode = super::vector_pack::PackMode::from_sat_flags(
+            ctx.srs_config.saturate(),
+            ctx.srs_config.symmetric_saturate(),
         );
-        let packed_hi = super::vector_pack::pack_half(
-            &src_hi,
-            bits_i,
-            bits_o,
-            signed,
-            super::vector_pack::PackMode::Truncate,
-        );
+        let packed_lo = super::vector_pack::pack_half(&src_lo, bits_i, bits_o, signed, mode);
+        let packed_hi = super::vector_pack::pack_half(&src_hi, bits_i, bits_o, signed, mode);
 
         // Each half produces (256/bits_i * bits_o) bits of packed data.
         let words_per_half = ((256 / bits_i as usize) * bits_o as usize / 32).max(1);
@@ -1378,6 +1399,29 @@ impl MemoryUnit {
             let offset = op.sources.get(1).map_or(0u32, |src| match src {
                 Operand::ModifierReg(m) => ctx.modifier_read(*m),
                 Operand::Immediate(v) => *v as u32,
+                _ => 0,
+            });
+            return base_addr.wrapping_add(offset);
+        }
+
+        // Fused stores (vst.srs/vst.pack/...) carry the pointer AFTER the data
+        // and shift operands (sources = [acc, shift, pointer]); a
+        // post-increment carries no offset operand (the step lives in
+        // post_modify). Locate the pointer by SEARCH -- mirroring get_address --
+        // so the positional fallback below never mistakes the shift register for
+        // the base address. Without this, a post-increment `vst.srs [pN], #imm`
+        // read the shift (e.g. 4) as the store address and scattered output to
+        // ~0x4; indexed forms decode to `Memory{}` and were unaffected, so it
+        // surfaced only on compiles that picked post-increment addressing.
+        if let Some(ptr_idx) = op.sources.iter().position(|s| matches!(s, Operand::PointerReg(_))) {
+            let base_addr = match &op.sources[ptr_idx] {
+                Operand::PointerReg(r) => ctx.pointer_read(*r),
+                _ => unreachable!(),
+            };
+            let offset = op.sources.get(ptr_idx + 1).map_or(0, |src| match src {
+                Operand::ModifierReg(r) => ctx.modifier_read(*r),
+                Operand::Immediate(v) => (*v as i32 * 4) as u32,
+                Operand::ScalarReg(r) => ctx.scalar_read(*r).wrapping_mul(4),
                 _ => 0,
             });
             return base_addr.wrapping_add(offset);
@@ -3129,6 +3173,11 @@ mod tests {
 
         MemoryUnit::execute(&ups_op, &mut ctx, &mut tile, None, None);
 
+        // The UPS shift register is sampled at issue+6 (II_VLDA_UPS operand
+        // cycle 7); advance the bundle clock and process the deferred load.
+        ctx.bundle_seq += 6;
+        ctx.process_pending_ups_loads();
+
         // Verify accumulator has non-zero data
         let acc = ctx.accumulator.read_wide(0);
         assert!(acc.iter().any(|&v| v != 0), "UPS should produce non-zero accumulator data");
@@ -3193,6 +3242,10 @@ mod tests {
         ups_op.is_vector = true;
 
         MemoryUnit::execute(&ups_op, &mut ctx, &mut tile, None, None);
+
+        // Stage-7 shift sample: advance and process the deferred UPS load.
+        ctx.bundle_seq += 6;
+        ctx.process_pending_ups_loads();
 
         // SRS with s0 = 0 (unchanged)
         let mut srs_op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Srs)
@@ -3261,6 +3314,10 @@ mod tests {
         let handled = MemoryUnit::execute(&ups, &mut ctx, &mut tile, None, None);
         assert!(handled, "post-increment vlda.ups must be handled by the fused-load path");
 
+        // Stage-7 shift sample: advance and process the deferred UPS load.
+        ctx.bundle_seq += 6;
+        ctx.process_pending_ups_loads();
+
         // Accumulator holds the loaded int32 values (widened to acc64), not zeros.
         let acc = ctx.accumulator.read(0);
         assert_eq!(acc[0], 10, "bml0 lane0 must be the loaded value, not garbage");
@@ -3268,6 +3325,51 @@ mod tests {
 
         // p0 post-incremented by 32 bytes.
         assert_eq!(ctx.pointer.read(0), 0x70120, "p0 must post-increment by 32 bytes");
+    }
+
+    /// Fused `vst.srs` with POST-INCREMENT addressing (`[p1], #32`) decodes as
+    /// sources = [acc, shift, PointerReg] + post_modify, with NO `Memory{}`
+    /// operand. The store address must be the POINTER's value, not a positional
+    /// `sources[1]` (which is the SHIFT register). Regression for the Half-B
+    /// mode-sweep SRS kernels: a compile emitted the first `VST.SRS` as
+    /// `[p1], #32`, and `get_store_address`'s positional fallback read the shift
+    /// (=4) as the base -- scattering the first 16 outputs to address 0x4 while
+    /// the indexed (`[p1, #off]` -> `Memory{}`) stores landed correctly. The
+    /// fused-load path already searched for the pointer; the store path did not.
+    #[test]
+    fn test_fused_srs_post_increment_store_address_is_pointer() {
+        ctx_and_op_assert_store_address(PostModify::Immediate(32), 0x70200);
+    }
+
+    /// The same store with a bare pointer and no post-modify (`[p1]`) must also
+    /// address the pointer, not the shift register.
+    #[test]
+    fn test_fused_srs_bare_pointer_store_address_is_pointer() {
+        ctx_and_op_assert_store_address(PostModify::None, 0x70200);
+    }
+
+    fn ctx_and_op_assert_store_address(post_modify: PostModify, expected: u32) {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        let mut ctx = make_ctx();
+        ctx.pointer.write(1, 0x70200);
+        // shift = 4: the value that used to leak through as the store address.
+        ctx.scalar.write(0, 4);
+        let mut srs = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Srs)
+            .with_source(Operand::AccumReg(0)) // acc data
+            .with_source(Operand::ScalarReg(0)) // shift register (NOT the address)
+            .with_source(Operand::PointerReg(1)); // address pointer
+        srs.from_type = Some(ElementType::Int64);
+        srs.element_type = Some(ElementType::Int16);
+        srs.accum_width = Some(AccumWidth::Full);
+        srs.mem_width = MemWidth::Vector256;
+        srs.is_vector = true;
+        srs.post_modify = post_modify;
+
+        assert_eq!(
+            MemoryUnit::get_store_address(&srs, &ctx),
+            expected,
+            "fused store must address the pointer, not the shift register"
+        );
     }
 
     // --- Cross-tile load pipeline hazard regression test ---

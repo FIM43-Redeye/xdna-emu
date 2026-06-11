@@ -716,6 +716,21 @@ impl CycleAccurateExecutor {
         // actually-issued bundle (stall pre-checks above return earlier), so
         // the clock tracks issued bundles, not stall cycles.
         ctx.advance_vector_bundle();
+
+        // Sample sources for VUNPACKs whose stage-7 read bundle arrived
+        // (after the vector clock advance so producer writes landing this
+        // bundle are visible, before slot execution).
+        ctx.process_pending_unpacks();
+
+        // Sample sources for accumulator add/subs whose stage-3 read bundle
+        // arrived (after commit_pending_writes so MAC/conv results that land
+        // this cycle are visible).
+        ctx.process_pending_acc_adds();
+
+        // Sample the shift register for fused vlda.ups whose stage-7 read
+        // bundle arrived and write their converted accumulators.
+        ctx.process_pending_ups_loads();
+
         ctx.begin_bundle();
 
         // Same-bundle scalar->shift forwarding. AIE2 writes an S register at
@@ -1025,6 +1040,12 @@ mod tests {
 
         executor.execute(&make_bundle(vec![mov, ups]), &mut ctx, &mut tile);
 
+        // The UPS samples the shift at issue+6 (II_VLDA_UPS operand cycle 7);
+        // issue empty bundles to reach the read bundle.
+        for _ in 0..6 {
+            executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
+        }
+
         // acc32 packs two int32 per u64: lane[2j]=acc[j] low, lane[2j+1]=high.
         // With the same-bundle shift forwarded, every lane = value << 4.
         let acc = ctx.accumulator.read(0);
@@ -1033,6 +1054,61 @@ mod tests {
             let hi = (acc[j] >> 32) as i32;
             assert_eq!(lo, (vals[2 * j] as i32) << 4, "lane {}", 2 * j);
             assert_eq!(hi, (vals[2 * j + 1] as i32) << 4, "lane {}", 2 * j + 1);
+        }
+    }
+
+    /// Cross-bundle late shift write: the `MOV s0,#1` issued several bundles
+    /// AFTER the vlda.ups must still control the conversion. II_VLDA_UPS reads
+    /// its shift S-register at operand cycle 7, and Peano schedules the
+    /// shift-setup mov in the load's shadow (vector fuzzer seeds 1142-1448,
+    /// silicon-verified: issue-time sampling produced the unshifted input for
+    /// upshift modes 1-7).
+    #[test]
+    fn test_late_shift_mov_controls_earlier_ups_load() {
+        use crate::interpreter::bundle::ElementType;
+        use crate::interpreter::decode::register_map::AccumWidth;
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+
+        let vals: [i16; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        for i in 0..16 {
+            let b = (vals[i] as u16).to_le_bytes();
+            tile.data_memory_mut()[0x200 + i * 2] = b[0];
+            tile.data_memory_mut()[0x200 + i * 2 + 1] = b[1];
+        }
+        ctx.pointer.write(0, 0x70200);
+        ctx.scalar.write(0, 0); // s0 = 0 at issue; the late MOV sets the shift
+
+        let mut ups = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Ups)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0));
+        ups.from_type = Some(ElementType::Int16);
+        ups.element_type = Some(ElementType::Int32);
+        ups.accum_width = Some(AccumWidth::Half);
+        ups.mem_width = MemWidth::Vector256;
+        ups.is_vector = true;
+
+        // Bundle 0: the UPS load. Bundles 1-4: nops. Bundle 5: MOV s0,#1
+        // (commits before the issue+6 sample). Bundle 6: sample lands.
+        executor.execute(&make_bundle(vec![ups]), &mut ctx, &mut tile);
+        for _ in 0..4 {
+            executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
+        }
+        let mov = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::Immediate(1));
+        executor.execute(&make_bundle(vec![mov]), &mut ctx, &mut tile);
+        executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
+
+        let acc = ctx.accumulator.read(0);
+        for j in 0..8usize {
+            let lo = (acc[j] & 0xFFFF_FFFF) as i32;
+            let hi = (acc[j] >> 32) as i32;
+            assert_eq!(lo, (vals[2 * j] as i32) << 1, "lane {}", 2 * j);
+            assert_eq!(hi, (vals[2 * j + 1] as i32) << 1, "lane {}", 2 * j + 1);
         }
     }
 
@@ -1455,6 +1531,80 @@ mod tests {
         ctx.cycles = 11;
         ctx.commit_pending_writes();
         assert_eq!(ctx.pointer.read(1), 0x1234);
+    }
+
+    // --- Deferred accumulator (VMOV bml,x) write tests ---
+
+    /// `VMOV bml0, x` (a wide vector->accumulator cross-file move) must defer
+    /// its accumulator write by the AIE2 def latency (2 cycles), not apply it
+    /// immediately. The accumulator def operand cycle for II_VMOV_X_BM_XM is 2
+    /// (NoBypass) in llvm-aie AIE2Schedule.td, so a fused VST.CONV/VST.SRS that
+    /// drains the accumulator in a software-pipelined loop reads the value as it
+    /// was two cycles earlier -- one VMOV behind the live register.
+    ///
+    /// Regression: surfaced by the vec_conv_bf16_edge silicon kernels, where the
+    /// f32->bf16 store-converts are packed into a RET's delay slots. With an
+    /// immediate (0-cycle) accumulator write, each delay-slot store read the
+    /// freshly-overwritten accumulator and produced Inf/NaN-range garbage shifted
+    /// one group forward; silicon (and a 2-cycle deferral) read the correct value.
+    #[test]
+    fn test_vmov_to_accum_deferred_by_def_latency() {
+        use crate::interpreter::bundle::ElementType;
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+
+        // x0 (wide 512-bit pair x0/x1) holds a recognizable pattern: 16 int32
+        // lanes 0x100..0x10F. Accumulator lane j packs lanes 2j (low) | 2j+1 (high).
+        let mut wide = [0u32; 16];
+        for (i, w) in wide.iter_mut().enumerate() {
+            *w = 0x100 + i as u32;
+        }
+        ctx.vector.write_wide(0, wide);
+
+        // Pre-seed bml0 with a sentinel so we can prove the new value is NOT
+        // visible until the latency elapses.
+        ctx.accumulator.write(0, [0xDEAD_BEEF_DEAD_BEEF; 8]);
+
+        // vmov bml0, x0  (wide cross-file move into the accumulator)
+        let mut vmov = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Copy)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::VectorReg(0));
+        vmov.is_wide_vector = true;
+        vmov.is_vector = true;
+        vmov.element_type = Some(ElementType::Int32);
+
+        executor.execute(&make_bundle(vec![vmov]), &mut ctx, &mut tile);
+
+        // Immediately after the issuing bundle, bml0 must still read the sentinel:
+        // the def latency (2) has not elapsed, so the write is in flight.
+        let acc_now = ctx.accumulator.read(0);
+        assert_eq!(
+            acc_now[0], 0xDEAD_BEEF_DEAD_BEEF,
+            "VMOV bml,x write must be deferred, not visible in the issuing bundle"
+        );
+
+        // Run filler bundles until the deferred write commits. With latency 2 the
+        // value lands within a couple of cycles; allow a small margin.
+        let mut committed = false;
+        for _ in 0..4 {
+            executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
+            if ctx.accumulator.read(0)[0] != 0xDEAD_BEEF_DEAD_BEEF {
+                committed = true;
+                break;
+            }
+        }
+        assert!(committed, "deferred VMOV->accum write never committed");
+
+        // Once committed, the accumulator holds the moved x0 data.
+        let acc = ctx.accumulator.read(0);
+        for j in 0..8usize {
+            let lo = (acc[j] & 0xFFFF_FFFF) as u32;
+            let hi = (acc[j] >> 32) as u32;
+            assert_eq!(lo, 0x100 + (2 * j) as u32, "acc lane {} low", 2 * j);
+            assert_eq!(hi, 0x100 + (2 * j + 1) as u32, "acc lane {} high", 2 * j + 1);
+        }
     }
 
     // --- NOP / slot-based event classification tests ---

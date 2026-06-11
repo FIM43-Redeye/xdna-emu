@@ -95,6 +95,7 @@ mod control;
 mod stream;
 mod cascade;
 pub(crate) mod cycle_accurate;
+pub mod fuzz_recorder;
 mod semantic;
 
 pub use vector_dispatch::VectorAlu;

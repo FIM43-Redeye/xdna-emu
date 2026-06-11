@@ -1,18 +1,17 @@
 //===- test.cpp -------------------------------------------------*- C++ -*-===//
 //
-// Host harness for the Half-B SRS capture kernel. Feeds a 48xi32 batch of
-// accumulator values drawn from the Half-A `srs` golden (config: bits_o=16,
-// signed, sat, sym_sat=false, rnd=FLOOR(0), shift=4) and checks the 48xi16
-// output against the golden's expected results. PASS means the SRS datapath
-// (BIAS + floor-round + saturate) ran correctly. The expected values are the
-// genuine aietools-model outputs, baked here so no SRS is reimplemented host-
-// side -- regenerate via tools/gen_vector_golden.py if the config changes.
+// Host harness for the Half-B vec_srs_i32 capture kernel (GENERATED -- edit the spec
+// in vector_kernel_specs.py, not this file). Feeds a baked input batch and
+// checks the output against the Half-A golden (srs slice). PASS means the
+// vec_srs_i32 datapath ran correctly. Expected values are the genuine
+// aietools-model outputs baked from tools/golden/vector_ops.json.
 //
 //===----------------------------------------------------------------------===//
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <vector>
 
@@ -24,10 +23,7 @@
 
 static constexpr int N = 48;
 
-// Golden slice: srs cases with bits_o=16, signed, sat, sym_sat=false, rnd=0
-// (FLOOR), shift=4 (int32-representable accumulator values). Padded to a
-// multiple of 8 with zeros. Source: tools/golden/vector_ops.json.
-static const int32_t SRS_IN[N] = {
+static const int32_t IN[48] = {
     0, 1, -255, 256, -256, -524288, -524287, 8388352,
     -524280, 8388353, 255, -8388608, -8388607, -8388480, 134213632, 134213633,
     16, 4096, -4096, -134217728, -134217727, 16777216, -16777216, 268435456,
@@ -35,7 +31,7 @@ static const int32_t SRS_IN[N] = {
     -1048576, 524271, -16, 524272, 524273, 8388351, 524280, -8388609,
     8388480, -1, -524289, 0, 0, 0, 0, 0,
 };
-static const int16_t SRS_EXP[N] = {
+static const int16_t EXP[48] = {
     0, 0, -16, 16, -16, -32768, -32768, 32767,
     -32768, 32767, 15, -32768, -32768, -32768, 32767, 32767,
     1, 256, -256, -32768, -32768, 32767, -32768, 32767,
@@ -73,7 +69,7 @@ int main(int argc, const char *argv[]) {
   int32_t *bufIn = bo_in.map<int32_t *>();
   int16_t *bufOut = bo_out.map<int16_t *>();
 
-  std::memcpy(bufIn, SRS_IN, N * sizeof(int32_t));
+  std::memcpy(bufIn, IN, N * sizeof(int32_t));
   std::memset(bufOut, 0, N * sizeof(int16_t));
 
   void *bufInstr = bo_instr.map<void *>();
@@ -93,12 +89,20 @@ int main(int argc, const char *argv[]) {
 
   bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
+  // Always dump the raw output buffer (one value per line) so a HW run can be
+  // captured as a silicon golden. Harmless for model-golden kernels.
+  {
+    std::ofstream dump("out.txt");
+    for (int i = 0; i < N; i++)
+      dump << (int64_t)bufOut[i] << "\n";
+  }
+
   int errors = 0;
   for (int i = 0; i < N; i++) {
-    if (bufOut[i] != SRS_EXP[i]) {
+    if (bufOut[i] != EXP[i]) {
       if (errors < 10)
-        std::cout << "Error [" << i << "]: in=" << SRS_IN[i]
-                  << " got=" << bufOut[i] << " != exp=" << SRS_EXP[i] << "\n";
+        std::cout << "Error [" << i << "]: in=" << (int)IN[i]
+                  << " got=" << (int)bufOut[i] << " != exp=" << (int)EXP[i] << "\n";
       errors++;
     }
   }

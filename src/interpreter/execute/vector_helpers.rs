@@ -409,10 +409,20 @@ impl VectorAlu {
 
     // ========== Scalar Destination Writers ==========
 
-    /// Write scalar result to destination.
+    /// Scalar (mask) result latency of vector compare ops.
+    ///
+    /// AIE2Schedule.td gives the rS mask destination of II_VMAX_LT / II_VMIN_GE
+    /// / II_VSUB_CMP / II_VCMP / II_VEQZ operand latency 2 with NoBypass: the
+    /// next bundle still reads the pre-compare value. Peano schedules
+    /// callee-save copies in that shadow (e.g. `vmax_lt x.,r16,..` followed by
+    /// `or r1, r16, r16`), so an immediate write corrupts the saved register.
+    const VEC_CMP_SCALAR_LATENCY: u64 = 2;
+
+    /// Write scalar result to destination (pipelined: visible after the
+    /// vector-compare scalar latency, never forwarded to the next bundle).
     pub(super) fn write_scalar_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: u32) {
         if let Some(Operand::ScalarReg(r)) = &op.dest {
-            ctx.scalar.write(*r, value);
+            ctx.queue_scalar_load(Operand::ScalarReg(*r), value, Self::VEC_CMP_SCALAR_LATENCY);
         }
     }
 
@@ -420,8 +430,12 @@ impl VectorAlu {
     /// Used for 8-bit comparisons where the bitmask exceeds 32 bits.
     pub(super) fn write_scalar_dest_wide(op: &SlotOp, ctx: &mut ExecutionContext, value: u64) {
         if let Some(Operand::ScalarReg(r)) = &op.dest {
-            ctx.scalar.write(*r, value as u32);
-            ctx.scalar.write(*r + 1, (value >> 32) as u32);
+            ctx.queue_scalar_load(Operand::ScalarReg(*r), value as u32, Self::VEC_CMP_SCALAR_LATENCY);
+            ctx.queue_scalar_load(
+                Operand::ScalarReg(*r + 1),
+                (value >> 32) as u32,
+                Self::VEC_CMP_SCALAR_LATENCY,
+            );
         }
     }
 
@@ -429,10 +443,11 @@ impl VectorAlu {
     /// dual-result instructions (VSUB_LT, VABS_GTZ, VNEG_GTZ, etc.).
     ///
     /// The cmp register receives a per-element bitmask: bit i is set when the
-    /// comparison is true for element i.
+    /// comparison is true for element i. Deferred by the mask latency (see
+    /// VEC_CMP_SCALAR_LATENCY).
     pub(super) fn write_cmp_dest(op: &SlotOp, ctx: &mut ExecutionContext, flags: u32) {
         if let Some(Operand::ScalarReg(r)) = op.extra_dests.first() {
-            ctx.scalar.write(*r, flags);
+            ctx.queue_scalar_load(Operand::ScalarReg(*r), flags, Self::VEC_CMP_SCALAR_LATENCY);
         }
     }
 
@@ -441,8 +456,12 @@ impl VectorAlu {
     pub(super) fn write_cmp_dest_wide(op: &SlotOp, ctx: &mut ExecutionContext, flags: u64) {
         if let Some(Operand::ScalarReg(r)) = op.extra_dests.first() {
             // Write low 32 bits to rN, high 32 bits to rN+1.
-            ctx.scalar.write(*r, flags as u32);
-            ctx.scalar.write(*r + 1, (flags >> 32) as u32);
+            ctx.queue_scalar_load(Operand::ScalarReg(*r), flags as u32, Self::VEC_CMP_SCALAR_LATENCY);
+            ctx.queue_scalar_load(
+                Operand::ScalarReg(*r + 1),
+                (flags >> 32) as u32,
+                Self::VEC_CMP_SCALAR_LATENCY,
+            );
         }
     }
 

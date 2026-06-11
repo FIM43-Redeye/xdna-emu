@@ -80,6 +80,21 @@ class Matmul:
         return self.M * self.N
 
 
+@dataclass(frozen=True)
+class DirectIO:
+    """Inputs supplied directly by the spec, bypassing the model corpus.
+
+    For kernels whose oracle is silicon (not the aietools model) and whose input
+    space (e.g. bf16 denormals) no corpus class produces. `inputs` are the host-
+    staged bit patterns; `reference` is a simple mathematical expectation (no-FTZ
+    widen/floor) used ONLY as a bootstrap EXP and a divergence baseline -- never
+    an oracle. The binding comparison is emulator-output vs captured silicon.
+    """
+
+    inputs: Tuple[int, ...]
+    reference: Tuple[int, ...]
+
+
 @dataclass
 class KernelSpec:
     """Everything needed to emit one vector-compute capture kernel.
@@ -102,6 +117,143 @@ class KernelSpec:
     defines: List[Tuple[str, object]] = field(default_factory=list)
     stem: Optional[str] = None
     matmul: Optional[Matmul] = None
+    silicon_golden: Optional[str] = None
+
+
+# --- Mode sweep --------------------------------------------------------------
+#
+# AIE2 vector-compute classes that round (SRS, bf16 convert) read crRnd; classes
+# that narrow with overflow (SRS, Pack, UPS) read crSat. A single capture kernel
+# bakes ONE mode (one set_rounding/set_saturation in the body, one matching
+# golden slice). Phase A makes the silicon check *mode-exhaustive*: emit one
+# kernel per reachable mode-point so every crRnd/crSat value is exercised on HW,
+# not just one representative -- the same axis the pack-saturation gap hid behind.
+#
+# The crRnd index -> aie::rounding_mode enum name and crSat index -> enum name
+# maps below are verified against the toolchain: the rnd_* macros in
+# aietools .../aie_ml/lib/me_defines.h and the saturation_mode enum in
+# aie_api/aie_types.hpp (none=0, saturate=1, symmetric=3). They match the
+# emulator's RoundingMode (crates/xdna-archspec/.../rounding.rs), so the kernel
+# the generator emits drives exactly the crRnd/crSat the baked golden slice was
+# produced under -- the body and the expected values stay in lockstep.
+
+ROUNDING_ENUM = {
+    0: "floor", 1: "ceil", 2: "symmetric_floor", 3: "symmetric_ceil",
+    8: "negative_inf", 9: "positive_inf", 10: "symmetric_zero",
+    11: "symmetric_inf", 12: "conv_even", 13: "conv_odd",
+}
+
+SAT_ENUM = {0: "none", 1: "saturate", 3: "symmetric"}
+
+
+def mode_lines(rnd, crsat):
+    """Render the set_rounding / set_saturation lines for a mode-point.
+
+    Emits set_rounding only when `rnd` is given (the class rounds) and
+    set_saturation only when `crsat` is given (the class can overflow), so each
+    class's `$mode` placeholder gets exactly the control-register writes it uses.
+    """
+    out = []
+    if rnd is not None:
+        out.append(f"  ::aie::set_rounding(aie::rounding_mode::{ROUNDING_ENUM[rnd]});")
+    if crsat is not None:
+        out.append(f"  ::aie::set_saturation(aie::saturation_mode::{SAT_ENUM[crsat]});")
+    return "\n".join(out)
+
+
+def _sat_filt(crsat, sat_field, symsat_field):
+    """Golden-filter fields selecting the records produced under crSat=`crsat`.
+
+    The corpus only ever pairs (sat=False, sym=False), (sat=True, sym=False),
+    (sat=True, sym=True) -- never (False, True) -- so {sat: crsat!=0, sym:
+    crsat==3} selects each of none(0)/saturate(1)/symmetric(3) unambiguously.
+    `symsat_field` is None for classes (e.g. UPS) whose corpus carries no
+    symmetric-saturation column; there only crSat 0/1 are swept.
+    """
+    filt = {sat_field: crsat != 0}
+    if symsat_field is not None:
+        filt[symsat_field] = crsat == 3
+    return filt
+
+
+@dataclass
+class SweepSpec:
+    """A family of capture kernels covering a class's full crRnd/crSat space.
+
+    `expand()` yields one `KernelSpec` per point in the cartesian product of
+    `rnds` x `sats`. Each point derives its kernel name suffix (`_r<rnd>_s<sat>`),
+    its body (the mode-setting lines substituted into `body_template`'s `$mode`
+    placeholder), and its golden filter (`base_filt` plus the mode fields) so the
+    swept body and the baked golden stay in lockstep by construction.
+
+    `body_template` is the hand-written intrinsic IP with a `$mode` marker where
+    the control-register writes belong (and `event0()`/`event1()` around it).
+    `rnds`/`sats` are the crRnd/crSat index lists to sweep (None => that axis is
+    fixed/absent for the class). `sat_field`/`symsat_field` name the corpus's
+    saturation columns (they differ across classes: srs uses sym_sat, pack uses
+    symsat, ups has none).
+    """
+
+    prefix: str
+    func: str
+    doc: str
+    inputs: List[Buf]
+    output: Buf
+    n: int
+    gclass: str
+    base_filt: dict
+    body_template: str
+    rnds: Optional[List[int]] = None
+    sats: Optional[List[int]] = None
+    sat_field: str = "sat"
+    symsat_field: Optional[str] = None
+    value_range: Optional[Tuple[int, int]] = None
+    predicate: Optional[object] = None
+    defines: List[Tuple[str, object]] = field(default_factory=list)
+    stem: Optional[str] = None
+    silicon: bool = False
+
+    def expand(self):
+        """Materialize the sweep into one KernelSpec per (rnd, crsat) point."""
+        rnds = self.rnds if self.rnds is not None else [None]
+        sats = self.sats if self.sats is not None else [None]
+        specs = []
+        for rnd in rnds:
+            for crsat in sats:
+                suffix = ""
+                desc = []
+                if rnd is not None:
+                    suffix += f"_r{rnd}"
+                    desc.append(f"rnd={rnd}({ROUNDING_ENUM[rnd]})")
+                if crsat is not None:
+                    suffix += f"_s{crsat}"
+                    desc.append(f"sat={crsat}({SAT_ENUM[crsat]})")
+                filt = dict(self.base_filt)
+                if rnd is not None:
+                    filt["rnd"] = rnd
+                if crsat is not None:
+                    filt.update(_sat_filt(crsat, self.sat_field, self.symsat_field))
+                golden = {"class": self.gclass, "filt": filt}
+                if self.value_range is not None:
+                    golden["value_range"] = self.value_range
+                if self.predicate is not None:
+                    golden["predicate"] = self.predicate
+                body = string.Template(self.body_template).substitute(
+                    mode=mode_lines(rnd, crsat))
+                specs.append(KernelSpec(
+                    name=self.prefix + suffix,
+                    func=self.func,
+                    doc=self.doc + " Mode-sweep point: " + ", ".join(desc) + ".",
+                    inputs=self.inputs,
+                    output=self.output,
+                    n=self.n,
+                    golden=golden,
+                    body=body,
+                    defines=self.defines,
+                    stem=self.stem,
+                    silicon_golden=_silicon_path(self.prefix + suffix) if self.silicon else None,
+                ))
+        return specs
 
 
 def _stem(spec):
@@ -176,7 +328,7 @@ def unpack_vec512(words, count, bytes_per, signed=True):
     ]
 
 
-def bake_matmul(records, filt, mm, predicate=None):
+def bake_matmul(records, filt, mm, predicate=None, silicon=None, name=None):
     """Bake (A, B, C) host arrays for a batch of row-major matmul tiles.
 
     Selects the matmul config slice (`filt`, with an optional record
@@ -188,6 +340,10 @@ def bake_matmul(records, filt, mm, predicate=None):
     corpus), so no value is recomputed. `predicate` excludes records a flat
     filter can't (e.g. bf16 tiles whose expected has NaN/Inf overflow lanes,
     which would break the exact bit-compare).
+
+    When `silicon` is a loaded silicon-golden dict, C is replaced by its
+    `silicon` field and the inputs are cross-checked for alignment (stale
+    captures that no longer match the corpus would bake mismatched EXP).
     """
     recs = select_records(records, filt, predicate=predicate)
     assert len(recs) >= mm.batch, f"{len(recs)} matmul records < batch {mm.batch}"
@@ -197,6 +353,10 @@ def bake_matmul(records, filt, mm, predicate=None):
         a_out += unpack_vec512(r["a"], mm.size_a, mm.a_bytes, signed=signed)
         b_out += unpack_vec512(r["b"], mm.size_b, mm.b_bytes, signed=signed)
         c_out += r["expected"][:mm.size_c]
+    if silicon is not None:
+        assert silicon["input_a"] == a_out and silicon["input_b"] == b_out, \
+            f"{name + ': ' if name else ''}silicon golden inputs != corpus slice (regenerate capture)"
+        c_out = silicon["silicon"]
     return a_out, b_out, c_out
 
 
@@ -214,6 +374,7 @@ _TEST_CPP_TMPL = string.Template(
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <vector>
 
@@ -277,6 +438,14 @@ int main(int argc, const char *argv[]) {
 
   bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
+  // Always dump the raw output buffer (one value per line) so a HW run can be
+  // captured as a silicon golden. Harmless for model-golden kernels.
+  {
+    std::ofstream dump("out.txt");
+    for (int i = 0; i < N; i++)
+      dump << (int64_t)bufOut[i] << "\\n";
+  }
+
   int errors = 0;
   for (int i = 0; i < N; i++) {
     if (bufOut[i] != EXP[i]) {
@@ -298,15 +467,61 @@ int main(int argc, const char *argv[]) {
 )
 
 
+def _silicon_path(name):
+    """Path to the HW-captured silicon golden for a kernel (tools/golden/silicon_edge/)."""
+    import os
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "golden", "silicon_edge", name + ".json")
+
+
+def replace_silicon(spec, path):
+    """Return a copy of `spec` with `silicon_golden` set (test helper)."""
+    import dataclasses
+    return dataclasses.replace(spec, silicon_golden=path)
+
+
+def _load_silicon(spec):
+    """Load the spec's silicon golden JSON if set and present, else None."""
+    import os
+    import json
+    if not spec.silicon_golden or not os.path.exists(spec.silicon_golden):
+        return None
+    with open(spec.silicon_golden) as f:
+        return json.load(f)
+
+
 def _bake_io(spec, golden):
-    """Select the spec's golden slice and bake (input, expected) arrays to N."""
+    """Select the spec's golden slice and bake (input, expected) arrays to N.
+
+    A spec whose `golden` carries a `direct` DirectIO sources inputs and the
+    bootstrap reference straight from it (no corpus class) -- for kernels whose
+    oracle is silicon and whose input space (bf16 denormals) no corpus class
+    produces. Otherwise the model corpus drives both arrays.
+
+    In both cases, if `spec.silicon_golden` points to an existing silicon
+    capture JSON, the expected array is taken from its `silicon` field (not the
+    model/reference) and the inputs are cross-checked (so a stale capture that no
+    longer matches can't silently bake mismatched EXP). When the file is absent
+    (bootstrap mode), the model corpus / direct reference drives both arrays.
+    """
     g = spec.golden
-    recs = select_records(
-        golden[g["class"]], g["filt"], g.get("value_range"),
-        predicate=g.get("predicate"),
-    )
-    in_vals = bake_array(recs, g.get("value_field", "value"), spec.n)
-    exp_vals = bake_array(recs, g.get("expected_field", "expected"), spec.n)
+    direct = g.get("direct")
+    if direct is not None:
+        in_vals = list(direct.inputs)
+        exp_vals = list(direct.reference)
+        assert len(in_vals) == spec.n and len(exp_vals) == spec.n, \
+            f"{spec.name}: direct inputs/reference must be exactly n={spec.n} " \
+            f"(got {len(in_vals)}/{len(exp_vals)})"
+    else:
+        recs = select_records(golden[g["class"]], g["filt"], g.get("value_range"),
+                              predicate=g.get("predicate"))
+        in_vals = bake_array(recs, g.get("value_field", "value"), spec.n)
+        exp_vals = bake_array(recs, g.get("expected_field", "expected"), spec.n)
+    sj = _load_silicon(spec)
+    if sj is not None:
+        assert sj["input"] == in_vals, \
+            f"{spec.name}: silicon golden inputs != corpus slice (regenerate capture)"
+        exp_vals = sj["silicon"]
     return in_vals, exp_vals
 
 
@@ -324,6 +539,7 @@ _TEST_CPP_MATMUL_TMPL = string.Template(
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <vector>
 
@@ -394,6 +610,14 @@ int main(int argc, const char *argv[]) {
 
   bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
+  // Always dump the raw output buffer (one value per line) so a HW run can be
+  // captured as a silicon golden. Harmless for model-golden kernels.
+  {
+    std::ofstream dump("out.txt");
+    for (int i = 0; i < NC; i++)
+      dump << (int64_t)bufOut[i] << "\\n";
+  }
+
   int errors = 0;
   for (int i = 0; i < NC; i++) {
     if (bufOut[i] != EXP[i]) {
@@ -425,7 +649,8 @@ def render_test_cpp(spec, golden):
         mm = spec.matmul
         a_vals, b_vals, c_vals = bake_matmul(
             golden[spec.golden["class"]], spec.golden["filt"], mm,
-            predicate=spec.golden.get("predicate"))
+            predicate=spec.golden.get("predicate"), silicon=_load_silicon(spec),
+            name=spec.name)
         return _TEST_CPP_MATMUL_TMPL.substitute(
             name=spec.name,
             gclass=spec.golden["class"],
@@ -687,22 +912,36 @@ def main(argv=None):
 
     ap = argparse.ArgumentParser(
         description="Generate Half-B vector-compute capture kernels from specs.")
-    ap.add_argument("name", help="spec name (e.g. vec_ups_i32), or 'all'")
+    ap.add_argument("name", help="spec name (e.g. vec_ups_i32), a sweep name "
+                                 "(e.g. vec_srs_i32_sweep), 'all', or 'all-sweeps'")
     ap.add_argument("--out", default=_default_out_dir(),
                     help="output root (default: tests/vector-verify)")
     ap.add_argument("--golden", default=_default_golden_path(),
                     help="vector_ops.json corpus (default: tools/golden/...)")
     args = ap.parse_args(argv)
 
-    from vector_kernel_specs import SPECS
+    from vector_kernel_specs import SPECS, SWEEPS
     golden = json.loads(open(args.golden).read())
 
-    names = sorted(SPECS) if args.name == "all" else [args.name]
-    for name in names:
-        if name not in SPECS:
-            ap.error(f"unknown spec '{name}'; known: {', '.join(sorted(SPECS))}")
-        dest = generate(SPECS[name], golden, args.out)
-        print(f"generated {name} -> {dest}")
+    # Resolve the request to a flat list of KernelSpecs. A sweep name expands to
+    # one KernelSpec per mode-point; 'all-sweeps' expands every sweep.
+    to_gen = []
+    if args.name == "all":
+        to_gen = [SPECS[n] for n in sorted(SPECS)]
+    elif args.name == "all-sweeps":
+        for sname in sorted(SWEEPS):
+            to_gen.extend(SWEEPS[sname].expand())
+    elif args.name in SWEEPS:
+        to_gen = SWEEPS[args.name].expand()
+    elif args.name in SPECS:
+        to_gen = [SPECS[args.name]]
+    else:
+        ap.error(f"unknown spec/sweep '{args.name}'; specs: {', '.join(sorted(SPECS))}; "
+                 f"sweeps: {', '.join(sorted(SWEEPS))}")
+
+    for spec in to_gen:
+        dest = generate(spec, golden, args.out)
+        print(f"generated {spec.name} -> {dest}")
 
 
 if __name__ == "__main__":

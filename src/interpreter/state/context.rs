@@ -136,6 +136,102 @@ pub struct PendingStore {
 const PARTIAL_WORD_STORE_DATA_LATENCY: u64 =
     xdna_archspec::aie2::processor::PARTIAL_STORE_DATA_LATENCY as u64;
 
+/// A deferred VUNPACK awaiting its late source-register read.
+///
+/// II_VUNPACK (AIE2Schedule.td) has OperandCycles=[7,7,7]: both the x-reg
+/// destination write AND the w-reg source read happen at pipeline stage 7.
+/// The compiler exploits the late read by scheduling the producer of the
+/// source register AFTER the vunpack (Peano emits `vunpack x4, wl2` four
+/// bundles before the `vsel.8 x2, ...` whose result it consumes; verified
+/// against NPU1 silicon, vector fuzzer seed 7). The unpack must therefore
+/// sample its source at issue+6 (one bundle before the cycle-7 write-back
+/// boundary, same rationale as PARTIAL_WORD_STORE_DATA_LATENCY) and land
+/// its destination at issue+7.
+#[derive(Debug, Clone)]
+pub struct PendingUnpack {
+    /// Source w-register index (256-bit), sampled at `ready_bundle`.
+    pub src_reg: u8,
+    /// Destination x-register index (512-bit pair base).
+    pub dest_reg: u8,
+    /// Input lane width in bits.
+    pub bits_i: u32,
+    /// Output lane width in bits.
+    pub bits_o: u32,
+    /// Sign-extend (true) vs zero-extend.
+    pub signed: bool,
+    /// Issued-bundle count (`bundle_seq`) at which the source is read.
+    pub ready_bundle: u64,
+}
+
+/// VUNPACK source-register read latency in issued bundles (II_VUNPACK
+/// operand cycle 7, sampled one bundle before write-back; see PendingUnpack).
+const VUNPACK_SRC_READ_LATENCY: u64 = 6;
+
+/// A deferred accumulator add/sub awaiting its stage-3 source read.
+///
+/// II_VADDMAC / II_VADDMACf (AIE2Schedule.td) read their accumulator
+/// sources at operand cycle 3, not at issue. The compiler relies on this:
+/// Peano bundles `vconv.fp32.bf16 bmh2, wl2` (result latency 2) WITH the
+/// `vadd.f bmh0, bmh0, bmh2` that consumes it, and the slot order executes
+/// the vadd first. Sampling at issue read the stale accumulator (verified
+/// against NPU1 silicon, vector fuzzer seed 4: low output half = a.lo +
+/// b.HI because the prior bundle's conv was the freshest visible write).
+/// All control bits are resolved at issue; only the accumulator source
+/// read is deferred.
+#[derive(Debug, Clone)]
+pub struct PendingAccAdd {
+    pub acc1_reg: u8,
+    pub acc2_reg: u8,
+    pub dst_reg: u8,
+    pub negate_acc1: bool,
+    pub negate_acc2: bool,
+    pub zero_acc1: bool,
+    pub shift16: bool,
+    pub is_float: bool,
+    pub is_wide: bool,
+    /// Issued-bundle count at which the accumulator sources are read.
+    pub ready_bundle: u64,
+}
+
+/// Accumulator add/sub source read latency in issued bundles (operand
+/// cycle 3, sampled one bundle before the boundary; see PendingAccAdd).
+const VACC_SRC_READ_LATENCY: u64 = 2;
+
+/// A deferred fused `vlda.ups` awaiting its stage-7 shift-register read.
+///
+/// II_VLDA_UPS (AIE2Schedule.td) reads its shift S-register at operand
+/// cycle 7, not at issue (OperandCycles `[9,7,1,1,...]`: acc dest at 9,
+/// S-reg at 7). The conversion happens after the load data returns, so the
+/// compiler schedules the `mov sN, rM` that sets the shift several bundles
+/// AFTER the vlda.ups it controls. Sampling at issue read the stale shift
+/// (verified against NPU1 silicon, vector fuzzer seeds 1142-1448: upshift
+/// modes 1-7 produced the unshifted input). The load data, destination, and
+/// element types are resolved at issue; only the shift amount is sampled at
+/// issue+6, one bundle before the cycle-7 boundary (same rationale as
+/// PendingUnpack). Plain register II_VUPS reads its shift at issue and is
+/// not deferred.
+#[derive(Debug, Clone)]
+pub struct PendingUpsLoad {
+    /// Vector data loaded from memory at issue.
+    pub vec_data: [u32; 8],
+    /// S-register holding the shift amount, sampled at `ready_bundle`.
+    pub shift_reg: u8,
+    /// Destination accumulator register.
+    pub dest_reg: u8,
+    /// Input element type.
+    pub from: xdna_archspec::aie2::isa::ElementType,
+    /// Output (accumulator lane) element type.
+    pub to: xdna_archspec::aie2::isa::ElementType,
+    /// Half (bml/bmh, 512-bit) vs full cm (1024-bit) destination.
+    pub is_half: bool,
+    /// Issued-bundle count at which the shift register is read.
+    pub ready_bundle: u64,
+}
+
+/// VLDA.UPS shift-register read latency in issued bundles (operand cycle 7,
+/// sampled one bundle before the boundary; see PendingUpsLoad).
+const VLDA_UPS_SHIFT_READ_LATENCY: u64 = 6;
+
 /// Maximum loop-body byte span for which the LE-bundle partial-word store is
 /// flushed on the zero-overhead-loop back-edge.
 ///
@@ -289,6 +385,18 @@ pub struct ExecutionContext {
     /// post-modify are computed at issue time; only the data read is deferred.
     pending_stores: Vec<PendingStore>,
 
+    // === Late-Read VUNPACK Pipeline ===
+    /// Deferred VUNPACKs awaiting their stage-7 source read (see PendingUnpack).
+    pending_unpacks: Vec<PendingUnpack>,
+
+    /// Deferred accumulator add/subs awaiting their stage-3 source read
+    /// (see PendingAccAdd).
+    pending_acc_adds: Vec<PendingAccAdd>,
+
+    /// Deferred fused vlda.ups awaiting their stage-7 shift read
+    /// (see PendingUpsLoad).
+    pending_ups_loads: Vec<PendingUpsLoad>,
+
     // === Memory Bank Conflict Detection ===
     /// Bitmask of memory banks accessed by the core during this cycle.
     /// Bit N set = bank N was accessed via load/store. Compared against
@@ -432,6 +540,9 @@ impl ExecutionContext {
             result_bypass: Bypass::No,
             bundle_seq: 0,
             pending_stores: Vec::new(),
+            pending_unpacks: Vec::new(),
+            pending_acc_adds: Vec::new(),
+            pending_ups_loads: Vec::new(),
             cycle_core_banks: 0,
             srs_config: SrsConfig::default(),
         }
@@ -1059,6 +1170,256 @@ impl ExecutionContext {
     /// Check if there are pending stores waiting to commit.
     pub fn pending_stores_empty(&self) -> bool {
         self.pending_stores.is_empty()
+    }
+
+    /// Queue a VUNPACK for its stage-7 source read (see [`PendingUnpack`]).
+    ///
+    /// The source w-register is sampled `VUNPACK_SRC_READ_LATENCY` issued
+    /// bundles after issue; the x-register result lands one bundle later
+    /// (total dest latency 7, II_VUNPACK operand_cycles[0]).
+    pub fn queue_pending_unpack(
+        &mut self,
+        src_reg: u8,
+        dest_reg: u8,
+        bits_i: u32,
+        bits_o: u32,
+        signed: bool,
+    ) {
+        self.pending_unpacks.push(PendingUnpack {
+            src_reg,
+            dest_reg,
+            bits_i,
+            bits_o,
+            signed,
+            ready_bundle: self.bundle_seq + VUNPACK_SRC_READ_LATENCY,
+        });
+    }
+
+    /// Sample sources for pending VUNPACKs that reached their read bundle and
+    /// queue their destination writes. Call once per issued bundle, after
+    /// `advance_vector_bundle()` (so producer writes that land this bundle are
+    /// architecturally visible) and before slot execution.
+    pub fn process_pending_unpacks(&mut self) {
+        if self.pending_unpacks.is_empty() {
+            return;
+        }
+        let current = self.bundle_seq;
+        let mut ready: Vec<PendingUnpack> = Vec::new();
+        self.pending_unpacks.retain(|pu| {
+            if pu.ready_bundle <= current {
+                ready.push(pu.clone());
+                false
+            } else {
+                true
+            }
+        });
+        ready.sort_by_key(|pu| pu.ready_bundle);
+        for pu in ready {
+            use crate::interpreter::execute::vector_pack::unpack_half;
+            let src = self.vector.read(pu.src_reg);
+            let lanes_per_half = (256 / pu.bits_o) as usize;
+            let lo = unpack_half(&src, 0, pu.bits_i, pu.bits_o, pu.signed);
+            let hi = unpack_half(&src, lanes_per_half, pu.bits_i, pu.bits_o, pu.signed);
+            let mut result = [0u32; 16];
+            result[..8].copy_from_slice(&lo);
+            result[8..].copy_from_slice(&hi);
+            // Source read at issue+6, write-back at issue+7: one more bundle.
+            self.vector.queue_write_wide(pu.dest_reg, result, 1, Bypass::No);
+        }
+    }
+
+    /// Queue an accumulator add/sub for its stage-3 source read (see
+    /// [`PendingAccAdd`]). Control bits are resolved by the caller at issue.
+    #[allow(clippy::too_many_arguments)]
+    pub fn queue_pending_acc_add(
+        &mut self,
+        acc1_reg: u8,
+        acc2_reg: u8,
+        dst_reg: u8,
+        negate_acc1: bool,
+        negate_acc2: bool,
+        zero_acc1: bool,
+        shift16: bool,
+        is_float: bool,
+        is_wide: bool,
+    ) {
+        self.pending_acc_adds.push(PendingAccAdd {
+            acc1_reg,
+            acc2_reg,
+            dst_reg,
+            negate_acc1,
+            negate_acc2,
+            zero_acc1,
+            shift16,
+            is_float,
+            is_wide,
+            ready_bundle: self.bundle_seq + VACC_SRC_READ_LATENCY,
+        });
+    }
+
+    /// Sample sources for pending accumulator add/subs that reached their
+    /// read bundle and write their results. Call once per issued bundle,
+    /// after `commit_pending_writes()` (so MAC results that land this cycle
+    /// are visible) and before slot execution.
+    pub fn process_pending_acc_adds(&mut self) {
+        if self.pending_acc_adds.is_empty() {
+            return;
+        }
+        let current = self.bundle_seq;
+        let mut ready: Vec<PendingAccAdd> = Vec::new();
+        self.pending_acc_adds.retain(|pa| {
+            if pa.ready_bundle <= current {
+                ready.push(pa.clone());
+                false
+            } else {
+                true
+            }
+        });
+        ready.sort_by_key(|pa| pa.ready_bundle);
+        for pa in ready {
+            if pa.is_wide {
+                let a1 = self.accumulator.read_wide(pa.acc1_reg);
+                let a2 = self.accumulator.read_wide(pa.acc2_reg);
+                let mut result = [0u64; 16];
+                for i in 0..16 {
+                    result[i] = Self::acc_add_sub_lane_pair(a1[i], a2[i], &pa);
+                }
+                self.accumulator.write_wide(pa.dst_reg, result);
+            } else {
+                let a1 = self.accumulator.read(pa.acc1_reg);
+                let a2 = self.accumulator.read(pa.acc2_reg);
+                let mut result = [0u64; 8];
+                for i in 0..8 {
+                    result[i] = Self::acc_add_sub_lane_pair(a1[i], a2[i], &pa);
+                }
+                self.accumulator.write(pa.dst_reg, result);
+            }
+        }
+    }
+
+    /// Queue a fused `vlda.ups` for its stage-7 shift-register read (see
+    /// [`PendingUpsLoad`]). Load data and destination are resolved at issue;
+    /// only the shift amount is sampled at issue+6.
+    pub fn queue_pending_ups_load(
+        &mut self,
+        vec_data: [u32; 8],
+        shift_reg: u8,
+        dest_reg: u8,
+        from: xdna_archspec::aie2::isa::ElementType,
+        to: xdna_archspec::aie2::isa::ElementType,
+        is_half: bool,
+    ) {
+        self.pending_ups_loads.push(PendingUpsLoad {
+            vec_data,
+            shift_reg,
+            dest_reg,
+            from,
+            to,
+            is_half,
+            ready_bundle: self.bundle_seq + VLDA_UPS_SHIFT_READ_LATENCY,
+        });
+    }
+
+    /// Sample the shift register for pending vlda.ups conversions that
+    /// reached their read bundle and write the converted accumulator. Call
+    /// once per issued bundle, after `advance_vector_bundle()` and before
+    /// slot execution.
+    pub fn process_pending_ups_loads(&mut self) {
+        if self.pending_ups_loads.is_empty() {
+            return;
+        }
+        let current = self.bundle_seq;
+        let mut ready: Vec<PendingUpsLoad> = Vec::new();
+        self.pending_ups_loads.retain(|pu| {
+            if pu.ready_bundle <= current {
+                ready.push(pu.clone());
+                false
+            } else {
+                true
+            }
+        });
+        ready.sort_by_key(|pu| pu.ready_bundle);
+        for pu in ready {
+            use crate::interpreter::execute::vector_ups::{ups_vector_to_acc, ups_vector_to_acc_wide};
+            let shift = self.scalar_read(pu.shift_reg);
+            if pu.is_half {
+                let acc = ups_vector_to_acc(&pu.vec_data, shift, pu.from, pu.to);
+                self.accumulator.write(pu.dest_reg, acc);
+            } else {
+                let acc = ups_vector_to_acc_wide(&pu.vec_data, shift, pu.from, pu.to);
+                self.accumulator.write_wide(pu.dest_reg, acc);
+            }
+        }
+    }
+
+    /// One 64-bit accumulator word of VADD/VSUB/VNEGADD/VNEGSUB: two
+    /// independent 32-bit lanes (fp32 or int32 per `is_float`).
+    fn acc_add_sub_lane_pair(a1: u64, a2: u64, pa: &PendingAccAdd) -> u64 {
+        if pa.is_float {
+            use crate::interpreter::execute::vector_float::aie2_acc_fp32_add;
+            // Denormal inputs are NOT flushed: the acc add ALU computes them
+            // at full precision and flushes only a denormal RESULT to signed
+            // zero (silicon-verified, fuzzer seed 4; see aie2_acc_fp32_add).
+            let mut a1_lo = if pa.zero_acc1 { 0 } else { a1 as u32 };
+            let mut a1_hi = if pa.zero_acc1 { 0 } else { (a1 >> 32) as u32 };
+            let mut a2_lo = a2 as u32;
+            let mut a2_hi = (a2 >> 32) as u32;
+            // Negate by flipping the sign bit -- but NOT for true zeros: the
+            // hardware negation leaves zero positive, so vsub.f(-0, +0) = +0
+            // (silicon-verified, fuzzer seed 4 sub stage; IEEE -0 + -0 would
+            // give -0). Normals, denormals, inf, and NaN all flip.
+            let neg = |bits: u32| {
+                if bits & 0x7FFF_FFFF == 0 {
+                    bits
+                } else {
+                    bits ^ 0x8000_0000
+                }
+            };
+            if pa.negate_acc1 {
+                a1_lo = neg(a1_lo);
+                a1_hi = neg(a1_hi);
+            }
+            if pa.negate_acc2 {
+                a2_lo = neg(a2_lo);
+                a2_hi = neg(a2_hi);
+            }
+            let r_lo = aie2_acc_fp32_add(a1_lo, a2_lo);
+            let r_hi = aie2_acc_fp32_add(a1_hi, a2_hi);
+            (r_lo as u64) | ((r_hi as u64) << 32)
+        } else {
+            // Acc32 mode: no carry chain between halves, per-lane 32-bit math.
+            let v1_lo = if pa.zero_acc1 { 0i32 } else { a1 as i32 };
+            let v1_hi = if pa.zero_acc1 { 0i32 } else { (a1 >> 32) as i32 };
+            let v2_lo = a2 as i32;
+            let v2_hi = (a2 >> 32) as i32;
+            let v1_lo = if pa.negate_acc1 {
+                v1_lo.wrapping_neg()
+            } else {
+                v1_lo
+            };
+            let v1_hi = if pa.negate_acc1 {
+                v1_hi.wrapping_neg()
+            } else {
+                v1_hi
+            };
+            let v2_lo = if pa.negate_acc2 {
+                v2_lo.wrapping_neg()
+            } else {
+                v2_lo
+            };
+            let v2_hi = if pa.negate_acc2 {
+                v2_hi.wrapping_neg()
+            } else {
+                v2_hi
+            };
+            let mut r_lo = v1_lo.wrapping_add(v2_lo);
+            let mut r_hi = v1_hi.wrapping_add(v2_hi);
+            if pa.shift16 {
+                r_lo >>= 16;
+                r_hi >>= 16;
+            }
+            (r_lo as u32 as u64) | ((r_hi as u32 as u64) << 32)
+        }
     }
 
     /// Check if there are pending (deferred) register writes awaiting commit.

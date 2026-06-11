@@ -1,9 +1,8 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// Half-B SRS capture design: single compute tile (0,2) reads a 48xi32 batch of
-// accumulator values from DDR via shim DMA, runs the SRS kernel, writes the
-// 48xi16 shift-round-saturated result back to DDR. Direct shim<->core
-// objectfifos (no memtile relay).
+// Half-B vec_srs_i32 capture design (GENERATED). Single compute tile (0,2) reads a
+// 48-element batch from DDR via shim DMA, runs the vec_srs_i32 kernel, writes the
+// result back. Direct shim<->core objectfifos (no memtile relay).
 //
 //===----------------------------------------------------------------------===//
 

@@ -275,28 +275,18 @@ impl VectorAlu {
                 }
             }
             ElementType::BFloat16 => {
-                // AIE2 NaN semantics: when either operand is NaN, the compare
-                // unit returns false, and the VMIN mux selects s1 (left operand).
-                // This is NaN propagation from s1, NOT IEEE 754 minNum.
+                // VMIN_GE mux: select s2 when (s1 >= s2) under the silicon
+                // sign-magnitude ordering, else s1. NaN makes the compare
+                // false, propagating s1 (NOT IEEE 754 minNum); -0 sorts
+                // strictly below +0, so min(-0, +0) = -0 (silicon-verified,
+                // vector fuzzer seed 1433 max counterpart).
                 for i in 0..8 {
-                    let a_lo_raw = (a[i] & 0xFFFF) as u16;
-                    let a_hi_raw = ((a[i] >> 16) & 0xFFFF) as u16;
-                    let b_lo_raw = (b[i] & 0xFFFF) as u16;
-                    let b_hi_raw = ((b[i] >> 16) & 0xFFFF) as u16;
-                    let a_lo = Self::bf16_to_f32(a_lo_raw);
-                    let a_hi = Self::bf16_to_f32(a_hi_raw);
-                    let b_lo = Self::bf16_to_f32(b_lo_raw);
-                    let b_hi = Self::bf16_to_f32(b_hi_raw);
-                    let r_lo = if a_lo.is_nan() || b_lo.is_nan() {
-                        a_lo_raw
-                    } else {
-                        Self::f32_to_bf16(a_lo.min(b_lo))
-                    };
-                    let r_hi = if a_hi.is_nan() || b_hi.is_nan() {
-                        a_hi_raw
-                    } else {
-                        Self::f32_to_bf16(a_hi.min(b_hi))
-                    };
+                    let a_lo = (a[i] & 0xFFFF) as u16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
+                    let b_lo = (b[i] & 0xFFFF) as u16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
+                    let r_lo = if Self::bf16_cmp_ge(a_lo, b_lo) { b_lo } else { a_lo };
+                    let r_hi = if Self::bf16_cmp_ge(a_hi, b_hi) { b_hi } else { a_hi };
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -379,28 +369,18 @@ impl VectorAlu {
                 }
             }
             ElementType::BFloat16 => {
-                // AIE2 NaN semantics: when either operand is NaN, the compare
-                // unit returns false, and the VMAX mux selects s1 (left operand).
-                // This is NaN propagation from s1, NOT IEEE 754 maxNum.
+                // VMAX_LT mux: select s2 when (s1 < s2) under the silicon
+                // sign-magnitude ordering, else s1. NaN makes the compare
+                // false, propagating s1 (NOT IEEE 754 maxNum); -0 sorts
+                // strictly below +0, so max(-0, +0) = +0 (silicon-verified,
+                // vector fuzzer seed 1433: numeric f32 max kept -0).
                 for i in 0..8 {
-                    let a_lo_raw = (a[i] & 0xFFFF) as u16;
-                    let a_hi_raw = ((a[i] >> 16) & 0xFFFF) as u16;
-                    let b_lo_raw = (b[i] & 0xFFFF) as u16;
-                    let b_hi_raw = ((b[i] >> 16) & 0xFFFF) as u16;
-                    let a_lo = Self::bf16_to_f32(a_lo_raw);
-                    let a_hi = Self::bf16_to_f32(a_hi_raw);
-                    let b_lo = Self::bf16_to_f32(b_lo_raw);
-                    let b_hi = Self::bf16_to_f32(b_hi_raw);
-                    let r_lo = if a_lo.is_nan() || b_lo.is_nan() {
-                        a_lo_raw
-                    } else {
-                        Self::f32_to_bf16(a_lo.max(b_lo))
-                    };
-                    let r_hi = if a_hi.is_nan() || b_hi.is_nan() {
-                        a_hi_raw
-                    } else {
-                        Self::f32_to_bf16(a_hi.max(b_hi))
-                    };
+                    let a_lo = (a[i] & 0xFFFF) as u16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
+                    let b_lo = (b[i] & 0xFFFF) as u16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
+                    let r_lo = if Self::bf16_cmp_lt(a_lo, b_lo) { b_lo } else { a_lo };
+                    let r_hi = if Self::bf16_cmp_lt(a_hi, b_hi) { b_hi } else { a_hi };
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -1198,7 +1178,6 @@ impl VectorAlu {
     /// The shift parameter comes from a scalar register operand.
     /// Hardware uses the low 6 bits as a signed value (range -32 to +31).
     pub(super) fn vector_floor_bf16_to_s32(src: &[u32; 8], shift: i32) -> [u32; 8] {
-        use super::vector_float::fp32_flush_to_zero;
         let mut result = [0u32; 8];
         // Hardware interprets shift as signed 6-bit (-32 to +31).
         let masked = (shift & 0x3F) as i8;
@@ -1206,7 +1185,11 @@ impl VectorAlu {
         let scale = (2.0f64).powi(effective_shift);
         for i in 0..8 {
             let bf16 = (src[i / 2] >> ((i % 2) * 16)) as u16;
-            let f = f32::from_bits(fp32_flush_to_zero(Self::bf16_to_f32(bf16).to_bits()));
+            // Silicon (NPU1 Phoenix, vec_vfloor_bf16_denorm, 2026-06-10) does NOT
+            // flush bf16 denormals before floor: a tiny negative denormal floors to
+            // -1, not 0. This is the datapath the compiled VFLOOR kernel uses (wide
+            // path, quarter-acc source) -- distinct from vector_convert's branch.
+            let f = Self::bf16_to_f32(bf16);
             // Hardware saturates NaN to INT_MAX (positive saturation).
             if f.is_nan() {
                 result[i] = i32::MAX as u32;
@@ -1603,126 +1586,23 @@ impl VectorAlu {
         let negate_acc1 = md1 ^ sub_acc1;
         let negate_acc2 = md2 ^ sub_acc2;
 
-        if is_wide {
-            // Wide path: 1024-bit cm registers (16 x 64-bit lanes).
-            let a1 = ctx.accumulator.read_wide(acc1_reg);
-            let a2 = ctx.accumulator.read_wide(acc2_reg);
-            let mut result = [0u64; 16];
-
-            if is_float {
-                use super::vector_float::{fp32_flush_to_zero, aie2_acc_fp32_add};
-                for i in 0..16 {
-                    let mut a1_lo = if zero_acc1 {
-                        0u32
-                    } else {
-                        fp32_flush_to_zero(a1[i] as u32)
-                    };
-                    let mut a1_hi = if zero_acc1 {
-                        0u32
-                    } else {
-                        fp32_flush_to_zero((a1[i] >> 32) as u32)
-                    };
-                    let mut a2_lo = fp32_flush_to_zero(a2[i] as u32);
-                    let mut a2_hi = fp32_flush_to_zero((a2[i] >> 32) as u32);
-
-                    // Negate by flipping sign bit (works for zero, normal, inf, NaN).
-                    if negate_acc1 {
-                        a1_lo ^= 0x8000_0000;
-                        a1_hi ^= 0x8000_0000;
-                    }
-                    if negate_acc2 {
-                        a2_lo ^= 0x8000_0000;
-                        a2_hi ^= 0x8000_0000;
-                    }
-
-                    // Use acc ALU add (no output FTZ): the accumulator
-                    // register file preserves denormalized fp32 values.
-                    let r_lo = aie2_acc_fp32_add(a1_lo, a2_lo);
-                    let r_hi = aie2_acc_fp32_add(a1_hi, a2_hi);
-                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
-                }
-            } else {
-                // Acc32 mode: each u64 holds two independent 32-bit accumulator
-                // lanes.  The hardware ALU has no carry chain between the lo and
-                // hi halves -- all arithmetic is per-lane 32-bit.
-                for i in 0..16 {
-                    let v1_lo = if zero_acc1 { 0i32 } else { a1[i] as i32 };
-                    let v1_hi = if zero_acc1 { 0i32 } else { (a1[i] >> 32) as i32 };
-                    let v2_lo = a2[i] as i32;
-                    let v2_hi = (a2[i] >> 32) as i32;
-                    let v1_lo = if negate_acc1 { v1_lo.wrapping_neg() } else { v1_lo };
-                    let v1_hi = if negate_acc1 { v1_hi.wrapping_neg() } else { v1_hi };
-                    let v2_lo = if negate_acc2 { v2_lo.wrapping_neg() } else { v2_lo };
-                    let v2_hi = if negate_acc2 { v2_hi.wrapping_neg() } else { v2_hi };
-                    let mut r_lo = v1_lo.wrapping_add(v2_lo);
-                    let mut r_hi = v1_hi.wrapping_add(v2_hi);
-                    if shift16 {
-                        r_lo >>= 16;
-                        r_hi >>= 16;
-                    }
-                    result[i] = (r_lo as u32 as u64) | ((r_hi as u32 as u64) << 32);
-                }
-            }
-
-            ctx.accumulator.write_wide(dst_reg, result);
-        } else {
-            // Narrow path: 512-bit bm registers (8 x 64-bit lanes).
-            let a1 = ctx.accumulator.read(acc1_reg);
-            let a2 = ctx.accumulator.read(acc2_reg);
-            let mut result = [0u64; 8];
-
-            if is_float {
-                use super::vector_float::{fp32_flush_to_zero, aie2_acc_fp32_add};
-                for i in 0..8 {
-                    let mut a1_lo = if zero_acc1 {
-                        0u32
-                    } else {
-                        fp32_flush_to_zero(a1[i] as u32)
-                    };
-                    let mut a1_hi = if zero_acc1 {
-                        0u32
-                    } else {
-                        fp32_flush_to_zero((a1[i] >> 32) as u32)
-                    };
-                    let mut a2_lo = fp32_flush_to_zero(a2[i] as u32);
-                    let mut a2_hi = fp32_flush_to_zero((a2[i] >> 32) as u32);
-
-                    if negate_acc1 {
-                        a1_lo ^= 0x8000_0000;
-                        a1_hi ^= 0x8000_0000;
-                    }
-                    if negate_acc2 {
-                        a2_lo ^= 0x8000_0000;
-                        a2_hi ^= 0x8000_0000;
-                    }
-
-                    let r_lo = aie2_acc_fp32_add(a1_lo, a2_lo);
-                    let r_hi = aie2_acc_fp32_add(a1_hi, a2_hi);
-                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
-                }
-            } else {
-                // Acc32 mode: independent 32-bit lane operations (see wide path).
-                for i in 0..8 {
-                    let v1_lo = if zero_acc1 { 0i32 } else { a1[i] as i32 };
-                    let v1_hi = if zero_acc1 { 0i32 } else { (a1[i] >> 32) as i32 };
-                    let v2_lo = a2[i] as i32;
-                    let v2_hi = (a2[i] >> 32) as i32;
-                    let v1_lo = if negate_acc1 { v1_lo.wrapping_neg() } else { v1_lo };
-                    let v1_hi = if negate_acc1 { v1_hi.wrapping_neg() } else { v1_hi };
-                    let v2_lo = if negate_acc2 { v2_lo.wrapping_neg() } else { v2_lo };
-                    let v2_hi = if negate_acc2 { v2_hi.wrapping_neg() } else { v2_hi };
-                    let mut r_lo = v1_lo.wrapping_add(v2_lo);
-                    let mut r_hi = v1_hi.wrapping_add(v2_hi);
-                    if shift16 {
-                        r_lo >>= 16;
-                        r_hi >>= 16;
-                    }
-                    result[i] = (r_lo as u32 as u64) | ((r_hi as u32 as u64) << 32);
-                }
-            }
-
-            ctx.accumulator.write(dst_reg, result);
-        }
+        // II_VADDMAC / II_VADDMACf read their accumulator sources at operand
+        // cycle 3, not at issue (AIE2Schedule.td); Peano bundles the vconv
+        // producing a source WITH the vadd that consumes it. Defer the source
+        // read+compute to the pending-acc-add queue; all control bits are
+        // resolved here at issue. The 32-bit lane math lives in
+        // `ExecutionContext::acc_add_sub_lane_pair`.
+        ctx.queue_pending_acc_add(
+            acc1_reg,
+            acc2_reg,
+            dst_reg,
+            negate_acc1,
+            negate_acc2,
+            zero_acc1,
+            shift16,
+            is_float,
+            is_wide,
+        );
     }
 
     /// Accumulator negate: dst = -src.
@@ -2177,6 +2057,32 @@ mod tests {
         assert_eq!(r[0], 0x01_FE_00_80);
     }
 
+    /// bf16 min/max mux semantics on signed zero and NaN (silicon-verified,
+    /// vector fuzzer seed 1433): -0 sorts strictly below +0, so
+    /// max(-0,+0)=+0 and min(-0,+0)=-0 regardless of operand order; a NaN
+    /// operand makes the compare false, propagating s1. Numeric f32 min/max
+    /// collapses the zeros and got the seed-1433 lane wrong.
+    #[test]
+    fn vector_max_min_bf16_signed_zero_and_nan() {
+        let nz = 0x8000u32; // -0.0 bf16
+        let pz = 0x0000u32; // +0.0 bf16
+        let nan = 0x7FC0u32;
+        let one = 0x3F80u32;
+        // lane lo of word 0; hi half unused (zeros compare equal -> s1).
+        let a = [nz, pz, nan, one, 0, 0, 0, 0];
+        let b = [pz, nz, one, nan, 0, 0, 0, 0];
+        let max = VectorAlu::vector_max(&a, &b, ElementType::BFloat16);
+        assert_eq!(max[0] & 0xFFFF, pz, "max(-0,+0)=+0");
+        assert_eq!(max[1] & 0xFFFF, pz, "max(+0,-0)=+0");
+        assert_eq!(max[2] & 0xFFFF, nan, "max(NaN,1) propagates s1");
+        assert_eq!(max[3] & 0xFFFF, one, "max(1,NaN) propagates s1");
+        let min = VectorAlu::vector_min(&a, &b, ElementType::BFloat16);
+        assert_eq!(min[0] & 0xFFFF, nz, "min(-0,+0)=-0");
+        assert_eq!(min[1] & 0xFFFF, nz, "min(+0,-0)=-0");
+        assert_eq!(min[2] & 0xFFFF, nan, "min(NaN,1) propagates s1");
+        assert_eq!(min[3] & 0xFFFF, one, "min(1,NaN) propagates s1");
+    }
+
     // -- vector_shift_left --
 
     #[test]
@@ -2459,10 +2365,16 @@ mod tests {
         ctx.scalar.write(0, 0);
 
         VectorAlu::execute(&op, &mut ctx);
+        // VADD.f samples its accumulator sources at operand cycle 3; drive
+        // the deferred read (issued at bundle 0, ready at bundle 2).
+        ctx.bundle_seq = 2;
+        ctx.process_pending_acc_adds();
 
         let result = ctx.accumulator.read(0);
-        // Each u64 lane should hold two copies of canonical NaN = 0x7F800001.
-        let expected = 0x7F800001_7F800001u64;
+        // 0xFFFFFFFF is a NEGATIVE NaN; the mantissa datapath sums the
+        // exp-255 operands (overflow), forces exp=255 with the NaN sticky in
+        // bit 0, and keeps the sum's (negative) sign: 0xFF800001 per lane.
+        let expected = 0xFF800001_FF800001u64;
         for (i, &v) in result.iter().enumerate() {
             assert_eq!(v, expected, "acc lane {} should be canonical NaN pair, got {:#018x}", i, v);
         }
@@ -2509,6 +2421,9 @@ mod tests {
         ctx.scalar.write(0, 0);
 
         VectorAlu::execute(&op, &mut ctx);
+        // Drive the deferred stage-3 accumulator source read.
+        ctx.bundle_seq = 2;
+        ctx.process_pending_acc_adds();
 
         // Read back via SRS s16.s32 with shift=0.
         let result_acc = ctx.accumulator.read(0);

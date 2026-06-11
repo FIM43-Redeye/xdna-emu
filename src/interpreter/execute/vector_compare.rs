@@ -9,6 +9,41 @@ use crate::interpreter::state::ExecutionContext;
 use super::vector_dispatch::VectorAlu;
 
 impl VectorAlu {
+    /// Sign-magnitude ordering key for bf16 comparisons (None = NaN).
+    ///
+    /// The bf16 vector comparators (VGE/VLT) are unordered on NaN -- any
+    /// NaN operand makes the comparison FALSE in both directions -- and
+    /// order all other lanes by their bit pattern, sign-magnitude, so -0
+    /// sorts strictly BELOW +0. Verified against NPU1 silicon (vector
+    /// fuzzer seeds 4/41/47: vge.bf16(-0, +0) is FALSE; lt/ge with a NaN
+    /// operand always FALSE; a numeric f32 compare flips the vsel lane).
+    #[inline]
+    pub(super) fn bf16_order_key(bits: u16) -> Option<i32> {
+        if bits & 0x7FFF > 0x7F80 {
+            return None; // NaN: unordered
+        }
+        let mag = (bits & 0x7FFF) as i32;
+        Some(if bits & 0x8000 != 0 { -mag - 1 } else { mag })
+    }
+
+    /// bf16 a >= b under the silicon ordering (false when either is NaN).
+    #[inline]
+    pub(super) fn bf16_cmp_ge(a: u16, b: u16) -> bool {
+        matches!(
+            (Self::bf16_order_key(a), Self::bf16_order_key(b)),
+            (Some(ka), Some(kb)) if ka >= kb
+        )
+    }
+
+    /// bf16 a < b under the silicon ordering (false when either is NaN).
+    #[inline]
+    pub(super) fn bf16_cmp_lt(a: u16, b: u16) -> bool {
+        matches!(
+            (Self::bf16_order_key(a), Self::bf16_order_key(b)),
+            (Some(ka), Some(kb)) if ka < kb
+        )
+    }
+
     /// Vector equality comparison (returns mask).
     pub(super) fn vector_cmp_eq(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
@@ -96,13 +131,18 @@ impl VectorAlu {
                 }
             }
             ElementType::BFloat16 => {
+                // Sign-magnitude ordering, NaN unordered (see bf16_order_key).
                 for i in 0..8 {
-                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
-                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
-                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
-                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
-                    let r_lo: u16 = if a_lo >= b_lo { !0 } else { 0 };
-                    let r_hi: u16 = if a_hi >= b_hi { !0 } else { 0 };
+                    let r_lo: u16 = if Self::bf16_cmp_ge((a[i] & 0xFFFF) as u16, (b[i] & 0xFFFF) as u16) {
+                        !0
+                    } else {
+                        0
+                    };
+                    let r_hi: u16 = if Self::bf16_cmp_ge((a[i] >> 16) as u16, (b[i] >> 16) as u16) {
+                        !0
+                    } else {
+                        0
+                    };
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -180,13 +220,18 @@ impl VectorAlu {
                 }
             }
             ElementType::BFloat16 => {
+                // Sign-magnitude ordering, NaN unordered (see bf16_order_key).
                 for i in 0..8 {
-                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
-                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
-                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
-                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
-                    let r_lo: u16 = if a_lo < b_lo { !0 } else { 0 };
-                    let r_hi: u16 = if a_hi < b_hi { !0 } else { 0 };
+                    let r_lo: u16 = if Self::bf16_cmp_lt((a[i] & 0xFFFF) as u16, (b[i] & 0xFFFF) as u16) {
+                        !0
+                    } else {
+                        0
+                    };
+                    let r_hi: u16 = if Self::bf16_cmp_lt((a[i] >> 16) as u16, (b[i] >> 16) as u16) {
+                        !0
+                    } else {
+                        0
+                    };
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -755,6 +800,23 @@ mod tests {
         assert_eq!(r[0], 0xFFFF_00FF);
     }
 
+    /// bf16 VGE/VLT silicon semantics (fuzzer seeds 4/41/47): sign-magnitude
+    /// ordering (-0 strictly below +0), NaN unordered (both directions FALSE).
+    #[test]
+    fn test_bf16_compare_neg_zero_and_nan() {
+        // lo = -0 vs +0, hi = +0 vs -0
+        let a = [0x0000_8000u32, 0x7FC0_8006, 0, 0, 0, 0, 0, 0];
+        let b = [0x8000_0000u32, 0x0000_7FC0, 0, 0, 0, 0, 0, 0];
+        let ge = VectorAlu::vector_compare_ge(&a, &b, ElementType::BFloat16);
+        let lt = VectorAlu::vector_compare_lt(&a, &b, ElementType::BFloat16);
+        // word 0 lo: ge(-0, +0) FALSE, lt TRUE; hi: ge(+0, -0) TRUE, lt FALSE.
+        assert_eq!(ge[0], 0xFFFF_0000);
+        assert_eq!(lt[0], 0x0000_FFFF);
+        // word 1 lo: -denorm vs +NaN -> both FALSE; hi: NaN vs 0 -> both FALSE.
+        assert_eq!(ge[1], 0);
+        assert_eq!(lt[1], 0);
+    }
+
     // ========== vector_compare_lt ==========
 
     #[test]
@@ -916,6 +978,8 @@ mod tests {
         //   1>=1=T, 2>=3=F, 3>=2=T, 4>=4=T, 5>=6=F, 6>=5=T, 7>=7=T, 8>=9=F
         //   mask_hi = 0b_0110_1101 = 0x6D
         // full_mask = mask_lo | (mask_hi << 8) = 0x6D75
+        // The scalar mask has pipeline latency 2 (II_VCMP); flush to observe it.
+        ctx.flush_pending_writes();
         let scalar_result = ctx.scalar.read(16);
         assert_eq!(scalar_result, 0x6D75, "wide VGE scalar bitmask mismatch: got {:#06x}", scalar_result);
     }
@@ -943,7 +1007,42 @@ mod tests {
         // lo: F,T,F,T,F,F,F,T -> 0b_1000_1010 = 0x8A
         // hi: F,T,F,F,T,F,F,T -> 0b_1001_0010 = 0x92
         // full_mask = 0x928A
+        // The scalar mask has pipeline latency 2 (II_VCMP); flush to observe it.
+        ctx.flush_pending_writes();
         let scalar_result = ctx.scalar.read(16);
         assert_eq!(scalar_result, 0x928A, "wide VLT scalar bitmask mismatch: got {:#06x}", scalar_result);
+    }
+
+    /// Regression: the scalar mask of a vector compare is pipelined (latency
+    /// 2, NoBypass per AIE2Schedule.td II_VMAX_LT/II_VCMP), so the next bundle
+    /// must still read the PRE-compare value. Peano schedules callee-save
+    /// copies of the mask register in that shadow (e.g. `vmax_lt x4,r16,..`
+    /// then `or r1,r16,r16`); an immediate write corrupts the saved value,
+    /// which fuzzer kernels then use as the lock-release delta (lock wedged
+    /// at -64, output DMA stalls).
+    #[test]
+    fn test_cmp_scalar_mask_not_visible_to_next_bundle() {
+        let mut ctx = make_ctx();
+        ctx.scalar.write(16, 1); // caller value (lock-release amount)
+        ctx.vector.write(0, [10, 5, 20, 3, 8, 8, 100, 0]);
+        ctx.vector.write(1, [1, 2, 3, 4, 5, 6, 7, 8]);
+        ctx.vector.write(2, [5, 10, 20, 4, 7, 8, 50, 1]);
+        ctx.vector.write(3, [1, 3, 2, 4, 6, 5, 7, 9]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::SetGe)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::ScalarReg(16))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(2));
+        op.is_wide_vector = true;
+
+        assert!(VectorAlu::execute(&op, &mut ctx));
+
+        // Latency shadow: a read in the next bundle sees the old value.
+        assert_eq!(ctx.scalar.read(16), 1, "compare mask forwarded too early");
+
+        // After the pipeline drains the mask becomes architectural.
+        ctx.flush_pending_writes();
+        assert_eq!(ctx.scalar.read(16), 0x6D75);
     }
 }

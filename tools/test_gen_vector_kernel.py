@@ -7,11 +7,17 @@ regenerating a known-good kernel (vec_srs_i32) reproduces its committed
 golden arrays exactly.
 """
 
+import dataclasses
 import json
+import os
+import tempfile
+import unittest
 from pathlib import Path
 
+import gen_vector_kernel as gen
 from gen_vector_kernel import (
     Buf,
+    DirectIO,
     KernelSpec,
     bake_array,
     render_test_cpp,
@@ -145,8 +151,8 @@ class TestGenerate:
         gen = (Path(outdir) / "test.cpp").read_text()
         committed = (REPO / "tests/vector-verify/vec_srs_i32/test.cpp").read_text()
 
-        assert nums(gen, "IN") == nums(committed, "SRS_IN")
-        assert nums(gen, "EXP") == nums(committed, "SRS_EXP")
+        assert nums(gen, "IN") == nums(committed, "IN")
+        assert nums(gen, "EXP") == nums(committed, "EXP")
 
 
 class TestRegistry:
@@ -164,8 +170,8 @@ class TestRegistry:
         outdir = generate(SPECS["vec_srs_i32"], GOLDEN, tmp_path)
         gen = (Path(outdir) / "test.cpp").read_text()
         committed = (REPO / "tests/vector-verify/vec_srs_i32/test.cpp").read_text()
-        assert nums(gen, "IN") == nums(committed, "SRS_IN")
-        assert nums(gen, "EXP") == nums(committed, "SRS_EXP")
+        assert nums(gen, "IN") == nums(committed, "IN")
+        assert nums(gen, "EXP") == nums(committed, "EXP")
 
     def test_every_spec_has_a_resolvable_golden_slice(self):
         """No spec names a golden config that yields zero records (silent empty)."""
@@ -173,6 +179,15 @@ class TestRegistry:
         from vector_kernel_specs import SPECS
         for name, spec in SPECS.items():
             g = spec.golden
+            if g["class"] == "direct":
+                # Direct specs carry their own input/reference arrays instead of
+                # slicing a corpus class; the anti-silent-empty / fits-N guarantee
+                # still holds, just against the DirectIO tuples.
+                d = g["direct"]
+                assert d.inputs, f"{name}: direct inputs empty"
+                assert len(d.inputs) == len(d.reference) == spec.n, \
+                    f"{name}: direct arrays len {len(d.inputs)}/{len(d.reference)} != N={spec.n}"
+                continue
             recs = select_records(GOLDEN[g["class"]], g["filt"],
                                   g.get("value_range"), predicate=g.get("predicate"))
             assert recs, f"{name}: golden slice is empty"
@@ -220,6 +235,28 @@ class TestKernelTypeSplit:
         cpp = render_test_cpp(spec, GOLDEN)
         assert "uint32_t *bufIn" in cpp
         assert "uint16_t *bufOut" in cpp
+
+
+class TestEdgePredicates:
+    def test_is_edge_f32_selects_nonnormal(self):
+        from vector_kernel_specs import _is_edge_f32
+        for v in (0x00010000, 0x7F800001, 0x7F800000, 0x00000000):
+            assert _is_edge_f32({"value": v})
+        assert not _is_edge_f32({"value": 0x3F800000})
+
+    def test_is_edge_is_complement_of_normal(self):
+        from vector_kernel_specs import _is_edge_f32, _is_normal_f32
+        for v in [0x0, 0x1, 0x00010000, 0x3F800000, 0x7F800000, 0x7F800001, 0xFF800000]:
+            assert _is_edge_f32({"value": v}) != _is_normal_f32({"value": v})
+
+    def test_has_overflow_expected(self):
+        from vector_kernel_specs import _has_overflow_expected, _all_expected_finite_f32
+        ovf = {"expected": [0x3F800000, 0x7F800000]}
+        fin = {"expected": [0x3F800000, 0x40000000]}
+        assert _has_overflow_expected(ovf)
+        assert not _has_overflow_expected(fin)
+        assert not _all_expected_finite_f32(ovf)
+        assert _all_expected_finite_f32(fin)
 
 
 class TestSelectRecordsPredicate:
@@ -372,6 +409,252 @@ def _mac_i8_spec():
     )
 
 
+class TestModeSweep:
+    """SweepSpec.expand()s a class's full crRnd/crSat space into one KernelSpec
+    per mode-point, keeping the swept body (set_rounding/set_saturation) and the
+    baked golden slice in lockstep -- the move that makes the silicon check
+    mode-exhaustive rather than one-representative-per-class."""
+
+    def test_rounding_and_sat_enum_maps_match_toolchain(self):
+        # crRnd index -> aie::rounding_mode name, per aietools me_defines.h.
+        from gen_vector_kernel import ROUNDING_ENUM, SAT_ENUM
+        assert ROUNDING_ENUM == {
+            0: "floor", 1: "ceil", 2: "symmetric_floor", 3: "symmetric_ceil",
+            8: "negative_inf", 9: "positive_inf", 10: "symmetric_zero",
+            11: "symmetric_inf", 12: "conv_even", 13: "conv_odd",
+        }
+        # crSat index -> saturation_mode name (none=0, saturate=1, symmetric=3).
+        assert SAT_ENUM == {0: "none", 1: "saturate", 3: "symmetric"}
+
+    def test_mode_lines_emit_only_present_axes(self):
+        from gen_vector_kernel import mode_lines
+        # both axes
+        ml = mode_lines(12, 1)
+        assert "aie::rounding_mode::conv_even" in ml
+        assert "aie::saturation_mode::saturate" in ml
+        # rounding-only class (no crsat): no set_saturation line
+        assert "set_saturation" not in mode_lines(0, None)
+        assert "aie::rounding_mode::floor" in mode_lines(0, None)
+        # sat-only class (no crrnd): no set_rounding line
+        assert "set_rounding" not in mode_lines(None, 3)
+        assert "aie::saturation_mode::symmetric" in mode_lines(None, 3)
+
+    def test_srs_sweep_expands_to_full_cross_product(self):
+        from vector_kernel_specs import SWEEPS
+        specs = SWEEPS["vec_srs_i32_sweep"].expand()
+        # 10 rounding modes x 3 saturation modes.
+        assert len(specs) == 30
+        names = {s.name for s in specs}
+        assert "vec_srs_i32_r0_s0" in names
+        assert "vec_srs_i32_r12_s3" in names
+        assert "vec_srs_i32_r13_s1" in names
+
+    def test_sweep_point_golden_filter_matches_its_body_mode(self):
+        """The baked golden slice's mode fields must equal the crRnd/crSat the
+        kernel body sets -- otherwise the kernel drives one mode while the
+        expected values came from another (the lockstep guarantee)."""
+        from vector_kernel_specs import SWEEPS
+        by_name = {s.name: s for s in SWEEPS["vec_srs_i32_sweep"].expand()}
+        # rnd=12 (conv_even), crsat=3 (symmetric) -> filt {rnd:12, sat:True, sym_sat:True}
+        s = by_name["vec_srs_i32_r12_s3"]
+        assert s.golden["filt"]["rnd"] == 12
+        assert s.golden["filt"]["sat"] is True
+        assert s.golden["filt"]["sym_sat"] is True
+        assert "aie::rounding_mode::conv_even" in s.body
+        assert "aie::saturation_mode::symmetric" in s.body
+        # crsat=0 (none) -> filt {sat:False, sym_sat:False}
+        s0 = by_name["vec_srs_i32_r0_s0"]
+        assert s0.golden["filt"]["sat"] is False
+        assert s0.golden["filt"]["sym_sat"] is False
+        assert "aie::saturation_mode::none" in s0.body
+
+    def test_pack_sweep_is_saturation_only(self):
+        from vector_kernel_specs import SWEEPS
+        specs = SWEEPS["vec_pack_i16_sweep"].expand()
+        assert {s.name for s in specs} == {
+            "vec_pack_i16_s0", "vec_pack_i16_s1", "vec_pack_i16_s3"}
+        for s in specs:
+            assert "set_rounding" not in s.body  # pack does not round
+            assert "rnd" not in s.golden["filt"]
+
+    def test_convert_sweep_is_rounding_only_normals(self):
+        from vector_kernel_specs import SWEEPS
+        specs = SWEEPS["vec_conv_bf16_sweep"].expand()
+        assert len(specs) == 10  # 10 rounding modes, no saturation axis
+        for s in specs:
+            assert "set_saturation" not in s.body
+            assert s.golden.get("predicate") is not None  # normals-only
+
+    def test_ups_sweep_two_sat_modes_no_symmetric(self):
+        from vector_kernel_specs import SWEEPS
+        specs = SWEEPS["vec_ups_i32_sweep"].expand()
+        assert {s.name for s in specs} == {"vec_ups_i32_s0", "vec_ups_i32_s1"}
+        for s in specs:
+            assert "sym_sat" not in s.golden["filt"]  # ups corpus has no such column
+
+    def test_every_sweep_point_has_a_resolvable_golden_slice_that_fits(self):
+        """No mode-point names an empty golden slice, and every slice fits its
+        buffer N (so bake_array never silently truncates a mode's records)."""
+        from gen_vector_kernel import select_records
+        from vector_kernel_specs import SWEEPS
+        for sname, sweep in SWEEPS.items():
+            for spec in sweep.expand():
+                g = spec.golden
+                recs = select_records(GOLDEN[g["class"]], g["filt"],
+                                      g.get("value_range"),
+                                      predicate=g.get("predicate"))
+                assert recs, f"{spec.name}: golden slice is empty"
+                assert len(recs) <= spec.n, \
+                    f"{spec.name}: {len(recs)} records > N={spec.n}"
+
+    def test_sweep_kernel_generates_four_files(self, tmp_path):
+        from gen_vector_kernel import generate
+        from vector_kernel_specs import SWEEPS
+        spec = SWEEPS["vec_srs_i32_sweep"].expand()[0]
+        outdir = generate(spec, GOLDEN, tmp_path)
+        for fn in ["run.lit", "aie.mlir", "test.cpp", "srs.cc"]:
+            assert (Path(outdir) / fn).is_file(), f"missing {fn}"
+
+
+class TestOutputDump(unittest.TestCase):
+    def setUp(self):
+        import os
+        gp = os.path.join(os.path.dirname(gen.__file__), "golden", "vector_ops.json")
+        self.golden = json.loads(open(gp).read())
+
+    def test_elementwise_harness_dumps_out_txt(self):
+        from vector_kernel_specs import SPECS
+        cpp = gen.render_test_cpp(SPECS["vec_srs_i32"], self.golden)
+        self.assertIn('std::ofstream', cpp)
+        self.assertIn('"out.txt"', cpp)
+        self.assertIn('for (int i = 0; i < N; i++)', cpp)
+
+    def test_matmul_harness_dumps_out_txt(self):
+        from vector_kernel_specs import SPECS
+        cpp = gen.render_test_cpp(SPECS["vec_mac_i8"], self.golden)
+        self.assertIn('std::ofstream', cpp)
+        self.assertIn('"out.txt"', cpp)
+
+
+class TestSiliconGoldenSource:
+    def test_silicon_field_defaults_none(self):
+        spec = gen.KernelSpec(name="x", func="x", doc="",
+                              inputs=[gen.Buf("in","int16_t","i16")],
+                              output=gen.Buf("out","int16_t","i16"), n=4,
+                              golden={"class":"srs","filt":{}}, body="")
+        assert spec.silicon_golden is None
+
+    def test_bootstrap_bakes_model_when_no_silicon_file(self):
+        from vector_kernel_specs import SWEEPS
+        pt = SWEEPS["vec_conv_bf16_edge_sweep"].expand()[0]
+        miss = gen.replace_silicon(pt, "/nonexistent.json")
+        in_vals, exp_vals = gen._bake_io(miss, GOLDEN)
+        assert len(exp_vals) == pt.n
+
+    def test_silicon_file_overrides_exp_keeps_inputs(self, tmp_path):
+        from vector_kernel_specs import SWEEPS
+        pt = SWEEPS["vec_conv_bf16_edge_sweep"].expand()[0]
+        in_model, _ = gen._bake_io(gen.replace_silicon(pt, None), GOLDEN)
+        sj = {"kernel": pt.name, "n": pt.n, "input": in_model,
+              "silicon": [0xDEAD]*pt.n, "model": [0]*pt.n, "divergences": []}
+        path = tmp_path / "sj.json"
+        path.write_text(json.dumps(sj))
+        in_vals, exp_vals = gen._bake_io(gen.replace_silicon(pt, str(path)), GOLDEN)
+        assert exp_vals == [0xDEAD]*pt.n
+        assert in_vals == in_model
+
+    def test_sweep_assigns_silicon_path_per_point(self):
+        from vector_kernel_specs import SWEEPS
+        for pt in SWEEPS["vec_conv_bf16_edge_sweep"].expand():
+            assert pt.silicon_golden is not None
+            assert pt.name in pt.silicon_golden
+
+
+class TestEdgeSpecs:
+    def test_convert_edge_sweep_is_ten_points(self):
+        from vector_kernel_specs import SWEEPS
+        pts = SWEEPS["vec_conv_bf16_edge_sweep"].expand()
+        assert len(pts) == 10
+        assert {p.name for p in pts} == {f"vec_conv_bf16_edge_r{r}" for r in (0,1,2,3,8,9,10,11,12,13)}
+
+    def test_convert_edge_inputs_all_nonnormal(self):
+        from vector_kernel_specs import SWEEPS, _is_normal_f32
+        pt = SWEEPS["vec_conv_bf16_edge_sweep"].expand()[0]
+        in_vals, _ = gen._bake_io(gen.replace_silicon(pt, None), GOLDEN)
+        for v in in_vals:
+            assert not _is_normal_f32({"value": v}), f"{v:#x} normal"
+
+    def test_convert_edge_slice_fits_buffer(self):
+        from vector_kernel_specs import SWEEPS
+        pt = SWEEPS["vec_conv_bf16_edge_sweep"].expand()[0]
+        recs = gen.select_records(GOLDEN["bf16_srs"], pt.golden["filt"],
+                                  predicate=pt.golden["predicate"])
+        assert len(recs) <= pt.n
+        assert len(recs) > 0
+
+    def test_mac_ovf_selects_overflow_tiles(self):
+        from vector_kernel_specs import SPECS, _has_overflow_expected
+        spec = SPECS["vec_mac_bf16_ovf"]
+        recs = gen.select_records(GOLDEN["matmul"], spec.golden["filt"],
+                                  predicate=spec.golden["predicate"])
+        assert len(recs) >= spec.matmul.batch
+        for r in recs[:spec.matmul.batch]:
+            assert _has_overflow_expected(r)
+
+
+class TestDirectInput(unittest.TestCase):
+    """A spec whose `golden` carries a DirectIO sources its inputs and bootstrap
+    reference straight from the spec, bypassing the model corpus -- for kernels
+    (bf16 denormal convert) whose oracle is silicon and whose input space no
+    corpus class produces. The silicon-override block runs on top of the direct
+    path unchanged: a present capture overrides the expected array, gated by an
+    input-alignment cross-check."""
+
+    @staticmethod
+    def _direct_spec():
+        return KernelSpec(
+            name="vec_conv_bf16_direct",
+            func="conv_bf16",
+            doc="direct-input convert.",
+            inputs=[Buf("in", "uint16_t", "bf16", ktype="bfloat16")],
+            output=Buf("out", "uint32_t", "f32", ktype="float"),
+            n=4,
+            golden={"class": "direct",
+                    "direct": DirectIO(
+                        inputs=(1, 2, 0x8001, 0),
+                        reference=(0x10000, 0x20000, 0x80010000, 0))},
+            body="  // body\n",
+        )
+
+    def test_direct_bypasses_corpus(self):
+        # Empty corpus proves the class is never consulted on the direct path.
+        in_vals, exp_vals = gen._bake_io(self._direct_spec(), {})
+        self.assertEqual(in_vals, [1, 2, 0x8001, 0])
+        self.assertEqual(exp_vals, [0x10000, 0x20000, 0x80010000, 0])
+
+    def test_direct_silicon_overrides_reference(self):
+        spec = self._direct_spec()
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "sj.json")
+            with open(path, "w") as f:
+                json.dump({"input": [1, 2, 0x8001, 0],
+                           "silicon": [0, 0, 0x80000000, 0]}, f)
+            in_vals, exp_vals = gen._bake_io(gen.replace_silicon(spec, path), {})
+        self.assertEqual(in_vals, [1, 2, 0x8001, 0])
+        self.assertEqual(exp_vals, [0, 0, 0x80000000, 0])
+
+    def test_direct_wrong_length_raises(self):
+        # A direct spec whose tuples don't match n must fail loudly, the same
+        # anti-silent-truncation guard bake_array gives the corpus path.
+        spec = dataclasses.replace(
+            self._direct_spec(),
+            golden={"class": "direct",
+                    "direct": DirectIO(inputs=(1, 2, 3),
+                                       reference=(1, 2, 3))})
+        with self.assertRaises(AssertionError):
+            gen._bake_io(spec, {})
+
+
 class TestKernelHeaderFormatting:
     def test_ruler_line_is_eighty_columns(self):
         """The kernel.cc header ruler matches the 80-col LLVM convention
@@ -381,3 +664,43 @@ class TestKernelHeaderFormatting:
         assert len(first) == 80, f"ruler is {len(first)} cols: {first!r}"
         assert first.startswith("//===- srs.cc ")
         assert first.endswith("*- C++ -*-===//")
+
+
+class TestConvertFtzAuditSpecs(unittest.TestCase):
+    """The two bf16 convert FTZ-audit capture kernels (Half-B phase C). Both
+    sweep the exhaustive bf16-denormal input space (all 254 denormals + +/-0)
+    via DirectIO, so their oracle is silicon and their bootstrap reference is
+    the no-FTZ widen/floor. vec_vfloor_bf16_denorm is the real audit test: a
+    standalone VFLOOR routes through vector_convert's bf16->int32 FTZ, so a
+    negative denormal floors to -1 without FTZ (vs 0 with it)."""
+
+    def test_audit_specs_generate_with_direct_denorm_inputs(self):
+        import vector_kernel_specs as vks
+        for name in ("vec_convexp_bf16_denorm", "vec_vfloor_bf16_denorm"):
+            spec = vks.SPECS[name]
+            d = spec.golden["direct"]
+            # 254 denormals + 2 zeros, exhaustive, length 256.
+            self.assertEqual(len(d.inputs), 256)
+            self.assertEqual(len(d.reference), 256)
+            # negative bf16 denormal present (the FTZ discriminator).
+            self.assertIn(0x8001, d.inputs)
+            # bootstrap bake (no silicon json) returns the direct arrays.
+            in_vals, exp_vals = gen._bake_io(gen.replace_silicon(spec, None), {})
+            self.assertEqual(in_vals, list(d.inputs))
+            self.assertEqual(exp_vals, list(d.reference))
+
+    def test_vfloor_reference_floors_negative_denormal_to_minus_one(self):
+        import vector_kernel_specs as vks
+        spec = vks.SPECS["vec_vfloor_bf16_denorm"]
+        d = spec.golden["direct"]
+        idx = d.inputs.index(0x8001)            # tiny negative denormal
+        self.assertEqual(d.reference[idx], -1)  # floor(-tiny) = -1, signed (no FTZ)
+        idx0 = d.inputs.index(0x0001)           # tiny positive denormal
+        self.assertEqual(d.reference[idx0], 0)  # floor(+tiny) = 0
+
+    def test_convexp_reference_widens_denormal_without_flush(self):
+        import vector_kernel_specs as vks
+        spec = vks.SPECS["vec_convexp_bf16_denorm"]
+        d = spec.golden["direct"]
+        idx = d.inputs.index(0x0001)
+        self.assertEqual(d.reference[idx], 0x00010000)  # widened f32 denormal, not flushed
