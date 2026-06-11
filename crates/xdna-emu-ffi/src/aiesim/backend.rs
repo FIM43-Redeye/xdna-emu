@@ -327,6 +327,10 @@ fn flush_host_to_bridge(host: &HostMemory, bridge: &mut dyn BridgeAbi) {
     for region in host.regions() {
         let mut bytes = vec![0u8; region.size];
         host.read_bytes(region.base_address, &mut bytes);
+        if std::env::var("XDNA_AIESIM_FLUSH_DEBUG").is_ok() {
+            let nz = bytes.iter().filter(|&&b| b != 0).count();
+            eprintln!("[FLUSH h->b] base=0x{:x} size={} nonzero={nz}", region.base_address, region.size);
+        }
         let _ = bridge.write_gm(region.base_address, &bytes);
     }
 }
@@ -339,7 +343,12 @@ fn flush_bridge_to_host(host: &mut HostMemory, bridge: &mut dyn BridgeAbi) {
     let regions: Vec<(u64, usize)> = host.regions().iter().map(|r| (r.base_address, r.size)).collect();
     for (base, size) in regions {
         let mut bytes = vec![0u8; size];
-        if bridge.read_gm(base, &mut bytes) == BridgeStatus::Ok {
+        let st = bridge.read_gm(base, &mut bytes);
+        if std::env::var("XDNA_AIESIM_FLUSH_DEBUG").is_ok() {
+            let nz = bytes.iter().filter(|&&b| b != 0).count();
+            eprintln!("[FLUSH b->h] base=0x{base:x} size={size} status={st:?} nonzero={nz}");
+        }
+        if st == BridgeStatus::Ok {
             host.write_bytes(base, &bytes);
         }
     }
