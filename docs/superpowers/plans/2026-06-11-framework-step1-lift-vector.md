@@ -745,3 +745,71 @@ Generated using Claude Code."
 **Placeholder scan:** every code step shows complete code or an exact mechanical-substitution list; moved code is identified by symbol + source line, not reproduced where reproduction adds nothing. No "TBD"/"handle edge cases"/"similar to".
 
 **Type consistency:** `CampaignOptions` fields match `VecFuzzOptions` (iterations, seed, jobs, hw, max_cycles, target_hits, verbose, report_only, replay, reverify). `Domain::Obs` = vector's `VecObs { output, trace, executed }`. `compare -> Option<String>` (divergent key) is consumed identically by `run_campaign`. `Banked<C, O>` carries `case`/`reference`/`keys`, all consumed in the replay arm. `dom.name()` = `"vector"` keeps `build/fuzz-vector` and `phoenix-survival/vector` paths.
+
+---
+
+## Outcome (2026-06-11 -- Step 1 complete, fidelity byte-identical)
+
+All six tasks landed subagent-driven (fresh implementer per task; the two
+substantive tasks got the full spec + code-quality two-stage review). `cargo
+test --lib` held at **3421 passed / 0 failed / 6 ignored** through every task
+(3421 = pre-Step-1 3420 + the one `Domain` mock test). Clean build, zero
+warnings throughout.
+
+**Commits (in order):**
+- `f0569f2d` -- Task 1: lift toolchain infra into `core/toolchain`.
+- `80d121e6` -- Task 2: lift `Ledger` into `core/`, decouple from the op table
+  (universe parameterized; `table_version` hash byte-preserved).
+- `7da58f21` -- Task 3: add the `Domain` trait, `Backend`, `CampaignOptions`,
+  `Banked` (mock-tested).
+- `b57dc929` -- Task 4: re-express the vector fuzzer as `VectorDomain`.
+- `0a875c8b` -- Task 4 correction (from the implementer's own escalation +
+  review): `compare()` takes the coverage **keys**, not the case, so the
+  durable-bank replay path stays table-independent (it had regressed to
+  live-table types); `bank()` draws the executed-op list from the EMU
+  observation, not the HW reference. Both restore exact pre-refactor behavior.
+- `a27d5dc7` -- Task 4 polish: restored the "stale zeros" rationale comment in
+  `observe` (code-quality review nit).
+- `90dc2405` -- Task 5: lift the campaign + replay loops into the generic
+  `core::engine::run_campaign<D: Domain>`; `run_vector_fuzz` is now a 17-line
+  wrapper; `VecFuzzOptions` re-exports `CampaignOptions` (CLI unchanged).
+- `9185c14d` -- Task 5 polish: `Domain::name` doc accuracy nit.
+
+**Design refinements made during execution (within the approved framework):**
+1. `compare(emu, reference, keys: &[String])` -- keys, not the case. Unifies the
+   campaign and replay comparators onto one table-independent path (campaign
+   passes live `coverage_keys`, replay passes banked keys). This is strictly
+   better than the original plan's `compare(.., case)` and was forced by the
+   table-independence requirement the durable-bank format (#118) exists to keep.
+2. `dump_divergent_observation(case_dir, &Obs)` -- a **defaulted no-op** trait
+   hook (the agreed resolution to the replay seam where the engine must persist
+   the EMU output but `Obs` is opaque). Keeps the engine 100% domain-agnostic;
+   vector overrides it to write `emu_output.bin`. Chosen over a `-> &[u8]`
+   accessor precisely to preserve the opaque-`Obs` invariant (a DMA/timing
+   observation has no single natural byte payload).
+3. `Sync` bounds (`D: Domain + Sync, D::Case: Sync`) live on `run_campaign`'s
+   signature, NOT on the `Domain` trait -- they are a property of the parallel
+   compile pool, not of being a domain. `Send` is not needed (the scope threads
+   borrow shared refs; no owned `D::Case` crosses the boundary).
+
+**Regression gate (offline, release binary):**
+- `fuzz-vector --report`: universe **218**, covered **218**, uncovered **0**,
+  divergent **0**, resolved **6** -- identical to the pre-refactor ledger.
+- `fuzz-vector --replay ~/npu-work/experiments/phoenix-survival/vector`:
+  **24 match, 0 divergent, 0 error** -- bit-identical EMU output to the
+  post-#114 baseline.
+
+**Documented cosmetic deltas (no functional impact -- counters, ledger,
+banking, replay verdicts, and exit codes are all byte-identical):**
+- Verbose `--no-hw` smoke logging lost its `({} bytes, {} vector ops executed)`
+  detail (now just `emu ok`), forced by `Obs` opacity. Behind both `-v` and
+  `--no-hw`; touches no credited path. Accepted rather than add a trait method
+  to restore a debug line (code-quality reviewer concurred).
+- The generic engine still prints "Vector"-flavored strings ("Vector fuzz:",
+  "chains executed no vector ops"). Faithfully preserved from the original (not
+  a defect); a second tenant would mis-label. Genericize via `dom.name()` /
+  a domain log hook in **Step 2**, where changing the strings is in-scope.
+
+**Carried to Step 2:** the `domains/{vector,scalar}/` directory regrouping (this
+step kept `vector/` in place); porting the scalar fuzzer as tenant 2 (the real
+stress test of the trait); and the engine log-string genericization above.
