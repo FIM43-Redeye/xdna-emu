@@ -233,9 +233,6 @@ pub(crate) fn compile_kernel_case(
 /// Compile a pre-written `case_dir/aie.mlir` to xclbin + insts via aiecc.py only
 /// (no Peano kernel object, no fuzz_template). Used by the DMA domain's
 /// `compile` override. Mirrors `compile_kernel_case`'s aiecc step exactly.
-// Consumed by the DMA domain's `Domain::compile` override (a later subtask);
-// the seam ships first so vector/scalar stay byte-identical.
-#[allow(dead_code)]
 pub(crate) fn compile_dma_mlir(tools: &ToolPaths, case_dir: &Path) -> Result<(), String> {
     let xclbin = case_dir.join("aie.xclbin");
     let mlir = case_dir.join("aie.mlir");

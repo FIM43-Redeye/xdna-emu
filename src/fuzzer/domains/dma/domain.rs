@@ -1,5 +1,5 @@
-//! DmaDomain: observation, buffer spec, localization (first half). Banking +
-//! impl Domain land in the next task. Mirrors scalar/domain.rs.
+//! DmaDomain: observation, buffer spec, localization, banking, and the
+//! `impl Domain`. Mirrors scalar/domain.rs.
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
