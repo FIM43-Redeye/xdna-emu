@@ -143,13 +143,36 @@ fn lower_shim(chain: &DmaChain) -> String {
     m
 }
 
+/// Render `, [<const_pad_before = b, const_pad_after = a>, ...]` or empty.
+fn pad_list(p: &BdPattern) -> String {
+    if p.pad_before.is_empty() {
+        return String::new();
+    }
+    let dims: Vec<String> = p
+        .pad_before
+        .iter()
+        .zip(&p.pad_after)
+        .map(|(b, a)| format!("<const_pad_before = {b}, const_pad_after = {a}>"))
+        .collect();
+    format!(", [{}]", dims.join(", "))
+}
+
 /// Memtile topology: the fuzzed access pattern rides a raw `aie.memtile_dma`
 /// static BD; the shim runs linear transfers in the runtime_sequence.
 ///
 /// Single-transfer by construction (gen forces N=1 for memtile -- see the guard
 /// in `gen::generate`). The transfer's direction decides which memtile BD (S2MM
 /// or MM2S) carries the fuzzed n-D pattern; the other memtile BD is linear.
-/// Shape verified against `build/experiments/dma-spike/memtile_strided/aie.mlir`.
+///
+/// Three emission forms compose on the memtile MM2S BD:
+/// - n-D access pattern (strided2d/3d/4d/transpose/overlap): rides the dma_bd
+///   `[<size, stride>...]` list, verified vs `strided4d_memtile/aie.mlir`.
+/// - packet (MM2S-only by gating): a top-level `aie.packet_flow` replaces the
+///   memtile->shim circuit flow, and the BD carries a `{packet = ...}` attribute,
+///   verified vs `packet_mm2s/aie.mlir`.
+/// - padding (MM2S-only by gating): the BD carries a `[<const_pad_before, ...>]`
+///   list and the padded `out_elems` length; the S2MM recv stays linear at the
+///   un-padded `in_elems`, verified vs `memtile_pad2d/aie.mlir`.
 fn lower_memtile(chain: &DmaChain) -> String {
     assert_eq!(
         chain.transfers.len(),
@@ -161,14 +184,28 @@ fn lower_memtile(chain: &DmaChain) -> String {
     let elem = chain.dtype.mlir_elem();
     let in_words = chain.in_words();
     let out_words = chain.out_words();
-    let l = t.in_elems; // memtile BD region length (no padding this task)
 
     // Direction routes the fuzzed pattern onto the matching memtile BD; the
-    // opposite memtile BD stays linear (empty access list).
+    // opposite memtile BD stays linear (empty access list). Padding rides only
+    // the MM2S BD (gating guarantees pad => MM2S), where it grows the streamed
+    // length to the padded total `out_elems`; the S2MM recv always lands the
+    // un-padded `in_elems` of data into the buffer.
     let pat = pattern_list(&t.pattern);
-    let (s2mm_pat, mm2s_pat) = match t.dir {
-        Direction::Mm2s => (String::new(), pat),
-        Direction::S2mm => (pat, String::new()),
+    let pad = pad_list(&t.pattern);
+    let (s2mm_bd, mm2s_bd) = match t.dir {
+        // Fuzzed pattern (+ optional padding) on MM2S; S2MM linear, un-padded.
+        Direction::Mm2s => (format!("0, {}", t.in_elems), format!("0, {}{pat}{pad}", t.out_elems)),
+        // Fuzzed pattern on S2MM; MM2S linear. Padding never occurs here.
+        Direction::S2mm => (format!("0, {}{pat}", t.in_elems), format!("0, {}", t.out_elems)),
+    };
+
+    // Packet (memtile MM2S-only by gating) rides the dma_bd ATTRIBUTE, not the
+    // op signature; it also turns the memtile->shim circuit flow into a
+    // packet_flow (both on one static path is contradictory).
+    let packet = t.pattern.packet;
+    let mm2s_attr = match packet {
+        Some((id, ty)) => format!(" {{packet = #aie.packet_info<pkt_type = {ty}, pkt_id = {id}>}}"),
+        None => String::new(),
     };
 
     let mut m = String::new();
@@ -177,7 +214,16 @@ fn lower_memtile(chain: &DmaChain) -> String {
     m.push_str("    %tile_0_0 = aie.tile(0, 0)\n");
     m.push_str("    %tile_0_1 = aie.tile(0, 1)\n");
     m.push_str("    aie.flow(%tile_0_0, DMA : 0, %tile_0_1, DMA : 0)\n");
-    m.push_str("    aie.flow(%tile_0_1, DMA : 0, %tile_0_0, DMA : 0)\n");
+    if let Some((id, _ty)) = packet {
+        // Packet rides the memtile->shim DMA:0 port: replace that circuit flow
+        // with a packet_flow. The forward shim->memtile leg stays circuit.
+        m.push_str(&format!("    aie.packet_flow({id}) {{\n"));
+        m.push_str("      aie.packet_source<%tile_0_1, DMA : 0>\n");
+        m.push_str("      aie.packet_dest<%tile_0_0, DMA : 0>\n");
+        m.push_str("    }\n");
+    } else {
+        m.push_str("    aie.flow(%tile_0_1, DMA : 0, %tile_0_0, DMA : 0)\n");
+    }
 
     // Memtile static block: S2MM recv into a buffer, MM2S read back out. One of
     // the two BDs carries the fuzzed pattern (per direction above).
@@ -190,14 +236,14 @@ fn lower_memtile(chain: &DmaChain) -> String {
     m.push_str("      %0 = aie.dma_start(S2MM, 0, ^s2mm, ^mm2s_entry)\n");
     m.push_str("    ^s2mm:\n");
     m.push_str("      aie.use_lock(%prod, AcquireGreaterEqual, 1)\n");
-    m.push_str(&format!("      aie.dma_bd(%buf : memref<{out_words}x{elem}>, 0, {l}{s2mm_pat})\n"));
+    m.push_str(&format!("      aie.dma_bd(%buf : memref<{out_words}x{elem}>, {s2mm_bd})\n"));
     m.push_str("      aie.use_lock(%cons, Release, 1)\n");
     m.push_str("      aie.next_bd ^s2mm\n");
     m.push_str("    ^mm2s_entry:\n");
     m.push_str("      %1 = aie.dma_start(MM2S, 0, ^mm2s, ^end)\n");
     m.push_str("    ^mm2s:\n");
     m.push_str("      aie.use_lock(%cons, AcquireGreaterEqual, 1)\n");
-    m.push_str(&format!("      aie.dma_bd(%buf : memref<{out_words}x{elem}>, 0, {l}{mm2s_pat})\n"));
+    m.push_str(&format!("      aie.dma_bd(%buf : memref<{out_words}x{elem}>, {mm2s_bd}){mm2s_attr}\n"));
     m.push_str("      aie.use_lock(%prod, Release, 1)\n");
     m.push_str("      aie.next_bd ^mm2s\n");
     m.push_str("    ^end:\n");
@@ -328,6 +374,63 @@ mod tests {
     #[ignore]
     fn memtile_strided_s2mm_compiles() {
         compile_one("strided2d/memtile/s2mm/I16", 22);
+    }
+
+    #[test]
+    fn memtile_packet_on_bd_attribute() {
+        let c = generate(30, "packet/memtile/mm2s/I32");
+        let m = lower_chain(&c);
+        assert!(m.contains("{packet = #aie.packet_info<pkt_type ="), "memtile packet on bd attr:\n{m}");
+        assert!(m.contains("aie.packet_flow("));
+    }
+
+    #[test]
+    fn memtile_padding_uses_const_pad_and_grows_output() {
+        let c = generate(31, "padboth/memtile/mm2s/I8");
+        let m = lower_chain(&c);
+        assert!(m.contains("const_pad_before"), "padding list missing:\n{m}");
+        assert!(c.transfers.iter().any(|t| t.out_elems > t.in_elems), "padded output must grow");
+    }
+
+    #[test]
+    #[ignore]
+    fn memtile_strided3d_compiles() {
+        compile_one("strided3d/memtile/mm2s/I32", 32);
+    }
+    #[test]
+    #[ignore]
+    fn memtile_strided4d_compiles() {
+        compile_one("strided4d/memtile/mm2s/I32", 33);
+    }
+    #[test]
+    #[ignore]
+    fn memtile_transpose_compiles() {
+        compile_one("transpose/memtile/s2mm/I16", 34);
+    }
+    #[test]
+    #[ignore]
+    fn memtile_overlap_compiles() {
+        compile_one("overlap/memtile/mm2s/I8", 35);
+    }
+    #[test]
+    #[ignore]
+    fn memtile_packet_compiles() {
+        compile_one("packet/memtile/mm2s/I32", 36);
+    }
+    #[test]
+    #[ignore]
+    fn memtile_padbefore_compiles() {
+        compile_one("padbefore/memtile/mm2s/I8", 37);
+    }
+    #[test]
+    #[ignore]
+    fn memtile_padafter_compiles() {
+        compile_one("padafter/memtile/mm2s/I16", 38);
+    }
+    #[test]
+    #[ignore]
+    fn memtile_padboth_compiles() {
+        compile_one("padboth/memtile/mm2s/I32", 39);
     }
 
     #[test]

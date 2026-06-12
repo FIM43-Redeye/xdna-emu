@@ -51,8 +51,18 @@ fn build_pattern(
         Engine::Shim => SHIM_STEP_MAX,
         Engine::Memtile => MEMTILE_STEP_MAX,
     };
-    let word = match engine {
-        Engine::Shim => (4 / dtype.byte_size()).max(1),
+    // `word` = elements per 32-bit word (I32->1, I16->2, I8->4). Two distinct
+    // constraints reference it:
+    //   - Shim NoC outer-stride alignment (4-byte): strided2d/3d/overlap below
+    //     scale their non-innermost strides by `shim_word`, which is `word` on
+    //     the shim and 1 on the memtile (element-granular -- those features
+    //     already have innermost stride 1 there, so no scaling is needed).
+    //   - Memtile sub-32-bit BD rules reference `word` directly on BOTH engines:
+    //     transpose's innermost dim must be a stride-1 word-run, and inner-axis
+    //     padding counts must be 32-bit-word-aligned.
+    let word = (4 / dtype.byte_size()).max(1);
+    let shim_word = match engine {
+        Engine::Shim => word,
         Engine::Memtile => 1,
     };
     let split2 = |rng: &mut Xorshift64, n: usize| -> (usize, usize) {
@@ -81,12 +91,13 @@ fn build_pattern(
             p
         }
         Feature::Strided2d => {
-            // Non-innermost stride is b; require b to be a multiple of `word`
-            // (shim word-addressing). region and word are powers of two, so split
-            // `region/word` units then scale: b = (region/a) stays word-aligned.
-            let units = (region / word).max(1);
+            // Non-innermost stride is b; on the shim require b to be a multiple of
+            // `shim_word` (NoC word-addressing). region and shim_word are powers of
+            // two, so split `region/shim_word` units then scale: b = (region/a)
+            // stays word-aligned. On the memtile shim_word == 1 (no constraint).
+            let units = (region / shim_word).max(1);
             let (a, bu) = split2(rng, units);
-            let b = bu * word;
+            let b = bu * shim_word;
             BdPattern {
                 sizes: vec![a as u32, b as u32],
                 strides: vec![clamp(b as u32), 1],
@@ -97,10 +108,12 @@ fn build_pattern(
         }
         Feature::Transpose => {
             if word > 1 {
-                // Word-granular transpose: innermost `word`-sized contiguous run
-                // (stride 1, exempt); outer strides `word` and `b*word` are both
-                // multiples of `word`. A genuine transpose of 4-byte words that
-                // fits the shim's 3-dim cap. b*a*word == region.
+                // Word-granular transpose (I8/I16, BOTH engines): innermost
+                // `word`-sized contiguous run (stride 1) -- satisfies the shim's
+                // 4-byte rule AND the memtile's sub-32-bit innermost-stride-1
+                // rule; outer strides `word` and `b*word` are multiples of `word`.
+                // 3 dims fits both the shim's 3-dim and memtile's 4-dim caps.
+                // b*a*word == region.
                 let units = (region / word).max(1);
                 let (b, a) = split2(rng, units);
                 BdPattern {
@@ -122,15 +135,17 @@ fn build_pattern(
             }
         }
         Feature::Strided3d => {
-            // Non-innermost strides are b*c and c; require c (hence b*c) to be a
-            // multiple of `word`. Split `region/word` units, then scale c by word.
-            let units = (region / word).max(1);
+            // Non-innermost strides are b*c and c; on the shim require c (hence
+            // b*c) to be a multiple of `shim_word`. Split `region/shim_word`
+            // units, then scale c by shim_word. Memtile: shim_word == 1 (the
+            // innermost stride is already 1, no further constraint).
+            let units = (region / shim_word).max(1);
             let (a, bc) = split2(rng, units);
             let (b, _c0) = split2(rng, bc.max(2));
             let a = a.max(1);
             let b = b.max(1);
             let cu = (units / (a * b)).max(1);
-            let c = cu * word;
+            let c = cu * shim_word;
             BdPattern {
                 sizes: vec![a as u32, b as u32, c as u32],
                 strides: vec![clamp((b * c) as u32), clamp(c as u32), 1],
@@ -151,18 +166,19 @@ fn build_pattern(
             }
         }
         Feature::Overlap => {
-            // Split `region/word` units so the inner run b is a multiple of
-            // `word` and large enough to admit a word-aligned overlapping stride
-            // (stride a multiple of `word`, 0 < stride < b). For word>1 this also
-            // keeps b's stride contiguity word-granular.
-            let units = (region / word).max(1);
+            // Split `region/shim_word` units so the inner run b is a multiple of
+            // `shim_word` and large enough to admit a word-aligned overlapping
+            // stride (a multiple of `shim_word`, 0 < stride < b). On the shim this
+            // keeps the outer stride NoC-word-aligned; on the memtile shim_word
+            // == 1 (innermost stride is 1, no constraint).
+            let units = (region / shim_word).max(1);
             let (a, bu) = split2(rng, units);
-            let b = bu * word;
-            // Overlapping outer stride: ~b/2 rounded to a multiple of `word`,
-            // clamped to [word, b-word] so it stays strictly below b and overlaps.
-            let mut stride = ((b / 2) / word).max(1) * word;
+            let b = bu * shim_word;
+            // Overlapping outer stride: ~b/2 rounded to a multiple of `shim_word`,
+            // clamped to [shim_word, b-shim_word] so it stays strictly below b.
+            let mut stride = ((b / 2) / shim_word).max(1) * shim_word;
             if stride >= b {
-                stride = b.saturating_sub(word).max(word);
+                stride = b.saturating_sub(shim_word).max(shim_word);
             }
             BdPattern {
                 sizes: vec![a as u32, b as u32],
@@ -174,11 +190,19 @@ fn build_pattern(
         }
         Feature::PadBefore | Feature::PadAfter | Feature::PadBoth => {
             let (a, b) = split2(rng, region);
-            let pad = 2u32;
+            // 2D pattern [a, b]; pad lists are [outer, inner]. The memtile BD
+            // requires the INNERMOST (last) pad count to be 32-bit-word-aligned:
+            // `inner_pad * byte_size % 4 == 0`. `word` (elems per 32-bit word) is
+            // I32->1, I16->2, I8->4 -- so `inner_pad = word` gives 4 bytes exactly
+            // for I16/I8. For I32 (word==1) keep 2 for parity with the spike;
+            // 2 elems * 4B = 8B, still word-aligned. Outer-axis pad is
+            // unconstrained, stays 2.
+            let outer_pad = 2u32;
+            let inner_pad = if word == 1 { 2 } else { word as u32 };
             let (pb, pa) = match feature {
-                Feature::PadBefore => (vec![pad, pad], vec![0, 0]),
-                Feature::PadAfter => (vec![0, 0], vec![pad, pad]),
-                _ => (vec![pad, pad], vec![pad, pad]),
+                Feature::PadBefore => (vec![outer_pad, inner_pad], vec![0, 0]),
+                Feature::PadAfter => (vec![0, 0], vec![outer_pad, inner_pad]),
+                _ => (vec![outer_pad, inner_pad], vec![outer_pad, inner_pad]),
             };
             BdPattern {
                 sizes: vec![a as u32, b as u32],
@@ -346,6 +370,32 @@ mod tests {
                             "seed{i} key{key}: non-innermost stride {st} (dim {d}) * {bs}B not 4-aligned"
                         );
                     }
+                }
+                let bs = c.dtype.byte_size();
+                // Memtile sub-32-bit rule: the innermost (last) data-dim stride
+                // must be 1 (contiguous word-run); aiecc rejects otherwise.
+                if t.engine == Engine::Memtile && bs < 4 {
+                    assert_eq!(
+                        *p.strides.last().unwrap(),
+                        1,
+                        "seed{i} key{key}: memtile sub-32b innermost stride must be 1"
+                    );
+                }
+                // Padding rule (memtile MM2S): each innermost pad count must be
+                // 32-bit-word-aligned in bytes.
+                if !p.pad_before.is_empty() {
+                    let pin_b = *p.pad_before.last().unwrap() as usize;
+                    let pin_a = *p.pad_after.last().unwrap() as usize;
+                    assert_eq!(
+                        (pin_b * bs) % 4,
+                        0,
+                        "seed{i} key{key}: inner pad_before {pin_b} * {bs}B not 4-aligned"
+                    );
+                    assert_eq!(
+                        (pin_a * bs) % 4,
+                        0,
+                        "seed{i} key{key}: inner pad_after {pin_a} * {bs}B not 4-aligned"
+                    );
                 }
                 assert_eq!(t.out_elems, t.in_elems + p.pad_elems());
             }
