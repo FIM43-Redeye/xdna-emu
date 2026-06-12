@@ -124,6 +124,38 @@ pub(crate) fn observe_impl(
     }
 }
 
+/// The region (localizable) keys: coverage keys that are not the case-level
+/// loop-style key. Order-preserving, so `region_keys(keys)[k]` is stage k's key.
+pub(crate) fn region_keys(keys: &[String]) -> Vec<String> {
+    keys.iter().filter(|k| !k.starts_with("loop_")).cloned().collect()
+}
+
+/// First differing output region between two buffers split into `n` equal
+/// regions, or `None` if equal. Exact-byte (scalar is integer; no tolerance).
+/// A length mismatch counts as a divergence at the first region past the
+/// common length.
+pub(crate) fn first_divergent_region(emu: &[u8], hw: &[u8], n: usize) -> Option<usize> {
+    if n == 0 {
+        return if emu == hw { None } else { Some(0) };
+    }
+    let common = emu.len().min(hw.len());
+    let region_bytes = (common / n).max(1);
+    for r in 0..n {
+        let start = r * region_bytes;
+        let end = ((r + 1) * region_bytes).min(common);
+        if start >= end {
+            break;
+        }
+        if emu[start..end] != hw[start..end] {
+            return Some(r);
+        }
+    }
+    if emu.len() != hw.len() {
+        return Some((common / region_bytes).min(n.saturating_sub(1)));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +188,34 @@ mod tests {
         assert_eq!(elem_type(Dtype::I32), ElementType::I32);
         assert_eq!(elem_type(Dtype::I16), ElementType::I16);
         assert_eq!(elem_type(Dtype::I8), ElementType::I8);
+    }
+
+    #[test]
+    fn region_keys_filter_drops_loop_keys() {
+        let keys = vec!["add/I32".to_string(), "branch/I32".to_string(), "loop_hw/I32".to_string()];
+        assert_eq!(region_keys(&keys), vec!["add/I32".to_string(), "branch/I32".to_string()]);
+    }
+
+    #[test]
+    fn first_divergent_region_localizes_to_the_changed_region() {
+        // 3 regions of 8 bytes; corrupt a byte in region 1.
+        let n = 3;
+        let emu = vec![0xAAu8; n * 8];
+        let mut hw = emu.clone();
+        hw[8 + 3] ^= 0x40;
+        assert_eq!(first_divergent_region(&emu, &hw, n), Some(1));
+    }
+
+    #[test]
+    fn equal_buffers_do_not_diverge() {
+        let emu = vec![0x5Au8; 4 * 16];
+        assert_eq!(first_divergent_region(&emu, &emu.clone(), 4), None);
+    }
+
+    #[test]
+    fn length_mismatch_diverges() {
+        let emu = vec![0u8; 3 * 8];
+        let hw = vec![0u8; 2 * 8];
+        assert!(first_divergent_region(&emu, &hw, 3).is_some());
     }
 }
