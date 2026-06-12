@@ -8,6 +8,16 @@
 //! `out[k*region_len + i]`. Stage k's operands come from `in[i]`, an earlier
 //! register `t{j}` (j<k), or a literal -- the in-body stores crossing the loop
 //! back-edge preserve the AIE2 ZOL store-flush / recency catches.
+//!
+//! Signed-overflow UB (e.g. `mul`/`add`/`shl` on `INT_MIN`, or a negative left
+//! shift) is intentionally NOT avoided here: the differential compares two
+//! compilations of the *same* generated kernel (EMU vs HW silicon), so both
+//! sides execute identical UB and agree. We are not checking the kernel against
+//! a defined oracle, so overflow is sound for this purpose -- it is never the
+//! cause of a real divergence. (The one way it could bite: a future EMU/HW
+//! toolchain split that miscompiles the same UB differently; flagged here so a
+//! `mul/I32` divergence investigation starts by ruling that out, not chasing
+//! overflow in our model.)
 
 use super::chain::{LoopStyle, Operand, ScalarChain, ScalarStage, StageOp};
 
