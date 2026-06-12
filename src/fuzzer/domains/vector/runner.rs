@@ -4,7 +4,7 @@
 
 use crate::fuzzer::core::domain::CampaignOptions;
 use crate::fuzzer::core::engine::run_campaign;
-use crate::fuzzer::vector::domain::VectorDomain;
+use crate::fuzzer::domains::vector::domain::VectorDomain;
 
 /// Campaign knobs for the `fuzz-vector` subcommand. The vector runner reuses the
 /// generic engine's [`CampaignOptions`] verbatim; this alias keeps the CLI and

@@ -159,7 +159,7 @@ pub(crate) fn pool_bytes(rng: &mut Xorshift64, slots: usize, for_float: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fuzzer::vector::table::{universe_keys, VecType};
+    use crate::fuzzer::domains::vector::table::{universe_keys, VecType};
 
     /// Pick a deterministic pseudo-random target key for a seed.
     fn key_for_seed(universe: &[String], seed: u64) -> &str {

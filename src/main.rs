@@ -416,7 +416,7 @@ fn run_fuzz_command(args: &[String]) -> anyhow::Result<()> {
 fn run_fuzz_vector_command(args: &[String]) -> anyhow::Result<()> {
     let opts = xdna_emu::fuzzer::cli::parse_vector_fuzz_args(args)
         .map_err(|e| anyhow::anyhow!("fuzz-vector: {}", e))?;
-    xdna_emu::fuzzer::vector::runner::run_vector_fuzz(&opts);
+    xdna_emu::fuzzer::domains::vector::runner::run_vector_fuzz(&opts);
     Ok(())
 }
 

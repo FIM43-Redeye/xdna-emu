@@ -90,8 +90,8 @@ pub fn lower_chain(chain: &Chain) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fuzzer::vector::gen::{generate, Xorshift64};
-    use crate::fuzzer::vector::table::universe_keys;
+    use crate::fuzzer::domains::vector::gen::{generate, Xorshift64};
+    use crate::fuzzer::domains::vector::table::universe_keys;
 
     /// Same deterministic key pick as gen's tests.
     fn key_for_seed(universe: &[String], seed: u64) -> &str {

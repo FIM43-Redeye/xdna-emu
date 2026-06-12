@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use crate::fuzzer::runner::FuzzOptions;
-use crate::fuzzer::vector::runner::VecFuzzOptions;
+use crate::fuzzer::domains::vector::runner::VecFuzzOptions;
 
 /// Runaway-guard ceiling for emulator cycles per fuzz case. Fuzz kernels are
 /// tiny (buffers 16-256 elems, 2-8 ops), so this only bounds pathological runs.

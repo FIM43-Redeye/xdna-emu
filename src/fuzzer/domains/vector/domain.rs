@@ -8,12 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::fuzzer::core::domain::{Backend, Banked, Domain};
 use crate::fuzzer::core::toolchain::TRACE_BUFFER_ELEMENTS;
-use crate::fuzzer::vector::chain::{Chain, Stage};
-use crate::fuzzer::vector::gen::generate;
-use crate::fuzzer::vector::lower::lower_chain;
-use crate::fuzzer::vector::table::{universe_keys, VecType};
+use crate::fuzzer::domains::vector::chain::{Chain, Stage};
+use crate::fuzzer::domains::vector::gen::generate;
+use crate::fuzzer::domains::vector::lower::lower_chain;
+use crate::fuzzer::domains::vector::table::{universe_keys, VecType};
 #[cfg(test)]
-use crate::fuzzer::vector::table::table;
+use crate::fuzzer::domains::vector::table::table;
 use crate::interpreter::execute::fuzz_recorder;
 use crate::testing::test_cpp_parser::{BufferDef, BufferDir, BufferSpec, ElementType, InputPattern};
 use crate::testing::xclbin_suite::{XclbinSuite, XclbinTest};

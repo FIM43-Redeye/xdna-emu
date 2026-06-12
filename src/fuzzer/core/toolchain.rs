@@ -11,7 +11,7 @@ use std::process::Command;
 
 /// Paths to external tools needed for compilation.
 ///
-/// `pub(crate)` so the vector fuzz runner (`super::vector::runner`) reuses the
+/// `pub(crate)` so the vector fuzz runner (`super::domains::vector::runner`) reuses the
 /// same compile pipeline.
 pub(crate) struct ToolPaths {
     /// Peano clang compiler.
