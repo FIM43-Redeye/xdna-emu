@@ -14,13 +14,31 @@ kernel, observed for *cycles* instead of *values*, compared with a *tolerance*
 instead of byte-equality. Before we build that mode we need to know where the
 timing ground truth lives, what is legitimately usable, and what is off-limits.
 A read-only reconnaissance of the locally-installed aietools tree (#123) plus a
-review of the open toolchain answers that. The headline: **there is no
-latency table to read -- there is a measurement pipeline to build.**
+broad documentation sweep across the whole install and our own tree answers that.
 
-The emulator already models timing in places (vector-op pipeline latencies are
-real enough that the vector fuzzer caught seven *latency-class* bugs invisible to
-hand tests -- #112/#114; MAC pipeline latency is modeled in #107/#108). This note
-is about how to extend that to a *systematic* timing model, derived correctly.
+**Correction (2026-06-11, after the broad doc sweep).** An earlier draft of this
+note headlined "there is no latency table to read." That was an artifact of a
+first pass scoped narrowly to aietools *data files*, and it undersold the
+picture. The accurate headline: **the timing *model* is well-documented and
+already partly built; only the last-mile exact per-instruction micro-latencies
+are proprietary -- and those we close by measurement.** Specifically:
+
+- **AM020 / AM027 ch.4** document the AIE-ML / AIE-ML-v2 timing model (pipeline
+  stages, a stated 7-cycle load-result latency, lock-arbitration overhead, DMA
+  channel timing) -- and we have both PDFs locally under `docs/xdna/pdfs/`.
+- **We already have an AM020-derived timing subsystem in-tree**:
+  `src/interpreter/timing/` (`latency.rs` cites AM020 ch.4 at 1 GHz with concrete
+  per-category cycle counts, plus `arbitration`/`hazards`/`memory`/`slots`/`sync`).
+  The vector fuzzer's seven silicon-only *latency-class* catches (#112/#114) and
+  the MAC pipeline-latency work (#107/#108) are this model in action. Timing as a
+  framework mode therefore *extends an existing, AM020-grounded model* -- it is
+  not greenfield.
+- The proprietary `.sfg`/`.so` tables hold the exact micro-latencies the open
+  docs leave qualitative; those are the *edge*, not the main story, and we get
+  them by measurement (source 2), not extraction.
+
+The policy below is unchanged; only the "how much is available" framing is
+corrected upward.
 
 ## The three sources, in priority order (mirrors the value-side policy)
 
