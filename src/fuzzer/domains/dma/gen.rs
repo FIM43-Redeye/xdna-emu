@@ -225,13 +225,29 @@ fn build_pattern(
                 packet: None,
             }
         }
-        Feature::Iter | Feature::Chain => BdPattern {
+        // iter is DEFERRED (fails on silicon -- see table::supported doc-comment
+        // and the iter-deferral findings doc). Never generated (gating off); this
+        // placeholder keeps the match exhaustive.
+        Feature::Iter => BdPattern {
             sizes: vec![region as u32],
             strides: vec![1],
             pad_before: vec![],
             pad_after: vec![],
             packet: None,
         },
+        Feature::Chain => {
+            // Memtile multi-BD chain (3b): this transfer is one BD in an N>=2
+            // next_bd chain (the chain STRUCTURE + double-buffer locks are the
+            // feature, emitted by lower_memtile). Its own access pattern is a
+            // plain linear region copy.
+            BdPattern {
+                sizes: vec![region as u32],
+                strides: vec![1],
+                pad_before: vec![],
+                pad_after: vec![],
+                packet: None,
+            }
+        }
     }
 }
 
@@ -247,14 +263,18 @@ pub fn generate(seed: u64, target: &str) -> DmaChain {
     // packet transfer with circuit transfers on that port would demand two
     // contradictory static routings -> aiecc rejects it. So packet chains must be
     // PURE: exactly one packet transfer, no circuit transfers mixed in.
-    // Memtile chains are forced single-transfer (spec "single-transfer mode"):
-    // N=1 covers all 48 memtile keys; multi-pattern memtile chains would need N
-    // distinct static BDs with intricate lock sequencing, and the shim path
-    // already exercises multi-transfer chains. Packet chains are N=1 for purity.
-    let n = if tgt.feature == Feature::Packet || tgt.engine == Engine::Memtile {
-        1
-    } else {
-        1 + rng.below(4)
+    // 3a memtile chains are forced single-transfer; the 3b `chain` feature is the
+    // one memtile multi-transfer case (N>=2 distinct BDs in a next_bd chain on one
+    // channel). Packet/iter chains are N=1.
+    let n = match tgt.feature {
+        // Chain is the one memtile multi-transfer case: N>=2 BDs in a next_bd
+        // chain. 2..=4 distinct regions, each its own chained BD.
+        Feature::Chain => 2 + rng.below(3),
+        // Packet is N=1 for routing purity; all other memtile features stay
+        // single-transfer (3a spec). Shim 3a chains are multi-transfer.
+        Feature::Packet => 1,
+        _ if tgt.engine == Engine::Memtile => 1,
+        _ => 1 + rng.below(4),
     };
     let target_slot = rng.below(n);
     let region = REGION_ELEMS[rng.below(REGION_ELEMS.len())];
@@ -265,6 +285,24 @@ pub fn generate(seed: u64, target: &str) -> DmaChain {
     for k in 0..n {
         let (feature, dir) = if k == target_slot {
             (tgt.feature, tgt.dir)
+        } else if tgt.feature == Feature::Chain {
+            // Chain fillers ride the SAME channel as the target (one memtile
+            // direction carries the whole next_bd chain) and must keep equal
+            // region sizes for the localizer -- so no padding (grows the region)
+            // and no packet. Any other supported memtile pattern is fair game;
+            // distinct patterns per BD exercise distinct-BD chaining.
+            let f = loop {
+                let f = rng.pick(&Feature::all_3a());
+                if supported(engine, f, tgt.dir)
+                    && !matches!(
+                        f,
+                        Feature::Packet | Feature::PadBefore | Feature::PadAfter | Feature::PadBoth
+                    )
+                {
+                    break f;
+                }
+            };
+            (f, tgt.dir)
         } else {
             loop {
                 let f = rng.pick(&Feature::all_3a());

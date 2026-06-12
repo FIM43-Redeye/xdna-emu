@@ -24,6 +24,10 @@ fn pattern_list(p: &BdPattern) -> String {
 pub fn lower_chain(chain: &DmaChain) -> String {
     match chain.engine {
         Engine::Shim => lower_shim(chain),
+        // A memtile chain (3b `chain` feature) is N>=2 transfers carried as a
+        // multi-BD next_bd chain with double-buffer locks; all other memtile
+        // cases are single-transfer (3a).
+        Engine::Memtile if chain.transfers.len() >= 2 => lower_memtile_chain(chain),
         Engine::Memtile => lower_memtile(chain),
     }
 }
@@ -277,10 +281,142 @@ fn lower_memtile(chain: &DmaChain) -> String {
     m
 }
 
+/// Memtile multi-BD `next_bd` chain (3b `chain` feature). N>=2 transfers ride one
+/// memtile_dma block as a chain of distinct BDs on each channel, with a
+/// double-buffer lock pair (producer init=N) -- the proven form from the spike's
+/// `chain_memtile_clean`. The patterned channel is the chain's direction; the
+/// opposite channel runs N linear BDs. The shim sends N linear regions in and
+/// drains N*region linearly out; the reshuffle lives entirely on the memtile BDs.
+fn lower_memtile_chain(chain: &DmaChain) -> String {
+    let elem = chain.dtype.mlir_elem();
+    let in_words = chain.in_words();
+    let out_words = chain.out_words();
+    let n = chain.transfers.len();
+    // All chain transfers share one region length (no padding in a chain).
+    let region = chain.transfers[0].in_elems;
+    assert!(
+        chain.transfers.iter().all(|t| t.in_elems == region && t.out_elems == region),
+        "memtile chain requires equal un-padded regions; got {:?}",
+        chain.transfers.iter().map(|t| (t.in_elems, t.out_elems)).collect::<Vec<_>>()
+    );
+
+    let mut m = String::new();
+    m.push_str("module {\n");
+    m.push_str("  aie.device(npu1_1col) {\n");
+    m.push_str("    %tile_0_0 = aie.tile(0, 0)\n");
+    m.push_str("    %tile_0_1 = aie.tile(0, 1)\n");
+    m.push_str("    aie.flow(%tile_0_0, DMA : 0, %tile_0_1, DMA : 0)\n");
+    m.push_str("    aie.flow(%tile_0_1, DMA : 0, %tile_0_0, DMA : 0)\n");
+
+    m.push_str("    %memtile_dma_0_1 = aie.memtile_dma(%tile_0_1) {\n");
+    for k in 0..n {
+        m.push_str(&format!(
+            "      %buf{k} = aie.buffer(%tile_0_1) {{sym_name = \"mt_buf{k}\"}} : memref<{region}x{elem}>\n"
+        ));
+    }
+    // Double-buffer locks: producer starts at N (all buffers free), consumer at 0.
+    m.push_str(&format!(
+        "      %prod = aie.lock(%tile_0_1, 0) {{init = {n} : i32, sym_name = \"mt_prod\"}}\n"
+    ));
+    m.push_str("      %cons = aie.lock(%tile_0_1, 1) {init = 0 : i32, sym_name = \"mt_cons\"}\n");
+
+    // S2MM chain: ^s2mm0 -> ^s2mm1 -> ... -> ^s2mm0. Each fills its buffer,
+    // acquiring prod and releasing cons.
+    m.push_str("      %0 = aie.dma_start(S2MM, 0, ^s2mm0, ^mm2s_entry)\n");
+    for k in 0..n {
+        let t = &chain.transfers[k];
+        let pat = if t.dir == Direction::S2mm {
+            pattern_list(&t.pattern)
+        } else {
+            String::new()
+        };
+        let next = (k + 1) % n;
+        m.push_str(&format!("    ^s2mm{k}:\n"));
+        m.push_str("      aie.use_lock(%prod, AcquireGreaterEqual, 1)\n");
+        m.push_str(&format!("      aie.dma_bd(%buf{k} : memref<{region}x{elem}>, 0, {region}{pat})\n"));
+        m.push_str("      aie.use_lock(%cons, Release, 1)\n");
+        m.push_str(&format!("      aie.next_bd ^s2mm{next}\n"));
+    }
+
+    // MM2S chain: ^mm2s0 -> ^mm2s1 -> ... -> ^mm2s0. Each drains its buffer,
+    // acquiring cons and releasing prod.
+    m.push_str("    ^mm2s_entry:\n");
+    m.push_str("      %1 = aie.dma_start(MM2S, 0, ^mm2s0, ^end)\n");
+    for k in 0..n {
+        let t = &chain.transfers[k];
+        let pat = if t.dir == Direction::Mm2s {
+            pattern_list(&t.pattern)
+        } else {
+            String::new()
+        };
+        let next = (k + 1) % n;
+        m.push_str(&format!("    ^mm2s{k}:\n"));
+        m.push_str("      aie.use_lock(%cons, AcquireGreaterEqual, 1)\n");
+        m.push_str(&format!("      aie.dma_bd(%buf{k} : memref<{region}x{elem}>, 0, {region}{pat})\n"));
+        m.push_str("      aie.use_lock(%prod, Release, 1)\n");
+        m.push_str(&format!("      aie.next_bd ^mm2s{next}\n"));
+    }
+    m.push_str("    ^end:\n");
+    m.push_str("      aie.end\n");
+    m.push_str("    }\n");
+
+    // Runtime sequence: one linear recv of all N regions, N linear sends (one per
+    // region). The reshuffle is entirely on the memtile BDs above.
+    m.push_str(&format!(
+        "    aie.runtime_sequence(%in: memref<{in_words}x{elem}>, %out: memref<{out_words}x{elem}>) {{\n"
+    ));
+    m.push_str("      %recv = aiex.dma_configure_task(%tile_0_0, S2MM, 0) {\n");
+    m.push_str(&format!(
+        "        aie.dma_bd(%out : memref<{out_words}x{elem}>, 0, {out_words}) {{bd_id = 8 : i32}}\n"
+    ));
+    m.push_str("        aie.end\n");
+    m.push_str("      } {issue_token = true}\n");
+    m.push_str("      aiex.dma_start_task(%recv)\n");
+    for k in 0..n {
+        let off = k * region;
+        let bd_id = k % 8;
+        let token = if k == n - 1 { " {issue_token = true}" } else { "" };
+        m.push_str(&format!("      %t{k} = aiex.dma_configure_task(%tile_0_0, MM2S, 0) {{\n"));
+        m.push_str(&format!(
+            "        aie.dma_bd(%in : memref<{in_words}x{elem}>, {off}, {region}) {{bd_id = {bd_id} : i32}}\n"
+        ));
+        m.push_str("        aie.end\n");
+        m.push_str(&format!("      }}{token}\n"));
+        m.push_str(&format!("      aiex.dma_start_task(%t{k})\n"));
+    }
+    m.push_str(&format!("      aiex.dma_await_task(%t{})\n", n - 1));
+    m.push_str("      aiex.dma_await_task(%recv)\n");
+    m.push_str("    }\n"); // runtime_sequence
+    m.push_str("  }\n"); // device
+    m.push_str("}\n"); // module
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fuzzer::domains::dma::gen::generate;
+
+    #[test]
+    fn memtile_chain_emits_multibd_double_buffer() {
+        let c = generate(3, "chain/memtile/mm2s/I32");
+        let n = c.transfers.len();
+        assert!(n >= 2, "chain must be multi-transfer, got {n}");
+        let m = lower_chain(&c);
+        assert!(m.contains(&format!("init = {n} : i32")), "producer lock init must equal N:\n{m}");
+        assert!(m.contains("^s2mm1:") && m.contains("^mm2s1:"), "needs >=2 chained BDs per channel:\n{m}");
+        assert!(
+            m.contains("aie.next_bd ^s2mm0") && m.contains("aie.next_bd ^mm2s0"),
+            "chain must loop back to BD0:\n{m}"
+        );
+        assert!(m.contains("%buf0") && m.contains("%buf1"), "one buffer per chained region");
+    }
+
+    #[test]
+    #[ignore = "requires toolchain; run with --ignored"]
+    fn memtile_chain_compiles() {
+        compile_one("chain/memtile/mm2s/I16", 3);
+    }
 
     fn compile_one(key: &str, seed: u64) {
         let tools = match crate::fuzzer::core::toolchain::ToolPaths::discover() {

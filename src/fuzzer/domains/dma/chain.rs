@@ -113,7 +113,8 @@ impl Feature {
             Feature::Chain => "chain",
         }
     }
-    /// All 3a features (excludes Iter/Chain).
+    /// All 3a features (excludes Iter/Chain). Used as the random-filler pool, so
+    /// fillers never structurally become an iter/chain transfer.
     pub fn all_3a() -> [Feature; 10] {
         [
             Feature::Linear,
@@ -126,6 +127,24 @@ impl Feature {
             Feature::PadBefore,
             Feature::PadAfter,
             Feature::PadBoth,
+        ]
+    }
+    /// Every feature (3a + the 3b structural features iter/chain). The coverage
+    /// universe enumerates this and lets `table::supported` gate per engine/dir.
+    pub fn all() -> [Feature; 12] {
+        [
+            Feature::Linear,
+            Feature::Strided2d,
+            Feature::Strided3d,
+            Feature::Strided4d,
+            Feature::Transpose,
+            Feature::Overlap,
+            Feature::Packet,
+            Feature::PadBefore,
+            Feature::PadAfter,
+            Feature::PadBoth,
+            Feature::Iter,
+            Feature::Chain,
         ]
     }
 }

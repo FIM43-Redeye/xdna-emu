@@ -2,9 +2,17 @@
 //! `{feature}/{engine}/{dir}/{dtype}`, capability-gated per the spike matrix.
 use super::chain::{Direction, Dtype, Engine, Feature};
 
-/// Is this (engine, feature, dir) combination part of the 3a universe?
-/// Gating (spike-verified): strided4d + pad* are memtile-only; packet + pad*
-/// are MM2S-only; iter/chain are deferred to 3b.
+/// Is this (engine, feature, dir) combination part of the coverage universe?
+/// Gating: strided4d + pad* are memtile-only; packet + pad* are MM2S-only
+/// (all spike-verified, 3a). 3b adds chain (memtile multi-BD next_bd, both dirs).
+///
+/// `iter` (shim BD iteration) is DEFERRED: it executes on the emulator but fails
+/// on real NPU1 silicon -- the overlapping iteration patterns are order-dependent
+/// on S2MM (writes) and the MM2S read variant times out the kernel. Making iter
+/// HW-deterministic needs non-overlapping interleaved patterns + a timeout
+/// root-cause. Evidence + redesign plan: docs/superpowers/findings/
+/// 2026-06-12-dma-iter-hw-deferral.md. Feature::Iter stays in the enum so the
+/// follow-up is a gating flip, not a refactor.
 pub fn supported(engine: Engine, feature: Feature, dir: Direction) -> bool {
     use Feature::*;
     match feature {
@@ -12,16 +20,18 @@ pub fn supported(engine: Engine, feature: Feature, dir: Direction) -> bool {
         Strided4d => engine == Engine::Memtile,
         Packet => dir == Direction::Mm2s,
         PadBefore | PadAfter | PadBoth => engine == Engine::Memtile && dir == Direction::Mm2s,
-        // 3b -- never in the 3a universe.
-        Iter | Chain => false,
+        // 3b: memtile-only multi-BD next_bd chain (silicon-verified).
+        Chain => engine == Engine::Memtile,
+        // Deferred (see doc-comment above): never in the universe yet.
+        Iter => false,
     }
 }
 
-/// The full sorted 3a key universe (81 keys).
+/// The full sorted coverage-key universe (87 keys: 81 3a + 6 chain).
 pub fn universe_keys() -> Vec<String> {
     let mut keys = Vec::new();
     for engine in Engine::all() {
-        for feature in Feature::all_3a() {
+        for feature in Feature::all() {
             for dir in Direction::all() {
                 if !supported(engine, feature, dir) {
                     continue;
@@ -57,7 +67,7 @@ pub fn parse_key(key: &str) -> Result<Target, String> {
     if parts.len() != 4 {
         return Err(format!("bad key (need feature/engine/dir/dtype): {key}"));
     }
-    let feature = Feature::all_3a()
+    let feature = Feature::all()
         .into_iter()
         .find(|f| f.key_str() == parts[0])
         .ok_or_else(|| format!("unknown feature: {}", parts[0]))?;
@@ -81,21 +91,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn universe_is_81_keys() {
+    fn universe_is_87_keys() {
+        // 81 (3a) + 6 chain (memtile x 2dir x 3dtype). iter is deferred.
         let u = universe_keys();
-        assert_eq!(u.len(), 81, "expected 81 3a keys, got {}", u.len());
+        assert_eq!(u.len(), 87, "expected 87 keys, got {}", u.len());
         let mut s = u.clone();
         s.sort();
         s.dedup();
         assert_eq!(s, u);
-    }
-
-    #[test]
-    fn no_iter_or_chain_keys() {
-        for k in universe_keys() {
-            assert!(!k.starts_with("iter/"), "iter is 3b: {k}");
-            assert!(!k.starts_with("chain/"), "chain is 3b: {k}");
-        }
+        assert_eq!(u.iter().filter(|k| k.starts_with("chain/")).count(), 6);
+        assert_eq!(u.iter().filter(|k| k.starts_with("iter/")).count(), 0, "iter is deferred");
     }
 
     #[test]
@@ -109,6 +114,10 @@ mod tests {
             }
             if k.starts_with("packet/") {
                 assert!(k.contains("/mm2s/"), "packet must be mm2s: {k}");
+            }
+            // chain is memtile-only, both directions.
+            if k.starts_with("chain/") {
+                assert!(k.contains("/memtile/"), "chain must be memtile: {k}");
             }
         }
     }

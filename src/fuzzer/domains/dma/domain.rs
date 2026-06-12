@@ -277,6 +277,48 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "3b chain EMU smoke (6 aiecc compiles + 6 emu runs); run with --ignored"]
+    fn chain_emu_smoke() {
+        use crate::fuzzer::core::domain::Domain;
+        let tools = match crate::fuzzer::core::toolchain::ToolPaths::discover() {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("SKIP: toolchain not discoverable");
+                return;
+            }
+        };
+        let dom = DmaDomain;
+        let keys: Vec<String> = dom.universe().into_iter().filter(|k| k.starts_with("chain/")).collect();
+        let mut fails: Vec<(String, String)> = Vec::new();
+        for (i, key) in keys.iter().enumerate() {
+            let c = dom.generate(i as u64 + 1, key);
+            let dir = std::env::temp_dir().join(format!("dma_3b_{i}_{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            match dom.compile(&tools, &dir, &c) {
+                Ok(()) => match dom.observe(
+                    Backend::Interpreter,
+                    &dir.join("aie.xclbin"),
+                    &dir.join("insts.bin"),
+                    &c,
+                    2_000_000,
+                ) {
+                    Ok(obs) if obs.output.iter().any(|&b| b != 0) => {
+                        eprintln!("OK {key}: {} transfers, {} out bytes", c.transfers.len(), obs.output.len())
+                    }
+                    Ok(_) => fails.push((key.clone(), "vacuous (all-zero) output".into())),
+                    Err(e) => fails.push((key.clone(), e)),
+                },
+                Err(e) => fails.push((key.clone(), e.lines().rev().take(2).collect::<Vec<_>>().join(" | "))),
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        for (k, e) in &fails {
+            eprintln!("FAIL {k}: {e}");
+        }
+        assert!(fails.is_empty(), "{}/{} chain keys failed", fails.len(), keys.len());
+    }
+
+    #[test]
     #[ignore = "full-universe EMU smoke (81 aiecc compiles + 81 emu runs); run with --ignored"]
     fn universe_emu_smoke() {
         use crate::fuzzer::core::domain::Domain;
