@@ -5,3 +5,4 @@
 //! `docs/superpowers/specs/2026-06-11-scalar-coverage-domain.md`.
 
 pub mod chain;
+pub mod table;
