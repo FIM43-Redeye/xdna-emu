@@ -293,7 +293,7 @@ impl Domain for VectorDomain {
     fn buffer_words(&self, c: &Chain) -> usize {
         buffer_words(c)
     }
-    fn dtype(&self) -> &str {
+    fn dtype(&self, _c: &Chain) -> &str {
         "i32"
     }
 

@@ -197,6 +197,90 @@ pub(crate) fn bank_case(
     Ok(bank_dir)
 }
 
+impl Domain for ScalarDomain {
+    type Case = ScalarChain;
+    type Obs = ScalarObs;
+
+    fn name(&self) -> &str {
+        "scalar"
+    }
+    fn universe(&self) -> Vec<String> {
+        universe_keys()
+    }
+    fn generate(&self, seed: u64, target: &str) -> ScalarChain {
+        generate(seed, target)
+    }
+    fn coverage_keys(&self, c: &ScalarChain) -> Vec<String> {
+        c.keys()
+    }
+    fn target_key(&self, c: &ScalarChain) -> String {
+        c.target_key.clone()
+    }
+    fn lower(&self, c: &ScalarChain) -> String {
+        lower_chain(c)
+    }
+    fn buffer_words(&self, c: &ScalarChain) -> usize {
+        buffer_words(c)
+    }
+    fn dtype(&self, c: &ScalarChain) -> &str {
+        c.dtype.template_dtype()
+    }
+
+    fn observe(
+        &self,
+        backend: Backend,
+        xclbin: &Path,
+        insts: &Path,
+        c: &ScalarChain,
+        max_cycles: u64,
+    ) -> Result<ScalarObs, String> {
+        observe_impl(backend, xclbin, insts, c, max_cycles)
+    }
+
+    fn warnings(&self, obs: &ScalarObs) -> Vec<String> {
+        if !obs.output.is_empty() && obs.output.iter().all(|&b| b == 0) {
+            vec!["vacuous output (all zero) -- chain folded or degenerate".into()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn compare(&self, emu: &ScalarObs, reference: &ScalarObs, keys: &[String]) -> Option<String> {
+        let rkeys = region_keys(keys);
+        let n = rkeys.len();
+        first_divergent_region(&emu.output, &reference.output, n)
+            .map(|r| rkeys[r.min(n.saturating_sub(1))].clone())
+    }
+
+    fn bank(
+        &self,
+        case_dir: &Path,
+        c: &ScalarChain,
+        reference: Option<&ScalarObs>,
+        _emu_obs: Option<&ScalarObs>,
+    ) -> Result<PathBuf, String> {
+        bank_case(case_dir, c, &c.keys(), reference.map(|o| o.output.as_slice()))
+    }
+
+    fn load_banked(&self, seed_dir: &Path) -> Result<Banked<ScalarChain, ScalarObs>, String> {
+        let record: ScalarChainRecord = std::fs::read_to_string(seed_dir.join("chain.json"))
+            .map_err(|e| e.to_string())
+            .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))?;
+        let npu_output =
+            std::fs::read(seed_dir.join("npu_output.bin")).map_err(|e| format!("npu_output.bin: {e}"))?;
+        Ok(Banked::Replayable {
+            case: record.chain,
+            reference: ScalarObs { output: npu_output, trace: None },
+            keys: record.keys,
+        })
+    }
+
+    fn dump_divergent_observation(&self, case_dir: &Path, emu: &ScalarObs) -> Result<(), String> {
+        std::fs::write(case_dir.join("emu_output.bin"), &emu.output)
+            .map_err(|e| format!("emu_output.bin write error: {e}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +352,62 @@ mod tests {
         let loaded: ScalarChainRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.chain, c);
         assert_eq!(loaded.keys, c.keys());
+    }
+
+    #[test]
+    fn compare_maps_region_to_its_stage_key() {
+        let dom = ScalarDomain;
+        let keys = vec!["add/I32".to_string(), "sub/I32".to_string(), "loop_simple/I32".to_string()];
+        let emu = ScalarObs { output: vec![1u8; 2 * 8], trace: None };
+        let mut hwout = emu.output.clone();
+        hwout[8] ^= 1; // region 1
+        let hw = ScalarObs { output: hwout, trace: None };
+        assert_eq!(dom.compare(&emu, &hw, &keys), Some("sub/I32".to_string()));
+    }
+
+    #[test]
+    fn vacuous_all_zero_output_warns() {
+        let dom = ScalarDomain;
+        let obs = ScalarObs { output: vec![0u8; 64], trace: None };
+        assert!(!dom.warnings(&obs).is_empty(), "all-zero output should warn vacuous");
+        let nonzero = ScalarObs { output: vec![1u8; 64], trace: None };
+        assert!(dom.warnings(&nonzero).is_empty());
+    }
+
+    #[test]
+    fn dtype_is_per_case() {
+        let dom = ScalarDomain;
+        assert_eq!(Domain::dtype(&dom, &generate(1, "add/I8")), "i8");
+        assert_eq!(Domain::dtype(&dom, &generate(1, "add/I32")), "i32");
+    }
+
+    #[test]
+    fn coverage_keys_match_the_chain_keys() {
+        let dom = ScalarDomain;
+        let c = generate(2, "add/I16");
+        assert_eq!(dom.coverage_keys(&c), c.keys());
+        assert_eq!(dom.target_key(&c), "add/I16");
+    }
+
+    #[test]
+    fn load_banked_reconstructs_replayable_case() {
+        let c = generate(9, "and/I32");
+        let tmp = std::env::temp_dir().join(format!("scalar-bank-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("fuzz_kernel.cc"), lower_chain(&c)).unwrap();
+        let record = ScalarChainRecord::from_chain(&c, &c.keys());
+        std::fs::write(tmp.join("chain.json"), serde_json::to_string(&record).unwrap()).unwrap();
+        std::fs::write(tmp.join("npu_output.bin"), vec![7u8; 16]).unwrap();
+
+        let dom = ScalarDomain;
+        match dom.load_banked(&tmp) {
+            Ok(Banked::Replayable { case, reference, keys }) => {
+                assert_eq!(case, c);
+                assert_eq!(reference.output, vec![7u8; 16]);
+                assert_eq!(keys, c.keys());
+            }
+            other => panic!("expected Replayable, got {:?}", other.map(|_| "skip/err")),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

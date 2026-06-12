@@ -164,7 +164,7 @@ where
                 }
                 let case = &cases[idx];
                 let words = dom.buffer_words(&case.case);
-                let r = compile_kernel_case(tools, &case.case_dir, words, dom.dtype());
+                let r = compile_kernel_case(tools, &case.case_dir, words, dom.dtype(&case.case));
                 *compiled[idx].lock().unwrap() = Some(r);
                 let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if !opts.verbose {
@@ -401,9 +401,12 @@ fn run_replay<D: Domain>(dom: &D, dir: &Path, opts: &CampaignOptions) {
                     }
                 }
             }
-            if let Err(e) =
-                compile_kernel_case(tools.as_ref().unwrap(), case_dir, dom.buffer_words(&case), dom.dtype())
-            {
+            if let Err(e) = compile_kernel_case(
+                tools.as_ref().unwrap(),
+                case_dir,
+                dom.buffer_words(&case),
+                dom.dtype(&case),
+            ) {
                 errors += 1;
                 println!("{name}: recompile failed: {}", tail_lines(&e, 3));
                 continue;

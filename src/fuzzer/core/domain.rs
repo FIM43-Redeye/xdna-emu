@@ -81,8 +81,9 @@ pub trait Domain {
     /// Buffer size in dtype words for the compile (`buf_in`/`scratch`/`out`).
     fn buffer_words(&self, case: &Self::Case) -> usize;
 
-    /// Element dtype string passed to `compile_kernel_case` (vector: `"i32"`).
-    fn dtype(&self) -> &str;
+    /// Element dtype string passed to `compile_kernel_case`. Depends on the case
+    /// for domains with per-case dtype (scalar I32/I16/I8); vector ignores it.
+    fn dtype(&self, case: &Self::Case) -> &str;
 
     /// Execute the compiled case on `backend`, returning a domain observation.
     fn observe(
@@ -164,7 +165,7 @@ mod tests {
         fn buffer_words(&self, _c: &u64) -> usize {
             16
         }
-        fn dtype(&self) -> &str {
+        fn dtype(&self, _c: &u64) -> &str {
             "i32"
         }
         fn observe(&self, _b: Backend, _x: &Path, _i: &Path, _c: &u64, _m: u64) -> Result<Vec<u8>, String> {
