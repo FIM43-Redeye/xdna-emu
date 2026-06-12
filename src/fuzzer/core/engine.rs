@@ -27,6 +27,19 @@ fn tail_lines(msg: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
+/// Keep only keys whose first `/`-delimited segment (the feature/op name) is in
+/// `filter`; `None` keeps everything. Order is preserved. Used to stage a
+/// campaign over a feature subset without disturbing the full-universe ledger.
+fn filter_features(keys: Vec<String>, filter: &Option<Vec<String>>) -> Vec<String> {
+    match filter {
+        None => keys,
+        Some(allow) => keys
+            .into_iter()
+            .filter(|k| allow.iter().any(|a| a == k.split('/').next().unwrap_or("")))
+            .collect(),
+    }
+}
+
 /// One generated case awaiting compile/execute.
 struct Case<D: Domain> {
     case: D::Case,
@@ -96,6 +109,13 @@ where
     if uncovered.is_empty() {
         println!("{} fuzz: coverage complete (target {} hits/key)", dom.name(), opts.target_hits);
         print!("{}", ledger.report(dom.name(), &universe, opts.target_hits));
+        return;
+    }
+    // Stage the run over a feature subset if requested; the full-universe
+    // completion check above still sees every uncovered key.
+    let uncovered = filter_features(uncovered, &opts.feature_filter);
+    if uncovered.is_empty() {
+        println!("{} fuzz: no uncovered keys match the feature filter", dom.name());
         return;
     }
     if opts.iterations == 0 {
@@ -444,5 +464,32 @@ mod tests {
         let msg = "a\nb\nc\nd";
         assert_eq!(tail_lines(msg, 2), "c\nd");
         assert_eq!(tail_lines(msg, 10), msg);
+    }
+
+    #[test]
+    fn filter_features_none_keeps_all() {
+        let keys = vec!["linear/shim/mm2s/I32".to_string(), "overlap/shim/s2mm/I8".to_string()];
+        assert_eq!(filter_features(keys.clone(), &None), keys);
+    }
+
+    #[test]
+    fn filter_features_keeps_only_matching_first_segment() {
+        let keys = vec![
+            "linear/shim/mm2s/I32".to_string(),
+            "strided2d/memtile/s2mm/I16".to_string(),
+            "overlap/shim/s2mm/I8".to_string(),
+            "transpose/memtile/mm2s/I32".to_string(),
+        ];
+        let filter = Some(vec!["linear".to_string(), "strided2d".to_string()]);
+        assert_eq!(
+            filter_features(keys, &filter),
+            vec!["linear/shim/mm2s/I32".to_string(), "strided2d/memtile/s2mm/I16".to_string()]
+        );
+    }
+
+    #[test]
+    fn filter_features_empty_when_no_match() {
+        let keys = vec!["linear/shim/mm2s/I32".to_string()];
+        assert!(filter_features(keys, &Some(vec!["nonesuch".to_string()])).is_empty());
     }
 }

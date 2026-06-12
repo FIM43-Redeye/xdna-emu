@@ -44,6 +44,7 @@ pub fn parse_fuzz_args(args: &[String]) -> Result<ScalarFuzzOptions, String> {
         report_only: false,
         replay: None,
         reverify: false,
+        feature_filter: None,
     };
     let mut trace_sweep = false;
     let mut trace_sweep_reps = 5;
@@ -91,6 +92,7 @@ pub fn parse_vector_fuzz_args(args: &[String]) -> Result<VecFuzzOptions, String>
         report_only: false,
         replay: None,
         reverify: false,
+        feature_filter: None,
     };
 
     let mut iter = args.iter().skip(1);
@@ -132,6 +134,7 @@ pub fn parse_dma_fuzz_args(args: &[String]) -> Result<DmaFuzzOptions, String> {
         report_only: false,
         replay: None,
         reverify: false,
+        feature_filter: None,
     };
 
     let mut iter = args.iter().skip(1);
@@ -147,6 +150,13 @@ pub fn parse_dma_fuzz_args(args: &[String]) -> Result<DmaFuzzOptions, String> {
             "--no-hw" => campaign.hw = false,
             "--report" => campaign.report_only = true,
             "--reverify" => campaign.reverify = true,
+            // Stage a run over a feature subset (comma-separated feature names,
+            // the first key segment): e.g. `--features linear,strided2d`.
+            "--features" => {
+                let csv = iter.next().ok_or("--features requires a comma-separated list")?;
+                campaign.feature_filter =
+                    Some(csv.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+            }
             "--replay" => {
                 let dir = iter.next().ok_or("--replay requires a directory")?;
                 campaign.replay = Some(PathBuf::from(dir));
@@ -320,5 +330,19 @@ mod tests {
         assert_eq!(o.campaign.iterations, 50);
         assert_eq!(o.campaign.seed, Some(7));
         assert!(o.campaign.report_only);
+        assert!(o.campaign.feature_filter.is_none());
+    }
+
+    #[test]
+    fn parse_dma_fuzz_features_filter() {
+        let args: Vec<String> = ["bin", "fuzz-dma", "--features", "linear, strided2d ,transpose"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let o = parse_dma_fuzz_args(&args).unwrap();
+        assert_eq!(
+            o.campaign.feature_filter,
+            Some(vec!["linear".to_string(), "strided2d".to_string(), "transpose".to_string()])
+        );
     }
 }

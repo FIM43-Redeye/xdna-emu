@@ -36,6 +36,11 @@ pub struct CampaignOptions {
     pub replay: Option<PathBuf>,
     /// Clear divergent flags and re-earn them against silicon this run.
     pub reverify: bool,
+    /// Restrict this run's work-set to keys whose first `/`-delimited segment
+    /// (the feature/op name) is in this list. `None` = the whole uncovered set.
+    /// Lets a campaign be staged over a feature subset (e.g. run safe DMA
+    /// patterns and bank them before pushing risky ones that may wedge the NPU).
+    pub feature_filter: Option<Vec<String>>,
 }
 
 /// Result of loading one banked case for replay.
