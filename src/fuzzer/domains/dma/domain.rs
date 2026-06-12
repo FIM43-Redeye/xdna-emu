@@ -275,4 +275,66 @@ mod tests {
         assert!(obs.output.iter().any(|&b| b != 0), "expected a non-zero reshuffle");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    #[ignore = "full-universe EMU smoke (81 aiecc compiles + 81 emu runs); run with --ignored"]
+    fn universe_emu_smoke() {
+        use crate::fuzzer::core::domain::Domain;
+        let tools = match crate::fuzzer::core::toolchain::ToolPaths::discover() {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("SKIP: toolchain not discoverable");
+                return;
+            }
+        };
+        let dom = DmaDomain;
+        let universe = dom.universe();
+        let total = universe.len();
+        let mut compile_fails: Vec<(String, String)> = Vec::new();
+        let mut run_fails: Vec<(String, String)> = Vec::new();
+        let mut ran = 0usize;
+        for (i, key) in universe.iter().enumerate() {
+            let c = dom.generate(i as u64 + 1, key);
+            let dir = std::env::temp_dir().join(format!("dma_smoke_{i}_{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            match dom.compile(&tools, &dir, &c) {
+                Ok(()) => {
+                    match dom.observe(
+                        Backend::Interpreter,
+                        &dir.join("aie.xclbin"),
+                        &dir.join("insts.bin"),
+                        &c,
+                        2_000_000,
+                    ) {
+                        Ok(obs) if !obs.output.is_empty() => ran += 1,
+                        Ok(_) => run_fails.push((key.clone(), "empty output".into())),
+                        Err(e) => run_fails.push((key.clone(), e)),
+                    }
+                }
+                Err(e) => {
+                    let tail: String = e
+                        .lines()
+                        .rev()
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    compile_fails.push((key.clone(), tail));
+                }
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        let compiled = total - compile_fails.len();
+        eprintln!("=== DMA universe smoke: compiled {compiled}/{total}, ran {ran}/{total} ===");
+        for (k, e) in &compile_fails {
+            eprintln!("COMPILE FAIL {k}: {e}");
+        }
+        for (k, e) in &run_fails {
+            eprintln!("RUN FAIL {k}: {e}");
+        }
+        assert!(compile_fails.is_empty(), "{} keys failed to compile", compile_fails.len());
+        assert_eq!(ran, total, "{} keys failed to run on the emulator", total - ran);
+    }
 }
