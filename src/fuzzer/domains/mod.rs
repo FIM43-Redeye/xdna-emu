@@ -5,3 +5,4 @@
 
 pub mod vector;
 pub mod scalar;
+pub mod dma;
