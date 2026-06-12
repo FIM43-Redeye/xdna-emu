@@ -1776,3 +1776,64 @@ Generated using Claude Code."
 - **The one localization subtlety** (compare gets keys, not the case, but DMA regions are unequal under padding) is resolved in T10-Step-4 by carrying `bounds` in `DmaObs` -- exact, not equal-split.
 - **Type consistency:** `DmaObs` gains a `bounds` field in T10-Step-4; the T9 tests construct `DmaObs` and must be updated there (called out). `compile_dma_mlir`, `ToolPaths`, `make_dma_buffer_spec` signatures are consistent across T1/T9/T10.
 - **No HW in the plan's gates:** all compile/run gates are EMU + `aiecc` (no NPU contention). The `--hw` differential campaign is run manually after merge (acceptance), like Steps 1/2.
+
+---
+
+## Outcome (2026-06-12)
+
+**Status: complete. Ready to merge.** Built subagent-driven on branch
+`framework-step3a-dma-tenant`, 14 commits (`92edeb8d..77862009`):
+
+| Commit | Task |
+|--------|------|
+| 92edeb8d | T1 framework compile seam (defaulted `Domain::compile` + `compile_dma_mlir`; campaign+replay both routed; vector/scalar byte-identical) |
+| 0c234319 | T2 chain AST |
+| d52550c8 | T3 81-key capability-gated universe |
+| 559333c9 | T4 Stage-A-safe generation |
+| ff7fc7c4 / cd75e46a | T5/T6 shim emitter (linear/strided2d; then 3d/transpose/overlap/packet, both dirs) |
+| cea03731 / 509c7184 | T7/T8 memtile emitter (single-transfer linear/strided; then 4d/transpose/overlap/packet-attr/padding) |
+| 77f1eb5c / 729d1004 | T9/T10 observe + equal-split localizer; banking + `impl Domain` |
+| eef25bdc | T11 `fuzz-dma` subcommand |
+| f2c39372 | domain-aware coverage-report label (core fix surfaced by T11) |
+| 293df877 | T12 full-universe EMU smoke gate |
+| 77862009 | T13 review-nit cleanup |
+
+**Acceptance met:**
+- `cargo test --lib`: **3481 pass / 0 fail** (+ toolchain-gated ignored: 18 per-feature compile-gates, the e2e run, and the 81-key smoke).
+- **81/81 keys compile through real `aiecc` AND run on the emulator** (T12 smoke, 125s) -- every feature x engine x direction x dtype.
+- **Vector/scalar unchanged**: the defaulted `compile` is byte-identical to the prior path (reviewer-confirmed both call sites); full suite green. **Empirically confirmed**: `fuzz-vector --replay` over the 24-case bank recompiled every case through the new `dom.compile` seam and reproduced the banked HW output exactly -- **24 match, 0 divergent, 0 error** (matches the Step-2 baseline).
+- Generator emits only Stage-A-safe patterns (2000-sample sweep asserts footprint + the two hardware-alignment rules).
+- Final holistic review: **ready to merge**, no blocking/important findings.
+
+**Two hardware-addressing constraints discovered and honored** (derived from
+`AIEXDialect.cpp`/`AIEDialect.cpp`, all 81 keys retained -- not gated):
+1. **Shim NoC = 4-byte words** -- narrow-dtype (I8/I16) shim BD non-innermost
+   strides must be 4-byte-aligned; transpose handled via a word-innermost dim.
+2. **Memtile sub-32-bit** -- innermost dim stride must be 1 for I8/I16, and
+   inner-axis padding must be 32-bit-word-aligned.
+Both are encoded in `gen.rs` with Rust-side assertions so a regression surfaces
+locally, not as an opaque aiecc failure.
+
+**Design refinements made during execution** (all spec-compliant, all keys kept):
+- **Packet and memtile chains forced to N=1** (single-transfer mode): packet
+  guarantees pure routing (no mixed circuit/packet on one port); memtile N=1
+  sidesteps N-static-BD lock sequencing. All 48 memtile + packet keys still fully
+  covered; the shim path carries the multi-transfer chain machinery (N=1..4).
+- **Equal-split localizer** (not the planned `DmaObs.bounds`): because memtile is
+  N=1 and the shim never pads, every chain's output regions are equal-sized, so
+  the scalar-style equal-split `first_divergent_region(emu, hw, n)` is exact.
+
+**3a/3b boundary clean:** `Feature::Iter`/`Feature::Chain` exist in the enum but
+`table::supported` returns false, `all_3a()` omits them, `parse_key`/`generate`
+can't emit them; tests lock it. 3b is a gating flip + the two emulator-engine
+fixes (shim BD-repeat, memtile `next_bd`), not a refactor.
+
+**Deferred (tracked):**
+- **3b**: `iter` (shim) + `chain` (memtile) keys, after fixing the emulator's DMA
+  engine (the two run-stall gaps the spike found).
+- Multi-transfer memtile chains (coverage-density optimization), compute-tile DMA,
+  Stage-B wedge-prone edges, timing mode, aiesim backend -- per the spec's Deferred
+  section.
+- **`--hw` differential campaign** against real NPU1 silicon: run after merge
+  (the actual axis-2 verification; the plan's gates are EMU + aiecc only), exactly
+  as Steps 1/2 were accepted.
