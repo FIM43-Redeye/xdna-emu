@@ -4,3 +4,4 @@
 //! planned as *modes* on these tenants, not separate domains.
 
 pub mod vector;
+pub mod scalar;
