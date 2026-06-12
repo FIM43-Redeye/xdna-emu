@@ -57,8 +57,10 @@ pub trait Domain {
     type Case;
     type Obs;
 
-    /// Stable short name: ledger lives at `build/fuzz-{name}`, banks at
-    /// `phoenix-survival/{name}`. For vector this is `"vector"`.
+    /// Stable short name for this domain. The engine's per-campaign work and
+    /// ledger directory is `build/fuzz-{name}`; by convention the domain also
+    /// banks under `phoenix-survival/{name}` (that path is owned by the domain's
+    /// own `bank`, not constructed by the engine). For vector this is `"vector"`.
     fn name(&self) -> &str;
 
     /// The full coverage-key universe (sorted), supplied to the ledger.
