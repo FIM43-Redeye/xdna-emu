@@ -1,5 +1,5 @@
 //! Deterministic, Stage-A-safe DMA chain generation.
-use super::chain::{BdPattern, Direction, DmaChain, DmaTransfer, Engine, Feature};
+use super::chain::{BdPattern, Direction, DmaChain, DmaTransfer, Dtype, Engine, Feature};
 use super::table::{parse_key, supported, Target};
 
 /// Field-width maxima (AM025 aie_registers_aie2.json). Stage A clamps well under
@@ -33,10 +33,27 @@ impl Xorshift64 {
 const REGION_ELEMS: [usize; 3] = [64, 128, 256];
 
 /// Build a Stage-A-safe pattern for `feature` covering `region` data elements.
-fn build_pattern(rng: &mut Xorshift64, feature: Feature, engine: Engine, region: usize) -> BdPattern {
+///
+/// `dtype` matters on the shim: the NoC addresses memory in 4-byte words, so
+/// every non-innermost BD stride must satisfy `stride * byte_size % 4 == 0`
+/// (verified against mlir-aie AIEXDialect.cpp shim BD legalization). We express
+/// that as `word = (4 / byte_size)` element-granularity: I32 -> 1 (no
+/// constraint, the fix is a no-op), I16 -> 2, I8 -> 4. Memtile is on-chip and
+/// element-granular, so `word = 1` there.
+fn build_pattern(
+    rng: &mut Xorshift64,
+    feature: Feature,
+    engine: Engine,
+    dtype: Dtype,
+    region: usize,
+) -> BdPattern {
     let step_max = match engine {
         Engine::Shim => SHIM_STEP_MAX,
         Engine::Memtile => MEMTILE_STEP_MAX,
+    };
+    let word = match engine {
+        Engine::Shim => (4 / dtype.byte_size()).max(1),
+        Engine::Memtile => 1,
     };
     let split2 = |rng: &mut Xorshift64, n: usize| -> (usize, usize) {
         let mut divs: Vec<usize> = (1..=n).filter(|d| n % d == 0).collect();
@@ -64,7 +81,12 @@ fn build_pattern(rng: &mut Xorshift64, feature: Feature, engine: Engine, region:
             p
         }
         Feature::Strided2d => {
-            let (a, b) = split2(rng, region);
+            // Non-innermost stride is b; require b to be a multiple of `word`
+            // (shim word-addressing). region and word are powers of two, so split
+            // `region/word` units then scale: b = (region/a) stays word-aligned.
+            let units = (region / word).max(1);
+            let (a, bu) = split2(rng, units);
+            let b = bu * word;
             BdPattern {
                 sizes: vec![a as u32, b as u32],
                 strides: vec![clamp(b as u32), 1],
@@ -74,21 +96,41 @@ fn build_pattern(rng: &mut Xorshift64, feature: Feature, engine: Engine, region:
             }
         }
         Feature::Transpose => {
-            let (a, b) = split2(rng, region);
-            BdPattern {
-                sizes: vec![b as u32, a as u32],
-                strides: vec![1, clamp(b as u32)],
-                pad_before: vec![],
-                pad_after: vec![],
-                packet: None,
+            if word > 1 {
+                // Word-granular transpose: innermost `word`-sized contiguous run
+                // (stride 1, exempt); outer strides `word` and `b*word` are both
+                // multiples of `word`. A genuine transpose of 4-byte words that
+                // fits the shim's 3-dim cap. b*a*word == region.
+                let units = (region / word).max(1);
+                let (b, a) = split2(rng, units);
+                BdPattern {
+                    sizes: vec![b as u32, a as u32, word as u32],
+                    strides: vec![clamp(word as u32), clamp((b * word) as u32), 1],
+                    pad_before: vec![],
+                    pad_after: vec![],
+                    packet: None,
+                }
+            } else {
+                let (a, b) = split2(rng, region);
+                BdPattern {
+                    sizes: vec![b as u32, a as u32],
+                    strides: vec![1, clamp(b as u32)],
+                    pad_before: vec![],
+                    pad_after: vec![],
+                    packet: None,
+                }
             }
         }
         Feature::Strided3d => {
-            let (a, bc) = split2(rng, region);
+            // Non-innermost strides are b*c and c; require c (hence b*c) to be a
+            // multiple of `word`. Split `region/word` units, then scale c by word.
+            let units = (region / word).max(1);
+            let (a, bc) = split2(rng, units);
             let (b, _c0) = split2(rng, bc.max(2));
             let a = a.max(1);
             let b = b.max(1);
-            let c = (region / (a * b)).max(1);
+            let cu = (units / (a * b)).max(1);
+            let c = cu * word;
             BdPattern {
                 sizes: vec![a as u32, b as u32, c as u32],
                 strides: vec![clamp((b * c) as u32), clamp(c as u32), 1],
@@ -109,8 +151,19 @@ fn build_pattern(rng: &mut Xorshift64, feature: Feature, engine: Engine, region:
             }
         }
         Feature::Overlap => {
-            let (a, b) = split2(rng, region);
-            let stride = (b / 2).max(1);
+            // Split `region/word` units so the inner run b is a multiple of
+            // `word` and large enough to admit a word-aligned overlapping stride
+            // (stride a multiple of `word`, 0 < stride < b). For word>1 this also
+            // keeps b's stride contiguity word-granular.
+            let units = (region / word).max(1);
+            let (a, bu) = split2(rng, units);
+            let b = bu * word;
+            // Overlapping outer stride: ~b/2 rounded to a multiple of `word`,
+            // clamped to [word, b-word] so it stays strictly below b and overlaps.
+            let mut stride = ((b / 2) / word).max(1) * word;
+            if stride >= b {
+                stride = b.saturating_sub(word).max(word);
+            }
             BdPattern {
                 sizes: vec![a as u32, b as u32],
                 strides: vec![clamp(stride as u32), 1],
@@ -152,7 +205,16 @@ pub fn generate(seed: u64, target: &str) -> DmaChain {
     let engine = tgt.engine;
     let dtype = tgt.dtype;
 
-    let n = 1 + rng.below(4);
+    // Packet routing is device-level: a packet transfer routes via aie.packet_flow
+    // instead of the circuit aie.flow on the same shim->memtile port. Mixing a
+    // packet transfer with circuit transfers on that port would demand two
+    // contradictory static routings -> aiecc rejects it. So packet chains must be
+    // PURE: exactly one packet transfer, no circuit transfers mixed in.
+    let n = if tgt.feature == Feature::Packet {
+        1
+    } else {
+        1 + rng.below(4)
+    };
     let target_slot = rng.below(n);
     let region = REGION_ELEMS[rng.below(REGION_ELEMS.len())];
 
@@ -166,12 +228,15 @@ pub fn generate(seed: u64, target: &str) -> DmaChain {
             loop {
                 let f = rng.pick(&Feature::all_3a());
                 let d = rng.pick(&Direction::all());
-                if supported(engine, f, d) {
+                // Exclude Packet from random fillers: a non-packet chain must
+                // never accidentally include a packet transfer (would corrupt
+                // device-level routing -- see the n=1 guard above).
+                if supported(engine, f, d) && f != Feature::Packet {
                     break (f, d);
                 }
             }
         };
-        let pattern = build_pattern(&mut rng, feature, engine, region);
+        let pattern = build_pattern(&mut rng, feature, engine, dtype, region);
         let in_elems = region;
         let out_elems = region + pattern.pad_elems();
         transfers.push(DmaTransfer { engine, dir, feature, pattern, in_off, out_off, in_elems, out_elems });
@@ -205,6 +270,26 @@ mod tests {
     }
 
     #[test]
+    fn packet_chains_are_single_pure() {
+        for dt in ["I32", "I16", "I8"] {
+            for eng in ["shim", "memtile"] {
+                let key = format!("packet/{eng}/mm2s/{dt}");
+                let c = generate(99, &key);
+                assert_eq!(c.transfers.len(), 1, "packet chain must be single-transfer: {key}");
+                assert_eq!(c.transfers[0].pattern.packet.is_some(), true, "{key}: packet info present");
+            }
+        }
+        // non-packet chains never include a packet transfer
+        for i in 0..200u64 {
+            let c = generate(i, "linear/shim/mm2s/I32");
+            assert!(
+                c.transfers.iter().all(|t| t.pattern.packet.is_none()),
+                "filler leaked a packet transfer"
+            );
+        }
+    }
+
+    #[test]
     fn stage_a_safe_footprints() {
         for (i, key) in universe_keys().into_iter().enumerate().cycle().take(2000) {
             let c = generate(i as u64 * 7 + 1, &key);
@@ -234,6 +319,21 @@ mod tests {
                 if t.engine == Engine::Shim {
                     assert!(p.sizes.len() <= 3, "shim caps at 3 data dims");
                     assert!(p.pad_before.is_empty(), "shim has no padding");
+                    // Shim NoC word-addressing: every NON-innermost stride must be
+                    // 4-byte aligned. The innermost dim (last) may be any stride
+                    // (typically 1, a contiguous run). Catch regressions in Rust.
+                    let bs = c.dtype.byte_size();
+                    let last = p.strides.len() - 1;
+                    for (d, &st) in p.strides.iter().enumerate() {
+                        if d == last {
+                            continue;
+                        }
+                        assert_eq!(
+                            (st as usize * bs) % 4,
+                            0,
+                            "seed{i} key{key}: non-innermost stride {st} (dim {d}) * {bs}B not 4-aligned"
+                        );
+                    }
                 }
                 assert_eq!(t.out_elems, t.in_elems + p.pad_elems());
             }

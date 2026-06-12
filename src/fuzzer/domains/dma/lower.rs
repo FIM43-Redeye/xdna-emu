@@ -42,13 +42,30 @@ fn lower_shim(chain: &DmaChain) -> String {
         chain.transfers.iter().map(|t| t.in_elems).collect::<Vec<_>>()
     );
 
+    // Packet routing is device-level. A packet chain is N=1 (gen enforces purity):
+    // the single MM2S transfer carries pattern.packet = Some((id, ty)) and routes
+    // via aie.packet_flow on the shim->memtile DMA:0 port instead of the circuit
+    // aie.flow. Detect it here.
+    let packet = chain.transfers.iter().find_map(|t| t.pattern.packet.map(|(id, ty)| (id, ty)));
+
     let mut m = String::new();
     m.push_str("module {\n");
     m.push_str("  aie.device(npu1_1col) {\n");
     m.push_str("    %tile_0_0 = aie.tile(0, 0)\n");
     m.push_str("    %tile_0_1 = aie.tile(0, 1)\n");
-    m.push_str("    aie.flow(%tile_0_0, DMA : 0, %tile_0_1, DMA : 0)\n");
-    m.push_str("    aie.flow(%tile_0_1, DMA : 0, %tile_0_0, DMA : 0)\n");
+    if let Some((id, _ty)) = packet {
+        // Packet rides the shim->memtile DMA:0 port: replace that circuit flow with
+        // a packet_flow (both on one static path is contradictory). The reverse
+        // memtile->shim leg stays circuit.
+        m.push_str("    aie.flow(%tile_0_1, DMA : 0, %tile_0_0, DMA : 0)\n");
+        m.push_str(&format!("    aie.packet_flow({id}) {{\n"));
+        m.push_str("      aie.packet_source<%tile_0_0, DMA : 0>\n");
+        m.push_str("      aie.packet_dest<%tile_0_1, DMA : 0>\n");
+        m.push_str("    }\n");
+    } else {
+        m.push_str("    aie.flow(%tile_0_0, DMA : 0, %tile_0_1, DMA : 0)\n");
+        m.push_str("    aie.flow(%tile_0_1, DMA : 0, %tile_0_0, DMA : 0)\n");
+    }
 
     // Memtile linear passthrough (no aie.core): S2MM into a buffer, MM2S back out.
     m.push_str("    %memtile_dma_0_1 = aie.memtile_dma(%tile_0_1) {\n");
@@ -102,8 +119,13 @@ fn lower_shim(chain: &DmaChain) -> String {
         m.push_str("      } {issue_token = true}\n");
         m.push_str(&format!("      aiex.dma_start_task(%recv{k})\n"));
 
-        // send (MM2S, from %in)
-        m.push_str(&format!("      %t{k} = aiex.dma_configure_task(%tile_0_0, MM2S, 0) {{\n"));
+        // send (MM2S, from %in). Packet rides the configure_task OP SIGNATURE
+        // (4th arg), not the inner dma_bd (spike-verified on the shim).
+        let pkt_arg = match t.pattern.packet {
+            Some((id, ty)) => format!(", <pkt_type = {ty}, pkt_id = {id}>"),
+            None => String::new(),
+        };
+        m.push_str(&format!("      %t{k} = aiex.dma_configure_task(%tile_0_0, MM2S, 0{pkt_arg}) {{\n"));
         m.push_str(&format!(
             "        aie.dma_bd(%in : memref<{in_words}x{elem}>, {in_off}, {l}{spat}) {{bd_id = {bd_id} : i32}}\n"
         ));
@@ -157,6 +179,47 @@ mod tests {
     #[ignore = "requires toolchain; run with --ignored"]
     fn shim_strided2d_compiles() {
         compile_one("strided2d/shim/mm2s/I32", 2);
+    }
+
+    #[test]
+    #[ignore = "requires toolchain; run with --ignored"]
+    fn shim_strided3d_compiles() {
+        compile_one("strided3d/shim/mm2s/I32", 3);
+    }
+
+    #[test]
+    #[ignore]
+    fn shim_transpose_compiles() {
+        compile_one("transpose/shim/mm2s/I16", 4);
+    }
+
+    #[test]
+    #[ignore]
+    fn shim_overlap_compiles() {
+        compile_one("overlap/shim/s2mm/I8", 5);
+    }
+
+    #[test]
+    #[ignore]
+    fn shim_packet_compiles() {
+        compile_one("packet/shim/mm2s/I32", 6);
+    }
+
+    #[test]
+    #[ignore]
+    fn shim_scatter_compiles() {
+        compile_one("strided2d/shim/s2mm/I32", 7);
+    }
+
+    #[test]
+    fn shim_packet_on_op_signature() {
+        let c = generate(5, "packet/shim/mm2s/I32");
+        let m = lower_chain(&c);
+        assert!(
+            m.contains("aiex.dma_configure_task(%tile_0_0, MM2S, 0, <pkt_type ="),
+            "shim packet on op sig:\n{m}"
+        );
+        assert!(m.contains("aie.packet_flow("), "needs a packet_flow decl");
     }
 
     #[test]
