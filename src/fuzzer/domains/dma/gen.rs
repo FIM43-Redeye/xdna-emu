@@ -210,7 +210,11 @@ pub fn generate(seed: u64, target: &str) -> DmaChain {
     // packet transfer with circuit transfers on that port would demand two
     // contradictory static routings -> aiecc rejects it. So packet chains must be
     // PURE: exactly one packet transfer, no circuit transfers mixed in.
-    let n = if tgt.feature == Feature::Packet {
+    // Memtile chains are forced single-transfer (spec "single-transfer mode"):
+    // N=1 covers all 48 memtile keys; multi-pattern memtile chains would need N
+    // distinct static BDs with intricate lock sequencing, and the shim path
+    // already exercises multi-transfer chains. Packet chains are N=1 for purity.
+    let n = if tgt.feature == Feature::Packet || tgt.engine == Engine::Memtile {
         1
     } else {
         1 + rng.below(4)
@@ -286,6 +290,14 @@ mod tests {
                 c.transfers.iter().all(|t| t.pattern.packet.is_none()),
                 "filler leaked a packet transfer"
             );
+        }
+    }
+
+    #[test]
+    fn memtile_chains_are_single() {
+        for i in 0..60u64 {
+            let c = generate(i, "strided2d/memtile/mm2s/I32");
+            assert_eq!(c.transfers.len(), 1, "memtile chains must be single-transfer");
         }
     }
 

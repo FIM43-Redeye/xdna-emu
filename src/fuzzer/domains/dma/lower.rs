@@ -143,10 +143,92 @@ fn lower_shim(chain: &DmaChain) -> String {
     m
 }
 
-/// Task 7 fills this in; for now return a minimal placeholder so the crate
-/// compiles. Task 5 only exercises the shim path.
-fn lower_memtile(_chain: &DmaChain) -> String {
-    String::new()
+/// Memtile topology: the fuzzed access pattern rides a raw `aie.memtile_dma`
+/// static BD; the shim runs linear transfers in the runtime_sequence.
+///
+/// Single-transfer by construction (gen forces N=1 for memtile -- see the guard
+/// in `gen::generate`). The transfer's direction decides which memtile BD (S2MM
+/// or MM2S) carries the fuzzed n-D pattern; the other memtile BD is linear.
+/// Shape verified against `build/experiments/dma-spike/memtile_strided/aie.mlir`.
+fn lower_memtile(chain: &DmaChain) -> String {
+    assert_eq!(
+        chain.transfers.len(),
+        1,
+        "memtile lowering is single-transfer (gen forces N=1); got {}",
+        chain.transfers.len()
+    );
+    let t = &chain.transfers[0];
+    let elem = chain.dtype.mlir_elem();
+    let in_words = chain.in_words();
+    let out_words = chain.out_words();
+    let l = t.in_elems; // memtile BD region length (no padding this task)
+
+    // Direction routes the fuzzed pattern onto the matching memtile BD; the
+    // opposite memtile BD stays linear (empty access list).
+    let pat = pattern_list(&t.pattern);
+    let (s2mm_pat, mm2s_pat) = match t.dir {
+        Direction::Mm2s => (String::new(), pat),
+        Direction::S2mm => (pat, String::new()),
+    };
+
+    let mut m = String::new();
+    m.push_str("module {\n");
+    m.push_str("  aie.device(npu1_1col) {\n");
+    m.push_str("    %tile_0_0 = aie.tile(0, 0)\n");
+    m.push_str("    %tile_0_1 = aie.tile(0, 1)\n");
+    m.push_str("    aie.flow(%tile_0_0, DMA : 0, %tile_0_1, DMA : 0)\n");
+    m.push_str("    aie.flow(%tile_0_1, DMA : 0, %tile_0_0, DMA : 0)\n");
+
+    // Memtile static block: S2MM recv into a buffer, MM2S read back out. One of
+    // the two BDs carries the fuzzed pattern (per direction above).
+    m.push_str("    %memtile_dma_0_1 = aie.memtile_dma(%tile_0_1) {\n");
+    m.push_str(&format!(
+        "      %buf = aie.buffer(%tile_0_1) {{sym_name = \"mt_buf\"}} : memref<{out_words}x{elem}>\n"
+    ));
+    m.push_str("      %prod = aie.lock(%tile_0_1, 0) {init = 1 : i32, sym_name = \"mt_prod\"}\n");
+    m.push_str("      %cons = aie.lock(%tile_0_1, 1) {init = 0 : i32, sym_name = \"mt_cons\"}\n");
+    m.push_str("      %0 = aie.dma_start(S2MM, 0, ^s2mm, ^mm2s_entry)\n");
+    m.push_str("    ^s2mm:\n");
+    m.push_str("      aie.use_lock(%prod, AcquireGreaterEqual, 1)\n");
+    m.push_str(&format!("      aie.dma_bd(%buf : memref<{out_words}x{elem}>, 0, {l}{s2mm_pat})\n"));
+    m.push_str("      aie.use_lock(%cons, Release, 1)\n");
+    m.push_str("      aie.next_bd ^s2mm\n");
+    m.push_str("    ^mm2s_entry:\n");
+    m.push_str("      %1 = aie.dma_start(MM2S, 0, ^mm2s, ^end)\n");
+    m.push_str("    ^mm2s:\n");
+    m.push_str("      aie.use_lock(%cons, AcquireGreaterEqual, 1)\n");
+    m.push_str(&format!("      aie.dma_bd(%buf : memref<{out_words}x{elem}>, 0, {l}{mm2s_pat})\n"));
+    m.push_str("      aie.use_lock(%prod, Release, 1)\n");
+    m.push_str("      aie.next_bd ^mm2s\n");
+    m.push_str("    ^end:\n");
+    m.push_str("      aie.end\n");
+    m.push_str("    }\n");
+
+    // Runtime sequence: shim runs plain linear transfers (DDR in -> memtile,
+    // memtile -> DDR out). The reshuffle lives entirely on the memtile BD.
+    m.push_str(&format!(
+        "    aie.runtime_sequence(%in: memref<{in_words}x{elem}>, %out: memref<{out_words}x{elem}>) {{\n"
+    ));
+    m.push_str("      %recv = aiex.dma_configure_task(%tile_0_0, S2MM, 0) {\n");
+    m.push_str(&format!(
+        "        aie.dma_bd(%out : memref<{out_words}x{elem}>, 0, {out_words}) {{bd_id = 8 : i32}}\n"
+    ));
+    m.push_str("        aie.end\n");
+    m.push_str("      } {issue_token = true}\n");
+    m.push_str("      aiex.dma_start_task(%recv)\n");
+    m.push_str("      %t0 = aiex.dma_configure_task(%tile_0_0, MM2S, 0) {\n");
+    m.push_str(&format!(
+        "        aie.dma_bd(%in : memref<{in_words}x{elem}>, 0, {in_words}) {{bd_id = 0 : i32}}\n"
+    ));
+    m.push_str("        aie.end\n");
+    m.push_str("      } {issue_token = true}\n");
+    m.push_str("      aiex.dma_start_task(%t0)\n");
+    m.push_str("      aiex.dma_await_task(%t0)\n");
+    m.push_str("      aiex.dma_await_task(%recv)\n");
+    m.push_str("    }\n"); // runtime_sequence
+    m.push_str("  }\n"); // device
+    m.push_str("}\n"); // module
+    m
 }
 
 #[cfg(test)]
@@ -220,6 +302,32 @@ mod tests {
             "shim packet on op sig:\n{m}"
         );
         assert!(m.contains("aie.packet_flow("), "needs a packet_flow decl");
+    }
+
+    #[test]
+    fn memtile_mlir_uses_static_block() {
+        let c = generate(10, "strided2d/memtile/mm2s/I32");
+        let m = lower_chain(&c);
+        assert!(m.contains("aie.memtile_dma(%tile_0_1)"));
+        assert!(m.contains("aie.dma_start(MM2S"));
+        assert!(m.contains("aie.next_bd"));
+        assert!(!m.contains("aie.core"));
+    }
+
+    #[test]
+    #[ignore = "requires toolchain; run with --ignored"]
+    fn memtile_linear_compiles() {
+        compile_one("linear/memtile/mm2s/I32", 20);
+    }
+    #[test]
+    #[ignore]
+    fn memtile_strided_compiles() {
+        compile_one("strided2d/memtile/mm2s/I32", 21);
+    }
+    #[test]
+    #[ignore]
+    fn memtile_strided_s2mm_compiles() {
+        compile_one("strided2d/memtile/s2mm/I16", 22);
     }
 
     #[test]
