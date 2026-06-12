@@ -287,7 +287,7 @@ mod tests {
     fn vector_ops_verified_but_unclaimed_vector_ops_still_perishable() {
         use crate::aie2::isa::SemanticOp::*;
         let m = CoverageModel::build(Architecture::Aie2);
-        // #126: the 20 empirically silicon-verified Vector ops leave perishable.
+        // #126/#127: the 22 empirically silicon-verified Vector ops leave perishable.
         for op in [
             Mac,
             MatMul,
@@ -309,14 +309,15 @@ mod tests {
             Accumulate,
             AccumSub,
             Align,
+            Pack,
+            Unpack,
         ] {
             let v = m.semantic_verdict(&op);
             assert!(matches!(v.verification, Verification::Verified { .. }), "{op:?} must be Verified");
             assert!(!v.is_perishable(), "{op:?} must leave the perishable queue");
         }
-        // Deferred (Pack/Unpack: archive-only) + never-executed variants stay
-        // honestly perishable -- the audit does not claim them.
-        for op in [Min, Max, Pack, Unpack, MatMulSub, NegMatMul, VectorPush, AccumNegAdd, SubLt] {
+        // Never-executed variants stay honestly perishable -- not claimed.
+        for op in [Min, Max, MatMulSub, NegMatMul, VectorPush, AccumNegAdd, SubLt] {
             let v = m.semantic_verdict(&op);
             assert!(v.is_perishable(), "{op:?} is unclaimed -- must stay perishable");
         }

@@ -481,6 +481,7 @@ fn print_help() {
         "    xdna-emu fuzz --replay build/fuzz-scalar/phoenix-survival/scalar  # replay banked divergences"
     );
     println!("    xdna-emu fuzz-vector --iterations 50 --hw   # vector differential batch");
+    println!("    xdna-emu fuzz-vector --features pack16,unpack32 --hw  # stage a family subset");
     println!("    xdna-emu fuzz-vector --report               # vector coverage status");
     println!("    xdna-emu fuzz-dma --iterations 50 --hw      # DMA differential batch");
     println!("    xdna-emu fuzz-dma --report                  # DMA coverage status");

@@ -12,7 +12,7 @@
 //! Silicon-verified credit only: keys are credited when EMU == HW for the full
 //! output buffer. Without `--hw`, the run is a smoke/EMU sweep with no credit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -225,6 +225,9 @@ where
     let exec_start = Instant::now();
     let (mut pass, mut fail, mut error, mut crash, mut folded) = (0usize, 0usize, 0usize, 0usize, 0usize);
     let mut since_save = 0usize;
+    // Target keys already persisted to the passing corpus this run (opt-in
+    // --bank-matches). One canonical seed per key, first match wins.
+    let mut banked_match_keys: HashSet<String> = HashSet::new();
     for (i, (case, compile_result)) in cases.iter().zip(&compile_results).enumerate() {
         if compile_result.is_err() {
             continue;
@@ -292,6 +295,18 @@ where
         match dom.compare(&emu, &npu, &keys) {
             None => {
                 pass += 1;
+                // Persist the first silicon-matched seed per target key as a
+                // durable, replayable corpus entry (opt-in). The fresh bank
+                // carries a pool, so load_banked replays it table-independently.
+                if opts.bank_matches {
+                    let target = dom.target_key(&case.case);
+                    if banked_match_keys.insert(target.clone()) {
+                        match dom.bank(&case.case_dir, &case.case, Some(&npu), Some(&emu)) {
+                            Ok(dir) => println!("seed {seed} MATCH {target} -> banked {}", dir.display()),
+                            Err(e) => eprintln!("seed {seed} bank error: {e}"),
+                        }
+                    }
+                }
                 ledger.credit_keys(&keys);
                 if opts.verbose {
                     println!("seed {seed} MATCH ({} stages)", keys.len());

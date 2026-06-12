@@ -39,16 +39,18 @@ matched real NPU1 byte-for-byte.
 3. **Verified set:** union of `executed.json` over the live-24 (currently
    replay-confirmable) seeds, intersected with `Category::Vector`.
 
-## Result: 20 Vector-category SemanticOps verified
+## Result: 22 Vector-category SemanticOps verified
 
-Executed in current silicon-matched replay (live-24 occurrence count in
-parens; the count reflects the curated corpus size, not verification depth --
-the full campaign fuzzed each key 10+ times):
+20 from the original #126 audit, executed in current silicon-matched replay
+(live-24 occurrence count in parens; the count reflects the curated corpus
+size, not verification depth -- the full campaign fuzzed each key 10+ times):
 
     Convert(32) VectorBroadcast(27) VectorSelect(25) MatMul(24) Mac(21)
     VectorClear(15) Accumulate(15) MaxLt(14) AccumSub(13) VectorInsert(12)
     VectorExtract(12) MinGe(12) Srs(11) Ups(10) Align(6) NegLtz(2) NegGtz(2)
     MaxDiffLt(2) Shuffle(1) AbsGtz(1)
+
+plus **`Pack` + `Unpack`** added by #127 (see "#127 resolution" below).
 
 ## Corrections to the prior static guess
 
@@ -63,14 +65,31 @@ the full campaign fuzzed each key 10+ times):
   execute and match silicon (they are the real lowering of the coupler,
   matrix-accumulator, and movement families).
 
+## #127 resolution: Pack/Unpack re-fuzzed and claimed
+
+The #126 deferral noted Pack/Unpack matched only in archived no-pool seeds.
+#127 re-fuzzed the four pack/unpack families on real NPU1 with the current
+218-key table, banking **pool-bearing (replayable) seeds** via a new opt-in
+`fuzz-vector --bank-matches` (banks the first silicon-matched seed per key,
+distinct from the always-on divergence bank). 60/60 HW match, 0 divergent;
+the 4 banked seeds replay 4/4 (corpus now 28/28).
+
+The decisive finding -- another instance of "family name != SemanticOp":
+
+| family | aie_api          | lowers to     | claim                |
+|--------|------------------|---------------|----------------------|
+| pack16   | `aie::pack` I32->I16   | **`Srs`**   | already #126         |
+| pack8    | `aie::pack` I16->I8    | **`Pack`**  | **new (#127)**       |
+| unpack16 | `aie::unpack` I8->I16  | **`Unpack`**| **new (#127)**       |
+| unpack32 | `aie::unpack` I16->I32 | **`Ups`**   | already #126         |
+
+I32<->I16 narrowing/widening *is* SRS/UPS (the accumulator<->vector-register
+path); only the I16<->I8 couplers hit the dedicated `Pack`/`Unpack` ops.
+Evidence: `seed_70001` (pack8 -> `Pack/Int16`) and `seed_70002` (unpack16 ->
+`Unpack/Int8`), both HW-matched with pools, current dispatch confirmed by replay.
+
 ## Deferred (honest under-claim)
 
-- **`Pack`/`Unpack`** executed+matched only in the 45 **archived** seeds
-  (pre-218 table, no banked pool -> `load_banked` returns `Skip`, not currently
-  replayable). They were silicon-verified at campaign time but I cannot
-  *currently* replay-confirm them, so they stay perishable. Re-flip by
-  re-banking pack16/pack8/unpack16/unpack32 seeds with a pool (or a small HW
-  re-fuzz). Tracked as a follow-up, NOT claimed.
 - **Genuinely uncovered** (never executed; correctly stay perishable):
   `Min`, `Max` (dead -- see above), `MatMulSub`, `NegMatMul`, `AddMac`,
   `SubMac`, `NegMul`, `NegAdd`, `AccumNegAdd`, `AccumNegSub`, `VectorPush`,
@@ -78,9 +97,8 @@ the full campaign fuzzed each key 10+ times):
 
 ## Gate impact
 
-The 20 verified ops leave the perishable queue. `clean_release(Aie2)` stays
-**red**: the remaining ~14 unclaimed Vector ops + Pack/Unpack + the unclaimed
-SideEffect ops (stream/cascade, tenants 4/5) are still perishable. The override
-lives in `crates/xdna-archspec/src/coverage/units.rs` (`vector_ops_verified`),
-mirroring the DMA-ops override (#113): `AietoolsModeled -> Verified`, evidence =
-this audit.
+The 22 verified ops leave the perishable queue. `clean_release(Aie2)` stays
+**red**: the remaining unclaimed Vector ops + the unclaimed SideEffect ops
+(stream/cascade, tenants 4/5) are still perishable. The override lives in
+`crates/xdna-archspec/src/coverage/units.rs` (`vector_ops_verified`), mirroring
+the DMA-ops override (#113): `AietoolsModeled -> Verified`, evidence = this audit.

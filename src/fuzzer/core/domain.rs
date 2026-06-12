@@ -41,6 +41,12 @@ pub struct CampaignOptions {
     /// Lets a campaign be staged over a feature subset (e.g. run safe DMA
     /// patterns and bank them before pushing risky ones that may wedge the NPU).
     pub feature_filter: Option<Vec<String>>,
+    /// Persist the first silicon-matched seed per target key as a durable
+    /// regression-corpus entry (the *passing* corpus), not just divergences.
+    /// Opt-in (default off) so normal campaigns are unchanged; used for targeted
+    /// corpus-building runs (e.g. re-banking a previously stranded key with a
+    /// fresh pool-bearing seed). One canonical seed per key, first match wins.
+    pub bank_matches: bool,
 }
 
 /// Result of loading one banked case for replay.

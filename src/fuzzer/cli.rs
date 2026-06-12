@@ -45,6 +45,7 @@ pub fn parse_fuzz_args(args: &[String]) -> Result<ScalarFuzzOptions, String> {
         replay: None,
         reverify: false,
         feature_filter: None,
+        bank_matches: false,
     };
     let mut trace_sweep = false;
     let mut trace_sweep_reps = 5;
@@ -93,6 +94,7 @@ pub fn parse_vector_fuzz_args(args: &[String]) -> Result<VecFuzzOptions, String>
         replay: None,
         reverify: false,
         feature_filter: None,
+        bank_matches: false,
     };
 
     let mut iter = args.iter().skip(1);
@@ -108,6 +110,16 @@ pub fn parse_vector_fuzz_args(args: &[String]) -> Result<VecFuzzOptions, String>
             "--target-hits" => opts.target_hits = parse_next(&mut iter, "--target-hits")?,
             "--report" => opts.report_only = true,
             "--reverify" => opts.reverify = true,
+            // Stage a run over a feature subset (comma-separated family names,
+            // the first key segment): e.g. `--features pack16,unpack32`.
+            "--features" => {
+                let csv = iter.next().ok_or("--features requires a comma-separated list")?;
+                opts.feature_filter =
+                    Some(csv.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+            }
+            // Bank the first silicon-matched seed per key into the durable
+            // passing corpus (e.g. to re-seed a previously stranded key).
+            "--bank-matches" => opts.bank_matches = true,
             "--replay" => {
                 let dir = iter.next().ok_or("--replay requires a directory")?;
                 opts.replay = Some(PathBuf::from(dir));
@@ -135,6 +147,7 @@ pub fn parse_dma_fuzz_args(args: &[String]) -> Result<DmaFuzzOptions, String> {
         replay: None,
         reverify: false,
         feature_filter: None,
+        bank_matches: false,
     };
 
     let mut iter = args.iter().skip(1);
@@ -231,6 +244,31 @@ mod tests {
     #[test]
     fn vector_no_hw_clears_hw_last_wins() {
         assert!(!parse_vector_fuzz_args(&vargv(&["--hw", "--no-hw"])).unwrap().hw);
+    }
+
+    #[test]
+    fn vector_features_filter_parses() {
+        let o = parse_vector_fuzz_args(&vargv(&["--features", "pack16, pack8 ,unpack16,unpack32"])).unwrap();
+        assert_eq!(
+            o.feature_filter,
+            Some(vec![
+                "pack16".to_string(),
+                "pack8".to_string(),
+                "unpack16".to_string(),
+                "unpack32".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn vector_features_defaults_none() {
+        assert!(parse_vector_fuzz_args(&vargv(&[])).unwrap().feature_filter.is_none());
+    }
+
+    #[test]
+    fn vector_bank_matches_flag_parses() {
+        assert!(!parse_vector_fuzz_args(&vargv(&[])).unwrap().bank_matches);
+        assert!(parse_vector_fuzz_args(&vargv(&["--bank-matches"])).unwrap().bank_matches);
     }
 
     #[test]
