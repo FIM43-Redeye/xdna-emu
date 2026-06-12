@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use crate::fuzzer::core::domain::CampaignOptions;
+use crate::fuzzer::domains::dma::runner::DmaFuzzOptions;
 use crate::fuzzer::domains::scalar::runner::ScalarFuzzOptions;
 use crate::fuzzer::domains::vector::runner::VecFuzzOptions;
 
@@ -114,6 +115,47 @@ pub fn parse_vector_fuzz_args(args: &[String]) -> Result<VecFuzzOptions, String>
         }
     }
     Ok(opts)
+}
+
+/// Parse `fuzz-dma` subcommand args (full argv, including argv[0] and the
+/// `fuzz-dma` token) into `DmaFuzzOptions`. DMA is campaign-only (no legacy
+/// trace path). Unknown flags are errors so typos fail loudly.
+pub fn parse_dma_fuzz_args(args: &[String]) -> Result<DmaFuzzOptions, String> {
+    let mut campaign = CampaignOptions {
+        iterations: 0,
+        seed: None,
+        jobs: default_jobs(),
+        hw: false,
+        max_cycles: DEFAULT_MAX_CYCLES,
+        target_hits: 10,
+        verbose: false,
+        report_only: false,
+        replay: None,
+        reverify: false,
+    };
+
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "fuzz-dma" => {}
+            "--iterations" | "-n" => campaign.iterations = parse_next(&mut iter, "--iterations")?,
+            "--seed" => campaign.seed = Some(parse_next(&mut iter, "--seed")?),
+            "--jobs" | "-j" => campaign.jobs = parse_next(&mut iter, "--jobs")?,
+            "--max-cycles" => campaign.max_cycles = parse_next(&mut iter, "--max-cycles")?,
+            "--target-hits" => campaign.target_hits = parse_next(&mut iter, "--target-hits")?,
+            "--hw" => campaign.hw = true,
+            "--no-hw" => campaign.hw = false,
+            "--report" => campaign.report_only = true,
+            "--reverify" => campaign.reverify = true,
+            "--replay" => {
+                let dir = iter.next().ok_or("--replay requires a directory")?;
+                campaign.replay = Some(PathBuf::from(dir));
+            }
+            "--verbose" | "-v" => campaign.verbose = true,
+            other => return Err(format!("unknown fuzz-dma argument: {}", other)),
+        }
+    }
+    Ok(DmaFuzzOptions { campaign })
 }
 
 #[cfg(test)]
@@ -266,5 +308,17 @@ mod tests {
     #[test]
     fn non_numeric_value_is_an_error() {
         assert!(parse_fuzz_args(&argv(&["--iterations", "lots"])).is_err());
+    }
+
+    #[test]
+    fn parse_dma_fuzz_basic() {
+        let args: Vec<String> = ["bin", "fuzz-dma", "-n", "50", "--seed", "7", "--report"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let o = parse_dma_fuzz_args(&args).unwrap();
+        assert_eq!(o.campaign.iterations, 50);
+        assert_eq!(o.campaign.seed, Some(7));
+        assert!(o.campaign.report_only);
     }
 }

@@ -79,6 +79,19 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // DMA fuzz subcommand: same positional contract as `fuzz`.
+    if args.len() >= 2 && args[1] == "fuzz-dma" {
+        #[cfg(feature = "tooling")]
+        {
+            return run_dma_fuzz_command(&args);
+        }
+        #[cfg(not(feature = "tooling"))]
+        {
+            eprintln!("fuzz-dma command requires --features tooling");
+            std::process::exit(1);
+        }
+    }
+
     // Check for GUI mode
     let gui_mode = args.iter().any(|a| a == "--gui" || a == "-g");
     let file_arg: Option<&str> = args
@@ -420,6 +433,14 @@ fn run_fuzz_vector_command(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "tooling")]
+fn run_dma_fuzz_command(args: &[String]) -> anyhow::Result<()> {
+    let opts =
+        xdna_emu::fuzzer::cli::parse_dma_fuzz_args(args).map_err(|e| anyhow::anyhow!("fuzz-dma: {}", e))?;
+    xdna_emu::fuzzer::domains::dma::runner::run_dma_fuzz(&opts);
+    Ok(())
+}
+
 /// Print help message.
 fn print_help() {
     println!("xdna-emu - Open-source emulator for AMD XDNA NPUs");
@@ -429,6 +450,7 @@ fn print_help() {
     println!("    xdna-emu test-suite <PATH>");
     println!("    xdna-emu fuzz [OPTIONS]");
     println!("    xdna-emu fuzz-vector [OPTIONS]");
+    println!("    xdna-emu fuzz-dma [OPTIONS]");
     println!();
     println!("OPTIONS:");
     println!("    -h, --help          Print this help message");
@@ -443,6 +465,7 @@ fn print_help() {
     println!("    test-suite <PATH>   Run xclbin test suite from directory");
     println!("    fuzz [OPTIONS]      Scalar-op differential fuzzer (coverage-ledger driven; --trace-sweep for legacy trace path)");
     println!("    fuzz-vector [OPTIONS]  Vector-op differential fuzzer (coverage-ledger driven)");
+    println!("    fuzz-dma [OPTIONS]  DMA/data-movement differential fuzzer (coverage-ledger driven)");
     println!();
     println!("EXAMPLES:");
     println!("    xdna-emu                         # Launch GUI");
@@ -459,6 +482,8 @@ fn print_help() {
     );
     println!("    xdna-emu fuzz-vector --iterations 50 --hw   # vector differential batch");
     println!("    xdna-emu fuzz-vector --report               # vector coverage status");
+    println!("    xdna-emu fuzz-dma --iterations 50 --hw      # DMA differential batch");
+    println!("    xdna-emu fuzz-dma --report                  # DMA coverage status");
 }
 
 #[cfg(feature = "gui")]
