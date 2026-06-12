@@ -1,168 +1,149 @@
 # Scalar fuzzer as a coverage-driven Domain tenant (framework Step 2)
 
 **Date:** 2026-06-11
-**Status:** design, for review (precedes the Step 2 execution plan).
-**Decision taken (Maya, 2026-06-11):** upgrade the scalar fuzzer to coverage-driven
-(not a behavior-preserving port). It becomes a full `Domain` tenant matching
-vector -- universe, target-driven generation, banking, replay -- validating the
-`core::Domain` trait against a second, structurally different tenant.
-**Related:** `2026-06-11-unified-diff-fuzzing-framework.md` (the framework),
-`2026-06-11-framework-step1-lift-vector.md` (Step 1, the engine + vector tenant).
+**Status:** design, confirmed (Maya, 2026-06-11) -- ready to plan.
+**Decision:** upgrade the scalar fuzzer to a **coverage-driven, per-op-localized
+chain tenant** matching vector's rigor. Not a behavior-preserving port: scalar's
+program model is redesigned from a single-accumulator kernel into a **chain of
+elementwise stages**, each writing its own output region, so a divergence
+localizes to the exact op -- exactly as vector localizes per slice.
+**Related:** `2026-06-11-unified-diff-fuzzing-framework.md` (framework),
+`2026-06-11-framework-step1-lift-vector.md` (Step 1: engine + vector tenant).
 
-## Why this is an uplift, not a port
+> **Supersedes** this doc's first draft (the single-output-buffer / coarse
+> "program-level localization" model). Maya's call: go all the way to vector-grade
+> per-op rigor -- "bringing everything together rigor-wise really matters here."
 
-The scalar fuzzer (`src/fuzzer/{ast,gen,lower_cpp,params,runner}.rs`, `fuzz`) is a
-**seed-sweep**: `generate(seed)` makes a random program, runs it EMU-vs-HW, diffs
-bytes. It has no coverage universe, no target-driven generation, no banking, no
-replay -- none of the coverage-driven machinery the `Domain` trait (built against
-vector) assumes. Making it a tenant means *adding* that machinery. The trait does
-not change; scalar grows into it.
+## Why a redesign, and why it does not lose scalar's value
 
-The one structural fact that shapes everything below: **a scalar program writes a
-single output buffer** (the final accumulator stored in a loop), whereas a vector
-chain writes one 64-byte slice per stage. Vector gets *per-stage* divergence
-localization for free; scalar cannot. The design accommodates that.
+Today's scalar fuzzer (`src/fuzzer/{ast,gen,lower_cpp,params,runner}.rs`, `fuzz`)
+is a seed-sweep with a single accumulator stored once -> one output buffer -> a
+mismatch can't be pinned to an op. Vector localizes per-op because each stage
+writes its own slice. To match that, scalar adopts the **same chain shape**:
 
-## The six decisions
+- A case = N **stages** + a dtype + a loop style. Each stage is an elementwise
+  scalar op `out_k[i] = op_k(operand_a[i], operand_b[i])` over the buffer, writing
+  its **own output region k**. Operands draw from the input buffer, a prior
+  stage's output, or a literal.
+- The kernel still loops over buffer elements (Simple or HardwareLoop), so the
+  loop body still contains stores crossing the AIE2 ZOL back-edge; body size =
+  stage count still sweeps the fetch-packet boundary; stage k+1 reading stage k's
+  output is exactly the recency-1 structure. **Scalar's distinctive
+  ZOL-store-flush / recency-1 catches are preserved** -- we only *add* per-op
+  localization on top. (This was the key worry; working it through, the chain
+  model keeps every loop-timing property the accumulator model had.)
 
-### 1. Coverage universe -- `{feature}/{dtype}`
+Both tenants are now "a chain of ops, each writing its own output, localized
+per-op" -- distinct op tables and lowering, one coherent shape. That uniformity is
+the point.
 
-Mirror vector's `{name}/{type}/m{mode}` with a scalar-appropriate key:
-`{feature}/{dtype}` where `dtype` is one of `I32`/`I16`/`I8` and `feature` is one of:
-- the 8 scalar arithmetic ops: `add`, `sub`, `mul`, `and`, `or`, `xor`, `shl`, `shr`
-- the control-flow / structural features the fuzzer exists to stress:
-  `branch`, `hwloop`, `loop_simple`, `loop_hw`
+## The decisions
 
-That is 12 features x 3 dtypes = **36 keys**. The arithmetic 24 are the core
-verification claim ("every scalar op silicon-verified at every width"); the
-structural 12 cover the branch / hardware-loop / loop-style paths that the
-generator was widened to exercise (the AIE2 ZOL store-flush boundary -- see
-`gen.rs`). Operand kinds (Var/Literal/Load) are *not* separate keys -- they are
-ubiquitous and not independently interesting.
+### 1. Coverage universe -- per-op localizable + a case-level loop dimension
 
-> **Open choice for review:** granularity. We could drop the structural 12 (keep
-> only 24 arith keys), or add operand-kind keys (broader). Proposal: the 36 above
-> -- arith is the core, loop/branch coverage is worth it given the fuzzer's
-> ZOL-boundary heritage, operand kinds are noise.
+`{feature}/{dtype}`, dtype in `I32`/`I16`/`I8`:
+- **Arithmetic stages** (localizable): `add sub mul and or xor shl shr` x 3 = **24**.
+- **Branch-select stage** (localizable): `branch` x 3 = **3**. An elementwise
+  select `out[i] = cond[i] ? a[i] : b[i]` -- still writes its own region, still
+  localizes.
+- **Loop style** (case-level, not per-stage): `loop_simple`, `loop_hw` x 3 = **6**.
+  This is what exercises the ZOL boundary; credited to the case, not a stage.
+
+= **33 keys**, every *value-producing* key (the 27 arith + branch) per-op
+localizable; the 6 loop-style keys are case-level.
+
+**Dropped vs. today:** the nested `HwLoop`-as-an-op variant. A per-element nested
+loop has no clean localizable region, and the hardware-loop *execution path* is
+still covered by the `loop_hw` outer style. Small, deliberate narrowing for a
+fully-localizable model.
 
 ### 2. Target-driven generation -- `generate(seed, target)`
 
-Parse `target` = `{feature}/{dtype}`: set the program dtype to `dtype`, then
-generate the random (seeded) body as today BUT guarantee at least one instance of
-`feature` appears (force a `Mul` op for `mul/*`; force a `HwLoop` for `hwloop/*`;
-set `loop_style` for `loop_*`; inject a `Branch` for `branch/*`). The rest stays
-random. This is exactly vector's approach (a seeded random case that is
-*guaranteed to exercise the target*), so the round-robin campaign over uncovered
-keys works unchanged.
+Parse `target` = `{feature}/{dtype}`: set the chain's dtype; generate N seeded
+random stages; guarantee the target appears (force an `add..shr` stage for an
+arith target; force a branch-select stage for `branch/*`; set the outer loop style
+for `loop_*`). Round-robin over uncovered keys, exactly as vector.
 
-### 3. Localization -- coarse by necessity, honest about it
+### 3. Localization -- per-op, matching vector
 
-Single output buffer => a byte mismatch cannot be pinned to one op. Resolution,
-all expressible within the existing trait:
-- **On match:** credit *all* coverage keys the program exercised (like vector
-  credits all stage keys). A whole-program silicon match is strong evidence for
-  every (op, dtype) it contains.
-- **On mismatch:** `compare` returns the **target key** (the one generation aimed
-  at), and the engine banks the full program. `coverage_keys(case)` lists the
-  target key **first**, so the existing `compare -> keys.first()` shape lands the
-  flag on the target meaningfully. Per-*element* mismatch detail (the existing
-  `format_mismatch`: "element [i]: emu=X, npu=Y") is preserved in the bank/log for
-  human triage.
+Per-region comparison (region k <-> stage k). `first_divergent_region` returns the
+first differing region; `compare` maps it to that stage's coverage key -- the
+direct analogue of vector's `first_divergent_slice` + `slice_to_key`. On match,
+credit all stage keys + the case's loop-style key. On mismatch, flag the
+localized stage's key and bank the chain. Full op-level rigor.
 
-This is coarser than vector (program-level, not op-level localization), which is
-the price of the single-buffer kernel shape. The bank carries the full program,
-so triage loses nothing; only the *automatic* attribution is coarse.
+### 4. Vacuous (all-zero) regions -- credit, but keep counting
 
-> **Flag for review:** this is the real semantic difference from vector. If you
-> want op-level localization, scalar kernels would have to be restructured to
-> store per-op slices -- a large behavior change I do *not* recommend (it would
-> warp scalar into vector). Proposal: accept program-level localization + the
-> bank for triage.
+A region that is all-zero on both sides is a (weak) silicon match. The trait's
+`compare` is binary, so a vacuous region credits, but the runner logs the vacuous
+count for visibility (as today). Minor, bounded by `target_hits`; avoids a trait
+change. (Per-region now, so vacuity is judged per stage.)
 
-### 4. Vacuous (all-zero) matches -- credit, but keep counting them
+### 5. trace_sweep -- preserved as legacy path, NOT ported (a future "mode")
 
-The existing scalar fuzzer flags all-zero==all-zero as "vacuous" (counted apart
-from real passes -- weak evidence, both sides trivially zero). The trait's
-`compare` is binary (None=credit / Some=divergent) and has no "match but don't
-credit" state. Resolution: a vacuous match credits coverage (it *is* a silicon
-match), but the runner still logs the vacuous count for visibility (as today). The
-coverage weakening is minor and bounded by `target_hits` (it is unlikely all N
-hits for a key are vacuous). Avoiding a trait change is worth that small cost.
+Step 2 ports only the value-diff to `run_campaign(&ScalarDomain)`. `--trace-sweep`
+keeps its existing code (`execute_trace_sweep`, `generate_group_insts`, the
+`trace_sweep` module), routed separately. trace becomes a real framework mode in a
+later step. (Note: the legacy trace_sweep assumed the old accumulator kernel; it
+stays wired to whatever the scalar lowering produces, or is parked behind the flag
+until the trace-mode step -- the plan will confirm it still builds against the
+chain lowering, else gate it explicitly.)
 
-> **Alternative if you dislike crediting vacuous:** bias the generator away from
-> trivially-zero outputs. Harder to guarantee; proposal is to credit + log.
+### 6. Banking -- serialize the chain AST (inputs are formulaic)
 
-### 5. trace_sweep -- preserved as-is, NOT ported (it is a future "mode")
+Inputs are `Sequential { start: 1, step: 1 }`, determined by buffer_size, so no
+input pool to bank (unlike vector). A `ScalarChainRecord` banks: seed, target_key,
+dtype, buffer_size, loop_style, the stage list, the coverage keys, and the HW
+output. Needs `serde` on the chain AST types. Replay deserializes -> lowers ->
+compiles -> runs EMU -> compares per region vs banked HW. Table-independent (the
+AST is the source of truth).
 
-`run_fuzz` today bundles value-diff (Phases 1-2) with `--trace-sweep` (Phase 3: a
-multi-group trace capture + comparison). The framework treats trace/timing as
-**modes**, deferred. Step 2 ports only the **value-diff** to
-`run_campaign(&ScalarDomain)`. `--trace-sweep` keeps its existing code path
-(`execute_trace_sweep`, `generate_group_insts`, the `trace_sweep` module) intact,
-routed separately. So `fuzz` (value-diff) goes through the framework; `fuzz
---trace-sweep` runs the preserved legacy path. trace becomes a real framework mode
-in a later step, not now.
+### 7. One small trait change -- `dtype(&self, case)`
 
-### 6. Banking format -- serialize the AST (inputs are formulaic)
+Vector's dtype is always `"i32"`; scalar's is per-case (I32/I16/I8). Widen the
+trait method to `dtype(&self, case: &Self::Case) -> &str` (vector ignores the arg).
+Minimal and honest -- dtype genuinely depends on the case for scalar. The only
+trait touch Step 2 needs.
 
-Scalar inputs are `Sequential { start: 1, step: 1 }` -- fully determined by
-`buffer_size`, so there is no input pool to bank (unlike vector). A `ScalarRecord`
-banks: `seed`, `target_key`, `dtype`, `buffer_size`, the `KernelBody` AST, the
-coverage `keys`, and (for replay) the HW output. This needs `serde` derives on the
-AST types (`KernelBody`/`KernelOp`/`ScalarOp`/`Operand`/`Var`/`BufRef`/`LoopStyle`)
--- the scalar analogue of vector's `StageRecord`. Replay deserializes the AST ->
-lowers -> compiles -> runs EMU -> compares vs banked HW. Table-independent by
-construction (the AST is the source of truth, not a regeneration).
-
-## What the ScalarDomain looks like (sketch)
+## ScalarDomain sketch
 
 ```
 struct ScalarDomain;
-struct ScalarObs { output: Vec<u8>, trace: Option<Vec<u8>>, vacuous: bool }
+struct ScalarChain { seed, target_key, dtype, buffer_size, loop_style, stages: Vec<ScalarStage> }
+struct ScalarStage { op: StageOp, operand_a: Operand, operand_b: Operand }  // StageOp = Arith(ScalarOp) | BranchSelect
+struct ScalarObs { regions: Vec<u8>, trace: Option<Vec<u8>> }
 
 impl Domain for ScalarDomain {
-    type Case = FuzzParams;   // seed + buffer_size + dtype + KernelBody
-    type Obs  = ScalarObs;
-    fn name(&self) -> &str { "scalar" }                 // build/fuzz-scalar, phoenix-survival/scalar
-    fn universe(&self) -> Vec<String> { /* 36 keys */ }
-    fn generate(&self, seed, target) -> FuzzParams { /* targeted gen, decision 2 */ }
-    fn coverage_keys(&self, c) -> Vec<String> { /* exercised keys, target first */ }
-    fn target_key(&self, c) -> String { c.target_key }   // (new field on FuzzParams or carried)
-    fn lower(&self, c) -> String { lower_cpp::lower_to_cpp(c) }
-    fn buffer_words(&self, c) -> usize { c.buffer_size }
-    fn dtype(&self) -> &str { /* per-case: see note */ }
-    fn observe(backend, ..) -> ScalarObs { /* existing run_emulator / run_on_npu_raw */ }
-    fn compare(emu, ref, keys) -> Option<String> { /* byte-eq; vacuous->credit; mismatch->keys[0] */ }
-    fn bank(..) / load_banked(..) { /* ScalarRecord, decision 6 */ }
-    fn dump_divergent_observation(..) { /* emu_output.bin, like vector */ }
+    type Case = ScalarChain;   type Obs = ScalarObs;
+    fn name(&self) -> &str { "scalar" }                  // build/fuzz-scalar, phoenix-survival/scalar
+    fn universe(&self) -> Vec<String>                    // 33 keys (decision 1)
+    fn generate(&self, seed, target) -> ScalarChain      // targeted chain gen (decision 2)
+    fn coverage_keys(&self, c) -> Vec<String>            // exercised stage keys + loop-style key, target first
+    fn target_key(&self, c) -> String { c.target_key }
+    fn lower(&self, c) -> String                         // NEW chain lowering: per-stage elementwise store
+    fn buffer_words(&self, c) -> usize                   // N stages * buffer_size region layout
+    fn dtype(&self, c) -> &str                           // per-case (decision 7)
+    fn observe(backend, ..) -> ScalarObs
+    fn compare(emu, ref, keys) -> Option<String>         // per-region localize (decision 3)
+    fn bank / load_banked                                // ScalarChainRecord (decision 6)
+    fn dump_divergent_observation                        // emu regions for diff
 }
 ```
 
-**One trait-fit note:** `dtype()` is currently `&self -> &str` (vector is always
-`"i32"`), but scalar's dtype is *per-case* (I32/I16/I8). The compile call needs the
-case's dtype. Two clean options: (a) widen the trait to `dtype(&self, case:
-&Self::Case) -> &str` (vector ignores the arg), or (b) have the engine pass
-`dtype` via the case and the domain's `lower`/`buffer_words` already carry it.
-Proposal: **(a)** -- `dtype(&self, case)` -- minimal, honest (dtype genuinely
-depends on the case for scalar), vector adapts trivially. This is the one small
-trait change Step 2 needs; flagging it explicitly.
+## Folded-in Step-1 deferrals
 
-## Scope and deferrals folded in
-
-Step 2 also clears the two Step-1 deferrals, since this is the natural moment:
-- **`domains/` regrouping:** move `vector/` -> `domains/vector/` and the scalar
-  files -> `domains/scalar/`, now that there are two tenants to group (per the
-  framework doc's end-state layout). Module-path churn, mechanical.
+- **`domains/` regrouping:** `vector/` -> `domains/vector/`, scalar files ->
+  `domains/scalar/`. Mechanical module-path churn; now justified by two tenants.
 - **Engine log-string genericization:** the engine's hardcoded "Vector fuzz:" /
-  "vector ops" strings become `dom.name()`-driven, so the scalar tenant logs
-  correctly. (Step 1 deferred this; with a second tenant it now matters.)
+  "vector ops" strings become `dom.name()`-driven so the scalar tenant logs right.
 
 ## Acceptance
 
-- `cargo test --lib` stays green (no regression; new scalar-domain tests added).
-- The vector tenant is **unchanged**: 218/218 report + 24/0/0 replay still
-  bit-identical (the `domains/` move and `dtype(case)` change must not touch vector
-  fidelity).
-- A scalar coverage smoke run reaches its 36-key universe and credits on EMU-only
-  (no-HW) without panic; a short `--hw` campaign credits real silicon matches.
-- `fuzz --trace-sweep` still works via the preserved legacy path.
+- `cargo test --lib` green (new scalar-chain + scalar-domain tests added).
+- Vector tenant **unchanged**: 218/218 report + 24/0/0 replay still bit-identical
+  (the `domains/` move and `dtype(case)` change must not touch vector fidelity).
+- A scalar EMU-only smoke run reaches the 33-key universe and credits without
+  panic; a short `--hw` campaign credits real silicon matches with per-op
+  localization on any divergence.
+- `fuzz --trace-sweep` still builds and runs (or is explicitly gated if the chain
+  lowering breaks the legacy trace path -- decided in the plan).
