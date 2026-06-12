@@ -189,14 +189,27 @@ fn build_pattern(
             }
         }
         Feature::PadBefore | Feature::PadAfter | Feature::PadBoth => {
-            let (a, b) = split2(rng, region);
-            // 2D pattern [a, b]; pad lists are [outer, inner]. The memtile BD
-            // requires the INNERMOST (last) pad count to be 32-bit-word-aligned:
-            // `inner_pad * byte_size % 4 == 0`. `word` (elems per 32-bit word) is
-            // I32->1, I16->2, I8->4 -- so `inner_pad = word` gives 4 bytes exactly
-            // for I16/I8. For I32 (word==1) keep 2 for parity with the spike;
-            // 2 elems * 4B = 8B, still word-aligned. Outer-axis pad is
-            // unconstrained, stays 2.
+            // Padding is MEMTILE-only (table gating). Two memtile sub-32-bit pad
+            // rules, both rooted in the BD pad fields counting 32-bit WORDS (AM029
+            // "Constant Pad this many 32-bit words"; mlir-aie AIERT.cpp
+            // configureBdInBlock scales the innermost pad by elem_bytes/4):
+            //   1. each innermost pad count must be word-aligned in bytes
+            //      (enforced by `inner_pad` below + AIEDialect.cpp verifier), and
+            //   2. the padded innermost EXTENT (size + pad_before + pad_after)
+            //      must be a whole number of 32-bit words -- since the pads are
+            //      already word-granular, the innermost DATA size must itself be
+            //      word-aligned in bytes. A sub-word inner size (e.g. 2 i8 elems
+            //      = 2B) + word-granular padding yields a non-word extent that the
+            //      aie-rt CDO backend rejects ("Error generating CDO files").
+            // So split `region/word` units and scale the inner size by `word`
+            // (I32 word==1 -> no-op, inner size = b as before).
+            let units = (region / word).max(1);
+            let (a, bu) = split2(rng, units);
+            let b = bu * word;
+            // 2D pattern [a, b]; pad lists are [outer, inner]. `inner_pad = word`
+            // gives exactly 4 bytes for I16/I8; for I32 (word==1) keep 2 for parity
+            // with the spike (2 elems * 4B = 8B, still word-aligned). Outer-axis
+            // pad is unconstrained, stays 2.
             let outer_pad = 2u32;
             let inner_pad = if word == 1 { 2 } else { word as u32 };
             let (pb, pa) = match feature {
@@ -396,6 +409,19 @@ mod tests {
                         0,
                         "seed{i} key{key}: inner pad_after {pin_a} * {bs}B not 4-aligned"
                     );
+                    // Padded innermost EXTENT (size + pads) must be a whole number
+                    // of 32-bit words for sub-32b memtile, else the CDO backend
+                    // rejects it. Pads are already word-aligned above, so this is
+                    // really the innermost-size-word-alignment invariant.
+                    if bs < 4 {
+                        let inner_size = *p.sizes.last().unwrap() as usize;
+                        let extent = inner_size + pin_b + pin_a;
+                        assert_eq!(
+                            (extent * bs) % 4,
+                            0,
+                            "seed{i} key{key}: padded sub-32b innermost extent {extent} * {bs}B not 4-aligned"
+                        );
+                    }
                 }
                 assert_eq!(t.out_elems, t.in_elems + p.pad_elems());
             }
