@@ -156,6 +156,47 @@ pub(crate) fn first_divergent_region(emu: &[u8], hw: &[u8], n: usize) -> Option<
     None
 }
 
+/// Serialized form of a banked scalar chain. The chain AST is self-describing
+/// (no live table, no input pool -- inputs are formulaic Sequential), so the
+/// record is the chain itself plus the banked coverage keys (for localization)
+/// and the silicon output.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ScalarChainRecord {
+    pub(crate) chain: ScalarChain,
+    pub(crate) keys: Vec<String>,
+}
+
+impl ScalarChainRecord {
+    pub(crate) fn from_chain(chain: &ScalarChain, keys: &[String]) -> Self {
+        Self { chain: chain.clone(), keys: keys.to_vec() }
+    }
+}
+
+/// Bank a divergent/crashed chain under `phoenix-survival/scalar/seed_N/`.
+pub(crate) fn bank_case(
+    case_dir: &Path,
+    chain: &ScalarChain,
+    keys: &[String],
+    npu_output: Option<&[u8]>,
+) -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+    let bank_dir =
+        PathBuf::from(home).join(format!("npu-work/experiments/phoenix-survival/scalar/seed_{}", chain.seed));
+    std::fs::create_dir_all(&bank_dir).map_err(|e| format!("create {}: {e}", bank_dir.display()))?;
+
+    std::fs::copy(case_dir.join("fuzz_kernel.cc"), bank_dir.join("fuzz_kernel.cc"))
+        .map_err(|e| format!("copy fuzz_kernel.cc: {e}"))?;
+
+    let record = ScalarChainRecord::from_chain(chain, keys);
+    let json = serde_json::to_string_pretty(&record).map_err(|e| format!("serialize chain: {e}"))?;
+    std::fs::write(bank_dir.join("chain.json"), json).map_err(|e| format!("write chain.json: {e}"))?;
+
+    if let Some(out) = npu_output {
+        std::fs::write(bank_dir.join("npu_output.bin"), out).map_err(|e| format!("write npu_output: {e}"))?;
+    }
+    Ok(bank_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +258,15 @@ mod tests {
         let emu = vec![0u8; 3 * 8];
         let hw = vec![0u8; 2 * 8];
         assert!(first_divergent_region(&emu, &hw, 3).is_some());
+    }
+
+    #[test]
+    fn chain_record_round_trips_through_json() {
+        let c = generate(5, "mul/I16");
+        let record = ScalarChainRecord::from_chain(&c, &c.keys());
+        let json = serde_json::to_string(&record).unwrap();
+        let loaded: ScalarChainRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.chain, c);
+        assert_eq!(loaded.keys, c.keys());
     }
 }
