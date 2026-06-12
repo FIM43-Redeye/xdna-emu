@@ -7,6 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
+use super::toolchain::ToolPaths;
+
 /// Which executor produced an observation. Differential = any two backends; the
 /// vector domain compares `Interpreter` vs `Hardware`. `Aiesim` is enumerated
 /// for forward-compatibility but not wired for vector in Step 1.
@@ -77,6 +79,18 @@ pub trait Domain {
 
     /// Lower the case to kernel source text written as `fuzz_kernel.cc`.
     fn lower(&self, case: &Self::Case) -> String;
+
+    /// Compile the case in `case_dir` to `aie.xclbin` + `insts.bin`. The default
+    /// is the compute path used by vector and scalar: write `lower(case)` to
+    /// `fuzz_kernel.cc`, then run Peano + fuzz_template.py + aiecc via
+    /// `compile_kernel_case`. The DMA domain overrides this to write `aie.mlir`
+    /// and run aiecc directly (no kernel object, no template).
+    fn compile(&self, tools: &ToolPaths, case_dir: &Path, case: &Self::Case) -> Result<(), String> {
+        let src = self.lower(case);
+        std::fs::write(case_dir.join("fuzz_kernel.cc"), &src)
+            .map_err(|e| format!("write fuzz_kernel.cc: {e}"))?;
+        super::toolchain::compile_kernel_case(tools, case_dir, self.buffer_words(case), self.dtype(case))
+    }
 
     /// Buffer size in dtype words for the compile (`buf_in`/`scratch`/`out`).
     fn buffer_words(&self, case: &Self::Case) -> usize;
@@ -194,6 +208,18 @@ mod tests {
 
     fn drive<D: Domain>(d: &D) -> Vec<String> {
         d.universe()
+    }
+
+    #[test]
+    fn default_compile_writes_lowered_source() {
+        let dom = MockDomain;
+        let dir = std::env::temp_dir().join(format!("dma_seam_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dom.lower(&0u64);
+        std::fs::write(dir.join("fuzz_kernel.cc"), &src).unwrap();
+        let back = std::fs::read_to_string(dir.join("fuzz_kernel.cc")).unwrap();
+        assert_eq!(back, src);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use crate::fuzzer::core::domain::{Backend, Banked, CampaignOptions, Domain};
 use crate::fuzzer::core::ledger::Ledger;
-use crate::fuzzer::core::toolchain::{catch_panic, compile_kernel_case, ToolPaths};
+use crate::fuzzer::core::toolchain::{catch_panic, ToolPaths};
 
 /// Last lines of a (possibly long) error message, for unreachable reasons.
 fn tail_lines(msg: &str, n: usize) -> String {
@@ -137,14 +137,6 @@ where
         })
         .collect();
 
-    for (i, case) in cases.iter().enumerate() {
-        std::fs::create_dir_all(&case.case_dir).ok();
-        let cpp = dom.lower(&case.case);
-        if let Err(e) = std::fs::write(case.case_dir.join("fuzz_kernel.cc"), &cpp) {
-            eprintln!("seed {} write error: {e}", base_seed.wrapping_add(i as u64));
-        }
-    }
-
     // Compile phase (parallel work-stealing, like the scalar runner).
     let compile_start = Instant::now();
     let compiled: Vec<std::sync::Mutex<Option<Result<(), String>>>> =
@@ -158,14 +150,15 @@ where
             let next = &next;
             let done = &done;
             let tools = &tools;
+            let dom = &dom;
             s.spawn(move || loop {
                 let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if idx >= cases.len() {
                     break;
                 }
                 let case = &cases[idx];
-                let words = dom.buffer_words(&case.case);
-                let r = compile_kernel_case(tools, &case.case_dir, words, dom.dtype(&case.case));
+                std::fs::create_dir_all(&case.case_dir).ok();
+                let r = dom.compile(tools, &case.case_dir, &case.case);
                 *compiled[idx].lock().unwrap() = Some(r);
                 let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if !opts.verbose {
@@ -403,12 +396,7 @@ fn run_replay<D: Domain>(dom: &D, dir: &Path, opts: &CampaignOptions) {
                     }
                 }
             }
-            if let Err(e) = compile_kernel_case(
-                tools.as_ref().unwrap(),
-                case_dir,
-                dom.buffer_words(&case),
-                dom.dtype(&case),
-            ) {
+            if let Err(e) = dom.compile(tools.as_ref().unwrap(), case_dir, &case) {
                 errors += 1;
                 println!("{name}: recompile failed: {}", tail_lines(&e, 3));
                 continue;

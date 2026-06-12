@@ -11,9 +11,10 @@ use std::process::Command;
 
 /// Paths to external tools needed for compilation.
 ///
-/// `pub(crate)` so the vector fuzz runner (`super::domains::vector::runner`) reuses the
-/// same compile pipeline.
-pub(crate) struct ToolPaths {
+/// `pub` so it can appear in the `pub` `Domain::compile` trait method signature
+/// (the vector fuzz runner `super::domains::vector::runner` also reuses the same
+/// compile pipeline). Fields stay private/`pub(crate)`.
+pub struct ToolPaths {
     /// Peano clang compiler.
     pub(crate) peano_clang: PathBuf,
     /// Python interpreter from ironenv.
@@ -226,6 +227,57 @@ pub(crate) fn compile_kernel_case(
         return Err("aiecc.py succeeded but insts.bin not found".into());
     }
 
+    Ok(())
+}
+
+/// Compile a pre-written `case_dir/aie.mlir` to xclbin + insts via aiecc.py only
+/// (no Peano kernel object, no fuzz_template). Used by the DMA domain's
+/// `compile` override. Mirrors `compile_kernel_case`'s aiecc step exactly.
+// Consumed by the DMA domain's `Domain::compile` override (a later subtask);
+// the seam ships first so vector/scalar stay byte-identical.
+#[allow(dead_code)]
+pub(crate) fn compile_dma_mlir(tools: &ToolPaths, case_dir: &Path) -> Result<(), String> {
+    let xclbin = case_dir.join("aie.xclbin");
+    let mlir = case_dir.join("aie.mlir");
+    if xclbin.exists() {
+        if let (Ok(s), Ok(x)) = (std::fs::metadata(&mlir), std::fs::metadata(&xclbin)) {
+            if let (Ok(st), Ok(xt)) = (s.modified(), x.modified()) {
+                if xt > st {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let mut cmd = Command::new(&tools.python);
+    cmd.arg(&tools.aiecc)
+        .arg("--no-xchesscc")
+        .arg("--no-xbridge")
+        .arg("--no-aiesim")
+        .arg("--aie-generate-xclbin")
+        .arg("--aie-generate-npu-insts")
+        .arg("--no-compile-host")
+        .arg("--alloc-scheme=basic-sequential")
+        .arg("--xclbin-name=aie.xclbin")
+        .arg("--npu-insts-name=insts.bin")
+        .arg("aie.mlir");
+    cmd.current_dir(case_dir);
+    tools.apply_env(&mut cmd);
+    let out = cmd.output().map_err(|e| format!("Failed to spawn aiecc.py: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let combined = if stderr.is_empty() { stdout } else { stderr };
+        return Err(format!(
+            "aiecc.py failed:\n{}",
+            combined.lines().take(12).collect::<Vec<_>>().join("\n")
+        ));
+    }
+    if !xclbin.exists() {
+        return Err("aiecc.py succeeded but aie.xclbin not found".into());
+    }
+    if !case_dir.join("insts.bin").exists() {
+        return Err("aiecc.py succeeded but insts.bin not found".into());
+    }
     Ok(())
 }
 
