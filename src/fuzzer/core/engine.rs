@@ -94,12 +94,12 @@ where
 
     let uncovered = ledger.uncovered(&universe, opts.target_hits);
     if uncovered.is_empty() {
-        println!("Vector fuzz: coverage complete (target {} hits/key)", opts.target_hits);
+        println!("{} fuzz: coverage complete (target {} hits/key)", dom.name(), opts.target_hits);
         print!("{}", ledger.report(&universe, opts.target_hits));
         return;
     }
     if opts.iterations == 0 {
-        println!("Vector fuzz: 0 iterations requested ({} keys uncovered)", uncovered.len());
+        println!("{} fuzz: 0 iterations requested ({} keys uncovered)", dom.name(), uncovered.len());
         return;
     }
 
@@ -110,7 +110,8 @@ where
             .as_nanos() as u64
     });
     println!(
-        "Vector fuzz: {} iterations, base seed {}, {} uncovered keys, hw={}",
+        "{} fuzz: {} iterations, base seed {}, {} uncovered keys, hw={}",
+        dom.name(),
         opts.iterations,
         base_seed,
         uncovered.len(),
@@ -333,10 +334,11 @@ where
         exec_start.elapsed().as_secs_f64()
     );
     if folded > 0 {
-        println!("  ({folded} chains executed no vector ops -- folded)");
+        println!("  ({folded} cases flagged a warning)");
     }
     println!(
-        "Vector fuzz complete: {pass} pass, {fail} fail, {} error, {crash} CRASH",
+        "{} fuzz complete: {pass} pass, {fail} fail, {} error, {crash} CRASH",
+        dom.name(),
         error + compile_errors
     );
     println!("  uncovered keys remaining: {}", ledger.uncovered(&universe, opts.target_hits).len());
