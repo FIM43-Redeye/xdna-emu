@@ -23,6 +23,44 @@ rare. Every axis the silicon distinguishes, the fuzzer covers. The only
 deferrals here are *separate subsystems* that earn their own later scope
 (compute-tile DMA), never a "this signal probably doesn't matter" cut.
 
+## Post-spike findings & the 3a/3b split (2026-06-11)
+
+Before planning, a two-round toolchain spike hand-authored representative
+generated-style MLIR and pushed it through the real `aiecc.py` + the in-process
+emulator. **The approach is fully validated; nothing here is speculative.** Key
+results that concretize the decisions below:
+
+- **Topology proven.** Device target `npu1_1col`. Shim-fuzzed cases use a
+  **memtile linear passthrough with no core ELF** (cleanest -- pure data
+  movement, no compiled object). Memtile-fuzzed cases carry the pattern on a
+  **raw `aie.memtile_dma` block** -- object_fifo is *not* needed for anything,
+  including N independent transfers and padding. The exact `aiecc` invocation the
+  compute tenants already use works verbatim for pure-DMA MLIR (no kernel `.o`).
+- **Per-engine capability matrix** (raw-MLIR loopback). Both engines:
+  `linear`, `strided2d`, `strided3d`, `transpose`, `overlap`. Memtile-only:
+  `strided4d` (shim caps at 3 data dims), `padbefore`/`padafter`/`padboth`.
+  `packet`: both engines but **different emission site** -- on the shim it rides
+  the `aiex.dma_configure_task` op signature (`(..., <pkt_type=, pkt_id=>)`); on
+  the memtile it rides the `aie.dma_bd` attribute (`{packet =
+  #aie.packet_info<...>}`). `packet` and `pad*` are MM2S-only.
+- **Two emulator DMA-engine gaps found** (compile-clean, run-stall): shim `iter`
+  (the outermost access-pattern dim is the BD *repeat count*, which the
+  emulator's shim BD engine doesn't iterate) and memtile `chain` (multi-BD
+  `next_bd` -- the emulator drains BD0 then stalls). These need
+  emulator-internals fixes, not fuzzer code -- the tenant surfacing real axis-2
+  divergences before it is even built.
+
+**Scope split (Maya, 2026-06-11):**
+- **Plan 3a (this spec's build):** the framework seam + full fuzzer harness +
+  the **8 faithfully-executing features** (`linear`, `strided2d`, `strided3d`,
+  `strided4d`, `transpose`, `overlap`, `packet`, `pad{before,after,both}`),
+  built to 100%-clean against HW. Universe = **81 keys** (33 shim + 48 memtile;
+  see decision 3). `iter` and `chain` are present in the `Feature` enum (so 3b is
+  a gating flip, not a refactor) but **excluded from `universe_keys()`**.
+- **Plan 3b (follow-on):** fix the two emulator DMA-engine gaps (shim BD-repeat
+  iteration, memtile `next_bd` multi-BD stepping), then enable the `iter` (shim)
+  and `chain` (memtile) coverage keys. Tracked, not built here.
+
 ## Why DMA inverts the framework, and what that forces
 
 Vector (tenant 1) and scalar (tenant 2) are **compute** tenants. The engine is
@@ -76,11 +114,20 @@ Real pure-DMA tests loop DDR through the array. The minimal faithful path:
 DDR(in) -> shim MM2S -> memtile S2MM -> memtile MM2S -> shim S2MM -> DDR(out)
 ```
 
-The fuzzed pattern rides whichever BD the target key names (a shim BD or a
-memtile BD, on the MM2S or S2MM side); the other three BDs run linear 1D. The N
-transfers issue sequentially (configure -> start -> await, BD-reuse), each with
-its own in/out offsets -- exactly the `shim_dma_bd_reuse` structure. No compute
-core is involved (the path is pure DMA loopback).
+The fuzzed pattern rides whichever BD the target key names. The spike confirmed
+two concrete topologies:
+- **Shim-fuzzed case:** the fuzzed pattern rides the runtime_sequence
+  `aiex.dma_configure_task` BDs (per transfer, with offsets -- the
+  `shim_dma_bd_reuse` structure); the **memtile is a linear passthrough static
+  `aie.memtile_dma` block with NO core ELF** (pure data movement, nothing
+  compiled). Per-chain transfer length is fixed so the passthrough loop is a
+  simple fixed-chunk `dma_start`/`next_bd` self-loop.
+- **Memtile-fuzzed case:** the fuzzed pattern (incl. padding) rides a raw
+  `aie.memtile_dma` BD; the shim runs linear `dma_configure_task` BDs in the
+  runtime_sequence. N transfers become N entries in the memtile channel's BD
+  list (the verified `memtile_chain2` form).
+
+No compute core is ever involved (the path is pure DMA loopback).
 
 ### 3. Coverage universe -- `{feature}/{engine}/{dir}/{dtype}`
 
@@ -92,22 +139,30 @@ Four axes, with capability gating so only valid combinations enter the universe:
   not hide behind scatter coverage (the principle).
 - **dtype** in {`i32`, `i16`, `i8`} -- element size changes byte strides and
   padding granularity; first-class per the principle.
-- **feature** -- the structural access-pattern class:
-  - both engines: `linear` (1D contiguous baseline / known-good anchor),
-    `strided2d`, `strided3d`, `transpose`, `overlap` (stride < size), `iter`
-    (iteration dimension active), `chain` (use_next_bd, 2+ BDs).
-  - shim/memtile MM2S-only: `packet` (packet-switched routing; circuit is the
-    default implied by every other feature).
-  - memtile-only: `strided4d` (D3).
+- **feature** -- the structural access-pattern class (3a set, per the spike's
+  per-engine capability matrix):
+  - both engines, both dirs: `linear` (1D contiguous baseline / known-good
+    anchor), `strided2d`, `strided3d`, `transpose`, `overlap` (stride < size).
+  - memtile-only, both dirs: `strided4d` (shim caps at 3 data dims -- a 4th shim
+    entry is the BD repeat count, which is the deferred `iter` feature).
+  - both engines, MM2S-only: `packet` (packet-switched routing; circuit is the
+    default implied by every other feature). **Different emission site per
+    engine:** shim -> the `aiex.dma_configure_task` op signature; memtile -> the
+    `aie.dma_bd` attribute.
   - memtile MM2S-only: `padbefore`, `padafter`, `padboth` (per-dimension
     zero-padding -- only expressible at raw MLIR `aie.dma_bd` level, see
-    decision 6, and only inserted on memtile MM2S per the emulator's
-    `transfer/padding.rs`).
+    decision 6).
+  - **deferred to 3b** (in the `Feature` enum, excluded from `universe_keys()`):
+    `iter` (shim-only -- outermost-dim-as-repeat) and `chain` (memtile-only --
+    multi-BD `next_bd`). Both stall the emulator's DMA engine today (see the
+    post-spike section); 3b fixes the engine then flips their gating on.
 
-Capability gating (4D + padding -> memtile only; packet + padding -> MM2S only)
-is enforced from the AM025 field layouts (`crates/xdna-archspec/src/dma/field_layouts.rs`),
-not hardcoded. The valid cross-product lands at roughly 100+ keys -- between
-scalar's 33 and vector's 218, finishable, built to 100%.
+Capability gating is enforced from the spike matrix + AM025 field layouts
+(`crates/xdna-archspec/src/dma/field_layouts.rs`), not hardcoded. The 3a valid
+cross-product is **81 keys**: 33 shim (5 both-dir features x 2 dirs x 3 dtypes +
+`packet` MM2S-only x 3 dtypes) + 48 memtile (6 both-dir features x 2 dirs x 3
+dtypes + `packet` x 3 + 3 pad features MM2S-only x 3) -- between scalar's 33 and
+vector's 218, finishable, built to 100%.
 
 **Note on packet routing:** the #97-era recon found the emulator currently does
 not distinguish packet vs circuit *routing* (it inserts packet headers but treats
@@ -268,6 +323,12 @@ campaign-only (`run_campaign(&DmaDomain)`); no flag-gated legacy code.
 
 ## Deferred (own later scope, never "marginal")
 
+- **Plan 3b: `iter` (shim) + `chain` (memtile)** -- both compile clean but stall
+  the emulator's DMA engine today (shim outermost-dim BD-repeat not iterated;
+  memtile multi-BD `next_bd` drains BD0 then stalls). 3b fixes the engine
+  (`addressing.rs` BD-repeat stepping, the `next_bd` chain drive) and flips their
+  `universe_keys()` gating on. Enum support is built in 3a so 3b is a gating flip,
+  not a refactor.
 - **Compute-tile DMA** -- core-local (feeding the kernel, not DDR movement), a
   genuinely separate subsystem.
 - **Stage-B wedge-prone edges** (decision 9) -- designed-for as a tier, built when
