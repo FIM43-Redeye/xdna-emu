@@ -123,7 +123,7 @@ impl Ledger {
     }
 
     /// Human-readable campaign status over `universe`.
-    pub fn report(&self, universe: &[String], target: u32) -> String {
+    pub fn report(&self, name: &str, universe: &[String], target: u32) -> String {
         let uncovered = self.uncovered(universe, target);
         let covered = universe
             .iter()
@@ -132,7 +132,7 @@ impl Ledger {
             .count();
 
         let mut out = String::new();
-        let _ = writeln!(out, "vector fuzzer coverage (target {target} hits/key)");
+        let _ = writeln!(out, "{name} fuzzer coverage (target {target} hits/key)");
         let _ = writeln!(out, "  universe:    {}", universe.len());
         let _ = writeln!(out, "  covered:     {covered}");
         let _ = writeln!(out, "  uncovered:   {}", uncovered.len());
@@ -303,7 +303,7 @@ mod tests {
         ledger.mark_resolved(&key, "re-verified clean, seed 5000");
         ledger.mark_divergent(&key); // re-flagging drops the resolved record
         assert!(ledger.is_divergent(&key));
-        let report = ledger.report(&u, 10);
+        let report = ledger.report("test", &u, 10);
         assert!(!report.contains("resolved:"), "no resolved entries: {report}");
     }
 
@@ -353,7 +353,7 @@ mod tests {
         let u = test_universe();
         ledger.mark_divergent(&u[0]);
         ledger.credit_keys(&u[1..]);
-        let report = ledger.report(&u, 1);
+        let report = ledger.report("test", &u, 1);
         assert!(report.contains("divergent"), "report: {report}");
         assert!(report.contains("divergent:   1"), "report: {report}");
         let covered = format!("covered:     {}", u.len() - 1);

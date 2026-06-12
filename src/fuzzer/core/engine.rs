@@ -67,7 +67,7 @@ where
     let universe = dom.universe();
 
     if opts.report_only {
-        print!("{}", ledger.report(&universe, opts.target_hits));
+        print!("{}", ledger.report(dom.name(), &universe, opts.target_hits));
         return;
     }
 
@@ -95,7 +95,7 @@ where
     let uncovered = ledger.uncovered(&universe, opts.target_hits);
     if uncovered.is_empty() {
         println!("{} fuzz: coverage complete (target {} hits/key)", dom.name(), opts.target_hits);
-        print!("{}", ledger.report(&universe, opts.target_hits));
+        print!("{}", ledger.report(dom.name(), &universe, opts.target_hits));
         return;
     }
     if opts.iterations == 0 {
