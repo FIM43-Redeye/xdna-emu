@@ -66,40 +66,45 @@ pub fn coverage_rank(v: &Verdict) -> u32 {
     base + tiebreak
 }
 
-/// One representative SemanticOp per category (the rollup needs each
-/// category's default verdict, which is rep-invariant).
-/// Mirrors the reps table in artifacts.rs::render_architecture_index; the
-/// category_rep_is_rep_invariant test below guards them from diverging.
-fn category_rep(cat: Category) -> crate::aie2::isa::SemanticOp {
+/// Per-op subsystem refinement (spec Section 3): which spine domain(s) an
+/// individual SemanticOp belongs to. Defaults to the op's category domains, so
+/// for a category that tags a single domain (or whose ops all share a verdict)
+/// this is exactly `category_domains(category(op))`. It DIVERGES only where a
+/// category spans multiple subsystems with now-distinct verdicts: SideEffect
+/// splits into dma (DmaStart/DmaWait), the core-side stream engine
+/// (StreamRead/Write/WritePacketHeader -> stream_switch), and cascade
+/// (CascadeRead/Write). This refinement is what keeps a per-op Verified
+/// override (e.g. the silicon-verified DMA ops, #113) from leaking onto a
+/// sibling subsystem whose own ops are still unverified. By construction it is
+/// always a subset of the op's category domains (test-gated below).
+fn op_domains(op: &crate::aie2::isa::SemanticOp) -> &'static [&'static str] {
     use crate::aie2::isa::SemanticOp::*;
-    match cat {
-        Category::Arithmetic => Add,
-        Category::Bitwise => And,
-        Category::Comparison => SetLt,
-        Category::Memory => Load,
-        Category::ControlFlow => Br,
-        Category::Vector => Mac,
-        Category::Sync => LockAcquire,
-        Category::SideEffect => DmaStart,
-        Category::NeedsTriage => Intrinsic(0),
+    use crate::coverage::derive::category;
+    match op {
+        DmaStart | DmaWait => &["dma"],
+        StreamRead | StreamWrite | StreamWritePacketHeader => &["stream_switch"],
+        CascadeRead | CascadeWrite => &["cascade"],
+        other => category_domains(category(other)),
     }
 }
 
-/// Worst-wins rollup of the categories tagged to `domain_id` (spec S3).
-/// `None` == category-orphan (no rollup; row shows `-`, drift exempt).
-/// Phase-1 constraint: AIE2 only (the sole wired arch). A future multi-arch
-/// caller must thread an `Architecture` through here rather than relying on
-/// this hardcoded `Aie2` (spec Section 8 phasing).
+/// Worst-wins rollup over the SemanticOps that actually belong to `domain_id`
+/// (spec S3), via the per-op `op_domains` refinement. `None` == category-orphan
+/// (no op maps; row shows `-`, drift exempt). Computing the floor over the
+/// domain's OWN ops -- not a single category representative -- is what makes a
+/// heterogeneous category (some ops Verified, some not) roll up honestly per
+/// subsystem instead of crediting every tagged domain with a lucky rep's
+/// verdict. Phase-1 constraint: AIE2 only (the sole wired arch). A future
+/// multi-arch caller must thread an `Architecture` through here rather than
+/// relying on this hardcoded `Aie2` (spec Section 8 phasing).
 pub fn rolled_up_verdict(domain_id: &str) -> Option<Verdict> {
-    use crate::coverage::CoverageModel;
+    use crate::coverage::{all_semantic_ops, CoverageModel};
     use crate::types::Architecture;
     let m = CoverageModel::build(Architecture::Aie2);
-    let cats: Vec<Category> = tagged_categories(domain_id).collect();
-    if cats.is_empty() {
-        return None;
-    }
-    cats.into_iter()
-        .map(|c| m.semantic_verdict(&category_rep(c)))
+    all_semantic_ops()
+        .iter()
+        .filter(|op| op_domains(op).contains(&domain_id))
+        .map(|op| m.semantic_verdict(op))
         .min_by_key(|verd| coverage_rank(verd))
 }
 
@@ -220,23 +225,40 @@ mod tests {
     }
 
     #[test]
-    fn category_rep_is_rep_invariant() {
-        // Every representative must classify back to its own category, so the
-        // rollup's per-category default is the real one (mirrors
-        // artifacts.rs::architecture_index_reps_match_category).
+    fn sideeffect_rollup_is_per_subsystem_not_category_wide() {
+        // #113: DmaStart/DmaWait are silicon-Verified but the sibling SideEffect
+        // ops (core-side stream + cascade) are not. The per-subsystem rollup
+        // must credit ONLY dma -- never leak the DMA Verified verdict onto
+        // stream_switch/cascade, which is exactly the over-claim a single
+        // category-rep rollup produced once the category went heterogeneous.
+        let dma = rolled_up_verdict("dma").expect("dma rolls up");
+        assert!(
+            matches!(dma.verification, Verification::Verified { .. }),
+            "dma rolls up Verified from its own ops (DmaStart/DmaWait)"
+        );
+        for sib in ["stream_switch", "cascade"] {
+            let v = rolled_up_verdict(sib).expect("rolls up");
+            assert!(
+                matches!(v.verification, Verification::Unverified),
+                "{sib} must stay Unverified -- the DMA verdict must not leak across the SideEffect category"
+            );
+        }
+    }
+
+    #[test]
+    fn op_domains_refines_but_never_escapes_category_domains() {
+        // The per-op subsystem refinement sharpens the category->domain link; it
+        // must always be a subset of the op's category domains.
+        use crate::coverage::all_semantic_ops;
         use crate::coverage::derive::category;
-        for cat in [
-            Category::Arithmetic,
-            Category::Bitwise,
-            Category::Comparison,
-            Category::Memory,
-            Category::ControlFlow,
-            Category::Vector,
-            Category::Sync,
-            Category::SideEffect,
-            Category::NeedsTriage,
-        ] {
-            assert_eq!(category(&category_rep(cat)), cat, "category_rep({cat:?}) drifted");
+        for op in all_semantic_ops() {
+            let cat_doms = category_domains(category(&op));
+            for d in op_domains(&op) {
+                assert!(
+                    cat_doms.contains(d),
+                    "op {op:?} maps to domain {d} which is not in its category domains {cat_doms:?}"
+                );
+            }
         }
     }
 

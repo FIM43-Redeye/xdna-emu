@@ -12,7 +12,7 @@ pub mod units;
 pub mod verdict;
 
 use crate::aie2::isa::SemanticOp;
-use crate::coverage::derive::{category, default_verdict};
+use crate::coverage::derive::{category, default_verdict, Category};
 use crate::coverage::units::{capability_spine, override_registry, BehavioralUnit};
 use crate::coverage::verdict::Verdict;
 use crate::types::{Architecture, ModuleKind, SubsystemKind, TileKind};
@@ -80,6 +80,21 @@ impl CoverageModel {
         default_verdict(category(op))
     }
 
+    /// Worst-wins verdict over every SemanticOp in `cat` (spec Section 3
+    /// lattice). The per-category architecture-index row uses this: once a
+    /// category is heterogeneous -- a per-op override Verifies some but not all
+    /// of its ops (e.g. DMA-ops Verified while stream/cascade are not) -- the
+    /// honest category-level verdict is the weakest of its ops, never a lucky
+    /// representative.
+    pub fn category_verdict(&self, cat: Category) -> Verdict {
+        all_semantic_ops()
+            .iter()
+            .filter(|op| category(op) == cat)
+            .map(|op| self.semantic_verdict(op))
+            .min_by_key(|v| crate::coverage::subsystem::coverage_rank(v))
+            .expect("every category has at least one SemanticOp")
+    }
+
     fn claiming_unit(&self, node: &CoverageNode) -> Option<&BehavioralUnit> {
         self.overrides.iter().find(|u| match &u.claims {
             crate::coverage::units::Claims::Nodes(ns) => ns.contains(node),
@@ -132,7 +147,7 @@ impl CoverageModel {
 /// the real TableGen-decoded instruction set. The `len()` assertion in the
 /// test module is a maintenance tripwire (reminds a maintainer to update this
 /// list), NOT a proof of completeness. Do not claim a guard that is not here.
-fn all_semantic_ops() -> Vec<SemanticOp> {
+pub(crate) fn all_semantic_ops() -> Vec<SemanticOp> {
     use SemanticOp::*;
     vec![
         Add,
@@ -263,6 +278,50 @@ mod tests {
         let intr = m.semantic_verdict(&SemanticOp::Intrinsic(0));
         assert!(!intr.is_comprehension_gap(), "Intrinsic must be Accepted, not a gap");
         assert!(matches!(intr.verification, Verification::Accepted { .. }));
+    }
+
+    #[test]
+    fn category_verdict_is_worst_wins_over_ops() {
+        use crate::coverage::derive::Category;
+        let m = CoverageModel::build(Architecture::Aie2);
+        // SideEffect is heterogeneous now (DMA Verified, stream/cascade not);
+        // the category verdict must be the worst-wins floor (Unverified), never
+        // the DMA Verified rep -- the per-category architecture-index row must
+        // not over-claim.
+        let se = m.category_verdict(Category::SideEffect);
+        assert!(
+            matches!(se.verification, Verification::Unverified),
+            "SideEffect category floor stays Unverified while stream/cascade ops are unverified"
+        );
+        // A homogeneous category is unaffected.
+        let arith = m.category_verdict(Category::Arithmetic);
+        assert_eq!(arith.verification, Verification::NotApplicable);
+    }
+
+    #[test]
+    fn dma_ops_verified_but_other_side_effects_still_perishable() {
+        // #113 axis-2: the framework's DMA tenant silicon-verified DmaStart +
+        // DmaWait (81/81 access-pattern keys vs NPU1, 0 divergent). Those two
+        // leave the perishable queue; the rest of the SideEffect category
+        // (cascade + core-side stream, tenants 4/5) stays honestly perishable.
+        let m = CoverageModel::build(Architecture::Aie2);
+        for op in [SemanticOp::DmaStart, SemanticOp::DmaWait] {
+            let v = m.semantic_verdict(&op);
+            assert!(matches!(v.verification, Verification::Verified { .. }), "{op:?} must be Verified");
+            assert!(!v.is_perishable(), "{op:?} must leave the perishable queue");
+        }
+        for op in [
+            SemanticOp::CascadeRead,
+            SemanticOp::CascadeWrite,
+            SemanticOp::StreamRead,
+            SemanticOp::StreamWrite,
+            SemanticOp::StreamWritePacketHeader,
+        ] {
+            assert!(
+                m.semantic_verdict(&op).is_perishable(),
+                "{op:?} is a tenant-4/5 op, not claimed -- must stay perishable"
+            );
+        }
     }
 
     #[test]

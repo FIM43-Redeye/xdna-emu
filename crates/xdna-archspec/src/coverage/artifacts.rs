@@ -1,9 +1,8 @@
 //! Axis-2 honesty artifacts (spec Section 4): committed, diffable markdown.
 //! A staleness test fails if the committed file drifts from regeneration.
 
-use crate::aie2::isa::SemanticOp;
 use crate::coverage::CoverageModel;
-use crate::coverage::derive::{Category, category};
+use crate::coverage::derive::Category;
 use crate::coverage::subsystem::{
     category_domains, is_category_orphan, rolled_up_verdict, unannotated_material_drift,
 };
@@ -104,21 +103,24 @@ pub fn render_architecture_index(arch: Architecture) -> String {
         "| Category | Provenance | Verification | Domains |".to_string(),
         "|----------|------------|--------------|---------|".to_string(),
     ];
-    // One representative op per category, in a fixed order for determinism.
-    let reps: &[(Category, SemanticOp)] = &[
-        (Category::Arithmetic, SemanticOp::Add),
-        (Category::Bitwise, SemanticOp::And),
-        (Category::Comparison, SemanticOp::SetLt),
-        (Category::Memory, SemanticOp::Load),
-        (Category::ControlFlow, SemanticOp::Br),
-        (Category::Vector, SemanticOp::Mac),
-        (Category::Sync, SemanticOp::LockAcquire),
-        (Category::SideEffect, SemanticOp::DmaStart),
-        (Category::NeedsTriage, SemanticOp::Intrinsic(0)),
+    // Every category, in a fixed order for determinism. The row verdict is the
+    // worst-wins floor over the category's ops (m.category_verdict), NOT a
+    // single representative -- so a heterogeneous category (some ops Verified by
+    // a per-op override, some not) reports its honest floor here, while the
+    // per-subsystem split surfaces in subsystem-index.md.
+    let cats: &[Category] = &[
+        Category::Arithmetic,
+        Category::Bitwise,
+        Category::Comparison,
+        Category::Memory,
+        Category::ControlFlow,
+        Category::Vector,
+        Category::Sync,
+        Category::SideEffect,
+        Category::NeedsTriage,
     ];
-    for (cat, rep) in reps {
-        debug_assert_eq!(category(rep), *cat, "index representative drifted from category()");
-        let v = m.semantic_verdict(rep);
+    for cat in cats {
+        let v = m.category_verdict(*cat);
         let doms = category_domains(*cat);
         lines.push(format!(
             "| {cat:?} | {:?} | {:?} | {} |",
@@ -289,29 +291,6 @@ mod tests {
              gen_coverage_artifacts` then `git add docs/coverage/` and commit",
             path.display()
         );
-    }
-
-    #[test]
-    fn architecture_index_reps_match_category() {
-        // The renderer's hand-listed (Category, SemanticOp) reps must stay in
-        // sync with category(). The render fn also debug_assert!s this, but
-        // that is invisible to release builds -- this makes the invariant a
-        // first-class `cargo test --lib` gate that fails AT THE SOURCE with a
-        // clear message rather than as a downstream staleness string-diff.
-        let reps: &[(Category, SemanticOp)] = &[
-            (Category::Arithmetic, SemanticOp::Add),
-            (Category::Bitwise, SemanticOp::And),
-            (Category::Comparison, SemanticOp::SetLt),
-            (Category::Memory, SemanticOp::Load),
-            (Category::ControlFlow, SemanticOp::Br),
-            (Category::Vector, SemanticOp::Mac),
-            (Category::Sync, SemanticOp::LockAcquire),
-            (Category::SideEffect, SemanticOp::DmaStart),
-            (Category::NeedsTriage, SemanticOp::Intrinsic(0)),
-        ];
-        for (cat, rep) in reps {
-            assert_eq!(category(rep), *cat, "rep {rep:?} drifted from category {cat:?}");
-        }
     }
 
     #[test]

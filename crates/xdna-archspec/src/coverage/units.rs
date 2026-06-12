@@ -66,8 +66,68 @@ impl CapabilityDomain {
 /// sole current entry Accepts the `SemanticOp::Intrinsic(_)` catch-all (#104).
 pub fn override_registry(arch: Architecture) -> Vec<BehavioralUnit> {
     match arch {
-        Architecture::Aie2 => vec![intrinsic_catchall_accepted()],
+        Architecture::Aie2 => vec![intrinsic_catchall_accepted(), dma_ops_verified()],
         _ => Vec::new(),
+    }
+}
+
+/// Flip `DmaStart` + `DmaWait` to silicon-Verified (#113 axis-2).
+///
+/// The diff-fuzzing framework's DMA/data-movement tenant drove the DMA
+/// access-pattern engine against real NPU1 silicon to ledger completion: the
+/// full 81-key universe `{feature}/{engine}/{dir}/{dtype}` (33 shim + 48
+/// memtile; linear/strided-2d/3d/4d/transpose/overlap/packet/pad-{before,
+/// after,both}) was silicon-matched at depth ~10 seeds/key -- 810 HW cases, 0
+/// emulator-vs-silicon divergences, 0 crashes, 0 wedges. Every n-dimensional BD
+/// program the generator can express lands byte-for-byte identically on the
+/// emulator and the hardware. In SemanticOp terms that is exactly `DmaStart`
+/// (issue + walk the BD) and `DmaWait` (await channel completion).
+///
+/// Scope is deliberately TWO ops, not the whole `SideEffect` category. The
+/// remaining five SideEffect ops -- `CascadeRead`/`CascadeWrite` (cascade) and
+/// `StreamRead`/`StreamWrite`/`StreamWritePacketHeader` (core-side stream) --
+/// are the contention/cascade tenants (4/5) and are NOT exercised by the DMA
+/// tenant, so they keep their honest `DocSpecified`/`Unverified` default.
+///
+/// Provenance stays `DocSpecified` (the access-pattern semantics are
+/// AM025/aie-rt described); only the verification axis moves to `Verified`,
+/// mirroring the modeled-then-silicon-checked transition. This Verified flip
+/// does NOT green `clean_release(Aie2)`: the perishable queue still holds the
+/// vector ops and the unclaimed SideEffect ops, so the gate stays honestly red
+/// until the vector and tenant-4/5 work lands.
+fn dma_ops_verified() -> BehavioralUnit {
+    use crate::aie2::isa::SemanticOp;
+    use crate::coverage::verdict::{Provenance, Verdict};
+    BehavioralUnit {
+        id: "aie2.dma_ops.verified".into(),
+        arch: Architecture::Aie2,
+        claims: Claims::Nodes(vec![
+            CoverageNode::Semantic { arch: Architecture::Aie2, op: SemanticOp::DmaStart },
+            CoverageNode::Semantic { arch: Architecture::Aie2, op: SemanticOp::DmaWait },
+        ]),
+        verdict: Verdict {
+            provenance: Provenance::DocSpecified,
+            verification: Verification::Verified {
+                evidence: "Diff-fuzzing framework DMA/data-movement tenant vs real NPU1: the full \
+                    81-key access-pattern universe ({feature}/{engine}/{dir}/{dtype}, 33 shim + 48 \
+                    memtile, linear/strided-2d/3d/4d/transpose/overlap/packet/pad-*) silicon-matched \
+                    at depth ~10 seeds/key -- 810 HW cases, 0 divergent, 0 crash, 0 wedge. The \
+                    emulator DMA model is indistinguishable from NPU1 silicon across the whole \
+                    n-dimensional BD access-pattern space. See \
+                    docs/superpowers/plans/2026-06-11-framework-step3a-dma-tenant.md (Outcome) and \
+                    docs/superpowers/specs/2026-06-11-dma-data-movement-domain.md."
+                    .into(),
+            },
+        },
+        shadows_derived: Some(
+            "DmaStart/DmaWait otherwise derive to the SideEffect category default \
+             (DocSpecified/Unverified -> perishable). This override claims ONLY these two ops -- \
+             the silicon evidence is the DMA-engine access-pattern campaign, which does not touch \
+             the cascade (CascadeRead/Write) or core-side stream (StreamRead/Write/ \
+             WritePacketHeader) ops; those stay on their derived default for tenants 4/5."
+                .into(),
+        ),
+        shared_from: None,
     }
 }
 
@@ -269,18 +329,54 @@ mod tests {
 
     #[test]
     fn override_registry_has_intrinsic_accept() {
-        // #104: the sole Phase-2 override is the Accept of the
-        // SemanticOp::Intrinsic(_) catch-all (never constructed, fail-loud; the
-        // concrete ops it resolves to are differentially verified -- #103). The
-        // rest of the spine still rides coarse derived defaults.
+        // #104: one Phase-2 override is the Accept of the SemanticOp::Intrinsic(_)
+        // catch-all (never constructed, fail-loud; the concrete ops it resolves
+        // to are differentially verified -- #103). Located by id, not index, so
+        // it survives the registry growing (the DMA-ops Verified override, #113,
+        // is the sibling entry).
         use crate::coverage::verdict::Verification;
         let regs = override_registry(Architecture::Aie2);
-        assert_eq!(regs.len(), 1, "exactly the intrinsic-catchall Accept");
-        assert!(matches!(regs[0].verdict.verification, Verification::Accepted { .. }));
-        assert!(
-            regs[0].shadows_derived.is_some(),
-            "Accept pulls Intrinsic off its derived NeedsTriage default"
+        let intr = regs
+            .iter()
+            .find(|u| u.id == "aie2.intrinsic_catchall.accepted")
+            .expect("intrinsic-catchall Accept present");
+        assert!(matches!(intr.verdict.verification, Verification::Accepted { .. }));
+        assert!(intr.shadows_derived.is_some(), "Accept pulls Intrinsic off its derived NeedsTriage default");
+    }
+
+    #[test]
+    fn override_registry_has_dma_ops_verified() {
+        // #113 axis-2: the DMA/data-movement tenant of the diff-fuzzing
+        // framework silicon-verified the DMA access-pattern engine against
+        // real NPU1 (81/81 keys, 810 HW cases at depth ~10, 0 divergent),
+        // which exercises exactly the DmaStart + DmaWait SemanticOps. The
+        // other five SideEffect ops (CascadeRead/Write, StreamRead/Write/
+        // WritePacketHeader) are the core-side stream/cascade tenants 4/5 --
+        // deliberately NOT claimed here. Under-claim is safe; over-claim is a
+        // correctness bug.
+        use crate::aie2::isa::SemanticOp;
+        use crate::coverage::verdict::Verification;
+        let regs = override_registry(Architecture::Aie2);
+        let dma = regs
+            .iter()
+            .find(|u| u.id == "aie2.dma_ops.verified")
+            .expect("DMA-ops Verified override present");
+        assert!(matches!(dma.verdict.verification, Verification::Verified { .. }));
+        let Claims::Nodes(nodes) = &dma.claims;
+        let want_start = CoverageNode::Semantic { arch: Architecture::Aie2, op: SemanticOp::DmaStart };
+        let want_wait = CoverageNode::Semantic { arch: Architecture::Aie2, op: SemanticOp::DmaWait };
+        assert!(nodes.contains(&want_start), "claims DmaStart");
+        assert!(nodes.contains(&want_wait), "claims DmaWait");
+        assert_eq!(
+            nodes.len(),
+            2,
+            "claims DmaStart + DmaWait ONLY -- not the whole SideEffect category (cascade/stream are tenants 4/5)"
         );
+        assert!(
+            dma.shadows_derived.is_some(),
+            "Verified pulls DMA ops off their DocSpecified/Unverified default"
+        );
+        assert!(dma.shared_from.is_none(), "earned on AIE2 silicon directly, not shared");
     }
 
     #[test]
