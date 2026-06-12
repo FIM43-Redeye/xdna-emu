@@ -391,6 +391,11 @@ impl Domain for VectorDomain {
             keys: record.keys,
         })
     }
+
+    fn dump_divergent_observation(&self, case_dir: &Path, emu: &VecObs) -> Result<(), String> {
+        std::fs::write(case_dir.join("emu_output.bin"), &emu.output)
+            .map_err(|e| format!("emu_output.bin write error: {e}"))
+    }
 }
 
 #[cfg(test)]
@@ -548,5 +553,124 @@ mod tests {
     fn table_version_is_stable_across_calls() {
         assert_eq!(current_table_version(), current_table_version());
         assert_ne!(current_table_version(), 0);
+    }
+
+    use crate::fuzzer::core::toolchain::ToolPaths;
+
+    /// Last lines of a (possibly long) compiler error message.
+    fn tail_lines(msg: &str, n: usize) -> String {
+        let lines: Vec<&str> = msg.lines().collect();
+        let start = lines.len().saturating_sub(n);
+        lines[start..].join("\n")
+    }
+
+    /// 200-seed Peano compile-clean: every lowered chain must compile with
+    /// `clang -O2 -c` (no aiecc). Catches bad emit strings (the bf16 sel/bcast
+    /// spellings were extrapolated, not spike-probed). Run once per table
+    /// change:
+    /// `cargo test --lib --features tooling vector_compile_clean -- --ignored`
+    #[test]
+    #[ignore = "needs Peano toolchain; run explicitly after table changes"]
+    fn vector_compile_clean_200_seeds() {
+        let tools = ToolPaths::discover().expect("tool discovery");
+        let universe = universe_keys();
+        let dir = std::env::current_dir().unwrap().join("build/fuzz-vector/compile-clean");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // At least 200 seeds, and at least one seed per universe key so every
+        // table entry/mode gets compiled.
+        let n_seeds = 200u64.max(universe.len() as u64);
+        let cases: Vec<(u64, String, PathBuf)> = (0..n_seeds)
+            .map(|seed| {
+                let key = universe[(seed as usize) % universe.len()].clone();
+                let case_dir = dir.join(format!("seed_{seed}"));
+                std::fs::create_dir_all(&case_dir).unwrap();
+                let chain = generate(seed, &key);
+                std::fs::write(case_dir.join("fuzz_kernel.cc"), lower_chain(&chain)).unwrap();
+                (seed, key, case_dir)
+            })
+            .collect();
+
+        // Sanity: round-robin over 200 seeds covers every table entry.
+        let entry_count = table().len();
+        assert!(universe.len() >= entry_count);
+
+        let failures = std::sync::Mutex::new(Vec::new());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let cases = &cases;
+                let tools = &tools;
+                let failures = &failures;
+                let next = &next;
+                s.spawn(move || loop {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= cases.len() {
+                        break;
+                    }
+                    let (seed, key, case_dir) = &cases[idx];
+                    let mut cmd = std::process::Command::new(&tools.peano_clang);
+                    cmd.arg("--target=aie2-none-unknown-elf")
+                        .arg("-O2")
+                        .arg("-std=c++20") // aie_api headers are C++20 (concepts)
+                        .arg("-c")
+                        .arg(case_dir.join("fuzz_kernel.cc"))
+                        .arg("-o")
+                        .arg(case_dir.join("fuzz_kernel.cc.o"));
+                    if let Some(inc) = tools.aie_api_include() {
+                        cmd.arg("-I").arg(inc);
+                    }
+                    tools.apply_env(&mut cmd);
+                    match cmd.output() {
+                        Ok(out) if out.status.success() => {
+                            // A successful compile can still fail to LINK: some
+                            // aie_api paths (i8 mmul 4x8x4, vector::set on 8-bit
+                            // lanes) reference an undefined runtime-mode
+                            // ::shuffle(v8DB64) symbol Peano's lib never defines.
+                            // Scan undefined symbols so link gaps fail here, not
+                            // in the aiecc pipeline. memset/memcpy resolve from
+                            // compiler-rt and are expected.
+                            if let Some(und) = undefined_symbols(tools, &case_dir.join("fuzz_kernel.cc.o")) {
+                                failures
+                                    .lock()
+                                    .unwrap()
+                                    .push(format!("seed {seed} key {key}: undefined symbols:\n{und}"));
+                            }
+                        }
+                        Ok(out) => failures.lock().unwrap().push(format!(
+                            "seed {seed} key {key}:\n{}",
+                            tail_lines(&String::from_utf8_lossy(&out.stderr), 8)
+                        )),
+                        Err(e) => failures.lock().unwrap().push(format!("seed {seed} key {key}: spawn {e}")),
+                    }
+                });
+            }
+        });
+
+        let failures = failures.into_inner().unwrap();
+        assert!(failures.is_empty(), "{} compile failures:\n{}", failures.len(), failures.join("\n---\n"));
+    }
+
+    /// Undefined symbols in an object file (excluding compiler-rt intrinsics:
+    /// mem* and `__`-prefixed soft-float builtins like __floatunsisf, which
+    /// aiecc resolves from libclang_rt), via Peano llvm-objdump. Real library
+    /// gaps are C++-mangled (e.g. _Z7shuffleDv8_DB64_S0_j). None = clean.
+    fn undefined_symbols(tools: &ToolPaths, obj: &Path) -> Option<String> {
+        let objdump = tools.peano_clang.parent()?.join("llvm-objdump");
+        let out = std::process::Command::new(objdump).arg("-t").arg(obj).output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let und: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("*UND*"))
+            .filter(|l| {
+                let sym = l.rsplit(' ').next().unwrap_or("");
+                !sym.starts_with("mem") && !sym.starts_with("__")
+            })
+            .collect();
+        if und.is_empty() {
+            None
+        } else {
+            Some(und.join("\n"))
+        }
     }
 }

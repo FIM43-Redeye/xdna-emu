@@ -6,8 +6,10 @@
 //! (`docs/superpowers/plans/2026-06-11-framework-step1-lift-vector.md`).
 
 pub mod domain;
+pub mod engine;
 pub mod ledger;
 pub mod toolchain;
 
 pub use domain::{Backend, Banked, CampaignOptions, Domain};
+pub use engine::run_campaign;
 pub use ledger::Ledger;

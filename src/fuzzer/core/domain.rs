@@ -121,6 +121,16 @@ pub trait Domain {
     /// Load one banked seed dir for replay: reconstruct the case + reference
     /// observation, or report why it cannot be replayed.
     fn load_banked(&self, seed_dir: &Path) -> Result<Banked<Self::Case, Self::Obs>, String>;
+
+    /// Persist post-mortem artifacts for a case that is STILL divergent on
+    /// replay (called by the engine's replay loop). The default is a no-op;
+    /// a domain overrides it to dump whatever helps a human diff the failure
+    /// (vector writes the EMU output next to the banked reference for byte
+    /// diffing). `case_dir` is the banked seed dir. Errors are logged, not fatal.
+    fn dump_divergent_observation(&self, case_dir: &Path, emu: &Self::Obs) -> Result<(), String> {
+        let _ = (case_dir, emu);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
