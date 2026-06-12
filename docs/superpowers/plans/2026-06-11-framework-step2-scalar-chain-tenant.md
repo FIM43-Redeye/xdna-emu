@@ -1857,3 +1857,62 @@ Generated using Claude Code."
 - **Type consistency:** `Dtype`/`LoopStyle`/`ScalarOp`/`StageOp`/`Operand`/`ScalarStage`/`ScalarChain` are defined in Task 2 and used unchanged through Tasks 3-11. `ScalarObs` has fields `output`/`trace` throughout. `coverage_keys` = stage keys + loop key everywhere; `region_keys` filters `loop_` everywhere.
 - **The loop-key-in-localization trap:** `compare` must filter `loop_`-prefixed keys (Task 7/9). A naive index into the full keys vector would mislabel a length mismatch as the loop key -- the `region_keys` filter plus the `r.min(n-1)` clamp prevent that. This is the scalar analogue of the Step-1 Task-4 compare-on-keys fix; do not regress it.
 - **Legacy trace risk:** Task 11 renames but does not gut `fuzzer::runner`. If the rename surfaces a path the legacy path depended on (e.g. an external caller of `run_fuzz`), search `grep -rn "runner::run_fuzz" src/` before renaming and update every caller.
+
+---
+
+## Outcome
+
+**Status: COMPLETE.** Executed subagent-driven on branch `framework-step2-scalar-tenant`
+(2026-06-11), fresh implementer per task, foreground builds throughout.
+
+**Commits** (12, `fd4e0e0b..` on the branch, off master `833b989b`-era + the plan commit):
+
+| Commit | Task |
+|--------|------|
+| `fd4e0e0b` | 1 -- regroup `vector/` -> `domains/vector/` (pure move) |
+| `f05bc062` | 2 -- chain AST + coverage keys |
+| `6ed72019` | 3 -- 33-key universe + target-key parsing |
+| `f8be58c7` | 4 -- deterministic target-driven generation |
+| `0ea2b770` | 5 -- chain -> C kernel lowering (per-stage region stores) |
+| `406a9782` | 6 -- ScalarObs, buffer spec, EMU/HW observe |
+| `cce6d7b9` | 7 -- per-region exact-byte localization helpers |
+| `2730d2e1` | 8 -- ScalarChainRecord banking |
+| `32ed2df1` | 9 -- `impl Domain` + `dtype(&self, case)` trait change |
+| `8065bb1e` | 10 -- genericize engine log strings via `dom.name()` |
+| `bb78fb49` | 11 -- CLI + runner dispatch (coverage default, `--trace-sweep` legacy) |
+| (UB note) | review follow-up -- document accepted signed-overflow UB in lowering |
+
+**Test count:** 3421 at plan start -> **3459** at completion (+38 scalar tests), 6 ignored,
+green throughout. No regression at any task boundary.
+
+**Acceptance, all met:**
+- `cargo test --lib` green (3459).
+- **Vector tenant byte-identical** (the hard bar): report 218/218 covered, 0 divergent,
+  6 resolved; replay 24 match, 0 divergent, 0 error -- unchanged by the `domains/` move
+  (Task 1) and the `dtype(case)` trait change (Task 9).
+- **Scalar EMU smoke** (`fuzz --iterations 40 --seed 1`): Compile 40 ok / 0 error;
+  Execute 40 pass / 0 fail / 0 CRASH. First real Peano/aiecc compile + EMU run of the
+  chain lowering -- no codegen issues. `fuzz --report` reaches the 33-key universe.
+- **Legacy trace intact** (`fuzz --trace-sweep --no-hw`): 4 compiled, emulator-only sweep
+  ran, no panic. The accumulator-kernel path is reached only via `--trace-sweep` now.
+
+**Design refinements during execution:**
+- Stray pre-existing untracked `tests/vector-verify/` fixtures (309 tracked + 8 new probe
+  artifacts) were being swept by `git add -A`. Added `tests/vector-verify/` to
+  `.git/info/exclude` and switched every implementer to staging explicit file lists. One
+  Task-2 amend mis-step (`git rm --cached -r` removed tracked fixtures too) was caught and
+  fully reverted before it left the branch.
+- The loop-key localization trap was avoided exactly as planned: `compare` filters
+  `loop_`-prefixed keys via `region_keys`, indexes only region keys, and clamps
+  `r.min(n-1)` -- the final review traced this and confirmed a divergence can never
+  localize to a `loop_` key.
+
+**Final holistic review (read-only subagent):** no blocking issues. Five non-blocking
+notes; the one acted on was documenting that signed-overflow UB in the generated C is
+sound for differential use (committed). Deferred follow-ups: lift the duplicated
+`Xorshift64` into a shared `core::rng` (touches vector `gen.rs`, deferred to avoid risking
+the byte-identical bar for a cosmetic dedup); optionally let random slots emit
+`BranchSelect` to raise `branch/*` coverage density. Neither blocks merge.
+
+**Next:** the scalar tenant is the second `core::Domain`. Tenant 3 (DMA/data-movement,
+the axis-2 Phoenix-retirement payoff) follows the same shape.
