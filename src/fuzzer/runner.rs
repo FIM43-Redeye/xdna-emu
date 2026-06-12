@@ -55,7 +55,7 @@ struct CompiledCase {
 }
 
 /// Run the fuzz loop: batch-compile, then run on emulator + NPU and compare.
-pub fn run_fuzz(opts: &FuzzOptions) {
+pub fn run_trace_sweep_legacy(opts: &FuzzOptions) {
     let iterations = opts.fuzz_iterations;
     let base_seed = opts.fuzz_seed.unwrap_or_else(|| {
         std::time::SystemTime::now()
@@ -975,7 +975,7 @@ mod tests {
             trace_sweep: false,
             trace_sweep_reps: 5,
         };
-        run_fuzz(&opts);
+        run_trace_sweep_legacy(&opts);
     }
 
     #[test]

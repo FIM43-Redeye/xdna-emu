@@ -408,7 +408,7 @@ fn run_test_suite(path: &str) -> anyhow::Result<()> {
 #[cfg(feature = "tooling")]
 fn run_fuzz_command(args: &[String]) -> anyhow::Result<()> {
     let opts = xdna_emu::fuzzer::cli::parse_fuzz_args(args).map_err(|e| anyhow::anyhow!("fuzz: {}", e))?;
-    xdna_emu::fuzzer::runner::run_fuzz(&opts);
+    xdna_emu::fuzzer::domains::scalar::runner::run_scalar_fuzz(&opts);
     Ok(())
 }
 
@@ -441,7 +441,7 @@ fn print_help() {
     println!();
     println!("COMMANDS:");
     println!("    test-suite <PATH>   Run xclbin test suite from directory");
-    println!("    fuzz [OPTIONS]      Differential logic fuzzer (EMU vs NPU)");
+    println!("    fuzz [OPTIONS]      Scalar-op differential fuzzer (coverage-ledger driven; --trace-sweep for legacy trace path)");
     println!("    fuzz-vector [OPTIONS]  Vector-op differential fuzzer (coverage-ledger driven)");
     println!();
     println!("EXAMPLES:");
@@ -451,8 +451,12 @@ fn print_help() {
     println!("    xdna-emu --trace trace.json test-suite ./tests/");
     println!("    xdna-emu kernel.elf              # Parse ELF file");
     println!("    xdna-emu --trace-view-hw hw/ --trace-view-emu emu/  # Compare traces");
-    println!("    xdna-emu fuzz --iterations 100              # EMU-only fuzz batch");
-    println!("    xdna-emu fuzz --iterations 1000 --hw        # EMU+HW differential");
+    println!("    xdna-emu fuzz --iterations 100              # scalar coverage campaign (EMU-only)");
+    println!("    xdna-emu fuzz --iterations 1000 --hw        # scalar EMU+HW differential");
+    println!("    xdna-emu fuzz --report                      # scalar coverage status");
+    println!(
+        "    xdna-emu fuzz --replay build/fuzz-scalar/phoenix-survival/scalar  # replay banked divergences"
+    );
     println!("    xdna-emu fuzz-vector --iterations 50 --hw   # vector differential batch");
     println!("    xdna-emu fuzz-vector --report               # vector coverage status");
 }

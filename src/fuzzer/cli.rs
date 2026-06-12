@@ -6,7 +6,8 @@
 
 use std::path::PathBuf;
 
-use crate::fuzzer::runner::FuzzOptions;
+use crate::fuzzer::core::domain::CampaignOptions;
+use crate::fuzzer::domains::scalar::runner::ScalarFuzzOptions;
 use crate::fuzzer::domains::vector::runner::VecFuzzOptions;
 
 /// Runaway-guard ceiling for emulator cycles per fuzz case. Fuzz kernels are
@@ -27,18 +28,24 @@ where
 }
 
 /// Parse `fuzz` subcommand args (full argv, including argv[0] and the `fuzz`
-/// token) into `FuzzOptions`. Unknown flags are errors so typos fail loudly.
-pub fn parse_fuzz_args(args: &[String]) -> Result<FuzzOptions, String> {
-    let mut opts = FuzzOptions {
-        verbose: false,
+/// token) into `ScalarFuzzOptions`. The default path is the coverage-driven
+/// scalar campaign; `--trace-sweep` selects the legacy single-accumulator
+/// trace path. Unknown flags are errors so typos fail loudly.
+pub fn parse_fuzz_args(args: &[String]) -> Result<ScalarFuzzOptions, String> {
+    let mut campaign = CampaignOptions {
+        iterations: 0,
+        seed: None,
         jobs: default_jobs(),
         hw: false,
         max_cycles: DEFAULT_MAX_CYCLES,
-        fuzz_iterations: 0,
-        fuzz_seed: None,
-        trace_sweep: false,
-        trace_sweep_reps: 5,
+        target_hits: 10,
+        verbose: false,
+        report_only: false,
+        replay: None,
+        reverify: false,
     };
+    let mut trace_sweep = false;
+    let mut trace_sweep_reps = 5;
 
     // Skip argv[0] (binary name); the `fuzz` token is consumed by its match arm.
     // Items borrow from `args`, not from `iter`, so calling parse_next(&mut iter)
@@ -47,19 +54,26 @@ pub fn parse_fuzz_args(args: &[String]) -> Result<FuzzOptions, String> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "fuzz" => {}
-            "--iterations" | "-n" => opts.fuzz_iterations = parse_next(&mut iter, "--iterations")?,
-            "--seed" => opts.fuzz_seed = Some(parse_next(&mut iter, "--seed")?),
-            "--jobs" | "-j" => opts.jobs = parse_next(&mut iter, "--jobs")?,
-            "--max-cycles" => opts.max_cycles = parse_next(&mut iter, "--max-cycles")?,
-            "--hw" => opts.hw = true,
-            "--no-hw" => opts.hw = false,
-            "--trace-sweep" => opts.trace_sweep = true,
-            "--trace-sweep-reps" => opts.trace_sweep_reps = parse_next(&mut iter, "--trace-sweep-reps")?,
-            "--verbose" | "-v" => opts.verbose = true,
+            "--iterations" | "-n" => campaign.iterations = parse_next(&mut iter, "--iterations")?,
+            "--seed" => campaign.seed = Some(parse_next(&mut iter, "--seed")?),
+            "--jobs" | "-j" => campaign.jobs = parse_next(&mut iter, "--jobs")?,
+            "--max-cycles" => campaign.max_cycles = parse_next(&mut iter, "--max-cycles")?,
+            "--target-hits" => campaign.target_hits = parse_next(&mut iter, "--target-hits")?,
+            "--hw" => campaign.hw = true,
+            "--no-hw" => campaign.hw = false,
+            "--report" => campaign.report_only = true,
+            "--reverify" => campaign.reverify = true,
+            "--replay" => {
+                let dir = iter.next().ok_or("--replay requires a directory")?;
+                campaign.replay = Some(PathBuf::from(dir));
+            }
+            "--trace-sweep" => trace_sweep = true,
+            "--trace-sweep-reps" => trace_sweep_reps = parse_next(&mut iter, "--trace-sweep-reps")?,
+            "--verbose" | "-v" => campaign.verbose = true,
             other => return Err(format!("unknown fuzz argument: {}", other)),
         }
     }
-    Ok(opts)
+    Ok(ScalarFuzzOptions { campaign, trace_sweep, trace_sweep_reps })
 }
 
 /// Parse `fuzz-vector` subcommand args (full argv, including argv[0] and the
@@ -185,25 +199,29 @@ mod tests {
     #[test]
     fn defaults_when_only_subcommand() {
         let o = parse_fuzz_args(&argv(&[])).unwrap();
-        assert_eq!(o.fuzz_iterations, 0);
-        assert_eq!(o.fuzz_seed, None);
-        assert!(!o.hw);
+        assert_eq!(o.campaign.iterations, 0);
+        assert_eq!(o.campaign.seed, None);
+        assert!(!o.campaign.hw);
+        assert_eq!(o.campaign.target_hits, 10);
+        assert!(!o.campaign.report_only);
+        assert!(o.campaign.replay.is_none());
+        assert!(!o.campaign.reverify);
         assert!(!o.trace_sweep);
         assert_eq!(o.trace_sweep_reps, 5);
-        assert!(!o.verbose);
+        assert!(!o.campaign.verbose);
     }
 
     #[test]
     fn parses_iterations_and_seed() {
         let o = parse_fuzz_args(&argv(&["--iterations", "100", "--seed", "42"])).unwrap();
-        assert_eq!(o.fuzz_iterations, 100);
-        assert_eq!(o.fuzz_seed, Some(42));
+        assert_eq!(o.campaign.iterations, 100);
+        assert_eq!(o.campaign.seed, Some(42));
     }
 
     #[test]
     fn hw_flag_sets_hw_and_no_hw_clears_it_last_wins() {
-        assert!(parse_fuzz_args(&argv(&["--hw"])).unwrap().hw);
-        assert!(!parse_fuzz_args(&argv(&["--hw", "--no-hw"])).unwrap().hw);
+        assert!(parse_fuzz_args(&argv(&["--hw"])).unwrap().campaign.hw);
+        assert!(!parse_fuzz_args(&argv(&["--hw", "--no-hw"])).unwrap().campaign.hw);
     }
 
     #[test]
@@ -218,10 +236,21 @@ mod tests {
             "3",
         ]))
         .unwrap();
-        assert_eq!(o.jobs, 4);
-        assert_eq!(o.max_cycles, 500_000);
+        assert_eq!(o.campaign.jobs, 4);
+        assert_eq!(o.campaign.max_cycles, 500_000);
         assert!(o.trace_sweep);
         assert_eq!(o.trace_sweep_reps, 3);
+    }
+
+    #[test]
+    fn parses_coverage_flags() {
+        let o = parse_fuzz_args(&argv(&["--target-hits", "3", "--report", "--reverify"])).unwrap();
+        assert_eq!(o.campaign.target_hits, 3);
+        assert!(o.campaign.report_only);
+        assert!(o.campaign.reverify);
+
+        let o = parse_fuzz_args(&argv(&["--replay", "/some/dir"])).unwrap();
+        assert_eq!(o.campaign.replay, Some(PathBuf::from("/some/dir")));
     }
 
     #[test]
