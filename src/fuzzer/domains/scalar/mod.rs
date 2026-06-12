@@ -6,4 +6,5 @@
 
 pub mod chain;
 pub mod gen;
+pub mod lower;
 pub mod table;
