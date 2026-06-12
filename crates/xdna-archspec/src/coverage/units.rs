@@ -66,8 +66,95 @@ impl CapabilityDomain {
 /// sole current entry Accepts the `SemanticOp::Intrinsic(_)` catch-all (#104).
 pub fn override_registry(arch: Architecture) -> Vec<BehavioralUnit> {
     match arch {
-        Architecture::Aie2 => vec![intrinsic_catchall_accepted(), dma_ops_verified()],
+        Architecture::Aie2 => {
+            vec![intrinsic_catchall_accepted(), dma_ops_verified(), vector_ops_verified()]
+        }
         _ => Vec::new(),
+    }
+}
+
+/// Flip the empirically silicon-verified Vector-category ops to Verified (#126).
+///
+/// The vector differential fuzzer (#112/#114) silicon-matched its full 218-key
+/// universe against real NPU1 (0 divergent). An empirical executed-op audit --
+/// `fuzz_recorder` captures the exact SemanticOps the emulator dispatches per
+/// case, banked as `executed.json`; current replay of the silicon-matched
+/// corpus is 24/24 match, and dispatch is a deterministic function of (xclbin,
+/// emulator) so a current output-match locks the banked executed set as current
+/// -- gives the precise set of Vector SemanticOps that ran in matched runs:
+/// these 20. Method + the full per-op evidence:
+/// `docs/superpowers/findings/2026-06-12-vector-semanticop-empirical-audit.md`.
+///
+/// The audit corrected the static guess: integer `aie::min`/`aie::max`/`abs`/
+/// `neg`/`maxdiff` lower to the hardware's FUSED compare-select instructions, so
+/// the verified ops are `MaxLt`/`MinGe`/`AbsGtz`/`NegGtz`/`NegLtz`/`MaxDiffLt` --
+/// NOT `Min`/`Max` (which are dead for this corpus and stay perishable).
+///
+/// Deliberately NOT claimed (stay perishable -- under-claim is safe): `Pack`/
+/// `Unpack` (silicon-matched only in archived no-pool seeds, not currently
+/// replay-confirmable) and the never-executed variants (`MatMulSub`,
+/// `NegMatMul`, `AddMac`, `SubMac`, `NegMul`, `NegAdd`, `AccumNegAdd`,
+/// `AccumNegSub`, `VectorPush`, `VectorPushHi`, `SubLt`, `SubGe`, `Min`, `Max`).
+///
+/// Provenance stays `AietoolsModeled` (the compute semantics were reimplemented
+/// from the aietools models); only verification moves to `Verified`. This does
+/// NOT green `clean_release(Aie2)`: the unclaimed Vector ops + Pack/Unpack + the
+/// stream/cascade SideEffect ops (tenants 4/5) keep the perishable queue
+/// non-empty.
+fn vector_ops_verified() -> BehavioralUnit {
+    use crate::aie2::isa::SemanticOp;
+    use crate::coverage::verdict::{Provenance, Verdict};
+    let ops = [
+        SemanticOp::Mac,
+        SemanticOp::MatMul,
+        SemanticOp::Srs,
+        SemanticOp::Ups,
+        SemanticOp::Shuffle,
+        SemanticOp::Convert,
+        SemanticOp::VectorBroadcast,
+        SemanticOp::VectorExtract,
+        SemanticOp::VectorInsert,
+        SemanticOp::VectorSelect,
+        SemanticOp::VectorClear,
+        SemanticOp::MaxDiffLt,
+        SemanticOp::MaxLt,
+        SemanticOp::MinGe,
+        SemanticOp::AbsGtz,
+        SemanticOp::NegGtz,
+        SemanticOp::NegLtz,
+        SemanticOp::Accumulate,
+        SemanticOp::AccumSub,
+        SemanticOp::Align,
+    ];
+    BehavioralUnit {
+        id: "aie2.vector_ops.verified".into(),
+        arch: Architecture::Aie2,
+        claims: Claims::Nodes(
+            ops.iter()
+                .map(|op| CoverageNode::Semantic { arch: Architecture::Aie2, op: op.clone() })
+                .collect(),
+        ),
+        verdict: Verdict {
+            provenance: Provenance::AietoolsModeled,
+            verification: Verification::Verified {
+                evidence: "Vector differential fuzzer (#112/#114) vs real NPU1: full 218-key universe \
+                    silicon-matched, 0 divergent. Empirical executed-op audit (fuzz_recorder -> \
+                    executed.json over the silicon-matched corpus; current replay 24/24 match, \
+                    deterministic dispatch) shows these 20 Vector-category SemanticOps dispatched in \
+                    matched runs. Note the fused compare-select lowering: min/max/abs/neg/maxdiff \
+                    execute as MaxLt/MinGe/AbsGtz/NegGtz/NegLtz/MaxDiffLt (Min/Max are dead). See \
+                    docs/superpowers/findings/2026-06-12-vector-semanticop-empirical-audit.md."
+                    .into(),
+            },
+        },
+        shadows_derived: Some(
+            "These 20 ops otherwise derive to the Vector category default (AietoolsModeled/Unverified \
+             -> perishable). Claimed ONLY where the empirical audit shows the op executed in a \
+             currently-replay-confirmed silicon match; Pack/Unpack (archive-only) and the \
+             never-executed Vector variants are NOT claimed and stay perishable."
+                .into(),
+        ),
+        shared_from: None,
     }
 }
 
@@ -377,6 +464,64 @@ mod tests {
             "Verified pulls DMA ops off their DocSpecified/Unverified default"
         );
         assert!(dma.shared_from.is_none(), "earned on AIE2 silicon directly, not shared");
+    }
+
+    #[test]
+    fn override_registry_has_vector_ops_verified() {
+        // #126 axis-1: the vector differential fuzzer (#112/#114) silicon-matched
+        // 218/218 keys; an empirical executed-op audit over the silicon-matched
+        // corpus (docs/superpowers/findings/2026-06-12-vector-semanticop-empirical-audit.md)
+        // shows exactly these 20 Vector-category SemanticOps dispatched in
+        // currently-replay-confirmed matched runs. Pack/Unpack (archive-only,
+        // not currently replayable) and the never-executed variants are
+        // deliberately NOT claimed.
+        use crate::aie2::isa::SemanticOp::*;
+        use crate::coverage::verdict::Verification;
+        let regs = override_registry(Architecture::Aie2);
+        let vec_unit = regs
+            .iter()
+            .find(|u| u.id == "aie2.vector_ops.verified")
+            .expect("vector-ops Verified override present");
+        assert!(matches!(vec_unit.verdict.verification, Verification::Verified { .. }));
+        let Claims::Nodes(nodes) = &vec_unit.claims;
+        let claimed: std::collections::HashSet<_> = nodes
+            .iter()
+            .map(|n| match n {
+                CoverageNode::Semantic { op, .. } => op.clone(),
+                other => panic!("vector override claims a non-semantic node: {other:?}"),
+            })
+            .collect();
+        let expected: std::collections::HashSet<_> = [
+            Mac,
+            MatMul,
+            Srs,
+            Ups,
+            Shuffle,
+            Convert,
+            VectorBroadcast,
+            VectorExtract,
+            VectorInsert,
+            VectorSelect,
+            VectorClear,
+            MaxDiffLt,
+            MaxLt,
+            MinGe,
+            AbsGtz,
+            NegGtz,
+            NegLtz,
+            Accumulate,
+            AccumSub,
+            Align,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(claimed, expected, "claims exactly the 20 empirically-verified Vector ops");
+        // Guard the deferred / uncovered ops are NOT in the claim.
+        for not_claimed in [Min, Max, Pack, Unpack, MatMulSub, VectorPush] {
+            assert!(!claimed.contains(&not_claimed), "{not_claimed:?} must NOT be claimed (perishable)");
+        }
+        assert!(vec_unit.shadows_derived.is_some());
+        assert!(vec_unit.shared_from.is_none());
     }
 
     #[test]

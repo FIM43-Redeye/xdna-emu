@@ -265,10 +265,13 @@ mod tests {
     #[test]
     fn semantic_rollup_uses_pessimistic_category_defaults() {
         let m = CoverageModel::build(Architecture::Aie2);
-        // Vector ops roll up to AietoolsModeled/Unverified -> perishable.
-        let vmac = m.semantic_verdict(&SemanticOp::Mac);
-        assert_eq!(vmac.provenance, Provenance::AietoolsModeled);
-        assert!(vmac.is_perishable());
+        // An UNCLAIMED vector op rolls up to AietoolsModeled/Unverified ->
+        // perishable. (Min is dead -- min/max lower to MaxLt/MinGe -- and not
+        // claimed by the #126 vector override, so it keeps the category default;
+        // Mac et al. are now Verified, so use Min as the perishable exemplar.)
+        let vmin = m.semantic_verdict(&SemanticOp::Min);
+        assert_eq!(vmin.provenance, Provenance::AietoolsModeled);
+        assert!(vmin.is_perishable());
         // Scalar add is toolchain ground truth -> in neither set.
         let add = m.semantic_verdict(&SemanticOp::Add);
         assert_eq!(add.verification, Verification::NotApplicable);
@@ -278,6 +281,45 @@ mod tests {
         let intr = m.semantic_verdict(&SemanticOp::Intrinsic(0));
         assert!(!intr.is_comprehension_gap(), "Intrinsic must be Accepted, not a gap");
         assert!(matches!(intr.verification, Verification::Accepted { .. }));
+    }
+
+    #[test]
+    fn vector_ops_verified_but_unclaimed_vector_ops_still_perishable() {
+        use crate::aie2::isa::SemanticOp::*;
+        let m = CoverageModel::build(Architecture::Aie2);
+        // #126: the 20 empirically silicon-verified Vector ops leave perishable.
+        for op in [
+            Mac,
+            MatMul,
+            Srs,
+            Ups,
+            Shuffle,
+            Convert,
+            VectorBroadcast,
+            VectorExtract,
+            VectorInsert,
+            VectorSelect,
+            VectorClear,
+            MaxDiffLt,
+            MaxLt,
+            MinGe,
+            AbsGtz,
+            NegGtz,
+            NegLtz,
+            Accumulate,
+            AccumSub,
+            Align,
+        ] {
+            let v = m.semantic_verdict(&op);
+            assert!(matches!(v.verification, Verification::Verified { .. }), "{op:?} must be Verified");
+            assert!(!v.is_perishable(), "{op:?} must leave the perishable queue");
+        }
+        // Deferred (Pack/Unpack: archive-only) + never-executed variants stay
+        // honestly perishable -- the audit does not claim them.
+        for op in [Min, Max, Pack, Unpack, MatMulSub, NegMatMul, VectorPush, AccumNegAdd, SubLt] {
+            let v = m.semantic_verdict(&op);
+            assert!(v.is_perishable(), "{op:?} is unclaimed -- must stay perishable");
+        }
     }
 
     #[test]
