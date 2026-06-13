@@ -315,6 +315,91 @@ module {{
 """
 
 
+def render_passthrough_mlir(
+    buffer_words: int,
+    iterations: int,
+    device: str,
+) -> str:
+    """Generate a shim->memtile->core->memtile->shim objectfifo passthrough.
+
+    This is the v2_core spike shape (proven to arm the memtile trace unit and
+    emit decodable LOCK_SEL events on real NPU1), parameterized by the per-
+    iteration objectfifo buffer size. It is rendered UNTRACED -- the memtile
+    lock-event trace is authored afterwards by tools/mlir-trace-inject.py
+    (the proven memtile-sweep injection path), not via inline aie.trace ops.
+
+    Burst-characterization use: the steady-state memtile lock-release cadence
+    (one release per buffer hand-off) reveals the per-buffer DDR-delivery cost.
+    Sweeping `buffer_words` discriminates a per-word transfer rate (period
+    scales with size) from a fixed per-buffer-exchange overhead (period flat).
+
+    The core does a trivial scalar copy of the buffer; it is intentionally far
+    cheaper than DDR delivery, so the steady-state period reflects delivery,
+    not compute (the core sits in LOCK_STALL between buffers, as on HW).
+
+    `iterations` (the objectfifo loop trip count) must be large enough to clear
+    the depth-2 double-buffer warmup (first ~2 iterations run at full speed)
+    and still leave several steady-state samples; >= 8 is the practical floor.
+    """
+    total = buffer_words * iterations
+    return f"""// Auto-generated DMA passthrough kernel. Do not edit by hand.
+// kind=dma_passthrough buffer_words={buffer_words} iterations={iterations}
+// total_words={total} device={device}
+// Trace (memtile LOCK_SEL events) is injected post-hoc by mlir-trace-inject.py.
+module {{
+  aie.device({device}) {{
+    %shim_0_0 = aie.tile(0, 0)
+    %mem_0_1  = aie.tile(0, 1)
+    %core_0_2 = aie.tile(0, 2)
+
+    // shim -> memtile -> core (input), core -> memtile -> shim (output).
+    aie.objectfifo @in(%shim_0_0, {{%mem_0_1}}, 2 : i32) : !aie.objectfifo<memref<{buffer_words}xi32>>
+    aie.objectfifo @in_fwd(%mem_0_1, {{%core_0_2}}, 2 : i32) : !aie.objectfifo<memref<{buffer_words}xi32>>
+    aie.objectfifo.link [@in] -> [@in_fwd]([] [0])
+
+    aie.objectfifo @out(%core_0_2, {{%mem_0_1}}, 2 : i32) : !aie.objectfifo<memref<{buffer_words}xi32>>
+    aie.objectfifo @out_fwd(%mem_0_1, {{%shim_0_0}}, 2 : i32) : !aie.objectfifo<memref<{buffer_words}xi32>>
+    aie.objectfifo.link [@out] -> [@out_fwd]([] [0])
+
+    %core = aie.core(%core_0_2) {{
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %cbuf = arith.constant {buffer_words} : index
+      %cN = arith.constant {iterations} : index
+      scf.for %it = %c0 to %cN step %c1 {{
+        %iv = aie.objectfifo.acquire @in_fwd(Consume, 1) : !aie.objectfifosubview<memref<{buffer_words}xi32>>
+        %ib = aie.objectfifo.subview.access %iv[0] : !aie.objectfifosubview<memref<{buffer_words}xi32>> -> memref<{buffer_words}xi32>
+        %ov = aie.objectfifo.acquire @out(Produce, 1) : !aie.objectfifosubview<memref<{buffer_words}xi32>>
+        %ob = aie.objectfifo.subview.access %ov[0] : !aie.objectfifosubview<memref<{buffer_words}xi32>> -> memref<{buffer_words}xi32>
+        scf.for %j = %c0 to %cbuf step %c1 {{
+          %v = memref.load %ib[%j] : memref<{buffer_words}xi32>
+          memref.store %v, %ob[%j] : memref<{buffer_words}xi32>
+        }}
+        aie.objectfifo.release @in_fwd(Consume, 1)
+        aie.objectfifo.release @out(Produce, 1)
+      }}
+      aie.end
+    }}
+
+    aie.runtime_sequence @seq(%in: memref<{total}xi32>, %out: memref<{total}xi32>) {{
+      %t_in = aiex.dma_configure_task_for @in {{
+        aie.dma_bd(%in : memref<{total}xi32>, 0, {total}) {{bd_id = 0 : i32}}
+        aie.end
+      }} {{issue_token = true}}
+      %t_out = aiex.dma_configure_task_for @out_fwd {{
+        aie.dma_bd(%out : memref<{total}xi32>, 0, {total}) {{bd_id = 1 : i32}}
+        aie.end
+      }} {{issue_token = true}}
+      aiex.dma_start_task(%t_in)
+      aiex.dma_start_task(%t_out)
+      aiex.dma_await_task(%t_in)
+      aiex.dma_await_task(%t_out)
+    }}
+  }}
+}}
+"""
+
+
 def resolve_target(args: argparse.Namespace) -> tuple:
     """Resolve target (col, row) from either explicit args or shorthand."""
     if args.target_col is not None or args.target_row is not None:
@@ -339,9 +424,16 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--kind", required=True,
-                   choices=["write32", "blockwrite", "maskwrite", "sync"])
+                   choices=["write32", "blockwrite", "maskwrite", "sync",
+                            "dma_passthrough"])
     p.add_argument("--count", type=int, required=True,
-                   help="Number of calibration packets between anchors")
+                   help="Number of calibration packets between anchors; for "
+                        "kind=dma_passthrough this is the objectfifo loop "
+                        "iteration count")
+    p.add_argument("--buffer-words", type=int, default=64, dest="buffer_words",
+                   help="Per-iteration objectfifo buffer size in i32 words "
+                        "(kind=dma_passthrough only). Swept to discriminate "
+                        "per-word rate from per-buffer-exchange overhead.")
     p.add_argument("--payload", type=int, default=8,
                    help="Payload words for BlockWrite (ignored otherwise)")
 
@@ -375,10 +467,35 @@ def main() -> int:
                         "measurement artifacts.")
     args = p.parse_args()
 
+    args.out.mkdir(parents=True, exist_ok=True)
+
+    # The DMA passthrough kind is structurally different from the control-packet
+    # calibration kernels: no target/anchor tiles, no inline trace (the memtile
+    # LOCK_SEL trace is injected later by mlir-trace-inject.py).
+    if args.kind == "dma_passthrough":
+        mlir_text = render_passthrough_mlir(
+            buffer_words=args.buffer_words,
+            iterations=args.count,
+            device=args.device,
+        )
+        (args.out / "aie.mlir").write_text(mlir_text)
+        params = {
+            "kind": args.kind,
+            "buffer_words": args.buffer_words,
+            "iterations": args.count,
+            "total_words": args.buffer_words * args.count,
+            "device": args.device,
+        }
+        (args.out / "params.json").write_text(json.dumps(params, indent=2) + "\n")
+        print(f"Wrote {args.out / 'aie.mlir'} "
+              f"(dma_passthrough buffer_words={args.buffer_words} "
+              f"iterations={args.count} on {args.device})",
+              file=sys.stderr)
+        return 0
+
     target_col, target_row = resolve_target(args)
     anchor_col, anchor_row = resolve_anchor(args)
 
-    args.out.mkdir(parents=True, exist_ok=True)
     mlir_text = render_mlir(
         kind=args.kind,
         count=args.count,

@@ -42,12 +42,38 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 GEN_KERNEL = REPO_ROOT / "tools" / "calibration" / "gen_kernel.py"
 PARSE_TRACE = REPO_ROOT / "tools" / "parse-trace.py"
+TRACE_INJECT = REPO_ROOT / "tools" / "mlir-trace-inject.py"
 BRIDGE_RUNNER = REPO_ROOT / "bridge-runner" / "build" / "bridge-trace-runner"
+
+# Memtile lock/DMA events swept for the dma_passthrough kind, plus the core
+# grounding tick. Same set the v2_core tenant-4 spike proved decodable on NPU1
+# (the memtile trace arms via the North broadcast pulled up by the core).
+PASSTHROUGH_MEMTILE_SWEEP = (
+    "LOCK_SEL0_ACQ_GE,LOCK_SEL0_REL,LOCK_SEL1_ACQ_GE,LOCK_SEL1_REL,"
+    "DMA_S2MM_SEL0_START_TASK,DMA_MM2S_SEL0_START_TASK"
+)
+PASSTHROUGH_CORE_GROUNDING = "PERF_CNT_2,INSTR_EVENT_0,INSTR_EVENT_1"
+# Depth-2 objectfifo: the first ~2 buffer hand-offs run at full speed before the
+# pipeline backs up to steady state. Drop this many leading release-deltas as
+# warmup before taking the steady-state median.
+PASSTHROUGH_WARMUP_DELTAS = 2
+# Match the proven v2_core trace BO size (steady cadence is tiny vs this).
+PASSTHROUGH_TRACE_SIZE = 1048576
 
 DEFAULT_SWEEP = [
     {"kind": "write32", "target": "compute", "counts": [16, 64, 256, 1024, 4096]},
     {"kind": "write32", "target": "mem",     "counts": [16, 64, 256, 1024, 4096]},
     {"kind": "write32", "target": "shim",    "counts": [16, 64, 256, 1024, 4096]},
+]
+
+# Buffer-size sweep for DDR-delivery burst characterization. The swept axis is
+# the per-iteration objectfifo buffer size; the iteration count is fixed high
+# enough to leave several steady-state samples after warmup. A flat steady
+# period across sizes => fixed per-buffer-exchange overhead; a period that
+# scales with size => per-word transfer rate; a staircase => true bursting.
+PASSTHROUGH_SWEEP = [
+    {"kind": "dma_passthrough", "device": "npu1_1col",
+     "count": 12, "buffer_words_list": [32, 64, 128, 256]},
 ]
 
 
@@ -57,6 +83,22 @@ def run(cmd: list, cwd: Path = None, check: bool = True) -> subprocess.Completed
 
 def gen_one(work_dir: Path, task: dict) -> None:
     work_dir.mkdir(parents=True, exist_ok=True)
+
+    # DMA passthrough: distinct generator path (buffer-size param, no
+    # target/anchor/payload). Trace is injected separately in inject_one().
+    if task["kind"] == "dma_passthrough":
+        cmd = [
+            sys.executable, str(GEN_KERNEL),
+            "--kind", "dma_passthrough",
+            "--count", str(task["count"]),
+            "--buffer-words", str(task["buffer_words"]),
+            "--out", str(work_dir),
+        ]
+        if "device" in task:
+            cmd += ["--device", task["device"]]
+        run(cmd)
+        return
+
     cmd = [
         sys.executable, str(GEN_KERNEL),
         "--kind", task["kind"],
@@ -81,11 +123,36 @@ def gen_one(work_dir: Path, task: dict) -> None:
     run(cmd)
 
 
-def compile_one(work_dir: Path) -> bool:
-    """Compile the kernel in `work_dir`. Returns True on success."""
-    # Create dummy input buffers (4 unused kernargs).
-    for i in range(4):
-        (work_dir / f"dummy{i}.bin").write_bytes(b"\0" * 64)
+def inject_one(work_dir: Path, task: dict) -> None:
+    """Author memtile LOCK_SEL trace into a dma_passthrough kernel.
+
+    Runs tools/mlir-trace-inject.py (the proven v2_core memtile-sweep path):
+    aie.mlir -> aie_traced.mlir, plus trace_config.json. The compile step then
+    builds aie_traced.mlir.
+    """
+    log_path = work_dir / "inject.log"
+    with open(log_path, "w") as logf:
+        subprocess.run([
+            sys.executable, str(TRACE_INJECT),
+            "--input", "aie.mlir",
+            "--out", "aie_traced.mlir",
+            "--trace-mode", "event_time",
+            "--core-grounding", PASSTHROUGH_CORE_GROUNDING,
+            "--memtile-sweep-events", PASSTHROUGH_MEMTILE_SWEEP,
+            "--trace-config-out", "trace_config.json",
+            "--config-test-name", task_tag(task),
+        ], cwd=work_dir, stdout=logf, stderr=subprocess.STDOUT, check=True)
+
+
+def compile_one(work_dir: Path, src_mlir: str = "aie.mlir",
+                make_dummies: bool = True) -> bool:
+    """Compile `src_mlir` in `work_dir`. Returns True on success."""
+    if make_dummies:
+        # Create dummy input buffers (4 unused kernargs) for control-packet
+        # kernels. The dma_passthrough kernel lets bridge-trace-runner
+        # auto-allocate its data BOs, so it skips this.
+        for i in range(4):
+            (work_dir / f"dummy{i}.bin").write_bytes(b"\0" * 64)
 
     log_path = work_dir / "compile.log"
     with open(log_path, "w") as logf:
@@ -99,43 +166,88 @@ def compile_one(work_dir: Path) -> bool:
             "--no-compile-host",
             "--xclbin-name=final.xclbin",
             "--npu-insts-name=insts.bin",
-            "aie.mlir",
+            src_mlir,
         ], cwd=work_dir, stdout=logf, stderr=subprocess.STDOUT)
     return proc.returncode == 0 and (work_dir / "final.xclbin").exists()
 
 
-def run_on_hw(work_dir: Path, trace_size: int = 262144) -> bool:
+def run_on_hw(work_dir: Path, task: dict = None, trace_size: int = 262144) -> bool:
     """Run the kernel on real NPU. Returns True on success."""
     log_path = work_dir / "run.log"
-    cmd = [
-        str(BRIDGE_RUNNER),
-        "--xclbin", "final.xclbin",
-        "--instr", "insts.bin",
-        "--kernel", "MLIR_AIE",
-        "--input", "dummy0.bin", "--input", "dummy1.bin",
-        "--input", "dummy2.bin", "--input", "dummy3.bin",
-        "--trace-out", "trace.bin",
-        "--trace-size", str(trace_size),
-    ]
+    if task and task["kind"] == "dma_passthrough":
+        # bridge-trace-runner auto-allocates the in/out data BOs and identifies
+        # the trace BO as the last kernarg; no --kernel/--input needed (proven
+        # by the v2_core baseline run).
+        cmd = [
+            str(BRIDGE_RUNNER),
+            "--xclbin", "final.xclbin",
+            "--instr", "insts.bin",
+            "--trace-out", "trace.bin",
+            "--trace-size", str(PASSTHROUGH_TRACE_SIZE),
+        ]
+    else:
+        cmd = [
+            str(BRIDGE_RUNNER),
+            "--xclbin", "final.xclbin",
+            "--instr", "insts.bin",
+            "--kernel", "MLIR_AIE",
+            "--input", "dummy0.bin", "--input", "dummy1.bin",
+            "--input", "dummy2.bin", "--input", "dummy3.bin",
+            "--trace-out", "trace.bin",
+            "--trace-size", str(trace_size),
+        ]
     with open(log_path, "w") as logf:
         proc = subprocess.run(cmd, cwd=work_dir, stdout=logf, stderr=subprocess.STDOUT)
     return proc.returncode == 0 and (work_dir / "trace.bin").exists()
 
 
-def parse_one(work_dir: Path) -> dict:
-    """Parse the trace into events.json and extract anchor cycle delta.
+def extract_passthrough_period(events: list) -> dict:
+    """Steady-state memtile buffer-handoff period from LOCK_SEL0_REL cadence.
 
-    Returns a dict with keys:
-      - hw_cycles: B - A delta, or None if anchors missing
-      - anchor_a_ts, anchor_b_ts
-      - core_ticks: count of INSTR_EVENT_0 firings
+    One SEL0_REL fires per objectfifo buffer hand-off on the memtile (row 1).
+    The inter-release deltas, after dropping the depth-2 double-buffer warmup,
+    give the steady-state per-buffer delivery cost -- the burst-model signal.
+    `hw_cycles` is set to the steady median so the sweep summary counts it.
     """
+    rels = sorted(e["ts"] for e in events
+                  if e.get("row") == 1 and e.get("name") == "LOCK_SEL0_REL")
+    if len(rels) < PASSTHROUGH_WARMUP_DELTAS + 3:
+        return {"hw_cycles": None,
+                "error": f"too few SEL0_REL ({len(rels)}) for a steady median"}
+    deltas = [b - a for a, b in zip(rels, rels[1:])]
+    steady = deltas[PASSTHROUGH_WARMUP_DELTAS:]
+    steady_sorted = sorted(steady)
+    median = steady_sorted[len(steady_sorted) // 2]
+    return {
+        "hw_cycles": median,
+        "period_median": median,
+        "period_min": min(steady),
+        "period_max": max(steady),
+        "n_releases": len(rels),
+        "all_deltas": deltas,
+        "steady_deltas": steady,
+        "first_rel_ts": rels[0],
+        "last_rel_ts": rels[-1],
+    }
+
+
+def parse_one(work_dir: Path, task: dict = None) -> dict:
+    """Parse the trace into events.json and extract the measurement.
+
+    For control-packet kinds: the anchor A->B cycle delta. For dma_passthrough:
+    the steady-state memtile buffer-handoff period.
+    """
+    is_passthrough = task and task["kind"] == "dma_passthrough"
+    # The passthrough builds aie_traced.mlir, so its lowered MLIR lives in a
+    # differently-named project dir.
+    xclbin_mlir = ("aie_traced.mlir.prj/input_with_addresses.mlir"
+                   if is_passthrough else "aie.mlir.prj/input_with_addresses.mlir")
     log_path = work_dir / "parse.log"
     with open(log_path, "w") as logf:
         proc = subprocess.run([
             sys.executable, str(PARSE_TRACE),
             "--trace-bin", "trace.bin",
-            "--xclbin-mlir", "aie.mlir.prj/input_with_addresses.mlir",
+            "--xclbin-mlir", xclbin_mlir,
             "--trace-mode", "event_time",
             "--decoder", "ours",
             "--out-events", "events.json",
@@ -147,6 +259,9 @@ def parse_one(work_dir: Path) -> dict:
         events = json.loads((work_dir / "events.json").read_text())["events"]
     except (FileNotFoundError, KeyError, json.JSONDecodeError) as e:
         return {"hw_cycles": None, "error": f"events.json read: {e}"}
+
+    if is_passthrough:
+        return extract_passthrough_period(events)
 
     # Slot indices match positions in the aie.trace.event<...> declarations
     # in gen_kernel.py. For compute anchor we declare three events
@@ -189,6 +304,17 @@ def expand_sweep(sweep_groups: list, reps: int) -> list:
     """
     tasks = []
     for grp in sweep_groups:
+        # dma_passthrough sweeps buffer_words at a fixed iteration count.
+        if grp.get("kind") == "dma_passthrough":
+            base = {k: v for k, v in grp.items() if k != "buffer_words_list"}
+            base.setdefault("payload", 0)
+            for bw in grp["buffer_words_list"]:
+                for rep in range(reps):
+                    t = dict(base)
+                    t["buffer_words"] = bw
+                    t["rep"] = rep
+                    tasks.append(t)
+            continue
         base = {k: v for k, v in grp.items() if k != "counts"}
         base.setdefault("payload", 0)
         for count in grp["counts"]:
@@ -213,15 +339,22 @@ def main() -> int:
                    help="Parallel compile workers")
     p.add_argument("--config", type=Path,
                    help="Optional sweep config JSON; overrides default sweep")
+    p.add_argument("--passthrough", action="store_true",
+                   help="Run the DMA-passthrough buffer-size sweep (DDR-delivery "
+                        "burst characterization) instead of the default "
+                        "control-packet sweep.")
     args = p.parse_args()
 
     sweep_groups = DEFAULT_SWEEP
+    if args.passthrough:
+        sweep_groups = PASSTHROUGH_SWEEP
     if args.config:
         sweep_groups = json.loads(args.config.read_text())
 
     tasks = expand_sweep(sweep_groups, args.reps)
-    print(f"Sweep: {len(tasks)} tasks across "
-          f"{sum(len(g['counts']) for g in sweep_groups)} configurations.",
+    n_configs = sum(len(g.get("counts", g.get("buffer_words_list", [])))
+                    for g in sweep_groups)
+    print(f"Sweep: {len(tasks)} tasks across {n_configs} configurations.",
           file=sys.stderr)
 
     args.workdir.mkdir(parents=True, exist_ok=True)
@@ -266,7 +399,7 @@ def main() -> int:
             continue
         # Each rep gets its own trace.bin; bridge-runner overwrites by default
         # so we run, then immediately parse, then move trace aside.
-        ok = run_on_hw(wd)
+        ok = run_on_hw(wd, t)
         t["hw_status"] = "ok" if ok else "fail"
         # Snapshot trace + events files per rep.
         if ok:
@@ -285,7 +418,7 @@ def main() -> int:
     measurement_keys = (
         "kind", "target", "target_col", "target_row",
         "anchor_col", "anchor_row", "device", "ticker_period",
-        "count", "payload", "rep",
+        "count", "payload", "buffer_words", "rep",
     )
     for t in tasks:
         wd = t["work_dir"]
@@ -299,7 +432,7 @@ def main() -> int:
         rep_trace = wd / f"trace_rep{t['rep']}.bin"
         if rep_trace.exists():
             (wd / "trace.bin").write_bytes(rep_trace.read_bytes())
-        result = parse_one(wd)
+        result = parse_one(wd, t)
         record.update(result)
         measurements.append(record)
     print(f"[phase 3/3] done in {time.time()-t0:.1f}s", file=sys.stderr)
@@ -329,6 +462,11 @@ def task_tag(task: dict) -> str:
     rep=0 xclbin). The tag must distinguish every dimension that affects
     the generated kernel.
     """
+    if task["kind"] == "dma_passthrough":
+        device_part = ""
+        if task.get("device") and task["device"] != "npu1_1col":
+            device_part = f"_{task['device']}"
+        return f"dma_passthrough_w{task['buffer_words']}_n{task['count']}{device_part}"
     if "target_col" in task or "target_row" in task:
         target_part = f"c{task.get('target_col', 0)}r{task.get('target_row', 2)}"
     else:
@@ -349,6 +487,10 @@ def task_tag(task: dict) -> str:
 def _gen_compile(work_dir: Path, task: dict) -> bool:
     try:
         gen_one(work_dir, task)
+        if task["kind"] == "dma_passthrough":
+            inject_one(work_dir, task)
+            return compile_one(work_dir, src_mlir="aie_traced.mlir",
+                               make_dummies=False)
         return compile_one(work_dir)
     except subprocess.CalledProcessError:
         return False
