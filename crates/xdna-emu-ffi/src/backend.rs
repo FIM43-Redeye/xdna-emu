@@ -181,8 +181,21 @@ pub(crate) fn run_interpreter(
     observer: &mut dyn RunObserver,
 ) -> RunOutcome {
     let mut cycles = 0u64;
-    // max_cycles == 0 means unbounded: the loop runs until a natural exit point.
+    // max_cycles == 0 means "unbounded": run until a natural exit point. But a
+    // genuinely unbounded loop is dangerous -- a DMA/scheduler deadlock (e.g. a
+    // buggy lock-release change) never reaches NaturalCompletion and the TDR
+    // wedge detector, which keys off core progress, classifies a pure-DMA
+    // lock-deadlock as "Progressing" forever. The loop then spins without ever
+    // returning, hanging the caller (bridge-trace-runner) and the box until a
+    // hard reboot. 2026-06-13: a symmetric memtile release-deferral did exactly
+    // this and forced a REISUB. So even in unbounded mode we enforce a hard
+    // RUNAWAY_CEILING -- far above any real NPU1 program (v2_core ~124k cyc; the
+    // config default budget is 10M) but finite, so a deadlock terminates the run
+    // (loud error + Budget halt) instead of wedging the host. Real long runs that
+    // legitimately need more should pass an explicit max_cycles.
+    const RUNAWAY_CEILING: u64 = 50_000_000;
     let unbounded = max_cycles == 0;
+    let effective_max = if unbounded { RUNAWAY_CEILING } else { max_cycles };
 
     log::info!(
         "Running emulator (max {})",
@@ -244,7 +257,7 @@ pub(crate) fn run_interpreter(
     let mut maskpoll_unsatisfied = false;
     let mut wedged: Option<(WedgeReason, TdrDiagnosis)> = None;
 
-    'run: while unbounded || cycles < max_cycles {
+    'run: while cycles < effective_max {
         // Publish the current simulation cycle to the tile array before the
         // NPU executor runs. Register-write side effects (trace unit
         // start/stop, broadcast propagation) driven by NPU instructions
@@ -324,6 +337,20 @@ pub(crate) fn run_interpreter(
                 break 'run;
             }
         }
+    }
+
+    // Runaway guard: an unbounded run that hit the hard ceiling without a
+    // natural halt or a wedge verdict is almost certainly a DMA/scheduler
+    // deadlock. Surface it loudly -- it halts as Budget below, but this is NOT a
+    // normal cycle-budget exhaustion; it means the kernel never reached
+    // quiescence. (Prevents the silent infinite spin that forced a REISUB.)
+    if unbounded && !natural_halt && wedged.is_none() && cycles >= effective_max {
+        log::error!(
+            "xdna_emu_run: RUNAWAY CEILING hit at {} cycles with no natural halt -- \
+             likely a DMA/scheduler deadlock (no core/DMA forward progress). Aborting \
+             to avoid hanging the host. Investigate the lock/BD-chain state.",
+            cycles
+        );
     }
 
     // Flush any pending trace packets through the stream switch to host DDR.
