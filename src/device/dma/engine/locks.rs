@@ -121,6 +121,17 @@ impl DmaEngine {
         if let Some(lock) = target_tile.locks.get_mut(local_id as usize) {
             let _ = lock.release_with_value(release_value);
         }
+        // Emit the lock-release trace event so the memory-module trace unit sees
+        // it, matching the arbiter path (`Tile::resolve_lock_requests`). The
+        // trace unit monitors all lock state changes regardless of whether the
+        // release went through the arbiter or this pipelined inline path.
+        // Without this, DMA BD-completion releases were invisible to the trace
+        // while acquires (arbiter path) were not -- an asymmetry vs real silicon
+        // (tenant-4 grant-order spike: NPU1 emits LOCK_SEL*_REL on memtile BD
+        // completion; this path dropped them).
+        target_tile
+            .mem_trace_pending
+            .push((self.current_cycle, EventType::LockRelease { lock_id: local_id }));
         log::info!(
             "DMA tile({},{}) lock release bd_lock={} delta={} (inline, pipelined with last data cycle)",
             self.col,

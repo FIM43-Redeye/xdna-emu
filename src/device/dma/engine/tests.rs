@@ -217,6 +217,50 @@ fn test_transfer_with_lock() {
 }
 
 #[test]
+fn test_direct_lock_release_emits_trace_event() {
+    // GAP A (tenant-4 grant-order spike): the pipelined BD-completion release
+    // path (`apply_lock_release_direct`, used by `begin_completion`) must emit a
+    // LockRelease trace event into the tile's mem_trace_pending, matching the
+    // arbiter path (`Tile::resolve_lock_requests`). Before the fix the DMA
+    // emitted lock ACQUIREs (arbiter path) but not RELEASEs (this inline path),
+    // so memtile lock-release events were invisible to the trace while NPU1
+    // silicon emits them -- breaking the emulator-vs-HW grant-order match.
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+    let mut host_mem = make_host_memory();
+
+    tile.locks[5].set(1);
+    let bd = BdConfig::simple_1d(0x100, 32)
+        .with_acquire(5, 1) // lock==1 -> 0
+        .with_release(5, 1); // +1 -> 1, via the inline completion path
+    engine.configure_bd(0, bd).unwrap();
+    engine.start_channel(2, 0).unwrap();
+
+    let mut cycles = 0;
+    while engine.channel_active(2) {
+        engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+        tile.resolve_lock_requests(0);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
+        cycles += 1;
+        if cycles > 500 {
+            panic!("Transfer took too long: {} cycles", cycles);
+        }
+    }
+
+    // The inline release must have emitted a LockRelease trace event for lock 5.
+    let released = tile
+        .mem_trace_pending
+        .iter()
+        .any(|(_, e)| matches!(e, crate::interpreter::state::EventType::LockRelease { lock_id: 5 }));
+    assert!(
+        released,
+        "direct BD-completion release must emit LockRelease{{lock_id:5}}; pending={:?}",
+        tile.mem_trace_pending
+    );
+}
+
+#[test]
 fn test_execute_1d_transfer() {
     let mut engine = DmaEngine::new_compute_tile(1, 2);
     let mut tile = make_tile();
