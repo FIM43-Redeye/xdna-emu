@@ -81,6 +81,17 @@ pub struct DmaTimingConfig {
     /// transient.  ~0 on Phoenix -- S2MM has no measurable tail past
     /// task 0, so this preserves the pure one-shot cold-start.
     pub shim_warmup_decay_s2mm_permille: u16,
+
+    /// Memtile lock-release pipeline latency, in cycles, from BD completion
+    /// (FINISHED_BD) to the cross-lock release landing on the semaphore.  Even
+    /// a swap that is immediately grantable does not release until this many
+    /// cycles after the buffer finished filling/draining; under backpressure
+    /// the swap dominates and this is absorbed.  Calibrated to ~63 on NPU1
+    /// Phoenix from the tenant-4 producer-fill probe (HW: FINISHED_BD->full-REL
+    /// gap 63-64 on the warmup/prompt releases, ~2071 once backpressured).
+    /// Applied only on memtile tiles (cross-lock producer/consumer handoff);
+    /// 0 elsewhere -- no compute/shim HW evidence for a non-zero value.
+    pub memtile_lock_release_latency_cycles: u16,
 }
 
 impl Default for DmaTimingConfig {
@@ -115,6 +126,10 @@ impl DmaTimingConfig {
             shim_per_task_overhead_s2mm_cycles: m.shim_per_task_overhead_s2mm_cycles,
             shim_warmup_decay_mm2s_permille: m.shim_warmup_decay_mm2s_permille,
             shim_warmup_decay_s2mm_permille: m.shim_warmup_decay_s2mm_permille,
+            // HW-calibrated micro-timing (NPU1 Phoenix memtile, tenant-4 probe).
+            // Not yet plumbed through the per-arch DmaModel -- a single memtile
+            // observation; promote to the arch model if AIE2P measures different.
+            memtile_lock_release_latency_cycles: 63,
         }
     }
 

@@ -563,7 +563,7 @@ impl DmaEngine {
         ch.controller_dispatch_index = 0;
         ch.prev_starving = false;
         ch.prev_lock_stalled = false;
-        ch.pending_release = None;
+        ch.pending_releases.clear();
 
         Ok(())
     }

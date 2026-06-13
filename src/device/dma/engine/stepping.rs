@@ -1,6 +1,7 @@
 //! FSM execution: the `step()` method and all helper methods it calls.
 
 use super::*;
+use crate::device::dma::channel::PendingRelease;
 use crate::interpreter::execute::cycle_accurate::{fire_watchpoint_events_with_origin, AccessOrigin};
 use crate::interpreter::timing::MemoryQuadrant;
 
@@ -95,12 +96,44 @@ impl DmaEngine {
             }
         }
 
+        // Apply any deferred cross-lock release whose swap has occurred and
+        // whose release latency has now elapsed. Runs after the FSM pass so a
+        // release whose swap landed this cycle (channel no longer blocked) is
+        // serviced the same cycle once past its ready_cycle floor.
+        self.service_pending_releases(tile, neighbors);
+
         if any_active {
             DmaResult::InProgress
         } else if any_waiting {
             DmaResult::WaitingForLock(0)
         } else {
             DmaResult::Complete
+        }
+    }
+
+    /// Apply queued cross-lock releases that are both swapped and latency-due.
+    ///
+    /// A release lands at `max(ready_cycle, swap)`. `swapped` records that the
+    /// owning channel's next BD acquire has been granted (the buffer swap, set
+    /// in the AcquiringLock grant arm); `ready_cycle` is the pipeline-latency
+    /// floor. In warmup the swap is immediate, so the release lands at
+    /// `ready_cycle` (completion + latency); under backpressure the channel
+    /// blocks on its next acquire, so `swapped` stays false until the consumer
+    /// frees a buffer and the release lands at the swap. The mutual-block case
+    /// is handled by the deadlock-break flush. The FIFO holds every in-flight
+    /// release so a fast producer never overwrites an un-applied one.
+    fn service_pending_releases(&mut self, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>) {
+        for ch_idx in 0..self.channels.len() {
+            let mut i = 0;
+            while i < self.channels[ch_idx].pending_releases.len() {
+                let p = self.channels[ch_idx].pending_releases[i];
+                if p.swapped && self.current_cycle >= p.ready_cycle {
+                    self.channels[ch_idx].pending_releases.remove(i);
+                    self.apply_lock_release_direct(p.lock_id, p.release_value, tile, neighbors);
+                } else {
+                    i += 1;
+                }
+            }
         }
     }
 
@@ -277,12 +310,16 @@ impl DmaEngine {
                             self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
                             self.channels[ch_idx].prev_lock_stalled = false;
                         }
-                        // This acquire grant IS the buffer swap: apply the prior
-                        // BD's deferred cross-lock release now, coupling it to the
-                        // next acquire exactly as HW does. (No-op when there is no
-                        // pending release, e.g. self-chains / cold-start BDs.)
-                        if let Some((rl, rv)) = self.channels[ch_idx].pending_release.take() {
-                            self.apply_lock_release_direct(rl, rv, tile, neighbors);
+                        // This acquire grant IS the buffer swap for the prior
+                        // BD's deferred cross-lock release: mark the oldest
+                        // un-swapped queued release swapped. It then lands via
+                        // service_pending_releases once its latency floor passes
+                        // (immediately in the backpressured case, where the swap
+                        // is long past that floor; after the latency in warmup).
+                        if let Some(pr) =
+                            self.channels[ch_idx].pending_releases.iter_mut().find(|p| !p.swapped)
+                        {
+                            pr.swapped = true;
                         }
                         // For a chained BD with no post-grant cooldown
                         // (cycles_remaining=0 from enter_chained_bd), collapse
@@ -544,13 +581,13 @@ impl DmaEngine {
             return ChannelFsm::AcquiringLock { lock_id, cycles_remaining: 0, acquired: false, transfer };
         }
 
-        // No lock to acquire on the next BD: there is no acquire grant to
-        // couple a deferred release to, so flush any pending release now.
-        // (begin_completion only defers when the next BD *has* a differing
-        // acquire lock, so this is defensive -- it keeps a stray pending from
-        // ever outliving its swap point.)
-        if let Some((rl, rv)) = self.channels[ch_idx].pending_release.take() {
-            self.apply_lock_release_direct(rl, rv, _tile, _neighbors);
+        // No lock to acquire on the next BD: there is no acquire grant to mark
+        // the swap, so this is the swap -- mark all queued releases swapped so
+        // service applies them once each clears its latency floor. (Mostly
+        // defensive: begin_completion only defers when the next BD *has* a
+        // differing acquire lock.)
+        for p in &mut self.channels[ch_idx].pending_releases {
+            p.swapped = true;
         }
 
         // No lock to acquire. Insert packet header and start transfer.
@@ -616,7 +653,34 @@ impl DmaEngine {
                 .and_then(|nbd| nbd.acquire_lock);
             match next_acquire {
                 Some(next_acq) if next_acq != lock_id => {
-                    self.channels[ch_idx].pending_release = Some((lock_id, release_value));
+                    // Floor the release at completion + the memtile lock-release
+                    // pipeline latency; the per-step service applies it at
+                    // max(ready_cycle, swap).
+                    //
+                    // The latency is a WRITE-completion effect, so it applies to
+                    // S2MM (fill) only: a memtile S2MM must drain its write
+                    // pipeline before the buffer is observably "full", which is
+                    // why the producer's full-release trails FINISHED_BD by ~63
+                    // cyc on NPU1 (tenant-4 probe). MM2S (drain) signals "free"
+                    // as soon as the last word is read out -- no write-back to
+                    // drain -- so its free-release is prompt. Non-memtile tiles
+                    // have no measured latency. Confirmed by the warmup fill
+                    // cadence: HW fills the next buffer immediately after a drain
+                    // frees one, which is only possible if the free-release is
+                    // not delayed.
+                    let latency = if self.tile_kind.is_mem()
+                        && matches!(self.channel_type(ch_idx as u8), ChannelType::S2MM)
+                    {
+                        self.timing_config.memtile_lock_release_latency_cycles as u64
+                    } else {
+                        0
+                    };
+                    self.channels[ch_idx].pending_releases.push(PendingRelease {
+                        lock_id,
+                        release_value,
+                        ready_cycle: self.current_cycle + latency,
+                        swapped: false,
+                    });
                 }
                 _ => self.apply_lock_release_direct(lock_id, release_value, tile, neighbors),
             }
@@ -894,12 +958,22 @@ impl DmaEngine {
             if other == blocked_ch {
                 continue;
             }
-            if let Some((rl, rv)) = self.channels[other].pending_release {
-                if self.resolve_lock_id(rl) == Some(want) {
+            // Find a DUE queued release (its pipeline latency has elapsed) that
+            // resolves to the lock this channel is blocked on. Only flush a due
+            // one: a transient warmup block clears on the next arbiter grant, so
+            // a not-yet-due peer release must not be pulled early -- that would
+            // defeat the release latency. A genuine mutual block happens ~a
+            // buffer-drain after completion, so the peer's release is long due
+            // and this still breaks it. current_cycle always advances, so a due
+            // release is always eventually reached: no permanent deadlock.
+            let n = self.channels[other].pending_releases.len();
+            for idx in 0..n {
+                let p = self.channels[other].pending_releases[idx];
+                if self.current_cycle >= p.ready_cycle && self.resolve_lock_id(p.lock_id) == Some(want) {
                     // Hand this channel the buffer it's waiting on. One match is
                     // enough to clear the wait -- stop so we don't over-release.
-                    self.channels[other].pending_release = None;
-                    self.apply_lock_release_direct(rl, rv, tile, neighbors);
+                    self.channels[other].pending_releases.remove(idx);
+                    self.apply_lock_release_direct(p.lock_id, p.release_value, tile, neighbors);
                     return;
                 }
             }

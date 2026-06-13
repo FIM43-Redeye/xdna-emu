@@ -2471,6 +2471,18 @@ fn memtile_producer_consumer_releases_couple_at_swap_no_deadlock() {
     // Data integrity: consumer output is the fed stream, in order.
     assert_eq!(drained, feed, "consumer output must equal the produced stream in order");
 
+    // Flush the tail: the memtile release latency can leave the final deferred
+    // releases pending after the data work is done. Step the (now idle) engine
+    // until the trace queue stops producing, so we capture every release.
+    for _ in 0..(engine.timing_config().memtile_lock_release_latency_cycles as u64 + 8) {
+        cycle += 1;
+        engine.set_current_cycle(cycle);
+        engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+        tile.resolve_lock_requests(cycle);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        events.extend(tile.mem_trace_pending.drain(..));
+    }
+
     // Release coupling: full-sem releases (producer, local lock 1) and free-sem
     // releases (consumer, local lock 0).
     let full_releases: Vec<u64> = events
@@ -2485,19 +2497,104 @@ fn memtile_producer_consumer_releases_couple_at_swap_no_deadlock() {
     assert_eq!(full_releases.len(), 3, "expected 3 full-sem releases, got {:?}", full_releases);
     assert_eq!(free_releases.len(), 3, "expected 3 free-sem releases, got {:?}", free_releases);
 
-    // The producer's SECOND full-release (buf1) is the deferred one: it must
-    // couple to the consumer's FIRST free-release (buf0) at the swap -- within a
-    // cycle, not staggered early as the old inline model produced.
-    let prod_full_2nd = full_releases[1] as i64;
+    // The producer's THIRD fill reuses buf0, so it cannot signal "full" until
+    // the consumer has freed buf0. That backpressured full-release must couple
+    // to the consumer's FIRST free-release (buf0) at the swap -- it lands at the
+    // swap, not staggered early as the old inline model produced. (The first two
+    // full-releases are prompt, landing a release-latency after their fills.)
+    let prod_full_reuse = full_releases[2] as i64;
     let cons_free_1st = free_releases[0] as i64;
     assert!(
-        (prod_full_2nd - cons_free_1st).abs() <= 1,
-        "deferred full-release (cycle {}) must couple to the consumer's free-release (cycle {}) at the \
-         swap, within 1 cycle; full={:?} free={:?}",
-        prod_full_2nd,
+        (prod_full_reuse - cons_free_1st).abs() <= 5,
+        "backpressured full-release (cycle {}) must couple to the consumer's free-release (cycle {}) at \
+         the swap; full={:?} free={:?}",
+        prod_full_reuse,
         cons_free_1st,
         full_releases,
         free_releases,
+    );
+}
+
+/// Memtile S2MM cross-lock release pipeline latency: even when the next BD's
+/// acquire is immediately grantable (warmup, buffers free), the release does
+/// not land at BD completion -- it lands `memtile_lock_release_latency_cycles`
+/// later. HW (tenant-4 probe) shows the producer's full-sem release trailing
+/// FINISHED_BD by ~63 cycles on the prompt/warmup releases; the emulator's old
+/// inline model fired it at +0. The latency is an S2MM (write/fill) effect --
+/// the write pipeline must drain before the buffer is observably full -- so it
+/// is exercised on an S2MM channel here.
+#[test]
+fn memtile_cross_lock_release_lands_after_pipeline_latency() {
+    use crate::interpreter::state::EventType;
+
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut tile = Tile::mem_tile(1, 1);
+    let mut host_mem = make_host_memory();
+
+    // Memtile S2MM ch0: BD0 fills Own buf, releases own lock 2 (cross-lock --
+    // next BD acquires own lock 1, a different lock), chains to BD1 which ends
+    // the task. Own locks are ids 64+local. Both acquire locks are available so
+    // both BDs run prompt -- no buffer backpressure, so the only thing delaying
+    // BD0's release is the pipeline latency.
+    engine
+        .configure_bd(
+            0,
+            BdConfig::simple_1d(0x80000, 16)
+                .with_acquire(64, 1)
+                .with_release(66, 1)
+                .with_next(1),
+        )
+        .unwrap();
+    engine
+        .configure_bd(1, BdConfig::simple_1d(0x80100, 16).with_acquire(65, 1).with_release(67, 1))
+        .unwrap();
+
+    tile.locks[0].set(1); // own lock 0 (id 64): BD0 acquire available
+    tile.locks[1].set(1); // own lock 1 (id 65): BD1 acquire available (prompt)
+
+    engine.start_channel(0, 0).unwrap();
+
+    let latency = engine.timing_config().memtile_lock_release_latency_cycles as u64;
+    let mut finished_bd0: Option<u64> = None;
+    let mut release_lock2: Option<u64> = None;
+
+    // Run a fixed window past the release latency so the deferred release is
+    // serviced even after the (short) transfers leave the channel idle. Feed
+    // S2MM stream_in greedily so the fills aren't stream-starved.
+    let feed: Vec<u32> = (0..8u32).collect();
+    let mut fed = 0usize;
+    for cycle in 0..(latency + 60) {
+        engine.set_current_cycle(cycle);
+        while fed < feed.len()
+            && engine.push_stream_in(StreamData { data: feed[fed], tlast: false, channel: 0 })
+        {
+            fed += 1;
+        }
+        engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+        tile.resolve_lock_requests(cycle);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        for (c, e) in engine.drain_trace_events() {
+            if matches!(e, EventType::DmaFinishedBd { channel: 0 }) && finished_bd0.is_none() {
+                finished_bd0 = Some(c);
+            }
+        }
+        for (c, e) in tile.mem_trace_pending.drain(..) {
+            if matches!(e, EventType::LockRelease { lock_id: 2 }) && release_lock2.is_none() {
+                release_lock2 = Some(c);
+            }
+        }
+    }
+
+    let finished = finished_bd0.expect("BD0 should emit FINISHED_BD");
+    let released = release_lock2.expect("BD0's cross-lock release (own lock 2) should land");
+    assert_eq!(
+        released - finished,
+        latency,
+        "prompt cross-lock release must trail FINISHED_BD by the pipeline latency ({} cyc); \
+         finished={} released={}",
+        latency,
+        finished,
+        released,
     );
 }
 

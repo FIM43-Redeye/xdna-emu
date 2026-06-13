@@ -16,6 +16,32 @@ use super::engine::{ChannelStats, ChannelTaskConfig, TaskQueue};
 use super::engine::TaskQueueEntry;
 use super::transfer::Transfer;
 
+/// A cross-lock BD release held until the buffer swap.
+///
+/// Tenant-4 mechanism: the release that signals the *other* channel does not
+/// fire at BD completion -- HW holds it until the DMA swaps to its next buffer
+/// (the next chained BD's AcquireGE is granted). On top of that, the memtile
+/// lock-release path has a fixed pipeline latency, so even a swap that is
+/// immediately grantable (warmup, buffers free) does not land the release until
+/// `completion + latency`. The release therefore fires at
+/// `max(ready_cycle, swap_cycle)`: `ready_cycle` floors the warmup/prompt case,
+/// the swap floors the backpressured case.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingRelease {
+    pub lock_id: u8,
+    pub release_value: i8,
+    /// Earliest cycle the release may land: BD-completion cycle plus the
+    /// memtile lock-release pipeline latency (0 on non-memtile tiles).
+    pub ready_cycle: u64,
+    /// Whether the buffer swap for this release has occurred -- i.e. the
+    /// owning channel's NEXT BD acquire has been granted. A release fires at
+    /// `max(ready_cycle, swap)`: in warmup the swap is immediate so it fires at
+    /// `ready_cycle` (the pipeline latency); under buffer backpressure the
+    /// owning channel blocks on its next acquire, so the swap (and the release)
+    /// waits for the consumer to free a buffer. Set at the acquire grant.
+    pub swapped: bool,
+}
+
 /// Information carried from a completed transfer into the lock release phase.
 /// Extracted from Transfer so the Transfer can be dropped once data movement
 /// is done.
@@ -281,7 +307,11 @@ pub struct ChannelContext {
     /// (the owning channel's swap) or, when two channels are mutually blocked
     /// holding each other's buffer, flushed by the blocked peer's
     /// deadlock-break scan.  See `begin_completion` / the AcquiringLock arm.
-    pub pending_release: Option<(u8, i8)>,
+    ///
+    /// A FIFO of in-flight releases: with the memtile release latency a fast
+    /// producer can fill several buffers before the earliest release lands, so
+    /// each completion enqueues rather than overwrites.
+    pub pending_releases: Vec<PendingRelease>,
 }
 
 impl ChannelContext {
@@ -303,7 +333,7 @@ impl ChannelContext {
             stats: ChannelStats::default(),
             prev_starving: false,
             prev_lock_stalled: false,
-            pending_release: None,
+            pending_releases: Vec::new(),
         }
     }
 
@@ -410,7 +440,7 @@ impl ChannelContext {
         self.prefetch_start_emitted = false;
         self.controller_dispatch_index = 0;
         self.stats = ChannelStats::default();
-        self.pending_release = None;
+        self.pending_releases.clear();
     }
 }
 
