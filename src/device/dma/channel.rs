@@ -266,6 +266,22 @@ pub struct ChannelContext {
     /// idle->blocked transition, not every cycle a lock acquire is
     /// pending.
     pub prev_lock_stalled: bool,
+
+    /// Deferred cross-lock release, held until the next chained BD's acquire
+    /// is granted (the buffer swap).  `(lock_id, release_value)`.
+    ///
+    /// Tenant-4 mechanism (HW-validated on NPU1): on a memtile shared-link
+    /// producer/consumer, a completing BD's lock RELEASE does not fire at BD
+    /// completion -- the DMA controller holds it until it swaps to the next
+    /// buffer (its next chained BD's AcquireGE is granted), so release and
+    /// next-acquire couple at the chain transition, gated on buffer
+    /// availability.  Only CROSS-lock handoff defers (next BD acquires a
+    /// different lock than the one released -- a producer->consumer signal);
+    /// same-lock self-chains release inline.  Applied at the acquire grant
+    /// (the owning channel's swap) or, when two channels are mutually blocked
+    /// holding each other's buffer, flushed by the blocked peer's
+    /// deadlock-break scan.  See `begin_completion` / the AcquiringLock arm.
+    pub pending_release: Option<(u8, i8)>,
 }
 
 impl ChannelContext {
@@ -287,6 +303,7 @@ impl ChannelContext {
             stats: ChannelStats::default(),
             prev_starving: false,
             prev_lock_stalled: false,
+            pending_release: None,
         }
     }
 
@@ -393,6 +410,7 @@ impl ChannelContext {
         self.prefetch_start_emitted = false;
         self.controller_dispatch_index = 0;
         self.stats = ChannelStats::default();
+        self.pending_release = None;
     }
 }
 

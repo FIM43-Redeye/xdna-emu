@@ -277,6 +277,13 @@ impl DmaEngine {
                             self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
                             self.channels[ch_idx].prev_lock_stalled = false;
                         }
+                        // This acquire grant IS the buffer swap: apply the prior
+                        // BD's deferred cross-lock release now, coupling it to the
+                        // next acquire exactly as HW does. (No-op when there is no
+                        // pending release, e.g. self-chains / cold-start BDs.)
+                        if let Some((rl, rv)) = self.channels[ch_idx].pending_release.take() {
+                            self.apply_lock_release_direct(rl, rv, tile, neighbors);
+                        }
                         // For a chained BD with no post-grant cooldown
                         // (cycles_remaining=0 from enter_chained_bd), collapse
                         // the AcquiringLock{acquired=true,cr=0} -> Transferring
@@ -316,6 +323,12 @@ impl DmaEngine {
                             self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: true });
                             self.channels[ch_idx].prev_lock_stalled = true;
                         }
+                        // Deadlock-break: if a peer channel holds the deferred
+                        // release for the lock we're blocked on, flush it (the
+                        // buffer swap). Resolves the producer/consumer mutual
+                        // wait that would otherwise hang. No-op outside a genuine
+                        // mutual-block (no peer holds a matching pending release).
+                        self.flush_peer_pending_release(ch_idx, lock_id, tile, neighbors);
                         ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired: false, transfer }
                     }
                 }
@@ -531,6 +544,15 @@ impl DmaEngine {
             return ChannelFsm::AcquiringLock { lock_id, cycles_remaining: 0, acquired: false, transfer };
         }
 
+        // No lock to acquire on the next BD: there is no acquire grant to
+        // couple a deferred release to, so flush any pending release now.
+        // (begin_completion only defers when the next BD *has* a differing
+        // acquire lock, so this is defensive -- it keeps a stray pending from
+        // ever outliving its swap point.)
+        if let Some((rl, rv)) = self.channels[ch_idx].pending_release.take() {
+            self.apply_lock_release_direct(rl, rv, _tile, _neighbors);
+        }
+
         // No lock to acquire. Insert packet header and start transfer.
         self.maybe_insert_packet_header_from_transfer(&mut transfer);
         let host_lat = self.timing_config.host_memory_latency_cycles;
@@ -581,7 +603,23 @@ impl DmaEngine {
 
         if let Some(lock_id) = transfer.release_lock {
             let release_value = transfer.release_value;
-            self.apply_lock_release_direct(lock_id, release_value, tile, neighbors);
+            // Cross-lock handoff defers the release to the next chained BD's
+            // acquire grant (the buffer swap); same-lock self-chains and
+            // task-end (no next BD) releases fire inline as before. The
+            // memtile producer/consumer signals the *other* channel via a
+            // different lock than the one its own next BD reacquires, so its
+            // full/free release must couple to the swap, not BD completion.
+            // See ChannelContext::pending_release and the tenant-4 finding.
+            let next_acquire = transfer
+                .next_bd
+                .and_then(|n| self.bd_configs.get(n as usize))
+                .and_then(|nbd| nbd.acquire_lock);
+            match next_acquire {
+                Some(next_acq) if next_acq != lock_id => {
+                    self.channels[ch_idx].pending_release = Some((lock_id, release_value));
+                }
+                _ => self.apply_lock_release_direct(lock_id, release_value, tile, neighbors),
+            }
         }
         self.after_transfer_done(ch_idx, completion, tile, neighbors)
     }
@@ -822,6 +860,48 @@ impl DmaEngine {
                 TransferCycleResult::FotFinish
             } else {
                 TransferCycleResult::Continue
+            }
+        }
+    }
+
+    /// Deadlock-break for the deferred-release model.
+    ///
+    /// When this channel is blocked acquiring `acquire_lock_id`, a *peer*
+    /// channel may be holding a deferred cross-lock release for exactly that
+    /// lock -- the buffer this channel is waiting for. In the memtile
+    /// producer/consumer mutual-block both channels stall this way, each
+    /// holding the lock the other needs (producer waits on free while holding
+    /// full; consumer waits on full while holding free). Flushing one matching
+    /// peer release clears the wait; this is the swap, where HW couples both
+    /// releases on adjacent cycles. Without it the two deferred releases would
+    /// circular-wait forever (the box-wedge from fix attempt 1).
+    ///
+    /// In normal flow a deferred release is applied at its own channel's next
+    /// acquire grant, so it never lingers for a peer to flush; this only fires
+    /// in the genuine mutual-block, never prematurely.
+    fn flush_peer_pending_release(
+        &mut self,
+        blocked_ch: usize,
+        acquire_lock_id: u8,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) {
+        let want = match self.resolve_lock_id(acquire_lock_id) {
+            Some(t) => t,
+            None => return,
+        };
+        for other in 0..self.channels.len() {
+            if other == blocked_ch {
+                continue;
+            }
+            if let Some((rl, rv)) = self.channels[other].pending_release {
+                if self.resolve_lock_id(rl) == Some(want) {
+                    // Hand this channel the buffer it's waiting on. One match is
+                    // enough to clear the wait -- stop so we don't over-release.
+                    self.channels[other].pending_release = None;
+                    self.apply_lock_release_direct(rl, rv, tile, neighbors);
+                    return;
+                }
             }
         }
     }
