@@ -2484,29 +2484,30 @@ fn memtile_producer_consumer_releases_couple_at_swap_no_deadlock() {
     }
 
     // Release coupling: full-sem releases (producer, local lock 1) and free-sem
-    // releases (consumer, local lock 0).
-    let full_releases: Vec<u64> = events
+    // releases (consumer, local lock 0). Sort by cycle: the deferred trace
+    // events emit when their BD slot recycles (or at channel-idle for slots that
+    // never recycle), so they may be *pushed* out of timestamp order -- exactly
+    // like the real trace pipeline, where the decoder sorts the buffer by
+    // timestamp. Compare on the timestamps, not the emission order.
+    let mut full_releases: Vec<u64> = events
         .iter()
         .filter_map(|(c, e)| matches!(e, EventType::LockRelease { lock_id: 1 }).then_some(*c))
         .collect();
-    let free_releases: Vec<u64> = events
+    let mut free_releases: Vec<u64> = events
         .iter()
         .filter_map(|(c, e)| matches!(e, EventType::LockRelease { lock_id: 0 }).then_some(*c))
         .collect();
+    full_releases.sort_unstable();
+    free_releases.sort_unstable();
 
     assert_eq!(full_releases.len(), 3, "expected 3 full-sem releases, got {:?}", full_releases);
     assert_eq!(free_releases.len(), 3, "expected 3 free-sem releases, got {:?}", free_releases);
 
     // The producer's THIRD fill reuses buf0, so it cannot signal "full" until
     // the consumer has freed buf0. That backpressured full-release couples to
-    // the consumer's FIRST free-release (buf0) at the swap.
-    //
-    // In the decoupled model the two prompt fills (bd0/bd1) complete in warmup
-    // but their TRACE events lag by the pipeline latency, so they land late
-    // (~completion + latency). The backpressured reuse, by contrast, completes
-    // only once the consumer frees buf0 -- already past the latency floor -- so
-    // its trace event lands at that swap and is the CHRONOLOGICALLY FIRST
-    // full-release collected. It must coincide with the consumer's first free.
+    // the consumer's FIRST free-release (buf0) at the swap: it is the earliest
+    // full-release (its reuse completes only once the consumer frees buf0),
+    // coincident with the consumer's earliest free.
     let prod_full_reuse = full_releases[0] as i64;
     let cons_free_1st = free_releases[0] as i64;
     assert!(

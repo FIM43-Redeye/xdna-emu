@@ -111,34 +111,46 @@ impl DmaEngine {
         }
     }
 
-    /// Service queued cross-lock releases in two stages: functional then trace.
+    /// Service queued cross-lock releases: functional release at the swap, then
+    /// the trace event at the BD-slot reuse (or the floor when never reused).
     ///
     /// Stage 1 (prompt): once `swapped` is set (the owning channel's next BD
     /// acquire was granted -- the buffer swap), release the FUNCTIONAL semaphore
     /// immediately. This keeps the consumer-free path off the producer's
-    /// critical path, so warmup fills stay shim-paced exactly as HW shows. The
-    /// trace event is scheduled for `max(ready_cycle, swap)`: in warmup the swap
-    /// is immediate so the latency floor (`ready_cycle`) dominates; under
-    /// backpressure the swap is the later one and dominates.
+    /// critical path, so warmup fills stay shim-paced exactly as HW shows.
     ///
-    /// Stage 2 (deferred): emit the LockRelease trace event once `current_cycle`
-    /// reaches the scheduled `trace_at`, then drop the entry.
+    /// Stage 2 (trace scheduling): the BD-reuse grant (see step()) sets
+    /// `trace_at` for a functionally-released slot when its descriptor is
+    /// re-acquired (HW's LOCK_SEL*_REL fires at this ring recycle). A slot that
+    /// is never reused before the channel idles -- the last fills of a finite
+    /// task -- falls back here to the `ready_cycle` floor.
+    ///
+    /// Stage 3 (emit): once `current_cycle` reaches `trace_at`, emit the trace
+    /// event at that cycle and drop the entry.
     ///
     /// The FIFO holds every in-flight release so a fast producer never loses one.
     /// The mutual-block case (swap can never fire) is handled by the
     /// deadlock-break flush.
     fn service_pending_releases(&mut self, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>) {
         for ch_idx in 0..self.channels.len() {
+            let channel_idle = !self.channels[ch_idx].has_pending_work();
             let mut i = 0;
             while i < self.channels[ch_idx].pending_releases.len() {
                 let p = self.channels[ch_idx].pending_releases[i];
-                // Stage 1: functional release at the swap (prompt).
-                if p.swapped && p.trace_at.is_none() {
+                // Stage 1: functional semaphore release at the swap (prompt).
+                if p.swapped && !p.functional_done {
                     self.release_lock_value(p.lock_id, p.release_value, tile, neighbors);
-                    let trace_at = p.ready_cycle.max(self.current_cycle);
-                    self.channels[ch_idx].pending_releases[i].trace_at = Some(trace_at);
+                    self.channels[ch_idx].pending_releases[i].functional_done = true;
                 }
-                // Stage 2: emit the deferred trace event once it is due.
+                // Stage 2 (fallback): a functionally-released slot that is never
+                // reused before the channel goes idle (the last fills of a finite
+                // task) emits its trace at the ready_cycle floor. The BD-reuse
+                // grant schedules trace_at for slots that DO recycle.
+                let p = self.channels[ch_idx].pending_releases[i];
+                if p.functional_done && p.trace_at.is_none() && channel_idle {
+                    self.channels[ch_idx].pending_releases[i].trace_at = Some(p.ready_cycle);
+                }
+                // Stage 3: emit the deferred trace event once it is due.
                 let p = self.channels[ch_idx].pending_releases[i];
                 match p.trace_at {
                     Some(t) if self.current_cycle >= t => {
@@ -324,16 +336,31 @@ impl DmaEngine {
                             self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
                             self.channels[ch_idx].prev_lock_stalled = false;
                         }
-                        // This acquire grant IS the buffer swap for the prior
+                        // This acquire grant is the buffer swap for the prior
                         // BD's deferred cross-lock release: mark the oldest
-                        // un-swapped queued release swapped. It then lands via
-                        // service_pending_releases once its latency floor passes
-                        // (immediately in the backpressured case, where the swap
-                        // is long past that floor; after the latency in warmup).
+                        // un-swapped queued release swapped, so
+                        // service_pending_releases performs its FUNCTIONAL
+                        // semaphore release (prompt -- keeps the consumer-free
+                        // path off the critical path).
                         if let Some(pr) =
                             self.channels[ch_idx].pending_releases.iter_mut().find(|p| !p.swapped)
                         {
                             pr.swapped = true;
+                        }
+                        // This grant also RETIRES the BD slot it re-acquires:
+                        // schedule the deferred TRACE event for the prior fill
+                        // that used this same slot (already functionally
+                        // released, awaiting reuse). HW's LOCK_SEL*_REL trace
+                        // fires at this BD-ring recycle, not at the swap -- for a
+                        // depth-2 fifo that is ~2 fill-periods after completion.
+                        let reuse_bd = transfer.bd_index;
+                        let now = self.current_cycle;
+                        if let Some(pr) = self.channels[ch_idx]
+                            .pending_releases
+                            .iter_mut()
+                            .find(|p| p.bd_index == reuse_bd && p.functional_done && p.trace_at.is_none())
+                        {
+                            pr.trace_at = Some(pr.ready_cycle.max(now));
                         }
                         // For a chained BD with no post-grant cooldown
                         // (cycles_remaining=0 from enter_chained_bd), collapse
@@ -690,8 +717,10 @@ impl DmaEngine {
                     self.channels[ch_idx].pending_releases.push(PendingRelease {
                         lock_id,
                         release_value,
+                        bd_index: completion.bd_index,
                         ready_cycle: self.current_cycle + latency,
                         swapped: false,
+                        functional_done: false,
                         trace_at: None,
                     });
                 }
