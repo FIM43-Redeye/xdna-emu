@@ -103,35 +103,43 @@ impl DmaEngine {
         tile: &mut Tile,
         neighbors: &mut NeighborTiles<'_>,
     ) {
-        let lock_target = match self.resolve_lock_id(lock_id) {
-            Some(target) => target,
-            None => return,
-        };
-        let (target_tile, local_id): (&mut Tile, u8) = match lock_target {
-            LockTarget::Own(id) => (tile, id),
-            LockTarget::West(id) => match neighbors.west.as_deref_mut() {
-                Some(west) => (west, id),
-                None => return,
-            },
-            LockTarget::East(id) => match neighbors.east.as_deref_mut() {
-                Some(east) => (east, id),
-                None => return,
-            },
-        };
-        if let Some(lock) = target_tile.locks.get_mut(local_id as usize) {
-            let _ = lock.release_with_value(release_value);
+        self.release_lock_value(lock_id, release_value, tile, neighbors);
+        self.emit_lock_release_trace_at(lock_id, self.current_cycle, tile, neighbors);
+    }
+
+    /// Resolve a (possibly-neighbor) lock id to its tile and local index.
+    fn resolve_lock_tile<'t>(
+        &self,
+        lock_id: u8,
+        tile: &'t mut Tile,
+        neighbors: &'t mut NeighborTiles<'_>,
+    ) -> Option<(&'t mut Tile, u8)> {
+        let lock_target = self.resolve_lock_id(lock_id)?;
+        match lock_target {
+            LockTarget::Own(id) => Some((tile, id)),
+            LockTarget::West(id) => neighbors.west.as_deref_mut().map(|w| (w, id)),
+            LockTarget::East(id) => neighbors.east.as_deref_mut().map(|e| (e, id)),
         }
-        // Emit the lock-release trace event so the memory-module trace unit sees
-        // it, matching the arbiter path (`Tile::resolve_lock_requests`). The
-        // trace unit monitors all lock state changes regardless of whether the
-        // release went through the arbiter or this pipelined inline path.
-        // Without this, DMA BD-completion releases were invisible to the trace
-        // while acquires (arbiter path) were not -- an asymmetry vs real silicon
-        // (tenant-4 grant-order spike: NPU1 emits LOCK_SEL*_REL on memtile BD
-        // completion; this path dropped them).
-        target_tile
-            .mem_trace_pending
-            .push((self.current_cycle, EventType::LockRelease { lock_id: local_id }));
+    }
+
+    /// Apply the FUNCTIONAL semaphore release -- the lock value a waiting
+    /// channel acquires. Carries no trace event; the observable LockRelease is
+    /// emitted separately (and, on the memtile, later) via
+    /// `emit_lock_release_trace_at`. Splitting the two lets the functional
+    /// release stay prompt (at the buffer swap) while the trace event trails by
+    /// the memtile pipeline latency -- see `PendingRelease`.
+    pub(super) fn release_lock_value(
+        &mut self,
+        lock_id: u8,
+        release_value: i8,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) {
+        if let Some((target_tile, local_id)) = self.resolve_lock_tile(lock_id, tile, neighbors) {
+            if let Some(lock) = target_tile.locks.get_mut(local_id as usize) {
+                let _ = lock.release_with_value(release_value);
+            }
+        }
         log::info!(
             "DMA tile({},{}) lock release bd_lock={} delta={} (inline, pipelined with last data cycle)",
             self.col,
@@ -139,6 +147,31 @@ impl DmaEngine {
             lock_id,
             release_value
         );
+    }
+
+    /// Emit the lock-release TRACE event at `emit_cycle` so the memory-module
+    /// trace unit sees it, matching the arbiter path
+    /// (`Tile::resolve_lock_requests`). The trace unit monitors all lock state
+    /// changes regardless of whether the release went through the arbiter or
+    /// this pipelined inline path. Without this, DMA BD-completion releases were
+    /// invisible to the trace while acquires (arbiter path) were not -- an
+    /// asymmetry vs real silicon (tenant-4 grant-order spike: NPU1 emits
+    /// LOCK_SEL*_REL on memtile BD completion; this path dropped them).
+    ///
+    /// `emit_cycle` is passed explicitly because on the memtile the trace event
+    /// trails the functional release by the lock-release pipeline latency.
+    pub(super) fn emit_lock_release_trace_at(
+        &mut self,
+        lock_id: u8,
+        emit_cycle: u64,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) {
+        if let Some((target_tile, local_id)) = self.resolve_lock_tile(lock_id, tile, neighbors) {
+            target_tile
+                .mem_trace_pending
+                .push((emit_cycle, EventType::LockRelease { lock_id: local_id }));
+        }
     }
 
     /// Submit a release request to the appropriate tile's arbiter.

@@ -2498,11 +2498,16 @@ fn memtile_producer_consumer_releases_couple_at_swap_no_deadlock() {
     assert_eq!(free_releases.len(), 3, "expected 3 free-sem releases, got {:?}", free_releases);
 
     // The producer's THIRD fill reuses buf0, so it cannot signal "full" until
-    // the consumer has freed buf0. That backpressured full-release must couple
-    // to the consumer's FIRST free-release (buf0) at the swap -- it lands at the
-    // swap, not staggered early as the old inline model produced. (The first two
-    // full-releases are prompt, landing a release-latency after their fills.)
-    let prod_full_reuse = full_releases[2] as i64;
+    // the consumer has freed buf0. That backpressured full-release couples to
+    // the consumer's FIRST free-release (buf0) at the swap.
+    //
+    // In the decoupled model the two prompt fills (bd0/bd1) complete in warmup
+    // but their TRACE events lag by the pipeline latency, so they land late
+    // (~completion + latency). The backpressured reuse, by contrast, completes
+    // only once the consumer frees buf0 -- already past the latency floor -- so
+    // its trace event lands at that swap and is the CHRONOLOGICALLY FIRST
+    // full-release collected. It must coincide with the consumer's first free.
+    let prod_full_reuse = full_releases[0] as i64;
     let cons_free_1st = free_releases[0] as i64;
     assert!(
         (prod_full_reuse - cons_free_1st).abs() <= 5,
@@ -2595,6 +2600,121 @@ fn memtile_cross_lock_release_lands_after_pipeline_latency() {
         latency,
         finished,
         released,
+    );
+}
+
+/// The memtile lock-release pipeline latency is an OBSERVABILITY effect, not a
+/// functional DMA stall. The FUNCTIONAL semaphore (what a waiting consumer
+/// acquires) must release PROMPTLY at the buffer swap; only the LockRelease
+/// *trace event* lags by the latency.
+///
+/// HW evidence (tenant-4 producer-fill probe): the producer's warmup fills land
+/// at exactly the shim's 65-cyc/buffer cadence -- back-to-back, no extra stall.
+/// That is only possible if the consumer-free path is OFF the critical path,
+/// i.e. the full-sem release is functionally prompt. If the latency gated the
+/// semaphore, the consumer drain (and thus the producer's buffer reuse) would
+/// stall ~63 cyc and the fills would not stay shim-paced. The +63 appears only
+/// in the trace (LOCK_SEL1_REL trailing FINISHED_BD), so it must be applied to
+/// the trace event alone, not the lock value.
+///
+/// This pins the two halves apart: the lock VALUE increments at the swap (a few
+/// chain cycles after FINISHED_BD), while the trace event lands at +latency
+/// (asserted by `memtile_cross_lock_release_lands_after_pipeline_latency`).
+#[test]
+fn memtile_cross_lock_release_frees_consumer_promptly_trace_lags() {
+    use crate::interpreter::state::EventType;
+
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut tile = Tile::mem_tile(1, 1);
+    let mut host_mem = make_host_memory();
+
+    // Same shape as the latency test: S2MM ch0, BD0 fills + cross-lock releases
+    // own lock 2 (id 66), chains to BD1 which acquires own lock 1 (id 65, a
+    // DIFFERENT lock -> cross-lock defer) and ends. Both acquires are available
+    // so the swap (BD1's acquire grant) is prompt -- nothing but the latency
+    // could delay the release.
+    engine
+        .configure_bd(
+            0,
+            BdConfig::simple_1d(0x80000, 16)
+                .with_acquire(64, 1)
+                .with_release(66, 1)
+                .with_next(1),
+        )
+        .unwrap();
+    engine
+        .configure_bd(1, BdConfig::simple_1d(0x80100, 16).with_acquire(65, 1).with_release(67, 1))
+        .unwrap();
+
+    tile.locks[0].set(1); // own lock 0 (id 64): BD0 acquire available
+    tile.locks[1].set(1); // own lock 1 (id 65): BD1 acquire available (prompt swap)
+                          // own lock 2 (id 66, the full-sem BD0 releases) starts at 0.
+    assert_eq!(tile.locks[2].value, 0, "full-sem must start empty");
+
+    engine.start_channel(0, 0).unwrap();
+
+    let latency = engine.timing_config().memtile_lock_release_latency_cycles as u64;
+    let mut finished_bd0: Option<u64> = None;
+    let mut functional_release: Option<u64> = None; // first cycle lock 2 value > 0
+    let mut trace_release: Option<u64> = None; // LockRelease{2} trace event cycle
+
+    let feed: Vec<u32> = (0..8u32).collect();
+    let mut fed = 0usize;
+    for cycle in 0..(latency + 60) {
+        engine.set_current_cycle(cycle);
+        while fed < feed.len()
+            && engine.push_stream_in(StreamData { data: feed[fed], tlast: false, channel: 0 })
+        {
+            fed += 1;
+        }
+        engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+        tile.resolve_lock_requests(cycle);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        for (c, e) in engine.drain_trace_events() {
+            if matches!(e, EventType::DmaFinishedBd { channel: 0 }) && finished_bd0.is_none() {
+                finished_bd0 = Some(c);
+            }
+        }
+        for (c, e) in tile.mem_trace_pending.drain(..) {
+            if matches!(e, EventType::LockRelease { lock_id: 2 }) && trace_release.is_none() {
+                trace_release = Some(c);
+            }
+        }
+        // Read the FUNCTIONAL lock value AFTER the step: the semaphore that a
+        // waiting consumer would acquire.
+        if functional_release.is_none() && tile.locks[2].value > 0 {
+            functional_release = Some(cycle);
+        }
+    }
+
+    let finished = finished_bd0.expect("BD0 should emit FINISHED_BD");
+    let functional = functional_release.expect("BD0's cross-lock release must land on the lock value");
+    let trace = trace_release.expect("BD0's cross-lock release must emit a trace event");
+
+    // FUNCTIONAL release is prompt: the lock becomes available at the swap, a
+    // few chain cycles after FINISHED_BD -- NOT delayed by the pipeline latency.
+    // A generous grace (well under `latency`) cleanly separates "prompt at swap"
+    // from "gated by the 63-cyc latency".
+    let grace = (engine.timing_config().chain_cycles() + 8).min(latency / 2);
+    assert!(
+        functional.saturating_sub(finished) <= grace,
+        "functional full-sem release must be PROMPT at the swap (<= {} cyc after FINISHED_BD), not \
+         gated by the {}-cyc trace latency; finished={} functional_release={}",
+        grace,
+        latency,
+        finished,
+        functional,
+    );
+
+    // The TRACE event still lags by the full pipeline latency (HW observability).
+    assert_eq!(
+        trace - finished,
+        latency,
+        "LockRelease trace event must trail FINISHED_BD by the pipeline latency ({} cyc); \
+         finished={} trace={}",
+        latency,
+        finished,
+        trace,
     );
 }
 

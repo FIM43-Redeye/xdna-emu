@@ -111,27 +111,41 @@ impl DmaEngine {
         }
     }
 
-    /// Apply queued cross-lock releases that are both swapped and latency-due.
+    /// Service queued cross-lock releases in two stages: functional then trace.
     ///
-    /// A release lands at `max(ready_cycle, swap)`. `swapped` records that the
-    /// owning channel's next BD acquire has been granted (the buffer swap, set
-    /// in the AcquiringLock grant arm); `ready_cycle` is the pipeline-latency
-    /// floor. In warmup the swap is immediate, so the release lands at
-    /// `ready_cycle` (completion + latency); under backpressure the channel
-    /// blocks on its next acquire, so `swapped` stays false until the consumer
-    /// frees a buffer and the release lands at the swap. The mutual-block case
-    /// is handled by the deadlock-break flush. The FIFO holds every in-flight
-    /// release so a fast producer never overwrites an un-applied one.
+    /// Stage 1 (prompt): once `swapped` is set (the owning channel's next BD
+    /// acquire was granted -- the buffer swap), release the FUNCTIONAL semaphore
+    /// immediately. This keeps the consumer-free path off the producer's
+    /// critical path, so warmup fills stay shim-paced exactly as HW shows. The
+    /// trace event is scheduled for `max(ready_cycle, swap)`: in warmup the swap
+    /// is immediate so the latency floor (`ready_cycle`) dominates; under
+    /// backpressure the swap is the later one and dominates.
+    ///
+    /// Stage 2 (deferred): emit the LockRelease trace event once `current_cycle`
+    /// reaches the scheduled `trace_at`, then drop the entry.
+    ///
+    /// The FIFO holds every in-flight release so a fast producer never loses one.
+    /// The mutual-block case (swap can never fire) is handled by the
+    /// deadlock-break flush.
     fn service_pending_releases(&mut self, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>) {
         for ch_idx in 0..self.channels.len() {
             let mut i = 0;
             while i < self.channels[ch_idx].pending_releases.len() {
                 let p = self.channels[ch_idx].pending_releases[i];
-                if p.swapped && self.current_cycle >= p.ready_cycle {
-                    self.channels[ch_idx].pending_releases.remove(i);
-                    self.apply_lock_release_direct(p.lock_id, p.release_value, tile, neighbors);
-                } else {
-                    i += 1;
+                // Stage 1: functional release at the swap (prompt).
+                if p.swapped && p.trace_at.is_none() {
+                    self.release_lock_value(p.lock_id, p.release_value, tile, neighbors);
+                    let trace_at = p.ready_cycle.max(self.current_cycle);
+                    self.channels[ch_idx].pending_releases[i].trace_at = Some(trace_at);
+                }
+                // Stage 2: emit the deferred trace event once it is due.
+                let p = self.channels[ch_idx].pending_releases[i];
+                match p.trace_at {
+                    Some(t) if self.current_cycle >= t => {
+                        self.channels[ch_idx].pending_releases.remove(i);
+                        self.emit_lock_release_trace_at(p.lock_id, t, tile, neighbors);
+                    }
+                    _ => i += 1,
                 }
             }
         }
@@ -365,7 +379,7 @@ impl DmaEngine {
                         // buffer swap). Resolves the producer/consumer mutual
                         // wait that would otherwise hang. No-op outside a genuine
                         // mutual-block (no peer holds a matching pending release).
-                        self.flush_peer_pending_release(ch_idx, lock_id, tile, neighbors);
+                        self.flush_peer_pending_release(ch_idx, lock_id);
                         ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired: false, transfer }
                     }
                 }
@@ -653,21 +667,19 @@ impl DmaEngine {
                 .and_then(|nbd| nbd.acquire_lock);
             match next_acquire {
                 Some(next_acq) if next_acq != lock_id => {
-                    // Floor the release at completion + the memtile lock-release
-                    // pipeline latency; the per-step service applies it at
-                    // max(ready_cycle, swap).
+                    // Set the TRACE-event floor at completion + the memtile
+                    // lock-release pipeline latency; the functional semaphore
+                    // still releases promptly at the swap (see
+                    // service_pending_releases / PendingRelease).
                     //
                     // The latency is a WRITE-completion effect, so it applies to
                     // S2MM (fill) only: a memtile S2MM must drain its write
                     // pipeline before the buffer is observably "full", which is
-                    // why the producer's full-release trails FINISHED_BD by ~63
-                    // cyc on NPU1 (tenant-4 probe). MM2S (drain) signals "free"
-                    // as soon as the last word is read out -- no write-back to
-                    // drain -- so its free-release is prompt. Non-memtile tiles
-                    // have no measured latency. Confirmed by the warmup fill
-                    // cadence: HW fills the next buffer immediately after a drain
-                    // frees one, which is only possible if the free-release is
-                    // not delayed.
+                    // why the producer's full-release trace event trails
+                    // FINISHED_BD by ~63 cyc on NPU1 (tenant-4 probe). MM2S
+                    // (drain) signals "free" as soon as the last word is read out
+                    // -- no write-back to drain -- so its trace event is prompt.
+                    // Non-memtile tiles have no measured latency.
                     let latency = if self.tile_kind.is_mem()
                         && matches!(self.channel_type(ch_idx as u8), ChannelType::S2MM)
                     {
@@ -680,6 +692,7 @@ impl DmaEngine {
                         release_value,
                         ready_cycle: self.current_cycle + latency,
                         swapped: false,
+                        trace_at: None,
                     });
                 }
                 _ => self.apply_lock_release_direct(lock_id, release_value, tile, neighbors),
@@ -943,13 +956,7 @@ impl DmaEngine {
     /// In normal flow a deferred release is applied at its own channel's next
     /// acquire grant, so it never lingers for a peer to flush; this only fires
     /// in the genuine mutual-block, never prematurely.
-    fn flush_peer_pending_release(
-        &mut self,
-        blocked_ch: usize,
-        acquire_lock_id: u8,
-        tile: &mut Tile,
-        neighbors: &mut NeighborTiles<'_>,
-    ) {
+    fn flush_peer_pending_release(&mut self, blocked_ch: usize, acquire_lock_id: u8) {
         let want = match self.resolve_lock_id(acquire_lock_id) {
             Some(t) => t,
             None => return,
@@ -958,22 +965,20 @@ impl DmaEngine {
             if other == blocked_ch {
                 continue;
             }
-            // Find a DUE queued release (its pipeline latency has elapsed) that
-            // resolves to the lock this channel is blocked on. Only flush a due
-            // one: a transient warmup block clears on the next arbiter grant, so
-            // a not-yet-due peer release must not be pulled early -- that would
-            // defeat the release latency. A genuine mutual block happens ~a
-            // buffer-drain after completion, so the peer's release is long due
-            // and this still breaks it. current_cycle always advances, so a due
-            // release is always eventually reached: no permanent deadlock.
+            // Find a not-yet-swapped queued release on a peer that resolves to
+            // the lock this channel is blocked on, and force its swap. In a
+            // genuine mutual block the peer cannot reach its own acquire grant,
+            // so its swap never fires on its own -- forcing it here breaks the
+            // deadlock. service_pending_releases then performs the functional
+            // semaphore release (this same step) and schedules the trace event
+            // at max(ready_cycle, now), so the observable timing is unchanged.
+            // (Warmup never blocks -- buffers are free -- so this only triggers
+            // on a real mutual hold, not prematurely.)
             let n = self.channels[other].pending_releases.len();
             for idx in 0..n {
                 let p = self.channels[other].pending_releases[idx];
-                if self.current_cycle >= p.ready_cycle && self.resolve_lock_id(p.lock_id) == Some(want) {
-                    // Hand this channel the buffer it's waiting on. One match is
-                    // enough to clear the wait -- stop so we don't over-release.
-                    self.channels[other].pending_releases.remove(idx);
-                    self.apply_lock_release_direct(p.lock_id, p.release_value, tile, neighbors);
+                if !p.swapped && self.resolve_lock_id(p.lock_id) == Some(want) {
+                    self.channels[other].pending_releases[idx].swapped = true;
                     return;
                 }
             }

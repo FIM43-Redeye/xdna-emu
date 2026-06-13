@@ -20,26 +20,39 @@ use super::transfer::Transfer;
 ///
 /// Tenant-4 mechanism: the release that signals the *other* channel does not
 /// fire at BD completion -- HW holds it until the DMA swaps to its next buffer
-/// (the next chained BD's AcquireGE is granted). On top of that, the memtile
-/// lock-release path has a fixed pipeline latency, so even a swap that is
-/// immediately grantable (warmup, buffers free) does not land the release until
-/// `completion + latency`. The release therefore fires at
-/// `max(ready_cycle, swap_cycle)`: `ready_cycle` floors the warmup/prompt case,
-/// the swap floors the backpressured case.
+/// (the next chained BD's AcquireGE is granted).
+///
+/// Two distinct timings are tracked because the memtile release latency is an
+/// OBSERVABILITY effect, not a functional stall:
+///
+/// - The FUNCTIONAL semaphore (the lock value a waiting consumer acquires) is
+///   released PROMPTLY at the swap. This keeps the consumer-free path off the
+///   producer's critical path, so warmup fills stay at the shim cadence exactly
+///   as HW shows (tenant-4 probe: back-to-back 65-cyc fills, no extra stall).
+/// - The LockRelease TRACE EVENT lands at `max(ready_cycle, swap)`: in warmup
+///   the swap is immediate, so the trace event still trails FINISHED_BD by the
+///   pipeline latency (HW: LOCK_SEL1_REL ~63 cyc after FINISHED_BD); under
+///   backpressure the swap dominates (HW: ~2071 cyc, the consumer-free point).
+///
+/// Applying the latency to the trace event alone -- not the lock value --
+/// reproduces both the warmup fill cadence and the observed release timing.
 #[derive(Debug, Clone, Copy)]
 pub struct PendingRelease {
     pub lock_id: u8,
     pub release_value: i8,
-    /// Earliest cycle the release may land: BD-completion cycle plus the
-    /// memtile lock-release pipeline latency (0 on non-memtile tiles).
+    /// Trace-event floor: BD-completion cycle plus the memtile lock-release
+    /// pipeline latency (0 on non-memtile tiles). The LockRelease trace event
+    /// is emitted at `max(ready_cycle, swap_cycle)`.
     pub ready_cycle: u64,
-    /// Whether the buffer swap for this release has occurred -- i.e. the
-    /// owning channel's NEXT BD acquire has been granted. A release fires at
-    /// `max(ready_cycle, swap)`: in warmup the swap is immediate so it fires at
-    /// `ready_cycle` (the pipeline latency); under buffer backpressure the
-    /// owning channel blocks on its next acquire, so the swap (and the release)
-    /// waits for the consumer to free a buffer. Set at the acquire grant.
+    /// Whether the buffer swap has occurred -- the owning channel's NEXT BD
+    /// acquire has been granted (set at the acquire grant / chained-BD entry /
+    /// deadlock-break flush). The functional semaphore releases as soon as this
+    /// is set.
     pub swapped: bool,
+    /// Once the functional semaphore has been released (at the swap), the cycle
+    /// at which the deferred trace event should be emitted: `max(ready_cycle,
+    /// swap_cycle)`. `None` until the semaphore is released.
+    pub trace_at: Option<u64>,
 }
 
 /// Information carried from a completed transfer into the lock release phase.
