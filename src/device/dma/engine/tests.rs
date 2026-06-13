@@ -1517,6 +1517,59 @@ fn run_memtile_mm2s_to_completion(
     panic!("DMA channel {} did not complete within {} cycles", channel, max_cycles);
 }
 
+/// Drive an S2MM MemTile DMA channel to completion, streaming `feed` words
+/// into `stream_in` as FIFO capacity allows each cycle.
+///
+/// Real silicon delivers S2MM input one word per cycle via the stream switch;
+/// the input FIFO is shallow (`input_fifo_capacity`). Tests must not bulk-push
+/// the whole payload up front -- that overflows the HW-faithful FIFO. This
+/// helper mirrors routing by offering the next word each cycle only when the
+/// channel's FIFO has room.
+fn run_memtile_s2mm_to_completion(
+    engine: &mut DmaEngine,
+    channel: u8,
+    own: &mut Tile,
+    neighbors_west: Option<&mut Tile>,
+    neighbors_east: Option<&mut Tile>,
+    feed: &[(u32, bool)],
+    max_cycles: usize,
+) {
+    use std::cell::RefCell;
+    let west_cell = neighbors_west.map(RefCell::new);
+    let east_cell = neighbors_east.map(RefCell::new);
+
+    let mut host_mem = make_host_memory();
+    let mut next = 0;
+    for cycle in 0..max_cycles {
+        // Offer the next word if the channel FIFO has room (mimics the stream
+        // switch delivering one beat per cycle under backpressure).
+        if next < feed.len() && engine.can_accept_stream_in_for_channel(channel) {
+            let (data, tlast) = feed[next];
+            if engine.push_stream_in(StreamData { data, tlast, channel }) {
+                next += 1;
+            }
+        }
+
+        let mut west_borrow = west_cell.as_ref().map(|c| c.borrow_mut());
+        let mut east_borrow = east_cell.as_ref().map(|c| c.borrow_mut());
+        let mut neighbors = NeighborTiles {
+            west: west_borrow.as_deref_mut().map(|b| &mut **b),
+            east: east_borrow.as_deref_mut().map(|b| &mut **b),
+        };
+        engine.step(own, &mut neighbors, &mut host_mem);
+        drop(west_borrow);
+        drop(east_borrow);
+
+        if next >= feed.len() && !engine.channel_active(channel) {
+            return;
+        }
+        if matches!(engine.channel_state(channel), ChannelState::Error) {
+            panic!("DMA channel {} entered Error state at cycle {}", channel, cycle);
+        }
+    }
+    panic!("DMA channel {} did not complete within {} cycles", channel, max_cycles);
+}
+
 #[test]
 fn test_memtile_mm2s_reads_from_east_neighbor() {
     // Verify a MemTile MM2S BD with a base_addr in the East window reads
@@ -1591,11 +1644,10 @@ fn test_memtile_s2mm_writes_to_east_neighbor() {
     own_tile.data_memory_mut()[0x300..0x310].copy_from_slice(&[0x55; 16]);
     east_tile.data_memory_mut()[0x300..0x310].copy_from_slice(&[0x00; 16]);
 
-    // Push 4 stream words for a 16-byte S2MM transfer on channel 0.
+    // 4 stream words for a 16-byte S2MM transfer on channel 0, streamed in as
+    // the shallow input FIFO drains (not bulk-pushed -- that overflows it).
     let payload_word = u32::from_le_bytes([0xC3; 4]);
-    for i in 0..4 {
-        engine.push_stream_in(StreamData { data: payload_word, tlast: i == 3, channel: 0 });
-    }
+    let feed: Vec<(u32, bool)> = (0..4).map(|i| (payload_word, i == 3)).collect();
 
     // BD writes into the East window at offset 0x300, length 16.
     // 0x100300 = East window (0x100000) + offset 0x300.
@@ -1603,7 +1655,7 @@ fn test_memtile_s2mm_writes_to_east_neighbor() {
     engine.configure_bd(0, bd).unwrap();
     engine.start_channel(0, 0).unwrap();
 
-    run_memtile_mm2s_to_completion(&mut engine, 0, &mut own_tile, None, Some(&mut east_tile), 500);
+    run_memtile_s2mm_to_completion(&mut engine, 0, &mut own_tile, None, Some(&mut east_tile), &feed, 500);
 
     // East tile should now hold the payload at offset 0x300.
     let east_data = &east_tile.data_memory()[0x300..0x310];
@@ -1781,13 +1833,16 @@ fn test_stream_in_per_channel_isolation() {
     // must not prevent another channel from receiving data.
     let mut engine = DmaEngine::new_shim_tile(0, 0);
 
-    // Fill stream_in with channel 1 (trace) data up to capacity.
-    // With a shared buffer of 256 entries, this would block channel 0.
-    for i in 0..256 {
+    // Flood channel 1's (trace) FIFO to capacity. With a shared buffer this
+    // would block channel 0; per-channel FIFOs keep them independent.
+    let cap = engine.input_fifo_capacity();
+    for i in 0..cap {
         let pushed =
             engine.push_stream_in(StreamData { data: 0xFEED_0000 | i as u32, tlast: false, channel: 1 });
         assert!(pushed, "channel 1 push {} should succeed", i);
     }
+    // Channel 1 is now full -- the next push to it must be rejected.
+    assert!(!engine.can_accept_stream_in_for_channel(1), "channel 1 FIFO should be full at capacity {}", cap);
 
     // Channel 0 (output) must still be able to receive data.
     // On real hardware, channel 0's FIFO is independent of channel 1's.

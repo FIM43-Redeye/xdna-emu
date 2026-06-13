@@ -2,16 +2,31 @@
 
 use super::*;
 
-/// Maximum number of words buffered per stream input FIFO.
-///
-/// Each S2MM channel has its own FIFO. Value determined empirically
-/// from bridge-test traces; not an AM025 register (the hardware FIFO
-/// is much smaller, but the emulator buffers more to absorb
-/// scheduler jitter without blocking). If this proves too shallow
-/// or too deep in practice, tune here in one place.
-pub(super) const STREAM_BUFFER_CAPACITY_WORDS: usize = 256;
-
 impl DmaEngine {
+    /// Maximum per-channel `stream_in` depth before that S2MM channel
+    /// backpressures its upstream stream-switch master port.
+    ///
+    /// Mirrors `output_fifo_capacity()` on the MM2S side. The S2MM consumer
+    /// reads from the tile's local master stream-switch port, whose FIFO AM020
+    /// ch2 specifies as 2-deep for AIE2 ("Local master ports have one register
+    /// slice with 1-cycle latency and a 2-deep FIFO"). The stream-switch fabric
+    /// already models that master port (`StreamPort::fifo` at
+    /// `STREAM_LOCAL_MASTER_FIFO_DEPTH`); this is the DMA's ingress staging
+    /// downstream of it, so it matches the same depth rather than adding a deep
+    /// decoupling buffer.
+    ///
+    /// History: this was a hardcoded 256-word buffer "to absorb scheduler
+    /// jitter without blocking." That depth silently absorbed ~256/buffer_words
+    /// extra fast iterations during double-buffer warmup, defeating the
+    /// otherwise HW-faithful master-port backpressure and producing a warmup
+    /// transient much longer than silicon (root-caused 2026-06-13 via the
+    /// dma_passthrough buffer-size sweep). The consume-before-produce cycle
+    /// order (`step_all_dma` Phase 3 drains before `route_streams` Phase 4
+    /// fills) means the shallow depth does not spuriously overflow.
+    pub fn input_fifo_capacity(&self) -> usize {
+        xdna_archspec::aie2::timing::STREAM_LOCAL_MASTER_FIFO_DEPTH as usize
+    }
+
     /// Map a combined channel index (S2MM_count + MM2S_offset) to the
     /// per-channel `stream_out` slot.  Returns `usize::MAX` if the channel
     /// isn't an MM2S channel on this tile -- callers that hit that case have
@@ -124,14 +139,18 @@ impl DmaEngine {
             self.fatal_errors.push(msg);
             return false;
         }
-        if self.stream_in[ch].len() < STREAM_BUFFER_CAPACITY_WORDS {
+        if self.stream_in[ch].len() < self.input_fifo_capacity() {
             self.stream_in[ch].push_back(data);
             true
         } else {
             let msg = format!(
                 "DMA({},{}) stream_in buffer full ({}), dropping ch{} data: 0x{:08X} -- \
                  backpressure violation",
-                self.col, self.row, STREAM_BUFFER_CAPACITY_WORDS, data.channel, data.data,
+                self.col,
+                self.row,
+                self.input_fifo_capacity(),
+                data.channel,
+                data.data,
             );
             log::error!("{}", msg);
             self.fatal_errors.push(msg);
@@ -156,14 +175,14 @@ impl DmaEngine {
     /// know the target channel should use `can_accept_stream_in_for_channel`
     /// for precise per-channel backpressure.
     pub fn can_accept_stream_in(&self) -> bool {
-        self.stream_in.iter().any(|q| q.len() < STREAM_BUFFER_CAPACITY_WORDS)
+        self.stream_in.iter().any(|q| q.len() < self.input_fifo_capacity())
     }
 
     /// Check if a specific S2MM channel's stream input buffer has space.
     pub fn can_accept_stream_in_for_channel(&self, channel: u8) -> bool {
         self.stream_in
             .get(channel as usize)
-            .map_or(false, |q| q.len() < STREAM_BUFFER_CAPACITY_WORDS)
+            .map_or(false, |q| q.len() < self.input_fifo_capacity())
     }
 
     /// Get the total number of words across all MM2S channel stream output
