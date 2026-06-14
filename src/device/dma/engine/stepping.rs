@@ -124,6 +124,12 @@ impl DmaEngine {
     /// that cycle and drop the entry.
     fn service_pending_releases(&mut self, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>) {
         for ch_idx in 0..self.channels.len() {
+            // End-of-stream release tail: while a producer is stream-stalled, a
+            // consumer-free (its acquire lock incrementing) is the SWAP-enable
+            // that fires the next deferred full-release -- HW emits LOCK_SEL*_REL
+            // there even though the stalled producer never re-acquires the slot.
+            self.schedule_swap_enable_releases(ch_idx, tile, neighbors);
+
             let channel_idle = !self.channels[ch_idx].has_pending_work();
             let mut i = 0;
             while i < self.channels[ch_idx].pending_releases.len() {
@@ -143,6 +149,76 @@ impl DmaEngine {
                     _ => i += 1,
                 }
             }
+        }
+    }
+
+    /// End-of-stream release tail (tenant-4, HW-pinned): the producer's deferred
+    /// full-release fires on the SWAP-enable -- the next buffer becoming FREE,
+    /// i.e. a consumer-free event -- not on the producer's actual re-acquire.
+    ///
+    /// In steady state the producer re-acquires the slot right after the consumer
+    /// frees it, so the re-acquire-grant path (`retire_slot_trace`) already lands
+    /// the release on the consumer cadence. But when the input stream is exhausted
+    /// the producer stream-stalls and never issues that re-acquire, so a trailing
+    /// fill's slot is never recycled and its release would be dropped (the probe's
+    /// 7-of-8 tail). HW still fires it: the producer probe shows the final
+    /// LOCK_SEL1_REL landing where the next consumer-free does, with no
+    /// LOCK_SEL0_ACQ after it.
+    ///
+    /// So while a channel is stream-stalled, watch its acquire lock (FREE). Each
+    /// increment is a consumer-free (the stalled producer cannot decrement it), so
+    /// emit one oldest still-pending release per +1 at `max(ready_cycle, now)`.
+    /// Gated on `prev_starving`, so steady state (where the re-acquire path owns
+    /// the timing) is untouched, and the `trace_at`-already-set guard prevents any
+    /// double-fire against the re-acquire path.
+    fn schedule_swap_enable_releases(&mut self, ch_idx: usize, tile: &Tile, neighbors: &NeighborTiles<'_>) {
+        if !self.channels[ch_idx].prev_starving {
+            // Not stream-stalled: re-baseline so the next stall starts fresh.
+            self.channels[ch_idx].swap_free_watch = None;
+            return;
+        }
+        // The stalled fill holds an acquired FREE buffer; its acquire lock IS the
+        // FREE semaphore the consumer replenishes.
+        let acquire_lock = self.channels[ch_idx].fsm.transfer().and_then(|t| t.acquire_lock);
+        let Some(lock_id) = acquire_lock else { return };
+        let Some(value) = self.read_lock_value(lock_id, tile, neighbors) else {
+            return;
+        };
+
+        let increments = match self.channels[ch_idx].swap_free_watch {
+            Some((prev_lock, prev_val)) if prev_lock == lock_id && value > prev_val => {
+                (value - prev_val) as usize
+            }
+            _ => 0,
+        };
+        self.channels[ch_idx].swap_free_watch = Some((lock_id, value));
+
+        // Emit one oldest still-pending release per consumer-free.
+        let now = self.current_cycle;
+        for _ in 0..increments {
+            if let Some(pr) = self.channels[ch_idx].pending_releases.iter_mut().find(|p| p.trace_at.is_none())
+            {
+                pr.trace_at = Some(pr.ready_cycle.max(now));
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Read a (possibly-neighbor) lock's committed value, read-only.
+    fn read_lock_value(&self, lock_id: u8, tile: &Tile, neighbors: &NeighborTiles<'_>) -> Option<i8> {
+        match self.resolve_lock_id(lock_id)? {
+            LockTarget::Own(id) => tile.locks.get(id as usize).map(|l| l.value),
+            LockTarget::West(id) => neighbors
+                .west
+                .as_deref()
+                .and_then(|w| w.locks.get(id as usize))
+                .map(|l| l.value),
+            LockTarget::East(id) => neighbors
+                .east
+                .as_deref()
+                .and_then(|e| e.locks.get(id as usize))
+                .map(|l| l.value),
         }
     }
 

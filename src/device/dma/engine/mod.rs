@@ -564,6 +564,7 @@ impl DmaEngine {
         ch.prev_starving = false;
         ch.prev_lock_stalled = false;
         ch.pending_releases.clear();
+        ch.swap_free_watch = None;
 
         Ok(())
     }

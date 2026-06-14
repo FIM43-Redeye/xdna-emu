@@ -2834,6 +2834,134 @@ fn memtile_cross_lock_release_frees_consumer_promptly_trace_lags() {
     );
 }
 
+/// End-of-stream release tail: the producer's FINAL full-release trace fires on
+/// the consumer-free cadence, even after the producer stream-stalls and never
+/// re-acquires that slot.
+///
+/// HW evidence (tenant-4 producer probe): the 8th LOCK_SEL1_REL fires ~2 periods
+/// after the 8th FINISHED_BD, right where the next consumer-free lands -- with NO
+/// 9th LOCK_SEL0_ACQ after it (the producer is stalled on exhausted input). So
+/// the deferred full-release is gated on the SWAP-enable (the next buffer
+/// becoming FREE = a consumer-free event), not on the producer's actual
+/// re-acquire grant. The emulator gates on the re-acquire grant, so a trailing
+/// fill whose slot is never re-acquired at end-of-stream drops its release (the
+/// probe's 7-of-8 tail).
+///
+/// This pins the gate: a producer that has stream-stalled with a trailing pending
+/// release must emit it when its acquire lock (FREE) is incremented by the
+/// consumer -- at the consumer-free cadence -- not drop it.
+#[test]
+fn memtile_stalled_producer_emits_trailing_release_on_consumer_free() {
+    use crate::interpreter::state::EventType;
+
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut tile = Tile::mem_tile(1, 1);
+    let mut host_mem = make_host_memory();
+
+    const FREE: u8 = 64; // local lock 0
+    const FULL: u8 = 65; // local lock 1 (the producer releases this -> LOCK_SEL1_REL)
+    let buf0 = 0x80000u64;
+    let buf1 = 0x80100u64;
+
+    // Looping double buffer: bd0 -> bd1 -> bd0 -> ... each fill acquires FREE,
+    // releases FULL (cross-lock -> deferred trace).
+    engine
+        .configure_bd(
+            0,
+            BdConfig::simple_1d(buf0, 16)
+                .with_acquire(FREE, -1)
+                .with_release(FULL, 1)
+                .with_next(1),
+        )
+        .unwrap();
+    engine
+        .configure_bd(
+            1,
+            BdConfig::simple_1d(buf1, 16)
+                .with_acquire(FREE, -1)
+                .with_release(FULL, 1)
+                .with_next(0),
+        )
+        .unwrap();
+
+    // FREE high enough that fills are not acquire-backpressured: the producer
+    // stream-stalls on exhausted input (not on the lock), matching the probe.
+    tile.locks[0].set(6);
+    tile.locks[1].set(0);
+
+    engine.start_channel(0, 0).unwrap();
+
+    // Feed exactly N buffers, then stop -> the (N+1)th fill stream-stalls.
+    let n_bufs = 4usize;
+    let feed: Vec<u32> = (0..(n_bufs as u32 * 4)).collect();
+    let mut fed = 0usize;
+    let mut events: Vec<(u64, EventType)> = Vec::new();
+
+    // Run until the producer is stream-stalled (fed everything, no forward
+    // progress for a while).
+    let mut cycle = 0u64;
+    let mut stall_since: Option<u64> = None;
+    loop {
+        engine.set_current_cycle(cycle);
+        while fed < feed.len()
+            && engine.push_stream_in(StreamData { data: feed[fed], tlast: false, channel: 0 })
+        {
+            fed += 1;
+        }
+        engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+        tile.resolve_lock_requests(cycle);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        events.extend(tile.mem_trace_pending.drain(..));
+
+        let stalled = fed == feed.len() && !engine.channel_active(0)
+            || (fed == feed.len() && engine.channel_fsm_description(0).starts_with("Transferring"));
+        if stalled {
+            stall_since.get_or_insert(cycle);
+            if cycle - stall_since.unwrap() > 80 {
+                break;
+            }
+        }
+        cycle += 1;
+        assert!(cycle < 2000, "producer never reached steady stream-stall");
+    }
+
+    let before = events
+        .iter()
+        .filter(|(_, e)| matches!(e, EventType::LockRelease { lock_id: 1 }))
+        .count();
+    assert!(
+        before < n_bufs,
+        "precondition: a trailing release should be undelivered while stalled (got {} of {})",
+        before,
+        n_bufs
+    );
+
+    // Simulate the consumer freeing the last buffer: increment FREE. On HW this
+    // is what fires the trailing LOCK_SEL1_REL.
+    let _ = tile.locks[0].release_with_value(1);
+    for _ in 0..40 {
+        cycle += 1;
+        engine.set_current_cycle(cycle);
+        engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+        tile.resolve_lock_requests(cycle);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        events.extend(tile.mem_trace_pending.drain(..));
+    }
+
+    let after = events
+        .iter()
+        .filter(|(_, e)| matches!(e, EventType::LockRelease { lock_id: 1 }))
+        .count();
+    assert!(
+        after > before,
+        "a consumer-free (FREE increment) while the producer is stream-stalled must emit the \
+         trailing full-release; before={} after={} (of {})",
+        before,
+        after,
+        n_bufs
+    );
+}
+
 #[test]
 fn memtile_invalid_bd_channel_combination_returns_error() {
     // BD 24 is the first "odd channel" BD; per-direction channel 0 (S2MM ch 0)

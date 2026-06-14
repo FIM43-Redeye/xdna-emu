@@ -327,6 +327,16 @@ pub struct ChannelContext {
     /// producer can fill several buffers before the earliest release lands, so
     /// each completion enqueues rather than overwrites.
     pub pending_releases: Vec<PendingRelease>,
+
+    /// Swap-enable watch for the end-of-stream release tail: `(acquire_lock_id,
+    /// last_value)` of the producer's acquire lock (FREE) while the channel is
+    /// stream-stalled. HW fires a deferred full-release on the SWAP-enable -- the
+    /// next buffer becoming FREE (a consumer-free event) -- not on the producer's
+    /// actual re-acquire. When stalled, an increment of this lock (the consumer
+    /// freeing a buffer) emits the oldest still-pending release, so a trailing
+    /// fill whose slot is never re-acquired still lands its trace. `None` when not
+    /// stream-stalled (re-baselined on each stall). See `service_pending_releases`.
+    pub swap_free_watch: Option<(u8, i8)>,
 }
 
 impl ChannelContext {
@@ -349,6 +359,7 @@ impl ChannelContext {
             prev_starving: false,
             prev_lock_stalled: false,
             pending_releases: Vec::new(),
+            swap_free_watch: None,
         }
     }
 
@@ -456,6 +467,7 @@ impl ChannelContext {
         self.controller_dispatch_index = 0;
         self.stats = ChannelStats::default();
         self.pending_releases.clear();
+        self.swap_free_watch = None;
     }
 }
 
