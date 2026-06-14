@@ -85,7 +85,7 @@ pub struct EventsConfig {
 /// the wrong comparison semantics. Falls back to `mem_events` when the
 /// specific table is absent (legacy events.json predating per-module
 /// slot_names emission), preserving old behavior for those snapshots.
-fn names_for_pkt(config: &EventsConfig, pkt_type: u8) -> &[String] {
+pub(crate) fn names_for_pkt(config: &EventsConfig, pkt_type: u8) -> &[String] {
     if pkt_type == 3 && !config.memtile_events.is_empty() {
         &config.memtile_events
     } else if pkt_type == 0 {
@@ -440,7 +440,7 @@ fn is_level_event(name: &str) -> bool {
 }
 
 /// Map a slot index to its configured event name.
-fn slot_name(slot: u8, names: &[String]) -> String {
+pub(crate) fn slot_name(slot: u8, names: &[String]) -> String {
     if (slot as usize) < names.len() {
         names[slot as usize].clone()
     } else {

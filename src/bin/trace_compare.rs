@@ -16,12 +16,19 @@ use std::process;
 
 use xdna_emu::trace::compare::{self, AnalysisOptions, EventsConfig};
 use xdna_emu::trace::stages;
+use xdna_emu::trace::stochastic;
 
 fn usage() -> ! {
     eprintln!("Usage:");
     eprintln!("  trace-compare --hw <events.json> --emu <events.json> \\");
     eprintln!("                [--events-json <slot-names.json>] [-o <file>]");
     eprintln!("  trace-compare --sweep <dir> [-o <file>]");
+    eprintln!("  trace-compare --hw-dir <dir-of-run_*.json> --emu <events.json> \\");
+    eprintln!("                [--band-sigma <k=2.0>] [--remap-columns]");
+    eprintln!();
+    eprintln!("  Stochastic-aware mode (--hw-dir / --hw-runs a,b,c) compares one EMU");
+    eprintln!("  capture against a HW *distribution* (N captures), with a per-event");
+    eprintln!("  tolerance band (mean +/- k*std) derived from HW run-to-run variance.");
     eprintln!();
     eprintln!("  The --hw/--emu inputs are events JSON produced by");
     eprintln!("  tools/parse-trace.py; the optional --events-json is a legacy");
@@ -49,6 +56,9 @@ fn main() {
     let mut output_path: Option<String> = None;
     let mut opts = AnalysisOptions::default();
     let mut stages_mode = false;
+    let mut hw_dir: Option<String> = None;
+    let mut hw_runs_list: Option<String> = None;
+    let mut band_sigma: f64 = 2.0;
 
     let mut i = 1;
     while i < args.len() {
@@ -99,6 +109,21 @@ fn main() {
             "--stages" => {
                 stages_mode = true;
             }
+            "--hw-dir" => {
+                i += 1;
+                hw_dir = Some(args.get(i).unwrap_or_else(|| usage()).clone());
+            }
+            "--hw-runs" => {
+                i += 1;
+                hw_runs_list = Some(args.get(i).unwrap_or_else(|| usage()).clone());
+            }
+            "--band-sigma" => {
+                i += 1;
+                band_sigma = args.get(i).unwrap_or_else(|| usage()).parse().unwrap_or_else(|_| {
+                    eprintln!("Error: --band-sigma expects a number");
+                    process::exit(1);
+                });
+            }
             "--help" | "-h" => usage(),
             other => {
                 eprintln!("Unknown argument: {}", other);
@@ -119,8 +144,9 @@ fn main() {
         eprintln!("Error: --emu required when using --hw");
         process::exit(1);
     }
-    if sweep_path.is_none() && hw_path.is_none() && !(stages_mode && emu_path.is_some()) {
-        eprintln!("Error: either --sweep or --hw/--emu required");
+    let stochastic_mode = hw_dir.is_some() || hw_runs_list.is_some();
+    if sweep_path.is_none() && hw_path.is_none() && !stochastic_mode && !(stages_mode && emu_path.is_some()) {
+        eprintln!("Error: either --sweep, --hw/--emu, or --hw-dir/--emu required");
         usage();
     }
 
@@ -149,6 +175,73 @@ fn main() {
             process::exit(1);
         });
         let report = stages::format_stages_report(&stage_rows);
+        print!("{}", report);
+        if let Some(out) = output_path {
+            let path = Path::new(&out);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(path, &report) {
+                eprintln!("Error writing {}: {}", out, e);
+                process::exit(1);
+            }
+            eprintln!("\nReport written to {}", out);
+        }
+        return;
+    }
+
+    // Stochastic-aware mode: --hw-dir/--hw-runs (N HW captures) + --emu (one).
+    // Derives a per-event tolerance band from HW run-to-run variance and
+    // band-compares the EMU. Standalone path; exits after.
+    if hw_dir.is_some() || hw_runs_list.is_some() {
+        if hw_path.is_some() || sweep_path.is_some() {
+            eprintln!("Error: --hw-dir/--hw-runs is incompatible with --hw/--sweep");
+            process::exit(1);
+        }
+        let emu = emu_path.unwrap_or_else(|| {
+            eprintln!("Error: --emu required with --hw-dir/--hw-runs");
+            process::exit(1);
+        });
+        let mut hw_paths: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(dir) = hw_dir {
+            let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+                eprintln!("Error reading --hw-dir {}: {}", dir, e);
+                process::exit(1);
+            });
+            for e in entries.flatten() {
+                let p = e.path();
+                let is_json = p.extension().map(|x| x == "json").unwrap_or(false);
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                // Accept run_*.json (the capture convention) or any *.json.
+                if is_json && (name.starts_with("run_") || name.ends_with(".json")) {
+                    hw_paths.push(p);
+                }
+            }
+            hw_paths.sort();
+        }
+        if let Some(list) = hw_runs_list {
+            for s in list.split(',').filter(|s| !s.is_empty()) {
+                hw_paths.push(std::path::PathBuf::from(s));
+            }
+        }
+        if hw_paths.is_empty() {
+            eprintln!("Error: no HW captures found for --hw-dir/--hw-runs");
+            process::exit(1);
+        }
+        let config = EventsConfig::default();
+        let report = match stochastic::compare_stochastic(
+            &hw_paths,
+            Path::new(&emu),
+            &config,
+            band_sigma,
+            opts.remap_columns,
+        ) {
+            Ok(r) => stochastic::format_report(&r),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            }
+        };
         print!("{}", report);
         if let Some(out) = output_path {
             let path = Path::new(&out);
