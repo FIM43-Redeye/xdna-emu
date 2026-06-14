@@ -581,6 +581,52 @@ fn parity_handler_error_is_sticky_continue_not_fatal() {
 }
 
 #[test]
+fn has_pending_control_packet_is_control_specific() {
+    // The hazard detector must fire ONLY on control-register-write packets being
+    // delivered (TileCtrl master / reassembler / pending action), NOT on other
+    // packet-switched traffic. Trace packets are also packet-switched (trace
+    // unit -> shim DDR) but never touch the control delivery path; a broad
+    // packet signal fired ~41x per traced tenant-4 run purely on trace traffic.
+    let mut array = TileArray::npu1();
+    assert!(!array.has_pending_control_packet(), "fresh array: no control packet pending");
+
+    let col = 1u8;
+    let row = 2u8;
+    let tile_idx = array.tile_index(col, row);
+
+    // A packet-switched word on a slave INPUT port (not the control delivery
+    // path, which is the TileCtrl MASTER + reassembler) must NOT trip the
+    // control-specific detector -- this stands in for trace traffic.
+    {
+        let ss = &mut array.tiles[tile_idx].stream_switch;
+        let slave = ss.tile_ctrl_slave_port().expect("ctrl slave exists");
+        ss.slave_mut(slave).unwrap().packet_enable = true;
+        ss.configure_slave_slot(slave, 0, 0x0000_0100);
+        ss.slave_mut(slave).unwrap().push(0x8000_0000);
+    }
+    assert!(
+        !array.has_pending_control_packet(),
+        "a packet not on the control delivery path (trace-like) must not trip the detector"
+    );
+
+    // A control word waiting at the TileCtrl MASTER port IS a pending control
+    // packet -- this is the destination delivery point the reassembler drains.
+    {
+        let ss = &mut array.tiles[tile_idx].stream_switch;
+        let ctrl_master = ss
+            .masters
+            .iter()
+            .position(|p| matches!(p.port_type, crate::device::stream_switch::PortType::TileCtrl))
+            .expect("compute tile must have a TileCtrl master port");
+        ss.masters[ctrl_master].push(0x8000_0000);
+    }
+    assert!(
+        array.has_pending_control_packet(),
+        "a control word at the TileCtrl master port must register as a pending control packet"
+    );
+}
+
+#[test]
 fn tile_array_exposes_clock_controller_with_silicon_accurate_default() {
     // TileArray::npu1() is the existing test helper.
     let array = TileArray::npu1();

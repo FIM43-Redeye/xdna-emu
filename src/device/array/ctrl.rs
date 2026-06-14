@@ -13,6 +13,34 @@ impl TileArray {
         std::mem::take(&mut self.pending_ctrl_actions)
     }
 
+    /// True if a control-register-write packet is still being delivered to any
+    /// tile: a word waiting at a TileCtrl master port, a packet mid-reassembly,
+    /// or a reassembled action not yet dispatched.
+    ///
+    /// This is the necessary precondition for the (deleted) inter-instruction
+    /// `flush_ctrl_packets` to have had any effect. It is deliberately
+    /// CONTROL-specific: it keys on the TileCtrl delivery path and the
+    /// per-tile control-packet reassemblers, NOT the broad packet-switched
+    /// signal. Trace packets are also packet-switched (trace units -> shim DDR)
+    /// but never touch the control path, so they must not trip the detector --
+    /// an early broad signal fired ~41x per traced tenant-4 run purely on trace
+    /// traffic. The control-packet ordering hazard detector screens on this: if
+    /// it is ever true at an NPU instruction boundary, removing the flush may
+    /// have changed control-register delivery ordering, and we want to know.
+    pub fn has_pending_control_packet(&self) -> bool {
+        if !self.pending_ctrl_actions.is_empty() {
+            return true;
+        }
+        if self.ctrl_reassemblers.iter().any(|r| r.is_mid_packet()) {
+            return true;
+        }
+        self.tiles.iter().any(|t| {
+            t.stream_switch.masters.iter().any(|p| {
+                matches!(p.port_type, crate::device::stream_switch::PortType::TileCtrl) && p.has_data()
+            })
+        })
+    }
+
     /// Handle a control packet OP_READ by reading registers and queuing
     /// a response packet for injection into the tile's TileCtrl slave port.
     ///

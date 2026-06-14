@@ -95,6 +95,15 @@ impl StreamReassembler {
         self.drop_header
     }
 
+    /// True if a control packet is mid-reassembly: a header has been received
+    /// and the reassembler is collecting its data beats. This is the
+    /// destination-side signal that a control-register-write packet is actively
+    /// being delivered to this tile -- distinct from trace packets, which never
+    /// pass through the control-packet reassembler.
+    pub fn is_mid_packet(&self) -> bool {
+        matches!(self.state, ReassemblerState::Collecting { .. })
+    }
+
     /// Feed one word from the TileCtrl master port.
     ///
     /// Returns `Complete(packet)` when a full control packet has been

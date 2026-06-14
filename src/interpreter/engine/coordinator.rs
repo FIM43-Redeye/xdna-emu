@@ -175,6 +175,11 @@ pub struct InterpreterEngine {
     stall_cycles: u64,
     /// Cycles of no progress before declaring stall. 0 = disabled.
     stall_threshold: u64,
+    /// Count of control-packet ordering hazards observed (see
+    /// `note_ctrl_packet_ordering_hazard`). Should be 0 for the
+    /// executor-direct-config majority of the corpus; non-zero only flags
+    /// control-packet kernels where the deleted flush would have force-delivered.
+    ctrl_packet_hazard_count: u64,
 }
 
 impl InterpreterEngine {
@@ -217,6 +222,7 @@ impl InterpreterEngine {
             last_instructions: 0,
             stall_cycles: 0,
             stall_threshold: 0,
+            ctrl_packet_hazard_count: 0,
         }
     }
 
@@ -342,39 +348,50 @@ impl InterpreterEngine {
         }
     }
 
-    /// Flush in-flight control packet data through the stream switch.
+    /// Detect a control-packet ordering hazard at an NPU instruction boundary.
     ///
-    /// On real hardware, stream switch latency is 1-3 cycles per hop -- far
-    /// shorter than the NPU firmware's instruction-to-instruction latency.
-    /// So when firmware observes a shim DMA completion (Sync) and then writes
-    /// a START_QUEUE register, the control packet data has long since arrived
-    /// at the destination tile.
+    /// Replaces the former `flush_ctrl_packets`, which fast-forwarded the stream
+    /// router up to 8x at a frozen simulation cycle to deliver in-flight control
+    /// packets before the next instruction read them. That flush was vestigial
+    /// under the active `provisional_npu1` firmware-latency model:
+    ///   - executor config writes (`execute_write32`) are immediate direct
+    ///     register writes, not fabric-routed -- they never needed a delivery
+    ///     window;
+    ///   - the normal per-cycle `step()` path already delivers and dispatches
+    ///     control packets every cycle (Phase 3);
+    ///   - every fabric control packet gets its physical 1-hop/cycle delivery
+    ///     across the emitting instruction's >=100-cycle retirement window.
+    /// Its only measurable effect was a parasitic end-of-stream burst that
+    /// over-delivered circuit-switched producer data (the tenant-4 tail-collapse),
+    /// because each frozen-cycle routing pass also advanced data streams.
     ///
-    /// In our emulator, the NPU executor and stream routing are interleaved
-    /// within the same cycle loop. Without explicit flushing, the executor
-    /// can fire START_QUEUE before the previous cycle's routing delivers
-    /// the control packet's final words to the tile's DMA BD registers.
-    ///
-    /// Call this between NPU executor advance and engine step to ensure
-    /// all in-flight control packet data reaches its destination before
-    /// subsequent NPU instructions take effect.
-    pub fn flush_ctrl_packets(&mut self) {
-        // Run routing passes to deliver pending stream data, then dispatch
-        // any control packet actions that were generated.  Limit to a few
-        // iterations; control packets traverse at most 4-5 hops.
-        for _ in 0..8 {
-            let (_, _, words) = self.device.array.step_data_movement(&mut self.host_memory);
-
-            let ctrl_actions = self.device.array.drain_ctrl_packet_actions();
-            if ctrl_actions.is_empty() && words == 0 {
-                break;
-            }
-
-            for action in ctrl_actions {
-                self.dispatch_ctrl_action(action);
-            }
-            self.drain_core_enables();
+    /// Removing it relies on the firmware-latency model for correct ordering.
+    /// To make that reliance falsifiable at runtime, this records a hazard
+    /// whenever a packet-switched control packet is STILL in flight at an
+    /// instruction boundary -- the exact precondition under which the old flush
+    /// would have force-delivered. For the executor-direct-config majority of
+    /// the corpus (tenant-4 included) this is never true. A non-zero count flags
+    /// a control-packet kernel to scrutinize: if its bridge output is still
+    /// correct the flush was unnecessary there too; if not, the fallback is a
+    /// packet-only flush (restrict routing to packet-switched traffic).
+    pub fn note_ctrl_packet_ordering_hazard(&mut self) {
+        if self.device.array.has_pending_control_packet() {
+            self.ctrl_packet_hazard_count += 1;
+            log::warn!(
+                "control-packet ordering hazard at cycle {}: a packet-switched control \
+                 packet is still in flight at an NPU instruction boundary -- the removed \
+                 flush_ctrl_packets would have force-delivered here. Verify control-packet \
+                 ordering for this kernel.",
+                self.total_cycles
+            );
         }
+    }
+
+    /// Number of control-packet ordering hazards observed this run (see
+    /// `note_ctrl_packet_ordering_hazard`). 0 = the deleted flush was never
+    /// load-bearing on this workload.
+    pub fn ctrl_packet_hazard_count(&self) -> u64 {
+        self.ctrl_packet_hazard_count
     }
 
     /// Get reference to device state.
@@ -2935,6 +2952,36 @@ mod tests {
         engine.step();
         assert_eq!(engine.status(), EngineStatus::Running);
         assert_eq!(engine.total_cycles(), 1);
+    }
+
+    #[test]
+    fn note_ctrl_packet_ordering_hazard_counts_inflight_packets() {
+        // The control-packet ordering hazard detector replaces the deleted
+        // flush_ctrl_packets. It records a hazard whenever a packet-switched
+        // control packet is still in flight at an NPU instruction boundary --
+        // the exact condition under which the removed flush would have
+        // force-delivered. With no packet in flight it must stay silent.
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.note_ctrl_packet_ordering_hazard();
+        assert_eq!(engine.ctrl_packet_hazard_count(), 0, "no control packet in flight -> no hazard");
+
+        // Put a control word at a tile's TileCtrl MASTER port -- the control
+        // delivery point the reassembler drains (not trace/data traffic).
+        let tile_idx = engine.device.array.tile_index(1, 2);
+        let ss = &mut engine.device.array.tiles[tile_idx].stream_switch;
+        let ctrl_master = ss
+            .masters
+            .iter()
+            .position(|p| matches!(p.port_type, crate::device::stream_switch::PortType::TileCtrl))
+            .expect("compute tile must have a TileCtrl master port");
+        ss.masters[ctrl_master].push(0x8000_0000);
+
+        engine.note_ctrl_packet_ordering_hazard();
+        assert_eq!(
+            engine.ctrl_packet_hazard_count(),
+            1,
+            "a control packet in flight at an instruction boundary must record one hazard"
+        );
     }
 
     #[test]

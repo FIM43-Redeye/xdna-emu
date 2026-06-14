@@ -285,13 +285,16 @@ pub(crate) fn run_interpreter(
             "executor reported BlockedOnPoll yet npu_progressed=true"
         );
 
-        // When the NPU executor progressed (executed an instruction that may
-        // configure DMA or write START_QUEUE), flush in-flight control packet
-        // data through the stream switch.  On real hardware the stream switch
-        // latency is invisible to firmware; in the emulator, routing is batched
-        // per cycle so control packet register writes can lag behind.
+        // When the NPU executor progressed, the former flush_ctrl_packets used
+        // to fast-forward in-flight control packets here. That flush was
+        // vestigial under the active firmware-latency model (executor config
+        // writes are immediate; normal step() delivers control packets every
+        // cycle) and its only side effect was the tenant-4 tail-collapse. It is
+        // now a detector: it records a hazard if a packet-switched control
+        // packet is still in flight at this instruction boundary (the condition
+        // the flush masked). See InterpreterEngine::note_ctrl_packet_ordering_hazard.
         if npu_progressed {
-            engine.flush_ctrl_packets();
+            engine.note_ctrl_packet_ordering_hazard();
         }
 
         // DMA-only path: when no cores are enabled the engine halts
