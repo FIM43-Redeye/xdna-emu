@@ -935,6 +935,26 @@ impl CycleAccurateExecutor {
                 .record_event(branch_cycle, EventType::BranchTaken { from_pc: pc, to_pc: target });
         }
 
+        // AIE2 lock-arbitration latency. Every completed lock transaction
+        // (acquire or release) costs one extra core cycle beyond issue, even
+        // when uncontended: the lock sits behind the tile memory module's
+        // round-robin arbiter, which grants one request per cycle (AM020 ch.2
+        // memory-bank arbitration). HW trails every LOCK_ACQUIRE_REQ /
+        // LOCK_RELEASE_REQ with a 1-cycle LOCK_STALL pulse; the aiesim ISS (and
+        // our prior model) treated uncontended locks as zero-stall (the
+        // documented per-lock-transaction known-fidelity gap, 2026-06-07).
+        // Charged only when the transaction completes (Continue) -- a blocked
+        // acquire pays it when it later resumes and succeeds, not while it
+        // stalls. DMA-engine lock transactions are timed separately in the DMA
+        // model; this is the compute core's lock path only.
+        if matches!(final_result, ExecuteResult::Continue)
+            && bundle
+                .active_slots()
+                .any(|op| matches!(op.semantic, Some(SemanticOp::LockAcquire | SemanticOp::LockRelease)))
+        {
+            ctx.record_stall(1);
+        }
+
         // Advance cycle counter by 1 (pipelined issue rate).
         // Latency-based deferred writes and hazard stalls handle the rest.
         ctx.record_instruction(1);
@@ -1174,6 +1194,64 @@ mod tests {
         ctx.record_instruction(1);
         ctx.commit_pending_writes();
         assert_eq!(ctx.scalar.read(2), 30);
+    }
+
+    #[test]
+    fn test_lock_acquire_charges_arbitration_cycle() {
+        // AIE2 charges one memory-arbitration cycle per lock transaction even
+        // when uncontended: the lock sits behind the tile memory module's
+        // round-robin arbiter, which grants one request per cycle (AM020 ch.2).
+        // HW trails every LOCK_ACQUIRE_REQ with a 1-cycle LOCK_STALL pulse. So a
+        // successful acquire costs 2 cycles: 1 issue + 1 arbitration.
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+        tile.locks[5].value = 1; // available -> uncontended success
+
+        let bundle =
+            make_bundle(vec![SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockAcquire)
+                .with_source(Operand::Lock(5))]);
+        let result = executor.execute(&bundle, &mut ctx, &mut tile);
+
+        assert!(matches!(result, ExecuteResult::Continue));
+        assert_eq!(tile.locks[5].value, 0, "lock acquired");
+        assert_eq!(ctx.cycles, 2, "1 issue + 1 arbitration cycle");
+    }
+
+    #[test]
+    fn test_lock_release_charges_arbitration_cycle() {
+        // Release is also an arbitrated transaction: 1 issue + 1 arbitration.
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+        tile.locks[3].value = 0;
+
+        let bundle =
+            make_bundle(vec![SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockRelease)
+                .with_source(Operand::Lock(3))]);
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        assert_eq!(ctx.cycles, 2, "1 issue + 1 arbitration cycle");
+    }
+
+    #[test]
+    fn test_blocked_lock_acquire_no_arbitration_charge() {
+        // A blocked acquire (lock unavailable) returns WaitLock and does NOT
+        // pay the arbitration cycle -- the core is stalling, not completing a
+        // transaction. The arbitration is charged once, later, when the
+        // acquire resumes and succeeds.
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+        tile.locks[5].value = 0; // unavailable -> blocks
+
+        let bundle =
+            make_bundle(vec![SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockAcquire)
+                .with_source(Operand::Lock(5))]);
+        let result = executor.execute(&bundle, &mut ctx, &mut tile);
+
+        assert!(matches!(result, ExecuteResult::WaitLock { .. }));
+        assert_eq!(ctx.cycles, 1, "issue only -- no arbitration while stalling");
     }
 
     #[test]
