@@ -158,6 +158,26 @@ core/EVENT_PC trace events (handled by the mode-aware comparator already);
 exact per-event cycle matching; modeling the NoC/memory-controller internals
 beyond a burst+latency abstraction.
 
+## 6.5 Demonstration (framework landed, 2026-06-14, commit 6454a8c4)
+
+Built default-off (uniform delivery -> zero behavioral change; full lib suite
+green 3511, no regression). End-to-end EMU-only proof on `add_one_using_dma`
+(env `XDNA_EMU_DDR_BURST_WORDS=2 INTER_BURST_CYCLES=256`):
+
+| event | EMU off | EMU burst | HW |
+|---|---|---|---|
+| `DMA_S2MM_0_STREAM_STARVATION` | 20 | 37 | 29 |
+| `DMA_S2MM_1_STREAM_STARVATION` | 29 | 34 | 34 |
+
+The mechanism is **sound and sufficient**: bursting the shim MM2S DDR-read
+input propagates through the compute pipeline to the shim S2MM output side,
+lifting starvation from *under* HW toward/past it -- channel 1 hit HW exactly.
+Data still PASSes (no corruption); total span grew (16146->22011) as gaps add
+latency. These params overshoot channel 0 (37 vs 29) -- that is the calibration
+surface, not a model defect. **Calibrating params that fit both channels and
+generalize across the corpus is the next HW-validated step** (needs a fresh
+HW capture as the target, then an EMU param sweep against it).
+
 ## 7. Decisions (resolved 2026-06-14)
 
 1. **#129 iter scope** → **burst-delivery first, iter next.** Land and validate
