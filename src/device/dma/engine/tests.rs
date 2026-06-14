@@ -2252,19 +2252,24 @@ fn chained_bd_no_lock_interval_diagnostic() {
 ///
 /// Tenant-4 mechanism (HW-validated on NPU1): on a memtile shared-link
 /// producer/consumer, a completing BD's lock RELEASE is held until the next
-/// chained BD's AcquireGE is granted -- release and next-acquire couple at the
-/// BD-chain transition (the buffer swap), gated on buffer availability. The
-/// deferral applies only to CROSS-lock handoff (next BD acquires a DIFFERENT
-/// lock than the one released, i.e. a producer->consumer signal); same-lock
-/// self-chains release inline (see chained_bd_lock_interval_baseline).
+/// A cross-lock FUNCTIONAL release must fire INLINE at BD completion -- never
+/// deferred to the next BD's acquire grant. This is the deadlock-prevention
+/// invariant: the consumer of a cross-lock release may be the compute CORE,
+/// which is not a DMA channel, so it cannot trigger a buffer swap. If the
+/// functional release waited for the swap, a DMA->core handoff with no buffer
+/// slack would wedge (the DMA defers its release awaiting its own next acquire,
+/// which needs the core to free the buffer, which needs that release).
 ///
-/// This drives a single MM2S channel whose BD0 releases lock 2 and chains to
-/// BD1, which acquires lock 1. lock 1 starts unavailable, so BD1 blocks. While
-/// blocked, lock 2 must still read 0 -- the release is deferred, NOT applied at
-/// BD0 completion. Only after lock 1 is freed (the "swap") does BD1's acquire
-/// grant and the deferred lock-2 release fire.
+/// (Only the OBSERVABLE memtile-S2MM trace event defers, to BD-slot reuse --
+/// the lock VALUE is always prompt. See PendingRelease and the memtile_*
+/// trace-timing tests.)
+///
+/// This drives a single compute-tile channel whose BD0 releases lock 2 and
+/// chains to BD1, which acquires lock 1. lock 1 starts unavailable, so BD1
+/// blocks. While blocked, lock 2 must already read 1 -- the functional release
+/// fired at BD0 completion, available immediately to a waiting consumer.
 #[test]
-fn cross_lock_release_defers_to_next_acquire_grant() {
+fn cross_lock_release_is_prompt_not_deferred() {
     let mut engine = DmaEngine::new_compute_tile(1, 2);
     let mut tile = make_tile();
     let mut host_mem = make_host_memory();
@@ -2305,16 +2310,16 @@ fn cross_lock_release_defers_to_next_acquire_grant() {
         }
     }
 
-    // BD0 has completed (it released lock2 in HEAD's inline model). Under the
-    // deferral model the release is held pending BD1's acquire grant, so lock2
-    // MUST still be 0 here. (RED on HEAD: inline release made lock2 == 1.)
+    // BD0 has completed. Its cross-lock release of lock2 fired INLINE at
+    // completion, so lock2 MUST read 1 here even though BD1 is still blocked --
+    // a waiting consumer (e.g. the core) must be able to proceed immediately.
     assert_eq!(
-        tile.locks[2].value, 0,
-        "cross-lock release must defer: lock2 should still be 0 while the next BD is blocked, got {}",
+        tile.locks[2].value, 1,
+        "cross-lock functional release must be prompt: lock2 should be 1 at BD0 completion, got {}",
         tile.locks[2].value
     );
 
-    // Phase 2: free lock1 (the "swap") and run to completion.
+    // Phase 2: free lock1 and run to completion; BD1's own release also fires.
     tile.locks[1].set(1);
     cycles = 0;
     while engine.channel_active(2) {
@@ -2326,27 +2331,23 @@ fn cross_lock_release_defers_to_next_acquire_grant() {
         assert!(cycles < 100, "channel did not complete after lock1 freed");
     }
 
-    // The deferred lock2 release fired at BD1's acquire grant; BD1's own lock3
-    // release fired inline at task end (next_bd == None never defers).
-    assert_eq!(tile.locks[2].value, 1, "deferred lock2 release must fire at the swap");
+    assert_eq!(tile.locks[2].value, 1, "lock2 release stays applied");
     assert_eq!(tile.locks[3].value, 1, "BD1 task-end release (lock3) fires inline");
 }
 
-/// Two-channel memtile producer/consumer double-buffer: deferred releases must
-/// couple at the swap AND the mutual-block must not deadlock.
+/// Two-channel memtile producer/consumer double-buffer: deferred TRACE events
+/// must couple at the swap AND the pair must not deadlock.
 ///
 /// This reproduces the tenant-4 shared-link in miniature on ONE memtile: an
 /// S2MM producer (ch0) fills buf0/buf1, an MM2S consumer (ch6) drains them,
 /// sharing own locks 0 (free-sem, init 2) and 1 (full-sem, init 0). The
-/// consumer is throttled (downstream drained slowly) so it is the bottleneck;
-/// the producer fills fast, then blocks on the free-sem holding its deferred
-/// full-release. At the swap both channels are momentarily blocked, each
-/// holding the buffer the other needs -- a circular wait. The deadlock-break
-/// (a blocked channel flushing a peer's matching pending release) must resolve
-/// it, and the producer's deferred full-release must land within a cycle of the
-/// consumer's free-release (the coincident swap HW shows).
+/// consumer is throttled (downstream drained slowly) so it is the bottleneck.
+/// Functional lock releases fire inline at completion, so the pair never wedges;
+/// the deferred memtile-S2MM full-release TRACE events emit at BD-slot reuse, so
+/// the backpressured reuse's trace couples to the consumer's free-release at the
+/// swap (asserted below on the timestamp-sorted events).
 ///
-/// Without the deferral+flush this would either stagger the releases (old
+/// Without the deferral this would either stagger the trace events (old
 /// inline model) or, with deferral but no break, deadlock -- caught here as a
 /// bounded cycle-budget panic, never a box hang.
 #[test]
@@ -2519,6 +2520,120 @@ fn memtile_producer_consumer_releases_couple_at_swap_no_deadlock() {
         full_releases,
         free_releases,
     );
+}
+
+/// Single-buffer (no double-buffering) producer/consumer must not deadlock.
+///
+/// With ONE shared buffer the producer and consumer strictly ping-pong: every
+/// fill's full-release and every drain's free-release is cross-lock and DEFERRED
+/// to the swap, and the swap for each can only fire after the *other* channel
+/// acts. That makes every handoff a mutual block that the deadlock-break flush
+/// must resolve -- there is no slack buffer to hide behind (unlike the depth-2
+/// case, where the second buffer lets one side run ahead). This is the
+/// `add_256_using_dma_op_no_double_buffering` topology distilled to two memtile
+/// channels; a regression in the functional-release path wedges it. Bounded so a
+/// wedge fails as a cycle-budget panic, never a box hang.
+#[test]
+fn memtile_single_buffer_producer_consumer_no_deadlock() {
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut tile = Tile::mem_tile(1, 1);
+    let mut host_mem = make_host_memory();
+
+    const FREE: u8 = 64;
+    const FULL: u8 = 65;
+    let buf0 = 0x81000u64;
+
+    // Producer S2MM ch0: fill buf0 three times (single buffer, chained).
+    engine
+        .configure_bd(
+            0,
+            BdConfig::simple_1d(buf0, 16)
+                .with_acquire(FREE, -1)
+                .with_release(FULL, 1)
+                .with_next(1),
+        )
+        .unwrap();
+    engine
+        .configure_bd(
+            1,
+            BdConfig::simple_1d(buf0, 16)
+                .with_acquire(FREE, -1)
+                .with_release(FULL, 1)
+                .with_next(2),
+        )
+        .unwrap();
+    engine
+        .configure_bd(2, BdConfig::simple_1d(buf0, 16).with_acquire(FREE, -1).with_release(FULL, 1))
+        .unwrap();
+
+    // Consumer MM2S ch6: drain buf0 three times (single buffer, chained).
+    engine
+        .configure_bd(
+            3,
+            BdConfig::simple_1d(buf0, 16)
+                .with_acquire(FULL, -1)
+                .with_release(FREE, 1)
+                .with_next(4),
+        )
+        .unwrap();
+    engine
+        .configure_bd(
+            4,
+            BdConfig::simple_1d(buf0, 16)
+                .with_acquire(FULL, -1)
+                .with_release(FREE, 1)
+                .with_next(5),
+        )
+        .unwrap();
+    engine
+        .configure_bd(5, BdConfig::simple_1d(buf0, 16).with_acquire(FULL, -1).with_release(FREE, 1))
+        .unwrap();
+
+    tile.locks[0].set(1); // free-sem: ONE empty buffer
+    tile.locks[1].set(0); // full-sem: nothing filled yet
+
+    engine.start_channel(0, 0).unwrap(); // producer S2MM
+    engine.start_channel(6, 3).unwrap(); // consumer MM2S
+
+    let feed: Vec<u32> = (0..12u32).map(|i| 0x2000_0000 + i).collect();
+    let mut fed = 0usize;
+    let mut drained: Vec<u32> = Vec::new();
+
+    let mut cycle: u64 = 0;
+    let max_cycles: u64 = 3000;
+    loop {
+        engine.set_current_cycle(cycle);
+        while fed < feed.len()
+            && engine.push_stream_in(StreamData { data: feed[fed], tlast: false, channel: 0 })
+        {
+            fed += 1;
+        }
+        engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+        tile.resolve_lock_requests(cycle);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        let _ = tile.mem_trace_pending.drain(..);
+        if let Some(w) = engine.pop_stream_out() {
+            drained.push(w.data);
+        }
+
+        let done = !engine.channel_has_pending_work(0) && !engine.channel_has_pending_work(6);
+        if done && engine.stream_out_len() == 0 && drained.len() == feed.len() {
+            break;
+        }
+        cycle += 1;
+        assert!(
+            cycle < max_cycles,
+            "single-buffer producer/consumer wedged at {} cyc -- functional-release/flush regression \
+             (fed={}, drained={}, prod={:?}, cons={:?})",
+            max_cycles,
+            fed,
+            drained.len(),
+            engine.channel_fsm_description(0),
+            engine.channel_fsm_description(6),
+        );
+    }
+
+    assert_eq!(drained, feed, "single-buffer consumer output must equal the produced stream in order");
 }
 
 /// Memtile S2MM cross-lock release pipeline latency: even when the next BD's

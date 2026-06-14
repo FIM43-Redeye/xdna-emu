@@ -16,37 +16,32 @@ use super::engine::{ChannelStats, ChannelTaskConfig, TaskQueue};
 use super::engine::TaskQueueEntry;
 use super::transfer::Transfer;
 
-/// A cross-lock BD release held until the buffer swap.
+/// A deferred LockRelease TRACE event awaiting its BD-slot reuse.
 ///
-/// Tenant-4 mechanism: the release that signals the *other* channel does not
-/// fire at BD completion -- HW holds it until the DMA swaps to its next buffer
-/// (the next chained BD's AcquireGE is granted).
+/// Tenant-4 mechanism, corrected: the memtile lock-release latency is purely an
+/// OBSERVABILITY effect. The FUNCTIONAL semaphore (the lock value a waiting
+/// consumer acquires) is released PROMPTLY at BD completion -- it must be, or a
+/// DMA->core handoff with no buffer slack deadlocks: the consuming compute core
+/// is not a DMA channel, so it can neither trigger a buffer swap nor be reached
+/// by the deadlock-break flush. Deferring the functional release would wedge
+/// (compute fills, defers the full-sem release awaiting its own next acquire,
+/// which needs the core to free the buffer, which needs the full-sem -- a cycle
+/// nothing breaks).
 ///
-/// Two distinct timings are tracked because the memtile release latency is an
-/// OBSERVABILITY effect, not a functional stall:
-///
-/// - The FUNCTIONAL semaphore (the lock value a waiting consumer acquires) is
-///   released PROMPTLY at the swap (the owning channel's next BD acquire). This
-///   keeps the consumer-free path off the producer's critical path, so warmup
-///   fills stay at the shim cadence exactly as HW shows (tenant-4 probe:
-///   back-to-back 65-cyc fills, no extra stall).
-/// - The LockRelease TRACE EVENT is deferred to the BD slot's NEXT REUSE -- the
-///   next acquire grant on the SAME `bd_index`. HW's LOCK_SEL1_REL reflects BD
-///   RETIREMENT, which happens when the DMA cycles its descriptor ring back to
-///   that slot, not at the immediate swap. For a depth-2 objectfifo the reuse
-///   is two fills later, so each trace event trails FINISHED_BD by the buffer's
-///   reuse interval: ~63 cyc in warmup (the latency floor dominates when the
-///   reuse is imminent), ~2 fill-periods in steady state (the reuse acquire is
-///   backpressured). The event is emitted at `max(ready_cycle, reuse_cycle)`.
-///   A BD that is never reused before its channel goes idle (the last fills of
-///   a finite task) falls back to the `ready_cycle` floor.
-///
-/// Applying the latency to the trace event alone -- not the lock value --
-/// reproduces both the warmup fill cadence and the observed release timing.
+/// Only the LockRelease TRACE EVENT defers, to the BD slot's NEXT REUSE -- the
+/// next acquire grant on the SAME `bd_index`. HW's LOCK_SEL1_REL reflects BD
+/// RETIREMENT, which happens when the DMA cycles its descriptor ring back to
+/// that slot, not at completion. For a depth-2 objectfifo the reuse is two fills
+/// later, so each trace event trails FINISHED_BD by the buffer's reuse interval:
+/// ~63 cyc in warmup (the latency floor dominates when the reuse is imminent),
+/// ~2 fill-periods in steady state (the reuse acquire is backpressured). The
+/// event is emitted at `max(ready_cycle, reuse_cycle)`, or at the `ready_cycle`
+/// floor if the slot is never reused before the channel idles (the last fills
+/// of a finite task).
 #[derive(Debug, Clone, Copy)]
 pub struct PendingRelease {
+    /// The released lock (resolves to the local lock the trace event names).
     pub lock_id: u8,
-    pub release_value: i8,
     /// The BD slot (descriptor-ring index) of the fill that owns this release.
     /// The trace event defers until this slot is re-acquired (reused).
     pub bd_index: u8,
@@ -55,14 +50,6 @@ pub struct PendingRelease {
     /// `max(ready_cycle, reuse_cycle)`, or at `ready_cycle` if the slot is never
     /// reused (channel goes idle first).
     pub ready_cycle: u64,
-    /// Whether the buffer swap has occurred -- the owning channel's next BD
-    /// acquire has been granted (set at the acquire grant / chained-BD entry /
-    /// deadlock-break flush). Triggers the functional semaphore release.
-    pub swapped: bool,
-    /// Whether the functional semaphore release has been performed (at the
-    /// swap). Once set, the entry lingers awaiting its BD-slot reuse to schedule
-    /// the trace event.
-    pub functional_done: bool,
     /// The cycle at which the deferred trace event should be emitted, set once
     /// the BD slot is reused (`max(ready_cycle, reuse_cycle)`) or, for a slot
     /// that is never reused, at the `ready_cycle` floor when the channel idles.
