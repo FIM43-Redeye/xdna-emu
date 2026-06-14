@@ -62,6 +62,7 @@
 
 pub mod addressing;
 pub mod bd;
+pub mod burst;
 pub mod channel;
 pub mod stream_io;
 pub mod transfer;
@@ -80,6 +81,7 @@ pub use engine::{
     LockTarget, NeighborTiles,
 };
 pub use token::{Token, TokenState, TaskQueue};
+pub use burst::{BurstGate, BurstParams};
 pub use channel::{ChannelFsm, ChannelContext, CompletionInfo};
 pub use timing::DmaTimingConfig;
 

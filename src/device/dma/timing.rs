@@ -14,6 +14,8 @@
 //! └──────────┘  └─────────┘  └──────────────┘  └─────────┘  └──────────┘
 //! ```
 
+use super::burst::BurstParams;
+
 /// DMA timing configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct DmaTimingConfig {
@@ -92,6 +94,15 @@ pub struct DmaTimingConfig {
     /// Applied only on memtile tiles (cross-lock producer/consumer handoff);
     /// 0 elsewhere -- no compute/shim HW evidence for a non-zero value.
     pub memtile_lock_release_latency_cycles: u16,
+
+    /// DDR burst-delivery parameters for shim host-memory transfers.  Models
+    /// the bursty AXI-master/DDR delivery cadence that makes downstream S2MM
+    /// channels starve the way silicon does (known-fidelity-gaps row 50/117).
+    /// Defaults to [`BurstParams::DISABLED`] (uniform delivery) so enabling
+    /// bursting is opt-in and never silently perturbs existing cycle-accuracy
+    /// baselines -- override via `XDNA_EMU_DDR_*` env vars or a future profile.
+    /// See `src/device/dma/burst.rs`.
+    pub ddr_burst: BurstParams,
 }
 
 impl Default for DmaTimingConfig {
@@ -130,6 +141,11 @@ impl DmaTimingConfig {
             // Not yet plumbed through the per-arch DmaModel -- a single memtile
             // observation; promote to the arch model if AIE2P measures different.
             memtile_lock_release_latency_cycles: 63,
+            // DDR burst delivery: disabled by default (uniform delivery, the
+            // historical behavior).  The env overlay below enables it when the
+            // user opts in; calibrating a non-zero Phoenix default is a
+            // separate HW-validated step.
+            ddr_burst: ddr_burst_from_env(BurstParams::DISABLED, |k| std::env::var(k).ok()),
         }
     }
 
@@ -159,9 +175,62 @@ impl DmaTimingConfig {
     }
 }
 
+/// Overlay DDR burst parameters from the environment onto a base.
+///
+/// Reads (via `get`, so the parse is testable without touching process env):
+/// - `XDNA_EMU_DDR_BURST_WORDS`     -> `burst_words` (set to non-zero to enable)
+/// - `XDNA_EMU_DDR_INTER_BURST_CYCLES` -> `inter_burst_cycles`
+/// - `XDNA_EMU_DDR_FIRST_LATENCY`   -> `first_access_latency`
+///
+/// Any var that is absent or unparseable leaves the corresponding field at its
+/// base value.  Enabling is opt-in: with no env set and a `DISABLED` base the
+/// result is `DISABLED` (uniform delivery).
+pub fn ddr_burst_from_env(base: BurstParams, get: impl Fn(&str) -> Option<String>) -> BurstParams {
+    let field = |key: &str, cur: u16| get(key).and_then(|v| v.trim().parse::<u16>().ok()).unwrap_or(cur);
+    BurstParams {
+        burst_words: field("XDNA_EMU_DDR_BURST_WORDS", base.burst_words),
+        inter_burst_cycles: field("XDNA_EMU_DDR_INTER_BURST_CYCLES", base.inter_burst_cycles),
+        first_access_latency: field("XDNA_EMU_DDR_FIRST_LATENCY", base.first_access_latency),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ddr_burst_disabled_by_default() {
+        // No env -> the model is off (uniform delivery), so default cycle
+        // accuracy is untouched.
+        let cfg = ddr_burst_from_env(BurstParams::DISABLED, |_| None);
+        assert_eq!(cfg, BurstParams::DISABLED);
+        assert!(!cfg.enabled());
+    }
+
+    #[test]
+    fn ddr_burst_env_overlay_enables_and_overrides() {
+        use std::collections::HashMap;
+        let env: HashMap<&str, &str> = [
+            ("XDNA_EMU_DDR_BURST_WORDS", "256"),
+            ("XDNA_EMU_DDR_INTER_BURST_CYCLES", "1024"),
+            ("XDNA_EMU_DDR_FIRST_LATENCY", "600"),
+        ]
+        .into_iter()
+        .collect();
+        let cfg = ddr_burst_from_env(BurstParams::DISABLED, |k| env.get(k).map(|s| s.to_string()));
+        assert!(cfg.enabled());
+        assert_eq!(cfg.burst_words, 256);
+        assert_eq!(cfg.inter_burst_cycles, 1024);
+        assert_eq!(cfg.first_access_latency, 600);
+
+        // Partial env: unset fields keep the base value.
+        let partial: HashMap<&str, &str> = [("XDNA_EMU_DDR_BURST_WORDS", "64")].into_iter().collect();
+        let base = BurstParams { burst_words: 0, inter_burst_cycles: 999, first_access_latency: 7 };
+        let cfg2 = ddr_burst_from_env(base, |k| partial.get(k).map(|s| s.to_string()));
+        assert_eq!(cfg2.burst_words, 64);
+        assert_eq!(cfg2.inter_burst_cycles, 999, "unset field keeps base");
+        assert_eq!(cfg2.first_access_latency, 7, "unset field keeps base");
+    }
 
     #[test]
     fn test_timing_config_default() {

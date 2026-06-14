@@ -565,6 +565,7 @@ impl DmaEngine {
         ch.prev_lock_stalled = false;
         ch.pending_releases.clear();
         ch.swap_free_watch = None;
+        ch.ddr_burst_gate.reset();
 
         Ok(())
     }
