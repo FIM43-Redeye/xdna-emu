@@ -70,6 +70,31 @@ pub struct EventsConfig {
     pub mem_events: Vec<String>,
     #[serde(default)]
     pub memtile_events: Vec<String>,
+    #[serde(default)]
+    pub shim_events: Vec<String>,
+}
+
+/// Select the slot-name table for a tile by its packet type.
+///
+/// pkt_type encodes the trace module: 0=core, 1=compute-tile mem module,
+/// 2=shim, 3=memtile. Each module has a distinct event-name namespace in the
+/// AIE2 event tables -- e.g. shim slot 6 is `DMA_S2MM_0_STREAM_STARVATION`
+/// while mem slot 6 is `EDGE_DETECTION_EVENT_0`. Routing shim events through
+/// the mem table (the historical default for pkt_type 2) mislabels every shim
+/// event and, because the name drives edge-vs-level classification, applies
+/// the wrong comparison semantics. Falls back to `mem_events` when the
+/// specific table is absent (legacy events.json predating per-module
+/// slot_names emission), preserving old behavior for those snapshots.
+fn names_for_pkt(config: &EventsConfig, pkt_type: u8) -> &[String] {
+    if pkt_type == 3 && !config.memtile_events.is_empty() {
+        &config.memtile_events
+    } else if pkt_type == 0 {
+        &config.core_events
+    } else if pkt_type == 2 && !config.shim_events.is_empty() {
+        &config.shim_events
+    } else {
+        &config.mem_events
+    }
 }
 
 /// Result of analyzing one edge event type.
@@ -467,8 +492,8 @@ struct SlotNamesRecord {
     mem: Vec<String>,
     #[serde(default)]
     memtile: Vec<String>,
-    // "shim" field exists in the JSON but we don't currently consume it;
-    // shim-tile slot naming would go through mem_events today.
+    #[serde(default)]
+    shim: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -532,7 +557,12 @@ pub fn load_events_json(
     }
 
     let config = match file.slot_names {
-        Some(sn) => EventsConfig { core_events: sn.core, mem_events: sn.mem, memtile_events: sn.memtile },
+        Some(sn) => EventsConfig {
+            core_events: sn.core,
+            mem_events: sn.mem,
+            memtile_events: sn.memtile,
+            shim_events: sn.shim,
+        },
         None => EventsConfig::default(),
     };
 
@@ -1093,13 +1123,7 @@ fn analyze_stall_attribution(
     let tile_configs: Vec<(TileKey, &[String])> = tile_results
         .iter()
         .map(|(key, _)| {
-            let names: &[String] = if key.pkt_type == 3 && !config.memtile_events.is_empty() {
-                &config.memtile_events
-            } else if key.pkt_type == 0 {
-                &config.core_events
-            } else {
-                &config.mem_events
-            };
+            let names: &[String] = names_for_pkt(config, key.pkt_type);
             (*key, names)
         })
         .collect();
@@ -1355,13 +1379,7 @@ fn analyze_cross_tile(
     let tile_configs: Vec<(TileKey, &[String])> = tile_results
         .iter()
         .map(|(key, _)| {
-            let names: &[String] = if key.pkt_type == 3 && !config.memtile_events.is_empty() {
-                &config.memtile_events
-            } else if key.pkt_type == 0 {
-                &config.core_events
-            } else {
-                &config.mem_events
-            };
+            let names: &[String] = names_for_pkt(config, key.pkt_type);
             (*key, names)
         })
         .collect();
@@ -1829,15 +1847,15 @@ pub fn compare_batch_with_opts(
     let (emu_tiles, emu_config, emu_placement, emu_modes) = load_events_json(emu_events_path)?;
 
     // Resolve slot-name config: caller override > HW-side JSON > EMU-side JSON.
-    let effective_config = if !config.core_events.is_empty()
-        || !config.mem_events.is_empty()
-        || !config.memtile_events.is_empty()
-    {
+    let has_names = |c: &EventsConfig| {
+        !c.core_events.is_empty()
+            || !c.mem_events.is_empty()
+            || !c.memtile_events.is_empty()
+            || !c.shim_events.is_empty()
+    };
+    let effective_config = if has_names(config) {
         config.clone()
-    } else if !hw_config.core_events.is_empty()
-        || !hw_config.mem_events.is_empty()
-        || !hw_config.memtile_events.is_empty()
-    {
+    } else if has_names(&hw_config) {
         hw_config
     } else {
         emu_config
@@ -1870,14 +1888,7 @@ pub fn compare_batch_with_opts(
     for key in all_keys {
         let hw_ev = hw_tiles.get(&key).map(|v| v.as_slice()).unwrap_or(&[]);
         let emu_ev = emu_tiles.get(&key).map(|v| v.as_slice()).unwrap_or(&[]);
-        let names = if key.pkt_type == 3 && !config.memtile_events.is_empty() {
-            // MemTile (row 1) has its own event namespace
-            &config.memtile_events
-        } else if key.pkt_type == 0 {
-            &config.core_events
-        } else {
-            &config.mem_events
-        };
+        let names = names_for_pkt(config, key.pkt_type);
         // Mode is a property of the (tile, module): HW is ground truth, fall
         // back to the EMU side, then to the legacy default.
         let mode = if hw_modes.contains_key(&key) || hw_tiles.contains_key(&key) {
@@ -3456,6 +3467,35 @@ mod tests {
         let as_pc = compare_tile_events(key, &hw, &emu, &names, &opts, TRACE_MODE_EVENT_PC);
         assert!(as_pc.level_results.is_empty(), "mode-1 tile must not feed cycle summary");
         assert!(as_pc.edge_results.is_empty(), "mode-1 tile must not feed edge summary");
+    }
+
+    #[test]
+    fn names_for_pkt_routes_shim_to_shim_table_not_mem() {
+        // Regression: shim (pkt_type 2) events were named through the mem
+        // table, mislabeling e.g. shim slot 6 (DMA_S2MM_0_STREAM_STARVATION)
+        // as mem slot 6 (EDGE_DETECTION_EVENT_0). With a shim table present,
+        // pkt_type 2 must resolve through it.
+        let config = EventsConfig {
+            core_events: (0..8).map(|i| format!("CORE_{i}")).collect(),
+            mem_events: (0..8).map(|i| format!("MEM_{i}")).collect(),
+            memtile_events: (0..8).map(|i| format!("MEMTILE_{i}")).collect(),
+            shim_events: (0..8).map(|i| format!("SHIM_{i}")).collect(),
+        };
+        assert_eq!(slot_name(6, names_for_pkt(&config, 0)), "CORE_6");
+        assert_eq!(slot_name(6, names_for_pkt(&config, 1)), "MEM_6");
+        assert_eq!(slot_name(6, names_for_pkt(&config, 2)), "SHIM_6", "shim must use shim table");
+        assert_eq!(slot_name(6, names_for_pkt(&config, 3)), "MEMTILE_6");
+
+        // Legacy fallback: with no shim table, pkt_type 2 falls back to mem
+        // (preserving behavior for events.json snapshots predating the field).
+        let legacy = EventsConfig {
+            core_events: (0..8).map(|i| format!("CORE_{i}")).collect(),
+            mem_events: (0..8).map(|i| format!("MEM_{i}")).collect(),
+            memtile_events: vec![],
+            shim_events: vec![],
+        };
+        assert_eq!(slot_name(6, names_for_pkt(&legacy, 2)), "MEM_6", "legacy shim falls back to mem");
+        assert_eq!(slot_name(6, names_for_pkt(&legacy, 3)), "MEM_6", "legacy memtile falls back to mem");
     }
 
     #[test]
