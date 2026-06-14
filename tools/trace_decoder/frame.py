@@ -146,3 +146,8 @@ class Event:
     name: str
     ts: int
     soc: int
+    # Trace mode this event was decoded under (TraceMode int: EVENT_TIME=0,
+    # EVENT_PC=1, INST_EXEC=2). Determines whether ``ts``/``soc`` is a cycle
+    # (EVENT_TIME) or a program counter (EVENT_PC). Consumers route their
+    # comparison accordingly; defaults to EVENT_TIME for the mode-0 path.
+    mode: int = 0

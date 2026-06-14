@@ -46,6 +46,18 @@ pub struct TileEvent {
 /// Per-tile decoded events, keyed by tile identifier.
 pub type TileEvents = HashMap<TileKey, Vec<TileEvent>>;
 
+/// Trace-mode codes, matching `tools/trace_decoder` `TraceMode`
+/// (EVENT_TIME=0, EVENT_PC=1, INST_EXEC=2). The mode determines what
+/// `TileEvent.abs_cycle` physically *is*: in EVENT_TIME it is a real SoC
+/// cycle, but in EVENT_PC it is the program counter of the firing
+/// instruction. The cycle-domain interval comparison (`events_to_intervals`,
+/// level/edge duration) is only meaningful for EVENT_TIME; EVENT_PC /
+/// INST_EXEC tiles are compared on the PC-anchored axis instead
+/// (`compare_pc_anchored_for_tile`) and are excluded from the cycle-drift
+/// verdict. Emitted per-event by parse-trace.py; carried through events.json.
+pub const TRACE_MODE_EVENT_TIME: u8 = 0;
+pub const TRACE_MODE_EVENT_PC: u8 = 1;
+
 /// Event name configuration from events.json.
 ///
 /// Maps trace slot indices (0-7) to hardware event names. Used for
@@ -438,6 +450,13 @@ struct EventRecord {
     /// See `docs/superpowers/findings/2026-05-10-trace-decoder-event-density-drift.md`.
     #[serde(default)]
     soc: Option<u64>,
+    /// Per-tile trace mode (EVENT_TIME=0, EVENT_PC=1, INST_EXEC=2) emitted by
+    /// parse-trace.py. Determines whether `ts`/`soc` is a cycle (EVENT_TIME)
+    /// or a PC (EVENT_PC). Absent in legacy snapshots -> defaulted by
+    /// `load_events_json` (cores are EVENT_PC, shim/memtile EVENT_TIME under
+    /// every bridge trace setup).
+    #[serde(default)]
+    mode: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -482,7 +501,9 @@ pub struct PlacementRecord {
 /// substitute their own config. Placement, when present, is the per-side
 /// observed origin used by trace-compare to normalize HW-vs-EMU column
 /// offsets without resorting to the dense-remap heuristic.
-pub fn load_events_json(path: &Path) -> Result<(TileEvents, EventsConfig, Option<PlacementRecord>), String> {
+pub fn load_events_json(
+    path: &Path,
+) -> Result<(TileEvents, EventsConfig, Option<PlacementRecord>, TileModes), String> {
     let text = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let file: EventsFile =
         serde_json::from_str(&text).map_err(|e| format!("parse {}: {}", path.display(), e))?;
@@ -491,6 +512,7 @@ pub fn load_events_json(path: &Path) -> Result<(TileEvents, EventsConfig, Option
     }
 
     let mut tiles: TileEvents = HashMap::new();
+    let mut modes: TileModes = HashMap::new();
     for rec in file.events {
         let key = TileKey { col: rec.col, row: rec.row, pkt_type: rec.pkt_type };
         // Prefer soc (SoC-cycle-corrected) over ts (mlir-aie convention
@@ -498,6 +520,12 @@ pub fn load_events_json(path: &Path) -> Result<(TileEvents, EventsConfig, Option
         // Old JSON snapshots without soc fall back to ts.
         let abs_cycle = rec.soc.unwrap_or(rec.ts);
         tiles.entry(key).or_default().push(TileEvent { slot: rec.slot, abs_cycle });
+        // Per-tile mode is uniform across a tile's events; record the first
+        // mode seen. Events without a mode field leave the tile unrecorded,
+        // so `tile_mode()` applies the legacy default.
+        if let Some(m) = rec.mode {
+            modes.entry(key).or_insert(m);
+        }
     }
     for events in tiles.values_mut() {
         events.sort_by_key(|e| e.abs_cycle);
@@ -508,7 +536,23 @@ pub fn load_events_json(path: &Path) -> Result<(TileEvents, EventsConfig, Option
         None => EventsConfig::default(),
     };
 
-    Ok((tiles, config, file.placement))
+    Ok((tiles, config, file.placement, modes))
+}
+
+/// Per-tile trace mode, keyed by tile identifier. Absent entries fall back to
+/// `tile_mode`'s legacy default. See [`TRACE_MODE_EVENT_TIME`].
+pub type TileModes = HashMap<TileKey, u8>;
+
+/// Resolve a tile's trace mode, applying the legacy default when the events
+/// JSON predates per-tile mode emission. Cores (pkt_type 0) are configured
+/// EVENT_PC by every bridge trace setup; shim/memtile are EVENT_TIME. Fresh
+/// data carries the real mode, so this heuristic only governs old snapshots.
+fn tile_mode(modes: &TileModes, key: &TileKey) -> u8 {
+    modes.get(key).copied().unwrap_or(if key.pkt_type == 0 {
+        TRACE_MODE_EVENT_PC
+    } else {
+        TRACE_MODE_EVENT_TIME
+    })
 }
 
 /// Remap physical columns to 0-indexed logical columns.
@@ -1685,7 +1729,25 @@ fn compare_tile_events(
     emu_events: &[TileEvent],
     slot_names: &[String],
     opts: &AnalysisOptions,
+    mode: u8,
 ) -> TileResult {
+    // The cycle-domain interval comparison below treats `abs_cycle` as a real
+    // SoC cycle. That holds only for EVENT_TIME tiles. EVENT_PC / INST_EXEC
+    // tiles carry program counters in `abs_cycle`; grouping PCs into "cycle
+    // intervals" is a category error (it manufactured the long-standing
+    // LOCK_STALL "2 vs 1 interval" phantom). Such tiles contribute nothing to
+    // the cycle-drift verdict -- they are compared on the PC-anchored axis
+    // (`compare_pc_anchored_for_tile`) instead.
+    if mode != TRACE_MODE_EVENT_TIME {
+        return TileResult {
+            hw_t0: 0,
+            emu_t0: 0,
+            edge_results: Vec::new(),
+            level_results: Vec::new(),
+            iteration_results: Vec::new(),
+        };
+    }
+
     let (hw_t0, emu_t0) = find_edge_anchor(hw_events, emu_events, slot_names);
 
     // Group events by slot, rebased to anchor.
@@ -1763,8 +1825,8 @@ pub fn compare_batch_with_opts(
     batch_idx: usize,
     opts: &AnalysisOptions,
 ) -> Result<BatchResult, String> {
-    let (hw_tiles, hw_config, hw_placement) = load_events_json(hw_events_path)?;
-    let (emu_tiles, emu_config, emu_placement) = load_events_json(emu_events_path)?;
+    let (hw_tiles, hw_config, hw_placement, hw_modes) = load_events_json(hw_events_path)?;
+    let (emu_tiles, emu_config, emu_placement, emu_modes) = load_events_json(emu_events_path)?;
 
     // Resolve slot-name config: caller override > HW-side JSON > EMU-side JSON.
     let effective_config = if !config.core_events.is_empty()
@@ -1816,7 +1878,14 @@ pub fn compare_batch_with_opts(
         } else {
             &config.mem_events
         };
-        let result = compare_tile_events(key, hw_ev, emu_ev, names, opts);
+        // Mode is a property of the (tile, module): HW is ground truth, fall
+        // back to the EMU side, then to the legacy default.
+        let mode = if hw_modes.contains_key(&key) || hw_tiles.contains_key(&key) {
+            tile_mode(&hw_modes, &key)
+        } else {
+            tile_mode(&emu_modes, &key)
+        };
+        let result = compare_tile_events(key, hw_ev, emu_ev, names, opts, mode);
         tiles.push((key, result));
     }
 
@@ -1837,8 +1906,13 @@ pub fn compare_batch_with_opts(
     let pc_anchored = if opts.pc_anchored {
         let mut map = HashMap::new();
         for key in hw_tiles.keys().chain(emu_tiles.keys()).copied().collect::<BTreeSet<_>>() {
-            // Only run on core tiles in mode-1 configuration.
-            if key.pkt_type != 0 {
+            // Only run on EVENT_PC (mode-1) tiles, where abs_cycle carries a PC.
+            let mode = if hw_modes.contains_key(&key) || hw_tiles.contains_key(&key) {
+                tile_mode(&hw_modes, &key)
+            } else {
+                tile_mode(&emu_modes, &key)
+            };
+            if mode != TRACE_MODE_EVENT_PC {
                 continue;
             }
             let hw_ev = hw_tiles.get(&key).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -2127,6 +2201,27 @@ pub fn format_report(batch_results: &[BatchResult]) -> String {
         "Level event types:   {} clean, {} diverged, {} count mismatch",
         total_level_clean, total_level_diverged, total_level_count_mismatch,
     );
+
+    // Authoritative machine-readable trace verdict. Downstream harnesses
+    // (emu-bridge-test.sh Phase 5) MUST parse this token, not prose substrings:
+    // the old `grep -q "CLEAN"` matched the "Edge timing (CLEAN pairs only)"
+    // header that prints on every report, making the bridge verdict vacuously
+    // CLEAN for every kernel regardless of divergence. Counts aggregate across
+    // batches; mode-1 (EVENT_PC) tiles contribute nothing (they carry PCs, not
+    // cycles, and are compared on the PC-anchored axis), so this reflects only
+    // genuine cycle-domain (EVENT_TIME) divergence.
+    let total_divergence =
+        total_edge_diverged + total_edge_count_mismatch + total_level_diverged + total_level_count_mismatch;
+    let _ = writeln!(out);
+    if total_divergence == 0 {
+        let _ = writeln!(out, "TRACE_VERDICT: CLEAN");
+    } else {
+        let _ = writeln!(
+            out,
+            "TRACE_VERDICT: DIVERGE (edge: {} diverged, {} mismatch; level: {} diverged, {} mismatch)",
+            total_edge_diverged, total_edge_count_mismatch, total_level_diverged, total_level_count_mismatch,
+        );
+    }
 
     // Timing stats for clean edge events.
     if !all_edge_deltas_clean.is_empty() {
@@ -3232,6 +3327,55 @@ mod tests {
         assert!(report.contains("Batches:             1"));
     }
 
+    #[test]
+    fn test_trace_verdict_token_clean_and_diverge() {
+        // No divergence -> authoritative CLEAN token. (Guards against the old
+        // bridge bug: `grep -q "CLEAN"` matched the "Edge timing (CLEAN pairs
+        // only)" header on EVERY report, so the verdict was vacuously CLEAN.)
+        let clean = BatchResult {
+            batch_idx: 0,
+            config: EventsConfig::default(),
+            tiles: Vec::new(),
+            stall_attributions: Vec::new(),
+            cross_tile: None,
+            pc_anchored: HashMap::new(),
+        };
+        let report = format_report(&[clean]);
+        assert!(report.contains("TRACE_VERDICT: CLEAN"), "no divergence must be CLEAN");
+        assert!(!report.contains("TRACE_VERDICT: DIVERGE"));
+
+        // A mode-0 level count mismatch (2 vs 1 intervals) -> DIVERGE.
+        let tile = (
+            TileKey { col: 0, row: 1, pkt_type: 3 },
+            TileResult {
+                hw_t0: 0,
+                emu_t0: 0,
+                edge_results: Vec::new(),
+                level_results: vec![LevelResult {
+                    name: "PORT_RUNNING_0".to_string(),
+                    hw_intervals: 2,
+                    emu_intervals: 1,
+                    paired: 1,
+                    diverge_idx: None,
+                    dur_deltas: Vec::new(),
+                    samples: Vec::new(),
+                }],
+                iteration_results: Vec::new(),
+            },
+        );
+        let diverge = BatchResult {
+            batch_idx: 0,
+            config: EventsConfig::default(),
+            tiles: vec![tile],
+            stall_attributions: Vec::new(),
+            cross_tile: None,
+            pc_anchored: HashMap::new(),
+        };
+        let report = format_report(&[diverge]);
+        assert!(report.contains("TRACE_VERDICT: DIVERGE"), "count mismatch must be DIVERGE");
+        assert!(!report.contains("TRACE_VERDICT: CLEAN"));
+    }
+
     // ---- PC-Anchored analysis tests (Task 7) ----
 
     #[test]
@@ -3279,6 +3423,56 @@ mod tests {
         assert_eq!(hw_c2, 1);
         assert_eq!(emu_c2, 1);
         assert_eq!(delta2, 0);
+    }
+
+    #[test]
+    fn mode_aware_dispatch_excludes_event_pc_tile_from_cycle_summary() {
+        // Core tile in EVENT_PC (mode 1): abs_cycle carries a PC, not a cycle.
+        // HW fires LOCK_STALL at PCs {832, 864}; EMU at {848}. The cycle-domain
+        // interval path would group those PCs into intervals and report a
+        // phantom "2 vs 1" count mismatch (the long-standing LOCK_STALL gap).
+        // Under mode-aware dispatch the EVENT_PC tile must contribute nothing
+        // to the cycle-drift level/edge summary -- it is handled on the
+        // PC-anchored axis instead.
+        let hw = vec![TileEvent { slot: 6, abs_cycle: 832 }, TileEvent { slot: 6, abs_cycle: 864 }];
+        let emu = vec![TileEvent { slot: 6, abs_cycle: 848 }];
+        // slot 6 == LOCK_STALL (a core level event).
+        let names: Vec<String> = ["", "", "", "", "", "", "LOCK_STALL", ""]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let key = TileKey { col: 0, row: 2, pkt_type: 0 };
+        let opts = AnalysisOptions::default();
+
+        // EVENT_TIME path: the buggy interpretation surfaces a count mismatch.
+        let as_cycle = compare_tile_events(key, &hw, &emu, &names, &opts, TRACE_MODE_EVENT_TIME);
+        assert_eq!(as_cycle.level_results.len(), 1, "EVENT_TIME yields a level result");
+        assert_ne!(
+            as_cycle.level_results[0].hw_intervals, as_cycle.level_results[0].emu_intervals,
+            "EVENT_TIME path treats PCs as cycles -> phantom interval count mismatch"
+        );
+
+        // EVENT_PC path: excluded from the cycle-drift summary entirely.
+        let as_pc = compare_tile_events(key, &hw, &emu, &names, &opts, TRACE_MODE_EVENT_PC);
+        assert!(as_pc.level_results.is_empty(), "mode-1 tile must not feed cycle summary");
+        assert!(as_pc.edge_results.is_empty(), "mode-1 tile must not feed edge summary");
+    }
+
+    #[test]
+    fn tile_mode_defaults_core_to_event_pc_when_absent() {
+        // Legacy events.json without per-tile mode: cores default to EVENT_PC,
+        // shim/memtile to EVENT_TIME.
+        let modes: TileModes = HashMap::new();
+        let core = TileKey { col: 0, row: 2, pkt_type: 0 };
+        let shim = TileKey { col: 0, row: 0, pkt_type: 2 };
+        let memtile = TileKey { col: 0, row: 1, pkt_type: 3 };
+        assert_eq!(tile_mode(&modes, &core), TRACE_MODE_EVENT_PC);
+        assert_eq!(tile_mode(&modes, &shim), TRACE_MODE_EVENT_TIME);
+        assert_eq!(tile_mode(&modes, &memtile), TRACE_MODE_EVENT_TIME);
+        // Explicit mode in the map overrides the default.
+        let mut modes2 = TileModes::new();
+        modes2.insert(core, TRACE_MODE_EVENT_TIME);
+        assert_eq!(tile_mode(&modes2, &core), TRACE_MODE_EVENT_TIME);
     }
 
     #[test]

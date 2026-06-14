@@ -474,6 +474,7 @@ def decode_one_ours(np_mod, td_mod,
                 "name": e.name,
                 "ts": e.ts,
                 "soc": e.soc,
+                "mode": e.mode,
             }
             for e in events
         ]

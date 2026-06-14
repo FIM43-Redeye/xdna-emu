@@ -162,9 +162,13 @@ def _emit_event(
     name: str,
     ts: int,
     soc: int,
+    mode: int = 0,
 ) -> None:
     out.append(
-        Event(col=col, row=row, pkt_type=pkt_type, slot=slot, name=name, ts=ts, soc=soc)
+        Event(
+            col=col, row=row, pkt_type=pkt_type, slot=slot, name=name,
+            ts=ts, soc=soc, mode=mode,
+        )
     )
 
 
@@ -439,6 +443,7 @@ def rebuild_timeline_mode1(
                         name=name,
                         ts=ev.cycles,  # mode 1: ts carries PC
                         soc=ev.cycles,  # mode 1 has no cycle-domain soc; mirror ts
+                        mode=TraceMode.EVENT_PC,
                     )
 
         for cmd in cmds:

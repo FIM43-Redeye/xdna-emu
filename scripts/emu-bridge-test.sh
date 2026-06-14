@@ -3653,9 +3653,15 @@ main() {
         cmp_out="$(run_trace_compare --hw "$hw_trace" --emu "$emu_trace" --xclbin-mlir "$t5_mlir" --remap-columns 2>&1)" || true
         echo "$cmp_out" > "$cmp_log"
 
-        if echo "$cmp_out" | grep -q "CLEAN"; then
+        # Parse the authoritative TRACE_VERDICT token emitted by trace-compare's
+        # format_report -- NOT a prose substring. The old `grep -q "CLEAN"`
+        # matched the "Edge timing (CLEAN pairs only)" header on every report,
+        # so this column was vacuously CLEAN for every kernel regardless of
+        # divergence (mode-1 core LOCK_STALL noise AND real shim/memtile gaps
+        # alike went unflagged).
+        if echo "$cmp_out" | grep -q "^TRACE_VERDICT: CLEAN"; then
           echo "CLEAN" > "$summary_file"
-        elif echo "$cmp_out" | grep -q "DIVERGE"; then
+        elif echo "$cmp_out" | grep -q "^TRACE_VERDICT: DIVERGE"; then
           echo "DIVERGE" > "$summary_file"
         else
           echo "ERROR" > "$summary_file"

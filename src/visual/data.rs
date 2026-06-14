@@ -119,8 +119,8 @@ impl LoadedComparison {
         // placement origin -- mirror that here so HashMap lookups against
         // sorted_keys hit the right entries.
         let opts = AnalysisOptions::default();
-        let (hw_events_raw, hw_config, hw_placement) = load_events_json(&hw_events_path)?;
-        let (emu_events_raw, _, emu_placement) = load_events_json(&emu_events_path)?;
+        let (hw_events_raw, hw_config, hw_placement, _hw_modes) = load_events_json(&hw_events_path)?;
+        let (emu_events_raw, _, emu_placement, _emu_modes) = load_events_json(&emu_events_path)?;
         let hw_events = match (hw_placement, opts.remap_columns) {
             (Some(p), _) => shift_tile_columns(&hw_events_raw, p),
             (None, true) => remap_tile_columns(&hw_events_raw),
