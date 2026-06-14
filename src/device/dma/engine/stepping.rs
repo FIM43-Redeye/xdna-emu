@@ -128,23 +128,13 @@ impl DmaEngine {
             let mut i = 0;
             while i < self.channels[ch_idx].pending_releases.len() {
                 let p = self.channels[ch_idx].pending_releases[i];
-                // Fallback: a never-reused slot -- the final fill(s) of a finite
-                // stream -- emits at its ready_cycle floor once the channel idles.
-                // Emit EAGERLY at that scheduled timestamp rather than waiting for
-                // `current_cycle` to reach it: an idle channel will not recycle the
-                // slot, so the cycle is already fixed, and the run loop may halt
-                // inside the latency window before `current_cycle` ever gets there
-                // (end-of-run truncation -- this dropped the tenant-4 probe's final
-                // LOCK_SEL*_REL). The decoder sorts the trace buffer by timestamp,
-                // so emitting a future-stamped event now lands it at the right
-                // place. Slots that DO recycle keep their `trace_at` from the
-                // BD-reuse grant and emit at the reuse cycle (steady-state path).
+                // Fallback: a never-reused slot emits at the ready_cycle floor
+                // once its channel idles.
                 if p.trace_at.is_none() && channel_idle {
-                    self.channels[ch_idx].pending_releases.remove(i);
-                    self.emit_lock_release_trace_at(p.lock_id, p.ready_cycle, tile, neighbors);
-                    continue;
+                    self.channels[ch_idx].pending_releases[i].trace_at = Some(p.ready_cycle);
                 }
-                // Emit a reuse-scheduled trace event once it is due.
+                // Emit the deferred trace event once it is due.
+                let p = self.channels[ch_idx].pending_releases[i];
                 match p.trace_at {
                     Some(t) if self.current_cycle >= t => {
                         self.channels[ch_idx].pending_releases.remove(i);
