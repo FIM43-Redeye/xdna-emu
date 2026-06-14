@@ -2834,6 +2834,111 @@ fn memtile_cross_lock_release_frees_consumer_promptly_trace_lags() {
     );
 }
 
+/// End-of-run truncation guard: a memtile S2MM deferred release whose BD slot
+/// never recycles -- the final fill of a finite stream -- must still emit its
+/// LockRelease trace event, timestamped at completion+latency, even when stepping
+/// stops as soon as the channel goes idle, WITHOUT the generous post-completion
+/// drain the steady-state tests use.
+///
+/// On HW the trace pipeline drains and LOCK_SEL*_REL fires at completion+latency
+/// regardless of subsequent array activity. The emulator must not drop it just
+/// because the run halts inside the latency window -- that cost the tenant-4 probe
+/// its 8th release (emulator emitted 7 of 8, dropping the final fill). The
+/// channel-idle fallback must emit the deferred trace EAGERLY at its scheduled
+/// ready_cycle, not lazily once `current_cycle` reaches a value the run may never
+/// step to.
+#[test]
+fn memtile_deferred_release_survives_end_of_run_truncation() {
+    use crate::interpreter::state::EventType;
+
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut tile = Tile::mem_tile(1, 1);
+    let mut host_mem = make_host_memory();
+
+    // S2MM ch0: BD0 fills + cross-lock releases own lock 2 (id 66) -- deferred
+    // because next BD1 acquires a different lock (id 65). BD0's slot never
+    // recycles (BD1 ends the task), so its release relies on the channel-idle
+    // fallback. This is the terminal-fill shape from the tenant-4 probe.
+    engine
+        .configure_bd(
+            0,
+            BdConfig::simple_1d(0x80000, 16)
+                .with_acquire(64, 1)
+                .with_release(66, 1)
+                .with_next(1),
+        )
+        .unwrap();
+    engine
+        .configure_bd(1, BdConfig::simple_1d(0x80100, 16).with_acquire(65, 1).with_release(67, 1))
+        .unwrap();
+
+    tile.locks[0].set(1); // own lock 0 (id 64): BD0 acquire available
+    tile.locks[1].set(1); // own lock 1 (id 65): BD1 acquire available (prompt swap)
+
+    engine.start_channel(0, 0).unwrap();
+
+    let latency = engine.timing_config().memtile_lock_release_latency_cycles as u64;
+    let grace = 5u64;
+    assert!(grace < latency, "grace must sit inside the latency window to exercise truncation");
+
+    let mut finished_bd0: Option<u64> = None;
+    let mut events: Vec<(u64, EventType)> = Vec::new();
+
+    // Feed greedily; step until the channel is idle, then only a SMALL grace
+    // (<< latency) -- emulating a run loop that halts when the data work is done,
+    // before `current_cycle` could ever reach the deferred release's ready_cycle.
+    let feed: Vec<u32> = (0..8u32).collect();
+    let mut fed = 0usize;
+    let mut cycle: u64 = 0;
+    let mut idle_since: Option<u64> = None;
+    loop {
+        engine.set_current_cycle(cycle);
+        while fed < feed.len()
+            && engine.push_stream_in(StreamData { data: feed[fed], tlast: false, channel: 0 })
+        {
+            fed += 1;
+        }
+        engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+        tile.resolve_lock_requests(cycle);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        for (c, e) in engine.drain_trace_events() {
+            if matches!(e, EventType::DmaFinishedBd { channel: 0 }) && finished_bd0.is_none() {
+                finished_bd0 = Some(c);
+            }
+        }
+        events.extend(tile.mem_trace_pending.drain(..));
+
+        if engine.channel_has_pending_work(0) {
+            idle_since = None;
+        } else {
+            match idle_since {
+                Some(since) if cycle - since >= grace => break,
+                Some(_) => {}
+                None => idle_since = Some(cycle),
+            }
+        }
+        cycle += 1;
+        assert!(cycle < 1000, "runaway: channel never went idle");
+    }
+
+    let finished = finished_bd0.expect("BD0 should emit FINISHED_BD");
+    let release = events
+        .iter()
+        .find_map(|(c, e)| matches!(e, EventType::LockRelease { lock_id: 2 }).then_some(*c))
+        .expect(
+            "BD0's deferred cross-lock release must NOT be dropped when the run halts within the \
+             latency window -- it must emit at channel-idle, timestamped at completion+latency",
+        );
+    assert_eq!(
+        release - finished,
+        latency,
+        "the truncation-surviving release must still carry the completion+latency timestamp; \
+         finished={} release={}",
+        finished,
+        release,
+    );
+}
+
 #[test]
 fn memtile_invalid_bd_channel_combination_returns_error() {
     // BD 24 is the first "odd channel" BD; per-direction channel 0 (S2MM ch 0)
