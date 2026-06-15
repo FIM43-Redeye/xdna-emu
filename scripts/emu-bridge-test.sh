@@ -16,7 +16,7 @@
 # Six-phase pipelined architecture:
 #   Phase 1: Discover        -- find tests, filter, skip npu2-only
 #   Phase 2: Compile         -- parallel xclbin builds (both compilers in parallel) + test.exe
-#   Phase 3+4: Run HW+EMU   -- HW (serial) and EMU (-j$JOBS) run concurrently
+#   Phase 3+4: Run HW+EMU   -- HW (serial) and EMU (-j$EMU_JOBS=nproc) concurrently
 #   Phase 5: Trace compare   -- automatic trace comparison (HW vs EMU)
 #   Phase 5c: aiesim        -- run aiesimulator on Chess builds + VCD coverage
 #   Phase 6: Report          -- per-compiler comparison matrix + summary
@@ -83,6 +83,13 @@ ln -sfn "$RESULTS_DIR" "${RESULTS_DIR%/*}/latest"
 # stable hardware. (Peano-based tools are ~0.5GB/job and not bound by this.)
 JOBS_CAP=8        # absolute Chess ceiling: 8 x ~5.5GB = ~44GB < 48GB wall
 JOBS=4            # safe default; pass -j8 explicitly when the box is idle
+
+# EMU-run parallelism is SEPARATE from Chess-compile parallelism. The RAM wall
+# above is a *Chess compile* constraint (xchesscc ~5.5GB/job); the emulator
+# itself is light (a Rust process per kernel, no Chess), so EMU runs fan out to
+# full nproc -- the natural dev-box load we want during bridge tests. Only the
+# Phase 2 compile pool stays clamped to $JOBS. Override via EMU_JOBS=N.
+EMU_JOBS="${EMU_JOBS:-$(nproc)}"
 
 # ---------------------------------------------------------------------------
 # Option parsing
@@ -3389,7 +3396,7 @@ main() {
   # comma and the aiesim side is actually announced.
   local -a _runtimes=()
   $RUN_HW && _runtimes+=("HW -j${NPU_HW_JOBS}")
-  $RUN_EMU && _runtimes+=("EMU -j${JOBS}")
+  $RUN_EMU && _runtimes+=("EMU -j${EMU_JOBS}")
   $RUN_AIESIM_EMU && _runtimes+=("aiesim -P${AIESIM_JOBS}")
   local _runtime_seq="" _r
   for _r in "${_runtimes[@]}"; do _runtime_seq="${_runtime_seq:+$_runtime_seq -> }$_r"; done
@@ -3589,7 +3596,7 @@ main() {
   # xargs token-splitting issues with empty variants.
   if $RUN_EMU; then
     printf '%s\n' "${all_jobs[@]}" \
-      | xargs -P"$JOBS" -I{} bash -c '
+      | xargs -P"$EMU_JOBS" -I{} bash -c '
           entry="$1"
           j_name="${entry%%:*}"
           tmp="${entry#*:}"
