@@ -1104,7 +1104,14 @@ impl InterpreterEngine {
 
                         let (prev_active, prev_stalled, prev_tlast) =
                             tile.prev_port_state[event_port as usize];
-                        let cur_active = port.cycle_active;
+                        // PORT_RUNNING reflects an actual beat crossing the
+                        // port this cycle (`cycle_beat`), not buffered-data
+                        // presence (`cycle_active`, which drives clock gating).
+                        // A receive port holding residual FIFO data between
+                        // upstream bursts is idle-with-data, not running -- HW
+                        // toggles PORT_RUNNING per beat-run, so we follow the
+                        // beat signal here.
+                        let cur_active = port.cycle_beat;
                         let cur_stalled = port.cycle_stalled;
                         let cur_tlast = port.cycle_tlast;
 

@@ -92,10 +92,19 @@ pub struct StreamPort {
     pub config: u32,
     /// Was this port active during the current routing cycle?
     /// Set true when data is pushed or when the FIFO was non-empty at the
-    /// start of routing. Used by PORT_RUNNING trace events -- data flows
-    /// through the entire stream switch within a single `route_streams()`
-    /// call, so checking `has_data()` between calls always sees empty FIFOs.
+    /// start of routing. Drives adaptive clock gating (a port holding
+    /// buffered data keeps the stream-switch clock awake, matching silicon's
+    /// idle detector), NOT the PORT_RUNNING trace -- see `cycle_beat`.
     pub cycle_active: bool,
+    /// Did a data beat actually cross this port during the current routing
+    /// cycle? Set true only when a word is pushed or popped this cycle; reset
+    /// (with no `has_data()` seed) at `begin_routing_cycle`. This is the
+    /// HW-faithful "port running" signal: a stream-switch port asserts
+    /// PORT_RUNNING only on cycles where a beat crosses it, not merely while
+    /// it holds residual buffered data (that is idle-with-data, or stalled
+    /// under backpressure). `cycle_active` conflates the two and over-marks
+    /// S2MM receive ports as continuously running; `cycle_beat` does not.
+    pub cycle_beat: bool,
     /// Was this port stalled during the current routing cycle?
     /// Set true when a slave has data but cannot forward it due to arbiter
     /// contention or master backpressure. Used by PORT_STALLED trace events.
@@ -141,6 +150,7 @@ impl StreamPort {
             enabled: false,
             packet_enable: false,
             cycle_active: false,
+            cycle_beat: false,
             cycle_stalled: false,
             cycle_tlast: false,
         }
@@ -170,6 +180,7 @@ impl StreamPort {
             self.fifo.push_back(data);
             self.tlast_flags.push_back(false);
             self.cycle_active = true;
+            self.cycle_beat = true;
             true
         } else {
             false
@@ -182,6 +193,7 @@ impl StreamPort {
             self.fifo.push_back(data);
             self.tlast_flags.push_back(tlast);
             self.cycle_active = true;
+            self.cycle_beat = true;
             if tlast {
                 self.cycle_tlast = true;
             }
@@ -192,10 +204,17 @@ impl StreamPort {
     }
 
     /// Pop data from FIFO.
+    ///
+    /// A successful pop is a beat crossing the port this cycle, so it sets
+    /// `cycle_beat` (the PORT_RUNNING signal) -- a receive port draining into
+    /// a consumer is running this cycle. It does NOT set `cycle_active`: that
+    /// flag intentionally tracks buffered-data presence for clock gating and
+    /// is seeded from `has_data()` at cycle start.
     pub fn pop(&mut self) -> Option<u32> {
         if self.fifo.is_empty() {
             None
         } else {
+            self.cycle_beat = true;
             self.tlast_flags.pop_front();
             self.fifo.pop_front()
         }
@@ -206,6 +225,7 @@ impl StreamPort {
         if self.fifo.is_empty() {
             None
         } else {
+            self.cycle_beat = true;
             let tlast = self.tlast_flags.pop_front().unwrap_or(false);
             if tlast {
                 self.cycle_tlast = true;

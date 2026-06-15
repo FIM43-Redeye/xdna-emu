@@ -311,11 +311,13 @@ impl StreamSwitch {
     pub fn begin_routing_cycle(&mut self) {
         for port in &mut self.masters {
             port.cycle_active = port.has_data();
+            port.cycle_beat = false;
             port.cycle_stalled = false;
             port.cycle_tlast = false;
         }
         for port in &mut self.slaves {
             port.cycle_active = port.has_data();
+            port.cycle_beat = false;
             port.cycle_stalled = false;
             port.cycle_tlast = false;
         }

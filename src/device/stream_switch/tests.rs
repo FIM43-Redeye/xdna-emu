@@ -881,6 +881,41 @@ fn test_cycle_active_tracks_port_activity() {
 }
 
 #[test]
+fn test_cycle_beat_tracks_actual_beat_crossings() {
+    // cycle_beat is the HW-faithful PORT_RUNNING signal: it is set only when
+    // a beat actually crosses the port this cycle (push OR pop), and -- unlike
+    // cycle_active -- it is NOT seeded from has_data() at begin_routing_cycle.
+    // This distinguishes "running" (beat crossing) from "idle-with-buffered-
+    // data" (a receive port holding residual FIFO data between upstream bursts).
+    let mut port = StreamPort::new(0, PortDirection::Master, PortType::Dma(0));
+    assert!(!port.cycle_beat);
+
+    // Push is a beat crossing.
+    port.push_with_tlast(0x1111, false);
+    assert!(port.cycle_beat, "push must set cycle_beat");
+
+    // Pop is also a beat crossing (a receive port draining to its consumer).
+    port.cycle_beat = false;
+    port.pop();
+    assert!(port.cycle_beat, "pop must set cycle_beat");
+}
+
+#[test]
+fn test_begin_routing_cycle_does_not_seed_beat_from_fifo() {
+    // The crux of the receive-port fix: a port that merely HOLDS buffered data
+    // (no beat this cycle) must NOT be marked running. begin_routing_cycle
+    // seeds cycle_active from has_data() (for clock gating) but leaves
+    // cycle_beat false, so PORT_RUNNING only asserts on real beat crossings.
+    let mut ss = StreamSwitch::new_compute_tile(0, 2);
+    ss.slaves[1].push_with_tlast(0x1234, false);
+
+    ss.begin_routing_cycle();
+
+    assert!(ss.slaves[1].cycle_active, "buffered-data port stays active (clock gating)");
+    assert!(!ss.slaves[1].cycle_beat, "buffered-data port without a beat this cycle must NOT be running");
+}
+
+#[test]
 fn test_begin_routing_cycle_seeds_from_fifo() {
     let mut ss = StreamSwitch::new_compute_tile(0, 2);
 
