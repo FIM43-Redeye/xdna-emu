@@ -196,18 +196,23 @@ impl DmaTimingConfig {
 /// Overlay DDR burst parameters from the environment onto a base.
 ///
 /// Reads (via `get`, so the parse is testable without touching process env):
-/// - `XDNA_EMU_DDR_BURST_WORDS`     -> `burst_words` (set to non-zero to enable)
-/// - `XDNA_EMU_DDR_INTER_BURST_CYCLES` -> `inter_burst_cycles`
+/// - `XDNA_EMU_DDR_BURST_WORDS`     -> both `burst_words_{min,max}` (degenerate /
+///   fixed alias; set to non-zero `max` to enable)
+/// - `XDNA_EMU_DDR_INTER_BURST_CYCLES` -> both `inter_burst_cycles_{min,max}`
 /// - `XDNA_EMU_DDR_FIRST_LATENCY`   -> `first_access_latency`
 ///
-/// Any var that is absent or unparseable leaves the corresponding field at its
-/// base value.  Enabling is opt-in: with no env set and a `DISABLED` base the
-/// result is `DISABLED` (uniform delivery).
+/// The single-value vars set both bounds (the historical fixed cadence). The
+/// explicit `_MIN`/`_MAX` range vars and `XDNA_EMU_DDR_SEED` are wired in step 2
+/// of the stochastic-jitter spec. Any var that is absent or unparseable leaves
+/// the corresponding field at its base value. Enabling is opt-in: with no env
+/// set and a `DISABLED` base the result is `DISABLED` (uniform delivery).
 pub fn ddr_burst_from_env(base: BurstParams, get: impl Fn(&str) -> Option<String>) -> BurstParams {
     let field = |key: &str, cur: u16| get(key).and_then(|v| v.trim().parse::<u16>().ok()).unwrap_or(cur);
     BurstParams {
-        burst_words: field("XDNA_EMU_DDR_BURST_WORDS", base.burst_words),
-        inter_burst_cycles: field("XDNA_EMU_DDR_INTER_BURST_CYCLES", base.inter_burst_cycles),
+        burst_words_min: field("XDNA_EMU_DDR_BURST_WORDS", base.burst_words_min),
+        burst_words_max: field("XDNA_EMU_DDR_BURST_WORDS", base.burst_words_max),
+        inter_burst_cycles_min: field("XDNA_EMU_DDR_INTER_BURST_CYCLES", base.inter_burst_cycles_min),
+        inter_burst_cycles_max: field("XDNA_EMU_DDR_INTER_BURST_CYCLES", base.inter_burst_cycles_max),
         first_access_latency: field("XDNA_EMU_DDR_FIRST_LATENCY", base.first_access_latency),
     }
 }
@@ -259,16 +264,27 @@ mod tests {
         .collect();
         let cfg = ddr_burst_from_env(BurstParams::DISABLED, |k| env.get(k).map(|s| s.to_string()));
         assert!(cfg.enabled());
-        assert_eq!(cfg.burst_words, 256);
-        assert_eq!(cfg.inter_burst_cycles, 1024);
+        // Single-value vars set both bounds (degenerate / fixed alias).
+        assert_eq!((cfg.burst_words_min, cfg.burst_words_max), (256, 256));
+        assert_eq!((cfg.inter_burst_cycles_min, cfg.inter_burst_cycles_max), (1024, 1024));
         assert_eq!(cfg.first_access_latency, 600);
 
         // Partial env: unset fields keep the base value.
         let partial: HashMap<&str, &str> = [("XDNA_EMU_DDR_BURST_WORDS", "64")].into_iter().collect();
-        let base = BurstParams { burst_words: 0, inter_burst_cycles: 999, first_access_latency: 7 };
+        let base = BurstParams {
+            burst_words_min: 0,
+            burst_words_max: 0,
+            inter_burst_cycles_min: 999,
+            inter_burst_cycles_max: 999,
+            first_access_latency: 7,
+        };
         let cfg2 = ddr_burst_from_env(base, |k| partial.get(k).map(|s| s.to_string()));
-        assert_eq!(cfg2.burst_words, 64);
-        assert_eq!(cfg2.inter_burst_cycles, 999, "unset field keeps base");
+        assert_eq!((cfg2.burst_words_min, cfg2.burst_words_max), (64, 64));
+        assert_eq!(
+            (cfg2.inter_burst_cycles_min, cfg2.inter_burst_cycles_max),
+            (999, 999),
+            "unset field keeps base"
+        );
         assert_eq!(cfg2.first_access_latency, 7, "unset field keeps base");
     }
 
