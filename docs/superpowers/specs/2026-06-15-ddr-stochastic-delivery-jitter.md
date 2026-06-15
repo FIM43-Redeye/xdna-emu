@@ -1,7 +1,9 @@
 # Stochastic DDR delivery jitter (task #140 close-out)
 
 **Date:** 2026-06-15
-**Status:** READY — all design decisions resolved (§7); ready to implement.
+**Status:** IN PROGRESS — steps 1-2 landed (PRNG range draws + seed/env wiring,
+commits `aa3fbae1`, `05d56cc3`); steps 3-5 (HW capture, calibrate, validate) are
+HW-gated. Design decisions resolved (§7).
 **Supersedes:** the `ddr_burst_jitter_permille` ("deterministic jitter") knob
 sketched in `2026-06-14-ddr-burst-delivery-model.md` §4.1 — replaced here by a
 seeded-PRNG draw (Maya: "reproduce it by literal RNG").
