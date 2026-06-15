@@ -102,6 +102,47 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// A per-process random `u64` drawn from the OS, with no `rand` dependency:
+/// `RandomState` seeds its hasher from system entropy, so a fresh hasher's
+/// `finish()` (no input) is a fresh random value each call.
+fn system_entropy() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new().build_hasher().finish()
+}
+
+/// Resolve the DDR master seed from the (already-read) `XDNA_EMU_DDR_SEED`
+/// value: a parseable integer pins it (reproducibility / CI); anything else
+/// falls back to fresh system entropy. Pure (entropy injected via the fallback)
+/// so the pin path is unit-testable.
+fn resolve_master_seed(env_value: Option<String>) -> u64 {
+    env_value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(system_entropy)
+}
+
+/// Process-wide DDR master seed, resolved once on first use. `XDNA_EMU_DDR_SEED`
+/// pins it; otherwise system entropy makes every fresh run differ (like real
+/// DRAM under shared SoC traffic). Logged once so any run can be reproduced by
+/// re-pinning the seed. Only consulted when the burst model is enabled, so the
+/// default-off path never draws entropy.
+pub fn master_seed() -> u64 {
+    use std::sync::OnceLock;
+    static MASTER_SEED: OnceLock<u64> = OnceLock::new();
+    *MASTER_SEED.get_or_init(|| {
+        let seed = resolve_master_seed(std::env::var("XDNA_EMU_DDR_SEED").ok());
+        log::info!("DDR burst-delivery master seed = {seed} (pin via XDNA_EMU_DDR_SEED to reproduce)");
+        seed
+    })
+}
+
+/// Per-channel PRNG seed: the master seed diffused with `(col,row,channel)` so
+/// every channel's delivery jitter decorrelates while staying reproducible from
+/// the single master seed.
+pub fn channel_seed(master: u64, col: u8, row: u8, channel: u8) -> u64 {
+    let mut s = master ^ ((col as u64) << 40) ^ ((row as u64) << 24) ^ ((channel as u64) << 8);
+    splitmix64(&mut s)
+}
+
 /// Per-channel burst-delivery state. Resume-safe: the only state is the words
 /// remaining in the current burst, the cycles remaining in the current
 /// gap/first-access latency, and the PRNG state. Stochastic *across* fresh
@@ -389,6 +430,37 @@ mod tests {
         let a = timeline(&mut BurstGate::seeded(111), p, 100);
         let b = timeline(&mut BurstGate::seeded(999), p, 100);
         assert_eq!(a, b, "fixed params must not depend on the seed");
+    }
+
+    #[test]
+    fn resolve_master_seed_pins_parseable_value() {
+        assert_eq!(resolve_master_seed(Some("777".into())), 777);
+        assert_eq!(resolve_master_seed(Some("  42 ".into())), 42, "trims whitespace");
+        // Unparseable / absent -> entropy fallback (just a value; cannot assert
+        // which, but it must not panic and must produce *something*).
+        let _ = resolve_master_seed(Some("not-a-number".into()));
+        let _ = resolve_master_seed(None);
+    }
+
+    #[test]
+    fn channel_seed_decorrelates_and_is_stable() {
+        let m = 0xDEAD_BEEF_CAFE_F00D;
+        // Same identity -> same seed (reproducible).
+        assert_eq!(channel_seed(m, 1, 2, 3), channel_seed(m, 1, 2, 3));
+        // Distinct identities -> distinct seeds (decorrelated across col/row/ch).
+        let seeds = [
+            channel_seed(m, 0, 1, 0),
+            channel_seed(m, 0, 1, 1),
+            channel_seed(m, 1, 1, 0),
+            channel_seed(m, 0, 2, 0),
+        ];
+        for i in 0..seeds.len() {
+            for j in (i + 1)..seeds.len() {
+                assert_ne!(seeds[i], seeds[j], "channel seeds must differ across identity");
+            }
+        }
+        // Different master -> different per-channel seed.
+        assert_ne!(channel_seed(m, 1, 2, 3), channel_seed(m ^ 1, 1, 2, 3));
     }
 
     #[test]

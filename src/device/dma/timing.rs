@@ -198,22 +198,32 @@ impl DmaTimingConfig {
 /// Reads (via `get`, so the parse is testable without touching process env):
 /// - `XDNA_EMU_DDR_BURST_WORDS`     -> both `burst_words_{min,max}` (degenerate /
 ///   fixed alias; set to non-zero `max` to enable)
+/// - `XDNA_EMU_DDR_BURST_WORDS_{MIN,MAX}`        -> each `burst_words_*` bound
 /// - `XDNA_EMU_DDR_INTER_BURST_CYCLES` -> both `inter_burst_cycles_{min,max}`
+/// - `XDNA_EMU_DDR_INTER_BURST_CYCLES_{MIN,MAX}` -> each `inter_burst_cycles_*`
 /// - `XDNA_EMU_DDR_FIRST_LATENCY`   -> `first_access_latency`
 ///
-/// The single-value vars set both bounds (the historical fixed cadence). The
-/// explicit `_MIN`/`_MAX` range vars and `XDNA_EMU_DDR_SEED` are wired in step 2
-/// of the stochastic-jitter spec. Any var that is absent or unparseable leaves
-/// the corresponding field at its base value. Enabling is opt-in: with no env
-/// set and a `DISABLED` base the result is `DISABLED` (uniform delivery).
+/// Precedence per bound: explicit `_MIN`/`_MAX` range var > single-value alias
+/// (sets both bounds = degenerate/fixed cadence) > base value. The PRNG seed is
+/// separate (`XDNA_EMU_DDR_SEED`, resolved process-wide in `burst::master_seed`).
+/// Any var that is absent or unparseable leaves the corresponding field at its
+/// base value. Enabling is opt-in: with no env set and a `DISABLED` base the
+/// result is `DISABLED` (uniform delivery).
 pub fn ddr_burst_from_env(base: BurstParams, get: impl Fn(&str) -> Option<String>) -> BurstParams {
-    let field = |key: &str, cur: u16| get(key).and_then(|v| v.trim().parse::<u16>().ok()).unwrap_or(cur);
+    let parse = |key: &str| get(key).and_then(|v| v.trim().parse::<u16>().ok());
+    // Single-value vars set BOTH bounds; _MIN/_MAX then override each bound.
+    let bw = parse("XDNA_EMU_DDR_BURST_WORDS");
+    let ib = parse("XDNA_EMU_DDR_INTER_BURST_CYCLES");
     BurstParams {
-        burst_words_min: field("XDNA_EMU_DDR_BURST_WORDS", base.burst_words_min),
-        burst_words_max: field("XDNA_EMU_DDR_BURST_WORDS", base.burst_words_max),
-        inter_burst_cycles_min: field("XDNA_EMU_DDR_INTER_BURST_CYCLES", base.inter_burst_cycles_min),
-        inter_burst_cycles_max: field("XDNA_EMU_DDR_INTER_BURST_CYCLES", base.inter_burst_cycles_max),
-        first_access_latency: field("XDNA_EMU_DDR_FIRST_LATENCY", base.first_access_latency),
+        burst_words_min: parse("XDNA_EMU_DDR_BURST_WORDS_MIN").or(bw).unwrap_or(base.burst_words_min),
+        burst_words_max: parse("XDNA_EMU_DDR_BURST_WORDS_MAX").or(bw).unwrap_or(base.burst_words_max),
+        inter_burst_cycles_min: parse("XDNA_EMU_DDR_INTER_BURST_CYCLES_MIN")
+            .or(ib)
+            .unwrap_or(base.inter_burst_cycles_min),
+        inter_burst_cycles_max: parse("XDNA_EMU_DDR_INTER_BURST_CYCLES_MAX")
+            .or(ib)
+            .unwrap_or(base.inter_burst_cycles_max),
+        first_access_latency: parse("XDNA_EMU_DDR_FIRST_LATENCY").unwrap_or(base.first_access_latency),
     }
 }
 
@@ -286,6 +296,37 @@ mod tests {
             "unset field keeps base"
         );
         assert_eq!(cfg2.first_access_latency, 7, "unset field keeps base");
+    }
+
+    #[test]
+    fn ddr_burst_env_min_max_ranges_and_precedence() {
+        use std::collections::HashMap;
+        // Explicit _MIN/_MAX set a stochastic range directly.
+        let env: HashMap<&str, &str> = [
+            ("XDNA_EMU_DDR_BURST_WORDS_MIN", "8"),
+            ("XDNA_EMU_DDR_BURST_WORDS_MAX", "16"),
+            ("XDNA_EMU_DDR_INTER_BURST_CYCLES_MIN", "7"),
+            ("XDNA_EMU_DDR_INTER_BURST_CYCLES_MAX", "16"),
+        ]
+        .into_iter()
+        .collect();
+        let cfg = ddr_burst_from_env(BurstParams::DISABLED, |k| env.get(k).map(|s| s.to_string()));
+        assert!(cfg.enabled());
+        assert_eq!((cfg.burst_words_min, cfg.burst_words_max), (8, 16));
+        assert_eq!((cfg.inter_burst_cycles_min, cfg.inter_burst_cycles_max), (7, 16));
+
+        // Precedence: _MAX overrides the single-value alias for that bound only;
+        // the un-overridden bound takes the single-value alias.
+        let env2: HashMap<&str, &str> =
+            [("XDNA_EMU_DDR_BURST_WORDS", "10"), ("XDNA_EMU_DDR_BURST_WORDS_MAX", "20")]
+                .into_iter()
+                .collect();
+        let cfg2 = ddr_burst_from_env(BurstParams::DISABLED, |k| env2.get(k).map(|s| s.to_string()));
+        assert_eq!(
+            (cfg2.burst_words_min, cfg2.burst_words_max),
+            (10, 20),
+            "min from single-value alias, max from explicit _MAX"
+        );
     }
 
     #[test]

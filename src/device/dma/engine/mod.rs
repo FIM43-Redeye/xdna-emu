@@ -171,7 +171,7 @@ impl DmaEngine {
 
         let channels = (0..num_channels).map(|i| ChannelContext::new(i as u8)).collect();
 
-        Self {
+        let mut engine = Self {
             col,
             row,
             tile_kind,
@@ -196,6 +196,26 @@ impl DmaEngine {
             },
             cycle_dma_banks: 0,
             fatal_errors: Vec::new(),
+        };
+        engine.seed_burst_gates();
+        engine
+    }
+
+    /// Seed each channel's DDR `BurstGate` PRNG from the process master seed
+    /// mixed with `(col,row,channel)`, so every channel's delivery jitter
+    /// decorrelates while staying reproducible from one master seed. No-op (and
+    /// never draws entropy) when the burst model is disabled -- the default --
+    /// so the deterministic default path is untouched. Re-run after any
+    /// `timing_config` change that may have enabled the model.
+    fn seed_burst_gates(&mut self) {
+        if !self.timing_config.ddr_burst.enabled() {
+            return;
+        }
+        let master = crate::device::dma::burst::master_seed();
+        let (col, row) = (self.col, self.row);
+        for (ch, c) in self.channels.iter_mut().enumerate() {
+            c.ddr_burst_gate
+                .set_seed(crate::device::dma::burst::channel_seed(master, col, row, ch as u8));
         }
     }
 
@@ -226,6 +246,9 @@ impl DmaEngine {
     /// This method allows tuning specific timing values if needed.
     pub fn with_timing(mut self, config: DmaTimingConfig) -> Self {
         self.timing_config = config;
+        // The new config may enable the burst model (e.g. an experiment
+        // overlay); (re)seed the gates so they are not left at the default seed.
+        self.seed_burst_gates();
         self
     }
 
