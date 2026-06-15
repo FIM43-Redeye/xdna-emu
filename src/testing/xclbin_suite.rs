@@ -1755,4 +1755,42 @@ mod tests {
             assert_eq!(v, i as i32 + 2, "out[{}] should be i+2 (add_one of [1..64])", i);
         }
     }
+
+    /// Calibration tool (#140): dump the in-process add_one_using_dma EMU trace
+    /// to the path in `XDNA_EMU_TRACE_DUMP`, honoring DDR-burst env overlay
+    /// (`XDNA_EMU_DDR_BURST_WORDS` / `_INTER_BURST_CYCLES` / `_FIRST_LATENCY`).
+    /// Lets us sweep burst params and inspect the memtile PORT_RUNNING cadence
+    /// without HW.  Ignored by default; run explicitly with the env set.
+    #[test]
+    #[ignore = "calibration tool: run with XDNA_EMU_TRACE_DUMP + DDR burst env set"]
+    fn dump_add_one_trace_for_calibration() {
+        let dump_path = match std::env::var("XDNA_EMU_TRACE_DUMP") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("set XDNA_EMU_TRACE_DUMP to a file path to dump the trace");
+                return;
+            }
+        };
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let test_dir = manifest.join("../mlir-aie/test/npu-xrt/add_one_using_dma");
+        let xclbin_path = manifest.join("../mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie.xclbin");
+        if !xclbin_path.exists() {
+            eprintln!("SKIP: chess xclbin not built at {}", xclbin_path.display());
+            return;
+        }
+        let spec = crate::testing::test_cpp_parser::parse_test_cpp(&test_dir)
+            .expect("parse add_one_using_dma test.cpp buffer spec");
+        let test = XclbinTest::from_path(&xclbin_path).with_buffer_spec(spec);
+        let suite = XclbinSuite::new();
+        let (outcome, _out, trace) = suite.run_single_with_trace(&test);
+        let trace = trace.unwrap_or_default();
+        std::fs::write(&dump_path, &trace).expect("write trace dump");
+        eprintln!(
+            "dumped {} trace bytes to {} (outcome={:?}, burst_words={:?})",
+            trace.len(),
+            dump_path,
+            outcome,
+            std::env::var("XDNA_EMU_DDR_BURST_WORDS").ok(),
+        );
+    }
 }

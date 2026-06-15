@@ -95,14 +95,25 @@ pub struct DmaTimingConfig {
     /// 0 elsewhere -- no compute/shim HW evidence for a non-zero value.
     pub memtile_lock_release_latency_cycles: u16,
 
-    /// DDR burst-delivery parameters for shim host-memory transfers.  Models
-    /// the bursty AXI-master/DDR delivery cadence that makes downstream S2MM
-    /// channels starve the way silicon does (known-fidelity-gaps row 50/117).
-    /// Defaults to [`BurstParams::DISABLED`] (uniform delivery) so enabling
-    /// bursting is opt-in and never silently perturbs existing cycle-accuracy
-    /// baselines -- override via `XDNA_EMU_DDR_*` env vars or a future profile.
-    /// See `src/device/dma/burst.rs`.
+    /// DDR burst-delivery parameters for shim host-memory transfers.  Models a
+    /// bursty AXI-master/DDR delivery cadence at the *producer* (shim host
+    /// read).  DISABLED by default: this was the wrong lever for the memtile
+    /// PORT_RUNNING cadence (that gap is a consumer-side per-BD-switch bubble,
+    /// `bd_switch_bubble_cycles`).  Parked, still env-enablable via
+    /// `XDNA_EMU_DDR_BURST_WORDS` for experiments.  See `src/device/dma/burst.rs`.
     pub ddr_burst: BurstParams,
+
+    /// Minimum inter-BD bubble, in cycles, on the chained-BD prefetch fast
+    /// path.  At each `next_bd` boundary the DMA channel deasserts its stream
+    /// port (PORT_RUNNING) for this many cycles -- the next_bd-fetch + lock
+    /// handshake costs a cycle even when the next buffer is immediately
+    /// available.  HW-confirmed: NPU1 Phoenix add_one memtile slot0 traces
+    /// `on16 off1 x4` (one 1-cycle bubble per 16-word S2MM BD execution), and
+    /// slot4 (MM2S) shows the same.  Larger real inter-BD waits (lock stall,
+    /// host pipeline) dominate and absorb this.  `0` restores the old
+    /// back-to-back prefetch (no bubble).  Calibrated to 1 on Phoenix;
+    /// env-overridable via `XDNA_EMU_BD_SWITCH_BUBBLE`.
+    pub bd_switch_bubble_cycles: u16,
 }
 
 impl Default for DmaTimingConfig {
@@ -141,11 +152,18 @@ impl DmaTimingConfig {
             // Not yet plumbed through the per-arch DmaModel -- a single memtile
             // observation; promote to the arch model if AIE2P measures different.
             memtile_lock_release_latency_cycles: 63,
-            // DDR burst delivery: disabled by default (uniform delivery, the
-            // historical behavior).  The env overlay below enables it when the
-            // user opts in; calibrating a non-zero Phoenix default is a
-            // separate HW-validated step.
+            // DDR burst delivery: DISABLED by default (uniform delivery).  The
+            // shim-side burst gate was the wrong model for the memtile
+            // PORT_RUNNING cadence -- that gap is a per-BD-switch bubble at the
+            // *consumer* (bd_switch_bubble_cycles), not a producer-side AXI
+            // burst.  A free-running 16-word gate fragments contiguous BDs and
+            // smears chained transfers (the k8 regression).  BurstGate is parked
+            // (still env-enablable via XDNA_EMU_DDR_BURST_WORDS) pending a
+            // keep/delete call.  See src/device/dma/burst.rs.
             ddr_burst: ddr_burst_from_env(BurstParams::DISABLED, |k| std::env::var(k).ok()),
+            // Per-BD-switch bubble: 1 cycle on Phoenix (NPU1 add_one memtile
+            // slot0 = on16/off1). Env-overridable for experiments.
+            bd_switch_bubble_cycles: bd_switch_bubble_from_env(1, |k| std::env::var(k).ok()),
         }
     }
 
@@ -194,9 +212,31 @@ pub fn ddr_burst_from_env(base: BurstParams, get: impl Fn(&str) -> Option<String
     }
 }
 
+/// Overlay the BD-switch bubble width from the environment onto a base.
+///
+/// Reads `XDNA_EMU_BD_SWITCH_BUBBLE` (via `get`, so it is testable without
+/// touching process env). Absent or unparseable leaves `base` unchanged. Set
+/// to `0` to restore the old back-to-back chained-BD prefetch (no bubble).
+pub fn bd_switch_bubble_from_env(base: u16, get: impl Fn(&str) -> Option<String>) -> u16 {
+    get("XDNA_EMU_BD_SWITCH_BUBBLE")
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .unwrap_or(base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bd_switch_bubble_defaults_to_one_and_env_overrides() {
+        // Phoenix default is a 1-cycle bubble (HW add_one memtile slot0 off1).
+        let cfg = DmaTimingConfig::from_model(&xdna_archspec::aie2::dma::AIE2_DMA_MODEL);
+        assert_eq!(cfg.bd_switch_bubble_cycles, 1, "default 1-cycle BD-switch bubble");
+        // Env can widen or disable it.
+        assert_eq!(bd_switch_bubble_from_env(1, |_| None), 1, "absent keeps base");
+        assert_eq!(bd_switch_bubble_from_env(1, |_| Some("0".into())), 0, "0 disables bubble");
+        assert_eq!(bd_switch_bubble_from_env(1, |_| Some("3".into())), 3, "override widens");
+    }
 
     #[test]
     fn ddr_burst_disabled_by_default() {
@@ -230,6 +270,17 @@ mod tests {
         assert_eq!(cfg2.burst_words, 64);
         assert_eq!(cfg2.inter_burst_cycles, 999, "unset field keeps base");
         assert_eq!(cfg2.first_access_latency, 7, "unset field keeps base");
+    }
+
+    #[test]
+    fn from_model_disables_ddr_burst_by_default() {
+        // The shim-side DDR burst gate is parked (wrong lever for the memtile
+        // PORT_RUNNING cadence -- that is a consumer-side per-BD-switch bubble).
+        // It must be OFF by default so it never perturbs cycle baselines; the
+        // env overlay can still enable it for experiments. (Relies on
+        // XDNA_EMU_DDR_* being unset, as in CI.)
+        let cfg = DmaTimingConfig::from_model(&xdna_archspec::aie2::dma::AIE2_DMA_MODEL);
+        assert!(!cfg.ddr_burst.enabled(), "burst gate should be parked (off) by default");
     }
 
     #[test]

@@ -39,6 +39,21 @@ impl BurstParams {
     pub const DISABLED: BurstParams =
         BurstParams { burst_words: 0, inter_burst_cycles: 0, first_access_latency: 0 };
 
+    /// AXI4-faithful DDR burst cadence for AIE2 shim host-memory reads -- the
+    /// default delivery model.
+    ///
+    /// `burst_words = 16` is AXI4's maximum read-burst length (ARLEN 0..15 ->
+    /// 1..16 beats); `inter_burst_cycles = 1` is the inter-burst address re-arm
+    /// bubble. HW-confirmed: NPU1 Phoenix memtile `PORT_RUNNING_0` (S2MM ch0
+    /// input, fed by the shim DDR read) traces a clean `on16 off1` cadence, and
+    /// the data-dependent burst size (ch1 carries 8-beat bursts) is the
+    /// fingerprint of AXI burst-splitting differently-sized transfers, not a
+    /// fixed per-tile internal cadence. `first_access_latency = 0` because the
+    /// DDR read-pipeline cold-start is already modeled by
+    /// `shim_ddr_cold_start_mm2s_cycles`; charging it here would double-count.
+    pub const AIE2_DDR_DEFAULT: BurstParams =
+        BurstParams { burst_words: 16, inter_burst_cycles: 1, first_access_latency: 0 };
+
     /// Whether the burst model is active. `burst_words == 0` means uniform
     /// delivery -- the gate is a no-op pass-through.
     #[inline]
@@ -115,6 +130,17 @@ impl BurstGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aie2_ddr_default_is_axi_faithful() {
+        // AXI4 max read burst (16 beats) + 1-cycle re-arm; cold-start is
+        // modeled elsewhere so first_access_latency stays 0 (no double-count).
+        let p = BurstParams::AIE2_DDR_DEFAULT;
+        assert!(p.enabled());
+        assert_eq!(p.burst_words, 16);
+        assert_eq!(p.inter_burst_cycles, 1);
+        assert_eq!(p.first_access_latency, 0);
+    }
 
     #[test]
     fn disabled_gate_never_constrains() {

@@ -372,12 +372,9 @@ impl DmaEngine {
                                 transfer,
                             }
                         } else {
-                            let host_lat = self.timing_config.host_memory_latency_cycles;
-                            if host_lat > 0 && transfer.involves_host_memory() {
-                                ChannelFsm::HostPipelineLatency { cycles_remaining: host_lat, transfer }
-                            } else {
-                                ChannelFsm::Transferring { transfer }
-                            }
+                            // Chained BD whose post-grant cooldown just elapsed:
+                            // route through the BD-switch bubble.
+                            self.enter_chained_transfer(transfer)
                         }
                     } else {
                         ChannelFsm::AcquiringLock {
@@ -427,15 +424,13 @@ impl DmaEngine {
                                 // pipeline-fill latency before data flows.
                                 ChannelFsm::HostPipelineLatency { cycles_remaining: host_lat, transfer }
                             } else {
-                                // Inline the first data cycle in the same
-                                // step as the grant. The grant has already
-                                // applied (arbiter resolved this cycle,
-                                // lock decremented), so moving data here
-                                // is pipelining, not speculation. Matches
-                                // HW's grant -> first-data-on-bus pipeline
-                                // and closes the last +1 cyc residual on
-                                // chained locked BDs.
-                                self.step_transferring_cycle(ch_idx, transfer, tile, neighbors, host_memory)
+                                self.enter_transfer_after_lock_grant(
+                                    ch_idx,
+                                    transfer,
+                                    tile,
+                                    neighbors,
+                                    host_memory,
+                                )
                             }
                         } else {
                             ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired: true, transfer }
@@ -480,6 +475,17 @@ impl DmaEngine {
                     ChannelFsm::Transferring { transfer }
                 } else {
                     ChannelFsm::HostPipelineLatency { cycles_remaining: cycles_remaining - 1, transfer }
+                }
+            }
+
+            ChannelFsm::BdSwitchBubble { cycles_remaining, transfer } => {
+                // No beat moves while bubbling -- the stream port idles, which
+                // is exactly the PORT_RUNNING deassert we model at each BD
+                // boundary. When it drains, resume data movement.
+                if cycles_remaining <= 1 {
+                    ChannelFsm::Transferring { transfer }
+                } else {
+                    ChannelFsm::BdSwitchBubble { cycles_remaining: cycles_remaining - 1, transfer }
                 }
             }
 
@@ -668,13 +674,53 @@ impl DmaEngine {
             return ChannelFsm::AcquiringLock { lock_id, cycles_remaining: 0, acquired: false, transfer };
         }
 
-        // No lock to acquire. Insert packet header and start transfer.
+        // No lock to acquire. Insert packet header and start transfer (through
+        // the BD-switch bubble -- this is a chained-BD boundary).
         self.maybe_insert_packet_header_from_transfer(&mut transfer);
+        self.enter_chained_transfer(transfer)
+    }
+
+    /// Route a chained BD's transfer into its data phase from a state that has
+    /// no inherent idle cycle of its own (the no-lock prefetch path, or a
+    /// post-cooldown acquired lock). Inserts the minimum BD-switch bubble
+    /// (`bd_switch_bubble_cycles`) so the stream port deasserts for ~1 cycle at
+    /// the boundary, unless a longer host-pipeline latency already provides the
+    /// gap (then the bubble is absorbed). `bubble == 0` restores the old
+    /// back-to-back behavior.
+    fn enter_chained_transfer(&self, transfer: Box<Transfer>) -> ChannelFsm {
         let host_lat = self.timing_config.host_memory_latency_cycles;
         if host_lat > 0 && transfer.involves_host_memory() {
             ChannelFsm::HostPipelineLatency { cycles_remaining: host_lat, transfer }
+        } else if self.timing_config.bd_switch_bubble_cycles > 0 {
+            ChannelFsm::BdSwitchBubble {
+                cycles_remaining: self.timing_config.bd_switch_bubble_cycles,
+                transfer,
+            }
         } else {
             ChannelFsm::Transferring { transfer }
+        }
+    }
+
+    /// Route a chained locked BD into its data phase the cycle its acquire is
+    /// granted. The grant cycle is itself a port-idle cycle (no beat moves), so
+    /// it already counts as the first BD-switch bubble cycle:
+    /// - `bubble == 0`: inline the first beat now (the historical no-bubble
+    ///   prefetch -- grant and first data in one step).
+    /// - `bubble == 1`: stay idle this cycle and resume next cycle (the grant
+    ///   cycle *is* the one-cycle bubble); the default, matching HW `off1`.
+    /// - `bubble >= 2`: idle for the remaining `bubble - 1` cycles.
+    fn enter_transfer_after_lock_grant(
+        &mut self,
+        ch_idx: usize,
+        transfer: Box<Transfer>,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+        host_memory: &mut HostMemory,
+    ) -> ChannelFsm {
+        match self.timing_config.bd_switch_bubble_cycles {
+            0 => self.step_transferring_cycle(ch_idx, transfer, tile, neighbors, host_memory),
+            1 => ChannelFsm::Transferring { transfer },
+            n => ChannelFsm::BdSwitchBubble { cycles_remaining: n - 1, transfer },
         }
     }
 

@@ -116,6 +116,19 @@ pub enum ChannelFsm {
         transfer: Box<Transfer>,
     },
 
+    /// BD-switch bubble: the minimum inter-BD handshake gap on the chained-BD
+    /// prefetch fast path. Hardware deasserts PORT_RUNNING for ~1 cycle at each
+    /// `next_bd` boundary (next_bd fetch + lock handshake) even when the next
+    /// buffer is immediately available -- NPU1 add_one memtile slot0 traces
+    /// `on16 off1 x4`. No beat moves during this state, so the downstream port
+    /// idles, producing the gap. When a real wait (lock stall, host pipeline)
+    /// is longer it dominates and this is absorbed.
+    /// Latency: DmaTimingConfig::bd_switch_bubble_cycles (default 1 for AIE2).
+    BdSwitchBubble {
+        cycles_remaining: u16,
+        transfer: Box<Transfer>,
+    },
+
     /// Actively moving data word by word.
     /// Exits when transfer.remaining_bytes() == 0 or FoT TLAST received.
     /// S2MM stalls transparently (stays in this state, no advancement).
@@ -156,6 +169,7 @@ impl ChannelFsm {
             ChannelFsm::AcquiringLock { .. } => "AcquiringLock",
             ChannelFsm::MemoryLatency { .. } => "MemoryLatency",
             ChannelFsm::HostPipelineLatency { .. } => "HostPipelineLatency",
+            ChannelFsm::BdSwitchBubble { .. } => "BdSwitchBubble",
             ChannelFsm::Transferring { .. } => "Transferring",
             ChannelFsm::ReleasingLock { .. } => "ReleasingLock",
             ChannelFsm::BdChaining { .. } => "BdChaining",
@@ -176,6 +190,7 @@ impl ChannelFsm {
             | ChannelFsm::AcquiringLock { transfer, .. }
             | ChannelFsm::MemoryLatency { transfer, .. }
             | ChannelFsm::HostPipelineLatency { transfer, .. }
+            | ChannelFsm::BdSwitchBubble { transfer, .. }
             | ChannelFsm::Transferring { transfer } => Some(transfer),
             _ => None,
         }
@@ -188,6 +203,7 @@ impl ChannelFsm {
             | ChannelFsm::AcquiringLock { transfer, .. }
             | ChannelFsm::MemoryLatency { transfer, .. }
             | ChannelFsm::HostPipelineLatency { transfer, .. }
+            | ChannelFsm::BdSwitchBubble { transfer, .. }
             | ChannelFsm::Transferring { transfer } => Some(transfer),
             _ => None,
         }
@@ -207,6 +223,9 @@ impl fmt::Display for ChannelFsm {
             }
             ChannelFsm::HostPipelineLatency { cycles_remaining, .. } => {
                 write!(f, "HostPipelineLatency(cycles={})", cycles_remaining)
+            }
+            ChannelFsm::BdSwitchBubble { cycles_remaining, .. } => {
+                write!(f, "BdSwitchBubble(cycles={})", cycles_remaining)
             }
             ChannelFsm::Transferring { transfer } => {
                 write!(f, "Transferring({} bytes remaining)", transfer.remaining_bytes())
@@ -409,6 +428,9 @@ impl ChannelContext {
                 } else {
                     format!("AcquiringLock({})", lock_id)
                 }
+            }
+            ChannelFsm::BdSwitchBubble { cycles_remaining, .. } => {
+                format!("BdSwitchBubble({})", cycles_remaining)
             }
             ChannelFsm::MemoryLatency { cycles_remaining, .. } => {
                 format!("MemoryLatency({})", cycles_remaining)

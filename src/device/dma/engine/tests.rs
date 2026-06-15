@@ -942,6 +942,77 @@ fn test_self_chaining_bd_loops_indefinitely() {
     );
 }
 
+/// At each `next_bd` boundary, hardware deasserts PORT_RUNNING for a minimum
+/// 1-cycle bubble -- the BD-switch handshake (next_bd fetch + lock cycle) costs
+/// a cycle even on the prefetch fast path. NPU1 add_one memtile slot0 traces a
+/// clean `on16 off1 x4` for its four 16-word S2MM BD executions; slot4 (MM2S)
+/// shows the same `off1` bubbles. The emulator's chained-BD prefetch went
+/// straight to Transferring with NO inter-BD gap, so a chained transfer came
+/// out as one unbroken beat-run instead of per-BD runs separated by bubbles.
+///
+/// This drives the consumer/producer-side BD-switch bubble: a looping MM2S
+/// chain must show a gap in stream-beat production between consecutive BDs.
+#[test]
+fn chained_bd_inserts_port_running_bubble_at_each_boundary() {
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+    let mut host_mem = make_host_memory();
+
+    // BD0 -> BD1 -> BD0 ... each 64 bytes (16 words => multiple Transferring
+    // cycles per BD at 4 words/cycle), no locks (so the only inter-BD cost is
+    // the BD-switch bubble we are modeling).
+    engine.configure_bd(0, BdConfig::simple_1d(0x100, 64).with_next(1)).unwrap();
+    engine.configure_bd(1, BdConfig::simple_1d(0x200, 64).with_next(0)).unwrap();
+    engine.enqueue_task(2, 0, 0, false); // MM2S ch0, start BD0, self-looping chain
+
+    // Record stream beats produced per cycle (drain fully so MM2S never
+    // backpressures and adds gaps of its own).
+    let mut per_cycle_beats = Vec::new();
+    for _ in 0..160 {
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        let mut n = 0;
+        while engine.pop_stream_out().is_some() {
+            n += 1;
+        }
+        per_cycle_beats.push(n);
+    }
+
+    // Count "interior" zero-gaps: a run of zero-beat cycles bracketed by beats
+    // on both sides. The leading cold-start zeros are excluded (no beats before
+    // them); each remaining gap is a per-BD PORT_RUNNING bubble. With the
+    // prefetch fast path going straight to Transferring there are zero interior
+    // gaps (one unbroken run); the bubble must produce one per BD boundary.
+    let mut gap_widths = Vec::new();
+    let mut seen_beat = false;
+    let mut i = 0;
+    while i < per_cycle_beats.len() {
+        if per_cycle_beats[i] > 0 {
+            seen_beat = true;
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < per_cycle_beats.len() && per_cycle_beats[i] == 0 {
+            i += 1;
+        }
+        let beat_after = i < per_cycle_beats.len() && per_cycle_beats[i] > 0;
+        if seen_beat && beat_after {
+            gap_widths.push(i - start);
+        }
+    }
+    assert!(
+        gap_widths.len() >= 3,
+        "expected a PORT_RUNNING bubble at each BD boundary (>=3 interior gaps), got {}; per-cycle beats: {per_cycle_beats:?}",
+        gap_widths.len()
+    );
+    // Each bubble is exactly the default 1-cycle off1 -- not 2 (no double-count
+    // with the lock/grant cycle) and not wider.
+    assert!(
+        gap_widths.iter().all(|&w| w == 1),
+        "expected every BD-switch bubble to be exactly 1 cycle (HW off1), got widths {gap_widths:?}"
+    );
+}
+
 // === Stream Port Integration Tests ===
 
 #[test]
@@ -2038,20 +2109,19 @@ fn test_per_direction_channel() {
     assert_eq!(engine.per_direction_channel(11), 5);
 }
 
-/// Chained BDs with acquire+release locks on a private lock pair finish
-/// back-to-back with `interval == data_cycles` (no dead cycles between
-/// FINISHED_BD events). Matches HW behavior via three non-speculative
-/// pipelining optimizations:
-/// 1. Inline release on the last data cycle (bypass ReleasingLock).
-/// 2. Inline grant transition (collapse AcquiringLock{acq=true,cr=0}).
-/// 3. Inline first data cycle on the grant (run do_transfer_cycle in
-///    the same step the arbiter grants).
+/// Chained BDs with acquire+release locks on a private lock pair finish with
+/// `interval == data_cycles + bd_switch_bubble_cycles`. The #26 pipelining
+/// optimizations (inline release, inline grant, inline first-data) removed the
+/// EMU-only dead cycles -- correct -- but the inline-first-data step also
+/// hid the ONE real cycle HW keeps: the per-BD `next_bd`-fetch/lock-handshake
+/// bubble. NPU1 add_one memtile slot0 traces `on16 off1` per 16-word BD, i.e.
+/// a 17-cycle period; PORT_RUNNING cannot deassert (`off1`) without a no-beat
+/// cycle, and a no-beat cycle is by definition additive to BD throughput. So
+/// the HW interval is data+1, and `bd_switch_bubble_cycles` (default 1)
+/// restores it. (Set the env to 0 to recover the old back-to-back behavior.)
 ///
 /// For 2-word BDs (8 bytes, 1 Transferring cycle each) the FINISHED_BD
-/// interval is 1 (data only). Earlier EMU paid 4 cycles: 1 data + 1
-/// ReleasingLock + 1 grant + 1 acquired=true cooldown. See finding doc
-/// `2026-05-11-emu-chained-bd-spec-acquire-attempt.md` for the failed
-/// speculative attempts and the eventual non-speculative fix.
+/// interval is 1 data + 1 bubble = 2.
 #[test]
 fn chained_bd_lock_interval_baseline() {
     use crate::interpreter::state::EventType;
@@ -2104,17 +2174,17 @@ fn chained_bd_lock_interval_baseline() {
     );
     let interval = finished_bd_cycles[1] - finished_bd_cycles[0];
     assert_eq!(
-        interval, 1,
-        "chained-BD FINISHED_BD interval == data cycles (no dead cycles); \
-         matches HW. cycles={:?}",
+        interval, 2,
+        "chained-BD FINISHED_BD interval == data cycles (1) + BD-switch bubble (1); \
+         matches HW off1. cycles={:?}",
         finished_bd_cycles
     );
 }
 
-/// 4-BD chain of 16-word locked BDs. With all of #26's pipelining
-/// optimizations -- inline release on last data cycle, inline grant
-/// transition, AND inline first data cycle on grant -- the chained
-/// interval matches data cycles exactly (`16w / 4wpc = 4`).
+/// 4-BD chain of 16-word locked BDs. `16w / 4wpc = 4` data cycles per BD,
+/// plus the 1-cycle per-BD-switch bubble HW keeps (add_one slot0 `on16 off1`)
+/// => interval 5 per BD. #26's inline optimizations remove the EMU-only dead
+/// cycles but not this real `off1`.
 #[test]
 fn chained_bd_16w_lock_interval_diagnostic() {
     use crate::interpreter::state::EventType;
@@ -2186,8 +2256,8 @@ fn chained_bd_16w_lock_interval_diagnostic() {
     let intervals: Vec<u64> = finished_bd_cycles.windows(2).map(|w| w[1] - w[0]).collect();
     assert_eq!(
         intervals,
-        vec![4u64, 4, 4],
-        "16w chained-BD intervals match data cycles; FINISHED_BD cycles={:?}",
+        vec![5u64, 5, 5],
+        "16w chained-BD intervals = 4 data + 1 BD-switch bubble; FINISHED_BD cycles={:?}",
         finished_bd_cycles
     );
 }
@@ -2236,13 +2306,13 @@ fn chained_bd_no_lock_interval_diagnostic() {
         .collect();
     let intervals: Vec<u64> = finished_bd_cycles.windows(2).map(|w| w[1] - w[0]).collect();
     // 16w BD with wpc=4 = 4 data cycles. Without locks, enter_chained_bd
-    // returns Transferring directly (no AcquiringLock). The Transferring
-    // state's match arm runs do_transfer_cycle. With no transition
-    // overhead, interval = data cycles = 4.
+    // routes through the BD-switch bubble (BdSwitchBubble for 1 cycle) before
+    // Transferring, so interval = 4 data + 1 bubble = 5. The bubble is the
+    // same per-BD `off1` HW shows whether or not the BD carries locks.
     assert_eq!(
         intervals,
-        vec![4u64, 4, 4],
-        "no-lock chained-BD intervals; FINISHED_BD cycles={:?}",
+        vec![5u64, 5, 5],
+        "no-lock chained-BD intervals = 4 data + 1 bubble; FINISHED_BD cycles={:?}",
         finished_bd_cycles
     );
 }
