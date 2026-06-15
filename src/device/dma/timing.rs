@@ -196,6 +196,8 @@ impl DmaTimingConfig {
 /// Overlay DDR burst parameters from the environment onto a base.
 ///
 /// Reads (via `get`, so the parse is testable without touching process env):
+/// - `XDNA_EMU_DDR_PROFILE`         -> named calibrated base (`phoenix` =
+///   `AIE2_DDR_PHOENIX`; `off`/`none` = `DISABLED`); range vars below override it
 /// - `XDNA_EMU_DDR_BURST_WORDS`     -> both `burst_words_{min,max}` (degenerate /
 ///   fixed alias; set to non-zero `max` to enable)
 /// - `XDNA_EMU_DDR_BURST_WORDS_{MIN,MAX}`        -> each `burst_words_*` bound
@@ -210,6 +212,13 @@ impl DmaTimingConfig {
 /// base value. Enabling is opt-in: with no env set and a `DISABLED` base the
 /// result is `DISABLED` (uniform delivery).
 pub fn ddr_burst_from_env(base: BurstParams, get: impl Fn(&str) -> Option<String>) -> BurstParams {
+    // A named profile (XDNA_EMU_DDR_PROFILE) selects a calibrated base; explicit
+    // range vars below still override individual bounds.
+    let base = match get("XDNA_EMU_DDR_PROFILE").as_deref().map(str::trim) {
+        Some("phoenix") => BurstParams::AIE2_DDR_PHOENIX,
+        Some("off") | Some("none") => BurstParams::DISABLED,
+        _ => base,
+    };
     let parse = |key: &str| get(key).and_then(|v| v.trim().parse::<u16>().ok());
     // Single-value vars set BOTH bounds; _MIN/_MAX then override each bound.
     let bw = parse("XDNA_EMU_DDR_BURST_WORDS");
@@ -296,6 +305,30 @@ mod tests {
             "unset field keeps base"
         );
         assert_eq!(cfg2.first_access_latency, 7, "unset field keeps base");
+    }
+
+    #[test]
+    fn ddr_burst_profile_selects_calibrated_base_and_vars_override() {
+        use std::collections::HashMap;
+        // The phoenix profile selects the band-calibrated range.
+        let env: HashMap<&str, &str> = [("XDNA_EMU_DDR_PROFILE", "phoenix")].into_iter().collect();
+        let cfg = ddr_burst_from_env(BurstParams::DISABLED, |k| env.get(k).map(|s| s.to_string()));
+        assert!(cfg.enabled());
+        assert_eq!(cfg, BurstParams::AIE2_DDR_PHOENIX);
+
+        // Explicit range vars still override a profile bound.
+        let env2: HashMap<&str, &str> =
+            [("XDNA_EMU_DDR_PROFILE", "phoenix"), ("XDNA_EMU_DDR_BURST_WORDS_MAX", "60")]
+                .into_iter()
+                .collect();
+        let cfg2 = ddr_burst_from_env(BurstParams::DISABLED, |k| env2.get(k).map(|s| s.to_string()));
+        assert_eq!(cfg2.burst_words_min, 36, "profile min retained");
+        assert_eq!(cfg2.burst_words_max, 60, "explicit _MAX overrides profile");
+
+        // 'off' forces DISABLED even over a non-disabled base.
+        let env3: HashMap<&str, &str> = [("XDNA_EMU_DDR_PROFILE", "off")].into_iter().collect();
+        let cfg3 = ddr_burst_from_env(BurstParams::AIE2_DDR_PHOENIX, |k| env3.get(k).map(|s| s.to_string()));
+        assert!(!cfg3.enabled());
     }
 
     #[test]

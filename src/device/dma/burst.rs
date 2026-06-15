@@ -81,6 +81,30 @@ impl BurstParams {
         first_access_latency: 0,
     };
 
+    /// Band-calibrated stochastic Phoenix (NPU1 / LPDDR5) profile.
+    ///
+    /// Burst `[36,46]` words, inter-burst gap `[8,14]` cycles. Calibrated
+    /// 2026-06-15 (NPU1, FW 1.5.5.391) against a 100-run HW PORT_RUNNING capture
+    /// of `add_one_using_dma`: it band-matches the memtile receive-port cadence
+    /// distribution (HW slot0 5.65 +- 0.48 -> EMU 5.34 +- 0.47, both `[5,6]`;
+    /// HW slot4 7.26 +- 0.46 -> EMU 7.62 +- 0.49) while leaving the deterministic
+    /// send ports exact (slot1=8, slot5=4). Both stochastic slots land within 1
+    /// sigma; the residual (slot0 leans 5, slot4 leans 8) is the irreducible
+    /// single-range coupling -- the two slots have opposite burst-size gradients.
+    ///
+    /// This is a *DRAM-shaped* profile, not a universal constant: cadence depends
+    /// on the part's DDR timing under shared SoC traffic. It is **opt-in** (the
+    /// default is `DISABLED` / uniform); select it via `XDNA_EMU_DDR_PROFILE=phoenix`
+    /// or override any bound with the `XDNA_EMU_DDR_*` env vars. See
+    /// `docs/superpowers/specs/2026-06-15-ddr-stochastic-delivery-jitter.md`.
+    pub const AIE2_DDR_PHOENIX: BurstParams = BurstParams {
+        burst_words_min: 36,
+        burst_words_max: 46,
+        inter_burst_cycles_min: 8,
+        inter_burst_cycles_max: 14,
+        first_access_latency: 0,
+    };
+
     /// Whether the burst model is active. `burst_words_max == 0` means uniform
     /// delivery -- the gate is a no-op pass-through.
     #[inline]
