@@ -1,9 +1,38 @@
 # Stochastic DDR delivery jitter (task #140 close-out)
 
 **Date:** 2026-06-15
-**Status:** IN PROGRESS — steps 1-2 landed (PRNG range draws + seed/env wiring,
-commits `aa3fbae1`, `05d56cc3`); steps 3-5 (HW capture, calibrate, validate) are
-HW-gated. Design decisions resolved (§7).
+**Status:** IN PROGRESS — steps 1-4 landed (PRNG range draws + seed/env wiring +
+fresh 100-run HW capture + calibrated `AIE2_DDR_PHOENIX` profile). Step 5
+(bridge no-regress) is trivially satisfied by default-off; full lib suite green
+(3532). Design decisions resolved (§7).
+
+## Calibration outcome (2026-06-15)
+
+Fresh HW capture (step 3): 100 runs of `add_one_using_dma` on NPU1 (FW 1.5.5.391),
+`build/experiments/port-running-baseline/highN-2026-06-15/`. Distribution target:
+slot0 `{5:35%, 6:65%}` mean 5.65±0.48, slot4 `{7:72%, 8:27%}` mean 7.26±0.46,
+slot1=8 / slot5=4 deterministic.
+
+Calibrated (step 4) via `--emu` multirun sweep (the decoded-trace oracle — same
+decoder as HW; the BP `cycle_beat` probe is NOT a valid oracle, it disagrees by
+~2 bursts). Winner **`AIE2_DDR_PHOENIX` = burst `[36,46]`, gap `[8,14]`**
+(N=50 confirm):
+
+| slot | EMU | HW | |
+|------|-----|----|----|
+| slot0 | 5.34±0.47 `[5,6]` | 5.65±0.48 `[5,6]` | distinct exact, means <1σ |
+| slot4 | 7.62±0.49 `[7,8]` | 7.26±0.46 `[6,7,8]` | means <1σ, misses rare 6 |
+| slot1 | 8.00 | 8.00 | exact ✓ |
+| slot5 | 4.00 | 4.00 | exact ✓ |
+
+**Irreducible coupling:** slot0 and slot4 are both driven by the *same* burst
+range with *opposite* gradients (slot0 wants smaller bursts → more breaks; slot4
+wants larger), so no single range optimizes both. `[36,46]` sits on that Pareto
+frontier — both stochastic slots within 1σ, deterministic slots exact, and no
+out-of-HW-range outliers (a wider range gives slot4 its `[6,7,8]` spread but
+introduces slot0=3, which HW never produces — a worse artifact). Good enough for
+a ballpark, opt-in, per-DRAM profile (the spec's intent), not a claim of exact
+distribution match.
 **Supersedes:** the `ddr_burst_jitter_permille` ("deterministic jitter") knob
 sketched in `2026-06-14-ddr-burst-delivery-model.md` §4.1 — replaced here by a
 seeded-PRNG draw (Maya: "reproduce it by literal RNG").

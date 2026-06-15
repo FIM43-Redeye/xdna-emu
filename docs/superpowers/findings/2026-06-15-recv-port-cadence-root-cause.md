@@ -1,5 +1,15 @@
 # #140 cadence divergence: physical root-cause localization (two causes, not one)
 
+> **RESOLVED (2026-06-15): one cause — shim DDR jitter — closed by the stochastic
+> delivery model.** The cadence gap (slot0 AND slot4) is reproduced by a
+> seeded-PRNG DDR burst-delivery model, calibrated against a fresh 100-run HW
+> capture to the `AIE2_DDR_PHOENIX` profile (burst `[36,46]`, gap `[8,14]`):
+> slot0 5.34±0.47 vs HW 5.65±0.48, slot4 7.62±0.49 vs HW 7.26±0.46 (both within
+> 1σ; slot1/slot5 exact). Opt-in (default-off), per-DRAM-tunable. Full design,
+> calibration table, and the irreducible-coupling caveat in
+> `docs/superpowers/specs/2026-06-15-ddr-stochastic-delivery-jitter.md`. The
+> investigation below stands as the root-cause record.
+
 > **TOP / CURRENT (2026-06-15 cont., probe-confirmed — supersedes everything below).**
 > A per-cycle backpressure-chain probe (`XDNA_EMU_BP_PROBE`, end of
 > `coordinator::step`) on the in-process `add_one` run settled the contradictions
