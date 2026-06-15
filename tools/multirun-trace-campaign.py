@@ -124,11 +124,38 @@ def kbuild_paths(k: int) -> dict:
     return paths
 
 
-def make_schedule(ks: list[int], n_runs: int, seed: int) -> list[tuple[int, int]]:
+def kernel_build_paths(name: str) -> dict:
+    """Compute trace artifact paths for a named npu-xrt kernel (chess build).
+
+    `name` may include a subpath (e.g. '_diag_shim_chain_sweep/k8'). Used by
+    --kernels mode to characterize delivery-shaped kernels (memtile/shim DMA
+    cadence) for the #140 calibration baseline, alongside the K-sweep path.
+    """
+    base = MLIR_AIE_ROOT / "build" / "test" / "npu-xrt" / name / "chess"
+    paths = {
+        "xclbin": base / "aie.xclbin",
+        "instr":  base / "insts.bin",
+        "mlir":   base / "aie_arch.mlir.prj" / "input_with_addresses.mlir",
+    }
+    for pname, p in paths.items():
+        if not p.exists():
+            raise FileNotFoundError(f"kernel {name}: missing {pname} at {p}")
+    return paths
+
+
+def sanitize_label(name: str) -> str:
+    """Filesystem-safe per-iteration subdir label for a kernel name."""
+    return name.replace("/", "__")
+
+
+def make_schedule(items: list, n_runs: int, seed: int) -> list[tuple[int, object]]:
+    """Randomized (run_idx, item) schedule. `item` is a K int (K-sweep) or a
+    kernel-name str (--kernels); randomized ordering decorrelates the item from
+    run-order (thermal / FW-state) effects."""
     rng = random.Random(seed)
-    items = [(r, k) for r in range(1, n_runs + 1) for k in ks]
-    rng.shuffle(items)
-    return items
+    sched = [(r, it) for r in range(1, n_runs + 1) for it in items]
+    rng.shuffle(sched)
+    return sched
 
 
 def env_no_emu() -> dict:
@@ -153,10 +180,14 @@ def env_with_emu(runtime: str = "debug") -> dict:
     return env
 
 
-def run_one(run_idx: int, k: int, paths: dict, out_root: Path,
+def run_one(run_idx: int, item, label: str, paths: dict, out_root: Path,
             verbose: bool, emu: bool, emu_runtime: str) -> dict:
-    """One iteration: bridge-trace-runner + parse-trace.py."""
-    run_dir = out_root / f"run{run_idx:03d}" / f"k{k}"
+    """One iteration: bridge-trace-runner + parse-trace.py.
+
+    `item` is the schedule item (K int or kernel-name str); `label` is its
+    filesystem-safe subdir name (`k{K}` for K-sweep, sanitized name otherwise).
+    """
+    run_dir = out_root / f"run{run_idx:03d}" / label
     run_dir.mkdir(parents=True, exist_ok=True)
 
     trace_bin = run_dir / "trace_raw.bin"
@@ -210,7 +241,9 @@ def run_one(run_idx: int, k: int, paths: dict, out_root: Path,
 
     meta = {
         "run_idx": run_idx,
-        "k": k,
+        "k": item if isinstance(item, int) else None,
+        "kernel": item if isinstance(item, str) else None,
+        "label": label,
         "start_utc": t_start_wall,
         "end_utc": t_end_wall,
         "elapsed_s": round(elapsed, 3),
@@ -223,7 +256,7 @@ def run_one(run_idx: int, k: int, paths: dict, out_root: Path,
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
     if verbose:
         status = "OK " if meta["ok"] else "FAIL"
-        print(f"  [{status}] run{run_idx:03d}/k{k}: {elapsed*1000:.0f}ms "
+        print(f"  [{status}] run{run_idx:03d}/{label}: {elapsed*1000:.0f}ms "
               f"(run={run_us/1000:.0f}ms parse={parse_us/1000:.0f}ms "
               f"rc=r{rr.returncode}/p{pr_rc})")
     return meta
@@ -238,6 +271,12 @@ def main() -> int:
     ap.add_argument("--ks", default="1,2,4,8",
                     help="comma-separated K values (default 1,2,4,8; "
                          "k16 wedges on HW; should be safe on --emu)")
+    ap.add_argument("--kernels", default=None,
+                    help="comma-separated npu-xrt kernel names (e.g. "
+                         "'add_one_using_dma,vec_vec_add_memtile_init'). When "
+                         "set, characterizes these delivery-shaped kernels "
+                         "instead of the K-sweep (for #140 calibration "
+                         "baseline). Names may include subpaths.")
     ap.add_argument("--seed", type=int, default=42,
                     help="schedule shuffle seed (default 42)")
     ap.add_argument("--out-root", type=Path, default=DEFAULT_OUT_ROOT,
@@ -261,11 +300,17 @@ def main() -> int:
     if args.n_runs is None:
         args.n_runs = 1 if args.emu else 50
 
-    ks = [int(x) for x in args.ks.split(",")]
-    if 16 in ks:
-        print("WARN: K=16 wedges per 2026-05-25 dispatch-overhead finding "
-              "-- proceed anyway; this run will likely hang at K=16",
-              file=sys.stderr)
+    kernel_mode = args.kernels is not None
+    if kernel_mode:
+        items = [n.strip() for n in args.kernels.split(",") if n.strip()]
+        ks = []
+    else:
+        items = [int(x) for x in args.ks.split(",")]
+        ks = items
+        if 16 in ks:
+            print("WARN: K=16 wedges per 2026-05-25 dispatch-overhead finding "
+                  "-- proceed anyway; this run will likely hang at K=16",
+                  file=sys.stderr)
 
     # Verify prerequisites before launching.
     if not RUNNER.is_file() or not os.access(RUNNER, os.X_OK):
@@ -277,10 +322,16 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    # Resolve per-K artifacts once; any error aborts before the campaign.
-    paths_by_k = {}
-    for k in ks:
-        paths_by_k[k] = kbuild_paths(k)
+    # Resolve per-item artifacts once; any error aborts before the campaign.
+    paths_by_item = {}
+    labels = {}
+    for it in items:
+        if kernel_mode:
+            paths_by_item[it] = kernel_build_paths(it)
+            labels[it] = sanitize_label(it)
+        else:
+            paths_by_item[it] = kbuild_paths(it)
+            labels[it] = f"k{it}"
 
     session = args.session or utc_now_str()
     if args.emu and not session.endswith("-emu"):
@@ -288,7 +339,7 @@ def main() -> int:
     out_root = args.out_root / session
     out_root.mkdir(parents=True, exist_ok=True)
 
-    schedule = make_schedule(ks, args.n_runs, args.seed)
+    schedule = make_schedule(items, args.n_runs, args.seed)
 
     # On EMU mode, skip the xrt-smi probe entirely: no live HW state to
     # report, and we want to avoid any risk of the probe touching the
@@ -300,7 +351,9 @@ def main() -> int:
         "session_start_utc": datetime.now(timezone.utc).isoformat(),
         "mode": "emu" if args.emu else "hw",
         "emu_runtime": args.emu_runtime if args.emu else None,
+        "item_mode": "kernels" if kernel_mode else "ks",
         "ks": ks,
+        "kernels": items if kernel_mode else None,
         "n_runs": args.n_runs,
         "n_iterations": len(schedule),
         "seed": args.seed,
@@ -313,12 +366,16 @@ def main() -> int:
         "parse_trace_path": str(PARSE_TRACE),
         "trace_size_bytes": TRACE_SIZE,
         "out_root": str(out_root),
-        "kbuild_paths": {str(k): {n: str(p) for n, p in v.items()}
-                         for k, v in paths_by_k.items()},
+        "item_paths": {str(it): {n: str(p) for n, p in v.items()}
+                       for it, v in paths_by_item.items()},
     }
     (out_root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     (out_root / "schedule.json").write_text(json.dumps(
-        [{"order": i, "run_idx": r, "k": k} for i, (r, k) in enumerate(schedule)],
+        [{"order": i, "run_idx": r,
+          "k": it if isinstance(it, int) else None,
+          "kernel": it if isinstance(it, str) else None,
+          "label": labels[it]}
+         for i, (r, it) in enumerate(schedule)],
         indent=2,
     ))
 
@@ -326,7 +383,10 @@ def main() -> int:
     print(f"  session     : {session}")
     print(f"  mode        : {manifest['mode']}"
           + (f" ({args.emu_runtime})" if args.emu else ""))
-    print(f"  ks          : {ks}")
+    if kernel_mode:
+        print(f"  kernels     : {items}")
+    else:
+        print(f"  ks          : {ks}")
     print(f"  n_runs      : {args.n_runs}")
     print(f"  iterations  : {len(schedule)}")
     print(f"  out_root    : {out_root}")
@@ -344,12 +404,12 @@ def main() -> int:
     t0 = time.monotonic()
     n_ok = 0
     n_fail = 0
-    for i, (run_idx, k) in enumerate(schedule, 1):
+    for i, (run_idx, it) in enumerate(schedule, 1):
         if not args.quiet:
             pct = 100 * (i - 1) / len(schedule)
-            print(f"[{i}/{len(schedule)}] {pct:5.1f}% run={run_idx} k={k}",
+            print(f"[{i}/{len(schedule)}] {pct:5.1f}% run={run_idx} item={it}",
                   flush=True)
-        meta = run_one(run_idx, k, paths_by_k[k], out_root,
+        meta = run_one(run_idx, it, labels[it], paths_by_item[it], out_root,
                        verbose=not args.quiet,
                        emu=args.emu, emu_runtime=args.emu_runtime)
         if meta["ok"]:
