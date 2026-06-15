@@ -79,6 +79,30 @@ Full lib suite green (3515 + 2 new `cycle_beat` tests). Low blast radius.
    rather than a model bug. The stochastic comparator's level-event handling
    should account for it (interval/duration-aware, not raw count).
 
+## Fresh-decode verification (current code, both fixes)
+
+Re-decoded `add_one_using_dma` EMU with the `cycle_beat` fix via the in-tree
+decoder (same backend as the HW captures), to stand on verified ground rather
+than the earlier stale bridge artifact:
+
+| port | HW raw | HW iv | EMU raw | EMU iv | note |
+|------|-------:|------:|--------:|-------:|------|
+| PORT_RUNNING_1 | 16 | 8 | 8 | 8 | send port -- exact match |
+| PORT_RUNNING_5 |  8 | 4 | 4 | 4 | send port -- exact match |
+| PORT_RUNNING_0 | 11 | 6 | 4 | 3 | recv<-shim: 2->3 (burst gap) |
+| PORT_RUNNING_4 | 16 | 8 | 5 | 5 | recv<-compute: 1->5 (calibration) |
+
+Confirms the encoding reality empirically: **HW emits ~2 records per running
+pulse** (a same-soc begin/end pair from its ~1-cycle pulse), **current EMU emits
+1 record per running interval** (the assert; the held span renders as a single
+record through the in-tree decoder). This is a benign representation difference,
+not a behavioural mismatch -- interval counting normalises it, and the two
+send ports become exact matches. The `cycle_beat` fix is confirmed on fresh
+code (recv ports 1->5 and 2->3). Stochastic verdict on fresh EMU: 3-of-10 OUT
+(was 6-of-10 raw), all three now *under*-emission: PORT_RUNNING_0 (-4.4 sigma),
+PORT_RUNNING_4 (-3.0 sigma), STREAM_STARVATION_0 (-1.0 sigma). The earlier
+PORT_RUNNING_4 +3.9 sigma was stale-artifact noise (fresh is -3.0 sigma).
+
 ## Why deterministic (vs the stochastic STREAM_STARVATION)
 
 PORT_RUNNING toggling is governed by structural BD/buffer/lock-handshake
