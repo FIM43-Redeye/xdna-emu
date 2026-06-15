@@ -432,7 +432,7 @@ fn name_to_hw_id_and_module(name: &str) -> Option<(u8, TraceModule)> {
 /// (unknown or reserved names are treated as pulse events, which is the
 /// safe default -- over-counting edge comparisons is better than missing
 /// level-structure mismatches).
-fn is_level_event(name: &str) -> bool {
+pub(crate) fn is_level_event(name: &str) -> bool {
     match name_to_hw_id_and_module(name) {
         Some((hw_id, module)) => crate::trace::event_codes::is_level_event(hw_id, module),
         None => false,
@@ -676,7 +676,7 @@ fn find_edge_anchor(hw_events: &[TileEvent], emu_events: &[TileEvent], slot_name
 ///
 /// Groups consecutive cycles (delta <= 1) into (start, end) intervals.
 /// Non-consecutive firings produce separate intervals.
-fn events_to_intervals(cycles: &[i64]) -> Vec<(i64, i64)> {
+pub(crate) fn events_to_intervals(cycles: &[i64]) -> Vec<(i64, i64)> {
     if cycles.is_empty() {
         return Vec::new();
     }

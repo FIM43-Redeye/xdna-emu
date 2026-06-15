@@ -20,16 +20,18 @@
 //! stochastic emulator DDR model earns its keep by reproducing that variance.
 //! See `docs/superpowers/specs/2026-06-14-stochastic-aware-trace-comparison.md`.
 //!
-//! METRIC CAVEAT: this MVP compares raw event-*record* counts per slot. For
-//! occurrence/edge events (DMA START/FINISHED tasks) that is exactly the
-//! occurrence count. For *level* events (PORT_RUNNING, STREAM_STARVATION) the
-//! record count is the held-level frame count, which can differ from the
-//! semantic interval count (HW and EMU may encode the same intervals with a
-//! different number of frames). The EMU-vs-HW comparison is internally
-//! consistent (both raw), but for level events a future revision should band on
-//! the reconstructed interval count (as `compare`'s level analysis does) to
-//! separate encoding differences from behavioral ones. The band comparison
-//! still correctly ranks EMU against the HW distribution either way.
+//! METRIC: the per-slot count bands on the *semantically meaningful* quantity
+//! for each event class. EDGE/occurrence events (DMA START/FINISHED tasks) use
+//! the raw record count -- each record is a distinct firing. LEVEL events
+//! (PORT_RUNNING, the stall family, ...) use the reconstructed *interval* count
+//! (`compare::events_to_intervals`): HW and EMU encode the same held-level
+//! intervals with a different records-per-interval ratio (HW emits a sub-tick
+//! begin/end pair collapsing to one soc; EMU emits a single rising-edge
+//! record), so raw records would inject a uniform ~2x encoding factor that is
+//! not behaviour. Counting intervals removes it -- e.g. on add_one_using_dma
+//! the two encoding-only ports (PORT_RUNNING_1/_5) collapse from 16-vs-8 /
+//! 8-vs-4 raw to exact 8-vs-8 / 4-vs-4 interval matches, leaving only the real
+//! model gaps visible.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -123,15 +125,43 @@ fn mean_std(xs: &[usize]) -> (f64, f64) {
 /// PC-repeat-expansion artifact, not a delivery-timing signal. The stochastic
 /// band comparison is about mode-0 shim/memtile DMA-delivery events. (Same
 /// rationale as the mode-aware cycle-drift exclusion in `compare`.)
-fn count_by_slot(tiles: &super::compare::TileEvents) -> BTreeMap<(TileKey, u8), usize> {
-    let mut out: BTreeMap<(TileKey, u8), usize> = BTreeMap::new();
+///
+/// LEVEL events (PORT_RUNNING, the stall family, ...) are counted as
+/// reconstructed *intervals* rather than raw records: HW and EMU encode the
+/// same held-level intervals with a different records-per-interval ratio (HW
+/// emits a sub-tick begin/end pair that collapses to one soc; EMU emits a
+/// single rising-edge record). Banding on raw records would inject a uniform
+/// ~2x factor that is pure encoding, not behaviour. EDGE events keep their raw
+/// occurrence count (each record is a distinct firing). `config` supplies the
+/// slot->name table used to classify level vs edge.
+fn count_by_slot(
+    tiles: &super::compare::TileEvents,
+    config: &EventsConfig,
+) -> BTreeMap<(TileKey, u8), usize> {
+    // Gather abs_cycles per (key, slot) so level slots can be collapsed to
+    // interval counts; edge slots fall back to the raw cycle-list length.
+    let mut cycles: BTreeMap<(TileKey, u8), Vec<u64>> = BTreeMap::new();
     for (key, evs) in tiles {
         if key.pkt_type == 0 {
             continue;
         }
         for e in evs {
-            *out.entry((*key, e.slot)).or_insert(0) += 1;
+            cycles.entry((*key, e.slot)).or_default().push(e.abs_cycle);
         }
+    }
+
+    let mut out: BTreeMap<(TileKey, u8), usize> = BTreeMap::new();
+    for ((key, slot), mut cs) in cycles {
+        let names = names_for_pkt(config, key.pkt_type);
+        let name = super::compare::slot_name(slot, names);
+        let count = if super::compare::is_level_event(&name) {
+            cs.sort_unstable();
+            let ic: Vec<i64> = cs.iter().map(|&c| c as i64).collect();
+            super::compare::events_to_intervals(&ic).len()
+        } else {
+            cs.len()
+        };
+        out.insert((key, slot), count);
     }
     out
 }
@@ -220,13 +250,15 @@ pub fn compare_stochastic(
     let load =
         |p: &Path, cfg_out: &mut Option<EventsConfig>| -> Result<BTreeMap<(TileKey, u8), usize>, String> {
             let (mut tiles, cfg, _placement, _modes) = load_events_json(p)?;
-            if cfg_out.is_none() && has_names(&cfg) {
-                *cfg_out = Some(cfg);
-            }
             if remap_columns {
                 tiles = remap_tile_columns(&tiles);
             }
-            Ok(count_by_slot(&tiles))
+            // Classify level vs edge with this file's own slot_names.
+            let counts = count_by_slot(&tiles, &cfg);
+            if cfg_out.is_none() && has_names(&cfg) {
+                *cfg_out = Some(cfg);
+            }
+            Ok(counts)
         };
     let hw_runs: Vec<_> = hw_paths
         .iter()
@@ -323,6 +355,40 @@ mod tests {
 
     fn k(col: u8, row: u8, pt: u8, slot: u8) -> (TileKey, u8) {
         (TileKey { col, row, pkt_type: pt }, slot)
+    }
+
+    #[test]
+    fn count_by_slot_collapses_level_events_to_intervals() {
+        use crate::trace::compare::{TileEvent, TileEvents, TileKey};
+        let mut tiles: TileEvents = std::collections::HashMap::new();
+
+        // Memtile (pkt_type 3) slot 0 = PORT_RUNNING_0, a LEVEL event. Encode
+        // it HW-style: a sub-tick begin/end pair sharing one soc per pulse, so
+        // 3 pulses = 6 records over 3 distinct cycles -> 3 intervals.
+        let memtile = TileKey { col: 0, row: 1, pkt_type: 3 };
+        let mut mt_evs = Vec::new();
+        for c in [100u64, 100, 150, 150, 200, 200] {
+            mt_evs.push(TileEvent { slot: 0, abs_cycle: c });
+        }
+        tiles.insert(memtile, mt_evs);
+
+        // Shim (pkt_type 2) slot 0 = DMA_S2MM_0_START_TASK, an EDGE event: each
+        // record is a distinct firing, so the raw record count is the metric.
+        let shim = TileKey { col: 0, row: 0, pkt_type: 2 };
+        let sh_evs = [10u64, 20, 30, 40]
+            .iter()
+            .map(|&c| TileEvent { slot: 0, abs_cycle: c })
+            .collect();
+        tiles.insert(shim, sh_evs);
+
+        let cfg = EventsConfig {
+            memtile_events: vec!["PORT_RUNNING_0".into()],
+            shim_events: vec!["DMA_S2MM_0_START_TASK".into()],
+            ..Default::default()
+        };
+        let counts = count_by_slot(&tiles, &cfg);
+        assert_eq!(counts[&k(0, 1, 3, 0)], 3, "level slot collapses 6 begin/end records to 3 intervals");
+        assert_eq!(counts[&k(0, 0, 2, 0)], 4, "edge slot keeps its raw 4-record occurrence count");
     }
 
     #[test]
