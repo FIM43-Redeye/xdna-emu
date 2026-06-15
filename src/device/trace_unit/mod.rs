@@ -943,11 +943,26 @@ impl TraceUnit {
                 // `cycles==0` frame plus `Repeat` tokens. Design + HW reference:
                 // docs/superpowers/specs/2026-06-08-skip-token-held-level-encoding.md.
                 if active == 0 {
-                    // No mode-0 encoding exists for an empty snapshot, and HW emits
-                    // none either. Leave the decoder's currently-active level(s)
-                    // asserted; the next emitted frame deactivates them (HW's
-                    // close-at-next-event behavior). Do NOT advance the anchor --
-                    // the gap carries forward to that closing frame.
+                    // A held level deasserted with nothing coincident. HW emits
+                    // the hold's Repeat tokens at the drop (not deferred), then
+                    // closes the level at the following frame. Emit the skip run
+                    // for the hold's real duration now, advance the anchor to the
+                    // drop, and clear frame_held -- so a re-assertion re-opens via
+                    // the normal hold-open path, whose `Event(cyc=drop_gap),
+                    // Event(cyc=0)` IS the HW re-checkpoint that deactivates the
+                    // survivor and re-activates it, splitting a momentary drop
+                    // into two Repeat runs. (Previously a bare no-op return, which
+                    // merged drop+reassert into one continuous hold and
+                    // over-extended a pure-deassert close to the next event.)
+                    if self.frame_held != 0 {
+                        let hold = self.pending_cycle.saturating_sub(self.last_event_cycle);
+                        if hold > 1 {
+                            self.emit_skip_run(hold - 1);
+                        }
+                        self.last_event_cycle = self.pending_cycle;
+                        self.frame_held = 0;
+                        self.try_emit_packet();
+                    }
                     return;
                 }
                 let gap = self.pending_cycle.saturating_sub(self.last_event_cycle);

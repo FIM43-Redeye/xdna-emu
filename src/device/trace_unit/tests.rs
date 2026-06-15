@@ -221,6 +221,59 @@ fn pulse_during_hold_emits_close_frame() {
     );
 }
 
+/// Isolating test for P1 (encoder) vs P2 (timeline): given HW's exact
+/// re-pulse edges, does EMU's encoder reproduce HW's re-checkpoint structure?
+///
+/// HW's memtile PORT_RUNNING_0 holds with periodic 1-cycle drops, encoded as
+/// `Event(cyc=0), Repeat(14), Event(cyc=1), Event(cyc=0), Repeat(14)` -- each
+/// momentary deassert/reassert is re-checkpointed, splitting the hold into
+/// multiple Repeat runs with a `cyc>0` re-pulse frame between them.
+///
+/// This drives the encoder directly with a held level that drops for one
+/// cycle and reasserts, isolating the encoder from any timeline gap. A
+/// faithful encoder preserves the re-pulse (>=2 Repeat runs); the current
+/// encoder's `active==0 -> return` path merges the drop into one continuous
+/// hold (1 Repeat run).
+///
+/// P2 (the per-BD-switch bubble) now feeds 1-cycle re-pulses to the encoder, so
+/// this is live: the encoder must re-checkpoint the drop into >=2 Repeat runs
+/// the way HW does, rather than merging it into one continuous hold.
+#[test]
+fn held_level_repulse_is_recheckpointed_not_merged() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24)); // slot3=26 level
+    tu.notify_event(28, 0, None);
+    let start_len = tu.byte_buffer.len();
+
+    // Assert level (slot3) at cycle 10, hold 14 cycles.
+    tu.set_event_level(26, 10, true);
+    for c in 11..=24 {
+        tu.commit_cycle(c);
+    }
+    // Re-pulse: momentary 1-cycle drop (deassert@25, reassert@26).
+    tu.set_event_level(26, 25, false);
+    tu.commit_cycle(25);
+    tu.set_event_level(26, 26, true);
+    // Hold 14 more cycles, then close.
+    for c in 27..=40 {
+        tu.commit_cycle(c);
+    }
+    tu.set_event_level(26, 41, false);
+    tu.commit_cycle(41);
+
+    // Count Repeat runs: Repeat0 (0xE0..=0xEF) or Repeat1 (0xD8..=0xDB lead byte).
+    let body = &tu.byte_buffer[start_len..];
+    let repeat_runs = body.iter().filter(|&&b| (b & 0xF0) == 0xE0 || (b & 0xFC) == 0xD8).count();
+    assert!(
+        repeat_runs >= 2,
+        "re-pulse must be re-checkpointed into >=2 Repeat runs like HW, got \
+         {} run(s); body {:02x?}",
+        repeat_runs,
+        body
+    );
+}
+
 /// With no levels asserted (`held_mask == 0`) the held-level mechanism is
 /// inert: pulse-event encoding is byte-identical to the pre-held-mask encoder.
 #[test]
