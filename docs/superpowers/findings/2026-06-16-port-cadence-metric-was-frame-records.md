@@ -347,3 +347,61 @@ RUNNING/STALLED overlay); HW capture under
 **Open residual:** the small opening-timing difference (EMU one extra RUNNING
 burst; EMU first stall ~17cy vs HW ~27cy) -- a fine DMA/double-buffer-fill detail,
 not semantics. Steady-state (`~9-10cy` bursts, `~56-63cy` stalls) matches HW.
+
+## Confirm-first on the opening residual (2026-06-16 cont. 4)
+
+Maya pushed back on parking it at a threshold: byte-identical is the north star,
+and a *consumer-pacing* difference is concerning because it implies our **core**
+timing model is off, not just a DMA cosmetic. Agreed -- so we ran a confirm-first
+probe before any model change.
+
+**Hypothesis tested:** "EMU fills one compute input buffer before backpressuring;
+HW overlaps both (double-buffer)." If true, at the first slot4 (memtile MM2S0)
+stall the compute `in1_cons_prod_lock` would still be `1` (one buffer free).
+
+**Result: DISPROVEN.** Per-cycle XFORM probe (`build/experiments/gap140/xform_probe_exclfix.log`),
+compute tile (0,2), `c2lk[0]` = `objFifo_in1_cons_prod_lock` (init 2):
+
+```
+cyc=7937  s4=1 s4st=0   c2lk=[1,0,2,0]   slot4 RUNNING, in1_prod=1
+cyc=7954  s4=1 s4st=0   c2lk=[0,0,2,0]   in1_prod hits 0: S2MM took BOTH buffers
+cyc=7967  s4=1 s4st=0   c2lk=[0,1,1,0]   core consuming + producing (out_prod 2->1)
+cyc=7981  s4=0 s4st=1   c2lk=[0,1,1,0]   FIRST slot4 STALL, in1_prod=0
+```
+
+At the first stall `in1_prod = 0` -- **both** compute input buffers were already
+filled. EMU does exploit the double-buffer depth. The burst width is **not** gated
+by buffer count, because the core consumes concurrently (cons-lock and out-prod tick
+during the burst). The earlier "10 ~= 8+2 vs 19 ~= 16+3" arithmetic was coincidence.
+
+**The real residual is consumer-drain cadence.** Full HW `PORT_RUNNING_4` spans
+(two independent persisted silicon runs agree, `20260614` + `baseline-cycle-only`):
+
+```
+HW  durs: 8, 8, 14, 61, 19, 19      <- one 61cy contiguous burst at the opening (cyc 33->94)
+EMU durs: 17, 16, 10, 10, 10, 9, 18 <- broken into ~16/10cy bursts with backpressure stalls
+```
+
+HW pipelines nearly the whole 64-word transfer in one sustained burst once warm,
+because its core drains input buffers fast enough to keep accepting. EMU stalls
+when both compute buffers transiently fill -- i.e. EMU's core is not freeing input
+buffers at HW's opening-warmup rate.
+
+**Why this matters (Maya's point):** this is in tension with the prior conclusion
+"the core instruction timing is faithful." That conclusion was about *bundle-issue
+rate* and *lock function-call overhead* (both correct and HW-calibrated); it did
+**not** test whether the core's per-buffer **drain cadence** sustains a continuous
+downstream stream the way HW's does. The bridge comparator (raw re-checkpoint
+records) rates `PORT_RUNNING_4` 8/8 OK within +1cy, so this is sub-threshold -- but
+we don't want a threshold, we want identity.
+
+**Status: DOCUMENTED, next-session target.** Confirm-first paid off twice: it ruled
+out a non-fix (buffers are already overlapped) and pointed the frontier at the core.
+
+**Resume direction:** instrument the compute core's per-buffer drain cadence --
+cycles from `in1_cons_cons_lock` acquire to `in1_cons_prod_lock` release per 8-word
+buffer -- and diff EMU vs HW across the opening warmup. The question is whether
+EMU's core frees input buffers at HW's rate before steady-state, or whether a
+warmup/pipeline-fill effect lets HW's core run ahead. Artifacts on disk:
+`build/experiments/gap140/{xform_probe_exclfix.log, disambig_stalled.py}`;
+HW refs `build/bridge-test-results/{20260614,baseline-cycle-only}/add_one_using_dma.chess.hw/`.
