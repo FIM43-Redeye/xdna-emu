@@ -187,19 +187,18 @@ pub struct TraceUnit {
     /// `cycles==0` + Repeat. See
     /// `docs/superpowers/specs/2026-06-08-skip-token-held-level-encoding.md`.
     frame_held: u8,
-    /// True iff the currently-open lone hold was opened across an idle gap
-    /// (`gap > 0`), which emits a *two-frame* open: a position frame carrying
-    /// the gap, then a separate `cycles=0` arming frame. The extra arming frame
-    /// advances the upstream decoder one uncompensated cycle past the level's B
-    /// mark, so the closing skip-run for that hold must cover `D - 2` cycles
-    /// rather than `D - 1`. A `gap == 0` open folds position+arm into one frame
-    /// and needs no correction. Set at the lone-hold open; consumed (and
-    /// cleared) at the lone close. Any intervening re-checkpoint
-    /// (held-across-gap continuation) clears it -- the correction is scoped to
-    /// the pure open->close case, the one with HW evidence (#140 RUN_1 spans).
-    /// See `docs/superpowers/specs/2026-06-08-skip-token-held-level-encoding.md`
-    /// (the "settle empirically" `-1` offset note).
-    hold_opened_with_gap: bool,
+    /// Decoder-timeline skew the encoder owes the decoder, in cycles. Upstream
+    /// advances its timer `+1` for every frame, so any *extra* frame the encoder
+    /// emits beyond the one that positions a level's B mark -- the `cycles=0`
+    /// arming frame after a gap-positioned open, or the held-only close frame
+    /// `close_pulses_during_hold` emits -- pushes the decoder one cycle past the
+    /// logical timeline. That debt is paid down at the next skip-run
+    /// (`emit_skip_run_paying_debt`), which covers that many fewer cycles, so
+    /// the decoded spans stay exact regardless of how many re-checkpoints a hold
+    /// survives. Left unpaid, the skew accumulates across concurrent levels and
+    /// inflates every held span (#140 PORT_RUNNING +1/+2/+3 over-count). See
+    /// `docs/superpowers/specs/2026-06-08-skip-token-held-level-encoding.md`.
+    skip_debt: u64,
     /// PC value associated with the most recent event in `pending_cycle`
     /// (mode 1 only). Mode 0 ignores this field entirely.
     pending_pc: u32,
@@ -280,7 +279,7 @@ impl TraceUnit {
             pending_slot_mask: 0,
             held_mask: 0,
             frame_held: 0,
-            hold_opened_with_gap: false,
+            skip_debt: 0,
             pending_pc: 0,
             pc_truncate_warnings: 0,
             no_pc_warnings: 0,
@@ -971,13 +970,12 @@ impl TraceUnit {
                     if self.frame_held != 0 {
                         let hold = self.pending_cycle.saturating_sub(self.last_event_cycle);
                         if hold > 1 {
-                            // A gap-opened hold paid an extra arming-frame cycle
-                            // at open (see `hold_opened_with_gap`); cover one
-                            // fewer cycle here so the decoded span equals `hold`.
-                            let extra = self.hold_opened_with_gap as u64;
-                            self.emit_skip_run(hold - 1 - extra);
+                            // The closing frame's implicit +1 supplies the final
+                            // hold cycle, so the run is `hold - 1` -- less any
+                            // skew debt this hold accrued (e.g. a gap-positioned
+                            // open's arming frame).
+                            self.emit_skip_run_paying_debt(hold - 1);
                         }
-                        self.hold_opened_with_gap = false;
                         self.last_event_cycle = self.pending_cycle;
                         self.frame_held = 0;
                         self.try_emit_packet();
@@ -989,18 +987,16 @@ impl TraceUnit {
                     // A level was held across the gap: cover it with skip tokens so
                     // upstream keeps survivors active, then emit this frame at
                     // cycles=0. The closing frame's implicit +1 supplies the final
-                    // hold cycle, so the run is `gap - 1` (matches HW: a 6354-cycle
-                    // hold -> 6353 cycles of Repeat).
+                    // hold cycle, so the run is `gap - 1` -- less any skew debt
+                    // accrued since the last skip-run (a gap-positioned open's arm
+                    // frame, or a prior held-only close frame). This is the
+                    // re-checkpoint's chance to settle the debt; left unpaid it
+                    // would inflate every concurrent held span.
                     if gap > 1 {
-                        self.emit_skip_run(gap - 1);
+                        self.emit_skip_run_paying_debt(gap - 1);
                     }
                     self.emit_event_frame(active, 0);
                     self.close_pulses_during_hold(pulses);
-                    // A re-checkpoint re-anchors the timeline (its own arming
-                    // frame is balanced by the `gap - 1` run above); the prior
-                    // gap-open correction no longer applies to the eventual
-                    // close, so fall back to the uncorrected path.
-                    self.hold_opened_with_gap = false;
                 } else if self.held_mask != 0 {
                     // Opening a hold (no level was held across the gap). With an
                     // idle gap, position+activate with the gap in the cycles field
@@ -1010,12 +1006,13 @@ impl TraceUnit {
                     // suffices.
                     if gap > 0 {
                         self.emit_event_frame(active, gap);
-                        // Two-frame open: the separate arming frame below adds
-                        // an uncompensated decoder cycle; the lone close must
-                        // shorten its skip-run by 1 to keep the span exact.
-                        self.hold_opened_with_gap = true;
-                    } else {
-                        self.hold_opened_with_gap = false;
+                        // Two-frame open: the `cycles=0` arming frame below is an
+                        // extra frame beyond the one that positioned/activated B,
+                        // so it advances the decoder one cycle the logical
+                        // timeline lacks. Record the debt; the next skip-run pays
+                        // it. (A gap==0 open folds position+arm into one frame and
+                        // accrues no debt.)
+                        self.skip_debt += 1;
                     }
                     self.emit_event_frame(active, 0);
                     self.close_pulses_during_hold(pulses);
@@ -1108,6 +1105,27 @@ impl TraceUnit {
     fn close_pulses_during_hold(&mut self, pulses: u8) {
         if pulses != 0 && self.held_mask != 0 {
             self.emit_event_frame(self.held_mask, 0);
+            // This held-only frame is an extra frame at the same edge -- it
+            // advances the decoder one cycle the logical timeline lacks. Owe it;
+            // the next skip-run pays it (see `emit_skip_run_paying_debt`).
+            self.skip_debt += 1;
+        }
+    }
+
+    /// Emit a skip run of `cycles` cycles, first settling any `skip_debt` the
+    /// encoder owes the decoder. Each unit of debt is an extra frame already
+    /// emitted that advanced the decoder timer one cycle beyond the logical
+    /// timeline, so the run covers that many fewer cycles. If the debt exceeds
+    /// this run it is absorbed in full (no Repeat emitted) and the remainder
+    /// carries to the next run -- the skew is global to the decoder timeline,
+    /// not scoped to one hold.
+    fn emit_skip_run_paying_debt(&mut self, cycles: u64) {
+        if self.skip_debt >= cycles {
+            self.skip_debt -= cycles;
+        } else {
+            let paid = cycles - self.skip_debt;
+            self.skip_debt = 0;
+            self.emit_skip_run(paid);
         }
     }
 

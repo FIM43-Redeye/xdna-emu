@@ -372,6 +372,40 @@ fn gap_opened_lone_hold_skip_run_is_d_minus_2() {
     );
 }
 
+/// The gap-open's extra arming frame injects a +1 decoder-timeline skew that
+/// must be paid down at the NEXT skip-run regardless of which path emits it --
+/// not only the lone close. When a second level joins (a held-across-gap
+/// re-checkpoint) before the first closes, that continuation's skip-run is the
+/// next one and must absorb the debt: `Repeat(gap - 2)`, not `Repeat(gap - 1)`.
+/// Otherwise the skew survives and inflates the held span (the #140 concurrent
+/// PORT_RUNNING +1/+2/+3 over-count). Mirror of the lone-hold `D-2` rule for the
+/// concurrent path.
+#[test]
+fn gap_opened_hold_pays_skew_debt_on_continuation_skip_run() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24)); // start=28, stop=29
+    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24)); // slot1=38, slot2=39
+    force_start(&mut tu, 28);
+    let start_len = tu.byte_buffer.len();
+
+    // slot1 gap-opens at cycle 10 (gap 10), then slot2 joins at cycle 20 while
+    // slot1 is still held (a held-across-gap re-checkpoint, gap 10).
+    tu.set_event_level(38, 10, true);
+    tu.set_event_level(39, 20, true);
+
+    let body = &tu.byte_buffer[start_len..];
+    // position Single0(slot1,10)=0x1A; arm Single0(slot1,0)=0x10;
+    // continuation Repeat0(8)=0xE8 (gap 10 - 1 baseline - 1 debt); then the
+    // re-checkpoint Multiple0[1,2] cyc=0 = [0xC0, 0x60].
+    // Pre-fix the continuation emitted Repeat0(9)=0xE9 (debt dropped).
+    assert_eq!(
+        body,
+        &[0x1A, 0x10, 0xE8, 0xC0, 0x60],
+        "continuation skip-run after a gap-open must pay the +1 debt (Repeat0(8)), got {:02x?}",
+        body
+    );
+}
+
 #[test]
 fn test_single1_encoding() {
     let mut tu = TraceUnit::new(0, 2);
