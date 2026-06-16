@@ -405,3 +405,96 @@ EMU's core frees input buffers at HW's rate before steady-state, or whether a
 warmup/pipeline-fill effect lets HW's core run ahead. Artifacts on disk:
 `build/experiments/gap140/{xform_probe_exclfix.log, disambig_stalled.py}`;
 HW refs `build/bridge-test-results/{20260614,baseline-cycle-only}/add_one_using_dma.chess.hw/`.
+
+## Root cause found via HW event sweep (2026-06-16 cont. 5)
+
+The cont.4 resume direction (instrument core drain cadence) was pursued and the
+**core hypothesis was disproven** -- then an HW event sweep pinned the real bug
+in the trace-unit encoder. Full chain below.
+
+### Core is faithful -- "too slow" disproven
+
+Measured the compute core's per-buffer drain cadence directly from the
+compute-tile (0,2) locks (`build/experiments/gap140/drain_cadence.py` on the
+XFORM probe): the core acquires a fresh input buffer every **~64-71 cycles**
+(~67cy/buffer). End-to-end, **HW total kernel span ~666cy vs EMU ~614cy** -- EMU
+is if anything *slightly faster*. The core throughput matches HW. The
+consumer-pacing residual is **not** a core-timing-fidelity problem.
+
+### HW event-selection confound (Maya's catch)
+
+The earlier HW captures showed `PORT_STALLED_*=0`, which looked like "HW never
+stalls the port." That was an **event-selection artifact**: the memtile trace
+unit has 8 event slots and those runs only ever selected `PORT_RUNNING_*`, never
+`PORT_STALLED_*` (id 97 vs 96 -- distinct slots). This is exactly what the trace
+**sweep** pipeline exists for: rotate the event selection across batches so every
+event on every tile gets HW-recorded, then merge. HW is the cheap fast oracle
+here (full 161-event memtile sweep ran in **4.65s**); EMU is the thing under
+test and cannot validate methodology (see memory `feedback_hw_is_the_cheap_oracle_not_emu`).
+
+Ran `tools/trace-sweep.py --tiles 0:1:memtile` on `add_one_using_dma` (HW arm).
+Batch 12 selected `[PORT_RUNNING_4, PORT_STALLED_4, ...]` together -> HW recorded
+**PORT_RUNNING_4 x4 AND PORT_STALLED_4 x4** in one run. So **HW does assert
+PORT_STALLED under backpressure** (H-A); EMU emitting STALLED is correct.
+Artifacts: `build/experiments/gap140/sweep-port4-hw/`.
+
+### The hardware law: sum(PORT_RUNNING) == words
+
+Decoded the sweep batches through the same perfetto-span lens as EMU (pairing
+B/E by pid=tile/tid=slot; names are empty so identity is positional --
+`build/experiments/gap140/be_spans.py`). **Every HW port asserts PORT_RUNNING for
+exactly 64 cycles == the 64-word transfer, at 1 cycle/word (AXI4-Stream rate):**
+
+```
+HW  RUNNING_0 (shim->MT in):     4x16        = 64
+HW  RUNNING_1 (compute->MT out): 8x8         = 64
+HW  RUNNING_4 (MT->compute in):  8,8,14,2,14,2,6,8,2 = 64   (fragmented by backpressure)
+HW  RUNNING_5 (MT->shim out):    4x16        = 64
+```
+
+Fragmentation differs per port (BD/buffer structure + backpressure) but the SUM
+is always exactly the word count. **EMU violates it on every port:**
+
+```
+EMU RUNNING_0 = 71   RUNNING_1 = 187   RUNNING_4 = 90   RUNNING_5 = 156
+EMU RUNNING_1 durs = [8,8,8,11,76,76]   RUNNING_5 durs = [16,16,62,62]
+```
+
+### Three-layer localization -> the encoder, not the signal or decoder
+
+1. **Not the core / DMA timing** -- total runtime matches (above).
+2. **Not the `cycle_beat` signal.** Reconstructed the RUNNING high-periods
+   straight from the edges fed to the encoder (the XEDGE probe in
+   `coordinator.rs:1129`): **ep1 input sum = 64, ep5 input sum = 64** -- exactly
+   correct. The deassert edges ARE computed and fed in. (`coordinator.rs:1114`
+   already reads `port.cycle_beat`, not `cycle_active` -- a prior fix.)
+3. **Not the decoder.** HW and EMU share `aie.utils.trace.parse_trace`; the
+   same decoder renders HW's buffer as a clean 64.
+
+Therefore: a **correct 64-cycle signal goes into EMU's trace-unit encoder and a
+187-cycle span comes out of the decoder.** The defect is in the **skip-token
+held-level frame encoding** (`commit_pending_frame`,
+`src/device/trace_unit/mod.rs:926`; spec
+`docs/superpowers/specs/2026-06-08-skip-token-held-level-encoding.md`). Pairs of
+RUNNING spans merge across their deassert->reassert gap: ep1's last four clean
+8-cycle spans `(8284,8292)(8348,8356)(8419,8427)(8483,8491)` decode as two
+~76-cycle blobs `(8284..8356)(8419..8491)`. The deassert edges are emitted into
+`set_event_level(active=false)` but lost in the encoding.
+
+**Secondary (smaller):** slot-4's signal itself reads ~70 vs 64 -- a mild
+`cycle_beat` over-count on the memtile->compute feed port, plausibly the
+"2-stage relay fill" residual from the recent stream-rate commits (67987db3).
+Minor next to the encoder inflation; revisit after the encoder fix.
+
+### Regression oracle + status
+
+The sweep handed us a clean ground-truth oracle: **`sum(PORT_RUNNING spans) ==
+words` per port.** A fix is validated when every EMU port sums to 64 and the
+full level-event sweep shows no other regression. **Status: root cause
+localized, recording before encoder surgery (shared infra, blast radius across
+all level events).** Fix not yet implemented.
+
+Artifacts on disk (`build/experiments/gap140/`): `sweep-port4-hw/` (full 161-event
+HW memtile sweep + decoded batches), `drain_cadence.py`, `be_spans.py`,
+`port4_timeline.py`, `xform_probe_exclfix.log`. HW span refs in
+`sweep-port4-hw/add_one_using_dma.chess.multitile.work/b1{0,2}.trace_hw.perfetto.json`.
