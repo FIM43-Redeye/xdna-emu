@@ -920,6 +920,15 @@ impl DmaEngine {
         // memory bus width).
         let words_per_cycle = if self.tile_kind.is_shim() && transfer.involves_host_memory() {
             self.timing_config.shim_words_per_cycle as usize
+        } else if transfer.direction == TransferDirection::MM2S
+            && std::env::var_os("XDNA_EMU_MM2S_1WORD").is_some()
+        {
+            // Experiment scaffolding (#140 Move B, Lever 1): AXI4-Stream egress
+            // is physically 1 beat (32-bit word) per cycle. The memory-side read
+            // is 4/cyc, but the fabric egress is metered. Gated test of whether
+            // 1-word/cyc egress rate-matches the consumer to the 1-word/cyc
+            // producer refill and restores HW's slot4 early-gap shape.
+            1
         } else {
             self.timing_config.words_per_cycle as usize
         };

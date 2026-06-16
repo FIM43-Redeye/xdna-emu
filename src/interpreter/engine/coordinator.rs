@@ -1121,6 +1121,17 @@ impl InterpreterEngine {
                         // trace unit records only the levels mapped to a slot,
                         // so emitting both is harmless when only one is traced.
                         if cur_active != prev_active {
+                            // XFORM edge log (#140): the exact PORT_RUNNING level
+                            // edges fed to the trace-unit encoder for the memtile.
+                            // If a continuously-beating port emits just 1 assert +
+                            // 1 deassert here but decodes to N>1 sub-bursts, the
+                            // transform is in the encode/decode, not the signal.
+                            if tt.is_mem() && std::env::var_os("XDNA_EMU_XFORM_PROBE").is_some() {
+                                eprintln!(
+                                    "[XEDGE] cyc={cycle} memtile ep{event_port} PORT_RUNNING={}",
+                                    cur_active as u8
+                                );
+                            }
                             port_events.push((idx, running_hw(event_port), Some(cur_active), tt));
                             port_events.push((idx, idle_hw(event_port), Some(!cur_active), tt));
                         }
@@ -1156,6 +1167,75 @@ impl InterpreterEngine {
             }
             for (idx, event_port, active, stalled, tlast) in prev_updates {
                 self.device.array.tiles[idx].prev_port_state[event_port as usize] = (active, stalled, tlast);
+            }
+        }
+
+        // XFORM_PROBE (#140 Move B): memtile (0,1) double-buffer transform
+        // timeline. Default-off scaffolding (XDNA_EMU_XFORM_PROBE). Per cycle,
+        // dump slot0/slot4 port beats + every active memtile DMA channel's
+        // progress + the in0 objfifo lock values, so the buffer-fill -> re-emit
+        // reshaping is directly observable. Remove when the Move-B fidelity
+        // work lands.
+        if std::env::var_os("XDNA_EMU_XFORM_PROBE").is_some() {
+            let cyc = self.total_cycles;
+            // Auto-detect the active memtile column: the FFI/plugin path places
+            // the kernel at a different column than the in-process path (the
+            // decoded trace shows it at col 1), so scan for the memtile (row 1)
+            // whose DMA has a live transfer this run rather than hardcoding col 0.
+            let probe_col = (0..self.cols as u8)
+                .find(|&c| {
+                    self.device
+                        .array
+                        .dma_engine(c, 1)
+                        .map_or(false, |e| (0u8..12).any(|ch| e.get_transfer(ch).is_some()))
+                })
+                .unwrap_or(0);
+            let mt = self.device.array.tile(probe_col, 1);
+            let beat = |ep: usize| -> i32 {
+                match mt.event_port_selection.get(ep).copied().flatten() {
+                    Some((pi, true)) => {
+                        mt.stream_switch.masters.get(pi as usize).map_or(-1, |p| p.cycle_beat as i32)
+                    }
+                    Some((pi, false)) => {
+                        mt.stream_switch.slaves.get(pi as usize).map_or(-1, |p| p.cycle_beat as i32)
+                    }
+                    None => -1,
+                }
+            };
+            let s0 = beat(0);
+            let s4 = beat(4);
+            let mut chans = String::new();
+            if let Some(eng) = self.device.array.dma_engine(probe_col, 1) {
+                for ch in 0u8..12 {
+                    if let Some(t) = eng.get_transfer(ch) {
+                        chans.push_str(&format!(" ch{}={}/{}", ch, t.bytes_transferred, t.total_bytes));
+                    }
+                }
+            }
+            let locks: Vec<i8> = mt.locks.iter().take(8).map(|l| l.value).collect();
+            // Compute (0,2) consumer side: input-objfifo locks (prod=lock0,
+            // cons=lock1), input S2MM fill, output MM2S drain, and whether the
+            // core executed this cycle. The HW-faithful invariant is that the
+            // core HOLDS cons_lock during its ~N-cycle add loop (prod_lock not
+            // yet ++), so with both buffers full (prod_lock==0) the compute S2MM
+            // must stall -- that stall is what backpressures memtile MM2S (slot4).
+            let c2 = self.device.array.tile(probe_col, 2);
+            let c2_locks: Vec<i8> = c2.locks.iter().take(4).map(|l| l.value).collect();
+            let mut c2_chans = String::new();
+            if let Some(eng) = self.device.array.dma_engine(probe_col, 2) {
+                for ch in 0u8..4 {
+                    if let Some(t) = eng.get_transfer(ch) {
+                        c2_chans.push_str(&format!(" c2ch{}={}/{}", ch, t.bytes_transferred, t.total_bytes));
+                    }
+                }
+            }
+            let c2_idx = probe_col as usize * self.rows + 2;
+            let c2_act = self.cores.get(c2_idx).map_or(false, |c| c.active_this_cycle);
+            if s0 == 1 || s4 == 1 || !chans.is_empty() || !c2_chans.is_empty() {
+                eprintln!(
+                    "[XFORM] col={probe_col} cyc={cyc} s0={s0} s4={s4}{chans} mtlk={locks:?} | c2act={} c2lk={c2_locks:?}{c2_chans}",
+                    c2_act as u8
+                );
             }
         }
 

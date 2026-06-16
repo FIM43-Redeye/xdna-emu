@@ -213,9 +213,18 @@ impl DmaEngine {
         }
         let master = crate::device::dma::burst::master_seed();
         let (col, row) = (self.col, self.row);
+        // Experiment scaffolding (#140 Move-B discriminating test): an optional
+        // scripted delivery sequence (XDNA_EMU_DDR_SCRIPT="b0:g0,b1:g1,...")
+        // overrides the [min,max] draws so a non-uniform HW-shaped slot0 delivery
+        // can be injected. Only the shim host-read gate acts on it, but seeding
+        // all gates is harmless. Remove with the XFORM_PROBE when Move B lands.
+        let script = crate::device::dma::burst::ddr_script_from_env();
         for (ch, c) in self.channels.iter_mut().enumerate() {
             c.ddr_burst_gate
                 .set_seed(crate::device::dma::burst::channel_seed(master, col, row, ch as u8));
+            if let Some(seq) = &script {
+                c.ddr_burst_gate.set_script(seq.clone());
+            }
         }
     }
 

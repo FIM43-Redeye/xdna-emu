@@ -159,6 +159,27 @@ pub fn master_seed() -> u64 {
     })
 }
 
+/// Parse a scripted delivery sequence from `XDNA_EMU_DDR_SCRIPT` (experiment
+/// scaffolding; see [`BurstGate::set_script`]). Format: comma-separated
+/// `burst_words:gap_cycles` pairs, e.g. `"11:16,11:16,11:7,11:9,10:13,10:0"`.
+/// Returns `None` when unset or unparseable (the stochastic range model stays
+/// in effect). Whitespace around tokens is tolerated.
+pub fn ddr_script_from_env() -> Option<Vec<(u16, u16)>> {
+    let raw = std::env::var("XDNA_EMU_DDR_SCRIPT").ok()?;
+    let seq: Vec<(u16, u16)> = raw
+        .split(',')
+        .filter_map(|tok| {
+            let (b, g) = tok.trim().split_once(':')?;
+            Some((b.trim().parse().ok()?, g.trim().parse().ok()?))
+        })
+        .collect();
+    if seq.is_empty() {
+        return None;
+    }
+    log::info!("DDR burst-delivery SCRIPT active ({} pairs): {seq:?}", seq.len());
+    Some(seq)
+}
+
 /// Per-channel PRNG seed: the master seed diffused with `(col,row,channel)` so
 /// every channel's delivery jitter decorrelates while staying reproducible from
 /// the single master seed.
@@ -184,6 +205,16 @@ pub struct BurstGate {
     /// PRNG state. Seeded per-channel (see [`set_seed`](Self::set_seed)); `0`
     /// (the default) is a valid fixed seed, used until a seed is wired in.
     rng_state: u64,
+    /// Experiment scaffolding (#140 Move-B discriminating test,
+    /// `XDNA_EMU_DDR_SCRIPT`): a fixed `(burst_words, gap_cycles)` sequence that
+    /// *replaces* the `[min,max]` draws, so a non-uniform, HW-shaped delivery can
+    /// be injected to test whether a correct slot0 yields a correct slot4 on its
+    /// own (transform-faithfulness check). `None` (the default) keeps the
+    /// stochastic range model untouched, bit-for-bit. Remove with the
+    /// `XFORM_PROBE` when Move B lands.
+    script: Option<Vec<(u16, u16)>>,
+    /// Cursor into `script`; the index of the burst currently being delivered.
+    script_idx: usize,
 }
 
 impl BurstGate {
@@ -205,8 +236,18 @@ impl BurstGate {
     /// re-roll DDR randomness, and preserving it keeps resume reproducible.
     pub fn reset(&mut self) {
         let seed = self.rng_state;
+        let script = self.script.take();
         *self = Self::default();
         self.rng_state = seed;
+        self.script = script; // script_idx resets to 0: a fresh session replays it
+    }
+
+    /// Install a scripted `(burst_words, gap_cycles)` delivery sequence
+    /// (experiment scaffolding; see the `script` field). Replaces the `[min,max]`
+    /// draws for this gate until `reset`/replacement; the cursor starts at 0.
+    pub fn set_script(&mut self, seq: Vec<(u16, u16)>) {
+        self.script = Some(seq);
+        self.script_idx = 0;
     }
 
     /// Draw an inclusive `[min, max]` value. `max <= min` returns `min` (the
@@ -237,18 +278,36 @@ impl BurstGate {
         if !self.armed {
             self.armed = true;
             self.gap_left = p.first_access_latency;
-            self.burst_left = self.draw(p.burst_words_min, p.burst_words_max);
+            self.burst_left = match &self.script {
+                // Scripted: the first burst is script[0] (cursor stays at 0).
+                Some(seq) => seq.first().map_or(u16::MAX, |&(b, _)| b),
+                None => self.draw(p.burst_words_min, p.burst_words_max),
+            };
         }
         if self.gap_left > 0 {
             self.gap_left -= 1;
             return 0;
         }
         if self.burst_left == 0 {
-            // Burst exhausted: redraw the next burst size, then open an
-            // inter-burst gap (also drawn), consuming one of its cycles now
+            // Burst exhausted: open the inter-burst gap belonging to the burst
+            // just finished, then arm the next burst. Consume one gap cycle now
             // (this cycle is the first idle cycle).
-            self.burst_left = self.draw(p.burst_words_min, p.burst_words_max);
-            let gap = self.draw(p.inter_burst_cycles_min, p.inter_burst_cycles_max);
+            let gap = if self.script.is_some() {
+                // Scripted: gap of the current index, then advance to the next
+                // (burst, gap) pair. Past the script end, deliver freely.
+                let idx = self.script_idx;
+                let g = self.script.as_ref().unwrap().get(idx).map_or(0, |&(_, gap)| gap);
+                self.script_idx += 1;
+                self.burst_left =
+                    self.script.as_ref().unwrap().get(self.script_idx).map_or(u16::MAX, |&(b, _)| b);
+                g
+            } else {
+                // Range model: redraw next burst, then gap. Draw ORDER is
+                // load-bearing (the phoenix calibration depends on it) -- do
+                // not reorder.
+                self.burst_left = self.draw(p.burst_words_min, p.burst_words_max);
+                self.draw(p.inter_burst_cycles_min, p.inter_burst_cycles_max)
+            };
             if gap > 0 {
                 self.gap_left = gap - 1;
                 return 0;
@@ -485,6 +544,39 @@ mod tests {
         }
         // Different master -> different per-channel seed.
         assert_ne!(channel_seed(m, 1, 2, 3), channel_seed(m ^ 1, 1, 2, 3));
+    }
+
+    #[test]
+    fn scripted_sequence_replaces_draws() {
+        // A scripted (burst,gap) sequence replays exactly, ignoring [min,max].
+        // Drive at 1 word/cyc; script bursts of 3 then 2, gaps 2 then 1.
+        let p = fixed(99, 99, 0); // enabled, but params must be ignored by script
+        let mut g = BurstGate::default();
+        g.set_script(vec![(3, 2), (2, 1)]);
+        let t = timeline(&mut g, p, 10);
+        // burst(3) gap(2) burst(2) gap(1) then script exhausted -> free delivery
+        assert_eq!(t, vec![1, 1, 1, 0, 0, 1, 1, 0, 1, 1]);
+    }
+
+    #[test]
+    fn scripted_mode_does_not_touch_prng() {
+        // Installing a script must not perturb the PRNG state -- the script path
+        // never calls draw(), so a later range run from the same seed is intact.
+        let p = BurstParams {
+            burst_words_min: 4,
+            burst_words_max: 16,
+            inter_burst_cycles_min: 1,
+            inter_burst_cycles_max: 12,
+            first_access_latency: 0,
+        };
+        let baseline = timeline(&mut BurstGate::seeded(0x77), p, 100);
+        let mut g = BurstGate::seeded(0x77);
+        g.set_script(vec![(3, 2)]);
+        let _ = timeline(&mut g, fixed(99, 99, 0), 50);
+        g.reset();
+        g.script = None; // drop the script; PRNG should be untouched at 0x77
+        let after = timeline(&mut g, p, 100);
+        assert_eq!(baseline, after, "scripted mode must not advance the PRNG");
     }
 
     #[test]
