@@ -100,9 +100,27 @@ drains during the opening and the port stays continuously asserted. The
 **steady-state** gaps already match (~50-56cy both); only the warmup/opening is
 fragmented. The DMA/stream model itself is HW-faithful (FIFO depths 4/4/2 from
 AM020, instantaneous backpressure) -- the divergence originates in the compute
-core, overlapping #135 (core steady-period) and #132 (release-overlap). Next:
-characterize the core's per-buffer acquire/release timing vs HW span edges, then
-pick the fix. No band-matching, no seeds.
+core, overlapping #135 (core steady-period) and #132 (release-overlap).
+
+**Refined root cause (characterized later same day).** The core's ~64cy/buffer is
+FLAT even when input is pre-staged (`in1_cons=2`, consumption uniform
+64/71/64/71) -- so it is not a "releases slightly late" phasing nudge but the
+core's whole per-buffer *period*. That period is honest interpreter instruction
+cost (`src/interpreter/execute/cycle_accurate.rs:938-960`: +1cy/lock-txn
+arbitration x4 + the TableGen latency table; no synthetic stall, no warmup
+distinction). HW front-loads because, with input pre-staged, its VLIW core runs
+the add-loop faster (~2-3 vs ~7 cy/element -- HW pipelining/forwarding that EMU
+over-charges as hazard stalls); this only surfaces at the opening because
+steady-state is delivery-bound (~50cy) on BOTH worlds, masking core speed (hence
+slot0/slot5 exact, only the compute-coupled slot1/slot4 diverge). **Output path
+ruled out** (`out1_prod` never 0, `out1_cons` always 0). aiesim ruled out as
+oracle (PORT_RUNNING-silent; internal VCD granularity-mismatched -- the
+consolidated `multirun --emu --aiesim` path runs add_one to completion but the
+trace unit emits nothing). The fix is a deliberate, broad task -- **"Improve
+interpreter VLIW core-timing fidelity (ILP/hazard modeling)"** -- whose blast
+radius across the bridge corpus is intended (a more-correct core that breaks a
+downstream check exposes that check's latent wrongness). HW PORT_RUNNING spans
+(slot1/slot4 -> 5/3) are the only oracle; preserve the #135 steady-period match.
 
 ## Consequences / decisions
 
