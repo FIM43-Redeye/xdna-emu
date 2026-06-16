@@ -180,8 +180,44 @@ def env_with_emu(runtime: str = "debug") -> dict:
     return env
 
 
+# Canonical aiesim-backend paths (mirror scripts/emu-bridge-test.sh:295-296);
+# overridable via the same env vars.
+AIESIM_BRIDGE_SO = Path(os.environ.get(
+    "AIESIM_BRIDGE_SO", REPO / "aiesim-bridge" / "build" / "libxdna_aiesim_bridge.so"))
+AIESIM_DEVICE_JSON = Path(os.environ.get(
+    "AIESIM_DEVICE_JSON", REPO / "build" / "experiments" / "aiesim-device-decrypt" / "NPU1.json"))
+
+
+def env_with_aiesim(env: dict, vcd_path: str | None = None) -> dict:
+    """Route the emulator plugin to the aiesim backend (XDNA_BACKEND=aiesim).
+
+    Augments an existing `env_with_emu` env: the plugin is still activated by
+    XDNA_EMU=1, but XDNA_BACKEND=aiesim makes the FFI select the aiesim bridge
+    instead of the Rust interpreter. Native NPU1 5x6 geometry so the kernel runs
+    at its real columns. Mirrors emu-bridge-test.sh's run_one_aiesim env. When
+    `vcd_path` is set, the bridge dumps its internal-signal VCD there.
+    """
+    env = dict(env)
+    env["XDNA_BACKEND"] = "aiesim"
+    env["XDNA_AIESIM_DEVICE_JSON"] = str(AIESIM_DEVICE_JSON)
+    env["XDNA_AIESIM_BRIDGE"] = str(AIESIM_BRIDGE_SO)
+    env["XDNA_AIESIM_NATIVE_GEOMETRY"] = "1"
+    aietools = os.environ.get("XILINX_VITIS_AIETOOLS") or os.environ.get("AIETOOLS_DIR", "")
+    ld_parts = []
+    if aietools:
+        ld_parts.append(f"{aietools}/lib/lnx64.o")
+    ld_parts.append(str(REPO / "aiesim-bridge" / "build"))
+    if env.get("LD_LIBRARY_PATH"):
+        ld_parts.append(env["LD_LIBRARY_PATH"])
+    env["LD_LIBRARY_PATH"] = ":".join(ld_parts)
+    if vcd_path:
+        env["XDNA_AIESIM_VCD"] = vcd_path
+    return env
+
+
 def run_one(run_idx: int, item, label: str, paths: dict, out_root: Path,
-            verbose: bool, emu: bool, emu_runtime: str) -> dict:
+            verbose: bool, emu: bool, emu_runtime: str,
+            aiesim: bool = False, aiesim_vcd: bool = False) -> dict:
     """One iteration: bridge-trace-runner + parse-trace.py.
 
     `item` is the schedule item (K int or kernel-name str); `label` is its
@@ -199,6 +235,9 @@ def run_one(run_idx: int, item, label: str, paths: dict, out_root: Path,
     t_start_wall = datetime.now(timezone.utc).isoformat()
 
     runner_env = env_with_emu(emu_runtime) if emu else env_no_emu()
+    if aiesim:
+        vcd_path = str(run_dir / "aiesim.vcd") if aiesim_vcd else None
+        runner_env = env_with_aiesim(runner_env, vcd_path)
     parser_env_base = runner_env  # parse-trace doesn't touch HW; same env is fine
 
     # 1) bridge-trace-runner
@@ -290,13 +329,25 @@ def main() -> int:
     ap.add_argument("--emu-runtime", default="debug",
                     choices=("debug", "release"),
                     help="EMU plugin profile to load (default debug)")
+    ap.add_argument("--aiesim", action="store_true",
+                    help="route the plugin to the aiesim backend "
+                         "(XDNA_BACKEND=aiesim) instead of the Rust "
+                         "interpreter; requires --emu")
+    ap.add_argument("--aiesim-vcd", action="store_true",
+                    help="with --aiesim, dump the bridge's internal-signal VCD "
+                         "to <run>/aiesim.vcd (large; use with --n-runs 1)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print schedule and manifest; don't execute")
     ap.add_argument("-q", "--quiet", action="store_true",
                     help="suppress per-iteration progress lines")
     args = ap.parse_args()
 
-    # Defaults differ by mode -- HW needs noise reduction, EMU does not.
+    if args.aiesim and not args.emu:
+        print("error: --aiesim requires --emu (the aiesim backend rides the "
+              "emulator plugin: XDNA_EMU=1 + XDNA_BACKEND=aiesim)", file=sys.stderr)
+        return 1
+
+    # Defaults differ by mode -- HW needs noise reduction, EMU/aiesim do not.
     if args.n_runs is None:
         args.n_runs = 1 if args.emu else 50
 
@@ -334,8 +385,9 @@ def main() -> int:
             labels[it] = f"k{it}"
 
     session = args.session or utc_now_str()
-    if args.emu and not session.endswith("-emu"):
-        session = f"{session}-emu"
+    suffix = "-aiesim" if args.aiesim else ("-emu" if args.emu else "")
+    if suffix and not session.endswith(suffix):
+        session = f"{session}{suffix}"
     out_root = args.out_root / session
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -349,8 +401,10 @@ def main() -> int:
     manifest = {
         "session": session,
         "session_start_utc": datetime.now(timezone.utc).isoformat(),
-        "mode": "emu" if args.emu else "hw",
+        "mode": "aiesim" if args.aiesim else ("emu" if args.emu else "hw"),
         "emu_runtime": args.emu_runtime if args.emu else None,
+        "aiesim_device_json": str(AIESIM_DEVICE_JSON) if args.aiesim else None,
+        "aiesim_bridge_so": str(AIESIM_BRIDGE_SO) if args.aiesim else None,
         "item_mode": "kernels" if kernel_mode else "ks",
         "ks": ks,
         "kernels": items if kernel_mode else None,
@@ -411,7 +465,8 @@ def main() -> int:
                   flush=True)
         meta = run_one(run_idx, it, labels[it], paths_by_item[it], out_root,
                        verbose=not args.quiet,
-                       emu=args.emu, emu_runtime=args.emu_runtime)
+                       emu=args.emu, emu_runtime=args.emu_runtime,
+                       aiesim=args.aiesim, aiesim_vcd=args.aiesim_vcd)
         if meta["ok"]:
             n_ok += 1
         else:

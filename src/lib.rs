@@ -14,7 +14,6 @@
 //! - [`testing`]: Test harness for XCLBIN binary compatibility
 //! - `ffi`: C-compatible FFI (separate crate: `xdna-emu-ffi`)
 //! - [`fuzzer`]: Differential logic fuzzer for emulator validation
-//! - [`aiesim`]: aiesimulator subprocess harness for VCD cross-validation
 //!
 //! Arch-data (register definitions, TableGen model, subsystems, ISA decode
 //! FFI) lives in the `xdna-archspec` crate at `xdna_archspec::aie2::*`.
@@ -26,7 +25,6 @@ pub mod device;
 pub mod interpreter;
 pub mod npu;
 pub mod trace;
-pub mod aiesim;
 pub mod debug;
 
 // GUI (requires eframe/egui)
