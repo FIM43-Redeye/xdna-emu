@@ -296,3 +296,54 @@ rate) experiment levers were removed with the phoenix model -- both targeted DDR
 delivery / egress rate, which the localization ruled out as the source.
 
 All remaining diagnostics gated and default-off; 3514 lib tests green.
+
+## HW disambiguation (2026-06-16 cont. 3): H-A confirmed, real gap = PORT_STALLED
+
+The "stream-rate fix" left a residual (slot4 5 vs HW 3 sub-bursts) framed two ways:
+**H-A** -- EMU's per-beat PORT_RUNNING is correct and the divergence is
+consumer-pacing/word-flow; **H-B** -- HW *holds* PORT_RUNNING through backpressure
+where EMU drops it. The existing single-event capture (PORT_RUNNING only) and the
+toolchain docs could not decide it, so we ran the decisive HW experiment: add
+`PORT_STALLED_4` (+0/1/5) to the memtile trace capture via the
+`XDNA_TRACE_MEMTILE_EVENTS` env override (read by emu-bridge-test.sh:1765; the
+`PORT_RUNNING_4` port-selection is shared, so `PORT_STALLED_4` reads the same
+physical port) and decode both on real NPU1.
+
+**Verdict: H-A. PORT_RUNNING is already correct.** On HW the memtile send port's
+`PORT_RUNNING_4` and `PORT_STALLED_4` are **perfectly complementary** -- every
+PORT_RUNNING gap (`g27`, `g58`, `g67`) is exactly filled by a PORT_STALLED
+interval; together they tile `[33,271]` continuously (port engaged the whole
+transfer, alternating beating <-> backpressured). HW's RUNNING **drops** during
+backpressure, exactly like EMU's per-beat model. (Had we guessed H-B we'd have
+broken correct semantics.) The original #140 PORT_RUNNING sub-burst residual is a
+small opening-timing detail (EMU stalls ~4-10cy earlier -> one extra group);
+semantics are sound.
+
+**The real gap the experiment exposed: EMU emitted ZERO PORT_STALLED on
+circuit-routed DMA ports.** `cycle_stalled` was set only in the packet-route path
+(`step_packet_routes`); circuit routes (most inter-tile DMA, incl. memtile
+MM2S->compute) skipped it silently. So HW shows complementary RUNNING/STALLED
+tiling and EMU showed RUNNING with silent gaps.
+
+**Fix (commit `a02187e4`).** `StreamSwitch::mark_stalled_ports()`, run once after
+all routing each cycle: a port that holds data but saw no beat this cycle was
+backpressured -> `cycle_stalled |= has_data() && !cycle_beat`. Evaluated
+*post-routing* (the local route runs in two passes around inter-tile propagation)
+so it reflects the final `cycle_beat`, keeping RUNNING and STALLED exclusive. A
+first attempt set the stall inside the circuit route's `!can_pop` branch, but the
+per-cycle probe (`s4st` readout added to XFORM_PROBE) showed it co-asserting with
+`cycle_beat` during FIFO-fill (the slave port beats on DMA *push* while the route
+can't *forward*) -> RUNNING/STALLED overlapped. The post-routing `!cycle_beat`
+definition removed all overlap (0 cycles with both set) and reproduces HW's
+complementary tiling. `cycle_stalled` is trace-only (consumed solely by
+PORT_STALLED emission), so data movement, cycle counts, and PORT_RUNNING baselines
+are unchanged; the default corpus capture (PORT_RUNNING only) is untouched. 3499
+lib tests green.
+
+**Validation oracle:** `build/experiments/gap140/disambig_stalled.py` (HW vs EMU
+RUNNING/STALLED overlay); HW capture under
+`build/bridge-test-results/20260616/add_one_using_dma.chess.hw`.
+
+**Open residual:** the small opening-timing difference (EMU one extra RUNNING
+burst; EMU first stall ~17cy vs HW ~27cy) -- a fine DMA/double-buffer-fill detail,
+not semantics. Steady-state (`~9-10cy` bursts, `~56-63cy` stalls) matches HW.
