@@ -357,6 +357,16 @@ impl TileArray {
         // Data reaching the TileCtrl master port gets processed as register writes
         words_routed += self.route_tile_switches_to_ctrl();
 
+        // Step 9: Mark stalled ports. After all routing for this cycle, any port
+        // still holding data that did not beat this cycle was backpressured --
+        // that is the HW PORT_STALLED condition. Evaluated here (not mid-route)
+        // so it reflects the final cycle_beat state and stays exclusive with
+        // PORT_RUNNING. Without this, circuit-routed DMA ports never emitted
+        // PORT_STALLED even though HW asserts it (confirmed on NPU1).
+        for tile in &mut self.tiles {
+            tile.stream_switch.mark_stalled_ports();
+        }
+
         words_routed
     }
 

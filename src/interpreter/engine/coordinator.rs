@@ -1202,8 +1202,24 @@ impl InterpreterEngine {
                     None => -1,
                 }
             };
+            // #140: stall readout parallel to beat -- to verify whether a slave
+            // port asserts cycle_beat (DMA push/pop) and cycle_stalled
+            // (can't-forward) in the SAME cycle, which HW treats as exclusive.
+            let stall = |ep: usize| -> i32 {
+                match mt.event_port_selection.get(ep).copied().flatten() {
+                    Some((pi, true)) => {
+                        mt.stream_switch.masters.get(pi as usize).map_or(-1, |p| p.cycle_stalled as i32)
+                    }
+                    Some((pi, false)) => {
+                        mt.stream_switch.slaves.get(pi as usize).map_or(-1, |p| p.cycle_stalled as i32)
+                    }
+                    None => -1,
+                }
+            };
             let s0 = beat(0);
             let s4 = beat(4);
+            let s4st = stall(4);
+            let s0st = stall(0);
             let mut chans = String::new();
             if let Some(eng) = self.device.array.dma_engine(probe_col, 1) {
                 for ch in 0u8..12 {
@@ -1233,7 +1249,7 @@ impl InterpreterEngine {
             let c2_act = self.cores.get(c2_idx).map_or(false, |c| c.active_this_cycle);
             if s0 == 1 || s4 == 1 || !chans.is_empty() || !c2_chans.is_empty() {
                 eprintln!(
-                    "[XFORM] col={probe_col} cyc={cyc} s0={s0} s4={s4}{chans} mtlk={locks:?} | c2act={} c2lk={c2_locks:?}{c2_chans}",
+                    "[XFORM] col={probe_col} cyc={cyc} s0={s0} s0st={s0st} s4={s4} s4st={s4st}{chans} mtlk={locks:?} | c2act={} c2lk={c2_locks:?}{c2_chans}",
                     c2_act as u8
                 );
             }

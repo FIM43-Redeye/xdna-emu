@@ -323,6 +323,32 @@ impl StreamSwitch {
         }
     }
 
+    /// Mark ports stalled after all routing for this cycle has completed.
+    ///
+    /// A port is stalled when it holds buffered data but no beat crossed it
+    /// this cycle -- it has something to move but was backpressured (downstream
+    /// FIFO full / arbiter contention). This is the HW PORT_STALLED condition.
+    /// Evaluated once at the end of the routing cycle so it reflects the final
+    /// `cycle_beat` state (the local route runs in two passes, around inter-tile
+    /// propagation, and a beat in either pass must win over a stall): a port
+    /// that beat this cycle is running, not stalled -- the two are exclusive,
+    /// matching HW where PORT_RUNNING and PORT_STALLED tile a transfer
+    /// complementarily (confirmed on NPU1 add_one_using_dma: the memtile MM2S
+    /// send port's RUNNING and STALLED fill each other's gaps exactly).
+    ///
+    /// Packet routes already set `cycle_stalled` mid-route (step_packet_routes);
+    /// this is additive (`||`) so those are preserved. Circuit routes never set
+    /// it, so before this pass PORT_STALLED never fired on circuit-routed DMA
+    /// ports even though HW asserts it.
+    pub fn mark_stalled_ports(&mut self) {
+        for port in &mut self.masters {
+            port.cycle_stalled = port.cycle_stalled || (port.has_data() && !port.cycle_beat);
+        }
+        for port in &mut self.slaves {
+            port.cycle_stalled = port.cycle_stalled || (port.has_data() && !port.cycle_beat);
+        }
+    }
+
     /// Get total data in all FIFOs.
     pub fn total_fifo_level(&self) -> usize {
         self.masters.iter().map(|p| p.fifo_level()).sum::<usize>()
